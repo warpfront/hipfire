@@ -274,13 +274,14 @@ impl ColdPrefillScratch {
 /// Device addresses of the prefill mailbox fields a call reads and writes.
 #[derive(Clone, Copy, Debug)]
 pub struct ColdPrefillIo {
-    /// `[rows, dim]` F32 normed rows (the routed experts' natural activation).
+    /// `[rows, dim]` F16 normed rows (the routed experts' natural activation).
     pub x_norm: u64,
     /// `[rows, top_k]` i32 route ids (unmasked).
     pub ids: u64,
     /// `[rows, top_k]` F32 route weights.
     pub weights: u64,
-    /// `[rows, dim]` F32 cold partial (written).
+    /// `[rows, dim]` BF16 cold partial (written; the BF16 round-trip combine
+    /// makes every element BF16-exact, so the narrowing is lossless).
     pub partial: u64,
 }
 
@@ -302,7 +303,8 @@ fn copy(gpu: &mut Gpu, dst: &DeviceBuffer, src: &DeviceBuffer, bytes: usize) -> 
 }
 
 /// Queue one layer's cold partial for `rows` rows on the current stream:
-/// mask the hot slots, zero the partial, run the sealed routed tail.
+/// widen the F16 rows, mask the hot slots, zero the local partial, run the
+/// sealed routed tail, then narrow the partial to BF16 into the mailbox.
 pub fn run_cold_prefill(
     gpu: &mut Gpu,
     layer: &ColdPrefillLayer,
@@ -316,13 +318,11 @@ pub fn run_cold_prefill(
     }
     let slots = rows * c.top_k;
     let row_bytes = rows * c.dim * 4;
-    let mb_x = view(io.x_norm, row_bytes, vec![rows, c.dim], DType::F32);
     let mb_w = view(io.weights, slots * 4, vec![slots], DType::F32);
-    let mb_partial = view(io.partial, row_bytes, vec![rows, c.dim], DType::F32);
     let x_norm = GpuTensor { buf: s.x_norm_batch.buf.byte_view(0, row_bytes), shape: vec![rows, c.dim], dtype: DType::F32 };
     let weights = GpuTensor { buf: s.topk_weights.buf.byte_view(0, slots * 4), shape: vec![slots], dtype: DType::F32 };
     let partial = GpuTensor { buf: s.x_batch.buf.byte_view(0, row_bytes), shape: vec![rows, c.dim], dtype: DType::F32 };
-    copy(gpu, &x_norm.buf, &mb_x.buf, row_bytes)?;
+    gpu.hetero_f16_to_f32(io.x_norm, &x_norm, (rows * c.dim) as i32).map_err(hip)?;
     copy(gpu, &weights.buf, &mb_w.buf, slots * 4)?;
     zero(gpu, &partial.buf, row_bytes)?;
     gpu.hetero_mask_hot(io.ids, &layer.cold_bitmap, c.n_experts as i32, slots as i32, &s.topk_indices)
@@ -411,5 +411,5 @@ pub fn run_cold_prefill(
     let experts = BoundMoeExperts::from_cache(&layer.table, &layer.cache)?;
     let call = seal_prefill(experts, &ctx, params)?;
     crate::pipeline::execute_steps(gpu, &ctx, &[Step::Moe(call)])?;
-    copy(gpu, &mb_partial.buf, &partial.buf, row_bytes)
+    gpu.hetero_f32_to_bf16(&partial, io.partial, (rows * c.dim) as i32).map_err(hip)
 }

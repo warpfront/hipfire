@@ -7,7 +7,11 @@
 //! * (b) the responder answers;
 //! * (c) await + install copy exactly the cold rows;
 //! * (d) a timeout writes the error word, installs nothing and returns promptly;
-//! * (e) zero cold slots still pair publish and await.
+//! * (e) zero cold slots still pair publish and await;
+//! * (f) prefill: F16 rows copied out per sub-chunk, meta + release, await +
+//!   BF16 copy back, add (37 rows, 2 sub-chunks);
+//! * (g) prefill timeouts (none answered / one of two answered) skip the add;
+//! * (h) zero-cold prefill masks nothing; (i) the expert device's converts.
 //!
 //! Prints `PASS` or `FAIL <case>: ...`; exits 1 on failure.
 //!
@@ -86,6 +90,57 @@ fn download_i32(gpu: &Gpu, t: &GpuTensor, n: usize) -> Vec<i32> {
 fn fail(case: &str, msg: String) -> ! {
     println!("FAIL {case}: {msg}");
     std::process::exit(1);
+}
+
+/// f32 -> IEEE half bits, round-to-nearest-even (the device `(_Float16)` cast).
+fn f32_to_f16_bits(v: f32) -> u16 {
+    let u = v.to_bits();
+    let sign = ((u >> 16) & 0x8000) as u16;
+    let exp = ((u >> 23) & 0xff) as i32;
+    let man = u & 0x7f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if man != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = man | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = 1u32 << (shift - 1);
+        let rem = m & ((1 << shift) - 1);
+        let mut r = m >> shift;
+        if rem > half || (rem == half && r & 1 == 1) {
+            r += 1;
+        }
+        return sign | r as u16;
+    }
+    let mut r = ((e as u32) << 10) | (man >> 13);
+    let rem = man & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && r & 1 == 1) {
+        r += 1;
+    }
+    sign | r as u16
+}
+
+fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+    let exp = ((h >> 10) & 0x1f) as i32;
+    let man = (h & 0x3ff) as f32;
+    match exp {
+        0 => sign * man * 2f32.powi(-24),
+        0x1f => if man == 0.0 { sign * f32::INFINITY } else { f32::NAN },
+        _ => sign * (1.0 + man / 1024.0) * 2f32.powi(exp - 15),
+    }
+}
+
+fn bf16_rne(v: f32) -> u16 {
+    let u = v.to_bits();
+    ((u + 0x7fff + ((u >> 16) & 1)) >> 16) as u16
 }
 
 fn main() {
@@ -220,26 +275,27 @@ fn main() {
     if download_i32(&gpu, &masked_t, TOP_K) != ids {
         fail("e", "zero-cold masked ids should equal the ids".into());
     }
-    // ---- (f)-(h): prefill slot (separate pinned slot, max 64 rows; layout
-    // mirrored from hetero_mailbox::PrefillGeometry).
+    // ---- (f)-(i): prefill slot (separate pinned slot, max 64 rows, two
+    // sub-chunks; layout mirrored from hetero_mailbox::PrefillGeometry).
     const PROWS: usize = 64;
+    const SUBS: usize = 2;
     let al = |x: usize| x.div_ceil(256) * 256;
-    let (p_x, p_ids) = (256usize, al(256 + PROWS * DIM * 4));
+    let p_x = al(64 * (1 + 3 * SUBS));
+    let p_ids = al(p_x + PROWS * DIM * 2);
     let p_w = al(p_ids + PROWS * TOP_K * 4);
     let p_part = al(p_w + PROWS * TOP_K * 4);
-    let p_total = al(p_part + PROWS * DIM * 4);
+    let p_total = al(p_part + PROWS * DIM * 2);
     let pb = gpu.hip.host_malloc(p_total, flags).unwrap().cast::<u8>();
     // SAFETY: fresh pinned allocation of `p_total` bytes.
     unsafe { std::ptr::write_bytes(pb, 0, p_total) };
     let pa = pb as u64;
-    let ps = HeteroSlotPtrs {
-        req_seq: pa,
-        resp_seq: pa + 64,
-        error: pa + 128,
-        x_rot: pa + p_x as u64,
-        ids: pa + p_ids as u64,
-        weights: pa + p_w as u64,
-        cold_out: pa + p_part as u64,
+    let p_err = pa;
+    let req = move |i: usize| pa + (64 * (1 + 3 * i)) as u64;
+    let resp = move |i: usize| req(i) + 64;
+    let meta = move |i: usize| req(i) + 128;
+    let sub_range = |rows: usize, i: usize| {
+        let (q, r) = (rows / SUBS, rows % SUBS);
+        (i * q + i.min(r), q + usize::from(i < r))
     };
     let rows = 37usize; // a partial last chunk
     let xs: Vec<f32> = (0..rows * DIM).map(|i| ((i % 113) as f32 - 56.0) * 0.003).collect();
@@ -249,45 +305,91 @@ fn main() {
     let pw: Vec<f32> = (0..rows * TOP_K).map(|s| (s % 7) as f32 * 0.05).collect();
     let pw_t = gpu.upload_f32(&pw, &[rows * TOP_K]).unwrap();
     let pmasked = gpu.alloc_tensor(&[PROWS * TOP_K], DType::F32).unwrap();
+    let x_f16 = gpu.alloc_tensor(&[PROWS * DIM / 2], DType::F32).unwrap();
+    let part_local = gpu.alloc_tensor(&[PROWS * DIM / 2], DType::F32).unwrap();
     let base_x: Vec<f32> = (0..rows * DIM).map(|i| (i % 17) as f32).collect();
     let x_batch = gpu.upload_f32(&base_x, &[rows * DIM]).unwrap();
-    let part = |i: usize| (i % 1009) as f32 * 0.25;
-    gpu.hetero_token_advance(&counter).unwrap(); // token 2
-    let want_f = seq_for(2, 5, LAYERS);
-    let rf = std::thread::spawn(move || {
-        let t0 = Instant::now();
-        while word(ps.req_seq).load(Ordering::Acquire) != want_f {
-            if t0.elapsed() > Duration::from_secs(5) {
-                return false;
+    // BF16-exact partial values (7 significant bits).
+    let part = |i: usize| ((i % 61) as f32 - 30.0) * 0.25;
+    // SAFETY: host views of the pinned slot.
+    let mb_x = unsafe { hip_bridge::DeviceBuffer::from_raw((pa + p_x as u64) as *mut std::ffi::c_void, PROWS * DIM * 2) };
+    let mb_part = unsafe { hip_bridge::DeviceBuffer::from_raw((pa + p_part as u64) as *mut std::ffi::c_void, PROWS * DIM * 2) };
+    // One chunk: publish, per sub-chunk copy-out + release, per sub-chunk
+    // await + copy-back, then the add. Stream order on the default stream.
+    let chunk = |gpu: &mut Gpu, bitmap_t: &GpuTensor, layer: u32, polls: u32| {
+        gpu.hetero_publish_rows(&xs_t, &pids_t, &pw_t, bitmap_t, N_EXP as i32, rows as i32, TOP_K as i32, DIM as i32, &x_f16, pa + p_ids as u64, pa + p_w as u64, &pmasked)
+            .unwrap();
+        for i in 0..SUBS {
+            let (off, n) = sub_range(rows, i);
+            gpu.hip.memcpy_dtod_async_default_at(&mb_x, off * DIM * 2, &x_f16.buf, off * DIM * 2, n * DIM * 2).unwrap();
+            gpu.hetero_release_rows(&counter, layer, LAYERS, off as i32, n as i32, meta(i), req(i)).unwrap();
+        }
+        for i in 0..SUBS {
+            let (off, n) = sub_range(rows, i);
+            let slot = HeteroSlotPtrs { req_seq: req(i), resp_seq: resp(i), error: p_err, x_rot: 0, ids: 0, weights: 0, cold_out: 0 };
+            gpu.hetero_await_cold(&counter, layer, LAYERS, &slot, polls).unwrap();
+            gpu.hip.memcpy_dtod_async_default_at(&part_local.buf, off * DIM * 2, &mb_part, off * DIM * 2, n * DIM * 2).unwrap();
+        }
+        gpu.hetero_add_partial(p_err, &part_local, (rows * DIM) as i32, &x_batch).unwrap();
+    };
+    // The host responder: answer sub-chunks `answer` of layer `layer`, checking
+    // each request's meta and F16 rows first.
+    let x16_want: Vec<u16> = xs.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let respond = |layer: u32, answer: Vec<usize>| {
+        let want = seq_for(2, layer, LAYERS);
+        let x16_want = x16_want.clone();
+        std::thread::spawn(move || -> Result<(), String> {
+            for i in answer {
+                let t0 = Instant::now();
+                while word(req(i)).load(Ordering::Acquire) != want {
+                    if t0.elapsed() > Duration::from_secs(5) {
+                        return Err(format!("sub {i}: request never seen"));
+                    }
+                }
+                let (l, off, n) = (word(meta(i)).load(Ordering::Acquire), word(meta(i) + 4).load(Ordering::Acquire), word(meta(i) + 8).load(Ordering::Acquire));
+                let (woff, wn) = sub_range(rows, i);
+                if (l, off as usize, n as usize) != (layer, woff, wn) {
+                    return Err(format!("sub {i}: meta ({l}, {off}, {n}) != ({layer}, {woff}, {wn})"));
+                }
+                // SAFETY: the slot's F16 rows and BF16 partial.
+                let (xg, out) = unsafe {
+                    (
+                        std::slice::from_raw_parts((pa + p_x as u64) as *const u16, PROWS * DIM),
+                        std::slice::from_raw_parts_mut((pa + p_part as u64) as *mut u16, PROWS * DIM),
+                    )
+                };
+                let r = woff * DIM..(woff + wn) * DIM;
+                if xg[r.clone()] != x16_want[r.clone()] {
+                    return Err(format!("sub {i}: F16 rows differ"));
+                }
+                for k in r {
+                    out[k] = (part(k).to_bits() >> 16) as u16;
+                }
+                word(resp(i)).store(want, Ordering::Release);
             }
-        }
-        // SAFETY: the partial area holds PROWS * DIM f32.
-        let out = unsafe { std::slice::from_raw_parts_mut(ps.cold_out as *mut f32, rows * DIM) };
-        for (i, v) in out.iter_mut().enumerate() {
-            *v = part(i);
-        }
-        word(ps.resp_seq).store(want_f, Ordering::Release);
-        true
-    });
-    gpu.hetero_publish_rows(&xs_t, &pids_t, &pw_t, &bitmap_t, N_EXP as i32, rows as i32, TOP_K as i32, DIM as i32, &ps, &pmasked)
-        .unwrap();
-    gpu.hetero_release_rows(&counter, 5, LAYERS, rows as i32, pa + 192, pa + 196, ps.req_seq).unwrap();
-    gpu.hetero_await_cold(&counter, 5, LAYERS, &ps, 50_000_000).unwrap();
-    gpu.hetero_add_partial(ps.error, ps.cold_out, (rows * DIM) as i32, &x_batch).unwrap();
+            Ok(())
+        })
+    };
+    // (f) both sub-chunks answered.
+    gpu.hetero_token_advance(&counter).unwrap(); // token 2 (the decode cases used 1)
+    let rf = respond(5, vec![0, 1]);
+    chunk(&mut gpu, &bitmap_t, 5, 50_000_000);
     gpu.hip.device_synchronize().unwrap();
-    if !rf.join().unwrap() {
-        fail("f", "prefill responder never saw the request".into());
+    if let Err(e) = rf.join().unwrap() {
+        fail("f", e);
     }
-    // SAFETY: slot fields.
-    let (gx, gl, gr) = unsafe {
+    if word(p_err).load(Ordering::Acquire) != 0 {
+        fail("f", "error word set".into());
+    }
+    // SAFETY: the slot's route fields.
+    let (gi, gw) = unsafe {
         (
-            std::slice::from_raw_parts(ps.x_rot as *const f32, rows * DIM),
-            *((pa + 192) as *const u32),
-            *((pa + 196) as *const u32),
+            std::slice::from_raw_parts((pa + p_ids as u64) as *const i32, rows * TOP_K),
+            std::slice::from_raw_parts((pa + p_w as u64) as *const f32, rows * TOP_K),
         )
     };
-    if gx != &xs[..] || gl != 5 || gr != rows as u32 {
-        fail("f", format!("prefill slot contents (layer {gl}, rows {gr})"));
+    if gi != &pids[..] || gw != &pw[..] {
+        fail("f", "prefill slot route".into());
     }
     let want_pm: Vec<i32> = pids.iter().map(|&e| if bitmap[e as usize] != 0 { -1 } else { e }).collect();
     if download_i32(&gpu, &pmasked, rows * TOP_K) != want_pm {
@@ -299,29 +401,71 @@ fn main() {
             fail("f", format!("x_batch[{i}] {} != {}", gotx[i], base_x[i] + part(i)));
         }
     }
-    // (g) timeout: nobody answers layer 6.
-    let before = gpu.download_f32(&x_batch).unwrap();
-    // SAFETY: zero the partial so a wrong add would show.
-    unsafe { std::ptr::write_bytes(ps.cold_out as *mut u8, 0x41, rows * DIM * 4) };
-    gpu.hetero_publish_rows(&xs_t, &pids_t, &pw_t, &bitmap_t, N_EXP as i32, rows as i32, TOP_K as i32, DIM as i32, &ps, &pmasked)
-        .unwrap();
-    gpu.hetero_release_rows(&counter, 6, LAYERS, rows as i32, pa + 192, pa + 196, ps.req_seq).unwrap();
-    gpu.hetero_await_cold(&counter, 6, LAYERS, &ps, 20_000).unwrap();
-    gpu.hetero_add_partial(ps.error, ps.cold_out, (rows * DIM) as i32, &x_batch).unwrap();
-    gpu.hip.device_synchronize().unwrap();
-    if word(ps.error).load(Ordering::Acquire) != seq_for(2, 6, LAYERS) {
-        fail("g", "prefill timeout did not set the error word".into());
+    // (g1) nobody answers layer 6: error word set, nothing added.
+    // (g2) only sub-chunk 0 of layer 7 answered: the whole add is still skipped.
+    for (case, layer, answer) in [("g1", 6u32, vec![]), ("g2", 7, vec![0usize])] {
+        // SAFETY: poison the partial so a wrong add would show; clear the error.
+        unsafe { std::ptr::write_bytes((pa + p_part as u64) as *mut u8, 0x41, PROWS * DIM * 2) };
+        word(p_err).store(0, Ordering::Release);
+        let before = gpu.download_f32(&x_batch).unwrap();
+        let r = respond(layer, answer);
+        chunk(&mut gpu, &bitmap_t, layer, 20_000);
+        gpu.hip.device_synchronize().unwrap();
+        if let Err(e) = r.join().unwrap() {
+            fail(case, e);
+        }
+        if word(p_err).load(Ordering::Acquire) != seq_for(2, layer, LAYERS) {
+            fail(case, "timeout did not set the error word".into());
+        }
+        if gpu.download_f32(&x_batch).unwrap() != before {
+            fail(case, "add_partial ran after a timeout".into());
+        }
     }
-    if gpu.download_f32(&x_batch).unwrap() != before {
-        fail("g", "add_partial ran after a timeout".into());
-    }
+    word(p_err).store(0, Ordering::Release);
     // (h) zero cold: masked == ids.
-    gpu.hetero_publish_rows(&xs_t, &pids_t, &pw_t, &none, N_EXP as i32, rows as i32, TOP_K as i32, DIM as i32, &ps, &pmasked)
+    gpu.hetero_publish_rows(&xs_t, &pids_t, &pw_t, &none, N_EXP as i32, rows as i32, TOP_K as i32, DIM as i32, &x_f16, pa + p_ids as u64, pa + p_w as u64, &pmasked)
         .unwrap();
     gpu.hip.device_synchronize().unwrap();
     if download_i32(&gpu, &pmasked, rows * TOP_K) != pids {
         fail("h", "zero-cold prefill masked ids should equal the ids".into());
     }
+    // (i) the expert device's converts (same source on every arch).
+    let specials = [0.0f32, -0.0, 1.0, -2.5, 65504.0, 1e-6, f32::INFINITY, f32::NEG_INFINITY, f32::NAN, f32::MIN_POSITIVE];
+    let mut vals: Vec<f32> = specials.to_vec();
+    // RNE ties and near-ties around BF16 boundaries.
+    for b in [0x3f80_8000u32, 0x3f81_8000, 0x3f80_7fff, 0x3f80_8001, 0xbf80_8000, 0x0000_8000, 0x7f7f_8000] {
+        vals.push(f32::from_bits(b));
+    }
+    vals.extend((0..997).map(|k| ((k * 7919) % 20011) as f32 * 0.0137 - 137.0));
+    let n = vals.len();
+    let src = gpu.upload_f32(&vals, &[n]).unwrap();
+    let b16 = gpu.hip.host_malloc(n * 2, flags).unwrap().cast::<u16>();
+    gpu.hetero_f32_to_bf16(&src, b16 as u64, n as i32).unwrap();
+    let f16s: Vec<u16> = vals.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let h16 = gpu.hip.host_malloc(n * 2, flags).unwrap().cast::<u16>();
+    // SAFETY: pinned buffers of n u16.
+    unsafe { std::ptr::copy_nonoverlapping(f16s.as_ptr(), h16, n) };
+    let back = gpu.alloc_tensor(&[n], DType::F32).unwrap();
+    gpu.hetero_f16_to_f32(h16 as u64, &back, n as i32).unwrap();
+    gpu.hip.device_synchronize().unwrap();
+    // SAFETY: as above.
+    let got16 = unsafe { std::slice::from_raw_parts(b16, n) }.to_vec();
+    for (k, &v) in vals.iter().enumerate() {
+        let want = bf16_rne(v);
+        let ok = if v.is_nan() { got16[k] & 0x7f80 == 0x7f80 && got16[k] & 0x7f != 0 } else { got16[k] == want };
+        if !ok {
+            fail("i", format!("bf16({v:e} = {:#010x}) = {:#06x}, want {want:#06x}", v.to_bits(), got16[k]));
+        }
+    }
+    let gotf = gpu.download_f32(&back).unwrap();
+    for (k, &h) in f16s.iter().enumerate() {
+        let want = f16_bits_to_f32(h);
+        if !(gotf[k].to_bits() == want.to_bits() || (want.is_nan() && gotf[k].is_nan())) {
+            fail("i", format!("f16 {h:#06x} -> {} want {want}", gotf[k]));
+        }
+    }
+    let _ = gpu.hip.host_free(b16.cast());
+    let _ = gpu.hip.host_free(h16.cast());
     let _ = gpu.hip.host_free(pb.cast());
     let _ = gpu.hip.host_free(base.cast());
     println!("PASS");

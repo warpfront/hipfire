@@ -89,49 +89,93 @@ pub fn seq_for(token: u32, layer: u32, layers: u32) -> u32 {
     }
 }
 
+/// Most sub-chunks one prefill chunk may be split into.
+pub const MAX_SUB_CHUNKS: usize = 8;
+
+/// Sub-chunks a full chunk is split into. Measured (R9700 + gfx1151, USB4,
+/// 2048 rows): 1 -> 21.6 ms per layer, 2 -> 16.1, 4 -> 15.4; 8 falls off the
+/// grouped-row floor below.
+pub const PREFILL_PIPELINE_SUB_CHUNKS: usize = 4;
+
+/// Smallest block the expert device's grouped prefill arm admits: below 512
+/// rows the QT44/QT53 route takes per-slot kernels (gfx1151: 5.6 ms at 32 rows,
+/// 11.7 ms at 511, 1.5 ms at 512), so no block is split below it.
+pub const MIN_SUB_CHUNK_ROWS: usize = 512;
+
 /// The one prefill slot (layers run sequentially, so one slot serves them
 /// all), placed after the decode slots in the same mailbox allocation.
+///
+/// A chunk is split into up to `sub_chunks` row blocks, each with its own
+/// request/response pair, so the primary's out-copy of block `i + 1`, the
+/// expert device's compute of block `i` and the copy back of block `i - 1`
+/// overlap. Rows travel as F16 and the partial as BF16 (the BF16 round-trip
+/// combine makes every partial element BF16-exact, so that leg is lossless).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrefillGeometry {
     pub max_rows: usize,
     pub top_k: usize,
     pub dim: usize,
+    pub sub_chunks: usize,
+}
+
+/// One sub-chunk's words: the request and response on their own lines, and
+/// the request's layer, first row and row count (three u32 the primary
+/// writes before the request word) on a third.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SubChunkWords {
+    pub req_seq: usize,
+    pub resp_seq: usize,
+    pub layer: usize,
+    pub row_off: usize,
+    pub rows: usize,
 }
 
 /// Byte offsets of the prefill slot fields from the mailbox base.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrefillOffsets {
-    pub req_seq: usize,
-    pub resp_seq: usize,
+    /// Shared by every sub-chunk: the first timed-out wait records its
+    /// sequence here, and the primary skips the whole chunk's add.
     pub error: usize,
-    /// Layer index and row count of the request (two u32 written by the
-    /// primary before the request word).
-    pub layer: usize,
-    pub rows: usize,
-    /// The chunk's normed rows, `rows x dim` f32 (the expert device runs its
+    /// `sub[..sub_chunks]` are live.
+    pub sub: [SubChunkWords; MAX_SUB_CHUNKS],
+    /// The chunk's normed rows, `rows x dim` F16 (the expert device runs its
     /// own input basis).
     pub x_norm: usize,
+    /// `rows x top_k` i32 route ids and F32 weights.
     pub ids: usize,
     pub weights: usize,
-    /// The expert device's weighted cold partial, `rows x dim` f32.
+    /// The expert device's weighted cold partial, `rows x dim` BF16.
     pub partial: usize,
 }
 
+const LINE: usize = 64;
+
 impl PrefillGeometry {
-    /// Local layout (from a 256-aligned start): words on lines 0, 1 and 2, the
-    /// layer/rows meta pair on line 3, then 256-aligned arrays; returns the
-    /// offsets and the slot's size.
+    fn check(&self) {
+        assert!(
+            (1..=MAX_SUB_CHUNKS).contains(&self.sub_chunks),
+            "prefill sub_chunks {} outside 1..={MAX_SUB_CHUNKS}",
+            self.sub_chunks
+        );
+    }
+
+    /// Local layout (from a 256-aligned start): the error word on line 0, each
+    /// sub-chunk's request, response and meta on three lines, then 256-aligned
+    /// arrays; returns the offsets and the slot's size.
     fn local(&self) -> (PrefillOffsets, usize) {
+        self.check();
+        let mut sub = [SubChunkWords::default(); MAX_SUB_CHUNKS];
+        for (i, w) in sub.iter_mut().enumerate().take(self.sub_chunks) {
+            let b = LINE * (1 + 3 * i);
+            *w = SubChunkWords { req_seq: b, resp_seq: b + LINE, layer: b + 2 * LINE, row_off: b + 2 * LINE + 4, rows: b + 2 * LINE + 8 };
+        }
         let slots = self.max_rows * self.top_k;
-        let x_norm = ARRAY_ALIGN;
-        let ids = align(x_norm + self.max_rows * self.dim * 4);
+        let x_norm = align(LINE * (1 + 3 * self.sub_chunks));
+        let ids = align(x_norm + self.max_rows * self.dim * 2);
         let weights = align(ids + slots * 4);
         let partial = align(weights + slots * 4);
-        let end = align(partial + self.max_rows * self.dim * 4);
-        (
-            PrefillOffsets { req_seq: 0, resp_seq: 64, error: 128, layer: 192, rows: 196, x_norm, ids, weights, partial },
-            end,
-        )
+        let end = align(partial + self.max_rows * self.dim * 2);
+        (PrefillOffsets { error: 0, sub, x_norm, ids, weights, partial }, end)
     }
 
     /// Offsets from the mailbox base when the slot starts at (or after)
@@ -139,12 +183,19 @@ impl PrefillGeometry {
     pub fn offsets(&self, base: usize) -> PrefillOffsets {
         let b = align(base);
         let (o, _) = self.local();
+        let mut sub = o.sub;
+        for w in sub.iter_mut().take(self.sub_chunks) {
+            *w = SubChunkWords {
+                req_seq: b + w.req_seq,
+                resp_seq: b + w.resp_seq,
+                layer: b + w.layer,
+                row_off: b + w.row_off,
+                rows: b + w.rows,
+            };
+        }
         PrefillOffsets {
-            req_seq: b + o.req_seq,
-            resp_seq: b + o.resp_seq,
             error: b + o.error,
-            layer: b + o.layer,
-            rows: b + o.rows,
+            sub,
             x_norm: b + o.x_norm,
             ids: b + o.ids,
             weights: b + o.weights,
@@ -156,28 +207,46 @@ impl PrefillGeometry {
     pub fn bytes(&self) -> usize {
         self.local().1
     }
+
+    /// How many sub-chunks a `rows`-row chunk uses: at most
+    /// [`PREFILL_PIPELINE_SUB_CHUNKS`] (and the slot's count), never a block
+    /// below [`MIN_SUB_CHUNK_ROWS`] unless the whole chunk is.
+    pub fn sub_chunks_for(&self, rows: usize) -> usize {
+        self.check();
+        (rows / MIN_SUB_CHUNK_ROWS).clamp(1, PREFILL_PIPELINE_SUB_CHUNKS.min(self.sub_chunks))
+    }
+
+    /// `(first row, rows)` of sub-chunk `i` of a `rows`-row chunk: near-equal
+    /// blocks, the larger ones first; trailing blocks may be empty (no request).
+    pub fn sub_range(&self, rows: usize, i: usize) -> (usize, usize) {
+        self.check();
+        let (q, r) = (rows / self.sub_chunks, rows % self.sub_chunks);
+        let n = q + usize::from(i < r);
+        let off = i * q + i.min(r);
+        (off, n)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const P: PrefillGeometry = PrefillGeometry { max_rows: 2048, top_k: 10, dim: 2560 };
+    const P: PrefillGeometry = PrefillGeometry { max_rows: 2048, top_k: 10, dim: 2560, sub_chunks: 4 };
 
     fn prefill_ranges(base: usize) -> Vec<(usize, usize)> {
         let o = P.offsets(base);
         let slots = P.max_rows * P.top_k;
-        vec![
-            (o.req_seq, 4),
-            (o.resp_seq, 4),
-            (o.error, 4),
-            (o.layer, 4),
-            (o.rows, 4),
-            (o.x_norm, P.max_rows * P.dim * 4),
+        let mut v = vec![(o.error, 4)];
+        for s in &o.sub[..P.sub_chunks] {
+            v.extend([(s.req_seq, 4), (s.resp_seq, 4), (s.layer, 4), (s.row_off, 4), (s.rows, 4)]);
+        }
+        v.extend([
+            (o.x_norm, P.max_rows * P.dim * 2),
             (o.ids, slots * 4),
             (o.weights, slots * 4),
-            (o.partial, P.max_rows * P.dim * 4),
-        ]
+            (o.partial, P.max_rows * P.dim * 2),
+        ]);
+        v
     }
 
     #[test]
@@ -185,7 +254,7 @@ mod tests {
         let base = G.total_bytes();
         let mut all: Vec<(usize, usize)> = (0..G.layers).flat_map(|l| ranges(&G, l)).collect();
         let pre = prefill_ranges(base);
-        for &(off, _) in &pre[5..] {
+        for &(off, _) in &pre[pre.len() - 4..] {
             assert_eq!(off % 256, 0);
         }
         assert!(pre.iter().all(|&(o, _)| o >= base), "prefill slot overlaps the decode slots");
@@ -199,19 +268,68 @@ mod tests {
     #[test]
     fn prefill_words_have_their_own_cache_lines() {
         let o = P.offsets(0);
-        let lines = [o.req_seq / 64, o.resp_seq / 64, o.error / 64, o.layer / 64];
-        for i in 0..lines.len() {
-            for j in i + 1..lines.len() {
-                assert_ne!(lines[i], lines[j]);
-            }
+        let mut lines = vec![o.error / 64];
+        for s in &o.sub[..P.sub_chunks] {
+            lines.extend([s.req_seq / 64, s.resp_seq / 64, s.layer / 64]);
+            assert_eq!(s.row_off / 64, s.layer / 64, "the primary-written meta shares one line");
+            assert_eq!(s.rows / 64, s.layer / 64, "the primary-written meta shares one line");
         }
-        assert_eq!(o.rows / 64, o.layer / 64, "layer and rows share the primary-written meta line");
+        let mut sorted = lines.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), lines.len(), "two words share a line: {lines:?}");
+        for &(off, _) in &prefill_ranges(0)[prefill_ranges(0).len() - 4..] {
+            assert!(!lines.contains(&(off / 64)), "an array shares a word's line");
+        }
     }
 
     #[test]
-    fn prefill_bytes_cover_the_partial() {
+    fn prefill_bytes_cover_the_bf16_partial() {
         let o = P.offsets(0);
-        assert!(P.bytes() >= o.partial + P.max_rows * P.dim * 4);
+        assert!(P.bytes() >= o.partial + P.max_rows * P.dim * 2);
+    }
+
+    #[test]
+    fn sub_chunks_tile_the_rows_in_order() {
+        for rows in [1usize, 3, 4, 37, 511, 512, 2000, 2048] {
+            let mut next = 0;
+            for i in 0..P.sub_chunks {
+                let (off, n) = P.sub_range(rows, i);
+                if n == 0 {
+                    continue;
+                }
+                assert_eq!(off, next, "rows {rows} sub {i}");
+                next += n;
+            }
+            assert_eq!(next, rows, "rows {rows} not covered");
+            // Leading sub-chunks are the larger ones (the expert device starts sooner on the first).
+            let sizes: Vec<usize> = (0..P.sub_chunks).map(|i| P.sub_range(rows, i).1).collect();
+            assert!(sizes.windows(2).all(|w| w[0] >= w[1]), "rows {rows}: {sizes:?}");
+        }
+    }
+
+    #[test]
+    fn sub_chunks_never_drop_below_the_grouped_row_floor() {
+        let g = PrefillGeometry { sub_chunks: MAX_SUB_CHUNKS, ..P };
+        for rows in [1usize, 37, 511, 512, 1023, 1024, 1525, 2047, 2048] {
+            let s = g.sub_chunks_for(rows);
+            assert!((1..=PREFILL_PIPELINE_SUB_CHUNKS).contains(&s), "rows {rows}: {s}");
+            let split = PrefillGeometry { sub_chunks: s, ..g };
+            let smallest = (0..s).map(|i| split.sub_range(rows, i).1).min().unwrap();
+            // Every block keeps the grouped arm unless the whole chunk is below it.
+            assert!(smallest >= MIN_SUB_CHUNK_ROWS || s == 1, "rows {rows}: {s} blocks, smallest {smallest}");
+        }
+        assert_eq!(g.sub_chunks_for(2048), PREFILL_PIPELINE_SUB_CHUNKS);
+        assert_eq!(g.sub_chunks_for(1024), 2);
+        assert_eq!(g.sub_chunks_for(1023), 1);
+        assert_eq!(PrefillGeometry { sub_chunks: 2, ..P }.sub_chunks_for(2048), 2, "never above the slot's count");
+    }
+
+    #[test]
+    fn sub_chunk_count_is_bounded() {
+        assert!(PrefillGeometry { sub_chunks: MAX_SUB_CHUNKS, ..P }.bytes() > 0);
+        assert!(std::panic::catch_unwind(|| PrefillGeometry { sub_chunks: MAX_SUB_CHUNKS + 1, ..P }.bytes()).is_err());
+        assert!(std::panic::catch_unwind(|| PrefillGeometry { sub_chunks: 0, ..P }.bytes()).is_err());
     }
 
     const G: MailboxGeometry = MailboxGeometry { layers: 48, max_rows: 1, top_k: 10, dim: 2560 };

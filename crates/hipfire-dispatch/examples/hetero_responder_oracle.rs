@@ -22,7 +22,7 @@ use hipfire_dispatch::cpu_exec::CpuMoeExpert;
 use hipfire_dispatch::families::moe::{
     MoeRecipe, MoeRouteCapability, MoeRouteFormats, MoeRouteGeometry, MoeRoutePolicy,
 };
-use hipfire_dispatch::hetero_mailbox::{MailboxGeometry, PrefillGeometry};
+use hipfire_dispatch::hetero_mailbox::{MailboxGeometry, PrefillGeometry, MAX_SUB_CHUNKS};
 use hipfire_dispatch::hetero_prefill::{
     run_cold_prefill, ColdPrefillConfig, ColdPrefillIo, ColdPrefillLayer, ColdPrefillScratch,
 };
@@ -83,6 +83,23 @@ fn upload_bytes(gpu: &mut Gpu, b: &[u8]) -> GpuTensor {
 fn fail(msg: String) -> ! {
     println!("FAIL: {msg}");
     std::process::exit(1);
+}
+
+/// f32 -> IEEE half bits, round-to-nearest-even, normal range (the device cast).
+fn f32_to_f16_bits(v: f32) -> u16 {
+    let u = v.to_bits();
+    let sign = ((u >> 16) & 0x8000) as u16;
+    let e = ((u >> 23) & 0xff) as i32 - 127 + 15;
+    let man = u & 0x7f_ffff;
+    if e <= 0 {
+        return sign;
+    }
+    let mut r = ((e as u32) << 10) | (man >> 13);
+    let rem = man & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && r & 1 == 1) {
+        r += 1;
+    }
+    sign | r as u16
 }
 
 fn main() {
@@ -151,9 +168,10 @@ fn main() {
 
     // Responder over a 2-layer mailbox.
     let geom = MailboxGeometry { layers: LAYERS, max_rows: 1, top_k: TOP_K, dim: DIM };
-    let pgeom = PrefillGeometry { max_rows: PREFILL_ROWS, top_k: TOP_K, dim: DIM };
+    // The slot carries MAX_SUB_CHUNKS sub-chunks; a chunk may use fewer.
+    let pgeom = PrefillGeometry { max_rows: PREFILL_ROWS, top_k: TOP_K, dim: DIM, sub_chunks: MAX_SUB_CHUNKS };
     let po = pgeom.offsets(geom.total_bytes());
-    let mb = pinned(&r, po.req_seq + pgeom.bytes(), true);
+    let mb = pinned(&r, po.error + pgeom.bytes(), true);
     let layer = ColdLayer { gate_up: gate_up.clone(), down: down.clone(), cold_bitmap: bitmap.clone() };
     let cold_cfg = ColdPrefillConfig {
         dim: DIM,
@@ -189,7 +207,7 @@ fn main() {
         mailbox_base: mb as u64,
         n_experts: N_EXP,
         mi: MI,
-        prefill: Some(PrefillServe { offsets: po, cold: cold_cfg }),
+        prefill: Some(PrefillServe { offsets: po, sub_chunks: MAX_SUB_CHUNKS, cold: cold_cfg }),
     };
     let responder = HeteroResponder::start(cfg, vec![layer.clone(); LAYERS]).unwrap_or_else(|e| fail(format!("start: {e:?}")));
 
@@ -256,20 +274,11 @@ fn main() {
     let mut strix = Gpu::init_with_device(1).expect("gfx1151");
     let ref_layer = ColdPrefillLayer::new(&mut strix, cold_cfg, &layer).unwrap_or_else(|e| fail(format!("ref layer: {e:?}")));
     let ref_scratch = ColdPrefillScratch::new(&mut strix, cold_cfg).unwrap_or_else(|e| fail(format!("ref scratch: {e:?}")));
-    let ref_x = pinned(&r, PREFILL_ROWS * DIM * 4, true).cast::<f32>();
+    let ref_x = pinned(&r, PREFILL_ROWS * DIM * 2, true).cast::<u16>();
     let ref_ids = pinned(&r, PREFILL_ROWS * TOP_K * 4, true).cast::<i32>();
     let ref_w = pinned(&r, PREFILL_ROWS * TOP_K * 4, true).cast::<f32>();
-    let ref_part = pinned(&r, PREFILL_ROWS * DIM * 4, true).cast::<f32>();
+    let ref_part = pinned(&r, PREFILL_ROWS * DIM * 2, true).cast::<u16>();
     let b = mb as u64;
-    let pslot = HeteroSlotPtrs {
-        req_seq: b + po.req_seq as u64,
-        resp_seq: b + po.resp_seq as u64,
-        error: b + po.error as u64,
-        x_rot: b + po.x_norm as u64,
-        ids: b + po.ids as u64,
-        weights: b + po.weights as u64,
-        cold_out: b + po.partial as u64,
-    };
     let chunk = |rows: usize| {
         let ids: Vec<i32> = (0..rows * TOP_K).map(|s| ids[(s + s / TOP_K) % TOP_K]).collect();
         let w: Vec<f32> = (0..rows * TOP_K).map(|s| 0.05 + 0.01 * ((s * 7) % 11) as f32).collect();
@@ -278,31 +287,97 @@ fn main() {
     };
     let p_bm = upload_bytes(&mut r, &bitmap);
     let p_masked = r.alloc_tensor(&[PREFILL_ROWS * TOP_K], DType::F32).unwrap();
-    let prefill_round = |r: &mut Gpu, l: u32, rows: usize, x: &GpuTensor, ids: &GpuTensor, w: &GpuTensor, xb: &GpuTensor| {
-        r.hetero_token_advance(&counter).unwrap();
-        r.hetero_publish_rows(x, ids, w, &p_bm, N_EXP as i32, rows as i32, TOP_K as i32, DIM as i32, &pslot, &p_masked)
-            .unwrap();
-        r.hetero_release_rows(&counter, l, LAYERS as u32, rows as i32, b + po.layer as u64, b + po.rows as u64, pslot.req_seq)
-            .unwrap();
-        r.hetero_await_cold(&counter, l, LAYERS as u32, &pslot, 50_000_000).unwrap();
-        r.hetero_add_partial(pslot.error, pslot.cold_out, (rows * DIM) as i32, xb).unwrap();
+    let x_f16 = r.alloc_tensor(&[PREFILL_ROWS * DIM / 2], DType::F32).unwrap();
+    let part_local = r.alloc_tensor(&[PREFILL_ROWS * DIM / 2], DType::F32).unwrap();
+    // SAFETY: views of the pinned prefill slot.
+    let (mb_x, mb_part) = unsafe {
+        (
+            hip_bridge::DeviceBuffer::from_raw((b + po.x_norm as u64) as *mut std::ffi::c_void, PREFILL_ROWS * DIM * 2),
+            hip_bridge::DeviceBuffer::from_raw((b + po.partial as u64) as *mut std::ffi::c_void, PREFILL_ROWS * DIM * 2),
+        )
     };
-    for (l, rows) in [(0u32, PREFILL_ROWS), (1, 37)] {
+    // Three R9700 streams: main (publish, add), out (copy engine + release
+    // per sub-chunk), back (bounded await + copy engine per sub-chunk).
+    let mut streams = [
+        Some(r.hip.stream_create_non_blocking().unwrap()),
+        Some(r.hip.stream_create_non_blocking().unwrap()),
+        Some(r.hip.stream_create_non_blocking().unwrap()),
+    ];
+    let (published, returned) = (r.hip.event_create().unwrap(), r.hip.event_create().unwrap());
+    let main_stream = r.active_stream.take();
+    // Launch `f` with stream `k` active.
+    fn on<T>(r: &mut Gpu, streams: &mut [Option<hip_bridge::Stream>; 3], k: usize, f: impl FnOnce(&mut Gpu) -> T) -> T {
+        r.active_stream = streams[k].take();
+        let out = f(r);
+        streams[k] = r.active_stream.take();
+        out
+    }
+    let prefill_round = |r: &mut Gpu, streams: &mut [Option<hip_bridge::Stream>; 3], l: u32, rows: usize, subs: usize, x: &GpuTensor, ids: &GpuTensor, w: &GpuTensor, xb: &GpuTensor| {
+        let split = PrefillGeometry { sub_chunks: subs, ..pgeom };
+        on(r, streams, 0, |r| {
+            r.hetero_token_advance(&counter).unwrap();
+            r.hetero_publish_rows(x, ids, w, &p_bm, N_EXP as i32, rows as i32, TOP_K as i32, DIM as i32, &x_f16, b + po.ids as u64, b + po.weights as u64, &p_masked)
+                .unwrap();
+            r.hip.event_record(&published, r.active_stream.as_ref()).unwrap();
+        });
+        on(r, streams, 1, |r| {
+            r.hip.stream_wait_event_on(r.active_stream.as_ref(), &published).unwrap();
+            for i in 0..subs {
+                let (off, n) = split.sub_range(rows, i);
+                if n == 0 {
+                    continue;
+                }
+                let st = r.active_stream.as_ref().unwrap();
+                r.hip.memcpy_dtod_async_at(&mb_x, off * DIM * 2, &x_f16.buf, off * DIM * 2, n * DIM * 2, st).unwrap();
+                let wd = po.sub[i];
+                r.hetero_release_rows(&counter, l, LAYERS as u32, off as i32, n as i32, b + wd.layer as u64, b + wd.req_seq as u64).unwrap();
+            }
+        });
+        on(r, streams, 2, |r| {
+            // The counter is read by the awaits: order them after the advance.
+            r.hip.stream_wait_event_on(r.active_stream.as_ref(), &published).unwrap();
+            for i in 0..subs {
+                let (off, n) = split.sub_range(rows, i);
+                if n == 0 {
+                    continue;
+                }
+                let wd = po.sub[i];
+                let slot = HeteroSlotPtrs { req_seq: b + wd.req_seq as u64, resp_seq: b + wd.resp_seq as u64, error: b + po.error as u64, x_rot: 0, ids: 0, weights: 0, cold_out: 0 };
+                r.hetero_await_cold(&counter, l, LAYERS as u32, &slot, 50_000_000).unwrap();
+                let st = r.active_stream.as_ref().unwrap();
+                r.hip.memcpy_dtod_async_at(&part_local.buf, off * DIM * 2, &mb_part, off * DIM * 2, n * DIM * 2, st).unwrap();
+            }
+            r.hip.event_record(&returned, r.active_stream.as_ref()).unwrap();
+        });
+        on(r, streams, 0, |r| {
+            r.hip.stream_wait_event_on(r.active_stream.as_ref(), &returned).unwrap();
+            r.hetero_add_partial(b + po.error as u64, &part_local, (rows * DIM) as i32, xb).unwrap();
+        });
+    };
+    let sync_all = |r: &mut Gpu, streams: &[Option<hip_bridge::Stream>; 3]| {
+        for st in streams.iter().flatten() {
+            r.hip.stream_synchronize(st).unwrap();
+        }
+    };
+    let error_word = || unsafe { *((b + po.error as u64) as *const u32) };
+    for (l, rows, subs) in [(0u32, PREFILL_ROWS, 4usize), (1, 37, 4), (0, 2000, 1), (1, 5, 8)] {
         let (ids_v, w_v, x_v) = chunk(rows);
         let x_t = r.upload_f32(&x_v, &[rows, DIM]).unwrap();
         let ids_t = upload_bytes(&mut r, &ids_v.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<u8>>());
         let w_t = r.upload_f32(&w_v, &[rows * TOP_K]).unwrap();
         let xb = r.upload_f32(&vec![0.0; rows * DIM], &[rows * DIM]).unwrap();
-        prefill_round(&mut r, l, rows, &x_t, &ids_t, &w_t, &xb);
         r.hip.device_synchronize().unwrap();
-        // SAFETY: the prefill slot's error word.
-        if unsafe { *(pslot.error as *const u32) } != 0 {
+        prefill_round(&mut r, &mut streams, l, rows, subs, &x_t, &ids_t, &w_t, &xb);
+        sync_all(&mut r, &streams);
+        if error_word() != 0 {
             fail(format!("prefill await timed out (responder: {:?})", responder.failure()));
         }
         let got = r.download_f32(&xb).unwrap();
+        // The reference: the same F16 rows, one direct call over all rows.
+        let x16: Vec<u16> = x_v.iter().map(|&v| f32_to_f16_bits(v)).collect();
         // SAFETY: private pinned reference buffers sized for PREFILL_ROWS.
         unsafe {
-            std::ptr::copy_nonoverlapping(x_v.as_ptr(), ref_x, x_v.len());
+            std::ptr::copy_nonoverlapping(x16.as_ptr(), ref_x, x16.len());
             std::ptr::copy_nonoverlapping(ids_v.as_ptr(), ref_ids, ids_v.len());
             std::ptr::copy_nonoverlapping(w_v.as_ptr(), ref_w, w_v.len());
         }
@@ -310,61 +385,93 @@ fn main() {
         run_cold_prefill(&mut strix, &ref_layer, &ref_scratch, rows, io).unwrap_or_else(|e| fail(format!("ref run: {e:?}")));
         strix.hip.device_synchronize().unwrap();
         // SAFETY: as above.
-        let want = unsafe { std::slice::from_raw_parts(ref_part, rows * DIM) };
-        if let Some(i) = (0..rows * DIM).find(|&i| got[i].to_bits() != want[i].to_bits()) {
-            fail(format!("prefill layer {l} rows {rows}: element {i}: {} != {}", got[i], want[i]));
-        }
+        let want: Vec<f32> = unsafe { std::slice::from_raw_parts(ref_part, rows * DIM) }
+            .iter()
+            .map(|&h| f32::from_bits((h as u32) << 16))
+            .collect();
         if want.iter().all(|v| *v == 0.0) {
             fail(format!("prefill layer {l} rows {rows}: vacuous (all-zero partial)"));
         }
-        println!("prefill layer {l}, {rows} rows: x_batch += partial bitwise == direct run_cold_prefill");
+        // Sub-chunked blocks run the grouped program per block, so the
+        // reference over all rows matches only where per-row results do not
+        // depend on the block (they should not: rows are independent).
+        if let Some(i) = (0..rows * DIM).find(|&i| got[i].to_bits() != want[i].to_bits()) {
+            fail(format!("prefill layer {l} rows {rows} subs {subs}: element {i}: {} != {}", got[i], want[i]));
+        }
+        println!("prefill layer {l}, {rows} rows, {subs} sub-chunks: x_batch += partial bitwise == direct run_cold_prefill");
     }
+    // Timing: 2,048-row layers, one per round, by sub-chunk count.
     let (ids_v, w_v, x_v) = chunk(PREFILL_ROWS);
     let x_t = r.upload_f32(&x_v, &[PREFILL_ROWS, DIM]).unwrap();
     let ids_t = upload_bytes(&mut r, &ids_v.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<u8>>());
     let w_t = r.upload_f32(&w_v, &[PREFILL_ROWS * TOP_K]).unwrap();
     let xb = r.upload_f32(&vec![0.0; PREFILL_ROWS * DIM], &[PREFILL_ROWS * DIM]).unwrap();
     let rounds = 48;
-    let t = Instant::now();
-    for i in 0..rounds {
-        prefill_round(&mut r, (i % LAYERS) as u32, PREFILL_ROWS, &x_t, &ids_t, &w_t, &xb);
+    for subs in [1usize, 2, 4, 8] {
+        r.hip.device_synchronize().unwrap();
+        let t = Instant::now();
+        for i in 0..rounds {
+            prefill_round(&mut r, &mut streams, (i % LAYERS) as u32, PREFILL_ROWS, subs, &x_t, &ids_t, &w_t, &xb);
+        }
+        sync_all(&mut r, &streams);
+        let ms = t.elapsed().as_secs_f64() * 1e3 / rounds as f64;
+        if error_word() != 0 {
+            fail(format!("timed prefill hit a timeout (responder: {:?})", responder.failure()));
+        }
+        println!(
+            "prefill: {PREFILL_ROWS}-row layer, {subs} sub-chunks: {ms:.2} ms -> {:.0} rows/s over 48 layers",
+            PREFILL_ROWS as f64 / (ms * 48.0 / 1e3)
+        );
     }
-    r.hip.device_synchronize().unwrap();
-    let ms = t.elapsed().as_secs_f64() * 1e3 / rounds as f64;
-    // SAFETY: the prefill slot's error word.
-    if unsafe { *(pslot.error as *const u32) } != 0 {
-        fail(format!("timed prefill hit a timeout (responder: {:?})", responder.failure()));
-    }
-    println!(
-        "prefill: {PREFILL_ROWS}-row layer round trip {ms:.2} ms ({} cold of {} slots) -> {:.0} rows/s over 48 layers",
-        ids_v.iter().filter(|&&e| bitmap[e as usize] != 0).count(),
-        ids_v.len(),
-        PREFILL_ROWS as f64 / (ms * 48.0 / 1e3)
-    );
-    // Phase split: the link legs alone (no release, so the responder idles;
-    // the add reads the last partial with the error word clear).
-    let time = |r: &mut Gpu, f: &mut dyn FnMut(&mut Gpu)| {
+    // The link legs alone, by copy engine (10.5 MB each way).
+    let time_copy = |r: &mut Gpu, dst: &hip_bridge::DeviceBuffer, src: &hip_bridge::DeviceBuffer| {
         r.hip.device_synchronize().unwrap();
         let t = Instant::now();
         for _ in 0..rounds {
-            f(r);
+            r.hip.memcpy_dtod_async_default_at(dst, 0, src, 0, PREFILL_ROWS * DIM * 2).unwrap();
         }
         r.hip.device_synchronize().unwrap();
         t.elapsed().as_secs_f64() * 1e3 / rounds as f64
     };
-    let publish_ms = time(&mut r, &mut |r| {
-        r.hetero_publish_rows(&x_t, &ids_t, &w_t, &p_bm, N_EXP as i32, PREFILL_ROWS as i32, TOP_K as i32, DIM as i32, &pslot, &p_masked)
-            .unwrap()
-    });
-    let add_ms = time(&mut r, &mut |r| {
-        r.hetero_add_partial(pslot.error, pslot.cold_out, (PREFILL_ROWS * DIM) as i32, &xb).unwrap()
-    });
-    let mb = (PREFILL_ROWS * DIM * 4) as f64 / 1e6;
+    let out_ms = time_copy(&mut r, &mb_x, &x_f16.buf);
+    let back_ms = time_copy(&mut r, &part_local.buf, &mb_part);
+    let mbytes = (PREFILL_ROWS * DIM * 2) as f64 / 1e6;
     println!(
-        "prefill link legs ({mb:.0} MB each): publish {publish_ms:.2} ms ({:.2} GB/s), add-partial {add_ms:.2} ms ({:.2} GB/s)",
-        mb / publish_ms,
-        mb / add_ms
+        "prefill link legs ({mbytes:.1} MB each, copy engine): out {out_ms:.2} ms ({:.2} GB/s), back {back_ms:.2} ms ({:.2} GB/s)",
+        mbytes / out_ms,
+        mbytes / back_ms
     );
+    // Full duplex? Both legs at once on two streams.
+    r.hip.device_synchronize().unwrap();
+    let t = Instant::now();
+    for _ in 0..rounds {
+        let (s1, s2) = (streams[1].as_ref().unwrap(), streams[2].as_ref().unwrap());
+        r.hip.memcpy_dtod_async_at(&mb_x, 0, &x_f16.buf, 0, PREFILL_ROWS * DIM * 2, s1).unwrap();
+        r.hip.memcpy_dtod_async_at(&part_local.buf, 0, &mb_part, 0, PREFILL_ROWS * DIM * 2, s2).unwrap();
+    }
+    sync_all(&mut r, &streams);
+    let both_ms = t.elapsed().as_secs_f64() * 1e3 / rounds as f64;
+    println!("prefill link legs concurrently: {both_ms:.2} ms (serial sum {:.2} ms)", out_ms + back_ms);
+    // Strix compute alone per block size (direct calls on the second context).
+    for rows in [32usize, 64, 128, 192, 255, 256, 257, 320, 384, 448, 511, 512, 1024, 2048] {
+        let io = ColdPrefillIo { x_norm: ref_x as u64, ids: ref_ids as u64, weights: ref_w as u64, partial: ref_part as u64 };
+        // SAFETY: reference buffers sized for PREFILL_ROWS.
+        unsafe {
+            let x16: Vec<u16> = x_v.iter().map(|&v| f32_to_f16_bits(v)).collect();
+            std::ptr::copy_nonoverlapping(x16.as_ptr(), ref_x, x16.len());
+            std::ptr::copy_nonoverlapping(ids_v.as_ptr(), ref_ids, ids_v.len());
+            std::ptr::copy_nonoverlapping(w_v.as_ptr(), ref_w, w_v.len());
+        }
+        run_cold_prefill(&mut strix, &ref_layer, &ref_scratch, rows, io).unwrap();
+        strix.hip.device_synchronize().unwrap();
+        let t = Instant::now();
+        for _ in 0..10 {
+            run_cold_prefill(&mut strix, &ref_layer, &ref_scratch, rows, io).unwrap();
+            strix.hip.device_synchronize().unwrap();
+        }
+        println!("strix compute, {rows} rows: {:.2} ms", t.elapsed().as_secs_f64() * 1e3 / 10.0);
+    }
+    r.active_stream = main_stream;
     let _ = decode_answered;
     println!(
         "PASS: cold rows bitwise == IgpuColdArm ({} cold slots); round trip incl. cold compute {us:.1} us over {n} rounds; answered {}",

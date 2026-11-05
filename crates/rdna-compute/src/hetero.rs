@@ -203,12 +203,13 @@ impl Gpu {
         })
     }
 
-    /// Prefill: copy a chunk's rotated rows and routing into the prefill slot
-    /// (`slot.x_rot/ids/weights`) and write the primary's masked ids (cold -1).
+    /// Prefill: convert a chunk's normed rows to F16 in `x_f16` (local staging
+    /// for the copy across the link), write the route into the prefill slot at
+    /// `mb_ids` / `mb_w`, and the primary's masked ids (cold -1).
     #[allow(clippy::too_many_arguments)]
     pub fn hetero_publish_rows(
         &mut self,
-        x_rot: &GpuTensor,
+        x_norm: &GpuTensor,
         ids: &GpuTensor,
         weights: &GpuTensor,
         cold_bitmap: &GpuTensor,
@@ -216,19 +217,22 @@ impl Gpu {
         rows: i32,
         top_k: i32,
         dim: i32,
-        slot: &HeteroSlotPtrs,
+        x_f16: &GpuTensor,
+        mb_ids: u64,
+        mb_w: u64,
         masked_ids: &GpuTensor,
     ) -> HipResult<()> {
-        let (x, i, w, bm, m) = (
-            x_rot.buf.as_ptr(),
+        let (x, i, w, bm, xf, m) = (
+            x_norm.buf.as_ptr(),
             ids.buf.as_ptr(),
             weights.buf.as_ptr(),
             cold_bitmap.buf.as_ptr(),
+            x_f16.buf.as_ptr(),
             masked_ids.buf.as_ptr(),
         );
-        let (mx, mi, mw) = (slot.x_rot as *mut c_void, slot.ids as *mut c_void, slot.weights as *mut c_void);
+        let (mi, mw) = (mb_ids as *mut c_void, mb_w as *mut c_void);
         let mut params = vec![
-            p(&x), p(&i), p(&w), p(&bm), p(&n_experts), p(&rows), p(&top_k), p(&dim), p(&mx), p(&mi), p(&mw), p(&m),
+            p(&x), p(&i), p(&w), p(&bm), p(&n_experts), p(&rows), p(&top_k), p(&dim), p(&xf), p(&mi), p(&mw), p(&m),
         ];
         let grid = ((rows.max(1) as u32 * dim as u32).div_ceil(256)).clamp(1, 1024);
         self.hetero_launch("hetero_publish_rows", grid, 256, &mut params, || {
@@ -241,7 +245,7 @@ impl Gpu {
             b.push_i32(rows);
             b.push_i32(top_k);
             b.push_i32(dim);
-            b.push_ptr(mx);
+            b.push_ptr(xf);
             b.push_ptr(mi);
             b.push_ptr(mw);
             b.push_ptr(m);
@@ -249,38 +253,40 @@ impl Gpu {
         })
     }
 
-    /// Prefill, after `hetero_publish_rows`: record the layer and row count,
-    /// then release the request sequence.
+    /// Prefill, one sub-chunk, after its rows were copied: write the layer,
+    /// first row and row count at `meta` (three u32), then release `req_seq`.
     #[allow(clippy::too_many_arguments)]
     pub fn hetero_release_rows(
         &mut self,
         counter: &GpuTensor,
         layer: u32,
         layers: u32,
+        row_off: i32,
         rows: i32,
-        mb_layer: u64,
-        mb_rows: u64,
+        meta: u64,
         req_seq: u64,
     ) -> HipResult<()> {
         let c = counter.buf.as_ptr();
-        let (ml, mr, rq) = (mb_layer as *mut c_void, mb_rows as *mut c_void, req_seq as *mut c_void);
-        let mut params = vec![p(&c), p(&layer), p(&layers), p(&rows), p(&ml), p(&mr), p(&rq)];
+        let (me, rq) = (meta as *mut c_void, req_seq as *mut c_void);
+        let mut params = vec![p(&c), p(&layer), p(&layers), p(&row_off), p(&rows), p(&me), p(&rq)];
         self.hetero_launch("hetero_release_rows", 1, 1, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(c);
             b.push_u32(layer);
             b.push_u32(layers);
+            b.push_i32(row_off);
             b.push_i32(rows);
-            b.push_ptr(ml);
-            b.push_ptr(mr);
+            b.push_ptr(me);
             b.push_ptr(rq);
             b
         })
     }
 
-    /// Prefill: `x_batch[0..n] += partial[0..n]`, skipped after a timed-out wait.
-    pub fn hetero_add_partial(&mut self, error: u64, partial: u64, n: i32, x_batch: &GpuTensor) -> HipResult<()> {
-        let (er, pa, xb) = (error as *mut c_void, partial as *mut c_void, x_batch.buf.as_ptr());
+    /// Prefill: `x_batch[0..n] += bf16(partial[0..n])` from the primary's local
+    /// copy of the partial, skipped after any timed-out wait (`error`).
+    pub fn hetero_add_partial(&mut self, error: u64, partial: &GpuTensor, n: i32, x_batch: &GpuTensor) -> HipResult<()> {
+        let er = error as *mut c_void;
+        let (pa, xb) = (partial.buf.as_ptr(), x_batch.buf.as_ptr());
         let mut params = vec![p(&er), p(&pa), p(&n), p(&xb)];
         let grid = (n.max(1) as u32).div_ceil(256).clamp(1, 1024);
         self.hetero_launch("hetero_add_partial", grid, 256, &mut params, || {
@@ -289,6 +295,34 @@ impl Gpu {
             b.push_ptr(pa);
             b.push_i32(n);
             b.push_ptr(xb);
+            b
+        })
+    }
+
+    /// Expert device: `dst[0..n] = f32(src[0..n])`, `src` F16 at a device address.
+    pub fn hetero_f16_to_f32(&mut self, src: u64, dst: &GpuTensor, n: i32) -> HipResult<()> {
+        let (sr, d) = (src as *mut c_void, dst.buf.as_ptr());
+        let mut params = vec![p(&sr), p(&d), p(&n)];
+        let grid = (n.max(1) as u32).div_ceil(256).clamp(1, 1024);
+        self.hetero_launch("hetero_f16_to_f32", grid, 256, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(sr);
+            b.push_ptr(d);
+            b.push_i32(n);
+            b
+        })
+    }
+
+    /// Expert device: `dst[0..n] = bf16_rne(src[0..n])`, `dst` at a device address.
+    pub fn hetero_f32_to_bf16(&mut self, src: &GpuTensor, dst: u64, n: i32) -> HipResult<()> {
+        let (sr, d) = (src.buf.as_ptr(), dst as *mut c_void);
+        let mut params = vec![p(&sr), p(&d), p(&n)];
+        let grid = (n.max(1) as u32).div_ceil(256).clamp(1, 1024);
+        self.hetero_launch("hetero_f32_to_bf16", grid, 256, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(sr);
+            b.push_ptr(d);
+            b.push_i32(n);
             b
         })
     }
