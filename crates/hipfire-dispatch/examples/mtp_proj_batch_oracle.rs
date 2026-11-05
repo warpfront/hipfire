@@ -44,9 +44,8 @@
 //! scratch row views swapped; (3) candidate lane 1 position (and lengths) off by one.
 //!
 //! ```text
-//! CARGO_TARGET_DIR=/home/kaden/qcal/release-0.4.5/d1proj/target \
-//!   /home/kaden/qcal/locks/build-slot.sh cargo run --release -p hipfire-dispatch \
-//!   --example mtp_proj_batch_oracle -j 8 -- [--out DIR] [--wide-selected-proj]
+//! cargo run --release -p hipfire-dispatch --features test-utils \
+//!   --example mtp_proj_batch_oracle -- [--out DIR] [--wide-selected-proj]
 //! ```
 //!
 //! Prints per case / round PASS / FAIL lines and a final `PASS mtp_proj_batch_oracle` only if
@@ -230,7 +229,8 @@ impl Weights {
         let mut seed = 0x0d10_5eed_u64;
         let mut raw = |gpu: &mut Gpu, m: usize, k: usize| -> R<GpuTensor> {
             let bytes = q8_weight(&mut seed, m, k);
-            gpu.upload_raw(&bytes, &[bytes.len()]).map_err(err("weight"))
+            gpu.upload_raw(&bytes, &[bytes.len()])
+                .map_err(err("weight"))
         };
         let indexer_qk = raw(gpu, INDEX_W, HIDDEN)?;
         let q = raw(gpu, QGATE_W, HIDDEN)?;
@@ -238,7 +238,8 @@ impl Weights {
         let v = raw(gpu, KV_W, HIDDEN)?;
         let output = raw(gpu, HIDDEN, Q_W)?;
         let mut rng = Rng::new(0x4e04);
-        let mut norm = |gpu: &mut Gpu, n: usize| upload_bytes(gpu, &bf16_norm(&mut rng, n), DType::BF16);
+        let mut norm =
+            |gpu: &mut Gpu, n: usize| upload_bytes(gpu, &bf16_norm(&mut rng, n), DType::BF16);
         Ok(Self {
             indexer_qk,
             q,
@@ -401,7 +402,9 @@ impl Arm {
                 .collect::<R<Vec<_>>>()?,
             lens: positions.iter().map(|&p| Lens::at(p)).collect(),
             input: gpu.zeros(&[n * HIDDEN], DType::F32).map_err(err("input"))?,
-            output: gpu.zeros(&[n * HIDDEN], DType::F32).map_err(err("output"))?,
+            output: gpu
+                .zeros(&[n * HIDDEN], DType::F32)
+                .map_err(err("output"))?,
             scratch: RowScratch::new(gpu, scratch_rows)?,
         })
     }
@@ -540,7 +543,13 @@ fn run_steps(gpu: &mut Gpu, ctx: &DispatchCtx, steps: &[Step<'_>]) -> R<()> {
 }
 
 /// The reference arm: one whole op per lane, executed lane after lane.
-fn run_reference(gpu: &mut Gpu, ctx: &DispatchCtx, w: &Weights, arm: &mut Arm, reuse: &[bool]) -> R<()> {
+fn run_reference(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    w: &Weights,
+    arm: &mut Arm,
+    reuse: &[bool],
+) -> R<()> {
     let n = reuse.len();
     let ins: Vec<GpuTensor> = (0..n)
         .map(|i| arm.input.sub_offset(i * HIDDEN, HIDDEN))
@@ -723,10 +732,16 @@ fn compare_round(gpu: &Gpu, rf: &Arm, cd: &Arm, pos_before: &[usize]) -> R<Vec<(
                 // Liveness: the reference wrote this lane's new K row over the sentinel.
                 let at = pos_before[i] * KV_W * 4;
                 let word = u32::from_le_bytes(ba[at..at + 4].try_into().expect("word"));
-                push(format!("lane{i}.reference_wrote_k_row"), usize::from(word == SENTINEL));
+                push(
+                    format!("lane{i}.reference_wrote_k_row"),
+                    usize::from(word == SENTINEL),
+                );
             }
         }
-        push(format!("lane{i}.host_lengths"), usize::from(rf.lens[i] != cd.lens[i]));
+        push(
+            format!("lane{i}.host_lengths"),
+            usize::from(rf.lens[i] != cd.lens[i]),
+        );
     }
     let out_a = bytes_of(gpu, &rf.output)?;
     let out_b = bytes_of(gpu, &cd.output)?;
@@ -851,14 +866,16 @@ fn run_case(
         let modes: String = reuse.iter().map(|&u| if u { 'R' } else { 'F' }).collect();
         if bad.is_empty() {
             if verbose {
-                emit(format!("PASS case {} round {} [{modes}]", case.name, r + 1), log);
+                emit(
+                    format!("PASS case {} round {} [{modes}]", case.name, r + 1),
+                    log,
+                );
             }
         } else {
             outcome.failed_rounds += 1;
             outcome.words += bad.iter().map(|b| b.1).sum::<usize>();
             if verbose {
-                let detail: Vec<String> =
-                    bad.iter().map(|(n, c)| format!("{n}={c}")).collect();
+                let detail: Vec<String> = bad.iter().map(|(n, c)| format!("{n}={c}")).collect();
                 emit(
                     format!(
                         "FAIL case {} round {} [{modes}]: mismatching words: {}",
@@ -891,7 +908,8 @@ fn parse_cli() -> R<Cli> {
         match arg.as_str() {
             "--out" => {
                 cli.out = Some(PathBuf::from(
-                    args.next().ok_or_else(|| "--out needs a directory".to_string())?,
+                    args.next()
+                        .ok_or_else(|| "--out needs a directory".to_string())?,
                 ));
             }
             "--wide-selected-proj" => cli.wide_selected = true,
@@ -930,7 +948,16 @@ fn run() -> R<bool> {
         );
         println!("{line}");
         log.push(line);
-        let o = run_case(&mut gpu, &ctx, &w, case, Control::None, cli.wide_selected, true, &mut log)?;
+        let o = run_case(
+            &mut gpu,
+            &ctx,
+            &w,
+            case,
+            Control::None,
+            cli.wide_selected,
+            true,
+            &mut log,
+        )?;
         if let Some(e) = o.error {
             let line = format!("FAIL case {}: {e}", case.name);
             println!("{line}");

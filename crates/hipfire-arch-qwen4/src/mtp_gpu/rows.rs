@@ -728,7 +728,10 @@ impl Qwen4MtpGpu {
                 Ok::<_, MtpGpuError>(op)
             };
             let projections = if batch {
-                Some((projection(MixerPhase::InProj)?, projection(MixerPhase::OutProj)?))
+                Some((
+                    projection(MixerPhase::InProj)?,
+                    projection(MixerPhase::OutProj)?,
+                ))
             } else {
                 None
             };
