@@ -3851,7 +3851,9 @@ pub enum IndexedAttentionMode<'a> {
     /// stale, so `selected_len` commits as 0.
     AppendOnly,
     /// One row: keep the persistent selection, append this position to it
-    /// on device, attend over it, project the output.
+    /// on device, attend over it, project the output. Also a `Core` phase
+    /// (the attention without the output projection) of a split op whose
+    /// projections run once over several lanes' rows.
     ReuseSelection { selected_len_out: &'a GpuTensor },
 }
 
@@ -3914,11 +3916,20 @@ impl IndexedAttentionOp<'_> {
         self.validate_layout()
     }
 
-    /// Selection reuse and the K/V-only append are single-row, whole-op modes.
+    /// The K/V-only append is a single-row, whole-op mode; selection reuse is
+    /// single-row and runs as the whole op or as its `Core` phase.
     fn check_phase(&self) -> Result<(), DispatchError> {
-        if self.phase != MixerPhase::Whole && !matches!(self.mode, IndexedAttentionMode::Full) {
+        let admitted = match self.mode {
+            IndexedAttentionMode::Full => true,
+            IndexedAttentionMode::AppendOnly => self.phase == MixerPhase::Whole,
+            IndexedAttentionMode::ReuseSelection { .. } => {
+                matches!(self.phase, MixerPhase::Whole | MixerPhase::Core)
+            }
+        };
+        if !admitted {
             return Err(DispatchError::Hip(
-                "indexed attention selection reuse and K/V-only append need the whole mixer op"
+                "indexed attention selection reuse needs the whole mixer op or its core; \
+                 K/V-only append needs the whole mixer op"
                     .into(),
             ));
         }
@@ -4724,11 +4735,6 @@ fn execute_indexed_attention_hc_impl(
     let k_batch = view(op.k_scratch, 0, op.rows * kv_width);
     let v_batch = view(op.v_scratch, 0, op.rows * kv_width);
     let qsa_output_batch = view(op.qsa_output, 0, op.rows * q_width);
-    let selected_batch = view(
-        op.selected_scratch,
-        0,
-        op.rows * op.state.selected_capacity * std::mem::size_of::<i32>(),
-    );
     let all = [
         (&op.indexer_qk, &index_batch),
         (&op.q, &qgate_batch),
@@ -5188,6 +5194,10 @@ fn execute_indexed_attention_hc_impl(
                 format: op.state.format,
             },
         ))?;
+        // A Core phase leaves the output projection to the OutProj phase.
+        if phase == MixerPhase::Core {
+            return Ok(());
+        }
         return project_weight(
             gpu,
             &op.output,
@@ -5197,6 +5207,13 @@ fn execute_indexed_attention_hc_impl(
             Some(op.rotation),
         );
     }
+    // Only the full-mode core reads per-row selections: the projection phases
+    // of a split op may carry a one-row selected scratch for `rows` rows.
+    let selected_batch = view(
+        op.selected_scratch,
+        0,
+        op.rows * op.state.selected_capacity * std::mem::size_of::<i32>(),
+    );
     let budget_blocks = op.budget / op.compress;
     let select = IndexedAttentionSelectBatch {
         query: &index_batch,
@@ -6664,7 +6681,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_attention_split_phase_refuses_reuse_and_append_modes() {
+    fn indexed_attention_split_phase_admits_only_core_selection_reuse() {
         let t = tensor(1, DType::F32);
         let scalar = tensor(4, DType::Raw);
         let reuse = IndexedAttentionMode::ReuseSelection {
@@ -6674,12 +6691,18 @@ mod tests {
             for mode in [reuse, IndexedAttentionMode::AppendOnly] {
                 let mut op = indexed_attention(&t, 1, 20, 12, mode);
                 op.phase = phase;
+                let core_reuse = phase == MixerPhase::Core
+                    && matches!(mode, IndexedAttentionMode::ReuseSelection { .. });
+                if core_reuse {
+                    assert!(op.check_phase().is_ok(), "core selection reuse is admitted");
+                    continue;
+                }
                 let error = op
                     .validate_layout()
-                    .expect_err("split phases are full-mode only");
+                    .expect_err("projection phases are full-mode only, append is whole-only");
                 assert!(
-                    error.to_string().contains("need the whole mixer op"),
-                    "{phase:?}"
+                    error.to_string().contains("needs the whole mixer op"),
+                    "{phase:?}: {error}"
                 );
             }
         }

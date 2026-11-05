@@ -9,7 +9,9 @@
 //! projections, the HC reads and writes, the MoE with one EP row gather, the
 //! final HC read, the draft head) run once over `n` rows; the stateful core
 //! (the indexed attention over each lane's own head arena) runs once per lane
-//! on that lane's row. Each lane keeps its own [`MtpGpuState`] and draft
+//! on that lane's row, and on exact gfx1201 the attention's Q8_0 input and
+//! output projections run once over the `n` rows around those cores
+//! ([`projection_batch`]). Each lane keeps its own [`MtpGpuState`] and draft
 //! request state; row `i` of every row stage is the one-token step of lane
 //! `i`, so the per-lane bytes equal `n` serial `forward_token_deferred`
 //! calls (proved per round by the lab oracle).
@@ -36,6 +38,32 @@ pub(crate) fn draft_rounds_enabled() -> bool {
 /// one x-batched GEMV over the ranking copy between its rows.
 const MTP_DRAFT_ROUNDS_XBATCH_ENV: &str = "HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS_XBATCH";
 
+/// `HIPFIRE_QWEN4_MTP_DRAFT_PROJ_BATCH` (default on; `0` restores one whole
+/// indexed-attention op per lane): see [`projection_batch`].
+const MTP_DRAFT_PROJ_BATCH_ENV: &str = "HIPFIRE_QWEN4_MTP_DRAFT_PROJ_BATCH";
+
+/// Whether a batched round of `n` lanes splits the indexed attention into ONE
+/// input projection over the `n` rows, each lane's core (its own positions,
+/// K/V cache, pool and selection, one row) and ONE output projection over the
+/// `n` rows, instead of one whole op per lane. Exact gfx1201 with every QSA
+/// projection Q8_0 on the few-row route only: there the `n`-row launches are
+/// `gemv_q8_0_rows_exact` (each row bitwise the rows == 1 `gemv_q8_0` the
+/// whole op launches, weights read once per call); anything else keeps the
+/// whole ops.
+fn projection_batch(gpu: &Gpu, qsa: &Qwen4QsaWeights<'_>, n: usize) -> bool {
+    use rdna_compute::gemv::{q8_0_rows_exact_route, Q8RowsExactRoute};
+    n >= 2
+        && gpu.arch_caps.is_gfx1201()
+        && (2..=gpu.few_row_limit()).contains(&gpu.route_rows(n))
+        && [&qsa.indexer_qk, &qsa.q, &qsa.k, &qsa.v, &qsa.output]
+            .iter()
+            .all(|w| {
+                w.dtype == DType::Q8_0
+                    && q8_0_rows_exact_route(&gpu.arch, w.k) != Q8RowsExactRoute::PerRowSingleton
+            })
+        && hipfire_config::developer_bool(MTP_DRAFT_PROJ_BATCH_ENV, true)
+}
+
 /// One drafting lane of a batched head round: the lane's own head arena and
 /// draft request state plus this round's input.
 pub(crate) struct DraftRow<'a> {
@@ -50,12 +78,14 @@ pub(crate) struct DraftRow<'a> {
 }
 
 /// Allocations of one [`MtpRowsScratch`], in field order.
-const ROWS_SCRATCH_TENSORS: usize = 39;
+const ROWS_SCRATCH_TENSORS: usize = 44;
 
 /// Operator scratch of a batched head round: every one-row head buffer
 /// ([`MtpGpuScratch`]) times [`MTP_DRAFT_LANES_MAX`] rows, plus the few-row
-/// grouped MoE's grouping buffers. The indexed attention keeps using the
-/// one-row [`MtpGpuScratch`] (lanes' attention runs one after another).
+/// grouped MoE's grouping buffers and the indexed attention's projection rows
+/// (index / q+gate / K / V / attention output, [`projection_batch`]). The
+/// lanes' attention cores run one after another on their own rows of those and
+/// share the one-row [`MtpGpuScratch`] selection scratch.
 pub(crate) struct MtpRowsScratch {
     token_ids: GpuTensor,
     embedding_rot: GpuTensor,
@@ -100,6 +130,14 @@ pub(crate) struct MtpRowsScratch {
     /// rotated hidden rows.
     draft_logits: GpuTensor,
     draft_rotation: GpuTensor,
+    /// The indexed attention's rows under [`projection_batch`]: `rows *`
+    /// index width, `rows * 2 * q_width`, `rows * kv_width` (K and V) and
+    /// `rows * q_width` F32 (the attention output the output projection reads).
+    qsa_index: GpuTensor,
+    qsa_qgate: GpuTensor,
+    qsa_k: GpuTensor,
+    qsa_v: GpuTensor,
+    qsa_output: GpuTensor,
 }
 
 /// The exact-extent row views a `rows`-lane step needs (HyperNorm infers its
@@ -130,6 +168,13 @@ impl MtpRowsScratch {
             .num_attention_heads
             .checked_mul(config.head_dim)
             .ok_or_else(|| invalid("MTP Q width overflow"))?;
+        let index_width = (config.indexer_n_heads + config.indexer_kv_heads)
+            .checked_mul(config.indexer_head_dim)
+            .ok_or_else(|| invalid("MTP index width overflow"))?;
+        let kv_width = config
+            .num_key_value_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| invalid("MTP KV width overflow"))?;
         let Qwen4FfnDims::Moe {
             num_experts,
             experts_per_token,
@@ -191,6 +236,11 @@ impl MtpRowsScratch {
             (grouped * hidden, DType::F32),
             (rows * config.vocab_size, DType::F32),
             (rows * hidden, DType::F32),
+            (rows * index_width, DType::F32),
+            (rows * 2 * q_width, DType::F32),
+            (rows * kv_width, DType::F32),
+            (rows * kv_width, DType::F32),
+            (rows * q_width, DType::F32),
         ];
         for shape in &mut shapes {
             shape.0 = shape.0.max(1);
@@ -288,6 +338,11 @@ impl MtpRowsScratch {
             moe_y_down_grouped: next(),
             draft_logits: next(),
             draft_rotation: next(),
+            qsa_index: next(),
+            qsa_qgate: next(),
+            qsa_k: next(),
+            qsa_v: next(),
+            qsa_output: next(),
         }))
     }
 
@@ -332,6 +387,11 @@ impl MtpRowsScratch {
             self.moe_y_down_grouped,
             self.draft_logits,
             self.draft_rotation,
+            self.qsa_index,
+            self.qsa_qgate,
+            self.qsa_k,
+            self.qsa_v,
+            self.qsa_output,
         ];
         let mut first = None;
         for tensor in tensors {
@@ -572,7 +632,8 @@ impl Qwen4MtpGpu {
         gpu.memcpy_htod_auto(&rs.token_ids.buf, &token_bytes[..n * 4])?;
 
         // Stages 2-4: the row stages once over all rows, the attention per
-        // lane. Everything the program borrows lives in this scope.
+        // lane (under [`projection_batch`] only its core: the projections run
+        // once over all rows). Everything the program borrows lives in this scope.
         let lengths = {
             let tensors = rs.tensors(&view);
             let views = HeadRowViews::new(&tensors, config, n);
@@ -586,6 +647,30 @@ impl Qwen4MtpGpu {
             let attention_outputs: SmallVec<[GpuTensor; MTP_DRAFT_LANES_MAX]> = (0..n)
                 .map(|row| rs.projected_embedding.sub_offset(row * hidden, hidden))
                 .collect();
+            let batch = projection_batch(gpu, &qsa_desc(weights, &mtp.attention)?, n);
+            // Each lane's rows of the batched projections' buffers (row-major
+            // `[n, width]`): index, q+gate, K, V, attention output.
+            let lane_rows: SmallVec<[[GpuTensor; 5]; MTP_DRAFT_LANES_MAX]> = if batch {
+                let index_width =
+                    (config.indexer_n_heads + config.indexer_kv_heads) * config.indexer_head_dim;
+                let q_width = config.num_attention_heads * config.head_dim;
+                let kv_width = config.num_key_value_heads * config.head_dim;
+                (0..n)
+                    .map(|row| {
+                        [
+                            rs.qsa_index.sub_offset(row * index_width, index_width),
+                            rs.qsa_qgate.sub_offset(row * 2 * q_width, 2 * q_width),
+                            rs.qsa_k.sub_offset(row * kv_width, kv_width),
+                            rs.qsa_v.sub_offset(row * kv_width, kv_width),
+                            rs.qsa_output.sub_offset(row * q_width, q_width),
+                        ]
+                    })
+                    .collect()
+            } else {
+                SmallVec::new()
+            };
+            let batch_input = rs.hc_mixed.sub_offset(0, n * hidden);
+            let batch_output = rs.projected_embedding.sub_offset(0, n * hidden);
             let mut attentions: SmallVec<[IndexedAttentionOp<'_>; MTP_DRAFT_LANES_MAX]> =
                 SmallVec::new();
             let mut lengths: SmallVec<[(usize, usize, usize, usize, usize); MTP_DRAFT_LANES_MAX]> =
@@ -600,7 +685,7 @@ impl Qwen4MtpGpu {
                         selected_len_out: &state.selected_len_out,
                     }
                 };
-                let attention = head_attention_op(
+                let mut attention = head_attention_op(
                     config,
                     scratch,
                     state,
@@ -609,9 +694,44 @@ impl Qwen4MtpGpu {
                     &attention_inputs[row],
                     &attention_outputs[row],
                 );
+                if let Some([index, qgate, k, v, output]) = lane_rows.get(row) {
+                    attention.phase = MixerPhase::Core;
+                    attention.index_scratch = index;
+                    attention.qgate_scratch = qgate;
+                    attention.k_scratch = k;
+                    attention.v_scratch = v;
+                    attention.qsa_output = output;
+                }
                 lengths.push(attention.next_lengths()?);
                 attentions.push(attention);
             }
+            // The batched input / output projections: lane 0's state rides
+            // along only to fill the op (the projection phases never read it).
+            let projection = |phase: MixerPhase| {
+                let mut op = head_attention_op(
+                    config,
+                    scratch,
+                    &*lanes[0].state,
+                    qsa_desc(weights, &mtp.attention)?,
+                    IndexedAttentionMode::Full,
+                    &batch_input,
+                    &batch_output,
+                );
+                op.rows = n;
+                op.phase = phase;
+                op.index_scratch = &rs.qsa_index;
+                op.qgate_scratch = &rs.qsa_qgate;
+                op.k_scratch = &rs.qsa_k;
+                op.v_scratch = &rs.qsa_v;
+                op.qsa_output = &rs.qsa_output;
+                op.rotation = &rs.rotation;
+                Ok::<_, MtpGpuError>(op)
+            };
+            let projections = if batch {
+                Some((projection(MixerPhase::InProj)?, projection(MixerPhase::OutProj)?))
+            } else {
+                None
+            };
             // Under EP the batched call is one MoE invocation: the gather
             // buffer `2 + j % 2` and layer index `trunk_layers + j % 2` for
             // the head's monotonic invocation counter `j`, advanced once.
@@ -653,9 +773,12 @@ impl Qwen4MtpGpu {
                 &view.backbone_hidden,
                 &attn.read,
             )?;
+            let (in_proj, out_proj) = projections.map_or((None, None), |(i, o)| (Some(i), Some(o)));
+            steps.extend(in_proj.map(Step::IndexedAttention));
             for attention in attentions {
                 steps.push(Step::IndexedAttention(attention));
             }
+            steps.extend(out_proj.map(Step::IndexedAttention));
             push_head_rows_back(
                 &mut steps,
                 config,
