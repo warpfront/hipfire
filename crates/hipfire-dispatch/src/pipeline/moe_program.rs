@@ -976,6 +976,10 @@ impl<'a> SealedMoeOp<'a> {
         {
             if self.state.front_allowed.get()
                 && !selection.cpu_deferred_experts
+                && !matches!(
+                    params.prelude.route,
+                    super::sealed_moe::PrefillRouteMode::HeteroCold
+                )
                 && super::qt44_qt53_prefill::front_applies(
                     gpu,
                     params,
@@ -2635,6 +2639,37 @@ fn lower_prefill<'a>(
     let mut steps = SmallVec::new();
     let op = |state: &'a MoeStepState<'a>| SealedMoeOp::new(state);
     append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Normalize))?;
+    if matches!(
+        params.prelude.route,
+        super::sealed_moe::PrefillRouteMode::HeteroCold
+    ) {
+        // The hetero expert device: the primary's route is already in the
+        // top-k buffers, so no router, route or shared stage runs; only the
+        // routed tail over the cold slots, combined into the zeroed partial.
+        if selection.cpu_split || selection.cpu_deferred_experts || selection.resolution.paro_mode {
+            return Err(DispatchError::Hip(
+                "sealed moe: HeteroCold prefill admits no CPU split, CPU deferral or Paro basis".into(),
+            ));
+        }
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
+        if selection.uses_grouped_rows() {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Scatter))?;
+        }
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateUp))?;
+        if selection.uses_grouped_rows() {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Unscatter))?;
+        }
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Activation))?;
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Down))?;
+        append_step(
+            &mut steps,
+            Step::MoeStage(op(state), MoeStage::MutationFence),
+        )?;
+        if selection.uses_grouped_rows() || !selection.resolution.down_path0 {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
+        }
+        return Ok(steps);
+    }
     if params.ep_row_gather.is_some()
         && (!selection
             .route
