@@ -2086,10 +2086,9 @@ impl Qwen4Bundle {
             };
             let attached = {
                 let me = &mut *self;
-                pool.run_all(
-                    || attach_borrow(me),
-                    &|_, peer: &mut Qwen4EpPeer| attach_borrow(&mut peer.bundle),
-                )
+                pool.run_all(|| attach_borrow(me), &|_, peer: &mut Qwen4EpPeer| {
+                    attach_borrow(&mut peer.bundle)
+                })
             };
             let attached = match attached {
                 Ok(attached) => attached,
@@ -2104,10 +2103,9 @@ impl Qwen4Bundle {
                 };
                 let refused = {
                     let me = &mut *self;
-                    pool.run_all(
-                        || refuse(me),
-                        &|_, peer: &mut Qwen4EpPeer| refuse(&mut peer.bundle),
-                    )
+                    pool.run_all(|| refuse(me), &|_, peer: &mut Qwen4EpPeer| {
+                        refuse(&mut peer.bundle)
+                    })
                 };
                 if let Err(error) = refused {
                     return Err(release_rank0(gpu, error));

@@ -1099,7 +1099,10 @@ impl UnitTailRank {
     pub(crate) fn borrow_occupied(&self) -> (usize, u64) {
         let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let slots = inner.occupied().len();
-        (slots, slots as u64 * (inner.gate_up_bytes + inner.down_bytes) as u64)
+        (
+            slots,
+            slots as u64 * (inner.gate_up_bytes + inner.down_bytes) as u64,
+        )
     }
 }
 
@@ -1144,12 +1147,9 @@ impl Inner {
         // ONE allocation (one memset): the gate/up block at offset 0, the down block at its
         // 256-aligned offset; `pool_gate_up` / `pool_down` are non-owning views of the two blocks.
         let layout = pool_layout(slots, self.gate_up_bytes, self.down_bytes, pad);
-        let pool = gpu.zeros(&[layout.total], DType::Raw).map_err(|e| {
-            format!(
-                "the tail pool ({slots} slots, {} bytes): {e}",
-                layout.total
-            )
-        })?;
+        let pool = gpu
+            .zeros(&[layout.total], DType::Raw)
+            .map_err(|e| format!("the tail pool ({slots} slots, {} bytes): {e}", layout.total))?;
         self.pool_gate_up = Some(pool_view(&pool, 0, layout.gate_up_len));
         self.pool_down = Some(pool_view(&pool, layout.down_offset, layout.down_len));
         self.pool_bytes = layout.total;
@@ -1957,7 +1957,10 @@ fn pool_view(pool: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
 /// The byte image of a device pointer table holding `entries` (u64 LE per expert): the format
 /// of [`TableImage`], so uploading it makes the device table equal that canonical entry list.
 fn canonical_image(entries: &[u64]) -> Vec<u8> {
-    entries.iter().flat_map(|entry| entry.to_le_bytes()).collect()
+    entries
+        .iter()
+        .flat_map(|entry| entry.to_le_bytes())
+        .collect()
 }
 
 /// Whether a slot holds the bytes of a completed fill that a table names now or may name after
@@ -2126,10 +2129,18 @@ impl Inner {
             gpu.hip.event_synchronize(&batch.event).map_err(io)?;
         }
         for layer in &self.layers {
-            upload_image(gpu, &layer.table_gate_up, &canonical_image(&layer.canon_gate_up))?;
+            upload_image(
+                gpu,
+                &layer.table_gate_up,
+                &canonical_image(&layer.canon_gate_up),
+            )?;
             upload_image(gpu, &layer.table_down, &canonical_image(&layer.canon_down))?;
             if let Some(full) = layer.full.as_ref() {
-                upload_image(gpu, &full.table_gate_up, &canonical_image(&full.base_gate_up))?;
+                upload_image(
+                    gpu,
+                    &full.table_gate_up,
+                    &canonical_image(&full.base_gate_up),
+                )?;
                 upload_image(gpu, &full.table_down, &canonical_image(&full.base_down))?;
             }
         }
@@ -2177,7 +2188,12 @@ impl Inner {
             let (layer, expert) = (op.unit.0 as usize, op.unit.1 as usize);
             let (host_gate_up, host_down) = self.canonical_bytes(op.unit)?;
             for (what, pool, at, host) in [
-                ("gate/up", pool_gate_up, op.slot * self.gate_up_bytes, host_gate_up),
+                (
+                    "gate/up",
+                    pool_gate_up,
+                    op.slot * self.gate_up_bytes,
+                    host_gate_up,
+                ),
                 ("down", pool_down, op.slot * self.down_bytes, host_down),
             ] {
                 let device = &mut device[..host.len()];
@@ -3052,7 +3068,11 @@ mod tests {
         // Already aligned: no gap.
         let layout = pool_layout(4, 1024, 512, pad);
         assert_eq!(layout.down_offset, layout.gate_up_len);
-        for (slots, gate_up, down) in [(1usize, 1usize, 1usize), (7, 3333, 1111), (1536, 2_359_296, 1_179_648)] {
+        for (slots, gate_up, down) in [
+            (1usize, 1usize, 1usize),
+            (7, 3333, 1111),
+            (1536, 2_359_296, 1_179_648),
+        ] {
             let layout = pool_layout(slots, gate_up, down, pad);
             assert_eq!(layout.down_offset % POOL_BLOCK_ALIGN, 0);
             assert!(layout.down_offset >= layout.gate_up_len);
@@ -3130,11 +3150,16 @@ mod tests {
     }
 
     fn occupied_slots(inner: &Inner) -> Vec<(usize, UnitKey)> {
-        inner.occupied().iter().map(|op| (op.slot, op.unit)).collect()
+        inner
+            .occupied()
+            .iter()
+            .map(|op| (op.slot, op.unit))
+            .collect()
     }
 
     #[test]
-    fn occupied_slots_are_the_live_and_quarantined_ones_plus_filling_only_when_unpublished_but_complete() {
+    fn occupied_slots_are_the_live_and_quarantined_ones_plus_filling_only_when_unpublished_but_complete(
+    ) {
         let mut priority = HashMap::new();
         for expert in 0..16u16 {
             priority.insert((0u16, expert), expert as u32);

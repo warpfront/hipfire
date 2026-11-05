@@ -2074,8 +2074,8 @@ pub(crate) mod moe_down_a8;
 pub use ep_reserve_forward::ep_reserve_receipt_scope;
 pub(crate) mod ep_reserve_loan;
 pub(crate) mod ep_reserve_scratch;
-pub(crate) mod ep_wave;
 pub(crate) mod ep_tail_borrow;
+pub(crate) mod ep_wave;
 pub use ep_tail_borrow::{
     parse_ep_tail_borrow_knob, qwen4_ep_tail_borrow_forward_bytes, qwen4_ep_tail_borrow_plan,
     qwen4_set_ep_tail_borrow_plan, resolve_ep_tail_borrow, EpTailBorrowFacts, EpTailBorrowKnob,

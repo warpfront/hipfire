@@ -3089,7 +3089,13 @@ pub fn qwen4_ep_vram_layers(
     // `Full` plan unless `HIPFIRE_EP_COMPACT_SCRATCH` admits the compact one).
     let scratch_mode = qwen4_ep_scratch_mode(gpu, hfq, &config, &manifest)?;
     // PrefBorrow D3: decide the tail-borrow plan before anything reads the prompt chunk.
-    qwen4_ep_tail_borrow_publish(gpu, scratch_mode, units_path.is_some(), shared.max_seq, true);
+    qwen4_ep_tail_borrow_publish(
+        gpu,
+        scratch_mode,
+        units_path.is_some(),
+        shared.max_seq,
+        true,
+    );
     let bytes_of = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
         crate::qwen4_slab::qwen4_entry_bytes(&recipe, entry, |entry| {
             hfq.tensor_data(&entry.name)
@@ -17034,13 +17040,13 @@ mod qwen4_ep_reserve_loader_tests {
             Ok(Qwen4PlacementForward::TailBorrow(bytes)) => assert_eq!(bytes, charged),
             _ => panic!("the published chunk takes the tail-borrow charge"),
         }
-        assert!(matches!(
-            at_resident,
-            Ok(Qwen4PlacementForward::Ordinary)
-        ));
+        assert!(matches!(at_resident, Ok(Qwen4PlacementForward::Ordinary)));
         let resident = gf::qwen4_forward_device_bytes(&config, 4096, Mode::Full).unwrap();
         let whole = gf::qwen4_forward_device_bytes(&config, 12288, Mode::Full).unwrap();
-        assert!(resident < charged && charged < whole, "{resident} < {charged} < {whole}");
+        assert!(
+            resident < charged && charged < whole,
+            "{resident} < {charged} < {whole}"
+        );
     }
 
     struct Mock {

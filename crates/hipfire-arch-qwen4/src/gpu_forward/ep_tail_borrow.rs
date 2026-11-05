@@ -181,9 +181,7 @@ pub fn resolve_ep_tail_borrow(
         );
     }
     if facts.explicit_chunk {
-        return refuse(format!(
-            "{QWEN4_PREFILL_CHUNK_ROWS_ENV} pins the chunk"
-        ));
+        return refuse(format!("{QWEN4_PREFILL_CHUNK_ROWS_ENV} pins the chunk"));
     }
     if let Some(conflict) = facts.conflict {
         return refuse(format!("it does not combine with {conflict}"));
@@ -349,7 +347,10 @@ pub fn qwen4_ep_tail_borrow_forward_bytes(
 /// masked tile ids are registered for), like `EpReserveBanks::exchange_capacity`.
 fn exchange_capacity_of(rows: usize, slots: &[ScratchSlot]) -> Option<EpExchangeCapacity> {
     let y_down = slots.get(ScratchField::MoeYDownGrouped as usize)?;
-    let tile_ids_bytes = slots.get(ScratchField::MoeExpertTileIds as usize)?.bytes().ok()?;
+    let tile_ids_bytes = slots
+        .get(ScratchField::MoeExpertTileIds as usize)?
+        .bytes()
+        .ok()?;
     let tile_ids = tile_ids_bytes / std::mem::size_of::<i32>();
     Some(EpExchangeCapacity {
         rows,
@@ -364,7 +365,10 @@ fn exchange_capacity_of(rows: usize, slots: &[ScratchSlot]) -> Option<EpExchange
 /// non-empty root of `slots` in [`ScratchField`] order, each start aligned to 256 bytes,
 /// EXCEPT the persistent roots ([`persistent_fields`]: they are never donor memory). Like
 /// [`Qwen4GpuForwardScratch::borrowed_backing`] otherwise.
-fn tail_backing_of(rows: usize, slots: &[ScratchSlot]) -> Result<ScratchBacking, Qwen4GpuForwardError> {
+fn tail_backing_of(
+    rows: usize,
+    slots: &[ScratchSlot],
+) -> Result<ScratchBacking, Qwen4GpuForwardError> {
     let overflow = || invalid("borrowed scratch backing overflows");
     let align = |x: u64| -> Result<u64, Qwen4GpuForwardError> {
         x.checked_add(DECODE_SHARE_ROOT_ALIGN - 1)
@@ -761,7 +765,11 @@ impl EpTailBorrow {
     /// Free the persistent roots (the banks own nothing else of this borrow).
     pub(crate) fn release(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
         let mut first = None;
-        for tensor in self.exchange_root.into_iter().chain(std::iter::once(self.ids)) {
+        for tensor in self
+            .exchange_root
+            .into_iter()
+            .chain(std::iter::once(self.ids))
+        {
             if let Err(error) = gpu.free_tensor(tensor) {
                 first.get_or_insert(error);
             }
@@ -796,7 +804,10 @@ impl Qwen4GpuForwardScratch {
         Self::check_external_ids(&slots, ids)?;
         let persistent = persistent_fields(&slots);
         let down = &slots[ScratchField::MoeYDownGrouped as usize];
-        match (persistent.contains(&ScratchField::MoeYDownGrouped), exchange_root) {
+        match (
+            persistent.contains(&ScratchField::MoeYDownGrouped),
+            exchange_root,
+        ) {
             (true, Some(root)) if root.dtype == down.dtype && root.numel() >= down.elements => {}
             (false, None) => {}
             _ => {
@@ -1081,7 +1092,9 @@ impl Qwen4GpuForward {
         let rows = self.scratch.max_chunk;
         if let Some(borrow) = self.ep_tail_borrow.as_mut() {
             if !matches!(borrow.state, EpTailState::Refused(_)) {
-                eprintln!("qwen4 EP rank {rank}: tail borrow off: {reason}; prompt chunk {rows} rows");
+                eprintln!(
+                    "qwen4 EP rank {rank}: tail borrow off: {reason}; prompt chunk {rows} rows"
+                );
                 borrow.state = EpTailState::Refused(reason.to_string());
                 borrow.tail = None;
             }
@@ -1130,7 +1143,9 @@ impl Qwen4GpuForward {
             .as_ref()
             .and_then(|ep| ep.tile.as_ref())
             .and_then(|route| route.hook.as_ref())
-            .ok_or_else(|| invalid("the EP tail borrow rendezvous needs the installed tile exchange"))?;
+            .ok_or_else(|| {
+                invalid("the EP tail borrow rendezvous needs the installed tile exchange")
+            })?;
         let epoch = self
             .ep_tail_borrow
             .as_ref()
@@ -1471,9 +1486,9 @@ impl Qwen4GpuForward {
                 stats.restore_bytes,
                 stats.restore_ms,
                 stats.barrier_wait_ms,
-                stats
-                    .last_digest
-                    .map_or(String::new(), |digest| format!(", last digest {digest:016x}"))
+                stats.last_digest.map_or(String::new(), |digest| format!(
+                    ", last digest {digest:016x}"
+                ))
             );
         }
         let (tail, open) = {
@@ -1549,9 +1564,18 @@ mod tests {
         assert_eq!(on.note, None);
         // The same resolver with the default off plans nothing and says nothing.
         let off = resolve_ep_tail_borrow(None, false, &facts());
-        assert_eq!(off, EpTailBorrowResolution { plan: None, note: None });
+        assert_eq!(
+            off,
+            EpTailBorrowResolution {
+                plan: None,
+                note: None
+            }
+        );
         // An empty value is unset.
-        assert_eq!(resolve_ep_tail_borrow(Some("  "), false, &facts()).plan, None);
+        assert_eq!(
+            resolve_ep_tail_borrow(Some("  "), false, &facts()).plan,
+            None
+        );
     }
 
     #[test]
@@ -1583,8 +1607,14 @@ mod tests {
         let junk = resolve("yes");
         assert_eq!(junk.plan, None);
         assert!(junk.note.unwrap().contains("expected 0, 1 or a row count"));
-        assert_eq!(parse_ep_tail_borrow_knob(None), Ok(EpTailBorrowKnob::Default));
-        assert_eq!(parse_ep_tail_borrow_knob(Some("1")), Ok(EpTailBorrowKnob::On));
+        assert_eq!(
+            parse_ep_tail_borrow_knob(None),
+            Ok(EpTailBorrowKnob::Default)
+        );
+        assert_eq!(
+            parse_ep_tail_borrow_knob(Some("1")),
+            Ok(EpTailBorrowKnob::On)
+        );
         assert_eq!(
             parse_ep_tail_borrow_knob(Some(" 8192 ")),
             Ok(EpTailBorrowKnob::Rows(8192))
@@ -1594,7 +1624,13 @@ mod tests {
     #[test]
     fn every_refusal_is_named_and_a_default_stays_silent() {
         let cases: [(EpTailBorrowFacts, &str); 7] = [
-            (EpTailBorrowFacts { ep: false, ..facts() }, "expert-parallel"),
+            (
+                EpTailBorrowFacts {
+                    ep: false,
+                    ..facts()
+                },
+                "expert-parallel",
+            ),
             (
                 EpTailBorrowFacts {
                     gfx1201: false,
@@ -1643,7 +1679,10 @@ mod tests {
             assert_eq!(explicit.plan, None, "{needle}");
             let note = explicit.note.expect("an explicit knob names the refusal");
             assert!(note.contains(needle), "{note} lacks {needle}");
-            assert!(note.starts_with("qwen4 EP tail borrow: ignored ("), "{note}");
+            assert!(
+                note.starts_with("qwen4 EP tail borrow: ignored ("),
+                "{note}"
+            );
             // The (flipped) default on a load it does not apply to is silent.
             let default = resolve_ep_tail_borrow(None, true, &facts);
             assert_eq!((default.plan, default.note), (None, None), "{needle}");
@@ -1658,7 +1697,10 @@ mod tests {
         assert_eq!(qwen4_ep_tail_borrow_plan(), None);
         let mode = Qwen4ForwardScratchMode::FnSymGfx1201;
         // Nothing published: the ordinary attach, no log.
-        assert_eq!(ep_tail_borrow_attach_plan(None, true, mode, 4096, None), Ok(None));
+        assert_eq!(
+            ep_tail_borrow_attach_plan(None, true, mode, 4096, None),
+            Ok(None)
+        );
         assert_eq!(
             ep_tail_borrow_attach_plan(plan(BORROWED), true, mode, BORROWED, None),
             Ok(plan(BORROWED))
@@ -1678,10 +1720,7 @@ mod tests {
     // ----- charge arithmetic --------------------------------------------------------------
 
     /// The compact plan with its own exchange root (what an EP load plans), and the Full plan.
-    fn plans(
-        mode: Qwen4ForwardScratchMode,
-        rows: usize,
-    ) -> (Vec<ScratchSlot>, usize) {
+    fn plans(mode: Qwen4ForwardScratchMode, rows: usize) -> (Vec<ScratchSlot>, usize) {
         let config = compact_test_config();
         Qwen4GpuForwardScratch::plan_scoped_root(
             &config,
@@ -1747,7 +1786,11 @@ mod tests {
         ];
         for (what, resident, borrowed, persistent) in cases {
             assert_eq!(persistent_fields(&borrowed).len(), persistent, "{what}");
-            assert_eq!(persistent_fields(&resident), persistent_fields(&borrowed), "{what}");
+            assert_eq!(
+                persistent_fields(&resident),
+                persistent_fields(&borrowed),
+                "{what}"
+            );
             let spec = qwen4_spec_buffer_bytes(&config, RESIDENT).unwrap();
             let resident_total = owning_bytes(&resident) + spec[0] + spec[1];
             let charged = charged_forward_bytes(resident_total, &resident, &borrowed).unwrap();
@@ -1792,9 +1835,8 @@ mod tests {
         let (resident, borrowed) = (shard_plans(RESIDENT), shard_plans(BORROWED));
         assert_eq!(persistent_fields(&borrowed), vec![ScratchField::TokenIds]);
         let total = owning_bytes(&resident);
-        let ids = |slots: &[ScratchSlot]| {
-            slots[ScratchField::TokenIds as usize].bytes().unwrap() as u64
-        };
+        let ids =
+            |slots: &[ScratchSlot]| slots[ScratchField::TokenIds as usize].bytes().unwrap() as u64;
         assert_eq!(
             charged_forward_bytes(total, &resident, &borrowed),
             Some(total - ids(&resident) + ids(&borrowed))
@@ -1872,7 +1914,11 @@ mod tests {
         let mut end = 0u64;
         for root in &backing.roots {
             assert_eq!(root.offset % DECODE_SHARE_ROOT_ALIGN, 0, "{:?}", root.field);
-            assert!(root.offset >= end, "{:?} overlaps its predecessor", root.field);
+            assert!(
+                root.offset >= end,
+                "{:?} overlaps its predecessor",
+                root.field
+            );
             end = root.offset + root.bytes;
         }
         assert!(backing.span_bytes >= end);
@@ -1938,7 +1984,10 @@ mod tests {
         let error = epoch
             .plan_call(BORROWED + 1, RESIDENT, BORROWED, true)
             .unwrap_err();
-        assert!(error.contains("8192-row borrowed prompt capacity"), "{error}");
+        assert!(
+            error.contains("8192-row borrowed prompt capacity"),
+            "{error}"
+        );
         // Planning never mutates.
         assert_eq!(epoch, EpTailEpoch::default());
     }
@@ -1948,9 +1997,15 @@ mod tests {
         let mut epoch = EpTailEpoch::default();
         // A long singleton prompt: three wide tiles and a short tail inside one bracket.
         assert!(epoch.begin_prompt());
-        assert_eq!(borrow_call(&mut epoch, BORROWED), EpTailCallPlan::Borrow { open_first: true });
+        assert_eq!(
+            borrow_call(&mut epoch, BORROWED),
+            EpTailCallPlan::Borrow { open_first: true }
+        );
         assert!(epoch.open());
-        assert_eq!(borrow_call(&mut epoch, BORROWED), EpTailCallPlan::Borrow { open_first: false });
+        assert_eq!(
+            borrow_call(&mut epoch, BORROWED),
+            EpTailCallPlan::Borrow { open_first: false }
+        );
         // The tail tile fits the resident bank: resident, the epoch stays open.
         assert_eq!(borrow_call(&mut epoch, 1000), EpTailCallPlan::Resident);
         assert!(epoch.open());
@@ -1964,7 +2019,10 @@ mod tests {
         assert_eq!(epoch.epochs(), 1);
         // The next long prompt opens a second epoch.
         assert!(epoch.begin_prompt());
-        assert_eq!(borrow_call(&mut epoch, 6000), EpTailCallPlan::Borrow { open_first: true });
+        assert_eq!(
+            borrow_call(&mut epoch, 6000),
+            EpTailCallPlan::Borrow { open_first: true }
+        );
         assert_eq!(epoch.end_prompt(true, false), EpTailPromptEnd::Close);
         epoch.closed();
         assert_eq!((epoch.epochs(), epoch.depth()), (2, 0));
@@ -1980,7 +2038,10 @@ mod tests {
         let mut epoch = EpTailEpoch::default();
         assert!(epoch.begin_prompt()); // forward_chunk
         assert!(!epoch.begin_prompt()); // an MTP fill / wave inside it
-        assert_eq!(borrow_call(&mut epoch, BORROWED), EpTailCallPlan::Borrow { open_first: true });
+        assert_eq!(
+            borrow_call(&mut epoch, BORROWED),
+            EpTailCallPlan::Borrow { open_first: true }
+        );
         assert_eq!(epoch.end_prompt(true, false), EpTailPromptEnd::Nested);
         assert!(epoch.open());
         assert_eq!(epoch.end_prompt(true, false), EpTailPromptEnd::Close);
@@ -2001,7 +2062,13 @@ mod tests {
             // The step's decode rows ran before its prefill tile, on the resident bank.
             assert_eq!(borrow_call(&mut epoch, 8), EpTailCallPlan::Resident);
             let plan = borrow_call(&mut epoch, BORROWED);
-            assert_eq!(plan, EpTailCallPlan::Borrow { open_first: step == 0 }, "step {step}");
+            assert_eq!(
+                plan,
+                EpTailCallPlan::Borrow {
+                    open_first: step == 0
+                },
+                "step {step}"
+            );
             match epoch.end_prompt(true, continues) {
                 EpTailPromptEnd::Keep => assert!(continues && epoch.open()),
                 EpTailPromptEnd::Close => {
@@ -2056,13 +2123,19 @@ mod tests {
     fn a_failed_tile_closes_and_the_next_prompt_reopens() {
         let mut epoch = EpTailEpoch::default();
         epoch.begin_prompt();
-        assert_eq!(borrow_call(&mut epoch, BORROWED), EpTailCallPlan::Borrow { open_first: true });
+        assert_eq!(
+            borrow_call(&mut epoch, BORROWED),
+            EpTailCallPlan::Borrow { open_first: true }
+        );
         // The forward closes right after the failed tile (before the bracket ends).
         epoch.closed();
         assert_eq!(epoch.end_prompt(false, false), EpTailPromptEnd::Clean);
         assert_eq!(epoch.check(), Ok(()));
         epoch.begin_prompt();
-        assert_eq!(borrow_call(&mut epoch, BORROWED), EpTailCallPlan::Borrow { open_first: true });
+        assert_eq!(
+            borrow_call(&mut epoch, BORROWED),
+            EpTailCallPlan::Borrow { open_first: true }
+        );
         assert_eq!(epoch.epochs(), 2);
     }
 
@@ -2075,17 +2148,24 @@ mod tests {
         assert!(!epoch.open());
         let error = epoch.check().unwrap_err();
         assert!(
-            error.starts_with("EP tail borrow poisoned (close after a failed prompt: host copy failed)")
-                && error.ends_with("reload the model"),
+            error.starts_with(
+                "EP tail borrow poisoned (close after a failed prompt: host copy failed)"
+            ) && error.ends_with("reload the model"),
             "{error}"
         );
         // Resident calls refuse too: nothing runs on a poisoned load.
         for rows in [1, RESIDENT, RESIDENT + 1, BORROWED] {
-            assert_eq!(epoch.plan_call(rows, RESIDENT, BORROWED, true), Err(error.clone()));
+            assert_eq!(
+                epoch.plan_call(rows, RESIDENT, BORROWED, true),
+                Err(error.clone())
+            );
         }
         // The first reason sticks; a second poison never rewrites it.
         epoch.poison("later");
-        assert_eq!(epoch.poisoned(), Some("close after a failed prompt: host copy failed"));
+        assert_eq!(
+            epoch.poisoned(),
+            Some("close after a failed prompt: host copy failed")
+        );
         // The bracket still balances and reports nothing to recover.
         assert_eq!(epoch.end_prompt(true, false), EpTailPromptEnd::Clean);
     }
