@@ -94,6 +94,10 @@ pub enum MoeStage {
     /// write the device-masked ids the hot routed tail reads. After `Route`,
     /// before the first routed table read. Never synchronizes the host.
     PublishColdRows,
+    /// Hetero prefill: enqueue the side-stream exchange `PublishColdRows`
+    /// staged (copies out + releases, waits + copies back). After `GateUp`, so
+    /// the host enqueue overlaps queued device work; no device wait.
+    SendColdRows,
     /// Hetero prefill: the main stream waits for the exchange, then adds the
     /// expert device's BF16 cold partial into the residual (skipped after a
     /// timed-out wait). Last: after the hot `Combine` and `SharedDown`.
@@ -797,6 +801,7 @@ impl<'a> SealedMoeOp<'a> {
             MoeStage::AwaitCold => self.await_cold(gpu),
             MoeStage::InstallCold => self.install_cold(gpu),
             MoeStage::PublishColdRows => self.publish_cold_rows(gpu),
+            MoeStage::SendColdRows => self.send_cold_rows(gpu),
             MoeStage::JoinColdRows => self.join_cold_rows(gpu),
         }
     }
@@ -854,6 +859,12 @@ impl<'a> SealedMoeOp<'a> {
             params.topk_weights,
             xq,
         )
+    }
+
+    /// `SendColdRows`: the staged exchange onto the side streams.
+    pub(super) fn send_cold_rows(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let (params, _) = self.state.prefill_parts()?;
+        Self::hetero_prefill_split(params)?.send(gpu)
     }
 
     /// `JoinColdRows`: wait for the exchange and add the cold partial.
@@ -2823,6 +2834,7 @@ fn lower_prefill<'a>(
                 append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Scatter))?;
             }
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateUp))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SendColdRows))?;
             if selection.uses_grouped_rows() {
                 append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Unscatter))?;
             }

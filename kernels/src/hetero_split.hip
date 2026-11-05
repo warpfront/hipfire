@@ -165,7 +165,12 @@ extern "C" __global__ void hetero_add_partial(
     const unsigned short* __restrict__ partial,
     int n,
     float* __restrict__ x_batch) {
-    if (hs_load(error) != 0u) return;
+    // One load of the error word per block (a system-scope load per thread
+    // costs hundreds of microseconds over a whole chunk).
+    __shared__ unsigned skip;
+    if (threadIdx.x == 0) skip = hs_load(error);
+    __syncthreads();
+    if (skip != 0u) return;
     const long long stride = (long long)gridDim.x * blockDim.x;
     for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
         x_batch[i] += __uint_as_float((unsigned)partial[i] << 16);

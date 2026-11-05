@@ -109,6 +109,12 @@ struct PrefillSlot {
     returned: hip_bridge::Event,
     /// A publish into this slot awaits its join.
     pending: std::sync::atomic::AtomicBool,
+    /// The slot's error word copied into primary memory by the back stream
+    /// after its waits: the add reads it per thread, and a remote word would
+    /// cost every thread a read across the link.
+    err_local: GpuTensor,
+    /// What `publish` staged for `send`: rows and the sidecar snapshot.
+    staged: Mutex<Option<(usize, Option<u64>)>>,
 }
 
 /// Load-wide prefill exchange state, shared by every layer of the load: the
@@ -182,6 +188,8 @@ impl HeteroPrefillShared {
                 published: gpu.hip.event_create().map_err(hip)?,
                 returned: gpu.hip.event_create().map_err(hip)?,
                 pending: Default::default(),
+                err_local: gpu.alloc_tensor(&[64], rdna_compute::DType::F32).map_err(hip)?,
+                staged: Mutex::new(None),
             });
         }
         Ok(Self {
@@ -354,6 +362,29 @@ impl HeteroPrefillSplit {
             None => None,
         };
         gpu.hip.event_record(&ps.published, gpu.active_stream.as_ref()).map_err(hip)?;
+        *ps.staged.lock().map_err(|_| DispatchError::Hip("hetero prefill: staged lock poisoned".into()))? =
+            Some((rows, xq.map(|p| p as u64)));
+        Ok(())
+    }
+
+    /// `SendColdRows`: enqueue the exchange `publish` staged, per sub-chunk on
+    /// the out stream the copy of its rows (int4 when the sidecar exists and
+    /// the expert device admits the block, else F16) and its release, and on
+    /// the back stream its bounded wait and the copy back of its BF16 partial,
+    /// then the error word. Nothing waits on the host.
+    pub fn send(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let sh = &*self.shared;
+        let g = sh.geom;
+        let ps = &sh.slots[sh.slot()];
+        let (rows, xq) = ps
+            .staged
+            .lock()
+            .map_err(|_| DispatchError::Hip("hetero prefill: staged lock poisoned".into()))?
+            .take()
+            .ok_or_else(|| DispatchError::Hip("hetero prefill: send without a publish".into()))?;
+        let xq = xq.map(|p| p as usize as *mut std::ffi::c_void);
+        let (mb, o, dim) = (sh.mailbox, ps.offsets, g.dim);
+        let i4 = int4_row_bytes(dim);
         let subs = g.sub_chunks_for(rows);
         let split = PrefillGeometry { sub_chunks: subs, ..g };
         let floor = sh.int4_min_rows();
@@ -421,6 +452,11 @@ impl HeteroPrefillSplit {
                     .memcpy_dtod_async_at(&ps.partial.buf, off * dim * 2, &mb_part, off * dim * 2, n * dim * 2, st)
                     .map_err(hip)?;
             }
+            // The error word, after every wait of this chunk, into primary memory.
+            // SAFETY: the slot's error word in the live pinned mailbox.
+            let err = unsafe { hip_bridge::DeviceBuffer::from_raw((mb + o.error as u64) as *mut std::ffi::c_void, 4) };
+            let st = gpu.active_stream.as_ref().expect("side stream installed");
+            gpu.hip.memcpy_dtod_async_at(&ps.err_local.buf, 0, &err, 0, 4, st).map_err(hip)?;
             gpu.hip.event_record(&ps.returned, gpu.active_stream.as_ref()).map_err(hip)
         })
     }
@@ -474,7 +510,7 @@ impl HeteroPrefillSplit {
             return Ok(());
         }
         gpu.hip.stream_wait_event_on(gpu.active_stream.as_ref(), &st.returned).map_err(hip)?;
-        gpu.hetero_add_partial(sh.mailbox + st.offsets.error as u64, &st.partial, (rows * sh.geom.dim) as i32, x_batch)
+        gpu.hetero_add_partial(st.err_local.buf.as_ptr() as u64, &st.partial, (rows * sh.geom.dim) as i32, x_batch)
             .map_err(hip)
     }
 }

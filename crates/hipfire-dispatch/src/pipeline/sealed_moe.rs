@@ -9711,12 +9711,16 @@ mod tests {
                 let st = split_prefill_stages(rows, Some(route), false, |_| {}, |s| s.hetero_prefill = true).unwrap();
                 let label = format!("{route:?} rows={rows}: {st:?}");
                 let at = |stage: MoeStage| st.iter().position(|s| *s == stage).unwrap_or_else(|| panic!("{stage:?} missing: {label}"));
-                for once in [MoeStage::PublishColdRows, MoeStage::JoinColdRows, MoeStage::Combine, MoeStage::SharedDown] {
+                for once in [MoeStage::PublishColdRows, MoeStage::SendColdRows, MoeStage::JoinColdRows, MoeStage::Combine, MoeStage::SharedDown] {
                     assert_eq!(st.iter().filter(|s| **s == once).count(), 1, "{once:?}: {label}");
                 }
-                // Published after the route wrote the ids, before any routed table read.
+                // Published after the route wrote the ids, before any routed table read;
+                // the side-stream exchange is enqueued once the hot gate/up is queued
+                // (the host enqueue then overlaps device work).
                 assert!(at(MoeStage::Route) < at(MoeStage::PublishColdRows), "{label}");
                 assert!(at(MoeStage::PublishColdRows) < at(MoeStage::GateUp), "{label}");
+                assert!(at(MoeStage::GateUp) < at(MoeStage::SendColdRows), "{label}");
+                assert!(at(MoeStage::SendColdRows) < at(MoeStage::Combine), "{label}");
                 if st.contains(&MoeStage::Scatter) {
                     assert!(at(MoeStage::PublishColdRows) < at(MoeStage::Scatter), "{label}");
                 }
