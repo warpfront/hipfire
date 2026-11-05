@@ -13,6 +13,7 @@ mod macros;
 pub mod context;
 pub mod cpu_exec;
 pub mod cpu_split;
+pub mod igpu_split;
 pub mod cpwait;
 pub mod families;
 pub mod offload_split;
