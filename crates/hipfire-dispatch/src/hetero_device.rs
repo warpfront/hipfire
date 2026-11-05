@@ -95,13 +95,29 @@ use std::sync::{Arc, Mutex};
 
 use crate::hetero_mailbox::{int4_row_bytes, PrefillGeometry, PrefillOffsets, ROWS_F16, ROWS_INT4};
 
-/// Load-wide prefill exchange state, shared by every layer of the load (layers
-/// run one at a time): the prefill slot of the mailbox, the primary's staging
-/// and partial buffers, and the two side streams with their events.
+/// One prefill slot of the mailbox and the primary's buffers for it: a chunk
+/// (or a layer-major tile) in flight owns one slot until its join.
+struct PrefillSlot {
+    offsets: PrefillOffsets,
+    /// F16 rows staged for the copy out, the chunk's int4 sidecar snapshot
+    /// (the primary's own IU4 scratch is reused by later stages while the out
+    /// stream still reads), and the BF16 partial copied back.
+    x_f16: GpuTensor,
+    xq: GpuTensor,
+    partial: GpuTensor,
+    published: hip_bridge::Event,
+    returned: hip_bridge::Event,
+    /// A publish into this slot awaits its join.
+    pending: std::sync::atomic::AtomicBool,
+}
+
+/// Load-wide prefill exchange state, shared by every layer of the load: the
+/// mailbox's prefill slots with the primary's buffers, the two side streams,
+/// the slot the next publish uses and whether its join is deferred to the
+/// caller (the layer-major schedule keeps several tiles in flight).
 pub struct HeteroPrefillShared {
     pub mailbox: u64,
-    pub offsets: PrefillOffsets,
-    /// `sub_chunks` is the slot's count; a chunk uses
+    /// `sub_chunks` is a slot's count; a chunk uses
     /// [`PrefillGeometry::sub_chunks_for`] of them.
     pub geom: PrefillGeometry,
     pub n_experts: i32,
@@ -109,18 +125,13 @@ pub struct HeteroPrefillShared {
     pub counter: GpuTensor,
     /// `hetero_await_cold` poll bound per sub-chunk.
     pub max_polls: u32,
-    /// F16 rows staged for the copy out, the chunk's int4 sidecar snapshot
-    /// (the primary's own IU4 scratch is reused by later stages while the out
-    /// stream still reads), and the BF16 partial copied back.
-    x_f16: GpuTensor,
-    xq: GpuTensor,
-    partial: GpuTensor,
+    slots: Vec<PrefillSlot>,
+    current: std::sync::atomic::AtomicUsize,
+    defer: std::sync::atomic::AtomicBool,
     out: Mutex<Option<hip_bridge::Stream>>,
     back: Mutex<Option<hip_bridge::Stream>>,
-    published: hip_bridge::Event,
-    returned: hip_bridge::Event,
     /// `HIPFIRE_HETERO_PREFILL_TRACE=1`: per-layer stream times (synchronizes
-    /// at every join; diagnosis only).
+    /// at every join; diagnosis only; immediate joins only).
     trace: Option<PrefillTrace>,
 }
 
@@ -139,37 +150,51 @@ struct PrefillTrace {
 unsafe impl Send for HeteroPrefillShared {}
 unsafe impl Sync for HeteroPrefillShared {}
 
+fn word(addr: u64) -> &'static std::sync::atomic::AtomicU32 {
+    // SAFETY: a word of the live pinned mailbox.
+    unsafe { &*(addr as usize as *const std::sync::atomic::AtomicU32) }
+}
+
 impl HeteroPrefillShared {
-    /// Allocate the primary's buffers, streams and events on `gpu`.
+    /// Allocate the primary's buffers, streams and events on `gpu`, one set per
+    /// slot of `slot_offsets`.
     pub fn new(
         gpu: &mut Gpu,
         mailbox: u64,
-        offsets: PrefillOffsets,
+        slot_offsets: &[PrefillOffsets],
         geom: PrefillGeometry,
         n_experts: usize,
         counter: GpuTensor,
         max_polls: u32,
     ) -> Result<Self, DispatchError> {
+        if slot_offsets.is_empty() {
+            return Err(DispatchError::Hip("hetero prefill: no slot".into()));
+        }
         let words = (geom.max_rows * geom.dim).div_ceil(2);
-        let x_f16 = gpu.alloc_tensor(&[words], rdna_compute::DType::F32).map_err(hip)?;
-        let partial = gpu.alloc_tensor(&[words], rdna_compute::DType::F32).map_err(hip)?;
-        let xq = gpu
-            .alloc_tensor(&[(geom.max_rows * int4_row_bytes(geom.dim)).div_ceil(4)], rdna_compute::DType::F32)
-            .map_err(hip)?;
+        let xq_words = (geom.max_rows * int4_row_bytes(geom.dim)).div_ceil(4);
+        let mut slots = Vec::with_capacity(slot_offsets.len());
+        for &offsets in slot_offsets {
+            slots.push(PrefillSlot {
+                offsets,
+                x_f16: gpu.alloc_tensor(&[words], rdna_compute::DType::F32).map_err(hip)?,
+                xq: gpu.alloc_tensor(&[xq_words], rdna_compute::DType::F32).map_err(hip)?,
+                partial: gpu.alloc_tensor(&[words], rdna_compute::DType::F32).map_err(hip)?,
+                published: gpu.hip.event_create().map_err(hip)?,
+                returned: gpu.hip.event_create().map_err(hip)?,
+                pending: Default::default(),
+            });
+        }
         Ok(Self {
             mailbox,
-            offsets,
             geom,
             n_experts: n_experts as i32,
             counter,
             max_polls,
-            x_f16,
-            xq,
-            partial,
+            slots,
+            current: Default::default(),
+            defer: Default::default(),
             out: Mutex::new(Some(gpu.hip.stream_create_non_blocking().map_err(hip)?)),
             back: Mutex::new(Some(gpu.hip.stream_create_non_blocking().map_err(hip)?)),
-            published: gpu.hip.event_create().map_err(hip)?,
-            returned: gpu.hip.event_create().map_err(hip)?,
             trace: if std::env::var("HIPFIRE_HETERO_PREFILL_TRACE").is_ok_and(|v| v == "1") {
                 Some(PrefillTrace {
                     start: gpu.hip.event_create().map_err(hip)?,
@@ -185,18 +210,52 @@ impl HeteroPrefillShared {
         })
     }
 
-    /// The expert device's int4 floor (0 = F16 only), published at its start.
-    fn int4_min_rows(&self) -> usize {
-        let addr = self.mailbox as usize + self.offsets.int4_min_rows;
-        // SAFETY: a word of the live pinned mailbox.
-        unsafe { &*(addr as *const std::sync::atomic::AtomicU32) }.load(std::sync::atomic::Ordering::Acquire) as usize
+    pub fn slots(&self) -> usize {
+        self.slots.len()
     }
 
-    /// The shared error word (any sub-chunk's timed-out wait).
+    /// The slot the next publish uses (the layer-major schedule's tile).
+    pub fn set_slot(&self, slot: usize) -> Result<(), DispatchError> {
+        if slot >= self.slots.len() {
+            return Err(DispatchError::Hip(format!("hetero prefill: slot {slot} of {}", self.slots.len())));
+        }
+        self.current.store(slot, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn slot(&self) -> usize {
+        self.current.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// While set, sealed calls leave `JoinColdRows` to the caller
+    /// ([`HeteroPrefillSplit::join_slot`]).
+    pub fn set_defer_join(&self, on: bool) {
+        self.defer.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn defer_join(&self) -> bool {
+        self.defer.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The expert device's int4 floor (0 = F16 only), published at its start.
+    fn int4_min_rows(&self) -> usize {
+        word(self.mailbox + self.slots[0].offsets.int4_min_rows as u64).load(std::sync::atomic::Ordering::Acquire) as usize
+    }
+
+    /// Forget every owed join (an aborted request; its partials are dropped).
+    pub fn clear_pending(&self) {
+        for s in &self.slots {
+            s.pending.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The first nonzero error word of any slot (a timed-out wait).
     pub fn error_word(&self) -> u32 {
-        let addr = self.mailbox as usize + self.offsets.error;
-        // SAFETY: a word of the live pinned mailbox.
-        unsafe { &*(addr as *const std::sync::atomic::AtomicU32) }.load(std::sync::atomic::Ordering::Acquire)
+        self.slots
+            .iter()
+            .map(|s| word(self.mailbox + s.offsets.error as u64).load(std::sync::atomic::Ordering::Acquire))
+            .find(|&e| e != 0)
+            .unwrap_or(0)
     }
 }
 
@@ -252,7 +311,11 @@ impl HeteroPrefillSplit {
         if rows == 0 || rows > g.max_rows || top_k != g.top_k {
             return Err(DispatchError::Hip(format!("hetero prefill: {rows} rows x top {top_k} outside the slot")));
         }
-        let (mb, o, dim) = (sh.mailbox, sh.offsets, g.dim);
+        let ps = &sh.slots[sh.slot()];
+        if ps.pending.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return Err(DispatchError::Hip("hetero prefill: publish into a slot whose join is still owed".into()));
+        }
+        let (mb, o, dim) = (sh.mailbox, ps.offsets, g.dim);
         if let Some(t) = &sh.trace {
             gpu.hip.event_record(&t.start, gpu.active_stream.as_ref()).map_err(hip)?;
             if xq.is_none() {
@@ -268,7 +331,7 @@ impl HeteroPrefillSplit {
             rows as i32,
             top_k as i32,
             dim as i32,
-            &sh.x_f16,
+            &ps.x_f16,
             mb + o.ids as u64,
             mb + o.weights as u64,
             &self.masked_ids,
@@ -282,15 +345,15 @@ impl HeteroPrefillSplit {
                 // SAFETY: the chunk's live int4 sidecar (`rows` rows).
                 let src = unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, rows * i4) };
                 match gpu.active_stream.as_ref() {
-                    Some(st) => gpu.hip.memcpy_dtod_async_at(&sh.xq.buf, 0, &src, 0, rows * i4, st),
-                    None => gpu.hip.memcpy_dtod_async_default_at(&sh.xq.buf, 0, &src, 0, rows * i4),
+                    Some(st) => gpu.hip.memcpy_dtod_async_at(&ps.xq.buf, 0, &src, 0, rows * i4, st),
+                    None => gpu.hip.memcpy_dtod_async_default_at(&ps.xq.buf, 0, &src, 0, rows * i4),
                 }
                 .map_err(hip)?;
-                Some(sh.xq.buf.as_ptr())
+                Some(ps.xq.buf.as_ptr())
             }
             None => None,
         };
-        gpu.hip.event_record(&sh.published, gpu.active_stream.as_ref()).map_err(hip)?;
+        gpu.hip.event_record(&ps.published, gpu.active_stream.as_ref()).map_err(hip)?;
         let subs = g.sub_chunks_for(rows);
         let split = PrefillGeometry { sub_chunks: subs, ..g };
         let floor = sh.int4_min_rows();
@@ -302,7 +365,7 @@ impl HeteroPrefillSplit {
             )
         };
         on_stream(gpu, &sh.out, |gpu| {
-            gpu.hip.stream_wait_event_on(gpu.active_stream.as_ref(), &sh.published).map_err(hip)?;
+            gpu.hip.stream_wait_event_on(gpu.active_stream.as_ref(), &ps.published).map_err(hip)?;
             for i in 0..subs {
                 let (off, n) = split.sub_range(rows, i);
                 if n == 0 {
@@ -321,7 +384,7 @@ impl HeteroPrefillSplit {
                 } else {
                     let st = gpu.active_stream.as_ref().expect("side stream installed");
                     gpu.hip
-                        .memcpy_dtod_async_at(&mb_x, off * dim * 2, &sh.x_f16.buf, off * dim * 2, n * dim * 2, st)
+                        .memcpy_dtod_async_at(&mb_x, off * dim * 2, &ps.x_f16.buf, off * dim * 2, n * dim * 2, st)
                         .map_err(hip)?;
                     ROWS_F16
                 };
@@ -336,7 +399,7 @@ impl HeteroPrefillSplit {
             Ok(())
         })?;
         on_stream(gpu, &sh.back, |gpu| {
-            gpu.hip.stream_wait_event_on(gpu.active_stream.as_ref(), &sh.published).map_err(hip)?;
+            gpu.hip.stream_wait_event_on(gpu.active_stream.as_ref(), &ps.published).map_err(hip)?;
             for i in 0..subs {
                 let (off, n) = split.sub_range(rows, i);
                 if n == 0 {
@@ -355,10 +418,10 @@ impl HeteroPrefillSplit {
                 gpu.hetero_await_cold(&sh.counter, self.layer, self.layers, &slot, sh.max_polls).map_err(hip)?;
                 let st = gpu.active_stream.as_ref().expect("side stream installed");
                 gpu.hip
-                    .memcpy_dtod_async_at(&sh.partial.buf, off * dim * 2, &mb_part, off * dim * 2, n * dim * 2, st)
+                    .memcpy_dtod_async_at(&ps.partial.buf, off * dim * 2, &mb_part, off * dim * 2, n * dim * 2, st)
                     .map_err(hip)?;
             }
-            gpu.hip.event_record(&sh.returned, gpu.active_stream.as_ref()).map_err(hip)
+            gpu.hip.event_record(&ps.returned, gpu.active_stream.as_ref()).map_err(hip)
         })
     }
 
@@ -366,33 +429,52 @@ impl HeteroPrefillSplit {
     /// BF16 cold partial into `x_batch` (skipped after a timed-out wait).
     pub fn join(&self, gpu: &mut Gpu, rows: usize, x_batch: &GpuTensor) -> Result<(), DispatchError> {
         let sh = &*self.shared;
+        let s = sh.slot();
         if let Some(t) = &sh.trace {
+            let slot = &sh.slots[s];
             gpu.hip.event_record(&t.hot, gpu.active_stream.as_ref()).map_err(hip)?;
             gpu.hip.event_synchronize(&t.hot).map_err(hip)?;
-            gpu.hip.event_synchronize(&sh.returned).map_err(hip)?;
+            gpu.hip.event_synchronize(&slot.returned).map_err(hip)?;
             let hot = gpu.hip.event_elapsed_ms(&t.start, &t.hot).map_err(hip)? as f64;
-            let cold = gpu.hip.event_elapsed_ms(&t.start, &sh.returned).map_err(hip)? as f64;
-            if let Ok(mut s) = t.sums.lock() {
-                *s = (s.0 + 1, s.1 + rows as u64, s.2 + hot, s.3 + cold);
-                if s.0 % self.layers as u64 == 0 {
-                    let n = s.0 as f64;
+            let cold = gpu.hip.event_elapsed_ms(&t.start, &slot.returned).map_err(hip)? as f64;
+            if let Ok(mut sums) = t.sums.lock() {
+                *sums = (sums.0 + 1, sums.1 + rows as u64, sums.2 + hot, sums.3 + cold);
+                if sums.0 % self.layers as u64 == 0 {
+                    let n = sums.0 as f64;
                     eprintln!(
                         "hetero prefill trace: {} layers, {:.0} rows/layer avg: publish->hot combine {:.2} ms, publish->cold returned {:.2} ms; blocks int4 {} f16 {}, calls without a sidecar {} (floor {})",
-                        s.0,
-                        s.1 as f64 / n,
-                        s.2 / n,
-                        s.3 / n,
+                        sums.0,
+                        sums.1 as f64 / n,
+                        sums.2 / n,
+                        sums.3 / n,
                         t.int4.swap(0, std::sync::atomic::Ordering::Relaxed),
                         t.f16.swap(0, std::sync::atomic::Ordering::Relaxed),
                         t.no_xq.swap(0, std::sync::atomic::Ordering::Relaxed),
                         sh.int4_min_rows()
                     );
-                    *s = (0, 0, 0.0, 0.0);
+                    *sums = (0, 0, 0.0, 0.0);
                 }
             }
         }
-        gpu.hip.stream_wait_event_on(gpu.active_stream.as_ref(), &sh.returned).map_err(hip)?;
-        gpu.hetero_add_partial(sh.mailbox + sh.offsets.error as u64, &sh.partial, (rows * sh.geom.dim) as i32, x_batch)
+        self.join_slot(gpu, s, rows, x_batch)
+    }
+
+    /// The join of slot `slot` (the layer-major schedule's deferred join):
+    /// the main stream waits for that slot's exchange, then adds its BF16 cold
+    /// partial into `x_batch` (skipped after any timed-out wait).
+    pub fn join_slot(&self, gpu: &mut Gpu, slot: usize, rows: usize, x_batch: &GpuTensor) -> Result<(), DispatchError> {
+        let sh = &*self.shared;
+        let st = sh
+            .slots
+            .get(slot)
+            .ok_or_else(|| DispatchError::Hip(format!("hetero prefill: slot {slot} of {}", sh.slots.len())))?;
+        if !st.pending.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            // The call did not take the exchange (its own combine carried the
+            // cold experts): nothing to add.
+            return Ok(());
+        }
+        gpu.hip.stream_wait_event_on(gpu.active_stream.as_ref(), &st.returned).map_err(hip)?;
+        gpu.hetero_add_partial(sh.mailbox + st.offsets.error as u64, &st.partial, (rows * sh.geom.dim) as i32, x_batch)
             .map_err(hip)
     }
 }

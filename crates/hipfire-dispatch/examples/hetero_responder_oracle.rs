@@ -220,7 +220,7 @@ fn main() {
         mailbox_base: mb as u64,
         n_experts: N_EXP,
         mi: MI,
-        prefill: Some(PrefillServe { offsets: po, sub_chunks: MAX_SUB_CHUNKS, cold: cold_cfg }),
+        prefill: vec![PrefillServe { offsets: po, sub_chunks: MAX_SUB_CHUNKS, cold: cold_cfg }],
     };
     let responder = HeteroResponder::start(cfg, vec![layer.clone(); LAYERS]).unwrap_or_else(|e| fail(format!("start: {e:?}")));
 

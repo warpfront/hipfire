@@ -96,7 +96,7 @@ pub enum MoeStage {
     PublishColdRows,
     /// Hetero prefill: the main stream waits for the exchange, then adds the
     /// expert device's BF16 cold partial into the residual (skipped after a
-    /// timed-out wait). After the hot `Combine`, before `SharedDown`.
+    /// timed-out wait). Last: after the hot `Combine` and `SharedDown`.
     JoinColdRows,
 }
 
@@ -265,6 +265,9 @@ pub(super) struct MoePrefillSelection {
     /// the cold experts run on the expert device while the hot routed tail
     /// runs here on device-masked ids. Exclusive with every CPU mode.
     pub(super) hetero_prefill: bool,
+    /// The caller runs the join (`HeteroPrefillSplit::join_slot`) after other
+    /// work: `JoinColdRows` is not lowered (the layer-major hetero schedule).
+    pub(super) hetero_defer_join: bool,
 }
 
 impl MoePrefillSelection {
@@ -2827,9 +2830,13 @@ fn lower_prefill<'a>(
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Down))?;
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::MutationFence))?;
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
-            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::JoinColdRows))?;
             if params.recipe.shared_after_combine() {
                 append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
+            }
+            // Last: hot, then shared, then cold, the order the layer-major
+            // schedule's deferred join has, so the two schedules agree bitwise.
+            if !selection.hetero_defer_join {
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::JoinColdRows))?;
             }
             return Ok(steps);
         }
@@ -3301,7 +3308,12 @@ pub(super) fn execute_after_clear(
         super::layer_ops::execute_clear(gpu, clear)?;
     }
     state.initial_zero.set(absorbed);
-    if let Some(write) = hc {
+    // Hetero prefill: the cold partial is added after the shared down, so an
+    // HC write folded into the shared down's epilogue would miss it.
+    let hetero_prefill = state
+        .prefill_parts()
+        .is_ok_and(|(_, selection)| selection.hetero_prefill);
+    if let Some(write) = hc.filter(|_| !hetero_prefill) {
         let mut offered = super::qt44_qt53_prefill::HcSharedDown::offer(write);
         if let (Some(offered), Some((read, next_write))) = (offered.as_mut(), next) {
             if let Ok((params, selection)) = state.prefill_parts() {
@@ -4420,6 +4432,7 @@ pub(super) fn select_prefill(
             cpu_split: false,
             cpwait: false,
             hetero_prefill: false,
+            hetero_defer_join: false,
         });
     }
     let route = (matches!(params.recipe, MoeRecipe::SoftmaxGatedShared { .. })
@@ -4740,6 +4753,11 @@ pub(super) fn select_prefill(
         cpu_deferred_experts: params.cpu_deferred_experts,
         cpu_split,
         hetero_prefill,
+        hetero_defer_join: hetero_prefill
+            && params
+                .routed_experts
+                .hetero_prefill()
+                .is_some_and(|split| split.shared.defer_join()),
         cpwait: cpu_split
             && cpu_split_executor_for_join(
                 params.routed_experts,
