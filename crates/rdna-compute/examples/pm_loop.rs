@@ -1407,7 +1407,7 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
     }
 
     // 3. correctness on the card
-    let gpu = match Gpu::init() {
+    let mut gpu = match Gpu::init() {
         Ok(g) => g,
         Err(e) => return fail(rec, "gpu_init", err(e)),
     };
@@ -1485,8 +1485,17 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
     if !detail.is_null() {
         rec["correctness"]["identity_by_buffer"] = detail;
     }
-    // `--flush`: the arms must also agree on every member of the weight pool.
+    // The product launcher on the same inputs must reproduce the shipped baseline's bytes.
     let mut pass = pass;
+    let product = w.product_oracle(&mut gpu, &base_out);
+    if !product.is_null() {
+        if product["pass"] != json!(true) {
+            pass = false;
+            rec["correctness"]["pass"] = json!(false);
+        }
+        rec["correctness"]["product_launcher"] = product;
+    }
+    // `--flush`: the arms must also agree on every member of the weight pool.
     if w.pool_sets() > 1 {
         match pool_identity(&gpu, &*w, &bf, &cf) {
             Ok(p) => {

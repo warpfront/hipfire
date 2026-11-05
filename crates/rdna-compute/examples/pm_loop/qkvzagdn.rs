@@ -954,6 +954,17 @@ impl Workload for Qkvzagdn {
         Ok(worst)
     }
 
+    /// The product launcher (`Gpu::gemm_qkvza_mq4g256v2_iu4_gdn_prepared`) on the same weights,
+    /// activations (reserved int4 scratch; slab planes + `mark_int4_mmq_slab` for the slab layout),
+    /// conv inputs and q_scale/eps as the arms: its Z, beta, alpha, q, k, v and raw-row outputs must
+    /// equal the shipped baseline arm's bytes.
+    fn product_oracle(&self, gpu: &mut Gpu, base_out: &[u8]) -> Value {
+        match self.product_run(gpu, base_out) {
+            Ok(v) => v,
+            Err(e) => json!({"pass": false, "error": e}),
+        }
+    }
+
     fn requires_baseline_identity(&self) -> bool {
         true
     }
@@ -966,6 +977,80 @@ impl Workload for Qkvzagdn {
 }
 
 impl Qkvzagdn {
+    fn product_run(&self, gpu: &mut Gpu, base_out: &[u8]) -> Result<Value> {
+        use rdna_compute::{F2GdnTargets, Int4MmqPrepared};
+        let inp = self.inputs.as_ref().ok_or("product oracle before setup")?;
+        let (k, n) = (self.k, self.n);
+        let sb = section_bytes(n);
+        // The loader marks the weights symmetric MQ4V2 (`iu4_gdn_fold_active`).
+        gpu.mq4v2_symmetric = true;
+        let up = |gpu: &Gpu, b: &[u8]| gpu.upload_raw(b, &[b.len()]).map_err(dev_err);
+        let a_qkv = up(gpu, &inp.hq.w)?;
+        let a_z = up(gpu, &inp.hz.w)?;
+        let conv_w = up(gpu, &inp.conv_w)?;
+        let conv_state = up(gpu, &inp.conv_state)?;
+        let out: Vec<_> = (0..OUTPUTS)
+            .map(|i| up(gpu, &vec![POISON; sb[i]]))
+            .collect::<Result<_>>()?;
+        let reservation = gpu.reserve_int4_mmq(k, n).map_err(dev_err)?;
+        let xq = match self.base.act {
+            ALayout::Token => inp.hq.recs.clone(),
+            ALayout::Slab => to_slab(&inp.hq.recs, n),
+        };
+        {
+            let scratch = gpu
+                .scratch
+                .int4_mmq_x_scratch
+                .as_ref()
+                .ok_or("reserve_int4_mmq left no int4 scratch")?;
+            gpu.hip.memcpy_htod(scratch, &xq).map_err(dev_err)?;
+        }
+        let prepared = Int4MmqPrepared::from_reservation(reservation);
+        if self.base.act == ALayout::Slab {
+            gpu.scratch.mark_int4_mmq_slab(&prepared).map_err(dev_err)?;
+        }
+        let targets = F2GdnTargets {
+            conv_weight: &conv_w,
+            conv_state: &conv_state,
+            q: &out[3],
+            k: &out[4],
+            v: &out[5],
+            q_scale: q_scale(),
+            eps: EPS,
+        };
+        let admitted = gpu
+            .gemm_qkvza_mq4g256v2_iu4_gdn_prepared(
+                &a_qkv, &a_z, &prepared, &out[6], &out[0], &out[1], &out[2], DIMS, k, n, &targets,
+            )
+            .map_err(dev_err)?;
+        if !admitted {
+            return Ok(json!({
+                "pass": false, "admitted": false,
+                "reason": "gemm_qkvza_mq4g256v2_iu4_gdn_prepared returned Ok(false) (iu4_gdn_fold_active or a buffer predicate declined)",
+            }));
+        }
+        gpu.hip.device_synchronize().map_err(dev_err)?;
+        let mut rows = Vec::new();
+        let mut all = true;
+        for (i, t) in out.iter().enumerate() {
+            let mut v = vec![0u8; t.buf.size()];
+            gpu.hip.memcpy_dtoh(&mut v, &t.buf).map_err(dev_err)?;
+            let want = self.section(base_out, i).0;
+            let same = v[..sb[i]] == *want;
+            all &= same;
+            rows.push(json!({
+                "buffer": SECTIONS[i], "bytes": sb[i], "identical_to_baseline_arm": same,
+                "first_differing_byte": v[..sb[i]].iter().zip(want).position(|(a, b)| a != b),
+            }));
+        }
+        let want_symbol = abi_of(self.base).exports[0].symbol;
+        Ok(json!({
+            "pass": all, "admitted": true, "launcher": "Gpu::gemm_qkvza_mq4g256v2_iu4_gdn_prepared",
+            "activations": if self.base.act == ALayout::Slab { "slab (mark_int4_mmq_slab)" } else { "token" },
+            "expected_symbol": want_symbol, "buffers": rows,
+        }))
+    }
+
     fn try_launch(&self, arm: Arm) -> Result<Launch> {
         let dev = self.dev.as_ref().ok_or("launch before setup")?;
         let spec = self.spec_of(arm);

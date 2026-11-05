@@ -156,6 +156,14 @@ pub trait Workload {
         Value::Null
     }
 
+    /// Run the PRODUCT launcher on the same inputs as the arms and compare its outputs with the
+    /// shipped baseline arm's payload `base_out`; recorded as `correctness.product_launcher`
+    /// (`Null`: the workload has no product launcher to cross-check). A record with
+    /// `"pass": false` fails correctness.
+    fn product_oracle(&self, _gpu: &mut Gpu, _base_out: &[u8]) -> Value {
+        Value::Null
+    }
+
     /// `true` when correctness requires the candidate's output to be bitwise
     /// equal to the shipped baseline in addition to passing the CPU reference.
     fn requires_baseline_identity(&self) -> bool {
