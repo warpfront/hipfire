@@ -146,10 +146,7 @@ static MQ2_XBATCH_PM: LazyLock<bool> =
 
 static MQ2_XBATCH_PM_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(|| {
     use sha2::{Digest, Sha256};
-    let actual = format!(
-        "{:x}",
-        Sha256::digest(kernels::GEMV_MQ2_XBATCH_PM_GFX1201)
-    );
+    let actual = format!("{:x}", Sha256::digest(kernels::GEMV_MQ2_XBATCH_PM_GFX1201));
     if actual == kernels::GEMV_MQ2_XBATCH_PM_GFX1201_SHA256 {
         Ok(())
     } else {
@@ -42652,16 +42649,7 @@ impl Gpu {
         } else {
             ("gemv_mq4g256v2_xbatch", kernels::GEMV_MQ4G256V2_XBATCH_SRC)
         };
-        self.gemv_v2_xbatch_rows(
-            func,
-            XbatchCode::Hip(source),
-            a_raw,
-            x,
-            y,
-            m,
-            k,
-            batch_size,
-        )
+        self.gemv_v2_xbatch_rows(func, XbatchCode::Hip(source), a_raw, x, y, m, k, batch_size)
     }
 
     /// Launch an x-batched V2 GEMV (`A, x, y, M, K, B` ABI) over `batch_size`
@@ -46933,16 +46921,7 @@ impl Gpu {
         } else {
             ("gemv_mq6g256v2_xbatch", kernels::GEMV_MQ6G256V2_XBATCH_SRC)
         };
-        self.gemv_v2_xbatch_rows(
-            func,
-            XbatchCode::Hip(source),
-            a_raw,
-            x,
-            y,
-            m,
-            k,
-            batch_size,
-        )
+        self.gemv_v2_xbatch_rows(func, XbatchCode::Hip(source), a_raw, x, y, m, k, batch_size)
     }
 
     pub fn gemm_mq6g256v2_batched_lmhead(
