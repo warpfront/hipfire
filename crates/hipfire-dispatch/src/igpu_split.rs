@@ -141,25 +141,57 @@ struct Job {
 /// A gfx1151 `Gpu` on a worker thread, computing D2 cold slots.
 pub struct IgpuColdArm {
     dims: ColdArmDims,
+    /// `HIPFIRE_IGPU_ARM_TRACE=1`: per-call timing totals, printed at drop.
+    trace: Option<Mutex<ArmTrace>>,
     tx: Mutex<Option<Sender<Job>>>,
-    rx: Mutex<Receiver<Result<(), String>>>,
+    rx: Mutex<Receiver<Result<(u64, u64), String>>>,
     poisoned: AtomicBool,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
+/// Accumulated timings (ns) of a traced arm.
+#[derive(Default, Debug)]
+struct ArmTrace {
+    calls: u64,
+    slots: u64,
+    caller_ns: u64,
+    copy_ns: u64,
+    kernel_sync_ns: u64,
+}
+
+impl ArmTrace {
+    fn report(&self) {
+        let per = |ns: u64| ns as f64 / self.calls.max(1) as f64 / 1e3;
+        eprintln!(
+            "igpu-arm trace: {} calls, {:.2} cold slots/call; per call: caller wait {:.1} us = copies {:.1} us + kernels+sync {:.1} us + handoff",
+            self.calls,
+            self.slots as f64 / self.calls.max(1) as f64,
+            per(self.caller_ns),
+            per(self.copy_ns),
+            per(self.kernel_sync_ns)
+        );
+    }
+}
+
 struct Worker {
     gpu: rdna_compute::Gpu,
+    /// The two pointer tables and the masked ids are written by the CPU into
+    /// one pinned staging area, then reach one device buffer by ONE host-async
+    /// copy queued ahead of the kernels (kernels read cached device memory; a
+    /// coherent host table is read uncached, and a synchronous copy blocks).
+    /// Each job's final device synchronize retires the copy before a rewrite.
+    pinned: [(*mut std::ffi::c_void, usize); 3],
+    staging: (*mut u8, usize),
+    tables: rdna_compute::GpuTensor,
     gate_up_ptrs: rdna_compute::GpuTensor,
     down_ptrs: rdna_compute::GpuTensor,
     ids: rdna_compute::GpuTensor,
+    /// Addresses already proven device-accessible (expert spans repeat across
+    /// tokens, activation and output buffers per executor): one query each.
+    verified: std::collections::HashSet<u64>,
     gate: rdna_compute::GpuTensor,
     up: rdna_compute::GpuTensor,
     rot: rdna_compute::GpuTensor,
-}
-
-fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
-    // SAFETY: plain-old-data slices (i32 / u64) viewed as bytes.
-    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
 }
 
 /// A non-owning tensor over pinned host memory, which is the same address on
@@ -185,10 +217,42 @@ impl Worker {
             gpu.alloc_tensor(&[n], rdna_compute::DType::F32).map_err(|e| e.to_string())
         };
         let slots = d.max_rows * d.top_k;
+        let flags = hip_bridge::HIP_HOST_MALLOC_MAPPED | hip_bridge::HIP_HOST_MALLOC_COHERENT;
+        // Layout of both the staging area and the device buffer.
+        let sizes = [d.n_experts * 8, d.n_experts * 8, slots * 4];
+        let total: usize = sizes.iter().sum();
+        let staging = gpu.hip.host_malloc(total, flags).map_err(|e| e.to_string())?.cast::<u8>();
+        let tables = match gpu.alloc_tensor(&[total / 4], rdna_compute::DType::F32) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = gpu.hip.host_free(staging.cast());
+                return Err(e.to_string());
+            }
+        };
+        let base = tables.buf.as_ptr() as usize;
+        let mut pinned = [(std::ptr::null_mut(), 0usize); 3];
+        let mut off = 0;
+        for (i, &bytes) in sizes.iter().enumerate() {
+            // SAFETY: inside the staging allocation (offsets sum to `total`).
+            pinned[i] = (unsafe { staging.add(off) }.cast(), bytes);
+            off += bytes;
+        }
+        // SAFETY: views into `tables` (live for the worker), same offsets.
+        let (gate_up_ptrs, down_ptrs, ids) = unsafe {
+            (
+                borrowed(base, sizes[0]),
+                borrowed(base + sizes[0], sizes[1]),
+                borrowed(base + sizes[0] + sizes[1], sizes[2]),
+            )
+        };
         Ok(Self {
-            gate_up_ptrs: f32s(&mut gpu, 2 * d.n_experts)?,
-            down_ptrs: f32s(&mut gpu, 2 * d.n_experts)?,
-            ids: f32s(&mut gpu, slots)?,
+            pinned,
+            staging: (staging, total),
+            tables,
+            gate_up_ptrs,
+            down_ptrs,
+            ids,
+            verified: std::collections::HashSet::new(),
             gate: f32s(&mut gpu, slots * d.mi)?,
             up: f32s(&mut gpu, slots * d.mi)?,
             rot: f32s(&mut gpu, slots * d.mi)?,
@@ -196,23 +260,48 @@ impl Worker {
         })
     }
 
-    fn run(&mut self, d: ColdArmDims, job: &Job) -> Result<(), String> {
-        let g = &mut self.gpu;
+    /// Returns `(copy_ns, kernel_sync_ns)`.
+    fn run(&mut self, d: ColdArmDims, job: &Job) -> Result<(u64, u64), String> {
+        let t0 = std::time::Instant::now();
         let s = |e: hip_bridge::HipError| e.to_string();
-        // Refuse (never fault on) any span the iGPU cannot read in place.
-        let lookup = |p: u64| {
-            // SAFETY: a one-byte non-owning view, used only for the attribute query.
-            let probe = unsafe { hip_bridge::DeviceBuffer::from_raw(p as *mut std::ffi::c_void, 1) };
-            g.hip.pointer_get_attributes(&probe).ok().map(|a| a.device_pointer as u64)
-        };
-        let spans = [job.x.0 as u64, job.out.0 as u64];
-        check_device_accessible(&spans, lookup)
-            .and_then(|()| check_device_accessible(&job.gate_up, lookup))
-            .and_then(|()| check_device_accessible(&job.down, lookup))
-            .map_err(|e| format!("{e:?}"))?;
-        g.memcpy_htod_auto(&self.ids.buf, as_bytes(&job.masked_ids)).map_err(s)?;
-        g.memcpy_htod_auto(&self.gate_up_ptrs.buf, as_bytes(&job.gate_up)).map_err(s)?;
-        g.memcpy_htod_auto(&self.down_ptrs.buf, as_bytes(&job.down)).map_err(s)?;
+        // Refuse (never fault on) any span the iGPU cannot read in place; each
+        // distinct address is queried once.
+        {
+            let hip = &self.gpu.hip;
+            let verified = &self.verified;
+            let lookup = |p: u64| {
+                if verified.contains(&p) {
+                    return Some(p);
+                }
+                // SAFETY: a one-byte non-owning view, used only for the attribute query.
+                let probe = unsafe { hip_bridge::DeviceBuffer::from_raw(p as *mut std::ffi::c_void, 1) };
+                hip.pointer_get_attributes(&probe).ok().map(|a| a.device_pointer as u64)
+            };
+            let spans = [job.x.0 as u64, job.out.0 as u64];
+            check_device_accessible(&spans, lookup)
+                .and_then(|()| check_device_accessible(&job.gate_up, lookup))
+                .and_then(|()| check_device_accessible(&job.down, lookup))
+                .map_err(|e| format!("{e:?}"))?;
+        }
+        let fresh = [job.x.0 as u64, job.out.0 as u64]
+            .into_iter()
+            .chain(job.gate_up.iter().copied())
+            .chain(job.down.iter().copied())
+            .filter(|&p| p != 0);
+        self.verified.extend(fresh);
+        // SAFETY: the pinned buffers hold exactly these extents (sizes from the
+        // same dims) and no kernel reads them: the previous job synchronized.
+        unsafe {
+            std::ptr::copy_nonoverlapping(job.gate_up.as_ptr(), self.pinned[0].0.cast::<u64>(), job.gate_up.len());
+            std::ptr::copy_nonoverlapping(job.down.as_ptr(), self.pinned[1].0.cast::<u64>(), job.down.len());
+            std::ptr::copy_nonoverlapping(job.masked_ids.as_ptr(), self.pinned[2].0.cast::<i32>(), job.masked_ids.len());
+        }
+        let g = &mut self.gpu;
+        // SAFETY: the staging area was just written above and stays unchanged
+        // until this job's final synchronize, after the copy has executed.
+        let staged = unsafe { std::slice::from_raw_parts(self.staging.0, self.staging.1) };
+        g.hip.memcpy_htod_async_default(&self.tables.buf, staged).map_err(s)?;
+        let t1 = std::time::Instant::now();
         // SAFETY: the caller blocks on this job, so both spans stay live.
         let (x, out) = unsafe { (borrowed(job.x.0, job.x.1), borrowed(job.out.0, job.out.1)) };
         g.gemv_mq4g256v2_moe_gate_up_top10_indexed_batched(
@@ -227,7 +316,18 @@ impl Worker {
             &self.down_ptrs, &self.ids, &self.rot, &out, d.dim, d.mi, job.rows, d.n_experts, d.top_k,
         )
         .map_err(s)?;
-        g.hip.device_synchronize().map_err(s)
+        g.hip.device_synchronize().map_err(s)?;
+        let t2 = std::time::Instant::now();
+        Ok(((t1 - t0).as_nanos() as u64, (t2 - t1).as_nanos() as u64))
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        let _ = self.gpu.hip.device_synchronize();
+        if !self.staging.0.is_null() {
+            let _ = self.gpu.hip.host_free(self.staging.0.cast());
+        }
     }
 }
 
@@ -239,13 +339,13 @@ impl IgpuColdArm {
             return Err(err(format!("top_k {} (the qt44/qt53 top-10 kernels need 10)", dims.top_k)));
         }
         let (tx, jobs) = mpsc::channel::<Job>();
-        let (reply, rx) = mpsc::channel::<Result<(), String>>();
+        let (reply, rx) = mpsc::channel::<Result<(u64, u64), String>>();
         let worker = std::thread::Builder::new()
             .name("igpu-cold-arm".into())
             .spawn(move || {
                 let mut w = match Worker::open(ordinal, dims) {
                     Ok(w) => {
-                        let _ = reply.send(Ok(()));
+                        let _ = reply.send(Ok((0, 0)));
                         w
                     }
                     Err(e) => {
@@ -263,8 +363,12 @@ impl IgpuColdArm {
         rx.recv()
             .map_err(|_| err("worker exited before it was ready"))?
             .map_err(|e| err(format!("open gfx1151 device {ordinal}: {e}")))?;
+        let trace = hipfire_config::developer_var("HIPFIRE_IGPU_ARM_TRACE")
+            .is_ok_and(|v| v == "1")
+            .then(|| Mutex::new(ArmTrace::default()));
         Ok(Self {
             dims,
+            trace,
             tx: Mutex::new(Some(tx)),
             rx: Mutex::new(rx),
             poisoned: AtomicBool::new(false),
@@ -318,9 +422,24 @@ impl IgpuColdArm {
             self.poisoned.store(true, Ordering::Release);
             err("worker is gone")
         })?;
+        let t_call = std::time::Instant::now();
         let rx = self.rx.lock().map_err(|_| err("reply lock poisoned"))?;
         match rx.recv_timeout(bound) {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok((copy_ns, kernel_ns))) => {
+                if let Some(t) = &self.trace {
+                    if let Ok(mut t) = t.lock() {
+                        t.calls += 1;
+                        t.slots += host_slots.len() as u64;
+                        t.caller_ns += t_call.elapsed().as_nanos() as u64;
+                        t.copy_ns += copy_ns;
+                        t.kernel_sync_ns += kernel_ns;
+                        if t.calls % 2048 == 0 {
+                            t.report();
+                        }
+                    }
+                }
+                Ok(())
+            }
             Ok(Err(e)) => {
                 self.poisoned.store(true, Ordering::Release);
                 Err(err(e))
@@ -339,6 +458,9 @@ impl IgpuColdArm {
 
 impl Drop for IgpuColdArm {
     fn drop(&mut self) {
+        if let Some(Ok(t)) = self.trace.as_ref().map(|t| t.lock()) {
+            t.report();
+        }
         // Closing the job channel ends the worker loop after its in-flight job,
         // whose device_synchronize drains the iGPU before the Gpu drops.
         if let Ok(mut tx) = self.tx.lock() {
