@@ -495,3 +495,4 @@ v_cmp_gt_u64_e64	vop3	0x5c	VDST:64,SRC0:64,SRC1:64	VDST	SRC0,SRC1	-	-	v_cmp_gt_u
 v_cmpx_ne_u64_e32	vopc	0xdd	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_ne_u64_e32 0, v[0:1]	7DBA0080	-
 v_cmpx_le_u64_e32	vopc	0xdb	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_le_u64_e32 s[22:23], v[2:3]	7DB60416	-
 s_code_end	sopp	0x1f	-	-	-	-	-	s_code_end	BF9F0000	-
+v_cmp_o_f32_e64	vop3	0x17	VDST:64,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_cmp_o_f32_e64 s0, v1, v2	D4170000 02020501	src2_unused:ignored:0x1ff:0x00/0x80/0x101

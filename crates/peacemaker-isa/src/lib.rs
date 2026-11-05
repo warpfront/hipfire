@@ -26,6 +26,7 @@ pub mod hip_twin;
 pub mod insn;
 pub mod lds;
 pub mod ledger;
+pub mod libm;
 pub mod native;
 #[path = "kernels/npu_trunk.rs"]
 pub mod npu_trunk;
@@ -64,6 +65,7 @@ pub mod kernels {
     pub mod lane_rows_bf16_gfx1201;
     pub mod lane_rows_mq6_gfx1201;
     pub mod legacy_mq4_rowtiles;
+    pub mod libm_exact;
     pub mod moe_rotate_i4_pm;
     pub mod moe_slot_ops;
     pub mod mq4_fp8_verify;

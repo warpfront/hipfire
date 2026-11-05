@@ -36,6 +36,11 @@ required-features = ["toolchain"]
 name = "cdna_card_tierc"
 required-features = ["lab"]
 
+# GPU exactness harness of the exact libm lowerings against hipcc (fabric job; HIP runtime).
+[[example]]
+name = "libm_exact"
+required-features = ["lab"]
+
 # One-card gfx1201 smoke of the persistent-megakernel prerequisites (fabric job; HIP runtime).
 [[example]]
 name = "pm_persistent_smoke"

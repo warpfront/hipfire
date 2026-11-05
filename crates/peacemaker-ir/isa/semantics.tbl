@@ -573,3 +573,4 @@ v_max3_u32	alu
 v_cmpx_neq_f16_e32	alu
 v_cmpx_ne_u64_e32	alu
 v_cmpx_le_u64_e32	alu
+v_cmp_o_f32_e64	alu

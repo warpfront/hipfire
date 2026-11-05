@@ -153,6 +153,8 @@ const V_CMP_EQ_F32: &[u32] = &[0x7c241103];
 const V_CMP_NEQ_F32: &[u32] = &[0x7c3a88ff, 0xff800000];
 /// `v_cmp_o_f32_e32 vcc_lo, v10, v10`
 const V_CMP_O_F32: &[u32] = &[0x7c2e150a];
+/// `v_cmp_o_f32_e64 s4, v10, v10` (the SGPR-mask form of the ordered test; used by the `libm` powf lowering)
+const V_CMP_O_F32_E64: &[u32] = &[0xd4170004, 0x0202150a];
 /// `v_cmp_le_f32_e32 vcc_lo, v1, v2`
 const V_CMP_LE_F32: &[u32] = &[0x7c260501];
 /// `v_cmp_ge_i32_e32 vcc_lo, s9, v1`
@@ -584,6 +586,11 @@ fn f32_compares_follow_ieee_ordering() {
     setv(&mut st, 10, &[ONE, NAN, INF]);
     run(V_CMP_O_F32, &mut st).unwrap();
     assert_eq!(st.vcc, 0b101);
+    // v_cmp_o_f32_e64 s4, v10, v10: the same ordered test into an SGPR lane mask.
+    st.s[4] = 0xdead_beef;
+    st.exec = 0b111;
+    run(V_CMP_O_F32_E64, &mut st).unwrap();
+    assert_eq!(st.s[4] & 0b111, 0b101);
     // v_cmp_le_f32 vcc, v1, v2: (1,2) true, (2,1) false, (-0,0) true, NaN false.
     st.exec = 0b1111;
     setv(&mut st, 1, &[ONE, TWO, NEG_ZERO, NAN]);

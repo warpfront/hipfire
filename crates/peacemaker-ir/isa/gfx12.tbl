@@ -565,3 +565,4 @@ v_max_u32_e32	vop2	0x14	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_max_u32_e
 v_max3_u32	vop3	0x21e	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_max3_u32 v42, v42, v46, v47	D61E002A 04BE5D2A	-
 v_cmpx_neq_f16_e32	vopc	0x8d	SRC0:16,VSRC1:16	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_neq_f16_e32 0, v42.l	7D1A5480	-
 v_cmpx_ne_u64_e32	vopc	0xdd	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_ne_u64_e32 0, v[0:1]	7DBA0080	-
+v_cmp_o_f32_e64	vop3	0x17	VDST:64,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_cmp_o_f32_e64 s0, v1, v2	D4170000 02020501	src2_unused:ignored:0x1ff:0x00/0x80/0x101
