@@ -31,6 +31,11 @@ required-features = ["toolchain"]
 name = "cdna_card_tierc"
 required-features = ["lab"]
 
+# One-card gfx1201 smoke of the persistent-megakernel prerequisites (fabric job; HIP runtime).
+[[example]]
+name = "pm_persistent_smoke"
+required-features = ["lab"]
+
 # Native gfx1100 emitters that also run the ROCm oracle/certify path (M7, radiowave): need `--features toolchain`.
 [[example]]
 name = "e8p_i4_moe_gemv_gfx1100_emit"

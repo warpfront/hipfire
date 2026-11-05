@@ -175,13 +175,62 @@ pub struct BuilderProof {
     pub loop_fixpoints: Vec<LoopFixpoint>,
     pub forbidden_mnemonics_checked: Vec<String>,
     pub s_text_sha256: String,
+    /// Declared release signals, event polls and fences (`sync::verify`); absent when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub syncs: Vec<crate::sync::SyncProof>,
+    /// Task-body regions emitted inside this program (`Builder::region`); absent when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<RegionProof>,
 }
 fn is_false(value: &bool) -> bool {
     !*value
+}
+/// Declared entry state of a task-body region ([`crate::Builder::region`]): the
+/// caller-owned registers the body reads (argument block pointer, lane id,
+/// virtual workgroup coordinate, ...), the LDS bytes it may use and the
+/// physical workgroup size it assumes.
+#[derive(Clone, Debug)]
+pub struct RegionAbi {
+    /// Labels `.L{name}_entry` / `.L{name}_exit` (local labels: not kernel symbols).
+    pub name: String,
+    /// `(meaning, register)`: read-only inputs, owned by the caller's register plan.
+    pub inputs: Vec<(String, crate::reg::RegRef)>,
+    pub lds_bytes: u32,
+    pub workgroup_size: u16,
+}
+/// The entry label of region `name`.
+pub fn region_entry_label(name: &str) -> String {
+    format!(".L{name}_entry")
+}
+/// The exit label of region `name`.
+pub fn region_exit_label(name: &str) -> String {
+    format!(".L{name}_exit")
+}
+/// What `Builder::region` proved about one emitted region.
+#[derive(Clone, Debug, Serialize)]
+pub struct RegionProof {
+    pub name: String,
+    /// Instruction indices of the entry and exit labels.
+    pub entry_pc: usize,
+    pub exit_pc: usize,
+    /// `(meaning, register)` of every declared input, live and unwritten across the region.
+    pub inputs: Vec<(String, String)>,
+    /// Register ranges live only inside the region (`Live::Between(entry, exit)`): free for
+    /// the caller outside it, disjoint from every caller range inside it (`verify_lifetimes`).
+    pub locals: Vec<String>,
+    pub lds_bytes: u32,
+    pub workgroup_size: u16,
+    /// The body writes EXEC (e.g. a lane-0 store `v_cmpx`): the caller restores it at the exit.
+    pub exec_clobbered: bool,
+    /// Global writes of the body not yet covered by a release at the exit: the caller
+    /// must release before publishing completion.
+    pub unreleased_writes_at_exit: bool,
 }
 #[derive(Clone, Debug)]
 pub struct Emitted {
     pub s_text: String,
     pub proof: BuilderProof,
     pub shape: IsaShape,
+    /// The instruction list the proofs' `pc_index` fields index (labels included).
+    pub program: crate::insn::Program,
 }

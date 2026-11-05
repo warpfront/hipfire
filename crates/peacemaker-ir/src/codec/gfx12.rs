@@ -922,7 +922,7 @@ pub fn decode_for(arch: Arch, words: &[u32]) -> Result<(Inst, usize), DecodeErro
                     2 => operands.push(Operand::Scope(CacheScope::Dev)),
                     _ => operands.push(Operand::Scope(CacheScope::Sys)),
                 }
-            } else if row.name == "global_inv" {
+            } else if matches!(row.name, "global_inv" | "global_wb") {
                 match field_value(arch, "SCOPE", row, words) {
                     0 => {}
                     1 => operands.push(Operand::Scope(CacheScope::Se)),
@@ -1034,9 +1034,9 @@ pub fn decode_for(arch: Arch, words: &[u32]) -> Result<(Inst, usize), DecodeErro
             }
         }
     }
-    if row.name == "global_inv" {
+    if matches!(row.name, "global_inv" | "global_wb") {
         if field_value(arch, "SADDR", row, words) != 124 {
-            return Err(reject("global_inv SADDR must be off"));
+            return Err(reject(format!("{} SADDR must be off", row.name)));
         }
         consumed[0] |= forms::field_for(arch, row.form, "SADDR")
             .expect("global SADDR")
@@ -1266,18 +1266,20 @@ pub fn encode_for(arch: Arch, inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeE
                 Operand::CacheTh(th) if row.form == Form::Vmem(crate::inst::VmemForm::Buffer) => {
                     encode_field(arch, "TH", row, &mut words, u32::from(*th))?
                 }
-                Operand::Scope(scope) if row.name == "global_inv" => encode_field(
-                    arch,
-                    "SCOPE",
-                    row,
-                    &mut words,
-                    match scope {
-                        CacheScope::Cu => 0,
-                        CacheScope::Se => 1,
-                        CacheScope::Dev => 2,
-                        CacheScope::Sys => 3,
-                    },
-                )?,
+                Operand::Scope(scope) if matches!(row.name, "global_inv" | "global_wb") => {
+                    encode_field(
+                        arch,
+                        "SCOPE",
+                        row,
+                        &mut words,
+                        match scope {
+                            CacheScope::Cu => 0,
+                            CacheScope::Se => 1,
+                            CacheScope::Dev => 2,
+                            CacheScope::Sys => 3,
+                        },
+                    )?
+                }
                 _ => return Err(reject("invalid VMEM modifier operand")),
             }
         }
@@ -1359,7 +1361,7 @@ pub fn encode_for(arch: Arch, inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeE
             encode_field(arch, "TH", row, &mut words, inst.mods.cpol.th.into())?;
             encode_field(arch, "SCOPE", row, &mut words, inst.mods.cpol.scope.into())?;
             encode_field(arch, "NV", row, &mut words, u32::from(inst.mods.cpol.nv))?;
-            if row.name == "global_inv" {
+            if matches!(row.name, "global_inv" | "global_wb") {
                 encode_field(arch, "SADDR", row, &mut words, 124)?;
             }
         } else {

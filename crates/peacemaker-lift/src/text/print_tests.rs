@@ -479,3 +479,50 @@ fn swmmac_index_key_prints_before_neg_lo_and_roundtrips() {
         assert_eq!(gfx12::encode(&parsed).unwrap().as_slice(), &words);
     }
 }
+
+/// gfx1201 words print as llvm-objdump spells them: GLOBAL `th:`/`scope:` from
+/// the cache policy, an atomic's `vdst` only when it returns, `s_sleep`'s
+/// decimal-up-to-64 immediate, and the symbolic `hwreg`/`MSG_RTN_*` names.
+#[test]
+fn gfx1201_global_sleep_hwreg_and_rtn_message_print_like_objdump() {
+    for (words, line) in [
+        (
+            &[0xee050006, 0x000c0001, 0x00000802][..],
+            "global_load_b32 v1, v2, s[6:7] offset:8 scope:SCOPE_SYS",
+        ),
+        (
+            &[0xee06c004, 0x01040000, 0x00000000][..],
+            "global_store_b64 v0, v[2:3], s[4:5] scope:SCOPE_SE",
+        ),
+        (
+            &[0xee0a401c, 0x77900000, 0xfffff800][..],
+            "global_store_addtid_b32 v239, s[28:29] offset:-8 th:TH_STORE_NT",
+        ),
+        (
+            &[0xee0d4002, 0x009c0006, 0x00001000][..],
+            "global_atomic_add_u32 v6, v0, v1, s[2:3] offset:16 th:TH_ATOMIC_RETURN scope:SCOPE_SYS",
+        ),
+        (
+            &[0xee0d4002, 0x008c0000, 0x00001000][..],
+            "global_atomic_add_u32 v0, v1, s[2:3] offset:16 scope:SCOPE_SYS",
+        ),
+        (&[0xbf830040][..], "s_sleep 64"),
+        (&[0xbf830041][..], "s_sleep 0x41"),
+        (&[0xbf83007f][..], "s_sleep 0x7f"),
+        (
+            &[0xb88208c1][..],
+            "s_getreg_b32 s2, hwreg(HW_REG_WAVE_MODE, 3, 2)",
+        ),
+        (&[0xb882f83f][..], "s_getreg_b32 s2, hwreg(63)"),
+        (
+            &[0xbe804d81][..],
+            "s_sendmsg_rtn_b64 s[0:1], sendmsg(MSG_RTN_GET_DDID)",
+        ),
+    ] {
+        let (inst, used) = gfx12::decode(words).unwrap();
+        assert_eq!(used, words.len(), "{line}");
+        assert_eq!(canonical(&inst, Arch::Gfx1201).unwrap(), line);
+        let parsed = crate::text::parse_line(line, Arch::Gfx1201).unwrap();
+        assert_eq!(gfx12::encode(&parsed).unwrap().as_slice(), words, "{line}");
+    }
+}

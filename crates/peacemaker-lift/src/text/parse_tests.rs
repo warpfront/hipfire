@@ -936,3 +936,64 @@ fn swmmac_index_key_matches_llvm_mc_and_is_refused_elsewhere() {
     )
     .is_err());
 }
+
+/// gfx1201 GLOBAL loads, stores and atomics carry `scope:` and `th:` in the
+/// cache policy; an atomic's `vdst` exists only with `th:TH_ATOMIC_RETURN`.
+/// Words are llvm-mc gfx1201's; the parser takes the modifiers in any order.
+#[test]
+fn gfx1201_global_scope_th_and_atomic_return_form() {
+    const RETURNING: &[u32] = &[0xee0d4002, 0x009c0006, 0x00001000];
+    const FIRE_AND_FORGET: &[u32] = &[0xee0d4002, 0x008c0000, 0x00001000];
+    for text in [
+        "global_atomic_add_u32 v6, v0, v1, s[2:3] offset:16 th:TH_ATOMIC_RETURN scope:SCOPE_SYS",
+        "global_atomic_add_u32 v6, v0, v1, s[2:3] scope:SCOPE_SYS th:TH_ATOMIC_RETURN offset:16",
+    ] {
+        assert_eq!(
+            parse_encode(text, Arch::Gfx1201).as_deref(),
+            Ok(RETURNING),
+            "{text}"
+        );
+    }
+    assert_eq!(
+        parse_encode(
+            "global_atomic_add_u32 v0, v1, s[2:3] offset:16 scope:SCOPE_SYS",
+            Arch::Gfx1201
+        )
+        .as_deref(),
+        Ok(FIRE_AND_FORGET)
+    );
+    for (text, words) in [
+        (
+            "global_load_b32 v1, v2, s[6:7] scope:SCOPE_DEV",
+            &[0xee050006, 0x00080001, 0x00000002][..],
+        ),
+        (
+            "global_load_b32 v1, v2, s[6:7] offset:8 scope:SCOPE_SYS",
+            &[0xee050006, 0x000c0001, 0x00000802][..],
+        ),
+        (
+            "global_store_b64 v0, v[2:3], s[4:5] scope:SCOPE_SE",
+            &[0xee06c004, 0x01040000, 0x00000000][..],
+        ),
+    ] {
+        assert_eq!(
+            parse_encode(text, Arch::Gfx1201).as_deref(),
+            Ok(words),
+            "{text}"
+        );
+    }
+    for text in [
+        // The atomic TH list has only the return bit modeled.
+        "global_atomic_add_u32 v6, v0, v1, s[2:3] th:TH_ATOMIC_NT",
+        // TH_ATOMIC_RETURN is an atomic spelling.
+        "global_load_b32 v1, v2, s[6:7] th:TH_ATOMIC_RETURN",
+        // Without the return TH there is no vdst operand.
+        "global_atomic_add_u32 v6, v0, v1, s[2:3] scope:SCOPE_DEV",
+        "global_atomic_add_u32 v0, v1, s[2:3] th:TH_ATOMIC_RETURN",
+    ] {
+        assert!(
+            parse_encode(text, Arch::Gfx1201).is_err(),
+            "must reject {text:?}"
+        );
+    }
+}

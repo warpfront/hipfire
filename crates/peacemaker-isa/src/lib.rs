@@ -19,6 +19,8 @@ pub mod author;
 /// The CDNA (wave64, gfx942 first) arm: checked builder, hazard pass, code-object emission.
 pub mod cdna;
 pub mod emit;
+/// Builder methods of the global memory model and the task-body region ABI.
+mod global_sync;
 pub mod hazard;
 pub mod hip_twin;
 pub mod insn;
@@ -34,6 +36,7 @@ pub mod profile;
 #[path = "kernels/railgun_guard.rs"]
 pub mod railgun_guard;
 pub mod reg;
+pub mod sync;
 pub mod vopd;
 pub mod kernels {
     pub mod bf16;
@@ -48,6 +51,7 @@ pub mod kernels {
     pub mod gdn_chunk_prep;
     pub mod gdn_scan;
     pub mod gemm_uk;
+    pub mod gemv_mq2_xbatch_pm_gfx1201;
     pub mod iu4_c8_producer;
     pub mod iu4_fold;
     pub mod iu4_gemm;
@@ -72,6 +76,9 @@ pub mod kernels {
     pub mod mq_i4_rows;
     pub mod mtp_dense_det_gfx11;
     pub mod mtp_q8_det_gfx11;
+    /// A trivial persistent dispatcher around the MQ2 xbatch body region, and the
+    /// two-workgroup event handoff smoke kernels (lab only; no product route).
+    pub mod persistent_dispatch_gfx1201;
     pub mod pm_decode;
     #[path = "qsa_gather.rip.rs"]
     pub mod qsa_gather;
@@ -168,6 +175,23 @@ pub struct Builder {
     /// Code falls through to the current point: false after a typed `s_branch`
     /// until a join brings in the state of a branch to this point.
     reachable: bool,
+    /// Global release/acquire obligations at the current point (`sync`).
+    sync: sync::SyncState,
+    /// Obligations assumed at each placed label (back edges must stay within them).
+    sync_at_label: std::collections::BTreeMap<String, sync::SyncState>,
+    /// Obligations carried by forward branches to labels not yet placed.
+    sync_forward: std::collections::BTreeMap<String, sync::SyncState>,
+    /// Declared release signals, polls and fences (`sync::verify` replays them).
+    pub syncs: Vec<sync::SyncProof>,
+    /// The open task-body region (`region`): no `s_endpgm`, no hardware workgroup ids.
+    open_region: Option<String>,
+    /// Emitting an event poll or a synchronization-variable RMW (`global_sync`).
+    sync_access: bool,
+    /// Heads of the `loop_` fixpoints being emitted, innermost last.
+    loop_heads: Vec<String>,
+    /// Obligations their back edges carried (joined into the head by the fixpoint).
+    sync_back: std::collections::BTreeMap<String, sync::SyncState>,
+    pub regions: Vec<plan::RegionProof>,
 }
 /// Loop bodies emitted before the back-edge state must have converged.
 const MAX_LOOP_RUNS: u8 = 8;
@@ -225,6 +249,15 @@ impl Builder {
             seal: Default::default(),
             exits: vec![],
             reachable: true,
+            sync: Default::default(),
+            sync_at_label: Default::default(),
+            sync_forward: Default::default(),
+            syncs: vec![],
+            open_region: None,
+            sync_access: false,
+            loop_heads: vec![],
+            sync_back: Default::default(),
+            regions: vec![],
         }
     }
     /// The program so far (read-only).
@@ -264,6 +297,23 @@ impl Builder {
         }
         self.labels.push(name.into());
         self.current_label = name.into();
+        // Obligations at the label: the forward branches' joined with the fall-through
+        // (absent after an unconditional `s_branch`/`s_endpgm`).
+        let falls_through = !self
+            .program
+            .instructions
+            .iter()
+            .rev()
+            .find(|i| !i.text.ends_with(':'))
+            .is_some_and(|i| matches!(i.mnemonic(), "s_branch" | "s_endpgm"));
+        if let Some(forward) = self.sync_forward.remove(name) {
+            self.sync = if falls_through {
+                self.sync.join(forward)
+            } else {
+                forward
+            };
+        }
+        self.sync_at_label.insert(name.into(), self.sync);
         if let Some(d) = &mut self.delay_alu {
             d.label()
         }
@@ -370,16 +420,28 @@ impl Builder {
     /// `ds_load`/`ds_store`. The builder inserts its waits and hazard guards.
     pub fn push(&mut self, insn: Instruction) -> Result<(), String> {
         insn.check_raw()?;
+        let m = insn.mnemonic();
         if matches!(
-            insn.mnemonic(),
-            "s_clause" | "global_inv" | "buffer_gl0_inv" | "buffer_gl1_inv"
+            m,
+            "s_clause" | "global_inv" | "global_wb" | "buffer_gl0_inv" | "buffer_gl1_inv"
         ) {
             return Err("clauses and global visibility require their builder methods".into());
+        }
+        if m.contains("_atomic_")
+            || insn
+                .memory
+                .is_some_and(|c| matches!(c, MemoryClass::VmemAtomic { .. }))
+        {
+            return Err(format!(
+                "{m}: global atomics go through global_atomic/event_rmw (their ledger and release accounting)"
+            ));
         }
         self.emit(insn)
     }
     /// Untyped kernels' branches and program end (`s_branch`, `s_cbranch_*`,
     /// `s_endpgm`): the typed core emits its own, so a sealed builder refuses.
+    /// Inside a task-body `region` the program end is refused: a region exits to
+    /// its caller through its exit label.
     pub fn control(&mut self, insn: Instruction) -> Result<(), String> {
         self.untyped()?;
         let m = insn.mnemonic();
@@ -388,7 +450,40 @@ impl Builder {
         {
             return Err(format!("{:?} is not a branch or s_endpgm", insn.text));
         }
+        if m == "s_endpgm" {
+            if let Some(r) = &self.open_region {
+                return Err(format!(
+                    "region {r}: a task body ends at its exit label, not s_endpgm"
+                ));
+            }
+        }
+        self.branch_sync(&insn.text)?;
         self.emit(insn)
+    }
+    /// Carry the release/acquire obligations of a branch to its target: joined
+    /// into a forward target's state, checked against a placed (loop head) label's.
+    fn branch_sync(&mut self, text: &str) -> Result<(), String> {
+        let Some(target) = sync::branch_target(text) else {
+            return Ok(());
+        };
+        if let Some(head) = self.sync_at_label.get(target).copied() {
+            if self.loop_heads.iter().any(|h| h == target) {
+                // A `loop_` head: the fixpoint joins this into the head and re-emits.
+                let state = self.sync;
+                let back = self.sync_back.entry(target.to_string()).or_default();
+                *back = back.join(state);
+            } else if !self.sync.within(head) {
+                return Err(format!(
+                    "back edge to {target} carries a release/acquire obligation its head does not assume ({:?} at the branch, {head:?} at the head)",
+                    self.sync
+                ));
+            }
+        } else {
+            let state = self.sync;
+            let entry = self.sync_forward.entry(target.to_string()).or_default();
+            *entry = entry.join(state);
+        }
+        Ok(())
     }
     /// Every instruction goes through here: waits, hazard guards, ledger.
     fn emit(&mut self, insn: Instruction) -> Result<(), String> {
@@ -404,15 +499,46 @@ impl Builder {
         if insn.mnemonic().starts_with("ds_") && !self.lds_access_allowed {
             return Err("DS access must carry an LDS slot through ds_load/ds_store".into());
         }
+        if let Some(r) = &self.open_region {
+            // gfx12 workgroup ids are ttmp9 (X) and ttmp7 (Y, Z): a region body runs at a
+            // virtual coordinate its caller passes in a declared input SGPR.
+            if insn.text.contains("ttmp") {
+                return Err(format!(
+                    "region {r}: `{}` reads a hardware workgroup id; a task body takes its coordinate as a declared input",
+                    insn.text
+                ));
+            }
+        }
+        let data_load = matches!(
+            insn.memory,
+            Some(
+                MemoryClass::VmemLoad
+                    | MemoryClass::SmemLoad
+                    | MemoryClass::VmemAtomic { returns: true }
+            )
+        );
+        if data_load && self.sync.unacquired && !self.sync_access {
+            return Err(format!(
+                "`{}`: a load after a relaxed event observation needs acquire() first (missing acquire)",
+                insn.text
+            ));
+        }
         for r in insn.defs.iter().chain(&insn.uses) {
             self.regs
                 .verify_access(*r, &self.current_label, &self.labels)?
         }
         self.emit_required(self.ledger.required(&insn))?;
+        if matches!(
+            insn.memory,
+            Some(MemoryClass::VmemStore | MemoryClass::VmemAtomic { .. })
+        ) && !self.sync_access
+        {
+            self.sync.write()
+        }
         let mnemonic = insn.mnemonic();
         let pipe = if matches!(
             insn.memory,
-            Some(MemoryClass::VmemLoad | MemoryClass::VmemStore)
+            Some(MemoryClass::VmemLoad | MemoryClass::VmemStore | MemoryClass::VmemAtomic { .. })
         ) {
             Pipeline::Vmem
         } else if insn.memory == Some(MemoryClass::SmemLoad) {
@@ -786,7 +912,10 @@ impl Builder {
         for runs in 1..=MAX_LOOP_RUNS {
             let mut run = start.clone();
             run.label(head)?;
-            body(&mut run)?;
+            run.loop_heads.push(head.into());
+            let result = body(&mut run);
+            run.loop_heads.pop();
+            result?;
             if run.ledger.shape() != entry {
                 return Err(format!(
                     "loop {head}: back-edge ledger must equal the entry ledger"
@@ -796,9 +925,16 @@ impl Builder {
             // entry's up to ids), everything else joined with its back edge.
             let mut next = start.clone();
             next.ledger = run.ledger.clone();
-            let grew = next
+            let mut grew = next
                 .join_back_edge(&run)
                 .map_err(|e| format!("loop {head} back edge: {e}"))?;
+            // Release/acquire obligations the back edges carry join into the head's.
+            if let Some(back) = run.sync_back.remove(head) {
+                if !back.within(start.sync) {
+                    next.sync = start.sync.join(back);
+                    grew = true;
+                }
+            }
             // At least two runs: the second runs from the back-edge ledger.
             if runs >= 2 && !grew {
                 *self = run;
@@ -851,6 +987,17 @@ impl Builder {
         }
         if let Some(e) = self.exits.iter().find(|e| !self.labels.contains(e)) {
             return Err(format!("kernel exit {e} is never placed"));
+        }
+        if let Some(r) = &self.open_region {
+            return Err(format!("region {r} is never closed"));
+        }
+        if let Some(target) = self.sync_forward.keys().next() {
+            return Err(format!("branch to {target}, which is never placed"));
+        }
+        global_sync::check_region_entries(&self.program, &self.regions)?;
+        if !self.syncs.is_empty() {
+            sync::verify(&self.program, &self.syncs)
+                .map_err(|e| format!("independent release/acquire replay: {e}"))?;
         }
         if self
             .program
@@ -927,11 +1074,14 @@ impl Builder {
             loop_fixpoints: self.loop_fixpoints,
             forbidden_mnemonics_checked: vec!["s_waitcnt (gfx12)".into(), "scratch_*".into()],
             s_text_sha256: hash,
+            syncs: self.syncs,
+            regions: self.regions,
         };
         Ok(Emitted {
             s_text: text,
             proof,
             shape,
+            program: self.program,
         })
     }
 }

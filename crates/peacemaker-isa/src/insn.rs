@@ -11,6 +11,11 @@ use crate::{
 pub enum MemoryClass {
     VmemLoad,
     VmemStore,
+    /// A global atomic read-modify-write (`Builder::global_atomic`/`event_rmw`): with a
+    /// return it counts on LOADcnt and defines its destination, without one on STOREcnt.
+    VmemAtomic {
+        returns: bool,
+    },
     DsLoad,
     DsStore,
     SmemLoad,

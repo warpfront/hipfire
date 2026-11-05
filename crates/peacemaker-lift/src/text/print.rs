@@ -36,7 +36,7 @@
 //! is classified by the T9 harness, never normalised here.
 
 use peacemaker_ir::{
-    inst::{Arch, Form, FormFields, Inst, Opcode},
+    inst::{Arch, Form, FormFields, Inst, Opcode, VmemForm},
     isa::{self, OpRow},
     operand::{ImmField, Modifiers, Omod, Operand, Special},
     reg::Kind,
@@ -65,7 +65,13 @@ pub fn canonical(inst: &Inst, arch: Arch) -> Result<String, PrintError> {
     if inst.form == Form::Vopd {
         return vopd_text(inst, row);
     }
-    let slots = grammar_slots(row);
+    let mut slots = grammar_slots(row);
+    // A VMEM atomic's `VDST@rtn` slot is printed only in the returning form.
+    if row.grammar.contains("@rtn") {
+        slots = row
+            .slots(isa::atomic_returns(arch, &inst.mods.cpol))
+            .collect();
+    }
     let skew = if inst.form == Form::Vopc && row.name.starts_with("v_cmp_") {
         1
     } else {
@@ -106,6 +112,21 @@ pub fn canonical(inst: &Inst, arch: Arch) -> Result<String, PrintError> {
             PrintError::Unspellable(format!("{} is missing its {slot_name} operand", row.name))
         })?;
         let mut text = operand_text(operand, Some(slot_name), row, inst)?;
+        if arch == Arch::Gfx1201 {
+            match (row.name, *slot_name, operand) {
+                ("s_getreg_b32", "SIMM16", Operand::Imm(ImmField::Sopk(n))) => {
+                    text = gfx12_hwreg_text(*n as u16);
+                }
+                (name, "SSRC0", Operand::SendMsg(msg))
+                    if name.starts_with("s_sendmsg_rtn") && msg.op == 0 =>
+                {
+                    if let Some(msg_name) = gfx12_rtn_msg_name(msg.id) {
+                        text = format!("sendmsg({msg_name})");
+                    }
+                }
+                _ => {}
+            }
+        }
         if matches!(inst.form, Form::Vop3 | Form::Vop1Dpp | Form::Vop2Dpp) {
             text = apply_vop3_src_mods(&text, operand, slot_name, &inst.mods)?;
         }
@@ -129,6 +150,14 @@ pub fn canonical(inst: &Inst, arch: Arch) -> Result<String, PrintError> {
     let mut tail: Vec<String> = Vec::new();
     for operand in inst.operands.iter().skip(slots.len() + skew - cmpx_offset) {
         tail.push(operand_text(operand, None, row, inst)?);
+    }
+    // gfx12 GLOBAL loads, stores and atomics keep TH and scope in the cache
+    // policy, not as operands.
+    if arch == Arch::Gfx1201
+        && inst.form == Form::Vmem(VmemForm::Global)
+        && !matches!(row.name, "global_inv" | "global_wb")
+    {
+        tail.extend(global_cache_policy_text(row, &inst.mods)?);
     }
     let mut text = row.name.to_owned();
     if inst.form == Form::Sopp && row.name == "s_endpgm" {
@@ -270,7 +299,7 @@ fn sopp_imm_text(row: &OpRow, n: i16) -> String {
         name if name.starts_with("s_wait_") || name == "s_clause" => {
             format!("0x{:x}", n as u16)
         }
-        "s_barrier_wait" => {
+        "s_barrier_wait" | "s_sleep" => {
             if (0..=64).contains(&n) {
                 format!("{n}")
             } else {
@@ -279,6 +308,68 @@ fn sopp_imm_text(row: &OpRow, n: i16) -> String {
         }
         _ => format!("{n}"),
     }
+}
+
+/// llvm's gfx12 `hwreg(...)` spelling of an `s_getreg_b32` immediate: the
+/// register name (or its numeric id) and, unless it spans all 32 bits from bit
+/// 0, the `offset, size` field.
+fn gfx12_hwreg_text(raw: u16) -> String {
+    let id = raw & 0x3f;
+    let offset = raw >> 6 & 0x1f;
+    let size = (raw >> 11 & 0x1f) + 1;
+    let name = super::parse::GFX12_HWREGS
+        .iter()
+        .find(|(known, _)| u16::from(*known) == id)
+        .map_or_else(|| id.to_string(), |(_, name)| (*name).to_owned());
+    if offset == 0 && size == 32 {
+        format!("hwreg({name})")
+    } else {
+        format!("hwreg({name}, {offset}, {size})")
+    }
+}
+
+/// llvm's gfx12 `MSG_RTN_*` names for the `s_sendmsg_rtn_*` message id.
+fn gfx12_rtn_msg_name(id: u8) -> Option<&'static str> {
+    super::parse::GFX12_RTN_MSGS
+        .iter()
+        .find(|(known, _)| *known == id)
+        .map(|(_, name)| *name)
+}
+
+/// `th:`/`scope:` tokens of a gfx12 GLOBAL row, in objdump order.
+fn global_cache_policy_text(row: &OpRow, mods: &Modifiers) -> Result<Vec<String>, PrintError> {
+    let mut out = Vec::new();
+    let th = usize::from(mods.cpol.th);
+    if th != 0 {
+        let text = if row.name.starts_with("global_atomic") {
+            match th {
+                1 => "th:TH_ATOMIC_RETURN",
+                _ => {
+                    return Err(PrintError::Unspellable(format!(
+                        "{} cache TH {th}",
+                        row.name
+                    )))
+                }
+            }
+            .to_owned()
+        } else if row.name.starts_with("global_load") {
+            let hints = ["RT", "NT", "HT", "LU", "NT_RT", "RT_NT", "NT_HT", "BYPASS"];
+            format!("th:TH_LOAD_{}", hints[th])
+        } else {
+            let hints = [
+                "RT", "NT", "HT", "BYPASS", "NT_RT", "RT_NT", "NT_HT", "NT_WB",
+            ];
+            format!("th:TH_STORE_{}", hints[th])
+        };
+        out.push(text);
+    }
+    match mods.cpol.scope {
+        0 => {}
+        1 => out.push("scope:SCOPE_SE".to_owned()),
+        2 => out.push("scope:SCOPE_DEV".to_owned()),
+        _ => out.push("scope:SCOPE_SYS".to_owned()),
+    }
+    Ok(out)
 }
 
 fn delay_text(mods: &Modifiers) -> Result<String, PrintError> {

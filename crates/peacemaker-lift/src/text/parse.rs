@@ -218,7 +218,7 @@ struct ParsedOperands {
 }
 
 fn parse_single(row: &'static OpRow, rest: &str, arch: Arch) -> Result<Inst, ParseError> {
-    let slots = grammar_slots(row);
+    let mut slots = grammar_slots(row);
     let segments = if rest.is_empty() {
         Vec::new()
     } else {
@@ -244,6 +244,16 @@ fn parse_single(row: &'static OpRow, rest: &str, arch: Arch) -> Result<Inst, Par
         } else {
             operand_texts.push(segment.clone());
         }
+    }
+    // A VMEM atomic's `VDST@rtn` slot is spelled only in the returning form:
+    // `th:TH_ATOMIC_RETURN` on gfx12, the `glc` suffix on gfx11.
+    if row.grammar.contains("@rtn") {
+        let returns = if arch == Arch::Gfx1201 {
+            extras.iter().any(|text| text == "th:TH_ATOMIC_RETURN")
+        } else {
+            suffixes.iter().any(|text| text == "glc")
+        };
+        slots = row.slots(returns).collect();
     }
     let mut parsed = ParsedOperands {
         arch,
@@ -373,11 +383,27 @@ fn parse_single(row: &'static OpRow, rest: &str, arch: Arch) -> Result<Inst, Par
             ));
         }
         let operand = parse_extra(row, text)?;
-        // Only VBUFFER carries TH as an operand; GLOBAL keeps it in the cache policy.
-        if let Operand::CacheTh(th) = operand {
-            if row.form == Form::Vmem(peacemaker_ir::inst::VmemForm::Global) {
-                parsed.mods.cpol.th = th;
-                continue;
+        // Only VBUFFER carries TH and scope as operands; GLOBAL loads, stores
+        // and atomics keep them in the cache policy (`global_inv`/`global_wb`
+        // spell their scope as an operand).
+        if row.form == Form::Vmem(peacemaker_ir::inst::VmemForm::Global)
+            && !matches!(row.name, "global_inv" | "global_wb")
+        {
+            match operand {
+                Operand::CacheTh(th) => {
+                    parsed.mods.cpol.th = th;
+                    continue;
+                }
+                Operand::Scope(scope) => {
+                    parsed.mods.cpol.scope = match scope {
+                        CacheScope::Cu => 0,
+                        CacheScope::Se => 1,
+                        CacheScope::Dev => 2,
+                        CacheScope::Sys => 3,
+                    };
+                    continue;
+                }
+                _ => {}
             }
         }
         if !matches!(
@@ -1048,6 +1074,46 @@ fn parse_scope(text: &str) -> Option<CacheScope> {
     }
 }
 
+/// gfx12 `s_sendmsg_rtn_*` message ids and their llvm-mc `MSG_RTN_*` names.
+pub(super) const GFX12_RTN_MSGS: [(u8, &str); 8] = [
+    (128, "MSG_RTN_GET_DOORBELL"),
+    (129, "MSG_RTN_GET_DDID"),
+    (130, "MSG_RTN_GET_TMA"),
+    (131, "MSG_RTN_GET_REALTIME"),
+    (132, "MSG_RTN_SAVE_WAVE"),
+    (133, "MSG_RTN_GET_TBA"),
+    (134, "MSG_RTN_GET_TBA_TO_PC"),
+    (135, "MSG_RTN_GET_SE_AID_ID"),
+];
+
+/// gfx12 hardware-register ids and the names llvm-mc prints for them (ids it
+/// has no name for print numerically).
+pub(super) const GFX12_HWREGS: [(u8, &str); 23] = [
+    (1, "HW_REG_WAVE_MODE"),
+    (2, "HW_REG_WAVE_STATUS"),
+    (4, "HW_REG_WAVE_STATE_PRIV"),
+    (5, "HW_REG_WAVE_GPR_ALLOC"),
+    (6, "HW_REG_WAVE_LDS_ALLOC"),
+    (7, "HW_REG_IB_STS"),
+    (10, "HW_REG_PERF_SNAPSHOT_DATA"),
+    (11, "HW_REG_PERF_SNAPSHOT_PC_LO"),
+    (12, "HW_REG_PERF_SNAPSHOT_PC_HI"),
+    (15, "HW_REG_PERF_SNAPSHOT_DATA1"),
+    (16, "HW_REG_PERF_SNAPSHOT_DATA2"),
+    (17, "HW_REG_WAVE_EXCP_FLAG_PRIV"),
+    (18, "HW_REG_WAVE_EXCP_FLAG_USER"),
+    (19, "HW_REG_WAVE_TRAP_CTRL"),
+    (20, "HW_REG_WAVE_SCRATCH_BASE_LO"),
+    (21, "HW_REG_WAVE_SCRATCH_BASE_HI"),
+    (23, "HW_REG_WAVE_HW_ID1"),
+    (24, "HW_REG_WAVE_HW_ID2"),
+    (26, "HW_REG_WAVE_SCHED_MODE"),
+    (29, "HW_REG_SHADER_CYCLES_LO"),
+    (30, "HW_REG_SHADER_CYCLES_HI"),
+    (31, "HW_REG_WAVE_DVGPR_ALLOC_LO"),
+    (32, "HW_REG_WAVE_DVGPR_ALLOC_HI"),
+];
+
 fn parse_sendmsg(text: &str) -> Result<Option<Msg>, ParseError> {
     if text == "sendmsg(MSG_DEALLOC_VGPRS)" {
         return Ok(Some(Msg { id: 3, op: 0 }));
@@ -1058,8 +1124,11 @@ fn parse_sendmsg(text: &str) -> Result<Option<Msg>, ParseError> {
     else {
         return Ok(None);
     };
-    if inner == "MSG_RTN_GET_REALTIME" {
-        return Ok(Some(Msg { id: 131, op: 0 }));
+    if let Some((id, _)) = GFX12_RTN_MSGS
+        .iter()
+        .find(|(_, name)| *name == inner.trim())
+    {
+        return Ok(Some(Msg { id: *id, op: 0 }));
     }
     let (id, op) = inner
         .split_once(',')
@@ -1096,7 +1165,10 @@ fn parse_hwreg(text: &str, arch: Arch) -> Result<Option<HwReg>, ParseError> {
             "HW_REG_WAVE_HW_ID2" | "HW_REG_HW_ID2" => Some(24),
             "HW_REG_SHADER_CYCLES_LO" => Some(29),
             "HW_REG_SHADER_CYCLES_HI" => Some(30),
-            _ => None,
+            _ => GFX12_HWREGS
+                .iter()
+                .find(|(_, known)| *known == name)
+                .map(|(id, _)| *id),
         }
     } else {
         match name {
@@ -1149,6 +1221,13 @@ fn parse_extra(row: &OpRow, text: &str) -> Result<Operand, ParseError> {
     }
     if let Some(th) = text.strip_prefix("th:") {
         let global = row.form == Form::Vmem(peacemaker_ir::inst::VmemForm::Global);
+        if global && row.name.starts_with("global_atomic") {
+            // gfx12 atomics: TH bit 0 selects the returning form.
+            return match th {
+                "TH_ATOMIC_RETURN" => Ok(Operand::CacheTh(1)),
+                _ => Err(bad_operand(row.name, text, "bad cache TH")),
+            };
+        }
         let load =
             row.name.starts_with("buffer_load") || global && row.name.starts_with("global_load");
         let store =

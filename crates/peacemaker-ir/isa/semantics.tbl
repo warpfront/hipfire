@@ -552,3 +552,5 @@ v_cmp_ne_i64_e64	alu
 v_cmp_le_u64_e64	alu
 v_cmp_ge_u64_e64	alu
 v_cmp_gt_u64_e64	alu
+global_wb	wait
+s_sleep	wait

@@ -168,6 +168,31 @@ impl Ledger {
     pub fn record(&mut self, arch: Arch, insn: &Instruction) {
         let Some(class) = insn.memory else { return };
         self.arch = Some(arch);
+        if let MemoryClass::VmemAtomic { returns } = class {
+            // gfx12: a returning atomic is a VMEM read access (LOADcnt), a returnless one a
+            // write access (STOREcnt); the builder emits atomics only on gfx12. Neither is
+            // assumed in order with the loads/stores around it (waits on it drain to zero),
+            // and its data/address sources stay locked until it retires.
+            let (counter, defs) = if returns {
+                (Counter::Load, insn.defs.clone())
+            } else {
+                (Counter::Store, vec![])
+            };
+            self.pending.push(Pending {
+                id: self.next_id,
+                counter,
+                defs,
+                src_locks: insn.uses.clone(),
+                in_order: false,
+                family: MemoryFamily::Global,
+                order: OrderClass::Family(MemoryFamily::Global),
+                maybe: false,
+                aliases: vec![],
+                lds_slots: vec![],
+            });
+            self.next_id += 1;
+            return;
+        }
         let gfx942 = arch == Arch::Gfx942;
         let mnemonic = insn.mnemonic();
         let (counter, in_order, load) = match (arch.gfx12(), class) {
@@ -185,12 +210,16 @@ impl Ledger {
             (false, MemoryClass::DsStore) => (Counter::Lgkm, true, false),
             (false, MemoryClass::SmemLoad) => (Counter::Lgkm, false, true),
             (_, MemoryClass::Export) => (Counter::Exp, false, false),
+            // recorded above
+            (_, MemoryClass::VmemAtomic { .. }) => return,
         };
         let family = match class {
             MemoryClass::VmemLoad | MemoryClass::VmemStore if mnemonic.starts_with("buffer_") => {
                 MemoryFamily::Buffer
             }
-            MemoryClass::VmemLoad | MemoryClass::VmemStore => MemoryFamily::Global,
+            MemoryClass::VmemLoad | MemoryClass::VmemStore | MemoryClass::VmemAtomic { .. } => {
+                MemoryFamily::Global
+            }
             MemoryClass::DsLoad | MemoryClass::DsStore => MemoryFamily::Ds,
             MemoryClass::SmemLoad => MemoryFamily::Smem,
             MemoryClass::Export => MemoryFamily::Export,
@@ -509,6 +538,10 @@ impl Ledger {
     }
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
+    }
+    /// Some operation of counter `c` is pending.
+    pub fn has_pending(&self, c: Counter) -> bool {
+        self.pending.iter().any(|p| p.counter == c)
     }
     /// Id of the most recently recorded operation.
     pub fn last_id(&self) -> Option<u64> {
