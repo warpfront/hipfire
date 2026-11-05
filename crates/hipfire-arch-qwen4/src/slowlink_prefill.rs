@@ -4735,11 +4735,7 @@ impl HeteroRun<'_, '_> {
                 // Stream-ordered and asynchronous: a synchronous copy would make
                 // the host wait for the device to drain before enqueueing the
                 // next tile's layer, idling the device in between.
-                let bytes = n * geo.hidden * std::mem::size_of::<f32>();
-                match gpu.active_stream.as_ref() {
-                    Some(st) => gpu.hip.memcpy_dtod_async_at(&ffn.buf, 0, &env.scratch.ffn_output.buf, 0, bytes, st),
-                    None => gpu.hip.memcpy_dtod_async_default_at(&ffn.buf, 0, &env.scratch.ffn_output.buf, 0, bytes),
-                }?;
+                gpu.copy_f32_buffer(ffn, &env.scratch.ffn_output, n * geo.hidden)?;
                 Ok(qsa)
             },
         );

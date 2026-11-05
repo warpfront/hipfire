@@ -176,7 +176,7 @@ pub fn qwen4_prefill_chunk_requested(
     // `topology.hetero_experts`: the expert device's prefill slot holds one
     // chunk of at most HETERO_PREFILL_MAX_ROWS rows.
     if matches!(crate::hetero::requested(), Ok(Some(_))) {
-        chunk.min(crate::hetero::HETERO_PREFILL_MAX_ROWS)
+        chunk.min(crate::hetero::hetero_prefill_rows())
     } else {
         chunk
     }
@@ -4297,7 +4297,7 @@ impl Qwen4MoeLayerRuntime {
                 mi: config.moe_intermediate_size,
                 top_k: config.num_experts_per_tok,
                 n_experts: placement.len(),
-                max_rows: crate::hetero::HETERO_PREFILL_MAX_ROWS,
+                max_rows: crate::hetero::hetero_prefill_rows(),
                 gate_up_dtype,
                 down_dtype,
                 gate_up_bytes,
@@ -4305,7 +4305,7 @@ impl Qwen4MoeLayerRuntime {
                 route_policy: Some(qwen4_route_policy(
                     config,
                     &shared,
-                    self.route_capability(crate::hetero::HETERO_PREFILL_MAX_ROWS),
+                    self.route_capability(crate::hetero::hetero_prefill_rows()),
                     self.slab_cold_codec(),
                     0,
                 )),

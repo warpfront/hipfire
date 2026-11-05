@@ -358,13 +358,15 @@ impl HeteroPrefillSplit {
         // this call can reuse the primary's IU4 scratch.
         let xq = match xq {
             Some(ptr) => {
+                // A plain copy kernel on the main stream (the runtime's blit path
+                // left ~0.9 ms of idle before the next kernel).
                 // SAFETY: the chunk's live int4 sidecar (`rows` rows).
-                let src = unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, rows * i4) };
-                match gpu.active_stream.as_ref() {
-                    Some(st) => gpu.hip.memcpy_dtod_async_at(&ps.xq.buf, 0, &src, 0, rows * i4, st),
-                    None => gpu.hip.memcpy_dtod_async_default_at(&ps.xq.buf, 0, &src, 0, rows * i4),
-                }
-                .map_err(hip)?;
+                let src = GpuTensor {
+                    buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, rows * i4) },
+                    shape: vec![rows * i4 / 4],
+                    dtype: rdna_compute::DType::F32,
+                };
+                gpu.copy_f32_buffer(&ps.xq, &src, rows * i4 / 4).map_err(hip)?;
                 Some(ps.xq.buf.as_ptr())
             }
             None => None,
