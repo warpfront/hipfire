@@ -105,6 +105,65 @@ extern "C" __global__ void hetero_install_cold(
     for (int i = threadIdx.x; i < dim; i += blockDim.x) dst[i] = src[i];
 }
 
+// Prefill (grid-stride, any grid). Copy a chunk's rotated rows and routing into
+// the prefill slot and write the primary's masked ids (cold -> -1). The request
+// itself is released by hetero_release_rows after this kernel completes, so the
+// expert device never sees a request before every block's copy landed.
+extern "C" __global__ void hetero_publish_rows(
+    const float* __restrict__ x_rot,
+    const int* __restrict__ ids,
+    const float* __restrict__ weights,
+    const unsigned char* __restrict__ cold_bitmap,
+    int n_experts,
+    int rows,
+    int top_k,
+    int dim,
+    float* mb_x,
+    int* mb_ids,
+    float* mb_w,
+    int* masked_ids) {
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    const long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    for (long long i = tid; i < (long long)rows * dim; i += stride) mb_x[i] = x_rot[i];
+    for (long long s = tid; s < (long long)rows * top_k; s += stride) {
+        const int e = ids[s];
+        mb_ids[s] = e;
+        mb_w[s] = weights[s];
+        masked_ids[s] = hs_cold(e, cold_bitmap, n_experts) ? -1 : e;
+    }
+}
+
+// Prefill, one thread: record the layer and row count, then release the
+// request sequence (after hetero_publish_rows on the same stream).
+extern "C" __global__ void hetero_release_rows(
+    const unsigned* __restrict__ counter,
+    unsigned layer,
+    unsigned layers,
+    int rows,
+    unsigned* mb_layer,
+    unsigned* mb_rows,
+    unsigned* req_seq) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    hs_store(mb_layer, layer);
+    hs_store(mb_rows, (unsigned)rows);
+    __threadfence_system();
+    hs_store(req_seq, hs_seq(counter[0], layer, layers));
+}
+
+// Prefill (grid-stride): x_batch += the expert device's weighted cold partial,
+// skipped entirely when the wait timed out.
+extern "C" __global__ void hetero_add_partial(
+    const unsigned* error,
+    const float* partial,
+    int n,
+    float* __restrict__ x_batch) {
+    if (hs_load(error) != 0u) return;
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        x_batch[i] += partial[i];
+    }
+}
+
 // Expert device, one block: masked ids for the cold kernels (hot -> -1).
 extern "C" __global__ void hetero_mask_hot(
     const int* mb_ids,

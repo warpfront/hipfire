@@ -89,9 +89,128 @@ pub fn seq_for(token: u32, layer: u32, layers: u32) -> u32 {
     }
 }
 
+/// The one prefill slot (layers run sequentially, so one slot serves them
+/// all), placed after the decode slots in the same mailbox allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefillGeometry {
+    pub max_rows: usize,
+    pub top_k: usize,
+    pub dim: usize,
+}
+
+/// Byte offsets of the prefill slot fields from the mailbox base.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefillOffsets {
+    pub req_seq: usize,
+    pub resp_seq: usize,
+    pub error: usize,
+    /// Layer index and row count of the request (two u32 written by the
+    /// primary before the request word).
+    pub layer: usize,
+    pub rows: usize,
+    pub x_rot: usize,
+    pub ids: usize,
+    pub weights: usize,
+    /// The expert device's weighted cold partial, `rows x dim` f32.
+    pub partial: usize,
+}
+
+impl PrefillGeometry {
+    /// Local layout (from a 256-aligned start): words on lines 0, 1 and 2, the
+    /// layer/rows meta pair on line 3, then 256-aligned arrays; returns the
+    /// offsets and the slot's size.
+    fn local(&self) -> (PrefillOffsets, usize) {
+        let slots = self.max_rows * self.top_k;
+        let x_rot = ARRAY_ALIGN;
+        let ids = align(x_rot + self.max_rows * self.dim * 4);
+        let weights = align(ids + slots * 4);
+        let partial = align(weights + slots * 4);
+        let end = align(partial + self.max_rows * self.dim * 4);
+        (
+            PrefillOffsets { req_seq: 0, resp_seq: 64, error: 128, layer: 192, rows: 196, x_rot, ids, weights, partial },
+            end,
+        )
+    }
+
+    /// Offsets from the mailbox base when the slot starts at (or after)
+    /// `base`, the end of the decode slots.
+    pub fn offsets(&self, base: usize) -> PrefillOffsets {
+        let b = align(base);
+        let (o, _) = self.local();
+        PrefillOffsets {
+            req_seq: b + o.req_seq,
+            resp_seq: b + o.resp_seq,
+            error: b + o.error,
+            layer: b + o.layer,
+            rows: b + o.rows,
+            x_rot: b + o.x_rot,
+            ids: b + o.ids,
+            weights: b + o.weights,
+            partial: b + o.partial,
+        }
+    }
+
+    /// Bytes of the slot (allocate `align(decode total) + bytes()`).
+    pub fn bytes(&self) -> usize {
+        self.local().1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const P: PrefillGeometry = PrefillGeometry { max_rows: 2048, top_k: 10, dim: 2560 };
+
+    fn prefill_ranges(base: usize) -> Vec<(usize, usize)> {
+        let o = P.offsets(base);
+        let slots = P.max_rows * P.top_k;
+        vec![
+            (o.req_seq, 4),
+            (o.resp_seq, 4),
+            (o.error, 4),
+            (o.layer, 4),
+            (o.rows, 4),
+            (o.x_rot, P.max_rows * P.dim * 4),
+            (o.ids, slots * 4),
+            (o.weights, slots * 4),
+            (o.partial, P.max_rows * P.dim * 4),
+        ]
+    }
+
+    #[test]
+    fn prefill_slot_follows_the_decode_slots_disjoint_and_aligned() {
+        let base = G.total_bytes();
+        let mut all: Vec<(usize, usize)> = (0..G.layers).flat_map(|l| ranges(&G, l)).collect();
+        let pre = prefill_ranges(base);
+        for &(off, _) in &pre[5..] {
+            assert_eq!(off % 256, 0);
+        }
+        assert!(pre.iter().all(|&(o, _)| o >= base), "prefill slot overlaps the decode slots");
+        all.extend(pre);
+        all.sort();
+        for w in all.windows(2) {
+            assert!(w[0].0 + w[0].1 <= w[1].0, "overlap {:?} {:?}", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn prefill_words_have_their_own_cache_lines() {
+        let o = P.offsets(0);
+        let lines = [o.req_seq / 64, o.resp_seq / 64, o.error / 64, o.layer / 64];
+        for i in 0..lines.len() {
+            for j in i + 1..lines.len() {
+                assert_ne!(lines[i], lines[j]);
+            }
+        }
+        assert_eq!(o.rows / 64, o.layer / 64, "layer and rows share the primary-written meta line");
+    }
+
+    #[test]
+    fn prefill_bytes_cover_the_partial() {
+        let o = P.offsets(0);
+        assert!(P.bytes() >= o.partial + P.max_rows * P.dim * 4);
+    }
 
     const G: MailboxGeometry = MailboxGeometry { layers: 48, max_rows: 1, top_k: 10, dim: 2560 };
 
