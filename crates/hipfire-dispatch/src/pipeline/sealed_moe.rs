@@ -8376,6 +8376,7 @@ mod tests {
             cpu_deferred_experts: false,
             cpu_split: false,
             cpwait: false,
+            hetero_prefill: false,
         })
     }
 
@@ -9236,6 +9237,7 @@ mod tests {
                 cpu_deferred_experts: false,
                 cpu_split: false,
                 cpwait: false,
+                hetero_prefill: false,
             });
             let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
             assert_eq!(
@@ -9301,6 +9303,7 @@ mod tests {
             cpu_deferred_experts: false,
             cpu_split: false,
             cpwait: false,
+            hetero_prefill: false,
         });
         let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
         let stages = moe_program::lowered_stages(&call).unwrap();
@@ -9696,6 +9699,44 @@ mod tests {
         let mut params = hetero_cold_params(&s, &routed, &fixture.gate_up_ptrs, &fixture.down_ptrs);
         params.routed_out = None;
         assert!(seal_prefill(experts, &ctx, params).is_err(), "a compact binding is never Single");
+    }
+
+    #[test]
+    fn hetero_prefill_brackets_the_hot_routed_tail_with_the_cold_exchange() {
+        for route in SPLIT_ROUTES {
+            for rows in [2, 512, 2048] {
+                let st = split_prefill_stages(rows, Some(route), false, |_| {}, |s| s.hetero_prefill = true).unwrap();
+                let label = format!("{route:?} rows={rows}: {st:?}");
+                let at = |stage: MoeStage| st.iter().position(|s| *s == stage).unwrap_or_else(|| panic!("{stage:?} missing: {label}"));
+                for once in [MoeStage::PublishColdRows, MoeStage::JoinColdRows, MoeStage::Combine, MoeStage::SharedDown] {
+                    assert_eq!(st.iter().filter(|s| **s == once).count(), 1, "{once:?}: {label}");
+                }
+                // Published after the route wrote the ids, before any routed table read.
+                assert!(at(MoeStage::Route) < at(MoeStage::PublishColdRows), "{label}");
+                assert!(at(MoeStage::PublishColdRows) < at(MoeStage::GateUp), "{label}");
+                if st.contains(&MoeStage::Scatter) {
+                    assert!(at(MoeStage::PublishColdRows) < at(MoeStage::Scatter), "{label}");
+                }
+                // Joined after the hot combine, before the shared expert's down.
+                assert!(at(MoeStage::Combine) < at(MoeStage::JoinColdRows), "{label}");
+                assert!(at(MoeStage::JoinColdRows) < at(MoeStage::SharedDown), "{label}");
+                for absent in [MoeStage::PrepareSplit, MoeStage::JoinSplit, MoeStage::CpuSplice, MoeStage::PublishCold, MoeStage::AwaitCold, MoeStage::InstallCold] {
+                    assert!(!st.contains(&absent), "{absent:?}: {label}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hetero_prefill_is_exclusive_with_the_cpu_split() {
+        let route = Some(MoeRouteCapability::Qt44Qt53GroupedSymmetric);
+        split_refused(
+            split_prefill_stages(2, route, true, |_| {}, |s| s.hetero_prefill = true),
+            "hetero prefill + cpu split",
+            "hetero",
+        );
+        let plain = split_prefill_stages(64, route, false, |_| {}, |_| {}).unwrap();
+        assert!(!plain.contains(&MoeStage::PublishColdRows) && !plain.contains(&MoeStage::JoinColdRows));
     }
 
     #[test]

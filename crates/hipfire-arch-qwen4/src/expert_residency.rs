@@ -2524,6 +2524,11 @@ pub fn expert_hotset_budget(
 /// placement charges use [`expert_stage_placement_enabled`] and the stage
 /// this switch alone turns on borrows donor layers (no dedicated VRAM).
 pub fn expert_stage_enabled(gpu: &rdna_compute::Gpu) -> bool {
+    // `topology.hetero_experts`: cold experts are computed on the expert
+    // device, never staged across the link.
+    if matches!(crate::hetero::requested(), Ok(Some(_))) {
+        return false;
+    }
     expert_stage_switch(
         &gpu.arch,
         hipfire_config::developer_var(crate::gpu_forward::QWEN4_EXPERT_STAGE_ENV)
@@ -2558,6 +2563,9 @@ pub(crate) fn expert_stage_switch(
 /// donor layers, so a stage the measured link alone enables never takes
 /// uncharged VRAM nor a resident layer.
 pub fn expert_stage_placement_enabled(arch: &str) -> bool {
+    if matches!(crate::hetero::requested(), Ok(Some(_))) {
+        return false;
+    }
     expert_stage_placement_switch(
         arch,
         hipfire_config::developer_var(crate::gpu_forward::QWEN4_EXPERT_STAGE_ENV)

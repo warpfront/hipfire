@@ -74,9 +74,15 @@ pub(crate) fn arm_for(primary_arch: &str, dims: ColdArmDims) -> Result<Option<Ar
 
 // ---- Device-side split (design v3) ---------------------------------------
 
-use hipfire_dispatch::hetero_device::HeteroDeviceSplit;
-use hipfire_dispatch::hetero_mailbox::MailboxGeometry;
-use hipfire_dispatch::hetero_responder::{ColdLayer, HeteroResponder, ResponderConfig};
+use hipfire_dispatch::hetero_device::{HeteroDeviceSplit, HeteroPrefillShared, HeteroPrefillSplit};
+use hipfire_dispatch::hetero_mailbox::{MailboxGeometry, PrefillGeometry, MAX_SUB_CHUNKS};
+use hipfire_dispatch::hetero_prefill::ColdPrefillConfig;
+use hipfire_dispatch::hetero_responder::{ColdLayer, HeteroResponder, PrefillServe, ResponderConfig};
+
+/// The prefill chunk under the split: the mailbox's prefill slot and the expert
+/// device's scratch are sized for it, and the load's prefill chunk is clamped
+/// to it (`gpu_forward::qwen4_prefill_chunk_requested`).
+pub const HETERO_PREFILL_MAX_ROWS: usize = 2048;
 
 /// `hetero_await_cold` poll bound: each poll is a PCIe read (~1-2 us) plus a
 /// short sleep, so this bounds a dead or stalled expert device at ~2 s.
@@ -93,6 +99,8 @@ struct DeviceContext {
     mi: usize,
     pending: Vec<Option<ColdLayer>>,
     responder: Option<HeteroResponder>,
+    prefill: Arc<HeteroPrefillShared>,
+    prefill_cold: ColdPrefillConfig,
 }
 
 // SAFETY: the raw mailbox address and the counter's device pointer are plain
@@ -125,18 +133,32 @@ pub(crate) fn attach_device_layer(
     top_k: usize,
     placement: &[u8],
     tables: (Vec<u64>, Vec<u64>),
-) -> Result<HeteroDeviceSplit, String> {
+    prefill_cold: ColdPrefillConfig,
+) -> Result<(HeteroDeviceSplit, HeteroPrefillSplit), String> {
     check_primary(&gpu.arch)?;
     let hip = |e: hip_bridge::HipError| format!("topology.hetero_experts: {e}");
     let mut guard = lock_device()?;
     if guard.is_none() {
         let geom = MailboxGeometry { layers, max_rows: 1, top_k, dim };
+        let pgeom = PrefillGeometry { max_rows: prefill_cold.max_rows, top_k, dim, sub_chunks: MAX_SUB_CHUNKS };
+        let poff = pgeom.offsets(geom.total_bytes());
+        let total = poff.error + pgeom.bytes();
         let flags = hip_bridge::HIP_HOST_MALLOC_MAPPED | hip_bridge::HIP_HOST_MALLOC_COHERENT;
-        let mailbox = gpu.hip.host_malloc(geom.total_bytes(), flags).map_err(hip)?.cast::<u8>();
-        // SAFETY: fresh pinned allocation of `total_bytes`: zero = never written.
-        unsafe { std::ptr::write_bytes(mailbox, 0, geom.total_bytes()) };
+        let mailbox = gpu.hip.host_malloc(total, flags).map_err(hip)?.cast::<u8>();
+        // SAFETY: fresh pinned allocation of `total` bytes: zero = never written.
+        unsafe { std::ptr::write_bytes(mailbox, 0, total) };
         let counter = gpu.alloc_tensor(&[1], rdna_compute::DType::F32).map_err(hip)?;
         gpu.memcpy_htod_auto(&counter.buf, &0u32.to_ne_bytes()).map_err(hip)?;
+        // SAFETY: a non-owning view of the load's counter, which outlives the load.
+        let counter_view = unsafe {
+            rdna_compute::GpuTensor {
+                buf: hip_bridge::DeviceBuffer::from_raw(counter.buf.as_ptr(), 4),
+                shape: vec![1],
+                dtype: rdna_compute::DType::F32,
+            }
+        };
+        let prefill = HeteroPrefillShared::new(gpu, mailbox as u64, poff, pgeom, placement.len(), counter_view, AWAIT_MAX_POLLS)
+            .map_err(|e| format!("topology.hetero_experts: {e:?}"))?;
         *guard = Some(DeviceContext {
             mailbox: mailbox as usize,
             geom,
@@ -145,6 +167,8 @@ pub(crate) fn attach_device_layer(
             mi,
             pending: (0..layers).map(|_| None).collect(),
             responder: None,
+            prefill: Arc::new(prefill),
+            prefill_cold,
         });
         eprintln!(
             "  qwen4 hetero experts: device split, {layers} layers, mailbox {} KiB pinned",
@@ -186,28 +210,54 @@ pub(crate) fn attach_device_layer(
             mailbox_base: b,
             n_experts: ctx.n_experts,
             mi: ctx.mi,
-            prefill: None,
+            prefill: Some(PrefillServe {
+                offsets: ctx.prefill.offsets,
+                sub_chunks: MAX_SUB_CHUNKS,
+                cold: ctx.prefill_cold,
+            }),
         };
         let responder = HeteroResponder::start(cfg, layers_v).map_err(|e| format!("topology.hetero_experts: {e:?}"))?;
         eprintln!("  qwen4 hetero experts: responder on gfx1151 (HIP device {EXPERT_DEVICE}) recorded {layers} layer graphs");
         ctx.responder = Some(responder);
     }
-    Ok(HeteroDeviceSplit {
+    // SAFETY: a non-owning view of the layer's bitmap, owned by its decode split.
+    let prefill_bitmap = unsafe {
+        rdna_compute::GpuTensor {
+            buf: hip_bridge::DeviceBuffer::from_raw(bitmap.buf.as_ptr(), bitmap.buf.size()),
+            shape: bitmap.shape.clone(),
+            dtype: bitmap.dtype,
+        }
+    };
+    let prefill_masked = gpu
+        .alloc_tensor(&[ctx.prefill.geom.max_rows * top_k], rdna_compute::DType::F32)
+        .map_err(hip)?;
+    let prefill = HeteroPrefillSplit {
         layer: layer as u32,
         layers: layers as u32,
-        slot,
-        counter,
-        cold_bitmap: bitmap,
-        masked_ids,
-        n_experts: placement.len() as i32,
-        max_polls: AWAIT_MAX_POLLS,
-    })
+        shared: Arc::clone(&ctx.prefill),
+        cold_bitmap: prefill_bitmap,
+        masked_ids: prefill_masked,
+    };
+    Ok((
+        HeteroDeviceSplit {
+            layer: layer as u32,
+            layers: layers as u32,
+            slot,
+            counter,
+            cold_bitmap: bitmap,
+            masked_ids,
+            n_experts: placement.len() as i32,
+            max_polls: AWAIT_MAX_POLLS,
+        },
+        prefill,
+    ))
 }
 
-/// Start of every one-row forward: fail closed on an earlier timeout or a
-/// stopped responder, then advance the device token counter (an eager launch on
-/// the primary's stream, ahead of the token's split stages). No-op without a
-/// device split.
+/// Start of every forward (decode token or prefill chunk): fail closed on an
+/// earlier timeout or a stopped responder, then advance the device token
+/// counter (an eager launch on the primary's stream, ahead of the forward's
+/// split stages), so every request of the forward carries a fresh sequence.
+/// No-op without a device split.
 pub(crate) fn begin_token(gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
     let guard = lock_device()?;
     let Some(ctx) = guard.as_ref() else {
@@ -228,6 +278,12 @@ pub(crate) fn begin_token(gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
                 "topology.hetero_experts: layer {l} timed out waiting for the expert device (seq {e}); the split is poisoned"
             ));
         }
+    }
+    let e = ctx.prefill.error_word();
+    if e != 0 {
+        return Err(format!(
+            "topology.hetero_experts: a prefill chunk timed out waiting for the expert device (seq {e}); the split is poisoned"
+        ));
     }
     gpu.hetero_token_advance(&ctx.counter).map_err(|e| format!("topology.hetero_experts: {e}"))
 }
