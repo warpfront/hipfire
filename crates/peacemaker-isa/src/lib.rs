@@ -52,6 +52,7 @@ pub mod kernels {
     pub mod ep_tile_mask;
     pub mod fa_prefill;
     pub mod fa_qprep;
+    pub mod fa_qresident;
     pub mod fp8_gemm;
     pub mod gdn_chunk_prep;
     pub mod gdn_scan;

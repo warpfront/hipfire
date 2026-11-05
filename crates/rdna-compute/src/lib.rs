@@ -31,6 +31,7 @@ pub mod emu_validate;
 pub mod expert_capabilities;
 pub mod fa_prefill_pm;
 pub mod fa_qprep_pm;
+pub mod fa_qresident_pm;
 pub mod feature_flags;
 pub mod ffn_activation;
 #[cfg(feature = "flash-attn-ck")]

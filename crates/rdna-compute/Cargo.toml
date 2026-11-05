@@ -1215,6 +1215,10 @@ name = "fa_pm_fp8_oracle"
 required-features = ["lab", "deltanet"]
 
 [[example]]
+name = "fa_qres_pm_timing"
+required-features = ["lab"]
+
+[[example]]
 name = "fa_pm_qprep_oracle"
 required-features = ["lab", "deltanet"]
 

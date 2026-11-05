@@ -134,7 +134,7 @@ pub fn q8_flash_tile_size(
 /// Dynamic LDS of the gfx1201 Q-resident v2 attention bodies: two KT48
 /// buffers (K8 12 KiB + V8 12 KiB + f32 K/V scales 2 x 192 B each) and the
 /// 8-byte position-bounds pair at 49,920 (`attention_q8_0_fa2_gqa.gfx1201.hip`).
-const QRESIDENT_V2_LDS_BYTES: u32 = 2 * (2 * 12288 + 2 * 192) + 16;
+pub(crate) const QRESIDENT_V2_LDS_BYTES: u32 = 2 * (2 * 12288 + 2 * 192) + 16;
 const _: () = assert!(QRESIDENT_V2_LDS_BYTES == 49936);
 
 // Full Q planes and active native-cache prefix; no arithmetic uses tensor shape
@@ -178,6 +178,56 @@ fn a3b_qresident_args(ptrs: [*mut c_void; 6], rows: usize) -> [u8; 68] {
     }
     args[64..68].copy_from_slice(&(1.0f32 / 16.0).to_le_bytes());
     args
+}
+
+/// hipcc export names of the A3B native-fp8 Q-resident attention (module
+/// `attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201`).
+const A3B_QRESIDENT_HIPCC_DIRECT: &str = "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201";
+const A3B_QRESIDENT_HIPCC_RANGE: &str =
+    "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_gfx1201";
+
+/// Kernel arm of the A3B Q-resident attention launch: the hipcc module or the embedded
+/// PeaceMaker twin ([`crate::fa_qresident_pm`]). Production follows
+/// `HIPFIRE_FA_QRESIDENT_PM` (default off).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum A3bQresRoute {
+    Hipcc,
+    Pm,
+}
+
+impl A3bQresRoute {
+    fn from_flag(fa_qresident_pm: bool) -> Self {
+        if fa_qresident_pm {
+            Self::Pm
+        } else {
+            Self::Hipcc
+        }
+    }
+}
+
+/// PM twin of a hipcc A3B Q-resident export (direct -> direct, range -> range).
+fn a3b_qresident_pm_symbol(symbol: &str) -> Option<&'static str> {
+    match symbol {
+        A3B_QRESIDENT_HIPCC_DIRECT => Some(crate::fa_qresident_pm::SYMBOL_DIRECT),
+        A3B_QRESIDENT_HIPCC_RANGE => Some(crate::fa_qresident_pm::SYMBOL_RANGE),
+        _ => None,
+    }
+}
+
+/// Symbol actually launched for `route`; the hipcc arm is the incoming symbol unchanged.
+fn a3b_qresident_launch_symbol(route: A3bQresRoute, symbol: &'static str) -> Option<&'static str> {
+    match route {
+        A3bQresRoute::Hipcc => Some(symbol),
+        A3bQresRoute::Pm => a3b_qresident_pm_symbol(symbol),
+    }
+}
+
+fn a3b_qresident_grid(batch_size: usize) -> [u32; 3] {
+    [
+        (batch_size.min(512) * 8).div_ceil(384) as u32,
+        2,
+        batch_size.div_ceil(512) as u32,
+    ]
 }
 
 /// Context ceiling of the gfx1201 Q8 FA2 prefill body: the model's 262144
@@ -7784,8 +7834,10 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        let route = A3bQresRoute::from_flag(self.flags.fa_qresident_pm);
         self.qresident_a3b_launch(
-            "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201",
+            route,
+            A3B_QRESIDENT_HIPCC_DIRECT,
             q,
             k_cache,
             v_cache,
@@ -7819,8 +7871,10 @@ impl Gpu {
         q_total_rows: usize,
         q_row_offset: usize,
     ) -> HipResult<()> {
+        let route = A3bQresRoute::from_flag(self.flags.fa_qresident_pm);
         self.qresident_a3b_launch(
-            "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_gfx1201",
+            route,
+            A3B_QRESIDENT_HIPCC_RANGE,
             q,
             k_cache,
             v_cache,
@@ -7836,9 +7890,85 @@ impl Gpu {
         )
     }
 
+    /// A3B Q-resident attention with the kernel arm chosen by the caller, not by
+    /// `HIPFIRE_FA_QRESIDENT_PM` (byte oracle / timing harness; identical validation).
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_routed_gfx1201(
+        &mut self,
+        route: A3bQresRoute,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.qresident_a3b_launch(
+            route,
+            A3B_QRESIDENT_HIPCC_DIRECT,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            batch_size,
+            0,
+        )
+    }
+
+    /// Range form of [`Self::attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_routed_gfx1201`].
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_routed_gfx1201(
+        &mut self,
+        route: A3bQresRoute,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        q_total_rows: usize,
+        q_row_offset: usize,
+    ) -> HipResult<()> {
+        self.qresident_a3b_launch(
+            route,
+            A3B_QRESIDENT_HIPCC_RANGE,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            q_total_rows,
+            q_row_offset,
+        )
+    }
+
+    /// `symbol` is the hipcc export name; [`A3bQresRoute::Pm`] launches its PM twin from
+    /// [`crate::fa_qresident_pm`] with the identical argument blob, grid, block and LDS.
     #[allow(clippy::too_many_arguments)]
     fn qresident_a3b_launch(
         &mut self,
+        route: A3bQresRoute,
         symbol: &'static str,
         q: &GpuTensor,
         k_cache: &GpuTensor,
@@ -7898,12 +8028,18 @@ impl Gpu {
                 return Err(invalid());
             }
         }
-        if !self.functions.contains_key(symbol) {
-            self.ensure_kernel(
-                "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201",
-                kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A3B_GFX1201_SRC,
-                symbol,
-            )?;
+        let launch_symbol = a3b_qresident_launch_symbol(route, symbol).ok_or_else(invalid)?;
+        match route {
+            A3bQresRoute::Hipcc => {
+                if !self.functions.contains_key(symbol) {
+                    self.ensure_kernel(
+                        "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201",
+                        kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A3B_GFX1201_SRC,
+                        symbol,
+                    )?;
+                }
+            }
+            A3bQresRoute::Pm => self.fa_qresident_pm_load(launch_symbol)?,
         }
         let qp = unsafe { (q.buf.as_ptr() as *mut u8).add(code_off) as *mut c_void };
         let sq = unsafe { (q.buf.as_ptr() as *mut u8).add(scale_off) as *mut c_void };
@@ -7921,12 +8057,8 @@ impl Gpu {
         // Same capture/recording posture as dense qresident, no eager-only gate.
         // KT48 double buffers: 2*(2*12288 + 2*192) + 16 = 49936 bytes.
         self.launch_blob_recorded(
-            symbol,
-            [
-                (batch_size.min(512) * 8).div_ceil(384) as u32,
-                2,
-                batch_size.div_ceil(512) as u32,
-            ],
+            launch_symbol,
+            a3b_qresident_grid(batch_size),
             [768, 1, 1],
             QRESIDENT_V2_LDS_BYTES,
             &mut args,
@@ -26678,6 +26810,92 @@ mod tests {
         )
         .is_err());
         assert_eq!(super::QRESIDENT_V2_LDS_BYTES, 49936);
+    }
+
+    #[test]
+    fn a3b_qresident_pm_symbol_mapping_and_route_selection() {
+        use super::{
+            a3b_qresident_launch_symbol, a3b_qresident_pm_symbol, A3bQresRoute,
+            A3B_QRESIDENT_HIPCC_DIRECT, A3B_QRESIDENT_HIPCC_RANGE,
+        };
+        use crate::fa_qresident_pm as pm;
+        assert_eq!(
+            a3b_qresident_pm_symbol(A3B_QRESIDENT_HIPCC_DIRECT),
+            Some(pm::SYMBOL_DIRECT)
+        );
+        assert_eq!(
+            a3b_qresident_pm_symbol(A3B_QRESIDENT_HIPCC_RANGE),
+            Some(pm::SYMBOL_RANGE)
+        );
+        assert_eq!(a3b_qresident_pm_symbol(pm::SYMBOL_DIRECT), None);
+        assert_eq!(
+            a3b_qresident_pm_symbol("attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201"),
+            None
+        );
+        // Flag off (route Hipcc) keeps the hipcc symbol untouched.
+        for hipcc in [A3B_QRESIDENT_HIPCC_DIRECT, A3B_QRESIDENT_HIPCC_RANGE] {
+            assert_eq!(
+                a3b_qresident_launch_symbol(A3bQresRoute::Hipcc, hipcc),
+                Some(hipcc)
+            );
+        }
+        assert_eq!(
+            a3b_qresident_launch_symbol(A3bQresRoute::Pm, A3B_QRESIDENT_HIPCC_DIRECT),
+            Some(pm::SYMBOL_DIRECT)
+        );
+        assert_eq!(
+            a3b_qresident_launch_symbol(A3bQresRoute::Pm, A3B_QRESIDENT_HIPCC_RANGE),
+            Some(pm::SYMBOL_RANGE)
+        );
+        assert_eq!(a3b_qresident_launch_symbol(A3bQresRoute::Pm, "unknown"), None);
+    }
+
+    #[test]
+    fn a3b_qresident_route_follows_the_flag_and_defaults_to_hipcc() {
+        use super::A3bQresRoute;
+        assert_eq!(A3bQresRoute::from_flag(false), A3bQresRoute::Hipcc);
+        assert_eq!(A3bQresRoute::from_flag(true), A3bQresRoute::Pm);
+        let mut flags = crate::feature_flags::FeatureFlags::for_test("gfx1201");
+        assert_eq!(
+            A3bQresRoute::from_flag(flags.fa_qresident_pm),
+            A3bQresRoute::Hipcc
+        );
+        flags.fa_qresident_pm = true;
+        assert_eq!(
+            A3bQresRoute::from_flag(flags.fa_qresident_pm),
+            A3bQresRoute::Pm
+        );
+    }
+
+    #[test]
+    fn a3b_qresident_grid_and_args_are_route_independent() {
+        use super::{a3b_qresident_args, a3b_qresident_grid};
+        use crate::fa_qresident_pm as pm;
+        assert_eq!(a3b_qresident_args([std::ptr::null_mut(); 6], 1).len(), 68);
+        assert_eq!(
+            a3b_qresident_args([std::ptr::null_mut(); 6], 1).len(),
+            pm::KERNARG_BYTES
+        );
+        for (batch, grid) in [
+            (1usize, [1u32, 2, 1]),
+            (48, [1, 2, 1]),
+            (64, [2, 2, 1]),
+            (511, [11, 2, 1]),
+            (512, [11, 2, 1]),
+            (513, [11, 2, 2]),
+            (8192, [11, 2, 16]),
+        ] {
+            assert_eq!(a3b_qresident_grid(batch), grid, "batch {batch}");
+            // The pre-wiring inline formula.
+            assert_eq!(
+                grid,
+                [
+                    (batch.min(512) * 8).div_ceil(384) as u32,
+                    2,
+                    batch.div_ceil(512) as u32
+                ]
+            );
+        }
     }
 
     #[test]

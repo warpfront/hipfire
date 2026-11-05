@@ -168,6 +168,7 @@ const NATIVE_USAGE: &str = "       emit options: [--co FILE] [--bundle FILE [--h
          (experimental DET dense F16 WMMA GEMM; no --shape; M7 requires --features toolchain)";
 const FA_PREFILL_USAGE:&str="       peacemaker-isa emit --kernel fa_prefill_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (H16/KV2/D256 Q8_0 FA2-GQA twin: one module, exports attention_fa2_q_preconvert_pm_gfx1201 then attention_q8_0_fa2_gqa_pm_gfx1201; --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/fa_prefill_pm.gfx1201.{preconvert,direct}.contract.json, --m7 a symbol-keyed receipt map)";
 const FA_PREFILL_FP8_USAGE:&str="       peacemaker-isa emit --kernel fa_prefill_fp8_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (H16/KV2/D256 native-fp8 E4M3 FA2-GQA twin: one module, ONE export attention_fp8_e4m3_fa2_gqa_f16_pm_gfx1201 (the Q preconvert/qprep stay in the Q8 and F5 modules); --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/fa_prefill_fp8_pm.gfx1201.direct.contract.json, --m7 a symbol-keyed receipt map)";
+const FA_QRESIDENT_USAGE:&str="       peacemaker-isa emit --kernel fa_qresident_a3b_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (H16/KV2/D256 register-resident-Q native-fp8 FA2-GQA twin of attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201: one module, two exports ..._a3b_pm_gfx1201 and ..._range_a3b_pm_gfx1201; --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/fa_qresident_a3b_pm.gfx1201.{direct,range}.contract.json, --m7 a symbol-keyed receipt map)";
 const FA_QPREP_USAGE:&str="       peacemaker-isa emit --kernel fa_qprep_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (H16/KV2/D256 rotary-64 Q prep: one module, one export attention_fa2_qprep_pm_gfx1201; --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/fa_qprep_pm.gfx1201.contract.json, --m7 a symbol-keyed receipt map)";
 const IU4_C8_USAGE:&str="       peacemaker-isa emit --kernel iu4_c8_producer_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (exact C8 IU4 producers of the A3B F3 route: one module, four exports iu4_c8_rotate_pm_gfx1201, iu4_c8_rmsnorm_rotate_pm_gfx1201, iu4_c8_sigmoid_rotate_pm_gfx1201 and iu4_c8_rmsnorm_out_rotate_pm_gfx1201; --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/iu4_c8_producer_pm.gfx1201.{rotate,norm,sigmoid_rotate,norm_out}.contract.json, --m7 a symbol-keyed receipt map)";
 const GDN_CHUNK_PREP_USAGE:&str="       peacemaker-isa emit --kernel gdn_chunk_prep_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (HK16/HV32/HD128 GDN chunk prep: one module, one export gdn_chunk_prep_pm_gfx1201; --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/gdn_chunk_prep_pm.gfx1201.contract.json, --m7 a symbol-keyed receipt map)";
@@ -1733,6 +1734,18 @@ fn fa_prefill_fp8_pm(arch: Arch) -> Result<(String, Vec<u8>), String> {
         serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
     ))
 }
+/// gfx1201 A3B register-resident-Q native-fp8 FA2-GQA twin: one module, the direct and range exports. `--co`/`--bundle`
+/// link it, `--shape DIR` writes both contracts, `--m7 FILE` the symbol-keyed receipt map.
+fn fa_qresident_a3b_pm(arch: Arch) -> Result<(String, Vec<u8>), String> {
+    let (_, text, proof) = peacemaker_isa::kernels::fa_qresident::emit_module(
+        arch,
+        &peacemaker_isa::kernels::fa_qresident::FaQresSpec::A3B,
+    )?;
+    Ok((
+        text,
+        serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+    ))
+}
 /// gfx1201 A3B FA2-GQA Q prep (one-wave Q RMSNorm + gate passthrough + captured-angle half-split RoPE + f16 RNE
 /// Q16): its own single-export module, separate from the `fa_prefill_pm` bundle. `--co`/`--bundle` link it,
 /// `--shape DIR` writes the contract and `--m7 FILE` the symbol-keyed receipt map.
@@ -1773,7 +1786,7 @@ fn run() -> Result<(), String> {
         return region_import(args);
     }
     if command.as_deref() != Some("emit") {
-        return Err(format!("{USAGE}\n{NATIVE_USAGE}\n{FA_PREFILL_USAGE}\n{FA_PREFILL_FP8_USAGE}\n{FA_QPREP_USAGE}\n{IU4_C8_USAGE}\n{GDN_CHUNK_PREP_USAGE}"));
+        return Err(format!("{USAGE}\n{NATIVE_USAGE}\n{FA_PREFILL_USAGE}\n{FA_PREFILL_FP8_USAGE}\n{FA_QPREP_USAGE}\n{FA_QRESIDENT_USAGE}\n{IU4_C8_USAGE}\n{GDN_CHUNK_PREP_USAGE}"));
     }
     let mut kernel = None;
     let mut arch = None;
@@ -1934,6 +1947,7 @@ fn run() -> Result<(), String> {
             "fa_prefill_pm" => fa_prefill_pm(arch)?,
             "fa_prefill_fp8_pm" => fa_prefill_fp8_pm(arch)?,
             "fa_qprep_pm" => fa_qprep_pm(arch)?,
+            "fa_qresident_a3b_pm" => fa_qresident_a3b_pm(arch)?,
             "iu4_c8_producer_pm" => iu4_c8_producer_pm(arch)?,
             "gdn_chunk_prep_pm" => gdn_chunk_prep_pm(arch)?,
             "mq4_fp8_verify" => mq4_fp8_verify(epi.as_deref().unwrap_or("all"), arch)?,
@@ -1951,6 +1965,7 @@ fn run() -> Result<(), String> {
     let fapm = kernel == "fa_prefill_pm";
     let fapm8 = kernel == "fa_prefill_fp8_pm";
     let fqp = kernel == "fa_qprep_pm";
+    let fqr = kernel == "fa_qresident_a3b_pm";
     let iu4c8 = kernel == "iu4_c8_producer_pm";
     let gcp = kernel == "gdn_chunk_prep_pm";
     let mq4f8 = kernel == "mq4_fp8_verify";
@@ -1978,6 +1993,7 @@ fn run() -> Result<(), String> {
         && !fapm
         && !fapm8
         && !fqp
+        && !fqr
         && !iu4c8
         && !gcp
         && !mq4f8
@@ -1990,7 +2006,7 @@ fn run() -> Result<(), String> {
         && !mtp_det
         && (shape.is_some() || m7.is_some())
     {
-        return Err("--shape/--m7 apply only to pm_decode_<module>, mq4_verify, fa_prefill_pm, fa_prefill_fp8_pm, fa_qprep_pm, iu4_c8_producer_pm, gdn_chunk_prep_pm, mq4_fp8_verify, mq_i4_rows, mq_i4_a4, moe_rotate_i4_pm, qwen4_lane_rows, spec_sampling_rows_pm, spec_accept_pm, qwen4_ep_owner_assign_pm, qwen4_ep_owner_assign_pinned_pm, ep_tile_mask_pm, argmax_regrid_pm, ep_gather_grouped_rows_by_tile_owner_pm, ep_gather_grouped_rows_by_tile_owner_n8_pm, moe_slot_ops_pm, moe_slot_ops_v2_pm, mtp_dense_det_gfx11 and mtp_q8_det_gfx11 (--m7 only)".into());
+        return Err("--shape/--m7 apply only to pm_decode_<module>, mq4_verify, fa_prefill_pm, fa_prefill_fp8_pm, fa_qprep_pm, fa_qresident_a3b_pm, iu4_c8_producer_pm, gdn_chunk_prep_pm, mq4_fp8_verify, mq_i4_rows, mq_i4_a4, moe_rotate_i4_pm, qwen4_lane_rows, spec_sampling_rows_pm, spec_accept_pm, qwen4_ep_owner_assign_pm, qwen4_ep_owner_assign_pinned_pm, ep_tile_mask_pm, argmax_regrid_pm, ep_gather_grouped_rows_by_tile_owner_pm, ep_gather_grouped_rows_by_tile_owner_n8_pm, moe_slot_ops_pm, moe_slot_ops_v2_pm, mtp_dense_det_gfx11 and mtp_q8_det_gfx11 (--m7 only)".into());
     }
     if spec_pm && co.is_none() && (shape.is_some() || m7.is_some()) {
         return Err("spec_*_pm --shape/--m7 require --co (M7 certifies the linked object)".into());
@@ -2041,6 +2057,14 @@ fn run() -> Result<(), String> {
     if iu4c8 && co.is_none() && (shape.is_some() || m7.is_some()) {
         return Err(
             "iu4_c8_producer_pm --shape/--m7 require --co (M7 certifies the linked object)".into(),
+        );
+    }
+    if fqr && epi.is_some() {
+        return Err("fa_qresident_a3b_pm has one module and no --epi variants".into());
+    }
+    if fqr && co.is_none() && (shape.is_some() || m7.is_some()) {
+        return Err(
+            "fa_qresident_a3b_pm --shape/--m7 require --co (M7 certifies the linked object)".into(),
         );
     }
     if fqp && epi.is_some() {
@@ -2332,6 +2356,10 @@ fn run() -> Result<(), String> {
         return Err("iu4_c8_producer_pm --shape/--m7 certify with M7: build peacemaker-isa with --features toolchain".into());
     }
     #[cfg(not(feature = "toolchain"))]
+    if fqr && (shape.is_some() || m7.is_some()) {
+        return Err("fa_qresident_a3b_pm --shape/--m7 certify with M7: build peacemaker-isa with --features toolchain".into());
+    }
+    #[cfg(not(feature = "toolchain"))]
     if fqp && (shape.is_some() || m7.is_some()) {
         return Err("fa_qprep_pm --shape/--m7 certify with M7: build peacemaker-isa with --features toolchain".into());
     }
@@ -2588,6 +2616,42 @@ fn run() -> Result<(), String> {
         }
         let mut receipts = serde_json::Map::new();
         receipts.insert(symbol, m7r);
+        let receipts = serde_json::to_vec_pretty(&receipts).map_err(|e| e.to_string())?;
+        println!("{}", String::from_utf8_lossy(&receipts));
+        if let Some(file) = &m7 {
+            fs::write(file, &receipts).map_err(|e| format!("{file}: {e}"))?
+        }
+    }
+    // fa_qresident_a3b_pm: M7 on both exports of the linked module (direct, range), plus both contracts (--shape DIR).
+    #[cfg(feature = "toolchain")]
+    if fqr && co.is_some() {
+        use peacemaker_isa::kernels::fa_qresident;
+        let path = co.as_deref().ok_or("missing --co")?;
+        let (emitted, _, _) = fa_qresident::emit_module(arch, &fa_qresident::FaQresSpec::A3B)?;
+        let [direct, range] = &emitted[..] else {
+            return Err("fa_qresident_a3b_pm: module must hold exactly the direct then the range export".into());
+        };
+        let mut receipts = serde_json::Map::new();
+        for (name, symbol, e) in [
+            ("direct", fa_qresident::SYMBOL_DIRECT, direct),
+            ("range", fa_qresident::SYMBOL_RANGE, range),
+        ] {
+            let contract = fa_qresident::contract(arch, e, symbol);
+            let m7r =
+                peacemaker_isa::pm_check::m7(std::path::Path::new(path), arch.name(), symbol)?;
+            if let Some(dir) = &shape {
+                let file = format!(
+                    "{dir}/fa_qresident_a3b_pm.{}.{name}.contract.json",
+                    arch.name()
+                );
+                fs::write(
+                    &file,
+                    serde_json::to_vec_pretty(&contract).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| format!("{file}: {e}"))?;
+            }
+            receipts.insert(symbol.to_owned(), m7r);
+        }
         let receipts = serde_json::to_vec_pretty(&receipts).map_err(|e| e.to_string())?;
         println!("{}", String::from_utf8_lossy(&receipts));
         if let Some(file) = &m7 {
