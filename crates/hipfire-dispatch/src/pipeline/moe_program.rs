@@ -4320,8 +4320,28 @@ pub(super) fn select_prefill(
         && matches!(
             params.prelude.route,
             super::sealed_moe::PrefillRouteMode::Replicated
+                | super::sealed_moe::PrefillRouteMode::HeteroCold
         ))
     .then(|| {
+        if matches!(
+            params.prelude.route,
+            super::sealed_moe::PrefillRouteMode::HeteroCold
+        ) {
+            return super::select_grouped_route_routed_only(
+                &params.dtypes,
+                params.n_exp,
+                params.k_top,
+                params.gate_up_k,
+                params.mi,
+                params.gate_up_k,
+                params.down_m,
+                params.down_k,
+                params.expert_dtype_tags,
+                params.expert_down_awq_ptrs.is_some() || params.down_awq_scale.is_some(),
+                params.route_policy,
+                ctx.arch.arch(),
+            );
+        }
         super::select_grouped_route(
             &params.dtypes,
             params.n_exp,
