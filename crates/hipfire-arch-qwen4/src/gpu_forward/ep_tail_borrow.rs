@@ -1283,12 +1283,12 @@ impl Qwen4GpuForward {
         Ok(())
     }
 
-    /// Swap the resident bank back into `scratch`; a no-op when it already is.
+    /// Swap the resident bank back into `scratch`; a no-op when it already is or when the
+    /// forward has no EP tail borrow (a non-EP load reaches this from teardown).
     fn ep_tail_swap_out(&mut self) -> Result<(), Qwen4GpuForwardError> {
-        let borrow = self
-            .ep_tail_borrow
-            .as_mut()
-            .expect("an EP tail borrow forward");
+        let Some(borrow) = self.ep_tail_borrow.as_mut() else {
+            return Ok(());
+        };
         let EpTailState::Attached(attached) = &mut borrow.state else {
             return Ok(());
         };
