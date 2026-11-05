@@ -46,6 +46,11 @@ required-features = ["lab"]
 name = "pm_persistent_smoke"
 required-features = ["lab"]
 
+# Regenerates railgun-cert's PeaceMaker release/acquire fixtures (tests/event_sync.rs).
+[[example]]
+name = "railgun_cert_event_sync_fixtures"
+required-features = ["lab"]
+
 # Native gfx1100 emitters that also run the ROCm oracle/certify path (M7, radiowave): need `--features toolchain`.
 [[example]]
 name = "e8p_i4_moe_gemv_gfx1100_emit"

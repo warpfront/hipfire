@@ -678,6 +678,26 @@ impl SingleQueuePm4Ib {
     }
 
     unsafe fn replay_and_wait_inner_checked(&mut self) -> Result<(), (ReplayError, Quiescence)> {
+        // SAFETY: forwarded from this method's caller.
+        unsafe { self.replay_submit_checked()? };
+        self.wait_replay_checked()
+    }
+
+    /// Publish one replay of the retained indirect buffer and return without
+    /// waiting: the first half of [`Self::replay_and_wait_checked`], with the
+    /// same state transitions on failure. `Ok(())` means the replay is in
+    /// flight ([`Self::in_flight`]); quiescence is only reached by
+    /// [`Self::wait_replay_checked`], [`Self::quiesce`] or drop. Until then the
+    /// queue refuses another replay (`AlreadyInFlight`).
+    ///
+    /// # Safety
+    ///
+    /// All code, kernarg, and pointee addresses encoded in the retained IB
+    /// must remain live and GPU-accessible until a later
+    /// [`Self::wait_replay_checked`] returns `Ok` (or, after any error, through
+    /// this object's destruction), and no host write to the memory the IB
+    /// reads may race the in-flight replay.
+    pub unsafe fn replay_submit_checked(&mut self) -> Result<(), (ReplayError, Quiescence)> {
         if !self.usable {
             return Err((ReplayError::GraphInactive, Quiescence::Proven));
         }
@@ -706,6 +726,28 @@ impl SingleQueuePm4Ib {
                 QuiescenceTransition::Cancelled,
             );
             return Err((error.into(), Quiescence::Proven));
+        }
+        Ok(())
+    }
+
+    /// `true` when [`Self::wait_replay_checked`] would return without
+    /// polling: no replay is in flight, the completion signal has reached
+    /// zero, or a queue fault is latched (the wait reports it). Non-blocking;
+    /// it changes no state, so quiescence is still only established by the
+    /// wait.
+    pub fn replay_complete(&self) -> bool {
+        !self.in_flight || self.completion.is_complete() || self.queues.check_faults().is_err()
+    }
+
+    /// Wait, with the finite default bound, for the replay published by
+    /// [`Self::replay_submit_checked`]: the second half of
+    /// [`Self::replay_and_wait_checked`] with unchanged timeout, watchdog
+    /// and quiescence semantics. `Ok(())` immediately when no replay is in
+    /// flight. On timeout or queue fault the queues are inactivated and the
+    /// error carries `Proven` only when that teardown succeeded.
+    pub fn wait_replay_checked(&mut self) -> Result<(), (ReplayError, Quiescence)> {
+        if !self.in_flight {
+            return Ok(());
         }
         match self
             .queues

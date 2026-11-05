@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use railgun_corpus::{CorpusRecord, KernelRecord, Receipt};
+use railgun_corpus::{CorpusRecord, KernelRecord, PinnedReceipt, Receipt};
 use serde::Serialize;
 
 use crate::{Binding, ResourceId, WordId};
@@ -38,6 +38,13 @@ pub enum MemClass {
     Atomic,
     AtomicCommutative,
     LdsDma,
+    /// A commutative atomic RMW issued with release ordering: the issuing
+    /// workgroup's earlier writes are visible to whoever acquires the cell
+    /// (an event-cell publication).
+    AtomicRelease,
+    /// A load whose observed value is followed by an acquire invalidate: what
+    /// it observes happens-before the loads that follow (an event-cell wait).
+    LoadAcquire,
 }
 
 impl MemClass {
@@ -49,6 +56,8 @@ impl MemClass {
             "atomic" => Self::Atomic,
             "atomic_commutative" => Self::AtomicCommutative,
             "lds_dma" => Self::LdsDma,
+            "atomic_release" => Self::AtomicRelease,
+            "load_acquire" => Self::LoadAcquire,
             other => return Err(format!("unknown memory class {other:?}")),
         })
     }
@@ -60,7 +69,21 @@ impl MemClass {
     pub fn writes(self) -> bool {
         matches!(
             self,
-            Self::VmemStore | Self::Atomic | Self::AtomicCommutative
+            Self::VmemStore | Self::Atomic | Self::AtomicCommutative | Self::AtomicRelease
+        )
+    }
+
+    /// The classes an event cell may be accessed with: atomics (commutative,
+    /// release) and loads (plain, scalar, acquire). A plain store or a
+    /// non-commutative atomic is not one.
+    pub fn is_event_class(self) -> bool {
+        matches!(
+            self,
+            Self::AtomicCommutative
+                | Self::AtomicRelease
+                | Self::LoadAcquire
+                | Self::VmemLoad
+                | Self::SmemLoad
         )
     }
 }
@@ -208,6 +231,40 @@ pub struct SealedTableFact {
     pub null_guarded: bool,
 }
 
+/// One pointer a kernel loads from a descriptor-arena record of some
+/// template, and what it does through the loaded address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArenaPointerLoad {
+    /// Record-relative byte offset of the 8-byte pointer (8-aligned).
+    pub record_offset: u32,
+    /// Sorted, deduplicated; empty when the pointer is loaded and never
+    /// dereferenced.
+    pub classes: Vec<MemClass>,
+}
+
+/// One record template of a descriptor arena: the pointer fields a kernel
+/// loads from a record of this template. A field the facts do not list is
+/// never loaded as an address base.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArenaTemplate {
+    pub template: u32,
+    pub pointer_loads: Vec<ArenaPointerLoad>,
+}
+
+/// One descriptor arena of a `Conditional` kernel (receipt
+/// `descriptor_arenas`): the pointer argument holding the base of an array of
+/// binding records and, per record template, the pointers loaded from a
+/// record. The certificate says "every address this kernel accesses through
+/// the arena is one of these loaded fields"; the program supplies the
+/// records ([`KernelProgram::bind_records`]), which turns each field into an
+/// effect on the resource it names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArenaFact {
+    /// Kernarg byte offset of the arena's base pointer.
+    pub arena_arg_offset: u32,
+    pub templates: Vec<ArenaTemplate>,
+}
+
 /// The guarded case of a `Conditional` kernel: valid only while every guard
 /// holds and every `witnesses` kind has a matching runtime bind witness.
 /// `indexed` and `tables` are the two independent case families (the
@@ -217,6 +274,9 @@ pub struct ConditionalFacts {
     pub guards: Vec<ArgGuard>,
     pub indexed: Vec<IndexedArgEffect>,
     pub tables: Vec<SealedTableFact>,
+    /// Descriptor arenas (the `descriptor_arena` case): discharged by
+    /// [`KernelProgram::bind_records`], not by a window witness.
+    pub arenas: Vec<ArenaFact>,
     pub witnesses: Vec<String>,
     pub case_digest: String,
 }
@@ -312,12 +372,13 @@ fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, St
     let sym = &record.symbol;
     let has_indexed = !record.indexed_effects.is_empty();
     let has_sealed = !record.sealed_tables.is_empty();
-    if (!has_indexed && !has_sealed)
+    let has_arena = !record.descriptor_arenas.is_empty();
+    if (!has_indexed && !has_sealed && !has_arena)
         || record.required_witnesses.is_empty()
         || record.case_digest.is_empty()
     {
         return Err(format!(
-            "{sym}: conditional record lacks effects (indexed or sealed tables), witnesses or case digest"
+            "{sym}: conditional record lacks effects (indexed, sealed tables or descriptor arenas), witnesses or case digest"
         ));
     }
     if has_indexed && record.guards.is_empty() {
@@ -437,6 +498,48 @@ fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, St
             guards: e.guards.clone(),
         });
     }
+    let mut arenas = Vec::with_capacity(record.descriptor_arenas.len());
+    for (i, a) in record.descriptor_arenas.iter().enumerate() {
+        a.validate(sym)?;
+        if record.descriptor_arenas[..i]
+            .iter()
+            .any(|o| o.arena_arg_offset == a.arena_arg_offset)
+        {
+            return Err(format!("{sym}: duplicate descriptor arena"));
+        }
+        let arena_arg = record.args.iter().find(|x| x.offset == a.arena_arg_offset);
+        if !arena_arg.is_some_and(|x| x.size == 8 && x.role == "pointer") {
+            return Err(format!(
+                "{sym}: descriptor arena argument +{} is not an 8-byte pointer argument",
+                a.arena_arg_offset
+            ));
+        }
+        let mut templates = Vec::with_capacity(a.templates.len());
+        for t in &a.templates {
+            let mut pointer_loads = Vec::with_capacity(t.pointer_loads.len());
+            for p in &t.pointer_loads {
+                let mut classes = p
+                    .classes
+                    .iter()
+                    .map(|c| MemClass::parse(c).map_err(|m| format!("{sym}: {m}")))
+                    .collect::<Result<Vec<_>, _>>()?;
+                classes.sort();
+                classes.dedup();
+                pointer_loads.push(ArenaPointerLoad {
+                    record_offset: p.record_offset,
+                    classes,
+                });
+            }
+            templates.push(ArenaTemplate {
+                template: t.template,
+                pointer_loads,
+            });
+        }
+        arenas.push(ArenaFact {
+            arena_arg_offset: a.arena_arg_offset,
+            templates,
+        });
+    }
     Ok(ConditionalFacts {
         guards: record
             .guards
@@ -450,6 +553,7 @@ fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, St
             .collect(),
         indexed,
         tables,
+        arenas,
         witnesses: record.required_witnesses.clone(),
         case_digest: record.case_digest.clone(),
     })
@@ -587,6 +691,27 @@ impl NodeFacts {
         receipt: &Receipt,
         symbol: &str,
     ) -> Result<Self, String> {
+        Self::from_receipt(&record.module, &record.receipt_sha256, receipt, symbol)
+    }
+
+    /// The facts for `symbol` from a pinned receipt of an externally emitted
+    /// object (`railgun_corpus::PinnedReceipt`): the same record shape as a
+    /// corpus hit, keyed by the same object SHA-256.
+    pub fn from_pinned(pinned: &PinnedReceipt, symbol: &str) -> Result<Self, String> {
+        Self::from_receipt(
+            &pinned.module,
+            &pinned.receipt_sha256,
+            &pinned.receipt,
+            symbol,
+        )
+    }
+
+    fn from_receipt(
+        module: &str,
+        receipt_sha256: &str,
+        receipt: &Receipt,
+        symbol: &str,
+    ) -> Result<Self, String> {
         let kernel = receipt
             .railgun
             .kernels
@@ -610,11 +735,11 @@ impl NodeFacts {
             })?;
         Ok(Self {
             kref: KernelRef {
-                module: record.module.clone(),
+                module: module.to_owned(),
                 symbol: symbol.to_owned(),
                 artifact_sha256: receipt.object_sha256.clone(),
                 kd_sha256: identity.kd_sha256.clone(),
-                receipt_sha256: record.receipt_sha256.clone(),
+                receipt_sha256: receipt_sha256.to_owned(),
                 tier: receipt.tier.clone(),
                 obligations: receipt.obligations.clone(),
             },
@@ -969,6 +1094,10 @@ pub struct KernelNode {
     /// no-op, from the object's guard certificate (`KernelFacts::guard_flag`)
     /// with its pointer bound to the start of that resource.
     pub guard: Option<ResourceId>,
+    /// The descriptor-arena case of a `Conditional` kernel (a copy of the
+    /// receipt's facts): the node is PM4 only once
+    /// [`KernelProgram::bind_records`] has bound every arena.
+    pub arena: Option<ArenaNode>,
 }
 
 /// What a window needs to bind a `Conditional` node: the explicit arguments
@@ -993,6 +1122,27 @@ pub struct TableNode {
     pub case_digest: String,
 }
 
+/// The lowering reason of a node whose descriptor arenas are not yet bound.
+pub(crate) const ARENA_UNBOUND: &str = "descriptor_arena records not bound";
+
+/// What [`KernelProgram::bind_records`] needs to discharge a
+/// `descriptor_arena` `Conditional` node: the arena facts of the loaded
+/// object, and which of them have been bound.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArenaNode {
+    pub arenas: Vec<ArenaFact>,
+    /// Parallel to `arenas`: the arena's records were bound and the
+    /// resulting effects added to the node.
+    pub bound: Vec<bool>,
+    pub case_digest: String,
+}
+
+impl ArenaNode {
+    pub fn all_bound(&self) -> bool {
+        self.bound.iter().all(|b| *b)
+    }
+}
+
 /// A word of the program and where it is patched.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ProgramWord {
@@ -1014,6 +1164,16 @@ pub struct KernelProgram {
     /// #867 IF bodies, disjoint and in node order
     /// ([`KernelProgram::add_conditional`]).
     pub conditionals: Vec<Conditional>,
+    /// What a resource is beyond "a plain allocation" (a resource absent
+    /// here is one, which is today's semantics). Written only by
+    /// [`KernelProgram::declare_event_cells`],
+    /// [`KernelProgram::declare_task_arena`] and
+    /// [`KernelProgram::bind_records`], each of which validates the nodes'
+    /// effects against the kind.
+    pub kinds: BTreeMap<ResourceId, crate::ResourceKind>,
+    /// Persistent-kernel groups that run concurrently, disjoint and in node
+    /// order ([`KernelProgram::add_coresident_group`]).
+    pub groups: Vec<crate::coresident::CoResidentGroup>,
 }
 
 /// #867: how a [`Conditional`] body is skipped when its flag is clear.
@@ -1290,19 +1450,38 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
                     }
                 }
             }
+            for a in &c.arenas {
+                let is_base = args.iter().any(|(offset, arg)| {
+                    *offset == a.arena_arg_offset
+                        && matches!(arg, Arg::Resource { interior: 0, .. })
+                });
+                if !is_base {
+                    refusals.push(format!(
+                        "descriptor arena argument +{} is not a bound allocation base (interior 0)",
+                        a.arena_arg_offset
+                    ));
+                }
+            }
         }
         let lowering = if !refusals.is_empty() {
             Lowering::HipDirect {
                 reason: refusals.join("; "),
             }
         } else if let Some(c) = conditional {
-            let reason = match (has_indexed_case(c), !c.tables.is_empty()) {
-                (true, false) => "indexed_bind witness not consumed",
-                (false, _) => "sealed_table witness not consumed",
-                (true, true) => "indexed_bind and sealed_table witnesses not consumed",
-            };
+            let mut reasons = Vec::new();
+            match (has_indexed_case(c), !c.tables.is_empty()) {
+                (true, false) => reasons.push("indexed_bind witness not consumed"),
+                (false, true) => reasons.push("sealed_table witness not consumed"),
+                (true, true) => {
+                    reasons.push("indexed_bind and sealed_table witnesses not consumed")
+                }
+                (false, false) => {}
+            }
+            if !c.arenas.is_empty() {
+                reasons.push(ARENA_UNBOUND);
+            }
             Lowering::Conditional {
-                reason: reason.to_owned(),
+                reason: reasons.join("; "),
             }
         } else if non_commutative_atomic {
             Lowering::Graph {
@@ -1350,6 +1529,13 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
                     witnesses: c.witnesses.clone(),
                     case_digest: c.case_digest.clone(),
                 }),
+            arena: conditional
+                .filter(|c| !c.arenas.is_empty())
+                .map(|c| ArenaNode {
+                    arenas: c.arenas.clone(),
+                    bound: vec![false; c.arenas.len()],
+                    case_digest: c.case_digest.clone(),
+                }),
             guard,
         });
     }
@@ -1359,6 +1545,8 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
         words,
         nodes,
         conditionals: Vec::new(),
+        kinds: BTreeMap::new(),
+        groups: Vec::new(),
     }
 }
 
@@ -1461,6 +1649,7 @@ fn uncertified_node(launch: &LaunchRecord, reason: String) -> KernelNode {
         lowering: Lowering::HipDirect { reason },
         indexed: None,
         table: None,
+        arena: None,
         guard: None,
     }
 }
@@ -1494,6 +1683,16 @@ impl KernelProgram {
             return Err(format!(
                 "conditional body {body:?} overlaps {:?} (nesting is not supported)",
                 other.body
+            ));
+        }
+        if let Some(other) = self
+            .groups
+            .iter()
+            .find(|g| g.nodes.start < body.end && body.start < g.nodes.end)
+        {
+            return Err(format!(
+                "conditional body {body:?} overlaps co-resident group {:?}",
+                other.nodes
             ));
         }
         if self
@@ -1731,8 +1930,11 @@ impl KernelProgram {
             {
                 continue;
             }
+            // A descriptor arena is discharged by `bind_records` alone; no
+            // window witness stands in for it.
             let covered = (n.indexed.is_none() || kinds.contains(&WITNESS_INDEXED_BIND))
-                && (n.table.is_none() || kinds.contains(&WITNESS_SEALED_TABLE));
+                && (n.table.is_none() || kinds.contains(&WITNESS_SEALED_TABLE))
+                && n.arena.as_ref().is_none_or(ArenaNode::all_bound);
             if covered {
                 n.lowering = Lowering::Pm4;
             }
@@ -1756,9 +1958,10 @@ impl KernelProgram {
 }
 
 /// Whether `c` carries an `indexed_bind` case. A conditional fact with
-/// neither family is the legacy indexed shape (hand-built facts).
+/// none of the three families is the legacy indexed shape (hand-built
+/// facts).
 fn has_indexed_case(c: &ConditionalFacts) -> bool {
-    !c.indexed.is_empty() || c.tables.is_empty()
+    !c.indexed.is_empty() || (c.tables.is_empty() && c.arenas.is_empty())
 }
 
 #[cfg(test)]

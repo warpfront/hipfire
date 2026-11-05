@@ -117,6 +117,8 @@ fn class_name(class: AccessClass) -> String {
             format!("atomic{}", if commutative { "_commutative" } else { "" })
         }
         AccessClass::LdsDma => "lds_dma".into(),
+        AccessClass::AtomicRelease => "atomic_release".into(),
+        AccessClass::LoadAcquire => "load_acquire".into(),
     }
 }
 fn path_name(path: MemPath) -> &'static str {
@@ -349,6 +351,7 @@ pub fn kernel_record(
         } else {
             Vec::new()
         },
+        descriptor_arenas: Vec::new(),
         required_witnesses: {
             let mut w = Vec::new();
             if conditional && !facts.indexed.is_empty() {

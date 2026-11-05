@@ -137,6 +137,7 @@ fn gather_record(null_guarded: bool) -> KernelRecord {
         guards: Vec::new(),
         indexed_effects: Vec::new(),
         sealed_tables: vec![sealed_record(null_guarded)],
+        descriptor_arenas: Vec::new(),
         required_witnesses: vec![receipt::WITNESS_SEALED_TABLE.into()],
         case_digest: String::new(),
         guard_flag: None,

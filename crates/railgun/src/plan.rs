@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
 
+use crate::coresident::GroupPlan;
 use crate::kernel::{CondLowering, Conditional, KernelProgram, MemClass};
 use crate::ResourceId;
 
@@ -396,6 +397,10 @@ pub struct Pm4Plan {
     pub rows_used: BTreeMap<Hazard, usize>,
     /// #867 `CpSkip` conditionals, in node order.
     pub skips: Vec<Conditional>,
+    /// Co-resident groups ([`KernelProgram::add_coresident_group`]), in node
+    /// order, with their member-member classification and, once admitted,
+    /// their residency proof.
+    pub groups: Vec<GroupPlan>,
 }
 
 /// One PM4 command of a segment, before packet encoding.
@@ -464,6 +469,20 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
     // entry is kept and joined back at its end (a skipped body is treated as
     // executed: its own effects stay open).
     let mut entry_state: Option<(Vec<usize>, HashMap<ResourceId, usize>, usize)> = None;
+    let mut open_group: Option<usize> = None;
+    let group_plans: Vec<GroupPlan> = program
+        .groups
+        .iter()
+        .map(|g| {
+            let (admitted, refusals) = crate::coresident::classify(program, g);
+            GroupPlan {
+                nodes: g.nodes.clone(),
+                admitted,
+                refusals,
+                residency: None,
+            }
+        })
+        .collect();
     for (j, node) in program.nodes.iter().enumerate() {
         if skips.iter().any(|c| c.body.end == j) {
             if let Some((was_open, loads, system)) = entry_state.take() {
@@ -484,6 +503,7 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
             });
         }
         if !node.lowering.is_pm4() {
+            open_group = None;
             if let Some(first) = segment_start.take() {
                 segments.push(Segment { first, end: j });
             }
@@ -494,12 +514,31 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
             });
             continue;
         }
+        let group_member = program.groups.iter().position(|g| g.nodes.contains(&j));
+        // A later member of the group whose first member already emitted the
+        // join of every member's pre-group edges: no boundary of its own
+        // (members run concurrently; their mutual edges are classified in
+        // `GroupPlan`, never answered by a wait).
+        if let (Some(g), Some(open_g)) = (group_member, open_group) {
+            if g == open_g && segment_start.is_some() {
+                boundaries.push(Boundary {
+                    visibility: Visibility::default(),
+                    edges: Vec::new(),
+                    split: false,
+                });
+                open.push(j);
+                note_loads(program, j, &mut last_vmem_load);
+                continue;
+            }
+        }
+        let group_start = group_member.filter(|&g| program.groups[g].nodes.start == j);
         let Some(first) = segment_start else {
             segment_start = Some(j);
             open.clear();
             open.push(j);
             last_vmem_load.clear();
             last_system = j;
+            open_group = group_start;
             // After a non-PM4 node the entry follows a drained HIP stream.
             let after_barrier = j > 0;
             let visibility = if after_barrier { BARRIER } else { ENTRY };
@@ -512,46 +551,54 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
             continue;
         };
         debug_assert!(first < j);
+        // The first member of a group answers for every member: all of them
+        // run after this boundary, against the nodes that precede the group.
+        let consumers = match group_start {
+            Some(g) => program.groups[g].nodes.clone(),
+            None => j..j + 1,
+        };
         let mut edges = Vec::new();
-        for effect in &program.nodes[j].effects {
-            for &i in &open {
-                for earlier in &program.nodes[i].effects {
-                    if earlier.resource != effect.resource {
-                        continue;
-                    }
-                    let mut push = |hazard| {
-                        edges.push(Edge {
-                            producer: i,
-                            consumer: j,
-                            hazard,
-                            resource: effect.resource.0,
-                        })
-                    };
-                    if earlier.writes() && effect.reads() {
-                        push(Hazard::Raw);
-                    }
-                    if earlier.reads() && effect.writes() {
-                        push(Hazard::War);
-                    }
-                    if earlier.writes() && effect.writes() {
-                        push(Hazard::Waw);
+        for m in consumers {
+            for effect in &program.nodes[m].effects {
+                for &i in &open {
+                    for earlier in &program.nodes[i].effects {
+                        if earlier.resource != effect.resource {
+                            continue;
+                        }
+                        let mut push = |hazard| {
+                            edges.push(Edge {
+                                producer: i,
+                                consumer: m,
+                                hazard,
+                                resource: effect.resource.0,
+                            })
+                        };
+                        if earlier.writes() && effect.reads() {
+                            push(Hazard::Raw);
+                        }
+                        if earlier.reads() && effect.writes() {
+                            push(Hazard::War);
+                        }
+                        if earlier.writes() && effect.writes() {
+                            push(Hazard::Waw);
+                        }
                     }
                 }
-            }
-            if effect.has(MemClass::VmemStore) {
-                if let Some(&i) = last_vmem_load.get(&effect.resource) {
-                    if i >= last_system && i < j {
-                        edges.push(Edge {
-                            producer: i,
-                            consumer: j,
-                            hazard: Hazard::WarPreWriter,
-                            resource: effect.resource.0,
-                        });
+                if effect.has(MemClass::VmemStore) {
+                    if let Some(&i) = last_vmem_load.get(&effect.resource) {
+                        if i >= last_system && i < j {
+                            edges.push(Edge {
+                                producer: i,
+                                consumer: m,
+                                hazard: Hazard::WarPreWriter,
+                                resource: effect.resource.0,
+                            });
+                        }
                     }
                 }
             }
         }
-        edges.sort_by_key(|e| (e.hazard, e.producer, e.resource));
+        edges.sort_by_key(|e| (e.hazard, e.producer, e.consumer, e.resource));
         edges.dedup();
         let visibility = edges.iter().fold(Visibility::default(), |acc, e| {
             acc.join(visibility_of(e.hazard))
@@ -571,6 +618,7 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
             last_system = j;
         }
         note_loads(program, j, &mut last_vmem_load);
+        open_group = group_start;
         boundaries.push(Boundary {
             visibility,
             edges,
@@ -586,6 +634,7 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
         boundaries,
         rows_used,
         skips,
+        groups: group_plans,
     }
 }
 

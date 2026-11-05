@@ -117,6 +117,7 @@ fn conditional(object: &str, elf: &str) -> KernelRecord {
         guards,
         indexed_effects: vec![effect()],
         sealed_tables: vec![],
+        descriptor_arenas: vec![],
         required_witnesses: vec!["indexed_bind".into()],
         case_digest: String::new(),
         guard_flag: None,

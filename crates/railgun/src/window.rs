@@ -807,15 +807,82 @@ pub struct NodeImage<'a> {
 pub trait WindowQueue: Send {
     /// Write every node's kernarg image and grid into the queue's retired
     /// storage, run the typed copy/fill steps' emission inputs, and launch.
-    /// `Ok` means the work is in flight; `Err` carries what is known.
+    /// `Ok` means the work was launched; `Err` carries what is known. A
+    /// queue that blocks here has proven quiescence by the time it returns
+    /// (its [`Self::wait`] only reports the outcome); see
+    /// [`Self::submit_nowait`] for one that has not.
     fn submit(
         &mut self,
         nodes: &[NodeImage<'_>],
         steps: &[ResolvedStep],
     ) -> Result<(), QueueFailure>;
 
+    /// [`Self::submit`] that does not wait for the launched work: `Ok` means
+    /// *in flight* and nothing more, and quiescence is proven only by
+    /// [`Self::wait`], whose result is this submit's outcome. The queue's
+    /// kernarg and grid storage belongs to the GPU until `wait` returns, so a
+    /// queue refuses a `submit` or `submit_nowait` issued while one is
+    /// outstanding (a [`Quiescence::Proven`] failure, "submit without
+    /// completion", before anything is written).
+    ///
+    /// The default is `submit`: a queue that blocks in `submit` is trivially
+    /// submitted when it returns, and its `wait` reports the stored result.
+    fn submit_nowait(
+        &mut self,
+        nodes: &[NodeImage<'_>],
+        steps: &[ResolvedStep],
+    ) -> Result<(), QueueFailure> {
+        self.submit(nodes, steps)
+    }
+
     /// Prove queue quiescence (blocking).
     fn wait(&mut self) -> Result<(), QueueFailure>;
+}
+
+/// A [`WindowQueue::submit_nowait`] in flight on a queue driven directly
+/// (without a [`PreparedWindow`]), from [`submit_queue_nowait`]. It holds the
+/// queue's `&mut` borrow, so a second submit is impossible while it lives.
+///
+/// [`Self::wait`] proves quiescence and returns the queue's outcome. Dropping
+/// the handle without waiting waits too (the result is discarded), so a
+/// dropped handle never leaves the queue in flight unobserved; a failure
+/// stays stored in the queue for its next submit (an `Unknown` one refuses
+/// it).
+#[must_use = "dropping the handle blocks until the queue is quiescent; call wait() for its result"]
+pub struct QueueCompletion<'q, Q: WindowQueue + ?Sized> {
+    queue: &'q mut Q,
+    waited: bool,
+}
+
+impl<Q: WindowQueue + ?Sized> QueueCompletion<'_, Q> {
+    /// Prove queue quiescence (blocking) and return the submit's outcome.
+    pub fn wait(mut self) -> Result<(), QueueFailure> {
+        self.waited = true;
+        self.queue.wait()
+    }
+}
+
+impl<Q: WindowQueue + ?Sized> Drop for QueueCompletion<'_, Q> {
+    fn drop(&mut self) {
+        if !self.waited {
+            let _ = self.queue.wait();
+        }
+    }
+}
+
+/// [`WindowQueue::submit_nowait`] on a raw queue: `Ok` is the in-flight
+/// handle, `Err` is a refused or failed submit (nothing in flight; the
+/// queue's `wait` still reports a stored failure).
+pub fn submit_queue_nowait<'q, Q: WindowQueue + ?Sized>(
+    queue: &'q mut Q,
+    nodes: &[NodeImage<'_>],
+    steps: &[ResolvedStep],
+) -> Result<QueueCompletion<'q, Q>, QueueFailure> {
+    queue.submit_nowait(nodes, steps)?;
+    Ok(QueueCompletion {
+        queue,
+        waited: false,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -928,7 +995,10 @@ pub struct CompletionFailure {
 
 /// `Submission` (§2): the work is queued; every bound resource, kernarg
 /// buffer and loaded kernel outlives [`Submission::complete`]. Dropping it
-/// without completing leaves the window in flight (never reusable).
+/// without completing leaves the window in flight (never reusable). After
+/// [`PreparedWindow::submit_nowait`] the queue may still be running:
+/// `complete` is then what waits for it, and nothing it reads may be written
+/// or freed before it returns.
 pub struct Submission {
     shared: Arc<Mutex<Shared>>,
     generation: u64,
@@ -1530,9 +1600,26 @@ impl PreparedWindow {
     }
 
     /// `PreparedWindow::submit` (§2): consume the bound generation and queue
-    /// it. A stale, foreign or already-consumed [`BoundWindow`] is refused
-    /// before the queue is touched.
+    /// it, blocking where the queue blocks (see [`WindowQueue::submit`]). A
+    /// stale, foreign or already-consumed [`BoundWindow`] is refused before
+    /// the queue is touched.
     pub fn submit(&mut self, bound: BoundWindow) -> Result<Submission, Refusal> {
+        self.submit_with(bound, false)
+    }
+
+    /// [`Self::submit`] over [`WindowQueue::submit_nowait`]: the same checks,
+    /// witnesses and failure handling, but `Ok` only means the window is in
+    /// flight. The returned [`Submission`]'s [`complete`] proves quiescence
+    /// (and reports the failure of a launch that did not finish); the window
+    /// stays in flight, and `bind` refuses, until then. On a queue that
+    /// blocks in `submit` this is exactly `submit`.
+    ///
+    /// [`complete`]: Submission::complete
+    pub fn submit_nowait(&mut self, bound: BoundWindow) -> Result<Submission, Refusal> {
+        self.submit_with(bound, true)
+    }
+
+    fn submit_with(&mut self, bound: BoundWindow, nowait: bool) -> Result<Submission, Refusal> {
         let mut shared = lock(&self.shared);
         if bound.prepared != self.id || bound.epoch != shared.epoch {
             return Err(Refusal::StaleBound);
@@ -1626,7 +1713,12 @@ impl PreparedWindow {
                 grid: *grid,
             })
             .collect();
-        match shared.queue.submit(&nodes, &self.resolved) {
+        let queued = if nowait {
+            shared.queue.submit_nowait(&nodes, &self.resolved)
+        } else {
+            shared.queue.submit(&nodes, &self.resolved)
+        };
+        match queued {
             Ok(()) => {
                 shared.phase = Phase::InFlight;
                 shared.last_submitted_generation = Some(bound.generation);
@@ -1967,6 +2059,78 @@ mod tests {
 
     fn prepared() -> (PreparedWindow, Arc<Mutex<Log>>) {
         prepared_with(patches())
+    }
+
+    #[derive(Default)]
+    struct AsyncLog {
+        blocking_submits: usize,
+        nowait_submits: usize,
+        waits: usize,
+        in_flight: bool,
+        wait_failure: Option<Quiescence>,
+    }
+
+    /// A queue whose `submit_nowait` returns with the work in flight and whose
+    /// `wait` alone settles it; like the real queue it refuses a submit while
+    /// one is outstanding. Its `submit` blocks (never in flight afterwards).
+    struct AsyncQueue(Arc<Mutex<AsyncLog>>);
+
+    impl AsyncQueue {
+        fn refuse_in_flight(log: &AsyncLog) -> Result<(), QueueFailure> {
+            if log.in_flight {
+                return Err(QueueFailure {
+                    message: "submit without completion".into(),
+                    quiescence: Quiescence::Proven,
+                });
+            }
+            Ok(())
+        }
+    }
+
+    impl WindowQueue for AsyncQueue {
+        fn submit(
+            &mut self,
+            _nodes: &[NodeImage<'_>],
+            _steps: &[ResolvedStep],
+        ) -> Result<(), QueueFailure> {
+            let mut log = self.0.lock().unwrap();
+            Self::refuse_in_flight(&log)?;
+            log.blocking_submits += 1;
+            Ok(())
+        }
+
+        fn submit_nowait(
+            &mut self,
+            _nodes: &[NodeImage<'_>],
+            _steps: &[ResolvedStep],
+        ) -> Result<(), QueueFailure> {
+            let mut log = self.0.lock().unwrap();
+            Self::refuse_in_flight(&log)?;
+            log.nowait_submits += 1;
+            log.in_flight = true;
+            Ok(())
+        }
+
+        fn wait(&mut self) -> Result<(), QueueFailure> {
+            let mut log = self.0.lock().unwrap();
+            log.waits += 1;
+            log.in_flight = false;
+            match log.wait_failure {
+                Some(q) => Err(QueueFailure {
+                    message: "wait".into(),
+                    quiescence: q,
+                }),
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn prepared_async() -> (PreparedWindow, Arc<Mutex<AsyncLog>>) {
+        let log = Arc::new(Mutex::new(AsyncLog::default()));
+        let plan = make_plan(parts_with(patches())).expect("plan");
+        let prepared =
+            PreparedWindow::new(plan, key(), Box::new(AsyncQueue(log.clone()))).expect("prepared");
+        (prepared, log)
     }
 
     fn shape(position: u64, generation: u64) -> WindowShape {
@@ -2405,6 +2569,171 @@ mod tests {
             w.bind(&shape(300, 2), &bindings(), &inputs()).unwrap_err(),
             Refusal::Quarantined
         );
+    }
+
+    #[test]
+    fn submit_nowait_then_complete_retires_the_window() {
+        // A queue that blocks in `submit`: `submit_nowait` is its `submit`.
+        let (mut w, log) = prepared();
+        let bound = w.bind(&shape(300, 1), &bindings(), &inputs()).unwrap();
+        let submission = w.submit_nowait(bound).unwrap();
+        assert_eq!(log.lock().unwrap().submits, 1);
+        assert!(!w.is_retired());
+        let done = submission.complete().unwrap();
+        assert_eq!(done.generation, 1);
+        assert!(w.is_retired());
+        assert_eq!(log.lock().unwrap().waits, 1);
+
+        // A queue with its own `submit_nowait`: in flight until `complete`.
+        let (mut w, log) = prepared_async();
+        let bound = w.bind(&shape(300, 1), &bindings(), &inputs()).unwrap();
+        let submission = w.submit_nowait(bound).unwrap();
+        {
+            let l = log.lock().unwrap();
+            assert_eq!((l.nowait_submits, l.blocking_submits, l.waits), (1, 0, 0));
+            assert!(l.in_flight);
+        }
+        assert!(!w.is_retired());
+        assert_eq!(
+            w.bind(&shape(300, 2), &bindings(), &inputs()).unwrap_err(),
+            Refusal::InFlight
+        );
+        let done = submission.complete().unwrap();
+        assert_eq!(done.generation, 1);
+        assert!(w.is_retired());
+        {
+            let l = log.lock().unwrap();
+            assert_eq!(l.waits, 1);
+            assert!(!l.in_flight);
+        }
+        // Retired again: the blocking path still works on the same window.
+        let bound = w.bind(&shape(300, 2), &bindings(), &inputs()).unwrap();
+        w.submit(bound).unwrap().complete().unwrap();
+        let l = log.lock().unwrap();
+        assert_eq!((l.nowait_submits, l.blocking_submits, l.waits), (1, 1, 2));
+    }
+
+    #[test]
+    fn submit_without_completion_is_refused_before_the_queue_is_touched() {
+        let (mut w, log) = prepared_async();
+        let bound = w.bind(&shape(300, 1), &bindings(), &inputs()).unwrap();
+        // `bind` refuses while in flight, so the only way to hold a second
+        // bound window of the live epoch is to build one here.
+        let forge = |generation: u64| BoundWindow {
+            prepared: bound.prepared,
+            epoch: bound.epoch,
+            generation,
+            host_delta: bound.host_delta,
+            indexed: None,
+            tables: None,
+            exact: false,
+        };
+        let (second_nowait, second_blocking) = (forge(2), forge(3));
+        let submission = w.submit_nowait(bound).unwrap();
+        assert_eq!(
+            w.submit_nowait(second_nowait).err(),
+            Some(Refusal::InFlight)
+        );
+        assert_eq!(w.submit(second_blocking).err(), Some(Refusal::InFlight));
+        {
+            let l = log.lock().unwrap();
+            assert_eq!((l.nowait_submits, l.blocking_submits, l.waits), (1, 0, 0));
+            assert!(l.in_flight);
+        }
+        // The refusals changed nothing: the first submission completes.
+        assert_eq!(submission.complete().unwrap().generation, 1);
+        assert!(w.is_retired());
+    }
+
+    #[test]
+    fn async_wait_failure_decides_quarantine_at_complete() {
+        let (mut w, log) = prepared_async();
+        let bound = w.bind(&shape(300, 1), &bindings(), &inputs()).unwrap();
+        let submission = w.submit_nowait(bound).unwrap();
+        // The queue was still running: its wait, not the submit, fails.
+        log.lock().unwrap().wait_failure = Some(Quiescence::Unknown);
+        assert_eq!(
+            submission.complete().unwrap_err(),
+            CompletionFailure {
+                generation: 1,
+                quiescence: Quiescence::Unknown,
+                message: "wait".into(),
+            }
+        );
+        assert!(!w.is_retired());
+        assert_eq!(
+            w.bind(&shape(300, 2), &bindings(), &inputs()).unwrap_err(),
+            Refusal::Quarantined
+        );
+
+        let (mut w, log) = prepared_async();
+        let bound = w.bind(&shape(300, 1), &bindings(), &inputs()).unwrap();
+        let submission = w.submit_nowait(bound).unwrap();
+        log.lock().unwrap().wait_failure = Some(Quiescence::Proven);
+        assert_eq!(
+            submission.complete().unwrap_err().quiescence,
+            Quiescence::Proven
+        );
+        assert!(w.is_retired());
+    }
+
+    #[test]
+    fn queue_completion_waits_exactly_once_on_wait_or_drop() {
+        let log = Arc::new(Mutex::new(AsyncLog::default()));
+        let mut queue = AsyncQueue(log.clone());
+
+        // `wait` returns the queue's result; the drop after it does not wait
+        // again.
+        let completion = submit_queue_nowait(&mut queue, &[], &[]).unwrap();
+        {
+            let l = log.lock().unwrap();
+            assert!(l.in_flight);
+            assert_eq!(l.waits, 0);
+        }
+        completion.wait().unwrap();
+        {
+            let l = log.lock().unwrap();
+            assert!(!l.in_flight);
+            assert_eq!(l.waits, 1);
+        }
+        log.lock().unwrap().wait_failure = Some(Quiescence::Unknown);
+        let completion = submit_queue_nowait(&mut queue, &[], &[]).unwrap();
+        assert_eq!(
+            completion.wait().unwrap_err(),
+            QueueFailure {
+                message: "wait".into(),
+                quiescence: Quiescence::Unknown,
+            }
+        );
+        assert_eq!(log.lock().unwrap().waits, 2);
+
+        // Dropped without `wait`: the drop waits, once, and the queue is no
+        // longer in flight.
+        log.lock().unwrap().wait_failure = None;
+        let completion = submit_queue_nowait(&mut queue, &[], &[]).unwrap();
+        assert!(log.lock().unwrap().in_flight);
+        drop(completion);
+        {
+            let l = log.lock().unwrap();
+            assert!(!l.in_flight);
+            assert_eq!(l.waits, 3);
+        }
+
+        // A refused submit hands back no handle, so nothing waits.
+        log.lock().unwrap().in_flight = true;
+        let refused = submit_queue_nowait(&mut queue, &[], &[]).err().unwrap();
+        assert_eq!(refused.quiescence, Quiescence::Proven);
+        assert!(refused.message.contains("submit without completion"));
+        assert_eq!(log.lock().unwrap().waits, 3);
+
+        // Works through a trait object too.
+        log.lock().unwrap().in_flight = false;
+        let mut boxed: Box<dyn WindowQueue> = Box::new(AsyncQueue(log.clone()));
+        submit_queue_nowait(&mut *boxed, &[], &[])
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(log.lock().unwrap().waits, 4);
     }
 
     #[test]

@@ -67,8 +67,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use petgraph::graph::{DiGraph, NodeIndex};
 use smallvec::SmallVec;
 
-use crate::cfg::{Body, InstId};
-use crate::effects::ImplicitSet;
+use crate::cfg::{Body, InstId, Terminator};
+use crate::effects::{ImplicitSet, MemClass};
 use crate::inst::{
     Abi, Arch, EntryCell, EntryValue, Form, FormFields, Inst, Kernel, RawAbi, VmemForm, Wave,
 };
@@ -82,6 +82,7 @@ use crate::kernarg::{
 use crate::metadata::Kernarg;
 use crate::operand::{ImmField, InlineConst, Operand, Special};
 use crate::reg::Kind;
+use crate::wait::Counter;
 
 use super::kernarg_ix::{
     certify, certify_source, load_ext, table_entry, Interner, Ix, KargKind, Node, CARRY_SCALAR,
@@ -811,6 +812,184 @@ fn mem_op(name: &str) -> MemOp {
     MemOp::Other
 }
 
+// ---------------------------------------------------------------------------
+// gfx12 release/acquire classification (`AccessClass::{AtomicRelease,
+// LoadAcquire}`). The shapes are those of LLVM's gfx12 HIP atomic lowering and
+// of PeaceMaker's `Builder::{event_rmw, event_wait}`:
+//
+//   release:  [global_wb scope:SCOPE_SYS]  s_wait_loadcnt 0  s_wait_storecnt 0
+//             global_atomic_*  scope:SCOPE_{DEV,SYS}
+//   acquire:  global_load_* scope:SCOPE_{DEV,SYS} ... s_wait_loadcnt 0 ...
+//             global_inv scope:>=load scope
+//
+// Everything here is a refusal-biased syntactic proof over the lifted CFG: an
+// access that does not fit stays `Atomic { commutative }` / `VmemLoad`.
+// ---------------------------------------------------------------------------
+
+const SCOPE_DEV: u8 = 2;
+const SCOPE_SYS: u8 = 3;
+
+fn inst_name(arch: Arch, inst: &Inst) -> &'static str {
+    inst.op.name(arch).unwrap_or("")
+}
+
+/// Whether `inst` is a wait that drains `counter` to zero (`s_wait_loadcnt 0`,
+/// the load half of `s_wait_loadcnt_dscnt 0`, `s_wait_storecnt 0`, ...).
+fn waits_zero(inst: &Inst, counter: Counter) -> bool {
+    inst.mods
+        .wait
+        .as_ref()
+        .is_some_and(|w| w.per_counter[counter as usize] == Some(0))
+}
+
+/// A memory instruction in the release/acquire sense: any memory effect, and
+/// the cache maintenance operations (which carry none).
+fn is_memory_inst(arch: Arch, inst: &Inst) -> bool {
+    inst.effects.mem.is_some()
+        || ["global_inv", "global_wb", "buffer_inv", "buffer_wb", "buffer_gl"]
+            .iter()
+            .any(|p| inst_name(arch, inst).starts_with(p))
+}
+
+/// Whether `inst` reads memory (any load, any atomic, LDS DMA, scalar loads).
+fn reads_memory(inst: &Inst) -> bool {
+    inst.effects.mem.as_ref().is_some_and(|m| {
+        !matches!(
+            m.class,
+            MemClass::VmemStore
+                | MemClass::DsStore
+                | MemClass::SmemStore
+                | MemClass::FlatStore
+                | MemClass::Export
+        )
+    })
+}
+
+/// The commutative atomic at `pos` (scope DEV/SYS) is a release: in its basic
+/// block, walking back over non-memory instructions, both `s_wait_loadcnt 0`
+/// and `s_wait_storecnt 0` appear before the first memory instruction, which
+/// at SYS scope must be `global_wb scope:SCOPE_SYS` (a DEV-scope release may
+/// stop at any memory instruction or at the block start).
+fn released_before(arch: Arch, body: &Body, block: usize, pos: usize, scope: u8) -> bool {
+    let range = body.blocks[block].range;
+    let (mut load0, mut store0) = (false, false);
+    let mut p = pos;
+    while p > range.0 {
+        p -= 1;
+        let Some(inst) = body.insts.get(body.layout[p]) else {
+            return false;
+        };
+        let (l, s) = (waits_zero(inst, Counter::Load), waits_zero(inst, Counter::Store));
+        if l || s {
+            load0 |= l;
+            store0 |= s;
+            continue;
+        }
+        if is_memory_inst(arch, inst) {
+            let wb_sys =
+                inst_name(arch, inst) == "global_wb" && inst.mods.cpol.scope == SCOPE_SYS;
+            return load0 && store0 && (scope == SCOPE_DEV || wb_sys);
+        }
+    }
+    load0 && store0 && scope == SCOPE_DEV
+}
+
+/// The load at `pos` (scope `scope`) is an acquire: on every CFG path from it
+/// to the next memory read, `s_wait_loadcnt 0` and then `global_inv` of at
+/// least `scope` execute. A path that ends (`s_endpgm`) first, or returns to
+/// the load itself (a spin's re-poll: the superseded observation is never
+/// used), has no read to protect. A different memory read, a `global_inv` too
+/// narrow or before the wait, or a path leaving the CFG fails the proof.
+fn acquired_after(
+    arch: Arch,
+    body: &Body,
+    block_of: &[usize],
+    pos: usize,
+    scope: u8,
+) -> bool {
+    let mut seen = vec![[false; 2]; body.blocks.len()];
+    let mut work = vec![(block_of[pos], pos + 1, false)];
+    while let Some((b, start, mut waited)) = work.pop() {
+        let blk = &body.blocks[b];
+        let mut p = start;
+        let mut covered = false;
+        while p < blk.range.1 {
+            if p == pos {
+                covered = true;
+                break;
+            }
+            let Some(inst) = body.insts.get(body.layout[p]) else {
+                return false;
+            };
+            if inst_name(arch, inst) == "global_inv" {
+                if waited && inst.mods.cpol.scope >= scope {
+                    covered = true;
+                    break;
+                }
+                return false;
+            }
+            if waits_zero(inst, Counter::Load) {
+                waited = true;
+            } else if reads_memory(inst) {
+                return false;
+            }
+            p += 1;
+        }
+        if covered {
+            continue;
+        }
+        if blk.term == Terminator::EndPgm {
+            continue;
+        }
+        if blk.term == Terminator::Unreachable || blk.succs.is_empty() {
+            return false;
+        }
+        for s in &blk.succs {
+            if !seen[s.0][usize::from(waited)] {
+                seen[s.0][usize::from(waited)] = true;
+                work.push((s.0, body.blocks[s.0].range.0, waited));
+            }
+        }
+    }
+    true
+}
+
+/// Per layout position: the release/acquire class of a global atomic/load, if
+/// the stream proves one. gfx12 (`Gfx1201`) only; empty elsewhere.
+fn sync_classes(arch: Arch, body: &Body) -> Vec<Option<AccessClass>> {
+    let mut out = vec![None; body.layout.len()];
+    if arch != Arch::Gfx1201 {
+        return out;
+    }
+    let mut block_of = vec![0usize; body.layout.len()];
+    for (b, block) in body.blocks.iter().enumerate() {
+        for pos in block.range.0..block.range.1 {
+            block_of[pos] = b;
+        }
+    }
+    for (pos, &id) in body.layout.iter().enumerate() {
+        let Some(inst) = body.insts.get(id) else {
+            continue;
+        };
+        let scope = inst.mods.cpol.scope;
+        if inst.form != Form::Vmem(VmemForm::Global) || !matches!(scope, SCOPE_DEV | SCOPE_SYS) {
+            continue;
+        }
+        match mem_op(inst_name(arch, inst)) {
+            MemOp::Atomic { commutative: true }
+                if released_before(arch, body, block_of[pos], pos, scope) =>
+            {
+                out[pos] = Some(AccessClass::AtomicRelease);
+            }
+            MemOp::Load if acquired_after(arch, body, &block_of, pos, scope) => {
+                out[pos] = Some(AccessClass::LoadAcquire);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Resolution of one access base.
 enum Base {
     Args {
@@ -1056,6 +1235,8 @@ struct Analyzer<'k> {
     cyclic: Vec<bool>,
     /// The same, per layout position.
     pos_cyclic: Vec<bool>,
+    /// gfx12 release/acquire refinement per layout position ([`sync_classes`]).
+    sync_class: Vec<Option<AccessClass>>,
     decoded: Vec<Option<Dec<'k>>>,
     /// Integer/address witness nodes (`kernarg_ix`).
     ix: RefCell<Interner>,
@@ -1214,6 +1395,7 @@ fn analyze_impl(
         GuardCtx { supplied, consts }
     });
     let cyclic = cyclic_blocks(body);
+    let sync_class = sync_classes(arch, body);
     let mut pos_cyclic = vec![false; body.layout.len()];
     for (b, block) in body.blocks.iter().enumerate() {
         for pos in block.range.0..block.range.1 {
@@ -1228,6 +1410,7 @@ fn analyze_impl(
         entry,
         cyclic,
         pos_cyclic,
+        sync_class,
         decoded,
         ix: RefCell::new(interner),
         guard,
@@ -2898,13 +3081,17 @@ impl<'k> Analyzer<'k> {
                     VmemForm::Flat => MemPath::Flat,
                     _ => MemPath::Global,
                 };
-                let class = match op {
+                let base_class = match op {
                     MemOp::Load => AccessClass::VmemLoad,
                     MemOp::Store => AccessClass::VmemStore,
                     MemOp::Atomic { commutative } => AccessClass::Atomic { commutative },
                     MemOp::LdsDma => AccessClass::LdsDma,
                     MemOp::Other => unreachable!(),
                 };
+                // Index and sealed-entry loads keep the plain class (their
+                // receipt records admit plain loads only); the access
+                // attribution gets the release/acquire refinement.
+                let class = self.sync_class[dec.pos].unwrap_or(base_class);
                 let addr = if form == VmemForm::Global {
                     self.vmem_addr(st, dec)
                 } else {
@@ -2929,7 +3116,7 @@ impl<'k> Analyzer<'k> {
                         dec,
                         addr,
                         &resolved,
-                        class,
+                        base_class,
                         path,
                         cache,
                         rec.as_deref_mut(),
@@ -2945,7 +3132,7 @@ impl<'k> Analyzer<'k> {
                         dec,
                         addr,
                         &resolved,
-                        class,
+                        base_class,
                         path,
                         cache,
                         rec.as_deref_mut(),
@@ -4242,8 +4429,12 @@ fn read_cache_of(accesses: &[ArgAccess]) -> ReadCacheClass {
     accesses.iter().fold(ReadCacheClass::NotRead, |acc, a| {
         acc.join(match a.class {
             AccessClass::SmemLoad => ReadCacheClass::ScalarOnly,
-            AccessClass::VmemLoad | AccessClass::LdsDma => ReadCacheClass::VmemOnly,
-            AccessClass::VmemStore | AccessClass::Atomic { .. } => ReadCacheClass::NotRead,
+            AccessClass::VmemLoad | AccessClass::LoadAcquire | AccessClass::LdsDma => {
+                ReadCacheClass::VmemOnly
+            }
+            AccessClass::VmemStore | AccessClass::Atomic { .. } | AccessClass::AtomicRelease => {
+                ReadCacheClass::NotRead
+            }
         })
     })
 }

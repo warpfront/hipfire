@@ -32,7 +32,7 @@ use railgun_corpus::{sha256_hex, JitCorpus};
 
 pub use crate::replay::railgun_lower::LowerTiming;
 use crate::replay::railgun_lower::{
-    DeviceSelect, LoweringContext, OwnedWindowLowering, SelfCheckFailure,
+    DeviceSelect, LoweringContext, OwnedReplayFailure, OwnedWindowLowering, SelfCheckFailure,
 };
 use crate::replay::railgun_shadow::{arch_lowering, lookup_facts, probe};
 use crate::replay::ReplayQuiescence;
@@ -412,6 +412,51 @@ impl Gpu {
             .map_err(|e| format!("{symbol}: {e}"))
     }
 
+    /// Register an externally emitted code object (a PeaceMaker `.co`/`.hxaco`
+    /// that no JIT corpus indexes) for railgun: admit its receipt against the
+    /// object's bytes and the pinned SHA-256 (`railgun_corpus::PinnedReceipt`),
+    /// load it as module `module` exporting `symbols`, prove each symbol's
+    /// loaded owner is exactly those bytes, and return each symbol's facts in
+    /// `symbols` order. Afterwards [`Self::railgun_resolve_artifacts`] resolves
+    /// nodes authored from those facts like any loaded kernel. Refused inside
+    /// plan mode (a plan-mode load would be recorded, not performed).
+    pub fn railgun_register_pinned_object(
+        &mut self,
+        module: &'static str,
+        image: Arc<[u8]>,
+        pinned_sha256: &str,
+        receipt_json: &[u8],
+        symbols: &[&str],
+    ) -> Result<Vec<Arc<NodeFacts>>, String> {
+        if self.plan_mode_active() {
+            return Err(format!(
+                "{module}: a pinned object cannot be registered inside plan mode"
+            ));
+        }
+        let pinned = railgun_corpus::PinnedReceipt::admit(
+            module,
+            &self.arch,
+            &image,
+            pinned_sha256,
+            receipt_json,
+        )?;
+        let mut facts = Vec::with_capacity(symbols.len());
+        for symbol in symbols {
+            // Refuse a symbol the receipt does not certify before loading anything for it.
+            let node = NodeFacts::from_pinned(&pinned, symbol)?;
+            self.ensure_embedded_kernel(module, Arc::clone(&image), symbol)
+                .map_err(|e| format!("{module}: load {symbol}: {e}"))?;
+            let loaded = self.railgun_loaded_digest(symbol)?;
+            if loaded != pinned_sha256 {
+                return Err(format!(
+                    "{module}: {symbol} is owned by object {loaded}, not the pinned {pinned_sha256}"
+                ));
+            }
+            facts.push(Arc::new(node));
+        }
+        Ok(facts)
+    }
+
     /// The railgun receipt corpus directory that ships beside the installed
     /// kernel pack this process loads objects from: `<pack arch dir>/../../
     /// railgun-corpus` (see [`corpus_beside_pack`]). `None` when no pack is
@@ -691,6 +736,7 @@ impl RailgunLoweringContext {
             grids: program.nodes.iter().map(|n| Some(n.grid)).collect(),
             lowering,
             failure: None,
+            in_flight: false,
             timing,
         })
     }
@@ -715,9 +761,20 @@ static LAST_SELF_CHECK: Mutex<Option<Vec<(usize, u64, usize)>>> = Mutex::new(Non
 
 /// `railgun::window::WindowQueue` over railgun's owned gfx12 lowering: one
 /// retained indirect buffer, one kernarg buffer per node. Only the kernarg
-/// images and grids that differ from what the queue last held are rewritten;
-/// each submit replays the whole tape and blocks until the queue is idle, so
-/// a successful submit has already proven quiescence.
+/// images and grids that differ from what the queue last held are rewritten.
+/// `submit` replays the whole tape and blocks until the queue is idle, so a
+/// successful submit has already proven quiescence. `submit_nowait` publishes
+/// the same replay and returns with it in flight: the kernarg buffers, grids
+/// and indirect buffer belong to the GPU until `wait` returns, so a submit
+/// (blocking or not) while one is in flight is refused before anything is
+/// written, and `wait` is what proves quiescence and reports the outcome.
+///
+/// Dropping the queue with a replay in flight cannot free a kernarg buffer
+/// under a running dispatch: `lowering` is declared first and the indirect
+/// buffer graph is its first field, whose drop inactivates the queue before
+/// the kernels and kernarg buffers are released. Like every Redline graph
+/// the drop never waits on the completion signal, so an unfinished replay
+/// (a persistent kernel) is cancelled, not drained.
 pub struct RailgunWindowQueue {
     lowering: OwnedWindowLowering,
     /// Per node: its symbol (self-check messages).
@@ -737,6 +794,9 @@ pub struct RailgunWindowQueue {
     grids: Vec<Option<[u32; 3]>>,
     /// The outcome of the last submit when it failed; what `wait` reports.
     failure: Option<QueueFailure>,
+    /// A `submit_nowait` replay is outstanding: nothing may be written or
+    /// submitted until `wait` observes it.
+    in_flight: bool,
     /// Where lowering this queue spent its time.
     timing: LowerTiming,
 }
@@ -824,14 +884,26 @@ impl RailgunWindowQueue {
         }
         Ok(())
     }
-}
 
-impl WindowQueue for RailgunWindowQueue {
-    fn submit(
+    /// Everything `submit` and `submit_nowait` do before a replay is
+    /// published: refuse while a replay is in flight or the queue is
+    /// quarantined, check the typed steps and node count, write what changed
+    /// and run the self-check. Every failure here happens before any
+    /// dispatch.
+    fn begin_submit(
         &mut self,
         nodes: &[NodeImage<'_>],
         steps: &[ResolvedStep],
     ) -> Result<(), QueueFailure> {
+        if self.in_flight {
+            // Refused before any write: `prepare` rewrites kernargs, which
+            // is only legal while quiescent. Not recorded in `failure`,
+            // which is `wait`'s report of the replay still in flight.
+            return Err(Self::proven(
+                "submit without completion: the previous submit has not completed (wait first)"
+                    .into(),
+            ));
+        }
         if let Some(failure) = &self.failure {
             if failure.quiescence == Quiescence::Unknown {
                 return Err(failure.clone());
@@ -894,28 +966,72 @@ impl WindowQueue for RailgunWindowQueue {
                 nodes.len()
             );
         }
+        Ok(())
+    }
+
+    /// Store a replay failure as what `wait` reports, and return it.
+    fn record_failure(&mut self, failure: OwnedReplayFailure) -> QueueFailure {
+        let failure = QueueFailure {
+            message: failure.error,
+            quiescence: match failure.quiescence {
+                ReplayQuiescence::Proven => Quiescence::Proven,
+                ReplayQuiescence::Unknown => Quiescence::Unknown,
+            },
+        };
+        self.failure = Some(failure.clone());
+        failure
+    }
+}
+
+impl WindowQueue for RailgunWindowQueue {
+    fn submit(
+        &mut self,
+        nodes: &[NodeImage<'_>],
+        steps: &[ResolvedStep],
+    ) -> Result<(), QueueFailure> {
+        self.begin_submit(nodes, steps)?;
         // SAFETY: every pointer in the kernarg images just written was bound
         // by the window binding key (`WindowBindingKey`), which proves each
         // allocation it names is live and unmoved for this generation; the
         // lowering owns its kernargs, kernels and indirect buffer, and the
-        // queue is quiescent (the previous replay waited, or none ran).
+        // queue is quiescent (`begin_submit` refused while a replay was in
+        // flight; the previous replay waited, or none ran).
         let replayed = unsafe { self.lowering.replay_and_wait() };
-        replayed.map_err(|failure| {
-            let failure = QueueFailure {
-                message: failure.error,
-                quiescence: match failure.quiescence {
-                    ReplayQuiescence::Proven => Quiescence::Proven,
-                    ReplayQuiescence::Unknown => Quiescence::Unknown,
-                },
-            };
-            self.failure = Some(failure.clone());
-            failure
-        })
+        replayed.map_err(|failure| self.record_failure(failure))
+    }
+
+    fn submit_nowait(
+        &mut self,
+        nodes: &[NodeImage<'_>],
+        steps: &[ResolvedStep],
+    ) -> Result<(), QueueFailure> {
+        self.begin_submit(nodes, steps)?;
+        // SAFETY: as in `submit`; the replay then stays in flight, and
+        // nothing writes a kernarg buffer, a grid or the indirect buffer
+        // until `wait` observes it (`begin_submit` refuses every submit while
+        // `in_flight`), and a drop inactivates the queue before anything the
+        // IB reads is freed.
+        let published = unsafe { self.lowering.replay_submit() };
+        published.map_err(|failure| self.record_failure(failure))?;
+        self.in_flight = true;
+        Ok(())
     }
 
     fn wait(&mut self) -> Result<(), QueueFailure> {
-        // `submit` blocks until the queue is idle, so a successful submit has
-        // already proven quiescence and there is nothing left to wait for.
+        if self.in_flight {
+            let waited = self.lowering.wait_replay();
+            // Whatever the outcome the replay is no longer outstanding for
+            // this queue: success and a proven teardown leave it quiescent,
+            // and an unproven teardown is carried by the stored `Unknown`
+            // failure (every later submit is refused; the lowering's drop
+            // retries the inactivation).
+            self.in_flight = false;
+            if let Err(failure) = waited {
+                self.record_failure(failure);
+            }
+        }
+        // A blocking `submit` has already proven quiescence, so only the
+        // stored outcome is left to report.
         match &self.failure {
             Some(failure) => Err(failure.clone()),
             None => Ok(()),

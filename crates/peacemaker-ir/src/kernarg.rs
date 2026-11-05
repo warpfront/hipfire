@@ -60,6 +60,16 @@ impl AccessMode {
 }
 
 /// `RegionEffect.class` (design §1.1).
+///
+/// `AtomicRelease` and `LoadAcquire` (gfx12 only) refine `Atomic {
+/// commutative: true }` and `VmemLoad` where the instruction stream proves the
+/// shape LLVM's gfx12 HIP lowering gives a release atomic / an acquire load
+/// (`passes::kernargs::sync_classes`): the atomic is device- or system-scope
+/// and directly preceded by `s_wait_loadcnt 0` + `s_wait_storecnt 0` (and, at
+/// system scope, `global_wb scope:SCOPE_SYS`); the load is device- or
+/// system-scope and, on every path to the next memory read, is followed by
+/// `s_wait_loadcnt 0` and a `global_inv` of at least its scope. Anything less
+/// stays the relaxed class.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum AccessClass {
     VmemLoad,
@@ -67,13 +77,19 @@ pub enum AccessClass {
     SmemLoad,
     Atomic { commutative: bool },
     LdsDma,
+    /// A commutative atomic RMW issued with release ordering.
+    AtomicRelease,
+    /// A load whose observed value is followed by an acquire invalidate.
+    LoadAcquire,
 }
 impl AccessClass {
     pub fn mode(self) -> AccessMode {
         match self {
-            Self::VmemLoad | Self::SmemLoad | Self::LdsDma => AccessMode::Read,
+            Self::VmemLoad | Self::SmemLoad | Self::LdsDma | Self::LoadAcquire => {
+                AccessMode::Read
+            }
             Self::VmemStore => AccessMode::Write,
-            Self::Atomic { .. } => AccessMode::ReadWrite,
+            Self::Atomic { .. } | Self::AtomicRelease => AccessMode::ReadWrite,
         }
     }
 }

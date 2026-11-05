@@ -872,15 +872,45 @@ impl OwnedWindowLowering {
     /// allocation of the owner (the window binding key proves it).
     pub(crate) unsafe fn replay_and_wait(&mut self) -> Result<(), OwnedReplayFailure> {
         // SAFETY: forwarded from this method's caller.
-        unsafe { self.graph.replay_and_wait_checked() }.map_err(|(error, quiescence)| {
-            OwnedReplayFailure {
-                error: error.to_string(),
-                quiescence: match quiescence {
-                    redline_dispatch::aql::Quiescence::Proven => ReplayQuiescence::Proven,
-                    redline_dispatch::aql::Quiescence::Unknown => ReplayQuiescence::Unknown,
-                },
-            }
-        })
+        unsafe { self.graph.replay_and_wait_checked() }.map_err(Self::replay_failure)
+    }
+
+    /// Publish the retained indirect buffer once and return without waiting.
+    /// `Ok(())` means the replay is in flight: no kernarg or grid may be
+    /// written and nothing may be submitted until [`Self::wait_replay`]
+    /// returns (or this lowering is dropped, which inactivates the queue
+    /// before the kernargs are freed).
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::replay_and_wait`], for the whole time the replay is in
+    /// flight (until `wait_replay` returns `Ok`, and after an error through
+    /// this lowering's destruction).
+    pub(crate) unsafe fn replay_submit(&mut self) -> Result<(), OwnedReplayFailure> {
+        // SAFETY: forwarded from this method's caller.
+        unsafe { self.graph.replay_submit_checked() }.map_err(Self::replay_failure)
+    }
+
+    /// Wait for the replay [`Self::replay_submit`] published (`Ok(())` at once
+    /// when none is in flight), with `replay_and_wait`'s timeout, watchdog and
+    /// quiescence semantics.
+    pub(crate) fn wait_replay(&mut self) -> Result<(), OwnedReplayFailure> {
+        self.graph.wait_replay_checked().map_err(Self::replay_failure)
+    }
+
+    fn replay_failure(
+        (error, quiescence): (
+            redline_dispatch::aql::ReplayError,
+            redline_dispatch::aql::Quiescence,
+        ),
+    ) -> OwnedReplayFailure {
+        OwnedReplayFailure {
+            error: error.to_string(),
+            quiescence: match quiescence {
+                redline_dispatch::aql::Quiescence::Proven => ReplayQuiescence::Proven,
+                redline_dispatch::aql::Quiescence::Unknown => ReplayQuiescence::Unknown,
+            },
+        }
     }
 }
 
@@ -933,6 +963,7 @@ mod tests {
                 .collect(),
             rows_used: BTreeMap::new(),
             skips: Vec::new(),
+            groups: Vec::new(),
         }
     }
 

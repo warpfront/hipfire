@@ -3300,6 +3300,7 @@ dependencies = [
  "peacemaker-rip",
  "radiowave",
  "railgun",
+ "railgun-cert",
  "railgun-corpus",
  "rayon",
  "redline-dispatch",

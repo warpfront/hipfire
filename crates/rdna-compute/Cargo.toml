@@ -36,6 +36,7 @@ peacemaker-isa = { path = "../peacemaker-isa", features = ["toolchain"] }
 peacemaker-ir = { path = "../peacemaker-ir" }
 peacemaker-lift = { path = "../peacemaker-lift" }
 peacemaker-rip = { path = "../peacemaker-rip" }
+railgun-cert = { path = "../railgun-cert" }
 [[example]]
 name = "bench_stream_mix_chain_gfx1201"
 required-features = ["lab"]
@@ -1268,6 +1269,12 @@ required-features = ["lab"]
 # DFlash railgun window GPU oracle (design A); `--features lab`.
 [[example]]
 name = "railgun_copy_fill_oracle"
+required-features = ["lab"]
+
+# railgun submits a PeaceMaker-emitted persistent kernel registered by its pinned
+# SHA-256 (one gfx1201 card); `--features lab`.
+[[example]]
+name = "railgun_pm_persistent_smoke"
 required-features = ["lab"]
 
 # Peer-VRAM push + flag collective vs the incumbent TP2 graph collective

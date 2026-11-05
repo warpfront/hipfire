@@ -26,8 +26,15 @@ pub const WITNESS_INDEXED_BIND: &str = "indexed_bind";
 /// Witness kind of a sealed-table case: a loader-sealed immutable pointer
 /// table whose pointees are immutable (`railgun::sealed_table`).
 pub const WITNESS_SEALED_TABLE: &str = "sealed_table";
+/// Witness kind of a descriptor-arena case: the program binds the arena's
+/// records from its own resources (`railgun::KernelProgram::bind_records`).
+pub const WITNESS_DESCRIPTOR_ARENA: &str = "descriptor_arena";
 /// Every witness kind a receipt may name.
-pub const KNOWN_WITNESSES: &[&str] = &[WITNESS_INDEXED_BIND, WITNESS_SEALED_TABLE];
+pub const KNOWN_WITNESSES: &[&str] = &[
+    WITNESS_INDEXED_BIND,
+    WITNESS_SEALED_TABLE,
+    WITNESS_DESCRIPTOR_ARENA,
+];
 
 /// `SealedTableRecord.bound_kind`: the guard bound is the 4-byte kernarg
 /// scalar at byte offset `bound_value` (unsigned compare).
@@ -206,6 +213,70 @@ impl SealedTableRecord {
     }
 }
 
+/// One pointer a descriptor arena's template record carries: the kernel loads
+/// 8 bytes at `record_offset` from a record of the template and dereferences
+/// the loaded value with `classes` (A1 memory class names).
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ArenaPointerRecord {
+    /// Record-relative byte offset of the pointer (8-aligned).
+    pub record_offset: u32,
+    pub classes: Vec<String>,
+}
+
+/// One record template of a descriptor arena: which pointer fields of a record
+/// of this template the kernel loads (and nothing else of the record is a
+/// pointer).
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ArenaTemplateRecord {
+    pub template: u32,
+    pub pointer_loads: Vec<ArenaPointerRecord>,
+}
+
+/// A descriptor arena of a kernel: the pointer argument that holds an array
+/// of binding records, and per record template the pointer fields the kernel
+/// loads from a record and what it does through each. Valid only once the
+/// program binds the arena's records (`railgun::KernelProgram::bind_records`):
+/// every pointer the kernel can load is then a pointer railgun wrote from the
+/// program's own bindings, so each access lands in a named resource.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DescriptorArenaRecord {
+    /// Kernarg byte offset of the (pointer) argument holding the arena base.
+    pub arena_arg_offset: u32,
+    pub templates: Vec<ArenaTemplateRecord>,
+}
+
+impl DescriptorArenaRecord {
+    /// Fail-closed structure check (the digest binds the content).
+    pub fn validate(&self, symbol: &str) -> Result<(), String> {
+        let bad = |what: &str| {
+            Err(format!(
+                "{symbol}: descriptor arena @{}: {what}",
+                self.arena_arg_offset
+            ))
+        };
+        if self.templates.is_empty() {
+            return bad("no template");
+        }
+        for (i, t) in self.templates.iter().enumerate() {
+            if self.templates[..i].iter().any(|o| o.template == t.template) {
+                return bad("duplicate template");
+            }
+            for (j, p) in t.pointer_loads.iter().enumerate() {
+                if p.record_offset % 8 != 0 {
+                    return bad("pointer offset is not 8-aligned");
+                }
+                if t.pointer_loads[..j]
+                    .iter()
+                    .any(|o| o.record_offset == p.record_offset)
+                {
+                    return bad("duplicate pointer offset in a template");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Tool {
     pub name: String,
@@ -377,6 +448,11 @@ pub struct KernelRecord {
     /// kernels without one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sealed_tables: Vec<SealedTableRecord>,
+    /// Descriptor arenas of the case (`descriptor_arena` witness: discharged
+    /// when the program binds the arena's records). Absent from kernels
+    /// without one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub descriptor_arenas: Vec<DescriptorArenaRecord>,
     /// Witness kinds the runtime must hold before the executable may use the
     /// effects (`indexed_bind` for `indexed_effects`, `sealed_table` for
     /// `sealed_tables`); exactly the kinds those fields imply, sorted;
@@ -394,26 +470,46 @@ pub struct KernelRecord {
 }
 
 /// The guarded-case digest under the exact object receipt (§A9.2; v2 binds
-/// `sealed_tables` as well).
+/// `sealed_tables` as well). A record with `descriptor_arenas` digests under
+/// `railgun-case-v3`, which binds them too; a record without any keeps the
+/// v2 input byte for byte, so every receipt written before arenas existed
+/// digests identically.
 pub fn case_digest(
     object_sha256: &str,
     device_elf_sha256: &str,
     arch: &str,
     k: &KernelRecord,
 ) -> String {
-    let bytes = serde_json::to_vec(&(
-        "railgun-case-v2",
-        object_sha256,
-        device_elf_sha256,
-        arch,
-        &k.symbol,
-        &k.status,
-        k.kernarg_size,
-        &k.guards,
-        &k.indexed_effects,
-        &k.sealed_tables,
-        &k.required_witnesses,
-    ))
+    let bytes = if k.descriptor_arenas.is_empty() {
+        serde_json::to_vec(&(
+            "railgun-case-v2",
+            object_sha256,
+            device_elf_sha256,
+            arch,
+            &k.symbol,
+            &k.status,
+            k.kernarg_size,
+            &k.guards,
+            &k.indexed_effects,
+            &k.sealed_tables,
+            &k.required_witnesses,
+        ))
+    } else {
+        serde_json::to_vec(&(
+            "railgun-case-v3",
+            object_sha256,
+            device_elf_sha256,
+            arch,
+            &k.symbol,
+            &k.status,
+            k.kernarg_size,
+            &k.guards,
+            &k.indexed_effects,
+            &k.sealed_tables,
+            &k.descriptor_arenas,
+            &k.required_witnesses,
+        ))
+    }
     .expect("case digest input serialises");
     crate::sha256_hex(&bytes)
 }
@@ -427,6 +523,9 @@ impl KernelRecord {
         }
         if !self.sealed_tables.is_empty() {
             out.push(WITNESS_SEALED_TABLE.to_owned());
+        }
+        if !self.descriptor_arenas.is_empty() {
+            out.push(WITNESS_DESCRIPTOR_ARENA.to_owned());
         }
         out.sort();
         out
@@ -446,6 +545,7 @@ impl KernelRecord {
         let empty = self.guards.is_empty()
             && self.indexed_effects.is_empty()
             && self.sealed_tables.is_empty()
+            && self.descriptor_arenas.is_empty()
             && self.required_witnesses.is_empty()
             && self.case_digest.is_empty();
         match self.status.as_str() {
@@ -460,7 +560,7 @@ impl KernelRecord {
             }
             STATUS_CONDITIONAL => {
                 let indexed = !self.indexed_effects.is_empty();
-                if (!indexed && self.sealed_tables.is_empty())
+                if (!indexed && self.sealed_tables.is_empty() && self.descriptor_arenas.is_empty())
                     || (indexed && self.guards.is_empty())
                     || (!indexed && !self.guards.is_empty())
                     || self.required_witnesses.is_empty()
@@ -488,6 +588,15 @@ impl KernelRecord {
                         return Err(format!("{}: duplicate sealed table", self.symbol));
                     }
                 }
+                for (i, a) in self.descriptor_arenas.iter().enumerate() {
+                    a.validate(&self.symbol)?;
+                    if self.descriptor_arenas[..i]
+                        .iter()
+                        .any(|o| o.arena_arg_offset == a.arena_arg_offset)
+                    {
+                        return Err(format!("{}: duplicate descriptor arena", self.symbol));
+                    }
+                }
                 if !self.differential.guarded || self.differential.guards != self.guards {
                     return Err(format!(
                         "{}: differential does not report the record's guards",
@@ -501,5 +610,143 @@ impl KernelRecord {
             }
             other => Err(format!("{}: unknown A1 status {other:?}", self.symbol)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record() -> KernelRecord {
+        KernelRecord {
+            symbol: "k".into(),
+            status: STATUS_PROVEN.into(),
+            unresolved: vec![],
+            kernarg_size: 8,
+            read_cache: "not_read".into(),
+            dynamic_kernarg_reads: false,
+            taint_overflow: false,
+            side: SideRecord::default(),
+            implicit: ImplicitRecord::default(),
+            args: vec![],
+            dwords: vec![],
+            differential: Differential {
+                source: "none".into(),
+                status: "pass".into(),
+                args: vec![],
+                radiowave_mutable_read_cache: None,
+                guards: vec![],
+                guarded: false,
+            },
+            pm_obligations: BTreeMap::new(),
+            pm_analyze_error: None,
+            unguarded_unresolved: vec![],
+            guards: vec![],
+            indexed_effects: vec![],
+            sealed_tables: vec![],
+            descriptor_arenas: vec![],
+            required_witnesses: vec![],
+            case_digest: String::new(),
+            guard_flag: None,
+        }
+    }
+
+    fn arena() -> DescriptorArenaRecord {
+        DescriptorArenaRecord {
+            arena_arg_offset: 8,
+            templates: vec![ArenaTemplateRecord {
+                template: 3,
+                pointer_loads: vec![ArenaPointerRecord {
+                    record_offset: 16,
+                    classes: vec!["vmem_load".into()],
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn record_without_arenas_serializes_and_digests_as_before() {
+        let k = record();
+        let json = serde_json::to_value(&k).unwrap();
+        assert!(
+            json.get("descriptor_arenas").is_none(),
+            "the new optional record is absent from a record that has none"
+        );
+        // A receipt written before the field existed parses to an empty list.
+        let back: KernelRecord = serde_json::from_value(json).unwrap();
+        assert!(back.descriptor_arenas.is_empty());
+        // The pre-arena digest input, spelled out: unchanged for such a record.
+        let old = crate::sha256_hex(
+            &serde_json::to_vec(&(
+                "railgun-case-v2",
+                "obj",
+                "elf",
+                "gfx1201",
+                &k.symbol,
+                &k.status,
+                k.kernarg_size,
+                &k.guards,
+                &k.indexed_effects,
+                &k.sealed_tables,
+                &k.required_witnesses,
+            ))
+            .unwrap(),
+        );
+        assert_eq!(case_digest("obj", "elf", "gfx1201", &k), old);
+        assert!(k.implied_witnesses().is_empty());
+    }
+
+    #[test]
+    fn arena_record_round_trips_binds_the_digest_and_implies_its_witness() {
+        let mut k = record();
+        k.status = STATUS_CONDITIONAL.into();
+        k.descriptor_arenas = vec![arena()];
+        k.required_witnesses = k.implied_witnesses();
+        assert_eq!(k.required_witnesses, vec![WITNESS_DESCRIPTOR_ARENA]);
+        k.differential.guarded = true;
+        k.case_digest = case_digest("obj", "elf", "gfx1201", &k);
+        k.validate_case("obj", "elf", "gfx1201").unwrap();
+
+        let json = serde_json::to_value(&k).unwrap();
+        assert!(json.get("descriptor_arenas").is_some());
+        let back: KernelRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back.descriptor_arenas, k.descriptor_arenas);
+
+        let mut changed = k.clone();
+        changed.descriptor_arenas[0].templates[0].pointer_loads[0].classes = vec!["vmem_store".into()];
+        assert!(
+            changed.validate_case("obj", "elf", "gfx1201").is_err(),
+            "the digest binds the arena facts"
+        );
+        let mut stale = k.clone();
+        stale.required_witnesses.clear();
+        assert!(stale.validate_case("obj", "elf", "gfx1201").is_err());
+        let mut proven = record();
+        proven.descriptor_arenas = vec![arena()];
+        assert!(
+            proven.validate_case("obj", "elf", "gfx1201").is_err(),
+            "a proven record may not carry an arena"
+        );
+    }
+
+    #[test]
+    fn malformed_arena_is_rejected() {
+        let mut a = arena();
+        a.templates[0].pointer_loads[0].record_offset = 12;
+        assert!(a.validate("k").is_err());
+        let mut a = arena();
+        let t = a.templates[0].clone();
+        a.templates.push(t);
+        assert!(a.validate("k").is_err());
+        let mut a = arena();
+        let load = a.templates[0].pointer_loads[0].clone();
+        a.templates[0].pointer_loads.push(load);
+        assert!(a.validate("k").is_err());
+        assert!(DescriptorArenaRecord {
+            arena_arg_offset: 0,
+            templates: vec![]
+        }
+        .validate("k")
+        .is_err());
     }
 }
