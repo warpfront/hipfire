@@ -1626,6 +1626,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "qwen4-ep-seq-parallel-recorded-guard",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "hipfire-arch-qwen4 forward_chunk_scoped (gpu_forward.rs): the EP2 sequence-parallel prefill route (HIPFIRE_QWEN4_EP_SEQ_PARALLEL) is declined for the whole chunk when `gpu.replay.is_recording() || gpu.graphs.capture_mode`, which then runs the all-reduce route (ar_hc_write) exactly as before",
+        effect: KernelSelection,
+        switches: "sp_hc_rs_d8_* reduce-scatter writes + sp_ag_rows_* all-gathers over own-row HC reads vs ar_hc_write_* all-reduce writes over all-row HC reads",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "both routes are byte-identical (same rank-ordered fold, same HC arithmetic, rows partitioned only): fn_mesh_lane_oracle raw logits off/on identical and sp_rs_ag_oracle PASS (receipts/selectors/sp_min_rows.json); the guard only keeps the SP launches (whose row ranges are armed per chunk on the host) out of recorded/captured programs",
+        reaches: &[],
+    },
+    Decision {
         id: "dflash-draft-overwrite-gfx12",
         predicates: &[IsRecording, CaptureMode, G0Observing],
         condition: "Gpu::draft_overwrite_gfx12_admitted (dflash_draft_fusion.rs:166-185), the device-free admission of gemm_mq4g256v2_overwrite_gfx12_dflash (which returns `Ok(false)` before any launch when it is false): exact gfx1201, HIPFIRE_DRAFT_COLLAPSE_OFF unset, no fp8/iu4 verify scope, 2 <= batch <= 63 (exactly 64 only inside draft_rows64_enter, which also needs wmma_batch_tiles), k % 256 == 0, gfx12 WMMA, fp16 and lm_head WMMA enabled, no a8_prefill_active, not the hfq4g256 ldsstage arm, and `!is_recording() && !capture_mode && !is_g0_observing()`. Consulted by the singleton draft (hipfire-runtime dflash.rs draft_lm_head_overwrite:2341 and gemm_dispatch's MQ4V2 arm:2520) and by the CB lane draft (dflash/lanes.rs pool_admitted:443, 450; pool_gemm:479)",
@@ -2223,13 +2234,14 @@ pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-arch-qwen4/src/gpu_forward.rs",
         function: "forward_chunk_scoped",
-        occurrences: 11,
+        occurrences: 13,
         decisions: &[
             "replay-recorder-lifecycle",
             "qwen4-g2-expert-stage",
             "qwen4-prefill-token-id-reuse",
             "qwen4-ple-async-upload",
             "qwen4-wide-verify-recorded-ar-guard",
+            "qwen4-ep-seq-parallel-recorded-guard",
         ],
     },
     Site {
