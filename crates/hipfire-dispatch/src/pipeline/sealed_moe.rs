@@ -8254,6 +8254,7 @@ mod tests {
             cpu_deferred_experts: false,
             cpu_split: false,
             cpwait: false,
+            hetero_device: false,
             norm_fold: false,
         })
     }
@@ -8677,6 +8678,41 @@ mod tests {
                 reordered.push(MoeStage::JoinSplit);
                 assert_eq!(reordered, cpwait, "{label}: host order {host:?}");
             }
+        }
+    }
+
+    #[test]
+    fn hetero_device_lowers_device_stages_in_order() {
+        for route in SPLIT_ROUTES {
+            let ordinary = split_decode_stages(Some(route), false, |_| {}, |_| {}).unwrap();
+            let st = split_decode_stages(Some(route), false, |_| {}, |s| s.hetero_device = true).unwrap();
+            let at = |x: MoeStage| st.iter().position(|s| *s == x).unwrap_or_else(|| panic!("{x:?} missing: {st:?}"));
+            assert!(at(MoeStage::PublishCold) < at(MoeStage::GateUp), "{route:?}: {st:?}");
+            assert!(at(MoeStage::MutationFence) < at(MoeStage::AwaitCold), "{route:?}: {st:?}");
+            assert!(at(MoeStage::AwaitCold) < at(MoeStage::InstallCold), "{route:?}: {st:?}");
+            assert!(at(MoeStage::InstallCold) < at(MoeStage::Combine), "{route:?}: {st:?}");
+            let without: Vec<MoeStage> = st
+                .into_iter()
+                .filter(|s| !matches!(s, MoeStage::PublishCold | MoeStage::AwaitCold | MoeStage::InstallCold))
+                .collect();
+            assert_eq!(without, ordinary, "decode {route:?}: the device split adds only its three stages");
+        }
+    }
+
+    #[test]
+    fn hetero_device_never_lowers_host_split_stages() {
+        for route in SPLIT_ROUTES {
+            let st = split_decode_stages(Some(route), false, |_| {}, |s| s.hetero_device = true).unwrap();
+            assert!(!st.contains(&MoeStage::PrepareSplit), "{st:?}");
+            assert!(!st.contains(&MoeStage::JoinSplit), "{st:?}");
+        }
+    }
+
+    #[test]
+    fn hetero_device_and_cpu_split_are_exclusive() {
+        for route in SPLIT_ROUTES {
+            let e = split_decode_stages(Some(route), true, |_| {}, |s| s.hetero_device = true).unwrap_err();
+            assert!(format!("{e:?}").contains("hetero"), "{e:?}");
         }
     }
 

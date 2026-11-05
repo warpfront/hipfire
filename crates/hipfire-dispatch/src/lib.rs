@@ -13,6 +13,7 @@ mod macros;
 pub mod context;
 pub mod cpu_exec;
 pub mod cpu_split;
+pub mod hetero_device;
 pub mod hetero_mailbox;
 pub mod hetero_responder;
 pub mod igpu_split;
