@@ -5400,6 +5400,10 @@ pub struct ReplayController {
     pm4_gfx12_dispatch_pacing: Gfx12DispatchPacing,
     state: ReplayState,
     recorded: Vec<RecordedHipLaunch>,
+    /// `recorded` length at the end of the retained body (before an output
+    /// head the forward runs on HIP after every replay); `None`: the whole
+    /// window is the body.
+    body_end: Option<usize>,
     certified_speedups: Vec<f64>,
     threshold: f64,
     max_recorded_launches: usize,
@@ -5524,6 +5528,7 @@ impl ReplayController {
             pm4_gfx12_dispatch_pacing: Gfx12DispatchPacing::None,
             state,
             recorded: Vec::new(),
+            body_end: None,
             certified_speedups: Vec::new(),
             threshold: 1.03,
             max_recorded_launches: 4096,
@@ -5652,6 +5657,7 @@ impl ReplayController {
             ReplayState::Armed
         };
         self.recorded.clear();
+        self.body_end = None;
         self.certified_speedups.clear();
         self.fallback_reason = None;
         self.prepared = None;
@@ -5732,6 +5738,21 @@ impl ReplayController {
 
     pub fn recorded_launches(&self) -> &[RecordedHipLaunch] {
         &self.recorded
+    }
+
+    /// Close the retained body of the open recording here: launches recorded
+    /// after this point (an output head the forward also runs on HIP after
+    /// every replay) stay out of every plan prepared from this capture.
+    pub fn mark_body_end(&mut self) {
+        if self.is_recording() {
+            self.body_end = Some(self.recorded.len());
+        }
+    }
+
+    /// The recorded launches a plan of this capture covers: the body before
+    /// [`Self::mark_body_end`], or the whole window.
+    pub fn retained_body_launches(&self) -> usize {
+        self.body_end.unwrap_or(self.recorded.len())
     }
 
     pub fn pm4_queue_policy(&self) -> QueuePolicy {
@@ -7372,6 +7393,7 @@ impl ReplayController {
             return Err("cannot capture during a G0 observation");
         }
         self.recorded.clear();
+        self.body_end = None;
         self.radiowave_effect_launches = 0;
         self.fallback_effect_launches = 0;
         self.unknown_effect_launches = 0;
@@ -11800,6 +11822,30 @@ mod tests {
             controller.finish_capture().unwrap().sequence_hash,
             first.sequence_hash
         );
+    }
+
+    #[test]
+    fn retained_body_end_is_scoped_to_one_capture() {
+        let mut controller = ReplayController::new_armed(ReplayBackendRequest::Shadow);
+        controller.begin_capture().unwrap();
+        controller.record_hip_launch("body", None, [1; 3], [32, 1, 1], 0, &[1]);
+        controller.mark_body_end();
+        controller.record_hip_launch("head", None, [1; 3], [32, 1, 1], 0, &[2]);
+        assert_eq!(controller.retained_body_launches(), 1);
+        controller.finish_capture().unwrap();
+        // Outside a recording window the mark is ignored.
+        controller.mark_body_end();
+        assert_eq!(controller.retained_body_launches(), 1);
+        // A new capture with no mark is its whole window.
+        controller.begin_capture().unwrap();
+        controller.record_hip_launch("a", None, [1; 3], [32, 1, 1], 0, &[1]);
+        controller.record_hip_launch("b", None, [1; 3], [32, 1, 1], 0, &[2]);
+        assert_eq!(controller.retained_body_launches(), 2);
+        controller.mark_body_end();
+        controller.record_hip_launch("c", None, [1; 3], [32, 1, 1], 0, &[3]);
+        // A model reset drops the mark with the launches.
+        controller.apply_model_default(true, ReplayTransport::AqlPackets);
+        assert_eq!(controller.retained_body_launches(), 0);
     }
 
     #[test]

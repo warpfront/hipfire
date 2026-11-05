@@ -17494,7 +17494,7 @@ impl Qwen4GpuForward {
                 // The exact-kernarg oracle: re-execute the recorded HIP launch
                 // sequence. This is the arm that proves the tape names the dispatches
                 // ordinary HIP issues, not merely that some retained transport runs.
-                let launches = gpu.replay.recorded_launches().len();
+                let launches = gpu.replay.retained_body_launches();
                 match gpu.replay_recorded_hip_prefix_at(launches, next_position) {
                     Ok(_) => true,
                     Err(reason) => {
@@ -17757,6 +17757,10 @@ impl Qwen4GpuForward {
                 }
             }
 
+            // The retained body ends here. The head writes the caller's logits and
+            // top-1, whose addresses change per request, and it runs on HIP below on
+            // every route, so the tape must not replay it a second time.
+            gpu.replay.mark_body_end();
             if let Some(requested_rows) = requested_rows.filter(|_| last) {
                 let final_hyper = final_hyper
                     .as_ref()
@@ -17942,6 +17946,8 @@ impl Qwen4GpuForward {
 /// Prepare failure after a successful HIP warmup poisons the route (sticky
 /// fallback) rather than failing the request that already produced output; a
 /// window that launched more kernels than it recorded is one such failure.
+/// The plan covers the retained body only (`mark_body_end`): the head runs on
+/// HIP after every replay.
 fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool) {
     let effects = gpu.replay.capture_window_effects();
     let summary = gpu.replay.capture_summary();
@@ -17980,14 +17986,14 @@ fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool) {
         eprintln!("[redline] qwen4 capture could not be closed or prepared: {reason}");
         return;
     }
-    let launches = gpu.replay.recorded_launches().len();
+    let launches = gpu.replay.retained_body_launches();
     let prepared = if gpu.replay.uses_pm4_transport() {
         gpu.replay
             .prepare_pm4_prefix(gpu.device_id as usize, launches)
             .map(|_| ())
     } else {
         gpu.replay
-            .prepare_linear_aql(gpu.device_id as usize)
+            .prepare_linear_aql_prefix(gpu.device_id as usize, launches)
             .map(|_| ())
     };
     match prepared {
