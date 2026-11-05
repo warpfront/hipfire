@@ -4780,6 +4780,22 @@ impl Qwen4MoeLayerRuntime {
                 );
             }
         }
+        let dims = hipfire_dispatch::igpu_split::ColdArmDims {
+            dim: config.hidden_size,
+            mi: config.moe_intermediate_size,
+            top_k: config.num_experts_per_tok,
+            n_experts: placement.len(),
+            max_rows: rows,
+        };
+        match crate::hetero::arm_for(&gpu.arch, dims) {
+            Ok(Some(arm)) => {
+                if let Err(error) = executor.set_igpu_arm(arm) {
+                    return Err(release(executor, format!("{error:?}")));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => return Err(release(executor, error)),
+        }
         Ok(executor)
     }
 
