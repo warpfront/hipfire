@@ -211,6 +211,10 @@ required-features = ["lab"]
 name = "moe_wide_oracle"
 required-features = ["lab"]
 
+[[example]]
+name = "moe_gu_few_pm_oracle"
+required-features = ["lab"]
+
 # S3 per-pick routed-down byte oracle + A/B (production k640_r4 vs dni on real expert tensors).
 [[example]]
 name = "moe_down_oracle"

@@ -4855,6 +4855,18 @@ pub const GEMV_MQ2_XBATCH_PM_GFX1201: &[u8] =
 /// Bare lowercase SHA-256 of [`GEMV_MQ2_XBATCH_PM_GFX1201`], without a newline.
 pub const GEMV_MQ2_XBATCH_PM_GFX1201_SHA256: &str =
     include_str!("../../../kernels/gemv_mq2_xbatch_pm_gfx1201.hxaco.sha256");
+/// gfx1201 PeaceMaker few-row Qwen4 MoE gate/up
+/// (`gemm_mq4g256v2p_moe_grouped_top10_o4_r2_x4_pm_r4_pad16_b128_altch`, WideNet F07
+/// `r4_pad16_b128_altch`, ELF sha256 `d5c2c64d…4496`): the ABI (40-byte pointer
+/// block + `M, K, x_row_div, grouped_rows, n_experts`) and per-output reduction DAG
+/// of the planar `gemm_mq4g256v2p_moe_grouped_top10_o4_r2_x4`, four slots per
+/// workgroup (grid `ceil(M/16) x ceil(grouped_rows/4)`), 16-byte LDS pad, b128
+/// activation loads. Tested byte-exact, not yet proven anchor-relative.
+pub const QWEN4_MOE_GU_FEW_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/qwen4_moe_gu_few_pm_gfx1201.hxaco");
+/// Bare lowercase SHA-256 of [`QWEN4_MOE_GU_FEW_PM_GFX1201`], without a newline.
+pub const QWEN4_MOE_GU_FEW_PM_GFX1201_SHA256: &str =
+    include_str!("../../../kernels/qwen4_moe_gu_few_pm_gfx1201.hxaco.sha256");
 /// Genuine gfx1100 MQ6/Q8 fixed-eight-row-tile module. Each family is derived
 /// from its gfx1100 singleton object; unsupported shape recipes refuse rather
 /// than substituting another architecture's arithmetic.

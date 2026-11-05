@@ -169,6 +169,35 @@ enum XbatchCode {
     },
 }
 
+/// `HIPFIRE_QWEN4_MOE_GU_FEW_PM` (on unless `0`): the few-row planar Qwen4 MoE
+/// gate/up (`o4_r2_x4`, M 1280 x K 2560) runs the gfx1201 PeaceMaker module at the
+/// row counts of [`MOE_GU_FEW_PM_ROWS`]; `0` keeps the hipcc kernel. Read once.
+static MOE_GU_FEW_PM: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_GU_FEW_PM", true));
+
+/// Source-row counts the few-row gate/up PeaceMaker module is routed at (M 1280, K 2560):
+/// the counts that are faster in every measurement, WideNet F07 (rows 7 0.774, rows 8 0.906),
+/// the cold-weight A/B of `moe_gu_few_pm_oracle` (0.97-0.98 on both ranks) and served rocprof.
+/// Rows 2..=6 stay on hipcc: about 1.00 in the oracle and 4-10% slower per launch served.
+pub const MOE_GU_FEW_PM_ROWS: &[usize] = &[7, 8];
+
+/// Entry symbol of [`kernels::QWEN4_MOE_GU_FEW_PM_GFX1201`].
+const MOE_GU_FEW_PM_ENTRY: &str =
+    "gemm_mq4g256v2p_moe_grouped_top10_o4_r2_x4_pm_r4_pad16_b128_altch";
+
+static MOE_GU_FEW_PM_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(|| {
+    use sha2::{Digest, Sha256};
+    let actual = format!("{:x}", Sha256::digest(kernels::QWEN4_MOE_GU_FEW_PM_GFX1201));
+    if actual == kernels::QWEN4_MOE_GU_FEW_PM_GFX1201_SHA256 {
+        Ok(())
+    } else {
+        Err(format!(
+            "qwen4_moe_gu_few_pm_gfx1201 SHA256 {actual} differs from pinned {}",
+            kernels::QWEN4_MOE_GU_FEW_PM_GFX1201_SHA256
+        ))
+    }
+});
+
 // Dispatch settings are process-wide, like FeatureFlags; resolve off the hot path.
 static DISPATCH_IU4_SYMFOLD: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0"));
@@ -50782,6 +50811,7 @@ impl Gpu {
                 x_row_div,
                 grouped_rows,
                 x_src_rows <= 8,
+                self.moe_gu_few_pm_active(m, k, x_row_div, x_src_rows),
             );
         }
         self.gemm_mq4g256v2_moe_grouped_top10_simt(
@@ -50816,7 +50846,17 @@ impl Gpu {
         x_row_div: usize,
         grouped_rows: usize,
         few: bool,
+        pm: bool,
     ) -> HipResult<()> {
+        if pm && !(few && self.moe_gu_few_pm_covers(m, k, x_row_div)) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "qwen4_moe_gu_few_pm_gfx1201: {} planar={} few={few} M={m} K={k} x_row_div={x_row_div} outside the module",
+                    self.arch, self.mq4_experts_planar
+                ),
+            ));
+        }
         self.bind_thread()?;
         // DESIGN F1: the drop-zero planar twin module (same ABI, grid and arithmetic).
         let planar = self.mq4_experts_planar;
@@ -50831,7 +50871,9 @@ impl Gpu {
                 kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R8_X4_GFX1151_SRC,
             )
         };
-        let (func, slots) = if few {
+        let (func, slots) = if pm {
+            (MOE_GU_FEW_PM_ENTRY, 4)
+        } else if few {
             (
                 if planar {
                     "gemm_mq4g256v2p_moe_grouped_top10_o4_r2_x4"
@@ -50857,7 +50899,18 @@ impl Gpu {
                 (module, src, func)
             };
         crate::moe_entry_log::moe_entry_receipt("gate_up", func, grouped_rows / 10);
-        self.ensure_kernel(module, src, func)?;
+        if pm {
+            MOE_GU_FEW_PM_VERIFIED
+                .clone()
+                .map_err(|reason| hip_bridge::HipError::new(1, &reason))?;
+            self.ensure_embedded_kernel(
+                "qwen4_moe_gu_few_pm_gfx1201",
+                kernels::QWEN4_MOE_GU_FEW_PM_GFX1201,
+                func,
+            )?;
+        } else {
+            self.ensure_kernel(module, src, func)?;
+        }
         let ep = expert_weight_ptrs.buf.as_ptr();
         let tp = expert_tile_ids.buf.as_ptr();
         let sp = sorted_slot_index.buf.as_ptr();
@@ -50912,6 +50965,70 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// Whether the gfx1201 PeaceMaker few-row gate/up module covers a call: exact
+    /// gfx1201, the drop-zero planar expert layout, the Qwen4 gate/up shape
+    /// (M 1280, K 2560) and sealed top-10 grouping.
+    pub fn moe_gu_few_pm_covers(&self, m: usize, k: usize, x_row_div: usize) -> bool {
+        self.arch == "gfx1201"
+            && self.mq4_experts_planar
+            && m == 1280
+            && k == 2560
+            && x_row_div == 10
+    }
+
+    /// Whether [`Self::gemm_mq4g256v2_moe_grouped_top10`] runs the few-row gate/up
+    /// PeaceMaker module for `x_src_rows` source rows: `HIPFIRE_QWEN4_MOE_GU_FEW_PM`
+    /// on, [`Self::moe_gu_few_pm_covers`], and a row count of [`MOE_GU_FEW_PM_ROWS`].
+    pub fn moe_gu_few_pm_active(
+        &self,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        x_src_rows: usize,
+    ) -> bool {
+        *MOE_GU_FEW_PM
+            && MOE_GU_FEW_PM_ROWS.contains(&x_src_rows)
+            && self.moe_gu_few_pm_covers(m, k, x_row_div)
+    }
+
+    /// The few-row (`o4_r2_x4`) gate/up launch on an explicit kernel: `pm` runs the
+    /// gfx1201 PeaceMaker module (an error where [`Self::moe_gu_few_pm_covers`]
+    /// refuses), otherwise the hipcc kernel, whatever the row count. Both write the
+    /// same bytes; `moe_gu_few_pm_oracle` pins that.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq4g256v2_moe_grouped_top10_few_with(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+        pm: bool,
+    ) -> HipResult<()> {
+        crate::moe::require_span(
+            y_grouped,
+            &[grouped_rows, m, 4],
+            "gemm_mq4g256v2_moe_grouped_top10_few_with grouped rows",
+        )?;
+        self.gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_gfx1151(
+            expert_weight_ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            x_src,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            grouped_rows,
+            true,
+            pm,
+        )
     }
 
     /// Whether the gfx1201 `g32` gate/up family serves a call of `rows` source rows
@@ -55822,7 +55939,7 @@ mod tests {
                 )
             } else {
                 gpu.gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_gfx1151(
-                    &ptrs_gpu, &tiles_gpu, &slots_gpu, &x_gpu, &y, M, K, 10, GROUPED, false,
+                    &ptrs_gpu, &tiles_gpu, &slots_gpu, &x_gpu, &y, M, K, 10, GROUPED, false, false,
                 )
             }
             .expect("gate/up launch");
