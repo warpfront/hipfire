@@ -10884,6 +10884,9 @@ pub struct Qwen4GpuForward {
     /// construction: whether `TokenReadback` queues the id copy at the
     /// argmax instead of at the PLE read.
     token_readback_early: bool,
+    /// Launches recorded before the head in the open retained capture: the
+    /// prefix the tape is prepared from (`None`: the whole window).
+    retained_body_end: Option<usize>,
     /// MoE runtime of each absolute trunk layer (`None`: a layer without a
     /// MoE FFN or one this band does not own); length `num_hidden_layers`.
     pub(crate) moe: Vec<Option<Qwen4MoeLayerRuntime>>,
@@ -13321,6 +13324,7 @@ impl Qwen4GpuForward {
                 "HIPFIRE_QWEN4_TOKEN_READBACK_EARLY",
                 true,
             ),
+            retained_body_end: None,
             cpu_deferred_experts: moe.iter().flatten().any(|layer| layer.cpu_deferred_experts),
             cpu_split_layers: moe
                 .iter()
@@ -17414,6 +17418,7 @@ impl Qwen4GpuForward {
                     }
                     RetainedBodyAction::Arm { diagnostic } => {
                         diagnostic_capture = diagnostic;
+                        self.retained_body_end = None;
                         // The fused GDN rotation's arrival counters are zeroed once,
                         // on first use; materialize them before the window opens so
                         // that memset is not state the tape would have to replay.
@@ -17757,6 +17762,12 @@ impl Qwen4GpuForward {
                 }
             }
 
+            // The retained body ends here. The head writes the caller's logits and
+            // top-1, whose addresses change per request, and it runs on HIP below on
+            // every route, so the tape must not replay it a second time.
+            if gpu.replay.is_recording() {
+                self.retained_body_end = Some(gpu.replay.recorded_launches().len());
+            }
             if let Some(requested_rows) = requested_rows.filter(|_| last) {
                 let final_hyper = final_hyper
                     .as_ref()
@@ -17893,7 +17904,7 @@ impl Qwen4GpuForward {
                 // that knows both ends of one recorded body, so the window can never
                 // outlive the forward that opened it.
                 if gpu.replay.should_auto_finalize_capture() {
-                    finish_qwen4_capture(gpu, diagnostic_capture);
+                    finish_qwen4_capture(gpu, diagnostic_capture, self.retained_body_end.take());
                 }
                 if traced {
                     self.write_route_trace(gpu, next_position)?;
@@ -17942,7 +17953,9 @@ impl Qwen4GpuForward {
 /// Prepare failure after a successful HIP warmup poisons the route (sticky
 /// fallback) rather than failing the request that already produced output; a
 /// window that launched more kernels than it recorded is one such failure.
-fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool) {
+/// `body_end` is the recorded launch count before the head: the head runs on
+/// HIP after every replay, so the plan stops there.
+fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool, body_end: Option<usize>) {
     let effects = gpu.replay.capture_window_effects();
     let summary = gpu.replay.capture_summary();
     eprintln!(
@@ -17980,14 +17993,14 @@ fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool) {
         eprintln!("[redline] qwen4 capture could not be closed or prepared: {reason}");
         return;
     }
-    let launches = gpu.replay.recorded_launches().len();
+    let launches = body_end.unwrap_or_else(|| gpu.replay.recorded_launches().len());
     let prepared = if gpu.replay.uses_pm4_transport() {
         gpu.replay
             .prepare_pm4_prefix(gpu.device_id as usize, launches)
             .map(|_| ())
     } else {
         gpu.replay
-            .prepare_linear_aql(gpu.device_id as usize)
+            .prepare_linear_aql_prefix(gpu.device_id as usize, launches)
             .map(|_| ())
     };
     match prepared {
