@@ -33,8 +33,8 @@
 
 use crate::backend::{Auth, Backend, SlotTransition};
 use crate::lds::{
-    ready, AllFree, Free, LdsRegion, Lowering, Published, Ring, Slots, State, StoreTarget,
-    Transitions, Writing,
+    check_private_layout, ready, AllFree, Free, LdsRegion, Lowering, Owned, PrivState, PrivWritable,
+    Published, Ring, Slots, State, StoreTarget, Transitions, WaveRegion, Writing,
 };
 use crate::target::{SplitBarrier, Target, WaitModel};
 use crate::wait::{Drained, Event, LdsWrite, Pending, Pendings};
@@ -164,6 +164,15 @@ impl<E: Event> Carried for Drained<E> {
     }
     fn agrees(&self, other: &Self, _: &Token) -> bool {
         self.last == other.last
+    }
+}
+impl<R, P: PrivState> sealed::Sealed for WaveRegion<R, P> {}
+impl<R, P: PrivState> Carried for WaveRegion<R, P> {
+    fn respawn(&self, _: &Token) -> Self {
+        WaveRegion::new(self.slot, self.last)
+    }
+    fn agrees(&self, other: &Self, _: &Token) -> bool {
+        self.slot == other.slot && self.last == other.last
     }
 }
 macro_rules! carried_tuple {
@@ -345,6 +354,60 @@ impl<'b, T: Target, B: Backend> Wave<'b, T, B> {
             .cur_slots()
             .ok_or("read of a ring buffer no barrier has published")?;
         self.b.ds_load(&self.auth, slots.ids(), insn)
+    }
+    /// One DS store into this wave's slice of a wave-private region (`Free`
+    /// or `Writing`). Wave scope: legal under wave-uniform control.
+    pub fn private_store<R, P: PrivWritable>(
+        &mut self,
+        r: WaveRegion<R, P>,
+        insn: B::Insn,
+    ) -> Result<WaveRegion<R, Writing>, String> {
+        let e = self.b.ds_store_private(&self.auth, r.slot, insn)?;
+        Ok(WaveRegion::new(r.slot, Some(e)))
+    }
+    /// Wait for this wave's stores into its slice (a no-op when an earlier
+    /// wait already retired them). Publishing and retiring never need it; a
+    /// workgroup barrier does for any DS store still in flight, as for a
+    /// shared region.
+    pub fn private_drain<R, P: PrivState>(
+        &mut self,
+        r: WaveRegion<R, P>,
+    ) -> Result<WaveRegion<R, P>, String> {
+        if r.last.is_some_and(|e| self.b.lds_store_pending(e)) {
+            self.b
+                .drain_lds_stores(&self.auth, <T::Waits as WaitModel>::LDS)?;
+        }
+        Ok(WaveRegion::new(r.slot, None))
+    }
+    /// `Writing -> Owned`: the owning wave may now read what it stored. It
+    /// emits nothing and needs no `Drained` evidence and no barrier: one
+    /// wave's DS instructions execute in issue order (RDNA3 ISA 12.5, RDNA4
+    /// ISA 12.5 and 5.7.1.4), so a later load sees the store.
+    pub fn private_publish<R>(
+        &mut self,
+        r: WaveRegion<R, Writing>,
+    ) -> Result<WaveRegion<R, Owned>, String> {
+        self.b.lds_private_publish(&self.auth, r.slot)?;
+        Ok(r.to())
+    }
+    /// One DS load from this wave's own slice of an `Owned` region. Its
+    /// destination registers are awaited by the backend on first use.
+    pub fn private_load<R>(
+        &mut self,
+        r: &WaveRegion<R, Owned>,
+        insn: B::Insn,
+    ) -> Result<(), String> {
+        self.b.ds_load_private(&self.auth, r.slot, insn)
+    }
+    /// `Owned -> Free`: the wave may rewrite its slice. It emits nothing: no
+    /// other wave reads the slice and the wave's own earlier loads are ahead
+    /// of its later stores in the in-order LDS stream.
+    pub fn private_retire<R>(
+        &mut self,
+        r: WaveRegion<R, Owned>,
+    ) -> Result<WaveRegion<R, Free>, String> {
+        self.b.lds_private_retire(&self.auth, r.slot)?;
+        Ok(r.to())
     }
     /// Wait for a token's operations; emits the counter wait the backend
     /// still needs (none when an earlier wait retired them).
@@ -601,6 +664,24 @@ impl<'b, T: Target, B: Backend> Workgroup<'b, T, B> {
             Slots::one(self.wave.b.lds_slot(&self.wave.auth, name, base, len)?),
             None,
         ))
+    }
+    /// Declare one wave-private LDS region: wave `w` owns bytes `[base + w *
+    /// stride, base + (w + 1) * stride)` for `waves` waves (`base` and
+    /// `stride` nonzero multiples of 16, the window inside the LDS and clear
+    /// of every other slot). See [`WaveRegion`].
+    pub fn lds_private<R: 'static>(
+        &mut self,
+        name: &str,
+        base: u32,
+        stride: u32,
+        waves: u32,
+    ) -> Result<WaveRegion<R, Free>, String> {
+        check_private_layout(name, base, stride, waves, T::LDS_BYTES, T::NAME)?;
+        let slot = self
+            .wave
+            .b
+            .lds_slot_private(&self.wave.auth, name, base, stride, waves)?;
+        Ok(WaveRegion::new(slot, None))
     }
     /// End the slot layout so a later phase can carve its own. Takes every
     /// region (all `Free`); the backend refuses if any slot is still live.

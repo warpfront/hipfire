@@ -35,6 +35,7 @@ pub mod wait;
 pub use backend::{Auth, Backend, EventId, Seal, SlotTransition};
 pub use lds::{
     advance, join, prime, ready, retire, retire_cur, rotate, AllFree, Free, JoinPart, LdsRegion,
+    Owned, PrivState, PrivWritable, WaveRegion,
     Lendable, Published, Ring, State, StoreTarget, Transition, Transitions, Writing,
     MAX_RING_DEPTH,
 };

@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/private_cross_wave_publish.rs:20:36
+   |
+20 |         let _ = wg.barrier((retire(o),))?;
+   |                             ------ ^ expected `LdsRegion<_, Published>`, found `WaveRegion<Scratch, Owned>`
+   |                             |
+   |                             arguments to this function are incorrect
+   |
+   = note: expected struct `LdsRegion<_, Published>`
+              found struct `WaveRegion<Scratch, peacemaker_author::Owned>`
+note: function defined here
+  --> src/lds.rs
+   |
+   | pub fn retire<R: 'static>(region: LdsRegion<R, Published>) -> Retire<R> {
+   |        ^^^^^^

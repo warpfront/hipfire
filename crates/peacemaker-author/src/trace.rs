@@ -29,6 +29,8 @@ pub struct Trace {
     /// Emitted instructions and labels, in order.
     pub text: Vec<String>,
     slots: Vec<(String, Slot)>,
+    /// Per slot: wave-private (declaration order, as `slots`).
+    private: Vec<bool>,
     stores: Vec<u64>,
     next: u64,
     signalled: Option<Vec<SlotTransition>>,
@@ -44,6 +46,7 @@ impl Trace {
             arch,
             text: Vec::new(),
             slots: Vec::new(),
+            private: Vec::new(),
             stores: Vec::new(),
             next: 0,
             signalled: None,
@@ -113,6 +116,12 @@ impl Trace {
                 SlotTransition::Retire(id) => (id, Slot::Reading, Slot::Free),
                 SlotTransition::Ready(id) => (id, Slot::Publishing, Slot::Published),
             };
+            if self.private.get(id) == Some(&true) {
+                return Err(format!(
+                    "{t:?}: {} is wave-private, no barrier publishes or retires it",
+                    self.slots[id].0
+                ));
+            }
             let slot = self.slots.get_mut(id).ok_or("unknown LDS slot")?;
             if slot.1 != from {
                 return Err(format!("{t:?}: {} is {:?}", slot.0, slot.1));
@@ -155,7 +164,72 @@ impl Backend for Trace {
         self.seal.check(auth)?;
         let _ = (base, len);
         self.slots.push((name.into(), Slot::Free));
+        self.private.push(false);
         Ok(self.slots.len() - 1)
+    }
+    fn lds_slot_private(
+        &mut self,
+        auth: &Auth,
+        name: &str,
+        base: u32,
+        stride: u32,
+        waves: u32,
+    ) -> Result<usize, String> {
+        self.seal.check(auth)?;
+        let _ = (base, stride, waves);
+        self.slots.push((name.into(), Slot::Free));
+        self.private.push(true);
+        Ok(self.slots.len() - 1)
+    }
+    fn ds_store_private(&mut self, auth: &Auth, slot: usize, insn: String) -> Result<EventId, String> {
+        self.seal.check(auth)?;
+        let private = self.private.get(slot) == Some(&true);
+        let s = self.slots.get_mut(slot).ok_or("unknown LDS slot")?;
+        if !private {
+            return Err(format!("{} is a workgroup-shared slot", s.0));
+        }
+        if !matches!(s.1, Slot::Free | Slot::Publishing) {
+            return Err(format!("{} cannot be stored while {:?}", s.0, s.1));
+        }
+        s.1 = Slot::Publishing;
+        self.emit(insn);
+        self.stores.push(self.next);
+        self.next += 1;
+        Ok(EventId(self.next - 1))
+    }
+    fn ds_load_private(&mut self, auth: &Auth, slot: usize, insn: String) -> Result<(), String> {
+        self.seal.check(auth)?;
+        let private = self.private.get(slot) == Some(&true);
+        let s = self.slots.get_mut(slot).ok_or("unknown LDS slot")?;
+        if !private {
+            return Err(format!("{} is a workgroup-shared slot", s.0));
+        }
+        if !matches!(s.1, Slot::Published | Slot::Reading) {
+            return Err(format!("{} is not published to its wave", s.0));
+        }
+        s.1 = Slot::Reading;
+        self.emit(insn);
+        Ok(())
+    }
+    fn lds_private_publish(&mut self, auth: &Auth, slot: usize) -> Result<(), String> {
+        self.seal.check(auth)?;
+        let private = self.private.get(slot) == Some(&true);
+        let s = self.slots.get_mut(slot).ok_or("unknown LDS slot")?;
+        if !private || s.1 != Slot::Publishing {
+            return Err(format!("{} cannot be published to its wave ({:?})", s.0, s.1));
+        }
+        s.1 = Slot::Published;
+        Ok(())
+    }
+    fn lds_private_retire(&mut self, auth: &Auth, slot: usize) -> Result<(), String> {
+        self.seal.check(auth)?;
+        let private = self.private.get(slot) == Some(&true);
+        let s = self.slots.get_mut(slot).ok_or("unknown LDS slot")?;
+        if !private || !matches!(s.1, Slot::Published | Slot::Reading) {
+            return Err(format!("{} cannot be retired ({:?})", s.0, s.1));
+        }
+        s.1 = Slot::Free;
+        Ok(())
     }
     fn lds_relayout(&mut self, auth: &Auth) -> Result<(), String> {
         self.seal.check(auth)?;
@@ -167,6 +241,12 @@ impl Backend for Trace {
     fn ds_store(&mut self, auth: &Auth, slots: &[usize], insn: String) -> Result<EventId, String> {
         self.seal.check(auth)?;
         for &id in slots {
+            if self.private.get(id) == Some(&true) {
+                return Err(format!(
+                    "{} is wave-private: a workgroup-shared store would give other waves access to it",
+                    self.slots[id].0
+                ));
+            }
             let slot = self.slots.get_mut(id).ok_or("unknown LDS slot")?;
             if !matches!(slot.1, Slot::Free | Slot::Publishing) {
                 return Err(format!("{} cannot be stored while {:?}", slot.0, slot.1));
@@ -181,6 +261,12 @@ impl Backend for Trace {
     fn ds_load(&mut self, auth: &Auth, slots: &[usize], insn: String) -> Result<(), String> {
         self.seal.check(auth)?;
         for &id in slots {
+            if self.private.get(id) == Some(&true) {
+                return Err(format!(
+                    "{} is wave-private: a workgroup-shared load would give other waves access to it",
+                    self.slots[id].0
+                ));
+            }
             let slot = self.slots.get_mut(id).ok_or("unknown LDS slot")?;
             if !matches!(slot.1, Slot::Published | Slot::Reading) {
                 return Err(format!("{} is not published", slot.0));
@@ -314,15 +400,19 @@ impl Backend for Trace {
         if slots.len() != self.slots.len() {
             return Err("paths join with different LDS layouts".into());
         }
-        for (mine, (name, theirs)) in self.slots.iter_mut().zip(slots) {
+        for (i, (mine, (name, theirs))) in self.slots.iter_mut().zip(slots).enumerate() {
+            let private = self.private[i];
             mine.1 = match (mine.1, theirs) {
                 (a, b) if a == b => a,
                 // Read on one path only: either way no other wave reads it
                 // unless a barrier retires this wave's reads.
                 (Slot::Published | Slot::Reading, Slot::Published | Slot::Reading) => Slot::Reading,
                 // Stored on one path only: the region is `Writing` on both,
-                // and the next barrier publishes what any wave stored.
-                (Slot::Free | Slot::Publishing, Slot::Free | Slot::Publishing) => Slot::Publishing,
+                // and the next barrier publishes what any wave stored. A
+                // wave-private slice is each wave's own: no merge.
+                (Slot::Free | Slot::Publishing, Slot::Free | Slot::Publishing) if !private => {
+                    Slot::Publishing
+                }
                 (a, b) => {
                     return Err(format!(
                         "paths join with {name} {a:?} on one and {b:?} on the other"
@@ -342,6 +432,12 @@ impl Backend for Trace {
     fn lds_peer_stores(&mut self, auth: &Auth, slots: &[usize]) -> Result<(), String> {
         self.seal.check(auth)?;
         for &id in slots {
+            if self.private.get(id) == Some(&true) {
+                return Err(format!(
+                    "{} is wave-private: other waves never store into it",
+                    self.slots[id].0
+                ));
+            }
             let slot = self.slots.get_mut(id).ok_or("unknown LDS slot")?;
             if slot.1 != Slot::Free {
                 return Err(format!(

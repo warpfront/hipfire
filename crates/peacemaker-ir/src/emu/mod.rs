@@ -690,6 +690,9 @@ pub struct Emulator<'a> {
     hw: Option<Vec<hw::StepHw>>,
     /// Workgroups run so far (the gate model's schedule budget).
     runs: std::sync::atomic::AtomicU64,
+    /// Wave-private LDS windows `(base, stride, waves)`: wave `w` owns `[base + w * stride, base + (w + 1) * stride)`.
+    /// The gate model refuses any access of another wave (or past a slice) to such a window (see `wave_private_lds`).
+    private_lds: Vec<(u32, u32, u32)>,
 }
 impl<'a> Emulator<'a> {
     pub fn new(program: &'a Program, symbol: &str) -> Result<Self> {
@@ -728,12 +731,23 @@ impl<'a> Emulator<'a> {
             decode_arch: program.target.arch,
             hw: None,
             runs: std::sync::atomic::AtomicU64::new(0),
+            private_lds: Vec::new(),
         })
     }
     /// Track which LDS bytes the workgroup has written; a read of any other LDS byte (including by an LDS atomic) is an
     /// error. Off by default so existing differential tests keep their (zero-initialised LDS) behaviour.
     pub fn strict_lds(mut self) -> Self {
         self.strict_lds = true;
+        self
+    }
+    /// Declare a wave-private LDS window (the builder's `LdsSlot::wave_private`): wave `w` owns bytes `[base + w *
+    /// stride, base + (w + 1) * stride)` and no other wave may touch them. The gate model (`hw_model`) checks every
+    /// LDS access that overlaps the window: it must come from the owning wave and stay inside that wave's slice,
+    /// else the run fails with a `[private]` error naming both waves. Within one wave the gate model needs no
+    /// ordering between accesses to its slice (one wave's DS instructions stay in issue order); a *different* wave's
+    /// access is refused here even when a barrier would order it, because ownership never crosses a barrier.
+    pub fn wave_private_lds(mut self, base: u32, stride: u32, waves: u32) -> Self {
+        self.private_lds.push((base, stride, waves));
         self
     }
     /// The lab's exactness contract for the lane kernels: non-NaN words bit-equal, a NaN must meet a NaN (payload and

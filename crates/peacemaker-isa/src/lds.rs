@@ -10,12 +10,26 @@ pub enum SlotState {
     Published,
     Reading,
 }
+/// The per-wave layout of a wave-private slot: wave `w` of the workgroup owns
+/// `[base + w * stride, base + (w + 1) * stride)` and no other wave touches it.
+/// Its transitions never pass a barrier (see [`Lds::private_publish`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct WavePrivate {
+    /// Bytes each wave owns.
+    pub stride: u32,
+    /// Waves that own a slice (the slot covers `stride * waves` bytes).
+    pub waves: u32,
+}
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct LdsSlot {
     pub name: String,
     pub base: u32,
     pub len: u32,
     pub state: SlotState,
+    /// `Some` for a wave-private slot (`len == stride * waves`); the proof
+    /// record of the layout a certifier checks DS addresses against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wave_private: Option<WavePrivate>,
 }
 /// One barrier-carried slot transition (shared with the typed core).
 pub use peacemaker_author::SlotTransition as Transition;
@@ -43,8 +57,57 @@ impl Lds {
             base,
             len,
             state: SlotState::Free,
+            wave_private: None,
         });
         Ok(self.slots.len() - 1)
+    }
+    /// Declare a wave-private slot: `waves` slices of `stride` bytes at `base`
+    /// (slice `w` is `[base + w * stride, base + (w + 1) * stride)`), one slot id
+    /// whose state is each wave's own (all waves run one program). The slices
+    /// are disjoint by construction and the whole window may not overlap any
+    /// other slot, so no shared slot can alias a wave's private bytes.
+    pub fn add_wave_private(
+        &mut self,
+        name: impl Into<String>,
+        base: u32,
+        stride: u32,
+        waves: u32,
+    ) -> Result<usize, String> {
+        if stride == 0 || waves == 0 {
+            return Err("a wave-private LDS slot needs a nonzero stride and wave count".into());
+        }
+        if stride % 16 != 0 || base % 16 != 0 {
+            return Err(
+                "a wave-private LDS slot's base and stride must be multiples of 16 bytes (every wave's slice starts 16-byte aligned for DS b128 accesses)"
+                    .into(),
+            );
+        }
+        let len = stride
+            .checked_mul(waves)
+            .ok_or("wave-private LDS window overflows")?;
+        let id = self.add(name, base, len)?;
+        self.slots[id].wave_private = Some(WavePrivate { stride, waves });
+        Ok(id)
+    }
+    /// The slot is a wave-private one (the barrier and shared store/load entry
+    /// points refuse it).
+    fn refuse_private(&self, id: usize, what: &str) -> Result<(), String> {
+        match self.slots.get(id) {
+            Some(s) if s.wave_private.is_some() => Err(format!(
+                "{} is wave-private: {what} would give other waves access to it; its ownership never crosses a barrier",
+                s.name
+            )),
+            _ => Ok(()),
+        }
+    }
+    fn require_private(&self, id: usize, what: &str) -> Result<(), String> {
+        match self.slots.get(id) {
+            Some(s) if s.wave_private.is_none() => Err(format!(
+                "{} is a workgroup-shared slot: {what} is for wave-private slots",
+                s.name
+            )),
+            _ => Ok(()),
+        }
     }
     fn slot(&mut self, id: usize) -> Result<&mut LdsSlot, String> {
         if self.signalled
@@ -58,6 +121,7 @@ impl Lds {
         self.slots.get_mut(id).ok_or("unknown LDS slot".into())
     }
     pub fn store(&mut self, id: usize) -> Result<(), String> {
+        self.refuse_private(id, "a workgroup-shared store")?;
         let s = self.slot(id)?;
         if !matches!(s.state, SlotState::Free | SlotState::Publishing) {
             return Err(format!("{} cannot be stored while {:?}", s.name, s.state));
@@ -66,11 +130,69 @@ impl Lds {
         Ok(())
     }
     pub fn load(&mut self, id: usize) -> Result<(), String> {
+        self.refuse_private(id, "a workgroup-shared load")?;
         let s = self.slot(id)?;
         if !matches!(s.state, SlotState::Published | SlotState::Reading) {
             return Err(format!("{} is not published", s.name));
         }
         s.state = SlotState::Reading;
+        Ok(())
+    }
+    /// A wave-private store: `Free | Publishing -> Publishing`.
+    pub fn private_store(&mut self, id: usize) -> Result<(), String> {
+        self.require_private(id, "a wave-private store")?;
+        let s = self.slot(id)?;
+        if !matches!(s.state, SlotState::Free | SlotState::Publishing) {
+            return Err(format!("{} cannot be stored while {:?}", s.name, s.state));
+        }
+        s.state = SlotState::Publishing;
+        Ok(())
+    }
+    /// A wave-private load: `Published | Reading -> Reading`.
+    pub fn private_load(&mut self, id: usize) -> Result<(), String> {
+        self.require_private(id, "a wave-private load")?;
+        let s = self.slot(id)?;
+        if !matches!(s.state, SlotState::Published | SlotState::Reading) {
+            return Err(format!("{} is not published to its wave", s.name));
+        }
+        s.state = SlotState::Reading;
+        Ok(())
+    }
+    /// Publish a wave-private slot to its owning wave: `Publishing ->
+    /// Published`, no barrier and no instruction. The only reader is the wave
+    /// that stored, and the LDS keeps one wave's DS instructions in issue
+    /// order (RDNA3 ISA 12.5 "Data Share Indexed and Atomic Access": "LDS
+    /// instructions stay in-order with other LDS instructions from the same
+    /// wave"; RDNA4 ISA 5.7.1.4 "LDS instructions are kept in order"), so a load
+    /// issued after the store reads the stored bytes with no `lgkmcnt`/`dscnt`
+    /// wait between them. A wait is only for the loaded VGPRs (the ledger's
+    /// use waits), never for this ordering.
+    pub fn private_publish(&mut self, id: usize) -> Result<(), String> {
+        self.require_private(id, "a wave-private publish")?;
+        let s = self.slot(id)?;
+        if s.state != SlotState::Publishing {
+            return Err(format!(
+                "{} cannot be published to its wave while {:?}: it needs a store first",
+                s.name, s.state
+            ));
+        }
+        s.state = SlotState::Published;
+        Ok(())
+    }
+    /// Retire a wave-private slot: `Published | Reading -> Free`, no barrier
+    /// and no instruction. The wave's own loads are already issued ahead of any
+    /// later store of its own (same in-order rule), and no other wave reads the
+    /// slice, so there is no cross-wave write-after-read to wait out.
+    pub fn private_retire(&mut self, id: usize) -> Result<(), String> {
+        self.require_private(id, "a wave-private retire")?;
+        let s = self.slot(id)?;
+        if !matches!(s.state, SlotState::Published | SlotState::Reading) {
+            return Err(format!(
+                "{} cannot be retired while {:?}: nothing was published",
+                s.name, s.state
+            ));
+        }
+        s.state = SlotState::Free;
         Ok(())
     }
     pub fn barrier_signal(
@@ -89,6 +211,7 @@ impl Lds {
                 Transition::Retire(id) => (*id, SlotState::Reading),
                 Transition::Ready(id) => (*id, SlotState::Publishing),
             };
+            self.refuse_private(id, "a barrier transition (a cross-wave publish or retire)")?;
             if self.slots.get(id).map(|s| s.state) != Some(expected) {
                 return Err(format!("invalid LDS transition {t:?}"));
             }
@@ -147,7 +270,9 @@ impl Lds {
             return Err("paths join with different LDS layouts".into());
         }
         for (mine, theirs) in self.slots.iter_mut().zip(&other.slots) {
-            if (&mine.name, mine.base, mine.len) != (&theirs.name, theirs.base, theirs.len) {
+            if (&mine.name, mine.base, mine.len, mine.wave_private)
+                != (&theirs.name, theirs.base, theirs.len, theirs.wave_private)
+            {
                 return Err("paths join with different LDS layouts".into());
             }
             mine.state = match (mine.state, theirs.state) {
@@ -156,10 +281,14 @@ impl Lds {
                     SlotState::Published | SlotState::Reading,
                     SlotState::Published | SlotState::Reading,
                 ) => SlotState::Reading,
+                // Stored on one path only: a shared region is `Writing` on both
+                // (the next barrier publishes what any wave stored). A
+                // wave-private slice is each wave's own, so a wave that took the
+                // other path holds nothing there: no merge.
                 (
                     SlotState::Free | SlotState::Publishing,
                     SlotState::Free | SlotState::Publishing,
-                ) => SlotState::Publishing,
+                ) if mine.wave_private.is_none() => SlotState::Publishing,
                 (a, b) => {
                     return Err(format!(
                         "paths join with {} {a:?} on one and {b:?} on the other",
@@ -174,4 +303,36 @@ impl Lds {
     pub fn all_slots(&self) -> Vec<LdsSlot> {
         self.retired.iter().chain(&self.slots).cloned().collect()
     }
+}
+
+/// One wave-private LDS window as the builder's proof records it
+/// (`BuilderProof::lds_slots` entries with `wave_private`): wave `w` of the
+/// workgroup owns bytes `[base + w * stride, base + (w + 1) * stride)` and
+/// no other wave touches them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrivateWindow {
+    pub base: u32,
+    pub stride: u32,
+    pub waves: u32,
+}
+impl PrivateWindow {
+    /// One past the window's last byte (saturating).
+    pub fn end(&self) -> u32 {
+        self.base
+            .saturating_add(self.stride.saturating_mul(self.waves))
+    }
+}
+
+/// The wave-private windows of a builder proof's LDS slots.
+pub fn private_windows(slots: &[LdsSlot]) -> Vec<PrivateWindow> {
+    slots
+        .iter()
+        .filter_map(|s| {
+            s.wave_private.map(|p| PrivateWindow {
+                base: s.base,
+                stride: p.stride,
+                waves: p.waves,
+            })
+        })
+        .collect()
 }

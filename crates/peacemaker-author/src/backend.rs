@@ -108,6 +108,41 @@ pub trait Backend: Sized {
     fn lds_slot(&mut self, auth: &Auth, name: &str, base: u32, len: u32) -> Result<usize, String>;
     /// End the slot layout; every slot must be Free.
     fn lds_relayout(&mut self, auth: &Auth) -> Result<(), String>;
+    /// Declare a wave-private slot: wave `w` of the workgroup owns bytes
+    /// `[base + w * stride, base + (w + 1) * stride)`, `waves` slices in all
+    /// (`stride` and `base` multiples of 16). The slot may not overlap any
+    /// other, and no barrier transition, shared store/load or peer store may
+    /// name it.
+    fn lds_slot_private(
+        &mut self,
+        auth: &Auth,
+        name: &str,
+        base: u32,
+        stride: u32,
+        waves: u32,
+    ) -> Result<usize, String>;
+    /// One DS store into the issuing wave's slice of a wave-private slot
+    /// (`Free | Publishing -> Publishing`); returns its event.
+    fn ds_store_private(
+        &mut self,
+        auth: &Auth,
+        slot: usize,
+        insn: Self::Insn,
+    ) -> Result<EventId, String>;
+    /// One DS load from the issuing wave's slice (`Published | Reading ->
+    /// Reading`).
+    fn ds_load_private(
+        &mut self,
+        auth: &Auth,
+        slot: usize,
+        insn: Self::Insn,
+    ) -> Result<(), String>;
+    /// `Publishing -> Published` for the owning wave: a state step with no
+    /// instruction (one wave's DS instructions execute in issue order).
+    fn lds_private_publish(&mut self, auth: &Auth, slot: usize) -> Result<(), String>;
+    /// `Published | Reading -> Free` for the owning wave: a state step with
+    /// no instruction.
+    fn lds_private_retire(&mut self, auth: &Auth, slot: usize) -> Result<(), String>;
     /// One DS store touching every slot in `slots`; returns its event.
     fn ds_store(
         &mut self,

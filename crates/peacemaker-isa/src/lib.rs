@@ -888,11 +888,23 @@ impl Builder {
         self.ds_store_slot(slot, insn)
     }
     fn ds_store_slot(&mut self, slot: usize, insn: Instruction) -> Result<(), String> {
+        self.ds_store_with(insn, |lds| lds.store(slot))
+    }
+    /// A wave-private store (`Lds::private_store`); only the typed core's
+    /// `Backend` reaches it.
+    fn ds_store_private_slot(&mut self, slot: usize, insn: Instruction) -> Result<(), String> {
+        self.ds_store_with(insn, |lds| lds.private_store(slot))
+    }
+    fn ds_store_with(
+        &mut self,
+        insn: Instruction,
+        step: impl FnOnce(&mut Lds) -> Result<(), String>,
+    ) -> Result<(), String> {
         if insn.memory != Some(MemoryClass::DsStore) || !insn.mnemonic().starts_with("ds_store") {
             return Err("ds_store requires an LDS store instruction".into());
         }
         let old = self.lds.clone();
-        self.lds.store(slot)?;
+        step(&mut self.lds)?;
         self.lds_access_allowed = true;
         let result = self.push(insn);
         self.lds_access_allowed = false;
@@ -906,11 +918,24 @@ impl Builder {
         self.ds_load_slot(slot, insn)
     }
     fn ds_load_slot(&mut self, slot: usize, insn: Instruction) -> Result<(), String> {
+        self.ds_load_with(slot, insn, |lds| lds.load(slot))
+    }
+    /// A wave-private load (`Lds::private_load`); only the typed core's
+    /// `Backend` reaches it.
+    fn ds_load_private_slot(&mut self, slot: usize, insn: Instruction) -> Result<(), String> {
+        self.ds_load_with(slot, insn, |lds| lds.private_load(slot))
+    }
+    fn ds_load_with(
+        &mut self,
+        slot: usize,
+        insn: Instruction,
+        step: impl FnOnce(&mut Lds) -> Result<(), String>,
+    ) -> Result<(), String> {
         if insn.memory != Some(MemoryClass::DsLoad) || !insn.mnemonic().starts_with("ds_load") {
             return Err("ds_load requires an LDS load instruction".into());
         }
         let old = self.lds.clone();
-        self.lds.load(slot)?;
+        step(&mut self.lds)?;
         self.lds_access_allowed = true;
         let result = self
             .push(insn)
