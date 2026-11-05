@@ -620,6 +620,18 @@ impl EpTailBorrow {
         self.exchange_root.is_some()
     }
 
+    /// The parked borrowed bank a tile of `rows` rows will run on (more than the resident
+    /// rows), for size-only preflights; its bytes are valid only inside an epoch. `None`
+    /// unless attached with the borrowed bank parked.
+    pub(crate) fn bank_for_rows(&self, rows: usize) -> Option<&Qwen4GpuForwardScratch> {
+        match &self.state {
+            EpTailState::Attached(attached) if rows > self.plan.resident_rows => {
+                attached.bank.as_ref()
+            }
+            _ => None,
+        }
+    }
+
     /// Allocate the persistent roots ([`persistent_fields`]) and build the resident bank over
     /// them. Returns the resident bank (the forward's `scratch`), the owner and the host staging
     /// vectors sized for the borrowed rows. Nothing is allocated on error.

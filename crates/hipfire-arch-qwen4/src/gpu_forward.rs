@@ -14996,6 +14996,14 @@ impl Qwen4GpuForward {
         {
             return bank;
         }
+        // EP tail borrow: a tile above the resident rows runs on the parked borrowed bank.
+        if let Some(bank) = self
+            .ep_tail_borrow
+            .as_ref()
+            .and_then(|borrow| borrow.bank_for_rows(rows))
+        {
+            return bank;
+        }
         self.share
             .as_ref()
             .filter(|share| share.active.is_none())
