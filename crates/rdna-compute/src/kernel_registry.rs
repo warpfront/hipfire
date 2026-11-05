@@ -2867,7 +2867,9 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "hetero_store_seq",
                 "hetero_publish_rows",
                 "hetero_release_rows",
-                "hetero_add_partial"
+                "hetero_add_partial",
+                "hetero_f16_to_f32",
+                "hetero_f32_to_bf16"
             ]
         );
     }

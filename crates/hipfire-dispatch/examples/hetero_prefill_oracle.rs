@@ -85,6 +85,34 @@ fn fail(msg: String) -> ! {
     std::process::exit(1);
 }
 
+/// f32 -> F16 bits, round-to-nearest-even, for normal-range values (the rows
+/// here are |v| <= 0.1, far from F16 overflow; subnormals flush to the nearest
+/// normal or zero, which the device cast matches for these inputs).
+fn f16_bits(v: f32) -> u16 {
+    let u = v.to_bits();
+    let sign = ((u >> 16) & 0x8000) as u16;
+    let e = ((u >> 23) & 0xff) as i32 - 127 + 15;
+    let man = u & 0x7f_ffff;
+    if e <= 0 {
+        return sign;
+    }
+    let mut r = ((e as u32) << 10) | (man >> 13);
+    let rem = man & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && r & 1 == 1) {
+        r += 1;
+    }
+    sign | r as u16
+}
+
+fn f16_value(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+    let e = ((h >> 10) & 0x1f) as i32;
+    if e == 0 {
+        return sign * 0.0;
+    }
+    sign * (1.0 + (h & 0x3ff) as f32 / 1024.0) * 2f32.powi(e - 15)
+}
+
 /// xorshift64*, deterministic.
 struct Rng(u64);
 impl Rng {
@@ -146,7 +174,8 @@ fn case(rng: &mut Rng, rows: usize) -> Case {
         let sum: f32 = w.iter().sum();
         weights.extend(w.iter().map(|v| v / sum));
     }
-    let x = (0..rows * DIM).map(|_| (rng.unit() - 0.5) * 0.2).collect();
+    // F16-exact, so the F16 leg carries the reference's own values.
+    let x = (0..rows * DIM).map(|_| f16_value(f16_bits((rng.unit() - 0.5) * 0.2))).collect();
     Case { rows, ids, weights, x }
 }
 
@@ -210,19 +239,27 @@ fn main() {
     let scratch = ColdPrefillScratch::new(&mut gpu, cfg).unwrap_or_else(|e| fail(format!("scratch: {e:?}")));
 
     // The prefill mailbox fields (coherent, as the real mailbox).
-    let x_mb = pinned(&gpu, MAX_ROWS * DIM * 4, true).cast::<f32>();
+    // Rows travel as F16 and the partial as BF16 (hetero_mailbox::PrefillGeometry).
+    let x_mb = pinned(&gpu, MAX_ROWS * DIM * 2, true).cast::<u16>();
     let ids_mb = pinned(&gpu, MAX_ROWS * TOP_K * 4, true).cast::<i32>();
     let w_mb = pinned(&gpu, MAX_ROWS * TOP_K * 4, true).cast::<f32>();
-    let part_mb = pinned(&gpu, MAX_ROWS * DIM * 4, true).cast::<f32>();
+    let part_mb = pinned(&gpu, MAX_ROWS * DIM * 2, true).cast::<u16>();
     let io = ColdPrefillIo { x_norm: x_mb as u64, ids: ids_mb as u64, weights: w_mb as u64, partial: part_mb as u64 };
-    let partial = || unsafe { std::slice::from_raw_parts(part_mb, MAX_ROWS * DIM) }.to_vec();
+    // SAFETY: the pinned BF16 partial of MAX_ROWS rows.
+    let partial = || -> Vec<f32> {
+        unsafe { std::slice::from_raw_parts(part_mb, MAX_ROWS * DIM) }
+            .iter()
+            .map(|&b| f32::from_bits((b as u32) << 16))
+            .collect()
+    };
     let run_on = |gpu: &mut Gpu, layer: &ColdPrefillLayer, c: &Case| {
         // SAFETY: mailbox buffers of MAX_ROWS rows; rows <= MAX_ROWS.
         unsafe {
-            std::ptr::copy_nonoverlapping(c.x.as_ptr(), x_mb, c.x.len());
+            let x16: Vec<u16> = c.x.iter().map(|&v| f16_bits(v)).collect();
+            std::ptr::copy_nonoverlapping(x16.as_ptr(), x_mb, x16.len());
             std::ptr::copy_nonoverlapping(c.ids.as_ptr(), ids_mb, c.ids.len());
             std::ptr::copy_nonoverlapping(c.weights.as_ptr(), w_mb, c.weights.len());
-            std::slice::from_raw_parts_mut(part_mb, MAX_ROWS * DIM).fill(SENTINEL);
+            std::slice::from_raw_parts_mut(part_mb, MAX_ROWS * DIM).fill((SENTINEL.to_bits() >> 16) as u16);
         }
         run_cold_prefill(gpu, layer, &scratch, c.rows, io).unwrap_or_else(|e| fail(format!("run {} rows: {e:?}", c.rows)));
         gpu.hip.device_synchronize().unwrap();

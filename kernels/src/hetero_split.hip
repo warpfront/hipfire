@@ -7,8 +7,10 @@
 // USB4 link has no PCIe atomics), and every wait is bounded.
 //
 // Primary:  hetero_token_advance, hetero_publish_cold, hetero_await_cold,
-//           hetero_install_cold.
-// Expert:   hetero_mask_hot, hetero_store_seq.
+//           hetero_install_cold; prefill: hetero_publish_rows,
+//           hetero_release_rows, hetero_add_partial.
+// Expert:   hetero_mask_hot, hetero_store_seq; prefill: hetero_f16_to_f32,
+//           hetero_f32_to_bf16.
 
 #include <hip/hip_runtime.h>
 
@@ -105,12 +107,13 @@ extern "C" __global__ void hetero_install_cold(
     for (int i = threadIdx.x; i < dim; i += blockDim.x) dst[i] = src[i];
 }
 
-// Prefill (grid-stride, any grid). Copy a chunk's rotated rows and routing into
-// the prefill slot and write the primary's masked ids (cold -> -1). The request
-// itself is released by hetero_release_rows after this kernel completes, so the
-// expert device never sees a request before every block's copy landed.
+// Prefill (grid-stride, any grid). Convert a chunk's normed rows to F16 in the
+// primary's local staging (a copy engine moves them across the link), write
+// the route straight into the prefill slot (small), and the primary's masked
+// ids (cold -> -1). Requests are released per sub-chunk by
+// hetero_release_rows after the staging copy, never by this kernel.
 extern "C" __global__ void hetero_publish_rows(
-    const float* __restrict__ x_rot,
+    const float* __restrict__ x_norm,
     const int* __restrict__ ids,
     const float* __restrict__ weights,
     const unsigned char* __restrict__ cold_bitmap,
@@ -118,13 +121,13 @@ extern "C" __global__ void hetero_publish_rows(
     int rows,
     int top_k,
     int dim,
-    float* mb_x,
+    _Float16* __restrict__ x_f16,
     int* mb_ids,
     float* mb_w,
     int* masked_ids) {
     const long long stride = (long long)gridDim.x * blockDim.x;
     const long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    for (long long i = tid; i < (long long)rows * dim; i += stride) mb_x[i] = x_rot[i];
+    for (long long i = tid; i < (long long)rows * dim; i += stride) x_f16[i] = (_Float16)x_norm[i];
     for (long long s = tid; s < (long long)rows * top_k; s += stride) {
         const int e = ids[s];
         mb_ids[s] = e;
@@ -133,34 +136,59 @@ extern "C" __global__ void hetero_publish_rows(
     }
 }
 
-// Prefill, one thread: record the layer and row count, then release the
-// request sequence (after hetero_publish_rows on the same stream).
+// Prefill, one thread: record one sub-chunk's layer, first row and row count
+// on its meta line, then release its request word. Queued after the copy of
+// the sub-chunk's rows (and after hetero_publish_rows) on the same stream.
 extern "C" __global__ void hetero_release_rows(
     const unsigned* __restrict__ counter,
     unsigned layer,
     unsigned layers,
+    int row_off,
     int rows,
-    unsigned* mb_layer,
-    unsigned* mb_rows,
+    unsigned* meta,
     unsigned* req_seq) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
-    hs_store(mb_layer, layer);
-    hs_store(mb_rows, (unsigned)rows);
+    hs_store(meta, layer);
+    hs_store(meta + 1, (unsigned)row_off);
+    hs_store(meta + 2, (unsigned)rows);
     __threadfence_system();
     hs_store(req_seq, hs_seq(counter[0], layer, layers));
 }
 
-// Prefill (grid-stride): x_batch += the expert device's weighted cold partial,
-// skipped entirely when the wait timed out.
+// Prefill (grid-stride): x_batch += the expert device's BF16 cold partial (in
+// the primary's local memory after the copy back), skipped entirely when any
+// sub-chunk's wait timed out (the shared error word).
 extern "C" __global__ void hetero_add_partial(
     const unsigned* error,
-    const float* partial,
+    const unsigned short* __restrict__ partial,
     int n,
     float* __restrict__ x_batch) {
     if (hs_load(error) != 0u) return;
     const long long stride = (long long)gridDim.x * blockDim.x;
     for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
-        x_batch[i] += partial[i];
+        x_batch[i] += __uint_as_float((unsigned)partial[i] << 16);
+    }
+}
+
+// Expert device (grid-stride): F16 rows from the prefill slot -> F32 scratch.
+extern "C" __global__ void hetero_f16_to_f32(const _Float16* src, float* __restrict__ dst, int n) {
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) dst[i] = (float)src[i];
+}
+
+// Expert device (grid-stride): F32 partial -> BF16 in the prefill slot,
+// round-to-nearest-even (exact for the BF16-exact partial; NaN stays NaN).
+extern "C" __global__ void hetero_f32_to_bf16(const float* __restrict__ src, unsigned short* dst, int n) {
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        const unsigned u = __float_as_uint(src[i]);
+        unsigned short b;
+        if ((u & 0x7fffffffu) > 0x7f800000u) {
+            b = (unsigned short)((u >> 16) | 0x40u);
+        } else {
+            b = (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+        }
+        dst[i] = b;
     }
 }
 
