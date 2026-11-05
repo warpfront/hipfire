@@ -1523,11 +1523,8 @@ fn gated_delta_step_gate_wmma_arms(
             "gated_delta_qk_norm_bf16_batched",
         )?;
     }
-    gpu.ensure_kernel_public(
-        gdn_chunk_module_name(format, arms.q8_inline, false),
-        gdn_chunk_source(format, arms.q8_inline, false),
-        gdn_chunk_kernel_name(format, arms.q8_inline, false),
-    )?;
+    // The PM twin (`gated_delta_chunk_pm`) or the hipcc kernel; same kernargs, grid and block.
+    let chunk_kernel = gpu.gdn_chunk_ensure(format, arms.q8_inline, false)?;
     // With `qk_prenormed` the convolution already stored the normalized Q/K
     // in this same scratch (`gated_delta_conv_params_qknorm_batched`).
     if !arms.qk_prenormed {
@@ -1601,7 +1598,7 @@ fn gated_delta_step_gate_wmma_arms(
     });
     args.pad_to(16);
     gpu.launch_blob_recorded(
-        gdn_chunk_kernel_name(format, arms.q8_inline, false),
+        chunk_kernel,
         [checked_u32(p.value_heads, "GDN chunk head grid")?, 1, 1],
         [256, 1, 1],
         0,

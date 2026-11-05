@@ -46,6 +46,7 @@ pub mod gated_delta_vector;
 pub mod gated_delta_vector_chunk;
 #[cfg(feature = "deltanet")]
 pub mod gated_delta_vector_pm;
+pub mod gated_delta_chunk_pm;
 pub mod gdn_chunk_prep_pm;
 #[cfg(test)]
 mod gdn_q8ef_reference;

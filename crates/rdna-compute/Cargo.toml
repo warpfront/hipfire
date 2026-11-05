@@ -1310,3 +1310,7 @@ required-features = ["deltanet"]
 [[example]]
 name = "argmax_regrid_pm_oracle"
 required-features = ["lab"]
+
+[[example]]
+name = "gdn_chunk_pm_oracle"
+required-features = ["lab"]

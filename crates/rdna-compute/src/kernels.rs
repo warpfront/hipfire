@@ -5601,6 +5601,46 @@ pub const GATED_DELTA_VECTOR_PM_GFX1201: &[u8] =
 /// Bare lowercase SHA-256 of [`GATED_DELTA_VECTOR_PM_GFX1201`], without a newline.
 pub const GATED_DELTA_VECTOR_PM_GFX1201_SHA256: &str =
     include_str!("../../../kernels/gated_delta_vector_pm_gfx1201.hxaco.sha256");
+/// gfx1151 PM twin of the chunked-GDN recurrence kernel `gated_delta_chunk_gate_wmma_pm_gfx1151` (F32 / Q8-scratch state): the shipped hipcc kernel under
+/// a renamed symbol, sealed by route A (`scripts/pm-hip-twin.sh`; `.text` sha256 equal to the incumbent compiled
+/// with the identical hipcc argv). Selected by `gated_delta_chunk_pm` (`HIPFIRE_GDN_CHUNK_PM=0` restores hipcc).
+pub const GATED_DELTA_CHUNK_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/gated_delta_chunk_pm_gfx1151.hxaco");
+/// Bare lowercase SHA-256 of [`GATED_DELTA_CHUNK_PM_GFX1151`], without a newline.
+pub const GATED_DELTA_CHUNK_PM_GFX1151_SHA256: &str =
+    include_str!("../../../kernels/gated_delta_chunk_pm_gfx1151.hxaco.sha256");
+/// gfx1151 PM twin of the chunked-GDN recurrence kernel `gated_delta_chunk_gate_wmma_arena_pm_gfx1151` (NPU trunk BF16 arena `z`): the shipped hipcc kernel under
+/// a renamed symbol, sealed by route A (`scripts/pm-hip-twin.sh`; `.text` sha256 equal to the incumbent compiled
+/// with the identical hipcc argv). Selected by `gated_delta_chunk_pm` (`HIPFIRE_GDN_CHUNK_PM=0` restores hipcc).
+pub const GATED_DELTA_CHUNK_ARENA_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/gated_delta_chunk_arena_pm_gfx1151.hxaco");
+/// Bare lowercase SHA-256 of [`GATED_DELTA_CHUNK_ARENA_PM_GFX1151`], without a newline.
+pub const GATED_DELTA_CHUNK_ARENA_PM_GFX1151_SHA256: &str =
+    include_str!("../../../kernels/gated_delta_chunk_arena_pm_gfx1151.hxaco.sha256");
+/// gfx1151 PM twin of the chunked-GDN recurrence kernel `gated_delta_chunk_gate_q8_wmma_pm_gfx1151` (inline plain-Q8 state): the shipped hipcc kernel under
+/// a renamed symbol, sealed by route A (`scripts/pm-hip-twin.sh`; `.text` sha256 equal to the incumbent compiled
+/// with the identical hipcc argv). Selected by `gated_delta_chunk_pm` (`HIPFIRE_GDN_CHUNK_PM=0` restores hipcc).
+pub const GATED_DELTA_CHUNK_Q8_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/gated_delta_chunk_q8_pm_gfx1151.hxaco");
+/// Bare lowercase SHA-256 of [`GATED_DELTA_CHUNK_Q8_PM_GFX1151`], without a newline.
+pub const GATED_DELTA_CHUNK_Q8_PM_GFX1151_SHA256: &str =
+    include_str!("../../../kernels/gated_delta_chunk_q8_pm_gfx1151.hxaco.sha256");
+/// gfx1151 PM twin of the chunked-GDN recurrence kernel `gated_delta_chunk_gate_q8_wmma_arena_pm_gfx1151`: the shipped hipcc kernel under
+/// a renamed symbol, sealed by route A (`scripts/pm-hip-twin.sh`; `.text` sha256 equal to the incumbent compiled
+/// with the identical hipcc argv). Selected by `gated_delta_chunk_pm` (`HIPFIRE_GDN_CHUNK_PM=0` restores hipcc).
+pub const GATED_DELTA_CHUNK_Q8_ARENA_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/gated_delta_chunk_q8_arena_pm_gfx1151.hxaco");
+/// Bare lowercase SHA-256 of [`GATED_DELTA_CHUNK_Q8_ARENA_PM_GFX1151`], without a newline.
+pub const GATED_DELTA_CHUNK_Q8_ARENA_PM_GFX1151_SHA256: &str =
+    include_str!("../../../kernels/gated_delta_chunk_q8_arena_pm_gfx1151.hxaco.sha256");
+/// gfx1100 PM twin of the chunked-GDN recurrence kernel `gated_delta_chunk_gate_wmma_pm_gfx1100` (F32 / Q8-scratch state): the shipped hipcc kernel under
+/// a renamed symbol, sealed by route A (`scripts/pm-hip-twin.sh`; `.text` sha256 equal to the incumbent compiled
+/// with the identical hipcc argv). Selected by `gated_delta_chunk_pm` (`HIPFIRE_GDN_CHUNK_PM=0` restores hipcc).
+pub const GATED_DELTA_CHUNK_PM_GFX1100: &[u8] =
+    include_bytes!("../../../kernels/gated_delta_chunk_pm_gfx1100.hxaco");
+/// Bare lowercase SHA-256 of [`GATED_DELTA_CHUNK_PM_GFX1100`], without a newline.
+pub const GATED_DELTA_CHUNK_PM_GFX1100_SHA256: &str =
+    include_str!("../../../kernels/gated_delta_chunk_pm_gfx1100.hxaco.sha256");
 /// gfx1100 PM twin of `gemm_mq4g256v2_moe_grouped_wmma_k2` (F32 entry):
 /// `gemm_mq4g256v2_moe_grouped_wmma_k2_pm_gfx1100`, the card-judged `R1Moe-04-xlds-w4-t2` candidate
 /// (64 rows per 128-lane block, tile_run 2, X through LDS) sealed by route A; same kernargs,

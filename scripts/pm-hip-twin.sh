@@ -8,6 +8,8 @@
 #   kernels/gemm_mq4g256v2_moe_grouped_k2_pm_gfx1100.hip
 #   kernels/gated_delta_vector_pm_gfx1201.hip          (the same two bodies, R9700 card judge)
 #   kernels/npu_trunk_pack_pm_gfx1151.hip              (Flash-Next A-pack K2560 / K5120, the incumbent bodies verbatim)
+#   kernels/gated_delta_chunk_{,arena_,q8_,q8_arena_}pm_gfx1151.hip, kernels/gated_delta_chunk_pm_gfx1100.hip
+#                                                      (GDN chunk recurrence twins; judged code = the incumbent hipcc .text)
 #
 # Each source is compiled with EXACTLY the runtime JIT argv (crates/rdna-compute/src/compiler.rs
 # `core_hipcc_flags` + the rocm path flags the card judge recorded in candidate.co.json), the
@@ -19,7 +21,8 @@
 # Writes kernels/<module>.hxaco, kernels/<module>.hxaco.sha256 and kernels/<module>.twin.json.
 #
 # Env: ROCM_PATH (default /opt/rocm/core), CARGO_TARGET_DIR, PM_TWIN_WORK (scratch dir, default
-#      <repo>/target/pm-hip-twin), PM_TWIN_ARCH (seal only that arch's modules; default all).
+#      <repo>/target/pm-hip-twin), PM_TWIN_ARCH (seal only that arch's modules; default all), PM_TWIN_MODULE (seal only
+#      the modules matching this glob; default all).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -41,23 +44,43 @@ TWIN_BIN="${CARGO_TARGET_DIR:-$REPO/target}/release/examples/hip_twin"
 
 # seal_module <arch> <module> <twin-src> <spec>...
 #   spec = twin_sym:incumbent_src:incumbent_sym:judged_candidate:judged_code_sha256
+#   (judged_code_sha256 may be `incumbent`: the incumbent's own sealed .text sha256; incumbent_src may be
+#   `arena@<file>`: the product NPU-arena source built from <file>)
 seal_module() {
   local arch="$1" module="$2" src="$3"
   shift 3
   if [[ -n "$ONLY_ARCH" && "$ONLY_ARCH" != "$arch" ]]; then return 0; fi
+  # shellcheck disable=SC2053
+  if [[ -n "${PM_TWIN_MODULE:-}" && "$module" != $PM_TWIN_MODULE ]]; then return 0; fi
   local dir="$WORK/$module"
   mkdir -p "$dir"
   hipcc_compile "$REPO/kernels/$src" "$dir/twin.co" "$arch"
   local args=(--in "$dir/twin.co" --arch "$arch" --out "$REPO/kernels/$module.hxaco" --report "$dir/report.json")
-  local spec i=0 tsym isrc isym
+  local spec i=0 tsym isrc isym label want resolved=() isrc_path
   for spec in "$@"; do
-    IFS=: read -r tsym isrc isym _ _ <<<"$spec"
-    hipcc_compile "$REPO/kernels/src/$isrc" "$dir/incumbent$i.co" "$arch"
+    IFS=: read -r tsym isrc isym label want <<<"$spec"
+    isrc_path="$REPO/kernels/src/$isrc"
+    if [[ "$isrc" == arena@* ]]; then
+      # The product arena twin source is `#define NPU_TRUNK_ARENA 1` + `#define <kernel> <kernel>_arena` +
+      # the shared source (npu_trunk_consumers.rs CHUNK_ARENA_SRC / CHUNK_Q8_ARENA_SRC), compiled from one file.
+      isrc_path="$dir/incumbent$i.hip"
+      printf '#define NPU_TRUNK_ARENA 1\n#define %s %s\n' "${isym%_arena}" "$isym" >"$isrc_path"
+      cat "$REPO/kernels/src/${isrc#arena@}" >>"$isrc_path"
+    fi
+    hipcc_compile "$isrc_path" "$dir/incumbent$i.co" "$arch"
     args+=(--kernel "$tsym" --abi-ref "$dir/incumbent$i.co" --abi-ref-symbol "$isym")
+    if [[ "$want" == incumbent ]]; then
+      # The judged code is the incumbent hipcc kernel itself: its `.text` sha256 is read from a seal of the
+      # incumbent object (same lift identity / hazard gates), so the twin must be byte-identical code.
+      "$TWIN_BIN" --in "$dir/incumbent$i.co" --arch "$arch" --out "$dir/incumbent$i.hxaco" \
+        --report "$dir/incumbent$i.report.json" --kernel "$isym" >/dev/null
+      want="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["text_sha256"])' "$dir/incumbent$i.report.json")"
+    fi
+    resolved+=("$tsym:$isrc:$isym:$label:$want")
     i=$((i + 1))
   done
   "$TWIN_BIN" "${args[@]}" >/dev/null
-  python3 - "$dir/report.json" "$REPO/kernels/$module.twin.json" "$module" "$arch" "$@" <<'PY'
+  python3 - "$dir/report.json" "$REPO/kernels/$module.twin.json" "$module" "$arch" "${resolved[@]}" <<'PY'
 import json, sys
 report_path, out_path, module, arch, *specs = sys.argv[1:]
 reports = json.load(open(report_path))
@@ -76,7 +99,7 @@ with open(out_path, "w") as f:
     json.dump({"module": module, "arch": arch, "reports": reports, "judged_text_check": judged}, f, indent=2)
     f.write("\n")
 if bad:
-    sys.exit("pm-hip-twin: rename/compile changed .text vs the card-judged candidate:\n  " + "\n  ".join(bad))
+    sys.exit("pm-hip-twin: rename/compile changed .text vs the judged code:\n  " + "\n  ".join(bad))
 PY
   echo "sealed kernels/$module.hxaco sha256 $(cat "$REPO/kernels/$module.hxaco.sha256")"
 }
@@ -103,3 +126,20 @@ seal_module gfx1201 gated_delta_vector_pm_gfx1201 gated_delta_vector_pm_gfx1201.
 seal_module gfx1151 npu_trunk_pack_pm_gfx1151 npu_trunk_pack_pm_gfx1151.hip \
   "npu_trunk_pack_a_bf16_pm:npu_trunk.hip:npu_trunk_pack_a_bf16:incumbent-hipcc:33b905ec30f54cf0cd09b9ea24d1f6d32406aaffd942b4ec5b78128dc06aaf5d" \
   "npu_trunk_pack_a_bf16_k5120_pm:npu_trunk.hip:npu_trunk_pack_a_bf16_k5120:incumbent-hipcc:812d6c31c54276fe6525b6741a5b043099ce117588b674b2a988873996d91943"
+
+# GDN chunk recurrence + gated RMSNorm (`gated_delta_chunk_gate_wmma` and the NPU-arena / inline-Q8 variants): the
+# shipped hipcc kernel itself, renamed by a macro before `#include`-ing the shared source (no copy of the source).
+# The judged code is the incumbent hipcc object compiled with the identical argv (`incumbent`: the twin `.text`
+# sha256 must equal the incumbent's). Product defines: arena = `NPU_TRUNK_ARENA` + `<kernel>_arena` rename
+# (npu_trunk_consumers.rs CHUNK_ARENA_SRC / CHUNK_Q8_ARENA_SRC; the `arena@` prefix builds that source).
+# gfx1151 serves all four; gfx1100 serves the F32 chunk kernel (the NPU arena and inline-Q8 arms are gfx1151 only).
+seal_module gfx1151 gated_delta_chunk_pm_gfx1151 gated_delta_chunk_pm_gfx1151.hip \
+  "gated_delta_chunk_gate_wmma_pm_gfx1151:gated_delta_chunk_wmma.gfx1151.hip:gated_delta_chunk_gate_wmma:incumbent-hipcc:incumbent"
+seal_module gfx1151 gated_delta_chunk_arena_pm_gfx1151 gated_delta_chunk_arena_pm_gfx1151.hip \
+  "gated_delta_chunk_gate_wmma_arena_pm_gfx1151:arena@gated_delta_chunk_wmma.gfx1151.hip:gated_delta_chunk_gate_wmma_arena:incumbent-hipcc:incumbent"
+seal_module gfx1151 gated_delta_chunk_q8_pm_gfx1151 gated_delta_chunk_q8_pm_gfx1151.hip \
+  "gated_delta_chunk_gate_q8_wmma_pm_gfx1151:gated_delta_chunk_q8_wmma.gfx1151.hip:gated_delta_chunk_gate_q8_wmma:incumbent-hipcc:incumbent"
+seal_module gfx1151 gated_delta_chunk_q8_arena_pm_gfx1151 gated_delta_chunk_q8_arena_pm_gfx1151.hip \
+  "gated_delta_chunk_gate_q8_wmma_arena_pm_gfx1151:arena@gated_delta_chunk_q8_wmma.gfx1151.hip:gated_delta_chunk_gate_q8_wmma_arena:incumbent-hipcc:incumbent"
+seal_module gfx1100 gated_delta_chunk_pm_gfx1100 gated_delta_chunk_pm_gfx1100.hip \
+  "gated_delta_chunk_gate_wmma_pm_gfx1100:gated_delta_chunk_wmma.gfx1151.hip:gated_delta_chunk_gate_wmma:incumbent-hipcc:incumbent"
