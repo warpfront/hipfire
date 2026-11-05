@@ -631,10 +631,10 @@ impl State {
                 Special::ExecHi if self.lanes == 64 => {
                     self.exec = (self.exec & 0xffff_ffff) | u64::from(value) << 32
                 }
-                Special::VccHi if self.lanes == 64 => {
-                    self.vcc = (self.vcc & 0xffff_ffff) | u64::from(value) << 32
-                }
-                Special::ExecHi | Special::VccHi => (),
+                // wave32: VCC_HI is ordinary scalar data (hipcc allocates it as a general SGPR); only wave64 aliases it
+                // with the mask, but in both cases the write must land, never be dropped.
+                Special::VccHi => self.vcc = (self.vcc & 0xffff_ffff) | u64::from(value) << 32,
+                Special::ExecHi => (),
                 Special::Scc => self.scc = value != 0,
                 Special::M0 => self.m0 = value,
                 Special::Null => (),
