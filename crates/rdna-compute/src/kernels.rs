@@ -10647,6 +10647,7 @@ pub const HC_FINALIZE_INPUT_MAP_SRC: &str =
     include_str!("../../../kernels/src/hc_finalize_input_map.hip");
 
 pub const ZERO_F32_SRC: &str = include_str!("../../../kernels/src/zero_f32.hip");
+pub const HETERO_SPLIT_SRC: &str = include_str!("../../../kernels/src/hetero_split.hip");
 
 /// Zero inactive rows for EP routed partials / final hidden isolation.
 /// Masked sibling writes exact +0.0f only to inactive rows (row = lane).

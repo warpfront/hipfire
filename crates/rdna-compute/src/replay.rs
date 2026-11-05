@@ -1278,6 +1278,25 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             Some(vec![read(0), write(8), read(16)])
         }
         "zero_f32" => Some(vec![write(0)]),
+        // Device-side hetero expert split (kernels/src/hetero_split.hip). The
+        // mailbox fields are pinned host memory written across the link.
+        "hetero_token_advance" => Some(vec![write(0)]),
+        "hetero_publish_cold" => Some(vec![
+            read(0),
+            read(16),
+            read(24),
+            read(32),
+            read(40),
+            write(64),
+            write(72),
+            write(80),
+            write(88),
+            write(96),
+        ]),
+        "hetero_await_cold" => Some(vec![read(0), read(16), write(24)]),
+        "hetero_install_cold" => Some(vec![read(0), read(8), read(16), read(24), write(40)]),
+        "hetero_mask_hot" => Some(vec![read(0), read(8), write(24)]),
+        "hetero_store_seq" => Some(vec![read(0), write(8)]),
         "rotate_with_rms_gfx1100" => Some(vec![
             read(0),
             read(8),
