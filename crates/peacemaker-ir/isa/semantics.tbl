@@ -2,8 +2,10 @@
 # This table is interpreter dispatch, not a full-domain numerical certificate.
 # The bounded replay gate is QSA convert/attend and sym NT4 gate_up/down.
 # A row means the interpreter has a model for the name; the model itself refuses every unmeasured modifier or
-# architecture at execution. Rows with an architecture-limited model: v_wmma_f32_16x16x16_bf16 (gfx1201 measured;
-# gfx1151 historical corpus only, fresh receipt pending), v_dot2_f32_f16/bf16 (gfx1201 only), and the gfx1201-only
+# architecture at execution. Rows with an architecture-limited model: v_wmma_f32_16x16x16_bf16 (gfx1201 and gfx1151
+# measured, gfx1151 by the Halo receipt of 2026-11-05, BDF 0000:c0:00.0, fabric job j4390: 0 mismatches over 27,624,704
+# BF16 words, controls/Cartesian/subnormal/C-tail/random, MODE variants, neg_lo/neg_hi; gfx1100 refused),
+# v_dot2_f32_f16/bf16 (gfx1201 and gfx1151, same Halo receipt; gfx1100 refused), and the gfx1201-only
 # SWMMAC rows v_swmmac_f32_16x16x32_f16/bf16 and v_swmmac_i32_16x16x32_iu8/iu4/x64_iu4 (index_key 0/1, measured
 # neg_lo/neg_hi, integer two-half CLAMP; accumulator NEG[2], float CLAMP and other OPSEL bits refused). The six
 # rows v_swmmac_f16_16x16x32_f16, v_swmmac_bf16_16x16x32_bf16 and v_swmmac_f32_16x16x32_{fp8,bf8}_{fp8,bf8} execute

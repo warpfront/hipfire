@@ -31,6 +31,8 @@ mod gfx11_decode_gap_tests;
 #[cfg(test)]
 mod gfx12_decode_gap_tests;
 mod hw;
+#[cfg(test)]
+mod hw_replay;
 pub use hw::RunReport;
 mod memory;
 pub mod mma;

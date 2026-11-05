@@ -322,10 +322,15 @@ pub fn wmma_i32_iu4(arch: Arch, a: &[i8], b: &[i8], c: i32, clamp: bool) -> i32 
 }
 
 /// IU8 WMMA dot over decoded bytes (signed -128..127 or unsigned 0..255 according to each operand's own NEG_LO flag,
-/// hence 16-bit carriers), K = 16, in physical K order. Without CLAMP the exact sum wraps modulo 2^32. GFX1201
-/// receipt `rcpt/gfx1201-C-r1` (0 mismatches over 295,680 words per clamp variant): CLAMP saturates to i32 after
-/// `C + products(K 0..8)` and AGAIN after adding `products(K 8..16)` (a single final saturation has 4,864
-/// mismatches, per-4-K 372, per-product 1,291). GFX1151 CLAMP has no receipt and is refused.
+/// hence 16-bit carriers), K = 16, in physical K order. Without CLAMP the exact sum wraps modulo 2^32.
+/// With CLAMP the accumulator saturates to i32 at architecture-specific points:
+/// * GFX1201 receipt `rcpt/gfx1201-C-r1` (0 mismatches over 295,680 words per clamp variant): after
+///   `C + products(K 0..8)` and AGAIN after adding `products(K 8..16)` (a single final saturation has 4,864
+///   mismatches, per-4-K 372, per-product 1,291).
+/// * GFX1151 receipt `pmrevive/PmBf16Halo/rcpt` (Halo, BDF 0000:c0:00.0; 0 mismatches over 295,680 words for each of
+///   the four clamp variants): after `C + products(K 0..2)` and again after every following K pair (eight
+///   saturating steps; one final saturation has 5,296 mismatches in each signed-B variant, two halves 611, per-4-K
+///   430, per-product 1,024).
 pub fn wmma_i32_iu8(arch: Arch, a: &[i16], b: &[i16], c: i32, clamp: bool) -> Result<i32, String> {
     if !matches!(arch, Arch::Gfx1151 | Arch::Gfx1201) {
         return Err(format!(
@@ -336,34 +341,47 @@ pub fn wmma_i32_iu8(arch: Arch, a: &[i16], b: &[i16], c: i32, clamp: bool) -> Re
     if !clamp {
         return Ok(integer_dot(a, b, c, false));
     }
-    if arch != Arch::Gfx1201 {
-        return Err(format!("IU8 WMMA CLAMP is not measured on {arch:?}"));
+    if arch == Arch::Gfx1151 {
+        return Ok(clamped_steps(a, b, c, 2));
     }
-    let half = integer_dot(&a[..8], &b[..8], c, true);
-    Ok(integer_dot(&a[8..], &b[8..], half, true))
+    Ok(clamped_steps(a, b, c, 8))
 }
 
-/// `v_dot2_f32_f16` / `v_dot2_f32_bf16` on GFX1201: exactly one two-term pair step of the WMMA FP32 accumulation
-/// (`dot_step` with pair grids and the threshold-23 accumulator rule). Receipt
-/// `pm-opcode-fill-numerics/rcpt/gfx1201-C-r1`: 0 mismatches over 1,321,984 full-set words x 8 MODE settings per
-/// opcode (NaN payloads, infinities, denormals in and out, -0) and 99,742 words x 15 modifier variants; round and
-/// denorm MODE and CLAMP have no effect. GFX1151/GFX1100 have no receipt and are refused.
+/// Saturating integer dot: `acc = sat_i32(acc + products(chunk))` for every `step`-long chunk of K in order.
+fn clamped_steps<T: Copy + Into<i64>>(a: &[T], b: &[T], c: i32, step: usize) -> i32 {
+    a.chunks(step)
+        .zip(b.chunks(step))
+        .fold(c, |acc, (a, b)| integer_dot(a, b, acc, true))
+}
+
+/// `v_dot2_f32_f16` / `v_dot2_f32_bf16`: exactly one two-term pair step of the architecture's WMMA FP32
+/// accumulation (`dot_step`).
+/// * GFX1201: pair grids and the threshold-23 accumulator rule. Receipt
+///   `pm-opcode-fill-numerics/rcpt/gfx1201-C-r1`: 0 mismatches over 1,321,984 full-set words x 8 MODE settings per
+///   opcode (NaN payloads, infinities, denormals in and out, -0) and 99,742 words x 15 modifier variants; round and
+///   denorm MODE and CLAMP have no effect.
+/// * GFX1151: the same chain as one GFX11 step (`gfx11 = true`: flushed FP32 C and BF16 factors, one's-complement
+///   sign frame). Receipt `pmrevive/PmBf16Halo/rcpt` (Halo, BDF 0000:c0:00.0): 0 mismatches over 1,321,984 full-set
+///   words x 8 MODE settings and 99,742 words x 15 modifier variants per opcode; MODE and CLAMP have no effect.
+/// GFX1100 has no receipt and is refused.
 pub fn dot2_f32(arch: Arch, a: [u16; 2], b: [u16; 2], c: u32, bf16: bool) -> Result<u32, String> {
-    if arch != Arch::Gfx1201 {
-        return Err(format!("floating-point dot2 is not qualified on {arch:?}"));
+    match arch {
+        Arch::Gfx1201 => Ok(dot_step(&a, &b, c, bf16, false)),
+        Arch::Gfx1151 => Ok(dot_step(&a, &b, c, bf16, true)),
+        _ => Err(format!("floating-point dot2 is not qualified on {arch:?}")),
     }
-    Ok(dot_step(&a, &b, c, bf16, false))
 }
 
 /// `v_dot4_i32_iu8` / `v_dot8_i32_iu4`: the ISA pseudocode sums every decoded product and `S2.i32` in a signed
 /// accumulator and wraps the dword. GFX1201 probe (0 mismatches over 402,304 full-grid evaluations plus 72,304
-/// per modifier set): the sum is exact and CLAMP is ONE final signed i32 saturation. GFX1151/GFX1100 have no probe
-/// receipt yet, so CLAMP there is refused rather than assumed.
+/// per modifier set) and GFX1151 probe (Halo receipt `pmrevive/PmBf16Halo/rcpt`, same sets, 0 mismatches for both
+/// opcodes): the sum is exact and CLAMP is ONE final signed i32 saturation (per-term saturation refuted: 1,674-2,322
+/// mismatches in each signed clamp variant on GFX1151). GFX1100 has no probe receipt, so CLAMP there is refused.
 pub fn dot_i32(arch: Arch, a: &[i32], b: &[i32], c: i32, clamp: bool) -> Result<i32, String> {
     if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
         return Err(format!("integer dot is not defined for {arch:?}"));
     }
-    if clamp && arch != Arch::Gfx1201 {
+    if clamp && arch == Arch::Gfx1100 {
         return Err(format!(
             "CLAMP on an integer dot product is not measured on {arch:?}"
         ));

@@ -11,7 +11,7 @@
 //
 // Build (CPU only, no GPU launch):  build.sh <gfx1151|gfx1201> [outdir]
 // Run (inside a bounded fabric hold):  numerics_probe <outdir> <suite[,suite...]|all>
-//   suites: identity dot wmma iu8 swmmac_map swmmac_num swmmac_valid; opt-in (not in `all`): div_scale scalar_udiv maxmin
+//   suites: identity dot wmma iu8 swmmac_map swmmac_num swmmac_valid; opt-in (not in `all`): div_scale scalar_udiv maxmin iu8_clamp
 // Output per test: <name>.json (schema/meta, mode request + MODE readback) and <name>.out.bin / <name>.in.bin.
 #include <hip/hip_runtime.h>
 #include <cstdarg>
@@ -626,6 +626,44 @@ static void suite_wmma() {
 }
 static void suite_iu8() { run_wset(3, make_iu8_set(0x1a8), "iu8"); }
 
+// Opt-in suite `iu8_clamp`: IU8 WMMA CLAMP discriminators for every operand-signedness combination. The `iu8` set's ladders put the
+// negative bytes on B only, so a rule that differs between "saturate once at the end" and "saturate after K groups" is only
+// exercised when B is signed. Here C sits within a few hundred thousand of INT_MAX / INT_MIN (partial sums of 16 products of up to
+// 128*128 cross the rail and come back) and the sign pattern is carried by A, by B, or by both, so v4..v7 (clamp x neg_lo[0]/[1])
+// each see waves where the saturation points change the result.
+static WSet make_iu8_clamp_set(uint64_t seed) {
+  WSet s;
+  Rng g(seed);
+  { WCase c = zero_case(); for (int i = 0; i < 16; i++) c.A[i * 16 + i] = 1; for (int k = 0; k < 16; k++) for (int j = 0; j < 16; j++) c.Bt[j * 16 + k] = uint16_t((k * 16 + j) & 255); s.cs.push_back(c); }
+  { WCase c = zero_case(); for (int i = 0; i < 256; i++) c.C[i] = 0x01000000u + uint32_t(i) * 0x10001u; s.cs.push_back(c); }
+  { WCase c = zero_case(); for (int j = 0; j < 16; j++) c.Bt[j * 16 + j] = 1; for (int i = 0; i < 256; i++) c.A[i] = uint16_t(i & 255); s.cs.push_back(c); }
+  for (int w = 0; w < 8000; w++) {
+    WCase c = zero_case();
+    const int style = w & 3;  // 0 random bytes | 1 sign ladder on A | 2 sign ladder on B | 3 sign ladders on both
+    const int pat = int(g.below(8));
+    auto ladder_sign = [&](int k) { return (pat & 1) ? (k >= 8 ? -1 : 1) : (pat & 2) ? (k < 8 ? -1 : 1) : (pat & 4) ? ((k & 2) ? -1 : 1) : ((k & 1) ? -1 : 1); };
+    for (int r = 0; r < 16; r++)
+      for (int k = 0; k < 16; k++) {
+        uint32_t ra = g.u32() & 255, rb = g.u32() & 255;
+        if (style == 1 || style == 3) ra = uint8_t(ladder_sign(k) * int(1 + (ra & 127)));
+        else if (style == 2) ra = 1 + (ra & 127);
+        if (style == 2 || style == 3) rb = uint8_t(ladder_sign(k) * int(1 + (rb & 127)));
+        else if (style == 1) rb = 1 + (rb & 127);
+        c.A[r * 16 + k] = uint16_t(ra);
+        c.Bt[r * 16 + k] = uint16_t(rb);
+      }
+    for (int i = 0; i < 256; i++) {
+      const uint32_t d = g.below(4) == 0 ? g.below(64) : g.below(700000);
+      c.C[i] = g.below(2) ? uint32_t(INT32_MAX) - d : uint32_t(INT32_MIN) + d;
+    }
+    s.cs.push_back(c);
+  }
+  s.n_sub = s.cs.size();
+  s.layout = "controls(3) random sign-ladder waves with C within 700000 of INT_MAX/INT_MIN (8000)";
+  return s;
+}
+static void suite_iu8_clamp() { run_wset(3, make_iu8_clamp_set(0x1a8c1a), "iu8c"); }
+
 // ============================================================================================== SWMMAC (gfx12)
 // Raw register images, so the index/fragment mapping is discovered rather than assumed.
 struct SCase { uint32_t a[4][32]; uint32_t b[8][32]; uint32_t idx[32]; uint32_t c[8][32]; };
@@ -1105,6 +1143,7 @@ int main(int argc, char** argv) {
   if (exact("div_scale")) suite_div_scale();
   if (exact("scalar_udiv")) suite_scalar_udiv();
   if (exact("maxmin")) suite_maxmin();
+  if (exact("iu8_clamp")) suite_iu8_clamp();
   std::string idx;
   for (auto& n : INDEX) idx += n + "\n";
   write_text(OUT + "/INDEX.txt", idx);

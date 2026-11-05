@@ -2123,28 +2123,39 @@ mod tests {
         }
     }
 
-    // gfx1151 IU8 CLAMP has no receipt: refused; the unclamped wrap is unchanged.
+    // gfx1151 IU8 CLAMP (Halo receipt pmrevive/PmBf16Halo/rcpt, 295,680 words per clamp variant, 0 mismatches):
+    // the accumulator saturates after `C + products(K 0..2)` and again after every following K pair. One final
+    // saturation (or the gfx1201 two-halves rule) gives a different word; the unclamped wrap is unchanged.
     #[test]
-    fn gfx1151_iu8_clamp_is_refused() {
-        let mut st = state();
-        let clamped = Modifiers {
-            clamp: true,
-            ..mods(3, 0)
+    fn gfx1151_iu8_clamp_saturates_after_every_k_pair() {
+        // D[0,0] = C[0,0] + sum_k A[0,k] * B[k,0], A/B signed: k0,k1 give +127*127 each (the pair overshoots
+        // C = MAX-100 and saturates), k2,k3 give -128*127 each (pull the saturated value back); k >= 4 are zero.
+        let run = |clamp: bool| -> i32 {
+            let mut st = state();
+            // gfx11 fragments are replicated across lanes 0..15 and 16..31: A row 0 / B col 0 sit in lanes 0 and 16,
+            // byte k in VGPR k>>2, byte k&3.
+            for lane in [0usize, 16] {
+                st.v[usize::from(A)][lane] = 0x8080_7f7f;
+                st.v[usize::from(B)][lane] = 0x7f7f_7f7f;
+            }
+            st.v[usize::from(C)][0] = (i32::MAX - 100) as u32;
+            let m = Modifiers {
+                clamp,
+                ..mods(3, 0)
+            };
+            let i = insn(
+                Arch::Gfx1151,
+                "v_wmma_i32_16x16x16_iu8",
+                [reg(D, 8), reg(A, 4), reg(B, 4), reg(C, 8)],
+                m,
+            );
+            execute(Arch::Gfx1151, "v_wmma_i32_16x16x16_iu8", &i, &mut st).unwrap();
+            st.v[usize::from(D)][0] as i32
         };
-        let i = insn(
-            Arch::Gfx1151,
-            "v_wmma_i32_16x16x16_iu8",
-            [reg(D, 8), reg(A, 4), reg(B, 4), reg(C, 8)],
-            clamped,
-        );
-        assert!(execute(Arch::Gfx1151, "v_wmma_i32_16x16x16_iu8", &i, &mut st).is_err());
-        let plain = insn(
-            Arch::Gfx1151,
-            "v_wmma_i32_16x16x16_iu8",
-            [reg(D, 8), reg(A, 4), reg(B, 4), reg(C, 8)],
-            mods(3, 0),
-        );
-        assert!(execute(Arch::Gfx1151, "v_wmma_i32_16x16x16_iu8", &plain, &mut st).is_ok());
+        let exact = i64::from(i32::MAX) - 100 + 2 * 127 * 127 - 2 * 128 * 127;
+        assert_eq!(run(false), exact as i32);
+        // Pair rule: sat(MAX-100+32258) = MAX, then MAX - 32512; one final saturation would give MAX - 354.
+        assert_eq!(run(true), i32::MAX - 2 * 128 * 127);
     }
 
     #[test]
