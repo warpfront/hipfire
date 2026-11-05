@@ -12,6 +12,7 @@ use std::sync::LazyLock;
 /// Lower row bound of the Qwen4 lane WMMA route (`HIPFIRE_QWEN4_LANE_WMMA`, [`Gpu::lane_wmma_applies`]); the upper
 /// bound is [`WIDE_VERIFY_MAX_ROWS`]. Measured on R9700 layer 4 cold: HC down/up and the dense BF16 rows beat the
 /// SIMT all-rows kernels from 16 rows; <= 8-row decode/verify keeps the bitwise SIMT path.
+// selector-receipt: receipts/selectors/qwen4_lane_wmma_min_rows.json
 pub const LANE_WMMA_MIN_ROWS: usize = 16;
 
 // The hybrid-buffer MoE gate/up kernel stays compiled but is never selected:
