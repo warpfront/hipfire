@@ -861,6 +861,7 @@ Policy owner: [`REDLINE.md`](REDLINE.md) (**shipped / ref-pinned**). Timing is n
 |---|---|
 | `HIPFIRE_DPM_WARMUP_SECS` | DPM warmup before timing |
 | `HIPFIRE_HOST_TIMING=1` | Host timing JSON |
+| `HIPFIRE_HOST_SITE_LEDGER=<dir>` | Developer diagnostic (lab census, never for timing). Every host synchronization (stream / event / device), HIP copy or memset and HIP allocation / free issued through `hip-bridge`, plus the EP AR host arrival gate wait, appends one line to `<dir>/ledger-<pid>.tsv` with its start, the host time blocked inside the call, bytes and the caller's return-address stack; `<dir>/maps-<pid>.txt` holds `/proc/self/maps` for offline symbolization (build with `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` for `file:line`). With `HIPFIRE_CB_PHASES=1` each served lane step also writes a step mark, so a census divides every call site per decode step. Off (default) each hook is one relaxed atomic load. |
 | `HIPFIRE_PROFILE` / `HIPFIRE_PROFILE_DECODE` / `HIPFIRE_PROFILE_CYCLES` | Profiling |
 | `HIPFIRE_DETERMINISTIC` | Determinism toggles in dispatch |
 | `HIPFIRE_STREAM_ORDERED_COPIES` | On; `0` off (developer). The blocking copies and fills of steady-state serving (Qwen4 lane top-1 / draft / logits readbacks, head-prologue and lane token-id uploads, lane and state reset memsets, the D2 tail log readback, and the first-request FWHT sign and HC/GDN counter initializers) run on the rank's active stream with one wait on it (`Gpu::dtoh_stream_ordered` / `upload_stream_ordered` / `memset_stream_ordered`), not on the legacy null stream. A blocking null-stream copy puts a packet on the null stream's own hardware queue, and that packet waits for the work queued on the compute stream. In about 1 in 5 fresh EP2 loads the queue mapper put that queue on the same CP pipe as the compute queue. The CP then time-sliced the two queues: 43% of dispatches on that card took 15.4 us instead of 3.1 us, and decode ran 30-35% slower for the life of the process. Same values; `0` restores the null-stream copies. |
@@ -2082,6 +2083,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_HIP_WAIT` | crates/rdna-compute/src/dispatch.rs | developer |
 | `HIPFIRE_HOME` | benchmarks/scripts/mq4v2_k5120_gfx1201_validate.sh, crates/hipfire-arch-qwen4/src/artifact.rs | stable |
 | `HIPFIRE_HOST` | crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_HOST_SITE_LEDGER` | crates/hip-bridge/src/site_ledger.rs | developer |
 | `HIPFIRE_HOST_TIMING` | crates/hipfire-generate/src/qwen.rs, crates/hipfire-runtime/examples/dflash_spec_demo.rs | developer |
 | `HIPFIRE_IDLE_TIMEOUT` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_IMAGE` | scripts/container-gate.sh | harness |

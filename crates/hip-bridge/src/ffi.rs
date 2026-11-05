@@ -7,6 +7,7 @@
 
 use crate::error::{HipError, HipResult};
 use crate::plan_tape::{PlanEvent, PlanGate, PlanTape};
+use crate::site_ledger::{self as sites, Api as SiteApi, Dir as SiteDir};
 use crate::{DeviceBuffer, MemcpyKind};
 #[cfg(unix)]
 use core::ffi::CStr;
@@ -1917,6 +1918,7 @@ impl HipRuntime {
         stream: Option<&Stream>,
     ) -> HipResult<()> {
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        let span = sites::begin();
         // SAFETY: the caller guarantees both ranges are live disjoint device
         // allocations; Rust does not deref device pointers.
         let code = unsafe {
@@ -1928,6 +1930,7 @@ impl HipRuntime {
                 stream_raw,
             )
         };
+        sites::end(span, SiteApi::MemcpyAsync, SiteDir::DtoD, size);
         memory_effects::dtod();
         self.check(code, "hipMemcpyAsync D2D raw")
     }
@@ -1946,9 +1949,11 @@ impl HipRuntime {
         stream: Option<&Stream>,
     ) -> HipResult<()> {
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        let span = sites::begin();
         // SAFETY: the caller guarantees the word range is a live device
         // allocation; Rust does not deref device pointers.
         let code = unsafe { (self.fn_memset_d32_async)(dst, value, words, stream_raw) };
+        sites::end(span, SiteApi::MemsetAsync, SiteDir::None, words * 4);
         memory_effects::memset();
         self.check(code, "hipMemsetD32Async raw")
     }
@@ -2138,6 +2143,7 @@ impl HipRuntime {
             "size ({size}) exceeds src ({})",
             src.size()
         );
+        let span = sites::begin();
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
         // async copies are the caller's contract; Rust does not deref device ptrs.
@@ -2150,6 +2156,7 @@ impl HipRuntime {
                 size,
             )
         };
+        sites::end(span, SiteApi::Memcpy, SiteDir::Peer, size);
         memory_effects::dtod();
         self.check(code, "hipMemcpyPeer")
     }
@@ -2175,6 +2182,7 @@ impl HipRuntime {
             "size ({size}) exceeds src ({})",
             src.size()
         );
+        let span = sites::begin();
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
         // async copies are the caller's contract; Rust does not deref device ptrs.
@@ -2188,6 +2196,7 @@ impl HipRuntime {
                 stream.0,
             )
         };
+        sites::end(span, SiteApi::MemcpyAsync, SiteDir::Peer, size);
         memory_effects::dtod();
         self.check(code, "hipMemcpyPeerAsync")
     }
@@ -2219,9 +2228,11 @@ impl HipRuntime {
 
     fn malloc_raw(&self, size: usize) -> HipResult<DeviceBuffer> {
         let mut ptr: *mut c_void = ptr::null_mut();
+        let span = sites::begin();
         // SAFETY: FFI out-params are stack locals with valid writable provenance;
         // HIP symbols were resolved at load. Returned pointers are opaque to Rust.
         let code = unsafe { (self.fn_malloc)(&mut ptr, size) };
+        sites::end(span, SiteApi::Malloc, SiteDir::None, size);
         self.check(code, "hipMalloc")?;
         crate::registry::record(ptr as usize, size, crate::registry::AllocationKind::Malloc);
         self.own_device_bytes
@@ -2283,9 +2294,11 @@ impl HipRuntime {
             ));
         };
         let mut ptr: *mut c_void = ptr::null_mut();
+        let span = sites::begin();
         // SAFETY: FFI out-params are stack locals with valid writable provenance;
         // HIP symbols were resolved at load. Returned pointers are opaque to Rust.
         let code = unsafe { ext_malloc(&mut ptr, size, HIP_DEVICE_MALLOC_FINEGRAINED) };
+        sites::end(span, SiteApi::Malloc, SiteDir::None, size);
         self.check(code, "hipExtMallocWithFlags(hipDeviceMallocFinegrained)")?;
         crate::registry::record(
             ptr as usize,
@@ -2311,9 +2324,11 @@ impl HipRuntime {
             ));
         };
         let mut ptr: *mut c_void = ptr::null_mut();
+        let span = sites::begin();
         // SAFETY: FFI out-params are stack locals with valid writable provenance;
         // HIP symbols were resolved at load. Returned pointers are opaque to Rust.
         let code = unsafe { ext_malloc(&mut ptr, size, HIP_MALLOC_SIGNAL_MEMORY) };
+        sites::end(span, SiteApi::Malloc, SiteDir::None, size);
         self.check(code, "hipExtMallocWithFlags(hipMallocSignalMemory)")?;
         crate::registry::record(ptr as usize, size, crate::registry::AllocationKind::Signal);
         Ok(DeviceBuffer {
@@ -2344,9 +2359,11 @@ impl HipRuntime {
         let token = buf.take_charge();
         let size = buf.size;
         crate::emu_budget::charged_free::<crate::emu_budget::Process>(token, || {
+            let span = sites::begin();
             // SAFETY: buf.ptr is a live hipMalloc allocation (ownership checked above);
             // caller must ensure GPU work on it is quiesced (documented on free).
             let code = unsafe { (self.fn_free)(buf.ptr) };
+            sites::end(span, SiteApi::Free, SiteDir::None, size);
             self.check(code, "hipFree")?;
             crate::registry::forget(buf.ptr as usize);
             self.own_device_bytes
@@ -2388,9 +2405,11 @@ impl HipRuntime {
     fn host_malloc_raw(&self, size: usize, flags: u32) -> HipResult<*mut c_void> {
         let func = self.missing_vmm_symbol("hipHostMalloc", self.fn_host_malloc)?;
         let mut ptr: *mut c_void = ptr::null_mut();
+        let span = sites::begin();
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
         // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(&mut ptr, size, flags) };
+        sites::end(span, SiteApi::HostMalloc, SiteDir::None, size);
         self.check(code, "hipHostMalloc")?;
         Ok(ptr)
     }
@@ -2419,9 +2438,11 @@ impl HipRuntime {
         self.plan_deny("hipHostFree")?;
         let func = self.missing_vmm_symbol("hipHostFree", self.fn_host_free)?;
         let raw = || {
+            let span = sites::begin();
             // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
             // # Safety or documented preconditions; out-params are stack locals.
             let code = unsafe { func(host) };
+            sites::end(span, SiteApi::HostFree, SiteDir::None, 0);
             self.check(code, "hipHostFree")
         };
         if crate::emu_budget::active().is_none() {
@@ -2654,9 +2675,11 @@ impl HipRuntime {
         let func = self.missing_vmm_symbol("hipMemCreate", self.fn_mem_create)?;
         let raw = || {
             let mut handle: HipMemGenericAllocationHandle = ptr::null_mut();
+            let span = sites::begin();
             // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
             // # Safety or documented preconditions; out-params are stack locals.
             let code = unsafe { func(&mut handle, size, prop as *const HipMemAllocationProp, 0) };
+            sites::end(span, SiteApi::VmmCreate, SiteDir::None, size);
             self.check(code, "hipMemCreate")?;
             Ok(handle)
         };
@@ -2686,9 +2709,11 @@ impl HipRuntime {
     ) -> HipResult<()> {
         self.plan_deny("hipMemMap")?;
         let func = self.missing_vmm_symbol("hipMemMap", self.fn_mem_map)?;
+        let span = sites::begin();
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
         // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(ptr, size, 0, handle, 0) };
+        sites::end(span, SiteApi::VmmMap, SiteDir::None, size);
         self.check(code, "hipMemMap")?;
         crate::registry::record(
             ptr as usize,
@@ -2703,9 +2728,11 @@ impl HipRuntime {
     pub unsafe fn mem_unmap(&self, ptr: *mut c_void, size: usize) -> HipResult<()> {
         self.plan_deny("hipMemUnmap")?;
         let func = self.missing_vmm_symbol("hipMemUnmap", self.fn_mem_unmap)?;
+        let span = sites::begin();
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
         // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(ptr, size) };
+        sites::end(span, SiteApi::VmmUnmap, SiteDir::None, size);
         self.check(code, "hipMemUnmap")?;
         crate::registry::forget(ptr as usize);
         Ok(())
@@ -2753,9 +2780,11 @@ impl HipRuntime {
         self.plan_deny("hipMemRelease")?;
         let func = self.missing_vmm_symbol("hipMemRelease", self.fn_mem_release)?;
         let raw = || {
+            let span = sites::begin();
             // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
             // # Safety or documented preconditions; out-params are stack locals.
             let code = unsafe { func(handle) };
+            sites::end(span, SiteApi::VmmRelease, SiteDir::None, 0);
             self.check(code, "hipMemRelease")
         };
         if crate::emu_budget::active().is_none() {
@@ -2933,6 +2962,7 @@ impl HipRuntime {
         // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
         // `u8::add` stays in the same live allocation; no host deref of device memory.
         let dst_ptr = unsafe { (dst.ptr as *mut u8).add(offset) as *mut c_void };
+        let span = sites::begin();
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
         // async copies are the caller's contract; Rust does not deref device ptrs.
@@ -2944,6 +2974,7 @@ impl HipRuntime {
                 MemcpyKind::HostToDevice as c_uint,
             )
         };
+        sites::end(span, SiteApi::Memcpy, SiteDir::HtoD, src.len());
         memory_effects::htod();
         self.check(code, "hipMemcpy H2D offset")
     }
@@ -2978,6 +3009,7 @@ impl HipRuntime {
         // `u8::add` stays in the same live allocation; no host deref of device memory.
         let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
         let t = std::time::Instant::now();
+        let span = sites::begin();
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
         // async copies are the caller's contract; Rust does not deref device ptrs.
@@ -2985,6 +3017,7 @@ impl HipRuntime {
             (self.fn_memcpy)(dst_ptr, src_ptr, size, MemcpyKind::DeviceToDevice as c_uint)
         };
         crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
+        sites::end(span, SiteApi::Memcpy, SiteDir::DtoD, size);
         memory_effects::dtod();
         self.check(code, "hipMemcpy D2D at offset")
     }
@@ -3008,6 +3041,7 @@ impl HipRuntime {
         // `u8::add` stays in the same live allocation; no host deref of device memory.
         let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
         let t = std::time::Instant::now();
+        let span = sites::begin();
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
         // async copies are the caller's contract; Rust does not deref device ptrs.
@@ -3015,6 +3049,7 @@ impl HipRuntime {
             (self.fn_memcpy)(dst.ptr, src_ptr, size, MemcpyKind::DeviceToDevice as c_uint)
         };
         crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
+        sites::end(span, SiteApi::Memcpy, SiteDir::DtoD, size);
         memory_effects::dtod();
         self.check(code, "hipMemcpy D2D offset")
     }
@@ -3033,6 +3068,7 @@ impl HipRuntime {
             dst.size
         );
         let t = std::time::Instant::now();
+        let span = sites::begin();
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
         // async copies are the caller's contract; Rust does not deref device ptrs.
@@ -3045,6 +3081,7 @@ impl HipRuntime {
             )
         };
         crate::ffi::launch_counters::memcpy_htod::record(t.elapsed().as_nanos() as u64);
+        sites::end(span, SiteApi::Memcpy, SiteDir::HtoD, src.len());
         memory_effects::htod();
         self.check(code, "hipMemcpy H2D")
     }
@@ -3061,6 +3098,7 @@ impl HipRuntime {
         );
         let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();
+        let span = sites::begin();
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
         // async copies are the caller's contract; Rust does not deref device ptrs.
@@ -3072,6 +3110,7 @@ impl HipRuntime {
                 MemcpyKind::DeviceToHost as c_uint,
             )
         };
+        sites::end(span, SiteApi::Memcpy, SiteDir::DtoH, dst.len());
         let elapsed = t.elapsed().as_nanos() as u64;
         crate::ffi::launch_counters::memcpy_dtoh::record_bytes(elapsed, dst.len() as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3117,6 +3156,7 @@ impl HipRuntime {
         let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
         let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();
+        let span = sites::begin();
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
         // async copies are the caller's contract; Rust does not deref device ptrs.
@@ -3128,6 +3168,7 @@ impl HipRuntime {
                 MemcpyKind::DeviceToHost as c_uint,
             )
         };
+        sites::end(span, SiteApi::Memcpy, SiteDir::DtoH, dst.len());
         let elapsed = t.elapsed().as_nanos() as u64;
         crate::ffi::launch_counters::memcpy_dtoh::record_bytes(elapsed, dst.len() as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3163,6 +3204,7 @@ impl HipRuntime {
         }
         assert!(size <= dst.size && size <= src.size);
         let t = std::time::Instant::now();
+        let span = sites::begin();
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
         // async copies are the caller's contract; Rust does not deref device ptrs.
@@ -3175,6 +3217,7 @@ impl HipRuntime {
             )
         };
         crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
+        sites::end(span, SiteApi::Memcpy, SiteDir::DtoD, size);
         memory_effects::dtod();
         self.check(code, "hipMemcpy D2D")
     }
@@ -3198,10 +3241,12 @@ impl HipRuntime {
             HipError::new(0, "hipMemcpyDtoD is not exported by the loaded HIP runtime")
         })?;
         let t = std::time::Instant::now();
+        let span = sites::begin();
         // SAFETY: the caller guarantees both ranges lie in live, disjoint
         // device allocations; Rust does not deref device pointers.
         let code = unsafe { f(dst, src as *mut c_void, size) };
         crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
+        sites::end(span, SiteApi::Memcpy, SiteDir::DtoD, size);
         memory_effects::dtod();
         self.check(code, "hipMemcpyDtoD")
     }
@@ -3221,10 +3266,12 @@ impl HipRuntime {
         assert!(size <= buf.size);
         let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();
+        let span = sites::begin();
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
         // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe { (self.fn_memset)(buf.ptr, value, size) };
+        sites::end(span, SiteApi::Memset, SiteDir::None, size);
         let elapsed = t.elapsed().as_nanos() as u64;
         crate::ffi::launch_counters::memset::record_bytes(elapsed, size as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3271,10 +3318,12 @@ impl HipRuntime {
         }
         assert!(count * 4 <= buf.size);
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        let span = sites::begin();
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
         // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe { (self.fn_memset_d32_async)(buf.ptr, value, count, stream_raw) };
+        sites::end(span, SiteApi::MemsetAsync, SiteDir::None, count * 4);
         memory_effects::memset();
         self.check(code, "hipMemsetD32Async")
     }
@@ -3301,10 +3350,12 @@ impl HipRuntime {
         assert!(size <= buf.size);
         let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();
+        let span = sites::begin();
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
         // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe { (self.fn_memset_async)(buf.ptr, value, size, stream.0) };
+        sites::end(span, SiteApi::MemsetAsync, SiteDir::None, size);
         let elapsed = t.elapsed().as_nanos() as u64;
         crate::ffi::launch_counters::memset::record_bytes(elapsed, size as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3359,10 +3410,12 @@ impl HipRuntime {
             return Err(hip_fault_err("sync"));
         }
         let t = std::time::Instant::now();
+        let span = sites::begin();
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
         // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_stream_synchronize)(stream.0) };
+        sites::end(span, SiteApi::StreamSync, SiteDir::None, 0);
         crate::ffi::launch_counters::stream_sync::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipStreamSynchronize")
     }
@@ -3696,10 +3749,12 @@ impl HipRuntime {
     pub fn event_synchronize(&self, event: &Event) -> HipResult<()> {
         self.plan_deny("hipEventSynchronize")?;
         let t = std::time::Instant::now();
+        let span = sites::begin();
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
         // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_event_synchronize)(event.0) };
+        sites::end(span, SiteApi::EventSync, SiteDir::None, 0);
         crate::ffi::launch_counters::event_sync::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipEventSynchronize")
     }
@@ -3793,6 +3848,7 @@ impl HipRuntime {
             return Err(hip_fault_err("upload"));
         }
         assert!(src.len() <= dst.size);
+        let span = sites::begin();
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
         // async copies are the caller's contract; Rust does not deref device ptrs.
@@ -3805,6 +3861,7 @@ impl HipRuntime {
                 stream.0,
             )
         };
+        sites::end(span, SiteApi::MemcpyAsync, SiteDir::HtoD, src.len());
         memory_effects::htod();
         self.check(code, "hipMemcpyAsync H2D")
     }
@@ -3828,6 +3885,7 @@ impl HipRuntime {
             src.len(),
             dst.size
         );
+        let span = sites::begin();
         // SAFETY: the byte offset was bounds-checked against the DeviceBuffer size;
         // `u8::add` stays in the same live allocation. Same-device/stream and
         // host-buffer lifetime across the async copy are the caller's contract.
@@ -3840,6 +3898,7 @@ impl HipRuntime {
                 stream.0,
             )
         };
+        sites::end(span, SiteApi::MemcpyAsync, SiteDir::HtoD, src.len());
         memory_effects::htod();
         self.check(code, "hipMemcpyAsync H2D offset")
     }
@@ -3867,6 +3926,7 @@ impl HipRuntime {
         self.plan_deny("hipMemcpyAsync H2D(default stream)")?;
         crate::null_stream::note("hipMemcpyAsync H2D", std::panic::Location::caller());
         assert!(src.len() <= dst.size);
+        let span = sites::begin();
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
         // async copies are the caller's contract; Rust does not deref device ptrs.
@@ -3879,6 +3939,7 @@ impl HipRuntime {
                 ptr::null_mut(),
             )
         };
+        sites::end(span, SiteApi::MemcpyAsync, SiteDir::HtoD, src.len());
         memory_effects::htod();
         self.check(code, "hipMemcpyAsync H2D default stream")
     }
@@ -3895,6 +3956,7 @@ impl HipRuntime {
             crate::null_stream::note("hipMemcpyAsync D2H", std::panic::Location::caller());
         }
         assert!(dst.len() <= src.size);
+        let span = sites::begin();
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
         // async copies are the caller's contract; Rust does not deref device ptrs.
@@ -3907,6 +3969,7 @@ impl HipRuntime {
                 stream.map_or(ptr::null_mut(), |s| s.0),
             )
         };
+        sites::end(span, SiteApi::MemcpyAsync, SiteDir::DtoH, dst.len());
         memory_effects::dtoh();
         self.check(code, "hipMemcpyAsync D2H")
     }
@@ -3942,6 +4005,7 @@ impl HipRuntime {
         // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
         // `u8::add` stays in the same live allocation; no host deref of device memory.
         let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
+        let span = sites::begin();
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
         // async copies are the caller's contract; Rust does not deref device ptrs.
@@ -3954,6 +4018,7 @@ impl HipRuntime {
                 stream.0,
             )
         };
+        sites::end(span, SiteApi::MemcpyAsync, SiteDir::DtoD, size);
         memory_effects::dtod();
         self.check(code, "hipMemcpyAsync D2D offset")
     }
@@ -3991,6 +4056,7 @@ impl HipRuntime {
         // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
         // `u8::add` stays in the same live allocation; no host deref of device memory.
         let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
+        let span = sites::begin();
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
         // async copies are the caller's contract; Rust does not deref device ptrs.
@@ -4003,6 +4069,7 @@ impl HipRuntime {
                 ptr::null_mut(),
             )
         };
+        sites::end(span, SiteApi::MemcpyAsync, SiteDir::DtoD, size);
         memory_effects::dtod();
         self.check(code, "hipMemcpyAsync D2D offset default stream")
     }
@@ -4083,6 +4150,7 @@ impl HipRuntime {
         let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
         let t = std::time::Instant::now();
+        let span = sites::begin();
         // SAFETY: pointers are live HIP allocations; the full strided span of
         // both sides (last row ends at offset + (height-1)*pitch + width) was
         // asserted to fit, and width <= both pitches. Same-device/stream and
@@ -4100,6 +4168,7 @@ impl HipRuntime {
                 stream_raw,
             )
         };
+        sites::end(span, SiteApi::MemcpyAsync, SiteDir::DtoD, width * height);
         crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
         memory_effects::dtod();
         self.check(code, "hipMemcpy2DAsync D2D at offset")
@@ -4363,9 +4432,11 @@ impl HipRuntime {
             return Err(hip_fault_err("sync"));
         }
         let t = std::time::Instant::now();
+        let span = sites::begin();
         // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
         // stack locals (or caller-provided device ids). No host pointer aliasing.
         let code = unsafe { (self.fn_device_synchronize)() };
+        sites::end(span, SiteApi::DeviceSync, SiteDir::None, 0);
         crate::ffi::launch_counters::device_sync::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipDeviceSynchronize")
     }
@@ -4465,14 +4536,18 @@ impl PinnedHostBuffer {
 impl Drop for PinnedHostBuffer {
     fn drop(&mut self) {
         let Some(token) = self.token.take() else {
+            let span = sites::begin();
             // SAFETY: unique hipHostMalloc owner; its library is still live. The
             // caller must have drained async copies before dropping the owner.
             let code = unsafe { (self.free)(self.ptr) };
+            sites::end(span, SiteApi::HostFree, SiteDir::None, 0);
             crate::error::observe_raw_code(code);
             return;
         };
+        let span = sites::begin();
         // SAFETY: as above.
         let code = unsafe { (self.free)(self.ptr) };
+        sites::end(span, SiteApi::HostFree, SiteDir::None, 0);
         crate::error::observe_raw_code(code);
         let _ = crate::emu_budget::charged_free::<crate::emu_budget::Process>(Some(token), || {
             if code == HIP_SUCCESS {
@@ -4716,9 +4791,11 @@ impl HostAllocOwner {
 impl Drop for HostAllocOwner {
     fn drop(&mut self) {
         let raw = || {
+            let span = sites::begin();
             // SAFETY: the unique owner of the allocation (see `adopt_host_allocation`); its
             // library is still loaded (`_lib`). The caller drained async GPU access.
             let code = unsafe { (self.free)(self.ptr) };
+            sites::end(span, SiteApi::HostFree, SiteDir::None, 0);
             crate::error::observe_raw_code(code);
             if code == HIP_SUCCESS {
                 Ok(())
@@ -4809,6 +4886,7 @@ impl PinnedTransferBuffer {
         }
         self.begin(hip, stream)?;
         let storage = self.storage.as_ref().expect("live transfer storage");
+        let span = sites::begin();
         // SAFETY: checked allocation extent; no host reference exists while
         // pending. Same-stream copies order prior upload reads before these
         // writes, and the owner drains before host reuse/free.
@@ -4821,6 +4899,7 @@ impl PinnedTransferBuffer {
                 self.stream,
             )
         };
+        sites::end(span, SiteApi::MemcpyAsync, SiteDir::DtoH, size);
         memory_effects::dtoh();
         hip.check(code, "hipMemcpyAsync pinned D2H")
     }
@@ -4844,6 +4923,7 @@ impl PinnedTransferBuffer {
         }
         self.begin(hip, stream)?;
         let storage = self.storage.as_ref().expect("live transfer storage");
+        let span = sites::begin();
         // SAFETY: checked source extent, and no host access is allowed until
         // complete drains the stream. The pinned owner survives this enqueue.
         let code = unsafe {
@@ -4855,6 +4935,7 @@ impl PinnedTransferBuffer {
                 self.stream,
             )
         };
+        sites::end(span, SiteApi::MemcpyAsync, SiteDir::HtoD, size);
         memory_effects::htod();
         hip.check(code, "hipMemcpyAsync pinned H2D")
     }
@@ -5026,8 +5107,10 @@ impl Drop for PinnedTransferBuffer {
         let drained = call_on_device(self.get_device, self.set_device, self.device, || {
             let mut code = HIP_SUCCESS;
             if pending {
+                let span = sites::begin();
                 // SAFETY: the pinned owner keeps the function-pointer library live.
                 code = unsafe { (self.synchronize)() };
+                sites::end(span, SiteApi::DeviceSync, SiteDir::None, 0);
             }
             if code == HIP_SUCCESS {
                 if let Some(event) = event.as_ref() {
@@ -5442,6 +5525,7 @@ impl MappedHostBuffer {
             if len == 0 || end > self.size || end > dst.size() {
                 return Err(mapped_err("gated upload range outside the buffers"));
             }
+            let span = sites::begin();
             // SAFETY: the range is inside the live mapped allocation and the
             // destination (checked above). The source bytes are written by the
             // host strictly before the gate the stream waits on is released,
@@ -5456,6 +5540,7 @@ impl MappedHostBuffer {
                     raw,
                 )
             };
+            sites::end(span, SiteApi::MemcpyAsync, SiteDir::HtoD, len);
             memory_effects::htod();
             hip.check(code, "hipMemcpyAsync gated mapped H2D")?;
             queued += 1;
@@ -5556,12 +5641,18 @@ impl Drop for MappedHostBuffer {
         let quiesced = match self.ledger.drop_plan() {
             MappedQuiesce::Done => true,
             MappedQuiesce::Event => self.quiesce_on_device(|| {
+                let span = sites::begin();
                 // SAFETY: live event owned by this buffer; device is bound.
-                unsafe { (self.event_synchronize)(event_raw) }
+                let code = unsafe { (self.event_synchronize)(event_raw) };
+                sites::end(span, SiteApi::EventSync, SiteDir::None, 0);
+                code
             }),
             MappedQuiesce::Device => self.quiesce_on_device(|| {
+                let span = sites::begin();
                 // SAFETY: device synchronize takes no arguments; device is bound.
-                unsafe { (self.synchronize)() }
+                let code = unsafe { (self.synchronize)() };
+                sites::end(span, SiteApi::DeviceSync, SiteDir::None, 0);
+                code
             }),
         };
         if !quiesced {
@@ -5574,8 +5665,10 @@ impl Drop for MappedHostBuffer {
         // SAFETY: the consumer is quiesced, so the event is idle and unshared.
         let destroyed = unsafe { (self.event_destroy)(event_raw) };
         crate::error::observe_raw_code(destroyed);
+        let span = sites::begin();
         // SAFETY: unique hipHostMalloc owner of `host`; library still live.
         let code = unsafe { (self.free)(self.host) };
+        sites::end(span, SiteApi::HostFree, SiteDir::None, 0);
         crate::error::observe_raw_code(code);
         if let Some(token) = self.token.take() {
             let _ =
@@ -5809,8 +5902,11 @@ impl SignalTeardown for SignalWordTeardown<'_> {
     fn quiesce(&mut self) -> bool {
         let word = &*self.0;
         call_on_device(word.get_device, word.set_device, word.device, || {
+            let span = sites::begin();
             // SAFETY: device synchronize takes no arguments; the device is bound.
-            unsafe { (word.synchronize)() }
+            let code = unsafe { (word.synchronize)() };
+            sites::end(span, SiteApi::DeviceSync, SiteDir::None, 0);
+            code
         })
     }
 
@@ -5823,9 +5919,11 @@ impl SignalTeardown for SignalWordTeardown<'_> {
         let token = owner.take_charge();
         let free = word.free;
         let freed = crate::emu_budget::charged_free::<crate::emu_budget::Process>(token, || {
+            let span = sites::begin();
             // SAFETY: unique hipExtMallocWithFlags owner; the drain was proved
             // and the abort value releases any wait, so nothing polls it.
             let code = unsafe { free(raw) };
+            sites::end(span, SiteApi::Free, SiteDir::None, 0);
             crate::error::observe_raw_code(code);
             if code == HIP_SUCCESS {
                 crate::registry::forget(raw as usize);

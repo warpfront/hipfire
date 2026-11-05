@@ -169,6 +169,7 @@ impl ArHcExchange {
         }
         let peer = 1 - rank;
         let ticket = self.arrivals[rank].fetch_add(1, Ordering::AcqRel) + 1;
+        let span = hip_bridge::site_ledger::begin();
         let start = Instant::now();
         let mut spins = 0u32;
         let mut reported = false;
@@ -177,6 +178,11 @@ impl ArHcExchange {
             // then aborted still reads as arrived.
             let aborted = self.gate_aborted.load(Ordering::Acquire);
             if self.arrivals[peer].load(Ordering::Acquire) >= ticket {
+                hip_bridge::site_ledger::end_tagged(
+                    span,
+                    hip_bridge::site_ledger::Api::HostWait,
+                    "ar_hc_exchange::host_gate",
+                );
                 return Ok(());
             }
             if aborted {

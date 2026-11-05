@@ -20,6 +20,7 @@ mod rccl;
 pub mod registry;
 mod rocblas;
 mod rocsolver;
+pub mod site_ledger;
 mod vmm;
 
 pub use error::{

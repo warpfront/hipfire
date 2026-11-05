@@ -972,6 +972,7 @@ impl StepTrace {
             pf={pf} pf_rows={pf_rows} ar={ar} ver={ver} ver_rows={ver_rows} mesh_lanes={} mesh_native={} mesh_copy={} mesh_ar={} tokens={tokens} accepted={accepted}",
             self.step, ms(self.origin, marks[0]), ms(self.last, marks[0]), ms(marks[0], marks[1]), ms(marks[1], marks[2]),
             ms(marks[2], marks[3]), ms(marks[3], now), mesh.lanes, mesh.native_windows, mesh.copy_windows, mesh.ar_windows);
+        hip_bridge::site_ledger::mark_step(self.step, mesh.lanes, pf_rows, tokens);
         self.step += 1;
         self.last = now;
     }
