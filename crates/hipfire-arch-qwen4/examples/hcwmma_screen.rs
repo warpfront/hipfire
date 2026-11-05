@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! HCW screen: the purpose-built WMMA kernels (`rdna_compute::hcw` and `hcw_lab`, BF16 and planar W8 weights, 1-3 BF16
+//! Lane WMMA screen: the purpose-built WMMA kernels (`rdna_compute::lane_wmma` and `lane_wmma_lab`, BF16 and planar W8 weights, 1-3 BF16
 //! activation split terms) against today's incumbents, on ONE real layer of an HFQM artifact, exact gfx1201.
 //!
 //! ```text
@@ -12,11 +12,11 @@
 //!
 //! Families / arms (per row count; rows 9..=64 run under `Gpu::set_wide_verify_rows(rows)`):
 //! * `hc_down` `[320, 10240]`, act 0.25: `incumbent` (rows <= 64 `gemv_bf16_xf32_k4_rows`; rows > 64
-//!   `gemm_bf16_xf16_hc_down_fused` on the F16 input), `hcw_bf16_t1`, `hcw_w8_t1` (`hcw_gemm`), rows > 64
-//!   also `hcw_w8_prefill` (`hcw_hc_down_fused_w8`).
+//!   `gemm_bf16_xf16_hc_down_fused` on the F16 input), `hcw_bf16_t1`, `hcw_w8_t1` (`lane_wmma_gemm`), rows > 64
+//!   also `hcw_w8_prefill` (`lane_wmma_hc_down_fused_w8`).
 //! * `hc_up` `[10240, 320]` + branch mix: `incumbent` (rows <= 64 `hyper_read_up_fused`; rows > 64
-//!   `hyper_read_up_wmma`), `hcw_bf16_t1`, `hcw_w8_t1` (`hcw_read_up`), rows > 64 also `hcw_w8_prefill`
-//!   (`hcw_read_up_wmma_w8`).
+//!   `hyper_read_up_wmma`), `hcw_bf16_t1`, `hcw_w8_t1` (`lane_wmma_read_up`), rows > 64 also `hcw_w8_prefill`
+//!   (`lane_wmma_hc_up_w8`).
 //! * `hc_gate` `[4, 10240]`, no act: `incumbent` vs `hcw_{bf16,w8}_t1`.
 //! * `shared_gate` / `shared_up` / `shared_down`: `incumbent` (`project_weight` BF16) vs
 //!   `hcw_{bf16,w8}_t{terms}` (`--terms`, default 1,2,3; the shared X is NOT BF16-exact).
@@ -31,7 +31,7 @@
 //! back-to-back calls with one hipEvent pair per batch. A launcher that refuses prints `UNAVAILABLE <reason>`.
 //!
 //! The W8 planar weights are built from the product quantizer (`Gpu::quantize_bf16_q8_0`) output through
-//! `hcw_lab::w8_planar_from_q8_0`.
+//! `lane_wmma_lab::w8_planar_from_q8_0`.
 //!
 //! Run one card, one fresh process:
 //! `HSA_USERPTR_FOR_PAGED_MEM=0 GPU_PINNED_MIN_XFER_SIZE=100000 hcwmma_screen --model ... --out ...`
@@ -50,8 +50,8 @@ use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::pipeline::project_weight;
 use hipfire_runtime::hfq::HfqFile;
 use rayon::prelude::*;
-use rdna_compute::hcw::{hcw_gemm, hcw_read_up, HcwCfg, HcwLaunch, HcwScratch, HcwWeight};
-use rdna_compute::hcw_lab::{hcw_hc_down_fused_w8, hcw_read_up_wmma_w8, w8_planar_from_q8_0};
+use rdna_compute::lane_wmma::{lane_wmma_gemm, lane_wmma_read_up, LaneWmmaCfg, LaneWmmaLaunch, LaneWmmaScratch, LaneWmmaWeight};
+use rdna_compute::lane_wmma_lab::{lane_wmma_hc_down_fused_w8, lane_wmma_hc_up_w8, w8_planar_from_q8_0};
 use rdna_compute::tensor_ops::{hyper_norm, hyper_read_up_fused, hyper_read_up_wmma, HyperNorm, HyperReadUpFused};
 use rdna_compute::{DType, Gpu, GpuTensor, HipResult, LabLaunchWitness};
 use serde_json::{json, Value};
@@ -305,7 +305,7 @@ fn q8_weight_bytes(m: usize, k: usize) -> usize {
     m * (k / 32) * 34
 }
 
-fn launch_note(l: &HcwLaunch) -> String {
+fn launch_note(l: &LaneWmmaLaunch) -> String {
     format!("{} grid{:?} block{:?}", l.kernel, l.grid, l.block)
 }
 
@@ -376,7 +376,7 @@ struct Ctx {
     cold: bool,
     /// Weight copies the next `arm` call cycles through (set just before it; reset to 1 by it).
     cold_n: usize,
-    /// Set by an arm closure to the launcher's `HcwLaunch` description.
+    /// Set by an arm closure to the launcher's `LaneWmmaLaunch` description.
     launch_note: Rc<RefCell<Option<String>>>,
 }
 
@@ -829,7 +829,7 @@ fn auto_split(m: usize, k: usize, rows: usize, nn: usize) -> usize {
         .unwrap_or(1)
 }
 
-/// `(partial floats, counters)` large enough for every `hcw_gemm` call this run makes.
+/// `(partial floats, counters)` large enough for every `lane_wmma_gemm` call this run makes.
 fn scratch_need(cli: &Cli, rows_run: &[usize]) -> (usize, usize) {
     let shapes = [(RANK, WIDE), (4, WIDE), (SH_I, HIDDEN), (SH_I, HIDDEN), (HIDDEN, SH_I)];
     let (mut part, mut cnt) = (1usize, 1usize);
@@ -851,7 +851,7 @@ macro_rules! launcher {
     ($($t:tt)*) => { &format!($($t)*) };
 }
 
-/// Inputs of one `hcw_gemm` arm family.
+/// Inputs of one `lane_wmma_gemm` arm family.
 struct Gm<'a> {
     family: &'a str,
     rows: usize,
@@ -869,9 +869,9 @@ struct Gm<'a> {
     ref_w8: &'a [f32],
 }
 
-fn gemm_arms(gpu: &mut Gpu, ctx: &mut Ctx, sc: &HcwScratch, cli: &Cli, g: &Gm<'_>) {
+fn gemm_arms(gpu: &mut Gpu, ctx: &mut Ctx, sc: &LaneWmmaScratch, cli: &Cli, g: &Gm<'_>) {
     let (m, k, rows) = (g.wt.m, g.wt.k, g.rows);
-    let cfg = HcwCfg {
+    let cfg = LaneWmmaCfg {
         nn: cli.nn.unwrap_or_else(|| auto_nn(m)),
         split_k: cli.split,
     };
@@ -892,7 +892,7 @@ fn gemm_arms(gpu: &mut Gpu, ctx: &mut Ctx, sc: &HcwScratch, cli: &Cli, g: &Gm<'_
                     rows,
                     arm: &arm,
                     launcher: launcher!(
-                        "hcw_lab::hcw_gemm({fmt}, terms {t}, [{m},{k}], act {act:?}, nn {} split {})",
+                        "lane_wmma_lab::lane_wmma_gemm({fmt}, terms {t}, [{m},{k}], act {act:?}, nn {} split {})",
                         cfg.nn,
                         cfg.split_k
                     ),
@@ -909,11 +909,11 @@ fn gemm_arms(gpu: &mut Gpu, ctx: &mut Ctx, sc: &HcwScratch, cli: &Cli, g: &Gm<'_
                     let c = list[i % list.len()];
                     i += 1;
                     let w = if bf {
-                        HcwWeight::Bf16(&c.bf)
+                        LaneWmmaWeight::Bf16(&c.bf)
                     } else {
-                        HcwWeight::W8 { q: &c.q, d: &c.d }
+                        LaneWmmaWeight::W8 { q: &c.q, d: &c.d }
                     };
-                    let l = hcw_gemm(gp, &w, x, y, m, k, rows, t, act, cfg, sc).map_err(es)?;
+                    let l = lane_wmma_gemm(gp, &w, x, y, m, k, rows, t, act, cfg, sc).map_err(es)?;
                     *ln.borrow_mut() = Some(launch_note(&l));
                     Ok(())
                 },
@@ -926,7 +926,7 @@ fn gemm_arms(gpu: &mut Gpu, ctx: &mut Ctx, sc: &HcwScratch, cli: &Cli, g: &Gm<'_
 fn run_rows(
     gpu: &mut Gpu,
     ctx: &mut Ctx,
-    sc: &HcwScratch,
+    sc: &LaneWmmaScratch,
     cli: &Cli,
     w: &Weights,
     cold: &Cold,
@@ -1061,7 +1061,7 @@ fn run_rows(
                     family: "hc_down",
                     rows,
                     arm: "hcw_w8_prefill",
-                    launcher: launcher!("hcw_lab::hcw_hc_down_fused_w8(q,d,x_f16,low_bf16,{RANK},{WIDE},{rows},{HC_SCALE})"),
+                    launcher: launcher!("lane_wmma_lab::lane_wmma_hc_down_fused_w8(q,d,x_f16,low_bf16,{RANK},{WIDE},{rows},{HC_SCALE})"),
                     weight_bytes: wb_q,
                     scope,
                     chk: Some(Check { exact: &down_rw, bf16: Some(&down_rb) }),
@@ -1069,7 +1069,7 @@ fn run_rows(
                 },
                 Some((&low16_w8, rows * RANK)),
                 |g| {
-                    let l = hcw_hc_down_fused_w8(
+                    let l = lane_wmma_hc_down_fused_w8(
                         g, &w.down.main.q, &w.down.main.d, &x16, &low16_w8, RANK, WIDE, rows, HC_SCALE,
                     )
                     .map_err(es)?;
@@ -1200,7 +1200,7 @@ fn run_rows(
                     family: "hc_up",
                     rows,
                     arm: "hcw_w8_prefill",
-                    launcher: "hcw_lab::hcw_read_up_wmma_w8 (planar W8 up, packed BF16 low, F16 normalized)",
+                    launcher: "lane_wmma_lab::lane_wmma_hc_up_w8 (planar W8 up, packed BF16 low, F16 normalized)",
                     weight_bytes: wb_q,
                     scope,
                     chk: Some(Check { exact: &up_rw, bf16: Some(&up_rb) }),
@@ -1208,7 +1208,7 @@ fn run_rows(
                 },
                 Some((&mixed, n_out)),
                 |g| {
-                    let l = hcw_read_up_wmma_w8(g, &w.up.main.q, &w.up.main.d, &read).map_err(es)?;
+                    let l = lane_wmma_hc_up_w8(g, &w.up.main.q, &w.up.main.d, &read).map_err(es)?;
                     *ln.borrow_mut() = Some(launch_note(&l));
                     Ok(())
                 },
@@ -1229,7 +1229,7 @@ fn run_rows(
                     family: "hc_up",
                     rows,
                     arm: &arm,
-                    launcher: launcher!("hcw_lab::hcw_read_up({fmt}, terms 1, hidden {HIDDEN}, low_rank {RANK})"),
+                    launcher: launcher!("lane_wmma_lab::lane_wmma_read_up({fmt}, terms 1, hidden {HIDDEN}, low_rank {RANK})"),
                     weight_bytes: wbytes,
                     scope,
                     chk: Some(Check {
@@ -1243,11 +1243,11 @@ fn run_rows(
                     let c = list[i % list.len()];
                     i += 1;
                     let wt = if bf {
-                        HcwWeight::Bf16(&c.bf)
+                        LaneWmmaWeight::Bf16(&c.bf)
                     } else {
-                        HcwWeight::W8 { q: &c.q, d: &c.d }
+                        LaneWmmaWeight::W8 { q: &c.q, d: &c.d }
                     };
-                    let l = hcw_read_up(g, &wt, &low32, &norm32, &mixed, rows, HIDDEN, RANK, 1).map_err(es)?;
+                    let l = lane_wmma_read_up(g, &wt, &low32, &norm32, &mixed, rows, HIDDEN, RANK, 1).map_err(es)?;
                     *ln.borrow_mut() = Some(launch_note(&l));
                     Ok(())
                 },
@@ -1523,7 +1523,7 @@ fn run() -> R<()> {
     let host = make_host(max_rows);
     let (part, cnt) = scratch_need(&cli, &rows_run);
     println!("hcw scratch: {part} partial floats ({} MB), {cnt} counters", part * 4 >> 20);
-    let scratch = HcwScratch::new(&mut gpu, part, cnt).map_err(|e| format!("HcwScratch::new: {e:?}"))?;
+    let scratch = LaneWmmaScratch::new(&mut gpu, part, cnt).map_err(|e| format!("LaneWmmaScratch::new: {e:?}"))?;
     let cold = if cli.cold && rows_run.iter().any(|&r| r <= SMALL_ROWS) {
         println!(
             "--cold: decode-family arms (rows <= {SMALL_ROWS}) cycle weight copies so each arm's working set is >= {} MB (MALL 64 MB); N printed per arm",

@@ -2,16 +2,16 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! HCW: purpose-built gfx1201 WMMA kernels for the Qwen3.8 Flash-Next HC mixers and the
+//! Lane WMMA: purpose-built gfx1201 WMMA kernels for the Qwen3.8 Flash-Next HC mixers and the
 //! dense BF16 `[rows, k]` projections at 16..=64 rows (the decode / lane / verify window),
 //! for BF16 weights and planar W8 weights (int8 widened to BF16 exactly, the per-32 scale
 //! applied in the f32 epilogue).
 //!
-//! Kernels: `kernels/src/hcw_wmma.gfx1201.hip`.
-//! * [`hcw_gemm`]: `Y[rows, M] = epi(X . W^T)`, optional `hc_act` epilogue, split-K with a
+//! Kernels: `kernels/src/qwen4_lane_wmma.gfx1201.hip`.
+//! * [`lane_wmma_gemm`]: `Y[rows, M] = epi(X . W^T)`, optional `hc_act` epilogue, split-K with a
 //!   deterministic last-block fold (the partials are summed in split order by the last block
 //!   to finish a tile, so the result never depends on block scheduling).
-//! * [`hcw_read_up`]: HC up projection with the fused branch mix.
+//! * [`lane_wmma_read_up`]: HC up projection with the fused branch mix.
 //!
 //! Activations are f32 in memory and are fed to the BF16 WMMA as `terms` BF16 split terms:
 //! * `terms == 1` is exact only when every activation is already BF16-representable. That is
@@ -24,27 +24,27 @@
 //! so outputs are NOT bitwise the SIMT route's; they are deterministic run to run.
 //!
 //! This module reads no environment variable. The product routes are gated by
-//! `HIPFIRE_QWEN4_HCW` (see `Gpu::hcw_applies`); the lab-only prefill W8 twins and the Q8_0
-//! repack live in [`crate::hcw_lab`].
+//! `HIPFIRE_QWEN4_LANE_WMMA` (see `Gpu::lane_wmma_applies`); the lab-only prefill W8 twins and the Q8_0
+//! repack live in [`crate::lane_wmma_lab`].
 
 use crate::dispatch::ReplayLaunchBindings;
 use crate::{DType, Gpu, GpuTensor};
 use hip_bridge::{HipError, HipResult, KernargBlob};
 
-/// The HCW kernel source (one module for every `hcw_gemm_*` / `hcw_read_up_*` entry).
-pub const HCW_SRC: &str = include_str!("../../../kernels/src/hcw_wmma.gfx1201.hip");
+/// The lane-WMMA kernel source (one module for every `lwmma_gemm_*` / `lwmma_read_up_*` entry).
+pub const LANE_WMMA_SRC: &str = include_str!("../../../kernels/src/qwen4_lane_wmma.gfx1201.hip");
 
-const HCW_MODULE: &str = "hcw_wmma";
+const LANE_WMMA_MODULE: &str = "qwen4_lane_wmma";
 
 /// Fixed size of the [`Gpu`]-owned split-K scratch: `split_k * m <= 320` tiles of 16 columns
 /// at most 64 rows (`320 * 16 * 64` floats), one counter per (column block, token block)
-/// (`<= 320`: [`hcw_auto_split_k`] keeps `blocks * split_k <= 320`).
-pub const HCW_SCRATCH_PARTIAL_FLOATS: usize = 320 * 16 * 64;
+/// (`<= 320`: [`lane_wmma_auto_split_k`] keeps `blocks * split_k <= 320`).
+pub const LANE_WMMA_SCRATCH_PARTIAL_FLOATS: usize = 320 * 16 * 64;
 /// Counter capacity of the [`Gpu`]-owned split-K scratch.
-pub const HCW_SCRATCH_COUNTERS: usize = 320;
+pub const LANE_WMMA_SCRATCH_COUNTERS: usize = 320;
 
 /// A GEMM weight operand.
-pub enum HcwWeight<'a> {
+pub enum LaneWmmaWeight<'a> {
     /// BF16 bits `[M, K]` row-major.
     Bf16(&'a GpuTensor),
     /// Planar W8 (block 32): `q` i8 `[M, K]` row-major, `d` f16 `[M, K / 32]` row-major;
@@ -54,14 +54,14 @@ pub enum HcwWeight<'a> {
 
 /// A1 launch configuration.
 #[derive(Clone, Copy, Debug)]
-pub struct HcwCfg {
+pub struct LaneWmmaCfg {
     /// Output n-tiles per block, 1 or 2.
     pub nn: usize,
-    /// K splits; 0 = [`hcw_auto_split_k`].
+    /// K splits; 0 = [`lane_wmma_auto_split_k`].
     pub split_k: usize,
 }
 
-impl Default for HcwCfg {
+impl Default for LaneWmmaCfg {
     /// The product configuration: one n-tile (measured best) and the auto split-K.
     fn default() -> Self {
         Self { nn: 1, split_k: 0 }
@@ -70,12 +70,12 @@ impl Default for HcwCfg {
 
 /// Split-K scratch: `partial` holds `split_k * rows * M` floats, `counters` one u32 per
 /// (column block, token block) and is zeroed once here; the kernel leaves it zeroed.
-pub struct HcwScratch {
+pub struct LaneWmmaScratch {
     pub partial: GpuTensor,
     pub counters: GpuTensor,
 }
 
-impl HcwScratch {
+impl LaneWmmaScratch {
     pub fn new(gpu: &mut Gpu, max_partial_floats: usize, max_counters: usize) -> HipResult<Self> {
         let partial = gpu.zeros(&[max_partial_floats.max(1)], DType::F32)?;
         let counters = gpu.zeros(&[max_counters.max(1)], DType::F32)?;
@@ -85,19 +85,19 @@ impl HcwScratch {
 
 /// What a launcher dispatched, for the bench log.
 #[derive(Clone, Debug)]
-pub struct HcwLaunch {
+pub struct LaneWmmaLaunch {
     pub kernel: String,
     pub grid: [u32; 3],
     pub block: [u32; 3],
 }
 
 pub(crate) fn err(msg: impl AsRef<str>) -> HipError {
-    HipError::new(1, &format!("hcw: {}", msg.as_ref()))
+    HipError::new(1, &format!("lane_wmma: {}", msg.as_ref()))
 }
 
-/// Token tiles per `hcw_read_up` block (1, 2 or 4; the other `8 / tiles` waves split K): the
+/// Token tiles per `lane_wmma_read_up` block (1, 2 or 4; the other `8 / tiles` waves split K): the
 /// fewest tiles covering `rows` up to four.
-pub fn hcw_read_up_tiles(rows: usize) -> usize {
+pub fn lane_wmma_read_up_tiles(rows: usize) -> usize {
     match rows.div_ceil(16) {
         0 | 1 => 1,
         2 => 2,
@@ -107,7 +107,7 @@ pub fn hcw_read_up_tiles(rows: usize) -> usize {
 
 /// Auto split-K: the largest divisor `s` of `k / 128` with
 /// `ceil(m / (16 nn)) * s * ceil(rows / 64) <= 320` (at least 1).
-pub fn hcw_auto_split_k(m: usize, k: usize, rows: usize, nn: usize) -> usize {
+pub fn lane_wmma_auto_split_k(m: usize, k: usize, rows: usize, nn: usize) -> usize {
     let tiles = m.div_ceil(16 * nn.max(1)) * rows.div_ceil(64).max(1);
     let chunks = k / 128;
     let mut best = 1;
@@ -147,7 +147,7 @@ pub(crate) fn need_f32(t: &GpuTensor, floats: usize, what: &str) -> HipResult<()
 /// Weight operand checks shared by both launchers: `rows_w` weight rows of `k` elements.
 /// Returns (q/bf16 pointer, d pointer or null, `"bf16"` / `"w8"`).
 fn weight_args(
-    w: &HcwWeight<'_>,
+    w: &LaneWmmaWeight<'_>,
     rows_w: usize,
     k: usize,
 ) -> HipResult<(*const std::ffi::c_void, *const std::ffi::c_void, &'static str)> {
@@ -155,11 +155,11 @@ fn weight_args(
         .checked_mul(k)
         .ok_or_else(|| err("weight extent overflow"))?;
     match w {
-        HcwWeight::Bf16(t) => {
+        LaneWmmaWeight::Bf16(t) => {
             need_bytes(t, elems * 2, "bf16 weight")?;
             Ok((t.buf.as_ptr() as *const _, std::ptr::null(), "bf16"))
         }
-        HcwWeight::W8 { q, d } => {
+        LaneWmmaWeight::W8 { q, d } => {
             need_bytes(q, elems, "w8 q")?;
             need_bytes(d, elems / 32 * 2, "w8 d")?;
             Ok((q.buf.as_ptr() as *const _, d.buf.as_ptr() as *const _, "w8"))
@@ -172,11 +172,11 @@ fn weight_args(
 /// is the number of BF16 split terms (1..=3). `k % (128 * split_k) == 0`.
 ///
 /// `scratch` must cover `split_k * rows * m` partial floats and one counter per (column block,
-/// token block) when `split_k > 1` (checked). Product callers use [`Gpu::hcw_gemm_fixed`].
+/// token block) when `split_k > 1` (checked). Product callers use [`Gpu::lane_wmma_gemm_fixed`].
 #[allow(clippy::too_many_arguments)]
-pub fn hcw_gemm(
+pub fn lane_wmma_gemm(
     gpu: &mut Gpu,
-    w: &HcwWeight<'_>,
+    w: &LaneWmmaWeight<'_>,
     x: &GpuTensor,
     y: &GpuTensor,
     m: usize,
@@ -184,9 +184,9 @@ pub fn hcw_gemm(
     rows: usize,
     terms: usize,
     hc_act: Option<f32>,
-    cfg: HcwCfg,
-    scratch: &HcwScratch,
-) -> HipResult<HcwLaunch> {
+    cfg: LaneWmmaCfg,
+    scratch: &LaneWmmaScratch,
+) -> HipResult<LaneWmmaLaunch> {
     if m == 0 || rows == 0 {
         return Err(err("m and rows must be non-zero"));
     }
@@ -201,7 +201,7 @@ pub fn hcw_gemm(
         other => return Err(err(format!("nn {other} not 1|2"))),
     };
     let split_k = if cfg.split_k == 0 {
-        hcw_auto_split_k(m, k, rows, nn)
+        lane_wmma_auto_split_k(m, k, rows, nn)
     } else {
         cfg.split_k
     };
@@ -224,12 +224,12 @@ pub fn hcw_gemm(
         u32_of(grid_z, "grid z")?,
     ];
     let block = [128u32, 1, 1];
-    let kernel = format!("hcw_gemm_{wname}_t{terms}_m{mt}_n{nn}");
+    let kernel = format!("lwmma_gemm_{wname}_t{terms}_m{mt}_n{nn}");
     let (scale, act) = match hc_act {
         Some(s) => (s, 1),
         None => (0.0f32, 0),
     };
-    gpu.ensure_kernel_public(HCW_MODULE, HCW_SRC, &kernel)?;
+    gpu.ensure_kernel_public(LANE_WMMA_MODULE, LANE_WMMA_SRC, &kernel)?;
     let mut args = KernargBlob::new();
     args.push_ptr(w_ptr);
     args.push_ptr(d_ptr);
@@ -252,7 +252,7 @@ pub fn hcw_gemm(
         args.as_mut_slice(),
         ReplayLaunchBindings::NONE,
     )?;
-    Ok(HcwLaunch {
+    Ok(LaneWmmaLaunch {
         kernel,
         grid,
         block,
@@ -263,9 +263,9 @@ pub fn hcw_gemm(
 /// fused: `mixed [rows, hidden]` (the `hyper_read_up_fused_f32_sx_t1` epilogue). `normalized` is
 /// F32 `[rows, 4 * hidden]`. `low_rank % 32 == 0`, `low_rank <= 512`, `hidden % 16 == 0`.
 #[allow(clippy::too_many_arguments)]
-pub fn hcw_read_up(
+pub fn lane_wmma_read_up(
     gpu: &mut Gpu,
-    w: &HcwWeight<'_>,
+    w: &LaneWmmaWeight<'_>,
     low: &GpuTensor,
     normalized: &GpuTensor,
     mixed: &GpuTensor,
@@ -273,7 +273,7 @@ pub fn hcw_read_up(
     hidden: usize,
     low_rank: usize,
     terms: usize,
-) -> HipResult<HcwLaunch> {
+) -> HipResult<LaneWmmaLaunch> {
     if rows == 0 || hidden == 0 || hidden % 16 != 0 {
         return Err(err(format!(
             "rows {rows} must be non-zero and hidden {hidden} a non-zero multiple of 16"
@@ -292,15 +292,15 @@ pub fn hcw_read_up(
     need_f32(low, rows * low_rank, "low")?;
     need_f32(normalized, rows * wide, "normalized")?;
     need_f32(mixed, rows * hidden, "mixed")?;
-    let tt = hcw_read_up_tiles(rows);
+    let tt = lane_wmma_read_up_tiles(rows);
     let grid = [
         u32_of(hidden / 16, "grid x")?,
         u32_of(rows.div_ceil(16 * tt), "grid y")?,
         1,
     ];
     let block = [256u32, 1, 1];
-    let kernel = format!("hcw_read_up_{wname}_t{terms}_g{tt}");
-    gpu.ensure_kernel_public(HCW_MODULE, HCW_SRC, &kernel)?;
+    let kernel = format!("lwmma_read_up_{wname}_t{terms}_g{tt}");
+    gpu.ensure_kernel_public(LANE_WMMA_MODULE, LANE_WMMA_SRC, &kernel)?;
     let mut args = KernargBlob::new();
     args.push_ptr(w_ptr);
     args.push_ptr(d_ptr);
@@ -319,7 +319,7 @@ pub fn hcw_read_up(
         args.as_mut_slice(),
         ReplayLaunchBindings::NONE,
     )?;
-    Ok(HcwLaunch {
+    Ok(LaneWmmaLaunch {
         kernel,
         grid,
         block,
@@ -327,15 +327,15 @@ pub fn hcw_read_up(
 }
 
 impl Gpu {
-    /// [`hcw_gemm`] with the product configuration ([`HcwCfg::default`]) and the `Gpu`-owned
+    /// [`lane_wmma_gemm`] with the product configuration ([`LaneWmmaCfg::default`]) and the `Gpu`-owned
     /// split-K scratch: allocated lazily on first use at the fixed
-    /// [`HCW_SCRATCH_PARTIAL_FLOATS`] / [`HCW_SCRATCH_COUNTERS`] size, zeroed once, never
+    /// [`LANE_WMMA_SCRATCH_PARTIAL_FLOATS`] / [`LANE_WMMA_SCRATCH_COUNTERS`] size, zeroed once, never
     /// grown (so a recorded launch's pointers never go stale). Too large a `split_k * rows * m`
-    /// is an error from [`hcw_gemm`], not a regrow.
+    /// is an error from [`lane_wmma_gemm`], not a regrow.
     #[allow(clippy::too_many_arguments)]
-    pub fn hcw_gemm_fixed(
+    pub fn lane_wmma_gemm_fixed(
         &mut self,
-        w: &HcwWeight<'_>,
+        w: &LaneWmmaWeight<'_>,
         x: &GpuTensor,
         y: &GpuTensor,
         m: usize,
@@ -343,14 +343,14 @@ impl Gpu {
         rows: usize,
         terms: usize,
         hc_act: Option<f32>,
-    ) -> HipResult<HcwLaunch> {
-        // Take the scratch out of `self` so `hcw_gemm` can borrow `self` mutably, and put it
+    ) -> HipResult<LaneWmmaLaunch> {
+        // Take the scratch out of `self` so `lane_wmma_gemm` can borrow `self` mutably, and put it
         // back on every path (including a launch error): the fixed buffer is never dropped.
-        let scratch = match self.scratch.hcw_scratch.take() {
+        let scratch = match self.scratch.lane_wmma_scratch.take() {
             Some(s) => s,
-            None => HcwScratch::new(self, HCW_SCRATCH_PARTIAL_FLOATS, HCW_SCRATCH_COUNTERS)?,
+            None => LaneWmmaScratch::new(self, LANE_WMMA_SCRATCH_PARTIAL_FLOATS, LANE_WMMA_SCRATCH_COUNTERS)?,
         };
-        let out = hcw_gemm(
+        let out = lane_wmma_gemm(
             self,
             w,
             x,
@@ -360,10 +360,10 @@ impl Gpu {
             rows,
             terms,
             hc_act,
-            HcwCfg::default(),
+            LaneWmmaCfg::default(),
             &scratch,
         );
-        self.scratch.hcw_scratch = Some(scratch);
+        self.scratch.lane_wmma_scratch = Some(scratch);
         out
     }
 }
@@ -374,36 +374,36 @@ mod tests {
 
     #[test]
     fn product_cfg_is_one_ntile_auto_split() {
-        let cfg = HcwCfg::default();
+        let cfg = LaneWmmaCfg::default();
         assert_eq!((cfg.nn, cfg.split_k), (1, 0));
     }
 
     #[test]
     fn read_up_tiles_cover_rows() {
-        assert_eq!(hcw_read_up_tiles(1), 1);
-        assert_eq!(hcw_read_up_tiles(16), 1);
-        assert_eq!(hcw_read_up_tiles(17), 2);
-        assert_eq!(hcw_read_up_tiles(32), 2);
-        assert_eq!(hcw_read_up_tiles(33), 4);
-        assert_eq!(hcw_read_up_tiles(64), 4);
+        assert_eq!(lane_wmma_read_up_tiles(1), 1);
+        assert_eq!(lane_wmma_read_up_tiles(16), 1);
+        assert_eq!(lane_wmma_read_up_tiles(17), 2);
+        assert_eq!(lane_wmma_read_up_tiles(32), 2);
+        assert_eq!(lane_wmma_read_up_tiles(33), 4);
+        assert_eq!(lane_wmma_read_up_tiles(64), 4);
     }
 
     #[test]
     fn auto_split_k_rule() {
         // HC down: M = 320, K = 10240 (80 chunks), nn = 2 -> 10 column blocks.
-        assert_eq!(hcw_auto_split_k(320, 10240, 1, 2), 20);
-        assert_eq!(hcw_auto_split_k(320, 10240, 16, 2), 20);
-        assert_eq!(hcw_auto_split_k(320, 10240, 64, 2), 20);
+        assert_eq!(lane_wmma_auto_split_k(320, 10240, 1, 2), 20);
+        assert_eq!(lane_wmma_auto_split_k(320, 10240, 16, 2), 20);
+        assert_eq!(lane_wmma_auto_split_k(320, 10240, 64, 2), 20);
         // 4096 rows: 64 token blocks * 10 = 640 > 320 even at s = 1 -> 1.
-        assert_eq!(hcw_auto_split_k(320, 10240, 4096, 2), 1);
+        assert_eq!(lane_wmma_auto_split_k(320, 10240, 4096, 2), 1);
         // Write gate: M = 4, nn = 1: 1 block, 80 chunks -> largest divisor of 80 <= 320 = 80.
-        assert_eq!(hcw_auto_split_k(4, 10240, 8, 1), 80);
+        assert_eq!(lane_wmma_auto_split_k(4, 10240, 8, 1), 80);
         // Shared gate/up: K = 2560 (20 chunks), M = 384, nn = 2 -> 12 blocks: 12 * 20 = 240.
-        assert_eq!(hcw_auto_split_k(384, 2560, 1, 2), 20);
+        assert_eq!(lane_wmma_auto_split_k(384, 2560, 1, 2), 20);
         // Shared down: K = 384 (3 chunks), M = 2560, nn = 2 -> 80 blocks: 80 * 3 = 240.
-        assert_eq!(hcw_auto_split_k(2560, 384, 8, 2), 3);
+        assert_eq!(lane_wmma_auto_split_k(2560, 384, 8, 2), 3);
         // Never below 1.
-        assert_eq!(hcw_auto_split_k(10240, 128, 4096, 2), 1);
+        assert_eq!(lane_wmma_auto_split_k(10240, 128, 4096, 2), 1);
     }
 
     /// The fixed `Gpu` scratch covers every product call: for 1..=64 rows (one token block)
@@ -414,11 +414,11 @@ mod tests {
         // (m, k) of the three product sites: HC down, shared/dense widths, wide-ish gates.
         for (m, k) in [(320usize, 10240usize), (4, 10240), (384, 2560), (2560, 384), (64, 4096)] {
             for rows in 16..=64usize {
-                let s = hcw_auto_split_k(m, k, rows, 1);
+                let s = lane_wmma_auto_split_k(m, k, rows, 1);
                 let blocks = m.div_ceil(16) * rows.div_ceil(64);
                 if s > 1 {
-                    assert!(s * rows * m <= HCW_SCRATCH_PARTIAL_FLOATS, "m {m} k {k} rows {rows}");
-                    assert!(blocks <= HCW_SCRATCH_COUNTERS, "m {m} k {k} rows {rows}");
+                    assert!(s * rows * m <= LANE_WMMA_SCRATCH_PARTIAL_FLOATS, "m {m} k {k} rows {rows}");
+                    assert!(blocks <= LANE_WMMA_SCRATCH_COUNTERS, "m {m} k {k} rows {rows}");
                 }
             }
         }

@@ -2,12 +2,12 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! HCW lab (developer screens only): the planar-W8 Q8_0 repack and the W8 twins of the tuned
-//! prefill HC kernels. The product decode launchers (`hcw_gemm`, `hcw_read_up`, the weight and
-//! scratch types) live in [`crate::hcw`]; no product dispatch reaches this module.
+//! Lane WMMA lab (developer screens only): the planar-W8 Q8_0 repack and the W8 twins of the tuned
+//! prefill HC kernels. The product decode launchers (`lane_wmma_gemm`, `lane_wmma_read_up`, the weight and
+//! scratch types) live in [`crate::lane_wmma`]; no product dispatch reaches this module.
 
 use crate::dispatch::ReplayLaunchBindings;
-use crate::hcw::{err, i32_of, need_bytes, need_f32, u32_of, HcwLaunch};
+use crate::lane_wmma::{err, i32_of, need_bytes, need_f32, u32_of, LaneWmmaLaunch};
 use crate::{DType, Gpu, GpuTensor};
 use hip_bridge::{HipResult, KernargBlob};
 
@@ -60,23 +60,23 @@ mod tests {
 // ---- prefill W8 twins ----
 //
 // Deliverable B: W8 twins of the tuned prefill kernels (rows > 64; the A1/A2 decode family in
-// `crate::hcw` also runs there). The weight is the planar W8 (`q` i8 `[m, k]`, `d` f16 `[m, k / 32]`); the
+// `crate::lane_wmma` also runs there). The weight is the planar W8 (`q` i8 `[m, k]`, `d` f16 `[m, k / 32]`); the
 // per-32 scale is applied in the f32 accumulation, never in an operand.
 
 /// `kernels/src/qwen4_hc_down_fused_w8.gfx1201.hip`: twin of `qwen4_hc_down_fused.hip`.
-pub const HCW_HC_DOWN_W8_SRC: &str =
+pub const LANE_WMMA_HC_DOWN_W8_SRC: &str =
     include_str!("../../../kernels/src/qwen4_hc_down_fused_w8.gfx1201.hip");
 /// `kernels/src/hyper_read_up_wmma_w8.gfx1201.hip`: twin of the `_v2` gfx1201 HC up+mix read.
-pub const HCW_READ_UP_W8_SRC: &str =
+pub const LANE_WMMA_HC_UP_W8_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_wmma_w8.gfx1201.hip");
 
-const HCW_HC_DOWN_W8_MODULE: &str = "hcw_hc_down_fused_w8";
-const HCW_HC_DOWN_W8_ENTRY: &str = "qwen4_hc_down_fused_w8_b64_k32";
-const HCW_READ_UP_W8_MODULE: &str = "hcw_read_up_wmma_w8";
-const HCW_READ_UP_W8_ENTRY: &str = "hyper_read_up_wmma_w8_gfx1201_v2";
+const LANE_WMMA_HC_DOWN_W8_MODULE: &str = "lane_wmma_hc_down_fused_w8";
+const LANE_WMMA_HC_DOWN_W8_ENTRY: &str = "qwen4_hc_down_fused_w8_b64_k32";
+const LANE_WMMA_HC_UP_W8_MODULE: &str = "lane_wmma_hc_up_w8";
+const LANE_WMMA_HC_UP_W8_ENTRY: &str = "hyper_read_up_wmma_w8_gfx1201_v2";
 /// Dynamic LDS of the W8 `_v2` read entry (`HRW_LDS_BYTES`): the 64 x (320 + 8) BF16 weight tile,
 /// the 2 x 2048-entry gate table and the 10 x 64 F16 scale table.
-const HCW_READ_UP_W8_LDS: u32 = 64 * (320 + 8) * 2 + 16384 + 10 * 64 * 2;
+const LANE_WMMA_HC_UP_W8_LDS: u32 = 64 * (320 + 8) * 2 + 16384 + 10 * 64 * 2;
 
 fn need_dtype(t: &GpuTensor, want: DType, what: &str) -> HipResult<()> {
     if t.dtype != want {
@@ -98,7 +98,7 @@ fn need_aligned(ptr: usize, align: usize, what: &str) -> HipResult<()> {
 /// `out_bf16` BF16 `[rows, 320]`. Only `m == 320`, `k == 10240` (the kernel's constants).
 /// Rows above 64 are what it is tuned for, but any `rows >= 1` runs.
 #[allow(clippy::too_many_arguments)]
-pub fn hcw_hc_down_fused_w8(
+pub fn lane_wmma_hc_down_fused_w8(
     gpu: &mut Gpu,
     q: &GpuTensor,
     d: &GpuTensor,
@@ -108,24 +108,24 @@ pub fn hcw_hc_down_fused_w8(
     k: usize,
     rows: usize,
     scale: f32,
-) -> HipResult<HcwLaunch> {
+) -> HipResult<LaneWmmaLaunch> {
     if gpu.arch != "gfx1201" {
         return Err(err(format!(
-            "hcw_hc_down_fused_w8: gfx1201 only (arch {})",
+            "lane_wmma_hc_down_fused_w8: gfx1201 only (arch {})",
             gpu.arch
         )));
     }
     if m != 320 || k != 10240 {
         return Err(err(format!(
-            "hcw_hc_down_fused_w8: m 320, k 10240 only (m {m}, k {k})"
+            "lane_wmma_hc_down_fused_w8: m 320, k 10240 only (m {m}, k {k})"
         )));
     }
     if rows == 0 {
-        return Err(err("hcw_hc_down_fused_w8: rows must be non-zero"));
+        return Err(err("lane_wmma_hc_down_fused_w8: rows must be non-zero"));
     }
     if rows * k * 2 >= (1usize << 32) {
         return Err(err(format!(
-            "hcw_hc_down_fused_w8: rows {rows} x k {k} x 2 bytes exceeds 2^32"
+            "lane_wmma_hc_down_fused_w8: rows {rows} x k {k} x 2 bytes exceeds 2^32"
         )));
     }
     need_bytes(q, m * k, "hc_down w8 q")?;
@@ -146,9 +146,9 @@ pub fn hcw_hc_down_fused_w8(
     let grid = [u32_of(rows.div_ceil(64), "grid x")?, 1, 1];
     let block = [256u32, 1, 1];
     gpu.ensure_kernel_public(
-        HCW_HC_DOWN_W8_MODULE,
-        HCW_HC_DOWN_W8_SRC,
-        HCW_HC_DOWN_W8_ENTRY,
+        LANE_WMMA_HC_DOWN_W8_MODULE,
+        LANE_WMMA_HC_DOWN_W8_SRC,
+        LANE_WMMA_HC_DOWN_W8_ENTRY,
     )?;
     // Argument order of the kernel: Q, D, X, out, K, B, scale.
     let mut args = KernargBlob::new();
@@ -161,15 +161,15 @@ pub fn hcw_hc_down_fused_w8(
     args.push_f32(scale);
     args.pad_to(16);
     gpu.launch_blob_recorded(
-        HCW_HC_DOWN_W8_ENTRY,
+        LANE_WMMA_HC_DOWN_W8_ENTRY,
         grid,
         block,
         0,
         args.as_mut_slice(),
         ReplayLaunchBindings::NONE,
     )?;
-    Ok(HcwLaunch {
-        kernel: HCW_HC_DOWN_W8_ENTRY.to_string(),
+    Ok(LaneWmmaLaunch {
+        kernel: LANE_WMMA_HC_DOWN_W8_ENTRY.to_string(),
         grid,
         block,
     })
@@ -181,26 +181,26 @@ pub fn hcw_hc_down_fused_w8(
 /// route passes; `p.up_weight` is ignored (`q` i8 `[4 * hidden, 320]`, `d` f16
 /// `[4 * hidden, 10]` are the weight). Only `low_rank == 320`, `hidden % 16 == 0`; any
 /// `rows >= 1` runs (the BF16 route only takes `_v2` from 128 rows).
-pub fn hcw_read_up_wmma_w8(
+pub fn lane_wmma_hc_up_w8(
     gpu: &mut Gpu,
     q: &GpuTensor,
     d: &GpuTensor,
     p: &crate::tensor_ops::HyperReadUpFused<'_>,
-) -> HipResult<HcwLaunch> {
+) -> HipResult<LaneWmmaLaunch> {
     if gpu.arch != "gfx1201" {
         return Err(err(format!(
-            "hcw_read_up_wmma_w8: gfx1201 only (arch {})",
+            "lane_wmma_hc_up_w8: gfx1201 only (arch {})",
             gpu.arch
         )));
     }
     if p.rows == 0 || p.hidden == 0 || p.hidden % 16 != 0 || p.low_rank != 320 {
         return Err(err(format!(
-            "hcw_read_up_wmma_w8: rows {} non-zero, hidden {} a multiple of 16, low_rank {} == 320",
+            "lane_wmma_hc_up_w8: rows {} non-zero, hidden {} a multiple of 16, low_rank {} == 320",
             p.rows, p.hidden, p.low_rank
         )));
     }
     if p.normalized_bf16 {
-        return Err(err("hcw_read_up_wmma_w8: normalized must be the F16 copy"));
+        return Err(err("lane_wmma_hc_up_w8: normalized must be the F16 copy"));
     }
     let wide = 4 * p.hidden;
     need_bytes(q, wide * p.low_rank, "read_up w8 q")?;
@@ -226,9 +226,9 @@ pub fn hcw_read_up_wmma_w8(
     let grid = [u32_of(p.hidden / 16, "grid x")?, u32_of(groups, "grid y")?, 1];
     let block = [512u32, 1, 1];
     gpu.ensure_kernel_public(
-        HCW_READ_UP_W8_MODULE,
-        HCW_READ_UP_W8_SRC,
-        HCW_READ_UP_W8_ENTRY,
+        LANE_WMMA_HC_UP_W8_MODULE,
+        LANE_WMMA_HC_UP_W8_SRC,
+        LANE_WMMA_HC_UP_W8_ENTRY,
     )?;
     // Argument order of the kernel: Wq, Wd, X, normalized, mixed, hidden, K, N.
     let mut args = KernargBlob::new();
@@ -242,15 +242,15 @@ pub fn hcw_read_up_wmma_w8(
     args.push_i32(i32_of(p.rows, "rows")?);
     args.pad_to(16);
     gpu.launch_blob_recorded(
-        HCW_READ_UP_W8_ENTRY,
+        LANE_WMMA_HC_UP_W8_ENTRY,
         grid,
         block,
-        HCW_READ_UP_W8_LDS,
+        LANE_WMMA_HC_UP_W8_LDS,
         args.as_mut_slice(),
         ReplayLaunchBindings::NONE,
     )?;
-    Ok(HcwLaunch {
-        kernel: HCW_READ_UP_W8_ENTRY.to_string(),
+    Ok(LaneWmmaLaunch {
+        kernel: LANE_WMMA_HC_UP_W8_ENTRY.to_string(),
         grid,
         block,
     })

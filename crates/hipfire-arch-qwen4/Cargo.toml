@@ -177,7 +177,7 @@ required-features = ["lab"]
 name = "bench_ep_gather"
 required-features = ["lab"]
 
-# HCW screen: purpose-built WMMA HC mixer / shared-expert kernels (rdna_compute::hcw_lab) vs incumbents.
+# Lane WMMA screen: purpose-built WMMA HC mixer / shared-expert kernels (rdna_compute::lane_wmma{,_lab}) vs incumbents.
 [[example]]
 name = "hcwmma_screen"
 required-features = ["lab"]

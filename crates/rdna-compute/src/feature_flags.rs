@@ -218,11 +218,11 @@ pub struct FeatureFlags {
     /// `gemv_bf16_xf32_k4_rows` reads each weight quarter once per output tile and applies it to
     /// every row, bitwise the k4 singleton's value. Default on for exact gfx1201.
     pub qwen4_hc_k4_allrows: bool,
-    /// BF16 WMMA (HCW) route for the HC down / HC up / dense BF16 rows projections at 16..=64
-    /// rows (`HIPFIRE_QWEN4_HCW`): purpose-built kernels with a deterministic split-K fold; the
+    /// BF16 WMMA (lane WMMA) route for the HC down / HC up / dense BF16 rows projections at 16..=64
+    /// rows (`HIPFIRE_QWEN4_LANE_WMMA`): purpose-built kernels with a deterministic split-K fold; the
     /// outputs are not bitwise the SIMT route's (f32 summation order). Default on for exact
     /// gfx1201 (`=0` kills it).
-    pub qwen4_hcw: bool,
+    pub qwen4_lane_wmma: bool,
     /// Decode HC read norm + the paired write's k4 gate GEMV in one launch
     /// (`HIPFIRE_QWEN4_HC_PAIR_DECODE`, 1..=8 rows): bitwise the unfused `hyper_norm` +
     /// `gemv_bf16_xf32_k4` sequence. Default on for exact gfx1201 (`=0` kills it).
@@ -1162,7 +1162,7 @@ impl FeatureFlags {
             qwen4_bf16_rows_otile: parse_bool("HIPFIRE_QWEN4_BF16_ROWS_OTILE").unwrap_or(true),
             qwen4_bf16_allrows: parse_bool("HIPFIRE_QWEN4_BF16_ALLROWS").unwrap_or(true),
             qwen4_hc_k4_allrows: parse_bool("HIPFIRE_QWEN4_HC_K4_ALLROWS").unwrap_or(true),
-            qwen4_hcw: parse_bool("HIPFIRE_QWEN4_HCW").unwrap_or(true),
+            qwen4_lane_wmma: parse_bool("HIPFIRE_QWEN4_LANE_WMMA").unwrap_or(true),
             qwen4_hc_pair_decode: parse_bool("HIPFIRE_QWEN4_HC_PAIR_DECODE").unwrap_or(true),
             stream_ordered_copies: parse_bool("HIPFIRE_STREAM_ORDERED_COPIES").unwrap_or(true),
             qwen4_hc_pair_allrows: parse_bool("HIPFIRE_QWEN4_HC_PAIR_ALLROWS").unwrap_or(true),
@@ -1963,11 +1963,11 @@ impl FeatureFlags {
         self.qwen4_hc_k4_allrows && self.arch == "gfx1201"
     }
 
-    /// HCW WMMA route for the Qwen4 HC down / HC up / dense BF16 rows projections at
-    /// 16..=`WIDE_VERIFY_MAX_ROWS` rows (`HIPFIRE_QWEN4_HCW`, default on, `=0` kills it).
+    /// lane WMMA route for the Qwen4 HC down / HC up / dense BF16 rows projections at
+    /// 16..=`WIDE_VERIFY_MAX_ROWS` rows (`HIPFIRE_QWEN4_LANE_WMMA`, default on, `=0` kills it).
     /// Exact gfx1201 only. Outputs are not bitwise the SIMT route's (f32 summation order).
-    pub fn qwen4_hcw_enabled(&self) -> bool {
-        self.qwen4_hcw && self.arch == "gfx1201"
+    pub fn qwen4_lane_wmma_enabled(&self) -> bool {
+        self.qwen4_lane_wmma && self.arch == "gfx1201"
     }
 
     /// Decode HC read norm + paired write k4 gate GEMV in one launch
@@ -2149,7 +2149,7 @@ impl FeatureFlags {
             qwen4_bf16_rows_otile: false,
             qwen4_bf16_allrows: false,
             qwen4_hc_k4_allrows: false,
-            qwen4_hcw: false,
+            qwen4_lane_wmma: false,
             qwen4_hc_pair_decode: false,
             stream_ordered_copies: false,
             qwen4_hc_pair_allrows: false,
@@ -3585,12 +3585,12 @@ mod tests {
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_hc_k4_allrows_enabled());
     }
 
-    /// The HCW WMMA decode route is default on (`=0` kills) and reaches exact gfx1201 only.
+    /// The lane WMMA decode route is default on (`=0` kills) and reaches exact gfx1201 only.
     #[test]
-    fn qwen4_hcw_flag_is_default_on_and_exact_gfx1201() {
+    fn qwen4_lane_wmma_flag_is_default_on_and_exact_gfx1201() {
         let with = |value: &'static str| {
             move |n: &str| -> std::result::Result<String, ()> {
-                if n == "HIPFIRE_QWEN4_HCW" {
+                if n == "HIPFIRE_QWEN4_LANE_WMMA" {
                     Ok(value.into())
                 } else {
                     Err(())
@@ -3601,13 +3601,13 @@ mod tests {
             "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
         ] {
             let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
-            assert_eq!(unset.qwen4_hcw_enabled(), arch == "gfx1201", "{arch}: unset");
+            assert_eq!(unset.qwen4_lane_wmma_enabled(), arch == "gfx1201", "{arch}: unset");
             let off = FeatureFlags::from_lookup(arch, with("0"));
-            assert!(!off.qwen4_hcw_enabled(), "{arch}: 0");
+            assert!(!off.qwen4_lane_wmma_enabled(), "{arch}: 0");
             let on = FeatureFlags::from_lookup(arch, with("1"));
-            assert_eq!(on.qwen4_hcw_enabled(), arch == "gfx1201", "{arch}: 1");
+            assert_eq!(on.qwen4_lane_wmma_enabled(), arch == "gfx1201", "{arch}: 1");
         }
-        assert!(!FeatureFlags::for_test("gfx1201").qwen4_hcw_enabled());
+        assert!(!FeatureFlags::for_test("gfx1201").qwen4_lane_wmma_enabled());
     }
 
     /// The decode HC read/write pair fusion is default on (`=0` kills) and reaches exact gfx1201 only.

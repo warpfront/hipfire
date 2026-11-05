@@ -1628,15 +1628,15 @@ fn execute_hyper_read_inner(
                 gpu.gemv_bf16_xf32_k4_rows(down.buf, &normalized, low, down.m, down.k, act, op.rows)
             })
         };
-        if gpu.hcw_applies(op.rows, rdna_compute::gemv::HCW_MIN_ROWS_DOWN)
+        if gpu.lane_wmma_applies(op.rows)
             && down.dtype == DType::BF16
             && down.awq_scale.is_none()
             && down.k % 128 == 0
         {
-            // HCW WMMA down + hc_act epilogue. One BF16 term is exact: `normalized` is
+            // lane WMMA down + hc_act epilogue. One BF16 term is exact: `normalized` is
             // `hyper_norm`'s BF16-rounded output and the weight is BF16.
-            hip(gpu.hcw_gemm_fixed(
-                &rdna_compute::hcw::HcwWeight::Bf16(down.buf),
+            hip(gpu.lane_wmma_gemm_fixed(
+                &rdna_compute::lane_wmma::LaneWmmaWeight::Bf16(down.buf),
                 &normalized,
                 &low,
                 down.m,
@@ -1730,10 +1730,10 @@ fn execute_hyper_read_inner(
                 return Ok(());
             }
         }
-        // Exact gfx1201 at HCW_MIN_ROWS_UP..=64 rows, the k4 route's F32 `normalized` / `low`
-        // (`low` is hc_act's BF16-rounded output, so one BF16 term is exact): the HCW WMMA
+        // Exact gfx1201 at LANE_WMMA_MIN_ROWS..=64 rows, the k4 route's F32 `normalized` / `low`
+        // (`low` is hc_act's BF16-rounded output, so one BF16 term is exact): the lane WMMA
         // up read. The launcher needs `low_rank % 32 == 0`, `low_rank <= 512`, `hidden % 16 == 0`.
-        if gpu.hcw_applies(op.rows, rdna_compute::gemv::HCW_MIN_ROWS_UP)
+        if gpu.lane_wmma_applies(op.rows)
             && !read.normalized_bf16
             && read.low.dtype == DType::F32
             && read.normalized.dtype == DType::F32
@@ -1742,9 +1742,9 @@ fn execute_hyper_read_inner(
             && op.hidden % 16 == 0
         {
             return hip(
-                rdna_compute::hcw::hcw_read_up(
+                rdna_compute::lane_wmma::lane_wmma_read_up(
                     gpu,
-                    &rdna_compute::hcw::HcwWeight::Bf16(op.input_mix_up.buf),
+                    &rdna_compute::lane_wmma::LaneWmmaWeight::Bf16(op.input_mix_up.buf),
                     read.low,
                     read.normalized,
                     read.mixed,

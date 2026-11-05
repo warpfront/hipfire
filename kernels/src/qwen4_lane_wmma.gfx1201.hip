@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
-// hipfire — HCW lab: purpose-built gfx1201 WMMA kernels for the Qwen3.8 Flash-Next HC mixers and
+// hipfire — lane-WMMA lab: purpose-built gfx1201 WMMA kernels for the Qwen3.8 Flash-Next HC mixers and
 // the shared expert (decode family, rows 1..=64 and also correct for rows > 64).
 //
 // Weights are BF16 ([M, K] u16) or planar W8 (q i8 [M, K], d f16 [M, K/32], value q * d).  The
@@ -15,68 +15,68 @@
 // substep at k; b = 8 BF16 of W row (n0 + l16), same K elements;
 // acc[i] = C[token t0 + 8 * kh + i][column n0 + l16], C = X . W^T.
 //
-// A1: hcw_gemm_{bf16,w8}_t{1,2,3}_m{1,2,3,4}_n{1,2}   Y[rows, M] = epi(X . W^T)
-// A2: hcw_read_up_{bf16,w8}_t{1,2,3}                   HC up projection + branch mix
+// A1: lwmma_gemm_{bf16,w8}_t{1,2,3}_m{1,2,3,4}_n{1,2}   Y[rows, M] = epi(X . W^T)
+// A2: lwmma_read_up_{bf16,w8}_t{1,2,3}                   HC up projection + branch mix
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
 
 // The epilogues are the reference kernels' expressions: no multiply-add contraction.
 #pragma clang fp contract(off)
 
-typedef short __attribute__((ext_vector_type(8))) hcw_bf16x8_t;
-typedef float __attribute__((ext_vector_type(8))) hcw_f8_t;
+typedef short __attribute__((ext_vector_type(8))) lwmma_bf16x8_t;
+typedef float __attribute__((ext_vector_type(8))) lwmma_f8_t;
 
 // tensor_ops.hip's bf16_to_f32(bf16_round(v)) == hip_bfloat16's RNE.
-static __device__ __forceinline__ float hcw_bf16r(float v) {
+static __device__ __forceinline__ float lwmma_bf16r(float v) {
     return static_cast<float>(static_cast<hip_bfloat16>(v));
 }
 
 // Finite-input BF16 RNE bits: u += 0x7fff + ((u >> 16) & 1); bits = u >> 16.
-static __device__ __forceinline__ unsigned int hcw_rne_bits(float x) {
+static __device__ __forceinline__ unsigned int lwmma_rne_bits(float x) {
     unsigned int u = __float_as_uint(x);
     u += 0x7fffu + ((u >> 16) & 1u);
     return u >> 16;
 }
 
-static __device__ __forceinline__ float hcw_bits_to_f32(unsigned int bits) {
+static __device__ __forceinline__ float lwmma_bits_to_f32(unsigned int bits) {
     return __uint_as_float(bits << 16);
 }
 
 // 8 f32 activations -> NT BF16 fragments (hi, lo, lo2).
 template <int NT>
-static __device__ __forceinline__ void hcw_split8(const float4 xa, const float4 xb, hcw_bf16x8_t* out) {
+static __device__ __forceinline__ void lwmma_split8(const float4 xa, const float4 xb, lwmma_bf16x8_t* out) {
     const float x[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
     unsigned int hi[8], lo[8], lo2[8];
 #pragma unroll
     for (int e = 0; e < 8; e++) {
-        hi[e] = hcw_rne_bits(x[e]);
+        hi[e] = lwmma_rne_bits(x[e]);
         if constexpr (NT >= 2) {
-            const float r = x[e] - hcw_bits_to_f32(hi[e]);
-            lo[e] = hcw_rne_bits(r);
+            const float r = x[e] - lwmma_bits_to_f32(hi[e]);
+            lo[e] = lwmma_rne_bits(r);
             if constexpr (NT >= 3) {
-                const float r2 = (x[e] - hcw_bits_to_f32(hi[e])) - hcw_bits_to_f32(lo[e]);
-                lo2[e] = hcw_rne_bits(r2);
+                const float r2 = (x[e] - lwmma_bits_to_f32(hi[e])) - lwmma_bits_to_f32(lo[e]);
+                lo2[e] = lwmma_rne_bits(r2);
             }
         }
     }
     uint4 p;
     p.x = hi[0] | (hi[1] << 16); p.y = hi[2] | (hi[3] << 16);
     p.z = hi[4] | (hi[5] << 16); p.w = hi[6] | (hi[7] << 16);
-    out[0] = __builtin_bit_cast(hcw_bf16x8_t, p);
+    out[0] = __builtin_bit_cast(lwmma_bf16x8_t, p);
     if constexpr (NT >= 2) {
         p.x = lo[0] | (lo[1] << 16); p.y = lo[2] | (lo[3] << 16);
         p.z = lo[4] | (lo[5] << 16); p.w = lo[6] | (lo[7] << 16);
-        out[1] = __builtin_bit_cast(hcw_bf16x8_t, p);
+        out[1] = __builtin_bit_cast(lwmma_bf16x8_t, p);
     }
     if constexpr (NT >= 3) {
         p.x = lo2[0] | (lo2[1] << 16); p.y = lo2[2] | (lo2[3] << 16);
         p.z = lo2[4] | (lo2[5] << 16); p.w = lo2[6] | (lo2[7] << 16);
-        out[2] = __builtin_bit_cast(hcw_bf16x8_t, p);
+        out[2] = __builtin_bit_cast(lwmma_bf16x8_t, p);
     }
 }
 
 // int8 -> f32 -> BF16 bits (exact: |q| <= 128 has at most 7 mantissa bits) for 8 packed bytes.
-static __device__ __forceinline__ hcw_bf16x8_t hcw_q8_frag(const uint2 u) {
+static __device__ __forceinline__ lwmma_bf16x8_t lwmma_q8_frag(const uint2 u) {
     const unsigned int w[2] = {u.x, u.y};
     uint4 p;
     unsigned int o[4];
@@ -90,11 +90,11 @@ static __device__ __forceinline__ hcw_bf16x8_t hcw_q8_frag(const uint2 u) {
         }
     }
     p.x = o[0]; p.y = o[1]; p.z = o[2]; p.w = o[3];
-    return __builtin_bit_cast(hcw_bf16x8_t, p);
+    return __builtin_bit_cast(lwmma_bf16x8_t, p);
 }
 
 // hc_act from gemv_bf16_xf32_k4.
-static __device__ __forceinline__ float hcw_hc_act(float value, float scale) {
+static __device__ __forceinline__ float lwmma_hc_act(float value, float scale) {
     value = static_cast<float>(static_cast<hip_bfloat16>(value));
     value *= scale;
     value = static_cast<float>(static_cast<hip_bfloat16>(value));
@@ -108,7 +108,7 @@ static __device__ __forceinline__ float hcw_hc_act(float value, float scale) {
 // K % (128 * split_k) == 0.  split_k > 1: partial[kz][token][M] + last-block deterministic fold
 // (ascending kz from 0.0f); `counters` [gridDim.z * gridDim.x] is left zeroed.
 template <int WF, int NT, int MT, int NN>
-static __device__ __forceinline__ void hcw_gemm_body(
+static __device__ __forceinline__ void lwmma_gemm_body(
     const void* __restrict__ Wv,
     const _Float16* __restrict__ D,
     const float* __restrict__ X,
@@ -146,16 +146,16 @@ static __device__ __forceinline__ void hcw_gemm_body(
     for (int mt = 0; mt < MT; mt++)
         xr[mt] = X + (size_t)min(t0 + mt * 16 + l16, rows - 1) * K + 8 * kh;
 
-    hcw_f8_t acc[MT][NN];
+    lwmma_f8_t acc[MT][NN];
 #pragma unroll
     for (int mt = 0; mt < MT; mt++)
 #pragma unroll
-        for (int nn = 0; nn < NN; nn++) acc[mt][nn] = hcw_f8_t{0, 0, 0, 0, 0, 0, 0, 0};
+        for (int nn = 0; nn < NN; nn++) acc[mt][nn] = lwmma_f8_t{0, 0, 0, 0, 0, 0, 0, 0};
 
 #pragma unroll 2
     for (int b = 0; b < nblk; b++) {
         const int k0 = kbeg + b * 32;
-        hcw_bf16x8_t wf[2][NN];
+        lwmma_bf16x8_t wf[2][NN];
         float dv[NN];
 #pragma unroll
         for (int nn = 0; nn < NN; nn++) {
@@ -163,9 +163,9 @@ static __device__ __forceinline__ void hcw_gemm_body(
             for (int s = 0; s < 2; s++) {
                 const int ke = k0 + s * 16 + 8 * kh;
                 if (WF == 0)
-                    wf[s][nn] = __builtin_bit_cast(hcw_bf16x8_t, *(const uint4*)(wb[nn] + ke));
+                    wf[s][nn] = __builtin_bit_cast(lwmma_bf16x8_t, *(const uint4*)(wb[nn] + ke));
                 else
-                    wf[s][nn] = hcw_q8_frag(*(const uint2*)(wq[nn] + ke));
+                    wf[s][nn] = lwmma_q8_frag(*(const uint2*)(wq[nn] + ke));
             }
             dv[nn] = WF ? (float)dr[nn][k0 >> 5] : 0.0f;
         }
@@ -178,19 +178,19 @@ static __device__ __forceinline__ void hcw_gemm_body(
                 xv[mt][s][0] = p[0];
                 xv[mt][s][1] = p[1];
             }
-        hcw_f8_t blk[MT][NN];
+        lwmma_f8_t blk[MT][NN];
         if (WF) {
 #pragma unroll
             for (int mt = 0; mt < MT; mt++)
 #pragma unroll
-                for (int nn = 0; nn < NN; nn++) blk[mt][nn] = hcw_f8_t{0, 0, 0, 0, 0, 0, 0, 0};
+                for (int nn = 0; nn < NN; nn++) blk[mt][nn] = lwmma_f8_t{0, 0, 0, 0, 0, 0, 0, 0};
         }
 #pragma unroll
         for (int s = 0; s < 2; s++) {
 #pragma unroll
             for (int mt = 0; mt < MT; mt++) {
-                hcw_bf16x8_t xa[NT];
-                hcw_split8<NT>(xv[mt][s][0], xv[mt][s][1], xa);
+                lwmma_bf16x8_t xa[NT];
+                lwmma_split8<NT>(xv[mt][s][0], xv[mt][s][1], xa);
 #pragma unroll
                 for (int t = 0; t < NT; t++) {
 #pragma unroll
@@ -236,7 +236,7 @@ static __device__ __forceinline__ void hcw_gemm_body(
         if (token >= rows || col >= M) continue;
         const float v = (red[e] + red[WAVE_STRIDE + e]) + (red[2 * WAVE_STRIDE + e] + red[3 * WAVE_STRIDE + e]);
         if (split_k == 1) {
-            Y[(size_t)token * M + col] = hc_act ? hcw_hc_act(v, scale) : v;
+            Y[(size_t)token * M + col] = hc_act ? lwmma_hc_act(v, scale) : v;
         } else {
             partial[((size_t)kz * rows + token) * M + col] = v;
         }
@@ -285,35 +285,35 @@ static __device__ __forceinline__ void hcw_gemm_body(
     }
 #pragma unroll
     for (int u = 0; u < EPT; u++)
-        if (ok[u]) Y[off[u]] = hc_act ? hcw_hc_act(v[u], scale) : v[u];
+        if (ok[u]) Y[off[u]] = hc_act ? lwmma_hc_act(v[u], scale) : v[u];
     if (tid == 0) *counter = 0u;
 }
 
-#define HCW_GEMM_ENTRY(WFN, WF, NT, MT, NN)                                                         \
-    extern "C" __global__ __launch_bounds__(128) void hcw_gemm_##WFN##_t##NT##_m##MT##_n##NN(        \
+#define LWMMA_GEMM_ENTRY(WFN, WF, NT, MT, NN)                                                         \
+    extern "C" __global__ __launch_bounds__(128) void lwmma_gemm_##WFN##_t##NT##_m##MT##_n##NN(        \
         const void* __restrict__ W, const _Float16* __restrict__ D, const float* __restrict__ X,    \
         float* __restrict__ Y, float* __restrict__ partial, unsigned int* __restrict__ counters,    \
         int M, int K, int rows, int split_k, float scale, int hc_act) {                             \
-        hcw_gemm_body<WF, NT, MT, NN>(W, D, X, Y, partial, counters, M, K, rows, split_k, scale,    \
+        lwmma_gemm_body<WF, NT, MT, NN>(W, D, X, Y, partial, counters, M, K, rows, split_k, scale,    \
                                       hc_act);                                                      \
     }
 
-#define HCW_GEMM_MN(WFN, WF, NT)          \
-    HCW_GEMM_ENTRY(WFN, WF, NT, 1, 1)     \
-    HCW_GEMM_ENTRY(WFN, WF, NT, 1, 2)     \
-    HCW_GEMM_ENTRY(WFN, WF, NT, 2, 1)     \
-    HCW_GEMM_ENTRY(WFN, WF, NT, 2, 2)     \
-    HCW_GEMM_ENTRY(WFN, WF, NT, 3, 1)     \
-    HCW_GEMM_ENTRY(WFN, WF, NT, 3, 2)     \
-    HCW_GEMM_ENTRY(WFN, WF, NT, 4, 1)     \
-    HCW_GEMM_ENTRY(WFN, WF, NT, 4, 2)
+#define LWMMA_GEMM_MN(WFN, WF, NT)          \
+    LWMMA_GEMM_ENTRY(WFN, WF, NT, 1, 1)     \
+    LWMMA_GEMM_ENTRY(WFN, WF, NT, 1, 2)     \
+    LWMMA_GEMM_ENTRY(WFN, WF, NT, 2, 1)     \
+    LWMMA_GEMM_ENTRY(WFN, WF, NT, 2, 2)     \
+    LWMMA_GEMM_ENTRY(WFN, WF, NT, 3, 1)     \
+    LWMMA_GEMM_ENTRY(WFN, WF, NT, 3, 2)     \
+    LWMMA_GEMM_ENTRY(WFN, WF, NT, 4, 1)     \
+    LWMMA_GEMM_ENTRY(WFN, WF, NT, 4, 2)
 
-HCW_GEMM_MN(bf16, 0, 1)
-HCW_GEMM_MN(bf16, 0, 2)
-HCW_GEMM_MN(bf16, 0, 3)
-HCW_GEMM_MN(w8, 1, 1)
-HCW_GEMM_MN(w8, 1, 2)
-HCW_GEMM_MN(w8, 1, 3)
+LWMMA_GEMM_MN(bf16, 0, 1)
+LWMMA_GEMM_MN(bf16, 0, 2)
+LWMMA_GEMM_MN(bf16, 0, 3)
+LWMMA_GEMM_MN(w8, 1, 1)
+LWMMA_GEMM_MN(w8, 1, 2)
+LWMMA_GEMM_MN(w8, 1, 3)
 
 // ---------------------------------------------------------------------------
 // A2: HC up projection [4 * hidden, K] of `low` [rows, K] with hyper_read_projected_f32's branch
@@ -321,7 +321,7 @@ HCW_GEMM_MN(w8, 1, 3)
 // KP = 8 / TT K parts.  Every wave parks its partial logits in LDS; the epilogue then runs on all
 // 256 threads, one (token, column) output each pass.  K % 32 == 0, K <= 512, hidden % 16 == 0.
 template <int WF, int NT, int TT>
-static __device__ __forceinline__ void hcw_read_up_body(
+static __device__ __forceinline__ void lwmma_read_up_body(
     const void* __restrict__ Wv,
     const _Float16* __restrict__ D,
     const float* __restrict__ low,
@@ -341,9 +341,9 @@ static __device__ __forceinline__ void hcw_read_up_body(
     const int b0 = part * nb / KP;
     const int b1 = (part + 1) * nb / KP;
 
-    hcw_f8_t acc[4];
+    lwmma_f8_t acc[4];
 #pragma unroll
-    for (int br = 0; br < 4; br++) acc[br] = hcw_f8_t{0, 0, 0, 0, 0, 0, 0, 0};
+    for (int br = 0; br < 4; br++) acc[br] = lwmma_f8_t{0, 0, 0, 0, 0, 0, 0, 0};
 
     if (t0 < rows) {
         const float* xr = low + (size_t)min(t0 + l16, rows - 1) * K + 8 * kh;
@@ -360,7 +360,7 @@ static __device__ __forceinline__ void hcw_read_up_body(
 #pragma unroll 1
         for (int b = b0; b < b1; b++) {
             const int k0 = b * 32;
-            hcw_bf16x8_t wf[2][4];
+            lwmma_bf16x8_t wf[2][4];
             float dv[4];
 #pragma unroll
             for (int br = 0; br < 4; br++) {
@@ -368,9 +368,9 @@ static __device__ __forceinline__ void hcw_read_up_body(
                 for (int s = 0; s < 2; s++) {
                     const int ke = k0 + s * 16 + 8 * kh;
                     if (WF == 0)
-                        wf[s][br] = __builtin_bit_cast(hcw_bf16x8_t, *(const uint4*)(wb[br] + ke));
+                        wf[s][br] = __builtin_bit_cast(lwmma_bf16x8_t, *(const uint4*)(wb[br] + ke));
                     else
-                        wf[s][br] = hcw_q8_frag(*(const uint2*)(wq[br] + ke));
+                        wf[s][br] = lwmma_q8_frag(*(const uint2*)(wq[br] + ke));
                 }
                 dv[br] = WF ? (float)dr[br][b] : 0.0f;
             }
@@ -381,15 +381,15 @@ static __device__ __forceinline__ void hcw_read_up_body(
                 xv[s][0] = p[0];
                 xv[s][1] = p[1];
             }
-            hcw_f8_t blk[4];
+            lwmma_f8_t blk[4];
             if (WF) {
 #pragma unroll
-                for (int br = 0; br < 4; br++) blk[br] = hcw_f8_t{0, 0, 0, 0, 0, 0, 0, 0};
+                for (int br = 0; br < 4; br++) blk[br] = lwmma_f8_t{0, 0, 0, 0, 0, 0, 0, 0};
             }
 #pragma unroll
             for (int s = 0; s < 2; s++) {
-                hcw_bf16x8_t xa[NT];
-                hcw_split8<NT>(xv[s][0], xv[s][1], xa);
+                lwmma_bf16x8_t xa[NT];
+                lwmma_split8<NT>(xv[s][0], xv[s][1], xa);
 #pragma unroll
                 for (int t = 0; t < NT; t++) {
 #pragma unroll
@@ -438,32 +438,32 @@ static __device__ __forceinline__ void hcw_read_up_body(
             float h = red[((0 * TT + t) * 32 + br * 8 + fi) * 32 + fl];
 #pragma unroll
             for (int p = 1; p < KP; p++) h += red[((p * TT + t) * 32 + br * 8 + fi) * 32 + fl];
-            const float gate_input = hcw_bf16r(h);
-            const float gate = hcw_bf16r(1.0f / (1.0f + expf(-gate_input)));
-            const float normed = hcw_bf16r(nv[br]);
-            const float term = hcw_bf16r(gate * normed);
+            const float gate_input = lwmma_bf16r(h);
+            const float gate = lwmma_bf16r(1.0f / (1.0f + expf(-gate_input)));
+            const float normed = lwmma_bf16r(nv[br]);
+            const float term = lwmma_bf16r(gate * normed);
             value += term;
         }
-        mixed[(size_t)token * hidden + j] = hcw_bf16r(value / 4.0f);
+        mixed[(size_t)token * hidden + j] = lwmma_bf16r(value / 4.0f);
     }
 }
 
-#define HCW_READ_UP_ENTRY(WFN, WF, NT, TT)                                                           \
-    extern "C" __global__ __launch_bounds__(256) void hcw_read_up_##WFN##_t##NT##_g##TT(              \
+#define LWMMA_READ_UP_ENTRY(WFN, WF, NT, TT)                                                           \
+    extern "C" __global__ __launch_bounds__(256) void lwmma_read_up_##WFN##_t##NT##_g##TT(              \
         const void* __restrict__ W, const _Float16* __restrict__ D, const float* __restrict__ low,   \
         const float* __restrict__ normalized, float* __restrict__ mixed, int hidden, int K,         \
         int rows) {                                                                                 \
-        hcw_read_up_body<WF, NT, TT>(W, D, low, normalized, mixed, hidden, K, rows);                 \
+        lwmma_read_up_body<WF, NT, TT>(W, D, low, normalized, mixed, hidden, K, rows);                 \
     }
 
-#define HCW_READ_UP_G(WFN, WF, NT)       \
-    HCW_READ_UP_ENTRY(WFN, WF, NT, 1)    \
-    HCW_READ_UP_ENTRY(WFN, WF, NT, 2)    \
-    HCW_READ_UP_ENTRY(WFN, WF, NT, 4)
+#define LWMMA_READ_UP_G(WFN, WF, NT)       \
+    LWMMA_READ_UP_ENTRY(WFN, WF, NT, 1)    \
+    LWMMA_READ_UP_ENTRY(WFN, WF, NT, 2)    \
+    LWMMA_READ_UP_ENTRY(WFN, WF, NT, 4)
 
-HCW_READ_UP_G(bf16, 0, 1)
-HCW_READ_UP_G(bf16, 0, 2)
-HCW_READ_UP_G(bf16, 0, 3)
-HCW_READ_UP_G(w8, 1, 1)
-HCW_READ_UP_G(w8, 1, 2)
-HCW_READ_UP_G(w8, 1, 3)
+LWMMA_READ_UP_G(bf16, 0, 1)
+LWMMA_READ_UP_G(bf16, 0, 2)
+LWMMA_READ_UP_G(bf16, 0, 3)
+LWMMA_READ_UP_G(w8, 1, 1)
+LWMMA_READ_UP_G(w8, 1, 2)
+LWMMA_READ_UP_G(w8, 1, 3)
