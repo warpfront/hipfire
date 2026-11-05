@@ -141,8 +141,12 @@ fn gpu_1201() -> Option<Gpu> {
 }
 
 fn new_scratch(gpu: &mut Gpu) -> LaneWmmaScratch {
-    LaneWmmaScratch::new(gpu, LANE_WMMA_SCRATCH_PARTIAL_FLOATS, LANE_WMMA_SCRATCH_COUNTERS)
-        .expect("scratch")
+    LaneWmmaScratch::new(
+        gpu,
+        LANE_WMMA_SCRATCH_PARTIAL_FLOATS,
+        LANE_WMMA_SCRATCH_COUNTERS,
+    )
+    .expect("scratch")
 }
 
 /// Random BF16 matrix as (bits, f32 values), N(0,1) * `scale`.
@@ -300,7 +304,10 @@ fn lane_wmma_gemm_dense_two_term_matches_cpu_hw() {
             let e2 = max_rel_err(&got2, &want);
             let e1 = max_rel_err(&got1, &want);
             eprintln!("dense m={m} k={k} rows={rows}: terms2 {e2:.3e}, terms1 {e1:.3e}");
-            assert!(e2 <= 2e-5, "m={m} k={k} rows={rows}: terms=2 rel err {e2:.3e}");
+            assert!(
+                e2 <= 2e-5,
+                "m={m} k={k} rows={rows}: terms=2 rel err {e2:.3e}"
+            );
             assert!(
                 e1 > e2,
                 "m={m} k={k} rows={rows}: terms=1 ({e1:.3e}) not worse than terms=2 ({e2:.3e})"
@@ -436,7 +443,9 @@ fn lane_wmma_gemm_split_k_deterministic_hw() {
     assert_eq!(bits_of(&a), bits_of(&b), "back-to-back runs differ");
     // A different-shape call in between must leave the counters at zero for the next run.
     let (m2, k2, rows2) = (384usize, 2560usize, 16usize);
-    let w2: Vec<u16> = (0..m2 * k2).map(|_| bf16_bits(rng.normal() * 0.05)).collect();
+    let w2: Vec<u16> = (0..m2 * k2)
+        .map(|_| bf16_bits(rng.normal() * 0.05))
+        .collect();
     let w2_t = upload_bf16(&mut gpu, &w2);
     let x2: Vec<f32> = (0..rows2 * k2).map(|_| rng.normal()).collect();
     let _ = run_gemm(
@@ -451,7 +460,11 @@ fn lane_wmma_gemm_split_k_deterministic_hw() {
         &scratch,
     );
     let c = run_gemm(&mut gpu, &w, &x, HC_M, HC_K, rows, 1, Some(0.25), &scratch);
-    assert_eq!(bits_of(&a), bits_of(&c), "run after a different shape differs");
+    assert_eq!(
+        bits_of(&a),
+        bits_of(&c),
+        "run after a different shape differs"
+    );
     let counters = download_f32(&gpu, &scratch.counters, LANE_WMMA_SCRATCH_COUNTERS);
     assert!(
         counters.iter().all(|c| c.to_bits() == 0),

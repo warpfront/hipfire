@@ -32104,6 +32104,27 @@ impl Gpu {
                 "gemm_bf16_xf32_multirow buffer capacity is too small",
             ));
         }
+        // `HIPFIRE_QWEN4_LANE_WMMA` (exact gfx1201, 16..=64 rows): the MoE call's BF16 router /
+        // shared-expert projections on the lane WMMA kernel, two BF16 activation terms (hi + lo:
+        // the f32 input is not BF16-exact). Not bitwise the arms below (f32 summation order).
+        if self.lane_wmma_applies(batch_size)
+            && k.is_multiple_of(128)
+            && x.dtype == DType::F32
+            && y.dtype == DType::F32
+        {
+            return self
+                .lane_wmma_gemm_fixed(
+                    &crate::lane_wmma::LaneWmmaWeight::Bf16(weight),
+                    x,
+                    y,
+                    m,
+                    k,
+                    batch_size,
+                    2,
+                    None,
+                )
+                .map(|_| ());
+        }
         // `HIPFIRE_QWEN4_BF16_ALLROWS` (exact gfx1201): 9..=64 rows in one launch that loads
         // each weight once per output tile; every output word is bitwise the arms below'.
         if self.bf16_allrows_applies(batch_size) {
