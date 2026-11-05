@@ -788,9 +788,19 @@ Under `HIPFIRE_EMULATE_GPUS` every rank shares one device, so a device-wide runt
 rank is parked on a boundary (a blocking null-stream copy, `hipDeviceSynchronize`, an allocation, a VMM map) waits
 for the parked rank, which waits for the caller: the wait stops at 500 ms and the step fails closed with
 `device wait timeout`. AR completed byte-identical to the single card in most runs (EP2 and EP4); native MTP always
-stopped. EP4 also needs more ROCm hardware queues than the default (`GPU_MAX_HW_QUEUES=16`). On separate devices
-those calls are per device and do not couple ranks; that, peer-memory visibility and the launch/sync gain are not
-measured yet (no multi-GPU gfx12 hardware in this work).
+stopped. EP4 also needs more ROCm hardware queues than the default (`GPU_MAX_HW_QUEUES=16`).
+
+**Physical EP2** (2 x R9700 gfx1201 over PCIe P2P, emulation off, commit `6ec14ca7f`, `qwen3.8-flash-next-gptq3.mq4`):
+AR host vs kernel byte-identical in 3 runs (130 logits records, 260 mirror hashes, 24 state digests), native MTP
+greedy token streams identical across single, host and kernel, and no `device wait timeout` without a profiler.
+Decode through `hipfire serve --spec mtp` (EP2, 3 fresh loads per arm alternating), kernel/host tok/s: code C1 1.040
+[0.854, 1.267], story C1 1.020 [0.928, 1.121], code C8 1.024 [0.997, 1.053], story C8 1.014 [1.006, 1.023] (95% CI
+over loads). **The 8% AR and 5% speculative targets are not met.** The host arm of that A/B predates the gfx1201
+default `HIPFIRE_QWEN4_EP_GATHER_DEVICE_WAIT` (host-arm gathers wait peer events on the stream), so it is not a
+current-beta baseline.
+Under `rocprofv3 --kernel-trace` one of two runs stopped with `device wait timeout` (rank 1, epoch 5711); the other
+completed with one 4.2 s boundary span. The cause is open (a peer that reached the boundary late, or a waiter that
+kept spinning after the peer published); the per-device kernel timestamps of that trace decide it.
 
 ### Flash-Next EP: EP reserve decoupling (default on, `=0` kill switch)
 
