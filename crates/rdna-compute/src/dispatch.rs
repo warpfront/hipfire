@@ -1713,6 +1713,11 @@ impl LabKernelFaultCountdown {
 /// `self.replay` will silently truncate a retained tape — use
 /// `debug_assert_tape_parity` or compare the two counts in a test.
 pub struct Gpu {
+    /// Reusable pinned landing buffer for [`Self::dtoh_stream_ordered`] (allocated at first
+    /// use, grown only for a larger read, never shrunk). `None` until first use.
+    pub(crate) steady_readback_pinned: std::sync::Mutex<Option<hip_bridge::PinnedTransferBuffer>>,
+    /// [`STEADY_READBACK_PINNED_ENV`], read once at construction.
+    pub(crate) steady_readback_pinned_on: bool,
     pub hip: HipRuntime,
     pub arch: String,
     pub flags: Arc<FeatureFlags>,
@@ -2035,6 +2040,11 @@ pub struct Gpu {
     /// rows, see [`Gpu::qwen4_moe_sym_iu4_applies`]).
     pub qwen4_moe_sym_iu4_floor: usize,
 }
+
+/// Developer kill switch for the pinned landing buffer of [`Gpu::dtoh_stream_ordered`]
+/// (`HIPFIRE_STEADY_READBACK_PINNED`, default on). `0` restores the pageable async copy plus
+/// stream wait. Read once when the [`Gpu`] is constructed.
+pub const STEADY_READBACK_PINNED_ENV: &str = "HIPFIRE_STEADY_READBACK_PINNED";
 
 /// See [`Gpu::kv_fit_floor`]: plain data, no behaviour.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -3160,6 +3170,11 @@ impl Gpu {
             arch_caps,
             device_id: id,
             moe_route_census: crate::gemm::MoeRouteLaunchCensus::default(),
+            steady_readback_pinned: std::sync::Mutex::new(None),
+            steady_readback_pinned_on: hipfire_config::developer_bool(
+                STEADY_READBACK_PINNED_ENV,
+                true,
+            ),
             hc_pair_sync: None,
             mq4_experts_planar: false,
             moe32_gu: match hipfire_config::developer_var("HIPFIRE_QWEN4_MOE32_GU").as_deref() {
@@ -9118,7 +9133,28 @@ impl Gpu {
         src: &hip_bridge::DeviceBuffer,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        let pinned_ok = self.steady_readback_pinned_on
+            && !self.graphs.capture_mode
+            && !self.replay.is_recording();
         match self.steady_copy_stream() {
+            Some(stream) if pinned_ok => {
+                // Land in the reusable pinned buffer (non-blocking async copy), one stream
+                // wait, then copy out: no pageable staging.
+                let mut guard = self
+                    .steady_readback_pinned
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let need = dst.len();
+                if guard.as_ref().is_none_or(|b| b.size() < need) {
+                    // First use or (rare) growth; the old buffer drains in its Drop.
+                    *guard = None;
+                    *guard = Some(self.hip.transfer_buffer(need.max(64 * 1024))?);
+                }
+                let buf = guard.as_mut().expect("pinned readback buffer");
+                buf.download_async(&self.hip, src, 0, need, Some(stream))?;
+                buf.complete(&self.hip)?;
+                dst.copy_from_slice(&buf.as_bytes_mut()[..need]);
+            }
             Some(stream) => {
                 self.hip.memcpy_dtoh_async(dst, src, Some(stream))?;
                 self.hip.stream_synchronize(stream)?;
@@ -10627,6 +10663,13 @@ impl Drop for Gpu {
             return;
         }
         self.bind_thread_or_warn();
+        // Drain (via its own Drop) and free the pinned readback buffer on the owning device.
+        drop(
+            self.steady_readback_pinned
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+        );
         if let Err(err) = self.release_registered_vmm() {
             eprintln!("[rdna-compute] failed to release VMM arena during Gpu drop: {err}");
         }

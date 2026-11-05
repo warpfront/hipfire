@@ -7615,6 +7615,24 @@ fn indexed_attention_select_rows8_core(
         (group, s.scores, s.cand, s.ctl)
     } else {
         let group = score_group.min(p.rows);
+        if gpu.flags.qwen4_qsa_scores_reserve_enabled() && p.shape_blocks > stride {
+            // The block count grows by one every compress-ratio tokens: an exact-size
+            // request regrows the shared scratch (device sync + free + malloc, and the
+            // captured-state invalidation) every few decode steps (served EP2 MTP:
+            // ~0.6 per rank per step). Reserve the call's shape bound once; the scores
+            // below keep their exact view.
+            let bound = p.shape_blocks;
+            let bound_group = (QSA_SELECT_SCORE_SCRATCH_BYTES / (bound * 4) / 16 * 16)
+                .max(16)
+                .min(p.rows);
+            if let Some(elems) = bound_group
+                .checked_mul(bound)
+                .and_then(|n| n.checked_mul(2))
+                .filter(|&elems| elems > group * stride * 2)
+            {
+                gpu.qwen4_f16_x_scratch(elems)?;
+            }
+        }
         let scores = gpu.qwen4_f16_x_scratch(group * stride * 2)?.buf.as_ptr();
         (group, scores, std::ptr::null_mut(), std::ptr::null_mut())
     };

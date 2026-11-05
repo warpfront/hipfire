@@ -35,7 +35,7 @@ pub(crate) const LANE_TOKEN_RING_SLOTS: usize = 4;
 /// The reuse state of the ring, free of any device handle.
 #[derive(Debug)]
 struct RingState {
-    slots: [PleUpload; LANE_TOKEN_RING_SLOTS],
+    slots: Vec<PleUpload>,
     cursor: usize,
     /// The cursor slot was drained and handed out, and its upload has not
     /// been enqueued yet.
@@ -43,9 +43,9 @@ struct RingState {
 }
 
 impl RingState {
-    fn new() -> Self {
+    fn new(slots: usize) -> Self {
         Self {
-            slots: [PleUpload::Idle; LANE_TOKEN_RING_SLOTS],
+            slots: vec![PleUpload::Idle; slots],
             cursor: 0,
             staged: false,
         }
@@ -92,7 +92,7 @@ impl RingState {
     fn fence_recorded(&mut self, slot: usize) {
         self.slots[slot] = self.slots[slot].fence_recorded();
         if self.slots[slot] == PleUpload::Fenced {
-            self.cursor = (slot + 1) % LANE_TOKEN_RING_SLOTS;
+            self.cursor = (slot + 1) % self.slots.len();
         }
     }
 }
@@ -123,14 +123,22 @@ impl LaneTokenRing {
     /// `capacity`: bytes of the widest upload (non-zero). No device memory is
     /// taken until a slot is first staged.
     pub(crate) fn new(capacity: usize) -> Self {
+        Self::with_slots(capacity, LANE_TOKEN_RING_SLOTS)
+    }
+
+    /// As [`Self::new`] with `slots` (non-zero) pinned slots: a caller that
+    /// uploads several times between two natural fences sizes the ring so a
+    /// slot's copy has long completed when the cursor wraps back to it.
+    pub(crate) fn with_slots(capacity: usize, slots: usize) -> Self {
+        assert!(slots != 0, "a token ring needs at least one slot");
         Self {
-            slots: (0..LANE_TOKEN_RING_SLOTS)
+            slots: (0..slots)
                 .map(|_| Slot {
                     bytes: None,
                     fence: None,
                 })
                 .collect(),
-            state: RingState::new(),
+            state: RingState::new(slots),
             capacity,
         }
     }
@@ -218,7 +226,7 @@ impl LaneTokenRing {
     /// leaked by [`Drop`].
     pub(crate) fn free_gpu(mut self, gpu: &Gpu) -> Option<HipError> {
         let mut first = None;
-        for index in 0..LANE_TOKEN_RING_SLOTS {
+        for index in 0..self.slots.len() {
             if let Err(error) = self.drain(gpu, index) {
                 first.get_or_insert(error);
             }
@@ -237,8 +245,8 @@ impl Drop for LaneTokenRing {
         // A slot dropped with a copy pending (no `free_gpu`, or a failed drain)
         // keeps its pinned bytes alive forever instead of freeing memory the
         // device may still read.
-        for (slot, state) in self.slots.iter_mut().zip(self.state.slots) {
-            if state != PleUpload::Idle {
+        for (slot, state) in self.slots.iter_mut().zip(self.state.slots.iter()) {
+            if *state != PleUpload::Idle {
                 std::mem::forget(slot.bytes.take());
             }
         }
@@ -263,7 +271,7 @@ mod tests {
 
     #[test]
     fn consecutive_forwards_use_distinct_slots_without_a_wait() {
-        let mut state = RingState::new();
+        let mut state = RingState::new(LANE_TOKEN_RING_SLOTS);
         for expected in 0..LANE_TOKEN_RING_SLOTS {
             assert_eq!(step(&mut state), (expected, PleDrain::Nothing));
         }
@@ -271,7 +279,7 @@ mod tests {
 
     #[test]
     fn a_wrapped_slot_waits_on_its_own_fence_only() {
-        let mut state = RingState::new();
+        let mut state = RingState::new(LANE_TOKEN_RING_SLOTS);
         for _ in 0..LANE_TOKEN_RING_SLOTS {
             step(&mut state);
         }
@@ -285,7 +293,7 @@ mod tests {
 
     #[test]
     fn a_slot_stays_pending_until_it_is_retired() {
-        let mut state = RingState::new();
+        let mut state = RingState::new(LANE_TOKEN_RING_SLOTS);
         step(&mut state);
         assert!(state.is_pending(0));
         assert!(!state.is_pending(1));
@@ -295,7 +303,7 @@ mod tests {
 
     #[test]
     fn a_failed_fence_record_keeps_the_slot_and_demands_a_device_drain() {
-        let mut state = RingState::new();
+        let mut state = RingState::new(LANE_TOKEN_RING_SLOTS);
         let slot = state.cursor();
         state.staged();
         assert_eq!(state.begin_enqueue(), Some(slot));
@@ -309,7 +317,7 @@ mod tests {
 
     #[test]
     fn an_unstaged_slot_cannot_be_enqueued() {
-        let mut state = RingState::new();
+        let mut state = RingState::new(LANE_TOKEN_RING_SLOTS);
         assert_eq!(state.begin_enqueue(), None);
         state.staged();
         assert_eq!(state.begin_enqueue(), Some(0));
@@ -318,7 +326,7 @@ mod tests {
 
     #[test]
     fn a_stage_without_an_upload_keeps_the_cursor_and_stays_idle() {
-        let mut state = RingState::new();
+        let mut state = RingState::new(LANE_TOKEN_RING_SLOTS);
         step(&mut state);
         let slot = state.cursor();
         state.retired(slot);

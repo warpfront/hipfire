@@ -138,6 +138,9 @@ pub(crate) struct MtpRowsScratch {
     qsa_k: GpuTensor,
     qsa_v: GpuTensor,
     qsa_output: GpuTensor,
+    /// Pinned, event-fenced staging of the round's token upload
+    /// ([`upload_token_ids`]); `None` when [`MTP_TOKEN_RING_ENV`] is `0`.
+    token_ring: Option<LaneTokenRing>,
 }
 
 /// The exact-extent row views a `rows`-lane step needs (HyperNorm infers its
@@ -343,10 +346,13 @@ impl MtpRowsScratch {
             qsa_k: next(),
             qsa_v: next(),
             qsa_output: next(),
+            token_ring: new_token_ring(MTP_DRAFT_LANES_MAX * std::mem::size_of::<i32>()),
         }))
     }
 
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+        // The ring drains its pending copies before `token_ids` is freed.
+        let ring_error = self.token_ring.and_then(|ring| ring.free_gpu(gpu));
         let tensors = [
             self.token_ids,
             self.embedding_rot,
@@ -393,7 +399,7 @@ impl MtpRowsScratch {
             self.qsa_v,
             self.qsa_output,
         ];
-        let mut first = None;
+        let mut first = ring_error;
         for tensor in tensors {
             if let Err(error) = gpu.free_tensor(tensor) {
                 first.get_or_insert(error);
@@ -572,7 +578,7 @@ impl Qwen4MtpGpu {
             moe_steps,
             ..
         } = self;
-        let rs = rows_scratch.as_ref().ok_or_else(|| {
+        let rs = rows_scratch.as_mut().ok_or_else(|| {
             invalid(format!(
                 "MTP rows scratch is not allocated: set {MTP_DRAFT_ROUNDS_ENV}=1 (MoE head) before load"
             ))
@@ -629,7 +635,13 @@ impl Qwen4MtpGpu {
             draft.observe_request(lane.request, lane.token);
             token_bytes[row * 4..row * 4 + 4].copy_from_slice(&(lane.token as i32).to_ne_bytes());
         }
-        gpu.upload_stream_ordered(&rs.token_ids.buf, &token_bytes[..n * 4])?;
+        upload_token_ids(
+            rs.token_ring.as_mut(),
+            gpu,
+            &rs.token_ids.buf,
+            &token_bytes[..n * 4],
+        )?;
+        let rs: &MtpRowsScratch = rs;
 
         // Stages 2-4: the row stages once over all rows, the attention per
         // lane (under [`projection_batch`] only its core: the projections run
