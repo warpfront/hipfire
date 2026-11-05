@@ -220,6 +220,109 @@ fn main() {
     if download_i32(&gpu, &masked_t, TOP_K) != ids {
         fail("e", "zero-cold masked ids should equal the ids".into());
     }
+    // ---- (f)-(h): prefill slot (separate pinned slot, max 64 rows; layout
+    // mirrored from hetero_mailbox::PrefillGeometry).
+    const PROWS: usize = 64;
+    let al = |x: usize| x.div_ceil(256) * 256;
+    let (p_x, p_ids) = (256usize, al(256 + PROWS * DIM * 4));
+    let p_w = al(p_ids + PROWS * TOP_K * 4);
+    let p_part = al(p_w + PROWS * TOP_K * 4);
+    let p_total = al(p_part + PROWS * DIM * 4);
+    let pb = gpu.hip.host_malloc(p_total, flags).unwrap().cast::<u8>();
+    // SAFETY: fresh pinned allocation of `p_total` bytes.
+    unsafe { std::ptr::write_bytes(pb, 0, p_total) };
+    let pa = pb as u64;
+    let ps = HeteroSlotPtrs {
+        req_seq: pa,
+        resp_seq: pa + 64,
+        error: pa + 128,
+        x_rot: pa + p_x as u64,
+        ids: pa + p_ids as u64,
+        weights: pa + p_w as u64,
+        cold_out: pa + p_part as u64,
+    };
+    let rows = 37usize; // a partial last chunk
+    let xs: Vec<f32> = (0..rows * DIM).map(|i| ((i % 113) as f32 - 56.0) * 0.003).collect();
+    let xs_t = gpu.upload_f32(&xs, &[rows * DIM]).unwrap();
+    let pids: Vec<i32> = (0..rows * TOP_K).map(|s| ((s * 29 + 3) % N_EXP) as i32).collect();
+    let pids_t = upload_i32(&mut gpu, &pids);
+    let pw: Vec<f32> = (0..rows * TOP_K).map(|s| (s % 7) as f32 * 0.05).collect();
+    let pw_t = gpu.upload_f32(&pw, &[rows * TOP_K]).unwrap();
+    let pmasked = gpu.alloc_tensor(&[PROWS * TOP_K], DType::F32).unwrap();
+    let base_x: Vec<f32> = (0..rows * DIM).map(|i| (i % 17) as f32).collect();
+    let x_batch = gpu.upload_f32(&base_x, &[rows * DIM]).unwrap();
+    let part = |i: usize| (i % 1009) as f32 * 0.25;
+    gpu.hetero_token_advance(&counter).unwrap(); // token 2
+    let want_f = seq_for(2, 5, LAYERS);
+    let rf = std::thread::spawn(move || {
+        let t0 = Instant::now();
+        while word(ps.req_seq).load(Ordering::Acquire) != want_f {
+            if t0.elapsed() > Duration::from_secs(5) {
+                return false;
+            }
+        }
+        // SAFETY: the partial area holds PROWS * DIM f32.
+        let out = unsafe { std::slice::from_raw_parts_mut(ps.cold_out as *mut f32, rows * DIM) };
+        for (i, v) in out.iter_mut().enumerate() {
+            *v = part(i);
+        }
+        word(ps.resp_seq).store(want_f, Ordering::Release);
+        true
+    });
+    gpu.hetero_publish_rows(&xs_t, &pids_t, &pw_t, &bitmap_t, N_EXP as i32, rows as i32, TOP_K as i32, DIM as i32, &ps, &pmasked)
+        .unwrap();
+    gpu.hetero_release_rows(&counter, 5, LAYERS, rows as i32, pa + 192, pa + 196, ps.req_seq).unwrap();
+    gpu.hetero_await_cold(&counter, 5, LAYERS, &ps, 50_000_000).unwrap();
+    gpu.hetero_add_partial(ps.error, ps.cold_out, (rows * DIM) as i32, &x_batch).unwrap();
+    gpu.hip.device_synchronize().unwrap();
+    if !rf.join().unwrap() {
+        fail("f", "prefill responder never saw the request".into());
+    }
+    // SAFETY: slot fields.
+    let (gx, gl, gr) = unsafe {
+        (
+            std::slice::from_raw_parts(ps.x_rot as *const f32, rows * DIM),
+            *((pa + 192) as *const u32),
+            *((pa + 196) as *const u32),
+        )
+    };
+    if gx != &xs[..] || gl != 5 || gr != rows as u32 {
+        fail("f", format!("prefill slot contents (layer {gl}, rows {gr})"));
+    }
+    let want_pm: Vec<i32> = pids.iter().map(|&e| if bitmap[e as usize] != 0 { -1 } else { e }).collect();
+    if download_i32(&gpu, &pmasked, rows * TOP_K) != want_pm {
+        fail("f", "prefill masked ids".into());
+    }
+    let gotx = gpu.download_f32(&x_batch).unwrap();
+    for i in 0..rows * DIM {
+        if gotx[i].to_bits() != (base_x[i] + part(i)).to_bits() {
+            fail("f", format!("x_batch[{i}] {} != {}", gotx[i], base_x[i] + part(i)));
+        }
+    }
+    // (g) timeout: nobody answers layer 6.
+    let before = gpu.download_f32(&x_batch).unwrap();
+    // SAFETY: zero the partial so a wrong add would show.
+    unsafe { std::ptr::write_bytes(ps.cold_out as *mut u8, 0x41, rows * DIM * 4) };
+    gpu.hetero_publish_rows(&xs_t, &pids_t, &pw_t, &bitmap_t, N_EXP as i32, rows as i32, TOP_K as i32, DIM as i32, &ps, &pmasked)
+        .unwrap();
+    gpu.hetero_release_rows(&counter, 6, LAYERS, rows as i32, pa + 192, pa + 196, ps.req_seq).unwrap();
+    gpu.hetero_await_cold(&counter, 6, LAYERS, &ps, 20_000).unwrap();
+    gpu.hetero_add_partial(ps.error, ps.cold_out, (rows * DIM) as i32, &x_batch).unwrap();
+    gpu.hip.device_synchronize().unwrap();
+    if word(ps.error).load(Ordering::Acquire) != seq_for(2, 6, LAYERS) {
+        fail("g", "prefill timeout did not set the error word".into());
+    }
+    if gpu.download_f32(&x_batch).unwrap() != before {
+        fail("g", "add_partial ran after a timeout".into());
+    }
+    // (h) zero cold: masked == ids.
+    gpu.hetero_publish_rows(&xs_t, &pids_t, &pw_t, &none, N_EXP as i32, rows as i32, TOP_K as i32, DIM as i32, &ps, &pmasked)
+        .unwrap();
+    gpu.hip.device_synchronize().unwrap();
+    if download_i32(&gpu, &pmasked, rows * TOP_K) != pids {
+        fail("h", "zero-cold prefill masked ids should equal the ids".into());
+    }
+    let _ = gpu.hip.host_free(pb.cast());
     let _ = gpu.hip.host_free(base.cast());
     println!("PASS");
 }
