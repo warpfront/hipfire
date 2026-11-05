@@ -96,6 +96,24 @@ pub fn fill_ptr_tables(
     Ok(())
 }
 
+/// Every nonzero address must be HIP-registered memory whose device address is
+/// the same address (pinned host memory): `lookup(p)` returns the device pointer
+/// HIP reports for `p`, or `None` when HIP does not know it. Anything else would
+/// make the iGPU fault, so it is refused before any launch.
+pub fn check_device_accessible(
+    ptrs: &[u64],
+    lookup: impl Fn(u64) -> Option<u64>,
+) -> Result<(), DispatchError> {
+    for &p in ptrs.iter().filter(|&&p| p != 0) {
+        if lookup(p) != Some(p) {
+            return Err(err(format!(
+                "address {p:#x} is not device-accessible pinned memory (expert bytes, activation and output must be pinned host memory)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Geometry of the routed experts the arm serves (one arm per load, all layers).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ColdArmDims {
@@ -181,6 +199,17 @@ impl Worker {
     fn run(&mut self, d: ColdArmDims, job: &Job) -> Result<(), String> {
         let g = &mut self.gpu;
         let s = |e: hip_bridge::HipError| e.to_string();
+        // Refuse (never fault on) any span the iGPU cannot read in place.
+        let lookup = |p: u64| {
+            // SAFETY: a one-byte non-owning view, used only for the attribute query.
+            let probe = unsafe { hip_bridge::DeviceBuffer::from_raw(p as *mut std::ffi::c_void, 1) };
+            g.hip.pointer_get_attributes(&probe).ok().map(|a| a.device_pointer as u64)
+        };
+        let spans = [job.x.0 as u64, job.out.0 as u64];
+        check_device_accessible(&spans, lookup)
+            .and_then(|()| check_device_accessible(&job.gate_up, lookup))
+            .and_then(|()| check_device_accessible(&job.down, lookup))
+            .map_err(|e| format!("{e:?}"))?;
         g.memcpy_htod_auto(&self.ids.buf, as_bytes(&job.masked_ids)).map_err(s)?;
         g.memcpy_htod_auto(&self.gate_up_ptrs.buf, as_bytes(&job.gate_up)).map_err(s)?;
         g.memcpy_htod_auto(&self.down_ptrs.buf, as_bytes(&job.down)).map_err(s)?;
@@ -334,6 +363,21 @@ mod tests {
             down_quant: CpuQuant::Mq4G128V2,
             down: dn,
         }
+    }
+
+    #[test]
+    fn spans_must_be_device_accessible_at_the_same_address() {
+        // A fake attribute lookup: 0x1000 and 0x2000 are pinned (device == host),
+        // 0x3000 is unknown to HIP, 0x4000 maps to a different device address.
+        let lookup = |p: u64| match p {
+            0x1000 | 0x2000 => Some(p),
+            0x4000 => Some(0x9000),
+            _ => None,
+        };
+        assert!(check_device_accessible(&[0x1000, 0, 0x2000], lookup).is_ok());
+        let e = format!("{:?}", check_device_accessible(&[0x1000, 0x3000], lookup).unwrap_err());
+        assert!(e.contains("not device-accessible") && e.contains("0x3000"), "{e}");
+        assert!(check_device_accessible(&[0x4000], lookup).is_err());
     }
 
     #[test]
