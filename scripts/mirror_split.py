@@ -152,6 +152,7 @@ PEACEMAKER_KERNELS = [
     "spec_sampling_rows_parallel_pm_gfx1201",
     "qwen4_moe_iu4_sym_w3_pm_gfx1151",
     "qwen4_moe_iu4_sym_w3_nt4_pm_gfx1151",
+    "gemv_mq2_xbatch_pm_gfx1201",
 ]
 
 MIRRORS: dict[str, dict] = {
