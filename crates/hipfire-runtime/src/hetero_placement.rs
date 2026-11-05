@@ -93,71 +93,6 @@ pub fn coverage_of_top(freq: &ExpertFrequency, fraction: f64) -> Vec<f64> {
         .collect()
 }
 
-/// Static hot/cold split of the routed experts (`hot[layer][expert]`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct HeteroPlacement {
-    pub hot: Vec<Vec<bool>>,
-    pub hot_bytes: u64,
-    pub cold_bytes: u64,
-    /// Share of the trace's routed slots that land on hot experts.
-    pub hot_traffic_share: f64,
-}
-
-/// Choose the hot experts that fit `vram_budget`.
-///
-/// Greedy over every `(layer, expert)` by routed count per byte, descending;
-/// ties go to the lower layer, then the lower expert id. An expert that does
-/// not fit is skipped and the scan continues, so smaller experts can still fill
-/// the budget.
-pub fn plan_hot_set(
-    freq: &ExpertFrequency,
-    expert_bytes: &[Vec<u64>],
-    vram_budget: u64,
-) -> HeteroPlacement {
-    assert_eq!(expert_bytes.len(), freq.counts.len(), "expert_bytes layer count");
-    let mut order = Vec::new();
-    for (layer, (counts, bytes)) in freq.counts.iter().zip(expert_bytes).enumerate() {
-        assert_eq!(bytes.len(), counts.len(), "expert_bytes[{layer}] expert count");
-        for expert in 0..counts.len() {
-            order.push((layer, expert));
-        }
-    }
-    // count_a / bytes_a > count_b / bytes_b, compared exactly by cross-multiplication.
-    order.sort_by(|&(la, ea), &(lb, eb)| {
-        let lhs = freq.counts[la][ea] as u128 * expert_bytes[lb][eb] as u128;
-        let rhs = freq.counts[lb][eb] as u128 * expert_bytes[la][ea] as u128;
-        rhs.cmp(&lhs).then((la, ea).cmp(&(lb, eb)))
-    });
-
-    let mut hot: Vec<Vec<bool>> = freq.counts.iter().map(|c| vec![false; c.len()]).collect();
-    let mut hot_bytes = 0u64;
-    for (layer, expert) in order {
-        let bytes = expert_bytes[layer][expert];
-        if hot_bytes + bytes <= vram_budget {
-            hot[layer][expert] = true;
-            hot_bytes += bytes;
-        }
-    }
-
-    let total_bytes: u64 = expert_bytes.iter().flatten().sum();
-    let mut hot_count = 0u64;
-    let mut all_count = 0u64;
-    for (layer, counts) in freq.counts.iter().enumerate() {
-        for (expert, &c) in counts.iter().enumerate() {
-            all_count += c;
-            if hot[layer][expert] {
-                hot_count += c;
-            }
-        }
-    }
-    HeteroPlacement {
-        hot,
-        hot_bytes,
-        cold_bytes: total_bytes - hot_bytes,
-        hot_traffic_share: if all_count == 0 { 0.0 } else { hot_count as f64 / all_count as f64 },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,50 +122,6 @@ mod tests {
     #[test]
     fn out_of_range_expert_is_an_error() {
         assert!(parse_route_trace("0 1 2 3 9\n", S).unwrap_err().contains("expert 9"));
-    }
-
-    fn freq(counts: Vec<Vec<u64>>) -> ExpertFrequency {
-        let n_layers = counts.len();
-        let n_experts = counts[0].len();
-        ExpertFrequency {
-            shape: RouteShape { n_layers, top_k: 1, n_experts },
-            tokens: 1,
-            dropped_partial_lines: 0,
-            counts,
-        }
-    }
-
-    #[test]
-    fn takes_highest_traffic_per_byte_within_budget() {
-        let p = plan_hot_set(&freq(vec![vec![10, 1, 5]]), &[vec![2, 2, 2]], 4);
-        assert_eq!(p.hot, vec![vec![true, false, true]]);
-        assert_eq!((p.hot_bytes, p.cold_bytes), (4, 2));
-        assert!((p.hot_traffic_share - 15.0 / 16.0).abs() < 1e-12);
-    }
-
-    #[test]
-    fn zero_or_tiny_budget_is_all_cold() {
-        for b in [0, 1] {
-            assert!(plan_hot_set(&freq(vec![vec![3, 4]]), &[vec![2, 2]], b).hot[0].iter().all(|h| !h));
-        }
-    }
-
-    #[test]
-    fn budget_above_total_is_all_hot() {
-        assert!(plan_hot_set(&freq(vec![vec![3, 0]]), &[vec![2, 2]], 100).hot[0].iter().all(|h| *h));
-    }
-
-    #[test]
-    fn keeps_scanning_after_a_miss() {
-        // ratios: e0 = 9/5, e1 = 3/2, e2 = 1/1. Budget 6: e0 (5) fits, e1 (2) misses, e2 (1) still fits.
-        let p = plan_hot_set(&freq(vec![vec![9, 3, 1]]), &[vec![5, 2, 1]], 6);
-        assert_eq!(p.hot, vec![vec![true, false, true]]);
-    }
-
-    #[test]
-    fn ties_prefer_lower_layer_then_lower_expert() {
-        let p = plan_hot_set(&freq(vec![vec![1, 1], vec![1, 1]]), &[vec![1, 1], vec![1, 1]], 1);
-        assert_eq!(p.hot, vec![vec![true, false], vec![false, false]]);
     }
 
     #[test]
