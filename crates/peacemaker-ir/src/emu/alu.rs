@@ -56,6 +56,10 @@
 //!   half); source `neg`/`abs` on a NaN operand and `clamp` of a NaN result are not in the sweep and stay errors.
 //! * `v_cvt_pk_f32_fp8` (gfx12 only, gfx1201 gids 93/94, all 4096 packed pairs): both FP8 NaN encodings of either
 //!   element give `0xffc00000` whatever the sign; every finite value is the OCP E4M3 value.
+//! * `v_cvt_pk_fp8_f32` (gfx1201 only, receipt `gfx1201-fp8cvt-r1/r2`, all 2^32 f32 inputs in four sweeps on two
+//!   cards plus 2 x 2^32 random (S0, S1, old VDST, half) tuples): RNE to OCP E4M3 with gradual underflow, NO
+//!   saturation (a magnitude above 464 or infinity gives the NaN code `0x7f`/`0xff` of its sign, any f32 NaN `0xff`);
+//!   MODE has no effect; the unselected half of VDST is preserved. See [`convert::f32_to_fp8`].
 //!
 //! NaN operands of `v_subrev_f32`, `v_dual_sub_f32`, `v_dual_subrev_f32`, `v_dual_fmamk_f32`, `v_fmaak_f32` and
 //! `v_dual_fmaak_f32` are not in either sweep and stay errors; the invalid operations (NaN result from non-NaN
@@ -68,7 +72,8 @@
 //!
 //! Not qualified on any arch: `v_med3_num_f32` with a NaN operand (a NaN-free operand set is the plain median of
 //! `v_med3_f32`; a NaN operand is an error), the gfx1151 `v_div_scale_f32` exponent domains its sweep
-//! leaves open (gfx1201 has the full exponent-field receipt, see [`div_scale_chain`]), BF16/FP8 encoders. Finite
+//! leaves open (gfx1201 has the full exponent-field receipt, see [`div_scale_chain`]), the BF16 encoder (the FP8 encoder is
+//! qualified on gfx1201, above). Finite
 //! operands of `v_div_fmas_f32` under VCC are unqualified on every arch but gfx1201.
 //!
 //! Scalar unsigned-division expansion (gfx1201 only; `s_cvt_f32_u32`, `v_s_rcp_f32`, `s_mul_f32`, `s_cvt_u32_f32`,
@@ -290,6 +295,7 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
         "v_s_rcp_f32" => udiv_scalar_rcp(arch, i, s),
         "v_add_co_u32" | "v_add_co_ci_u32_e64" | "v_add_co_ci_u32_e32" => add_carry(name, i, s),
         "v_cvt_pk_f32_fp8_e32" | "v_cvt_pk_f32_fp8_e64" => cvt_pk_f32_fp8(arch, i, s),
+        "v_cvt_pk_fp8_f32" => cvt_pk_fp8_f32(arch, i, s),
         _ if name.starts_with("v_cmp") => compare(name, i, s),
         _ => lanes(arch, name, i, s),
     }
@@ -1730,6 +1736,49 @@ fn cvt_pk_f32_fp8(arch: Arch, i: &Inst, s: &mut State) -> Result<()> {
         if let Some(pair) = pair {
             s.put(&o[0], lane, 0, pair[0])?;
             s.put(&o[0], lane, 1, pair[1])?;
+        }
+    }
+    Ok(())
+}
+
+/// `v_cvt_pk_fp8_f32 vdst.{l,h}, S0, S1` (gfx1201 only): byte 0 of the selected 16-bit half is E4M3(S0), byte 1 is
+/// E4M3(S1) ([`convert::f32_to_fp8`], exhaustive receipt `gfx1201-fp8cvt-r1`), and the OTHER half of VDST is preserved
+/// (random old VDST, 2^32 pairs x 2 MODE settings, 0 mismatches). The destination half is the true16 operand
+/// (OPSEL[3]); source modifiers, omod, clamp, DPP/SDWA and the source OPSEL bits were not measured and are refused.
+fn cvt_pk_fp8_f32(arch: Arch, i: &Inst, s: &mut State) -> Result<()> {
+    let (o, m) = (&i.operands, &i.mods);
+    if arch != Arch::Gfx1201 {
+        return Err(format!(
+            "v_cvt_pk_fp8_f32: the FP8 encoder is measured on gfx1201 only, not {arch:?}"
+        ));
+    }
+    half_dst(o)?;
+    if m.neg | m.abs != 0
+        || m.omod != Omod::None
+        || m.clamp
+        || m.dpp.is_some()
+        || m.sdwa.is_some()
+        || m.op_sel & 0b0111 != 0
+    {
+        return Err(
+            "v_cvt_pk_fp8_f32: neg/abs/omod/clamp/DPP/SDWA/source OPSEL are not measured".into(),
+        );
+    }
+    if o.len() != 3 {
+        return Err(format!(
+            "v_cvt_pk_fp8_f32: expected vdst, S0, S1, got {} operands",
+            o.len()
+        ));
+    }
+    let mut out = [None; 64];
+    for lane in active(s) {
+        let (a, b) = (s.read(&o[1], lane, 0)?, s.read(&o[2], lane, 0)?);
+        out[lane] =
+            Some(u32::from(convert::f32_to_fp8(a)) | u32::from(convert::f32_to_fp8(b)) << 8);
+    }
+    for (lane, v) in out.into_iter().enumerate() {
+        if let Some(v) = v {
+            s.put(&o[0], lane, 0, v)?;
         }
     }
     Ok(())
@@ -4006,6 +4055,64 @@ mod tests {
             );
             assert_eq!((st.v[10][0], st.v[11][0]), (7, 8));
         }
+    }
+
+    // v_cvt_pk_fp8_f32 (gfx1201, exhaustive receipt gfx1201-fp8cvt-r1): byte 0 of the selected half = E4M3(S0), byte 1 =
+    // E4M3(S1); the other half and inactive lanes keep their value; nothing saturates; NaN input gives 0xff.
+    #[test]
+    fn cvt_pk_fp8_f32_packs_two_bytes_into_the_selected_half() {
+        for (sel, want) in [(Half::Lo, 0x1234_c038u32), (Half::Hi, 0xc038_5678)] {
+            let i = insn(
+                "v_cvt_pk_fp8_f32",
+                vec![half(4, sel), v(0), lit(0xc000_0000)],
+            );
+            let mut st = state();
+            st.exec = 0b101;
+            st.v[0][0] = 1f32.to_bits();
+            st.v[0][2] = 1f32.to_bits();
+            st.v[0][1] = 0x4000_0000; // inactive: untouched
+            for lane in 0..3 {
+                st.v[4][lane] = 0x1234_5678;
+            }
+            run("v_cvt_pk_fp8_f32", &i, &mut st).unwrap();
+            assert_eq!(st.v[4][0], want, "{sel:?}");
+            assert_eq!(st.v[4][2], want, "{sel:?}");
+            assert_eq!(st.v[4][1], 0x1234_5678, "inactive lane {sel:?}");
+        }
+        // No saturation: 480 and +inf give the NaN code 0x7f, -1e30 gives 0xff; f32 NaN (any sign) gives 0xff.
+        let i = insn("v_cvt_pk_fp8_f32", vec![half(4, Half::Lo), v(0), v(1)]);
+        let mut st = state();
+        st.exec = 1;
+        for (a, b, want) in [
+            (480f32.to_bits(), f32::INFINITY.to_bits(), 0x7f7f),
+            ((-1e30f32).to_bits(), 448f32.to_bits(), 0x7eff),
+            (0x7fc0_0000, 0xffc0_0001, 0xffff),
+            (0, 0x8000_0000, 0x8000),
+        ] {
+            (st.v[0][0], st.v[1][0], st.v[4][0]) = (a, b, 0xffff_0000);
+            run("v_cvt_pk_fp8_f32", &i, &mut st).unwrap();
+            assert_eq!(st.v[4][0], 0xffff_0000 | want, "{a:#x} {b:#x}");
+        }
+        // Unmeasured: other architectures, source modifiers, omod/clamp, SDWA/DPP, a 32-bit destination.
+        for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+            assert!(
+                execute(arch, "v_cvt_pk_fp8_f32", &i, &mut st).is_err(),
+                "{arch:?}"
+            );
+        }
+        for tweak in [
+            |i: &mut Inst| i.mods.neg = 1,
+            |i: &mut Inst| i.mods.abs = 2,
+            |i: &mut Inst| i.mods.clamp = true,
+            |i: &mut Inst| i.mods.omod = Omod::Mul2,
+            |i: &mut Inst| i.mods.op_sel = 1,
+        ] {
+            let mut bad = i.clone();
+            tweak(&mut bad);
+            assert!(run("v_cvt_pk_fp8_f32", &bad, &mut st).is_err());
+        }
+        let wide = insn("v_cvt_pk_fp8_f32", vec![v(4), v(0), v(1)]);
+        assert!(run("v_cvt_pk_fp8_f32", &wide, &mut st).is_err());
     }
 
     // Source modifiers reach the class test; NaN compares follow the ISA predicates; inactive lanes are 0.

@@ -15,7 +15,12 @@
 # The AMDGPU unsigned-division expansion of the builder GEMM prologues (s_cvt_f32_u32, v_s_rcp_f32, s_mul_f32,
 # s_cvt_u32_f32) executes on gfx1201 only, for denominators 1..=2^24 (hardware-measured stage by stage); v_div_scale_f32
 # follows the measured exponent-field chain of emu/alu.rs. See float_edges.md.
-# NO row, so a decoded program hard-errors at load: v_wmma_bf16_16x16x16_bf16 and every FP8/BF8 WMMA.
+# The four dense FP8/BF8 WMMA rows v_wmma_f32_16x16x16_{fp8,bf8}_{fp8,bf8} (gfx1201 only: two 8-term steps with quad
+# alignment, factor-NaN and BF8 invalid-operation words; clamp and A/B neg refused, C neg_lo/neg_hi measured to have no
+# effect), v_cvt_pk_fp8_f32 (gfx1201 only, exhaustive over all 2^32 f32 inputs; source modifiers refused) and
+# global_load_tr_b64 (gfx1201 wave32; EXEC ignored, EXEC == 0 skips) are hardware-measured, see float_edges.md "FP8 attention
+# capabilities (B2)".
+# NO row, so a decoded program hard-errors at load: v_wmma_bf16_16x16x16_bf16.
 # v_maxmin_num_f32 (gfx1201 only, no source modifiers/omod/clamp) is the num_select composition, hardware-compared
 # over every triple of a 48-value f32 set (float_edges.md, receipt gfx1201-maxmin-r1).
 # See isa/emu/float_edges.md "Opcode-fill qualification (pending)".
@@ -182,6 +187,7 @@ v_cvt_f32_ubyte0_e32	alu
 v_cvt_i32_f32_e32	alu
 v_cvt_pk_f32_fp8_e32	alu
 v_cvt_pk_f32_fp8_e64	alu
+v_cvt_pk_fp8_f32	alu
 v_cvt_u32_f32_e32	alu
 v_div_fixup_f32	alu
 v_div_fmas_f32	alu
@@ -239,6 +245,10 @@ v_sub_f32_e32	alu
 v_sub_nc_u32_e32	alu
 v_subrev_nc_u32_e32	alu
 v_wmma_f32_16x16x16_f16	alu
+v_wmma_f32_16x16x16_bf8_bf8	alu
+v_wmma_f32_16x16x16_bf8_fp8	alu
+v_wmma_f32_16x16x16_fp8_bf8	alu
+v_wmma_f32_16x16x16_fp8_fp8	alu
 v_wmma_i32_16x16x16_iu4	alu
 v_wmma_i32_16x16x32_iu4	alu
 v_xor_b32_e32	alu
@@ -367,6 +377,7 @@ ds_bpermute_b32	memory
 global_load_b128	memory
 global_load_b32	memory
 global_load_b64	memory
+global_load_tr_b64	memory
 global_load_d16_b16	memory
 global_load_i8	memory
 global_load_u16	memory

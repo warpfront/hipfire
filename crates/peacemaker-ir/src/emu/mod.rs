@@ -37,6 +37,11 @@ pub use hw::RunReport;
 mod memory;
 pub mod mma;
 #[cfg(test)]
+#[rustfmt::skip]
+mod fp8_fixtures;
+#[cfg(test)]
+mod fp8_receipts;
+#[cfg(test)]
 mod swmmac_fixtures;
 pub mod trans;
 #[cfg(test)]

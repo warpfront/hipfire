@@ -348,6 +348,72 @@ fn scratch_access(name: &str, i: &Inst, s: &mut State) -> Result<()> {
     }
     Ok(())
 }
+/// Lane address of a `global_*` / `flat_*` access. SADDR form: a 32-bit VGPR byte offset added to the SGPR-pair base (the
+/// RDNA ISA rule); otherwise a 64-bit VGPR address (plus an optional SGPR-pair base). `offset` is the immediate field.
+fn global_addr(ops: &[Operand], load: bool, offset: i64, s: &State, lane: usize) -> Result<u64> {
+    let a = usize::from(load);
+    let saddr = matches!(ops.get(2),Some(Operand::Reg(r)) if r.kind==crate::reg::Kind::S&&r.len==2)
+        && matches!(&ops[a], Operand::Reg(v) if v.kind==crate::reg::Kind::V&&v.len==1);
+    if saddr {
+        return Ok(s
+            .read64(&ops[2], lane)?
+            .wrapping_add(u64::from(s.read(&ops[a], lane, 0)?))
+            .wrapping_add_signed(offset));
+    }
+    let mut addr = s.read64(&ops[a], lane)?.wrapping_add_signed(offset);
+    if let Some(Operand::Reg(r)) = ops.get(2) {
+        if r.kind == crate::reg::Kind::S {
+            addr = addr.wrapping_add(s.read64(&ops[2], lane)?);
+        }
+    }
+    Ok(addr)
+}
+
+/// `global_load_tr_b64` (gfx1201, wave32, 8-bit elements): every lane supplies the address of 8 bytes; the 32 chunks are
+/// transposed inside each 16-lane group. Result byte `t` (0..8, dword `t / 4`, byte `t % 4`) of lane `l` is byte `l & 7`
+/// of the chunk loaded by lane `(l & 16) + 4 * ((l >> 3) & 1) + (t & 3) + 8 * (t >> 2)`. Hardware receipt `gfx1201-fp8ltr-r1`/`r2` (float_edges.md):
+/// 0 mismatches over per-lane-independent random addresses of every alignment 1/2/4/8, the qresident v2 address
+/// patterns (strides 516 and 1032) and the SADDR+VGPR-offset+immediate form. EXEC does not mask anything: with ANY
+/// non-zero EXEC (40,000 random masks with 1..29 active lanes, including 404 with an entire 16-lane group inactive)
+/// every lane's address register is read, all 32 chunks are loaded and all 32 lanes are written; only EXEC == 0 skips
+/// the instruction. The load reads the whole 8-byte chunk of every lane, so an unmapped chunk of any lane (also one
+/// whose lane is inactive) is an error, as the hardware faults on it.
+fn global_load_tr_b64(i: &Inst, s: &mut State, mem: &mut Memory) -> Result<()> {
+    let ops = &i.operands;
+    if s.lanes != 32 {
+        return Err("global_load_tr_b64: the transpose is modeled for wave32 only".into());
+    }
+    if s.exec & 0xffff_ffff == 0 {
+        // EXEC == 0 skips the instruction: the destination keeps its value (receipt gfx1201-fp8ltr-r2 `exec8`, 1 case).
+        return Ok(());
+    }
+    if ops.len() < 2 {
+        return Err("global_load_tr_b64: expected vdst, vaddr".into());
+    }
+    let mut offset = 0i64;
+    for op in ops {
+        if let Operand::Imm(ImmField::VmemOffset(n)) = op {
+            offset += i64::from(*n);
+        }
+    }
+    let mut chunk = [[0u8; 8]; 32];
+    for (lane, bytes) in chunk.iter_mut().enumerate() {
+        let addr = global_addr(ops, true, offset, s, lane)?;
+        bytes.copy_from_slice(mem.read(addr, 8)?);
+    }
+    let mut out = [[0u32; 2]; 32];
+    for (l, words) in out.iter_mut().enumerate() {
+        for t in 0..8usize {
+            let src = (l & 16) + 4 * ((l >> 3) & 1) + (t & 3) + 8 * (t >> 2);
+            words[t >> 2] |= u32::from(chunk[src][l & 7]) << (8 * (t & 3));
+        }
+    }
+    for (l, words) in out.iter().enumerate() {
+        s.put(&ops[0], l, 0, words[0])?;
+        s.put(&ops[0], l, 1, words[1])?;
+    }
+    Ok(())
+}
 pub(super) fn execute(
     name: &str,
     i: &Inst,
@@ -488,6 +554,9 @@ pub(super) fn execute_tracked(
     if name == "global_atomic_add_u32" {
         return global_atomic_add_u32(i, s, mem);
     }
+    if name == "global_load_tr_b64" {
+        return global_load_tr_b64(i, s, mem);
+    }
     if let Some((kind, returns)) = ds_atomic(name) {
         return ds_atomic_execute(kind, returns, name, i, s, lds, defined, log);
     }
@@ -547,23 +616,7 @@ pub(super) fn execute_tracked(
             raw_bounds = Some((relative, u64::from(s.s[r + 2])));
             addr = base.wrapping_add(relative);
         } else if name.starts_with("global_") || name.starts_with("flat_") {
-            let a = if load { 1 } else { 0 };
-            // SADDR form: a 32-bit VGPR byte offset added to the SGPR-pair base (the RDNA ISA rule); otherwise a 64-bit VGPR address.
-            let saddr = matches!(ops.get(2),Some(Operand::Reg(r)) if r.kind==crate::reg::Kind::S&&r.len==2)
-                && matches!(&ops[a],Operand::Reg(v) if v.kind==crate::reg::Kind::V&&v.len==1);
-            if saddr {
-                addr = s
-                    .read64(&ops[2], lane)?
-                    .wrapping_add(u64::from(s.read(&ops[a], lane, 0)?))
-                    .wrapping_add_signed(offset);
-            } else {
-                addr = s.read64(&ops[a], lane)?.wrapping_add_signed(offset);
-                if let Some(Operand::Reg(r)) = ops.get(2) {
-                    if r.kind == crate::reg::Kind::S {
-                        addr = addr.wrapping_add(s.read64(&ops[2], lane)?);
-                    }
-                }
-            }
+            addr = global_addr(ops, load, offset, s, lane)?;
         } else {
             return Err(format!("memory opcode {name} unsupported"));
         }
@@ -1510,5 +1563,217 @@ mod tests {
             0
         )
         .is_err());
+    }
+
+    // ---- global_load_tr_b64 (gfx1201): hardware waves of receipts fp8ltr-r1/r2 ----
+    const LTR_BASE: u64 = 0x10_0000_0000;
+    const LTR_SPAN: usize = 1 << 24;
+    /// Three byte planes (byte at offset o = (o >> 8p) & 255) recover the 24-bit source offset of every loaded byte.
+    fn ltr_plane(p: usize) -> Memory {
+        let mut mem = Memory::default();
+        mem.map(
+            format!("plane{p}"),
+            LTR_BASE,
+            (0..LTR_SPAN).map(|o| (o >> (8 * p)) as u8).collect(),
+        )
+        .unwrap();
+        mem
+    }
+    /// One `global_load_tr_b64 v[4:5]` over `offs`; the `off` form (64-bit VGPR address) or SADDR + VGPR offset + imm 24.
+    fn ltr_run(mem: &mut Memory, offs: &[u32; 32], exec: u64, saddr: bool) -> Result<State> {
+        let mut st = state();
+        st.exec = exec;
+        for (lane, &o) in offs.iter().enumerate() {
+            st.v[4][lane] = 0xa5a5_a5a5;
+            st.v[5][lane] = 0x5a5a_5a5a;
+            if saddr {
+                st.v[2][lane] = o.wrapping_sub(24);
+            } else {
+                st.v[2][lane] = (LTR_BASE + u64::from(o)) as u32;
+                st.v[3][lane] = ((LTR_BASE + u64::from(o)) >> 32) as u32;
+            }
+        }
+        let ops = if saddr {
+            st.s[8] = LTR_BASE as u32;
+            st.s[9] = (LTR_BASE >> 32) as u32;
+            vec![
+                reg(Kind::V, 4, 2),
+                reg(Kind::V, 2, 1),
+                reg(Kind::S, 8, 2),
+                Operand::Imm(ImmField::VmemOffset(24)),
+            ]
+        } else {
+            vec![reg(Kind::V, 4, 2), reg(Kind::V, 2, 2)]
+        };
+        execute(
+            "global_load_tr_b64",
+            &insn_on(Arch::Gfx1201, "global_load_tr_b64", ops),
+            &mut st,
+            mem,
+            &mut [],
+        )?;
+        Ok(st)
+    }
+    fn ltr_origins(
+        planes: &mut [Memory; 3],
+        offs: &[u32; 32],
+        exec: u64,
+        saddr: bool,
+    ) -> [[u32; 8]; 32] {
+        let mut org = [[0u32; 8]; 32];
+        for (p, mem) in planes.iter_mut().enumerate() {
+            let st = ltr_run(mem, offs, exec, saddr).unwrap();
+            for (lane, row) in org.iter_mut().enumerate() {
+                for (t, o) in row.iter_mut().enumerate() {
+                    let word = st.v[4 + t / 4][lane];
+                    *o |= ((word >> (8 * (t % 4))) & 0xff) << (8 * p);
+                }
+            }
+        }
+        org
+    }
+    #[test]
+    fn global_load_tr_b64_reproduces_the_hardware_waves() {
+        use crate::emu::fp8_fixtures::LTR_WAVES;
+        let mut planes = [ltr_plane(0), ltr_plane(1), ltr_plane(2)];
+        let mut sets = std::collections::BTreeMap::<&str, usize>::new();
+        for w in &LTR_WAVES {
+            let saddr = w.set.starts_with("saddr");
+            // EXEC never masks the transpose: the recorded origins hold for the recorded mask and for a full one.
+            let got = ltr_origins(&mut planes, &w.offs, u64::from(w.mask), saddr);
+            assert_eq!(got, w.org, "set {} mask {:#x}", w.set, w.mask);
+            assert_eq!(
+                ltr_origins(&mut planes, &w.offs, 0xffff_ffff, saddr),
+                w.org,
+                "set {} full exec",
+                w.set
+            );
+            *sets.entry(w.set).or_default() += 1;
+        }
+        // Every recorded address family is present: contiguous, every alignment, both strides, SADDR, partial EXEC.
+        for set in [
+            "seq",
+            "rand_a8",
+            "rand_a4",
+            "rand_a2",
+            "rand_a1",
+            "qres_s516",
+            "qres_s1032",
+            "saddr_a8",
+            "saddr_a4",
+            "saddr_a1",
+            "exec8",
+        ] {
+            assert!(sets.contains_key(set), "{set}");
+        }
+    }
+    // The documented lane mapping, independent of the receipts: group g = lane >> 4, result byte t of lane l is byte
+    // (l & 7) of the chunk of lane (l & 16) + 4 * ((l >> 3) & 1) + (t & 3) + 8 * (t >> 2).
+    #[test]
+    fn global_load_tr_b64_lane_mapping_and_exec_rules() {
+        let mut mem = Memory::default();
+        let data: Vec<u8> = (0..32 * 8).map(|i| i as u8 ^ 0x5c).collect();
+        mem.map("m".into(), LTR_BASE, data.clone()).unwrap();
+        // Lane l loads chunk l (8 bytes at LTR_BASE + 8 * l).
+        let mut st = state();
+        for l in 0..32usize {
+            st.v[2][l] = (LTR_BASE as u32).wrapping_add(8 * l as u32);
+            st.v[3][l] = (LTR_BASE >> 32) as u32;
+        }
+        st.exec = 0xffff_ffff;
+        let i = insn_on(
+            Arch::Gfx1201,
+            "global_load_tr_b64",
+            vec![reg(Kind::V, 4, 2), reg(Kind::V, 2, 2)],
+        );
+        execute("global_load_tr_b64", &i, &mut st, &mut mem, &mut []).unwrap();
+        for l in 0..32usize {
+            for t in 0..8usize {
+                let src = (l & 16) + 4 * ((l >> 3) & 1) + (t & 3) + 8 * (t >> 2);
+                let want = data[8 * src + (l & 7)];
+                assert_eq!(
+                    (st.v[4 + t / 4][l] >> (8 * (t % 4))) as u8,
+                    want,
+                    "lane {l} byte {t}"
+                );
+            }
+        }
+        // EXEC == 0 skips the instruction (destination kept); one active lane still writes every lane.
+        st.v[4][5] = 0x1111_1111;
+        let before = st.v[4][5];
+        st.exec = 0;
+        execute("global_load_tr_b64", &i, &mut st, &mut mem, &mut []).unwrap();
+        assert_eq!(st.v[4][5], before);
+        st.exec = 1 << 20;
+        execute("global_load_tr_b64", &i, &mut st, &mut mem, &mut []).unwrap();
+        assert_ne!(st.v[4][5], before);
+        // An unmapped chunk of an INACTIVE lane is still a fault (the hardware reads every lane's address register).
+        st.v[2][3] = 0x1000;
+        st.v[3][3] = 0;
+        assert!(execute("global_load_tr_b64", &i, &mut st, &mut mem, &mut []).is_err());
+        // Wave64 is not modeled.
+        let mut wide = state();
+        wide.lanes = 64;
+        wide.exec = u64::MAX;
+        assert!(execute("global_load_tr_b64", &i, &mut wide, &mut mem, &mut []).is_err());
+    }
+    /// Replays every captured wave of a `loadtr` receipt directory: `PM_FP8_RECEIPT_DIR=<outdir> cargo test --release
+    /// -p peacemaker-ir --lib global_load_tr_b64_receipt_replay -- --ignored`.
+    #[test]
+    #[ignore = "needs a hardware receipt directory (PM_FP8_RECEIPT_DIR)"]
+    fn global_load_tr_b64_receipt_replay() {
+        let dir = std::env::var("PM_FP8_RECEIPT_DIR").expect("PM_FP8_RECEIPT_DIR");
+        let mut planes = [ltr_plane(0), ltr_plane(1), ltr_plane(2)];
+        let u32s = |b: &[u8]| -> Vec<u32> {
+            b.chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let (mut waves, mut skipped) = (0u64, 0u64);
+        for ent in std::fs::read_dir(&dir).unwrap() {
+            let path = ent.unwrap().path();
+            let name = path.file_name().unwrap().to_str().unwrap().to_string();
+            let Some(set) = name
+                .strip_prefix("ltr.")
+                .and_then(|n| n.strip_suffix(".in.bin"))
+            else {
+                continue;
+            };
+            // A set whose kernel faulted (r1 `exec8`: inactive lanes held stale addresses) has inputs but no result file.
+            let Ok(outs) = std::fs::read(path.with_file_name(format!("ltr.{set}.out.bin"))) else {
+                println!("set {set}: no result file, skipped");
+                continue;
+            };
+            let ins = u32s(&std::fs::read(&path).unwrap());
+            let outs = u32s(&outs);
+            let saddr = set.starts_with("saddr");
+            for (c, rec) in ins.chunks_exact(33).enumerate() {
+                let mask = rec[0];
+                if mask == 0 {
+                    skipped += 1;
+                    continue;
+                }
+                let offs: [u32; 32] = rec[1..].try_into().unwrap();
+                let got = ltr_origins(&mut planes, &offs, u64::from(mask), saddr);
+                for lane in 0..32 {
+                    for t in 0..8 {
+                        let mut want = 0u32;
+                        for p in 0..3 {
+                            let word = outs[((c * 3 + p) * 32 + lane) * 2 + t / 4];
+                            want |= ((word >> (8 * (t % 4))) & 0xff) << (8 * p);
+                        }
+                        assert_eq!(
+                            got[lane][t], want,
+                            "set {set} case {c} lane {lane} byte {t}"
+                        );
+                    }
+                }
+                waves += 1;
+            }
+        }
+        assert!(waves > 0);
+        println!(
+            "global_load_tr_b64 replay: {waves} waves identical ({skipped} EXEC==0 waves skipped)"
+        );
     }
 }

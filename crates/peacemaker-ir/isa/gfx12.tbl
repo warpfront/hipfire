@@ -135,6 +135,9 @@ v_mul_hi_i32	vop3	0x32e	VDST:32,SRC0:32,SRC1:32,literal@last	VDST	SRC0,SRC1	-	-	
 v_readlane_b32	vop3	0x360	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_readlane_b32 s22, v1, s21	D7600016 02002B01	src2_unused:ignored:0x1ff:0x00/0x80/0x101
 v_cvt_pk_fp8_f32	vop3	0x369	VDST:16,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_cvt_pk_fp8_f32 v130.l, v169, v170	D7690082 020355A9	src2_unused:ignored:0x1ff:0x00/0x80/0x101
 v_wmma_f32_16x16x16_fp8_fp8	vop3p	0x46	VDST:256,SRC0:64,SRC1:64,SRC2:256	VDST	SRC0,SRC1,SRC2	-	-	v_wmma_f32_16x16x16_fp8_fp8 v[120:127], v[169:170], v[130:131], v[120:127]	CC464078 1DE305A9	w0_extra:ignored:0x800000:0x0
+v_wmma_f32_16x16x16_fp8_bf8	vop3p	0x47	VDST:256,SRC0:64,SRC1:64,SRC2:256	VDST	SRC0,SRC1,SRC2	-	-	v_wmma_f32_16x16x16_fp8_bf8 v[1:8], v[9:10], v[11:12], v[1:8]	CC474001 1C061709	w0_extra:ignored:0x800000:0x0
+v_wmma_f32_16x16x16_bf8_fp8	vop3p	0x48	VDST:256,SRC0:64,SRC1:64,SRC2:256	VDST	SRC0,SRC1,SRC2	-	-	v_wmma_f32_16x16x16_bf8_fp8 v[1:8], v[9:10], v[11:12], v[1:8]	CC484001 1C061709	w0_extra:ignored:0x800000:0x0
+v_wmma_f32_16x16x16_bf8_bf8	vop3p	0x49	VDST:256,SRC0:64,SRC1:64,SRC2:256	VDST	SRC0,SRC1,SRC2	-	-	v_wmma_f32_16x16x16_bf8_bf8 v[1:8], v[9:10], v[11:12], v[1:8]	CC494001 1C061709	w0_extra:ignored:0x800000:0x0
 v_wmma_i32_16x16x32_iu4	vop3p	0x4a	VDST:256,SRC0:64,SRC1:64,SRC2:256	VDST	SRC0,SRC1,SRC2	-	-	v_wmma_i32_16x16x32_iu4 v[57:64], v[71:72], v[1:2], 0 neg_lo:[1,1,0]	CC4A4039 7A020347	w0_extra:ignored:0x800000:0x0
 v_swmmac_i32_16x16x64_iu4	vop3p	0x56	VDST:256,SRC0:64,SRC1:128,SRC2:32	VDST	SRC0,SRC1,SRC2,VDST	-	-	v_swmmac_i32_16x16x64_iu4 v[0:7], v[8:9], v[10:13], v14	CC564000 1C3A1508	w0_extra:ignored:0x800000:0x0
 v_cmp_lt_f32_e32	vopc	0x11	SRC0:32,VSRC1:32	implicit	SRC0,VSRC1	vcc:w	-	v_cmp_lt_f32_e32 vcc_lo, 0, v130	7C230480	-

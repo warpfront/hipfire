@@ -113,6 +113,40 @@ pub fn fp8_to_f32(x: u8) -> u32 {
     }
     sign | ((u32::from(e) + 120) << 23) | (f << 20)
 }
+/// `v_cvt_pk_fp8_f32` element conversion on gfx1201: binary32 to OCP E4M3 (bias 7, `S.1111.111` NaN, no infinity),
+/// round to nearest even with gradual underflow (an f32 denormal is far below half the smallest FP8 denormal and gives
+/// zero). Hardware receipts (`emu/float_edges.md`, `gfx1201-fp8cvt-r1`: all 2^32 inputs, four sweeps, 257 runs
+/// each): nothing saturates; a finite magnitude above 464 (the midpoint of 448 and the NaN code, so the tie 464 rounds
+/// to 448) and infinity both give the NaN code with the input's sign (`0x7f`/`0xff`), and any f32 NaN gives `0xff`
+/// whatever its sign or payload. MODE (round/denorm) has no effect.
+pub fn f32_to_fp8(x: u32) -> u8 {
+    let sign = ((x >> 24) & 0x80) as u8;
+    let a = x & 0x7fff_ffff;
+    if a > 0x7f80_0000 {
+        return 0xff;
+    }
+    if a > 0x43e8_0000 {
+        return sign | 0x7f;
+    }
+    let e = (a >> 23) as i32;
+    if e == 0 {
+        return sign;
+    }
+    let sig = u64::from(a & 0x7f_ffff | 0x80_0000);
+    // Target biased exponent; field 1 is the smallest normal, below it the significand is shifted into the denormals.
+    let te = e - 120;
+    let shift = if te >= 1 { 20 } else { 20 + 1 - te };
+    let q = if shift > 62 {
+        0
+    } else {
+        let tail = sig & ((1 << shift) - 1);
+        let half = 1u64 << (shift - 1);
+        let head = sig >> shift;
+        head + u64::from(tail > half || (tail == half && head & 1 != 0))
+    };
+    let base = if te >= 1 { ((te - 1) as u64) << 3 } else { 0 };
+    sign | (base + q) as u8
+}
 pub fn ldexp_f32(x: u32, n: i32) -> u32 {
     let sign = x & 0x80000000;
     let e = (x >> 23) & 255;
