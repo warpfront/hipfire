@@ -23,11 +23,11 @@ use radiowave::{CodeObjectCertification, KernelArgumentAccess, MutableReadCache}
 use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, FenceScope, Gfx10DispatchInitiatorPolicy,
     Gfx10KernelImage, Gfx10Pm4CommandBuffer, Gfx10Scratch, Gfx10ScratchFamily, Gfx10ScratchPlan,
-    Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy,
-    Gfx11DispatchInterleave, Gfx12DispatchPacing, Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy,
-    GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector, HeaderPolicy, KernargBuffer,
-    KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy, Quiescence,
-    RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
+    Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave,
+    Gfx12DispatchPacing, Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy, GpuBatchTiming, GpuDevice,
+    GpuMultiQueueTiming, GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel,
+    LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy, Quiescence, RecordedDispatch, Runtime,
+    SingleQueueBatchGraph, SingleQueuePm4Ib,
 };
 use redline_dispatch::{
     AllocationPolicy, BindingRevision, KernargAbi, KernargField, Recorder, ReplayBindings,

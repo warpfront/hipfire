@@ -1262,12 +1262,8 @@ mod tests {
             | ENABLE_SGPR_FLAT_SCRATCH_INIT
             | ENABLE_SGPR_PRIVATE_SEGMENT_SIZE
             | ENABLE_WAVEFRONT_SIZE32;
-        let values = hsa_user_sgprs(
-            &private_image(10, true, properties),
-            kernarg,
-            Some(scratch),
-        )
-        .unwrap();
+        let values =
+            hsa_user_sgprs(&private_image(10, true, properties), kernarg, Some(scratch)).unwrap();
         // 96 CUs * 32 slots = 3072 one-KiB wave slots; 10 B rounds to 12 B.
         assert_eq!(
             values,

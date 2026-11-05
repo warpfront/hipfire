@@ -28,9 +28,9 @@ use std::time::Duration;
 
 use redline_rocr::packet::{KernelDispatchPacket, PacketImage};
 use redline_rocr::{
-    load_symbols, CompletionSignal, Executable, Gfx10KernelImage, Gfx10Pm4CommandBuffer,
-    Gfx10Scratch, Gfx10ScratchFamily, Gfx10ScratchPlan, Gfx10ScratchTopology, GpuDevice,
-    GpuSelector, KernargBuffer, KernargPool, Kernel, LaunchGeometry, QueueSet, Runtime,
+    CompletionSignal, Executable, Gfx10KernelImage, Gfx10Pm4CommandBuffer, Gfx10Scratch,
+    Gfx10ScratchFamily, Gfx10ScratchPlan, Gfx10ScratchTopology, GpuDevice, GpuSelector,
+    KernargBuffer, KernargPool, Kernel, LaunchGeometry, QueueSet, Runtime, load_symbols,
 };
 
 type R<T> = Result<T, String>;
@@ -115,7 +115,12 @@ impl Rig {
     }
 
     fn words(&self, words: &[u32]) -> R<KernargBuffer> {
-        self.buffer(&words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>())
+        self.buffer(
+            &words
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn zeros(&self, bytes: usize) -> R<KernargBuffer> {
@@ -513,7 +518,12 @@ fn case_order(rig: &mut Rig, tally: &mut Tally, dyn_kernel: &Kernel, plain: &Ker
         let o3 = rig.zeros(threads * 4)?;
         let mut o4 = rig.zeros(threads * 4)?;
         let plain_args = |rig: &Rig, from: &KernargBuffer, to: &KernargBuffer| {
-            kernarg_for(rig, plain, geometry, &ptr_bytes(&[Part::Ptr(from), Part::Ptr(to)]))
+            kernarg_for(
+                rig,
+                plain,
+                geometry,
+                &ptr_bytes(&[Part::Ptr(from), Part::Ptr(to)]),
+            )
         };
         let dyn_args = |rig: &Rig, from: &KernargBuffer, to: &KernargBuffer| {
             kernarg_for(
@@ -579,13 +589,13 @@ fn case_alias(rig: &mut Rig, tally: &mut Tally, alias: &Kernel) -> R<()> {
     } else {
         64
     };
-    let capacity_waves =
-        (rig.topology.compute_units * rig.topology.max_waves_per_cu) as usize;
+    let capacity_waves = (rig.topology.compute_units * rig.topology.max_waves_per_cu) as usize;
     // Twice the device's wave capacity so every slot is busy and more wait.
     let block = 128_usize;
     let threads = (capacity_waves * lanes * 2).next_multiple_of(block);
     let spins = 1500;
-    let geometry = LaunchGeometry::new([threads as u32, 1, 1], [block as u16, 1, 1]).map_err(err)?;
+    let geometry =
+        LaunchGeometry::new([threads as u32, 1, 1], [block as u16, 1, 1]).map_err(err)?;
     for seed in [0x5eed_0001_u32, 0xa11a_5000] {
         let reference = scratch_alias_ref(threads, spins, seed);
         let args = |rig: &Rig, out: &KernargBuffer, fail: &KernargBuffer| {
@@ -670,7 +680,8 @@ fn case_alias_control(rig: &mut Rig, tally: &mut Tally, alias: &Kernel) -> R<()>
     let threads = (capacity_waves * lanes * 2).next_multiple_of(block);
     let spins = 1500;
     let seed = 0x5eed_0001_u32;
-    let geometry = LaunchGeometry::new([threads as u32, 1, 1], [block as u16, 1, 1]).map_err(err)?;
+    let geometry =
+        LaunchGeometry::new([threads as u32, 1, 1], [block as u16, 1, 1]).map_err(err)?;
     let reference = scratch_alias_ref(threads, spins, seed);
     let mut out = rig.zeros(threads * 4)?;
     let mut fail = rig.zeros(16)?;
@@ -822,7 +833,10 @@ fn case_residual(
         let aql = run(rig, false)?;
         let pm4 = run(rig, true)?;
         let pm4_again = run(rig, true)?;
-        let nan_lanes = pm4.iter().filter(|w| (**w & 0x7fff_ffff) > 0x7f80_0000).count();
+        let nan_lanes = pm4
+            .iter()
+            .filter(|w| (**w & 0x7fff_ffff) > 0x7f80_0000)
+            .count();
         tally.check(
             &format!("{label} residual {name} M={m} K={k}"),
             aql == pm4 && pm4 == pm4_again,
@@ -903,7 +917,9 @@ fn main() -> R<()> {
         .map_err(err)?;
         let residual = exe.kernel("gemv_mq4g256v2_residual.kd").map_err(err)?;
         // Dual-row kernel: one block per two rows.
-        case_residual(&mut rig, &mut tally, &residual, "mq4", 136, |m| m.div_ceil(2))?;
+        case_residual(&mut rig, &mut tally, &residual, "mq4", 136, |m| {
+            m.div_ceil(2)
+        })?;
     }
     if !mq3.as_os_str().is_empty() && wanted("mq3") {
         let exe = Executable::load(

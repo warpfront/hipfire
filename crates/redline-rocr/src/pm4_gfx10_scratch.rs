@@ -224,8 +224,9 @@ impl Gfx10ScratchPlan {
         let slots = (per_engine * engines) as u32;
         let waves = match family {
             Gfx10ScratchFamily::Gfx11 => per_engine as u32,
-            Gfx10ScratchFamily::Gfx10 => slots.min(0xfff) / topology.shader_engines
-                * topology.shader_engines,
+            Gfx10ScratchFamily::Gfx10 => {
+                slots.min(0xfff) / topology.shader_engines * topology.shader_engines
+            }
         };
         let slots = match family {
             Gfx10ScratchFamily::Gfx11 => slots,
@@ -345,7 +346,6 @@ impl Gfx10Scratch {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,8 +396,8 @@ mod tests {
     #[test]
     fn plan_is_capped_by_backing_but_never_below_one_workgroup() {
         // 544 B/lane * 64 lanes = 34816 B -> 137 units (odd) = 35072 B per wave.
-        let plan = Gfx10ScratchPlan::new(Gfx10ScratchFamily::Gfx11, XTX, 544 * 64, 64 << 20)
-            .unwrap();
+        let plan =
+            Gfx10ScratchPlan::new(Gfx10ScratchFamily::Gfx11, XTX, 544 * 64, 64 << 20).unwrap();
         assert_eq!(plan.bytes_per_wave(), 137 * 256);
         assert!(plan.backing_bytes() <= 64 << 20);
         assert_eq!(plan.slots() % XTX.shader_engines, 0);
