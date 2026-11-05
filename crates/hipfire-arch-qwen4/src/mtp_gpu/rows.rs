@@ -589,6 +589,9 @@ impl Qwen4MtpGpu {
             .ok_or_else(|| invalid("MTP wide dimension overflow"))?;
         let wide_bytes = wide * std::mem::size_of::<f32>();
 
+        // Never the plain-AR retained body (see `head_prologue`).
+        gpu.replay.set_forward_eligible(false);
+
         // Stage 1 (per lane, host): the position guards and the backbone
         // hidden staging, exactly `head_prologue`'s; then the draft history
         // and ONE H2D of the `n` tokens.

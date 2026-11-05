@@ -1626,6 +1626,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "qwen4-gdn-slot-retained-identity",
+        predicates: &[ReplayEnabled, IsRecording],
+        condition: "hipfire-arch-qwen4 forward_chunk_scoped (gpu_forward.rs): with a replay backend enabled (`gpu.replay.is_enabled()`) the forward reads the live GDN recurrent ring slot; a recording tape latches it as route identity QWEN4_GDN_SLOT_IDENTITY_KEY (only while `is_recording()`), and a plain-AR forward whose live slot differs from the latched one is not retained-eligible and runs on HIP (MTP verify windows move the slot via set_gdn_live; HIPF-294)",
+        effect: Lifecycle,
+        switches: "retained replay vs HIP for one AR forward; the tape stays prepared",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "the HIP forward runs the tape's arithmetic: qwen4_tile_verify_reference latches the recorded QSA reference at every non-prefill row count, so split-K stays closed. Halo gfx1151 Flash-Next MTP + forced Redline, split-K default and off: one digest per request whichever route the seed took (HIPF-294 / HIPF-300)",
+        reaches: &[],
+    },
+    Decision {
         id: "qwen4-ep-seq-parallel-recorded-guard",
         predicates: &[IsRecording, CaptureMode],
         condition: "hipfire-arch-qwen4 forward_chunk_scoped (gpu_forward.rs): the EP2 sequence-parallel prefill route (HIPFIRE_QWEN4_EP_SEQ_PARALLEL) is declined for the whole chunk when `gpu.replay.is_recording() || gpu.graphs.capture_mode`, which then runs the all-reduce route (ar_hc_write) exactly as before",
@@ -2234,7 +2245,7 @@ pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-arch-qwen4/src/gpu_forward.rs",
         function: "forward_chunk_scoped",
-        occurrences: 13,
+        occurrences: 15,
         decisions: &[
             "replay-recorder-lifecycle",
             "qwen4-g2-expert-stage",
@@ -2242,6 +2253,7 @@ pub const SITES: &[Site] = &[
             "qwen4-ple-async-upload",
             "qwen4-wide-verify-recorded-ar-guard",
             "qwen4-ep-seq-parallel-recorded-guard",
+            "qwen4-gdn-slot-retained-identity",
         ],
     },
     Site {

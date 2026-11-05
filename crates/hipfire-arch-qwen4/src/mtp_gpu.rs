@@ -3335,6 +3335,11 @@ impl Qwen4MtpGpu {
         backbone_hidden: Option<&GpuTensor>,
         position: usize,
     ) -> Result<(), MtpGpuError> {
+        // The MTP head is never the plain-AR retained body. Eligibility is
+        // stated per forward and otherwise left as the last trunk forward set
+        // it, so a head step after an eligible spec AR token would run as if it
+        // were being recorded or replayed (HIPF-294).
+        gpu.replay.set_forward_eligible(false);
         let wide = config
             .hc_count
             .checked_mul(config.hidden_size)
@@ -3603,6 +3608,8 @@ impl Qwen4MtpGpu {
         device_ids: Option<&GpuTensor>,
         position: usize,
     ) -> Result<(), MtpGpuError> {
+        // Never the plain-AR retained body (see `head_prologue`).
+        gpu.replay.set_forward_eligible(false);
         let config = config.mtp_geometry();
         let rows = tokens.len();
         let w = AppendWidths::new(config).ok_or_else(|| invalid("MTP append width overflow"))?;

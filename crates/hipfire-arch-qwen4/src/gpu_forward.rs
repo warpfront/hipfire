@@ -329,6 +329,10 @@ pub(crate) fn qwen4_prefill_chunk_rungs(requested: usize) -> impl Iterator<Item 
 /// final row only. Actual admission also requires allocated forward scratch.
 pub(crate) const QWEN4_SPEC_VERIFY_ROWS: usize = hipfire_config::QWEN4_VERIFY_MAX_ROWS;
 
+/// Route-identity key under which a retained tape latches the GDN recurrent
+/// slot it was recorded at (an ASCII tag; MoE keys are table addresses).
+const QWEN4_GDN_SLOT_IDENTITY_KEY: u64 = u64::from_be_bytes(*b"qwen4gdn");
+
 /// Rows a verify forward on this GPU runs row-exact (each row bitwise the
 /// sequential single-row decode): the per-arch value of
 /// [`rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows`] (the
@@ -392,6 +396,22 @@ pub(crate) fn qwen4_ar_launch(
         return Qwen4ArLaunch::Eager;
     }
     Qwen4ArLaunch::Recorded
+}
+
+/// The QSA arithmetic reference a non-prefill tile latches, at every row
+/// count: a multi-row verify launches eagerly but must reproduce the AR
+/// arithmetic, and a one-row forward that runs on HIP while the retained route
+/// is live (the GDN slot guard) must reproduce the tape it stands in for
+/// (HIPF-294). Prefill tiles latch nothing.
+pub(crate) fn qwen4_tile_verify_reference(
+    prefill_scope: bool,
+    launch: impl FnOnce() -> Qwen4ArLaunch,
+) -> Option<rdna_compute::prefill_invariant::Qwen4VerifyReference> {
+    use rdna_compute::prefill_invariant::Qwen4VerifyReference;
+    (!prefill_scope).then(|| match launch() {
+        Qwen4ArLaunch::Eager => Qwen4VerifyReference::Eager,
+        Qwen4ArLaunch::Recorded => Qwen4VerifyReference::Recorded,
+    })
 }
 
 pub(crate) fn qwen4_spec_logit_rows(max_chunk: usize) -> usize {
@@ -16134,18 +16154,13 @@ impl Qwen4GpuForward {
         }
         // Latch before installing this call's routing scopes: a multi-row
         // verify remains eager but must reproduce the singleton AR arithmetic
-        // that would run at this exact boundary.
-        let verify_reference = if !self.prefill_scope && tokens.len() >= 2 {
-            use rdna_compute::prefill_invariant::Qwen4VerifyReference;
-            Some(match self.ar_launch_reference(bundle, gpu) {
-                Qwen4ArLaunch::Eager => Qwen4VerifyReference::Eager,
-                Qwen4ArLaunch::Recorded => Qwen4VerifyReference::Recorded,
-            })
-        } else {
-            None
-        };
+        // that would run at this exact boundary, and so must a one-row forward
+        // the retained route hands to HIP.
+        let verify_reference = qwen4_tile_verify_reference(self.prefill_scope, || {
+            self.ar_launch_reference(bundle, gpu)
+        });
         #[cfg(feature = "lab")]
-        if verify_reference.is_some() {
+        if tokens.len() >= 2 && verify_reference.is_some() {
             self.last_verify_reference = verify_reference;
         }
         let (scopes, _append) = self.enter_tile_scopes(gpu, tokens.len());
@@ -17351,7 +17366,21 @@ impl Qwen4GpuForward {
             // launch bypasses the Redline recorder (census 82 launched / 80
             // recorded on tiny-dense-dev-gpu, card B) and the per-row GDN conv
             // carries a position kernarg linear AQL cannot rebind.
+            //
+            // MTP verify windows move every GDN layer's recurrent state between
+            // capture-ring slots (`set_gdn_live`), and a tape bakes the slot it
+            // was recorded at: a forward whose live slot differs runs on HIP.
+            let gdn_slot = gpu
+                .replay
+                .is_enabled()
+                .then(|| bundle.state.gdn.first())
+                .flatten()
+                .map(|layer| format!("{:#x}", layer.recurrent.buf.as_ptr() as usize));
             let eligible = n == 1
+                && gpu
+                    .replay
+                    .route_identity(QWEN4_GDN_SLOT_IDENTITY_KEY)
+                    .is_none_or(|latched| gdn_slot.as_deref() == Some(latched))
                 && self.ep.is_none()
                 && !cpu_deferred_experts
                 && config.profile.is_flash_next()
@@ -17421,6 +17450,13 @@ impl Qwen4GpuForward {
                         gpu.replay
                             .begin_auto_capture_if_armed()
                             .map_err(|reason| invalid(reason))?;
+                        if let Some(slot) = gdn_slot.as_deref() {
+                            if gpu.replay.is_recording() {
+                                gpu.replay
+                                    .note_route_identity(QWEN4_GDN_SLOT_IDENTITY_KEY, slot)
+                                    .map_err(invalid)?;
+                            }
+                        }
                     }
                     RetainedBodyAction::Route => {}
                 }
@@ -17445,6 +17481,9 @@ impl Qwen4GpuForward {
                 // arena generations) here, before any retained submit.
                 let moe = tile_moe;
                 if let Err(reason) = gpu.replay.validate_route_identities(|key| {
+                    if key == QWEN4_GDN_SLOT_IDENTITY_KEY {
+                        return gdn_slot.as_deref();
+                    }
                     moe.iter().flatten()
                         .flat_map(|layer| layer.retained_identities.iter())
                         .find(|(bound, _)| *bound == key)
@@ -18005,7 +18044,10 @@ fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool) {
 
 #[cfg(test)]
 mod wide_verify_guard_tests {
-    use super::{qwen4_ar_launch, qwen4_spec_logit_rows, Qwen4ArLaunch};
+    use super::{
+        qwen4_ar_launch, qwen4_spec_logit_rows, qwen4_tile_verify_reference, Qwen4ArLaunch,
+    };
+    use rdna_compute::prefill_invariant::Qwen4VerifyReference;
     use rdna_compute::replay::{ReplayBackendRequest as Request, ReplayState as State};
 
     #[test]
@@ -18097,6 +18139,26 @@ mod wide_verify_guard_tests {
         for (state, expected) in transitions {
             assert_eq!(qwen4_ar_launch(true, Request::Auto, state, false), expected);
         }
+    }
+
+    /// A forward outside prefill latches the AR reference whatever its row
+    /// count, so a one-row HIP forward under a live retained state keeps the
+    /// recorded arithmetic (HIPF-294 / HIPF-300 B2: a rows >= 2 gate gave it
+    /// eager split-K and a second greedy output).
+    #[test]
+    fn tile_reference_follows_the_ar_launch_outside_prefill() {
+        assert_eq!(
+            qwen4_tile_verify_reference(false, || Qwen4ArLaunch::Recorded),
+            Some(Qwen4VerifyReference::Recorded)
+        );
+        assert_eq!(
+            qwen4_tile_verify_reference(false, || Qwen4ArLaunch::Eager),
+            Some(Qwen4VerifyReference::Eager)
+        );
+        assert_eq!(
+            qwen4_tile_verify_reference(true, || Qwen4ArLaunch::Recorded),
+            None
+        );
     }
 }
 
