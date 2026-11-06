@@ -177,9 +177,15 @@ fn edge_row(rng: &mut Rng, which: usize) -> Vec<f32> {
     let v: Vec<f32> = match which {
         0 => vec![0.0; WIDE],
         1 => vec![1.0; WIDE],
-        2 => (0..WIDE).map(|i| if i % 2 == 0 { 3.0e4 } else { -3.0e4 }).collect(),
-        3 => (0..WIDE).map(|_| sign(rng) * 1.0e4 * (0.5 + rng.unit())).collect(),
-        4 => (0..WIDE).map(|_| sign(rng) * 1.0e-12 * (0.5 + rng.unit())).collect(),
+        2 => (0..WIDE)
+            .map(|i| if i % 2 == 0 { 3.0e4 } else { -3.0e4 })
+            .collect(),
+        3 => (0..WIDE)
+            .map(|_| sign(rng) * 1.0e4 * (0.5 + rng.unit()))
+            .collect(),
+        4 => (0..WIDE)
+            .map(|_| sign(rng) * 1.0e-12 * (0.5 + rng.unit()))
+            .collect(),
         5 => {
             let mut v = vec![0.0; WIDE];
             v[rng.below(WIDE as u64) as usize] = 256.0;
@@ -413,7 +419,12 @@ struct Model {
     layers: Vec<(usize, usize, usize)>,
 }
 
-fn read_op<'a>(c: &'a Conn, v: &'a [GpuTensor], rot: &'a GpuTensor, rows: usize) -> HyperReadOp<'a> {
+fn read_op<'a>(
+    c: &'a Conn,
+    v: &'a [GpuTensor],
+    rot: &'a GpuTensor,
+    rows: usize,
+) -> HyperReadOp<'a> {
     HyperReadOp {
         state_bf16: false,
         input: &v[STREAMS],
@@ -432,7 +443,12 @@ fn read_op<'a>(c: &'a Conn, v: &'a [GpuTensor], rot: &'a GpuTensor, rows: usize)
     }
 }
 
-fn write_op<'a>(c: &'a Conn, v: &'a [GpuTensor], rot: &'a GpuTensor, rows: usize) -> HyperWriteOp<'a> {
+fn write_op<'a>(
+    c: &'a Conn,
+    v: &'a [GpuTensor],
+    rot: &'a GpuTensor,
+    rows: usize,
+) -> HyperWriteOp<'a> {
     HyperWriteOp {
         state_bf16: false,
         input: &v[STREAMS],
@@ -613,7 +629,10 @@ fn compare_cell(
                 .count();
             if bad != 0 {
                 st.violation_words += bad as u64;
-                st.note(format!("{tag}: readonly {} changed in {bad} words", NAMES[b]));
+                st.note(format!(
+                    "{tag}: readonly {} changed in {bad} words",
+                    NAMES[b]
+                ));
             }
             continue;
         }
@@ -629,7 +648,10 @@ fn compare_cell(
                 .count();
             if bad != 0 {
                 st.violation_words += bad as u64;
-                st.note(format!("{tag}: tail of {} touched in {bad} words", NAMES[b]));
+                st.note(format!(
+                    "{tag}: tail of {} touched in {bad} words",
+                    NAMES[b]
+                ));
             }
         }
         for (i, &src) in order.iter().enumerate() {
@@ -721,7 +743,9 @@ fn run() -> R<bool> {
         return Err(format!("needs exact gfx1201, got {}", gpu.arch));
     }
     if !gpu.flags.qwen4_lane_hc_allrows_enabled() {
-        return Err("HIPFIRE_QWEN4_LANE_HC_ALLROWS is off: the all-rows arm would not engage".into());
+        return Err(
+            "HIPFIRE_QWEN4_LANE_HC_ALLROWS is off: the all-rows arm would not engage".into(),
+        );
     }
 
     // Group the payloads by connection prefix.
@@ -734,9 +758,16 @@ fn run() -> R<bool> {
         } else {
             return Err(format!("unexpected sidecar tensor {}", p.name));
         };
-        let want = if slot == 0 { [RANK, WIDE] } else { [WIDE, RANK] };
+        let want = if slot == 0 {
+            [RANK, WIDE]
+        } else {
+            [WIDE, RANK]
+        };
         if p.shape != want {
-            return Err(format!("{}: shape {:?}, expected {want:?}", p.name, p.shape));
+            return Err(format!(
+                "{}: shape {:?}, expected {want:?}",
+                p.name, p.shape
+            ));
         }
         let slots = by_prefix.entry(prefix.to_string()).or_default();
         if slots[slot].replace(i).is_some() {
@@ -830,8 +861,21 @@ fn run() -> R<bool> {
         for &stage in &stages {
             let tag = format!("seed {seed} {}", label(&model, stage));
             let kind = stage.kind();
-            let single = run_arm(&mut gpu, &ctx, &model, stage, &bufs, &single_init, BASE_ROWS, true)?;
-            let before = (st.cells, st.bytes, st.mismatching_bytes + st.violation_words);
+            let single = run_arm(
+                &mut gpu,
+                &ctx,
+                &model,
+                stage,
+                &bufs,
+                &single_init,
+                BASE_ROWS,
+                true,
+            )?;
+            let before = (
+                st.cells,
+                st.bytes,
+                st.mismatching_bytes + st.violation_words,
+            );
             for rows in 1..=rows_max {
                 for reversed in [false, true] {
                     let order: Vec<usize> = if reversed {
