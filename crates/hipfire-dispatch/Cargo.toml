@@ -49,3 +49,11 @@ required-features = ["test-utils"]
 [[example]]
 name = "mtp_proj_batch_oracle"
 required-features = ["test-utils"]
+
+[[example]]
+name = "hetero_prefill_oracle"
+required-features = ["deltanet"]
+
+[[example]]
+name = "hetero_responder_oracle"
+required-features = ["deltanet"]

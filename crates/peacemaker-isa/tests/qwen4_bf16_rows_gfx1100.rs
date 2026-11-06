@@ -1359,9 +1359,12 @@ fn source_pair_provenance_remains_the_recorded_gfx1100_reference() {
     // PM row-tile kernels then replaced the HIP `gemv_bf16_xf32_{x4,k4}_rows_wide_r{16,32}`
     // twins, whose definitions were deleted from the tail of qwen4_gemv_bf16_xf32.hip
     // (nothing before that tail changed, so the gfx1100 singleton exports are unchanged);
-    // the current file is pinned to its post-removal digest.
+    // the current file is pinned to its post-removal digest. The standalone
+    // `gemv_bf16_xf32` kernel's `#if defined(__gfx1151__)` then widened to
+    // `|| defined(__gfx1201__)` (comment and that line only), so gfx1100's
+    // preprocessed source and singleton exports are again unchanged; re-pinned.
     const QWEN4_SRC_WITHOUT_WIDE_TWINS: &str =
-        "8a4b2c8402369979f8432599150ad24dbbfe337490d16aa893c516608ae6831b";
+        "32ebc3e174097daa95973d5b76c2cc063d1177ea0ac92ba26b428a30e44b42b7";
     for (source, expected) in [
         ("gemv_bf16_xf32.hip", FIXTURES[0].4),
         ("qwen4_gemv_bf16_xf32.hip", QWEN4_SRC_WITHOUT_WIDE_TWINS),
