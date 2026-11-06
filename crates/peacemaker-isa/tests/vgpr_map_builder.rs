@@ -61,7 +61,14 @@ fn settle_defs_translates_to_the_renamed_register() {
             Instruction::new(
                 "global_load_b32 v9, v1, s[0:1]",
                 vec![v(9)],
-                vec![v(1), RegRef { kind: Kind::S, base: 0, len: 2 }],
+                vec![
+                    v(1),
+                    RegRef {
+                        kind: Kind::S,
+                        base: 0,
+                        len: 2,
+                    },
+                ],
             )
             .memory(MemoryClass::VmemLoad),
         )
@@ -83,7 +90,10 @@ fn settle_defs_translates_to_the_renamed_register() {
         .iter()
         .map(|i| i.text.as_str())
         .collect();
-    let load = text.iter().position(|t| t.starts_with("global_load")).unwrap();
+    let load = text
+        .iter()
+        .position(|t| t.starts_with("global_load"))
+        .unwrap();
     // the load's destination is renamed (v9 has no neighbour to keep it in place), yet the wait stays right after it
     assert!(!text[load].contains(" v9,"), "{text:?}");
     assert!(text[load + 1].starts_with("s_wait_loadcnt"), "{text:?}");
