@@ -113,18 +113,16 @@ fn gen_case(s: Scenario, rng: &mut Lcg, tokens: usize, hidden: usize) -> Case {
     match s {
         Scenario::Random => {}
         Scenario::InvalidIds => {
-            for (i, id) in ids.iter_mut().enumerate() {
+            for id in ids.iter_mut() {
                 match rng.below(5) {
                     0 => *id = -1,
                     1 => *id = N_EXPERTS as i32 + rng.below(40) as i32,
                     _ => {}
                 }
-                if i % 10 == 0 && i / 10 == 0 {
-                    // an all-unrouted row
-                    for k in 0..10 {
-                        ids[k] = if k % 2 == 0 { -1 } else { N_EXPERTS as i32 };
-                    }
-                }
+            }
+            // an all-unrouted row
+            for (k, id) in ids.iter_mut().take(10).enumerate() {
+                *id = if k % 2 == 0 { -1 } else { N_EXPERTS as i32 };
             }
             // unrouted rows may hold uninitialised data: poison them with NaN
             for (slot, &id) in ids.iter().enumerate() {
