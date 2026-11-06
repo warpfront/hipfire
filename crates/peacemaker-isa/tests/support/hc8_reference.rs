@@ -133,7 +133,10 @@ pub fn host_model_set(
     let steps = k / 16 / kw;
     let mut out = vec![0u32; rows * m];
     for n in 0..rows {
-        let b: Vec<u16> = x[n * k..(n + 1) * k].iter().map(|&f| bf16_bits(f)).collect();
+        let b: Vec<u16> = x[n * k..(n + 1) * k]
+            .iter()
+            .map(|&f| bf16_bits(f))
+            .collect();
         for r in 0..m {
             let a = &w[r * k..(r + 1) * k];
             let mut fold = 0f32;
@@ -410,12 +413,7 @@ fn act_tail(b: &mut Builder, out: u8) -> R {
     )?;
     // y = x / (1 + exp(-x)).
     let [w0, w1, w2, w3, w4, w5] = [t0, t1, t2, t3, t4, t5];
-    valu(
-        b,
-        format!("v_add_f32_e32 v{w0}, 1.0, v{w0}"),
-        &[w0],
-        &[w0],
-    )?;
+    valu(b, format!("v_add_f32_e32 v{w0}, 1.0, v{w0}"), &[w0], &[w0])?;
     valu(
         b,
         format!("v_div_scale_f32 v{w1}, null, v{w0}, v{w0}, v{out}"),
@@ -493,7 +491,10 @@ fn act_tail(b: &mut Builder, out: u8) -> R {
 pub fn emit_reference(geo: Geo, k: u32) -> Result<Emitted, String> {
     let kw = geo.kw;
     if kw == 0 || k == 0 || k % (32 * kw) != 0 {
-        return Err(format!("reference: K={k} must be a multiple of 32*KW={}", 32 * kw));
+        return Err(format!(
+            "reference: K={k} must be a multiple of 32*KW={}",
+            32 * kw
+        ));
     }
     let steps = k / 16 / kw; // K16 steps per slice
     let kernargs = KernargLayout::new(48)
@@ -521,12 +522,7 @@ pub fn emit_reference(geo: Geo, k: u32) -> Result<Emitted, String> {
     smem(b, S_M, 4, 0, 32)?;
     b.wait_all()?;
     sop(b, format!("s_mov_b32 s{S_MT}, ttmp9"), &[S_MT], &[])?;
-    sop(
-        b,
-        format!("s_and_b32 s{S_CT}, ttmp7, 0xffff"),
-        &[S_CT],
-        &[],
-    )?;
+    sop(b, format!("s_and_b32 s{S_CT}, ttmp7, 0xffff"), &[S_CT], &[])?;
     sop(
         b,
         format!("s_mul_i32 s{S_AB}, s{S_MT}, {}", lit(32 * k)),
@@ -551,19 +547,19 @@ pub fn emit_reference(geo: Geo, k: u32) -> Result<Emitted, String> {
         &[S_MTB],
         &[S_MT],
     )?;
-    sop(
-        b,
-        format!("s_lshl_b32 s{S_M4}, s{S_M}, 2"),
-        &[S_M4],
-        &[S_M],
-    )?;
+    sop(b, format!("s_lshl_b32 s{S_M4}, s{S_M}, 2"), &[S_M4], &[S_M])?;
     // High words of the wave32 masks are never written.
     sop(b, format!("s_mov_b32 s{}, 0", S_EM + 1), &[S_EM + 1], &[])?;
     sop(b, format!("s_mov_b32 s{}, 0", MASK0 + 1), &[MASK0 + 1], &[])?;
     sop(b, format!("s_mov_b32 s{}, 0", MASK1 + 1), &[MASK1 + 1], &[])?;
 
     // Lane geometry: r = lane & 15 (A row / B column), h = lane >> 4.
-    valu(b, format!("v_and_b32_e32 v{V_R}, 15, v{V_TID}"), &[V_R], &[V_TID])?;
+    valu(
+        b,
+        format!("v_and_b32_e32 v{V_R}, 15, v{V_TID}"),
+        &[V_R],
+        &[V_TID],
+    )?;
     valu(
         b,
         format!("v_lshrrev_b32_e32 v{V_H}, 4, v{V_TID}"),

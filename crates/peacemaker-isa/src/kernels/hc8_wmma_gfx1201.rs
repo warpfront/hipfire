@@ -209,7 +209,10 @@ impl Geo {
 /// Swizzle a row-major `[m, k]` 8-bit matrix into the A-fragment tile order described
 /// in the module doc. `m % 16 == 0` and `k % 32 == 0` (panics otherwise).
 pub fn swizzle_hc8(w: &[u8], m: usize, k: usize) -> Vec<u8> {
-    assert!(m % 16 == 0 && k % 32 == 0 && w.len() == m * k, "bad hc8 dims");
+    assert!(
+        m % 16 == 0 && k % 32 == 0 && w.len() == m * k,
+        "bad hc8 dims"
+    );
     let mut out = vec![0u8; m * k];
     for_each_slot(m, k, |dst, src| out[dst] = w[src]);
     out
@@ -217,7 +220,10 @@ pub fn swizzle_hc8(w: &[u8], m: usize, k: usize) -> Vec<u8> {
 
 /// Inverse of [`swizzle_hc8`].
 pub fn unswizzle_hc8(q: &[u8], m: usize, k: usize) -> Vec<u8> {
-    assert!(m % 16 == 0 && k % 32 == 0 && q.len() == m * k, "bad hc8 dims");
+    assert!(
+        m % 16 == 0 && k % 32 == 0 && q.len() == m * k,
+        "bad hc8 dims"
+    );
     let mut out = vec![0u8; m * k];
     for_each_slot(m, k, |dst, src| out[src] = q[dst]);
     out
@@ -506,16 +512,21 @@ fn prologue(b: &mut Builder, g: &Geo, end: &str) -> R {
     // M tile = wg*MW + mi.
     if g.mw == 1 {
         let a = b.spec.arch;
-        sop(b, format!("{} s{MT}, s{WG}, s{MI}", s_add_i32(a)), &[MT], &[WG, MI])?;
-    } else {
         sop(
             b,
-            format!("s_mul_i32 s{MT}, s{WG}, {}", g.mw),
+            format!("{} s{MT}, s{WG}, s{MI}", s_add_i32(a)),
             &[MT],
-            &[WG],
+            &[WG, MI],
         )?;
+    } else {
+        sop(b, format!("s_mul_i32 s{MT}, s{WG}, {}", g.mw), &[MT], &[WG])?;
         let a = b.spec.arch;
-        sop(b, format!("{} s{MT}, s{MT}, s{MI}", s_add_i32(a)), &[MT], &[MT, MI])?;
+        sop(
+            b,
+            format!("{} s{MT}, s{MT}, s{MI}", s_add_i32(a)),
+            &[MT],
+            &[MT, MI],
+        )?;
     }
     // Weight pointer: q + ((mt*(K/32) + ki*KT) * 512).
     sop(b, format!("s_lshr_b32 s{TMP}, s{SK}, 5"), &[TMP], &[SK])?;
@@ -611,12 +622,7 @@ fn prologue(b: &mut Builder, g: &Geo, end: &str) -> R {
         &[v(XOFF), v(VT2)],
     )?;
     if nt > 1 {
-        sop(
-            b,
-            format!("s_lshl_b32 s{TMP}, s{KB}, 4"),
-            &[TMP],
-            &[KB],
-        )?;
+        sop(b, format!("s_lshl_b32 s{TMP}, s{KB}, 4"), &[TMP], &[KB])?;
         for c in 1..nt {
             sop(
                 b,
@@ -716,7 +722,10 @@ fn decode(b: &mut Builder, g: &Geo, l: &Lay, t: u32) -> R {
                 )?;
                 op(
                     b,
-                    format!("v_cvt_pk_f32_fp8_e64 {}, v{w}.h op_sel:[1,0]", vr(tb + 2, 2)),
+                    format!(
+                        "v_cvt_pk_f32_fp8_e64 {}, v{w}.h op_sel:[1,0]",
+                        vr(tb + 2, 2)
+                    ),
                     &[vr(tb + 2, 2)],
                     &[v(w)],
                 )?;
@@ -820,7 +829,12 @@ fn k_loops(b: &mut Builder, g: &Geo, l: &Lay) -> R {
         branch(b, &format!("s_cbranch_scc1 {skip}"))?;
         b.loop_(&head, |b| {
             batch(b, g, l, u)?;
-            sop(b, format!("s_sub_co_i32 s{REM}, s{REM}, {u}"), &[REM], &[REM])?;
+            sop(
+                b,
+                format!("s_sub_co_i32 s{REM}, s{REM}, {u}"),
+                &[REM],
+                &[REM],
+            )?;
             sop(b, format!("s_cmp_ge_u32 s{REM}, {u}"), &[], &[REM])?;
             branch(b, &format!("s_cbranch_scc1 {head}"))
         })?;
@@ -1035,7 +1049,10 @@ pub fn emit_geos(geos: &[Geo]) -> Result<(Vec<Emitted>, String, ModuleProof), St
             ));
         }
         if e.proof.arch != Arch::Gfx1201 {
-            return Err(format!("{MODULE}: {} not built for exact gfx1201", g.symbol()));
+            return Err(format!(
+                "{MODULE}: {} not built for exact gfx1201",
+                g.symbol()
+            ));
         }
     }
     let (text, proof) = super::iu4_gemm::module(&emitted, MODULE)?;
@@ -1046,5 +1063,3 @@ pub fn emit_geos(geos: &[Geo]) -> Result<(Vec<Emitted>, String, ModuleProof), St
 pub fn emit_module() -> Result<(Vec<Emitted>, String, ModuleProof), String> {
     emit_geos(&all_geos())
 }
-
-

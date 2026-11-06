@@ -499,7 +499,14 @@ fn check_regions(
 }
 
 /// One launch of PM entry `g` over `rows` activation rows. `rows` outside `1..=16*NT` must write nothing.
-fn run_kernel(emu: &Emulator, g: Geo, c: &Case, x: &[f32], rows: usize, tag: &str) -> Result<Vec<u32>, Bad> {
+fn run_kernel(
+    emu: &Emulator,
+    g: Geo,
+    c: &Case,
+    x: &[f32],
+    rows: usize,
+    tag: &str,
+) -> Result<Vec<u32>, Bad> {
     assert_eq!(x.len(), rows * c.k);
     let valid = rows >= 1 && rows <= g.max_rows() as usize;
     let live = if valid { rows } else { 0 };
@@ -530,7 +537,14 @@ fn run_kernel(emu: &Emulator, g: Geo, c: &Case, x: &[f32], rows: usize, tag: &st
 }
 
 /// One launch of the independent reference (host-decoded row-major BF16 weights).
-fn run_reference(emu: &Emulator, g: Geo, c: &Case, x: &[f32], rows: usize, tag: &str) -> Result<Vec<u32>, Bad> {
+fn run_reference(
+    emu: &Emulator,
+    g: Geo,
+    c: &Case,
+    x: &[f32],
+    rows: usize,
+    tag: &str,
+) -> Result<Vec<u32>, Bad> {
     assert_eq!(x.len(), rows * c.k);
     assert!(rows >= 1 && rows <= 64);
     let mut mem = Memory::default();
@@ -588,7 +602,11 @@ fn lift_text(text: &str) -> Program {
     .program
 }
 
-fn emulators<'a>(program: &'a Program, syms: &BTreeSet<String>, what: &str) -> BTreeMap<String, Emulator<'a>> {
+fn emulators<'a>(
+    program: &'a Program,
+    syms: &BTreeSet<String>,
+    what: &str,
+) -> BTreeMap<String, Emulator<'a>> {
     syms.iter()
         .map(|s| {
             let e = Emulator::new(program, s)
@@ -687,16 +705,13 @@ impl Tally {
     }
 }
 
-fn compare_words(
-    t: &mut Tally,
-    label: &str,
-    what: &str,
-    got: &[u32],
-    want: &[u32],
-    m: usize,
-) {
+fn compare_words(t: &mut Tally, label: &str, what: &str, got: &[u32], want: &[u32], m: usize) {
     if got.len() != want.len() {
-        t.fail(format!("{label} [{what}]: {} words != {}", got.len(), want.len()));
+        t.fail(format!(
+            "{label} [{what}]: {} words != {}",
+            got.len(),
+            want.len()
+        ));
         return;
     }
     let bad: Vec<usize> = (0..got.len()).filter(|&i| got[i] != want[i]).collect();
@@ -751,7 +766,14 @@ fn kernel_vs_reference(
     };
     t.executed += 1;
     t.words_vs_reference += kw.len() as u64;
-    compare_words(t, label, "kernel vs independent WMMA reference", &kw, &rw, c.m);
+    compare_words(
+        t,
+        label,
+        "kernel vs independent WMMA reference",
+        &kw,
+        &rw,
+        c.m,
+    );
     Some(kw)
 }
 
@@ -805,7 +827,11 @@ fn rt32(x: f32) -> f32 {
 /// absolute bound; `act` loosely against an f64 silu chain (two BF16 ulps; the exact bytes are pinned by the
 /// independent reference). Finite inputs only.
 fn f64_check(t: &mut Tally, label: &str, g: Geo, c: &Case, x: &[f32], rows: usize, y: &[u32]) {
-    let wf: Vec<f64> = c.wbf.iter().map(|&b| f64::from(f32::from_bits(u32::from(b) << 16))).collect();
+    let wf: Vec<f64> = c
+        .wbf
+        .iter()
+        .map(|&b| f64::from(f32::from_bits(u32::from(b) << 16)))
+        .collect();
     let steps = (c.k / 16) as f64 + g.kw as f64 + 2.0;
     let unit = steps * 2f64.powi(-22);
     for n in 0..rows {
@@ -828,11 +854,17 @@ fn f64_check(t: &mut Tally, label: &str, g: Geo, c: &Case, x: &[f32], rows: usiz
                 let e = (-f64::from(v)).exp();
                 let yv = rt32((f64::from(v) / (1.0 + e)) as f32);
                 let yv = f64::from(yv);
-                (yv, yv.abs() * 2f64.powi(-6) + 2.0 * abs_tol * f64::from(c.act_scale.abs()) + 1e-30)
+                (
+                    yv,
+                    yv.abs() * 2f64.powi(-6) + 2.0 * abs_tol * f64::from(c.act_scale.abs()) + 1e-30,
+                )
             } else {
                 let want = dot * sc;
                 let strict = sabs * sc.abs() <= 4.0 * want.abs();
-                (want, want.abs() * 1e-5 + if strict { 0.0 } else { abs_tol } + 1e-37)
+                (
+                    want,
+                    want.abs() * 1e-5 + if strict { 0.0 } else { abs_tol } + 1e-37,
+                )
             };
             t.words_vs_f64 += 1;
             if !got.is_finite() || (got - want).abs() > tol {
@@ -872,7 +904,8 @@ fn expected_swizzle(w: &[u8], m: usize, k: usize) -> Vec<u8> {
                         let lane = ((kk >> 2) & 1) * 16 + r;
                         let vgpr = (kk >> 3) * 2 + ((kk >> 1) & 1);
                         let half = kk & 1;
-                        let byte = (mt * ktiles + kt) * 512 + lane * 16 + step * 8 + vgpr * 2 + half;
+                        let byte =
+                            (mt * ktiles + kt) * 512 + lane * 16 + step * 8 + vgpr * 2 + half;
                         q[byte] = w[(mt * 16 + r) * k + kt * 32 + step * 16 + kk];
                     }
                 }
@@ -884,9 +917,16 @@ fn expected_swizzle(w: &[u8], m: usize, k: usize) -> Vec<u8> {
 
 #[test]
 fn swizzle_matches_the_independently_derived_wmma_fragment_layout() {
-    for (seed, (m, k)) in [(16usize, 32usize), (16, 64), (32, 32), (48, 96), (64, 320), (128, 256)]
-        .into_iter()
-        .enumerate()
+    for (seed, (m, k)) in [
+        (16usize, 32usize),
+        (16, 64),
+        (32, 32),
+        (48, 96),
+        (64, 320),
+        (128, 256),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let mut rng = Rng::new(0x5a17 + seed as u64);
         let w: Vec<u8> = (0..m * k).map(|_| rng.next() as u8).collect();
@@ -911,7 +951,12 @@ fn swizzle_matches_the_independently_derived_wmma_fragment_layout() {
             let (mt, r, kt, kin) = (row / 16, row % 16, col / 32, col % 32);
             let (step, kk) = (kin / 16, kin % 16);
             let lane = ((kk >> 2) & 1) * 16 + r;
-            let byte = (mt * (k / 32) + kt) * 512 + lane * 16 + step * 8 + (kk >> 3) * 4 + ((kk >> 1) & 1) * 2 + (kk & 1);
+            let byte = (mt * (k / 32) + kt) * 512
+                + lane * 16
+                + step * 8
+                + (kk >> 3) * 4
+                + ((kk >> 1) & 1) * 2
+                + (kk & 1);
             assert_eq!(hits, vec![byte], "one-hot A[{row}][{col}]");
         }
     }
@@ -951,7 +996,14 @@ fn mnemonics(text: &str) -> Vec<String> {
     let body = head.split_once(".text").map_or(head, |(_, b)| b);
     body.lines()
         .filter_map(|l| {
-            let l = l.split(';').next().unwrap().split("//").next().unwrap().trim();
+            let l = l
+                .split(';')
+                .next()
+                .unwrap()
+                .split("//")
+                .next()
+                .unwrap()
+                .trim();
             if l.is_empty() || l.starts_with('.') || l.ends_with(':') {
                 None
             } else {
@@ -1006,7 +1058,13 @@ fn module_record_abi_resources_and_native_roundtrip() {
     }
     assert_eq!(emitted.len(), 80);
     assert_eq!(proof.kernels.len(), 80);
-    let forbidden = ["scratch_", "buffer_atomic", "global_atomic", "flat_", "v_swmmac"];
+    let forbidden = [
+        "scratch_",
+        "buffer_atomic",
+        "global_atomic",
+        "flat_",
+        "v_swmmac",
+    ];
     let mut vgprs = BTreeMap::new();
     for sym in &want {
         let owners: Vec<_> = emitted
@@ -1017,9 +1075,15 @@ fn module_record_abi_resources_and_native_roundtrip() {
         let em = owners[0];
         let t = &em.s_text;
         assert_eq!(em.proof.arch, ARCH, "{sym}");
-        assert!(t.contains(&format!(".name: {sym}\n")), "{sym}: metadata name");
+        assert!(
+            t.contains(&format!(".name: {sym}\n")),
+            "{sym}: metadata name"
+        );
         assert!(t.contains(".amdhsa_wavefront_size32 1"), "{sym}: wave32");
-        assert!(t.contains(".private_segment_fixed_size: 0\n"), "{sym}: private segment");
+        assert!(
+            t.contains(".private_segment_fixed_size: 0\n"),
+            "{sym}: private segment"
+        );
         assert!(
             t.contains(".sgpr_spill_count: 0\n") && t.contains(".vgpr_spill_count: 0\n"),
             "{sym}: spills"
@@ -1035,7 +1099,10 @@ fn module_record_abi_resources_and_native_roundtrip() {
             [8, 8, 8, 8, 4, 4, 4, 4],
             "{sym}: kernarg sizes"
         );
-        let g = expected_geos().into_iter().find(|g| expected_symbol(*g) == *sym).unwrap();
+        let g = expected_geos()
+            .into_iter()
+            .find(|g| expected_symbol(*g) == *sym)
+            .unwrap();
         assert_eq!(
             field(t, ".max_flat_workgroup_size:"),
             [32 * g.mw * g.kw],
@@ -1043,14 +1110,20 @@ fn module_record_abi_resources_and_native_roundtrip() {
         );
         let lds = field(t, ".group_segment_fixed_size:");
         assert_eq!(lds.len(), 1, "{sym}: LDS descriptor");
-        assert!(lds[0] <= 65536, "{sym}: LDS {} B over the 64 KiB limit", lds[0]);
+        assert!(
+            lds[0] <= 65536,
+            "{sym}: LDS {} B over the 64 KiB limit",
+            lds[0]
+        );
         let vg = field(t, ".vgpr_count:");
         let sg = field(t, ".sgpr_count:");
         assert!(vg.len() == 1 && vg[0] <= 256, "{sym}: vgpr_count {vg:?}");
         let ms = mnemonics(t);
         for m in &ms {
             assert!(
-                !forbidden.iter().any(|f| m.starts_with(f)) && !m.contains("atomic") && !m.contains("cmpswap"),
+                !forbidden.iter().any(|f| m.starts_with(f))
+                    && !m.contains("atomic")
+                    && !m.contains("cmpswap"),
                 "{sym}: forbidden instruction {m}"
             );
         }
@@ -1062,7 +1135,10 @@ fn module_record_abi_resources_and_native_roundtrip() {
         assert_eq!(cvt, g.fmt == Fmt::E4M3, "{sym}: v_cvt_pk_f32_fp8 iff E4M3");
         let act_ops = ms.iter().any(|m| m.starts_with("v_div_fixup"));
         assert_eq!(act_ops, g.act, "{sym}: hc_act division sequence iff act");
-        vgprs.insert(sym.clone(), (vg[0], sg.first().copied().unwrap_or(0), lds[0]));
+        vgprs.insert(
+            sym.clone(),
+            (vg[0], sg.first().copied().unwrap_or(0), lds[0]),
+        );
     }
     for (sym, (v, s, l)) in &vgprs {
         log(format!("[resources] {sym} vgprs={v} sgprs={s} lds={l}"));
@@ -1125,7 +1201,11 @@ fn host_decode_matches_the_emulator_fp8_model_and_int8_is_exact() {
             "E4M3 {code:#04x}"
         );
     }
-    assert_eq!(decode_weights(Fmt::E4M3, &[0x80])[0], 0x8000, "-0 keeps its sign");
+    assert_eq!(
+        decode_weights(Fmt::E4M3, &[0x80])[0],
+        0x8000,
+        "-0 keeps its sign"
+    );
     assert_eq!(decode_weights(Fmt::E4M3, &[0x7f])[0], 0x7fc0, "NaN +");
     assert_eq!(decode_weights(Fmt::E4M3, &[0xff])[0], 0xffc0, "NaN -");
     assert_eq!(decode_weights(Fmt::I8, &[0x80])[0], 0xc300, "int8 -128");
@@ -1152,7 +1232,14 @@ fn reference_kernel_matches_host_wmma_model_and_f64_for_every_kw() {
         for fmt in FMTS {
             for act in [false, true] {
                 let g = geo(fmt, 1, kw, 4, act);
-                let c = rand_case(0x7e0 + ci as u64 * 17 + act as u64, fmt, m, k, act, QKind::Full);
+                let c = rand_case(
+                    0x7e0 + ci as u64 * 17 + act as u64,
+                    fmt,
+                    m,
+                    k,
+                    act,
+                    QKind::Full,
+                );
                 let mut rng = Rng::new(0xabc + ci as u64);
                 let kinds: &[usize] = if act { &MODERATE_KINDS } else { &[0, 1, 2, 4] };
                 let pool = gen_pool(&mut rng, k, 33, kinds);
@@ -1160,7 +1247,14 @@ fn reference_kernel_matches_host_wmma_model_and_f64_for_every_kw() {
                     let label = format!("reference {} kw{kw} M{m} K{k} rows{rows}", fmt_name(fmt));
                     let x: Vec<f32> = pool[..rows].iter().flatten().copied().collect();
                     t.launches += 1;
-                    match run_reference(&rf[&reference_symbol(g, k as u32)], g, &c, &x, rows, &label) {
+                    match run_reference(
+                        &rf[&reference_symbol(g, k as u32)],
+                        g,
+                        &c,
+                        &x,
+                        rows,
+                        &label,
+                    ) {
                         Ok(y) => {
                             t.executed += 1;
                             host_check(&mut t, &label, g, &c, &x, rows, &y);
@@ -1197,7 +1291,8 @@ fn sweep_class(mw: u32, kw: u32) {
             let geos: Vec<Geo> = (1..=4).map(|nt| geo(fmt, mw, kw, nt, act)).collect();
             let pm_e = emulators(&pm.program, &syms_of(&geos), "PM entry");
             let rprog = reference_program(&[(geos[0], k as u32)]);
-            let rsyms: BTreeSet<String> = [reference_symbol(geos[0], k as u32)].into_iter().collect();
+            let rsyms: BTreeSet<String> =
+                [reference_symbol(geos[0], k as u32)].into_iter().collect();
             let rf = emulators(&rprog, &rsyms, "reference");
             let tag = format!("{} act={act}", fmt_name(fmt));
             // Singleton outputs of every pool row (NT = 1 entry, rows = 1).
@@ -1238,7 +1333,15 @@ fn sweep_class(mw: u32, kw: u32) {
                 }
             }
             // Same input row at every position, and rotated slot order.
-            for (rows, j) in [(2usize, 0usize), (16, 3), (17, 9), (32, 31), (33, 40), (48, 47), (64, 63)] {
+            for (rows, j) in [
+                (2usize, 0usize),
+                (16, 3),
+                (17, 9),
+                (32, 31),
+                (33, 40),
+                (48, 47),
+                (64, 63),
+            ] {
                 let g = geos[nt_for(rows) as usize - 1];
                 let label = format!("{name} {tag} replicate row {j} x{rows}");
                 let x: Vec<f32> = (0..rows).flat_map(|_| pool[j].iter().copied()).collect();
@@ -1249,7 +1352,14 @@ fn sweep_class(mw: u32, kw: u32) {
                         if let Some(s) = &singles[j] {
                             for r in 0..rows {
                                 t.words_vs_singleton += c.m as u64;
-                                compare_words(&mut t, &label, &format!("position {r}"), &y[r * c.m..(r + 1) * c.m], s, c.m);
+                                compare_words(
+                                    &mut t,
+                                    &label,
+                                    &format!("position {r}"),
+                                    &y[r * c.m..(r + 1) * c.m],
+                                    s,
+                                    c.m,
+                                );
                             }
                         }
                     }
@@ -1262,7 +1372,10 @@ fn sweep_class(mw: u32, kw: u32) {
                 let g = geos[nt_for(rows) as usize - 1];
                 let label = format!("{name} {tag} rotated by {rot} rows={rows}");
                 let order: Vec<usize> = (0..rows).map(|i| (i + rot) % 64).collect();
-                let x: Vec<f32> = order.iter().flat_map(|&j| pool[j].iter().copied()).collect();
+                let x: Vec<f32> = order
+                    .iter()
+                    .flat_map(|&j| pool[j].iter().copied())
+                    .collect();
                 t.launches += 1;
                 match run_kernel(&pm_e[&g.symbol()], g, &c, &x, rows, &label) {
                     Ok(y) => {
@@ -1270,7 +1383,14 @@ fn sweep_class(mw: u32, kw: u32) {
                         for (r, &j) in order.iter().enumerate() {
                             if let Some(s) = &singles[j] {
                                 t.words_vs_singleton += c.m as u64;
-                                compare_words(&mut t, &label, &format!("slot {r} = pool row {j}"), &y[r * c.m..(r + 1) * c.m], s, c.m);
+                                compare_words(
+                                    &mut t,
+                                    &label,
+                                    &format!("slot {r} = pool row {j}"),
+                                    &y[r * c.m..(r + 1) * c.m],
+                                    s,
+                                    c.m,
+                                );
                             }
                         }
                     }
@@ -1320,9 +1440,11 @@ fn entry_matrix(fmt: Fmt) {
             let geos: Vec<Geo> = (1..=4).map(|nt| geo(fmt, mw, kw, nt, act)).collect();
             let pm_e = emulators(&pm.program, &syms_of(&geos), "PM entry");
             let rprog = reference_program(&[(geos[0], k as u32)]);
-            let rsyms: BTreeSet<String> = [reference_symbol(geos[0], k as u32)].into_iter().collect();
+            let rsyms: BTreeSet<String> =
+                [reference_symbol(geos[0], k as u32)].into_iter().collect();
             let rf = emulators(&rprog, &rsyms, "reference");
-            let seed = 0x2000 + (ci * 2 + act as usize) as u64 + if fmt == Fmt::I8 { 0x100 } else { 0 };
+            let seed =
+                0x2000 + (ci * 2 + act as usize) as u64 + if fmt == Fmt::I8 { 0x100 } else { 0 };
             let c = rand_case(seed, fmt, m, k, act, QKind::Full);
             let mut rng = Rng::new(seed ^ 0xbeef);
             let kinds: &[usize] = if act { &MODERATE_KINDS } else { &[0, 1, 2, 4] };
@@ -1335,7 +1457,9 @@ fn entry_matrix(fmt: Fmt) {
                 for rows in rows_list {
                     let label = format!("{name} {} rows={rows}", g.symbol());
                     let x: Vec<f32> = pool[..rows].iter().flatten().copied().collect();
-                    if let Some(y) = kernel_vs_reference(&mut t, &label, &pm_e, &rf, *g, &c, &x, rows) {
+                    if let Some(y) =
+                        kernel_vs_reference(&mut t, &label, &pm_e, &rf, *g, &c, &x, rows)
+                    {
                         host_check(&mut t, &label, *g, &c, &x, rows, &y);
                         f64_check(&mut t, &label, *g, &c, &x, rows, &y);
                     }
@@ -1408,7 +1532,12 @@ fn decode_sweep(fmt: Fmt) {
     let ga = geo(fmt, mw, kw, 4, true);
     let pm_e = emulators(&pm.program, &syms_of(&[g, ga]), "PM entry");
     let rprog = reference_program(&[(g, k as u32), (ga, k as u32)]);
-    let rsyms: BTreeSet<String> = [reference_symbol(g, k as u32), reference_symbol(ga, k as u32)].into_iter().collect();
+    let rsyms: BTreeSet<String> = [
+        reference_symbol(g, k as u32),
+        reference_symbol(ga, k as u32),
+    ]
+    .into_iter()
+    .collect();
     let rf = emulators(&rprog, &rsyms, "reference");
     let raw: Vec<u8> = (0..m * k)
         .map(|i| {
@@ -1425,7 +1554,11 @@ fn decode_sweep(fmt: Fmt) {
     raw.iter().for_each(|&b| {
         seen.insert(b);
     });
-    assert_eq!(seen.len(), if fmt == Fmt::E4M3 { 254 } else { 256 }, "every finite code present");
+    assert_eq!(
+        seen.len(),
+        if fmt == Fmt::E4M3 { 254 } else { 256 },
+        "every finite code present"
+    );
     for act in [false, true] {
         let c = make_case(fmt, m, k, raw.clone(), vec![1.0; m], 1.0);
         let gg = if act { ga } else { g };
@@ -1523,7 +1656,9 @@ fn exceptional(fmt: Fmt) {
                 vec![0.0; k],
                 gen_x_row(&mut rng, k, 3),
                 gen_x_row(&mut rng, k, 5),
-                (0..k).map(|i| f32::from_bits(0x7f7f_0000 | if i % 2 == 0 { 0 } else { 0x8000_0000 })).collect(),
+                (0..k)
+                    .map(|i| f32::from_bits(0x7f7f_0000 | if i % 2 == 0 { 0 } else { 0x8000_0000 }))
+                    .collect(),
             ];
             // Clean rows alongside, to prove NaN/Inf rows do not leak into their neighbours.
             pool.push(gen_x_row(&mut rng, k, 0));
@@ -1538,7 +1673,8 @@ fn exceptional(fmt: Fmt) {
                 };
                 let x: Vec<f32> = sel.iter().flat_map(|r| r.iter().copied()).collect();
                 let label = format!("{name} {} rows={rows}", g.symbol());
-                let Some(y) = kernel_vs_reference(&mut t, &label, &pm_e, &rf, g, &c, &x, rows) else {
+                let Some(y) = kernel_vs_reference(&mut t, &label, &pm_e, &rf, g, &c, &x, rows)
+                else {
                     continue;
                 };
                 // A NaN activation poisons the whole output row; clean rows stay finite in `set`.
@@ -1546,7 +1682,9 @@ fn exceptional(fmt: Fmt) {
                     let has_nan = row.iter().any(|v| v.is_nan());
                     let out = &y[r * m..(r + 1) * m];
                     if has_nan && !out.iter().all(|&w| f32::from_bits(w).is_nan()) {
-                        t.fail(format!("{label}: row {r} has a NaN activation but a non-NaN output"));
+                        t.fail(format!(
+                            "{label}: row {r} has a NaN activation but a non-NaN output"
+                        ));
                     }
                 }
                 if !act && fmt == Fmt::E4M3 {
