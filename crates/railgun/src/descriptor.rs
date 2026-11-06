@@ -787,6 +787,7 @@ mod tests {
                 .collect(),
             sealed: Vec::new(),
             wg_footprints: Vec::new(),
+            hidden_grid: Vec::new(),
         }
     }
 
@@ -1175,6 +1176,7 @@ mod tests {
                 }],
                 sealed_tables: vec![],
                 wg_footprints: vec![],
+                hidden_grid: vec![],
             }],
         }];
         k.required_witnesses = k.implied_witnesses();

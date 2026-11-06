@@ -71,7 +71,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use railgun_corpus::receipt::{
-    ArgRecord, TaskGridOffsets, TaskProtocolRecord, TASK_PROTO_REGION_WG, TASK_PROTO_REQUIRED,
+    ArgRecord, RequireOp, TaskGridOffsets, TaskProtocolRecord, TASK_PROTO_REGION_WG,
+    TASK_PROTO_REQUIRED,
 };
 
 use crate::coresident::{GroupOrdering, OrderedEdge};
@@ -395,6 +396,10 @@ pub struct TaskGraphProof {
     /// Obligations the program cannot discharge and the harness must hold at
     /// every submit.
     pub obligations: Vec<String>,
+    /// Lab only: named reasons the proof is uncertified beyond the pending
+    /// protocol (`inter-WG disjointness unproven: template <t>, resource
+    /// <r>`, one per pair, sorted); empty for a certified proof.
+    pub pending: Vec<String>,
 }
 
 impl TaskGraphProof {
@@ -465,6 +470,8 @@ enum PoolEffects {
         footprints: BTreeMap<u32, Vec<WgFootprint>>,
         /// The sealed tables bound for the pool node's templates.
         sealed: Vec<ArenaSealedBinding>,
+        /// Hidden grid arguments the template bodies load, by template.
+        hidden: BTreeMap<u32, Vec<(u32, String)>>,
     },
     /// Pending without facts: every field of the record is read and written.
     Conservative,
@@ -619,7 +626,10 @@ impl TaskGraph {
             templates,
         };
         let proof = self.prove(program, group.clone(), &protocol, mode)?;
-        Ok(GroupOrdering::lab_pending(proof.edges).with_task_graph(group))
+        let reasons = proof.pending.clone();
+        Ok(GroupOrdering::lab_pending(proof.edges)
+            .with_pending_reasons(reasons)
+            .with_task_graph(group))
     }
 
     fn prove(
@@ -849,6 +859,7 @@ impl TaskGraph {
                         t.ka_off, t.template, self.arena.0
                     ));
                 };
+                self.grid_tie(&pool_effects[pi], record, t, &what)?;
                 let effects = match memo.get(&(pi, t.template, t.ka_off)) {
                     Some(e) => e.clone(),
                     None => {
@@ -1071,6 +1082,7 @@ impl TaskGraph {
             }
         }
         let p = self.pools.len();
+        let mut pending_reasons: Option<BTreeSet<String>> = pending.then(BTreeSet::new);
         let mut ordered_pairs = 0u64;
         let mut directed: BTreeSet<(usize, usize, ResourceId)> = BTreeSet::new();
         for (&resource, list) in &by_resource {
@@ -1086,7 +1098,14 @@ impl TaskGraph {
                         (b, a)
                     } else if instances.same(a, b) {
                         self.same_instance_pair(
-                            &flat, &accesses, &by_base, resource, a, b, &place,
+                            &flat,
+                            &accesses,
+                            &by_base,
+                            resource,
+                            a,
+                            b,
+                            &place,
+                            pending_reasons.as_mut(),
                         )?;
                         continue;
                     } else {
@@ -1195,6 +1214,9 @@ impl TaskGraph {
             events_used: event_ids.len(),
             ordered_pairs,
             obligations,
+            pending: pending_reasons
+                .map(|s| s.into_iter().collect())
+                .unwrap_or_default(),
         })
     }
 
@@ -1273,6 +1295,7 @@ impl TaskGraph {
         let mut footprints: BTreeMap<u32, Vec<WgFootprint>> = BTreeMap::new();
         let mut any = false;
         let mut sealed: Vec<ArenaSealedBinding> = Vec::new();
+        let mut hidden: BTreeMap<u32, Vec<(u32, String)>> = BTreeMap::new();
         if let Some(arena) = &node.arena {
             for (k, (fact, bound)) in arena.arenas.iter().zip(&arena.bound).enumerate() {
                 let is_arena = node.args.iter().any(|(o, a)| {
@@ -1298,6 +1321,10 @@ impl TaskGraph {
                         .entry(t.template)
                         .or_default()
                         .extend(t.wg_footprints.iter().cloned());
+                    hidden
+                        .entry(t.template)
+                        .or_default()
+                        .extend(t.hidden_grid.iter().cloned());
                 }
             }
         }
@@ -1306,6 +1333,7 @@ impl TaskGraph {
                 loads: templates,
                 footprints,
                 sealed,
+                hidden,
             });
         }
         if !mode.pending {
@@ -1319,6 +1347,7 @@ impl TaskGraph {
                 loads: map.clone(),
                 footprints: BTreeMap::new(),
                 sealed: Vec::new(),
+                hidden: BTreeMap::new(),
             },
             None => PoolEffects::Conservative,
         })
@@ -1367,6 +1396,7 @@ impl TaskGraph {
                 loads: map,
                 footprints,
                 sealed,
+                ..
             } => {
                 let loads = map.get(&record.template).ok_or_else(|| {
                     format!(
@@ -1443,6 +1473,52 @@ impl TaskGraph {
             .collect())
     }
 
+    /// The host grid tie of a task: every hidden grid argument the template's
+    /// body loads (receipt `hidden_grid`) is a scalar the record declares,
+    /// and its `block_count_*` equals the task header's `gx/gy/gz` (the grid
+    /// the same-instance rule and the workgroup-inside-grid check use). A
+    /// pool without receipt facts for the template has nothing to tie.
+    fn grid_tie(
+        &self,
+        source: &PoolEffects,
+        record: &BindingRecord,
+        t: &TaskHeader,
+        what: &str,
+    ) -> Result<(), String> {
+        let PoolEffects::Templates { hidden, .. } = source else {
+            return Ok(());
+        };
+        let Some(list) = hidden.get(&record.template) else {
+            return Ok(());
+        };
+        for (offset, kind) in list {
+            // A 2-byte hidden value (group size, remainder, grid dims) lives in
+            // the declared 4-aligned scalar dword that contains it.
+            let dword = offset & !3;
+            let Some(&(_, value)) = record.scalars.iter().find(|(o, _)| *o == dword) else {
+                return Err(format!(
+                    "{what}: template {} loads hidden grid argument {kind} at record +{offset}, but record @{} does not declare that offset (its containing dword) as a railgun scalar",
+                    record.template, record.base
+                ));
+            };
+            let header = match kind.as_str() {
+                "block_count_x" => Some(("x", t.gx)),
+                "block_count_y" => Some(("y", t.gy)),
+                "block_count_z" => Some(("z", t.gz)),
+                _ => None,
+            };
+            if let Some((axis, g)) = header {
+                if value != g {
+                    return Err(format!(
+                        "{what}: header grid {axis} extent {g} differs from the record's hidden {kind} {value} (+{offset}, record @{}): the body would see another grid than the one the headers were proved over",
+                        record.base
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A conflicting pair of tasks of one launch instance on `resource`
     /// (see [`Instances`]): admitted only when the template's own
     /// certificate says concurrent workgroups of its grid do not conflict
@@ -1458,6 +1534,7 @@ impl TaskGraph {
         a: usize,
         b: usize,
         place: &dyn Fn(usize) -> (usize, usize),
+        pending: Option<&mut BTreeSet<String>>,
     ) -> Result<(), String> {
         let (ta, tb) = (flat[a], flat[b]);
         let conc = accesses[a]
@@ -1474,6 +1551,13 @@ impl TaskGraph {
             Conc::Commutative => return Ok(()),
             Conc::Footprint(fp) => fp,
             Conc::None => {
+                if let Some(set) = pending {
+                    set.insert(format!(
+                        "inter-WG disjointness unproven: template {}, resource {}",
+                        ta.template, resource.0
+                    ));
+                    return Ok(());
+                }
                 return Err(format!(
                     "race on resource {}: {tasks} are workgroups of one launch instance of template {} (ka_off {}) and conflict on it; standalone receipt proves no inter-WG write disjointness (not all commutative atomics, and no write-only per-workgroup footprint)",
                     resource.0, ta.template, ta.ka_off
@@ -1495,14 +1579,24 @@ impl TaskGraph {
                 }
             }
         }
-        for &(offset, mask, value) in &fp.requires {
+        for req in &fp.requires {
             let got = by_base
                 .get(&u64::from(ta.ka_off))
-                .and_then(|r| r.scalars.iter().find(|(o, _)| *o == offset))
+                .and_then(|r| r.scalars.iter().find(|(o, _)| *o == req.offset))
                 .map(|(_, v)| *v);
-            if got.map(|v| v & mask) != Some(value) {
+            if !got.is_some_and(|v| req.holds(v, [ta.gx, ta.gy, ta.gz])) {
+                let (offset, mask, value) = (req.offset, req.mask, req.value);
+                let rel = match req.op {
+                    RequireOp::MaskEq => format!("& {mask:#x} == {value:#x}"),
+                    RequireOp::LeU => format!("<= {value:#x}"),
+                    RequireOp::GeU => format!(">= {value:#x}"),
+                    RequireOp::GridLe => format!(
+                        ">= {value} * grid extent {} (virtual grid {}, {}, {})",
+                        mask, ta.gx, ta.gy, ta.gz
+                    ),
+                };
                 return Err(format!(
-                    "{tasks} (template {}, ka_off {}): the footprint on resource {} requires record dword +{offset} & {mask:#x} == {value:#x}, the record's scalar is {got:?}",
+                    "{tasks} (template {}, ka_off {}): the footprint on resource {} requires record dword +{offset} {rel}, the record's scalar is {got:?}",
                     ta.template, ta.ka_off, resource.0
                 ));
             }

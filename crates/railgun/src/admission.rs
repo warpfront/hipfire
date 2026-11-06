@@ -233,14 +233,23 @@ pub(crate) fn node_pending(program: &KernelProgram, range: Range<usize>) -> Vec<
     out
 }
 
-/// The reason a group's ordering is uncertified (`None` when certified).
-pub(crate) fn ordering_pending(index: usize, g: &CoResidentGroup) -> Option<String> {
-    g.ordering.is_pending().then(|| {
-        format!(
-            "group {index} {:?}: ordering edges are not from a task-graph certificate",
-            g.nodes
-        )
-    })
+/// The reasons a group's ordering is uncertified (empty when certified): the
+/// generic one, then each named reason the ordering carries.
+pub(crate) fn ordering_pending(index: usize, g: &CoResidentGroup) -> Vec<String> {
+    if !g.ordering.is_pending() {
+        return Vec::new();
+    }
+    let mut out = vec![format!(
+        "group {index} {:?}: ordering edges are not from a task-graph certificate",
+        g.nodes
+    )];
+    out.extend(
+        g.ordering
+            .pending_reasons()
+            .iter()
+            .map(|r| format!("group {index} {:?}: {r}", g.nodes)),
+    );
+    out
 }
 
 /// Every pending reason of `program`: its `LabPending` nodes, then its
@@ -252,7 +261,7 @@ pub(crate) fn program_pending(program: &KernelProgram) -> Vec<String> {
             .groups
             .iter()
             .enumerate()
-            .filter_map(|(i, g)| ordering_pending(i, g)),
+            .flat_map(|(i, g)| ordering_pending(i, g)),
     );
     out
 }

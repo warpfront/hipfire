@@ -2062,6 +2062,7 @@ impl<'k> Analyzer<'k> {
         if let Some(rec) = rec.as_deref_mut() {
             self.record_sinks(st, dec, rec, cyclic);
         }
+        let lane_upd = self.lane_pre(st, dec);
 
         if name == "s_setpc_b64"
             || name == "s_swappc_b64"
@@ -2237,8 +2238,161 @@ impl<'k> Analyzer<'k> {
         if fx.exec_nz {
             st.exec_nz = true;
         }
+        for (tgt, ix) in lane_upd {
+            match tgt {
+                LaneTgt::S(i) if i < NS => st.s[i].ix = ix,
+                LaneTgt::Exec => st.exec[0].ix = ix,
+                LaneTgt::S(_) => {}
+            }
+        }
+        if rec.is_some() {
+            if let (Ok(r), Ok(regs)) = (std::env::var("WGTRACE"), std::env::var("WGREGS")) {
+                let mut rr = r.split('-').map(|x| x.parse::<usize>().unwrap());
+                let (a, b) = (rr.next().unwrap(), rr.next().unwrap());
+                if pos >= a && pos <= b {
+                    let mut ix = self.ix.borrow_mut();
+                    let mut line = format!("T {pos} {}:", name);
+                    for reg in regs.split(',') {
+                        let n: usize = reg[1..].parse().unwrap();
+                        let x = match &reg[..1] {
+                            "s" => st.s[n].ix.live(),
+                            "v" => st.v[n].ix.live(),
+                            _ => Ix::NONE,
+                        };
+                        line.push_str(&format!(
+                            " {reg}={}",
+                            super::wg_footprint::show_ix(&mut *ix, x, 6)
+                        ));
+                    }
+                    line.push_str(&format!(
+                        " exec={}",
+                        super::wg_footprint::show_ix(&mut *ix, st.exec[0].ix.live(), 3)
+                    ));
+                    eprintln!("{line}");
+                }
+            }
+        }
     }
 
+    /// Workgroup-footprint analysis: lane-mask witnesses. A vector compare of
+    /// exact 32-bit operands writes the mask whose set lanes satisfy the
+    /// compare; ANDs of masks keep every operand's facts; the EXEC register's
+    /// witness is then the mask every active lane belongs to, whose facts are
+    /// the lane predicates of a store. Computed from the pre-state.
+    fn lane_pre(&self, st: &State, dec: &Dec) -> SmallVec<[(LaneTgt, Ix); 2]> {
+        let mut out = SmallVec::new();
+        if !self.wgf || self.wave != Wave::Wave32 || dec.parts.len() != 1 {
+            return out;
+        }
+        let part = &dec.parts[0];
+        let name = norm_name(part.name);
+        let tgt_of = |op: &Operand| -> Option<LaneTgt> {
+            match op {
+                Operand::Reg(r) if r.kind == Kind::S => Some(LaneTgt::S(usize::from(r.base))),
+                Operand::Special(Special::Vcc | Special::VccLo) => Some(LaneTgt::S(VCC_LO)),
+                Operand::Special(Special::Exec | Special::ExecLo) => Some(LaneTgt::Exec),
+                _ => None,
+            }
+        };
+        let srcs: SmallVec<[&Field; 4]> = part.sources().collect();
+        let mut it = self.ix.borrow_mut();
+        let it = &mut *it;
+        let exec_ix = st.exec[0].ix.live();
+        let mut src_ix = |i: usize, it: &mut Interner| -> Ix {
+            srcs.get(i)
+                .map(|f| ixof(it, self.vals(st, f).first().copied().unwrap_or_default()))
+                .unwrap_or(Ix::NONE)
+        };
+        if let Some(rest) = name
+            .strip_prefix("v_cmpx_")
+            .or_else(|| name.strip_prefix("v_cmp_"))
+        {
+            let cmpx = name.starts_with("v_cmpx_");
+            let Some((rel, ty)) = rest.split_once('_') else {
+                return out;
+            };
+            if ty != "u32" && ty != "i32" {
+                return out;
+            }
+            let (a, b) = (src_ix(0, it), src_ix(1, it));
+            if a.is_none() || b.is_none() {
+                return out;
+            }
+            let lt = |it: &mut Interner, x: Ix, y: Ix| {
+                if ty == "u32" {
+                    it.ltu(x, y)
+                } else {
+                    it.lts(x, y)
+                }
+            };
+            let (atom, holds) = match rel {
+                "lt" => (lt(it, a, b), true),
+                "gt" => (lt(it, b, a), true),
+                "le" => (lt(it, b, a), false),
+                "ge" => (lt(it, a, b), false),
+                "eq" => (it.eq32(a, b), true),
+                "ne" => (it.eq32(a, b), false),
+                _ => return out,
+            };
+            if atom.is_none() {
+                return out;
+            }
+            let mask = it.lane_mask(vec![(atom, holds)], None);
+            if cmpx {
+                out.push((LaneTgt::Exec, it.mask_and(exec_ix, mask)));
+            } else if let Some(t) = part
+                .fields
+                .iter()
+                .filter(|f| f.def)
+                .find_map(|f| tgt_of(f.op))
+            {
+                out.push((t, mask));
+            }
+            return out;
+        }
+        match name.as_str() {
+            "s_and_b32" | "s_or_b32" => {
+                let (a, b) = (src_ix(0, it), src_ix(1, it));
+                let r = if name == "s_and_b32" {
+                    it.mask_and(a, b)
+                } else {
+                    it.mask_or(a, b)
+                };
+                if !r.is_none() {
+                    if let Some(t) = part
+                        .fields
+                        .iter()
+                        .filter(|f| f.def)
+                        .find_map(|f| tgt_of(f.op))
+                    {
+                        out.push((t, r));
+                    }
+                }
+            }
+            "s_and_saveexec_b32" => {
+                let x = src_ix(0, it);
+                out.push((LaneTgt::Exec, it.mask_and(exec_ix, x)));
+                if let Some(LaneTgt::S(i)) = part
+                    .fields
+                    .iter()
+                    .filter(|f| f.def)
+                    .find_map(|f| tgt_of(f.op))
+                {
+                    out.push((LaneTgt::S(i), exec_ix));
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// The lane predicates every active lane satisfies (see [`Self::lane_pre`]).
+    fn lane_facts_of(&self, st: &State) -> Vec<(Ix, bool)> {
+        if !self.wgf || self.wave != Wave::Wave32 {
+            return Vec::new();
+        }
+        self.ix.borrow().mask_facts(st.exec[0].ix.live())
+    }
     /// The mask value of an operand (for EXEC and saved-mask arithmetic).
     fn mask_of(&self, st: &State, op: &Operand) -> Mask {
         let sgprs = |base: usize, len: usize| -> Mask {
@@ -2568,7 +2722,20 @@ impl<'k> Analyzer<'k> {
         let (Some(&s0), Some(&s1)) = (srcs.first(), srcs.get(1)) else {
             if matches!(name.as_str(), "v_readfirstlane_b32" | "v_mov_b32_dpp") {
                 if let Some(d) = part.fields.iter().find(|f| f.def) {
-                    patch_ix(writes, d.op, &[Ix::NONE]);
+                    // Under the entry EXEC lane 0 of the wave is active: the
+                    // result is the source's lane-0 value.
+                    let x = match srcs.first() {
+                        Some(&s) if name == "v_readfirstlane_b32" && st.exec_exact == Some(0) => {
+                            let mut it = self.ix.borrow_mut();
+                            let src = ixof(
+                                &mut it,
+                                self.vals(st, s).first().copied().unwrap_or_default(),
+                            );
+                            it.first_lane(src)
+                        }
+                        _ => Ix::NONE,
+                    };
+                    patch_ix(writes, d.op, &[x]);
                 }
             }
             return;
@@ -3556,7 +3723,7 @@ impl<'k> Analyzer<'k> {
                     );
                     if let Some(site) = rec.wsites.get_mut(&dec.id) {
                         site.facts = st.facts.clone();
-                        site.lane_facts = st.lane_facts.clone();
+                        site.lane_facts = self.lane_facts_of(st);
                     }
                 }
                 if let Some(d) = dst {
@@ -4784,6 +4951,13 @@ struct GuardWalk {
 
 fn other_is_negative(op: &Operand) -> bool {
     matches!(op, Operand::Inline(InlineConst::Integer(n)) if *n < 0)
+}
+
+/// A register a lane-mask witness is written to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaneTgt {
+    S(usize),
+    Exec,
 }
 
 /// Where an implicit carry-out lane mask is written.

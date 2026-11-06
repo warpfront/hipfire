@@ -57,6 +57,7 @@
 //! kernarg scalar, a pointer selected between arguments, a loaded value, ...)
 //! kills the fact for the argument: `Unproven` with the address shape.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::rc::Rc;
 
 use crate::cfg::InstId;
 use crate::inst::{Abi, Arch, Kernel};
@@ -72,14 +73,34 @@ pub struct WgLaunch {
     pub block_x: u32,
 }
 
-/// `kernarg dword at offset & mask == value` must hold of the record of every
-/// tile the fact is used for.
+/// The relation of a [`WgRequirement`] on a kernarg/record dword `d`.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum WgReqOp {
+    /// `(d & mask) == value`.
+    #[default]
+    MaskEq,
+    /// `d <= value` (unsigned); `mask` is `0xffff_ffff`.
+    LeU,
+    /// `d >= value` (unsigned); `mask` is `0xffff_ffff`.
+    GeU,
+    /// `value * grid_extent[axis] <= d` (unsigned, 64-bit arithmetic) over the
+    /// task's tile grid; `mask` is the axis (0 x, 1 y, 2 z).
+    GridLe,
+}
+
+/// The kernarg dword at `offset` satisfies `op` (default: masked with `mask`,
+/// equals `value`); must hold of the record of every tile the fact is used for.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct WgRequirement {
     pub offset: u32,
     pub mask: u32,
     pub value: u32,
+    pub op: WgReqOp,
 }
+
+mod guard;
+#[cfg(test)]
+mod guard_tests;
 
 /// The proven footprint of one pointer argument.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,8 +216,12 @@ pub fn analyze(kernel: &Kernel, arch: Arch, sealed: bool, launch: WgLaunch) -> W
     let mut ev = Eval {
         it: input.it,
         block: i128::from(launch.block_x),
+        lanes: (0..launch.block_x).collect(),
+        wave32: kernel.wave == crate::inst::Wave::Wave32,
         group_size_dword,
         memo: HashMap::new(),
+        full_memo: HashMap::new(),
+        in_all: false,
     };
     let args = facts
         .args
@@ -219,8 +244,13 @@ pub fn analyze(kernel: &Kernel, arch: Arch, sealed: bool, launch: WgLaunch) -> W
 // Affine forms.
 // ---------------------------------------------------------------------------
 
-/// `U + sum S_a wg_a + r  (mod 2^bits)` plus at most one scaled extension
-/// (64-bit only).
+/// The exact values of a lane-dependent part: one integer per work-item slot of
+/// the evaluation ([`Eval::lanes`]).
+type Tab = Rc<Vec<i128>>;
+
+/// `U + sum S_a wg_a + r + sum_X X * G_X  (mod 2^bits)` plus at most one scaled
+/// extension (64-bit only). `X` is a uniform atom and `G_X` a form that depends
+/// on the tile id or the lane (the product `row stride * row index`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Aff {
     bits: u8,
@@ -234,7 +264,13 @@ struct Aff {
     rhi: i128,
     /// Every value of `r` is a multiple of `2^rtz`.
     rtz: u8,
+    /// The value of `r` of every work-item slot, when known exactly (`rlo`,
+    /// `rhi`, `rtz` describe it).
+    tab: Option<Tab>,
     ext: Option<Box<Ext>>,
+    /// Atom times non-constant form; never an atom that also has a constant
+    /// coefficient in `usym` (see [`normalize`]).
+    prod: BTreeMap<Ix, Box<Aff>>,
     /// Uses the hidden-group-size substitution.
     req: bool,
 }
@@ -260,6 +296,17 @@ fn ctz(x: i128) -> u32 {
     }
 }
 
+/// `(min, max, common trailing zero bits)` of a lane table.
+fn tab_stats(t: &[i128]) -> (i128, i128, u8) {
+    let (mut lo, mut hi, mut tz) = (i128::MAX, i128::MIN, 127u32);
+    for &v in t {
+        lo = lo.min(v);
+        hi = hi.max(v);
+        tz = tz.min(ctz(v));
+    }
+    (lo, hi, tz as u8)
+}
+
 impl Aff {
     fn constant(bits: u8, v: i128) -> Aff {
         Aff {
@@ -270,7 +317,9 @@ impl Aff {
             rlo: 0,
             rhi: 0,
             rtz: 0,
+            tab: None,
             ext: None,
+            prod: BTreeMap::new(),
             req: false,
         }
     }
@@ -287,6 +336,21 @@ impl Aff {
             ..Aff::constant(bits, 0)
         }
     }
+    /// A pure lane value with the exact per-slot integers `t` (a constant when
+    /// they are all equal).
+    fn from_tab(bits: u8, t: Vec<i128>) -> Aff {
+        let (lo, hi, tz) = tab_stats(&t);
+        if lo == hi {
+            return Aff::constant(bits, lo);
+        }
+        Aff {
+            rlo: lo,
+            rhi: hi,
+            rtz: tz,
+            tab: Some(Rc::new(t)),
+            ..Aff::constant(bits, 0)
+        }
+    }
     fn wg(axis: usize, coef: i128) -> Aff {
         let mut a = Aff::constant(32, 0);
         a.s[axis] = coef;
@@ -295,8 +359,12 @@ impl Aff {
     fn is_lane_free(&self) -> bool {
         self.rlo == 0 && self.rhi == 0
     }
+    /// A product term anywhere in the form (also inside the extension).
+    fn has_prod_deep(&self) -> bool {
+        !self.prod.is_empty() || self.ext.as_ref().is_some_and(|e| e.inner.has_prod_deep())
+    }
     fn has_wg(&self) -> bool {
-        self.s != [0; 3] || self.ext.is_some()
+        self.s != [0; 3] || self.ext.is_some() || !self.prod.is_empty()
     }
     /// No workgroup id, no lane term, no extension: the same for every lane of
     /// every workgroup.
@@ -313,6 +381,16 @@ impl Aff {
             return None;
         }
         let m = modulus(self.bits);
+        if let Some(t) = &self.tab {
+            let mut lo = i128::MAX;
+            let mut hi = i128::MIN;
+            for &v in t.iter() {
+                let r = (self.uc + v).rem_euclid(m);
+                lo = lo.min(r);
+                hi = hi.max(r);
+            }
+            return Some((lo, hi));
+        }
         let (lo, hi) = (self.uc + self.rlo, self.uc + self.rhi);
         if lo >= 0 && hi < m {
             Some((lo, hi))
@@ -320,6 +398,22 @@ impl Aff {
             Some((lo + m, hi + m))
         } else {
             None
+        }
+    }
+    /// The machine value of each of `n` lane slots of a pure constant or lane
+    /// expression with an exact table.
+    fn residues(&self, n: usize) -> Option<Vec<i128>> {
+        if self.has_wg() || !self.usym.is_empty() {
+            return None;
+        }
+        let m = modulus(self.bits);
+        match &self.tab {
+            Some(t) if t.len() == n => {
+                Some(t.iter().map(|&v| (self.uc + v).rem_euclid(m)).collect())
+            }
+            Some(_) => None,
+            None if self.is_lane_free() => Some(vec![self.uc.rem_euclid(m); n]),
+            None => None,
         }
     }
     /// Low bits of the residue known to be zero.
@@ -346,12 +440,46 @@ impl Aff {
         if let Some(e) = &self.ext {
             t = t.min(ctz(e.scale));
         }
+        for g in self.prod.values() {
+            t = t.min(g.total_tz());
+        }
         t.min(u32::from(self.bits))
     }
 }
 
 fn checked<T>(x: Option<T>) -> Result<T, String> {
     x.ok_or_else(|| "coefficient overflow".to_owned())
+}
+
+/// Fold a constant lane part into the uniform constant.
+fn fold_lane_const(a: &mut Aff) -> Result<(), String> {
+    if a.rlo == a.rhi && a.rlo != 0 {
+        a.uc = checked(a.uc.checked_add(a.rlo))?;
+        a.rlo = 0;
+        a.rhi = 0;
+        a.rtz = 0;
+        a.tab = None;
+    }
+    Ok(())
+}
+
+/// Keep every atom either with a constant coefficient (`usym`) or with a
+/// non-constant form (`prod`), never both.
+fn normalize(a: &mut Aff) -> Result<(), String> {
+    let keys: Vec<Ix> = a.prod.keys().copied().collect();
+    for x in keys {
+        if let Some(c) = a.usym.remove(&x) {
+            let g = a.prod.get_mut(&x).expect("product");
+            g.uc = checked(g.uc.checked_add(c))?;
+        }
+        if let Some(c) = a.prod[&x].as_const() {
+            a.prod.remove(&x);
+            if c != 0 {
+                a.usym.insert(x, c);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn add(a: &Aff, b: &Aff) -> Res {
@@ -364,6 +492,18 @@ fn add(a: &Aff, b: &Aff) -> Res {
         *e = checked(e.checked_add(c))?;
         if *e == 0 {
             usym.remove(&k);
+        }
+    }
+    let mut prod = a.prod.clone();
+    for (&k, g) in &b.prod {
+        match prod.get(&k) {
+            Some(h) => {
+                let sum = add(h, g)?;
+                prod.insert(k, Box::new(sum));
+            }
+            None => {
+                prod.insert(k, g.clone());
+            }
         }
     }
     let mut s = [0i128; 3];
@@ -390,18 +530,32 @@ fn add(a: &Aff, b: &Aff) -> Res {
     if ext.is_some() && s != [0; 3] {
         return Err("a direct 64-bit workgroup term next to an extension term".into());
     }
-    let (rlo, rhi) = (
-        checked(a.rlo.checked_add(b.rlo))?,
-        checked(a.rhi.checked_add(b.rhi))?,
-    );
-    let rtz = if a.is_lane_free() {
-        b.rtz
-    } else if b.is_lane_free() {
-        a.rtz
-    } else {
-        a.rtz.min(b.rtz)
+    let (tab, rlo, rhi, rtz) = match (a.is_lane_free(), b.is_lane_free()) {
+        (true, true) => (None, 0, 0, 0),
+        (true, false) => (b.tab.clone(), b.rlo, b.rhi, b.rtz),
+        (false, true) => (a.tab.clone(), a.rlo, a.rhi, a.rtz),
+        (false, false) => match (&a.tab, &b.tab) {
+            (Some(x), Some(y)) if x.len() == y.len() => {
+                let mut t = Vec::with_capacity(x.len());
+                for (p, q) in x.iter().zip(y.iter()) {
+                    t.push(checked(p.checked_add(*q))?);
+                }
+                let (lo, hi, tz) = tab_stats(&t);
+                if lo == 0 && hi == 0 {
+                    (None, 0, 0, 0)
+                } else {
+                    (Some(Rc::new(t)), lo, hi, tz)
+                }
+            }
+            _ => (
+                None,
+                checked(a.rlo.checked_add(b.rlo))?,
+                checked(a.rhi.checked_add(b.rhi))?,
+                a.rtz.min(b.rtz),
+            ),
+        },
     };
-    Ok(Aff {
+    let mut out = Aff {
         bits: a.bits,
         usym,
         uc: checked(a.uc.checked_add(b.uc))?,
@@ -409,9 +563,14 @@ fn add(a: &Aff, b: &Aff) -> Res {
         rlo,
         rhi,
         rtz,
+        tab,
         ext,
+        prod,
         req: a.req | b.req,
-    })
+    };
+    fold_lane_const(&mut out)?;
+    normalize(&mut out)?;
+    Ok(out)
 }
 
 fn mulc(a: &Aff, c: i128) -> Res {
@@ -425,14 +584,14 @@ fn mulc(a: &Aff, c: i128) -> Res {
     for (&k, &v) in &a.usym {
         usym.insert(k, checked(v.checked_mul(c))?);
     }
+    let mut prod = BTreeMap::new();
+    for (&k, g) in &a.prod {
+        prod.insert(k, Box::new(mulc(g, c)?));
+    }
     let mut s = [0i128; 3];
     for i in 0..3 {
         s[i] = checked(a.s[i].checked_mul(c))?;
     }
-    let (x, y) = (
-        checked(a.rlo.checked_mul(c))?,
-        checked(a.rhi.checked_mul(c))?,
-    );
     let ext = match &a.ext {
         None => None,
         Some(e) => Some(Box::new(Ext {
@@ -440,18 +599,39 @@ fn mulc(a: &Aff, c: i128) -> Res {
             ..(**e).clone()
         })),
     };
-    let rtz = (u32::from(a.rtz) + ctz(c).min(64)).min(127) as u8;
-    Ok(Aff {
+    let (tab, rlo, rhi, rtz) = match &a.tab {
+        Some(t) => {
+            let mut nt = Vec::with_capacity(t.len());
+            for v in t.iter() {
+                nt.push(checked(v.checked_mul(c))?);
+            }
+            let (lo, hi, tz) = tab_stats(&nt);
+            (Some(Rc::new(nt)), lo, hi, tz)
+        }
+        None => {
+            let (x, y) = (
+                checked(a.rlo.checked_mul(c))?,
+                checked(a.rhi.checked_mul(c))?,
+            );
+            let rtz = (u32::from(a.rtz) + ctz(c).min(64)).min(127) as u8;
+            (None, x.min(y), x.max(y), rtz)
+        }
+    };
+    let mut out = Aff {
         bits: a.bits,
         usym,
         uc: checked(a.uc.checked_mul(c))?,
         s,
-        rlo: x.min(y),
-        rhi: x.max(y),
+        rlo,
+        rhi,
         rtz,
+        tab,
         ext,
+        prod,
         req: a.req,
-    })
+    };
+    fold_lane_const(&mut out)?;
+    Ok(out)
 }
 
 fn sub(a: &Aff, b: &Aff) -> Res {
@@ -472,9 +652,19 @@ fn pure_range(bits: u8, lo: i128, hi: i128, rtz: u8, req: bool) -> Aff {
 struct Eval {
     it: Interner,
     block: i128,
+    /// The lane identity of every work-item slot of the tile: slot `l` stands
+    /// for work-item `lanes[l]`. A site whose EXEC predicate leaves only some
+    /// work-items active maps every inactive slot to an active one, so that the
+    /// lane tables of the evaluation describe the active work-items only.
+    lanes: Vec<u32>,
+    wave32: bool,
     /// Kernarg byte offset of `hidden_group_size_x` (4-aligned), if declared.
     group_size_dword: Option<u32>,
     memo: HashMap<Ix, Res>,
+    /// The evaluation memo over every work-item (the first-lane values).
+    full_memo: HashMap<Ix, Res>,
+    /// Currently evaluating over every work-item ([`Eval::with_all_lanes`]).
+    in_all: bool,
 }
 
 impl Eval {
@@ -498,6 +688,110 @@ impl Eval {
         self.it.uniform(ix).then(|| Aff::atom(bits, ix))
     }
 
+    /// Run `f` with every work-item active (the identity lane map and its own
+    /// memo).
+    fn with_all_lanes<R>(&mut self, f: impl FnOnce(&mut Eval) -> R) -> R {
+        if self.in_all {
+            return f(self);
+        }
+        let identity: Vec<u32> = (0..self.block as u32).collect();
+        let lanes = std::mem::replace(&mut self.lanes, identity);
+        std::mem::swap(&mut self.memo, &mut self.full_memo);
+        self.in_all = true;
+        let r = f(self);
+        self.in_all = false;
+        std::mem::swap(&mut self.memo, &mut self.full_memo);
+        self.lanes = lanes;
+        r
+    }
+
+    /// Evaluate with the work-items `lanes` standing for the slots (the
+    /// per-site EXEC restriction); the memo is kept when the map is unchanged.
+    fn set_lanes(&mut self, lanes: Vec<u32>) {
+        if self.lanes != lanes {
+            self.lanes = lanes;
+            self.memo.clear();
+        }
+    }
+
+    fn n(&self) -> usize {
+        self.lanes.len()
+    }
+
+    /// Pointwise 32-bit operation on two pure lane/constant values, at least
+    /// one of them lane-dependent with an exact table.
+    fn lane_map2(&self, x: &Aff, y: &Aff, f: impl Fn(i128, i128) -> i128) -> Option<Aff> {
+        if x.is_lane_free() && y.is_lane_free() {
+            return None;
+        }
+        let (vx, vy) = (x.residues(self.n())?, y.residues(self.n())?);
+        let m = modulus(32);
+        let t: Vec<i128> = vx
+            .iter()
+            .zip(&vy)
+            .map(|(&p, &q)| f(p, q).rem_euclid(m))
+            .collect();
+        let mut a = Aff::from_tab(32, t);
+        a.req = x.req | y.req;
+        Some(a)
+    }
+
+    fn lane_map1(&self, x: &Aff, f: impl Fn(i128) -> i128) -> Option<Aff> {
+        if x.is_lane_free() {
+            return None;
+        }
+        let vx = x.residues(self.n())?;
+        let m = modulus(32);
+        let t: Vec<i128> = vx.iter().map(|&p| f(p).rem_euclid(m)).collect();
+        let mut a = Aff::from_tab(32, t);
+        a.req = x.req;
+        Some(a)
+    }
+
+    /// The truth value of flag `f` for every lane slot, when it is a function
+    /// of the work-item id alone (pure lane/constant operands).
+    fn flag_lanes(&mut self, f: Ix) -> Option<Vec<bool>> {
+        let n = self.n();
+        let sgn = |v: i128, bits: u8| {
+            let m = modulus(bits);
+            if v >= m / 2 {
+                v - m
+            } else {
+                v
+            }
+        };
+        match self.it.node(f)? {
+            Node::True => Some(vec![true; n]),
+            Node::Not(g) => Some(self.flag_lanes(g)?.into_iter().map(|b| !b).collect()),
+            Node::And(a, b) | Node::Or(a, b) => {
+                let is_and = matches!(self.it.node(f), Some(Node::And(..)));
+                let (x, y) = (self.flag_lanes(a)?, self.flag_lanes(b)?);
+                Some(
+                    x.into_iter()
+                        .zip(y)
+                        .map(|(p, q)| if is_and { p && q } else { p || q })
+                        .collect(),
+                )
+            }
+            Node::Ltu { a, b } | Node::Lts { a, b } | Node::Eq { a, b } => {
+                let (x, y) = (self.eval(a).ok()?, self.eval(b).ok()?);
+                let (vx, vy) = (x.residues(n)?, y.residues(n)?);
+                let node = self.it.node(f)?;
+                Some(
+                    vx.iter()
+                        .zip(&vy)
+                        .map(|(&p, &q)| match node {
+                            Node::Ltu { .. } => p < q,
+                            Node::Lts { .. } => sgn(p, x.bits) < sgn(q, y.bits),
+                            _ => p == q,
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        }
+    }
+
     fn eval_node(&mut self, ix: Ix) -> Res {
         let Some(node) = self.it.node(ix) else {
             return Err("no witness".into());
@@ -513,11 +807,49 @@ impl Eval {
                 a.s[2] = 1 << 16;
                 Ok(a)
             }
-            Node::Entry(EntryReg::WorkitemIdPacked) => Ok(Aff::range(32, 0, self.block - 1, 0)),
+            Node::Entry(EntryReg::WorkitemIdPacked) => Ok(Aff::from_tab(
+                32,
+                self.lanes.iter().map(|&l| i128::from(l)).collect(),
+            )),
+            Node::FirstLane(a) => {
+                if !self.wave32 {
+                    return Err("the first lane of a wave64 wave".into());
+                }
+                // The value of lane 0 of the wave, over every work-item.
+                let x = self.with_all_lanes(|e| e.eval(a))?;
+                let Some(vals) = x.residues(self.block as usize) else {
+                    return Err(
+                        "the first lane of a value that is not a function of the work-item id"
+                            .into(),
+                    );
+                };
+                let t: Vec<i128> = self
+                    .lanes
+                    .iter()
+                    .map(|&l| vals[(l as usize / 32) * 32])
+                    .collect();
+                let mut r = Aff::from_tab(32, t);
+                r.req = x.req;
+                Ok(r)
+            }
             Node::Load(_) => Err("a loaded value".into()),
             Node::Ent(_) => Err("a sealed-table entry".into()),
             Node::MulSU24(..) => Err("a signed-by-unsigned 64-bit product (mad pair)".into()),
             Node::LaneMask(_) => Err("a lane mask".into()),
+            Node::Mask(f) | Node::Bit(f) => {
+                let Some(fl) = self.flag_lanes(f) else {
+                    return Err("a flag/carry value in an address".into());
+                };
+                let on = if matches!(node, Node::Mask(_)) {
+                    modulus(32) - 1
+                } else {
+                    1
+                };
+                Ok(Aff::from_tab(
+                    32,
+                    fl.into_iter().map(|b| if b { on } else { 0 }).collect(),
+                ))
+            }
             Node::Carry { .. }
             | Node::Ltu { .. }
             | Node::Lts { .. }
@@ -527,8 +859,6 @@ impl Eval {
             | Node::Not(_)
             | Node::Or(..)
             | Node::And(..)
-            | Node::Mask(_)
-            | Node::Bit(_)
             | Node::NzFlag(_) => Err("a flag/carry value in an address".into()),
             Node::Add32(a, b) => {
                 let (x, y) = (self.eval(a)?, self.eval(b)?);
@@ -581,6 +911,9 @@ impl Eval {
                     }
                 }
                 if bits == 32 {
+                    if let Some(r) = self.lane_map2(&x, &y, |p, q| p * q) {
+                        return Ok(r);
+                    }
                     if let (Some((al, ah)), Some((bl, bh))) = (x.exact_range(), y.exact_range()) {
                         if let (Some(lo), Some(hi)) = (al.checked_mul(bl), ah.checked_mul(bh)) {
                             if hi < modulus(32) {
@@ -588,6 +921,20 @@ impl Eval {
                             }
                         }
                     }
+                }
+                // A uniform factor `c + sum c_i X_i` times a form that depends
+                // on the tile or the lane distributes into products of atoms
+                // with that form.
+                if x.is_uniform() != y.is_uniform() {
+                    let (u, v) = if x.is_uniform() { (&x, &y) } else { (&y, &x) };
+                    let mut out = mulc(v, sgn(u.uc))?;
+                    for (&atom, &c) in &u.usym {
+                        let mut term = Aff::constant(bits, 0);
+                        term.prod.insert(atom, Box::new(mulc(v, sgn(c))?));
+                        out = add(&out, &term)?;
+                    }
+                    out.req |= u.req;
+                    return Ok(out);
                 }
                 Err("product of two non-constant values".into())
             }
@@ -604,6 +951,9 @@ impl Eval {
             }
             Node::Sra31(a) => {
                 let x = self.eval(a)?;
+                if let Some(r) = self.lane_map1(&x, |p| ((p as u32 as i32) >> 31) as u32 as i128) {
+                    return Ok(r);
+                }
                 if let Some((lo, hi)) = x.exact_range() {
                     let m = modulus(32);
                     return Ok(if hi < m / 2 {
@@ -625,6 +975,9 @@ impl Eval {
             }
             Node::Shr32(a, k) => {
                 let x = self.eval(a)?;
+                if let Some(r) = self.lane_map1(&x, |p| p >> k) {
+                    return Ok(r);
+                }
                 if let Some((lo, hi)) = x.exact_range() {
                     return Ok(pure_range(32, lo >> k, hi >> k, 0, x.req));
                 }
@@ -636,6 +989,9 @@ impl Eval {
             }
             Node::Sra32(a, k) => {
                 let x = self.eval(a)?;
+                if let Some(r) = self.lane_map1(&x, |p| ((p as u32 as i32) >> k) as u32 as i128) {
+                    return Ok(r);
+                }
                 if let Some((lo, hi)) = x.exact_range() {
                     let m = modulus(32);
                     if hi < m / 2 {
@@ -670,6 +1026,9 @@ impl Eval {
                 {
                     return Ok(Aff::wg(1, 1));
                 }
+                if let Some(r) = self.lane_map2(&x, &y, |p, q| p & q) {
+                    return Ok(r);
+                }
                 let masked = match (x.as_const(), y.as_const()) {
                     (_, Some(m)) => Some((norm(m), &x)),
                     (Some(m), _) => Some((norm(m), &y)),
@@ -680,7 +1039,7 @@ impl Eval {
                         if (m & (m + 1)) == 0 && hi <= m {
                             return Ok(v.clone());
                         }
-                        let tz = v.total_tz().min(ctz(m)).min(31) as u8;
+                        let tz = v.total_tz().max(ctz(m)).min(31) as u8;
                         return Ok(pure_range(32, 0, hi.min(m), tz, x.req | y.req));
                     }
                 } else if let (Some((_, ah)), Some((_, bh))) = (x.exact_range(), y.exact_range()) {
@@ -691,6 +1050,9 @@ impl Eval {
             }
             Node::Or32(a, b) => {
                 let (x, y) = (self.eval(a)?, self.eval(b)?);
+                if let Some(r) = self.lane_map2(&x, &y, |p, q| p | q) {
+                    return Ok(r);
+                }
                 // Disjoint bit ranges: OR is ADD.
                 for (hi_part, lo_part) in [(&x, &y), (&y, &x)] {
                     if let Some((_, h)) = lo_part.exact_range() {
@@ -718,6 +1080,23 @@ impl Eval {
                 let (x, y) = (self.eval(a)?, self.eval(b)?);
                 let signed = matches!(node, Node::MinS(..) | Node::MaxS(..));
                 let max = matches!(node, Node::MaxS(..) | Node::MaxU(..));
+                let key = |v: i128| {
+                    if signed {
+                        i128::from(v as u32 as i32)
+                    } else {
+                        v
+                    }
+                };
+                if let Some(r) = self.lane_map2(&x, &y, |p, q| {
+                    let (kp, kq) = (key(p), key(q));
+                    if (kp < kq) == max {
+                        q
+                    } else {
+                        p
+                    }
+                }) {
+                    return Ok(r);
+                }
                 if let (Some((al, ah)), Some((bl, bh))) = (x.exact_range(), y.exact_range()) {
                     let m = modulus(32);
                     let sg = |lo: i128, hi: i128| -> Option<(i128, i128)> {
@@ -743,15 +1122,52 @@ impl Eval {
                 self.uniform_atom(ix, 32)
                     .ok_or_else(|| "min/max involving a workgroup-dependent value".into())
             }
-            Node::Sel(..) => self
-                .uniform_atom(ix, 32)
-                .ok_or_else(|| "select on a workgroup-dependent value".into()),
+            Node::Sel(f, a, b) => {
+                if let Some(u) = self.uniform_atom(ix, 32) {
+                    return Ok(u);
+                }
+                let Some(fl) = self.flag_lanes(f) else {
+                    return Err("select on a workgroup-dependent value".into());
+                };
+                let (x, y) = (self.eval(a)?, self.eval(b)?);
+                let n = self.n();
+                let (Some(vx), Some(vy)) = (x.residues(n), y.residues(n)) else {
+                    return Err("select of workgroup-dependent values".into());
+                };
+                let t: Vec<i128> = fl
+                    .iter()
+                    .zip(vx.iter().zip(&vy))
+                    .map(|(&c, (&p, &q))| if c { p } else { q })
+                    .collect();
+                let mut r = Aff::from_tab(32, t);
+                r.req = x.req | y.req;
+                Ok(r)
+            }
         }
     }
 
     fn extend(&mut self, ix: Ix, signed: bool, x: Aff) -> Res {
         if x.bits != 32 {
             return Err("extension of a non-32-bit value".into());
+        }
+        if let Some(t) = &x.tab {
+            if !x.has_wg() && x.usym.is_empty() {
+                let m = modulus(32);
+                let vals: Vec<i128> = t
+                    .iter()
+                    .map(|&v| {
+                        let r = (x.uc + v).rem_euclid(m);
+                        if signed && r >= m / 2 {
+                            r - m
+                        } else {
+                            r
+                        }
+                    })
+                    .collect();
+                let mut r = Aff::from_tab(64, vals);
+                r.req = x.req;
+                return Ok(r);
+            }
         }
         if let Some((lo, hi)) = x.exact_range() {
             let m = modulus(32);
@@ -763,20 +1179,22 @@ impl Eval {
                 return Err("sign extension of a value spanning the sign bit".into());
             };
             let rtz = if lo == hi { 0 } else { x.rtz };
-            return Ok(Aff {
+            let mut a = Aff {
                 req: x.req,
                 rlo: lo,
                 rhi: hi,
                 rtz,
                 ..Aff::constant(64, 0)
-            });
+            };
+            fold_lane_const(&mut a)?;
+            return Ok(a);
         }
         if x.is_uniform() {
             return self
                 .uniform_atom(ix, 64)
                 .ok_or_else(|| "extension of a non-uniform value".into());
         }
-        if x.s == [0; 3] {
+        if x.s == [0; 3] && x.prod.is_empty() {
             return Err("extension of a lane-dependent value with an unknown part".into());
         }
         let req = x.req;
@@ -845,6 +1263,7 @@ fn show(it: &Interner, ix: Ix, depth: u32) -> String {
         Node::MinS(a, b) | Node::MinU(a, b) => format!("min({},{})", s(a), s(b)),
         Node::MaxS(a, b) | Node::MaxU(a, b) => format!("max({},{})", s(a), s(b)),
         Node::Sel(_, a, b) => format!("sel({},{})", s(a), s(b)),
+        Node::FirstLane(a) => format!("first({})", s(a)),
         _ => "flag".into(),
     }
 }
@@ -864,6 +1283,33 @@ struct SiteForm {
     ext: Option<Ext>,
     width: i128,
     req: bool,
+    /// The full address form without the base pointer.
+    a: Aff,
+    /// The dominating scalar branch facts, evaluated under the site's lanes.
+    rels: Vec<guard::Rel>,
+}
+
+/// The work-items that can execute a site: every work-item that satisfies the
+/// EXEC lane predicates (`None`: none can). Inactive slots map to the first
+/// active work-item so the lane tables of the evaluation describe active ones.
+fn lane_model(ev: &mut Eval, lane_facts: &[(Ix, bool)]) -> Option<Vec<u32>> {
+    let block = ev.block as usize;
+    let mut active = vec![true; block];
+    ev.with_all_lanes(|e| {
+        for &(atom, holds) in lane_facts {
+            if let Some(v) = e.flag_lanes(atom) {
+                for (a, b) in active.iter_mut().zip(v) {
+                    *a &= b == holds;
+                }
+            }
+        }
+    });
+    let first = active.iter().position(|&a| a)?;
+    Some(
+        (0..block)
+            .map(|l| if active[l] { l as u32 } else { first as u32 })
+            .collect(),
+    )
 }
 
 fn check_arg(
@@ -906,6 +1352,11 @@ fn check_arg(
         if site.addr.is_none() {
             return un(at("the address has no exact witness (not a global access, or an unmodelled operation)"));
         }
+        let Some(lanes) = lane_model(ev, &site.lane_facts) else {
+            // No work-item satisfies the EXEC predicates: the write never executes.
+            continue;
+        };
+        ev.set_lanes(lanes);
         let a = match ev.eval(site.addr) {
             Ok(a) => a,
             Err(e) => return un(at(&format!("address not affine in the tile id: {e}"))),
@@ -928,6 +1379,9 @@ fn check_arg(
         {
             return un(at("another argument pointer enters the address"));
         }
+        let rels = guard::rels(ev, &site.facts);
+        let mut a_nb = a.clone();
+        a_nb.usym = usym.clone();
         forms.push(SiteForm {
             usym,
             uc: a.uc,
@@ -937,9 +1391,75 @@ fn check_arg(
             ext: a.ext.map(|e| *e),
             width: i128::from(width),
             req: a.req,
+            a: a_nb,
+            rels,
         });
     }
     let _ = facts;
+    if forms.is_empty() {
+        return un("every write is under an unsatisfiable lane predicate".into());
+    }
+    let req = forms.iter().any(|f| f.req);
+    if std::env::var("WGDBG2").is_ok() {
+        for w in &writes {
+            if let Some(s) = sites.get(&w.inst) {
+                let f: Vec<String> = s
+                    .facts
+                    .iter()
+                    .map(|(a, p)| format!("{}{}", if *p { "" } else { "!" }, show(&ev.it, *a, 6)))
+                    .collect();
+                let l: Vec<String> = s
+                    .lane_facts
+                    .iter()
+                    .map(|(a, p)| format!("{}{}", if *p { "" } else { "!" }, show(&ev.it, *a, 6)))
+                    .collect();
+                eprintln!(
+                    "DBG arg@{} pc{} facts {:?} lane {:?} node {:?}",
+                    arg.offset,
+                    s.pos,
+                    f,
+                    l,
+                    s.lane_facts
+                        .iter()
+                        .map(|(a, _)| ev.it.node(*a))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+    let mut requires: Vec<WgRequirement> = match (req, ev.group_size_dword) {
+        (true, Some(o)) => vec![WgRequirement {
+            offset: o,
+            mask: 0xffff,
+            value: launch.block_x,
+            op: WgReqOp::MaskEq,
+        }],
+        _ => Vec::new(),
+    };
+    if forms.iter().any(|f| f.a.has_prod_deep()) {
+        let gsites: Vec<guard::Site<'_>> = forms
+            .iter()
+            .map(|f| guard::Site {
+                a: &f.a,
+                width: f.width,
+                rels: &f.rels,
+            })
+            .collect();
+        return match guard::prove(ev, &gsites) {
+            Ok(p) => {
+                requires.extend(p.needs);
+                requires.sort();
+                ArgWgClass::Disjoint(WgDisjoint {
+                    axes: p.axes,
+                    bounds: p.bounds,
+                    block_x: launch.block_x,
+                    requires,
+                    sites: forms.len(),
+                })
+            }
+            Err(e) => un(format!("guarded range proof failed: {e}")),
+        };
+    }
     let first = &forms[0];
     for f in &forms[1..] {
         if f.usym != first.usym {
@@ -958,15 +1478,6 @@ fn check_arg(
             _ => return un("sites differ in the shape of their tile term".into()),
         }
     }
-    let req = forms.iter().any(|f| f.req);
-    let requires: Vec<WgRequirement> = match (req, ev.group_size_dword) {
-        (true, Some(o)) => vec![WgRequirement {
-            offset: o,
-            mask: 0xffff,
-            value: launch.block_x,
-        }],
-        _ => Vec::new(),
-    };
     for cand in BOUND_CANDIDATES {
         let bounds = [
             cand.min(HW_BOUNDS[0]),
@@ -1222,6 +1733,8 @@ mod tests {
             ext: None,
             width,
             req: false,
+            a: Aff::constant(64, 0),
+            rels: Vec::new(),
         }]
     }
 

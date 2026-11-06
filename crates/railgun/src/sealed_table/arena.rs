@@ -68,6 +68,7 @@ fn pool_facts(bound: TableBound) -> Arc<NodeFacts> {
                 }],
                 sealed: vec![sealed_fact(bound)],
                 wg_footprints: Vec::new(),
+                hidden_grid: Vec::new(),
             }],
         }],
         task_protocol: None,
@@ -470,6 +471,7 @@ fn a_writer_added_by_the_same_or_a_later_bind_refuses() {
         }],
         sealed: Vec::new(),
         wg_footprints: Vec::new(),
+        hidden_grid: Vec::new(),
     });
     let mut pool = launch(&[(0, ARENA)], 8, vec![ptr(0, &[SmemLoad])]);
     pool.facts = Ok(Arc::new(f));

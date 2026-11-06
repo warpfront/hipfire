@@ -14,6 +14,7 @@ use crate::plan::{plan, CacheTable, RowPolicy};
 use crate::sealed_table::tests as st;
 use crate::sealed_table::{Pointee, SealedTableRegistry};
 use crate::{Binding, BindingField, BindingRecord, EVENT_CELL_BYTES};
+use railgun_corpus::receipt::RequireOp;
 
 const TASKS: u64 = 0x7000_0000;
 const EVENTS: u64 = 0x7100_0000;
@@ -39,6 +40,17 @@ const T_ATOM: u32 = 8;
 const T_TILE_B: u32 = 9;
 const T_TILE_R: u32 = 10;
 const T_TILE_Q: u32 = 11;
+/// Write field 8; the body loads hidden block counts at record +24/+28/+32
+/// (declared by the record); `T_HIDU` also loads +40, which no record declares.
+/// Footprint over x requiring record dword@16 (0x1_0080): `<= 0x1_0080` (met),
+/// `<= 0x7f` (not met), `>= 0x1_0081` (not met).
+const T_LE_OK: u32 = 14;
+const T_LE_BAD: u32 = 15;
+const T_GE_BAD: u32 = 16;
+/// `8 * grid_x <= dword@16`: met for gx = 4 (dword 0x1_0080), not for gx > 0x2010.
+const T_GRID_LE: u32 = 17;
+const T_HID: u32 = 12;
+const T_HIDU: u32 = 13;
 
 const N: u32 = NONE;
 const ALL: [u32; 4] = [T_COPY, T_READ, T_NOP, T_WRITE];
@@ -87,7 +99,8 @@ fn template(id: u32) -> ArenaTemplate {
             record_offset: 8,
             classes: vec![VmemStore],
         }],
-        T_TILE_X | T_TILE_XY | T_TILE_B | T_TILE_R | T_TILE_Q => vec![L {
+        T_TILE_X | T_TILE_XY | T_TILE_B | T_TILE_R | T_TILE_Q | T_HID | T_HIDU | T_LE_OK
+        | T_LE_BAD | T_GE_BAD | T_GRID_LE => vec![L {
             record_offset: 8,
             classes: vec![VmemStore],
         }],
@@ -139,9 +152,52 @@ fn template(id: u32) -> ArenaTemplate {
                 ..crate::kernel::WgFootprint::plain(8, 1)
             }],
             T_TILE_R | T_TILE_Q => vec![crate::kernel::WgFootprint {
-                requires: vec![(16, 0xffff, if id == T_TILE_R { 0x80 } else { 0x81 })],
+                requires: vec![crate::kernel::WgRequire::mask_eq(
+                    16,
+                    0xffff,
+                    if id == T_TILE_R { 0x80 } else { 0x81 },
+                )],
                 ..crate::kernel::WgFootprint::plain(8, 1)
             }],
+            T_GRID_LE => vec![crate::kernel::WgFootprint {
+                requires: vec![crate::kernel::WgRequire {
+                    offset: 16,
+                    op: RequireOp::GridLe,
+                    mask: 0,
+                    value: 8,
+                }],
+                ..crate::kernel::WgFootprint::plain(8, 1)
+            }],
+            T_LE_OK | T_LE_BAD | T_GE_BAD => {
+                let (op, value) = match id {
+                    T_LE_OK => (RequireOp::LeU, 0x1_0080),
+                    T_LE_BAD => (RequireOp::LeU, 0x7f),
+                    _ => (RequireOp::GeU, 0x1_0081),
+                };
+                vec![crate::kernel::WgFootprint {
+                    requires: vec![crate::kernel::WgRequire {
+                        offset: 16,
+                        op,
+                        mask: u32::MAX,
+                        value,
+                    }],
+                    ..crate::kernel::WgFootprint::plain(8, 1)
+                }]
+            }
+            _ => Vec::new(),
+        },
+        hidden_grid: match id {
+            T_HID | T_HIDU => {
+                let mut h = vec![
+                    (24, "block_count_x".to_owned()),
+                    (28, "block_count_y".to_owned()),
+                    (32, "block_count_z".to_owned()),
+                ];
+                if id == T_HIDU {
+                    h.push((40, "block_count_x".to_owned()));
+                }
+                h
+            }
             _ => Vec::new(),
         },
     }
@@ -336,6 +392,32 @@ fn footprint_assumptions_are_checked_against_the_headers_and_record() {
     assert!(err.contains("requires record dword +16"), "{err}");
 }
 
+#[test]
+fn ordering_requirements_are_evaluated_against_the_record_scalars() {
+    let two = |tpl| vec![tile(tpl, 0, 0, 0, 2, 4, 1), tile(tpl, 0, 2, 0, 2, 4, 1)];
+    tiles(T_LE_OK, two(T_LE_OK), region_wg_protocol()).unwrap();
+    let err = tiles(T_LE_BAD, two(T_LE_BAD), region_wg_protocol()).unwrap_err();
+    assert!(err.contains("requires record dword +16 <= 0x7f"), "{err}");
+    let err = tiles(T_GE_BAD, two(T_GE_BAD), region_wg_protocol()).unwrap_err();
+    assert!(
+        err.contains("requires record dword +16 >= 0x10081"),
+        "{err}"
+    );
+    // grid_le: 8 * gx <= 0x1_0080 holds for gx = 4 and fails for gx = 0x2011.
+    let two_g = |gx| {
+        vec![
+            tile(T_GRID_LE, 0, 0, 0, 2, gx, 1),
+            tile(T_GRID_LE, 0, 2, 0, 2, gx, 1),
+        ]
+    };
+    tiles(T_GRID_LE, two_g(4), region_wg_protocol()).unwrap();
+    let err = tiles(T_GRID_LE, two_g(0x2011), region_wg_protocol()).unwrap_err();
+    assert!(
+        err.contains("requires record dword +16 >= 8 * grid extent 0"),
+        "{err}"
+    );
+}
+
 fn pool_args() -> Vec<ArgFact> {
     vec![
         ptr(0, &[SmemLoad]),
@@ -516,8 +598,13 @@ fn build_with(
                 .collect(),
             scalars: if *template == T_SEALED {
                 vec![(SEALED_BOUND_AT, SEALED_N)]
-            } else if matches!(*template, T_TILE_R | T_TILE_Q) {
+            } else if matches!(
+                *template,
+                T_TILE_R | T_TILE_Q | T_LE_OK | T_LE_BAD | T_GE_BAD | T_GRID_LE
+            ) {
                 vec![(16, 0x1_0080)]
+            } else if matches!(*template, T_HID | T_HIDU) {
+                vec![(24, 4), (28, 1), (32, 1)]
             } else {
                 Vec::new()
             },
@@ -1115,9 +1202,117 @@ fn a_ten_thousand_task_chain_is_proved() {
     assert_eq!(proof.events_used, n as usize);
 }
 
+#[test]
+fn the_host_grid_must_equal_the_records_hidden_block_counts() {
+    let run = |gx: u32, template: u32| {
+        build(
+            vec![vec![tile(template, 0, 0, 0, 0, gx, 1)]],
+            &[(template, &[(8, X)])],
+            vec![vec![template]],
+            Some(proven_protocol()),
+            false,
+        )
+        .check()
+    };
+    run(4, T_HID).unwrap();
+    let err = run(8, T_HID).unwrap_err();
+    assert!(
+        err.contains("header grid x extent 8 differs from the record's hidden block_count_x 4"),
+        "{err}"
+    );
+    let err = run(4, T_HIDU).unwrap_err();
+    assert!(
+        err.contains("hidden grid argument block_count_x at record +40")
+            && err.contains("as a railgun scalar"),
+        "{err}"
+    );
+}
+
 #[cfg(feature = "lab")]
 mod lab {
     use super::*;
+    use crate::admission::{Admission, DifferentialWitness};
+
+    fn uncovered_pair(protocol: Option<TaskProtocolFact>) -> Fixture {
+        let two = vec![
+            tile(T_WRITE, 0, 0, 0, 2, 4, 1),
+            tile(T_WRITE, 0, 2, 0, 2, 4, 1),
+        ];
+        build(
+            vec![two, vec![t(T_NOP, 1, N, 0, N)]],
+            &[(T_WRITE, &[(8, X)]), (T_NOP, &[])],
+            vec![ALL.to_vec(); 2],
+            protocol,
+            false,
+        )
+    }
+
+    #[test]
+    fn lab_admits_an_uncovered_same_instance_pair_with_a_named_reason() {
+        let fx = uncovered_pair(None);
+        let ordering = fx
+            .graph
+            .check_pending(&fx.program, fx.group.clone())
+            .unwrap();
+        let x = fx.data(X).0;
+        let reason = format!("inter-WG disjointness unproven: template {T_WRITE}, resource {x}");
+        assert!(ordering.is_pending());
+        assert_eq!(ordering.pending_reasons(), [reason.clone()]);
+        let mut program = fx.program.clone();
+        program.add_coresident_group(1..3, ordering).unwrap();
+        let Admission::LabPending { reasons } = program.admission() else {
+            panic!("not lab-pending");
+        };
+        assert!(reasons.iter().any(|r| r.ends_with(&reason)), "{reasons:?}");
+        let witness = DifferentialWitness::compare(b"f", b"a", b"a").unwrap();
+        let receipt = Admission::LabPending { reasons }
+            .receipt(Some(&witness))
+            .unwrap();
+        assert!(receipt
+            .pending
+            .unwrap()
+            .iter()
+            .any(|r| r.ends_with(&reason)));
+
+        // Certified `check` refuses the same graph.
+        let fx = uncovered_pair(Some(region_wg_protocol()));
+        let err = fx.check().unwrap_err();
+        assert!(
+            err.contains("proves no inter-WG write disjointness"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn lab_still_refuses_overlapping_workgroups_and_a_grid_mismatch() {
+        let fx = build(
+            vec![vec![
+                tile(T_WRITE, 0, 0, 0, 3, 4, 1),
+                tile(T_WRITE, 0, 2, 0, 2, 4, 1),
+            ]],
+            &[(T_WRITE, &[(8, X)])],
+            vec![vec![T_WRITE]],
+            None,
+            false,
+        );
+        let err = fx
+            .graph
+            .check_pending(&fx.program, fx.group.clone())
+            .unwrap_err();
+        assert!(err.contains("run twice concurrently"), "{err}");
+        let fx = build(
+            vec![vec![tile(T_HID, 0, 0, 0, 0, 8, 1)]],
+            &[(T_HID, &[(8, X)])],
+            vec![vec![T_HID]],
+            None,
+            false,
+        );
+        let err = fx
+            .graph
+            .check_pending(&fx.program, fx.group.clone())
+            .unwrap_err();
+        assert!(err.contains("header grid x extent 8"), "{err}");
+    }
 
     #[test]
     fn check_pending_runs_the_host_checks_and_yields_a_pending_ordering() {

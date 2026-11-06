@@ -186,37 +186,157 @@ fn zero_f32_record_carries_block_bound_and_requirement() {
 /// `gated_delta_gate_rotate` (t6, block 64): the b128 stores through the pointers
 /// at +0 and +24 write `1024 * wg_x + 16 * lane` (hand-derived by reading the
 /// disassembly); the 8 b32 stores through +32 are restricted by an EXEC lane
-/// guard (only lanes < 32) the prover does not track, so no fact.
+/// predicate (`v_cmpx`: only lanes < 32 store), which the prover now tracks, so
+/// all three written arguments are disjoint along x.
 #[test]
-fn gate_rotate_proves_two_of_three_written_arguments() {
+fn gate_rotate_proves_all_three_written_arguments() {
     let sym = "gated_delta_gate_rotate_bf16_f32_batched";
-    for off in [0, 24] {
+    for off in [0, 24, 32] {
         let c = class_of("b32b3e78", sym, 64, off);
         assert_eq!(disjoint(&c).axes, [0], "+{off}");
     }
-    assert!(matches!(
-        class_of("b32b3e78", sym, 64, 32),
-        ArgWgClass::Unproven(_)
-    ));
 }
 
-/// The real conflicts MegaM0 hit (j8250): `gemv_k4_otile` +16 and the o4 MoE
-/// gate/up `+32` are NOT provable by this analysis (column-major `c * M + row`
-/// output guarded by `row < M`, and a row-major `row * N + col` output guarded by
-/// `col < N`: both need a guard-bounded radix argument the prover lacks).
+/// The real conflicts MegaM0 hit (j8250), second one: the o4 MoE gate/up `+32`
+/// is a row-major `grouped_slot * M + row` output
+/// (`4 * (N * (2 * wg_y + r) + 16 * wg_x + 4 * wave + j)`) whose stores are each
+/// dominated by `col < N`: the guard-aware prover proves it disjoint along every
+/// tile axis with no precondition on the record. The `gemv_k4_otile` `+16`
+/// output (a `c * A + row` transposed layout written by lanes selected through a
+/// divergent EXEC region) is still refused: its address has no exact witness.
 #[test]
-fn the_j8250_conflicts_are_still_refused() {
+fn the_j8250_gate_up_conflict_is_proven_the_k4_otile_one_is_not() {
+    let c = class_of(
+        "07782644",
+        "gemm_mq4g256v2p_moe_grouped_top10_o4_r2_x4",
+        128,
+        32,
+    );
+    let d = disjoint(&c);
+    assert_eq!(d.axes, [0, 1, 2]);
+    assert_eq!(d.sites, 8);
+    assert_eq!(d.bounds, [1 << 24, 1 << 16, 1 << 12]);
+    assert!(d.requires.is_empty(), "{:?}", d.requires);
     assert!(matches!(
         class_of("6d0492fc", "gemv_bf16_xf32_k4_rows_otile_r6", 128, 16),
         ArgWgClass::Unproven(_)
     ));
-    assert!(matches!(
-        class_of(
-            "07782644",
-            "gemm_mq4g256v2p_moe_grouped_top10_o4_r2_x4",
-            128,
-            32
-        ),
-        ArgWgClass::Unproven(_)
-    ));
+}
+
+/// `gemv_mq4g128v2p_moe_down_top10_dni_k640` (t18) `+24`: one store per wave
+/// lane group to `out + 4 * (r * k[32] + c0 + e)` with `r = k[48] * wg_z + wg_y`
+/// (guard `wg_y < k[48]`), `c0 = 32 * wg_x + 8 * wave` and `e` in 0..8
+/// (`(lane & 3) == 0` lanes). The kernel guards only the column BASE
+/// (`c0 < k[32]`), so disjointness needs `k[32] % 8 == 0` (Main's ruling: an
+/// explicit certified precondition, never assumed; the product's dni admission
+/// enforces `m % 32 == 0`) and, so that `k[48] * wg_z + wg_y` cannot wrap i32
+/// at the recorded z bound, `k[48] <= 32768`.
+#[test]
+fn t18_down_dni_is_disjoint_under_explicit_preconditions() {
+    use peacemaker_ir::passes::wg_footprint::{WgReqOp, WgRequirement};
+    let c = class_of(
+        "8c49fcc0",
+        "gemv_mq4g128v2p_moe_down_top10_dni_k640",
+        128,
+        24,
+    );
+    let d = disjoint(&c);
+    assert_eq!(d.axes, [0, 1, 2]);
+    assert_eq!(d.sites, 1);
+    assert_eq!(
+        d.requires,
+        vec![
+            WgRequirement {
+                offset: 32,
+                mask: 7,
+                value: 0,
+                op: WgReqOp::MaskEq
+            },
+            WgRequirement {
+                offset: 48,
+                mask: u32::MAX,
+                value: 32768,
+                op: WgReqOp::LeU
+            },
+        ]
+    );
+}
+
+/// The receipt records of the guarded proofs, through the same path the
+/// standalone region builder uses (`kernel_facts` + `wg_footprint_records`):
+/// every precondition is emitted as an explicit record relation.
+fn records_of(
+    prefix: &str,
+    symbol: &str,
+    block: u32,
+) -> Vec<railgun_corpus::receipt::WgFootprintRecord> {
+    let bytes = object(prefix);
+    let lifted = lift_object(
+        &bytes,
+        Options {
+            frontend: Frontend::Hipcc,
+        },
+    )
+    .expect("lift");
+    let index = lifted
+        .program
+        .kernels
+        .iter()
+        .position(|k| k.symbol.0 == symbol)
+        .expect("kernel");
+    let kernel = &lifted.program.kernels[index];
+    let mut facts = kernargs::analyze(kernel, Arch::Gfx1201);
+    if facts.status != KernelStatus::Proven {
+        facts = kernargs::analyze_sealed(kernel, Arch::Gfx1201);
+    }
+    railgun_cert::wg_footprint_records(
+        &lifted.program.kernels[index],
+        lifted.program.target.arch,
+        &facts,
+        Some(block),
+    )
+}
+
+#[test]
+fn t18_record_carries_the_mask_and_cap_relations() {
+    use railgun_corpus::receipt::RequireOp;
+    let recs = records_of("8c49fcc0", "gemv_mq4g128v2p_moe_down_top10_dni_k640", 128);
+    let r = recs
+        .iter()
+        .find(|r| r.record_offset == 24)
+        .expect("the +24 output footprint");
+    assert_eq!(r.axes, ["x", "y", "z"]);
+    let rel: Vec<_> = r
+        .requires
+        .iter()
+        .map(|q| (q.offset, q.op, q.mask, q.value))
+        .collect();
+    assert_eq!(
+        rel,
+        [
+            (32, RequireOp::MaskEq, 7, 0),
+            (48, RequireOp::LeU, u32::MAX, 32768)
+        ]
+    );
+}
+
+/// `hyper_read_up_fused_f32_sx_t1_k320` (t9) `+24`: `mixed + 4 * (tok * hidden +
+/// 8 * wg_x + lane)` for `lane < 8` with NO `col < hidden` guard in the kernel:
+/// disjointness needs `8 * grid_x <= hidden` (the product enforces
+/// `hidden % 8 == 0` and `grid_x = hidden / 8`); the prover emits it as a
+/// certified grid relation, never assumes it.
+#[test]
+fn t9_hyper_read_up_needs_the_grid_relation() {
+    use railgun_corpus::receipt::RequireOp;
+    let c = class_of("1ee5877c", "hyper_read_up_fused_f32_sx_t1_k320", 256, 24);
+    let d = disjoint(&c);
+    assert_eq!(d.axes, [0, 1, 2]);
+    let recs = records_of("1ee5877c", "hyper_read_up_fused_f32_sx_t1_k320", 256);
+    let r = recs.iter().find(|r| r.record_offset == 24).expect("+24");
+    let rel: Vec<_> = r
+        .requires
+        .iter()
+        .map(|q| (q.offset, q.op, q.mask, q.value))
+        .collect();
+    assert_eq!(rel, [(32, RequireOp::GridLe, 0, 8)]);
 }

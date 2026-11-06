@@ -56,9 +56,9 @@ use peacemaker_lift::regions_note::{read_regions, KernelRegions, Region};
 use peacemaker_lift::rewrite::region::{lift_region, RegionInputs};
 use peacemaker_lift::{lift_object, Options};
 use railgun_corpus::receipt::{
-    ArenaPointerRecord, ArenaTemplateRecord, DescriptorArenaRecord, SealedTableRecord,
-    TaskProtocolRecord, SEALED_BOUND_KERNARG, STATUS_CONDITIONAL, STATUS_PROVEN, STATUS_UNKNOWN,
-    WITNESS_DESCRIPTOR_ARENA, WITNESS_SEALED_TABLE,
+    ArenaPointerRecord, ArenaTemplateRecord, DescriptorArenaRecord, HiddenGridRecord,
+    SealedTableRecord, TaskProtocolRecord, SEALED_BOUND_KERNARG, STATUS_CONDITIONAL, STATUS_PROVEN,
+    STATUS_UNKNOWN, WITNESS_DESCRIPTOR_ARENA, WITNESS_SEALED_TABLE,
 };
 use sha2::{Digest, Sha256};
 
@@ -750,6 +750,7 @@ fn derive_lifted(
             pointer_loads: loads,
             sealed_tables,
             wg_footprints: standalone_footprints(&bytes, &r.source_symbol, r.block),
+            hidden_grid: hidden_grid_from_standalone(record),
         },
         lds_bytes: lifted.lds_bytes,
         evidence: format!(
@@ -763,6 +764,30 @@ fn derive_lifted(
             hidden.join(", ")
         ) + &sealed_note,
     })
+}
+
+/// The loaded hidden grid arguments of a standalone body (`hidden_block_count_*`,
+/// `hidden_group_size_*`, `hidden_remainder_*`, `hidden_grid_dims`), at their standalone
+/// kernarg offsets: inside the pool region the record is the body's kernarg block, so
+/// the host patches/checks exactly these words. `kind` is the value kind without `hidden_`.
+fn hidden_grid_from_standalone(record: &KernelRecord) -> Vec<HiddenGridRecord> {
+    let mut out: Vec<HiddenGridRecord> = record
+        .args
+        .iter()
+        .filter(|a| {
+            a.loaded && peacemaker_ir::kernarg::HIDDEN_GRID_KINDS.contains(&a.value_kind.as_str())
+        })
+        .map(|a| HiddenGridRecord {
+            record_offset: a.offset,
+            kind: a
+                .value_kind
+                .strip_prefix("hidden_")
+                .unwrap_or(&a.value_kind)
+                .to_owned(),
+        })
+        .collect();
+    out.sort_by_key(|h| h.record_offset);
+    out
 }
 
 /// The template facts of a standalone body's A1 record: its pointer loads and
@@ -902,6 +927,10 @@ fn derive_native(kernel: &Kernel, arch: Arch, p: &Placed) -> Result<RegionFacts,
             pointer_loads: loads,
             sealed_tables: Vec::new(),
             wg_footprints: Vec::new(),
+            // A native region's cut-out kernel has no declared arguments, so no record
+            // dword is a hidden grid value; the grid it reads (COPY: the dispatcher's s72 =
+            // header gx) is tied by `region_wg_from_header`, not by a record offset.
+            hidden_grid: Vec::new(),
         },
         lds_bytes: 0,
         evidence: format!(
@@ -1636,6 +1665,7 @@ mod sealed_tests {
                 pointer_loads: loads,
                 sealed_tables: sealed,
                 wg_footprints: Vec::new(),
+                hidden_grid: Vec::new(),
             }],
         }];
         pool.required_witnesses = pool.implied_witnesses();

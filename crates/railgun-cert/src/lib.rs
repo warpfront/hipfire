@@ -318,6 +318,20 @@ pub fn wg_footprint_records(
                     .iter()
                     .map(|r| WgRequirementRecord {
                         offset: r.offset,
+                        op: match r.op {
+                            peacemaker_ir::passes::wg_footprint::WgReqOp::MaskEq => {
+                                railgun_corpus::receipt::RequireOp::MaskEq
+                            }
+                            peacemaker_ir::passes::wg_footprint::WgReqOp::LeU => {
+                                railgun_corpus::receipt::RequireOp::LeU
+                            }
+                            peacemaker_ir::passes::wg_footprint::WgReqOp::GeU => {
+                                railgun_corpus::receipt::RequireOp::GeU
+                            }
+                            peacemaker_ir::passes::wg_footprint::WgReqOp::GridLe => {
+                                railgun_corpus::receipt::RequireOp::GridLe
+                            }
+                        },
                         mask: r.mask,
                         value: r.value,
                     })

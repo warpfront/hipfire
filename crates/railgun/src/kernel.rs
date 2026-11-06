@@ -254,8 +254,37 @@ pub struct WgFootprint {
     /// Exclusive per-axis tile-id bounds (`None`: unbounded); the host
     /// requires the virtual grid extents `gx, gy, gz` within them.
     pub bounds: [Option<u64>; 3],
-    /// Record dwords the proof used: `(offset, mask, value)`.
-    pub requires: Vec<(u32, u32, u32)>,
+    /// Record dwords the proof used; every one must hold of the record's
+    /// declared scalar.
+    pub requires: Vec<WgRequire>,
+}
+
+/// One record-dword relation a footprint's proof assumed (receipt
+/// `WgRequirementRecord`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WgRequire {
+    pub offset: u32,
+    pub op: railgun_corpus::receipt::RequireOp,
+    pub mask: u32,
+    pub value: u32,
+}
+
+impl WgRequire {
+    /// `(offset & mask) == value`.
+    pub fn mask_eq(offset: u32, mask: u32, value: u32) -> Self {
+        Self {
+            offset,
+            op: railgun_corpus::receipt::RequireOp::MaskEq,
+            mask,
+            value,
+        }
+    }
+
+    /// Whether the record scalar `d` satisfies the relation for a task whose
+    /// virtual grid extents are `grid`.
+    pub fn holds(&self, d: u32, grid: [u32; 3]) -> bool {
+        self.op.holds(d, self.mask, self.value, grid)
+    }
 }
 
 impl WgFootprint {
@@ -288,6 +317,12 @@ pub struct ArenaTemplate {
     /// Certified per-workgroup write footprints (receipt
     /// `ArenaTemplateRecord::wg_footprints`).
     pub wg_footprints: Vec<WgFootprint>,
+    /// Hidden grid arguments the body loads, `(record offset, kind)` (receipt
+    /// `ArenaTemplateRecord::hidden_grid`; `kind` is `block_count_x|y|z`,
+    /// `group_size_*`, `remainder_*`, `grid_dims`). `prove` requires every
+    /// record of the template to declare each offset as a railgun scalar and
+    /// every task header grid to equal the record's `block_count_*`.
+    pub hidden_grid: Vec<(u32, String)>,
 }
 
 /// One descriptor arena of a `Conditional` kernel (receipt
@@ -572,11 +607,21 @@ fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, St
                             requires: f
                                 .requires
                                 .iter()
-                                .map(|r| (r.offset, r.mask, r.value))
+                                .map(|r| WgRequire {
+                                    offset: r.offset,
+                                    op: r.op,
+                                    mask: r.mask,
+                                    value: r.value,
+                                })
                                 .collect(),
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()?,
+                hidden_grid: t
+                    .hidden_grid
+                    .iter()
+                    .map(|h| (h.record_offset, h.kind.clone()))
+                    .collect(),
             });
         }
         arenas.push(ArenaFact {

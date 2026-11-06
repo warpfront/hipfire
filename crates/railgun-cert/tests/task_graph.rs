@@ -122,6 +122,74 @@ fn prove_bytes(
     (rules, partial)
 }
 
+/// The loaded hidden grid words each real template carries (record offset = the
+/// standalone kernarg offset); every template not listed loads none and so serializes
+/// without the field (its receipt is byte-identical to before).
+#[test]
+fn real_templates_carry_their_hidden_grid_words() {
+    use railgun_corpus::receipt::HiddenGridRecord;
+    let h = |record_offset: u32, kind: &str| HiddenGridRecord {
+        record_offset,
+        kind: kind.into(),
+    };
+    let want: &[(&str, u32, Vec<HiddenGridRecord>)] = &[
+        ("b32", 17, vec![h(100, "block_count_y")]),
+        (
+            "b256",
+            4,
+            vec![h(140, "group_size_x"), h(142, "group_size_y")],
+        ),
+        ("b256", 13, vec![h(80, "block_count_x")]),
+        (
+            "b256",
+            14,
+            vec![h(28, "group_size_x"), h(30, "group_size_y")],
+        ),
+        (
+            "b256",
+            15,
+            vec![h(116, "group_size_x"), h(118, "group_size_y")],
+        ),
+    ];
+    for &(name, symbol, _) in POOLS {
+        let (refusals, partial) = prove(name, symbol);
+        assert!(refusals.is_empty(), "{name}: {refusals:#?}");
+        for t in &partial.expect("proof").arena.templates {
+            let expect = want
+                .iter()
+                .find(|(n, id, _)| *n == name && *id == t.template)
+                .map(|(_, _, v)| v.clone())
+                .unwrap_or_default();
+            assert_eq!(t.hidden_grid, expect, "{name} t{}", t.template);
+            let json = serde_json::to_string(t).expect("json");
+            assert_eq!(
+                json.contains("hidden_grid"),
+                !expect.is_empty(),
+                "{name} t{}: {json}",
+                t.template
+            );
+            // the footprint requirement `hidden_group_size_x == block` names the same word
+            if name == "b256" && t.template == 14 {
+                let f = t
+                    .wg_footprints
+                    .iter()
+                    .find(|f| f.record_offset == 0)
+                    .unwrap();
+                assert_eq!(
+                    f.requires,
+                    [railgun_corpus::receipt::WgRequirementRecord {
+                        offset: 28,
+                        mask: 0xffff,
+                        value: 256,
+                        op: Default::default()
+                    }]
+                );
+                assert!(t.hidden_grid.iter().any(|g| g.record_offset == 28));
+            }
+        }
+    }
+}
+
 /// Every obligation holds on the OR-poison pools: a conditional record per pool.
 #[test]
 fn real_pools_are_certified() {

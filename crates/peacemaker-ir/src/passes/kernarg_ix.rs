@@ -150,6 +150,10 @@ pub(super) enum Node {
     /// 32-bit lane mask (wave32): bit `l` is set only for lanes whose work-item
     /// satisfies every `(atom, polarity)` of fact list `id` (`Interner::lane_facts`).
     /// Atoms compare 32-bit values that may depend on the work-item id.
+    /// `v_readfirstlane_b32` under the entry EXEC: the value of the argument in
+    /// lane 0 of the executing wave (a wave32 lane-0 value: wave-uniform, not
+    /// workgroup-uniform).
+    FirstLane(Ix),
     LaneMask(u32),
 }
 impl Node {
@@ -220,6 +224,7 @@ impl Interner {
             | Node::Load(_)
             | Node::Ent(_)
             | Node::Carry { .. }
+            | Node::FirstLane(_)
             | Node::LaneMask(_) => {
                 self.uni.insert(ix, false);
                 return false;
@@ -474,6 +479,17 @@ impl Interner {
             (true, false) => Node::MaxU(a, b),
         };
         self.mk(n, &[a, b])
+    }
+    /// The lane-0 value of the executing wave (`v_readfirstlane_b32` under the
+    /// entry EXEC). A uniform argument is its own first-lane value.
+    pub fn first_lane(&mut self, a: Ix) -> Ix {
+        if !self.is32(a) {
+            return Ix::NONE;
+        }
+        if self.uniform(a) {
+            return a;
+        }
+        self.mk(Node::FirstLane(a), &[a])
     }
     /// `flag ? a : b`.
     pub fn sel(&mut self, f: Ix, a: Ix, b: Ix) -> Ix {
@@ -783,6 +799,38 @@ impl Interner {
             _ => None,
         }
     }
+    /// The facts a lane-mask witness implies for its set lanes (none for any
+    /// other witness).
+    pub fn mask_facts(&self, ix: Ix) -> Vec<(Ix, bool)> {
+        self.lane_mask_facts(ix)
+            .map(|(f, _)| f.to_vec())
+            .unwrap_or_default()
+    }
+    /// `a & b` of two lane masks: its set lanes satisfy the facts of each
+    /// lane-mask operand (a non-mask operand adds none). `NONE` when neither
+    /// is a lane mask.
+    pub fn mask_and(&mut self, a: Ix, b: Ix) -> Ix {
+        let (ma, mb) = (
+            self.lane_mask_facts(a).is_some(),
+            self.lane_mask_facts(b).is_some(),
+        );
+        if !ma && !mb {
+            return Ix::NONE;
+        }
+        let mut f = self.mask_facts(a);
+        f.extend(self.mask_facts(b));
+        self.lane_mask(f, None)
+    }
+    /// `a | b` of two lane masks: a set lane satisfies the facts both share;
+    /// `NONE` unless both are lane masks.
+    pub fn mask_or(&mut self, a: Ix, b: Ix) -> Ix {
+        if self.lane_mask_facts(a).is_none() || self.lane_mask_facts(b).is_none() {
+            return Ix::NONE;
+        }
+        let (fa, fb) = (self.mask_facts(a), self.mask_facts(b));
+        let common: Vec<(Ix, bool)> = fa.into_iter().filter(|x| fb.contains(x)).collect();
+        self.lane_mask(common, None)
+    }
 
     /// Which kinds of leaf the value depends on (`LEAF_*`); memoised.
     pub fn leaves(&mut self, ix: Ix) -> u8 {
@@ -798,7 +846,8 @@ impl Interner {
             Node::Entry(EntryReg::WorkitemIdPacked) => LEAF_LANE,
             Node::Entry(_) => LEAF_WG,
             Node::Load(_) | Node::Ent(_) | Node::Carry { .. } | Node::LaneMask(_) => LEAF_OTHER,
-            Node::Lo(a)
+            Node::FirstLane(a)
+            | Node::Lo(a)
             | Node::Hi(a)
             | Node::Sra31(a)
             | Node::Shl32(a, _)
@@ -1021,6 +1070,7 @@ fn to_expr(
         | Node::MaxU(..)
         | Node::Sel(..)
         | Node::MulSU24(..)
+        | Node::FirstLane(_)
         | Node::LaneMask(_) => return Err("witness-unsupported-op"),
         Node::Lo(_) | Node::Hi(_) | Node::Sra31(_) | Node::Carry { .. } => {
             return Err("witness-unmatched-half")

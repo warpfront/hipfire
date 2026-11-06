@@ -255,10 +255,51 @@ pub struct WgBoundRecord {
     pub bound: u64,
 }
 
-/// The record dword at `offset`, masked with `mask`, equals `value`.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// The relation a [`WgRequirementRecord`] asserts on a record dword `d`.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequireOp {
+    /// `(d & mask) == value` (the original, default meaning).
+    #[default]
+    MaskEq,
+    /// `d <= value` (unsigned); `mask` is `0xffff_ffff`.
+    LeU,
+    /// `d >= value` (unsigned); `mask` is `0xffff_ffff`.
+    GeU,
+    /// `value * grid_extent[mask] <= d` in 64-bit arithmetic, where `mask`
+    /// is the grid axis (0 x, 1 y, 2 z) and the extent is the task's
+    /// virtual grid `gx, gy, gz`.
+    GridLe,
+}
+
+impl RequireOp {
+    fn is_default(&self) -> bool {
+        *self == RequireOp::MaskEq
+    }
+
+    /// Whether dword `d` satisfies `op` against `mask` and `value`, for a
+    /// task whose virtual grid extents are `grid`. A `GridLe` axis other
+    /// than 0..=2 never holds.
+    pub fn holds(self, d: u32, mask: u32, value: u32, grid: [u32; 3]) -> bool {
+        match self {
+            RequireOp::MaskEq => d & mask == value,
+            RequireOp::LeU => d <= value,
+            RequireOp::GeU => d >= value,
+            RequireOp::GridLe => grid
+                .get(mask as usize)
+                .is_some_and(|&g| u64::from(value) * u64::from(g) <= u64::from(d)),
+        }
+    }
+}
+
+/// The record dword at `offset` satisfies `op` (default: masked with `mask`,
+/// equals `value`). An unknown `op` fails to deserialize: the receipt is
+/// refused.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct WgRequirementRecord {
     pub offset: u32,
+    #[serde(default, skip_serializing_if = "RequireOp::is_default")]
+    pub op: RequireOp,
     pub mask: u32,
     pub value: u32,
 }
@@ -287,6 +328,24 @@ pub struct ArenaTemplateRecord {
     /// them, so such receipts digest and serialize as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wg_footprints: Vec<WgFootprintRecord>,
+    /// Hidden grid arguments the template's body loads (block counts, group
+    /// sizes, remainders, `grid_dims`), as record offsets: inside the pool
+    /// region the record is the body's kernarg block, so the host must
+    /// declare each offset as a railgun scalar and tie the task header grid
+    /// to the block counts. Absent when the body reads none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_grid: Vec<HiddenGridRecord>,
+}
+
+/// One hidden grid argument a template's body loads: `record_offset` is its
+/// kernarg offset (2-aligned; `block_count_*` 4-aligned), `kind` the hidden value kind without the
+/// `hidden_` prefix (`block_count_x|y|z`, `group_size_x|y|z`,
+/// `remainder_x|y|z`, `grid_dims`; free-form, only `block_count_*` is tied to
+/// the task header grid).
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct HiddenGridRecord {
+    pub record_offset: u32,
+    pub kind: String,
 }
 
 /// A descriptor arena of a kernel: the pointer argument that holds an array
@@ -361,6 +420,28 @@ impl DescriptorArenaRecord {
                 }
                 if f.requires.iter().any(|r| r.offset % 4 != 0) {
                     return bad("a workgroup requirement offset is not 4-aligned");
+                }
+                if f.requires.iter().any(|r| match r.op {
+                    RequireOp::MaskEq => false,
+                    RequireOp::LeU | RequireOp::GeU => r.mask != u32::MAX,
+                    RequireOp::GridLe => r.mask > 2,
+                }) {
+                    return bad(
+                        "an ordering workgroup requirement has a bad mask (le_u/ge_u: 0xffffffff, grid_le: axis 0..=2)",
+                    );
+                }
+            }
+            for (j, h) in t.hidden_grid.iter().enumerate() {
+                if h.record_offset % 2 != 0
+                    || (h.kind.starts_with("block_count_") && h.record_offset % 4 != 0)
+                {
+                    return bad("a hidden grid offset is misaligned (2-byte kinds 2-aligned, block counts 4-aligned)");
+                }
+                if t.hidden_grid[..j]
+                    .iter()
+                    .any(|o| o.record_offset == h.record_offset)
+                {
+                    return bad("duplicate hidden grid offset in a template");
                 }
             }
             for (j, s) in t.sealed_tables.iter().enumerate() {
@@ -986,6 +1067,7 @@ mod tests {
                 }],
                 sealed_tables: vec![],
                 wg_footprints: vec![],
+                hidden_grid: vec![],
             }],
         }
     }
@@ -1007,6 +1089,7 @@ mod tests {
             }],
             requires: vec![WgRequirementRecord {
                 offset: 28,
+                op: RequireOp::MaskEq,
                 mask: 0xffff,
                 value: 128,
             }],
@@ -1021,6 +1104,32 @@ mod tests {
         let mut b = a.clone();
         b.templates[0].wg_footprints[0].axes.clear();
         assert!(b.validate("k").is_err());
+        // Ordering requirements: mask must be all ones; the default op is
+        // omitted from the serialization; an unknown op is refused.
+        let mut b = a.clone();
+        b.templates[0].wg_footprints[0].requires[0].op = RequireOp::LeU;
+        assert!(b.validate("k").is_err());
+        b.templates[0].wg_footprints[0].requires[0].mask = u32::MAX;
+        b.validate("k").unwrap();
+        let v = serde_json::to_value(&b.templates[0].wg_footprints[0].requires[0]).unwrap();
+        assert_eq!(v["op"], "le_u");
+        let v = serde_json::to_value(&a.templates[0].wg_footprints[0].requires[0]).unwrap();
+        assert!(v.get("op").is_none());
+        b.templates[0].wg_footprints[0].requires[0].op = RequireOp::GridLe;
+        assert!(b.validate("k").is_err(), "grid_le axis must be 0..=2");
+        b.templates[0].wg_footprints[0].requires[0].mask = 0;
+        b.validate("k").unwrap();
+        assert_eq!(
+            serde_json::to_value(&b.templates[0].wg_footprints[0].requires[0]).unwrap()["op"],
+            "grid_le"
+        );
+        assert!(RequireOp::GridLe.holds(64, 0, 8, [8, 1, 1]));
+        assert!(!RequireOp::GridLe.holds(63, 0, 8, [8, 1, 1]));
+        assert!(!RequireOp::GridLe.holds(64, 3, 8, [8, 1, 1]));
+        assert!(serde_json::from_str::<WgRequirementRecord>(
+            r#"{"offset":4,"op":"lt","mask":4294967295,"value":1}"#
+        )
+        .is_err());
     }
 
     fn sealed_table() -> SealedTableRecord {

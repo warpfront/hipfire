@@ -57,6 +57,10 @@ pub struct GroupOrdering {
     /// The edges are not from a certificate (`lab`: differential-verified,
     /// certificate pending).
     pending: bool,
+    /// Named lab reasons the pending ordering rests on beyond "no
+    /// certificate" (e.g. unproven inter-workgroup disjointness); each is
+    /// reported by the admission.
+    pending_reasons: Vec<String>,
     /// The member range a task-graph check ([`crate::task_graph`]) covered:
     /// every member's task headers were proven race-free and deadlock-free
     /// against its dispatcher protocol. A member that carries a task protocol
@@ -72,6 +76,7 @@ impl GroupOrdering {
         Self {
             edges: Vec::new(),
             pending: false,
+            pending_reasons: Vec::new(),
             task_graph: None,
         }
     }
@@ -82,6 +87,7 @@ impl GroupOrdering {
         Self {
             edges,
             pending: false,
+            pending_reasons: Vec::new(),
             task_graph: None,
         }
     }
@@ -106,8 +112,22 @@ impl GroupOrdering {
         Self {
             edges,
             pending: true,
+            pending_reasons: Vec::new(),
             task_graph: None,
         }
+    }
+
+    /// Lab only: name the reasons this pending ordering is admitted
+    /// uncertified; they are reported verbatim in the group's admission.
+    #[cfg(feature = "lab")]
+    pub fn with_pending_reasons(mut self, reasons: Vec<String>) -> Self {
+        self.pending_reasons = reasons;
+        self
+    }
+
+    /// The named pending reasons ([`GroupOrdering::with_pending_reasons`]).
+    pub fn pending_reasons(&self) -> &[String] {
+        &self.pending_reasons
     }
 
     pub fn edges(&self) -> &[OrderedEdge] {
