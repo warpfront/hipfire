@@ -591,6 +591,12 @@ pub fn state_census_with_forward(
         None => crate::gpu_forward::qwen4_forward_device_bytes(config, chunk_rows, mode)
             .ok_or_else(|| overflow("forward resources"))?,
     };
+    // `topology.hetero_experts`: the primary's prefill exchange buffers and the
+    // layer-major arena, allocated after placement, are chunk-sized forward
+    // resources too.
+    let forward = forward
+        .checked_add(crate::hetero::primary_device_bytes(config, chunk_rows))
+        .ok_or_else(|| overflow("forward resources"))?;
     Ok(StateCensus {
         qsa_context,
         state,
