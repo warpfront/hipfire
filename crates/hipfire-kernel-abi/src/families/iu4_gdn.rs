@@ -417,7 +417,7 @@ const DOMAIN: &[DomainRuleV1] = &[
     DomainRuleV1 {
         rule: Rule::AtMost(V_DESC_BYTES, U32_MAX),
         why:
-            "gdn_epilogue.rs OUTD num_records = N * heads * 256 (v: 48 heads) is a 32-bit s_mul_i32",
+            "gdn_epilogue.rs OUTD num_records = N * heads * 256 (v: 48 heads) is a 32-bit s_mul_i32 (inferred from the generator source, not hardware-observed)",
     },
 ];
 
