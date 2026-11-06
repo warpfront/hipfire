@@ -1061,6 +1061,7 @@ fn main() {
     if let Some(model) = &startup_model {
         hipfire_loader::prepare_host_memory_for(model);
     }
+    hipfire_loader::prepare_dispatch();
     reserve_and_verify_gpus(&mut gpu_locks).unwrap_or_else(|error| {
         eprintln!("FATAL: {error}");
         std::process::exit(1);

@@ -31,7 +31,7 @@ pub use error::{
 pub use ffi::kernel_timing::{
     reject_kernel_timing_backend, KernelTimingCoverage, KernelTimingPool, KernelTimingReport,
 };
-pub use ffi::{arm_hip_fault, keep_host_memory_out_of_reclaim};
+pub use ffi::{arm_hip_fault, dispatch_on_worker_threads, keep_host_memory_out_of_reclaim};
 pub use ffi::{launch_counters, memory_effects};
 pub use ffi::{
     Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp,
