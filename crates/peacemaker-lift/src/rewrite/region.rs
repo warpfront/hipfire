@@ -527,6 +527,8 @@ fn barrier_participation(body: &Body, waves: u32) -> Result<(usize, usize, Strin
         vcc: bool,
         /// EXEC differs between waves (full in every wave until a per-wave write).
         exec: bool,
+        /// The instruction that made SCC / VCC / EXEC per-wave (diagnostics).
+        why: [Option<String>; 3],
     }
     let mut at: Vec<Option<U>> = vec![None; n];
     at[0] = Some(U::default());
@@ -568,8 +570,10 @@ fn barrier_participation(body: &Body, waves: u32) -> Result<(usize, usize, Strin
                     }
                 }
             }
+            let text = || format!("{name} {:?}", e.uses);
             if e.implicit.writes & ImplicitSet::SCC != 0 {
                 u.scc = varying;
+                u.why[0] = varying.then(text);
             }
             let defines = |lo: u16| {
                 e.defs.iter().any(|r| {
@@ -578,10 +582,12 @@ fn barrier_participation(body: &Body, waves: u32) -> Result<(usize, usize, Strin
             };
             if e.implicit.writes & ImplicitSet::VCC != 0 || defines(106) {
                 u.vcc = varying;
+                u.why[1] = varying.then(text);
             }
             if e.implicit.writes & ImplicitSet::EXEC != 0 || defines(126) {
                 // v_cmpx / saveexec from a VALU compare: per-wave from here on
                 u.exec = varying || name.starts_with("v_cmpx");
+                u.why[2] = u.exec.then(text);
             }
         }
         out[bi] = u.clone();
@@ -594,6 +600,7 @@ fn barrier_participation(body: &Body, waves: u32) -> Result<(usize, usize, Strin
                     scc: old.scc | u.scc,
                     vcc: old.vcc | u.vcc,
                     exec: old.exec | u.exec,
+                    why: [0, 1, 2].map(|i| old.why[i].clone().or_else(|| u.why[i].clone())),
                 },
             };
             if at[si].as_ref() != Some(&next) {
@@ -603,6 +610,7 @@ fn barrier_participation(body: &Body, waves: u32) -> Result<(usize, usize, Strin
         }
     }
     let mut divergent_blocks = Vec::new();
+    let mut why_of = BTreeMap::new();
     let (mut uniform, mut divergent) = (0, 0);
     for (bi, block) in body.blocks.iter().enumerate() {
         if let Terminator::Branch { cond, .. } = block.term {
@@ -614,6 +622,18 @@ fn barrier_participation(body: &Body, waves: u32) -> Result<(usize, usize, Strin
             if per_wave {
                 divergent += 1;
                 divergent_blocks.push(bi);
+                let k = match cond {
+                    Cond::Scc0 | Cond::Scc1 => 0,
+                    Cond::Vccz | Cond::Vccnz => 1,
+                    Cond::Execz | Cond::Execnz => 2,
+                };
+                why_of.insert(
+                    bi,
+                    format!(
+                        "{cond:?} per-wave because of `{}`",
+                        out[bi].why[k].clone().unwrap_or_default()
+                    ),
+                );
             } else {
                 uniform += 1;
             }
@@ -709,7 +729,7 @@ fn barrier_participation(body: &Body, waves: u32) -> Result<(usize, usize, Strin
             while let Some(y) = st.pop() {
                 if y == x {
                     return Err(format!(
-                        "barrier participation: block {x} repeats a barrier on a cycle under the per-wave branch of block {bi}"
+                        "barrier participation: block {x} repeats a barrier on a cycle under the per-wave branch of block {bi} ({})", why_of[&bi]
                     ));
                 }
                 if seen.insert(y) {
@@ -750,7 +770,8 @@ fn barrier_participation(body: &Body, waves: u32) -> Result<(usize, usize, Strin
             .collect();
         if counts.len() != 1 || counts.iter().any(|(l, h)| l != h) {
             return Err(format!(
-                "barrier participation: the paths from the per-wave branch of block {bi} to its post-dominator {} pass different numbers of barriers {counts:?}; a {waves}-wave region would pair a barrier with another wave's dispatcher barrier",
+                "barrier participation: the paths from the per-wave branch of block {bi} ({}) to its post-dominator {} pass different numbers of barriers {counts:?}; a {waves}-wave region would pair a barrier with another wave's dispatcher barrier",
+                why_of[&bi],
                 if ipdom == n { "(the exit)".to_string() } else { ipdom.to_string() }
             ));
         }
