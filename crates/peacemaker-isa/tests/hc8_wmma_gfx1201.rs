@@ -174,6 +174,7 @@ enum QKind {
     /// Small magnitudes (E4M3 exponent field 4..=9, int8 in -7..=7).
     Small,
     /// Mostly zero.
+    #[allow(dead_code)]
     Sparse,
 }
 
@@ -292,9 +293,11 @@ fn gen_scale(rng: &mut Rng, m: usize, act: bool) -> Vec<f32> {
 
 /// A weight matrix with its scale: raw bytes, swizzled bytes, host-decoded BF16.
 struct Case {
+    #[allow(dead_code)]
     fmt: Fmt,
     m: usize,
     k: usize,
+    #[allow(dead_code)]
     raw: Vec<u8>,
     swz: Vec<u8>,
     wbf: Vec<u16>,

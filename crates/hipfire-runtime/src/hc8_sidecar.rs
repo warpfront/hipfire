@@ -34,7 +34,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -579,6 +579,7 @@ pub fn write_hc8_sidecar(base_path: &Path, output: &Path) -> Result<Hc8WriteRepo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use crate::hfq::{write_hfqm_package_mem, HfqMemTensor};
     use rdna_compute::hc8::{dequant_rowmajor, quantize_e4m3_rows, Hc8Fmt};
     use rdna_compute::hc8_weight::hc8_swizzled_offset;
