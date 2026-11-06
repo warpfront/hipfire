@@ -12215,7 +12215,10 @@ pub mod memory {
                 hc8_sidecar_path(Path::new("/m/qwen3.8-flash-next.mq4-xts")),
                 PathBuf::from("/m/qwen3.8-flash-next.mq4-xts.hc8")
             );
-            assert_eq!(hc8_sidecar_path(Path::new("model")), PathBuf::from("model.hc8"));
+            assert_eq!(
+                hc8_sidecar_path(Path::new("model")),
+                PathBuf::from("model.hc8")
+            );
         }
 
         #[test]

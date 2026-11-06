@@ -1097,7 +1097,15 @@ fn append_hc8_read(
         let x = normalized.sub_offset(start * wide, take * wide);
         let l = low.sub_offset(start * rank, take * rank);
         let u = up.sub_offset(start * wide, take * wide);
-        gpu.hc8_gemm_tensor(down.buf, down.m, down.k, &x, &l, take, Some(1.0 / branches as f32))?;
+        gpu.hc8_gemm_tensor(
+            down.buf,
+            down.m,
+            down.k,
+            &x,
+            &l,
+            take,
+            Some(1.0 / branches as f32),
+        )?;
         gpu.hc8_gemm_tensor(upw.buf, upw.m, upw.k, &l, &u, take, None)?;
         start += take;
     }

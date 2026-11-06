@@ -101,13 +101,14 @@ pub fn hc8_sidecar_saved_bytes(
     enabled: bool,
     config: &Qwen4Config,
 ) -> Result<u64, String> {
-    Ok(resolve(hfq, model_path, enabled, config, false)?
-        .map_or(0, |sidecar| {
+    Ok(
+        resolve(hfq, model_path, enabled, config, false)?.map_or(0, |sidecar| {
             sidecar
                 .bound
                 .replaced_bytes()
                 .saturating_sub(sidecar.bound.payload_bytes())
-        }))
+        }),
+    )
 }
 
 fn resolve(

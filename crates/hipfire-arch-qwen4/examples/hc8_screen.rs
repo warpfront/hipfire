@@ -131,10 +131,9 @@ fn dot_ref(w: &[f32], m: usize, k: usize, x: &[f32], nr: usize) -> Vec<f64> {
 /// `max|a - r| / max|r|`.
 fn max_rel(a: &[f32], r: &[f32]) -> f64 {
     let den = r.iter().fold(0.0f64, |m, &v| m.max(f64::from(v).abs()));
-    let num = a
-        .iter()
-        .zip(r)
-        .fold(0.0f64, |m, (&x, &y)| m.max((f64::from(x) - f64::from(y)).abs()));
+    let num = a.iter().zip(r).fold(0.0f64, |m, (&x, &y)| {
+        m.max((f64::from(x) - f64::from(y)).abs())
+    });
     if den == 0.0 {
         num
     } else {
@@ -230,7 +229,9 @@ impl Timer {
     fn time<F: FnMut(&mut Gpu) -> R<()>>(&self, gpu: &mut Gpu, mut f: F) -> R<Stat> {
         let mut v = Vec::with_capacity(self.calls);
         for i in 0..self.warm + self.calls {
-            gpu.hip.memset(&self.flush, i as i32 & 0x7f, FLUSH_BYTES).map_err(es)?;
+            gpu.hip
+                .memset(&self.flush, i as i32 & 0x7f, FLUSH_BYTES)
+                .map_err(es)?;
             let start = gpu.hip.event_create().map_err(es)?;
             let stop = gpu.hip.event_create().map_err(es)?;
             gpu.hip.event_record(&start, None).map_err(es)?;
@@ -288,7 +289,15 @@ impl Out {
         }));
     }
 
-    fn unavailable(&mut self, tensor: &str, family: &str, rows: usize, arm: &str, geom: &str, why: &str) {
+    fn unavailable(
+        &mut self,
+        tensor: &str,
+        family: &str,
+        rows: usize,
+        arm: &str,
+        geom: &str,
+        why: &str,
+    ) {
         println!("{tensor:<9} {family:<5} rows={rows:<3} {arm:<12} {geom:<8} UNAVAILABLE {why}");
         self.recs.push(json!({
             "tensor": tensor, "family": family, "rows": rows, "arm": arm, "geom": geom,
@@ -326,8 +335,10 @@ fn build_q(gpu: &mut Gpu, hc: &Hc, fmt: Hc8Fmt) -> R<Q> {
     };
     let (dq_q, dq_s) = quant(&hc.down_h, RANK, WIDE);
     let (up_q, up_s) = quant(&hc.up_h, WIDE, RANK);
-    let down = Hc8Weight::upload(gpu, fmt, &swizzle_hc8(&dq_q, RANK, WIDE), &dq_s, RANK, WIDE).map_err(es)?;
-    let up = Hc8Weight::upload(gpu, fmt, &swizzle_hc8(&up_q, WIDE, RANK), &up_s, WIDE, RANK).map_err(es)?;
+    let down = Hc8Weight::upload(gpu, fmt, &swizzle_hc8(&dq_q, RANK, WIDE), &dq_s, RANK, WIDE)
+        .map_err(es)?;
+    let up = Hc8Weight::upload(gpu, fmt, &swizzle_hc8(&up_q, WIDE, RANK), &up_s, WIDE, RANK)
+        .map_err(es)?;
     Ok(Q {
         fmt,
         raw: [(dq_q.clone(), dq_s.clone()), (up_q.clone(), up_s.clone())],
@@ -475,12 +486,17 @@ fn run_hc(
         std::fs::create_dir_all(dir).map_err(es)?;
         let f32le = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
         for q in qs {
-            for (i, (fam, m, k, x)) in [("down", RANK, WIDE, &xn_h), ("up", WIDE, RANK, &low_h.to_vec())]
-                .into_iter()
-                .enumerate()
+            for (i, (fam, m, k, x)) in [
+                ("down", RANK, WIDE, &xn_h),
+                ("up", WIDE, RANK, &low_h.to_vec()),
+            ]
+            .into_iter()
+            .enumerate()
             {
                 let base = dir.join(format!("{}_{}_{}", hc.name, fam, q.fmt.name()));
-                let w = |ext: &str, b: &[u8]| std::fs::write(format!("{}.{ext}", base.display()), b).map_err(es);
+                let w = |ext: &str, b: &[u8]| {
+                    std::fs::write(format!("{}.{ext}", base.display()), b).map_err(es)
+                };
                 w("q.u8", &q.raw[i].0)?;
                 w("s.f32", &f32le(&q.raw[i].1))?;
                 w("x.f32", &f32le(&x[..MAX_ROWS * k]))?;
@@ -652,7 +668,8 @@ fn run_hc(
                         let chk = json!({"max_rel_act": e_act, "max_rel_set": e_set,
                             "row_inv_bad_rows": inv, "pass": ok});
                         if !ok {
-                            out.fails.push(format!("{name} {arm} {gs} rows={rows}: {chk}"));
+                            out.fails
+                                .push(format!("{name} {arm} {gs} rows={rows}: {chk}"));
                         }
                         out.timed(&name, "down", rows, arm, &gs, q.down.bytes(), st, chk);
                     }
@@ -675,9 +692,11 @@ fn run_hc(
                             ok &= bad == 0;
                             inv = json!(bad);
                         }
-                        let chk = json!({"max_rel_set": e_set, "row_inv_bad_rows": inv, "pass": ok});
+                        let chk =
+                            json!({"max_rel_set": e_set, "row_inv_bad_rows": inv, "pass": ok});
                         if !ok {
-                            out.fails.push(format!("{name} {arm} {gs} rows={rows}: {chk}"));
+                            out.fails
+                                .push(format!("{name} {arm} {gs} rows={rows}: {chk}"));
                         }
                         out.timed(&name, "up", rows, arm, &gs, q.up.bytes(), st, chk);
                         let full = tm.time(gpu, |gp| {
@@ -745,7 +764,8 @@ fn summarize(recs: &[Value]) -> Vec<Value> {
         for fam in fams {
             for (cname, pred) in classes {
                 // Mean median over the class's rows per (arm, geom); incumbents are always complete.
-                let mut agg: std::collections::BTreeMap<(String, String), (f64, usize)> = Default::default();
+                let mut agg: std::collections::BTreeMap<(String, String), (f64, usize)> =
+                    Default::default();
                 let mut nrows = std::collections::BTreeSet::new();
                 for r in recs {
                     if r["tensor"] != tensor || r["status"] != "ok" {
@@ -765,7 +785,10 @@ fn summarize(recs: &[Value]) -> Vec<Value> {
                     }
                     nrows.insert(rows);
                     let e = agg
-                        .entry((r["arm"].as_str().unwrap().into(), r["geom"].as_str().unwrap().into()))
+                        .entry((
+                            r["arm"].as_str().unwrap().into(),
+                            r["geom"].as_str().unwrap().into(),
+                        ))
                         .or_insert((0.0, 0));
                     e.0 += r["med_us"].as_f64().unwrap();
                     e.1 += 1;
@@ -814,8 +837,16 @@ fn run() -> R<()> {
     let mut out = Out::default();
     for name in ["attn", "mlp"] {
         let p = format!("{name}_hyper_connection");
-        let down_b = hfq.bf16(cli.layer, &format!("{p}.input_mix_weight_down.weight"), &[RANK, WIDE])?;
-        let up_b = hfq.bf16(cli.layer, &format!("{p}.input_mix_weight_up.weight"), &[WIDE, RANK])?;
+        let down_b = hfq.bf16(
+            cli.layer,
+            &format!("{p}.input_mix_weight_down.weight"),
+            &[RANK, WIDE],
+        )?;
+        let up_b = hfq.bf16(
+            cli.layer,
+            &format!("{p}.input_mix_weight_up.weight"),
+            &[WIDE, RANK],
+        )?;
         let norm_b = hfq.bf16(cli.layer, &format!("{p}.hc_norm.weight"), &[WIDE])?;
         let hc = Hc {
             name: if name == "attn" { "attn" } else { "mlp" },

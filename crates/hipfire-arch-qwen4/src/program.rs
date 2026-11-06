@@ -461,7 +461,12 @@ pub fn validate_final_hyper(
     {
         // The HC8 sidecar mixers (exact gfx1201): `execute_hyper_read_inner` reads them through the
         // `hc8_gemm` decode route or expands them exactly to BF16.
-        require_hc8_weight(&weights.input_mix_down, low, wide, "final HC input mix down")?;
+        require_hc8_weight(
+            &weights.input_mix_down,
+            low,
+            wide,
+            "final HC input mix down",
+        )?;
         require_hc8_weight(&weights.input_mix_up, wide, low, "final HC input mix up")?;
     } else {
         require_projection_weight(

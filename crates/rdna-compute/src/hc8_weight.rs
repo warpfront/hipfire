@@ -18,7 +18,6 @@ use crate::{DType, Gpu, GpuTensor};
 use hip_bridge::{HipError, HipResult};
 use std::ffi::c_void;
 
-
 fn err(message: impl AsRef<str>) -> HipError {
     HipError::new(0, &format!("hc8 weight: {}", message.as_ref()))
 }
@@ -56,7 +55,8 @@ impl Gpu {
         if w.dtype != DType::HC8E4M3Row {
             return Err(err(format!("weight is {:?}, not HC8E4M3Row", w.dtype)));
         }
-        let bytes = hc8_payload_bytes(m, k).ok_or_else(|| err(format!("[{m}, {k}] is not an HC8 shape")))?;
+        let bytes = hc8_payload_bytes(m, k)
+            .ok_or_else(|| err(format!("[{m}, {k}] is not an HC8 shape")))?;
         if w.buf.size() < bytes {
             return Err(err(format!(
                 "weight holds {} bytes, an [{m}, {k}] payload is {bytes}",
@@ -127,7 +127,13 @@ impl Gpu {
 
     /// Exact expansion of an HC8 weight into `dst` (BF16 or F16, `m * k` elements, row-major).
     /// `dst` must not alias `w`.
-    pub fn hc8_dequant(&mut self, w: &GpuTensor, m: usize, k: usize, dst: &GpuTensor) -> HipResult<()> {
+    pub fn hc8_dequant(
+        &mut self,
+        w: &GpuTensor,
+        m: usize,
+        k: usize,
+        dst: &GpuTensor,
+    ) -> HipResult<()> {
         self.hc8_check(w, m, k)?;
         let entry = match dst.dtype {
             DType::BF16 => "hc8_dequant_bf16",
@@ -135,29 +141,55 @@ impl Gpu {
             other => return Err(err(format!("dequant target is {other:?}, not BF16 / F16"))),
         };
         if dst.buf.size() < m * k * 2 {
-            return Err(err(format!("dequant target holds {} bytes, needs {}", dst.buf.size(), m * k * 2)));
+            return Err(err(format!(
+                "dequant target holds {} bytes, needs {}",
+                dst.buf.size(),
+                m * k * 2
+            )));
         }
         self.hc8_dequant_raw(w.buf.as_ptr(), m, k, dst.buf.as_ptr(), entry)
     }
 
     /// [`Gpu::hc8_dequant`] to a raw F16 destination (the shadow cache's allocation).
-    pub(crate) fn hc8_dequant_f16_ptr(&mut self, w: &GpuTensor, m: usize, k: usize, dst: *mut c_void) -> HipResult<()> {
+    pub(crate) fn hc8_dequant_f16_ptr(
+        &mut self,
+        w: &GpuTensor,
+        m: usize,
+        k: usize,
+        dst: *mut c_void,
+    ) -> HipResult<()> {
         self.hc8_check(w, m, k)?;
         self.hc8_dequant_raw(w.buf.as_ptr(), m, k, dst, "hc8_dequant_f16")
     }
 
     /// [`Gpu::hc8_dequant_f16_ptr`] over a raw payload pointer (the borrowed-shadow rebuild keeps
     /// only addresses). The caller guarantees `src` holds the `m * k + 4 * m` byte payload.
-    pub(crate) fn hc8_dequant_f16_at(&mut self, src: *mut c_void, m: usize, k: usize, dst: *mut c_void) -> HipResult<()> {
+    pub(crate) fn hc8_dequant_f16_at(
+        &mut self,
+        src: *mut c_void,
+        m: usize,
+        k: usize,
+        dst: *mut c_void,
+    ) -> HipResult<()> {
         if hc8_payload_bytes(m, k).is_none() {
             return Err(err(format!("[{m}, {k}] is not an HC8 shape")));
         }
         self.hc8_dequant_raw(src, m, k, dst, "hc8_dequant_f16")
     }
 
-    fn hc8_dequant_raw(&mut self, src: *mut c_void, m: usize, k: usize, dst: *mut c_void, entry: &str) -> HipResult<()> {
+    fn hc8_dequant_raw(
+        &mut self,
+        src: *mut c_void,
+        m: usize,
+        k: usize,
+        dst: *mut c_void,
+        entry: &str,
+    ) -> HipResult<()> {
         let n = m * k;
-        let n_u32 = u32::try_from(n).ok().filter(|&n| n < (1 << 31)).ok_or_else(|| err("weight too large"))?;
+        let n_u32 = u32::try_from(n)
+            .ok()
+            .filter(|&n| n < (1 << 31))
+            .ok_or_else(|| err("weight too large"))?;
         hc8::verify_image().map_err(err)?;
         self.bind_thread()?;
         self.ensure_embedded_kernel(hc8::MODULE, hc8::IMAGE, entry)?;
@@ -185,7 +217,13 @@ impl Gpu {
     /// exact BF16 expansion of `w`. The contents are valid until the next call for the same slot;
     /// caches keyed on the scratch pointer are NOT valid (the F16 shadow keys on the E4M3 weight).
     /// Allocated once per slot and never regrown for the HC shapes; a different size errors.
-    pub fn hc8_bf16_scratch(&mut self, slot: usize, w: &GpuTensor, m: usize, k: usize) -> HipResult<GpuTensor> {
+    pub fn hc8_bf16_scratch(
+        &mut self,
+        slot: usize,
+        w: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<GpuTensor> {
         self.hc8_check(w, m, k)?;
         if slot >= self.scratch.hc8_bf16.len() {
             return Err(err(format!("scratch slot {slot} out of range")));
@@ -193,13 +231,17 @@ impl Gpu {
         let bytes = m * k * 2;
         if self.scratch.hc8_bf16[slot].is_none() {
             if self.replay.is_recording() || self.graphs.capture_mode {
-                return Err(err("the BF16 scratch cannot be first allocated during recording / capture"));
+                return Err(err(
+                    "the BF16 scratch cannot be first allocated during recording / capture",
+                ));
             }
             self.invalidate_for_scratch_growth();
             let scratch = self.alloc_tensor(&[m * k], DType::BF16)?;
             self.scratch.hc8_bf16[slot] = Some(scratch);
         }
-        let scratch = self.scratch.hc8_bf16[slot].as_ref().expect("allocated above");
+        let scratch = self.scratch.hc8_bf16[slot]
+            .as_ref()
+            .expect("allocated above");
         if scratch.buf.size() != bytes {
             return Err(err(format!(
                 "scratch slot {slot} is {} bytes, [{m}, {k}] needs {bytes}",
@@ -235,11 +277,17 @@ mod tests {
     #[test]
     fn dequant_offsets_invert_the_swizzle() {
         for (m, k) in [(32usize, 64usize), (48, 96), (64, 320)] {
-            let rowmajor: Vec<u8> = (0..m * k).map(|i| (i.wrapping_mul(131) >> 3) as u8).collect();
+            let rowmajor: Vec<u8> = (0..m * k)
+                .map(|i| (i.wrapping_mul(131) >> 3) as u8)
+                .collect();
             let swizzled = hc8::swizzle_hc8(&rowmajor, m, k);
             for r in 0..m {
                 for c in 0..k {
-                    assert_eq!(swizzled[hc8_swizzled_offset(r, c, k)], rowmajor[r * k + c], "({r}, {c}) of [{m}, {k}]");
+                    assert_eq!(
+                        swizzled[hc8_swizzled_offset(r, c, k)],
+                        rowmajor[r * k + c],
+                        "({r}, {c}) of [{m}, {k}]"
+                    );
                 }
             }
         }

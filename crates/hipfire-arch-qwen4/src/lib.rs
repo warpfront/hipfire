@@ -65,6 +65,7 @@ pub mod expert_unit_tail;
 pub(crate) mod expert_unit_tail_rank;
 pub mod gpu_forward;
 pub mod gpu_forward_lanes;
+pub mod hc8_sidecar;
 /// Measured host-to-device link class (narrow-link G2 and chunk defaults).
 pub mod host_link;
 pub mod kv_backend;
@@ -120,7 +121,6 @@ pub mod state;
 pub mod state_parity;
 pub mod sym_verdict_cache;
 pub(crate) mod trunk_a8;
-pub mod hc8_sidecar;
 pub mod trunk_overlay;
 pub(crate) mod trunk_route;
 pub mod weights;
@@ -151,6 +151,7 @@ pub use gpu_forward::{
     QWEN4_COMPACT_SCRATCH_ENV,
 };
 pub use gpu_forward_lanes::{WaveHead, WaveLane};
+pub use hc8_sidecar::{hc8_sidecar_saved_bytes, resolve_hc8_sidecar, Qwen4Hc8Sidecar};
 pub use kv_backend::{qwen4_vmm_refusal, qwen4_vmm_supported, Qwen4ContextCommit, Qwen4KvBackend};
 pub use ple::{
     PleHashMetadata, PleHistory, PleMetadataError, PleRowId, PLE_HEAD_COUNT, PLE_HEAD_OFFSETS,
@@ -162,5 +163,4 @@ pub use state::{resolve_gdn_format, resolve_qsa_format, resolve_state_format, Qw
 pub use trunk_overlay::{
     resolve_trunk_overlay, trunk_overlay_extra_bytes, Qwen4TrunkOverlay, TrunkOverlayPolicy,
 };
-pub use hc8_sidecar::{hc8_sidecar_saved_bytes, resolve_hc8_sidecar, Qwen4Hc8Sidecar};
 pub use weights::{Qwen4ManifestIdentity, Qwen4TierRecipe};

@@ -3684,7 +3684,11 @@ mod tests {
             "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
         ] {
             let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
-            assert_eq!(unset.qwen4_hc8_enabled(), arch == "gfx1201", "{arch}: unset");
+            assert_eq!(
+                unset.qwen4_hc8_enabled(),
+                arch == "gfx1201",
+                "{arch}: unset"
+            );
             let off = FeatureFlags::from_lookup(arch, with("0"));
             assert!(!off.qwen4_hc8_enabled(), "{arch}: 0");
             let on = FeatureFlags::from_lookup(arch, with("1"));

@@ -8360,7 +8360,10 @@ mod weight_store_arena_replacement {
         assert_eq!(plan, vec![(0, 0)]);
         assert_eq!(skipped, 1);
         let none = plan_hc8_sidecar(&weights, &by_name, &payloads[1..]).unwrap_err();
-        assert!(none.contains("no resident HC mixer weight matched"), "{none}");
+        assert!(
+            none.contains("no resident HC mixer weight matched"),
+            "{none}"
+        );
     }
 
     #[test]
@@ -8380,18 +8383,19 @@ mod weight_store_arena_replacement {
         let weights = bf16(DType::BF16, span);
         let error = plan_hc8_sidecar(&weights, &hc8_index(&weights), &[hc8_payload(name, m, 128)])
             .unwrap_err();
-        assert!(error.contains("overlay") || error.contains("sidecar"), "{error}");
+        assert!(
+            error.contains("overlay") || error.contains("sidecar"),
+            "{error}"
+        );
         // Not BF16 any more.
         let weights = bf16(DType::MQ4G256V2, span);
-        let error =
-            plan_hc8_sidecar(&weights, &hc8_index(&weights), &[hc8_payload(name, m, k)])
-                .unwrap_err();
+        let error = plan_hc8_sidecar(&weights, &hc8_index(&weights), &[hc8_payload(name, m, k)])
+            .unwrap_err();
         assert!(error.contains("not BF16"), "{error}");
         // Wrong byte size.
         let weights = bf16(DType::BF16, span - 2);
-        let error =
-            plan_hc8_sidecar(&weights, &hc8_index(&weights), &[hc8_payload(name, m, k)])
-                .unwrap_err();
+        let error = plan_hc8_sidecar(&weights, &hc8_index(&weights), &[hc8_payload(name, m, k)])
+            .unwrap_err();
         assert!(error.contains("bytes"), "{error}");
         // Bad payload length.
         let weights = bf16(DType::BF16, span);

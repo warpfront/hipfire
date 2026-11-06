@@ -115,6 +115,7 @@ pub mod sidecar;
 pub mod slot_batch;
 pub mod spec;
 
+pub mod hc8_sidecar;
 pub mod ngram_mod;
 pub mod offload;
 pub mod spec_economics;
@@ -127,7 +128,6 @@ pub mod swap;
 pub mod tp_shard;
 #[cfg(feature = "deltanet")]
 pub mod triattn;
-pub mod hc8_sidecar;
 pub mod trunk_overlay;
 pub mod verified_cache;
 /// Shared-weight host protocol v1 (`HIPFIRE_WEIGHT_HOST`): identities, typed

@@ -1629,7 +1629,9 @@ fn execute_hyper_read_hc8_decode(
                         state_bf16: op.state_bf16,
                     },
                 ))?;
-                if let Some(write) = paired.filter(|write| hyper_pair_allrows_applies(gpu, op, write)) {
+                if let Some(write) =
+                    paired.filter(|write| hyper_pair_allrows_applies(gpu, op, write))
+                {
                     let gates = view(write.gates, 0, op.rows * write.branches);
                     hip(gpu.gemv_bf16_xf32_k4_rows(
                         write.block_inject.buf,
@@ -1660,11 +1662,24 @@ fn execute_hyper_read_hc8_decode(
     let rotated = rotate_into.filter(|r| {
         op.branches == 4 && op.hidden.is_multiple_of(256) && r.numel() >= op.rows * op.hidden
     });
-    if rotated.is_none() && op.branches == 4 && op.hidden.is_multiple_of(16) && upw.k.is_multiple_of(32) {
+    if rotated.is_none()
+        && op.branches == 4
+        && op.hidden.is_multiple_of(16)
+        && upw.k.is_multiple_of(32)
+    {
         // One launch: the up GEMM and the product `hyper_read_projected` branch mix
         // (`hc8_read_up_e4m3_n*`, word-equal to the two-launch pair below).
         return hip(gpu
-            .hc8_read_up_tensor(upw.buf, upw.m, upw.k, &low, &normalized, &mixed, op.rows, op.hidden)
+            .hc8_read_up_tensor(
+                upw.buf,
+                upw.m,
+                upw.k,
+                &low,
+                &normalized,
+                &mixed,
+                op.rows,
+                op.hidden,
+            )
             .map(|_| ()));
     }
     hip(gpu.hc8_gemm_tensor(upw.buf, upw.m, upw.k, &low, &up, op.rows, None))?;

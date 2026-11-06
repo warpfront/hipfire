@@ -14,10 +14,7 @@ use hipfire_runtime::hc8_sidecar::write_hc8_sidecar;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "hipfire-quantize hc8",
-    about = "Flash-Next HC8 sidecar tools"
-)]
+#[command(name = "hipfire-quantize hc8", about = "Flash-Next HC8 sidecar tools")]
 pub(crate) struct Hc8Cli {
     #[command(subcommand)]
     pub command: Hc8Command,
@@ -97,10 +94,9 @@ mod tests {
 
     #[test]
     fn parses_build_out_and_force() {
-        let cli = Hc8Cli::try_parse_from([
-            "hc8", "build", "--model", "m", "--out", "o.hc8", "--force",
-        ])
-        .unwrap();
+        let cli =
+            Hc8Cli::try_parse_from(["hc8", "build", "--model", "m", "--out", "o.hc8", "--force"])
+                .unwrap();
         let Hc8Command::Build(args) = cli.command;
         assert_eq!(args.out, Some(PathBuf::from("o.hc8")));
         assert!(args.force);

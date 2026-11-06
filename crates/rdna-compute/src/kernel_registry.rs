@@ -15087,7 +15087,10 @@ extern "C" __global__ void NAMED(int* p) {}
         assert_eq!(planned[0].module(), crate::hc8::MODULE);
         assert_eq!(planned[0].symbols(), crate::hc8::ROUTE_SYMBOLS.as_slice());
         assert!(plan("gfx1201", false, false).is_empty(), "no sidecar");
-        assert!(plan("gfx1201", true, true).is_empty(), "HIPFIRE_QWEN4_HC8=0");
+        assert!(
+            plan("gfx1201", true, true).is_empty(),
+            "HIPFIRE_QWEN4_HC8=0"
+        );
         assert!(plan("gfx1100", true, false).is_empty(), "other arch");
     }
 

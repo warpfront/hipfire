@@ -349,11 +349,7 @@ impl BoundHc8Sidecar {
 
     /// Total base (BF16) bytes of the tensors the sidecar replaces.
     pub fn replaced_bytes(&self) -> u64 {
-        self.manifest
-            .tensors
-            .iter()
-            .map(|t| t.base_data_size)
-            .sum()
+        self.manifest.tensors.iter().map(|t| t.base_data_size).sum()
     }
 
     /// Resident device bytes the sidecar adds on top of the base: payload minus
@@ -579,14 +575,16 @@ pub fn write_hc8_sidecar(base_path: &Path, output: &Path) -> Result<Hc8WriteRepo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use crate::hfq::{write_hfqm_package_mem, HfqMemTensor};
     use rdna_compute::hc8::{dequant_rowmajor, quantize_e4m3_rows, Hc8Fmt};
     use rdna_compute::hc8_weight::hc8_swizzled_offset;
+    use std::io::Write;
 
     const ARCH: u32 = 16;
-    const DOWN: &str = "model.language_model.layers.0.attn_hyper_connection.input_mix_weight_down.weight";
-    const UP: &str = "model.language_model.layers.0.attn_hyper_connection.input_mix_weight_up.weight";
+    const DOWN: &str =
+        "model.language_model.layers.0.attn_hyper_connection.input_mix_weight_down.weight";
+    const UP: &str =
+        "model.language_model.layers.0.attn_hyper_connection.input_mix_weight_up.weight";
     const OTHER: &str = "model.language_model.layers.0.other.weight";
 
     struct Rng(u64);
@@ -689,7 +687,11 @@ mod tests {
             }
             let e = (amax / 448.0).log2().ceil() as i32;
             assert_eq!(s[r], 2.0f32.powi(e), "row {r}");
-            assert_eq!(s[r].to_bits() & 0x007f_ffff, 0, "row {r} scale is not a power of two");
+            assert_eq!(
+                s[r].to_bits() & 0x007f_ffff,
+                0,
+                "row {r} scale is not a power of two"
+            );
         }
     }
 
@@ -733,7 +735,12 @@ mod tests {
                 to_le(&down),
             ),
             mem(OTHER, 13, &[4, 8], vec![5; 4 * 8]),
-            mem(UP, 16, &[up_shape[0] as u32, up_shape[1] as u32], to_le(&up)),
+            mem(
+                UP,
+                16,
+                &[up_shape[0] as u32, up_shape[1] as u32],
+                to_le(&up),
+            ),
         ];
         write_hfqm_package_mem(&base, ARCH, "{}", &tensors).unwrap();
         Fixture {
@@ -803,8 +810,7 @@ mod tests {
     fn builder_refuses_a_base_without_bf16_targets() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("b.hfq");
-        write_hfqm_package_mem(&base, ARCH, "{}", &[mem(OTHER, 13, &[4, 8], vec![0; 32])])
-            .unwrap();
+        write_hfqm_package_mem(&base, ARCH, "{}", &[mem(OTHER, 13, &[4, 8], vec![0; 32])]).unwrap();
         let err = write_hc8_sidecar(&base, &dir.path().join("o.hc8")).unwrap_err();
         assert!(err.contains("no BF16 hyper-connection"), "{err}");
     }

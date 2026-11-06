@@ -6935,9 +6935,10 @@ fn load_qwen4_rank_unscoped(
     };
     // An applied hc8 sidecar is a net saving (never a charge): the helper is
     // 0 for it, so placement keeps the manifest's BF16 sizes.
-    let overlay_extra_bytes = overlay_extra_bytes.saturating_add(hc8_sidecar.as_ref().map_or(0, |s| {
-        hipfire_arch_qwen4::expert_residency::hc8_net_charge(s.bound().net_bytes())
-    }));
+    let overlay_extra_bytes =
+        overlay_extra_bytes.saturating_add(hc8_sidecar.as_ref().map_or(0, |s| {
+            hipfire_arch_qwen4::expert_residency::hc8_net_charge(s.bound().net_bytes())
+        }));
     let placement_inputs = placement_inputs.map(|mut inputs| {
         inputs.0 = inputs
             .0

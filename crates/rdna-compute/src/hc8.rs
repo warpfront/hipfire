@@ -31,6 +31,7 @@ pub const GEOMS: [Hc8Geom; 5] = [
     Hc8Geom { mw: 8, kw: 1 },
     Hc8Geom { mw: 2, kw: 4 },
 ];
+// selector-receipt: receipts/selectors/hc8_max_rows.json
 pub const MAX_ROWS: usize = 64;
 /// Exports a sidecar-applied route binds: the decode geometries of [`default_geom`] (long K, short K), the fused
 /// read-up and the prefill dequant. The module also exports the other geometries and `i8`; the screen uses those.
@@ -126,7 +127,13 @@ impl Hc8Weight {
     }
 
     /// Quantize BF16 bits `[m, k]` row-major and upload.
-    pub fn from_bf16(gpu: &mut Gpu, fmt: Hc8Fmt, bf16: &[u16], m: usize, k: usize) -> HipResult<Self> {
+    pub fn from_bf16(
+        gpu: &mut Gpu,
+        fmt: Hc8Fmt,
+        bf16: &[u16],
+        m: usize,
+        k: usize,
+    ) -> HipResult<Self> {
         let (q, s) = match fmt {
             Hc8Fmt::E4m3 => quantize_e4m3_rows(bf16, m, k),
             Hc8Fmt::I8 => quantize_i8_rows(bf16, m, k),
@@ -350,9 +357,14 @@ pub fn hc8_gemm(
     gpu.bind_thread()?;
     gpu.ensure_embedded_kernel(MODULE, IMAGE, &name)?;
     let mut args = [0u8; KERNARG_BYTES];
-    for (i, p) in [w.q.buf.as_ptr(), w.s.buf.as_ptr(), x.buf.as_ptr(), y.buf.as_ptr()]
-        .into_iter()
-        .enumerate()
+    for (i, p) in [
+        w.q.buf.as_ptr(),
+        w.s.buf.as_ptr(),
+        x.buf.as_ptr(),
+        y.buf.as_ptr(),
+    ]
+    .into_iter()
+    .enumerate()
     {
         args[i * 8..i * 8 + 8].copy_from_slice(&(p as u64).to_le_bytes());
     }
@@ -386,7 +398,9 @@ pub fn hc8_read_up(
     rows: usize,
     hidden: usize,
 ) -> HipResult<String> {
-    use peacemaker_isa::kernels::hc8_wmma_gfx1201::{read_up_symbol, READ_UP_BLOCK, READ_UP_KERNARG_BYTES};
+    use peacemaker_isa::kernels::hc8_wmma_gfx1201::{
+        read_up_symbol, READ_UP_BLOCK, READ_UP_KERNARG_BYTES,
+    };
     if gpu.arch != "gfx1201" {
         return Err(err("requires exact gfx1201; no HIP fallback"));
     }
@@ -398,7 +412,10 @@ pub fn hc8_read_up(
     }
     let k = w.k;
     if hidden == 0 || hidden % 16 != 0 || w.m != 4 * hidden || k == 0 || k % 32 != 0 {
-        return Err(err(format!("read_up: weight [{}, {k}] is not [4 * hidden {hidden}, K % 32 == 0]", w.m)));
+        return Err(err(format!(
+            "read_up: weight [{}, {k}] is not [4 * hidden {hidden}, K % 32 == 0]",
+            w.m
+        )));
     }
     for (t, bytes, name) in [
         (low, rows * k * 4, "low"),
@@ -406,7 +423,9 @@ pub fn hc8_read_up(
         (mixed, rows * hidden * 4, "mixed"),
     ] {
         if t.dtype != DType::F32 || t.buf.size() < bytes {
-            return Err(err(format!("read_up: {name} must be F32 with >= {bytes} bytes")));
+            return Err(err(format!(
+                "read_up: {name} must be F32 with >= {bytes} bytes"
+            )));
         }
     }
     IMAGE_VERIFIED.clone().map_err(err)?;
@@ -448,7 +467,10 @@ mod tests {
     fn route_symbols_are_module_exports() {
         let exports = peacemaker_isa::kernels::hc8_wmma_gfx1201::symbols();
         for s in ROUTE_SYMBOLS {
-            assert!(exports.iter().any(|e| e == s), "{s} is not an export of {MODULE}");
+            assert!(
+                exports.iter().any(|e| e == s),
+                "{s} is not an export of {MODULE}"
+            );
         }
         let mut sorted = ROUTE_SYMBOLS.to_vec();
         sorted.sort_unstable();
@@ -510,8 +532,14 @@ mod tests {
     fn i8_scale_and_rounding() {
         let (m, k) = (2, 4);
         let w = vec![
-            bf(127.0), bf(-127.0), bf(0.5), bf(1.5), // row 0: s = 1: 0.5 -> 0, 1.5 -> 2
-            bf(0.0), bf(0.0), bf(0.0), bf(0.0), // zero row
+            bf(127.0),
+            bf(-127.0),
+            bf(0.5),
+            bf(1.5), // row 0: s = 1: 0.5 -> 0, 1.5 -> 2
+            bf(0.0),
+            bf(0.0),
+            bf(0.0),
+            bf(0.0), // zero row
         ];
         let (q, s) = quantize_i8_rows_rowmajor(&w, m, k);
         assert_eq!(s, vec![1.0, 1.0]);
