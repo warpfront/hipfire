@@ -380,6 +380,9 @@ pub struct ScratchState {
     /// Fixed-size split-K scratch of the lane WMMA route (`crate::lane_wmma`): allocated lazily on
     /// first use, zeroed once, never grown or replaced.
     pub lane_wmma_scratch: Option<crate::lane_wmma::LaneWmmaScratch>,
+    /// Reused exact-BF16 expansions of the HC8 sidecar weights (`crate::hc8_weight`): slot 0 the HC
+    /// down, slot 1 the HC up. Allocated lazily on first prefill-class use, never regrown.
+    pub hc8_bf16: [Option<GpuTensor>; 2],
     /// Global score rows for the QSA block selector when an arena's pooled
     /// block count exceeds its dynamic-LDS row (contexts past 61,440 tokens):
     /// `QSA_SELECT_GLOBAL_ROWS` rows of the arena's padded block count.

@@ -262,6 +262,11 @@ static IMAGE_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(|| {
     Ok(())
 });
 
+/// The pinned-SHA256 check of the embedded image, shared with `crate::hc8_weight`'s dequant entries.
+pub(crate) fn verify_image() -> Result<(), String> {
+    IMAGE_VERIFIED.clone()
+}
+
 /// Entry name for `fmt`, geometry, column tiles and epilogue.
 pub fn entry_name(fmt: Hc8Fmt, g: Hc8Geom, nt: usize, act: bool) -> String {
     format!(

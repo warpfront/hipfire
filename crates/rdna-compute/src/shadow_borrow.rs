@@ -14,7 +14,8 @@ use crate::shared_i8::shared_i8_shadow_plane_bytes;
 /// Destination alignment of every shadow span.
 pub const SHADOW_SPAN_ALIGN: usize = 256;
 
-/// One F16 shadow of a BF16 `[rows, cols]` weight: converted into `dst_ptr`
+/// One F16 shadow of a BF16 `[rows, cols]` weight (or, with `hc8`, of an `HC8E4M3Row` weight whose
+/// payload is `rows * cols` E4M3 bytes then `rows` f32 scales): converted into `dst_ptr`
 /// (`2 * rows * cols` bytes).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct F16ShadowSpan {
@@ -23,6 +24,8 @@ pub struct F16ShadowSpan {
     pub dst_ptr: usize,
     pub rows: usize,
     pub cols: usize,
+    /// The source is an `HC8E4M3Row` payload (exact E4M3 -> F16), not BF16.
+    pub hc8: bool,
 }
 
 impl F16ShadowSpan {
@@ -345,6 +348,7 @@ mod tests {
                 dst_ptr: BASE,
                 rows: 16,
                 cols: 32,
+                hc8: false,
             }],
             shared_i8: vec![i8_span(3, 0xA000, gu_dst, dn_dst)],
         }

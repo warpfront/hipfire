@@ -18,6 +18,8 @@ flash-attn-ck = ["dep:libloading"]
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
 hipfire-kernel-abi = { path = "../hipfire-kernel-abi" }
+# The HC8 host swizzle (`hc8::swizzle_hc8`) is the PM module's own function; dev-dependencies below add the toolchain feature.
+peacemaker-isa = { path = "../peacemaker-isa" }
 redline-dispatch = { path = "../redline-dispatch" }
 radiowave = { path = "../radiowave" }
 railgun = { path = "../railgun" }

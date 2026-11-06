@@ -223,6 +223,12 @@ pub struct FeatureFlags {
     /// outputs are not bitwise the SIMT route's (f32 summation order). Default on for exact
     /// gfx1201 (`=0` kills it).
     pub qwen4_lane_wmma: bool,
+    /// OCP E4M3 HC mixer sidecar (`HIPFIRE_QWEN4_HC8`): the load applies the `<model>.hc8`
+    /// sidecar (per-row power-of-two scaled E4M3 HC down / up weights, dtype
+    /// `DType::HC8E4M3Row`) and decode reads it through the PeaceMaker `hc8_gemm` kernel.
+    /// Default on for exact gfx1201 (`=0` kills it: the sidecar is ignored, the BF16 base weights
+    /// load and run exactly as before).
+    pub qwen4_hc8: bool,
     /// EP2 all-reduce / sequence-parallel HC apply fast path (`HIPFIRE_EP_AR_FAST_APPLY`): bf16
     /// rounding by selects instead of the branchy `hip_bfloat16` casts (bit-identical for all
     /// 2^32 inputs) and, for tagged launches of at most `AR_HC_SPLIT_MAX_ROWS` rows, one lane
@@ -1182,6 +1188,7 @@ impl FeatureFlags {
             qwen4_bf16_allrows: parse_bool("HIPFIRE_QWEN4_BF16_ALLROWS").unwrap_or(true),
             qwen4_hc_k4_allrows: parse_bool("HIPFIRE_QWEN4_HC_K4_ALLROWS").unwrap_or(true),
             qwen4_lane_wmma: parse_bool("HIPFIRE_QWEN4_LANE_WMMA").unwrap_or(true),
+            qwen4_hc8: parse_bool("HIPFIRE_QWEN4_HC8").unwrap_or(true),
             ep_ar_fast_apply: parse_bool("HIPFIRE_EP_AR_FAST_APPLY").unwrap_or(true),
             qwen4_hc_pair_decode: parse_bool("HIPFIRE_QWEN4_HC_PAIR_DECODE").unwrap_or(true),
             qwen4_qsa_scores_reserve: parse_bool("HIPFIRE_QWEN4_QSA_SCORES_RESERVE")
@@ -1994,6 +2001,12 @@ impl FeatureFlags {
         self.qwen4_lane_wmma && self.arch == "gfx1201"
     }
 
+    /// E4M3 HC mixer sidecar (`HIPFIRE_QWEN4_HC8`, default on, `=0` kills it). Exact gfx1201
+    /// only: the PeaceMaker `hc8_wmma_pm_gfx1201` module has no other target.
+    pub fn qwen4_hc8_enabled(&self) -> bool {
+        self.qwen4_hc8 && self.arch == "gfx1201"
+    }
+
     /// EP2 AR / SP HC apply fast path (`HIPFIRE_EP_AR_FAST_APPLY`, default on, `=0` kills it).
     /// Exact gfx1201 only (the only arch with those kernels).
     pub fn ep_ar_fast_apply_enabled(&self) -> bool {
@@ -2186,6 +2199,7 @@ impl FeatureFlags {
             qwen4_bf16_allrows: false,
             qwen4_hc_k4_allrows: false,
             qwen4_lane_wmma: false,
+            qwen4_hc8: false,
             ep_ar_fast_apply: false,
             qwen4_hc_pair_decode: false,
             qwen4_qsa_scores_reserve: false,
@@ -3652,6 +3666,31 @@ mod tests {
             assert_eq!(on.qwen4_lane_wmma_enabled(), arch == "gfx1201", "{arch}: 1");
         }
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_lane_wmma_enabled());
+    }
+
+    /// The HC8 sidecar route is default on (`=0` kills) and reaches exact gfx1201 only.
+    #[test]
+    fn qwen4_hc8_flag_is_default_on_and_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |n: &str| -> std::result::Result<String, ()> {
+                if n == "HIPFIRE_QWEN4_HC8" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_hc8_enabled(), arch == "gfx1201", "{arch}: unset");
+            let off = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!off.qwen4_hc8_enabled(), "{arch}: 0");
+            let on = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(on.qwen4_hc8_enabled(), arch == "gfx1201", "{arch}: 1");
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").qwen4_hc8_enabled());
     }
 
     /// The EP2 AR fast apply is default on (`=0` kills) and reaches exact gfx1201 only.

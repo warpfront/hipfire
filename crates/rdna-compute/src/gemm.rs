@@ -30704,7 +30704,7 @@ impl Gpu {
         qwen4_f16_wmma_applies_for(
             &self.arch_caps,
             *QWEN4_F16_WMMA_GFX1201,
-            weight.dtype == DType::BF16,
+            matches!(weight.dtype, DType::BF16 | DType::HC8E4M3Row),
             self.route_rows(batch_size),
             k,
             !self.replay.is_recording() && !self.graphs.capture_mode,
@@ -31281,7 +31281,7 @@ impl Gpu {
             self.arch
         );
         assert!(
-            weight.dtype == DType::BF16
+            matches!(weight.dtype, DType::BF16 | DType::HC8E4M3Row)
                 && x_f16.dtype == DType::F16
                 && low_bf16.dtype == DType::BF16,
             "gemm_bf16_xf16_hc_down_fused: dtypes must be BF16 weight, F16 x, BF16 out"
@@ -31489,7 +31489,7 @@ impl Gpu {
         let mut yp = [std::ptr::null_mut(); 4];
         let mut ms = [0i32; 4];
         for (i, &(weight, y, m)) in projections.iter().enumerate() {
-            assert_eq!(weight.dtype, DType::BF16);
+            assert!(matches!(weight.dtype, DType::BF16 | DType::HC8E4M3Row));
             assert_eq!(y.dtype, DType::F32);
             if m != 0 {
                 ap[i] = self.ensure_bf16_f16_shadow(weight, m, k)?;

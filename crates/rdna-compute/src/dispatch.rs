@@ -1007,6 +1007,16 @@ pub enum DType {
     /// ggml IQ4_XS (GGUF type 23): 136 B per 256 elements, 4.25 bpw (non-linear
     /// 16-level codebook + 6-bit sub-scales). `K % 256 == 0`.
     GgmlIQ4XS,
+    /// Qwen4 HC mixer weight as OCP E4M3 with a per-output-row power-of-two scale
+    /// (qt=57 `HC8E4M3Row`, exact gfx1201, `HIPFIRE_QWEN4_HC8`). Logical `[m, k]`; payload
+    /// = `m*k` E4M3 bytes in the 512-B WMMA A-fragment tile order of
+    /// `peacemaker_isa::kernels::hc8_wmma_gfx1201::swizzle_hc8`, then `f32 s[m]`
+    /// (`m*k + 4*m` bytes, see [`crate::hc8_weight::hc8_payload_bytes`]); the weight is
+    /// `q * s[row]` exactly (also an exact BF16). No per-row stride (`row_bytes()` is
+    /// `None`). Read only by the PeaceMaker `hc8_gemm` decode routes and the exact dequant to
+    /// BF16 / F16 (`Gpu::hc8_dequant_bf16`, the F16 shadow): every other consumer must refuse
+    /// it by name.
+    HC8E4M3Row,
 }
 
 impl DType {
@@ -1076,7 +1086,8 @@ impl DType {
             | DType::GgmlQ5K
             | DType::GgmlQ6K
             | DType::GgmlQ8_0
-            | DType::GgmlIQ4XS => 1, // byte-level
+            | DType::GgmlIQ4XS
+            | DType::HC8E4M3Row => 1, // byte-level
         }
     }
 
@@ -3246,6 +3257,7 @@ impl Gpu {
                 fp16_x_scratch: None,
                 fp16_x_scratch_bytes: 0,
                 lane_wmma_scratch: None,
+                hc8_bf16: [None, None],
                 qsa_select_scores: None,
                 qsa_select_scores_bytes: 0,
                 gdn_state_f32: None,
@@ -6360,7 +6372,12 @@ impl Gpu {
         }
         let n = m * k;
         let fp16 = self.alloc_f16_shadow_dest(key, n, "ensure_bf16_f16_shadow")?;
-        self.launch_bf16_to_f16(weight.buf.as_ptr(), fp16.buf.as_ptr(), n)?;
+        match weight.dtype {
+            // The HC8 sidecar weight: the shadow is the exact F16 expansion of the E4M3 buffer
+            // (keyed on ITS pointer, never on the reused BF16 dequant scratch).
+            DType::HC8E4M3Row => self.hc8_dequant_f16_ptr(weight, m, k, fp16.buf.as_ptr())?,
+            _ => self.launch_bf16_to_f16(weight.buf.as_ptr(), fp16.buf.as_ptr(), n)?,
+        }
         let ptr = fp16.buf.as_ptr();
         self.fp16_shadow_cache.insert(key, fp16);
         Ok(ptr)
@@ -6832,7 +6849,11 @@ impl Gpu {
             }
         };
         for s in &plan.f16 {
-            self.launch_bf16_to_f16(s.src_ptr as *mut c_void, map(s.dst_ptr), s.rows * s.cols)?;
+            if s.hc8 {
+                self.hc8_dequant_f16_at(s.src_ptr as *mut c_void, s.rows, s.cols, map(s.dst_ptr))?;
+            } else {
+                self.launch_bf16_to_f16(s.src_ptr as *mut c_void, map(s.dst_ptr), s.rows * s.cols)?;
+            }
         }
         for s in &plan.shared_i8 {
             self.shared_i8_build_planes(
