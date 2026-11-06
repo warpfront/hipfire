@@ -205,7 +205,8 @@ pub enum SyncKind {
     Poll,
     /// The `global_inv` completing an acquire.
     Acquire,
-    /// The waits (and system writeback) of a standalone release fence.
+    /// A standalone release fence; `pc_index` is its last wait, after which the
+    /// ordering holds.
     Release,
 }
 
@@ -347,19 +348,8 @@ pub fn verify(program: &Program, proofs: &[SyncProof]) -> Result<(), String> {
                     }
                     f.obligations.release(p.scope);
                 }
-                SyncKind::Release => {
-                    if f.loads || f.stores {
-                        return Err(format!(
-                            "pc {pc}: release fence with global accesses outstanding"
-                        ));
-                    }
-                    if p.scope == Scope::Sys && f.obligations.unreleased_sys {
-                        return Err(format!(
-                            "pc {pc}: system-scope release without global_wb scope:SCOPE_SYS"
-                        ));
-                    }
-                    f.obligations.release(p.scope);
-                }
+                // checked after the instruction (the fence's last wait), below
+                SyncKind::Release => {}
                 SyncKind::RelaxedSignal => {
                     if f.obligations.unreleased(p.scope) {
                         return Err(format!(
@@ -440,6 +430,19 @@ pub fn verify(program: &Program, proofs: &[SyncProof]) -> Result<(), String> {
         if is_poll {
             f.obligations.unacquired = true;
             f.poll_in_flight = true;
+        }
+        for p in proof_at(pc).filter(|p| p.kind == SyncKind::Release) {
+            if f.loads || f.stores {
+                return Err(format!(
+                    "pc {pc}: release fence with global accesses outstanding"
+                ));
+            }
+            if p.scope == Scope::Sys && f.obligations.unreleased_sys {
+                return Err(format!(
+                    "pc {pc}: system-scope release without global_wb scope:SCOPE_SYS"
+                ));
+            }
+            f.obligations.release(p.scope);
         }
         let mut succ: Vec<usize> = Vec::new();
         if mnemonic == "s_endpgm" {

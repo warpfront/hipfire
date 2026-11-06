@@ -38,6 +38,50 @@ fn dpp_text_roundtrips_and_assembles_to_the_shipped_words() {
             [0x7fb2_02fa, 0xff01_50ed],
             "v_mov_b32_dpp v217, v237 row_share:0 row_mask:0xf bank_mask:0xf",
         ),
+        (
+            [0x7e02_02fa, 0xff00_e402],
+            "v_mov_b32_dpp v1, v2 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+        ),
+        (
+            [0x7e02_02fa, 0xff00_1b02],
+            "v_mov_b32_dpp v1, v2 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+        ),
+        (
+            [0x7e02_02fa, 0xff01_1302],
+            "v_mov_b32_dpp v1, v2 row_shr:3 row_mask:0xf bank_mask:0xf",
+        ),
+        (
+            [0x7e02_02fa, 0xff01_2302],
+            "v_mov_b32_dpp v1, v2 row_ror:3 row_mask:0xf bank_mask:0xf",
+        ),
+        (
+            [0x7e02_02fa, 0xff01_4002],
+            "v_mov_b32_dpp v1, v2 row_mirror row_mask:0xf bank_mask:0xf",
+        ),
+        (
+            [0x7e02_02fa, 0xff01_4102],
+            "v_mov_b32_dpp v1, v2 row_half_mirror row_mask:0xf bank_mask:0xf",
+        ),
+        (
+            [0x7e02_02fa, 0xff01_5302],
+            "v_mov_b32_dpp v1, v2 row_share:3 row_mask:0xf bank_mask:0xf",
+        ),
+        (
+            [0x7e02_02fa, 0xff01_6302],
+            "v_mov_b32_dpp v1, v2 row_xmask:3 row_mask:0xf bank_mask:0xf",
+        ),
+        (
+            [0x7e02_02fa, 0x3509_0302],
+            "v_mov_b32_dpp v1, v2 row_shl:3 row_mask:0x3 bank_mask:0x5 bound_ctrl:1",
+        ),
+        (
+            [0x7e06_02e9, 0x688f_ac03],
+            "v_mov_b32_dpp v3, v3 dpp8:[4,5,6,7,0,1,2,3]",
+        ),
+        (
+            [0x7e0a_02e9, 0xffff_ff05],
+            "v_mov_b32_dpp v5, v5 dpp8:[7,7,7,7,7,7,7,7]",
+        ),
     ] {
         let (inst, used) = gfx12::decode(&words).expect("shipped DPP encoding");
         assert_eq!(used, 2);

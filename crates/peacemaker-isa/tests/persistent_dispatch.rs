@@ -782,3 +782,132 @@ fn dispatcher_matches_the_standalone_module_on_the_emulator() {
         );
     }
 }
+
+// ------------------------------------------------------------------ lifted region (P0 pool)
+
+/// The shipped MQ2 module, lifted from its committed bundle (not re-emitted), converted
+/// into a region (`peacemaker_lift::rewrite::region`) and hosted by the P0 pool
+/// dispatcher: every carried instruction re-encodes to its original words, and on the
+/// emulator the pool writes the standalone module's bytes.
+#[test]
+fn lifted_shipped_mq2_module_runs_as_a_p0_pool_region_on_the_emulator() {
+    use peacemaker_isa::kernels::lifted_dispatch_gfx1201 as ld;
+    use peacemaker_lift::rewrite::region::{check_carried, lift_region, RegionInputs};
+    let bundle = include_bytes!("../../../kernels/gemv_mq2_xbatch_pm_gfx1201.hxaco");
+    let region = lift_region(
+        bundle,
+        mq2::SYMBOL,
+        &RegionInputs {
+            prefix: ".Lmq2r".into(),
+            workgroup_x: ld::WG_X,
+            workgroup_yz: ld::WG_YZ,
+            block: 32,
+            dynamic_lds: 0,
+        },
+    )
+    .unwrap();
+    assert_eq!(region.receipt.exits_converted, 1);
+    assert_eq!(
+        region.receipt.input_rewrites[0].2, 1,
+        "one ttmp9 read rewritten"
+    );
+    let pool = ld::pool(
+        "pm_pool_mq2",
+        32,
+        &[ld::Hosted {
+            tmpl: 5,
+            region: &region,
+        }],
+    )
+    .unwrap();
+    let elf = native::assemble(&pool.s_text, Arch::Gfx1201).unwrap();
+    assert!(check_carried(&elf, "pm_pool_mq2", &region).unwrap() > 1000);
+    let solo = mq2::emit_text(&mq2::SHIPPED).unwrap();
+    let (m, k, b) = (21usize, 512usize, 3usize);
+    let want = run_mq2(&solo, mq2::SYMBOL, m.div_ceil(4) as u32, m, k, b, false);
+    // the P0 run: one task per 3 virtual workgroups, kernarg block = the 36-byte ABI
+    let program = peacemaker_lift::lift_object(
+        &elf,
+        peacemaker_lift::Options {
+            frontend: Frontend::Builder,
+        },
+    )
+    .unwrap()
+    .program;
+    let emu = Emulator::new(&program, "pm_pool_mq2").unwrap();
+    let (a, x) = mq2_inputs(m, k, b, 7);
+    let mut karg = Vec::new();
+    for p in [A, X, Y] {
+        karg.extend(p.to_le_bytes());
+    }
+    for v in [m, k, b] {
+        karg.extend((v as u32).to_le_bytes());
+    }
+    karg.resize(48, 0);
+    let gx = m.div_ceil(4) as u32;
+    let mut tasks = Vec::new();
+    let mut x0 = 0;
+    while x0 < gx {
+        let n = 3.min(gx - x0);
+        let mut t = [0u32; 32];
+        t[..12].copy_from_slice(&[5, x0, 0, 0, gx, 1, 1, 0, u32::MAX, 0, 0, n]);
+        tasks.extend(t.iter().flat_map(|w| w.to_le_bytes()));
+        x0 += n;
+    }
+    let n_tasks = (tasks.len() / 128) as u32;
+    const TASKS: u64 = 0xb00_0000;
+    const PARAMS: u64 = 0xc00_0000;
+    let mut params = Vec::new();
+    for p in [TASKS, QUEUE, QUEUE + 16, KARG, QUEUE + 64, QUEUE + 32] {
+        params.extend(p.to_le_bytes());
+    }
+    params.extend(1000u64.to_le_bytes());
+    params.extend(n_tasks.to_le_bytes());
+    params.extend(1u32.to_le_bytes());
+    params.resize(ld::KERNARG_BYTES as usize, 0);
+    let mut mem = Memory::default();
+    mem.map("karg".into(), KARG, karg).unwrap();
+    mem.map("a".into(), A, a).unwrap();
+    mem.map("x".into(), X, x).unwrap();
+    mem.map("y".into(), Y, vec![0xa5; b * m * 4]).unwrap();
+    mem.map("tasks".into(), TASKS, tasks).unwrap();
+    mem.map("queue".into(), QUEUE, vec![0; 64 + n_tasks as usize * 48])
+        .unwrap();
+    mem.map("params".into(), PARAMS, params).unwrap();
+    for wg in 0..2u32 {
+        emu.run_workgroup(
+            &Launch {
+                kernarg_ptr: PARAMS,
+                workgroup: [wg, 0, 0],
+                block: [32, 1, 1],
+                dynamic_lds: 0,
+            },
+            &mut mem,
+        )
+        .unwrap_or_else(|e| panic!("pool workgroup {wg}: {e}"));
+    }
+    assert_eq!(
+        mem.read(Y, b * m * 4).unwrap(),
+        &want[..],
+        "pool output != standalone"
+    );
+    let q = mem
+        .read(QUEUE, 64 + n_tasks as usize * 48)
+        .unwrap()
+        .to_vec();
+    let word = |o: usize| u32::from_le_bytes(q[o..o + 4].try_into().unwrap());
+    assert_eq!(
+        word(0),
+        n_tasks + 2,
+        "claims: every task plus one stop per workgroup"
+    );
+    assert_eq!(
+        word(16),
+        n_tasks,
+        "events[0]: one release increment per task"
+    );
+    assert_eq!(word(32), 0, "poison");
+    for i in 0..n_tasks as usize {
+        assert_eq!(word(64 + i * 48), i as u32, "trace record {i}");
+    }
+}

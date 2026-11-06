@@ -1936,6 +1936,7 @@ impl<'k> Analyzer<'k> {
                 inst.form,
                 Form::Vop1
                     | Form::Vop1Dpp
+                    | Form::Vop1Dpp8
                     | Form::Vop2
                     | Form::Vop2Dpp
                     | Form::Vop3

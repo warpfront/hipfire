@@ -134,7 +134,7 @@ impl Builder {
         self.gfx12_untyped("release")?;
         self.release_waits(scope)?;
         self.syncs.push(SyncProof {
-            pc_index: self.program.instructions.len(),
+            pc_index: self.program.instructions.len() - 1,
             kind: SyncKind::Release,
             scope,
         });
@@ -262,8 +262,10 @@ impl Builder {
         }
         // The spin drains LOADcnt each trip: start from no pending loads so its back-edge
         // ledger equals its head's (the `loop_` fixpoint).
-        if self.ledger.has_pending(Counter::Load) {
-            self.emit_wait(Counter::Load, 0, Reason::LoopFixpoint)?;
+        for c in [Counter::Load, Counter::Km] {
+            if self.ledger.has_pending(c) {
+                self.emit_wait(c, 0, Reason::LoopFixpoint)?;
+            }
         }
         let ready = format!("{head}_ready");
         let poll = Instruction::new(
@@ -505,6 +507,155 @@ impl Builder {
             workgroup_size: abi.workgroup_size,
             exec_clobbered,
             unreleased_writes_at_exit: self.sync.unreleased_dev,
+        });
+        Ok(())
+    }
+    /// Emit a converted foreign body (`peacemaker_lift::rewrite::region`) as a region:
+    /// `lines` are its labels (`name:`) and instructions, ending with its quiesce block
+    /// (every memory counter drained). The body names SGPRs `[0, sgprs)` plus the
+    /// declared `abi.inputs`, VGPRs `[0, vgprs)` and LDS `[0, lds_bytes)`.
+    ///
+    /// Entry contract (what hipcc assumed at kernel start): no memory operation of
+    /// the caller is outstanding and no ALU result is in flight (`s_wait_alu 0x0`).
+    /// The body's registers become plan ranges live only `Between(entry, exit)`, so
+    /// `RegPlan` refuses any caller range sharing them inside the region. Builder LDS
+    /// slots must lie above `lds_bytes`. The foreign instructions themselves are
+    /// checked by the lift (conversion receipt) and re-lifted after emission; the
+    /// builder does not re-derive their waits. After the exit the ledger is empty
+    /// (quiesced), the hazard trackers are saturated, the body's global writes are
+    /// pending a release and EXEC is clobbered.
+    pub fn foreign_region(
+        &mut self,
+        abi: &RegionAbi,
+        lines: &[String],
+        sgprs: u16,
+        vgprs: u16,
+        lds_bytes: u32,
+    ) -> Result<(), String> {
+        self.untyped()?;
+        if !self.spec.arch.gfx12() {
+            return Err("foreign regions are gfx12 only".into());
+        }
+        let name = &abi.name;
+        if let Some(open) = &self.open_region {
+            return Err(format!("region {name} inside region {open}"));
+        }
+        if !self.ledger.is_empty() {
+            return Err(format!(
+                "region {name}: the caller's memory operations must be retired at entry"
+            ));
+        }
+        if self.sync.unacquired {
+            return Err(format!(
+                "region {name}: entered with an unacquired event observation"
+            ));
+        }
+        if abi.workgroup_size != self.spec.workgroup_size {
+            return Err(format!(
+                "region {name}: body geometry {} threads != caller workgroup {}",
+                abi.workgroup_size, self.spec.workgroup_size
+            ));
+        }
+        if lds_bytes > self.spec.group_segment_fixed_size
+            || self.lds.all_slots().iter().any(|s| s.base < lds_bytes)
+        {
+            return Err(format!(
+                "region {name}: body LDS [0, {lds_bytes}) must fit the allocation below every builder slot"
+            ));
+        }
+        if lines.iter().any(|l| {
+            let m = l.split_whitespace().next().unwrap_or("");
+            m == "s_endpgm" || l.contains("ttmp")
+        }) {
+            return Err(format!(
+                "region {name}: an unconverted exit or hardware workgroup id"
+            ));
+        }
+        let (entry, exit) = (
+            crate::plan::region_entry_label(name),
+            crate::plan::region_exit_label(name),
+        );
+        // The body's registers: aligned power-of-two pieces live only inside the region.
+        let between = Live::Between(entry.clone(), exit.clone());
+        for (kind, count, tag) in [(Kind::S, sgprs, "s"), (Kind::V, vgprs, "v")] {
+            let mut at = 0u16;
+            while at < count {
+                let mut piece = 8u16;
+                while piece > 1 && (at % piece != 0 || at + piece > count) {
+                    piece /= 2;
+                }
+                self.regs
+                    .add_range(
+                        &format!("{name}_{tag}{at}"),
+                        kind,
+                        at as u8,
+                        piece as u8,
+                        between.clone(),
+                    )
+                    .map_err(|e| format!("region {name}: body register {tag}{at}: {e}"))?;
+                at += piece;
+            }
+        }
+        self.label(&entry)?;
+        let entry_pc = self.program.instructions.len() - 1;
+        for (meaning, r) in &abi.inputs {
+            self.regs
+                .verify_access(*r, &entry, &self.labels)
+                .map_err(|e| format!("region {name} input {meaning}: {e}"))?;
+        }
+        // hipcc's entry state: nothing in flight.
+        self.program
+            .instructions
+            .push(Instruction::new("s_wait_alu 0x0", vec![], vec![]));
+        self.open_region = Some(name.clone());
+        for line in lines {
+            if let Some(l) = line.strip_suffix(':') {
+                self.place_label(l)?;
+            } else {
+                self.program
+                    .instructions
+                    .push(Instruction::new(line.clone(), vec![], vec![]));
+            }
+        }
+        self.open_region = None;
+        self.label(&exit)?;
+        let exit_pc = self.program.instructions.len() - 1;
+        self.ledger = crate::ledger::Ledger::default();
+        self.hazard.saturate();
+        self.previous_wmma_dst.clear();
+        self.sync.write();
+        let inner: Vec<&str> = self.program.instructions[entry_pc + 1..=exit_pc]
+            .iter()
+            .filter_map(|i| i.text.strip_suffix(':'))
+            .collect();
+        for i in &self.program.instructions[entry_pc..exit_pc] {
+            if let Some(t) = sync::branch_target(&i.text) {
+                if !inner.contains(&t) {
+                    return Err(format!("region {name}: `{}` leaves the region", i.text));
+                }
+            }
+        }
+        let locals = self
+            .regs
+            .ranges
+            .iter()
+            .filter(|r| r.live == between)
+            .map(|r| format!("{} {}", r.name, r.reg()))
+            .collect();
+        self.regions.push(RegionProof {
+            name: name.clone(),
+            entry_pc,
+            exit_pc,
+            inputs: abi
+                .inputs
+                .iter()
+                .map(|(m, r)| (m.clone(), r.to_string()))
+                .collect(),
+            locals,
+            lds_bytes,
+            workgroup_size: abi.workgroup_size,
+            exec_clobbered: true,
+            unreleased_writes_at_exit: true,
         });
         Ok(())
     }

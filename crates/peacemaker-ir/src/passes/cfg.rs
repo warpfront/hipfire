@@ -29,7 +29,8 @@ use thiserror::Error;
 use crate::cfg::{Block, BlockId, Body, InstId, Terminator};
 use crate::effects::Control;
 use crate::inst::{Form, Inst};
-use crate::operand::{ImmField, Operand};
+use crate::operand::{ImmField, InlineConst, Operand};
+use crate::reg::Kind;
 
 /// Base dword width of one instruction word stream without a literal dword.
 ///
@@ -39,7 +40,13 @@ pub fn base_dwords(form: Form, arch: crate::inst::Arch) -> usize {
         Form::Sop1 | Form::Sop2 | Form::Sopc | Form::Sopk | Form::Sopp => 1,
         Form::Vop1 | Form::Vop2 | Form::Vopc => 1,
         Form::Smem => 2,
-        Form::Vop1Dpp | Form::Vop2Dpp | Form::Vop3 | Form::Vop3p | Form::Vopd | Form::Vinterp => 2,
+        Form::Vop1Dpp
+        | Form::Vop1Dpp8
+        | Form::Vop2Dpp
+        | Form::Vop3
+        | Form::Vop3p
+        | Form::Vopd
+        | Form::Vinterp => 2,
         Form::Ds => 2,
         Form::Vmem(_) => {
             if arch == crate::inst::Arch::Gfx1201 {
@@ -88,6 +95,8 @@ pub enum CfgError {
     TargetMidInstruction { index: usize, target: u32 },
     #[error("kernel does not end in s_endpgm (last block falls through)")]
     MissingEndPgm,
+    #[error("s_setpc_b64 at layout index {index} is not a recognised getpc/add/setpc far jump")]
+    UnresolvedIndirectJump { index: usize },
     #[error("body has no blocks; run build_blocks first")]
     BlocksNotBuilt,
 }
@@ -108,6 +117,70 @@ fn branch_offset(inst: &Inst, index: usize) -> Result<i16, CfgError> {
         }
     }
     found.ok_or(CfgError::MissingOffset { index })
+}
+
+/// The value of a 32-bit scalar immediate operand (literal or inline integer).
+fn scalar_immediate(op: &Operand) -> Option<u32> {
+    match op {
+        Operand::Literal(v) => Some(*v),
+        Operand::Inline(InlineConst::Integer(v)) => Some(i32::from(*v) as u32),
+        _ => None,
+    }
+}
+
+/// Layout index of the closest instruction before `k` that is not a pure wait/delay (`s_wait_alu`, `s_delay_alu`).
+fn previous_real(body: &Body, arch: crate::inst::Arch, mut k: usize) -> Option<usize> {
+    loop {
+        k = k.checked_sub(1)?;
+        let name = body.insts.get(body.layout[k])?.op.name(arch)?;
+        if !matches!(name, "s_wait_alu" | "s_delay_alu") {
+            return Some(k);
+        }
+    }
+}
+
+/// Target dword PC of the far-branch expansion hipcc emits when a branch exceeds the SOPP range:
+/// `s_getpc_b64 sA:B; s_add_co_u32 sA, sA, lo; s_add_co_ci_u32 sB, sB, hi; s_setpc_b64 sA:B` (wait/delay
+/// instructions may sit between the four). `s_getpc_b64` yields the address of the next instruction, so the target is
+/// that PC plus the sign-extended 64-bit byte offset `hi:lo`. `i` is the layout index of the `s_setpc_b64`.
+fn far_jump_target(
+    body: &Body,
+    arch: crate::inst::Arch,
+    pcs: &[u32],
+    dwords: &[usize],
+    i: usize,
+) -> Option<i64> {
+    let inst = |k: usize| body.insts.get(body.layout[k]);
+    let name = |k: usize| inst(k).and_then(|x| x.op.name(arch));
+    let Some(Operand::Reg(pair)) = inst(i)?.operands.first() else {
+        return None;
+    };
+    if pair.kind != Kind::S || pair.len != 2 {
+        return None;
+    }
+    let ci = previous_real(body, arch, i).filter(|&k| name(k) == Some("s_add_co_ci_u32"))?;
+    let add = previous_real(body, arch, ci).filter(|&k| name(k) == Some("s_add_co_u32"))?;
+    let getpc = previous_real(body, arch, add).filter(|&k| name(k) == Some("s_getpc_b64"))?;
+    if inst(getpc)?.operands.as_slice() != [Operand::Reg(*pair)] {
+        return None;
+    }
+    let half = |index: u16| {
+        Operand::Reg(crate::reg::RegRef {
+            kind: Kind::S,
+            base: pair.base + index,
+            len: 1,
+        })
+    };
+    let lo = match inst(add)?.operands.as_slice() {
+        [d, s, imm] if *d == half(0) && *s == half(0) => scalar_immediate(imm)?,
+        _ => return None,
+    };
+    let hi = match inst(ci)?.operands.as_slice() {
+        [d, s, imm] if *d == half(1) && *s == half(1) => scalar_immediate(imm)?,
+        _ => return None,
+    };
+    let bytes = (u64::from(hi) << 32 | u64::from(lo)) as i64;
+    (bytes % 4 == 0).then(|| i64::from(pcs[getpc]) + dwords[getpc] as i64 + bytes / 4)
 }
 
 /// Block containing `id`, by linear scan of block ranges.
@@ -181,6 +254,19 @@ pub fn build_blocks(body: &mut Body, arch: crate::inst::Arch) -> Result<LayoutIn
                 } else {
                     End::Branch { target_pos }
                 });
+            }
+            Control::None if inst.op.name(arch) == Some("s_setpc_b64") => {
+                let target = far_jump_target(body, arch, &pcs, &dwords, i)
+                    .ok_or(CfgError::UnresolvedIndirectJump { index: i })?;
+                if target < 0 || target >= total as i64 {
+                    return Err(CfgError::TargetOutsideKernel { index: i, target });
+                }
+                let target = target as u32;
+                let target_pos = pos_of_pc
+                    .get(&target)
+                    .copied()
+                    .ok_or(CfgError::TargetMidInstruction { index: i, target })?;
+                ends[i] = Some(End::Jump { target_pos });
             }
             Control::EndPgm | Control::Halt | Control::Trap => {
                 ends[i] = Some(End::Terminating);
@@ -689,6 +775,56 @@ mod tests {
             control,
             vec![Operand::Imm(ImmField::Sopp(off))],
         )
+    }
+
+    /// Body decoded from llvm-mc gfx1201 words (`llvm-mc --arch=amdgcn --mcpu=gfx1201 --show-encoding`).
+    fn body_from_words(words: &[u32]) -> Body {
+        let mut insts = Vec::new();
+        let mut at = 0;
+        while at < words.len() {
+            let (inst, used) = crate::codec::gfx12::decode(&words[at..]).unwrap();
+            insts.push(inst);
+            at += used;
+        }
+        body_of(insts)
+    }
+
+    #[test]
+    fn hipcc_far_jump_is_a_jump_to_its_getpc_relative_target() {
+        // 0 s_nop; 1 s_getpc_b64 s[58:59]; 2 s_wait_alu; 3 s_add_co_u32 s58, s58, lit(0x20); 5 s_add_co_ci_u32 s59, s59,
+        // lit(0x0); 7 s_wait_alu; 8 s_setpc_b64 s[58:59]; 9 s_nop; 10 s_endpgm. `s_getpc_b64` yields the next PC (2), so
+        // the +0x20 byte offset (8 dwords) lands on the s_endpgm at 10.
+        let mut body = body_from_words(&[
+            0xbf80_0000,
+            0xbeba_4700,
+            0xbf88_ff9e,
+            0x803a_ff3a,
+            0x0000_0020,
+            0x823b_ff3b,
+            0x0000_0000,
+            0xbf88_ff9e,
+            0xbe80_483a,
+            0xbf80_0000,
+            0xbfb0_0000,
+        ]);
+        let info = build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
+        assert_eq!(info.pcs, vec![0, 1, 2, 3, 5, 7, 8, 9, 10]);
+        let ranges: Vec<_> = body.blocks.iter().map(|b| b.range).collect();
+        assert_eq!(ranges, vec![(0, 7), (7, 8), (8, 9)]);
+        assert_eq!(body.blocks[0].term, Terminator::Jump(BlockId(2)));
+        assert_eq!(body.blocks[0].succs.as_slice(), &[BlockId(2)]);
+        assert_eq!(body.blocks[1].term, Terminator::Unreachable);
+        assert_eq!(body.blocks[2].term, Terminator::EndPgm);
+    }
+
+    #[test]
+    fn setpc_without_the_far_jump_expansion_is_refused() {
+        // s_setpc_b64 s[2:3] has no getpc/add/add-carry producer: the target is unknown, never a fall-through.
+        let mut body = body_from_words(&[0xbe80_4802, 0xbfb0_0000]);
+        assert_eq!(
+            build_blocks(&mut body, crate::inst::Arch::Gfx1201),
+            Err(CfgError::UnresolvedIndirectJump { index: 0 })
+        );
     }
 
     #[test]

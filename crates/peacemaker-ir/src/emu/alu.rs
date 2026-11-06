@@ -88,7 +88,7 @@
 use super::{convert, Result, State, Wide};
 use crate::{
     operand::{Dpp, InlineConst, Omod, Operand},
-    Arch, FormFields, Inst,
+    Arch, Form, FormFields, Inst,
 };
 #[cfg(test)]
 #[path = "isa_gap_tests.rs"]
@@ -535,6 +535,30 @@ fn dpp_plan(d: &Dpp, fi: bool, s: &State, lane: usize) -> Result<Option<Src0>> {
     })
 }
 
+/// Lane selects of a DPP8 instruction (the `dpp8_sel` field: eight 3-bit selects from bit 8 of word 1), if it is one.
+fn dpp8_select(i: &Inst) -> Option<u32> {
+    if i.form != Form::Vop1Dpp8 {
+        return None;
+    }
+    i.fields
+        .honored()
+        .iter()
+        .find(|f| f.name == "dpp8_sel")
+        .map(|f| f.value >> 8)
+}
+
+/// DPP8 routing of one lane: lane `l` reads lane `8 * (l / 8) + select[l % 8]` of its group of eight. A disabled
+/// source lane (FI=0) is not modeled: the ISA text for the inactive-source read is not pinned by a measurement here.
+fn dpp8_plan(select: u32, s: &State, lane: usize) -> Result<Src0> {
+    let src = (lane & !7) | ((select >> (3 * (lane & 7))) & 7) as usize;
+    if s.exec & (1 << src) == 0 {
+        return Err(format!(
+            "DPP8 lane {lane} reads disabled lane {src}: FI=0 inactive-source behaviour is not modeled"
+        ));
+    }
+    Ok(Src0::Lane(src))
+}
+
 fn read_src(s: &State, op: &Operand, lane: usize, d: Src0) -> Result<u32> {
     match d {
         Src0::Plain => s.read(op, lane, 0),
@@ -553,7 +577,8 @@ fn stem(name: &str) -> &str {
 fn lanes(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result<()> {
     let o = &i.operands;
     let dpp = i.mods.dpp;
-    if dpp.is_some() != name.ends_with("_dpp") {
+    let dpp8 = dpp8_select(i);
+    if (dpp.is_some() || dpp8.is_some()) != name.ends_with("_dpp") {
         return Err(format!("{name}: DPP control and opcode form disagree"));
     }
     if s.exec == 0 {
@@ -567,12 +592,13 @@ fn lanes(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result<()> {
     let fi = dpp_fi(i);
     let mut vals: [Option<Val>; 64] = [None; 64];
     for lane in active(s) {
-        let d = match dpp {
-            Some(d) => match dpp_plan(&d, fi, s, lane)? {
+        let d = match (dpp, dpp8) {
+            (Some(d), _) => match dpp_plan(&d, fi, s, lane)? {
                 Some(d) => d,
                 None => continue,
             },
-            None => Src0::Plain,
+            (None, Some(select)) => dpp8_plan(select, s, lane)?,
+            (None, None) => Src0::Plain,
         };
         vals[lane] = Some(vector(arch, name, o, i, s, lane, d)?);
     }
@@ -930,6 +956,11 @@ fn vector(
             Class::Int,
             ((u64::from(raw(0)? & 0xff_ffff) * u64::from(raw(1)? & 0xff_ffff)) >> 32) as u32,
         ),
+        // D.i32 = (S0.i24 * S1.i24) >> 32 over the 64-bit signed product (RDNA ISA V_MUL_HI_I32_I24).
+        "v_mul_hi_i32_i24" => {
+            let sext = |x: u32| i64::from(((x << 8) as i32) >> 8);
+            (Class::Int, ((sext(raw(0)?) * sext(raw(1)?)) >> 32) as u32)
+        }
         "v_mad_u32_u24" => (
             Class::Int,
             (raw(0)? & 0xff_ffff)
@@ -2461,6 +2492,16 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
             0,
             if s.scc { a } else { b },
         );
+    }
+    // `s_sendmsg_rtn_b64 sdst, sendmsg(MSG_RTN_GET_REALTIME)` (message 0x83): the constant
+    // 100 MHz clock. The interpreter has no wall clock; it reads 0, so runs stay
+    // deterministic (the value only feeds timestamps). Other return messages are refused.
+    if name == "s_sendmsg_rtn_b64" {
+        match o.get(1) {
+            Some(crate::operand::Operand::SendMsg(m)) if m.id == 0x83 => {}
+            other => return Err(format!("s_sendmsg_rtn_b64: unmodeled message {other:?}")),
+        }
+        return s.put_wide(o.first().ok_or("missing scalar operand")?, 0, 0);
     }
     if name == "s_mov_b64" {
         let value = s.read_wide(o.get(1).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;

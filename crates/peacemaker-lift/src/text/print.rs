@@ -132,13 +132,22 @@ pub fn canonical(inst: &Inst, arch: Arch) -> Result<String, PrintError> {
         }
         parts.push(text);
     }
-    // `s_fmamk_f32 D, S0, K, S1` / `s_fmaak_f32 D, S0, S1, K`: the K constant is
-    // the instruction's literal word, spelled as the fourth operand.
-    if matches!(row.name, "s_fmamk_f32" | "s_fmaak_f32") {
+    // `*_fmamk_* D, S0, K, S1` / `*_fmaak_* D, S0, S1, K` (SOP2 and VOP2): the K
+    // constant is the instruction's literal word, spelled as the fourth operand.
+    if matches!(
+        row.name,
+        "s_fmamk_f32"
+            | "s_fmaak_f32"
+            | "v_fmamk_f32"
+            | "v_fmaak_f32"
+            | "v_fmamk_f16"
+            | "v_fmaak_f16"
+    ) && parts.len() == 3
+    {
         let literal = inst.literal.ok_or_else(|| {
             PrintError::Unspellable(format!("{} is missing its literal word", row.name))
         })?;
-        let at = if row.name == "s_fmamk_f32" {
+        let at = if row.name.contains("_fmamk_") {
             2
         } else {
             parts.len()
@@ -501,17 +510,30 @@ fn modifier_suffix(inst: &Inst, row: &OpRow) -> Result<String, PrintError> {
             let dpp = mods
                 .dpp
                 .ok_or_else(|| PrintError::Unspellable("DPP modifiers missing".into()))?;
-            let control =
-                if let Some(shift) = dpp.ctrl.checked_sub(0x100).filter(|v| (1..=15).contains(v)) {
-                    format!("row_shl:{shift}")
-                } else if let Some(lane) = dpp.ctrl.checked_sub(0x150).filter(|v| *v <= 15) {
-                    format!("row_share:{lane}")
-                } else {
+            let ctrl = dpp.ctrl;
+            let low = ctrl & 0xf;
+            let control = match ctrl {
+                0x000..=0x0ff => format!(
+                    "quad_perm:[{},{},{},{}]",
+                    ctrl & 3,
+                    ctrl >> 2 & 3,
+                    ctrl >> 4 & 3,
+                    ctrl >> 6 & 3
+                ),
+                0x101..=0x10f => format!("row_shl:{low}"),
+                0x111..=0x11f => format!("row_shr:{low}"),
+                0x121..=0x12f => format!("row_ror:{low}"),
+                0x140 => "row_mirror".to_owned(),
+                0x141 => "row_half_mirror".to_owned(),
+                0x150..=0x15f => format!("row_share:{low}"),
+                0x160..=0x16f => format!("row_xmask:{low}"),
+                _ => {
                     return Err(PrintError::Unspellable(format!(
                         "DPP control {:#x}",
                         dpp.ctrl
                     )));
-                };
+                }
+            };
             out.push_str(&format!(
                 " {control} row_mask:{:#x} bank_mask:{:#x}",
                 dpp.row_mask, dpp.bank_mask
@@ -519,6 +541,20 @@ fn modifier_suffix(inst: &Inst, row: &OpRow) -> Result<String, PrintError> {
             if dpp.bound_ctrl {
                 out.push_str(" bound_ctrl:1");
             }
+        }
+        Form::Vop1Dpp8 => {
+            let select = inst
+                .fields
+                .honored()
+                .iter()
+                .find(|f| f.name == "dpp8_sel")
+                .ok_or_else(|| PrintError::Unspellable("DPP8 lane selects missing".into()))?
+                .value
+                >> 8;
+            let lanes: Vec<String> = (0..8)
+                .map(|lane| (select >> (3 * lane) & 7).to_string())
+                .collect();
+            out.push_str(&format!(" dpp8:[{}]", lanes.join(",")));
         }
         Form::Vop3 => {
             if mods.omod != Omod::None {
@@ -559,7 +595,17 @@ fn modifier_suffix(inst: &Inst, row: &OpRow) -> Result<String, PrintError> {
             // without 16-bit operands (WMMA, duals), same rule as VOP3.
             // Entry layout for a hypothetical 16-bit VOP3P row is
             // unprobed; the source-bit entries below are best-effort.
-            if has_w16_operand(row) && mods.op_sel != 0 {
+            // v_fma_mix*: op_sel / op_sel_hi pick the f16 half / mark the f16 sources of
+            // each of the three sources (LLVM spells three entries each).
+            let mix = row.name.starts_with("v_fma_mix");
+            if mix && mods.op_sel != 0 {
+                out.push_str(&format!(
+                    " op_sel:[{},{},{}]",
+                    mods.op_sel & 1,
+                    mods.op_sel >> 1 & 1,
+                    mods.op_sel >> 2 & 1
+                ));
+            } else if has_w16_operand(row) && mods.op_sel != 0 {
                 let nsrcs = src_slot_count(row);
                 let mut entries: Vec<String> = (0..nsrcs)
                     .map(|i| ((mods.op_sel >> i) & 1).to_string())
@@ -567,7 +613,7 @@ fn modifier_suffix(inst: &Inst, row: &OpRow) -> Result<String, PrintError> {
                 entries.push(((mods.op_sel >> 3) & 1).to_string());
                 out.push_str(&format!(" op_sel:[{}]", entries.join(",")));
             }
-            if has_w16_operand(row) && mods.op_sel_hi != 0 {
+            if (mix || has_w16_operand(row)) && mods.op_sel_hi != 0 {
                 out.push_str(&format!(
                     " op_sel_hi:[{},{},{}]",
                     mods.op_sel_hi & 1,

@@ -443,9 +443,9 @@ fn decode_body(
         let (index, rule) = match e {
             CfgError::TargetOutsideKernel { index, .. }
             | CfgError::TargetMidInstruction { index, .. } => (index, Rule::BranchTarget),
-            CfgError::MissingOffset { index } | CfgError::UnexpectedLabel { index } => {
-                (index, Rule::ControlFlow)
-            }
+            CfgError::MissingOffset { index }
+            | CfgError::UnexpectedLabel { index }
+            | CfgError::UnresolvedIndirectJump { index } => (index, Rule::ControlFlow),
             CfgError::MissingEndPgm => (vas.len().saturating_sub(1), Rule::ControlFlow),
             CfgError::Empty
             | CfgError::AlreadyBuilt

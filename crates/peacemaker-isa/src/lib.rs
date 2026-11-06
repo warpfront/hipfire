@@ -70,6 +70,9 @@ pub mod kernels {
     pub mod lane_rows_mq6_gfx1201;
     pub mod legacy_mq4_rowtiles;
     pub mod libm_exact;
+    /// A persistent pool dispatcher hosting lifted hipcc bodies as regions (MegaM0's
+    /// P0 task ABI; lab only, no product route).
+    pub mod lifted_dispatch_gfx1201;
     pub mod moe_rotate_i4_pm;
     pub mod moe_slot_ops;
     pub mod mq4_fp8_verify;

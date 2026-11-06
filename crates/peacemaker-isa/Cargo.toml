@@ -51,6 +51,26 @@ required-features = ["lab"]
 name = "railgun_cert_event_sync_fixtures"
 required-features = ["lab"]
 
+# Region-conversion survey of lifted hipcc bodies (CPU only).
+[[example]]
+name = "pm_lift_survey"
+required-features = ["lab"]
+
+# One-card gfx1201 byte-identity of lifted hipcc bodies run as pool-dispatcher regions (fabric job).
+[[example]]
+name = "pm_lift_smoke"
+required-features = ["lab"]
+
+# CPU emulator differential of the o4 gate/up body: standalone vs pool region.
+[[example]]
+name = "pm_lift_emu"
+required-features = ["lab"]
+
+# Rows-6 pool dispatchers (one per blockDim) over every convertible template (CPU only).
+[[example]]
+name = "pm_lift_pools"
+required-features = ["lab"]
+
 # Native gfx1100 emitters that also run the ROCm oracle/certify path (M7, radiowave): need `--features toolchain`.
 [[example]]
 name = "e8p_i4_moe_gemv_gfx1100_emit"

@@ -62,6 +62,15 @@ impl Gfx12Sgpr {
         self.vcc_salu = false;
         self.vcc_valu = false;
     }
+    /// Assume every SGPR VALU-read and every write pending a guard (after foreign
+    /// code the builder did not track): the next reads take their waits.
+    pub(crate) fn saturate(&mut self) {
+        self.tracked.fill(true);
+        self.salu.fill(true);
+        self.valu.fill(true);
+        self.vcc_salu = true;
+        self.vcc_valu = true;
+    }
     pub fn step(
         &mut self,
         pipe: Pipeline,
