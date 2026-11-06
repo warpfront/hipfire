@@ -1483,7 +1483,9 @@ impl CpuSplitExecutor {
         out: &mut [f32],
     ) -> Result<(), DispatchError> {
         match self.igpu.as_deref().filter(|_| !shadowed) {
-            Some(arm) => arm.host_slot_outputs(rows, ids, host_slots, resolved, x, out, IGPU_ARM_BOUND),
+            Some(arm) => {
+                arm.host_slot_outputs(rows, ids, host_slots, resolved, x, out, IGPU_ARM_BOUND)
+            }
             None => cpu_exec::moe_cpu_host_slot_outputs(
                 self.dim,
                 self.mi,

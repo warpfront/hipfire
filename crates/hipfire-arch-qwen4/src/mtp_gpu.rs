@@ -3030,7 +3030,9 @@ impl Qwen4MtpGpu {
     /// (`topology.hetero_experts`).
     pub(crate) fn head_hetero(&self) -> bool {
         use hipfire_dispatch::families::moe::RoutedExpertWeights;
-        self.moe.as_ref().is_some_and(|moe| moe.hetero_split().is_some())
+        self.moe
+            .as_ref()
+            .is_some_and(|moe| moe.hetero_split().is_some())
     }
 
     /// Whether the head's experts run on a rows=1 D2 split executor.

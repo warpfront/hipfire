@@ -53,7 +53,16 @@ impl MailboxGeometry {
         let cold_out = align(weights + slots * 4);
         let end = align(cold_out + slots * self.dim * 4);
         (
-            SlotOffsets { req_seq: 0, resp_seq: 64, error: 128, rows: 192, x_rot, ids, weights, cold_out },
+            SlotOffsets {
+                req_seq: 0,
+                resp_seq: 64,
+                error: 128,
+                rows: 192,
+                x_rot,
+                ids,
+                weights,
+                cold_out,
+            },
             end,
         )
     }
@@ -87,7 +96,11 @@ impl MailboxGeometry {
 /// keeps meaning "never written" (a collision once every 2^32 sequences, far
 /// beyond any wait window).
 pub fn seq_for(token: u32, layer: u32, layers: u32) -> u32 {
-    match token.wrapping_mul(layers).wrapping_add(layer).wrapping_add(1) {
+    match token
+        .wrapping_mul(layers)
+        .wrapping_add(layer)
+        .wrapping_add(1)
+    {
         0 => 1,
         v => v,
     }
@@ -189,7 +202,14 @@ impl PrefillGeometry {
         for (i, w) in sub.iter_mut().enumerate().take(self.sub_chunks) {
             let b = LINE * (2 + 3 * i);
             let m = b + 2 * LINE;
-            *w = SubChunkWords { req_seq: b, resp_seq: b + LINE, layer: m, row_off: m + 4, rows: m + 8, format: m + 12 };
+            *w = SubChunkWords {
+                req_seq: b,
+                resp_seq: b + LINE,
+                layer: m,
+                row_off: m + 4,
+                rows: m + 8,
+                format: m + 12,
+            };
         }
         let slots = self.max_rows * self.top_k;
         let x_norm = align(LINE * (2 + 3 * self.sub_chunks));
@@ -198,7 +218,18 @@ impl PrefillGeometry {
         let weights = align(ids + slots * 4);
         let partial = align(weights + slots * 4);
         let end = align(partial + self.max_rows * self.dim * 2);
-        (PrefillOffsets { error: 0, int4_min_rows: LINE, sub, x_norm, ids, weights, partial }, end)
+        (
+            PrefillOffsets {
+                error: 0,
+                int4_min_rows: LINE,
+                sub,
+                x_norm,
+                ids,
+                weights,
+                partial,
+            },
+            end,
+        )
     }
 
     /// Offsets from the mailbox base when the slot starts at (or after)
@@ -256,14 +287,26 @@ impl PrefillGeometry {
 mod tests {
     use super::*;
 
-    const P: PrefillGeometry = PrefillGeometry { max_rows: 2048, top_k: 10, dim: 2560, sub_chunks: 4 };
+    const P: PrefillGeometry = PrefillGeometry {
+        max_rows: 2048,
+        top_k: 10,
+        dim: 2560,
+        sub_chunks: 4,
+    };
 
     fn prefill_ranges(base: usize) -> Vec<(usize, usize)> {
         let o = P.offsets(base);
         let slots = P.max_rows * P.top_k;
         let mut v = vec![(o.error, 4), (o.int4_min_rows, 4)];
         for s in &o.sub[..P.sub_chunks] {
-            v.extend([(s.req_seq, 4), (s.resp_seq, 4), (s.layer, 4), (s.row_off, 4), (s.rows, 4), (s.format, 4)]);
+            v.extend([
+                (s.req_seq, 4),
+                (s.resp_seq, 4),
+                (s.layer, 4),
+                (s.row_off, 4),
+                (s.rows, 4),
+                (s.format, 4),
+            ]);
         }
         v.extend([
             (o.x_norm, P.max_rows * P.dim * 2),
@@ -282,7 +325,10 @@ mod tests {
         for &(off, _) in &pre[pre.len() - 4..] {
             assert_eq!(off % 256, 0);
         }
-        assert!(pre.iter().all(|&(o, _)| o >= base), "prefill slot overlaps the decode slots");
+        assert!(
+            pre.iter().all(|&(o, _)| o >= base),
+            "prefill slot overlaps the decode slots"
+        );
         all.extend(pre);
         all.sort();
         for w in all.windows(2) {
@@ -298,15 +344,26 @@ mod tests {
         for s in &o.sub[..P.sub_chunks] {
             lines.extend([s.req_seq / 64, s.resp_seq / 64, s.layer / 64]);
             for w in [s.row_off, s.rows, s.format] {
-                assert_eq!(w / 64, s.layer / 64, "the primary-written meta shares one line");
+                assert_eq!(
+                    w / 64,
+                    s.layer / 64,
+                    "the primary-written meta shares one line"
+                );
             }
         }
         let mut sorted = lines.clone();
         sorted.sort();
         sorted.dedup();
-        assert_eq!(sorted.len(), lines.len(), "two words share a line: {lines:?}");
+        assert_eq!(
+            sorted.len(),
+            lines.len(),
+            "two words share a line: {lines:?}"
+        );
         for &(off, _) in &prefill_ranges(0)[prefill_ranges(0).len() - 4..] {
-            assert!(!lines.contains(&(off / 64)), "an array shares a word's line");
+            assert!(
+                !lines.contains(&(off / 64)),
+                "an array shares a word's line"
+            );
         }
     }
 
@@ -339,35 +396,70 @@ mod tests {
             assert_eq!(next, rows, "rows {rows} not covered");
             // Leading sub-chunks are the larger ones (the expert device starts sooner on the first).
             let sizes: Vec<usize> = (0..P.sub_chunks).map(|i| P.sub_range(rows, i).1).collect();
-            assert!(sizes.windows(2).all(|w| w[0] >= w[1]), "rows {rows}: {sizes:?}");
+            assert!(
+                sizes.windows(2).all(|w| w[0] >= w[1]),
+                "rows {rows}: {sizes:?}"
+            );
         }
     }
 
     #[test]
     fn sub_chunks_never_drop_below_the_grouped_row_floor() {
-        let g = PrefillGeometry { sub_chunks: MAX_SUB_CHUNKS, ..P };
+        let g = PrefillGeometry {
+            sub_chunks: MAX_SUB_CHUNKS,
+            ..P
+        };
         for rows in [1usize, 37, 511, 512, 1023, 1024, 1525, 2047, 2048] {
             let s = g.sub_chunks_for(rows);
-            assert!((1..=PREFILL_PIPELINE_SUB_CHUNKS).contains(&s), "rows {rows}: {s}");
+            assert!(
+                (1..=PREFILL_PIPELINE_SUB_CHUNKS).contains(&s),
+                "rows {rows}: {s}"
+            );
             let split = PrefillGeometry { sub_chunks: s, ..g };
             let smallest = (0..s).map(|i| split.sub_range(rows, i).1).min().unwrap();
             // Every block keeps the grouped arm unless the whole chunk is below it.
-            assert!(smallest >= MIN_SUB_CHUNK_ROWS || s == 1, "rows {rows}: {s} blocks, smallest {smallest}");
+            assert!(
+                smallest >= MIN_SUB_CHUNK_ROWS || s == 1,
+                "rows {rows}: {s} blocks, smallest {smallest}"
+            );
         }
         assert_eq!(g.sub_chunks_for(2048), PREFILL_PIPELINE_SUB_CHUNKS);
         assert_eq!(g.sub_chunks_for(1024), 2);
         assert_eq!(g.sub_chunks_for(1023), 1);
-        assert_eq!(PrefillGeometry { sub_chunks: 2, ..P }.sub_chunks_for(2048), 2, "never above the slot's count");
+        assert_eq!(
+            PrefillGeometry { sub_chunks: 2, ..P }.sub_chunks_for(2048),
+            2,
+            "never above the slot's count"
+        );
     }
 
     #[test]
     fn sub_chunk_count_is_bounded() {
-        assert!(PrefillGeometry { sub_chunks: MAX_SUB_CHUNKS, ..P }.bytes() > 0);
-        assert!(std::panic::catch_unwind(|| PrefillGeometry { sub_chunks: MAX_SUB_CHUNKS + 1, ..P }.bytes()).is_err());
-        assert!(std::panic::catch_unwind(|| PrefillGeometry { sub_chunks: 0, ..P }.bytes()).is_err());
+        assert!(
+            PrefillGeometry {
+                sub_chunks: MAX_SUB_CHUNKS,
+                ..P
+            }
+            .bytes()
+                > 0
+        );
+        assert!(std::panic::catch_unwind(|| PrefillGeometry {
+            sub_chunks: MAX_SUB_CHUNKS + 1,
+            ..P
+        }
+        .bytes())
+        .is_err());
+        assert!(
+            std::panic::catch_unwind(|| PrefillGeometry { sub_chunks: 0, ..P }.bytes()).is_err()
+        );
     }
 
-    const G: MailboxGeometry = MailboxGeometry { layers: 48, max_rows: 1, top_k: 10, dim: 2560 };
+    const G: MailboxGeometry = MailboxGeometry {
+        layers: 48,
+        max_rows: 1,
+        top_k: 10,
+        dim: 2560,
+    };
 
     fn ranges(g: &MailboxGeometry, l: usize) -> Vec<(usize, usize)> {
         let s = g.slot(l);
@@ -399,10 +491,17 @@ mod tests {
     fn words_have_their_own_cache_lines() {
         for l in [0, 1, 47] {
             let s = G.slot(l);
-            let lines: Vec<usize> = [s.req_seq, s.resp_seq, s.error, s.rows].iter().map(|o| o / 64).collect();
+            let lines: Vec<usize> = [s.req_seq, s.resp_seq, s.error, s.rows]
+                .iter()
+                .map(|o| o / 64)
+                .collect();
             let mut distinct = lines.clone();
             distinct.dedup();
-            assert_eq!(distinct.len(), 4, "the slot's words share a line: {lines:?}");
+            assert_eq!(
+                distinct.len(),
+                4,
+                "the slot's words share a line: {lines:?}"
+            );
             for &(off, _) in &ranges(&G, l)[3..] {
                 assert!(!lines.contains(&(off / 64)), "array shares a word's line");
             }

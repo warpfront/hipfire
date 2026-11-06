@@ -4301,10 +4301,16 @@ pub(crate) fn try_run_hetero_prompt(
         return decline(why);
     }
     let entry = bundle.state.position;
-    let Some(end) = entry.checked_add(rows).filter(|&end| end <= bundle.state.max_seq_len) else {
+    let Some(end) = entry
+        .checked_add(rows)
+        .filter(|&end| end <= bundle.state.max_seq_len)
+    else {
         return decline("context capacity");
     };
-    if tokens.iter().any(|&t| t as usize >= bundle.config.vocab_size) {
+    if tokens
+        .iter()
+        .any(|&t| t as usize >= bundle.config.vocab_size)
+    {
         return decline("token outside the vocabulary");
     }
     // Session boundaries: every tile ends at one (its layers' state is
@@ -4312,7 +4318,9 @@ pub(crate) fn try_run_hetero_prompt(
     let cuts = bundle.prompt_txn_cuts(entry, end);
     let few_row_limit = few_row_limit_of(forward, gpu, tile_rows);
     let geo = RunGeo::new(forward, bundle, few_row_limit, bundle.config.num_experts)?;
-    let Some(lm) = crate::hetero::layer_major(gpu, tile_rows, geo.wide, geo.hidden).map_err(invalid)? else {
+    let Some(lm) =
+        crate::hetero::layer_major(gpu, tile_rows, geo.wide, geo.hidden).map_err(invalid)?
+    else {
         return Ok(false);
     };
     let slots = crate::hetero::layer_major_tiles(lm.shared.slots());
@@ -4324,7 +4332,8 @@ pub(crate) fn try_run_hetero_prompt(
     // over the fewest windows of at most `slots` tiles.
     let total_tiles = rows.div_ceil(tile_rows);
     let window_count = total_tiles.div_ceil(slots);
-    let per_window = |w: usize| total_tiles / window_count + usize::from(w < total_tiles % window_count);
+    let per_window =
+        |w: usize| total_tiles / window_count + usize::from(w < total_tiles % window_count);
     let mut prompt_row = 0;
     while prompt_row < rows {
         let first = tiles.len();
@@ -4335,7 +4344,10 @@ pub(crate) fn try_run_hetero_prompt(
                 break;
             }
             let position = entry + prompt_row;
-            let to_cut = cuts.iter().find(|&&c| c > position).map_or(usize::MAX, |&c| c - position);
+            let to_cut = cuts
+                .iter()
+                .find(|&&c| c > position)
+                .map_or(usize::MAX, |&c| c - position);
             let n = tile_rows.min(rows - prompt_row).min(to_cut);
             tiles.push(TilePlan {
                 index: tiles.len(),
@@ -4355,7 +4367,10 @@ pub(crate) fn try_run_hetero_prompt(
         if let Some(last) = tiles.last_mut() {
             last.last_in_window = true;
         }
-        let (w_start, w_end) = (entry + window_prompt_row, entry + window_prompt_row + window_row);
+        let (w_start, w_end) = (
+            entry + window_prompt_row,
+            entry + window_prompt_row + window_row,
+        );
         // The transaction's own boundaries of this window; each must be a tile end.
         let window_cuts = bundle.prompt_txn_cuts(w_start, w_end);
         for (i, &cut) in window_cuts.iter().enumerate() {
@@ -4395,14 +4410,19 @@ pub(crate) fn try_run_hetero_prompt(
     let outcome = {
         let mut run = HeteroRun {
             host: [0.0; 7],
-            trace: std::env::var("HIPFIRE_HETERO_PREFILL_TRACE").is_ok_and(|v| v == "1").then(HeteroTrace::default),
+            trace: std::env::var("HIPFIRE_HETERO_PREFILL_TRACE")
+                .is_ok_and(|v| v == "1")
+                .then(HeteroTrace::default),
             forward: &mut *forward,
             bundle: &mut *bundle,
             gpu: &mut *gpu,
             geo: &geo,
             tokens,
             output: &mut output,
-            ple: PleCursor { retained: ple_retained, histories: Vec::new() },
+            ple: PleCursor {
+                retained: ple_retained,
+                histories: Vec::new(),
+            },
             lm: &lm,
         };
         let mut outcome = Ok(());
@@ -4477,7 +4497,9 @@ impl HeteroRun<'_, '_> {
                 self.lm.shared.clear_pending();
                 match self.bundle.prompt_txn_abort(&mut *self.gpu, txn) {
                     Ok(()) => Err(error),
-                    Err(abort) => Err(invalid(format!("{error}; transaction abort failed: {abort}"))),
+                    Err(abort) => Err(invalid(format!(
+                        "{error}; transaction abort failed: {abort}"
+                    ))),
                 }
             }
         }
@@ -4485,7 +4507,8 @@ impl HeteroRun<'_, '_> {
 
     fn body(&mut self, w: &WinCtx<'_>, txn: &mut PromptTxn) -> R<()> {
         let geo = self.geo;
-        self.ple.histories = PleCursor::histories_for(self.bundle.state.ple_history, w.tiles, w.tokens);
+        self.ple.histories =
+            PleCursor::histories_for(self.bundle.state.ple_history, w.tiles, w.tokens);
         // Every tile reaches the PLE layer back to back (layer-major), so the
         // one-tile lookahead of `stage_tile` hides almost nothing: warm every
         // tile's rows now (best effort, no lease), while layer 0 runs.
@@ -4502,7 +4525,13 @@ impl HeteroRun<'_, '_> {
             .iter()
             .any(|tile| tile.routing.route_rows >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS)
         {
-            if let Some(qsa) = self.bundle.state.qsa.first().filter(|qsa| qsa.f16_arena.is_none()) {
+            if let Some(qsa) = self
+                .bundle
+                .state
+                .qsa
+                .first()
+                .filter(|qsa| qsa.f16_arena.is_none())
+            {
                 ensure_qsa_gathered_wmma_workspace(
                     &mut *self.gpu,
                     qsa.format,
@@ -4540,10 +4569,14 @@ impl HeteroRun<'_, '_> {
             return f(self);
         };
         let begin = self.gpu.hip.event_create()?;
-        self.gpu.hip.event_record(&begin, self.gpu.active_stream.as_ref())?;
+        self.gpu
+            .hip
+            .event_record(&begin, self.gpu.active_stream.as_ref())?;
         let out = f(self);
         let end = self.gpu.hip.event_create()?;
-        self.gpu.hip.event_record(&end, self.gpu.active_stream.as_ref())?;
+        self.gpu
+            .hip
+            .event_record(&end, self.gpu.active_stream.as_ref())?;
         if let Some(t) = self.trace.as_mut() {
             t.marks.push((post, begin, end));
         }
@@ -4593,8 +4626,14 @@ impl HeteroRun<'_, '_> {
             let _ = self.gpu.hip.event_destroy(y);
         }
         by_op.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let ops: Vec<String> = by_op.iter().map(|(n, ms, c)| format!("{n} {:.2} ms ({c})", ms / layers)).collect();
-        eprintln!("hetero layer-major trace: mixer per layer by op: {}", ops.join(", "));
+        let ops: Vec<String> = by_op
+            .iter()
+            .map(|(n, ms, c)| format!("{n} {:.2} ms ({c})", ms / layers))
+            .collect();
+        eprintln!(
+            "hetero layer-major trace: mixer per layer by op: {}",
+            ops.join(", ")
+        );
         eprintln!(
             "hetero layer-major trace: {} tiles, {} rows: stream span {span:.1} ms (wall {:.1}), per layer pre {:.2} ms post {:.2} ms (post = joins incl. waits + HC writes)",
             w.tiles.len(),
@@ -4654,8 +4693,12 @@ impl HeteroRun<'_, '_> {
     fn pre(&mut self, w: &WinCtx<'_>, ti: usize, layer: usize) -> R<()> {
         let tile = &w.tiles[ti];
         let n = tile.rows;
-        self.lm.shared.set_slot(self.slot(ti)).map_err(|e| invalid(format!("{e:?}")))?;
-        self.gpu.set_router_row_base(if n > 1 { tile.position } else { 0 });
+        self.lm
+            .shared
+            .set_slot(self.slot(ti))
+            .map_err(|e| invalid(format!("{e:?}")))?;
+        self.gpu
+            .set_router_row_base(if n > 1 { tile.position } else { 0 });
         let (scopes, _) = self.forward.enter_tile_scopes(&mut *self.gpu, n);
         let outcome = self.pre_scoped(w, ti, layer);
         Qwen4GpuForward::leave_tile_scopes(&mut *self.gpu, scopes);
@@ -4679,7 +4722,12 @@ impl HeteroRun<'_, '_> {
         Ok(())
     }
 
-    fn pre_scoped(&mut self, w: &WinCtx<'_>, ti: usize, layer: usize) -> R<Option<(usize, usize, usize, usize, usize)>> {
+    fn pre_scoped(
+        &mut self,
+        w: &WinCtx<'_>,
+        ti: usize,
+        layer: usize,
+    ) -> R<Option<(usize, usize, usize, usize, usize)>> {
         let geo = self.geo;
         let tile = &w.tiles[ti];
         let n = tile.rows;
@@ -4719,7 +4767,8 @@ impl HeteroRun<'_, '_> {
         }
         let ffn = &self.lm.ffn[self.slot(ti)];
         let trace = self.trace.is_some();
-        let mut split_marks: Option<(hip_bridge::Event, hip_bridge::Event, hip_bridge::Event)> = None;
+        let mut split_marks: Option<(hip_bridge::Event, hip_bridge::Event, hip_bridge::Event)> =
+            None;
         let mut op_marks: Vec<(&'static str, hip_bridge::Event, hip_bridge::Event)> = Vec::new();
         let t_frame = std::time::Instant::now();
         let mut ph = [0f64; 5];
@@ -4737,13 +4786,20 @@ impl HeteroRun<'_, '_> {
                 let env = frame.env;
                 let mut steps: Vec<Step<'_>> = Vec::with_capacity(8);
                 if geo.ple_layer == Some(layer) {
-                    let ple_weights = frame.layer.ple.as_ref().ok_or_else(|| invalid("PLE weights missing"))?;
-                    let (step, _rows_f16) = env.ple_step(gpu, ple_weights, geo.ple_heads, geo.ple_width)?;
+                    let ple_weights = frame
+                        .layer
+                        .ple
+                        .as_ref()
+                        .ok_or_else(|| invalid("PLE weights missing"))?;
+                    let (step, _rows_f16) =
+                        env.ple_step(gpu, ple_weights, geo.ple_heads, geo.ple_width)?;
                     steps.push(step);
                 }
                 env.push_mixer_prefix(&mut steps, layer, frame.layer, frame.description)?;
                 match &frame.description.ffn {
-                    Qwen4FfnBinding::Moe(moe) => env.moe_steps(&mut steps, frame.ctx, *moe, frame.scratch_desc)?,
+                    Qwen4FfnBinding::Moe(moe) => {
+                        env.moe_steps(&mut steps, frame.ctx, *moe, frame.scratch_desc)?
+                    }
                     Qwen4FfnBinding::Dense(dense) => steps.push(env.dense_step(dense)),
                 }
                 ph[1] = t.elapsed().as_secs_f64() * 1e6;
@@ -4758,22 +4814,32 @@ impl HeteroRun<'_, '_> {
                     }
                 }
                 if trace {
-                    let moe_at = steps.iter().position(|s| matches!(s, Step::Moe(_))).unwrap_or(steps.len());
-                    let (a, b, c) = (gpu.hip.event_create()?, gpu.hip.event_create()?, gpu.hip.event_create()?);
+                    let moe_at = steps
+                        .iter()
+                        .position(|s| matches!(s, Step::Moe(_)))
+                        .unwrap_or(steps.len());
+                    let (a, b, c) = (
+                        gpu.hip.event_create()?,
+                        gpu.hip.event_create()?,
+                        gpu.hip.event_create()?,
+                    );
                     gpu.hip.event_record(&a, gpu.active_stream.as_ref())?;
                     for step in &steps[..moe_at] {
                         let (x, y) = (gpu.hip.event_create()?, gpu.hip.event_create()?);
                         gpu.hip.event_record(&x, gpu.active_stream.as_ref())?;
-                        execute_validated_steps(gpu, frame.ctx, std::slice::from_ref(step)).map_err(dsp_err("layer program"))?;
+                        execute_validated_steps(gpu, frame.ctx, std::slice::from_ref(step))
+                            .map_err(dsp_err("layer program"))?;
                         gpu.hip.event_record(&y, gpu.active_stream.as_ref())?;
                         op_marks.push((step.variant_name(), x, y));
                     }
                     gpu.hip.event_record(&b, gpu.active_stream.as_ref())?;
-                    execute_validated_steps(gpu, frame.ctx, &steps[moe_at..]).map_err(dsp_err("layer program"))?;
+                    execute_validated_steps(gpu, frame.ctx, &steps[moe_at..])
+                        .map_err(dsp_err("layer program"))?;
                     gpu.hip.event_record(&c, gpu.active_stream.as_ref())?;
                     split_marks = Some((a, b, c));
                 } else {
-                    execute_validated_steps(gpu, frame.ctx, &steps).map_err(dsp_err("layer program"))?;
+                    execute_validated_steps(gpu, frame.ctx, &steps)
+                        .map_err(dsp_err("layer program"))?;
                 }
                 ph[3] = t.elapsed().as_secs_f64() * 1e6;
                 let t = std::time::Instant::now();
@@ -4814,11 +4880,16 @@ impl HeteroRun<'_, '_> {
         let slot = self.slot(ti);
         let ffn = view(&self.lm.ffn[slot], 0, n * geo.hidden);
         if let Some(runtime) = self.forward.moe.get(layer).and_then(Option::as_ref) {
-            if let Some(split) = hipfire_dispatch::families::moe::RoutedExpertWeights::hetero_prefill(runtime) {
-                split.join_slot(&mut *self.gpu, slot, n, &ffn).map_err(|e| invalid(format!("{e:?}")))?;
+            if let Some(split) =
+                hipfire_dispatch::families::moe::RoutedExpertWeights::hetero_prefill(runtime)
+            {
+                split
+                    .join_slot(&mut *self.gpu, slot, n, &ffn)
+                    .map_err(|e| invalid(format!("{e:?}")))?;
             }
         }
-        self.gpu.set_router_row_base(if n > 1 { tile.position } else { 0 });
+        self.gpu
+            .set_router_row_base(if n > 1 { tile.position } else { 0 });
         let (scopes, _) = self.forward.enter_tile_scopes(&mut *self.gpu, n);
         let result = with_tile_frame(
             &*self.forward,
@@ -4844,7 +4915,8 @@ impl HeteroRun<'_, '_> {
         let tile = &w.tiles[ti];
         let n = tile.rows;
         for (index, token) in w.tile_tokens(ti).iter().copied().enumerate() {
-            self.forward.host_token_bytes[index * 4..index * 4 + 4].copy_from_slice(&(token as i32).to_ne_bytes());
+            self.forward.host_token_bytes[index * 4..index * 4 + 4]
+                .copy_from_slice(&(token as i32).to_ne_bytes());
         }
         let (scopes, _) = self.forward.enter_tile_scopes(&mut *self.gpu, n);
         let result = (|| -> R<()> {
@@ -4856,12 +4928,24 @@ impl HeteroRun<'_, '_> {
             let ids = view(&scratch.token_ids, 0, n * std::mem::size_of::<i32>());
             let embedding_rot = view(&scratch.embedding_rot, 0, n * geo.hidden);
             let embeddings = view(&scratch.embeddings, 0, n * geo.hidden);
-            let table = self.bundle.weights.resident(&self.bundle.weights.root.embedding)?;
+            let table = self
+                .bundle
+                .weights
+                .resident(&self.bundle.weights.root.embedding)?;
             execute_embedding(
                 &mut *self.gpu,
-                &EmbeddingOp { table, rotated: &embedding_rot, token_ids: &ids, output: &embeddings, rows: n, dim: geo.hidden },
+                &EmbeddingOp {
+                    table,
+                    rotated: &embedding_rot,
+                    token_ids: &ids,
+                    output: &embeddings,
+                    rows: n,
+                    dim: geo.hidden,
+                },
             )
-            .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("Qwen4 embedding: {error:?}")))?;
+            .map_err(|error| {
+                Qwen4GpuForwardError::Dispatch(format!("Qwen4 embedding: {error:?}"))
+            })?;
             let tile_streams = f32_view(&self.lm.streams, tile.stream_offset, n * geo.wide);
             if tile.routing.bf16_streams {
                 self.gpu.hc_streams_init_from_embed_batched_bf16(
@@ -4902,9 +4986,14 @@ impl HeteroRun<'_, '_> {
         let result = (|| -> R<()> {
             let tile_streams = f32_view(&self.lm.streams, tile.stream_offset, n * geo.wide);
             let scratch = &self.forward.scratch;
-            let final_hyper =
-                crate::gpu_forward::hyper_read_desc(&self.bundle.weights, &self.bundle.weights.root.final_hyper)?;
-            let lm_head = crate::gpu_forward::dense_ref(&self.bundle.weights, &self.bundle.weights.root.lm_head)?;
+            let final_hyper = crate::gpu_forward::hyper_read_desc(
+                &self.bundle.weights,
+                &self.bundle.weights.root.final_hyper,
+            )?;
+            let lm_head = crate::gpu_forward::dense_ref(
+                &self.bundle.weights,
+                &self.bundle.weights.root.lm_head,
+            )?;
             let router_logits = matrix_view(&scratch.router_logits, n, router_columns(geo.dims))?;
             let scratch_desc = layer_scratch(scratch, &router_logits);
             execute_final_hyper(
@@ -4916,15 +5005,32 @@ impl HeteroRun<'_, '_> {
                 n,
                 tile.routing.bf16_streams,
             )
-            .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 final hyper: {error:?}")))?;
+            .map_err(|error| {
+                Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 final hyper: {error:?}"))
+            })?;
             let final_hidden = view(&scratch.hc_mixed, 0, n * geo.hidden);
             let head_rotation = view(&scratch.rotation, 0, n * geo.hidden);
-            execute_lm_head(&mut *self.gpu, &lm_head, &final_hidden, logits, n, 1, Some(&head_rotation))
-                .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 LM head: {error:?}")))?;
+            execute_lm_head(
+                &mut *self.gpu,
+                &lm_head,
+                &final_hidden,
+                logits,
+                n,
+                1,
+                Some(&head_rotation),
+            )
+            .map_err(|error| {
+                Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 LM head: {error:?}"))
+            })?;
             if let Some(top1) = top1 {
                 argmax_f32(
                     &mut *self.gpu,
-                    &ArgmaxF32 { logits, indices: top1, rows: 1, vocab: geo.config.vocab_size },
+                    &ArgmaxF32 {
+                        logits,
+                        indices: top1,
+                        rows: 1,
+                        vocab: geo.config.vocab_size,
+                    },
                 )?;
             }
             Ok(())

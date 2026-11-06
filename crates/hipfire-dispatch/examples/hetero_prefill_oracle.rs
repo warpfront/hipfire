@@ -21,10 +21,10 @@ use hipfire_dispatch::cpu_exec::CpuMoeExpert;
 use hipfire_dispatch::families::moe::{
     MoeRecipe, MoeRouteCapability, MoeRouteFormats, MoeRouteGeometry, MoeRoutePolicy,
 };
+use hipfire_dispatch::hetero_mailbox::{int4_row_bytes, ROWS_F16, ROWS_INT4};
 use hipfire_dispatch::hetero_prefill::{
     run_cold_prefill, ColdPrefillConfig, ColdPrefillIo, ColdPrefillLayer, ColdPrefillScratch,
 };
-use hipfire_dispatch::hetero_mailbox::{int4_row_bytes, ROWS_F16, ROWS_INT4};
 use hipfire_dispatch::hetero_responder::ColdLayer;
 use hipfire_dispatch::igpu_split::{ColdArmDims, IgpuColdArm};
 use rdna_compute::{DType, Gpu};
@@ -50,12 +50,17 @@ fn weight_bytes(q: CpuQuant, m: usize, k: usize, expert: usize, symmetric: bool)
     let hdr = q.row_header_bytes();
     // f16: sc = 1/16 (0x2c00), zp = -1/4 (0xb400) or -1/2 (0xb800, symmetric).
     let zp: u16 = if symmetric { 0xb800 } else { 0xb400 };
-    let quad: Vec<u8> = [0x2c00u16, zp, 0x2c00, zp].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let quad: Vec<u8> = [0x2c00u16, zp, 0x2c00, zp]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
     let mut out = Vec::new();
     for row in 0..m {
         for g in 0..groups {
             let salt = row * groups + g + expert * 7919;
-            let mut b: Vec<u8> = (0..hdr + q.group_bytes()).map(|i| (((i + salt) * 37 + 11) & 0xFF) as u8).collect();
+            let mut b: Vec<u8> = (0..hdr + q.group_bytes())
+                .map(|i| (((i + salt) * 37 + 11) & 0xFF) as u8)
+                .collect();
             match q {
                 CpuQuant::Mq4G256V2 => b[..8].copy_from_slice(&quad),
                 CpuQuant::Mq4G128V2 => b[..4].copy_from_slice(&quad[..4]),
@@ -75,7 +80,11 @@ fn pinned(gpu: &Gpu, bytes: usize, coherent: bool) -> *mut u8 {
     if coherent {
         flags |= hip_bridge::HIP_HOST_MALLOC_COHERENT;
     }
-    let p = gpu.hip.host_malloc(bytes, flags).expect("host_malloc").cast::<u8>();
+    let p = gpu
+        .hip
+        .host_malloc(bytes, flags)
+        .expect("host_malloc")
+        .cast::<u8>();
     // SAFETY: fresh allocation of `bytes`.
     unsafe { std::ptr::write_bytes(p, 0, bytes) };
     p
@@ -176,13 +185,23 @@ fn case(rng: &mut Rng, rows: usize) -> Case {
         weights.extend(w.iter().map(|v| v / sum));
     }
     // F16-exact, so the F16 leg carries the reference's own values.
-    let x = (0..rows * DIM).map(|_| f16_value(f16_bits((rng.unit() - 0.5) * 0.2))).collect();
-    Case { rows, ids, weights, x }
+    let x = (0..rows * DIM)
+        .map(|_| f16_value(f16_bits((rng.unit() - 0.5) * 0.2)))
+        .collect();
+    Case {
+        rows,
+        ids,
+        weights,
+        x,
+    }
 }
 
 fn main() {
     let mut gpu = Gpu::init_with_device(0).expect("gfx1151");
-    assert_eq!(gpu.arch, "gfx1151", "run with HIP_VISIBLE_DEVICES=<strix> HIPFIRE_DEVICES=gfx1151");
+    assert_eq!(
+        gpu.arch, "gfx1151",
+        "run with HIP_VISIBLE_DEVICES=<strix> HIPFIRE_DEVICES=gfx1151"
+    );
     let symmetric = std::env::var("ORACLE_SYMMETRIC").map_or(true, |v| v != "0");
     let capability = if symmetric {
         MoeRouteCapability::Qt44Qt53GroupedSymmetric
@@ -209,7 +228,11 @@ fn main() {
         }
     }
     let cold_set = |pick: &dyn Fn(usize) -> bool| {
-        let mut c = ColdLayer { gate_up: vec![0; N_EXP], down: vec![0; N_EXP], cold_bitmap: vec![0; N_EXP] };
+        let mut c = ColdLayer {
+            gate_up: vec![0; N_EXP],
+            down: vec![0; N_EXP],
+            cold_bitmap: vec![0; N_EXP],
+        };
         for e in (0..N_EXP).filter(|&e| pick(e)) {
             // SAFETY: inside `mem`.
             let g = unsafe { mem.add(e * per) };
@@ -233,11 +256,17 @@ fn main() {
         down_bytes: dn_len,
         route_policy: Some(policy(capability)),
         experts_all_gate_up_mq4: true,
-        recipe: MoeRecipe::SoftmaxGatedShared { bf16_round_trip: true, shared_after_combine: true },
+        recipe: MoeRecipe::SoftmaxGatedShared {
+            bf16_round_trip: true,
+            shared_after_combine: true,
+        },
     };
-    let layer = ColdPrefillLayer::new(&mut gpu, cfg, &cold).unwrap_or_else(|e| fail(format!("layer: {e:?}")));
-    let layer_all = ColdPrefillLayer::new(&mut gpu, cfg, &cold_all).unwrap_or_else(|e| fail(format!("layer ALL: {e:?}")));
-    let scratch = ColdPrefillScratch::new(&mut gpu, cfg).unwrap_or_else(|e| fail(format!("scratch: {e:?}")));
+    let layer = ColdPrefillLayer::new(&mut gpu, cfg, &cold)
+        .unwrap_or_else(|e| fail(format!("layer: {e:?}")));
+    let layer_all = ColdPrefillLayer::new(&mut gpu, cfg, &cold_all)
+        .unwrap_or_else(|e| fail(format!("layer ALL: {e:?}")));
+    let scratch =
+        ColdPrefillScratch::new(&mut gpu, cfg).unwrap_or_else(|e| fail(format!("scratch: {e:?}")));
 
     // The prefill mailbox fields (coherent, as the real mailbox).
     // Rows travel as F16 and the partial as BF16 (hetero_mailbox::PrefillGeometry).
@@ -245,7 +274,13 @@ fn main() {
     let ids_mb = pinned(&gpu, MAX_ROWS * TOP_K * 4, true).cast::<i32>();
     let w_mb = pinned(&gpu, MAX_ROWS * TOP_K * 4, true).cast::<f32>();
     let part_mb = pinned(&gpu, MAX_ROWS * DIM * 2, true).cast::<u16>();
-    let io = ColdPrefillIo { x_norm: x_mb as u64, format: ROWS_F16, ids: ids_mb as u64, weights: w_mb as u64, partial: part_mb as u64 };
+    let io = ColdPrefillIo {
+        x_norm: x_mb as u64,
+        format: ROWS_F16,
+        ids: ids_mb as u64,
+        weights: w_mb as u64,
+        partial: part_mb as u64,
+    };
     // SAFETY: the pinned BF16 partial of MAX_ROWS rows.
     let partial = || -> Vec<f32> {
         unsafe { std::slice::from_raw_parts(part_mb, MAX_ROWS * DIM) }
@@ -260,22 +295,35 @@ fn main() {
             std::ptr::copy_nonoverlapping(x16.as_ptr(), x_mb, x16.len());
             std::ptr::copy_nonoverlapping(c.ids.as_ptr(), ids_mb, c.ids.len());
             std::ptr::copy_nonoverlapping(c.weights.as_ptr(), w_mb, c.weights.len());
-            std::slice::from_raw_parts_mut(part_mb, MAX_ROWS * DIM).fill((SENTINEL.to_bits() >> 16) as u16);
+            std::slice::from_raw_parts_mut(part_mb, MAX_ROWS * DIM)
+                .fill((SENTINEL.to_bits() >> 16) as u16);
         }
-        run_cold_prefill(gpu, layer, &scratch, c.rows, io).unwrap_or_else(|e| fail(format!("run {} rows: {e:?}", c.rows)));
+        run_cold_prefill(gpu, layer, &scratch, c.rows, io)
+            .unwrap_or_else(|e| fail(format!("run {} rows: {e:?}", c.rows)));
         gpu.hip.device_synchronize().unwrap();
     };
 
     // Reference rows: rotate on this GPU, then Plan 3's arm per cold slot.
-    let arm = IgpuColdArm::new(0, ColdArmDims { dim: DIM, mi: MI, top_k: TOP_K, n_experts: N_EXP, max_rows: MAX_ROWS })
-        .unwrap_or_else(|e| fail(format!("arm: {e:?}")));
+    let arm = IgpuColdArm::new(
+        0,
+        ColdArmDims {
+            dim: DIM,
+            mi: MI,
+            top_k: TOP_K,
+            n_experts: N_EXP,
+            max_rows: MAX_ROWS,
+        },
+    )
+    .unwrap_or_else(|e| fail(format!("arm: {e:?}")));
     let reference = |gpu: &mut Gpu, c: &Case| -> Vec<f64> {
         let xs = gpu.upload_f32(&c.x, &[c.rows, DIM]).unwrap();
         let xr = gpu.alloc_tensor(&[c.rows, DIM], DType::F32).unwrap();
         gpu.rotate_x_mq_batched(&xs, &xr, DIM, c.rows).unwrap();
         let x_rot = gpu.download_f32(&xr).unwrap();
-        let host_slots: Vec<u32> =
-            (0..c.rows * TOP_K).filter(|&s| cold.cold_bitmap[c.ids[s] as usize] != 0).map(|s| s as u32).collect();
+        let host_slots: Vec<u32> = (0..c.rows * TOP_K)
+            .filter(|&s| cold.cold_bitmap[c.ids[s] as usize] != 0)
+            .map(|s| s as u32)
+            .collect();
         let experts: Vec<CpuMoeExpert<'_>> = host_slots
             .iter()
             .map(|&s| {
@@ -301,8 +349,16 @@ fn main() {
                 std::slice::from_raw_parts_mut(out_pin, c.rows * TOP_K * DIM),
             )
         };
-        arm.host_slot_outputs(c.rows, &c.ids, &host_slots, &experts, x_host, rows_out, std::time::Duration::from_secs(60))
-            .unwrap_or_else(|e| fail(format!("arm call: {e:?}")));
+        arm.host_slot_outputs(
+            c.rows,
+            &c.ids,
+            &host_slots,
+            &experts,
+            x_host,
+            rows_out,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap_or_else(|e| fail(format!("arm call: {e:?}")));
         let mut sum = vec![0f64; c.rows * DIM];
         for &s in &host_slots {
             let (r, s) = (s as usize / TOP_K, s as usize);
@@ -324,7 +380,10 @@ fn main() {
         for i in 0..rows * DIM {
             let d = got[i] as f64 - want[i];
             if !d.is_finite() {
-                fail(format!("rows {rows}: non-finite at {i}: got {} want {}", got[i], want[i]));
+                fail(format!(
+                    "rows {rows}: non-finite at {i}: got {} want {}",
+                    got[i], want[i]
+                ));
             }
             err2 += d * d;
             ref2 += want[i] * want[i];
@@ -335,14 +394,25 @@ fn main() {
         if let Some(i) = (rows * DIM..MAX_ROWS * DIM).find(|&i| got[i] != SENTINEL) {
             fail(format!("rows {rows}: wrote past the chunk at element {i}"));
         }
-        println!("rows {rows:>4}: rel L2 {rel:.3e}, max |d| {max_abs:.3e}, ref rms {:.3e}", (ref2 / (rows * DIM) as f64).sqrt());
-        let bound = if symmetric { REL_L2_MAX_SYMMETRIC } else { REL_L2_MAX };
+        println!(
+            "rows {rows:>4}: rel L2 {rel:.3e}, max |d| {max_abs:.3e}, ref rms {:.3e}",
+            (ref2 / (rows * DIM) as f64).sqrt()
+        );
+        let bound = if symmetric {
+            REL_L2_MAX_SYMMETRIC
+        } else {
+            REL_L2_MAX
+        };
         if rel > bound {
             fail(format!("rows {rows}: rel L2 {rel:.3e} > {bound:.0e}"));
         }
         // Determinism: a second run of the same chunk is bitwise equal.
         run_on(&mut gpu, &layer, &c);
-        if partial()[..rows * DIM].iter().zip(&got).any(|(a, b)| a.to_bits() != b.to_bits()) {
+        if partial()[..rows * DIM]
+            .iter()
+            .zip(&got)
+            .any(|(a, b)| a.to_bits() != b.to_bits())
+        {
             fail(format!("rows {rows}: second run differs"));
         }
     }
@@ -354,7 +424,12 @@ fn main() {
         let c = case(&mut rng, rows);
         run_on(&mut gpu, &layer, &c);
         let masked = partial();
-        let mut pre = Case { rows, ids: c.ids.clone(), weights: c.weights.clone(), x: c.x.clone() };
+        let mut pre = Case {
+            rows,
+            ids: c.ids.clone(),
+            weights: c.weights.clone(),
+            x: c.x.clone(),
+        };
         for id in pre.ids.iter_mut() {
             if cold.cold_bitmap[*id as usize] == 0 {
                 *id = -1;
@@ -364,7 +439,10 @@ fn main() {
         let premasked = partial();
         let n = rows * DIM;
         if let Some(i) = (0..n).find(|&i| masked[i].to_bits() != premasked[i].to_bits()) {
-            fail(format!("masking rows {rows}: element {i} differs: {} vs {}", masked[i], premasked[i]));
+            fail(format!(
+                "masking rows {rows}: element {i} differs: {} vs {}",
+                masked[i], premasked[i]
+            ));
         }
         println!("masking rows {rows:>4}: device mask == pre-masked route, bitwise");
     }
@@ -387,7 +465,11 @@ fn main() {
     // ship, and the int4 call must equal the F16 call bitwise. A 256-row block
     // (below the IU4 arm) and the F16 route must refuse it.
     let x4_mb = pinned(&gpu, MAX_ROWS * int4_row_bytes(DIM), true);
-    let io4 = ColdPrefillIo { x_norm: x4_mb as u64, format: ROWS_INT4, ..io };
+    let io4 = ColdPrefillIo {
+        x_norm: x4_mb as u64,
+        format: ROWS_INT4,
+        ..io
+    };
     for rows in [512usize, 2048, 256] {
         let c = case(&mut rng, rows);
         run_on(&mut gpu, &layer, &c);
@@ -405,7 +487,10 @@ fn main() {
         };
         gpu.hip.memcpy_dtod(&dst, &src, bytes).unwrap();
         // SAFETY: poison the partial; ids/weights are still this case's.
-        unsafe { std::slice::from_raw_parts_mut(part_mb, MAX_ROWS * DIM).fill((SENTINEL.to_bits() >> 16) as u16) };
+        unsafe {
+            std::slice::from_raw_parts_mut(part_mb, MAX_ROWS * DIM)
+                .fill((SENTINEL.to_bits() >> 16) as u16)
+        };
         let got = run_cold_prefill(&mut gpu, &layer, &scratch, rows, io4);
         gpu.hip.device_synchronize().unwrap();
         let expect_ok = symmetric && rows >= 512;
@@ -413,12 +498,20 @@ fn main() {
             (Ok(()), true) => {
                 let g = partial();
                 if let Some(i) = (0..rows * DIM).find(|&i| g[i].to_bits() != want[i].to_bits()) {
-                    fail(format!("int4 rows {rows}: element {i}: {} != F16 path {}", g[i], want[i]));
+                    fail(format!(
+                        "int4 rows {rows}: element {i}: {} != F16 path {}",
+                        g[i], want[i]
+                    ));
                 }
                 println!("int4 rows {rows}: shipped sidecar == own F16 basis, bitwise");
             }
-            (Err(e), false) => println!("int4 rows {rows}: refused as expected ({})", format!("{e:?}").chars().take(90).collect::<String>()),
-            (Ok(()), false) => fail(format!("int4 rows {rows}: accepted where the IU4 arm does not run")),
+            (Err(e), false) => println!(
+                "int4 rows {rows}: refused as expected ({})",
+                format!("{e:?}").chars().take(90).collect::<String>()
+            ),
+            (Ok(()), false) => fail(format!(
+                "int4 rows {rows}: accepted where the IU4 arm does not run"
+            )),
             (Err(e), true) => fail(format!("int4 rows {rows}: {e:?}")),
         }
     }
@@ -433,7 +526,11 @@ fn main() {
         gpu.hip.device_synchronize().unwrap();
     }
     let per = t.elapsed().as_secs_f64() / n as f64;
-    let cold_slots = c.ids.iter().filter(|&&e| cold.cold_bitmap[e as usize] != 0).count();
+    let cold_slots = c
+        .ids
+        .iter()
+        .filter(|&&e| cold.cold_bitmap[e as usize] != 0)
+        .count();
     println!(
         "timing: {MAX_ROWS} rows ({cold_slots} cold slots) {:.2} ms/layer, {:.0} rows/s per layer",
         per * 1e3,

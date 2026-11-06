@@ -12,11 +12,10 @@ use hip_bridge::DeviceBuffer;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::context::DispatchCtx;
-use crate::types::DispatchError;
 use crate::families::gemv::WeightRef;
 use crate::families::moe::{
-    MoeDtypes, MoeNormalization, MoePrefillParams, MoePrefillPrelude, MoeQ8RouterPolicy,
-    MoeRecipe, MoeRoutePolicy, RoutedExpertWeights,
+    MoeDtypes, MoeNormalization, MoePrefillParams, MoePrefillPrelude, MoeQ8RouterPolicy, MoeRecipe,
+    MoeRoutePolicy, RoutedExpertWeights,
 };
 use crate::hetero_mailbox::{int4_row_bytes, ROWS_F16, ROWS_INT4};
 use crate::hetero_responder::ColdLayer;
@@ -25,6 +24,7 @@ use crate::pipeline::{
     ExpertMetadata, ExpertResource, ExpertResources, ExpertTable, PrefillRouteMode, Step,
 };
 use crate::types::dtype_rotation_plan;
+use crate::types::DispatchError;
 
 /// Grouped-GEMM row block of the sealed prefill (`MOE_GROUPED_BLOCK_M`).
 const GROUPED_BLOCK_M: usize = 16;
@@ -142,7 +142,11 @@ static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 impl ColdPrefillLayer {
     /// `cold.gate_up[e]` / `cold.down[e]` are expert `e`'s byte addresses (0
     /// for a hot expert, which this device never runs).
-    pub fn new(gpu: &mut Gpu, cfg: ColdPrefillConfig, cold: &ColdLayer) -> Result<Self, DispatchError> {
+    pub fn new(
+        gpu: &mut Gpu,
+        cfg: ColdPrefillConfig,
+        cold: &ColdLayer,
+    ) -> Result<Self, DispatchError> {
         let n = cfg.n_experts;
         if cold.gate_up.len() != n || cold.down.len() != n || cold.cold_bitmap.len() != n {
             return Err(err("cold tables do not cover every expert"));
@@ -153,7 +157,9 @@ impl ColdPrefillLayer {
             let (gu, dn) = (cold.gate_up[e], cold.down[e]);
             let cold_e = cold.cold_bitmap[e] != 0;
             if cold_e != (gu != 0 && dn != 0) || (!cold_e && (gu != 0 || dn != 0)) {
-                return Err(err(format!("expert {e}: cold bit and table entries disagree")));
+                return Err(err(format!(
+                    "expert {e}: cold bit and table entries disagree"
+                )));
             }
             let gu_res = ExpertResource::new(
                 "hetero.cold.gate_up",
@@ -178,7 +184,12 @@ impl ColdPrefillLayer {
             let record = ExpertMetadata::new(e, 0, e, ExpertResources::fused(gu_res, dn_res)?)?;
             if cold_e {
                 views.push(Some((
-                    view(gu, cfg.gate_up_bytes, vec![cfg.gate_up_bytes], cfg.gate_up_dtype),
+                    view(
+                        gu,
+                        cfg.gate_up_bytes,
+                        vec![cfg.gate_up_bytes],
+                        cfg.gate_up_dtype,
+                    ),
                     view(dn, cfg.down_bytes, vec![cfg.down_bytes], cfg.down_dtype),
                 )));
                 metadata.push(record);
@@ -197,16 +208,29 @@ impl ColdPrefillLayer {
         let mut cache = table.prepare_binding(0, 1, gpu.device_id)?;
         let upload = |gpu: &mut Gpu, entries: &[u64]| -> Result<GpuTensor, DispatchError> {
             let bytes: Vec<u8> = entries.iter().flat_map(|v| v.to_ne_bytes()).collect();
-            let t = gpu.alloc_tensor(&[entries.len() * 2], DType::F32).map_err(hip)?;
+            let t = gpu
+                .alloc_tensor(&[entries.len() * 2], DType::F32)
+                .map_err(hip)?;
             gpu.hip.memcpy_htod(&t.buf, &bytes).map_err(hip)?;
             Ok(t)
         };
         let gate_up_ptrs = upload(gpu, &cold.gate_up)?;
         let down_ptrs = upload(gpu, &cold.down)?;
-        let cold_bitmap = gpu.alloc_tensor(&[n.div_ceil(4)], DType::F32).map_err(hip)?;
-        gpu.hip.memcpy_htod(&cold_bitmap.buf, &cold.cold_bitmap).map_err(hip)?;
+        let cold_bitmap = gpu
+            .alloc_tensor(&[n.div_ceil(4)], DType::F32)
+            .map_err(hip)?;
+        gpu.hip
+            .memcpy_htod(&cold_bitmap.buf, &cold.cold_bitmap)
+            .map_err(hip)?;
         cache.bind_live(&table, &experts, &gate_up_ptrs, &down_ptrs, None, None)?;
-        let mut layer = Self { table, cache, experts, gate_up_ptrs, down_ptrs, cold_bitmap };
+        let mut layer = Self {
+            table,
+            cache,
+            experts,
+            gate_up_ptrs,
+            down_ptrs,
+            cold_bitmap,
+        };
         layer.verify_symmetric(gpu, cold, &upload)?;
         Ok(layer)
     }
@@ -228,7 +252,12 @@ impl ColdPrefillLayer {
             return Ok(());
         };
         let qt = c.gate_up_dtype == DType::MQ4G256V2 && c.down_dtype == DType::MQ4G128V2;
-        if !qt || !matches!(policy.capability, Cap::Qt44Qt53Grouped | Cap::Qt44Qt53GroupedSymmetric) {
+        if !qt
+            || !matches!(
+                policy.capability,
+                Cap::Qt44Qt53Grouped | Cap::Qt44Qt53GroupedSymmetric
+            )
+        {
             return Ok(());
         }
         let gu: Vec<u64> = cold.gate_up.iter().copied().filter(|&p| p != 0).collect();
@@ -237,11 +266,19 @@ impl ColdPrefillLayer {
             return Ok(());
         }
         let (gu_t, dn_t) = (upload(gpu, &gu)?, upload(gpu, &dn)?);
-        let symmetric = gpu.qwen4_moe_sym_check(&gu_t, 2 * c.mi, c.dim, gu.len(), 136).map_err(hip)?
-            && gpu.qwen4_moe_sym_check(&dn_t, c.dim, c.mi, dn.len(), 68).map_err(hip)?;
+        let symmetric = gpu
+            .qwen4_moe_sym_check(&gu_t, 2 * c.mi, c.dim, gu.len(), 136)
+            .map_err(hip)?
+            && gpu
+                .qwen4_moe_sym_check(&dn_t, c.dim, c.mi, dn.len(), 68)
+                .map_err(hip)?;
         let _ = gpu.free_tensor(gu_t);
         let _ = gpu.free_tensor(dn_t);
-        policy.capability = if symmetric { Cap::Qt44Qt53GroupedSymmetric } else { Cap::Qt44Qt53Grouped };
+        policy.capability = if symmetric {
+            Cap::Qt44Qt53GroupedSymmetric
+        } else {
+            Cap::Qt44Qt53Grouped
+        };
         Ok(())
     }
 
@@ -339,7 +376,12 @@ fn zero(gpu: &mut Gpu, buf: &DeviceBuffer, bytes: usize) -> Result<(), DispatchE
 }
 
 /// Stream-ordered copy (the active stream, else the default stream).
-fn copy(gpu: &mut Gpu, dst: &DeviceBuffer, src: &DeviceBuffer, bytes: usize) -> Result<(), DispatchError> {
+fn copy(
+    gpu: &mut Gpu,
+    dst: &DeviceBuffer,
+    src: &DeviceBuffer,
+    bytes: usize,
+) -> Result<(), DispatchError> {
     match gpu.active_stream.as_ref() {
         Some(stream) => gpu.hip.memcpy_dtod_async_at(dst, 0, src, 0, bytes, stream),
         None => gpu.hip.memcpy_dtod_async_default_at(dst, 0, src, 0, bytes),
@@ -364,14 +406,27 @@ pub fn run_cold_prefill(
     let slots = rows * c.top_k;
     let row_bytes = rows * c.dim * 4;
     let mb_w = view(io.weights, slots * 4, vec![slots], DType::F32);
-    let x_norm = GpuTensor { buf: s.x_norm_batch.buf.byte_view(0, row_bytes), shape: vec![rows, c.dim], dtype: DType::F32 };
-    let weights = GpuTensor { buf: s.topk_weights.buf.byte_view(0, slots * 4), shape: vec![slots], dtype: DType::F32 };
-    let partial = GpuTensor { buf: s.x_batch.buf.byte_view(0, row_bytes), shape: vec![rows, c.dim], dtype: DType::F32 };
+    let x_norm = GpuTensor {
+        buf: s.x_norm_batch.buf.byte_view(0, row_bytes),
+        shape: vec![rows, c.dim],
+        dtype: DType::F32,
+    };
+    let weights = GpuTensor {
+        buf: s.topk_weights.buf.byte_view(0, slots * 4),
+        shape: vec![slots],
+        dtype: DType::F32,
+    };
+    let partial = GpuTensor {
+        buf: s.x_batch.buf.byte_view(0, row_bytes),
+        shape: vec![rows, c.dim],
+        dtype: DType::F32,
+    };
     // F16 rows are widened for the call's own basis; an int4 sidecar is
     // copied into this device's IU4 reservation and consumed as is.
     let xq = match io.format {
         ROWS_F16 => {
-            gpu.hetero_f16_to_f32(io.x_norm, &x_norm, (rows * c.dim) as i32).map_err(hip)?;
+            gpu.hetero_f16_to_f32(io.x_norm, &x_norm, (rows * c.dim) as i32)
+                .map_err(hip)?;
             None
         }
         ROWS_INT4 => {
@@ -380,14 +435,22 @@ pub fn run_cold_prefill(
             let dst = view(res.ptr() as u64, bytes, vec![bytes], DType::Raw);
             let src = view(io.x_norm, bytes, vec![bytes], DType::Raw);
             copy(gpu, &dst.buf, &src.buf, bytes)?;
-            Some(rdna_compute::scratch::Int4MmqPrepared::from_reservation(res))
+            Some(rdna_compute::scratch::Int4MmqPrepared::from_reservation(
+                res,
+            ))
         }
         f => return Err(err(format!("unknown row format {f}"))),
     };
     copy(gpu, &weights.buf, &mb_w.buf, slots * 4)?;
     zero(gpu, &partial.buf, row_bytes)?;
-    gpu.hetero_mask_hot(io.ids, &layer.cold_bitmap, c.n_experts as i32, slots as i32, &s.topk_indices)
-        .map_err(hip)?;
+    gpu.hetero_mask_hot(
+        io.ids,
+        &layer.cold_bitmap,
+        c.n_experts as i32,
+        slots as i32,
+        &s.topk_indices,
+    )
+    .map_err(hip)?;
 
     let router = WeightRef {
         buf: &s.router,
@@ -472,5 +535,6 @@ pub fn run_cold_prefill(
     let experts = BoundMoeExperts::from_cache(&layer.table, &layer.cache)?;
     let call = seal_prefill(experts, &ctx, params)?;
     crate::pipeline::execute_steps(gpu, &ctx, &[Step::Moe(call)])?;
-    gpu.hetero_f32_to_bf16(&partial, io.partial, (rows * c.dim) as i32).map_err(hip)
+    gpu.hetero_f32_to_bf16(&partial, io.partial, (rows * c.dim) as i32)
+        .map_err(hip)
 }

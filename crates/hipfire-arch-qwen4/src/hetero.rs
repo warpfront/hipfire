@@ -54,12 +54,17 @@ static ARM: Mutex<Option<Arc<IgpuColdArm>>> = Mutex::new(None);
 /// The shared iGPU arm when the split is requested, opened on first use; `None`
 /// when it is not. `dims.max_rows` is raised to the D2 storage cap so every
 /// executor of the load (wider verify reservations included) fits one arm.
-pub(crate) fn arm_for(primary_arch: &str, dims: ColdArmDims) -> Result<Option<Arc<IgpuColdArm>>, String> {
+pub(crate) fn arm_for(
+    primary_arch: &str,
+    dims: ColdArmDims,
+) -> Result<Option<Arc<IgpuColdArm>>, String> {
     if requested()?.is_none() {
         return Ok(None);
     }
     check_primary(primary_arch)?;
-    let mut slot = ARM.lock().map_err(|_| "topology.hetero_experts: arm lock poisoned".to_owned())?;
+    let mut slot = ARM
+        .lock()
+        .map_err(|_| "topology.hetero_experts: arm lock poisoned".to_owned())?;
     if let Some(arm) = slot.as_ref() {
         return Ok(Some(Arc::clone(arm)));
     }
@@ -83,7 +88,9 @@ pub(crate) fn arm_for(primary_arch: &str, dims: ColdArmDims) -> Result<Option<Ar
 use hipfire_dispatch::hetero_device::{HeteroDeviceSplit, HeteroPrefillShared, HeteroPrefillSplit};
 use hipfire_dispatch::hetero_mailbox::{MailboxGeometry, PrefillGeometry, MAX_SUB_CHUNKS};
 use hipfire_dispatch::hetero_prefill::ColdPrefillConfig;
-use hipfire_dispatch::hetero_responder::{ColdLayer, HeteroResponder, PrefillServe, ResponderConfig};
+use hipfire_dispatch::hetero_responder::{
+    ColdLayer, HeteroResponder, PrefillServe, ResponderConfig,
+};
 
 /// Rows of the decode exchange: single-token decode and MTP verify windows up
 /// to this width take the decode slot (one round trip per layer, no staging);
@@ -176,7 +183,9 @@ unsafe impl Send for DeviceContext {}
 static DEVICE: Mutex<Option<DeviceContext>> = Mutex::new(None);
 
 fn lock_device() -> Result<std::sync::MutexGuard<'static, Option<DeviceContext>>, String> {
-    DEVICE.lock().map_err(|_| "topology.hetero_experts: device context lock poisoned".to_owned())
+    DEVICE
+        .lock()
+        .map_err(|_| "topology.hetero_experts: device context lock poisoned".to_owned())
 }
 
 /// Whether every layer has attached (the responder can start).
@@ -207,8 +216,18 @@ pub(crate) fn attach_device_layer(
     if guard.is_none() {
         // One slot per trunk layer, then the MTP head's (served once a head
         // attaches: `attach_head_layer`).
-        let geom = MailboxGeometry { layers: layers + HEAD_SLOTS, max_rows: HETERO_DECODE_ROWS, top_k, dim };
-        let pgeom = PrefillGeometry { max_rows: prefill_cold.max_rows, top_k, dim, sub_chunks: MAX_SUB_CHUNKS };
+        let geom = MailboxGeometry {
+            layers: layers + HEAD_SLOTS,
+            max_rows: HETERO_DECODE_ROWS,
+            top_k,
+            dim,
+        };
+        let pgeom = PrefillGeometry {
+            max_rows: prefill_cold.max_rows,
+            top_k,
+            dim,
+            sub_chunks: MAX_SUB_CHUNKS,
+        };
         let mut poffs = Vec::with_capacity(HETERO_PREFILL_SLOTS);
         let mut end = geom.total_bytes();
         for _ in 0..HETERO_PREFILL_SLOTS {
@@ -221,8 +240,11 @@ pub(crate) fn attach_device_layer(
         let mailbox = gpu.hip.host_malloc(total, flags).map_err(hip)?.cast::<u8>();
         // SAFETY: fresh pinned allocation of `total` bytes: zero = never written.
         unsafe { std::ptr::write_bytes(mailbox, 0, total) };
-        let counter = gpu.alloc_tensor(&[1], rdna_compute::DType::F32).map_err(hip)?;
-        gpu.memcpy_htod_auto(&counter.buf, &0u32.to_ne_bytes()).map_err(hip)?;
+        let counter = gpu
+            .alloc_tensor(&[1], rdna_compute::DType::F32)
+            .map_err(hip)?;
+        gpu.memcpy_htod_auto(&counter.buf, &0u32.to_ne_bytes())
+            .map_err(hip)?;
         // SAFETY: a non-owning view of the load's counter, which outlives the load.
         let counter_view = unsafe {
             rdna_compute::GpuTensor {
@@ -231,8 +253,16 @@ pub(crate) fn attach_device_layer(
                 dtype: rdna_compute::DType::F32,
             }
         };
-        let prefill = HeteroPrefillShared::new(gpu, mailbox as u64, &poffs, pgeom, placement.len(), counter_view, AWAIT_MAX_POLLS)
-            .map_err(|e| format!("topology.hetero_experts: {e:?}"))?;
+        let prefill = HeteroPrefillShared::new(
+            gpu,
+            mailbox as u64,
+            &poffs,
+            pgeom,
+            placement.len(),
+            counter_view,
+            AWAIT_MAX_POLLS,
+        )
+        .map_err(|e| format!("topology.hetero_experts: {e:?}"))?;
         *guard = Some(DeviceContext {
             mailbox: mailbox as usize,
             geom,
@@ -253,12 +283,22 @@ pub(crate) fn attach_device_layer(
     }
     let ctx = guard.as_mut().expect("initialized above");
     if ctx.pending.len() != layers || layer >= layers || ctx.n_experts != placement.len() {
-        return Err(format!("topology.hetero_experts: layer {layer} of {layers} does not match the load's geometry"));
+        return Err(format!(
+            "topology.hetero_experts: layer {layer} of {layers} does not match the load's geometry"
+        ));
     }
-    ctx.pending[layer] = Some(ColdLayer { gate_up: tables.0, down: tables.1, cold_bitmap: placement.to_vec() });
-    let bitmap = gpu.alloc_tensor(&[placement.len().div_ceil(4)], rdna_compute::DType::F32).map_err(hip)?;
+    ctx.pending[layer] = Some(ColdLayer {
+        gate_up: tables.0,
+        down: tables.1,
+        cold_bitmap: placement.to_vec(),
+    });
+    let bitmap = gpu
+        .alloc_tensor(&[placement.len().div_ceil(4)], rdna_compute::DType::F32)
+        .map_err(hip)?;
     gpu.memcpy_htod_auto(&bitmap.buf, placement).map_err(hip)?;
-    let masked_ids = gpu.alloc_tensor(&[HETERO_DECODE_ROWS * top_k], rdna_compute::DType::F32).map_err(hip)?;
+    let masked_ids = gpu
+        .alloc_tensor(&[HETERO_DECODE_ROWS * top_k], rdna_compute::DType::F32)
+        .map_err(hip)?;
     let slot = slot_ptrs(ctx, layer);
     let b = ctx.mailbox as u64;
     // SAFETY: a non-owning view of the load's counter, which outlives the load.
@@ -270,7 +310,11 @@ pub(crate) fn attach_device_layer(
         }
     };
     if all_attached(&ctx.pending) && ctx.responder.is_none() {
-        let layers_v: Vec<ColdLayer> = ctx.pending.iter().map(|l| l.clone().expect("all attached")).collect();
+        let layers_v: Vec<ColdLayer> = ctx
+            .pending
+            .iter()
+            .map(|l| l.clone().expect("all attached"))
+            .collect();
         let cfg = ResponderConfig {
             ordinal: EXPERT_DEVICE,
             geom: ctx.geom,
@@ -280,10 +324,15 @@ pub(crate) fn attach_device_layer(
             prefill: ctx
                 .prefill_offsets
                 .iter()
-                .map(|&offsets| PrefillServe { offsets, sub_chunks: MAX_SUB_CHUNKS, cold: ctx.prefill_cold })
+                .map(|&offsets| PrefillServe {
+                    offsets,
+                    sub_chunks: MAX_SUB_CHUNKS,
+                    cold: ctx.prefill_cold,
+                })
                 .collect(),
         };
-        let responder = HeteroResponder::start(cfg, layers_v).map_err(|e| format!("topology.hetero_experts: {e:?}"))?;
+        let responder = HeteroResponder::start(cfg, layers_v)
+            .map_err(|e| format!("topology.hetero_experts: {e:?}"))?;
         eprintln!("  qwen4 hetero experts: responder on gfx1151 (HIP device {EXPERT_DEVICE}) recorded {layers} layer graphs");
         ctx.responder = Some(responder);
     }
@@ -296,7 +345,10 @@ pub(crate) fn attach_device_layer(
         }
     };
     let prefill_masked = gpu
-        .alloc_tensor(&[ctx.prefill.geom.max_rows * top_k], rdna_compute::DType::F32)
+        .alloc_tensor(
+            &[ctx.prefill.geom.max_rows * top_k],
+            rdna_compute::DType::F32,
+        )
         .map_err(hip)?;
     let prefill = HeteroPrefillSplit {
         layer: layer as u32,
@@ -355,9 +407,9 @@ pub(crate) fn attach_head_layer(
     check_primary(&gpu.arch)?;
     let hip = |e: hip_bridge::HipError| format!("topology.hetero_experts: MTP head: {e}");
     let mut guard = lock_device()?;
-    let ctx = guard
-        .as_mut()
-        .ok_or_else(|| "topology.hetero_experts: MTP head attached before the trunk layers".to_owned())?;
+    let ctx = guard.as_mut().ok_or_else(|| {
+        "topology.hetero_experts: MTP head attached before the trunk layers".to_owned()
+    })?;
     let index = ctx.pending.len();
     if ctx.head_counter.is_some()
         || ctx.n_experts != placement.len()
@@ -367,15 +419,24 @@ pub(crate) fn attach_head_layer(
     {
         return Err("topology.hetero_experts: the MTP head does not match the load's split (or attached twice)".into());
     }
-    let responder = ctx
-        .responder
-        .as_ref()
-        .ok_or_else(|| "topology.hetero_experts: MTP head attached before the responder started".to_owned())?;
+    let responder = ctx.responder.as_ref().ok_or_else(|| {
+        "topology.hetero_experts: MTP head attached before the responder started".to_owned()
+    })?;
     responder
-        .add_slot(index, ColdLayer { gate_up: tables.0, down: tables.1, cold_bitmap: placement.to_vec() })
+        .add_slot(
+            index,
+            ColdLayer {
+                gate_up: tables.0,
+                down: tables.1,
+                cold_bitmap: placement.to_vec(),
+            },
+        )
         .map_err(|e| format!("topology.hetero_experts: MTP head: {e:?}"))?;
-    let counter = gpu.alloc_tensor(&[1], rdna_compute::DType::F32).map_err(hip)?;
-    gpu.memcpy_htod_auto(&counter.buf, &0u32.to_ne_bytes()).map_err(hip)?;
+    let counter = gpu
+        .alloc_tensor(&[1], rdna_compute::DType::F32)
+        .map_err(hip)?;
+    gpu.memcpy_htod_auto(&counter.buf, &0u32.to_ne_bytes())
+        .map_err(hip)?;
     // SAFETY: a non-owning view of the head's counter, which the context keeps.
     let counter_view = unsafe {
         rdna_compute::GpuTensor {
@@ -385,9 +446,13 @@ pub(crate) fn attach_head_layer(
         }
     };
     ctx.head_counter = Some(counter);
-    let bitmap = gpu.alloc_tensor(&[placement.len().div_ceil(4)], rdna_compute::DType::F32).map_err(hip)?;
+    let bitmap = gpu
+        .alloc_tensor(&[placement.len().div_ceil(4)], rdna_compute::DType::F32)
+        .map_err(hip)?;
     gpu.memcpy_htod_auto(&bitmap.buf, placement).map_err(hip)?;
-    let masked_ids = gpu.alloc_tensor(&[HETERO_DECODE_ROWS * top_k], rdna_compute::DType::F32).map_err(hip)?;
+    let masked_ids = gpu
+        .alloc_tensor(&[HETERO_DECODE_ROWS * top_k], rdna_compute::DType::F32)
+        .map_err(hip)?;
     eprintln!(
         "  qwen4 hetero experts: MTP head on the device split (slot {index}, {} cold experts)",
         placement.iter().filter(|&&c| c != 0).count()
@@ -417,7 +482,10 @@ pub(crate) fn begin_token(gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
         return Ok(());
     };
     let Some(responder) = ctx.responder.as_ref() else {
-        return Err("topology.hetero_experts: not every layer attached the device split; no responder".into());
+        return Err(
+            "topology.hetero_experts: not every layer attached the device split; no responder"
+                .into(),
+        );
     };
     if let Some(f) = responder.failure() {
         return Err(format!("topology.hetero_experts: responder stopped: {f}"));
@@ -425,7 +493,8 @@ pub(crate) fn begin_token(gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
     for l in 0..ctx.geom.layers {
         let addr = ctx.mailbox + ctx.geom.slot(l).error;
         // SAFETY: an aligned word in the live pinned mailbox.
-        let e = unsafe { &*(addr as *const std::sync::atomic::AtomicU32) }.load(std::sync::atomic::Ordering::Acquire);
+        let e = unsafe { &*(addr as *const std::sync::atomic::AtomicU32) }
+            .load(std::sync::atomic::Ordering::Acquire);
         if e != 0 {
             return Err(format!(
                 "topology.hetero_experts: layer {l} timed out waiting for the expert device (seq {e}); the split is poisoned"
@@ -438,7 +507,8 @@ pub(crate) fn begin_token(gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
             "topology.hetero_experts: a prefill chunk timed out waiting for the expert device (seq {e}); the split is poisoned"
         ));
     }
-    gpu.hetero_token_advance(&ctx.counter).map_err(|e| format!("topology.hetero_experts: {e}"))
+    gpu.hetero_token_advance(&ctx.counter)
+        .map_err(|e| format!("topology.hetero_experts: {e}"))
 }
 
 #[cfg(test)]
@@ -456,7 +526,10 @@ mod tests {
     fn hetero_requires_primary_gfx1201_then_gfx1151() {
         assert!(check_primary("gfx1201").is_ok());
         let e = check_primary("gfx1151").unwrap_err();
-        assert!(e.contains("topology.hetero_experts") && e.contains("gfx1201,gfx1151"), "{e}");
+        assert!(
+            e.contains("topology.hetero_experts") && e.contains("gfx1201,gfx1151"),
+            "{e}"
+        );
     }
 }
 
@@ -471,8 +544,13 @@ pub(crate) struct LayerMajor {
 }
 
 /// (tile rows, wide, hidden) the arena was sized for, and its owners.
-static ARENA: Mutex<Option<((usize, usize, usize), rdna_compute::GpuTensor, Vec<rdna_compute::GpuTensor>)>> =
-    Mutex::new(None);
+static ARENA: Mutex<
+    Option<(
+        (usize, usize, usize),
+        rdna_compute::GpuTensor,
+        Vec<rdna_compute::GpuTensor>,
+    )>,
+> = Mutex::new(None);
 
 fn view_of(t: &rdna_compute::GpuTensor) -> rdna_compute::GpuTensor {
     // SAFETY: a non-owning view of an arena tensor that lives for the process.
@@ -507,7 +585,9 @@ pub(crate) fn layer_major(
     }
     let slots = shared.slots();
     let hip = |e: hip_bridge::HipError| format!("topology.hetero_experts: layer-major arena: {e}");
-    let mut arena = ARENA.lock().map_err(|_| "topology.hetero_experts: arena lock poisoned".to_owned())?;
+    let mut arena = ARENA
+        .lock()
+        .map_err(|_| "topology.hetero_experts: arena lock poisoned".to_owned())?;
     let shape = (tile_rows, wide, hidden);
     if arena.as_ref().is_none_or(|(s, _, _)| *s != shape) {
         if let Some((_, streams, ffn)) = arena.take() {
@@ -516,7 +596,9 @@ pub(crate) fn layer_major(
                 let _ = gpu.free_tensor(t);
             }
         }
-        let streams = gpu.alloc_tensor(&[slots * tile_rows * wide], rdna_compute::DType::F32).map_err(hip)?;
+        let streams = gpu
+            .alloc_tensor(&[slots * tile_rows * wide], rdna_compute::DType::F32)
+            .map_err(hip)?;
         let ffn = (0..slots)
             .map(|_| gpu.alloc_tensor(&[tile_rows * hidden], rdna_compute::DType::F32))
             .collect::<Result<Vec<_>, _>>()
@@ -528,7 +610,11 @@ pub(crate) fn layer_major(
         *arena = Some((shape, streams, ffn));
     }
     let (_, streams, ffn) = arena.as_ref().expect("allocated above");
-    Ok(Some(LayerMajor { shared, streams: view_of(streams), ffn: ffn.iter().map(view_of).collect() }))
+    Ok(Some(LayerMajor {
+        shared,
+        streams: view_of(streams),
+        ffn: ffn.iter().map(view_of).collect(),
+    }))
 }
 
 /// Primary (gfx1201) device bytes the split adds for a `chunk_rows` prefill
