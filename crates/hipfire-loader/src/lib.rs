@@ -3773,6 +3773,7 @@ fn resolve_route_plan(
         hipcc_extra_flags: &gpu.flags.hipcc_extra_flags,
         flags: &gpu.flags,
         route_axes: &axes,
+        hc8_sidecar: false,
     })
     .map_err(|e| format!("{e:?}"))?;
     Ok((plan, spec, seal))
@@ -3840,16 +3841,14 @@ fn resolve_qwen4_route_plan(
     {
         return Err("trunk overlay".into());
     }
-    if hipfire_arch_qwen4::resolve_hc8_sidecar(
+    // An applied `.hc8` sidecar adds its PM image to the walked plan (`RouteKernelInput::hc8_sidecar`).
+    let hc8_sidecar = hipfire_arch_qwen4::resolve_hc8_sidecar(
         hfq,
         Path::new(req.path),
         gpu.flags.qwen4_hc8_enabled(),
         &receipt.config,
     )?
-    .is_some()
-    {
-        return Err("hc8 sidecar".into());
-    }
+    .is_some();
     let kv_mode = req
         .kv_mode_override
         .filter(|s| !s.is_empty())
@@ -3914,6 +3913,7 @@ fn resolve_qwen4_route_plan(
         hipcc_extra_flags: &gpu.flags.hipcc_extra_flags,
         flags: &gpu.flags,
         route_axes: &axes,
+        hc8_sidecar: hc8_sidecar,
     })
     .map_err(|e| format!("{e:?}"))?;
     Ok((plan, spec, seal))

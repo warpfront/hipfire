@@ -7254,6 +7254,9 @@ pub struct RouteKernelInput<'a> {
     /// (`#! axis` lines of `route_plans/*.tsv`), e.g. `("qsa", "fp8")`.
     /// Empty for routes without a walked plan.
     pub route_axes: &'a [(&'a str, String)],
+    /// The load applies a `<model>.hc8` sidecar (`HIPFIRE_QWEN4_HC8` on, exact gfx1201, sidecar
+    /// bound): the walked plan then also plans the `hc8_wmma_pm_gfx1201` image.
+    pub hc8_sidecar: bool,
 }
 
 #[derive(Debug)]
@@ -9216,6 +9219,7 @@ fn walked_route_entries_in(
         }));
     }
     add_wide_twin_entries(input.arch, &mut planned);
+    add_hc8_entries(input, &mut planned);
     let seal = if plan
         .sealed
         .contains(&if native_mtp { "native_mtp" } else { "ar" })
@@ -9380,6 +9384,20 @@ fn plan_wide_embedded(
 /// Add the PM row tiles of every switched-on family to a walked route.
 fn add_wide_twin_entries(arch: &str, planned: &mut Vec<PlannedKernel>) {
     add_rowtile_entries(arch, planned, |family| family.enabled());
+}
+
+/// The `hc8_wmma_pm_gfx1201` image of an applied `.hc8` sidecar (`HIPFIRE_QWEN4_HC8`, exact gfx1201):
+/// decode geometries, fused read-up and prefill dequant exports. Not planned without the sidecar
+/// or with the kill switch, so those loads never load the module.
+fn add_hc8_entries(input: &RouteKernelInput<'_>, planned: &mut Vec<PlannedKernel>) {
+    if input.hc8_sidecar && input.arch == "gfx1201" && input.flags.qwen4_hc8_enabled() {
+        planned.push(PlannedKernel::Embedded {
+            module: crate::hc8::MODULE,
+            image: crate::hc8::IMAGE,
+            radiowave_json: None,
+            symbols: &crate::hc8::ROUTE_SYMBOLS,
+        });
+    }
 }
 
 fn add_rowtile_entries(
@@ -9629,6 +9647,7 @@ mod tests {
                 hipcc_extra_flags: "",
                 flags: &flags,
                 route_axes: &[],
+                hc8_sidecar: false,
             };
             match route_entries(&input) {
                 Err(RegistryError::UnsupportedRoute(reason)) => {
@@ -14576,6 +14595,7 @@ extern "C" __global__ void NAMED(int* p) {}
                 hipcc_extra_flags: "",
                 flags: &flags,
                 route_axes: &[],
+                hc8_sidecar: false,
             };
             let (module, image, symbols) = crate::pm_mtp_gemm::route_object();
             let plan = route_entries(&input).expect("native MTP closed route");
@@ -14633,6 +14653,7 @@ extern "C" __global__ void NAMED(int* p) {}
             hipcc_extra_flags: "",
             flags: &flags,
             route_axes: &[],
+            hc8_sidecar: false,
         })
     }
 
@@ -14781,6 +14802,7 @@ extern "C" __global__ void NAMED(int* p) {}
                 hipcc_extra_flags: "",
                 flags: &flags,
                 route_axes: &[],
+                hc8_sidecar: false,
             };
             let plan = route_entries(&input).unwrap();
             assert!(
@@ -14843,6 +14865,7 @@ extern "C" __global__ void NAMED(int* p) {}
             hipcc_extra_flags: "",
             flags: &flags,
             route_axes: &[],
+            hc8_sidecar: false,
         };
         let mut plan = route_entries(&input).unwrap();
         apply_gate_up_pm_tune_variant(&mut plan.entries, &VARIANT);
@@ -15037,11 +15060,35 @@ extern "C" __global__ void NAMED(int* p) {}
             hipcc_extra_flags: "",
             flags,
             route_axes: axes,
+            hc8_sidecar: false,
         }
     }
 
     fn is_unsupported(result: Result<Option<(RouteKernelPlan, RouteSeal)>, RegistryError>) -> bool {
         matches!(result, Err(RegistryError::UnsupportedRoute(_)))
+    }
+
+    #[test]
+    fn hc8_image_is_planned_only_for_an_applied_sidecar() {
+        let axes = synthetic_axes();
+        let plan = |arch: &str, sidecar: bool, kill: bool| {
+            let mut flags = default_feature_flags(arch).unwrap();
+            if kill {
+                flags.qwen4_hc8 = false;
+            }
+            let mut input = synthetic_input(arch, &[], KernelSpecRoute::Ar, &flags, &axes);
+            input.hc8_sidecar = sidecar;
+            let mut planned = Vec::new();
+            add_hc8_entries(&input, &mut planned);
+            planned
+        };
+        let planned = plan("gfx1201", true, false);
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].module(), crate::hc8::MODULE);
+        assert_eq!(planned[0].symbols(), crate::hc8::ROUTE_SYMBOLS.as_slice());
+        assert!(plan("gfx1201", false, false).is_empty(), "no sidecar");
+        assert!(plan("gfx1201", true, true).is_empty(), "HIPFIRE_QWEN4_HC8=0");
+        assert!(plan("gfx1100", true, false).is_empty(), "other arch");
     }
 
     #[test]

@@ -32,6 +32,32 @@ pub const GEOMS: [Hc8Geom; 5] = [
     Hc8Geom { mw: 2, kw: 4 },
 ];
 pub const MAX_ROWS: usize = 64;
+/// Exports a sidecar-applied route binds: the decode geometries of [`default_geom`] (long K, short K), the fused
+/// read-up and the prefill dequant. The module also exports the other geometries and `i8`; the screen uses those.
+pub const ROUTE_SYMBOLS: [&str; 22] = [
+    "hc8_gemm_e4m3_mw1_kw16_n1_act",
+    "hc8_gemm_e4m3_mw1_kw16_n1_set",
+    "hc8_gemm_e4m3_mw1_kw16_n2_act",
+    "hc8_gemm_e4m3_mw1_kw16_n2_set",
+    "hc8_gemm_e4m3_mw1_kw16_n3_act",
+    "hc8_gemm_e4m3_mw1_kw16_n3_set",
+    "hc8_gemm_e4m3_mw1_kw16_n4_act",
+    "hc8_gemm_e4m3_mw1_kw16_n4_set",
+    "hc8_gemm_e4m3_mw4_kw1_n1_act",
+    "hc8_gemm_e4m3_mw4_kw1_n1_set",
+    "hc8_gemm_e4m3_mw4_kw1_n2_act",
+    "hc8_gemm_e4m3_mw4_kw1_n2_set",
+    "hc8_gemm_e4m3_mw4_kw1_n3_act",
+    "hc8_gemm_e4m3_mw4_kw1_n3_set",
+    "hc8_gemm_e4m3_mw4_kw1_n4_act",
+    "hc8_gemm_e4m3_mw4_kw1_n4_set",
+    "hc8_read_up_e4m3_n1",
+    "hc8_read_up_e4m3_n2",
+    "hc8_read_up_e4m3_n3",
+    "hc8_read_up_e4m3_n4",
+    "hc8_dequant_bf16",
+    "hc8_dequant_f16",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hc8Fmt {
@@ -417,6 +443,18 @@ pub fn hc8_read_up(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_symbols_are_module_exports() {
+        let exports = peacemaker_isa::kernels::hc8_wmma_gfx1201::symbols();
+        for s in ROUTE_SYMBOLS {
+            assert!(exports.iter().any(|e| e == s), "{s} is not an export of {MODULE}");
+        }
+        let mut sorted = ROUTE_SYMBOLS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ROUTE_SYMBOLS.len());
+    }
 
     fn bf(v: f32) -> u16 {
         (v.to_bits() >> 16) as u16

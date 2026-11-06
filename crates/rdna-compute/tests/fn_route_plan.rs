@@ -228,6 +228,7 @@ fn plan(load: &Load<'_>) -> Result<RouteKernelPlan, RegistryError> {
         hipcc_extra_flags: &load.flags.hipcc_extra_flags,
         flags: load.flags,
         route_axes: load.axes,
+        hc8_sidecar: false,
     })
 }
 
