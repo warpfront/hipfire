@@ -625,6 +625,17 @@ pub fn prepare_host_memory_for(model: &std::path::Path) {
     }
 }
 
+/// Choose clr's submission mode before the HIP runtime loads: a process that
+/// requests `topology.hetero_experts` keeps two devices' streams fed at once
+/// and submits through per-stream worker threads
+/// (`hip_bridge::dispatch_on_worker_threads`). The daemon calls it once the
+/// process configuration is installed and before its first HIP call.
+pub fn prepare_dispatch() {
+    if hipfire_arch_qwen4::hetero_split_requested() {
+        hip_bridge::dispatch_on_worker_threads("topology.hetero_experts");
+    }
+}
+
 /// Executable local-path Qwen4 carrier.  Distribution/product admission stays
 /// outside this registry; this route only makes an already admitted HFQM
 /// artifact loadable.

@@ -28,6 +28,7 @@ pub mod d2_default;
 /// Decode-share developer knobs, mode enum and load admission.
 pub mod decode_share;
 pub(crate) mod hetero;
+pub use hetero::split_requested as hetero_split_requested;
 /// Donor-tail loan state machine of decode-share (`fixed` / `on`).
 pub(crate) mod decode_share_loan;
 /// Layout of the weight-shadow region borrowed inside the donor tail.

@@ -43,6 +43,12 @@ pub(crate) fn requested() -> Result<Option<String>, String> {
     )
 }
 
+/// Whether this process requests the split (a valid `topology.hetero_experts`).
+/// Needs the process and runtime configuration installed.
+pub fn split_requested() -> bool {
+    matches!(requested(), Ok(Some(_)))
+}
+
 static ARM: Mutex<Option<Arc<IgpuColdArm>>> = Mutex::new(None);
 
 /// The shared iGPU arm when the split is requested, opened on first use; `None`

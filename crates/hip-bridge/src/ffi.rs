@@ -924,6 +924,30 @@ pub fn keep_host_memory_out_of_reclaim(reason: &str) {
     }
 }
 
+/// clr's submission mode: `1` (ROCm's default on Linux) submits each command
+/// on the thread that enqueues it, `0` hands submission to a worker thread
+/// per stream.
+const AMD_DIRECT_DISPATCH: &str = "AMD_DIRECT_DISPATCH";
+
+/// Submit through clr's per-stream worker threads (`AMD_DIRECT_DISPATCH=0`)
+/// unless the environment already chooses, in a process that must keep
+/// several streams on two devices fed at once. Call before the HIP runtime
+/// loads: clr reads the switch once, at initialization.
+///
+/// Evidence (ROCm 7.2.2, R9700 + Strix Halo iGPU, Qwen3.8 Flash-Next under
+/// `topology.hetero_experts`, same build): layer-major prefill 2,282 / 2,711
+/// / 2,719 tok/s at 2K / 8K / 16K with direct dispatch vs 2,847 / 3,862 /
+/// 3,940 without it, greedy text bitwise identical; decode 35.8 vs 34.5
+/// tok/s. The Strix alone shows no prefill difference (1,656 vs 1,651 at 2K),
+/// so it is not set elsewhere.
+pub fn dispatch_on_worker_threads(reason: &str) {
+    if !cfg!(target_os = "linux") || std::env::var_os(AMD_DIRECT_DISPATCH).is_some() {
+        return;
+    }
+    std::env::set_var(AMD_DIRECT_DISPATCH, "0");
+    eprintln!("[hip-bridge] {AMD_DIRECT_DISPATCH}=0 ({reason}): per-stream submission threads");
+}
+
 /// Exact opt-out from the process-wide [`GPU_PINNED_MIN_XFER_SIZE`] default:
 /// when it is `0`, [`keep_pageable_copies_out_of_reclaim`] leaves the switch
 /// unset, so clr keeps its own built-in threshold. That is an exact
