@@ -346,6 +346,8 @@ struct Cli {
     warm: usize,
     out: Option<PathBuf>,
     fixtures: Option<PathBuf>,
+    /// `--fmts e4m3,i8` (default e4m3 only: the decided format).
+    fmts: Vec<Hc8Fmt>,
 }
 
 fn parse_cli() -> R<Cli> {
@@ -357,6 +359,7 @@ fn parse_cli() -> R<Cli> {
         warm: 3,
         out: None,
         fixtures: None,
+        fmts: vec![Hc8Fmt::E4m3],
     };
     let mut have = false;
     let mut it = std::env::args().skip(1);
@@ -378,6 +381,16 @@ fn parse_cli() -> R<Cli> {
             "--calls" => cli.calls = v("--calls")?.parse().map_err(es)?,
             "--warm" => cli.warm = v("--warm")?.parse().map_err(es)?,
             "--dump-fixtures" => cli.fixtures = Some(PathBuf::from(v("--dump-fixtures")?)),
+            "--fmts" => {
+                cli.fmts = v("--fmts")?
+                    .split(',')
+                    .map(|t| match t {
+                        "e4m3" => Ok(Hc8Fmt::E4m3),
+                        "i8" => Ok(Hc8Fmt::I8),
+                        o => Err(format!("unknown fmt {o}")),
+                    })
+                    .collect::<R<_>>()?
+            }
             "--out" => cli.out = Some(PathBuf::from(v("--out")?)),
             o => return Err(format!("unknown argument {o}")),
         }
@@ -812,10 +825,11 @@ fn run() -> R<()> {
             down_h: bf16_bytes_to_u16(&down_b),
             up_h: bf16_bytes_to_u16(&up_b),
         };
-        let qs = [
-            build_q(&mut gpu, &hc, Hc8Fmt::E4m3)?,
-            build_q(&mut gpu, &hc, Hc8Fmt::I8)?,
-        ];
+        let qs: Vec<Q> = cli
+            .fmts
+            .iter()
+            .map(|&f| build_q(&mut gpu, &hc, f))
+            .collect::<R<_>>()?;
         for q in &qs {
             // Weight-only quantization error (vs BF16 weights), for the record.
             let bf: Vec<f32> = hc.down_h.iter().map(|&h| bf16_to_f32(h)).collect();
