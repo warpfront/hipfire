@@ -105,11 +105,35 @@ extern "C" __global__ void hetero_install_cold(
     int n_experts,
     int dim,
     float* __restrict__ down_expanded) {
-    if (hs_load(error) != 0u) return;
     const int s = blockIdx.x;
     if (!hs_cold(ids[s], cold_bitmap, n_experts)) return;
     const float* src = mb_cold_out + (long long)s * dim;
     float* dst = down_expanded + (long long)s * dim;
+    // The rows live in the expert device's memory, across the link: issue every
+    // load (and the error word's) before the first store, so the block pays one
+    // link round trip instead of one per loop iteration. The await's acquire
+    // already ordered these reads after the response.
+    constexpr int kVec = 8;
+    const int n4 = dim / 4;
+    const bool vec = (dim & 3) == 0 && n4 <= kVec * (int)blockDim.x;
+    if (vec) {
+        const float4* src4 = reinterpret_cast<const float4*>(src);
+        float4 v[kVec];
+#pragma unroll
+        for (int k = 0; k < kVec; ++k) {
+            const int i = threadIdx.x + k * blockDim.x;
+            if (i < n4) v[k] = src4[i];
+        }
+        if (__hip_atomic_load(const_cast<unsigned*>(error), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) != 0u) return;
+        float4* dst4 = reinterpret_cast<float4*>(dst);
+#pragma unroll
+        for (int k = 0; k < kVec; ++k) {
+            const int i = threadIdx.x + k * blockDim.x;
+            if (i < n4) dst4[i] = v[k];
+        }
+        return;
+    }
+    if (hs_load(error) != 0u) return;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) dst[i] = src[i];
 }
 

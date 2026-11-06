@@ -99,6 +99,84 @@ fn word(cfg: &ResponderConfig, offset: usize) -> &'static AtomicU32 {
     unsafe { &*((cfg.mailbox_base as usize + offset) as *const AtomicU32) }
 }
 
+/// `HIPFIRE_HETERO_DECODE_TRACE=1`: per decode token, where the time between
+/// two layers' requests goes, as the Strix sees it. For each request: `launch`
+/// (the `hipGraphLaunch` call), `answer` (request seen -> the graph's response
+/// word, polled here, so serving pauses for it: a diagnostic) and `primary`
+/// (this layer's response -> the next layer's request: the primary noticing the
+/// answer, the rest of its layer and the next layer's front). Printed as means
+/// over every 64 tokens.
+struct DecodeTrace {
+    layers: usize,
+    /// Answer time of the previous request, and its layer.
+    prev: Option<(usize, std::time::Instant)>,
+    /// First request of the current token.
+    token_start: Option<std::time::Instant>,
+    /// Sums in us: launch, answer, primary; then token period; counts.
+    sum: [f64; 4],
+    reqs: u64,
+    gaps: u64,
+    tokens: u64,
+}
+
+impl DecodeTrace {
+    fn from_env(layers: usize) -> Option<Self> {
+        std::env::var("HIPFIRE_HETERO_DECODE_TRACE").is_ok_and(|v| v == "1").then(|| Self {
+            layers,
+            prev: None,
+            token_start: None,
+            sum: [0.0; 4],
+            reqs: 0,
+            gaps: 0,
+            tokens: 0,
+        })
+    }
+
+    fn layer(&mut self, cfg: &ResponderConfig, layer: usize, req: u32, seen: std::time::Instant) {
+        let launched = std::time::Instant::now();
+        let resp = word(cfg, cfg.geom.slot(layer).resp_seq);
+        let deadline = launched + Duration::from_millis(100);
+        while resp.load(Ordering::Acquire) != req && std::time::Instant::now() < deadline {
+            std::hint::spin_loop();
+        }
+        let answered = std::time::Instant::now();
+        self.sum[0] += (launched - seen).as_secs_f64() * 1e6;
+        self.sum[1] += (answered - seen).as_secs_f64() * 1e6;
+        self.reqs += 1;
+        if let Some((pl, pt)) = self.prev {
+            if layer == pl + 1 {
+                self.sum[2] += (seen - pt).as_secs_f64() * 1e6;
+                self.gaps += 1;
+            }
+        }
+        if layer == 0 {
+            if let Some(t0) = self.token_start {
+                let period = (seen - t0).as_secs_f64() * 1e6;
+                // A token boundary, not an idle gap between requests.
+                if period < 1e6 {
+                    self.sum[3] += period;
+                    self.tokens += 1;
+                }
+            }
+            self.token_start = Some(seen);
+            if self.tokens >= 64 {
+                let (r, g, t) = (self.reqs as f64, self.gaps.max(1) as f64, self.tokens as f64);
+                eprintln!(
+                    "hetero decode trace: token {:.0} us over {} layers; per layer: launch {:.1} us, answer {:.1} us, primary {:.1} us",
+                    self.sum[3] / t,
+                    self.layers,
+                    self.sum[0] / r,
+                    self.sum[1] / r,
+                    self.sum[2] / g
+                );
+                self.sum = [0.0; 4];
+                (self.reqs, self.gaps, self.tokens) = (0, 0, 0);
+            }
+        }
+        self.prev = Some((layer, answered));
+    }
+}
+
 struct Prefill {
     serves: Vec<PrefillServe>,
     layers: Vec<ColdPrefillLayer>,
@@ -389,6 +467,7 @@ impl HeteroResponder {
                 let mut last_prefill: Vec<u32> =
                     prefill_words.iter().map(|(_, _, req, ..)| req.load(Ordering::Acquire)).collect();
                 let mut idle = 0u32;
+                let mut trace = DecodeTrace::from_env(n);
                 while !stop2.load(Ordering::Acquire) {
                     let mut busy = false;
                     // Sub-chunks in order: the primary releases them in order.
@@ -420,12 +499,16 @@ impl HeteroResponder {
                         if r != last[l] {
                             last[l] = r;
                             busy = true;
+                            let seen = std::time::Instant::now();
                             let st = graphs.gpu.active_stream.as_ref().expect("responder stream");
                             if let Err(e) = graphs.gpu.hip.graph_launch(&graphs.execs[l], st) {
                                 if let Ok(mut f) = failure2.lock() {
                                     *f = Some(format!("layer {l}: graph launch: {e}"));
                                 }
                                 return;
+                            }
+                            if let Some(t) = trace.as_mut() {
+                                t.layer(&cfg, l, r, seen);
                             }
                             answered2.fetch_add(1, Ordering::Relaxed);
                         }
