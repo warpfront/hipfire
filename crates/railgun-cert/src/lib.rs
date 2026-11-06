@@ -24,6 +24,7 @@
 //! complete node sequence with exact-object identities, the FP8 attention
 //! explicit-ABI table, refusals for non-railgun or fact-less nodes).
 pub mod recording;
+pub mod task_graph;
 pub mod whole16;
 
 use std::collections::BTreeMap;
@@ -365,6 +366,7 @@ pub fn kernel_record(
         },
         case_digest: String::new(),
         guard_flag: None,
+        task_protocol: None,
     }
 }
 

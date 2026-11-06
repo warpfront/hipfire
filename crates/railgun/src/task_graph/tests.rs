@@ -1,0 +1,931 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+use std::sync::Arc;
+
+use super::*;
+use crate::kernel::tests::{facts, launch, ptr};
+use crate::kernel::{
+    author, ArenaFact, ArenaTemplate, ArgFact, ArgRole, ConditionalFacts, FactStatus, LaunchRecord,
+    MemClass::*, NodeFacts, RegionEffect,
+};
+use crate::plan::{plan, CacheTable, RowPolicy};
+use crate::{BindingField, BindingRecord, EVENT_CELL_BYTES};
+
+const TASKS: u64 = 0x7000_0000;
+const EVENTS: u64 = 0x7100_0000;
+const ARENA: u64 = 0x7200_0000;
+const CTL: u64 = 0x7300_0000;
+const X: u64 = 0x7400_0000;
+const Y: u64 = 0x7500_0000;
+const Z: u64 = 0x7600_0000;
+
+/// Body templates: 1 reads field 0 and writes field 8; 2 reads field 0;
+/// 3 touches nothing; 4 writes field 8.
+const T_COPY: u32 = 1;
+const T_READ: u32 = 2;
+const T_NOP: u32 = 3;
+const T_WRITE: u32 = 4;
+
+const N: u32 = NONE;
+const ALL: [u32; 4] = [T_COPY, T_READ, T_NOP, T_WRITE];
+
+fn t(template: u32, record: u32, pred: u32, expected: u32, done: u32) -> TaskHeader {
+    TaskHeader {
+        template,
+        ka_off: record * 64,
+        pred_event: pred,
+        expected,
+        done_event: done,
+    }
+}
+
+fn template(id: u32) -> ArenaTemplate {
+    use crate::kernel::ArenaPointerLoad as L;
+    let loads = match id {
+        T_COPY => vec![
+            L {
+                record_offset: 0,
+                classes: vec![VmemLoad],
+            },
+            L {
+                record_offset: 8,
+                classes: vec![VmemStore],
+            },
+        ],
+        T_READ => vec![L {
+            record_offset: 0,
+            classes: vec![VmemLoad],
+        }],
+        T_NOP => vec![],
+        T_WRITE => vec![L {
+            record_offset: 8,
+            classes: vec![VmemStore],
+        }],
+        other => panic!("no template {other}"),
+    };
+    ArenaTemplate {
+        template: id,
+        pointer_loads: loads,
+    }
+}
+
+fn proven_protocol() -> TaskProtocolFact {
+    TaskProtocolFact {
+        layout: TaskLayout::M0,
+        tasks_arg_offset: 0,
+        ticket_arg_offset: 8,
+        events_arg_offset: 16,
+        n_tasks_arg_offset: 56,
+        proved: TASK_PROTO_REQUIRED
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect(),
+    }
+}
+
+fn pool_args() -> Vec<ArgFact> {
+    vec![
+        ptr(0, &[SmemLoad]),
+        ptr(8, &[AtomicCommutative]),
+        ptr(16, &[AtomicRelease, LoadAcquire]),
+        ptr(24, &[SmemLoad]),
+        ArgFact {
+            offset: 56,
+            size: 4,
+            role: ArgRole::Integer,
+        },
+    ]
+}
+
+fn conditional_facts(known: &[u32], protocol: Option<TaskProtocolFact>) -> Arc<NodeFacts> {
+    let mut f = (*facts(pool_args(), 64)).clone();
+    f.facts.status = FactStatus::Conditional(ConditionalFacts {
+        guards: Vec::new(),
+        indexed: Vec::new(),
+        tables: Vec::new(),
+        arenas: vec![ArenaFact {
+            arena_arg_offset: 24,
+            templates: known.iter().map(|&id| template(id)).collect(),
+        }],
+        task_protocol: protocol,
+        witnesses: vec!["descriptor_arena".into()],
+        case_digest: "ab".repeat(32),
+    });
+    Arc::new(f)
+}
+
+fn unknown_facts() -> Arc<NodeFacts> {
+    let mut f = (*facts(pool_args(), 64)).clone();
+    f.facts.status = FactStatus::Unknown(vec!["indirect-pointer-load".into()]);
+    Arc::new(f)
+}
+
+fn pool_launch(pool: usize, n_tasks: u32, facts: Arc<NodeFacts>) -> LaunchRecord {
+    let mut l = launch(
+        &[
+            (0, TASKS + pool as u64 * 0x1_0000),
+            (8, CTL + 8 * pool as u64),
+            (16, EVENTS),
+            (24, ARENA),
+        ],
+        60,
+        pool_args(),
+    );
+    l.kernarg[56..60].copy_from_slice(&n_tasks.to_le_bytes());
+    l.facts = Ok(facts);
+    l
+}
+
+fn rid(program: &KernelProgram, base: u64) -> ResourceId {
+    ResourceId(
+        program
+            .resources
+            .iter()
+            .position(|b| b.base == base)
+            .unwrap_or_else(|| panic!("no resource at {base:#x}")) as u32,
+    )
+}
+
+struct Fixture {
+    program: KernelProgram,
+    group: Range<usize>,
+    graph: TaskGraph,
+}
+
+impl Fixture {
+    fn events(&self) -> ResourceId {
+        rid(&self.program, EVENTS)
+    }
+
+    fn data(&self, base: u64) -> ResourceId {
+        rid(&self.program, base)
+    }
+
+    fn protocol(&self) -> TaskProtocol {
+        TaskProtocol::from_program(&self.program, self.group.clone()).unwrap()
+    }
+
+    fn check(&self) -> Result<TaskGraphProof, String> {
+        self.graph
+            .check(&self.program, self.group.clone(), &self.protocol())
+    }
+}
+
+/// Node 0 touches the data resources; nodes `1..=pools` are the pool nodes.
+/// Record `i` is at arena offset `64 * i`. `known[p]` are the templates pool
+/// `p`'s receipt facts carry.
+fn build(
+    pools: Vec<Vec<TaskHeader>>,
+    records: &[(u32, &[(u32, u64)])],
+    known: Vec<Vec<u32>>,
+    protocol: Option<TaskProtocolFact>,
+    unknown: bool,
+) -> Fixture {
+    let mut launches = vec![launch(
+        &[(0, X), (8, Y), (16, Z)],
+        24,
+        vec![
+            ptr(0, &[VmemLoad]),
+            ptr(8, &[VmemLoad]),
+            ptr(16, &[VmemLoad]),
+        ],
+    )];
+    for (p, tasks) in pools.iter().enumerate() {
+        let f = if unknown {
+            unknown_facts()
+        } else {
+            conditional_facts(&known[p], protocol.clone())
+        };
+        launches.push(pool_launch(p, tasks.len() as u32, f));
+    }
+    let mut program = author("gfx1201", &launches);
+    let big = 1 << 22;
+    for base in [EVENTS, CTL] {
+        let r = rid(&program, base);
+        program.resources[r.0 as usize].bytes = big;
+    }
+    for p in 0..pools.len() {
+        let r = rid(&program, TASKS + p as u64 * 0x1_0000);
+        program.resources[r.0 as usize].bytes = big;
+    }
+    let events = rid(&program, EVENTS);
+    let ctl = rid(&program, CTL);
+    let arena = rid(&program, ARENA);
+    let cells = (big / EVENT_CELL_BYTES) as u32;
+    program.declare_event_cells(events, cells).unwrap();
+    program.declare_event_cells(ctl, cells).unwrap();
+    for p in 0..pools.len() {
+        let r = rid(&program, TASKS + p as u64 * 0x1_0000);
+        program.declare_task_arena(r).unwrap();
+    }
+    let records: Vec<BindingRecord> = records
+        .iter()
+        .enumerate()
+        .map(|(i, (template, fields))| BindingRecord {
+            base: 64 * i as u64,
+            template: *template,
+            fields: fields
+                .iter()
+                .map(|&(offset, base)| BindingField {
+                    offset,
+                    resource: rid(&program, base),
+                    interior: 0,
+                })
+                .collect(),
+        })
+        .collect();
+    program.bind_records(arena, records).unwrap();
+    let group = 1..1 + pools.len();
+    let graph = TaskGraph::new(
+        pools
+            .into_iter()
+            .enumerate()
+            .map(|(p, tasks)| PoolTasks { node: 1 + p, tasks })
+            .collect(),
+        events,
+        20_000,
+        arena,
+    );
+    Fixture {
+        program,
+        group,
+        graph,
+    }
+}
+
+/// Every pool knows every template.
+fn fixture(pools: Vec<Vec<TaskHeader>>, records: &[(u32, &[(u32, u64)])]) -> Fixture {
+    let known = vec![ALL.to_vec(); pools.len()];
+    build(pools, records, known, Some(proven_protocol()), false)
+}
+
+#[test]
+fn an_ordered_producer_consumer_is_admitted_and_orders_its_edge() {
+    let fx = build(
+        vec![vec![t(T_COPY, 0, N, 0, 0)], vec![t(T_READ, 1, 0, 1, N)]],
+        &[(T_COPY, &[(0, X), (8, Y)]), (T_READ, &[(0, Y)])],
+        vec![vec![T_COPY], vec![T_READ]],
+        Some(proven_protocol()),
+        false,
+    );
+    let proof = fx.check().unwrap();
+    assert_eq!(proof.tasks, 2);
+    assert_eq!(proof.ordered_pairs, 1);
+    assert_eq!(
+        proof.edges(),
+        &[OrderedEdge {
+            producer: 1,
+            consumer: 2,
+            resource: fx.data(Y),
+            event: fx.events(),
+        }]
+    );
+    assert!(proof
+        .obligations
+        .iter()
+        .any(|o| o.contains("zero at every submit")));
+    let ordering = proof.ordering();
+    assert_eq!(ordering.edges(), proof.edges());
+    assert_eq!(ordering.task_graph(), Some(&(1..3)));
+    assert!(!ordering.is_pending());
+    let mut program = fx.program.clone();
+    program.add_coresident_group(1..3, ordering).unwrap();
+}
+
+#[test]
+fn a_war_order_is_an_edge_with_the_reader_first() {
+    // pool 0 reads Y, then pool 1 (after it) writes Y.
+    let fx = build(
+        vec![vec![t(T_READ, 0, N, 0, 0)], vec![t(T_WRITE, 1, 0, 1, N)]],
+        &[(T_READ, &[(0, Y)]), (T_WRITE, &[(8, Y)])],
+        vec![vec![T_READ], vec![T_WRITE]],
+        Some(proven_protocol()),
+        false,
+    );
+    let proof = fx.check().unwrap();
+    assert_eq!(
+        proof.edges(),
+        &[OrderedEdge {
+            producer: 1,
+            consumer: 2,
+            resource: fx.data(Y),
+            event: fx.events(),
+        }]
+    );
+    let mut program = fx.program.clone();
+    program
+        .add_coresident_group(1..3, proof.ordering())
+        .expect("a write-after-read order passes the edge validation");
+}
+
+#[test]
+fn node_level_conflicts_no_task_pair_has_get_a_vacuous_edge() {
+    // Both pools' receipts write Z through template 2 of a record, but no
+    // task uses that record: the node effects over-approximate the tasks.
+    let fx = build(
+        vec![vec![t(T_COPY, 0, N, 0, 0)], vec![t(T_READ, 1, 0, 1, N)]],
+        &[
+            (T_COPY, &[(0, X), (8, Y)]),
+            (T_READ, &[(0, Y)]),
+            (T_WRITE, &[(8, Z)]),
+        ],
+        vec![vec![T_COPY, T_WRITE], vec![T_READ, T_WRITE]],
+        Some(proven_protocol()),
+        false,
+    );
+    let proof = fx.check().unwrap();
+    let z = fx.data(Z);
+    assert!(
+        proof.edges().iter().any(|e| e.resource == z),
+        "{:?}",
+        proof.edges()
+    );
+    let mut program = fx.program.clone();
+    program
+        .add_coresident_group(1..3, proof.ordering())
+        .unwrap();
+    let g = plan(
+        &program,
+        &CacheTable::for_arch("gfx1201").unwrap(),
+        RowPolicy::TierD,
+    );
+    assert!(
+        g.groups[0].refusals.is_empty(),
+        "{:?}",
+        g.groups[0].refusals
+    );
+}
+
+#[test]
+fn the_plan_refuses_a_task_protocol_member_without_a_task_graph_proof() {
+    let fx = build(
+        vec![vec![t(T_COPY, 0, N, 0, 0)], vec![t(T_READ, 1, 0, 1, N)]],
+        &[(T_COPY, &[(0, X), (8, Y)]), (T_READ, &[(0, Y)])],
+        vec![vec![T_COPY], vec![T_READ]],
+        Some(proven_protocol()),
+        false,
+    );
+    let mut program = fx.program.clone();
+    program
+        .add_coresident_group(1..3, GroupOrdering::none())
+        .unwrap();
+    let g = plan(
+        &program,
+        &CacheTable::for_arch("gfx1201").unwrap(),
+        RowPolicy::TierD,
+    );
+    assert!(
+        g.groups[0]
+            .refusals
+            .iter()
+            .any(|r| r.contains("task protocol but no task-graph proof")),
+        "{:?}",
+        g.groups[0].refusals
+    );
+    // A proof of another range does not cover the group.
+    let other = GroupOrdering::none().with_task_graph(0..2);
+    assert!(fx
+        .program
+        .clone()
+        .add_coresident_group(1..3, other)
+        .is_err());
+}
+
+#[test]
+fn unordered_write_write_race_between_pools_is_refused_and_ordered_is_admitted() {
+    let records: &[(u32, &[(u32, u64)])] = &[(T_WRITE, &[(8, Y)]), (T_WRITE, &[(8, Y)])];
+    let fx = fixture(
+        vec![vec![t(T_WRITE, 0, N, 0, N)], vec![t(T_WRITE, 1, N, 0, N)]],
+        records,
+    );
+    let err = fx.check().unwrap_err();
+    assert!(err.contains("race on resource"), "{err}");
+    assert!(err.contains("both write"), "{err}");
+    assert!(err.contains("neither happens-before"), "{err}");
+
+    let fx = fixture(
+        vec![vec![t(T_WRITE, 0, N, 0, 0)], vec![t(T_WRITE, 1, 0, 1, N)]],
+        records,
+    );
+    let proof = fx.check().unwrap();
+    assert_eq!(proof.ordered_pairs, 1);
+    assert_eq!(proof.edges().len(), 1);
+    assert_eq!(
+        (proof.edges()[0].producer, proof.edges()[0].consumer),
+        (1, 2)
+    );
+}
+
+#[test]
+fn a_read_write_race_is_refused_in_either_direction() {
+    let records: &[(u32, &[(u32, u64)])] = &[(T_READ, &[(0, Y)]), (T_WRITE, &[(8, Y)])];
+    let fx = fixture(
+        vec![vec![t(T_READ, 0, N, 0, N)], vec![t(T_WRITE, 1, N, 0, N)]],
+        records,
+    );
+    let err = fx.check().unwrap_err();
+    assert!(err.contains("read/write"), "{err}");
+    // Two readers never race.
+    let fx = fixture(
+        vec![vec![t(T_READ, 0, N, 0, N)], vec![t(T_READ, 0, N, 0, N)]],
+        &[(T_READ, &[(0, Y)])],
+    );
+    fx.check().unwrap();
+}
+
+#[test]
+fn a_same_pool_race_is_refused_and_an_event_chain_admits_it() {
+    let records: &[(u32, &[(u32, u64)])] = &[(T_WRITE, &[(8, Y)])];
+    // Claim order is not an order: two workers run task 0 and task 1 at once.
+    let fx = fixture(
+        vec![vec![t(T_WRITE, 0, N, 0, N), t(T_WRITE, 0, N, 0, N)], vec![]],
+        records,
+    );
+    let err = fx.check().unwrap_err();
+    assert!(err.contains("task 0 of pool 0"), "{err}");
+    assert!(err.contains("task 1 of pool 0"), "{err}");
+
+    let fx = fixture(
+        vec![vec![t(T_WRITE, 0, N, 0, 0), t(T_WRITE, 0, 0, 1, N)], vec![]],
+        records,
+    );
+    fx.check().unwrap();
+}
+
+#[test]
+fn ordering_is_transitive_through_a_chain_of_events() {
+    // pool0: a(done 0) ; pool1: b(pred 0, done 1) ; pool0: c(pred 1).
+    // a and c write Y; the only order between them is a -> b -> c.
+    let records: &[(u32, &[(u32, u64)])] = &[(T_WRITE, &[(8, Y)]), (T_NOP, &[])];
+    let fx = fixture(
+        vec![
+            vec![t(T_WRITE, 0, N, 0, 0), t(T_WRITE, 0, 1, 1, N)],
+            vec![t(T_NOP, 1, 0, 1, 1)],
+        ],
+        records,
+    );
+    let proof = fx.check().unwrap();
+    assert_eq!(proof.ordered_pairs, 1);
+    // Break the chain's middle: c waits on an event nobody that follows a
+    // releases.
+    let fx = fixture(
+        vec![
+            vec![t(T_WRITE, 0, N, 0, 0), t(T_WRITE, 0, 2, 1, N)],
+            vec![t(T_NOP, 1, 0, 1, 1), t(T_NOP, 1, N, 0, 2)],
+        ],
+        records,
+    );
+    let err = fx.check().unwrap_err();
+    assert!(err.contains("race on resource"), "{err}");
+}
+
+#[test]
+fn producer_cardinality_more_and_fewer_are_refused() {
+    let records: &[(u32, &[(u32, u64)])] = &[(T_NOP, &[])];
+    // Two producers, the consumer expects one: it could pass on a subset.
+    let fx = fixture(
+        vec![
+            vec![t(T_NOP, 0, N, 0, 0), t(T_NOP, 0, N, 0, 0)],
+            vec![t(T_NOP, 0, 0, 1, N)],
+        ],
+        records,
+    );
+    let err = fx.check().unwrap_err();
+    assert!(err.contains("2 tasks release it"), "{err}");
+    assert!(err.contains("subset"), "{err}");
+    // One producer, the consumer expects two: it never starts.
+    let fx = fixture(
+        vec![vec![t(T_NOP, 0, N, 0, 0)], vec![t(T_NOP, 0, 0, 2, N)]],
+        records,
+    );
+    let err = fx.check().unwrap_err();
+    assert!(err.contains("1 tasks release it"), "{err}");
+    assert!(err.contains("deadlocks"), "{err}");
+    // Nobody releases an awaited event.
+    let fx = fixture(vec![vec![t(T_NOP, 0, 3, 1, N)], vec![]], records);
+    assert!(fx.check().unwrap_err().contains("0 tasks release it"));
+    // Exactly `expected` producers: admitted.
+    let fx = fixture(
+        vec![
+            vec![t(T_NOP, 0, N, 0, 0), t(T_NOP, 0, N, 0, 0)],
+            vec![t(T_NOP, 0, 0, 2, N)],
+        ],
+        records,
+    );
+    fx.check().unwrap();
+}
+
+#[test]
+fn a_dependency_cycle_across_two_pools_is_refused() {
+    // Pool P = [p1, p2], pool Q = [q1, q2]: p1 waits on q2, q1 waits on p2.
+    // Claim order makes p1 -> p2 and q1 -> q2; with p2 -> q1 and q2 -> p1 the
+    // four tasks wait on each other although no single pool cycles.
+    let records: &[(u32, &[(u32, u64)])] = &[(T_NOP, &[])];
+    let fx = fixture(
+        vec![
+            vec![t(T_NOP, 0, 1, 1, 2), t(T_NOP, 0, N, 0, 3)],
+            vec![t(T_NOP, 0, 3, 1, 4), t(T_NOP, 0, N, 0, 1)],
+        ],
+        records,
+    );
+    let err = fx.check().unwrap_err();
+    assert!(err.contains("no progress"), "{err}");
+    assert!(err.contains("dependency cycle"), "{err}");
+    assert!(err.contains("is claimed after"), "{err}");
+    // Reordering the pools' tasks (producers first) breaks the cycle.
+    let fx = fixture(
+        vec![
+            vec![t(T_NOP, 0, N, 0, 3), t(T_NOP, 0, 1, 1, 2)],
+            vec![t(T_NOP, 0, N, 0, 1), t(T_NOP, 0, 3, 1, 4)],
+        ],
+        records,
+    );
+    fx.check().unwrap();
+}
+
+#[test]
+fn a_task_waiting_on_a_later_task_of_its_own_pool_is_refused() {
+    let records: &[(u32, &[(u32, u64)])] = &[(T_NOP, &[])];
+    let fx = fixture(
+        vec![vec![t(T_NOP, 0, 1, 1, N), t(T_NOP, 0, N, 0, 1)], vec![]],
+        records,
+    );
+    let err = fx.check().unwrap_err();
+    assert!(err.contains("no progress"), "{err}");
+    assert!(err.contains("task 0 of pool 0"), "{err}");
+    // A task waiting on itself.
+    let fx = fixture(vec![vec![t(T_NOP, 0, 0, 1, 0)], vec![]], records);
+    assert!(fx.check().unwrap_err().contains("no progress"));
+}
+
+#[test]
+fn a_task_naming_a_missing_record_is_refused() {
+    let records: &[(u32, &[(u32, u64)])] = &[(T_COPY, &[(0, X), (8, Y)])];
+    // No record at 5 * 64.
+    let fx = fixture(vec![vec![t(T_COPY, 5, N, 0, N)], vec![]], records);
+    let err = fx.check().unwrap_err();
+    assert!(err.contains("task 0 of pool 0"), "{err}");
+    assert!(err.contains("names no record of its template"), "{err}");
+    // A record exists, but of another template.
+    let fx = fixture(vec![vec![t(T_READ, 0, N, 0, N)], vec![]], records);
+    assert!(fx
+        .check()
+        .unwrap_err()
+        .contains("names no record of its template"));
+}
+
+#[test]
+fn a_template_the_pools_receipt_does_not_know_is_refused() {
+    let records: &[(u32, &[(u32, u64)])] = &[(T_COPY, &[(0, X), (8, Y)]), (T_READ, &[(0, Y)])];
+    let fx = build(
+        vec![vec![t(T_COPY, 0, N, 0, N)], vec![t(T_READ, 1, N, 0, N)]],
+        records,
+        vec![vec![T_READ], vec![T_COPY, T_READ]],
+        Some(proven_protocol()),
+        false,
+    );
+    let err = fx.check().unwrap_err();
+    assert!(
+        err.contains("not in the pool node's certified templates"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_missing_or_partial_protocol_is_refused() {
+    let records: &[(u32, &[(u32, u64)])] = &[(T_NOP, &[])];
+    let tasks = || vec![vec![t(T_NOP, 0, N, 0, N)], vec![]];
+    // No protocol in the receipt facts.
+    let fx = build(tasks(), records, vec![ALL.to_vec(); 2], None, false);
+    let err = TaskProtocol::from_program(&fx.program, fx.group.clone()).unwrap_err();
+    assert!(err.contains("no certified task protocol"), "{err}");
+    // Only one member has one.
+    let mut fx = fixture(tasks(), records);
+    fx.program.nodes[2].arena.as_mut().unwrap().task_protocol = None;
+    assert!(TaskProtocol::from_program(&fx.program, fx.group.clone()).is_err());
+    // A protocol missing a property.
+    for missing in TASK_PROTO_REQUIRED {
+        let mut p = proven_protocol();
+        p.proved.retain(|q| q != missing);
+        let fx = build(tasks(), records, vec![ALL.to_vec(); 2], Some(p), false);
+        let err = fx.check().unwrap_err();
+        assert!(err.contains(missing), "{err}");
+        assert!(err.contains("not proved"), "{err}");
+    }
+    // A layout the headers were not parsed with.
+    let mut p = proven_protocol();
+    p.layout.desc_stride = 64;
+    let fx = build(tasks(), records, vec![ALL.to_vec(); 2], Some(p), false);
+    assert!(fx.check().unwrap_err().contains("task layout"));
+}
+
+#[test]
+fn a_pool_without_certified_per_template_effects_is_refused() {
+    let records: &[(u32, &[(u32, u64)])] = &[(T_NOP, &[])];
+    let mut fx = fixture(vec![vec![t(T_NOP, 0, N, 0, N)], vec![]], records);
+    let protocol = fx.protocol();
+    fx.program.nodes[1].arena = None;
+    let err = fx
+        .graph
+        .check(&fx.program, fx.group.clone(), &protocol)
+        .unwrap_err();
+    assert!(err.contains("no certified per-template effects"), "{err}");
+}
+
+#[test]
+fn malformed_headers_and_pool_bindings_are_refused() {
+    let records: &[(u32, &[(u32, u64)])] = &[(T_NOP, &[])];
+    let base = || {
+        fixture(
+            vec![vec![t(T_NOP, 0, N, 0, N)], vec![t(T_NOP, 0, N, 0, N)]],
+            records,
+        )
+    };
+
+    // Event id past the cells.
+    let mut fx = base();
+    fx.graph.pools[0].tasks[0].done_event = 20_000;
+    assert!(fx
+        .check()
+        .unwrap_err()
+        .contains("past the 20000 event cells"));
+    let mut fx = base();
+    fx.graph.pools[0].tasks[0].pred_event = 20_000;
+    assert!(fx.check().unwrap_err().contains("pred event 20000"));
+
+    // More event ids than the event cells hold.
+    let mut fx = base();
+    fx.graph.event_cells = 1 << 30;
+    assert!(fx.check().unwrap_err().contains("the event cells hold"));
+
+    // The events resource is not event cells.
+    let mut fx = base();
+    fx.graph.events = fx.data(X);
+    assert!(fx.check().unwrap_err().contains("not declared EventCells"));
+
+    // A pool whose events argument is some other event cells.
+    let mut fx = base();
+    fx.graph.events = fx.data(CTL);
+    assert!(fx.check().unwrap_err().contains("events argument"));
+
+    // A task count that is not the pool's.
+    let mut fx = base();
+    fx.graph.pools[0].tasks.push(t(T_NOP, 0, N, 0, N));
+    assert!(fx.check().unwrap_err().contains("n_tasks"));
+
+    // Two pools sharing a claim ticket.
+    let mut fx = base();
+    let ticket = fx.program.nodes[1]
+        .args
+        .iter()
+        .find(|(o, _)| *o == 8)
+        .unwrap()
+        .1
+        .clone();
+    for (o, a) in &mut fx.program.nodes[2].args {
+        if *o == 8 {
+            *a = ticket.clone();
+        }
+    }
+    assert!(fx.check().unwrap_err().contains("ticket is shared"));
+
+    // A ticket inside the event ids.
+    let mut fx = base();
+    let events = fx.events();
+    for (o, a) in &mut fx.program.nodes[1].args {
+        if *o == 8 {
+            *a = Arg::Resource {
+                resource: events,
+                interior: 16,
+            };
+        }
+    }
+    assert!(fx.check().unwrap_err().contains("lies in event ids"));
+
+    // A pool that is not in the graph / a graph pool outside the group.
+    let mut fx = base();
+    fx.graph.pools.pop();
+    assert!(fx.check().unwrap_err().contains("has no task pool"));
+    let mut fx = base();
+    fx.graph.pools[1].node = 5;
+    assert!(fx.check().unwrap_err().contains("not in group"));
+
+    // Task headers somebody writes.
+    let mut fx = base();
+    let tasks = rid(&fx.program, TASKS);
+    fx.program.nodes[0].effects.push(RegionEffect {
+        arg_offset: 0,
+        resource: tasks,
+        classes: vec![VmemStore],
+    });
+    assert!(fx.check().unwrap_err().contains("immutable during replay"));
+
+    // More tasks than the arena holds.
+    let mut fx = base();
+    let tasks = rid(&fx.program, TASKS);
+    fx.program.resources[tasks.0 as usize].bytes = 64;
+    assert!(fx.check().unwrap_err().contains("task arena"));
+}
+
+#[test]
+fn access_outside_the_protocol_is_refused() {
+    let records: &[(u32, &[(u32, u64)])] = &[(T_WRITE, &[(8, Y)])];
+    let mut fx = fixture(vec![vec![t(T_WRITE, 0, N, 0, N)], vec![]], records);
+    // Pool 1 also stores into Y through an explicit pointer argument.
+    let y = fx.data(Y);
+    fx.program.nodes[2].effects.push(RegionEffect {
+        arg_offset: 32,
+        resource: y,
+        classes: vec![VmemStore],
+    });
+    let err = fx.check().unwrap_err();
+    assert!(err.contains("outside the task protocol"), "{err}");
+    // Reaching a resource no task touches is fine.
+    let mut fx = fixture(vec![vec![t(T_WRITE, 0, N, 0, N)], vec![]], records);
+    let z = fx.data(Z);
+    fx.program.nodes[2].effects.push(RegionEffect {
+        arg_offset: 32,
+        resource: z,
+        classes: vec![VmemStore],
+    });
+    fx.check().unwrap();
+}
+
+#[test]
+fn headers_parse_from_the_uploaded_bytes() {
+    let mut bytes = vec![0u8; 256];
+    let mut put = |rec: usize, at: u32, v: u32| {
+        let at = rec * 128 + at as usize;
+        bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    };
+    let l = TaskLayout::M0;
+    // Task 0: template 7 at record offset 64, waits 3 for 2, releases 9.
+    put(0, l.template_offset, 7);
+    put(0, l.ka_off_offset, 64);
+    put(0, l.pred_event_offset, 3);
+    put(0, l.expected_offset, 2);
+    put(0, l.done_event_offset, 9);
+    // Task 1: no events.
+    put(1, l.template_offset, 1);
+    put(1, l.pred_event_offset, NONE);
+    put(1, l.done_event_offset, NONE);
+    let pool = PoolTasks::parse(4, &bytes, &l).unwrap();
+    assert_eq!(pool.node, 4);
+    assert_eq!(
+        pool.tasks,
+        vec![
+            TaskHeader {
+                template: 7,
+                ka_off: 64,
+                pred_event: 3,
+                expected: 2,
+                done_event: 9
+            },
+            TaskHeader {
+                template: 1,
+                ka_off: 0,
+                pred_event: NONE,
+                expected: 0,
+                done_event: NONE
+            },
+        ]
+    );
+    assert!(PoolTasks::parse(4, &bytes[..200], &l).is_err());
+    assert_eq!(PoolTasks::parse(4, &[], &l).unwrap().tasks, vec![]);
+}
+
+#[test]
+fn a_ten_thousand_task_chain_is_proved() {
+    // Alternating pools; task i waits for task i-1 and every task writes Y:
+    // the whole of the 10^4 x 10^4 pair space is ordered through the closure.
+    let n = 10_000u32;
+    let mut pools = vec![Vec::new(), Vec::new()];
+    for i in 0..n {
+        let pred = if i == 0 { N } else { i - 1 };
+        let expected = u32::from(i != 0);
+        pools[(i % 2) as usize].push(t(T_WRITE, 0, pred, expected, i));
+    }
+    let fx = fixture(pools, &[(T_WRITE, &[(8, Y)])]);
+    let proof = fx.check().unwrap();
+    assert_eq!(proof.tasks, n as usize);
+    assert_eq!(proof.ordered_pairs, u64::from(n) * u64::from(n - 1) / 2);
+    assert_eq!(proof.events_used, n as usize);
+}
+
+#[cfg(feature = "lab")]
+mod lab {
+    use super::*;
+
+    #[test]
+    fn check_pending_runs_the_host_checks_and_yields_a_pending_ordering() {
+        // The receipts carry arena facts but no task protocol yet.
+        let tasks = || vec![vec![t(T_COPY, 0, N, 0, 0)], vec![t(T_READ, 1, 0, 1, N)]];
+        let records: &[(u32, &[(u32, u64)])] = &[(T_COPY, &[(0, X), (8, Y)]), (T_READ, &[(0, Y)])];
+        let fx = build(
+            tasks(),
+            records,
+            vec![vec![T_COPY], vec![T_READ]],
+            None,
+            false,
+        );
+        assert!(
+            TaskProtocol::from_program(&fx.program, fx.group.clone()).is_err(),
+            "check needs a proven protocol"
+        );
+        let ordering = fx
+            .graph
+            .check_pending(&fx.program, fx.group.clone())
+            .unwrap();
+        assert!(ordering.is_pending());
+        assert_eq!(ordering.task_graph(), Some(&(1..3)));
+        assert_eq!(ordering.edges().len(), 1);
+        assert_eq!(
+            (ordering.edges()[0].producer, ordering.edges()[0].consumer),
+            (1, 2)
+        );
+        let mut program = fx.program.clone();
+        program.add_coresident_group(1..3, ordering).unwrap();
+
+        // The checks are the same ones: a race is refused while pending too.
+        let fx = build(
+            vec![vec![t(T_COPY, 0, N, 0, N)], vec![t(T_READ, 1, N, 0, N)]],
+            records,
+            vec![vec![T_COPY], vec![T_READ]],
+            None,
+            false,
+        );
+        let err = fx
+            .graph
+            .check_pending(&fx.program, fx.group.clone())
+            .unwrap_err();
+        assert!(err.contains("race on resource"), "{err}");
+        // And so is a header cardinality error.
+        let fx = build(
+            vec![vec![t(T_COPY, 0, N, 0, 0)], vec![t(T_READ, 1, 0, 2, N)]],
+            records,
+            vec![vec![T_COPY], vec![T_READ]],
+            None,
+            false,
+        );
+        let err = fx
+            .graph
+            .check_pending(&fx.program, fx.group.clone())
+            .unwrap_err();
+        assert!(err.contains("deadlocks"), "{err}");
+    }
+
+    /// The lab flow of today's pool receipts: `A1 Unknown`, no arena facts.
+    /// Every record field is conservatively read and written, so only an
+    /// ordered graph passes.
+    #[test]
+    fn unknown_receipts_are_checked_conservatively() {
+        let records: &[(u32, &[(u32, u64)])] = &[(T_COPY, &[(0, X), (8, Y)]), (T_READ, &[(0, Y)])];
+        let ordered = |pred: u32, expected: u32| {
+            let mut fx = build(
+                vec![
+                    vec![t(T_COPY, 0, N, 0, 0)],
+                    vec![t(T_READ, 1, pred, expected, N)],
+                ],
+                records,
+                vec![vec![], vec![]],
+                None,
+                true,
+            );
+            let arena = fx.graph.arena;
+            for node in fx.group.clone() {
+                fx.program.admit_lab_pending(node, Some(arena)).unwrap();
+            }
+            fx
+        };
+        let fx = ordered(0, 1);
+        let ordering = fx
+            .graph
+            .check_pending(&fx.program, fx.group.clone())
+            .unwrap();
+        assert!(ordering.is_pending());
+        let mut program = fx.program.clone();
+        program.add_coresident_group(1..3, ordering).unwrap();
+
+        // Unordered: the conservative effects of X (read+written by the copy
+        // task) and Y race.
+        let fx = ordered(N, 0);
+        let err = fx
+            .graph
+            .check_pending(&fx.program, fx.group.clone())
+            .unwrap_err();
+        assert!(err.contains("race on resource"), "{err}");
+
+        // The caller may supply the body kernels' own classes instead.
+        let mut templates = BTreeMap::new();
+        templates.insert(T_COPY, template(T_COPY).pointer_loads);
+        templates.insert(T_READ, template(T_READ).pointer_loads);
+        let fx = ordered(N, 0);
+        let err = fx
+            .graph
+            .check_pending_with(&fx.program, fx.group.clone(), Some(&templates))
+            .unwrap_err();
+        assert!(err.contains("race on resource"), "{err}");
+    }
+}

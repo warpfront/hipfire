@@ -57,6 +57,12 @@ pub struct GroupOrdering {
     /// The edges are not from a certificate (`lab`: differential-verified,
     /// certificate pending).
     pending: bool,
+    /// The member range a task-graph check ([`crate::task_graph`]) covered:
+    /// every member's task headers were proven race-free and deadlock-free
+    /// against its dispatcher protocol. A member that carries a task protocol
+    /// is refused by the plan unless this covers it, so the node-level edges
+    /// above are never the only evidence for a persistent pool.
+    task_graph: Option<Range<usize>>,
 }
 
 impl GroupOrdering {
@@ -66,16 +72,29 @@ impl GroupOrdering {
         Self {
             edges: Vec::new(),
             pending: false,
+            task_graph: None,
         }
     }
 
     /// The ordering a task-graph certificate produced.
-    #[allow(dead_code)] // the producer, `crate::task_graph`, does not exist yet; tests build one
+    #[allow(dead_code)] // tests build one directly
     pub(crate) fn from_certificate(edges: Vec<OrderedEdge>) -> Self {
         Self {
             edges,
             pending: false,
+            task_graph: None,
         }
+    }
+
+    /// The ordering of a [`crate::task_graph::TaskGraphProof`] over `nodes`.
+    pub(crate) fn with_task_graph(mut self, nodes: Range<usize>) -> Self {
+        self.task_graph = Some(nodes);
+        self
+    }
+
+    /// The member range a task-graph check covered, if any.
+    pub fn task_graph(&self) -> Option<&Range<usize>> {
+        self.task_graph.as_ref()
     }
 
     /// Lab only: an ordering whose certificate is pending. Its edges get
@@ -87,6 +106,7 @@ impl GroupOrdering {
         Self {
             edges,
             pending: true,
+            task_graph: None,
         }
     }
 
@@ -205,14 +225,18 @@ pub(crate) fn check_ordered_edge(
             e.producer, e.consumer, e.consumer, e.event.0
         ));
     }
+    // The edge orders the producer's accesses before the consumer's: at least
+    // one of the two must write the resource (RAW/WAW: the producer; WAR: the
+    // consumer, after the producer's reads).
     if !program.nodes[e.producer]
         .effects
         .iter()
+        .chain(&program.nodes[e.consumer].effects)
         .any(|x| x.resource == e.resource && x.writes())
     {
         return Err(format!(
-            "ordered edge {}->{}: producer {} does not write resource {}",
-            e.producer, e.consumer, e.producer, e.resource.0
+            "ordered edge {}->{}: neither node writes resource {}",
+            e.producer, e.consumer, e.resource.0
         ));
     }
     Ok(())
@@ -231,6 +255,23 @@ pub(crate) fn classify(
         if !program.nodes[m].lowering.is_pm4_lowerable() {
             refusals.push(format!(
                 "member {m} ({}) is not PM4",
+                program.nodes[m].symbol
+            ));
+        }
+    }
+    for &m in &members {
+        let covered = group
+            .ordering
+            .task_graph()
+            .is_some_and(|covered| *covered == group.nodes);
+        if program.nodes[m]
+            .arena
+            .as_ref()
+            .is_some_and(|a| a.task_protocol.is_some())
+            && !covered
+        {
+            refusals.push(format!(
+                "member {m} ({}) carries a task protocol but no task-graph proof covers the group",
                 program.nodes[m].symbol
             ));
         }
@@ -371,6 +412,13 @@ impl KernelProgram {
                 "co-resident group {nodes:?} is past {} nodes",
                 self.nodes.len()
             ));
+        }
+        if let Some(covered) = ordering.task_graph() {
+            if *covered != nodes {
+                return Err(format!(
+                    "co-resident group {nodes:?}: the ordering's task-graph proof covers {covered:?}"
+                ));
+            }
         }
         for j in nodes.clone() {
             if !self.nodes[j].lowering.is_pm4_lowerable() {

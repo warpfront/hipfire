@@ -1237,6 +1237,9 @@ struct Analyzer<'k> {
     pos_cyclic: Vec<bool>,
     /// gfx12 release/acquire refinement per layout position ([`sync_classes`]).
     sync_class: Vec<Option<AccessClass>>,
+    /// Per layout position: attribution is skipped (the dataflow still runs through the
+    /// instruction). Empty when nothing is excluded ([`analyze_excluding`]).
+    excluded: Vec<bool>,
     decoded: Vec<Option<Dec<'k>>>,
     /// Integer/address witness nodes (`kernarg_ix`).
     ix: RefCell<Interner>,
@@ -1256,7 +1259,22 @@ struct Analyzer<'k> {
 /// an instruction the pass does not model, yields `KernelStatus::Unknown`
 /// with the reason in `unresolved`.
 pub fn analyze(kernel: &Kernel, arch: Arch) -> KernargFacts {
-    analyze_impl(kernel, arch, None, false)
+    analyze_impl(kernel, arch, None, false, &[])
+}
+
+/// The unguarded analysis with the instructions whose lifted byte offset
+/// (`Provenance::pc`, relative to the kernel symbol) lies in one of `excluded`
+/// (`[lo, hi)` ranges) left out of refusal and side-read attribution: the pass
+/// still runs through them for their register effects, and an access of theirs
+/// that resolves to an argument is still credited to it (with its kernarg
+/// sinks), but an access that does not resolve (a pointer loaded from the
+/// argument's pointee), a side read or any other refusal there adds nothing.
+/// For a persistent dispatcher whose hosted task bodies are certified
+/// separately: the facts are the dispatcher shell's own plus what the bodies
+/// read of their argument block. An instruction without a recorded offset is
+/// never excluded.
+pub fn analyze_excluding(kernel: &Kernel, arch: Arch, excluded: &[(u32, u32)]) -> KernargFacts {
+    analyze_impl(kernel, arch, None, false, excluded)
 }
 
 /// The guarded analysis of amendment 2026-10-25 §A9.1/§A9.3: the same pass
@@ -1272,7 +1290,7 @@ pub fn analyze(kernel: &Kernel, arch: Arch) -> KernargFacts {
 /// (guards cleared), `Unknown` otherwise. The unguarded [`analyze`] result is
 /// unaffected and stays the diagnostic baseline.
 pub fn analyze_guarded(kernel: &Kernel, arch: Arch, guards: &[Guard]) -> KernargFacts {
-    analyze_impl(kernel, arch, Some(guards), false)
+    analyze_impl(kernel, arch, Some(guards), false, &[])
 }
 
 /// The sealed-table analysis (design: `SealedTable` certificate). The same
@@ -1299,7 +1317,7 @@ pub fn analyze_guarded(kernel: &Kernel, arch: Arch, guards: &[Guard]) -> Kernarg
 /// `sealed-*` rules. The result is void without a matching `sealed_table`
 /// runtime witness.
 pub fn analyze_sealed(kernel: &Kernel, arch: Arch) -> KernargFacts {
-    analyze_impl(kernel, arch, None, true)
+    analyze_impl(kernel, arch, None, true, &[])
 }
 
 fn analyze_impl(
@@ -1307,6 +1325,7 @@ fn analyze_impl(
     arch: Arch,
     guards: Option<&[Guard]>,
     sealed: bool,
+    excluded: &[(u32, u32)],
 ) -> KernargFacts {
     let (args, size) = match &kernel.abi {
         Abi::Hsa {
@@ -1411,6 +1430,19 @@ fn analyze_impl(
         cyclic,
         pos_cyclic,
         sync_class,
+        excluded: if excluded.is_empty() {
+            Vec::new()
+        } else {
+            body.layout
+                .iter()
+                .map(|&id| {
+                    body.insts
+                        .get(id)
+                        .and_then(|i| i.prov.pc)
+                        .is_some_and(|pc| excluded.iter().any(|&(lo, hi)| (lo..hi).contains(&pc)))
+                })
+                .collect()
+        },
         decoded,
         ix: RefCell::new(interner),
         guard,
@@ -3567,7 +3599,23 @@ impl<'k> Analyzer<'k> {
                 continue;
             };
             for pos in block.range.0..block.range.1 {
-                self.step(&mut st, pos, Some(&mut *rec), self.cyclic[b]);
+                if self.excluded.get(pos).copied().unwrap_or(false) {
+                    // Run the instruction for its register effects and keep only what
+                    // resolves to an argument (its access and its kernarg sinks: a
+                    // pointer loaded from the record and dereferenced is unresolved
+                    // here, and a refusal or side read belongs to the body's own proof).
+                    let mut scratch = Rec::new(DwSet::default());
+                    self.step(&mut st, pos, Some(&mut scratch), self.cyclic[b]);
+                    for (sink, extra) in rec.sinks.iter_mut().zip(&scratch.sinks) {
+                        *sink |= *extra;
+                    }
+                    rec.taint_overflow |= scratch.taint_overflow;
+                    for (target, accesses) in scratch.accesses {
+                        rec.accesses.entry(target).or_default().extend(accesses);
+                    }
+                } else {
+                    self.step(&mut st, pos, Some(&mut *rec), self.cyclic[b]);
+                }
             }
         }
     }

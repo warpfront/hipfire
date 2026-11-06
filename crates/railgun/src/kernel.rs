@@ -277,6 +277,9 @@ pub struct ConditionalFacts {
     /// Descriptor arenas (the `descriptor_arena` case): discharged by
     /// [`KernelProgram::bind_records`], not by a window witness.
     pub arenas: Vec<ArenaFact>,
+    /// The dispatcher protocol the task-graph certificate proved (see
+    /// [`crate::task_graph`]); only with `arenas`.
+    pub task_protocol: Option<crate::task_graph::TaskProtocolFact>,
     pub witnesses: Vec<String>,
     pub case_digest: String,
 }
@@ -540,6 +543,16 @@ fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, St
             templates,
         });
     }
+    let task_protocol = record
+        .task_protocol
+        .as_ref()
+        .map(|p| crate::task_graph::TaskProtocolFact::from_record(p, &record.args, sym))
+        .transpose()?;
+    if task_protocol.is_some() && arenas.is_empty() {
+        return Err(format!(
+            "{sym}: a task protocol needs the descriptor arena its tasks' records live in"
+        ));
+    }
     Ok(ConditionalFacts {
         guards: record
             .guards
@@ -554,6 +567,7 @@ fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, St
         indexed,
         tables,
         arenas,
+        task_protocol,
         witnesses: record.required_witnesses.clone(),
         case_digest: record.case_digest.clone(),
     })
@@ -1156,6 +1170,10 @@ pub(crate) const ARENA_UNBOUND: &str = "descriptor_arena records not bound";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArenaNode {
     pub arenas: Vec<ArenaFact>,
+    /// The proven dispatcher protocol of a persistent pool kernel; the node
+    /// is only admitted to a group together with a task-graph proof
+    /// ([`crate::task_graph::TaskGraph::check`]).
+    pub task_protocol: Option<crate::task_graph::TaskProtocolFact>,
     /// Parallel to `arenas`: the arena's records were bound and the
     /// resulting effects added to the node.
     pub bound: Vec<bool>,
@@ -1558,6 +1576,7 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
                 .filter(|c| !c.arenas.is_empty())
                 .map(|c| ArenaNode {
                     arenas: c.arenas.clone(),
+                    task_protocol: c.task_protocol.clone(),
                     bound: vec![false; c.arenas.len()],
                     case_digest: c.case_digest.clone(),
                 }),

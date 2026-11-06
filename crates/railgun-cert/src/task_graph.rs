@@ -1,0 +1,1329 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! The byte-level half of the task-graph certificate for PeaceMaker persistent
+//! pool objects (`railgun::task_graph` is the host half; plan §8.2).
+//!
+//! [`certify_pool`] is [`crate::certify`] for an object whose kernels carry a
+//! `.note.pm_regions` table (`peacemaker_lift::regions_note`): the dispatcher
+//! (pool) kernel plus the hosted task bodies it enters as *regions*. A tagged
+//! kernel is upgraded from A1 `unknown` to `conditional` (witness
+//! `descriptor_arena` + a [`TaskProtocolRecord`]) when, and only when, all of
+//! these are proven from the bytes, and each failure stays an explicit
+//! `task_graph-*` unresolved rule on the unchanged record:
+//!
+//! 1. **Regions.** Every region of the note is re-derived. A lifted region
+//!    (non-zero source digest): the standalone object is looked up by digest
+//!    (its SHA-256 is checked), converted with `lift_region` from the note's
+//!    recorded inputs, assembled, and its words must equal the pool kernel's
+//!    bytes in `[entry_pc, exit_pc)` exactly. A native region (zero digest):
+//!    the region's own instructions are analysed by A1 in a region-scoped
+//!    mode (the region cut out of the lifted CFG as a kernel whose `s[0:1]` is
+//!    the record base, with no declared arguments, so every record pointer is
+//!    a synthetic slot at its record offset).
+//! 2. **Per-template arena facts.** A lifted region's standalone object must
+//!    have a `proven` A1 record; its explicit pointer arguments (offset →
+//!    classes) are the template's `pointer_loads` (inside the region
+//!    `s[0:1]` is the record base, so a kernarg offset is a record offset).
+//!    The same facts are re-derived by the region-scoped A1 of the region's
+//!    bytes in the pool and must agree. They are emitted as one
+//!    [`DescriptorArenaRecord`] whose arena argument is the dispatcher's
+//!    `kernargs` pointer. The hidden arguments a body loads live in the same
+//!    record at their standalone offsets (reported in the `task-graph` check).
+//! 3. **Dispatcher shell.** A1 on the pool kernel with the regions excluded
+//!    from attribution ([`peacemaker_ir::passes::kernargs::analyze_excluding`])
+//!    must be `Proven`: every access outside the regions resolves to a pointer
+//!    argument of the dispatcher's params block, the event cells are touched
+//!    only by `atomic_release` and `load_acquire`, and no region instruction
+//!    writes an SGPR of the dispatcher range or a trap temporary, or reaches
+//!    outside the region's own LDS and control flow.
+//! 4. **Protocol.** [`protocol`] runs a symbolic dataflow over the lifted
+//!    pool CFG and proves the six [`TASK_PROTO_REQUIRED`] properties, which
+//!    the host reads from the [`TaskProtocolRecord`].
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use peacemaker_ir::cfg::{BlockId, Body, Terminator};
+use peacemaker_ir::codec::gfx12;
+use peacemaker_ir::effects::Control;
+use peacemaker_ir::inst::{Abi, Arch, Frontend, Kernel, Program};
+use peacemaker_ir::kernarg::{KernargFacts, KernelStatus};
+use peacemaker_ir::passes::kernargs;
+use peacemaker_ir::reg::Kind;
+use peacemaker_lift::regions_note::{read_regions, KernelRegions, Region};
+use peacemaker_lift::rewrite::region::{lift_region, RegionInputs};
+use peacemaker_lift::{lift_object, Options};
+use railgun_corpus::receipt::{
+    ArenaPointerRecord, ArenaTemplateRecord, DescriptorArenaRecord, TaskProtocolRecord,
+    STATUS_CONDITIONAL, STATUS_PROVEN, STATUS_UNKNOWN, WITNESS_DESCRIPTOR_ARENA,
+};
+use sha2::{Digest, Sha256};
+
+use crate::{
+    arg_record, case_digest, kernel_record, metadata_effects, radiowave_cert, CertError, Check,
+    KernelRecord, Receipt, UnresolvedRecord,
+};
+
+pub mod protocol;
+
+/// The standalone-object resolver of [`certify_pool`]: the object whose SHA-256
+/// is the argument, if the caller has it.
+pub type Standalone<'a> = &'a dyn Fn(&[u8; 32]) -> Option<Vec<u8>>;
+
+/// Obligation names a conditional pool record adds to the receipt.
+pub const OBLIGATION_ARENA: &str = "DescriptorArenaWitness";
+pub const OBLIGATION_PROTOCOL: &str = "TaskProtocol";
+
+/// A failed obligation: stays on the record as an `Unresolved` with this rule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    pub rule: &'static str,
+    pub detail: String,
+    pub pc: Option<u32>,
+}
+
+pub(crate) fn refuse(rule: &'static str, detail: impl Into<String>) -> Refusal {
+    Refusal {
+        rule,
+        detail: detail.into(),
+        pc: None,
+    }
+}
+
+/// What the certificate established about one pool kernel (conditional upgrade).
+#[derive(Clone, Debug)]
+pub struct PoolProof {
+    pub arena: DescriptorArenaRecord,
+    pub protocol: TaskProtocolRecord,
+    /// Human-readable evidence lines (the `task-graph` check detail).
+    pub evidence: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// object bytes
+// ---------------------------------------------------------------------------
+
+/// The code bytes of kernel `symbol` in the ELF `elf`.
+fn kernel_text<'a>(elf: &'a [u8], symbol: &str) -> Result<&'a [u8], String> {
+    use object::{Object, ObjectSection, ObjectSymbol};
+    let file = object::File::parse(elf).map_err(|e| format!("ELF parse: {e}"))?;
+    let sym = file
+        .symbols()
+        .find(|s| s.name() == Ok(symbol) && !s.is_undefined())
+        .ok_or_else(|| format!("kernel symbol {symbol:?} not found"))?;
+    let index = sym
+        .section_index()
+        .ok_or_else(|| format!("{symbol}: no defining section"))?;
+    let section = file
+        .section_by_index(index)
+        .map_err(|e| format!("{symbol}: {e}"))?;
+    let data = section.data().map_err(|e| format!("{symbol}: {e}"))?;
+    let at = sym
+        .address()
+        .checked_sub(section.address())
+        .ok_or_else(|| format!("{symbol}: below its section"))? as usize;
+    data.get(at..at + sym.size() as usize)
+        .ok_or_else(|| format!("{symbol}: outside its section"))
+}
+
+// ---------------------------------------------------------------------------
+// region assembly (the native writer's text path: `parse_line` + the codec,
+// branch labels resolved to word offsets)
+// ---------------------------------------------------------------------------
+
+fn encode_line(line: &str, arch: Arch) -> Result<Vec<u32>, String> {
+    let inst = peacemaker_lift::text::parse_line(line, arch).map_err(|e| format!("{line}: {e}"))?;
+    gfx12::encode(&inst)
+        .map(|w| w.to_vec())
+        .map_err(|e| format!("{line}: {e}"))
+}
+
+/// The words `Builder::foreign_region` emits between a region's entry and exit
+/// labels for a converted body: `s_wait_alu 0x0`, then its lines with every
+/// label branch resolved.
+pub fn region_words(lines: &[String], arch: Arch) -> Result<Vec<u32>, String> {
+    let mut words: Vec<u32> = Vec::new();
+    let mut labels: HashMap<&str, usize> = HashMap::new();
+    let mut branches: Vec<(usize, &str, &str)> = Vec::new();
+    words.extend(encode_line("s_wait_alu 0x0", arch)?);
+    for line in lines {
+        if let Some(label) = line.strip_suffix(':') {
+            if labels.insert(label, words.len()).is_some() {
+                return Err(format!("duplicate label {label}"));
+            }
+            continue;
+        }
+        let (head, rest) = line
+            .split_once(char::is_whitespace)
+            .map_or((line.as_str(), ""), |(h, r)| (h, r.trim()));
+        if (head == "s_branch" || head.starts_with("s_cbranch_")) && rest.starts_with(".L") {
+            branches.push((words.len(), head, rest));
+            words.push(0);
+        } else {
+            words.extend(encode_line(line, arch)?);
+        }
+    }
+    for (at, mnemonic, label) in branches {
+        let target = *labels
+            .get(label)
+            .ok_or_else(|| format!("undefined label {label}"))?;
+        let offset = target as i64 - (at as i64 + 1);
+        let words_of = encode_line(&format!("{mnemonic} {offset}"), arch)?;
+        let [word] = words_of[..] else {
+            return Err(format!("{mnemonic}: branch is not one dword"));
+        };
+        words[at] = word;
+    }
+    Ok(words)
+}
+
+// ---------------------------------------------------------------------------
+// the pool kernel as the checks see it
+// ---------------------------------------------------------------------------
+
+/// One region of the note located in the lifted kernel's layout.
+#[derive(Clone, Debug)]
+pub struct Placed {
+    pub region: Region,
+    /// Layout position of the instruction at `entry_pc`, and of the first
+    /// instruction at or after `exit_pc` (the layout length when none).
+    pub p_entry: usize,
+    pub p_exit: usize,
+}
+
+/// The address of the kernel's first instruction: `Provenance::pc` of a lifted
+/// instruction is an address in the object's text, the region note's offsets are
+/// relative to the kernel symbol.
+pub(crate) fn text_base(kernel: &Kernel) -> u32 {
+    match &kernel.origin {
+        peacemaker_ir::inst::KernelOrigin::Frontend { entry_va, .. } => *entry_va as u32,
+        _ => 0,
+    }
+}
+
+/// `pc` relative to the kernel symbol.
+pub(crate) fn rel_pc(kernel: &Kernel, pc: Option<u32>) -> Option<u32> {
+    pc.map(|p| p.wrapping_sub(text_base(kernel)))
+}
+
+/// Layout position of each instruction's byte offset from the kernel symbol.
+pub(crate) fn pc_positions(kernel: &Kernel) -> BTreeMap<u32, usize> {
+    let body = &kernel.body;
+    body.layout
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, &id)| Some((rel_pc(kernel, body.insts.get(id)?.prov.pc)?, pos)))
+        .collect()
+}
+
+fn place_regions(kernel: &Kernel, notes: &KernelRegions) -> Result<Vec<Placed>, Refusal> {
+    let by_pc = pc_positions(kernel);
+    let mut out = Vec::new();
+    for r in &notes.regions {
+        let (entry, exit) = (r.entry_pc as u32, r.exit_pc as u32);
+        let p_entry = *by_pc.get(&entry).ok_or_else(|| {
+            refuse(
+                "task_graph-region-structure",
+                format!(
+                    "template {}: entry {entry:#x} is not an instruction boundary",
+                    r.template_id
+                ),
+            )
+        })?;
+        let p_exit = by_pc
+            .range(exit..)
+            .next()
+            .map_or(kernel.body.layout.len(), |(_, &p)| p);
+        if by_pc.get(&exit).is_none() && p_exit != kernel.body.layout.len() {
+            return Err(refuse(
+                "task_graph-region-structure",
+                format!(
+                    "template {}: exit {exit:#x} is not an instruction boundary",
+                    r.template_id
+                ),
+            ));
+        }
+        out.push(Placed {
+            region: r.clone(),
+            p_entry,
+            p_exit,
+        });
+    }
+    Ok(out)
+}
+
+fn mnemonic(kernel: &Kernel, arch: Arch, pos: usize) -> &'static str {
+    kernel
+        .body
+        .insts
+        .get(kernel.body.layout[pos])
+        .and_then(|i| i.op.name(arch))
+        .unwrap_or("")
+}
+
+/// Structural checks of one placed region over the lifted CFG: the region is
+/// entered only at its entry and left only through its exit, no instruction
+/// writes the dispatcher's SGPR range or a trap temporary, none ends or traps
+/// the wave, and a native region touches no LDS and no barrier.
+fn check_region_structure(
+    kernel: &Kernel,
+    arch: Arch,
+    lo: u16,
+    hi: u16,
+    p: &Placed,
+) -> Vec<Refusal> {
+    let body = &kernel.body;
+    let t = p.region.template_id;
+    let mut out = Vec::new();
+    let inside = |pos: usize| (p.p_entry..p.p_exit).contains(&pos);
+    for block in &body.blocks {
+        let (s, e) = block.range;
+        if s >= e {
+            continue;
+        }
+        let last_inside = inside(e - 1);
+        for succ in &block.succs {
+            let target = body.blocks[succ.0].range.0;
+            let enters_interior = target > p.p_entry && target < p.p_exit;
+            if enters_interior && !last_inside {
+                out.push(refuse(
+                    "task_graph-region-structure",
+                    format!("template {t}: a branch from outside enters the middle of the region (block {} -> {})", block.id.0, succ.0),
+                ));
+            }
+            if last_inside && !(inside(target) || target == p.p_exit) {
+                out.push(refuse(
+                    "task_graph-region-structure",
+                    format!(
+                        "template {t}: the region branches out of itself (block {} -> {})",
+                        block.id.0, succ.0
+                    ),
+                ));
+            }
+        }
+        if last_inside && matches!(block.term, Terminator::EndPgm | Terminator::Unreachable) {
+            out.push(refuse(
+                "task_graph-region-structure",
+                format!(
+                    "template {t}: block {} ends the wave inside the region",
+                    block.id.0
+                ),
+            ));
+        }
+    }
+    for pos in p.p_entry..p.p_exit.min(body.layout.len()) {
+        let Some(inst) = body.insts.get(body.layout[pos]) else {
+            continue;
+        };
+        let name = mnemonic(kernel, arch, pos);
+        let text = format!("{name} @{:#x}", rel_pc(kernel, inst.prov.pc).unwrap_or(0));
+        for d in &inst.effects.defs {
+            let (a, b) = (d.base, d.base + u16::from(d.len) - 1);
+            if d.kind == Kind::S && a <= hi && b >= lo {
+                out.push(refuse(
+                    "task_graph-region-sgpr-write",
+                    format!("template {t}: `{text}` writes s{a}..s{b} of the dispatcher range s{lo}..s{hi}"),
+                ));
+            }
+        }
+        for r in inst.effects.defs.iter().chain(&inst.effects.uses) {
+            if r.kind == Kind::Ttmp {
+                out.push(refuse(
+                    "task_graph-region-structure",
+                    format!("template {t}: `{text}` names a trap temporary"),
+                ));
+            }
+        }
+        if matches!(
+            inst.effects.control,
+            Control::EndPgm | Control::Halt | Control::Trap
+        ) || name.starts_with("s_setreg")
+            || matches!(
+                name,
+                "s_setpc_b64"
+                    | "s_swappc_b64"
+                    | "s_getpc_b64"
+                    | "s_rfe_b64"
+                    | "s_round_mode"
+                    | "s_denorm_mode"
+                    | "s_sethalt"
+                    | "s_trap"
+            )
+        {
+            out.push(refuse(
+                "task_graph-region-structure",
+                format!("template {t}: `{text}` ends the wave, traps or changes MODE"),
+            ));
+        }
+        if p.region.is_native() {
+            let lds = inst.effects.lds.is_some()
+                || matches!(
+                    inst.effects.mem.map(|m| m.class),
+                    Some(
+                        peacemaker_ir::effects::MemClass::DsLoad
+                            | peacemaker_ir::effects::MemClass::DsStore
+                            | peacemaker_ir::effects::MemClass::DsAtomic { .. }
+                            | peacemaker_ir::effects::MemClass::LdsDma
+                    )
+                );
+            if lds || matches!(inst.effects.control, Control::Barrier(_)) {
+                out.push(refuse(
+                    "task_graph-region-native",
+                    format!("template {t}: native region `{text}` uses LDS or a barrier, which its declared geometry does not cover"),
+                ));
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// region arena facts
+// ---------------------------------------------------------------------------
+
+/// What one region contributes to the arena and the receipt.
+#[derive(Clone, Debug)]
+pub struct RegionFacts {
+    pub template: ArenaTemplateRecord,
+    pub lds_bytes: u32,
+    pub evidence: String,
+}
+
+fn pointer_loads(facts: &KernargFacts) -> Vec<ArenaPointerRecord> {
+    let mut out: Vec<ArenaPointerRecord> = facts
+        .args
+        .iter()
+        .filter(|a| !a.accesses.is_empty())
+        .map(|a| {
+            let r = arg_record(a);
+            ArenaPointerRecord {
+                record_offset: r.offset,
+                classes: r.classes,
+            }
+        })
+        .collect();
+    out.sort_by_key(|p| p.record_offset);
+    out
+}
+
+/// The region `[p_entry, p_exit)` of `kernel` cut out as a kernel of its own:
+/// the region's blocks (clipped at the region), `s[0:1]` the kernarg-segment
+/// pointer of the entry state (the record base), no declared arguments and no
+/// kernarg size, so every pointer loaded from the record is a synthetic slot
+/// at its record offset.
+fn region_kernel(kernel: &Kernel, p: &Placed) -> Result<Kernel, String> {
+    let body = &kernel.body;
+    let mut map: HashMap<usize, usize> = HashMap::new();
+    let mut blocks = Vec::new();
+    for b in &body.blocks {
+        let (s, e) = (b.range.0.max(p.p_entry), b.range.1.min(p.p_exit));
+        if s < e {
+            map.insert(b.id.0, blocks.len());
+            blocks.push(b);
+        }
+    }
+    if blocks.is_empty() {
+        return Err("no block overlaps the region".into());
+    }
+    let first = blocks[0];
+    if first.range.0.max(p.p_entry) != p.p_entry {
+        return Err("the region does not start its first block".into());
+    }
+    let mut out_blocks = Vec::with_capacity(blocks.len());
+    for (i, b) in blocks.iter().enumerate() {
+        let (s, e) = (b.range.0.max(p.p_entry), b.range.1.min(p.p_exit));
+        let clipped_end = b.range.1 > p.p_exit;
+        let remap = |id: &BlockId| map.get(&id.0).map(|&n| BlockId(n));
+        let succs: smallvec::SmallVec<[BlockId; 2]> = b.succs.iter().filter_map(remap).collect();
+        let preds: smallvec::SmallVec<[BlockId; 2]> = b.preds.iter().filter_map(remap).collect();
+        let term = match (&b.term, clipped_end) {
+            (_, true) => Terminator::EndPgm,
+            (Terminator::Jump(t), false) => match remap(t) {
+                Some(t) => Terminator::Jump(t),
+                None => Terminator::EndPgm,
+            },
+            (
+                Terminator::Branch {
+                    cond,
+                    taken,
+                    fallthrough,
+                },
+                false,
+            ) => match (remap(taken), remap(fallthrough)) {
+                (Some(taken), Some(fallthrough)) => Terminator::Branch {
+                    cond: *cond,
+                    taken,
+                    fallthrough,
+                },
+                _ => return Err("a conditional branch leaves the region".into()),
+            },
+            (Terminator::FallThrough, false) => match succs.first() {
+                Some(&n) => {
+                    let _ = n;
+                    Terminator::FallThrough
+                }
+                None => Terminator::EndPgm,
+            },
+            (t, false) => t.clone(),
+        };
+        out_blocks.push(peacemaker_ir::cfg::Block {
+            id: BlockId(i),
+            range: (s - p.p_entry, e - p.p_entry),
+            term,
+            preds,
+            succs,
+        });
+    }
+    let mut abi = kernel.abi.clone();
+    if let Abi::Hsa {
+        descriptor,
+        metadata,
+    } = &mut abi
+    {
+        metadata.parsed.args.clear();
+        // a record is not bounded by the pool's own kernarg size: every dword of the
+        // analysed window is the region's
+        metadata.parsed.kernarg_segment_size = 512;
+        descriptor.kernarg_size = 512;
+    }
+    Ok(Kernel {
+        symbol: kernel.symbol.clone(),
+        wave: kernel.wave,
+        abi,
+        body: Body {
+            insts: body.insts.clone(),
+            layout: body.layout[p.p_entry..p.p_exit].to_vec(),
+            blocks: out_blocks,
+        },
+        origin: kernel.origin.clone(),
+    })
+}
+
+/// Region-scoped A1: the region's own instructions, `s[0:1]` the record base.
+fn region_scoped(kernel: &Kernel, arch: Arch, p: &Placed) -> Result<KernargFacts, Refusal> {
+    let t = p.region.template_id;
+    let sub = region_kernel(kernel, p).map_err(|e| {
+        refuse(
+            "task_graph-region-native",
+            format!("template {t}: region cannot be cut out: {e}"),
+        )
+    })?;
+    let facts = kernargs::analyze(&sub, arch);
+    if facts.status != KernelStatus::Proven {
+        let why: Vec<String> = facts
+            .unresolved
+            .iter()
+            .take(4)
+            .map(|u| format!("{}: {}", u.rule, u.detail))
+            .collect();
+        return Err(refuse(
+            "task_graph-region-native",
+            format!(
+                "template {t}: region-scoped A1 is {:?}: {}",
+                facts.status,
+                why.join("; ")
+            ),
+        ));
+    }
+    Ok(facts)
+}
+
+/// Per-process cache of certified standalone objects (several regions may share one).
+struct Sources<'a> {
+    lookup: Standalone<'a>,
+    certified: HashMap<[u8; 32], Result<Receipt, String>>,
+}
+
+impl Sources<'_> {
+    fn bytes_of(&self, digest: &[u8; 32]) -> Result<Vec<u8>, Refusal> {
+        let bytes = (self.lookup)(digest).ok_or_else(|| {
+            refuse(
+                "task_graph-region-source-missing",
+                format!("no standalone object with SHA-256 {}", hex32(digest)),
+            )
+        })?;
+        let actual: [u8; 32] = Sha256::digest(&bytes).into();
+        if &actual != digest {
+            return Err(refuse(
+                "task_graph-region-source-digest",
+                format!(
+                    "the object offered for {} hashes to {}",
+                    hex32(digest),
+                    hex32(&actual)
+                ),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn receipt(&mut self, digest: &[u8; 32], bytes: &[u8]) -> Result<&Receipt, Refusal> {
+        let entry = self
+            .certified
+            .entry(*digest)
+            .or_insert_with(|| crate::certify(bytes, None).map_err(|e| e.to_string()));
+        entry.as_ref().map_err(|e| {
+            refuse(
+                "task_graph-region-source-certify",
+                format!("standalone {}: {e}", hex32(digest)),
+            )
+        })
+    }
+}
+
+fn hex32(d: &[u8; 32]) -> String {
+    d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Item 1 and 2 of one lifted region.
+fn derive_lifted(
+    kernel: &Kernel,
+    arch: Arch,
+    pool_text: &[u8],
+    pool_waves: u32,
+    pool_rsrc1_modes: Option<u32>,
+    p: &Placed,
+    sources: &mut Sources<'_>,
+) -> Result<RegionFacts, Refusal> {
+    let r = &p.region;
+    let t = r.template_id;
+    let bytes = sources.bytes_of(&r.digest)?;
+    let lifted = lift_region(
+        &bytes,
+        &r.source_symbol,
+        &RegionInputs {
+            prefix: r.prefix.clone(),
+            workgroup_x: r.wg_x,
+            workgroup_yz: r.wg_yz,
+            block: r.block,
+            dynamic_lds: r.dynamic_lds,
+        },
+    )
+    .map_err(|e| {
+        refuse(
+            "task_graph-region-lift",
+            format!("template {t}: {}", e.reason),
+        )
+    })?;
+    if lifted.receipt.waves != pool_waves {
+        return Err(refuse(
+            "task_graph-region-geometry",
+            format!(
+                "template {t}: the body runs {} waves, the pool kernel {pool_waves}",
+                lifted.receipt.waves
+            ),
+        ));
+    }
+    if let Some(modes) = pool_rsrc1_modes {
+        if modes != lifted.receipt.rsrc1_modes {
+            return Err(refuse(
+                "task_graph-region-rsrc1",
+                format!(
+                    "template {t}: descriptor RSRC1 modes {modes:#x} differ from the body's {:#x}",
+                    lifted.receipt.rsrc1_modes
+                ),
+            ));
+        }
+    }
+    let words = region_words(&lifted.lines, arch).map_err(|e| {
+        refuse(
+            "task_graph-region-lift",
+            format!("template {t}: assemble: {e}"),
+        )
+    })?;
+    let have = pool_text
+        .get(r.entry_pc as usize..r.exit_pc as usize)
+        .ok_or_else(|| {
+            refuse(
+                "task_graph-region-bytes",
+                format!("template {t}: range outside the kernel"),
+            )
+        })?;
+    let want: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    if have != &want[..] {
+        let at = have
+            .chunks(4)
+            .zip(want.chunks(4))
+            .position(|(a, b)| a != b)
+            .unwrap_or_else(|| have.len().min(want.len()) / 4);
+        return Err(refuse(
+            "task_graph-region-bytes",
+            format!(
+                "template {t}: the pool's bytes [{:#x}, {:#x}) ({} words) differ from the body re-derived from {} ({} words), first at word {at} (pc {:#x})",
+                r.entry_pc,
+                r.exit_pc,
+                have.len() / 4,
+                r.source_symbol,
+                want.len() / 4,
+                r.entry_pc + 4 * at as u64
+            ),
+        ));
+    }
+    // item 2: the standalone body's own A1 record
+    let receipt = sources.receipt(&r.digest, &bytes)?;
+    let record = receipt
+        .railgun
+        .kernels
+        .iter()
+        .find(|k| k.symbol == r.source_symbol)
+        .ok_or_else(|| {
+            refuse(
+                "task_graph-region-arena",
+                format!(
+                    "template {t}: {} is not in the standalone receipt",
+                    r.source_symbol
+                ),
+            )
+        })?;
+    if record.status != STATUS_PROVEN {
+        return Err(refuse(
+            "task_graph-region-arena",
+            format!(
+                "template {t}: the standalone body's A1 record is {}, not proven",
+                record.status
+            ),
+        ));
+    }
+    if record.dynamic_kernarg_reads
+        || record.taint_overflow
+        || record.side.module_global != 0
+        || record.side.abi_packet != 0
+        || record.side.scratch != 0
+        || record.side.kernarg_segment != 0
+    {
+        return Err(refuse(
+            "task_graph-region-arena",
+            format!("template {t}: the body reads outside its own record (side reads or dynamic kernarg reads)"),
+        ));
+    }
+    let loads: Vec<ArenaPointerRecord> = {
+        let mut v: Vec<ArenaPointerRecord> = record
+            .args
+            .iter()
+            .filter(|a| a.role == "pointer" && a.accesses > 0)
+            .map(|a| ArenaPointerRecord {
+                record_offset: a.offset,
+                classes: a.classes.clone(),
+            })
+            .collect();
+        v.sort_by_key(|p| p.record_offset);
+        v
+    };
+    // The same facts from the pool's own bytes (region-scoped A1) are reported, not
+    // required: the bytes are proven identical to the standalone body, whose own
+    // proven A1 record is the source of the template.
+    let cross = match region_scoped(kernel, arch, p) {
+        Ok(s) if pointer_loads(&s) == loads => "agrees".to_owned(),
+        Ok(s) => format!("differs ({:?})", pointer_loads(&s)),
+        Err(r) => format!("not analysable ({})", r.rule),
+    };
+    let hidden: Vec<String> = record
+        .implicit
+        .hidden_loaded
+        .iter()
+        .map(|k| {
+            let off = record
+                .args
+                .iter()
+                .find(|a| a.value_kind == *k && a.loaded)
+                .map(|a| (a.offset, a.size));
+            match off {
+                Some((o, s)) => format!("{k}@{o}+{s}"),
+                None => k.clone(),
+            }
+        })
+        .collect();
+    for h in record
+        .args
+        .iter()
+        .filter(|a| a.value_kind.starts_with("hidden_") && a.loaded)
+    {
+        if h.offset + h.size > record.kernarg_size {
+            return Err(refuse(
+                "task_graph-region-arena",
+                format!(
+                    "template {t}: hidden argument {} lies outside the {}-byte record",
+                    h.value_kind, record.kernarg_size
+                ),
+            ));
+        }
+    }
+    Ok(RegionFacts {
+        template: ArenaTemplateRecord {
+            template: t,
+            pointer_loads: loads,
+        },
+        lds_bytes: lifted.lds_bytes,
+        evidence: format!(
+            "t{t}: {} lifted from {} ({}) = pool bytes [{:#x},{:#x}); record {}B, hidden loaded [{}]; region-scoped A1 cross-check of the pool's bytes: {cross} (informational: the standalone record is the proof)",
+            r.source_symbol,
+            hex32(&r.digest).get(..12).unwrap_or(""),
+            record.status,
+            r.entry_pc,
+            r.exit_pc,
+            record.kernarg_size,
+            hidden.join(", ")
+        ),
+    })
+}
+
+fn derive_native(kernel: &Kernel, arch: Arch, p: &Placed) -> Result<RegionFacts, Refusal> {
+    let t = p.region.template_id;
+    let scoped = region_scoped(kernel, arch, p)?;
+    let loads = pointer_loads(&scoped);
+    if loads.is_empty() {
+        return Err(refuse(
+            "task_graph-region-native",
+            format!("template {t}: the native region dereferences no record pointer"),
+        ));
+    }
+    Ok(RegionFacts {
+        template: ArenaTemplateRecord {
+            template: t,
+            pointer_loads: loads,
+        },
+        lds_bytes: 0,
+        evidence: format!(
+            "t{t}: native region [{:#x},{:#x}) analysed by region-scoped A1 (s[0:1] = record base)",
+            p.region.entry_pc, p.region.exit_pc
+        ),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// one pool kernel
+// ---------------------------------------------------------------------------
+
+/// Run every obligation for one tagged kernel; all refusals are returned.
+pub fn prove_pool(
+    program: &Program,
+    kernel_index: usize,
+    pool_elf: &[u8],
+    notes: &KernelRegions,
+    standalone: Standalone<'_>,
+    partial: &mut Option<PoolProof>,
+) -> Result<PoolProof, Vec<Refusal>> {
+    let kernel = &program.kernels[kernel_index];
+    let arch = program.target.arch;
+    let mut refusals = Vec::new();
+    if arch != Arch::Gfx1201 {
+        return Err(vec![refuse(
+            "task_graph-arch",
+            format!("{arch:?}: persistent pools are gfx1201 only"),
+        )]);
+    }
+    let Abi::Hsa {
+        descriptor,
+        metadata,
+    } = &kernel.abi
+    else {
+        return Err(vec![refuse("task_graph-abi", "not an HSA kernel")]);
+    };
+    let block = metadata.parsed.max_flat_workgroup_size;
+    if block == 0 || block % 32 != 0 || block > 1024 {
+        return Err(vec![refuse(
+            "task_graph-geometry",
+            format!("workgroup size {block} is not a whole number of waves"),
+        )]);
+    }
+    let waves = block / 32;
+    let rsrc1_modes = descriptor.compute_pgm_rsrc1.0 & !(0x3f | (0xf << 6));
+    let (lo, hi) = (notes.dispatcher.lo, notes.dispatcher.hi);
+    let placed = match place_regions(kernel, notes) {
+        Ok(p) => p,
+        Err(r) => return Err(vec![r]),
+    };
+    let text = match kernel_text(pool_elf, &kernel.symbol.0) {
+        Ok(t) => t,
+        Err(e) => return Err(vec![refuse("task_graph-note", e)]),
+    };
+    // 1+2: regions
+    let mut sources = Sources {
+        lookup: standalone,
+        certified: HashMap::new(),
+    };
+    let mut facts = Vec::new();
+    for p in &placed {
+        let before = refusals.len();
+        refusals.extend(check_region_structure(kernel, arch, lo, hi, p));
+        if refusals.len() != before {
+            continue;
+        }
+        let result = if p.region.is_native() {
+            derive_native(kernel, arch, p)
+        } else {
+            derive_lifted(
+                kernel,
+                arch,
+                text,
+                waves,
+                Some(rsrc1_modes),
+                p,
+                &mut sources,
+            )
+        };
+        match result {
+            Ok(f) => facts.push(f),
+            Err(r) => refusals.push(r),
+        }
+    }
+    // 3: the dispatcher shell
+    let base = text_base(kernel);
+    let ranges: Vec<(u32, u32)> = placed
+        .iter()
+        .map(|p| {
+            (
+                p.region.entry_pc as u32 + base,
+                p.region.exit_pc as u32 + base,
+            )
+        })
+        .collect();
+    let shell = kernargs::analyze_excluding(kernel, arch, &ranges);
+    if shell.status != KernelStatus::Proven {
+        refusals.push(refuse(
+            "task_graph-shell-unresolved",
+            format!(
+                "the dispatcher shell's A1 is {:?}: {}",
+                shell.status,
+                shell
+                    .unresolved
+                    .iter()
+                    .take(4)
+                    .map(|u| format!("{}: {}", u.rule, u.detail))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        ));
+    }
+    // 4: the protocol (also derives which pointer argument plays which role)
+    let proto = match protocol::check(kernel, arch, notes, &placed, waves, &shell, &facts) {
+        Ok(p) => p,
+        Err(rs) => {
+            refusals.extend(rs);
+            return Err(refusals);
+        }
+    };
+    // LDS: the dispatcher's claim slot lies above every body's LDS
+    if let Some(slot) = proto.lds_slot_base {
+        let top = facts.iter().map(|f| f.lds_bytes).max().unwrap_or(0);
+        if slot < top {
+            refusals.push(refuse(
+                "task_graph-lds",
+                format!("the claim slot at LDS {slot} overlaps a body's LDS [0, {top})"),
+            ));
+        }
+        if descriptor.group_segment_fixed_size < slot + 64 {
+            refusals.push(refuse(
+                "task_graph-lds",
+                format!(
+                    "the claim slot [{slot}, {}) exceeds the {}-byte LDS allocation",
+                    slot + 64,
+                    descriptor.group_segment_fixed_size
+                ),
+            ));
+        }
+    }
+    let mut templates: Vec<ArenaTemplateRecord> =
+        facts.iter().map(|f| f.template.clone()).collect();
+    templates.sort_by_key(|t| t.template);
+    let mut evidence: Vec<String> = facts.iter().map(|f| f.evidence.clone()).collect();
+    evidence.extend(proto.evidence.iter().cloned());
+    let proof = PoolProof {
+        arena: DescriptorArenaRecord {
+            arena_arg_offset: proto.kernargs_arg_offset,
+            templates,
+        },
+        protocol: proto.record.clone(),
+        evidence,
+    };
+    if let Err(rs) = check_shell_args(&shell, &proof, &proto) {
+        refusals.extend(rs);
+    }
+    // the poison contract: only a monotonic update (set-only OR with release) may
+    // write the poison cell; a plain store or a swap is refused
+    for (pc, off) in &proto.poison_plain_stores {
+        refusals.push(Refusal {
+            rule: "task_graph-poison-plain-store",
+            detail: format!(
+                "a plain 32-bit store through params +{off}: the watchdog poison must be a set-only atomic OR with release, not a store"
+            ),
+            pc: *pc,
+        });
+    }
+    if refusals.is_empty() {
+        Ok(proof)
+    } else {
+        *partial = Some(proof);
+        Err(refusals)
+    }
+}
+
+/// The shell's argument accesses must be exactly the roles the protocol found.
+fn check_shell_args(
+    shell: &KernargFacts,
+    proof: &PoolProof,
+    proto: &protocol::ProtocolProof,
+) -> Result<(), Vec<Refusal>> {
+    let mut out = Vec::new();
+    let t = &proof.protocol;
+    for a in shell.args.iter().filter(|a| !a.accesses.is_empty()) {
+        let r = arg_record(a);
+        let classes: BTreeSet<&str> = r.classes.iter().map(String::as_str).collect();
+        if proto.output_args.contains(&a.offset) {
+            // trace and poison: stored to, or monotonically updated (set-only OR)
+            if let Some(bad) = classes
+                .iter()
+                .find(|c| !matches!(**c, "vmem_store" | "atomic_release" | "atomic_commutative"))
+            {
+                out.push(refuse(
+                    "task_graph-shell-access",
+                    format!("output argument +{} is accessed as {bad}", a.offset),
+                ));
+            }
+            continue;
+        }
+        let want: Option<&[&str]> = if a.offset == t.tasks_arg_offset {
+            Some(&["vmem_load"])
+        } else if a.offset == t.ticket_arg_offset {
+            Some(&["atomic_commutative"])
+        } else if a.offset == t.events_arg_offset {
+            Some(&["atomic_release", "load_acquire"])
+        } else if a.offset == proof.arena.arena_arg_offset {
+            None
+        } else if proto.output_args.contains(&a.offset) {
+            Some(&["vmem_store"])
+        } else {
+            out.push(refuse(
+                "task_graph-shell-access",
+                format!(
+                    "the shell accesses argument +{} ({}) that is none of the protocol's roles",
+                    a.offset, a.name
+                ),
+            ));
+            continue;
+        };
+        if let Some(want) = want {
+            let want: BTreeSet<&str> = want.iter().copied().collect();
+            if classes != want {
+                out.push(refuse(
+                    "task_graph-shell-access",
+                    format!(
+                        "argument +{} ({}) is accessed as {classes:?}, the protocol needs exactly {want:?}",
+                        a.offset, a.name
+                    ),
+                ));
+            }
+        } else if a.mode.is_some_and(|m| m.writes()) {
+            out.push(refuse(
+                "task_graph-shell-access",
+                format!("a region writes the argument block +{}", a.offset),
+            ));
+        }
+    }
+    let side = &shell.side;
+    if side.kernarg_segment != 0
+        || side.module_global != 0
+        || side.abi_packet != 0
+        || side.scratch != 0
+        || shell.dynamic_kernarg_reads
+        || shell.taint_overflow
+    {
+        out.push(refuse(
+            "task_graph-shell-access",
+            "the shell reads the kernarg segment dynamically, a module global, the AQL packet or scratch",
+        ));
+    }
+    if out.is_empty() {
+        Ok(())
+    } else {
+        Err(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// receipt assembly
+// ---------------------------------------------------------------------------
+
+/// [`crate::certify`] for a pool object: every kernel tagged by the object's
+/// `.note.pm_regions` is upgraded to a conditional record carrying its
+/// descriptor arena and task protocol when all four obligations (module docs)
+/// are proven from the bytes; otherwise its A1 record is unchanged and gains
+/// one `task_graph-*` unresolved rule per failed obligation. `standalone`
+/// resolves a region's source object by its SHA-256.
+pub fn certify_pool(pool_elf: &[u8], standalone: Standalone<'_>) -> Result<Receipt, CertError> {
+    let mut receipt = crate::certify(pool_elf, None)?;
+    let notes =
+        read_regions(pool_elf).map_err(|e| CertError::Lift(format!("regions note: {e}")))?;
+    if notes.is_empty() {
+        return Ok(receipt);
+    }
+    let lifted = lift_object(
+        pool_elf,
+        Options {
+            frontend: Frontend::Hipcc,
+        },
+    )
+    .map_err(|e| CertError::Lift(e.to_string()))?;
+    let program = &lifted.program;
+    let arch = program.target.arch;
+    let (source, cert) = radiowave_cert(pool_elf, program, None);
+    let mut details = Vec::new();
+    for note in &notes {
+        let Some(index) = program
+            .kernels
+            .iter()
+            .position(|k| k.symbol.0 == note.kernel)
+        else {
+            return Err(CertError::Lift(format!(
+                "regions note names {:?}, which is not a kernel of the object",
+                note.kernel
+            )));
+        };
+        let Some(slot) = receipt
+            .railgun
+            .kernels
+            .iter()
+            .position(|k| k.symbol == note.kernel)
+        else {
+            return Err(CertError::Lift(format!("{}: no record", note.kernel)));
+        };
+        let mut partial = None;
+        match prove_pool(program, index, pool_elf, note, standalone, &mut partial) {
+            Ok(proof) => {
+                let kernel = &program.kernels[index];
+                let shell = kernargs::analyze_excluding(
+                    kernel,
+                    arch,
+                    &note
+                        .regions
+                        .iter()
+                        .map(|r| {
+                            let base = text_base(kernel);
+                            (r.entry_pc as u32 + base, r.exit_pc as u32 + base)
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                let meta = metadata_effects(&source, cert.as_ref(), &kernel.symbol.0);
+                let old = &receipt.railgun.kernels[slot];
+                let mut record: KernelRecord = kernel_record(kernel, &shell, &meta);
+                record.status = STATUS_CONDITIONAL.into();
+                record.unguarded_unresolved = old.unresolved.clone();
+                record.pm_obligations = old.pm_obligations.clone();
+                record.pm_analyze_error = old.pm_analyze_error.clone();
+                record.guard_flag = old.guard_flag;
+                record.differential.guarded = true;
+                record.differential.guards = Vec::new();
+                record.descriptor_arenas = vec![proof.arena.clone()];
+                record.task_protocol = Some(proof.protocol.clone());
+                record.required_witnesses = record.implied_witnesses();
+                debug_assert_eq!(record.required_witnesses, [WITNESS_DESCRIPTOR_ARENA]);
+                record.case_digest = case_digest(
+                    &receipt.object_sha256,
+                    &receipt.device_elf_sha256,
+                    &receipt.arch,
+                    &record,
+                );
+                details.push(format!(
+                    "{}: conditional ({} templates; protocol {})",
+                    note.kernel,
+                    proof.arena.templates.len(),
+                    proof.protocol.proved.join(",")
+                ));
+                details.extend(proof.evidence.iter().map(|e| format!("  {e}")));
+                receipt.railgun.kernels[slot] = record;
+            }
+            Err(refusals) => {
+                let record = &mut receipt.railgun.kernels[slot];
+                details.push(format!(
+                    "{}: unknown ({} refusals)",
+                    note.kernel,
+                    refusals.len()
+                ));
+                for r in refusals {
+                    details.push(format!("  {}: {}", r.rule, r.detail));
+                    record.unresolved.push(UnresolvedRecord {
+                        pc: r.pc,
+                        rule: r.rule.into(),
+                        detail: r.detail,
+                    });
+                }
+                record.status = STATUS_UNKNOWN.into();
+            }
+        }
+    }
+    let records = &receipt.railgun.kernels;
+    let proven = records.iter().filter(|r| r.status == STATUS_PROVEN).count();
+    let conditional = records
+        .iter()
+        .filter(|r| r.status == STATUS_CONDITIONAL)
+        .count();
+    let proofs = records.iter().filter(|r| r.task_protocol.is_some()).count();
+    let total = records.len();
+    for check in &mut receipt.checks {
+        if check.id == "railgun-a1" {
+            check.status = if proven == total {
+                "proven"
+            } else if proven + conditional == total {
+                "conditional"
+            } else {
+                "unknown"
+            }
+            .into();
+            check.detail = format!(
+                "{proven}/{total} kernels Proven, {conditional} Conditional (witness required)"
+            );
+        }
+    }
+    receipt.checks.push(Check {
+        id: "task-graph".into(),
+        status: if details.iter().any(|d| d.contains(": unknown (")) {
+            "unknown"
+        } else {
+            "conditional"
+        }
+        .into(),
+        detail: details.join("\n"),
+    });
+    if proofs > 0 {
+        for o in [OBLIGATION_ARENA, OBLIGATION_PROTOCOL] {
+            if !receipt.obligations.iter().any(|x| x == o) {
+                receipt.obligations.push(o.to_owned());
+            }
+        }
+        receipt.obligations.sort();
+    }
+    Ok(receipt)
+}
+
+// ---------------------------------------------------------------------------
+// command line
+// ---------------------------------------------------------------------------
+
+fn collect_objects(dir: &std::path::Path, out: &mut BTreeMap<[u8; 32], std::path::PathBuf>) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_objects(&path, out);
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            out.entry(Sha256::digest(&bytes).into()).or_insert(path);
+        }
+    }
+}
+
+/// `railgun-cert pool [--out DIR] [--standalone DIR]... POOL.co...` writes the
+/// [`certify_pool`] receipt of each pool object to
+/// `DIR/receipts/<arch>/<object_sha256>.receipt.json` (standalone objects are
+/// found by SHA-256 anywhere under the `--standalone` directories);
+/// `railgun-cert pool-dump POOL.co` prints each tagged kernel's region table and
+/// the canonical text of its lifted instructions.
+pub fn cli(command: &str, args: &[String]) -> Result<(), String> {
+    let mut out = std::path::PathBuf::from("railgun-cert-out");
+    let mut dirs = Vec::new();
+    let mut objects = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--out" => out = it.next().ok_or("--out needs a value")?.into(),
+            "--standalone" => dirs.push(std::path::PathBuf::from(
+                it.next().ok_or("--standalone needs a value")?,
+            )),
+            other => objects.push(std::path::PathBuf::from(other)),
+        }
+    }
+    match command {
+        "pool" => {
+            let mut index = BTreeMap::new();
+            for d in &dirs {
+                collect_objects(d, &mut index);
+            }
+            let lookup = |digest: &[u8; 32]| index.get(digest).and_then(|p| std::fs::read(p).ok());
+            for path in objects {
+                let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                let receipt = certify_pool(&bytes, &lookup)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                let dir = out.join("receipts").join(&receipt.arch);
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                let file = dir.join(format!("{}.receipt.json", receipt.object_sha256));
+                std::fs::write(
+                    &file,
+                    serde_json::to_vec_pretty(&receipt).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+                for k in &receipt.railgun.kernels {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        receipt.arch,
+                        k.symbol,
+                        k.status,
+                        file.display()
+                    );
+                    for u in k
+                        .unresolved
+                        .iter()
+                        .filter(|u| u.rule.starts_with("task_graph-"))
+                    {
+                        println!("  {}: {}", u.rule, u.detail);
+                    }
+                }
+                if let Some(c) = receipt.checks.iter().find(|c| c.id == "task-graph") {
+                    println!("{}", c.detail);
+                }
+            }
+            Ok(())
+        }
+        "pool-dump" => {
+            for path in objects {
+                let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                let notes = read_regions(&bytes)?;
+                let lifted = lift_object(
+                    &bytes,
+                    Options {
+                        frontend: Frontend::Hipcc,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+                for n in &notes {
+                    println!("kernel {} dispatcher {:?}", n.kernel, n.dispatcher);
+                    for r in &n.regions {
+                        println!(
+                            "  region t{} [{:#x},{:#x}) native={} src={} prefix={} wg=({},{}) block={} lds={}",
+                            r.template_id, r.entry_pc, r.exit_pc, r.is_native(), r.source_symbol,
+                            r.prefix, r.wg_x, r.wg_yz, r.block, r.dynamic_lds
+                        );
+                    }
+                    let Some(k) = lifted
+                        .program
+                        .kernels
+                        .iter()
+                        .find(|k| k.symbol.0 == n.kernel)
+                    else {
+                        continue;
+                    };
+                    let arch = lifted.program.target.arch;
+                    for (b, block) in k.body.blocks.iter().enumerate() {
+                        println!("block {b}: {:?}", block.term);
+                        for pos in block.range.0..block.range.1 {
+                            let inst = k.body.insts.get(k.body.layout[pos]).expect("laid out");
+                            let pc = rel_pc(k, inst.prov.pc).unwrap_or(0);
+                            let tag = n
+                                .regions
+                                .iter()
+                                .find(|r| (r.entry_pc..r.exit_pc).contains(&u64::from(pc)))
+                                .map_or(String::new(), |r| format!(" [t{}]", r.template_id));
+                            println!(
+                                "  {pc:#06x} {}{tag}",
+                                peacemaker_lift::text::print::canonical(inst, arch)
+                                    .unwrap_or_else(|e| format!("<{e}>"))
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        other => Err(format!("unknown pool command {other}")),
+    }
+}

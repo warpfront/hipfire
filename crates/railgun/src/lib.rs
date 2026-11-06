@@ -47,6 +47,7 @@ pub mod npu;
 pub mod plan;
 pub mod sealed_table;
 pub mod shadow;
+pub mod task_graph;
 pub mod watchdog;
 pub mod window;
 

@@ -1037,6 +1037,7 @@ mod tests {
             required_witnesses: vec![],
             case_digest: String::new(),
             guard_flag: None,
+            task_protocol: None,
         }
     }
 

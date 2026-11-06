@@ -121,6 +121,7 @@ fn conditional(object: &str, elf: &str) -> KernelRecord {
         required_witnesses: vec!["indexed_bind".into()],
         case_digest: String::new(),
         guard_flag: None,
+        task_protocol: None,
     };
     k.case_digest = case_digest(object, elf, "gfx1201", &k);
     k

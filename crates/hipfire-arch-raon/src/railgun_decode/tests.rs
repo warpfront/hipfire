@@ -141,6 +141,7 @@ fn gather_record(null_guarded: bool) -> KernelRecord {
         required_witnesses: vec![receipt::WITNESS_SEALED_TABLE.into()],
         case_digest: String::new(),
         guard_flag: None,
+        task_protocol: None,
     };
     k.case_digest = receipt::case_digest(OBJECT, ELF, "gfx1201", &k);
     k

@@ -186,6 +186,7 @@ pub(crate) fn writer_facts() -> Arc<NodeFacts> {
                 indexed: vec![effect],
                 tables: Vec::new(),
                 arenas: Vec::new(),
+                task_protocol: None,
                 witnesses: vec!["indexed_bind".into()],
                 case_digest: "ef".repeat(32),
             }),

@@ -277,6 +277,122 @@ impl DescriptorArenaRecord {
     }
 }
 
+/// A persistent pool kernel's dispatcher protocol property (see
+/// [`TaskProtocolRecord::proved`]): one claim is a single `fetch_add(1)` on
+/// the ticket, and the task header is read from `tasks[claim * desc_stride]`.
+pub const TASK_PROTO_CLAIM: &str = "claim_single_fetch_add";
+/// The claim is compared against the `n_tasks` kernarg: a claim at or past it
+/// runs no body, and every claim below it runs exactly one task.
+pub const TASK_PROTO_BOUNDED: &str = "claim_bounded_by_n_tasks";
+/// The body is reachable only after an acquire load of `events[pred]` has
+/// observed a value `>= expected`, when `pred != none_event`.
+pub const TASK_PROTO_ACQUIRE: &str = "acquire_before_body";
+/// The only release increment of `events[done]` follows the body on every
+/// path, and happens only when `done != none_event`.
+pub const TASK_PROTO_RELEASE: &str = "body_before_release";
+/// Every memory access of the body is complete (memory counters waited,
+/// workgroup barrier passed) before that release.
+pub const TASK_PROTO_COMPLETE: &str = "body_complete_before_release";
+/// A claimed task increments `events[done]` exactly once (never zero times
+/// or twice), by `+1`.
+pub const TASK_PROTO_ONCE: &str = "one_release_per_task";
+/// Every property a task-graph proof needs, sorted.
+pub const TASK_PROTO_REQUIRED: [&str; 6] = [
+    TASK_PROTO_ACQUIRE,
+    TASK_PROTO_RELEASE,
+    TASK_PROTO_COMPLETE,
+    TASK_PROTO_BOUNDED,
+    TASK_PROTO_CLAIM,
+    TASK_PROTO_ONCE,
+];
+
+/// What `railgun-cert`'s task-graph certificate proved about a persistent
+/// pool kernel's dispatcher, on the emitted object (`railgun::task_graph`
+/// consumes it: its proof of a co-resident group's ordering and progress is
+/// only as good as this record). Present only on a `conditional` record, and
+/// bound by the case digest (`railgun-case-v4`). A kernel without a proven
+/// protocol carries none.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct TaskProtocolRecord {
+    /// Kernarg byte offsets of the dispatcher's pointer arguments: the task
+    /// headers, the claim ticket (one `u32` cell), the event cells; and of
+    /// the `u32` task count.
+    pub tasks_arg_offset: u32,
+    pub ticket_arg_offset: u32,
+    pub events_arg_offset: u32,
+    pub n_tasks_arg_offset: u32,
+    /// Bytes per task header, and the byte offsets inside one of the `u32`
+    /// fields the dispatcher reads.
+    pub desc_stride: u32,
+    pub template_offset: u32,
+    pub ka_off_offset: u32,
+    pub pred_event_offset: u32,
+    pub expected_offset: u32,
+    pub done_event_offset: u32,
+    /// The `pred`/`done` value meaning "no event".
+    pub none_event: u32,
+    /// Bytes between event cells: event id `i` is at `events + i * stride`.
+    pub event_stride: u32,
+    /// The properties the certificate proved on the object (sorted, no
+    /// duplicates; names are the `TASK_PROTO_*` constants). A consumer
+    /// requires every one of [`TASK_PROTO_REQUIRED`].
+    pub proved: Vec<String>,
+}
+
+impl TaskProtocolRecord {
+    /// Fail-closed structure check (the digest binds the content).
+    pub fn validate(&self, symbol: &str) -> Result<(), String> {
+        let bad = |what: &str| Err(format!("{symbol}: task protocol: {what}"));
+        if self.desc_stride == 0 || self.desc_stride % 4 != 0 {
+            return bad("descriptor stride is not a positive multiple of 4");
+        }
+        let fields = [
+            self.template_offset,
+            self.ka_off_offset,
+            self.pred_event_offset,
+            self.expected_offset,
+            self.done_event_offset,
+        ];
+        for (i, &at) in fields.iter().enumerate() {
+            if at % 4 != 0 || at.checked_add(4).is_none_or(|end| end > self.desc_stride) {
+                return bad("a header field is misaligned or outside the descriptor");
+            }
+            if fields[..i].contains(&at) {
+                return bad("two header fields share an offset");
+            }
+        }
+        let args = [
+            self.tasks_arg_offset,
+            self.ticket_arg_offset,
+            self.events_arg_offset,
+            self.n_tasks_arg_offset,
+        ];
+        if args.iter().enumerate().any(|(i, a)| args[..i].contains(a)) {
+            return bad("two arguments share an offset");
+        }
+        if self.tasks_arg_offset % 8 != 0
+            || self.ticket_arg_offset % 8 != 0
+            || self.events_arg_offset % 8 != 0
+        {
+            return bad("a pointer argument is not 8-aligned");
+        }
+        if self.event_stride == 0 {
+            return bad("event stride is zero");
+        }
+        if !self.proved.windows(2).all(|w| w[0] < w[1]) {
+            return bad("proved properties are not sorted and unique");
+        }
+        if let Some(p) = self
+            .proved
+            .iter()
+            .find(|p| !TASK_PROTO_REQUIRED.contains(&p.as_str()))
+        {
+            return bad(&format!("unknown property {p:?}"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Tool {
     pub name: String,
@@ -467,20 +583,43 @@ pub struct KernelRecord {
     /// written before the field and from unguarded kernels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard_flag: Option<u32>,
+    /// The dispatcher protocol of a persistent pool kernel that the
+    /// task-graph certificate proved on the emitted object (see
+    /// [`TaskProtocolRecord`]). Absent from every other kernel, so receipts
+    /// written before the field are unchanged (and digest as before).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_protocol: Option<TaskProtocolRecord>,
 }
 
 /// The guarded-case digest under the exact object receipt (§A9.2; v2 binds
 /// `sealed_tables` as well). A record with `descriptor_arenas` digests under
-/// `railgun-case-v3`, which binds them too; a record without any keeps the
-/// v2 input byte for byte, so every receipt written before arenas existed
-/// digests identically.
+/// `railgun-case-v3`, which binds them too, and one with a `task_protocol`
+/// under `railgun-case-v4`, which binds that as well; a record without any
+/// keeps the v2 input byte for byte, so every receipt written before arenas
+/// existed digests identically.
 pub fn case_digest(
     object_sha256: &str,
     device_elf_sha256: &str,
     arch: &str,
     k: &KernelRecord,
 ) -> String {
-    let bytes = if k.descriptor_arenas.is_empty() {
+    let bytes = if let Some(protocol) = &k.task_protocol {
+        serde_json::to_vec(&(
+            "railgun-case-v4",
+            object_sha256,
+            device_elf_sha256,
+            arch,
+            &k.symbol,
+            &k.status,
+            k.kernarg_size,
+            &k.guards,
+            &k.indexed_effects,
+            &k.sealed_tables,
+            &k.descriptor_arenas,
+            protocol,
+            &k.required_witnesses,
+        ))
+    } else if k.descriptor_arenas.is_empty() {
         serde_json::to_vec(&(
             "railgun-case-v2",
             object_sha256,
@@ -546,6 +685,7 @@ impl KernelRecord {
             && self.indexed_effects.is_empty()
             && self.sealed_tables.is_empty()
             && self.descriptor_arenas.is_empty()
+            && self.task_protocol.is_none()
             && self.required_witnesses.is_empty()
             && self.case_digest.is_empty();
         match self.status.as_str() {
@@ -595,6 +735,15 @@ impl KernelRecord {
                         .any(|o| o.arena_arg_offset == a.arena_arg_offset)
                     {
                         return Err(format!("{}: duplicate descriptor arena", self.symbol));
+                    }
+                }
+                if let Some(protocol) = &self.task_protocol {
+                    protocol.validate(&self.symbol)?;
+                    if self.descriptor_arenas.is_empty() {
+                        return Err(format!(
+                            "{}: a task protocol needs the descriptor arena its tasks' records live in",
+                            self.symbol
+                        ));
                     }
                 }
                 if !self.differential.guarded || self.differential.guards != self.guards {
@@ -648,6 +797,7 @@ mod tests {
             required_witnesses: vec![],
             case_digest: String::new(),
             guard_flag: None,
+            task_protocol: None,
         }
     }
 
@@ -749,5 +899,89 @@ mod tests {
         }
         .validate("k")
         .is_err());
+    }
+
+    fn protocol() -> TaskProtocolRecord {
+        TaskProtocolRecord {
+            tasks_arg_offset: 0,
+            ticket_arg_offset: 8,
+            events_arg_offset: 16,
+            n_tasks_arg_offset: 56,
+            desc_stride: 128,
+            template_offset: 0,
+            ka_off_offset: 28,
+            pred_event_offset: 32,
+            expected_offset: 36,
+            done_event_offset: 40,
+            none_event: u32::MAX,
+            event_stride: 4,
+            proved: TASK_PROTO_REQUIRED
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn task_protocol_is_optional_binds_the_digest_and_needs_an_arena() {
+        let k = record();
+        assert!(serde_json::to_value(&k)
+            .unwrap()
+            .get("task_protocol")
+            .is_none());
+
+        let mut k = record();
+        k.status = STATUS_CONDITIONAL.into();
+        k.descriptor_arenas = vec![arena()];
+        k.task_protocol = Some(protocol());
+        k.required_witnesses = k.implied_witnesses();
+        k.differential.guarded = true;
+        let v3 = {
+            let mut no_protocol = k.clone();
+            no_protocol.task_protocol = None;
+            case_digest("obj", "elf", "gfx1201", &no_protocol)
+        };
+        k.case_digest = case_digest("obj", "elf", "gfx1201", &k);
+        assert_ne!(k.case_digest, v3, "the digest binds the protocol");
+        k.validate_case("obj", "elf", "gfx1201").unwrap();
+        let back: KernelRecord = serde_json::from_value(serde_json::to_value(&k).unwrap()).unwrap();
+        assert_eq!(back.task_protocol, k.task_protocol);
+
+        let mut changed = k.clone();
+        changed.task_protocol.as_mut().unwrap().proved.pop();
+        assert!(changed.validate_case("obj", "elf", "gfx1201").is_err());
+        let mut no_arena = k.clone();
+        no_arena.descriptor_arenas.clear();
+        no_arena.required_witnesses.clear();
+        assert!(no_arena.validate_case("obj", "elf", "gfx1201").is_err());
+        let mut proven = record();
+        proven.task_protocol = Some(protocol());
+        assert!(
+            proven.validate_case("obj", "elf", "gfx1201").is_err(),
+            "a proven record may not carry a task protocol"
+        );
+    }
+
+    #[test]
+    fn malformed_task_protocol_is_rejected() {
+        assert!(protocol().validate("k").is_ok());
+        let mut p = protocol();
+        p.proved.push("zzz".into());
+        assert!(p.validate("k").is_err(), "unknown property");
+        let mut p = protocol();
+        p.proved.reverse();
+        assert!(p.validate("k").is_err(), "unsorted");
+        let mut p = protocol();
+        p.done_event_offset = p.expected_offset;
+        assert!(p.validate("k").is_err(), "shared field offset");
+        let mut p = protocol();
+        p.ka_off_offset = 126;
+        assert!(p.validate("k").is_err(), "field outside the descriptor");
+        let mut p = protocol();
+        p.events_arg_offset = p.tasks_arg_offset;
+        assert!(p.validate("k").is_err(), "shared argument offset");
+        let mut p = protocol();
+        p.event_stride = 0;
+        assert!(p.validate("k").is_err());
     }
 }

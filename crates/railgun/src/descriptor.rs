@@ -440,6 +440,7 @@ mod tests {
                 arena_arg_offset: arena_arg,
                 templates,
             }],
+            task_protocol: None,
             witnesses: vec!["descriptor_arena".into()],
             case_digest: "ab".repeat(32),
         });
