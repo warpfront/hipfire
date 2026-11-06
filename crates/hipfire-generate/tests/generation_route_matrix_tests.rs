@@ -372,6 +372,15 @@ const SAFE_ROUTES: &[GenerationRoute] = &[
     // Arch 19 with the shared DFlash2 drafter: the same router over committed
     // tokens (`Qwen35Emit` via the Raon carrier, grammar off).
     GenerationRoute::RaonSpec,
+    // Arch 11 (LFM2.5-MoE) and arch 24 (LFM3), legacy contract like Maple.
+    // `generate_lfm2moe` withholds the `<|tool_call_start|>` span and parses
+    // Liquid's Pythonic body; `generate_lfm3` withholds the Qwen3-style
+    // `<tool_call><function=…>` span through the strict `ToolOutputRouter` that
+    // `qwen_ar` uses. Both emit a `{"type":"tool_calls"}` event plus a
+    // `finish_reason=tool_calls` terminal. `LfmSpec` (arch 11 + drafter) is NOT
+    // admitted: its speculative producer is `generate_dflash`, whose tool path
+    // is only proven on the Qwen carriers.
+    GenerationRoute::LfmAr,
 ];
 
 /// Pure gate model mirroring generate()'s tools preflight:
@@ -1198,7 +1207,7 @@ fn exact_safe_set_is_qwen_ar_qwen4_ar_mtp_dflash_ds4_ar_ep_spec_glimmer_ar_spec_
     let mut expected = SAFE_ROUTES.to_vec();
     expected.sort_by_key(|r| r.name());
     assert_eq!(from_all, expected);
-    assert_eq!(from_all.len(), 13);
+    assert_eq!(from_all.len(), 14);
     // Negative: every other ALL member is denied for tools.
     for &r in GenerationRoute::ALL {
         if !SAFE_ROUTES.contains(&r) {
@@ -1256,6 +1265,7 @@ fn stop_sequences_are_honoured_exactly_on_the_qwen_semantic_producers() {
     assert_eq!(
         with_stop,
         [
+            "lfm_ar",
             "qwen4_ar",
             "qwen4_spec",
             "qwen_ar",

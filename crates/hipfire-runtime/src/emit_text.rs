@@ -1938,6 +1938,48 @@ mod tests {
         assert_no_protocol_leak(&vis);
     }
 
+    /// LFM3 (arch 24) emits the Qwen3-style XML its vendor template renders:
+    /// `<tool_call>\n<function=NAME>\n<parameter=K>\nV\n</parameter>\n</function>\n</tool_call>`
+    /// (see the LFM3-1.7B `tokenizer_config.json` `response_template.tool_calls`
+    /// regex). The router must parse that exact shape, withhold it from visible
+    /// prose, and stay byte-split stable — `generate_lfm3` relies on it.
+    #[test]
+    fn router_lfm3_template_shape_matches_oracle() {
+        let emitted = "Here you go.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=units>\ncelsius\n</parameter>\n</function>\n</tool_call>";
+        let (vis, calls, term) = feed(&[emitted]);
+        assert_eq!(term, Terminal::Ok);
+        assert_eq!(vis, "Here you go.\n");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].arguments["city"], "Paris");
+        assert_eq!(calls[0].arguments["units"], "celsius");
+        assert_no_protocol_leak(&vis);
+
+        let oracle = extract_tool_calls_from_text(emitted);
+        assert_eq!(calls.len(), oracle.len());
+        call_eq(&calls[0], &oracle[0]);
+
+        // Byte-boundary stability (markers arrive split across fragments).
+        for split in 1..emitted.len() {
+            let (v, c, t) = feed(&[&emitted[..split], &emitted[split..]]);
+            assert_eq!(t, Terminal::Ok, "split@{split}");
+            assert_eq!(v, vis, "split@{split}");
+            assert_eq!(c.len(), 1, "split@{split}");
+            call_eq(&c[0], &calls[0]);
+        }
+    }
+
+    /// An unclosed `<tool_call>` (budget cap mid-call) must fail closed: no
+    /// fabricated call, marker body never leaked as visible prose.
+    #[test]
+    fn router_lfm3_unclosed_span_fails_closed() {
+        let (vis, calls, term) =
+            feed(&["<tool_call>\n<function=get_weather>\n<parameter=city>\nPar"]);
+        assert_eq!(term, Terminal::Malformed);
+        assert!(calls.is_empty());
+        assert_no_protocol_leak(&vis);
+    }
+
     #[test]
     fn router_qwen_xml_untyped_values_and_name_priority() {
         let a = "<tool_call>\n<function=probe>\n<parameter=count>42</parameter>\n<parameter=enabled>true</parameter>\n<parameter=options>{\"mode\":\"fast\"}</parameter>\n</function>\n</tool_call>";
