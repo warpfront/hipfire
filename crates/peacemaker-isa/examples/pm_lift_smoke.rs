@@ -674,21 +674,9 @@ fn run_case(card: &Card, objects: &Path, case: Case, shared: &SharedPool) -> Res
         for k in 0..live.len() as u32 + 2 {
             let mut t = [0u32; 32];
             t[..15].copy_from_slice(&[
-                case.tid,
-                0,
-                0,
-                0,
-                gx,
-                gy,
-                gz,
-                0,
-                u32::MAX,
-                0,
-                0,
-                1,
-                1,
-                k,
-                0,
+                case.tid, 0, 0, 0, gx, gy, gz, 0,
+                1, // the host-filled span names event 1, expected 0
+                0, 0, 1, 1, k, 0,
             ]);
             tasks.extend(t.iter().flat_map(|w| w.to_le_bytes()));
         }

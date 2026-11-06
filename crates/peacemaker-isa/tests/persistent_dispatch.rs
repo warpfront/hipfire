@@ -958,7 +958,8 @@ fn lifted_shipped_mq2_module_runs_as_a_p0_pool_region_on_the_emulator() {
 
 /// Span mode (railgunmega/DYNAMIC.md) on the emulator: span headers take their virtual
 /// workgroup from a live list; past the live count they are NOPs that still publish; a
-/// duplicate entry, an out-of-grid entry and a count above the capacity poison.
+/// duplicate entry, an out-of-grid entry, a count above the capacity and a span header
+/// without a predecessor event poison.
 #[test]
 fn p0_pool_span_mode_runs_live_entries_and_poisons_bad_ones_on_the_emulator() {
     use peacemaker_isa::kernels::lifted_dispatch_gfx1201 as ld;
@@ -1022,8 +1023,9 @@ fn p0_pool_span_mode_runs_live_entries_and_poisons_bad_ones_on_the_emulator() {
     dup[1] = dup[0];
     let mut outside = live_all.clone();
     outside[2] = [gx, 0, 0];
-    let cases: [(&str, Vec<[u32; 3]>, u32, u32, bool); 4] = [
+    let cases: [(&str, Vec<[u32; 3]>, u32, u32, bool); 5] = [
         ("live", live_all.clone(), gx, gx + 2, false),
+        ("no predecessor", live_all.clone(), gx, gx + 2, true),
         ("duplicate", dup, gx, gx + 2, true),
         ("out of grid", outside, gx, gx + 2, true),
         ("count above capacity", live_all, gx + 3, gx + 2, true),
@@ -1032,7 +1034,13 @@ fn p0_pool_span_mode_runs_live_entries_and_poisons_bad_ones_on_the_emulator() {
         let mut tasks = Vec::new();
         for kk in 0..cap {
             let mut t = [0u32; 32];
-            t[..15].copy_from_slice(&[5, 0, 0, 0, gx, 1, 1, 0, u32::MAX, 0, 0, 1, 1, kk, 0]);
+            // a host-filled span names event 1 with `expected = 0`: satisfied, acquired
+            let pred = if what == "no predecessor" {
+                u32::MAX
+            } else {
+                1
+            };
+            t[..15].copy_from_slice(&[5, 0, 0, 0, gx, 1, 1, 0, pred, 0, 0, 1, 1, kk, 0]);
             tasks.extend(t.iter().flat_map(|w| w.to_le_bytes()));
         }
         let n_tasks = cap;

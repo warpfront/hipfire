@@ -1058,7 +1058,8 @@ pub fn pool(
 /// overlap; `bytes < 2^32`. The body's registers are s0..s15, v0..v3 (the region's).
 /// Span mode (railgunmega/DYNAMIC.md), on wave 0 lane 0 after the predecessor acquire,
 /// with the descriptor in v4..v15 and its span words in v18 (flags), v19 (k), v20 (list
-/// id); v24..v28 are its temporaries. Static tasks (flags 0) pass straight to `.Lready`. A span task reads its live
+/// id); v24..v28 are its temporaries. Static tasks (flags 0) pass straight to `.Lready`; a
+/// span task without a predecessor event poisons. A span task reads its live
 /// entry: `c = count` (after the acquire), `c > K` poisons, `k >= c` turns the task into
 /// a NOP (template `NOP_TMPL`: no region, `done` still released), the entry `{vx, vy, vz}`
 /// must lie inside the header grid and its bit in the claim bitmap must be clear (a
@@ -1076,6 +1077,12 @@ fn span_entry(b: &mut Builder) -> Result<(), String> {
     op(b, &format!("s_cmp_eq_u32 s{TEMP}, 0"), &[], &[s(TEMP)])?;
     branch(b, "s_cbranch_scc1 .Lready")?;
     op(b, &format!("s_cmp_lg_u32 s{TEMP}, 1"), &[], &[s(TEMP)])?;
+    branch(b, "s_cbranch_scc1 .Lspan_poison")?;
+    // a span header must name its producer's done event: the count load below is then
+    // ordered by that wait's acquire on every path (a host-filled span names an event the
+    // host leaves satisfied, e.g. `expected = 0`)
+    readfirst(b, VX, 12)?;
+    op(b, &format!("s_cmp_eq_u32 s{VX}, -1"), &[], &[s(VX)])?;
     branch(b, "s_cbranch_scc1 .Lspan_poison")?;
     // the span table: u32 n_spans at +0, descriptor i at +32 + 32 i
     param(b, desc, 0x40)?;
