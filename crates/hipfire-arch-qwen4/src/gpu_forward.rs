@@ -11987,9 +11987,16 @@ impl Qwen4GpuForward {
         let mut f16_spans = Vec::with_capacity(region.f16.len());
         for member in &region.f16 {
             let tensor = resident(&member.name, member.layer)?;
-            if tensor.dtype != DType::BF16 || tensor.numel() != member.rows * member.cols {
+            let hc8 = tensor.dtype == DType::HC8E4M3Row;
+            let planned = if hc8 {
+                rdna_compute::hc8_weight::hc8_payload_bytes(member.rows, member.cols)
+                    .is_some_and(|bytes| tensor.buf.size() >= bytes)
+            } else {
+                tensor.dtype == DType::BF16 && tensor.numel() == member.rows * member.cols
+            };
+            if !planned {
                 return Err(invalid(format!(
-                    "decode-share shadow source '{}' is not its planned BF16 [{}, {}] matrix",
+                    "decode-share shadow source '{}' is not its planned BF16 (or HC8 E4M3) [{}, {}] matrix",
                     member.name, member.rows, member.cols
                 )));
             }
@@ -11999,6 +12006,7 @@ impl Qwen4GpuForward {
                 dst_ptr: at(member.offset)?,
                 rows: member.rows,
                 cols: member.cols,
+                hc8,
             });
         }
         let mut i8_spans = Vec::with_capacity(region.shared_i8.len());

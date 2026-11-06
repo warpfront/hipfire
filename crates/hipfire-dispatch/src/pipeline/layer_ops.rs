@@ -1327,8 +1327,8 @@ impl HyperReadOp<'_> {
             DType::F32,
             "hyper read mixed",
         )?;
-        require_weight(&self.input_mix_down, self.low_rank, wide, "hyper read down")?;
-        require_weight(&self.input_mix_up, wide, self.low_rank, "hyper read up")?;
+        require_hyper_mixer(&self.input_mix_down, self.low_rank, wide, "hyper read down")?;
+        require_hyper_mixer(&self.input_mix_up, wide, self.low_rank, "hyper read up")?;
         Ok(())
     }
 }
@@ -1427,7 +1427,7 @@ fn hyper_read_wmma_route(gpu: &Gpu, op: &HyperReadOp<'_>) -> bool {
     let up_fused = gpu.arch_caps.has_gfx11_plus_simt()
         && gpu.route_rows(op.rows) > 1
         && op.branches == 4
-        && op.input_mix_up.dtype == DType::BF16
+        && matches!(op.input_mix_up.dtype, DType::BF16 | DType::HC8E4M3Row)
         && op.input_mix_up.m == wide
         && op.input_mix_up.k == op.low_rank
         && op.low_rank % 8 == 0
@@ -1435,9 +1435,253 @@ fn hyper_read_wmma_route(gpu: &Gpu, op: &HyperReadOp<'_>) -> bool {
         && op.hidden % 8 == 0;
     let f16 = !wide_exact_rows(gpu, op.rows)
         && up_fused
-        && op.input_mix_down.dtype == DType::BF16
+        && matches!(op.input_mix_down.dtype, DType::BF16 | DType::HC8E4M3Row)
         && gpu.qwen4_f16_wmma_applies(op.input_mix_down.buf, op.input_mix_down.k, op.rows);
     f16 && op.low_rank % 16 == 0 && op.low_rank <= 504 && op.hidden % 16 == 0
+}
+
+fn is_hc8(weight: &WeightRef<'_>) -> bool {
+    weight.dtype == DType::HC8E4M3Row
+}
+
+/// [`require_weight`] for an HC mixer: also admits the HC8 sidecar payload (`m * k + 4 * m` bytes).
+fn require_hyper_mixer(
+    weight: &WeightRef<'_>,
+    m: usize,
+    k: usize,
+    label: &'static str,
+) -> Result<(), DispatchError> {
+    if !is_hc8(weight) {
+        return require_weight(weight, m, k, label);
+    }
+    match rdna_compute::hc8_weight::hc8_payload_bytes(m, k) {
+        Some(bytes) if weight.m == m && weight.k == k && weight.buf.buf.size() >= bytes => Ok(()),
+        _ => Err(DispatchError::Hip(format!(
+            "{label} has incompatible shape or HC8 payload"
+        ))),
+    }
+}
+
+/// The decode / verify HC8 route: both mixers are HC8 weights of a launchable shape and the
+/// routed row count is within the kernel's `1..=hc8::MAX_ROWS`.
+fn hc8_decode_applies(gpu: &Gpu, op: &HyperReadOp<'_>) -> bool {
+    let wide = op.branches * op.hidden;
+    let (down, up) = (&op.input_mix_down, &op.input_mix_up);
+    is_hc8(down)
+        && is_hc8(up)
+        && op.rows <= rdna_compute::hc8::MAX_ROWS
+        && gpu.route_rows(op.rows) <= rdna_compute::hc8::MAX_ROWS
+        && (down.m, down.k) == (op.low_rank, wide)
+        && (up.m, up.k) == (wide, op.low_rank)
+        && rdna_compute::hc8_weight::hc8_decode_shape_supported(down.m, down.k)
+        && rdna_compute::hc8_weight::hc8_decode_shape_supported(up.m, up.k)
+}
+
+/// The F16 WMMA read route of [`execute_hyper_read_inner`] for an operand set whose up weight is
+/// BF16 (the down may be BF16 or HC8): the `f16` term.
+fn hyper_read_f16_route(gpu: &Gpu, op: &HyperReadOp<'_>) -> bool {
+    let wide = op.branches * op.hidden;
+    let up_fused = gpu.arch_caps.has_gfx11_plus_simt()
+        && gpu.route_rows(op.rows) > 1
+        && op.branches == 4
+        && op.input_mix_up.dtype == DType::BF16
+        && op.input_mix_up.m == wide
+        && op.input_mix_up.k == op.low_rank
+        && op.low_rank % 8 == 0
+        && (257..=512).contains(&op.low_rank)
+        && op.hidden % 8 == 0;
+    !wide_exact_rows(gpu, op.rows)
+        && up_fused
+        && matches!(op.input_mix_down.dtype, DType::BF16 | DType::HC8E4M3Row)
+        && gpu.qwen4_f16_wmma_applies(op.input_mix_down.buf, op.input_mix_down.k, op.rows)
+}
+
+/// HC8 mixers beyond the decode route (prefill-class rows, or a shape the kernel does not launch):
+/// the up weight (and the down, unless it takes the F16 shadow route) is expanded exactly to BF16
+/// in the per-GPU scratch and the existing BF16 read runs on it. The scratch is rewritten per
+/// call, so no cache may be keyed on it: the F16 shadow of the down is built from, and keyed on,
+/// the E4M3 buffer.
+fn execute_hyper_read_hc8_expanded(
+    gpu: &mut Gpu,
+    op: &HyperReadOp<'_>,
+    normalized_ready: bool,
+    rotate_into: Option<&GpuTensor>,
+    paired: Option<&HyperWriteOp<'_>>,
+    gates_written: &mut bool,
+    prenormed: bool,
+) -> Result<(), DispatchError> {
+    let wide = checked_mul(op.branches, op.hidden, "hyper read wide")?;
+    let (down, up) = (&op.input_mix_down, &op.input_mix_up);
+    if (down.m, down.k) != (op.low_rank, wide) || (up.m, up.k) != (wide, op.low_rank) {
+        return Err(DispatchError::Hip(
+            "hyper read: HC8 mixer shapes do not match the read geometry".into(),
+        ));
+    }
+    let up_bf16 = if is_hc8(up) {
+        Some(hip(gpu.hc8_bf16_scratch(1, up.buf, up.m, up.k))?)
+    } else {
+        None
+    };
+    let up_ref = match up_bf16.as_ref() {
+        Some(tensor) => WeightRef {
+            buf: tensor,
+            dtype: DType::BF16,
+            row_stride: up.k * 2,
+            ..*up
+        },
+        None => *up,
+    };
+    let mut sub = HyperReadOp {
+        state_bf16: op.state_bf16,
+        input: op.input,
+        norm_weight: op.norm_weight,
+        input_mix_down: *down,
+        input_mix_up: up_ref,
+        normalized: op.normalized,
+        low: op.low,
+        up: op.up,
+        mixed: op.mixed,
+        rows: op.rows,
+        branches: op.branches,
+        hidden: op.hidden,
+        low_rank: op.low_rank,
+        rotation: op.rotation,
+    };
+    let down_bf16 = if is_hc8(down) && !hyper_read_f16_route(gpu, &sub) {
+        Some(hip(gpu.hc8_bf16_scratch(0, down.buf, down.m, down.k))?)
+    } else {
+        None
+    };
+    if let Some(tensor) = down_bf16.as_ref() {
+        sub.input_mix_down = WeightRef {
+            buf: tensor,
+            dtype: DType::BF16,
+            row_stride: down.k * 2,
+            ..*down
+        };
+    }
+    execute_hyper_read_inner(
+        gpu,
+        &sub,
+        normalized_ready,
+        rotate_into,
+        paired,
+        gates_written,
+        prenormed,
+    )
+}
+
+/// Decode / verify read on the HC8 mixers (`1..=64` routed rows): the norm (and the paired write's
+/// k4 gates, as the k4 route), the down `hc8_gemm` with the `hc_act` epilogue into `low`, the up
+/// `hc8_gemm` into `up`, then the BF16 branch mix. Every row is bitwise the singleton's (the kernel's
+/// K split and fold order do not depend on the row count).
+fn execute_hyper_read_hc8_decode(
+    gpu: &mut Gpu,
+    op: &HyperReadOp<'_>,
+    normalized_ready: bool,
+    rotate_into: Option<&GpuTensor>,
+    paired: Option<&HyperWriteOp<'_>>,
+    gates_written: &mut bool,
+    prenormed: bool,
+) -> Result<(), DispatchError> {
+    if prenormed {
+        return Err(DispatchError::Hip(
+            "hyper read: prenormed input needs the paired F16 WMMA read route".into(),
+        ));
+    }
+    let wide = checked_mul(op.branches, op.hidden, "hyper read wide")?;
+    let input = view(op.input, 0, op.rows * wide);
+    let normalized = view(op.normalized, 0, op.rows * wide);
+    let low = view(op.low, 0, op.rows * op.low_rank);
+    let up = view(op.up, 0, op.rows * wide);
+    let mixed = view(op.mixed, 0, op.rows * op.hidden);
+    if !normalized_ready {
+        match paired.filter(|write| hyper_pair_decode_applies(gpu, op, write)) {
+            // The read's norm and the paired write's k4 gate GEMV in one launch; that write
+            // then skips its own norm + gate launches.
+            Some(write) => {
+                let gates = view(write.gates, 0, op.rows * write.branches);
+                hip(hyper_norm_gate_k4_outputs(
+                    gpu,
+                    &HyperNormGateK4Outputs {
+                        input: &input,
+                        norm_weight: op.norm_weight,
+                        gate_weight: write.block_inject.buf,
+                        normalized: &normalized,
+                        gates: &gates,
+                        rows: op.rows,
+                        branches: op.branches,
+                        hidden: op.hidden,
+                        state_bf16: op.state_bf16,
+                    },
+                ))?;
+                *gates_written = true;
+            }
+            None => {
+                hip(hyper_norm(
+                    gpu,
+                    &HyperNorm {
+                        input: &input,
+                        norm_weight: op.norm_weight,
+                        normalized: &normalized,
+                        branches: op.branches,
+                        hidden: op.hidden,
+                        state_bf16: op.state_bf16,
+                    },
+                ))?;
+                if let Some(write) = paired.filter(|write| hyper_pair_allrows_applies(gpu, op, write)) {
+                    let gates = view(write.gates, 0, op.rows * write.branches);
+                    hip(gpu.gemv_bf16_xf32_k4_rows(
+                        write.block_inject.buf,
+                        &normalized,
+                        &gates,
+                        write.block_inject.m,
+                        write.block_inject.k,
+                        None,
+                        op.rows,
+                    ))?;
+                    *gates_written = true;
+                }
+            }
+        }
+    }
+    let (down, upw) = (&op.input_mix_down, &op.input_mix_up);
+    // `normalized` is `hyper_norm`'s BF16-rounded output, so the E4M3 x BF16 products are exact;
+    // the down's epilogue applies hc_act (`low` is BF16-exact), which the up then reads.
+    hip(gpu.hc8_gemm_tensor(
+        down.buf,
+        down.m,
+        down.k,
+        &normalized,
+        &low,
+        op.rows,
+        Some(1.0 / op.branches as f32),
+    ))?;
+    hip(gpu.hc8_gemm_tensor(upw.buf, upw.m, upw.k, &low, &up, op.rows, None))?;
+    if let Some(rotated) = rotate_into.filter(|r| {
+        op.branches == 4 && op.hidden.is_multiple_of(256) && r.numel() >= op.rows * op.hidden
+    }) {
+        return hip(gpu.hyper_read_projected_rotate(
+            &normalized,
+            &up,
+            &mixed,
+            &view(rotated, 0, op.rows * op.hidden),
+            op.hidden,
+            op.rows,
+        ));
+    }
+    hip(hyper_read_projected(
+        gpu,
+        &HyperReadProjected {
+            input: &input,
+            norm_weight: op.norm_weight,
+            up: &up,
+            normalized: &normalized,
+            mixed: &mixed,
+            branches: op.branches,
+            hidden: op.hidden,
+        },
+    ))
 }
 
 /// `normalized_ready`: a preceding fused launch already wrote this read's
@@ -1451,6 +1695,34 @@ fn execute_hyper_read_inner(
     gates_written: &mut bool,
     prenormed: bool,
 ) -> Result<(), DispatchError> {
+    // The HC8 sidecar (`DType::HC8E4M3Row`, exact gfx1201): decode / verify rows read the E4M3
+    // weights through the PeaceMaker `hc8_gemm`; prefill-class rows get exact BF16 operands.
+    if is_hc8(&op.input_mix_up) || is_hc8(&op.input_mix_down) {
+        if hc8_decode_applies(gpu, op) {
+            return execute_hyper_read_hc8_decode(
+                gpu,
+                op,
+                normalized_ready,
+                rotate_into,
+                paired,
+                gates_written,
+                prenormed,
+            );
+        }
+        // An HC8 down on the F16 WMMA route is read through its E4M3-keyed F16 shadow
+        // (`Gpu::ensure_bf16_f16_shadow`); every other consumer needs real BF16 bits.
+        if is_hc8(&op.input_mix_up) || !hyper_read_f16_route(gpu, op) {
+            return execute_hyper_read_hc8_expanded(
+                gpu,
+                op,
+                normalized_ready,
+                rotate_into,
+                paired,
+                gates_written,
+                prenormed,
+            );
+        }
+    }
     let wide = checked_mul(op.branches, op.hidden, "hyper read wide")?;
     let input = view(op.input, 0, op.rows * wide);
     let normalized = view(op.normalized, 0, op.rows * wide);
@@ -1481,7 +1753,7 @@ fn execute_hyper_read_inner(
     // takes `normalized` as BF16 bits, which only it reads.
     let f16 = !wide_exact_rows(gpu, op.rows)
         && up_fused
-        && op.input_mix_down.dtype == DType::BF16
+        && matches!(op.input_mix_down.dtype, DType::BF16 | DType::HC8E4M3Row)
         && gpu.qwen4_f16_wmma_applies(op.input_mix_down.buf, op.input_mix_down.k, op.rows);
     let wmma_read = f16 && op.low_rank % 16 == 0 && op.low_rank <= 504 && op.hidden % 16 == 0;
     let mut normalized_f16 = None;

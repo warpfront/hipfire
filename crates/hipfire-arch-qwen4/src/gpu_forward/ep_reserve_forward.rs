@@ -1043,6 +1043,7 @@ impl EpReserveForward {
                 dst_ptr: at(index)?,
                 rows: member.rows,
                 cols: member.cols,
+                hc8: tensor.dtype == rdna_compute::DType::HC8E4M3Row,
             });
         }
         let mut i8_spans = Vec::with_capacity(region.shared_i8.len());

@@ -456,19 +456,28 @@ pub fn validate_final_hyper(
     let wide_rows = checked_mul(rows, wide, "final hyper input")?;
     let hidden = checked_mul(rows, dims.hidden, "final hyper output")?;
     require_tensor(weights.norm, wide, DType::BF16, "final HC norm")?;
-    require_projection_weight(
-        &weights.input_mix_down,
-        low,
-        wide,
-        "final HC input mix down",
-    )?;
-    require_dense_weight(
-        &weights.input_mix_up,
-        wide,
-        low,
-        DType::BF16,
-        "final HC input mix up",
-    )?;
+    if weights.input_mix_down.dtype == DType::HC8E4M3Row
+        || weights.input_mix_up.dtype == DType::HC8E4M3Row
+    {
+        // The HC8 sidecar mixers (exact gfx1201): `execute_hyper_read_inner` reads them through the
+        // `hc8_gemm` decode route or expands them exactly to BF16.
+        require_hc8_weight(&weights.input_mix_down, low, wide, "final HC input mix down")?;
+        require_hc8_weight(&weights.input_mix_up, wide, low, "final HC input mix up")?;
+    } else {
+        require_projection_weight(
+            &weights.input_mix_down,
+            low,
+            wide,
+            "final HC input mix down",
+        )?;
+        require_dense_weight(
+            &weights.input_mix_up,
+            wide,
+            low,
+            DType::BF16,
+            "final HC input mix up",
+        )?;
+    }
     require_tensor(streams, wide_rows, DType::F32, "final hyper streams")?;
     require_tensor(scratch.hc_mixed, hidden, DType::F32, "final hyper mixed")
 }
@@ -821,6 +830,34 @@ fn require_projection_weight(
             "Qwen4 {name} dtype mismatch: expected BF16 or a Qwen4 matrix quantization, got {dtype:?}"
         ))),
     }
+}
+
+/// An HC mixer that is the HC8 sidecar's `[m, k]` E4M3 payload (`m * k + 4 * m` bytes) or plain BF16.
+fn require_hc8_weight(
+    weight: &WeightRef<'_>,
+    m: usize,
+    k: usize,
+    name: &'static str,
+) -> Result<(), DispatchError> {
+    if weight.dtype == DType::BF16 {
+        return require_dense_weight(weight, m, k, DType::BF16, name);
+    }
+    require_weight(weight, m, k, name)?;
+    let bytes = rdna_compute::hc8_weight::hc8_payload_bytes(m, k)
+        .filter(|_| weight.dtype == DType::HC8E4M3Row)
+        .ok_or_else(|| {
+            DispatchError::Hip(format!(
+                "Qwen4 {name} dtype mismatch: expected BF16 or HC8E4M3Row [{m}x{k}], got {:?}",
+                weight.dtype
+            ))
+        })?;
+    if weight.buf.buf.size() < bytes {
+        return Err(DispatchError::Hip(format!(
+            "Qwen4 {name} capacity too small: need {bytes} bytes, have {}",
+            weight.buf.buf.size()
+        )));
+    }
+    Ok(())
 }
 
 fn require_weight(

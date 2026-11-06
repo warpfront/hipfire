@@ -990,20 +990,33 @@ impl<'a> AppendWeights<'a> {
         if !w.wide.is_multiple_of(32) {
             return Err(invalid("MTP batched append HC down needs K % 32 == 0"));
         }
+        // The HC mixers are BF16, or the exact-gfx1201 HC8 sidecar weights (read by `append_hc8_read`).
+        let hc_dtype = |weight: &WeightRef<'_>| {
+            if weight.dtype == DType::HC8E4M3Row {
+                DType::HC8E4M3Row
+            } else {
+                DType::BF16
+            }
+        };
         check(
             "HC down",
             &hc.input_mix_down,
-            DType::BF16,
+            hc_dtype(&hc.input_mix_down),
             config.hc_lowrank,
             w.wide,
         )?;
         check(
             "HC up",
             &hc.input_mix_up,
-            DType::BF16,
+            hc_dtype(&hc.input_mix_up),
             w.wide,
             config.hc_lowrank,
         )?;
+        if hc.input_mix_down.dtype != hc.input_mix_up.dtype {
+            return Err(invalid(
+                "MTP batched append HC down and up must both be BF16 or both HC8",
+            ));
+        }
         let qsa = qsa_desc(weights, &mtp.attention)?;
         // The tiled Q8_0 projection is the K = 2560 staged kernel.
         if w.hidden != 2560 {
@@ -1048,6 +1061,45 @@ fn append_dense_projection(
         gpu.gemm_bf16_xf32_mtp_dense_det_pm(weight.buf, x, y, weight.m, weight.k, rows)?;
     } else {
         gpu.gemm_bf16_xf32_multirow(weight.buf, x, y, weight.m, weight.k, rows)?;
+    }
+    Ok(())
+}
+
+/// The batched append's HC read down + up projections on the HC8 sidecar weights: `rows` rows in
+/// `hc8::MAX_ROWS` slices (the kernel is row-invariant, so a row's bytes do not depend on its
+/// slice). Down applies hc_act (scale 1/branches) in its epilogue into `low`, up reads `low` into
+/// `up`. The DET route is exact gfx1151 (F16 shadows of BF16 weights) and HC8 is exact gfx1201, so
+/// the pair is refused by name rather than read as BF16.
+#[allow(clippy::too_many_arguments)]
+fn append_hc8_read(
+    gpu: &mut Gpu,
+    det: bool,
+    hc: &Qwen4HyperReadWeights<'_>,
+    normalized: &GpuTensor,
+    low: &GpuTensor,
+    up: &GpuTensor,
+    rows: usize,
+    branches: usize,
+) -> Result<(), MtpGpuError> {
+    if det {
+        return Err(invalid(
+            "MTP DET append reads BF16 HC mixers; the HC8 sidecar weights are exact gfx1201, DET is exact gfx1151",
+        ));
+    }
+    let (down, upw) = (&hc.input_mix_down, &hc.input_mix_up);
+    if down.dtype != DType::HC8E4M3Row || upw.dtype != DType::HC8E4M3Row {
+        return Err(invalid("MTP HC8 append needs both HC mixers as HC8E4M3Row"));
+    }
+    let (wide, rank) = (down.k, down.m);
+    let mut start = 0;
+    while start < rows {
+        let take = (rows - start).min(rdna_compute::hc8::MAX_ROWS);
+        let x = normalized.sub_offset(start * wide, take * wide);
+        let l = low.sub_offset(start * rank, take * rank);
+        let u = up.sub_offset(start * wide, take * wide);
+        gpu.hc8_gemm_tensor(down.buf, down.m, down.k, &x, &l, take, Some(1.0 / branches as f32))?;
+        gpu.hc8_gemm_tensor(upw.buf, upw.m, upw.k, &l, &u, take, None)?;
+        start += take;
     }
     Ok(())
 }
@@ -3881,7 +3933,20 @@ impl Qwen4MtpGpu {
                 state_bf16: false,
             },
         )?;
-        if det {
+        if mw.hc.input_mix_down.dtype == DType::HC8E4M3Row {
+            // HC8 sidecar mixers (exact gfx1201): down (+ hc_act) and up on the `hc8_gemm`
+            // kernel, bitwise the per-row HC read's launches (the kernel is row-invariant).
+            append_hc8_read(
+                gpu,
+                det,
+                &mw.hc,
+                &hc_normalized,
+                &hc_low,
+                &hc_up,
+                rows,
+                config.hc_count,
+            )?;
+        } else if det {
             // DET: the raw fixed-ascending-K F16 WMMA down projection, then the
             // HC read activation (`hc_activation_fused_f32`, scale 1/branches,
             // in place over the F32 `hc_low` rows) the incumbent fuses into the
@@ -3915,7 +3980,9 @@ impl Qwen4MtpGpu {
                 rows,
             )?;
         }
-        append_dense_projection(gpu, det, &mw.hc.input_mix_up, &hc_low, &hc_up, rows)?;
+        if mw.hc.input_mix_up.dtype != DType::HC8E4M3Row {
+            append_dense_projection(gpu, det, &mw.hc.input_mix_up, &hc_low, &hc_up, rows)?;
+        }
         hyper_read_projected(
             gpu,
             &HyperReadProjected {

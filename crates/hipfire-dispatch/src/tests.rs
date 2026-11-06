@@ -801,6 +801,7 @@ const ALL_DTYPES: &[DType] = &[
     DType::ParoQ4G64,
     DType::FP8E4M3B128,
     DType::FP8E4M3PT,
+    DType::HC8E4M3Row,
     DType::Raw,
     DType::MQ3I4G128R256,
     DType::MQ3I4G128R128,

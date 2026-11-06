@@ -822,6 +822,7 @@ mod residual_coverage_tests {
             ParoQ4G64,
             FP8E4M3B128,
             FP8E4M3PT,
+            HC8E4M3Row,
             Raw,
             MQ3I4G128R256,
             MQ3I4G128R128,
