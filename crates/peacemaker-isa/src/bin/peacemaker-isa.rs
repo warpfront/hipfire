@@ -138,7 +138,7 @@ const NATIVE_USAGE: &str = "       emit options: [--co FILE] [--bundle FILE [--h
        peacemaker-isa emit --kernel lane_rows_mq6_gfx1201|lane_rows_bf16_gfx1201 [--epi all] --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
          (lane_rows_mq6_pm_gfx1201 / lane_rows_bf16_pm_gfx1201: ten unchanged narrow exports then two t8 exports)
        peacemaker-isa emit --kernel hc8_wmma_gfx1201 [--epi all|priority] --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
-         (hc8_wmma_pm_gfx1201: hc8_gemm_{e4m3|i8}_mw{MW}_kw{KW}_n{NT}_{set|act}, 80 exports for `all`; `priority` = e4m3 mw1kw16 and mw4kw1 n1 set/act only)
+         (hc8_wmma_pm_gfx1201: hc8_gemm_{e4m3|i8}_mw{MW}_kw{KW}_n{NT}_{set|act}, 80 GEMM exports + hc8_dequant_{bf16|f16} = 82 for `all`; `priority` = e4m3 mw1kw16 and mw4kw1 n1 set/act only, no dequant)
        peacemaker-isa emit --kernel mq4_rows_x4 [--epi entry|t8|all] --arch gfx1151|gfx1201|gfx1100 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
          (mq4_rows_x4_pm_<arch>: unchanged narrow plus t8 on gfx1151/gfx1201; gfx1100 has only the actual scalar-DAG t8 export, no narrow entry; no r16/r32 exports)
        peacemaker-isa emit --kernel qwen4_bf16_rows_wide [--epi t8|k4_t8|all] --arch gfx1151|gfx1100 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
@@ -1039,6 +1039,25 @@ fn row_image(kernel: &str, epi: &str, arch: Arch) -> Result<Option<RowImage>, St
                     "arithmetic_recipe": "hc8 W8A16 BF16 WMMA; K split per wave, KW partials folded ascending in LDS; one v_mul by s[m]; act = lane_rows hc_act DAG",
                 });
                 image.push(e, [grid.as_str(), "1", "1"], rows(g.max_rows() as u8), contract)?;
+            }
+            if epi == "all" {
+                for (out, e) in k::DEQUANT_OUTS.into_iter().zip(k::emit_dequants()?) {
+                    let contract = json!({
+                        "shape_domain": {
+                            "M": "M % 16 == 0",
+                            "K": "K % 32 == 0 && M*K < 2^31",
+                        },
+                        "kernarg": "q@0 s@8 out@16 u64; M@24 K@28 u32",
+                        "arithmetic_recipe": format!(
+                            "hc8 prefill dequant: out[r*K+c] = {}(decode_e4m3(q_swizzled) * s[r]), f32 product exact (power-of-two s); one thread per element, lanes >= M*K masked off; no row domain",
+                            match out {
+                                k::DequantOut::Bf16 => "bf16 (high 16 bits of the exactly-BF16 f32)",
+                                k::DequantOut::F16 => "f16 RNE (v_cvt_f16_f32, gradual subnormals, overflow to inf)",
+                            }
+                        ),
+                    });
+                    image.push(e, ["ceil(M*K/256)", "1", "1"], empty(), contract)?;
+                }
             }
         }
         "mq4_rows_x4" => {

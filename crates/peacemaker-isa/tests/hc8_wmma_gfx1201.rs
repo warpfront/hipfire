@@ -34,7 +34,7 @@
 //!
 //! Also checked on every launch: weights, scale and activations are byte-identical and never written; the written
 //! byte set of `y` is exactly `rows * M * 4` (dead columns and capacity padding never stored, sentinel words intact,
-//! guard words intact); `rows == 0` and `rows > 16*NT` write nothing and terminate. Structural test: 80 symbols,
+//! guard words intact); `rows == 0` and `rows > 16*NT` write nothing and terminate. Structural test: 80 GEMM + 2 dequant symbols,
 //! ABI 48 B, offsets, no scratch/spills/atomics/flat, deterministic emission, native assemble + lift + `Emulator::new`
 //! of every entry.
 //!
@@ -1042,12 +1042,20 @@ fn module_record_abi_resources_and_native_roundtrip() {
     assert_eq!(want.len(), 80, "2 fmt x 5 classes x 4 NT x 2 epilogues");
     assert_eq!(want_set.len(), 80);
     let got: Vec<String> = symbols();
+    let dequant_syms = ["hc8_dequant_bf16", "hc8_dequant_f16"];
+    let mut all_set = want_set.clone();
+    all_set.extend(dequant_syms.iter().map(|s| s.to_string()));
     assert_eq!(
         got.iter().cloned().collect::<BTreeSet<_>>(),
-        want_set,
-        "exported symbols (spec naming rule)"
+        all_set,
+        "exported symbols (spec naming rule + 2 dequant)"
     );
-    assert_eq!(got.len(), 80, "no duplicate or missing export");
+    assert_eq!(got.len(), 82, "80 GEMM + 2 dequant, no duplicate or missing export");
+    assert_eq!(
+        &got[80..],
+        &dequant_syms.map(String::from)[..],
+        "dequant entries appended after the 80 GEMMs"
+    );
     for g in expected_geos() {
         assert_eq!(g.symbol(), expected_symbol(g), "Geo::symbol");
         assert_eq!(g.block(), 32 * g.mw * g.kw, "{}: block", expected_symbol(g));
@@ -1057,8 +1065,8 @@ fn module_record_abi_resources_and_native_roundtrip() {
             assert_eq!(g.grid(m), m / (16 * g.mw), "{}: grid", expected_symbol(g));
         }
     }
-    assert_eq!(emitted.len(), 80);
-    assert_eq!(proof.kernels.len(), 80);
+    assert_eq!(emitted.len(), 82);
+    assert_eq!(proof.kernels.len(), 82);
     let forbidden = [
         "scratch_",
         "buffer_atomic",
@@ -1146,7 +1154,7 @@ fn module_record_abi_resources_and_native_roundtrip() {
     }
     // Native assemble + lift is exact: every symbol lifts and constructs an emulator.
     let program = lift_text(&text);
-    let syms: BTreeSet<String> = want_set;
+    let syms: BTreeSet<String> = all_set;
     let _ = emulators(&program, &syms, "PM entry");
 }
 

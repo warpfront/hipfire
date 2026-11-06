@@ -57,6 +57,10 @@
 //!   batches `U/2 .. 1` for the remainder; all loads of a batch are issued before its
 //!   first use so the builder's ledger waits only for what is needed. No scratch, no
 //!   spills.
+mod dequant;
+pub use dequant::{
+    emit_dequant, emit_dequants, DequantOut, DEQUANT_BLOCK, DEQUANT_KERNARG_BYTES, DEQUANT_OUTS,
+};
 use super::iu4_gemm::ModuleProof;
 use crate::insn::{Instruction, MemoryClass};
 use crate::kernels::common::{add64, add64_imm, lit, op, s, s_add_i32, smem, sop, v, vr};
@@ -140,7 +144,9 @@ pub fn priority_geos() -> Vec<Geo> {
 
 /// Exported symbols of the full module, in module order.
 pub fn symbols() -> Vec<String> {
-    all_geos().iter().map(Geo::symbol).collect()
+    let mut out: Vec<String> = all_geos().iter().map(Geo::symbol).collect();
+    out.extend(DEQUANT_OUTS.iter().map(|d| d.symbol().to_string()));
+    out
 }
 
 impl Geo {
@@ -1052,32 +1058,42 @@ fn exported(e: &Emitted) -> Option<&str> {
         .map(str::trim)
 }
 
-/// Build the given exports into one module source and proof.
-pub fn emit_geos(geos: &[Geo]) -> Result<(Vec<Emitted>, String, ModuleProof), String> {
-    let mut emitted = Vec::with_capacity(geos.len());
-    for g in geos {
-        emitted.push(emit_geo(g).map_err(|e| format!("{MODULE}: {}: {e}", g.symbol()))?);
-    }
-    for (g, e) in geos.iter().zip(&emitted) {
-        if exported(e) != Some(g.symbol().as_str()) {
+/// Link `emitted` (each already checked against `symbols`) into one module source and proof.
+fn link(
+    emitted: Vec<Emitted>,
+    symbols: &[String],
+) -> Result<(Vec<Emitted>, String, ModuleProof), String> {
+    for (sym, e) in symbols.iter().zip(&emitted) {
+        if exported(e) != Some(sym.as_str()) {
             return Err(format!(
-                "{MODULE}: builder exported {:?}, expected {}",
-                exported(e),
-                g.symbol()
+                "{MODULE}: builder exported {:?}, expected {sym}",
+                exported(e)
             ));
         }
         if e.proof.arch != Arch::Gfx1201 {
-            return Err(format!(
-                "{MODULE}: {} not built for exact gfx1201",
-                g.symbol()
-            ));
+            return Err(format!("{MODULE}: {sym} not built for exact gfx1201"));
         }
     }
     let (text, proof) = super::iu4_gemm::module(&emitted, MODULE)?;
     Ok((emitted, text, proof))
 }
 
-/// Build every export of [`all_geos`].
+fn emit_gemms(geos: &[Geo]) -> Result<Vec<Emitted>, String> {
+    geos.iter()
+        .map(|g| emit_geo(g).map_err(|e| format!("{MODULE}: {}: {e}", g.symbol())))
+        .collect()
+}
+
+/// Build the given GEMM exports (no dequant entries) into one module source and proof.
+pub fn emit_geos(geos: &[Geo]) -> Result<(Vec<Emitted>, String, ModuleProof), String> {
+    let symbols: Vec<String> = geos.iter().map(Geo::symbol).collect();
+    link(emit_gemms(geos)?, &symbols)
+}
+
+/// Build the full module: every export of [`all_geos`] then `hc8_dequant_{bf16,f16}`
+/// (82 exports, [`symbols`] order).
 pub fn emit_module() -> Result<(Vec<Emitted>, String, ModuleProof), String> {
-    emit_geos(&all_geos())
+    let mut emitted = emit_gemms(&all_geos())?;
+    emitted.extend(emit_dequants()?);
+    link(emitted, &symbols())
 }
