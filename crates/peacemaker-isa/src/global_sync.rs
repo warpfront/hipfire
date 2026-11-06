@@ -507,6 +507,7 @@ impl Builder {
             workgroup_size: abi.workgroup_size,
             exec_clobbered,
             unreleased_writes_at_exit: self.sync.unreleased_dev,
+            ..Default::default()
         });
         Ok(())
     }
@@ -656,6 +657,7 @@ impl Builder {
             workgroup_size: abi.workgroup_size,
             exec_clobbered: true,
             unreleased_writes_at_exit: true,
+            ..Default::default()
         });
         Ok(())
     }

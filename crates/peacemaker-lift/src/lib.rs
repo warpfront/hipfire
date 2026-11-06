@@ -20,6 +20,7 @@ pub mod kd;
 pub mod layout;
 pub mod metadata;
 pub mod raw;
+pub mod regions_note;
 pub mod rewrite;
 pub mod text;
 

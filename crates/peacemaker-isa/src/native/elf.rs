@@ -33,6 +33,7 @@
 //! the v5 and v6 objects are otherwise byte-identical.
 use super::descriptor::{ENTRY_OFFSET, KD_SIZE};
 use crate::Arch;
+use std::borrow::Cow;
 
 const PAGE: u64 = 0x1000;
 const EHDR: u64 = 64;
@@ -54,6 +55,7 @@ const CODE_END_DWORDS: usize = 96;
 /// `Linker: AMD LLD ...` string, which would claim a tool that never ran.
 pub(crate) const NATIVE_COMMENT: &str =
     concat!("hipfire peacemaker native-emit ", env!("CARGO_PKG_VERSION"));
+const REGIONS_NAME: &[u8] = b".note.pm_regions\0";
 const SHSTRTAB: &[u8] = b"\0.note\0.dynsym\0.gnu.hash\0.hash\0.dynstr\0.rodata\0.text\0.dynamic\0.relro_padding\0.comment\0.symtab\0.shstrtab\0.strtab\0";
 const NT_AMDGPU_METADATA: u32 = 32;
 const GNU_HASH_SHIFT2: u32 = 26;
@@ -186,6 +188,22 @@ pub(crate) fn link(
     metadata: &[u8],
     code_end: bool,
 ) -> Result<Vec<u8>, String> {
+    link_with_regions(arch, code_object_version, kernels, metadata, code_end, &[])
+}
+
+/// [`link`] plus an optional `.note.pm_regions` section (index 14: `SHT_PROGBITS`, no flags, address 0,
+/// align 1, so non-alloc and outside every segment). `regions` is the already-encoded raw payload
+/// (sequential PMRG records). When non-empty, `.note.pm_regions\0` is appended to `.shstrtab`, the payload
+/// follows `.strtab` before the section headers, and `e_shnum` becomes 15; existing section indices are
+/// unchanged. An empty `regions` yields exactly the bytes of [`link`].
+pub(crate) fn link_with_regions(
+    arch: Arch,
+    code_object_version: u32,
+    kernels: &[Kernel],
+    metadata: &[u8],
+    code_end: bool,
+    regions: &[u8],
+) -> Result<Vec<u8>, String> {
     let abi = abi_version(code_object_version)?;
     if code_object_version == 5 && !arch.wave64() {
         return Err(format!(
@@ -285,9 +303,17 @@ pub(crate) fn link(
     let comment_size = NATIVE_COMMENT.len() as u64 + 1;
     let symtab_off = align(comment_off + comment_size, 8);
     let symtab_size = (2 + names.len() as u64) * SYM;
+    let shstrtab: Cow<[u8]> = if regions.is_empty() {
+        Cow::Borrowed(SHSTRTAB)
+    } else {
+        let mut v = SHSTRTAB.to_vec();
+        v.extend_from_slice(REGIONS_NAME);
+        Cow::Owned(v)
+    };
     let shstrtab_off = symtab_off + symtab_size;
-    let strtab_off = shstrtab_off + SHSTRTAB.len() as u64;
-    let shoff = align(strtab_off + strtab.len() as u64, 8);
+    let strtab_off = shstrtab_off + shstrtab.len() as u64;
+    let regions_off = strtab_off + strtab.len() as u64;
+    let shoff = align(regions_off + regions.len() as u64, 8);
 
     let kd_addr = |i: usize| rodata_off + (i * KD_SIZE) as u64;
     let symbol_entry = |out: &mut Out, i: usize| {
@@ -324,7 +350,7 @@ pub(crate) fn link(
     out.u16(PHDR as u16);
     out.u16(PHNUM as u16);
     out.u16(SHDR as u16);
-    out.u16(14);
+    out.u16(if regions.is_empty() { 14 } else { 15 });
     out.u16(12);
     // Program headers: (type, flags, offset, addr, filesz, memsz, align).
     let phdrs = [
@@ -478,8 +504,11 @@ pub(crate) fn link(
     for i in 0..names.len() {
         symbol_entry(&mut out, i)
     }
-    out.bytes(shstrtab_off, SHSTRTAB);
+    out.bytes(shstrtab_off, &shstrtab);
     out.bytes(strtab_off, &strtab);
+    if !regions.is_empty() {
+        out.bytes(regions_off, regions);
+    }
     out.pad_to(shoff);
     let alloc = 2;
     let write = 1;
@@ -637,7 +666,7 @@ pub(crate) fn link(
             flags: 0,
             addr: 0,
             offset: shstrtab_off,
-            size: SHSTRTAB.len() as u64,
+            size: shstrtab.len() as u64,
             link: 0,
             info: 0,
             align: 1,
@@ -656,7 +685,20 @@ pub(crate) fn link(
             entsize: 0,
         },
     ];
-    for s in sections {
+    let regions_section = Section {
+        name: SHSTRTAB.len() as u32,
+        kind: 1,
+        flags: 0,
+        addr: 0,
+        offset: regions_off,
+        size: regions.len() as u64,
+        link: 0,
+        info: 0,
+        align: 1,
+        entsize: 0,
+    };
+    let extra = (!regions.is_empty()).then_some(regions_section);
+    for s in sections.into_iter().chain(extra) {
         out.u32(s.name);
         out.u32(s.kind);
         out.u64(s.flags);
@@ -712,6 +754,48 @@ mod tests {
         assert_eq!(u32::from_le_bytes(rdna[48..52].try_into().unwrap()), 0x41);
         assert!(link(Arch::Gfx1100, 5, &one_kernel(), &[0x80], false).is_err());
         assert!(link(Arch::Gfx942, 4, &one_kernel(), &[0x80], false).is_err());
+    }
+    #[test]
+    fn empty_regions_are_byte_identical_to_link() {
+        for (arch, v) in [(Arch::Gfx942, 5), (Arch::Gfx1100, 6)] {
+            let a = link(arch, v, &one_kernel(), &[0x80], false).unwrap();
+            let b = link_with_regions(arch, v, &one_kernel(), &[0x80], false, &[]).unwrap();
+            assert_eq!(a, b);
+        }
+    }
+    #[test]
+    fn regions_become_a_nonalloc_progbits_section_14() {
+        let payload = b"PMRG\x01\x02\x03";
+        let base = link(Arch::Gfx942, 6, &one_kernel(), &[0x80], false).unwrap();
+        let elf =
+            link_with_regions(Arch::Gfx942, 6, &one_kernel(), &[0x80], false, payload).unwrap();
+        assert_eq!(u16::from_le_bytes(elf[60..62].try_into().unwrap()), 15);
+        let sh = u64_at(&elf, 40);
+        let hdr = sh + 64 * 14;
+        let name = u32::from_le_bytes(elf[hdr..hdr + 4].try_into().unwrap()) as usize;
+        assert_eq!(
+            u32::from_le_bytes(elf[hdr + 4..hdr + 8].try_into().unwrap()),
+            1
+        );
+        assert_eq!(u64_at(&elf, hdr + 8), 0); // flags
+        assert_eq!(u64_at(&elf, hdr + 16), 0); // addr
+        assert_eq!(u64_at(&elf, hdr + 48), 1); // align
+        let (off, size) = section(&elf, 14);
+        assert_eq!(&elf[off..off + size], payload);
+        let (stroff, strsize) = section(&elf, 12);
+        let names = &elf[stroff..stroff + strsize];
+        assert!(names.starts_with(SHSTRTAB));
+        let n = &names[name..];
+        assert_eq!(
+            &n[..n.iter().position(|&c| c == 0).unwrap()],
+            b".note.pm_regions"
+        );
+        // Every pre-existing section keeps its index and content.
+        for i in [7usize, 11] {
+            let (o, s) = section(&elf, i);
+            let (bo, bs) = section(&base, i);
+            assert_eq!(elf[o..o + s], base[bo..bo + bs]);
+        }
     }
     fn u64_at(b: &[u8], at: usize) -> usize {
         u64::from_le_bytes(b[at..at + 8].try_into().unwrap()) as usize

@@ -206,8 +206,18 @@ pub fn region_entry_label(name: &str) -> String {
 pub fn region_exit_label(name: &str) -> String {
     format!(".L{name}_exit")
 }
-/// What `Builder::region` proved about one emitted region.
+/// Inputs needed to re-derive a lifted task body from its standalone object.
+/// Register numbers name SGPRs; `block` and `dynamic_lds` retain the lift request.
 #[derive(Clone, Debug, Serialize)]
+pub struct RegionLiftInputs {
+    pub prefix: String,
+    pub workgroup_x: u16,
+    pub workgroup_yz: u16,
+    pub block: u32,
+    pub dynamic_lds: u32,
+}
+/// What `Builder::region` proved about one emitted region.
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct RegionProof {
     pub name: String,
     /// Instruction indices of the entry and exit labels.
@@ -225,6 +235,18 @@ pub struct RegionProof {
     /// Global writes of the body not yet covered by a release at the exit: the caller
     /// must release before publishing completion.
     pub unreleased_writes_at_exit: bool,
+    /// Explicit dispatcher template id. Only tagged regions enter `.note.pm_regions`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<u32>,
+    /// Original lift request; absent for a native PM body such as COPY.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lift_inputs: Option<RegionLiftInputs>,
+    /// SHA-256 of the standalone source object (the lift receipt's exact bytes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_object_sha256: Option<[u8; 32]>,
+    /// Kernel symbol in that standalone source object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_symbol: Option<String>,
 }
 #[derive(Clone, Debug)]
 pub struct Emitted {
