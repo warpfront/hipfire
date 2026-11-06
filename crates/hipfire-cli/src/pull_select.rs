@@ -593,6 +593,14 @@ fn trunk_overlay_applies(
     gpu_arches.is_empty() || gpu_arches.iter().any(|arch| arch == applying)
 }
 
+/// Whether this host's GPUs apply the pinned HC8 sidecar, so the pull fetches
+/// it. The loader applies it only on exact gfx1201 (`FeatureFlags::qwen4_hc8_enabled`).
+/// A host with no detected GPU keeps the download (the pull cannot know where
+/// the model will run), as does a mixed host with any gfx1201 card.
+pub(crate) fn hc8_sidecar_wanted(gpu_arches: &[String]) -> bool {
+    gpu_arches.is_empty() || gpu_arches.iter().any(|arch| arch == "gfx1201")
+}
+
 /// Every file the pull of `choice` touches, in pull order.
 pub(crate) fn plan_items(
     ctx: &PullContext<'_, '_>,
@@ -704,6 +712,14 @@ fn plan_items_with_ep(
             &local,
             overlay.sidecar.size_bytes,
         ));
+    }
+    // The HC8 sidecar installs beside the selected base like the overlay.
+    if let Some(hc8) =
+        hipfire_registry::hc8_sidecar_in(identity, hipfire_registry::HC8_SIDECAR_PINS)
+            .filter(|_| hc8_sidecar_wanted(&ctx.host.gpu_arches))
+    {
+        let local = format!("{model_file}{}", hipfire_config::memory::HC8_SIDECAR_SUFFIX);
+        items.push(item("hc8".to_owned(), &local, hc8.sidecar.size_bytes));
     }
     if choice.expert_hotset {
         if let Some(hotset) = hipfire_registry::expert_hotset_in(identity, ctx.hotset_pins) {
@@ -1830,6 +1846,70 @@ mod tests {
             .unwrap();
         assert_eq!(hotset.file, format!("{STOCK_BASE}.expert-hotset"));
         assert_eq!(hotset.size, Some(217_675));
+    }
+
+    /// A registry whose one entry is the published symmetric-trunk base the HC8 pin binds to.
+    fn symtrunk_registry() -> RegistryV1 {
+        let pin = &hipfire_registry::HC8_SIDECAR_PINS[0];
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "generated_at": "2099-01-01T00:00:00Z",
+            "models": {
+                "symtrunk:test": {
+                    "repo": "hipfire-models/qwen3.8-flash-next",
+                    "file": "qwen3.8-flash-next-base.mq4-xts-symtrunk",
+                    "size_gb": 70.9, "min_vram_gb": 72.0, "arch_id": 16, "quant": "mq4",
+                    "desc": "Qwen3.8-Flash-Next MQ4 XTS symmetric-trunk base",
+                    "sha256": pin.base_sha256, "size_bytes": pin.base_size
+                }
+            },
+            "aliases": {}
+        });
+        RegistryV1::parse(&value.to_string(), "test").unwrap()
+    }
+
+    fn hc8_plan_labels(registry: &RegistryV1, tag: &str, arch: &str) -> Vec<PlanItem> {
+        let host = host_with_arch(arch);
+        let (tag, entry) = registry.model(tag).unwrap();
+        let ctx = PullContext {
+            registry,
+            host: &host,
+            overlay_pins: hipfire_registry::TRUNK_OVERLAY_PINS,
+            hotset_pins: hipfire_registry::EXPERT_HOTSET_PINS,
+            grandfather_pins: hipfire_registry::GRANDFATHERED_MONOLITHICS,
+            present: &absent,
+        };
+        plan_items_no_ep(
+            &ctx,
+            &PullChoice::defaults(tag, entry, &PullFlags::default()),
+            false,
+        )
+    }
+
+    #[test]
+    fn the_symtrunk_base_pull_plans_the_hc8_sidecar_beside_it() {
+        let registry = symtrunk_registry();
+        let pin = &hipfire_registry::HC8_SIDECAR_PINS[0];
+        for arch in ["gfx1201", ""] {
+            let items = hc8_plan_labels(&registry, "symtrunk:test", arch);
+            let hc8 = items.iter().find(|item| item.label == "hc8").unwrap();
+            assert_eq!(hc8.file, pin.file, "{arch:?}");
+            assert_eq!(hc8.size, Some(pin.size_bytes), "{arch:?}");
+        }
+        // Not wanted where the loader never applies it.
+        for arch in ["gfx1100", "gfx1151"] {
+            let items = hc8_plan_labels(&registry, "symtrunk:test", arch);
+            assert!(items.iter().all(|item| item.label != "hc8"), "{arch}");
+        }
+        assert!(hc8_sidecar_wanted(&["gfx1100".into(), "gfx1201".into()]));
+        assert!(!hc8_sidecar_wanted(&["gfx1100".into()]));
+    }
+
+    #[test]
+    fn the_stock_split_base_pull_plans_no_hc8_sidecar() {
+        let registry = stock_registry();
+        let items = hc8_plan_labels(&registry, "qwen3.8:flash", "gfx1201");
+        assert!(items.iter().all(|item| item.label != "hc8"));
     }
 
     const GF_MONO: &str = "qwen3.8-flash-next.mq4-xts";

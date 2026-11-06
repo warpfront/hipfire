@@ -2161,6 +2161,25 @@ fn pull_with_all_pins(
             );
         }
     }
+    if let Some(hc8) =
+        hipfire_registry::hc8_sidecar_in(identity, hipfire_registry::HC8_SIDECAR_PINS)
+    {
+        if pull_select::hc8_sidecar_wanted(&ple::local_gpu_arches()) {
+            fetch_registry_sidecar(
+                &VerifiedCache::in_home(&paths.root),
+                "HC8 sidecar",
+                hc8.repo,
+                &hc8.sidecar,
+                &hipfire_config::memory::hc8_sidecar_path(&model_path),
+                args.force,
+            );
+        } else {
+            eprintln!(
+                "  Skipping HC8 sidecar (no gfx1201 GPU detected; the loader applies it only on exact gfx1201): {}",
+                hc8.sidecar.file
+            );
+        }
+    }
     if choice.expert_hotset {
         if let Some(hotset) = hipfire_registry::expert_hotset_in(identity, hotset_pins) {
             fetch_registry_sidecar(

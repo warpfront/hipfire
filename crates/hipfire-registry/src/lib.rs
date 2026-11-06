@@ -23,9 +23,10 @@ use std::{
 use thiserror::Error;
 pub mod local_files;
 pub use local_files::{
-    is_expert_hotset_name, is_listable_model_file, is_model_file, is_ple_sidecar_name,
-    is_standalone_model, is_trunk_overlay_name, names_registry_model, probe_hfq_arch_id,
-    registry_sidecar_files, MODEL_SUFFIXES, PLE_AUX_SUFFIXES, SERVE_TRUNK_ARCH_IDS,
+    is_expert_hotset_name, is_hc8_sidecar_name, is_listable_model_file, is_model_file,
+    is_ple_sidecar_name, is_standalone_model, is_trunk_overlay_name, names_registry_model,
+    probe_hfq_arch_id, registry_sidecar_files, MODEL_SUFFIXES, PLE_AUX_SUFFIXES,
+    SERVE_TRUNK_ARCH_IDS,
 };
 pub mod xdna;
 pub use xdna::{XdnaManifest, XdnaProfile, XdnaSidecarDescriptor};
@@ -306,6 +307,70 @@ pub fn trunk_overlay_in(entry: &ModelEntry, pins: &[TrunkOverlayPin]) -> Option<
         })
 }
 
+/// Content identity of one HC8 sidecar and of the exact base artifact it is
+/// bound to.
+///
+/// The HC8 sidecar (`<base file>.hc8`) is an HFQM container of the base's
+/// hyper-connection mixer weights requantized to per-row-scaled E4M3
+/// (`hipfire_runtime::hc8_sidecar`); the Qwen4 loader applies it by default on
+/// exact gfx1201 (`HIPFIRE_QWEN4_HC8=0` is the kill switch) and binds it to the
+/// base's file length and index sha256. Like [`TrunkOverlayPin`], the pin lives
+/// in the client rather than in a registry field, keyed by the base identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hc8SidecarPin {
+    /// SHA-256 of the base artifact (the registry entry's `sha256`).
+    pub base_sha256: &'static str,
+    /// Size in bytes of the base artifact (the registry entry's `size_bytes`).
+    pub base_size: u64,
+    /// Hugging Face repo that hosts the sidecar file.
+    pub repo: &'static str,
+    /// Sidecar file name: the base file name plus
+    /// `hipfire_config::memory::HC8_SIDECAR_SUFFIX`.
+    pub file: &'static str,
+    /// SHA-256 of the sidecar file.
+    pub sha256: &'static str,
+    /// Size in bytes of the sidecar file.
+    pub size_bytes: u64,
+}
+
+/// HC8 sidecars known to this client, keyed by exact base artifact identity.
+pub const HC8_SIDECAR_PINS: &[Hc8SidecarPin] = &[
+    // The Flash-Next MQ4 XTS symmetric-trunk base.
+    Hc8SidecarPin {
+        base_sha256: "27dfff6692eba3385655959d134771fcff154c6279ab0a6c43cb8c7d81a7fa31",
+        base_size: 70_888_270_360,
+        repo: FLASH_NEXT_XTS_REPO,
+        file: "qwen3.8-flash-next-base.mq4-xts-symtrunk.hc8",
+        sha256: "2adf32e564f09efbe185c7ebf57483dc58103f21341569e716173098f0e2ee67",
+        size_bytes: 659_649_536,
+    },
+];
+
+/// A resolved HC8 sidecar: the repo that hosts it and its sidecar identity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Hc8Sidecar {
+    pub repo: &'static str,
+    pub sidecar: Sidecar,
+}
+
+/// The pin in `pins` whose base identity equals the entry's `sha256` and
+/// `size_bytes`, as a [`Hc8Sidecar`]. An entry without a pinned digest and
+/// size never matches.
+pub fn hc8_sidecar_in(entry: &ModelEntry, pins: &[Hc8SidecarPin]) -> Option<Hc8Sidecar> {
+    let sha256 = entry.sha256.as_deref()?;
+    let size_bytes = entry.size_bytes?;
+    pins.iter()
+        .find(|pin| pin.base_size == size_bytes && pin.base_sha256.eq_ignore_ascii_case(sha256))
+        .map(|pin| Hc8Sidecar {
+            repo: pin.repo,
+            sidecar: Sidecar {
+                file: pin.file.to_owned(),
+                sha256: Some(pin.sha256.to_owned()),
+                size_bytes: Some(pin.size_bytes),
+            },
+        })
+}
+
 /// A replacement artifact this client pulls in place of a published one.
 ///
 /// The published registry entry (repo, `file`, `sha256`, `size_bytes`) stays
@@ -560,7 +625,7 @@ pub struct RetiredModel {
 impl RetiredModel {
     /// The registry card the retired entry carried, so a verified local copy
     /// loads with the same identity, sampling defaults and sidecar pins (the
-    /// sha256/size keyed [`TRUNK_OVERLAY_PINS`] and [`EXPERT_HOTSET_PINS`]) it
+    /// sha256/size keyed [`TRUNK_OVERLAY_PINS`], [`HC8_SIDECAR_PINS`] and [`EXPERT_HOTSET_PINS`]) it
     /// had while published. It declares no sidecar slots.
     pub fn entry(&self) -> ModelEntry {
         ModelEntry {
@@ -871,6 +936,12 @@ impl ModelEntry {
     /// the compiled-in [`TRUNK_OVERLAY_PINS`]; `None` for every other entry.
     pub fn trunk_overlay(&self) -> Option<TrunkOverlay> {
         trunk_overlay_in(self, TRUNK_OVERLAY_PINS)
+    }
+
+    /// The Flash-Next HC8 sidecar of this entry's base artifact, from the
+    /// compiled-in [`HC8_SIDECAR_PINS`]; `None` for every other entry.
+    pub fn hc8_sidecar(&self) -> Option<Hc8Sidecar> {
+        hc8_sidecar_in(self, HC8_SIDECAR_PINS)
     }
 
     /// The Flash-Next expert-hotset sidecar of this entry's base artifact, from
@@ -2125,6 +2196,99 @@ mod tests {
         let mut other = split;
         other.sha256 = Some(digest('a'));
         assert!(other.trunk_overlay().is_none());
+    }
+
+    const SYMTRUNK_BASE_FILE: &str = "qwen3.8-flash-next-base.mq4-xts-symtrunk";
+
+    /// The published symmetric-trunk base the HC8 pin binds to.
+    fn symtrunk_base_entry() -> ModelEntry {
+        let pin = &HC8_SIDECAR_PINS[0];
+        ModelEntry {
+            file: SYMTRUNK_BASE_FILE.into(),
+            sha256: Some(pin.base_sha256.into()),
+            size_bytes: Some(pin.base_size),
+            ..stock_split_base_entry()
+        }
+    }
+
+    #[test]
+    fn hc8_sidecar_pin_names_the_base_file_plus_the_suffix() {
+        assert_eq!(HC8_SIDECAR_PINS.len(), 1);
+        let pin = &HC8_SIDECAR_PINS[0];
+        assert_eq!(
+            pin.file,
+            format!(
+                "{SYMTRUNK_BASE_FILE}{}",
+                hipfire_config::memory::HC8_SIDECAR_SUFFIX
+            )
+        );
+        assert_eq!(
+            pin.base_sha256,
+            "27dfff6692eba3385655959d134771fcff154c6279ab0a6c43cb8c7d81a7fa31"
+        );
+        assert_eq!(pin.base_size, FLASH_NEXT_XTS_SPLIT_BASE_SIZE);
+        assert_eq!(pin.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(
+            pin.sha256,
+            "2adf32e564f09efbe185c7ebf57483dc58103f21341569e716173098f0e2ee67"
+        );
+        assert_eq!(pin.size_bytes, 659_649_536);
+        for digest in [pin.base_sha256, pin.sha256] {
+            assert_eq!(digest.len(), 64);
+            assert!(digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        }
+        assert!(!pin.file.contains('/') && !pin.file.contains('\\'));
+    }
+
+    #[test]
+    fn hc8_sidecar_lookup_matches_the_symtrunk_base_identity_only() {
+        let entry = symtrunk_base_entry();
+        let hc8 = entry.hc8_sidecar().unwrap();
+        let pin = &HC8_SIDECAR_PINS[0];
+        assert_eq!(hc8.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(
+            hc8.sidecar,
+            Sidecar {
+                file: pin.file.into(),
+                sha256: Some(pin.sha256.into()),
+                size_bytes: Some(pin.size_bytes),
+            }
+        );
+        // Upper-case digests of the same base still match.
+        let mut upper = entry.clone();
+        upper.sha256 = upper.sha256.map(|sha| sha.to_ascii_uppercase());
+        assert!(upper.hc8_sidecar().is_some());
+        // The stock split base (a different artifact of the same size) has no pin.
+        assert!(stock_split_base_entry().hc8_sidecar().is_none());
+        assert_eq!(
+            stock_split_base_entry().size_bytes,
+            Some(HC8_SIDECAR_PINS[0].base_size)
+        );
+        // A different size or sha, or no pinned identity, never matches.
+        let mut other = entry.clone();
+        other.size_bytes = Some(pin.base_size - 1);
+        assert!(other.hc8_sidecar().is_none());
+        let mut other = entry.clone();
+        other.sha256 = Some(digest('a'));
+        assert!(other.hc8_sidecar().is_none());
+        let mut other = entry.clone();
+        other.sha256 = None;
+        assert!(other.hc8_sidecar().is_none());
+        let mut other = entry;
+        other.size_bytes = None;
+        assert!(other.hc8_sidecar().is_none());
+    }
+
+    #[test]
+    fn hc8_pin_does_not_bind_either_overlay_or_hotset_base() {
+        for pin in TRUNK_OVERLAY_PINS {
+            assert_ne!(pin.base_sha256, HC8_SIDECAR_PINS[0].base_sha256);
+        }
+        assert!(symtrunk_base_entry().trunk_overlay().is_none());
+        assert!(symtrunk_base_entry().expert_hotset().is_none());
+        assert!(hc8_sidecar_in(&symtrunk_base_entry(), &[]).is_none());
     }
 
     const EXPERT_HOTSET_FILE: &str = "qwen3.8-flash-next.mq4-xts.expert-hotset";
