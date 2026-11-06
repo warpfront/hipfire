@@ -206,11 +206,11 @@ static MOE_GU_C8_PM: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_GU_C8_PM", true));
 
 /// Persistent workgroup counts of the c8 gate/up module per entry: the resident capacity of each on
-/// gfx1201 (r8: 232 VGPRs, 6 waves/SIMD = 3 workgroups/WGP x 32 WGPs = 96; r4: 176 VGPRs, 8 waves/SIMD =
-/// 128). More workgroups than fit run as a second, mostly idle wave (served rocprof j8197: r8 at 128
-/// blocks 389 us vs 326 us at 96 per 41..=48-row launch).
-pub const MOE_GU_C8_PM_BLOCKS_R8: u32 = 96;
-pub const MOE_GU_C8_PM_BLOCKS_R4: u32 = 128;
+/// gfx1201 (r8: 192 VGPRs, 8 waves/SIMD = 4 workgroups/WGP x 32 WGPs = 128; r4: 136 VGPRs, 11 waves/SIMD =
+/// 5 workgroups/WGP = 160). More workgroups than fit run as a second, mostly idle wave (served rocprof
+/// j8197, 232-VGPR r8: 389 us at 128 blocks vs 326 us at 96 per 41..=48-row launch).
+pub const MOE_GU_C8_PM_BLOCKS_R8: u32 = 128;
+pub const MOE_GU_C8_PM_BLOCKS_R4: u32 = 160;
 
 /// `HIPFIRE_QWEN4_MOE_GU_C8_PM_BLOCKS`: overrides the persistent workgroup count of both c8 gate/up
 /// entries (unset: [`MOE_GU_C8_PM_BLOCKS_R8`] / [`MOE_GU_C8_PM_BLOCKS_R4`]; clamped to 1..=4096). Read once.
@@ -221,11 +221,12 @@ static MOE_GU_C8_PM_BLOCKS: LazyLock<Option<u32>> = LazyLock::new(|| {
         .map(|n| n.clamp(1, 4096))
 });
 
-/// Source-row counts the c8 gate/up module is routed at: 9..=16 (`r4`) and from 33 (`r8`). Served
-/// rocprof (j8197, kill switch vs module, per launch): rows 9..=16 0.94, 41..=48 0.87, 33..=40 0.96;
-/// rows 17..=32 stay on hipcc (1.03 at 96 workgroups, 1.21 at 128).
+/// Source-row counts the c8 gate/up module is routed at: every `g32` row count (9 and up). Served rocprof
+/// of the 192-VGPR r8 / 136-VGPR r4 module (j8226, kill switch vs module, per launch): 41..=48 rows 0.75,
+/// 33..=40 0.70, 9..=16 0.85; 17..=32 (j8231, normalised by the same loads' hipcc down) about 0.87; card
+/// oracle cold-ish timing 0.89..=0.97 at every row count.
 pub fn moe_gu_c8_pm_rows(rows: usize) -> bool {
-    (9..=16).contains(&rows) || rows >= 33
+    rows >= 9
 }
 
 /// Entry symbols of [`kernels::QWEN4_MOE_GU_C8_PM_GFX1201`]: source rows above 16 (`r8`) and 9..=16 (`r4`).
