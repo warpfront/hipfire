@@ -181,3 +181,8 @@ required-features = ["lab"]
 [[example]]
 name = "hcwmma_screen"
 required-features = ["lab"]
+
+# HC8: 8-bit HC mixer weights (rdna_compute::hc8, PM module hc8_wmma_pm_gfx1201) vs BF16 incumbents.
+[[example]]
+name = "hc8_screen"
+required-features = ["lab"]

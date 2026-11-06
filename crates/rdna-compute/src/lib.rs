@@ -73,6 +73,7 @@ pub mod ggml_ops;
 mod gpu_test;
 pub mod graph;
 pub mod grouped_ops;
+pub mod hc8;
 pub mod hc_row_fold;
 pub mod head_lanes;
 pub mod iu4_c8_pm;
