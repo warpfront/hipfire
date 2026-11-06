@@ -756,6 +756,64 @@ fn four_thousand_eight_hundred_entries_check_fast() {
     assert!(start.elapsed().as_secs_f64() < 5.0);
 }
 
+/// A one-task span list over a `(gx, gy, gz)` grid of the footprint over x, y
+/// and z.
+fn big_grid(gx: u32, gy: u32, gz: u32) -> Spec {
+    let mut spec = Spec::std(1, gx, gy).template(T_TILE_XYZ);
+    for t in spec.pools[1].iter_mut().filter(|t| t.flags != 0) {
+        t.gz = gz;
+    }
+    spec
+}
+
+#[test]
+fn a_span_grid_must_fit_the_dispatchers_yz_packing_and_bitmap_index() {
+    // Boundaries admitted: y or z extent exactly 65536, the grid exactly 2^32.
+    big_grid(2, 65_536, 1).build().unwrap().check().unwrap();
+    big_grid(2, 1, 65_536).build().unwrap().check().unwrap();
+    let mut fx = big_grid(65_536, 65_536, 1).build().unwrap();
+    let bitmap = fx.data(BITMAP);
+    fx.program.resources[bitmap.0 as usize].bytes = 1 << 30;
+    fx.check().unwrap();
+    // One past each is refused.
+    for (grid, what) in [
+        ((1, 65_537, 1), "y"),
+        ((1, 1, 65_537), "z"),
+        ((65_536, 65_536, 2), "2^32"),
+        ((65_537, 65_536, 1), "2^32"),
+    ] {
+        let err = refused(big_grid(grid.0, grid.1, grid.2));
+        assert!(
+            err.contains("exceeds what the dispatcher encodes exactly"),
+            "{what} {grid:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn a_static_instance_grid_must_fit_the_dispatchers_yz_packing() {
+    let two = |gy: u32, gz: u32| {
+        let mut tasks = vec![
+            tile(T_TILE_XYZ, 0, 0, 0, 2, 4, gy),
+            tile(T_TILE_XYZ, 0, 2, 0, 2, 4, gy),
+        ];
+        for t in &mut tasks {
+            t.gz = gz;
+        }
+        tasks
+    };
+    for (gy, gz) in [(65_536, 1), (1, 65_536)] {
+        tiles(T_TILE_XYZ, two(gy, gz), region_wg_protocol()).unwrap();
+    }
+    for (gy, gz) in [(65_537, 1), (1, 65_537)] {
+        let err = tiles(T_TILE_XYZ, two(gy, gz), region_wg_protocol()).unwrap_err();
+        assert!(
+            err.contains("16-bit y/z workgroup packing"),
+            "{gy} {gz}: {err}"
+        );
+    }
+}
+
 #[cfg(feature = "lab")]
 mod lab {
     use super::*;
