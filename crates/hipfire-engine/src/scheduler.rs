@@ -1315,6 +1315,9 @@ pub struct BatchLaneDoneMetrics {
     pub prefill_tok_s: f64,
     pub tok_s: f64,
     pub decode_tok_s: f64,
+    /// Measured decode wall time (first token to finish), the span
+    /// `decode_tok_s` divides by; 0 without a first-token stamp.
+    pub decode_ms: f64,
 }
 
 pub fn batch_lane_done_metrics(
@@ -1354,13 +1357,16 @@ pub fn batch_lane_done_metrics(
 
     // Decode rate over the post-first-token interval. Zero/one-token and missing
     // first-token stamps stay finite zero (no positive span to amortize).
-    let decode_tok_s = match first_token_at {
-        Some(ft) if generated > 0 => {
-            let decode_s = finished_at.saturating_duration_since(ft).as_secs_f64();
-            batch_finite_rate(generated, decode_s)
-        }
+    let decode_s = match first_token_at {
+        Some(ft) if generated > 0 => finished_at.saturating_duration_since(ft).as_secs_f64(),
         _ => 0.0,
     };
+    let decode_tok_s = if decode_s > 0.0 {
+        batch_finite_rate(generated, decode_s)
+    } else {
+        0.0
+    };
+    let decode_ms = decode_s * 1000.0;
 
     BatchLaneDoneMetrics {
         latency_ms: if latency_ms.is_finite() {
@@ -1377,6 +1383,11 @@ pub fn batch_lane_done_metrics(
         prefill_tok_s,
         tok_s,
         decode_tok_s,
+        decode_ms: if decode_ms.is_finite() {
+            decode_ms
+        } else {
+            0.0
+        },
     }
 }
 
