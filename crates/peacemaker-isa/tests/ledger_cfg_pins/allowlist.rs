@@ -195,730 +195,16 @@ pub const FINDINGS: &[Allow] = &[
         needle: "`v_ashrrev_i32_e32 v82, 31, v81` (after label `.LBB44`): needs Lgkm wait 0 (War { reg: \"v82\" })",
         why: "MODEL LIMITATION, not a claimed race: the ledger keeps a pending DS store's source VGPRs locked until its LGKMcnt wait and reports the first write of one on a CFG path with no such wait. The existing text replay documents that hipcc code reuses DS store sources under a hardware interlock (`ledger_replay::replay_hazards`: \"hardware-interlocked DS-source reuse the strict replay already flags\"), so this stricter-than-hardware lock is the ledger's model; that this exact reuse is interlocked, and that the path is feasible, is not established here",
     },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq4g256v2_moe_grouped_k2_pm_gfx1100.hxaco#gemm_mq4g256v2_moe_grouped_wmma_k2_pm_gfx1100",
+        needle: "`global_load_b128 v[9:12], v[19:20], off` (after label `.LBB26`): needs Vm wait 0 (Waw { reg: \"v[9:12]\" })",
+        why: "MODEL LIMITATION, not a claimed race: this younger global_load_b128 overwrites v[9:12], the destination of an older global_load_b128 v[9:12], v[9:10] (prologue, before the loop) that nothing read in between; two same-class in-order global loads return older first, and `s_waitcnt vmcnt(0) lgkmcnt(1)` follows before any consumer. The pending queue also holds two younger flat loads (flat_load_b128 v[13:16], flat_load_b32 v23), which the ledger models as unordered (in_order false, Vm and Lgkm), so it credits no nonzero vmcnt and asks for Vm wait 0 on the whole queue; the ledger has no representation of an ordered-load destination overwrite. That the path is feasible (loop count above one) and the hardware order of this exact pair are not established here",
+    },
 ];
 
 /// Inputs with no verification: a verifier refusal or a refusal upstream of it (lift region, pool).
 pub const UNSUPPORTED: &[Allow] = &[
-    Allow {
-        scope: "pins",
-        target: "gemm_mq4g256v2_moe_grouped_k2_pm_gfx1100.hxaco#gemm_mq4g256v2_moe_grouped_wmma_k2_pm_gfx1100",
-        needle: "a FlatLoad memory operation, which the wait ledger cannot track",
-        why: "UNSUPPORTED INPUT: a flat memory operation counts on both LOADcnt and DScnt, which the wait ledger does not model; the verifier refuses it, so this kernel is not verified",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:lane_rows_bf16_pm_gfx1201.co#gemv_bf16_xf32_k4_c1_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_k4_c1_pm_gfx1201: 99 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:lane_rows_bf16_pm_gfx1201.co#gemv_bf16_xf32_k4_rows_t8_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_k4_rows_t8_pm_gfx1201: 100 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:lane_rows_bf16_pm_gfx1201.co#gemv_bf16_xf32_k4_xbatch_r4_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_k4_xbatch_r4_pm_gfx1201: 99 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:lane_rows_bf16_pm_gfx1201.co#gemv_bf16_xf32_k4_xbatch_r8_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_k4_xbatch_r8_pm_gfx1201: 99 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:lane_rows_bf16_pm_gfx1201.hxaco#gemv_bf16_xf32_k4_c1_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_k4_c1_pm_gfx1201: 99 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:lane_rows_bf16_pm_gfx1201.hxaco#gemv_bf16_xf32_k4_rows_t8_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_k4_rows_t8_pm_gfx1201: 100 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:lane_rows_bf16_pm_gfx1201.hxaco#gemv_bf16_xf32_k4_xbatch_r4_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_k4_xbatch_r4_pm_gfx1201: 99 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:lane_rows_bf16_pm_gfx1201.hxaco#gemv_bf16_xf32_k4_xbatch_r8_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_k4_xbatch_r8_pm_gfx1201: 99 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:mq4_fp8_verify_pm_gfx1201.hxaco#mq4_fp8_verify_qkvza_pm_gfx1201_bt2w4",
-        needle: "pool refused: mq4_fp8_verify_qkvza_pm_gfx1201_bt2w4: 74 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:mq4_fp8_verify_pm_gfx1201.hxaco#mq4_fp8_verify_qkvza_pm_gfx1201_bt4w4",
-        needle: "pool refused: mq4_fp8_verify_qkvza_pm_gfx1201_bt4w4: 74 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:mq4_fp8_verify_pm_gfx1201.hxaco#mq4_fp8_verify_qkvza_pm_gfx1201_bt8w4",
-        needle: "pool refused: mq4_fp8_verify_qkvza_pm_gfx1201_bt8w4: 74 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:qwen4_moe_down_gp_p_pm_gfx1201.hxaco#qwen4_moe_down_iu4_sym_p_gp_pm_gfx1201_nt4",
-        needle: "pool refused: qwen4_moe_down_iu4_sym_p_gp_pm_gfx1201_nt4: 89 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:qwen4_moe_down_gp_p_pm_gfx1201.hxaco#qwen4_moe_down_iu4_sym_p_gp_pm_gfx1201_nt8",
-        needle: "pool refused: qwen4_moe_down_iu4_sym_p_gp_pm_gfx1201_nt8: 89 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:qwen4_moe_down_gp_pm_gfx1201.hxaco#qwen4_moe_down_iu4_sym_gp_pm_gfx1201_nt4",
-        needle: "pool refused: qwen4_moe_down_iu4_sym_gp_pm_gfx1201_nt4: 80 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:qwen4_moe_down_gp_pm_gfx1201.hxaco#qwen4_moe_down_iu4_sym_gp_pm_gfx1201_nt8",
-        needle: "pool refused: qwen4_moe_down_iu4_sym_gp_pm_gfx1201_nt8: 80 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:qwen4_moe_gu_few_pm_gfx1201.co#gemm_mq4g256v2p_moe_grouped_top10_o4_r2_x4_pm_r4_pad16_b128_altch",
-        needle: "pool refused: gemm_mq4g256v2p_moe_grouped_top10_o4_r2_x4_pm_r4_pad16_b128_altch: 95 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:qwen4_moe_gu_few_pm_gfx1201.hxaco#gemm_mq4g256v2p_moe_grouped_top10_o4_r2_x4_pm_r4_pad16_b128_altch",
-        needle: "pool refused: gemm_mq4g256v2p_moe_grouped_top10_o4_r2_x4_pm_r4_pad16_b128_altch: 95 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:qwen4_moe_iu4_sym_e8p_pm_gfx1201.hxaco#qwen4_moe_down_iu4_sym_e8p_pm_gfx1201",
-        needle: "pool refused: qwen4_moe_down_iu4_sym_e8p_pm_gfx1201: 88 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:qwen4_moe_iu4_sym_e8p_pm_gfx1201.hxaco#qwen4_moe_down_iu4_sym_e8p_pm_gfx1201_acc",
-        needle: "pool refused: qwen4_moe_down_iu4_sym_e8p_pm_gfx1201_acc: 88 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:qwen4_moe_iu4_sym_p_pm_gfx1201.hxaco#qwen4_moe_down_iu4_sym_p_pm_gfx1201_nt4",
-        needle: "pool refused: qwen4_moe_down_iu4_sym_p_pm_gfx1201_nt4: 89 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:qwen4_moe_iu4_sym_p_pm_gfx1201.hxaco#qwen4_moe_down_iu4_sym_p_pm_gfx1201_nt8",
-        needle: "pool refused: qwen4_moe_down_iu4_sym_p_pm_gfx1201_nt8: 89 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:qwen4_moe_iu4_sym_pm_gfx1201.hxaco#qwen4_moe_down_iu4_sym_pm_gfx1201_nt4",
-        needle: "pool refused: qwen4_moe_down_iu4_sym_pm_gfx1201_nt4: 80 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:qwen4_moe_iu4_sym_pm_gfx1201.hxaco#qwen4_moe_down_iu4_sym_pm_gfx1201_nt8",
-        needle: "pool refused: qwen4_moe_down_iu4_sym_pm_gfx1201_nt8: 80 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:qwen4_moe_iu4_sym_w3_pm_gfx1201.hxaco#qwen4_moe_down_iu4_sym_w3_pm_gfx1201",
-        needle: "pool refused: qwen4_moe_down_iu4_sym_w3_pm_gfx1201: 77 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b128:qwen4_moe_iu4_sym_w3_pm_gfx1201.hxaco#qwen4_moe_down_iu4_sym_w3_pm_gfx1201_acc",
-        needle: "pool refused: qwen4_moe_down_iu4_sym_w3_pm_gfx1201_acc: 77 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b256:dflash_sampled_accept_pm_gfx1201.hxaco#dflash_sampled_accept_sparse_q_f32_pm_gfx1201",
-        needle: "pool refused: dflash_sampled_accept_sparse_q_f32_pm_gfx1201: 102 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b256:gdn_chunk_prep_pm_gfx1201.hxaco#gdn_chunk_prep_pm_gfx1201",
-        needle: "pool refused: gdn_chunk_prep_pm_gfx1201: 92 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b256:lane_rows_bf16_pm_gfx1201.co#gemv_bf16_xf32_k4_xbatch_r4_wg8_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_k4_xbatch_r4_wg8_pm_gfx1201: 99 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b256:lane_rows_bf16_pm_gfx1201.co#gemv_bf16_xf32_k4_xbatch_r8_wg8_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_k4_xbatch_r8_wg8_pm_gfx1201: 99 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b256:lane_rows_bf16_pm_gfx1201.co#gemv_bf16_xf32_x4_xbatch_r4_wg8_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_x4_xbatch_r4_wg8_pm_gfx1201: 97 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b256:lane_rows_bf16_pm_gfx1201.co#gemv_bf16_xf32_x4_xbatch_r8_wg8_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_x4_xbatch_r8_wg8_pm_gfx1201: 97 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b256:lane_rows_bf16_pm_gfx1201.hxaco#gemv_bf16_xf32_k4_xbatch_r4_wg8_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_k4_xbatch_r4_wg8_pm_gfx1201: 99 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b256:lane_rows_bf16_pm_gfx1201.hxaco#gemv_bf16_xf32_k4_xbatch_r8_wg8_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_k4_xbatch_r8_wg8_pm_gfx1201: 99 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b256:lane_rows_bf16_pm_gfx1201.hxaco#gemv_bf16_xf32_x4_xbatch_r4_wg8_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_x4_xbatch_r4_wg8_pm_gfx1201: 97 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b256:lane_rows_bf16_pm_gfx1201.hxaco#gemv_bf16_xf32_x4_xbatch_r8_wg8_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_x4_xbatch_r8_wg8_pm_gfx1201: 97 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b256:mq4_fp8_verify_pm_gfx1201.hxaco#mq4_fp8_verify_qkvza_pm_gfx1201_bt2w8",
-        needle: "pool refused: mq4_fp8_verify_qkvza_pm_gfx1201_bt2w8: 74 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b256:mq4_fp8_verify_pm_gfx1201.hxaco#mq4_fp8_verify_qkvza_pm_gfx1201_bt4w8",
-        needle: "pool refused: mq4_fp8_verify_qkvza_pm_gfx1201_bt4w8: 74 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b256:mq4_fp8_verify_pm_gfx1201.hxaco#mq4_fp8_verify_qkvza_pm_gfx1201_bt8w8",
-        needle: "pool refused: mq4_fp8_verify_qkvza_pm_gfx1201_bt8w8: 74 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b256:qsa_gather_pm_gfx1201.hxaco#indexed_attention_kv_f16vb_fp8_pm_gfx1201",
-        needle: "pool refused: indexed_attention_kv_f16vb_fp8_pm_gfx1201: 73 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b256:spec_sampling_rows_parallel_pm_gfx1201.hxaco#spec_cpu_ar_rows_parallel_f32_pm_gfx1201",
-        needle: "pool refused: spec_cpu_ar_rows_parallel_f32_pm_gfx1201: 96 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:e8p_i4_moe_gemv_pm_gfx1201.co#e8p_i4_moe_gemv_r128_down",
-        needle: "pool refused: e8p_i4_moe_gemv_r128_down: 88 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:e8p_i4_moe_gemv_pm_gfx1201.co#e8p_i4_moe_gemv_r256_gate_up",
-        needle: "pool refused: e8p_i4_moe_gemv_r256_gate_up: 88 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:e8p_i4_moe_gemv_pm_gfx1201.hxaco#e8p_i4_moe_gemv_r128_down",
-        needle: "pool refused: e8p_i4_moe_gemv_r128_down: 88 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:e8p_i4_moe_gemv_pm_gfx1201.hxaco#e8p_i4_moe_gemv_r256_gate_up",
-        needle: "pool refused: e8p_i4_moe_gemv_r256_gate_up: 88 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:lane_rows_bf16_pm_gfx1201.co#gemv_bf16_xf32_rows_x4_t8_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_rows_x4_t8_pm_gfx1201: 100 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:lane_rows_bf16_pm_gfx1201.co#gemv_bf16_xf32_x4_c1_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_x4_c1_pm_gfx1201: 97 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:lane_rows_bf16_pm_gfx1201.co#gemv_bf16_xf32_x4_xbatch_r4_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_x4_xbatch_r4_pm_gfx1201: 97 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:lane_rows_bf16_pm_gfx1201.co#gemv_bf16_xf32_x4_xbatch_r8_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_x4_xbatch_r8_pm_gfx1201: 97 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:lane_rows_bf16_pm_gfx1201.hxaco#gemv_bf16_xf32_rows_x4_t8_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_rows_x4_t8_pm_gfx1201: 100 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:lane_rows_bf16_pm_gfx1201.hxaco#gemv_bf16_xf32_x4_c1_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_x4_c1_pm_gfx1201: 97 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:lane_rows_bf16_pm_gfx1201.hxaco#gemv_bf16_xf32_x4_xbatch_r4_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_x4_xbatch_r4_pm_gfx1201: 97 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:lane_rows_bf16_pm_gfx1201.hxaco#gemv_bf16_xf32_x4_xbatch_r8_pm_gfx1201",
-        needle: "pool refused: gemv_bf16_xf32_x4_xbatch_r8_pm_gfx1201: 97 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:lane_rows_mq6_pm_gfx1201.co#gemv_mq6g256v2_x4_xbatch_r8_pm_gfx1201",
-        needle: "pool refused: gemv_mq6g256v2_x4_xbatch_r8_pm_gfx1201: 80 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:lane_rows_mq6_pm_gfx1201.co#gemv_mq6g256v2_xbatch_r8_pm_gfx1201",
-        needle: "pool refused: gemv_mq6g256v2_xbatch_r8_pm_gfx1201: 80 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:lane_rows_mq6_pm_gfx1201.hxaco#gemv_mq6g256v2_x4_xbatch_r8_pm_gfx1201",
-        needle: "pool refused: gemv_mq6g256v2_x4_xbatch_r8_pm_gfx1201: 80 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:lane_rows_mq6_pm_gfx1201.hxaco#gemv_mq6g256v2_xbatch_r8_pm_gfx1201",
-        needle: "pool refused: gemv_mq6g256v2_xbatch_r8_pm_gfx1201: 80 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:mq4_fp8_verify_pm_gfx1201.hxaco#mq4_fp8_verify_qkvza_pm_gfx1201_bt1w1",
-        needle: "pool refused: mq4_fp8_verify_qkvza_pm_gfx1201_bt1w1: 74 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:mq4_rows_x4_pm_gfx1201.co#gemv_mq4g256v2_rows_x4_pm_gfx1201",
-        needle: "pool refused: gemv_mq4g256v2_rows_x4_pm_gfx1201: 80 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:mq4_rows_x4_pm_gfx1201.co#gemv_mq4g256v2_rows_x4_t8_pm_gfx1201",
-        needle: "pool refused: gemv_mq4g256v2_rows_x4_t8_pm_gfx1201: 80 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:mq4_rows_x4_pm_gfx1201.hxaco#gemv_mq4g256v2_rows_x4_pm_gfx1201",
-        needle: "pool refused: gemv_mq4g256v2_rows_x4_pm_gfx1201: 80 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:mq4_rows_x4_pm_gfx1201.hxaco#gemv_mq4g256v2_rows_x4_t8_pm_gfx1201",
-        needle: "pool refused: gemv_mq4g256v2_rows_x4_t8_pm_gfx1201: 80 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:mq_i4_moe_gemv_pm_gfx1201.co#mq_i4_moe_gemv_mq3i4_r128_down",
-        needle: "pool refused: mq_i4_moe_gemv_mq3i4_r128_down: 81 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:mq_i4_moe_gemv_pm_gfx1201.co#mq_i4_moe_gemv_mq3i4_r256_gate_up",
-        needle: "pool refused: mq_i4_moe_gemv_mq3i4_r256_gate_up: 81 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:mq_i4_moe_gemv_pm_gfx1201.co#mq_i4_moe_gemv_mq4sym_r128_down",
-        needle: "pool refused: mq_i4_moe_gemv_mq4sym_r128_down: 81 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:mq_i4_moe_gemv_pm_gfx1201.co#mq_i4_moe_gemv_mq4sym_r256_gate_up",
-        needle: "pool refused: mq_i4_moe_gemv_mq4sym_r256_gate_up: 81 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:mq_i4_moe_gemv_pm_gfx1201.hxaco#mq_i4_moe_gemv_mq3i4_r128_down",
-        needle: "pool refused: mq_i4_moe_gemv_mq3i4_r128_down: 81 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:mq_i4_moe_gemv_pm_gfx1201.hxaco#mq_i4_moe_gemv_mq3i4_r256_gate_up",
-        needle: "pool refused: mq_i4_moe_gemv_mq3i4_r256_gate_up: 81 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:mq_i4_moe_gemv_pm_gfx1201.hxaco#mq_i4_moe_gemv_mq4sym_r128_down",
-        needle: "pool refused: mq_i4_moe_gemv_mq4sym_r128_down: 81 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:mq_i4_moe_gemv_pm_gfx1201.hxaco#mq_i4_moe_gemv_mq4sym_r256_gate_up",
-        needle: "pool refused: mq_i4_moe_gemv_mq4sym_r256_gate_up: 81 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b32:spec_accept_ordered_pm_gfx1201.hxaco#spec_accept_ordered_u32_pm_gfx1201",
-        needle: "pool refused: spec_accept_ordered_u32_pm_gfx1201: 92 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b512:qwen4_ep_owner_assign_pm_gfx1201.hxaco#qwen4_ep_owner_assign_pm_gfx1201",
-        needle: "pool refused: qwen4_ep_owner_assign_pm_gfx1201: 96 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b64:qwen4_moe_iu4_sym_e8p_pm_gfx1201.hxaco#qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1201",
-        needle: "pool refused: qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1201: 88 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b64:qwen4_moe_iu4_sym_e8p_pm_gfx1201.hxaco#qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1201_acc",
-        needle: "pool refused: qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1201_acc: 88 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b64:qwen4_moe_iu4_sym_w3_pm_gfx1201.hxaco#qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1201",
-        needle: "pool refused: qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1201: 77 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "pool:b64:qwen4_moe_iu4_sym_w3_pm_gfx1201.hxaco#qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1201_acc",
-        needle: "pool refused: qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1201_acc: 79 SGPRs exceed the hosted limit 72",
-        why: "ld::pool refuses the region (it names more SGPRs than the hosted limit, BODY_SGPR_LIMIT 72, and needs SGPR renaming), so no pool exists for this kernel; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:e8p_i4_moe_gemv_pm_gfx1201.co#e8p_i4_moe_gemv_r128_down_t8",
-        needle: "not convertible: barrier participation: the paths from the per-wave branch of block 4 (Scc1 per-wave because of `s_cmp_ge_u32 [RegRef { kind: S, base:",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:e8p_i4_moe_gemv_pm_gfx1201.co#e8p_i4_moe_gemv_r256_gate_up_t8",
-        needle: "not convertible: barrier participation: the paths from the per-wave branch of block 4 (Scc1 per-wave because of `s_cmp_ge_u32 [RegRef { kind: S, base:",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:e8p_i4_moe_gemv_pm_gfx1201.hxaco#e8p_i4_moe_gemv_r128_down_t8",
-        needle: "not convertible: barrier participation: the paths from the per-wave branch of block 4 (Scc1 per-wave because of `s_cmp_ge_u32 [RegRef { kind: S, base:",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:e8p_i4_moe_gemv_pm_gfx1201.hxaco#e8p_i4_moe_gemv_r256_gate_up_t8",
-        needle: "not convertible: barrier participation: the paths from the per-wave branch of block 4 (Scc1 per-wave because of `s_cmp_ge_u32 [RegRef { kind: S, base:",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:fa_prefill_fp8_pm_gfx1201.hxaco#attention_fp8_e4m3_fa2_gqa_f16_pm_gfx1201",
-        needle: "not convertible: barrier participation: block 8 repeats a barrier on a cycle under the per-wave branch of block 5 (Scc1 per-wave because of `s_cmp_lt_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:fa_prefill_pm_gfx1201.hxaco#attention_q8_0_fa2_gqa_pm_gfx1201",
-        needle: "not convertible: barrier participation: block 8 repeats a barrier on a cycle under the per-wave branch of block 5 (Scc1 per-wave because of `s_cmp_lt_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:fa_qresident_a3b_pm_gfx1201.hxaco#attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_pm_gfx1201",
-        needle: "not convertible: barrier participation: block 61 repeats a barrier on a cycle under the per-wave branch of block 8 (Scc1 per-wave because of `s_cmp_lt",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:fa_qresident_a3b_pm_gfx1201.hxaco#attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_pm_gfx1201",
-        needle: "not convertible: barrier participation: block 61 repeats a barrier on a cycle under the per-wave branch of block 8 (Scc1 per-wave because of `s_cmp_lt",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco#gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1",
-        needle: "not convertible: barrier participation: block 3 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco#gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1_bf16",
-        needle: "not convertible: barrier participation: block 3 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco#gemm_mq4g256v2_residual_mmq_iu4_full_add_b1",
-        needle: "not convertible: barrier participation: block 3 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco#gemm_mq4g256v2_residual_mmq_iu4_full_add_sigmoid_b1",
-        needle: "not convertible: barrier participation: block 3 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco#gemm_mq4g256v2_residual_mmq_iu4_full_set_b1",
-        needle: "not convertible: barrier participation: block 3 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco#gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1",
-        needle: "not convertible: barrier participation: block 3 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1_control.hxaco#gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1",
-        needle: "not convertible: barrier participation: block 3 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1_control.hxaco#gemm_mq4g256v2_residual_mmq_iu4_full_add_b1",
-        needle: "not convertible: barrier participation: block 3 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1_control.hxaco#gemm_mq4g256v2_residual_mmq_iu4_full_set_b1",
-        needle: "not convertible: barrier participation: block 3 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco#gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s",
-        needle: "not convertible: barrier participation: block 3 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco#gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s_bf16",
-        needle: "not convertible: barrier participation: block 3 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco#gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s_v64",
-        needle: "not convertible: barrier participation: block 5 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco#gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s",
-        needle: "not convertible: barrier participation: block 3 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco#gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s_v64",
-        needle: "not convertible: barrier participation: block 5 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco#gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
-        needle: "not convertible: barrier participation: block 3 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco#gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s_v64",
-        needle: "not convertible: barrier participation: block 5 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco#gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",
-        needle: "not convertible: barrier participation: block 3 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco#gemm_mq4g256v2_residual_mmq_iu4_qkvzaset_b1s",
-        needle: "not convertible: barrier participation: block 3 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco#gemm_mq4g256v2_residual_mmq_iu4_qkvzaset_b1s_v64",
-        needle: "not convertible: barrier participation: block 5 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_add_k128_b1",
-        needle: "not convertible: barrier participation: block 2 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_add_row_b1",
-        needle: "not convertible: barrier participation: block 2 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_qkv_k128_b1",
-        needle: "not convertible: barrier participation: block 2 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_qkv_row_b1",
-        needle: "not convertible: barrier participation: block 2 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_qkvza_k128_b1",
-        needle: "not convertible: barrier participation: block 2 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_qkvza_row_b1",
-        needle: "not convertible: barrier participation: block 2 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_qkvzagdn_row_b1",
-        needle: "not convertible: barrier participation: block 2 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_set_k128_b1",
-        needle: "not convertible: barrier participation: block 2 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_set_row_b1",
-        needle: "not convertible: barrier participation: block 2 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_silu_k128_b1",
-        needle: "not convertible: barrier participation: block 2 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_silu_row_b1",
-        needle: "not convertible: barrier participation: block 2 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_silu_row_b1_bf16",
-        needle: "not convertible: barrier participation: block 2 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq6g256v2_mmq_i8_pm_gfx1201.hxaco#gemm_mq6g256v2_mmq_i8_pm_set_bf16_gfx1201",
-        needle: "not convertible: barrier participation: block 3 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq6g256v2_mmq_i8_pm_gfx1201.hxaco#gemm_mq6g256v2_mmq_i8_pm_set_bf16_gfx1201_t128x256",
-        needle: "not convertible: barrier participation: block 3 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq6g256v2_mmq_i8_pm_gfx1201.hxaco#gemm_mq6g256v2_mmq_i8_pm_set_gfx1201",
-        needle: "not convertible: barrier participation: block 3 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq6g256v2_mmq_i8_pm_gfx1201.hxaco#gemm_mq6g256v2_mmq_i8_pm_set_gfx1201_t128x256",
-        needle: "not convertible: barrier participation: block 3 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:gemm_mq6g256v2_mmq_i8_pm_gfx1201.hxaco#gemm_mq6g256v2_mmq_i8_pm_set_nr_gfx1201_t256x128",
-        needle: "not convertible: barrier participation: block 3 repeats a barrier on a cycle under the per-wave branch of block 0 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
     Allow {
         scope: "pools",
         target: "region:ggml_convert_shim_gfx1201.co#ggml_dequant_q8_0_f16_gfx1201",
@@ -987,123 +273,9 @@ pub const UNSUPPORTED: &[Allow] = &[
     },
     Allow {
         scope: "pools",
-        target: "region:mq_i4_moe_gemv_pm_gfx1201.co#mq_i4_moe_gemv_mq3i4_r128_down_t8",
-        needle: "not convertible: barrier participation: block 25 repeats a barrier on a cycle under the per-wave branch of block 15 (Vccnz per-wave because of `v_cmp_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:mq_i4_moe_gemv_pm_gfx1201.co#mq_i4_moe_gemv_mq3i4_r256_gate_up_t8",
-        needle: "not convertible: barrier participation: block 25 repeats a barrier on a cycle under the per-wave branch of block 15 (Vccnz per-wave because of `v_cmp_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:mq_i4_moe_gemv_pm_gfx1201.co#mq_i4_moe_gemv_mq4sym_r128_down_t8",
-        needle: "not convertible: barrier participation: block 25 repeats a barrier on a cycle under the per-wave branch of block 15 (Vccnz per-wave because of `v_cmp_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:mq_i4_moe_gemv_pm_gfx1201.co#mq_i4_moe_gemv_mq4sym_r256_gate_up_t8",
-        needle: "not convertible: barrier participation: block 25 repeats a barrier on a cycle under the per-wave branch of block 15 (Vccnz per-wave because of `v_cmp_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:mq_i4_moe_gemv_pm_gfx1201.hxaco#mq_i4_moe_gemv_mq3i4_r128_down_t8",
-        needle: "not convertible: barrier participation: block 25 repeats a barrier on a cycle under the per-wave branch of block 15 (Vccnz per-wave because of `v_cmp_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:mq_i4_moe_gemv_pm_gfx1201.hxaco#mq_i4_moe_gemv_mq3i4_r256_gate_up_t8",
-        needle: "not convertible: barrier participation: block 25 repeats a barrier on a cycle under the per-wave branch of block 15 (Vccnz per-wave because of `v_cmp_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:mq_i4_moe_gemv_pm_gfx1201.hxaco#mq_i4_moe_gemv_mq4sym_r128_down_t8",
-        needle: "not convertible: barrier participation: block 25 repeats a barrier on a cycle under the per-wave branch of block 15 (Vccnz per-wave because of `v_cmp_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:mq_i4_moe_gemv_pm_gfx1201.hxaco#mq_i4_moe_gemv_mq4sym_r256_gate_up_t8",
-        needle: "not convertible: barrier participation: block 25 repeats a barrier on a cycle under the per-wave branch of block 15 (Vccnz per-wave because of `v_cmp_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:qsa_gather_pm_gfx1201.hxaco#indexed_attention_gathered_wmma_f16_pm_gfx1201",
-        needle: "not convertible: barrier participation: block 8 repeats a barrier on a cycle under the per-wave branch of block 5 (Scc1 per-wave because of `s_cmp_eq_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
         target: "region:qwen4_ep_owner_assign_pinned_pm_gfx1201.hxaco#qwen4_ep_owner_assign_pinned_pm_gfx1201",
         needle: "not convertible: input SGPRs s102/s103 collide with the body's s0..s104",
         why: "lift_region refuses the kernel (the input SGPRs s102/s103 collide with the body's registers), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:qwen4_moe_down_c8_pm_gfx1201.co#qwen4_moe_down_a8_grouped_planar_nodz_pm_persist_gfx1201",
-        needle: "not convertible: barrier participation: block 7 repeats a barrier on a cycle under the per-wave branch of block 5 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:qwen4_moe_down_c8_pm_gfx1201.hxaco#qwen4_moe_down_a8_grouped_planar_nodz_pm_persist_gfx1201",
-        needle: "not convertible: barrier participation: block 7 repeats a barrier on a cycle under the per-wave branch of block 5 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:qwen4_moe_gu_c8_pm_gfx1201.co#gemm_mq4g256v2p_moe_grouped_top10_g32_r4_nodz_pm_persist",
-        needle: "not convertible: barrier participation: block 6 repeats a barrier on a cycle under the per-wave branch of block 1 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:qwen4_moe_gu_c8_pm_gfx1201.co#gemm_mq4g256v2p_moe_grouped_top10_g32_r8_nodz_pm_persist",
-        needle: "not convertible: barrier participation: block 6 repeats a barrier on a cycle under the per-wave branch of block 1 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:qwen4_moe_gu_c8_pm_gfx1201.hxaco#gemm_mq4g256v2p_moe_grouped_top10_g32_r4_nodz_pm_persist",
-        needle: "not convertible: barrier participation: block 6 repeats a barrier on a cycle under the per-wave branch of block 1 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:qwen4_moe_gu_c8_pm_gfx1201.hxaco#gemm_mq4g256v2p_moe_grouped_top10_g32_r8_nodz_pm_persist",
-        needle: "not convertible: barrier participation: block 6 repeats a barrier on a cycle under the per-wave branch of block 1 (Scc1 per-wave because of `s_cmp_ge_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:qwen4_moe_iu4_sym_p_pm_gfx1201.hxaco#qwen4_moe_gate_up_silu_iu4_sym_p_pm_gfx1201_nt4",
-        needle: "not convertible: barrier participation: the paths from the per-wave branch of block 5 (Scc1 per-wave because of `s_cmp_lg_u32 [RegRef { kind: S, base:",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:qwen4_moe_iu4_sym_p_pm_gfx1201.hxaco#qwen4_moe_gate_up_silu_iu4_sym_p_pm_gfx1201_nt8",
-        needle: "not convertible: barrier participation: block 7 repeats a barrier on a cycle under the per-wave branch of block 5 (Scc1 per-wave because of `s_cmp_lg_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:qwen4_moe_iu4_sym_pm_gfx1201.hxaco#qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4",
-        needle: "not convertible: barrier participation: the paths from the per-wave branch of block 5 (Scc1 per-wave because of `s_cmp_lg_u32 [RegRef { kind: S, base:",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
-    },
-    Allow {
-        scope: "pools",
-        target: "region:qwen4_moe_iu4_sym_pm_gfx1201.hxaco#qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8",
-        needle: "not convertible: barrier participation: block 7 repeats a barrier on a cycle under the per-wave branch of block 5 (Scc1 per-wave because of `s_cmp_lg_",
-        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
     },
     Allow {
         scope: "pools",
@@ -1122,6 +294,240 @@ pub const UNSUPPORTED: &[Allow] = &[
         target: "region:qwen4_mq6_x4_pm_gfx1201.hxaco#qwen4_mq6_x4_pm_gfx1201_w8",
         needle: "not convertible: `v_pk_fma_f16 v184, v208, v212, v208` does not re-encode to its words [cc0e60b8, 1743a9d0] (g",
         why: "lift_region refuses the kernel (the printed instruction does not re-encode to its original words), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:e8p_i4_moe_gemv_pm_gfx1201.co#e8p_i4_moe_gemv_r256_gate_up_t8",
+        needle: "not convertible: barrier participation: the paths from the per-wave branch of block 4 (EXEC Full; Scc1 on a per-wave SCC) to its post-dominator (the exit) pass different numbers of barriers {(0, 0), (0, 2)}; a 8-wave region would pair a barrier with another wave's dispatcher barrier",
+        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:e8p_i4_moe_gemv_pm_gfx1201.co#e8p_i4_moe_gemv_r128_down_t8",
+        needle: "not convertible: barrier participation: the paths from the per-wave branch of block 4 (EXEC Full; Scc1 on a per-wave SCC) to its post-dominator (the exit) pass different numbers of barriers {(0, 0), (0, 2)}; a 8-wave region would pair a barrier with another wave's dispatcher barrier",
+        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:e8p_i4_moe_gemv_pm_gfx1201.hxaco#e8p_i4_moe_gemv_r256_gate_up_t8",
+        needle: "not convertible: barrier participation: the paths from the per-wave branch of block 4 (EXEC Full; Scc1 on a per-wave SCC) to its post-dominator (the exit) pass different numbers of barriers {(0, 0), (0, 2)}; a 8-wave region would pair a barrier with another wave's dispatcher barrier",
+        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:e8p_i4_moe_gemv_pm_gfx1201.hxaco#e8p_i4_moe_gemv_r128_down_t8",
+        needle: "not convertible: barrier participation: the paths from the per-wave branch of block 4 (EXEC Full; Scc1 on a per-wave SCC) to its post-dominator (the exit) pass different numbers of barriers {(0, 0), (0, 2)}; a 8-wave region would pair a barrier with another wave's dispatcher barrier",
+        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:fa_prefill_fp8_pm_gfx1201.hxaco#attention_fp8_e4m3_fa2_gqa_f16_pm_gfx1201",
+        needle: "not convertible: barrier participation: block 8 repeats a barrier on a cycle under the per-wave branch of block 5 (EXEC Full; Scc1 on a per-wave SCC)",
+        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:fa_prefill_pm_gfx1201.hxaco#attention_q8_0_fa2_gqa_pm_gfx1201",
+        needle: "not convertible: barrier participation: block 8 repeats a barrier on a cycle under the per-wave branch of block 5 (EXEC Full; Scc1 on a per-wave SCC)",
+        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:fa_qresident_a3b_pm_gfx1201.hxaco#attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_pm_gfx1201",
+        needle: "not convertible: barrier participation: block 61 repeats a barrier on a cycle under the per-wave branch of block 8 (EXEC Full; Scc1 on a per-wave SCC)",
+        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:fa_qresident_a3b_pm_gfx1201.hxaco#attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_pm_gfx1201",
+        needle: "not convertible: barrier participation: block 61 repeats a barrier on a cycle under the per-wave branch of block 8 (EXEC Full; Scc1 on a per-wave SCC)",
+        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco#gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1",
+        needle: "not convertible: input SGPRs s102/s103 collide with the body's s0..s103",
+        why: "lift_region refuses the kernel (the input SGPRs s102/s103 collide with the body's registers), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco#gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",
+        needle: "not convertible: input SGPRs s102/s103 collide with the body's s0..s103",
+        why: "lift_region refuses the kernel (the input SGPRs s102/s103 collide with the body's registers), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_set_row_b1",
+        needle: "not convertible: input SGPRs s102/s103 collide with the body's s0..s104",
+        why: "lift_region refuses the kernel (the input SGPRs s102/s103 collide with the body's registers), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_add_row_b1",
+        needle: "not convertible: input SGPRs s102/s103 collide with the body's s0..s104",
+        why: "lift_region refuses the kernel (the input SGPRs s102/s103 collide with the body's registers), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_silu_row_b1",
+        needle: "not convertible: input SGPRs s102/s103 collide with the body's s0..s104",
+        why: "lift_region refuses the kernel (the input SGPRs s102/s103 collide with the body's registers), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_qkv_row_b1",
+        needle: "not convertible: input SGPRs s102/s103 collide with the body's s0..s104",
+        why: "lift_region refuses the kernel (the input SGPRs s102/s103 collide with the body's registers), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_qkvza_row_b1",
+        needle: "not convertible: input SGPRs s102/s103 collide with the body's s0..s104",
+        why: "lift_region refuses the kernel (the input SGPRs s102/s103 collide with the body's registers), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_set_k128_b1",
+        needle: "not convertible: input SGPRs s102/s103 collide with the body's s0..s104",
+        why: "lift_region refuses the kernel (the input SGPRs s102/s103 collide with the body's registers), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_add_k128_b1",
+        needle: "not convertible: input SGPRs s102/s103 collide with the body's s0..s104",
+        why: "lift_region refuses the kernel (the input SGPRs s102/s103 collide with the body's registers), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_silu_k128_b1",
+        needle: "not convertible: input SGPRs s102/s103 collide with the body's s0..s104",
+        why: "lift_region refuses the kernel (the input SGPRs s102/s103 collide with the body's registers), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_qkv_k128_b1",
+        needle: "not convertible: input SGPRs s102/s103 collide with the body's s0..s104",
+        why: "lift_region refuses the kernel (the input SGPRs s102/s103 collide with the body's registers), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_qkvza_k128_b1",
+        needle: "not convertible: input SGPRs s102/s103 collide with the body's s0..s104",
+        why: "lift_region refuses the kernel (the input SGPRs s102/s103 collide with the body's registers), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_silu_row_b1_bf16",
+        needle: "not convertible: input SGPRs s102/s103 collide with the body's s0..s104",
+        why: "lift_region refuses the kernel (the input SGPRs s102/s103 collide with the body's registers), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco#gemm_mq4g256v2_fp8_qkvzagdn_row_b1",
+        needle: "not convertible: input SGPRs s102/s103 collide with the body's s0..s104",
+        why: "lift_region refuses the kernel (the input SGPRs s102/s103 collide with the body's registers), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:mq_i4_moe_gemv_pm_gfx1201.co#mq_i4_moe_gemv_mq3i4_r256_gate_up_t8",
+        needle: "not convertible: barrier participation: block 25 repeats a barrier on a cycle under the per-wave branch of block 15 (EXEC Full; Vccnz on a per-wave VCC)",
+        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:mq_i4_moe_gemv_pm_gfx1201.co#mq_i4_moe_gemv_mq3i4_r128_down_t8",
+        needle: "not convertible: barrier participation: block 25 repeats a barrier on a cycle under the per-wave branch of block 15 (EXEC Full; Vccnz on a per-wave VCC)",
+        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:mq_i4_moe_gemv_pm_gfx1201.co#mq_i4_moe_gemv_mq4sym_r256_gate_up_t8",
+        needle: "not convertible: barrier participation: block 25 repeats a barrier on a cycle under the per-wave branch of block 15 (EXEC Full; Vccnz on a per-wave VCC)",
+        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:mq_i4_moe_gemv_pm_gfx1201.co#mq_i4_moe_gemv_mq4sym_r128_down_t8",
+        needle: "not convertible: barrier participation: block 25 repeats a barrier on a cycle under the per-wave branch of block 15 (EXEC Full; Vccnz on a per-wave VCC)",
+        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:mq_i4_moe_gemv_pm_gfx1201.hxaco#mq_i4_moe_gemv_mq3i4_r256_gate_up_t8",
+        needle: "not convertible: barrier participation: block 25 repeats a barrier on a cycle under the per-wave branch of block 15 (EXEC Full; Vccnz on a per-wave VCC)",
+        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:mq_i4_moe_gemv_pm_gfx1201.hxaco#mq_i4_moe_gemv_mq3i4_r128_down_t8",
+        needle: "not convertible: barrier participation: block 25 repeats a barrier on a cycle under the per-wave branch of block 15 (EXEC Full; Vccnz on a per-wave VCC)",
+        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:mq_i4_moe_gemv_pm_gfx1201.hxaco#mq_i4_moe_gemv_mq4sym_r256_gate_up_t8",
+        needle: "not convertible: barrier participation: block 25 repeats a barrier on a cycle under the per-wave branch of block 15 (EXEC Full; Vccnz on a per-wave VCC)",
+        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:mq_i4_moe_gemv_pm_gfx1201.hxaco#mq_i4_moe_gemv_mq4sym_r128_down_t8",
+        needle: "not convertible: barrier participation: block 25 repeats a barrier on a cycle under the per-wave branch of block 15 (EXEC Full; Vccnz on a per-wave VCC)",
+        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:qwen4_moe_gu_c8_pm_gfx1201.co#gemm_mq4g256v2p_moe_grouped_top10_g32_r8_nodz_pm_persist",
+        needle: "not convertible: input SGPRs s102/s103 collide with the body's s0..s104",
+        why: "lift_region refuses the kernel (the input SGPRs s102/s103 collide with the body's registers), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:qwen4_moe_gu_c8_pm_gfx1201.co#gemm_mq4g256v2p_moe_grouped_top10_g32_r4_nodz_pm_persist",
+        needle: "not convertible: input SGPRs s102/s103 collide with the body's s0..s104",
+        why: "lift_region refuses the kernel (the input SGPRs s102/s103 collide with the body's registers), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:qwen4_moe_gu_c8_pm_gfx1201.hxaco#gemm_mq4g256v2p_moe_grouped_top10_g32_r8_nodz_pm_persist",
+        needle: "not convertible: input SGPRs s102/s103 collide with the body's s0..s104",
+        why: "lift_region refuses the kernel (the input SGPRs s102/s103 collide with the body's registers), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:qwen4_moe_gu_c8_pm_gfx1201.hxaco#gemm_mq4g256v2p_moe_grouped_top10_g32_r4_nodz_pm_persist",
+        needle: "not convertible: input SGPRs s102/s103 collide with the body's s0..s104",
+        why: "lift_region refuses the kernel (the input SGPRs s102/s103 collide with the body's registers), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:qwen4_moe_iu4_sym_p_pm_gfx1201.hxaco#qwen4_moe_gate_up_silu_iu4_sym_p_pm_gfx1201_nt4",
+        needle: "not convertible: barrier participation: the paths from the per-wave branch of block 5 (EXEC Full; Scc1 on a per-wave SCC) to its post-dominator block 38 pass different numbers of barriers {(0, 0), (2, 2)}; a 4-wave region would pair a barrier with another wave's dispatcher barrier",
+        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:qwen4_moe_iu4_sym_p_pm_gfx1201.hxaco#qwen4_moe_gate_up_silu_iu4_sym_p_pm_gfx1201_nt8",
+        needle: "not convertible: barrier participation: block 7 repeats a barrier on a cycle under the per-wave branch of block 5 (EXEC Full; Scc1 on a per-wave SCC)",
+        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:qwen4_moe_iu4_sym_pm_gfx1201.hxaco#qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4",
+        needle: "not convertible: barrier participation: the paths from the per-wave branch of block 5 (EXEC Full; Scc1 on a per-wave SCC) to its post-dominator block 38 pass different numbers of barriers {(0, 0), (2, 2)}; a 4-wave region would pair a barrier with another wave's dispatcher barrier",
+        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:qwen4_moe_iu4_sym_pm_gfx1201.hxaco#qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8",
+        needle: "not convertible: barrier participation: block 7 repeats a barrier on a cycle under the per-wave branch of block 5 (EXEC Full; Scc1 on a per-wave SCC)",
+        why: "lift_region refuses the kernel (barrier participation is not provable under its per-wave branches), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "pool:b32:multi",
+        needle: "pool refused: no VGPR left to park dispatcher SGPRs",
+        why: "ld::pool refuses the multi-template pool (no VGPR is left to park the dispatcher's SGPRs for the hosted bodies combined), so no multi pool exists for this blockDim; every hosted body is still verified in its single-template pool; not a verifier finding",
     },
 ];
 
@@ -1154,14 +560,14 @@ pub struct PoolBody {
 /// Every hosted body whose strict verification reports, one entry per template (the walk
 /// reports the first). Each is the pool-hosted copy of an existing `pins` finding (same
 /// target, instruction, need and category; the label differs: `.LBBn` vs `.Lt<tid>b_n`),
-/// at the same pc. Sources: the strict pool run `artifact://97452` (its `POOL VERIFY
-/// FAILED` lines name templates 28, 34, 35, 38, 39, 40, 45, 46, 47, 48 with the pool pc;
-/// every one is 128 above the `pins` pc, the dispatcher's offset to the first body line)
-/// and, for templates 27, 33, 36, 37, 43, 44 whose pool stopped at the (since fixed)
-/// dispatcher T_READY finding before reaching the body, the `pins` rows
-/// (`local://ledger-join-finding.md` rows 2, 4, 3, 5, 14, 11; their pool pc is INFERRED
-/// from the same offset and is checked by the test, which fails on any mismatch). No entry
-/// is a proven race.
+/// at the same body pc. Template ids are those the single-template pools of the scan
+/// `artifact://98021` (observed on the prior `pmprereq/uniform` base, before the rebase onto
+/// the current beta with its new hc8 modules) reported: the gfx1201 ggml shim bodies moved
+/// from 33-48 to 55-70, templates 27 and 28 are unchanged. The next run on the rebased tree
+/// may enumerate the templates differently; a changed id then fails as an unlisted body
+/// finding plus a stale entry here and is fixed by editing the `tid` only (body pc, insn and
+/// need are the same). Witnesses: `local://ledger-join-finding.md`. No entry is a proven
+/// race, and there is no dispatcher entry.
 pub const POOL_BODY: &[PoolBody] = &[
     // pins row 2, W2
     PoolBody {
@@ -1184,7 +590,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 4
     PoolBody {
-        tid: 33,
+        tid: 55,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q4_k_f16_gfx1201",
         body_pc: 143,
         category: Category::ModelLimit,
@@ -1193,7 +599,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 6; artifact://97452 pm_pool_34 pc 271
     PoolBody {
-        tid: 34,
+        tid: 56,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q5_k_f16_gfx1201",
         body_pc: 143,
         category: Category::ModelLimit,
@@ -1202,7 +608,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 8, W4; artifact://97452 pm_pool_35 pc 323
     PoolBody {
-        tid: 35,
+        tid: 57,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q6_k_f16_gfx1201",
         body_pc: 195,
         category: Category::Candidate,
@@ -1211,7 +617,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 3, W3
     PoolBody {
-        tid: 36,
+        tid: 58,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_iq4_xs_f32_gfx1201",
         body_pc: 252,
         category: Category::Candidate,
@@ -1220,7 +626,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 5
     PoolBody {
-        tid: 37,
+        tid: 59,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q4_k_f32_gfx1201",
         body_pc: 152,
         category: Category::ModelLimit,
@@ -1229,7 +635,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 7; artifact://97452 pm_pool_38 pc 280
     PoolBody {
-        tid: 38,
+        tid: 60,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q5_k_f32_gfx1201",
         body_pc: 152,
         category: Category::ModelLimit,
@@ -1238,7 +644,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 9; artifact://97452 pm_pool_39 pc 289
     PoolBody {
-        tid: 39,
+        tid: 61,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q6_k_f32_gfx1201",
         body_pc: 161,
         category: Category::ModelLimit,
@@ -1247,7 +653,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 10, W5; artifact://97452 pm_pool_40 pc 295
     PoolBody {
-        tid: 40,
+        tid: 62,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q8_0_f32_gfx1201",
         body_pc: 167,
         category: Category::Candidate,
@@ -1256,7 +662,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 14
     PoolBody {
-        tid: 43,
+        tid: 65,
         target: "ggml_convert_shim_gfx1201.co#ggml_get_row_q4_k_f32_gfx1201",
         body_pc: 45,
         category: Category::ModelLimit,
@@ -1265,7 +671,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 11
     PoolBody {
-        tid: 44,
+        tid: 66,
         target: "ggml_convert_shim_gfx1201.co#ggml_get_row1_q4_k_f32_gfx1201",
         body_pc: 38,
         category: Category::ModelLimit,
@@ -1274,7 +680,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 15; artifact://97452 pm_pool_45 pc 173
     PoolBody {
-        tid: 45,
+        tid: 67,
         target: "ggml_convert_shim_gfx1201.co#ggml_get_row_q5_k_f32_gfx1201",
         body_pc: 45,
         category: Category::ModelLimit,
@@ -1283,7 +689,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 12; artifact://97452 pm_pool_46 pc 166
     PoolBody {
-        tid: 46,
+        tid: 68,
         target: "ggml_convert_shim_gfx1201.co#ggml_get_row1_q5_k_f32_gfx1201",
         body_pc: 38,
         category: Category::ModelLimit,
@@ -1292,7 +698,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 16; artifact://97452 pm_pool_47 pc 194
     PoolBody {
-        tid: 47,
+        tid: 69,
         target: "ggml_convert_shim_gfx1201.co#ggml_get_row_q6_k_f32_gfx1201",
         body_pc: 66,
         category: Category::ModelLimit,
@@ -1301,7 +707,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 13; artifact://97452 pm_pool_48 pc 146
     PoolBody {
-        tid: 48,
+        tid: 70,
         target: "ggml_convert_shim_gfx1201.co#ggml_get_row1_q6_k_f32_gfx1201",
         body_pc: 18,
         category: Category::ModelLimit,
