@@ -63,6 +63,7 @@ pub mod kernels {
     pub mod gdn_scan;
     pub mod gemm_uk;
     pub mod gemv_mq2_xbatch_pm_gfx1201;
+    pub mod hc8_wmma_gfx1201;
     pub mod iu4_c8_producer;
     pub mod iu4_fold;
     pub mod iu4_gemm;

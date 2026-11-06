@@ -137,6 +137,8 @@ const NATIVE_USAGE: &str = "       emit options: [--co FILE] [--bundle FILE [--h
           Q8 k2560 single accepts K>1536 divisible32, x2 only K2560; k320 and small-wide use the actual four-chain singleton)
        peacemaker-isa emit --kernel lane_rows_mq6_gfx1201|lane_rows_bf16_gfx1201 [--epi all] --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
          (lane_rows_mq6_pm_gfx1201 / lane_rows_bf16_pm_gfx1201: ten unchanged narrow exports then two t8 exports)
+       peacemaker-isa emit --kernel hc8_wmma_gfx1201 [--epi all|priority] --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
+         (hc8_wmma_pm_gfx1201: hc8_gemm_{e4m3|i8}_mw{MW}_kw{KW}_n{NT}_{set|act}, 80 exports for `all`; `priority` = e4m3 mw1kw16 and mw4kw1 n1 set/act only)
        peacemaker-isa emit --kernel mq4_rows_x4 [--epi entry|t8|all] --arch gfx1151|gfx1201|gfx1100 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
          (mq4_rows_x4_pm_<arch>: unchanged narrow plus t8 on gfx1151/gfx1201; gfx1100 has only the actual scalar-DAG t8 export, no narrow entry; no r16/r32 exports)
        peacemaker-isa emit --kernel qwen4_bf16_rows_wide [--epi t8|k4_t8|all] --arch gfx1151|gfx1100 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
@@ -869,6 +871,12 @@ fn row_image(kernel: &str, epi: &str, arch: Arch) -> Result<Option<RowImage>, St
                 kernels::lane_rows_bf16_gfx1201::MODULE.into()
             })
         }
+        "hc8_wmma_gfx1201" => {
+            if arch != Arch::Gfx1201 || !matches!(epi, "all" | "priority") {
+                return Err("hc8_wmma_gfx1201 requires --arch gfx1201 --epi all|priority".into());
+            }
+            RowImage::new(kernels::hc8_wmma_gfx1201::MODULE.into())
+        }
         "mq4_rows_x4" => RowImage::new(kernels::mq4_rows_x4::Spec::module(arch)),
         "qwen4_bf16_rows_wide" => RowImage::new(kernels::qwen4_bf16_rows_wide::module(arch)),
         "legacy_mq4_rowtiles" => {
@@ -1010,6 +1018,27 @@ fn row_image(kernel: &str, epi: &str, arch: Arch) -> Result<Option<RowImage>, St
                     rows(64),
                     empty(),
                 )?;
+            }
+        }
+        "hc8_wmma_gfx1201" => {
+            use kernels::hc8_wmma_gfx1201 as k;
+            let geos = if epi == "priority" {
+                k::priority_geos()
+            } else {
+                k::all_geos()
+            };
+            let (entries, _, _) = k::emit_geos(&geos)?;
+            for (g, e) in geos.iter().zip(entries) {
+                let grid = format!("M/{}", 16 * g.mw);
+                let contract = json!({
+                    "shape_domain": {
+                        "M": format!("M % {} == 0", 16 * g.mw),
+                        "K": format!("K % {} == 0 && M*K < 2^32", 32 * g.kw),
+                    },
+                    "kernarg": "q@0 s@8 x@16 y@24 u64; M@32 K@36 rows@40 u32; act_scale@44 f32",
+                    "arithmetic_recipe": "hc8 W8A16 BF16 WMMA; K split per wave, KW partials folded ascending in LDS; one v_mul by s[m]; act = lane_rows hc_act DAG",
+                });
+                image.push(e, [grid.as_str(), "1", "1"], rows(g.max_rows()), contract)?;
             }
         }
         "mq4_rows_x4" => {
