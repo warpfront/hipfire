@@ -7516,6 +7516,20 @@ mod tests {
     }
 
     #[test]
+    fn ep_mtp_experts_resident_is_on_unless_exactly_zero() {
+        use memory::parse_ep_mtp_experts_resident as parse;
+        assert!(parse(None) && parse(Some("")) && parse(Some("1")) && parse(Some("off")));
+        assert!(parse(Some("true")) && parse(Some("00")) && parse(Some("2")));
+        assert!(!parse(Some("0")) && !parse(Some(" 0 ")));
+        // The process snapshot of a test binary carries no knob: the default is on.
+        assert!(memory::ep_mtp_experts_resident());
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_EP_MTP_EXPERTS_RESIDENT").as_deref(),
+            Some("developer.ep_mtp_experts_resident")
+        );
+    }
+
+    #[test]
     fn qwen4_sp_is_a_typed_bool_developer_key_unset_follows_the_arch_default() {
         const KEY: &str = "developer.qwen4_sp";
         const ENV: &str = "HIPFIRE_QWEN4_SP";
@@ -11259,6 +11273,21 @@ pub mod memory {
 
     /// Pure truth table behind [`ep_share_host`]: only a trimmed `0` is off.
     pub fn parse_ep_share_host(raw: Option<&str>) -> bool {
+        raw.map(str::trim) != Some("0")
+    }
+
+    /// Developer kill switch `HIPFIRE_EP_MTP_EXPERTS_RESIDENT` for the expert-parallel
+    /// native-MTP head's routed experts: default on, each rank of an EP load (2 or more
+    /// ranks) with the head attached keeps ITS OWNED slice of them (experts `e % ranks ==
+    /// rank`, 256 of 512 on EP2) VRAM-resident, charged to the rank's expert budget before the
+    /// trunk unit ranking walk, instead of pinned host RAM read over PCIe on every decode
+    /// step. Exactly `0` restores the host-mapped head placement.
+    pub fn ep_mtp_experts_resident() -> bool {
+        parse_ep_mtp_experts_resident(process_value("HIPFIRE_EP_MTP_EXPERTS_RESIDENT").as_deref())
+    }
+
+    /// Pure truth table behind [`ep_mtp_experts_resident`]: only a trimmed `0` is off.
+    pub fn parse_ep_mtp_experts_resident(raw: Option<&str>) -> bool {
         raw.map(str::trim) != Some("0")
     }
 

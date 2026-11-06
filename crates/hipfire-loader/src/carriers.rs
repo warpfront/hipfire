@@ -959,13 +959,25 @@ impl Carrier for Qwen4Carrier {
                 eprintln!("{}", reserve_plan.describe());
             }
             // One receipt line per rank (rank-0 load log, beside the fit lines
-            // each rank prints) and the MTP head's placement.
+            // each rank prints) and the MTP head's placement (the owned slice
+            // VRAM-resident on every rank, or host-mapped with the reason).
             if let Some(units) = &plan.ep_units {
                 for line in units.receipt_lines() {
                     eprintln!("{line}");
                 }
+            }
+            if plan.ep_units.is_some() || split.mtp_experts.is_some() {
+                let why_host = if hipfire_config::memory::ep_mtp_experts_resident() {
+                    "no native MTP head attached on this load"
+                } else {
+                    "HIPFIRE_EP_MTP_EXPERTS_RESIDENT=0"
+                };
                 eprintln!(
-                    "qwen4 EP expert tier: the MTP head's experts stay host-mapped (today's placement, pinned on every rank)"
+                    "{}",
+                    hipfire_arch_qwen4::expert_residency::ep_mtp_experts_line(
+                        split.mtp_experts.as_ref(),
+                        why_host,
+                    )
                 );
             }
         }
@@ -2436,12 +2448,12 @@ fn qwen4_placement_inputs(
     // the head is still attached after it only where the host-mapped policy
     // keeps it (exact gfx1100 or gfx1201, or an explicit `--spec mtp`); only then does
     // it need VRAM.
-    let mtp_kept = native_mtp
-        && crate::admission::qwen4_mtp_with_host_mapped_experts(
-            spec,
-            &gpu.arch,
-            usize::from(routed_experts),
-        );
+    let mtp_kept = qwen4_mtp_kept(spec, &gpu.arch, native_mtp, routed_experts);
+    // `HIPFIRE_EP_MTP_EXPERTS_RESIDENT`: an EP rank keeps its owned slice of the head's routed
+    // experts in VRAM, so those bytes are replicated, non-expert-style charge of every rank:
+    // the unit ranking walk, the whole-layer split and each rank's own fit check all read this
+    // one `non_expert`, so the trunk's expert budget shrinks by exactly the owned bytes.
+    let ep_mtp = qwen4_ep_mtp_resident(weights, bytes_of, ranks, mtp_kept)?;
     let args = hipfire_arch_qwen4::expert_residency::PlacementInputsArgs {
         gpu,
         config,
@@ -2489,12 +2501,53 @@ fn qwen4_placement_inputs(
         }
     };
     Ok((
-        inputs.non_expert,
+        inputs
+            .non_expert
+            .saturating_add(ep_mtp.map_or(0, |mtp| mtp.bytes)),
         inputs.layer_experts,
         inputs.reserve,
         inputs.mtp_bytes,
         inputs.gather_bytes,
     ))
+}
+
+/// Whether the native MTP head is still attached after an expert placement that host-maps at
+/// least its routed experts: `native_mtp` and the host-mapped MTP policy
+/// ([`crate::admission::qwen4_mtp_with_host_mapped_experts`], worst case one host blob).
+fn qwen4_mtp_kept(
+    spec: SpecLoadCfg,
+    arch: &str,
+    native_mtp: bool,
+    routed_experts: bool,
+) -> bool {
+    native_mtp
+        && crate::admission::qwen4_mtp_with_host_mapped_experts(
+            spec,
+            arch,
+            usize::from(routed_experts),
+        )
+}
+
+/// `HIPFIRE_EP_MTP_EXPERTS_RESIDENT` (default on, exact `0` off) for one load of `ranks`
+/// ranks: the rank's owned slice of the attached MTP head's routed experts and its device
+/// bytes ([`hipfire_arch_qwen4::expert_residency::ep_mtp_resident_decision`]), or `None` for
+/// today's host-mapped head (kill switch, single device, no head attached, no head experts).
+/// The plan-time split and every rank's load decide with this one function over the same
+/// manifest, so they agree on the charge byte for byte.
+fn qwen4_ep_mtp_resident(
+    weights: &[hipfire_runtime::weight_manifest::WeightEntry],
+    bytes_of: &dyn Fn(&hipfire_runtime::weight_manifest::WeightEntry) -> Option<u64>,
+    ranks: usize,
+    mtp_kept: bool,
+) -> Result<Option<hipfire_arch_qwen4::expert_residency::EpMtpResident>, String> {
+    hipfire_arch_qwen4::expert_residency::ep_mtp_resident_decision(
+        weights,
+        bytes_of,
+        ranks,
+        hipfire_config::memory::ep_mtp_experts_resident(),
+        mtp_kept,
+    )
+    .map_err(|error| format!("qwen4: {error}"))
 }
 /// Shared placement mode the metadata-only preload plan and the production load
 /// both resolve through the genuine owners: `FixedLayers(n)` is an explicit
@@ -3110,6 +3163,19 @@ pub fn qwen4_ep_vram_layers(
         shared.max_seq,
         scratch_mode,
     );
+    // `HIPFIRE_EP_MTP_EXPERTS_RESIDENT`: decided here exactly as `qwen4_placement_inputs` does
+    // (it charges these bytes into `non_expert` below, so every budget below shrinks by them).
+    let ep_mtp = qwen4_ep_mtp_resident(
+        &manifest.weights,
+        &bytes_of,
+        ranks,
+        qwen4_mtp_kept(
+            shared.spec,
+            &gpu.arch,
+            shared.native_mtp,
+            !config.ffn.is_dense(),
+        ),
+    )?;
     // The ordinary (non-decoupled) placement inputs at one prefill chunk, with
     // the AR-lane store that chunk commits: the per-rank non-expert and
     // per-layer expert bytes, the reserve (same charges as each rank's load
@@ -3367,6 +3433,10 @@ pub fn qwen4_ep_vram_layers(
     let host_expert_bytes = |layers: usize| -> Result<u64, String> {
         let mut placed = manifest.weights.clone();
         qwen4_shared_apply_placement(&mut placed, layers, None);
+        if ep_mtp.is_some() {
+            // The head's owned slice is VRAM-resident, not pinned.
+            hipfire_arch_qwen4::expert_residency::keep_mtp_head_routed_resident(&mut placed);
+        }
         hipfire_arch_qwen4::expert_residency::host_mapped_bytes_ranks(&placed, &bytes_of, ranks)
             .map(|per_rank| {
                 per_rank
@@ -3624,6 +3694,7 @@ pub fn qwen4_ep_vram_layers(
             split.ep_units = Some(std::sync::Arc::new(staged.plan));
         }
     }
+    split.mtp_experts = ep_mtp;
     Ok(split)
 }
 
@@ -4377,6 +4448,7 @@ fn qwen4_ep_chunk_autofit(
         chunk_rows: Some(rows),
         fit_note: Some(fit_note),
         ep_units: None,
+        mtp_experts: split.mtp_experts,
     })
 }
 
@@ -4558,6 +4630,10 @@ pub struct Qwen4EpVramSplit {
     /// The per-expert residency plan (`HIPFIRE_QWEN4_EP_EXPERT_HOTSET`); `None`
     /// without the flag and when the load is fully resident anyway.
     pub ep_units: Option<std::sync::Arc<hipfire_arch_qwen4::expert_ep_units::EpUnitPlan>>,
+    /// The MTP head's owned routed-expert slice every rank keeps VRAM-resident
+    /// (`HIPFIRE_EP_MTP_EXPERTS_RESIDENT`, charged to every rank's budget before the unit
+    /// ranking walk); `None`: the head stays host-mapped (kill switch, no head attached).
+    pub mtp_experts: Option<hipfire_arch_qwen4::expert_residency::EpMtpResident>,
 }
 
 /// The facts of one load [`admit_ep_reserve`](hipfire_arch_qwen4::ep_reserve::admit_ep_reserve)
@@ -4888,6 +4964,7 @@ fn qwen4_ep_vram_split(
                     chunk_rows: None,
                     fit_note: None,
                     ep_units: None,
+                    mtp_experts: None,
                 });
             }
             Qwen4EpReserveResolution::Ordinary(why) => {
@@ -4904,6 +4981,7 @@ fn qwen4_ep_vram_split(
         chunk_rows: None,
         fit_note: None,
         ep_units: None,
+        mtp_experts: None,
     })
 }
 
@@ -6910,6 +6988,19 @@ fn load_qwen4_rank_unscoped(
     } else {
         None
     };
+    // `HIPFIRE_EP_MTP_EXPERTS_RESIDENT` for this rank: the same decision (same manifest, same
+    // function) `qwen4_placement_inputs` just charged into `non_expert` and the plan-time split
+    // charged before it.
+    let ep_mtp = if band.is_none() {
+        qwen4_ep_mtp_resident(
+            &manifest.weights,
+            &bytes_of,
+            ep_ranks,
+            qwen4_mtp_kept(ctx.spec, &ctx.gpu.arch, placement_native_mtp, routed_experts),
+        )?
+    } else {
+        None
+    };
     // The bound trunk overlay's net resident bytes (owned Q8F16 copies larger
     // than the MQ6 tensors they replace) land after placement: charge them as
     // non-expert bytes in the one census every budget below reads, identically
@@ -8086,6 +8177,18 @@ fn load_qwen4_rank_unscoped(
             vram_layers,
             resident_set.as_deref(),
         );
+        // `HIPFIRE_EP_MTP_EXPERTS_RESIDENT`: the placement host-maps the head's routed experts
+        // like every non-resident layer; this rank keeps its OWNED slice in VRAM (the stacks are
+        // `ExpertSharded`, so the ordinary resident upload carries only the owned experts), the
+        // bytes the census above already charged. The per-expert overlay below leaves the
+        // head's entries alone.
+        let moved = if ep_mtp.is_some() {
+            moved.saturating_sub(residency::keep_mtp_head_routed_resident(
+                &mut manifest.weights,
+            ))
+        } else {
+            moved
+        };
         applied_layers = resident_set
             .as_ref()
             .map_or(vram_layers.min(config.num_hidden_layers), Vec::len);
@@ -8325,7 +8428,7 @@ fn load_qwen4_rank_unscoped(
     {
         eprintln!(
             "{}",
-            residency::ep_fit_rank_line(
+            residency::ep_fit_rank_line_mtp(
                 &config,
                 placement.rank,
                 placement.ranks,
@@ -8334,8 +8437,18 @@ fn load_qwen4_rank_unscoped(
                 layer_experts,
                 reserve,
                 applied_layers,
+                ep_mtp.map_or(0, |mtp| mtp.bytes),
             )
         );
+        if let Some(mtp) = &ep_mtp {
+            eprintln!(
+                "qwen4 EP rank {}/{}: MTP head experts: {} owned units ({:.1} MiB) VRAM-resident, charged before the ranking walk (no pinned host copy)",
+                placement.rank,
+                placement.ranks,
+                mtp.owned_experts,
+                mtp.bytes as f64 / (1u64 << 20) as f64,
+            );
+        }
     }
     // The per-expert plan's receipt for this rank, beside its fit line.
     if let (Some(units), Some(placement)) = (&ep_units, ep) {
@@ -18048,5 +18161,103 @@ mod ep_unit_plan_tests {
             "{error}"
         );
         assert!(error.contains("model.expert-hotset"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod qwen4_ep_mtp_resident_tests {
+    use super::{qwen4_ep_mtp_resident, qwen4_shared_apply_placement};
+    use hipfire_arch_qwen4::expert_residency as residency;
+    use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency};
+    use rdna_compute::DType;
+
+    const GATE_UP: u64 = 1_689_600;
+    const DOWN: u64 = 844_800;
+
+    fn stack(name: &str, layer: Option<usize>, dtype: DType) -> WeightEntry {
+        let experts = 512;
+        let shape = if name.ends_with("gate_up_proj") {
+            vec![experts, 1_280, 2_560]
+        } else {
+            vec![experts, 2_560, 640]
+        };
+        let mut entry = WeightEntry::model(name, shape, dtype, ShardPolicy::Replicate);
+        entry.layer = layer;
+        entry
+    }
+
+    /// Two trunk layers and the head, planar drop-zero routed stacks.
+    fn manifest() -> Vec<WeightEntry> {
+        let mut weights = Vec::new();
+        for layer in 0..2 {
+            for (suffix, dtype) in [
+                ("gate_up_proj", DType::MQ4G256V2P),
+                ("down_proj", DType::MQ4G128V2P),
+            ] {
+                weights.push(stack(
+                    &format!("model.language_model.layers.{layer}.mlp.experts.{suffix}"),
+                    Some(layer),
+                    dtype,
+                ));
+            }
+        }
+        for (suffix, dtype) in [
+            ("gate_up_proj", DType::MQ4G256V2P),
+            ("down_proj", DType::MQ4G128V2P),
+        ] {
+            weights.push(stack(
+                &format!("mtp.layers.0.mlp.experts.{suffix}"),
+                Some(0),
+                dtype,
+            ));
+        }
+        weights
+    }
+
+    fn bytes_of(entry: &WeightEntry) -> Option<u64> {
+        let per_expert = if entry.name.ends_with("gate_up_proj") {
+            GATE_UP
+        } else {
+            DOWN
+        };
+        Some(per_expert * 512)
+    }
+
+    #[test]
+    fn the_owned_slice_is_kept_resident_after_the_whole_layer_placement_and_never_pinned() {
+        let mut weights = manifest();
+        let owned = 256 * (GATE_UP + DOWN);
+        let mtp = qwen4_ep_mtp_resident(&weights, &bytes_of, 2, true)
+            .unwrap()
+            .expect("the default is on");
+        assert_eq!((mtp.owned_experts, mtp.bytes), (256, owned));
+        // Layer 0 resident, layer 1 and the head host-mapped by the placement.
+        assert_eq!(qwen4_shared_apply_placement(&mut weights, 1, None), 4);
+        let pinned = |weights: &[WeightEntry]| {
+            residency::host_mapped_bytes_ranks(weights, bytes_of, 2).unwrap()[0]
+        };
+        let with_head_host = pinned(&weights);
+        // The rank load restores exactly the head's two stacks.
+        assert_eq!(residency::keep_mtp_head_routed_resident(&mut weights), 2);
+        assert!(weights
+            .iter()
+            .filter(|entry| entry.name.starts_with("mtp."))
+            .all(|entry| entry.residency == WeightResidency::Resident));
+        // The host census (host check, receipt) loses exactly the head's owned bytes plus its
+        // two pads; the trunk's host layer is untouched.
+        assert_eq!(
+            with_head_host - pinned(&weights),
+            owned + 2 * residency::HOST_MAPPED_PAD_BYTES
+        );
+        assert!(weights.iter().any(|entry| {
+            entry.layer == Some(1) && entry.residency == WeightResidency::HostMapped
+        }));
+    }
+
+    #[test]
+    fn no_charge_without_ep_or_without_the_head_attached() {
+        let weights = manifest();
+        assert_eq!(qwen4_ep_mtp_resident(&weights, &bytes_of, 1, true), Ok(None));
+        assert_eq!(qwen4_ep_mtp_resident(&weights, &bytes_of, 2, false), Ok(None));
     }
 }

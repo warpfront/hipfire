@@ -15,8 +15,12 @@
 //! budget, and reproduces today's split exactly when no ranking is given.
 //!
 //! Pure CPU arithmetic: no file, environment, device or manifest access. Only
-//! the trunk layers are planned; the MTP head's experts stay on today's
-//! placement (always host).
+//! the trunk layers are planned. The MTP head's experts are not units: by default
+//! (`HIPFIRE_EP_MTP_EXPERTS_RESIDENT`) every rank keeps its owned slice of them
+//! VRAM-resident and the loader charges those bytes to every rank's `non_expert`
+//! (hence to [`ep_unit_rank_budgets`]) BEFORE this planner walks the ranking
+//! ([`crate::expert_residency::ep_mtp_resident_decision`]); with the switch `=0` they
+//! stay host-mapped, pinned on every rank (today's placement).
 //!
 //! # Walk
 //!

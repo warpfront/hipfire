@@ -3242,11 +3242,13 @@ pub fn mtp_head_routed_census(
 }
 
 /// Keep the native MTP head's routed experts VRAM-resident
-/// (`HIPFIRE_QWEN4_MTP_HEAD_RESIDENT`): undo, for exactly those entries, the
-/// host placement [`place_routed_experts`] / [`place_routed_experts_set`] gave
-/// them (they upload through the ordinary resident tensor path, no new
-/// format). The caller has already charged [`MtpHeadRoutedCensus::payload_bytes`]
-/// against the device budget. Returns the number of entries restored.
+/// (`HIPFIRE_QWEN4_MTP_HEAD_RESIDENT` on a single card, `HIPFIRE_EP_MTP_EXPERTS_RESIDENT` on an
+/// expert-parallel load): undo, for exactly those entries, the host placement
+/// [`place_routed_experts`] / [`place_routed_experts_set`] gave them (they upload through the
+/// ordinary resident tensor path, no new format; an EP-sharded entry uploads only the rank's
+/// owned experts). The caller has already charged the device bytes against the budget
+/// ([`MtpHeadRoutedCensus::payload_bytes`], or [`EpMtpResident::bytes`] on EP). Returns the
+/// number of entries restored.
 pub fn keep_mtp_head_routed_resident(weights: &mut [WeightEntry]) -> usize {
     let mut restored = 0;
     for entry in weights.iter_mut() {
@@ -3256,6 +3258,77 @@ pub fn keep_mtp_head_routed_resident(weights: &mut [WeightEntry]) -> usize {
         }
     }
     restored
+}
+
+/// The native MTP head's routed experts one rank of an expert-parallel load keeps
+/// VRAM-resident (`HIPFIRE_EP_MTP_EXPERTS_RESIDENT`, default on): the rank's OWNED slice only.
+/// The EP manifest declares the head's stacks `ExpertSharded` like every trunk layer's
+/// ([`crate::weights::Qwen4Manifest::with_expert_parallel`]), so a `Resident` entry uploads
+/// just the owned experts (`e % ranks == rank`, compact, planar when the load repacks), the
+/// bytes [`rank_share`] charges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpMtpResident {
+    /// Head routed entries (gate/up and down stacks: 2 on Flash-Next).
+    pub entries: usize,
+    /// Experts of the head the largest rank (rank 0) owns: 256 of 512 on EP2. One
+    /// "unit" is one expert's gate/up plus down payload.
+    pub owned_experts: usize,
+    /// Device bytes of those owned experts on the largest rank (gate/up + down; no per-expert
+    /// or arena pad: the entries upload as ordinary resident tensors, like a resident trunk
+    /// layer). Every rank's budget is charged this, so a layer counted resident fits every
+    /// rank of an uneven split, the way `layer_experts` is.
+    pub bytes: u64,
+}
+
+/// Whether this load keeps the head's owned experts VRAM-resident, and what it weighs:
+/// `Some` exactly when the switch is `enabled`, the load is expert-parallel (`ranks >= 2`),
+/// the native MTP head stays attached (`head_kept`) and the manifest declares head routed
+/// experts with payload. `None` is today's placement (host-mapped on every rank), also when
+/// the head is not attached (an AR load pins them without need, as before). Checked sums.
+pub fn ep_mtp_resident_decision(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    ranks: usize,
+    enabled: bool,
+    head_kept: bool,
+) -> Result<Option<EpMtpResident>, String> {
+    if !enabled || !head_kept || ranks < 2 {
+        return Ok(None);
+    }
+    let (mut entries, mut bytes, mut owned_experts) = (0usize, 0u64, 0usize);
+    for entry in weights.iter().filter(|entry| is_mtp_head_routed(entry)) {
+        let payload =
+            bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
+        // Rank 0 owns the most experts of an uneven split: the charge every rank budgets.
+        let share = rank_share(entry, payload, 0, ranks)?;
+        entries += 1;
+        bytes = bytes
+            .checked_add(share)
+            .ok_or_else(|| "MTP head owned routed-expert byte census overflows".to_string())?;
+        let experts = entry.logical_shape.first().copied().unwrap_or(0);
+        owned_experts = owned_experts.max(Qwen4EpPlacement { rank: 0, ranks }.local_count(experts));
+    }
+    Ok((entries > 0 && bytes > 0).then_some(EpMtpResident {
+        entries,
+        owned_experts,
+        bytes,
+    }))
+}
+
+/// The one load line stating where the MTP head's routed experts sit on an expert-parallel
+/// load: the owned slice VRAM-resident on every rank (`resident`), or the host-mapped
+/// placement with `why` (the kill switch, or no head attached).
+pub fn ep_mtp_experts_line(resident: Option<&EpMtpResident>, why_host: &str) -> String {
+    match resident {
+        Some(mtp) => format!(
+            "qwen4 EP expert tier: the MTP head's experts: {} owned units VRAM-resident on every rank ({} MiB, charged before the ranking walk)",
+            mtp.owned_experts,
+            mtp.bytes >> 20
+        ),
+        None => format!(
+            "qwen4 EP expert tier: the MTP head's experts stay host-mapped (today's placement, pinned on every rank; {why_host})"
+        ),
+    }
 }
 
 /// Mark the replicated token embedding table ([`crate::weights::QWEN4_EMBED`])
@@ -3503,8 +3576,9 @@ pub fn moe_layer_count_scope(config: &Qwen4Config, scope: &Qwen4BandScope) -> us
 /// How many of the model's MoE layers (trunk first, the MTP layer last) one
 /// rank with `free_vram` keeps resident: all of them when the trunk, every
 /// layer's experts and the reserve fit, otherwise the trunk layers `auto`
-/// fits (the MTP layer is then always host-mapped, as in
-/// [`place_routed_experts`]). `layer_expert_bytes_per_rank` is one MoE
+/// fits (the MTP layer is then host-mapped, as in [`place_routed_experts`], unless the
+/// caller keeps its owned slice resident ([`ep_mtp_resident_decision`], charged into
+/// `non_expert_bytes`)). `layer_expert_bytes_per_rank` is one MoE
 /// layer's routed experts on the largest rank (`max_local_count` experts), so
 /// a layer counted resident fits every rank of an uneven split.
 pub fn ep_rank_layers(
@@ -3816,7 +3890,41 @@ pub fn ep_fit_rank_line(
     reserve_bytes: u64,
     applied_layers: usize,
 ) -> String {
-    let moe_layers = moe_layer_count(config);
+    ep_fit_rank_line_mtp(
+        config,
+        rank,
+        ranks,
+        free_vram,
+        non_expert_bytes,
+        layer_expert_bytes_per_rank,
+        reserve_bytes,
+        applied_layers,
+        0,
+    )
+}
+
+/// [`ep_fit_rank_line`] for a load whose `non_expert_bytes` already carries
+/// `mtp_resident_bytes`, the rank's owned slice of the MTP head's routed experts kept
+/// VRAM-resident ([`ep_mtp_resident_decision`]): the line names the charge beside the trunk and
+/// counts only the trunk's MoE layers in the split (the MTP layer is no longer one of the
+/// layers a split leaves in host RAM), so no byte is counted twice in the headroom. `0` is
+/// exactly [`ep_fit_rank_line`].
+pub fn ep_fit_rank_line_mtp(
+    config: &Qwen4Config,
+    rank: usize,
+    ranks: usize,
+    free_vram: u64,
+    non_expert_bytes: u64,
+    layer_expert_bytes_per_rank: u64,
+    reserve_bytes: u64,
+    applied_layers: usize,
+    mtp_resident_bytes: u64,
+) -> String {
+    let moe_layers = if mtp_resident_bytes > 0 {
+        config.num_hidden_layers
+    } else {
+        moe_layer_count(config)
+    };
     let applied = applied_layers.min(moe_layers);
     let own = ep_rank_layers(
         config,
@@ -3824,15 +3932,24 @@ pub fn ep_fit_rank_line(
         non_expert_bytes,
         layer_expert_bytes_per_rank,
         reserve_bytes,
-    );
+    )
+    .min(moe_layers);
     let resident_bytes = layer_expert_bytes_per_rank.saturating_mul(applied as u64);
     let headroom = i128::from(free_vram)
         - i128::from(non_expert_bytes)
         - i128::from(resident_bytes)
         - i128::from(reserve_bytes);
     let gib = |bytes: u64| bytes as f64 / GIB;
+    let mtp_note = if mtp_resident_bytes > 0 {
+        format!(
+            " (incl. {:.1} MiB MTP head experts, this rank's owned slice VRAM-resident)",
+            mtp_resident_bytes as f64 / (1u64 << 20) as f64
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "qwen4 EP rank {rank}/{ranks}: free {:.2} GiB | trunk {:.2} GiB | experts {:.2} GiB/rank \
+        "qwen4 EP rank {rank}/{ranks}: free {:.2} GiB | trunk {:.2} GiB{mtp_note} | experts {:.2} GiB/rank \
          ({moe_layers} MoE layers x {:.1} MiB) | resident expert layers {applied} of {moe_layers} \
          ({} host-mapped; this rank alone fits {own}) | reserve {:.2} GiB | headroom {:+.2} GiB",
         gib(free_vram),
@@ -4591,6 +4708,163 @@ mod tests {
             .all(|entry| entry.residency == WeightResidency::Resident));
         // Idempotent: nothing left to restore.
         assert_eq!(keep_mtp_head_routed_resident(&mut weights), 0);
+    }
+
+    /// The Flash-Next EP weights the MTP decision reads: one trunk layer and the head's two
+    /// routed stacks (512 experts each, planar MQ4 drop-zero bytes: 1,689,600 gate/up and
+    /// 844,800 down per expert), plus a head shared expert that is not a routed stack.
+    fn ep_mtp_weights() -> Vec<WeightEntry> {
+        let stack = |name: &str, layer: usize| {
+            let mut stack = entry(name, layer);
+            stack.logical_shape = vec![512, 1];
+            stack
+        };
+        vec![
+            stack("model.language_model.layers.0.mlp.experts.gate_up_proj", 0),
+            stack("model.language_model.layers.0.mlp.experts.down_proj", 0),
+            stack("mtp.layers.0.mlp.experts.gate_up_proj", 0),
+            stack("mtp.layers.0.mlp.experts.down_proj", 0),
+            entry("mtp.layers.0.mlp.shared_expert.down_proj.weight", 0),
+        ]
+    }
+
+    fn ep_mtp_bytes(entry: &WeightEntry) -> Option<u64> {
+        let per_expert = if entry.name.ends_with(".mlp.experts.gate_up_proj") {
+            1_689_600
+        } else if entry.name.ends_with(".mlp.experts.down_proj") {
+            844_800
+        } else {
+            return Some(4096);
+        };
+        Some(entry.logical_shape[0] as u64 * per_expert)
+    }
+
+    #[test]
+    fn ep_mtp_resident_decision_is_the_owned_slice_and_off_without_its_conditions() {
+        let weights = ep_mtp_weights();
+        let unit = 1_689_600 + 844_800;
+        // EP2: 256 of 512 experts, 256 x 2,534,400 B = 618.75 MiB, the trunk layers and the
+        // head's shared expert never counted.
+        let two = ep_mtp_resident_decision(&weights, ep_mtp_bytes, 2, true, true)
+            .unwrap()
+            .expect("EP2 with the head attached keeps the owned slice resident");
+        assert_eq!(two.entries, 2);
+        assert_eq!(two.owned_experts, 256);
+        assert_eq!(two.bytes, 256 * unit);
+        assert_eq!(two.bytes, 648_806_400);
+        assert_eq!(two.bytes >> 20, 618);
+        // An uneven split budgets the largest rank (rank 0: 171 of 512 over 3 ranks).
+        let three = ep_mtp_resident_decision(&weights, ep_mtp_bytes, 3, true, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!((three.owned_experts, three.bytes), (171, 171 * unit));
+        // The kill switch, no head attached and a single device are today's placement.
+        assert_eq!(
+            ep_mtp_resident_decision(&weights, ep_mtp_bytes, 2, false, true),
+            Ok(None)
+        );
+        assert_eq!(
+            ep_mtp_resident_decision(&weights, ep_mtp_bytes, 2, true, false),
+            Ok(None)
+        );
+        assert_eq!(
+            ep_mtp_resident_decision(&weights, ep_mtp_bytes, 1, true, true),
+            Ok(None)
+        );
+        // A manifest with no head experts (the trunk shard drops the head).
+        let headless: Vec<WeightEntry> = weights
+            .iter()
+            .filter(|entry| !entry.name.starts_with("mtp."))
+            .cloned()
+            .collect();
+        assert_eq!(
+            ep_mtp_resident_decision(&headless, ep_mtp_bytes, 2, true, true),
+            Ok(None)
+        );
+        // A missing payload size is an error, never a zero charge.
+        assert!(ep_mtp_resident_decision(&weights, |_| None, 2, true, true).is_err());
+    }
+
+    #[test]
+    fn ep_mtp_resident_charge_shrinks_the_trunk_unit_budget_by_exactly_the_owned_bytes() {
+        use crate::expert_ep_units::{
+            ep_unit_geometry, ep_unit_rank_budgets, place_routed_experts_units_staged, EpRanking,
+        };
+        let weights = ep_mtp_weights();
+        let mtp = ep_mtp_resident_decision(&weights, ep_mtp_bytes, 2, true, true)
+            .unwrap()
+            .unwrap();
+        // The loader adds the charge to the replicated non-expert bytes (`qwen4_placement_inputs`)
+        // that every budget subtracts, so the walk's budget drops by exactly `mtp.bytes`.
+        let (free, non_expert, reserve) = (20u64 << 30, 5u64 << 30, 4u64 << 30);
+        let without = ep_unit_rank_budgets(&[free; 2], non_expert, reserve);
+        let with = ep_unit_rank_budgets(&[free; 2], non_expert + mtp.bytes, reserve);
+        for rank in 0..2 {
+            assert_eq!(without[rank] - with[rank], mtp.bytes);
+        }
+        // The ranking walk over those budgets (3 trunk layers x 512 experts, ascending ids):
+        // the trunk keeps fewer units, and the MTP bytes plus the trunk's planned VRAM still
+        // fit the budget the trunk had without the head (nothing over-commits).
+        let layers = 3usize;
+        let geometry = ep_unit_geometry(
+            layers,
+            512,
+            2,
+            &vec![512 * 1_689_600; layers],
+            &vec![512 * 844_800; layers],
+        )
+        .unwrap();
+        let rank: Vec<u32> = (0..(layers * 512) as u32).collect();
+        let ranking = EpRanking {
+            rank: &rank,
+            counts: None,
+            sha256: None,
+        };
+        let small = [1_000_000_000u64; 2];
+        let small_with = [small[0] - mtp.bytes; 2];
+        let off = place_routed_experts_units_staged(&geometry, ranking, &small, false).unwrap();
+        let on = place_routed_experts_units_staged(&geometry, ranking, &small_with, false).unwrap();
+        for rank in 0..2 {
+            assert!(on.plan.resident_units(rank) < off.plan.resident_units(rank));
+            assert!(on.plan.vram_bytes(rank) <= small_with[rank]);
+            assert!(on.plan.vram_bytes(rank) + mtp.bytes <= small[rank]);
+        }
+    }
+
+    #[test]
+    fn ep_mtp_experts_line_states_the_actual_placement() {
+        let mtp = EpMtpResident {
+            entries: 2,
+            owned_experts: 256,
+            bytes: 648_806_400,
+        };
+        assert_eq!(
+            ep_mtp_experts_line(Some(&mtp), "unused"),
+            "qwen4 EP expert tier: the MTP head's experts: 256 owned units VRAM-resident on every rank (618 MiB, charged before the ranking walk)"
+        );
+        let host = ep_mtp_experts_line(None, "HIPFIRE_EP_MTP_EXPERTS_RESIDENT=0");
+        assert!(host.contains("stay host-mapped") && host.contains("HIPFIRE_EP_MTP_EXPERTS_RESIDENT=0"));
+    }
+
+    #[test]
+    fn ep_fit_rank_line_names_the_mtp_charge_without_counting_it_twice() {
+        let config = crate::config::compact_test_config();
+        assert_eq!(moe_layer_count(&config), 49);
+        let (free, trunk, layer, reserve) = (30u64 << 30, 6u64 << 30, 512u64 << 20, 4u64 << 30);
+        let mtp = layer;
+        let off = ep_fit_rank_line(&config, 0, 2, free, trunk, layer, reserve, 30);
+        let on = ep_fit_rank_line_mtp(&config, 0, 2, free, trunk + mtp, layer, reserve, 30, mtp);
+        assert_eq!(
+            off,
+            ep_fit_rank_line_mtp(&config, 0, 2, free, trunk, layer, reserve, 30, 0)
+        );
+        assert!(off.contains("resident expert layers 30 of 49"), "{off}");
+        assert!(on.contains("resident expert layers 30 of 48"), "{on}");
+        assert!(on.contains("incl. 512.0 MiB MTP head experts"), "{on}");
+        // The MTP bytes sit once in the trunk term (not also in a 49th expert layer): the
+        // headroom is the MTP-less one less exactly the owned bytes.
+        assert!(off.ends_with("headroom +5.00 GiB"), "{off}");
+        assert!(on.ends_with("headroom +4.50 GiB"), "{on}");
     }
 
     #[test]
