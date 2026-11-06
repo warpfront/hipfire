@@ -58,6 +58,7 @@
 //!   first use so the builder's ledger waits only for what is needed. No scratch, no
 //!   spills.
 mod dequant;
+mod read_up;
 use super::iu4_gemm::ModuleProof;
 use crate::insn::{Instruction, MemoryClass};
 use crate::kernels::common::{add64, add64_imm, lit, op, s, s_add_i32, smem, sop, v, vr};
@@ -68,6 +69,9 @@ use crate::reg::{Kind, Live};
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan};
 pub use dequant::{
     emit_dequant, emit_dequants, DequantOut, DEQUANT_BLOCK, DEQUANT_KERNARG_BYTES, DEQUANT_OUTS,
+};
+pub use read_up::{
+    emit_read_up, emit_read_ups, read_up_symbol, READ_UP_BLOCK, READ_UP_KERNARG_BYTES,
 };
 
 type R = Result<(), String>;
@@ -146,6 +150,7 @@ pub fn priority_geos() -> Vec<Geo> {
 pub fn symbols() -> Vec<String> {
     let mut out: Vec<String> = all_geos().iter().map(Geo::symbol).collect();
     out.extend(DEQUANT_OUTS.iter().map(|d| d.symbol().to_string()));
+    out.extend((1..=4).map(read_up_symbol));
     out
 }
 
@@ -478,11 +483,13 @@ fn perm_pack(b: &mut Builder, dst: u8, hi: u8, lo: u8) -> R {
 }
 
 // -------------------------------------------------------------------- prologue
-fn prologue(b: &mut Builder, g: &Geo, end: &str) -> R {
+/// `ru`: the fused read-up kernel's kernarg (`hidden K rows` at 40, in the `M K rows`
+/// SGPRs) and its `mt = wave*(hidden/16) + wg` tile map.
+fn prologue(b: &mut Builder, g: &Geo, end: &str, ru: bool) -> R {
     let lg = g.kw.trailing_zeros();
     let nt = g.nt;
     smem(b, KQ, 8, KARG, 0)?;
-    smem(b, MK, 4, KARG, 32)?;
+    smem(b, MK, 4, KARG, if ru { 40 } else { 32 })?;
     op(
         b,
         format!("v_lshrrev_b32_e32 v{VT}, 5, v{TID}"),
@@ -540,7 +547,22 @@ fn prologue(b: &mut Builder, g: &Geo, end: &str) -> R {
     sop(b, format!("s_mov_b32 s{REM}, s{KT}"), &[REM], &[KT])?;
     sop(b, format!("s_lshl_b32 s{KB}, s{SK}, 2"), &[KB], &[SK])?;
     // M tile = wg*MW + mi.
-    if g.mw == 1 {
+    if ru {
+        sop(b, format!("s_lshr_b32 s{TMP}, s{SM}, 4"), &[TMP], &[SM])?;
+        sop(
+            b,
+            format!("s_mul_i32 s{MT}, s{TMP}, s{MI}"),
+            &[MT],
+            &[TMP, MI],
+        )?;
+        let a = b.spec.arch;
+        sop(
+            b,
+            format!("{} s{MT}, s{MT}, s{WG}", s_add_i32(a)),
+            &[MT],
+            &[MT, WG],
+        )?;
+    } else if g.mw == 1 {
         let a = b.spec.arch;
         sop(
             b,
@@ -690,12 +712,23 @@ fn prologue(b: &mut Builder, g: &Geo, end: &str) -> R {
         &[v(YA)],
         &[v(YA), v(VT2)],
     )?;
-    op(
-        b,
-        format!("v_add_nc_u32_e32 v{YA}, s{TMP2}, v{YA}"),
-        &[v(YA)],
-        &[v(YA), s(TMP2)],
-    )?;
+    if ru {
+        // Read-up output rows index hidden columns: the workgroup, not the M tile.
+        sop(b, format!("s_lshl_b32 s{TMP3}, s{WG}, 6"), &[TMP3], &[WG])?;
+        op(
+            b,
+            format!("v_add_nc_u32_e32 v{YA}, s{TMP3}, v{YA}"),
+            &[v(YA)],
+            &[v(YA), s(TMP3)],
+        )?;
+    } else {
+        op(
+            b,
+            format!("v_add_nc_u32_e32 v{YA}, s{TMP2}, v{YA}"),
+            &[v(YA)],
+            &[v(YA), s(TMP2)],
+        )?;
+    }
     op(
         b,
         format!("v_add_nc_u32_e32 v{SO}, s{TMP2}, v{VT2}"),
@@ -851,10 +884,10 @@ fn batch(b: &mut Builder, g: &Geo, l: &Lay, u: u32) -> R {
     Ok(())
 }
 
-fn k_loops(b: &mut Builder, g: &Geo, l: &Lay) -> R {
+fn k_loops(b: &mut Builder, g: &Geo, l: &Lay, tag: &str) -> R {
     for u in g.batches() {
-        let skip = lbl(g, &format!("skip{u}"));
-        let head = lbl(g, &format!("loop{u}"));
+        let skip = format!(".Lhc8_{tag}_skip{u}");
+        let head = format!(".Lhc8_{tag}_loop{u}");
         sop(b, format!("s_cmp_lt_u32 s{REM}, {u}"), &[], &[REM])?;
         branch(b, &format!("s_cbranch_scc1 {skip}"))?;
         b.loop_(&head, |b| {
@@ -1046,10 +1079,10 @@ fn emit_geo(g: &Geo) -> Result<Emitted, String> {
         None
     };
     let end = lbl(g, "end");
-    prologue(&mut b, g, &end)?;
+    prologue(&mut b, g, &end, false)?;
     zero_regs(&mut b, ACC, g.nr())?;
     zero_regs(&mut b, l.xb, 16 * l.u * g.nt)?;
-    k_loops(&mut b, g, &l)?;
+    k_loops(&mut b, g, &l, &g.symbol())?;
     epilogue(&mut b, g, &l, slot, &end)?;
     b.wait_all()?;
     b.label(&end)?;
@@ -1101,5 +1134,6 @@ pub fn emit_geos(geos: &[Geo]) -> Result<(Vec<Emitted>, String, ModuleProof), St
 pub fn emit_module() -> Result<(Vec<Emitted>, String, ModuleProof), String> {
     let mut emitted = emit_gemms(&all_geos())?;
     emitted.extend(emit_dequants()?);
+    emitted.extend(emit_read_ups()?);
     link(emitted, &symbols())
 }
