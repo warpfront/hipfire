@@ -21,6 +21,11 @@ required-features = ["lab"]
 name = "ceil_probe_emit"
 required-features = ["lab"]
 
+# Standalone gfx1201 EXPAND_LIVE code-object emitter (CPU only, native assemble).
+[[example]]
+name = "emit_expand_live"
+required-features = ["lab"]
+
 [[example]]
 name = "pm_r4_screen"
 required-features = ["toolchain"]

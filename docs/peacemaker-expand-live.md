@@ -21,7 +21,7 @@ b128 (block 128) pool; PmPrereq confirmed this.
 | 0 | `expert_tile_ids` | `u64` pointer, read-only |
 | 8 | `sorted_slot_index` | `u64` pointer, read-only |
 | 16 | `live_list` | `u64` pointer, write-only |
-| 24 | `count_cell` | `u64` pointer, write-only |
+| 24 | `count_cell` | `u64` pointer, **read-write** (`actual_access` read_write: atomic RMW); host-zeroed before launch |
 | 32 | `M` | `u32` |
 | 36 | `grouped_rows` | `u32` |
 | 40 | `n_experts` | `u32` |
@@ -51,9 +51,11 @@ Real M0 is well inside these bounds.
 ## LiveList format
 
 `live_list` is an array of 16-byte entries `u32 {vx, vy, vz = 0, pad = 0}`. The count
-is a `u32` in `count_cell`. The host header carries an implicit `vcount` of 1 per entry.
+is a `u32` in `count_cell`, which the host zeroes before each launch (reset precondition); the
+producer publishes it with a device-scope release `global_atomic_add_u32` (an EventCells
+signal), not a plain store, so the j8292 bind refusal of a plain-store count is fixed. The host header carries an implicit `vcount` of 1 per entry.
 Order is **y ascending, then x ascending** (y-major). Entries are released before the
-final count store, and the count store is released. The multi-wave body takes a barrier
+final count publication, and the count atomic add is a release; it is retired before exit. The multi-wave body takes a barrier
 after every wave's record release and before flat-tid-0 publishes the count.
 
 The input pointers come from the o4 consumer's kernarg offsets **+8** (tile ids)
@@ -143,6 +145,11 @@ expert tiles are not the R2-pair count.
 **unconditionally** for every in-range block. An invalid-expert block therefore
 zero-fills its output and is observable; dropping it would leave stale words. Main
 decided to keep the dni grid static, with no producer.
+
+## Standalone image
+
+`cargo run -p peacemaker-isa --features lab --example emit_expand_live -- 128 /existing/dir/expand_live_b128.co`
+writes the native-assembled gfx1201 code object (BLOCK 32/64/128/256; output parent must exist).
 
 ## Notes
 

@@ -4,8 +4,8 @@
 
 use crate::insn::{Instruction, MemoryClass};
 use crate::reg::{Kind, RegRef};
-use crate::sync::Scope;
-use crate::Builder;
+use crate::sync::{GlobalAddr, Ordering, Scope};
+use crate::{Builder, S, V};
 
 fn r(kind: Kind, base: u8, len: u8) -> RegRef {
     RegRef { kind, base, len }
@@ -165,9 +165,9 @@ pub fn expand_body(b: &mut Builder, block: u32, name: &str) -> Result<(), String
     })?;
     b.label(&publish)?;
     full_exec(b)?;
-    // The count store must not overtake any wave's entries. Each wave releases
+    // The count signal must not overtake any wave's entries. Each wave releases
     // its stores first; the convergent workgroup barrier then precedes tid0's
-    // publication, including for empty routes and waves with no active x lane.
+    // publication onto the host-zeroed EventCells count, even for empty routes.
     b.release(Scope::Dev)?;
     if block > 32 {
         b.barrier(&[])?;
@@ -175,13 +175,15 @@ pub fn expand_body(b: &mut Builder, block: u32, name: &str) -> Result<(), String
     op(b, "v_cmpx_eq_u32_e32 0, v0", &[], &[v(0)])?;
     op(b, "v_mov_b32_e32 v1, 0", &[v(1)], &[])?;
     op(b, "v_mov_b32_e32 v2, s19", &[v(2)], &[s(19)])?;
-    b.push(
-        Instruction::new(
-            "global_store_b32 v1, v2, s[10:11]",
-            vec![],
-            vec![v(1), v(2), sp(10)],
-        )
-        .memory(MemoryClass::VmemStore),
+    b.event_signal(
+        V::<1>(2),
+        GlobalAddr {
+            vaddr: V::<1>(1),
+            base: S::<2>(10),
+            offset: 0,
+        },
+        Scope::Dev,
+        Ordering::Release,
     )?;
     b.release(Scope::Dev)?;
     full_exec(b)?;

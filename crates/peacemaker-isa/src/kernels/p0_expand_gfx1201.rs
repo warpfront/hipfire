@@ -12,7 +12,7 @@
 //!
 //! # Kernarg ABI ([`KERNARG_BYTES`] = 64)
 //! `u64` pointers: `expert_tile_ids` +0 (RO), `sorted_slot_index` +8 (RO),
-//! `live_list` +16 (WO), `count_cell` +24 (WO). `u32`: `M` +32, `grouped_rows` +36,
+//! `live_list` +16 (WO), `count_cell` +24 (RW, atomic RMW). `u32`: `M` +32, `grouped_rows` +36,
 //! `n_experts` +40, `gx` +44, `gy` +48, `capacity` +52, reserved +56 and +60.
 //!
 //! # Valid domain
@@ -22,8 +22,9 @@
 //! implicit `vcount` is 1 in the host header). A pair `y` is live iff `2*y < grouped_rows`,
 //! `expert_tile_ids[(2*y) >> 4]` is signed `>= 0` and `< n_experts`, and at least one of
 //! sorted slots `2*y` or (in range) `2*y+1` is signed `>= 0`; an `x` is live iff
-//! `16*x < M`. Mixed live/pad pairs emit. `count_cell` is a `u32`; entries are released
-//! before the final count store, and the final count is released.
+//! `16*x < M`. Mixed live/pad pairs emit. `count_cell` is a host-zeroed `u32` EventCells
+//! cell; entries are released before the final count, which flat tid 0 publishes with a
+//! device-scope release `global_atomic_add_u32` (no plain store; j8292).
 //!
 //! Fixed ABI contract (not validated at runtime; real M0 is well inside): `M` and
 //! `n_experts` are `<= i32::MAX` (the hipcc kernel's `int`s); `grouped_rows <=
@@ -127,7 +128,7 @@ pub fn kernel_spec(block: u32) -> KernelSpec {
             .pointer_access("expert_tile_ids", 0, Access::ReadOnly)
             .pointer_access("sorted_slot_index", 8, Access::ReadOnly)
             .pointer_access("live_list", 16, Access::WriteOnly)
-            .pointer_access("count_cell", 24, Access::WriteOnly)
+            .pointer_access("count_cell", 24, Access::ReadWrite)
             .hidden("M", 32, 4, "by_value")
             .hidden("grouped_rows", 36, 4, "by_value")
             .hidden("n_experts", 40, 4, "by_value")

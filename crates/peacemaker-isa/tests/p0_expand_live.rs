@@ -188,7 +188,8 @@ fn run(c: &Case, block: u32) -> (Vec<u8>, Vec<u8>) {
     let list_init = background(HEAD + capacity as usize * 16 + TAIL, 0x5A);
     let count_init: Vec<u8> = {
         let mut v = background(48, 0xC3);
-        v[16..20].copy_from_slice(&0xC3C3_C3C3u32.to_le_bytes());
+        // Host-zeroed count cell: the release atomic add publishes onto 0 (guard bytes stay).
+        v[16..20].copy_from_slice(&0u32.to_le_bytes());
         v
     };
 
@@ -344,6 +345,45 @@ fn constants_and_deterministic_emission() {
         assert_eq!(x.s_text, y.s_text, "block {b} emission not deterministic");
         assert_eq!(x.proof.s_text_sha256, y.proof.s_text_sha256, "block {b}");
         assert!(x.s_text.contains(&format!("{}:", ex::SYMBOL)), "block {b}");
+        // The count pointer's kernarg metadata is read-write (atomic RMW reads and writes).
+        let spec = ex::kernel_spec(b);
+        let access = |name: &str| {
+            spec.kernargs
+                .args
+                .iter()
+                .find(|a| a.name == name)
+                .and_then(|a| a.actual_access.clone())
+        };
+        assert_eq!(
+            access("count_cell").as_deref(),
+            Some(peacemaker_isa::plan::Access::ReadWrite.name()),
+            "block {b}: count_cell access"
+        );
+        assert_eq!(
+            access("live_list").as_deref(),
+            Some(peacemaker_isa::plan::Access::WriteOnly.name()),
+            "block {b}: live_list access"
+        );
+        // Count publication is a release atomic add (EventCells), never a plain b32 store.
+        let insns = &x.program.instructions;
+        let atomics: Vec<usize> = (0..insns.len())
+            .filter(|&i| insns[i].text.starts_with("global_atomic_add_u32"))
+            .collect();
+        assert_eq!(atomics.len(), 1, "block {b}: one count atomic add");
+        assert!(
+            !x.s_text.contains("global_store_b32"),
+            "block {b}: plain count store"
+        );
+        assert!(
+            x.s_text.contains("global_store_b128"),
+            "block {b}: LiveList store"
+        );
+        assert!(
+            x.proof.syncs.iter().any(|s| s.pc_index == atomics[0]
+                && s.kind == peacemaker_isa::sync::SyncKind::ReleaseSignal
+                && s.scope == peacemaker_isa::sync::Scope::Dev),
+            "block {b}: count atomic is not a device-scope release signal"
+        );
     }
     let texts: Vec<_> = BLOCKS
         .iter()
