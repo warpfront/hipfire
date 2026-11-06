@@ -73,7 +73,9 @@ use std::ops::Range;
 use railgun_corpus::receipt::{ArgRecord, TaskProtocolRecord, TASK_PROTO_REQUIRED};
 
 use crate::coresident::{GroupOrdering, OrderedEdge};
-use crate::kernel::{ArenaPointerLoad, Arg, KernelNode, KernelProgram, MemClass, RegionEffect};
+use crate::kernel::{
+    ArenaPointerLoad, ArenaSealedBinding, Arg, KernelNode, KernelProgram, MemClass, RegionEffect,
+};
 use crate::{BindingRecord, ResourceId, ResourceKind};
 
 /// The "no event" value of the M0 task ABI.
@@ -400,7 +402,11 @@ struct Access {
 
 /// Where a pool's per-template pointer loads come from.
 enum PoolEffects {
-    Templates(BTreeMap<u32, Vec<ArenaPointerLoad>>),
+    Templates {
+        loads: BTreeMap<u32, Vec<ArenaPointerLoad>>,
+        /// The sealed tables bound for the pool node's templates.
+        sealed: Vec<ArenaSealedBinding>,
+    },
     /// Pending without facts: every field of the record is read and written.
     Conservative,
 }
@@ -888,7 +894,43 @@ impl TaskGraph {
         let hb = |a: usize, b: usize| {
             pred_ix[b].is_some_and(|e| before[e].as_ref().expect("a used event").get(a))
         };
-
+        // ---- Sealed tables are immutable: no task and no member's node-level
+        // effect may write a table or a pointee a pool's records bind.
+        let mut protected: BTreeMap<ResourceId, &'static str> = BTreeMap::new();
+        for source in &pool_effects {
+            if let PoolEffects::Templates { sealed, .. } = source {
+                for b in sealed {
+                    protected.insert(b.resource, "sealed table");
+                    for p in &b.pointees {
+                        protected.entry(*p).or_insert("sealed pointee allocation");
+                    }
+                }
+            }
+        }
+        for (gid, acc) in accesses.iter().enumerate() {
+            if let Some(a) = acc
+                .iter()
+                .find(|a| a.write && protected.contains_key(&a.resource))
+            {
+                let (pi, k) = place(gid);
+                return Err(format!(
+                    "task {k} of pool {pi} (node {}) writes resource {}, a {}: sealed content is immutable",
+                    self.pools[pi].node, a.resource.0, protected[&a.resource]
+                ));
+            }
+        }
+        for n in group.clone() {
+            if let Some(e) = program.nodes[n]
+                .effects
+                .iter()
+                .find(|e| e.writes() && protected.contains_key(&e.resource))
+            {
+                return Err(format!(
+                    "node {n} ({}) writes resource {}, a {}: sealed content is immutable",
+                    program.nodes[n].symbol, e.resource.0, protected[&e.resource]
+                ));
+            }
+        }
         // ---- Races, and the node-level edges they give.
         let mut by_resource: BTreeMap<ResourceId, Vec<(usize, bool)>> = BTreeMap::new();
         let mut node_access: BTreeMap<(usize, ResourceId), (bool, bool)> = BTreeMap::new();
@@ -1055,8 +1097,9 @@ impl TaskGraph {
         // Bound arena facts whose arena argument is the graph's arena.
         let mut templates: BTreeMap<u32, Vec<ArenaPointerLoad>> = BTreeMap::new();
         let mut any = false;
+        let mut sealed: Vec<ArenaSealedBinding> = Vec::new();
         if let Some(arena) = &node.arena {
-            for (fact, bound) in arena.arenas.iter().zip(&arena.bound) {
+            for (k, (fact, bound)) in arena.arenas.iter().zip(&arena.bound).enumerate() {
                 let is_arena = node.args.iter().any(|(o, a)| {
                     *o == fact.arena_arg_offset
                         && matches!(a, Arg::Resource { resource, interior: 0 } if *resource == self.arena)
@@ -1070,6 +1113,7 @@ impl TaskGraph {
                     ));
                 }
                 any = true;
+                sealed.extend(arena.sealed.iter().filter(|b| b.arena == k).cloned());
                 for t in &fact.templates {
                     templates
                         .entry(t.template)
@@ -1079,7 +1123,10 @@ impl TaskGraph {
             }
         }
         if any {
-            return Ok(PoolEffects::Templates(templates));
+            return Ok(PoolEffects::Templates {
+                loads: templates,
+                sealed,
+            });
         }
         if !mode.pending {
             return Err(format!(
@@ -1088,7 +1135,10 @@ impl TaskGraph {
             ));
         }
         Ok(match mode.templates {
-            Some(map) => PoolEffects::Templates(map.clone()),
+            Some(map) => PoolEffects::Templates {
+                loads: map.clone(),
+                sealed: Vec::new(),
+            },
             None => PoolEffects::Conservative,
         })
     }
@@ -1120,7 +1170,7 @@ impl TaskGraph {
                     add(f.resource, true, true);
                 }
             }
-            PoolEffects::Templates(map) => {
+            PoolEffects::Templates { loads: map, sealed } => {
                 let loads = map.get(&record.template).ok_or_else(|| {
                     format!(
                         "{what}: template {} is not in the pool node's certified templates",
@@ -1147,6 +1197,23 @@ impl TaskGraph {
                         classes.iter().any(|c| c.reads()),
                         classes.iter().any(|c| c.writes()),
                     );
+                }
+                // The sealed tables `bind_records` discharged: the task reads
+                // the table its record names and every pointee of that table
+                // (read-only, so these only conflict with a writer, which
+                // `prove` refuses outright).
+                for b in sealed.iter().filter(|b| b.template == record.template) {
+                    let names_table = record
+                        .fields
+                        .iter()
+                        .any(|f| f.offset == b.table_arg_offset && f.resource == b.resource);
+                    if !names_table {
+                        continue;
+                    }
+                    add(b.resource, true, false);
+                    for p in &b.pointees {
+                        add(*p, true, false);
+                    }
                 }
             }
         }

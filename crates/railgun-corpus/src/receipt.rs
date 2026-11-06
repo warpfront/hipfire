@@ -230,6 +230,18 @@ pub struct ArenaPointerRecord {
 pub struct ArenaTemplateRecord {
     pub template: u32,
     pub pointer_loads: Vec<ArenaPointerRecord>,
+    /// The sealed pointer tables the template's body reads through (the
+    /// standalone body's `sealed_tables`, whose kernarg offsets are record
+    /// offsets: inside the pool region the record is the body's kernarg
+    /// block). `table_arg_offset` names a record pointer field holding the
+    /// table base; a [`SEALED_BOUND_KERNARG`] bound is the record offset of
+    /// the 4-byte entry-count scalar. Valid only once the program binds
+    /// every record of the template with a sealed table the runtime holds
+    /// (`railgun::KernelProgram::bind_records` with a
+    /// `railgun::sealed_table::SealedTableRegistry`). Absent from a template
+    /// that has none, so such receipts digest and serialize as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sealed_tables: Vec<SealedTableRecord>,
 }
 
 /// A descriptor arena of a kernel: the pointer argument that holds an array
@@ -270,6 +282,19 @@ impl DescriptorArenaRecord {
                     .any(|o| o.record_offset == p.record_offset)
                 {
                     return bad("duplicate pointer offset in a template");
+                }
+            }
+            for (j, s) in t.sealed_tables.iter().enumerate() {
+                s.validate(symbol)?;
+                if s.table_arg_offset % 8 != 0 {
+                    return bad("sealed table offset is not 8-aligned");
+                }
+                if t.sealed_tables[..j].iter().any(|o| {
+                    o.table_arg_offset == s.table_arg_offset
+                        && o.bound_kind == s.bound_kind
+                        && o.bound_value == s.bound_value
+                }) {
+                    return bad("duplicate sealed table in a template");
                 }
             }
         }
@@ -663,6 +688,13 @@ impl KernelRecord {
         if !self.sealed_tables.is_empty() {
             out.push(WITNESS_SEALED_TABLE.to_owned());
         }
+        let arena_sealed = self
+            .descriptor_arenas
+            .iter()
+            .any(|a| a.templates.iter().any(|t| !t.sealed_tables.is_empty()));
+        if arena_sealed && self.sealed_tables.is_empty() {
+            out.push(WITNESS_SEALED_TABLE.to_owned());
+        }
         if !self.descriptor_arenas.is_empty() {
             out.push(WITNESS_DESCRIPTOR_ARENA.to_owned());
         }
@@ -810,8 +842,86 @@ mod tests {
                     record_offset: 16,
                     classes: vec!["vmem_load".into()],
                 }],
+                sealed_tables: vec![],
             }],
         }
+    }
+
+    fn sealed_table() -> SealedTableRecord {
+        SealedTableRecord {
+            table_arg_offset: 0,
+            bound_kind: SEALED_BOUND_KERNARG.into(),
+            bound_value: 24,
+            entry_bytes: 8,
+            entries: vec![SealedEntryRecord {
+                pc: 0x40,
+                class: "smem_load".into(),
+                path: "scalar".into(),
+                cache: "th=0 scope=0".into(),
+                width: 8,
+                index_expr: "load@0x20".into(),
+                guard_pcs: vec![0x30],
+            }],
+            accesses: vec![SealedAccessRecord {
+                pc: 0x50,
+                class: "vmem_load".into(),
+                path: "vector".into(),
+                cache: "th=0 scope=0".into(),
+                width: 16,
+                entry_pcs: vec![0x40],
+            }],
+            null_guarded: false,
+        }
+    }
+
+    #[test]
+    fn arena_template_sealed_tables_are_optional_validated_and_digest_bound() {
+        // Absent: the serialized template is byte-identical to before the field.
+        let plain = arena();
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json["templates"][0].get("sealed_tables").is_none());
+        let back: DescriptorArenaRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back, plain);
+        let mut k = record();
+        k.status = STATUS_CONDITIONAL.into();
+        k.descriptor_arenas = vec![plain];
+        k.required_witnesses = k.implied_witnesses();
+        assert_eq!(k.required_witnesses, vec![WITNESS_DESCRIPTOR_ARENA]);
+        k.differential.guarded = true;
+        k.case_digest = case_digest("obj", "elf", "gfx1201", &k);
+        k.validate_case("obj", "elf", "gfx1201").unwrap();
+
+        // Present: round-trips, implies the sealed_table witness, binds the digest.
+        let mut sealed = k.clone();
+        sealed.descriptor_arenas[0].templates[0].sealed_tables = vec![sealed_table()];
+        let json = serde_json::to_value(&sealed).unwrap();
+        assert!(json["descriptor_arenas"][0]["templates"][0]
+            .get("sealed_tables")
+            .is_some());
+        let back: KernelRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back.descriptor_arenas, sealed.descriptor_arenas);
+        assert_eq!(
+            sealed.implied_witnesses(),
+            vec![WITNESS_DESCRIPTOR_ARENA, WITNESS_SEALED_TABLE]
+        );
+        // The old witness set and digest no longer validate.
+        assert!(sealed.validate_case("obj", "elf", "gfx1201").is_err());
+        sealed.required_witnesses = sealed.implied_witnesses();
+        sealed.case_digest = case_digest("obj", "elf", "gfx1201", &sealed);
+        assert_ne!(sealed.case_digest, k.case_digest);
+        sealed.validate_case("obj", "elf", "gfx1201").unwrap();
+
+        // Fail-closed shapes.
+        let mut bad = sealed.clone();
+        bad.descriptor_arenas[0].templates[0].sealed_tables[0].entry_bytes = 4;
+        assert!(bad.descriptor_arenas[0].validate("k").is_err());
+        let mut dup = sealed.descriptor_arenas[0].clone();
+        let t = dup.templates[0].sealed_tables[0].clone();
+        dup.templates[0].sealed_tables.push(t);
+        assert!(dup.validate("k").is_err());
+        let mut unaligned = sealed.descriptor_arenas[0].clone();
+        unaligned.templates[0].sealed_tables[0].table_arg_offset = 4;
+        assert!(unaligned.validate("k").is_err());
     }
 
     #[test]

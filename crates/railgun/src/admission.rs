@@ -485,6 +485,7 @@ mod lab_tests {
     use crate::kernel::tests::{facts, launch, ptr};
     use crate::kernel::{author, FactStatus, MemClass::*};
     use crate::plan::{plan, CacheTable, RowPolicy};
+    use crate::sealed_table::SealedTableRegistry;
     use crate::{BindingField, BindingRecord, ResourceId, ResourceKind};
 
     const A: u64 = 0x7000_0000;
@@ -657,8 +658,10 @@ mod lab_tests {
                     interior: 0,
                 },
             ],
+            scalars: Vec::new(),
         };
-        p.bind_records(ResourceId(0), vec![rec]).unwrap();
+        p.bind_records(ResourceId(0), vec![rec], &SealedTableRegistry::new())
+            .unwrap();
 
         // The arena must be the declared kind and some argument must be bound to it.
         let mut q = p.clone();

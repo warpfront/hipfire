@@ -55,8 +55,9 @@ use peacemaker_lift::regions_note::{read_regions, KernelRegions, Region};
 use peacemaker_lift::rewrite::region::{lift_region, RegionInputs};
 use peacemaker_lift::{lift_object, Options};
 use railgun_corpus::receipt::{
-    ArenaPointerRecord, ArenaTemplateRecord, DescriptorArenaRecord, TaskProtocolRecord,
-    STATUS_CONDITIONAL, STATUS_PROVEN, STATUS_UNKNOWN, WITNESS_DESCRIPTOR_ARENA,
+    ArenaPointerRecord, ArenaTemplateRecord, DescriptorArenaRecord, SealedTableRecord,
+    TaskProtocolRecord, SEALED_BOUND_KERNARG, STATUS_CONDITIONAL, STATUS_PROVEN, STATUS_UNKNOWN,
+    WITNESS_DESCRIPTOR_ARENA, WITNESS_SEALED_TABLE,
 };
 use sha2::{Digest, Sha256};
 
@@ -675,15 +676,7 @@ fn derive_lifted(
                 ),
             )
         })?;
-    if record.status != STATUS_PROVEN {
-        return Err(refuse(
-            "task_graph-region-arena",
-            format!(
-                "template {t}: the standalone body's A1 record is {}, not proven",
-                record.status
-            ),
-        ));
-    }
+    let (loads, sealed_tables) = template_from_standalone(t, record)?;
     if record.dynamic_kernarg_reads
         || record.taint_overflow
         || record.side.module_global != 0
@@ -696,19 +689,6 @@ fn derive_lifted(
             format!("template {t}: the body reads outside its own record (side reads or dynamic kernarg reads)"),
         ));
     }
-    let loads: Vec<ArenaPointerRecord> = {
-        let mut v: Vec<ArenaPointerRecord> = record
-            .args
-            .iter()
-            .filter(|a| a.role == "pointer" && a.accesses > 0)
-            .map(|a| ArenaPointerRecord {
-                record_offset: a.offset,
-                classes: a.classes.clone(),
-            })
-            .collect();
-        v.sort_by_key(|p| p.record_offset);
-        v
-    };
     // The same facts from the pool's own bytes (region-scoped A1) are reported, not
     // required: the bytes are proven identical to the standalone body, whose own
     // proven A1 record is the source of the template.
@@ -748,10 +728,26 @@ fn derive_lifted(
             ));
         }
     }
+    let sealed_note = if sealed_tables.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; sealed tables [{}]",
+            sealed_tables
+                .iter()
+                .map(|s| format!(
+                    "@{} bound {}={}",
+                    s.table_arg_offset, s.bound_kind, s.bound_value
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     Ok(RegionFacts {
         template: ArenaTemplateRecord {
             template: t,
             pointer_loads: loads,
+            sealed_tables,
         },
         lds_bytes: lifted.lds_bytes,
         evidence: format!(
@@ -763,8 +759,129 @@ fn derive_lifted(
             r.exit_pc,
             record.kernarg_size,
             hidden.join(", ")
-        ),
+        ) + &sealed_note,
     })
+}
+
+/// The template facts of a standalone body's A1 record: its pointer loads and
+/// sealed tables. A proven record yields no sealed tables; a conditional record is
+/// admitted only when its sole condition is sealed tables (see the rules below).
+fn template_from_standalone(
+    t: u32,
+    record: &KernelRecord,
+) -> Result<(Vec<ArenaPointerRecord>, Vec<SealedTableRecord>), Refusal> {
+    let no = |why: String| {
+        refuse(
+            "task_graph-region-arena",
+            format!(
+                "template {t}: the standalone body's A1 record is {}, not admitted: {why}",
+                record.status
+            ),
+        )
+    };
+    let sealed_only = match record.status.as_str() {
+        STATUS_PROVEN => false,
+        STATUS_CONDITIONAL => {
+            if !record.indexed_effects.is_empty() {
+                return Err(no("it has indexed effects (indexed_bind)".into()));
+            }
+            if record.sealed_tables.is_empty() {
+                return Err(no("it is conditional without sealed tables".into()));
+            }
+            if !record.guards.is_empty()
+                || !record.descriptor_arenas.is_empty()
+                || record.task_protocol.is_some()
+            {
+                return Err(no(
+                    "it has guards, descriptor arenas or a task protocol".into()
+                ));
+            }
+            if record.required_witnesses != [WITNESS_SEALED_TABLE] {
+                return Err(no(format!(
+                    "its witnesses are {:?}, not exactly [sealed_table]",
+                    record.required_witnesses
+                )));
+            }
+            true
+        }
+        _ => return Err(no("it is not proven".into())),
+    };
+    let mut sealed: Vec<SealedTableRecord> = Vec::new();
+    if sealed_only {
+        for s in &record.sealed_tables {
+            s.validate(&record.symbol).map_err(no)?;
+            let arg = record
+                .args
+                .iter()
+                .find(|a| a.offset == s.table_arg_offset)
+                .filter(|a| a.role == "pointer" && a.size == 8)
+                .ok_or_else(|| {
+                    no(format!(
+                        "sealed table arg +{} is not an 8-byte pointer argument",
+                        s.table_arg_offset
+                    ))
+                })?;
+            if arg
+                .classes
+                .iter()
+                .any(|c| !matches!(c.as_str(), "smem_load" | "vmem_load"))
+                || matches!(arg.mode.as_deref(), Some("write" | "read_write"))
+            {
+                return Err(no(format!(
+                    "sealed table arg +{} is written or accessed as {:?}",
+                    s.table_arg_offset, arg.classes
+                )));
+            }
+            if s.bound_kind == SEALED_BOUND_KERNARG {
+                let b = s.bound_value;
+                if b % 4 != 0 || b + 4 > u64::from(record.kernarg_size) {
+                    return Err(no(format!(
+                        "kernarg bound +{b} is not a 4-aligned scalar inside the {}-byte record",
+                        record.kernarg_size
+                    )));
+                }
+                if record.args.iter().any(|a| {
+                    a.role == "pointer"
+                        && b < u64::from(a.offset) + u64::from(a.size)
+                        && u64::from(a.offset) < b + 4
+                }) {
+                    return Err(no(format!(
+                        "kernarg bound +{b} overlaps a pointer argument"
+                    )));
+                }
+            }
+            sealed.push(s.clone());
+        }
+        sealed.sort_by(|a, b| {
+            (a.table_arg_offset, &a.bound_kind, a.bound_value).cmp(&(
+                b.table_arg_offset,
+                &b.bound_kind,
+                b.bound_value,
+            ))
+        });
+    }
+    let mut loads: Vec<ArenaPointerRecord> = record
+        .args
+        .iter()
+        .filter(|a| a.role == "pointer" && a.accesses > 0)
+        .map(|a| ArenaPointerRecord {
+            record_offset: a.offset,
+            classes: a.classes.clone(),
+        })
+        .collect();
+    for s in &sealed {
+        if !loads.iter().any(|l| l.record_offset == s.table_arg_offset) {
+            let mut classes: Vec<String> = s.entries.iter().map(|e| e.class.clone()).collect();
+            classes.sort();
+            classes.dedup();
+            loads.push(ArenaPointerRecord {
+                record_offset: s.table_arg_offset,
+                classes,
+            });
+        }
+    }
+    loads.sort_by_key(|p| p.record_offset);
+    Ok((loads, sealed))
 }
 
 fn derive_native(kernel: &Kernel, arch: Arch, p: &Placed) -> Result<RegionFacts, Refusal> {
@@ -781,6 +898,7 @@ fn derive_native(kernel: &Kernel, arch: Arch, p: &Placed) -> Result<RegionFacts,
         template: ArenaTemplateRecord {
             template: t,
             pointer_loads: loads,
+            sealed_tables: Vec::new(),
         },
         lds_bytes: 0,
         evidence: format!(
@@ -1116,7 +1234,19 @@ pub fn certify_pool(pool_elf: &[u8], standalone: Standalone<'_>) -> Result<Recei
                 record.descriptor_arenas = vec![proof.arena.clone()];
                 record.task_protocol = Some(proof.protocol.clone());
                 record.required_witnesses = record.implied_witnesses();
-                debug_assert_eq!(record.required_witnesses, [WITNESS_DESCRIPTOR_ARENA]);
+                let sealed = proof
+                    .arena
+                    .templates
+                    .iter()
+                    .any(|t| !t.sealed_tables.is_empty());
+                debug_assert_eq!(
+                    record.required_witnesses,
+                    if sealed {
+                        vec![WITNESS_DESCRIPTOR_ARENA, WITNESS_SEALED_TABLE]
+                    } else {
+                        vec![WITNESS_DESCRIPTOR_ARENA]
+                    }
+                );
                 record.case_digest = case_digest(
                     &receipt.object_sha256,
                     &receipt.device_elf_sha256,
@@ -1325,5 +1455,190 @@ pub fn cli(command: &str, args: &[String]) -> Result<(), String> {
             Ok(())
         }
         other => Err(format!("unknown pool command {other}")),
+    }
+}
+
+#[cfg(test)]
+mod sealed_tests {
+    use super::*;
+    use railgun_corpus::receipt::{
+        case_digest, ArgRecord, Differential, SealedAccessRecord, SealedEntryRecord,
+    };
+    use std::collections::BTreeMap;
+
+    fn arg(offset: u32, size: u32, role: &str, accesses: usize, classes: &[&str]) -> ArgRecord {
+        ArgRecord {
+            offset,
+            size,
+            index: None,
+            name: format!("a{offset}"),
+            value_kind: "global_buffer".into(),
+            role: role.into(),
+            mode: (accesses > 0).then(|| "read".to_owned()),
+            bound: None,
+            classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+            paths: vec![],
+            cache_bits: vec![],
+            accesses,
+            shared: false,
+            read_cache: "not_read".into(),
+            sinks: vec![],
+            loaded: true,
+        }
+    }
+
+    fn table(arg_off: u32, bound: u64) -> SealedTableRecord {
+        SealedTableRecord {
+            table_arg_offset: arg_off,
+            bound_kind: SEALED_BOUND_KERNARG.into(),
+            bound_value: bound,
+            entry_bytes: 8,
+            entries: vec![SealedEntryRecord {
+                pc: 0x40,
+                class: "smem_load".into(),
+                path: "scalar".into(),
+                cache: "th=0 scope=0".into(),
+                width: 8,
+                index_expr: "load@0x20".into(),
+                guard_pcs: vec![0x30],
+            }],
+            accesses: vec![SealedAccessRecord {
+                pc: 0x50,
+                class: "vmem_load".into(),
+                path: "vector".into(),
+                cache: "th=0 scope=0".into(),
+                width: 16,
+                entry_pcs: vec![0x40],
+            }],
+            null_guarded: false,
+        }
+    }
+
+    /// Table arg +0 (no counted accesses), output pointer +8, bound scalar +16.
+    fn record() -> KernelRecord {
+        KernelRecord {
+            symbol: "body".into(),
+            status: STATUS_CONDITIONAL.into(),
+            unresolved: vec![],
+            kernarg_size: 24,
+            read_cache: "not_read".into(),
+            dynamic_kernarg_reads: false,
+            taint_overflow: false,
+            side: Default::default(),
+            implicit: Default::default(),
+            args: vec![
+                arg(0, 8, "pointer", 0, &[]),
+                arg(8, 8, "pointer", 1, &["vmem_store"]),
+                arg(16, 4, "integer", 0, &[]),
+            ],
+            dwords: vec![],
+            differential: Differential {
+                source: "none".into(),
+                status: "pass".into(),
+                args: vec![],
+                radiowave_mutable_read_cache: None,
+                guards: vec![],
+                guarded: true,
+            },
+            pm_obligations: BTreeMap::new(),
+            pm_analyze_error: None,
+            unguarded_unresolved: vec![],
+            guards: vec![],
+            indexed_effects: vec![],
+            sealed_tables: vec![table(0, 16)],
+            descriptor_arenas: vec![],
+            required_witnesses: vec![WITNESS_SEALED_TABLE.to_owned()],
+            case_digest: String::new(),
+            guard_flag: None,
+            task_protocol: None,
+        }
+    }
+
+    fn refused(r: &KernelRecord) -> Refusal {
+        template_from_standalone(7, r).expect_err("must refuse")
+    }
+
+    #[test]
+    fn sealed_only_conditional_is_admitted_with_unchanged_offsets() {
+        let (loads, sealed) = template_from_standalone(7, &record()).expect("admitted");
+        assert_eq!(sealed, vec![table(0, 16)]);
+        let offs: Vec<u32> = loads.iter().map(|l| l.record_offset).collect();
+        assert_eq!(offs, [0, 8]);
+        assert_eq!(loads[0].classes, ["smem_load"]);
+        assert_eq!(loads[1].classes, ["vmem_store"]);
+    }
+
+    #[test]
+    fn other_conditional_shapes_are_refused() {
+        let mut indexed = record();
+        indexed.indexed_effects = vec![railgun_corpus::receipt::IndexedEffectRecord {
+            pc: 0,
+            base_arg_offset: 8,
+            mode: "read".into(),
+            class: "vmem_load".into(),
+            path: "vector".into(),
+            cache: "".into(),
+            width: 4,
+            address_expr: "x".into(),
+            index_loads: vec![],
+            guards: vec![],
+        }];
+        indexed.required_witnesses = vec!["indexed_bind".into(), WITNESS_SEALED_TABLE.into()];
+        let r = refused(&indexed);
+        assert_eq!(r.rule, "task_graph-region-arena");
+        assert!(r.detail.contains("indexed"), "{}", r.detail);
+
+        let mut guards = record();
+        guards.guards = vec![railgun_corpus::receipt::GuardRecord {
+            kind: "k".into(),
+            arg_offset: 0,
+            size: 4,
+            value: "1".into(),
+        }];
+        assert_eq!(refused(&guards).rule, "task_graph-region-arena");
+
+        let mut wit = record();
+        wit.required_witnesses = vec!["indexed_bind".into(), WITNESS_SEALED_TABLE.into()];
+        assert_eq!(refused(&wit).rule, "task_graph-region-arena");
+
+        let mut overlap = record();
+        overlap.sealed_tables = vec![table(0, 8)];
+        assert_eq!(refused(&overlap).rule, "task_graph-region-arena");
+
+        let mut outside = record();
+        outside.sealed_tables = vec![table(0, 24)];
+        assert_eq!(refused(&outside).rule, "task_graph-region-arena");
+
+        let mut scalar_table = record();
+        scalar_table.sealed_tables = vec![table(16, 20)];
+        assert_eq!(refused(&scalar_table).rule, "task_graph-region-arena");
+
+        let mut written = record();
+        written.args[0] = arg(0, 8, "pointer", 1, &["vmem_store"]);
+        assert_eq!(refused(&written).rule, "task_graph-region-arena");
+    }
+
+    #[test]
+    fn pool_record_with_sealed_templates_validates_with_both_witnesses() {
+        let (loads, sealed) = template_from_standalone(7, &record()).unwrap();
+        let mut pool = record();
+        pool.args.clear();
+        pool.sealed_tables.clear();
+        pool.required_witnesses.clear();
+        pool.descriptor_arenas = vec![DescriptorArenaRecord {
+            arena_arg_offset: 0,
+            templates: vec![ArenaTemplateRecord {
+                template: 7,
+                pointer_loads: loads,
+                sealed_tables: sealed,
+            }],
+        }];
+        pool.required_witnesses = pool.implied_witnesses();
+        assert_eq!(
+            pool.required_witnesses,
+            [WITNESS_DESCRIPTOR_ARENA, WITNESS_SEALED_TABLE]
+        );
+        pool.case_digest = case_digest("obj", "elf", "gfx1201", &pool);
+        pool.validate_case("obj", "elf", "gfx1201").expect("valid");
     }
 }

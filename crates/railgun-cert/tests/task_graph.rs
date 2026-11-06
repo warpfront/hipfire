@@ -21,8 +21,8 @@ use peacemaker_lift::{lift_object, Options};
 use railgun_cert::task_graph::certify_pool;
 use railgun_cert::{KernelRecord, Receipt};
 use railgun_corpus::receipt::{
-    TASK_PROTO_ACQUIRE, TASK_PROTO_BOUNDED, TASK_PROTO_CLAIM, TASK_PROTO_COMPLETE, TASK_PROTO_ONCE,
-    TASK_PROTO_RELEASE, TASK_PROTO_REQUIRED,
+    SEALED_BOUND_KERNARG, TASK_PROTO_ACQUIRE, TASK_PROTO_BOUNDED, TASK_PROTO_CLAIM,
+    TASK_PROTO_COMPLETE, TASK_PROTO_ONCE, TASK_PROTO_RELEASE, TASK_PROTO_REQUIRED,
 };
 
 fn dir() -> PathBuf {
@@ -70,15 +70,12 @@ fn explain(k: &KernelRecord) -> String {
 const POOLS: &[(&str, &str, &[u32])] = &[
     ("b32", "pm_pool_b32", &[8, 10, 11, 17]),
     ("b64", "pm_pool_b64", &[6]),
+    ("b128", "pm_pool_b128", &[7, 12, 16, 18]),
     ("b256", "pm_pool_b256", &[2, 4, 9, 13, 14, 15]),
 ];
 
-/// b128 hosts two MoE bodies (templates 16, 18) whose standalone A1 record is not
-/// proven (their expert pointers are loaded from tables): the pool stays unknown, with
-/// exactly those two refusals, and nothing else (the dispatcher's shell and protocol,
-/// the other two regions, are proven).
-/// Run the obligations on a fixture pool: the refusals, and the proof the pool would
-/// have had if those refusals did not stand.
+/// Run the obligations on a fixture pool: the refusals, and the proof the pool
+/// would have had if those refusals did not stand.
 fn prove(name: &str, symbol: &str) -> (Vec<String>, Option<railgun_cert::task_graph::PoolProof>) {
     let bytes = pool(name);
     let lifted = lift_object(
@@ -181,7 +178,12 @@ fn real_pools_are_certified() {
         assert!(k.unresolved.is_empty(), "{name}:\n{}", explain(k));
         assert_eq!(k.descriptor_arenas, [proof.arena.clone()]);
         assert_eq!(k.task_protocol.as_ref(), Some(&proof.protocol));
-        assert_eq!(k.required_witnesses, ["descriptor_arena"]);
+        let want: &[&str] = if arena.templates.iter().any(|t| !t.sealed_tables.is_empty()) {
+            &["descriptor_arena", "sealed_table"]
+        } else {
+            &["descriptor_arena"]
+        };
+        assert_eq!(k.required_witnesses, want, "{name}");
         k.validate_case(
             &receipt.object_sha256,
             &receipt.device_elf_sha256,
@@ -191,22 +193,113 @@ fn real_pools_are_certified() {
     }
 }
 
-/// b128 hosts two MoE bodies (templates 16, 18) whose standalone A1 record is not
-/// proven (their expert pointers are loaded from tables): two more refusals, nothing else
-/// (the dispatcher's shell and protocol and the other two regions are proven).
+/// b128 hosts two MoE bodies (templates 16, 18) whose standalone A1 record is
+/// `conditional` with a sealed table (the expert pointers come from a
+/// loader-written table): each template of the pool record carries it, at the
+/// record offset of its table argument with the entry-count scalar's record
+/// offset as bound, and the pool record requires the `sealed_table` witness
+/// besides `descriptor_arena`.
 #[test]
-fn b128_is_refused_on_its_two_unproven_moe_bodies_and_the_poison_store() {
-    let (refusals, _) = prove("b128", "pm_pool_b128");
-    let kinds: Vec<&str> = refusals
-        .iter()
-        .map(|r| r.split(':').next().unwrap())
-        .collect();
-    assert_eq!(
-        kinds,
-        ["task_graph-region-arena", "task_graph-region-arena"],
-        "{refusals:#?}"
-    );
-    assert!(refusals[0].contains("template 16:") && refusals[1].contains("template 18:"));
+fn b128_carries_the_sealed_tables_of_its_two_moe_bodies() {
+    let (refusals, partial) = prove("b128", "pm_pool_b128");
+    assert!(refusals.is_empty(), "{refusals:#?}");
+    let proof = partial.expect("the proof");
+    for t in &proof.arena.templates {
+        let sealed = !t.sealed_tables.is_empty();
+        assert_eq!(
+            sealed,
+            [16, 18].contains(&t.template),
+            "template {}",
+            t.template
+        );
+        if sealed {
+            assert_eq!(t.sealed_tables.len(), 1, "template {}", t.template);
+            let s = &t.sealed_tables[0];
+            assert_eq!(s.table_arg_offset, 0, "template {}", t.template);
+            assert_eq!(
+                s.bound_kind, SEALED_BOUND_KERNARG,
+                "template {}",
+                t.template
+            );
+            // The table argument is loaded from the record, so it is a pointer load.
+            assert!(
+                t.pointer_loads.iter().any(|p| p.record_offset == 0),
+                "template {}",
+                t.template
+            );
+            // The bound is a scalar of the record, not any pointer field.
+            assert!(
+                t.pointer_loads
+                    .iter()
+                    .all(|p| u64::from(p.record_offset) + 8 <= s.bound_value
+                        || s.bound_value + 4 <= u64::from(p.record_offset)),
+                "template {}",
+                t.template
+            );
+        }
+    }
+    let receipt = certify_pool(&pool("b128"), &from_disk).expect("certify");
+    let k = kernel(&receipt, "pm_pool_b128");
+    assert_eq!(k.status, "conditional", "{}", explain(k));
+    assert_eq!(k.required_witnesses, ["descriptor_arena", "sealed_table"]);
+    k.validate_case(
+        &receipt.object_sha256,
+        &receipt.device_elf_sha256,
+        &receipt.arch,
+    )
+    .unwrap();
+}
+
+/// The standalone sealed-table proofs assume the region is entered with the
+/// kernel-entry EXEC (every lane). The dispatcher narrows EXEC to lane 0 for
+/// its claim code and restores it before each region: a pool that keeps EXEC
+/// narrowed (lane 0, zero or unknown) at a region entry is refused.
+#[test]
+fn a_region_entered_without_the_kernel_entry_exec_is_refused() {
+    for (name, symbol) in [("b32", "pm_pool_b32"), ("b128", "pm_pool_b128")] {
+        let base = pool(name);
+        let at = locate(&base, symbol);
+        let restore = words_of("s_mov_b32 exec_lo, -1")[0];
+        let pcs: Vec<u32> = instructions(&base, symbol)
+            .into_iter()
+            .filter(|(pc, dwords, m)| {
+                m == "s_mov_b32" && *dwords == 1 && {
+                    let o = at.file_at + *pc as usize;
+                    u32::from_le_bytes(base[o..o + 4].try_into().unwrap()) == restore
+                }
+            })
+            .map(|(pc, _, _)| pc)
+            .collect();
+        // One restore per path the dispatcher takes to a region: mutating the
+        // first leaves some region entered with the narrowed EXEC.
+        assert!(!pcs.is_empty(), "{name}: the dispatcher restores EXEC");
+        let variants: &[&str] = if name == "b32" {
+            &[
+                "s_mov_b32 exec_lo, 1",
+                "s_mov_b32 exec_lo, 0",
+                "s_mov_b32 exec_lo, 5",
+            ]
+        } else {
+            &["s_mov_b32 exec_lo, 1"]
+        };
+        for narrowed in variants {
+            let mut bytes = base.clone();
+            patch(&mut bytes, &at, pcs[0], &words_of(narrowed));
+            let r = certified(&bytes, symbol);
+            expect_refused(&r, symbol, "task_graph-region-exec");
+            let detail = explain(kernel(&r, symbol));
+            assert!(
+                detail.contains("not the kernel-entry EXEC"),
+                "{name} {narrowed}: {detail}"
+            );
+        }
+        // Dropping the restore altogether (a nop) is the same.
+        if name == "b32" {
+            let mut bytes = base.clone();
+            nop_out(&mut bytes, symbol, &at, pcs[0], 1);
+            expect_refused(&certified(&bytes, symbol), symbol, "task_graph-region-exec");
+        }
+    }
 }
 
 #[test]

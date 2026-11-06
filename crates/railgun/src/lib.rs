@@ -163,7 +163,8 @@ pub enum ResourceKind {
 pub const EVENT_CELL_BYTES: u64 = 16;
 
 /// One record of a [`ResourceKind::BindingRecords`] arena: an instance of
-/// `template` at `base`, whose pointer `fields` railgun writes.
+/// `template` at `base`, whose pointer `fields` and `u32` `scalars` railgun
+/// writes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BindingRecord {
     /// Byte offset of the record in the arena.
@@ -172,6 +173,12 @@ pub struct BindingRecord {
     /// from it (`ArenaFact::templates`).
     pub template: u32,
     pub fields: Vec<BindingField>,
+    /// Declared `u32` scalar fields, `(record-relative byte offset
+    /// (4-aligned), value)`, written by railgun exactly like the pointer
+    /// fields. A certified kernel may bound a sealed-table index by one of
+    /// them (`SealedTableFact::bound`); only a declared scalar is a bound
+    /// railgun knows. Never overlaps a pointer field of the record.
+    pub scalars: Vec<(u32, u32)>,
 }
 
 /// One 8-byte pointer field of a [`BindingRecord`]: written as
@@ -183,6 +190,45 @@ pub struct BindingField {
     pub resource: ResourceId,
     /// Byte offset of the pointee inside `resource` (below its size).
     pub interior: u64,
+}
+
+/// What railgun writes into a binding-record arena
+/// ([`KernelProgram::binding_record_image`]): the little-endian bytes of
+/// every declared pointer field and scalar, by arena byte offset.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BindingRecordImage {
+    /// `(arena byte offset, pointer value)`, sorted by offset.
+    pub pointers: Vec<(u64, u64)>,
+    /// `(arena byte offset, value)`, sorted by offset.
+    pub scalars: Vec<(u64, u32)>,
+}
+
+impl BindingRecordImage {
+    /// Every write as `(arena byte offset, little-endian bytes)`, sorted by
+    /// offset. The writes never overlap (checked at construction).
+    pub fn writes(&self) -> Vec<(u64, Vec<u8>)> {
+        let mut out: Vec<(u64, Vec<u8>)> = self
+            .pointers
+            .iter()
+            .map(|&(at, v)| (at, v.to_le_bytes().to_vec()))
+            .chain(
+                self.scalars
+                    .iter()
+                    .map(|&(at, v)| (at, v.to_le_bytes().to_vec())),
+            )
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Number of fields (pointers plus scalars).
+    pub fn len(&self) -> usize {
+        self.pointers.len() + self.scalars.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

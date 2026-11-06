@@ -8,10 +8,12 @@ use super::*;
 use crate::kernel::tests::{facts, launch, ptr};
 use crate::kernel::{
     author, ArenaFact, ArenaTemplate, ArgFact, ArgRole, ConditionalFacts, FactStatus, LaunchRecord,
-    MemClass::*, NodeFacts, RegionEffect,
+    MemClass::*, NodeFacts, RegionEffect, SealedTableFact, TableAccess, TableBound, TableEntryLoad,
 };
 use crate::plan::{plan, CacheTable, RowPolicy};
-use crate::{BindingField, BindingRecord, EVENT_CELL_BYTES};
+use crate::sealed_table::tests as st;
+use crate::sealed_table::{Pointee, SealedTableRegistry};
+use crate::{Binding, BindingField, BindingRecord, EVENT_CELL_BYTES};
 
 const TASKS: u64 = 0x7000_0000;
 const EVENTS: u64 = 0x7100_0000;
@@ -30,6 +32,11 @@ const T_WRITE: u32 = 4;
 
 const N: u32 = NONE;
 const ALL: [u32; 4] = [T_COPY, T_READ, T_NOP, T_WRITE];
+/// Reads through the sealed pointer table at field +0 (bound: the declared
+/// `u32` scalar at record +8); every pointee is read-only.
+const T_SEALED: u32 = 5;
+const SEALED_BOUND_AT: u32 = 8;
+const SEALED_N: u32 = st::ENTRIES;
 
 fn t(template: u32, record: u32, pred: u32, expected: u32, done: u32) -> TaskHeader {
     TaskHeader {
@@ -63,11 +70,42 @@ fn template(id: u32) -> ArenaTemplate {
             record_offset: 8,
             classes: vec![VmemStore],
         }],
+        T_SEALED => vec![L {
+            record_offset: 0,
+            classes: vec![SmemLoad],
+        }],
         other => panic!("no template {other}"),
     };
     ArenaTemplate {
         template: id,
         pointer_loads: loads,
+        sealed: if id == T_SEALED {
+            vec![SealedTableFact {
+                table_arg_offset: 0,
+                bound: TableBound::Kernarg(SEALED_BOUND_AT),
+                entry_bytes: 8,
+                entries: vec![TableEntryLoad {
+                    pc: 0x10,
+                    class: SmemLoad,
+                    path: "scalar".into(),
+                    cache: "th=0".into(),
+                    width: 8,
+                    index_expr: "load@0x8".into(),
+                    guard_pcs: vec![0x20],
+                }],
+                accesses: vec![TableAccess {
+                    pc: 0x30,
+                    class: VmemLoad,
+                    path: "vector".into(),
+                    cache: "th=0".into(),
+                    width: 16,
+                    entry_pcs: vec![0x10],
+                }],
+                null_guarded: false,
+            }]
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -110,7 +148,11 @@ fn conditional_facts(known: &[u32], protocol: Option<TaskProtocolFact>) -> Arc<N
             templates: known.iter().map(|&id| template(id)).collect(),
         }],
         task_protocol: protocol,
-        witnesses: vec!["descriptor_arena".into()],
+        witnesses: if known.contains(&T_SEALED) {
+            vec!["descriptor_arena".into(), "sealed_table".into()]
+        } else {
+            vec!["descriptor_arena".into()]
+        },
         case_digest: "ab".repeat(32),
     });
     Arc::new(f)
@@ -183,6 +225,30 @@ fn build(
     protocol: Option<TaskProtocolFact>,
     unknown: bool,
 ) -> Fixture {
+    build_with(
+        pools,
+        records,
+        known,
+        protocol,
+        unknown,
+        &SealedTableRegistry::new(),
+        Vec::new(),
+    )
+    .unwrap()
+}
+
+/// [`build`] over a sealed-table registry, with `extra` launches (after the
+/// pools, so the group is unchanged) that make further allocations program
+/// resources; `Err` is a refused `bind_records`.
+fn build_with(
+    pools: Vec<Vec<TaskHeader>>,
+    records: &[(u32, &[(u32, u64)])],
+    known: Vec<Vec<u32>>,
+    protocol: Option<TaskProtocolFact>,
+    unknown: bool,
+    sealed: &SealedTableRegistry,
+    extra: Vec<LaunchRecord>,
+) -> Result<Fixture, String> {
     let mut launches = vec![launch(
         &[(0, X), (8, Y), (16, Z)],
         24,
@@ -200,6 +266,7 @@ fn build(
         };
         launches.push(pool_launch(p, tasks.len() as u32, f));
     }
+    launches.extend(extra);
     let mut program = author("gfx1201", &launches);
     let big = 1 << 22;
     for base in [EVENTS, CTL] {
@@ -234,9 +301,14 @@ fn build(
                     interior: 0,
                 })
                 .collect(),
+            scalars: if *template == T_SEALED {
+                vec![(SEALED_BOUND_AT, SEALED_N)]
+            } else {
+                Vec::new()
+            },
         })
         .collect();
-    program.bind_records(arena, records).unwrap();
+    program.bind_records(arena, records, sealed)?;
     let group = 1..1 + pools.len();
     let graph = TaskGraph::new(
         pools
@@ -248,11 +320,11 @@ fn build(
         20_000,
         arena,
     );
-    Fixture {
+    Ok(Fixture {
         program,
         group,
         graph,
-    }
+    })
 }
 
 /// Every pool knows every template.
@@ -928,4 +1000,209 @@ mod lab {
             .unwrap_err();
         assert!(err.contains("race on resource"), "{err}");
     }
+}
+
+// ---- sealed tables of arena templates (design D.2) ------------------------
+
+// The default seal's addresses moved clear of the fixture's `X`/`Y`/`Z`.
+const TBL: u64 = 0x7800_0000;
+const PW0: u64 = 0x7900_0000;
+const PW1: u64 = 0x7a00_0000;
+
+fn tbl() -> Binding {
+    Binding {
+        base: TBL,
+        bytes: st::TABLE_BYTES,
+    }
+}
+
+fn pw0() -> Binding {
+    Binding {
+        base: PW0,
+        bytes: st::W_BYTES,
+    }
+}
+
+fn pw1() -> Binding {
+    Binding {
+        base: PW1,
+        bytes: st::W_BYTES,
+    }
+}
+
+fn pointees() -> Vec<Pointee> {
+    vec![Pointee::immutable(pw0()), Pointee::immutable(pw1())]
+}
+
+fn entry_ptrs() -> [u64; 4] {
+    [PW0, PW0 + 0x100, PW1 + 8, PW1 + st::W_BYTES - 8]
+}
+
+/// The table and both pointee allocations of the default seal as program
+/// resources (read by plain nodes after the pools, so the group is unchanged).
+fn sealed_extras(more: Vec<LaunchRecord>) -> Vec<LaunchRecord> {
+    use crate::index_bind::tests as ib;
+    let mut v = vec![
+        ib::extra_launch("table", TBL, tbl(), &[SmemLoad]),
+        ib::extra_launch("w0", PW0, pw0(), &[VmemLoad]),
+        ib::extra_launch("w1", PW1, pw1(), &[VmemLoad]),
+    ];
+    v.extend(more);
+    v
+}
+
+fn sealed_registry() -> SealedTableRegistry {
+    let registry = SealedTableRegistry::new();
+    registry
+        .seal(
+            tbl(),
+            st::ENTRIES,
+            &st::table_bytes(&entry_ptrs()),
+            &pointees(),
+            st::GEN,
+        )
+        .unwrap();
+    registry
+}
+
+/// Pool 0 runs one sealed-table task (record 0: the table field at +0, the
+/// declared entry count at +8); pool 1 runs a task reading `W0` (a pointee)
+/// through an ordinary field, ordered after it.
+fn sealed_fixture(
+    registry: &SealedTableRegistry,
+    more: Vec<LaunchRecord>,
+) -> Result<Fixture, String> {
+    build_with(
+        vec![vec![t(T_SEALED, 0, N, 0, 0)], vec![t(T_READ, 1, 0, 1, N)]],
+        &[(T_SEALED, &[(0, TBL)]), (T_READ, &[(0, PW0)])],
+        vec![vec![T_SEALED], vec![T_READ]],
+        Some(proven_protocol()),
+        false,
+        registry,
+        sealed_extras(more),
+    )
+}
+
+#[test]
+fn a_sealed_table_task_reads_the_table_and_every_pointee() {
+    let fx = sealed_fixture(&sealed_registry(), Vec::new()).unwrap();
+    let (table, w0, w1) = (fx.data(TBL), fx.data(PW0), fx.data(PW1));
+    let node = &fx.program.nodes[1];
+    let arena = node.arena.as_ref().unwrap();
+    assert_eq!(arena.sealed.len(), 1);
+    assert_eq!(arena.sealed[0].pointees, vec![w0, w1]);
+
+    // The per-task accesses: table and both pointees, read-only.
+    let mode = Mode {
+        pending: false,
+        templates: None,
+    };
+    let source = fx.graph.pool_effects(node, "pool 0", mode).unwrap();
+    let ResourceKind::BindingRecords(records) = &fx.program.kinds[&fx.graph.arena] else {
+        panic!("bound arena")
+    };
+    let access = fx
+        .graph
+        .task_effects(&fx.program, &source, &records[0], "task 0")
+        .unwrap();
+    let got: BTreeSet<(ResourceId, bool, bool)> = access
+        .iter()
+        .map(|a| (a.resource, a.read, a.write))
+        .collect();
+    assert_eq!(
+        got,
+        BTreeSet::from([(table, true, false), (w0, true, false), (w1, true, false)])
+    );
+
+    // Reading the same pointee from the other pool is no conflict: the proof
+    // is admitted and orders nothing on the weights.
+    let proof = fx.check().unwrap();
+    assert!(
+        proof
+            .edges()
+            .iter()
+            .all(|e| e.resource != w0 && e.resource != w1),
+        "{:?}",
+        proof.edges()
+    );
+}
+
+#[test]
+fn a_writer_of_a_sealed_pointee_or_table_in_the_group_refuses() {
+    for (what, target) in [("pointee", PW1), ("table", TBL)] {
+        let mut fx = sealed_fixture(&sealed_registry(), Vec::new()).unwrap();
+        let r = fx.data(target);
+        // A pool member (node 2) whose node effects write sealed content.
+        fx.program.nodes[2].effects.push(RegionEffect {
+            arg_offset: 0,
+            resource: r,
+            classes: vec![VmemStore],
+        });
+        let err = fx.check().unwrap_err();
+        assert!(
+            err.contains("sealed content is immutable") && err.contains(what),
+            "{what}: {err}"
+        );
+    }
+}
+
+#[test]
+fn a_sealed_table_bind_is_refused_for_writers_missing_seals_and_long_bounds() {
+    use crate::index_bind::tests as ib;
+    // A node outside the group writes an expert-weight allocation.
+    let err = sealed_fixture(
+        &sealed_registry(),
+        vec![ib::extra_launch(
+            "weight_writer",
+            PW0 + 0x100,
+            pw0(),
+            &[VmemStore],
+        )],
+    )
+    .err()
+    .expect("a written pointee refuses");
+    assert!(
+        err.contains("writes the sealed pointee allocation"),
+        "{err}"
+    );
+
+    // A record of another template in the same bind writes one through its
+    // fields.
+    let err = build_with(
+        vec![vec![t(T_SEALED, 0, N, 0, N)]],
+        &[(T_SEALED, &[(0, TBL)]), (T_WRITE, &[(8, PW1)])],
+        vec![vec![T_SEALED, T_WRITE]],
+        Some(proven_protocol()),
+        false,
+        &sealed_registry(),
+        sealed_extras(Vec::new()),
+    )
+    .err()
+    .expect("a record-field writer refuses");
+    assert!(
+        err.contains("writes the sealed pointee allocation"),
+        "{err}"
+    );
+
+    // No seal: no witness.
+    let err = sealed_fixture(&SealedTableRegistry::new(), Vec::new())
+        .err()
+        .expect("an unsealed table refuses");
+    assert!(err.contains("no sealed table"), "{err}");
+
+    // The declared bound (4) is past a table sealed with two entries.
+    let short = SealedTableRegistry::new();
+    short
+        .seal(
+            tbl(),
+            2,
+            &st::table_bytes(&entry_ptrs()[..2]),
+            &pointees(),
+            st::GEN,
+        )
+        .unwrap();
+    let err = sealed_fixture(&short, Vec::new())
+        .err()
+        .expect("a bound past the table refuses");
+    assert!(err.contains("exceeds the 2 sealed entries"), "{err}");
 }

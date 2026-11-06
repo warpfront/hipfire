@@ -1439,8 +1439,22 @@ impl Walk<'_> {
             }
             _ => errs.push("s[0:1] is not `kernargs + zext(ka_off)`"),
         }
+        // The standalone bodies' certificates (the sealed-table case seeds a
+        // nonzero EXEC at kernel entry) hold only if the region is entered
+        // with the EXEC the kernel was launched with: every lane of the wave.
+        // The dispatcher narrows EXEC to lane 0 for its claim code
+        // (`s_mov_b32 exec_lo, 1`) and must have restored it on every path to
+        // the entry; an entry with lane 0 only, zero or an unproven EXEC is
+        // refused.
         if st.exec != Exec::Full {
-            errs.push("EXEC is not full");
+            self.fail(
+                run,
+                pos,
+                "task_graph-region-exec",
+                format!(
+                    "region {t}: EXEC at entry is not the kernel-entry EXEC (all lanes of the wave): the dispatcher's EXEC is lane-0 only, zero or not proven restored on every path to the region"
+                ),
+            );
         }
         if st.v.get(&0) != Some(&one(E::Tid)) {
             errs.push("v0 is not the workgroup-linear workitem id");

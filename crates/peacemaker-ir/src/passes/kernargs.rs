@@ -366,9 +366,10 @@ struct State {
     exec: [Val; 2],
     m0: Val,
     scc: Val,
-    /// Sealed analysis: EXEC is known nonzero (a decided EXECZ/EXECNZ edge
-    /// set it; any EXEC write but a superset `s_or_b32 exec_lo, exec_lo, x`
-    /// clears it; joins keep it only when both sides know it).
+    /// Sealed analysis: EXEC is known nonzero (the wave launch state, or a
+    /// decided EXECZ/EXECNZ edge set it; any EXEC write but a superset
+    /// `s_or_b32 exec_lo, exec_lo, x` clears it; joins keep it only when both
+    /// sides know it).
     exec_nz: bool,
 }
 
@@ -1373,6 +1374,12 @@ fn analyze_impl(
         );
     }
     let (mut entry, entry_loaded) = entry_state(kernel, arch);
+    // Sealed analysis: a wave is only launched with at least one enabled lane,
+    // so EXEC is nonzero at the kernel entry. It stays known only while no
+    // instruction writes EXEC (but a superset OR), which `step` enforces; this
+    // is what lets `exec_lo & mask == 0` prove `mask == 0` for a guard that is
+    // not preceded by an EXECZ branch.
+    entry.exec_nz = sealed;
     let mut interner = Interner::default();
     if arch == Arch::Gfx1201 && matches!(kernel.abi, Abi::Hsa { .. }) {
         entry.t[9].ix = interner.entry(EntryReg::WorkgroupIdX);
@@ -5683,6 +5690,79 @@ mod tests {
         0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000,
         0x00000001, 0xbfb00000,
     ];
+    /// `SIGNED_NO_EXEC_FACT` with `s_mov_b32 exec_lo, n` before the guard.
+    const SIGNED_EXEC_CLOBBERED: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbefe000a, 0xbf04800b, 0x981480c1, 0xbf030a0b, 0x981580c1, 0x8c141514, 0x8b6a147e,
+        0xbfa4000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000,
+        0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008,
+        0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    // The shape the compiler emits for `if (e < 0 || e >= n) return; ptrs[e]`
+    // with `e` zero-extended by a separate `s_mov_b32 s13, 0` into `s[12:13]`,
+    // no EXECZ branch anywhere. Variants below break one thing each.
+    const ZEXT_SIGNED_PAIR: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf04800c, 0x981480c1, 0xbf030a0c, 0x981580c1, 0x8c141514, 0x8b6a147e, 0xbe8d0080,
+        0xbfa4000d, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280,
+        0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001,
+        0xbfb00000,
+    ];
+    /// `s_mov_b32 exec_lo, n` before the guard: EXEC is no longer known nonzero.
+    const ZEXT_EXEC_CLOBBERED: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbefe000a, 0xbf04800c, 0x981480c1, 0xbf030a0c, 0x981580c1, 0x8c141514, 0x8b6a147e,
+        0xbe8d0080, 0xbfa4000d, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000,
+        0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000,
+        0x00000001, 0xbfb00000,
+    ];
+    /// The index register is reloaded from another word after the guard.
+    const ZEXT_RELOADED_INDEX: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf04800c, 0x981480c1, 0xbf030a0c, 0x981580c1, 0x8c141514, 0x8b6a147e, 0xbe8d0080,
+        0xbfa40010, 0xf4000303, 0xf8000004, 0xbfc70000, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    /// Both compares test a different loaded word than the one that indexes.
+    const ZEXT_GUARD_OTHER_REGISTER: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf048011, 0x981480c1, 0xbf030a11, 0x981580c1, 0x8c141514, 0x8b6a147e, 0xbe8d0080,
+        0xbfa4000d, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280,
+        0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001,
+        0xbfb00000,
+    ];
+    /// The `e < 0` half is replaced by a constant-false flag.
+    const ZEXT_NO_LOWER_BOUND: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbe940080, 0xbf030a0c, 0x981580c1, 0x8c141514, 0x8b6a147e, 0xbe8d0080, 0xbfa4000d,
+        0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e,
+        0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    /// The upper bound is another loaded word, not a kernarg or a constant.
+    const ZEXT_BOUND_NOT_KERNARG: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf04800c, 0x981480c1, 0xbf03110c, 0x981580c1, 0x8c141514, 0x8b6a147e, 0xbe8d0080,
+        0xbfa4000d, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280,
+        0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001,
+        0xbfb00000,
+    ];
+    /// `if (flag == 0) goto entry_load;` jumps over the whole guard.
+    const ZEXT_PATH_SKIPS_GUARD: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbe8d0080, 0xbf068010, 0xbfa20008, 0xbf04800c, 0x981480c1, 0xbf030a0c, 0x981580c1,
+        0x8c141514, 0x8b6a147e, 0xbe8d0080, 0xbfa4000d, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
     const SIGNED_MISSING_NONNEG: &[u32] = &[
         0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
         0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
@@ -5736,6 +5816,15 @@ mod tests {
         0x98158081, 0xbf078115, 0xbfa20007, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
         0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
     ];
+    /// `NULL_CHECK_FLAGS_NO_EXEC_FACT` with `s_mov_b32 exec_lo, n` first.
+    const NULL_CHECK_FLAGS_EXEC_CLOBBERED: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbefe000a, 0xbf0a0a0b, 0xbfa10015, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04,
+        0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280, 0xbf11800e, 0x981480c1, 0x8b157e14,
+        0x98158081, 0xbf078115, 0xbfa20007, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
     const NULL_CHECK_FLAGS_NO_EXEC_FACT: &[u32] = &[
         0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
         0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
@@ -5756,15 +5845,58 @@ mod tests {
     fn a_signed_pair_guard_through_flags_and_exec_is_followed() {
         // `if (e < 0 || e >= n) return;` as the compiler writes it: two
         // compares into masks, `or`, `exec & mask`, `vccnz`. It proves `e < n`
-        // only because EXEC is known nonzero (the EXECZ edge before it).
+        // only because EXEC is known nonzero (the EXECZ edge before it, or the
+        // launch state).
         let f = sealed(SIGNED_GUARD_FLAGS);
         assert_eq!(f.status, KernelStatus::Conditional, "{:?}", f.unresolved);
         let [t] = &f.sealed[..] else { panic!() };
         assert_eq!(t.bound, SealedBound::Kernarg { offset: 24 });
         assert_eq!(t.entries[0].guard_pcs.len(), 2, "both signed compares");
-        refuses(SIGNED_NO_EXEC_FACT, "sealed-index-unguarded");
+        // No EXECZ edge is needed: the launch EXEC is known nonzero, and stays
+        // so until an instruction writes EXEC.
+        let f = sealed(SIGNED_NO_EXEC_FACT);
+        assert_eq!(f.status, KernelStatus::Conditional, "{:?}", f.unresolved);
+        refuses(SIGNED_EXEC_CLOBBERED, "sealed-index-unguarded");
         refuses(SIGNED_MISSING_NONNEG, "sealed-index-unguarded");
         refuses(SIGNED_NONNEG_OF_OTHER, "sealed-index-unguarded");
+    }
+
+    #[test]
+    fn a_zero_extended_signed_pair_guard_without_an_execz_edge_is_followed() {
+        // The compiler's shape for `if (e < 0 || e >= n) return; ptrs[e]`:
+        // `e` zero-extended by a separate `s_mov_b32 s13, 0`, both compares
+        // into masks, `or`, `exec & mask`, `vccnz`, and no EXECZ branch.
+        let f = sealed(ZEXT_SIGNED_PAIR);
+        assert_eq!(f.status, KernelStatus::Conditional, "{:?}", f.unresolved);
+        let [t] = &f.sealed[..] else { panic!() };
+        assert_eq!(t.table_arg_offset, 0);
+        assert_eq!(t.bound, SealedBound::Kernarg { offset: 24 });
+        let [e] = &t.entries[..] else { panic!() };
+        assert_eq!(e.index, SealedIndex::Load { pc: 5 });
+        assert_eq!(
+            e.guard_pcs.len(),
+            2,
+            "both signed compares: {:?}",
+            e.guard_pcs
+        );
+        assert_eq!(t.accesses.len(), 1);
+    }
+
+    #[test]
+    fn near_misses_of_the_zero_extended_signed_guard_stay_unguarded() {
+        // EXEC rewritten before the guard: `exec & mask == 0` no longer says
+        // `mask == 0`.
+        refuses(ZEXT_EXEC_CLOBBERED, "sealed-index-unguarded");
+        // The index is reloaded between the guard and the entry load.
+        refuses(ZEXT_RELOADED_INDEX, "sealed-index-unguarded");
+        // The guard tests another register than the one that indexes.
+        refuses(ZEXT_GUARD_OTHER_REGISTER, "sealed-index-unguarded");
+        // Upper bound only: a negative `e` would index below the table.
+        refuses(ZEXT_NO_LOWER_BOUND, "sealed-index-unguarded");
+        // The bound is a loaded value, not a kernarg or a constant.
+        refuses(ZEXT_BOUND_NOT_KERNARG, "sealed-index-unguarded");
+        // One feasible path reaches the entry load without the guard.
+        refuses(ZEXT_PATH_SKIPS_GUARD, "sealed-index-unguarded");
     }
 
     #[test]
@@ -5781,8 +5913,13 @@ mod tests {
             ),
             ("check bypassed on a path", NULL_CHECK_BYPASSED, false),
             (
-                "flag check without the exec fact",
+                "flag null check from the launch exec fact",
                 NULL_CHECK_FLAGS_NO_EXEC_FACT,
+                true,
+            ),
+            (
+                "flag check after exec is rewritten",
+                NULL_CHECK_FLAGS_EXEC_CLOBBERED,
                 false,
             ),
         ] {

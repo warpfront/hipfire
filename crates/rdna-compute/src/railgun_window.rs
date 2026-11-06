@@ -815,14 +815,16 @@ impl Gpu {
         Ok(())
     }
 
-    /// Write the pointer fields of binding-record arena `arena` of `program`
-    /// (`KernelProgram::binding_record_image` over the authored bindings:
-    /// each field is `base(resource) + interior`) into the arena's device
+    /// Write the pointer fields and declared `u32` scalars of binding-record
+    /// arena `arena` of `program` (`KernelProgram::binding_record_image` over
+    /// the authored bindings: each pointer field is `base(resource) +
+    /// interior`, each scalar its declared value) into the arena's device
     /// allocation, then read every field back and compare. The arena's
     /// binding must be exactly the live allocation HIP reports for its base.
     /// Fields are written at their arena offsets, adjacent ones in one copy;
-    /// the non-pointer bytes of the records are the caller's. Returns the
-    /// number of pointer fields written; any readback mismatch is an `Err`.
+    /// the other bytes of the records are the caller's. Returns the number
+    /// of fields (pointers plus scalars) written; any readback mismatch is
+    /// an `Err`.
     /// Refused inside plan mode.
     pub fn railgun_write_binding_records(
         &self,
@@ -832,7 +834,8 @@ impl Gpu {
         if self.plan_mode_active() {
             return Err("binding records cannot be written inside plan mode".to_owned());
         }
-        let fields = program.binding_record_image(arena, &program.resources)?;
+        let image = program.binding_record_image(arena, &program.resources)?;
+        let writes = image.writes();
         let binding = *program
             .resources
             .get(arena.0 as usize)
@@ -859,10 +862,11 @@ impl Gpu {
         let mut end = 0u64;
         let mut run: Vec<u8> = Vec::new();
         let mut run_at = 0u64;
-        for &(at, value) in &fields {
+        for (at, bytes) in &writes {
+            let at = *at;
             if at < end {
                 return Err(format!(
-                    "arena {}: pointer field at +{at} overlaps the previous field ending at +{end}",
+                    "arena {}: field at +{at} overlaps the previous field ending at +{end}",
                     arena.0
                 ));
             }
@@ -875,32 +879,28 @@ impl Gpu {
             if run.is_empty() {
                 run_at = at;
             }
-            run.extend_from_slice(&value.to_le_bytes());
-            end = at + 8;
+            run.extend_from_slice(bytes);
+            end = at + bytes.len() as u64;
         }
         if !run.is_empty() {
             self.hip
                 .memcpy_htod_offset(&buf, run_at as usize, &run)
                 .map_err(|e| format!("arena {} write +{run_at}: {e}", arena.0))?;
         }
-        if fields.is_empty() {
+        if writes.is_empty() {
             return Ok(0);
         }
         let back = self.railgun_read_allocation(binding, end as usize)?;
-        for &(at, value) in &fields {
-            let got = u64::from_le_bytes(
-                back[at as usize..at as usize + 8]
-                    .try_into()
-                    .expect("an 8-byte field"),
-            );
-            if got != value {
+        for (at, bytes) in &writes {
+            let got = &back[*at as usize..*at as usize + bytes.len()];
+            if got != bytes.as_slice() {
                 return Err(format!(
-                    "arena {} field +{at}: read back {got:#x}, wrote {value:#x}",
+                    "arena {} field +{at}: read back {got:02x?}, wrote {bytes:02x?}",
                     arena.0
                 ));
             }
         }
-        Ok(fields.len())
+        Ok(image.len())
     }
 }
 

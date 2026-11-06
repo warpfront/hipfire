@@ -249,6 +249,13 @@ pub struct ArenaPointerLoad {
 pub struct ArenaTemplate {
     pub template: u32,
     pub pointer_loads: Vec<ArenaPointerLoad>,
+    /// The sealed pointer tables the body reads through (receipt
+    /// `ArenaTemplateRecord::sealed_tables`). `table_arg_offset` is the
+    /// record offset of the table pointer field; a [`TableBound::Kernarg`]
+    /// bound is the record offset of a declared `u32` scalar
+    /// ([`crate::BindingRecord::scalars`]). Discharged by
+    /// [`KernelProgram::bind_records`] for every record of the template.
+    pub sealed: Vec<SealedTableFact>,
 }
 
 /// One descriptor arena of a `Conditional` kernel (receipt
@@ -421,56 +428,7 @@ fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, St
                 t.table_arg_offset
             ));
         }
-        let bound = match t.bound_kind.as_str() {
-            railgun_corpus::receipt::SEALED_BOUND_KERNARG => {
-                let at = u32::try_from(t.bound_value)
-                    .ok()
-                    .filter(|at| at.checked_add(4).is_some_and(|end| end <= record.kernarg_size))
-                    .ok_or_else(|| {
-                        format!(
-                            "{sym}: sealed table bound +{} lies outside the {}-byte kernarg segment",
-                            t.bound_value, record.kernarg_size
-                        )
-                    })?;
-                TableBound::Kernarg(at)
-            }
-            railgun_corpus::receipt::SEALED_BOUND_CONST => TableBound::Const(
-                u32::try_from(t.bound_value)
-                    .map_err(|_| format!("{sym}: sealed table constant bound exceeds u32"))?,
-            ),
-            other => return Err(format!("{sym}: unknown sealed table bound kind {other:?}")),
-        };
-        let mut entries = Vec::with_capacity(t.entries.len());
-        for e in &t.entries {
-            entries.push(TableEntryLoad {
-                pc: e.pc,
-                class: MemClass::parse(&e.class).map_err(|m| format!("{sym}: {m}"))?,
-                path: e.path.clone(),
-                cache: e.cache.clone(),
-                width: e.width,
-                index_expr: e.index_expr.clone(),
-                guard_pcs: e.guard_pcs.clone(),
-            });
-        }
-        let mut accesses = Vec::with_capacity(t.accesses.len());
-        for a in &t.accesses {
-            accesses.push(TableAccess {
-                pc: a.pc,
-                class: MemClass::parse(&a.class).map_err(|m| format!("{sym}: {m}"))?,
-                path: a.path.clone(),
-                cache: a.cache.clone(),
-                width: a.width,
-                entry_pcs: a.entry_pcs.clone(),
-            });
-        }
-        tables.push(SealedTableFact {
-            table_arg_offset: t.table_arg_offset,
-            bound,
-            entry_bytes: t.entry_bytes,
-            entries,
-            accesses,
-            null_guarded: t.null_guarded,
-        });
+        tables.push(sealed_fact(sym, t, Some(record.kernarg_size))?);
     }
     let mut indexed = Vec::with_capacity(record.indexed_effects.len());
     for e in &record.indexed_effects {
@@ -519,6 +477,11 @@ fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, St
         }
         let mut templates = Vec::with_capacity(a.templates.len());
         for t in &a.templates {
+            let sealed = t
+                .sealed_tables
+                .iter()
+                .map(|s| sealed_fact(sym, s, None))
+                .collect::<Result<Vec<_>, _>>()?;
             let mut pointer_loads = Vec::with_capacity(t.pointer_loads.len());
             for p in &t.pointer_loads {
                 let mut classes = p
@@ -536,6 +499,7 @@ fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, St
             templates.push(ArenaTemplate {
                 template: t.template,
                 pointer_loads,
+                sealed,
             });
         }
         arenas.push(ArenaFact {
@@ -570,6 +534,69 @@ fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, St
         task_protocol,
         witnesses: record.required_witnesses.clone(),
         case_digest: record.case_digest.clone(),
+    })
+}
+
+/// A receipt sealed table as a fact. `kernarg_size` bounds a kernarg-bound
+/// offset (a standalone record's own segment); an arena template's bound is a
+/// record offset, checked against the records when they are bound.
+fn sealed_fact(
+    sym: &str,
+    t: &railgun_corpus::receipt::SealedTableRecord,
+    kernarg_size: Option<u32>,
+) -> Result<SealedTableFact, String> {
+    let bound = match t.bound_kind.as_str() {
+        railgun_corpus::receipt::SEALED_BOUND_KERNARG => {
+            let at = u32::try_from(t.bound_value)
+                .ok()
+                .filter(|at| {
+                    at.checked_add(4)
+                        .is_some_and(|end| kernarg_size.is_none_or(|size| end <= size))
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "{sym}: sealed table bound +{} lies outside the {:?}-byte kernarg segment",
+                        t.bound_value, kernarg_size
+                    )
+                })?;
+            TableBound::Kernarg(at)
+        }
+        railgun_corpus::receipt::SEALED_BOUND_CONST => TableBound::Const(
+            u32::try_from(t.bound_value)
+                .map_err(|_| format!("{sym}: sealed table constant bound exceeds u32"))?,
+        ),
+        other => return Err(format!("{sym}: unknown sealed table bound kind {other:?}")),
+    };
+    let mut entries = Vec::with_capacity(t.entries.len());
+    for e in &t.entries {
+        entries.push(TableEntryLoad {
+            pc: e.pc,
+            class: MemClass::parse(&e.class).map_err(|m| format!("{sym}: {m}"))?,
+            path: e.path.clone(),
+            cache: e.cache.clone(),
+            width: e.width,
+            index_expr: e.index_expr.clone(),
+            guard_pcs: e.guard_pcs.clone(),
+        });
+    }
+    let mut accesses = Vec::with_capacity(t.accesses.len());
+    for a in &t.accesses {
+        accesses.push(TableAccess {
+            pc: a.pc,
+            class: MemClass::parse(&a.class).map_err(|m| format!("{sym}: {m}"))?,
+            path: a.path.clone(),
+            cache: a.cache.clone(),
+            width: a.width,
+            entry_pcs: a.entry_pcs.clone(),
+        });
+    }
+    Ok(SealedTableFact {
+        table_arg_offset: t.table_arg_offset,
+        bound,
+        entry_bytes: t.entry_bytes,
+        entries,
+        accesses,
+        null_guarded: t.null_guarded,
     })
 }
 
@@ -1177,12 +1204,60 @@ pub struct ArenaNode {
     /// Parallel to `arenas`: the arena's records were bound and the
     /// resulting effects added to the node.
     pub bound: Vec<bool>,
+    /// The sealed tables `bind_records` discharged for the records of the
+    /// arena templates (empty until bound, and for a template whose records
+    /// all carry a zero bound). A node with any needs the `sealed_table`
+    /// witness of a window bind ([`KernelNode::needs_sealed_table_witness`]).
+    pub sealed: Vec<ArenaSealedBinding>,
+    /// The receipt's required witness kinds (digest-bound).
+    pub witnesses: Vec<String>,
     pub case_digest: String,
 }
 
 impl ArenaNode {
     pub fn all_bound(&self) -> bool {
         self.bound.iter().all(|b| *b)
+    }
+}
+
+/// One sealed pointer table of an arena template, as
+/// [`KernelProgram::bind_records`] discharged it: the table resource the
+/// records' table field names, the sealed identity the registry held for it
+/// and the program resources its entries' pointees are. The window bind
+/// re-verifies the identity against the live allocation, generation and
+/// content ([`crate::sealed_table::SealedTableRegistry::bind_sealed_table`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArenaSealedBinding {
+    /// Index into [`ArenaNode::arenas`].
+    pub arena: usize,
+    pub template: u32,
+    /// Record offset of the table pointer field.
+    pub table_arg_offset: u32,
+    /// The program resource the table field names (interior 0).
+    pub resource: ResourceId,
+    /// The largest nonzero declared bound over the records naming `resource`
+    /// (each is `<= entries`).
+    pub bound: u32,
+    pub null_guarded: bool,
+    /// The sealed table's identity at bind time.
+    pub allocation: Binding,
+    pub entries: u32,
+    pub generation: u64,
+    pub content_sha256: [u8; 32],
+    /// Program resources equal to a pointee allocation of the sealed table
+    /// (a pointee that is no program resource is read by no node's effects
+    /// and cannot be written by any program node).
+    pub pointees: Vec<ResourceId>,
+    /// The read classes the certified body applies through an entry.
+    pub accesses: Vec<MemClass>,
+}
+
+impl KernelNode {
+    /// The node carries sealed tables a window must discharge with a
+    /// [`crate::sealed_table::SealedTableWitness`]: its own `table` case, or
+    /// tables of its bound arena templates.
+    pub fn needs_sealed_table_witness(&self) -> bool {
+        self.table.is_some() || self.arena.as_ref().is_some_and(|a| !a.sealed.is_empty())
     }
 }
 
@@ -1578,6 +1653,8 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
                     arenas: c.arenas.clone(),
                     task_protocol: c.task_protocol.clone(),
                     bound: vec![false; c.arenas.len()],
+                    sealed: Vec::new(),
+                    witnesses: c.witnesses.clone(),
                     case_digest: c.case_digest.clone(),
                 }),
             guard,
@@ -1982,7 +2059,7 @@ impl KernelProgram {
         self.nodes
             .iter()
             .enumerate()
-            .filter(|(_, n)| n.table.is_some())
+            .filter(|(_, n)| n.needs_sealed_table_witness())
             .map(|(i, _)| i)
             .collect()
     }
@@ -1998,15 +2075,17 @@ impl KernelProgram {
     pub fn assume_witnesses(&self, kinds: &[&str]) -> KernelProgram {
         let mut p = self.clone();
         for n in &mut p.nodes {
-            if (n.indexed.is_none() && n.table.is_none())
+            if (n.indexed.is_none() && n.table.is_none() && !n.needs_sealed_table_witness())
                 || !matches!(n.lowering, Lowering::Conditional { .. })
             {
                 continue;
             }
             // A descriptor arena is discharged by `bind_records` alone; no
-            // window witness stands in for it.
+            // window witness stands in for it. The sealed tables its records
+            // carry are the `sealed_table` kind.
             let covered = (n.indexed.is_none() || kinds.contains(&WITNESS_INDEXED_BIND))
-                && (n.table.is_none() || kinds.contains(&WITNESS_SEALED_TABLE))
+                && ((n.table.is_none() && !n.needs_sealed_table_witness())
+                    || kinds.contains(&WITNESS_SEALED_TABLE))
                 && n.arena.as_ref().is_none_or(ArenaNode::all_bound);
             if covered {
                 n.lowering = Lowering::Pm4;

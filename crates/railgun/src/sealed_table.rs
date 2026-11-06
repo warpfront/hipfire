@@ -40,12 +40,21 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use sha2::{Digest, Sha256};
 
-use crate::kernel::{Arg, KernelProgram, Lowering, TableBound, WITNESS_SEALED_TABLE};
+use crate::kernel::{
+    ArenaSealedBinding, Arg, KernelProgram, Lowering, TableBound, WITNESS_SEALED_TABLE,
+};
 use crate::window::{AllocationIdentity, Quiescence, WindowStep};
-use crate::Binding;
+use crate::{Binding, ResourceId};
 
 /// Bytes of one table entry (a 64-bit pointer).
 pub const ENTRY_BYTES: u64 = 8;
+
+/// The largest bound a sealed table's guard may carry. The certificate's
+/// entry-index analysis accepts a sign-extended 32-bit index under an
+/// *unsigned* guard `index < bound`, which only bounds the 64-bit address
+/// when `bound <= i32::MAX`; a larger bound (even within the sealed entry
+/// count) is refused by every bind.
+pub const MAX_BOUND: u32 = i32::MAX as u32;
 
 /// Whether [`SealedTableRegistry::seal_with`] accepts null table entries. The
 /// owner passes `Allow` only for a table whose certificate (the receipt's
@@ -67,6 +76,12 @@ pub enum SealedTableError {
     WrongAllocation(String),
     #[error("node {node}: {detail}")]
     Node { node: usize, detail: String },
+    #[error("node {node} table +{table_arg}: bound {bound} exceeds the largest sealed index bound {MAX_BOUND} (a sign-extended index is only sound below 2^31)")]
+    BoundTooLarge {
+        node: usize,
+        table_arg: u32,
+        bound: u32,
+    },
     #[error("node {node} table +{table_arg}: bound {bound} exceeds the {entries} sealed entries")]
     BoundExceedsEntries {
         node: usize,
@@ -166,7 +181,7 @@ fn short(d: &[u8; 32]) -> String {
     d[..6].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn overlaps(a: Binding, b: Binding) -> bool {
+pub(crate) fn overlaps(a: Binding, b: Binding) -> bool {
     a.base < b.base.saturating_add(b.bytes) && b.base < a.base.saturating_add(a.bytes)
 }
 
@@ -551,22 +566,31 @@ impl SealedTableRegistry {
             })
         };
         let node = &input.program.nodes[index];
-        let case = node
-            .table
-            .as_ref()
-            .expect("sealed-table nodes carry table facts");
         let Some(kref) = node.kref.as_ref() else {
             return bad("no certified facts".into());
         };
-        if !case.witnesses.iter().any(|w| w == WITNESS_SEALED_TABLE) {
+        let arena_sealed: &[ArenaSealedBinding] =
+            node.arena.as_ref().map_or(&[], |a| a.sealed.as_slice());
+        // The case (and so the receipt witnesses and digest) this node's
+        // sealed tables belong to: its own `table` case, or its bound arena
+        // templates'. A node with both is not a shape any receipt names.
+        let (witnesses, case_digest) = match (&node.table, &node.arena) {
+            (Some(_), Some(a)) if !a.sealed.is_empty() => {
+                return bad("carries both a sealed-table case and sealed arena templates".into())
+            }
+            (Some(case), _) => (&case.witnesses, &case.case_digest),
+            (None, Some(a)) if !a.sealed.is_empty() => (&a.witnesses, &a.case_digest),
+            _ => return bad("carries no sealed table".into()),
+        };
+        if !witnesses.iter().any(|w| w == WITNESS_SEALED_TABLE) {
             return bad(
                 "receipt does not require the sealed_table witness this bind provides".into(),
             );
         }
         let image = &input.images[index];
-        let mut tables = Vec::with_capacity(case.tables.len());
+        let mut tables = Vec::new();
         let mut vacuous = Vec::new();
-        for t in &case.tables {
+        for t in node.table.iter().flat_map(|c| c.tables.iter()) {
             let off = t.table_arg_offset;
             // The guard bound this launch carries: the encoded image's scalar,
             // or the receipt constant.
@@ -600,91 +624,169 @@ impl SealedTableRegistry {
                 node: index,
                 detail: "short kernarg image".into(),
             })?;
-            let (Some(b), Some(alloc)) = (
-                input.bindings.get(resource.0 as usize).copied(),
-                input.allocations.get(resource.0 as usize).copied(),
-            ) else {
-                return bad(format!("unknown resource {}", resource.0));
-            };
-            if alloc.base != b.base || alloc.bytes != b.bytes {
-                return bad(format!(
-                    "resource {} allocation identity differs from its binding",
-                    resource.0
-                ));
-            }
-            let Some(sealed) = self.table_at(b.base) else {
-                return Err(SealedTableError::NotSealed(format!(
-                    "no sealed table at {:#x}+{} (node {index} table argument +{off})",
-                    b.base, b.bytes
-                )));
-            };
-            if sealed.allocation != b {
-                return Err(SealedTableError::WrongAllocation(format!(
-                    "node {index} table argument +{off} is resource {} {:#x}+{}, the table sealed at that base is {:#x}+{}",
-                    resource.0, b.base, b.bytes, sealed.allocation.base, sealed.allocation.bytes
-                )));
-            }
-            if value != b.base {
-                return Err(SealedTableError::WrongAllocation(format!(
-                    "node {index} table argument +{off} = {value:#x} is not the sealed allocation base {:#x}",
-                    b.base
-                )));
-            }
-            if alloc.generation != sealed.generation {
-                return Err(SealedTableError::Stale(format!(
-                    "table at {:#x} was sealed at generation {}, the bound allocation is at {}",
-                    b.base, sealed.generation, alloc.generation
-                )));
-            }
-            if sealed.has_null_entries && !t.null_guarded {
-                return Err(SealedTableError::NullEntryUnguarded {
-                    node: index,
-                    table_arg: off,
-                });
-            }
-            if bound > sealed.entries {
-                return Err(SealedTableError::BoundExceedsEntries {
-                    node: index,
-                    table_arg: off,
-                    bound,
-                    entries: sealed.entries,
-                });
-            }
-            if verified.get(&b.base) != Some(&sealed) {
-                let live = content
-                    .read_table(sealed.allocation, sealed.entries as usize)
-                    .map_err(SealedTableError::Content)?;
-                if live.len() as u64 != u64::from(sealed.entries) * ENTRY_BYTES {
-                    return Err(SealedTableError::Content(format!(
-                        "the owner returned {} bytes for {} entries",
-                        live.len(),
-                        sealed.entries
-                    )));
-                }
-                if digest(&live) != sealed.content_sha256 {
-                    return Err(SealedTableError::Modified { base: b.base });
-                }
-                verified.insert(b.base, sealed.clone());
-            }
-            tables.push(BoundTable {
-                table_arg_offset: off,
-                allocation: sealed.allocation,
-                entries: sealed.entries,
+            tables.push(self.verify_table(
+                input,
+                index,
+                resource,
+                off,
+                Some(value),
                 bound,
-                generation: sealed.generation,
-                content_sha256: sealed.content_sha256,
-            });
+                t.null_guarded,
+                content,
+                verified,
+            )?);
+        }
+        // The sealed tables of the bound arena templates: the pointer lives
+        // in a record railgun wrote from the bindings (the base of the table
+        // resource), the bound in a scalar railgun declared; both are
+        // immutable during replay. The sealed identity `bind_records`
+        // discharged must still be the registry's.
+        for a in arena_sealed {
+            let t = self.verify_table(
+                input,
+                index,
+                a.resource,
+                a.table_arg_offset,
+                None,
+                a.bound,
+                a.null_guarded,
+                content,
+                verified,
+            )?;
+            if t.entries != a.entries
+                || t.generation != a.generation
+                || t.content_sha256 != a.content_sha256
+                || t.allocation != a.allocation
+            {
+                return Err(SealedTableError::Stale(format!(
+                    "node {index} template {} table +{}: the registry's seal at {:#x} is not the one bind_records discharged (rebind the records)",
+                    a.template, a.table_arg_offset, a.allocation.base
+                )));
+            }
+            tables.push(t);
         }
         Ok(BoundTableNode {
             node: index,
             symbol: node.symbol.clone(),
             artifact_sha256: kref.artifact_sha256.clone(),
             receipt_sha256: kref.receipt_sha256.clone(),
-            case_digest: case.case_digest.clone(),
+            case_digest: case_digest.clone(),
             tables,
             vacuous,
             kernarg_digest: digest(image),
             grid: input.grids[index],
+        })
+    }
+
+    /// One nonzero-bound table of node `index`: `resource` (the table
+    /// argument's, or an arena record's table field's) is exactly a sealed
+    /// table's allocation at the sealed generation, the pointer the kernel
+    /// sees is its base (`value`, when it is read from the kernarg image; an
+    /// arena record's pointer is `base(resource)` by construction), the
+    /// bound is at most the sealed entry count, null entries meet a
+    /// null-guarded certificate, and the live content hashes to the sealed
+    /// digest.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_table(
+        &self,
+        input: &TableBindInputs<'_>,
+        index: usize,
+        resource: ResourceId,
+        off: u32,
+        value: Option<u64>,
+        bound: u32,
+        null_guarded: bool,
+        content: &dyn TableContent,
+        verified: &mut BTreeMap<u64, SealedTable>,
+    ) -> Result<BoundTable, SealedTableError> {
+        let bad = |d: String| {
+            Err(SealedTableError::Node {
+                node: index,
+                detail: d,
+            })
+        };
+        let (Some(b), Some(alloc)) = (
+            input.bindings.get(resource.0 as usize).copied(),
+            input.allocations.get(resource.0 as usize).copied(),
+        ) else {
+            return bad(format!("unknown resource {}", resource.0));
+        };
+        if alloc.base != b.base || alloc.bytes != b.bytes {
+            return bad(format!(
+                "resource {} allocation identity differs from its binding",
+                resource.0
+            ));
+        }
+        let Some(sealed) = self.table_at(b.base) else {
+            return Err(SealedTableError::NotSealed(format!(
+                "no sealed table at {:#x}+{} (node {index} table argument +{off})",
+                b.base, b.bytes
+            )));
+        };
+        if sealed.allocation != b {
+            return Err(SealedTableError::WrongAllocation(format!(
+                "node {index} table argument +{off} is resource {} {:#x}+{}, the table sealed at that base is {:#x}+{}",
+                resource.0, b.base, b.bytes, sealed.allocation.base, sealed.allocation.bytes
+            )));
+        }
+        if let Some(value) = value {
+            if value != b.base {
+                return Err(SealedTableError::WrongAllocation(format!(
+                    "node {index} table argument +{off} = {value:#x} is not the sealed allocation base {:#x}",
+                    b.base
+                )));
+            }
+        }
+        if alloc.generation != sealed.generation {
+            return Err(SealedTableError::Stale(format!(
+                "table at {:#x} was sealed at generation {}, the bound allocation is at {}",
+                b.base, sealed.generation, alloc.generation
+            )));
+        }
+        if sealed.has_null_entries && !null_guarded {
+            return Err(SealedTableError::NullEntryUnguarded {
+                node: index,
+                table_arg: off,
+            });
+        }
+        if bound > MAX_BOUND {
+            return Err(SealedTableError::BoundTooLarge {
+                node: index,
+                table_arg: off,
+                bound,
+            });
+        }
+        if bound > sealed.entries {
+            return Err(SealedTableError::BoundExceedsEntries {
+                node: index,
+                table_arg: off,
+                bound,
+                entries: sealed.entries,
+            });
+        }
+        if verified.get(&b.base) != Some(&sealed) {
+            let live = content
+                .read_table(sealed.allocation, sealed.entries as usize)
+                .map_err(SealedTableError::Content)?;
+            if live.len() as u64 != u64::from(sealed.entries) * ENTRY_BYTES {
+                return Err(SealedTableError::Content(format!(
+                    "the owner returned {} bytes for {} entries",
+                    live.len(),
+                    sealed.entries
+                )));
+            }
+            if digest(&live) != sealed.content_sha256 {
+                return Err(SealedTableError::Modified { base: b.base });
+            }
+            verified.insert(b.base, sealed.clone());
+        }
+        Ok(BoundTable {
+            table_arg_offset: off,
+            allocation: sealed.allocation,
+            entries: sealed.entries,
+            bound,
+            generation: sealed.generation,
+            content_sha256: sealed.content_sha256,
         })
     }
 }
@@ -918,3 +1020,6 @@ impl SealedTableWitness {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod arena;
