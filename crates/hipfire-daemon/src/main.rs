@@ -3635,27 +3635,12 @@ fn main() {
                 if has_lfm3_depth || has_lfm3_audio {
                     let tts = msg.get("tts").and_then(|v| v.as_bool()).unwrap_or(false);
                     if tts {
-                        // TTS output is AUDIO. A tool call is a text artifact
-                        // the caller must act on before the next turn, and the
-                        // spoken reply has no channel to carry it, so a tools
-                        // request on the TTS route cannot be honored. Refuse
-                        // by name here instead of vocoding an answer that
-                        // silently ignored the schemas.
-                        if tools_json.is_some() {
-                            hipfire_generate::dense::emit_active_attempt_error(
-                                &mut stdout,
-                                Some(id),
-                                "tools are not supported on the LFM3 TTS route (tts=true) — \
-                                 its output is audio; drop `tts` to get a text turn that can \
-                                 emit tool calls, or run TTS as a second request over the \
-                                 text answer",
-                                "unsupported",
-                                false,
-                                false,
-                            );
-                            let _ = stdout.flush();
-                            continue;
-                        }
+                        // `tools` on a TTS turn is inert and deliberately
+                        // ignored, not refused: the output is audio and a
+                        // spoken reply cannot carry a call. Clients that
+                        // declare tools on every request must not be failed
+                        // for a field this route structurally cannot use. Tool
+                        // calling lives on the text turn.
                         if has_lfm3_depth {
                             let mode = msg
                                 .get("mode")

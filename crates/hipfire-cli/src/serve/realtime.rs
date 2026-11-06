@@ -51,8 +51,18 @@ struct RealtimeSessionState {
     output_audio: bool,
     input_pcm: Vec<u8>,
     pending_transcript: Option<String>,
-    history: Vec<(String, String)>,
+    /// Conversation history as full OpenAI message values, not `(role, text)`
+    /// pairs: a tool turn has to replay the assistant's `tool_calls` and the
+    /// following `role: "tool"` results, which a pair cannot express.
+    history: Vec<serde_json::Value>,
     queued_items: Vec<String>,
+    /// `function_call_output` items received since the last `response.create`.
+    /// Held out of `history` until the turn that consumes them runs, so a
+    /// result arriving before its `response.create` is still delivered.
+    pending_tool_results: Vec<serde_json::Value>,
+    /// `tools` from `session.update`. `voice.js` declares them once per
+    /// session; the text stage forwards them to the model per turn.
+    tools: Vec<serde_json::Value>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -227,12 +237,25 @@ pub(crate) fn handle_realtime(
 }
 
 /// Blocking daemon call for the realtime text stage (thinking off).
+/// One turn's text stage: visible prose plus any structured tool calls.
+struct RealtimeTextOutcome {
+    reply: String,
+    /// Canonical calls (`{id?, name, arguments}`) from the daemon's
+    /// `{"type":"tool_calls"}` event or the tool-safe `done`.
+    calls: Vec<serde_json::Value>,
+}
+
+/// Blocking text generation for one realtime turn. `tools` is forwarded so the
+/// model can answer with structured calls instead of prose; the daemon's LFM3
+/// route renders the schemas through the vendor template and withholds the
+/// `<tool_call>` span from the visible stream.
 fn realtime_text(
     shared: &Arc<ServeShared>,
     messages: &[serde_json::Value],
     max_tokens: usize,
+    tools: &[serde_json::Value],
     cancel: &std::sync::atomic::AtomicBool,
-) -> Result<String> {
+) -> Result<RealtimeTextOutcome> {
     let model = shared
         .runtime
         .lock()
@@ -243,7 +266,7 @@ fn realtime_text(
         .ok_or_else(|| anyhow!("realtime requires a resident/default model"))?;
     let mut runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
     runtime.ensure_model(&model, &shared.meta, ModelOrigin::Request)?;
-    let generate = serde_json::json!({
+    let mut generate = serde_json::json!({
         "type": "generate",
         "id": request_id(),
         "messages": messages,
@@ -251,21 +274,99 @@ fn realtime_text(
         "max_think_tokens": 1,
         "attempt_id": next_attempt_id(),
     });
+    if !tools.is_empty() {
+        generate["tools"] = serde_json::Value::Array(tools.to_vec());
+    }
     let mut reply = String::new();
+    let mut calls: Vec<serde_json::Value> = Vec::new();
     runtime.engine.generate(&generate, |event| {
         if cancel.load(Ordering::Relaxed) {
             return Err(hipfire_client::ClientError::Cancelled);
         }
-        if event.get("type").and_then(serde_json::Value::as_str) == Some("token")
-            && event.get("reasoning").and_then(serde_json::Value::as_bool) != Some(true)
-        {
-            if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
-                reply.push_str(text);
+        match event.get("type").and_then(serde_json::Value::as_str) {
+            Some("token") => {
+                if event.get("reasoning").and_then(serde_json::Value::as_bool) != Some(true) {
+                    if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
+                        reply.push_str(text);
+                    }
+                }
             }
+            // The LFM3 route emits calls as a dedicated event BEFORE the
+            // commit handshake. Record them; the terminal `calls` array is the
+            // fallback for a route that only stages them.
+            Some("tool_calls") => {
+                if let Some(arr) = event.get("calls").and_then(serde_json::Value::as_array) {
+                    calls = arr.clone();
+                }
+            }
+            Some("commit_ready") | Some("done") => {
+                if event
+                    .get("finish_reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("tool_calls")
+                {
+                    if let Some(arr) = event.get("calls").and_then(serde_json::Value::as_array) {
+                        if !arr.is_empty() {
+                            calls = arr.clone();
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
         Ok(())
     })?;
-    Ok(reply)
+    Ok(RealtimeTextOutcome { reply, calls })
+}
+
+/// The history assistant message carrying one turn's calls, in the flat shape
+/// [`hipfire_runtime::prompt_frame::Message`] deserializes (`{id?, name,
+/// arguments}` with `arguments` as a JSON OBJECT — the LFM3 template refuses a
+/// JSON-encoded string).
+fn realtime_assistant_tool_message(calls: &[serde_json::Value]) -> serde_json::Value {
+    serde_json::json!({
+        "role": "assistant",
+        "content": "",
+        "tool_calls": calls,
+    })
+}
+
+/// Project one client `conversation.item.create` value into an OpenAI
+/// `role: "tool"` message, or `None` when it is not a `function_call_output`.
+///
+/// Accepts the OpenAI realtime shape (`{"type":"function_call_output",
+/// "call_id","output"}`) and the nested-content variant voice.js may send
+/// (`{"type":"function_call_output","call_id":"…","content":[{"type":"text",
+/// "text":"…"}]}`), so the protocol tolerance lives in one tested place.
+fn realtime_tool_result_message(item: &serde_json::Value) -> Option<serde_json::Value> {
+    if item.get("type").and_then(serde_json::Value::as_str) != Some("function_call_output") {
+        return None;
+    }
+    let call_id = item
+        .get("call_id")
+        .or_else(|| item.get("tool_call_id"))
+        .and_then(serde_json::Value::as_str)?;
+    let output = item
+        .get("output")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            // Nested content parts: join their text.
+            let parts = item.get("content")?.as_array()?;
+            let mut joined = String::new();
+            for part in parts {
+                if let Some(t) = part.get("text").and_then(serde_json::Value::as_str) {
+                    joined.push_str(t);
+                }
+            }
+            Some(joined)
+        })
+        .unwrap_or_default();
+    Some(serde_json::json!({
+        "role": "tool",
+        "tool_call_id": call_id,
+        "content": output,
+    }))
 }
 
 /// Blocking ASR daemon call for the realtime commit (16 kHz mono PCM16).
@@ -304,17 +405,27 @@ fn realtime_asr(shared: &Arc<ServeShared>, pcm16_mono_16k: &[u8]) -> Result<Stri
     Ok(transcript.trim().to_owned())
 }
 
+/// Bound the replayed conversation. Tool turns add up to three messages rather
+/// than two, so the cap counts messages and drops the oldest first.
+fn trim_realtime_history(history: &mut Vec<serde_json::Value>) {
+    const MAX_MESSAGES: usize = 40;
+    let excess = history.len().saturating_sub(MAX_MESSAGES);
+    if excess > 0 {
+        history.drain(..excess);
+    }
+}
+
 /// Drive one turn (text reply + spoken chunks), emitting events on `tx`.
 fn run_turn(
     shared: &Arc<ServeShared>,
     state: &Arc<std::sync::Mutex<RealtimeSessionState>>,
-    user_text: String,
+    user_text: Option<String>,
     tx: &mpsc::UnboundedSender<String>,
 ) {
     let emit = |value: serde_json::Value| {
         let _ = tx.send(value.to_string());
     };
-    let (instructions, max_tokens, want_audio, history) = {
+    let (instructions, max_tokens, want_audio, history, tools, tool_results) = {
         let st = state.lock().unwrap_or_else(|e| e.into_inner());
         (
             st.instructions.clone().unwrap_or_else(|| {
@@ -324,18 +435,24 @@ fn run_turn(
             st.max_output_tokens as usize,
             st.output_audio,
             st.history.clone(),
+            st.tools.clone(),
+            st.pending_tool_results.clone(),
         )
     };
+    // Order matters in a tool loop: the queued `tool` results must sit
+    // immediately AFTER the assistant `tool_calls` message that produced them
+    // (the end of `history`), and BEFORE any new user text.
     let mut messages: Vec<serde_json::Value> =
         vec![serde_json::json!({ "role": "system", "content": instructions })];
-    for (role, content) in &history {
-        messages.push(serde_json::json!({ "role": role, "content": content }));
+    messages.extend(history.iter().cloned());
+    messages.extend(tool_results.iter().cloned());
+    if let Some(text) = &user_text {
+        messages.push(serde_json::json!({ "role": "user", "content": text }));
     }
-    messages.push(serde_json::json!({ "role": "user", "content": user_text }));
 
     let cancel_flag = Arc::clone(&state.lock().unwrap_or_else(|e| e.into_inner()).cancel);
-    let reply = match realtime_text(shared, &messages, max_tokens, &cancel_flag) {
-        Ok(reply) => reply,
+    let outcome = match realtime_text(shared, &messages, max_tokens, &tools, &cancel_flag) {
+        Ok(outcome) => outcome,
         Err(error) => {
             if cancel_flag.load(Ordering::Relaxed) {
                 emit(serde_json::json!({"type":"response.done","response":{"status":"cancelled"}}));
@@ -348,19 +465,106 @@ fn run_turn(
             return;
         }
     };
-    let reply_visible = strip_realtime_tool_markers(&reply);
+    // Consume the queued results: they are now part of `history` below.
+    state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pending_tool_results
+        .clear();
+
+    if !outcome.calls.is_empty() {
+        // A tool turn is NOT spoken: the client executes the calls and answers
+        // with `function_call_output`. voice.js owns approval + execution, the
+        // server only orchestrates the protocol.
+        let ids: Vec<String> = (0..outcome.calls.len())
+            .map(|i| format!("call_{i}"))
+            .collect();
+        let ided: Vec<serde_json::Value> = outcome
+            .calls
+            .iter()
+            .zip(&ids)
+            .map(|(call, id)| {
+                serde_json::json!({
+                    "id": id,
+                    "name": call.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                    "arguments": call.get("arguments").cloned()
+                        .unwrap_or(serde_json::json!({})),
+                })
+            })
+            .collect();
+        // Type the arguments against the schemas the client declared, exactly
+        // as the HTTP gateway does (`normalize_tool_calls`). The model's XML
+        // carries every value as a string, so without this an `integer`
+        // parameter reaches the client as `"3"`.
+        let mut typed_calls: Vec<hipfire_runtime::prompt_frame::ToolCall> =
+            serde_json::from_value(serde_json::Value::Array(ided.clone())).unwrap_or_default();
+        crate::serve::complete::normalize_tool_calls(
+            &mut typed_calls,
+            &serde_json::json!({ "tools": tools }),
+        );
+        let ided: Vec<serde_json::Value> = typed_calls
+            .iter()
+            .map(|call| {
+                serde_json::json!({
+                    "id": call.id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                })
+            })
+            .collect();
+        {
+            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+            for result in tool_results {
+                st.history.push(result);
+            }
+            if let Some(text) = &user_text {
+                st.history
+                    .push(serde_json::json!({ "role": "user", "content": text }));
+            }
+            st.history.push(realtime_assistant_tool_message(&ided));
+            trim_realtime_history(&mut st.history);
+        }
+        for (call, id) in ided.iter().zip(&ids) {
+            let arguments = call
+                .get("arguments")
+                .map(|a| {
+                    a.as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| a.to_string())
+                })
+                .unwrap_or_else(|| "{}".to_owned());
+            emit(serde_json::json!({
+                "type": "response.function_call_arguments.done",
+                "call_id": id,
+                "name": call.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                "arguments": arguments,
+            }));
+        }
+        emit(serde_json::json!({
+            "type":"response.done",
+            "response":{"status":"completed"},
+        }));
+        return;
+    }
+
+    let reply_visible = strip_realtime_tool_markers(&outcome.reply);
     for chunk in chunk_text_for_tts(&reply_visible) {
         emit(serde_json::json!({"type":"response.output_text.delta","delta":chunk}));
     }
     {
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-        st.history.push(("user".to_owned(), user_text));
-        st.history
-            .push(("assistant".to_owned(), reply_visible.clone()));
-        let excess = st.history.len().saturating_sub(20);
-        if excess > 0 {
-            st.history.drain(..excess);
+        for result in tool_results {
+            st.history.push(result);
         }
+        if let Some(text) = &user_text {
+            st.history
+                .push(serde_json::json!({ "role": "user", "content": text }));
+        }
+        st.history.push(serde_json::json!({
+            "role": "assistant",
+            "content": reply_visible.clone(),
+        }));
+        trim_realtime_history(&mut st.history);
     }
     if want_audio && !reply_visible.trim().is_empty() {
         for chunk in chunk_text_for_tts(&reply_visible) {
@@ -445,6 +649,15 @@ async fn run_session(upgraded: Upgraded, shared: Arc<ServeShared>) -> Result<()>
                         if let Some(m) = event.pointer("/session/output_modalities").and_then(|v| v.as_array()) {
                             st.output_audio = m.iter().filter_map(|v| v.as_str()).any(|m| m == "audio");
                         }
+                        // `tools` / `tool_choice` from the session. The server
+                        // forwards the schemas on each turn's text stage; the
+                        // model (LFM3-Omni) then answers with structured calls
+                        // that `run_turn` releases as
+                        // `response.function_call_arguments.done`. Liquid Agent
+                        // keeps approvals and execution.
+                        if let Some(tools) = event.pointer("/session/tools").and_then(|v| v.as_array()) {
+                            st.tools = tools.clone();
+                        }
                     }
                     Some("input_audio_buffer.append") => {
                         if let Some(audio) = event.get("audio").and_then(|v| v.as_str()) {
@@ -477,7 +690,17 @@ async fn run_session(upgraded: Upgraded, shared: Arc<ServeShared>) -> Result<()>
                     }
                     Some("conversation.item.create") => {
                         let item = event.get("item").cloned().unwrap_or(serde_json::Value::Null);
-                        if let Some(content) = item.get("content").and_then(|v| v.as_str()) {
+                        // A tool result goes into the conversation as a
+                        // `role: "tool"` message, NOT into the user queue: the
+                        // next `response.create` replays it in order so the
+                        // model can answer on top of the call it made.
+                        if let Some(result) = realtime_tool_result_message(&item) {
+                            state
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .pending_tool_results
+                                .push(result);
+                        } else if let Some(content) = item.get("content").and_then(|v| v.as_str()) {
                             state.lock().unwrap_or_else(|e| e.into_inner()).queued_items.push(content.to_owned());
                         }
                     }
@@ -489,9 +712,19 @@ async fn run_session(upgraded: Upgraded, shared: Arc<ServeShared>) -> Result<()>
                                 if !t.trim().is_empty() { parts.push(t.trim().to_owned()); }
                             }
                             parts.extend(std::mem::take(&mut st.queued_items));
-                            if parts.is_empty() { None } else {
+                            // A queued tool result also drives a turn: the
+                            // model must get a chance to answer after the
+                            // client executed the call. `run_turn` carries the
+                            // result itself, so the user text is a neutral
+                            // continuation prompt in that case.
+                            let has_tool_result = !st.pending_tool_results.is_empty();
+                            if parts.is_empty() && !has_tool_result {
+                                None
+                            } else {
                                 st.cancel.store(false, Ordering::Relaxed);
-                                Some(parts.join("\n"))
+                                // A turn driven only by tool results carries no
+                                // new user message.
+                                Some((!parts.is_empty()).then(|| parts.join("\n")))
                             }
                         };
                         match turn {
@@ -525,7 +758,74 @@ async fn run_session(upgraded: Upgraded, shared: Arc<ServeShared>) -> Result<()>
 
 #[cfg(test)]
 mod tests {
-    use super::realtime_websocket_accept_key;
+    use super::{
+        realtime_assistant_tool_message, realtime_tool_result_message,
+        realtime_websocket_accept_key,
+    };
+
+    /// The OpenAI realtime `function_call_output` shape voice.js sends.
+    #[test]
+    fn function_call_output_becomes_a_tool_message() {
+        let item = serde_json::json!({
+            "type": "function_call_output",
+            "call_id": "call_0",
+            "output": "{\"ok\":true}",
+        });
+        let msg = realtime_tool_result_message(&item).expect("tool message");
+        assert_eq!(msg["role"], "tool");
+        assert_eq!(msg["tool_call_id"], "call_0");
+        assert_eq!(msg["content"], "{\"ok\":true}");
+    }
+
+    /// The nested-content variant, and the `tool_call_id` alias.
+    #[test]
+    fn function_call_output_accepts_nested_content_and_alias() {
+        let item = serde_json::json!({
+            "type": "function_call_output",
+            "tool_call_id": "call_7",
+            "content": [{"type": "text", "text": "12 degrees"}, {"type": "text", "text": " and raining"}],
+        });
+        let msg = realtime_tool_result_message(&item).expect("tool message");
+        assert_eq!(msg["tool_call_id"], "call_7");
+        assert_eq!(msg["content"], "12 degrees and raining");
+    }
+
+    /// Anything that is not a function-call output must fall through to the
+    /// user-item path, not be misread as a tool result.
+    #[test]
+    fn ordinary_items_are_not_tool_results() {
+        assert!(realtime_tool_result_message(&serde_json::json!({
+            "type": "message", "role": "user", "content": "hello"
+        }))
+        .is_none());
+        assert!(realtime_tool_result_message(&serde_json::json!({"content": "hi"})).is_none());
+        // A function-call output with no call id cannot be correlated.
+        assert!(realtime_tool_result_message(&serde_json::json!({
+            "type": "function_call_output", "output": "x"
+        }))
+        .is_none());
+    }
+
+    /// The history assistant turn replays the calls in the flat shape
+    /// `prompt_frame::Message` deserializes, with `arguments` as an OBJECT —
+    /// LFM3's template raises on a JSON-encoded string.
+    #[test]
+    fn assistant_tool_message_keeps_arguments_an_object() {
+        let calls = vec![serde_json::json!({
+            "id": "call_0",
+            "name": "book_room",
+            "arguments": {"people": 3, "day": "Tuesday"},
+        })];
+        let msg = realtime_assistant_tool_message(&calls);
+        assert_eq!(msg["role"], "assistant");
+        assert_eq!(msg["content"], "");
+        assert!(msg["tool_calls"][0]["arguments"].is_object());
+        // Round-trips through the daemon's message parser.
+        let parsed: Vec<hipfire_runtime::prompt_frame::Message> =
+            serde_json::from_value(serde_json::json!([msg.clone()])).expect("deserializes");
+        assert_eq!(parsed[0].tool_calls[0].name, "book_room");
+        assert_eq!(parsed[0].tool_calls[0].id.as_deref(), Some("call_0"));
+    }
 
     #[test]
     fn realtime_accept_key_matches_rfc6455_example() {

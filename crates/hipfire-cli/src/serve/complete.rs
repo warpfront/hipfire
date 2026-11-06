@@ -482,7 +482,7 @@ fn normalize_value(
     }
 }
 
-fn normalize_tool_calls(calls: &mut [ToolCall], body: &serde_json::Value) {
+pub(crate) fn normalize_tool_calls(calls: &mut [ToolCall], body: &serde_json::Value) {
     let tools = match body.get("tools").and_then(|v| v.as_array()) {
         Some(a) => a,
         None => return,
@@ -3146,7 +3146,9 @@ pub(crate) fn request_audio_base64(messages: Option<&serde_json::Value>) -> Resu
             let payload = part
                 .pointer("/input_audio/data")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| invalid_request!("input_audio content part requires input_audio.data"))?;
+                .ok_or_else(|| {
+                    invalid_request!("input_audio content part requires input_audio.data")
+                })?;
             match part
                 .pointer("/input_audio/format")
                 .and_then(serde_json::Value::as_str)
