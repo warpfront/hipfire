@@ -1422,3 +1422,8 @@ required-features = ["lab"]
 [[example]]
 name = "fn_expert_table_indirection"
 required-features = ["lab"]
+
+# Q8 flash-attention head_dim=96 probe (needs a GPU).
+[[example]]
+name = "q8_flash_head96_test"
+required-features = ["lab"]

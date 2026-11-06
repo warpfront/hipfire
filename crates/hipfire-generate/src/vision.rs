@@ -230,6 +230,19 @@ pub struct GenerateVLParams<'a> {
     pub assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     /// Per-request sampler seed (see `hipfire_engine::request_seed_for`).
     pub seed: u32,
+    /// [OI] `tools` for this turn, already projected by the serve gateway.
+    ///
+    /// Only the LFM3-VL route renders these (its vendor template has a real
+    /// `{% if tools %}` block and the model emits the standard
+    /// `<tool_call><function=…>` shape). Every other VL route accepts and
+    /// ignores it: their templates carry no tool format, so the daemon refuses
+    /// a tools request on those routes before reaching here rather than
+    /// silently dropping the schemas.
+    pub tools: Option<&'a [serde_json::Value]>,
+    /// Conversation history. The tools path needs it: a tool-using turn has to
+    /// replay prior assistant `tool_calls` and `tool` results through the
+    /// template, which a single `prompt` string cannot express.
+    pub messages_history: Option<&'a [hipfire_runtime::prompt_frame::Message]>,
 }
 
 impl<'a> GenerateVLParams<'a> {
@@ -1143,6 +1156,11 @@ pub fn generate_vl(
         max_think_tokens,
         assistant_prefix,
         seed,
+        // Only the LFM3-VL route renders `tools`; this Qwen-family VL body has
+        // no tool format in its template, so the daemon refuses a tools
+        // request before dispatch instead of silently dropping the schemas.
+        tools: _,
+        messages_history: _,
     } = *params;
     // Render the conversation (CPU only) BEFORE the stream opener: the opener's
     // `started_in_think` is read off the rendered prompt tail, like the text

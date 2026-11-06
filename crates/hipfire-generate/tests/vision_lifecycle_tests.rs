@@ -768,6 +768,8 @@ fn vl_params<'a>(
         max_think_tokens: 0,
         assistant_prefix: AssistantPrefix::Plain,
         seed: 0xC10C,
+        tools: None,
+        messages_history: None,
     }
 }
 
