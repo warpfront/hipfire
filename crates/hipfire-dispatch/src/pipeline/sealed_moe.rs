@@ -8802,6 +8802,34 @@ mod tests {
     }
 
     #[test]
+    fn hetero_device_runs_a_bf16_shared_down_inside_the_cold_wait() {
+        let bf16_shared = |p: &mut MoeParams<'_>| {
+            let shared = p.shared.as_mut().expect("fixture carries a shared expert");
+            shared.weights.down.dtype = DType::BF16;
+            shared.weights.down.awq_scale = None;
+        };
+        for route in [MoeRouteCapability::Qt44Qt53Grouped, MoeRouteCapability::Qt44Qt53GroupedSymmetric] {
+            let st = split_decode_stages(Some(route), false, bf16_shared, |s| s.hetero_device = true).unwrap();
+            let label = format!("{route:?}: {st:?}");
+            let at = |x: MoeStage| st.iter().position(|s| *s == x).unwrap_or_else(|| panic!("{x:?} missing: {label}"));
+            if !cfg!(feature = "deltanet") {
+                assert!(!st.contains(&MoeStage::SharedAdd), "{label}");
+                continue;
+            }
+            // The GEMV half after the hot down, inside the wait; the fold after
+            // the routed combine, last: routed first, shared second.
+            assert_eq!(st.iter().filter(|s| **s == MoeStage::SharedDown).count(), 1, "{label}");
+            assert!(at(MoeStage::Down) < at(MoeStage::SharedDown), "{label}");
+            assert!(at(MoeStage::SharedDown) < at(MoeStage::AwaitCold), "{label}");
+            assert!(at(MoeStage::Combine) < at(MoeStage::SharedAdd), "{label}");
+            assert_eq!(*st.last().unwrap(), MoeStage::SharedAdd, "{label}");
+            // Without the device split the fused shared down keeps its place.
+            let plain = split_decode_stages(Some(route), false, bf16_shared, |_| {}).unwrap();
+            assert!(!plain.contains(&MoeStage::SharedAdd), "{route:?}: {plain:?}");
+        }
+    }
+
+    #[test]
     fn hetero_device_never_lowers_host_split_stages() {
         for route in SPLIT_ROUTES {
             let st = split_decode_stages(Some(route), false, |_| {}, |s| s.hetero_device = true).unwrap();

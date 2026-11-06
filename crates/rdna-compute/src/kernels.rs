@@ -10493,8 +10493,11 @@ pub const QWEN4_GEMV_BF16_XF32_SRC: &str =
     include_str!("../../../kernels/src/qwen4_gemv_bf16_xf32.hip");
 /// Source of the shipped `gemv_bf16_xf32` module: #774's gfx1151 body there,
 /// the shipped text everywhere else.
-pub fn gemv_bf16_xf32_src(is_gfx1151: bool) -> &'static str {
-    if is_gfx1151 {
+/// `gemv_bf16_xf32`'s source: gfx1151 and gfx1201 take the Qwen4 file, whose
+/// kernel runs the shared eight-load row body (bitwise the single-step one);
+/// every other arch keeps the original single-step file.
+pub fn gemv_bf16_xf32_src(unrolled_arch: bool) -> &'static str {
+    if unrolled_arch {
         QWEN4_GEMV_BF16_XF32_SRC
     } else {
         GEMV_BF16_XF32_SRC
