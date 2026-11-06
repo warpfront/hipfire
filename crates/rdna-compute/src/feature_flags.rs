@@ -234,6 +234,13 @@ pub struct FeatureFlags {
     /// 2^32 inputs) and, for tagged launches of at most `AR_HC_SPLIT_MAX_ROWS` rows, one lane
     /// per (granule, branch). Byte-identical. Default on for exact gfx1201 (`=0` kills it).
     pub ep_ar_fast_apply: bool,
+    /// EP2 fused all-reduce + HC write launch grid (`HIPFIRE_EP_AR_WIDE_GRID`): launches the
+    /// non-split entries (`ar_hc_write_d8_*` / `ar_hc_write_*`, 13+ rows: wide verify and lane
+    /// steps, short prefill tiles) on up to 64 blocks of up to 512 lanes (one granule per lane up
+    /// to 51 rows, at most 3 up to 153 rows; larger launches keep it) instead of the 16-block
+    /// default shape. Byte-identical (the per-granule arithmetic
+    /// does not depend on which lane runs it). Default on for exact gfx1201 (`=0` kills it).
+    pub ep_ar_wide_grid: bool,
     /// Decode HC read norm + the paired write's k4 gate GEMV in one launch
     /// (`HIPFIRE_QWEN4_HC_PAIR_DECODE`, 1..=8 rows): bitwise the unfused `hyper_norm` +
     /// `gemv_bf16_xf32_k4` sequence. Default on for exact gfx1201 (`=0` kills it).
@@ -1190,6 +1197,7 @@ impl FeatureFlags {
             qwen4_lane_wmma: parse_bool("HIPFIRE_QWEN4_LANE_WMMA").unwrap_or(true),
             qwen4_hc8: parse_bool("HIPFIRE_QWEN4_HC8").unwrap_or(true),
             ep_ar_fast_apply: parse_bool("HIPFIRE_EP_AR_FAST_APPLY").unwrap_or(true),
+            ep_ar_wide_grid: parse_bool("HIPFIRE_EP_AR_WIDE_GRID").unwrap_or(true),
             qwen4_hc_pair_decode: parse_bool("HIPFIRE_QWEN4_HC_PAIR_DECODE").unwrap_or(true),
             qwen4_qsa_scores_reserve: parse_bool("HIPFIRE_QWEN4_QSA_SCORES_RESERVE")
                 .unwrap_or(true),
@@ -2013,6 +2021,12 @@ impl FeatureFlags {
         self.ep_ar_fast_apply && self.arch == "gfx1201"
     }
 
+    /// EP2 AR wide launch grid (`HIPFIRE_EP_AR_WIDE_GRID`, default on, `=0` kills it). Exact
+    /// gfx1201 only (the only arch with the kernel).
+    pub fn ep_ar_wide_grid_enabled(&self) -> bool {
+        self.ep_ar_wide_grid && self.arch == "gfx1201"
+    }
+
     /// Decode HC read norm + paired write k4 gate GEMV in one launch
     /// (`HIPFIRE_QWEN4_HC_PAIR_DECODE`, default on, `=0` kills it). Exact gfx1201 only.
     pub fn qwen4_hc_pair_decode_enabled(&self) -> bool {
@@ -2201,6 +2215,7 @@ impl FeatureFlags {
             qwen4_lane_wmma: false,
             qwen4_hc8: false,
             ep_ar_fast_apply: false,
+            ep_ar_wide_grid: false,
             qwen4_hc_pair_decode: false,
             qwen4_qsa_scores_reserve: false,
             stream_ordered_copies: false,
@@ -3728,6 +3743,33 @@ mod tests {
             );
         }
         assert!(!FeatureFlags::for_test("gfx1201").ep_ar_fast_apply_enabled());
+    }
+
+    /// The EP2 AR wide grid is default on (`=0` kills) and reaches exact gfx1201 only.
+    #[test]
+    fn ep_ar_wide_grid_defaults_on_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |n: &str| -> std::result::Result<String, ()> {
+                if n == "HIPFIRE_EP_AR_WIDE_GRID" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                unset.ep_ar_wide_grid_enabled(),
+                arch == "gfx1201",
+                "{arch}: unset"
+            );
+            let off = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!off.ep_ar_wide_grid_enabled(), "{arch}: 0");
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").ep_ar_wide_grid_enabled());
     }
 
     /// The decode HC read/write pair fusion is default on (`=0` kills) and reaches exact gfx1201 only.

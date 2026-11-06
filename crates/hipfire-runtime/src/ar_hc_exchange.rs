@@ -41,8 +41,8 @@
 use crate::ep_row_gather::{DEFAULT_BARRIER_TIMEOUT, SLOW_BARRIER_REPORT};
 use hip_bridge::{DeviceBuffer, HipError, HipResult, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED};
 use rdna_compute::ar_hc_write::{
-    ar_hc_bank_bytes_for, ar_hc_fold, ar_hc_geometry, ar_hc_write_model, ar_hc_write_model_f32,
-    ArHcWire, StreamKind, AR_HC_GEN_BYTES, AR_HC_HIDDEN, AR_HC_ROW_CAP,
+    ar_hc_bank_bytes_for, ar_hc_fold, ar_hc_launch_geometry, ar_hc_write_model,
+    ar_hc_write_model_f32, ArHcWire, StreamKind, AR_HC_GEN_BYTES, AR_HC_HIDDEN, AR_HC_ROW_CAP,
 };
 use rdna_compute::Gpu;
 use std::ffi::c_void;
@@ -508,7 +508,7 @@ impl ArHcExchange {
             let n = slice.min(rows - done);
             let wire = self.wire_for(n);
             let region = self.region_offset(wire);
-            let geometry = ar_hc_geometry(n)
+            let geometry = ar_hc_launch_geometry(n, gpu.flags.ep_ar_wide_grid_enabled())
                 .ok_or_else(|| err(format!("ar_hc_exchange: no launch geometry for {n} rows")))?;
             let dbg = if mixed_dbg.is_null() {
                 mixed_dbg
