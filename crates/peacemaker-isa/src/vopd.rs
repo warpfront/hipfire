@@ -218,3 +218,49 @@ where
         },
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mul(dst: u8, src0: u8, src1: u8) -> VopdOp {
+        VopdOp {
+            op: VopdF32::Mul,
+            dst,
+            src0: Operand::V(src0),
+            src1,
+        }
+    }
+
+    /// hipcc's `attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201` emits
+    /// `v_dual_mul_f32 v230, v189, v222 :: v_dual_mul_f32 v231, v189, v223`: both halves read the same VGPR as src0.
+    #[test]
+    fn gfx12_allows_the_same_vgpr_as_src0_in_both_halves() {
+        let (x, y) = (mul(230, 189, 222), mul(231, 189, 223));
+        assert!(validate_pair(Arch::Gfx1201, x, y).is_ok());
+        let text = packet(Arch::Gfx1201, x, y).unwrap().text;
+        assert_eq!(
+            text,
+            "v_dual_mul_f32 v230, v189, v222 :: v_dual_mul_f32 v231, v189, v223"
+        );
+    }
+
+    /// Different registers in one bank stay refused (src0 and src1), on every arch; gfx11 stays strict for equal src0.
+    #[test]
+    fn distinct_registers_in_one_bank_stay_refused() {
+        for arch in [Arch::Gfx1201, Arch::Gfx1151] {
+            assert_eq!(
+                validate_pair(arch, mul(0, 2, 4), mul(1, 6, 5)).unwrap_err(),
+                "VOPD src0 bank collision"
+            );
+            assert_eq!(
+                validate_pair(arch, mul(0, 2, 4), mul(1, 3, 0)).unwrap_err(),
+                "VOPD src1 bank collision"
+            );
+        }
+        assert_eq!(
+            validate_pair(Arch::Gfx1151, mul(0, 2, 4), mul(1, 2, 5)).unwrap_err(),
+            "VOPD src0 bank collision"
+        );
+    }
+}

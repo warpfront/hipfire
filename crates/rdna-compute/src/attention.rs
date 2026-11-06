@@ -188,7 +188,7 @@ const A3B_QRESIDENT_HIPCC_RANGE: &str =
 
 /// Kernel arm of the A3B Q-resident attention launch: the hipcc module or the embedded
 /// PeaceMaker twin ([`crate::fa_qresident_pm`]). Production follows
-/// `HIPFIRE_FA_QRESIDENT_PM` (default off).
+/// `HIPFIRE_FA_QRESIDENT_PM` (default on for exact gfx1201; `0` selects hipcc).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum A3bQresRoute {
     Hipcc,
@@ -26851,19 +26851,19 @@ mod tests {
     }
 
     #[test]
-    fn a3b_qresident_route_follows_the_flag_and_defaults_to_hipcc() {
+    fn a3b_qresident_route_follows_the_flag_and_defaults_to_pm_on_gfx1201() {
         use super::A3bQresRoute;
         assert_eq!(A3bQresRoute::from_flag(false), A3bQresRoute::Hipcc);
         assert_eq!(A3bQresRoute::from_flag(true), A3bQresRoute::Pm);
         let mut flags = crate::feature_flags::FeatureFlags::for_test("gfx1201");
         assert_eq!(
             A3bQresRoute::from_flag(flags.fa_qresident_pm),
-            A3bQresRoute::Hipcc
+            A3bQresRoute::Pm
         );
-        flags.fa_qresident_pm = true;
+        flags.fa_qresident_pm = false;
         assert_eq!(
             A3bQresRoute::from_flag(flags.fa_qresident_pm),
-            A3bQresRoute::Pm
+            A3bQresRoute::Hipcc
         );
     }
 

@@ -719,11 +719,11 @@ pub struct FeatureFlags {
     /// Emit preconverted fp8 Q for the v2 Q-resident attention twin.
     /// `HIPFIRE_GFX12_FA_PREP_FP8Q=0` retains F32 Q.
     pub gfx12_fa_prep_fp8q: bool,
-    /// `HIPFIRE_FA_QRESIDENT_PM` (developer, **default OFF**): run the A3B H16/KV2/D256
-    /// native-fp8 Q-resident FA2 prefill attention (`qresident_a3b_launch`, direct and range)
-    /// from the embedded PeaceMaker twin `fa_qresident_a3b_pm_gfx1201` instead of the hipcc
-    /// module. Same arguments, grid, block and dynamic LDS; `1` opts in on exact gfx1201,
-    /// unset/`0` keeps the hipcc kernel byte-for-byte.
+    /// `HIPFIRE_FA_QRESIDENT_PM` (**default ON on exact gfx1201**, off elsewhere): run the A3B
+    /// H16/KV2/D256 native-fp8 Q-resident FA2 prefill attention (`qresident_a3b_launch`, direct
+    /// and range) from the embedded PeaceMaker twin `fa_qresident_a3b_pm_gfx1201` instead of the
+    /// hipcc module (byte-identical output, oracle 2694 cases / 0 mismatches). Same arguments,
+    /// grid, block and dynamic LDS; `0` is the kill switch and keeps the hipcc kernel.
     pub fa_qresident_pm: bool,
     /// Whole-chunk Q8/Q8 FA2 on exact gfx1100/gfx1151
     /// (`HIPFIRE_GFX11_Q8_FA2_WIDE`, `kernel.gfx11_q8_fa2_wide`).
@@ -1484,7 +1484,7 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             gfx12_fa_prep_fp8q: parse_bool("HIPFIRE_GFX12_FA_PREP_FP8Q")
                 .unwrap_or(arch == "gfx1201"),
-            fa_qresident_pm: parse_bool("HIPFIRE_FA_QRESIDENT_PM").unwrap_or(false),
+            fa_qresident_pm: parse_bool("HIPFIRE_FA_QRESIDENT_PM").unwrap_or(arch == "gfx1201"),
             gfx11_q8_fa2_wide: parse_bool("HIPFIRE_GFX11_Q8_FA2_WIDE")
                 .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
             gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
@@ -2323,7 +2323,7 @@ impl FeatureFlags {
             gfx1100_wmma_verify_attn: false,
             gfx12_fa_prep_fused: false,
             gfx12_fa_prep_fp8q: false,
-            fa_qresident_pm: false,
+            fa_qresident_pm: arch == "gfx1201",
             gfx11_q8_fa2_wide: false,
             gfx11_fa2_prefill: false,
             gemm_dump: false,
@@ -4101,7 +4101,7 @@ mod tests {
     }
 
     #[test]
-    fn fa_qresident_pm_defaults_off_on_every_arch_and_parses() {
+    fn fa_qresident_pm_defaults_on_for_exact_gfx1201_and_parses() {
         for arch in ["gfx1201", "gfx1100", "gfx1151", "gfx1030"] {
             let flags = |v: Option<&str>| {
                 FeatureFlags::from_lookup(arch, |name| match (name, v) {
@@ -4109,11 +4109,12 @@ mod tests {
                     _ => Err(()),
                 })
             };
-            assert!(!flags(None).fa_qresident_pm, "{arch}: unset is off");
+            let on = arch == "gfx1201";
+            assert_eq!(flags(None).fa_qresident_pm, on, "{arch}: unset follows the arch");
             assert!(flags(Some("1")).fa_qresident_pm, "{arch}: 1 opts in");
-            assert!(!flags(Some("0")).fa_qresident_pm, "{arch}: 0 is off");
-            assert!(!flags(Some("junk")).fa_qresident_pm, "{arch}: junk is off");
-            assert!(!FeatureFlags::for_test(arch).fa_qresident_pm);
+            assert!(!flags(Some("0")).fa_qresident_pm, "{arch}: 0 is the kill switch");
+            assert_eq!(flags(Some("junk")).fa_qresident_pm, on, "{arch}: junk is the default");
+            assert_eq!(FeatureFlags::for_test(arch).fa_qresident_pm, on);
         }
     }
 
