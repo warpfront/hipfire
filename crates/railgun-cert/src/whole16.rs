@@ -1038,6 +1038,7 @@ mod tests {
             case_digest: String::new(),
             guard_flag: None,
             task_protocol: None,
+            wg_footprints: Vec::new(),
         }
     }
 

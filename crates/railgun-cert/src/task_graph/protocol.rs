@@ -20,7 +20,8 @@
 //! forgotten (the range itself is proven unwritten by the region check) and the
 //! walk resumes at the region's exit.
 //!
-//! What it proves, on every path, for the six `TASK_PROTO_*` properties:
+//! What it proves, on every path, for the six required `TASK_PROTO_*` properties (and,
+//! when it holds, the optional seventh):
 //!
 //! * claim: the only ticket access is one `global_atomic_add_u32` of constant 1
 //!   with return, device scope, issued by a single lane of wave 0, on the pointer
@@ -39,6 +40,28 @@
 //! * once: it executes once per claimed task (not inside an inner loop, by one
 //!   lane of wave 0), and every complete trip of the claim loop passes it, skips
 //!   it for `done == NONE`, or is a wave that never signals.
+//! * region_wg (optional: added to `proved` only when every check below holds): every
+//!   region is entered with its `wg_x` register `= header[vx] + step` and its `wg_yz`
+//!   register `= header[vy] | header[vz] << 16`, all fields of the claimed task, where
+//!   `step` is the counter of a step loop around the region. The induction fact is the
+//!   symbolic [`E::Trip`]: the counter is `0` on every entry edge of the loop (with its
+//!   bound register holding a header field, optionally `max(.., 1)`) and the loop's
+//!   latch increments it by one and takes the back edge only while `step + 1 < bound`
+//!   ([`E::TripNext`] refined to [`E::TripCont`] on that edge), so `step` is the trip
+//!   number and `step < max(bound, 1)` at every head; a write of the counter anywhere
+//!   else loses the fact. Every trip must enter the region (`RAN`) before it takes the
+//!   back edge or leaves the loop, and the only way out is the failed bound compare, so
+//!   every step of `[0, max(vcount, 1))` runs the region once.
+//!   Grid: `gx` is derived from the bytes (the one other header dword the dispatcher keeps
+//!   live in a dispatcher SGPR, `s72`; a native region's grid-stride loop reads it, and
+//!   its reads of the dispatcher range are checked to be only that register and the
+//!   workgroup registers). `gy`/`gz` are the next two header dwords (loaded, distinct from
+//!   every consumed field, never read by the dispatcher). A lifted body does not read the
+//!   header grid at all: its grid comes from the hidden arguments of its own record, which
+//!   the dispatcher never writes, so the relation `header grid == record hidden counts`
+//!   is an obligation of whoever builds the arena (the host), stated in the evidence line
+//!   and not provable here. `wg_yz` is `vy | vz << 16` without masking: it equals the
+//!   hardware `ttmp7` only for `vy, vz < 65536`.
 //!
 //! Multi-wave pools: waves other than 0 run no claim code and take the
 //! descriptor from the LDS slot wave 0 filled before a barrier; the check proves
@@ -60,8 +83,8 @@ use peacemaker_ir::wait::Counter;
 use peacemaker_lift::regions_note::KernelRegions;
 use peacemaker_lift::text::print::canonical;
 use railgun_corpus::receipt::{
-    TaskProtocolRecord, TASK_PROTO_ACQUIRE, TASK_PROTO_BOUNDED, TASK_PROTO_CLAIM,
-    TASK_PROTO_COMPLETE, TASK_PROTO_ONCE, TASK_PROTO_RELEASE,
+    TaskGridOffsets, TaskProtocolRecord, TASK_PROTO_ACQUIRE, TASK_PROTO_BOUNDED, TASK_PROTO_CLAIM,
+    TASK_PROTO_COMPLETE, TASK_PROTO_ONCE, TASK_PROTO_REGION_WG, TASK_PROTO_RELEASE,
 };
 
 use super::{refuse, Placed, Refusal, RegionFacts};
@@ -84,6 +107,7 @@ const MERGED: u32 = 1 << 13; // a workgroup barrier executed this trip
 const DIV2: u32 = 1 << 14; // in the wave-0-only tail after the release barrier
 const STORED: u32 = 1 << 15; // this wave stored the LDS slot, no barrier since
 const LOADED: u32 = 1 << 16; // this wave loaded the LDS slot, no barrier since
+const RAN: u32 = 1 << 17; // the region of the current step-loop trip was entered
 
 const NONE: u32 = u32::MAX;
 const MAX_ALTS: usize = 6;
@@ -128,24 +152,86 @@ enum E {
     Cell(u32),
     /// An unmodelled value that is the same in every wave.
     Uni,
+    /// `a | b` and `a + b` (32-bit, wrapping); the operands are in `Ord` order.
+    Or(Box<E>, Box<E>),
+    Add(Box<E>, Box<E>),
+    /// `max(x, 1)`, unsigned.
+    MaxOne(Box<E>),
+    /// The trip number (0, 1, ..) of the step loop headed by block `head` at its
+    /// head, with `step < max(bound, 1)` established by the loop's own entry and
+    /// back-edge conditions; [`E::TripNext`] is that number plus one before the
+    /// latch's bound compare, [`E::TripCont`] after the compare's taken edge
+    /// (`step + 1 < bound`). Created only at the step-loop edge hook.
+    Trip {
+        head: usize,
+        bound: Box<E>,
+    },
+    TripNext {
+        head: usize,
+        bound: Box<E>,
+    },
+    TripCont {
+        head: usize,
+        bound: Box<E>,
+    },
 }
 
 impl E {
     fn uniform(&self) -> bool {
         match self {
             E::Const(_) | E::Karg(_) | E::Param(_) | E::Cell(_) | E::Uni => true,
-            E::Shl(x, _) => x.uniform(),
+            E::Shl(x, _) | E::MaxOne(x) => x.uniform(),
             E::PtrLo { add, .. } | E::PtrHi { add, .. } => add.uniform(),
+            E::Or(a, b) | E::Add(a, b) => a.uniform() && b.uniform(),
+            E::Trip { bound, .. } | E::TripNext { bound, .. } | E::TripCont { bound, .. } => {
+                bound.uniform()
+            }
             _ => false,
         }
     }
     fn depth(&self) -> usize {
         match self {
-            E::Shl(x, _) => 1 + x.depth(),
+            E::Shl(x, _) | E::MaxOne(x) => 1 + x.depth(),
             E::EventAt { idx, .. } => 1 + idx.depth(),
             E::PtrLo { add, .. } | E::PtrHi { add, .. } => 1 + add.depth(),
+            E::Or(a, b) | E::Add(a, b) => 1 + a.depth().max(b.depth()),
+            E::Trip { bound, .. } | E::TripNext { bound, .. } | E::TripCont { bound, .. } => {
+                1 + bound.depth()
+            }
             _ => 0,
         }
+    }
+    /// Whether the value is only meaningful for the claim of the current trip of the
+    /// claim loop (a header field, the LDS slot, the claim itself, anything derived):
+    /// it must not survive into the next trip's code.
+    fn per_claim(&self) -> bool {
+        match self {
+            E::Claim
+            | E::Hdr(_)
+            | E::Cell(_)
+            | E::EventAt { .. }
+            | E::Trip { .. }
+            | E::TripNext { .. }
+            | E::TripCont { .. } => true,
+            E::Shl(x, _) | E::MaxOne(x) => x.per_claim(),
+            E::PtrLo { add, .. } | E::PtrHi { add, .. } => add.per_claim(),
+            E::Or(a, b) | E::Add(a, b) => a.per_claim() || b.per_claim(),
+            _ => false,
+        }
+    }
+    fn is_step(&self) -> bool {
+        matches!(
+            self,
+            E::Trip { .. } | E::TripNext { .. } | E::TripCont { .. }
+        )
+    }
+    fn add(a: E, b: E) -> E {
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        E::Add(Box::new(a), Box::new(b))
+    }
+    fn or(a: E, b: E) -> E {
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        E::Or(Box::new(a), Box::new(b))
     }
 }
 
@@ -509,6 +595,41 @@ struct Event {
     cells: BTreeMap<u32, Alts>,
 }
 
+/// A loop of the dispatcher that runs one region once per step: `counter` (an SGPR)
+/// is compared `counter < bound` by the latch block, whose taken edge returns to
+/// `head`. Only the shape is found here ([`find_step_loops`]); the dataflow proves
+/// what the two registers hold.
+#[derive(Clone, Debug)]
+struct StepLoop {
+    head: usize,
+    latch: usize,
+    counter: u16,
+    bound: u16,
+    /// The natural loop of the back edge `latch -> head`.
+    members: BTreeSet<usize>,
+}
+
+/// One region entry's view of the workgroup-from-header facts.
+struct WgEntry {
+    template: u32,
+    /// Dispatcher-range SGPRs holding a plain header dword of the claimed task.
+    plain: BTreeMap<u16, u32>,
+    /// Dispatcher-range SGPRs a native region reads.
+    native_reads: BTreeSet<u16>,
+}
+
+/// What `region_wg_from_header` collected on one pass of the walk.
+#[derive(Default)]
+struct WgRun {
+    /// Why the property is not proved (empty: every check held).
+    unproven: BTreeSet<String>,
+    /// Header offsets named by `wg_x`/`wg_yz`/the bound: `vx`, `vy`, `vz`, `vcount`.
+    fields: BTreeMap<&'static str, u32>,
+    entries: Vec<WgEntry>,
+    /// Templates entered inside each step loop (by head block).
+    heads: BTreeMap<usize, BTreeSet<u32>>,
+}
+
 struct Walk<'a> {
     kernel: &'a Kernel,
     arch: Arch,
@@ -524,7 +645,7 @@ struct Walk<'a> {
     template_ids: BTreeSet<u32>,
     lds_in: Vec<Event>,
     exit_waited: Vec<u8>,
-    nonzero_waits: Vec<u8>,
+    steps: BTreeMap<usize, StepLoop>,
 }
 
 #[derive(Default)]
@@ -541,6 +662,9 @@ struct Run {
     unmatched_signal: bool,
     first_barrier: [Option<usize>; 2],
     backedges: usize,
+    /// Header dwords the three b128 loads produced.
+    hdr_loaded: BTreeSet<u32>,
+    wg: WgRun,
 }
 
 fn set_once<T: PartialEq + Copy + std::fmt::Debug>(
@@ -756,6 +880,47 @@ impl Walk<'_> {
                     self.put(st, &ops[0], Some(one(E::Tid)));
                 } else {
                     handled = false;
+                }
+            }
+            "s_max_u32" if ops.len() == 3 && parse_num(&ops[2]) == Some(1) => {
+                let r = self.value(st, &ops[1]).map(|a| {
+                    a.into_iter()
+                        .map(|e| match e {
+                            E::Const(c) => E::Const(c.max(1)),
+                            e @ E::MaxOne(_) => e,
+                            e => E::MaxOne(Box::new(e)),
+                        })
+                        .collect::<Alts>()
+                });
+                self.put(st, &ops[0], r);
+                st.scc = None;
+            }
+            "s_add_co_i32" if ops.len() == 3 => {
+                let a = self.value(st, &ops[1]);
+                let b = self.value(st, &ops[2]);
+                match step_sum(a.as_ref(), b.as_ref()) {
+                    Some(v) => self.put(st, &ops[0], Some(v)),
+                    None => handled = false,
+                }
+                st.scc = None;
+            }
+            "v_lshl_or_b32"
+                if ops.len() == 4 && st.exec != Exec::Top && parse_num(&ops[2]) == Some(16) =>
+            {
+                // the first active lane's `(a << 16) | c`; lane 0 is active under both
+                // EXEC values modelled here
+                match (self.value(st, &ops[1]), self.value(st, &ops[3])) {
+                    (Some(a), Some(c)) if a.len() * c.len() <= MAX_ALTS => {
+                        let v: Alts = a
+                            .iter()
+                            .flat_map(|x| {
+                                c.iter()
+                                    .map(move |y| E::or(E::Shl(Box::new(x.clone()), 16), y.clone()))
+                            })
+                            .collect();
+                        self.put(st, &ops[0], Some(v));
+                    }
+                    _ => handled = false,
                 }
             }
             "s_load_b32" | "s_load_b64" | "s_load_b128" | "s_load_b256" | "s_load_b512"
@@ -1156,6 +1321,7 @@ impl Walk<'_> {
                 run.header_sites.insert(pos);
                 let off = ins.offset();
                 for i in 0..len {
+                    run.hdr_loaded.insert(off as u32 + 4 * i as u32);
                     self.put_dword(
                         st,
                         Rk::V,
@@ -1459,18 +1625,20 @@ impl Walk<'_> {
         if st.v.get(&0) != Some(&one(E::Tid)) {
             errs.push("v0 is not the workgroup-linear workitem id");
         }
-        // A counter the dispatcher left undrained (the previous task's release increment
-        // is still on STOREcnt at the next trip's first region) is harmless to a body
-        // that only waits it to zero; a body that waits a counter to a non-zero count
-        // needs it drained.
-        let must = self.nonzero_waits[idx];
-        if st.waited & must != must {
-            errs.push("a memory operation of the dispatcher may still be in flight (the body waits that counter to a non-zero count)");
-            let detail = format!(
-                "region {t}: counters drained {:#06b} (load/store/ds/km), body needs {:#06b}, path facts {:#x}",
-                st.waited, must, st.facts
+        // Every counter is drained at region entry (PeaceMaker's `drain_all_counters`
+        // before each region): the bodies' certificates start from nothing in flight, so
+        // an operation of the dispatcher still outstanding is refused whatever the body
+        // later waits for.
+        if st.waited & (WL | WS | WD | WK) != (WL | WS | WD | WK) {
+            self.fail(
+                run,
+                pos,
+                "task_graph-region-drain",
+                format!(
+                    "region {t}: not every counter is drained at entry (load/store/ds/km drained {:#06b}, path facts {:#x}): a dispatcher memory operation may still be in flight",
+                    st.waited, st.facts
+                ),
             );
-            self.fail(run, pos, "task_graph-protocol-entry", detail);
         }
         if st.facts & ACQ == 0 {
             errs.push("no device-scope acquire since the descriptor was read");
@@ -1491,6 +1659,7 @@ impl Walk<'_> {
                 format!("region {t}: {e}"),
             );
         }
+        self.check_wg(st, pos, placed, run);
         // apply the summary: the dispatcher's SGPR range survives, nothing else
         let (lo_r, hi_r) = (d.lo, d.hi);
         st.s.retain(|k, _| (lo_r..=hi_r).contains(k));
@@ -1500,6 +1669,7 @@ impl Walk<'_> {
         st.carry = None;
         st.waited = self.exit_waited[idx];
         st.facts |= BODY;
+        st.facts |= RAN;
         st.facts &= !BDSYNC;
     }
 
@@ -1514,6 +1684,22 @@ impl Walk<'_> {
         };
         let a = single(&cmp.a).cloned();
         let b = single(&cmp.b).cloned();
+        // the step loop's continue edge: `step + 1 < bound` taken
+        if !cmp.signed && matches!((cmp.rel, truth), (Rel::Lt, true) | (Rel::Ge, false)) {
+            if let (Some(next @ E::TripNext { head, bound }), Some(bd), Some(r)) =
+                (&a, &b, cmp.a_reg)
+            {
+                if **bound == *bd && st.s.get(&r) == Some(&one(next.clone())) {
+                    st.s.insert(
+                        r,
+                        one(E::TripCont {
+                            head: *head,
+                            bound: bound.clone(),
+                        }),
+                    );
+                }
+            }
+        }
         // wave role
         if a == Some(E::WaveId) && b == Some(E::Const(0)) {
             if let Some(is0) = eq {
@@ -1682,10 +1868,36 @@ impl Fix<'_, '_> {
             st.tmpl_ne.clear();
             st.div2 = None;
             st.choice = None;
+            // the next claim's code re-derives every header-derived value
+            st.s.retain(|_, a| !a.iter().any(E::per_claim));
+            st.v.retain(|_, a| !a.iter().any(E::per_claim));
         }
         if st.div2 == Some(target) {
             st.facts &= !DIV2;
             st.div2 = None;
+        }
+        if let Some(sl) = w.steps.get(&to_block) {
+            w.step_head(&mut st, sl, sl.members.contains(&from_block), &mut self.run);
+        }
+        for sl in w.steps.values() {
+            if sl.members.contains(&from_block) && !sl.members.contains(&to_block) {
+                let counter = st.s.get(&sl.counter).and_then(only);
+                let failed_compare = matches!(
+                    counter,
+                    Some(E::TripNext { head, .. }) if *head == sl.head
+                );
+                if from_block != sl.latch || !failed_compare {
+                    self.run.wg.unproven.insert(format!(
+                        "the step loop at block {} is left other than by its failed bound compare (edge block {from_block} -> {to_block})",
+                        sl.head
+                    ));
+                } else if st.facts & RAN == 0 {
+                    self.run.wg.unproven.insert(format!(
+                        "the step loop at block {} is left after a trip that did not enter its region",
+                        sl.head
+                    ));
+                }
+            }
         }
         self.propagate(target, st);
     }
@@ -1725,7 +1937,14 @@ impl Fix<'_, '_> {
                 continue;
             }
             match block.term.clone() {
-                Terminator::EndPgm | Terminator::Unreachable => {}
+                Terminator::EndPgm | Terminator::Unreachable => {
+                    if w.steps.values().any(|s| s.members.contains(&b)) {
+                        self.run
+                            .wg
+                            .unproven
+                            .insert(format!("the wave ends inside a step loop (block {b})"));
+                    }
+                }
                 Terminator::FallThrough => {
                     if let Some(&n) = block.succs.first() {
                         self.edge(b, n.0, st);
@@ -1893,6 +2112,7 @@ pub(super) fn check(
     };
     let head = claim_loop.header.0;
     let loop_members: BTreeSet<usize> = claim_loop.members.iter().map(|b| b.0).collect();
+    let steps = find_step_loops(kernel, &cfg, &ins, &in_region, &loop_members, head);
     // static scans of the shell: no flat/scratch, no atomic but the two sites
     for (pos, i) in ins.iter().enumerate() {
         if in_region[pos] {
@@ -1915,10 +2135,6 @@ pub(super) fn check(
         .iter()
         .map(|p| region_exit_waited(kernel, &ins, p))
         .collect();
-    let nonzero_waits: Vec<u8> = placed
-        .iter()
-        .map(|p| region_nonzero_waits(kernel, p))
-        .collect();
     let mut lds_in: Vec<Event> = Vec::new();
     let mut result: Option<Run> = None;
     for _ in 0..5 {
@@ -1937,7 +2153,7 @@ pub(super) fn check(
             template_ids: template_ids.clone(),
             lds_in: lds_in.clone(),
             exit_waited: exit_waited.clone(),
-            nonzero_waits: nonzero_waits.clone(),
+            steps: steps.clone(),
         };
         let mut init = State {
             s: BTreeMap::new(),
@@ -2156,6 +2372,11 @@ pub(super) fn check(
         .filter(|a| !a.accesses.is_empty() && !roles_set.contains(&a.offset))
         .map(|a| a.offset)
         .collect();
+    let wg = wg_verdict(
+        &run,
+        notes,
+        [template_offset, ka_off_offset, pred, expected, done],
+    );
     let mut proved = vec![
         TASK_PROTO_ACQUIRE,
         TASK_PROTO_BOUNDED,
@@ -2164,8 +2385,22 @@ pub(super) fn check(
         TASK_PROTO_ONCE,
         TASK_PROTO_RELEASE,
     ];
+    let (grid, wg_evidence) = match wg {
+        Ok((g, line)) => {
+            proved.push(TASK_PROTO_REGION_WG);
+            (Some(g), line)
+        }
+        Err(why) => (
+            None,
+            format!(
+                "protocol: {TASK_PROTO_REGION_WG} NOT proved: {}",
+                why.join("; ")
+            ),
+        ),
+    };
     proved.sort_unstable();
     let record = TaskProtocolRecord {
+        grid,
         tasks_arg_offset: tasks,
         ticket_arg_offset: ticket,
         events_arg_offset: events,
@@ -2184,6 +2419,7 @@ pub(super) fn check(
         "protocol: claim fetch-add on +{ticket}, header tasks(+{tasks})[claim<<{stride_shift}] fields tmpl@{template_offset} ka_off@{ka_off_offset} pred@{pred} expected@{expected} done@{done}, events(+{events})[i<<{event_shift}], n_tasks@+{n_tasks}, arena kernargs(+{kernargs}); {} wave(s)",
         waves
     )];
+    evidence.push(wg_evidence);
     if run.unmatched_signal {
         evidence.push(format!(
             "protocol: a task whose template is not one of {:?} is released without running a body (the host must not submit one)",
@@ -2230,46 +2466,6 @@ fn on_inner_cycle(kernel: &Kernel, members: &BTreeSet<usize>, head: usize, b: us
     false
 }
 
-/// The counters a region waits to a non-zero count (bit set): it needs those drained
-/// at its entry; a counter it only ever waits to zero tolerates an older operation.
-fn region_nonzero_waits(kernel: &Kernel, p: &Placed) -> u8 {
-    let body = &kernel.body;
-    let mut out = 0u8;
-    for pos in p.p_entry..p.p_exit.min(body.layout.len()) {
-        let Some(w) = body
-            .insts
-            .get(body.layout[pos])
-            .and_then(|i| i.mods.wait.as_ref())
-        else {
-            continue;
-        };
-        for (c, bit) in [
-            (Counter::Load, WL),
-            (Counter::Store, WS),
-            (Counter::Ds, WD),
-            (Counter::Km, WK),
-        ] {
-            if w.per_counter[c as usize].is_some_and(|n| n > 0) {
-                out |= bit;
-            }
-        }
-        // any other counter (samples, bvh, exports) is not drained by the dispatcher
-        for c in [
-            Counter::Sample,
-            Counter::Bvh,
-            Counter::Exp,
-            Counter::Vm,
-            Counter::Vs,
-            Counter::Lgkm,
-        ] {
-            if w.per_counter[c as usize].is_some_and(|n| n > 0) {
-                out |= WL | WS | WD | WK;
-            }
-        }
-    }
-    out
-}
-
 impl Walk<'_> {
     /// The poison cell's monotonic update: a set-only `global_atomic_or_b32` (no return,
     /// device scope) issued after the load and store counters are waited (a release).
@@ -2293,5 +2489,439 @@ impl Walk<'_> {
             );
         }
         run.poison_sites.insert(pos);
+    }
+}
+
+/// `a + b` where one side is a step counter ([`E::Trip`]): the counter plus one (the
+/// latch's increment) or the counter added to other values (a region's `vx + step`).
+fn step_sum(a: Option<&Alts>, b: Option<&Alts>) -> Option<Alts> {
+    let (a, b) = (a?, b?);
+    let is_trip = |x: &Alts| matches!(only(x), Some(E::Trip { .. }));
+    let (t, other) = if is_trip(b) {
+        (b, a)
+    } else if is_trip(a) {
+        (a, b)
+    } else {
+        return None;
+    };
+    let t = only(t)?.clone();
+    if let (Some(E::Const(1)), E::Trip { head, bound }) = (only(other), &t) {
+        return Some(one(E::TripNext {
+            head: *head,
+            bound: bound.clone(),
+        }));
+    }
+    if other.iter().any(E::is_step) {
+        return None;
+    }
+    Some(other.iter().map(|e| E::add(e.clone(), t.clone())).collect())
+}
+
+/// `header[vx] + step` with `step` the counter of a step loop bounded by
+/// `max(header[vcount], 1)`: `(vx, vcount, head block)`.
+fn parts_x(e: &E) -> Option<(u32, u32, usize)> {
+    let E::Add(a, b) = e else { return None };
+    for (h, t) in [(&**a, &**b), (&**b, &**a)] {
+        if let (E::Hdr(vx), E::Trip { head, bound }) = (h, t) {
+            let raw = match &**bound {
+                E::MaxOne(x) => &**x,
+                x => x,
+            };
+            if let E::Hdr(vc) = raw {
+                return Some((*vx, *vc, *head));
+            }
+        }
+    }
+    None
+}
+
+/// `header[vy] | header[vz] << 16`: `(vy, vz)`.
+fn parts_yz(e: &E) -> Option<(u32, u32)> {
+    let E::Or(a, b) = e else { return None };
+    for (s, l) in [(&**a, &**b), (&**b, &**a)] {
+        if let (E::Shl(z, 16), E::Hdr(vy)) = (s, l) {
+            if let E::Hdr(vz) = &**z {
+                return Some((*vy, *vz));
+            }
+        }
+    }
+    None
+}
+
+/// The step loops of the dispatcher: a block outside every region that ends
+/// `s_cmp_lt_u32 c, b; s_cbranch_scc1 head` (or `s_cmp_ge_u32 ..; s_cbranch_scc0`),
+/// with `head` an inner block that dominates it (a real back edge), not the claim
+/// loop's head. A header claimed by two latches is dropped.
+fn find_step_loops(
+    kernel: &Kernel,
+    cfg: &Cfg,
+    ins: &[Ins],
+    in_region: &[bool],
+    claim: &BTreeSet<usize>,
+    claim_head: usize,
+) -> BTreeMap<usize, StepLoop> {
+    let body = &kernel.body;
+    let mut found: BTreeMap<usize, StepLoop> = BTreeMap::new();
+    let mut dup = BTreeSet::new();
+    for &b in claim {
+        let block = &body.blocks[b];
+        let (start, end) = block.range;
+        // (the latch block may start inside the region it follows; its branch does not)
+        if start >= end || in_region[end - 1] {
+            continue;
+        }
+        let Terminator::Branch { cond, taken, .. } = &block.term else {
+            continue;
+        };
+        let want = match cond {
+            Cond::Scc1 => "s_cmp_lt_u32",
+            Cond::Scc0 => "s_cmp_ge_u32",
+            _ => continue,
+        };
+        let mut p = end - 1;
+        let cmp = loop {
+            if p == start {
+                break None;
+            }
+            p -= 1;
+            match ins[p].mn.as_str() {
+                "s_wait_alu" | "s_delay_alu" | "s_nop" => continue,
+                m if m == want => break Some(p),
+                _ => break None,
+            }
+        };
+        let Some(p) = cmp else { continue };
+        let reg = |i: usize| match ins[p].ops.get(i).and_then(|o| parse_reg(o)) {
+            Some((Rk::S, r, 1)) => Some(r),
+            _ => None,
+        };
+        let (Some(counter), Some(bound)) = (reg(0), reg(1)) else {
+            continue;
+        };
+        let h = taken.0;
+        if h == claim_head || !claim.contains(&h) || !cfg.dominates(BlockId(h), BlockId(b)) {
+            continue;
+        }
+        let mut members = BTreeSet::from([h]);
+        let mut work = vec![b];
+        while let Some(x) = work.pop() {
+            if members.insert(x) {
+                work.extend(body.blocks[x].preds.iter().map(|q| q.0));
+            }
+        }
+        let sl = StepLoop {
+            head: h,
+            latch: b,
+            counter,
+            bound,
+            members,
+        };
+        if found.insert(h, sl).is_some() {
+            dup.insert(h);
+        }
+    }
+    for h in dup {
+        found.remove(&h);
+    }
+    found
+}
+
+/// Whether `region_wg_from_header` holds after the walk, and the header offsets it
+/// rests on: `Ok((grid offsets, evidence))` or the reasons it is not proved.
+/// `other` are the offsets of the template, `ka_off`, `pred`, `expected`, `done`
+/// fields.
+fn wg_verdict(
+    run: &Run,
+    notes: &KernelRegions,
+    other: [u32; 5],
+) -> Result<(TaskGridOffsets, String), Vec<String>> {
+    let mut why: Vec<String> = run.wg.unproven.iter().cloned().collect();
+    let d = &notes.dispatcher;
+    let get = |k: &str| run.wg.fields.get(k).copied();
+    let (Some(vx), Some(vy), Some(vz), Some(vcount)) =
+        (get("vx"), get("vy"), get("vz"), get("vcount"))
+    else {
+        why.push("the region entries did not yield vx, vy, vz and vcount".into());
+        return Err(why);
+    };
+    let templates: BTreeSet<u32> = run.wg.entries.iter().map(|e| e.template).collect();
+    for r in &notes.regions {
+        if !templates.contains(&r.template_id) {
+            why.push(format!("region {} was not checked", r.template_id));
+        }
+    }
+    for (head, ts) in &run.wg.heads {
+        if ts.len() > 1 {
+            why.push(format!(
+                "the step loop at block {head} runs several regions {ts:?}"
+            ));
+        }
+    }
+    let known = [
+        other[0], other[1], other[2], other[3], other[4], vx, vy, vz, vcount,
+    ];
+    for (i, k) in known.iter().enumerate() {
+        if known[..i].contains(k) {
+            why.push(format!(
+                "two header fields resolve to offset {k} (vx@{vx} vy@{vy} vz@{vz} vcount@{vcount})"
+            ));
+            break;
+        }
+    }
+    // The grid: the one header dword the dispatcher keeps live in a dispatcher
+    // SGPR besides the fields above is the virtual grid's x extent (what a native
+    // region's grid-stride loop reads); y and z follow it in the header layout and
+    // are never read by the dispatcher.
+    let mut candidates: BTreeSet<(u16, u32)> = BTreeSet::new();
+    for e in &run.wg.entries {
+        for (&r, &k) in &e.plain {
+            if !known.contains(&k) {
+                candidates.insert((r, k));
+            }
+        }
+    }
+    let grid_reg = match candidates.iter().next() {
+        Some(&(r, k)) if candidates.len() == 1 => Some((r, k)),
+        _ => {
+            why.push(format!(
+                "the dispatcher does not keep exactly one other header dword live in its SGPRs ({candidates:?}): the grid x field is not derived"
+            ));
+            None
+        }
+    };
+    let Some((grid_r, gx)) = grid_reg else {
+        return Err(why);
+    };
+    for e in &run.wg.entries {
+        if e.plain.get(&grid_r) != Some(&gx) {
+            why.push(format!(
+                "region {}: s{grid_r} does not hold header[{gx}]",
+                e.template
+            ));
+        }
+        if let Some(x) = e
+            .native_reads
+            .iter()
+            .find(|&&r| r != d.wg_x && r != d.wg_yz && r != grid_r)
+        {
+            why.push(format!(
+                "native region {} reads dispatcher register s{x} beyond the workgroup registers and the grid register s{grid_r}",
+                e.template
+            ));
+        }
+    }
+    let (gy, gz) = (gx + 4, gx + 8);
+    for g in [gx, gy, gz] {
+        if known.contains(&g) || !run.hdr_loaded.contains(&g) {
+            why.push(format!(
+                "grid field offset {g} is not a loaded header dword distinct from the other fields"
+            ));
+        }
+    }
+    if !why.is_empty() {
+        return Err(why);
+    }
+    let grid = TaskGridOffsets {
+        vx_offset: vx,
+        vy_offset: vy,
+        vz_offset: vz,
+        gx_offset: gx,
+        gy_offset: gy,
+        gz_offset: gz,
+        vcount_offset: vcount,
+    };
+    let line = format!(
+        "protocol: {TASK_PROTO_REGION_WG}: wg_x(s{}) = header[vx@{vx}] + step, wg_yz(s{}) = header[vy@{vy}] | header[vz@{vz}] << 16 (no masking: exact only for vy, vz < 65536), step over [0, max(header[vcount@{vcount}], 1)): counter 0 at loop entry, +1 per trip, back edge while step+1 < bound, every trip enters its region; grid x = header[gx@{gx}] in s{grid_r} (what a native region's stride reads); gy@{gy}/gz@{gz} are the header layout's next two dwords, never read by the dispatcher; lifted bodies take their grid from their record's hidden arguments, which the dispatcher does not write (the host must set them equal to the header grid)",
+        d.wg_x, d.wg_yz
+    );
+    Ok((grid, line))
+}
+
+impl Walk<'_> {
+    /// The value of `e` with every LDS slot cell replaced by what its store events
+    /// agree on, and the facts it was established under (their meet).
+    fn canon(&self, st: &State, e: &E) -> Option<(E, u32)> {
+        Some(match e {
+            E::Cell(_) => self.resolve(st, e)?,
+            E::Shl(x, n) => {
+                let (c, f) = self.canon(st, x)?;
+                (E::Shl(Box::new(c), *n), f)
+            }
+            E::MaxOne(x) => {
+                let (c, f) = self.canon(st, x)?;
+                (E::MaxOne(Box::new(c)), f)
+            }
+            E::Or(a, b) => {
+                let ((ca, fa), (cb, fb)) = (self.canon(st, a)?, self.canon(st, b)?);
+                (E::or(ca, cb), fa & fb)
+            }
+            E::Add(a, b) => {
+                let ((ca, fa), (cb, fb)) = (self.canon(st, a)?, self.canon(st, b)?);
+                (E::add(ca, cb), fa & fb)
+            }
+            E::Trip { head, bound } => {
+                let (c, f) = self.canon(st, bound)?;
+                (
+                    E::Trip {
+                        head: *head,
+                        bound: Box::new(c),
+                    },
+                    f,
+                )
+            }
+            _ => (e.clone(), st.facts),
+        })
+    }
+
+    /// An edge into the head of a step loop: the induction. From outside the loop the
+    /// counter must be exactly 0 (and the bound register a single value): it becomes
+    /// [`E::Trip`]. On a back edge it must be [`E::TripCont`] of the same loop (the
+    /// increment, compared against the bound on the taken edge), after a trip that
+    /// entered its region. Anything else forgets the counter, so no region entry
+    /// downstream can use it.
+    fn step_head(&self, st: &mut State, sl: &StepLoop, back: bool, run: &mut Run) {
+        let cur = st.s.get(&sl.counter).and_then(only).cloned();
+        let new = if back {
+            if st.facts & RAN == 0 {
+                run.wg.unproven.insert(format!(
+                    "the step loop at block {} takes its back edge after a trip that did not enter its region",
+                    sl.head
+                ));
+                None
+            } else {
+                match cur {
+                    Some(E::TripCont { head, bound }) if head == sl.head => {
+                        Some(E::Trip { head, bound })
+                    }
+                    _ => None,
+                }
+            }
+        } else {
+            let bound = st.s.get(&sl.bound).and_then(only).cloned();
+            match (cur, bound) {
+                (Some(E::Const(0)), Some(b)) => Some(E::Trip {
+                    head: sl.head,
+                    bound: Box::new(b),
+                }),
+                _ => None,
+            }
+        };
+        // a counter that is not the induction value is still one value in every wave
+        // when it was uniform (the unmodelled-value rule of `generic`)
+        let uniform =
+            st.s.get(&sl.counter)
+                .is_some_and(|a| a.iter().all(E::uniform))
+                .then(|| one(E::Uni));
+        self.put_dword(st, Rk::S, sl.counter, new.map(one).or(uniform));
+        st.facts &= !RAN;
+    }
+
+    fn wg_set(&self, run: &mut Run, t: u32, name: &'static str, v: u32) {
+        match run.wg.fields.get(name) {
+            None => {
+                run.wg.fields.insert(name, v);
+            }
+            Some(&old) if old == v => {}
+            Some(&old) => {
+                run.wg.unproven.insert(format!(
+                    "region {t}: {name} is header[{v}] here and header[{old}] elsewhere"
+                ));
+            }
+        }
+    }
+
+    /// `region_wg_from_header` at one region entry (see the module docs): the
+    /// region's `wg_x`/`wg_yz` registers and the header dwords the dispatcher keeps
+    /// live. Failures only withhold the property; the pool's other proofs stand.
+    fn check_wg(&self, st: &State, pos: usize, placed: &Placed, run: &mut Run) {
+        let t = placed.region.template_id;
+        let d = &self.notes.dispatcher;
+        let need = CL | BD | HD | PO;
+        let mut why: Vec<String> = Vec::new();
+        let mut found: Vec<(&'static str, u32)> = Vec::new();
+        if !placed.region.is_native()
+            && (placed.region.wg_x != d.wg_x || placed.region.wg_yz != d.wg_yz)
+        {
+            why.push(format!(
+                "its row reads the workgroup from s{}/s{}, not the dispatcher's s{}/s{}",
+                placed.region.wg_x, placed.region.wg_yz, d.wg_x, d.wg_yz
+            ));
+        }
+        let held = |reg: u16| -> Option<E> {
+            let (e, f) = self.canon(st, st.s.get(&reg).and_then(only)?)?;
+            (f & need == need).then_some(e)
+        };
+        match held(d.wg_x) {
+            Some(e) => match parts_x(&e) {
+                Some((vx, vc, head)) => {
+                    found.push(("vx", vx));
+                    found.push(("vcount", vc));
+                    match self.steps.get(&head) {
+                        Some(sl) if sl.members.contains(&self.block_of[pos]) => {
+                            run.wg.heads.entry(head).or_default().insert(t);
+                        }
+                        _ => why.push(
+                            "its step counter's loop does not contain the region entry".into(),
+                        ),
+                    }
+                }
+                None => why.push(format!(
+                    "wg_x register s{} is not `header[vx] + step` with step < max(header[vcount], 1): {e:?}",
+                    d.wg_x
+                )),
+            },
+            None => why.push(format!(
+                "wg_x register s{} holds no value derived from the claimed header",
+                d.wg_x
+            )),
+        }
+        match held(d.wg_yz) {
+            Some(e) => match parts_yz(&e) {
+                Some((vy, vz)) => {
+                    found.push(("vy", vy));
+                    found.push(("vz", vz));
+                }
+                None => why.push(format!(
+                    "wg_yz register s{} is not `header[vy] | header[vz] << 16`: {e:?}",
+                    d.wg_yz
+                )),
+            },
+            None => why.push(format!(
+                "wg_yz register s{} holds no value derived from the claimed header",
+                d.wg_yz
+            )),
+        }
+        let mut plain = BTreeMap::new();
+        for r in d.lo..=d.hi {
+            if let Some(E::Hdr(k)) = held(r) {
+                plain.insert(r, k);
+            }
+        }
+        let mut native_reads = BTreeSet::new();
+        if placed.region.is_native() {
+            for p in placed.p_entry..placed.p_exit.min(self.kernel.body.layout.len()) {
+                for r in &self.inst(p).effects.uses {
+                    if r.kind == peacemaker_ir::reg::Kind::S {
+                        for i in 0..u16::from(r.len) {
+                            let g = r.base + i;
+                            if (d.lo..=d.hi).contains(&g) {
+                                native_reads.insert(g);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (name, v) in found {
+            self.wg_set(run, t, name, v);
+        }
+        run.wg
+            .unproven
+            .extend(why.into_iter().map(|w| format!("region {t}: {w}")));
+        run.wg.entries.push(WgEntry {
+            template: t,
+            plain,
+            native_reads,
+        });
     }
 }

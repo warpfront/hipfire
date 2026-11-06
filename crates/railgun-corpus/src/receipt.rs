@@ -223,6 +223,46 @@ pub struct ArenaPointerRecord {
     pub classes: Vec<String>,
 }
 
+/// The write footprint of one pointer field `record_offset` of a template:
+/// writes through that pointer by two workgroups `w != w'` of the template's
+/// standalone grid are disjoint whenever `w` and `w'` differ on some axis in
+/// `axes` (`"x"`, `"y"`, `"z"`; sorted, no duplicates, non-empty), under the
+/// assumptions below (each skipped when empty, so plain records are unchanged).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct WgFootprintRecord {
+    pub record_offset: u32,
+    pub axes: Vec<String>,
+    /// Work-items per tile on x the proof assumes (the region block); 0: none.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub block_x: u32,
+    /// Per-axis exclusive tile-id bounds the proof needs (32-bit address math
+    /// wraps beyond): the host checks the tile grid extents against them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bounds: Vec<WgBoundRecord>,
+    /// Record dword relations the proof used.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<WgRequirementRecord>,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+/// Workgroup ids on `axis` are below `bound` (exclusive).
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct WgBoundRecord {
+    pub axis: String,
+    pub bound: u64,
+}
+
+/// The record dword at `offset`, masked with `mask`, equals `value`.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct WgRequirementRecord {
+    pub offset: u32,
+    pub mask: u32,
+    pub value: u32,
+}
+
 /// One record template of a descriptor arena: which pointer fields of a record
 /// of this template the kernel loads (and nothing else of the record is a
 /// pointer).
@@ -242,6 +282,11 @@ pub struct ArenaTemplateRecord {
     /// that has none, so such receipts digest and serialize as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sealed_tables: Vec<SealedTableRecord>,
+    /// Certified per-workgroup write footprints of pointer fields of this
+    /// template (see [`WgFootprintRecord`]). Absent from a template without
+    /// them, so such receipts digest and serialize as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wg_footprints: Vec<WgFootprintRecord>,
 }
 
 /// A descriptor arena of a kernel: the pointer argument that holds an array
@@ -284,6 +329,40 @@ impl DescriptorArenaRecord {
                     return bad("duplicate pointer offset in a template");
                 }
             }
+            for (j, f) in t.wg_footprints.iter().enumerate() {
+                if !t
+                    .pointer_loads
+                    .iter()
+                    .any(|p| p.record_offset == f.record_offset)
+                {
+                    return bad("a workgroup footprint names a field that is not a pointer load");
+                }
+                if t.wg_footprints[..j]
+                    .iter()
+                    .any(|o| o.record_offset == f.record_offset)
+                {
+                    return bad("duplicate workgroup footprint for a field");
+                }
+                if f.axes.is_empty()
+                    || !f.axes.windows(2).all(|w| w[0] < w[1])
+                    || f.axes
+                        .iter()
+                        .any(|a| !matches!(a.as_str(), "x" | "y" | "z"))
+                {
+                    return bad("workgroup footprint axes are empty, unsorted or not in x/y/z");
+                }
+                for (k, b) in f.bounds.iter().enumerate() {
+                    if !matches!(b.axis.as_str(), "x" | "y" | "z")
+                        || b.bound < 1
+                        || f.bounds[..k].iter().any(|o| o.axis == b.axis)
+                    {
+                        return bad("a workgroup bound has a bad axis or a zero or repeated bound");
+                    }
+                }
+                if f.requires.iter().any(|r| r.offset % 4 != 0) {
+                    return bad("a workgroup requirement offset is not 4-aligned");
+                }
+            }
             for (j, s) in t.sealed_tables.iter().enumerate() {
                 s.validate(symbol)?;
                 if s.table_arg_offset % 8 != 0 {
@@ -321,6 +400,23 @@ pub const TASK_PROTO_COMPLETE: &str = "body_complete_before_release";
 /// A claimed task increments `events[done]` exactly once (never zero times
 /// or twice), by `+1`.
 pub const TASK_PROTO_ONCE: &str = "one_release_per_task";
+/// The dispatcher runs a task's region at virtual workgroup
+/// `(vx + step, vyz)` for every `step < max(vcount, 1)`, where `vx, vy, vz,
+/// vcount` are read from the task header at [`TaskGridOffsets`] (so the task's
+/// virtual workgroup set is determined by those header fields alone). Optional:
+/// proving it is what lets a host treat one launch's tile claims as the
+/// intra-grid concurrency of a single launch.
+pub const TASK_PROTO_REGION_WG: &str = "region_wg_from_header";
+/// Every property a consumer may find in [`TaskProtocolRecord::proved`].
+pub const TASK_PROTO_KNOWN: [&str; 7] = [
+    TASK_PROTO_ACQUIRE,
+    TASK_PROTO_BOUNDED,
+    TASK_PROTO_CLAIM,
+    TASK_PROTO_COMPLETE,
+    TASK_PROTO_ONCE,
+    TASK_PROTO_RELEASE,
+    TASK_PROTO_REGION_WG,
+];
 /// Every property a task-graph proof needs, sorted.
 pub const TASK_PROTO_REQUIRED: [&str; 6] = [
     TASK_PROTO_ACQUIRE,
@@ -362,6 +458,23 @@ pub struct TaskProtocolRecord {
     /// duplicates; names are the `TASK_PROTO_*` constants). A consumer
     /// requires every one of [`TASK_PROTO_REQUIRED`].
     pub proved: Vec<String>,
+    /// Header offsets of the virtual-grid fields the dispatcher derives the
+    /// region's workgroup from (needed by [`TASK_PROTO_REGION_WG`]). Absent
+    /// (and skipped when serializing) on receipts that do not prove it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid: Option<TaskGridOffsets>,
+}
+
+/// Byte offsets, inside one task header, of the `u32` virtual-grid fields.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct TaskGridOffsets {
+    pub vx_offset: u32,
+    pub vy_offset: u32,
+    pub vz_offset: u32,
+    pub gx_offset: u32,
+    pub gy_offset: u32,
+    pub gz_offset: u32,
+    pub vcount_offset: u32,
 }
 
 impl TaskProtocolRecord {
@@ -410,9 +523,31 @@ impl TaskProtocolRecord {
         if let Some(p) = self
             .proved
             .iter()
-            .find(|p| !TASK_PROTO_REQUIRED.contains(&p.as_str()))
+            .find(|p| !TASK_PROTO_KNOWN.contains(&p.as_str()))
         {
             return bad(&format!("unknown property {p:?}"));
+        }
+        if let Some(g) = &self.grid {
+            let all = [
+                g.vx_offset,
+                g.vy_offset,
+                g.vz_offset,
+                g.gx_offset,
+                g.gy_offset,
+                g.gz_offset,
+                g.vcount_offset,
+            ];
+            for (i, &at) in all.iter().enumerate() {
+                if at % 4 != 0 || at.checked_add(4).is_none_or(|end| end > self.desc_stride) {
+                    return bad("a grid field is misaligned or outside the descriptor");
+                }
+                if all[..i].contains(&at) || fields.contains(&at) {
+                    return bad("a grid field shares an offset with another header field");
+                }
+            }
+        }
+        if self.proved.iter().any(|p| p == TASK_PROTO_REGION_WG) && self.grid.is_none() {
+            return bad("region_wg_from_header is proved without the grid field offsets");
         }
         Ok(())
     }
@@ -614,6 +749,12 @@ pub struct KernelRecord {
     /// written before the field are unchanged (and digest as before).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_protocol: Option<TaskProtocolRecord>,
+    /// Workgroup write footprints of the kernel's pointer arguments, proven from
+    /// the object's bytes (`peacemaker_ir::passes::wg_footprint`), for the tile
+    /// geometry `block_x`; `record_offset` is the kernarg offset of the pointer
+    /// argument. Absent when nothing is proven, so other receipts are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wg_footprints: Vec<WgFootprintRecord>,
 }
 
 /// The guarded-case digest under the exact object receipt (§A9.2; v2 binds
@@ -830,6 +971,7 @@ mod tests {
             case_digest: String::new(),
             guard_flag: None,
             task_protocol: None,
+            wg_footprints: Vec::new(),
         }
     }
 
@@ -843,8 +985,42 @@ mod tests {
                     classes: vec!["vmem_load".into()],
                 }],
                 sealed_tables: vec![],
+                wg_footprints: vec![],
             }],
         }
+    }
+
+    #[test]
+    fn wg_footprints_validate_and_are_skipped_when_empty() {
+        let mut a = arena();
+        assert!(serde_json::to_value(&a.templates[0])
+            .unwrap()
+            .get("wg_footprints")
+            .is_none());
+        a.templates[0].wg_footprints = vec![WgFootprintRecord {
+            record_offset: 16,
+            axes: vec!["x".into(), "y".into()],
+            block_x: 128,
+            bounds: vec![WgBoundRecord {
+                axis: "x".into(),
+                bound: 1 << 24,
+            }],
+            requires: vec![WgRequirementRecord {
+                offset: 28,
+                mask: 0xffff,
+                value: 128,
+            }],
+        }];
+        a.validate("k").unwrap();
+        let mut b = a.clone();
+        b.templates[0].wg_footprints[0].record_offset = 24;
+        assert!(b.validate("k").is_err());
+        let mut b = a.clone();
+        b.templates[0].wg_footprints[0].axes = vec!["y".into(), "x".into()];
+        assert!(b.validate("k").is_err());
+        let mut b = a.clone();
+        b.templates[0].wg_footprints[0].axes.clear();
+        assert!(b.validate("k").is_err());
     }
 
     fn sealed_table() -> SealedTableRecord {
@@ -1029,7 +1205,32 @@ mod tests {
                 .iter()
                 .map(|s| (*s).to_owned())
                 .collect(),
+            grid: None,
         }
+    }
+
+    #[test]
+    fn region_wg_property_needs_grid_offsets_and_is_skipped_when_absent() {
+        let p = protocol();
+        assert!(serde_json::to_value(&p).unwrap().get("grid").is_none());
+        let mut q = p.clone();
+        q.proved.push(TASK_PROTO_REGION_WG.into());
+        assert!(q.validate("k").is_err(), "property without offsets");
+        q.grid = Some(TaskGridOffsets {
+            vx_offset: 4,
+            vy_offset: 8,
+            vz_offset: 12,
+            gx_offset: 16,
+            gy_offset: 20,
+            gz_offset: 24,
+            vcount_offset: 44,
+        });
+        q.validate("k").unwrap();
+        let back: TaskProtocolRecord =
+            serde_json::from_value(serde_json::to_value(&q).unwrap()).unwrap();
+        assert_eq!(back, q);
+        q.grid.as_mut().unwrap().vx_offset = 28;
+        assert!(q.validate("k").is_err(), "grid field overlaps ka_off");
     }
 
     #[test]

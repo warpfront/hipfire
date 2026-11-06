@@ -21,8 +21,9 @@ use peacemaker_lift::{lift_object, Options};
 use railgun_cert::task_graph::certify_pool;
 use railgun_cert::{KernelRecord, Receipt};
 use railgun_corpus::receipt::{
-    SEALED_BOUND_KERNARG, TASK_PROTO_ACQUIRE, TASK_PROTO_BOUNDED, TASK_PROTO_CLAIM,
-    TASK_PROTO_COMPLETE, TASK_PROTO_ONCE, TASK_PROTO_RELEASE, TASK_PROTO_REQUIRED,
+    TaskGridOffsets, SEALED_BOUND_KERNARG, TASK_PROTO_ACQUIRE, TASK_PROTO_BOUNDED,
+    TASK_PROTO_CLAIM, TASK_PROTO_COMPLETE, TASK_PROTO_ONCE, TASK_PROTO_REGION_WG,
+    TASK_PROTO_RELEASE, TASK_PROTO_REQUIRED,
 };
 
 fn dir() -> PathBuf {
@@ -77,15 +78,21 @@ const POOLS: &[(&str, &str, &[u32])] = &[
 /// Run the obligations on a fixture pool: the refusals, and the proof the pool
 /// would have had if those refusals did not stand.
 fn prove(name: &str, symbol: &str) -> (Vec<String>, Option<railgun_cert::task_graph::PoolProof>) {
-    let bytes = pool(name);
+    prove_bytes(&pool(name), symbol)
+}
+
+fn prove_bytes(
+    bytes: &[u8],
+    symbol: &str,
+) -> (Vec<String>, Option<railgun_cert::task_graph::PoolProof>) {
     let lifted = lift_object(
-        &bytes,
+        bytes,
         Options {
             frontend: Frontend::Hipcc,
         },
     )
     .expect("lift");
-    let notes = read_regions(&bytes).expect("note");
+    let notes = read_regions(bytes).expect("note");
     let note = notes.iter().find(|n| n.kernel == symbol).expect("note");
     let index = lifted
         .program
@@ -97,7 +104,7 @@ fn prove(name: &str, symbol: &str) -> (Vec<String>, Option<railgun_cert::task_gr
     let result = railgun_cert::task_graph::prove_pool(
         &lifted.program,
         index,
-        &bytes,
+        bytes,
         note,
         &from_disk,
         &mut partial,
@@ -136,9 +143,33 @@ fn real_pools_are_certified() {
         }
         // item 4: the protocol, derived from the bytes
         let p = &proof.protocol;
+        // the six required properties and the optional seventh: the dispatcher runs
+        // each region at (header[vx] + step, header[vy] | header[vz] << 16)
         let mut want: Vec<String> = TASK_PROTO_REQUIRED.iter().map(|s| s.to_string()).collect();
+        want.push(TASK_PROTO_REGION_WG.to_string());
         want.sort();
-        assert_eq!(p.proved, want);
+        assert_eq!(p.proved, want, "{name}");
+        assert_eq!(
+            p.grid,
+            Some(TaskGridOffsets {
+                vx_offset: 4,
+                vy_offset: 8,
+                vz_offset: 12,
+                gx_offset: 16,
+                gy_offset: 20,
+                gz_offset: 24,
+                vcount_offset: 44,
+            }),
+            "{name}"
+        );
+        assert!(
+            proof
+                .evidence
+                .iter()
+                .any(|e| e.contains("region_wg_from_header: wg_x(s102)")),
+            "{name}: {:#?}",
+            proof.evidence
+        );
         assert_eq!(
             [
                 p.tasks_arg_offset,
@@ -617,5 +648,267 @@ fn a_plain_store_or_a_swap_as_poison_is_refused() {
                 explain(k)
             );
         }
+    }
+}
+
+/// Region entry needs every counter drained: remove the drain in front of a region and the
+/// pool is refused. `wide = false` removes the counter waits right before the entry;
+/// `wide = true` removes every dispatcher counter wait before it (a pool whose earlier waits
+/// already leave the counters drained at that entry needs the earlier ones gone too).
+#[test]
+fn a_region_entered_without_the_counter_drain_is_refused() {
+    for (name, symbol, template, wide) in [
+        ("b32", "pm_pool_b32", 10, false),
+        ("b32", "pm_pool_b32", 11, false),
+        ("b128", "pm_pool_b128", 12, true),
+        ("b256", "pm_pool_b256", 13, true),
+    ] {
+        let mut bytes = pool(name);
+        let at = locate(&bytes, symbol);
+        let (entry, _) = region_range(&bytes, symbol, template);
+        let notes = read_regions(&bytes).expect("note");
+        let regions = &notes.iter().find(|n| n.kernel == symbol).unwrap().regions;
+        let in_region = |pc: u32| {
+            regions
+                .iter()
+                .any(|r| (r.entry_pc..r.exit_pc).contains(&u64::from(pc)))
+        };
+        let insts = instructions(&bytes, symbol);
+        let drain: Vec<(u32, usize)> = insts
+            .iter()
+            .filter(|(pc, _, m)| {
+                let near = u64::from(*pc) + 0x20 >= entry;
+                u64::from(*pc) < entry
+                    && (near || (wide && !in_region(*pc)))
+                    && [
+                        "s_wait_loadcnt",
+                        "s_wait_storecnt",
+                        "s_wait_dscnt",
+                        "s_wait_kmcnt",
+                    ]
+                    .iter()
+                    .any(|w| m.starts_with(w))
+            })
+            .map(|(pc, d, _)| (*pc, *d))
+            .collect();
+        assert!(
+            drain.len() >= 2,
+            "{name} t{template}: the drain before the entry: {drain:?}"
+        );
+        for (pc, dwords) in drain {
+            nop_out(&mut bytes, symbol, &at, pc, dwords);
+        }
+        let r = certified(&bytes, symbol);
+        let k = kernel(&r, symbol);
+        assert_eq!(k.status, "unknown", "{name} t{template}");
+        assert!(k.task_protocol.is_none(), "{name} t{template}");
+        assert!(
+            rules(k).contains(&"task_graph-region-drain"),
+            "{name} t{template}: {}",
+            explain(k)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// region_wg_from_header
+// ---------------------------------------------------------------------------
+
+/// The file offsets (kernel-relative pcs) of every instruction that encodes exactly `line`.
+fn find(elf: &[u8], symbol: &str, line: &str) -> Vec<u32> {
+    let at = locate(elf, symbol);
+    let words = words_of(line);
+    instructions(elf, symbol)
+        .into_iter()
+        .filter(|(pc, dwords, _)| {
+            *dwords == words.len() && {
+                let o = at.file_at + *pc as usize;
+                words.iter().enumerate().all(|(i, w)| {
+                    u32::from_le_bytes(elf[o + 4 * i..o + 4 * i + 4].try_into().unwrap()) == *w
+                })
+            }
+        })
+        .map(|(pc, _, _)| pc)
+        .collect()
+}
+
+/// `from` -> `to` (the same length) at the `nth` place the dispatcher encodes `from`.
+fn mutate(name: &str, symbol: &str, from: &str, to: &str, nth: usize) -> Vec<u8> {
+    let mut bytes = pool(name);
+    let at = locate(&bytes, symbol);
+    let pcs = find(&bytes, symbol, from);
+    assert!(pcs.len() > nth, "{name}: no `{from}` (found {pcs:?})");
+    let words = words_of(to);
+    assert_eq!(
+        words.len(),
+        words_of(from).len(),
+        "`{to}` is as long as `{from}`"
+    );
+    patch(&mut bytes, &at, pcs[nth], &words);
+    bytes
+}
+
+/// The pool still proves its six required properties (the mutation lives in the
+/// optional seventh) but not `region_wg_from_header`, for a stated reason.
+fn expect_wg_withheld(bytes: &[u8], symbol: &str, why: &str, what: &str) {
+    let (refusals, partial) = prove_bytes(bytes, symbol);
+    assert!(refusals.is_empty(), "{what}: {refusals:#?}");
+    let proof = partial.expect("the proof");
+    let mut want: Vec<String> = TASK_PROTO_REQUIRED.iter().map(|s| s.to_string()).collect();
+    want.sort();
+    assert_eq!(proof.protocol.proved, want, "{what}");
+    assert!(proof.protocol.grid.is_none(), "{what}");
+    let note = proof
+        .evidence
+        .iter()
+        .find(|e| e.contains("region_wg_from_header NOT proved"))
+        .unwrap_or_else(|| panic!("{what}: no withheld note in {:#?}", proof.evidence));
+    assert!(note.contains(why), "{what}: expected `{why}` in:\n{note}");
+    // the record still validates
+    proof.protocol.validate(symbol).expect("validates");
+}
+
+/// The certified receipt of a pool whose `region_wg_from_header` is withheld stays
+/// `conditional` and carries the record without the property.
+fn expect_conditional_without_wg(bytes: &[u8], symbol: &str, what: &str) {
+    let receipt = certify_pool(bytes, &from_disk).expect("certify");
+    let k = kernel(&receipt, symbol);
+    assert_eq!(k.status, "conditional", "{what}:\n{}", explain(k));
+    let record = k.task_protocol.as_ref().expect("record");
+    assert!(
+        !record.proved.iter().any(|p| p == TASK_PROTO_REGION_WG) && record.grid.is_none(),
+        "{what}"
+    );
+}
+
+/// Every wg_x derivation the property rests on is a mutation target: each one must
+/// withhold the property on the single-wave pool and the small multi-wave pool (whose
+/// header reaches the regions through the LDS slot); the large multi-wave and the
+/// native-COPY pools take the two mutations that differ there (the step add and the
+/// counter start).
+#[test]
+fn region_wg_is_withheld_when_the_dispatcher_does_not_derive_it_from_the_header() {
+    let pools = [
+        ("b32", "pm_pool_b32"),
+        ("b64", "pm_pool_b64"),
+        ("b128", "pm_pool_b128"),
+        ("b256", "pm_pool_b256"),
+    ];
+    // (from, to, expected reason)
+    let cases: &[(&str, &str, &str)] = &[
+        // s102 = vx without + step
+        (
+            "s_add_co_i32 s102, s96, s101",
+            "s_mov_b32 s102, s96",
+            "wg_x register s102 is not `header[vx] + step",
+        ),
+        // step counter initialised to 1: the first step never runs
+        (
+            "s_mov_b32 s101, 0",
+            "s_mov_b32 s101, 1",
+            "wg_x register s102",
+        ),
+        // the counter steps by 2: steps are skipped
+        (
+            "s_add_co_i32 s101, s101, 1",
+            "s_add_co_i32 s101, s101, 2",
+            "step loop",
+        ),
+        // one step too many: the compare admits step == bound
+        (
+            "s_cmp_lt_u32 s101, s100",
+            "s_cmp_le_u32 s101, s100",
+            "wg_x register s102",
+        ),
+        // s103 from the wrong header field (vx for vy): two fields on one offset
+        (
+            "v_lshl_or_b32 v6, v7, 16, v6",
+            "v_lshl_or_b32 v6, v7, 16, v5",
+            "two header fields resolve to offset 4",
+        ),
+        // s103 packed with the wrong shift
+        (
+            "v_lshl_or_b32 v6, v7, 16, v6",
+            "v_lshl_or_b32 v6, v7, 8, v6",
+            "wg_yz register s103",
+        ),
+        // s103 = vx, not the packed vy | vz << 16
+        (
+            "s_mov_b32 s103, s97",
+            "s_mov_b32 s103, s96",
+            "wg_yz register s103 is not",
+        ),
+        // the loop bound is the done event, not vcount
+        (
+            "v_readfirstlane_b32 s100, v15",
+            "v_readfirstlane_b32 s100, v14",
+            "two header fields resolve to offset 40",
+        ),
+    ];
+    for &(name, symbol) in &pools {
+        let n = if name == "b32" || name == "b64" {
+            cases.len()
+        } else {
+            2
+        };
+        for &(from, to, why) in &cases[..n] {
+            let bytes = mutate(name, symbol, from, to, 0);
+            expect_wg_withheld(&bytes, symbol, why, &format!("{name}: {from} -> {to}"));
+        }
+    }
+}
+
+/// The counter written anywhere else in the loop loses the induction fact: a second
+/// increment (the `s_wait_alu` ahead of the latch's add turned into one).
+#[test]
+fn a_second_write_of_the_step_counter_withholds_region_wg() {
+    for (name, symbol) in [("b32", "pm_pool_b32"), ("b128", "pm_pool_b128")] {
+        let base = pool(name);
+        let add = find(&base, symbol, "s_add_co_i32 s101, s101, 1")[0];
+        let insts = instructions(&base, symbol);
+        let at = insts.iter().position(|(pc, _, _)| *pc == add).unwrap();
+        let (wait_pc, dwords, m) = insts[at - 1].clone();
+        assert_eq!((dwords, m.as_str()), (1, "s_wait_alu"), "{name}");
+        let mut bytes = base.clone();
+        let loc = locate(&bytes, symbol);
+        patch(
+            &mut bytes,
+            &loc,
+            wait_pc,
+            &words_of("s_add_co_i32 s101, s101, 1"),
+        );
+        expect_wg_withheld(&bytes, symbol, "step loop", name);
+        expect_conditional_without_wg(&bytes, symbol, name);
+    }
+}
+
+/// `s_max_u32 s100, s100, 1` is redundant for the property: the loop is a do-while
+/// (the region runs, then the compare), so `vcount == 0` runs one step either way
+/// and the steps are `[0, max(vcount, 1))` with or without it. Removing it keeps
+/// the proof (and the same offsets), a bound that is not the header's vcount does
+/// not.
+#[test]
+fn the_max_one_on_the_loop_bound_does_not_change_what_is_proved() {
+    for (name, symbol) in [("b32", "pm_pool_b32"), ("b64", "pm_pool_b64")] {
+        let (refusals, partial) = prove(name, symbol);
+        assert!(refusals.is_empty(), "{name}: {refusals:#?}");
+        let with = partial.expect("proof").protocol;
+        let mut bytes = pool(name);
+        let at = locate(&bytes, symbol);
+        let pcs = find(&bytes, symbol, "s_max_u32 s100, s100, 1");
+        assert_eq!(pcs.len(), 1, "{name}");
+        patch(&mut bytes, &at, pcs[0], &words_of("s_nop 0"));
+        let (refusals, partial) = prove_bytes(&bytes, symbol);
+        assert!(refusals.is_empty(), "{name}: {refusals:#?}");
+        assert_eq!(partial.expect("proof").protocol, with, "{name}");
+        // ... but a constant bound is no header field
+        let bytes = mutate(
+            name,
+            symbol,
+            "s_max_u32 s100, s100, 1",
+            "s_mov_b32 s100, 2",
+            0,
+        );
+        expect_wg_withheld(&bytes, symbol, "wg_x register s102", name);
     }
 }

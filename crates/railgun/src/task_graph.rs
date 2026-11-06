@@ -70,11 +70,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
-use railgun_corpus::receipt::{ArgRecord, TaskProtocolRecord, TASK_PROTO_REQUIRED};
+use railgun_corpus::receipt::{
+    ArgRecord, TaskGridOffsets, TaskProtocolRecord, TASK_PROTO_REGION_WG, TASK_PROTO_REQUIRED,
+};
 
 use crate::coresident::{GroupOrdering, OrderedEdge};
 use crate::kernel::{
     ArenaPointerLoad, ArenaSealedBinding, Arg, KernelNode, KernelProgram, MemClass, RegionEffect,
+    WgFootprint,
 };
 use crate::{BindingRecord, ResourceId, ResourceKind};
 
@@ -96,6 +99,8 @@ pub struct TaskLayout {
     pub done_event_offset: u32,
     pub none_event: u32,
     pub event_stride: u32,
+    /// Offsets of the virtual-grid fields (`vx, vy, vz, gx, gy, gz, vcount`).
+    pub grid: TaskGridOffsets,
 }
 
 impl TaskLayout {
@@ -111,6 +116,15 @@ impl TaskLayout {
         done_event_offset: 40,
         none_event: NONE,
         event_stride: 4,
+        grid: TaskGridOffsets {
+            vx_offset: 4,
+            vy_offset: 8,
+            vz_offset: 12,
+            gx_offset: 16,
+            gy_offset: 20,
+            gz_offset: 24,
+            vcount_offset: 44,
+        },
     };
 }
 
@@ -160,6 +174,9 @@ impl TaskProtocolFact {
                 done_event_offset: record.done_event_offset,
                 none_event: record.none_event,
                 event_stride: record.event_stride,
+                // A receipt that does not carry the offsets reads the M0 ones;
+                // `region_wg_from_header` is only honoured with them proved.
+                grid: record.grid.unwrap_or(TaskLayout::M0.grid),
             },
             tasks_arg_offset: record.tasks_arg_offset,
             ticket_arg_offset: record.ticket_arg_offset,
@@ -178,6 +195,12 @@ impl TaskProtocolFact {
             None => Ok(()),
             Some(missing) => Err(format!("property {missing:?} is not proved")),
         }
+    }
+
+    /// The certificate proved the region runs at virtual workgroup
+    /// `(vx + step, vyz)` for `step < max(vcount, 1)` from the header fields.
+    pub fn proves_region_wg(&self) -> bool {
+        self.proved.iter().any(|p| p == TASK_PROTO_REGION_WG)
     }
 
     /// The M0 pool ABI (`M0Params`: tasks @0, ticket @8, events @16, task
@@ -280,6 +303,16 @@ pub struct TaskHeader {
     pub expected: u32,
     /// The event the task increments on completion (`NONE`: none).
     pub done_event: u32,
+    /// The virtual workgroup the task's region starts at, the record's
+    /// virtual grid, and the number of consecutive x workgroups claimed
+    /// (`0` and `1` both mean one).
+    pub vx: u32,
+    pub vy: u32,
+    pub vz: u32,
+    pub gx: u32,
+    pub gy: u32,
+    pub gz: u32,
+    pub vcount: u32,
 }
 
 /// The tasks of one pool, in claim order: task `k` is the one the pool's
@@ -318,6 +351,13 @@ impl PoolTasks {
                     pred_event: word(rec, layout.pred_event_offset)?,
                     expected: word(rec, layout.expected_offset)?,
                     done_event: word(rec, layout.done_event_offset)?,
+                    vx: word(rec, layout.grid.vx_offset)?,
+                    vy: word(rec, layout.grid.vy_offset)?,
+                    vz: word(rec, layout.grid.vz_offset)?,
+                    gx: word(rec, layout.grid.gx_offset)?,
+                    gy: word(rec, layout.grid.gy_offset)?,
+                    gz: word(rec, layout.grid.gz_offset)?,
+                    vcount: word(rec, layout.grid.vcount_offset)?,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -393,17 +433,36 @@ impl Mode<'_> {
 }
 
 /// One task's access to a resource.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Access {
     resource: ResourceId,
     read: bool,
     write: bool,
+    /// What the template certifies about this resource across the workgroups
+    /// of its own grid.
+    conc: Conc,
+}
+
+/// How a template's accesses to one resource behave across two workgroups of
+/// the same launch.
+#[derive(Clone, PartialEq, Eq)]
+enum Conc {
+    /// Nothing certified: concurrent workgroups may conflict.
+    None,
+    /// Every access is a commutative atomic (`AtomicCommutative` /
+    /// `AtomicRelease` only): concurrent workgroups commute.
+    Commutative,
+    /// One write-only pointer field with a certified `WgDisjoint` footprint
+    /// (axes mask: bit 0 x, 1 y, 2 z) and its proof assumptions.
+    Footprint(WgFootprint),
 }
 
 /// Where a pool's per-template pointer loads come from.
 enum PoolEffects {
     Templates {
         loads: BTreeMap<u32, Vec<ArenaPointerLoad>>,
+        /// Certified per-workgroup write footprints by template.
+        footprints: BTreeMap<u32, Vec<WgFootprint>>,
         /// The sealed tables bound for the pool node's templates.
         sealed: Vec<ArenaSealedBinding>,
     },
@@ -459,6 +518,38 @@ impl Index {
 
     fn pool_of(&self, gid: usize) -> usize {
         self.base.partition_point(|&b| b <= gid) - 1
+    }
+}
+
+/// The tasks that are workgroups of one eager launch.
+///
+/// Two tasks `a != b` are the same launch instance iff they have the same
+/// template and the same `ka_off` (the same binding record). Preconditions,
+/// refused when violated: (i) each task's virtual workgroup set
+/// `W(t) = {(vx + s, vy, vz) : s in [0, max(vcount, 1))}` lies inside the
+/// record's virtual grid `[0, gx) x [0, gy) x [0, gz)` and (ii) the `W` sets
+/// of the instance's tasks are pairwise disjoint. They need the certificate
+/// to prove `region_wg_from_header` (the dispatcher runs the region at
+/// `(vx + step, vyz)` for `step < max(vcount, 1)` from those header fields),
+/// so `W(t)` is what actually runs; without it the instance rule is off and
+/// every conflicting pair needs happens-before.
+///
+/// Given them, the tasks of one instance are exactly the concurrent
+/// workgroups of one eager launch of the certified standalone grid kernel.
+/// That kernel's certificate says nothing about workgroups racing each other
+/// on memory, so a conflicting same-instance pair on a resource is admitted
+/// only by the template's own facts: (A) every access of the template to it
+/// is a commutative atomic, or (B) its one write-only pointer field has a
+/// certified `WgDisjoint` footprint over axes such that every workgroup of
+/// `a` and every workgroup of `b` differ on one of them
+/// ([`TaskGraph::same_instance_pair`]). Otherwise the pair is a race.
+/// Across instances, and between an instance's tasks and any other task,
+/// every conflicting pair needs happens-before.
+struct Instances(Vec<Option<(u32, u32)>>);
+
+impl Instances {
+    fn same(&self, a: usize, b: usize) -> bool {
+        matches!((self.0[a], self.0[b]), (Some(x), Some(y)) if x == y)
     }
 }
 
@@ -894,6 +985,21 @@ impl TaskGraph {
         let hb = |a: usize, b: usize| {
             pred_ix[b].is_some_and(|e| before[e].as_ref().expect("a used event").get(a))
         };
+        // ---- Same-launch instances: tasks of one record (same template and
+        // `ka_off`) whose virtual workgroup sets are inside the grid and
+        // pairwise disjoint are the intra-grid concurrency of one launch, not
+        // a hazard between launches (see `Instances`).
+        let wg_ok: Vec<bool> = self
+            .pools
+            .iter()
+            .map(|p| {
+                pending
+                    || protocol
+                        .node(p.node)
+                        .is_some_and(TaskProtocolFact::proves_region_wg)
+            })
+            .collect();
+        let instances = self.instances(&flat, &index, &wg_ok)?;
         // ---- Sealed tables are immutable: no task and no member's node-level
         // effect may write a table or a pointee a pool's records bind.
         let mut protected: BTreeMap<ResourceId, &'static str> = BTreeMap::new();
@@ -978,6 +1084,11 @@ impl TaskGraph {
                         (a, b)
                     } else if hb(b, a) {
                         (b, a)
+                    } else if instances.same(a, b) {
+                        self.same_instance_pair(
+                            &flat, &accesses, &by_base, resource, a, b, &place,
+                        )?;
+                        continue;
                     } else {
                         let (pa, ka) = place(a);
                         let (pb, kb) = place(b);
@@ -1087,6 +1198,69 @@ impl TaskGraph {
         })
     }
 
+    /// Group tasks by launch instance and validate each qualifying instance.
+    fn instances(
+        &self,
+        flat: &[&TaskHeader],
+        index: &Index,
+        wg_ok: &[bool],
+    ) -> Result<Instances, String> {
+        let mut by_key: BTreeMap<(u32, u32), Vec<usize>> = BTreeMap::new();
+        for (gid, t) in flat.iter().enumerate() {
+            by_key.entry((t.template, t.ka_off)).or_default().push(gid);
+        }
+        let place = |gid: usize| {
+            let pi = index.pool_of(gid);
+            (pi, gid - index.base[pi])
+        };
+        let who = |gid: usize| {
+            let (pi, k) = place(gid);
+            format!("task {k} of pool {pi} (node {})", self.pools[pi].node)
+        };
+        let mut of = vec![None; flat.len()];
+        for (key, gids) in by_key {
+            // One task is no concurrency; without the proof the rule is off.
+            if gids.len() < 2 || gids.iter().any(|&g| !wg_ok[index.pool_of(g)]) {
+                continue;
+            }
+            let first = flat[gids[0]];
+            let mut spans: Vec<(u32, u32, u64, u64, usize)> = Vec::with_capacity(gids.len());
+            for &g in &gids {
+                let t = flat[g];
+                if (t.gx, t.gy, t.gz) != (first.gx, first.gy, first.gz) {
+                    return Err(format!(
+                        "{}: virtual grid ({}, {}, {}) differs from {}'s ({}, {}, {}) in the same launch instance (template {}, ka_off {})",
+                        who(g), t.gx, t.gy, t.gz, who(gids[0]), first.gx, first.gy, first.gz, key.0, key.1
+                    ));
+                }
+                let n = u64::from(t.vcount.max(1));
+                let end = u64::from(t.vx) + n;
+                if t.vy >= t.gy || t.vz >= t.gz || end > u64::from(t.gx) {
+                    return Err(format!(
+                        "{}: virtual workgroups x {}..{end} at (y {}, z {}) lie outside the record's virtual grid ({}, {}, {})",
+                        who(g), t.vx, t.vy, t.vz, t.gx, t.gy, t.gz
+                    ));
+                }
+                spans.push((t.vy, t.vz, u64::from(t.vx), end, g));
+            }
+            spans.sort_unstable();
+            for w in spans.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                if (a.0, a.1) == (b.0, b.1) && b.2 < a.3 {
+                    return Err(format!(
+                        "{} and {} both run virtual workgroup x {} at (y {}, z {}) of the same launch instance (template {}, ka_off {}): one workgroup would run twice concurrently",
+                        who(a.4), who(b.4), b.2, a.0, a.1, key.0, key.1
+                    ));
+                }
+            }
+            let id = u32::try_from(key.1).ok().map(|_| key);
+            for &g in &gids {
+                of[g] = id;
+            }
+        }
+        Ok(Instances(of))
+    }
+
     /// The per-template pointer loads of a pool node's task records.
     fn pool_effects(
         &self,
@@ -1096,6 +1270,7 @@ impl TaskGraph {
     ) -> Result<PoolEffects, String> {
         // Bound arena facts whose arena argument is the graph's arena.
         let mut templates: BTreeMap<u32, Vec<ArenaPointerLoad>> = BTreeMap::new();
+        let mut footprints: BTreeMap<u32, Vec<WgFootprint>> = BTreeMap::new();
         let mut any = false;
         let mut sealed: Vec<ArenaSealedBinding> = Vec::new();
         if let Some(arena) = &node.arena {
@@ -1119,12 +1294,17 @@ impl TaskGraph {
                         .entry(t.template)
                         .or_default()
                         .extend(t.pointer_loads.iter().cloned());
+                    footprints
+                        .entry(t.template)
+                        .or_default()
+                        .extend(t.wg_footprints.iter().cloned());
                 }
             }
         }
         if any {
             return Ok(PoolEffects::Templates {
                 loads: templates,
+                footprints,
                 sealed,
             });
         }
@@ -1137,6 +1317,7 @@ impl TaskGraph {
         Ok(match mode.templates {
             Some(map) => PoolEffects::Templates {
                 loads: map.clone(),
+                footprints: BTreeMap::new(),
                 sealed: Vec::new(),
             },
             None => PoolEffects::Conservative,
@@ -1152,25 +1333,41 @@ impl TaskGraph {
         record: &BindingRecord,
         what: &str,
     ) -> Result<Vec<Access>, String> {
-        let mut merged: BTreeMap<ResourceId, (bool, bool)> = BTreeMap::new();
-        let mut add = |resource: ResourceId, read: bool, write: bool| {
+        let mut merged: BTreeMap<ResourceId, (bool, bool, Conc)> = BTreeMap::new();
+        let mut add = |resource: ResourceId, read: bool, write: bool, conc: Conc| {
             if matches!(
                 program.kinds.get(&resource),
                 Some(ResourceKind::EventCells { .. })
             ) {
                 return;
             }
-            let e = merged.entry(resource).or_default();
-            e.0 |= read;
-            e.1 |= write;
+            match merged.get_mut(&resource) {
+                None => {
+                    merged.insert(resource, (read, write, conc));
+                }
+                Some(e) => {
+                    e.0 |= read;
+                    e.1 |= write;
+                    // Two accesses (fields) to one resource only stay certified
+                    // when both are commutative atomics: a footprint speaks
+                    // for one pointer, and another field may alias it.
+                    if !(e.2 == Conc::Commutative && conc == Conc::Commutative) {
+                        e.2 = Conc::None;
+                    }
+                }
+            }
         };
         match source {
             PoolEffects::Conservative => {
                 for f in &record.fields {
-                    add(f.resource, true, true);
+                    add(f.resource, true, true, Conc::None);
                 }
             }
-            PoolEffects::Templates { loads: map, sealed } => {
+            PoolEffects::Templates {
+                loads: map,
+                footprints,
+                sealed,
+            } => {
                 let loads = map.get(&record.template).ok_or_else(|| {
                     format!(
                         "{what}: template {} is not in the pool node's certified templates",
@@ -1192,10 +1389,28 @@ impl TaskGraph {
                     if classes.is_empty() {
                         continue;
                     }
+                    let conc = if classes
+                        .iter()
+                        .all(|c| matches!(c, MemClass::AtomicCommutative | MemClass::AtomicRelease))
+                    {
+                        Conc::Commutative
+                    } else if classes.iter().any(|c| c.writes())
+                        && !classes.iter().any(|c| c.reads())
+                    {
+                        footprints
+                            .get(&record.template)
+                            .and_then(|fs| {
+                                fs.iter().find(|f| f.record_offset == load.record_offset)
+                            })
+                            .map_or(Conc::None, |f| Conc::Footprint(f.clone()))
+                    } else {
+                        Conc::None
+                    };
                     add(
                         field.resource,
                         classes.iter().any(|c| c.reads()),
                         classes.iter().any(|c| c.writes()),
+                        conc,
                     );
                 }
                 // The sealed tables `bind_records` discharged: the task reads
@@ -1210,21 +1425,113 @@ impl TaskGraph {
                     if !names_table {
                         continue;
                     }
-                    add(b.resource, true, false);
+                    add(b.resource, true, false, Conc::None);
                     for p in &b.pointees {
-                        add(*p, true, false);
+                        add(*p, true, false, Conc::None);
                     }
                 }
             }
         }
         Ok(merged
             .into_iter()
-            .map(|(resource, (read, write))| Access {
+            .map(|(resource, (read, write, conc))| Access {
                 resource,
                 read,
                 write,
+                conc,
             })
             .collect())
+    }
+
+    /// A conflicting pair of tasks of one launch instance on `resource`
+    /// (see [`Instances`]): admitted only when the template's own
+    /// certificate says concurrent workgroups of its grid do not conflict
+    /// there. A commutative-atomic resource always; a write-only field with a
+    /// `WgDisjoint` footprint iff every workgroup of `a` and every workgroup
+    /// of `b` differ on some footprint axis; otherwise refused.
+    fn same_instance_pair(
+        &self,
+        flat: &[&TaskHeader],
+        accesses: &[Vec<Access>],
+        by_base: &BTreeMap<u64, &BindingRecord>,
+        resource: ResourceId,
+        a: usize,
+        b: usize,
+        place: &dyn Fn(usize) -> (usize, usize),
+    ) -> Result<(), String> {
+        let (ta, tb) = (flat[a], flat[b]);
+        let conc = accesses[a]
+            .iter()
+            .find(|x| x.resource == resource)
+            .map_or(Conc::None, |x| x.conc.clone());
+        let (pa, ka) = place(a);
+        let (pb, kb) = place(b);
+        let tasks = format!(
+            "task {ka} of pool {pa} (node {}) and task {kb} of pool {pb} (node {})",
+            self.pools[pa].node, self.pools[pb].node
+        );
+        let fp = match conc {
+            Conc::Commutative => return Ok(()),
+            Conc::Footprint(fp) => fp,
+            Conc::None => {
+                return Err(format!(
+                    "race on resource {}: {tasks} are workgroups of one launch instance of template {} (ka_off {}) and conflict on it; standalone receipt proves no inter-WG write disjointness (not all commutative atomics, and no write-only per-workgroup footprint)",
+                    resource.0, ta.template, ta.ka_off
+                ));
+            }
+        };
+        let axes = fp.axes;
+        // The proof's assumptions, against the headers and the record's
+        // bound scalars.
+        for (i, name) in ["x", "y", "z"].iter().enumerate() {
+            let Some(bound) = fp.bounds[i] else { continue };
+            for t in [ta, tb] {
+                let extent = [t.gx, t.gy, t.gz][i];
+                if u64::from(extent) > bound {
+                    return Err(format!(
+                        "{tasks} (template {}, ka_off {}): virtual grid extent {extent} on {name} exceeds the footprint's certified tile-id bound {bound} on resource {}",
+                        ta.template, ta.ka_off, resource.0
+                    ));
+                }
+            }
+        }
+        for &(offset, mask, value) in &fp.requires {
+            let got = by_base
+                .get(&u64::from(ta.ka_off))
+                .and_then(|r| r.scalars.iter().find(|(o, _)| *o == offset))
+                .map(|(_, v)| *v);
+            if got.map(|v| v & mask) != Some(value) {
+                return Err(format!(
+                    "{tasks} (template {}, ka_off {}): the footprint on resource {} requires record dword +{offset} & {mask:#x} == {value:#x}, the record's scalar is {got:?}",
+                    ta.template, ta.ka_off, resource.0
+                ));
+            }
+        }
+        let (ax0, ax1) = (
+            u64::from(ta.vx),
+            u64::from(ta.vx) + u64::from(ta.vcount.max(1)),
+        );
+        let (bx0, bx1) = (
+            u64::from(tb.vx),
+            u64::from(tb.vx) + u64::from(tb.vcount.max(1)),
+        );
+        let x_overlap = ax0 < bx1 && bx0 < ax1;
+        let differs = (axes & 2 != 0 && ta.vy != tb.vy)
+            || (axes & 4 != 0 && ta.vz != tb.vz)
+            || (axes & 1 != 0 && !x_overlap);
+        if differs {
+            return Ok(());
+        }
+        let common = ax0.max(bx0);
+        let (wx, wx2) = if axes & 1 != 0 {
+            (common, common)
+        } else {
+            (ax0, bx0)
+        };
+        Err(format!(
+            "race on resource {}: {tasks} (template {}, ka_off {}) run workgroups ({wx}, {}, {}) and ({wx2}, {}, {}) concurrently, which agree on every footprint axis (mask {axes:#05b}); the certified footprint only separates workgroups differing on those axes",
+            resource.0, ta.template, ta.ka_off, ta.vy, ta.vz, tb.vy, tb.vz
+        ))
     }
 
     /// Whether node effect `e` is reached through the binding-record arena

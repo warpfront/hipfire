@@ -786,6 +786,7 @@ mod tests {
                 })
                 .collect(),
             sealed: Vec::new(),
+            wg_footprints: Vec::new(),
         }
     }
 
@@ -1173,6 +1174,7 @@ mod tests {
                     classes: vec!["load_acquire".into(), "vmem_load".into()],
                 }],
                 sealed_tables: vec![],
+                wg_footprints: vec![],
             }],
         }];
         k.required_witnesses = k.implied_witnesses();

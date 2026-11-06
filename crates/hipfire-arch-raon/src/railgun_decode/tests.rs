@@ -142,6 +142,7 @@ fn gather_record(null_guarded: bool) -> KernelRecord {
         case_digest: String::new(),
         guard_flag: None,
         task_protocol: None,
+        wg_footprints: Vec::new(),
     };
     k.case_digest = receipt::case_digest(OBJECT, ELF, "gfx1201", &k);
     k

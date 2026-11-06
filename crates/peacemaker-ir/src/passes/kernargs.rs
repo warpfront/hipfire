@@ -371,6 +371,15 @@ struct State {
     /// `s_or_b32 exec_lo, exec_lo, x` clears it; joins keep it only when both
     /// sides know it).
     exec_nz: bool,
+    /// Position (+1) of the last instruction that wrote EXEC; `u32::MAX` after a
+    /// join of different ones. Names the EXEC value of VALU carry witnesses.
+    epoch: u32,
+    /// Workgroup-footprint analysis: scalar compare facts `(atom, polarity)`
+    /// that hold on every path to here (dominating branch edges); joins keep the
+    /// facts both sides know.
+    facts: Vec<(Ix, bool)>,
+    /// Lane predicates every active lane satisfies (the EXEC conjunction).
+    lane_facts: Vec<(Ix, bool)>,
 }
 
 impl State {
@@ -387,6 +396,9 @@ impl State {
             m0: Val::default(),
             scc: Val::default(),
             exec_nz: false,
+            epoch: 0,
+            facts: Vec::new(),
+            lane_facts: Vec::new(),
         }
     }
     fn top(&self) -> u8 {
@@ -461,6 +473,11 @@ impl State {
         self.m0 = self.m0.join(o.m0);
         self.scc = self.scc.join(o.scc);
         self.exec_nz &= o.exec_nz;
+        if self.epoch != o.epoch {
+            self.epoch = u32::MAX;
+        }
+        self.facts.retain(|f| o.facts.contains(f));
+        self.lane_facts.retain(|f| o.lane_facts.contains(f));
     }
     /// EXEC ⊆ its old value: lanes being disabled keep their current values.
     fn exec_narrow(&mut self) {
@@ -1178,6 +1195,8 @@ struct Rec {
     guards_used: BTreeSet<usize>,
     sealed_entries: BTreeMap<InstId, EntryRec>,
     sealed_accesses: Vec<TableAccessRec>,
+    /// Write accesses attributed to an argument, with their address witnesses.
+    wsites: BTreeMap<InstId, WriteSite>,
 }
 impl Rec {
     fn new(loaded: DwSet) -> Self {
@@ -1195,6 +1214,7 @@ impl Rec {
             guards_used: BTreeSet::new(),
             sealed_entries: BTreeMap::new(),
             sealed_accesses: Vec::new(),
+            wsites: BTreeMap::new(),
         }
     }
     fn sink(&mut self, taint: DwSet, tf: u8, bit: u8) {
@@ -1254,6 +1274,13 @@ struct Analyzer<'k> {
     /// The access the null-guard replay watches and the table bits its base
     /// carried when it was replayed.
     probe: RefCell<(Option<InstId>, u8)>,
+    /// The scalar flag/constant semantics of the sealed analysis (SCC compare
+    /// witnesses, decided selects, EXEC-nonzero tracking, branch pruning) are
+    /// on: the sealed analysis and the workgroup-footprint analysis.
+    flags: bool,
+    /// The workgroup-footprint analysis: branch edges add compare facts and
+    /// EXEC predicates are tracked ([`State::facts`], [`State::lane_facts`]).
+    wgf: bool,
 }
 
 /// A1/A3/A4 facts for `kernel`. Never fails: an unsupported arch or ABI, or
@@ -1328,6 +1355,48 @@ fn analyze_impl(
     sealed: bool,
     excluded: &[(u32, u32)],
 ) -> KernargFacts {
+    analyze_core(kernel, arch, guards, sealed, excluded, false).0
+}
+
+/// The unguarded analysis (`sealed` = [`analyze_sealed`]) together with the
+/// exact address witnesses of every write it attributed to an argument, for
+/// the workgroup-footprint analysis (`passes::wg_footprint`).
+pub(super) fn analyze_for_wg(
+    kernel: &Kernel,
+    arch: Arch,
+    sealed: bool,
+) -> (KernargFacts, Option<WgInput>) {
+    analyze_core(kernel, arch, None, sealed, &[], true)
+}
+
+/// One write access attributed to an argument and its exact address witness.
+pub(super) struct WriteSite {
+    pub pos: u32,
+    /// The 64-bit address witness (global VMEM only; otherwise `Ix::NONE`).
+    pub addr: Ix,
+    pub width: Option<u8>,
+    /// Inside a CFG cycle: such an access executes many times per workgroup.
+    pub cyclic: bool,
+    /// Scalar compare facts holding on every path to the access.
+    pub facts: Vec<(Ix, bool)>,
+    /// Lane predicates every active lane of the access satisfies.
+    pub lane_facts: Vec<(Ix, bool)>,
+}
+
+/// What the workgroup-footprint analysis needs of the replay.
+pub(super) struct WgInput {
+    pub it: Interner,
+    pub sites: BTreeMap<InstId, WriteSite>,
+}
+
+fn analyze_core(
+    kernel: &Kernel,
+    arch: Arch,
+    guards: Option<&[Guard]>,
+    sealed: bool,
+    excluded: &[(u32, u32)],
+    wg: bool,
+) -> (KernargFacts, Option<WgInput>) {
     let (args, size) = match &kernel.abi {
         Abi::Hsa {
             metadata,
@@ -1353,7 +1422,7 @@ fn analyze_impl(
             rule: "unsupported-arch",
             detail: format!("{arch:?}"),
         });
-        return finish(facts, &layout, None, &[], Vec::new());
+        return (finish(facts, &layout, None, &[], Vec::new()), None);
     }
     let body = &kernel.body;
     if body.blocks.is_empty() {
@@ -1362,7 +1431,7 @@ fn analyze_impl(
             rule: "blocks-not-built",
             detail: String::new(),
         });
-        return finish(facts, &layout, None, &[], Vec::new());
+        return (finish(facts, &layout, None, &[], Vec::new()), None);
     }
     let mut decoded = Vec::with_capacity(body.layout.len());
     for (pos, &id) in body.layout.iter().enumerate() {
@@ -1379,7 +1448,7 @@ fn analyze_impl(
     // instruction writes EXEC (but a superset OR), which `step` enforces; this
     // is what lets `exec_lo & mask == 0` prove `mask == 0` for a guard that is
     // not preceded by an EXECZ branch.
-    entry.exec_nz = sealed;
+    entry.exec_nz = sealed || wg;
     let mut interner = Interner::default();
     if arch == Arch::Gfx1201 && matches!(kernel.abi, Abi::Hsa { .. }) {
         entry.t[9].ix = interner.entry(EntryReg::WorkgroupIdX);
@@ -1456,6 +1525,8 @@ fn analyze_impl(
         sealed: sealed.then(SealedCtx::default),
         atom_pc: RefCell::new(BTreeMap::new()),
         probe: RefCell::new((None, 0)),
+        flags: sealed || wg,
+        wgf: wg,
     };
     let ins = an.fixpoint();
     an.record(&ins, &mut rec);
@@ -1490,7 +1561,14 @@ fn analyze_impl(
             size: 0,
         },
     );
-    finish(facts, &layout, Some(rec), &supplied, sealed_uses)
+    let wg = WgInput {
+        it: an.ix.take(),
+        sites: std::mem::take(&mut rec.wsites),
+    };
+    (
+        finish(facts, &layout, Some(rec), &supplied, sealed_uses),
+        Some(wg),
+    )
 }
 
 fn cyclic_blocks(body: &Body) -> Vec<bool> {
@@ -1700,14 +1778,16 @@ impl<'k> Analyzer<'k> {
                 self.step(&mut st, pos, None, false);
             }
             for target in self.live_succs(block, &st) {
+                let edge = self.edge_state(block, target, &st);
+                let src = edge.as_ref().unwrap_or(&st);
                 let changed = match &mut ins[target] {
                     Some(existing) => {
                         let before = existing.clone();
-                        existing.join_from(&st);
+                        existing.join_from(src);
                         *existing != before
                     }
                     slot @ None => {
-                        *slot = Some(st.clone());
+                        *slot = Some(src.clone());
                         true
                     }
                 };
@@ -1720,6 +1800,46 @@ impl<'k> Analyzer<'k> {
         ins
     }
 
+    /// Workgroup-footprint analysis: the state flowing along the branch edge
+    /// `block -> target` with the compare facts that edge implies added
+    /// (`None`: no change).
+    fn edge_state(&self, block: &crate::cfg::Block, target: usize, st: &State) -> Option<State> {
+        use crate::cfg::{Cond, Terminator};
+        if !self.wgf {
+            return None;
+        }
+        let Terminator::Branch {
+            cond,
+            taken,
+            fallthrough,
+        } = &block.term
+        else {
+            return None;
+        };
+        if taken == fallthrough {
+            return None;
+        }
+        let is_taken = target == taken.0;
+        let mut facts = Vec::new();
+        self.edge_facts(*cond, is_taken, st, &mut facts);
+        let nz = self.wave == Wave::Wave32
+            && matches!(
+                (cond, is_taken),
+                (Cond::Execz, false) | (Cond::Execnz, true)
+            );
+        if facts.is_empty() && !nz {
+            return None;
+        }
+        let mut out = st.clone();
+        out.facts.extend(facts);
+        out.facts.sort();
+        out.facts.dedup();
+        if nz {
+            out.exec_nz = true;
+        }
+        Some(out)
+    }
+
     /// Which edge of a conditional branch `st` decides: `Some(true)` the taken
     /// edge only, `Some(false)` the fall-through only, `None` both. The
     /// guarded analysis decides SCC branches whose SCC is a known constant;
@@ -1728,7 +1848,7 @@ impl<'k> Analyzer<'k> {
     /// which the compiler relies on). EXEC branches are never decided.
     fn branch_outcome(&self, cond: crate::cfg::Cond, st: &State) -> Option<bool> {
         use crate::cfg::Cond;
-        if self.guard.is_none() && self.sealed.is_none() {
+        if self.guard.is_none() && !self.flags {
             return None;
         }
         match cond {
@@ -1736,7 +1856,7 @@ impl<'k> Analyzer<'k> {
                 let scc = st.scc.konst?;
                 Some((scc != 0) == (cond == Cond::Scc1))
             }
-            Cond::Vccz | Cond::Vccnz if self.sealed.is_some() && self.wave == Wave::Wave32 => {
+            Cond::Vccz | Cond::Vccnz if self.flags && self.wave == Wave::Wave32 => {
                 let vcc = st.s[VCC_LO].konst?;
                 Some((vcc == 0) == (cond == Cond::Vccz))
             }
@@ -1952,7 +2072,7 @@ impl<'k> Analyzer<'k> {
                 rec.fail(self.arch, dec, "call");
             }
         }
-        let fx = if self.sealed.is_some() {
+        let fx = if self.flags {
             self.sealed_scalar(st, dec)
         } else {
             SealedFx::default()
@@ -1968,8 +2088,9 @@ impl<'k> Analyzer<'k> {
             let mut lane_writes: SmallVec<[(u16, Option<u8>, Val); 1]> = SmallVec::new();
             scc_konst = self.cmp_konst(st, dec);
             for part in &dec.parts {
-                self.eval(st, part, &mut writes, &mut lane_writes, &mut carry);
+                self.eval(st, part, &mut writes, &mut lane_writes, &mut carry, pos);
             }
+            self.opaque_defs(st, dec, &mut writes);
             let plan = self.exec_plan(st, dec);
             let valu = matches!(
                 inst.form,
@@ -2074,7 +2195,7 @@ impl<'k> Analyzer<'k> {
                 st.s[i].ix = ix;
             }
         }
-        if self.sealed.is_some() && st.exec_nz {
+        if self.flags && st.exec_nz {
             let writes_exec = inst.effects.implicit.writes & ImplicitSet::EXEC != 0
                 || dec.parts.iter().any(|p| {
                     p.fields.iter().any(|f| {
@@ -2098,6 +2219,20 @@ impl<'k> Analyzer<'k> {
             if writes_exec && !superset {
                 st.exec_nz = false;
             }
+        }
+        // EXEC epoch: the position (+1) of the last instruction that wrote EXEC.
+        if inst.effects.implicit.writes & ImplicitSet::EXEC != 0
+            || dec.parts.iter().any(|p| {
+                p.fields.iter().any(|f| {
+                    f.def
+                        && matches!(
+                            f.op,
+                            Operand::Special(Special::Exec | Special::ExecLo | Special::ExecHi)
+                        )
+                })
+            })
+        {
+            st.epoch = pos as u32 + 1;
         }
         if fx.exec_nz {
             st.exec_nz = true;
@@ -2305,6 +2440,82 @@ impl<'k> Analyzer<'k> {
         }
     }
 
+    /// A pure scalar instruction outside every CFG cycle whose sources are all
+    /// witnessed uniform values (constants, kernarg dwords and pure functions of
+    /// them) computes a uniform value the witness has no expression for
+    /// (compiler division sequences, float conversions): name it as the
+    /// opaque result of this instruction so equal uses stay equal. Anything
+    /// that reads lane or wave state (EXEC, VCC, M0, hardware registers), a
+    /// lane mask, or a value without a uniform witness gets none.
+    fn opaque_defs(&self, st: &State, dec: &Dec, writes: &mut [(&Operand, SmallVec<[Val; 4]>)]) {
+        if self.pos_cyclic[dec.pos] || dec.parts.len() != 1 {
+            return;
+        }
+        let part = &dec.parts[0];
+        let name = part.name;
+        let pure = match dec.inst.form {
+            Form::Sop1 | Form::Sop2 | Form::Sopk => {
+                const IMPURE: &[&str] = &[
+                    "getreg",
+                    "setreg",
+                    "getpc",
+                    "setpc",
+                    "swappc",
+                    "movrel",
+                    "saveexec",
+                    "sendmsg",
+                    "rtn",
+                    "memtime",
+                    "memrealtime",
+                    "ttrace",
+                    "barrier",
+                    "wait",
+                    "sleep",
+                    "prefetch",
+                    "rfe",
+                    "alloc",
+                    "wqm",
+                    "quadmask",
+                    "bitreplicate",
+                ];
+                !IMPURE.iter().any(|p| name.contains(p))
+            }
+            _ => name.starts_with("v_s_"),
+        };
+        if !pure
+            || dec.inst.effects.implicit.reads
+                & (ImplicitSet::SCC | ImplicitSet::VCC | ImplicitSet::EXEC | ImplicitSet::M0)
+                != 0
+            || part
+                .fields
+                .iter()
+                .any(|f| f.used && !f.def && is_mask(part.name, f.name))
+        {
+            return;
+        }
+        let mut it = self.ix.borrow_mut();
+        for f in part.fields.iter().filter(|f| f.used) {
+            for v in self.vals(st, f) {
+                let ix = ixof(&mut it, v);
+                if !it.uniform(ix) {
+                    return;
+                }
+            }
+        }
+        for (k, (op, vals)) in writes.iter_mut().enumerate() {
+            if let Operand::Reg(r) = op {
+                if matches!(r.kind, Kind::S | Kind::Ttmp)
+                    && r.len == 1
+                    && vals.len() == 1
+                    && vals[0].ix.live().is_none()
+                    && vals[0].konst.is_none()
+                {
+                    vals[0].ix = it.opaque(dec.id, k as u8);
+                }
+            }
+        }
+    }
+
     /// Values written by one opcode half. Every explicit destination gets a
     /// value: a destination the semantic rules below do not cover receives
     /// the provenance-free combination of the sources.
@@ -2315,6 +2526,7 @@ impl<'k> Analyzer<'k> {
         writes: &mut SmallVec<[(&'a Operand, SmallVec<[Val; 4]>); 4]>,
         lanes: &mut SmallVec<[(u16, Option<u8>, Val); 1]>,
         carry: &mut Option<(CarryTo, Ix)>,
+        pos: usize,
     ) {
         let start = writes.len();
         let lane_start = lanes.len();
@@ -2329,7 +2541,7 @@ impl<'k> Analyzer<'k> {
                 writes.push((d.op, smallvec::smallvec![Val::kill(uses.iter())]));
             }
         }
-        self.eval_ix(st, part, &mut writes[start..], carry);
+        self.eval_ix(st, part, &mut writes[start..], carry, pos);
     }
 
     /// The integer/address witness of this part's results (§A9.3 rule 2): exact
@@ -2342,13 +2554,17 @@ impl<'k> Analyzer<'k> {
         part: &Part<'a>,
         writes: &mut [(&'a Operand, SmallVec<[Val; 4]>)],
         carry: &mut Option<(CarryTo, Ix)>,
+        pos: usize,
     ) {
         enum Res {
             One(Ix),
             Two(Ix),
+            /// Explicit `(lo, hi)` witnesses of a 64-bit destination.
+            Pair(Ix, Ix),
         }
         let name = norm_name(part.name);
         let srcs: SmallVec<[&Field; 4]> = part.sources().collect();
+        let s2 = srcs.get(2).copied();
         let (Some(&s0), Some(&s1)) = (srcs.first(), srcs.get(1)) else {
             if matches!(name.as_str(), "v_readfirstlane_b32" | "v_mov_b32_dpp") {
                 if let Some(d) = part.fields.iter().find(|f| f.def) {
@@ -2357,7 +2573,16 @@ impl<'k> Analyzer<'k> {
             }
             return;
         };
-        let lvl = st.exec_exact.unwrap_or(EXEC_UNKNOWN);
+        // The EXEC level a VALU carry names: the saved-mask level EXEC equals,
+        // or, with EXEC narrowed to an unnamed mask, the last instruction that
+        // wrote EXEC (outside every CFG cycle, where one dynamic instance of it
+        // reaches both halves of the add), so a carry-out and its carry-in
+        // under one unchanged mask still match.
+        let lvl: u32 = match st.exec_exact {
+            Some(k) => u32::from(k),
+            None if st.epoch != u32::MAX && !self.pos_cyclic[pos] => 0x1_0000 + st.epoch,
+            None => EXEC_UNKNOWN,
+        };
         let mut it = self.ix.borrow_mut();
         let it = &mut *it;
         let one = |it: &mut Interner, f: &Field| -> Ix {
@@ -2379,7 +2604,7 @@ impl<'k> Analyzer<'k> {
             .or_else(|| part.fields.iter().find(|f| f.def && f.name == "SDST"));
         let sdst = part.fields.iter().find(|f| f.def && f.name == "SDST");
         // High half of `A + B` given the matched carry and the high words.
-        let hi_sum = |it: &mut Interner, cin: Ix, lvl: u8, ha: Ix, hb: Ix| -> Ix {
+        let hi_sum = |it: &mut Interner, cin: Ix, lvl: u32, ha: Ix, hb: Ix| -> Ix {
             let Some((ca, cb)) = it.carry_parts(cin, lvl) else {
                 return Ix::NONE;
             };
@@ -2464,17 +2689,19 @@ impl<'k> Analyzer<'k> {
                 }
                 None => Ix::NONE,
             })),
-            "s_ashr_i32" => Some(Res::One(if kon(s1).map(|k| k & 31) == Some(31) {
-                let x = one(it, s0);
-                it.sra31(x)
-            } else {
-                Ix::NONE
+            "s_ashr_i32" => Some(Res::One(match kon(s1) {
+                Some(k) => {
+                    let x = one(it, s0);
+                    it.sra32(x, k & 31)
+                }
+                None => Ix::NONE,
             })),
-            "v_ashrrev_i32" => Some(Res::One(if kon(s0).map(|k| k & 31) == Some(31) {
-                let x = one(it, s1);
-                it.sra31(x)
-            } else {
-                Ix::NONE
+            "v_ashrrev_i32" => Some(Res::One(match kon(s0) {
+                Some(k) => {
+                    let x = one(it, s1);
+                    it.sra32(x, k & 31)
+                }
+                None => Ix::NONE,
             })),
             "s_add_nc_u64" | "s_add_u64" => {
                 let (x, y) = (wide(it, s0), wide(it, s1));
@@ -2498,6 +2725,131 @@ impl<'k> Analyzer<'k> {
                 }
                 None => Ix::NONE,
             })),
+            "s_and_b32" | "v_and_b32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                Some(Res::One(it.and32(x, y)))
+            }
+            "s_or_b32" | "v_or_b32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                Some(Res::One(it.or32(x, y)))
+            }
+            "s_lshr_b32" => Some(Res::One(match kon(s1) {
+                Some(k) => {
+                    let x = one(it, s0);
+                    it.shr32(x, k & 31)
+                }
+                None => Ix::NONE,
+            })),
+            "v_lshrrev_b32" => Some(Res::One(match kon(s0) {
+                Some(k) => {
+                    let x = one(it, s1);
+                    it.shr32(x, k & 31)
+                }
+                None => Ix::NONE,
+            })),
+            "s_min_i32" | "s_max_i32" | "s_min_u32" | "s_max_u32" | "v_min_i32" | "v_max_i32"
+            | "v_min_u32" | "v_max_u32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                Some(Res::One(it.minmax32(
+                    x,
+                    y,
+                    name.contains("_max_"),
+                    name.ends_with("_i32"),
+                )))
+            }
+            "v_mul_u32_u24" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                let m = it.c32(0x00ff_ffff);
+                let (x, y) = (it.and32(x, m), it.and32(y, m));
+                Some(Res::One(it.mul32(x, y)))
+            }
+            "v_mad_u32_u24" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                let z = s2.map_or(Ix::NONE, |f| one(it, f));
+                let m = it.c32(0x00ff_ffff);
+                let (x, y) = (it.and32(x, m), it.and32(y, m));
+                let p = it.mul32(x, y);
+                Some(Res::One(it.add32(p, z)))
+            }
+            "v_add3_u32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                let z = s2.map_or(Ix::NONE, |f| one(it, f));
+                let p = it.add32(x, y);
+                Some(Res::One(it.add32(p, z)))
+            }
+            "v_lshl_add_u32" => Some(Res::One(match kon(s1) {
+                Some(k) => {
+                    let x = one(it, s0);
+                    let z = s2.map_or(Ix::NONE, |f| one(it, f));
+                    let sh = it.shl32(x, k & 31);
+                    it.add32(sh, z)
+                }
+                None => Ix::NONE,
+            })),
+            "v_lshl_or_b32" => Some(Res::One(match kon(s1) {
+                Some(k) => {
+                    let x = one(it, s0);
+                    let z = s2.map_or(Ix::NONE, |f| one(it, f));
+                    let sh = it.shl32(x, k & 31);
+                    it.or32(sh, z)
+                }
+                None => Ix::NONE,
+            })),
+            "v_add_lshl_u32" => Some(Res::One(match s2.and_then(|f| kon(f)) {
+                Some(k) => {
+                    let (x, y) = (one(it, s0), one(it, s1));
+                    let sum = it.add32(x, y);
+                    it.shl32(sum, k & 31)
+                }
+                None => Ix::NONE,
+            })),
+            "v_and_or_b32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                let z = s2.map_or(Ix::NONE, |f| one(it, f));
+                let a = it.and32(x, y);
+                Some(Res::One(it.or32(a, z)))
+            }
+            "v_or3_b32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                let z = s2.map_or(Ix::NONE, |f| one(it, f));
+                let a = it.or32(x, y);
+                Some(Res::One(it.or32(a, z)))
+            }
+            "v_bfe_u32" => Some(Res::One(
+                match (kon(s1).map(|k| k & 31), s2.and_then(|f| kon(f))) {
+                    (Some(off), Some(w)) if (1..=32).contains(&(w & 63)) && (w & 63) <= 32 => {
+                        let x = one(it, s0);
+                        let w = w & 63;
+                        let shifted = it.shr32(x, off);
+                        if w == 32 {
+                            shifted
+                        } else {
+                            let m = it.c32((1u32 << w) - 1);
+                            it.and32(shifted, m)
+                        }
+                    }
+                    _ => Ix::NONE,
+                },
+            )),
+            "v_mad_co_u64_u32" | "v_mad_co_i64_i32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                let cl = s2.map_or(Ix::NONE, |f| one(it, f));
+                let p = it.mul32(x, y);
+                let lo = it.add32(p, cl);
+                if name == "v_mad_co_u64_u32" {
+                    let c = s2.map_or(Ix::NONE, |f| wide(it, f));
+                    let (zx, zy) = (it.zext(x), it.zext(y));
+                    let m = it.mul64(zx, zy);
+                    let w = it.add64(m, c);
+                    if w.is_none() {
+                        Some(Res::Pair(lo, Ix::NONE))
+                    } else {
+                        Some(Res::Two(w))
+                    }
+                } else {
+                    Some(Res::Pair(lo, Ix::NONE))
+                }
+            }
             "v_readfirstlane_b32" | "v_mov_b32_dpp" => Some(Res::One(Ix::NONE)),
             _ => None,
         };
@@ -2508,6 +2860,7 @@ impl<'k> Analyzer<'k> {
                     let (lo, hi) = (it.lo_of(w), it.hi_of(w));
                     patch_ix(writes, d.op, &[lo, hi]);
                 }
+                Res::Pair(lo, hi) => patch_ix(writes, d.op, &[lo, hi]),
             }
         }
     }
@@ -3201,6 +3554,10 @@ impl<'k> Analyzer<'k> {
                         addr,
                         access_width(name),
                     );
+                    if let Some(site) = rec.wsites.get_mut(&dec.id) {
+                        site.facts = st.facts.clone();
+                        site.lane_facts = st.lane_facts.clone();
+                    }
                 }
                 if let Some(d) = dst {
                     self.write(st, d.op, &out);
@@ -3417,6 +3774,19 @@ impl<'k> Analyzer<'k> {
                         cache,
                         shared,
                     });
+                }
+                if writes {
+                    rec.wsites.insert(
+                        dec.id,
+                        WriteSite {
+                            pos: dec.pos as u32,
+                            addr,
+                            width,
+                            cyclic: self.pos_cyclic[dec.pos],
+                            facts: Vec::new(),
+                            lane_facts: Vec::new(),
+                        },
+                    );
                 }
                 rec.sink(base_dws, 0, Sinks::ADDRESS_BASE);
                 rec.sink(
@@ -4423,7 +4793,7 @@ enum CarryTo {
     Vcc,
 }
 /// `State::exec_exact` unknown: a VALU carry then names no EXEC level.
-const EXEC_UNKNOWN: u8 = 0xfe;
+const EXEC_UNKNOWN: u32 = u32::MAX - 1;
 
 /// Mnemonic without the encoding suffix, VOPD halves as their plain opcode.
 fn norm_name(name: &str) -> String {

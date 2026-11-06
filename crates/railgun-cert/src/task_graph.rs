@@ -40,7 +40,8 @@
 //!    outside the region's own LDS and control flow.
 //! 4. **Protocol.** [`protocol`] runs a symbolic dataflow over the lifted
 //!    pool CFG and proves the six [`TASK_PROTO_REQUIRED`] properties, which
-//!    the host reads from the [`TaskProtocolRecord`].
+//!    the host reads from the [`TaskProtocolRecord`], and, when it holds,
+//!    `region_wg_from_header` with the header offsets of the virtual grid.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -748,6 +749,7 @@ fn derive_lifted(
             template: t,
             pointer_loads: loads,
             sealed_tables,
+            wg_footprints: standalone_footprints(&bytes, &r.source_symbol, r.block),
         },
         lds_bytes: lifted.lds_bytes,
         evidence: format!(
@@ -899,6 +901,7 @@ fn derive_native(kernel: &Kernel, arch: Arch, p: &Placed) -> Result<RegionFacts,
             template: t,
             pointer_loads: loads,
             sealed_tables: Vec::new(),
+            wg_footprints: Vec::new(),
         },
         lds_bytes: 0,
         evidence: format!(
@@ -1551,6 +1554,7 @@ mod sealed_tests {
             case_digest: String::new(),
             guard_flag: None,
             task_protocol: None,
+            wg_footprints: Vec::new(),
         }
     }
 
@@ -1631,6 +1635,7 @@ mod sealed_tests {
                 template: 7,
                 pointer_loads: loads,
                 sealed_tables: sealed,
+                wg_footprints: Vec::new(),
             }],
         }];
         pool.required_witnesses = pool.implied_witnesses();
@@ -1641,4 +1646,37 @@ mod sealed_tests {
         pool.case_digest = case_digest("obj", "elf", "gfx1201", &pool);
         pool.validate_case("obj", "elf", "gfx1201").expect("valid");
     }
+}
+
+/// The workgroup footprints of a standalone body's pointer arguments for a region of
+/// `block` threads (`record_offset` = the standalone kernarg offset = the record offset).
+/// A body that cannot be re-analysed has none: an absent footprint is never a claim.
+fn standalone_footprints(
+    object: &[u8],
+    symbol: &str,
+    block: u32,
+) -> Vec<railgun_corpus::receipt::WgFootprintRecord> {
+    let Ok(lifted) = lift_object(
+        object,
+        Options {
+            frontend: Frontend::Hipcc,
+        },
+    ) else {
+        return Vec::new();
+    };
+    let Some(index) = lifted
+        .program
+        .kernels
+        .iter()
+        .position(|k| k.symbol.0 == symbol)
+    else {
+        return Vec::new();
+    };
+    let (facts, _, _) = crate::kernel_facts(&lifted.program, index);
+    crate::wg_footprint_records(
+        &lifted.program.kernels[index],
+        lifted.program.target.arch,
+        &facts,
+        Some(block),
+    )
 }

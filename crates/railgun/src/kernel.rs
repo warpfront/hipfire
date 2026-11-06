@@ -242,6 +242,35 @@ pub struct ArenaPointerLoad {
     pub classes: Vec<MemClass>,
 }
 
+/// Writes through the pointer at `record_offset` by two workgroups `w != w'`
+/// are disjoint whenever they differ on some axis in `axes` (a mask: bit 0 x,
+/// bit 1 y, bit 2 z; never zero).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WgFootprint {
+    pub record_offset: u32,
+    pub axes: u8,
+    /// Work-items per tile on x the proof assumes (0: none).
+    pub block_x: u32,
+    /// Exclusive per-axis tile-id bounds (`None`: unbounded); the host
+    /// requires the virtual grid extents `gx, gy, gz` within them.
+    pub bounds: [Option<u64>; 3],
+    /// Record dwords the proof used: `(offset, mask, value)`.
+    pub requires: Vec<(u32, u32, u32)>,
+}
+
+impl WgFootprint {
+    /// A footprint over the axis mask with no assumptions.
+    pub fn plain(record_offset: u32, axes: u8) -> Self {
+        Self {
+            record_offset,
+            axes,
+            block_x: 0,
+            bounds: [None; 3],
+            requires: Vec::new(),
+        }
+    }
+}
+
 /// One record template of a descriptor arena: the pointer fields a kernel
 /// loads from a record of this template. A field the facts do not list is
 /// never loaded as an address base.
@@ -256,6 +285,9 @@ pub struct ArenaTemplate {
     /// ([`crate::BindingRecord::scalars`]). Discharged by
     /// [`KernelProgram::bind_records`] for every record of the template.
     pub sealed: Vec<SealedTableFact>,
+    /// Certified per-workgroup write footprints (receipt
+    /// `ArenaTemplateRecord::wg_footprints`).
+    pub wg_footprints: Vec<WgFootprint>,
 }
 
 /// One descriptor arena of a `Conditional` kernel (receipt
@@ -500,6 +532,51 @@ fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, St
                 template: t.template,
                 pointer_loads,
                 sealed,
+                wg_footprints: t
+                    .wg_footprints
+                    .iter()
+                    .map(|f| {
+                        let mut axes = 0u8;
+                        for a in &f.axes {
+                            axes |= match a.as_str() {
+                                "x" => 1,
+                                "y" => 2,
+                                "z" => 4,
+                                other => {
+                                    return Err(format!("{sym}: unknown workgroup axis {other:?}"))
+                                }
+                            };
+                        }
+                        if axes == 0 {
+                            return Err(format!("{sym}: workgroup footprint has no axes"));
+                        }
+                        let mut bounds = [None; 3];
+                        for b in &f.bounds {
+                            let i = match b.axis.as_str() {
+                                "x" => 0,
+                                "y" => 1,
+                                "z" => 2,
+                                other => {
+                                    return Err(format!("{sym}: unknown workgroup axis {other:?}"))
+                                }
+                            };
+                            if b.bound == 0 || bounds[i].replace(b.bound).is_some() {
+                                return Err(format!("{sym}: bad workgroup bound on {}", b.axis));
+                            }
+                        }
+                        Ok(WgFootprint {
+                            record_offset: f.record_offset,
+                            axes,
+                            block_x: f.block_x,
+                            bounds,
+                            requires: f
+                                .requires
+                                .iter()
+                                .map(|r| (r.offset, r.mask, r.value))
+                                .collect(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
             });
         }
         arenas.push(ArenaFact {

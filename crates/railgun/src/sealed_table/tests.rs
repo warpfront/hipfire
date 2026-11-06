@@ -194,6 +194,7 @@ pub(crate) fn record_with(tables: Vec<SealedTableRecord>) -> KernelRecord {
         case_digest: String::new(),
         guard_flag: None,
         task_protocol: None,
+        wg_footprints: Vec::new(),
     })
 }
 

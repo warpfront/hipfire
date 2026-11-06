@@ -49,9 +49,10 @@ pub use railgun_corpus::receipt::{
     case_digest, ArgCheck, ArgRecord, Check, Differential, DwordRecord, GuardRecord,
     ImplicitRecord, IndexLoadRecord, IndexedEffectRecord, KernelIdentity, KernelRecord,
     RailgunSection, Receipt, SealedAccessRecord, SealedEntryRecord, SealedTableRecord, SideRecord,
-    Tool, UnresolvedRecord, KNOWN_WITNESSES, RAILGUN_SECTION_VERSION, RECEIPT_SCHEMA,
-    RECEIPT_SCHEMA_VERSION, SEALED_BOUND_CONST, SEALED_BOUND_KERNARG, STATUS_CONDITIONAL,
-    STATUS_PROVEN, STATUS_UNKNOWN, WITNESS_INDEXED_BIND, WITNESS_SEALED_TABLE,
+    Tool, UnresolvedRecord, WgBoundRecord, WgFootprintRecord, WgRequirementRecord, KNOWN_WITNESSES,
+    RAILGUN_SECTION_VERSION, RECEIPT_SCHEMA, RECEIPT_SCHEMA_VERSION, SEALED_BOUND_CONST,
+    SEALED_BOUND_KERNARG, STATUS_CONDITIONAL, STATUS_PROVEN, STATUS_UNKNOWN, WITNESS_INDEXED_BIND,
+    WITNESS_SEALED_TABLE,
 };
 
 /// Stated in every receipt: what a `Proven` A1 verdict rests on.
@@ -273,6 +274,60 @@ fn arg_record(a: &ArgFacts) -> ArgRecord {
     }
 }
 
+/// The workgroup write footprints (`peacemaker_ir::passes::wg_footprint`) of
+/// `kernel`'s pointer arguments as receipt records (`record_offset` = the
+/// argument's kernarg offset), for tiles of `block_x` work-items on x (`None`:
+/// the kernel's declared maximum flat workgroup size, else 1024). `facts` is the
+/// A1 result the record carries: a `Conditional` one is admitted only as the
+/// sealed-table case. Empty when nothing is proven (any other arch, geometry or
+/// A1 status included); an argument with no proof has no record.
+pub fn wg_footprint_records(
+    kernel: &Kernel,
+    arch: Arch,
+    facts: &KernargFacts,
+    block_x: Option<u32>,
+) -> Vec<WgFootprintRecord> {
+    use peacemaker_ir::passes::wg_footprint::{analyze, ArgWgClass, WgLaunch, HW_BOUNDS};
+    let max_flat = match &kernel.abi {
+        peacemaker_ir::inst::Abi::Hsa { metadata, .. } => metadata.parsed.max_flat_workgroup_size,
+        _ => 0,
+    };
+    let block = block_x.unwrap_or(if max_flat == 0 { 1024 } else { max_flat });
+    let sealed = facts.status == KernelStatus::Conditional;
+    let result = analyze(kernel, arch, sealed, WgLaunch { block_x: block });
+    let axis_name = |a: u8| ["x", "y", "z"][usize::from(a)].to_owned();
+    result
+        .args
+        .iter()
+        .filter_map(|a| match &a.class {
+            ArgWgClass::Disjoint(d) => Some(WgFootprintRecord {
+                record_offset: a.arg_offset,
+                axes: d.axes.iter().map(|&x| axis_name(x)).collect(),
+                block_x: d.block_x,
+                bounds: d
+                    .axes
+                    .iter()
+                    .filter(|&&x| d.bounds[usize::from(x)] < HW_BOUNDS[usize::from(x)])
+                    .map(|&x| WgBoundRecord {
+                        axis: axis_name(x),
+                        bound: d.bounds[usize::from(x)],
+                    })
+                    .collect(),
+                requires: d
+                    .requires
+                    .iter()
+                    .map(|r| WgRequirementRecord {
+                        offset: r.offset,
+                        mask: r.mask,
+                        value: r.value,
+                    })
+                    .collect(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Serialise one kernel's facts (plus its differential) for the receipt.
 pub fn kernel_record(
     kernel: &Kernel,
@@ -367,6 +422,7 @@ pub fn kernel_record(
         case_digest: String::new(),
         guard_flag: None,
         task_protocol: None,
+        wg_footprints: Vec::new(),
     }
 }
 
@@ -987,6 +1043,7 @@ pub fn certify(bytes: &[u8], sidecar: Option<&str>) -> Result<Receipt, CertError
         record.pm_analyze_error = pm_error;
         let facts = guarded.unwrap_or(facts);
         record.guard_flag = guard_flag(kernel, arch);
+        record.wg_footprints = wg_footprint_records(kernel, arch, &facts, None);
         if facts.args.iter().any(|a| a.bound.is_some()) {
             obligations.insert("InBoundsNoAlias".to_owned());
         }

@@ -122,6 +122,7 @@ fn conditional(object: &str, elf: &str) -> KernelRecord {
         case_digest: String::new(),
         guard_flag: None,
         task_protocol: None,
+        wg_footprints: Vec::new(),
     };
     k.case_digest = case_digest(object, elf, "gfx1201", &k);
     k

@@ -29,6 +29,16 @@ const T_COPY: u32 = 1;
 const T_READ: u32 = 2;
 const T_NOP: u32 = 3;
 const T_WRITE: u32 = 4;
+/// Write-only field 8 with a certified workgroup footprint over axes x;
+/// over x and y; a commutative atomic on field 8.
+const T_TILE_X: u32 = 6;
+const T_TILE_XY: u32 = 7;
+const T_ATOM: u32 = 8;
+/// Footprint over x with a tile-id bound of 4 on x; with the requirement
+/// `dword@16 & 0xffff == 0x80` (met by the record) / `== 0x81` (not met).
+const T_TILE_B: u32 = 9;
+const T_TILE_R: u32 = 10;
+const T_TILE_Q: u32 = 11;
 
 const N: u32 = NONE;
 const ALL: [u32; 4] = [T_COPY, T_READ, T_NOP, T_WRITE];
@@ -45,6 +55,13 @@ fn t(template: u32, record: u32, pred: u32, expected: u32, done: u32) -> TaskHea
         pred_event: pred,
         expected,
         done_event: done,
+        vx: 0,
+        vy: 0,
+        vz: 0,
+        gx: 1,
+        gy: 1,
+        gz: 1,
+        vcount: 0,
     }
 }
 
@@ -69,6 +86,14 @@ fn template(id: u32) -> ArenaTemplate {
         T_WRITE => vec![L {
             record_offset: 8,
             classes: vec![VmemStore],
+        }],
+        T_TILE_X | T_TILE_XY | T_TILE_B | T_TILE_R | T_TILE_Q => vec![L {
+            record_offset: 8,
+            classes: vec![VmemStore],
+        }],
+        T_ATOM => vec![L {
+            record_offset: 8,
+            classes: vec![AtomicCommutative],
         }],
         T_SEALED => vec![L {
             record_offset: 0,
@@ -106,6 +131,19 @@ fn template(id: u32) -> ArenaTemplate {
         } else {
             Vec::new()
         },
+        wg_footprints: match id {
+            T_TILE_X => vec![crate::kernel::WgFootprint::plain(8, 1)],
+            T_TILE_XY => vec![crate::kernel::WgFootprint::plain(8, 3)],
+            T_TILE_B => vec![crate::kernel::WgFootprint {
+                bounds: [Some(4), None, None],
+                ..crate::kernel::WgFootprint::plain(8, 1)
+            }],
+            T_TILE_R | T_TILE_Q => vec![crate::kernel::WgFootprint {
+                requires: vec![(16, 0xffff, if id == T_TILE_R { 0x80 } else { 0x81 })],
+                ..crate::kernel::WgFootprint::plain(8, 1)
+            }],
+            _ => Vec::new(),
+        },
     }
 }
 
@@ -121,6 +159,181 @@ fn proven_protocol() -> TaskProtocolFact {
             .map(|s| (*s).to_owned())
             .collect(),
     }
+}
+
+fn region_wg_protocol() -> TaskProtocolFact {
+    let mut p = proven_protocol();
+    p.proved
+        .push(railgun_corpus::receipt::TASK_PROTO_REGION_WG.to_owned());
+    p
+}
+
+/// A tile claim: workgroups `vx..vx+vcount` at `(vy, vz = 0)` of a
+/// `(gx, gy, 1)` virtual grid, of record `record`.
+fn tile(template: u32, record: u32, vx: u32, vy: u32, vcount: u32, gx: u32, gy: u32) -> TaskHeader {
+    TaskHeader {
+        vx,
+        vy,
+        gx,
+        gy,
+        vcount,
+        ..t(template, record, N, 0, N)
+    }
+}
+
+fn tiles(
+    template: u32,
+    tasks: Vec<TaskHeader>,
+    protocol: TaskProtocolFact,
+) -> Result<TaskGraphProof, String> {
+    build(
+        vec![tasks],
+        &[(template, &[(8, X)])],
+        vec![vec![template]],
+        Some(protocol),
+        false,
+    )
+    .check()
+}
+
+#[test]
+fn same_instance_tiles_with_a_footprint_are_admitted_only_with_the_property() {
+    let two = || {
+        vec![
+            tile(T_TILE_X, 0, 0, 0, 2, 4, 1),
+            tile(T_TILE_X, 0, 2, 0, 2, 4, 1),
+        ]
+    };
+    let proof = tiles(T_TILE_X, two(), region_wg_protocol()).unwrap();
+    assert_eq!(proof.tasks, 2);
+    assert_eq!(proof.ordered_pairs, 0);
+    let err = tiles(T_TILE_X, two(), proven_protocol()).unwrap_err();
+    assert!(
+        err.contains("race on resource") && err.contains("both write"),
+        "{err}"
+    );
+}
+
+#[test]
+fn same_instance_tiles_with_overlapping_workgroups_are_refused() {
+    let err = tiles(
+        T_TILE_X,
+        vec![
+            tile(T_TILE_X, 0, 0, 0, 3, 4, 1),
+            tile(T_TILE_X, 0, 2, 0, 2, 4, 1),
+        ],
+        region_wg_protocol(),
+    )
+    .unwrap_err();
+    assert!(err.contains("run twice concurrently"), "{err}");
+}
+
+#[test]
+fn same_instance_tiles_outside_the_virtual_grid_are_refused() {
+    for bad in [
+        tile(T_TILE_X, 0, 2, 0, 3, 4, 1), // x 2..5 > gx 4
+        tile(T_TILE_X, 0, 2, 1, 2, 4, 1), // vy 1 >= gy 1
+    ] {
+        let err = tiles(
+            T_TILE_X,
+            vec![tile(T_TILE_X, 0, 0, 0, 2, 4, 1), bad],
+            region_wg_protocol(),
+        )
+        .unwrap_err();
+        assert!(err.contains("outside the record's virtual grid"), "{err}");
+    }
+}
+
+#[test]
+fn a_different_ka_off_of_one_template_still_needs_happens_before() {
+    let records: &[(u32, &[(u32, u64)])] = &[(T_TILE_X, &[(8, X)]), (T_TILE_X, &[(8, X)])];
+    let run = |second: TaskHeader| {
+        build(
+            vec![vec![tile(T_TILE_X, 0, 0, 0, 2, 4, 1), second]],
+            records,
+            vec![vec![T_TILE_X]],
+            Some(region_wg_protocol()),
+            false,
+        )
+        .check()
+    };
+    let err = run(tile(T_TILE_X, 1, 2, 0, 2, 4, 1)).unwrap_err();
+    assert!(err.contains("neither happens-before"), "{err}");
+    // Ordered by an event, the same pair is admitted.
+    let fx = build(
+        vec![vec![t(T_TILE_X, 0, N, 0, 0), t(T_TILE_X, 1, 0, 1, N)]],
+        records,
+        vec![vec![T_TILE_X]],
+        Some(region_wg_protocol()),
+        false,
+    );
+    assert_eq!(fx.check().unwrap().ordered_pairs, 1);
+}
+
+#[test]
+fn the_same_ka_off_cannot_name_two_templates() {
+    // A record has one template: a task naming another is no instance of it.
+    let err = tiles(
+        T_TILE_X,
+        vec![
+            tile(T_TILE_X, 0, 0, 0, 2, 4, 1),
+            tile(T_TILE_XY, 0, 2, 0, 2, 4, 1),
+        ],
+        region_wg_protocol(),
+    )
+    .unwrap_err();
+    assert!(err.contains("names no record of its template"), "{err}");
+}
+
+#[test]
+fn footprint_axes_must_separate_every_workgroup_pair() {
+    let by_y = || {
+        vec![
+            tile(T_TILE_X, 0, 0, 0, 2, 4, 2),
+            tile(T_TILE_X, 0, 0, 1, 2, 4, 2),
+        ]
+    };
+    // Axes {x}: tiles that differ only in y overlap in x: refused.
+    let err = tiles(T_TILE_X, by_y(), region_wg_protocol()).unwrap_err();
+    assert!(
+        err.contains("agree on every footprint axis") && err.contains("(0, 0, 0) and (0, 1, 0)"),
+        "{err}"
+    );
+    // Axes {x, y}: the same tiles differ on y: admitted.
+    let by_y_xy = vec![
+        tile(T_TILE_XY, 0, 0, 0, 2, 4, 2),
+        tile(T_TILE_XY, 0, 0, 1, 2, 4, 2),
+    ];
+    tiles(T_TILE_XY, by_y_xy, region_wg_protocol()).unwrap();
+    // Axes {x}: disjoint x ranges at different y: admitted.
+    let diag = vec![
+        tile(T_TILE_X, 0, 0, 0, 2, 4, 2),
+        tile(T_TILE_X, 0, 2, 1, 2, 4, 2),
+    ];
+    tiles(T_TILE_X, diag, region_wg_protocol()).unwrap();
+}
+
+#[test]
+fn same_instance_writers_without_a_footprint_or_atomics_are_refused() {
+    let two = |tpl| vec![tile(tpl, 0, 0, 0, 2, 4, 1), tile(tpl, 0, 2, 0, 2, 4, 1)];
+    let err = tiles(T_WRITE, two(T_WRITE), region_wg_protocol()).unwrap_err();
+    assert!(
+        err.contains("proves no inter-WG write disjointness"),
+        "{err}"
+    );
+    // Commutative atomics commute across workgroups.
+    tiles(T_ATOM, two(T_ATOM), region_wg_protocol()).unwrap();
+}
+
+#[test]
+fn footprint_assumptions_are_checked_against_the_headers_and_record() {
+    let two = |tpl, gx| vec![tile(tpl, 0, 0, 0, 2, gx, 1), tile(tpl, 0, 2, 0, 2, gx, 1)];
+    tiles(T_TILE_B, two(T_TILE_B, 4), region_wg_protocol()).unwrap();
+    let err = tiles(T_TILE_B, two(T_TILE_B, 8), region_wg_protocol()).unwrap_err();
+    assert!(err.contains("tile-id bound 4"), "{err}");
+    tiles(T_TILE_R, two(T_TILE_R, 4), region_wg_protocol()).unwrap();
+    let err = tiles(T_TILE_Q, two(T_TILE_Q, 4), region_wg_protocol()).unwrap_err();
+    assert!(err.contains("requires record dword +16"), "{err}");
 }
 
 fn pool_args() -> Vec<ArgFact> {
@@ -303,6 +516,8 @@ fn build_with(
                 .collect(),
             scalars: if *template == T_SEALED {
                 vec![(SEALED_BOUND_AT, SEALED_N)]
+            } else if matches!(*template, T_TILE_R | T_TILE_Q) {
+                vec![(16, 0x1_0080)]
             } else {
                 Vec::new()
             },
@@ -849,6 +1064,13 @@ fn headers_parse_from_the_uploaded_bytes() {
         pool.tasks,
         vec![
             TaskHeader {
+                vx: 0,
+                vy: 0,
+                vz: 0,
+                gx: 0,
+                gy: 0,
+                gz: 0,
+                vcount: 0,
                 template: 7,
                 ka_off: 64,
                 pred_event: 3,
@@ -856,6 +1078,13 @@ fn headers_parse_from_the_uploaded_bytes() {
                 done_event: 9
             },
             TaskHeader {
+                vx: 0,
+                vy: 0,
+                vz: 0,
+                gx: 0,
+                gy: 0,
+                gz: 0,
+                vcount: 0,
                 template: 1,
                 ka_off: 0,
                 pred_event: NONE,
