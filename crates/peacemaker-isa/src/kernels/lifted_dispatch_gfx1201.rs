@@ -38,8 +38,8 @@ use peacemaker_lift::rewrite::region::LiftedRegion;
 pub const KERNARG_BYTES: u32 = 72;
 pub const TASK_BYTES: u32 = 128;
 pub const TRACE_BYTES: u32 = 48;
-/// Highest SGPR count a hosted body may use (the dispatcher owns s74..s103).
-pub const BODY_SGPR_LIMIT: u16 = 74;
+/// Highest SGPR count a hosted body may use (the dispatcher owns s72..s103).
+pub const BODY_SGPR_LIMIT: u16 = 72;
 /// The SGPRs that carry the virtual workgroup id (`ttmp9`, `ttmp7`) into a region.
 pub const WG_X: u16 = 102;
 pub const WG_YZ: u16 = 103;
@@ -51,6 +51,7 @@ pub struct Hosted<'a> {
 }
 
 // Dispatcher SGPRs (all above BODY_SGPR_LIMIT).
+const GX: u8 = 72;
 const PTR_A: u8 = 74;
 const T_PUBLISH: u8 = 76;
 const PTR_B: u8 = 78;
@@ -164,10 +165,21 @@ fn add_pieces(
     Ok(())
 }
 
-/// The pool dispatcher `symbol` of workgroup size `block` hosting `hosted`.
-pub fn pool(symbol: &str, block: u32, hosted: &[Hosted]) -> Result<Emitted, String> {
-    if hosted.is_empty() {
+/// The pool dispatcher `symbol` of workgroup size `block` hosting `hosted`, and
+/// with `copy = Some(tmpl)` the PM-emitted COPY template (`copy_body`).
+pub fn pool(
+    symbol: &str,
+    block: u32,
+    hosted: &[Hosted],
+    copy: Option<u32>,
+) -> Result<Emitted, String> {
+    if hosted.is_empty() && copy.is_none() {
         return Err("a pool hosts at least one template".into());
+    }
+    if let Some(c) = copy {
+        if hosted.iter().any(|h| h.tmpl == c) {
+            return Err(format!("tmpl {c} is both COPY and a lifted body"));
+        }
     }
     for h in hosted {
         let r = h.region;
@@ -199,7 +211,11 @@ pub fn pool(symbol: &str, block: u32, hosted: &[Hosted]) -> Result<Emitted, Stri
     let slot_base = body_lds.next_multiple_of(16);
     let lds_total = if multi { slot_base + 64 } else { body_lds };
     let step_label = |t: u32| format!(".Lt{t}_step");
-    let first_step = step_label(hosted[0].tmpl);
+    let first_step = step_label(
+        hosted
+            .first()
+            .map_or_else(|| copy.expect("copy"), |h| h.tmpl),
+    );
     let mut regs = RegPlan::new(256, 104)?;
     // entry: the hardware kernarg pointer and thread id, consumed before the loop
     regs.add_range(
@@ -217,6 +233,7 @@ pub fn pool(symbol: &str, block: u32, hosted: &[Hosted]) -> Result<Emitted, Stri
         Live::Between("entry".into(), ".Lnext".into()),
     )?;
     for (name, base, len) in [
+        ("gx", GX, 1),
         ("ptr_a", PTR_A, 2),
         ("t_publish", T_PUBLISH, 2),
         ("ptr_b", PTR_B, 2),
@@ -292,6 +309,31 @@ pub fn pool(symbol: &str, block: u32, hosted: &[Hosted]) -> Result<Emitted, Stri
             1,
             Live::Between(step, exit),
         )?;
+    }
+    if let Some(c) = copy {
+        // COPY is a PM-emitted region: its inputs stay dispatcher-owned (and unwritten)
+        // through the region; its own registers are s2..s15, v1..v3.
+        let name = format!("t{c}");
+        let (step, entry, exit) = (
+            step_label(c),
+            region_entry_label(&name),
+            region_exit_label(&name),
+        );
+        let between = Live::Between(entry, exit);
+        // through the exit label (live there: the region checks its inputs at its exit)
+        let through = Live::Between(step, ".Lpublish".into());
+        regs.add_range(&format!("{name}_args"), Kind::S, 0, 2, through.clone())?;
+        regs.add_range(&format!("{name}_lane"), Kind::V, 0, 1, through.clone())?;
+        regs.add_range(
+            &format!("{name}_wg_x"),
+            Kind::S,
+            WG_X as u8,
+            1,
+            through.clone(),
+        )?;
+        regs.add_range(&format!("{name}_wg_yz"), Kind::S, WG_YZ as u8, 1, through)?;
+        add_pieces(&mut regs, &format!("{name}_s"), Kind::S, 2, 16, &between)?;
+        add_pieces(&mut regs, &format!("{name}_v"), Kind::V, 1, 4, &between)?;
     }
     let spec = KernelSpec {
         kernel_id: "pm_lift_pool".into(),
@@ -547,6 +589,7 @@ pub fn pool(symbol: &str, block: u32, hosted: &[Hosted]) -> Result<Emitted, Stri
             (KA_OFF, 11),
             (DONE, 14),
             (VCOUNT, 15),
+            (GX, 8),
         ] {
             readfirst(b, dst, src)?;
         }
@@ -567,6 +610,10 @@ pub fn pool(symbol: &str, block: u32, hosted: &[Hosted]) -> Result<Emitted, Stri
                 &[s(TMPL)],
             )?;
             branch(b, &format!("s_cbranch_scc1 .Lt{}_go", h.tmpl))?;
+        }
+        if let Some(c) = copy {
+            op(b, &format!("s_cmp_eq_u32 s{TMPL}, {c:#x}"), &[], &[s(TMPL)])?;
+            branch(b, &format!("s_cbranch_scc1 .Lt{c}_go"))?;
         }
         branch(b, "s_branch .Lpublish")?;
         for h in hosted {
@@ -642,6 +689,80 @@ pub fn pool(symbol: &str, block: u32, hosted: &[Hosted]) -> Result<Emitted, Stri
                     &[s(STEP), s(VCOUNT)],
                 )?;
                 branch(b, &format!("s_cbranch_scc1 {}", step_label(h.tmpl)))
+            })?;
+            b.realtime(S::<2>(T_END))?;
+            b.wait_all()?;
+            branch(b, "s_branch .Lpublish")?;
+        }
+        if let Some(c) = copy {
+            let name = format!("t{c}");
+            b.label(&format!(".Lt{c}_go"))?;
+            op(b, &format!("s_mov_b32 s{STEP}, 0"), &[s(STEP)], &[])?;
+            b.realtime(S::<2>(T_START))?;
+            b.wait_all()?;
+            let abi = RegionAbi {
+                name: name.clone(),
+                inputs: vec![
+                    ("args".into(), sp(0)),
+                    ("lane".into(), v(0)),
+                    ("workgroup_x".into(), s(WG_X as u8)),
+                ],
+                lds_bytes: 0,
+                workgroup_size: block as u16,
+            };
+            b.loop_(&step_label(c), |b| {
+                if multi {
+                    b.barrier(&[])?;
+                }
+                op(
+                    b,
+                    &format!("s_add_co_i32 s{WG_X}, s{VX}, s{STEP}"),
+                    &[s(WG_X as u8)],
+                    &[s(VX), s(STEP)],
+                )?;
+                op(
+                    b,
+                    &format!("s_mov_b32 s{WG_YZ}, s{VYZ}"),
+                    &[s(WG_YZ as u8)],
+                    &[s(VYZ)],
+                )?;
+                smem(
+                    b,
+                    &format!("s_load_b64 s[0:1], s[{PARAMS}:{}], 0x18", PARAMS + 1),
+                    &[sp(0)],
+                    &[sp(PARAMS)],
+                )?;
+                b.wait_all()?;
+                op(
+                    b,
+                    &format!("s_add_co_u32 s0, s0, s{KA_OFF}"),
+                    &[s(0)],
+                    &[s(0), s(KA_OFF)],
+                )?;
+                op(b, "s_add_co_ci_u32 s1, s1, 0", &[s(1)], &[s(1)])?;
+                op(b, "v_mbcnt_lo_u32_b32 v0, -1, 0", &[v(0)], &[])?;
+                op(
+                    b,
+                    &format!("v_add_nc_u32_e32 v0, s{WAVEBASE}, v0"),
+                    &[v(0)],
+                    &[v(0), s(WAVEBASE)],
+                )?;
+                b.wait_all()?;
+                b.region(&abi, |b| copy_body(b, block, &name))?;
+                exec_all(b)?;
+                op(
+                    b,
+                    &format!("s_add_co_i32 s{STEP}, s{STEP}, 1"),
+                    &[s(STEP)],
+                    &[s(STEP)],
+                )?;
+                op(
+                    b,
+                    &format!("s_cmp_lt_u32 s{STEP}, s{VCOUNT}"),
+                    &[],
+                    &[s(STEP), s(VCOUNT)],
+                )?;
+                branch(b, &format!("s_cbranch_scc1 {}", step_label(c)))
             })?;
             b.realtime(S::<2>(T_END))?;
             b.wait_all()?;
@@ -749,4 +870,94 @@ pub fn pool(symbol: &str, block: u32, hosted: &[Hosted]) -> Result<Emitted, Stri
     b.label(".Ldone")?;
     branch(&mut b, "s_endpgm")?;
     b.finish()
+}
+
+/// COPY (`M0CopyArgs {u64 dst, u64 src, u64 bytes}` at the task's kernarg block):
+/// virtual workgroup `w` of `gx` copies dwords `w * block + t + k * gx * block` below
+/// `bytes / 4`; virtual workgroup 0 copies the `bytes % 4` tail. `src`/`dst` must not
+/// overlap; `bytes < 2^32`. The body's registers are s0..s15, v0..v3 (the region's).
+fn copy_body(b: &mut Builder, block: u32, name: &str) -> Result<(), String> {
+    let (wx, nb) = (WG_X as u8, block);
+    smem(
+        b,
+        "s_load_b128 s[4:7], s[0:1], 0x0",
+        &[sp(4), sp(6)],
+        &[sp(0)],
+    )?;
+    smem(b, "s_load_b32 s8, s[0:1], 0x10", &[s(8)], &[sp(0)])?;
+    op(
+        b,
+        &format!("s_mul_i32 s10, s{GX}, {nb:#x}"),
+        &[s(10)],
+        &[s(GX)],
+    )?;
+    op(
+        b,
+        &format!("s_mul_i32 s11, s{wx}, {nb:#x}"),
+        &[s(11)],
+        &[s(wx)],
+    )?;
+    op(b, "v_add_nc_u32_e32 v1, s11, v0", &[v(1)], &[s(11), v(0)])?;
+    op(b, "s_lshr_b32 s9, s8, 2", &[s(9)], &[s(8)])?;
+    b.wait_all()?;
+    let (head, tail, end) = (
+        format!(".L{name}_copy"),
+        format!(".L{name}_tail"),
+        format!(".L{name}_end"),
+    );
+    b.loop_(&head, |b| {
+        // lanes past the last dword drop out of EXEC for good
+        op(b, "v_cmpx_gt_u32_e32 s9, v1", &[], &[s(9), v(1)])?;
+        branch(b, &format!("s_cbranch_execz {tail}"))?;
+        op(b, "v_lshlrev_b32_e32 v2, 2, v1", &[v(2)], &[v(1)])?;
+        b.push(
+            Instruction::new(
+                "global_load_b32 v3, v2, s[6:7]",
+                vec![v(3)],
+                vec![v(2), sp(6)],
+            )
+            .memory(MemoryClass::VmemLoad),
+        )?;
+        b.push(
+            Instruction::new(
+                "global_store_b32 v2, v3, s[4:5]",
+                vec![],
+                vec![v(2), v(3), sp(4)],
+            )
+            .memory(MemoryClass::VmemStore),
+        )?;
+        op(b, "v_add_nc_u32_e32 v1, s10, v1", &[v(1)], &[s(10), v(1)])?;
+        b.release_store_sources()?;
+        branch(b, &format!("s_branch {head}"))
+    })?;
+    b.label(&tail)?;
+    exec_all(b)?;
+    op(b, "s_and_b32 s12, s8, 3", &[s(12)], &[s(8)])?;
+    // tail only when bytes % 4 != 0, by virtual workgroup 0 (s12 != 0 and wx == 0)
+    op(b, "s_cmp_eq_u32 s12, 0", &[], &[s(12)])?;
+    branch(b, &format!("s_cbranch_scc1 {end}"))?;
+    op(b, &format!("s_cmp_lg_u32 s{wx}, 0"), &[], &[s(wx)])?;
+    branch(b, &format!("s_cbranch_scc1 {end}"))?;
+    op(b, "v_cmpx_gt_u32_e32 s12, v0", &[], &[s(12), v(0)])?;
+    branch(b, &format!("s_cbranch_execz {end}"))?;
+    op(b, "s_and_b32 s14, s8, -4", &[s(14)], &[s(8)])?;
+    op(b, "v_add_nc_u32_e32 v2, s14, v0", &[v(2)], &[s(14), v(0)])?;
+    b.push(
+        Instruction::new(
+            "global_load_u8 v3, v2, s[6:7]",
+            vec![v(3)],
+            vec![v(2), sp(6)],
+        )
+        .memory(MemoryClass::VmemLoad),
+    )?;
+    b.push(
+        Instruction::new(
+            "global_store_b8 v2, v3, s[4:5]",
+            vec![],
+            vec![v(2), v(3), sp(4)],
+        )
+        .memory(MemoryClass::VmemStore),
+    )?;
+    b.label(&end)?;
+    b.wait_all()
 }

@@ -13,6 +13,9 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+/// MegaM0's COPY template id.
+pub const COPY_TMPL: u32 = 2;
+
 /// One template: its id, MegaM0 name, eager symbol, blockDim, conversion (or the
 /// refused obligation) and the object it came from.
 pub struct Converted {
@@ -118,7 +121,9 @@ pub fn build_pools(
                     region: c.region.as_ref().expect("converted"),
                 })
                 .collect();
-            let elf = ld::pool(&symbol, b, &hosted)
+            // COPY (tmpl 2, M0CopyArgs) is hosted by the 256-thread pool
+            let copy = (b == 256).then_some(COPY_TMPL);
+            let elf = ld::pool(&symbol, b, &hosted, copy)
                 .and_then(|e| native::assemble(&e.s_text, Arch::Gfx1201))
                 .and_then(|elf| {
                     for h in &hosted {

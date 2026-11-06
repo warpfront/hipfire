@@ -54,6 +54,18 @@ fn main() {
     for tmpl in t.as_array().expect("array") {
         let tid = tmpl["tid"].as_u64().unwrap_or(0) as u32;
         let mut row = tmpl.clone();
+        if tid == lift_common::COPY_TMPL {
+            if let Some((pool, symbol, file)) = pool_of.values().find(|(p, _, _)| p == "b256") {
+                row["mode"] = json!("PM_NATIVE");
+                row["legal"] = json!(true);
+                row["reason"] =
+                    json!("PM-emitted COPY region (M0CopyArgs {u64 dst, u64 src, u64 bytes})");
+                row["card_verified"] = json!(verified.contains(&tid));
+                row["pool"] = json!(pool);
+                row["pool_symbol"] = json!(symbol);
+                row["kernel"] = json!(file);
+            }
+        }
         let Some(c) = converted.iter().find(|c| c.tid == tid) else {
             rows.push(row);
             continue;

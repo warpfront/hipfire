@@ -818,6 +818,7 @@ fn lifted_shipped_mq2_module_runs_as_a_p0_pool_region_on_the_emulator() {
             tmpl: 5,
             region: &region,
         }],
+        None,
     )
     .unwrap();
     let elf = native::assemble(&pool.s_text, Arch::Gfx1201).unwrap();

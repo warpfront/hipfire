@@ -451,6 +451,7 @@ fn run_case(
                     tmpl: case.tid,
                     region: &region,
                 }],
+                None,
             )?;
             std::fs::write(
                 out.join(format!("p0_r6_{}_{}.s", case.tid, case.name)),
@@ -615,6 +616,74 @@ fn run_case(
     }))
 }
 
+/// COPY (tmpl 2) inside the shared 256-thread pool against the host's bytes.
+fn copy_check(card: &Card, symbol: &str, elf: &[u8]) -> Result<Value, String> {
+    let mut rng = Lcg(0xc0ffee);
+    let bytes = 1_234_571usize; // a 3-byte tail
+    let src: Vec<u8> = (0..bytes).map(|_| rng.next() as u8).collect();
+    let (ds, dd) = (card.upload(&src)?, card.upload(&vec![0xa5; bytes + 64])?);
+    let mut ka = Vec::new();
+    for v in [dd.as_ptr() as u64, ds.as_ptr() as u64, bytes as u64] {
+        ka.extend(v.to_le_bytes());
+    }
+    let gx = 64u32;
+    let mut tasks = Vec::new();
+    for x in (0..gx).step_by(4) {
+        let mut t = [0u32; 32];
+        t[..12].copy_from_slice(&[
+            lift_common::COPY_TMPL,
+            x,
+            0,
+            0,
+            gx,
+            1,
+            1,
+            0,
+            u32::MAX,
+            0,
+            0,
+            4,
+        ]);
+        tasks.extend(t.iter().flat_map(|w| w.to_le_bytes()));
+    }
+    let n_tasks = (tasks.len() / 128) as u32;
+    let (dt, ticket, events, kargs, trace, poison) = (
+        card.upload(&tasks)?,
+        card.upload(&[0u8; 4])?,
+        card.upload(&[0u8; 16])?,
+        card.upload(&ka)?,
+        card.upload(&vec![0u8; n_tasks as usize * 48])?,
+        card.upload(&[0u8; 4])?,
+    );
+    let mut params = Vec::new();
+    for p in [&dt, &ticket, &events, &kargs, &trace, &poison] {
+        params.extend((p.as_ptr() as u64).to_le_bytes());
+    }
+    params.extend(1_000_000u64.to_le_bytes());
+    params.extend(n_tasks.to_le_bytes());
+    params.extend(1u32.to_le_bytes());
+    params.resize(ld::KERNARG_BYTES as usize, 0);
+    let f = card.function(elf, symbol)?;
+    card.launch(&f, [8, 1, 1], 256, &mut params)?;
+    let got = card.read(&dd, bytes + 64)?;
+    let ev = u32::from_le_bytes(card.read(&events, 4)?[..4].try_into().unwrap());
+    let pz = u32::from_le_bytes(card.read(&poison, 4)?[..4].try_into().unwrap());
+    let bad = got[..bytes]
+        .iter()
+        .zip(&src)
+        .filter(|(a, b)| a != b)
+        .count();
+    let overrun = got[bytes..].iter().filter(|&&b| b != 0xa5).count();
+    for d in [ds, dd, dt, ticket, events, kargs, trace, poison] {
+        card.rt.free(d).map_err(|e| e.to_string())?;
+    }
+    let pass = bad == 0 && overrun == 0 && ev == n_tasks && pz == 0;
+    Ok(
+        json!({"tid": lift_common::COPY_TMPL, "name": "copy", "pool_symbol": symbol, "bytes": bytes,
+        "tasks": n_tasks, "mismatched_bytes": bad, "overrun_bytes": overrun, "events0": ev, "poison": pz, "pass": pass}),
+    )
+}
+
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -687,6 +756,13 @@ fn main() {
             "kernel": if pass { Value::String(format!("p0_r6_{tid}_{name}.co")) } else { Value::Null },
             "pool_symbol": r["pool_symbol"],
         }));
+        results.push(r);
+    }
+    if let Some((_, (symbol, elf))) = shared.iter().find(|(b, _)| *b == 256) {
+        let r = copy_check(&card, symbol, elf)
+            .unwrap_or_else(|e| json!({"tid": 2, "name": "copy", "pass": false, "error": e}));
+        println!("{r}");
+        all &= r["pass"] == true;
         results.push(r);
     }
     std::fs::write(

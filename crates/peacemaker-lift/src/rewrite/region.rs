@@ -110,6 +110,8 @@ pub struct RegionReceipt {
 #[derive(Clone, Debug)]
 pub struct LiftedRegion {
     pub symbol: String,
+    /// The inputs it was converted with (a re-derivation repeats the conversion).
+    pub inputs: RegionInputs,
     pub lines: Vec<String>,
     pub quiesce_label: String,
     pub block: u32,
@@ -487,6 +489,7 @@ fn convert(
     };
     Ok(LiftedRegion {
         symbol: symbol.into(),
+        inputs: inputs.clone(),
         lines,
         quiesce_label: quiesce,
         block: inputs.block,

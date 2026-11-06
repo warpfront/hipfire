@@ -92,6 +92,7 @@ fn main() {
                                     tmpl: tmpl["tid"].as_u64().unwrap_or(0) as u32,
                                     region: &r,
                                 }],
+                                None,
                             )?;
                             let elf = peacemaker_isa::native::assemble(
                                 &e.s_text,
