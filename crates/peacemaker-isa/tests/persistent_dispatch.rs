@@ -893,57 +893,65 @@ fn lifted_shipped_mq2_module_runs_as_a_p0_pool_region_on_the_emulator() {
     let n_tasks = (tasks.len() / 128) as u32;
     const TASKS: u64 = 0xb00_0000;
     const PARAMS: u64 = 0xc00_0000;
-    let mut params = Vec::new();
-    for p in [TASKS, QUEUE, QUEUE + 16, KARG, QUEUE + 64, QUEUE + 32] {
-        params.extend(p.to_le_bytes());
-    }
-    params.extend(1000u64.to_le_bytes());
-    params.extend(n_tasks.to_le_bytes());
-    params.extend(1u32.to_le_bytes());
-    params.resize(ld::KERNARG_BYTES as usize, 0);
-    let mut mem = Memory::default();
-    mem.map("karg".into(), KARG, karg).unwrap();
-    mem.map("a".into(), A, a).unwrap();
-    mem.map("x".into(), X, x).unwrap();
-    mem.map("y".into(), Y, vec![0xa5; b * m * 4]).unwrap();
-    mem.map("tasks".into(), TASKS, tasks).unwrap();
-    mem.map("queue".into(), QUEUE, vec![0; 64 + n_tasks as usize * 48])
-        .unwrap();
-    mem.map("params".into(), PARAMS, params).unwrap();
-    for wg in 0..2u32 {
-        emu.run_workgroup(
-            &Launch {
-                kernarg_ptr: PARAMS,
-                workgroup: [wg, 0, 0],
-                block: [32, 1, 1],
-                dynamic_lds: 0,
-            },
-            &mut mem,
-        )
-        .unwrap_or_else(|e| panic!("pool workgroup {wg}: {e}"));
-    }
-    assert_eq!(
-        mem.read(Y, b * m * 4).unwrap(),
-        &want[..],
-        "pool output != standalone"
-    );
-    let q = mem
-        .read(QUEUE, 64 + n_tasks as usize * 48)
-        .unwrap()
-        .to_vec();
-    let word = |o: usize| u32::from_le_bytes(q[o..o + 4].try_into().unwrap());
-    assert_eq!(
-        word(0),
-        n_tasks + 2,
-        "claims: every task plus one stop per workgroup"
-    );
-    assert_eq!(
-        word(16),
-        n_tasks,
-        "events[0]: one release increment per task"
-    );
-    assert_eq!(word(32), 0, "poison");
-    for i in 0..n_tasks as usize {
-        assert_eq!(word(64 + i * 48), i as u32, "trace record {i}");
+    for trace_on in [1u32, 0] {
+        let mut params = Vec::new();
+        for p in [TASKS, QUEUE, QUEUE + 16, KARG, QUEUE + 64, QUEUE + 32] {
+            params.extend(p.to_le_bytes());
+        }
+        params.extend(1000u64.to_le_bytes());
+        params.extend(n_tasks.to_le_bytes());
+        params.extend(trace_on.to_le_bytes());
+        params.resize(ld::KERNARG_BYTES as usize, 0);
+        let mut mem = Memory::default();
+        mem.map("karg".into(), KARG, karg.clone()).unwrap();
+        mem.map("a".into(), A, a.clone()).unwrap();
+        mem.map("x".into(), X, x.clone()).unwrap();
+        mem.map("y".into(), Y, vec![0xa5; b * m * 4]).unwrap();
+        mem.map("tasks".into(), TASKS, tasks.clone()).unwrap();
+        mem.map("queue".into(), QUEUE, vec![0; 64 + n_tasks as usize * 48])
+            .unwrap();
+        mem.map("params".into(), PARAMS, params).unwrap();
+        for wg in 0..2u32 {
+            emu.run_workgroup(
+                &Launch {
+                    kernarg_ptr: PARAMS,
+                    workgroup: [wg, 0, 0],
+                    block: [32, 1, 1],
+                    dynamic_lds: 0,
+                },
+                &mut mem,
+            )
+            .unwrap_or_else(|e| panic!("pool workgroup {wg}: {e}"));
+        }
+        assert_eq!(
+            mem.read(Y, b * m * 4).unwrap(),
+            &want[..],
+            "trace_on {trace_on}: pool output != standalone"
+        );
+        let q = mem
+            .read(QUEUE, 64 + n_tasks as usize * 48)
+            .unwrap()
+            .to_vec();
+        let word = |o: usize| u32::from_le_bytes(q[o..o + 4].try_into().unwrap());
+        assert_eq!(
+            word(0),
+            n_tasks + 2,
+            "claims: every task plus one stop per workgroup"
+        );
+        assert_eq!(
+            word(16),
+            n_tasks,
+            "events[0]: one release increment per task"
+        );
+        assert_eq!(word(32), 0, "poison");
+        for i in 0..n_tasks as usize {
+            // trace off (the timing configuration) leaves the records untouched
+            let want = if trace_on == 1 { i as u32 } else { 0 };
+            assert_eq!(
+                word(64 + i * 48),
+                want,
+                "trace_on {trace_on}: trace record {i}"
+            );
+        }
     }
 }

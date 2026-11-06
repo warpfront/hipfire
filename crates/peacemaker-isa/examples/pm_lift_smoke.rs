@@ -492,7 +492,7 @@ fn run_case(card: &Card, objects: &Path, case: Case, shared: &SharedPool) -> Res
     }
     params.extend(1_000_000u64.to_le_bytes());
     params.extend(n_tasks.to_le_bytes());
-    params.extend(1u32.to_le_bytes());
+    params.extend(u32::from(trace_on()).to_le_bytes());
     params.resize(ld::KERNARG_BYTES as usize, 0);
     let pool_fn = card.function(&pool_elf, &pool_symbol)?;
     let workers = n_tasks.min(
@@ -553,7 +553,7 @@ fn run_case(card: &Card, objects: &Path, case: Case, shared: &SharedPool) -> Res
         && ev == n_tasks
         && pz == 0
         && tk == n_tasks + workers
-        && traced == n_tasks as usize;
+        && traced == if trace_on() { n_tasks as usize } else { 0 };
     for d in d_solo
         .into_iter()
         .chain(d_pool)
@@ -627,7 +627,7 @@ fn copy_check(card: &Card, symbol: &str, elf: &[u8]) -> Result<Value, String> {
     }
     params.extend(1_000_000u64.to_le_bytes());
     params.extend(n_tasks.to_le_bytes());
-    params.extend(1u32.to_le_bytes());
+    params.extend(u32::from(trace_on()).to_le_bytes());
     params.resize(ld::KERNARG_BYTES as usize, 0);
     let f = card.function(elf, symbol)?;
     card.run_blob_sync(&f, [8, 1, 1], 256, &mut params)?;
@@ -648,6 +648,11 @@ fn copy_check(card: &Card, symbol: &str, elf: &[u8]) -> Result<Value, String> {
         json!({"tid": lift_common::COPY_TMPL, "name": "copy", "pool_symbol": symbol, "bytes": bytes,
         "tasks": n_tasks, "mismatched_bytes": bad, "overrun_bytes": overrun, "events0": ev, "poison": pz, "pass": pass}),
     )
+}
+
+/// `LIFT_TRACE=0` runs the pools with the trace off (MegaM0's timing configuration).
+fn trace_on() -> bool {
+    std::env::var("LIFT_TRACE").map_or(true, |v| v != "0")
 }
 
 fn hex(b: &[u8]) -> String {
