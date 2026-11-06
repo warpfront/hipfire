@@ -315,6 +315,8 @@ struct Q {
     /// Dequantized host weights (q * s).
     down_dq: Vec<f32>,
     up_dq: Vec<f32>,
+    /// Row-major 8-bit bytes and row scales (fixture dump).
+    raw: [(Vec<u8>, Vec<f32>); 2],
 }
 
 fn build_q(gpu: &mut Gpu, hc: &Hc, fmt: Hc8Fmt) -> R<Q> {
@@ -328,6 +330,7 @@ fn build_q(gpu: &mut Gpu, hc: &Hc, fmt: Hc8Fmt) -> R<Q> {
     let up = Hc8Weight::upload(gpu, fmt, &swizzle_hc8(&up_q, WIDE, RANK), &up_s, WIDE, RANK).map_err(es)?;
     Ok(Q {
         fmt,
+        raw: [(dq_q.clone(), dq_s.clone()), (up_q.clone(), up_s.clone())],
         down_dq: dequant_rowmajor(fmt, &dq_q, &dq_s, RANK, WIDE),
         up_dq: dequant_rowmajor(fmt, &up_q, &up_s, WIDE, RANK),
         down,
@@ -342,6 +345,7 @@ struct Cli {
     calls: usize,
     warm: usize,
     out: Option<PathBuf>,
+    fixtures: Option<PathBuf>,
 }
 
 fn parse_cli() -> R<Cli> {
@@ -352,6 +356,7 @@ fn parse_cli() -> R<Cli> {
         calls: 40,
         warm: 3,
         out: None,
+        fixtures: None,
     };
     let mut have = false;
     let mut it = std::env::args().skip(1);
@@ -372,6 +377,7 @@ fn parse_cli() -> R<Cli> {
             }
             "--calls" => cli.calls = v("--calls")?.parse().map_err(es)?,
             "--warm" => cli.warm = v("--warm")?.parse().map_err(es)?,
+            "--dump-fixtures" => cli.fixtures = Some(PathBuf::from(v("--dump-fixtures")?)),
             "--out" => cli.out = Some(PathBuf::from(v("--out")?)),
             o => return Err(format!("unknown argument {o}")),
         }
@@ -452,6 +458,27 @@ fn run_hc(
     let low1: Vec<GpuTensor> = (0..nmax)
         .map(|r| upload_f32(gpu, &low_h[r * RANK..(r + 1) * RANK]))
         .collect::<R<_>>()?;
+    if let Some(dir) = &cli.fixtures {
+        std::fs::create_dir_all(dir).map_err(es)?;
+        let f32le = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        for q in qs {
+            for (i, (fam, m, k, x)) in [("down", RANK, WIDE, &xn_h), ("up", WIDE, RANK, &low_h.to_vec())]
+                .into_iter()
+                .enumerate()
+            {
+                let base = dir.join(format!("{}_{}_{}", hc.name, fam, q.fmt.name()));
+                let w = |ext: &str, b: &[u8]| std::fs::write(format!("{}.{ext}", base.display()), b).map_err(es);
+                w("q.u8", &q.raw[i].0)?;
+                w("s.f32", &f32le(&q.raw[i].1))?;
+                w("x.f32", &f32le(&x[..MAX_ROWS * k]))?;
+                let js = json!({"m": m, "k": k, "fmt": q.fmt.name(), "rows": MAX_ROWS, "tensor": format!("{}_{fam}", hc.name),
+                    "q": format!("{}.q.u8", base.display()), "scales": format!("{}.s.f32", base.display()),
+                    "x": format!("{}.x.f32", base.display())});
+                w("json", js.to_string().as_bytes())?;
+            }
+        }
+        println!("fixtures written to {}", dir.display());
+    }
     struct Refs {
         down_set: Vec<f32>,
         down_act: Vec<f32>,
