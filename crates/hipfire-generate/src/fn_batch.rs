@@ -502,22 +502,16 @@ fn adopt_promoted(
 }
 
 /// The wire class and retryability of a failed lane step: a mapping refusal
-/// ([`PROVISION_MAP_REFUSED`], the lane could not commit the device pages its context needs) or a
+/// ([`PROVISION_MAP_REFUSED`], the lane could not commit the device pages its context needs), a
 /// page-budget refusal ([`LANE_PAGE_BUDGET_REFUSED`], the request can never fit the free device
-/// pages) is a capacity condition, answered `overload` + retryable (HTTP 503, the request may be
-/// retried when other lanes finish); every other failure keeps the caller's class and is not
-/// retryable.
-/// The HIP runtime's out-of-memory text (a lane step that ran out of device memory outside a context map).
-const DEVICE_OUT_OF_MEMORY: &str = "out of memory";
-
+/// pages) or a device out-of-memory failure outside a context map is a capacity condition, answered
+/// `overload` + retryable (HTTP 503, the request may be retried when other lanes finish); every
+/// other failure keeps the caller's class and is not retryable.
 fn lane_error_wire<'a>(message: &str, class: &'a str) -> (&'a str, bool) {
-    if message.contains(PROVISION_MAP_REFUSED)
-        || message.contains(LANE_PAGE_BUDGET_REFUSED)
-        || message.contains(DEVICE_OUT_OF_MEMORY)
-    {
+    if message.contains(PROVISION_MAP_REFUSED) || message.contains(LANE_PAGE_BUDGET_REFUSED) {
         ("overload", true)
     } else {
-        (class, false)
+        crate::common::fail_closed_wire(message, class, false)
     }
 }
 

@@ -11200,7 +11200,8 @@ fn qwen4_pp_mtp_parts<'a>(
 pub enum SpecPrefillTerminal {
     /// The client aborted mid-prefill: a cancel, never a validation error.
     Cancelled,
-    /// A real prefill failure: the fail-closed `validation` error.
+    /// A real prefill failure: the fail-closed `validation` error (a device out-of-memory one
+    /// answers a retryable `overload`, [`crate::common::fail_closed_wire`]).
     Failed(String),
 }
 

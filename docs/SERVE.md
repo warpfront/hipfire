@@ -786,7 +786,9 @@ emits an OpenAI-shaped SSE `data: {"error": {...}}` frame followed by
 `data: [DONE]`, so a streaming client always sees a terminal event instead of
 a silently truncated `200`. Non-streaming failures keep the typed
 status mapping (`400` request/config, `503` + `Retry-After` overload or
-transient, `500` internal).
+transient, `500` internal). A request the device ran out of memory for
+(`hipMalloc` / `hipMemCreate: out of memory` anywhere in its message) is an
+`overload` (`503`, retryable), never a `400`.
 
 Loads whose ack reports `cache_capable: true`, or whose route is continuous-batch
 capable, skip the per-request `reset` so multi-turn longest-common-prefix reuse
@@ -922,7 +924,13 @@ request run alone on the singleton route. **Default off, experimental.**
   row budget per step is `serve.max_batch_tokens`. The QSA context backend must
   be VMM and the lane store must fit the free device memory; otherwise the
   load logs `[daemon] qwen4 lanes refused: <reason> — fallback to sequential`
-  and serves the singleton route exactly as before. With
+  and serves the singleton route exactly as before. A single-card load that
+  asks for lanes reserves the lane store (every slot's state and its first
+  context pages) beside the singleton's census before it places the experts
+  (load log `qwen4 lane store: <N> MiB reserved beside the census ...`), so a
+  burst of lanes and the singleton's long-prompt prefill scratch and context
+  never compete for the same free memory; the price is that many MiB fewer
+  device-resident experts. With
   `continuous_batch_size >= 2` but `serve.vmm_batch` off the load logs
   `[daemon] qwen4 lanes need serve.vmm_batch — fallback to sequential` and
   advertises `continuous_batch_capable: false`.
@@ -950,6 +958,10 @@ request run alone on the singleton route. **Default off, experimental.**
   units from a measured model of the shared step (an AR row costs its
   proportional share of an all-AR step; a window adds its verify rows'
   marginal cost), so a lane whose drafts do not pay falls back to AR rows.
+  EP mesh lanes run without it by default and route their draft depth from
+  their own agreement (`HIPFIRE_QWEN4_EP_LANE_AR_FLOOR=1` restores it, see
+  [env-vars.md](env-vars.md)): it retired single lanes of a code C8 burst that
+  were emitting three tokens per step, leaving one stream to finish alone.
 - **Exact per lane:** every MTP lane window is byte-identical to the one
   singleton window it takes (a batched window at the lane's draft depth, or
   the singleton's AR step), on the lane's own states. Stateful stages (PLE

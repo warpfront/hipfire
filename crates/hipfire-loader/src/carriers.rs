@@ -892,7 +892,7 @@ impl Carrier for Qwen4Carrier {
         let native_mtp = native_mtp && dflash_draft.is_none();
         let meta = resolve_source_meta(&src, ctx.path)?;
         let shared = Qwen4RankShared {
-            continuous_batch: ctx.batch_request.lanes().is_some(),
+            batch: ctx.batch_request,
             path: ctx.path.to_string(),
             max_seq: ctx.max_seq,
             sequence: ctx.sequence,
@@ -1460,10 +1460,13 @@ pub struct Qwen4RankShared {
     /// rank attaches its own head).
     pub native_mtp: bool,
     pub max_k: usize,
-    /// The load requests continuous batching (the daemon stages lanes after
-    /// the load): decode-share is single-stream and refuses (a lane needs a
-    /// scratch bank of its own). `false` for every caller that stages no lanes.
-    pub continuous_batch: bool,
+    /// The load's continuous-batching request (the daemon stages lanes after the load when it
+    /// asks for them, [`hipfire_runtime::loader_api::BatchLoadRequest::lanes`]): decode-share is
+    /// single-stream and refuses (a lane needs a scratch bank of its own), and a single-device
+    /// load reserves the lane store beside its census (`qwen4_single_lane_store_bytes`). The
+    /// default (no lanes) for every
+    /// caller that stages no lanes.
+    pub batch: hipfire_runtime::loader_api::BatchLoadRequest,
 }
 
 /// The source model's tokenizer and chat template, from which a session
@@ -4444,6 +4447,58 @@ fn qwen4_ep_lane_request(
     })
 }
 
+/// Device bytes a single-device Qwen4 load reserves for the continuous-batch lane store the
+/// daemon stages after it (`batch_staging::stage_qwen4_lanes`, topology `single`); `0` without a
+/// lane request ([`hipfire_runtime::loader_api::BatchLoadRequest::lanes`]) or off the VMM
+/// backend, which the staging refuses.
+/// The figure is the census the lane page budget earmarks for slots it has not allocated yet
+/// ([`hipfire_arch_qwen4::ep::ep_lane_store_device_bytes`] at the charged rows
+/// [`hipfire_arch_qwen4::ep::ep_lane_commit_rows`] of the load's prefill chunk) for the store the
+/// staging builds: native-MTP lanes of draft depth `max_k` clamped to the lane ring when the load
+/// attaches the MTP head (`native_mtp`; a developer `serve.batch_spec=false` then stages the
+/// smaller AR store inside the reservation), no copy lane (single-card lanes stay copy-off).
+fn qwen4_single_lane_store_bytes(
+    shared: &Qwen4RankShared,
+    config: &hipfire_arch_qwen4::Qwen4Config,
+    state_format: hipfire_arch_qwen4::Qwen4StateFormat,
+    chunk_rows: usize,
+    native_mtp: bool,
+) -> Result<u64, String> {
+    let Some(lanes) = shared.batch.lanes() else {
+        return Ok(0);
+    };
+    if shared.backend != hipfire_arch_qwen4::Qwen4KvBackend::Vmm {
+        return Ok(0);
+    }
+    let row_budget = hipfire_arch_qwen4::ep::ep_lane_row_budget(shared.batch.row_budget, lanes);
+    let spec_k = native_mtp.then(|| {
+        shared
+            .max_k
+            .min(hipfire_arch_qwen4::gpu_forward_lanes::LANE_MAX_ROWS - 1)
+            .max(1)
+    });
+    let charge_rows = hipfire_arch_qwen4::ep::ep_lane_commit_rows(chunk_rows);
+    let bytes = hipfire_arch_qwen4::ep::ep_lane_store_device_bytes(
+        config,
+        state_format,
+        shared.backend,
+        shared.max_seq,
+        charge_rows,
+        shared.vmm_granularity,
+        lanes,
+        row_budget,
+        spec_k,
+        None,
+    )
+    .ok_or("qwen4: single-device lane store device bytes overflow")?;
+    eprintln!(
+        "  qwen4 lane store: {} MiB reserved beside the census for {lanes} lanes ({charge_rows} rows charged per lane context, {}, row budget {row_budget})",
+        bytes >> 20,
+        spec_k.map_or_else(|| "AR lanes".to_string(), |k| format!("MTP lanes K={k}")),
+    );
+    Ok(bytes)
+}
+
 // ---------------------------------------------------------------------------
 // EP reserve decoupling (opt-in `HIPFIRE_EP_RESERVE_DECOUPLE=1`)
 //
@@ -6853,8 +6908,27 @@ fn load_qwen4_rank_unscoped(
     let overlay_extra_bytes = trunk_overlay.as_ref().map_or(0u64, |overlay| {
         u64::try_from(overlay.net_extra_bytes()).unwrap_or(0)
     });
+    // A single-device load that stages continuous-batch lanes reserves the lane store beside the
+    // census, as an expert-parallel split does (`Qwen4EpPlacementAt::lane`): without it the hot
+    // set leaves free only what the singleton's census charges, the store's slots then take the
+    // singleton's lazily allocated prefill scratch and long context (or the other way round), and
+    // whichever comes second runs the device out of memory (cp9 j8160).
+    let lane_store_bytes = if ep.is_none() && band.is_none() {
+        qwen4_single_lane_store_bytes(
+            shared,
+            &config,
+            state_format,
+            placement_chunk,
+            placement_native_mtp,
+        )?
+    } else {
+        0
+    };
     let placement_inputs = placement_inputs.map(|mut inputs| {
-        inputs.0 = inputs.0.saturating_add(overlay_extra_bytes);
+        inputs.0 = inputs
+            .0
+            .saturating_add(overlay_extra_bytes)
+            .saturating_add(lane_store_bytes);
         inputs
     });
     // Decode-share `on` (verdict change 4): an admitted load charges only the
@@ -7291,7 +7365,7 @@ fn load_qwen4_rank_unscoped(
             dflash: ctx.spec.dflash == Some(true),
             offload_exec: hipfire_config::memory::offload_exec_explicit(),
             d2_default_forced: hipfire_config::memory::qwen4_d2_default() == Some(true),
-            continuous_batch: shared.continuous_batch,
+            continuous_batch: shared.batch.lanes().is_some(),
             prefill_chunk: placement_chunk,
         };
         match hipfire_arch_qwen4::decode_share::decode_share_admission(&facts) {
@@ -10522,7 +10596,7 @@ fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedMode
     let max_k = qwen4_native_mtp_k(ctx.spec, &ctx.gpu.arch);
     let meta = resolve_source_meta(&src, ctx.path)?;
     let shared = Qwen4RankShared {
-        continuous_batch: false,
+        batch: Default::default(),
         path: ctx.path.to_string(),
         max_seq: ctx.max_seq,
         sequence: None,
