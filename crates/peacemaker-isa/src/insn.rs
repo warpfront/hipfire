@@ -479,6 +479,151 @@ impl Wmma {
         ))
     }
 }
+/// How one `v_fma_mix_*` source is read: a full F32, or the low / high F16 half of the register
+/// (`op_sel_hi[i]` selects F16, `op_sel[i]` the half).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MixWidth {
+    F32,
+    F16Lo,
+    F16Hi,
+}
+/// A `v_fma_mix_*` source value: a VGPR or the inline constant 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MixValue {
+    Reg(V<1>),
+    Zero,
+}
+/// One typed `v_fma_mix_*` source: value, width and the VOP3P `neg` source modifier (printed `-v1`, and
+/// `neg(0)` for the negated inline zero, the `-0.0` addend of the exact single-rounded product). The absolute-value
+/// modifier (`NEG_HI`, `|v1|`) is not exposed: the native writer rejects it for packed sources.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MixSrc {
+    pub value: MixValue,
+    pub width: MixWidth,
+    pub neg: bool,
+}
+impl MixSrc {
+    pub fn f32(v: V<1>) -> Self {
+        Self {
+            value: MixValue::Reg(v),
+            width: MixWidth::F32,
+            neg: false,
+        }
+    }
+    pub fn f16_lo(v: V<1>) -> Self {
+        Self {
+            width: MixWidth::F16Lo,
+            ..Self::f32(v)
+        }
+    }
+    pub fn f16_hi(v: V<1>) -> Self {
+        Self {
+            width: MixWidth::F16Hi,
+            ..Self::f32(v)
+        }
+    }
+    /// The inline constant 0 as an F32 source.
+    pub fn zero() -> Self {
+        Self {
+            value: MixValue::Zero,
+            width: MixWidth::F32,
+            neg: false,
+        }
+    }
+    pub fn neg(self) -> Self {
+        Self { neg: true, ..self }
+    }
+    fn text(self) -> Result<String, String> {
+        Ok(match self.value {
+            MixValue::Reg(v) => {
+                let r = v.reg().to_string();
+                if self.neg {
+                    format!("-{r}")
+                } else {
+                    r
+                }
+            }
+            MixValue::Zero => {
+                if self.width != MixWidth::F32 {
+                    return Err("the inline zero of v_fma_mix is an F32 source".into());
+                }
+                if self.neg { "neg(0)" } else { "0" }.into()
+            }
+        })
+    }
+}
+/// The three `v_fma_mix` opcodes: `F32` writes a full F32 result, `Lo` / `Hi` round the fused result to F16 into the
+/// low / high half of `dst` and keep the other half.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FmaMix {
+    F32,
+    Lo,
+    Hi,
+}
+impl FmaMix {
+    pub fn mnemonic(self) -> &'static str {
+        match self {
+            Self::F32 => "v_fma_mix_f32",
+            Self::Lo => "v_fma_mixlo_f16",
+            Self::Hi => "v_fma_mixhi_f16",
+        }
+    }
+    /// `dst = fma(a, b, c)` with mixed-width sources, one rounding. RDNA only; the emulator's measured domain
+    /// (`peacemaker_ir::emu::alu`, gfx1151 gids 93..=101 and gfx1201 gids 95..=103) is the numerics contract.
+    /// `Lo` / `Hi` also read `dst` (the preserved half). Text spelling is the assembler's: `op_sel:[..]` (half select)
+    /// before `op_sel_hi:[..]` (F16 select), each printed only when non-zero, no `clamp`.
+    pub fn insn(
+        self,
+        arch: Arch,
+        dst: V<1>,
+        a: MixSrc,
+        b: MixSrc,
+        c: MixSrc,
+    ) -> Result<Instruction, String> {
+        if arch.cdna().is_some() {
+            return Err("v_fma_mix is RDNA only".into());
+        }
+        let srcs = [a, b, c];
+        let (mut op_sel, mut op_sel_hi) = (0u8, 0u8);
+        for (i, s) in srcs.iter().enumerate() {
+            match s.width {
+                MixWidth::F32 => {}
+                MixWidth::F16Lo => op_sel_hi |= 1 << i,
+                MixWidth::F16Hi => {
+                    op_sel_hi |= 1 << i;
+                    op_sel |= 1 << i;
+                }
+            }
+        }
+        let bits = |v: u8| format!("[{},{},{}]", v & 1, v >> 1 & 1, v >> 2 & 1);
+        let mut text = format!(
+            "{} {}, {}, {}, {}",
+            self.mnemonic(),
+            dst.reg(),
+            a.text()?,
+            b.text()?,
+            c.text()?
+        );
+        if op_sel != 0 {
+            text.push_str(&format!(" op_sel:{}", bits(op_sel)));
+        }
+        if op_sel_hi != 0 {
+            text.push_str(&format!(" op_sel_hi:{}", bits(op_sel_hi)));
+        }
+        let mut uses: Vec<RegRef> = srcs
+            .iter()
+            .filter_map(|s| match s.value {
+                MixValue::Reg(v) => Some(v.reg()),
+                MixValue::Zero => None,
+            })
+            .collect();
+        if self != Self::F32 {
+            uses.push(dst.reg());
+        }
+        Ok(Instruction::new(text, vec![dst.reg()], uses))
+    }
+}
+
 /// The SWMMAC opcodes of gfx12 (`v_swmmac_*`), named `{D}{A}{B}` after the
 /// accumulator/A/B element types (`Iu4X64` is the K=64 iu4 row).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
