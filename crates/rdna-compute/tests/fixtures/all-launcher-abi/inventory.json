@@ -144,6 +144,7 @@
     "kernels/src/moe_down_combine_grouped_k8.hip",
     "kernels/src/moe_down_combine_grouped_top10.hip",
     "kernels/src/moe_down_combine_top10_batched.hip",
+    "kernels/src/moe_down_combine_top10_batched_partitioned.hip",
     "kernels/src/moe_down_unscatter_k8.hip",
     "kernels/src/moe_router_softmax_top10_f32.hip",
     "kernels/src/moe_router_softmax_top10_f32_fast.hip",
