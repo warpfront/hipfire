@@ -27,9 +27,8 @@ pub struct Converted {
     pub region: Result<LiftedRegion, String>,
 }
 
-/// Convert every template of `templates` found in `standalone/*/sa.co`. The
-/// template's `lds_bytes` above the descriptor's static size is dynamic LDS.
-pub fn convert_all(templates: &Value, standalone: &Path) -> Vec<Converted> {
+/// Every `standalone/*/sa.co` with the kernel symbols it defines.
+pub fn standalone_objects(standalone: &Path) -> Vec<(std::path::PathBuf, Vec<u8>, Vec<String>)> {
     let mut objects = Vec::new();
     for entry in std::fs::read_dir(standalone)
         .expect("standalone dir")
@@ -54,6 +53,22 @@ pub fn convert_all(templates: &Value, standalone: &Path) -> Vec<Converted> {
             objects.push((path, bytes, symbols));
         }
     }
+    objects
+}
+
+/// The standalone object (path, bytes) that defines kernel `symbol`.
+#[allow(dead_code)] // used by the card smoke only
+pub fn find_object(standalone: &Path, symbol: &str) -> Option<(std::path::PathBuf, Vec<u8>)> {
+    standalone_objects(standalone)
+        .into_iter()
+        .find(|(_, _, s)| s.iter().any(|k| k == symbol))
+        .map(|(p, b, _)| (p, b))
+}
+
+/// Convert every template of `templates` found in `standalone/*/sa.co`. The
+/// template's `lds_bytes` above the descriptor's static size is dynamic LDS.
+pub fn convert_all(templates: &Value, standalone: &Path) -> Vec<Converted> {
+    let objects = standalone_objects(standalone);
     let mut out = Vec::new();
     for t in templates.as_array().expect("templates array") {
         let Some(symbol) = t["symbol"].as_str() else {

@@ -889,7 +889,10 @@ pub fn pool(
         if multi {
             b.label(".Lnext_tail")?;
         }
-        b.wait_all()?;
+        // `.Ltraced` is also reached with trace off straight from the release signal,
+        // whose atomic may still be reading v1/v2: the linear ledger here only knows the
+        // traced path, so drain every counter before the claim reuses those VGPRs.
+        b.drain_all_counters()?;
         branch(b, "s_branch .Lnext")
     })?;
     b.label(".Ldone")?;

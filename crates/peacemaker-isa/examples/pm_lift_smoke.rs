@@ -14,17 +14,19 @@
 //!   compared byte for byte, `events[0] == tasks`, `poison == 0`, the trace
 //!   records complete.
 //!
-//! `pm_lift_smoke STANDALONE_DIR OUT_DIR [TEMPLATES.json]` (with templates: every
-//! case runs in the shared multi-template pool of its blockDim) writes `OUT_DIR/p0_r6_<tid>_<name>.co`
-//! (only for bodies that pass), `OUT_DIR/templates_r6_lift.json` and
-//! `OUT_DIR/smoke.json`; exit 0 when every body is byte-identical.
+//! `pm_lift_smoke STANDALONE_DIR OUT_DIR TEMPLATES.json`: every case runs in the shared
+//! multi-template pool of its blockDim (every converted template of `TEMPLATES.json`).
+//! A case names only its template id: its kernel symbol comes from the templates table and
+//! its standalone object is the `STANDALONE_DIR/*/sa.co` that defines that symbol; the
+//! standalone launch's kernarg image is laid out from that object's own metadata (the
+//! explicit argument count must equal the case's). Writes `OUT_DIR/templates_r6_lift.json`
+//! and `OUT_DIR/smoke.json`; exit 0 when every body is byte-identical.
 
 #[path = "lift_common/mod.rs"]
 mod lift_common;
 
 use hip_bridge::{DeviceBuffer, Function, HipRuntime};
 use peacemaker_isa::kernels::lifted_dispatch_gfx1201 as ld;
-use peacemaker_isa::{native, Arch};
 use peacemaker_lift::rewrite::region::{check_carried, lift_region, LiftedRegion, RegionInputs};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -64,8 +66,8 @@ enum Arg {
 struct Case {
     tid: u32,
     name: &'static str,
-    dir: &'static str,
-    symbol: &'static str,
+    /// the template's kernel symbol (from the templates table)
+    symbol: String,
     block: u32,
     grid: [u32; 3],
     /// (name, bytes); every buffer is compared after the run
@@ -111,8 +113,7 @@ fn o4_gate_up(rng: &mut Lcg) -> Case {
     Case {
         tid: 16,
         name: "moe_gate_up_o4_r2",
-        dir: "gemm_mq4g256v2p_moe_grouped_top10_o4_r8_x4",
-        symbol: "gemm_mq4g256v2p_moe_grouped_top10_o4_r2_x4",
+        symbol: String::new(),
         block: 128,
         grid: [m.div_ceil(16) as u32, grouped_rows.div_ceil(2) as u32, 1],
         ptr_table: Some((0, (1..=n_experts).collect())),
@@ -179,8 +180,7 @@ fn unscatter_silu(rng: &mut Lcg) -> Case {
     Case {
         tid: 17,
         name: "moe_unscatter_silu_rot",
-        dir: "moe_gate_up_unscatter_silu_top10",
-        symbol: "moe_gate_up_unscatter_silu_rotate128_top10",
+        symbol: String::new(),
         block: 32,
         grid: [(m_total + extra) as u32, gy as u32, 1],
         ptr_table: None,
@@ -225,8 +225,7 @@ fn gemv_x4_otile(rng: &mut Lcg) -> Case {
     Case {
         tid: 8,
         name: "gemv_x4_otile",
-        dir: "qwen4_gemv_bf16_xf32_otile",
-        symbol: "gemv_bf16_xf32_x4_rows_otile_r6",
+        symbol: String::new(),
         block: 32,
         grid: [ms.iter().sum::<usize>() as u32, 1, 1],
         ptr_table: None,
@@ -266,8 +265,7 @@ fn down_dni(rng: &mut Lcg) -> Case {
     Case {
         tid: 18,
         name: "moe_down_dni",
-        dir: "gemv_mq4g128v2_moe_down_top10_dni",
-        symbol: "gemv_mq4g128v2p_moe_down_top10_dni_k640",
+        symbol: String::new(),
         block: 128,
         grid: [m.div_ceil(32) as u32, k_top as u32, n as u32],
         ptr_table: Some((0, (1..=n_exp).collect())),
@@ -320,7 +318,7 @@ impl Card {
         std::mem::forget(m);
         Ok(f)
     }
-    fn launch(
+    fn run_blob_sync(
         &self,
         f: &Function,
         grid: [u32; 3],
@@ -387,18 +385,13 @@ fn read_all(card: &Card, case: &Case, d: &[DeviceBuffer]) -> Result<Vec<Vec<u8>>
 /// A shared pool to host the case instead of its own single-template pool.
 type SharedPool = (String, Vec<u8>);
 
-fn run_case(
-    card: &Card,
-    objects: &Path,
-    out: &Path,
-    case: Case,
-    shared: Option<&SharedPool>,
-) -> Result<Value, String> {
-    let object = std::fs::read(objects.join(case.dir).join("sa.co"))
-        .map_err(|e| format!("{}: {e}", case.dir))?;
+fn run_case(card: &Card, objects: &Path, case: Case, shared: &SharedPool) -> Result<Value, String> {
+    let object = lift_common::find_object(objects, &case.symbol)
+        .ok_or_else(|| format!("{}: no standalone object defines it", case.symbol))?
+        .1;
     let region = lift_region(
         &object,
-        case.symbol,
+        &case.symbol,
         &RegionInputs {
             prefix: format!(".Lt{}b", case.tid),
             workgroup_x: ld::WG_X,
@@ -435,48 +428,21 @@ fn run_case(
     if offsets.len() != case.args.len() {
         return Err(format!(
             "{}: {} explicit args in metadata, case has {}",
-            case.symbol,
+            &case.symbol,
             offsets.len(),
             case.args.len()
         ));
     }
-    let (pool_symbol, pool_elf) = match shared {
-        Some((symbol, elf)) => (symbol.clone(), elf.clone()),
-        None => {
-            let symbol = format!("pm_lift_{}", case.name);
-            let emitted = ld::pool(
-                &symbol,
-                case.block,
-                &[ld::Hosted {
-                    tmpl: case.tid,
-                    region: &region,
-                }],
-                None,
-            )?;
-            std::fs::write(
-                out.join(format!("p0_r6_{}_{}.s", case.tid, case.name)),
-                &emitted.s_text,
-            )
-            .map_err(|e| e.to_string())?;
-            (
-                symbol,
-                native::assemble_with_regions(
-                    &emitted.s_text,
-                    Arch::Gfx1201,
-                    &emitted.proof.regions,
-                )?,
-            )
-        }
-    };
+    let (pool_symbol, pool_elf) = shared.clone();
     let carried = check_carried(&pool_elf, &pool_symbol, &region)?;
 
     // ---- standalone
-    let solo = card.function(&object, case.symbol)?;
+    let solo = card.function(&object, &case.symbol)?;
     let d_solo = stage(card, &case)?;
     let mut blob = explicit(&case, &d_solo, &region, &offsets);
     let explicit_end = offsets.iter().map(|(o, s)| o + s).max().unwrap_or(0) as usize;
     blob.truncate(explicit_end.next_multiple_of(8));
-    card.launch(&solo, case.grid, case.block, &mut blob)?;
+    card.run_blob_sync(&solo, case.grid, case.block, &mut blob)?;
     let want = read_all(card, &case, &d_solo)?;
 
     // ---- persistent pool
@@ -536,7 +502,7 @@ fn run_case(
             .unwrap_or(48),
     );
     let t0 = std::time::Instant::now();
-    card.launch(&pool_fn, [workers, 1, 1], case.block, &mut params)?;
+    card.run_blob_sync(&pool_fn, [workers, 1, 1], case.block, &mut params)?;
     let wall_us = t0.elapsed().as_secs_f64() * 1e6;
     let got = read_all(card, &case, &d_pool)?;
     let ev = u32::from_le_bytes(card.read(&events, 4)?[..4].try_into().unwrap());
@@ -588,13 +554,6 @@ fn run_case(
         && pz == 0
         && tk == n_tasks + workers
         && traced == n_tasks as usize;
-    if pass && shared.is_none() {
-        std::fs::write(
-            out.join(format!("p0_r6_{}_{}.co", case.tid, case.name)),
-            &pool_elf,
-        )
-        .map_err(|e| e.to_string())?;
-    }
     for d in d_solo
         .into_iter()
         .chain(d_pool)
@@ -671,7 +630,7 @@ fn copy_check(card: &Card, symbol: &str, elf: &[u8]) -> Result<Value, String> {
     params.extend(1u32.to_le_bytes());
     params.resize(ld::KERNARG_BYTES as usize, 0);
     let f = card.function(elf, symbol)?;
-    card.launch(&f, [8, 1, 1], 256, &mut params)?;
+    card.run_blob_sync(&f, [8, 1, 1], 256, &mut params)?;
     let got = card.read(&dd, bytes + 64)?;
     let ev = u32::from_le_bytes(card.read(&events, 4)?[..4].try_into().unwrap());
     let pz = u32::from_le_bytes(card.read(&poison, 4)?[..4].try_into().unwrap());
@@ -701,24 +660,22 @@ fn sha2_digest(b: &[u8]) -> impl std::fmt::LowerHex {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let (Some(objects), Some(out)) = (args.get(1), args.get(2)) else {
-        eprintln!("usage: pm_lift_smoke STANDALONE_DIR OUT_DIR [TEMPLATES.json]");
+    let (Some(objects), Some(out), Some(templates)) = (args.get(1), args.get(2), args.get(3))
+    else {
+        eprintln!("usage: pm_lift_smoke STANDALONE_DIR OUT_DIR TEMPLATES.json");
         std::process::exit(2);
     };
     let (objects, out) = (Path::new(objects), Path::new(out));
-    // With TEMPLATES.json: every case runs inside the shared pool of its blockDim
-    // (hosting every converted rows-6 template of that blockDim).
-    let shared: Vec<(u32, SharedPool)> = match args.get(3) {
-        None => vec![],
-        Some(t) => {
-            let t: Value = serde_json::from_str(&std::fs::read_to_string(t).expect("templates"))
-                .expect("json");
-            lift_common::build_pools(&lift_common::convert_all(&t, objects))
-                .into_iter()
-                .filter_map(|(b, symbol, elf, _)| elf.ok().map(|e| (b, (symbol, e))))
-                .collect()
-        }
-    };
+    let table: Value =
+        serde_json::from_str(&std::fs::read_to_string(templates).expect("templates"))
+            .expect("json");
+    // every case runs inside the shared pool of its blockDim (hosting every converted
+    // rows-6 template of that blockDim)
+    let shared: Vec<(u32, SharedPool)> =
+        lift_common::build_pools(&lift_common::convert_all(&table, objects))
+            .into_iter()
+            .filter_map(|(b, symbol, elf, _)| elf.ok().map(|e| (b, (symbol, e))))
+            .collect();
     std::fs::create_dir_all(out).expect("out dir");
     let rt = HipRuntime::load().expect("HipRuntime::load");
     rt.set_device(0).expect("hipSetDevice");
@@ -735,21 +692,28 @@ fn main() {
     if let Ok(only) = std::env::var("LIFT_ONLY") {
         cases.retain(|c| c.name == only);
     }
+    for case in &mut cases {
+        case.symbol = table
+            .as_array()
+            .and_then(|rows| rows.iter().find(|t| t["tid"] == case.tid))
+            .and_then(|t| t["symbol"].as_str())
+            .unwrap_or_else(|| panic!("template {} has no symbol", case.tid))
+            .to_owned();
+    }
     let mut results = Vec::new();
     let mut templates = Vec::new();
     let mut all = true;
     for case in cases {
-        let (tid, name, symbol, block) = (case.tid, case.name, case.symbol, case.block);
-        let pool = shared.iter().find(|(b, _)| *b == block).map(|(_, p)| p);
-        if !shared.is_empty() && pool.is_none() {
+        let (tid, name, symbol, block) = (case.tid, case.name, case.symbol.clone(), case.block);
+        let Some(pool) = shared.iter().find(|(b, _)| *b == block).map(|(_, p)| p) else {
             println!(
                 "{}",
                 json!({"tid": tid, "name": name, "pass": false, "error": "no shared pool for this blockDim"})
             );
             all = false;
             continue;
-        }
-        let r = run_case(&card, objects, out, case, pool)
+        };
+        let r = run_case(&card, objects, case, pool)
             .unwrap_or_else(|e| json!({"tid": tid, "name": name, "pass": false, "error": e}));
         println!("{r}");
         let pass = r["pass"] == true;
@@ -760,7 +724,7 @@ fn main() {
             "kernarg_bytes": r["receipt"]["kernarg_bytes"], "lds_bytes": r["receipt"]["lds_bytes"],
             "hidden_args": r["receipt"]["hidden_args"], "legal": pass,
             "reason": r.get("error").cloned().unwrap_or(Value::String(String::new())),
-            "kernel": if pass { Value::String(format!("p0_r6_{tid}_{name}.co")) } else { Value::Null },
+            "kernel": if pass { Value::String(format!("p0_r6_pool_b{block}.co")) } else { Value::Null },
             "pool_symbol": r["pool_symbol"],
         }));
         results.push(r);
