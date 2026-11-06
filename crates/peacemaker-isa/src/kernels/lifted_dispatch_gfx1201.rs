@@ -82,7 +82,8 @@ const STEP: u8 = 101;
 pub const NOP_TMPL: u32 = 0xffff_fffe;
 /// Every dispatcher-owned SGPR range (name, base, length).
 const DISPATCHER_SGPRS: &[(&str, u8, u8)] = &[
-    ("gx", GX, 1),
+    // s72 = gx; s[72:73] = the span bitmap base inside the span checks (before the broadcast)
+    ("gx", GX, 2),
     ("ptr_a", PTR_A, 2),
     ("t_publish", T_PUBLISH, 2),
     ("ptr_b", PTR_B, 2),
@@ -363,7 +364,7 @@ pub fn pool(
         "claim_v",
         Kind::V,
         1,
-        32,
+        40,
         &Live::Between(".Lnext".into(), first_step.clone()),
     )?;
     add_pieces(
@@ -1058,17 +1059,30 @@ pub fn pool(
 /// overlap; `bytes < 2^32`. The body's registers are s0..s15, v0..v3 (the region's).
 /// Span mode (railgunmega/DYNAMIC.md), on wave 0 lane 0 after the predecessor acquire,
 /// with the descriptor in v4..v15 and its span words in v18 (flags), v19 (k), v20 (list
-/// id); v24..v28 are its temporaries. Static tasks (flags 0) pass straight to `.Lready`; a
-/// span task without a predecessor event poisons. A span task reads its live
-/// entry: `c = count` (after the acquire), `c > K` poisons, `k >= c` turns the task into
-/// a NOP (template `NOP_TMPL`: no region, `done` still released), the entry `{vx, vy, vz}`
-/// must lie inside the header grid and its bit in the claim bitmap must be clear (a
-/// returning atomic OR sets it); any failed check poisons. A valid entry replaces the
-/// descriptor's `vx, vy, vz` and sets `vcount = 1`.
+/// id). Static tasks (flags 0) pass straight to `.Lready`; a span task without a
+/// predecessor event poisons. A span task reads its span descriptor and live entry into
+/// VGPRs (v24..v39: the dispatcher's meaning-carrying SGPRs are not reused; the bitmap
+/// base alone is read into s[72:73], free until the broadcast defines `gx`):
+/// `list_id < n_spans`, `c = count` (after the acquire) `<= K`, `k >= c` turns the task
+/// into a NOP (template `NOP_TMPL`: no region, `done` still released), the entry
+/// `{vx, vy, vz}` must lie inside the header grid and its bit in the claim bitmap must be
+/// clear (a returning atomic OR sets it); any failed check poisons. A valid entry replaces
+/// the descriptor's `vx, vy, vz` and sets `vcount = 1`.
 fn span_entry(b: &mut Builder) -> Result<(), String> {
-    // SGPR temporaries free between the claim and the broadcast: TEMP, PTR_A, PTR_B,
-    // T_START, T_END, VX, VCOUNT, STEP (all reloaded or rewritten before their uses)
-    let (desc, list, count, bitmap) = (PTR_B, T_START, T_END, PTR_A);
+    // v_cmp into TEMP, then branch to `to` when any lane (lane 0) holds
+    fn check(b: &mut Builder, cmp: &str, uses: &[RegRef], to: &str) -> Result<(), String> {
+        op(b, &format!("{cmp}"), &[s(TEMP)], uses)?;
+        op(b, &format!("s_cmp_lg_u32 s{TEMP}, 0"), &[], &[s(TEMP)])?;
+        branch(b, &format!("s_cbranch_scc1 {to}"))
+    }
+    let load = |b: &mut Builder, text: String, def: RegRef, uses: Vec<RegRef>| {
+        b.push(Instruction::new(text, vec![def], uses).memory(MemoryClass::VmemLoad))
+    };
+    let vp = |n: u8| RegRef {
+        kind: Kind::V,
+        base: n,
+        len: 2,
+    };
     b.label(".Lspan")?;
     // reached from the no-predecessor branch and the wait's exit: the span words' load
     // may still be in flight on either (the linear ledger here only knows the wait path)
@@ -1081,135 +1095,90 @@ fn span_entry(b: &mut Builder) -> Result<(), String> {
     // a span header must name its producer's done event: the count load below is then
     // ordered by that wait's acquire on every path (a host-filled span names an event the
     // host leaves satisfied, e.g. `expected = 0`)
-    readfirst(b, VX, 12)?;
-    op(b, &format!("s_cmp_eq_u32 s{VX}, -1"), &[], &[s(VX)])?;
+    readfirst(b, TEMP, 12)?;
+    op(b, &format!("s_cmp_eq_u32 s{TEMP}, -1"), &[], &[s(TEMP)])?;
     branch(b, "s_cbranch_scc1 .Lspan_poison")?;
     // the span table: u32 n_spans at +0, descriptor i at +32 + 32 i
-    param(b, desc, 0x40)?;
+    param(b, PTR_B, 0x40)?;
     b.wait_all()?;
     op(
         b,
-        &format!("s_or_b32 s{TEMP}, s{desc}, s{}", desc + 1),
+        &format!("s_or_b32 s{TEMP}, s{PTR_B}, s{}", PTR_B + 1),
         &[s(TEMP)],
-        &[sp(desc)],
+        &[sp(PTR_B)],
     )?;
     op(b, &format!("s_cmp_eq_u32 s{TEMP}, 0"), &[], &[s(TEMP)])?;
     branch(b, "s_cbranch_scc1 .Lspan_poison")?;
-    smem(
+    op(b, "v_mov_b32_e32 v1, 0", &[v(1)], &[])?;
+    load(
         b,
-        &format!("s_load_b32 s{TEMP}, s[{desc}:{}], 0x0", desc + 1),
-        &[s(TEMP)],
-        &[sp(desc)],
+        format!("global_load_b32 v28, v1, s[{PTR_B}:{}]", PTR_B + 1),
+        v(28),
+        vec![v(1), sp(PTR_B)],
     )?;
-    readfirst(b, VCOUNT, 20)?;
     b.wait_all()?;
-    op(
+    check(
         b,
-        &format!("s_cmp_ge_u32 s{VCOUNT}, s{TEMP}"),
-        &[],
-        &[s(VCOUNT), s(TEMP)],
+        &format!("v_cmp_ge_u32_e64 s{TEMP}, v20, v28"),
+        &[v(20), v(28)],
+        ".Lspan_poison",
     )?;
-    branch(b, "s_cbranch_scc1 .Lspan_poison")?;
-    op(
-        b,
-        &format!("s_lshl_b32 s{TEMP}, s{VCOUNT}, 5"),
-        &[s(TEMP)],
-        &[s(VCOUNT)],
-    )?;
-    op(
-        b,
-        &format!("s_add_co_u32 s{desc}, s{desc}, s{TEMP}"),
-        &[s(desc)],
-        &[s(desc), s(TEMP)],
-    )?;
-    op(
-        b,
-        &format!("s_add_co_ci_u32 s{}, s{}, 0", desc + 1, desc + 1),
-        &[s(desc + 1)],
-        &[s(desc + 1)],
-    )?;
-    for (dst, off) in [(list, 0x20u32), (count, 0x28)] {
-        smem(
+    // descriptor `{live_list, count_cell}` -> v[32:35], `{bitmap, K, 0}` -> v[36:39]
+    op(b, "v_lshl_add_u32 v29, v20, 5, 32", &[v(29)], &[v(20)])?;
+    for (dst, off) in [(32u8, ""), (36, " offset:16")] {
+        load(
             b,
-            &format!(
-                "s_load_b64 s[{dst}:{}], s[{desc}:{}], {off:#x}",
-                dst + 1,
-                desc + 1
+            format!(
+                "global_load_b128 v[{dst}:{}], v29, s[{PTR_B}:{}]{off}",
+                dst + 3,
+                PTR_B + 1
             ),
-            &[sp(dst)],
-            &[sp(desc)],
+            vq(dst),
+            vec![v(29), sp(PTR_B)],
         )?;
     }
-    smem(
-        b,
-        &format!(
-            "s_load_b64 s[{bitmap}:{}], s[{desc}:{}], 0x30",
-            bitmap + 1,
-            desc + 1
-        ),
-        &[sp(bitmap)],
-        &[sp(desc)],
-    )?;
-    smem(
-        b,
-        &format!("s_load_b32 s{TEMP}, s[{desc}:{}], 0x38", desc + 1),
-        &[s(TEMP)],
-        &[sp(desc)],
-    )?;
     b.wait_all()?;
     // c, ordered after the predecessor acquire (the producer released entries and count)
-    op(b, "v_mov_b32_e32 v1, 0", &[v(1)], &[])?;
-    b.push(
-        Instruction::new(
-            format!("global_load_b32 v28, v1, s[{count}:{}]", count + 1),
-            vec![v(28)],
-            vec![v(1), sp(count)],
-        )
-        .memory(MemoryClass::VmemLoad),
+    load(
+        b,
+        "global_load_b32 v28, v[34:35], off".into(),
+        v(28),
+        vec![vp(34)],
     )?;
     b.wait_all()?;
-    readfirst(b, STEP, 28)?;
+    check(
+        b,
+        &format!("v_cmp_gt_u32_e64 s{TEMP}, v28, v38"),
+        &[v(28), v(38)],
+        ".Lspan_poison",
+    )?;
+    check(
+        b,
+        &format!("v_cmp_ge_u32_e64 s{TEMP}, v19, v28"),
+        &[v(19), v(28)],
+        ".Lspan_nop",
+    )?;
     op(
         b,
-        &format!("s_cmp_gt_u32 s{STEP}, s{TEMP}"),
-        &[],
-        &[s(STEP), s(TEMP)],
+        "v_mad_co_u64_u32 v[30:31], null, v19, 16, v[32:33]",
+        &[vp(30)],
+        &[v(19), vp(32)],
     )?;
-    branch(b, "s_cbranch_scc1 .Lspan_poison")?;
-    readfirst(b, VX, 19)?;
-    op(
+    load(
         b,
-        &format!("s_cmp_ge_u32 s{VX}, s{STEP}"),
-        &[],
-        &[s(VX), s(STEP)],
-    )?;
-    branch(b, "s_cbranch_scc1 .Lspan_nop")?;
-    op(
-        b,
-        &format!("s_lshl_b32 s{TEMP}, s{VX}, 4"),
-        &[s(TEMP)],
-        &[s(VX)],
-    )?;
-    vmov_s(b, 1, TEMP)?;
-    b.push(
-        Instruction::new(
-            format!("global_load_b128 v[24:27], v1, s[{list}:{}]", list + 1),
-            vec![vq(24)],
-            vec![v(1), sp(list)],
-        )
-        .memory(MemoryClass::VmemLoad),
+        "global_load_b128 v[24:27], v[30:31], off".into(),
+        vq(24),
+        vec![vp(30)],
     )?;
     b.wait_all()?;
     // inside the header grid (v8..v10 = gx, gy, gz)
     for (e, g) in [(24u8, 8u8), (25, 9), (26, 10)] {
-        op(
+        check(
             b,
-            &format!("v_cmp_ge_u32_e64 s{count}, v{e}, v{g}"),
-            &[s(count)],
+            &format!("v_cmp_ge_u32_e64 s{TEMP}, v{e}, v{g}"),
             &[v(e), v(g)],
+            ".Lspan_poison",
         )?;
-        op(b, &format!("s_cmp_lg_u32 s{count}, 0"), &[], &[s(count)])?;
-        branch(b, "s_cbranch_scc1 .Lspan_poison")?;
     }
     // bit = vx + gx * (vy + gy * vz); claim it in the bitmap
     op(b, "v_mul_lo_u32 v27, v26, v9", &[v(27)], &[v(26), v(9)])?;
@@ -1230,13 +1199,15 @@ fn span_entry(b: &mut Builder) -> Result<(), String> {
     op(b, "v_lshlrev_b32_e32 v1, 2, v1", &[v(1)], &[v(1)])?;
     op(b, "v_and_b32_e32 v2, 31, v27", &[v(2)], &[v(27)])?;
     op(b, "v_lshlrev_b32_e64 v2, v2, 1", &[v(2)], &[v(2)])?;
+    readfirst(b, GX, 36)?;
+    readfirst(b, GX + 1, 37)?;
     b.event_rmw(
         AtomicOp::OrB32,
         Some(V::<1>(3)),
         v(2),
         GlobalAddr {
             vaddr: V::<1>(1),
-            base: S::<2>(bitmap),
+            base: S::<2>(GX),
             offset: 0,
         },
         Scope::Dev,
@@ -1244,14 +1215,12 @@ fn span_entry(b: &mut Builder) -> Result<(), String> {
     )?;
     b.wait_all()?;
     op(b, "v_and_b32_e32 v3, v3, v2", &[v(3)], &[v(3), v(2)])?;
-    op(
+    check(
         b,
-        &format!("v_cmp_ne_u32_e64 s{count}, 0, v3"),
-        &[s(count)],
+        &format!("v_cmp_ne_u32_e64 s{TEMP}, 0, v3"),
         &[v(3)],
+        ".Lspan_poison",
     )?;
-    op(b, &format!("s_cmp_lg_u32 s{count}, 0"), &[], &[s(count)])?;
-    branch(b, "s_cbranch_scc1 .Lspan_poison")?;
     for (d, e) in [(5u8, 24u8), (6, 25), (7, 26)] {
         op(b, &format!("v_mov_b32_e32 v{d}, v{e}"), &[v(d)], &[v(e)])?;
     }
