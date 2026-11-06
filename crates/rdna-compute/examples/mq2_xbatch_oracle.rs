@@ -31,7 +31,9 @@
 //! Correctness (runs unless `--bench --no-oracle`): for every shape (K = 256 .. 4352, every M
 //! residue, small shapes) and every B = 1..=max-b, ONE launch of the object into a y buffer
 //! guarded by 0x7f on both sides must equal, byte for byte including guards, the per-column
-//! `Gpu::gemv_mq2g256v2` bytes; the hipcc kernel in chunks of <= 4 must equal them too.
+//! `Gpu::gemv_mq2g256v2` bytes (plus M7 K768/K1280 and M33 K768 edge cases: half header
+//! scale/zero NaN payloads/Inf/signed zero/subnormal/extremes, NaN/Inf/zero/subnormal/extreme
+//! activations, compared as raw hardware bytes, NaN included); the hipcc kernel in chunks of <= 4 must equal them too.
 //!
 //! `--bench` times the object's single launch (B = 1..8) against the TODAY cap4 baseline:
 //! `--baseline-object PATH` (REQUIRED with `--bench`; must be the pre-change shipped cap4
@@ -298,20 +300,92 @@ fn launch_chunked(
     Ok(())
 }
 
+/// Half bit patterns for header scale/zero-point: distinct NaN payloads (quiet, signalling,
+/// negative), +-Inf, +-0, subnormals, extremes, min normal, ordinary values.
+const EDGE_HALF: [u16; 20] = [
+    0x7e00, 0x7c01, 0xfe55, 0x7dff, 0xfc01, 0x7c00, 0xfc00, 0x0000, 0x8000, 0x0001, 0x8001,
+    0x03ff, 0x83ff, 0x7bff, 0xfbff, 0x0400, 0x8400, 0x3c00, 0xbc00, 0x3555,
+];
+
+/// MQ2 weights whose every (scale, zero-point) half is drawn from `EDGE_HALF`; payloads random.
+fn edge_weights(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
+    let groups = m * (k / 256);
+    let mut bytes = Vec::with_capacity(groups * 72);
+    for _ in 0..groups {
+        for _ in 0..4 {
+            let h = EDGE_HALF[(rng.next() >> 33) as usize % EDGE_HALF.len()];
+            bytes.extend_from_slice(&h.to_le_bytes());
+        }
+        for _ in 0..8 {
+            bytes.extend_from_slice(&rng.next().to_le_bytes());
+        }
+    }
+    bytes
+}
+
+/// `[8][k]` activations, one pattern per column: finite; sparse NaN payloads; +-Inf (Inf-Inf
+/// possible); signed zeros; subnormals; +-f32::MAX; dense distinct NaN payloads; Inf+NaN mix.
+fn edge_x(rng: &mut Rng, k: usize) -> Vec<f32> {
+    const SPECIAL: [u32; 14] = [
+        0x7fc0_0001, 0xffc0_1234, 0x7f80_0001, 0xff80_0abc, 0x7f80_0000, 0xff80_0000, 0x0000_0000,
+        0x8000_0000, 0x0000_0001, 0x8000_0001, 0x007f_ffff, 0x7f7f_ffff, 0xff7f_ffff, 0x0080_0000,
+    ];
+    let mut x = Vec::with_capacity(8 * k);
+    for col in 0..8usize {
+        for i in 0..k {
+            let r = rng.next();
+            let pick = |set: &[u32]| f32::from_bits(set[(r >> 33) as usize % set.len()]);
+            let sparse = (r & 15) == 0;
+            let v = match col {
+                0 => rng.f32() * 3.0,
+                1 if sparse => pick(&SPECIAL[..4]),
+                2 if sparse => pick(&SPECIAL[4..6]),
+                3 => pick(&SPECIAL[4..6]),
+                4 => pick(&SPECIAL[6..8]),
+                5 => pick(&SPECIAL[8..11]),
+                6 => f32::from_bits(0x7fc0_0000 | ((i as u32 * 2654435761 ^ col as u32) & 0x003f_ffff)),
+                7 if (r & 7) == 0 => pick(&SPECIAL),
+                7 => pick(&SPECIAL[11..13]),
+                _ => rng.f32() * 3.0,
+            };
+            x.push(v);
+        }
+    }
+    x
+}
+
 /// Direct correctness of `obj`: single launch at B = 1..=max_b vs per-column singleton bytes
 /// (guards both sides included); hipcc in chunks of <= 4 vs the same bytes.
 fn direct_cases(gpu: &mut Gpu, obj: &Obj, max_b: usize) -> Result<(Vec<serde_json::Value>, usize)> {
     let mut rng = Rng(0xD1EC7_5EED_0001);
     let mut cases = Vec::new();
     let mut bad_total = 0usize;
-    for (m, k) in [
+    // (kind, m, k): "random" = finite synthetic; "edge_hdr" = edge half headers + edge x;
+    // "edge_x" = finite headers + edge x.
+    let mut specs: Vec<(&str, usize, usize)> = [
         (1usize, 256usize), (2, 512), (3, 1024), (4, 256), (5, 256), (6, 512), (7, 256), (8, 256),
         (9, 768), (15, 256), (31, 768), (130, 2560), (1001, 2560), (4093, 2048), (33, 4352),
         (100003, 2560), (100276, 2560),
-    ] {
-        let a_bytes = weights(&mut rng, m, k);
+    ]
+    .into_iter()
+    .map(|(m, k)| ("random", m, k))
+    .collect();
+    for (m, k) in [(7usize, 768usize), (7, 1280), (33, 768)] {
+        specs.push(("edge_hdr", m, k));
+        specs.push(("edge_x", m, k));
+    }
+    for (kind, m, k) in specs {
+        let a_bytes = if kind == "edge_hdr" {
+            edge_weights(&mut rng, m, k)
+        } else {
+            weights(&mut rng, m, k)
+        };
         let a = gpu.upload_raw(&a_bytes, &[a_bytes.len()]).map_err(err)?;
-        let x_host: Vec<f32> = (0..8 * k).map(|_| rng.f32() * 3.0).collect();
+        let x_host: Vec<f32> = if kind == "random" {
+            (0..8 * k).map(|_| rng.f32() * 3.0).collect()
+        } else {
+            edge_x(&mut rng, k)
+        };
         let x = gpu.upload_f32(&x_host, &[x_host.len()]).map_err(err)?;
         let y_ref = gpu.zeros(&[8 * m], DType::F32).map_err(err)?;
         let y = gpu.zeros(&[8 * m + 2 * GUARD_F], DType::F32).map_err(err)?;
@@ -343,7 +417,7 @@ fn direct_cases(gpu: &mut Gpu, obj: &Obj, max_b: usize) -> Result<(Vec<serde_jso
                 + hip[guard + written..].iter().filter(|&&v| v != 0x7f).count();
             bad_total += bad_written + bad_guard + bad_hip;
             cases.push(json!({
-                "m": m, "k": k, "b": b, "single_launch_mismatch_bytes": bad_written,
+                "kind": kind, "m": m, "k": k, "b": b, "single_launch_mismatch_bytes": bad_written,
                 "single_launch_guard_overwritten_bytes": bad_guard,
                 "hipcc_chunked_mismatch_bytes": bad_hip,
             }));
