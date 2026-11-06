@@ -523,6 +523,46 @@ static __device__ __forceinline__ float gdn_q8_halves_peak(
     return fmaxf(peak_half[0][value_index], peak_half[1][value_index]);
 }
 
+#if defined(__GFX12__) && !defined(HIPFIRE_GDN_PERSISTENT_SERIAL)
+// gfx12 gated_delta_step_persistent256_body: the few-row parameter pass staged
+// by the whole block and the per-row Q8 boundary without the int8 round trip
+// (both bit-identical). `HIPFIRE_GDN_PERSISTENT_STAGED=0` compiles the module
+// with HIPFIRE_GDN_PERSISTENT_SERIAL, restoring the previous body.
+#define GDN_PERSISTENT_STAGED 1
+
+// Rows up to which gated_delta_step_persistent256_body's parameter pass stages
+// the per-element q/k squares with the whole block (the few-row verify,
+// capture-lanes and rollback windows); wider row blocks keep one thread per row.
+#define GDN_PERSISTENT_STAGE_ROWS 8
+
+// hip_bfloat16's float -> bfloat16 conversion (RNE; Inf/NaN keep their high
+// bits, a NaN whose payload lies in the low 16 bits gets the quiet-preserving
+// bit 16) as selects instead of the header's divergent branch. Same bits.
+static __device__ __forceinline__ unsigned short gdn_bf16_bits(float value) {
+    const unsigned int u = __float_as_uint(value);
+    const unsigned int rne = u + 0x7fffu + ((u >> 16) & 1u);
+    const unsigned int special = (u & 0xffffu) != 0u ? (u | 0x10000u) : u;
+    return (unsigned short)(((~u & 0x7f800000u) != 0u ? rne : special) >> 16);
+}
+
+static __device__ __forceinline__ float gdn_bf16_value(unsigned int bits) {
+    return __uint_as_float(bits << 16);
+}
+
+// gdn_q8_round's code as the F32 value the (signed char) conversion keeps:
+// the clamped floor is already an integer in [-128, 127] (a NaN clamps to
+// -128 in both), so float -> int8 -> float is the identity on it. The same
+// expression sequence as gdn_q8_round up to the conversion.
+static __device__ __forceinline__ float gdn_q8_round_value(
+    float value, float inv, int head, int row, int column, unsigned int frame) {
+    unsigned int rng = (unsigned int)head * 1664525u + (unsigned int)row * 1013904223u
+        + (unsigned int)column * 214013u + frame * 2531011u;
+    rng = rng * 1664525u + 1013904223u;
+    const float noise = (float)(rng >> 8) * (1.0f / 16777216.0f);
+    return fminf(fmaxf(floorf(value * inv + noise), -128.0f), 127.0f);
+}
+#endif
+
 // Wave-size-independent persistent row-batched path for exact 128x128 geometry.
 // A block owns one value head and 256 threads.  tid%128 is the output channel
 // and tid/128 selects the half; each thread retains 64 state values in
@@ -594,6 +634,9 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
     __shared__ float handoff_kv[128];
     __shared__ float handoff_delta[128];
     __shared__ float handoff_out[128];
+#if defined(GDN_PERSISTENT_STAGED)
+    __shared__ __align__(16) unsigned short square_rows[GDN_PERSISTENT_STAGE_ROWS][2][128];
+#endif
 
     float state_half[64];
     if constexpr (kQ8) {
@@ -642,12 +685,58 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
     for (int block = 0; block < rows; block += 256) {
         const int block_rows = min(256, rows - block);
         gdn_lds_barrier();
+#if defined(GDN_PERSISTENT_STAGED)
+        // Few-row blocks: the whole block stages every row's BF16-rounded q/k
+        // element squares (independent per element) into LDS, so the row
+        // threads below only add them in kd order. The thread-per-row pass
+        // ran each row's 128-element load-and-round chain on one wave while
+        // the other seven waited, most of a few-row launch's fixed cost.
+        // Same values, same serial sum order.
+        const bool staged = block_rows <= GDN_PERSISTENT_STAGE_ROWS;
+        if (staged) {
+            const int kd = thread & 127;
+            const int column = (thread < 128 ? q_offset : k_offset) + kd;
+            float x[GDN_PERSISTENT_STAGE_ROWS];
+            #pragma unroll
+            for (int r = 0; r < GDN_PERSISTENT_STAGE_ROWS; ++r) {
+                x[r] = projection[(block + min(r, block_rows - 1)) * qkv_width + column];
+            }
+            #pragma unroll
+            for (int r = 0; r < GDN_PERSISTENT_STAGE_ROWS; ++r) {
+                if (r < block_rows) {
+                    const float rounded = gdn_bf16_value(gdn_bf16_bits(x[r]));
+                    square_rows[r][thread >> 7][kd] = gdn_bf16_bits(rounded * rounded);
+                }
+            }
+            gdn_lds_barrier();
+        }
+#endif
         if (thread < block_rows) {
             const int row = block + thread;
             const int row_base = row * qkv_width;
             float q_sum_f32 = 0.0f;
             float k_sum_f32 = 0.0f;
             const __hip_bfloat16 eps = bf16_round(1.0e-6f);
+#if defined(GDN_PERSISTENT_STAGED)
+            if (staged) {
+                const uint4* q_squares = reinterpret_cast<const uint4*>(square_rows[thread][0]);
+                const uint4* k_squares = reinterpret_cast<const uint4*>(square_rows[thread][1]);
+                #pragma unroll
+                for (int c = 0; c < 16; ++c) {
+                    const uint4 qw = q_squares[c];
+                    const uint4 kw = k_squares[c];
+                    #pragma unroll
+                    for (int w = 0; w < 4; ++w) {
+                        const unsigned int qp = (&qw.x)[w];
+                        const unsigned int kp = (&kw.x)[w];
+                        q_sum_f32 += gdn_bf16_value(qp & 0xffffu);
+                        k_sum_f32 += gdn_bf16_value(kp & 0xffffu);
+                        q_sum_f32 += gdn_bf16_value(qp >> 16);
+                        k_sum_f32 += gdn_bf16_value(kp >> 16);
+                    }
+                }
+            } else {
+#endif
             // float4 loads, the next pair issued before the current one is
             // consumed (a scalar load per kd waited a full memory round trip
             // each); the kd-order sums are unchanged.  More loads in flight
@@ -668,6 +757,9 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
                     k_sum_f32 += bf16_to_f32(bf16_round(k_float * k_float));
                 }
             }
+#if defined(GDN_PERSISTENT_STAGED)
+            }
+#endif
             const __hip_bfloat16 q_sum = bf16_round(q_sum_f32);
             const __hip_bfloat16 k_sum = bf16_round(k_sum_f32);
             q_inv_rows[thread] = bf16_round(
@@ -843,9 +935,16 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
                     } else {
                     #pragma unroll
                     for (int kd = 0; kd < 64; ++kd) {
+#if defined(GDN_PERSISTENT_STAGED)
+                        // The code's exact F32 value: no float -> int8 -> float trip.
+                        state_half[kd] = scale * gdn_q8_round_value(
+                            state_half[kd], inv, value_head, value_index, kd_base + kd,
+                            row_frame);
+#else
                         state_half[kd] = scale * (float)gdn_q8_round(
                             state_half[kd], inv, value_head, value_index, kd_base + kd,
                             row_frame);
+#endif
                     }
                     }
                 }
