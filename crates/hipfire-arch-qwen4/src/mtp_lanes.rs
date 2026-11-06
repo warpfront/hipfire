@@ -234,6 +234,27 @@ pub(crate) fn floor_env_enabled() -> bool {
     hipfire_config::developer_var("HIPFIRE_MTP_AR_FLOOR").as_deref() != Ok("0")
 }
 
+/// `HIPFIRE_QWEN4_EP_LANE_AR_FLOOR` (developer; default off, `1` on): whether EP mesh
+/// native-MTP lanes run the AR floor (measured window pricing with sticky retirement to
+/// head-free AR). Off (the default), a mesh lane routes its draft depth from its own agreement
+/// ([`Qwen4Floor::provisional_depth`]; depth 0 is a one-token `ArSynced` window, never sticky)
+/// and the n-gram copy lane is never stopped by the floor. On, the floor runs unless
+/// `HIPFIRE_MTP_AR_FLOOR=0`.
+///
+/// Why off: a lane's floor prices each drafting window an even share of its step's row-group
+/// spill and AR none, so retiring one lane looks like it saves a share of the step, while the
+/// other lanes keep drafting and the step does not shrink; and a lane whose first window
+/// rejected early holds the shallow cap it was moved to (the deeper cap is never re-measured)
+/// until it retires. On EP2 R9700 code C8 (cp8/cp9, CpFix j8164) one or two of eight lanes
+/// retired after 16 windows in every load and decoded 1 token per 72 ms step while the others
+/// emitted about 6: the last stream ran alone for about 1.8 s and the cell failed the
+/// concurrency check (all-8-decoding 0.39-0.48 of its span) at 269-292 tok/s, against 434-443
+/// tok/s and a pass with the floor off. Story C4 1.22x, story C8 1.05x, code C8 1.34x with
+/// the floor off (CpFix j8168, 2 loads per arm).
+pub(crate) fn ep_mesh_lane_floor_enabled() -> bool {
+    floor_env_enabled() && hipfire_config::developer_bool("HIPFIRE_QWEN4_EP_LANE_AR_FLOOR", false)
+}
+
 const LANE_MAX_DRAFTS: usize = crate::gpu_forward_lanes::LANE_MAX_ROWS - 1;
 
 /// `HIPFIRE_QWEN4_LANE_COST` (developer; `0` opts out): the measured lane

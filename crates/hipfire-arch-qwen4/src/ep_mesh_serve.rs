@@ -123,7 +123,7 @@ impl Qwen4Bundle {
         let mut mesh = EpMeshLanes::new(
             self,
             topology_generation,
-            crate::mtp_lanes::floor_env_enabled(),
+            crate::mtp_lanes::ep_mesh_lane_floor_enabled(),
         )?;
         mesh.set_driver_terminates(true);
         self.mesh_lanes = Some(Box::new(mesh));
