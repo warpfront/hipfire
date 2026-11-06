@@ -1290,3 +1290,8 @@ required-features = ["lab"]
 [[example]]
 name = "gated_delta_vector_chunk_node"
 required-features = ["deltanet"]
+
+# Q8 flash-attention head_dim=96 probe (needs a GPU).
+[[example]]
+name = "q8_flash_head96_test"
+required-features = ["lab"]

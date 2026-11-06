@@ -652,6 +652,7 @@ Workspace crates with a path dependency on this crate:
 - `hipfire-arch-embeddinggemma2`
 - `hipfire-arch-gemma4`
 - `hipfire-arch-lfm2moe`
+- `hipfire-arch-lfm3`
 - `hipfire-arch-maple`
 - `hipfire-arch-minimax`
 - `hipfire-arch-muse-glimmer`

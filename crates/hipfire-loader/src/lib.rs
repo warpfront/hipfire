@@ -7801,6 +7801,24 @@ mod registry_tests {
             if id == 15 {
                 continue;
             }
+            // LFM3 (24) declares QwenJinja only so the engine forwards
+            // `thinking` / `reasoning_effort` / `max_think_tokens` (its vendor
+            // template keys a real `enable_thinking` boolean). That contract
+            // does not imply replay: the template's generation turn computes
+            // `keep_thinking = preserve_thinking or loop.index0 >
+            // last_user_index`, which is false for every HISTORICAL assistant
+            // turn at the default `preserve_thinking=false`, and it then strips
+            // any `</think>` out of `content` and emits an EMPTY
+            // `<think></think>` in its place. Forwarding `reasoning_content`
+            // would therefore change nothing the model sees — the same
+            // situation the doc comment above allows for DeepSeek4 and Gemma4.
+            // Serve reporting the fallback `qwen3` label (which does not
+            // replay) matches the template. If LFM3 ever opts into
+            // `preserve_thinking`, give it its own `arch_label` AND a replay
+            // rule, and delete this exemption.
+            if id == 24 {
+                continue;
+            }
             let label = arch_label(id);
             assert!(
                 arch_replays_history_reasoning(label),

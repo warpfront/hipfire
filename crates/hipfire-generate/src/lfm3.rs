@@ -16,7 +16,7 @@ use hipfire_arch_lfm3_audio::{lfm3_audio, mel as lfm3_mel, wav as lfm3_wav};
 use hipfire_arch_lfm3_vl::lfm3_vl;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_engine::emit::{
-    emit_error_with_id, emit_gen_start, render_tail_opens_think, write_error,
+    emit_error_with_id, emit_gen_start, emit_visible_token, render_tail_opens_think, write_error,
 };
 use hipfire_engine::terminal::{
     active_attempt_id, await_client_terminal_commit, emit_staged_terminal_done,
@@ -36,6 +36,151 @@ fn emit_active_attempt_error(
     rolled_back: bool,
 ) {
     crate::dense::emit_active_attempt_error(stdout, id, message, class, retryable, rolled_back);
+}
+
+/// Tool-call routing shared by every LFM3 decode loop (text, VL, audio).
+///
+/// LFM3's vendor `chat_template.jinja` renders `tools` into a
+/// `<tools>…</tools>` system block and emits Qwen3-style XML calls —
+/// `<tool_call>\n<function=NAME>\n<parameter=K>\nV\n</parameter>\n</function>\n</tool_call>`
+/// — which is exactly the shape `tokenizer_config.json`'s
+/// `response_template.tool_calls` regex describes and that `emit_text`'s
+/// strict `ToolOutputRouter` already parses for `qwen_ar`. Reuse that router
+/// rather than adding a second parser: it holds marker prefixes across
+/// fragments (robust to `<tool_call>` arriving split) and withholds the whole
+/// span from the client stream, so no raw XML leaks into `content` and no
+/// tool-span text can be mis-matched as a user `stop` sequence.
+///
+/// Arch 24 is a LEGACY-contract route (`Lfm3Carrier::caps` declares
+/// `semantic_contract_version: None`), so calls surface the legacy way: a
+/// `{"type":"tool_calls"}` event read by the client fold BEFORE the
+/// commit_ready terminal, plus `finish_reason == "tool_calls"` on `done` —
+/// the same convention `generate_lfm2moe` and `generate_maple` use. The
+/// canonical `calls` are also staged on the terminal so the payload is
+/// v2-ready if arch 24 ever grows a router-backed producer.
+///
+/// When the request declares no tools the router is `disabled()`, so
+/// tool-looking text stays ordinary visible content and can never fail the
+/// tool protocol.
+pub(crate) struct Lfm3ToolRoute {
+    /// `None` once [`Self::finish`] consumed the router (its drain takes
+    /// ownership), so a late `push` after the drain is a no-op instead of a
+    /// panic.
+    router: Option<ToolOutputRouter>,
+    calls: Vec<hipfire_runtime::prompt_frame::ToolCall>,
+    /// Latched fail-closed verdict: malformed/truncated tool protocol was seen
+    /// (unclosed span, stray closer, bad body).
+    error: Option<String>,
+}
+
+impl Lfm3ToolRoute {
+    pub(crate) fn new(tools_nonempty: bool) -> Self {
+        Self {
+            router: Some(if tools_nonempty {
+                ToolOutputRouter::new()
+            } else {
+                ToolOutputRouter::disabled()
+            }),
+            calls: Vec::new(),
+            error: None,
+        }
+    }
+
+    /// Feed one decoded fragment's VISIBLE prose through the router and return
+    /// the prose that is now safe to emit. Returns `Err(())` once the protocol
+    /// has latched malformed so the caller can end the turn.
+    pub(crate) fn push(&mut self, frag: &str) -> Result<Vec<String>, ()> {
+        let Some(router) = self.router.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let events = match router.push(frag) {
+            Ok(events) => events,
+            Err(e) => {
+                self.error.get_or_insert_with(|| e.detail().to_string());
+                return Err(());
+            }
+        };
+        Ok(self.absorb(events))
+    }
+
+    /// End-of-stream drain: flushes prose held back as a possible marker
+    /// prefix, or fails closed on an unclosed span.
+    pub(crate) fn finish(&mut self) -> Vec<String> {
+        let Some(router) = self.router.take() else {
+            return Vec::new();
+        };
+        match router.finish() {
+            Ok(events) => self.absorb(events),
+            Err(e) => {
+                self.error.get_or_insert_with(|| e.detail().to_string());
+                Vec::new()
+            }
+        }
+    }
+
+    fn absorb(&mut self, events: Vec<ToolRouteEvent>) -> Vec<String> {
+        let mut visible = Vec::new();
+        for event in events {
+            match event {
+                ToolRouteEvent::VisibleText(vt) => visible.push(vt.as_str().to_string()),
+                ToolRouteEvent::ToolCall(tc) => self.calls.push(tc),
+            }
+        }
+        visible
+    }
+
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// Resolve this turn's `finish_reason` and release the calls.
+    ///
+    /// `hit_length_cap` wins: a truncated turn never releases calls (a
+    /// half-written `<tool_call>` body must not become executable
+    /// arguments) and the client ignores `calls` on a length terminal.
+    ///
+    /// A latched malformed protocol that the model ended the turn inside is a
+    /// non-retryable unsafe terminal; running out of budget there is an
+    /// ordinary length stop, exactly as the Qwen AR and LFM2.5 paths classify
+    /// it. Returns `Err(detail)` for the caller to emit as a `validation`
+    /// error and return without a `done`.
+    pub(crate) fn terminal(
+        self,
+        hit_length_cap: bool,
+    ) -> Result<(&'static str, Vec<hipfire_runtime::prompt_frame::ToolCall>), String> {
+        if let Some(detail) = self.error {
+            if !hit_length_cap {
+                return Err(detail);
+            }
+        }
+        // A length terminal releases NO calls, structurally: a turn cut off by
+        // the budget can hold a half-written call, and it is the wire's job —
+        // not the client's — to keep that off the response.
+        if hit_length_cap {
+            return Ok(("length", Vec::new()));
+        }
+        let finish_reason = if self.calls.is_empty() {
+            "stop"
+        } else {
+            "tool_calls"
+        };
+        Ok((finish_reason, self.calls))
+    }
+}
+
+/// Stage and emit the legacy tool-call surfaces for a finished LFM3 turn.
+///
+/// The `{"type":"tool_calls"}` event MUST precede the commit_ready terminal:
+/// the client fold reads it before the terminal handshake.
+pub(crate) fn emit_lfm3_tool_terminal(
+    stdout: &mut impl Write,
+    id: &str,
+    pending_done: &mut serde_json::Value,
+    finish_reason: &str,
+    calls: &[hipfire_runtime::prompt_frame::ToolCall],
+) {
+    hipfire_engine::emit::stage_terminal_tool_calls(pending_done, finish_reason, calls);
+    hipfire_engine::emit::emit_tool_calls_event(stdout, id, calls);
 }
 
 pub fn generate_lfm3(
@@ -289,36 +434,9 @@ pub fn generate_lfm3(
     let mut generated_count: usize = 0;
     let mut stop_matcher = hipfire_runtime::stop_sequence::StopMatcher::new(stop);
 
-    // ── Tool-call routing. LFM3 is a tool-calling model. Its vendor
-    // `chat_template.jinja` renders `tools` into a `<tools>…</tools>` system
-    // block and emits Qwen3-style XML calls —
-    // `<tool_call>\n<function=NAME>\n<parameter=K>\nV\n</parameter>\n</function>\n</tool_call>`
-    // — which is exactly the shape `tokenizer_config.json`'s
-    // `response_template.tool_calls` regex describes and that
-    // `emit_text`'s `ToolOutputRouter` already parses for `qwen_ar`. So reuse
-    // that router rather than adding a second parser: it holds marker prefixes
-    // across fragments (robust to `<tool_call>` arriving split) and withholds
-    // the whole span from the client stream, so no raw XML leaks into
-    // `content` and nothing gets mis-matched as a `stop` sequence.
-    //
-    // The LFM3 route is the LEGACY wire contract (`Lfm3Carrier::caps` declares
-    // `semantic_contract_version: None`), so the client fold expects calls as a
-    // `{"type":"tool_calls"}` event (read before the commit_ready terminal)
-    // plus a `finish_reason == "tool_calls"` `done` — the same convention
-    // `generate_lfm2moe` and `generate_maple` use. When the request declares no
-    // tools the router is `disabled()`, so tool-looking text stays ordinary
-    // visible content and can never fail the tool protocol.
-    let tools_nonempty = tools.map(|t| !t.is_empty()).unwrap_or(false);
-    let mut tool_router = if tools_nonempty {
-        ToolOutputRouter::new()
-    } else {
-        ToolOutputRouter::disabled()
-    };
-    let mut tool_calls: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
-    // Latched fail-closed verdict: the model emitted malformed/truncated tool
-    // protocol (unclosed span, stray closer, bad body). The turn must not
-    // release calls and must not claim a natural stop.
-    let mut tool_protocol_error: Option<String> = None;
+    // ── Tool-call routing (see `Lfm3ToolRoute` for why this router and why
+    // the legacy terminal shape). ──
+    let mut tools_route = Lfm3ToolRoute::new(tools.map(|t| !t.is_empty()).unwrap_or(false));
 
     let decode_t0 = Instant::now();
     loop {
@@ -346,40 +464,24 @@ pub fn generate_lfm3(
             break;
         }
         // Route the fragment. Tool-call spans are withheld from the client
-        // stream and parsed into structured `tool_calls`; only the router's
-        // visible prose reaches the stop matcher (so tool-span text can never
-        // trip a user `stop` sequence) and the wire.
-        match tool_router.push(&frag) {
-            Ok(events) => {
-                for event in events {
-                    if stop_matcher.matched() {
-                        break;
-                    }
-                    match event {
-                        ToolRouteEvent::VisibleText(vt) => {
-                            // [OI] stop matching on the visible answer: emit
-                            // only what is now safe (a possible stop prefix is
-                            // held back), and end the turn when a stop sequence
-                            // matches — the stop text itself is never emitted.
-                            let visible = stop_matcher.push(vt.as_str());
-                            if !visible.is_empty() {
-                                let envelope = serde_json::json!({
-                                    "type": "token",
-                                    "id": id,
-                                    "text": visible.as_ref(),
-                                    "attempt_id": active_attempt_id(),
-                                });
-                                let _ = writeln!(stdout, "{}", envelope);
-                                let _ = stdout.flush();
-                            }
-                        }
-                        ToolRouteEvent::ToolCall(tc) => tool_calls.push(tc),
-                    }
-                }
-            }
-            Err(e) => {
-                tool_protocol_error = Some(e.detail().to_string());
+        // stream and parsed into structured calls; only the router's visible
+        // prose reaches the stop matcher (so tool-span text can never trip a
+        // user `stop` sequence) and the wire.
+        let visible_parts = match tools_route.push(&frag) {
+            Ok(parts) => parts,
+            Err(()) => break,
+        };
+        for part in visible_parts {
+            if stop_matcher.matched() {
                 break;
+            }
+            // [OI] stop matching on the visible answer: emit only what is now
+            // safe (a possible stop prefix is held back), and end the turn
+            // when a stop sequence matches — the stop text itself is never
+            // emitted.
+            let visible = stop_matcher.push(&part);
+            if !visible.is_empty() {
+                emit_visible_token(stdout, id, visible.as_ref());
             }
         }
         if stop_matcher.matched() {
@@ -407,38 +509,16 @@ pub fn generate_lfm3(
 
     m.seq_pos = m.lfm3().unwrap().state.n_tokens;
 
-    // End-of-stream router drain. A normal state flushes any prose held back as
-    // a possible `<tool_call>` marker prefix; an open span fails closed (the
-    // partial body is dropped, no calls are fabricated). Visible text still
-    // passes the stop matcher first.
-    match tool_router.finish() {
-        Ok(events) => {
-            for event in events {
-                if stop_matcher.matched() {
-                    break;
-                }
-                match event {
-                    ToolRouteEvent::VisibleText(vt) => {
-                        let visible = stop_matcher.push(vt.as_str());
-                        if !visible.is_empty() {
-                            let envelope = serde_json::json!({
-                                "type": "token",
-                                "id": id,
-                                "text": visible.as_ref(),
-                                "attempt_id": active_attempt_id(),
-                            });
-                            let _ = writeln!(stdout, "{}", envelope);
-                            let _ = stdout.flush();
-                        }
-                    }
-                    ToolRouteEvent::ToolCall(tc) => tool_calls.push(tc),
-                }
-            }
+    // End-of-stream router drain: flushes prose held back as a possible
+    // `<tool_call>` marker prefix, or fails closed on an unclosed span (the
+    // partial body is dropped, no calls are fabricated).
+    for part in tools_route.finish() {
+        if stop_matcher.matched() {
+            break;
         }
-        Err(e) => {
-            if tool_protocol_error.is_none() {
-                tool_protocol_error = Some(e.detail().to_string());
-            }
+        let visible = stop_matcher.push(&part);
+        if !visible.is_empty() {
+            emit_visible_token(stdout, id, visible.as_ref());
         }
     }
 
@@ -446,17 +526,10 @@ pub fn generate_lfm3(
     // loop ended WITHOUT a match (cap / EOS) is legitimate output — release
     // it as one final token event. Suppressed on a fail-closed tool protocol so
     // nothing more is written after the router rejected the turn.
-    if !stop_matcher.matched() && tool_protocol_error.is_none() {
+    if !stop_matcher.matched() && tools_route.error().is_none() {
         let tail = stop_matcher.finish();
         if !tail.is_empty() {
-            let envelope = serde_json::json!({
-                "type": "token",
-                "id": id,
-                "text": tail,
-                "attempt_id": active_attempt_id(),
-            });
-            let _ = writeln!(stdout, "{}", envelope);
-            let _ = stdout.flush();
+            emit_visible_token(stdout, id, &tail);
         }
     }
 
@@ -467,18 +540,15 @@ pub fn generate_lfm3(
     } else {
         0.0
     };
-    // The loop's only breaks are the max_tokens cap, stop_toks, the
-    // string-level EOS guard, a [OI] stop-sequence match, and a latched tool
-    // protocol error. Reaching the cap is the sole non-stop cause: the CLI
-    // defaults a missing finish_reason to "stop", which mislabeled token-cap
-    // truncation as a natural stop.
+    // Reaching the token cap is the sole non-stop cause besides a tool
+    // terminal: the CLI defaults a missing finish_reason to "stop", which
+    // mislabeled token-cap truncation as a natural stop.
     let hit_length_cap = generated_count >= max_tokens;
-    // An unfinished tool protocol is a NON-retryable unsafe terminal when the
-    // model ended the turn inside it. Running out of budget there is an
-    // ordinary length stop (no calls, no fabrication), exactly as the Qwen AR
-    // and LFM2.5 paths classify it.
-    if let Some(detail) = tool_protocol_error.as_deref() {
-        if !hit_length_cap {
+    let (finish_reason, tool_calls) = match tools_route.terminal(hit_length_cap) {
+        Ok(resolved) => resolved,
+        Err(detail) => {
+            // A malformed tool protocol the model ended the turn inside is a
+            // non-retryable unsafe terminal: no `done`, no calls.
             emit_active_attempt_error(
                 stdout,
                 Some(id),
@@ -490,17 +560,6 @@ pub fn generate_lfm3(
             let _ = stdout.flush();
             return;
         }
-    }
-    // "length" when the token budget ended the turn mid-stream; "tool_calls"
-    // when the turn ended by producing executable calls (the convention every
-    // tool-capable arch uses); otherwise a natural "stop". Calls are ignored by
-    // the client on a length terminal, so a truncated call never surfaces.
-    let finish_reason = if hit_length_cap {
-        "length"
-    } else if !tool_calls.is_empty() {
-        "tool_calls"
-    } else {
-        "stop"
     };
     let mut pending_done = serde_json::json!({
         "type": "done",
@@ -512,12 +571,11 @@ pub fn generate_lfm3(
         "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
-    // Legacy contract: embed the canonical `calls` on the staged done (so the
-    // payload is v2-ready if arch 24 ever grows a router) AND emit the
-    // `{"type":"tool_calls"}` event the client fold reads. The event must
-    // precede the commit_ready terminal.
-    hipfire_engine::emit::stage_terminal_tool_calls(&mut pending_done, finish_reason, &tool_calls);
-    hipfire_engine::emit::emit_tool_calls_event(stdout, id, &tool_calls);
+    // Legacy contract: the canonical `calls` ride the staged done (so the
+    // payload is v2-ready if arch 24 ever grows a router-backed producer) and
+    // the `{"type":"tool_calls"}` event the client fold reads precedes the
+    // commit_ready terminal.
+    emit_lfm3_tool_terminal(stdout, id, &mut pending_done, finish_reason, &tool_calls);
     let _ = stdout.flush();
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => {
@@ -553,6 +611,8 @@ pub fn generate_lfm3_vl(
         max_think_tokens: _,
         repeat_penalty: _,
         repeat_window: _,
+        tools,
+        messages_history,
         ..
     } = *params;
 
@@ -721,19 +781,67 @@ pub fn generate_lfm3_vl(
             reasoning_strength: None,
             reasoning_effort: None,
         };
-        match frame.render() {
+        // A tools request renders the WHOLE conversation (the vendor template
+        // needs `tools` plus any prior `tool_calls` / `tool` turns on the
+        // message array); a plain turn keeps the single-prompt `render()` it
+        // has always used, so non-tool VL output is byte-identical.
+        let rendered = if tools.is_some_and(|t| !t.is_empty()) || messages_history.is_some() {
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                Some(h) => h,
+                None => {
+                    let mut v = Vec::new();
+                    if let Some(sys) = system_prompt {
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: sys.to_string(),
+                            reasoning_content: None,
+                            name: None,
+                            rendered_name: None,
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                            tool_plan: String::new(),
+                        });
+                    }
+                    v.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: prompt.to_string(),
+                        reasoning_content: None,
+                        name: None,
+                        rendered_name: None,
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                        tool_plan: String::new(),
+                    });
+                    synthesized = v;
+                    &synthesized
+                }
+            };
+            frame.render_messages(messages_slice, tools, None)
+        } else {
+            frame.render()
+        };
+        match rendered {
             Ok(rendered) => {
                 let mut toks = tokenizer.encode(&rendered);
                 // Insert the vision sequence immediately before the user
-                // content (the prompt tokens) in the rendered stream.
-                if !q_tokens.is_empty() {
-                    if let Some(pos) = toks.windows(q_tokens.len()).position(|w| w == q_tokens) {
+                // content (the prompt tokens) in the rendered stream. Anchor on
+                // the LAST occurrence: with a tool-using history the same user
+                // text can appear in an earlier turn, and the image belongs to
+                // the current one.
+                let anchor = if q_tokens.is_empty() {
+                    None
+                } else {
+                    toks.windows(q_tokens.len())
+                        .rposition(|w| w == q_tokens.as_slice())
+                };
+                match anchor {
+                    Some(pos) => {
                         toks.splice(pos..pos, vision_seq.clone());
-                    } else {
-                        eprintln!(
-                            "[lfm3-vl] warning: could not locate user content for vision splice"
-                        );
                     }
+                    None => eprintln!(
+                        "[lfm3-vl] warning: could not locate user content for vision splice"
+                    ),
                 }
                 toks
             }
@@ -872,6 +980,7 @@ pub fn generate_lfm3_vl(
         .unwrap_or(0x9E3779B97F4A7C15);
     let mut rng = sampling::Xorshift::new(seed);
     let mut generated_count: usize = 0;
+    let mut tools_route = Lfm3ToolRoute::new(tools.map(|t| !t.is_empty()).unwrap_or(false));
     let decode_t0 = Instant::now();
     loop {
         if generated_count >= max_tokens {
@@ -893,14 +1002,18 @@ pub fn generate_lfm3_vl(
         if matches!(frag.trim(), "</s>" | "<|im_end|>") {
             break;
         }
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
+        // Tool-call routing: an LFM3-VL turn can end in a call (the same
+        // `<tool_call><function=…>` shape the text route emits), so the
+        // visible prose is routed and the span withheld exactly as in
+        // `generate_lfm3`.
+        match tools_route.push(&frag) {
+            Ok(parts) => {
+                for part in parts {
+                    emit_visible_token(stdout, id, &part);
+                }
+            }
+            Err(()) => break,
+        }
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
@@ -922,6 +1035,11 @@ pub fn generate_lfm3_vl(
     }
 
     m.seq_pos = m.lfm3().unwrap().state.n_tokens;
+    // Flush prose held back as a possible marker prefix / fail closed on an
+    // unclosed span.
+    for part in tools_route.finish() {
+        emit_visible_token(stdout, id, &part);
+    }
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
     let tok_s = if generated_count > 0 {
@@ -929,16 +1047,26 @@ pub fn generate_lfm3_vl(
     } else {
         0.0
     };
-    // The loop's only breaks are the max_tokens cap, stop_toks, and the
-    // string-level EOS guard (all "stop"), so reaching the cap is the sole
-    // non-stop cause. The CLI defaults a missing finish_reason to "stop",
-    // which mislabeled token-cap truncation as a natural stop.
-    let finish_reason = if generated_count >= max_tokens {
-        "length"
-    } else {
-        "stop"
+    // Reaching the cap is the sole non-stop cause besides a tool terminal: the
+    // CLI defaults a missing finish_reason to "stop", which mislabeled
+    // token-cap truncation as a natural stop.
+    let hit_length_cap = generated_count >= max_tokens;
+    let (finish_reason, tool_calls) = match tools_route.terminal(hit_length_cap) {
+        Ok(resolved) => resolved,
+        Err(detail) => {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!("malformed tool protocol: {detail}"),
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
     };
-    let pending_done = serde_json::json!({
+    let mut pending_done = serde_json::json!({
         "type": "done",
         "id": id,
         "tokens": generated_count,
@@ -948,6 +1076,8 @@ pub fn generate_lfm3_vl(
         "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
+    emit_lfm3_tool_terminal(stdout, id, &mut pending_done, finish_reason, &tool_calls);
+    let _ = stdout.flush();
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => {
             let _ = emit_staged_terminal_done(stdout, &pending_done);
@@ -1009,6 +1139,13 @@ pub fn generate_lfm3_audio(
     // open-think request turns it on.
     enable_thinking: bool,
     audio_bytes: &[u8],
+    // [OI] `tools` on an audio turn: the model hears the clip and may answer
+    // with a tool call. The vendor template renders the `<tools>` block and
+    // `Lfm3ToolRoute` withholds/parses the `<tool_call>` span exactly as the
+    // text and VL routes do. `None` (the ASR default) keeps the transcript
+    // path byte-identical.
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
     use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame};
 
@@ -1202,7 +1339,46 @@ pub fn generate_lfm3_audio(
             reasoning_strength: None,
             reasoning_effort: None,
         };
-        match frame.render() {
+        // A tools request renders the WHOLE conversation so prior
+        // `tool_calls` / `tool` turns replay; a plain ASR turn keeps the
+        // single-prompt `render()` it has always used.
+        let rendered = if tools.is_some_and(|t| !t.is_empty()) || messages_history.is_some() {
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                Some(h) => h,
+                None => {
+                    let mut v = Vec::new();
+                    if let Some(sys) = system_prompt {
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: sys.to_string(),
+                            reasoning_content: None,
+                            name: None,
+                            rendered_name: None,
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                            tool_plan: String::new(),
+                        });
+                    }
+                    v.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: prompt.to_string(),
+                        reasoning_content: None,
+                        name: None,
+                        rendered_name: None,
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                        tool_plan: String::new(),
+                    });
+                    synthesized = v;
+                    &synthesized
+                }
+            };
+            frame.render_messages(messages_slice, tools, None)
+        } else {
+            frame.render()
+        };
+        match rendered {
             Ok(rendered) => {
                 let mut toks = tokenizer.encode(&rendered);
                 // Splice position: when the request carries text, immediately
@@ -1367,6 +1543,7 @@ pub fn generate_lfm3_audio(
         .unwrap_or(0x9E3779B97F4A7C15);
     let mut rng = sampling::Xorshift::new(seed);
     let mut generated_count: usize = 0;
+    let mut tools_route = Lfm3ToolRoute::new(tools.map(|t| !t.is_empty()).unwrap_or(false));
     let decode_t0 = Instant::now();
     loop {
         if generated_count >= max_tokens {
@@ -1383,14 +1560,14 @@ pub fn generate_lfm3_audio(
         if matches!(frag.trim(), "</s>" | "<|im_end|>") {
             break;
         }
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
+        match tools_route.push(&frag) {
+            Ok(parts) => {
+                for part in parts {
+                    emit_visible_token(stdout, id, &part);
+                }
+            }
+            Err(()) => break,
+        }
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
@@ -1412,6 +1589,9 @@ pub fn generate_lfm3_audio(
     }
 
     m.seq_pos = m.lfm3().unwrap().state.n_tokens;
+    for part in tools_route.finish() {
+        emit_visible_token(stdout, id, &part);
+    }
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
     let tok_s = if generated_count > 0 {
@@ -1419,16 +1599,26 @@ pub fn generate_lfm3_audio(
     } else {
         0.0
     };
-    // The loop's only breaks are the max_tokens cap, stop_toks, and the
-    // string-level EOS guard (all "stop"), so reaching the cap is the sole
-    // non-stop cause. The CLI defaults a missing finish_reason to "stop",
-    // which mislabeled token-cap truncation as a natural stop.
-    let finish_reason = if generated_count >= max_tokens {
-        "length"
-    } else {
-        "stop"
+    // Reaching the cap is the sole non-stop cause besides a tool terminal: the
+    // CLI defaults a missing finish_reason to "stop", which mislabeled
+    // token-cap truncation as a natural stop.
+    let hit_length_cap = generated_count >= max_tokens;
+    let (finish_reason, tool_calls) = match tools_route.terminal(hit_length_cap) {
+        Ok(resolved) => resolved,
+        Err(detail) => {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!("malformed tool protocol: {detail}"),
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
     };
-    let pending_done = serde_json::json!({
+    let mut pending_done = serde_json::json!({
         "type": "done",
         "id": id,
         "tokens": generated_count,
@@ -1438,6 +1628,8 @@ pub fn generate_lfm3_audio(
         "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
+    emit_lfm3_tool_terminal(stdout, id, &mut pending_done, finish_reason, &tool_calls);
+    let _ = stdout.flush();
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => {
             let _ = emit_staged_terminal_done(stdout, &pending_done);
@@ -1984,4 +2176,126 @@ pub fn generate_lfm3_omni(
         serde_json::json!({"type":"done","id":id,"tokens":out.text_tokens.len(),"total_ms":gen_ms,"finish_reason":finish_reason,"attempt_id":active_attempt_id()})
     );
     let _ = stdout.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Lfm3ToolRoute;
+
+    /// The XML shape LFM3's vendor template renders and the model emits
+    /// (matches `tokenizer_config.json`'s `response_template.tool_calls`).
+    const CALL: &str = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=units>\ncelsius\n</parameter>\n</function>\n</tool_call>";
+
+    /// Split `s` into one-token-per-char fragments, the way the decode loops
+    /// feed it (markers arrive split across fragments).
+    fn feed(route: &mut Lfm3ToolRoute, s: &str) {
+        for ch in s.chars() {
+            let mut buf = [0u8; 4];
+            route
+                .push(ch.encode_utf8(&mut buf))
+                .expect("no protocol error");
+        }
+    }
+
+    #[test]
+    fn prose_is_visible_and_a_complete_call_is_released() {
+        let mut route = Lfm3ToolRoute::new(true);
+        feed(&mut route, &format!("Let me check.\n{CALL}"));
+        assert!(route.finish().is_empty());
+        let (finish_reason, calls) = route.terminal(false).expect("clean terminal");
+        assert_eq!(finish_reason, "tool_calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].arguments["city"], "Paris");
+        assert_eq!(calls[0].arguments["units"], "celsius");
+    }
+
+    #[test]
+    fn tool_span_never_reaches_visible_text() {
+        let mut route = Lfm3ToolRoute::new(true);
+        let mut visible = String::new();
+        for ch in format!("pre{CALL}post").chars() {
+            let mut buf = [0u8; 4];
+            visible.push_str(
+                &route
+                    .push(ch.encode_utf8(&mut buf))
+                    .expect("no error")
+                    .concat(),
+            );
+        }
+        visible.push_str(&route.finish().concat());
+        assert_eq!(visible, "prepost");
+        assert!(!visible.contains("<tool_call"));
+        assert!(!visible.contains("<parameter="));
+    }
+
+    #[test]
+    fn a_tool_free_request_keeps_tool_looking_text_visible() {
+        // Router disabled: the same bytes are ordinary prose and can never
+        // become executable calls or latch a protocol error.
+        let mut route = Lfm3ToolRoute::new(false);
+        let mut visible = String::new();
+        for ch in format!("pre{CALL}post").chars() {
+            let mut buf = [0u8; 4];
+            visible.push_str(
+                &route
+                    .push(ch.encode_utf8(&mut buf))
+                    .expect("no error")
+                    .concat(),
+            );
+        }
+        visible.push_str(&route.finish().concat());
+        assert_eq!(visible, format!("pre{CALL}post"));
+        let (finish_reason, calls) = route.terminal(false).expect("clean terminal");
+        assert_eq!(finish_reason, "stop");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn unclosed_span_at_end_of_turn_fails_closed() {
+        let mut route = Lfm3ToolRoute::new(true);
+        feed(
+            &mut route,
+            "<tool_call>\n<function=get_weather>\n<parameter=city>\nPar",
+        );
+        assert!(route.finish().is_empty());
+        let err = route.terminal(false).expect_err("must fail closed");
+        assert!(err.contains("unclosed"), "detail: {err}");
+    }
+
+    #[test]
+    fn unclosed_span_under_the_token_cap_is_a_plain_length_stop() {
+        // Running out of budget inside a call is truncation, not a malformed
+        // terminal: `length`, no calls, nothing fabricated.
+        let mut route = Lfm3ToolRoute::new(true);
+        feed(
+            &mut route,
+            "<tool_call>\n<function=get_weather>\n<parameter=city>\nPar",
+        );
+        assert!(route.finish().is_empty());
+        let (finish_reason, calls) = route.terminal(true).expect("length terminal");
+        assert_eq!(finish_reason, "length");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn a_truncated_capped_turn_never_releases_a_completed_call() {
+        // The call body completed but the budget kept ending the turn: calls
+        // stay off the wire so a half-written reply cannot execute.
+        let mut route = Lfm3ToolRoute::new(true);
+        feed(&mut route, CALL);
+        let (finish_reason, calls) = route.terminal(true).expect("length terminal");
+        assert_eq!(finish_reason, "length");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn plain_prose_turn_is_a_stop_with_no_calls() {
+        let mut route = Lfm3ToolRoute::new(true);
+        feed(&mut route, "The weather in Paris is mild.");
+        assert!(route.finish().is_empty());
+        let (finish_reason, calls) = route.terminal(false).expect("clean terminal");
+        assert_eq!(finish_reason, "stop");
+        assert!(calls.is_empty());
+    }
 }

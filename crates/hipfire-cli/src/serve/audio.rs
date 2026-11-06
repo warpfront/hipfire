@@ -226,6 +226,24 @@ pub(crate) async fn handle_tts(
         .and_then(serde_json::Value::as_str)
         .filter(|v| *v == "male" || *v == "female")
         .map(str::to_owned);
+    // `/tts` returns AUDIO. A tool call is a text artifact the caller has to
+    // act on before the next turn, and speech has no channel to carry it, so a
+    // `tools` field here cannot be honored. Refuse by name rather than
+    // synthesizing a reply that silently ignored the declared schemas (the
+    // model would still happily speak a *description* of a call it never
+    // made).
+    if body
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+    {
+        return openai_error(
+            "tools are not supported on /tts — its response is audio/wav. Send the text \
+             turn to /v1/chat/completions with `tools` to get a tool call, then speak the \
+             text answer with a second /tts request",
+            400,
+        );
+    }
     let max_steps = tts_max_steps_for_input(&input);
 
     let cancel = CancellationToken::new();

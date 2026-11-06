@@ -55,4 +55,7 @@ hipfire-arch-maple         debt        4     0   arch 15; no registry use to rec
 hipfire-arch-qwen2         debt        2     0
 hipfire-arch-raon          debt        1     0   Raon-1-mini-preview arch; 1 direct rdna-compute launcher call (bypass debt owned by the Raon bring-up; the Q8_0 prefill projection now goes through hipfire-dispatch q8_0_prefill_gemm)
 hipfire-arch-lfm2-vl       debt        2     0   arch 11; tower/projector GEMMs (gemm_f16_wmma_mb8, gemm_f16)
+hipfire-arch-lfm3-audio    debt        1     0   arch 24 (LFM3 speech encoder); the conformer/downsampler projector's linear (gemm_f16), the same tower-GEMM debt lfm2-vl carries
+hipfire-arch-lfm3-omni     debt        3     0   arch 24 (LFM3-Omni depth decoder + audio codec); depth-decoder projection linear and the codec's two f16 GEMMs (gemm_f16); same registry-key debt, migration target is the shared project_weights family
+hipfire-arch-lfm3-vl       debt        1     0   arch 24 (LFM3-VL); the SigLIP-style tower/projector linear (gemm_f16), the same tower-GEMM debt lfm2-vl carries
 hipfire-arch-qwen35-vl     debt        5     0   arch 5 vision tower linears; +3 = LDS-tiled WMMA GEMM (gfx1201 split1 packed + pitched for the padded fc2, gfx11 lds_auto_ld), the same entry points qwen35-embed uses

@@ -3588,14 +3588,75 @@ fn main() {
                 let has_image = image_base64.is_some() || image.is_some();
                 let vision_route = hipfire_loader::vision_route(m.arch_id);
 
-                // LFM3-Omni TTS (audio OUT) / LFM3-Audio ASR (audio IN):
-                // arch 24 routes keyed on the pre-merge top-level request
-                // fields (`tts` / `audio` / `audio_base64`). Checked before the
-                // generic text route; VL still flows through the vision branch.
-                if m.arch_id == 24 {
+                // A tools request on a vision turn is only renderable on the
+                // LFM3-VL route: its vendor template has a real
+                // `{% if tools %}` block AND the model emits the
+                // `<tool_call><function=…>` shape `generate_lfm3_vl` routes.
+                // Every other vision template carries no tool format, and
+                // dropping the schemas silently is the worst outcome — the
+                // model still produces a confident tool call, just for a tool
+                // inventory it was never given (verified on LFM3-VL before
+                // this wiring: with `tools` supplied but unrendered it wrote
+                // `set_colour("#E81C1C")` into prose instead of calling it).
+                // Refuse by name instead.
+                if has_image
+                    && tools_json.is_some()
+                    && !matches!(vision_route, hipfire_loader::VisionRoute::Lfm3Vl)
+                {
+                    hipfire_generate::dense::emit_active_attempt_error(
+                        &mut stdout,
+                        Some(id),
+                        &format!(
+                            "tools are not supported on the {:?} vision route — its chat \
+                             template embeds no tool format; request the image turn without \
+                             `tools` (LFM3-VL is the only vision route that renders them)",
+                            vision_route
+                        ),
+                        "unsupported",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+
+                // LFM3-Omni TTS (audio OUT) / LFM3-Audio ASR (audio IN): the
+                // `tts` / `audio` / `audio_base64` wire fields are LFM3-only
+                // surfaces, dispatched on the TOWERS the loaded bundle carries
+                // rather than on an arch id — the same declared-capability
+                // rule `has_vision_encoder()` follows below, and what keeps
+                // the `daemon_arch_id` ratchet at zero. Both accessors are
+                // `None` for every
+                // non-LFM3 load (no `Lfm3Bundle` to downcast), so a model
+                // without the towers never enters. Checked before the generic
+                // text route; VL still flows through the vision branch.
+                let has_lfm3_depth = m.lfm3_depth_weights().is_some();
+                let has_lfm3_audio = m.lfm3_audio_weights().is_some();
+                if has_lfm3_depth || has_lfm3_audio {
                     let tts = msg.get("tts").and_then(|v| v.as_bool()).unwrap_or(false);
                     if tts {
-                        if m.lfm3_depth_weights().is_some() {
+                        // TTS output is AUDIO. A tool call is a text artifact
+                        // the caller must act on before the next turn, and the
+                        // spoken reply has no channel to carry it, so a tools
+                        // request on the TTS route cannot be honored. Refuse
+                        // by name here instead of vocoding an answer that
+                        // silently ignored the schemas.
+                        if tools_json.is_some() {
+                            hipfire_generate::dense::emit_active_attempt_error(
+                                &mut stdout,
+                                Some(id),
+                                "tools are not supported on the LFM3 TTS route (tts=true) — \
+                                 its output is audio; drop `tts` to get a text turn that can \
+                                 emit tool calls, or run TTS as a second request over the \
+                                 text answer",
+                                "unsupported",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                        if has_lfm3_depth {
                             let mode = msg
                                 .get("mode")
                                 .and_then(|v| v.as_str())
@@ -3627,7 +3688,7 @@ fn main() {
                             write_error(
                                 &mut stdout,
                                 id,
-                                "model has no depth decoder (not an LFM3-Omni model); tts=true needs arch_id 24 + depth decoder",
+                                "model has no depth decoder (this LFM3 load carries no Omni depth tower); tts=true needs one",
                             );
                         }
                         continue;
@@ -3635,7 +3696,7 @@ fn main() {
                     let audio_base64 = msg.get("audio_base64").and_then(|v| v.as_str());
                     let audio_path = msg.get("audio").and_then(|v| v.as_str());
                     if audio_base64.is_some() || audio_path.is_some() {
-                        if m.lfm3_audio_weights().is_none() {
+                        if !has_lfm3_audio {
                             write_error(&mut stdout, id, "model has no audio encoder");
                             continue;
                         }
@@ -3687,6 +3748,8 @@ fn main() {
                                 hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
                             ),
                             &audio_bytes,
+                            tools_json.as_deref(),
+                            messages_history.as_deref(),
                         );
                         continue;
                     }
@@ -3883,6 +3946,12 @@ fn main() {
                         max_think_tokens: vl_max_think_tokens,
                         assistant_prefix,
                         seed: vl_request_seed,
+                        // Only the LFM3-VL route renders tools (its vendor
+                        // template has a `{% if tools %}` block); every other
+                        // VL route refuses a tools request at the gate above
+                        // rather than silently dropping the schemas.
+                        tools: tools_json.as_deref(),
+                        messages_history: messages_history.as_deref(),
                     };
                     match vision_route {
                         hipfire_loader::VisionRoute::DotsOcr => {

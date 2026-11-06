@@ -57,6 +57,12 @@
  6 hipfire-arch-muse-glimmer
  6 hipfire-arch-qwen2
  6 hipfire-arch-lfm2-vl
+# LFM3 (arch 24) family. The three tower crates sit in the arch band on
+# runtime/rdna-compute; -omni is a layer higher because the depth decoder
+# depends on the -lfm3 backbone crate.
+ 6 hipfire-arch-lfm3
+ 6 hipfire-arch-lfm3-audio
+ 6 hipfire-arch-lfm3-vl
  6 hipfire-arch-qwen35-vl
  6 hipfire-arch-qwen4
  6 hipfire-arch-raon
@@ -67,6 +73,7 @@
  7 hipfire-arch-deepseek4
  7 hipfire-arch-dots-ocr
  7 hipfire-arch-lfm2moe
+ 7 hipfire-arch-lfm3-omni
  7 hipfire-arch-minimax
  7 hipfire-arch-qwen35
  7 hipfire-arch-qwen35-embed

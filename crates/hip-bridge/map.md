@@ -482,6 +482,10 @@ Workspace crates with a path dependency on this crate:
 - `hipfire-arch-gemma4`
 - `hipfire-arch-lfm2-vl`
 - `hipfire-arch-lfm2moe`
+- `hipfire-arch-lfm3`
+- `hipfire-arch-lfm3-audio`
+- `hipfire-arch-lfm3-omni`
+- `hipfire-arch-lfm3-vl`
 - `hipfire-arch-llama`
 - `hipfire-arch-maple`
 - `hipfire-arch-minimax`
