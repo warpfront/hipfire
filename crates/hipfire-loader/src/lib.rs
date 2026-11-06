@@ -3840,6 +3840,16 @@ fn resolve_qwen4_route_plan(
     {
         return Err("trunk overlay".into());
     }
+    if hipfire_arch_qwen4::resolve_hc8_sidecar(
+        hfq,
+        Path::new(req.path),
+        gpu.flags.qwen4_hc8_enabled(),
+        &receipt.config,
+    )?
+    .is_some()
+    {
+        return Err("hc8 sidecar".into());
+    }
     let kv_mode = req
         .kv_mode_override
         .filter(|s| !s.is_empty())

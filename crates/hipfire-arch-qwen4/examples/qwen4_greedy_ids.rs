@@ -421,6 +421,13 @@ impl Model {
         let trunk_overlay =
             hipfire_arch_qwen4::resolve_trunk_overlay(&hfq, path, &gpu.arch, &receipt.config)
                 .map_err(|e| format!("qwen4 trunk overlay: {e}"))?;
+        let hc8_sidecar = hipfire_arch_qwen4::resolve_hc8_sidecar(
+            &hfq,
+            path,
+            gpu.flags.qwen4_hc8_enabled(),
+            &receipt.config,
+        )
+        .map_err(|e| format!("qwen4 hc8 sidecar: {e}"))?;
         eprintln!(
             "qwen4_greedy_ids: ple rows: {} from {}",
             choice.format.name(),
@@ -592,6 +599,11 @@ impl Model {
             bundle
                 .attach_trunk_overlay(overlay)
                 .map_err(|e| format!("qwen4 trunk overlay: {e}"))?;
+        }
+        if let Some(sidecar) = hc8_sidecar {
+            bundle
+                .attach_hc8_sidecar(sidecar)
+                .map_err(|e| format!("qwen4 hc8 sidecar: {e}"))?;
         }
         bundle
             .attach_forward(&mut gpu, max_seq, scratch_mode)

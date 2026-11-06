@@ -6465,6 +6465,15 @@ fn load_qwen4_rank_unscoped(
     if band.is_some() && trunk_overlay.is_some() {
         return Err("qwen4: a trunk overlay sidecar cannot be used with pipeline parallelism (topology.pp > 1); set topology.pp = 1 or remove the overlay".into());
     }
+    // The hc8 sidecar (`<model>.hc8`): bound to this base while it is open,
+    // applied by `attach_forward`. A pipeline band applies it tolerantly
+    // (tensors outside the band are skipped).
+    let hc8_sidecar = hipfire_arch_qwen4::resolve_hc8_sidecar(
+        &hfq,
+        std::path::Path::new(ctx.path),
+        ctx.gpu.flags.qwen4_hc8_enabled(),
+        &receipt.config,
+    )?;
     // An EP rank must load the sealed source generation: base file, the PLE
     // rows just resolved and the trunk-overlay sidecar just bound. Checked
     // after both are bound, before any allocation, so a sidecar created or
@@ -6924,6 +6933,11 @@ fn load_qwen4_rank_unscoped(
     } else {
         0
     };
+    // An applied hc8 sidecar is a net saving (never a charge): the helper is
+    // 0 for it, so placement keeps the manifest's BF16 sizes.
+    let overlay_extra_bytes = overlay_extra_bytes.saturating_add(hc8_sidecar.as_ref().map_or(0, |s| {
+        hipfire_arch_qwen4::expert_residency::hc8_net_charge(s.bound().net_bytes())
+    }));
     let placement_inputs = placement_inputs.map(|mut inputs| {
         inputs.0 = inputs
             .0
@@ -8983,6 +8997,13 @@ fn load_qwen4_rank_unscoped(
             let detail = error.to_string();
             let _ = bundle.free_gpu(ctx.gpu);
             return Err(format!("qwen4: trunk overlay setup failed: {detail}"));
+        }
+    }
+    if let Some(sidecar) = hc8_sidecar {
+        if let Err(error) = bundle.attach_hc8_sidecar(sidecar) {
+            let detail = error.to_string();
+            let _ = bundle.free_gpu(ctx.gpu);
+            return Err(format!("qwen4: hc8 sidecar setup failed: {detail}"));
         }
     }
     rdna_compute::load_phases::add(

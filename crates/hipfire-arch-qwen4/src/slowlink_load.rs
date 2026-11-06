@@ -153,6 +153,9 @@ fn load_inner(
         .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let trunk_overlay = crate::resolve_trunk_overlay(&hfq, path, &gpu.arch, &receipt.config)
         .map_err(|error| format!("qwen4 trunk overlay: {error}"))?;
+    let hc8_sidecar =
+        crate::resolve_hc8_sidecar(&hfq, path, gpu.flags.qwen4_hc8_enabled(), &receipt.config)
+            .map_err(|error| format!("qwen4 hc8 sidecar: {error}"))?;
     let scratch_mode =
         crate::artifact::source_forward_scratch_mode(gpu, &hfq, &receipt.config, &receipt.manifest)
             .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
@@ -517,6 +520,15 @@ fn load_inner(
                 Err(free) => format!("bundle teardown reported {free}"),
             };
             return Err(format!("qwen4 trunk overlay: {error}; {teardown}"));
+        }
+    }
+    if let Some(sidecar) = hc8_sidecar {
+        if let Err(error) = bundle.attach_hc8_sidecar(sidecar) {
+            let teardown = match bundle.free_gpu(gpu) {
+                Ok(()) => "bundle released to the device pool".to_string(),
+                Err(free) => format!("bundle teardown reported {free}"),
+            };
+            return Err(format!("qwen4 hc8 sidecar: {error}; {teardown}"));
         }
     }
     let slowlink_profile = profile.is_some();

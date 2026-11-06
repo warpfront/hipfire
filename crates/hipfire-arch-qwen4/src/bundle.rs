@@ -248,6 +248,9 @@ pub struct Qwen4Bundle {
     /// Accepted trunk overlay sidecar (`attach_trunk_overlay`), consumed by
     /// `attach_forward`; `None` = none pending.
     pub(crate) trunk_overlay: Option<crate::trunk_overlay::Qwen4TrunkOverlay>,
+    /// Accepted `.hc8` sidecar (`attach_hc8_sidecar`), consumed by
+    /// `attach_forward`; `None` = none pending.
+    pub(crate) hc8_sidecar: Option<crate::hc8_sidecar::Qwen4Hc8Sidecar>,
     pub(crate) npu_model_index: Option<Result<String, String>>,
     /// Actually reserved D1 CPU-owned expert window rows (logical window rows; 0 =
     /// none). Stored only by the loader after the real prewarm lands (see
@@ -973,6 +976,7 @@ impl Qwen4Bundle {
             pp_band: None,
             ep_seal: None,
             trunk_overlay: None,
+            hc8_sidecar: None,
             npu_model_index: None,
             cpu_d1_storage_rows: 0,
         })
@@ -1155,6 +1159,64 @@ impl Qwen4Bundle {
             }
         }
         Ok(None)
+    }
+
+    /// Hand the bundle an accepted `.hc8` sidecar
+    /// ([`crate::hc8_sidecar::resolve_hc8_sidecar`]).  [`Self::attach_forward`]
+    /// applies it right after the trunk overlay: a payload that fails its
+    /// sha256 or the weights' pre-check logs `REFUSED` and the BF16 weights
+    /// run.  One sidecar, before the forward attaches.
+    pub fn attach_hc8_sidecar(
+        &mut self,
+        sidecar: crate::hc8_sidecar::Qwen4Hc8Sidecar,
+    ) -> Result<(), BundleError> {
+        if self.execution.is_some() {
+            return Err(BundleError::Forward(
+                "Qwen4 hc8 sidecar must attach before the forward resources".to_string(),
+            ));
+        }
+        if self.hc8_sidecar.is_some() {
+            return Err(BundleError::Forward(
+                "Qwen4 hc8 sidecar is already attached".to_string(),
+            ));
+        }
+        self.hc8_sidecar = Some(sidecar);
+        Ok(())
+    }
+
+    /// Apply the pending hc8 sidecar, if any.  A refusal (payload digest,
+    /// weight pre-check) is logged and leaves the BF16 weights; a failure
+    /// after replacement started is an error.
+    fn apply_pending_hc8_sidecar(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        let Some(sidecar) = self.hc8_sidecar.take() else {
+            return Ok(());
+        };
+        let payloads = match sidecar.bound.read_verified() {
+            Ok(payloads) => payloads,
+            Err(reason) => {
+                eprintln!(
+                    "{}",
+                    crate::hc8_sidecar::hc8_refusal_line(sidecar.path(), &reason)
+                );
+                return Ok(());
+            }
+        };
+        match self
+            .weights
+            .apply_hc8_sidecar(gpu, &payloads)
+            .map_err(BundleError::Forward)?
+        {
+            crate::weights::Hc8Outcome::Refused(reason) => {
+                eprintln!(
+                    "{}",
+                    crate::hc8_sidecar::hc8_refusal_line(sidecar.path(), &reason)
+                );
+            }
+            crate::weights::Hc8Outcome::Applied(applied) => {
+                eprintln!("{}", crate::hc8_sidecar::hc8_applied_line(&applied));
+            }
+        }
+        Ok(())
     }
 
     /// `HIPFIRE_QWEN4_EP_TRUNK_SHARD`: keep this rank's half of the trunk projections
@@ -1675,6 +1737,7 @@ impl Qwen4Bundle {
         )
         .map_err(|error| BundleError::Forward(error.to_string()))?;
         let overlay_route = self.apply_pending_trunk_overlay(gpu)?;
+        self.apply_pending_hc8_sidecar(gpu)?;
         #[cfg(target_os = "linux")]
         if let Some(prepared) = &mut npu_prepared {
             prepared.set_overlay_route(overlay_route);
@@ -6925,6 +6988,7 @@ impl Qwen4Bundle {
         }
         // The overlay and requantization the ordinary attach applies before the forward is built.
         let _overlay_route = self.apply_pending_trunk_overlay(gpu)?;
+        self.apply_pending_hc8_sidecar(gpu)?;
         self.weights
             .requant_from_env(gpu)
             .map_err(BundleError::Forward)?;

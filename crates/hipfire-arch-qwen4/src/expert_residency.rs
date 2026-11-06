@@ -1401,6 +1401,13 @@ pub fn native_mtp_census_scope(
 /// expert's gate/up/down and the PLE key/value projections. The direct BF16
 /// readers (`input_mix_weight_up`, `shared_expert_gate`) and every other
 /// tensor are not shadowed.
+///
+/// An applied `.hc8` sidecar replaces the BF16 `input_mix_weight_down`
+/// matrices of these (and the `input_mix_weight_up` ones) by E4M3 rows; the
+/// census does NOT shrink: the lazy F16 shadow stays `2 * rows * cols` per
+/// owner (built from the E4M3 weight, keyed on its buffer), and placement
+/// keeps the manifest's BF16 sizes (see
+/// [`crate::hc8_sidecar::hc8_sidecar_saved_bytes`]).
 const F16_SHADOW_LAYER_SUFFIXES: [&str; 8] = [
     "attn_hyper_connection.input_mix_weight_down.weight",
     "mlp_hyper_connection.input_mix_weight_down.weight",
@@ -1428,6 +1435,14 @@ const F16_SHADOW_ROOT: &str =
 /// without them (an MQ-quantized trunk) charges nothing.
 pub fn f16_shadow_bytes(weights: &[WeightEntry], num_layers: usize) -> Result<u64, String> {
     f16_shadow_bytes_owned(weights, num_layers, |_| true, true)
+}
+
+/// Resident bytes an applied `.hc8` sidecar adds after placement ran:
+/// `max(0, net)` of its `payload - replaced` (negative: E4M3 rows are
+/// smaller than the BF16 matrices they replace), so a sidecar never raises
+/// placement. Plan-time placement keeps charging the manifest's BF16 sizes.
+pub fn hc8_net_charge(net_bytes: i64) -> u64 {
+    u64::try_from(net_bytes).unwrap_or(0)
 }
 
 /// [`f16_shadow_bytes`] for one pipeline-parallel band: only the shadows of
@@ -6293,6 +6308,32 @@ mod tests {
         assert_eq!(weights.len() - owners, 256);
         // Layers past the trunk own nothing; only the root mix is left.
         assert_eq!(f16_shadow_bytes(&weights, 0), Ok(6_553_600));
+    }
+
+    /// An applied `.hc8` sidecar never changes the F16 shadow census and is
+    /// a net saving the census never charges.
+    #[test]
+    fn the_hc8_sidecar_leaves_f16_shadows_unchanged_and_charges_nothing() {
+        let weights = j1778_bf16_manifest();
+        assert_eq!(f16_shadow_bytes(&weights, 48), Ok(1_298_923_520));
+        let (mut replaced, mut payload) = (0i64, 0i64);
+        for entry in weights.iter().filter(|entry| {
+            entry.name.contains("hyper_connection")
+                && (entry.name.ends_with(".input_mix_weight_down.weight")
+                    || entry.name.ends_with(".input_mix_weight_up.weight"))
+        }) {
+            let [m, k] = entry.logical_shape[..] else {
+                panic!("{}: not rank 2", entry.name)
+            };
+            replaced += (m * k * 2) as i64;
+            payload += rdna_compute::hc8_weight::hc8_payload_bytes(m, k).unwrap() as i64;
+        }
+        assert!(replaced > 0, "the manifest has HC mixer weights");
+        let net = payload - replaced;
+        assert!(net < 0, "E4M3 rows are smaller than BF16: {net}");
+        assert_eq!(hc8_net_charge(net), 0);
+        assert_eq!(hc8_net_charge(0), 0);
+        assert_eq!(hc8_net_charge(4096), 4096);
     }
 
     /// The census charges exactly when the runtime predicate can hold: every

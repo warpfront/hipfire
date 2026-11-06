@@ -3461,6 +3461,41 @@ impl Qwen4Weights {
         }))
     }
 
+    /// Replace the resident BF16 HC mixer weights named by a verified `.hc8`
+    /// sidecar (`hipfire_runtime::hc8_sidecar`) with their E4M3 payloads.
+    ///
+    /// Checked first ([`plan_hc8_sidecar`]): a payload whose name is not
+    /// resident at all is skipped and counted; a name that is present but
+    /// fails any check, or no payload matching, is
+    /// [`Hc8Outcome::Refused`] with nothing replaced. An upload or free error
+    /// once replacement started is an `Err`.
+    pub fn apply_hc8_sidecar(
+        &mut self,
+        gpu: &mut Gpu,
+        payloads: &[hipfire_runtime::hc8_sidecar::Hc8Payload],
+    ) -> Result<Hc8Outcome, String> {
+        let (plan, skipped) = match plan_hc8_sidecar(&self.taken, &self.taken_by_name, payloads) {
+            Ok(planned) => planned,
+            Err(reason) => return Ok(Hc8Outcome::Refused(reason)),
+        };
+        let (mut before, mut after) = (0usize, 0usize);
+        for &(index, slot) in &plan {
+            let (old_bytes, new_bytes) = replace_resident(
+                gpu,
+                &mut self.taken[slot],
+                Replacement::Hc8(Cow::Borrowed(&payloads[index].bytes[..])),
+            )?;
+            before += old_bytes;
+            after += new_bytes;
+        }
+        Ok(Hc8Outcome::Applied(Hc8Applied {
+            tensors: plan.len(),
+            skipped,
+            before_bytes: before,
+            after_bytes: after,
+        }))
+    }
+
     /// Keep only TP rank `rank` of `parts` of every dense FFN layer: gate/up
     /// rows and down columns along the intermediate, as their manifest
     /// policies (`ColumnShard { axis: 0 }`, `RowShard { axis: 1 }`) declare,
@@ -3578,6 +3613,93 @@ pub struct TrunkOverlayApplied {
     pub qt3_tensors: usize,
     pub before_bytes: usize,
     pub after_bytes: usize,
+}
+
+/// What [`Qwen4Weights::apply_hc8_sidecar`] did.
+#[derive(Debug)]
+pub enum Hc8Outcome {
+    Applied(Hc8Applied),
+    /// Nothing was replaced; the reason is one line.
+    Refused(String),
+}
+
+/// HC mixer tensors replaced by the `.hc8` sidecar and their device bytes
+/// before/after.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hc8Applied {
+    pub tensors: usize,
+    /// Payload tensors whose name is not resident in this load.
+    pub skipped: usize,
+    pub before_bytes: usize,
+    pub after_bytes: usize,
+}
+
+/// Check every HC8 payload against the resident weights; no device access.
+/// Returns `(payload index, slot)` pairs and the count of payloads whose name
+/// is not in `by_name` at all (skipped). A name that is present but fails any
+/// check is an `Err` (the whole sidecar is refused).
+fn plan_hc8_sidecar(
+    taken: &[TakenWeight],
+    by_name: &HashMap<String, Vec<usize>>,
+    payloads: &[hipfire_runtime::hc8_sidecar::Hc8Payload],
+) -> Result<(Vec<(usize, usize)>, usize), String> {
+    let mut plan: Vec<(usize, usize)> = Vec::with_capacity(payloads.len());
+    let mut skipped = 0usize;
+    for (index, payload) in payloads.iter().enumerate() {
+        let Some(slots) = by_name.get(&payload.name) else {
+            skipped += 1;
+            continue;
+        };
+        let mut resident = slots
+            .iter()
+            .copied()
+            .filter(|&slot| matches!(taken[slot].handle, WeightHandle::Resident(_)));
+        let (Some(slot), None) = (resident.next(), resident.next()) else {
+            return Err(format!(
+                "tensor {} does not match exactly one resident weight",
+                payload.name
+            ));
+        };
+        let [m, k] = payload.shape;
+        let weight = &taken[slot];
+        if weight.projection.logical_shape != [m, k] {
+            return Err(format!(
+                "tensor {}: the model's weight is {:?}, sidecar is [{m}, {k}]",
+                payload.name, weight.projection.logical_shape
+            ));
+        }
+        let WeightHandle::Resident(tensor) = &weight.handle else {
+            unreachable!("filtered to resident handles")
+        };
+        if tensor.dtype != DType::BF16 {
+            return Err(format!(
+                "tensor {}: the resident weight is {:?}, not BF16",
+                payload.name, tensor.dtype
+            ));
+        }
+        if Some(tensor.buf.size()) != m.checked_mul(k).and_then(|n| n.checked_mul(2)) {
+            return Err(format!(
+                "tensor {}: the resident weight is {} bytes, not the {m}x{k} BF16 size",
+                payload.name,
+                tensor.buf.size()
+            ));
+        }
+        if rdna_compute::hc8_weight::hc8_payload_bytes(m, k) != Some(payload.bytes.len()) {
+            return Err(format!(
+                "tensor {}: {} bytes is not an HC8 {m}x{k} matrix",
+                payload.name,
+                payload.bytes.len()
+            ));
+        }
+        if plan.iter().any(|&(_, planned)| planned == slot) {
+            return Err(format!("tensor {} is listed twice", payload.name));
+        }
+        plan.push((index, slot));
+    }
+    if plan.is_empty() {
+        return Err("no resident HC mixer weight matched".to_string());
+    }
+    Ok((plan, skipped))
 }
 
 /// Byte size of an `m x k` QT44 matrix; `None` unless K is a multiple of 256.
@@ -3719,6 +3841,9 @@ enum Replacement<'a> {
     Tensor(GpuTensor),
     Qt44(Cow<'a, [u8]>),
     Q8(Cow<'a, [u8]>),
+    /// Pre-encoded HC8 (`HC8E4M3Row`, shape `[len]`) bytes: swizzled E4M3 `q`
+    /// then little-endian f32 row scales.
+    Hc8(Cow<'a, [u8]>),
 }
 
 /// The device/owner operations of a replacement. [`GpuReplace`] is the only
@@ -3747,6 +3872,9 @@ trait ReplaceOps {
     /// Upload pre-encoded Q8F16 bytes (dtype `Q8_0`) as an owned resident
     /// tensor.
     fn upload_q8(&mut self, bytes: &[u8]) -> Result<GpuTensor, String>;
+    /// Upload a pre-encoded HC8 payload (dtype `HC8E4M3Row`) as an owned
+    /// resident tensor.
+    fn upload_hc8(&mut self, bytes: &[u8]) -> Result<GpuTensor, String>;
 }
 
 struct GpuReplace<'g>(&'g mut Gpu);
@@ -3800,6 +3928,15 @@ impl ReplaceOps for GpuReplace<'_> {
         copy.dtype = DType::Q8_0;
         Ok(copy)
     }
+
+    fn upload_hc8(&mut self, bytes: &[u8]) -> Result<GpuTensor, String> {
+        let mut copy = self
+            .0
+            .upload_raw(bytes, &[bytes.len()])
+            .map_err(|error| error.to_string())?;
+        copy.dtype = DType::HC8E4M3Row;
+        Ok(copy)
+    }
 }
 
 fn replace_resident(
@@ -3849,6 +3986,7 @@ fn replace_owned(
         Replacement::Tensor(copy) => copy,
         Replacement::Qt44(bytes) => ops.upload_qt44(&bytes)?,
         Replacement::Q8(bytes) => ops.upload_q8(&bytes)?,
+        Replacement::Hc8(bytes) => ops.upload_hc8(&bytes)?,
     };
     let WeightHandle::Resident(old) = &taken.handle else {
         let _ = ops.free(copy);
@@ -3946,6 +4084,13 @@ fn replace_in_arena_span(
     let (view, before, after, temp) = match replacement {
         Replacement::Qt44(bytes) => {
             let view = arena_replacement_view(old, bytes.len(), &[bytes.len()], DType::MQ4G256V2)?;
+            ops.invalidate_arena_source(old.buf.as_ptr() as usize)?;
+            ops.write_host(&old.buf, &bytes)?;
+            (view, old.buf.size(), bytes.len(), None)
+        }
+        Replacement::Hc8(bytes) => {
+            // E4M3 payload (m*k + 4*m bytes) is always smaller than its BF16 span.
+            let view = arena_replacement_view(old, bytes.len(), &[bytes.len()], DType::HC8E4M3Row)?;
             ops.invalidate_arena_source(old.buf.as_ptr() as usize)?;
             ops.write_host(&old.buf, &bytes)?;
             (view, old.buf.size(), bytes.len(), None)
@@ -7928,6 +8073,15 @@ mod weight_store_arena_replacement {
             self.log.push(format!("upload_q8:{}", bytes.len()));
             Ok(owned(TEMP_BASE, bytes.len(), DType::Q8_0, &[bytes.len()]))
         }
+        fn upload_hc8(&mut self, bytes: &[u8]) -> Result<GpuTensor, String> {
+            self.log.push(format!("upload_hc8:{}", bytes.len()));
+            Ok(owned(
+                TEMP_BASE,
+                bytes.len(),
+                DType::HC8E4M3Row,
+                &[bytes.len()],
+            ))
+        }
     }
 
     fn ptr_of(taken: &TakenWeight) -> usize {
@@ -8092,6 +8246,167 @@ mod weight_store_arena_replacement {
             ],
             "no temporary owner exists, so nothing is uploaded or freed"
         );
+    }
+
+    fn hc8_named(name: &str, handle: WeightHandle, m: usize, k: usize) -> TakenWeight {
+        let mut weight = taken(handle, m, k);
+        weight.key = WeightPlacementKey::new(name, Some(0), 0);
+        weight
+    }
+
+    fn hc8_payload(name: &str, m: usize, k: usize) -> hipfire_runtime::hc8_sidecar::Hc8Payload {
+        hipfire_runtime::hc8_sidecar::Hc8Payload {
+            name: name.to_string(),
+            shape: [m, k],
+            bytes: vec![0u8; rdna_compute::hc8_weight::hc8_payload_bytes(m, k).unwrap()],
+        }
+    }
+
+    fn hc8_index(taken: &[TakenWeight]) -> HashMap<String, Vec<usize>> {
+        let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
+        for (slot, weight) in taken.iter().enumerate() {
+            by_name
+                .entry(weight.key.name.clone())
+                .or_default()
+                .push(slot);
+        }
+        by_name
+    }
+
+    #[test]
+    fn hc8_owned_replacement_swaps_and_frees_the_bf16_tensor() {
+        let (m, k) = (16usize, 64usize);
+        let span = m * k * 2;
+        let payload = hc8_payload("w", m, k);
+        let mut weight = taken(
+            WeightHandle::Resident(owned(TEMP_BASE, span, DType::BF16, &[m, k])),
+            m,
+            k,
+        );
+        let mut ops = Fake::default();
+        let sizes = replace_resident_with(
+            &mut ops,
+            &mut weight,
+            Replacement::Hc8(Cow::Borrowed(&payload.bytes[..])),
+        )
+        .unwrap();
+        assert_eq!(sizes, (span, payload.bytes.len()));
+        assert_eq!(payload.bytes.len(), m * k + 4 * m);
+        let WeightHandle::Resident(now) = &weight.handle else {
+            panic!("not resident")
+        };
+        assert_eq!(now.dtype, DType::HC8E4M3Row);
+        assert_eq!(now.shape, vec![payload.bytes.len()]);
+        assert_eq!(
+            ops.log,
+            vec![
+                format!("upload_hc8:{}", payload.bytes.len()),
+                format!("free:{TEMP_BASE:#x}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn hc8_arena_span_replacement_keeps_the_pointer_and_retags() {
+        let (m, k) = (16usize, 64usize);
+        let span = m * k * 2;
+        let payload = hc8_payload("w", m, k);
+        let mut weight = taken(
+            WeightHandle::Resident(view(ROOT_BASE, span, DType::BF16, &[m, k])),
+            m,
+            k,
+        );
+        let mut ops = Fake::default();
+        let sizes = replace_resident_with(
+            &mut ops,
+            &mut weight,
+            Replacement::Hc8(Cow::Borrowed(&payload.bytes[..])),
+        )
+        .unwrap();
+        assert_eq!(sizes, (span, payload.bytes.len()));
+        let WeightHandle::Resident(now) = &weight.handle else {
+            panic!("not resident")
+        };
+        assert_eq!(now.buf.as_ptr() as usize, ROOT_BASE);
+        assert!(now.buf.is_borrowed());
+        assert_eq!(now.buf.size(), span);
+        assert_eq!(now.dtype, DType::HC8E4M3Row);
+        assert_eq!(now.shape, vec![payload.bytes.len()]);
+        assert_eq!(
+            ops.log,
+            vec![
+                format!("invalidate:{ROOT_BASE:#x}"),
+                format!("write:{ROOT_BASE:#x}:{}", payload.bytes.len()),
+            ]
+        );
+    }
+
+    #[test]
+    fn hc8_plan_counts_absent_names_as_skipped() {
+        let (m, k) = (16usize, 64usize);
+        let span = m * k * 2;
+        let weights = vec![hc8_named(
+            "a.input_mix_weight_down.weight",
+            WeightHandle::Resident(view(ROOT_BASE, span, DType::BF16, &[m, k])),
+            m,
+            k,
+        )];
+        let by_name = hc8_index(&weights);
+        let payloads = vec![
+            hc8_payload("a.input_mix_weight_down.weight", m, k),
+            hc8_payload("mtp.absent.input_mix_weight_down.weight", m, k),
+        ];
+        let (plan, skipped) = plan_hc8_sidecar(&weights, &by_name, &payloads).unwrap();
+        assert_eq!(plan, vec![(0, 0)]);
+        assert_eq!(skipped, 1);
+        let none = plan_hc8_sidecar(&weights, &by_name, &payloads[1..]).unwrap_err();
+        assert!(none.contains("no resident HC mixer weight matched"), "{none}");
+    }
+
+    #[test]
+    fn hc8_plan_refuses_wrong_shape_dtype_size_and_duplicates() {
+        let (m, k) = (16usize, 64usize);
+        let span = m * k * 2;
+        let name = "a.input_mix_weight_down.weight";
+        let bf16 = |dtype, size| {
+            vec![hc8_named(
+                name,
+                WeightHandle::Resident(view(ROOT_BASE, size, dtype, &[m, k])),
+                m,
+                k,
+            )]
+        };
+        // Wrong logical shape.
+        let weights = bf16(DType::BF16, span);
+        let error = plan_hc8_sidecar(&weights, &hc8_index(&weights), &[hc8_payload(name, m, 128)])
+            .unwrap_err();
+        assert!(error.contains("overlay") || error.contains("sidecar"), "{error}");
+        // Not BF16 any more.
+        let weights = bf16(DType::MQ4G256V2, span);
+        let error =
+            plan_hc8_sidecar(&weights, &hc8_index(&weights), &[hc8_payload(name, m, k)])
+                .unwrap_err();
+        assert!(error.contains("not BF16"), "{error}");
+        // Wrong byte size.
+        let weights = bf16(DType::BF16, span - 2);
+        let error =
+            plan_hc8_sidecar(&weights, &hc8_index(&weights), &[hc8_payload(name, m, k)])
+                .unwrap_err();
+        assert!(error.contains("bytes"), "{error}");
+        // Bad payload length.
+        let weights = bf16(DType::BF16, span);
+        let mut bad = hc8_payload(name, m, k);
+        bad.bytes.pop();
+        let error = plan_hc8_sidecar(&weights, &hc8_index(&weights), &[bad]).unwrap_err();
+        assert!(error.contains("HC8"), "{error}");
+        // Listed twice.
+        let error = plan_hc8_sidecar(
+            &weights,
+            &hc8_index(&weights),
+            &[hc8_payload(name, m, k), hc8_payload(name, m, k)],
+        )
+        .unwrap_err();
+        assert!(error.contains("listed twice"), "{error}");
     }
 
     #[test]

@@ -69,6 +69,10 @@ pub fn qwen4_source_generation(hfq: &HfqFile, model_path: &Path) -> Result<Strin
     if overlay.exists() {
         files.push(identity(&overlay)?);
     }
+    let hc8 = hipfire_config::memory::hc8_sidecar_path(model_path);
+    if hc8.exists() {
+        files.push(identity(&hc8)?);
+    }
     Ok(source_generation_fingerprint(&files))
 }
 
@@ -549,6 +553,36 @@ mod tests {
         std::fs::write(&overlay, b"bb").unwrap();
         assert_ne!(qwen4_source_generation(&hfq, &model).unwrap(), with_overlay);
         std::fs::remove_file(&overlay).unwrap();
+        assert_eq!(qwen4_source_generation(&hfq, &model).unwrap(), base);
+        drop(hfq);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The generation covers the `.hc8` sidecar beside the model too.
+    #[test]
+    fn source_generation_binds_the_hc8_sidecar() {
+        use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-qwen4-ep-gen-hc8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("m.hfq");
+        let tensor = HfqMemTensor {
+            name: "t".into(),
+            quant_type: 1,
+            shape: vec![2],
+            group_size: 0,
+            data: vec![0; 4],
+        };
+        write_hfqm_package_mem(&model, crate::ARCH_ID, "{}", &[tensor]).unwrap();
+        let hfq = HfqFile::open(&model).unwrap();
+        let base = qwen4_source_generation(&hfq, &model).unwrap();
+        let sidecar = hipfire_config::memory::hc8_sidecar_path(&model);
+        std::fs::write(&sidecar, b"a").unwrap();
+        let with_sidecar = qwen4_source_generation(&hfq, &model).unwrap();
+        assert_ne!(with_sidecar, base);
+        std::fs::write(&sidecar, b"bb").unwrap();
+        assert_ne!(qwen4_source_generation(&hfq, &model).unwrap(), with_sidecar);
+        std::fs::remove_file(&sidecar).unwrap();
         assert_eq!(qwen4_source_generation(&hfq, &model).unwrap(), base);
         drop(hfq);
         std::fs::remove_dir_all(&dir).unwrap();

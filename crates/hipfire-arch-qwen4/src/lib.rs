@@ -120,6 +120,7 @@ pub mod state;
 pub mod state_parity;
 pub mod sym_verdict_cache;
 pub(crate) mod trunk_a8;
+pub mod hc8_sidecar;
 pub mod trunk_overlay;
 pub(crate) mod trunk_route;
 pub mod weights;
@@ -161,4 +162,5 @@ pub use state::{resolve_gdn_format, resolve_qsa_format, resolve_state_format, Qw
 pub use trunk_overlay::{
     resolve_trunk_overlay, trunk_overlay_extra_bytes, Qwen4TrunkOverlay, TrunkOverlayPolicy,
 };
+pub use hc8_sidecar::{hc8_sidecar_saved_bytes, resolve_hc8_sidecar, Qwen4Hc8Sidecar};
 pub use weights::{Qwen4ManifestIdentity, Qwen4TierRecipe};
