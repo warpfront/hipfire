@@ -240,7 +240,7 @@ impl HeteroPrefillShared {
             defer: Default::default(),
             out: Mutex::new(Some(gpu.hip.stream_create_non_blocking().map_err(hip)?)),
             back: Mutex::new(Some(gpu.hip.stream_create_non_blocking().map_err(hip)?)),
-            trace: if std::env::var("HIPFIRE_HETERO_PREFILL_TRACE").is_ok_and(|v| v == "1") {
+            trace: if hipfire_config::developer_var("HIPFIRE_HETERO_PREFILL_TRACE").is_ok_and(|v| v == "1") {
                 Some(PrefillTrace {
                     start: gpu.hip.event_create().map_err(hip)?,
                     hot: gpu.hip.event_create().map_err(hip)?,

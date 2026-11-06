@@ -826,7 +826,7 @@ impl<'a> MoeStepState<'a> {
 /// `HIPFIRE_MOE_STAGE_HOST_TRACE=1`: host wall time per sealed-MoE stage,
 /// summed and printed every 4096 stages (diagnosis only).
 static STAGE_HOST_TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    std::env::var("HIPFIRE_MOE_STAGE_HOST_TRACE").is_ok_and(|v| v == "1")
+    hipfire_config::developer_var("HIPFIRE_MOE_STAGE_HOST_TRACE").is_ok_and(|v| v == "1")
 });
 
 static STAGE_HOST: std::sync::Mutex<Vec<(String, std::time::Duration, u64)>> =

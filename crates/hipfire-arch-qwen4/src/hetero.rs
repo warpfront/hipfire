@@ -107,7 +107,7 @@ pub const HETERO_PREFILL_MAX_ROWS: usize = 4096;
 pub fn hetero_prefill_rows() -> usize {
     static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *ROWS.get_or_init(|| {
-        std::env::var("HIPFIRE_HETERO_PREFILL_ROWS")
+        hipfire_config::developer_var("HIPFIRE_HETERO_PREFILL_ROWS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .map(|r| r / 256 * 256)
@@ -125,7 +125,7 @@ pub const HETERO_PREFILL_SLOTS: usize = 8;
 /// whole 256-row steps, at least 512 so every tile keeps the expert device's
 /// grouped arm), at most the forward's chunk.
 pub(crate) fn layer_major_tile_rows(max_chunk: usize, rows: usize) -> usize {
-    std::env::var("HIPFIRE_HETERO_TILE_ROWS")
+    hipfire_config::developer_var("HIPFIRE_HETERO_TILE_ROWS")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .map(|r| r / 256 * 256)
@@ -145,7 +145,7 @@ pub(crate) fn layer_major_tile_rows(max_chunk: usize, rows: usize) -> usize {
 /// Tiles the layer-major schedule keeps in flight (`HIPFIRE_HETERO_TILES`,
 /// default 4), at most the mailbox's slots.
 pub(crate) fn layer_major_tiles(slots: usize) -> usize {
-    std::env::var("HIPFIRE_HETERO_TILES")
+    hipfire_config::developer_var("HIPFIRE_HETERO_TILES")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&t| t >= 2)
@@ -570,7 +570,7 @@ pub(crate) fn layer_major(
     wide: usize,
     hidden: usize,
 ) -> Result<Option<LayerMajor>, String> {
-    if std::env::var("HIPFIRE_HETERO_LAYER_MAJOR").is_ok_and(|v| v == "0") {
+    if hipfire_config::developer_var("HIPFIRE_HETERO_LAYER_MAJOR").is_ok_and(|v| v == "0") {
         return Ok(None);
     }
     let shared = {
