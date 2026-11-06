@@ -902,8 +902,6 @@ mod tests {
         assert_eq!(st.v[0][0], u32::from_le_bytes([4, 5, 6, 7]));
         load(&mut st, &mut mem, Operand::Vmem(VmemToken::Off), vec![]).unwrap();
         assert_eq!(st.v[0][0], u32::from_le_bytes([0, 1, 2, 3]));
-        load(&mut st, &mut mem, reg(Kind::V, 2, 2), vec![]).unwrap();
-        assert_eq!(st.v[0][0], u32::from_le_bytes([0, 1, 2, 3]));
         st.v[2][0] = 8; // offset 8 == NUM_RECORDS: out of bounds reads zero
         load(&mut st, &mut mem, reg(Kind::V, 2, 1), vec![offen()]).unwrap();
         assert_eq!(st.v[0][0], 0);

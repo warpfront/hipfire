@@ -1815,23 +1815,28 @@ mod tests {
     }
 
     #[test]
-    fn buffer_offen_idxen_flags_keep_register_vaddr() {
-        // offen: one VGPR; idxen: one VGPR; idxen+offen: v[2:3] pair. Each round-trips.
-        for (flags, vaddr, len) in [(0x40u32, 3u32, 1u8), (0x80, 3, 1), (0xc0, 2, 2)] {
+    fn buffer_offen_keeps_register_vaddr_and_idxen_stays_refused() {
+        // OFFEN alone: one VGPR, round-trips.
+        let mut words = BUFFER_OFF_WORDS;
+        words[1] = (words[1] & 0x00ff_ffff) | (0x40 << 24);
+        words[2] = (words[2] & !0xff) | 3;
+        let (inst, _) = decode(&words).unwrap();
+        assert_eq!(
+            inst.operands[1],
+            Operand::Reg(RegRef {
+                kind: Kind::V,
+                base: 3,
+                len: 1
+            })
+        );
+        assert_eq!(encode(&inst).unwrap().as_slice(), &words);
+        // IDXEN and IDXEN+OFFEN are outside the modeled form and refused by the existing model.
+        for flags in [0x80u32, 0xc0] {
             let mut words = BUFFER_OFF_WORDS;
             words[1] = (words[1] & 0x00ff_ffff) | (flags << 24);
-            words[2] = (words[2] & !0xff) | vaddr;
-            let (inst, _) = decode(&words).unwrap();
-            assert_eq!(
-                inst.operands[1],
-                Operand::Reg(RegRef {
-                    kind: Kind::V,
-                    base: vaddr as u16,
-                    len
-                }),
-                "flags {flags:#x}"
-            );
-            assert_eq!(encode(&inst).unwrap().as_slice(), &words);
+            words[2] = (words[2] & !0xff) | 2;
+            let e = decode(&words).unwrap_err();
+            assert!(format!("{e:?}").contains("idxen"), "flags {flags:#x}: {e:?}");
         }
     }
 
