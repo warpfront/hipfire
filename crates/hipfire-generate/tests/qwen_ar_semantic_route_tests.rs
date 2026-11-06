@@ -169,6 +169,38 @@ fn parse_jsonl(out: &str) -> Vec<serde_json::Value> {
 }
 
 #[test]
+fn tool_free_producer_still_stops_on_im_end() {
+    set_active_attempt_id(18);
+    let mut producer = QwenArSemanticProducer::new_with_tool_protocol("tool-free", false, false);
+    let mut sink = Vec::new();
+    let mut conversation_tokens = Vec::new();
+    let mut streamed_tokens = Vec::new();
+    let mut seq_pos = 0usize;
+    let stopped = producer
+        .commit_and_observe(
+            &mut sink,
+            &mut conversation_tokens,
+            &mut streamed_tokens,
+            &mut seq_pos,
+            1000,
+            b"<tool_call>",
+        )
+        .expect("marker text");
+    assert!(!stopped);
+    let stopped = producer
+        .commit_and_observe(
+            &mut sink,
+            &mut conversation_tokens,
+            &mut streamed_tokens,
+            &mut seq_pos,
+            1001,
+            b"<|im_end|>",
+        )
+        .expect("terminator");
+    assert!(stopped);
+}
+
+#[test]
 fn tool_free_producer_keeps_tool_like_text_as_content() {
     set_active_attempt_id(17);
     let text = "<tool_call>\n<function=cat\n</function>\n</tool_call>";
@@ -467,6 +499,60 @@ fn decoded_im_end_stops_without_emitting_marker() {
     let fin = fin.expect("finish after EOT");
     assert!(fin.wire_tool_calls.is_empty());
     assert_ne!(fin.finish_reason, "tool_calls");
+}
+
+#[test]
+fn builtin_terminator_inside_open_tool_call_does_not_end_the_turn() {
+    for marker in ["<|im_end|>", "<|endoftext|>"] {
+        let (out, visible, fin, stopped, _, _) = drive_ar_semantic_path(
+            &[
+                "<tool_call><function=read><parameter=path>/tmp/x</parameter></function>",
+                marker,
+                "</tool_call>",
+            ],
+            false,
+            false,
+        );
+        assert!(!stopped, "{marker}");
+        assert!(!out.contains(marker), "{marker}");
+        assert!(!visible.contains(marker), "{marker}");
+        let fin = fin.expect(marker);
+        assert_eq!(fin.finish_reason, "tool_calls", "{marker}");
+        assert_eq!(fin.wire_tool_calls.len(), 1, "{marker}");
+        assert_eq!(fin.wire_tool_calls[0].name, "read");
+        assert_eq!(fin.wire_tool_calls[0].arguments["path"], "/tmp/x");
+    }
+}
+
+#[test]
+fn terminator_inside_open_tool_call_stays_fail_closed_without_a_closer() {
+    let (_, _, fin, stopped, _, _) = drive_ar_semantic_path(
+        &[
+            "<tool_call><function=read><parameter=path>/tmp/x</parameter>",
+            "<|im_end|>",
+        ],
+        false,
+        false,
+    );
+    assert!(!stopped);
+    let err = fin.expect_err("unclosed span");
+    assert_eq!(err.detail(), "unclosed <tool_call> span at end of output");
+}
+
+#[test]
+fn terminator_inside_open_tool_call_at_length_reports_length() {
+    let (_, _, fin, stopped, _, _) = drive_ar_semantic_path(
+        &[
+            "<tool_call><function=read><parameter=path>/tmp/x</parameter>",
+            "<|im_end|>",
+        ],
+        false,
+        true,
+    );
+    assert!(!stopped);
+    let fin = fin.expect("length");
+    assert_eq!(fin.finish_reason, "length");
+    assert!(fin.wire_tool_calls.is_empty());
 }
 
 #[test]

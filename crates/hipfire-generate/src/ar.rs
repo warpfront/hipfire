@@ -27,7 +27,8 @@ use hipfire_engine::terminal::*;
 use hipfire_engine::turn_cache::*;
 use hipfire_loader::LoadedModel;
 use hipfire_runtime::emit_text::{
-    currently_in_think, ThinkOutputRouter, ToolOutputRouter, ToolRouteError,
+    block_terminators_while_in_tool_call, currently_in_think, ThinkOutputRouter, ToolOutputRouter,
+    ToolRouteError,
 };
 use hipfire_runtime::emit_text::{ThinkRouteEvent, ToolRouteEvent};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
@@ -325,10 +326,30 @@ pub fn qwen_ar_finish_route(
     }
 }
 
+/// Mask built-in turn terminators while `router` is inside `<tool_call>`.
+fn mask_tool_call_terminators(
+    blocked: &mut Vec<u32>,
+    router: &ToolOutputRouter,
+    eos_token: u32,
+    eos_id: u32,
+    im_end_token: Option<u32>,
+    eot_id: Option<u32>,
+) {
+    block_terminators_while_in_tool_call(
+        blocked,
+        router.in_tool_call(),
+        [eos_token, eos_id]
+            .into_iter()
+            .chain(im_end_token)
+            .chain(eot_id),
+    );
+}
+
 /// Apply one filter observe step into the semantic router. Returns
 /// `Ok(true)` when the filter signals Stop / EmitAndStop (decoded EOT)
 /// so the caller can break the decode loop without emitting marker text.
 /// A user stop-sequence match is reported by `stop.matched()`, not here.
+/// Inside an open `<tool_call>`, a stop marker is not a turn boundary.
 pub fn qwen_ar_observe_and_route(
     stdout: &mut impl std::io::Write,
     id: &str,
@@ -339,7 +360,12 @@ pub fn qwen_ar_observe_and_route(
     new_bytes: &[u8],
     visible_acc: &mut String,
 ) -> Result<bool, ToolRouteError> {
-    let (text_bytes, filter_stop) = match filter.observe(new_bytes) {
+    let action = if router.in_tool_call() {
+        filter.observe_suppressing_stops(new_bytes)
+    } else {
+        filter.observe(new_bytes)
+    };
+    let (text_bytes, filter_stop) = match action {
         FilterAction::Emit(text_bytes) => (text_bytes, false),
         FilterAction::EmitAndStop(text_bytes) => (text_bytes, true),
         FilterAction::Hold => return Ok(false),
@@ -5537,13 +5563,14 @@ pub fn generate(
                 }
             }
 
-            if next_token == config.eos_token {
-                break;
-            }
-            if im_end_token == Some(next_token) {
-                break;
-            }
-            if tokenizer.is_terminator(next_token) {
+            // An open tool span keeps going through EOS, <|im_end|>, and
+            // <|endoftext|>. User stops return above; the loop bound is
+            // the token budget.
+            let end_on_terminator = !semantic.router.in_tool_call()
+                && (next_token == config.eos_token
+                    || im_end_token == Some(next_token)
+                    || tokenizer.is_terminator(next_token));
+            if end_on_terminator {
                 break;
             }
 
@@ -5772,6 +5799,14 @@ pub fn generate(
                         2,
                         &mut blocked,
                     );
+                    mask_tool_call_terminators(
+                        &mut blocked,
+                        &semantic.router,
+                        config.eos_token,
+                        tokenizer.eos_id,
+                        im_end_token,
+                        tokenizer.eot_id,
+                    );
                     let cfg = SamplerConfig {
                         temperature: temp,
                         top_p,
@@ -5942,6 +5977,14 @@ pub fn generate(
                     blocked.push(t);
                 }
             }
+            mask_tool_call_terminators(
+                &mut blocked,
+                &semantic.router,
+                config.eos_token,
+                tokenizer.eos_id,
+                im_end_token,
+                tokenizer.eot_id,
+            );
             let cfg = SamplerConfig {
                 temperature: temp,
                 top_p,

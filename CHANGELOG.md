@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed: an open `<tool_call>` on the Qwen AR path stays open through EOS, `<|im_end|>`, and `<|endoftext|>`.** While the tool router is inside the span, those terminator ids are masked before sampling, and the same bytes are not a turn boundary in the EOS filter. A user stop sequence and the token budget still end the turn. Ending inside the span still fails closed, and running out of tokens still finishes with `length`.
+
 ## v0.4.5 — 2026-10-30
 
 Highlights (details in the entries below):
