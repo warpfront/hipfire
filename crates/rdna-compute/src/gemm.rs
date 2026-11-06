@@ -42603,9 +42603,6 @@ impl Gpu {
         self.gemm_mq4g256v2_xbatch(a_raw, x, y, m, k, batch_size, false)
     }
 
-    /// Plain `Y = W·X` over `batch_size` rows of an MQ2G256V2 weight with the
-    /// order), and every weight row is read once per chunk. `x` holds the rows
-    /// already in the weight's FWHT basis, `y` is `[batch_size, m]`.
     pub fn gemv_mq2g256v2_xbatch(
         &mut self,
         a_raw: &GpuTensor,
