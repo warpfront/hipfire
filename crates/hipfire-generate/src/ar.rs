@@ -974,6 +974,18 @@ impl GenerationRoute {
     /// declared tools when its message closes and released only on a
     /// `finish_reason == "tool_calls"` terminal; a malformed or truncated
     /// call fails the turn closed.
+    ///
+    /// `LfmAr` covers both LFM tool callers: LFM2.5-MoE (arch 11) and LFM3
+    /// (arch 24). `generate_lfm2moe` withholds the `<|tool_call_start|>` span
+    /// and parses Liquid's Pythonic body; `generate_lfm3` withholds the
+    /// Qwen3-style `<tool_call><function=…>` span through the same strict
+    /// `ToolOutputRouter` that `qwen_ar` uses (LFM3's vendor template emits
+    /// exactly that shape). Both are LEGACY-contract routes
+    /// (`semantic_contract_version: None`), so calls surface as a
+    /// `{"type":"tool_calls"}` event plus a `finish_reason == "tool_calls"`
+    /// terminal. `LfmSpec` (arch 11 with a loaded drafter) is deliberately NOT
+    /// listed: its speculative producer is `generate_dflash`, whose tool path
+    /// is only proven on the Qwen carriers.
     pub const fn supports_tools(self) -> bool {
         matches!(
             self,
@@ -991,6 +1003,7 @@ impl GenerationRoute {
                 | Self::RaonSpec
                 | Self::Gemma4Ar
                 | Self::InklingAr
+                | Self::LfmAr
         )
     }
 
