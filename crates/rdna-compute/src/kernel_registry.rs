@@ -11974,6 +11974,22 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // `HIPFIRE_EP_TRUNK_BALANCED_OWNERS=1` (opt-in, exact gfx1201, EP trunk shard): the
+        // partitioned top-10 combine of the fixed `e % ranks` reduction partition.
+        const TRUNK_REDUCTION_PARTITION_ADDED_MODULES: [&str; 1] =
+            ["moe_down_combine_top10_batched_partitioned"];
+        for module in TRUNK_REDUCTION_PARTITION_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing EP reduction-partition module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -12014,7 +12030,8 @@ mod tests {
                 + MOE_DOWN_DNI_ADDED_MODULES.len()
                 + MQ6_R8_PK_ADDED_MODULES.len()
                 + PMASK_IMPLICIT_ZERO_ADDED_MODULES.len()
-                + LANE_LEVIATHAN_ADDED_MODULES.len(),
+                + LANE_LEVIATHAN_ADDED_MODULES.len()
+                + TRUNK_REDUCTION_PARTITION_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
