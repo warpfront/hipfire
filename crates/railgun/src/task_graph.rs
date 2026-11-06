@@ -1641,6 +1641,14 @@ impl TaskGraph {
                         who(g), t.vx, t.vy, t.vz, t.gx, t.gy, t.gz
                     ));
                 }
+                // The certified dispatcher packs wg_yz = vy | vz << 16: exact only for
+                // y and z extents of at most 65536.
+                if t.gy > 1 << 16 || t.gz > 1 << 16 {
+                    return Err(format!(
+                        "{}: virtual grid ({}, {}, {}) exceeds the dispatcher's 16-bit y/z workgroup packing",
+                        who(g), t.gx, t.gy, t.gz
+                    ));
+                }
                 spans.push((t.vy, t.vz, u64::from(t.vx), end, g));
             }
             spans.sort_unstable();
@@ -1849,6 +1857,15 @@ impl TaskGraph {
                 return Err(format!(
                     "{what}: K = {k_total} exceeds the {grid} workgroups of the ({}, {}, {}) grid of template {}",
                     first.gx, first.gy, first.gz, first.template
+                ));
+            }
+            // The certified dispatcher packs wg_yz = vy | vz << 16 and indexes the
+            // claim bitmap with a 32-bit bit = vx + gx*(vy + gy*vz): both are exact
+            // only when every in-grid y/z fits 16 bits and the grid fits 2^32.
+            if first.gy > 1 << 16 || first.gz > 1 << 16 || grid > 1u128 << 32 {
+                return Err(format!(
+                    "{what}: grid ({}, {}, {}) exceeds what the dispatcher encodes exactly (y, z <= 65536 for the wg_yz packing, gx*gy*gz <= 2^32 for the claim bitmap index)",
+                    first.gx, first.gy, first.gz
                 ));
             }
             if gids.len() != k_total as usize {
