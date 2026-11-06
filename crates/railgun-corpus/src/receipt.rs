@@ -532,6 +532,35 @@ pub const TASK_PROTO_REQUIRED: [&str; 6] = [
     TASK_PROTO_ONCE,
 ];
 
+/// The named assumption that every LDS access of a region lies inside the LDS the region
+/// declares (below the dispatcher's claim slot and parked state). A pool's task-graph record
+/// states, per region, how far the certificate went: nothing in the record implies the claim
+/// slot or the parked SGPRs are protected beyond it.
+pub const ASSUMPTION_REGION_LDS: &str = "region_lds_accesses_within_declared";
+/// A lifted hipcc body: its static allocation does not bound dynamic LDS indices.
+pub const ASSUMPTION_UNPROVEN: &str = "unproven";
+/// A native PM region: the builder that emitted it proved the bound; the certificate does not
+/// re-derive it.
+pub const ASSUMPTION_BUILDER_PROVEN: &str = "builder-proven, not re-derived";
+/// A native region whose every DS access address interval was proved inside the declared LDS
+/// by `railgun-cert` from the pool's bytes.
+pub const ASSUMPTION_CERT_PROVEN: &str = "proven (railgun-cert DS bounds)";
+/// Every status an assumption may carry.
+pub const ASSUMPTION_STATUSES: [&str; 3] = [
+    ASSUMPTION_UNPROVEN,
+    ASSUMPTION_BUILDER_PROVEN,
+    ASSUMPTION_CERT_PROVEN,
+];
+
+/// A named assumption the certificate rests on for one region of the pool, and its status.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct RegionAssumption {
+    pub template: u32,
+    /// [`ASSUMPTION_REGION_LDS`].
+    pub name: String,
+    /// One of [`ASSUMPTION_STATUSES`].
+    pub status: String,
+}
 /// What `railgun-cert`'s task-graph certificate proved about a persistent
 /// pool kernel's dispatcher, on the emitted object (`railgun::task_graph`
 /// consumes it: its proof of a co-resident group's ordering and progress is
@@ -575,6 +604,11 @@ pub struct TaskProtocolRecord {
     /// otherwise, so receipts written before span mode are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<TaskSpanOffsets>,
+    /// The assumptions each region's certificate rests on (sorted by template, one per
+    /// region), each with its status; absent (and skipped when serializing) from receipts
+    /// that predate it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assumptions: Vec<RegionAssumption>,
 }
 
 /// Byte offsets, inside one task header, of the `u32` virtual-grid fields.
@@ -775,6 +809,17 @@ impl TaskProtocolRecord {
                 return bad(
                     "the span table layout is misaligned, overlapping or outside its descriptor",
                 );
+            }
+        }
+        for (i, a) in self.assumptions.iter().enumerate() {
+            if a.name != ASSUMPTION_REGION_LDS {
+                return bad(&format!("unknown assumption {:?}", a.name));
+            }
+            if !ASSUMPTION_STATUSES.contains(&a.status.as_str()) {
+                return bad(&format!("unknown assumption status {:?}", a.status));
+            }
+            if i > 0 && self.assumptions[i - 1].template >= a.template {
+                return bad("assumptions are not sorted by template and unique");
             }
         }
         Ok(())
@@ -1469,6 +1514,7 @@ mod tests {
                 .collect(),
             grid: None,
             span: None,
+            assumptions: Vec::new(),
         }
     }
 

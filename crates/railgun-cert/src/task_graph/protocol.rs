@@ -3114,6 +3114,7 @@ pub(super) fn check(
         event_stride: 1 << event_shift,
         proved: proved.into_iter().map(str::to_owned).collect(),
         span: span_proof.as_ref().map(|s| s.offsets),
+        assumptions: Vec::new(),
     };
     let mut evidence = vec![format!(
         "protocol: claim fetch-add on +{ticket}, header tasks(+{tasks})[claim<<{stride_shift}] fields tmpl@{template_offset} ka_off@{ka_off_offset} pred@{pred} expected@{expected} done@{done}, events(+{events})[i<<{event_shift}], n_tasks@+{n_tasks}, arena kernargs(+{kernargs}); {} wave(s)",

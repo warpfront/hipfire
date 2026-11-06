@@ -103,7 +103,8 @@ use peacemaker_lift::rewrite::region::{lift_region_in, RegionInputs};
 use peacemaker_lift::{lift_object, Options};
 use railgun_corpus::receipt::{
     ArenaPointerRecord, ArenaTemplateRecord, DescriptorArenaRecord, HiddenGridRecord,
-    SealedTableRecord, TaskProtocolRecord, WgFootprintRecord, SEALED_BOUND_KERNARG,
+    RegionAssumption, SealedTableRecord, TaskProtocolRecord, WgFootprintRecord,
+    ASSUMPTION_BUILDER_PROVEN, ASSUMPTION_REGION_LDS, ASSUMPTION_UNPROVEN, SEALED_BOUND_KERNARG,
     STATUS_CONDITIONAL, STATUS_PROVEN, STATUS_UNKNOWN, WITNESS_DESCRIPTOR_ARENA,
     WITNESS_SEALED_TABLE,
 };
@@ -1478,13 +1479,17 @@ fn prove_pool_in(
     let mut evidence: Vec<String> = facts.iter().map(|f| f.evidence.clone()).collect();
     evidence.extend(proto.evidence.iter().cloned());
     let span_arena = proto.span.as_ref().map(span_arena);
+    let assumptions = region_assumptions(&placed);
+    evidence.push(assumption_evidence(&assumptions));
+    let mut protocol = proto.record.clone();
+    protocol.assumptions = assumptions;
     let proof = PoolProof {
         arena: DescriptorArenaRecord {
             arena_arg_offset: proto.kernargs_arg_offset,
             templates,
         },
         span_arena,
-        protocol: proto.record.clone(),
+        protocol,
         evidence,
     };
     if let Err(rs) = check_shell_args(&shell, &proof, &proto) {
@@ -1507,6 +1512,43 @@ fn prove_pool_in(
         *partial = Some(proof);
         Err(refusals)
     }
+}
+
+/// The `region_lds_accesses_within_declared` assumption of each region of the pool (sorted by
+/// template): a lifted hipcc body's static allocation does not bound its dynamic LDS indices
+/// (`unproven`); a native PM region's bound is the builder's, not re-derived here.
+fn region_assumptions(placed: &[Placed]) -> Vec<RegionAssumption> {
+    let mut out: Vec<RegionAssumption> = placed
+        .iter()
+        .map(|p| RegionAssumption {
+            template: p.region.template_id,
+            name: ASSUMPTION_REGION_LDS.to_owned(),
+            status: if p.region.is_native() {
+                ASSUMPTION_BUILDER_PROVEN
+            } else {
+                ASSUMPTION_UNPROVEN
+            }
+            .to_owned(),
+        })
+        .collect();
+    out.sort_by_key(|a| a.template);
+    out
+}
+
+/// The evidence line of [`region_assumptions`]: the statuses grouped, and what they leave open.
+fn assumption_evidence(a: &[RegionAssumption]) -> String {
+    let mut by: BTreeMap<&str, Vec<u32>> = BTreeMap::new();
+    for x in a {
+        by.entry(x.status.as_str()).or_default().push(x.template);
+    }
+    let groups: Vec<String> = by
+        .iter()
+        .map(|(status, ts)| format!("{status} for t{ts:?}"))
+        .collect();
+    format!(
+        "assumption {ASSUMPTION_REGION_LDS}: {}; nothing else in this certificate bounds a region's LDS accesses, so the dispatcher's claim slot and parked SGPR state are protected only as far as these statuses say",
+        groups.join("; ")
+    )
 }
 
 /// The span table's descriptor records (the arena fact of the `spans` argument).

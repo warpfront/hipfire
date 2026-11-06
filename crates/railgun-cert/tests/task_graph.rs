@@ -1816,3 +1816,90 @@ fn removing_the_span_pred_none_poison_is_refused() {
         );
     }
 }
+
+/// Every pool record names, per region, how far the certificate went on "the region's LDS
+/// accesses stay inside its declared LDS": `unproven` for lifted hipcc bodies (a static
+/// allocation does not bound dynamic indices), `builder-proven, not re-derived` for the native
+/// PM regions. The statuses are in the record, in the digest-bound receipt and in the
+/// `railgun-cert pool` text, which says nothing else protects the claim slot / parked state.
+#[test]
+fn every_region_records_its_lds_assumption_status() {
+    use railgun_corpus::receipt::{
+        ASSUMPTION_BUILDER_PROVEN, ASSUMPTION_REGION_LDS, ASSUMPTION_UNPROVEN,
+    };
+    // the native templates of each fixture pool
+    let native: &[(&str, &[u32])] = &[
+        ("b32", &[]),
+        ("b64", &[]),
+        ("b128", &[1]),
+        ("b256", &[2]),
+        ("b320", &[]),
+    ];
+    for &(name, symbol, templates) in POOLS {
+        let receipt = certify_pool(&pool(name), &from_disk).expect("certify");
+        let k = kernel(&receipt, symbol);
+        let record = k.task_protocol.as_ref().expect("record");
+        let natives = native.iter().find(|(n, _)| *n == name).unwrap().1;
+        let want: Vec<(u32, &str)> = {
+            let mut ts = templates.to_vec();
+            ts.sort_unstable();
+            ts.into_iter()
+                .map(|t| {
+                    (
+                        t,
+                        if natives.contains(&t) {
+                            ASSUMPTION_BUILDER_PROVEN
+                        } else {
+                            ASSUMPTION_UNPROVEN
+                        },
+                    )
+                })
+                .collect()
+        };
+        let got: Vec<(u32, &str)> = record
+            .assumptions
+            .iter()
+            .map(|a| {
+                assert_eq!(a.name, ASSUMPTION_REGION_LDS, "{name}");
+                (a.template, a.status.as_str())
+            })
+            .collect();
+        assert_eq!(got, want, "{name}");
+        record.validate(symbol).expect("validates");
+        // bound by the case digest: the receipt validates, and the record serializes the
+        // statuses
+        k.validate_case(
+            &receipt.object_sha256,
+            &receipt.device_elf_sha256,
+            &receipt.arch,
+        )
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let json = serde_json::to_value(record).unwrap();
+        assert_eq!(
+            json["assumptions"].as_array().map(Vec::len),
+            Some(templates.len()),
+            "{name}"
+        );
+        // the text output (the task-graph check detail) states the statuses and their limit
+        let detail = &receipt
+            .checks
+            .iter()
+            .find(|c| c.id == "task-graph")
+            .expect("check")
+            .detail;
+        let line = detail
+            .lines()
+            .find(|l| l.contains("assumption region_lds_accesses_within_declared"))
+            .unwrap_or_else(|| panic!("{name}: no assumption line in\n{detail}"));
+        assert!(line.contains("unproven for t["), "{name}: {line}");
+        assert_eq!(
+            line.contains("builder-proven, not re-derived for t["),
+            !natives.is_empty(),
+            "{name}: {line}"
+        );
+        assert!(
+            line.contains("claim slot and parked SGPR state are protected only as far as"),
+            "{name}: {line}"
+        );
+    }
+}
