@@ -17,8 +17,15 @@
 //! `pred == NONE`, `events[pred] >= expected`, `tmpl == t`, `tmpl == -1`,
 //! `wave != 0`). Region bodies are summarised at their entry: the entry state
 //! is checked, then every register outside the dispatcher's SGPR range is
-//! forgotten (the range itself is proven unwritten by the region check) and the
-//! walk resumes at the region's exit.
+//! forgotten and the walk resumes at the region's exit. A dispatcher SGPR the
+//! region writes is *clobbered* from there until the dispatcher writes it again:
+//! reading it is refused (`task_graph-region-sgpr-park`), except after a restore
+//! `v_readlane_b32 sK, vN, lane` from the VGPR lane (constant lane) that held a copy
+//! of `sK` (`v_writelane_b32 vN, sK, lane`) on every path into the entry, with `vN`
+//! unwritten by the region (every region VGPR def, VOPD halves and wide
+//! destinations included); the restore gives `sK` the symbolic value it had at the
+//! entry. Parked in a VGPR the region writes, or restored from another lane or
+//! another VGPR, is refused.
 //!
 //! What it proves, on every path, for the six required `TASK_PROTO_*` properties (and,
 //! when it holds, the optional seventh):
@@ -298,6 +305,29 @@ struct State {
     div2: Option<usize>,
     /// The store events (indices into the LDS summary) the loaded slot may hold.
     choice: Option<BTreeSet<usize>>,
+    /// Parked dispatcher SGPRs: `(vgpr, lane) -> sgpr` while lane `lane` of `vgpr` holds
+    /// the current value of that SGPR (`v_writelane_b32 vN, sK, lane` with a constant lane;
+    /// killed by any write of either register).
+    lanes: BTreeMap<(u16, u8), u16>,
+    /// Dispatcher SGPRs a region has overwritten and the dispatcher has not yet restored.
+    clob: BTreeMap<u16, Clob>,
+}
+
+/// A dispatcher SGPR clobbered by a region: the lanes it was parked in before the entry
+/// (empty when the paths disagree) and the symbolic value it held then.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Clob {
+    lanes: BTreeSet<(u16, u8)>,
+    saved: Option<Alts>,
+    /// Template of the region that overwrote it.
+    by: u32,
+}
+
+/// A constant-lane `v_writelane_b32 vV, sS, L` / `v_readlane_b32 sS, vV, L`.
+#[derive(Clone, Copy)]
+enum ParkOp {
+    Write(u16, u8, u16),
+    Read(u16, u16, u8),
 }
 
 const WL: u8 = 1;
@@ -330,6 +360,38 @@ impl State {
             (Some(a), Some(b)) => Some(a.union(b).copied().collect()),
             _ => None,
         };
+        self.lanes.retain(|k, r| o.lanes.get(k) == Some(r));
+        for (r, c) in &o.clob {
+            match self.clob.get_mut(r) {
+                Some(mine) => {
+                    mine.lanes = mine.lanes.intersection(&c.lanes).copied().collect();
+                    mine.saved = match (&mine.saved, &c.saved) {
+                        (Some(a), Some(b)) => {
+                            let u: Alts = a.union(b).cloned().collect();
+                            (u.len() <= MAX_ALTS).then_some(u)
+                        }
+                        _ => None,
+                    };
+                }
+                // clobbered on one path only: not restorable
+                None => {
+                    self.clob.insert(
+                        *r,
+                        Clob {
+                            lanes: BTreeSet::new(),
+                            saved: None,
+                            by: c.by,
+                        },
+                    );
+                }
+            }
+        }
+        for (r, c) in &mut self.clob {
+            if !o.clob.contains_key(r) {
+                c.lanes.clear();
+                c.saved = None;
+            }
+        }
     }
 }
 
@@ -522,6 +584,54 @@ fn apply_wait(inst: &Inst, mn: &str, waited: u8) -> u8 {
     }
 }
 
+/// The registers one region writes: the dispatcher-range SGPRs and every VGPR (a wide
+/// destination, a VOPD half or a lane write included).
+#[derive(Clone, Debug, Default)]
+struct RegionDefs {
+    s: BTreeSet<u16>,
+    v: BTreeSet<u16>,
+}
+
+fn region_defs(kernel: &Kernel, ins: &[Ins], p: &Placed, lo: u16, hi: u16) -> RegionDefs {
+    use peacemaker_ir::reg::Kind;
+    let body = &kernel.body;
+    let mut out = RegionDefs::default();
+    for pos in p.p_entry..p.p_exit.min(body.layout.len()) {
+        let Some(inst) = body.insts.get(body.layout[pos]) else {
+            continue;
+        };
+        for d in &inst.effects.defs {
+            for r in d.base..d.base + u16::from(d.len) {
+                match d.kind {
+                    Kind::S if (lo..=hi).contains(&r) => {
+                        out.s.insert(r);
+                    }
+                    Kind::V => {
+                        out.v.insert(r);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // belt and braces from the printed form: the destination of a lane write and of
+        // each half of a VOPD pair, whatever the effect table says
+        let t = &ins[pos];
+        let mut dsts: Vec<&String> = Vec::new();
+        if t.mn == "v_writelane_b32" || t.mn.starts_with("v_dual_") {
+            dsts.extend(t.ops.first());
+            if let Some(i) = t.ops.iter().position(|o| o == "::") {
+                dsts.extend(t.ops.get(i + 2));
+            }
+        }
+        for o in dsts {
+            if let Some((Rk::V, base, len)) = parse_reg(o) {
+                out.v.extend(base..base + len);
+            }
+        }
+    }
+    out
+}
+
 /// The drained-counter knowledge at a region's exit, starting from every counter
 /// drained at its entry (the entry check requires that): a forward must-dataflow
 /// over the region's blocks.
@@ -645,6 +755,7 @@ struct Walk<'a> {
     template_ids: BTreeSet<u32>,
     lds_in: Vec<Event>,
     exit_waited: Vec<u8>,
+    region_defs: Vec<RegionDefs>,
     steps: BTreeMap<usize, StepLoop>,
 }
 
@@ -824,7 +935,90 @@ impl Walk<'_> {
         let ops = &ins.ops;
         let mem = inst.effects.mem.is_some() || mn == "s_sendmsg_rtn_b64";
         let mut handled = true;
+        // SGPRs parked in VGPR lanes across a region (`v_writelane_b32 vN, sK, lane` before
+        // the entry, `v_readlane_b32 sK, vN, lane` after the exit): a lane write records the
+        // copy, a read of a clobbered SGPR's own lane restores its symbolic value, and every
+        // other write of either register kills the copy.
+        for r in &inst.effects.uses {
+            if r.kind != peacemaker_ir::reg::Kind::S {
+                continue;
+            }
+            for k in r.base..r.base + u16::from(r.len) {
+                if let Some(c) = st.clob.get(&k) {
+                    self.fail(
+                        run,
+                        pos,
+                        "task_graph-region-sgpr-park",
+                        format!("reads s{k}, overwritten by region {} and not restored from its park since", c.by),
+                    );
+                }
+            }
+        }
+        let park = match (mn, ops.len()) {
+            ("v_writelane_b32", 3) => {
+                match (parse_reg(&ops[0]), parse_reg(&ops[1]), parse_num(&ops[2])) {
+                    (Some((Rk::V, v, 1)), Some((Rk::S, s, 1)), Some(l)) if (0..32).contains(&l) => {
+                        Some(ParkOp::Write(v, l as u8, s))
+                    }
+                    _ => None,
+                }
+            }
+            ("v_readlane_b32", 3) => {
+                match (parse_reg(&ops[0]), parse_reg(&ops[1]), parse_num(&ops[2])) {
+                    (Some((Rk::S, s, 1)), Some((Rk::V, v, 1)), Some(l)) if (0..32).contains(&l) => {
+                        Some(ParkOp::Read(s, v, l as u8))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let keeps_lanes = match park {
+            Some(ParkOp::Write(..)) => true,
+            Some(ParkOp::Read(s, ..)) => st.clob.contains_key(&s),
+            None => false,
+        };
+        if let (true, Some(ParkOp::Read(s, v, l))) = (keeps_lanes, park) {
+            // a restore of a clobbered SGPR
+            let c = st.clob.remove(&s).expect("clobbered");
+            st.lanes.retain(|_, src| *src != s);
+            if c.lanes.contains(&(v, l)) {
+                match c.saved {
+                    Some(a) => {
+                        st.s.insert(s, a);
+                    }
+                    None => {
+                        st.s.remove(&s);
+                    }
+                }
+                st.lanes.insert((v, l), s);
+            } else {
+                st.s.remove(&s);
+                let parked = if c.lanes.is_empty() {
+                    "no lane on every path".to_owned()
+                } else {
+                    c.lanes
+                        .iter()
+                        .map(|(pv, pl)| format!("v{pv} lane {pl}"))
+                        .collect::<Vec<_>>()
+                        .join(" or ")
+                };
+                self.fail(
+                    run,
+                    pos,
+                    "task_graph-region-sgpr-park",
+                    format!("restores s{s} from v{v} lane {l}, but it was parked in {parked} before region {}", c.by),
+                );
+            }
+        } else if let Some(ParkOp::Write(v, l, s)) = park {
+            st.lanes.insert((v, l), s);
+            for c in st.clob.values_mut() {
+                c.lanes.remove(&(v, l));
+            }
+            st.v.remove(&v);
+        }
         match mn {
+            _ if keeps_lanes => {}
             "s_nop" | "s_wait_alu" | "s_delay_alu" | "s_sleep" | "s_clause" | "s_wait_event"
             | "s_waitcnt" => {}
             "s_mov_b32" | "v_mov_b32_e32" | "v_mov_b32" if ops.len() == 2 => {
@@ -1051,6 +1245,9 @@ impl Walk<'_> {
         if !handled {
             self.generic(st, inst, mem);
         }
+        if !keeps_lanes {
+            self.kill_copies(st, inst);
+        }
         // the equality knowledge about `tmpl` dies with a write to its register
         let tmpl = self.notes.dispatcher.tmpl;
         if inst.effects.defs.iter().any(|d| {
@@ -1073,6 +1270,32 @@ impl Walk<'_> {
             && st.waited & (WL | WS) == (WL | WS)
         {
             st.facts |= BDSYNC;
+        }
+    }
+
+    /// An instruction's register writes end the copies they overwrite: a VGPR write kills
+    /// the lanes of that register (and the parks the dispatcher could restore from), an SGPR
+    /// write kills the copies of that SGPR and its pending restore (the dispatcher has
+    /// replaced the value it would have restored).
+    fn kill_copies(&self, st: &mut State, inst: &Inst) {
+        use peacemaker_ir::reg::Kind;
+        for d in &inst.effects.defs {
+            let (a, b) = (d.base, d.base + u16::from(d.len));
+            match d.kind {
+                Kind::V => {
+                    st.lanes.retain(|(v, _), _| !(a..b).contains(v));
+                    for c in st.clob.values_mut() {
+                        c.lanes.retain(|(v, _)| !(a..b).contains(v));
+                    }
+                }
+                Kind::S => {
+                    st.lanes.retain(|_, s| !(a..b).contains(s));
+                    for r in a..b {
+                        st.clob.remove(&r);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1660,9 +1883,60 @@ impl Walk<'_> {
             );
         }
         self.check_wg(st, pos, placed, run);
-        // apply the summary: the dispatcher's SGPR range survives, nothing else
+        // The dispatcher's SGPR range survives, except what the region writes: each such
+        // SGPR must be parked on every path into the entry in a VGPR lane the region does
+        // not write (a copy that survives the region), and stays unusable until the
+        // dispatcher restores it from that same lane.
+        let defs = &self.region_defs[idx];
+        let mut clob = BTreeMap::new();
+        for &r in &defs.s {
+            let parked: BTreeSet<(u16, u8)> = st
+                .lanes
+                .iter()
+                .filter(|(_, &src)| src == r)
+                .map(|(&k, _)| k)
+                .collect();
+            let usable: BTreeSet<(u16, u8)> = parked
+                .iter()
+                .copied()
+                .filter(|(v, _)| !defs.v.contains(v))
+                .collect();
+            // Not parked at all: the register is dead for the dispatcher if no path reads
+            // it before writing it again (a read of the clobbered register is refused at
+            // the read). Parked, but only in VGPRs the region writes: refused here, the
+            // dispatcher's restore would read the region's value.
+            if usable.is_empty() && !parked.is_empty() {
+                self.fail(
+                    run,
+                    pos,
+                    "task_graph-region-sgpr-park",
+                    format!(
+                        "region {t} writes dispatcher register s{r}, parked in {}, which the region writes",
+                        parked
+                            .iter()
+                            .map(|(v, l)| format!("v{v} lane {l}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+            }
+            clob.insert(
+                r,
+                Clob {
+                    lanes: usable,
+                    saved: st.s.get(&r).cloned(),
+                    by: t,
+                },
+            );
+        }
         let (lo_r, hi_r) = (d.lo, d.hi);
-        st.s.retain(|k, _| (lo_r..=hi_r).contains(k));
+        st.s.retain(|k, _| (lo_r..=hi_r).contains(k) && !defs.s.contains(k));
+        st.lanes.retain(|(v, _), src| {
+            !defs.v.contains(v) && (lo_r..=hi_r).contains(src) && !defs.s.contains(src)
+        });
+        for (r, c) in clob {
+            st.clob.insert(r, c);
+        }
         st.v.clear();
         st.exec = Exec::Top;
         st.scc = None;
@@ -2135,6 +2409,10 @@ pub(super) fn check(
         .iter()
         .map(|p| region_exit_waited(kernel, &ins, p))
         .collect();
+    let region_defs: Vec<RegionDefs> = placed
+        .iter()
+        .map(|p| region_defs(kernel, &ins, p, notes.dispatcher.lo, notes.dispatcher.hi))
+        .collect();
     let mut lds_in: Vec<Event> = Vec::new();
     let mut result: Option<Run> = None;
     for _ in 0..5 {
@@ -2153,6 +2431,7 @@ pub(super) fn check(
             template_ids: template_ids.clone(),
             lds_in: lds_in.clone(),
             exit_waited: exit_waited.clone(),
+            region_defs: region_defs.clone(),
             steps: steps.clone(),
         };
         let mut init = State {
@@ -2167,6 +2446,8 @@ pub(super) fn check(
             tmpl_ne: BTreeSet::new(),
             div2: None,
             choice: None,
+            lanes: BTreeMap::new(),
+            clob: BTreeMap::new(),
         };
         init.s.insert(0, one(E::Karg(0)));
         init.s.insert(1, one(E::Karg(1)));

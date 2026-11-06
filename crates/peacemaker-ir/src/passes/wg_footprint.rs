@@ -834,7 +834,26 @@ impl Eval {
             }
             Node::Load(_) => Err("a loaded value".into()),
             Node::Ent(_) => Err("a sealed-table entry".into()),
-            Node::MulSU24(..) => Err("a signed-by-unsigned 64-bit product (mad pair)".into()),
+            // `zext(a) * zext(b) + ((sext24(sign(a)) * sext24(b)) << 32)` equals
+            // `sext(a) * zext(b)` exactly when `b < 2^23`.
+            Node::MulSU24(a, b) => {
+                let y = self.eval(b)?;
+                match y.exact_range() {
+                    Some((_, hi)) if hi < 1 << 23 => {}
+                    _ => {
+                        return Err(
+                            "a signed-by-unsigned product whose unsigned factor may reach 2^23"
+                                .into(),
+                        )
+                    }
+                }
+                let (sa, zb) = (self.it.sext(a), self.it.zext(b));
+                let m = self.it.mul64(sa, zb);
+                if m.is_none() {
+                    return Err("a signed-by-unsigned product with no witness".into());
+                }
+                self.eval(m)
+            }
             Node::LaneMask(_) => Err("a lane mask".into()),
             Node::Mask(f) | Node::Bit(f) => {
                 let Some(fl) = self.flag_lanes(f) else {
@@ -1379,7 +1398,9 @@ fn check_arg(
         {
             return un(at("another argument pointer enters the address"));
         }
-        let rels = guard::rels(ev, &site.facts);
+        let all_facts: Vec<(Ix, bool)> =
+            site.facts.iter().chain(&site.lane_facts).copied().collect();
+        let rels = guard::rels(ev, &all_facts);
         let mut a_nb = a.clone();
         a_nb.usym = usym.clone();
         forms.push(SiteForm {
@@ -1400,33 +1421,6 @@ fn check_arg(
         return un("every write is under an unsatisfiable lane predicate".into());
     }
     let req = forms.iter().any(|f| f.req);
-    if std::env::var("WGDBG2").is_ok() {
-        for w in &writes {
-            if let Some(s) = sites.get(&w.inst) {
-                let f: Vec<String> = s
-                    .facts
-                    .iter()
-                    .map(|(a, p)| format!("{}{}", if *p { "" } else { "!" }, show(&ev.it, *a, 6)))
-                    .collect();
-                let l: Vec<String> = s
-                    .lane_facts
-                    .iter()
-                    .map(|(a, p)| format!("{}{}", if *p { "" } else { "!" }, show(&ev.it, *a, 6)))
-                    .collect();
-                eprintln!(
-                    "DBG arg@{} pc{} facts {:?} lane {:?} node {:?}",
-                    arg.offset,
-                    s.pos,
-                    f,
-                    l,
-                    s.lane_facts
-                        .iter()
-                        .map(|(a, _)| ev.it.node(*a))
-                        .collect::<Vec<_>>()
-                );
-            }
-        }
-    }
     let mut requires: Vec<WgRequirement> = match (req, ev.group_size_dword) {
         (true, Some(o)) => vec![WgRequirement {
             offset: o,

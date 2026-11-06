@@ -6,9 +6,9 @@
 //! objects of MegaM0's P0 megakernel, and byte mutations of them.
 //!
 //! Fixtures (`tests/fixtures/task_graph/`, generator in its README): the pool
-//! dispatchers `p0_r6_pool_b{32,128,256}.co` (each hosting lifted hipcc bodies as
-//! regions, b256 also the native COPY region) and the standalone objects they were
-//! lifted from, named `standalone/<sha256>.co`.
+//! dispatchers `p0_r6_pool_b{32,64,128,256,320}.co` (each hosting lifted hipcc bodies as
+//! regions, b256 also the native COPY region and the SGPR-parking template 5) and the
+//! standalone objects they were lifted from, named `standalone/<sha256>.co`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -72,7 +72,8 @@ const POOLS: &[(&str, &str, &[u32])] = &[
     ("b32", "pm_pool_b32", &[8, 10, 11, 17]),
     ("b64", "pm_pool_b64", &[6]),
     ("b128", "pm_pool_b128", &[7, 12, 16, 18]),
-    ("b256", "pm_pool_b256", &[2, 4, 9, 13, 14, 15]),
+    ("b256", "pm_pool_b256", &[2, 3, 4, 5, 9, 13, 14, 15]),
+    ("b320", "pm_pool_b320", &[19]),
 ];
 
 /// Run the obligations on a fixture pool: the refusals, and the proof the pool
@@ -140,6 +141,11 @@ fn real_templates_carry_their_hidden_grid_words() {
             vec![h(140, "group_size_x"), h(142, "group_size_y")],
         ),
         ("b256", 13, vec![h(80, "block_count_x")]),
+        (
+            "b256",
+            3,
+            vec![h(76, "group_size_x"), h(78, "group_size_y")],
+        ),
         (
             "b256",
             14,
@@ -726,8 +732,8 @@ fn a_plain_store_or_a_swap_as_poison_is_refused() {
 #[test]
 fn a_region_entered_without_the_counter_drain_is_refused() {
     for (name, symbol, template, wide) in [
-        ("b32", "pm_pool_b32", 10, false),
-        ("b32", "pm_pool_b32", 11, false),
+        ("b32", "pm_pool_b32", 10, true),
+        ("b32", "pm_pool_b32", 11, true),
         ("b128", "pm_pool_b128", 12, true),
         ("b256", "pm_pool_b256", 13, true),
     ] {
@@ -776,6 +782,124 @@ fn a_region_entered_without_the_counter_drain_is_refused() {
             explain(k)
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// the SGPR park around a region that overwrites dispatcher registers
+// ---------------------------------------------------------------------------
+
+/// b256's gated-delta body (template 5) writes s72, s73 and s74..s79 of the dispatcher range
+/// (its 80-SGPR working set). The dispatcher parks s72 and s74..s79 in lanes 0 and 2..7 of
+/// v119 before the entry (`v_writelane_b32 v119, sK, lane`) and restores them after the exit
+/// (`v_readlane_b32 sK, v119, lane`); s73 is dead (no path reads it before writing it).
+const PARK_POOL: (&str, &str) = ("b256", "pm_pool_b256");
+
+fn park_refusals(bytes: &[u8]) -> Vec<String> {
+    let receipt = certified(bytes, PARK_POOL.1);
+    expect_refused(&receipt, PARK_POOL.1, "task_graph-region-sgpr-park");
+    kernel(&receipt, PARK_POOL.1)
+        .unresolved
+        .iter()
+        .filter(|u| u.rule == "task_graph-region-sgpr-park")
+        .map(|u| u.detail.clone())
+        .collect()
+}
+
+#[test]
+fn a_parked_region_proves_its_restore_values() {
+    let (refusals, partial) = prove(PARK_POOL.0, PARK_POOL.1);
+    assert!(refusals.is_empty(), "{refusals:#?}");
+    let proof = partial.expect("proof");
+    // the grid x register s72 is parked and restored across template 5: the header-derived
+    // value reaches the next trip's entry, so the optional property still holds
+    assert!(proof
+        .protocol
+        .proved
+        .iter()
+        .any(|p| p == TASK_PROTO_REGION_WG));
+    let bytes = pool(PARK_POOL.0);
+    for (line, n) in [
+        ("v_writelane_b32 v119, s72, 0", 1),
+        ("v_writelane_b32 v119, s79, 7", 1),
+        ("v_readlane_b32 s72, v119, 0", 1),
+        ("v_readlane_b32 s79, v119, 7", 1),
+    ] {
+        assert_eq!(find(&bytes, PARK_POOL.1, line).len(), n, "{line}");
+    }
+}
+
+/// The region overwrites the parking VGPR (here by turning a one-dword `s_nop` inside it
+/// into `v_mov_b32 v119, 0`): the restore would read the region's value.
+#[test]
+fn a_region_that_writes_the_parking_vgpr_is_refused() {
+    let (symbol, mut bytes) = (PARK_POOL.1, pool(PARK_POOL.0));
+    let (entry, exit) = region_range(&bytes, symbol, 5);
+    let at = locate(&bytes, symbol);
+    let nop = find(&bytes, symbol, "s_nop 0")
+        .into_iter()
+        .find(|&pc| (entry..exit).contains(&u64::from(pc)))
+        .expect("an s_nop inside template 5");
+    let write = words_of("v_mov_b32_e32 v119, 0");
+    assert_eq!(write.len(), 1);
+    patch(&mut bytes, &at, nop, &write);
+    let r = park_refusals(&bytes);
+    assert!(
+        r.iter().any(|d| d.contains("s74")
+            && d.contains("v119")
+            && d.contains("which the region writes")),
+        "{r:#?}"
+    );
+}
+
+/// One restore removed: the dispatcher's next trip parks (reads) the clobbered register.
+#[test]
+fn a_missing_restore_of_one_register_is_refused() {
+    let (symbol, mut bytes) = (PARK_POOL.1, pool(PARK_POOL.0));
+    let at = locate(&bytes, symbol);
+    let pc = find(&bytes, symbol, "v_readlane_b32 s76, v119, 4");
+    assert_eq!(pc.len(), 1);
+    nop_out(&mut bytes, symbol, &at, pc[0], 2);
+    let r = park_refusals(&bytes);
+    assert!(
+        r.iter()
+            .any(|d| d.contains("reads s76") && d.contains("not restored")),
+        "{r:#?}"
+    );
+}
+
+/// A restore from another lane than the one the register was parked in.
+#[test]
+fn a_restore_from_the_wrong_lane_is_refused() {
+    let symbol = PARK_POOL.1;
+    let bytes = mutate(
+        PARK_POOL.0,
+        symbol,
+        "v_readlane_b32 s75, v119, 3",
+        "v_readlane_b32 s75, v119, 4",
+        0,
+    );
+    let r = park_refusals(&bytes);
+    assert!(
+        r.iter()
+            .any(|d| d.contains("restores s75 from v119 lane 4") && d.contains("v119 lane 3")),
+        "{r:#?}"
+    );
+}
+
+/// A register the region writes and the dispatcher restores, but never parked.
+#[test]
+fn a_restore_of_a_register_that_was_never_parked_is_refused() {
+    let (symbol, mut bytes) = (PARK_POOL.1, pool(PARK_POOL.0));
+    let at = locate(&bytes, symbol);
+    let pc = find(&bytes, symbol, "v_writelane_b32 v119, s77, 5");
+    assert_eq!(pc.len(), 1);
+    nop_out(&mut bytes, symbol, &at, pc[0], 2);
+    let r = park_refusals(&bytes);
+    assert!(
+        r.iter()
+            .any(|d| d.contains("s77") && d.contains("no lane on every path")),
+        "{r:#?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

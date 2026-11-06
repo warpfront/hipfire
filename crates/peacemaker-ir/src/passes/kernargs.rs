@@ -2245,33 +2245,6 @@ impl<'k> Analyzer<'k> {
                 LaneTgt::S(_) => {}
             }
         }
-        if rec.is_some() {
-            if let (Ok(r), Ok(regs)) = (std::env::var("WGTRACE"), std::env::var("WGREGS")) {
-                let mut rr = r.split('-').map(|x| x.parse::<usize>().unwrap());
-                let (a, b) = (rr.next().unwrap(), rr.next().unwrap());
-                if pos >= a && pos <= b {
-                    let mut ix = self.ix.borrow_mut();
-                    let mut line = format!("T {pos} {}:", name);
-                    for reg in regs.split(',') {
-                        let n: usize = reg[1..].parse().unwrap();
-                        let x = match &reg[..1] {
-                            "s" => st.s[n].ix.live(),
-                            "v" => st.v[n].ix.live(),
-                            _ => Ix::NONE,
-                        };
-                        line.push_str(&format!(
-                            " {reg}={}",
-                            super::wg_footprint::show_ix(&mut *ix, x, 6)
-                        ));
-                    }
-                    line.push_str(&format!(
-                        " exec={}",
-                        super::wg_footprint::show_ix(&mut *ix, st.exec[0].ix.live(), 3)
-                    ));
-                    eprintln!("{line}");
-                }
-            }
-        }
     }
 
     /// Workgroup-footprint analysis: lane-mask witnesses. A vector compare of
@@ -2337,7 +2310,11 @@ impl<'k> Analyzer<'k> {
             if atom.is_none() {
                 return out;
             }
-            let mask = it.lane_mask(vec![(atom, holds)], None);
+            // Exact while EXEC keeps this generation: an active lane's bit is
+            // set exactly when the compare holds.
+            let exact =
+                (!cmpx && st.epoch != u32::MAX && !self.pos_cyclic[dec.pos]).then_some(st.epoch);
+            let mask = it.lane_mask(vec![(atom, holds)], exact);
             if cmpx {
                 out.push((LaneTgt::Exec, it.mask_and(exec_ix, mask)));
             } else if let Some(t) = part
@@ -2345,6 +2322,7 @@ impl<'k> Analyzer<'k> {
                 .iter()
                 .filter(|f| f.def)
                 .find_map(|f| tgt_of(f.op))
+                .or_else(|| part.name.ends_with("_e32").then_some(LaneTgt::S(VCC_LO)))
             {
                 out.push((t, mask));
             }
@@ -3016,6 +2994,32 @@ impl<'k> Analyzer<'k> {
                 } else {
                     Some(Res::Pair(lo, Ix::NONE))
                 }
+            }
+            // `mask ? src1 : src0` under an exact single-fact lane mask formed
+            // under the current EXEC (no neg/abs modifiers).
+            "v_cndmask_b32"
+                if self.wgf
+                    && !self.pos_cyclic[pos]
+                    && self.decoded[pos]
+                        .as_ref()
+                        .is_some_and(|d| d.inst.mods.neg == 0 && d.inst.mods.abs == 0) =>
+            {
+                let (x0, x1) = (one(it, s0), one(it, s1));
+                let m = part
+                    .field("SRC2")
+                    .map(|f| one(it, f))
+                    .unwrap_or_else(|| st.s[VCC_LO].ix.live());
+                let single = match it.lane_mask_facts(m) {
+                    Some(([f], Some(g))) if st.epoch != u32::MAX && g == st.epoch => Some(*f),
+                    _ => None,
+                };
+                Some(Res::One(match single {
+                    Some((atom, holds)) => {
+                        let flag = if holds { atom } else { it.flag_not(atom) };
+                        it.sel(flag, x1, x0)
+                    }
+                    None => Ix::NONE,
+                }))
             }
             "v_readfirstlane_b32" | "v_mov_b32_dpp" => Some(Res::One(Ix::NONE)),
             _ => None,

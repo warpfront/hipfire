@@ -616,7 +616,7 @@ impl Interner {
         }
     }
 
-    fn sext(&mut self, a: Ix) -> Ix {
+    pub fn sext(&mut self, a: Ix) -> Ix {
         if !self.is32(a) {
             return Ix::NONE;
         }

@@ -266,15 +266,9 @@ fn mnemonic(kernel: &Kernel, arch: Arch, pos: usize) -> &'static str {
 
 /// Structural checks of one placed region over the lifted CFG: the region is
 /// entered only at its entry and left only through its exit, no instruction
-/// writes the dispatcher's SGPR range or a trap temporary, none ends or traps
-/// the wave, and a native region touches no LDS and no barrier.
-fn check_region_structure(
-    kernel: &Kernel,
-    arch: Arch,
-    lo: u16,
-    hi: u16,
-    p: &Placed,
-) -> Vec<Refusal> {
+/// names a trap temporary, none ends or traps the wave, and a native region touches
+/// no LDS and no barrier.
+fn check_region_structure(kernel: &Kernel, arch: Arch, p: &Placed) -> Vec<Refusal> {
     let body = &kernel.body;
     let t = p.region.template_id;
     let mut out = Vec::new();
@@ -320,15 +314,8 @@ fn check_region_structure(
         };
         let name = mnemonic(kernel, arch, pos);
         let text = format!("{name} @{:#x}", rel_pc(kernel, inst.prov.pc).unwrap_or(0));
-        for d in &inst.effects.defs {
-            let (a, b) = (d.base, d.base + u16::from(d.len) - 1);
-            if d.kind == Kind::S && a <= hi && b >= lo {
-                out.push(refuse(
-                    "task_graph-region-sgpr-write",
-                    format!("template {t}: `{text}` writes s{a}..s{b} of the dispatcher range s{lo}..s{hi}"),
-                ));
-            }
-        }
+        // (a write of the dispatcher's SGPR range is the protocol check's business: it is
+        // admitted only when parked and restored, `protocol::enter_region`)
         for r in inst.effects.defs.iter().chain(&inst.effects.uses) {
             if r.kind == Kind::Ttmp {
                 out.push(refuse(
@@ -978,7 +965,6 @@ pub fn prove_pool(
     }
     let waves = block / 32;
     let rsrc1_modes = descriptor.compute_pgm_rsrc1.0 & !(0x3f | (0xf << 6));
-    let (lo, hi) = (notes.dispatcher.lo, notes.dispatcher.hi);
     let placed = match place_regions(kernel, notes) {
         Ok(p) => p,
         Err(r) => return Err(vec![r]),
@@ -995,7 +981,7 @@ pub fn prove_pool(
     let mut facts = Vec::new();
     for p in &placed {
         let before = refusals.len();
-        refusals.extend(check_region_structure(kernel, arch, lo, hi, p));
+        refusals.extend(check_region_structure(kernel, arch, p));
         if refusals.len() != before {
             continue;
         }
