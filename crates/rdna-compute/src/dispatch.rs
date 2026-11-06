@@ -1010,7 +1010,7 @@ pub enum DType {
     /// Qwen4 HC mixer weight as OCP E4M3 with a per-output-row power-of-two scale
     /// (qt=57 `HC8E4M3Row`, exact gfx1201, `HIPFIRE_QWEN4_HC8`). Logical `[m, k]`; payload
     /// = `m*k` E4M3 bytes in the 512-B WMMA A-fragment tile order of
-    /// `peacemaker_isa::kernels::hc8_wmma_gfx1201::swizzle_hc8`, then `f32 s[m]`
+    /// `hc8::swizzle_hc8`, then `f32 s[m]`
     /// (`m*k + 4*m` bytes, see [`crate::hc8_weight::hc8_payload_bytes`]); the weight is
     /// `q * s[row]` exactly (also an exact BF16). No per-row stride (`row_bytes()` is
     /// `None`). Read only by the PeaceMaker `hc8_gemm` decode routes and the exact dequant to

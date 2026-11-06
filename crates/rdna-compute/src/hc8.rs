@@ -10,13 +10,14 @@
 //! * `i8`: `s = rowamax / 127`, `q = clamp(rint(w / s), -127, 127)`.
 //!
 //! An all-zero row gets `s = 1` (any finite value is exact; the kernel multiplies by it).
-//! The 8-bit bytes are pre-swizzled into 512-B WMMA tiles by `peacemaker_isa::kernels::hc8_wmma_gfx1201::swizzle_hc8`.
+//! The 8-bit bytes are pre-swizzled into 512-B WMMA tiles by [`swizzle_hc8`], a local copy of
+//! `peacemaker_isa::kernels::hc8_wmma_gfx1201::swizzle_hc8` (the runtime embeds the pinned image and never links the
+//! compiler crate; the `tests` module asserts every local copy equals the compiler crate's).
 //! Kernel entries `hc8_gemm_{fmt}_mw{MW}_kw{KW}_n{NT}_{epi}`; kernarg 48 B: `q@0 s@8 x@16 y@24` pointers,
 //! `M u32@32 K u32@36 rows u32@40 act_scale f32@44`; block `32*MW*KW`, grid x `M / (16*MW)`.
 
 use crate::{DType, Gpu, GpuTensor};
 use hip_bridge::{HipError, HipResult};
-pub use peacemaker_isa::kernels::hc8_wmma_gfx1201::swizzle_hc8;
 use std::sync::LazyLock;
 
 pub const MODULE: &str = "hc8_wmma_pm_gfx1201";
@@ -33,6 +34,48 @@ pub(crate) fn image() -> &'static [u8] {
 }
 pub const IMAGE_SHA256: &str = include_str!("../../../kernels/hc8_wmma_pm_gfx1201.hxaco.sha256");
 pub const KERNARG_BYTES: usize = 48;
+
+/// Fused read-up workgroup threads (`peacemaker_isa::kernels::hc8_wmma_gfx1201::READ_UP_BLOCK`).
+pub const READ_UP_BLOCK: u32 = 128;
+/// Fused read-up kernarg bytes (`READ_UP_KERNARG_BYTES`).
+pub const READ_UP_KERNARG_BYTES: u32 = 56;
+
+/// Symbol of the fused read-up export with `nt` column tiles (`read_up_symbol`).
+pub fn read_up_symbol(nt: u32) -> String {
+    format!("hc8_read_up_e4m3_n{nt}")
+}
+
+/// Swizzle a row-major `[m, k]` 8-bit matrix into the WMMA A-fragment tile order (`m % 16 == 0`, `k % 32 == 0`;
+/// panics otherwise). Local copy of `peacemaker_isa::kernels::hc8_wmma_gfx1201::swizzle_hc8`.
+pub fn swizzle_hc8(w: &[u8], m: usize, k: usize) -> Vec<u8> {
+    assert!(
+        m % 16 == 0 && k % 32 == 0 && w.len() == m * k,
+        "bad hc8 dims"
+    );
+    let mut out = vec![0u8; m * k];
+    for_each_slot(m, k, |dst, src| out[dst] = w[src]);
+    out
+}
+
+/// Calls `f(swizzled_offset, rowmajor_offset)` for every element.
+fn for_each_slot(m: usize, k: usize, mut f: impl FnMut(usize, usize)) {
+    for mt in 0..m / 16 {
+        for kt in 0..k / 32 {
+            for l in 0..32usize {
+                let (r, h) = (l & 15, l >> 4);
+                for step in 0..2usize {
+                    for j in 0..8usize {
+                        let kk = 16 * step + 4 * h + (j & 3) + 8 * (j >> 2);
+                        f(
+                            (mt * (k / 32) + kt) * 512 + l * 16 + step * 8 + j,
+                            (mt * 16 + r) * k + kt * 32 + kk,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
 /// The `(mw, kw)` geometries the module exports.
 pub const GEOMS: [Hc8Geom; 5] = [
     Hc8Geom { mw: 1, kw: 8 },
@@ -408,9 +451,6 @@ pub fn hc8_read_up(
     rows: usize,
     hidden: usize,
 ) -> HipResult<String> {
-    use peacemaker_isa::kernels::hc8_wmma_gfx1201::{
-        read_up_symbol, READ_UP_BLOCK, READ_UP_KERNARG_BYTES,
-    };
     if gpu.arch != "gfx1201" {
         return Err(err("requires exact gfx1201; no HIP fallback"));
     }
@@ -473,9 +513,11 @@ pub fn hc8_read_up(
 mod tests {
     use super::*;
 
+    use peacemaker_isa::kernels::hc8_wmma_gfx1201 as isa;
+
     #[test]
     fn route_symbols_are_module_exports() {
-        let exports = peacemaker_isa::kernels::hc8_wmma_gfx1201::symbols();
+        let exports = isa::symbols();
         for s in ROUTE_SYMBOLS {
             assert!(
                 exports.iter().any(|e| e == s),
@@ -486,6 +528,72 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), ROUTE_SYMBOLS.len());
+    }
+
+    /// The local copies equal the compiler crate's (the runtime must not link it).
+    #[test]
+    fn local_copies_equal_the_peacemaker_isa_source_of_truth() {
+        assert_eq!(MODULE, isa::MODULE);
+        assert_eq!(GEOMS.map(|g| (g.mw as u32, g.kw as u32)), isa::GEOMETRIES);
+        assert_eq!(READ_UP_BLOCK, isa::READ_UP_BLOCK);
+        assert_eq!(READ_UP_KERNARG_BYTES, isa::READ_UP_KERNARG_BYTES);
+        for nt in 1..=4 {
+            assert_eq!(read_up_symbol(nt), isa::read_up_symbol(nt));
+        }
+        // Every module export is either a gemm entry `entry_name` spells, a read-up, or a dequant.
+        let mut gemm = 0;
+        for geo in isa::all_geos() {
+            let fmt = match geo.fmt {
+                isa::Fmt::E4M3 => Hc8Fmt::E4m3,
+                isa::Fmt::I8 => Hc8Fmt::I8,
+            };
+            let g = Hc8Geom {
+                mw: geo.mw as usize,
+                kw: geo.kw as usize,
+            };
+            assert!(GEOMS.contains(&g), "{g:?}");
+            assert_eq!(entry_name(fmt, g, geo.nt as usize, geo.act), geo.symbol());
+            assert_eq!(32 * g.mw * g.kw, geo.block() as usize);
+            gemm += 1;
+        }
+        assert_eq!(gemm + 4 + 2, isa::symbols().len());
+        for out in isa::DEQUANT_OUTS {
+            assert!(
+                isa::symbols().iter().any(|s| s == out.symbol()),
+                "{}",
+                out.symbol()
+            );
+        }
+        assert_eq!(isa::DEQUANT_KERNARG_BYTES, 32);
+        assert_eq!(isa::DEQUANT_BLOCK, 256);
+        let mut dequants: Vec<&str> = ROUTE_SYMBOLS
+            .iter()
+            .copied()
+            .filter(|s| s.starts_with("hc8_dequant_"))
+            .collect();
+        dequants.sort_unstable();
+        let mut want: Vec<&str> = isa::DEQUANT_OUTS.iter().map(|o| o.symbol()).collect();
+        want.sort_unstable();
+        assert_eq!(dequants, want);
+    }
+
+    #[test]
+    fn local_swizzle_equals_the_peacemaker_isa_swizzle() {
+        for (m, k) in [
+            (16usize, 32usize),
+            (32, 64),
+            (48, 96),
+            (64, 320),
+            (320, 64),
+            (16, 10240 / 8),
+        ] {
+            let w: Vec<u8> = (0..m * k)
+                .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+                .collect();
+            let local = swizzle_hc8(&w, m, k);
+            assert_eq!(local, isa::swizzle_hc8(&w, m, k), "{m}x{k}");
+            assert_eq!(isa::unswizzle_hc8(&local, m, k), w, "{m}x{k} round trip");
+        }
     }
 
     fn bf(v: f32) -> u16 {
