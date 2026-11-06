@@ -49,8 +49,9 @@
 //!   lane_rows HC entries (`lane_rows_bf16_gfx1201::hc_act_tail`: bf16 round trip,
 //!   `act_scale * x`, round trip, `x / (1 + exp(-x))` with the full division sequence,
 //!   round trip).
-//! * Weight decode: E4M3 via `v_cvt_pk_f32_fp8` (e32 low pair, e64 `op_sel:[1,0]` high
-//!   pair), then `v_perm_b32 0x07060302` packs the two f32 high halves; int8 via
+//! * Weight decode: E4M3 via `v_cvt_pk_f32_fp8_e64` (`op_sel:[0,0]` / `[1,0]`
+//!   for the low / high byte pairs; raw weights occupy VGPRs above the e32 true16
+//!   limit), then `v_perm_b32 0x07060302` packs the f32 high halves; int8 via
 //!   `v_bfe_i32` + `v_cvt_f32_i32` + the same pack. Both are exact.
 //! * K loop: batches of `U` tiles (`U = 8/4/2/2` for `NT = 1/2/3/4`), then halving
 //!   batches `U/2 .. 1` for the remainder; all loads of a batch are issued before its
@@ -733,7 +734,7 @@ fn decode(b: &mut Builder, g: &Geo, l: &Lay, t: u32) -> R {
             Fmt::E4M3 => {
                 op(
                     b,
-                    format!("v_cvt_pk_f32_fp8_e32 {}, v{w}.l", vr(tb, 2)),
+                    format!("v_cvt_pk_f32_fp8_e64 {}, v{w}.l op_sel:[0,0]", vr(tb, 2)),
                     &[vr(tb, 2)],
                     &[v(w)],
                 )?;

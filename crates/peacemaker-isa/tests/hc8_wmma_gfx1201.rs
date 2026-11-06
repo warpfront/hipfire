@@ -578,15 +578,16 @@ fn run_reference(
 // ------------------------------------------------------------------------------------------------ module / emulators
 
 struct Pm {
-    program: Program,
+    program: &'static Program,
 }
 
 impl Pm {
     fn new() -> Self {
-        let (_, text, _) = emit_module().unwrap_or_else(|e| panic!("emit_module: {e}"));
-        Pm {
-            program: lift_text(&text),
-        }
+        static PROGRAM: std::sync::LazyLock<Program> = std::sync::LazyLock::new(|| {
+            let (_, text, _) = emit_module().unwrap_or_else(|e| panic!("emit_module: {e}"));
+            lift_text(&text)
+        });
+        Pm { program: &PROGRAM }
     }
 }
 
