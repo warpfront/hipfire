@@ -1606,7 +1606,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-lane-hc-allrows-eager-only",
         predicates: &[IsRecording, CaptureMode],
-        condition: "hipfire-arch-qwen4 forward_lanes_scoped (gpu_forward_lanes.rs) via hc_all_rows_applies: an AR / verify lane step of more than LANE_MAX_ROWS rows runs its HC stages (layer reads, the writes no TP2 all-reduce carries, the final read) as ONE all-rows segment under HIPFIRE_QWEN4_LANE_HC_ALLROWS (exact gfx1201, default on, `=0` kills it) only while `!(gpu.replay.is_recording() || gpu.graphs.capture_mode)` and outside the prefill-invariant scope; a recorded or captured step keeps the per <= 8-row group emission",
+        condition: "hipfire-arch-qwen4 forward_lanes_scoped (gpu_forward_lanes.rs) via LaneAllRowsRule::from_parts (its `eager` fact, also the mesh root's plan-time rule) and hc_all_rows_applies: an AR / verify lane step of more than LANE_MAX_ROWS rows runs its HC stages (layer reads, the writes no TP2 all-reduce carries, the final read) as ONE all-rows segment under HIPFIRE_QWEN4_LANE_HC_ALLROWS (exact gfx1201, default on, `=0` kills it) only while `!(gpu.replay.is_recording() || gpu.graphs.capture_mode)` and outside the prefill-invariant scope; a recorded or captured step keeps the per <= 8-row group emission",
         effect: KernelSelection,
         switches: "eager: gemv_bf16_xf32_k4_rows_lane_t8 (one launch over every row tile) and the t1 HC up read at 9..=64 rows; recorded/captured: the incumbent per-group HC launches",
         kernels: &["gemv_bf16_xf32_k4_rows_lane_t8"],
@@ -2319,12 +2319,14 @@ pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-arch-qwen4/src/gpu_forward_lanes.rs",
         function: "forward_lanes_scoped",
-        occurrences: 4,
-        decisions: &[
-            "qwen4-ple-async-upload",
-            "qwen4-lane-token-ids-async",
-            "qwen4-lane-hc-allrows-eager-only",
-        ],
+        occurrences: 2,
+        decisions: &["qwen4-ple-async-upload", "qwen4-lane-token-ids-async"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/gpu_forward_lanes.rs",
+        function: "from_parts",
+        occurrences: 2,
+        decisions: &["qwen4-lane-hc-allrows-eager-only"],
     },
     Site {
         file: "hipfire-arch-qwen4/src/ple_stage.rs",
