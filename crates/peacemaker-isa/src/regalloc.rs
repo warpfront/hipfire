@@ -187,6 +187,19 @@ fn vtokens(text: &str) -> Vec<Tok> {
     out
 }
 
+/// The renamed unit of old unit `u` in the first of `items` (submission renamings) that names it.
+fn renamed_in<'a>(
+    mut items: impl Iterator<Item = &'a (u64, Box<[(u8, u8)]>)>,
+    u: u8,
+) -> Option<u8> {
+    items.find_map(|(_, pairs)| {
+        pairs
+            .binary_search_by_key(&u, |p| p.0)
+            .ok()
+            .map(|k| pairs[k].1)
+    })
+}
+
 impl VgprMap {
     /// Number of submitted instructions the map covers.
     pub fn len(&self) -> usize {
@@ -210,6 +223,32 @@ impl VgprMap {
             return Err(format!("vgpr map: VALU window {n} holds {len} instructions, the recorded schedule {held} (emission is not deterministic)"));
         }
         Ok(w)
+    }
+    /// Registers `regs` of the emitter's numbering as the program holds them just before submission `at`: the
+    /// renamed unit of the last earlier submission that names the unit (the value pass 1's wait ledger saw
+    /// there), or, for a unit not named yet, of the first submission that names it. A unit no submission
+    /// names is dropped: nothing ever writes or reads it.
+    pub(crate) fn translate_defs(&self, at: usize, regs: &[RegRef]) -> Vec<RegRef> {
+        let at = at.min(self.len());
+        let mut out = vec![];
+        for r in regs {
+            if r.kind != Kind::V {
+                out.push(*r);
+                continue;
+            }
+            for u in r.base..r.base + r.len {
+                let held = renamed_in(self.inner.per_insn[..at].iter().rev(), u)
+                    .or_else(|| renamed_in(self.inner.per_insn[at..].iter(), u));
+                if let Some(n) = held {
+                    out.push(RegRef {
+                        kind: Kind::V,
+                        base: n,
+                        len: 1,
+                    });
+                }
+            }
+        }
+        out
     }
     /// The instruction submitted as the `n`-th `emit` call, with every VGPR operand renamed.
     pub(crate) fn rewrite(&self, n: usize, mut insn: Instruction) -> Result<Instruction, String> {

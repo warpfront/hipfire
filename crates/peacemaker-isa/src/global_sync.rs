@@ -418,6 +418,13 @@ impl Builder {
                 abi.lds_bytes, self.spec.group_segment_fixed_size
             ));
         }
+        if self.vgpr_map.is_some() {
+            if let Some((meaning, _)) = abi.inputs.iter().find(|(_, r)| r.kind == Kind::V) {
+                return Err(format!(
+                    "Builder::region {name}: VGPR input {meaning} is not renamed under compact_vgprs (declare region inputs in SGPRs)"
+                ));
+            }
+        }
         let (entry, exit) = (
             crate::plan::region_entry_label(name),
             crate::plan::region_exit_label(name),

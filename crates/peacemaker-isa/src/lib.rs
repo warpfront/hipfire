@@ -547,8 +547,16 @@ impl Builder {
     /// in flight into them, of stores still reading them): the minimal counter waits of the
     /// ledger, nothing when there is none. A caller about to open a clause settles its members'
     /// destinations first, since a clause takes no waits inside.
+    ///
+    /// Under `compact_vgprs` (pass 2) `regs` name the emitter's registers: they are translated to the renamed
+    /// registers of the next submission that names them.
     pub fn settle_defs(&mut self, regs: &[reg::RegRef]) -> Result<(), String> {
-        let probe = Instruction::new("", regs.to_vec(), Vec::new());
+        self.flush_valu()?;
+        let regs = match &self.vgpr_map {
+            Some(map) => map.translate_defs(self.vgpr_sub, regs),
+            None => regs.to_vec(),
+        };
+        let probe = Instruction::new("", regs, Vec::new());
         let required = self.ledger.required(&probe);
         self.emit_required(required)
     }
