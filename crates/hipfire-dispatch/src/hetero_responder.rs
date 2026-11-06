@@ -140,7 +140,7 @@ struct DecodeTrace {
 
 impl DecodeTrace {
     fn from_env(layers: usize) -> Option<Self> {
-        std::env::var("HIPFIRE_HETERO_DECODE_TRACE")
+        hipfire_config::developer_var("HIPFIRE_HETERO_DECODE_TRACE")
             .is_ok_and(|v| v == "1")
             .then(|| Self {
                 layers,

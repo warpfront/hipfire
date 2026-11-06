@@ -4410,7 +4410,7 @@ pub(crate) fn try_run_hetero_prompt(
     let outcome = {
         let mut run = HeteroRun {
             host: [0.0; 7],
-            trace: std::env::var("HIPFIRE_HETERO_PREFILL_TRACE")
+            trace: hipfire_config::developer_var("HIPFIRE_HETERO_PREFILL_TRACE")
                 .is_ok_and(|v| v == "1")
                 .then(HeteroTrace::default),
             forward: &mut *forward,
@@ -4461,7 +4461,7 @@ struct HeteroTrace {
 /// `HIPFIRE_HETERO_HOST_TRACE=1`: host wall time per phase of `pre`
 /// (frame, steps, validate, execute, snapshot) and `post`, per window.
 static HOST_TRACE: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var("HIPFIRE_HETERO_HOST_TRACE").is_ok_and(|v| v == "1"));
+    std::sync::LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_HETERO_HOST_TRACE").is_ok_and(|v| v == "1"));
 
 struct HeteroRun<'a, 'o> {
     /// Host phase sums: frame, steps, validate, execute, snapshot, post, calls.
