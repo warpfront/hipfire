@@ -3020,11 +3020,28 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ]
         );
         add!("zero_f32", kernels::ZERO_F32_SRC, ["zero_f32"]);
+        add!(
+            "hetero_split",
+            kernels::HETERO_SPLIT_SRC,
+            [
+                "hetero_token_advance",
+                "hetero_publish_cold",
+                "hetero_await_cold",
+                "hetero_install_cold",
+                "hetero_mask_hot",
+                "hetero_store_seq",
+                "hetero_publish_rows",
+                "hetero_release_rows",
+                "hetero_add_partial",
+                "hetero_f16_to_f32",
+                "hetero_f32_to_bf16"
+            ]
+        );
     }
     if matches!(arch, "gfx1201" | "gfx1100") {
         add!(
             "gemv_bf16_xf32",
-            kernels::gemv_bf16_xf32_src(arch == "gfx1151"),
+            kernels::gemv_bf16_xf32_src(matches!(arch, "gfx1151" | "gfx1201")),
             ["gemv_bf16_xf32"]
         );
     }
@@ -4192,7 +4209,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
         add!(
             "gemv_bf16_xf32",
-            kernels::gemv_bf16_xf32_src(arch == "gfx1151"),
+            kernels::gemv_bf16_xf32_src(matches!(arch, "gfx1151" | "gfx1201")),
             [
                 "gemv_bf16_xf32",
                 "gemv_bf16_xf32_bf16_scaled_add",
@@ -11843,6 +11860,20 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // The device-side hetero expert split (`hetero.rs`, `hetero_split.hip`).
+        const HETERO_SPLIT_ADDED_MODULES: [&str; 1] = ["hetero_split"];
+        for module in HETERO_SPLIT_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing hetero split module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         // Opt-in multi-lane fn-lanes GDN decode core (tensor_ops + gdn_lanes.hip).
         const GDN_LANES_ADDED_MODULES: [&str; 1] = ["gdn_lanes"];
         for module in GDN_LANES_ADDED_MODULES {
@@ -12012,6 +12043,7 @@ mod tests {
         assert_eq!(
             registry.len(),
             count
+                + HETERO_SPLIT_ADDED_MODULES.len()
                 + MQ3V25_ADDED_MODULES.len()
                 + GDN_LANES_ADDED_MODULES.len()
                 + PRE_S1_ADDED_SINCE_P0

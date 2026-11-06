@@ -647,6 +647,12 @@ pub fn state_census_with_forward(
         None => crate::gpu_forward::qwen4_forward_device_bytes(config, chunk_rows, mode)
             .ok_or_else(|| overflow("forward resources"))?,
     };
+    // `topology.hetero_experts`: the primary's prefill exchange buffers and the
+    // layer-major arena, allocated after placement, are chunk-sized forward
+    // resources too.
+    let forward = forward
+        .checked_add(crate::hetero::primary_device_bytes(config, chunk_rows))
+        .ok_or_else(|| overflow("forward resources"))?;
     Ok(StateCensus {
         qsa_context,
         state,
@@ -2636,6 +2642,11 @@ pub fn expert_hotset_budget(
 /// placement charges use [`expert_stage_placement_enabled`] and the stage
 /// this switch alone turns on borrows donor layers (no dedicated VRAM).
 pub fn expert_stage_enabled(gpu: &rdna_compute::Gpu) -> bool {
+    // `topology.hetero_experts`: cold experts are computed on the expert
+    // device, never staged across the link.
+    if matches!(crate::hetero::requested(), Ok(Some(_))) {
+        return false;
+    }
     expert_stage_switch(
         &gpu.arch,
         hipfire_config::developer_var(crate::gpu_forward::QWEN4_EXPERT_STAGE_ENV)
@@ -2670,6 +2681,9 @@ pub(crate) fn expert_stage_switch(
 /// donor layers, so a stage the measured link alone enables never takes
 /// uncharged VRAM nor a resident layer.
 pub fn expert_stage_placement_enabled(arch: &str) -> bool {
+    if matches!(crate::hetero::requested(), Ok(Some(_))) {
+        return false;
+    }
     expert_stage_placement_switch(
         arch,
         hipfire_config::developer_var(crate::gpu_forward::QWEN4_EXPERT_STAGE_ENV)

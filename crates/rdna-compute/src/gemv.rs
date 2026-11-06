@@ -21646,7 +21646,7 @@ impl Gpu {
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_bf16_xf32",
-            kernels::gemv_bf16_xf32_src(self.arch_caps.is_gfx1151()),
+            kernels::gemv_bf16_xf32_src(self.arch_caps.is_gfx1151() || self.arch_caps.is_gfx1201()),
             "gemv_bf16_xf32",
         )?;
         #[cfg(feature = "lab")]

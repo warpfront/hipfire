@@ -28,6 +28,7 @@ use crate::cpwait::{
     Watchdog, READY_SPIN_BUDGET,
 };
 use crate::families::moe::RoutedExpertWeights;
+use crate::igpu_split::IgpuColdArm;
 use crate::types::DispatchError;
 use hip_bridge::{
     HipError, MappedHostBuffer, MappedPublished, PinnedTransferBuffer, SignalGen, SignalWord,
@@ -94,6 +95,10 @@ const MAX_SLOTS: usize = CPU_SPLIT_STORAGE_MAX_ROWS * 10;
 fn err(message: impl std::fmt::Display) -> DispatchError {
     DispatchError::Hip(format!("CPU tier split: {message}"))
 }
+
+/// Longest an iGPU-arm layer may take before the split fails closed. A layer's
+/// cold slots take well under a millisecond; this only bounds a dead device.
+const IGPU_ARM_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// CPU-readable bytes of ANY expert of a layer, hot or cold, independent of
 /// tier owners. Implemented by the lab over the artifact mmap.
@@ -1118,6 +1123,9 @@ pub struct CpuSplitExecutor {
     /// cached. Independent of `diag_on`/parity: it never enables them and they
     /// never enable it. Disabled: no clock reads, records, or output.
     cpu_trace: bool,
+    /// Cold arithmetic on a gfx1151 iGPU instead of host CPU cores
+    /// ([`Self::set_igpu_arm`]); `None` keeps the CPU arm.
+    igpu: Option<Arc<IgpuColdArm>>,
     /// `HIPFIRE_QWEN4_TIER_COUNTERS=1` counting state ([`TIER_COUNTERS_ENV`]);
     /// `None` is production.
     tally: Option<TierTally>,
@@ -1256,6 +1264,7 @@ impl CpuSplitExecutor {
             ready_fallback_syncs: Cell::new(0),
             join_refusal: None,
             cpu_trace: cpu_split_trace_enabled(),
+            igpu: None,
             tally: None,
         })
     }
@@ -1423,6 +1432,77 @@ impl CpuSplitExecutor {
     /// `(cpwait_joins, cpwait_aborts, watchdog_fires)`, each cumulative: calls
     /// released with their generation, waits released with the abort value by
     /// an error path, and abort stores by the watchdog.
+    /// Run this executor's cold slot arithmetic on `arm` (a gfx1151 iGPU)
+    /// instead of host CPU cores. Refuses an arm whose geometry differs. Turns
+    /// the CPU-arm trace off: it times CPU arithmetic that no longer runs.
+    pub fn set_igpu_arm(&mut self, arm: Arc<IgpuColdArm>) -> Result<(), DispatchError> {
+        let d = arm.dims();
+        if d.dim != self.dim
+            || d.mi != self.mi
+            || d.top_k != self.top_k
+            || d.n_experts != self.placement.len()
+            || d.max_rows < self.max_rows
+        {
+            return Err(err(format!(
+                "iGPU arm geometry {d:?} does not serve dim {} mi {} top_k {} experts {} rows {}",
+                self.dim,
+                self.mi,
+                self.top_k,
+                self.placement.len(),
+                self.max_rows
+            )));
+        }
+        self.cpu_trace = false;
+        self.igpu = Some(arm);
+        Ok(())
+    }
+
+    /// Which engine runs the cold slots: `"cpu"` or `"igpu"`.
+    pub fn arm_name(&self) -> &'static str {
+        if self.igpu.is_some() {
+            "igpu"
+        } else {
+            "cpu"
+        }
+    }
+
+    /// The cold slot arithmetic of `join`, on the selected arm. Same contract
+    /// as [`cpu_exec::moe_cpu_host_slot_outputs`]. `shadowed` (cold bytes from a
+    /// lab [`CpuShadow`] over the artifact mmap, not the pinned tier) always runs
+    /// on the CPU: the iGPU can read pinned memory only.
+    #[allow(clippy::too_many_arguments)]
+    fn cold_slot_outputs(
+        &self,
+        shadowed: bool,
+        rows: usize,
+        ids: &[i32],
+        gpu_ids: &[i32],
+        host_slots: &[u32],
+        resolved: &[CpuMoeExpert<'_>],
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), DispatchError> {
+        match self.igpu.as_deref().filter(|_| !shadowed) {
+            Some(arm) => {
+                arm.host_slot_outputs(rows, ids, host_slots, resolved, x, out, IGPU_ARM_BOUND)
+            }
+            None => cpu_exec::moe_cpu_host_slot_outputs(
+                self.dim,
+                self.mi,
+                rows,
+                self.top_k,
+                self.placement.len(),
+                ids,
+                Some(gpu_ids),
+                host_slots,
+                resolved,
+                x,
+                false,
+                out,
+            ),
+        }
+    }
+
     pub fn cpwait_counters(&self) -> (u64, u64, u64) {
         match self.cpwait.as_ref() {
             Some(cp) => (
@@ -2604,18 +2684,14 @@ impl CpuSplitExecutor {
                         trace_entry.expect("trace_on supplies the join trace epoch"),
                     )?)
                 } else {
-                    cpu_exec::moe_cpu_host_slot_outputs(
-                        self.dim,
-                        self.mi,
+                    self.cold_slot_outputs(
+                        shadow.is_some(),
                         rows,
-                        self.top_k,
-                        self.placement.len(),
                         &ids[..slots],
-                        Some(&gpu_ids[..slots]),
+                        &gpu_ids[..slots],
                         &host_slots[..*host_count],
                         &resolved[..*host_count],
                         x,
-                        false,
                         rows_out,
                     )?;
                     None
@@ -2696,18 +2772,14 @@ impl CpuSplitExecutor {
             if let Some(w) = warm.as_ref() {
                 w.arm_next_install();
             }
-            cpu_exec::moe_cpu_host_slot_outputs(
-                self.dim,
-                self.mi,
+            self.cold_slot_outputs(
+                shadow.is_some(),
                 rows,
-                self.top_k,
-                self.placement.len(),
                 &ids[..slots],
-                Some(&gpu_ids[..slots]),
+                &gpu_ids[..slots],
                 &host_slots[..*host_count],
                 &resolved[..*host_count],
                 x,
-                false,
                 out,
             )?;
             let cpu_ns = t_cpu.map_or(0, |t| ns(t, Instant::now()));

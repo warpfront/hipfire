@@ -278,6 +278,20 @@ pub enum PrefillRouteMode<'a> {
     AdoptRoot {
         proof: &'a MoePrefillRouteProducerProof,
     },
+    /// The hetero expert split's expert device (`topology.hetero_experts`):
+    /// the primary GPU's sealed router already wrote `topk_indices` /
+    /// `topk_weights` (hot slots masked to -1), and this call runs the routed
+    /// experts only, combining into `x_batch`, which the caller zeroed as the
+    /// cold partial. Single binding, no shared expert, softmax recipe only.
+    ///
+    /// `xq`: the primary's int4 activation sidecar for these rows (the
+    /// symmetric IU4 producer is bitwise identical on both devices), copied
+    /// into this device's IU4 reservation. With it no input basis runs and the
+    /// gate/up must take the symmetric IU4 arm (any other arm fails closed);
+    /// `None` runs the call's own basis from `x_norm_batch`.
+    HeteroCold {
+        xq: Option<&'a rdna_compute::scratch::Int4MmqPrepared>,
+    },
 }
 
 /// The producer that owns the route buffers used by a sealed call.
@@ -3252,7 +3266,9 @@ pub fn seal_prefill<'a>(
 ) -> Result<SealedMoeCall<'a>, DispatchError> {
     let router = match params.recipe {
         crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. } => match params.prelude.route {
-            PrefillRouteMode::AdoptRoot { .. } => MoeRouterInput::PrecomputedSoftmaxTopK,
+            PrefillRouteMode::AdoptRoot { .. } | PrefillRouteMode::HeteroCold { .. } => {
+                MoeRouterInput::PrecomputedSoftmaxTopK
+            }
             _ => MoeRouterInput::SoftmaxTopK,
         },
         crate::families::moe::MoeRecipe::SigmoidRoutedNoShared => MoeRouterInput::SigmoidTopK,
@@ -3284,7 +3300,9 @@ fn prepare_prefill<'a>(
     }
     let expected = match params.recipe {
         crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. } => match params.prelude.route {
-            PrefillRouteMode::AdoptRoot { .. } => MoeRouterInput::PrecomputedSoftmaxTopK,
+            PrefillRouteMode::AdoptRoot { .. } | PrefillRouteMode::HeteroCold { .. } => {
+                MoeRouterInput::PrecomputedSoftmaxTopK
+            }
             _ => MoeRouterInput::SoftmaxTopK,
         },
         crate::families::moe::MoeRecipe::SigmoidRoutedNoShared => MoeRouterInput::SigmoidTopK,
@@ -3322,7 +3340,9 @@ fn seal_prefill_with_router<'a>(
         protocol: MoeProtocol::GroupedPrefill,
         router,
         contribution,
-        shared: if params.recipe == crate::families::moe::MoeRecipe::SigmoidRoutedNoShared {
+        shared: if params.recipe == crate::families::moe::MoeRecipe::SigmoidRoutedNoShared
+            || matches!(params.prelude.route, PrefillRouteMode::HeteroCold { .. })
+        {
             MoeSharedContribution::None
         } else {
             MoeSharedContribution::PerRankResidual
@@ -3333,12 +3353,47 @@ fn seal_prefill_with_router<'a>(
         route_receipt: None,
     };
     if let SealedParams::Prefill(params) = &call.params {
-        if let PrefillRouteMode::AdoptRoot { proof } = params.prelude.route {
-            let receipt = adopt_prefill_route(&call, proof)?;
-            call.attach_route_receipt(receipt)?;
+        match params.prelude.route {
+            PrefillRouteMode::AdoptRoot { proof } => {
+                let receipt = adopt_prefill_route(&call, proof)?;
+                call.attach_route_receipt(receipt)?;
+            }
+            PrefillRouteMode::HeteroCold { .. } => {
+                let receipt = hetero_cold_route(&call)?;
+                call.attach_route_receipt(receipt)?;
+            }
+            _ => {}
         }
     }
     Ok(call)
+}
+
+/// The route receipt of a `HeteroCold` call. The route was produced by the
+/// primary GPU's sealed router in another process-local program and copied
+/// into this call's top-k buffers by the hetero mailbox; the opt-in key and
+/// the mailbox's sequence pairing are its authority. Single binding only.
+fn hetero_cold_route<'a>(call: &SealedMoeCall<'a>) -> Result<MoeRouteReceipt<'a>, DispatchError> {
+    let SealedParams::Prefill(params) = &call.params else {
+        return Err(invalid("HeteroCold route requires a prefill call"));
+    };
+    if call.experts.rank_count() != 1 || call.experts.local_rank() != 0 {
+        return Err(invalid(
+            "HeteroCold prefill requires a Single expert binding",
+        ));
+    }
+    if call.contribution != MoeContribution::Residual {
+        return Err(invalid("HeteroCold prefill combines into x_batch"));
+    }
+    Ok(MoeRouteReceipt {
+        invocation: call.invocation,
+        protocol: call.protocol,
+        router: call.router,
+        n_experts: params.n_exp,
+        k_top: params.k_top,
+        indices: params.topk_indices,
+        weights: params.topk_weights,
+        adopted_from: None,
+    })
 }
 
 /// Launch-free grouped-prefill preflight.  It shares the same binding,
@@ -3351,7 +3406,9 @@ pub fn preflight_prefill<'a>(
 ) -> Result<(), DispatchError> {
     let router = match params.recipe {
         crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. } => match params.prelude.route {
-            PrefillRouteMode::AdoptRoot { .. } => MoeRouterInput::PrecomputedSoftmaxTopK,
+            PrefillRouteMode::AdoptRoot { .. } | PrefillRouteMode::HeteroCold { .. } => {
+                MoeRouterInput::PrecomputedSoftmaxTopK
+            }
             _ => MoeRouterInput::SoftmaxTopK,
         },
         MoeRecipe::SigmoidRoutedNoShared => MoeRouterInput::SigmoidTopK,
@@ -3387,6 +3444,11 @@ pub fn seal_prefill_ep<'a>(
         PrefillRouteMode::Replicated => {
             return Err(invalid(
                 "compact EP prefill requires ProduceRoot or AdoptRoot route authority",
+            ));
+        }
+        PrefillRouteMode::HeteroCold { .. } => {
+            return Err(invalid(
+                "compact EP prefill never admits the HeteroCold route (Single expert device only)",
             ));
         }
     };
@@ -3715,6 +3777,99 @@ fn validate_shared_prefill(
     }
 }
 
+/// The router operands of a prefill call that runs its own router.
+fn validate_prefill_router(
+    params: &MoePrefillParams<'_>,
+    hidden: usize,
+) -> Result<(), DispatchError> {
+    validate_weight_ref(
+        &params.prelude.router,
+        params.n_exp,
+        hidden,
+        "prefill router weight",
+    )?;
+    let score_shape = [params.batch_size, params.n_exp];
+    let score_elements = params
+        .batch_size
+        .checked_mul(params.n_exp)
+        .ok_or_else(|| invalid("prefill router score capacity overflows"))?;
+    require_elements(
+        params.prelude.router_logits,
+        score_elements,
+        "prefill router logits",
+    )?;
+    if params.prelude.router_scores.shape.as_slice() != score_shape {
+        return Err(invalid(format!(
+            "prefill router scores shape {:?} must be [{}, {}]",
+            params.prelude.router_scores.shape, params.batch_size, params.n_exp
+        )));
+    }
+    require_elements(
+        params.prelude.router_scores,
+        score_elements,
+        "prefill router scores",
+    )?;
+    match params.prelude.q8_router_policy {
+        MoeQ8RouterPolicy::DispatcherEntry => {}
+        MoeQ8RouterPolicy::FreshFp16Wmma { scratch, .. } => {
+            if params.prelude.router.dtype != DType::Q8_0 {
+                return Err(invalid(
+                    "fresh FP16 router projection is only valid for Q8 router weights",
+                ));
+            }
+            require_elements(
+                scratch,
+                params
+                    .batch_size
+                    .checked_mul(params.prelude.router.k)
+                    .ok_or_else(|| invalid("fresh router scratch capacity overflows"))?,
+                "fresh router FP16 scratch",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// `PrefillRouteMode::HeteroCold`: the routed experts only, over the
+/// primary's route, combined into `x_batch` (the caller's zeroed partial).
+fn validate_hetero_cold_prefill(params: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
+    if !matches!(params.recipe, MoeRecipe::SoftmaxGatedShared { .. }) {
+        return Err(invalid(
+            "HeteroCold prefill requires the SoftmaxGatedShared route",
+        ));
+    }
+    if params.prelude.shared.is_some() || params.dtypes.shared.is_some() {
+        return Err(invalid(
+            "HeteroCold prefill runs no shared expert; bind none",
+        ));
+    }
+    if params.routed_out.is_some() {
+        return Err(invalid(
+            "HeteroCold prefill combines into x_batch (the zeroed cold partial); routed_out must be None",
+        ));
+    }
+    if params.cpu_deferred_experts
+        || params.ep_row_gather.is_some()
+        || params.ep_tile_exchange.is_some()
+    {
+        return Err(invalid(
+            "HeteroCold prefill admits no CPU-deferred window or EP exchange",
+        ));
+    }
+    if matches!(
+        params.prelude.route,
+        PrefillRouteMode::HeteroCold { xq: Some(_) }
+    ) && !params
+        .route_policy
+        .is_some_and(|policy| policy.capability == MoeRouteCapability::Qt44Qt53GroupedSymmetric)
+    {
+        return Err(invalid(
+            "HeteroCold int4 activation requires the symmetric QT44/QT53 route policy",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_decode(
     _ctx: &DispatchCtx,
     experts: &BoundMoeExperts<'_>,
@@ -3910,51 +4065,11 @@ fn validate_prefill(
         .ok_or_else(|| invalid("prefill hidden capacity overflows"))?;
     validate_grouped_m_total_max(total_slots, params.n_exp, params.m_total_max)?;
     validate_normalization(&params.prelude.normalization, hidden, batch_hidden)?;
-    validate_shared_prefill(params, hidden)?;
-    validate_weight_ref(
-        &params.prelude.router,
-        params.n_exp,
-        hidden,
-        "prefill router weight",
-    )?;
-    let score_shape = [params.batch_size, params.n_exp];
-    let score_elements = params
-        .batch_size
-        .checked_mul(params.n_exp)
-        .ok_or_else(|| invalid("prefill router score capacity overflows"))?;
-    require_elements(
-        params.prelude.router_logits,
-        score_elements,
-        "prefill router logits",
-    )?;
-    if params.prelude.router_scores.shape.as_slice() != score_shape {
-        return Err(invalid(format!(
-            "prefill router scores shape {:?} must be [{}, {}]",
-            params.prelude.router_scores.shape, params.batch_size, params.n_exp
-        )));
-    }
-    require_elements(
-        params.prelude.router_scores,
-        score_elements,
-        "prefill router scores",
-    )?;
-    match params.prelude.q8_router_policy {
-        MoeQ8RouterPolicy::DispatcherEntry => {}
-        MoeQ8RouterPolicy::FreshFp16Wmma { scratch, .. } => {
-            if params.prelude.router.dtype != DType::Q8_0 {
-                return Err(invalid(
-                    "fresh FP16 router projection is only valid for Q8 router weights",
-                ));
-            }
-            require_elements(
-                scratch,
-                params
-                    .batch_size
-                    .checked_mul(params.prelude.router.k)
-                    .ok_or_else(|| invalid("fresh router scratch capacity overflows"))?,
-                "fresh router FP16 scratch",
-            )?;
-        }
+    if matches!(params.prelude.route, PrefillRouteMode::HeteroCold { .. }) {
+        validate_hetero_cold_prefill(params)?;
+    } else {
+        validate_shared_prefill(params, hidden)?;
+        validate_prefill_router(params, hidden)?;
     }
     validate_expert_shape_and_dtype(
         experts,
@@ -8389,6 +8504,7 @@ mod tests {
             cpu_deferred_experts: false,
             cpu_split: false,
             cpwait: false,
+            hetero_device: false,
             norm_fold: false,
         })
     }
@@ -8411,6 +8527,9 @@ mod tests {
             cpu_deferred_experts: false,
             cpu_split: false,
             cpwait: false,
+            hetero_prefill: false,
+            hetero_rows: false,
+            hetero_defer_join: false,
         })
     }
 
@@ -8812,6 +8931,115 @@ mod tests {
                 reordered.push(MoeStage::JoinSplit);
                 assert_eq!(reordered, cpwait, "{label}: host order {host:?}");
             }
+        }
+    }
+
+    #[test]
+    fn hetero_device_lowers_device_stages_in_order() {
+        for route in SPLIT_ROUTES {
+            let ordinary = split_decode_stages(Some(route), false, |_| {}, |_| {}).unwrap();
+            let st = split_decode_stages(Some(route), false, |_| {}, |s| s.hetero_device = true)
+                .unwrap();
+            let at = |x: MoeStage| {
+                st.iter()
+                    .position(|s| *s == x)
+                    .unwrap_or_else(|| panic!("{x:?} missing: {st:?}"))
+            };
+            assert!(
+                at(MoeStage::PublishCold) < at(MoeStage::GateUp),
+                "{route:?}: {st:?}"
+            );
+            assert!(
+                at(MoeStage::MutationFence) < at(MoeStage::AwaitCold),
+                "{route:?}: {st:?}"
+            );
+            assert!(
+                at(MoeStage::AwaitCold) < at(MoeStage::InstallCold),
+                "{route:?}: {st:?}"
+            );
+            assert!(
+                at(MoeStage::InstallCold) < at(MoeStage::Combine),
+                "{route:?}: {st:?}"
+            );
+            let without: Vec<MoeStage> = st
+                .into_iter()
+                .filter(|s| {
+                    !matches!(
+                        s,
+                        MoeStage::PublishCold | MoeStage::AwaitCold | MoeStage::InstallCold
+                    )
+                })
+                .collect();
+            assert_eq!(
+                without, ordinary,
+                "decode {route:?}: the device split adds only its three stages"
+            );
+        }
+    }
+
+    #[test]
+    fn hetero_device_runs_a_bf16_shared_down_inside_the_cold_wait() {
+        let bf16_shared = |p: &mut MoeParams<'_>| {
+            let shared = p.shared.as_mut().expect("fixture carries a shared expert");
+            shared.weights.down.dtype = DType::BF16;
+            shared.weights.down.awq_scale = None;
+        };
+        for route in [
+            MoeRouteCapability::Qt44Qt53Grouped,
+            MoeRouteCapability::Qt44Qt53GroupedSymmetric,
+        ] {
+            let st =
+                split_decode_stages(Some(route), false, bf16_shared, |s| s.hetero_device = true)
+                    .unwrap();
+            let label = format!("{route:?}: {st:?}");
+            let at = |x: MoeStage| {
+                st.iter()
+                    .position(|s| *s == x)
+                    .unwrap_or_else(|| panic!("{x:?} missing: {label}"))
+            };
+            if !cfg!(feature = "deltanet") {
+                assert!(!st.contains(&MoeStage::SharedAdd), "{label}");
+                continue;
+            }
+            // The GEMV half after the hot down, inside the wait; the fold after
+            // the routed combine, last: routed first, shared second.
+            assert_eq!(
+                st.iter().filter(|s| **s == MoeStage::SharedDown).count(),
+                1,
+                "{label}"
+            );
+            assert!(at(MoeStage::Down) < at(MoeStage::SharedDown), "{label}");
+            assert!(
+                at(MoeStage::SharedDown) < at(MoeStage::AwaitCold),
+                "{label}"
+            );
+            assert!(at(MoeStage::Combine) < at(MoeStage::SharedAdd), "{label}");
+            assert_eq!(*st.last().unwrap(), MoeStage::SharedAdd, "{label}");
+            // Without the device split the fused shared down keeps its place.
+            let plain = split_decode_stages(Some(route), false, bf16_shared, |_| {}).unwrap();
+            assert!(
+                !plain.contains(&MoeStage::SharedAdd),
+                "{route:?}: {plain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hetero_device_never_lowers_host_split_stages() {
+        for route in SPLIT_ROUTES {
+            let st = split_decode_stages(Some(route), false, |_| {}, |s| s.hetero_device = true)
+                .unwrap();
+            assert!(!st.contains(&MoeStage::PrepareSplit), "{st:?}");
+            assert!(!st.contains(&MoeStage::JoinSplit), "{st:?}");
+        }
+    }
+
+    #[test]
+    fn hetero_device_and_cpu_split_are_exclusive() {
+        for route in SPLIT_ROUTES {
+            let e = split_decode_stages(Some(route), true, |_| {}, |s| s.hetero_device = true)
+                .unwrap_err();
+            assert!(format!("{e:?}").contains("hetero"), "{e:?}");
         }
     }
 
@@ -9266,6 +9494,9 @@ mod tests {
                 cpu_deferred_experts: false,
                 cpu_split: false,
                 cpwait: false,
+                hetero_prefill: false,
+                hetero_rows: false,
+                hetero_defer_join: false,
             });
             let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
             assert_eq!(
@@ -9331,6 +9562,9 @@ mod tests {
             cpu_deferred_experts: false,
             cpu_split: false,
             cpwait: false,
+            hetero_prefill: false,
+            hetero_rows: false,
+            hetero_defer_join: false,
         });
         let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
         let stages = moe_program::lowered_stages(&call).unwrap();
@@ -9852,6 +10086,367 @@ mod tests {
             stripped.retain(|s| *s != MoeStage::TileMask);
             assert_eq!(stripped, without, "only the mask stage differs");
         }
+    }
+
+    /// The hetero split's expert-device call: the primary's route, the routed
+    /// experts only, combined into `x_batch` (the caller's zeroed cold partial).
+    fn hetero_cold_params<'a>(
+        s: &'a PrefillScratch,
+        routed: &'a dyn RoutedExpertWeights,
+        gate_up_ptrs: &'a GpuTensor,
+        down_ptrs: &'a GpuTensor,
+    ) -> MoePrefillParams<'a> {
+        let mut params = ep_prefill_params(s, routed, gate_up_ptrs, down_ptrs, None);
+        hetero_cold_route(&mut params);
+        params
+    }
+
+    #[test]
+    fn hetero_cold_prefill_lowers_the_routed_tail_only() {
+        for route in SPLIT_ROUTES {
+            for rows in [2, 64, 2048] {
+                let stages =
+                    split_prefill_stages(rows, Some(route), false, hetero_cold_route, |_| {})
+                        .unwrap();
+                let label = format!("{route:?} rows={rows}: {stages:?}");
+                for absent in [
+                    MoeStage::RouterProjection,
+                    MoeStage::SharedGateUp,
+                    MoeStage::SharedActivation,
+                    MoeStage::SharedDown,
+                    MoeStage::Route,
+                    MoeStage::PrepareSplit,
+                    MoeStage::JoinSplit,
+                    MoeStage::CpuSplice,
+                ] {
+                    assert!(!stages.contains(&absent), "{absent:?} in {label}");
+                }
+                let at = |stage: MoeStage| {
+                    stages
+                        .iter()
+                        .position(|s| *s == stage)
+                        .unwrap_or_else(|| panic!("{stage:?} missing: {label}"))
+                };
+                let order = [
+                    MoeStage::Normalize,
+                    MoeStage::InputBasis,
+                    MoeStage::GateUp,
+                    MoeStage::Activation,
+                    MoeStage::Down,
+                    MoeStage::MutationFence,
+                    MoeStage::Combine,
+                ];
+                for pair in order.windows(2) {
+                    assert!(
+                        at(pair[0]) < at(pair[1]),
+                        "{:?} before {:?}: {label}",
+                        pair[0],
+                        pair[1]
+                    );
+                }
+                assert_eq!(*stages.last().unwrap(), MoeStage::Combine, "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn hetero_cold_prefill_never_seals_as_ep() {
+        let (plan_table, cache, fixture) = ep_prefill_table();
+        let experts = BoundMoeExperts::from_cache(&plan_table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test_device("gfx1200", 5);
+        let routed = compact_routed(&plan_table, &fixture, DType::MQ4G256);
+        let s = prefill_scratch(0xE6_0000);
+        let mut params = hetero_cold_params(&s, &routed, &fixture.gate_up_ptrs, &fixture.down_ptrs);
+        params.routed_out = Some(&s.partial);
+        let err = seal_prefill_ep(experts, &ctx, params)
+            .err()
+            .expect("EP must refuse HeteroCold");
+        assert!(format!("{err:?}").contains("HeteroCold"), "{err:?}");
+        let mut params = hetero_cold_params(&s, &routed, &fixture.gate_up_ptrs, &fixture.down_ptrs);
+        params.routed_out = None;
+        assert!(
+            seal_prefill(experts, &ctx, params).is_err(),
+            "a compact binding is never Single"
+        );
+    }
+
+    #[test]
+    fn hetero_cold_prefill_seals_single_with_the_route_attached() {
+        let single_table = table(4, DType::MQ4G256);
+        let mut cache = single_table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&single_table, 0xE4_0000);
+        bind_fixture(&single_table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&single_table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test_device("gfx1151", 0);
+        let s = prefill_scratch(0xE4_0000);
+        let params = || {
+            hetero_cold_params(
+                &s,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+            )
+        };
+        let call = seal_prefill(experts, &ctx, params()).unwrap();
+        assert_eq!(call.router_input(), MoeRouterInput::PrecomputedSoftmaxTopK);
+        assert_eq!(call.contribution(), MoeContribution::Residual);
+        assert_eq!(call.shared_contribution(), MoeSharedContribution::None);
+        assert!(call.attached_route_stamp().is_some());
+
+        let refused = |params: MoePrefillParams<'_>, needle: &str| {
+            let err = seal_prefill(experts, &ctx, params).err().expect(needle);
+            assert!(format!("{err:?}").contains(needle), "{needle}: {err:?}");
+        };
+        let mut shared = params();
+        shared.prelude.shared = ep_prefill_params(
+            &s,
+            &fixture.routed,
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+        )
+        .prelude
+        .shared;
+        refused(shared, "shared expert");
+        let mut partial = params();
+        partial.routed_out = Some(&s.partial);
+        refused(partial, "routed_out");
+        let mut sigmoid = params();
+        sigmoid.recipe = MoeRecipe::SigmoidRoutedNoShared;
+        assert!(
+            seal_prefill(experts, &ctx, sigmoid).is_err(),
+            "sigmoid never seals HeteroCold"
+        );
+    }
+
+    fn hetero_cold_route(params: &mut MoePrefillParams<'_>) {
+        params.prelude.route = PrefillRouteMode::HeteroCold { xq: None };
+        params.prelude.shared = None;
+        params.dtypes.shared = None;
+        params.prelude.normalization = crate::families::moe::MoeNormalization::Provided;
+    }
+
+    #[test]
+    fn hetero_prefill_brackets_the_hot_routed_tail_with_the_cold_exchange() {
+        for route in SPLIT_ROUTES {
+            for rows in [2, 512, 2048] {
+                let st = split_prefill_stages(
+                    rows,
+                    Some(route),
+                    false,
+                    |_| {},
+                    |s| s.hetero_prefill = true,
+                )
+                .unwrap();
+                let label = format!("{route:?} rows={rows}: {st:?}");
+                let at = |stage: MoeStage| {
+                    st.iter()
+                        .position(|s| *s == stage)
+                        .unwrap_or_else(|| panic!("{stage:?} missing: {label}"))
+                };
+                for once in [
+                    MoeStage::PublishColdRows,
+                    MoeStage::SendColdRows,
+                    MoeStage::JoinColdRows,
+                    MoeStage::Combine,
+                    MoeStage::SharedDown,
+                ] {
+                    assert_eq!(
+                        st.iter().filter(|s| **s == once).count(),
+                        1,
+                        "{once:?}: {label}"
+                    );
+                }
+                // Published after the route wrote the ids, before any routed table read;
+                // the side-stream exchange is enqueued once the hot gate/up is queued
+                // (the host enqueue then overlaps device work).
+                assert!(
+                    at(MoeStage::Route) < at(MoeStage::PublishColdRows),
+                    "{label}"
+                );
+                assert!(
+                    at(MoeStage::PublishColdRows) < at(MoeStage::GateUp),
+                    "{label}"
+                );
+                assert!(at(MoeStage::GateUp) < at(MoeStage::SendColdRows), "{label}");
+                assert!(
+                    at(MoeStage::SendColdRows) < at(MoeStage::Combine),
+                    "{label}"
+                );
+                if st.contains(&MoeStage::Scatter) {
+                    assert!(
+                        at(MoeStage::PublishColdRows) < at(MoeStage::Scatter),
+                        "{label}"
+                    );
+                }
+                // Joined last, after the hot combine and the shared expert's down:
+                // the same accumulation order as the layer-major schedule's
+                // deferred join, so both schedules are bitwise equal.
+                assert!(at(MoeStage::Combine) < at(MoeStage::SharedDown), "{label}");
+                assert!(
+                    at(MoeStage::SharedDown) < at(MoeStage::JoinColdRows),
+                    "{label}"
+                );
+                assert_eq!(*st.last().unwrap(), MoeStage::JoinColdRows, "{label}");
+                for absent in [
+                    MoeStage::PrepareSplit,
+                    MoeStage::JoinSplit,
+                    MoeStage::CpuSplice,
+                    MoeStage::PublishCold,
+                    MoeStage::AwaitCold,
+                    MoeStage::InstallCold,
+                ] {
+                    assert!(!st.contains(&absent), "{absent:?}: {label}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hetero_prefill_is_exclusive_with_the_cpu_split() {
+        let route = Some(MoeRouteCapability::Qt44Qt53GroupedSymmetric);
+        split_refused(
+            split_prefill_stages(2, route, true, |_| {}, |s| s.hetero_prefill = true),
+            "hetero prefill + cpu split",
+            "hetero",
+        );
+        let plain = split_prefill_stages(64, route, false, |_| {}, |_| {}).unwrap();
+        assert!(
+            !plain.contains(&MoeStage::PublishColdRows) && !plain.contains(&MoeStage::JoinColdRows)
+        );
+    }
+
+    #[test]
+    fn hetero_prefill_with_a_deferred_join_leaves_the_join_to_the_caller() {
+        for route in SPLIT_ROUTES {
+            let st = split_prefill_stages(
+                2048,
+                Some(route),
+                false,
+                |_| {},
+                |s| {
+                    s.hetero_prefill = true;
+                    s.hetero_defer_join = true;
+                },
+            )
+            .unwrap();
+            let label = format!("{route:?}: {st:?}");
+            assert!(!st.contains(&MoeStage::JoinColdRows), "{label}");
+            let at = |stage: MoeStage| {
+                st.iter()
+                    .position(|s| *s == stage)
+                    .unwrap_or_else(|| panic!("{stage:?}: {label}"))
+            };
+            assert!(
+                at(MoeStage::PublishColdRows) < at(MoeStage::GateUp),
+                "{label}"
+            );
+            assert!(at(MoeStage::Combine) < at(MoeStage::SharedDown), "{label}");
+            assert_eq!(*st.last().unwrap(), MoeStage::SharedDown, "{label}");
+        }
+    }
+
+    #[test]
+    fn hetero_rows_brackets_the_hot_tail_with_the_decode_exchange() {
+        for route in SPLIT_ROUTES {
+            for rows in [2, 4, 8] {
+                let st = split_prefill_stages(
+                    rows,
+                    Some(route),
+                    false,
+                    |_| {},
+                    |s| {
+                        s.resolution.use_path2 = false;
+                        s.hetero_rows = true;
+                    },
+                )
+                .unwrap();
+                let label = format!("{route:?} rows={rows}: {st:?}");
+                let at = |stage: MoeStage| {
+                    st.iter()
+                        .position(|s| *s == stage)
+                        .unwrap_or_else(|| panic!("{stage:?} missing: {label}"))
+                };
+                for once in [
+                    MoeStage::PublishCold,
+                    MoeStage::AwaitCold,
+                    MoeStage::InstallCold,
+                    MoeStage::Combine,
+                    MoeStage::SharedDown,
+                ] {
+                    assert_eq!(
+                        st.iter().filter(|s| **s == once).count(),
+                        1,
+                        "{once:?}: {label}"
+                    );
+                }
+                // Published after the route, before the masked hot tail; the cold
+                // slot rows are installed after the hot down and before the
+                // canonical combine of the original route, then the shared down.
+                assert!(at(MoeStage::Route) < at(MoeStage::PublishCold), "{label}");
+                assert!(at(MoeStage::PublishCold) < at(MoeStage::GateUp), "{label}");
+                assert!(at(MoeStage::Down) < at(MoeStage::AwaitCold), "{label}");
+                assert!(
+                    at(MoeStage::AwaitCold) < at(MoeStage::InstallCold),
+                    "{label}"
+                );
+                assert!(at(MoeStage::InstallCold) < at(MoeStage::Combine), "{label}");
+                assert!(at(MoeStage::Combine) < at(MoeStage::SharedDown), "{label}");
+                for absent in [
+                    MoeStage::PrepareSplit,
+                    MoeStage::JoinSplit,
+                    MoeStage::PublishColdRows,
+                    MoeStage::SendColdRows,
+                    MoeStage::JoinColdRows,
+                    MoeStage::Scatter,
+                    MoeStage::Unscatter,
+                ] {
+                    assert!(!st.contains(&absent), "{absent:?}: {label}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hetero_rows_is_exclusive_with_the_other_splits_and_grouped_rows() {
+        let route = Some(MoeRouteCapability::Qt44Qt53GroupedSymmetric);
+        let rows_only = |s: &mut MoePrefillSelection| {
+            s.resolution.use_path2 = false;
+            s.hetero_rows = true;
+        };
+        split_refused(
+            split_prefill_stages(4, route, true, |_| {}, rows_only),
+            "hetero rows + cpu split",
+            "hetero rows",
+        );
+        split_refused(
+            split_prefill_stages(
+                4,
+                route,
+                false,
+                |_| {},
+                |s| {
+                    rows_only(s);
+                    s.hetero_prefill = true;
+                },
+            ),
+            "hetero rows + prefill exchange",
+            "hetero rows",
+        );
+        split_refused(
+            split_prefill_stages(
+                4,
+                route,
+                false,
+                |_| {},
+                |s| {
+                    s.hetero_rows = true;
+                    s.resolution.use_path2 = true;
+                },
+            ),
+            "hetero rows + grouped rows",
+            "hetero rows",
+        );
     }
 }
 

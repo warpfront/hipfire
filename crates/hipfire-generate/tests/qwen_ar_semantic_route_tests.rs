@@ -135,6 +135,7 @@ fn drive_ar_semantic_path_with_stop(
                     0.0,
                     0.0,
                     0.0,
+                    0.0,
                     0,
                     "",
                 );
@@ -1097,7 +1098,7 @@ fn real_writers_hostile_request_ids() {
         }],
     );
     emit_qwen_ar_done(
-        &mut sink, hostile, "stop", 1, 1.0, 0, 0.0, 0.0, 1.0, 0.0, 0, "",
+        &mut sink, hostile, "stop", 1, 1.0, 0, 0.0, 0.0, 1.0, 1000.0, 0.0, 0, "",
     );
     let events = parse_jsonl(&String::from_utf8(sink).unwrap());
     assert_eq!(events.len(), 4);
@@ -1110,6 +1111,7 @@ fn real_writers_hostile_request_ids() {
     assert_eq!(events[2]["type"], "tool_calls");
     assert_eq!(events[3]["type"], "done");
     assert_eq!(events[3]["finish_reason"], "stop");
+    assert_eq!(events[3]["decode_ms"], 1000.0);
 }
 
 #[test]
@@ -1555,6 +1557,7 @@ fn finish_defers_tool_calls_until_commit_effects() {
         0.0,
         0.0,
         1.0,
+        1000.0,
         0.0,
         0,
         "",

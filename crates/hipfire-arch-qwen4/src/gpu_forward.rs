@@ -174,9 +174,16 @@ pub fn qwen4_prefill_chunk_requested(
             return rows.min(max_seq);
         }
     }
-    prefill_chunk_requested_from(&gpu.arch, env.as_deref(), max_seq, mode, || {
+    let chunk = prefill_chunk_requested_from(&gpu.arch, env.as_deref(), max_seq, mode, || {
         crate::host_link::host_link(gpu)
-    })
+    });
+    // `topology.hetero_experts`: the expert device's prefill slot holds one
+    // chunk of at most `hetero_prefill_rows()` rows.
+    if matches!(crate::hetero::requested(), Ok(Some(_))) {
+        chunk.min(crate::hetero::hetero_prefill_rows())
+    } else {
+        chunk
+    }
 }
 
 /// The prefill chunk the current expert-parallel load's auto-fit chose
@@ -1705,6 +1712,11 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     /// The layer's preallocated split executor (masked route + slot storage),
     /// released through `free_gpu` only.
     cpu_split: Option<hipfire_dispatch::cpu_split::CpuSplitExecutor>,
+    /// `topology.hetero_experts`: this trunk layer's device-side split (in
+    /// place of `cpu_split`; never both).
+    hetero: Option<hipfire_dispatch::hetero_device::HeteroDeviceSplit>,
+    /// The layer's prefill attachment to the same split.
+    hetero_prefill: Option<hipfire_dispatch::hetero_device::HeteroPrefillSplit>,
     /// Keeps the frozen payload owners and borrowed pointer tables alive.
     tier: Option<crate::expert_tier_owners::ExpertTierLease>,
     /// S1 over a ranked hot set is enabled for this load's arch
@@ -2122,6 +2134,14 @@ impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
 
     fn cpu_split(&self) -> Option<&hipfire_dispatch::cpu_split::CpuSplitExecutor> {
         self.cpu_split.as_ref()
+    }
+
+    fn hetero_split(&self) -> Option<&hipfire_dispatch::hetero_device::HeteroDeviceSplit> {
+        self.hetero.as_ref()
+    }
+
+    fn hetero_prefill(&self) -> Option<&hipfire_dispatch::hetero_device::HeteroPrefillSplit> {
+        self.hetero_prefill.as_ref()
     }
 
     fn tier_identity(&self) -> Option<&hipfire_dispatch::families::moe::ExpertTierIdentity> {
@@ -5765,6 +5785,8 @@ impl Qwen4MoeLayerRuntime {
             cpu_expert_owners,
             cpu_cold_owners,
             cpu_split: None,
+            hetero: None,
+            hetero_prefill: None,
             tier: tier_layer.as_ref().map(|view| view.lease()),
             s1_tier_ok: tier_layer.is_some()
                 && crate::slowlink_admission::s1_tier_enabled_on(&gpu.arch),
@@ -5785,7 +5807,12 @@ impl Qwen4MoeLayerRuntime {
         .seal_retained_identities()?;
         // The executor owns device storage, so it is created last: nothing
         // after it can fail and strand it.
-        runtime.attach_cpu_split(gpu, config, if head_split { 1 } else { d2_executor_rows() })
+        runtime.attach_cpu_split(
+            gpu,
+            config,
+            if head_split { 1 } else { d2_executor_rows() },
+            head_split,
+        )
     }
 
     /// Create the layer's D2 split executor from its cold-expert owner's
@@ -5797,6 +5824,7 @@ impl Qwen4MoeLayerRuntime {
         gpu: &mut Gpu,
         config: &Qwen4Config,
         rows: usize,
+        head: bool,
     ) -> Result<Self, Qwen4GpuForwardError> {
         let Some(placement) = self
             .cpu_cold_owners
@@ -5805,6 +5833,148 @@ impl Qwen4MoeLayerRuntime {
         else {
             return Ok(self);
         };
+        let hetero = crate::hetero::requested().map_err(|error| {
+            Qwen4GpuForwardError::Dispatch(format!("layer {} hetero: {error}", self.label))
+        })?;
+        if hetero.is_some() && head {
+            // The native MTP head (built with label 0): its whole-layer
+            // host experts are computed by the gfx1151 responder in the
+            // head's own mailbox slot; no D2 executor, no prefill split.
+            let owners = self
+                .cpu_cold_owners
+                .as_ref()
+                .expect("placement came from the owners");
+            let (mut gate_up, mut down) =
+                (vec![0u64; placement.len()], vec![0u64; placement.len()]);
+            for (e, &cold) in placement.iter().enumerate() {
+                if cold == 0 {
+                    continue;
+                }
+                let expert = &self.experts[e];
+                let payload = owners
+                    .payload(e, expert.gate_up.dtype, expert.down.dtype)
+                    .ok_or_else(|| {
+                        Qwen4GpuForwardError::Dispatch(format!(
+                            "MTP head hetero: cold expert {e} has no host span"
+                        ))
+                    })?;
+                if (expert.gate_up.dtype, expert.down.dtype) != (DType::MQ4G256V2, DType::MQ4G128V2)
+                {
+                    return Err(Qwen4GpuForwardError::Dispatch(format!(
+                        "MTP head hetero: cold expert {e} is {:?}/{:?}, the responder serves MQ4G256V2/MQ4G128V2",
+                        expert.gate_up.dtype, expert.down.dtype
+                    )));
+                }
+                gate_up[e] = payload.gate_up.as_ptr() as u64;
+                down[e] = payload.down.as_ptr() as u64;
+            }
+            let split = crate::hetero::attach_head_layer(
+                gpu,
+                config.hidden_size,
+                config.num_experts_per_tok,
+                &placement,
+                (gate_up, down),
+            )
+            .map_err(Qwen4GpuForwardError::Dispatch)?;
+            self.hetero = Some(split);
+            return Ok(self);
+        }
+        if hetero.is_some() && self.label < config.num_hidden_layers {
+            // Device-side split (design v3): no D2 executor; the layer's cold
+            // experts are computed by the gfx1151 responder from these tables.
+            let owners = self
+                .cpu_cold_owners
+                .as_ref()
+                .expect("placement came from the owners");
+            let (mut gate_up, mut down) =
+                (vec![0u64; placement.len()], vec![0u64; placement.len()]);
+            let mut spans: Option<(DType, DType, usize, usize)> = None;
+            for (e, &cold) in placement.iter().enumerate() {
+                if cold == 0 {
+                    continue;
+                }
+                let expert = &self.experts[e];
+                let payload = owners
+                    .payload(e, expert.gate_up.dtype, expert.down.dtype)
+                    .ok_or_else(|| {
+                        Qwen4GpuForwardError::Dispatch(format!(
+                            "layer {} hetero: cold expert {e} has no host span",
+                            self.label
+                        ))
+                    })?;
+                gate_up[e] = payload.gate_up.as_ptr() as u64;
+                down[e] = payload.down.as_ptr() as u64;
+                let this = (
+                    expert.gate_up.dtype,
+                    expert.down.dtype,
+                    payload.gate_up.len(),
+                    payload.down.len(),
+                );
+                if *spans.get_or_insert(this) != this {
+                    return Err(Qwen4GpuForwardError::Dispatch(format!(
+                        "layer {} hetero: cold experts differ in format or size ({spans:?} vs {this:?})",
+                        self.label
+                    )));
+                }
+            }
+            // A layer with no cold expert still attaches (its requests answer
+            // with an all-zero partial); its formats are the layer's own.
+            let (gate_up_dtype, down_dtype, gate_up_bytes, down_bytes) = spans.unwrap_or((
+                self.experts[0].gate_up.dtype,
+                self.experts[0].down.dtype,
+                self.experts[0].gate_up.tensor.buf.size(),
+                self.experts[0].down.tensor.buf.size(),
+            ));
+            let shared = MoeSharedWeights {
+                selector: self.shared_scalar.dispatch_ref(),
+                gate: self.shared_gate.dispatch_ref(),
+                up: self.shared_up.dispatch_ref(),
+                down: self.shared_down.dispatch_ref(),
+            };
+            let prefill_cold = hipfire_dispatch::hetero_prefill::ColdPrefillConfig {
+                dim: config.hidden_size,
+                mi: config.moe_intermediate_size,
+                top_k: config.num_experts_per_tok,
+                n_experts: placement.len(),
+                max_rows: crate::hetero::hetero_prefill_rows(),
+                gate_up_dtype,
+                down_dtype,
+                gate_up_bytes,
+                down_bytes,
+                route_policy: Some(qwen4_route_policy(
+                    config,
+                    &shared,
+                    self.route_capability(
+                        crate::hetero::hetero_prefill_rows(),
+                        rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
+                    ),
+                    self.slab_cold_codec(),
+                    0,
+                )),
+                experts_all_gate_up_mq4: self.experts_all_gate_up_mq4,
+                recipe: MoeRecipe::SoftmaxGatedShared {
+                    bf16_round_trip: true,
+                    shared_after_combine: true,
+                },
+            };
+            let (split, prefill) = crate::hetero::attach_device_layer(
+                gpu,
+                self.label,
+                config.num_hidden_layers,
+                config.hidden_size,
+                config.moe_intermediate_size,
+                config.num_experts_per_tok,
+                &placement,
+                (gate_up, down),
+                prefill_cold,
+            )
+            .map_err(|error| {
+                Qwen4GpuForwardError::Dispatch(format!("layer {} {error}", self.label))
+            })?;
+            self.hetero = Some(split);
+            self.hetero_prefill = Some(prefill);
+            return Ok(self);
+        }
         // `HIPFIRE_QWEN4_D2_RETURN`, `HIPFIRE_QWEN4_D2_READY` and
         // `HIPFIRE_QWEN4_D2_JOIN` are read from the immutable process snapshot
         // for this load: an invalid spelling refuses the load before any
@@ -6214,6 +6384,8 @@ impl Qwen4MoeLayerRuntime {
             cpu_expert_owners: None,
             cpu_cold_owners,
             cpu_split: None,
+            hetero: None,
+            hetero_prefill: None,
             tier: None,
             s1_tier_ok: false,
             tier_identity: None,
@@ -6232,7 +6404,7 @@ impl Qwen4MoeLayerRuntime {
         }
         .seal_retained_identities()?;
         // The executor owns device storage, so it is created last.
-        runtime.attach_cpu_split(gpu, config, d2_executor_rows())
+        runtime.attach_cpu_split(gpu, config, d2_executor_rows(), false)
     }
 
     /// Load-only D2 prewarm/reserve: replace this layer's default-4 executor
@@ -6413,6 +6585,22 @@ impl Qwen4MoeLayerRuntime {
                     self.label
                 );
             }
+        }
+        let dims = hipfire_dispatch::igpu_split::ColdArmDims {
+            dim: config.hidden_size,
+            mi: config.moe_intermediate_size,
+            top_k: config.num_experts_per_tok,
+            n_experts: placement.len(),
+            max_rows: rows,
+        };
+        match crate::hetero::arm_for(&gpu.arch, dims) {
+            Ok(Some(arm)) => {
+                if let Err(error) = executor.set_igpu_arm(arm) {
+                    return Err(release(executor, format!("{error:?}")));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => return Err(release(executor, error)),
         }
         Ok(executor)
     }
@@ -16073,6 +16261,10 @@ impl Qwen4GpuForward {
                 output_policy,
             );
         }
+        // Every MoE call of the device split (one-row decode and prefill
+        // chunks alike) publishes requests: check the earlier waits, then
+        // advance the token counter so this forward's sequences are fresh.
+        crate::hetero::begin_token(gpu).map_err(Qwen4GpuForwardError::Dispatch)?;
         if self.share.is_none() && self.moe_borrow.is_empty() {
             return self.forward_chunk_tile(
                 bundle,

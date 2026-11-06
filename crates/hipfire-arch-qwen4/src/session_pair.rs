@@ -1241,7 +1241,10 @@ impl Qwen4Bundle {
         scope: SlowlinkScope,
     ) -> Result<bool, BundleError> {
         self.slowlink_begin_request();
-        if self.slowlink.profile.is_none() {
+        // `topology.hetero_experts`: the layer-major hetero schedule needs no
+        // S1 profile (it brings its own arena and runs no expert panels).
+        let hetero = matches!(crate::hetero::requested(), Ok(Some(_)));
+        if self.slowlink.profile.is_none() && !hetero {
             self.slowlink.bypass = Some("no admitted slow-link profile".into());
             return Ok(false);
         }
@@ -1258,8 +1261,11 @@ impl Qwen4Bundle {
         })?;
         let prior_scope = std::mem::replace(&mut forward.prefill_scope, true);
         self.slowlink.scope = scope;
-        let result =
-            crate::slowlink_prefill::try_run_prompt(&mut forward, self, gpu, tokens, output);
+        let result = if hetero {
+            crate::slowlink_prefill::try_run_hetero_prompt(&mut forward, self, gpu, tokens, output)
+        } else {
+            crate::slowlink_prefill::try_run_prompt(&mut forward, self, gpu, tokens, output)
+        };
         self.slowlink.scope = SlowlinkScope::default();
         forward.prefill_scope = prior_scope;
         self.execution = Some(forward);

@@ -611,6 +611,17 @@ pub(crate) fn input_basis_front(
     Ok(MoeFront { xq, x16, x8: None })
 }
 
+/// The device address of a fused front's routed int4 sidecar (the gate/up's
+/// activation for `n` rows), while it is still the live reservation.
+pub(crate) fn front_xq_ptr(
+    gpu: &Gpu,
+    front: &MoeFront,
+    k: usize,
+    n: usize,
+) -> Option<*mut std::ffi::c_void> {
+    gpu.int4_mmq_prepared_ptr(&front.xq, k, n).ok()
+}
+
 /// Whether the path-2 F16 WMMA gate/up rotates the activation straight to
 /// F16 itself (the bytes the F32 rotation + conversion produce): only when no
 /// shared projection reads the F32 basis `x_rot_batch`.
@@ -2130,6 +2141,31 @@ pub(crate) fn gate_up_front(
     let gate_up_ptrs = p
         .expert_stage_ptrs
         .map_or(p.expert_gate_up_ptrs, |stage| stage.gate_up);
+    // The hetero split's shipped int4 activation: only the symmetric IU4 arm
+    // consumes it (no `x_norm_batch` was written), so any other arm refuses.
+    if let super::sealed_moe::PrefillRouteMode::HeteroCold { xq: Some(xq) } = p.prelude.route {
+        if is_slab(p) || !sym_iu4(gpu, p, use_path2) {
+            return Err(DispatchError::Hip(format!(
+                "hetero cold prefill: a shipped int4 activation needs the symmetric IU4 gate/up, \
+                 which {} rows do not take on this device",
+                p.batch_size
+            )));
+        }
+        hip(gpu.int4_mmq_prepared_ptr(xq, p.gate_up_k, p.batch_size))?;
+        return hip(gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
+            gate_up_ptrs,
+            gemm_tile_ids(p),
+            p.sorted_slot_index,
+            xq,
+            p.y_gate_up_grouped,
+            2 * p.mi,
+            p.gate_up_k,
+            p.k_top,
+            grouped_rows,
+            p.batch_size,
+            experts_host_mapped(p),
+        ));
+    }
     if is_slab(p) {
         return slab_gate_up(gpu, p, grouped_rows);
     }
