@@ -1702,10 +1702,10 @@ impl WindowQueue for TwinQueue {
         if steps.is_empty() {
             Ok(())
         } else {
-            Err(QueueFailure {
-                message: "twin queue: typed steps are program nodes on the railgun route".into(),
-                quiescence: Quiescence::Proven,
-            })
+            Err(QueueFailure::new(
+                "twin queue: typed steps are program nodes on the railgun route",
+                Quiescence::Proven,
+            ))
         }
     }
 

@@ -1246,10 +1246,7 @@ impl WindowQueue for MockQueue {
         assert_eq!(nodes.len(), 2);
         let mut log = self.0.lock().unwrap();
         if let Some((m, q)) = log.submit_failure {
-            return Err(QueueFailure {
-                message: m.into(),
-                quiescence: q,
-            });
+            return Err(QueueFailure::new(m, q));
         }
         log.submits += 1;
         Ok(())
@@ -1259,10 +1256,7 @@ impl WindowQueue for MockQueue {
         let mut log = self.0.lock().unwrap();
         log.waits += 1;
         match log.wait_failure {
-            Some((m, q)) => Err(QueueFailure {
-                message: m.into(),
-                quiescence: q,
-            }),
+            Some((m, q)) => Err(QueueFailure::new(m, q)),
             None => Ok(()),
         }
     }

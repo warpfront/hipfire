@@ -47,6 +47,7 @@ pub mod npu;
 pub mod plan;
 pub mod sealed_table;
 pub mod shadow;
+pub mod watchdog;
 pub mod window;
 
 use std::ops::RangeInclusive;

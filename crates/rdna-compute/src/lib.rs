@@ -139,6 +139,7 @@ pub mod qsa_sp_select;
 pub mod qwen35_fa_batch;
 pub mod qwen4_moe_down_a8;
 pub mod railgun_check;
+pub mod railgun_quarantine;
 pub mod railgun_window;
 pub mod rdna;
 pub mod replay;

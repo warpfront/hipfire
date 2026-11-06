@@ -23,10 +23,11 @@ pub use redline_rocr::{
     QueueDepthStats, QueueSet, Runtime, RuntimeError, Symbols, load_symbols,
 };
 pub use replay::{
-    BatchFencePolicy, DecodedDispatch, GpuBatchTiming, GpuMultiQueueTiming, PhasedMultiQueuePm4Ib,
-    Quiescence, RecordedDispatch, RecordedGraph, ReplayError, ReplaySubmission,
-    SingleQueueBatchGraph, SingleQueueBatchSubmission, SingleQueuePm4Ib, TwoQueueBatchSubmission,
-    TwoQueuePhase, TwoQueuePhasedGraph, TwoQueueSerializedBatchGraph, TwoQueueSubmission,
+    BatchFencePolicy, CancelEvidence, DecodedDispatch, GpuBatchTiming, GpuMultiQueueTiming,
+    PhasedMultiQueuePm4Ib, Quiescence, RecordedDispatch, RecordedGraph, ReplayError,
+    ReplaySubmission, ReplayWait, SingleQueueBatchGraph, SingleQueueBatchSubmission,
+    SingleQueuePm4Ib, TwoQueueBatchSubmission, TwoQueuePhase, TwoQueuePhasedGraph,
+    TwoQueueSerializedBatchGraph, TwoQueueSubmission,
 };
 
 #[cfg(test)]

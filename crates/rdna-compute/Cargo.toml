@@ -1281,6 +1281,12 @@ required-features = ["lab"]
 name = "railgun_pm_persistent_smoke"
 required-features = ["lab"]
 
+# Persistent-program completion cancel on one gfx1201 card (poison cell,
+# teardown escalation, device quarantine); `--features lab`.
+[[example]]
+name = "railgun_persistent_cancel_smoke"
+required-features = ["lab"]
+
 # Peer-VRAM push + flag collective vs the incumbent TP2 graph collective
 # (two gfx1201 cards); `--features lab`.
 [[example]]
