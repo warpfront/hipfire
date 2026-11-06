@@ -25,7 +25,9 @@ pub(crate) enum MoeExpertDown {
                   ple-hot-pack  Cut the <model>.plehotrows hot-row pack from a model and its \
                   .plehot sidecar (run `hipfire-quantize ple-hot-pack --help`)\n  \
                   trunk-overlay  Build the <model>.trunk-overlay QT44 overlay sidecar for a base \
-                  model (run `hipfire-quantize trunk-overlay --help`)"
+                  model (run `hipfire-quantize trunk-overlay --help`)\n  \
+                  hc8  Build the <model>.hc8 8-bit hyper-connection mixer sidecar for a Flash-Next \
+                  base model (run `hipfire-quantize hc8 build --help`)"
 )]
 pub(crate) struct QuantizeArgs {
     /// Hugging Face model directory or model ID. A GGUF weight file is

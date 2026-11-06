@@ -86,6 +86,7 @@ fn kernel_dtype_for_quant_type(quant_type: u8) -> rdna_compute::DType {
         53 => DType::MQ4G128V2,
         55 => DType::FP8E4M3B128,
         56 => DType::FP8E4M3PT,
+        57 => DType::HC8E4M3Row,
         _ => DType::Raw,
     }
 }

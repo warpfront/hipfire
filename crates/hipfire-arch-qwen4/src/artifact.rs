@@ -54,6 +54,9 @@ const QWEN4_QT_FP8E4M3B128: u8 = 55;
 /// FP8E4M3PT (qt=56): 16-byte per-tensor BF16 scale header then one e4m3 code
 /// per value (stock-FP8 PLE rows); group_size 0.
 const QWEN4_QT_FP8E4M3PT: u8 = 56;
+/// HC8E4M3Row (qt=57): the Flash-Next HC8 sidecar format (`<model>.hc8`). Named
+/// only; a base artifact tensor carrying it is refused by validation.
+const QWEN4_QT_HC8E4M3ROW: u8 = 57;
 /// One FWHT-256 segment: the unit the encoder rotates and the decode GEMV/GEMM
 /// assert (`assert!(k % 256 == 0)`).  A payload that only satisfied the
 /// 32-weight block size would pass every byte count here and then either panic
@@ -419,6 +422,7 @@ fn source_dtype_name(quant_type: u8) -> Option<&'static str> {
         QWEN4_QT_MFP4G32E8SOA => Some("MFP4G32E8SOA"),
         QWEN4_QT_FP8E4M3B128 => Some("FP8E4M3B128"),
         QWEN4_QT_FP8E4M3PT => Some("FP8E4M3PT"),
+        QWEN4_QT_HC8E4M3ROW => Some("HC8E4M3Row"),
         _ => None,
     }
 }
@@ -3827,6 +3831,14 @@ mod tests {
                 headers[index].quant_type = 99;
             },
             "unsupported HFQM quant_type=99",
+        );
+        // qt=57 HC8E4M3Row is a sidecar-only format: a BASE artifact carrying it stays refused.
+        refused(
+            &|headers| {
+                let index = position(headers, experts);
+                headers[index].quant_type = QWEN4_QT_HC8E4M3ROW;
+            },
+            "unsupported HFQM quant_type=57",
         );
         // gate_up (K=2560) retagged MQ4G128V2 is byte-for-byte the same extent
         // as MQ4G256V2 (20 x 68 == 10 x 136) and its source set admits both,

@@ -165,6 +165,29 @@ weights and `=1` applies the overlay on any architecture.
   (`<file>.trunk-overlay`). `*.trunk-overlay` files are sidecars: never listed
   or served as models.
 
+### Flash-Next HC8 sidecar
+
+`<model>.hc8` is an optional sidecar of a Flash-Next (Qwen4) base: the
+hyper-connection mixer weights (`*input_mix_weight_down.weight` and
+`*input_mix_weight_up.weight` of every attn/mlp hyper connection, the final
+mixer, and the MTP ones when the base carries them) requantized offline from
+BF16 to 8-bit OCP E4M3 with one power-of-two f32 scale per output row. Every
+dequantized weight is exactly a BF16 value. The format is described in
+[`quant-formats/hc8-e4m3-row.md`](quant-formats/hc8-e4m3-row.md).
+
+- **Build.** `hipfire-quantize hc8 build --model <base> [--out <base>.hc8]
+  [--force]` reads the BF16 mixer tensors of the base (no GPU), writes the
+  sidecar, re-binds and re-reads it as a self-check, and prints a JSON report.
+  An existing output is refused unless `--force`.
+- **Placement.** The file is named `<model file name>.hc8`, next to the base
+  (the full file name plus `.hc8`), and is bound to that base by its length and
+  index sha256; a mismatching sidecar is refused with one log line and the BF16
+  base weights load.
+- **Default on, exact gfx1201.** When the sidecar is present the loader applies
+  it by default on exact gfx1201 only; other architectures load the BF16 base
+  untouched. `HIPFIRE_QWEN4_HC8=0` is the kill switch: the sidecar is ignored
+  and the BF16 weights load bit for bit as without it.
+
 ### Flash-Next expert hotset
 
 The same four stock Flash-Next MQ4 XTS tags (one base artifact, sha256

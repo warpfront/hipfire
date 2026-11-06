@@ -1362,6 +1362,7 @@ fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
         53 => panic!("MQ4G128V2 (qt=53) is typed-Qwen4-only; generic dequant_f32 refuses it"),
         55 => panic!("FP8E4M3B128 (qt=55) is typed-Qwen4-gfx942-only; generic dequant_f32 refuses it"),
         56 => panic!("FP8E4M3PT (qt=56) is read by the Qwen4 PLE row store only; generic dequant_f32 refuses it"),
+        57 => panic!("HC8E4M3Row (qt=57) is a Qwen4 HC8 sidecar format read by the typed Qwen4 HC route only; generic dequant_f32 refuses it"),
         131..=134 => panic!(
             "MQ-I4 (qt={quant_type}) is a typed-Qwen4 expert-slab format; generic dequant_f32 refuses it"
         ),

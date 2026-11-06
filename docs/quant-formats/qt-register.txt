@@ -89,6 +89,7 @@
 54  QwenI64      reserved     Qwen4 raw-I64 metadata record (non-weight; written by the Qwen4 producer, no QuantType variant)
 55  FP8E4M3B128  passthrough  OCP e4m3fn codes verbatim + 128x128 bf16 s_inv block scales, expert-blocked payload (docs/quant-formats/fp8-e4m3.md); Qwen4 stock-FP8 routed experts, gfx942 only
 56  FP8E4M3PT    arch-loaded  OCP e4m3fn codes + one per-tensor bf16 scale in a 16-B header; read by the Qwen4 PLE row store, not the passthrough table
+57  HC8E4M3Row   sidecar-only  Qwen4 HC8 sidecar (<model>.hc8): swizzled OCP E4M3 bytes + f32 per-row pow2 scales (docs/quant-formats/hc8-e4m3-row.md); never in a base artifact (base validation refuses it)
 131 MQ3I4G128R256  arch-loaded  MQ3-I4 gate/up: planar 3-bit codes + per-128 f16 scales (R256 FWHT); typed-qwen4 expert-slab only; no GPU kernels yet and the loader refuses it; codec in hipfire-runtime/src/mq_i4.rs; qt=130 is the compact-Hessian record id
 132 MQ3I4G128R128  arch-loaded  MQ3-I4 down: planar 3-bit codes + per-128 f16 scales (R128 FWHT); typed-qwen4 expert-slab only; no GPU kernels yet and the loader refuses it
 133 MQ2I4G128R256  arch-loaded  MQ2-I4 gate/up: planar 2-bit codes + per-128 f16 scales (R256 FWHT); typed-qwen4 expert-slab only; no GPU kernels yet and the loader refuses it

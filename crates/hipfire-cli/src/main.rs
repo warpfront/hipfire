@@ -2733,6 +2733,11 @@ fn rm_with_sidecar_pins(
     if ep_hotset.is_file() {
         targets.insert(ep_hotset);
     }
+    // The E4M3 HC sidecar (`<resolved file>.hc8`) rides with its base too.
+    let hc8 = hipfire_config::memory::hc8_sidecar_path(&path);
+    if hc8.is_file() {
+        targets.insert(hc8);
+    }
     if let Some((file, _)) = kept_mtp.as_ref() {
         // The stem sweep matched the shared head beside the trunk; keep it.
         let kept = paths.models.join(file);

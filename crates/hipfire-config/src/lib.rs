@@ -10723,6 +10723,19 @@ pub mod memory {
         PathBuf::from(path)
     }
 
+    /// Suffix of a Flash-Next HC8 sidecar: offline-requantized 8-bit (E4M3,
+    /// per-row power-of-two scale) hyper-connection mixer weights (an HFQM
+    /// container bound to its base by size and index sha256).
+    pub const HC8_SIDECAR_SUFFIX: &str = ".hc8";
+
+    /// Path of the HC8 sidecar of `model`: `<model file name>.hc8`, appended
+    /// to the full file name, the same placement as [`trunk_overlay_sidecar_path`].
+    pub fn hc8_sidecar_path(model: &Path) -> PathBuf {
+        let mut path = model.as_os_str().to_owned();
+        path.push(HC8_SIDECAR_SUFFIX);
+        PathBuf::from(path)
+    }
+
     /// Suffix of a Flash-Next expert hot set sidecar: the decode-ranked
     /// per-expert VRAM placement of a Qwen4 aggregate-MQ4 base (JSON, bound to
     /// its base by size and index sha256).
@@ -12194,6 +12207,15 @@ pub mod memory {
                 trunk_overlay_sidecar_path(Path::new("model")),
                 PathBuf::from("model.trunk-overlay")
             );
+        }
+
+        #[test]
+        fn hc8_sidecar_path_appends_to_full_file_name() {
+            assert_eq!(
+                hc8_sidecar_path(Path::new("/m/qwen3.8-flash-next.mq4-xts")),
+                PathBuf::from("/m/qwen3.8-flash-next.mq4-xts.hc8")
+            );
+            assert_eq!(hc8_sidecar_path(Path::new("model")), PathBuf::from("model.hc8"));
         }
 
         #[test]

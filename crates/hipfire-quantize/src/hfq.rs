@@ -74,6 +74,7 @@ impl QuantType {
             53 => Some(Self::MQ4G128V2),
             55 => Some(Self::FP8E4M3B128),
             56 => Some(Self::FP8E4M3PT),
+            57 => Some(Self::HC8E4M3Row),
             131 => Some(Self::MQ3I4G128R256),
             132 => Some(Self::MQ3I4G128R128),
             133 => Some(Self::MQ2I4G128R256),
@@ -253,6 +254,12 @@ pub(crate) enum QuantType {
     /// FP8 E4M3PT (qt=56): OCP e4m3fn codes with one per-tensor bf16 scale in a
     /// 16-byte header, then `rows*K` code bytes. Arch-loaded (Qwen4 PLE row store).
     FP8E4M3PT = 56,
+    /// HC8 E4M3Row (qt=57): wire constant, Qwen4 HC8 sidecar (`<model>.hc8`) only,
+    /// never produced by the quantize pipeline. `[m, k]` payload = swizzled OCP
+    /// e4m3 bytes (`m*k`) then little-endian f32 per-row power-of-two scales
+    /// (`4*m`); decode `q * s`. Layout in `docs/quant-formats/hc8-e4m3-row.md`;
+    /// built by `hipfire-quantize hc8 build`.
+    HC8E4M3Row = 57,
     /// MQ3-I4 gate/up (qt=131, DESIGN F1/F2): W3 grid ±{1,3,5,7} (3-bit planar
     /// codes) + per-128 f16 scales, R256 FWHT (seeds 42/1042). Tensor bytes are
     /// `[codes plane M*K*3/8][scales plane M*K/128 f16]`. Typed-qwen4 expert
