@@ -1292,6 +1292,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(80),
             write(88),
             write(96),
+            write(104),
         ]),
         "hetero_await_cold" => Some(vec![read(0), read(16), write(24)]),
         "hetero_install_cold" => Some(vec![read(0), read(8), read(16), read(24), write(40)]),

@@ -4232,6 +4232,7 @@ impl Qwen4MoeLayerRuntime {
             } else {
                 hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS
             },
+            head_split,
         )
     }
 
@@ -4244,6 +4245,7 @@ impl Qwen4MoeLayerRuntime {
         gpu: &mut Gpu,
         config: &Qwen4Config,
         rows: usize,
+        head: bool,
     ) -> Result<Self, Qwen4GpuForwardError> {
         let Some(placement) = self
             .cpu_cold_owners
@@ -4254,6 +4256,40 @@ impl Qwen4MoeLayerRuntime {
         };
         let hetero = crate::hetero::requested()
             .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("layer {} hetero: {error}", self.label)))?;
+        if hetero.is_some() && head {
+            // The native MTP head (built with label 0): its whole-layer
+            // host experts are computed by the gfx1151 responder in the
+            // head's own mailbox slot; no D2 executor, no prefill split.
+            let owners = self.cpu_cold_owners.as_ref().expect("placement came from the owners");
+            let (mut gate_up, mut down) = (vec![0u64; placement.len()], vec![0u64; placement.len()]);
+            for (e, &cold) in placement.iter().enumerate() {
+                if cold == 0 {
+                    continue;
+                }
+                let expert = &self.experts[e];
+                let payload = owners.payload(e, expert.gate_up.dtype, expert.down.dtype).ok_or_else(|| {
+                    Qwen4GpuForwardError::Dispatch(format!("MTP head hetero: cold expert {e} has no host span"))
+                })?;
+                if (expert.gate_up.dtype, expert.down.dtype) != (DType::MQ4G256V2, DType::MQ4G128V2) {
+                    return Err(Qwen4GpuForwardError::Dispatch(format!(
+                        "MTP head hetero: cold expert {e} is {:?}/{:?}, the responder serves MQ4G256V2/MQ4G128V2",
+                        expert.gate_up.dtype, expert.down.dtype
+                    )));
+                }
+                gate_up[e] = payload.gate_up.as_ptr() as u64;
+                down[e] = payload.down.as_ptr() as u64;
+            }
+            let split = crate::hetero::attach_head_layer(
+                gpu,
+                config.hidden_size,
+                config.num_experts_per_tok,
+                &placement,
+                (gate_up, down),
+            )
+            .map_err(Qwen4GpuForwardError::Dispatch)?;
+            self.hetero = Some(split);
+            return Ok(self);
+        }
         if hetero.is_some() && self.label < config.num_hidden_layers {
             // Device-side split (design v3): no D2 executor; the layer's cold
             // experts are computed by the gfx1151 responder from these tables.
@@ -4754,7 +4790,7 @@ impl Qwen4MoeLayerRuntime {
         }
         .seal_retained_identities()?;
         // The executor owns device storage, so it is created last.
-        runtime.attach_cpu_split(gpu, config, hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS)
+        runtime.attach_cpu_split(gpu, config, hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS, false)
     }
 
     /// Load-only D2 prewarm/reserve: replace this layer's default-4 executor

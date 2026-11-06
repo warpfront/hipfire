@@ -1,14 +1,17 @@
 //! Strix responder of the device-side hetero split (design v3).
 //!
-//! One gfx1151 `Gpu` on a worker thread. At start it records one HIP graph per
-//! trunk layer:
+//! One gfx1151 `Gpu` on a worker thread. At start it records, for every trunk
+//! layer's slot and every row count `1..=max_rows` (decode, MTP verify), one
+//! HIP graph:
 //! `hetero_mask_hot -> qt44 gate/up -> SiLU+rotate -> qt53 down -> hetero_store_seq`.
-//! The graph reads the layer's mailbox slot (activation and ids) and writes its
-//! cold rows and response word. The pointer tables of the layer's host-tier
-//! experts and its cold bitmap are uploaded once.
+//! The graph reads the slot (rows, ids) and writes its cold slot rows and
+//! response word. The pointer tables of the layer's host-tier experts and its
+//! cold bitmap are uploaded once. A later slot (the MTP head's) is registered
+//! while serving ([`HeteroResponder::add_slot`]).
 //!
-//! The thread then scans every slot's request word and launches the graph of
-//! any layer whose request changed since it last answered. It never predicts
+//! The thread then scans every served slot's request word and launches the
+//! graph for the request's row count (the slot's `rows` word) of any slot
+//! whose request changed since it last answered. It never predicts
 //! sequence numbers: the graph answers with the request's own value, so the
 //! responder cannot drift from the primary's token counter. While idle it backs
 //! off from spinning to sleeping (at most 1 ms). Waits on the primary side are
@@ -77,8 +80,12 @@ impl PrefillServe {
     }
 }
 
+/// A late slot registration: the slot, its cold experts, and where to report.
+type AddSlot = (usize, ColdLayer, std::sync::mpsc::Sender<Result<(), String>>);
+
 pub struct HeteroResponder {
     stop: Arc<AtomicBool>,
+    add: Mutex<std::sync::mpsc::Sender<AddSlot>>,
     failure: Arc<Mutex<Option<String>>>,
     answered: Arc<AtomicU64>,
     worker: Option<JoinHandle<()>>,
@@ -117,6 +124,8 @@ struct DecodeTrace {
     reqs: u64,
     gaps: u64,
     tokens: u64,
+    /// Requests by row count (index = rows).
+    rows: Vec<u64>,
 }
 
 impl DecodeTrace {
@@ -129,10 +138,15 @@ impl DecodeTrace {
             reqs: 0,
             gaps: 0,
             tokens: 0,
+            rows: Vec::new(),
         })
     }
 
-    fn layer(&mut self, cfg: &ResponderConfig, layer: usize, req: u32, seen: std::time::Instant) {
+    fn layer(&mut self, cfg: &ResponderConfig, layer: usize, rows: usize, req: u32, seen: std::time::Instant) {
+        if self.rows.len() <= rows {
+            self.rows.resize(rows + 1, 0);
+        }
+        self.rows[rows] += 1;
         let launched = std::time::Instant::now();
         let resp = word(cfg, cfg.geom.slot(layer).resp_seq);
         let deadline = launched + Duration::from_millis(100);
@@ -162,14 +176,16 @@ impl DecodeTrace {
             if self.tokens >= 64 {
                 let (r, g, t) = (self.reqs as f64, self.gaps.max(1) as f64, self.tokens as f64);
                 eprintln!(
-                    "hetero decode trace: token {:.0} us over {} layers; per layer: launch {:.1} us, answer {:.1} us, primary {:.1} us",
+                    "hetero decode trace: token {:.0} us over {} layers; per layer: launch {:.1} us, answer {:.1} us, primary {:.1} us; requests by rows {:?}",
                     self.sum[3] / t,
                     self.layers,
                     self.sum[0] / r,
                     self.sum[1] / r,
-                    self.sum[2] / g
+                    self.sum[2] / g,
+                    self.rows.iter().enumerate().skip(1).filter(|(_, n)| **n > 0).collect::<Vec<_>>()
                 );
                 self.sum = [0.0; 4];
+                self.rows.clear();
                 (self.reqs, self.gaps, self.tokens) = (0, 0, 0);
             }
         }
@@ -187,7 +203,11 @@ struct Graphs {
     /// Its `active_stream` is the one stream every graph is captured on and
     /// launched on (and every prefill job queued on).
     gpu: rdna_compute::Gpu,
-    execs: Vec<hip_bridge::GraphExec>,
+    /// One graph per slot and row count: `execs[slot][rows - 1]`; empty for a
+    /// slot not (yet) registered, whose request word no primary writes.
+    execs: Vec<Vec<hip_bridge::GraphExec>>,
+    /// Decode scratch every slot's graphs share: masked ids, gate, up, rot.
+    scratch: [rdna_compute::GpuTensor; 4],
     prefill: Option<Prefill>,
     _keep: Vec<rdna_compute::GpuTensor>,
 }
@@ -339,10 +359,107 @@ unsafe fn view(addr: u64, size: usize) -> rdna_compute::GpuTensor {
     }
 }
 
+fn stream(gpu: &rdna_compute::Gpu) -> &hip_bridge::Stream {
+    gpu.active_stream.as_ref().expect("responder stream is installed")
+}
+
+/// Record slot `slot`'s decode tail for `rows` rows on the responder stream:
+/// mask the hot ids, the cold gate/up, SiLU + rotate, the cold down into the
+/// slot's rows, then the response word.
+#[allow(clippy::too_many_arguments)]
+fn record_slot(
+    gpu: &mut rdna_compute::Gpu,
+    cfg: &ResponderConfig,
+    scratch: &[rdna_compute::GpuTensor; 4],
+    tables: &(rdna_compute::GpuTensor, rdna_compute::GpuTensor, rdna_compute::GpuTensor),
+    slot: usize,
+    rows: usize,
+) -> Result<(), String> {
+    let s = |e: hip_bridge::HipError| e.to_string();
+    let g = cfg.geom;
+    let o = g.slot(slot);
+    let base = cfg.mailbox_base;
+    let (gu, dn, bm) = tables;
+    let [masked, gate, up, rot] = scratch;
+    let slots = rows * g.top_k;
+    // SAFETY: mailbox fields of slot `slot`, live for the responder's lifetime.
+    let (x, out) = unsafe {
+        (view(base + o.x_rot as u64, rows * g.dim * 4), view(base + o.cold_out as u64, slots * g.dim * 4))
+    };
+    gpu.hetero_mask_hot(base + o.ids as u64, bm, cfg.n_experts as i32, slots as i32, masked).map_err(s)?;
+    gpu.gemv_mq4g256v2_moe_gate_up_top10_indexed_batched(gu, masked, &x, gate, up, 2 * cfg.mi, g.dim, rows)
+        .map_err(s)?;
+    gpu.silu_mul_bf16_rt_rotate_x_mq_128_v2_shared(gate, up, rot, cfg.mi, slots, None).map_err(s)?;
+    gpu.gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(
+        dn, masked, rot, &out, g.dim, cfg.mi, rows, cfg.n_experts, g.top_k,
+    )
+    .map_err(s)?;
+    gpu.hetero_store_seq(base + o.req_seq as u64, base + o.resp_seq as u64).map_err(s)
+}
+
+impl Graphs {
+    /// Serve slot `slot` for `layer`'s cold experts: check the expert spans
+    /// are readable here, upload its tables and capture one graph per row
+    /// count. The slot's request word must not have been written yet.
+    fn add_slot(&mut self, cfg: &ResponderConfig, slot: usize, layer: &ColdLayer, warm: bool) -> Result<(), String> {
+        let s = |e: hip_bridge::HipError| e.to_string();
+        if slot >= cfg.geom.layers || !self.execs[slot].is_empty() {
+            return Err(format!("slot {slot} of {} is out of range or already served", cfg.geom.layers));
+        }
+        {
+            let hip = &self.gpu.hip;
+            let lookup = |p: u64| {
+                // SAFETY: one-byte non-owning view, attribute query only.
+                let probe = unsafe { hip_bridge::DeviceBuffer::from_raw(p as *mut std::ffi::c_void, 1) };
+                hip.pointer_get_attributes(&probe).ok().map(|a| a.device_pointer as u64)
+            };
+            check_device_accessible(&layer.gate_up, lookup)
+                .and_then(|()| check_device_accessible(&layer.down, lookup))
+                .map_err(|e| format!("{e:?}"))?;
+        }
+        let gpu = &mut self.gpu;
+        let f32s = |gpu: &mut rdna_compute::Gpu, n: usize| {
+            gpu.alloc_tensor(&[n], rdna_compute::DType::F32).map_err(|e| e.to_string())
+        };
+        let as_bytes = |v: &[u64]| v.iter().flat_map(|x| x.to_ne_bytes()).collect::<Vec<u8>>();
+        let gu = f32s(gpu, 2 * cfg.n_experts)?;
+        let dn = f32s(gpu, 2 * cfg.n_experts)?;
+        let bm = f32s(gpu, cfg.n_experts.div_ceil(4))?;
+        gpu.memcpy_htod_auto(&gu.buf, &as_bytes(&layer.gate_up)).map_err(s)?;
+        gpu.memcpy_htod_auto(&dn.buf, &as_bytes(&layer.down)).map_err(s)?;
+        gpu.memcpy_htod_auto(&bm.buf, &layer.cold_bitmap).map_err(s)?;
+        let tables = (gu, dn, bm);
+        if warm {
+            // Outside capture: loads every kernel's code object before the
+            // first capture needs it. The slot's request word is still zero,
+            // and a zero response is "never written", which no primary waits for.
+            for rows in 1..=cfg.geom.max_rows {
+                record_slot(gpu, cfg, &self.scratch, &tables, slot, rows)?;
+            }
+            gpu.hip.stream_synchronize(stream(gpu)).map_err(s)?;
+        }
+        let mut execs = Vec::with_capacity(cfg.geom.max_rows);
+        for rows in 1..=cfg.geom.max_rows {
+            gpu.hip.stream_begin_capture(stream(gpu), 0).map_err(s)?;
+            let recorded = record_slot(gpu, cfg, &self.scratch, &tables, slot, rows);
+            let graph = gpu.hip.stream_end_capture(stream(gpu)).map_err(s)?;
+            recorded?;
+            execs.push(gpu.hip.graph_instantiate(&graph).map_err(s)?);
+            let _ = gpu.hip.graph_destroy(graph);
+        }
+        self.execs[slot] = execs;
+        let (gu, dn, bm) = tables;
+        self._keep.extend([gu, dn, bm]);
+        Ok(())
+    }
+}
+
+/// The responder's device state: slots `0..layers.len()` served from the
+/// start; any later slot of the mailbox waits for [`HeteroResponder::add_slot`].
 fn build(cfg: &ResponderConfig, layers: &[ColdLayer]) -> Result<Graphs, String> {
     let g = cfg.geom;
-    if g.max_rows != 1 || g.top_k != 10 || layers.len() != g.layers {
-        return Err(format!("geometry {g:?} with {} layers: v1 serves 1-row decode, top-10", layers.len()));
+    if g.max_rows == 0 || g.top_k != 10 || layers.is_empty() || layers.len() > g.layers {
+        return Err(format!("geometry {g:?} with {} layers: serves top-10 decode of 1..=max_rows rows", layers.len()));
     }
     let mut gpu = rdna_compute::Gpu::init_with_device(cfg.ordinal).map_err(|e| e.to_string())?;
     if gpu.arch != "gfx1151" {
@@ -357,76 +474,21 @@ fn build(cfg: &ResponderConfig, layers: &[ColdLayer]) -> Result<Graphs, String> 
             hip.pointer_get_attributes(&probe).ok().map(|a| a.device_pointer as u64)
         };
         check_device_accessible(&[cfg.mailbox_base], lookup).map_err(|e| format!("{e:?}"))?;
-        for l in layers {
-            check_device_accessible(&l.gate_up, lookup)
-                .and_then(|()| check_device_accessible(&l.down, lookup))
-                .map_err(|e| format!("{e:?}"))?;
-        }
     }
     let slots = g.max_rows * g.top_k;
     let f32s = |gpu: &mut rdna_compute::Gpu, n: usize| {
         gpu.alloc_tensor(&[n], rdna_compute::DType::F32).map_err(|e| e.to_string())
     };
-    let masked = f32s(&mut gpu, slots)?;
-    let gate = f32s(&mut gpu, slots * cfg.mi)?;
-    let up = f32s(&mut gpu, slots * cfg.mi)?;
-    let rot = f32s(&mut gpu, slots * cfg.mi)?;
-    let mut tables = Vec::with_capacity(layers.len());
-    for l in layers {
-        let as_bytes = |v: &[u64]| v.iter().flat_map(|x| x.to_ne_bytes()).collect::<Vec<u8>>();
-        let gu = f32s(&mut gpu, 2 * cfg.n_experts)?;
-        let dn = f32s(&mut gpu, 2 * cfg.n_experts)?;
-        let bm = f32s(&mut gpu, cfg.n_experts.div_ceil(4))?;
-        gpu.memcpy_htod_auto(&gu.buf, &as_bytes(&l.gate_up)).map_err(s)?;
-        gpu.memcpy_htod_auto(&dn.buf, &as_bytes(&l.down)).map_err(s)?;
-        gpu.memcpy_htod_auto(&bm.buf, &l.cold_bitmap).map_err(s)?;
-        tables.push((gu, dn, bm));
-    }
+    let scratch = [f32s(&mut gpu, slots)?, f32s(&mut gpu, slots * cfg.mi)?, f32s(&mut gpu, slots * cfg.mi)?, f32s(&mut gpu, slots * cfg.mi)?];
     gpu.active_stream = Some(gpu.hip.stream_create_non_blocking().map_err(s)?);
-    fn stream(gpu: &rdna_compute::Gpu) -> &hip_bridge::Stream {
-        gpu.active_stream.as_ref().expect("responder stream is installed")
+    let mut graphs = Graphs { gpu, execs: (0..g.layers).map(|_| Vec::new()).collect(), scratch, prefill: None, _keep: Vec::new() };
+    for (slot, layer) in layers.iter().enumerate() {
+        graphs.add_slot(cfg, slot, layer, slot == 0)?;
     }
-    let record = |gpu: &mut rdna_compute::Gpu, l: usize| -> Result<(), String> {
-        let o = g.slot(l);
-        let base = cfg.mailbox_base;
-        let (gu, dn, bm) = &tables[l];
-        // SAFETY: mailbox fields of slot `l`, live for the responder's lifetime.
-        let (x, out) = unsafe {
-            (view(base + o.x_rot as u64, g.dim * 4), view(base + o.cold_out as u64, slots * g.dim * 4))
-        };
-        gpu.hetero_mask_hot(base + o.ids as u64, bm, cfg.n_experts as i32, slots as i32, &masked).map_err(s)?;
-        gpu.gemv_mq4g256v2_moe_gate_up_top10_indexed_batched(gu, &masked, &x, &gate, &up, 2 * cfg.mi, g.dim, 1)
-            .map_err(s)?;
-        gpu.silu_mul_bf16_rt_rotate_x_mq_128_v2_shared(&gate, &up, &rot, cfg.mi, slots, None).map_err(s)?;
-        gpu.gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(
-            dn, &masked, &rot, &out, g.dim, cfg.mi, 1, cfg.n_experts, g.top_k,
-        )
-        .map_err(s)?;
-        gpu.hetero_store_seq(base + o.req_seq as u64, base + o.resp_seq as u64).map_err(s)
-    };
-    // Warm-up outside capture: compiles and loads every kernel. A zeroed slot
-    // answers 0 ("never written"), which no primary waits for.
-    record(&mut gpu, 0)?;
-    gpu.hip.stream_synchronize(stream(&gpu)).map_err(s)?;
-    let mut execs = Vec::with_capacity(layers.len());
-    for l in 0..layers.len() {
-        gpu.hip.stream_begin_capture(stream(&gpu), 0).map_err(s)?;
-        let recorded = record(&mut gpu, l);
-        let graph = gpu.hip.stream_end_capture(stream(&gpu)).map_err(s)?;
-        recorded?;
-        execs.push(gpu.hip.graph_instantiate(&graph).map_err(s)?);
-        let _ = gpu.hip.graph_destroy(graph);
+    if !cfg.prefill.is_empty() {
+        graphs.prefill = Some(build_prefill(&mut graphs.gpu, cfg, &cfg.prefill, layers)?);
     }
-    let mut keep = vec![masked, gate, up, rot];
-    for (gu, dn, bm) in tables {
-        keep.extend([gu, dn, bm]);
-    }
-    let prefill = if cfg.prefill.is_empty() {
-        None
-    } else {
-        Some(build_prefill(&mut gpu, cfg, &cfg.prefill, layers)?)
-    };
-    Ok(Graphs { gpu, execs, prefill, _keep: keep })
+    Ok(graphs)
 }
 
 impl HeteroResponder {
@@ -437,6 +499,7 @@ impl HeteroResponder {
         let failure = Arc::new(Mutex::new(None::<String>));
         let answered = Arc::new(AtomicU64::new(0));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let (add_tx, add_rx) = std::sync::mpsc::channel::<AddSlot>();
         let (stop2, failure2, answered2) = (Arc::clone(&stop), Arc::clone(&failure), Arc::clone(&answered));
         let worker = std::thread::Builder::new()
             .name("hetero-responder".into())
@@ -470,6 +533,14 @@ impl HeteroResponder {
                 let mut trace = DecodeTrace::from_env(n);
                 while !stop2.load(Ordering::Acquire) {
                     let mut busy = false;
+                    while let Ok((slot, layer, reply)) = add_rx.try_recv() {
+                        let added = graphs.add_slot(&cfg, slot, &layer, false);
+                        if added.is_ok() {
+                            last[slot] = req_word(&cfg, slot).load(Ordering::Acquire);
+                        }
+                        let _ = reply.send(added);
+                        busy = true;
+                    }
                     // Sub-chunks in order: the primary releases them in order.
                     for (i, (slot, sub, req, layer, row_off, rows, format)) in prefill_words.iter().enumerate() {
                         let r = req.load(Ordering::Acquire);
@@ -500,15 +571,30 @@ impl HeteroResponder {
                             last[l] = r;
                             busy = true;
                             let seen = std::time::Instant::now();
+                            // Written with the route before the request word;
+                            // the Acquire load of the request orders this read.
+                            let rows = word(&cfg, cfg.geom.slot(l).rows).load(Ordering::Acquire) as usize;
+                            if rows == 0 || rows > cfg.geom.max_rows {
+                                if let Ok(mut f) = failure2.lock() {
+                                    *f = Some(format!("layer {l}: request of {rows} rows (1..={})", cfg.geom.max_rows));
+                                }
+                                return;
+                            }
                             let st = graphs.gpu.active_stream.as_ref().expect("responder stream");
-                            if let Err(e) = graphs.gpu.hip.graph_launch(&graphs.execs[l], st) {
+                            let Some(exec) = graphs.execs[l].get(rows - 1) else {
+                                if let Ok(mut f) = failure2.lock() {
+                                    *f = Some(format!("layer {l}: request on a slot that is not served"));
+                                }
+                                return;
+                            };
+                            if let Err(e) = graphs.gpu.hip.graph_launch(exec, st) {
                                 if let Ok(mut f) = failure2.lock() {
                                     *f = Some(format!("layer {l}: graph launch: {e}"));
                                 }
                                 return;
                             }
                             if let Some(t) = trace.as_mut() {
-                                t.layer(&cfg, l, r, seen);
+                                t.layer(&cfg, l, rows, r, seen);
                             }
                             answered2.fetch_add(1, Ordering::Relaxed);
                         }
@@ -528,7 +614,7 @@ impl HeteroResponder {
                 if let Some(st) = graphs.gpu.active_stream.as_ref() {
                     let _ = graphs.gpu.hip.stream_synchronize(st);
                 }
-                for e in graphs.execs {
+                for e in graphs.execs.into_iter().flatten() {
                     let _ = graphs.gpu.hip.graph_exec_destroy(e);
                 }
             })
@@ -537,7 +623,24 @@ impl HeteroResponder {
             .recv()
             .map_err(|_| err("worker exited before it was ready"))?
             .map_err(err)?;
-        Ok(Self { stop, failure, answered, worker: Some(worker) })
+        Ok(Self { stop, failure, answered, add: Mutex::new(add_tx), worker: Some(worker) })
+    }
+
+    /// Serve mailbox slot `slot` (one not served from the start, whose request
+    /// word no primary has written) for `layer`'s cold experts: the responder
+    /// thread records its graphs between requests. Returns once they exist,
+    /// or the error; bounded, so a stopped responder fails here.
+    pub fn add_slot(&self, slot: usize, layer: ColdLayer) -> Result<(), DispatchError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.add
+            .lock()
+            .map_err(|_| err("add-slot channel poisoned"))?
+            .send((slot, layer, tx))
+            .map_err(|_| err(format!("slot {slot}: the responder has stopped ({:?})", self.failure())))?;
+        match rx.recv_timeout(Duration::from_secs(120)) {
+            Ok(result) => result.map_err(|e| err(format!("slot {slot}: {e}"))),
+            Err(_) => Err(err(format!("slot {slot}: no answer from the responder ({:?})", self.failure()))),
+        }
     }
 
     /// The HIP failure that stopped the responder, if any.

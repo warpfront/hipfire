@@ -8377,6 +8377,7 @@ mod tests {
             cpu_split: false,
             cpwait: false,
             hetero_prefill: false,
+            hetero_rows: false,
             hetero_defer_join: false,
         })
     }
@@ -9239,6 +9240,7 @@ mod tests {
                 cpu_split: false,
                 cpwait: false,
                 hetero_prefill: false,
+                hetero_rows: false,
                 hetero_defer_join: false,
             });
             let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
@@ -9306,6 +9308,7 @@ mod tests {
             cpu_split: false,
             cpwait: false,
             hetero_prefill: false,
+            hetero_rows: false,
             hetero_defer_join: false,
         });
         let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
@@ -9752,6 +9755,70 @@ mod tests {
             assert!(at(MoeStage::Combine) < at(MoeStage::SharedDown), "{label}");
             assert_eq!(*st.last().unwrap(), MoeStage::SharedDown, "{label}");
         }
+    }
+
+    #[test]
+    fn hetero_rows_brackets_the_hot_tail_with_the_decode_exchange() {
+        for route in SPLIT_ROUTES {
+            for rows in [2, 4, 8] {
+                let st = split_prefill_stages(rows, Some(route), false, |_| {}, |s| {
+                    s.resolution.use_path2 = false;
+                    s.hetero_rows = true;
+                })
+                .unwrap();
+                let label = format!("{route:?} rows={rows}: {st:?}");
+                let at = |stage: MoeStage| st.iter().position(|s| *s == stage).unwrap_or_else(|| panic!("{stage:?} missing: {label}"));
+                for once in [MoeStage::PublishCold, MoeStage::AwaitCold, MoeStage::InstallCold, MoeStage::Combine, MoeStage::SharedDown] {
+                    assert_eq!(st.iter().filter(|s| **s == once).count(), 1, "{once:?}: {label}");
+                }
+                // Published after the route, before the masked hot tail; the cold
+                // slot rows are installed after the hot down and before the
+                // canonical combine of the original route, then the shared down.
+                assert!(at(MoeStage::Route) < at(MoeStage::PublishCold), "{label}");
+                assert!(at(MoeStage::PublishCold) < at(MoeStage::GateUp), "{label}");
+                assert!(at(MoeStage::Down) < at(MoeStage::AwaitCold), "{label}");
+                assert!(at(MoeStage::AwaitCold) < at(MoeStage::InstallCold), "{label}");
+                assert!(at(MoeStage::InstallCold) < at(MoeStage::Combine), "{label}");
+                assert!(at(MoeStage::Combine) < at(MoeStage::SharedDown), "{label}");
+                for absent in [
+                    MoeStage::PrepareSplit,
+                    MoeStage::JoinSplit,
+                    MoeStage::PublishColdRows,
+                    MoeStage::SendColdRows,
+                    MoeStage::JoinColdRows,
+                    MoeStage::Scatter,
+                    MoeStage::Unscatter,
+                ] {
+                    assert!(!st.contains(&absent), "{absent:?}: {label}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hetero_rows_is_exclusive_with_the_other_splits_and_grouped_rows() {
+        let route = Some(MoeRouteCapability::Qt44Qt53GroupedSymmetric);
+        let rows_only = |s: &mut MoePrefillSelection| {
+            s.resolution.use_path2 = false;
+            s.hetero_rows = true;
+        };
+        split_refused(split_prefill_stages(4, route, true, |_| {}, rows_only), "hetero rows + cpu split", "hetero rows");
+        split_refused(
+            split_prefill_stages(4, route, false, |_| {}, |s| {
+                rows_only(s);
+                s.hetero_prefill = true;
+            }),
+            "hetero rows + prefill exchange",
+            "hetero rows",
+        );
+        split_refused(
+            split_prefill_stages(4, route, false, |_| {}, |s| {
+                s.hetero_rows = true;
+                s.resolution.use_path2 = true;
+            }),
+            "hetero rows + grouped rows",
+            "hetero rows",
+        );
     }
 
     #[test]

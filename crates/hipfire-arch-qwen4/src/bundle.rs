@@ -1686,9 +1686,12 @@ impl Qwen4Bundle {
             .and_then(Qwen4GpuForward::ep_binding);
         let decision = crate::mtp_gpu::head_d2_decision(
             hipfire_config::memory::qwen4_mtp_head_d2(),
+            // Under `topology.hetero_experts` the trunk has no D2 layer, but
+            // the head follows the trunk's device split instead.
             self.execution
                 .as_ref()
-                .is_some_and(|forward| !forward.split_layers().is_empty()),
+                .is_some_and(|forward| !forward.split_layers().is_empty())
+                || crate::hetero::split_requested(),
             ep_binding.is_some(),
         );
         let mtp = Qwen4MtpGpu::new_with_backend(
@@ -1704,6 +1707,9 @@ impl Qwen4Bundle {
         )
         .map_err(|error| BundleError::Forward(error.to_string()))?;
         match (decision, mtp.head_d2_modes(), mtp.head_d2_host_bytes()) {
+            (crate::mtp_gpu::HeadD2Decision::Armed, _, _) if mtp.head_hetero() => {
+                eprintln!("  qwen4 MTP head: experts on the hetero device split (gfx1151)")
+            }
             (
                 crate::mtp_gpu::HeadD2Decision::Armed,
                 Some(modes),

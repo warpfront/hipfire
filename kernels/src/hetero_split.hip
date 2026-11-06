@@ -36,8 +36,9 @@ extern "C" __global__ void hetero_token_advance(unsigned* counter) {
     if (blockIdx.x == 0 && threadIdx.x == 0) counter[0] += 1u;
 }
 
-// One block. Copy the layer's route into its mailbox slot, write the primary's
-// masked ids (cold -> -1), then release the request sequence.
+// One block. Copy the layer's `rows` rows and route into its mailbox slot (and
+// the row count), write the primary's masked ids (cold -> -1), then release the
+// request sequence.
 extern "C" __global__ void hetero_publish_cold(
     const unsigned* __restrict__ counter,
     unsigned layer,
@@ -54,8 +55,10 @@ extern "C" __global__ void hetero_publish_cold(
     int* mb_ids,
     float* mb_w,
     int* masked_ids,
-    unsigned* req_seq) {
+    unsigned* req_seq,
+    unsigned* mb_rows) {
     const int slots = rows * top_k;
+    if (threadIdx.x == 0) mb_rows[0] = (unsigned)rows;
     for (int i = threadIdx.x; i < rows * dim; i += blockDim.x) mb_x[i] = x_rot[i];
     for (int s = threadIdx.x; s < slots; s += blockDim.x) {
         const int e = ids[s];

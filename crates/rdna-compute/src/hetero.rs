@@ -18,6 +18,7 @@ pub struct HeteroSlotPtrs {
     pub req_seq: u64,
     pub resp_seq: u64,
     pub error: u64,
+    pub rows: u64,
     pub x_rot: u64,
     pub ids: u64,
     pub weights: u64,
@@ -80,15 +81,16 @@ impl Gpu {
             cold_bitmap.buf.as_ptr(),
             masked_ids.buf.as_ptr(),
         );
-        let (mx, mi, mw, rq) = (
+        let (mx, mi, mw, rq, mr) = (
             slot.x_rot as *mut c_void,
             slot.ids as *mut c_void,
             slot.weights as *mut c_void,
             slot.req_seq as *mut c_void,
+            slot.rows as *mut c_void,
         );
         let mut params = vec![
             p(&c), p(&layer), p(&layers), p(&x), p(&i), p(&w), p(&bm), p(&n_experts),
-            p(&rows), p(&top_k), p(&dim), p(&mx), p(&mi), p(&mw), p(&m), p(&rq),
+            p(&rows), p(&top_k), p(&dim), p(&mx), p(&mi), p(&mw), p(&m), p(&rq), p(&mr),
         ];
         self.hetero_launch("hetero_publish_cold", 1, 256, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
@@ -108,6 +110,7 @@ impl Gpu {
             b.push_ptr(mw);
             b.push_ptr(m);
             b.push_ptr(rq);
+            b.push_ptr(mr);
             b
         })
     }

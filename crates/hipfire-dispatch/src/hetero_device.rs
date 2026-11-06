@@ -25,6 +25,12 @@ pub struct HeteroDeviceSplit {
     pub n_experts: i32,
     /// `hetero_await_cold` poll bound.
     pub max_polls: u32,
+    /// Rows the slot holds (`masked_ids` is `max_rows x top_k`).
+    pub max_rows: usize,
+    /// `PublishCold` first advances `counter`: a slot whose calls are not
+    /// one per forward (the MTP head drafts several times between trunk
+    /// forwards) owns its counter, so every request carries a fresh sequence.
+    pub advance: bool,
 }
 
 fn hip(e: hip_bridge::HipError) -> DispatchError {
@@ -43,6 +49,9 @@ impl HeteroDeviceSplit {
         ids: &GpuTensor,
         weights: &GpuTensor,
     ) -> Result<(), DispatchError> {
+        if self.advance {
+            gpu.hetero_token_advance(&self.counter).map_err(hip)?;
+        }
         gpu.hetero_publish_cold(
             &self.counter,
             self.layer,
@@ -465,6 +474,7 @@ impl HeteroPrefillSplit {
                     req_seq: mb + w.req_seq as u64,
                     resp_seq: mb + w.resp_seq as u64,
                     error: mb + o.error as u64,
+                    rows: 0,
                     x_rot: 0,
                     ids: 0,
                     weights: 0,
