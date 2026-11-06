@@ -226,24 +226,13 @@ pub(crate) async fn handle_tts(
         .and_then(serde_json::Value::as_str)
         .filter(|v| *v == "male" || *v == "female")
         .map(str::to_owned);
-    // `/tts` returns AUDIO. A tool call is a text artifact the caller has to
-    // act on before the next turn, and speech has no channel to carry it, so a
-    // `tools` field here cannot be honored. Refuse by name rather than
-    // synthesizing a reply that silently ignored the declared schemas (the
-    // model would still happily speak a *description* of a call it never
-    // made).
-    if body
-        .get("tools")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|tools| !tools.is_empty())
-    {
-        return openai_error(
-            "tools are not supported on /tts — its response is audio/wav. Send the text \
-             turn to /v1/chat/completions with `tools` to get a tool call, then speak the \
-             text answer with a second /tts request",
-            400,
-        );
-    }
+    // `tools` is inert here and deliberately ignored, not refused: the
+    // response is `audio/wav` and a spoken reply has no channel to carry a
+    // call. A client that declares tools on every request (voice.js does, per
+    // session) must not be 400'd for a field this endpoint structurally cannot
+    // use. Tool calling lives on the text turn — `/v1/chat/completions` or
+    // `/v1/realtime`'s `response.create` — not on synthesis.
+    let _ = body.get("tools");
     let max_steps = tts_max_steps_for_input(&input);
 
     let cancel = CancellationToken::new();
