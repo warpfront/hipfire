@@ -818,7 +818,7 @@ fn lifted_shipped_mq2_module_runs_as_a_p0_pool_region_on_the_emulator() {
             tmpl: 5,
             region: &region,
         }],
-        None,
+        &[],
     )
     .unwrap();
     let elf =
@@ -953,5 +953,159 @@ fn lifted_shipped_mq2_module_runs_as_a_p0_pool_region_on_the_emulator() {
                 "trace_on {trace_on}: trace record {i}"
             );
         }
+    }
+}
+
+/// Span mode (railgunmega/DYNAMIC.md) on the emulator: span headers take their virtual
+/// workgroup from a live list; past the live count they are NOPs that still publish; a
+/// duplicate entry, an out-of-grid entry and a count above the capacity poison.
+#[test]
+fn p0_pool_span_mode_runs_live_entries_and_poisons_bad_ones_on_the_emulator() {
+    use peacemaker_isa::kernels::lifted_dispatch_gfx1201 as ld;
+    use peacemaker_lift::rewrite::region::{lift_region, RegionInputs};
+    let bundle = include_bytes!("../../../kernels/gemv_mq2_xbatch_pm_gfx1201.hxaco");
+    let region = lift_region(
+        bundle,
+        mq2::SYMBOL,
+        &RegionInputs {
+            prefix: ".Lmq2r".into(),
+            workgroup_x: ld::WG_X,
+            workgroup_yz: ld::WG_YZ,
+            block: 32,
+            dynamic_lds: 0,
+        },
+    )
+    .unwrap();
+    let pool = ld::pool(
+        "pm_pool_mq2",
+        32,
+        &[ld::Hosted {
+            tmpl: 5,
+            region: &region,
+        }],
+        &[],
+    )
+    .unwrap();
+    let elf =
+        native::assemble_with_regions(&pool.s_text, Arch::Gfx1201, &pool.proof.regions).unwrap();
+    let program = peacemaker_lift::lift_object(
+        &elf,
+        peacemaker_lift::Options {
+            frontend: Frontend::Builder,
+        },
+    )
+    .unwrap()
+    .program;
+    let emu = Emulator::new(&program, "pm_pool_mq2").unwrap();
+    let solo = mq2::emit_text(&mq2::SHIPPED).unwrap();
+    let (m, k, b) = (21usize, 512usize, 3usize);
+    let want = run_mq2(&solo, mq2::SYMBOL, m.div_ceil(4) as u32, m, k, b, false);
+    let (a, x) = mq2_inputs(m, k, b, 7);
+    let mut karg = Vec::new();
+    for p in [A, X, Y] {
+        karg.extend(p.to_le_bytes());
+    }
+    for v in [m, k, b] {
+        karg.extend((v as u32).to_le_bytes());
+    }
+    karg.resize(48, 0);
+    let gx = m.div_ceil(4) as u32;
+    const TASKS: u64 = 0xb00_0000;
+    const PARAMS: u64 = 0xc00_0000;
+    const SPANS: u64 = 0xd00_0000;
+    const LIST: u64 = 0xd10_0000;
+    const COUNT: u64 = 0xd20_0000;
+    const BITMAP: u64 = 0xd30_0000;
+    // (live entries, count, capacity K, expect poison)
+    let live_all: Vec<[u32; 3]> = (0..gx).rev().map(|x| [x, 0, 0]).collect();
+    let mut dup = live_all.clone();
+    dup[1] = dup[0];
+    let mut outside = live_all.clone();
+    outside[2] = [gx, 0, 0];
+    let cases: [(&str, Vec<[u32; 3]>, u32, u32, bool); 4] = [
+        ("live", live_all.clone(), gx, gx + 2, false),
+        ("duplicate", dup, gx, gx + 2, true),
+        ("out of grid", outside, gx, gx + 2, true),
+        ("count above capacity", live_all, gx + 3, gx + 2, true),
+    ];
+    for (what, live, count, cap, poisoned) in cases {
+        let mut tasks = Vec::new();
+        for kk in 0..cap {
+            let mut t = [0u32; 32];
+            t[..15].copy_from_slice(&[5, 0, 0, 0, gx, 1, 1, 0, u32::MAX, 0, 0, 1, 1, kk, 0]);
+            tasks.extend(t.iter().flat_map(|w| w.to_le_bytes()));
+        }
+        let n_tasks = cap;
+        let mut params = Vec::new();
+        for p in [TASKS, QUEUE, QUEUE + 16, KARG, QUEUE + 64, QUEUE + 32] {
+            params.extend(p.to_le_bytes());
+        }
+        params.extend(1000u64.to_le_bytes());
+        params.extend(n_tasks.to_le_bytes());
+        params.extend(0u32.to_le_bytes());
+        params.extend(SPANS.to_le_bytes());
+        params.resize(ld::KERNARG_BYTES as usize, 0);
+        let mut spans = vec![0u8; 64];
+        spans[..4].copy_from_slice(&1u32.to_le_bytes());
+        for (o, v) in [(32usize, LIST), (40, COUNT), (48, BITMAP)] {
+            spans[o..o + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        spans[56..60].copy_from_slice(&cap.to_le_bytes());
+        let mut list = vec![0u8; cap as usize * 16];
+        for (i, e) in live.iter().enumerate() {
+            for (j, w) in e.iter().enumerate() {
+                list[i * 16 + j * 4..i * 16 + j * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+        }
+        let mut mem = Memory::default();
+        mem.map("karg".into(), KARG, karg.clone()).unwrap();
+        mem.map("a".into(), A, a.clone()).unwrap();
+        mem.map("x".into(), X, x.clone()).unwrap();
+        mem.map("y".into(), Y, vec![0xa5; b * m * 4]).unwrap();
+        mem.map("tasks".into(), TASKS, tasks).unwrap();
+        mem.map("queue".into(), QUEUE, vec![0; 64 + n_tasks as usize * 48])
+            .unwrap();
+        mem.map("params".into(), PARAMS, params).unwrap();
+        mem.map("spans".into(), SPANS, spans).unwrap();
+        mem.map("list".into(), LIST, list).unwrap();
+        mem.map("count".into(), COUNT, count.to_le_bytes().to_vec())
+            .unwrap();
+        mem.map("bitmap".into(), BITMAP, vec![0; 64]).unwrap();
+        for wg in 0..2u32 {
+            emu.run_workgroup(
+                &Launch {
+                    kernarg_ptr: PARAMS,
+                    workgroup: [wg, 0, 0],
+                    block: [32, 1, 1],
+                    dynamic_lds: 0,
+                },
+                &mut mem,
+            )
+            .unwrap_or_else(|e| panic!("{what}: pool workgroup {wg}: {e}"));
+        }
+        let q = mem.read(QUEUE, 64).unwrap().to_vec();
+        let word = |o: usize| u32::from_le_bytes(q[o..o + 4].try_into().unwrap());
+        if poisoned {
+            assert_ne!(word(32), 0, "{what}: poison");
+            continue;
+        }
+        assert_eq!(word(32), 0, "{what}: poison");
+        assert_eq!(
+            mem.read(Y, b * m * 4).unwrap(),
+            &want[..],
+            "{what}: pool output != standalone"
+        );
+        assert_eq!(word(0), n_tasks + 2, "{what}: claims");
+        assert_eq!(
+            word(16),
+            n_tasks,
+            "{what}: every span header publishes, NOPs too"
+        );
+        let bits = u32::from_le_bytes(mem.read(BITMAP, 4).unwrap().try_into().unwrap());
+        assert_eq!(
+            bits,
+            (1u32 << gx) - 1,
+            "{what}: every live workgroup claimed once"
+        );
     }
 }

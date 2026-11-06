@@ -137,7 +137,7 @@ fn main() {
             tmpl: 16,
             region: &region,
         }],
-        None,
+        &[],
     )
     .expect("pool");
     std::fs::write(&args[2], &e.s_text).unwrap();

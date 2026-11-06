@@ -77,6 +77,9 @@ const KA_OFF: u8 = 98;
 const DONE: u8 = 99;
 const VCOUNT: u8 = 100;
 const STEP: u8 = 101;
+/// The template id a span task whose index is past the live count runs as: hosted by no
+/// pool, so the task publishes its done event without entering a region.
+pub const NOP_TMPL: u32 = 0xffff_fffe;
 /// Every dispatcher-owned SGPR range (name, base, length).
 const DISPATCHER_SGPRS: &[(&str, u8, u8)] = &[
     ("gx", GX, 1),
@@ -194,21 +197,52 @@ fn add_pieces(
     Ok(())
 }
 
-/// The pool dispatcher `symbol` of workgroup size `block` hosting `hosted`, and
-/// with `copy = Some(tmpl)` the PM-emitted COPY template (`copy_body`).
+/// A PM-emitted template a pool hosts beside its lifted bodies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Native {
+    /// COPY (`M0CopyArgs {u64 dst, u64 src, u64 bytes}`), MegaM0's tmpl 2.
+    Copy(u32),
+    /// EXPAND_LIVE (`kernels::p0_expand_gfx1201`), tmpl 1: o4's live tile list.
+    Expand(u32),
+}
+impl Native {
+    pub fn tmpl(self) -> u32 {
+        match self {
+            Native::Copy(t) | Native::Expand(t) => t,
+        }
+    }
+    /// The registers the body owns inside its region: SGPRs `[2, s)` and VGPRs `[1, v)`.
+    fn footprint(self) -> (u8, u8) {
+        use crate::kernels::p0_expand_gfx1201 as expand;
+        match self {
+            Native::Copy(_) => (16, 4),
+            Native::Expand(_) => (expand::SGPRS as u8, expand::VGPRS as u8),
+        }
+    }
+    fn emit(self, b: &mut Builder, block: u32, name: &str) -> Result<(), String> {
+        match self {
+            Native::Copy(_) => copy_body(b, block, name),
+            Native::Expand(_) => crate::kernels::p0_expand_gfx1201::expand_body(b, block, name),
+        }
+    }
+}
+
+/// The pool dispatcher `symbol` of workgroup size `block` hosting the lifted bodies
+/// `hosted` and the PM-emitted templates `natives`.
 pub fn pool(
     symbol: &str,
     block: u32,
     hosted: &[Hosted],
-    copy: Option<u32>,
+    natives: &[Native],
 ) -> Result<Emitted, String> {
-    if hosted.is_empty() && copy.is_none() {
+    if hosted.is_empty() && natives.is_empty() {
         return Err("a pool hosts at least one template".into());
     }
-    if let Some(c) = copy {
-        if hosted.iter().any(|h| h.tmpl == c) {
-            return Err(format!("tmpl {c} is both COPY and a lifted body"));
-        }
+    let mut tmpls: Vec<u32> = hosted.iter().map(|h| h.tmpl).collect();
+    tmpls.extend(natives.iter().map(|n| n.tmpl()));
+    let distinct: std::collections::BTreeSet<u32> = tmpls.iter().copied().collect();
+    if distinct.len() != tmpls.len() {
+        return Err(format!("a template id is hosted twice: {tmpls:?}"));
     }
     for h in hosted {
         let r = h.region;
@@ -240,11 +274,7 @@ pub fn pool(
     let slot_base = body_lds.next_multiple_of(16);
     let lds_total = if multi { slot_base + 64 } else { body_lds };
     let step_label = |t: u32| format!(".Lt{t}_step");
-    let first_step = step_label(
-        hosted
-            .first()
-            .map_or_else(|| copy.expect("copy"), |h| h.tmpl),
-    );
+    let first_step = step_label(hosted.first().map_or_else(|| natives[0].tmpl(), |h| h.tmpl));
     let mut regs = RegPlan::new(256, 104)?;
     // entry: the hardware kernarg pointer and thread id, consumed before the loop
     regs.add_range(
@@ -333,7 +363,7 @@ pub fn pool(
         "claim_v",
         Kind::V,
         1,
-        18,
+        32,
         &Live::Between(".Lnext".into(), first_step.clone()),
     )?;
     add_pieces(
@@ -380,9 +410,10 @@ pub fn pool(
             Live::Between(step, exit),
         )?;
     }
-    if let Some(c) = copy {
-        // COPY is a PM-emitted region: its inputs stay dispatcher-owned (and unwritten)
-        // through the region; its own registers are s2..s15, v1..v3.
+    for (i, n) in natives.iter().enumerate() {
+        // A PM-emitted region: its inputs stay dispatcher-owned (and unwritten) through
+        // the region; it owns `footprint()` inside it.
+        let c = n.tmpl();
         let name = format!("t{c}");
         let (step, entry, exit) = (
             step_label(c),
@@ -390,8 +421,12 @@ pub fn pool(
             region_exit_label(&name),
         );
         let between = Live::Between(entry, exit);
-        // through the exit label (live there: the region checks its inputs at its exit)
-        let through = Live::Between(step, ".Lpublish".into());
+        // through the exit label (live there: the region checks its inputs at its exit),
+        // up to the next native template's arm
+        let end = natives
+            .get(i + 1)
+            .map_or(".Lpublish".to_string(), |m| format!(".Lt{}_go", m.tmpl()));
+        let through = Live::Between(step, end);
         regs.add_range(&format!("{name}_args"), Kind::S, 0, 2, through.clone())?;
         regs.add_range(&format!("{name}_lane"), Kind::V, 0, 1, through.clone())?;
         regs.add_range(
@@ -402,8 +437,9 @@ pub fn pool(
             through.clone(),
         )?;
         regs.add_range(&format!("{name}_wg_yz"), Kind::S, WG_YZ as u8, 1, through)?;
-        add_pieces(&mut regs, &format!("{name}_s"), Kind::S, 2, 16, &between)?;
-        add_pieces(&mut regs, &format!("{name}_v"), Kind::V, 1, 4, &between)?;
+        let (s_end, v_end) = n.footprint();
+        add_pieces(&mut regs, &format!("{name}_s"), Kind::S, 2, s_end, &between)?;
+        add_pieces(&mut regs, &format!("{name}_v"), Kind::V, 1, v_end, &between)?;
     }
     let spec = KernelSpec {
         kernel_id: "pm_lift_pool".into(),
@@ -420,7 +456,7 @@ pub fn pool(
             .hidden("spin_ticks", 48, 8, "by_value")
             .hidden("n_tasks", 56, 4, "by_value")
             .hidden("trace_on", 60, 4, "by_value")
-            .hidden("pad", 64, 8, "by_value"),
+            .pointer_access("spans", 64, Access::ReadOnly),
         user_sgpr_count: 2,
         system_sgpr_workgroup_id_y: false,
         workgroup_size: block as u16,
@@ -509,7 +545,8 @@ pub fn pool(
             &[s(IDX)],
         )?;
         vmov_s(b, 1, TEMP)?;
-        for (dst, off) in [(4u8, 0u32), (8, 16), (12, 32)] {
+        // dwords 0..11 (v4..v15) and the span words 12..15 (v18..v21: flags, k, list id)
+        for (dst, off) in [(4u8, 0u32), (8, 16), (12, 32), (18, 48)] {
             let o = if off == 0 {
                 String::new()
             } else {
@@ -530,7 +567,7 @@ pub fn pool(
         }
         readfirst(b, TEMP, 12)?;
         op(b, &format!("s_cmp_eq_u32 s{TEMP}, -1"), &[], &[s(TEMP)])?;
-        branch(b, "s_cbranch_scc1 .Lready")?;
+        branch(b, "s_cbranch_scc1 .Lspan")?;
         readfirst(b, TMPL, 13)?; // expected
         param(b, PTR_B, 0x10)?;
         op(
@@ -564,7 +601,7 @@ pub fn pool(
                 timeout: ".Ltimeout".into(),
             }),
         )?;
-        branch(b, "s_branch .Lready")?;
+        branch(b, "s_branch .Lspan")?;
         b.label(".Ltimeout")?;
         b.acquire(Scope::Dev)?;
         param(b, PTR_B, 0x28)?;
@@ -585,6 +622,8 @@ pub fn pool(
             Ordering::Release,
         )?;
         op(b, "v_mov_b32_e32 v4, -1", &[v(4)], &[])?;
+        branch(b, "s_branch .Lready")?;
+        span_entry(b)?;
         b.label(".Lready")?;
         b.realtime(S::<2>(T_READY))?;
         b.label(".Lclaimed")?;
@@ -687,7 +726,8 @@ pub fn pool(
             )?;
             branch(b, &format!("s_cbranch_scc1 .Lt{}_go", h.tmpl))?;
         }
-        if let Some(c) = copy {
+        for n in natives {
+            let c = n.tmpl();
             op(b, &format!("s_cmp_eq_u32 s{TMPL}, {c:#x}"), &[], &[s(TMPL)])?;
             branch(b, &format!("s_cbranch_scc1 .Lt{c}_go"))?;
         }
@@ -813,7 +853,8 @@ pub fn pool(
             b.wait_all()?;
             branch(b, "s_branch .Lpublish")?;
         }
-        if let Some(c) = copy {
+        for &n in natives {
+            let c = n.tmpl();
             let name = format!("t{c}");
             b.label(&format!(".Lt{c}_go"))?;
             op(b, &format!("s_mov_b32 s{STEP}, 0"), &[s(STEP)], &[])?;
@@ -867,7 +908,7 @@ pub fn pool(
                     &[v(0), s(WAVEBASE)],
                 )?;
                 b.wait_all()?;
-                b.region(&abi, |b| copy_body(b, block, &name))?;
+                b.region(&abi, |b| n.emit(b, block, &name))?;
                 b.regions
                     .last_mut()
                     .expect("region records a proof")
@@ -1015,6 +1056,223 @@ pub fn pool(
 /// virtual workgroup `w` of `gx` copies dwords `w * block + t + k * gx * block` below
 /// `bytes / 4`; virtual workgroup 0 copies the `bytes % 4` tail. `src`/`dst` must not
 /// overlap; `bytes < 2^32`. The body's registers are s0..s15, v0..v3 (the region's).
+/// Span mode (railgunmega/DYNAMIC.md), on wave 0 lane 0 after the predecessor acquire,
+/// with the descriptor in v4..v15 and its span words in v18 (flags), v19 (k), v20 (list
+/// id); v24..v28 are its temporaries. Static tasks (flags 0) pass straight to `.Lready`. A span task reads its live
+/// entry: `c = count` (after the acquire), `c > K` poisons, `k >= c` turns the task into
+/// a NOP (template `NOP_TMPL`: no region, `done` still released), the entry `{vx, vy, vz}`
+/// must lie inside the header grid and its bit in the claim bitmap must be clear (a
+/// returning atomic OR sets it); any failed check poisons. A valid entry replaces the
+/// descriptor's `vx, vy, vz` and sets `vcount = 1`.
+fn span_entry(b: &mut Builder) -> Result<(), String> {
+    // SGPR temporaries free between the claim and the broadcast: TEMP, PTR_A, PTR_B,
+    // T_START, T_END, VX, VCOUNT, STEP (all reloaded or rewritten before their uses)
+    let (desc, list, count, bitmap) = (PTR_B, T_START, T_END, PTR_A);
+    b.label(".Lspan")?;
+    // reached from the no-predecessor branch and the wait's exit: the span words' load
+    // may still be in flight on either (the linear ledger here only knows the wait path)
+    b.wait(Counter::Load, 0)?;
+    readfirst(b, TEMP, 18)?;
+    op(b, &format!("s_cmp_eq_u32 s{TEMP}, 0"), &[], &[s(TEMP)])?;
+    branch(b, "s_cbranch_scc1 .Lready")?;
+    op(b, &format!("s_cmp_lg_u32 s{TEMP}, 1"), &[], &[s(TEMP)])?;
+    branch(b, "s_cbranch_scc1 .Lspan_poison")?;
+    // the span table: u32 n_spans at +0, descriptor i at +32 + 32 i
+    param(b, desc, 0x40)?;
+    b.wait_all()?;
+    op(
+        b,
+        &format!("s_or_b32 s{TEMP}, s{desc}, s{}", desc + 1),
+        &[s(TEMP)],
+        &[sp(desc)],
+    )?;
+    op(b, &format!("s_cmp_eq_u32 s{TEMP}, 0"), &[], &[s(TEMP)])?;
+    branch(b, "s_cbranch_scc1 .Lspan_poison")?;
+    smem(
+        b,
+        &format!("s_load_b32 s{TEMP}, s[{desc}:{}], 0x0", desc + 1),
+        &[s(TEMP)],
+        &[sp(desc)],
+    )?;
+    readfirst(b, VCOUNT, 20)?;
+    b.wait_all()?;
+    op(
+        b,
+        &format!("s_cmp_ge_u32 s{VCOUNT}, s{TEMP}"),
+        &[],
+        &[s(VCOUNT), s(TEMP)],
+    )?;
+    branch(b, "s_cbranch_scc1 .Lspan_poison")?;
+    op(
+        b,
+        &format!("s_lshl_b32 s{TEMP}, s{VCOUNT}, 5"),
+        &[s(TEMP)],
+        &[s(VCOUNT)],
+    )?;
+    op(
+        b,
+        &format!("s_add_co_u32 s{desc}, s{desc}, s{TEMP}"),
+        &[s(desc)],
+        &[s(desc), s(TEMP)],
+    )?;
+    op(
+        b,
+        &format!("s_add_co_ci_u32 s{}, s{}, 0", desc + 1, desc + 1),
+        &[s(desc + 1)],
+        &[s(desc + 1)],
+    )?;
+    for (dst, off) in [(list, 0x20u32), (count, 0x28)] {
+        smem(
+            b,
+            &format!(
+                "s_load_b64 s[{dst}:{}], s[{desc}:{}], {off:#x}",
+                dst + 1,
+                desc + 1
+            ),
+            &[sp(dst)],
+            &[sp(desc)],
+        )?;
+    }
+    smem(
+        b,
+        &format!(
+            "s_load_b64 s[{bitmap}:{}], s[{desc}:{}], 0x30",
+            bitmap + 1,
+            desc + 1
+        ),
+        &[sp(bitmap)],
+        &[sp(desc)],
+    )?;
+    smem(
+        b,
+        &format!("s_load_b32 s{TEMP}, s[{desc}:{}], 0x38", desc + 1),
+        &[s(TEMP)],
+        &[sp(desc)],
+    )?;
+    b.wait_all()?;
+    // c, ordered after the predecessor acquire (the producer released entries and count)
+    op(b, "v_mov_b32_e32 v1, 0", &[v(1)], &[])?;
+    b.push(
+        Instruction::new(
+            format!("global_load_b32 v28, v1, s[{count}:{}]", count + 1),
+            vec![v(28)],
+            vec![v(1), sp(count)],
+        )
+        .memory(MemoryClass::VmemLoad),
+    )?;
+    b.wait_all()?;
+    readfirst(b, STEP, 28)?;
+    op(
+        b,
+        &format!("s_cmp_gt_u32 s{STEP}, s{TEMP}"),
+        &[],
+        &[s(STEP), s(TEMP)],
+    )?;
+    branch(b, "s_cbranch_scc1 .Lspan_poison")?;
+    readfirst(b, VX, 19)?;
+    op(
+        b,
+        &format!("s_cmp_ge_u32 s{VX}, s{STEP}"),
+        &[],
+        &[s(VX), s(STEP)],
+    )?;
+    branch(b, "s_cbranch_scc1 .Lspan_nop")?;
+    op(
+        b,
+        &format!("s_lshl_b32 s{TEMP}, s{VX}, 4"),
+        &[s(TEMP)],
+        &[s(VX)],
+    )?;
+    vmov_s(b, 1, TEMP)?;
+    b.push(
+        Instruction::new(
+            format!("global_load_b128 v[24:27], v1, s[{list}:{}]", list + 1),
+            vec![vq(24)],
+            vec![v(1), sp(list)],
+        )
+        .memory(MemoryClass::VmemLoad),
+    )?;
+    b.wait_all()?;
+    // inside the header grid (v8..v10 = gx, gy, gz)
+    for (e, g) in [(24u8, 8u8), (25, 9), (26, 10)] {
+        op(
+            b,
+            &format!("v_cmp_ge_u32_e64 s{count}, v{e}, v{g}"),
+            &[s(count)],
+            &[v(e), v(g)],
+        )?;
+        op(b, &format!("s_cmp_lg_u32 s{count}, 0"), &[], &[s(count)])?;
+        branch(b, "s_cbranch_scc1 .Lspan_poison")?;
+    }
+    // bit = vx + gx * (vy + gy * vz); claim it in the bitmap
+    op(b, "v_mul_lo_u32 v27, v26, v9", &[v(27)], &[v(26), v(9)])?;
+    op(
+        b,
+        "v_add_nc_u32_e32 v27, v27, v25",
+        &[v(27)],
+        &[v(27), v(25)],
+    )?;
+    op(b, "v_mul_lo_u32 v27, v27, v8", &[v(27)], &[v(27), v(8)])?;
+    op(
+        b,
+        "v_add_nc_u32_e32 v27, v27, v24",
+        &[v(27)],
+        &[v(27), v(24)],
+    )?;
+    op(b, "v_lshrrev_b32_e32 v1, 5, v27", &[v(1)], &[v(27)])?;
+    op(b, "v_lshlrev_b32_e32 v1, 2, v1", &[v(1)], &[v(1)])?;
+    op(b, "v_and_b32_e32 v2, 31, v27", &[v(2)], &[v(27)])?;
+    op(b, "v_lshlrev_b32_e64 v2, v2, 1", &[v(2)], &[v(2)])?;
+    b.event_rmw(
+        AtomicOp::OrB32,
+        Some(V::<1>(3)),
+        v(2),
+        GlobalAddr {
+            vaddr: V::<1>(1),
+            base: S::<2>(bitmap),
+            offset: 0,
+        },
+        Scope::Dev,
+        Ordering::Relaxed,
+    )?;
+    b.wait_all()?;
+    op(b, "v_and_b32_e32 v3, v3, v2", &[v(3)], &[v(3), v(2)])?;
+    op(
+        b,
+        &format!("v_cmp_ne_u32_e64 s{count}, 0, v3"),
+        &[s(count)],
+        &[v(3)],
+    )?;
+    op(b, &format!("s_cmp_lg_u32 s{count}, 0"), &[], &[s(count)])?;
+    branch(b, "s_cbranch_scc1 .Lspan_poison")?;
+    for (d, e) in [(5u8, 24u8), (6, 25), (7, 26)] {
+        op(b, &format!("v_mov_b32_e32 v{d}, v{e}"), &[v(d)], &[v(e)])?;
+    }
+    op(b, "v_mov_b32_e32 v15, 1", &[v(15)], &[])?;
+    branch(b, "s_branch .Lready")?;
+    b.label(".Lspan_nop")?;
+    op(b, &format!("v_mov_b32_e32 v4, {NOP_TMPL:#x}"), &[v(4)], &[])?;
+    branch(b, "s_branch .Lready")?;
+    b.label(".Lspan_poison")?;
+    b.acquire(Scope::Dev)?;
+    param(b, PTR_B, 0x28)?;
+    op(b, "v_mov_b32_e32 v1, 0", &[v(1)], &[])?;
+    op(b, "v_mov_b32_e32 v2, 1", &[v(2)], &[])?;
+    b.event_rmw(
+        AtomicOp::OrB32,
+        None,
+        v(2),
+        GlobalAddr {
+            vaddr: V::<1>(1),
+            base: S::<2>(PTR_B),
+            offset: 0,
+        },
+        Scope::Dev,
+        Ordering::Release,
+    )?;
+    op(b, "v_mov_b32_e32 v4, -1", &[v(4)], &[])
+}
+
 fn copy_body(b: &mut Builder, block: u32, name: &str) -> Result<(), String> {
     let (wx, nb) = (WG_X as u8, block);
     smem(

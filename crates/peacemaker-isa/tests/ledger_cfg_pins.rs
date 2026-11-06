@@ -432,7 +432,7 @@ fn lifted_pools_dispatcher_is_fatal_and_bodies_match_exact_entries() {
                     tmpl: r.tid,
                     region: &r.region,
                 }],
-                None,
+                &[],
             );
             let target = format!("pool:b{block}:{}", r.target);
             match single {
@@ -464,7 +464,7 @@ fn lifted_pools_dispatcher_is_fatal_and_bodies_match_exact_entries() {
                 .collect();
             let tids: Vec<u32> = built.iter().map(|r| r.tid).collect();
             let target = format!("pool:b{block}:multi");
-            match ld::pool(&format!("pm_pool_b{block}"), block, &hosted, None) {
+            match ld::pool(&format!("pm_pool_b{block}"), block, &hosted, &[]) {
                 Ok(emitted) => check_pool(
                     &mut report,
                     &mut counts,

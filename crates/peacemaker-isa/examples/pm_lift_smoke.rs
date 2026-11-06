@@ -655,10 +655,48 @@ fn run_case(card: &Card, objects: &Path, case: Case, shared: &SharedPool) -> Res
             .copy_from_slice(&value.to_le_bytes()[..h.size as usize]);
     }
     let mut tasks = Vec::new();
+    // LIFT_SPAN=1: span-mode headers (railgunmega/DYNAMIC.md) over a host-filled live
+    // list of every virtual workgroup in a shuffled order, plus two NOP headers past it
+    let span = std::env::var("LIFT_SPAN").is_ok_and(|v| v != "0");
+    let mut live: Vec<[u32; 4]> = Vec::new();
+    if span {
+        for z in 0..gz {
+            for y in 0..gy {
+                for x in 0..gx {
+                    live.push([x, y, z, 0]);
+                }
+            }
+        }
+        let mut rng = Lcg(0x5a17);
+        for i in (1..live.len()).rev() {
+            live.swap(i, rng.next() as usize % (i + 1));
+        }
+        for k in 0..live.len() as u32 + 2 {
+            let mut t = [0u32; 32];
+            t[..15].copy_from_slice(&[
+                case.tid,
+                0,
+                0,
+                0,
+                gx,
+                gy,
+                gz,
+                0,
+                u32::MAX,
+                0,
+                0,
+                1,
+                1,
+                k,
+                0,
+            ]);
+            tasks.extend(t.iter().flat_map(|w| w.to_le_bytes()));
+        }
+    }
     for z in 0..gz {
         for y in 0..gy {
             let mut x = 0;
-            while x < gx {
+            while x < gx && !span {
                 let vc = std::env::var("LIFT_VCOUNT")
                     .ok()
                     .and_then(|v| v.parse().ok())
@@ -678,6 +716,24 @@ fn run_case(card: &Card, objects: &Path, case: Case, shared: &SharedPool) -> Res
     let kargs = card.upload(&ka)?;
     let trace = card.upload(&vec![0u8; n_tasks as usize * 48])?;
     let poison = card.upload(&[0u8; 4])?;
+    let cap = live.len() as u32 + 2;
+    let list = card.upload(
+        &live
+            .iter()
+            .flatten()
+            .flat_map(|w| w.to_le_bytes())
+            .chain(std::iter::repeat(0).take(32))
+            .collect::<Vec<u8>>(),
+    )?;
+    let count = card.upload(&(live.len() as u32).to_le_bytes())?;
+    let bitmap = card.upload(&vec![0u8; (live.len().div_ceil(32) * 4).max(4)])?;
+    let mut table = vec![0u8; 64];
+    table[..4].copy_from_slice(&1u32.to_le_bytes());
+    for (o, d) in [(32usize, &list), (40, &count), (48, &bitmap)] {
+        table[o..o + 8].copy_from_slice(&(d.as_ptr() as u64).to_le_bytes());
+    }
+    table[56..60].copy_from_slice(&cap.to_le_bytes());
+    let spans = card.upload(&table)?;
     let mut params = Vec::new();
     for p in [&dt, &ticket, &events, &kargs, &trace, &poison] {
         params.extend((p.as_ptr() as u64).to_le_bytes());
@@ -685,6 +741,7 @@ fn run_case(card: &Card, objects: &Path, case: Case, shared: &SharedPool) -> Res
     params.extend(1_000_000u64.to_le_bytes());
     params.extend(n_tasks.to_le_bytes());
     params.extend(u32::from(trace_on()).to_le_bytes());
+    params.extend(if span { spans.as_ptr() as u64 } else { 0 }.to_le_bytes());
     params.resize(ld::KERNARG_BYTES as usize, 0);
     let pool_fn = card.function(&pool_elf, &pool_symbol)?;
     let workers = n_tasks.min(
@@ -741,16 +798,21 @@ fn run_case(card: &Card, objects: &Path, case: Case, shared: &SharedPool) -> Res
         .filter(|((_, init), _)| init.first() == Some(&0xa5))
         .map(|(_, w)| w.chunks(4).filter(|c| *c == [0xa5; 4]).count())
         .sum();
+    // span mode: every live workgroup claimed exactly once in the bitmap
+    let claimed: usize = card
+        .read(&bitmap, (live.len().div_ceil(32) * 4).max(4))?
+        .chunks(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()).count_ones() as usize)
+        .sum();
     let pass = mismatched.is_empty()
         && ev == n_tasks
         && pz == 0
         && tk == n_tasks + workers
-        && traced == if trace_on() { n_tasks as usize } else { 0 };
-    for d in d_solo
-        .into_iter()
-        .chain(d_pool)
-        .chain([dt, ticket, events, kargs, trace, poison])
-    {
+        && traced == if trace_on() { n_tasks as usize } else { 0 }
+        && claimed == live.len();
+    for d in d_solo.into_iter().chain(d_pool).chain([
+        dt, ticket, events, kargs, trace, poison, list, count, bitmap, spans,
+    ]) {
         card.rt.free(d).map_err(|e| e.to_string())?;
     }
     let r = &region.receipt;
