@@ -5807,7 +5807,12 @@ impl Qwen4MoeLayerRuntime {
         .seal_retained_identities()?;
         // The executor owns device storage, so it is created last: nothing
         // after it can fail and strand it.
-        runtime.attach_cpu_split(gpu, config, if head_split { 1 } else { d2_executor_rows() }, head_split)
+        runtime.attach_cpu_split(
+            gpu,
+            config,
+            if head_split { 1 } else { d2_executor_rows() },
+            head_split,
+        )
     }
 
     /// Create the layer's D2 split executor from its cold-expert owner's
@@ -5828,23 +5833,33 @@ impl Qwen4MoeLayerRuntime {
         else {
             return Ok(self);
         };
-        let hetero = crate::hetero::requested()
-            .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("layer {} hetero: {error}", self.label)))?;
+        let hetero = crate::hetero::requested().map_err(|error| {
+            Qwen4GpuForwardError::Dispatch(format!("layer {} hetero: {error}", self.label))
+        })?;
         if hetero.is_some() && head {
             // The native MTP head (built with label 0): its whole-layer
             // host experts are computed by the gfx1151 responder in the
             // head's own mailbox slot; no D2 executor, no prefill split.
-            let owners = self.cpu_cold_owners.as_ref().expect("placement came from the owners");
-            let (mut gate_up, mut down) = (vec![0u64; placement.len()], vec![0u64; placement.len()]);
+            let owners = self
+                .cpu_cold_owners
+                .as_ref()
+                .expect("placement came from the owners");
+            let (mut gate_up, mut down) =
+                (vec![0u64; placement.len()], vec![0u64; placement.len()]);
             for (e, &cold) in placement.iter().enumerate() {
                 if cold == 0 {
                     continue;
                 }
                 let expert = &self.experts[e];
-                let payload = owners.payload(e, expert.gate_up.dtype, expert.down.dtype).ok_or_else(|| {
-                    Qwen4GpuForwardError::Dispatch(format!("MTP head hetero: cold expert {e} has no host span"))
-                })?;
-                if (expert.gate_up.dtype, expert.down.dtype) != (DType::MQ4G256V2, DType::MQ4G128V2) {
+                let payload = owners
+                    .payload(e, expert.gate_up.dtype, expert.down.dtype)
+                    .ok_or_else(|| {
+                        Qwen4GpuForwardError::Dispatch(format!(
+                            "MTP head hetero: cold expert {e} has no host span"
+                        ))
+                    })?;
+                if (expert.gate_up.dtype, expert.down.dtype) != (DType::MQ4G256V2, DType::MQ4G128V2)
+                {
                     return Err(Qwen4GpuForwardError::Dispatch(format!(
                         "MTP head hetero: cold expert {e} is {:?}/{:?}, the responder serves MQ4G256V2/MQ4G128V2",
                         expert.gate_up.dtype, expert.down.dtype
@@ -5867,20 +5882,34 @@ impl Qwen4MoeLayerRuntime {
         if hetero.is_some() && self.label < config.num_hidden_layers {
             // Device-side split (design v3): no D2 executor; the layer's cold
             // experts are computed by the gfx1151 responder from these tables.
-            let owners = self.cpu_cold_owners.as_ref().expect("placement came from the owners");
-            let (mut gate_up, mut down) = (vec![0u64; placement.len()], vec![0u64; placement.len()]);
+            let owners = self
+                .cpu_cold_owners
+                .as_ref()
+                .expect("placement came from the owners");
+            let (mut gate_up, mut down) =
+                (vec![0u64; placement.len()], vec![0u64; placement.len()]);
             let mut spans: Option<(DType, DType, usize, usize)> = None;
             for (e, &cold) in placement.iter().enumerate() {
                 if cold == 0 {
                     continue;
                 }
                 let expert = &self.experts[e];
-                let payload = owners.payload(e, expert.gate_up.dtype, expert.down.dtype).ok_or_else(|| {
-                    Qwen4GpuForwardError::Dispatch(format!("layer {} hetero: cold expert {e} has no host span", self.label))
-                })?;
+                let payload = owners
+                    .payload(e, expert.gate_up.dtype, expert.down.dtype)
+                    .ok_or_else(|| {
+                        Qwen4GpuForwardError::Dispatch(format!(
+                            "layer {} hetero: cold expert {e} has no host span",
+                            self.label
+                        ))
+                    })?;
                 gate_up[e] = payload.gate_up.as_ptr() as u64;
                 down[e] = payload.down.as_ptr() as u64;
-                let this = (expert.gate_up.dtype, expert.down.dtype, payload.gate_up.len(), payload.down.len());
+                let this = (
+                    expert.gate_up.dtype,
+                    expert.down.dtype,
+                    payload.gate_up.len(),
+                    payload.down.len(),
+                );
                 if *spans.get_or_insert(this) != this {
                     return Err(Qwen4GpuForwardError::Dispatch(format!(
                         "layer {} hetero: cold experts differ in format or size ({spans:?} vs {this:?})",
@@ -5915,12 +5944,18 @@ impl Qwen4MoeLayerRuntime {
                 route_policy: Some(qwen4_route_policy(
                     config,
                     &shared,
-                    self.route_capability(crate::hetero::hetero_prefill_rows(), rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS),
+                    self.route_capability(
+                        crate::hetero::hetero_prefill_rows(),
+                        rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
+                    ),
                     self.slab_cold_codec(),
                     0,
                 )),
                 experts_all_gate_up_mq4: self.experts_all_gate_up_mq4,
-                recipe: MoeRecipe::SoftmaxGatedShared { bf16_round_trip: true, shared_after_combine: true },
+                recipe: MoeRecipe::SoftmaxGatedShared {
+                    bf16_round_trip: true,
+                    shared_after_combine: true,
+                },
             };
             let (split, prefill) = crate::hetero::attach_device_layer(
                 gpu,
@@ -5933,7 +5968,9 @@ impl Qwen4MoeLayerRuntime {
                 (gate_up, down),
                 prefill_cold,
             )
-            .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("layer {} {error}", self.label)))?;
+            .map_err(|error| {
+                Qwen4GpuForwardError::Dispatch(format!("layer {} {error}", self.label))
+            })?;
             self.hetero = Some(split);
             self.hetero_prefill = Some(prefill);
             return Ok(self);

@@ -39,7 +39,11 @@ fn main() {
         let x: Vec<f32> = (0..rows * DIM)
             .map(|i| {
                 let v = (unit() - 0.5) * 2.0;
-                if i % 997 == 0 { v * 40.0 } else { v }
+                if i % 997 == 0 {
+                    v * 40.0
+                } else {
+                    v
+                }
             })
             .collect();
         let (sa, sb) = (sidecar(&mut a, &x, rows), sidecar(&mut b, &x, rows));
@@ -52,13 +56,20 @@ fn main() {
             let (r0, r1) = (rows / 3, rows / 3 + 7.min(rows - rows / 3));
             let part = sidecar(&mut a, &x[r0 * DIM..r1 * DIM], r1 - r0);
             let sliced = &sa[r0 * per..r1 * per];
-            println!("rows {rows}: rows {r0}..{r1} re-quantized alone == byte slice of the chunk: {}", part == sliced);
+            println!(
+                "rows {rows}: rows {r0}..{r1} re-quantized alone == byte slice of the chunk: {}",
+                part == sliced
+            );
             // Block-major ([K/128 block][row] records of 72 B): gather each
             // block's run of the sub-range (one 2D copy on the device).
             let blocks = DIM / 128;
-            let gathered: Vec<u8> =
-                (0..blocks).flat_map(|b| sa[(b * rows + r0) * 72..(b * rows + r1) * 72].to_vec()).collect();
-            println!("rows {rows}: rows {r0}..{r1} re-quantized alone == block-major gather: {}", part == gathered);
+            let gathered: Vec<u8> = (0..blocks)
+                .flat_map(|b| sa[(b * rows + r0) * 72..(b * rows + r1) * 72].to_vec())
+                .collect();
+            println!(
+                "rows {rows}: rows {r0}..{r1} re-quantized alone == block-major gather: {}",
+                part == gathered
+            );
         }
     }
 }

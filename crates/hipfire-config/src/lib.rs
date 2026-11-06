@@ -10382,9 +10382,11 @@ pub mod topology {
 
         #[test]
         fn hetero_refuses_other_parallelism() {
-            for (ep, pp, tp, key) in
-                [(2, 1, 1, "topology.ep"), (1, 2, 1, "topology.pp"), (1, 1, 2, "tp")]
-            {
+            for (ep, pp, tp, key) in [
+                (2, 1, 1, "topology.ep"),
+                (1, 2, 1, "topology.pp"),
+                (1, 1, 2, "tp"),
+            ] {
                 let e = resolve_hetero_experts(Some("gfx1151"), true, ep, pp, tp).unwrap_err();
                 assert!(e.contains(key), "{e}");
             }

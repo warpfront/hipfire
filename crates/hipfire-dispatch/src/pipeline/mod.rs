@@ -1213,10 +1213,16 @@ mod qwen4_route_tests {
         let mut dtypes = canonical_dtypes();
         dtypes.shared = None;
         let admitted = cfg!(feature = "deltanet").then_some(MoeRouteCapability::Qt44Qt53Grouped);
-        assert_eq!(routed_only(&dtypes, Some(policy(DType::MQ4G128V2))), admitted);
+        assert_eq!(
+            routed_only(&dtypes, Some(policy(DType::MQ4G128V2))),
+            admitted
+        );
         // No policy, a bound shared expert, or a routed format off the policy: refused.
         assert_eq!(routed_only(&dtypes, None), None);
-        assert_eq!(routed_only(&canonical_dtypes(), Some(policy(DType::MQ4G128V2))), None);
+        assert_eq!(
+            routed_only(&canonical_dtypes(), Some(policy(DType::MQ4G128V2))),
+            None
+        );
         let mut off = dtypes;
         off.routed_down = DType::MQ4G256V2;
         assert_eq!(routed_only(&off, Some(policy(DType::MQ4G128V2))), None);
@@ -5634,10 +5640,9 @@ pub(super) fn decode_shared_down_defers(
         && !p.skip_shared
         && p.recipe.bf16_round_trip()
         && p.recipe.shared_after_combine()
-        && p
-            .shared
-            .as_ref()
-            .is_some_and(|s| s.weights.down.dtype == DType::BF16 && s.weights.down.awq_scale.is_none())
+        && p.shared.as_ref().is_some_and(|s| {
+            s.weights.down.dtype == DType::BF16 && s.weights.down.awq_scale.is_none()
+        })
 }
 
 /// The deferred shared down's first half (see [`decode_shared_down_defers`]):
@@ -5658,7 +5663,13 @@ pub(super) fn decode_shared_down_deferred(
     let scalar_live = slice_moe_f32_view(shared.scalar, 0, 1);
     let shared_hid = slice_moe_f32_view(p.ffn_hidden, 0, shared.intermediate);
     if !qt44_shared_activation_in_routed(p, route) {
-        hip!(gpu.shared_expert_activation_bf16_f32(shared_gate, shared_up, &shared_hid, &scalar_live, 1))?;
+        hip!(gpu.shared_expert_activation_bf16_f32(
+            shared_gate,
+            shared_up,
+            &shared_hid,
+            &scalar_live,
+            1
+        ))?;
     }
     hip!(gpu.gemv_bf16_xf32(w.buf, &shared_hid, p.ffn_out, w.m, w.k))
 }
@@ -5676,7 +5687,12 @@ pub(super) fn decode_shared_add(
         .ok_or_else(|| DispatchError::Hip("shared add stage requires shared weights".into()))?;
     hip!(bf16_scaled_add(
         gpu,
-        &Bf16ScaledAdd { residual: target, value: p.ffn_out, scalar: shared.scalar, elements: p.hidden },
+        &Bf16ScaledAdd {
+            residual: target,
+            value: p.ffn_out,
+            scalar: shared.scalar,
+            elements: p.hidden
+        },
     ))
 }
 

@@ -72,8 +72,14 @@ impl HeteroDeviceSplit {
 
     /// `AwaitCold`: bounded wait for the expert device's response.
     pub fn await_cold(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
-        gpu.hetero_await_cold(&self.counter, self.layer, self.layers, &self.slot, self.max_polls)
-            .map_err(hip)
+        gpu.hetero_await_cold(
+            &self.counter,
+            self.layer,
+            self.layers,
+            &self.slot,
+            self.max_polls,
+        )
+        .map_err(hip)
     }
 
     /// `InstallCold`: the cold slots' rows into the expanded down buffer.
@@ -195,14 +201,28 @@ impl HeteroPrefillShared {
         for &offsets in slot_offsets {
             slots.push(PrefillSlot {
                 offsets,
-                x_f16: gpu.alloc_tensor(&[words], rdna_compute::DType::F32).map_err(hip)?,
-                xq: gpu.alloc_tensor(&[xq_words], rdna_compute::DType::F32).map_err(hip)?,
-                partial: gpu.alloc_tensor(&[words], rdna_compute::DType::F32).map_err(hip)?,
+                x_f16: gpu
+                    .alloc_tensor(&[words], rdna_compute::DType::F32)
+                    .map_err(hip)?,
+                xq: gpu
+                    .alloc_tensor(&[xq_words], rdna_compute::DType::F32)
+                    .map_err(hip)?,
+                partial: gpu
+                    .alloc_tensor(&[words], rdna_compute::DType::F32)
+                    .map_err(hip)?,
                 // Dependency-only events (no timestamps), per hip_bridge's guidance.
-                published: gpu.hip.event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING).map_err(hip)?,
-                returned: gpu.hip.event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING).map_err(hip)?,
+                published: gpu
+                    .hip
+                    .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)
+                    .map_err(hip)?,
+                returned: gpu
+                    .hip
+                    .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)
+                    .map_err(hip)?,
                 pending: Default::default(),
-                err_local: gpu.alloc_tensor(&[64], rdna_compute::DType::F32).map_err(hip)?,
+                err_local: gpu
+                    .alloc_tensor(&[64], rdna_compute::DType::F32)
+                    .map_err(hip)?,
                 staged: Mutex::new(None),
                 route_local: gpu
                     .alloc_tensor(&[2 * geom.max_rows * geom.top_k], rdna_compute::DType::F32)
@@ -242,9 +262,13 @@ impl HeteroPrefillShared {
     /// The slot the next publish uses (the layer-major schedule's tile).
     pub fn set_slot(&self, slot: usize) -> Result<(), DispatchError> {
         if slot >= self.slots.len() {
-            return Err(DispatchError::Hip(format!("hetero prefill: slot {slot} of {}", self.slots.len())));
+            return Err(DispatchError::Hip(format!(
+                "hetero prefill: slot {slot} of {}",
+                self.slots.len()
+            )));
         }
-        self.current.store(slot, std::sync::atomic::Ordering::Relaxed);
+        self.current
+            .store(slot, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -264,7 +288,8 @@ impl HeteroPrefillShared {
 
     /// The expert device's int4 floor (0 = F16 only), published at its start.
     fn int4_min_rows(&self) -> usize {
-        word(self.mailbox + self.slots[0].offsets.int4_min_rows as u64).load(std::sync::atomic::Ordering::Acquire) as usize
+        word(self.mailbox + self.slots[0].offsets.int4_min_rows as u64)
+            .load(std::sync::atomic::Ordering::Acquire) as usize
     }
 
     /// Forget every owed join (an aborted request; its partials are dropped).
@@ -278,7 +303,10 @@ impl HeteroPrefillShared {
     pub fn error_word(&self) -> u32 {
         self.slots
             .iter()
-            .map(|s| word(self.mailbox + s.offsets.error as u64).load(std::sync::atomic::Ordering::Acquire))
+            .map(|s| {
+                word(self.mailbox + s.offsets.error as u64)
+                    .load(std::sync::atomic::Ordering::Acquire)
+            })
             .find(|&e| e != 0)
             .unwrap_or(0)
     }
@@ -301,8 +329,12 @@ fn on_stream<T>(
     slot: &Mutex<Option<hip_bridge::Stream>>,
     f: impl FnOnce(&mut Gpu) -> Result<T, DispatchError>,
 ) -> Result<T, DispatchError> {
-    let mut held = slot.lock().map_err(|_| DispatchError::Hip("hetero prefill: stream lock poisoned".into()))?;
-    let side = held.take().ok_or_else(|| DispatchError::Hip("hetero prefill: side stream in use".into()))?;
+    let mut held = slot
+        .lock()
+        .map_err(|_| DispatchError::Hip("hetero prefill: stream lock poisoned".into()))?;
+    let side = held
+        .take()
+        .ok_or_else(|| DispatchError::Hip("hetero prefill: side stream in use".into()))?;
     let main = std::mem::replace(&mut gpu.active_stream, Some(side));
     let out = f(gpu);
     *held = std::mem::replace(&mut gpu.active_stream, main);
@@ -334,15 +366,21 @@ impl HeteroPrefillSplit {
         let sh = &*self.shared;
         let g = sh.geom;
         if rows == 0 || rows > g.max_rows || top_k != g.top_k {
-            return Err(DispatchError::Hip(format!("hetero prefill: {rows} rows x top {top_k} outside the slot")));
+            return Err(DispatchError::Hip(format!(
+                "hetero prefill: {rows} rows x top {top_k} outside the slot"
+            )));
         }
         let ps = &sh.slots[sh.slot()];
         if ps.pending.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            return Err(DispatchError::Hip("hetero prefill: publish into a slot whose join is still owed".into()));
+            return Err(DispatchError::Hip(
+                "hetero prefill: publish into a slot whose join is still owed".into(),
+            ));
         }
         let (mb, o, dim) = (sh.mailbox, ps.offsets, g.dim);
         if let Some(t) = &sh.trace {
-            gpu.hip.event_record(&t.start, gpu.active_stream.as_ref()).map_err(hip)?;
+            gpu.hip
+                .event_record(&t.start, gpu.active_stream.as_ref())
+                .map_err(hip)?;
             if xq.is_none() {
                 t.no_xq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -375,13 +413,18 @@ impl HeteroPrefillSplit {
                     shape: vec![rows * i4 / 4],
                     dtype: rdna_compute::DType::F32,
                 };
-                gpu.copy_f32_buffer(&ps.xq, &src, rows * i4 / 4).map_err(hip)?;
+                gpu.copy_f32_buffer(&ps.xq, &src, rows * i4 / 4)
+                    .map_err(hip)?;
                 Some(ps.xq.buf.as_ptr())
             }
             None => None,
         };
-        gpu.hip.event_record(&ps.published, gpu.active_stream.as_ref()).map_err(hip)?;
-        *ps.staged.lock().map_err(|_| DispatchError::Hip("hetero prefill: staged lock poisoned".into()))? =
+        gpu.hip
+            .event_record(&ps.published, gpu.active_stream.as_ref())
+            .map_err(hip)?;
+        *ps.staged
+            .lock()
+            .map_err(|_| DispatchError::Hip("hetero prefill: staged lock poisoned".into()))? =
             Some((rows, xq.map(|p| p as u64)));
         Ok(())
     }
@@ -405,30 +448,56 @@ impl HeteroPrefillSplit {
         let (mb, o, dim) = (sh.mailbox, ps.offsets, g.dim);
         let i4 = int4_row_bytes(dim);
         let subs = g.sub_chunks_for(rows);
-        let split = PrefillGeometry { sub_chunks: subs, ..g };
+        let split = PrefillGeometry {
+            sub_chunks: subs,
+            ..g
+        };
         let floor = sh.int4_min_rows();
         // SAFETY: views of the live pinned prefill slot.
         let (mb_x, mb_part) = unsafe {
             (
-                hip_bridge::DeviceBuffer::from_raw((mb + o.x_norm as u64) as *mut std::ffi::c_void, o.ids - o.x_norm),
-                hip_bridge::DeviceBuffer::from_raw((mb + o.partial as u64) as *mut std::ffi::c_void, g.max_rows * dim * 2),
+                hip_bridge::DeviceBuffer::from_raw(
+                    (mb + o.x_norm as u64) as *mut std::ffi::c_void,
+                    o.ids - o.x_norm,
+                ),
+                hip_bridge::DeviceBuffer::from_raw(
+                    (mb + o.partial as u64) as *mut std::ffi::c_void,
+                    g.max_rows * dim * 2,
+                ),
             )
         };
         on_stream(gpu, &sh.out, |gpu| {
-            gpu.hip.stream_wait_event_on(gpu.active_stream.as_ref(), &ps.published).map_err(hip)?;
+            gpu.hip
+                .stream_wait_event_on(gpu.active_stream.as_ref(), &ps.published)
+                .map_err(hip)?;
             // The route first (every sub-chunk's release follows it in order).
             let route = rows * g.top_k * 4;
             // SAFETY: the slot's ids and weights fields in the live pinned mailbox.
             let (mb_ids, mb_w) = unsafe {
                 (
-                    hip_bridge::DeviceBuffer::from_raw((mb + o.ids as u64) as *mut std::ffi::c_void, route),
-                    hip_bridge::DeviceBuffer::from_raw((mb + o.weights as u64) as *mut std::ffi::c_void, route),
+                    hip_bridge::DeviceBuffer::from_raw(
+                        (mb + o.ids as u64) as *mut std::ffi::c_void,
+                        route,
+                    ),
+                    hip_bridge::DeviceBuffer::from_raw(
+                        (mb + o.weights as u64) as *mut std::ffi::c_void,
+                        route,
+                    ),
                 )
             };
             let st = gpu.active_stream.as_ref().expect("side stream installed");
-            gpu.hip.memcpy_dtod_async_at(&mb_ids, 0, &ps.route_local.buf, 0, route, st).map_err(hip)?;
             gpu.hip
-                .memcpy_dtod_async_at(&mb_w, 0, &ps.route_local.buf, g.max_rows * g.top_k * 4, route, st)
+                .memcpy_dtod_async_at(&mb_ids, 0, &ps.route_local.buf, 0, route, st)
+                .map_err(hip)?;
+            gpu.hip
+                .memcpy_dtod_async_at(
+                    &mb_w,
+                    0,
+                    &ps.route_local.buf,
+                    g.max_rows * g.top_k * 4,
+                    route,
+                    st,
+                )
                 .map_err(hip)?;
             for i in 0..subs {
                 let (off, n) = split.sub_range(rows, i);
@@ -442,13 +511,30 @@ impl HeteroPrefillSplit {
                     // SAFETY: the split's own sidecar snapshot (`rows` rows).
                     let src = unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, rows * i4) };
                     gpu.hip
-                        .memcpy_dtod_2d_async_at(&mb_x, off * i4, n * 72, &src, off * 72, rows * 72, n * 72, dim / 128, gpu.active_stream.as_ref())
+                        .memcpy_dtod_2d_async_at(
+                            &mb_x,
+                            off * i4,
+                            n * 72,
+                            &src,
+                            off * 72,
+                            rows * 72,
+                            n * 72,
+                            dim / 128,
+                            gpu.active_stream.as_ref(),
+                        )
                         .map_err(hip)?;
                     ROWS_INT4
                 } else {
                     let st = gpu.active_stream.as_ref().expect("side stream installed");
                     gpu.hip
-                        .memcpy_dtod_async_at(&mb_x, off * dim * 2, &ps.x_f16.buf, off * dim * 2, n * dim * 2, st)
+                        .memcpy_dtod_async_at(
+                            &mb_x,
+                            off * dim * 2,
+                            &ps.x_f16.buf,
+                            off * dim * 2,
+                            n * dim * 2,
+                            st,
+                        )
                         .map_err(hip)?;
                     ROWS_F16
                 };
@@ -457,13 +543,24 @@ impl HeteroPrefillSplit {
                     c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 let w = o.sub[i];
-                gpu.hetero_release_rows(&sh.counter, self.layer, self.layers, off as i32, n as i32, format, mb + w.layer as u64, mb + w.req_seq as u64)
-                    .map_err(hip)?;
+                gpu.hetero_release_rows(
+                    &sh.counter,
+                    self.layer,
+                    self.layers,
+                    off as i32,
+                    n as i32,
+                    format,
+                    mb + w.layer as u64,
+                    mb + w.req_seq as u64,
+                )
+                .map_err(hip)?;
             }
             Ok(())
         })?;
         on_stream(gpu, &sh.back, |gpu| {
-            gpu.hip.stream_wait_event_on(gpu.active_stream.as_ref(), &ps.published).map_err(hip)?;
+            gpu.hip
+                .stream_wait_event_on(gpu.active_stream.as_ref(), &ps.published)
+                .map_err(hip)?;
             for i in 0..subs {
                 let (off, n) = split.sub_range(rows, i);
                 if n == 0 {
@@ -480,35 +577,67 @@ impl HeteroPrefillSplit {
                     weights: 0,
                     cold_out: 0,
                 };
-                gpu.hetero_await_cold(&sh.counter, self.layer, self.layers, &slot, sh.max_polls).map_err(hip)?;
+                gpu.hetero_await_cold(&sh.counter, self.layer, self.layers, &slot, sh.max_polls)
+                    .map_err(hip)?;
                 let st = gpu.active_stream.as_ref().expect("side stream installed");
                 gpu.hip
-                    .memcpy_dtod_async_at(&ps.partial.buf, off * dim * 2, &mb_part, off * dim * 2, n * dim * 2, st)
+                    .memcpy_dtod_async_at(
+                        &ps.partial.buf,
+                        off * dim * 2,
+                        &mb_part,
+                        off * dim * 2,
+                        n * dim * 2,
+                        st,
+                    )
                     .map_err(hip)?;
             }
             // The error word, after every wait of this chunk, into primary memory.
             // SAFETY: the slot's error word in the live pinned mailbox.
-            let err = unsafe { hip_bridge::DeviceBuffer::from_raw((mb + o.error as u64) as *mut std::ffi::c_void, 4) };
+            let err = unsafe {
+                hip_bridge::DeviceBuffer::from_raw(
+                    (mb + o.error as u64) as *mut std::ffi::c_void,
+                    4,
+                )
+            };
             let st = gpu.active_stream.as_ref().expect("side stream installed");
-            gpu.hip.memcpy_dtod_async_at(&ps.err_local.buf, 0, &err, 0, 4, st).map_err(hip)?;
-            gpu.hip.event_record(&ps.returned, gpu.active_stream.as_ref()).map_err(hip)
+            gpu.hip
+                .memcpy_dtod_async_at(&ps.err_local.buf, 0, &err, 0, 4, st)
+                .map_err(hip)?;
+            gpu.hip
+                .event_record(&ps.returned, gpu.active_stream.as_ref())
+                .map_err(hip)
         })
     }
 
     /// `JoinColdRows`: the main stream waits for the exchange, then adds the
     /// BF16 cold partial into `x_batch` (skipped after a timed-out wait).
-    pub fn join(&self, gpu: &mut Gpu, rows: usize, x_batch: &GpuTensor) -> Result<(), DispatchError> {
+    pub fn join(
+        &self,
+        gpu: &mut Gpu,
+        rows: usize,
+        x_batch: &GpuTensor,
+    ) -> Result<(), DispatchError> {
         let sh = &*self.shared;
         let s = sh.slot();
         if let Some(t) = &sh.trace {
             let slot = &sh.slots[s];
-            gpu.hip.event_record(&t.hot, gpu.active_stream.as_ref()).map_err(hip)?;
+            gpu.hip
+                .event_record(&t.hot, gpu.active_stream.as_ref())
+                .map_err(hip)?;
             gpu.hip.event_synchronize(&t.hot).map_err(hip)?;
             gpu.hip.event_synchronize(&slot.returned).map_err(hip)?;
             let hot = gpu.hip.event_elapsed_ms(&t.start, &t.hot).map_err(hip)? as f64;
-            let cold = gpu.hip.event_elapsed_ms(&t.start, &slot.returned).map_err(hip)? as f64;
+            let cold = gpu
+                .hip
+                .event_elapsed_ms(&t.start, &slot.returned)
+                .map_err(hip)? as f64;
             if let Ok(mut sums) = t.sums.lock() {
-                *sums = (sums.0 + 1, sums.1 + rows as u64, sums.2 + hot, sums.3 + cold);
+                *sums = (
+                    sums.0 + 1,
+                    sums.1 + rows as u64,
+                    sums.2 + hot,
+                    sums.3 + cold,
+                );
                 if sums.0 % self.layers as u64 == 0 {
                     let n = sums.0 as f64;
                     eprintln!(
@@ -532,19 +661,31 @@ impl HeteroPrefillSplit {
     /// The join of slot `slot` (the layer-major schedule's deferred join):
     /// the main stream waits for that slot's exchange, then adds its BF16 cold
     /// partial into `x_batch` (skipped after any timed-out wait).
-    pub fn join_slot(&self, gpu: &mut Gpu, slot: usize, rows: usize, x_batch: &GpuTensor) -> Result<(), DispatchError> {
+    pub fn join_slot(
+        &self,
+        gpu: &mut Gpu,
+        slot: usize,
+        rows: usize,
+        x_batch: &GpuTensor,
+    ) -> Result<(), DispatchError> {
         let sh = &*self.shared;
-        let st = sh
-            .slots
-            .get(slot)
-            .ok_or_else(|| DispatchError::Hip(format!("hetero prefill: slot {slot} of {}", sh.slots.len())))?;
+        let st = sh.slots.get(slot).ok_or_else(|| {
+            DispatchError::Hip(format!("hetero prefill: slot {slot} of {}", sh.slots.len()))
+        })?;
         if !st.pending.swap(false, std::sync::atomic::Ordering::Relaxed) {
             // The call did not take the exchange (its own combine carried the
             // cold experts): nothing to add.
             return Ok(());
         }
-        gpu.hip.stream_wait_event_on(gpu.active_stream.as_ref(), &st.returned).map_err(hip)?;
-        gpu.hetero_add_partial(st.err_local.buf.as_ptr() as u64, &st.partial, (rows * sh.geom.dim) as i32, x_batch)
-            .map_err(hip)
+        gpu.hip
+            .stream_wait_event_on(gpu.active_stream.as_ref(), &st.returned)
+            .map_err(hip)?;
+        gpu.hetero_add_partial(
+            st.err_local.buf.as_ptr() as u64,
+            &st.partial,
+            (rows * sh.geom.dim) as i32,
+            x_batch,
+        )
+        .map_err(hip)
     }
 }

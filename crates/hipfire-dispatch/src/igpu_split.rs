@@ -47,9 +47,17 @@ fn err(message: impl std::fmt::Display) -> DispatchError {
 
 /// Masked routing ids for the iGPU: every slot `-1` except the host slots, which
 /// keep their original expert id. `out` has one entry per routed slot.
-pub fn igpu_masked_ids(ids: &[i32], host_slots: &[u32], out: &mut [i32]) -> Result<(), DispatchError> {
+pub fn igpu_masked_ids(
+    ids: &[i32],
+    host_slots: &[u32],
+    out: &mut [i32],
+) -> Result<(), DispatchError> {
     if out.len() != ids.len() {
-        return Err(err(format!("{} masked ids for {} routed slots", out.len(), ids.len())));
+        return Err(err(format!(
+            "{} masked ids for {} routed slots",
+            out.len(),
+            ids.len()
+        )));
     }
     out.fill(-1);
     for &slot in host_slots {
@@ -89,7 +97,12 @@ pub fn fill_ptr_tables(
         let e_idx = usize::try_from(id)
             .ok()
             .filter(|&i| i < gate_up.len())
-            .ok_or_else(|| err(format!("expert id {id} outside the {}-entry table", gate_up.len())))?;
+            .ok_or_else(|| {
+                err(format!(
+                    "expert id {id} outside the {}-entry table",
+                    gate_up.len()
+                ))
+            })?;
         gate_up[e_idx] = e.gate_up.as_ptr() as u64;
         down[e_idx] = e.down.as_ptr() as u64;
     }
@@ -214,14 +227,19 @@ impl Worker {
             return Err(format!("device {ordinal} is {}, not gfx1151", gpu.arch));
         }
         let f32s = |gpu: &mut rdna_compute::Gpu, n: usize| {
-            gpu.alloc_tensor(&[n], rdna_compute::DType::F32).map_err(|e| e.to_string())
+            gpu.alloc_tensor(&[n], rdna_compute::DType::F32)
+                .map_err(|e| e.to_string())
         };
         let slots = d.max_rows * d.top_k;
         let flags = hip_bridge::HIP_HOST_MALLOC_MAPPED | hip_bridge::HIP_HOST_MALLOC_COHERENT;
         // Layout of both the staging area and the device buffer.
         let sizes = [d.n_experts * 8, d.n_experts * 8, slots * 4];
         let total: usize = sizes.iter().sum();
-        let staging = gpu.hip.host_malloc(total, flags).map_err(|e| e.to_string())?.cast::<u8>();
+        let staging = gpu
+            .hip
+            .host_malloc(total, flags)
+            .map_err(|e| e.to_string())?
+            .cast::<u8>();
         let tables = match gpu.alloc_tensor(&[total / 4], rdna_compute::DType::F32) {
             Ok(t) => t,
             Err(e) => {
@@ -274,8 +292,11 @@ impl Worker {
                     return Some(p);
                 }
                 // SAFETY: a one-byte non-owning view, used only for the attribute query.
-                let probe = unsafe { hip_bridge::DeviceBuffer::from_raw(p as *mut std::ffi::c_void, 1) };
-                hip.pointer_get_attributes(&probe).ok().map(|a| a.device_pointer as u64)
+                let probe =
+                    unsafe { hip_bridge::DeviceBuffer::from_raw(p as *mut std::ffi::c_void, 1) };
+                hip.pointer_get_attributes(&probe)
+                    .ok()
+                    .map(|a| a.device_pointer as u64)
             };
             let spans = [job.x.0 as u64, job.out.0 as u64];
             check_device_accessible(&spans, lookup)
@@ -292,28 +313,62 @@ impl Worker {
         // SAFETY: the pinned buffers hold exactly these extents (sizes from the
         // same dims) and no kernel reads them: the previous job synchronized.
         unsafe {
-            std::ptr::copy_nonoverlapping(job.gate_up.as_ptr(), self.pinned[0].0.cast::<u64>(), job.gate_up.len());
-            std::ptr::copy_nonoverlapping(job.down.as_ptr(), self.pinned[1].0.cast::<u64>(), job.down.len());
-            std::ptr::copy_nonoverlapping(job.masked_ids.as_ptr(), self.pinned[2].0.cast::<i32>(), job.masked_ids.len());
+            std::ptr::copy_nonoverlapping(
+                job.gate_up.as_ptr(),
+                self.pinned[0].0.cast::<u64>(),
+                job.gate_up.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                job.down.as_ptr(),
+                self.pinned[1].0.cast::<u64>(),
+                job.down.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                job.masked_ids.as_ptr(),
+                self.pinned[2].0.cast::<i32>(),
+                job.masked_ids.len(),
+            );
         }
         let g = &mut self.gpu;
         // SAFETY: the staging area was just written above and stays unchanged
         // until this job's final synchronize, after the copy has executed.
         let staged = unsafe { std::slice::from_raw_parts(self.staging.0, self.staging.1) };
-        g.hip.memcpy_htod_async_default(&self.tables.buf, staged).map_err(s)?;
+        g.hip
+            .memcpy_htod_async_default(&self.tables.buf, staged)
+            .map_err(s)?;
         let t1 = std::time::Instant::now();
         // SAFETY: the caller blocks on this job, so both spans stay live.
         let (x, out) = unsafe { (borrowed(job.x.0, job.x.1), borrowed(job.out.0, job.out.1)) };
         g.gemv_mq4g256v2_moe_gate_up_top10_indexed_batched(
-            &self.gate_up_ptrs, &self.ids, &x, &self.gate, &self.up, 2 * d.mi, d.dim, job.rows,
+            &self.gate_up_ptrs,
+            &self.ids,
+            &x,
+            &self.gate,
+            &self.up,
+            2 * d.mi,
+            d.dim,
+            job.rows,
         )
         .map_err(s)?;
         g.silu_mul_bf16_rt_rotate_x_mq_128_v2_shared(
-            &self.gate, &self.up, &self.rot, d.mi, job.rows * d.top_k, None,
+            &self.gate,
+            &self.up,
+            &self.rot,
+            d.mi,
+            job.rows * d.top_k,
+            None,
         )
         .map_err(s)?;
         g.gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(
-            &self.down_ptrs, &self.ids, &self.rot, &out, d.dim, d.mi, job.rows, d.n_experts, d.top_k,
+            &self.down_ptrs,
+            &self.ids,
+            &self.rot,
+            &out,
+            d.dim,
+            d.mi,
+            job.rows,
+            d.n_experts,
+            d.top_k,
         )
         .map_err(s)?;
         g.hip.device_synchronize().map_err(s)?;
@@ -336,7 +391,10 @@ impl IgpuColdArm {
     /// tables and scratch. Returns once the worker is ready, or its error.
     pub fn new(ordinal: i32, dims: ColdArmDims) -> Result<Self, DispatchError> {
         if dims.top_k != 10 {
-            return Err(err(format!("top_k {} (the qt44/qt53 top-10 kernels need 10)", dims.top_k)));
+            return Err(err(format!(
+                "top_k {} (the qt44/qt53 top-10 kernels need 10)",
+                dims.top_k
+            )));
         }
         let (tx, jobs) = mpsc::channel::<Job>();
         let (reply, rx) = mpsc::channel::<Result<(u64, u64), String>>();
@@ -399,7 +457,12 @@ impl IgpuColdArm {
         }
         let d = self.dims;
         let slots = rows * d.top_k;
-        if rows == 0 || rows > d.max_rows || ids.len() < slots || x_rot.len() < rows * d.dim || out.len() < slots * d.dim {
+        if rows == 0
+            || rows > d.max_rows
+            || ids.len() < slots
+            || x_rot.len() < rows * d.dim
+            || out.len() < slots * d.dim
+        {
             return Err(err(format!("extent mismatch for {rows} rows")));
         }
         if host_slots.is_empty() {
@@ -418,10 +481,13 @@ impl IgpuColdArm {
             out: (out.as_mut_ptr() as usize, slots * d.dim * 4),
         };
         let tx = self.tx.lock().map_err(|_| err("sender lock poisoned"))?;
-        tx.as_ref().ok_or_else(|| err("arm is shut down"))?.send(job).map_err(|_| {
-            self.poisoned.store(true, Ordering::Release);
-            err("worker is gone")
-        })?;
+        tx.as_ref()
+            .ok_or_else(|| err("arm is shut down"))?
+            .send(job)
+            .map_err(|_| {
+                self.poisoned.store(true, Ordering::Release);
+                err("worker is gone")
+            })?;
         let t_call = std::time::Instant::now();
         let rx = self.rx.lock().map_err(|_| err("reply lock poisoned"))?;
         match rx.recv_timeout(bound) {
@@ -497,8 +563,14 @@ mod tests {
             _ => None,
         };
         assert!(check_device_accessible(&[0x1000, 0, 0x2000], lookup).is_ok());
-        let e = format!("{:?}", check_device_accessible(&[0x1000, 0x3000], lookup).unwrap_err());
-        assert!(e.contains("not device-accessible") && e.contains("0x3000"), "{e}");
+        let e = format!(
+            "{:?}",
+            check_device_accessible(&[0x1000, 0x3000], lookup).unwrap_err()
+        );
+        assert!(
+            e.contains("not device-accessible") && e.contains("0x3000"),
+            "{e}"
+        );
         assert!(check_device_accessible(&[0x4000], lookup).is_err());
     }
 
@@ -548,7 +620,10 @@ mod tests {
         let mut e = expert(&a, &b);
         e.down_quant = CpuQuant::Mq4G256V2;
         let (mut gu, mut dn) = ([0u64; 4], [0u64; 4]);
-        let msg = format!("{:?}", fill_ptr_tables(&[1], &[0], &[e], &mut gu, &mut dn).unwrap_err());
+        let msg = format!(
+            "{:?}",
+            fill_ptr_tables(&[1], &[0], &[e], &mut gu, &mut dn).unwrap_err()
+        );
         assert!(msg.contains("qt53"), "{msg}");
     }
 

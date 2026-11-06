@@ -11863,7 +11863,10 @@ mod tests {
         // The device-side hetero expert split (`hetero.rs`, `hetero_split.hip`).
         const HETERO_SPLIT_ADDED_MODULES: [&str; 1] = ["hetero_split"];
         for module in HETERO_SPLIT_ADDED_MODULES {
-            assert!(by_name.contains_key(module), "missing hetero split module {module}");
+            assert!(
+                by_name.contains_key(module),
+                "missing hetero split module {module}"
+            );
             assert!(
                 !expected
                     .lines()

@@ -89,8 +89,23 @@ impl Gpu {
             slot.rows as *mut c_void,
         );
         let mut params = vec![
-            p(&c), p(&layer), p(&layers), p(&x), p(&i), p(&w), p(&bm), p(&n_experts),
-            p(&rows), p(&top_k), p(&dim), p(&mx), p(&mi), p(&mw), p(&m), p(&rq), p(&mr),
+            p(&c),
+            p(&layer),
+            p(&layers),
+            p(&x),
+            p(&i),
+            p(&w),
+            p(&bm),
+            p(&n_experts),
+            p(&rows),
+            p(&top_k),
+            p(&dim),
+            p(&mx),
+            p(&mi),
+            p(&mw),
+            p(&m),
+            p(&rq),
+            p(&mr),
         ];
         self.hetero_launch("hetero_publish_cold", 1, 256, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
@@ -154,7 +169,11 @@ impl Gpu {
         down_expanded: &GpuTensor,
     ) -> HipResult<()> {
         let (er, co) = (slot.error as *mut c_void, slot.cold_out as *mut c_void);
-        let (i, bm, d) = (ids.buf.as_ptr(), cold_bitmap.buf.as_ptr(), down_expanded.buf.as_ptr());
+        let (i, bm, d) = (
+            ids.buf.as_ptr(),
+            cold_bitmap.buf.as_ptr(),
+            down_expanded.buf.as_ptr(),
+        );
         let mut params = vec![p(&er), p(&co), p(&i), p(&bm), p(&n_experts), p(&dim), p(&d)];
         self.hetero_launch("hetero_install_cold", slots, 256, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
@@ -235,7 +254,18 @@ impl Gpu {
         );
         let (mi, mw) = (mb_ids as *mut c_void, mb_w as *mut c_void);
         let mut params = vec![
-            p(&x), p(&i), p(&w), p(&bm), p(&n_experts), p(&rows), p(&top_k), p(&dim), p(&xf), p(&mi), p(&mw), p(&m),
+            p(&x),
+            p(&i),
+            p(&w),
+            p(&bm),
+            p(&n_experts),
+            p(&rows),
+            p(&top_k),
+            p(&dim),
+            p(&xf),
+            p(&mi),
+            p(&mw),
+            p(&m),
         ];
         let grid = ((rows.max(1) as u32 * dim as u32).div_ceil(256)).clamp(1, 1024);
         self.hetero_launch("hetero_publish_rows", grid, 256, &mut params, || {
@@ -273,7 +303,16 @@ impl Gpu {
     ) -> HipResult<()> {
         let c = counter.buf.as_ptr();
         let (me, rq) = (meta as *mut c_void, req_seq as *mut c_void);
-        let mut params = vec![p(&c), p(&layer), p(&layers), p(&row_off), p(&rows), p(&format), p(&me), p(&rq)];
+        let mut params = vec![
+            p(&c),
+            p(&layer),
+            p(&layers),
+            p(&row_off),
+            p(&rows),
+            p(&format),
+            p(&me),
+            p(&rq),
+        ];
         self.hetero_launch("hetero_release_rows", 1, 1, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(c);
@@ -290,7 +329,13 @@ impl Gpu {
 
     /// Prefill: `x_batch[0..n] += bf16(partial[0..n])` from the primary's local
     /// copy of the partial, skipped after any timed-out wait (`error`).
-    pub fn hetero_add_partial(&mut self, error: u64, partial: &GpuTensor, n: i32, x_batch: &GpuTensor) -> HipResult<()> {
+    pub fn hetero_add_partial(
+        &mut self,
+        error: u64,
+        partial: &GpuTensor,
+        n: i32,
+        x_batch: &GpuTensor,
+    ) -> HipResult<()> {
         let er = error as *mut c_void;
         let (pa, xb) = (partial.buf.as_ptr(), x_batch.buf.as_ptr());
         let mut params = vec![p(&er), p(&pa), p(&n), p(&xb)];

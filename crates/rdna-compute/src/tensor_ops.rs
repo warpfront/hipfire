@@ -11727,7 +11727,8 @@ pub fn qsa_gathered_wmma_enabled(gpu: &Gpu, format: QsaKvFormat) -> bool {
             // gfx1201: the gfx12 attention over the Q8 rows dequantized to F16
             // (`HIPFIRE_QWEN4_QSA_Q8_GATHER_GFX1201=0` keeps the hg4 kernel).
             QsaKvFormat::Q8 => {
-                gpu.arch_caps.is_gfx1151() || (gpu.arch_caps.is_gfx1201() && *QWEN4_QSA_Q8_GATHER_GFX1201)
+                gpu.arch_caps.is_gfx1151()
+                    || (gpu.arch_caps.is_gfx1201() && *QWEN4_QSA_Q8_GATHER_GFX1201)
             }
             QsaKvFormat::Fp8Fnuz => false,
         }
