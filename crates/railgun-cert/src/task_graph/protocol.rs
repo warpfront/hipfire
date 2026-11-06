@@ -120,6 +120,29 @@ const NONE: u32 = u32::MAX;
 const MAX_ALTS: usize = 6;
 const MAX_DEPTH: usize = 6;
 
+/// Work bounds of the protocol check (see "Complexity and work bounds" in [`super`]). One
+/// exceeded refuses with `task_graph-protocol-budget` and the measured counts; the walk is
+/// then incomplete and nothing it saw is admitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    /// State visits of one walk pass, per block of the dispatcher's CFG.
+    pub visits_per_block: u32,
+    /// Path partitions (`(block, facts)` states) held by one walk pass, per block.
+    pub states_per_block: u32,
+    /// Walk passes of the LDS-slot fixpoint (the claim slot's contents feed the next pass).
+    pub lds_passes: u32,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Budget {
+            visits_per_block: 256,
+            states_per_block: 64,
+            lds_passes: 5,
+        }
+    }
+}
+
 /// A symbolic 32-bit value.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum E {
@@ -2091,17 +2114,24 @@ impl Walk<'_> {
 struct Fix<'a, 'b> {
     w: &'b Walk<'a>,
     states: BTreeMap<usize, BTreeMap<u32, State>>,
-    work: Vec<usize>,
+    /// Changed partitions to (re)visit, `(position, facts)`.
+    work: Vec<(usize, u32)>,
     run: Run,
+    /// `(position, facts)` states held: the path partitions.
+    n_states: usize,
+    /// `visit` runs so far: one per change of a partition.
+    visits: u64,
 }
 
 impl Fix<'_, '_> {
     fn propagate(&mut self, pos: usize, st: State) {
-        let slot = self.states.entry(pos).or_default().entry(st.facts);
+        let st_facts = st.facts;
+        let slot = self.states.entry(pos).or_default().entry(st_facts);
         use std::collections::btree_map::Entry;
         let changed = match slot {
             Entry::Vacant(v) => {
                 v.insert(st);
+                self.n_states += 1;
                 true
             }
             Entry::Occupied(mut o) => {
@@ -2110,8 +2140,12 @@ impl Fix<'_, '_> {
                 *o.get() != before
             }
         };
-        if changed && !self.work.contains(&pos) {
-            self.work.push(pos);
+        // a partition is re-visited only when its own state changed: a visit is a function
+        // of `(position, state)` and its effects on the run are idempotent set insertions,
+        // so re-running an unchanged partition could only repeat them
+        let key = (pos, st_facts);
+        if changed && !self.work.contains(&key) {
+            self.work.push(key);
         }
     }
 
@@ -2275,18 +2309,40 @@ impl Fix<'_, '_> {
         }
     }
 
-    fn solve(&mut self, init: State) {
+    /// Run the walk to its fixpoint within `budget`; `Err` names the bound that was
+    /// exceeded (with the measured counts) and leaves the walk incomplete, so its result
+    /// is never used.
+    fn solve(&mut self, init: State, budget: &Budget) -> Result<(), String> {
+        let blocks = self.w.kernel.body.blocks.len().max(1) as u64;
+        let cap_visits = u64::from(budget.visits_per_block) * blocks;
+        let cap_states = (u64::from(budget.states_per_block) * blocks) as usize;
         self.propagate(0, init);
-        while let Some(pos) = self.work.pop() {
-            let states: Vec<State> = self
-                .states
-                .get(&pos)
-                .map(|m| m.values().cloned().collect())
-                .unwrap_or_default();
-            for st in states {
-                self.visit(pos, st);
+        while let Some((pos, facts)) = self.work.pop() {
+            let Some(st) = self.states.get(&pos).and_then(|m| m.get(&facts)).cloned() else {
+                continue;
+            };
+            self.visits += 1;
+            if self.visits > cap_visits {
+                return Err(format!(
+                    "the walk made {} state visits over {blocks} blocks, past its bound of {cap_visits} ({} per block); {} path partitions held",
+                    self.visits, budget.visits_per_block, self.n_states
+                ));
             }
+            if self.n_states > cap_states {
+                return Err(format!(
+                    "the walk holds {} path partitions ((position, facts) states) over {blocks} blocks, past its bound of {cap_states} ({} per block), after {} visits",
+                    self.n_states, budget.states_per_block, self.visits
+                ));
+            }
+            self.visit(pos, st);
         }
+        crate::timing::note(|| {
+            format!(
+                "walk pass: {} visits of {cap_visits}, {} partitions of {cap_states}, {blocks} blocks",
+                self.visits, self.n_states
+            )
+        });
+        Ok(())
     }
 }
 
@@ -2318,6 +2374,7 @@ pub(super) fn check(
     waves: u32,
     shell: &KernargFacts,
     _facts: &[RegionFacts],
+    budget: &Budget,
 ) -> Result<ProtocolProof, Vec<Refusal>> {
     let body = &kernel.body;
     let mut out = Vec::new();
@@ -2415,7 +2472,9 @@ pub(super) fn check(
         .collect();
     let mut lds_in: Vec<Event> = Vec::new();
     let mut result: Option<Run> = None;
-    for _ in 0..5 {
+    let mut converged = false;
+    let passes = budget.lds_passes.max(1);
+    for _ in 0..passes {
         let w = Walk {
             kernel,
             arch,
@@ -2457,22 +2516,38 @@ pub(super) fn check(
             states: BTreeMap::new(),
             work: Vec::new(),
             run: Run::default(),
+            n_states: 0,
+            visits: 0,
         };
-        fix.solve(init);
+        if let Err(why) =
+            crate::timing::timed("fixpoint pass (Walk/Fix)", || fix.solve(init, budget))
+        {
+            out.push(refuse(
+                "task_graph-protocol-budget",
+                format!("protocol dataflow: {why}"),
+            ));
+            return Err(out);
+        }
         let run = fix.run;
         let produced = events_of(&run.lds_out);
         let stable = produced == lds_in;
         lds_in = produced;
         result = Some(run);
         if stable {
+            converged = true;
             break;
         }
     }
     let run = result.expect("at least one run");
-    if events_of(&run.lds_out) != lds_in {
+    // the last pass must have been run against the slot contents it itself produced; a
+    // walk whose input differs from its output proves nothing
+    if !converged {
         out.push(refuse(
-            "task_graph-protocol-lds",
-            "the LDS slot's contents did not reach a fixpoint",
+            "task_graph-protocol-budget",
+            format!(
+                "the LDS slot's contents did not reach a fixpoint within {} passes of the walk",
+                budget.lds_passes.max(1)
+            ),
         ));
     }
     for (pos, rule, detail) in &run.refusals {

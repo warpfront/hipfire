@@ -25,6 +25,7 @@
 //! explicit-ABI table, refusals for non-railgun or fact-less nodes).
 pub mod recording;
 pub mod task_graph;
+pub mod timing;
 pub mod whole16;
 
 use std::collections::BTreeMap;
@@ -36,7 +37,8 @@ use peacemaker_ir::kernarg::{
     KernargFacts, KernelStatus, MemPath, ReadCacheClass, RegionBound, SealedAccess, SealedBound,
     SealedEntryLoad, SealedTableUse,
 };
-use peacemaker_ir::passes::kernargs;
+use peacemaker_ir::passes::kernargs::{self, A1Budget};
+use peacemaker_ir::state::Lifted;
 use peacemaker_lift::kd::DescriptorCodec;
 use peacemaker_lift::{lift_object, Options};
 use radiowave::{
@@ -287,16 +289,41 @@ pub fn wg_footprint_records(
     facts: &KernargFacts,
     block_x: Option<u32>,
 ) -> Vec<WgFootprintRecord> {
-    use peacemaker_ir::passes::wg_footprint::{analyze, ArgWgClass, WgLaunch, HW_BOUNDS};
+    wg_footprint_records_budgeted(kernel, arch, facts, block_x, &A1Budget::default())
+}
+
+/// [`wg_footprint_records`] with the A1 replay under an explicit work bound: one that
+/// overruns it has no records (an absent footprint is never a claim).
+pub fn wg_footprint_records_budgeted(
+    kernel: &Kernel,
+    arch: Arch,
+    facts: &KernargFacts,
+    block_x: Option<u32>,
+    budget: &A1Budget,
+) -> Vec<WgFootprintRecord> {
+    wg_footprint_outcome(kernel, arch, facts, block_x, budget).0
+}
+
+/// [`wg_footprint_records_budgeted`] with the reason the analysis did not apply (`None`:
+/// it ran; the A1 budget rule shows up here).
+pub(crate) fn wg_footprint_outcome(
+    kernel: &Kernel,
+    arch: Arch,
+    facts: &KernargFacts,
+    block_x: Option<u32>,
+    budget: &A1Budget,
+) -> (Vec<WgFootprintRecord>, Option<String>) {
+    use peacemaker_ir::passes::wg_footprint::{analyze_budgeted, ArgWgClass, WgLaunch, HW_BOUNDS};
     let max_flat = match &kernel.abi {
         peacemaker_ir::inst::Abi::Hsa { metadata, .. } => metadata.parsed.max_flat_workgroup_size,
         _ => 0,
     };
     let block = block_x.unwrap_or(if max_flat == 0 { 1024 } else { max_flat });
     let sealed = facts.status == KernelStatus::Conditional;
-    let result = analyze(kernel, arch, sealed, WgLaunch { block_x: block });
+    let result = analyze_budgeted(kernel, arch, sealed, WgLaunch { block_x: block }, budget);
     let axis_name = |a: u8| ["x", "y", "z"][usize::from(a)].to_owned();
-    result
+    let why = result.applicable.clone().err();
+    let records = result
         .args
         .iter()
         .filter_map(|a| match &a.class {
@@ -339,7 +366,8 @@ pub fn wg_footprint_records(
             }),
             _ => None,
         })
-        .collect()
+        .collect();
+    (records, why)
 }
 
 /// Serialise one kernel's facts (plus its differential) for the receipt.
@@ -484,11 +512,16 @@ fn sealed_record(t: &SealedTableUse) -> SealedTableRecord {
 /// sealed analysis finds a table-shaped entry load but cannot prove it, the
 /// unguarded refusals are replaced by its exact `sealed-*` rules (still
 /// `Unknown`); a kernel with no table-shaped load keeps the unguarded result.
-fn sealed_facts(kernel: &Kernel, arch: Arch, unguarded: &mut KernargFacts) -> Option<KernargFacts> {
-    if unguarded.status != KernelStatus::Unknown {
+fn sealed_facts(
+    kernel: &Kernel,
+    arch: Arch,
+    unguarded: &mut KernargFacts,
+    budget: &A1Budget,
+) -> Option<KernargFacts> {
+    if unguarded.status != KernelStatus::Unknown || hit_budget(unguarded) {
         return None;
     }
-    let sealed = kernargs::analyze_sealed(kernel, arch);
+    let sealed = kernargs::analyze_sealed_budgeted(kernel, arch, budget);
     if sealed.status == KernelStatus::Conditional && !sealed.sealed.is_empty() {
         return Some(sealed);
     }
@@ -498,6 +531,15 @@ fn sealed_facts(kernel: &Kernel, arch: Arch, unguarded: &mut KernargFacts) -> Op
         .any(|u| u.rule.starts_with("sealed-"))
     {
         unguarded.unresolved = sealed.unresolved;
+    } else if hit_budget(&sealed) {
+        // the sealed variant ran past its work bound: the kernel is unknown for that reason
+        // too, and the receipt says so
+        unguarded.unresolved.extend(
+            sealed
+                .unresolved
+                .into_iter()
+                .filter(|u| u.rule == kernargs::RULE_FIXPOINT_BUDGET),
+        );
     }
     None
 }
@@ -657,8 +699,13 @@ const GUARDED_CASES: &[GuardedCase] = &[GuardedCase {
 /// guarded analysis of the original ISA returns Conditional with indexed
 /// effects under every one of the case's guards. Otherwise `None` and the
 /// unguarded (Unknown) result stands.
-fn guarded_facts(kernel: &Kernel, arch: Arch, unguarded: &KernargFacts) -> Option<KernargFacts> {
-    if unguarded.status != KernelStatus::Unknown {
+fn guarded_facts(
+    kernel: &Kernel,
+    arch: Arch,
+    unguarded: &KernargFacts,
+    budget: &A1Budget,
+) -> Option<KernargFacts> {
+    if unguarded.status != KernelStatus::Unknown || hit_budget(unguarded) {
         return None;
     }
     let case = GUARDED_CASES.iter().find(|c| c.symbol == kernel.symbol.0)?;
@@ -672,13 +719,23 @@ fn guarded_facts(kernel: &Kernel, arch: Arch, unguarded: &KernargFacts) -> Optio
     {
         return None;
     }
-    let facts = kernargs::analyze_guarded(kernel, arch, case.guards);
+    let facts = kernargs::analyze_guarded_budgeted(kernel, arch, case.guards, budget);
     let mut want = case.guards.to_vec();
     want.sort();
     let mut have = facts.guards.clone();
     have.sort();
     (facts.status == KernelStatus::Conditional && !facts.indexed.is_empty() && have == want)
         .then_some(facts)
+}
+
+/// Whether `facts` is `Unknown` because the analysis ran past its work bound: the guarded
+/// and sealed variants replay the same fixpoint, so they are not retried (a retry could
+/// only repeat the overrun).
+fn hit_budget(facts: &KernargFacts) -> bool {
+    facts
+        .unresolved
+        .iter()
+        .any(|u| u.rule == kernargs::RULE_FIXPOINT_BUDGET)
 }
 
 /// #867 kernel-guard certificate for one lifted kernel: the kernarg offset
@@ -1022,42 +1079,132 @@ pub fn code_identity(bytes: &[u8]) -> Result<Vec<KernelIdentity>, CertError> {
         .collect())
 }
 
+/// How much of one kernel's receipt record [`certify_kernel`] derives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KernelDetail {
+    /// Everything [`certify`] reports: the `edit::analyze` obligations and the record's
+    /// own `wg_footprints` (the kernel's maximum flat workgroup size).
+    Full,
+    /// A kernel a pool hosts as a region: only what the arena derivation reads. The A1
+    /// facts are those of `Full` (`edit::analyze` runs `kernargs::analyze` on the kernel
+    /// unchanged, and [`kernel_facts`] falls back to it when that analysis errs, so the
+    /// facts do not depend on the other passes); `pm_obligations`, `pm_analyze_error` and
+    /// `wg_footprints` stay empty.
+    Body,
+}
+
+/// One kernel's receipt record with the A1 facts it was built from.
+pub(crate) struct KernelCertificate {
+    pub identity: KernelIdentity,
+    /// SHA-256 of the device ELF the kernel came from.
+    pub device_sha: String,
+    pub record: KernelRecord,
+    /// The facts the record serialises: the guarded or sealed analysis when it applied.
+    pub facts: KernargFacts,
+    /// A1 as `kernargs::analyze` returned it, before any guarded/sealed refinement (what
+    /// the workgroup-footprint analysis of a region body is keyed on).
+    pub raw: KernargFacts,
+}
+
+/// The per-kernel half of [`certify`]: kernel `index` of `lifted` (the Hipcc lift of the
+/// object whose SHA-256 is `object_sha256`), under the A1 work bound `budget`.
+pub(crate) fn certify_kernel(
+    lifted: &Lifted<Program>,
+    index: usize,
+    object_sha256: &str,
+    source: &str,
+    cert: Option<&CodeObjectCertification>,
+    detail: KernelDetail,
+    budget: &A1Budget,
+) -> KernelCertificate {
+    let program = &lifted.program;
+    let arch = program.target.arch;
+    let kernel = &program.kernels[index];
+    let (identity, device_sha) = kernel_identity(kernel, &lifted.proof);
+    let (mut facts, pm, pm_error) = match detail {
+        KernelDetail::Full => timing::timed("kernel_facts (edit::analyze)", || {
+            kernel_facts(program, index)
+        }),
+        KernelDetail::Body => timing::timed("A1 (kernargs::analyze)", || {
+            (
+                kernargs::analyze_budgeted(kernel, arch, budget),
+                BTreeMap::new(),
+                None,
+            )
+        }),
+    };
+    let raw = facts.clone();
+    let meta = metadata_effects(source, cert, &kernel.symbol.0);
+    let guarded = timing::timed("guarded_facts/sealed_facts", || {
+        guarded_facts(kernel, arch, &facts, budget)
+            .or_else(|| sealed_facts(kernel, arch, &mut facts, budget))
+    });
+    let mut record = kernel_record(kernel, guarded.as_ref().unwrap_or(&facts), &meta);
+    if guarded.is_some() {
+        record.unguarded_unresolved = kernel_record(kernel, &facts, &meta).unresolved;
+        record.case_digest = case_digest(object_sha256, &device_sha, arch_name(arch), &record);
+    }
+    record.pm_obligations = pm;
+    record.pm_analyze_error = pm_error;
+    let facts = guarded.unwrap_or(facts);
+    record.guard_flag = guard_flag(kernel, arch);
+    if detail == KernelDetail::Full {
+        record.wg_footprints = timing::timed("wg_footprint_records", || {
+            wg_footprint_records_budgeted(kernel, arch, &facts, None, budget)
+        });
+    }
+    KernelCertificate {
+        identity,
+        device_sha,
+        record,
+        facts,
+        raw,
+    }
+}
+
 /// Lift, analyse and serialise one code object. `sidecar` is the runtime's
 /// `*.radiowave.json` for these exact bytes, when one exists.
 pub fn certify(bytes: &[u8], sidecar: Option<&str>) -> Result<Receipt, CertError> {
-    let lifted = lift_object(
-        bytes,
-        Options {
-            frontend: Frontend::Hipcc,
-        },
-    )
+    let lifted = timing::timed("lift_object", || {
+        lift_object(
+            bytes,
+            Options {
+                frontend: Frontend::Hipcc,
+            },
+        )
+    })
     .map_err(|e| CertError::Lift(e.to_string()))?;
+    Ok(certify_lifted(bytes, &lifted, sidecar))
+}
+
+/// [`certify`] for an object already lifted: `lifted` is the Hipcc-frontend lift of `bytes`.
+pub(crate) fn certify_lifted(
+    bytes: &[u8],
+    lifted: &Lifted<Program>,
+    sidecar: Option<&str>,
+) -> Receipt {
     let program = &lifted.program;
     let arch = program.target.arch;
-    let (source, cert) = radiowave_cert(bytes, program, sidecar);
+    let (source, cert) =
+        timing::timed("radiowave_cert", || radiowave_cert(bytes, program, sidecar));
     let mut identities = Vec::new();
     let mut records = Vec::new();
     let mut obligations = std::collections::BTreeSet::new();
     let mut device_sha = String::new();
-    for (index, kernel) in program.kernels.iter().enumerate() {
-        let (identity, device) = kernel_identity(kernel, &lifted.proof);
-        device_sha = device;
-        identities.push(identity);
-        let (mut facts, pm, pm_error) = kernel_facts(program, index);
-        let meta = metadata_effects(&source, cert.as_ref(), &kernel.symbol.0);
-        let guarded =
-            guarded_facts(kernel, arch, &facts).or_else(|| sealed_facts(kernel, arch, &mut facts));
-        let mut record = kernel_record(kernel, guarded.as_ref().unwrap_or(&facts), &meta);
-        if guarded.is_some() {
-            record.unguarded_unresolved = kernel_record(kernel, &facts, &meta).unresolved;
-            record.case_digest =
-                case_digest(&sha256_hex(bytes), &device_sha, arch_name(arch), &record);
-        }
-        record.pm_obligations = pm;
-        record.pm_analyze_error = pm_error;
-        let facts = guarded.unwrap_or(facts);
-        record.guard_flag = guard_flag(kernel, arch);
-        record.wg_footprints = wg_footprint_records(kernel, arch, &facts, None);
+    let object_sha = sha256_hex(bytes);
+    for index in 0..program.kernels.len() {
+        let cert_k = certify_kernel(
+            lifted,
+            index,
+            &object_sha,
+            &source,
+            cert.as_ref(),
+            KernelDetail::Full,
+            &A1Budget::default(),
+        );
+        device_sha = cert_k.device_sha;
+        identities.push(cert_k.identity);
+        let facts = &cert_k.facts;
         if facts.args.iter().any(|a| a.bound.is_some()) {
             obligations.insert("InBoundsNoAlias".to_owned());
         }
@@ -1075,7 +1222,7 @@ pub fn certify(bytes: &[u8], sidecar: Option<&str>) -> Result<Receipt, CertError
             }
             KernelStatus::Unknown => {}
         }
-        records.push(record);
+        records.push(cert_k.record);
     }
     let proven = records.iter().filter(|r| r.status == STATUS_PROVEN).count();
     let conditional = records
@@ -1129,7 +1276,7 @@ pub fn certify(bytes: &[u8], sidecar: Option<&str>) -> Result<Receipt, CertError
         proof_bytes.extend(s.stream_sha256);
     }
     let git = git_sha();
-    Ok(Receipt {
+    Receipt {
         schema: RECEIPT_SCHEMA.into(),
         schema_version: RECEIPT_SCHEMA_VERSION,
         object_sha256: sha256_hex(bytes),
@@ -1157,7 +1304,7 @@ pub fn certify(bytes: &[u8], sidecar: Option<&str>) -> Result<Receipt, CertError
             assumptions: ASSUMPTIONS.iter().map(|s| (*s).to_owned()).collect(),
             kernels: records,
         },
-    })
+    }
 }
 
 #[cfg(test)]
@@ -1342,5 +1489,65 @@ mod tests {
         let back: Receipt =
             serde_json::from_str(&serde_json::to_string(&receipt).unwrap()).unwrap();
         assert_eq!(back.railgun.kernels.len(), receipt.railgun.kernels.len());
+    }
+
+    /// The record of a hosted body (`KernelDetail::Body`, what a pool certification derives per
+    /// region, once per kernel) is the record `certify` derives for the same kernel except for
+    /// the two things it skips: the `edit::analyze` obligations (`pm_obligations`,
+    /// `pm_analyze_error`) and the receipt's own `wg_footprints`. The A1 facts, the sealed
+    /// tables and the case digest are identical, and so are the raw facts the footprints of a
+    /// region are keyed on.
+    #[test]
+    fn a_body_record_equals_the_full_record_without_the_pm_obligations_and_footprints() {
+        let objects: [&[u8]; 3] = [
+            // two sealed-table MoE kernels (conditional)
+            include_bytes!("../tests/fixtures/task_graph/standalone/8c49fcc03c571de42932eb3a40a51f0c2f71dc2ef199a850f328e903e52d5809.co"),
+            include_bytes!("../tests/fixtures/task_graph/standalone/7dbb04851c98bd7f07449b46e5b0804c6eb611e5e20467665c2b0dd723e1f445.co"),
+            include_bytes!("../tests/fixtures/task_graph/standalone/31db469d89b63428c65f0fdc8a7932025cd8a3f7fedef4406820f7d68b912f12.co"),
+        ];
+        let mut statuses = std::collections::BTreeSet::new();
+        for bytes in objects {
+            let full = certify(bytes, None).expect("certifies");
+            let lifted = lift_object(
+                bytes,
+                Options {
+                    frontend: Frontend::Hipcc,
+                },
+            )
+            .expect("lifts");
+            let (source, cert) = radiowave_cert(bytes, &lifted.program, None);
+            let sha = sha256_hex(bytes);
+            assert_eq!(full.railgun.kernels.len(), lifted.program.kernels.len());
+            for (index, record) in full.railgun.kernels.iter().enumerate() {
+                let body = certify_kernel(
+                    &lifted,
+                    index,
+                    &sha,
+                    &source,
+                    cert.as_ref(),
+                    KernelDetail::Body,
+                    &A1Budget::default(),
+                );
+                let mut want = record.clone();
+                want.pm_obligations.clear();
+                want.pm_analyze_error = None;
+                want.wg_footprints.clear();
+                assert_eq!(
+                    serde_json::to_value(&body.record).unwrap(),
+                    serde_json::to_value(&want).unwrap(),
+                    "{}",
+                    record.symbol
+                );
+                statuses.insert(record.status.clone());
+                // the raw facts are `kernel_facts` unchanged (what the old per-region
+                // footprint analysis recomputed)
+                let (raw, _, _) = kernel_facts(&lifted.program, index);
+                assert_eq!(body.raw, raw, "{}", record.symbol);
+            }
+        }
+        assert!(
+            statuses.contains(STATUS_PROVEN) && statuses.contains(STATUS_CONDITIONAL),
+            "{statuses:?}"
+        );
     }
 }

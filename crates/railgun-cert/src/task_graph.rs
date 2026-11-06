@@ -42,6 +42,51 @@
 //!    pool CFG and proves the six [`TASK_PROTO_REQUIRED`] properties, which
 //!    the host reads from the [`TaskProtocolRecord`], and, when it holds,
 //!    `region_wg_from_header` with the header offsets of the virtual grid.
+//!
+//! # Complexity and work bounds
+//!
+//! The certificate is a fixed pipeline over finite objects, so it terminates; what this
+//! section bounds is *how long*. Notation: `I`, `B` are the instructions and basic blocks
+//! of the pool kernel, `R` its regions, `Is`, `Bs` those of a hosted standalone kernel,
+//! `O` the instructions of a whole standalone object (all its kernels). Every iterative
+//! phase carries an explicit work bound; one that is exceeded stops the phase and refuses
+//! with a `task_graph-*-budget` rule naming the bound and the measured counts, the
+//! kernel stays `unknown`, and nothing the stopped phase had computed is used, so a
+//! refusal never admits anything. The bounds are [`PoolBudget`]'s fields (the same
+//! figures are the defaults of [`certify_pool`]; [`certify_pool_with`] takes others).
+//!
+//! | phase | cost | bound (default) | refusal |
+//! |---|---|---|---|
+//! | note and kernel size | `O(1)` | `R <= 64`, `I <= 65536` (`max_regions`, `max_kernel_insts`) | `task_graph-size-budget` |
+//! | whole-object receipt (`certify`, the unchanged baseline record) | lift `O(I)`; A1 and its guarded/sealed variants as below; peacemaker-ir passes: wait replay (`NoFixpoint` past 1000 walks per instruction), SGPR hazards (256 sweeps), LDS (widening after 3 updates per block), definedness (bitset dataflow) | the default [`A1Budget`] on its A1 runs | the record's own `a1-fixpoint-budget` unresolved (the whole-object record is replaced or refused by the obligations below) |
+//! | standalone object | SHA-256 and `lift_object` `O(O)`, once per digest per call | none needed (linear) | `task_graph-region-source-*`, `task_graph-region-lift` |
+//! | region re-derivation (`lift_region_in`) | liveness plus barrier-participation fixpoint over the (block, EXEC) product graph, `O(Is)` states | 200 000 rounds (`uniformity::explore`) | `task_graph-region-lift` |
+//! | byte compare | `O(region words)` | linear | `task_graph-region-bytes` |
+//! | standalone body A1 and sealed/guarded variants | one forward dataflow per `(digest, symbol)`: at most `work_per_inst * Is` units, a unit being one replayed instruction or block visit; the sealed entry/guard replays are bounded by 4096 paths and 400 000 steps | `A1Budget::fixpoint_work_per_inst` = 512 | `task_graph-a1-budget` (A1 rule `a1-fixpoint-budget`); `sealed-guard-path-budget` stays an A1 `sealed-*` rule |
+//! | workgroup footprints of a body | one A1 run with compare facts per `(digest, symbol, block)` plus per-lane evaluation `O(block * forms)` | the same A1 bound; the footprints are withheld (never refused: an absent footprint is no claim) and the evidence line says why | evidence only |
+//! | region-scoped A1 (native region; lifted cross-check) | `O(region)` cut plus one A1 run | `A1Budget` | `task_graph-a1-budget` (a cross-check only reports it) |
+//! | dispatcher shell A1 (`analyze_excluding`, once) | one A1 run, `O(512 * I)` worst case | `A1Budget` | `task_graph-a1-budget` |
+//! | protocol walk (`Walk`/`Fix`) | worklist over `(block, facts)` path partitions: a partition is joined monotonically and visited once per change of its state, a visit costs `O(block * alts)`; at most `2^18` fact sets per block in principle | state visits `<= 256 * B`, held partitions `<= 64 * B` per pass | `task_graph-protocol-budget` |
+//! | protocol LDS-slot fixpoint | the walk repeated until the slot contents are stable (one extra pass for a multi-wave pool) | 5 passes, and the last pass must have been run on the contents it produced | `task_graph-protocol-budget` |
+//! | protocol prelude (`region_exit_waited`, `region_defs`, `find_step_loops`, `on_inner_cycle`) | monotone must-dataflow on 4-bit masks (`<= 5` visits per block), linear scans, `O(claim-loop blocks * (B + E))` | linear or by lattice height | none |
+//!
+//! Measured (release, `railgun-cert pool --timings`; the table of every phase is printed per
+//! pool): the A1 runs of the five fixture pools, their bodies and their mutations use 1.0 to
+//! 21 units of work per instruction (the largest of 1414 fixpoints over every fixture of this
+//! crate's tests is 63, in the Whole16 fixtures); the protocol walks
+//! make 1.4 to 6.1 state visits and hold 0.8 to 5.1 partitions per block (b32 172 visits and
+//! 94 partitions over 124 blocks, b64 177 and 149 over 29, b128 393 and 224 over 163, b256
+//! 734 and 324 over 391, b320 177 and 149 over 59), in two passes for a multi-wave pool and
+//! one for a single wave.
+//! The A1, walk and region-count defaults are at least 8 times the largest measured value;
+//! the pool-size bound (65 536 instructions against 14 315 measured) and the 5 LDS passes
+//! (2 needed) keep smaller margins on purpose: they cap the worst case.
+//!
+//! Caching: a standalone object is looked up, hashed, lifted and radiowave-certified once
+//! per [`certify_pool_with`] call, its kernel analysed once per symbol and its footprints
+//! once per `(symbol, block)`; each cache entry is a function of exactly those keys, the
+//! object's SHA-256 (checked) and the call's budget, so a hit is the value a recomputation
+//! would give. The pool kernel is lifted and certified once and its shell A1 run once.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -50,15 +95,17 @@ use peacemaker_ir::codec::gfx12;
 use peacemaker_ir::effects::Control;
 use peacemaker_ir::inst::{Abi, Arch, Frontend, Kernel, Program};
 use peacemaker_ir::kernarg::{KernargFacts, KernelStatus};
-use peacemaker_ir::passes::kernargs;
+use peacemaker_ir::passes::kernargs::{self, A1Budget};
 use peacemaker_ir::reg::Kind;
+use peacemaker_ir::state::Lifted;
 use peacemaker_lift::regions_note::{read_regions, KernelRegions, Region};
-use peacemaker_lift::rewrite::region::{lift_region, RegionInputs};
+use peacemaker_lift::rewrite::region::{lift_region_in, RegionInputs};
 use peacemaker_lift::{lift_object, Options};
 use railgun_corpus::receipt::{
     ArenaPointerRecord, ArenaTemplateRecord, DescriptorArenaRecord, HiddenGridRecord,
-    SealedTableRecord, TaskProtocolRecord, SEALED_BOUND_KERNARG, STATUS_CONDITIONAL, STATUS_PROVEN,
-    STATUS_UNKNOWN, WITNESS_DESCRIPTOR_ARENA, WITNESS_SEALED_TABLE,
+    SealedTableRecord, TaskProtocolRecord, WgFootprintRecord, SEALED_BOUND_KERNARG,
+    STATUS_CONDITIONAL, STATUS_PROVEN, STATUS_UNKNOWN, WITNESS_DESCRIPTOR_ARENA,
+    WITNESS_SEALED_TABLE,
 };
 use sha2::{Digest, Sha256};
 
@@ -72,6 +119,37 @@ pub mod protocol;
 /// The standalone-object resolver of [`certify_pool`]: the object whose SHA-256
 /// is the argument, if the caller has it.
 pub type Standalone<'a> = &'a dyn Fn(&[u8; 32]) -> Option<Vec<u8>>;
+
+/// The work bounds of one [`certify_pool_with`] call (module docs, "Complexity and work
+/// bounds"). A bound that is exceeded refuses with a `task_graph-*-budget` rule naming it and
+/// the measured counts; the kernel then stays `unknown`. A refusal is never an admission:
+/// every proof obligation still has to hold on the work that was not cut short, and a
+/// refused analysis contributes no fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolBudget {
+    /// Regions one pool kernel's note may list (`task_graph-size-budget`).
+    pub max_regions: usize,
+    /// Instructions of one analysed kernel: the pool kernel, or a hosted standalone body
+    /// (`task_graph-size-budget`).
+    pub max_kernel_insts: usize,
+    /// Every A1 analysis the certificate runs on a body, a region cut or the dispatcher
+    /// shell (`task_graph-a1-budget`; the standalone footprint analysis reports it as
+    /// evidence and withholds the footprints).
+    pub a1: A1Budget,
+    /// The protocol dataflow (`task_graph-protocol-budget`).
+    pub protocol: protocol::Budget,
+}
+
+impl Default for PoolBudget {
+    fn default() -> Self {
+        PoolBudget {
+            max_regions: 64,
+            max_kernel_insts: 1 << 16,
+            a1: A1Budget::default(),
+            protocol: protocol::Budget::default(),
+        }
+    }
+}
 
 /// Obligation names a conditional pool record adds to the receipt.
 pub const OBLIGATION_ARENA: &str = "DescriptorArenaWitness";
@@ -489,8 +567,31 @@ fn region_kernel(kernel: &Kernel, p: &Placed) -> Result<Kernel, String> {
     })
 }
 
+/// The `task_graph-a1-budget` refusal when an A1 analysis (`what`) stopped at its work bound:
+/// `unresolved` are its `(rule, detail)` reasons.
+fn a1_budget<'a>(
+    what: &str,
+    mut unresolved: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Option<Refusal> {
+    unresolved
+        .find(|(rule, _)| *rule == kernargs::RULE_FIXPOINT_BUDGET)
+        .map(|(rule, detail)| {
+            refuse(
+                "task_graph-a1-budget",
+                format!(
+                    "{what} ran past its work bound ({rule}: {detail}); the kernel stays unknown"
+                ),
+            )
+        })
+}
+
 /// Region-scoped A1: the region's own instructions, `s[0:1]` the record base.
-fn region_scoped(kernel: &Kernel, arch: Arch, p: &Placed) -> Result<KernargFacts, Refusal> {
+fn region_scoped(
+    kernel: &Kernel,
+    arch: Arch,
+    p: &Placed,
+    budget: &PoolBudget,
+) -> Result<KernargFacts, Refusal> {
     let t = p.region.template_id;
     let sub = region_kernel(kernel, p).map_err(|e| {
         refuse(
@@ -498,8 +599,14 @@ fn region_scoped(kernel: &Kernel, arch: Arch, p: &Placed) -> Result<KernargFacts
             format!("template {t}: region cannot be cut out: {e}"),
         )
     })?;
-    let facts = kernargs::analyze(&sub, arch);
+    let facts = kernargs::analyze_budgeted(&sub, arch, &budget.a1);
     if facts.status != KernelStatus::Proven {
+        if let Some(r) = a1_budget(
+            &format!("template {t}: region-scoped A1"),
+            facts.unresolved.iter().map(|u| (u.rule, u.detail.as_str())),
+        ) {
+            return Err(r);
+        }
         let why: Vec<String> = facts
             .unresolved
             .iter()
@@ -518,14 +625,107 @@ fn region_scoped(kernel: &Kernel, arch: Arch, p: &Placed) -> Result<KernargFacts
     Ok(facts)
 }
 
-/// Per-process cache of certified standalone objects (several regions may share one).
-struct Sources<'a> {
-    lookup: Standalone<'a>,
-    certified: HashMap<[u8; 32], Result<Receipt, String>>,
+/// What one standalone kernel's receipt record and A1 facts are, derived once.
+struct BodyCert {
+    record: KernelRecord,
+    /// A1 as `kernargs::analyze` returned it (the key of the workgroup-footprint analysis).
+    raw: KernargFacts,
 }
 
-impl Sources<'_> {
-    fn bytes_of(&self, digest: &[u8; 32]) -> Result<Vec<u8>, Refusal> {
+/// One standalone object of a pool certification: looked up and hashed once, lifted once,
+/// and each kernel it hosts analysed once, however many regions (templates) name it. Every
+/// cached value is a function of the object's bytes (the map key is their SHA-256, checked
+/// when the entry is made), the kernel symbol, the region's block size (footprints) and the
+/// work bounds, which are fixed for the lifetime of the [`Sources`] that owns it.
+struct StandaloneObject {
+    sha256_hex: String,
+    lifted: Result<Lifted<Program>, String>,
+    source: String,
+    cert: Option<radiowave::CodeObjectCertification>,
+    bodies: HashMap<String, BodyCert>,
+    footprints: HashMap<(String, u32), (Vec<WgFootprintRecord>, Option<String>)>,
+}
+
+impl StandaloneObject {
+    /// The record and facts of kernel `symbol` (the body half of [`crate::certify_kernel`],
+    /// run at most once per symbol).
+    fn body(&mut self, symbol: &str, a1: &A1Budget) -> Option<&BodyCert> {
+        if !self.bodies.contains_key(symbol) {
+            let lifted = self.lifted.as_ref().ok()?;
+            let index = lifted
+                .program
+                .kernels
+                .iter()
+                .position(|k| k.symbol.0 == symbol)?;
+            let c = crate::certify_kernel(
+                lifted,
+                index,
+                &self.sha256_hex,
+                &self.source,
+                self.cert.as_ref(),
+                crate::KernelDetail::Body,
+                a1,
+            );
+            self.bodies.insert(
+                symbol.to_owned(),
+                BodyCert {
+                    record: c.record,
+                    raw: c.raw,
+                },
+            );
+        }
+        self.bodies.get(symbol)
+    }
+
+    /// The workgroup footprints of kernel `symbol`'s pointer arguments for a region of
+    /// `block` threads (`record_offset` = the standalone kernarg offset = the record
+    /// offset), and why none were computed when the analysis did not apply. A body that
+    /// cannot be re-analysed has none: an absent footprint is never a claim.
+    fn footprints(
+        &mut self,
+        symbol: &str,
+        block: u32,
+        a1: &A1Budget,
+    ) -> (Vec<WgFootprintRecord>, Option<String>) {
+        let key = (symbol.to_owned(), block);
+        if let Some(f) = self.footprints.get(&key) {
+            return f.clone();
+        }
+        let out = (|| {
+            let raw = self.bodies.get(symbol)?.raw.clone();
+            let program = &self.lifted.as_ref().ok()?.program;
+            let kernel = program.kernels.iter().find(|k| k.symbol.0 == symbol)?;
+            Some(crate::wg_footprint_outcome(
+                kernel,
+                program.target.arch,
+                &raw,
+                Some(block),
+                a1,
+            ))
+        })()
+        .unwrap_or_default();
+        self.footprints.insert(key, out.clone());
+        out
+    }
+}
+
+/// The standalone objects of one [`certify_pool_with`] call, by SHA-256.
+struct Sources<'a> {
+    lookup: Standalone<'a>,
+    budget: PoolBudget,
+    objects: HashMap<[u8; 32], Result<StandaloneObject, Refusal>>,
+}
+
+impl<'a> Sources<'a> {
+    fn new(lookup: Standalone<'a>, budget: PoolBudget) -> Self {
+        Sources {
+            lookup,
+            budget,
+            objects: HashMap::new(),
+        }
+    }
+
+    fn load(&self, digest: &[u8; 32]) -> Result<StandaloneObject, Refusal> {
         let bytes = (self.lookup)(digest).ok_or_else(|| {
             refuse(
                 "task_graph-region-source-missing",
@@ -543,20 +743,40 @@ impl Sources<'_> {
                 ),
             ));
         }
-        Ok(bytes)
-    }
-
-    fn receipt(&mut self, digest: &[u8; 32], bytes: &[u8]) -> Result<&Receipt, Refusal> {
-        let entry = self
-            .certified
-            .entry(*digest)
-            .or_insert_with(|| crate::certify(bytes, None).map_err(|e| e.to_string()));
-        entry.as_ref().map_err(|e| {
-            refuse(
-                "task_graph-region-source-certify",
-                format!("standalone {}: {e}", hex32(digest)),
+        let lifted = crate::timing::timed("lift standalone (once per digest)", || {
+            lift_object(
+                &bytes,
+                Options {
+                    frontend: Frontend::Hipcc,
+                },
             )
         })
+        .map_err(|e| e.to_string());
+        let (source, cert) = match &lifted {
+            Ok(l) => radiowave_cert(&bytes, &l.program, None),
+            Err(_) => (String::new(), None),
+        };
+        Ok(StandaloneObject {
+            sha256_hex: hex32(digest),
+            lifted,
+            source,
+            cert,
+            bodies: HashMap::new(),
+            footprints: HashMap::new(),
+        })
+    }
+
+    /// The object with SHA-256 `digest`, loaded on first use.
+    fn object(&mut self, digest: &[u8; 32]) -> Result<&mut StandaloneObject, Refusal> {
+        if !self.objects.contains_key(digest) {
+            let loaded = self.load(digest);
+            self.objects.insert(*digest, loaded);
+        }
+        match self.objects.get_mut(digest) {
+            Some(Ok(o)) => Ok(o),
+            Some(Err(r)) => Err(r.clone()),
+            None => unreachable!("inserted above"),
+        }
     }
 }
 
@@ -576,24 +796,39 @@ fn derive_lifted(
 ) -> Result<RegionFacts, Refusal> {
     let r = &p.region;
     let t = r.template_id;
-    let bytes = sources.bytes_of(&r.digest)?;
-    let lifted = lift_region(
-        &bytes,
-        &r.source_symbol,
-        &RegionInputs {
-            prefix: r.prefix.clone(),
-            workgroup_x: r.wg_x,
-            workgroup_yz: r.wg_yz,
-            block: r.block,
-            dynamic_lds: r.dynamic_lds,
-        },
-    )
-    .map_err(|e| {
-        refuse(
-            "task_graph-region-lift",
-            format!("template {t}: {}", e.reason),
-        )
-    })?;
+    let budget = sources.budget;
+    let object = crate::timing::timed("read + sha256 standalone", || sources.object(&r.digest))?;
+    let lifted = {
+        let program = match &object.lifted {
+            Ok(l) => &l.program,
+            Err(e) => {
+                return Err(refuse(
+                    "task_graph-region-lift",
+                    format!("template {t}: lift: {e}"),
+                ))
+            }
+        };
+        crate::timing::timed("lift_region (convert)", || {
+            lift_region_in(
+                program,
+                r.digest,
+                &r.source_symbol,
+                &RegionInputs {
+                    prefix: r.prefix.clone(),
+                    workgroup_x: r.wg_x,
+                    workgroup_yz: r.wg_yz,
+                    block: r.block,
+                    dynamic_lds: r.dynamic_lds,
+                },
+            )
+        })
+        .map_err(|e| {
+            refuse(
+                "task_graph-region-lift",
+                format!("template {t}: {}", e.reason),
+            )
+        })?
+    };
     if lifted.receipt.waves != pool_waves {
         return Err(refuse(
             "task_graph-region-geometry",
@@ -614,7 +849,10 @@ fn derive_lifted(
             ));
         }
     }
-    let words = region_words(&lifted.lines, arch).map_err(|e| {
+    let words = crate::timing::timed("region_words (assemble)", || {
+        region_words(&lifted.lines, arch)
+    })
+    .map_err(|e| {
         refuse(
             "task_graph-region-lift",
             format!("template {t}: assemble: {e}"),
@@ -648,22 +886,32 @@ fn derive_lifted(
             ),
         ));
     }
-    // item 2: the standalone body's own A1 record
-    let receipt = sources.receipt(&r.digest, &bytes)?;
-    let record = receipt
-        .railgun
-        .kernels
-        .iter()
-        .find(|k| k.symbol == r.source_symbol)
-        .ok_or_else(|| {
-            refuse(
-                "task_graph-region-arena",
-                format!(
-                    "template {t}: {} is not in the standalone receipt",
-                    r.source_symbol
-                ),
-            )
-        })?;
+    // item 2: the standalone body's own A1 record (its size is bounded by the pool
+    // kernel's: the body's words are the region's, compared equal above)
+    let record = crate::timing::timed("standalone body A1 record (once per kernel)", || {
+        object
+            .body(&r.source_symbol, &budget.a1)
+            .map(|b| b.record.clone())
+    })
+    .ok_or_else(|| {
+        refuse(
+            "task_graph-region-arena",
+            format!(
+                "template {t}: {} is not in the standalone object",
+                r.source_symbol
+            ),
+        )
+    })?;
+    let record = &record;
+    if let Some(refusal) = a1_budget(
+        &format!("template {t}: the standalone body {}'s A1", r.source_symbol),
+        record
+            .unresolved
+            .iter()
+            .map(|u| (u.rule.as_str(), u.detail.as_str())),
+    ) {
+        return Err(refusal);
+    }
     let (loads, sealed_tables) = template_from_standalone(t, record)?;
     if record.dynamic_kernarg_reads
         || record.taint_overflow
@@ -680,7 +928,9 @@ fn derive_lifted(
     // The same facts from the pool's own bytes (region-scoped A1) are reported, not
     // required: the bytes are proven identical to the standalone body, whose own
     // proven A1 record is the source of the template.
-    let cross = match region_scoped(kernel, arch, p) {
+    let cross = match crate::timing::timed("region-scoped A1 cross-check", || {
+        region_scoped(kernel, arch, p, &budget)
+    }) {
         Ok(s) if pointer_loads(&s) == loads => "agrees".to_owned(),
         Ok(s) => format!("differs ({:?})", pointer_loads(&s)),
         Err(r) => format!("not analysable ({})", r.rule),
@@ -731,12 +981,22 @@ fn derive_lifted(
                 .join(", ")
         )
     };
+    let (wg_footprints, wg_why) =
+        crate::timing::timed("standalone footprints (once per kernel and block)", || {
+            object.footprints(&r.source_symbol, r.block, &budget.a1)
+        });
+    let wg_note = match wg_why {
+        Some(why) if why.contains(kernargs::RULE_FIXPOINT_BUDGET) => {
+            format!("; workgroup footprints not computed ({why})")
+        }
+        _ => String::new(),
+    };
     Ok(RegionFacts {
         template: ArenaTemplateRecord {
             template: t,
             pointer_loads: loads,
             sealed_tables,
-            wg_footprints: standalone_footprints(&bytes, &r.source_symbol, r.block),
+            wg_footprints,
             hidden_grid: hidden_grid_from_standalone(record),
         },
         lds_bytes: lifted.lds_bytes,
@@ -749,7 +1009,8 @@ fn derive_lifted(
             r.exit_pc,
             record.kernarg_size,
             hidden.join(", ")
-        ) + &sealed_note,
+        ) + &sealed_note
+            + &wg_note,
     })
 }
 
@@ -898,9 +1159,16 @@ fn template_from_standalone(
     Ok((loads, sealed))
 }
 
-fn derive_native(kernel: &Kernel, arch: Arch, p: &Placed) -> Result<RegionFacts, Refusal> {
+fn derive_native(
+    kernel: &Kernel,
+    arch: Arch,
+    p: &Placed,
+    budget: &PoolBudget,
+) -> Result<RegionFacts, Refusal> {
     let t = p.region.template_id;
-    let scoped = region_scoped(kernel, arch, p)?;
+    let scoped = crate::timing::timed("region-scoped A1", || {
+        region_scoped(kernel, arch, p, budget)
+    })?;
     let loads = pointer_loads(&scoped);
     if loads.is_empty() {
         return Err(refuse(
@@ -931,7 +1199,8 @@ fn derive_native(kernel: &Kernel, arch: Arch, p: &Placed) -> Result<RegionFacts,
 // one pool kernel
 // ---------------------------------------------------------------------------
 
-/// Run every obligation for one tagged kernel; all refusals are returned.
+/// Run every obligation for one tagged kernel under the default [`PoolBudget`]; all refusals
+/// are returned.
 pub fn prove_pool(
     program: &Program,
     kernel_index: usize,
@@ -940,6 +1209,50 @@ pub fn prove_pool(
     standalone: Standalone<'_>,
     partial: &mut Option<PoolProof>,
 ) -> Result<PoolProof, Vec<Refusal>> {
+    prove_pool_budgeted(
+        program,
+        kernel_index,
+        pool_elf,
+        notes,
+        standalone,
+        &PoolBudget::default(),
+        partial,
+    )
+}
+
+/// [`prove_pool`] under an explicit [`PoolBudget`].
+pub fn prove_pool_budgeted(
+    program: &Program,
+    kernel_index: usize,
+    pool_elf: &[u8],
+    notes: &KernelRegions,
+    standalone: Standalone<'_>,
+    budget: &PoolBudget,
+    partial: &mut Option<PoolProof>,
+) -> Result<PoolProof, Vec<Refusal>> {
+    let mut sources = Sources::new(standalone, *budget);
+    prove_pool_in(
+        program,
+        kernel_index,
+        pool_elf,
+        notes,
+        &mut sources,
+        partial,
+    )
+    .map(|(p, _)| p)
+}
+
+/// [`prove_pool`] over the standalone objects `sources` already holds, also returning the
+/// dispatcher shell's A1 facts (the record of a proven pool is built from them).
+fn prove_pool_in(
+    program: &Program,
+    kernel_index: usize,
+    pool_elf: &[u8],
+    notes: &KernelRegions,
+    sources: &mut Sources<'_>,
+    partial: &mut Option<PoolProof>,
+) -> Result<(PoolProof, KernargFacts), Vec<Refusal>> {
+    let budget = sources.budget;
     let kernel = &program.kernels[kernel_index];
     let arch = program.target.arch;
     let mut refusals = Vec::new();
@@ -965,6 +1278,26 @@ pub fn prove_pool(
     }
     let waves = block / 32;
     let rsrc1_modes = descriptor.compute_pgm_rsrc1.0 & !(0x3f | (0xf << 6));
+    if notes.regions.len() > budget.max_regions {
+        return Err(vec![refuse(
+            "task_graph-size-budget",
+            format!(
+                "the note lists {} regions, past the bound of {}",
+                notes.regions.len(),
+                budget.max_regions
+            ),
+        )]);
+    }
+    if kernel.body.layout.len() > budget.max_kernel_insts {
+        return Err(vec![refuse(
+            "task_graph-size-budget",
+            format!(
+                "the pool kernel has {} instructions, past the bound of {}",
+                kernel.body.layout.len(),
+                budget.max_kernel_insts
+            ),
+        )]);
+    }
     let placed = match place_regions(kernel, notes) {
         Ok(p) => p,
         Err(r) => return Err(vec![r]),
@@ -974,34 +1307,33 @@ pub fn prove_pool(
         Err(e) => return Err(vec![refuse("task_graph-note", e)]),
     };
     // 1+2: regions
-    let mut sources = Sources {
-        lookup: standalone,
-        certified: HashMap::new(),
-    };
     let mut facts = Vec::new();
     for p in &placed {
-        let before = refusals.len();
-        refusals.extend(check_region_structure(kernel, arch, p));
-        if refusals.len() != before {
-            continue;
-        }
-        let result = if p.region.is_native() {
-            derive_native(kernel, arch, p)
-        } else {
-            derive_lifted(
-                kernel,
-                arch,
-                text,
-                waves,
-                Some(rsrc1_modes),
-                p,
-                &mut sources,
-            )
-        };
-        match result {
-            Ok(f) => facts.push(f),
-            Err(r) => refusals.push(r),
-        }
+        let label = format!("region t{} {}", p.region.template_id, {
+            if p.region.is_native() {
+                "(native)"
+            } else {
+                p.region.source_symbol.as_str()
+            }
+        });
+        crate::timing::timed(&label, || {
+            let before = refusals.len();
+            refusals.extend(crate::timing::timed("check_region_structure", || {
+                check_region_structure(kernel, arch, p)
+            }));
+            if refusals.len() != before {
+                return;
+            }
+            let result = if p.region.is_native() {
+                derive_native(kernel, arch, p, &budget)
+            } else {
+                derive_lifted(kernel, arch, text, waves, Some(rsrc1_modes), p, sources)
+            };
+            match result {
+                Ok(f) => facts.push(f),
+                Err(r) => refusals.push(r),
+            }
+        });
     }
     // 3: the dispatcher shell
     let base = text_base(kernel);
@@ -1014,8 +1346,18 @@ pub fn prove_pool(
             )
         })
         .collect();
-    let shell = kernargs::analyze_excluding(kernel, arch, &ranges);
+    let shell = crate::timing::timed("shell A1 (analyze_excluding)", || {
+        kernargs::analyze_excluding_budgeted(kernel, arch, &ranges, &budget.a1)
+    });
     if shell.status != KernelStatus::Proven {
+        if let Some(r) = a1_budget(
+            "the dispatcher shell's A1",
+            shell.unresolved.iter().map(|u| (u.rule, u.detail.as_str())),
+        ) {
+            // the protocol check reads the shell's facts: there are none to read
+            refusals.push(r);
+            return Err(refusals);
+        }
         refusals.push(refuse(
             "task_graph-shell-unresolved",
             format!(
@@ -1032,7 +1374,18 @@ pub fn prove_pool(
         ));
     }
     // 4: the protocol (also derives which pointer argument plays which role)
-    let proto = match protocol::check(kernel, arch, notes, &placed, waves, &shell, &facts) {
+    let proto = match crate::timing::timed("protocol::check", || {
+        protocol::check(
+            kernel,
+            arch,
+            notes,
+            &placed,
+            waves,
+            &shell,
+            &facts,
+            &budget.protocol,
+        )
+    }) {
         Ok(p) => p,
         Err(rs) => {
             refusals.extend(rs);
@@ -1087,7 +1440,7 @@ pub fn prove_pool(
         });
     }
     if refusals.is_empty() {
-        Ok(proof)
+        Ok((proof, shell))
     } else {
         *partial = Some(proof);
         Err(refusals)
@@ -1185,24 +1538,42 @@ fn check_shell_args(
 /// descriptor arena and task protocol when all four obligations (module docs)
 /// are proven from the bytes; otherwise its A1 record is unchanged and gains
 /// one `task_graph-*` unresolved rule per failed obligation. `standalone`
-/// resolves a region's source object by its SHA-256.
+/// resolves a region's source object by its SHA-256. Runs under the default
+/// [`PoolBudget`].
 pub fn certify_pool(pool_elf: &[u8], standalone: Standalone<'_>) -> Result<Receipt, CertError> {
-    let mut receipt = crate::certify(pool_elf, None)?;
+    certify_pool_with(pool_elf, standalone, &PoolBudget::default())
+}
+
+/// [`certify_pool`] under an explicit [`PoolBudget`]: a work bound that is exceeded refuses
+/// (the kernel stays `unknown`, the refusal names the bound and the measured counts) and
+/// never admits anything.
+pub fn certify_pool_with(
+    pool_elf: &[u8],
+    standalone: Standalone<'_>,
+    budget: &PoolBudget,
+) -> Result<Receipt, CertError> {
+    let lifted = crate::timing::timed("lift_object (pool)", || {
+        lift_object(
+            pool_elf,
+            Options {
+                frontend: Frontend::Hipcc,
+            },
+        )
+    })
+    .map_err(|e| CertError::Lift(e.to_string()))?;
+    let mut receipt = crate::timing::timed("certify (whole pool object)", || {
+        crate::certify_lifted(pool_elf, &lifted, None)
+    });
     let notes =
         read_regions(pool_elf).map_err(|e| CertError::Lift(format!("regions note: {e}")))?;
     if notes.is_empty() {
         return Ok(receipt);
     }
-    let lifted = lift_object(
-        pool_elf,
-        Options {
-            frontend: Frontend::Hipcc,
-        },
-    )
-    .map_err(|e| CertError::Lift(e.to_string()))?;
     let program = &lifted.program;
-    let arch = program.target.arch;
     let (source, cert) = radiowave_cert(pool_elf, program, None);
+    // one standalone cache for every tagged kernel of the object: an object that hosts
+    // several templates is lifted and analysed once
+    let mut sources = Sources::new(standalone, *budget);
     let mut details = Vec::new();
     for note in &notes {
         let Some(index) = program
@@ -1224,21 +1595,11 @@ pub fn certify_pool(pool_elf: &[u8], standalone: Standalone<'_>) -> Result<Recei
             return Err(CertError::Lift(format!("{}: no record", note.kernel)));
         };
         let mut partial = None;
-        match prove_pool(program, index, pool_elf, note, standalone, &mut partial) {
-            Ok(proof) => {
+        match crate::timing::timed("prove_pool", || {
+            prove_pool_in(program, index, pool_elf, note, &mut sources, &mut partial)
+        }) {
+            Ok((proof, shell)) => {
                 let kernel = &program.kernels[index];
-                let shell = kernargs::analyze_excluding(
-                    kernel,
-                    arch,
-                    &note
-                        .regions
-                        .iter()
-                        .map(|r| {
-                            let base = text_base(kernel);
-                            (r.entry_pc as u32 + base, r.exit_pc as u32 + base)
-                        })
-                        .collect::<Vec<_>>(),
-                );
                 let meta = metadata_effects(&source, cert.as_ref(), &kernel.symbol.0);
                 let old = &receipt.railgun.kernels[slot];
                 let mut record: KernelRecord = kernel_record(kernel, &shell, &meta);
@@ -1361,10 +1722,12 @@ fn collect_objects(dir: &std::path::Path, out: &mut BTreeMap<[u8; 32], std::path
     }
 }
 
-/// `railgun-cert pool [--out DIR] [--standalone DIR]... POOL.co...` writes the
+/// `railgun-cert pool [--out DIR] [--standalone DIR]... [--timings] POOL.co...` writes the
 /// [`certify_pool`] receipt of each pool object to
 /// `DIR/receipts/<arch>/<object_sha256>.receipt.json` (standalone objects are
-/// found by SHA-256 anywhere under the `--standalone` directories);
+/// found by SHA-256 anywhere under the `--standalone` directories; `--timings`
+/// prints the per-phase wall times of each pool object to stderr, see
+/// [`crate::timing`]);
 /// `railgun-cert pool-dump POOL.co` prints each tagged kernel's region table and
 /// the canonical text of its lifted instructions.
 pub fn cli(command: &str, args: &[String]) -> Result<(), String> {
@@ -1375,6 +1738,7 @@ pub fn cli(command: &str, args: &[String]) -> Result<(), String> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--out" => out = it.next().ok_or("--out needs a value")?.into(),
+            "--timings" => crate::timing::enable(),
             "--standalone" => dirs.push(std::path::PathBuf::from(
                 it.next().ok_or("--standalone needs a value")?,
             )),
@@ -1390,8 +1754,17 @@ pub fn cli(command: &str, args: &[String]) -> Result<(), String> {
             let lookup = |digest: &[u8; 32]| index.get(digest).and_then(|p| std::fs::read(p).ok());
             for path in objects {
                 let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-                let receipt = certify_pool(&bytes, &lookup)
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                let started = std::time::Instant::now();
+                let result = crate::timing::timed("certify_pool", || certify_pool(&bytes, &lookup));
+                if crate::timing::enabled() {
+                    eprintln!(
+                        "timings {} ({:.2} s wall)\n{}",
+                        path.display(),
+                        started.elapsed().as_secs_f64(),
+                        crate::timing::take_report()
+                    );
+                }
+                let receipt = result.map_err(|e| format!("{}: {e}", path.display()))?;
                 let dir = out.join("receipts").join(&receipt.arch);
                 std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
                 let file = dir.join(format!("{}.receipt.json", receipt.object_sha256));
@@ -1662,37 +2035,4 @@ mod sealed_tests {
         pool.case_digest = case_digest("obj", "elf", "gfx1201", &pool);
         pool.validate_case("obj", "elf", "gfx1201").expect("valid");
     }
-}
-
-/// The workgroup footprints of a standalone body's pointer arguments for a region of
-/// `block` threads (`record_offset` = the standalone kernarg offset = the record offset).
-/// A body that cannot be re-analysed has none: an absent footprint is never a claim.
-fn standalone_footprints(
-    object: &[u8],
-    symbol: &str,
-    block: u32,
-) -> Vec<railgun_corpus::receipt::WgFootprintRecord> {
-    let Ok(lifted) = lift_object(
-        object,
-        Options {
-            frontend: Frontend::Hipcc,
-        },
-    ) else {
-        return Vec::new();
-    };
-    let Some(index) = lifted
-        .program
-        .kernels
-        .iter()
-        .position(|k| k.symbol.0 == symbol)
-    else {
-        return Vec::new();
-    };
-    let (facts, _, _) = crate::kernel_facts(&lifted.program, index);
-    crate::wg_footprint_records(
-        &lifted.program.kernels[index],
-        lifted.program.target.arch,
-        &facts,
-        Some(block),
-    )
 }

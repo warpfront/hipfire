@@ -186,7 +186,18 @@ pub fn lift_region(
         symbol: symbol.into(),
         reason: format!("lift: {e}"),
     })?;
-    let program = lifted.program;
+    lift_region_in(&lifted.program, sha256(object), symbol, inputs)
+}
+
+/// [`lift_region`] for an object already lifted: `program` is the Hipcc-frontend lift of
+/// the object whose SHA-256 is `object_sha256` (the digest the receipt records). Callers
+/// converting several kernels of one object lift it once.
+pub fn lift_region_in(
+    program: &peacemaker_ir::inst::Program,
+    object_sha256: [u8; 32],
+    symbol: &str,
+    inputs: &RegionInputs,
+) -> Result<LiftedRegion, RegionError> {
     let arch = program.target.arch;
     if arch != Arch::Gfx1201 {
         return refuse(symbol, format!("{arch:?}: regions are gfx1201 only"));
@@ -199,7 +210,7 @@ pub fn lift_region(
             symbol: symbol.into(),
             reason: "no such kernel in the object".into(),
         })?;
-    convert(kernel, arch, sha256(object), inputs)
+    convert(kernel, arch, object_sha256, inputs)
 }
 
 fn convert(

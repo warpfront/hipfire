@@ -45,4 +45,5 @@ sets the template id and the lift provenance) and links with
 `native::assemble_with_regions`, so the objects carry the region note.
 
 Inspect an object with `railgun-cert pool-dump POOL.co`; certify one with
-`railgun-cert pool --standalone standalone POOL.co`.
+`railgun-cert pool --standalone standalone POOL.co` (add `--timings` for the per-phase
+wall times and work counters; release builds certify each fixture pool in 0.2 to 2.6 s).

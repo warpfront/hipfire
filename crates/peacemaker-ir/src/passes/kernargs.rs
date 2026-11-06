@@ -61,6 +61,18 @@
 //! base argument. Every other unresolved base keeps its refusal, and the
 //! unguarded [`analyze`] is unchanged. A `Conditional` result is void
 //! without bind witnesses for each guard and indexed effect.
+//!
+//! Complexity and work bound. The forward dataflow is a worklist over blocks: each popped
+//! block replays its instructions and clones/joins the state into every successor, so the
+//! cost is the sum over pops of `block length + 1`. No termination argument is relied on:
+//! that sum is capped at [`A1Budget::fixpoint_work_per_inst`] times the kernel's instruction
+//! count (default 512; the largest ratio over every kernel of the repository's certifier
+//! fixtures is 63, and the task-graph pools and bodies stay under 22). A
+//! kernel that exceeds it is `Unknown` with the single reason [`RULE_FIXPOINT_BUDGET`] and the
+//! measured counts (no access fact of a half-computed result is reported), for the plain,
+//! excluding, guarded, sealed and workgroup-footprint runs alike; the sealed variant runs the
+//! fixpoint twice, each run under the bound. The sealed-table entry and guard replays keep
+//! their own bounds (`GUARD_PATHS`, `GUARD_STEPS`: rule `sealed-guard-path-budget`).
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -92,6 +104,38 @@ use super::kernarg_ix::{
 /// segment fall back to the overflow flags: an overflowing pointer root is
 /// `Unknown`, an overflowing taint is reported as `taint_overflow`.
 const MAX_DW: u32 = 128;
+
+/// Rule of the `Unresolved` an analysis that exceeded its [`A1Budget`] reports.
+pub const RULE_FIXPOINT_BUDGET: &str = "a1-fixpoint-budget";
+
+/// Work bound of one A1 analysis (see "Complexity" in the module docs). An analysis that
+/// exceeds it stops at once and returns `Unknown` carrying [`RULE_FIXPOINT_BUDGET`] with the
+/// measured counts: a refusal, never a partial result, so exceeding the bound admits
+/// nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct A1Budget {
+    /// Work of one dataflow fixpoint run, per instruction of the kernel: every block visit
+    /// costs the block's instruction count (each is replayed through the transfer function)
+    /// plus one (the state joined into each successor).
+    pub fixpoint_work_per_inst: u32,
+}
+
+impl Default for A1Budget {
+    fn default() -> Self {
+        A1Budget {
+            fixpoint_work_per_inst: 512,
+        }
+    }
+}
+
+/// A fixpoint that ran past its bound.
+struct FixpointOverrun {
+    work: u64,
+    limit: u64,
+    visits: u64,
+    blocks: usize,
+    insts: usize,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 struct DwSet(u128);
@@ -1287,7 +1331,12 @@ struct Analyzer<'k> {
 /// an instruction the pass does not model, yields `KernelStatus::Unknown`
 /// with the reason in `unresolved`.
 pub fn analyze(kernel: &Kernel, arch: Arch) -> KernargFacts {
-    analyze_impl(kernel, arch, None, false, &[])
+    analyze_budgeted(kernel, arch, &A1Budget::default())
+}
+
+/// [`analyze`] under an explicit work bound.
+pub fn analyze_budgeted(kernel: &Kernel, arch: Arch, budget: &A1Budget) -> KernargFacts {
+    analyze_impl(kernel, arch, None, false, &[], budget)
 }
 
 /// The unguarded analysis with the instructions whose lifted byte offset
@@ -1302,7 +1351,17 @@ pub fn analyze(kernel: &Kernel, arch: Arch) -> KernargFacts {
 /// read of their argument block. An instruction without a recorded offset is
 /// never excluded.
 pub fn analyze_excluding(kernel: &Kernel, arch: Arch, excluded: &[(u32, u32)]) -> KernargFacts {
-    analyze_impl(kernel, arch, None, false, excluded)
+    analyze_excluding_budgeted(kernel, arch, excluded, &A1Budget::default())
+}
+
+/// [`analyze_excluding`] under an explicit work bound.
+pub fn analyze_excluding_budgeted(
+    kernel: &Kernel,
+    arch: Arch,
+    excluded: &[(u32, u32)],
+    budget: &A1Budget,
+) -> KernargFacts {
+    analyze_impl(kernel, arch, None, false, excluded, budget)
 }
 
 /// The guarded analysis of amendment 2026-10-25 §A9.1/§A9.3: the same pass
@@ -1318,7 +1377,17 @@ pub fn analyze_excluding(kernel: &Kernel, arch: Arch, excluded: &[(u32, u32)]) -
 /// (guards cleared), `Unknown` otherwise. The unguarded [`analyze`] result is
 /// unaffected and stays the diagnostic baseline.
 pub fn analyze_guarded(kernel: &Kernel, arch: Arch, guards: &[Guard]) -> KernargFacts {
-    analyze_impl(kernel, arch, Some(guards), false, &[])
+    analyze_guarded_budgeted(kernel, arch, guards, &A1Budget::default())
+}
+
+/// [`analyze_guarded`] under an explicit work bound.
+pub fn analyze_guarded_budgeted(
+    kernel: &Kernel,
+    arch: Arch,
+    guards: &[Guard],
+    budget: &A1Budget,
+) -> KernargFacts {
+    analyze_impl(kernel, arch, Some(guards), false, &[], budget)
 }
 
 /// The sealed-table analysis (design: `SealedTable` certificate). The same
@@ -1345,7 +1414,12 @@ pub fn analyze_guarded(kernel: &Kernel, arch: Arch, guards: &[Guard]) -> Kernarg
 /// `sealed-*` rules. The result is void without a matching `sealed_table`
 /// runtime witness.
 pub fn analyze_sealed(kernel: &Kernel, arch: Arch) -> KernargFacts {
-    analyze_impl(kernel, arch, None, true, &[])
+    analyze_sealed_budgeted(kernel, arch, &A1Budget::default())
+}
+
+/// [`analyze_sealed`] under an explicit work bound.
+pub fn analyze_sealed_budgeted(kernel: &Kernel, arch: Arch, budget: &A1Budget) -> KernargFacts {
+    analyze_impl(kernel, arch, None, true, &[], budget)
 }
 
 fn analyze_impl(
@@ -1354,8 +1428,9 @@ fn analyze_impl(
     guards: Option<&[Guard]>,
     sealed: bool,
     excluded: &[(u32, u32)],
+    budget: &A1Budget,
 ) -> KernargFacts {
-    analyze_core(kernel, arch, guards, sealed, excluded, false).0
+    analyze_core(kernel, arch, guards, sealed, excluded, false, budget).0
 }
 
 /// The unguarded analysis (`sealed` = [`analyze_sealed`]) together with the
@@ -1365,8 +1440,9 @@ pub(super) fn analyze_for_wg(
     kernel: &Kernel,
     arch: Arch,
     sealed: bool,
+    budget: &A1Budget,
 ) -> (KernargFacts, Option<WgInput>) {
-    analyze_core(kernel, arch, None, sealed, &[], true)
+    analyze_core(kernel, arch, None, sealed, &[], true, budget)
 }
 
 /// One write access attributed to an argument and its exact address witness.
@@ -1396,6 +1472,7 @@ fn analyze_core(
     sealed: bool,
     excluded: &[(u32, u32)],
     wg: bool,
+    budget: &A1Budget,
 ) -> (KernargFacts, Option<WgInput>) {
     let (args, size) = match &kernel.abi {
         Abi::Hsa {
@@ -1528,7 +1605,13 @@ fn analyze_core(
         flags: sealed || wg,
         wgf: wg,
     };
-    let ins = an.fixpoint();
+    let ins = match an.fixpoint(budget) {
+        Ok(ins) => ins,
+        Err(over) => {
+            facts.unresolved.append(&mut rec.unresolved);
+            return (overrun_facts(facts, &mut an.layout, &over), None);
+        }
+    };
     an.record(&ins, &mut rec);
     let mut rejected: Vec<Unresolved> = Vec::new();
     let mut sealed_uses: Vec<SealedTableUse> = Vec::new();
@@ -1545,7 +1628,13 @@ fn analyze_core(
             }
             // Second run: the qualified entry loads now carry their table
             // provenance, so every access through them is attributed.
-            let ins = an.fixpoint();
+            let ins = match an.fixpoint(budget) {
+                Ok(ins) => ins,
+                Err(over) => {
+                    facts.unresolved.append(&mut rejected);
+                    return (overrun_facts(facts, &mut an.layout, &over), None);
+                }
+            };
             rec = Rec::new(entry_loaded);
             an.record(&ins, &mut rec);
             sealed_uses = an.assemble_sealed(&rec);
@@ -1569,6 +1658,36 @@ fn analyze_core(
         finish(facts, &layout, Some(rec), &supplied, sealed_uses),
         Some(wg),
     )
+}
+
+/// The result of an analysis stopped by its work bound: `Unknown`, with the measured counts
+/// as the only reason (no access facts of a half-computed fixpoint are ever reported).
+fn overrun_facts(
+    mut facts: KernargFacts,
+    layout: &mut Layout,
+    over: &FixpointOverrun,
+) -> KernargFacts {
+    facts.unresolved.push(Unresolved {
+        inst: None,
+        rule: RULE_FIXPOINT_BUDGET,
+        detail: format!(
+            "the dataflow fixpoint did {} units of work ({} block visits over {} blocks, {} instructions), past its bound of {} ({} per instruction)",
+            over.work,
+            over.visits,
+            over.blocks,
+            over.insts,
+            over.limit,
+            over.limit / over.insts.max(1) as u64
+        ),
+    });
+    let layout = std::mem::replace(
+        layout,
+        Layout {
+            args: Vec::new(),
+            size: 0,
+        },
+    );
+    finish(facts, &layout, None, &[], Vec::new())
 }
 
 fn cyclic_blocks(body: &Body) -> Vec<bool> {
@@ -1761,14 +1880,33 @@ enum ExecPlan {
 }
 
 impl<'k> Analyzer<'k> {
-    fn fixpoint(&self) -> Vec<Option<State>> {
+    /// The forward dataflow to a fixpoint: a worklist of blocks, each popped block replays
+    /// its instructions and joins its out-state into its successors. A pop costs the block's
+    /// instruction count plus one; the sum may not pass `budget.fixpoint_work_per_inst`
+    /// times the kernel's instruction count, else [`FixpointOverrun`].
+    fn fixpoint(&self, budget: &A1Budget) -> Result<Vec<Option<State>>, FixpointOverrun> {
         let n = self.body.blocks.len();
         let mut ins: Vec<Option<State>> = vec![None; n];
         ins[0] = Some(self.entry.clone());
         let mut work: Vec<usize> = vec![0];
         let mut queued = vec![false; n];
         queued[0] = true;
+        let insts = self.body.layout.len();
+        let limit = u64::from(budget.fixpoint_work_per_inst) * insts.max(1) as u64;
+        let (mut spent, mut visits) = (0u64, 0u64);
         while let Some(b) = work.pop() {
+            visits += 1;
+            let range = self.body.blocks[b].range;
+            spent += (range.1 - range.0) as u64 + 1;
+            if spent > limit {
+                return Err(FixpointOverrun {
+                    work: spent,
+                    limit,
+                    visits,
+                    blocks: n,
+                    insts,
+                });
+            }
             queued[b] = false;
             let Some(mut st) = ins[b].clone() else {
                 continue;
@@ -1797,7 +1935,7 @@ impl<'k> Analyzer<'k> {
                 }
             }
         }
-        ins
+        Ok(ins)
     }
 
     /// Workgroup-footprint analysis: the state flowing along the branch edge
@@ -5600,6 +5738,90 @@ mod tests {
         );
         assert_eq!(f.arg_at(20).unwrap().role, ArgRole::NotLoaded);
         assert!(f.arg_at(0).unwrap().sinks.has(Sinks::ADDRESS_BASE));
+    }
+
+    /// The loop kernel of the test above, built as a [`Kernel`] for the budgeted entry points.
+    fn loop_kernel() -> Kernel {
+        kernel(
+            &[
+                0xf4000080, 0xf8000010, 0xf4002100, 0xf8000000, 0xf4000200, 0xf8000008, 0xbfc70000,
+                0xbe830080, 0x81038103, 0xbf0a0203, 0xbfa2fffd, 0x96067508, 0x7e000206, 0x7e020203,
+                0xee068004, 0x00800000, 0x00000000, 0xbfb00000,
+            ],
+            &[
+                ("out", 0, 8, "global_buffer"),
+                ("n", 8, 4, "by_value"),
+                ("bcx", 16, 4, "hidden_block_count_x"),
+                ("bcy", 20, 4, "hidden_block_count_y"),
+                ("bcz", 24, 4, "hidden_block_count_z"),
+                ("gsx", 28, 2, "hidden_group_size_x"),
+            ],
+        )
+    }
+
+    /// A fixpoint that runs past its work bound is `Unknown` with the budget rule and the
+    /// measured counts, reports no access fact of a half-computed result, and does so for
+    /// every entry point (unguarded, excluding, sealed, guarded and the workgroup-footprint
+    /// replay); the default bound proves the same kernel.
+    #[test]
+    fn a_fixpoint_past_its_work_bound_is_unknown_with_the_measured_counts() {
+        let k = loop_kernel();
+        assert_eq!(analyze(&k, Arch::Gfx1201).status, KernelStatus::Proven);
+        for per_inst in [0, 1] {
+            let tight = A1Budget {
+                fixpoint_work_per_inst: per_inst,
+            };
+            let runs = [
+                analyze_budgeted(&k, Arch::Gfx1201, &tight),
+                analyze_excluding_budgeted(&k, Arch::Gfx1201, &[(0, 4)], &tight),
+                analyze_sealed_budgeted(&k, Arch::Gfx1201, &tight),
+                analyze_guarded_budgeted(&k, Arch::Gfx1201, &[], &tight),
+            ];
+            for f in runs {
+                assert_eq!(f.status, KernelStatus::Unknown, "{per_inst}");
+                let rules: Vec<&str> = f.unresolved.iter().map(|u| u.rule).collect();
+                assert_eq!(rules, [RULE_FIXPOINT_BUDGET], "{per_inst}");
+                let detail = &f.unresolved[0].detail;
+                assert!(
+                    detail.contains("units of work")
+                        && detail.contains("block visits")
+                        && detail.contains(&format!("({per_inst} per instruction)")),
+                    "{detail}"
+                );
+                assert!(
+                    f.args.iter().all(|a| a.accesses.is_empty() && !a.loaded)
+                        && f.indexed.is_empty()
+                        && f.sealed.is_empty(),
+                    "an overrun reports no fact"
+                );
+            }
+            let wg = crate::passes::wg_footprint::analyze_budgeted(
+                &k,
+                Arch::Gfx1201,
+                false,
+                crate::passes::wg_footprint::WgLaunch { block_x: 32 },
+                &tight,
+            );
+            let why = wg.applicable.expect_err("withheld");
+            assert!(why.contains(RULE_FIXPOINT_BUDGET), "{why}");
+            assert!(wg.args.is_empty());
+        }
+        // the loop settles within a few units per instruction: a bound just above what it
+        // uses admits it, so the bound is the only thing that changed
+        let used = (1..=64)
+            .find(|&n| {
+                analyze_budgeted(
+                    &k,
+                    Arch::Gfx1201,
+                    &A1Budget {
+                        fixpoint_work_per_inst: n,
+                    },
+                )
+                .status
+                    == KernelStatus::Proven
+            })
+            .expect("the loop settles");
+        assert!(used >= 2 && used < 16, "{used}");
     }
 
     #[test]

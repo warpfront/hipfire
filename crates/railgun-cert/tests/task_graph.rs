@@ -1104,3 +1104,290 @@ fn the_max_one_on_the_loop_bound_does_not_change_what_is_proved() {
         expect_wg_withheld(&bytes, symbol, "wg_x register s102", name);
     }
 }
+
+// ---------------------------------------------------------------------------
+// work bounds: a bound that is exceeded refuses (never hangs, never admits)
+// ---------------------------------------------------------------------------
+
+use peacemaker_ir::passes::kernargs::A1Budget;
+use railgun_cert::task_graph::protocol::Budget as ProtocolBudget;
+use railgun_cert::task_graph::{certify_pool_with, PoolBudget};
+use std::time::{Duration, Instant};
+
+/// How long a budget refusal may take. The bounds below are tiny, so the work that runs
+/// before one trips is the pool's lift and the standalone lifts (about a second on the
+/// slowest fixture); the margin is for a loaded host.
+const QUICK: Duration = Duration::from_secs(30);
+
+fn under(name: &str, budget: &PoolBudget) -> (Receipt, Duration) {
+    let started = Instant::now();
+    let receipt = certify_pool_with(&pool(name), &from_disk, budget).expect("certify");
+    (receipt, started.elapsed())
+}
+
+/// `name` under `budget` stays `unknown` with the rule `rule` whose detail contains every
+/// needle, and the receipt carries no proof of any kind.
+fn expect_budget(name: &str, symbol: &str, budget: &PoolBudget, rule: &str, needles: &[&str]) {
+    let (r, took) = under(name, budget);
+    expect_refused(&r, symbol, rule);
+    let k = kernel(&r, symbol);
+    assert!(
+        k.required_witnesses.is_empty() && k.guards.is_empty(),
+        "{name}"
+    );
+    let details: Vec<&str> = k
+        .unresolved
+        .iter()
+        .filter(|u| u.rule == rule)
+        .map(|u| u.detail.as_str())
+        .collect();
+    for needle in needles {
+        assert!(
+            details.iter().any(|d| d.contains(needle)),
+            "{name}: no {rule} detail contains {needle:?}:\n{}",
+            explain(k)
+        );
+    }
+    let check = r
+        .checks
+        .iter()
+        .find(|c| c.id == "task-graph")
+        .expect("check");
+    assert_eq!(check.status, "unknown", "{name}");
+    assert!(
+        !r.obligations.iter().any(|o| o == "TaskProtocol"),
+        "{name}: a refusal must not add the pool's obligations"
+    );
+    assert!(took < QUICK, "{name}: {rule} took {took:?}");
+}
+
+fn conditional(name: &str, symbol: &str, budget: &PoolBudget) {
+    let (r, _) = under(name, budget);
+    let k = kernel(&r, symbol);
+    assert_eq!(k.status, "conditional", "{name}:\n{}", explain(k));
+    assert!(k.task_protocol.is_some());
+}
+
+fn a1(per_inst: u32) -> PoolBudget {
+    PoolBudget {
+        a1: A1Budget {
+            fixpoint_work_per_inst: per_inst,
+        },
+        ..PoolBudget::default()
+    }
+}
+
+fn protocol(visits: u32, states: u32, passes: u32) -> PoolBudget {
+    PoolBudget {
+        protocol: ProtocolBudget {
+            visits_per_block: visits,
+            states_per_block: states,
+            lds_passes: passes,
+        },
+        ..PoolBudget::default()
+    }
+}
+
+#[test]
+fn the_default_bounds_are_the_documented_ones() {
+    let d = PoolBudget::default();
+    assert_eq!(d.max_regions, 64);
+    assert_eq!(d.max_kernel_insts, 65536);
+    assert_eq!(d.a1.fixpoint_work_per_inst, 512);
+    assert_eq!(d.protocol.visits_per_block, 256);
+    assert_eq!(d.protocol.states_per_block, 64);
+    assert_eq!(d.protocol.lds_passes, 5);
+}
+
+/// An A1 run that overruns its bound refuses the kernel: the dispatcher shell (no facts to
+/// run the protocol on) and every body's standalone record, region-scoped cut and
+/// footprints. A bound the analysis fits in changes nothing.
+#[test]
+fn an_a1_work_bound_refuses_the_shell_and_the_bodies() {
+    for (name, symbol) in [
+        ("b32", "pm_pool_b32"),
+        ("b128", "pm_pool_b128"),
+        ("b320", "pm_pool_b320"),
+    ] {
+        for per_inst in [0, 1] {
+            expect_budget(
+                name,
+                symbol,
+                &a1(per_inst),
+                "task_graph-a1-budget",
+                &[
+                    "the dispatcher shell's A1 ran past its work bound",
+                    "a1-fixpoint-budget",
+                    "units of work",
+                    &format!("({per_inst} per instruction)"),
+                ],
+            );
+        }
+    }
+    // every hosted body is refused by its own bound as well (not only the shell)
+    let (r, _) = under("b32", &a1(1));
+    let k = kernel(&r, "pm_pool_b32");
+    let bodies = k
+        .unresolved
+        .iter()
+        .filter(|u| u.rule == "task_graph-a1-budget" && u.detail.contains("the standalone body"))
+        .count();
+    assert_eq!(bodies, 4, "{}", explain(k));
+}
+
+#[test]
+fn a_protocol_visit_bound_refuses() {
+    for (name, symbol) in [("b64", "pm_pool_b64"), ("b320", "pm_pool_b320")] {
+        // zero allows no visit; one per block is below what the walk needs (it visits a
+        // block once per fact set and re-queues loop bodies)
+        for visits in [0, 1] {
+            expect_budget(
+                name,
+                symbol,
+                &protocol(visits, 64, 5),
+                "task_graph-protocol-budget",
+                &["state visits", "past its bound"],
+            );
+        }
+    }
+}
+
+#[test]
+fn a_protocol_partition_bound_refuses() {
+    for (name, symbol) in [("b64", "pm_pool_b64"), ("b320", "pm_pool_b320")] {
+        for states in [0, 1] {
+            expect_budget(
+                name,
+                symbol,
+                &protocol(256, states, 5),
+                "task_graph-protocol-budget",
+                &["path partitions", "past its bound"],
+            );
+        }
+    }
+}
+
+/// The claim slot's contents feed the next walk pass; a multi-wave pool needs a second pass
+/// to see that they are stable. A pass limit below that refuses (it used to pass silently:
+/// the result of a walk run on contents it did not itself produce was admitted).
+#[test]
+fn an_lds_slot_that_is_not_stable_within_the_pass_bound_refuses() {
+    // two waves: pass one produces the slot, pass two confirms it
+    expect_budget(
+        "b64",
+        "pm_pool_b64",
+        &protocol(256, 64, 1),
+        "task_graph-protocol-budget",
+        &["LDS slot", "within 1 passes"],
+    );
+    conditional("b64", "pm_pool_b64", &protocol(256, 64, 2));
+    // one wave has no slot: stable at once, one pass suffices
+    conditional("b32", "pm_pool_b32", &protocol(256, 64, 1));
+}
+
+#[test]
+fn a_size_bound_refuses_before_any_analysis() {
+    let regions = |n| PoolBudget {
+        max_regions: n,
+        ..PoolBudget::default()
+    };
+    expect_budget(
+        "b32",
+        "pm_pool_b32",
+        &regions(3),
+        "task_graph-size-budget",
+        &["the note lists 4 regions, past the bound of 3"],
+    );
+    conditional("b32", "pm_pool_b32", &regions(4));
+    let insts = |n| PoolBudget {
+        max_kernel_insts: n,
+        ..PoolBudget::default()
+    };
+    expect_budget(
+        "b32",
+        "pm_pool_b32",
+        &insts(100),
+        "task_graph-size-budget",
+        &["the pool kernel has", "instructions, past the bound of 100"],
+    );
+    // the b32 dispatcher is a few thousand instructions
+    conditional("b32", "pm_pool_b32", &insts(1 << 16));
+}
+
+/// Whatever bound is exceeded, on whichever pool, nothing is admitted.
+#[test]
+fn no_exceeded_bound_admits_anything() {
+    let budgets = [
+        a1(0),
+        protocol(0, 64, 5),
+        protocol(256, 0, 5),
+        PoolBudget {
+            max_regions: 0,
+            ..PoolBudget::default()
+        },
+    ];
+    for (name, symbol, _) in POOLS {
+        for budget in &budgets {
+            let (r, took) = under(name, budget);
+            let k = kernel(&r, symbol);
+            assert_eq!(k.status, "unknown", "{name} {budget:?}\n{}", explain(k));
+            assert!(
+                k.task_protocol.is_none() && k.descriptor_arenas.is_empty(),
+                "{name} {budget:?}"
+            );
+            assert!(
+                rules(k).iter().any(|r| r.ends_with("-budget")),
+                "{name} {budget:?}\n{}",
+                explain(k)
+            );
+            assert!(took < QUICK, "{name} {budget:?}: {took:?}");
+        }
+    }
+}
+
+/// A standalone object that hosts several templates is looked up (and so hashed, lifted and
+/// analysed) once per call, and a pool whose region names an object that holds ninety-odd
+/// other kernels does not pay for them: b64's one region used to take a minute because every
+/// kernel of its source object was certified.
+#[test]
+fn each_standalone_object_is_used_once_per_call_and_only_for_its_kernel() {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    for (name, symbol, templates) in POOLS {
+        let calls: RefCell<HashMap<[u8; 32], usize>> = RefCell::new(HashMap::new());
+        let started = Instant::now();
+        let receipt = certify_pool(&pool(name), &|d: &[u8; 32]| {
+            *calls.borrow_mut().entry(*d).or_default() += 1;
+            from_disk(d)
+        })
+        .expect("certify");
+        let took = started.elapsed();
+        assert_eq!(kernel(&receipt, symbol).status, "conditional", "{name}");
+        let calls = calls.into_inner();
+        let lifted_regions = read_regions(&pool(name)).unwrap()[0]
+            .regions
+            .iter()
+            .filter(|r| !r.is_native())
+            .count();
+        assert!(
+            calls.values().all(|&n| n == 1),
+            "{name}: an object was resolved more than once: {calls:?}"
+        );
+        assert!(
+            calls.len() <= lifted_regions && !calls.is_empty(),
+            "{name} ({templates:?}): {} objects for {lifted_regions} lifted regions",
+            calls.len()
+        );
+        // the 97-kernel object of b64/b256 took 52 s before it was analysed per kernel
+        assert!(took < Duration::from_secs(40), "{name}: {took:?}");
+    }
+    // b256 hosts three templates of one object and four others
+    let notes = read_regions(&pool("b256")).unwrap();
+    let digests: std::collections::BTreeSet<[u8; 32]> = notes[0]
+        .regions
+        .iter()
+        .filter(|r| !r.is_native())
+        .map(|r| r.digest)
+        .collect();
+    assert!(digests.len() < notes[0].regions.iter().filter(|r| !r.is_native()).count());
+}

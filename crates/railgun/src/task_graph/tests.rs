@@ -49,6 +49,13 @@ const T_LE_BAD: u32 = 15;
 const T_GE_BAD: u32 = 16;
 /// `8 * grid_x <= dword@16`: met for gx = 4 (dword 0x1_0080), not for gx > 0x2010.
 const T_GRID_LE: u32 = 17;
+/// Write-only field 8 with a certified footprint over axes y; z; x and z;
+/// y and z; x, y and z.
+const T_TILE_Y: u32 = 18;
+const T_TILE_Z: u32 = 19;
+const T_TILE_XZ: u32 = 20;
+const T_TILE_YZ: u32 = 21;
+const T_TILE_XYZ: u32 = 22;
 const T_HID: u32 = 12;
 const T_HIDU: u32 = 13;
 
@@ -100,7 +107,8 @@ fn template(id: u32) -> ArenaTemplate {
             classes: vec![VmemStore],
         }],
         T_TILE_X | T_TILE_XY | T_TILE_B | T_TILE_R | T_TILE_Q | T_HID | T_HIDU | T_LE_OK
-        | T_LE_BAD | T_GE_BAD | T_GRID_LE => vec![L {
+        | T_LE_BAD | T_GE_BAD | T_GRID_LE | T_TILE_Y | T_TILE_Z | T_TILE_XZ | T_TILE_YZ
+        | T_TILE_XYZ => vec![L {
             record_offset: 8,
             classes: vec![VmemStore],
         }],
@@ -151,6 +159,11 @@ fn template(id: u32) -> ArenaTemplate {
                 bounds: [Some(4), None, None],
                 ..crate::kernel::WgFootprint::plain(8, 1)
             }],
+            T_TILE_Y => vec![crate::kernel::WgFootprint::plain(8, 2)],
+            T_TILE_Z => vec![crate::kernel::WgFootprint::plain(8, 4)],
+            T_TILE_XZ => vec![crate::kernel::WgFootprint::plain(8, 5)],
+            T_TILE_YZ => vec![crate::kernel::WgFootprint::plain(8, 6)],
+            T_TILE_XYZ => vec![crate::kernel::WgFootprint::plain(8, 7)],
             T_TILE_R | T_TILE_Q => vec![crate::kernel::WgFootprint {
                 requires: vec![crate::kernel::WgRequire::mask_eq(
                     16,
@@ -563,7 +576,7 @@ fn build_with(
     }
     launches.extend(extra);
     let mut program = author("gfx1201", &launches);
-    let big = 1 << 22;
+    let big = 1 << 24;
     for base in [EVENTS, CTL] {
         let r = rid(&program, base);
         program.resources[r.0 as usize].bytes = big;
@@ -1629,4 +1642,620 @@ fn a_sealed_table_bind_is_refused_for_writers_missing_seals_and_long_bounds() {
         .err()
         .expect("a bound past the table refuses");
     assert!(err.contains("exceeds the 2 sealed entries"), "{err}");
+}
+
+/// The sweep race pass against the all-pairs oracle it replaced.
+mod sweep {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn chance(&mut self, num: usize, den: usize) -> bool {
+            self.below(den) < num
+        }
+
+        fn shuffle<T>(&mut self, xs: &mut [T]) {
+            for i in (1..xs.len()).rev() {
+                xs.swap(i, self.below(i + 1));
+            }
+        }
+    }
+
+    /// Templates of the random graphs: plain readers and writers, atomics,
+    /// and footprints over every axis mask, with and without assumptions.
+    const TEMPLATES: [u32; 19] = [
+        T_COPY, T_READ, T_NOP, T_WRITE, T_ATOM, T_TILE_X, T_TILE_XY, T_TILE_Y, T_TILE_Z, T_TILE_XZ,
+        T_TILE_YZ, T_TILE_XYZ, T_TILE_B, T_TILE_R, T_TILE_Q, T_LE_OK, T_LE_BAD, T_GE_BAD,
+        T_GRID_LE,
+    ];
+    /// The footprint templates the single-instance graphs draw from.
+    const FOOTPRINTS: [u32; 8] = [
+        T_TILE_X, T_TILE_XY, T_TILE_Y, T_TILE_Z, T_TILE_XZ, T_TILE_YZ, T_TILE_XYZ, T_ATOM,
+    ];
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Shape {
+        /// Several records, pools, events and mutations.
+        Mixed,
+        /// Tens of records and up to a few hundred tasks: bitset rows of
+        /// several words, instances smaller and larger than a row.
+        Large,
+        /// One record of up to a dozen tiles on a footprint template, no
+        /// events: the coordinate rules of the instance.
+        Instance,
+    }
+
+    struct Case {
+        pools: Vec<Vec<TaskHeader>>,
+        records: Vec<(u32, Vec<(u32, u64)>)>,
+        known: Vec<u32>,
+        protocol: TaskProtocolFact,
+        sealed: bool,
+    }
+
+    fn fields(template: u32, rng: &mut Rng) -> Vec<(u32, u64)> {
+        let (a, b) = ([X, Y, Z][rng.below(3)], [X, Y, Z][rng.below(3)]);
+        match template {
+            T_COPY => vec![(0, a), (8, b)],
+            T_READ => vec![(0, a)],
+            T_NOP => Vec::new(),
+            _ => vec![(8, a)],
+        }
+    }
+
+    /// The tasks of one record: distinct virtual workgroups of a random
+    /// `(gx, gy, gz)` grid, some claiming two or three consecutive x steps,
+    /// and now and then one that repeats a workgroup (refused).
+    fn record_tasks(
+        template: u32,
+        record: u32,
+        want: usize,
+        repeat: usize,
+        rng: &mut Rng,
+    ) -> Vec<TaskHeader> {
+        let (gx, gy, gz) = (
+            1 + rng.below(6) as u32,
+            1 + rng.below(3) as u32,
+            1 + rng.below(3) as u32,
+        );
+        let mut points = Vec::new();
+        for vz in 0..gz {
+            for vy in 0..gy {
+                for vx in 0..gx {
+                    points.push((vx, vy, vz));
+                }
+            }
+        }
+        rng.shuffle(&mut points);
+        let mut taken: BTreeSet<(u32, u32, u32)> = BTreeSet::new();
+        let mut out: Vec<TaskHeader> = Vec::new();
+        for (vx, vy, vz) in points {
+            if out.len() >= want {
+                break;
+            }
+            if taken.contains(&(vx, vy, vz)) {
+                continue;
+            }
+            let mut vcount = rng.below(4) as u32;
+            let steps = vcount.max(1);
+            let free = vx + steps <= gx && (1..steps).all(|s| !taken.contains(&(vx + s, vy, vz)));
+            if !free {
+                vcount = 1;
+            }
+            for s in 0..vcount.max(1) {
+                taken.insert((vx + s, vy, vz));
+            }
+            out.push(TaskHeader {
+                vx,
+                vy,
+                vz,
+                gx,
+                gy,
+                gz,
+                vcount,
+                ..t(template, record, N, 0, N)
+            });
+        }
+        if rng.chance(1, repeat) && out.len() >= 2 {
+            let (vx, vy, vz) = (out[0].vx, out[0].vy, out[0].vz);
+            let last = out.len() - 1;
+            out[last].vx = vx;
+            out[last].vy = vy;
+            out[last].vz = vz;
+        }
+        out
+    }
+
+    fn generate(rng: &mut Rng, shape: Shape, sealed: bool) -> Case {
+        let mixed = shape != Shape::Instance;
+        let n_pools = match shape {
+            Shape::Mixed => 1 + rng.below(3),
+            Shape::Instance => 1 + rng.below(2),
+            Shape::Large => 2 + rng.below(2),
+        };
+        let n_records = match shape {
+            Shape::Mixed => 1 + rng.below(5),
+            Shape::Instance => 1,
+            Shape::Large => 30 + rng.below(40),
+        };
+        let mut records: Vec<(u32, Vec<(u32, u64)>)> = Vec::new();
+        // (pool, header)
+        let mut tasks: Vec<(usize, TaskHeader)> = Vec::new();
+        for r in 0..n_records {
+            let template = if shape == Shape::Large && !rng.chance(1, 12) {
+                // Mostly readers: the few writers can be ordered.
+                [T_READ, T_NOP][rng.below(2)]
+            } else if mixed {
+                TEMPLATES[rng.below(TEMPLATES.len())]
+            } else {
+                FOOTPRINTS[rng.below(FOOTPRINTS.len())]
+            };
+            let fields = fields(template, rng);
+            records.push((template, fields));
+            let want = match shape {
+                Shape::Instance => 1 + rng.below(14),
+                Shape::Mixed => 1 + rng.below(5),
+                Shape::Large if rng.chance(1, 12) => 10 + rng.below(30),
+                Shape::Large => 1 + rng.below(4),
+            };
+            let repeat = if shape == Shape::Large { 1500 } else { 30 };
+            for task in record_tasks(template, r as u32, want, repeat, rng) {
+                tasks.push((rng.below(n_pools), task));
+            }
+        }
+        if sealed {
+            // One sealed-table task and one reader of a pointee.
+            let r = records.len() as u32;
+            records.push((T_SEALED, vec![(0, TBL)]));
+            records.push((T_READ, vec![(0, PW0)]));
+            tasks.push((rng.below(n_pools), t(T_SEALED, r, N, 0, N)));
+            tasks.push((rng.below(n_pools), t(T_READ, r + 1, N, 0, N)));
+        }
+        // Claim order is the global rank order, so every dependency below
+        // goes forward in rank and the graph is acyclic.
+        let mut ranks: Vec<usize> = (0..tasks.len()).collect();
+        rng.shuffle(&mut ranks);
+        let chain = match shape {
+            Shape::Large => rng.chance(2, 3),
+            Shape::Mixed => rng.chance(1, 4),
+            Shape::Instance => false,
+        };
+        if chain {
+            // Every task waits for the one before it in rank order, except at
+            // up to two breaks (a total order: all pairs ordered, or a few
+            // pairs across a break unordered).
+            let n = tasks.len();
+            let breaks: Vec<usize> = if rng.chance(1, 2) || n < 3 {
+                Vec::new()
+            } else {
+                (0..1 + rng.below(2))
+                    .map(|_| 1 + rng.below(n - 1))
+                    .collect()
+            };
+            for (i, (_, task)) in tasks.iter_mut().enumerate() {
+                let rank = ranks[i];
+                task.done_event = rank as u32;
+                if rank > 0 && !breaks.contains(&rank) {
+                    task.pred_event = rank as u32 - 1;
+                    task.expected = 1;
+                }
+            }
+        } else if mixed {
+            let n_events = if shape == Shape::Large {
+                1 + rng.below(6)
+            } else {
+                rng.below(5)
+            };
+            let mut producers = vec![0u32; n_events];
+            let mut last = vec![0usize; n_events];
+            if n_events > 0 {
+                for (i, (_, task)) in tasks.iter_mut().enumerate() {
+                    if rng.chance(1, 2) {
+                        let e = rng.below(n_events);
+                        task.done_event = e as u32;
+                        producers[e] += 1;
+                        last[e] = last[e].max(ranks[i]);
+                    }
+                }
+                for (i, (_, task)) in tasks.iter_mut().enumerate() {
+                    let eligible: Vec<usize> = (0..n_events)
+                        .filter(|&e| producers[e] > 0 && last[e] < ranks[i])
+                        .collect();
+                    if !eligible.is_empty() && rng.chance(2, 3) {
+                        let e = eligible[rng.below(eligible.len())];
+                        task.pred_event = e as u32;
+                        task.expected = producers[e];
+                    }
+                }
+            }
+            if rng.chance(1, 30) {
+                let i = rng.below(tasks.len());
+                tasks[i].1.expected += 1;
+                if tasks[i].1.pred_event == N {
+                    tasks[i].1.pred_event = 0;
+                }
+            }
+        }
+        let mut pools: Vec<Vec<(usize, TaskHeader)>> = vec![Vec::new(); n_pools];
+        for (i, (pool, task)) in tasks.into_iter().enumerate() {
+            pools[pool].push((ranks[i], task));
+        }
+        let pools = pools
+            .into_iter()
+            .map(|mut p| {
+                p.sort_by_key(|(rank, _)| *rank);
+                p.into_iter().map(|(_, task)| task).collect()
+            })
+            .collect();
+        let protocol = if rng.chance(3, 4) {
+            region_wg_protocol()
+        } else {
+            proven_protocol()
+        };
+        Case {
+            pools,
+            records,
+            known: TEMPLATES.to_vec(),
+            protocol,
+            sealed,
+        }
+    }
+
+    fn fixture_of(case: Case, certified: bool) -> Fixture {
+        let recs: Vec<(u32, &[(u32, u64)])> = case
+            .records
+            .iter()
+            .map(|(t, f)| (*t, f.as_slice()))
+            .collect();
+        let mut known = case.known.clone();
+        if case.sealed {
+            known.push(T_SEALED);
+        }
+        let known = vec![known; case.pools.len()];
+        let protocol = certified.then(|| case.protocol.clone());
+        if case.sealed {
+            build_with(
+                case.pools.clone(),
+                &recs,
+                known,
+                protocol,
+                false,
+                &sealed_registry(),
+                sealed_extras(Vec::new()),
+            )
+            .unwrap()
+        } else {
+            build(case.pools.clone(), &recs, known, protocol, false)
+        }
+    }
+
+    /// Give a random pool a different view of its templates than the others
+    /// have of theirs (commutative atomics, loads only, no footprint, another
+    /// axis mask): members of one launch instance in different pools then
+    /// need not share an access rule.
+    fn perturb(fx: &mut Fixture, rng: &mut Rng) {
+        if fx.graph.pools.len() < 2 || !rng.chance(1, 3) {
+            return;
+        }
+        let node = 1 + rng.below(fx.graph.pools.len());
+        let Some(arena) = fx.program.nodes[node].arena.as_mut() else {
+            return;
+        };
+        let mode = rng.below(4);
+        let axes = 1 + rng.below(7) as u8;
+        for fact in &mut arena.arenas {
+            for tpl in &mut fact.templates {
+                match mode {
+                    0 => {
+                        for l in &mut tpl.pointer_loads {
+                            l.classes = vec![AtomicCommutative];
+                        }
+                    }
+                    1 => {
+                        for l in &mut tpl.pointer_loads {
+                            l.classes = vec![VmemLoad];
+                        }
+                    }
+                    2 => tpl.wg_footprints.clear(),
+                    _ => {
+                        for f in &mut tpl.wg_footprints {
+                            f.axes = axes;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// What the random graphs exercised.
+    #[derive(Default, Debug)]
+    #[allow(dead_code)]
+    struct Stats {
+        admitted: u32,
+        ordered: u32,
+        cross_race: u32,
+        footprint_race: u32,
+        unproven_race: u32,
+        assumption: u32,
+        pending_reasons: u32,
+        other: u32,
+        others: std::collections::BTreeMap<String, u32>,
+    }
+
+    impl Stats {
+        fn note(&mut self, verdict: &Result<TaskGraphProof, String>) {
+            match verdict {
+                Ok(proof) => {
+                    self.admitted += 1;
+                    self.ordered += u32::from(proof.ordered_pairs > 0);
+                    self.pending_reasons += u32::from(!proof.pending.is_empty());
+                }
+                Err(e) if e.contains("neither happens-before") => self.cross_race += 1,
+                Err(e) if e.contains("agree on every footprint axis") => self.footprint_race += 1,
+                Err(e) if e.contains("proves no inter-WG write disjointness") => {
+                    self.unproven_race += 1
+                }
+                Err(e) if e.contains("requires record dword") || e.contains("tile-id bound") => {
+                    self.assumption += 1
+                }
+                Err(e) => {
+                    self.other += 1;
+                    // The refusal's shape: its text without digits, clipped.
+                    let shape: String =
+                        e.chars().filter(|c| !c.is_ascii_digit()).take(90).collect();
+                    *self.others.entry(shape).or_default() += 1;
+                }
+            }
+        }
+    }
+
+    fn certified(fx: &Fixture) -> Result<TaskGraphProof, String> {
+        let sweep = fx.check();
+        let oracle = fx
+            .graph
+            .check_pairwise(&fx.program, fx.group.clone(), &fx.protocol());
+        assert_eq!(sweep, oracle, "pools {:#?}", fx.graph.pools);
+        sweep
+    }
+
+    #[cfg(feature = "lab")]
+    fn pending(fx: &Fixture) -> Result<TaskGraphProof, String> {
+        let sweep = fx.graph.prove_pending(&fx.program, fx.group.clone(), false);
+        let oracle = fx.graph.prove_pending(&fx.program, fx.group.clone(), true);
+        assert_eq!(sweep, oracle, "pools {:#?}", fx.graph.pools);
+        sweep
+    }
+
+    fn run(shape: Shape, cases: u64, seed: u64) -> Stats {
+        let mut stats = Stats::default();
+        for case in 0..cases {
+            let mut rng = Rng(seed ^ case.wrapping_mul(0xD6E8_FEB8_6659_FD93));
+            let sealed = shape == Shape::Mixed && rng.chance(1, 6);
+            let generated = generate(&mut rng, shape, sealed);
+            let mut fx = fixture_of(generated, true);
+            perturb(&mut fx, &mut rng);
+            stats.note(&certified(&fx));
+        }
+        stats
+    }
+
+    #[test]
+    fn the_sweep_agrees_with_all_pairs_on_random_graphs() {
+        let stats = run(Shape::Mixed, 8000, 0x5EED_0001);
+        eprintln!("{stats:?}");
+        assert!(stats.admitted >= 100, "{stats:?}");
+        assert!(stats.ordered >= 50, "{stats:?}");
+        assert!(stats.cross_race >= 50, "{stats:?}");
+        assert!(stats.footprint_race >= 10, "{stats:?}");
+        assert!(stats.unproven_race >= 10, "{stats:?}");
+        assert!(stats.assumption >= 5, "{stats:?}");
+    }
+
+    #[test]
+    fn the_sweep_agrees_with_all_pairs_on_single_instances() {
+        let stats = run(Shape::Instance, 4000, 0x5EED_0002);
+        eprintln!("{stats:?}");
+        assert!(stats.admitted >= 100, "{stats:?}");
+        assert!(stats.footprint_race >= 50, "{stats:?}");
+    }
+
+    #[test]
+    fn the_sweep_agrees_with_all_pairs_on_large_graphs() {
+        let stats = run(Shape::Large, 600, 0x5EED_0006);
+        eprintln!("{stats:?}");
+        assert!(stats.cross_race >= 100, "{stats:?}");
+        assert!(stats.admitted >= 20, "{stats:?}");
+        assert!(stats.ordered >= 5, "{stats:?}");
+    }
+
+    #[test]
+    fn the_bit_helpers_agree_with_bit_by_bit_loops() {
+        let mut rng = Rng(0xB175);
+        for _ in 0..4000 {
+            let words = 1 + rng.below(5);
+            let mut a: Vec<u64> = (0..words).map(|_| rng.next()).collect();
+            let mut b: Vec<u64> = (0..words).map(|_| rng.next()).collect();
+            // Sparse rows too: most bits clear.
+            if rng.chance(1, 2) {
+                for w in a.iter_mut().chain(b.iter_mut()) {
+                    *w &= rng.next() & rng.next() & rng.next();
+                }
+            }
+            let bits = words * 64;
+            let lo = rng.below(bits + 1);
+            let hi = lo + rng.below(bits + 1 - lo);
+            let get = |w: &[u64], i: usize| (w[i / 64] >> (i % 64)) & 1 == 1;
+            let naive = (lo..hi).any(|i| get(&a, i) && get(&b, i));
+            assert_eq!(any_and_in(&a, &b, lo, hi), naive, "{lo}..{hi}");
+            let count = (0..bits).filter(|&i| get(&a, i) && get(&b, i)).count() as u64;
+            assert_eq!(popcount_and(&a, &b), count);
+            assert_eq!(lowest_bit(&a), (0..bits).find(|&i| get(&a, i)));
+        }
+        assert_eq!(pairs(0), 0);
+        assert_eq!(pairs(1), 0);
+        assert_eq!(pairs(5), 10);
+    }
+
+    #[cfg(feature = "lab")]
+    #[test]
+    fn the_pending_sweep_agrees_with_all_pairs_on_random_graphs() {
+        let mut stats = Stats::default();
+        for (shape, seed) in [
+            (Shape::Mixed, 0x5EED_0003),
+            (Shape::Instance, 0x5EED_0004),
+            (Shape::Large, 0x5EED_0005),
+        ] {
+            let cases = if shape == Shape::Large { 400 } else { 3000 };
+            for case in 0..cases as u64 {
+                let mut rng = Rng(seed ^ case.wrapping_mul(0xD6E8_FEB8_6659_FD93));
+                let sealed = shape == Shape::Mixed && rng.chance(1, 6);
+                let mut fx = fixture_of(generate(&mut rng, shape, sealed), false);
+                perturb(&mut fx, &mut rng);
+                stats.note(&pending(&fx));
+            }
+        }
+        eprintln!("{stats:?}");
+        assert!(stats.admitted >= 100, "{stats:?}");
+        assert!(stats.pending_reasons >= 20, "{stats:?}");
+        assert!(stats.cross_race >= 20, "{stats:?}");
+    }
+
+    /// Instances whose members wait on events of other pools in a chain
+    /// among themselves: happens-before inside one instance.
+    #[test]
+    fn instance_members_ordered_among_themselves_agree_with_all_pairs() {
+        for template in [T_TILE_XY, T_TILE_X, T_WRITE, T_ATOM] {
+            for gap in [0u32, 1] {
+                // Task i of one pool waits for task i - 1 (all but every
+                // `gap + 2`-th, which starts a new chain), all of one record.
+                let n = 9u32;
+                let tasks: Vec<TaskHeader> = (0..n)
+                    .map(|i| {
+                        let chained = i % (gap + 2) != 0;
+                        TaskHeader {
+                            vx: i % 3,
+                            vy: i / 3,
+                            gx: 3,
+                            gy: 3,
+                            vcount: 1,
+                            pred_event: if chained { i - 1 } else { N },
+                            expected: u32::from(chained),
+                            done_event: i,
+                            ..t(template, 0, N, 0, N)
+                        }
+                    })
+                    .collect();
+                let fx = build(
+                    vec![tasks],
+                    &[(template, &[(8, X)])],
+                    vec![TEMPLATES.to_vec()],
+                    Some(region_wg_protocol()),
+                    false,
+                );
+                certified(&fx).ok();
+            }
+        }
+    }
+
+    /// `tiles_x * tiles_y` tiles of one launch instance (template
+    /// `T_TILE_XY`, one workgroup each) between a stage of three tasks and a
+    /// stage of two readers: every tile waits for the first stage, the second
+    /// waits for every tile.
+    fn scale_fixture(tiles_x: u32, tiles_y: u32) -> Fixture {
+        let n = tiles_x * tiles_y;
+        let mut tiles = Vec::with_capacity(n as usize);
+        for vy in 0..tiles_y {
+            for vx in 0..tiles_x {
+                tiles.push(TaskHeader {
+                    vx,
+                    vy,
+                    gx: tiles_x,
+                    gy: tiles_y,
+                    vcount: 1,
+                    ..t(T_TILE_XY, 0, 0, 3, 1)
+                });
+            }
+        }
+        let first = vec![
+            t(T_WRITE, 1, N, 0, 0),
+            t(T_WRITE, 2, N, 0, 0),
+            t(T_NOP, 3, N, 0, 0),
+        ];
+        let last = vec![t(T_READ, 4, 1, n, N), t(T_COPY, 5, 1, n, N)];
+        build(
+            vec![first, tiles, last],
+            &[
+                (T_TILE_XY, &[(8, X)]),
+                (T_WRITE, &[(8, Y)]),
+                (T_WRITE, &[(8, Z)]),
+                (T_NOP, &[]),
+                (T_READ, &[(0, X)]),
+                (T_COPY, &[(0, Y), (8, Z)]),
+            ],
+            vec![ALL.to_vec(), vec![T_TILE_XY], ALL.to_vec()],
+            Some(region_wg_protocol()),
+            false,
+        )
+    }
+
+    #[test]
+    fn the_scale_shape_agrees_with_all_pairs_at_small_size() {
+        for (x, y) in [(12, 10), (30, 20), (64, 3)] {
+            let fx = scale_fixture(x, y);
+            let proof = certified(&fx).unwrap();
+            assert_eq!(proof.tasks, (x * y) as usize + 5);
+            assert_eq!(proof.events_used, 2);
+            assert!(!proof.edges().is_empty());
+        }
+        let fx = scale_fixture(12, 10);
+        let proof = certified(&fx).unwrap();
+        // Every tile is ordered before both readers and after the first
+        // stage: the oracle and the sweep count the same pairs.
+        assert!(proof.ordered_pairs > 0);
+    }
+
+    #[test]
+    fn forty_thousand_same_instance_tiles_are_proved_in_seconds() {
+        let fx = scale_fixture(200, 200);
+        let start = Instant::now();
+        let proof = fx.check().unwrap();
+        let took = start.elapsed();
+        eprintln!("40,000 tiles + 5: check {took:?}");
+        assert_eq!(proof.tasks, 40_005);
+        assert_eq!(proof.events_used, 2);
+        if !cfg!(debug_assertions) {
+            assert!(took < Duration::from_secs(2), "{took:?}");
+        }
+    }
+
+    /// Baseline of the all-pairs oracle on the scale graph (release: ~5 s
+    /// here; the original pass, which also built a label and cloned the rule
+    /// for every pair, took ~73 s):
+    /// `cargo test --release -p railgun baseline -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn baseline_all_pairs_on_forty_thousand_tiles() {
+        let fx = scale_fixture(200, 200);
+        let start = Instant::now();
+        let proof = fx
+            .graph
+            .check_pairwise(&fx.program, fx.group.clone(), &fx.protocol())
+            .unwrap();
+        eprintln!("40,000 tiles + 5, all pairs: {:?}", start.elapsed());
+        assert_eq!(proof.tasks, 40_005);
+    }
 }

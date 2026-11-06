@@ -64,7 +64,7 @@ use crate::inst::{Abi, Arch, Kernel};
 use crate::kernarg::{AccessClass, ArgFacts, ArgRole, EntryReg, KernargFacts, KernelStatus};
 
 use super::kernarg_ix::{Interner, Ix, Node};
-use super::kernargs::{analyze_for_wg, WriteSite};
+use super::kernargs::{analyze_for_wg, A1Budget, WriteSite};
 
 /// The tile geometry a footprint is proven for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,6 +159,18 @@ const BOUND_CANDIDATES: [u64; 7] = [1 << 32, 1 << 28, 1 << 24, 1 << 20, 1 << 16,
 /// variant ([`super::kernargs::analyze_sealed`]) whose `Conditional` status is
 /// admitted when its only condition is sealed tables.
 pub fn analyze(kernel: &Kernel, arch: Arch, sealed: bool, launch: WgLaunch) -> WgFacts {
+    analyze_budgeted(kernel, arch, sealed, launch, &A1Budget::default())
+}
+
+/// [`analyze`] with the A1 replay under an explicit work bound; one that overruns it
+/// reports no footprint (`applicable` carries the A1 reason).
+pub fn analyze_budgeted(
+    kernel: &Kernel,
+    arch: Arch,
+    sealed: bool,
+    launch: WgLaunch,
+    budget: &A1Budget,
+) -> WgFacts {
     let na = |why: String| WgFacts {
         applicable: Err(why),
         args: Vec::new(),
@@ -188,9 +200,13 @@ pub fn analyze(kernel: &Kernel, arch: Arch, sealed: bool, launch: WgLaunch) -> W
     if (descriptor.compute_pgm_rsrc2.0 >> 11) & 3 != 0 {
         return na("the descriptor enables y/z work-item ids (v0 is packed)".into());
     }
-    let (facts, input) = analyze_for_wg(kernel, arch, sealed);
+    let (facts, input) = analyze_for_wg(kernel, arch, sealed, budget);
     let Some(input) = input else {
-        return na("A1 analysis did not run".into());
+        let why = facts
+            .unresolved
+            .first()
+            .map_or(String::new(), |u| format!(": {}: {}", u.rule, u.detail));
+        return na(format!("A1 analysis did not run{why}"));
     };
     match facts.status {
         KernelStatus::Proven => {}

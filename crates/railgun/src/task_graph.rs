@@ -66,6 +66,76 @@
 //! `obligations` (counters and tickets zero at every submit; header bytes
 //! equal to those parsed). [`TaskGraphProof::ordering`] turns it into the
 //! [`GroupOrdering`] `add_coresident_group` consumes.
+//!
+//! # Complexity
+//!
+//! `n` tasks, `E` events some task waits on, `w = ceil(n / 64)`. Header
+//! checks, per-task effects, producer cardinality and launch instances are
+//! `O(n log n)`; progress and the happens-before closure are `O(n + E·w)`
+//! (one `w`-word row `before[e]` per awaited event, refused above 1 GiB).
+//! The race pass is **not** the all-pairs scan of (4), which is `O(n^2)` per
+//! resource (one MoE launch of 38,400 same-instance tasks took ~80 s):
+//! per resource with `m` accessing tasks it is `O(m log m + G·w)`, `G` the
+//! number of distinct `(event awaited, writes)` among them, plus `O(m·w)`
+//! only to *name* a race once one is known to exist (a refusal). Launch
+//! instances whose members are not uniform, or are ordered among themselves
+//! (neither happens in one eager launch), are checked pairwise.
+//!
+//! ## Why the race pass agrees with all pairs
+//!
+//! The reference semantics (`Races::check_pairwise`, the test oracle; the
+//! tests compare verdict, message and the whole [`TaskGraphProof`] on random
+//! graphs) visits every pair `a < b` of tasks accessing a resource with a
+//! write, resources in order: `a -> b` or `b -> a` (happens-before) is
+//! ordered, an unordered pair of one launch instance goes to the instance
+//! rule, any other unordered pair is a race, and the first refusal in
+//! `(resource, a, b)` order is the error. Happens-before `->` is a strict
+//! partial order (the progress search proved the dependency graph acyclic),
+//! so a conflicting pair is ordered in exactly one direction or unordered.
+//!
+//! * *Ordered pairs and edges.* `a -> b` iff `a` is in `before[pred(b)]`, and
+//!   `a` conflicts with `b` iff `b` writes (any accessor `a`) or `a` writes.
+//!   So the ordered pairs ending in `b` number
+//!   `|before[pred(b)] ∩ (accessors if b writes else writers)|`, the same
+//!   for every task of one `(pred, writes)`: one popcount per group.
+//!   `ordered_pairs` is their sum. The same intersection, cut at the pool
+//!   boundaries (a pool's tasks are one index range), says which pool pairs
+//!   have an ordered pair: the `directed` set the node edges come from.
+//! * *Unordered pairs are counted, not visited.* Conflicting pairs are
+//!   `C(m, 2) - C(readers, 2)`; unordered ones are those minus the ordered
+//!   ones. Inside one instance the same formula over its members counts its
+//!   unordered pairs. The unordered pairs outside every instance are the
+//!   difference of the two totals: zero iff there is no race.
+//! * *Instances.* Members of one instance run on one `(template, ka_off)`
+//!   record, so they share the header grid, the record and the footprint
+//!   assumptions: whether a pair is admitted depends only on the template's
+//!   rule for `a` (commutative, unproven, or a footprint) and, for a
+//!   footprint whose assumptions hold, on coordinates. If the members are
+//!   uniform (same write flag, same certified concurrency) and unordered
+//!   among themselves, every pair is conflicting and unordered, the first
+//!   pair's rule is every pair's, and a footprint over axes `A` admits a
+//!   pair iff it differs on an axis of `A`: `vy` / `vz` unequal, x-intervals
+//!   disjoint. The *refused* pairs are therefore those agreeing on `vy` (if
+//!   `y` in `A`) and `vz` (if `z` in `A`) and, if `x` in `A`, overlapping
+//!   in x: found by sorting on `(vy, vz)` (`O(m log m)`), where without `x`
+//!   the first two members of a key group are the lowest pair and with it a
+//!   sweep over a set of merged x-intervals finds the lowest task that
+//!   overlaps a later one. Per instance this is the lowest refused pair of
+//!   the all-pairs scan, and the lowest over instances is the instance
+//!   candidate.
+//! * *Naming a race.* Process the tasks of the resource in the order the
+//!   progress search finished them: every `->` edge goes forward in it, so
+//!   for `y` before `x` the pair is unordered iff `y` is not in
+//!   `before[pred(x)]`. The unordered conflicting `y` outside `x`'s instance
+//!   form a bitset of `w` words (running sets of the earlier accessors and
+//!   writers, minus the row, minus the instance's members); its lowest bit
+//!   `y` gives the lowest pair `x` is in (`(y, x)` if `y < x`, else
+//!   `(x, y)`, all its bits being above `x`). The lowest over all `x` is
+//!   the first race.
+//! * *The error.* The sweep reports the lowest of the race and instance
+//!   candidates of the first resource that has one, which is the first
+//!   refusal of the all-pairs scan; the messages are built by the same
+//!   code from the same pair. Nothing is counted on a refused resource.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -549,12 +619,14 @@ impl Index {
 /// is a commutative atomic, or (B) its one write-only pointer field has a
 /// certified `WgDisjoint` footprint over axes such that every workgroup of
 /// `a` and every workgroup of `b` differ on one of them
-/// ([`TaskGraph::same_instance_pair`]). Otherwise the pair is a race.
+/// ([`Races::same_instance_pair`]). Otherwise the pair is a race.
 /// Across instances, and between an instance's tasks and any other task,
 /// every conflicting pair needs happens-before.
 struct Instances(Vec<Option<(u32, u32)>>);
 
 impl Instances {
+    /// The all-pairs oracle's test: both tasks run in one instance.
+    #[cfg(test)]
     fn same(&self, a: usize, b: usize) -> bool {
         matches!((self.0[a], self.0[b]), (Some(x), Some(y)) if x == y)
     }
@@ -638,6 +710,60 @@ impl TaskGraph {
         group: Range<usize>,
         protocol: &TaskProtocol,
         mode: Mode<'_>,
+    ) -> Result<TaskGraphProof, String> {
+        self.prove_with(program, group, protocol, mode, RacePass::Sweep)
+    }
+
+    /// [`TaskGraph::check`] with the all-pairs race pass: the oracle the
+    /// sweep must agree with, proof and message, on every input.
+    #[cfg(test)]
+    fn check_pairwise(
+        &self,
+        program: &KernelProgram,
+        group: Range<usize>,
+        protocol: &TaskProtocol,
+    ) -> Result<TaskGraphProof, String> {
+        if protocol.pending {
+            return Err("task protocol is pending: no certificate proves the dispatcher".into());
+        }
+        self.prove_with(
+            program,
+            group,
+            protocol,
+            Mode::CERTIFIED,
+            RacePass::Pairwise,
+        )
+    }
+
+    /// [`TaskGraph::check_pending`]'s proof, with the sweep or the all-pairs
+    /// race pass.
+    #[cfg(all(test, feature = "lab"))]
+    fn prove_pending(
+        &self,
+        program: &KernelProgram,
+        group: Range<usize>,
+        pairwise: bool,
+    ) -> Result<TaskGraphProof, String> {
+        let protocol = TaskProtocol::lab_pending(program, group.clone());
+        let mode = Mode {
+            pending: true,
+            templates: None,
+        };
+        let pass = if pairwise {
+            RacePass::Pairwise
+        } else {
+            RacePass::Sweep
+        };
+        self.prove_with(program, group, &protocol, mode, pass)
+    }
+
+    fn prove_with(
+        &self,
+        program: &KernelProgram,
+        group: Range<usize>,
+        protocol: &TaskProtocol,
+        mode: Mode<'_>,
+        pass: RacePass,
     ) -> Result<TaskGraphProof, String> {
         let pending = mode.pending;
         let layout = &self.layout;
@@ -944,9 +1070,13 @@ impl TaskGraph {
         let mut before: Vec<Option<Bits>> = vec![None; event_ids.len()];
         let mut stack: Vec<usize> = (0..nodes_total).filter(|&v| indegree[v] == 0).collect();
         let mut done = vec![false; nodes_total];
+        let mut topo = vec![0usize; total];
         let mut processed = 0usize;
         while let Some(v) = stack.pop() {
             done[v] = true;
+            if v < total {
+                topo[v] = processed;
+            }
             processed += 1;
             if v < total {
                 let t = flat[v];
@@ -993,9 +1123,6 @@ impl TaskGraph {
                 self.describe_cycle(&flat, &index, &done, &producers)
             ));
         }
-        let hb = |a: usize, b: usize| {
-            pred_ix[b].is_some_and(|e| before[e].as_ref().expect("a used event").get(a))
-        };
         // ---- Same-launch instances: tasks of one record (same template and
         // `ka_off`) whose virtual workgroup sets are inside the grid and
         // pairwise disjoint are the intra-grid concurrency of one launch, not
@@ -1081,63 +1208,27 @@ impl TaskGraph {
                 n.1 |= e.writes();
             }
         }
-        let p = self.pools.len();
         let mut pending_reasons: Option<BTreeSet<String>> = pending.then(BTreeSet::new);
-        let mut ordered_pairs = 0u64;
-        let mut directed: BTreeSet<(usize, usize, ResourceId)> = BTreeSet::new();
-        for (&resource, list) in &by_resource {
-            let mut dir = vec![false; p * p];
-            for (i, &(a, a_writes)) in list.iter().enumerate() {
-                for &(b, b_writes) in &list[i + 1..] {
-                    if !(a_writes || b_writes) {
-                        continue;
-                    }
-                    let (from, to) = if hb(a, b) {
-                        (a, b)
-                    } else if hb(b, a) {
-                        (b, a)
-                    } else if instances.same(a, b) {
-                        self.same_instance_pair(
-                            &flat,
-                            &accesses,
-                            &by_base,
-                            resource,
-                            a,
-                            b,
-                            &place,
-                            pending_reasons.as_mut(),
-                        )?;
-                        continue;
-                    } else {
-                        let (pa, ka) = place(a);
-                        let (pb, kb) = place(b);
-                        return Err(format!(
-                            "race on resource {}: task {ka} of pool {pa} (node {}) and task {kb} of pool {pb} (node {}) {} it and neither happens-before the other",
-                            resource.0,
-                            self.pools[pa].node,
-                            self.pools[pb].node,
-                            match (a_writes, b_writes) {
-                                (true, true) => "both write",
-                                (true, false) => "write/read",
-                                _ => "read/write",
-                            },
-                        ));
-                    };
-                    ordered_pairs += 1;
-                    let (pf, pt) = (index.pool_of(from), index.pool_of(to));
-                    if pf != pt {
-                        dir[pf * p + pt] = true;
-                    }
-                }
-            }
-            for pf in 0..p {
-                for pt in 0..p {
-                    if dir[pf * p + pt] {
-                        directed.insert((self.pools[pf].node, self.pools[pt].node, resource));
-                    }
-                }
-            }
-        }
+        let races = Races {
+            graph: self,
+            flat: &flat,
+            index: &index,
+            accesses: &accesses,
+            by_base: &by_base,
+            instances: &instances,
+            pred_ix: &pred_ix,
+            before: &before,
+            topo: &topo,
+        };
+        let totals = match pass {
+            RacePass::Sweep => races.check(&by_resource, pending_reasons.as_mut())?,
+            #[cfg(test)]
+            RacePass::Pairwise => races.check_pairwise(&by_resource, pending_reasons.as_mut())?,
+        };
+        let RaceTotals {
+            ordered_pairs,
+            directed,
+        } = totals;
 
         // ---- Resources reached outside the arena: not covered by the headers.
         self.check_direct(program, &group, &node_access)?;
@@ -1519,115 +1610,6 @@ impl TaskGraph {
         Ok(())
     }
 
-    /// A conflicting pair of tasks of one launch instance on `resource`
-    /// (see [`Instances`]): admitted only when the template's own
-    /// certificate says concurrent workgroups of its grid do not conflict
-    /// there. A commutative-atomic resource always; a write-only field with a
-    /// `WgDisjoint` footprint iff every workgroup of `a` and every workgroup
-    /// of `b` differ on some footprint axis; otherwise refused.
-    fn same_instance_pair(
-        &self,
-        flat: &[&TaskHeader],
-        accesses: &[Vec<Access>],
-        by_base: &BTreeMap<u64, &BindingRecord>,
-        resource: ResourceId,
-        a: usize,
-        b: usize,
-        place: &dyn Fn(usize) -> (usize, usize),
-        pending: Option<&mut BTreeSet<String>>,
-    ) -> Result<(), String> {
-        let (ta, tb) = (flat[a], flat[b]);
-        let conc = accesses[a]
-            .iter()
-            .find(|x| x.resource == resource)
-            .map_or(Conc::None, |x| x.conc.clone());
-        let (pa, ka) = place(a);
-        let (pb, kb) = place(b);
-        let tasks = format!(
-            "task {ka} of pool {pa} (node {}) and task {kb} of pool {pb} (node {})",
-            self.pools[pa].node, self.pools[pb].node
-        );
-        let fp = match conc {
-            Conc::Commutative => return Ok(()),
-            Conc::Footprint(fp) => fp,
-            Conc::None => {
-                if let Some(set) = pending {
-                    set.insert(format!(
-                        "inter-WG disjointness unproven: template {}, resource {}",
-                        ta.template, resource.0
-                    ));
-                    return Ok(());
-                }
-                return Err(format!(
-                    "race on resource {}: {tasks} are workgroups of one launch instance of template {} (ka_off {}) and conflict on it; standalone receipt proves no inter-WG write disjointness (not all commutative atomics, and no write-only per-workgroup footprint)",
-                    resource.0, ta.template, ta.ka_off
-                ));
-            }
-        };
-        let axes = fp.axes;
-        // The proof's assumptions, against the headers and the record's
-        // bound scalars.
-        for (i, name) in ["x", "y", "z"].iter().enumerate() {
-            let Some(bound) = fp.bounds[i] else { continue };
-            for t in [ta, tb] {
-                let extent = [t.gx, t.gy, t.gz][i];
-                if u64::from(extent) > bound {
-                    return Err(format!(
-                        "{tasks} (template {}, ka_off {}): virtual grid extent {extent} on {name} exceeds the footprint's certified tile-id bound {bound} on resource {}",
-                        ta.template, ta.ka_off, resource.0
-                    ));
-                }
-            }
-        }
-        for req in &fp.requires {
-            let got = by_base
-                .get(&u64::from(ta.ka_off))
-                .and_then(|r| r.scalars.iter().find(|(o, _)| *o == req.offset))
-                .map(|(_, v)| *v);
-            if !got.is_some_and(|v| req.holds(v, [ta.gx, ta.gy, ta.gz])) {
-                let (offset, mask, value) = (req.offset, req.mask, req.value);
-                let rel = match req.op {
-                    RequireOp::MaskEq => format!("& {mask:#x} == {value:#x}"),
-                    RequireOp::LeU => format!("<= {value:#x}"),
-                    RequireOp::GeU => format!(">= {value:#x}"),
-                    RequireOp::GridLe => format!(
-                        ">= {value} * grid extent {} (virtual grid {}, {}, {})",
-                        mask, ta.gx, ta.gy, ta.gz
-                    ),
-                };
-                return Err(format!(
-                    "{tasks} (template {}, ka_off {}): the footprint on resource {} requires record dword +{offset} {rel}, the record's scalar is {got:?}",
-                    ta.template, ta.ka_off, resource.0
-                ));
-            }
-        }
-        let (ax0, ax1) = (
-            u64::from(ta.vx),
-            u64::from(ta.vx) + u64::from(ta.vcount.max(1)),
-        );
-        let (bx0, bx1) = (
-            u64::from(tb.vx),
-            u64::from(tb.vx) + u64::from(tb.vcount.max(1)),
-        );
-        let x_overlap = ax0 < bx1 && bx0 < ax1;
-        let differs = (axes & 2 != 0 && ta.vy != tb.vy)
-            || (axes & 4 != 0 && ta.vz != tb.vz)
-            || (axes & 1 != 0 && !x_overlap);
-        if differs {
-            return Ok(());
-        }
-        let common = ax0.max(bx0);
-        let (wx, wx2) = if axes & 1 != 0 {
-            (common, common)
-        } else {
-            (ax0, bx0)
-        };
-        Err(format!(
-            "race on resource {}: {tasks} (template {}, ka_off {}) run workgroups ({wx}, {}, {}) and ({wx2}, {}, {}) concurrently, which agree on every footprint axis (mask {axes:#05b}); the certified footprint only separates workgroups differing on those axes",
-            resource.0, ta.template, ta.ka_off, ta.vy, ta.vz, tb.vy, tb.vz
-        ))
-    }
-
     /// Whether node effect `e` is reached through the binding-record arena
     /// (an arena pointer load, so covered by the task headers) rather than a
     /// pointer argument of its own.
@@ -1745,6 +1727,742 @@ impl TaskGraph {
             path.push((cur, how));
             cur = next;
         }
+    }
+}
+
+/// Which race pass [`TaskGraph::prove`] runs: the sweep, or (tests only) the
+/// all-pairs scan it must agree with on every input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RacePass {
+    Sweep,
+    #[cfg(test)]
+    Pairwise,
+}
+
+/// A refusal on one resource: the violating task pair (global indices,
+/// `a < b`) and the message.
+type Fault = (usize, usize, String);
+
+/// Keep the violating pair the all-pairs scan reaches first (`a` ascending,
+/// then `b`).
+fn keep_first(best: &mut Option<Fault>, fault: Fault) {
+    if best
+        .as_ref()
+        .map_or(true, |b| (fault.0, fault.1) < (b.0, b.1))
+    {
+        *best = Some(fault);
+    }
+}
+
+/// Unordered pairs among `n` items.
+fn pairs(n: u64) -> u64 {
+    n * n.saturating_sub(1) / 2
+}
+
+/// The number of set bits of `a & b`.
+fn popcount_and(a: &[u64], b: &[u64]) -> u64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| u64::from((x & y).count_ones()))
+        .sum()
+}
+
+/// Whether `a & b` has a set bit among the bits `lo..hi`.
+fn any_and_in(a: &[u64], b: &[u64], lo: usize, hi: usize) -> bool {
+    if lo >= hi {
+        return false;
+    }
+    let (first, last) = (lo / 64, (hi - 1) / 64);
+    (first..=last).any(|w| {
+        let mut x = a[w] & b[w];
+        if w == first {
+            x &= !0u64 << (lo % 64);
+        }
+        if w == last {
+            x &= !0u64 >> (63 - (hi - 1) % 64);
+        }
+        x != 0
+    })
+}
+
+/// The lowest set bit of `words`.
+fn lowest_bit(words: &[u64]) -> Option<usize> {
+    let i = words.iter().position(|w| *w != 0)?;
+    Some(i * 64 + words[i].trailing_zeros() as usize)
+}
+
+/// What the race pass proved over every resource.
+#[derive(Default)]
+struct RaceTotals {
+    /// Conflicting task pairs proved ordered.
+    ordered_pairs: u64,
+    /// `(producer node, consumer node, resource)` of every ordered
+    /// conflicting pair across two pools.
+    directed: BTreeSet<(usize, usize, ResourceId)>,
+}
+
+/// What admits a same-instance conflict, once everything that does not
+/// depend on the pair has held.
+enum PairRule {
+    /// Commutative atomics, or an unproven access of a lab build: every
+    /// pair is admitted.
+    Admit,
+    /// A footprint whose assumptions hold: a pair is admitted iff its
+    /// workgroups differ on one of these axes (bit 0 x, 1 y, 2 z).
+    Axes(u8),
+}
+
+/// The race pass of [`TaskGraph::prove`]: on every resource, every
+/// conflicting task pair is ordered by happens-before or, inside one launch
+/// instance, admitted by the instance rule
+/// ([`Races::same_instance_pair`]); the first refusal is reported. It is not
+/// a scan of all pairs: the module docs ("Complexity") give the argument
+/// that it agrees with one on every input.
+struct Races<'a> {
+    graph: &'a TaskGraph,
+    flat: &'a [&'a TaskHeader],
+    index: &'a Index,
+    accesses: &'a [Vec<Access>],
+    by_base: &'a BTreeMap<u64, &'a BindingRecord>,
+    instances: &'a Instances,
+    /// The event index each task waits on.
+    pred_ix: &'a [Option<usize>],
+    /// `before[e]`: every task that happens-before a consumer of event `e`.
+    before: &'a [Option<Bits>],
+    /// The position of each task in the order the progress search finished
+    /// them: every happens-before edge goes forward in it.
+    topo: &'a [usize],
+}
+
+impl Races<'_> {
+    fn place(&self, gid: usize) -> (usize, usize) {
+        let pi = self.index.pool_of(gid);
+        (pi, gid - self.index.base[pi])
+    }
+
+    fn row(&self, event: usize) -> &Bits {
+        self.before[event].as_ref().expect("a used event")
+    }
+
+    /// Task `a` happens-before task `b`.
+    fn hb(&self, a: usize, b: usize) -> bool {
+        self.pred_ix[b].is_some_and(|e| self.row(e).get(a))
+    }
+
+    /// Every resource of `by_resource` (accessing tasks in index order,
+    /// with whether each writes), in resource order; the first refusal.
+    fn check(
+        &self,
+        by_resource: &BTreeMap<ResourceId, Vec<(usize, bool)>>,
+        mut pending: Option<&mut BTreeSet<String>>,
+    ) -> Result<RaceTotals, String> {
+        let mut totals = RaceTotals::default();
+        for (&resource, list) in by_resource {
+            self.check_resource(resource, list, pending.as_deref_mut(), &mut totals)?;
+        }
+        Ok(totals)
+    }
+
+    /// One resource. `list` is its accessing tasks in index order.
+    ///
+    /// Three independent facts are computed, none of them by visiting pairs:
+    /// the number of ordered conflicting pairs (popcounts of the
+    /// happens-before rows), the verdict of each launch instance, and, only
+    /// when the counts show an unordered pair outside every instance, which
+    /// pair that is.
+    fn check_resource(
+        &self,
+        resource: ResourceId,
+        list: &[(usize, bool)],
+        mut pending: Option<&mut BTreeSet<String>>,
+        totals: &mut RaceTotals,
+    ) -> Result<(), String> {
+        let total = self.index.total();
+        let mut all = Bits::new(total);
+        let mut writers = Bits::new(total);
+        let mut readers = 0u64;
+        for &(g, w) in list {
+            all.set(g);
+            if w {
+                writers.set(g);
+            } else {
+                readers += 1;
+            }
+        }
+        // Pairs with a write: a pair of two readers never conflicts.
+        let conflicting = pairs(list.len() as u64) - pairs(readers);
+        let (ordered, directed) = self.ordered(list, &all, &writers);
+
+        let mut by_instance: BTreeMap<(u32, u32), Vec<(usize, bool)>> = BTreeMap::new();
+        for &(g, w) in list {
+            if let Some(key) = self.instances.0[g] {
+                by_instance.entry(key).or_default().push((g, w));
+            }
+        }
+        let mut best: Option<Fault> = None;
+        // Conflicting pairs inside an instance that no happens-before orders.
+        let mut inside = 0u64;
+        for members in by_instance.values().filter(|m| m.len() >= 2) {
+            let m_readers = members.iter().filter(|(_, w)| !w).count() as u64;
+            let m_conflicting = pairs(members.len() as u64) - pairs(m_readers);
+            let m_ordered = self.ordered_within(members);
+            inside += m_conflicting - m_ordered;
+            // Nothing to decide: every conflicting pair is ordered, or an
+            // earlier instance already refused at a smaller first task.
+            if m_conflicting == m_ordered || best.as_ref().is_some_and(|b| b.0 < members[0].0) {
+                continue;
+            }
+            let fault = if m_ordered == 0 && self.uniform(resource, members) {
+                self.uniform_instance(resource, members, pending.as_deref_mut())
+            } else {
+                self.pairwise_instance(resource, members, pending.as_deref_mut())
+            };
+            if let Some(fault) = fault {
+                keep_first(&mut best, fault);
+            }
+        }
+        // Every conflicting pair is ordered in exactly one direction or in
+        // none (the graph is acyclic), so `conflicting - ordered` is the
+        // number of unordered ones; the rest of them, outside every
+        // instance, are races.
+        if conflicting - ordered != inside {
+            match self.first_race(resource, list, &by_instance) {
+                Some(fault) => keep_first(&mut best, fault),
+                None => {
+                    return Err(format!(
+                        "race on resource {}: {} unordered conflicting pairs, {inside} inside launch instances, and no pair found (inconsistent happens-before rows)",
+                        resource.0,
+                        conflicting - ordered
+                    ))
+                }
+            }
+        }
+        if let Some((_, _, why)) = best {
+            return Err(why);
+        }
+        totals.ordered_pairs += ordered;
+        for (pf, pt) in directed {
+            totals.directed.insert((
+                self.graph.pools[pf].node,
+                self.graph.pools[pt].node,
+                resource,
+            ));
+        }
+        Ok(())
+    }
+
+    /// The conflicting pairs `(a, b)` of `list` with `a` happens-before `b`,
+    /// and the pools `(producer, consumer)` they run in across two pools.
+    ///
+    /// `a` happens-before `b` iff `a` is in `before` of `b`'s event, and a
+    /// pair conflicts iff `b` writes (`a` any accessor) or `a` writes (`b`
+    /// any accessor): so for every `b` the ordered pairs ending in it are
+    /// `|before ∩ (all if b writes else writers)|`, the same for every task
+    /// of one `(event, writes)`.
+    fn ordered(
+        &self,
+        list: &[(usize, bool)],
+        all: &Bits,
+        writers: &Bits,
+    ) -> (u64, BTreeSet<(usize, usize)>) {
+        let mut groups: BTreeMap<(usize, bool), (u64, BTreeSet<usize>)> = BTreeMap::new();
+        for &(g, w) in list {
+            if let Some(e) = self.pred_ix[g] {
+                let entry = groups.entry((e, w)).or_default();
+                entry.0 += 1;
+                entry.1.insert(self.index.pool_of(g));
+            }
+        }
+        let mut ordered = 0u64;
+        let mut directed = BTreeSet::new();
+        for (&(e, w), (count, consumers)) in &groups {
+            let row = &self.row(e).0;
+            let mask = &(if w { all } else { writers }).0;
+            let hits = popcount_and(row, mask);
+            if hits == 0 {
+                continue;
+            }
+            ordered += count * hits;
+            for pf in 0..self.graph.pools.len() {
+                if any_and_in(row, mask, self.index.base[pf], self.index.base[pf + 1]) {
+                    for &pt in consumers {
+                        if pt != pf {
+                            directed.insert((pf, pt));
+                        }
+                    }
+                }
+            }
+        }
+        (ordered, directed)
+    }
+
+    /// [`Races::ordered`] over the pairs of one instance's members.
+    fn ordered_within(&self, members: &[(usize, bool)]) -> u64 {
+        let mut events: Vec<(usize, bool)> = members
+            .iter()
+            .filter_map(|&(g, w)| self.pred_ix[g].map(|e| (e, w)))
+            .collect();
+        if events.is_empty() {
+            return 0;
+        }
+        let words = self.index.total().div_ceil(64);
+        let (mut all, mut writers) = (vec![0u64; words], vec![0u64; words]);
+        for &(g, w) in members {
+            all[g / 64] |= 1 << (g % 64);
+            if w {
+                writers[g / 64] |= 1 << (g % 64);
+            }
+        }
+        events.sort_unstable();
+        events
+            .chunk_by(|a, b| a == b)
+            .map(|run| {
+                let (e, w) = run[0];
+                let mask = if w { &all } else { &writers };
+                run.len() as u64 * popcount_and(&self.row(e).0, mask)
+            })
+            .sum()
+    }
+
+    /// Every member accesses the resource the same way: the same write flag
+    /// and (members of one pool share their accesses) the same certified
+    /// concurrency, so one pair's rule is every pair's.
+    fn uniform(&self, resource: ResourceId, members: &[(usize, bool)]) -> bool {
+        let conc = |g: usize| {
+            self.accesses[g]
+                .iter()
+                .find(|x| x.resource == resource)
+                .map(|x| &x.conc)
+        };
+        let (first, writes) = members[0];
+        let pool = self.index.pool_of(first);
+        let first_conc = conc(first);
+        members
+            .iter()
+            .all(|&(g, w)| w == writes && (self.index.pool_of(g) == pool || conc(g) == first_conc))
+    }
+
+    /// The first refusal inside one instance whose members are
+    /// [`Races::uniform`] writers and have no happens-before among them:
+    /// every pair is conflicting and unordered, so the rule of the first
+    /// pair is the rule of all, and a footprint separates them by
+    /// coordinates alone ([`Races::first_agreeing`]).
+    fn uniform_instance(
+        &self,
+        resource: ResourceId,
+        members: &[(usize, bool)],
+        pending: Option<&mut BTreeSet<String>>,
+    ) -> Option<Fault> {
+        let (a, b) = (members[0].0, members[1].0);
+        let axes = match self.pair_rule(resource, a, b, pending) {
+            Err(why) => return Some((a, b, why)),
+            Ok(PairRule::Admit) => return None,
+            Ok(PairRule::Axes(axes)) => axes,
+        };
+        let (x, y) = self.first_agreeing(members, axes)?;
+        let why = self.separation(resource, x, y, axes).err().unwrap_or_else(|| {
+            format!(
+                "race on resource {}: internal: tasks {x} and {y} agree on every footprint axis but the pair is separated",
+                resource.0
+            )
+        });
+        Some((x, y, why))
+    }
+
+    /// The lowest pair `(a, b)`, `a < b`, of `members` (in index order) no
+    /// footprint axis in `axes` separates: equal `vy` if `y` is an axis,
+    /// equal `vz` if `z` is, overlapping x-intervals if `x` is. Tiles of one
+    /// instance on equal `(vy, vz)` have disjoint x-intervals, so they
+    /// never overlap.
+    fn first_agreeing(&self, members: &[(usize, bool)], axes: u8) -> Option<(usize, usize)> {
+        let key = |g: usize| {
+            let t = self.flat[g];
+            (
+                if axes & 2 != 0 { t.vy } else { 0 },
+                if axes & 4 != 0 { t.vz } else { 0 },
+            )
+        };
+        let mut order: Vec<((u32, u32), usize)> =
+            members.iter().map(|&(g, _)| (key(g), g)).collect();
+        order.sort_unstable();
+        let mut best: Option<(usize, usize)> = None;
+        for group in order.chunk_by(|a, b| a.0 == b.0) {
+            let gids: Vec<usize> = group.iter().map(|&(_, g)| g).collect();
+            let found = match gids.len() {
+                0 | 1 => None,
+                _ if axes & 1 == 0 => Some((gids[0], gids[1])),
+                _ => self.first_x_overlap(&gids),
+            };
+            if let Some(pair) = found {
+                if best.map_or(true, |b| pair < b) {
+                    best = Some(pair);
+                }
+            }
+        }
+        best
+    }
+
+    /// The lowest pair `(a, b)`, `a < b`, of `gids` (ascending) whose
+    /// x-intervals `[vx, vx + max(vcount, 1))` overlap: the lowest `a` that
+    /// overlaps a later task, found by inserting the tasks from the last in
+    /// a set of disjoint merged intervals, then its lowest later partner.
+    fn first_x_overlap(&self, gids: &[usize]) -> Option<(usize, usize)> {
+        let span = |g: usize| {
+            let t = self.flat[g];
+            let start = u64::from(t.vx);
+            (start, start + u64::from(t.vcount.max(1)))
+        };
+        // start -> end of disjoint, non-touching segments of the union of the
+        // x-intervals of the tasks after the one being inserted.
+        let mut union: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut first = None;
+        for &g in gids.iter().rev() {
+            let (start, end) = span(g);
+            if union
+                .range(..end)
+                .next_back()
+                .is_some_and(|(_, &seg_end)| seg_end > start)
+            {
+                first = Some(g);
+            }
+            let (mut lo, mut hi) = (start, end);
+            if let Some((&seg_start, &seg_end)) = union.range(..=lo).next_back() {
+                if seg_end >= lo {
+                    lo = seg_start;
+                    hi = hi.max(seg_end);
+                    union.remove(&seg_start);
+                }
+            }
+            while let Some((&seg_start, &seg_end)) = union.range(lo..=hi).next() {
+                hi = hi.max(seg_end);
+                union.remove(&seg_start);
+            }
+            union.insert(lo, hi);
+        }
+        let a = first?;
+        let (a0, a1) = span(a);
+        let b = gids.iter().copied().find(|&g| {
+            let (b0, b1) = span(g);
+            g > a && a0 < b1 && b0 < a1
+        })?;
+        Some((a, b))
+    }
+
+    /// The first refusal among the pairs of one instance's members: the
+    /// all-pairs scan, for instances whose members are not uniform or are
+    /// ordered among themselves (neither happens in one eager launch).
+    fn pairwise_instance(
+        &self,
+        resource: ResourceId,
+        members: &[(usize, bool)],
+        mut pending: Option<&mut BTreeSet<String>>,
+    ) -> Option<Fault> {
+        for (i, &(a, a_writes)) in members.iter().enumerate() {
+            for &(b, b_writes) in &members[i + 1..] {
+                if !(a_writes || b_writes) || self.hb(a, b) || self.hb(b, a) {
+                    continue;
+                }
+                if let Err(why) = self.same_instance_pair(resource, a, b, pending.as_deref_mut()) {
+                    return Some((a, b, why));
+                }
+            }
+        }
+        None
+    }
+
+    /// The lowest unordered conflicting pair of tasks of `list` that are not
+    /// of one instance.
+    ///
+    /// Process the tasks in the order the progress search finished them.
+    /// Every happens-before edge goes forward in it, so a pair `(y, x)` with
+    /// `y` earlier is unordered iff `y` is not in `before` of `x`'s event.
+    /// For each task `x` the earlier tasks that conflict with it and are
+    /// outside `x`'s instance form a bitset; its lowest bit `y` gives the
+    /// lowest pair this `x` is in (`(y, x)` if `y < x`, else `(x, y)`, as
+    /// all its bits are above `x`). The lowest over all `x` is the lowest
+    /// pair.
+    fn first_race(
+        &self,
+        resource: ResourceId,
+        list: &[(usize, bool)],
+        by_instance: &BTreeMap<(u32, u32), Vec<(usize, bool)>>,
+    ) -> Option<Fault> {
+        let words = self.index.total().div_ceil(64);
+        let mut order = list.to_vec();
+        order.sort_unstable_by_key(|&(g, _)| self.topo[g]);
+        let (mut seen, mut seen_writers) = (vec![0u64; words], vec![0u64; words]);
+        let mut unordered = vec![0u64; words];
+        // Dense masks of the instances larger than a mask.
+        let mut dense: BTreeMap<(u32, u32), Vec<u64>> = BTreeMap::new();
+        let mut best: Option<(usize, usize)> = None;
+        for &(x, writes) in &order {
+            let conflicting = if writes { &seen } else { &seen_writers };
+            match self.pred_ix[x] {
+                Some(e) => {
+                    for ((u, c), r) in unordered.iter_mut().zip(conflicting).zip(&self.row(e).0) {
+                        *u = c & !r;
+                    }
+                }
+                None => unordered.copy_from_slice(conflicting),
+            }
+            if let Some(key) = self.instances.0[x] {
+                let members = &by_instance[&key];
+                if members.len() > words {
+                    let mask = dense.entry(key).or_insert_with(|| {
+                        let mut mask = vec![0u64; words];
+                        for &(g, _) in members {
+                            mask[g / 64] |= 1 << (g % 64);
+                        }
+                        mask
+                    });
+                    for (u, m) in unordered.iter_mut().zip(mask.iter()) {
+                        *u &= !m;
+                    }
+                } else {
+                    for &(g, _) in members {
+                        unordered[g / 64] &= !(1u64 << (g % 64));
+                    }
+                }
+            }
+            if let Some(y) = lowest_bit(&unordered) {
+                let pair = (x.min(y), x.max(y));
+                if best.map_or(true, |b| pair < b) {
+                    best = Some(pair);
+                }
+            }
+            seen[x / 64] |= 1 << (x % 64);
+            if writes {
+                seen_writers[x / 64] |= 1 << (x % 64);
+            }
+        }
+        let (a, b) = best?;
+        let writes = |g: usize| {
+            list.binary_search_by_key(&g, |p| p.0)
+                .map(|i| list[i].1)
+                .expect("a task of the list")
+        };
+        Some((
+            a,
+            b,
+            self.race_message(resource, a, b, writes(a), writes(b)),
+        ))
+    }
+
+    /// The refusal of an unordered conflicting pair of different instances.
+    fn race_message(
+        &self,
+        resource: ResourceId,
+        a: usize,
+        b: usize,
+        a_writes: bool,
+        b_writes: bool,
+    ) -> String {
+        let (pa, ka) = self.place(a);
+        let (pb, kb) = self.place(b);
+        format!(
+            "race on resource {}: task {ka} of pool {pa} (node {}) and task {kb} of pool {pb} (node {}) {} it and neither happens-before the other",
+            resource.0,
+            self.graph.pools[pa].node,
+            self.graph.pools[pb].node,
+            match (a_writes, b_writes) {
+                (true, true) => "both write",
+                (true, false) => "write/read",
+                _ => "read/write",
+            },
+        )
+    }
+
+    /// The reference semantics of the race pass, kept as the oracle the
+    /// sweep is tested against: every conflicting pair of every resource in
+    /// index order, `O(n^2)` per resource.
+    #[cfg(test)]
+    fn check_pairwise(
+        &self,
+        by_resource: &BTreeMap<ResourceId, Vec<(usize, bool)>>,
+        mut pending: Option<&mut BTreeSet<String>>,
+    ) -> Result<RaceTotals, String> {
+        let p = self.graph.pools.len();
+        let mut totals = RaceTotals::default();
+        for (&resource, list) in by_resource {
+            let mut dir = vec![false; p * p];
+            for (i, &(a, a_writes)) in list.iter().enumerate() {
+                for &(b, b_writes) in &list[i + 1..] {
+                    if !(a_writes || b_writes) {
+                        continue;
+                    }
+                    let (from, to) = if self.hb(a, b) {
+                        (a, b)
+                    } else if self.hb(b, a) {
+                        (b, a)
+                    } else if self.instances.same(a, b) {
+                        self.same_instance_pair(resource, a, b, pending.as_deref_mut())?;
+                        continue;
+                    } else {
+                        return Err(self.race_message(resource, a, b, a_writes, b_writes));
+                    };
+                    totals.ordered_pairs += 1;
+                    let (pf, pt) = (self.index.pool_of(from), self.index.pool_of(to));
+                    if pf != pt {
+                        dir[pf * p + pt] = true;
+                    }
+                }
+            }
+            for pf in 0..p {
+                for pt in 0..p {
+                    if dir[pf * p + pt] {
+                        totals.directed.insert((
+                            self.graph.pools[pf].node,
+                            self.graph.pools[pt].node,
+                            resource,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(totals)
+    }
+
+    /// `"task k of pool p (node n) and task k' of pool p' (node n')"`.
+    fn pair_label(&self, a: usize, b: usize) -> String {
+        let (pa, ka) = self.place(a);
+        let (pb, kb) = self.place(b);
+        format!(
+            "task {ka} of pool {pa} (node {}) and task {kb} of pool {pb} (node {})",
+            self.graph.pools[pa].node, self.graph.pools[pb].node
+        )
+    }
+
+    /// A conflicting pair of tasks `a < b` of one launch instance on
+    /// `resource` (see [`Instances`]): admitted only when the template's own
+    /// certificate says concurrent workgroups of its grid do not conflict
+    /// there. A commutative-atomic resource always; a write-only field with a
+    /// `WgDisjoint` footprint iff every workgroup of `a` and every workgroup
+    /// of `b` differ on some footprint axis; otherwise refused.
+    fn same_instance_pair(
+        &self,
+        resource: ResourceId,
+        a: usize,
+        b: usize,
+        pending: Option<&mut BTreeSet<String>>,
+    ) -> Result<(), String> {
+        match self.pair_rule(resource, a, b, pending)? {
+            PairRule::Admit => Ok(()),
+            PairRule::Axes(axes) => self.separation(resource, a, b, axes),
+        }
+    }
+
+    /// The part of [`Races::same_instance_pair`] that does not depend on
+    /// which two tasks of the instance (they share template, record and
+    /// virtual grid): the rule `a`'s access carries, and for a footprint the
+    /// checks of its assumptions against the headers and the record.
+    fn pair_rule(
+        &self,
+        resource: ResourceId,
+        a: usize,
+        b: usize,
+        pending: Option<&mut BTreeSet<String>>,
+    ) -> Result<PairRule, String> {
+        let (ta, tb) = (self.flat[a], self.flat[b]);
+        let fp = match self.accesses[a]
+            .iter()
+            .find(|x| x.resource == resource)
+            .map(|x| &x.conc)
+        {
+            Some(Conc::Commutative) => return Ok(PairRule::Admit),
+            Some(Conc::Footprint(fp)) => fp,
+            Some(Conc::None) | None => {
+                if let Some(set) = pending {
+                    set.insert(format!(
+                        "inter-WG disjointness unproven: template {}, resource {}",
+                        ta.template, resource.0
+                    ));
+                    return Ok(PairRule::Admit);
+                }
+                return Err(format!(
+                    "race on resource {}: {} are workgroups of one launch instance of template {} (ka_off {}) and conflict on it; standalone receipt proves no inter-WG write disjointness (not all commutative atomics, and no write-only per-workgroup footprint)",
+                    resource.0,
+                    self.pair_label(a, b),
+                    ta.template,
+                    ta.ka_off
+                ));
+            }
+        };
+        // The proof's assumptions, against the headers and the record's
+        // bound scalars.
+        for (i, name) in ["x", "y", "z"].iter().enumerate() {
+            let Some(bound) = fp.bounds[i] else { continue };
+            for t in [ta, tb] {
+                let extent = [t.gx, t.gy, t.gz][i];
+                if u64::from(extent) > bound {
+                    return Err(format!(
+                        "{} (template {}, ka_off {}): virtual grid extent {extent} on {name} exceeds the footprint's certified tile-id bound {bound} on resource {}",
+                        self.pair_label(a, b),
+                        ta.template,
+                        ta.ka_off,
+                        resource.0
+                    ));
+                }
+            }
+        }
+        for req in &fp.requires {
+            let got = self
+                .by_base
+                .get(&u64::from(ta.ka_off))
+                .and_then(|r| r.scalars.iter().find(|(o, _)| *o == req.offset))
+                .map(|(_, v)| *v);
+            if !got.is_some_and(|v| req.holds(v, [ta.gx, ta.gy, ta.gz])) {
+                let (offset, mask, value) = (req.offset, req.mask, req.value);
+                let rel = match req.op {
+                    RequireOp::MaskEq => format!("& {mask:#x} == {value:#x}"),
+                    RequireOp::LeU => format!("<= {value:#x}"),
+                    RequireOp::GeU => format!(">= {value:#x}"),
+                    RequireOp::GridLe => format!(
+                        ">= {value} * grid extent {} (virtual grid {}, {}, {})",
+                        mask, ta.gx, ta.gy, ta.gz
+                    ),
+                };
+                return Err(format!(
+                    "{} (template {}, ka_off {}): the footprint on resource {} requires record dword +{offset} {rel}, the record's scalar is {got:?}",
+                    self.pair_label(a, b),
+                    ta.template,
+                    ta.ka_off,
+                    resource.0
+                ));
+            }
+        }
+        Ok(PairRule::Axes(fp.axes))
+    }
+
+    /// A footprint over `axes` admits the pair `a < b` iff it differs on an
+    /// axis: `vy` / `vz` unequal, or (x) disjoint x-intervals.
+    fn separation(&self, resource: ResourceId, a: usize, b: usize, axes: u8) -> Result<(), String> {
+        let (ta, tb) = (self.flat[a], self.flat[b]);
+        let (ax0, ax1) = (
+            u64::from(ta.vx),
+            u64::from(ta.vx) + u64::from(ta.vcount.max(1)),
+        );
+        let (bx0, bx1) = (
+            u64::from(tb.vx),
+            u64::from(tb.vx) + u64::from(tb.vcount.max(1)),
+        );
+        let x_overlap = ax0 < bx1 && bx0 < ax1;
+        let differs = (axes & 2 != 0 && ta.vy != tb.vy)
+            || (axes & 4 != 0 && ta.vz != tb.vz)
+            || (axes & 1 != 0 && !x_overlap);
+        if differs {
+            return Ok(());
+        }
+        let common = ax0.max(bx0);
+        let (wx, wx2) = if axes & 1 != 0 {
+            (common, common)
+        } else {
+            (ax0, bx0)
+        };
+        let tasks = self.pair_label(a, b);
+        Err(format!(
+            "race on resource {}: {tasks} (template {}, ka_off {}) run workgroups ({wx}, {}, {}) and ({wx2}, {}, {}) concurrently, which agree on every footprint axis (mask {axes:#05b}); the certified footprint only separates workgroups differing on those axes",
+            resource.0, ta.template, ta.ka_off, ta.vy, ta.vz, tb.vy, tb.vz
+        ))
     }
 }
 
