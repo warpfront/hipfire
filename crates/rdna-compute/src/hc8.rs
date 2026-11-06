@@ -345,6 +345,75 @@ pub fn hc8_gemm(
     Ok(name)
 }
 
+/// Fused HC read-up `hc8_read_up_e4m3_n{1..4}`: `mixed[rows, hidden]` = the up projection of `low`
+/// on the HC8 weight `w` (`[4 * hidden, low_rank]`) folded with `normalized` through the product
+/// `hyper_read_projected_f32` DAG (four branches), word-equal to [`hc8_gemm`] (`set`) followed by
+/// `hyper_read_projected`. `low` is F32 `[rows, low_rank]` (BF16-exact), `normalized` F32
+/// `[rows, 4 * hidden]`, `mixed` F32 `[rows, hidden]`; `rows` in `1..=64`, `hidden % 16 == 0`,
+/// `low_rank % 32 == 0`. Returns the launched entry name.
+pub fn hc8_read_up(
+    gpu: &mut Gpu,
+    w: &Hc8Weight,
+    low: &GpuTensor,
+    normalized: &GpuTensor,
+    mixed: &GpuTensor,
+    rows: usize,
+    hidden: usize,
+) -> HipResult<String> {
+    use peacemaker_isa::kernels::hc8_wmma_gfx1201::{read_up_symbol, READ_UP_BLOCK, READ_UP_KERNARG_BYTES};
+    if gpu.arch != "gfx1201" {
+        return Err(err("requires exact gfx1201; no HIP fallback"));
+    }
+    if w.fmt != Hc8Fmt::E4m3 {
+        return Err(err("read_up: the fused read exists for e4m3 only"));
+    }
+    if !(1..=MAX_ROWS).contains(&rows) {
+        return Err(err(format!("rows {rows} not in 1..={MAX_ROWS}")));
+    }
+    let k = w.k;
+    if hidden == 0 || hidden % 16 != 0 || w.m != 4 * hidden || k == 0 || k % 32 != 0 {
+        return Err(err(format!("read_up: weight [{}, {k}] is not [4 * hidden {hidden}, K % 32 == 0]", w.m)));
+    }
+    for (t, bytes, name) in [
+        (low, rows * k * 4, "low"),
+        (normalized, rows * 4 * hidden * 4, "normalized"),
+        (mixed, rows * hidden * 4, "mixed"),
+    ] {
+        if t.dtype != DType::F32 || t.buf.size() < bytes {
+            return Err(err(format!("read_up: {name} must be F32 with >= {bytes} bytes")));
+        }
+    }
+    IMAGE_VERIFIED.clone().map_err(err)?;
+    let name = read_up_symbol(rows.div_ceil(16) as u32);
+    gpu.bind_thread()?;
+    gpu.ensure_embedded_kernel(MODULE, IMAGE, &name)?;
+    let mut args = [0u8; READ_UP_KERNARG_BYTES as usize];
+    for (i, p) in [
+        w.q.buf.as_ptr(),
+        w.s.buf.as_ptr(),
+        low.buf.as_ptr(),
+        normalized.buf.as_ptr(),
+        mixed.buf.as_ptr(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        args[i * 8..i * 8 + 8].copy_from_slice(&(p as u64).to_le_bytes());
+    }
+    args[40..44].copy_from_slice(&(hidden as u32).to_le_bytes());
+    args[44..48].copy_from_slice(&(k as u32).to_le_bytes());
+    args[48..52].copy_from_slice(&(rows as u32).to_le_bytes());
+    gpu.launch_blob_recorded(
+        &name,
+        [(hidden / 16) as u32, 1, 1],
+        [READ_UP_BLOCK, 1, 1],
+        0,
+        &mut args,
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )?;
+    Ok(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

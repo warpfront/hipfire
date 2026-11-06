@@ -106,6 +106,25 @@ impl Gpu {
         hc8::hc8_gemm(self, &view, x, y, rows, act, geom)
     }
 
+    /// Fused HC read-up ([`hc8::hc8_read_up`]) on a resident `HC8E4M3Row` up weight `[4 * hidden, k]`:
+    /// `mixed` from `low` and `normalized`, word-equal to `hc8_gemm_tensor` (no act) +
+    /// `hyper_read_projected`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc8_read_up_tensor(
+        &mut self,
+        w: &GpuTensor,
+        m: usize,
+        k: usize,
+        low: &GpuTensor,
+        normalized: &GpuTensor,
+        mixed: &GpuTensor,
+        rows: usize,
+        hidden: usize,
+    ) -> HipResult<String> {
+        let view = self.hc8_weight_view(w, m, k)?;
+        hc8::hc8_read_up(self, &view, low, normalized, mixed, rows, hidden)
+    }
+
     /// Exact expansion of an HC8 weight into `dst` (BF16 or F16, `m * k` elements, row-major).
     /// `dst` must not alias `w`.
     pub fn hc8_dequant(&mut self, w: &GpuTensor, m: usize, k: usize, dst: &GpuTensor) -> HipResult<()> {
