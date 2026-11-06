@@ -399,11 +399,17 @@ fn parse_single(row: &'static OpRow, rest: &str, arch: Arch) -> Result<Inst, Par
             ));
         }
         let operand = parse_extra(row, text)?;
-        // Only VBUFFER carries TH and scope as operands; GLOBAL loads, stores
-        // and atomics keep them in the cache policy (`global_inv`/`global_wb`
+        // Only VBUFFER carries TH and scope as operands; GLOBAL/FLAT/SCRATCH loads,
+        // stores and atomics keep them in the cache policy (`global_inv`/`global_wb`
         // spell their scope as an operand).
-        if row.form == Form::Vmem(peacemaker_ir::inst::VmemForm::Global)
-            && !matches!(row.name, "global_inv" | "global_wb")
+        if matches!(
+            row.form,
+            Form::Vmem(
+                peacemaker_ir::inst::VmemForm::Global
+                    | peacemaker_ir::inst::VmemForm::Flat
+                    | peacemaker_ir::inst::VmemForm::Scratch
+            )
+        ) && !matches!(row.name, "global_inv" | "global_wb")
         {
             match operand {
                 Operand::CacheTh(th) => {
@@ -1236,18 +1242,25 @@ fn parse_extra(row: &OpRow, text: &str) -> Result<Operand, ParseError> {
         return Ok(Operand::Scope(scope));
     }
     if let Some(th) = text.strip_prefix("th:") {
-        let global = row.form == Form::Vmem(peacemaker_ir::inst::VmemForm::Global);
-        if global && row.name.starts_with("global_atomic") {
+        let global = matches!(
+            row.form,
+            Form::Vmem(
+                peacemaker_ir::inst::VmemForm::Global
+                    | peacemaker_ir::inst::VmemForm::Flat
+                    | peacemaker_ir::inst::VmemForm::Scratch
+            )
+        );
+        // the operation after the global_/flat_/scratch_ prefix
+        let op = row.name.split_once('_').map_or(row.name, |(_, rest)| rest);
+        if global && op.starts_with("atomic") {
             // gfx12 atomics: TH bit 0 selects the returning form.
             return match th {
                 "TH_ATOMIC_RETURN" => Ok(Operand::CacheTh(1)),
                 _ => Err(bad_operand(row.name, text, "bad cache TH")),
             };
         }
-        let load =
-            row.name.starts_with("buffer_load") || global && row.name.starts_with("global_load");
-        let store =
-            row.name.starts_with("buffer_store") || global && row.name.starts_with("global_store");
+        let load = row.name.starts_with("buffer_load") || global && op.starts_with("load");
+        let store = row.name.starts_with("buffer_store") || global && op.starts_with("store");
         let names = if load {
             ["RT", "NT", "HT", "LU", "NT_RT", "RT_NT", "NT_HT", "BYPASS"]
         } else if store {

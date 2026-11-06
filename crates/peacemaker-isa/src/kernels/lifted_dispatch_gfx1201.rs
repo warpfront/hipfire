@@ -39,7 +39,9 @@ use peacemaker_lift::rewrite::region::LiftedRegion;
 pub const KERNARG_BYTES: u32 = 72;
 pub const TASK_BYTES: u32 = 128;
 pub const TRACE_BYTES: u32 = 48;
-/// Highest SGPR count a hosted body may use (the dispatcher owns s72..s103).
+/// SGPRs a hosted body may use without spilling (the dispatcher owns s72..s103). A body
+/// using more (up to `WG_X`, the first region input above it) runs with the dispatcher
+/// SGPRs below its extent parked in the lanes of one spare VGPR.
 pub const BODY_SGPR_LIMIT: u16 = 72;
 /// The SGPRs that carry the virtual workgroup id (`ttmp9`, `ttmp7`) into a region.
 pub const WG_X: u16 = 102;
@@ -73,6 +75,30 @@ const KA_OFF: u8 = 98;
 const DONE: u8 = 99;
 const VCOUNT: u8 = 100;
 const STEP: u8 = 101;
+/// Every dispatcher-owned SGPR range (name, base, length).
+const DISPATCHER_SGPRS: &[(&str, u8, u8)] = &[
+    ("gx", GX, 1),
+    ("ptr_a", PTR_A, 2),
+    ("t_publish", T_PUBLISH, 2),
+    ("ptr_b", PTR_B, 2),
+    ("hw_wg", HW_WG, 1),
+    ("t_start", T_START, 2),
+    ("t_end", T_END, 2),
+    ("t_ready", T_READY, 2),
+    ("params", PARAMS, 2),
+    ("wavebase", WAVEBASE, 1),
+    ("temp", TEMP, 1),
+    ("n_tasks", N_TASKS, 1),
+    ("trace_on", TRACE_ON, 1),
+    ("idx", IDX, 1),
+    ("tmpl", TMPL, 1),
+    ("vx", VX, 1),
+    ("vyz", VYZ, 1),
+    ("ka_off", KA_OFF, 1),
+    ("done", DONE, 1),
+    ("vcount", VCOUNT, 1),
+    ("step", STEP, 1),
+];
 
 fn s(n: u8) -> RegRef {
     RegRef {
@@ -190,9 +216,9 @@ pub fn pool(
                 r.symbol, r.block
             ));
         }
-        if r.sgprs > BODY_SGPR_LIMIT {
+        if r.sgprs > WG_X {
             return Err(format!(
-                "{}: {} SGPRs exceed the hosted limit {BODY_SGPR_LIMIT}",
+                "{}: {} SGPRs reach the region inputs at s{WG_X}",
                 r.symbol, r.sgprs
             ));
         }
@@ -233,30 +259,66 @@ pub fn pool(
         1,
         Live::Between("entry".into(), ".Lnext".into()),
     )?;
-    for (name, base, len) in [
-        ("gx", GX, 1),
-        ("ptr_a", PTR_A, 2),
-        ("t_publish", T_PUBLISH, 2),
-        ("ptr_b", PTR_B, 2),
-        ("hw_wg", HW_WG, 1),
-        ("t_start", T_START, 2),
-        ("t_end", T_END, 2),
-        ("t_ready", T_READY, 2),
-        ("params", PARAMS, 2),
-        ("wavebase", WAVEBASE, 1),
-        ("temp", TEMP, 1),
-        ("n_tasks", N_TASKS, 1),
-        ("trace_on", TRACE_ON, 1),
-        ("idx", IDX, 1),
-        ("tmpl", TMPL, 1),
-        ("vx", VX, 1),
-        ("vyz", VYZ, 1),
-        ("ka_off", KA_OFF, 1),
-        ("done", DONE, 1),
-        ("vcount", VCOUNT, 1),
-        ("step", STEP, 1),
-    ] {
-        regs.add_range(name, Kind::S, base, len, Live::Whole)?;
+    // Bodies above BODY_SGPR_LIMIT: the dispatcher SGPRs they overlap are parked in
+    // lanes of `spill_v` (above every body's and dispatcher temporary's VGPRs) from just
+    // before the region entry to just after its exit; those SGPRs' ranges exclude it.
+    let spill_v: u8 = hosted
+        .iter()
+        .map(|h| h.region.vgprs)
+        .max()
+        .unwrap_or(0)
+        .max(19)
+        .try_into()
+        .map_err(|_| "no VGPR left to park dispatcher SGPRs".to_string())?;
+    let spilling: Vec<(u32, String, String, u16)> = hosted
+        .iter()
+        .filter(|h| h.region.sgprs > BODY_SGPR_LIMIT)
+        .map(|h| {
+            let name = format!("t{}", h.tmpl);
+            (
+                h.tmpl,
+                region_entry_label(&name),
+                region_exit_label(&name),
+                h.region.sgprs,
+            )
+        })
+        .collect();
+    for &(name, base, len) in DISPATCHER_SGPRS {
+        let parked: Vec<&(u32, String, String, u16)> = spilling
+            .iter()
+            .filter(|(_, _, _, top)| u16::from(base) < *top)
+            .collect();
+        if parked.is_empty() {
+            regs.add_range(name, Kind::S, base, len, Live::Whole)?;
+            continue;
+        }
+        let mut from = "entry".to_string();
+        for (i, (_, entry, exit, _)) in parked.iter().enumerate() {
+            regs.add_range(
+                &format!("{name}_{i}"),
+                Kind::S,
+                base,
+                len,
+                Live::Between(from, entry.clone()),
+            )?;
+            from = exit.clone();
+        }
+        regs.add_range(
+            &format!("{name}_{}", parked.len()),
+            Kind::S,
+            base,
+            len,
+            Live::Between(from, ".Ldone".into()),
+        )?;
+    }
+    for (t, ..) in &spilling {
+        regs.add_range(
+            &format!("park_t{t}"),
+            Kind::V,
+            spill_v,
+            1,
+            Live::Between(format!(".Lt{t}_park"), format!(".Lt{t}_unpark")),
+        )?;
     }
     // claim/broadcast and publish temporaries (outside every region)
     add_pieces(
@@ -681,6 +743,23 @@ pub fn pool(
                 )?;
                 b.wait_all()?;
                 let r = h.region;
+                // the dispatcher SGPRs below the body's extent, parked lane by lane
+                let parked: Vec<u8> = DISPATCHER_SGPRS
+                    .iter()
+                    .filter(|(_, base, _)| u16::from(*base) < r.sgprs)
+                    .flat_map(|&(_, base, len)| base..base + len)
+                    .collect();
+                if !parked.is_empty() {
+                    b.label(&format!(".Lt{}_park", h.tmpl))?;
+                    for &k in &parked {
+                        op(
+                            b,
+                            &format!("v_writelane_b32 v{spill_v}, s{k}, {}", k - GX),
+                            &[v(spill_v)],
+                            &[s(k)],
+                        )?;
+                    }
+                }
                 b.foreign_region(&abi, &r.lines, r.sgprs, r.vgprs, r.lds_bytes)?;
                 // provenance for `.note.pm_regions` (railgun-cert replays the conversion)
                 let p = b
@@ -697,6 +776,17 @@ pub fn pool(
                 });
                 p.source_object_sha256 = Some(r.receipt.base_object_sha256);
                 p.source_symbol = Some(r.symbol.clone());
+                for &k in &parked {
+                    op(
+                        b,
+                        &format!("v_readlane_b32 s{k}, v{spill_v}, {}", k - GX),
+                        &[s(k)],
+                        &[v(spill_v)],
+                    )?;
+                }
+                if !parked.is_empty() {
+                    b.label(&format!(".Lt{}_unpark", h.tmpl))?;
+                }
                 exec_all(b)?;
                 op(
                     b,

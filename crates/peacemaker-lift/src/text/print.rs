@@ -160,10 +160,13 @@ pub fn canonical(inst: &Inst, arch: Arch) -> Result<String, PrintError> {
     for operand in inst.operands.iter().skip(slots.len() + skew - cmpx_offset) {
         tail.push(operand_text(operand, None, row, inst)?);
     }
-    // gfx12 GLOBAL loads, stores and atomics keep TH and scope in the cache
-    // policy, not as operands.
+    // gfx12 GLOBAL/FLAT/SCRATCH loads, stores and atomics keep TH and scope in the
+    // cache policy, not as operands.
     if arch == Arch::Gfx1201
-        && inst.form == Form::Vmem(VmemForm::Global)
+        && matches!(
+            inst.form,
+            Form::Vmem(VmemForm::Global | VmemForm::Flat | VmemForm::Scratch)
+        )
         && !matches!(row.name, "global_inv" | "global_wb")
     {
         tail.extend(global_cache_policy_text(row, &inst.mods)?);
@@ -345,12 +348,13 @@ fn gfx12_rtn_msg_name(id: u8) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
-/// `th:`/`scope:` tokens of a gfx12 GLOBAL row, in objdump order.
+/// `th:`/`scope:` tokens of a gfx12 GLOBAL/FLAT/SCRATCH row, in objdump order.
 fn global_cache_policy_text(row: &OpRow, mods: &Modifiers) -> Result<Vec<String>, PrintError> {
     let mut out = Vec::new();
     let th = usize::from(mods.cpol.th);
     if th != 0 {
-        let text = if row.name.starts_with("global_atomic") {
+        let op = row.name.split_once('_').map_or(row.name, |(_, rest)| rest);
+        let text = if op.starts_with("atomic") {
             match th {
                 1 => "th:TH_ATOMIC_RETURN",
                 _ => {
@@ -361,7 +365,7 @@ fn global_cache_policy_text(row: &OpRow, mods: &Modifiers) -> Result<Vec<String>
                 }
             }
             .to_owned()
-        } else if row.name.starts_with("global_load") {
+        } else if op.starts_with("load") {
             let hints = ["RT", "NT", "HT", "LU", "NT_RT", "RT_NT", "NT_HT", "BYPASS"];
             format!("th:TH_LOAD_{}", hints[th])
         } else {
