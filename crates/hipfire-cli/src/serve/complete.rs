@@ -3561,6 +3561,10 @@ pub(crate) fn completion_timings(completion: &Completion) -> serde_json::Value {
         // on gfx1101 multi-slot. `hipfire.tok_s` carries the wall number
         // for clients that want it.
         "decode_tok_s": done.get("decode_tok_s"),
+        // Measured decode wall time (the span `decode_tok_s` divides by), so
+        // clients read decode time directly instead of deriving it from a
+        // rounded rate; the counterpart of `prefill_ms`.
+        "decode_ms": done.get("decode_ms"),
         "latency_ms": done.get("latency_ms"),
         "tau": done.get("tau"),
         "cycles": done.get("cycles"),
@@ -3596,6 +3600,7 @@ pub(crate) fn completion_hipfire(completion: &Completion) -> serde_json::Value {
         "tok_s": done.get("tok_s"),
         "prefill_tok_s": done.get("prefill_tok_s"),
         "decode_tok_s": done.get("decode_tok_s"),
+        "decode_ms": done.get("decode_ms"),
         "execution_mode": done.get("execution_mode"),
         "continuous_batch": done.get("continuous_batch"),
     });
@@ -3944,6 +3949,7 @@ mod tests {
                 "prefill_ms": 10.0,
                 "prefill_tok_s": 100.0,
                 "decode_tok_s": 40.0,
+                "decode_ms": 3175.0,
                 "latency_ms": 250.5,
                 "tok_s": 20.0,
             }),
@@ -3953,6 +3959,9 @@ mod tests {
         let timings = completion_timings(&completion);
         assert_eq!(timings["latency_ms"], 250.5);
         assert_eq!(timings["ttft_ms"], 12.5);
+        assert_eq!(timings["prefill_ms"], 10.0);
+        assert_eq!(timings["decode_ms"], 3175.0);
+        assert_eq!(completion_hipfire(&completion)["decode_ms"], 3175.0);
         // Absent latency stays null-like (serde_json::Value::Null via .get).
         let no_lat = completion_timings(&Completion {
             id: "req-lat".into(),
