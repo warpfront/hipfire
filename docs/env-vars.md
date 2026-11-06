@@ -2575,6 +2575,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_EP` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/hipfire-arch-qwen4/src/weights/trunk_shard.rs | developer |
 | `HIPFIRE_QWEN4_EP_EXPERT_HOTSET` | crates/hipfire-arch-qwen4/src/artifact.rs, crates/hipfire-arch-qwen4/src/bundle.rs | developer |
 | `HIPFIRE_QWEN4_EP_GATHER_DEVICE_WAIT` | crates/hipfire-arch-qwen4/src/ep.rs | developer |
+| `HIPFIRE_QWEN4_EP_LANE_AR_FLOOR` | crates/hipfire-arch-qwen4/src/mtp_lanes.rs | developer |
 | `HIPFIRE_QWEN4_EP_LONE_MTP_LANE` | crates/hipfire-generate/src/batch.rs | developer |
 | `HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO` | crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO_POISON` | crates/rdna-compute/src/feature_flags.rs | developer |
