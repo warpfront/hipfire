@@ -344,8 +344,8 @@ impl DraftHead {
     /// reused row after row). With `batch` = (`logits` of at least `rows *
     /// vocab` F32, `rotation` of at least `rows * hidden` F32) and an
     /// MQ2G256V2 ranking copy, the rows that rank the same layout share one
-    /// x-batched GEMV over the copy (every weight row read once per chunk of
-    /// four rows): each row is rotated by the one-row rotate, the x-batched
+    /// x-batched GEMV over the copy (every weight row read once per chunk: eight
+    /// rows on the gfx1201 PeaceMaker module, four on the hipcc kernel): each row is rotated by the one-row rotate, the x-batched
     /// kernel is byte-identical per row to the one-row GEMV, and each row's
     /// top-8 re-score runs on its own logits row, so every slot holds the
     /// bytes a one-row `draft_enqueue` writes. Every lane's result is parsed

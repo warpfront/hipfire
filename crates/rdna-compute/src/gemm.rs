@@ -158,8 +158,17 @@ static MQ2_XBATCH_PM_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(|| {
     }
 });
 
+/// x-batch capacity of the gfx1201 PeaceMaker MQ2 module: B = 1..=8 rows run in
+/// one launch. The hipcc MQ2 kernel stays at 4 ([`XBATCH_HIP_CAP`]).
+const MQ2_XBATCH_PM_CAP: usize = 8;
+
+/// x-batch capacity of every hipcc x-batch source
+/// (`HIPFIRE_MQ{4,6}G256V2_XBATCH_MAX`).
+const XBATCH_HIP_CAP: usize = 4;
+
 /// Code of an x-batched V2 GEMV launch: a hipcc source (one output row per
-/// wave) or an embedded PeaceMaker module (`rows_per_block` rows per wave).
+/// wave, x-batch chunks of at most 4 rows) or an embedded PeaceMaker module
+/// (`rows_per_block` rows per wave, chunks of at most `cap` x-batch rows).
 #[derive(Clone, Copy)]
 enum XbatchCode {
     Hip(&'static str),
@@ -167,6 +176,7 @@ enum XbatchCode {
         module: &'static str,
         image: &'static [u8],
         rows_per_block: usize,
+        cap: usize,
     },
 }
 
@@ -42594,8 +42604,6 @@ impl Gpu {
     }
 
     /// Plain `Y = W·X` over `batch_size` rows of an MQ2G256V2 weight with the
-    /// x-batched scalar GEMV (chunks of 4): each row is byte-identical to the
-    /// singleton `gemv_mq2g256v2` on that row (same per-row accumulation
     /// order), and every weight row is read once per chunk. `x` holds the rows
     /// already in the weight's FWHT basis, `y` is `[batch_size, m]`.
     pub fn gemv_mq2g256v2_xbatch(
@@ -42619,7 +42627,7 @@ impl Gpu {
     }
 
     /// Whether the gfx1201 PeaceMaker x-batched MQ2 module covers this shape:
-    /// exact gfx1201, `K % 256 == 0`, and every buffer of a four-row chunk
+    /// exact gfx1201, `K % 256 == 0`, and every buffer of an eight-row chunk
     /// within the module's 32-bit buffer offsets.
     pub fn mq2_xbatch_pm_covers(&self, m: usize, k: usize) -> bool {
         const LIMIT: usize = i32::MAX as usize;
@@ -42631,8 +42639,8 @@ impl Gpu {
                 .checked_mul(72)
                 .and_then(|row| row.checked_mul(m))
                 .is_some_and(|bytes| bytes <= LIMIT)
-            && m.checked_mul(16).is_some_and(|bytes| bytes <= LIMIT)
-            && k.checked_mul(16).is_some_and(|bytes| bytes <= LIMIT)
+            && m.checked_mul(32).is_some_and(|bytes| bytes <= LIMIT)
+            && k.checked_mul(32).is_some_and(|bytes| bytes <= LIMIT)
     }
 
     /// [`Self::gemv_mq2g256v2_xbatch`] on an explicit kernel: `pm` runs the
@@ -42672,6 +42680,7 @@ impl Gpu {
                 module: "gemv_mq2_xbatch_pm_gfx1201",
                 image: kernels::GEMV_MQ2_XBATCH_PM_GFX1201,
                 rows_per_block: 4,
+                cap: MQ2_XBATCH_PM_CAP,
             }
         } else {
             XbatchCode::Hip(kernels::GEMV_MQ2G256V2_XBATCH_SRC)
@@ -42715,8 +42724,10 @@ impl Gpu {
     }
 
     /// Launch an x-batched V2 GEMV (`A, x, y, M, K, B` ABI) over `batch_size`
-    /// rows in chunks of `XBATCH_MAX`, the accumulator width of every x-batch
-    /// source (`HIPFIRE_MQ{4,6}G256V2_XBATCH_MAX`).
+    /// rows in chunks of the kernel's x-batch capacity: [`XBATCH_HIP_CAP`] (4,
+    /// the accumulator width of every hipcc x-batch source,
+    /// `HIPFIRE_MQ{4,6}G256V2_XBATCH_MAX`) or the PeaceMaker module's `cap`
+    /// ([`MQ2_XBATCH_PM_CAP`], 8).
     #[allow(clippy::too_many_arguments)]
     fn gemv_v2_xbatch_rows(
         &mut self,
@@ -42729,32 +42740,32 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        const XBATCH_MAX: usize = 4;
         assert!(
             k.is_multiple_of(256),
             "{func}: x-batch V2 GEMV requires K%256==0"
         );
         self.bind_thread()?;
-        let rows_per_block = match code {
+        let (rows_per_block, xbatch_max) = match code {
             XbatchCode::Hip(source) => {
                 self.ensure_kernel(func, source, func)?;
-                1
+                (1, XBATCH_HIP_CAP)
             }
             XbatchCode::Pm {
                 module,
                 image,
                 rows_per_block,
+                cap,
             } => {
                 self.ensure_embedded_kernel(module, image, func)?;
-                rows_per_block
+                (rows_per_block, cap)
             }
         };
         let grid_x = m.div_ceil(rows_per_block) as u32;
         let a_ptr = a_raw.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
-        for start in (0..batch_size).step_by(XBATCH_MAX) {
-            let rows = XBATCH_MAX.min(batch_size - start);
+        for start in (0..batch_size).step_by(xbatch_max) {
+            let rows = xbatch_max.min(batch_size - start);
             let x_rows = x.sub_offset(start * k, rows * k);
             let y_rows = y.sub_offset(start * m, rows * m);
             let x_ptr = x_rows.buf.as_ptr();
