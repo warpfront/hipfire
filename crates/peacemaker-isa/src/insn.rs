@@ -20,6 +20,12 @@ pub enum MemoryClass {
     DsStore,
     SmemLoad,
     Export,
+    /// A FLAT access (foreign lifted text only; the builder emits none). It may reach
+    /// global memory or LDS, so it counts on the VMEM counter (LOADcnt for a load or a
+    /// returning atomic, STOREcnt otherwise) and on DScnt, in order with neither.
+    Flat {
+        load: bool,
+    },
 }
 #[derive(Clone, Debug)]
 pub struct Instruction {

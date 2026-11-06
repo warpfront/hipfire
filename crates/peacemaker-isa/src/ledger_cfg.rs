@@ -46,7 +46,7 @@
 //!   line through the lift's instruction table (`peacemaker_lift::text::parse_line`,
 //!   whose `Effects` give defs, uses and the memory class) and checked like any
 //!   other instruction. A foreign line the table cannot decode, a memory class the
-//!   ledger cannot track (flat, LDS DMA), or a `ttmp` operand of a memory
+//!   ledger cannot track (LDS DMA; FLAT counts on both the VMEM counter and DScnt), or a `ttmp` operand of a memory
 //!   operation is an error, not a skipped line (`ttmp` operands of other
 //!   instructions, e.g. workgroup-id reads, are not tracked). Outside `foreign`, an instruction with empty metadata is taken
 //!   at its word: it has no memory effect.
@@ -386,10 +386,10 @@ fn enrich(text: &str, arch: Arch) -> Result<Instruction, String> {
             // SMEM returns out of order on its own counter; a store defines nothing.
             MemClass::SmemLoad | MemClass::SmemStore => MemoryClass::SmemLoad,
             MemClass::Export => MemoryClass::Export,
-            class @ (MemClass::LdsDma
-            | MemClass::FlatLoad
-            | MemClass::FlatStore
-            | MemClass::FlatAtomic { .. }) => {
+            MemClass::FlatLoad => MemoryClass::Flat { load: true },
+            MemClass::FlatStore => MemoryClass::Flat { load: false },
+            MemClass::FlatAtomic { returns } => MemoryClass::Flat { load: returns },
+            class @ MemClass::LdsDma => {
                 return Err(format!(
                     "a {class:?} memory operation, which the wait ledger cannot track"
                 ))

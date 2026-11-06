@@ -205,6 +205,38 @@ impl Ledger {
             self.next_id += 1;
             return;
         }
+        if let MemoryClass::Flat { load } = class {
+            // one pending entry per counter it may count on; a load's destination is
+            // defined once both have retired (each entry carries it)
+            let vmem = match (arch.gfx12(), load) {
+                (true, true) => Counter::Load,
+                (true, false) => Counter::Store,
+                (false, true) => Counter::Vm,
+                (false, false) if arch == Arch::Gfx942 => Counter::Vm,
+                (false, false) => Counter::Vs,
+            };
+            let lds = if arch.gfx12() {
+                Counter::Ds
+            } else {
+                Counter::Lgkm
+            };
+            for counter in [vmem, lds] {
+                self.pending.push(Pending {
+                    id: self.next_id,
+                    counter,
+                    defs: if load { insn.defs.clone() } else { vec![] },
+                    src_locks: insn.uses.clone(),
+                    in_order: false,
+                    family: MemoryFamily::Global,
+                    order: OrderClass::Family(MemoryFamily::Global),
+                    maybe: false,
+                    aliases: vec![],
+                    lds_slots: vec![],
+                });
+                self.next_id += 1;
+            }
+            return;
+        }
         let gfx942 = arch == Arch::Gfx942;
         let mnemonic = insn.mnemonic();
         let (counter, in_order, load) = match (arch.gfx12(), class) {
@@ -223,15 +255,16 @@ impl Ledger {
             (false, MemoryClass::SmemLoad) => (Counter::Lgkm, false, true),
             (_, MemoryClass::Export) => (Counter::Exp, false, false),
             // recorded above
-            (_, MemoryClass::VmemAtomic { .. }) => return,
+            (_, MemoryClass::VmemAtomic { .. } | MemoryClass::Flat { .. }) => return,
         };
         let family = match class {
             MemoryClass::VmemLoad | MemoryClass::VmemStore if mnemonic.starts_with("buffer_") => {
                 MemoryFamily::Buffer
             }
-            MemoryClass::VmemLoad | MemoryClass::VmemStore | MemoryClass::VmemAtomic { .. } => {
-                MemoryFamily::Global
-            }
+            MemoryClass::VmemLoad
+            | MemoryClass::VmemStore
+            | MemoryClass::VmemAtomic { .. }
+            | MemoryClass::Flat { .. } => MemoryFamily::Global,
             MemoryClass::DsLoad | MemoryClass::DsStore => MemoryFamily::Ds,
             MemoryClass::SmemLoad => MemoryFamily::Smem,
             MemoryClass::Export => MemoryFamily::Export,
@@ -942,6 +975,39 @@ mod gfx942_tests {
     /// Loads and stores of buffer and global share VM_CNT in issue order
     /// (CDNA3 ISA §4.4 p.19): the wait is the number of younger VM_CNT
     /// operations of either kind, and no VS_CNT exists.
+    #[test]
+    fn a_flat_access_counts_on_the_vmem_counter_and_dscnt() {
+        let flat = Instruction::new(
+            "flat_load_b32 v3, v[1:2]",
+            vec![r(Kind::V, 3)],
+            vec![r(Kind::V, 1)],
+        )
+        .memory(MemoryClass::Flat { load: true });
+        let use_v3 = Instruction::new("v_mov_b32 v4, v3", vec![r(Kind::V, 4)], vec![r(Kind::V, 3)]);
+        let mut l = Ledger::default();
+        l.record(Arch::Gfx1201, &flat);
+        let mut need: Vec<(Counter, u8)> = l.required(&use_v3).iter().map(|w| (w.0, w.1)).collect();
+        need.sort_by_key(|w| format!("{w:?}"));
+        assert_eq!(need, vec![(Counter::Ds, 0), (Counter::Load, 0)]);
+        // a flat store keeps its sources until both counters retire it
+        let store = Instruction::new("flat_store_b32 v[1:2], v5", vec![], vec![r(Kind::V, 5)])
+            .memory(MemoryClass::Flat { load: false });
+        let def_v5 = Instruction::new("v_mov_b32 v5, 0", vec![r(Kind::V, 5)], vec![]);
+        let mut l = Ledger::default();
+        l.record(Arch::Gfx1201, &store);
+        let counters: std::collections::BTreeSet<String> = l
+            .required(&def_v5)
+            .iter()
+            .map(|w| format!("{:?}", w.0))
+            .collect();
+        assert!(
+            counters.contains("Store") && counters.contains("Ds"),
+            "{counters:?}"
+        );
+        l.drain();
+        assert!(l.is_empty());
+    }
+
     #[test]
     fn mixed_buffer_global_loads_and_stores_wait_by_position() {
         let window = [
