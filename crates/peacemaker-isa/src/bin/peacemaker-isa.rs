@@ -138,7 +138,7 @@ const NATIVE_USAGE: &str = "       emit options: [--co FILE] [--bundle FILE [--h
        peacemaker-isa emit --kernel lane_rows_mq6_gfx1201|lane_rows_bf16_gfx1201 [--epi all] --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
          (lane_rows_mq6_pm_gfx1201 / lane_rows_bf16_pm_gfx1201: ten unchanged narrow exports then two t8 exports)
        peacemaker-isa emit --kernel hc8_wmma_gfx1201 [--epi all|priority] --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
-         (hc8_wmma_pm_gfx1201: hc8_gemm_{e4m3|i8}_mw{MW}_kw{KW}_n{NT}_{set|act}, 80 GEMM exports + hc8_dequant_{bf16|f16} = 82 for `all`; `priority` = e4m3 mw1kw16 and mw4kw1 n1 set/act only, no dequant)
+         (hc8_wmma_pm_gfx1201: 80 hc8_gemm_{e4m3|i8}_mw{MW}_kw{KW}_n{NT}_{set|act} + hc8_dequant_{bf16|f16} + hc8_read_up_e4m3_n{1..4} = 86 exports for `all`; `priority` = e4m3 mw1kw16 and mw4kw1 n1 set/act only)
        peacemaker-isa emit --kernel mq4_rows_x4 [--epi entry|t8|all] --arch gfx1151|gfx1201|gfx1100 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
          (mq4_rows_x4_pm_<arch>: unchanged narrow plus t8 on gfx1151/gfx1201; gfx1100 has only the actual scalar-DAG t8 export, no narrow entry; no r16/r32 exports)
        peacemaker-isa emit --kernel qwen4_bf16_rows_wide [--epi t8|k4_t8|all] --arch gfx1151|gfx1100 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
