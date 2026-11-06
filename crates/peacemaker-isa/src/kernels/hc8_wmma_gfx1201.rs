@@ -351,6 +351,23 @@ fn lbl(g: &Geo, name: &str) -> String {
     format!(".Lhc8_{}_{name}", g.symbol())
 }
 
+/// Declare `[base, base+len)` as the fewest aligned ranges of legal widths (1, 2, 4, 8).
+/// No operand of this kernel spans two chunks: every multi-register operand (an 8-wide
+/// accumulator, a 4-wide fragment, a 2-wide decode pair, an SGPR pair or quad) sits
+/// inside one 8-aligned or naturally aligned chunk.
+fn add_split(regs: &mut RegPlan, name: &str, kind: Kind, base: u8, len: u8) -> R {
+    let (mut at, end) = (u32::from(base), u32::from(base) + u32::from(len));
+    while at < end {
+        let w = [8u32, 4, 2, 1]
+            .into_iter()
+            .find(|w| at % w == 0 && at + w <= end)
+            .expect("width 1 always fits");
+        regs.add_range(&format!("{name}@{at}"), kind, at as u8, w as u8, Live::Whole)?;
+        at += w;
+    }
+    Ok(())
+}
+
 fn plan(g: &Geo, l: &Lay) -> Result<RegPlan, String> {
     let mut regs = RegPlan::new(l.top as u16, SGPR_BUDGET)?;
     let nt = g.nt as u8;
@@ -376,7 +393,7 @@ fn plan(g: &Geo, l: &Lay) -> Result<RegPlan, String> {
         ("temp4", TMP4, 1),
     ];
     for (name, base, len) in sr_ {
-        regs.add_range(name, Kind::S, base, len, Live::Whole)?;
+        add_split(&mut regs, name, Kind::S, base, len)?;
     }
     let mut vr_: Vec<(&str, u8, u8)> = vec![
         ("tid", TID, 1),
@@ -396,7 +413,7 @@ fn plan(g: &Geo, l: &Lay) -> Result<RegPlan, String> {
     vr_.push(("x_raw", l.xb, (16 * l.u * g.nt) as u8));
     vr_.push(("w_raw", l.wr, (4 * l.u) as u8));
     for (name, base, len) in vr_ {
-        regs.add_range(name, Kind::V, base, len, Live::Whole)?;
+        add_split(&mut regs, name, Kind::V, base, len)?;
     }
     Ok(regs)
 }
