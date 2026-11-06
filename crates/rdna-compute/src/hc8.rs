@@ -21,6 +21,16 @@ use std::sync::LazyLock;
 
 pub const MODULE: &str = "hc8_wmma_pm_gfx1201";
 pub const IMAGE: &[u8] = include_bytes!("../../../kernels/hc8_wmma_pm_gfx1201.hxaco");
+/// The ONE address of the embedded image every launcher passes to `Gpu::ensure_embedded_kernel`:
+/// each use of the `IMAGE` const may materialise its own copy (a different pointer per use site),
+/// and the per-launch function/image identity check then falls back to hashing the whole 1.4 MB
+/// bundle on every launch (a decode token launches hundreds of these entries).
+static IMAGE_STATIC: &[u8] = IMAGE;
+
+/// The embedded image at its single static address (see [`IMAGE_STATIC`]).
+pub(crate) fn image() -> &'static [u8] {
+    IMAGE_STATIC
+}
 pub const IMAGE_SHA256: &str = include_str!("../../../kernels/hc8_wmma_pm_gfx1201.hxaco.sha256");
 pub const KERNARG_BYTES: usize = 48;
 /// The `(mw, kw)` geometries the module exports.
@@ -355,7 +365,7 @@ pub fn hc8_gemm(
     let nt = rows.div_ceil(16);
     let name = entry_name(w.fmt, geom, nt, act.is_some());
     gpu.bind_thread()?;
-    gpu.ensure_embedded_kernel(MODULE, IMAGE, &name)?;
+    gpu.ensure_embedded_kernel(MODULE, image(), &name)?;
     let mut args = [0u8; KERNARG_BYTES];
     for (i, p) in [
         w.q.buf.as_ptr(),
@@ -431,7 +441,7 @@ pub fn hc8_read_up(
     IMAGE_VERIFIED.clone().map_err(err)?;
     let name = read_up_symbol(rows.div_ceil(16) as u32);
     gpu.bind_thread()?;
-    gpu.ensure_embedded_kernel(MODULE, IMAGE, &name)?;
+    gpu.ensure_embedded_kernel(MODULE, image(), &name)?;
     let mut args = [0u8; READ_UP_KERNARG_BYTES as usize];
     for (i, p) in [
         w.q.buf.as_ptr(),

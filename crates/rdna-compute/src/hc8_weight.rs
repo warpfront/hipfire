@@ -192,7 +192,7 @@ impl Gpu {
             .ok_or_else(|| err("weight too large"))?;
         hc8::verify_image().map_err(err)?;
         self.bind_thread()?;
-        self.ensure_embedded_kernel(hc8::MODULE, hc8::IMAGE, entry)?;
+        self.ensure_embedded_kernel(hc8::MODULE, hc8::image(), entry)?;
         // Kernarg (32 B): q u64@0, s u64@8 (right after q), out u64@16, m u32@24, k u32@28.
         let mut args = [0u8; 32];
         let qp = src as u64;
