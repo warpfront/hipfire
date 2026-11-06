@@ -925,7 +925,7 @@ impl EpLanes {
             after >> 20
         );
         if kind.mesh() {
-            bundle.ep_mesh_lanes_arm(1)?;
+            bundle.ep_mesh_lanes_arm(gpu, 1)?;
         }
         bundle.set_lanes_sampled(true);
         Ok(())

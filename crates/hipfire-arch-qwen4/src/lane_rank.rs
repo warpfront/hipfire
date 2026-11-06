@@ -157,6 +157,7 @@ impl LaneProto {
                     moe_layers: 0,
                     moe_once: false,
                     stream_bf16: false,
+                    all_rows: crate::gpu_forward_lanes::LaneAllRowsRule::never(),
                 },
                 floor_enabled: crate::mtp_lanes::floor_env_enabled(),
             },
@@ -1167,6 +1168,7 @@ mod tests {
                 moe_layers: 0,
                 moe_once: false,
                 stream_bf16: false,
+                all_rows: crate::gpu_forward_lanes::LaneAllRowsRule::never(),
             },
             floor_enabled: floor,
         }

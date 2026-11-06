@@ -45,7 +45,7 @@
 //!   keyed by [`LaneWindowKey`] (full [`RequestEpoch`], lane generation,
 //!   window sequence) inside a [`MeshStepKey`].
 
-use crate::gpu_forward_lanes::LANE_MAX_ROWS;
+use crate::gpu_forward_lanes::{LaneAllRowsRule, StageName, LANE_MAX_ROWS};
 use crate::lane::LabRoutes;
 use crate::lane_exec::LaneRoute;
 use crate::mesh_lane_copy::{
@@ -529,6 +529,11 @@ pub struct StagePolicy {
     /// EP `moe=once` (one exchange per layer per row group) vs per-lane.
     pub moe_once: bool,
     pub stream_bf16: bool,
+    /// The load-constant facts of the one predicate that decides whether a verify step runs
+    /// its routed MoE once over all rows ([`LaneAllRowsRule::moe_all_rows`]); the executor
+    /// (`forward_lanes`) and this root's ledger ask the same rule. Roots that never run the
+    /// EP all-rows MoE (PP, single, scripted) carry [`LaneAllRowsRule::never`].
+    pub all_rows: LaneAllRowsRule,
 }
 
 /// Immutable root configuration.
@@ -663,6 +668,7 @@ fn start_digest(key: &MeshStepKey, lanes: &[LanePlan], b: &WindowBudgets, s: &St
         .usize(b.max_rows)
         .usize(b.head_lag_rows)
         .usize(s.moe_layers);
+    all_rows_rule_digest(&mut d, &s.all_rows);
     for l in lanes {
         lane_plan_digest(&mut d, l);
     }
@@ -956,6 +962,49 @@ pub fn pack_classed_row_groups_with_cap(
         }
     }
     groups
+}
+
+/// The sealed `target_exchanges` of an EP verify step packed into `groups`: the routed-MoE
+/// gather calls per rank. Under `moe=once` (`stage.moe_once`) the MoE is one call per gathered
+/// layer over every row when the shared rule ([`LaneAllRowsRule::moe_all_rows`], the executor's
+/// own `moe_all` predicate) takes the step, else one per row group; per lane otherwise.
+/// `groups` are [`pack_classed_row_groups`] of the lanes, exactly the groups the executor's
+/// `classed_segments` packs; `any_wide_lane` is its `lanes.iter().any(|lane| lane.wide)`.
+pub(crate) fn planned_ep_target_exchanges(
+    stage: &StagePolicy,
+    groups: &[RowGroup],
+    lanes: usize,
+    any_wide_lane: bool,
+) -> usize {
+    if !stage.moe_once {
+        return stage.moe_layers * lanes;
+    }
+    let group_rows: Vec<usize> = groups.iter().map(|g| g.rows).collect();
+    let calls_per_layer = if stage.all_rows.moe_all_rows(&group_rows, any_wide_lane) {
+        1
+    } else {
+        groups.len()
+    };
+    stage.moe_layers * calls_per_layer
+}
+
+/// Fold every fact of the all-rows rule into a plan digest.
+fn all_rows_rule_digest(d: &mut Digest, r: &LaneAllRowsRule) {
+    d.bool(r.hc_flag)
+        .bool(r.stages_flag)
+        .bool(r.exact_flag)
+        .bool(r.moe_flag)
+        .bool(r.gdn_qkv_bf16)
+        .usize(r.wide_verify_rows)
+        .bool(r.eager)
+        .bool(r.cpu_splice)
+        .usize(r.bf16_min_rows)
+        .usize(r.gather_cap.map_or(0, |cap| cap + 1))
+        .bool(r.trunk_ar_write)
+        .usize(r.band_moe_calls);
+    for stage in StageName::ALL {
+        d.usize(r.policy.share(stage) as usize);
+    }
 }
 
 /// The sampler owner's target output for the sealed rows.
@@ -2455,8 +2504,9 @@ impl MeshRoot {
             d.u64(self.cfg.topology_generation)
                 .usize(self.cfg.stage.moe_layers)
                 .bool(self.cfg.stage.moe_once)
-                .bool(self.cfg.stage.stream_bf16)
-                .bool(self.cfg.floor_enabled)
+                .bool(self.cfg.stage.stream_bf16);
+            all_rows_rule_digest(&mut d, &self.cfg.stage.all_rows);
+            d.bool(self.cfg.floor_enabled)
                 .usize(budgets.max_lanes)
                 .usize(budgets.verify_rows_per_lane)
                 .usize(budgets.copy_take_cap)
@@ -2969,8 +3019,12 @@ impl MeshRoot {
             wide_groups: groups.iter().filter(|g| g.wide).count(),
             target_exchanges: match self.world[0].kind {
                 MeshKind::Pp | MeshKind::Single => 0,
-                MeshKind::Ep if s.start.stage.moe_once => s.start.stage.moe_layers * groups.len(),
-                MeshKind::Ep => s.start.stage.moe_layers * lanes.len(),
+                MeshKind::Ep => planned_ep_target_exchanges(
+                    &s.start.stage,
+                    &groups,
+                    lanes.len(),
+                    lanes.iter().any(|l| l.wide),
+                ),
             },
             microbatches: match self.world[0].kind {
                 MeshKind::Pp => microbatches.len(),
@@ -4861,6 +4915,17 @@ mod tests {
         }
 
         fn new_with(kind: MeshKind, floor: bool, copy: Option<NgramModConfig>) -> Self {
+            Self::new_staged(kind, floor, copy, 48, LaneAllRowsRule::never())
+        }
+
+        /// A mesh whose root plans `moe_layers` gathered layers per call under `all_rows`.
+        fn new_staged(
+            kind: MeshKind,
+            floor: bool,
+            copy: Option<NgramModConfig>,
+            moe_layers: usize,
+            all_rows: LaneAllRowsRule,
+        ) -> Self {
             let w = world(kind);
             let script = Rc::new(RefCell::new(Script::default()));
             let own = *w.iter().find(|r| r.root).unwrap();
@@ -4870,9 +4935,10 @@ mod tests {
                 RootConfig {
                     topology_generation: 7,
                     stage: StagePolicy {
-                        moe_layers: 48,
+                        moe_layers,
                         moe_once: true,
                         stream_bf16: false,
+                        all_rows,
                     },
                     floor_enabled: floor,
                 },
@@ -5164,6 +5230,218 @@ mod tests {
     }
 
     const BOTH: [MeshKind; 2] = [MeshKind::Ep, MeshKind::Pp];
+
+    // ---- the sealed target exchanges follow the shared all-rows MoE rule -----------------
+
+    /// An enabled all-rows rule as a default exact-gfx1201 EP load builds it: every flag on, an
+    /// eager step, no CPU splice, the production stage shares, a 48-row gather and 48 band layers.
+    fn all_rows_rule(gather_cap: Option<usize>, trunk_ar_write: bool) -> LaneAllRowsRule {
+        LaneAllRowsRule {
+            hc_flag: true,
+            stages_flag: true,
+            exact_flag: false,
+            moe_flag: true,
+            gdn_qkv_bf16: false,
+            wide_verify_rows: 0,
+            eager: true,
+            cpu_splice: false,
+            bf16_min_rows: 512,
+            gather_cap,
+            trunk_ar_write,
+            band_moe_calls: 48,
+            policy: crate::gpu_forward_lanes::LaneStagePolicy::production(),
+        }
+    }
+
+    /// What the executor does for these lanes (rows per lane, wide class): the packing
+    /// `classed_segments` runs, then `forward_lanes`' own placement decision
+    /// ([`LaneAllRowsRule::decide`]); the MoE gather calls it executes per gathered layer.
+    fn executed_moe_calls_per_layer(
+        rule: &LaneAllRowsRule,
+        rows: &[usize],
+        wide: &[bool],
+        wide_cap: usize,
+    ) -> usize {
+        let groups = pack_classed_row_groups_with_cap(rows, wide, wide_cap);
+        let group_rows: Vec<usize> = groups.iter().map(|g| g.rows).collect();
+        if rule
+            .decide(true, &group_rows, wide.iter().any(|&w| w))
+            .moe_all
+        {
+            1
+        } else {
+            groups.len()
+        }
+    }
+
+    /// `lanes` greedy lanes of `k + 1` rows each sealed on an EP root: its ledger's
+    /// `(target_exchanges, row_groups)`.
+    fn sealed_ep_ledger(
+        lanes: u64,
+        k: usize,
+        moe_layers: usize,
+        all_rows: LaneAllRowsRule,
+    ) -> (usize, usize) {
+        let mut m = Mesh::new_staged(MeshKind::Ep, false, None, moe_layers, all_rows);
+        let mut reqs = Vec::new();
+        for tag in 1..=lanes {
+            m.admit(tag, 100 + tag as usize, 7, None, Some(k));
+            script_matching(&m, tag, 0, 8);
+            reqs.push(req(tag, 99));
+        }
+        m.s_plan(None, &reqs, &budgets(LabRoutes::Batched, k))
+            .unwrap();
+        m.s_ready().unwrap();
+        m.s_draft().unwrap();
+        let plan = m.s_verify().unwrap();
+        (plan.ledger.target_exchanges, plan.ledger.row_groups)
+    }
+
+    /// The planned `target_exchanges` equal the gather calls the executor makes, for one group
+    /// (C1), several groups without the all-rows MoE (rule off), several groups with it (C8,
+    /// rows within the gather cap) and several groups it refuses (rows above the cap), on the
+    /// trunk shard's balanced layer count (15 here, writer on) and the non-trunk MoE count (48).
+    #[test]
+    fn mesh_lane_protocol_ep_ledger_plans_the_executors_moe_calls() {
+        for (moe_layers, trunk) in [(48usize, false), (15, true)] {
+            let on = all_rows_rule(Some(48), trunk);
+            let off = LaneAllRowsRule::never();
+            // (lanes, k, rule, expected calls per layer, expected row groups)
+            let cases: [(u64, usize, LaneAllRowsRule, usize, usize); 6] = [
+                // C1: one lane of four rows is one group, whatever the rule.
+                (1, 3, off, 1, 1),
+                (1, 3, on, 1, 1),
+                // Four lanes x four rows: two groups of eight rows; one MoE call per group
+                // with the rule off, ONE call over all 16 rows with it on.
+                (4, 3, off, 2, 2),
+                (4, 3, on, 1, 2),
+                // C8: eight lanes x six rows = 48 rows (<= the 48-row gather cap): eight groups,
+                // one MoE call per layer.
+                (8, 5, on, 1, 8),
+                // Eight lanes x eight rows = 64 rows: above the gather cap, the eight groups stay.
+                (8, 7, on, 8, 8),
+            ];
+            for (lanes, k, rule, calls, groups) in cases {
+                let rows = vec![k + 1; lanes as usize];
+                let wide = vec![false; lanes as usize];
+                assert_eq!(
+                    executed_moe_calls_per_layer(&rule, &rows, &wide, 32),
+                    calls,
+                    "executor model, {lanes} lanes x {} rows",
+                    k + 1
+                );
+                let (planned, row_groups) = sealed_ep_ledger(lanes, k, moe_layers, rule);
+                assert_eq!(row_groups, groups, "{lanes} lanes x {} rows", k + 1);
+                assert_eq!(
+                    planned,
+                    moe_layers * calls,
+                    "{lanes} lanes x {} rows, {moe_layers} layers, trunk {trunk}",
+                    k + 1
+                );
+            }
+        }
+    }
+
+    /// The pure planner against hand-computed expectations: refusals keep the per-group count
+    /// (rows above the gather cap, a wide-class lane, a CPU splice, an odd layer count, the
+    /// per-lane policy), applications take one call per layer.
+    #[test]
+    fn mesh_lane_protocol_planned_ep_exchanges_by_rule() {
+        let stage = |rule: LaneAllRowsRule, moe_once: bool| StagePolicy {
+            moe_layers: 48,
+            moe_once,
+            stream_bf16: false,
+            all_rows: rule,
+        };
+        let groups_of =
+            |rows: &[usize], wide: &[bool]| pack_classed_row_groups_with_cap(rows, wide, 32);
+        let planned = |rule: LaneAllRowsRule, rows: &[usize], wide: &[bool]| {
+            planned_ep_target_exchanges(
+                &stage(rule, true),
+                &groups_of(rows, wide),
+                rows.len(),
+                wide.iter().any(|&w| w),
+            )
+        };
+        let on = all_rows_rule(Some(48), false);
+        let eight = [6usize; 8];
+        let greedy = [false; 8];
+        // C8: 8 lanes x 6 rows = 48 rows, 8 groups, one call per layer.
+        assert_eq!(planned(on, &eight, &greedy), 48);
+        // The rule off (PP / single / scripted roots): one call per group.
+        assert_eq!(planned(LaneAllRowsRule::never(), &eight, &greedy), 48 * 8);
+        // Rows above the gather cap (a 32-row rank gather): the groups stay.
+        assert_eq!(
+            planned(all_rows_rule(Some(32), false), &eight, &greedy),
+            48 * 8
+        );
+        // No EP gather installed: the groups stay.
+        assert_eq!(
+            planned(all_rows_rule(None, false), &eight, &greedy),
+            48 * 8
+        );
+        // A wide-class lane keeps its classed group; the step takes no all-rows MoE.
+        let mut wide_mixed = [false; 8];
+        wide_mixed[3] = true;
+        let groups = groups_of(&eight, &wide_mixed);
+        assert_eq!(planned(on, &eight, &wide_mixed), 48 * groups.len());
+        // CPU-splice groups are CPU-window sized: no all-rows segment, no all-rows MoE.
+        let mut cpu = on;
+        cpu.cpu_splice = true;
+        assert_eq!(planned(cpu, &eight, &greedy), 48 * 8);
+        // An odd band layer count would reuse a gather buffer across steps.
+        let mut odd = on;
+        odd.band_moe_calls = 47;
+        assert_eq!(planned(odd, &eight, &greedy), 48 * 8);
+        // A flag off (LANE_ALLROWS_MOE, LANE_ALLROWS, LANE_HC_ALLROWS), a stateful scope or a
+        // non-eager step.
+        let edits: [fn(&mut LaneAllRowsRule); 6] = [
+            |r| r.moe_flag = false,
+            |r| r.stages_flag = false,
+            |r| r.hc_flag = false,
+            |r| r.gdn_qkv_bf16 = true,
+            |r| r.wide_verify_rows = 8,
+            |r| r.eager = false,
+        ];
+        for edit in edits {
+            let mut rule = on;
+            edit(&mut rule);
+            assert_eq!(planned(rule, &eight, &greedy), 48 * 8);
+        }
+        // A single group (<= 8 rows) never takes the all-rows segment.
+        assert_eq!(planned(on, &[4, 4], &[false; 2]), 48);
+        assert_eq!(planned(on, &[8], &[false]), 48);
+        // The trunk shard's writer carries the step up to the AR HC launch cap (256 rows).
+        assert_eq!(planned(all_rows_rule(Some(48), true), &eight, &greedy), 48);
+        // The per-lane stage policy keeps one exchange per lane.
+        assert_eq!(
+            planned_ep_target_exchanges(&stage(on, false), &groups_of(&eight, &greedy), 8, false),
+            48 * 8
+        );
+    }
+
+    /// The rule is part of what a root's plan digest covers: two roots whose rules differ in any
+    /// load fact cannot seal the same `policy_digest` / start digest.
+    #[test]
+    fn mesh_lane_protocol_plan_digest_covers_the_all_rows_rule() {
+        let digest_of = |rule: LaneAllRowsRule| {
+            let mut m = Mesh::new_staged(MeshKind::Ep, false, None, 48, rule);
+            m.admit(1, 101, 7, None, Some(3));
+            let start = m
+                .s_plan(None, &[req(1, 99)], &budgets(LabRoutes::Batched, 3))
+                .unwrap();
+            (start.key.policy_digest, start.digest)
+        };
+        let on = all_rows_rule(Some(48), false);
+        assert_eq!(digest_of(on), digest_of(on));
+        assert_ne!(digest_of(on), digest_of(LaneAllRowsRule::never()));
+        let mut cap = on;
+        cap.gather_cap = Some(32);
+        assert_ne!(digest_of(on), digest_of(cap));
+        let mut writer = on;
+        writer.trunk_ar_write = true;
+        assert_ne!(digest_of(on), digest_of(writer));
+    }
 
     // ---- consumed_rows ----------------------------------------------------
 
@@ -6788,6 +7066,7 @@ mod tests {
                 moe_layers: 48,
                 moe_once: true,
                 stream_bf16: false,
+                all_rows: LaneAllRowsRule::never(),
             },
             floor_enabled: false,
         };

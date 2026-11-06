@@ -2942,7 +2942,7 @@ fn drive_mtp_ep(
         before.saturating_sub(after) >> 20,
         after >> 20
     );
-    let mut mesh = EpMeshLanes::new(bundle, 1, routes == RoutesArg::Floor)?;
+    let mut mesh = EpMeshLanes::new(gpu, bundle, 1, routes == RoutesArg::Floor)?;
     let mut next_tag = 0u64;
     let mut runs = Vec::new();
     let mut per_k = Vec::new();

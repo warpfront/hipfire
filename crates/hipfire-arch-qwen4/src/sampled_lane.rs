@@ -1911,6 +1911,7 @@ mod tests {
                         moe_layers: 48,
                         moe_once: true,
                         stream_bf16: false,
+                        all_rows: crate::gpu_forward_lanes::LaneAllRowsRule::never(),
                     },
                     floor_enabled: floor,
                 },

@@ -831,7 +831,7 @@ fn stage_qwen4_lanes(
     if topology == "ep" && spec_on_k.is_some() {
         match m.qwen4_mut() {
             Some(bundle) => {
-                if let Err(e) = bundle.ep_mesh_lanes_arm(1) {
+                if let Err(e) = bundle.ep_mesh_lanes_arm(gpu, 1) {
                     return refuse(&format!("ep mesh lanes: {e}"));
                 }
             }

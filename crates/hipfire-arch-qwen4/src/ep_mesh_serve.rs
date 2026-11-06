@@ -102,11 +102,16 @@ pub struct MeshStepFacts {
 }
 
 impl Qwen4Bundle {
-    /// Arm the mesh lane transaction owner for the staged EP spec store.
+    /// Arm the mesh lane transaction owner for the staged EP spec store, on rank 0's `gpu`
+    /// (the all-rows MoE rule the root seals its plans with is read from it).
     /// Idempotent refusal: an already armed bundle errors. The serve driver
     /// owns request termination (EOS/stop/length), so the root never closes
     /// a lane and drafts through an EOS draft, as the single-card route.
-    pub fn ep_mesh_lanes_arm(&mut self, topology_generation: u64) -> Result<(), String> {
+    pub fn ep_mesh_lanes_arm(
+        &mut self,
+        gpu: &Gpu,
+        topology_generation: u64,
+    ) -> Result<(), String> {
         if self.mesh_lanes.is_some() {
             return Err("EP mesh lanes are already armed".to_string());
         }
@@ -121,6 +126,7 @@ impl Qwen4Bundle {
             return Err("EP mesh lanes need native-MTP lanes".to_string());
         }
         let mut mesh = EpMeshLanes::new(
+            gpu,
             self,
             topology_generation,
             crate::mtp_lanes::ep_mesh_lane_floor_enabled(),

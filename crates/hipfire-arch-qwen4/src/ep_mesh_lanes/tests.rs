@@ -66,6 +66,7 @@ fn root_with_moe_layers(floor: bool, moe_layers: usize) -> MeshRoot {
                 moe_layers,
                 moe_once: true,
                 stream_bf16: false,
+                all_rows: crate::gpu_forward_lanes::LaneAllRowsRule::never(),
             },
             floor_enabled: floor,
         },
@@ -559,6 +560,89 @@ fn mesh_lane_trunk_shard_plans_zero_target_exchanges() {
     assert_eq!(fan.rv.crossings(), 3);
     let sims = fan.finish();
     assert!(sims.iter().all(|s| s.aborts.is_empty()));
+}
+
+/// A multi-group step of the EP driver (C8: eight lanes x six rows) under the all-rows MoE rule:
+/// the sealed plan holds ONE gather per gathered layer (the executor runs one `ep_lane_moe_rows`
+/// call over every row), on the trunk shard's balanced count and on the plain MoE count, and the
+/// merged ledger and the barrier crossings agree. With the rule off the same step plans one
+/// gather per group (the per-group count the executor's all-rows MoE no longer matches).
+#[test]
+fn mesh_lane_ep_multi_group_all_rows_step_plans_one_exchange_per_layer() {
+    let rule = |trunk: bool| crate::gpu_forward_lanes::LaneAllRowsRule {
+        hc_flag: true,
+        stages_flag: true,
+        exact_flag: false,
+        moe_flag: true,
+        gdn_qkv_bf16: false,
+        wide_verify_rows: 0,
+        eager: true,
+        cpu_splice: false,
+        bf16_min_rows: 512,
+        gather_cap: Some(48),
+        trunk_ar_write: trunk,
+        band_moe_calls: 48,
+        policy: crate::gpu_forward_lanes::LaneStagePolicy::production(),
+    };
+    for trunk in [false, true] {
+        let layers = planned_gather_layers(48, trunk, 15);
+        for (all_rows, groups) in [(rule(trunk), 1usize), (LaneAllRowsRule::never(), 8)] {
+            let world = vec![RankOwnership::ep(0), RankOwnership::ep(1)];
+            let mut root = MeshRoot::new(
+                RankOwnership::ep(0),
+                &world,
+                RootConfig {
+                    topology_generation: 3,
+                    stage: StagePolicy {
+                        moe_layers: layers,
+                        moe_once: true,
+                        stream_bf16: false,
+                        all_rows,
+                    },
+                    floor_enabled: false,
+                },
+            )
+            .unwrap();
+            let windows: Vec<_> = (1..=8u64)
+                .map(|tag| script(tag, 0, &[10, 11, 12, 13, 14], &[10, 11, 12, 13, 14, 99]))
+                .collect();
+            let mut fan = fanout_with(windows, |_, _| {});
+            let reqs: Vec<LaneRequest> = (1..=8u64).map(|tag| req(tag, 64)).collect();
+            for tag in 1..=8u64 {
+                admit(&mut root, &mut fan, tag, 10, 9, None, Some(5));
+            }
+            let driven = drive_step(
+                &mut root,
+                &mut fan,
+                None,
+                &reqs,
+                &budgets(LabRoutes::Batched, 5),
+                &mut GreedyRule,
+            )
+            .expect("a clean two-rank step: the plan and the ranks agree");
+            let merged = root
+                .merge_evidence(
+                    &driven.receipts,
+                    ControllerInterval {
+                        wall_us: 40_000.0,
+                        prefill_ran: false,
+                    },
+                )
+                .expect("coherent rank receipts");
+            assert_eq!(
+                merged.counts.target_exchanges,
+                layers * groups,
+                "trunk {trunk}, {groups} MoE calls per layer"
+            );
+            assert_eq!(merged.counts.row_groups, 8);
+            assert_eq!(
+                fan.rv.crossings(),
+                (merged.counts.head_draft_calls + layers * groups) as u64
+            );
+            let sims = fan.finish();
+            assert!(sims.iter().all(|s| s.aborts.is_empty()));
+        }
+    }
 }
 
 #[test]

@@ -79,7 +79,8 @@
 use crate::bundle::{BundleError, Qwen4Bundle};
 use crate::ep::{gather_tally, GatherTally};
 use crate::gpu_forward_lanes::{
-    forward_lanes, row_group_count, LaneOutputs, LaneRowKind, LaneRows, StageName, StageShare,
+    forward_lanes, row_group_count, LaneAllRowsRule, LaneOutputs, LaneRowKind, LaneRows, StageName,
+    StageShare,
 };
 use crate::lane::download_lane_rows;
 use crate::lane::{LabRoutes, LaneSpec, LaneStatus, Qwen4LaneState, Qwen4LaneStore, StepParts};
@@ -444,6 +445,15 @@ impl RankLane<'_> {
         // resident bank over whole donor layers: an open borrowed-bank epoch
         // (EP reserve-sharing load) refuses the window.
         crate::ep_reserve::mesh_window_epoch_check(self.bundle.ep_reserve_epoch_open())?;
+        // The all-rows MoE rule the root sealed the plan's exchanges with is this rank's own
+        // (every gather count of the step follows from it).
+        let rule = all_rows_rule_of(&*self.gpu, &*self.bundle)?;
+        if rule != start.stage.all_rows {
+            return Err(format!(
+                "rank {} all-rows MoE rule {rule:?} differs from the root's {:?}",
+                self.exec.rank, start.stage.all_rows
+            ));
+        }
         let Self { bundle, gpu, .. } = self;
         let (spec_k, rows_cap, max_lanes) = {
             let store = bundle
@@ -1006,6 +1016,19 @@ impl DraftReadPlan {
             Self::Sequential => (0..ops).map(|i| i..i + 1).collect(),
         }
     }
+}
+
+/// The all-rows MoE rule of `bundle`'s forward on `gpu` under its lane store's stage policy:
+/// what the root seals its ledger with (rank 0's) and every rank checks itself against.
+fn all_rows_rule_of(gpu: &Gpu, bundle: &Qwen4Bundle) -> R<LaneAllRowsRule> {
+    let store = bundle
+        .lanes()
+        .ok_or_else(|| "Qwen4 lanes are not staged".to_string())?;
+    let forward = bundle
+        .execution
+        .as_ref()
+        .ok_or_else(|| "Qwen4 forward resources are not attached".to_string())?;
+    LaneAllRowsRule::for_forward(gpu, forward, &store.stage_policy()).map_err(|e| e.to_string())
 }
 
 /// MoE layers whose expert-row gather the sealed ledger plans per row group. The trunk shard's FFN
@@ -1908,10 +1931,12 @@ impl From<ProtocolError> for MeshStepError {
 }
 
 impl EpMeshLanes {
-    /// The root and rank 0's state for `bundle`'s staged EP lane store.
+    /// The root and rank 0's state for `bundle`'s staged EP lane store, run on rank 0's `gpu`
+    /// (whose flags and forward fix the all-rows MoE rule the plan is sealed with).
     /// `topology_generation` names this mesh load; `floor_enabled` is the
     /// production floor (lab route modes ignore it).
     pub fn new(
+        gpu: &Gpu,
         bundle: &Qwen4Bundle,
         topology_generation: u64,
         floor_enabled: bool,
@@ -1934,6 +1959,10 @@ impl EpMeshLanes {
             balanced_trunk,
         );
         let moe_once = store.stage_policy().share(StageName::Moe) == StageShare::OnceAllRows;
+        // The one predicate the executor's `moe_all` is decided by, captured once from rank 0's
+        // own `Gpu` / forward: the sealed ledger plans its exchanges from it, and every rank
+        // checks its own rule against it at `begin_window`.
+        let all_rows = all_rows_rule_of(gpu, bundle)?;
         let world: Vec<RankOwnership> = (0..ranks).map(RankOwnership::ep).collect();
         let mut root = MeshRoot::new(
             RankOwnership::ep(0),
@@ -1944,6 +1973,7 @@ impl EpMeshLanes {
                     moe_layers,
                     moe_once,
                     stream_bf16: false,
+                    all_rows,
                 },
                 floor_enabled,
             },

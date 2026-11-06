@@ -1456,7 +1456,7 @@ fn run_inner(args: &Args, report: &mut Value) -> R<i32> {
             None,
         )
         .map_err(e)?;
-    let mut mesh = EpMeshLanes::new(bundle, 1, false)?;
+    let mut mesh = EpMeshLanes::new(&gpu, bundle, 1, false)?;
     let budgets = mesh.window_budgets(bundle, LabRoutes::Batched)?;
     let mut rows_file = std::io::BufWriter::new(
         std::fs::File::create(sibling(&args.out, ".rows.jsonl")).map_err(e)?,

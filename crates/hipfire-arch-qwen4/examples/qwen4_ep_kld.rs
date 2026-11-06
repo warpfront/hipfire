@@ -1651,7 +1651,7 @@ fn run(args: &Args) -> R<()> {
                 before.saturating_sub(after) >> 20,
                 after >> 20
             );
-            let mut mesh = EpMeshLanes::new(bundle, 1, false)?;
+            let mut mesh = EpMeshLanes::new(&gpu, bundle, 1, false)?;
             let budgets = mesh.window_budgets(bundle, LabRoutes::Batched)?;
             if budgets.verify_rows_per_lane < k + 1 {
                 return Err(format!(
