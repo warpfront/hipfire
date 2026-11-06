@@ -32,6 +32,26 @@
 //!
 //! Group bounds (`gmax`, `gmin` over the workgroup's queries' positions) are computed redundantly by every wave
 //! (loads + XOR butterfly) instead of through LDS atomics; they are workgroup-uniform values either way.
+//!
+//! Schedule (the part PM owns; every item below leaves the output bytes unchanged). Median kernel time PM / hipcc on
+//! R9700 card B, A3B pp16000 chunk shapes (8192 rows ctx 8192 | 7808 rows ctx 16000), 30 interleaved launches:
+//!
+//! | step                                                                       | 8192 | 7808 |
+//! |----------------------------------------------------------------------------|------|------|
+//! | straight-line port of the hipcc DAG                                        | 1.08 | 1.06 |
+//! | element groups of eight (dependent ops spread; `s_delay_alu` hints kept)   | 1.06 | 1.04 |
+//! | 28 `v_dual_*` pairs per sub (scores, exps, P, P codes)                     | 1.01 | 0.99 |
+//! | fully live tiles skip dead-lane zeroing, masks and clamps in fill / commit | 0.99 | 0.98 |
+//! | commit of tile k+1 after the compute of tile k (no lockstep fill phase)    | 0.97 | 0.96 |
+//! | loads for tile k+2 between the rendezvous signal and its wait              | 0.97 | 0.95 |
+//! | all eight K fragment loads in flight before the QK chain                   | 0.96 | 0.94 |
+//!
+//! Measured and not shipped: no `s_delay_alu` hints (+40 %), no `s_setprio` (+1 %), one K chunk as `global_load_b128`
+//! (neutral), a per-tile full-mask flag and key-scale loads ahead of the chain (neutral), V fragments through
+//! `global_load_tr_b64` (-0.4 %, needs 8-byte-aligned transposing loads on 516-byte rows), V fragment prefetch ahead
+//! of the softmax (+1 %), two interleaved QK chains (not the hipcc accumulation order; no gain). Probe builds showed
+//! the cost is additive, not overlapped: QK and PV matrix chains ~58 %, softmax ~13 %, commit / fill ~11 %, and a
+//! rendezvous + latency skeleton ~19 % at the start of the work (waves run the phases in lockstep between barriers).
 
 use crate::kernels::common::{lit, op, s, sop, sr, v, vr};
 use crate::kernels::fa_prefill::{fdiv, gload, wait_alu};
@@ -40,6 +60,7 @@ use crate::lds::Transition;
 use crate::ledger::Counter;
 use crate::plan::Access;
 use crate::reg::{Live, RegRef};
+use crate::vopd::{Operand as VOperand, VopdF32, VopdOp};
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan};
 
 type R = Result<(), String>;
@@ -112,7 +133,6 @@ const TK: u32 = 48;
 const BUFB: u32 = 24_960;
 const OFF_V: u32 = 12_288;
 const OFF_SK: u32 = 24_576;
-const OFF_SV: u32 = 24_768;
 /// `1.0f / 448.0f` rounded to f32.
 const INV448: u32 = 0x3b12_4925;
 /// `-448.0f`.
@@ -135,6 +155,24 @@ struct L {
 impl L {
     fn n(&self, name: &str) -> String {
         format!(".Lfq{}_{name}", self.tag)
+    }
+    /// Independent element operations in program order, issued as `v_dual_*` pairs.
+    fn pairs(&self, b: &mut Builder, ops: &[VopdOp]) -> R {
+        for pair in ops.chunks(2) {
+            match pair {
+                [x, y] => b.vopd(*x, *y)?,
+                _ => {
+                    for o in pair {
+                        plain(b, *o)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    /// `s_setprio`: the WMMA bursts run ahead of the other waves' vector and fill work.
+    fn prio(&self, b: &mut Builder, level: u8) -> R {
+        op(b, format!("s_setprio {level}"), &[], &[])
     }
 }
 
@@ -262,9 +300,6 @@ fn exec_restore(b: &mut Builder, save: u8) -> R {
 fn vmov(b: &mut Builder, d: u8, src: &str) -> R {
     ins!(b, format!("v_mov_b32_e32 v{d}, {src}"); v(d); )
 }
-fn vmov_s(b: &mut Builder, d: u8, sreg: u8) -> R {
-    ins!(b, format!("v_mov_b32_e32 v{d}, s{sreg}"); v(d); s(sreg))
-}
 fn dload128(b: &mut Builder, slot: usize, dst: u8, addr: u8, imm: u32) -> R {
     b.ds_load(
         slot,
@@ -324,6 +359,56 @@ fn gstore128(b: &mut Builder, voff: u8, data: u8, sbase: u8, imm: u32) -> R {
         )
         .memory(MemoryClass::VmemStore),
     )
+}
+fn operand_text(o: VOperand) -> (String, Option<RegRef>) {
+    match o {
+        VOperand::V(n) => (format!("v{n}"), Some(v(n))),
+        VOperand::S(n) => (format!("s{n}"), Some(s(n))),
+        VOperand::Lit(n) => (format!("{n:#x}"), None),
+        VOperand::Inline(n) => (n.to_string(), None),
+    }
+}
+/// The single-issue form of a dual half.
+fn plain(b: &mut Builder, o: VopdOp) -> R {
+    let (name, fmac) = match o.op {
+        VopdF32::Add => ("v_add_f32_e32", false),
+        VopdF32::Sub => ("v_sub_f32_e32", false),
+        VopdF32::Subrev => ("v_subrev_f32_e32", false),
+        VopdF32::Mul => ("v_mul_f32_e32", false),
+        VopdF32::Fmac => ("v_fmac_f32_e32", true),
+    };
+    let (s0, r0) = operand_text(o.src0);
+    let mut uses: Vec<RegRef> = r0.into_iter().collect();
+    uses.push(v(o.src1));
+    if fmac {
+        uses.push(v(o.dst));
+    }
+    op(b, format!("{name} v{}, {s0}, v{}", o.dst, o.src1), &[v(o.dst)], &uses)
+}
+/// `dst = src0 * src1` / `src0 - src1` half descriptors.
+fn mulv(dst: u8, src0: u8, src1: u8) -> VopdOp {
+    VopdOp {
+        op: VopdF32::Mul,
+        dst,
+        src0: VOperand::V(src0),
+        src1,
+    }
+}
+fn mullit(dst: u8, lit: u32, src1: u8) -> VopdOp {
+    VopdOp {
+        op: VopdF32::Mul,
+        dst,
+        src0: VOperand::Lit(lit),
+        src1,
+    }
+}
+fn subv(dst: u8, src0: u8, src1: u8) -> VopdOp {
+    VopdOp {
+        op: VopdF32::Sub,
+        dst,
+        src0: VOperand::V(src0),
+        src1,
+    }
 }
 /// `v_wmma_f32_16x16x16_fp8_fp8 dst(8), a(2), bb(2), acc|0`: A is the first operand.
 fn wmma8(b: &mut Builder, dst: u8, a: u8, bb: u8, acc: bool) -> R {
@@ -660,7 +745,7 @@ fn prologue(b: &mut Builder, l: &L) -> R {
     sop(b, format!("s_cmp_lt_i32 s{S_GMAX}, 0"), &[], &[S_GMAX])?;
     op(b, format!("s_cbranch_scc1 {epi}"), &[], &[])?;
     fill_constants(b, wv, lane)?;
-    // Tile 0 into buffer 0, tile 48 in flight.
+    // Tile 0 into buffer 0, tile 48 in flight (its commit closes tile 0).
     sop(b, format!("s_mov_b32 s{S_TG}, 0"), &[S_TG], &[])?;
     issue(b, l, "p0", S_TG)?;
     b.wait(Counter::Load, 0)?;
@@ -734,7 +819,7 @@ fn fill_constants(b: &mut Builder, wv: u8, lane: u8) -> R {
 /// loads of key `kt + KI`), waves 12..23 also eight V dwords (keys clamped to the last live key), wave 0 the tile's
 /// K/V scale words. Dead lanes are exec-masked and their destinations pre-zeroed; nothing here depends on a branch
 /// for the pending-load shape (the scalar role branches skip whole roles and their consumers alike).
-fn issue(b: &mut Builder, l: &L, tag: &str, kt: u8) -> R {
+fn issue_general(b: &mut Builder, l: &L, tag: &str, kt: u8) -> R {
     let (rem, off) = (S_TA, S_TB);
     sop(b, format!("s_sub_co_i32 s{rem}, s{S_SEQ}, s{kt}"), &[rem], &[S_SEQ, kt])?;
     sop(b, format!("s_mul_i32 s{off}, s{kt}, {}", lit(ROW_BYTES)), &[off], &[kt])?;
@@ -799,6 +884,53 @@ fn issue(b: &mut Builder, l: &L, tag: &str, kt: u8) -> R {
     Ok(())
 }
 
+/// The tile fill: a branch-light path for tiles whose keys are all live (no dead-lane zeroing, masks or clamps),
+/// [`issue_general`] for the last, partial tile.
+fn issue(b: &mut Builder, l: &L, tag: &str, kt: u8) -> R {
+    let partial = l.n(&format!("{tag}_partial"));
+    let done = l.n(&format!("{tag}_done"));
+    sop(b, format!("s_add_co_i32 s{S_TA}, s{kt}, {}", lit(TK)), &[S_TA], &[kt])?;
+    sop(b, format!("s_cmp_gt_i32 s{S_TA}, s{S_SEQ}"), &[], &[S_TA, S_SEQ])?;
+    op(b, format!("s_cbranch_scc1 {partial}"), &[], &[])?;
+    let off = S_TB;
+    sop(b, format!("s_mul_i32 s{off}, s{kt}, {}", lit(ROW_BYTES)), &[off], &[kt])?;
+    // K: one chunk per lane (all keys of the tile are live).
+    ins!(b, format!("v_add_nc_u32_e32 v{}, s{off}, v{V_GK}", t(0)); v(t(0)); s(off), v(V_GK))?;
+    for i in 0..4u8 {
+        gload(b, "b32", v(V_KW + i), t(0), S_KB, 4 * u32::from(i))?;
+    }
+    // V (waves 12..23): eight consecutive keys at 516-byte strides from one base.
+    let skip_v = l.n(&format!("{tag}_fskipv"));
+    sop(b, format!("s_cmp_lt_u32 s{S_WAVE}, 12"), &[], &[S_WAVE])?;
+    op(b, format!("s_cbranch_scc1 {skip_v}"), &[], &[])?;
+    let base = t(1);
+    ins!(b, format!("v_add_nc_u32_e32 v{base}, s{kt}, v{V_VKB}"); v(base); s(kt), v(V_VKB))?;
+    ins!(b, format!("v_mad_u32_u24 v{base}, v{base}, {}, v{V_GV}", lit(ROW_BYTES)); v(base); v(base), v(V_GV))?;
+    for r in 0..8u8 {
+        gload(b, "b32", v(V_VW + r), base, S_VB, u32::from(r) * ROW_BYTES)?;
+    }
+    b.label(&skip_v)?;
+    // Scales (wave 0): 32 keys on all lanes, 16 more on lanes 0..15.
+    let skip_s = l.n(&format!("{tag}_fskips"));
+    sop(b, format!("s_cmp_lg_u32 s{S_WAVE}, 0"), &[], &[S_WAVE])?;
+    op(b, format!("s_cbranch_scc1 {skip_s}"), &[], &[])?;
+    let a = t(1);
+    ins!(b, format!("v_add_nc_u32_e32 v{a}, s{off}, v{V_GS}"); v(a); s(off), v(V_GS))?;
+    ins!(b, format!("v_cmp_gt_u32_e64 s{S_MA}, 16, v{V_LANE}"); m(S_MA); v(V_LANE))?;
+    gload(b, "u16", v(V_SP), a, S_KB, 0)?;
+    gload(b, "u16", v(V_SP + 1), a, S_VB, 0)?;
+    exec_and(b, S_SV3, S_MA)?;
+    gload(b, "u16", v(V_SP + 2), a, S_KB, 32 * ROW_BYTES)?;
+    gload(b, "u16", v(V_SP + 3), a, S_VB, 32 * ROW_BYTES)?;
+    exec_restore(b, S_SV3)?;
+    b.label(&skip_s)?;
+    op(b, format!("s_branch {done}"), &[], &[])?;
+    b.label(&partial)?;
+    issue_general(b, l, &format!("{tag}_g"), kt)?;
+    b.label(&done)?;
+    Ok(())
+}
+
 /// Commit the tile loaded by the matching [`issue`] into LDS buffer `wb` (the caller has drained the loads).
 fn commit(b: &mut Builder, l: &L, tag: &str, kt: u8, wb: usize) -> R {
     let base = wb as u32 * BUFB;
@@ -825,7 +957,11 @@ fn commit(b: &mut Builder, l: &L, tag: &str, kt: u8, wb: usize) -> R {
         perm(b, d + 4 + h, u1, t1, 0x0504_0100)?;
         perm(b, d + 6 + h, u1, t1, 0x0706_0302)?;
     }
-    // keep = bytes of live keys: nvalid = clamp(seq - (kt + VKB), 0, 8).
+    // keep = bytes of live keys: nvalid = clamp(seq - (kt + VKB), 0, 8) (skipped for a fully live tile).
+    let store_v = l.n(&format!("{tag}_cstorev"));
+    sop(b, format!("s_add_co_i32 s{S_TC}, s{kt}, {}", lit(TK)), &[S_TC], &[kt])?;
+    sop(b, format!("s_cmp_le_i32 s{S_TC}, s{S_SEQ}"), &[], &[S_TC, S_SEQ])?;
+    op(b, format!("s_cbranch_scc1 {store_v}"), &[], &[])?;
     let (k0, nv, sh, mlo, mhi) = (t(4), t(5), t(6), t(8), t(9));
     ins!(b, format!("v_add_nc_u32_e32 v{k0}, s{kt}, v{V_VKB}"); v(k0); s(kt), v(V_VKB))?;
     ins!(b, format!("v_sub_nc_u32_e32 v{nv}, s{S_SEQ}, v{k0}"); v(nv); s(S_SEQ), v(k0))?;
@@ -841,6 +977,9 @@ fn commit(b: &mut Builder, l: &L, tag: &str, kt: u8, wb: usize) -> R {
     for c in 0..4u8 {
         ins!(b, format!("v_and_b32_e32 v{}, v{mlo}, v{}", d + 2 * c, d + 2 * c); v(d + 2 * c); v(mlo), v(d + 2 * c))?;
         ins!(b, format!("v_and_b32_e32 v{}, v{mhi}, v{}", d + 2 * c + 1, d + 2 * c + 1); v(d + 2 * c + 1); v(mhi), v(d + 2 * c + 1))?;
+    }
+    b.label(&store_v)?;
+    for c in 0..4u8 {
         dstore(b, wb, "b64", V_WV, vr(d + 2 * c, 2), base + 16 * u32::from(c))?;
     }
     b.label(&skip_v)?;
@@ -849,16 +988,17 @@ fn commit(b: &mut Builder, l: &L, tag: &str, kt: u8, wb: usize) -> R {
     sop(b, format!("s_cmp_lg_u32 s{S_WAVE}, 0"), &[], &[S_WAVE])?;
     op(b, format!("s_cbranch_scc1 {skip_s}"), &[], &[])?;
     let (x0, x1) = (t(0), t(1));
+    let ws = V_WS;
     ins!(b, format!("v_cvt_f32_f16_e64 v{x0}, v{V_SP}.l"); v(x0); v(V_SP))?;
     ins!(b, format!("v_cvt_f32_f16_e64 v{x1}, v{}.l", V_SP + 1); v(x1); v(V_SP + 1))?;
-    dstore(b, wb, "b32", V_WS, v(x0), base)?;
-    dstore(b, wb, "b32", V_WS, v(x1), base + 192)?;
+    dstore(b, wb, "b32", ws, v(x0), base)?;
+    dstore(b, wb, "b32", ws, v(x1), base + 192)?;
     ins!(b, format!("v_cmp_gt_u32_e64 s{S_MD}, 16, v{V_LANE}"); m(S_MD); v(V_LANE))?;
     ins!(b, format!("v_cvt_f32_f16_e64 v{x0}, v{}.l", V_SP + 2); v(x0); v(V_SP + 2))?;
     ins!(b, format!("v_cvt_f32_f16_e64 v{x1}, v{}.l", V_SP + 3); v(x1); v(V_SP + 3))?;
     exec_and(b, S_SAVE, S_MD)?;
-    dstore(b, wb, "b32", V_WS, v(x0), base + 128)?;
-    dstore(b, wb, "b32", V_WS, v(x1), base + 192 + 128)?;
+    dstore(b, wb, "b32", ws, v(x0), base + 128)?;
+    dstore(b, wb, "b32", ws, v(x1), base + 192 + 128)?;
     exec_restore(b, S_SAVE)?;
     b.label(&skip_s)?;
     // Drain the stores on every path (the role branches skip counted work): the buffer is published by the barrier
@@ -868,9 +1008,10 @@ fn commit(b: &mut Builder, l: &L, tag: &str, kt: u8, wb: usize) -> R {
 }
 
 // ------------------------------------------------------------------ tile loop
-/// One tile with LDS buffer `rb` read and `1 - rb` committed: commit of the next tile, issue of the one after,
-/// the sub loop, the rendezvous (Ready next, Retire this) and the tile advance (exit to the epilogue past the
-/// last tile).
+/// One tile with LDS buffer `rb` read and `1 - rb` written: the compute of the sub loop, then the commit of the next
+/// tile (its loads were issued at the end of the previous tile), then the rendezvous (Ready next, Retire this); the
+/// loads for the tile after next go out between the rendezvous signal and its wait. Past the last tile the code
+/// leaves for the epilogue.
 fn tile(b: &mut Builder, l: &L, rb: usize) -> R {
     let wb = 1 - rb;
     let c = if rb == 0 { "a" } else { "b" };
@@ -878,15 +1019,7 @@ fn tile(b: &mut Builder, l: &L, rb: usize) -> R {
     let skip_cm = l.n(&format!("{c}_skipcommit"));
     let barrier = l.n(&format!("{c}_barrier"));
     sop(b, format!("s_add_co_i32 s{S_TG}, s{S_KT}, {}", lit(TK)), &[S_TG], &[S_KT])?;
-    sop(b, format!("s_add_co_i32 s{S_TH}, s{S_KT}, {}", lit(2 * TK)), &[S_TH], &[S_KT])?;
-    // Drain before the branch: every path (committing or not) reaches the issue with no load in flight.
-    b.wait(Counter::Load, 0)?;
-    sop(b, format!("s_cmp_ge_i32 s{S_TG}, s{S_SEQ}"), &[], &[S_TG, S_SEQ])?;
-    op(b, format!("s_cbranch_scc1 {skip_cm}"), &[], &[])?;
-    commit(b, l, &format!("{c}c"), S_TG, wb)?;
-    b.label(&skip_cm)?;
-    issue(b, l, &format!("{c}i"), S_TH)?;
-    // Compute (dead waves only join the rendezvous).
+    // Compute (dead waves only join the fill and the rendezvous).
     sop(b, format!("s_cmp_eq_u32 s{S_WLIVE}, 0"), &[], &[S_WLIVE])?;
     op(b, format!("s_cbranch_scc1 {barrier}"), &[], &[])?;
     // nsub = min(3, (gmax - ktile) / 16 + 1): subs with kt_sub <= gmax.
@@ -905,8 +1038,20 @@ fn tile(b: &mut Builder, l: &L, rb: usize) -> R {
     sop(b, format!("s_lshl_b32 s{S_TA}, s{S_TI}, 6"), &[S_TA], &[S_TI])?;
     ins!(b, format!("v_subrev_nc_u32_e32 v{V_RSK}, s{S_TA}, v{V_RSK}"); v(V_RSK); s(S_TA), v(V_RSK))?;
     b.label(&barrier)?;
+    // Both paths into the commit (compute done, dead wave) reach the first scalar read of the tile bound the same way.
+    wait_alu(b, "depctr_sa_sdst(0)")?;
+    // Commit of tile k + 1 (the drain before the branch keeps every path free of loads in flight).
+    b.wait(Counter::Load, 0)?;
+    sop(b, format!("s_cmp_ge_i32 s{S_TG}, s{S_SEQ}"), &[], &[S_TG, S_SEQ])?;
+    op(b, format!("s_cbranch_scc1 {skip_cm}"), &[], &[])?;
+    commit(b, l, &format!("{c}c"), S_TG, wb)?;
+    b.label(&skip_cm)?;
     b.wait(Counter::Ds, 0)?;
-    b.barrier(&[Transition::Ready(wb), Transition::Retire(rb)])?;
+    b.barrier_signal(&[Transition::Ready(wb), Transition::Retire(rb)])?;
+    // Loads for tile k + 2 (its commit closes tile k + 1), issued while the other waves arrive.
+    sop(b, format!("s_add_co_i32 s{S_TH}, s{S_KT}, {}", lit(2 * TK)), &[S_TH], &[S_KT])?;
+    issue(b, l, &format!("{c}i"), S_TH)?;
+    b.barrier_wait()?;
     sop(b, format!("s_add_co_i32 s{S_KT}, s{S_KT}, {TK}"), &[S_KT], &[S_KT])?;
     sop(b, format!("s_cmp_ge_i32 s{S_KT}, s{S_SEQ}"), &[], &[S_KT, S_SEQ])?;
     op(b, format!("s_cbranch_scc1 {epi}"), &[], &[])
@@ -924,25 +1069,22 @@ fn sub(b: &mut Builder, l: &L, rb: usize, c: &str) -> R {
     let base = rb as u32 * BUFB;
     let head = l.n(&format!("{c}_sub"));
     let sa = V_SA;
-    // ---- QK: S^T = K^T Q over 16 dimension fragments, in dimension order.
-    op(b, "s_setprio 3", &[], &[])?;
-    for p in 0..4u8 {
-        dload128(b, rb, V_FR + 4 * p, V_RDK, base + u32::from(p) * 1536)?;
+    // ---- QK: S^T = K^T Q over 16 dimension fragments, in dimension order. All eight K fragment loads are in flight
+    // before the chain: fragments 0..4 in the fragment ring, 4..8 in the temporaries (dead until the softmax).
+    let slot = |p: u8| if p < 4 { V_FR + 4 * p } else { V_T + 4 * (p - 4) };
+    l.prio(b, 3)?;
+    for p in 0..8u8 {
+        dload128(b, rb, slot(p), V_RDK, base + u32::from(p) * 1536)?;
     }
     for p in 0..8u8 {
-        let slot = V_FR + 4 * (p % 4);
-        wmma8(b, sa, slot, V_QF + 4 * p, p > 0)?;
-        wmma8(b, sa, slot + 2, V_QF + 4 * p + 2, true)?;
-        if p + 4 < 8 {
-            dload128(b, rb, slot, V_RDK, base + u32::from(p + 4) * 1536)?;
-        }
+        wmma8(b, sa, slot(p), V_QF + 4 * p, p > 0)?;
+        wmma8(b, sa, slot(p) + 2, V_QF + 4 * p + 2, true)?;
     }
-    op(b, "s_setprio 0", &[], &[])?;
+    l.prio(b, 0)?;
     // Key/value scales of the sub: sk[0..8] -> FR[0..8], sv[0..8] -> FR[8..16].
-    dload128(b, rb, V_FR, V_RSK, base)?;
-    dload128(b, rb, V_FR + 4, V_RSK, base + 16)?;
-    dload128(b, rb, V_FR + 8, V_RSK, base + 192)?;
-    dload128(b, rb, V_FR + 12, V_RSK, base + 208)?;
+    for (i, off) in [0u32, 16, 192, 208].into_iter().enumerate() {
+        dload128(b, rb, V_FR + 4 * i as u8, V_RSK, base + off)?;
+    }
     // ---- scores: s = (acc * qs) * sk, masked to -inf past the row's position.
     let full_path = l.n(&format!("{c}_fast"));
     let scored = l.n(&format!("{c}_scored"));
@@ -976,19 +1118,24 @@ fn sub(b: &mut Builder, l: &L, rb: usize, c: &str) -> R {
     for j in 0..8u8 {
         let x = sa + j;
         ins!(b, format!("v_mul_f32_e32 v{x}, v{V_QS}, v{x}"); v(x); v(V_QS), v(x))?;
+    }
+    for j in 0..8u8 {
+        let x = sa + j;
         ins!(b, format!("v_mul_f32_e32 v{x}, v{x}, v{}", V_FR + j); v(x); v(x), v(V_FR + j))?;
+    }
+    for j in 0..8u8 {
+        let x = sa + j;
         ins!(b, format!("v_cndmask_b32_e64 v{x}, {NEG_INF:#x}, v{x}, s{}", mj(j)); v(x); v(x), m(mj(j)))?;
     }
     op(b, format!("s_branch {scored}"), &[], &[])?;
     b.label(&full_path)?;
-    for j in 0..8u8 {
-        let x = sa + j;
-        ins!(b, format!("v_mul_f32_e32 v{x}, v{V_QS}, v{x}"); v(x); v(V_QS), v(x))?;
-        ins!(b, format!("v_mul_f32_e32 v{x}, v{x}, v{}", V_FR + j); v(x); v(x), v(V_FR + j))?;
-    }
+    let qs_ops: Vec<VopdOp> = (0..8u8).map(|j| mulv(sa + j, V_QS, sa + j)).collect();
+    l.pairs(b, &qs_ops)?;
+    let sk_ops: Vec<VopdOp> = (0..8u8).map(|j| mulv(sa + j, sa + j, V_FR + j)).collect();
+    l.pairs(b, &sk_ops)?;
     b.label(&scored)?;
     softmax(b, l, c)?;
-    pv(b, rb)?;
+    pv(b, l, rb)?;
     // Advance the fragment bases to the next sub.
     ins!(b, format!("v_add_nc_u32_e32 v{V_RDK}, 0x200, v{V_RDK}"); v(V_RDK); v(V_RDK))?;
     ins!(b, format!("v_add_nc_u32_e32 v{V_RDV}, 0x1000, v{V_RDV}"); v(V_RDV); v(V_RDV))?;
@@ -1000,11 +1147,12 @@ fn sub(b: &mut Builder, l: &L, rb: usize, c: &str) -> R {
 }
 
 /// Online softmax of one sub (the hipcc DAG): max, running max with the alpha rescale, exponentials, the serial
-/// normaliser, the V-scaled P, the E4M3 scale `needed`, the O rescale and the bracketed P codes into `t(10), t(11)`.
+/// normaliser, the V-scaled P (in place of the value scales, `FR[8..16]`), the E4M3 scale `needed`, the O rescale and
+/// the bracketed P codes into `t(10), t(11)`. Independent element operations are emitted in groups of eight so
+/// dependent instructions sit several slots apart (the schedule, not the arithmetic).
 fn softmax(b: &mut Builder, l: &L, c: &str) -> R {
     let sa = V_SA;
-    let sk = |j: u8| V_FR + j;
-    let sv = |j: u8| V_FR + 8 + j;
+    let pr = |j: u8| V_FR + 8 + j;
     let mx = t(0);
     let (x1, x2, x3) = (t(1), t(2), t(3));
     // mx = max over the lane's 8 keys (the hipcc max3 chain), then against the other key half.
@@ -1043,10 +1191,12 @@ fn softmax(b: &mut Builder, l: &L, c: &str) -> R {
     ins!(b, format!("v_cndmask_b32_e64 v{V_M}, v{V_M}, v{mx}, s{S_MC}"); v(V_M); v(V_M), v(mx), m(S_MC))?;
     // e_j = exp(s_j - m): lanes still at m == -inf produce 0.
     ins!(b, format!("v_cmp_eq_f32_e64 s{S_MA}, {NEG_INF:#x}, v{V_M}"); m(S_MA); v(V_M))?;
+    let sub_ops: Vec<VopdOp> = (0..8u8).map(|j| subv(sa + j, sa + j, V_M)).collect();
+    l.pairs(b, &sub_ops)?;
+    let log_ops: Vec<VopdOp> = (0..8u8).map(|j| mullit(sa + j, LOG2E, sa + j)).collect();
+    l.pairs(b, &log_ops)?;
     for j in 0..8u8 {
         let x = sa + j;
-        ins!(b, format!("v_sub_f32_e32 v{x}, v{x}, v{V_M}"); v(x); v(x), v(V_M))?;
-        ins!(b, format!("v_mul_f32_e32 v{x}, {LOG2E:#x}, v{x}"); v(x); v(x))?;
         ins!(b, format!("v_exp_f32_e32 v{x}, v{x}"); v(x); v(x))?;
     }
     let fast_e = l.n(&format!("{c}_fast_e"));
@@ -1057,29 +1207,29 @@ fn softmax(b: &mut Builder, l: &L, c: &str) -> R {
         ins!(b, format!("v_cndmask_b32_e64 v{x}, v{x}, 0, s{S_MA}"); v(x); v(x), m(S_MA))?;
     }
     b.label(&fast_e)?;
-    // sum = ((e0 + e1) + e2) + ... (ascending, new term first), then the other key half, then l += sum.
+    // sum = ((e0 + e1) + e2) + ... (ascending, new term first), interleaved with P = sv * e (in place of sv),
+    // then the other key half and l += sum.
     let sum = x2;
+    // P = sv * e (sv first): rewritten as the in-place `v_mul sv, sv, e`.
+    let p_ops: Vec<VopdOp> = (0..8u8).map(|j| mulv(pr(j), pr(j), sa + j)).collect();
+    l.pairs(b, &p_ops)?;
     ins!(b, format!("v_add_f32_e32 v{sum}, v{sa}, v{}", sa + 1); v(sum); v(sa), v(sa + 1))?;
     for j in 2..8u8 {
         ins!(b, format!("v_add_f32_e32 v{sum}, v{}, v{sum}", sa + j); v(sum); v(sa + j), v(sum))?;
     }
     xor16(b, x3, sum)?;
-    ins!(b, format!("v_add_f32_e32 v{sum}, v{sum}, v{x3}"); v(sum); v(sum), v(x3))?;
-    ins!(b, format!("v_add_f32_e32 v{V_L}, v{V_L}, v{sum}"); v(V_L); v(V_L), v(sum))?;
-    // P = sv * e.
-    for j in 0..8u8 {
-        let x = sa + j;
-        ins!(b, format!("v_mul_f32_e32 v{x}, v{}, v{x}", sv(j)); v(x); v(sv(j)), v(x))?;
-    }
-    // wmax = max(0, p0..p7) over both halves; needed = wmax > 0 ? max(wmax / 448, 2^-64) : b.
+    // wmax = max(0, p0..p7) over both halves (the P max chain overlaps the sum's lane exchange).
     let wm = x1;
-    ins!(b, format!("v_max3_num_f32 v{wm}, v{sa}, 0, v{}", sa + 1); v(wm); v(sa), v(sa + 1))?;
+    ins!(b, format!("v_max3_num_f32 v{wm}, v{}, 0, v{}", pr(0), pr(1)); v(wm); v(pr(0)), v(pr(1)))?;
+    ins!(b, format!("v_add_f32_e32 v{sum}, v{sum}, v{x3}"); v(sum); v(sum), v(x3))?;
     for j in [2u8, 4, 6] {
-        ins!(b, format!("v_max3_num_f32 v{wm}, v{wm}, v{}, v{}", sa + j, sa + j + 1); v(wm); v(wm), v(sa + j), v(sa + j + 1))?;
+        ins!(b, format!("v_max3_num_f32 v{wm}, v{wm}, v{}, v{}", pr(j), pr(j + 1)); v(wm); v(wm), v(pr(j)), v(pr(j + 1)))?;
     }
+    ins!(b, format!("v_add_f32_e32 v{V_L}, v{V_L}, v{sum}"); v(V_L); v(V_L), v(sum))?;
     xor16(b, x3, wm)?;
     ins!(b, format!("v_max_num_f32_e32 v{x3}, v{x3}, v{x3}"); v(x3); v(x3))?;
     ins!(b, format!("v_max_num_f32_e32 v{wm}, v{wm}, v{x3}"); v(wm); v(wm), v(x3))?;
+    // needed = wmax > 0 ? max(wmax / 448, 2^-64) : b.
     let (q, needed) = (x2, x3);
     ins!(b, format!("v_mul_f32_e32 v{q}, {INV448:#x}, v{wm}"); v(q); v(wm))?;
     ins!(b, format!("v_cmp_lt_f32_e64 s{S_MB}, 0, v{wm}"); m(S_MB); v(wm))?;
@@ -1106,19 +1256,19 @@ fn softmax(b: &mut Builder, l: &L, c: &str) -> R {
     }
     b.label(&resc_done)?;
     exec_restore(b, S_SAVE)?;
-    // P codes: cvt(p * yb_lo) vs cvt(p * yb_hi); equal codes are the IEEE-division codes.
+    // P codes: cvt(p * yb_lo) vs cvt(p * yb_hi); equal codes are the IEEE-division codes. The eight products of a
+    // bracket go to t(0..8) (dead here) before their four conversions.
     let (pw0, pw1, hw0, hw1) = (t(10), t(11), t(12), t(13));
-    let (u0, u1) = (t(14), t(15));
     for (words, y) in [([pw0, pw1], V_YL), ([hw0, hw1], V_YH)] {
+        let prod: Vec<VopdOp> = (0..8u8).map(|j| mulv(t(j), pr(j), y)).collect();
+        l.pairs(b, &prod)?;
         for (wi, w) in words.into_iter().enumerate() {
             for half in 0..2u8 {
                 let j = (4 * wi as u8) + 2 * half;
-                ins!(b, format!("v_mul_f32_e32 v{u0}, v{}, v{y}", sa + j); v(u0); v(sa + j), v(y))?;
-                ins!(b, format!("v_mul_f32_e32 v{u1}, v{}, v{y}", sa + j + 1); v(u1); v(sa + j + 1), v(y))?;
                 if half == 0 {
-                    ins!(b, format!("v_cvt_pk_fp8_f32 v{w}.l, v{u0}, v{u1}"); v(w); v(u0), v(u1), v(w))?;
+                    ins!(b, format!("v_cvt_pk_fp8_f32 v{w}.l, v{}, v{}", t(j), t(j + 1)); v(w); v(t(j)), v(t(j + 1)), v(w))?;
                 } else {
-                    ins!(b, format!("v_cvt_pk_fp8_f32 v{w}.h, v{u0}, v{u1} op_sel:[0,0,1]"); v(w); v(u0), v(u1), v(w))?;
+                    ins!(b, format!("v_cvt_pk_fp8_f32 v{w}.h, v{}, v{} op_sel:[0,0,1]", t(j), t(j + 1)); v(w); v(t(j)), v(t(j + 1)), v(w))?;
                 }
             }
         }
@@ -1127,13 +1277,14 @@ fn softmax(b: &mut Builder, l: &L, c: &str) -> R {
     ins!(b, format!("v_cmp_ne_u32_e64 s{S_MB}, v{pw1}, v{hw1}"); m(S_MB); v(pw1), v(hw1))?;
     op(b, format!("s_or_b32 s{S_MA}, s{S_MA}, s{S_MB}"), &[m(S_MA)], &[m(S_MA), m(S_MB)])?;
     let p_done = l.n(&format!("{c}_pcode_done"));
+    let (u0, u1) = (t(14), t(15));
     op(b, format!("s_and_saveexec_b32 s{S_SAVE}, s{S_MA}"), &[m(S_SAVE)], &[m(S_MA)])?;
     op(b, format!("s_cbranch_execz {p_done}"), &[], &[])?;
     for (wi, w) in [pw0, pw1].into_iter().enumerate() {
         for half in 0..2u8 {
             let j = (4 * wi as u8) + 2 * half;
-            fdiv(b, u0, &format!("v{}", sa + j), &format!("v{V_B}"), &[v(sa + j), v(V_B)], [t(17), t(18), t(19), t(20)])?;
-            fdiv(b, u1, &format!("v{}", sa + j + 1), &format!("v{V_B}"), &[v(sa + j + 1), v(V_B)], [t(17), t(18), t(19), t(20)])?;
+            fdiv(b, u0, &format!("v{}", pr(j)), &format!("v{V_B}"), &[v(pr(j)), v(V_B)], [t(17), t(18), t(19), t(20)])?;
+            fdiv(b, u1, &format!("v{}", pr(j + 1)), &format!("v{V_B}"), &[v(pr(j + 1)), v(V_B)], [t(17), t(18), t(19), t(20)])?;
             if half == 0 {
                 ins!(b, format!("v_cvt_pk_fp8_f32 v{w}.l, v{u0}, v{u1}"); v(w); v(u0), v(u1), v(w))?;
             } else {
@@ -1147,10 +1298,10 @@ fn softmax(b: &mut Builder, l: &L, c: &str) -> R {
 }
 
 /// `O += V^T P`: V fragments first operand, the P words (`t(10), t(11)`) second, per 16-dim chunk pair.
-fn pv(b: &mut Builder, rb: usize) -> R {
+fn pv(b: &mut Builder, l: &L, rb: usize) -> R {
     let base = rb as u32 * BUFB;
     let pb = t(10);
-    op(b, "s_setprio 3", &[], &[])?;
+    l.prio(b, 3)?;
     for p in 0..4u8 {
         dload128(b, rb, V_FR + 4 * p, V_RDV, base + u32::from(p) * 512)?;
     }
@@ -1162,7 +1313,7 @@ fn pv(b: &mut Builder, rb: usize) -> R {
             dload128(b, rb, slot, V_RDV, base + u32::from(p + 4) * 512)?;
         }
     }
-    op(b, "s_setprio 0", &[], &[])
+    l.prio(b, 0)
 }
 
 // ------------------------------------------------------------------ epilogue
@@ -1211,14 +1362,12 @@ fn epilogue(b: &mut Builder, l: &L) -> R {
 /// One export (`range` selects the symbol; the body is shared).
 pub fn emit(arch: Arch, spec: &FaQresSpec, range: bool) -> Result<Emitted, String> {
     admit(arch, spec)?;
-    let l = L {
-        tag: if range { "r" } else { "d" },
-    };
-    let (symbol, variant) = if range {
-        (SYMBOL_RANGE, "range")
+    let (symbol, variant, tag) = if range {
+        (SYMBOL_RANGE, "range", "r")
     } else {
-        (SYMBOL_DIRECT, "direct")
+        (SYMBOL_DIRECT, "direct", "d")
     };
+    let l = L { tag };
     let mut b = Builder::new(kernel_spec(symbol, variant), plan(&l)?);
     b.enable_delay_alu();
     b.enable_workgroup_id_z();
@@ -1318,18 +1467,11 @@ mod tests {
     fn the_direct_export_emits() {
         let e = emit(Arch::Gfx1201, &FaQresSpec::A3B, false).unwrap();
         assert!(e.s_text.contains(SYMBOL_DIRECT));
-        eprintln!("{:?}", e.shape);
     }
 
     #[test]
     fn the_module_assembles_natively() {
         let (_, text, _) = emit_module(Arch::Gfx1201, &FaQresSpec::A3B).unwrap();
-        std::fs::write(
-            std::env::var("FAQRES_DUMP").unwrap_or_else(|_| "/dev/null".into()),
-            &text,
-        )
-        .unwrap();
-        let elf = crate::native::assemble(&text, Arch::Gfx1201).unwrap();
-        eprintln!("{} bytes", elf.len());
+        crate::native::assemble(&text, Arch::Gfx1201).unwrap();
     }
 }

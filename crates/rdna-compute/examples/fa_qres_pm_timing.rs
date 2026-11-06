@@ -155,8 +155,15 @@ struct Buffers {
     k: GpuTensor,
     v: GpuTensor,
     pos: GpuTensor,
-    out_hip: GpuTensor,
-    out_pm: GpuTensor,
+    /// One output per arm (arm 0 is hipcc).
+    outs: Vec<GpuTensor>,
+}
+
+/// A timed arm: its name and kernel route.
+#[derive(Clone)]
+struct Arm {
+    name: String,
+    route: A3bQresRoute,
 }
 
 fn upload(gpu: &Gpu, t: &GpuTensor, data: &[u8]) -> Result<()> {
@@ -169,11 +176,7 @@ fn download(gpu: &Gpu, t: &GpuTensor, len: usize) -> Result<Vec<u8>> {
     Ok(v)
 }
 
-fn launch(gpu: &mut Gpu, s: &Shape, route: A3bQresRoute, b: &Buffers) -> HipResult<()> {
-    let out = match route {
-        A3bQresRoute::Hipcc => &b.out_hip,
-        A3bQresRoute::Pm => &b.out_pm,
-    };
+fn launch(gpu: &mut Gpu, s: &Shape, route: A3bQresRoute, b: &Buffers, out: &GpuTensor) -> HipResult<()> {
     match s.range {
         None => gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_routed_gfx1201(
             route, &b.q, &b.k, &b.v, out, &b.pos, H, KV, D, s.ctx, s.rows,
@@ -197,92 +200,117 @@ fn stats(us: &mut Vec<f64>) -> Value {
         "samples": n})
 }
 
-fn time_shape(gpu: &mut Gpu, s: &Shape) -> Result<bool> {
+fn time_shape(gpu: &mut Gpu, s: &Shape, arms: &[Arm]) -> Result<bool> {
+    let arms: Vec<&Arm> = arms.iter().collect();
     let (q, k, v, positions) = fixtures(s);
     let pos_bytes: Vec<u8> = positions.iter().flat_map(|p| p.to_le_bytes()).collect();
+    let mut outs = Vec::new();
+    for _ in &arms {
+        outs.push(gpu.alloc_tensor(&[s.rows * ROW], DType::F32)?);
+    }
     let b = Buffers {
         q: gpu.alloc_tensor(&[s.q_bytes()], DType::Raw)?,
         k: gpu.alloc_tensor(&[s.cache_bytes()], DType::Raw)?,
         v: gpu.alloc_tensor(&[s.cache_bytes()], DType::Raw)?,
         pos: gpu.alloc_tensor(&[s.rows], DType::F32)?,
-        out_hip: gpu.alloc_tensor(&[s.rows * ROW], DType::F32)?,
-        out_pm: gpu.alloc_tensor(&[s.rows * ROW], DType::F32)?,
+        outs,
     };
     upload(gpu, &b.q, &q)?;
     upload(gpu, &b.k, &k)?;
     upload(gpu, &b.v, &v)?;
     upload(gpu, &b.pos, &pos_bytes)?;
     // Distinct poisons: an unwritten output cannot match.
-    gpu.hip.memset(&b.out_hip.buf, 0xA5, s.out_bytes())?;
-    gpu.hip.memset(&b.out_pm.buf, 0x5A, s.out_bytes())?;
+    for (i, o) in b.outs.iter().enumerate() {
+        gpu.hip.memset(&o.buf, if i == 0 { 0xA5 } else { 0x5A }, s.out_bytes())?;
+    }
     gpu.hip.device_synchronize()?;
-    // Byte identity first, fail closed.
-    launch(gpu, s, A3bQresRoute::Hipcc, &b)?;
-    launch(gpu, s, A3bQresRoute::Pm, &b)?;
+    // Byte identity of every arm against hipcc first, fail closed.
+    for (a, o) in arms.iter().zip(&b.outs) {
+        launch(gpu, s, a.route, &b, o)?;
+    }
     gpu.hip.device_synchronize()?;
-    let hip = download(gpu, &b.out_hip, s.out_bytes())?;
-    let pm = download(gpu, &b.out_pm, s.out_bytes())?;
-    let mismatch_words = hip
-        .chunks_exact(4)
-        .zip(pm.chunks_exact(4))
-        .filter(|(a, b)| a != b)
-        .count();
-    let first = hip
-        .chunks_exact(4)
-        .zip(pm.chunks_exact(4))
-        .position(|(a, b)| a != b)
-        .map(|i| {
-            json!({"row": i / ROW, "head": (i % ROW) / D, "dim": i % D,
-                "hip_bits": format!("0x{:08x}", u32::from_le_bytes(hip[i * 4..i * 4 + 4].try_into().unwrap())),
-                "pm_bits": format!("0x{:08x}", u32::from_le_bytes(pm[i * 4..i * 4 + 4].try_into().unwrap()))})
-        });
-    let identical = mismatch_words == 0 && hip.len() == pm.len();
-    let written = hip.iter().any(|&x| x != 0xA5) && pm.iter().any(|&x| x != 0x5A);
-    if !identical || !written {
+    let hip = download(gpu, &b.outs[0], s.out_bytes())?;
+    let mut all_ok = hip.iter().any(|&x| x != 0xA5);
+    let mut ident = Vec::new();
+    for (a, o) in arms.iter().zip(&b.outs).skip(1) {
+        let pm = download(gpu, o, s.out_bytes())?;
+        let mismatch_words = hip
+            .chunks_exact(4)
+            .zip(pm.chunks_exact(4))
+            .filter(|(x, y)| x != y)
+            .count();
+        let first = hip
+            .chunks_exact(4)
+            .zip(pm.chunks_exact(4))
+            .position(|(x, y)| x != y)
+            .map(|i| {
+                json!({"row": i / ROW, "head": (i % ROW) / D, "dim": i % D,
+                    "hip_bits": format!("0x{:08x}", u32::from_le_bytes(hip[i * 4..i * 4 + 4].try_into().unwrap())),
+                    "pm_bits": format!("0x{:08x}", u32::from_le_bytes(pm[i * 4..i * 4 + 4].try_into().unwrap()))})
+            });
+        let identical = mismatch_words == 0 && hip.len() == pm.len();
+        let written = pm.iter().any(|&x| x != 0x5A);
+        all_ok &= identical && written;
+        ident.push(json!({"arm": a.name, "byte_identical": identical, "outputs_written": written,
+            "mismatch_words": mismatch_words, "first_mismatch": first}));
+    }
+    if !all_ok {
         println!(
             "{}",
             json!({"kind": "timing_shape", "shape": s.name, "rows": s.rows, "context": s.ctx,
-                "byte_identical": identical, "outputs_written": written,
-                "mismatch_words": mismatch_words, "first_mismatch": first,
-                "timed": false, "pass": false})
+                "identity": ident, "timed": false, "pass": false})
         );
         return Ok(false);
     }
-    drop((hip, pm));
+    drop(hip);
     let (ea, eb) = (gpu.hip.event_create()?, gpu.hip.event_create()?);
-    let time_one = |gpu: &mut Gpu, route: A3bQresRoute| -> Result<f64> {
+    let time_one = |gpu: &mut Gpu, i: usize| -> Result<f64> {
         gpu.hip.event_record(&ea, None)?;
-        launch(gpu, s, route, &b)?;
+        launch(gpu, s, arms[i].route, &b, &b.outs[i])?;
         gpu.hip.event_record(&eb, None)?;
         gpu.hip.event_synchronize(&eb)?;
         Ok(gpu.hip.event_elapsed_ms(&ea, &eb)? as f64 * 1000.0)
     };
     for _ in 0..WARMUPS {
-        time_one(gpu, A3bQresRoute::Hipcc)?;
-        time_one(gpu, A3bQresRoute::Pm)?;
+        for i in 0..arms.len() {
+            time_one(gpu, i)?;
+        }
     }
-    let (mut hip_us, mut pm_us) = (Vec::new(), Vec::new());
+    let mut us: Vec<Vec<f64>> = vec![Vec::new(); arms.len()];
     for _ in 0..ITERS {
-        hip_us.push(time_one(gpu, A3bQresRoute::Hipcc)?);
-        pm_us.push(time_one(gpu, A3bQresRoute::Pm)?);
+        for i in 0..arms.len() {
+            us[i].push(time_one(gpu, i)?);
+        }
     }
     gpu.hip.event_destroy(ea)?;
     gpu.hip.event_destroy(eb)?;
-    let (hs, ps) = (stats(&mut hip_us), stats(&mut pm_us));
-    let ratio = |key: &str| ps[key].as_f64().unwrap() / hs[key].as_f64().unwrap();
-    println!(
-        "{}",
-        json!({"kind": "timing_shape", "shape": s.name, "rows": s.rows, "start": s.start,
+    let stat: Vec<Value> = us.iter_mut().map(stats).collect();
+    let ratio = |i: usize, key: &str| stat[i][key].as_f64().unwrap() / stat[0][key].as_f64().unwrap();
+    let mut arms_json = serde_json::Map::new();
+    for (i, a) in arms.iter().enumerate() {
+        let mut e = stat[i].clone();
+        if i > 0 {
+            e["ratio_over_hip_median"] = json!(ratio(i, "median_us"));
+            e["ratio_over_hip_mean"] = json!(ratio(i, "mean_us"));
+            e["ratio_over_hip_min"] = json!(ratio(i, "min_us"));
+        }
+        arms_json.insert(a.name.clone(), e);
+    }
+    let mut out = json!({"kind": "timing_shape", "shape": s.name, "rows": s.rows, "start": s.start,
             "context": s.ctx, "range": s.range.map(|(t, o)| json!({"q_total_rows": t, "q_row_offset": o})),
             "grid": s.grid(), "block": [768, 1, 1], "lds": 49_936,
             "byte_identical": true, "warmups_per_arm": WARMUPS, "timed_per_arm": ITERS,
             "order": "interleaved ABAB (A = hipcc, B = PM)",
-            "hipcc": hs, "pm": ps,
-            "ratio_pm_over_hip_median": ratio("median_us"),
-            "ratio_pm_over_hip_mean": ratio("mean_us"),
-            "ratio_pm_over_hip_min": ratio("min_us"),
-            "pass": true})
-    );
+            "arms": arms_json, "pass": true});
+    // The two-arm form of the original harness stays readable on its own.
+    if let Some(pm) = arms.iter().position(|a| a.name == "pm") {
+        out["hipcc"] = stat[0].clone();
+        out["pm"] = stat[pm].clone();
+        out["ratio_pm_over_hip_median"] = json!(ratio(pm, "median_us"));
+        out["ratio_pm_over_hip_mean"] = json!(ratio(pm, "mean_us"));
+        out["ratio_pm_over_hip_min"] = json!(ratio(pm, "min_us"));
+    }
+    println!("{out}");
     Ok(true)
 }
 
@@ -297,6 +325,15 @@ fn run() -> Result<bool> {
             _ => return Err(format!("unknown argument {a}; usage: fa_qres_pm_timing [--plan] [--shape SUBSTR]").into()),
         }
     }
+    // Arm 0 is hipcc.
+    let mut arms = vec![Arm {
+        name: "hipcc".into(),
+        route: A3bQresRoute::Hipcc,
+    }];
+    arms.push(Arm {
+        name: "pm".into(),
+        route: A3bQresRoute::Pm,
+    });
     let shapes: Vec<Shape> = SHAPES
         .iter()
         .copied()
@@ -315,7 +352,7 @@ fn run() -> Result<bool> {
                     "range": s.range.map(|(t, o)| json!({"q_total_rows": t, "q_row_offset": o})),
                     "grid": s.grid(), "block": [768, 1, 1], "lds": 49_936,
                     "device_bytes": s.device_bytes(),
-                    "launches": 2 + 2 * WARMUPS + 2 * ITERS})
+                    "launches_per_arm": 1 + WARMUPS + ITERS})
             );
         }
         // Buffers are freed per shape; the pool may retain them, so budget the sum.
@@ -345,7 +382,7 @@ fn run() -> Result<bool> {
     );
     let mut ok = true;
     for s in &shapes {
-        ok &= time_shape(&mut gpu, s)?;
+        ok &= time_shape(&mut gpu, s, &arms)?;
         if !ok {
             break;
         }

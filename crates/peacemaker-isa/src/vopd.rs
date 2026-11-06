@@ -86,8 +86,10 @@ pub fn validate_pair(arch: Arch, x: VopdOp, y: VopdOp) -> Result<(), String> {
     if x.dst % 2 == y.dst % 2 {
         return Err("VOPD destination parity collision".into());
     }
+    // gfx12 lets both halves read the same VGPR as src0 (hipcc emits `v_dual_mul_f32 .., v189, .. :: v_dual_mul_f32 ..,
+    // v189, ..`), as it does for src1.
     if let (Operand::V(a), Operand::V(b)) = (x.src0, y.src0) {
-        if a % 4 == b % 4 {
+        if a % 4 == b % 4 && !(arch.gfx12() && a == b) {
             return Err("VOPD src0 bank collision".into());
         }
     }
