@@ -220,6 +220,13 @@ impl Native {
             Native::Expand(_) => (expand::SGPRS as u8, expand::VGPRS as u8),
         }
     }
+    /// The body's LDS, `[0, lds)` like a lifted body's (the dispatcher slot sits above).
+    fn lds(self) -> u32 {
+        match self {
+            Native::Copy(_) => 0,
+            Native::Expand(_) => crate::kernels::p0_expand_gfx1201::LDS_BYTES,
+        }
+    }
     fn emit(self, b: &mut Builder, block: u32, name: &str) -> Result<(), String> {
         match self {
             Native::Copy(_) => copy_body(b, block, name),
@@ -271,7 +278,12 @@ pub fn pool(
         }
     }
     let multi = block > 32;
-    let body_lds = hosted.iter().map(|h| h.region.lds_bytes).max().unwrap_or(0);
+    let body_lds = hosted
+        .iter()
+        .map(|h| h.region.lds_bytes)
+        .chain(natives.iter().map(|n| n.lds()))
+        .max()
+        .unwrap_or(0);
     let slot_base = body_lds.next_multiple_of(16);
     let lds_total = if multi { slot_base + 64 } else { body_lds };
     let step_label = |t: u32| format!(".Lt{t}_step");
@@ -868,7 +880,7 @@ pub fn pool(
                     ("lane".into(), v(0)),
                     ("workgroup_x".into(), s(WG_X as u8)),
                 ],
-                lds_bytes: 0,
+                lds_bytes: n.lds(),
                 workgroup_size: block as u16,
             };
             b.loop_(&step_label(c), |b| {
