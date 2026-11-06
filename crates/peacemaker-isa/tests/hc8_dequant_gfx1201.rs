@@ -108,7 +108,11 @@ fn case(m: usize, k: usize) -> Case {
         })
         .collect();
     let swz = swizzle_spec(&w, m, k);
-    assert_eq!(swz, swizzle_hc8(&w, m, k), "spec swizzle vs swizzle_hc8 ({m}x{k})");
+    assert_eq!(
+        swz,
+        swizzle_hc8(&w, m, k),
+        "spec swizzle vs swizzle_hc8 ({m}x{k})"
+    );
     let scales: Vec<f32> = (0..m).map(|r| pow2(EXPS[r % EXPS.len()])).collect();
     let vals = (0..m * k).map(|i| e4m3(w[i]) * scales[i / k]).collect();
     Case {
@@ -215,7 +219,12 @@ fn run(out: DequantOut, c: &Case, extra_groups: u32) -> Vec<u8> {
         "{}: out guards overwritten",
         out.symbol()
     );
-    assert_eq!(r.written.count(), total * 2, "{}: written byte count", out.symbol());
+    assert_eq!(
+        r.written.count(),
+        total * 2,
+        "{}: written byte count",
+        out.symbol()
+    );
     for b in 0..r.bytes.len() {
         assert_eq!(
             r.written.contains(b),
@@ -266,13 +275,27 @@ fn f16_output_every_byte() {
 fn oracle_covers_edges() {
     // The 16-row case holds all 254 finite codes in every row under all 16 scales.
     let c = case(16, 256);
-    let w_codes: std::collections::BTreeSet<u8> = (0..16 * 256).map(|i| finite_codes()[(i + 3 * (i / 256)) % 254]).collect();
+    let w_codes: std::collections::BTreeSet<u8> = (0..16 * 256)
+        .map(|i| finite_codes()[(i + 3 * (i / 256)) % 254])
+        .collect();
     assert_eq!(w_codes.len(), 254);
     let h = expected(DequantOut::F16, &c.vals);
-    let halves: Vec<u16> = h.chunks(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
-    assert!(halves.iter().any(|&x| x == 0x7c00 || x == 0xfc00), "no f16 overflow to inf");
-    assert!(halves.iter().any(|&x| x & 0x7c00 == 0 && x & 0x3ff != 0), "no f16 subnormal");
-    assert!(halves.iter().any(|&x| x & 0x7fff == 0), "no zero (+/-0 codes, total underflow)");
+    let halves: Vec<u16> = h
+        .chunks(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    assert!(
+        halves.iter().any(|&x| x == 0x7c00 || x == 0xfc00),
+        "no f16 overflow to inf"
+    );
+    assert!(
+        halves.iter().any(|&x| x & 0x7c00 == 0 && x & 0x3ff != 0),
+        "no f16 subnormal"
+    );
+    assert!(
+        halves.iter().any(|&x| x & 0x7fff == 0),
+        "no zero (+/-0 codes, total underflow)"
+    );
     assert!(halves.iter().any(|&x| x == 0x8000), "no -0");
     assert!(halves.iter().any(|&x| x == 0x0000), "no +0");
 }
@@ -282,7 +305,9 @@ fn module_exports_and_resources() {
     let (emitted, text, proof) = emit_module().unwrap();
     assert_eq!(emitted.len(), 82);
     assert_eq!(proof.kernels.len(), 82);
-    assert!(text.contains(".globl hc8_dequant_bf16\n") && text.contains(".globl hc8_dequant_f16\n"));
+    assert!(
+        text.contains(".globl hc8_dequant_bf16\n") && text.contains(".globl hc8_dequant_f16\n")
+    );
     for out in [DequantOut::Bf16, DequantOut::F16] {
         let e = emit_dequant(out).unwrap();
         let t = &e.s_text;
@@ -308,7 +333,11 @@ fn module_exports_and_resources() {
             if line.starts_with('.') || line.ends_with(':') || line.is_empty() {
                 continue;
             }
-            let mut rest = line.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+            let mut rest = line
+                .split_whitespace()
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join(" ");
             rest = rest.replace(['[', ']', ','], " ").replace(':', " ");
             for tok in rest.split_whitespace() {
                 let tok = tok.split('.').next().unwrap();
@@ -319,8 +348,16 @@ fn module_exports_and_resources() {
                 }
             }
         }
-        assert!(nums(".sgpr_count:")[0] >= max_s, "{sym}: sgpr_count {:?} < used {max_s}", nums(".sgpr_count:"));
-        assert!(nums(".vgpr_count:")[0] >= max_v, "{sym}: vgpr_count {:?} < used {max_v}", nums(".vgpr_count:"));
+        assert!(
+            nums(".sgpr_count:")[0] >= max_s,
+            "{sym}: sgpr_count {:?} < used {max_s}",
+            nums(".sgpr_count:")
+        );
+        assert!(
+            nums(".vgpr_count:")[0] >= max_v,
+            "{sym}: vgpr_count {:?} < used {max_v}",
+            nums(".vgpr_count:")
+        );
         for bad in ["scratch_", "atomic", "flat_", "cmpswap"] {
             assert!(!body.contains(bad), "{sym}: forbidden {bad}");
         }

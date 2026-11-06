@@ -15,7 +15,7 @@
 #![allow(dead_code)]
 use peacemaker_isa::{
     insn::{Instruction, MemoryClass},
-    kernels::common::{mem, op, s, smem, sop, sr, v},
+    kernels::common::{mem, op, s, smem, sop, sr, v, vr},
     plan::Access,
     reg::{Kind, Live},
     Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan,
@@ -41,13 +41,18 @@ const RESULT: u8 = 19;
 const SCC_OUT: u8 = 20;
 const OUT_OFF: u8 = 21;
 const OUT_ADDR: u8 = 22; // s[22:23]
-// VGPRs: v0 = 0 offset, v[2:3] = result, scc.
+                         // VGPRs: v0 = 0 offset, v[2:3] = result, scc.
 const V_ZERO: u8 = 0;
 const V_DATA: u8 = 2;
 
 /// `s_add_co_u32 lo, a, b; s_add_co_ci_u32 hi, a+1, 0`: 64-bit add with a proper carry.
 fn add64(b: &mut Builder, dst: u8, base: u8, x: u8) -> Result<(), String> {
-    sop(b, format!("s_add_co_u32 s{dst}, s{base}, s{x}"), &[dst], &[base, x])?;
+    sop(
+        b,
+        format!("s_add_co_u32 s{dst}, s{base}, s{x}"),
+        &[dst],
+        &[base, x],
+    )?;
     sop(
         b,
         format!("s_add_co_ci_u32 s{}, s{}, 0", dst + 1, base + 1),
@@ -83,7 +88,12 @@ pub fn emit_probe() -> Result<Emitted, String> {
     let b = &mut builder;
     smem(b, IN_PTR, 4, KARG, 0)?;
     sop(b, format!("s_mov_b32 s{WG}, ttmp9"), &[WG], &[])?;
-    sop(b, format!("s_mul_i32 s{IN_OFF}, s{WG}, 12"), &[IN_OFF], &[WG])?;
+    sop(
+        b,
+        format!("s_mul_i32 s{IN_OFF}, s{WG}, 12"),
+        &[IN_OFF],
+        &[WG],
+    )?;
     add64(b, REC, IN_PTR, IN_OFF)?;
     smem(b, WIDTH, 2, REC, 0)?;
     smem(b, SCC_IN, 1, REC, 8)?;
@@ -95,13 +105,28 @@ pub fn emit_probe() -> Result<Emitted, String> {
         &[RESULT],
         &[WIDTH, OFFSET],
     )?;
-    sop(b, format!("s_cselect_b32 s{SCC_OUT}, 1, 0"), &[SCC_OUT], &[])?;
-    sop(b, format!("s_lshl_b32 s{OUT_OFF}, s{WG}, 3"), &[OUT_OFF], &[WG])?;
+    sop(
+        b,
+        format!("s_cselect_b32 s{SCC_OUT}, 1, 0"),
+        &[SCC_OUT],
+        &[],
+    )?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{OUT_OFF}, s{WG}, 3"),
+        &[OUT_OFF],
+        &[WG],
+    )?;
     add64(b, OUT_ADDR, OUT_PTR, OUT_OFF)?;
     // Lane 0 only.
     op(b, "s_mov_b32 exec_lo, 1", &[], &[])?;
     op(b, format!("v_mov_b32_e32 v{V_ZERO}, 0"), &[v(V_ZERO)], &[])?;
-    op(b, format!("v_mov_b32_e32 v{V_DATA}, s{RESULT}"), &[v(V_DATA)], &[s(RESULT)])?;
+    op(
+        b,
+        format!("v_mov_b32_e32 v{V_DATA}, s{RESULT}"),
+        &[v(V_DATA)],
+        &[s(RESULT)],
+    )?;
     op(
         b,
         format!("v_mov_b32_e32 v{}, s{SCC_OUT}", V_DATA + 1),
@@ -116,7 +141,7 @@ pub fn emit_probe() -> Result<Emitted, String> {
             OUT_ADDR + 1
         ),
         &[],
-        &[v(V_ZERO), sr(V_DATA, 2), sr(OUT_ADDR, 2)],
+        &[v(V_ZERO), vr(V_DATA, 2), sr(OUT_ADDR, 2)],
         MemoryClass::VmemStore,
     )?;
     b.wait_all()?;
@@ -157,6 +182,10 @@ pub fn inputs() -> Vec<[u32; 3]> {
 /// SCC after = SCC before = `input[2] != 0`. Returns `[result, scc]`.
 pub fn expected(input: [u32; 3]) -> [u32; 2] {
     let width = input[0] & 31;
-    let mask = if width == 0 { 0 } else { u32::MAX >> (32 - width) };
+    let mask = if width == 0 {
+        0
+    } else {
+        u32::MAX >> (32 - width)
+    };
     [mask.wrapping_shl(input[1]), u32::from(input[2] != 0)]
 }

@@ -1050,7 +1050,11 @@ fn module_record_abi_resources_and_native_roundtrip() {
         all_set,
         "exported symbols (spec naming rule + 2 dequant)"
     );
-    assert_eq!(got.len(), 82, "80 GEMM + 2 dequant, no duplicate or missing export");
+    assert_eq!(
+        got.len(),
+        82,
+        "80 GEMM + 2 dequant, no duplicate or missing export"
+    );
     assert_eq!(
         &got[80..],
         &dequant_syms.map(String::from)[..],

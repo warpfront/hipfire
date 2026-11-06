@@ -31,9 +31,9 @@
 use super::{add_split, branch, R};
 use crate::insn::MemoryClass;
 use crate::kernels::common::{mem, op, s, smem, sop, sr, v, vr};
-use crate::reg::RegRef;
 use crate::plan::Access;
 use crate::reg::Kind;
+use crate::reg::RegRef;
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan};
 
 /// Output element format.
@@ -120,12 +120,32 @@ fn divmod_tile(b: &mut Builder) -> R {
     alu(b, format!("v_cvt_f32_u32_e32 v{F}, s{KT}"), F, &[s(KT)])?;
     alu(b, format!("v_rcp_iflag_f32_e32 v{F}, v{F}"), F, &[v(F)])?;
     alu(b, format!("v_cvt_f32_u32_e32 v{Q}, v{T}"), Q, &[v(T)])?;
-    alu(b, format!("v_mul_f32_e32 v{Q}, v{Q}, v{F}"), Q, &[v(Q), v(F)])?;
+    alu(
+        b,
+        format!("v_mul_f32_e32 v{Q}, v{Q}, v{F}"),
+        Q,
+        &[v(Q), v(F)],
+    )?;
     alu(b, format!("v_cvt_u32_f32_e32 v{Q}, v{Q}"), Q, &[v(Q)])?;
-    alu(b, format!("v_mul_lo_u32 v{R_}, v{Q}, s{KT}"), R_, &[v(Q), s(KT)])?;
-    alu(b, format!("v_sub_nc_u32_e32 v{R_}, v{T}, v{R_}"), R_, &[v(T), v(R_)])?;
+    alu(
+        b,
+        format!("v_mul_lo_u32 v{R_}, v{Q}, s{KT}"),
+        R_,
+        &[v(Q), s(KT)],
+    )?;
+    alu(
+        b,
+        format!("v_sub_nc_u32_e32 v{R_}, v{T}, v{R_}"),
+        R_,
+        &[v(T), v(R_)],
+    )?;
     // remainder < 0: q -= 1, r += d.
-    op(b, format!("v_cmp_gt_i32_e64 s{MSK}, 0, v{R_}"), &[s(MSK)], &[v(R_)])?;
+    op(
+        b,
+        format!("v_cmp_gt_i32_e64 s{MSK}, 0, v{R_}"),
+        &[s(MSK)],
+        &[v(R_)],
+    )?;
     alu(b, format!("v_add_nc_u32_e32 v{W}, -1, v{Q}"), W, &[v(Q)])?;
     alu(
         b,
@@ -133,7 +153,12 @@ fn divmod_tile(b: &mut Builder) -> R {
         Q,
         &[v(Q), v(W), s(MSK)],
     )?;
-    alu(b, format!("v_add_nc_u32_e32 v{W}, s{KT}, v{R_}"), W, &[s(KT), v(R_)])?;
+    alu(
+        b,
+        format!("v_add_nc_u32_e32 v{W}, s{KT}, v{R_}"),
+        W,
+        &[s(KT), v(R_)],
+    )?;
     alu(
         b,
         format!("v_cndmask_b32_e64 v{R_}, v{R_}, v{W}, s{MSK}"),
@@ -141,7 +166,12 @@ fn divmod_tile(b: &mut Builder) -> R {
         &[v(R_), v(W), s(MSK)],
     )?;
     // remainder >= d: q += 1, r -= d.
-    op(b, format!("v_cmp_le_u32_e64 s{MSK}, s{KT}, v{R_}"), &[s(MSK)], &[s(KT), v(R_)])?;
+    op(
+        b,
+        format!("v_cmp_le_u32_e64 s{MSK}, s{KT}, v{R_}"),
+        &[s(MSK)],
+        &[s(KT), v(R_)],
+    )?;
     alu(b, format!("v_add_nc_u32_e32 v{W}, 1, v{Q}"), W, &[v(Q)])?;
     alu(
         b,
@@ -149,7 +179,12 @@ fn divmod_tile(b: &mut Builder) -> R {
         Q,
         &[v(Q), v(W), s(MSK)],
     )?;
-    alu(b, format!("v_sub_nc_u32_e64 v{W}, v{R_}, s{KT}"), W, &[s(KT), v(R_)])?;
+    alu(
+        b,
+        format!("v_subrev_nc_u32_e32 v{W}, s{KT}, v{R_}"),
+        W,
+        &[s(KT), v(R_)],
+    )?;
     alu(
         b,
         format!("v_cndmask_b32_e64 v{R_}, v{R_}, v{W}, s{MSK}"),
@@ -159,7 +194,12 @@ fn divmod_tile(b: &mut Builder) -> R {
 }
 
 fn bfe(b: &mut Builder, dst: u8, off: u32, width: u32) -> R {
-    alu(b, format!("v_bfe_u32 v{dst}, v{I}, {off}, {width}"), dst, &[v(I)])
+    alu(
+        b,
+        format!("v_bfe_u32 v{dst}, v{I}, {off}, {width}"),
+        dst,
+        &[v(I)],
+    )
 }
 
 fn emit_one(out: DequantOut) -> Result<Emitted, String> {
@@ -171,7 +211,11 @@ fn emit_one(out: DequantOut) -> Result<Emitted, String> {
         .hidden("k", 28, 4, "by_value");
     let spec = KernelSpec {
         kernel_id: "hc8_dequant".into(),
-        variant: out.symbol().strip_prefix("hc8_dequant_").unwrap_or("").into(),
+        variant: out
+            .symbol()
+            .strip_prefix("hc8_dequant_")
+            .unwrap_or("")
+            .into(),
         arch: Arch::Gfx1201,
         symbol: out.symbol().into(),
         kernargs,
@@ -196,7 +240,12 @@ fn emit_one(out: DequantOut) -> Result<Emitted, String> {
     )?;
     b.wait_all()?;
     sop(b, format!("s_lshr_b32 s{KT}, s{SK}, 5"), &[KT], &[SK])?;
-    sop(b, format!("s_mul_i32 s{TOT}, s{SM}, s{SK}"), &[TOT], &[SM, SK])?;
+    sop(
+        b,
+        format!("s_mul_i32 s{TOT}, s{SM}, s{SK}"),
+        &[TOT],
+        &[SM, SK],
+    )?;
     // Lanes with i >= M*K touch nothing.
     op(
         b,
@@ -204,27 +253,82 @@ fn emit_one(out: DequantOut) -> Result<Emitted, String> {
         &[s(MSK)],
         &[s(TOT), v(I)],
     )?;
-    op(b, format!("s_and_b32 exec_lo, exec_lo, s{MSK}"), &[], &[s(MSK)])?;
+    op(
+        b,
+        format!("s_and_b32 exec_lo, exec_lo, s{MSK}"),
+        &[],
+        &[s(MSK)],
+    )?;
     gload(b, "global_load_u8", QB, I, QP)?;
     alu(b, format!("v_lshrrev_b32_e32 v{T}, 9, v{I}"), T, &[v(I)])?;
     divmod_tile(b)?; // Q = mt, R_ = kt
-    // Swizzle inverse: rr = (i>>4)&15, h = (i>>8)&1, step = (i>>3)&1, j = i&7.
+                     // Swizzle inverse: rr = (i>>4)&15, h = (i>>8)&1, step = (i>>3)&1, j = i&7.
     bfe(b, W, 4, 4)?; // rr
     bfe(b, T1, 8, 1)?; // h
     bfe(b, STEP, 3, 1)?;
     bfe(b, T2, 0, 2)?; // j & 3
-    alu(b, format!("v_lshlrev_b32_e32 v{STEP}, 4, v{STEP}"), STEP, &[v(STEP)])?;
-    alu(b, format!("v_add_nc_u32_e32 v{STEP}, v{STEP}, v{T2}"), STEP, &[v(STEP), v(T2)])?;
-    alu(b, format!("v_lshl_add_u32 v{STEP}, v{T1}, 2, v{STEP}"), STEP, &[v(T1), v(STEP)])?;
+    alu(
+        b,
+        format!("v_lshlrev_b32_e32 v{STEP}, 4, v{STEP}"),
+        STEP,
+        &[v(STEP)],
+    )?;
+    alu(
+        b,
+        format!("v_add_nc_u32_e32 v{STEP}, v{STEP}, v{T2}"),
+        STEP,
+        &[v(STEP), v(T2)],
+    )?;
+    alu(
+        b,
+        format!("v_lshl_add_u32 v{STEP}, v{T1}, 2, v{STEP}"),
+        STEP,
+        &[v(T1), v(STEP)],
+    )?;
     bfe(b, T2, 2, 1)?; // j >> 2
-    alu(b, format!("v_lshl_add_u32 v{STEP}, v{T2}, 3, v{STEP}"), STEP, &[v(T2), v(STEP)])?; // kk
-    alu(b, format!("v_lshl_add_u32 v{ROW}, v{Q}, 4, v{W}"), ROW, &[v(Q), v(W)])?; // r
-    alu(b, format!("v_lshl_add_u32 v{COL}, v{R_}, 5, v{STEP}"), COL, &[v(R_), v(STEP)])?; // c
-    alu(b, format!("v_lshlrev_b32_e32 v{SOFF}, 2, v{ROW}"), SOFF, &[v(ROW)])?;
+    alu(
+        b,
+        format!("v_lshl_add_u32 v{STEP}, v{T2}, 3, v{STEP}"),
+        STEP,
+        &[v(T2), v(STEP)],
+    )?; // kk
+    alu(
+        b,
+        format!("v_lshl_add_u32 v{ROW}, v{Q}, 4, v{W}"),
+        ROW,
+        &[v(Q), v(W)],
+    )?; // r
+    alu(
+        b,
+        format!("v_lshl_add_u32 v{COL}, v{R_}, 5, v{STEP}"),
+        COL,
+        &[v(R_), v(STEP)],
+    )?; // c
+    alu(
+        b,
+        format!("v_lshlrev_b32_e32 v{SOFF}, 2, v{ROW}"),
+        SOFF,
+        &[v(ROW)],
+    )?;
     gload(b, "global_load_b32", SC, SOFF, SP)?;
-    alu(b, format!("v_mul_lo_u32 v{OFF}, v{ROW}, s{SK}"), OFF, &[v(ROW), s(SK)])?;
-    alu(b, format!("v_add_nc_u32_e32 v{OFF}, v{OFF}, v{COL}"), OFF, &[v(OFF), v(COL)])?;
-    alu(b, format!("v_lshlrev_b32_e32 v{OFF}, 1, v{OFF}"), OFF, &[v(OFF)])?;
+    alu(
+        b,
+        format!("v_mul_lo_u32 v{OFF}, v{ROW}, s{SK}"),
+        OFF,
+        &[v(ROW), s(SK)],
+    )?;
+    alu(
+        b,
+        format!("v_add_nc_u32_e32 v{OFF}, v{OFF}, v{COL}"),
+        OFF,
+        &[v(OFF), v(COL)],
+    )?;
+    alu(
+        b,
+        format!("v_lshlrev_b32_e32 v{OFF}, 1, v{OFF}"),
+        OFF,
+        &[v(OFF)],
+    )?;
     // Decode: byte 0 of QB as E4M3 -> f32 pair (lo, byte 1); lo * s[r] is exact.
     op(
         b,
@@ -232,10 +336,20 @@ fn emit_one(out: DequantOut) -> Result<Emitted, String> {
         &[vr(PK, 2)],
         &[v(QB)],
     )?;
-    alu(b, format!("v_mul_f32_e32 v{PK}, v{PK}, v{SC}"), PK, &[v(PK), v(SC)])?;
+    alu(
+        b,
+        format!("v_mul_f32_e32 v{PK}, v{PK}, v{SC}"),
+        PK,
+        &[v(PK), v(SC)],
+    )?;
     match out {
         DequantOut::Bf16 => {
-            alu(b, format!("v_lshrrev_b32_e32 v{PK}, 16, v{PK}"), PK, &[v(PK)])?;
+            alu(
+                b,
+                format!("v_lshrrev_b32_e32 v{PK}, 16, v{PK}"),
+                PK,
+                &[v(PK)],
+            )?;
         }
         DequantOut::F16 => {
             op(

@@ -1038,7 +1038,12 @@ fn row_image(kernel: &str, epi: &str, arch: Arch) -> Result<Option<RowImage>, St
                     "kernarg": "q@0 s@8 x@16 y@24 u64; M@32 K@36 rows@40 u32; act_scale@44 f32",
                     "arithmetic_recipe": "hc8 W8A16 BF16 WMMA; K split per wave, KW partials folded ascending in LDS; one v_mul by s[m]; act = lane_rows hc_act DAG",
                 });
-                image.push(e, [grid.as_str(), "1", "1"], rows(g.max_rows() as u8), contract)?;
+                image.push(
+                    e,
+                    [grid.as_str(), "1", "1"],
+                    rows(g.max_rows() as u8),
+                    contract,
+                )?;
             }
             if epi == "all" {
                 for (out, e) in k::DEQUANT_OUTS.into_iter().zip(k::emit_dequants()?) {

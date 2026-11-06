@@ -11,6 +11,8 @@
 
 #[path = "../tests/support/hc8_reference.rs"]
 mod reference;
+#[path = "../tests/support/s_bfm_probe.rs"]
+mod s_bfm_probe;
 
 use hip_bridge::{DeviceBuffer, Function, HipRuntime};
 use peacemaker_isa::kernels::hc8_wmma_gfx1201::{self as hc8, Fmt, Geo};
@@ -236,6 +238,170 @@ fn load_fixtures(paths: &[String]) -> Result<Vec<Input>, String> {
         .collect()
 }
 
+fn scalar_mask_oracle(card: &Card) -> Result<(serde_json::Value, usize), String> {
+    let emitted = s_bfm_probe::emit_probe()?;
+    let elf = native::assemble(&emitted.s_text, Arch::Gfx1201)?;
+    let module = card.0.module_load_data(&elf).map_err(|e| e.to_string())?;
+    let function = card
+        .0
+        .module_get_function(&module, s_bfm_probe::SYMBOL)
+        .map_err(|e| e.to_string())?;
+    let records = s_bfm_probe::inputs();
+    let inputs = guarded(
+        &records
+            .iter()
+            .flatten()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>(),
+    );
+    let mut expected = vec![SENT; GUARD];
+    expected.extend(
+        records
+            .iter()
+            .flat_map(|&i| s_bfm_probe::expected(i))
+            .flat_map(|v| v.to_le_bytes()),
+    );
+    expected.resize(expected.len() + GUARD, SENT);
+    let din = card.upload(&inputs)?;
+    let dout = card.upload(&vec![SENT; expected.len()])?;
+    let mut blob = Vec::with_capacity(s_bfm_probe::KERNARG_BYTES as usize);
+    for p in [ptr(&din), ptr(&dout)] {
+        blob.extend(p.to_le_bytes());
+    }
+    // SAFETY: the 16-byte probe ABI contains live guarded input/output records;
+    // one workgroup handles each input and only its lane 0 stores two words.
+    unsafe {
+        card.0.launch_kernel_blob(
+            &function,
+            [records.len() as u32, 1, 1],
+            [s_bfm_probe::BLOCK, 1, 1],
+            0,
+            None,
+            &mut blob,
+        )
+    }
+    .map_err(|e| e.to_string())?;
+    card.0.device_synchronize().map_err(|e| e.to_string())?;
+    let got = card.download(&dout, expected.len())?;
+    let compared = compare(&got, &expected, "s_bfm_b32 result/SCC probe")?;
+    if card.download(&din, inputs.len())? != inputs {
+        return Err("s_bfm_b32 probe changed its inputs".into());
+    }
+    for d in [din, dout] {
+        card.0.free(d).map_err(|e| e.to_string())?;
+    }
+    Ok((
+        json!({"symbol":s_bfm_probe::SYMBOL,"records":records.len(),"words":records.len()*2,
+        "elf_sha256":format!("{:x}",Sha256::digest(&elf)),"pass":true}),
+        compared,
+    ))
+}
+
+fn dequant_oracle(
+    card: &Card,
+    functions: [&Function; 2],
+    fixtures: &[Input],
+) -> Result<(Vec<serde_json::Value>, usize), String> {
+    let synthetic: Vec<Input> = [(16, 32), (32, 64), (64, 320)]
+        .into_iter()
+        .map(|(m, k)| {
+            let w = (0..m * k)
+                .map(|i| {
+                    let q = i as u8;
+                    if q & 0x7f == 0x7f {
+                        q & 0xfe
+                    } else {
+                        q
+                    }
+                })
+                .collect();
+            let scales = (0..m)
+                .flat_map(|r| {
+                    let exponent = [-24i32, -16, -8, -1, 0, 8, 16][r % 7];
+                    f32::from_bits(((127 + exponent) as u32) << 23).to_le_bytes()
+                })
+                .collect();
+            Input {
+                name: "all-finite-codes-and-half-edges".into(),
+                fmt: Fmt::E4M3,
+                m,
+                k,
+                w,
+                scales,
+                x: Vec::new(),
+            }
+        })
+        .collect();
+    let mut cases = Vec::new();
+    let mut compared = 0;
+    for c in synthetic
+        .iter()
+        .chain(fixtures.iter().filter(|c| c.fmt == Fmt::E4M3))
+    {
+        let q = guarded(&hc8::swizzle_hc8(&c.w, c.m, c.k));
+        let scales = guarded(&c.scales);
+        let dq = card.upload(&q)?;
+        let ds = card.upload(&scales)?;
+        let poison = vec![SENT; 2 * GUARD + c.m * c.k * 2];
+        let dy = card.upload(&poison)?;
+        let decoded = reference::decode_weights(Fmt::E4M3, &c.w);
+        for (f, half) in functions.into_iter().zip([false, true]) {
+            let mut expected = poison.clone();
+            for (i, &bits) in decoded.iter().enumerate() {
+                let at = (i / c.k) * 4;
+                let s = f32::from_le_bytes(c.scales[at..at + 4].try_into().unwrap());
+                let v = f32::from_bits(u32::from(bits) << 16) * s;
+                let word = if half {
+                    peacemaker_ir::emu::convert::f32_to_f16(v.to_bits())
+                } else {
+                    peacemaker_ir::emu::convert::f32_to_bf16(v.to_bits())
+                };
+                expected[GUARD + 2 * i..GUARD + 2 * i + 2].copy_from_slice(&word.to_le_bytes());
+            }
+            card.0
+                .memcpy_htod(&dy, &poison)
+                .map_err(|e| e.to_string())?;
+            let mut blob = Vec::with_capacity(32);
+            for p in [ptr(&dq), ptr(&ds), ptr(&dy)] {
+                blob.extend(p.to_le_bytes());
+            }
+            blob.extend((c.m as u32).to_le_bytes());
+            blob.extend((c.k as u32).to_le_bytes());
+            // SAFETY: exact 32-byte dequant ABI; guarded allocations above cover
+            // every input and output element, grid uses the fixed block of 256.
+            unsafe {
+                card.0.launch_kernel_blob(
+                    f,
+                    [(c.m * c.k).div_ceil(256) as u32, 1, 1],
+                    [256, 1, 1],
+                    0,
+                    None,
+                    &mut blob,
+                )
+            }
+            .map_err(|e| e.to_string())?;
+            card.0.device_synchronize().map_err(|e| e.to_string())?;
+            let got = card.download(&dy, poison.len())?;
+            let symbol = if half {
+                "hc8_dequant_f16"
+            } else {
+                "hc8_dequant_bf16"
+            };
+            compared += compare(&got, &expected, &format!("{symbol} {}", c.name))?;
+            for (d, bytes) in [(&dq, &q), (&ds, &scales)] {
+                if card.download(d, bytes.len())? != *bytes {
+                    return Err(format!("{symbol}: readonly input changed"));
+                }
+            }
+            cases.push(json!({"symbol":symbol,"m":c.m,"k":c.k,"kind":c.name,"bytes":got.len(),"pass":true}));
+        }
+        for d in [dq, ds, dy] {
+            card.0.free(d).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok((cases, compared))
+}
+
 fn run(out: &str, fixture_paths: &[String]) -> Result<(), String> {
     if std::env::var_os("FABRIC_JOB").is_none() {
         return Err("run through fabric-run.sh --class correct --card <one gfx1201 card>".into());
@@ -264,8 +430,8 @@ fn run(out: &str, fixture_paths: &[String]) -> Result<(), String> {
     }
     let module = card.0.module_load_data(&elf).map_err(|e| e.to_string())?;
     let mut cases = Vec::new();
-    let mut compared_bytes = 0usize;
-    let mut launches = 0usize;
+    let (scalar_mask, mut compared_bytes) = scalar_mask_oracle(&card)?;
+    let mut launches = 1usize;
     for fmt in [Fmt::E4M3, Fmt::I8] {
         for (mw, kw) in [(1, 8), (1, 16), (4, 1), (8, 1), (2, 4)] {
             let small_m = 16 * mw as usize;
@@ -421,11 +587,22 @@ fn run(out: &str, fixture_paths: &[String]) -> Result<(), String> {
             }
         }
     }
+    let bf16 = card
+        .0
+        .module_get_function(&module, "hc8_dequant_bf16")
+        .map_err(|e| e.to_string())?;
+    let f16 = card
+        .0
+        .module_get_function(&module, "hc8_dequant_f16")
+        .map_err(|e| e.to_string())?;
+    let (dequant_cases, dequant_bytes) = dequant_oracle(&card, [&bf16, &f16], &fixtures)?;
+    compared_bytes += dequant_bytes;
+    launches += dequant_cases.len();
     let receipt = json!({"schema":"hc8-byte-oracle-v1","pass":true,"arch":arch,
         "fabric_job":std::env::var("FABRIC_JOB").ok(),"elf_sha256":format!("{:x}",Sha256::digest(&elf)),
         "bundle_sha256":bundle_sha,"fixtures":fixture_paths,
         "reference":"independent row-major dequantized BF16 WMMA; identical fixed KW fold; no compressed decoder",
-        "compared_bytes":compared_bytes,"launches":launches,"cases":cases});
+        "compared_bytes":compared_bytes,"launches":launches,"cases":cases,"dequant":dequant_cases,"s_bfm_b32":scalar_mask});
     std::fs::write(
         out,
         serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())?,

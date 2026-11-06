@@ -37,7 +37,9 @@ fn host_law_matches_bitwise_model_and_inputs_cover_everything() {
         .map(|i| (i[0] & 31, i[1] & 31, i[2]))
         .collect();
     assert_eq!(low.len(), 32 * 32 * 2);
-    assert!(inputs.iter().any(|i| i[0] >> 5 != 0 && i[0] >> 5 != u32::MAX >> 5));
+    assert!(inputs
+        .iter()
+        .any(|i| i[0] >> 5 != 0 && i[0] >> 5 != u32::MAX >> 5));
     assert_eq!(s_bfm_probe::expected([0, 7, 1]), [0, 1]);
     assert_eq!(s_bfm_probe::expected([32, 0, 0]), [0, 0]);
     assert_eq!(s_bfm_probe::expected([16, 0, 0]), [0xffff, 0]);
@@ -48,7 +50,9 @@ fn host_law_matches_bitwise_model_and_inputs_cover_everything() {
 fn emulated_probe_equals_the_independent_model_over_all_inputs() {
     let emitted = s_bfm_probe::emit_probe().unwrap();
     assert!(emitted.s_text.contains("s_bfm_b32"));
-    assert!(emitted.s_text.contains(&format!("{}:", s_bfm_probe::SYMBOL)));
+    assert!(emitted
+        .s_text
+        .contains(&format!("{}:", s_bfm_probe::SYMBOL)));
     let elf = peacemaker_isa::native::assemble(&emitted.s_text, Arch::Gfx1201).unwrap();
     let program = peacemaker_lift::lift_object(
         &elf,
@@ -90,7 +94,12 @@ fn emulated_probe_equals_the_independent_model_over_all_inputs() {
             )
             .unwrap_or_else(|e| panic!("record {i} {:?}: {e}", inputs[i]));
     }
-    let out = &mem.regions.iter().find(|r| r.name == "outputs").unwrap().bytes;
+    let out = &mem
+        .regions
+        .iter()
+        .find(|r| r.name == "outputs")
+        .unwrap()
+        .bytes;
     for (i, input) in inputs.iter().enumerate() {
         let got = [
             u32::from_le_bytes(out[8 * i..8 * i + 4].try_into().unwrap()),

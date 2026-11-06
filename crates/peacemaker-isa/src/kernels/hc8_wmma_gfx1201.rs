@@ -58,9 +58,6 @@
 //!   first use so the builder's ledger waits only for what is needed. No scratch, no
 //!   spills.
 mod dequant;
-pub use dequant::{
-    emit_dequant, emit_dequants, DequantOut, DEQUANT_BLOCK, DEQUANT_KERNARG_BYTES, DEQUANT_OUTS,
-};
 use super::iu4_gemm::ModuleProof;
 use crate::insn::{Instruction, MemoryClass};
 use crate::kernels::common::{add64, add64_imm, lit, op, s, s_add_i32, smem, sop, v, vr};
@@ -69,6 +66,9 @@ use crate::lds::Transition;
 use crate::plan::Access;
 use crate::reg::{Kind, Live};
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan};
+pub use dequant::{
+    emit_dequant, emit_dequants, DequantOut, DEQUANT_BLOCK, DEQUANT_KERNARG_BYTES, DEQUANT_OUTS,
+};
 
 type R = Result<(), String>;
 
@@ -369,7 +369,13 @@ fn add_split(regs: &mut RegPlan, name: &str, kind: Kind, base: u8, len: u8) -> R
             .into_iter()
             .find(|w| at % w == 0 && at + w <= end)
             .expect("width 1 always fits");
-        regs.add_range(&format!("{name}@{at}"), kind, at as u8, w as u8, Live::Whole)?;
+        regs.add_range(
+            &format!("{name}@{at}"),
+            kind,
+            at as u8,
+            w as u8,
+            Live::Whole,
+        )?;
         at += w;
     }
     Ok(())
