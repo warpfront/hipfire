@@ -222,7 +222,11 @@ fn check(name: &str, c: &Cell, nan_kv: bool) {
     let r = run(&pm, fa_qresident::SYMBOL_DIRECT, c).unwrap_or_else(|e| panic!("{name}: pm: {e}"));
     assert!(r.guards_intact, "{name}: a store escaped the output");
     assert!(r.inputs_untouched, "{name}: an input changed");
-    assert_eq!(r.out_written, c.rows * 4096 * 4, "{name}: live output bytes");
+    assert_eq!(
+        r.out_written,
+        c.rows * 4096 * 4,
+        "{name}: live output bytes"
+    );
     if !nan_kv {
         for (i, w) in words(&r.out).iter().enumerate() {
             assert!(
@@ -244,7 +248,11 @@ fn check(name: &str, c: &Cell, nan_kv: bool) {
                 return;
             }
         };
-        assert_eq!(h.out_written, c.rows * 4096 * 4, "{name}: hipcc live output bytes");
+        assert_eq!(
+            h.out_written,
+            c.rows * 4096 * 4,
+            "{name}: hipcc live output bytes"
+        );
         for (i, (g, w)) in words(&r.out).iter().zip(words(&h.out)).enumerate() {
             assert_eq!(
                 *g,
@@ -259,7 +267,10 @@ fn check(name: &str, c: &Cell, nan_kv: bool) {
                 f32::from_bits(w)
             );
         }
-        eprintln!("{name}: PM == hipcc on the interpreter ({} words)", r.out.len() / 4);
+        eprintln!(
+            "{name}: PM == hipcc on the interpreter ({} words)",
+            r.out.len() / 4
+        );
     } else {
         eprintln!("{name}: FAQRES_HIPCC_HSACO unset, hipcc comparison skipped");
     }

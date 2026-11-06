@@ -2629,7 +2629,10 @@ fn run() -> Result<(), String> {
         let path = co.as_deref().ok_or("missing --co")?;
         let (emitted, _, _) = fa_qresident::emit_module(arch, &fa_qresident::FaQresSpec::A3B)?;
         let [direct, range] = &emitted[..] else {
-            return Err("fa_qresident_a3b_pm: module must hold exactly the direct then the range export".into());
+            return Err(
+                "fa_qresident_a3b_pm: module must hold exactly the direct then the range export"
+                    .into(),
+            );
         };
         let mut receipts = serde_json::Map::new();
         for (name, symbol, e) in [

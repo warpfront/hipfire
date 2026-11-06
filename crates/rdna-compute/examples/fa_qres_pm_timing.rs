@@ -176,14 +176,21 @@ fn download(gpu: &Gpu, t: &GpuTensor, len: usize) -> Result<Vec<u8>> {
     Ok(v)
 }
 
-fn launch(gpu: &mut Gpu, s: &Shape, route: A3bQresRoute, b: &Buffers, out: &GpuTensor) -> HipResult<()> {
+fn launch(
+    gpu: &mut Gpu,
+    s: &Shape,
+    route: A3bQresRoute,
+    b: &Buffers,
+    out: &GpuTensor,
+) -> HipResult<()> {
     match s.range {
         None => gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_routed_gfx1201(
             route, &b.q, &b.k, &b.v, out, &b.pos, H, KV, D, s.ctx, s.rows,
         ),
-        Some((total, off)) => gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_routed_gfx1201(
-            route, &b.q, &b.k, &b.v, out, &b.pos, H, KV, D, s.ctx, s.rows, total, off,
-        ),
+        Some((total, off)) => gpu
+            .attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_routed_gfx1201(
+                route, &b.q, &b.k, &b.v, out, &b.pos, H, KV, D, s.ctx, s.rows, total, off,
+            ),
     }
 }
 
@@ -221,7 +228,8 @@ fn time_shape(gpu: &mut Gpu, s: &Shape, arms: &[Arm]) -> Result<bool> {
     upload(gpu, &b.pos, &pos_bytes)?;
     // Distinct poisons: an unwritten output cannot match.
     for (i, o) in b.outs.iter().enumerate() {
-        gpu.hip.memset(&o.buf, if i == 0 { 0xA5 } else { 0x5A }, s.out_bytes())?;
+        gpu.hip
+            .memset(&o.buf, if i == 0 { 0xA5 } else { 0x5A }, s.out_bytes())?;
     }
     gpu.hip.device_synchronize()?;
     // Byte identity of every arm against hipcc first, fail closed.
@@ -251,8 +259,10 @@ fn time_shape(gpu: &mut Gpu, s: &Shape, arms: &[Arm]) -> Result<bool> {
         let identical = mismatch_words == 0 && hip.len() == pm.len();
         let written = pm.iter().any(|&x| x != 0x5A);
         all_ok &= identical && written;
-        ident.push(json!({"arm": a.name, "byte_identical": identical, "outputs_written": written,
-            "mismatch_words": mismatch_words, "first_mismatch": first}));
+        ident.push(
+            json!({"arm": a.name, "byte_identical": identical, "outputs_written": written,
+            "mismatch_words": mismatch_words, "first_mismatch": first}),
+        );
     }
     if !all_ok {
         println!(
@@ -285,7 +295,8 @@ fn time_shape(gpu: &mut Gpu, s: &Shape, arms: &[Arm]) -> Result<bool> {
     gpu.hip.event_destroy(ea)?;
     gpu.hip.event_destroy(eb)?;
     let stat: Vec<Value> = us.iter_mut().map(stats).collect();
-    let ratio = |i: usize, key: &str| stat[i][key].as_f64().unwrap() / stat[0][key].as_f64().unwrap();
+    let ratio =
+        |i: usize, key: &str| stat[i][key].as_f64().unwrap() / stat[0][key].as_f64().unwrap();
     let mut arms_json = serde_json::Map::new();
     for (i, a) in arms.iter().enumerate() {
         let mut e = stat[i].clone();
@@ -322,7 +333,12 @@ fn run() -> Result<bool> {
         match a.as_str() {
             "--plan" => plan = true,
             "--shape" => filter = Some(it.next().ok_or("--shape needs a substring")?),
-            _ => return Err(format!("unknown argument {a}; usage: fa_qres_pm_timing [--plan] [--shape SUBSTR]").into()),
+            _ => {
+                return Err(format!(
+                    "unknown argument {a}; usage: fa_qres_pm_timing [--plan] [--shape SUBSTR]"
+                )
+                .into())
+            }
         }
     }
     // Arm 0 is hipcc.
@@ -337,7 +353,11 @@ fn run() -> Result<bool> {
     let shapes: Vec<Shape> = SHAPES
         .iter()
         .copied()
-        .filter(|s| filter.as_ref().map_or(true, |f| s.name.contains(f.as_str())))
+        .filter(|s| {
+            filter
+                .as_ref()
+                .map_or(true, |f| s.name.contains(f.as_str()))
+        })
         .collect();
     if shapes.is_empty() {
         return Err("--shape matched no shape".into());

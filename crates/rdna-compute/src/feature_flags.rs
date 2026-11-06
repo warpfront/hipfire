@@ -4110,10 +4110,21 @@ mod tests {
                 })
             };
             let on = arch == "gfx1201";
-            assert_eq!(flags(None).fa_qresident_pm, on, "{arch}: unset follows the arch");
+            assert_eq!(
+                flags(None).fa_qresident_pm,
+                on,
+                "{arch}: unset follows the arch"
+            );
             assert!(flags(Some("1")).fa_qresident_pm, "{arch}: 1 opts in");
-            assert!(!flags(Some("0")).fa_qresident_pm, "{arch}: 0 is the kill switch");
-            assert_eq!(flags(Some("junk")).fa_qresident_pm, on, "{arch}: junk is the default");
+            assert!(
+                !flags(Some("0")).fa_qresident_pm,
+                "{arch}: 0 is the kill switch"
+            );
+            assert_eq!(
+                flags(Some("junk")).fa_qresident_pm,
+                on,
+                "{arch}: junk is the default"
+            );
             assert_eq!(FeatureFlags::for_test(arch).fa_qresident_pm, on);
         }
     }

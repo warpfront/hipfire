@@ -53,9 +53,9 @@
 //! the cost is additive, not overlapped: QK and PV matrix chains ~58 %, softmax ~13 %, commit / fill ~11 %, and a
 //! rendezvous + latency skeleton ~19 % at the start of the work (waves run the phases in lockstep between barriers).
 
+use crate::insn::{Instruction, MemoryClass, Sop};
 use crate::kernels::common::{lit, op, s, sop, sr, v, vr};
 use crate::kernels::fa_prefill::{fdiv, gload, wait_alu};
-use crate::insn::{Instruction, MemoryClass, Sop};
 use crate::lds::Transition;
 use crate::ledger::Counter;
 use crate::plan::Access;
@@ -276,12 +276,7 @@ macro_rules! ins {
 
 // ------------------------------------------------------------------ small emitters
 fn exec_and(b: &mut Builder, save: u8, mask: u8) -> R {
-    op(
-        b,
-        format!("s_mov_b32 s{save}, exec_lo"),
-        &[m(save)],
-        &[],
-    )?;
+    op(b, format!("s_mov_b32 s{save}, exec_lo"), &[m(save)], &[])?;
     op(
         b,
         format!("s_and_b32 exec_lo, exec_lo, s{mask}"),
@@ -383,7 +378,12 @@ fn plain(b: &mut Builder, o: VopdOp) -> R {
     if fmac {
         uses.push(v(o.dst));
     }
-    op(b, format!("{name} v{}, {s0}, v{}", o.dst, o.src1), &[v(o.dst)], &uses)
+    op(
+        b,
+        format!("{name} v{}, {s0}, v{}", o.dst, o.src1),
+        &[v(o.dst)],
+        &uses,
+    )
 }
 /// `dst = src0 * src1` / `src0 - src1` half descriptors.
 fn mulv(dst: u8, src0: u8, src1: u8) -> VopdOp {
@@ -570,29 +570,74 @@ fn prologue(b: &mut Builder, l: &L) -> R {
     wait_alu(b, "depctr_va_sdst(0)")?;
     // Shape guards: workgroup-uniform, before any data access or barrier.
     for (reg, want) in [(S_NH, 16u32), (S_NKV, 2), (S_HD, 256)] {
-        sop(b, format!("s_cmp_lg_u32 s{reg}, {}", lit(want)), &[], &[reg])?;
+        sop(
+            b,
+            format!("s_cmp_lg_u32 s{reg}, {}", lit(want)),
+            &[],
+            &[reg],
+        )?;
         op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
     }
-    op(b, format!("s_and_b32 s{S_KVH}, ttmp7, 0xffff"), &[s(S_KVH)], &[])?;
+    op(
+        b,
+        format!("s_and_b32 s{S_KVH}, ttmp7, 0xffff"),
+        &[s(S_KVH)],
+        &[],
+    )?;
     sop(b, format!("s_cmp_gt_u32 s{S_KVH}, 1"), &[], &[S_KVH])?;
     op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
     // bz = gridDim.z - 1 - z, gridDim.z = ceil(batch / 512); query_offset = batch > 512 ? 512 bz : 0.
     op(b, format!("s_lshr_b32 s{S_TA}, ttmp7, 16"), &[s(S_TA)], &[])?;
-    sop(b, format!("s_add_co_i32 s{S_TB}, s{S_BATCH}, 0x1ff"), &[S_TB], &[S_BATCH])?;
-    sop(b, format!("s_lshr_b32 s{S_TB}, s{S_TB}, 9"), &[S_TB], &[S_TB])?;
-    sop(b, format!("s_add_co_i32 s{S_TB}, s{S_TB}, -1"), &[S_TB], &[S_TB])?;
-    sop(b, format!("s_sub_co_i32 s{S_TB}, s{S_TB}, s{S_TA}"), &[S_TB], &[S_TB, S_TA])?;
+    sop(
+        b,
+        format!("s_add_co_i32 s{S_TB}, s{S_BATCH}, 0x1ff"),
+        &[S_TB],
+        &[S_BATCH],
+    )?;
+    sop(
+        b,
+        format!("s_lshr_b32 s{S_TB}, s{S_TB}, 9"),
+        &[S_TB],
+        &[S_TB],
+    )?;
+    sop(
+        b,
+        format!("s_add_co_i32 s{S_TB}, s{S_TB}, -1"),
+        &[S_TB],
+        &[S_TB],
+    )?;
+    sop(
+        b,
+        format!("s_sub_co_i32 s{S_TB}, s{S_TB}, s{S_TA}"),
+        &[S_TB],
+        &[S_TB, S_TA],
+    )?;
     sop(b, format!("s_cmp_lt_i32 s{S_TB}, 0"), &[], &[S_TB])?;
     op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
-    sop(b, format!("s_lshl_b32 s{S_QOFF}, s{S_TB}, 9"), &[S_QOFF], &[S_TB])?;
-    sop(b, format!("s_cmp_gt_i32 s{S_BATCH}, 0x200"), &[], &[S_BATCH])?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{S_QOFF}, s{S_TB}, 9"),
+        &[S_QOFF],
+        &[S_TB],
+    )?;
+    sop(
+        b,
+        format!("s_cmp_gt_i32 s{S_BATCH}, 0x200"),
+        &[],
+        &[S_BATCH],
+    )?;
     sop(
         b,
         format!("s_cselect_b32 s{S_QOFF}, s{S_QOFF}, 0"),
         &[S_QOFF],
         &[S_QOFF],
     )?;
-    sop(b, format!("s_cmp_ge_i32 s{S_QOFF}, s{S_BATCH}"), &[], &[S_QOFF, S_BATCH])?;
+    sop(
+        b,
+        format!("s_cmp_ge_i32 s{S_QOFF}, s{S_BATCH}"),
+        &[],
+        &[S_QOFF, S_BATCH],
+    )?;
     op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
     sop(
         b,
@@ -600,44 +645,169 @@ fn prologue(b: &mut Builder, l: &L) -> R {
         &[S_RUN],
         &[S_BATCH, S_QOFF],
     )?;
-    sop(b, format!("s_min_i32 s{S_RUN}, s{S_RUN}, 0x200"), &[S_RUN], &[S_RUN])?;
-    sop(b, format!("s_lshl_b32 s{S_R8}, s{S_RUN}, 3"), &[S_R8], &[S_RUN])?;
+    sop(
+        b,
+        format!("s_min_i32 s{S_RUN}, s{S_RUN}, 0x200"),
+        &[S_RUN],
+        &[S_RUN],
+    )?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{S_R8}, s{S_RUN}, 3"),
+        &[S_R8],
+        &[S_RUN],
+    )?;
     // bx = gridDim.x - 1 - x, gridDim.x = ceil(min(batch, 512) 8 / 384) (x/384 = (x/3) >> 7).
-    sop(b, format!("s_min_i32 s{S_TC}, s{S_BATCH}, 0x200"), &[S_TC], &[S_BATCH])?;
-    sop(b, format!("s_lshl_b32 s{S_TC}, s{S_TC}, 3"), &[S_TC], &[S_TC])?;
-    sop(b, format!("s_add_co_i32 s{S_TC}, s{S_TC}, 0x17f"), &[S_TC], &[S_TC])?;
+    sop(
+        b,
+        format!("s_min_i32 s{S_TC}, s{S_BATCH}, 0x200"),
+        &[S_TC],
+        &[S_BATCH],
+    )?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{S_TC}, s{S_TC}, 3"),
+        &[S_TC],
+        &[S_TC],
+    )?;
+    sop(
+        b,
+        format!("s_add_co_i32 s{S_TC}, s{S_TC}, 0x17f"),
+        &[S_TC],
+        &[S_TC],
+    )?;
     sop(
         b,
         format!("s_mul_hi_u32 s{S_TD}, s{S_TC}, 0xaaaaaaab"),
         &[S_TD],
         &[S_TC],
     )?;
-    sop(b, format!("s_lshr_b32 s{S_TD}, s{S_TD}, 8"), &[S_TD], &[S_TD])?;
-    sop(b, format!("s_add_co_i32 s{S_TD}, s{S_TD}, -1"), &[S_TD], &[S_TD])?;
-    op(b, format!("s_sub_co_i32 s{S_TD}, s{S_TD}, ttmp9"), &[s(S_TD)], &[s(S_TD)])?;
+    sop(
+        b,
+        format!("s_lshr_b32 s{S_TD}, s{S_TD}, 8"),
+        &[S_TD],
+        &[S_TD],
+    )?;
+    sop(
+        b,
+        format!("s_add_co_i32 s{S_TD}, s{S_TD}, -1"),
+        &[S_TD],
+        &[S_TD],
+    )?;
+    op(
+        b,
+        format!("s_sub_co_i32 s{S_TD}, s{S_TD}, ttmp9"),
+        &[s(S_TD)],
+        &[s(S_TD)],
+    )?;
     sop(b, format!("s_cmp_lt_i32 s{S_TD}, 0"), &[], &[S_TD])?;
     op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
-    sop(b, format!("s_mul_i32 s{S_ROWB}, s{S_TD}, 0x180"), &[S_ROWB], &[S_TD])?;
-    sop(b, format!("s_cmp_ge_i32 s{S_ROWB}, s{S_R8}"), &[], &[S_ROWB, S_R8])?;
+    sop(
+        b,
+        format!("s_mul_i32 s{S_ROWB}, s{S_TD}, 0x180"),
+        &[S_ROWB],
+        &[S_TD],
+    )?;
+    sop(
+        b,
+        format!("s_cmp_ge_i32 s{S_ROWB}, s{S_R8}"),
+        &[],
+        &[S_ROWB, S_R8],
+    )?;
     op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
     // Wave-level liveness and the head terms of the K/V lane offsets.
-    sop(b, format!("s_lshl_b32 s{S_TE}, s{S_WAVE}, 4"), &[S_TE], &[S_WAVE])?;
-    sop(b, format!("s_add_co_i32 s{S_TE}, s{S_TE}, s{S_ROWB}"), &[S_TE], &[S_TE, S_ROWB])?;
-    sop(b, format!("s_cmp_lt_i32 s{S_TE}, s{S_R8}"), &[], &[S_TE, S_R8])?;
-    sop(b, format!("s_cselect_b32 s{S_WLIVE}, 1, 0"), &[S_WLIVE], &[])?;
-    sop(b, format!("s_add_co_i32 s{S_TF}, s{S_ROWB}, 0x17f"), &[S_TF], &[S_ROWB])?;
-    sop(b, format!("s_cmp_lt_i32 s{S_TF}, s{S_R8}"), &[], &[S_TF, S_R8])?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{S_TE}, s{S_WAVE}, 4"),
+        &[S_TE],
+        &[S_WAVE],
+    )?;
+    sop(
+        b,
+        format!("s_add_co_i32 s{S_TE}, s{S_TE}, s{S_ROWB}"),
+        &[S_TE],
+        &[S_TE, S_ROWB],
+    )?;
+    sop(
+        b,
+        format!("s_cmp_lt_i32 s{S_TE}, s{S_R8}"),
+        &[],
+        &[S_TE, S_R8],
+    )?;
+    sop(
+        b,
+        format!("s_cselect_b32 s{S_WLIVE}, 1, 0"),
+        &[S_WLIVE],
+        &[],
+    )?;
+    sop(
+        b,
+        format!("s_add_co_i32 s{S_TF}, s{S_ROWB}, 0x17f"),
+        &[S_TF],
+        &[S_ROWB],
+    )?;
+    sop(
+        b,
+        format!("s_cmp_lt_i32 s{S_TF}, s{S_R8}"),
+        &[],
+        &[S_TF, S_R8],
+    )?;
     sop(b, format!("s_cselect_b32 s{S_QALL}, 1, 0"), &[S_QALL], &[])?;
-    sop(b, format!("s_mov_b32 s{S_PSEL}, 0x76543210"), &[S_PSEL], &[])?;
-    sop(b, format!("s_lshl_b32 s{S_X8}, s{S_KVH}, 8"), &[S_X8], &[S_KVH])?;
-    sop(b, format!("s_lshl_b32 s{S_X2}, s{S_KVH}, 1"), &[S_X2], &[S_KVH])?;
-    sop(b, format!("s_add_co_i32 s{S_X2}, s{S_X2}, 0x200"), &[S_X2], &[S_X2])?;
-    sop(b, format!("s_lshl_b32 s{S_TG}, s{S_KVH}, 3"), &[S_TG], &[S_KVH])?;
+    sop(
+        b,
+        format!("s_mov_b32 s{S_PSEL}, 0x76543210"),
+        &[S_PSEL],
+        &[],
+    )?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{S_X8}, s{S_KVH}, 8"),
+        &[S_X8],
+        &[S_KVH],
+    )?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{S_X2}, s{S_KVH}, 1"),
+        &[S_X2],
+        &[S_KVH],
+    )?;
+    sop(
+        b,
+        format!("s_add_co_i32 s{S_X2}, s{S_X2}, 0x200"),
+        &[S_X2],
+        &[S_X2],
+    )?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{S_TG}, s{S_KVH}, 3"),
+        &[S_TG],
+        &[S_KVH],
+    )?;
     // Group bounds: first query of the workgroup, live queries (<= 48); positions of those queries.
-    sop(b, format!("s_lshr_b32 s{S_TH}, s{S_ROWB}, 3"), &[S_TH], &[S_ROWB])?;
-    sop(b, format!("s_sub_co_i32 s{S_TC}, s{S_RUN}, s{S_TH}"), &[S_TC], &[S_RUN, S_TH])?;
-    sop(b, format!("s_min_i32 s{S_TC}, s{S_TC}, 48"), &[S_TC], &[S_TC])?;
-    sop(b, format!("s_add_co_i32 s{S_TI}, s{S_QOFF}, s{S_TH}"), &[S_TI], &[S_QOFF, S_TH])?;
+    sop(
+        b,
+        format!("s_lshr_b32 s{S_TH}, s{S_ROWB}, 3"),
+        &[S_TH],
+        &[S_ROWB],
+    )?;
+    sop(
+        b,
+        format!("s_sub_co_i32 s{S_TC}, s{S_RUN}, s{S_TH}"),
+        &[S_TC],
+        &[S_RUN, S_TH],
+    )?;
+    sop(
+        b,
+        format!("s_min_i32 s{S_TC}, s{S_TC}, 48"),
+        &[S_TC],
+        &[S_TC],
+    )?;
+    sop(
+        b,
+        format!("s_add_co_i32 s{S_TI}, s{S_QOFF}, s{S_TH}"),
+        &[S_TI],
+        &[S_QOFF, S_TH],
+    )?;
     // Row quantities of this lane: row = wave row base + ml.
     let (row, ql, h3, query, qc, head, qrow, kgx, qoff) =
         (t(4), t(5), t(6), t(7), t(8), t(9), t(10), t(11), t(12));
@@ -689,7 +859,14 @@ fn prologue(b: &mut Builder, l: &L) -> R {
     ins!(b, format!("v_lshlrev_b32_e32 v{qso}, 2, v{qrow}"); v(qso); v(qrow))?;
     exec_and(b, S_SAVE, S_QOK)?;
     for mm in 0..8u8 {
-        gload(b, "b128", vr(V_QF + 4 * mm, 4), qoff, S_QC, 16 * u32::from(mm))?;
+        gload(
+            b,
+            "b128",
+            vr(V_QF + 4 * mm, 4),
+            qoff,
+            S_QC,
+            16 * u32::from(mm),
+        )?;
     }
     gload(b, "b32", v(V_QS), qso, S_QSC, 0)?;
     exec_restore(b, S_SAVE)?;
@@ -730,7 +907,12 @@ fn prologue(b: &mut Builder, l: &L) -> R {
     ins!(b, format!("v_sub_nc_u32_e32 v{V_PK}, v{pos}, v{xa}"); v(V_PK); v(pos), v(xa))?;
     // q scale: scale_attn * row scale.
     ins!(b, format!("v_mul_f32_e32 v{V_QS}, s{S_SCALE}, v{V_QS}"); v(V_QS); s(S_SCALE), v(V_QS))?;
-    sop(b, format!("s_add_co_i32 s{S_SEQ}, s{S_GMAX}, 1"), &[S_SEQ], &[S_GMAX])?;
+    sop(
+        b,
+        format!("s_add_co_i32 s{S_SEQ}, s{S_GMAX}, 1"),
+        &[S_SEQ],
+        &[S_GMAX],
+    )?;
     sop(b, format!("s_mov_b32 s{S_KT}, 0"), &[S_KT], &[])?;
     // Fresh online state: O = +0, m = -inf, l = +0, b = 2^-64 with its reciprocal brackets.
     for r in 0..128u8 {
@@ -821,8 +1003,18 @@ fn fill_constants(b: &mut Builder, wv: u8, lane: u8) -> R {
 /// for the pending-load shape (the scalar role branches skip whole roles and their consumers alike).
 fn issue_general(b: &mut Builder, l: &L, tag: &str, kt: u8) -> R {
     let (rem, off) = (S_TA, S_TB);
-    sop(b, format!("s_sub_co_i32 s{rem}, s{S_SEQ}, s{kt}"), &[rem], &[S_SEQ, kt])?;
-    sop(b, format!("s_mul_i32 s{off}, s{kt}, {}", lit(ROW_BYTES)), &[off], &[kt])?;
+    sop(
+        b,
+        format!("s_sub_co_i32 s{rem}, s{S_SEQ}, s{kt}"),
+        &[rem],
+        &[S_SEQ, kt],
+    )?;
+    sop(
+        b,
+        format!("s_mul_i32 s{off}, s{kt}, {}", lit(ROW_BYTES)),
+        &[off],
+        &[kt],
+    )?;
     for i in 0..4u8 {
         vmov(b, V_KW + i, "0")?;
     }
@@ -889,11 +1081,26 @@ fn issue_general(b: &mut Builder, l: &L, tag: &str, kt: u8) -> R {
 fn issue(b: &mut Builder, l: &L, tag: &str, kt: u8) -> R {
     let partial = l.n(&format!("{tag}_partial"));
     let done = l.n(&format!("{tag}_done"));
-    sop(b, format!("s_add_co_i32 s{S_TA}, s{kt}, {}", lit(TK)), &[S_TA], &[kt])?;
-    sop(b, format!("s_cmp_gt_i32 s{S_TA}, s{S_SEQ}"), &[], &[S_TA, S_SEQ])?;
+    sop(
+        b,
+        format!("s_add_co_i32 s{S_TA}, s{kt}, {}", lit(TK)),
+        &[S_TA],
+        &[kt],
+    )?;
+    sop(
+        b,
+        format!("s_cmp_gt_i32 s{S_TA}, s{S_SEQ}"),
+        &[],
+        &[S_TA, S_SEQ],
+    )?;
     op(b, format!("s_cbranch_scc1 {partial}"), &[], &[])?;
     let off = S_TB;
-    sop(b, format!("s_mul_i32 s{off}, s{kt}, {}", lit(ROW_BYTES)), &[off], &[kt])?;
+    sop(
+        b,
+        format!("s_mul_i32 s{off}, s{kt}, {}", lit(ROW_BYTES)),
+        &[off],
+        &[kt],
+    )?;
     // K: one chunk per lane (all keys of the tile are live).
     ins!(b, format!("v_add_nc_u32_e32 v{}, s{off}, v{V_GK}", t(0)); v(t(0)); s(off), v(V_GK))?;
     for i in 0..4u8 {
@@ -959,8 +1166,18 @@ fn commit(b: &mut Builder, l: &L, tag: &str, kt: u8, wb: usize) -> R {
     }
     // keep = bytes of live keys: nvalid = clamp(seq - (kt + VKB), 0, 8) (skipped for a fully live tile).
     let store_v = l.n(&format!("{tag}_cstorev"));
-    sop(b, format!("s_add_co_i32 s{S_TC}, s{kt}, {}", lit(TK)), &[S_TC], &[kt])?;
-    sop(b, format!("s_cmp_le_i32 s{S_TC}, s{S_SEQ}"), &[], &[S_TC, S_SEQ])?;
+    sop(
+        b,
+        format!("s_add_co_i32 s{S_TC}, s{kt}, {}", lit(TK)),
+        &[S_TC],
+        &[kt],
+    )?;
+    sop(
+        b,
+        format!("s_cmp_le_i32 s{S_TC}, s{S_SEQ}"),
+        &[],
+        &[S_TC, S_SEQ],
+    )?;
     op(b, format!("s_cbranch_scc1 {store_v}"), &[], &[])?;
     let (k0, nv, sh, mlo, mhi) = (t(4), t(5), t(6), t(8), t(9));
     ins!(b, format!("v_add_nc_u32_e32 v{k0}, s{kt}, v{V_VKB}"); v(k0); s(kt), v(V_VKB))?;
@@ -980,7 +1197,14 @@ fn commit(b: &mut Builder, l: &L, tag: &str, kt: u8, wb: usize) -> R {
     }
     b.label(&store_v)?;
     for c in 0..4u8 {
-        dstore(b, wb, "b64", V_WV, vr(d + 2 * c, 2), base + 16 * u32::from(c))?;
+        dstore(
+            b,
+            wb,
+            "b64",
+            V_WV,
+            vr(d + 2 * c, 2),
+            base + 16 * u32::from(c),
+        )?;
     }
     b.label(&skip_v)?;
     // Scales (wave 0).
@@ -1018,42 +1242,107 @@ fn tile(b: &mut Builder, l: &L, rb: usize) -> R {
     let epi = l.n("epi");
     let skip_cm = l.n(&format!("{c}_skipcommit"));
     let barrier = l.n(&format!("{c}_barrier"));
-    sop(b, format!("s_add_co_i32 s{S_TG}, s{S_KT}, {}", lit(TK)), &[S_TG], &[S_KT])?;
+    sop(
+        b,
+        format!("s_add_co_i32 s{S_TG}, s{S_KT}, {}", lit(TK)),
+        &[S_TG],
+        &[S_KT],
+    )?;
     // Compute (dead waves only join the fill and the rendezvous).
     sop(b, format!("s_cmp_eq_u32 s{S_WLIVE}, 0"), &[], &[S_WLIVE])?;
     op(b, format!("s_cbranch_scc1 {barrier}"), &[], &[])?;
     // nsub = min(3, (gmax - ktile) / 16 + 1): subs with kt_sub <= gmax.
-    sop(b, format!("s_sub_co_i32 s{S_TA}, s{S_GMAX}, s{S_KT}"), &[S_TA], &[S_GMAX, S_KT])?;
-    sop(b, format!("s_lshr_b32 s{S_TA}, s{S_TA}, 4"), &[S_TA], &[S_TA])?;
-    sop(b, format!("s_add_co_i32 s{S_TA}, s{S_TA}, 1"), &[S_TA], &[S_TA])?;
-    sop(b, format!("s_min_u32 s{S_NSUB}, s{S_TA}, 3"), &[S_NSUB], &[S_TA])?;
-    sop(b, format!("s_mov_b32 s{S_TI}, s{S_NSUB}"), &[S_TI], &[S_NSUB])?;
+    sop(
+        b,
+        format!("s_sub_co_i32 s{S_TA}, s{S_GMAX}, s{S_KT}"),
+        &[S_TA],
+        &[S_GMAX, S_KT],
+    )?;
+    sop(
+        b,
+        format!("s_lshr_b32 s{S_TA}, s{S_TA}, 4"),
+        &[S_TA],
+        &[S_TA],
+    )?;
+    sop(
+        b,
+        format!("s_add_co_i32 s{S_TA}, s{S_TA}, 1"),
+        &[S_TA],
+        &[S_TA],
+    )?;
+    sop(
+        b,
+        format!("s_min_u32 s{S_NSUB}, s{S_TA}, 3"),
+        &[S_NSUB],
+        &[S_TA],
+    )?;
+    sop(
+        b,
+        format!("s_mov_b32 s{S_TI}, s{S_NSUB}"),
+        &[S_TI],
+        &[S_NSUB],
+    )?;
     sop(b, format!("s_mov_b32 s{S_KTS}, s{S_KT}"), &[S_KTS], &[S_KT])?;
     b.loop_(&l.n(&format!("{c}_sub")), |b| sub(b, l, rb, c))?;
     // Restore the fragment bases (nsub subs consumed).
-    sop(b, format!("s_lshl_b32 s{S_TA}, s{S_TI}, 9"), &[S_TA], &[S_TI])?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{S_TA}, s{S_TI}, 9"),
+        &[S_TA],
+        &[S_TI],
+    )?;
     ins!(b, format!("v_subrev_nc_u32_e32 v{V_RDK}, s{S_TA}, v{V_RDK}"); v(V_RDK); s(S_TA), v(V_RDK))?;
-    sop(b, format!("s_lshl_b32 s{S_TA}, s{S_TI}, 12"), &[S_TA], &[S_TI])?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{S_TA}, s{S_TI}, 12"),
+        &[S_TA],
+        &[S_TI],
+    )?;
     ins!(b, format!("v_subrev_nc_u32_e32 v{V_RDV}, s{S_TA}, v{V_RDV}"); v(V_RDV); s(S_TA), v(V_RDV))?;
-    sop(b, format!("s_lshl_b32 s{S_TA}, s{S_TI}, 6"), &[S_TA], &[S_TI])?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{S_TA}, s{S_TI}, 6"),
+        &[S_TA],
+        &[S_TI],
+    )?;
     ins!(b, format!("v_subrev_nc_u32_e32 v{V_RSK}, s{S_TA}, v{V_RSK}"); v(V_RSK); s(S_TA), v(V_RSK))?;
     b.label(&barrier)?;
     // Both paths into the commit (compute done, dead wave) reach the first scalar read of the tile bound the same way.
     wait_alu(b, "depctr_sa_sdst(0)")?;
     // Commit of tile k + 1 (the drain before the branch keeps every path free of loads in flight).
     b.wait(Counter::Load, 0)?;
-    sop(b, format!("s_cmp_ge_i32 s{S_TG}, s{S_SEQ}"), &[], &[S_TG, S_SEQ])?;
+    sop(
+        b,
+        format!("s_cmp_ge_i32 s{S_TG}, s{S_SEQ}"),
+        &[],
+        &[S_TG, S_SEQ],
+    )?;
     op(b, format!("s_cbranch_scc1 {skip_cm}"), &[], &[])?;
     commit(b, l, &format!("{c}c"), S_TG, wb)?;
     b.label(&skip_cm)?;
     b.wait(Counter::Ds, 0)?;
     b.barrier_signal(&[Transition::Ready(wb), Transition::Retire(rb)])?;
     // Loads for tile k + 2 (its commit closes tile k + 1), issued while the other waves arrive.
-    sop(b, format!("s_add_co_i32 s{S_TH}, s{S_KT}, {}", lit(2 * TK)), &[S_TH], &[S_KT])?;
+    sop(
+        b,
+        format!("s_add_co_i32 s{S_TH}, s{S_KT}, {}", lit(2 * TK)),
+        &[S_TH],
+        &[S_KT],
+    )?;
     issue(b, l, &format!("{c}i"), S_TH)?;
     b.barrier_wait()?;
-    sop(b, format!("s_add_co_i32 s{S_KT}, s{S_KT}, {TK}"), &[S_KT], &[S_KT])?;
-    sop(b, format!("s_cmp_ge_i32 s{S_KT}, s{S_SEQ}"), &[], &[S_KT, S_SEQ])?;
+    sop(
+        b,
+        format!("s_add_co_i32 s{S_KT}, s{S_KT}, {TK}"),
+        &[S_KT],
+        &[S_KT],
+    )?;
+    sop(
+        b,
+        format!("s_cmp_ge_i32 s{S_KT}, s{S_SEQ}"),
+        &[],
+        &[S_KT, S_SEQ],
+    )?;
     op(b, format!("s_cbranch_scc1 {epi}"), &[], &[])
 }
 
@@ -1071,7 +1360,13 @@ fn sub(b: &mut Builder, l: &L, rb: usize, c: &str) -> R {
     let sa = V_SA;
     // ---- QK: S^T = K^T Q over 16 dimension fragments, in dimension order. All eight K fragment loads are in flight
     // before the chain: fragments 0..4 in the fragment ring, 4..8 in the temporaries (dead until the softmax).
-    let slot = |p: u8| if p < 4 { V_FR + 4 * p } else { V_T + 4 * (p - 4) };
+    let slot = |p: u8| {
+        if p < 4 {
+            V_FR + 4 * p
+        } else {
+            V_T + 4 * (p - 4)
+        }
+    };
     l.prio(b, 3)?;
     for p in 0..8u8 {
         dload128(b, rb, slot(p), V_RDK, base + u32::from(p) * 1536)?;
@@ -1088,10 +1383,25 @@ fn sub(b: &mut Builder, l: &L, rb: usize, c: &str) -> R {
     // ---- scores: s = (acc * qs) * sk, masked to -inf past the row's position.
     let full_path = l.n(&format!("{c}_fast"));
     let scored = l.n(&format!("{c}_scored"));
-    sop(b, format!("s_add_co_i32 s{S_TA}, s{S_KTS}, 15"), &[S_TA], &[S_KTS])?;
-    sop(b, format!("s_cmp_le_i32 s{S_TA}, s{S_GMIN}"), &[], &[S_TA, S_GMIN])?;
+    sop(
+        b,
+        format!("s_add_co_i32 s{S_TA}, s{S_KTS}, 15"),
+        &[S_TA],
+        &[S_KTS],
+    )?;
+    sop(
+        b,
+        format!("s_cmp_le_i32 s{S_TA}, s{S_GMIN}"),
+        &[],
+        &[S_TA, S_GMIN],
+    )?;
     sop(b, format!("s_cselect_b32 s{S_TB}, 1, 0"), &[S_TB], &[])?;
-    sop(b, format!("s_and_b32 s{S_TC}, s{S_TB}, s{S_QALL}"), &[S_TC], &[S_TB, S_QALL])?;
+    sop(
+        b,
+        format!("s_and_b32 s{S_TC}, s{S_TB}, s{S_QALL}"),
+        &[S_TC],
+        &[S_TB, S_QALL],
+    )?;
     sop(b, format!("s_cmp_eq_u32 s{S_TC}, 1"), &[], &[S_TC])?;
     // Both score paths consume the scale registers: drain the DS loads before the branch.
     b.wait(Counter::Ds, 0)?;
@@ -1140,8 +1450,18 @@ fn sub(b: &mut Builder, l: &L, rb: usize, c: &str) -> R {
     ins!(b, format!("v_add_nc_u32_e32 v{V_RDK}, 0x200, v{V_RDK}"); v(V_RDK); v(V_RDK))?;
     ins!(b, format!("v_add_nc_u32_e32 v{V_RDV}, 0x1000, v{V_RDV}"); v(V_RDV); v(V_RDV))?;
     ins!(b, format!("v_add_nc_u32_e32 v{V_RSK}, 64, v{V_RSK}"); v(V_RSK); v(V_RSK))?;
-    sop(b, format!("s_add_co_i32 s{S_KTS}, s{S_KTS}, 16"), &[S_KTS], &[S_KTS])?;
-    sop(b, format!("s_sub_co_i32 s{S_NSUB}, s{S_NSUB}, 1"), &[S_NSUB], &[S_NSUB])?;
+    sop(
+        b,
+        format!("s_add_co_i32 s{S_KTS}, s{S_KTS}, 16"),
+        &[S_KTS],
+        &[S_KTS],
+    )?;
+    sop(
+        b,
+        format!("s_sub_co_i32 s{S_NSUB}, s{S_NSUB}, 1"),
+        &[S_NSUB],
+        &[S_NSUB],
+    )?;
     sop(b, format!("s_cmp_gt_i32 s{S_NSUB}, 0"), &[], &[S_NSUB])?;
     op(b, format!("s_cbranch_scc1 {head}"), &[], &[])
 }
@@ -1168,11 +1488,31 @@ fn softmax(b: &mut Builder, l: &L, c: &str) -> R {
     ins!(b, format!("v_cmp_eq_f32_e64 s{S_MB}, {NEG_INF:#x}, v{V_M}"); m(S_MB); v(V_M))?;
     ins!(b, format!("v_add_f32_e32 v{x1}, 4.0, v{V_M}"); v(x1); v(V_M))?;
     ins!(b, format!("v_cmp_gt_f32_e64 s{S_MD}, v{mx}, v{x1}"); m(S_MD); v(mx), v(x1))?;
-    op(b, format!("s_and_b32 s{S_MC}, s{S_MA}, s{S_MB}"), &[m(S_MC)], &[m(S_MA), m(S_MB)])?;
-    op(b, format!("s_and_b32 s{S_SV2}, s{S_MA}, s{S_MD}"), &[m(S_SV2)], &[m(S_MA), m(S_MD)])?;
-    op(b, format!("s_and_not1_b32 s{S_SV2}, s{S_SV2}, s{S_MB}"), &[m(S_SV2)], &[m(S_SV2), m(S_MB)])?;
+    op(
+        b,
+        format!("s_and_b32 s{S_MC}, s{S_MA}, s{S_MB}"),
+        &[m(S_MC)],
+        &[m(S_MA), m(S_MB)],
+    )?;
+    op(
+        b,
+        format!("s_and_b32 s{S_SV2}, s{S_MA}, s{S_MD}"),
+        &[m(S_SV2)],
+        &[m(S_MA), m(S_MD)],
+    )?;
+    op(
+        b,
+        format!("s_and_not1_b32 s{S_SV2}, s{S_SV2}, s{S_MB}"),
+        &[m(S_SV2)],
+        &[m(S_SV2), m(S_MB)],
+    )?;
     let alpha_done = l.n(&format!("{c}_alpha_done"));
-    op(b, format!("s_and_saveexec_b32 s{S_SAVE}, s{S_SV2}"), &[m(S_SAVE)], &[m(S_SV2)])?;
+    op(
+        b,
+        format!("s_and_saveexec_b32 s{S_SAVE}, s{S_SV2}"),
+        &[m(S_SAVE)],
+        &[m(S_SV2)],
+    )?;
     op(b, format!("s_cbranch_execz {alpha_done}"), &[], &[])?;
     {
         let (al, yb) = (x1, x2);
@@ -1181,13 +1521,25 @@ fn softmax(b: &mut Builder, l: &L, c: &str) -> R {
         ins!(b, format!("v_exp_f32_e32 v{al}, v{al}"); v(al); v(al))?;
         ins!(b, format!("v_mul_f32_e32 v{V_L}, v{V_L}, v{al}"); v(V_L); v(V_L), v(al))?;
         ins!(b, format!("v_mul_f32_e32 v{V_B}, v{V_B}, v{al}"); v(V_B); v(V_B), v(al))?;
-        fdiv(b, yb, "1.0", &format!("v{V_B}"), &[v(V_B)], [t(17), t(18), t(19), t(20)])?;
+        fdiv(
+            b,
+            yb,
+            "1.0",
+            &format!("v{V_B}"),
+            &[v(V_B)],
+            [t(17), t(18), t(19), t(20)],
+        )?;
         ins!(b, format!("v_mul_f32_e32 v{V_YL}, {BRK_LO:#x}, v{yb}"); v(V_YL); v(yb))?;
         ins!(b, format!("v_mul_f32_e32 v{V_YH}, {BRK_HI:#x}, v{yb}"); v(V_YH); v(yb))?;
     }
     b.label(&alpha_done)?;
     exec_restore(b, S_SAVE)?;
-    op(b, format!("s_or_b32 s{S_MC}, s{S_MC}, s{S_SV2}"), &[m(S_MC)], &[m(S_MC), m(S_SV2)])?;
+    op(
+        b,
+        format!("s_or_b32 s{S_MC}, s{S_MC}, s{S_SV2}"),
+        &[m(S_MC)],
+        &[m(S_MC), m(S_SV2)],
+    )?;
     ins!(b, format!("v_cndmask_b32_e64 v{V_M}, v{V_M}, v{mx}, s{S_MC}"); v(V_M); v(V_M), v(mx), m(S_MC))?;
     // e_j = exp(s_j - m): lanes still at m == -inf produce 0.
     ins!(b, format!("v_cmp_eq_f32_e64 s{S_MA}, {NEG_INF:#x}, v{V_M}"); m(S_MA); v(V_M))?;
@@ -1240,12 +1592,31 @@ fn softmax(b: &mut Builder, l: &L, c: &str) -> R {
     // needed > b: rescale O by rho = b / needed, b = needed, refresh the reciprocal brackets.
     let resc_done = l.n(&format!("{c}_resc_done"));
     ins!(b, format!("v_cmp_gt_f32_e64 s{S_MC}, v{needed}, v{V_B}"); m(S_MC); v(needed), v(V_B))?;
-    op(b, format!("s_and_saveexec_b32 s{S_SAVE}, s{S_MC}"), &[m(S_SAVE)], &[m(S_MC)])?;
+    op(
+        b,
+        format!("s_and_saveexec_b32 s{S_SAVE}, s{S_MC}"),
+        &[m(S_SAVE)],
+        &[m(S_MC)],
+    )?;
     op(b, format!("s_cbranch_execz {resc_done}"), &[], &[])?;
     {
         let (rho, yb) = (t(4), t(5));
-        fdiv(b, rho, &format!("v{V_B}"), &format!("v{needed}"), &[v(V_B), v(needed)], [t(17), t(18), t(19), t(20)])?;
-        fdiv(b, yb, "1.0", &format!("v{needed}"), &[v(needed)], [t(17), t(18), t(19), t(20)])?;
+        fdiv(
+            b,
+            rho,
+            &format!("v{V_B}"),
+            &format!("v{needed}"),
+            &[v(V_B), v(needed)],
+            [t(17), t(18), t(19), t(20)],
+        )?;
+        fdiv(
+            b,
+            yb,
+            "1.0",
+            &format!("v{needed}"),
+            &[v(needed)],
+            [t(17), t(18), t(19), t(20)],
+        )?;
         for i in 0..128u8 {
             let o = V_O + i;
             ins!(b, format!("v_mul_f32_e32 v{o}, v{o}, v{rho}"); v(o); v(o), v(rho))?;
@@ -1275,16 +1646,40 @@ fn softmax(b: &mut Builder, l: &L, c: &str) -> R {
     }
     ins!(b, format!("v_cmp_ne_u32_e64 s{S_MA}, v{pw0}, v{hw0}"); m(S_MA); v(pw0), v(hw0))?;
     ins!(b, format!("v_cmp_ne_u32_e64 s{S_MB}, v{pw1}, v{hw1}"); m(S_MB); v(pw1), v(hw1))?;
-    op(b, format!("s_or_b32 s{S_MA}, s{S_MA}, s{S_MB}"), &[m(S_MA)], &[m(S_MA), m(S_MB)])?;
+    op(
+        b,
+        format!("s_or_b32 s{S_MA}, s{S_MA}, s{S_MB}"),
+        &[m(S_MA)],
+        &[m(S_MA), m(S_MB)],
+    )?;
     let p_done = l.n(&format!("{c}_pcode_done"));
     let (u0, u1) = (t(14), t(15));
-    op(b, format!("s_and_saveexec_b32 s{S_SAVE}, s{S_MA}"), &[m(S_SAVE)], &[m(S_MA)])?;
+    op(
+        b,
+        format!("s_and_saveexec_b32 s{S_SAVE}, s{S_MA}"),
+        &[m(S_SAVE)],
+        &[m(S_MA)],
+    )?;
     op(b, format!("s_cbranch_execz {p_done}"), &[], &[])?;
     for (wi, w) in [pw0, pw1].into_iter().enumerate() {
         for half in 0..2u8 {
             let j = (4 * wi as u8) + 2 * half;
-            fdiv(b, u0, &format!("v{}", pr(j)), &format!("v{V_B}"), &[v(pr(j)), v(V_B)], [t(17), t(18), t(19), t(20)])?;
-            fdiv(b, u1, &format!("v{}", pr(j + 1)), &format!("v{V_B}"), &[v(pr(j + 1)), v(V_B)], [t(17), t(18), t(19), t(20)])?;
+            fdiv(
+                b,
+                u0,
+                &format!("v{}", pr(j)),
+                &format!("v{V_B}"),
+                &[v(pr(j)), v(V_B)],
+                [t(17), t(18), t(19), t(20)],
+            )?;
+            fdiv(
+                b,
+                u1,
+                &format!("v{}", pr(j + 1)),
+                &format!("v{V_B}"),
+                &[v(pr(j + 1)), v(V_B)],
+                [t(17), t(18), t(19), t(20)],
+            )?;
             if half == 0 {
                 ins!(b, format!("v_cvt_pk_fp8_f32 v{w}.l, v{u0}, v{u1}"); v(w); v(u0), v(u1), v(w))?;
             } else {
@@ -1325,7 +1720,14 @@ fn epilogue(b: &mut Builder, l: &L) -> R {
     op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
     let inv = t(0);
     ins!(b, format!("v_cmp_lt_f32_e64 s{S_MA}, 0, v{V_L}"); m(S_MA); v(V_L))?;
-    fdiv(b, inv, &format!("v{V_B}"), &format!("v{V_L}"), &[v(V_B), v(V_L)], [t(1), t(2), t(3), t(4)])?;
+    fdiv(
+        b,
+        inv,
+        &format!("v{V_B}"),
+        &format!("v{V_L}"),
+        &[v(V_B), v(V_L)],
+        [t(1), t(2), t(3), t(4)],
+    )?;
     wait_alu(b, "depctr_va_sdst(0)")?;
     ins!(b, format!("v_cndmask_b32_e64 v{inv}, 0, v{inv}, s{S_MA}"); v(inv); v(inv), m(S_MA))?;
     for i in 0..128u8 {
@@ -1334,13 +1736,28 @@ fn epilogue(b: &mut Builder, l: &L) -> R {
     }
     // Byte offset of the lane's first element: (query * 16 + head) * 1024 + 32 kg.
     let (row, a, c) = (t(5), t(6), t(7));
-    sop(b, format!("s_lshl_b32 s{S_TA}, s{S_WAVE}, 4"), &[S_TA], &[S_WAVE])?;
-    sop(b, format!("s_add_co_i32 s{S_TA}, s{S_TA}, s{S_ROWB}"), &[S_TA], &[S_TA, S_ROWB])?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{S_TA}, s{S_WAVE}, 4"),
+        &[S_TA],
+        &[S_WAVE],
+    )?;
+    sop(
+        b,
+        format!("s_add_co_i32 s{S_TA}, s{S_TA}, s{S_ROWB}"),
+        &[S_TA],
+        &[S_TA, S_ROWB],
+    )?;
     ins!(b, format!("v_and_b32_e32 v{c}, 15, v{V_LANE}"); v(c); v(V_LANE))?;
     ins!(b, format!("v_add_nc_u32_e32 v{row}, s{S_TA}, v{c}"); v(row); s(S_TA), v(c))?;
     ins!(b, format!("v_lshrrev_b32_e32 v{a}, 3, v{row}"); v(a); v(row))?;
     ins!(b, format!("v_add_nc_u32_e32 v{a}, s{S_QOFF}, v{a}"); v(a); s(S_QOFF), v(a))?;
-    sop(b, format!("s_lshl_b32 s{S_TB}, s{S_KVH}, 3"), &[S_TB], &[S_KVH])?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{S_TB}, s{S_KVH}, 3"),
+        &[S_TB],
+        &[S_KVH],
+    )?;
     ins!(b, format!("v_and_b32_e32 v{c}, 7, v{row}"); v(c); v(row))?;
     ins!(b, format!("v_add_nc_u32_e32 v{c}, s{S_TB}, v{c}"); v(c); s(S_TB), v(c))?;
     ins!(b, format!("v_lshl_add_u32 v{a}, v{a}, 4, v{c}"); v(a); v(a), v(c))?;
@@ -1392,7 +1809,6 @@ pub fn emit_module(
     let (text, proof) = super::iu4_gemm::module(&emitted, MODULE)?;
     Ok((emitted, text, proof))
 }
-
 
 // ------------------------------------------------------------------ contracts
 const COUNTED: [&str; 24] = [

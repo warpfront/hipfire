@@ -92,8 +92,8 @@
 //! independently decoded, f16-staged K/V omits Q16 conversion and the WMMA/reduction DAG: diagnostic only.
 use hip_bridge::KernargBlob;
 use rdna_compute::attention::A3bQresRoute;
-use rdna_compute::fa_qresident_pm;
 use rdna_compute::fa_prefill_pm::{self, FaPrefillKvCodec};
+use rdna_compute::fa_qresident_pm;
 use rdna_compute::qwen35_fa_batch::FaPrepQOut;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
@@ -1912,8 +1912,8 @@ fn native_candidate_seg_routed(
             total,
             off,
         )?,
-        (false, Some(r)) => {
-            gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_routed_gfx1201(
+        (false, Some(r)) => gpu
+            .attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_routed_gfx1201(
                 r,
                 &q,
                 &kc,
@@ -1927,8 +1927,7 @@ fn native_candidate_seg_routed(
                 rows,
                 total,
                 off,
-            )?
-        }
+            )?,
     }
     Ok(())
 }
@@ -4334,10 +4333,7 @@ fn pm_qres_round(
     full_q.extend_from_slice(bytes(&p.q_scales));
     let mut direct_q = p.q_codes[..rows * Q_CODES_ROW].to_vec();
     direct_q.extend_from_slice(bytes(&p.q_scales[..rows * H]));
-    let (hip_poison, pm_poison) = (
-        NATIVE_POISONS[round] as u8,
-        NATIVE_POISONS[1 - round] as u8,
-    );
+    let (hip_poison, pm_poison) = (NATIVE_POISONS[round] as u8, NATIVE_POISONS[1 - round] as u8);
     // Direct: batch-local scale plane.
     a.q().upload(gpu, &direct_q)?;
     let (hip_d, pm_d) = pm_pair(gpu, a, cell, rows, &[(0, rows)], p.used_out, round)?;
@@ -4401,8 +4397,7 @@ fn pm_qres_round(
                 a.kc().upload(gpu, &kc)?;
                 a.vc().upload(gpu, &vc)?;
                 gpu.hip.device_synchronize()?;
-                let (hip_p, pm_p) =
-                    pm_pair(gpu, a, cell, ltotal, &[(0, rows)], p.used_out, round)?;
+                let (hip_p, pm_p) = pm_pair(gpu, a, cell, ltotal, &[(0, rows)], p.used_out, round)?;
                 let name = format!("probe_{layout}_row{row}_{kind}");
                 t.cmp(&name, &hip_p, &pm_p, 0);
                 let stable = |probe: &[u8], base: &[u8]| {
@@ -4489,7 +4484,10 @@ fn pm_qres_plan() {
             "kernarg_bytes": fa_qresident_pm::KERNARG_BYTES, "block": fa_qresident_pm::BLOCK,
             "lds": fa_qresident_pm::LDS, "gpu_launched": false})
     );
-    println!("PM_QRES_PLAN cells={} total_cases={total_cases}", cells.len());
+    println!(
+        "PM_QRES_PLAN cells={} total_cases={total_cases}",
+        cells.len()
+    );
 }
 /// CPU invariants of the PM mode (cells, segments, comparator). Panics on failure.
 fn pm_qres_self_check() -> usize {
@@ -4501,9 +4499,11 @@ fn pm_qres_self_check() -> usize {
     let cells = pm_qres_cells();
     let base = native_cells();
     ok(
-        cells.len() > base.len() && cells[..base.len()].iter().zip(&base).all(|(x, y)| {
-            x.rows == y.rows && x.start == y.start && x.kind == y.kind
-        }),
+        cells.len() > base.len()
+            && cells[..base.len()]
+                .iter()
+                .zip(&base)
+                .all(|(x, y)| x.rows == y.rows && x.start == y.start && x.kind == y.kind),
         "native cells kept first and unchanged",
     );
     let mut names: Vec<String> = cells.iter().map(|c| c.name()).collect();
@@ -4511,7 +4511,9 @@ fn pm_qres_self_check() -> usize {
     names.dedup();
     ok(names.len() == cells.len(), "cell names unique");
     ok(
-        cells.iter().all(|c| c.rows >= 1 && c.ctx() <= PM_QRES_CTX_MAX.max(16_384)),
+        cells
+            .iter()
+            .all(|c| c.rows >= 1 && c.ctx() <= PM_QRES_CTX_MAX.max(16_384)),
         "contexts bounded",
     );
     ok(
@@ -4554,8 +4556,7 @@ fn pm_qres_self_check() -> usize {
     for c in &cells {
         let segs = pm_qres_range_segs(c.rows);
         ok(
-            segs[0] == (0, c.rows)
-                && segs.iter().all(|&(o, m)| m >= 1 && o + m <= c.rows),
+            segs[0] == (0, c.rows) && segs.iter().all(|&(o, m)| m >= 1 && o + m <= c.rows),
             "range segments in bounds",
         );
         ok(
@@ -4584,7 +4585,10 @@ fn pm_qres_self_check() -> usize {
         pm_compare(&a, &b2[..b2.len() - 4], 0).mismatch_words == 2,
         "length mismatch is counted",
     );
-    ok(pm_qres_cases_per_round(1) == 1 + 1 + 1 * 2 * 2, "case formula rows 1");
+    ok(
+        pm_qres_cases_per_round(1) == 1 + 1 + 1 * 2 * 2,
+        "case formula rows 1",
+    );
     ok(
         pm_qres_probe_layouts(8192) == 1 && pm_qres_probe_layouts(513) == 2,
         "probe layouts",
@@ -4628,7 +4632,8 @@ fn pm_qres_run(o: &Opts) -> Result<bool> {
         json!({"kind": "pm_qres_arena", "buffers": NATIVE_BUFFER_NAMES,
             "arena_bytes_each": arena.sizes()})
     );
-    let (mut cases, mut mismatches, mut errors, mut cells_failed) = (0usize, 0usize, 0usize, 0usize);
+    let (mut cases, mut mismatches, mut errors, mut cells_failed) =
+        (0usize, 0usize, 0usize, 0usize);
     'cells: for nc in &selected {
         let mut rounds = Vec::new();
         let (mut cell_cases, mut cell_mismatches, mut cell_error) = (0usize, 0usize, false);

@@ -88,7 +88,10 @@ fn emission_is_deterministic_and_the_module_is_direct_then_range() {
     );
     assert_eq!((ma.module.as_str(), ma.arch), (fa_qresident::MODULE, ARCH));
     assert_eq!(ea.len(), 2);
-    assert_eq!(ea[0].s_text, a.s_text, "the module entry is the standalone direct export");
+    assert_eq!(
+        ea[0].s_text, a.s_text,
+        "the module entry is the standalone direct export"
+    );
     assert_eq!(ta.matches(".amdhsa_kernel ").count(), 2);
     let direct = ta
         .find(&format!(".amdhsa_kernel {}\n", fa_qresident::SYMBOL_DIRECT))
@@ -107,7 +110,10 @@ fn descriptor_kernarg_and_resources_match_the_hipcc_twin() {
         .zip([fa_qresident::SYMBOL_DIRECT, fa_qresident::SYMBOL_RANGE])
     {
         let t = &e.s_text;
-        assert!(t.contains(&format!(".amdhsa_kernel {symbol}\n")), "{symbol}");
+        assert!(
+            t.contains(&format!(".amdhsa_kernel {symbol}\n")),
+            "{symbol}"
+        );
         let field = |key: &str| -> u32 {
             t.lines()
                 .filter_map(|l| l.trim().strip_prefix(key))
@@ -120,12 +126,20 @@ fn descriptor_kernarg_and_resources_match_the_hipcc_twin() {
         assert_eq!(field(".amdhsa_kernarg_size"), fa_qresident::KERNARG_BYTES);
         assert_eq!(field(".amdhsa_group_segment_fixed_size"), 0);
         assert_eq!(field(".amdhsa_private_segment_fixed_size"), 0);
-        assert!(field(".amdhsa_next_free_vgpr") <= 240, "{symbol}: VGPR budget");
+        assert!(
+            field(".amdhsa_next_free_vgpr") <= 240,
+            "{symbol}: VGPR budget"
+        );
         assert_eq!(field(".amdhsa_wavefront_size32"), 1);
         assert_eq!(field(".amdhsa_system_sgpr_workgroup_id_z"), 1);
-        assert!(t.contains(".workgroup_size_hint")
-            || t.contains(&format!(".max_flat_workgroup_size: {}", fa_qresident::BLOCK)),
-            "{symbol}: workgroup size");
+        assert!(
+            t.contains(".workgroup_size_hint")
+                || t.contains(&format!(
+                    ".max_flat_workgroup_size: {}",
+                    fa_qresident::BLOCK
+                )),
+            "{symbol}: workgroup size"
+        );
         // Pointer kernargs and the five by-value scalars at the hipcc twin's offsets.
         for (name, off, size) in [
             ("q_codes", 0u32, 8u32),
@@ -141,7 +155,8 @@ fn descriptor_kernarg_and_resources_match_the_hipcc_twin() {
             ("scale_attn", 64, 4),
         ] {
             assert!(
-                t.contains(&format!(".name: {name}\n")) || t.contains(&format!(".name:       {name}\n")),
+                t.contains(&format!(".name: {name}\n"))
+                    || t.contains(&format!(".name:       {name}\n")),
                 "{symbol}: kernarg {name}@{off}+{size}"
             );
         }
@@ -155,7 +170,9 @@ fn descriptor_kernarg_and_resources_match_the_hipcc_twin() {
 
 #[test]
 fn text_census_counts_the_arithmetic_of_one_sub() {
-    let t = &fa_qresident::emit(ARCH, &FaQresSpec::A3B, false).unwrap().s_text;
+    let t = &fa_qresident::emit(ARCH, &FaQresSpec::A3B, false)
+        .unwrap()
+        .s_text;
     let n = |m: &str| {
         t.lines()
             .filter(|l| l.trim().split_whitespace().next() == Some(m))
@@ -232,7 +249,10 @@ fn committed_contracts_and_m7_receipts_equal_fresh_ones() {
         ("range", fa_qresident::SYMBOL_RANGE, &entries[1]),
     ] {
         let fresh = fa_qresident::contract(ARCH, e, symbol);
-        let file = format!("{}/fa_qresident_a3b_pm.gfx1201.{name}.contract.json", kernels_dir());
+        let file = format!(
+            "{}/fa_qresident_a3b_pm.gfx1201.{name}.contract.json",
+            kernels_dir()
+        );
         let committed: Value =
             serde_json::from_slice(&std::fs::read(&file).unwrap_or_else(|e| panic!("{file}: {e}")))
                 .unwrap();

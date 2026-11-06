@@ -26847,7 +26847,10 @@ mod tests {
             a3b_qresident_launch_symbol(A3bQresRoute::Pm, A3B_QRESIDENT_HIPCC_RANGE),
             Some(pm::SYMBOL_RANGE)
         );
-        assert_eq!(a3b_qresident_launch_symbol(A3bQresRoute::Pm, "unknown"), None);
+        assert_eq!(
+            a3b_qresident_launch_symbol(A3bQresRoute::Pm, "unknown"),
+            None
+        );
     }
 
     #[test]
