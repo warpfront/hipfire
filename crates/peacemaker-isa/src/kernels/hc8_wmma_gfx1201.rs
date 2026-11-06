@@ -625,7 +625,7 @@ fn prologue(b: &mut Builder, g: &Geo, end: &str) -> R {
         b,
         format!("v_mul_lo_u32 v{XOFF}, s{KB}, v{VT}"),
         &[v(XOFF)],
-        &[v(VT)],
+        &[v(VT), s(KB)],
     )?;
     op(
         b,
@@ -652,7 +652,7 @@ fn prologue(b: &mut Builder, g: &Geo, end: &str) -> R {
                 b,
                 format!("v_add_nc_u32_e32 v{}, s{TMP2}, v{XOFF}", XOFF + c as u8),
                 &[v(XOFF + c as u8)],
-                &[v(XOFF)],
+                &[v(XOFF), s(TMP2)],
             )?;
         }
     }
@@ -662,7 +662,7 @@ fn prologue(b: &mut Builder, g: &Geo, end: &str) -> R {
         b,
         format!("v_mul_lo_u32 v{YA}, s{TMP}, v{VT}"),
         &[v(YA)],
-        &[v(VT)],
+        &[v(VT), s(TMP)],
     )?;
     sop(b, format!("s_lshl_b32 s{TMP2}, s{MT}, 6"), &[TMP2], &[MT])?;
     // h*32 (same offset indexes the scale vector `s`).
@@ -682,13 +682,13 @@ fn prologue(b: &mut Builder, g: &Geo, end: &str) -> R {
         b,
         format!("v_add_nc_u32_e32 v{YA}, s{TMP2}, v{YA}"),
         &[v(YA)],
-        &[v(YA)],
+        &[v(YA), s(TMP2)],
     )?;
     op(
         b,
         format!("v_add_nc_u32_e32 v{SO}, s{TMP2}, v{VT2}"),
         &[v(SO)],
-        &[v(VT2)],
+        &[v(VT2), s(TMP2)],
     )?;
     for c in 1..nt {
         sop(
@@ -705,7 +705,7 @@ fn prologue(b: &mut Builder, g: &Geo, end: &str) -> R {
                 YN + c as u8
             ),
             &[v(YA + c as u8)],
-            &[v(YA)],
+            &[v(YA), s(YN + c as u8)],
         )?;
     }
     Ok(())
@@ -924,7 +924,7 @@ fn epilogue(b: &mut Builder, g: &Geo, l: &Lay, slot: Option<usize>, end: &str) -
         b,
         format!("v_add_nc_u32_e32 v{LB}, s{TMP}, v{LB}"),
         &[v(LB)],
-        &[v(LB)],
+        &[v(LB), s(TMP)],
     )?;
     op(
         b,
@@ -942,7 +942,7 @@ fn epilogue(b: &mut Builder, g: &Geo, l: &Lay, slot: Option<usize>, end: &str) -
         b,
         format!("v_add_nc_u32_e32 v{LR}, s{TMP}, v{LR}"),
         &[v(LR)],
-        &[v(LR)],
+        &[v(LR), s(TMP)],
     )?;
     for j in 0..nr {
         let a = ACC + j as u8;
