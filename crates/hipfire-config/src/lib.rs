@@ -6477,17 +6477,17 @@ fn insert_toml_path(
     insert_toml_path(nested, tail, value)
 }
 
-/// Process-wide sequence for [`atomic_write`] staging names: every writer in a
-/// process shares the pid, so the pid alone cannot keep two threads apart.
+/// Process-wide sequence for [`stage_file`] names: every writer in a process
+/// shares the pid, so the pid alone cannot keep two threads apart.
 static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Replace `path` with `bytes`: stage in a sibling file, then rename over it.
-/// The staging file is private to this call (`<stem>.tmp.<pid>.<seq>`, created
-/// `O_EXCL` so a stale leftover of a reused pid is skipped, not truncated), so
-/// concurrent writers of one file, whether threads of this process or other
-/// processes, never share a staging file: the last rename wins and every
-/// reader sees one whole payload.
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+/// Write `bytes` to a staging file beside `path` and return its path; the
+/// caller then [`publish_staged`]s it (or removes it). The file is private to
+/// this call (`<stem>.tmp.<pid>.<seq>`, created `O_EXCL` so a stale leftover of
+/// a reused pid is skipped, not truncated), so concurrent writers of one file,
+/// whether threads of this process or other processes, never share a staging
+/// file. A failed write removes its own staging file.
+pub(crate) fn stage_file(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
     use std::io::Write as _;
 
     if let Some(parent) = path.parent() {
@@ -6514,14 +6514,25 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&tmp);
         return Err(ConfigError::Write { path: tmp, source });
     }
-    drop(staged);
-    fs::rename(&tmp, path).map_err(|source| {
-        let _ = fs::remove_file(&tmp);
+    Ok(tmp)
+}
+
+/// Rename a [`stage_file`] staging file over `path`; a failed rename removes
+/// the staging file.
+pub(crate) fn publish_staged(tmp: &Path, path: &Path) -> Result<()> {
+    fs::rename(tmp, path).map_err(|source| {
+        let _ = fs::remove_file(tmp);
         ConfigError::Write {
             path: path.to_owned(),
             source,
         }
     })
+}
+
+/// Replace `path` with `bytes`: stage in a sibling file, then rename over it.
+/// The last rename wins and every reader sees one whole payload.
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    publish_staged(&stage_file(path, bytes)?, path)
 }
 
 fn read_string(path: &Path) -> Result<String> {
