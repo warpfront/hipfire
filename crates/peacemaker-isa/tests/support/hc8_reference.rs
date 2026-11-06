@@ -171,7 +171,7 @@ fn ref_spec(symbol: &str, variant: &str, kernargs: KernargLayout) -> KernelSpec 
         kernargs,
         user_sgpr_count: 2,
         system_sgpr_workgroup_id_y: true,
-        workgroup_size: REFERENCE_BLOCK,
+        workgroup_size: REFERENCE_BLOCK as u16,
         group_segment_fixed_size: 0,
         wave32: true,
         cu_mode: false,
