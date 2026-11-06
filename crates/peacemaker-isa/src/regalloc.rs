@@ -56,14 +56,24 @@ pub enum StreamItem {
     Label(String),
 }
 
+/// One step of a recorded VALU window schedule (local indices of the window's submissions).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// One instruction.
+    One(usize),
+    /// A VOPD packet of two instructions.
+    Pair(usize, usize),
+    /// One merged wait for the strongest requirement of these (ready) instructions, before any of them issues.
+    Wait(Vec<usize>),
+}
+
 /// What pass 1 records: the program in final order (after the VALU window scheduler), the hash of every
-/// submitted instruction's text (by submission id) and the scheduler's decision per window (local indices of
-/// the window's submissions, in issue order; a pair is one VOPD packet).
+/// submitted instruction's text (by submission id) and the scheduler's decision per window (in issue order).
 #[derive(Clone, Debug, Default)]
 pub struct Recording {
     pub stream: Vec<StreamItem>,
     pub hashes: Vec<u64>,
-    pub windows: Vec<Vec<(usize, Option<usize>)>>,
+    pub windows: Vec<Vec<Step>>,
 }
 
 /// What an emitter's build function does with the VGPR map.
@@ -104,7 +114,7 @@ struct Inner {
     /// Per submitted instruction: `(hash of its original text, [(old unit, new unit)] sorted by old unit)`.
     per_insn: Vec<(u64, Box<[(u8, u8)]>)>,
     /// The VALU window schedules of pass 1, replayed by pass 2.
-    windows: Vec<Vec<(usize, Option<usize>)>>,
+    windows: Vec<Vec<Step>>,
 }
 /// The renaming of one kernel, keyed by submission id (the n-th `Builder::emit` call), not by final pc.
 #[derive(Clone, Debug)]
@@ -213,12 +223,19 @@ impl VgprMap {
         self.inner.windows.len()
     }
     /// The schedule of the `n`-th non-empty VALU window, which must hold `len` instructions.
-    pub(crate) fn window(&self, n: usize, len: usize) -> Result<&[(usize, Option<usize>)], String> {
+    pub(crate) fn window(&self, n: usize, len: usize) -> Result<&[Step], String> {
         let w =
             self.inner.windows.get(n).ok_or_else(|| {
                 format!("vgpr map: VALU window {n} is past the recorded schedule")
             })?;
-        let held: usize = w.iter().map(|(_, b)| 1 + usize::from(b.is_some())).sum();
+        let held: usize = w
+            .iter()
+            .map(|s| match s {
+                Step::One(_) => 1,
+                Step::Pair(..) => 2,
+                Step::Wait(_) => 0,
+            })
+            .sum();
         if held != len {
             return Err(format!("vgpr map: VALU window {n} holds {len} instructions, the recorded schedule {held} (emission is not deterministic)"));
         }

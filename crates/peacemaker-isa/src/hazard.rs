@@ -242,6 +242,10 @@ impl DelayAlu {
     const TRANS: [&'static str; 7] = [
         "v_rcp_", "v_sqrt_", "v_rsq_", "v_sin_", "v_cos_", "v_exp_", "v_log_",
     ];
+    /// Destinations of the last (up to four) VALU instructions, newest first.
+    pub fn recent_defs(&self) -> Vec<Vec<RegRef>> {
+        self.recent.iter().rev().map(|(d, _)| d.clone()).collect()
+    }
     /// A branch target may be reached from another stream: forget producers.
     pub fn label(&mut self) {
         self.recent.clear()

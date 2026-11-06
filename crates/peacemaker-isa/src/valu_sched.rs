@@ -28,9 +28,15 @@ use crate::insn::Instruction;
 use crate::reg::Kind;
 use crate::vopd::{Operand, VopdF32, VopdOp};
 
-/// Issue slots between a VALU producer and a consumer that issues without a
-/// dependency stall (the `s_delay_alu` VALU_DEP window is 4).
-pub(crate) const VALU_LATENCY: usize = 4;
+/// Issue slots between a VALU producer and a consumer that issues without a dependency stall. The builder hints
+/// (`s_delay_alu`) every VALU read of a result written by one of the previous four VALU instructions, so five
+/// slots separate a consumer that needs none. Measured on WideNet F01 (4..8): 5 gives the fewest hints, 6..8 the
+/// same, 4 about one more per hundred.
+pub(crate) const VALU_LATENCY: usize = 5;
+
+/// Pressure mode: once more than this many VGPR units are live in a window (counted from its own defs and last
+/// reads), ties between equally stalled nodes go to the one that ends the most live ranges. Inert below it.
+pub(crate) const PRESSURE_BUDGET: usize = 48;
 
 /// A plain VALU instruction the window may reorder.
 pub(crate) fn schedulable(insn: &Instruction) -> bool {
@@ -59,7 +65,12 @@ pub(crate) fn schedulable(insn: &Instruction) -> bool {
         "fi:",
         "sdwa",
     ];
-    if TEXT.iter().any(|t| insn.text.contains(t)) {
+    // `v_fma_mix_f32` names its source halves with `op_sel`/`op_sel_hi` but always writes the full 32-bit register.
+    let mix = m.starts_with("v_fma_mix_f32");
+    if TEXT
+        .iter()
+        .any(|t| insn.text.contains(t) && !(mix && t.starts_with("op_sel")))
+    {
         return false;
     }
     const MNEMONIC: [&str; 22] = [
@@ -170,17 +181,25 @@ pub(crate) struct Dag {
     preds: Vec<Vec<usize>>,
     /// Longest latency-weighted path from the node to a sink.
     pub(crate) height: Vec<usize>,
+    latency: usize,
+    /// Per node, the issue slots `-k` (the k-th newest VALU instruction before the window) whose results it reads.
+    pre: Vec<Vec<usize>>,
 }
 impl Dag {
-    pub(crate) fn new(insns: Vec<Instruction>) -> Self {
+    /// `before`: the destinations of the VALU instructions issued before the window, newest first.
+    pub(crate) fn new(
+        insns: Vec<Instruction>,
+        latency: usize,
+        before: &[Vec<crate::reg::RegRef>],
+    ) -> Self {
         let n = insns.len();
         let (mut raw, mut preds) = (vec![vec![]; n], vec![vec![]; n]);
+        let hit = |a: &[crate::reg::RegRef], b: &[crate::reg::RegRef]| {
+            a.iter().any(|x| b.iter().any(|y| x.overlaps(*y)))
+        };
         for j in 0..n {
             for i in 0..j {
                 let (p, c) = (&insns[i], &insns[j]);
-                let hit = |a: &[crate::reg::RegRef], b: &[crate::reg::RegRef]| {
-                    a.iter().any(|x| b.iter().any(|y| x.overlaps(*y)))
-                };
                 let r = hit(&p.defs, &c.uses);
                 if r || hit(&p.defs, &c.defs) || hit(&p.uses, &c.defs) {
                     preds[j].push(i);
@@ -190,12 +209,21 @@ impl Dag {
                 }
             }
         }
+        let pre: Vec<Vec<usize>> = insns
+            .iter()
+            .map(|c| {
+                (0..before.len())
+                    .filter(|&k| hit(&before[k], &c.uses))
+                    .map(|k| k + 1)
+                    .collect::<Vec<usize>>()
+            })
+            .collect();
         let mut height = vec![0usize; n];
         for i in (0..n).rev() {
             let mut h = 1;
             for j in i + 1..n {
                 if raw[j].contains(&i) {
-                    h = h.max(height[j] + VALU_LATENCY)
+                    h = h.max(height[j] + latency)
                 } else if preds[j].contains(&i) {
                     h = h.max(height[j] + 1)
                 }
@@ -207,6 +235,8 @@ impl Dag {
             raw,
             preds,
             height,
+            latency,
+            pre,
         }
     }
     pub(crate) fn len(&self) -> usize {
@@ -217,12 +247,111 @@ impl Dag {
     }
     /// Issue slots this node would stall at slot `now`.
     pub(crate) fn stall(&self, issued: &[Option<usize>], i: usize, now: usize) -> usize {
-        self.raw[i]
+        let inside = self.raw[i]
             .iter()
             .filter_map(|p| issued[*p])
-            .map(|t| (t + VALU_LATENCY).saturating_sub(now))
-            .max()
-            .unwrap_or(0)
+            .map(|t| (t + self.latency).saturating_sub(now));
+        // a producer issued k slots before the window sits at slot -k
+        let outside = self.pre[i]
+            .iter()
+            .map(|k| self.latency.saturating_sub(now + k));
+        inside.chain(outside).max().unwrap_or(0)
+    }
+}
+
+/// Live VGPR units of one window, tracked from the window's own defs and last uses (the Builder has not seen what
+/// follows the window): a unit read before it is defined here is live on entry, a unit defined here and never
+/// read again stays live on exit, and a value dies at its last in-window read only if the window defines the
+/// unit (a temporary, or overwritten later); anything else may still be read after the window.
+pub(crate) struct Pressure {
+    uses: Vec<Vec<u8>>,
+    defs: Vec<Vec<u8>>,
+    /// Remaining in-window readers / writers per unit.
+    readers: Vec<u16>,
+    writers: Vec<u16>,
+    local: Vec<bool>,
+    live: Vec<bool>,
+    count: usize,
+}
+impl Pressure {
+    fn units(regs: &[crate::reg::RegRef]) -> Vec<u8> {
+        let mut out = vec![];
+        for r in regs.iter().filter(|r| r.kind == Kind::V) {
+            for u in u16::from(r.base)..u16::from(r.base) + u16::from(r.len) {
+                if !out.contains(&(u as u8)) {
+                    out.push(u as u8)
+                }
+            }
+        }
+        out
+    }
+    pub(crate) fn new(insns: &[Instruction]) -> Self {
+        let uses: Vec<Vec<u8>> = insns.iter().map(|i| Self::units(&i.uses)).collect();
+        let defs: Vec<Vec<u8>> = insns.iter().map(|i| Self::units(&i.defs)).collect();
+        let (mut readers, mut writers) = (vec![0u16; 256], vec![0u16; 256]);
+        let (mut live, mut local) = (vec![false; 256], vec![false; 256]);
+        for k in 0..insns.len() {
+            for &u in &uses[k] {
+                readers[u as usize] += 1;
+                if !local[u as usize] {
+                    live[u as usize] = true;
+                }
+            }
+            for &u in &defs[k] {
+                writers[u as usize] += 1;
+                local[u as usize] = true;
+            }
+        }
+        let count = live.iter().filter(|l| **l).count();
+        Self {
+            uses,
+            defs,
+            readers,
+            writers,
+            local,
+            live,
+            count,
+        }
+    }
+    pub(crate) fn live(&self) -> usize {
+        self.count
+    }
+    fn ends(&self, i: usize, u: u8) -> bool {
+        self.readers[u as usize] == 1
+            && !self.defs[i].contains(&u)
+            && (self.writers[u as usize] > 0 || self.local[u as usize])
+    }
+    /// Change of the live count if node `i` issues now: units it starts minus units whose value ends with it.
+    pub(crate) fn delta(&self, i: usize) -> isize {
+        let started = self.defs[i]
+            .iter()
+            .filter(|u| !self.live[**u as usize])
+            .count() as isize;
+        let ended = self.uses[i].iter().filter(|u| self.ends(i, **u)).count() as isize;
+        started - ended
+    }
+    pub(crate) fn issue(&mut self, i: usize) {
+        let ended: Vec<u8> = self.uses[i]
+            .iter()
+            .copied()
+            .filter(|u| self.ends(i, *u))
+            .collect();
+        for &u in &self.uses[i] {
+            self.readers[u as usize] -= 1;
+        }
+        for &u in &self.defs[i] {
+            self.writers[u as usize] -= 1;
+            if !self.live[u as usize] {
+                self.live[u as usize] = true;
+                self.count += 1;
+            }
+        }
+        for u in ended {
+            if self.live[u as usize] {
+                self.live[u as usize] = false;
+                self.count -= 1;
+            }
+        }
     }
 }
 
@@ -274,10 +403,52 @@ mod tests {
         let half = Instruction::new("v_add_f16_e32 v1, v2, v3", vec![v(1)], vec![v(2), v(3)]);
         assert!(!schedulable(&half));
         assert!(schedulable(&fmac(1, 2, 3)));
+        // v_fma_mix_f32 names source halves with op_sel_hi but writes a whole register
+        let mix = Instruction::new(
+            "v_fma_mix_f32 v1, v2, v3, v4 op_sel_hi:[1,0,0]",
+            vec![v(1)],
+            vec![v(2), v(3), v(4)],
+        );
+        assert!(schedulable(&mix));
+        let sel = Instruction::new(
+            "v_add_f32_e64 v1, v2, v3 op_sel:[1,0]",
+            vec![v(1)],
+            vec![v(2), v(3)],
+        );
+        assert!(!schedulable(&sel));
+    }
+    #[test]
+    fn producers_before_the_window_stall_its_first_slots() {
+        // v8 was written by the newest VALU instruction before the window (slot -1).
+        let d = Dag::new(vec![fmac(9, 8, 4), fmac(10, 1, 5)], 5, &[vec![v(8)]]);
+        let issued = vec![None; 2];
+        assert_eq!(d.stall(&issued, 0, 0), 4);
+        assert_eq!(d.stall(&issued, 0, 3), 1);
+        assert_eq!(d.stall(&issued, 0, 4), 0);
+        assert_eq!(d.stall(&issued, 1, 0), 0);
+        // an older producer (slot -3) stalls two slots less
+        let d = Dag::new(vec![fmac(9, 8, 4)], 5, &[vec![], vec![], vec![v(8)]]);
+        assert_eq!(d.stall(&[None], 0, 0), 2);
+    }
+    #[test]
+    fn pressure_ends_window_local_values_at_their_last_read() {
+        let mul = Instruction::new("v_mul_f32_e32 v9, v1, v2", vec![v(9)], vec![v(1), v(2)]);
+        let add = Instruction::new("v_add_f32_e32 v8, v8, v9", vec![v(8)], vec![v(8), v(9)]);
+        let mut p = Pressure::new(&[mul, add]);
+        // v1, v2 and v8 are read before the window writes them: live on entry
+        assert_eq!(p.live(), 3);
+        // the product starts a range; v1/v2 may still be read after the window
+        assert_eq!(p.delta(0), 1);
+        p.issue(0);
+        assert_eq!(p.live(), 4);
+        // the accumulate ends the product (a window-local value) and redefines v8 in place
+        assert_eq!(p.delta(1), -1);
+        p.issue(1);
+        assert_eq!(p.live(), 3);
     }
     #[test]
     fn dag_orders_only_dependent_pairs() {
-        let d = Dag::new(vec![fmac(8, 0, 4), fmac(8, 1, 5), fmac(9, 2, 6)]);
+        let d = Dag::new(vec![fmac(8, 0, 4), fmac(8, 1, 5), fmac(9, 2, 6)], 4, &[]);
         let issued = vec![None; 3];
         assert!(d.ready(&issued, 0) && !d.ready(&issued, 1) && d.ready(&issued, 2));
         assert!(d.height[0] > d.height[2]);

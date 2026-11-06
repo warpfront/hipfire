@@ -341,31 +341,43 @@ impl Builder {
         let start = self.vgpr_win_start;
         if let Some(map) = self.vgpr_map.clone() {
             // Pass 2 of `compact_vgprs`: replay the schedule pass 1 chose (the renaming was proven on that order).
-            let units = map.window(self.vgpr_cursor, pending.len())?;
+            let steps = map.window(self.vgpr_cursor, pending.len())?;
             self.vgpr_cursor += 1;
-            for &(a, b) in units {
-                match b {
-                    None => self.emit_now(pending[a].clone(), [start + a, usize::MAX])?,
-                    Some(b) => {
-                        let packet =
-                            valu_sched::pair(arch, &pending[a], &pending[b]).ok_or_else(|| {
+            for step in steps {
+                match step {
+                    regalloc::Step::One(a) => {
+                        self.emit_now(pending[*a].clone(), [start + a, usize::MAX])?
+                    }
+                    regalloc::Step::Pair(a, b) => {
+                        let packet = valu_sched::pair(arch, &pending[*a], &pending[*b])
+                            .ok_or_else(|| {
                                 format!(
                                     "vgpr map: `{}` and `{}` no longer form a VOPD packet",
-                                    pending[a].text, pending[b].text
+                                    pending[*a].text, pending[*b].text
                                 )
                             })?;
                         self.emit_now(packet, [start + a, start + b])?
+                    }
+                    regalloc::Step::Wait(set) => {
+                        let required = self.merged_wait(set.iter().map(|k| &pending[*k]));
+                        self.emit_required(required)?
                     }
                 }
             }
             return Ok(());
         }
-        let dag = valu_sched::Dag::new(pending);
+        // The last VALU instructions before the window still stall its first slots.
+        let before = self
+            .delay_alu
+            .as_ref()
+            .map_or(vec![], DelayAlu::recent_defs);
+        let dag = valu_sched::Dag::new(pending, valu_sched::VALU_LATENCY, &before);
         let n = dag.len();
+        let mut press = valu_sched::Pressure::new(&dag.insns);
         let mut issued: Vec<Option<usize>> = vec![None; n];
         let mut done = 0;
         let mut now = 0;
-        let mut window: Vec<(usize, Option<usize>)> = vec![];
+        let mut window: Vec<regalloc::Step> = vec![];
         // A wait the ledger would need before the instruction: none sorts first,
         // then the weakest (largest remaining count).
         let wait_key = |b: &Builder, i: &Instruction| -> usize {
@@ -377,10 +389,20 @@ impl Builder {
         };
         while done < n {
             let ready: Vec<usize> = (0..n).filter(|i| dag.ready(&issued, *i)).collect();
+            if ready.iter().all(|i| wait_key(self, &dag.insns[*i]) > 0) {
+                // Every ready instruction waits on memory: one wait for the strongest requirement among
+                // them instead of the weakest-first chain the issue order would emit.
+                let required = self.merged_wait(ready.iter().map(|i| &dag.insns[*i]));
+                self.emit_required(required)?;
+                window.push(regalloc::Step::Wait(ready.clone()));
+            }
+            // Over the pressure budget, ties on (wait, stall) go to the node that ends the most live ranges.
+            let over = press.live() > valu_sched::PRESSURE_BUDGET;
             let key = |i: usize| {
                 (
                     wait_key(self, &dag.insns[i]),
                     dag.stall(&issued, i, now),
+                    if over { press.delta(i) } else { 0 },
                     usize::MAX - dag.height[i],
                     i,
                 )
@@ -397,15 +419,17 @@ impl Builder {
                 .min_by_key(|(b, _)| key(*b));
             issued[a] = Some(now);
             done += 1;
+            press.issue(a);
             match partner {
                 Some((b, packet)) => {
                     issued[b] = Some(now);
                     done += 1;
-                    window.push((a, Some(b)));
+                    press.issue(b);
+                    window.push(regalloc::Step::Pair(a, b));
                     self.emit_now(packet, [start + a, start + b])?
                 }
                 None => {
-                    window.push((a, None));
+                    window.push(regalloc::Step::One(a));
                     self.emit_now(dag.insns[a].clone(), [start + a, usize::MAX])?
                 }
             }
@@ -415,6 +439,23 @@ impl Builder {
             rec.windows.push(window);
         }
         Ok(())
+    }
+    /// The strongest wait (smallest remaining count per counter) any of `insns` needs now.
+    fn merged_wait<'a>(
+        &self,
+        insns: impl IntoIterator<Item = &'a Instruction>,
+    ) -> Vec<(Counter, u8, Reason)> {
+        let mut merged: Vec<(Counter, u8, Reason)> = vec![];
+        for insn in insns {
+            for (counter, count, reason) in self.ledger.required(insn) {
+                match merged.iter_mut().find(|m| m.0 == counter) {
+                    Some(m) if count < m.1 => *m = (counter, count, reason),
+                    Some(_) => {}
+                    None => merged.push((counter, count, reason)),
+                }
+            }
+        }
+        merged
     }
     fn assert_flushed(&self) {
         assert!(

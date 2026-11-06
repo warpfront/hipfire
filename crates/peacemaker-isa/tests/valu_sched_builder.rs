@@ -4,8 +4,9 @@
 
 //! Builder-level checks of the gfx12 VALU window scheduler and its `s_delay_alu` hints.
 
-use peacemaker_isa::insn::Instruction;
-use peacemaker_isa::reg::Live;
+use peacemaker_isa::insn::{Instruction, MemoryClass};
+use peacemaker_isa::reg::{Kind, Live, RegRef};
+use peacemaker_isa::regalloc::{compact_vgprs, declare_vgprs, Pass};
 use peacemaker_isa::{Arch, Builder, KernargLayout, KernelSpec, RegPlan};
 
 const NAMES: [&str; 8] = ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7"];
@@ -65,4 +66,76 @@ fn delay_hint_does_not_merge_across_a_branch() {
     let hints: Vec<&String> = t.iter().filter(|x| x.starts_with("s_delay_alu")).collect();
     assert_eq!(hints.len(), 2, "{t:?}");
     assert!(hints.iter().all(|h| !h.contains("instskip")), "{t:?}");
+}
+
+fn v(base: u8) -> RegRef {
+    RegRef {
+        kind: Kind::V,
+        base,
+        len: 1,
+    }
+}
+
+fn kernel_plan(pass: Pass) -> RegPlan {
+    let mut regs = RegPlan::new(pass.vgprs().unwrap_or(16), 8).unwrap();
+    match pass.vgprs() {
+        None => {
+            for b in 0..16u8 {
+                regs.add_range(&format!("v{b}"), Kind::V, b, 1, Live::Whole)
+                    .unwrap();
+            }
+        }
+        Some(n) => declare_vgprs(&mut regs, n).unwrap(),
+    }
+    regs.add_range("srd", Kind::S, 0, 2, Live::Whole).unwrap();
+    regs
+}
+
+/// The window scheduler pays one wait for the strongest requirement of the ready instructions, not the
+/// weakest-first chain (four loads issued in order, four readers), and pass 2 of the VGPR compaction replays it.
+#[test]
+fn ready_instructions_share_one_memory_wait() {
+    let build = |pass: Pass| {
+        let mut b = Builder::new(spec(), kernel_plan(pass));
+        b.vgpr_pass(pass);
+        b.enable_valu_schedule().unwrap();
+        for k in 0..4u8 {
+            b.push(
+                Instruction::new(
+                    format!("global_load_b32 v{}, v1, s[0:1]", 4 + k),
+                    vec![v(4 + k)],
+                    vec![
+                        v(1),
+                        RegRef {
+                            kind: Kind::S,
+                            base: 0,
+                            len: 2,
+                        },
+                    ],
+                )
+                .memory(MemoryClass::VmemLoad),
+            )
+            .unwrap();
+        }
+        for k in 0..4u8 {
+            b.push(Instruction::new(
+                format!("v_add_f32_e32 v{}, v{}, v{}", 8 + k, 4 + k, 4 + k),
+                vec![v(8 + k)],
+                vec![v(4 + k), v(4 + k)],
+            ))
+            .unwrap();
+        }
+        b.control(Instruction::new("s_endpgm", vec![], vec![]))
+            .unwrap();
+        b.finish().map(|e| ((), e))
+    };
+    let ((), kernel) = compact_vgprs(build).unwrap();
+    let waits: Vec<&str> = kernel
+        .program
+        .instructions
+        .iter()
+        .map(|i| i.text.as_str())
+        .filter(|t| t.starts_with("s_wait_loadcnt"))
+        .collect();
+    assert_eq!(waits, ["s_wait_loadcnt 0x0"]);
 }
