@@ -4381,6 +4381,7 @@ pub(crate) fn try_run_hetero_prompt(
     lm.shared.set_defer_join(true);
     let outcome = {
         let mut run = HeteroRun {
+            host: [0.0; 7],
             trace: std::env::var("HIPFIRE_HETERO_PREFILL_TRACE").is_ok_and(|v| v == "1").then(HeteroTrace::default),
             forward: &mut *forward,
             bundle: &mut *bundle,
@@ -4424,7 +4425,14 @@ struct HeteroTrace {
     ops: Vec<(&'static str, hip_bridge::Event, hip_bridge::Event)>,
 }
 
+/// `HIPFIRE_HETERO_HOST_TRACE=1`: host wall time per phase of `pre`
+/// (frame, steps, validate, execute, snapshot) and `post`, per window.
+static HOST_TRACE: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("HIPFIRE_HETERO_HOST_TRACE").is_ok_and(|v| v == "1"));
+
 struct HeteroRun<'a, 'o> {
+    /// Host phase sums: frame, steps, validate, execute, snapshot, post, calls.
+    host: [f64; 7],
     trace: Option<HeteroTrace>,
     forward: &'a mut Qwen4GpuForward,
     bundle: &'a mut Qwen4Bundle,
@@ -4492,8 +4500,24 @@ impl HeteroRun<'_, '_> {
         }
         let first = geo.band.start;
         let wall = std::time::Instant::now();
+        self.host = [0.0; 7];
         let result = self.walk(w, txn, first);
         self.report_trace(w, wall)?;
+        if *HOST_TRACE {
+            let h = self.host;
+            let calls = h[6].max(1.0);
+            eprintln!(
+                "hetero host trace: {} rows in {:.1} ms wall; per tile-layer pre: frame {:.0} us, steps {:.0} us, validate {:.0} us, execute {:.0} us, snapshot {:.0} us; post {:.0} us",
+                w.window.rows,
+                wall.elapsed().as_secs_f64() * 1e3,
+                h[0] / calls,
+                h[1] / calls,
+                h[2] / calls,
+                h[3] / calls,
+                h[4] / calls,
+                h[5] / calls
+            );
+        }
         result
     }
 
@@ -4684,6 +4708,8 @@ impl HeteroRun<'_, '_> {
         let trace = self.trace.is_some();
         let mut split_marks: Option<(hip_bridge::Event, hip_bridge::Event, hip_bridge::Event)> = None;
         let mut op_marks: Vec<(&'static str, hip_bridge::Event, hip_bridge::Event)> = Vec::new();
+        let t_frame = std::time::Instant::now();
+        let mut ph = [0f64; 5];
         let out = with_tile_frame(
             &*self.forward,
             &*self.bundle,
@@ -4693,6 +4719,8 @@ impl HeteroRun<'_, '_> {
             tile,
             layer,
             |gpu, frame| {
+                ph[0] = t_frame.elapsed().as_secs_f64() * 1e6;
+                let t = std::time::Instant::now();
                 let env = frame.env;
                 let mut steps: Vec<Step<'_>> = Vec::with_capacity(8);
                 if geo.ple_layer == Some(layer) {
@@ -4705,7 +4733,11 @@ impl HeteroRun<'_, '_> {
                     Qwen4FfnBinding::Moe(moe) => env.moe_steps(&mut steps, frame.ctx, *moe, frame.scratch_desc)?,
                     Qwen4FfnBinding::Dense(dense) => steps.push(env.dense_step(dense)),
                 }
+                ph[1] = t.elapsed().as_secs_f64() * 1e6;
+                let t = std::time::Instant::now();
                 validate_steps(&*gpu, &steps).map_err(dsp_err("preflight"))?;
+                ph[2] = t.elapsed().as_secs_f64() * 1e6;
+                let t = std::time::Instant::now();
                 let mut qsa = None;
                 for step in &steps {
                     if let Step::IndexedAttention(op) = step {
@@ -4730,15 +4762,22 @@ impl HeteroRun<'_, '_> {
                 } else {
                     execute_validated_steps(gpu, frame.ctx, &steps).map_err(dsp_err("layer program"))?;
                 }
+                ph[3] = t.elapsed().as_secs_f64() * 1e6;
+                let t = std::time::Instant::now();
                 // Hold the tile's MoE/FFN result until its join: the next
                 // tile's layer rewrites the shared FFN output.
                 // Stream-ordered and asynchronous: a synchronous copy would make
                 // the host wait for the device to drain before enqueueing the
                 // next tile's layer, idling the device in between.
                 gpu.copy_f32_buffer(ffn, &env.scratch.ffn_output, n * geo.hidden)?;
+                ph[4] = t.elapsed().as_secs_f64() * 1e6;
                 Ok(qsa)
             },
         );
+        for (i, v) in ph.iter().enumerate() {
+            self.host[i] += v;
+        }
+        self.host[6] += 1.0;
         if let (Some(t), Some(m)) = (self.trace.as_mut(), split_marks) {
             t.split.push(m);
             t.ops.extend(op_marks);
@@ -4749,6 +4788,13 @@ impl HeteroRun<'_, '_> {
     /// Tile `ti`'s join (the expert device's cold partial into its FFN result)
     /// and closing HC write of `layer`.
     fn post(&mut self, w: &WinCtx<'_>, ti: usize, layer: usize) -> R<()> {
+        let t = std::time::Instant::now();
+        let out = self.post_inner(w, ti, layer);
+        self.host[5] += t.elapsed().as_secs_f64() * 1e6;
+        out
+    }
+
+    fn post_inner(&mut self, w: &WinCtx<'_>, ti: usize, layer: usize) -> R<()> {
         let geo = self.geo;
         let tile = &w.tiles[ti];
         let n = tile.rows;

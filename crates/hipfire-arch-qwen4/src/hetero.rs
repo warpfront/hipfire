@@ -82,7 +82,7 @@ use hipfire_dispatch::hetero_responder::{ColdLayer, HeteroResponder, PrefillServ
 /// The prefill chunk under the split: the mailbox's prefill slot and the expert
 /// device's scratch are sized for it, and the load's prefill chunk is clamped
 /// to it (`gpu_forward::qwen4_prefill_chunk_requested`).
-pub const HETERO_PREFILL_MAX_ROWS: usize = 2048;
+pub const HETERO_PREFILL_MAX_ROWS: usize = 4096;
 
 /// The load's hetero prefill chunk: `HIPFIRE_HETERO_PREFILL_ROWS` (whole
 /// 256-row steps, 512..=8192) or [`HETERO_PREFILL_MAX_ROWS`]. Read once.
@@ -112,11 +112,15 @@ pub(crate) fn layer_major_tile_rows(max_chunk: usize, rows: usize) -> usize {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .map(|r| r / 256 * 256)
         .filter(|&r| r >= 512)
-        // Measured (R9700 + gfx1151, 4 tiles in flight): 2048-row tiles run
-        // 4K/8K at 1,902/1,868 tok/s vs 1,654/1,611 at 1024 rows (the
-        // primary's per-row cost falls with the batch); a prompt below two
-        // full tiles splits into 1024-row tiles (2K: 1,741 vs 1,660 one chunk).
-        .unwrap_or(if rows >= 2 * max_chunk { max_chunk } else { 1024 })
+        // The fewest tiles that fit the chunk, never one (the exchange must
+        // overlap another tile's work), each a whole number of 256-row steps.
+        // Measured (R9700 + gfx1151): bigger tiles cut the primary's per-row
+        // cost (8K: 2 x 4096 2,729 tok/s vs 4 x 2048 2,616; 4K: 2 x 2048
+        // 2,417 vs 4 x 1024 1,654).
+        .unwrap_or_else(|| {
+            let tiles = rows.div_ceil(max_chunk).max(2);
+            rows.div_ceil(tiles).div_ceil(256) * 256
+        })
         .min(max_chunk)
 }
 
@@ -132,7 +136,8 @@ pub(crate) fn layer_major_tiles(slots: usize) -> usize {
 }
 
 /// `hetero_await_cold` poll bound: each poll is a PCIe read (~1-2 us) plus a
-/// short sleep, so this bounds a dead or stalled expert device at ~2 s.
+/// short sleep (`s_sleep(8)`, ~0.2 us), so this bounds a dead or stalled
+/// expert device at ~2 s.
 const AWAIT_MAX_POLLS: u32 = 1_000_000;
 
 /// Load-wide state of the device-side split: the pinned mailbox, the device
@@ -431,4 +436,25 @@ pub(crate) fn layer_major(
     }
     let (_, streams, ffn) = arena.as_ref().expect("allocated above");
     Ok(Some(LayerMajor { shared, streams: view_of(streams), ffn: ffn.iter().map(view_of).collect() }))
+}
+
+/// Primary (gfx1201) device bytes the split adds for a `chunk_rows` prefill
+/// chunk when `topology.hetero_experts` is requested (0 otherwise): every
+/// prefill slot's staging (F16 rows, int4 sidecar snapshot, BF16 partial,
+/// route), the per-layer masked ids, and the layer-major arena (HC streams and
+/// an FFN buffer per tile in flight). Charged in the placement reserve's
+/// `forward` term, so the hot set leaves room for them.
+pub(crate) fn primary_device_bytes(config: &crate::config::Qwen4Config, chunk_rows: usize) -> u64 {
+    if !matches!(requested(), Ok(Some(_))) {
+        return 0;
+    }
+    let rows = chunk_rows.min(hetero_prefill_rows()) as u64;
+    let (hidden, top_k) = (config.hidden_size as u64, config.num_experts_per_tok as u64);
+    let wide = config.hc_count as u64 * hidden;
+    let int4 = hipfire_dispatch::hetero_mailbox::int4_row_bytes(config.hidden_size) as u64;
+    let slot = rows * hidden * 2 * 2 + rows * int4 + rows * top_k * 4 * 2 + 256;
+    let masked = config.num_hidden_layers as u64 * rows * top_k * 4;
+    let tiles = layer_major_tiles(HETERO_PREFILL_SLOTS) as u64;
+    let arena = tiles * rows * (wide + hidden) * 4;
+    HETERO_PREFILL_SLOTS as u64 * slot + masked + arena
 }

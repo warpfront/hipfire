@@ -81,9 +81,15 @@ extern "C" __global__ void hetero_await_cold(
     unsigned max_polls) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
     const unsigned want = hs_seq(counter[0], layer, layers);
+    // Relaxed polling, one acquire on the match: a system-scope acquire per poll
+    // invalidates the device caches every few hundred cycles, which stalls the
+    // other streams' kernels for the whole wait.
     for (unsigned n = 0; n < max_polls; ++n) {
-        if (hs_load(resp_seq) == want) return;
-        __builtin_amdgcn_s_sleep(1);
+        if (__hip_atomic_load(const_cast<unsigned*>(resp_seq), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) == want) {
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            return;
+        }
+        __builtin_amdgcn_s_sleep(8);
     }
     hs_store(error, want);
 }
