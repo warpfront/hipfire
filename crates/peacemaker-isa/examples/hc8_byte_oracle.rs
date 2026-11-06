@@ -8,6 +8,14 @@
 //! BF16 WMMA reference and the compressed n1 singleton for that input row. Every
 //! rows=1..64 and every compatible NT is exercised, including unused capacity.
 //! Reference construction is shared with the CPU oracle, not the kernel generator.
+//!
+//! `--read-up --projected-object OBJECT.co RECEIPT.json [FIXTURE.json ...]`
+//! compares each fused `hc8_read_up_e4m3_n{1..4}` entry bitwise against the
+//! original `hc8_gemm_e4m3_mw4_kw1_nN_set` output fed to the product
+//! `hyper_read_projected_f32` loaded from a pre-compiled code object (the cached
+//! hipcc anchor; nothing is compiled here), plus 64 singleton rows for row
+//! invariance and sentinel dead-store checks. A mismatch is counted into the
+//! receipt, not fatal; the process still exits non-zero.
 
 #[path = "../tests/support/hc8_reference.rs"]
 mod reference;
@@ -611,13 +619,542 @@ fn run(out: &str, fixture_paths: &[String]) -> Result<(), String> {
     println!("PASS: {compared_bytes} bytes, {launches} launches; receipt {out}");
     Ok(())
 }
+/// Words are compared bitwise. Both-NaN differences are tallied separately so a
+/// payload/sign-only divergence is visible but still counts as a mismatch.
+#[derive(Default)]
+struct Tally {
+    comparisons: usize,
+    words: usize,
+    mismatches: usize,
+    nan_both: usize,
+    samples: Vec<serde_json::Value>,
+}
+impl Tally {
+    fn cmp(&mut self, context: &str, got: &[u8], want: &[u8]) {
+        assert_eq!(got.len(), want.len(), "{context}: unequal extents");
+        self.comparisons += 1;
+        for (i, (g, w)) in got
+            .chunks_exact(4)
+            .zip(want.chunks_exact(4))
+            .enumerate()
+        {
+            self.words += 1;
+            if g == w {
+                continue;
+            }
+            let (g, w) = (
+                u32::from_le_bytes(g.try_into().unwrap()),
+                u32::from_le_bytes(w.try_into().unwrap()),
+            );
+            self.mismatches += 1;
+            self.nan_both += (f32::from_bits(g).is_nan() && f32::from_bits(w).is_nan()) as usize;
+            if self.samples.len() < 8 {
+                self.samples.push(json!({"context":context,"word":i,
+                    "got":format!("{g:08x}"),"want":format!("{w:08x}")}));
+            }
+        }
+    }
+    fn json(&self) -> serde_json::Value {
+        json!({"comparisons":self.comparisons,"words":self.words,"mismatches":self.mismatches,
+            "mismatches_both_nan":self.nan_both,"samples":self.samples})
+    }
+}
+
+#[derive(Default)]
+struct Timings(std::collections::BTreeMap<String, (u64, u128)>);
+impl Timings {
+    fn json(&self) -> serde_json::Value {
+        serde_json::Value::Object(
+            self.0
+                .iter()
+                .map(|(k, (n, ns))| {
+                    (
+                        k.clone(),
+                        json!({"launches":n,"host_wall_ns_incl_sync":ns.to_string()}),
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
+/// One launch plus device sync, timed on the host wall clock. This is a
+/// correctness-run diagnostic, not a performance measurement.
+fn launch_timed(
+    card: &Card,
+    timings: &mut Timings,
+    name: &str,
+    f: &Function,
+    grid: [u32; 3],
+    block: u32,
+    blob: &mut [u8],
+) -> Result<(), String> {
+    let start = std::time::Instant::now();
+    // SAFETY: every blob pointer is a live guarded device allocation sized for
+    // the shape the caller built; the ABI byte layout matches each entry.
+    unsafe {
+        card.0
+            .launch_kernel_blob(f, grid, [block, 1, 1], 0, None, blob)
+    }
+    .map_err(|e| format!("{name}: {e}"))?;
+    card.0
+        .device_synchronize()
+        .map_err(|e| format!("{name}: {e}"))?;
+    let e = timings.0.entry(name.to_string()).or_default();
+    e.0 += 1;
+    e.1 += start.elapsed().as_nanos();
+    Ok(())
+}
+
+/// Non-sentinel bytes outside the live extent (guards and dead rows).
+fn dead_bytes(bytes: &[u8], live: usize) -> usize {
+    bytes[..GUARD]
+        .iter()
+        .chain(bytes[GUARD + live..].iter())
+        .filter(|&&b| b != SENT)
+        .count()
+}
+/// Live words still equal to the sentinel. A BF16-rounded output has zero low
+/// 16 bits, so a legitimate result can never equal 0xa5a5a5a5.
+fn unstored_words(bytes: &[u8], live: usize) -> usize {
+    bytes[GUARD..GUARD + live]
+        .chunks_exact(4)
+        .filter(|w| w.iter().all(|&b| b == SENT))
+        .count()
+}
+
+struct ReadUpCase {
+    name: String,
+    hidden: usize,
+    k: usize,
+    w: Vec<u8>,
+    scales: Vec<u8>,
+    low: Vec<u8>,
+    normalized: Vec<u8>,
+    normalized_source: &'static str,
+}
+
+fn bf16_word(v: f32) -> u32 {
+    peacemaker_ir::emu::convert::f32_to_bf16(v.to_bits()) as u32
+}
+/// Seeded BF16-exact normalized [64, 4*hidden]: realistic uniform |x|<=4 with
+/// `kind` selecting sprinkled edges (1) or edges plus NaN/Inf (2).
+fn normalized_data(hidden: usize, kind: usize) -> Vec<u8> {
+    let mut rng = Rng(0x7e5d_0a11_c0de_0003 ^ (hidden as u64) << 20 ^ kind as u64);
+    let edge = [
+        0x0000_0000u32,
+        0x8000_0000,
+        0x0001_0000,
+        0x8001_0000,
+        0x0080_0000,
+        0x7f7f_0000,
+        0xff7f_0000,
+        0x3f80_0000,
+        0xbf80_0000,
+        0x4080_0000,
+        0xc080_0000,
+    ];
+    let special = [0x7f80_0000u32, 0xff80_0000, 0x7fc1_0000, 0xffa1_0000];
+    (0..64 * 4 * hidden)
+        .flat_map(|i| {
+            let bits = if kind >= 1 && i % 16 == 5 {
+                edge[(i / 16) % edge.len()]
+            } else if kind == 2 && i % 37 == 11 {
+                special[(i / 37) % special.len()]
+            } else {
+                let u = rng.next() as f64 / (1u64 << 16) as f64 / 65536.0;
+                bf16_word((u * 8.0 - 4.0) as f32) << 16
+            };
+            bits.to_le_bytes()
+        })
+        .collect()
+}
+
+fn read_up_cases(fixtures: &[Input]) -> Vec<ReadUpCase> {
+    let mut cases = Vec::new();
+    for (hidden, k) in [(16usize, 32usize), (32, 96), (80, 320)] {
+        for kind in 0..4 {
+            let (w, mut scales, low) = data(Fmt::E4M3, 4 * hidden, k, kind % 3);
+            if kind == 3 {
+                // Moderate scales keep the sigmoid interior live (kind 0 saturates).
+                scales = (0..4 * hidden)
+                    .flat_map(|i| {
+                        let e = -14 + (i % 9) as i32;
+                        f32::from_bits(((127 + e) as u32) << 23).to_le_bytes()
+                    })
+                    .collect();
+            }
+            cases.push(ReadUpCase {
+                name: [
+                    "random_finite",
+                    "finite_edges",
+                    "nan_inf_edges",
+                    "moderate_scales",
+                ][kind]
+                    .into(),
+                hidden,
+                k,
+                w,
+                scales,
+                low,
+                normalized: normalized_data(hidden, [0, 1, 2, 0][kind]),
+                normalized_source: "synthetic_seeded_bf16",
+            });
+        }
+    }
+    for f in fixtures.iter().filter(|f| f.fmt == Fmt::E4M3 && f.m % 64 == 0) {
+        let hidden = f.m / 4;
+        for (suffix, kind) in [("", 0), ("+nan_inf_normalized", 2)] {
+            cases.push(ReadUpCase {
+                name: format!("{}{suffix}", f.name),
+                hidden,
+                k: f.k,
+                w: f.w.clone(),
+                scales: f.scales.clone(),
+                low: f.x.clone(),
+                normalized: normalized_data(hidden, kind),
+                normalized_source: "synthetic_seeded_bf16",
+            });
+        }
+    }
+    cases
+}
+
+/// Kernarg of the fused read-up entry: q,s,low,normalized,mixed u64; hidden,
+/// low_rank, rows u32; pad.
+fn read_up_args(
+    p: [u64; 5],
+    hidden: usize,
+    k: usize,
+    rows: usize,
+) -> Result<Vec<u8>, String> {
+    let mut blob = Vec::with_capacity(hc8::READ_UP_KERNARG_BYTES as usize);
+    for v in p {
+        blob.extend(v.to_le_bytes());
+    }
+    for v in [hidden, k, rows] {
+        blob.extend((v as u32).to_le_bytes());
+    }
+    if blob.len() > hc8::READ_UP_KERNARG_BYTES as usize {
+        return Err("read-up kernarg fields overflow READ_UP_KERNARG_BYTES".into());
+    }
+    blob.resize(hc8::READ_UP_KERNARG_BYTES as usize, 0);
+    Ok(blob)
+}
+/// Product ABI: five pointers, branches/hidden/rows i32, padded to 16 as
+/// `hyper_read_projected` does in rdna-compute.
+fn projected_args(p: [u64; 5], hidden: usize, rows: usize) -> Vec<u8> {
+    let mut blob = Vec::with_capacity(64);
+    for v in p {
+        blob.extend(v.to_le_bytes());
+    }
+    for v in [4usize, hidden, rows] {
+        blob.extend((v as u32).to_le_bytes());
+    }
+    blob.resize(blob.len().next_multiple_of(16), 0);
+    blob
+}
+
+fn run_read_up(out: &str, projected_object: &str, fixture_paths: &[String]) -> Result<(), String> {
+    if std::env::var_os("FABRIC_JOB").is_none() {
+        return Err("run through fabric-run.sh --class correct --card <one gfx1201 card>".into());
+    }
+    let object = std::fs::read(projected_object).map_err(|e| format!("{projected_object}: {e}"))?;
+    let rt = HipRuntime::load().map_err(|e| e.to_string())?;
+    rt.set_device(0).map_err(|e| e.to_string())?;
+    let arch = rt.get_arch(0).map_err(|e| e.to_string())?;
+    if arch.split(':').next() != Some("gfx1201") {
+        return Err(format!("requires exact gfx1201, got {arch}"));
+    }
+    if rt.device_count().map_err(|e| e.to_string())? != 1 {
+        return Err("requires exactly one visible card".into());
+    }
+    let card = Card(rt);
+    let fixtures = load_fixtures(fixture_paths)?;
+    let (_, text, _) = hc8::emit_module()?;
+    let elf = native::assemble(&text, Arch::Gfx1201)?;
+    let bundle_sha = format!("{:x}", Sha256::digest(BUNDLE));
+    if bundle_sha != BUNDLE_SHA.trim()
+        || native::bundle(&elf, Arch::Gfx1201, native::DEFAULT_HOST_TARGET) != BUNDLE
+    {
+        return Err("committed bundle/sha differs from fresh generator output".into());
+    }
+    let symbols = hc8::symbols();
+    let module = card.0.module_load_data(&elf).map_err(|e| e.to_string())?;
+    let projected_module = card
+        .0
+        .module_load_data(&object)
+        .map_err(|e| format!("{projected_object}: {e}"))?;
+    let projected = card
+        .0
+        .module_get_function(&projected_module, "hyper_read_projected_f32")
+        .map_err(|e| e.to_string())?;
+    let mut fused = Vec::new();
+    let mut sets = Vec::new();
+    for nt in 1..=4u32 {
+        let geo = Geo {
+            fmt: Fmt::E4M3,
+            mw: 4,
+            kw: 1,
+            nt,
+            act: false,
+        };
+        for name in [hc8::read_up_symbol(nt), geo.symbol()] {
+            if !symbols.contains(&name) {
+                return Err(format!("module symbols() lacks {name}"));
+            }
+        }
+        fused.push(
+            card.0
+                .module_get_function(&module, &hc8::read_up_symbol(nt))
+                .map_err(|e| e.to_string())?,
+        );
+        sets.push((
+            geo,
+            card.0
+                .module_get_function(&module, &geo.symbol())
+                .map_err(|e| e.to_string())?,
+        ));
+    }
+
+    let dummy = card.upload(&guarded(&[0u8; 16]))?;
+    let mut timings = Timings::default();
+    let mut cases = Vec::new();
+    let (mut launches, mut compared_words) = (0usize, 0usize);
+    let mut total_mismatches = 0usize;
+    let mut failures = Vec::new();
+    for case in read_up_cases(&fixtures) {
+        let (hidden, k) = (case.hidden, case.k);
+        let m = 4 * hidden;
+        if hidden % 16 != 0 || k % 32 != 0 {
+            return Err(format!("{}: hidden%16/K%32 violated", case.name));
+        }
+        let q = guarded(&hc8::swizzle_hc8(&case.w, m, k));
+        let scales = guarded(&case.scales);
+        let low = guarded(&case.low);
+        let norm = guarded(&case.normalized);
+        let (dq, ds, dl, dn) = (
+            card.upload(&q)?,
+            card.upload(&scales)?,
+            card.upload(&low)?,
+            card.upload(&norm)?,
+        );
+        let out_poison = vec![SENT; 2 * GUARD + 64 * hidden * 4];
+        let set_poison = vec![SENT; 2 * GUARD + 64 * m * 4];
+        let (dfused, dprod) = (card.upload(&out_poison)?, card.upload(&out_poison)?);
+        let dset = card.upload(&set_poison)?;
+        let (mut vs_product, mut vs_single) = (Tally::default(), Tally::default());
+        let (mut dead, mut unstored, mut set_dead) = (0usize, 0usize, 0usize);
+        let mut case_launches = 0usize;
+        let grid = (hidden / 16) as u32;
+        let block = hc8::READ_UP_BLOCK as u32;
+
+        // Row-invariance anchor: each input row alone through the n1 entry.
+        let mut singleton = Vec::with_capacity(64 * hidden * 4);
+        for row in 0..64usize {
+            card.0
+                .memcpy_htod(&dfused, &out_poison)
+                .map_err(|e| e.to_string())?;
+            let mut blob = read_up_args(
+                [
+                    ptr(&dq),
+                    ptr(&ds),
+                    ptr(&dl) + (row * k * 4) as u64,
+                    ptr(&dn) + (row * m * 4) as u64,
+                    ptr(&dfused),
+                ],
+                hidden,
+                k,
+                1,
+            )?;
+            launch_timed(
+                &card,
+                &mut timings,
+                &hc8::read_up_symbol(1),
+                &fused[0],
+                [grid, 1, 1],
+                block,
+                &mut blob,
+            )?;
+            case_launches += 1;
+            let bytes = card.download(&dfused, out_poison.len())?;
+            dead += dead_bytes(&bytes, hidden * 4);
+            unstored += unstored_words(&bytes, hidden * 4);
+            singleton.extend_from_slice(&bytes[GUARD..GUARD + hidden * 4]);
+        }
+
+        for nt in 1..=4usize {
+            let (geo, set_fn) = &sets[nt - 1];
+            for rows in 1..=16 * nt {
+                for (d, p) in [(&dfused, &out_poison), (&dprod, &out_poison), (&dset, &set_poison)]
+                {
+                    card.0.memcpy_htod(d, p).map_err(|e| e.to_string())?;
+                }
+                let mut set_blob = args(ptr(&dq), ptr(&ds), ptr(&dl), ptr(&dset), m, k, rows);
+                launch_timed(
+                    &card,
+                    &mut timings,
+                    &geo.symbol(),
+                    set_fn,
+                    [geo.grid(m as u32), 1, 1],
+                    geo.block(),
+                    &mut set_blob,
+                )?;
+                let mut prod_blob = projected_args(
+                    [ptr(&dummy), ptr(&dummy), ptr(&dset), ptr(&dn), ptr(&dprod)],
+                    hidden,
+                    rows,
+                );
+                launch_timed(
+                    &card,
+                    &mut timings,
+                    "hyper_read_projected_f32",
+                    &projected,
+                    [(m as u32).div_ceil(256), rows as u32, 1],
+                    256,
+                    &mut prod_blob,
+                )?;
+                let mut fused_blob = read_up_args(
+                    [ptr(&dq), ptr(&ds), ptr(&dl), ptr(&dn), ptr(&dfused)],
+                    hidden,
+                    k,
+                    rows,
+                )?;
+                launch_timed(
+                    &card,
+                    &mut timings,
+                    &hc8::read_up_symbol(nt as u32),
+                    &fused[nt - 1],
+                    [grid, 1, 1],
+                    block,
+                    &mut fused_blob,
+                )?;
+                case_launches += 3;
+                let got = card.download(&dfused, out_poison.len())?;
+                let want = card.download(&dprod, out_poison.len())?;
+                let mid = card.download(&dset, set_poison.len())?;
+                let live = rows * hidden * 4;
+                dead += dead_bytes(&got, live) + dead_bytes(&want, live);
+                unstored += unstored_words(&got, live) + unstored_words(&want, live);
+                set_dead += dead_bytes(&mid, rows * m * 4);
+                let context = format!("{} rows={rows}", hc8::read_up_symbol(nt as u32));
+                vs_product.cmp(
+                    &format!("fused vs product {context}"),
+                    &got[GUARD..GUARD + live],
+                    &want[GUARD..GUARD + live],
+                );
+                vs_single.cmp(
+                    &format!("fused vs singleton {context}"),
+                    &got[GUARD..GUARD + live],
+                    &singleton[..live],
+                );
+            }
+        }
+        let mut readonly_changed = Vec::new();
+        for (name, d, bytes) in [
+            ("q", &dq, &q),
+            ("s", &ds, &scales),
+            ("low", &dl, &low),
+            ("normalized", &dn, &norm),
+        ] {
+            if card.download(d, bytes.len())? != *bytes {
+                readonly_changed.push(name);
+            }
+        }
+        let mismatches = vs_product.mismatches
+            + vs_single.mismatches
+            + dead
+            + unstored
+            + set_dead
+            + readonly_changed.len();
+        let pass = mismatches == 0;
+        if !pass {
+            failures.push(format!(
+                "{} hidden={hidden} k={k}: product {} singleton {} dead {dead} unstored {unstored} set_dead {set_dead} readonly {readonly_changed:?}",
+                case.name, vs_product.mismatches, vs_single.mismatches
+            ));
+        }
+        total_mismatches += mismatches;
+        launches += case_launches;
+        compared_words += vs_product.words + vs_single.words;
+        println!(
+            "{} hidden={hidden} k={k}: {} words vs product, {} vs singleton, {mismatches} mismatches {}",
+            case.name,
+            vs_product.words,
+            vs_single.words,
+            if pass { "PASS" } else { "FAIL" }
+        );
+        cases.push(json!({"kind":case.name,"hidden":hidden,"m":m,"k":k,
+            "normalized_source":case.normalized_source,
+            "q_rowmajor_sha256":format!("{:x}",Sha256::digest(&case.w)),
+            "scales_sha256":format!("{:x}",Sha256::digest(&case.scales)),
+            "low_sha256":format!("{:x}",Sha256::digest(&case.low)),
+            "normalized_sha256":format!("{:x}",Sha256::digest(&case.normalized)),
+            "rows":"every 1..=16*NT for each NT 1..4; plus 64 singleton rows",
+            "launches":case_launches,
+            "fused_vs_product":vs_product.json(),"fused_vs_singleton":vs_single.json(),
+            "dead_store_bytes":dead,"unstored_live_words":unstored,
+            "set_intermediate_dead_store_bytes":set_dead,
+            "readonly_changed":readonly_changed,"pass":pass}));
+        for d in [dq, ds, dl, dn, dfused, dprod, dset] {
+            card.0.free(d).map_err(|e| e.to_string())?;
+        }
+    }
+    card.0.free(dummy).map_err(|e| e.to_string())?;
+    let pass = total_mismatches == 0;
+    let receipt = json!({"schema":"hc8-read-up-byte-oracle-v1","pass":pass,"arch":arch,
+        "fabric_job":std::env::var("FABRIC_JOB").ok(),
+        "elf_sha256":format!("{:x}",Sha256::digest(&elf)),"bundle_sha256":bundle_sha,
+        "projected_object":projected_object,
+        "projected_object_sha256":format!("{:x}",Sha256::digest(&object)),
+        "projected_symbol":"hyper_read_projected_f32","fixtures":fixture_paths,
+        "baseline":"hc8_gemm_e4m3_mw4_kw1_nN_set then product hyper_read_projected_f32 (compiled object, no hipcc, no CPU libm)",
+        "normalized":"seeded BF16-exact synthetic, |x|<=4 plus +-0/tiny/large/NaN/Inf edges; no real normalized capture",
+        "compared_words":compared_words,"launches":launches,
+        "total_mismatches":total_mismatches,"failures":failures,
+        "timings_note":"host wall clock around launch+sync; correctness diagnostic, not performance",
+        "timings":timings.json(),"cases":cases});
+    std::fs::write(
+        out,
+        serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    if !pass {
+        return Err(format!(
+            "{total_mismatches} mismatches; receipt {out}: {}",
+            failures.join("; ")
+        ));
+    }
+    println!("PASS: {compared_words} words, {launches} launches; receipt {out}");
+    Ok(())
+}
+
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let Some(out) = args.first() else {
-        eprintln!("usage: hc8_byte_oracle RECEIPT.json [FIXTURE.json ...]");
+    let mut read_up = false;
+    let mut projected = None;
+    let mut positional = Vec::new();
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--read-up" => read_up = true,
+            "--projected-object" => projected = it.next(),
+            _ => positional.push(a),
+        }
+    }
+    let usage = "usage: hc8_byte_oracle RECEIPT.json [FIXTURE.json ...]\n       hc8_byte_oracle --read-up --projected-object OBJECT.co RECEIPT.json [FIXTURE.json ...]";
+    let Some(out) = positional.first() else {
+        eprintln!("{usage}");
         return ExitCode::from(2);
     };
-    match run(out, &args[1..]) {
+    let result = match (read_up, &projected) {
+        (true, Some(object)) => run_read_up(out, object, &positional[1..]),
+        (false, None) => run(out, &positional[1..]),
+        _ => {
+            eprintln!("{usage}\n--projected-object is mandatory with --read-up and only valid with it");
+            return ExitCode::from(2);
+        }
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("FAIL: {e}");
