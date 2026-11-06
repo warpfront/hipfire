@@ -7,8 +7,10 @@
 //! (`release-0.4.5/megam0/p0h/m0_rt.h`); nothing here is on a product route.
 //!
 //! Kernarg: `M0Params` (72 bytes): `tasks, ticket, events, kernargs, trace, poison`
-//! pointers at 0..48, `spin_ticks` at 48 (its low dword is the poll budget of a
-//! predecessor wait), `n_tasks` at 56, `trace_on` at 60. A task is a 128-byte
+//! pointers at 0..48, `spin_ticks` at 48, `n_tasks` at 56, `trace_on` at 60.
+//! `spin_ticks` is a count of POLLS, not of clock ticks: its low dword is how many
+//! times one predecessor wait re-reads `events[pred]` (each poll is a device-scope load
+//! plus an `s_sleep`) before it gives up and sets poison; the high dword is ignored. A task is a 128-byte
 //! `M0TaskDesc`: `tmpl, vx, vy, vz, gx, gy, gz, ka_off, pred_event, expected,
 //! done_event, vcount`. Every workgroup (the hosted bodies' `blockDim`) loops:
 //!
