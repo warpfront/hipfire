@@ -1,0 +1,6 @@
+num_samples=16000
+num_frames=98
+n_mels=128
+n_fft=400
+hop=160
+num_freq_bins=201

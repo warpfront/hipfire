@@ -9590,6 +9590,11 @@ pub const FUSED_SIGMOID_ALPHA_GATE_SRC: &str =
 /// `sigmoid_f32(gate)` + `mul_f32(attn_out, gate, attn_out)`.
 pub const SIGMOID_MUL_SRC: &str = include_str!("../../../kernels/src/sigmoid_mul.hip");
 
+/// LFM3 attention output gate: per-head sigmoid broadcast over
+/// `[n_heads * head_dim]` — `out[i] *= sigmoid(gate[i / head_dim])`.
+pub const SIGMOID_HEAD_GATE_MUL_SRC: &str =
+    include_str!("../../../kernels/src/sigmoid_head_gate_mul.hip");
+
 /// Top-K=128 extraction over a logits vector. Lets the host sampler work
 /// on a 1 KB GPU-side candidate set instead of DtoH'ing the full 600 KB
 /// logits array. See kernel header for bit-exactness reasoning.
@@ -9611,6 +9616,12 @@ pub const ROPE_PARTIAL_INTERLEAVED_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const ROPE_PARTIAL_HALFSPLIT_SRC: &str =
     include_str!("../../../kernels/src/rope_partial_halfsplit.hip");
+
+/// LFM3 zero-tail partial RoPE (`full_attention` layers, partial rotary
+/// factor < 1.0) — pairs (d, d + head_dim/2) at freq base^(-2d/head_dim),
+/// zero tail pass-through. See the kernel header for the HF layout.
+#[cfg(feature = "deltanet")]
+pub const ROPE_ZERO_TAIL_SRC: &str = include_str!("../../../kernels/src/rope_zero_tail.hip");
 
 /// gfx1201 decode twin of `rope_partial_halfsplit_f32` (`HIPFIRE_G12_DEC_NORM`):
 /// one workgroup per head instead of one wave looping over all heads.
@@ -10545,6 +10556,19 @@ pub const ATTENTION_ROWS_SOFTMAX_SRC: &str =
 /// |i-j| > window. See `kernels/src/attention_band_mask.hip`.
 pub const ATTENTION_BAND_MASK_SRC: &str =
     include_str!("../../../kernels/src/attention_band_mask.hip");
+
+/// Bidirectional GQA ViT attention for the LFM3-VL vision tower: separate
+/// Q/K/V buffers with distinct head counts (16 Q / 8 KV). Grid=[n_heads, N].
+pub const VIT_ATTENTION_GQA_SRC: &str =
+    include_str!("../../../kernels/src/vit_attention_gqa_f32.hip");
+
+/// Exact (erf) GELU: 0.5 * x * (1 + erf(x/sqrt(2))). LFM3-VL projector uses
+/// nn.GELU(approximate="none") — distinct from `GELU_TANH_SRC`.
+pub const GELU_ERF_SRC: &str = include_str!("../../../kernels/src/gelu_erf_f32.hip");
+
+/// LFM3-VL vision conv layer: double-gated depthwise 2D convolution over the
+/// merge-grouped patch grid. Grid=[N, hidden]. See `conv2d_gated_f32.hip`.
+pub const CONV2D_GATED_SRC: &str = include_str!("../../../kernels/src/conv2d_gated_f32.hip");
 
 /// 2D rotary positional embedding for the Qwen3.5-VL vision tower. Rotates Q
 /// and K halves of the packed QKV buffer in-place using per-token cos/sin of

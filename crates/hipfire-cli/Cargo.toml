@@ -39,3 +39,7 @@ base64.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 ureq = "3"
+# LFM3 serve surface: /tts + /v1/realtime (Phase 5 re-homes onto serve/*).
+tiny_http = "0.12"
+tungstenite = { version = "0.30.0", default-features = false }
+sha1 = "0.10"

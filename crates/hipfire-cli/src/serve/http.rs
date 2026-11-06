@@ -1188,6 +1188,30 @@ async fn handle_request(
         // K×dim token matrix, not a single pooled vector) and the request
         // may set `"kind": "query" | "document"` (default document) — the
         // two sides use different markers and truncation limits.
+        (Method::GET, "/v1/realtime") => {
+            crate::serve::realtime::handle_realtime(req, Arc::clone(&shared))
+        }
+        (Method::POST, "/tts") => {
+            let max_bytes = shared.max_request_bytes;
+            if req
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|length| length > max_bytes)
+            {
+                return openai_error(&format!("request body exceeds {max_bytes} bytes"), 413);
+            }
+            let body_val = match read_json_body(req.into_body(), max_bytes).await {
+                Ok(v) => v,
+                Err(err) => {
+                    let msg = err.to_string();
+                    let status = if msg.contains("exceeds") { 413 } else { 400 };
+                    return openai_error(&msg, status);
+                }
+            };
+            crate::serve::audio::handle_tts(Arc::clone(&shared), body_val).await
+        }
         (Method::POST, "/v1/embeddings") => {
             let max_bytes = shared.max_request_bytes;
             if req

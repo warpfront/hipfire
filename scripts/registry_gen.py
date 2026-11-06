@@ -285,6 +285,7 @@ def log(msg: str) -> None:
 #   12 = Cohere2-MoE / North-Mini-Code
 #   14 = Muse Glimmer dense text tower
 #   16 = Qwen4 experimental / Qwen3.8-Flash-Next
+#   24 = LFM3 family (text / VL / audio / omni variants)
 #   20 = DFlash drafter sidecar (crates/hipfire-quantize/src/bin/dflash_convert.rs)
 #   23 = Muse Glimmer DFlash drafter (muse_glimmer_assistant)
 def arch_id_for(tag: str, entry: dict) -> int | None:
@@ -342,6 +343,8 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 10
     if family == "lfm2.5":
         return 11
+    if family == "lfm3":
+        return 13
     if family == "north-mini-code":
         return 12
     # Maple-Preview: natively-ternary 256-expert MoE, its own arch crate.

@@ -187,6 +187,7 @@ pub use trunk_mask::{
     TRUNK_QSA_BITS,
 };
 
+pub use attention::q8_flash_tile_size;
 pub use compiler::KernelCompiler;
 #[cfg(feature = "lab")]
 pub use dispatch::LabKernelFaultReceipt;
@@ -242,6 +243,7 @@ pub fn calib_force_bf16() -> bool {
 pub fn qsa_code_check_self_test() -> String {
     loaded_code_check::self_test_report()
 }
+
 pub use kernels::GEMV_SRC;
 /// whose gfx11 and gfx12 kernels are separate translation units. Exported so
 /// no-GPU tests can assert the launcher resolves to a real entry point on both

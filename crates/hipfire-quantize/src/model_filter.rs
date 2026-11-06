@@ -31,6 +31,15 @@ pub(crate) fn should_quantize(name: &str) -> bool {
         // LFM2/Idefics-style multimodal projector rides the vision group
         // (VL artifact contract) — F16 under --include-vision, skipped without.
         || name.starts_with("model.multi_modal_projector.")
+        // LFM3-Audio / LFM3-Omni towers (AUDIO-NAME-1): the conv2d downsampler +
+        // audio projector, and the omni depth decoder + shared codebook
+        // embedding, stay F16 like the vision tower during bring-up.
+        || name.starts_with("encoder.downsample.")
+        || name.starts_with("mlp.model.")
+        || name.starts_with("model.audio_encoder.")
+        || name.starts_with("model.audio_projector.")
+        || name.starts_with("model.depth_decoder.")
+        || name.starts_with("model.codebook_embedding.")
     {
         return false;
     }

@@ -81,6 +81,23 @@ pub(crate) fn vision_max_pixels() -> usize {
         .unwrap_or(VISION_MAX_PIXELS)
 }
 
+/// LFM3-VL pixel budget (HF `Lfm3VlImageProcessor.size` —
+/// `{"shortest_edge": 65_536, "longest_edge": 16_777_216}`; see
+/// image_processing_lfm3_vl.py). VL-RESIZE-1: the shared preprocessor used to
+/// hard-code Qwen's budget, so LFM3-VL images under 65 536 px were not
+/// upscaled (HF does) and images over ~1.0M px were downscaled ~16× earlier
+/// than HF — both silently change the patch grid / visual-token count vs the
+/// reference. LFM3-VL passes these explicitly via
+/// [`load_and_preprocess_with_pixels`].
+pub const LFM3_VL_MIN_PIXELS: usize = 65_536;
+pub const LFM3_VL_MAX_PIXELS: usize = 16_777_216;
+
+/// Historical Qwen3.5-VL budget constants (HF `Qwen2VLImageProcessor` defaults).
+/// Qwen35-VL now uses `VISION_MIN_PIXELS` / `vision_max_pixels()`; these remain
+/// pinned by the parity tests that assert the old budget.
+pub const QWEN35_MIN_PIXELS: usize = 56 * 56;
+pub const QWEN35_MAX_PIXELS: usize = 14 * 14 * 4 * 1280;
+
 /// Smart resize matching HuggingFace Qwen2_5_VLImageProcessor.
 ///
 /// `factor` MUST equal `patch_size * spatial_merge_size`. With that constraint
@@ -125,16 +142,19 @@ pub fn smart_resize(
 /// Shared preprocessing logic that takes an already-loaded `DynamicImage`.
 /// Returns (CHW data, height, width) where height and width are multiples of
 /// `patch_size * spatial_merge_size`.
+///
+/// `min_pixels` / `max_pixels` are the caller's model pixel budget (see the
+/// `*_MIN_PIXELS` / `*_MAX_PIXELS` constants).
 fn preprocess_dynamic_image(
     img: image::DynamicImage,
     patch_size: usize,
     spatial_merge_size: usize,
+    min_pixels: usize,
+    max_pixels: usize,
 ) -> (Vec<f32>, usize, usize) {
     let (orig_w, orig_h) = (img.width() as usize, img.height() as usize);
 
     let factor = patch_size * spatial_merge_size;
-    let min_pixels = VISION_MIN_PIXELS;
-    let max_pixels = vision_max_pixels();
     let (final_h, final_w) = smart_resize(orig_h, orig_w, factor, min_pixels, max_pixels);
 
     // HF's `Qwen2VLImageProcessorFast` uses PIL's BICUBIC (`resample=3`).
@@ -188,11 +208,31 @@ pub fn load_and_preprocess(
     patch_size: usize,
     spatial_merge_size: usize,
 ) -> Result<(Vec<f32>, usize, usize), String> {
+    load_and_preprocess_with_pixels(
+        path,
+        patch_size,
+        spatial_merge_size,
+        VISION_MIN_PIXELS,
+        vision_max_pixels(),
+    )
+}
+
+/// [`load_and_preprocess`] with an explicit model pixel budget (VL-RESIZE-1:
+/// LFM3-VL uses `LFM3_VL_{MIN,MAX}_PIXELS`, not Qwen's).
+pub fn load_and_preprocess_with_pixels(
+    path: &Path,
+    patch_size: usize,
+    spatial_merge_size: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> Result<(Vec<f32>, usize, usize), String> {
     let img = hipfire_runtime::imagedec::decode_dynamic_path(path)?;
     Ok(preprocess_dynamic_image(
         img,
         patch_size,
         spatial_merge_size,
+        min_pixels,
+        max_pixels,
     ))
 }
 
@@ -210,11 +250,34 @@ pub fn load_and_preprocess_from_bytes(
     patch_size: usize,
     spatial_merge_size: usize,
 ) -> Result<(Vec<f32>, usize, usize), String> {
+    load_and_preprocess_from_bytes_with_pixels(
+        data,
+        patch_size,
+        spatial_merge_size,
+        VISION_MIN_PIXELS,
+        vision_max_pixels(),
+    )
+}
+
+/// [`load_and_preprocess_from_bytes`] with an explicit model pixel budget.
+///
+/// The bomb guard scales with the budget: an LFM3-VL panorama within its
+/// 16.7M-px `longest_edge` is legitimate input (HF decodes then resizes),
+/// while the historical 4M blanket would reject it pre-decode. The 2×
+/// headroom still rejects the pathological 50000×50000 case.
+pub fn load_and_preprocess_from_bytes_with_pixels(
+    data: &[u8],
+    patch_size: usize,
+    spatial_merge_size: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> Result<(Vec<f32>, usize, usize), String> {
     let (orig_w, orig_h) = hipfire_runtime::imagedec::probe_dimensions(data)?;
     let (orig_w, orig_h) = (orig_w as usize, orig_h as usize);
-    if orig_w * orig_h > MAX_DIMENSION_PIXELS {
+    let max_dimension = (max_pixels.saturating_mul(2)).max(MAX_DIMENSION_PIXELS);
+    if orig_w * orig_h > max_dimension {
         return Err(format!(
-            "image dimensions ({orig_w}x{orig_h}) exceed maximum ({MAX_DIMENSION_PIXELS} pixels)"
+            "image dimensions ({orig_w}x{orig_h}) exceed maximum ({max_dimension} pixels)"
         ));
     }
 
@@ -223,6 +286,8 @@ pub fn load_and_preprocess_from_bytes(
         img,
         patch_size,
         spatial_merge_size,
+        min_pixels,
+        max_pixels,
     ))
 }
 
@@ -977,5 +1042,46 @@ mod tests {
         assert!(!vcn_header_rejected(&[]));
         assert!(!vcn_header_rejected(b"definitely not an image"));
         assert!(!vcn_header_rejected(&[0xFF, 0xD8, 0xFF, 0x00]));
+    }
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use super::*;
+
+    /// VL-RESIZE-1: pin the LFM3-VL pixel budget (factor 32 = patch 16 ×
+    /// merge 2, min 65 536 / max 16 777 216) against HF-exact expectations
+    /// computed from `image_processing_lfm3_vl.py::smart_resize`.
+    #[test]
+    fn lfm3_vl_pixel_budget_matches_hf() {
+        let f = 32; // patch_size * spatial_merge_size
+        let cases: &[(usize, usize, usize, usize)] = &[
+            // Under shortest_edge → upscaled (HF does; Qwen's budget would not).
+            (224, 224, 256, 256),
+            (200, 200, 256, 256),
+            (100, 100, 256, 256),
+            // Inside the band → rounded to factor only.
+            (1600, 1200, 1600, 1216),
+            (224, 448, 224, 448),
+            // Over longest_edge → downscaled.
+            (8000, 6000, 4704, 3520),
+        ];
+        for &(h, w, eh, ew) in cases {
+            let (gh, gw) = smart_resize(h, w, f, LFM3_VL_MIN_PIXELS, LFM3_VL_MAX_PIXELS);
+            assert_eq!((gh, gw), (eh, ew), "{h}x{w}");
+        }
+    }
+
+    /// Regression guard: the OLD hard-coded Qwen budget produces a DIFFERENT
+    /// grid for the same image (224×224 stays put under min_pixels=3136) —
+    /// exactly the silent token-count drift this fix removes.
+    #[test]
+    fn qwen_budget_diverges_on_out_of_overlap_sizes() {
+        let f = 32;
+        let (gh_q, gw_q) = smart_resize(224, 224, f, QWEN35_MIN_PIXELS, QWEN35_MAX_PIXELS);
+        assert_eq!((gh_q, gw_q), (224, 224));
+        let (gh_l, gw_l) = smart_resize(224, 224, f, LFM3_VL_MIN_PIXELS, LFM3_VL_MAX_PIXELS);
+        assert_eq!((gh_l, gw_l), (256, 256));
+        assert_ne!((gh_q, gw_q), (gh_l, gw_l));
     }
 }

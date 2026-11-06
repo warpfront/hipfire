@@ -1506,6 +1506,80 @@ impl Gpu {
         result
     }
 
+    /// LFM3 zero-tail partial RoPE (`full_attention` layers,
+    /// partial_rotary_factor < 1.0): rotates pairs (d, d + head_dim/2) for
+    /// d < rope_angles with freq base^(-2d/head_dim) — HF
+    /// modeling_lfm3.py `compute_default_rope_parameters`. Dims in
+    /// [rope_angles, head_dim/2) and their rotate_half partners pass through.
+    /// `rope_partial_halfsplit_f32` cannot express this layout (see the
+    /// kernel header); full-rotary layers (partial = 1.0) keep the halfsplit
+    /// kernel, where the two coincide.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_zero_tail_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        pos_buf: &hip_bridge::DeviceBuffer,
+        n_heads_q: usize,
+        n_heads_k: usize,
+        head_dim: usize,
+        rope_angles: usize,
+        freq_base: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rope_zero_tail",
+            kernels::ROPE_ZERO_TAIL_SRC,
+            "rope_zero_tail_f32",
+        )?;
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let pp = pos_buf.as_ptr();
+        let nhq = n_heads_q as i32;
+        let nhk = n_heads_k as i32;
+        let hd = head_dim as i32;
+        let ra = rope_angles as i32;
+        let fb = freq_base;
+        let n_pairs = rope_angles as u32;
+        let block = 32u32.min(n_pairs).max(1);
+        let grid = [(n_pairs + block - 1) / block, 1, 1];
+        let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim);
+        let timer = crate::profile::begin_timer(&self.hip, "rope", "rope_zero_tail_f32", bytes);
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &nhq as *const _ as *mut c_void,
+            &nhk as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &ra as *const _ as *mut c_void,
+            &fb as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            "rope_zero_tail_f32",
+            grid,
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(pp);
+                b.push_i32(nhq);
+                b.push_i32(nhk);
+                b.push_i32(hd);
+                b.push_i32(ra);
+                b.push_f32(fb);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     /// Exact gfx1100 Qwen3.6 full-attention preparation. Replaces the
     /// dependent deinterleave, Q RMS, K RMS, and partial half-split RoPE
     /// dispatches with one head-local launch. Admission is enforced by the
@@ -3205,6 +3279,58 @@ impl Gpu {
         // pointer-keyed F16/FP8 conversion cached from its previous contents
         // (the Q8 residual WMMA consumer would otherwise reuse stale X).
         self.invalidate_x_caches_for(out.buf.as_ptr());
+        result
+    }
+
+    /// LFM3 attention output gate: `out[i] *= sigmoid(gate[i / head_dim])`.
+    /// `out` is `[n_heads * head_dim]` in/out; `gate` is `[n_heads]` pre-sigmoid
+    /// logits. One launch replaces `sigmoid_f32(gate)` + a per-head broadcast
+    /// multiply — the gate LFM3's `Lfm3Attention` applies before `o_proj`.
+    pub fn sigmoid_head_gate_mul_f32(
+        &mut self,
+        out: &GpuTensor,
+        gate: &GpuTensor,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "sigmoid_head_gate_mul",
+            kernels::SIGMOID_HEAD_GATE_MUL_SRC,
+            "sigmoid_head_gate_mul_f32",
+        )?;
+        let op = out.buf.as_ptr();
+        let gp = gate.buf.as_ptr();
+        let hd = head_dim as i32;
+        let total = out.numel() as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &op as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &total as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((total as u32) + block - 1) / block;
+        let bytes = crate::profile::elementwise1_bytes(total as usize) * 3;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "fused", "sigmoid_head_gate_mul_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "sigmoid_head_gate_mul_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(op);
+                b.push_ptr(gp);
+                b.push_i32(hd);
+                b.push_i32(total);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         result
     }
 
@@ -6773,6 +6899,106 @@ impl Gpu {
                 b.push_ptr(xp);
                 b.push_ptr(op);
                 b.push_i32(ni);
+                b
+            },
+        )
+    }
+
+    /// Exact (erf) GELU: 0.5 * x * (1 + erf(x/sqrt(2))). In-place capable.
+    /// Used by the LFM3-VL multi-modal projector (nn.GELU, approximate="none").
+    /// GRAPH-1: launches via `launch_maybe_blob` — the raw `launch_kernel`
+    /// path dangles its stack kernargs under hipGraph capture.
+    pub fn gelu_erf_f32(&mut self, x: &GpuTensor, out: &GpuTensor, n: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gelu_erf_f32", kernels::GELU_ERF_SRC, "gelu_erf_f32")?;
+        let xp = x.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let ni = n as i32;
+        let blocks = ((n + 255) / 256) as u32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gelu_erf_f32",
+            [blocks, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(op);
+                b.push_i32(ni);
+                b
+            },
+        )
+    }
+
+    /// LFM3-VL vision conv layer: double-gated depthwise 2D convolution.
+    /// `bcx` is `[N, 3*hidden]` (B|C|x), `weight` is `[hidden, 3, 3]` flattened
+    /// (`[hidden*9]`), `out` is `[N, hidden]` = C * depthwise_conv(B*x). Patches
+    /// are in `(gy,gx,sy,sx)` merge-grouped order; the conv runs over the full
+    /// `(grid_h, grid_w)` raster grid with zero padding.
+    pub fn conv2d_gated_f32(
+        &mut self,
+        bcx: &GpuTensor,
+        weight: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+        hidden: usize,
+        grid_h: usize,
+        grid_w: usize,
+        sms: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "conv2d_gated_f32",
+            kernels::CONV2D_GATED_SRC,
+            "conv2d_gated_f32",
+        )?;
+        // GRAPH-1: launches via `launch_maybe_blob` — the raw `launch_kernel`
+        // path dangles its stack kernargs under hipGraph capture.
+        let bp = bcx.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let ni = n as i32;
+        let hi = hidden as i32;
+        let gh = grid_h as i32;
+        let gw = grid_w as i32;
+        let sm = sms as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &bp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+            &hi as *const _ as *mut c_void,
+            &gh as *const _ as *mut c_void,
+            &gw as *const _ as *mut c_void,
+            &sm as *const _ as *mut c_void,
+        ];
+        // 16x16 thread block → grid [ceil(N/16), ceil(hidden/16)].
+        let bx = 16u32;
+        let by = 16u32;
+        let gx = ((n as u32) + bx - 1) / bx;
+        let gy = ((hidden as u32) + by - 1) / by;
+        self.launch_maybe_blob(
+            "conv2d_gated_f32",
+            [gx, gy, 1],
+            [bx, by, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(bp);
+                b.push_ptr(wp);
+                b.push_ptr(op);
+                b.push_i32(ni);
+                b.push_i32(hi);
+                b.push_i32(gh);
+                b.push_i32(gw);
+                b.push_i32(sm);
                 b
             },
         )

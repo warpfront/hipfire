@@ -18050,3 +18050,177 @@ mod ep_unit_plan_tests {
         assert!(error.contains("model.expert-hotset"), "{error}");
     }
 }
+
+// ─── Lfm3Carrier (arch 24) ────────────────────────────────────────────
+//
+// LFM3 (LiquidAI) text backbone with optional VL / audio / omni towers,
+// detected by tensor presence (the qwen35-vl precedent: one arch_id, towers
+// opt-in). The tower state rides in the loader-local `Lfm3Bundle` (see lib.rs)
+// so `ArchModel::free_gpu` owns every side and a reload cannot leak.
+
+pub struct Lfm3Carrier;
+impl Carrier for Lfm3Carrier {
+    fn name(&self) -> &'static str {
+        "lfm3"
+    }
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == 24
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+            // LFM3-VL / -Audio / -Omni artifacts carry their towers; tower-less
+            // text checkpoints still refuse media via the bundle checks
+            // (`has_vision_encoder()` / `has_audio_encoder()`).
+            supports_images: true,
+            // LFM3's vendor chat template keys a real `enable_thinking`
+            // boolean (`{% if enable_thinking %} thinking {% else %}
+            //  thinking`), so it honors the engine's reasoning toggle like
+            // the other Jinja-thinking families. Reporting `Unsupported` made
+            // the CLI drop `thinking`/`reasoning_effort`/`max_think_tokens`
+            // ("[WARN: INVALID CONFIG] ... dropped for unsupported contract"),
+            // leaving LFM3 always thinking and burning short caps inside its
+            // chain-of-thought.
+            reasoning_contract: saddle_core::caps::ReasoningContract::QwenJinja,
+        }
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
+
+        use hipfire_arch_lfm3 as lfm3;
+        use hipfire_arch_lfm3_audio::lfm3_audio;
+        use hipfire_arch_lfm3_omni as lfm3_omni;
+        use hipfire_arch_lfm3_vl::lfm3_vl;
+        // Optional tower state, filled by tensor presence below.
+        let mut vision_config: Option<lfm3_vl::VisionConfig> = None;
+        let mut vision_weights: Option<lfm3_vl::VisionWeights> = None;
+        let mut audio_config: Option<lfm3_audio::AudioConfig> = None;
+        let mut audio_weights: Option<lfm3_audio::AudioWeights> = None;
+        let mut depth_config: Option<lfm3_omni::DepthConfig> = None;
+        let mut depth_weights: Option<lfm3_omni::DepthWeights> = None;
+
+        let (config, weights) = match src {
+            ModelSource::Hfq(mut hfq) => {
+                let config = lfm3::config::Lfm3Config::from_hfq(&hfq)?;
+                let weights = lfm3::lfm3::Lfm3Weights::load(&mut hfq, &config, ctx.gpu)?;
+                // LFM3-VL vision tower by tensor presence (arch_id stays 24).
+                if hfq
+                    .tensor_data("model.vision_tower.patchifier.weight")
+                    .is_some()
+                {
+                    eprintln!(
+                        "lfm3: LFM3-VL vision tower detected — loading vision + projector weights"
+                    );
+                    let vc = lfm3_vl::vision_config_from_hfq(&hfq).ok_or_else(|| {
+                        "lfm3-vl: vision_config not found in HFQ metadata".to_string()
+                    })?;
+                    let vw = lfm3_vl::load_vision_weights(&hfq, &vc, ctx.gpu)
+                        .map_err(|e| format!("lfm3-vl: load_vision_weights: {e:?}"))?;
+                    vision_config = Some(vc);
+                    vision_weights = Some(vw);
+                }
+                // LFM3-Audio speech encoder by tensor presence.
+                // AUDIO-NAME-1: Audio-2B names it `encoder.downsample.*`;
+                // Omni-2B names it `model.audio_encoder.downsample.*`.
+                if hfq
+                    .tensor_data("encoder.downsample.conv_in.weight")
+                    .is_some()
+                    || hfq
+                        .tensor_data("model.audio_encoder.downsample.conv_in.weight")
+                        .is_some()
+                {
+                    eprintln!("lfm3: LFM3-Audio speech encoder detected — loading downsampler + encoder + projector weights");
+                    let ac = lfm3_audio::audio_config_from_hfq(&hfq).ok_or_else(|| {
+                        "lfm3-audio: audio_config not found in HFQ metadata".to_string()
+                    })?;
+                    let aw = lfm3_audio::load_audio_weights(&hfq, &ac, ctx.gpu)
+                        .map_err(|e| format!("lfm3-audio: load_audio_weights: {e:?}"))?;
+                    audio_config = Some(ac);
+                    audio_weights = Some(aw);
+                }
+                // LFM3-Omni depth decoder by tensor presence.
+                if hfq
+                    .tensor_data("model.depth_decoder.depth_linear.weight")
+                    .is_some()
+                {
+                    eprintln!("lfm3: LFM3-Omni depth decoder detected — loading depth decoder + codebook embedding weights");
+                    let dc = lfm3_omni::depth_config_from_hfq(&hfq).ok_or_else(|| {
+                        "lfm3-omni: depth_config not found in HFQ metadata".to_string()
+                    })?;
+                    let dw = lfm3_omni::load_depth_weights(&hfq, &dc, ctx.gpu)
+                        .map_err(|e| format!("lfm3-omni: load_depth_weights: {e:?}"))?;
+                    depth_config = Some(dc);
+                    depth_weights = Some(dw);
+                }
+                (config, weights)
+            }
+            ModelSource::Dir(source) => {
+                let config = lfm3::config_from_source(&source)
+                    .ok_or_else(|| "lfm3: failed to parse config from safetensors".to_string())?;
+                let weights = lfm3::load_weights_from_source(&source, &config, ctx.gpu)?;
+                (config, weights)
+            }
+        };
+        hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
+
+        let state = lfm3::lfm3::Lfm3State::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
+            .map_err(|e| format!("lfm3: Lfm3State::new_with_max_seq failed: {e}"))?;
+        let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<|im_end|>", "</s>", ""]);
+        // Phase 1 is AR-only: LFM3 does not yet impl `SpecTarget`, so
+        // `build_speculator` returns None unless HIPFIRE_NGRAM_DRAFT is set.
+        let speculator = crate::spec_build::build_speculator(
+            meta.arch_id,
+            None,
+            None,
+            true,
+            ctx.max_seq,
+            ctx.spec,
+        );
+        // LFM3's chat_template.jinja uses transformers' `{% generation %}` block,
+        // which minijinja cannot parse (the daemon would fall back to a bare
+        // Plain prompt and the model echoes the prompt tail). Strip the markers
+        // but keep their content; single-turn rendering is unchanged.
+        let chat_template = meta.chat_template.map(|t| {
+            let s = t
+                .replace("{%- generation -%}", "")
+                .replace("{% generation %}", "")
+                .replace("{%- endgeneration -%}", "")
+                .replace("{% endgeneration %}", "");
+            if s != t {
+                eprintln!("lfm3: stripped unsupported {{% generation %}} block from chat template");
+            }
+            s
+        });
+        Ok(LoadedModel {
+            state: Some(Box::new(crate::Lfm3Bundle {
+                config,
+                weights,
+                state,
+                eos_tok,
+                vision_config,
+                vision_weights,
+                audio_config,
+                audio_weights,
+                depth_config,
+                depth_weights,
+            })),
+            speculator,
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                chat_template,
+                meta.chat_template_source,
+            )
+        })
+    }
+}

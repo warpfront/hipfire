@@ -304,6 +304,20 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
             reason: "flux2 is an image-gen component — never a text retry candidate",
         },
     };
+    const LFM3: ResetCoreCoverage = ResetCoreCoverage {
+        arch: "lfm3",
+        recurrent_or_conv: true,
+        s_ef_residual: false,
+        kv_or_aux_caches: true,
+        graphs: false,
+        drafter: false,
+        adaptive: false,
+        host_position_and_conversation: true,
+        eligibility: RetryResetEligibility::Ineligible {
+            reason:
+                "lfm3 is AR-only (hybrid conv + attention) — not a serve-hardening retry candidate",
+        },
+    };
     &[
         QWEN35,
         QWEN4,
@@ -322,6 +336,7 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
         EMBEDDING_GEMMA2,
         FLUX,
         FLUX2,
+        LFM3,
     ]
 }
 
@@ -620,6 +635,7 @@ mod tests {
                 19 => Some("raon1_mini"),
                 17 => Some("qwen35-embed"),
                 18 => Some("embeddinggemma2"),
+                24 => Some("lfm3"),
                 40 => Some("flux"),
                 45 => Some("flux2"),
                 // Drafter sidecars (22, 23) are intentionally not retry

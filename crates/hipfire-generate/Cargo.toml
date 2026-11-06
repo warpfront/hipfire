@@ -42,6 +42,10 @@ hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
 hipfire-arch-diffusion = { path = "../hipfire-arch-diffusion" }
 hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
 hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
+hipfire-arch-lfm3 = { path = "../hipfire-arch-lfm3" }
+hipfire-arch-lfm3-vl = { path = "../hipfire-arch-lfm3-vl" }
+hipfire-arch-lfm3-audio = { path = "../hipfire-arch-lfm3-audio" }
+hipfire-arch-lfm3-omni = { path = "../hipfire-arch-lfm3-omni" }
 hipfire-arch-lfm2-vl = { path = "../hipfire-arch-lfm2-vl" }
 hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
 hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }

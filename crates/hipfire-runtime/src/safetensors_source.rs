@@ -925,6 +925,10 @@ mod tests {
         assert_eq!(derive_arch_id(&json!({ "model_type": "lfm2_moe" })), 11);
         assert_eq!(derive_arch_id(&json!({ "model_type": "lfm2" })), 11);
         assert_eq!(derive_arch_id(&json!({ "model_type": "cohere2_moe" })), 12);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "lfm3" })), 24);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "lfm3_vl" })), 24);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "lfm3_audio" })), 24);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "lfm3_omni" })), 24);
         assert_eq!(derive_arch_id(&json!({ "model_type": "qwen4_exp" })), 16);
         assert_eq!(
             derive_arch_id(&json!({

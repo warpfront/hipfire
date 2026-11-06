@@ -18592,6 +18592,79 @@ impl Gpu {
         }
     }
 
+    /// Bidirectional GQA ViT attention for the LFM3-VL vision tower. Separate
+    /// Q/K/V buffers with distinct head counts (e.g. 16 Q / 8 KV). Every query
+    /// patch attends to every key patch in the same frame (no causal mask).
+    pub fn vit_attention_gqa_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+        n_heads: usize,
+        n_kv: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "vit_attention_gqa_f32",
+            kernels::VIT_ATTENTION_GQA_SRC,
+            "vit_attention_gqa_f32",
+        )?;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut vp = v.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut nh = n_heads as i32;
+        let mut nk = n_kv as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        // GRID-1: N is flattened onto gridDim.x ([n_heads * N]) — gridDim.y
+        // caps at 65535 and the LFM3-VL pixel budget reaches N ≈ 65536. The
+        // kernel tiles the key loop (VIT_ATTN_TILE), so the LDS scratch is a
+        // fixed tile + reduction workspace instead of N floats — the old
+        // (N + block) * 4 bytes exceeded the ~64 KB workgroup LDS ceiling at
+        // N ≳ 16k. Must match the kernel's `#define VIT_ATTN_TILE`.
+        const VIT_ATTN_TILE: usize = 2048;
+        let block_size: u32 = 256; // power of two; ≥ head_dim for the VL shape
+        let shared_mem = ((VIT_ATTN_TILE + block_size as usize) * 4) as u32;
+        let grid_x = (n_heads * n) as u32;
+        self.launch_maybe_blob(
+            "vit_attention_gqa_f32",
+            [grid_x, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(op);
+                b.push_i32(ni);
+                b.push_i32(nh);
+                b.push_i32(nk);
+                b.push_i32(hd);
+                b.push_f32(sc);
+                b
+            },
+        )
+    }
+
     /// Apply 2D rotary positional embedding to the Q and K halves of a packed
     /// QKV buffer for the Qwen3.5-VL vision tower (V is left untouched).
     ///

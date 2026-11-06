@@ -1727,6 +1727,14 @@
       "desc": "LFM2.5 1.2B Thinking dense (Q8, reasoning)",
       "quant_recipe": "v3-awq-f1"
     },
+    "lfm3:1.7b": {
+      "repo": "",
+      "file": "lfm3-1.7b.q8.hfq",
+      "size_gb": 1.9,
+      "min_vram_gb": 5.0,
+      "desc": "LiquidAI LFM3-1.7B hybrid conv/full-attn/sliding-attn text model (arch_id=24). Q8 HFQ; local-only until the quant is published. Routing-ready — product admission is owned by admissions.yml, not the registry.",
+      "quant_recipe": "q8"
+    },
     "raon-1-mini-preview": {
       "repo": "hipfire-models/raon-1-mini-preview",
       "file": "raon-1-mini-preview.mq4-xts",
@@ -1750,8 +1758,7 @@
       "file": "raon-1-mini-preview-dflash2.mq4",
       "size_gb": 0.75,
       "min_vram_gb": 20.0,
-      "desc": "KRAFTON Raon-1-mini-preview-dflash2 DFlash2 draft, MQ4V2 with F16 fc, for raon-1-mini-preview; the paired auto draft (opt out with speculation.dflash=off)."
-    },
+      "desc": "KRAFTON Raon-1-mini-preview-dflash2 DFlash2 draft, MQ4V2 with F16 fc, for raon-1-mini-preview; the paired auto draft (opt out with speculation.dflash=off)."    },
     "qwen3.5:2b-mq3": {
       "repo": "hipfire-models/qwen3.5-2b",
       "file": "qwen3.5-2b.mq3",
