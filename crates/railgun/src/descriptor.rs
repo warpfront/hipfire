@@ -555,7 +555,10 @@ mod tests {
 
     #[test]
     fn task_arena_is_recorded() {
-        let mut p = author("gfx1201", &[launch(&[(0, A)], 8, vec![ptr(0, &[VmemStore])])]);
+        let mut p = author(
+            "gfx1201",
+            &[launch(&[(0, A)], 8, vec![ptr(0, &[VmemStore])])],
+        );
         p.declare_task_arena(ResourceId(0)).unwrap();
         assert_eq!(p.kinds[&ResourceId(0)], ResourceKind::TaskArena);
     }
@@ -582,7 +585,12 @@ mod tests {
         // An interior arena pointer is refused (the arena must be a base).
         let args = vec![ptr(0, &[SmemLoad])];
         let mut l = launch(&[(0, A + 0x40)], 8, args.clone());
-        l.facts = Ok(arena_facts(args, 8, 0, vec![template(7, &[(0, &[VmemLoad])])]));
+        l.facts = Ok(arena_facts(
+            args,
+            8,
+            0,
+            vec![template(7, &[(0, &[VmemLoad])])],
+        ));
         let p = author("gfx1201", &[l]);
         assert!(
             matches!(&p.nodes[0].lowering, Lowering::HipDirect { reason } if reason.contains("interior 0")),
@@ -704,7 +712,12 @@ mod tests {
     fn an_arena_a_node_writes_cannot_be_bound() {
         let args = vec![ptr(0, &[SmemLoad])];
         let mut arena = launch(&[(0, A)], 8, args.clone());
-        arena.facts = Ok(arena_facts(args, 8, 0, vec![template(7, &[(0, &[VmemLoad])])]));
+        arena.facts = Ok(arena_facts(
+            args,
+            8,
+            0,
+            vec![template(7, &[(0, &[VmemLoad])])],
+        ));
         let writer = launch(&[(0, A)], 8, vec![ptr(0, &[VmemStore])]);
         let toucher = launch(&[(0, B)], 8, vec![ptr(0, &[VmemLoad])]);
         let mut p = author("gfx1201", &[arena, writer, toucher]);
@@ -748,12 +761,7 @@ mod tests {
         // Resource 1 is B's allocation, 2 is C's (launch bases are 4 KiB aligned).
         assert_eq!(
             image,
-            vec![
-                (0, B + 0x100),
-                (8, C + 0x20),
-                (64, C + 0x8),
-                (72, B + 0x10),
-            ]
+            vec![(0, B + 0x100), (8, C + 0x20), (64, C + 0x8), (72, B + 0x10),]
         );
         // A window's live bindings re-base every field.
         let live: Vec<Binding> = p
@@ -769,14 +777,10 @@ mod tests {
         // Smaller live bindings refuse an interior outside them.
         let mut small = p.resources.clone();
         small[1].bytes = 0x80;
-        let err = p
-            .binding_record_image(ResourceId(0), &small)
-            .unwrap_err();
+        let err = p.binding_record_image(ResourceId(0), &small).unwrap_err();
         assert!(err.contains("out-of-bounds descriptor"), "{err}");
         // A resource that is not bound records has no image.
-        assert!(p
-            .binding_record_image(ResourceId(1), &p.resources)
-            .is_err());
+        assert!(p.binding_record_image(ResourceId(1), &p.resources).is_err());
         // Address arithmetic is checked.
         let mut huge = p.resources.clone();
         huge[1].base = u64::MAX - 8;
@@ -835,5 +839,51 @@ mod tests {
         let mut bad = k.clone();
         bad.descriptor_arenas.push(bad.descriptor_arenas[0].clone());
         assert!(KernelFacts::from_record(&bad).is_err());
+    }
+
+    #[test]
+    fn arena_fields_may_name_allocations_no_kernarg_reaches() {
+        let mut p = arena_program();
+        assert_eq!(
+            p.resources.len(),
+            1,
+            "only the arena is an explicit argument"
+        );
+        let x = p
+            .resource_for(Binding {
+                base: B,
+                bytes: SIZE,
+            })
+            .unwrap();
+        let y = p
+            .resource_for(Binding {
+                base: C,
+                bytes: SIZE,
+            })
+            .unwrap();
+        assert_eq!((x, y), (ResourceId(1), ResourceId(2)));
+        assert_eq!(
+            p.resource_for(Binding {
+                base: B,
+                bytes: SIZE
+            }),
+            Ok(x),
+            "same allocation, same id"
+        );
+        let err = p
+            .resource_for(Binding {
+                base: B + 8,
+                bytes: SIZE,
+            })
+            .unwrap_err();
+        assert!(err.contains("overlaps resource 1"), "{err}");
+        assert!(p.resource_for(Binding { base: B, bytes: 0 }).is_err());
+        p.bind_records(ResourceId(0), vec![rec(0, 7, &[(0, 1, 0), (8, 2, 16)])])
+            .unwrap();
+        assert!(p.nodes[0].lowering.is_pm4(), "{:?}", p.nodes[0].lowering);
+        assert_eq!(
+            p.binding_record_image(ResourceId(0), &p.resources).unwrap(),
+            vec![(0, B), (8, C + 16)]
+        );
     }
 }

@@ -435,13 +435,14 @@ impl JitCorpus {
                 "receipt SHA-256 does not match the corpus index".into(),
             ));
         }
-        let receipt = parse_receipt(&bytes, key.arch, key.artifact_sha256).map_err(|e| match e {
-            ReceiptError::Json(source) => CorpusError::Json {
-                path: path.clone(),
-                source,
-            },
-            ReceiptError::Invalid(detail) => invalid(detail),
-        })?;
+        let receipt =
+            parse_receipt(&bytes, key.arch, key.artifact_sha256).map_err(|e| match e {
+                ReceiptError::Json(source) => CorpusError::Json {
+                    path: path.clone(),
+                    source,
+                },
+                ReceiptError::Invalid(detail) => invalid(detail),
+            })?;
         Ok(Lookup::Hit(Box::new(Hit {
             record: record.clone(),
             receipt,

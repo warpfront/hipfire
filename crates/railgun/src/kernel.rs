@@ -1680,6 +1680,35 @@ fn uncertified_node(launch: &LaunchRecord, reason: String) -> KernelNode {
 }
 
 impl KernelProgram {
+    /// The resource of allocation `binding`, added when the program does not
+    /// name it yet: a binding-record field may point into an allocation no
+    /// explicit kernarg pointer reaches ([`Self::bind_records`]). `binding`
+    /// must be the whole live allocation the runtime reports
+    /// (`hipMemGetAddressRange`), as [`author`] binds every pointer; the same
+    /// `(base, bytes)` yields the same id, and an allocation overlapping a
+    /// different one already in the program is refused.
+    pub fn resource_for(&mut self, binding: Binding) -> Result<ResourceId, String> {
+        if binding.bytes == 0 || binding.base.checked_add(binding.bytes).is_none() {
+            return Err(format!(
+                "allocation {:#x}+{} is empty or wraps",
+                binding.base, binding.bytes
+            ));
+        }
+        if let Some(i) = self.resources.iter().position(|r| *r == binding) {
+            return Ok(ResourceId(i as u32));
+        }
+        if let Some((i, r)) = self.resources.iter().enumerate().find(|(_, r)| {
+            binding.base < r.base.saturating_add(r.bytes) && r.base < binding.base + binding.bytes
+        }) {
+            return Err(format!(
+                "allocation {:#x}+{} overlaps resource {i} ({:#x}+{})",
+                binding.base, binding.bytes, r.base, r.bytes
+            ));
+        }
+        self.resources.push(binding);
+        Ok(ResourceId(self.resources.len() as u32 - 1))
+    }
+
     /// Make `c.body` an IF on `c.flag` (#867). Refused unless: the body is
     /// non-empty, in range and disjoint from every other conditional (no
     /// nesting); `flag` is a resource of at least 4 bytes; every body node

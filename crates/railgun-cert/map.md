@@ -113,5 +113,6 @@ Workspace crates with a path dependency on this crate:
 
 - `railgun`
 - `railgun-jitcorpus`
+- `rdna-compute`
 
 <!-- crate-map:generated:end -->

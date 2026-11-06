@@ -91,7 +91,8 @@ fn sys_variant(text: &str, wb: bool, inv_scope: &str, extra_load: bool) -> Strin
 }
 
 fn main() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../railgun-cert/tests/fixtures");
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../railgun-cert/tests/fixtures");
     let write = |name: &str, text: &str| {
         let elf = native::assemble(text, Arch::Gfx1201).expect("assemble");
         std::fs::write(dir.join(name), elf).expect("write fixture");

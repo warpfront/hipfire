@@ -98,7 +98,10 @@ fn kernarg(a: u64, x: u64, y: u64, m: u32, k: u32, b: u32, queue: u64, tasks: u3
 fn run(out: &str) -> Result<bool, String> {
     let mut gpu = rdna_compute::Gpu::init().map_err(|e| format!("gpu init: {e}"))?;
     if gpu.arch != "gfx1201" {
-        return Err(format!("device is {}; this smoke runs only on gfx1201", gpu.arch));
+        return Err(format!(
+            "device is {}; this smoke runs only on gfx1201",
+            gpu.arch
+        ));
     }
 
     // 1. Emit, certify, register.
@@ -170,8 +173,14 @@ fn run(out: &str) -> Result<bool, String> {
 
         // Direct HIP launch of the very same registered object.
         let mut direct_ka = ka(&y_direct, &q_direct);
-        gpu.launch_kernel_blob(pd::DISPATCH_SYMBOL, [grid, 1, 1], [32, 1, 1], 0, &mut direct_ka)
-            .map_err(|e| format!("direct launch: {e}"))?;
+        gpu.launch_kernel_blob(
+            pd::DISPATCH_SYMBOL,
+            [grid, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut direct_ka,
+        )
+        .map_err(|e| format!("direct launch: {e}"))?;
         gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
         let want_y = read(&y_direct, y_bytes)?;
         let want_q = u32s(&read(&q_direct, 8)?);
@@ -249,9 +258,11 @@ fn run(out: &str) -> Result<bool, String> {
                 b * m,
                 if ok { "OK" } else { "FAIL" }
             );
-            submits.push(json!({"rep": rep, "mismatched_words": mismatched, "unwritten_words": unwritten,
+            submits.push(
+                json!({"rep": rep, "mismatched_words": mismatched, "unwritten_words": unwritten,
                 "queue_direct": want_q, "queue_railgun": got_q,
-                "host_submit_return_us": submit_us, "host_complete_us": complete_us, "pass": ok}));
+                "host_submit_return_us": submit_us, "host_complete_us": complete_us, "pass": ok}),
+            );
         }
 
         // Submit without completion: refused before any write, then wait completes the first.

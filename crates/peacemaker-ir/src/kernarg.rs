@@ -75,7 +75,9 @@ pub enum AccessClass {
     VmemLoad,
     VmemStore,
     SmemLoad,
-    Atomic { commutative: bool },
+    Atomic {
+        commutative: bool,
+    },
     LdsDma,
     /// A commutative atomic RMW issued with release ordering.
     AtomicRelease,
@@ -85,9 +87,7 @@ pub enum AccessClass {
 impl AccessClass {
     pub fn mode(self) -> AccessMode {
         match self {
-            Self::VmemLoad | Self::SmemLoad | Self::LdsDma | Self::LoadAcquire => {
-                AccessMode::Read
-            }
+            Self::VmemLoad | Self::SmemLoad | Self::LdsDma | Self::LoadAcquire => AccessMode::Read,
             Self::VmemStore => AccessMode::Write,
             Self::Atomic { .. } | Self::AtomicRelease => AccessMode::ReadWrite,
         }

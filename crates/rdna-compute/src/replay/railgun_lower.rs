@@ -328,21 +328,16 @@ fn lower_owned(
             plan.segments.len()
         ));
     }
-    if let Some((i, node)) = program
-        .nodes
-        .iter()
-        .enumerate()
-        .find(|(_, n)| {
-            // `Lowering::LabPending` (differential-verified, certificate
-            // pending) lowers only in a lab build; a product build refuses
-            // it with the message below, exactly as before.
-            #[cfg(feature = "lab")]
-            let lowerable = n.lowering.is_pm4_lowerable();
-            #[cfg(not(feature = "lab"))]
-            let lowerable = n.lowering.is_pm4();
-            !lowerable
-        })
-    {
+    if let Some((i, node)) = program.nodes.iter().enumerate().find(|(_, n)| {
+        // `Lowering::LabPending` (differential-verified, certificate
+        // pending) lowers only in a lab build; a product build refuses
+        // it with the message below, exactly as before.
+        #[cfg(feature = "lab")]
+        let lowerable = n.lowering.is_pm4_lowerable();
+        #[cfg(not(feature = "lab"))]
+        let lowerable = n.lowering.is_pm4();
+        !lowerable
+    }) {
         return Err(format!(
             "node {i} {} is not PM4-lowered: {:?}",
             node.symbol, node.lowering
@@ -904,7 +899,9 @@ impl OwnedWindowLowering {
     /// when none is in flight), with `replay_and_wait`'s timeout, watchdog and
     /// quiescence semantics.
     pub(crate) fn wait_replay(&mut self) -> Result<(), OwnedReplayFailure> {
-        self.graph.wait_replay_checked().map_err(Self::replay_failure)
+        self.graph
+            .wait_replay_checked()
+            .map_err(Self::replay_failure)
     }
 
     fn replay_failure(

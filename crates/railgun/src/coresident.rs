@@ -235,8 +235,10 @@ pub(crate) fn classify(
             ));
         }
     }
-    let classes: Vec<BTreeMap<ResourceId, Vec<MemClass>>> =
-        members.iter().map(|&m| member_classes(program, m)).collect();
+    let classes: Vec<BTreeMap<ResourceId, Vec<MemClass>>> = members
+        .iter()
+        .map(|&m| member_classes(program, m))
+        .collect();
     // Event cells admit only event classes, from every member.
     let mut resources: Vec<ResourceId> = classes.iter().flat_map(|c| c.keys().copied()).collect();
     resources.sort_unstable();
@@ -271,14 +273,10 @@ pub(crate) fn classify(
                 let Some(cb) = classes[bi].get(&resource) else {
                     continue;
                 };
-                let (a_reads, a_writes) = (
-                    ca.iter().any(|c| c.reads()),
-                    ca.iter().any(|c| c.writes()),
-                );
-                let (b_reads, b_writes) = (
-                    cb.iter().any(|c| c.reads()),
-                    cb.iter().any(|c| c.writes()),
-                );
+                let (a_reads, a_writes) =
+                    (ca.iter().any(|c| c.reads()), ca.iter().any(|c| c.writes()));
+                let (b_reads, b_writes) =
+                    (cb.iter().any(|c| c.reads()), cb.iter().any(|c| c.writes()));
                 if !(a_writes || b_writes) {
                     continue; // both sides only read: no hazard
                 }
@@ -569,7 +567,7 @@ mod tests {
     use super::*;
     use crate::kernel::tests::{launch, ptr};
     use crate::kernel::{author, Lowering, MemClass::*};
-    use crate::plan::{plan, CacheTable, Rung, RowPolicy, Visibility};
+    use crate::plan::{plan, CacheTable, RowPolicy, Rung, Visibility};
 
     const X: u64 = 0x7000_0000;
     const E: u64 = 0x7100_0000;
@@ -577,7 +575,11 @@ mod tests {
     const D2: u64 = 0x7300_0000;
 
     fn plan_of(p: &KernelProgram) -> Pm4Plan {
-        plan(p, &CacheTable::for_arch("gfx1201").unwrap(), RowPolicy::TierD)
+        plan(
+            p,
+            &CacheTable::for_arch("gfx1201").unwrap(),
+            RowPolicy::TierD,
+        )
     }
 
     /// n0 stores X; n1 (member) releases on E, stores D1; n2 (member)
@@ -638,7 +640,11 @@ mod tests {
         assert_eq!(dispatches[1], dispatches[0] + 1);
         // The event cells conflict is admitted, with a reason.
         assert_eq!(g.groups.len(), 1);
-        assert!(g.groups[0].refusals.is_empty(), "{:?}", g.groups[0].refusals);
+        assert!(
+            g.groups[0].refusals.is_empty(),
+            "{:?}",
+            g.groups[0].refusals
+        );
         assert_eq!(g.groups[0].admitted.len(), 1);
         assert_eq!(g.groups[0].admitted[0].0.resource, 1);
         assert_eq!(g.groups[0].admitted[0].1, WHY_EVENT_CELLS);
@@ -702,7 +708,10 @@ mod tests {
             g.groups[0].refusals
         );
         let err = g.group_admission().unwrap_err();
-        assert!(err.contains("refused") && err.contains("resource 0"), "{err}");
+        assert!(
+            err.contains("refused") && err.contains("resource 0"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -753,7 +762,11 @@ mod tests {
         p.add_coresident_group(0..2, GroupOrdering::from_certificate(vec![edge(0, 1)]))
             .unwrap();
         let g = plan_of(&p);
-        assert!(g.groups[0].refusals.is_empty(), "{:?}", g.groups[0].refusals);
+        assert!(
+            g.groups[0].refusals.is_empty(),
+            "{:?}",
+            g.groups[0].refusals
+        );
         let data: Vec<_> = g.groups[0]
             .admitted
             .iter()
@@ -814,9 +827,7 @@ mod tests {
         let mut p = ordered_program();
         assert!(p.add_coresident_group(0..1, GroupOrdering::none()).is_err());
         assert!(p.add_coresident_group(0..5, GroupOrdering::none()).is_err());
-        p.nodes[1].lowering = Lowering::HipDirect {
-            reason: "x".into(),
-        };
+        p.nodes[1].lowering = Lowering::HipDirect { reason: "x".into() };
         assert!(p.add_coresident_group(0..2, GroupOrdering::none()).is_err());
         p.nodes[1].lowering = Lowering::Pm4;
         p.add_coresident_group(0..2, GroupOrdering::none()).unwrap();
@@ -874,10 +885,7 @@ mod tests {
         // 10/4 + 48/8 = 8.5 > 7.5 and 58 > 40.
         let (p, mut plan) = residency_plan([[10, 1, 1], [48, 1, 1]]);
         let err = plan.admit_residency(&p, 0, 10, &[4, 8]).unwrap_err();
-        assert!(
-            err.contains("co-resident group exceeds occupancy"),
-            "{err}"
-        );
+        assert!(err.contains("co-resident group exceeds occupancy"), "{err}");
         assert!(plan.groups[0].residency.is_none());
         // One more workgroup over the rule-B boundary.
         let (p, mut plan) = residency_plan([[7, 1, 1], [48, 1, 1]]);

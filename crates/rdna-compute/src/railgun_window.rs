@@ -759,9 +759,10 @@ impl Gpu {
                         node.symbol, kref.artifact_sha256
                     ));
                 }
-                let func = self.functions.get(&node.symbol).ok_or_else(|| {
-                    format!("node {i} {}: function is not loaded", node.symbol)
-                })?;
+                let func = self
+                    .functions
+                    .get(&node.symbol)
+                    .ok_or_else(|| format!("node {i} {}: function is not loaded", node.symbol))?;
                 let threads = node.block[0]
                     .checked_mul(node.block[1])
                     .and_then(|t| t.checked_mul(node.block[2]))
@@ -1711,10 +1712,7 @@ mod tests {
 
     #[test]
     fn a_group_member_grid_must_be_the_admitted_one() {
-        let node = |grid| NodeImage {
-            kernarg: &[],
-            grid,
-        };
+        let node = |grid| NodeImage { kernarg: &[], grid };
         let admitted = [None, Some([4, 1, 1]), Some([2, 1, 1])];
         let ok = [node([9, 9, 9]), node([4, 1, 1]), node([2, 1, 1])];
         assert_eq!(check_admitted_grids(&admitted, &ok), Ok(()));

@@ -713,7 +713,8 @@ mod tests {
         assert_eq!(back.descriptor_arenas, k.descriptor_arenas);
 
         let mut changed = k.clone();
-        changed.descriptor_arenas[0].templates[0].pointer_loads[0].classes = vec!["vmem_store".into()];
+        changed.descriptor_arenas[0].templates[0].pointer_loads[0].classes =
+            vec!["vmem_store".into()];
         assert!(
             changed.validate_case("obj", "elf", "gfx1201").is_err(),
             "the digest binds the arena facts"

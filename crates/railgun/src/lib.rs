@@ -136,7 +136,9 @@ pub enum ResourceKind {
     /// stores into them with a plain store).
     ///
     /// [`KernelProgram::declare_event_cells`]: crate::kernel::KernelProgram::declare_event_cells
-    EventCells { cells: u32 },
+    EventCells {
+        cells: u32,
+    },
     /// GPU-rewritten task records (design §8.1 `TaskDesc`): the device may
     /// write them. No loaded value is an address base — A1 attributes every
     /// access to an explicit pointer argument or a descriptor arena, so a

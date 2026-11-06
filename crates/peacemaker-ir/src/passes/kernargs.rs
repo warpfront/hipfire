@@ -846,9 +846,15 @@ fn waits_zero(inst: &Inst, counter: Counter) -> bool {
 /// the cache maintenance operations (which carry none).
 fn is_memory_inst(arch: Arch, inst: &Inst) -> bool {
     inst.effects.mem.is_some()
-        || ["global_inv", "global_wb", "buffer_inv", "buffer_wb", "buffer_gl"]
-            .iter()
-            .any(|p| inst_name(arch, inst).starts_with(p))
+        || [
+            "global_inv",
+            "global_wb",
+            "buffer_inv",
+            "buffer_wb",
+            "buffer_gl",
+        ]
+        .iter()
+        .any(|p| inst_name(arch, inst).starts_with(p))
 }
 
 /// Whether `inst` reads memory (any load, any atomic, LDS DMA, scalar loads).
@@ -879,15 +885,17 @@ fn released_before(arch: Arch, body: &Body, block: usize, pos: usize, scope: u8)
         let Some(inst) = body.insts.get(body.layout[p]) else {
             return false;
         };
-        let (l, s) = (waits_zero(inst, Counter::Load), waits_zero(inst, Counter::Store));
+        let (l, s) = (
+            waits_zero(inst, Counter::Load),
+            waits_zero(inst, Counter::Store),
+        );
         if l || s {
             load0 |= l;
             store0 |= s;
             continue;
         }
         if is_memory_inst(arch, inst) {
-            let wb_sys =
-                inst_name(arch, inst) == "global_wb" && inst.mods.cpol.scope == SCOPE_SYS;
+            let wb_sys = inst_name(arch, inst) == "global_wb" && inst.mods.cpol.scope == SCOPE_SYS;
             return load0 && store0 && (scope == SCOPE_DEV || wb_sys);
         }
     }
@@ -900,13 +908,7 @@ fn released_before(arch: Arch, body: &Body, block: usize, pos: usize, scope: u8)
 /// the load itself (a spin's re-poll: the superseded observation is never
 /// used), has no read to protect. A different memory read, a `global_inv` too
 /// narrow or before the wait, or a path leaving the CFG fails the proof.
-fn acquired_after(
-    arch: Arch,
-    body: &Body,
-    block_of: &[usize],
-    pos: usize,
-    scope: u8,
-) -> bool {
+fn acquired_after(arch: Arch, body: &Body, block_of: &[usize], pos: usize, scope: u8) -> bool {
     let mut seen = vec![[false; 2]; body.blocks.len()];
     let mut work = vec![(block_of[pos], pos + 1, false)];
     while let Some((b, start, mut waited)) = work.pop() {
@@ -963,9 +965,7 @@ fn sync_classes(arch: Arch, body: &Body) -> Vec<Option<AccessClass>> {
     }
     let mut block_of = vec![0usize; body.layout.len()];
     for (b, block) in body.blocks.iter().enumerate() {
-        for pos in block.range.0..block.range.1 {
-            block_of[pos] = b;
-        }
+        block_of[block.range.0..block.range.1].fill(b);
     }
     for (pos, &id) in body.layout.iter().enumerate() {
         let Some(inst) = body.insts.get(id) else {

@@ -227,10 +227,7 @@ pub(crate) fn node_pending(program: &KernelProgram, range: Range<usize>) -> Vec<
     let mut out = Vec::new();
     for i in range {
         if let Lowering::LabPending { pending } = &program.nodes[i].lowering {
-            out.push(format!(
-                "node {i} ({}): {pending}",
-                program.nodes[i].symbol
-            ));
+            out.push(format!("node {i} ({}): {pending}", program.nodes[i].symbol));
         }
     }
     out
@@ -301,7 +298,12 @@ mod lab {
         MemClass::AtomicCommutative,
     ];
 
-    fn grant(effects: &mut Vec<RegionEffect>, arg_offset: u32, resource: ResourceId, add: &[MemClass]) {
+    fn grant(
+        effects: &mut Vec<RegionEffect>,
+        arg_offset: u32,
+        resource: ResourceId,
+        add: &[MemClass],
+    ) {
         match effects
             .iter_mut()
             .find(|e| e.arg_offset == arg_offset && e.resource == resource)
@@ -368,9 +370,7 @@ mod lab {
                         "{who} is certified but not PM4 ({reason}): not a pending certificate"
                     ))
                 }
-                Lowering::LabPending { .. } => {
-                    return Err(format!("{who} is already lab-pending"))
-                }
+                Lowering::LabPending { .. } => return Err(format!("{who} is already lab-pending")),
             };
             if n.kref.is_none() {
                 return Err(format!(
@@ -492,11 +492,19 @@ mod lab_tests {
     const D: u64 = 0x7200_0000;
 
     fn plan_of(p: &KernelProgram) -> Pm4Plan {
-        plan(p, &CacheTable::for_arch("gfx1201").unwrap(), RowPolicy::TierD)
+        plan(
+            p,
+            &CacheTable::for_arch("gfx1201").unwrap(),
+            RowPolicy::TierD,
+        )
     }
 
     /// A launch whose facts are `A1 Unknown`.
-    fn unknown(pointers: &[(u32, u64)], explicit: u32, args: Vec<crate::kernel::ArgFact>) -> crate::kernel::LaunchRecord {
+    fn unknown(
+        pointers: &[(u32, u64)],
+        explicit: u32,
+        args: Vec<crate::kernel::ArgFact>,
+    ) -> crate::kernel::LaunchRecord {
         let mut l = launch(pointers, explicit, args.clone());
         let mut f = (*facts(args, explicit)).clone();
         f.facts.status = FactStatus::Unknown(vec!["indirect-pointer-load".into()]);
@@ -508,7 +516,11 @@ mod lab_tests {
     fn a1_unknown_node_is_admitted_lab_pending_with_conservative_effects() {
         let mut p = author(
             "gfx1201",
-            &[unknown(&[(0, A), (8, E)], 16, vec![ptr(0, &[SmemLoad]), ptr(8, &[AtomicRelease])])],
+            &[unknown(
+                &[(0, A), (8, E)],
+                16,
+                vec![ptr(0, &[SmemLoad]), ptr(8, &[AtomicRelease])],
+            )],
         );
         p.declare_event_cells(ResourceId(1), 4).unwrap();
         assert!(matches!(
@@ -518,10 +530,17 @@ mod lab_tests {
         assert_eq!(p.admission(), Admission::Certified, "no lab node yet");
         p.admit_lab_pending(0, None).unwrap();
         let n = &p.nodes[0];
-        assert!(matches!(&n.lowering, Lowering::LabPending { pending } if pending.starts_with("A1 Unknown (")));
+        assert!(
+            matches!(&n.lowering, Lowering::LabPending { pending } if pending.starts_with("A1 Unknown ("))
+        );
         assert!(!n.lowering.is_pm4());
         assert!(n.lowering.is_pm4_lowerable());
-        let on = |r: u32| n.effects.iter().find(|e| e.resource == ResourceId(r)).unwrap();
+        let on = |r: u32| {
+            n.effects
+                .iter()
+                .find(|e| e.resource == ResourceId(r))
+                .unwrap()
+        };
         // A's A1 class is kept and VmemLoad + VmemStore are added.
         assert!(on(0).has(SmemLoad) && on(0).has(VmemLoad) && on(0).has(VmemStore));
         // The event cells keep A1's classes: no plain store.
@@ -529,7 +548,10 @@ mod lab_tests {
         match p.admission() {
             Admission::LabPending { reasons } => {
                 assert_eq!(reasons.len(), 1);
-                assert!(reasons[0].starts_with("node 0 (k): A1 Unknown ("), "{reasons:?}");
+                assert!(
+                    reasons[0].starts_with("node 0 (k): A1 Unknown ("),
+                    "{reasons:?}"
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -544,7 +566,8 @@ mod lab_tests {
         );
         let before = p.clone();
         // Declaring as event cells already fails; bypass it to hit admit's own check.
-        p.kinds.insert(ResourceId(0), ResourceKind::EventCells { cells: 4 });
+        p.kinds
+            .insert(ResourceId(0), ResourceKind::EventCells { cells: 4 });
         let err = p.admit_lab_pending(0, None).unwrap_err();
         assert!(err.contains("not an event class"), "{err}");
         assert_eq!(p.nodes, before.nodes, "an Err leaves the nodes unchanged");
@@ -577,14 +600,26 @@ mod lab_tests {
         assert!(err.contains("G8 differential fails"), "{err}");
 
         // A proven PM4 node and a missing node.
-        let mut p = author("gfx1201", &[launch(&[(0, A)], 8, vec![ptr(0, &[VmemLoad])])]);
-        assert!(p.admit_lab_pending(0, None).unwrap_err().contains("already PM4"));
+        let mut p = author(
+            "gfx1201",
+            &[launch(&[(0, A)], 8, vec![ptr(0, &[VmemLoad])])],
+        );
+        assert!(p
+            .admit_lab_pending(0, None)
+            .unwrap_err()
+            .contains("already PM4"));
         assert!(p.admit_lab_pending(3, None).is_err());
 
         // Twice.
-        let mut p = author("gfx1201", &[unknown(&[(0, A)], 8, vec![ptr(0, &[VmemLoad])])]);
+        let mut p = author(
+            "gfx1201",
+            &[unknown(&[(0, A)], 8, vec![ptr(0, &[VmemLoad])])],
+        );
         p.admit_lab_pending(0, None).unwrap();
-        assert!(p.admit_lab_pending(0, None).unwrap_err().contains("already lab-pending"));
+        assert!(p
+            .admit_lab_pending(0, None)
+            .unwrap_err()
+            .contains("already lab-pending"));
     }
 
     #[test]
@@ -594,7 +629,11 @@ mod lab_tests {
         let toucher = launch(
             &[(0, 0x7300_0000), (8, 0x7400_0000), (16, E)],
             24,
-            vec![ptr(0, &[VmemLoad]), ptr(8, &[VmemLoad]), ptr(16, &[AtomicRelease])],
+            vec![
+                ptr(0, &[VmemLoad]),
+                ptr(8, &[VmemLoad]),
+                ptr(16, &[AtomicRelease]),
+            ],
         );
         let mut p = author("gfx1201", &[n0, toucher]);
         p.declare_event_cells(ResourceId(3), 4).unwrap();
@@ -602,29 +641,59 @@ mod lab_tests {
             base: 0,
             template: 1,
             fields: vec![
-                BindingField { offset: 0, resource: ResourceId(1), interior: 0 },
-                BindingField { offset: 8, resource: ResourceId(2), interior: 0 },
-                BindingField { offset: 16, resource: ResourceId(3), interior: 0 },
+                BindingField {
+                    offset: 0,
+                    resource: ResourceId(1),
+                    interior: 0,
+                },
+                BindingField {
+                    offset: 8,
+                    resource: ResourceId(2),
+                    interior: 0,
+                },
+                BindingField {
+                    offset: 16,
+                    resource: ResourceId(3),
+                    interior: 0,
+                },
             ],
         };
         p.bind_records(ResourceId(0), vec![rec]).unwrap();
 
         // The arena must be the declared kind and some argument must be bound to it.
         let mut q = p.clone();
-        assert!(q.admit_lab_pending(0, Some(ResourceId(1))).unwrap_err().contains("not declared BindingRecords"));
-        let mut q = author("gfx1201", &[unknown(&[(0, A)], 8, vec![ptr(0, &[SmemLoad])])]);
+        assert!(q
+            .admit_lab_pending(0, Some(ResourceId(1)))
+            .unwrap_err()
+            .contains("not declared BindingRecords"));
+        let mut q = author(
+            "gfx1201",
+            &[unknown(&[(0, A)], 8, vec![ptr(0, &[SmemLoad])])],
+        );
         q.kinds.insert(ResourceId(0), ResourceKind::TaskArena);
         assert!(q.admit_lab_pending(0, Some(ResourceId(0))).is_err());
         // A node with no argument bound to the arena.
         let stray = unknown(&[(0, 0x7500_0000)], 8, vec![ptr(0, &[VmemLoad])]);
         let mut r = author("gfx1201", &[stray]);
-        r.resources.push(crate::Binding { base: A, bytes: 0x10000 });
-        r.kinds.insert(ResourceId(1), ResourceKind::BindingRecords(Vec::new()));
-        assert!(r.admit_lab_pending(0, Some(ResourceId(1))).unwrap_err().contains("no argument of the node is bound"));
+        r.resources.push(crate::Binding {
+            base: A,
+            bytes: 0x10000,
+        });
+        r.kinds
+            .insert(ResourceId(1), ResourceKind::BindingRecords(Vec::new()));
+        assert!(r
+            .admit_lab_pending(0, Some(ResourceId(1)))
+            .unwrap_err()
+            .contains("no argument of the node is bound"));
 
         p.admit_lab_pending(0, Some(ResourceId(0))).unwrap();
         let n = &p.nodes[0];
-        let on = |r: u32| n.effects.iter().find(|e| e.resource == ResourceId(r)).unwrap();
+        let on = |r: u32| {
+            n.effects
+                .iter()
+                .find(|e| e.resource == ResourceId(r))
+                .unwrap()
+        };
         // The arena: its A1 class plus a read, never a write.
         assert!(on(0).has(SmemLoad) && on(0).has(VmemLoad) && !on(0).writes());
         // Plain field resources: load + store through the arena argument.
@@ -642,8 +711,16 @@ mod lab_tests {
         let mut p = author(
             "gfx1201",
             &[
-                unknown(&[(0, E), (8, D)], 16, vec![ptr(0, &[AtomicRelease]), ptr(8, &[VmemStore])]),
-                unknown(&[(0, E), (8, D)], 16, vec![ptr(0, &[LoadAcquire]), ptr(8, &[VmemLoad])]),
+                unknown(
+                    &[(0, E), (8, D)],
+                    16,
+                    vec![ptr(0, &[AtomicRelease]), ptr(8, &[VmemStore])],
+                ),
+                unknown(
+                    &[(0, E), (8, D)],
+                    16,
+                    vec![ptr(0, &[LoadAcquire]), ptr(8, &[VmemLoad])],
+                ),
             ],
         );
         p.declare_event_cells(ResourceId(0), 4).unwrap();
@@ -669,8 +746,16 @@ mod lab_tests {
         p.add_coresident_group(0..2, GroupOrdering::lab_pending(vec![edge()]))
             .unwrap();
         let mut g = plan_of(&p);
-        assert!(g.groups[0].refusals.is_empty(), "{:?}", g.groups[0].refusals);
-        let data: Vec<_> = g.groups[0].admitted.iter().filter(|(e, _)| e.resource == 1).collect();
+        assert!(
+            g.groups[0].refusals.is_empty(),
+            "{:?}",
+            g.groups[0].refusals
+        );
+        let data: Vec<_> = g.groups[0]
+            .admitted
+            .iter()
+            .filter(|(e, _)| e.resource == 1)
+            .collect();
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].1, WHY_ORDERED_EDGE);
         g.admit_residency(&p, 0, 10, &[4, 4]).unwrap();
@@ -680,7 +765,9 @@ mod lab_tests {
             Admission::LabPending { reasons } => {
                 // Both members and the ordering are pending.
                 assert_eq!(reasons.len(), 3, "{reasons:?}");
-                assert!(reasons.iter().any(|r| r.contains("ordering edges are not from a task-graph certificate")));
+                assert!(reasons
+                    .iter()
+                    .any(|r| r.contains("ordering edges are not from a task-graph certificate")));
             }
             other => panic!("{other:?}"),
         }
@@ -718,7 +805,10 @@ mod lab_tests {
                 lowering: crate::kernel::CondLowering::CpSkip,
             })
             .unwrap_err();
-        assert!(err.contains("not PM4") || err.contains("COND_EXEC"), "{err}");
+        assert!(
+            err.contains("not PM4") || err.contains("COND_EXEC"),
+            "{err}"
+        );
     }
 }
 
@@ -761,8 +851,16 @@ mod tests {
         let mut p = author(
             "gfx1201",
             &[
-                launch(&[(0, E), (8, D)], 16, vec![ptr(0, &[AtomicRelease]), ptr(8, &[VmemStore])]),
-                launch(&[(0, E), (8, D)], 16, vec![ptr(0, &[LoadAcquire]), ptr(8, &[VmemLoad])]),
+                launch(
+                    &[(0, E), (8, D)],
+                    16,
+                    vec![ptr(0, &[AtomicRelease]), ptr(8, &[VmemStore])],
+                ),
+                launch(
+                    &[(0, E), (8, D)],
+                    16,
+                    vec![ptr(0, &[LoadAcquire]), ptr(8, &[VmemLoad])],
+                ),
             ],
         );
         p.declare_event_cells(ResourceId(0), 4).unwrap();
@@ -777,7 +875,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.admission(), Admission::Certified);
-        let g = plan(&p, &CacheTable::for_arch("gfx1201").unwrap(), RowPolicy::TierD);
+        let g = plan(
+            &p,
+            &CacheTable::for_arch("gfx1201").unwrap(),
+            RowPolicy::TierD,
+        );
         assert_eq!(g.admission(), Admission::Certified);
         assert_eq!(g.groups[0].admission(), Admission::Certified);
         assert!(!p.groups[0].ordering.is_pending());

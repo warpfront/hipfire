@@ -80,8 +80,8 @@ fn receipt_of_another_object_is_refused() {
         PinnedReceipt::admit("copy", "gfx1201", &bytes, &sha, &receipt_json(&other)).unwrap_err();
     assert!(err.contains("receipt certifies"), "{err}");
     // ... and a receipt for the right bytes on another arch.
-    let err = PinnedReceipt::admit("copy", "gfx1100", &bytes, &sha, &receipt_json(&bytes))
-        .unwrap_err();
+    let err =
+        PinnedReceipt::admit("copy", "gfx1100", &bytes, &sha, &receipt_json(&bytes)).unwrap_err();
     assert!(err.contains("receipt certifies"), "{err}");
 }
 
