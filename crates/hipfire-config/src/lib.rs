@@ -6477,21 +6477,50 @@ fn insert_toml_path(
     insert_toml_path(nested, tail, value)
 }
 
+/// Process-wide sequence for [`atomic_write`] staging names: every writer in a
+/// process shares the pid, so the pid alone cannot keep two threads apart.
+static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Replace `path` with `bytes`: stage in a sibling file, then rename over it.
+/// The staging file is private to this call (`<stem>.tmp.<pid>.<seq>`, created
+/// `O_EXCL` so a stale leftover of a reused pid is skipped, not truncated), so
+/// concurrent writers of one file, whether threads of this process or other
+/// processes, never share a staging file: the last rename wins and every
+/// reader sees one whole payload.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
             path: parent.to_owned(),
             source,
         })?;
     }
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    fs::write(&tmp, bytes).map_err(|source| ConfigError::Write {
-        path: tmp.clone(),
-        source,
-    })?;
-    fs::rename(&tmp, path).map_err(|source| ConfigError::Write {
-        path: path.to_owned(),
-        source,
+    let (tmp, mut staged) = loop {
+        let seq = STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp.{}.{seq}", std::process::id()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => break (tmp, file),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(ConfigError::Write { path: tmp, source }),
+        }
+    };
+    if let Err(source) = staged.write_all(bytes) {
+        drop(staged);
+        let _ = fs::remove_file(&tmp);
+        return Err(ConfigError::Write { path: tmp, source });
+    }
+    drop(staged);
+    fs::rename(&tmp, path).map_err(|source| {
+        let _ = fs::remove_file(&tmp);
+        ConfigError::Write {
+            path: path.to_owned(),
+            source,
+        }
     })
 }
 
@@ -6925,6 +6954,54 @@ mod tests {
 
     fn temp_root(name: &str) -> PathBuf {
         env::temp_dir().join(format!("hipfire-config-{name}-{}", std::process::id()))
+    }
+
+    /// Every writer in one process shares the pid, so a pid-only staging name
+    /// made concurrent writes of one file race: one writer's rename took the
+    /// staging file out from under another (`No such file or directory`), or
+    /// two writers interleaved into it. Sixteen threads released together by a
+    /// barrier writing the same file must all succeed, leave exactly one whole
+    /// payload and leave no staging file behind.
+    #[test]
+    fn concurrent_atomic_writes_of_one_file_all_succeed_and_leave_one_whole_payload() {
+        const THREADS: usize = 16;
+        const ROUNDS: usize = 100;
+        let root = temp_root("atomic-write-concurrent");
+        let _ = fs::remove_dir_all(&root);
+        let path = root.join("config.toml");
+        // Distinct multi-page payloads, so overlapping writers would visibly mix.
+        let payloads: Vec<Vec<u8>> = (0..THREADS)
+            .map(|thread| format!("writer = {thread}\n").repeat(2048).into_bytes())
+            .collect();
+        let start = std::sync::Barrier::new(THREADS);
+        std::thread::scope(|scope| {
+            for payload in &payloads {
+                let (path, start) = (&path, &start);
+                scope.spawn(move || {
+                    start.wait();
+                    for round in 0..ROUNDS {
+                        atomic_write(path, payload)
+                            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+                    }
+                });
+            }
+        });
+        let written = fs::read(&path).unwrap();
+        assert!(
+            payloads.contains(&written),
+            "config.toml is not one writer's whole payload ({} bytes)",
+            written.len()
+        );
+        let entries: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            [std::ffi::OsString::from("config.toml")],
+            "a staging file was left behind"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn home_env<'a>(
