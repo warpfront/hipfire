@@ -343,6 +343,21 @@ pub const GFX1201_Q8_QSA_ROWS_RECEIPT: &str =
 pub const GFX1201_Q8_TRUNK_ROWS_RECEIPT: &str =
     "g0 mgmtp/q8trunk/runs/oracle1 j6678 2026-11-02 gfx1201 q8f16 gdn in/out head rows1-8";
 
+/// G0 oracle receipt behind the gfx1201 HC8 (`.hc8` sidecar, `DType::HC8E4M3Row`)
+/// row-twin proofs (`HyperRead([BF16, HC8E4M3Row, HC8E4M3Row])` for `HcRead` and
+/// `FinalHyper`; EP domain; `HcWrite` keeps its BF16 `block_inject` row):
+/// `lane_hc8_rows_oracle` over the real sidecar (200 sha256-verified payloads, 100
+/// connections: 48 layers x attn/mlp, the MTP layer's, the final mixer), the
+/// dispatch's shared all-rows launch (`execute_hyper_read`, `execute_final_hyper`, and
+/// the fused write -> read chain of `execute_validated_steps` over 47 consecutive layer
+/// pairs, under the all-rows wide scope for R > 8) vs R separate rows == 1 launches per
+/// row, R in 1..=64 in both row orders, 2 seeds of BF16-exact stream rows plus
+/// real-magnitude edge rows, over normalized/low/up/mixed (and chain streams/gates/clear):
+/// 0 mismatching bytes (38,656 cells, 137,418,045,440 bytes compared, fabric j8251,
+/// card B).
+pub const GFX1201_HC8_ROWS_RECEIPT: &str =
+    "g0 hc8/proof/oracle1 j8251 2026-11-06 gfx1201 hc8 e4m3 hc read rows1-64";
+
 /// Device topology a lane step runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LaneTopology {
@@ -661,6 +676,15 @@ pub static LANE_ROW_TWIN_PROOFS: &[RowTwinProof] = &[
         LANE_EP_ONLY,
         GFX1201_EP2_MQ4_RECEIPT,
     ),
+    // HC8 sidecar (`.hc8`, E4M3 mixers): the all-rows read is bitwise the rows == 1
+    // singleton per row, oracle `lane_hc8_rows_oracle`. `HcWrite` stays BF16.
+    proof(
+        "gfx1201",
+        StageName::HcRead,
+        StageRoute::HyperRead([DType::BF16, DType::HC8E4M3Row, DType::HC8E4M3Row]),
+        LANE_EP_ONLY,
+        GFX1201_HC8_ROWS_RECEIPT,
+    ),
     proof(
         "gfx1201",
         StageName::HcWrite,
@@ -734,6 +758,13 @@ pub static LANE_ROW_TWIN_PROOFS: &[RowTwinProof] = &[
         StageRoute::HyperRead([DType::BF16; 3]),
         LANE_EP_ONLY,
         GFX1201_EP2_MQ4_RECEIPT,
+    ),
+    proof(
+        "gfx1201",
+        StageName::FinalHyper,
+        StageRoute::HyperRead([DType::BF16, DType::HC8E4M3Row, DType::HC8E4M3Row]),
+        LANE_EP_ONLY,
+        GFX1201_HC8_ROWS_RECEIPT,
     ),
     proof(
         "gfx1201",
@@ -4262,8 +4293,8 @@ mod tests {
         // and one EP row per shared stage, plus the second PP MoE row (the
         // mq3 slab class), the two EP Q8F16 QSA overlay rows (qsa_in x4,
         // qsa_out) and the three EP Q8F16 trunk rows (gdn_in x4, gdn_out,
-        // head).
-        assert_eq!(LANE_ROW_TWIN_PROOFS.len(), 3 * shared.len() + 1 + 2 + 3);
+        // head), and the two EP HC8 rows (hc_read, final_hyper).
+        assert_eq!(LANE_ROW_TWIN_PROOFS.len(), 3 * shared.len() + 1 + 2 + 3 + 2);
         for arch in ["gfx1151", "gfx1201"] {
             for stage in StageName::ALL {
                 for topology in ALL_TOPOLOGIES {
@@ -4301,6 +4332,8 @@ mod tests {
                                         | StageName::GdnInProj
                                         | StageName::GdnOutProj
                                         | StageName::Head
+                                        | StageName::HcRead
+                                        | StageName::FinalHyper
                                 ),
                         );
                     assert_eq!(rows.len(), count, "{arch} {topology:?} {}", stage.key());
@@ -4348,6 +4381,12 @@ mod tests {
                                     );
                                 }
                                 assert_eq!(proof.domain, [LaneTopology::Ep]);
+                                let hc8_row = proof.route
+                                    == StageRoute::HyperRead([
+                                        DType::BF16,
+                                        DType::HC8E4M3Row,
+                                        DType::HC8E4M3Row,
+                                    ]);
                                 let q8_row = matches!(
                                     proof.route,
                                     StageRoute::QsaIn([
@@ -4363,6 +4402,7 @@ mod tests {
                                     ]) | StageRoute::Projection(DType::Q8_0)
                                 );
                                 let want = match (q8_row, stage) {
+                                    (false, _) if hc8_row => GFX1201_HC8_ROWS_RECEIPT,
                                     (false, _) => GFX1201_EP2_MQ4_RECEIPT,
                                     (true, StageName::QsaInProj | StageName::QsaOutProj) => {
                                         GFX1201_Q8_QSA_ROWS_RECEIPT
@@ -4578,16 +4618,19 @@ mod tests {
         for stage in shared_stages() {
             let rows = &table[stage.index()];
             // The QSA, GDN in/out and head stages carry the MQ6 row first and the
-            // Q8F16 trunk-overlay row second; every other stage one row.
-            let q8_trunk = matches!(
+            // Q8F16 trunk-overlay row second; hc_read and final_hyper the BF16 row
+            // first and the HC8 sidecar row second; every other stage one row.
+            let two_rows = matches!(
                 stage,
                 StageName::QsaInProj
                     | StageName::QsaOutProj
                     | StageName::GdnInProj
                     | StageName::GdnOutProj
                     | StageName::Head
+                    | StageName::HcRead
+                    | StageName::FinalHyper
             );
-            assert_eq!(rows.len(), 1 + usize::from(q8_trunk), "{}", stage.key());
+            assert_eq!(rows.len(), 1 + usize::from(two_rows), "{}", stage.key());
             assert!(
                 routes[stage.index()].iter().all(|route| *route == rows[0]),
                 "{}",
@@ -4614,6 +4657,9 @@ mod tests {
             table[StageName::Head.index()][1],
             StageRoute::Projection(DType::Q8_0)
         );
+        let hc8 = StageRoute::HyperRead([DType::BF16, DType::HC8E4M3Row, DType::HC8E4M3Row]);
+        assert_eq!(table[StageName::HcRead.index()][1], hc8);
+        assert_eq!(table[StageName::FinalHyper.index()][1], hc8);
         assert_eq!(table[StageName::Moe.index()], [ep_moe()]);
 
         let resolution = LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Ep, &routes);
@@ -4648,6 +4694,7 @@ mod tests {
             from_table.receipts,
             [
                 GFX1201_EP2_MQ4_RECEIPT,
+                GFX1201_HC8_ROWS_RECEIPT,
                 GFX1201_Q8_TRUNK_ROWS_RECEIPT,
                 GFX1201_Q8_QSA_ROWS_RECEIPT
             ]
