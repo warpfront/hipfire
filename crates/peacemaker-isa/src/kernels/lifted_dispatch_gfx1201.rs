@@ -680,6 +680,21 @@ pub fn pool(
                 b.wait_all()?;
                 let r = h.region;
                 b.foreign_region(&abi, &r.lines, r.sgprs, r.vgprs, r.lds_bytes)?;
+                // provenance for `.note.pm_regions` (railgun-cert replays the conversion)
+                let p = b
+                    .regions
+                    .last_mut()
+                    .expect("foreign_region records a proof");
+                p.template_id = Some(h.tmpl);
+                p.lift_inputs = Some(crate::plan::RegionLiftInputs {
+                    prefix: r.inputs.prefix.clone(),
+                    workgroup_x: r.inputs.workgroup_x,
+                    workgroup_yz: r.inputs.workgroup_yz,
+                    block: r.inputs.block,
+                    dynamic_lds: r.inputs.dynamic_lds,
+                });
+                p.source_object_sha256 = Some(r.receipt.base_object_sha256);
+                p.source_symbol = Some(r.symbol.clone());
                 exec_all(b)?;
                 op(
                     b,
@@ -754,6 +769,10 @@ pub fn pool(
                 )?;
                 b.wait_all()?;
                 b.region(&abi, |b| copy_body(b, block, &name))?;
+                b.regions
+                    .last_mut()
+                    .expect("region records a proof")
+                    .template_id = Some(c);
                 exec_all(b)?;
                 op(
                     b,

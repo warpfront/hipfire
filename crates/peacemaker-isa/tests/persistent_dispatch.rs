@@ -821,8 +821,24 @@ fn lifted_shipped_mq2_module_runs_as_a_p0_pool_region_on_the_emulator() {
         None,
     )
     .unwrap();
-    let elf = native::assemble(&pool.s_text, Arch::Gfx1201).unwrap();
+    let elf =
+        native::assemble_with_regions(&pool.s_text, Arch::Gfx1201, &pool.proof.regions).unwrap();
     assert!(check_carried(&elf, "pm_pool_mq2", &region).unwrap() > 1000);
+    // `.note.pm_regions` names the region, its lift request and its source object
+    let notes = peacemaker_lift::regions_note::read_regions(&elf).unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].kernel, "pm_pool_mq2");
+    let [note] = notes[0].regions.as_slice() else {
+        panic!("one region expected: {:?}", notes[0].regions)
+    };
+    assert_eq!(note.template_id, 5);
+    assert!(note.entry_pc < note.exit_pc);
+    assert_eq!(note.digest, region.receipt.base_object_sha256);
+    assert_eq!(note.source_symbol, region.symbol);
+    assert_eq!(
+        (note.block, note.prefix.as_str()),
+        (region.inputs.block, region.inputs.prefix.as_str())
+    );
     let solo = mq2::emit_text(&mq2::SHIPPED).unwrap();
     let (m, k, b) = (21usize, 512usize, 3usize);
     let want = run_mq2(&solo, mq2::SYMBOL, m.div_ceil(4) as u32, m, k, b, false);

@@ -94,9 +94,10 @@ fn main() {
                                 }],
                                 None,
                             )?;
-                            let elf = peacemaker_isa::native::assemble(
+                            let elf = peacemaker_isa::native::assemble_with_regions(
                                 &e.s_text,
                                 peacemaker_isa::Arch::Gfx1201,
+                                &e.proof.regions,
                             )?;
                             peacemaker_lift::rewrite::region::check_carried(&elf, &sym, &r)
                                 .map(|n| format!("ok: {n} carried"))

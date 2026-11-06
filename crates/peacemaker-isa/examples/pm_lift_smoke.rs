@@ -458,7 +458,14 @@ fn run_case(
                 &emitted.s_text,
             )
             .map_err(|e| e.to_string())?;
-            (symbol, native::assemble(&emitted.s_text, Arch::Gfx1201)?)
+            (
+                symbol,
+                native::assemble_with_regions(
+                    &emitted.s_text,
+                    Arch::Gfx1201,
+                    &emitted.proof.regions,
+                )?,
+            )
         }
     };
     let carried = check_carried(&pool_elf, &pool_symbol, &region)?;

@@ -124,7 +124,9 @@ pub fn build_pools(
             // COPY (tmpl 2, M0CopyArgs) is hosted by the 256-thread pool
             let copy = (b == 256).then_some(COPY_TMPL);
             let elf = ld::pool(&symbol, b, &hosted, copy)
-                .and_then(|e| native::assemble(&e.s_text, Arch::Gfx1201))
+                .and_then(|e| {
+                    native::assemble_with_regions(&e.s_text, Arch::Gfx1201, &e.proof.regions)
+                })
                 .and_then(|elf| {
                     for h in &hosted {
                         check_carried(&elf, &symbol, h.region)?;

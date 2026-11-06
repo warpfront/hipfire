@@ -141,7 +141,8 @@ fn main() {
     )
     .expect("pool");
     std::fs::write(&args[2], &e.s_text).unwrap();
-    let elf = native::assemble(&e.s_text, Arch::Gfx1201).expect("assemble");
+    let elf = native::assemble_with_regions(&e.s_text, Arch::Gfx1201, &e.proof.regions)
+        .expect("assemble");
     let pool = peacemaker_lift::lift_object(
         &elf,
         peacemaker_lift::Options {
