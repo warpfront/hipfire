@@ -152,6 +152,8 @@ const SPY: u32 = 1 << 22; // entry.vy < header gy
 const SPZ: u32 = 1 << 23; // entry.vz < header gz
 const SPC: u32 = 1 << 24; // the claim bitmap's bit of the entry was clear (returning atomic OR)
 const SPK: u32 = 1 << 25; // on the `k >= count` (NOP) edge
+const SPP: u32 = 1 << 26; // on a span path: pred != NONE (the NONE edge poisons)
+const SPQ: u32 = 1 << 27; // pred == NONE was observed on this path
 /// Every fact a span-mode path needs before a region (the live-list index, the count
 /// bound and the table index are proved structurally, by the value of the address).
 const SP_ALL: u32 = SP1 | SPN | SPX | SPY | SPZ | SPC;
@@ -271,9 +273,23 @@ enum E {
         gx: u32,
         gy: u32,
     },
-    /// Lane 0's mask of `a >= b` (unsigned), and of `x != 0`.
-    GeMask(Box<E>, Box<E>),
+    /// Lane 0's mask of `a >= b` (`gt`: `a > b`), unsigned, of a wave32 vector compare whose
+    /// first operand sat in VGPR `reg`; and of `x != 0`.
+    VCmp {
+        gt: bool,
+        a: Box<E>,
+        b: Box<E>,
+        reg: u16,
+    },
     NzMask(Box<E>),
+    /// Byte offset `32 + 32 * list_id` of the span descriptor of the list id at header offset
+    /// `.0` (after `list_id < n_spans`).
+    DescOff(u32),
+    /// Lo/hi dword of `live_list + 16 * k` (k at header offset `.k`, after `k < count <= K`).
+    LiveAddr {
+        k: u32,
+        hi: bool,
+    },
 }
 
 /// A stage of the claim-bitmap index computation `bit = vx + gx * (vy + gy * vz)` of a span
@@ -317,7 +333,7 @@ impl E {
             E::EventAt { idx, .. } => 1 + idx.depth(),
             E::PtrLo { add, .. } | E::PtrHi { add, .. } => 1 + add.depth(),
             E::Or(a, b) | E::Add(a, b) => 1 + a.depth().max(b.depth()),
-            E::Mul(a, b) | E::GeMask(a, b) => 1 + a.depth().max(b.depth()),
+            E::Mul(a, b) | E::VCmp { a, b, .. } => 1 + a.depth().max(b.depth()),
             E::NzMask(x) => 1 + x.depth(),
             E::Trip { bound, .. } | E::TripNext { bound, .. } | E::TripCont { bound, .. } => {
                 1 + bound.depth()
@@ -347,9 +363,10 @@ impl E {
             | E::Tile { .. } => true,
             E::Shl(x, _) | E::MaxOne(x) | E::NzMask(x) => x.per_claim(),
             E::PtrLo { add, .. } | E::PtrHi { add, .. } => add.per_claim(),
-            E::Or(a, b) | E::Add(a, b) | E::Mul(a, b) | E::GeMask(a, b) => {
+            E::Or(a, b) | E::Add(a, b) | E::Mul(a, b) | E::VCmp { a, b, .. } => {
                 a.per_claim() || b.per_claim()
             }
+            E::DescOff(_) | E::LiveAddr { .. } => true,
             _ => false,
         }
     }
@@ -900,8 +917,7 @@ struct SpanRun {
     grid: [BTreeSet<u32>; 3],
     /// `(gx, gy)` header offsets of the bitmap index and of its tested bit.
     tile: BTreeSet<(u32, u32)>,
-    /// The count load can be reached without a pred acquire (pred == NONE).
-    count_unordered: bool,
+    /// (the count load requires `SPP | POLLED | ACQ`: refused otherwise)
     /// The done release was reached on the `k >= count` edge without a body.
     nop_release: bool,
     /// Constants written over a register holding header dword `.0`.
@@ -1259,10 +1275,78 @@ impl Walk<'_> {
                     None => handled = false,
                 }
             }
-            "v_cmp_ge_u32_e64" | "v_cmp_ne_u32_e64" if ops.len() == 3 && st.exec == Exec::One => {
-                match self.mask_op(st, mn, &ops[1], &ops[2]) {
-                    Some(e) => self.put(st, &ops[0], Some(one(e))),
-                    None => handled = false,
+            m if m.starts_with("v_cmp_") && m.ends_with("_e64") && ops.len() == 3 => {
+                // a wave32 compare writes ONE SGPR (the effects table's pair is an
+                // over-approximation that would clobber the next register)
+                let v = if st.exec == Exec::One {
+                    self.mask_op(st, m, &ops[1], &ops[2])
+                } else {
+                    None
+                };
+                self.put(st, &ops[0], v.map(one));
+            }
+            "v_lshl_add_u32" if ops.len() == 4 => {
+                // `(list_id << 5) + 32`: the span descriptor offset
+                let (a, sh, c) = (
+                    self.value(st, &ops[1]),
+                    self.value(st, &ops[2]),
+                    self.value(st, &ops[3]),
+                );
+                match (single(&a), single(&sh), single(&c)) {
+                    (
+                        Some(E::SpanId(l)),
+                        Some(E::Const(SPAN_DESC_SHIFT_U32)),
+                        Some(E::Const(32)),
+                    ) => {
+                        self.put(st, &ops[0], Some(one(E::DescOff(*l))));
+                    }
+                    _ => handled = false,
+                }
+            }
+            "v_mad_co_u64_u32" if ops.len() == 5 => {
+                // `live_list + 16 * k` into a VGPR pair
+                let k = self.value(st, &ops[2]);
+                let sixteen = self.value(st, &ops[3]);
+                let base = match parse_reg(&ops[4]) {
+                    Some((Rk::V, r, 2)) => (
+                        st.v.get(&r).and_then(only).cloned(),
+                        st.v.get(&(r + 1)).and_then(only).cloned(),
+                    ),
+                    _ => (None, None),
+                };
+                match (parse_reg(&ops[0]), single(&k), single(&sixteen), base) {
+                    (
+                        Some((Rk::V, d, 2)),
+                        Some(E::SpanIdx(k)),
+                        Some(E::Const(16)),
+                        (
+                            Some(E::SpanFld { off: 0, hi: false }),
+                            Some(E::SpanFld { off: 0, hi: true }),
+                        ),
+                    ) => {
+                        let k = *k;
+                        self.put_dword(st, Rk::V, d, Some(one(E::LiveAddr { k, hi: false })));
+                        self.put_dword(st, Rk::V, d + 1, Some(one(E::LiveAddr { k, hi: true })));
+                    }
+                    (
+                        _,
+                        _,
+                        _,
+                        (
+                            Some(E::SpanFld { off: 0, hi: false }),
+                            Some(E::SpanFld { off: 0, hi: true }),
+                        ),
+                    ) => {
+                        // an address into the live list whose index is not `k < count <= K`
+                        self.fail(
+                            run,
+                            pos,
+                            "task_graph-span-entry",
+                            "the entry address is not `live_list + 16 * k` with `k < count <= K` established by compares (the count > K and k >= count checks)",
+                        );
+                        handled = false;
+                    }
+                    _ => handled = false,
                 }
             }
             "s_or_b32" if ops.len() == 3 => {
@@ -1334,7 +1418,6 @@ impl Walk<'_> {
                         let v = (off >= 0).then(|| one(E::Param(off as u32 + 4 * i as u32)));
                         self.put_dword(st, Rk::S, db + i, v);
                     }
-                } else if dk == Rk::S && self.span_load(st, pos, run, n, db, &ops[1], &ops[2]) {
                 } else {
                     for i in 0..n {
                         self.put_dword(st, Rk::S, db + i, None);
@@ -1722,8 +1805,7 @@ impl Walk<'_> {
                 s.put_dword(st, Rk::V, dst + i, None);
             }
         };
-        if let Some(f) = self.span_ptr(st, &ins.ops[2]) {
-            self.span_global(st, pos, run, f);
+        if self.span_global(st, pos, run) {
             return;
         }
         let Some(ptr) = self.param_ptr(st, &ins.ops[2]) else {
@@ -1742,7 +1824,7 @@ impl Walk<'_> {
                         run,
                         pos,
                         "task_graph-claim",
-                        "a header load that is not a single-lane b128 load after claim < n_tasks",
+                        format!("a header load that is not a single-lane b128 load after claim < n_tasks (EXEC {:?}, path facts {:#x}, s92 {:?}, va {:?})", st.exec, st.facts, st.s.get(&92), va),
                     );
                     clear(self, st);
                     return;
@@ -2256,11 +2338,22 @@ impl Walk<'_> {
                 _ => None,
             };
             if let Some((k, from_slot)) = hdr {
-                let is_pred = !from_slot && st.facts & ACQ == 0;
+                // a `Hdr(k) == NONE` compare is the pred's before the acquire, and also after
+                // it when `k` is the pred field the poll already named (the span path's
+                // `pred == NONE` poison check); any other one is the done event's
+                let named_pred = run.derived.borrow().pred == Some(k);
+                let is_pred = !from_slot && (st.facts & ACQ == 0 || named_pred);
+                if is_pred && !eq && st.facts & SPQ != 0 {
+                    // the pred was already found to be NONE on this path: infeasible
+                    return false;
+                }
+                if is_pred && !eq && st.facts & SP1 != 0 {
+                    st.facts |= SPP;
+                }
                 if is_pred {
                     set_once(run, pos, "pred event field", |d| &mut d.pred, k);
                     if eq && st.facts & (CL | BD | HD) == (CL | BD | HD) {
-                        st.facts |= PO;
+                        st.facts |= PO | SPQ;
                     }
                 } else {
                     set_once(run, pos, "done event field", |d| &mut d.done, k);
@@ -3647,6 +3740,7 @@ impl Walk<'_> {
 const SPAN_DESC_BASE: i64 = 0x20;
 /// log2 of a span descriptor's size and of a live entry's size.
 const SPAN_DESC_SHIFT: u8 = 5;
+const SPAN_DESC_SHIFT_U32: u32 = SPAN_DESC_SHIFT as u32;
 const SPAN_ENTRY_SHIFT: u8 = 4;
 
 impl Walk<'_> {
@@ -3772,13 +3866,28 @@ impl Walk<'_> {
         None
     }
 
-    /// Lane 0's `a >= b` (an entry dword against a header dword) and `0 != x` masks.
+    /// Lane 0's `a >= b` / `a > b` (an entry dword against a header dword, the list id against
+    /// `n_spans`, k against the bounded count, the count against K) and `0 != x` masks of a
+    /// wave32 `v_cmp_*_e64` (whose destination is ONE SGPR).
     fn mask_op(&self, st: &State, mn: &str, a: &str, b: &str) -> Option<E> {
         let (x, y) = self.singles(st, a, b)?;
+        let reg = match parse_reg(a) {
+            Some((Rk::V, r, 1)) => r,
+            _ => u16::MAX,
+        };
+        let cmp = |gt: bool| {
+            Some(E::VCmp {
+                gt,
+                a: Box::new(x.clone()),
+                b: Box::new(y.clone()),
+                reg,
+            })
+        };
         match (mn, &x, &y) {
-            ("v_cmp_ge_u32_e64", E::Entry(_), E::Hdr(_)) => {
-                Some(E::GeMask(Box::new(x), Box::new(y)))
-            }
+            ("v_cmp_ge_u32_e64", E::Entry(_), E::Hdr(_))
+            | ("v_cmp_ge_u32_e64", E::Hdr(_), E::SpanN)
+            | ("v_cmp_ge_u32_e64", E::Hdr(_), E::SpanCountLe) => cmp(false),
+            ("v_cmp_gt_u32_e64", E::SpanCount, E::SpanFld { off: 24, hi: false }) => cmp(true),
             (
                 "v_cmp_ne_u32_e64",
                 E::Const(0),
@@ -3793,22 +3902,6 @@ impl Walk<'_> {
                 },
                 E::Const(0),
             ) => Some(E::NzMask(Box::new(h.clone()))),
-            _ => None,
-        }
-    }
-
-    /// A pointer pair `s[b:b+1]` that is `Param(base) + add`: `(base, add)`.
-    fn ptr_pair(&self, st: &State, op: &str) -> Option<(u32, E)> {
-        let (k, base, len) = parse_reg(op)?;
-        if k != Rk::S || len != 2 {
-            return None;
-        }
-        match (only(st.s.get(&base)?)?, only(st.s.get(&(base + 1))?)?) {
-            (E::PtrLo { base: b1, add: a1 }, E::PtrHi { base: b2, add: a2 })
-                if b1 == b2 && a1 == a2 =>
-            {
-                Some((*b1, (**a1).clone()))
-            }
             _ => None,
         }
     }
@@ -3829,174 +3922,115 @@ impl Walk<'_> {
         }
     }
 
-    /// `s_load` through the span table pointer (`n_spans`) or through the descriptor of the
-    /// claimed header's list id. Returns whether the base was a span-table pointer (the
-    /// load is then fully handled here).
-    fn span_load(
-        &self,
-        st: &mut State,
-        pos: usize,
-        run: &mut Run,
-        n: u16,
-        db: u16,
-        base: &str,
-        off_op: &str,
-    ) -> bool {
-        let off = parse_num(off_op).unwrap_or(-1);
-        let clear = |s: &Self, st: &mut State| {
-            for i in 0..n {
-                s.put_dword(st, Rk::S, db + i, None);
-            }
-        };
-        let need = SPN | SP1;
-        if let Some(p) = self.param_ptr(st, base) {
-            if !run.span.spans_arg.contains(&p) {
-                return false;
-            }
-            run.span.table_sites.insert(pos);
-            if st.facts & need != need {
-                self.fail(
-                    run,
-                    pos,
-                    "task_graph-span-table",
-                    "the span table is read on a path that has not established flags == 1 and a nonzero table pointer",
-                );
-                clear(self, st);
-            } else if off == 0 && n == 1 {
-                self.put_dword(st, Rk::S, db, Some(one(E::SpanN)));
-            } else {
-                self.fail(
-                    run,
-                    pos,
-                    "task_graph-span-table",
-                    format!(
-                        "a table load other than the u32 n_spans at +0 (offset {off}, {n} dwords)"
-                    ),
-                );
-                clear(self, st);
-            }
-            return true;
-        }
-        let Some((b, add)) = self.ptr_pair(st, base) else {
-            return false;
-        };
-        if !run.span.spans_arg.contains(&b) {
-            return false;
-        }
-        run.span.table_sites.insert(pos);
-        if st.facts & need != need {
-            self.fail(
-                run,
-                pos,
-                "task_graph-span-table",
-                "a descriptor is read on a path that has not established flags == 1 and a nonzero table pointer",
-            );
-            clear(self, st);
-            return true;
-        }
-        let list = match &add {
-            E::Shl(x, SPAN_DESC_SHIFT) => match &**x {
-                E::SpanId(l) => Some(*l),
-                _ => None,
-            },
-            _ => None,
-        };
-        let Some(list) = list else {
-            self.fail(
-                run,
-                pos,
-                "task_graph-span-table",
-                "the descriptor address is not `spans + 32 * list_id` with `list_id < n_spans` established by a compare",
-            );
-            clear(self, st);
-            return true;
-        };
-        run.span.list.insert(list);
-        let field = off - SPAN_DESC_BASE;
-        match (field, n) {
-            (0 | 8 | 16, 2) => {
-                let f = field as u8;
-                self.put_dword(st, Rk::S, db, Some(one(E::SpanFld { off: f, hi: false })));
-                self.put_dword(
-                    st,
-                    Rk::S,
-                    db + 1,
-                    Some(one(E::SpanFld { off: f, hi: true })),
-                );
-            }
-            (24, 1) => self.put_dword(st, Rk::S, db, Some(one(E::SpanFld { off: 24, hi: false }))),
-            _ => {
-                self.fail(
-                    run,
-                    pos,
-                    "task_graph-span-table",
-                    format!("a descriptor load of {n} dwords at descriptor byte {field}: only the pointer pairs at 0/8/16 and the u32 K at 24 are read"),
-                );
-                clear(self, st);
-            }
-        }
-        true
-    }
-
-    /// A global load through a descriptor pointer: the count load (`count_cell`) or the
-    /// entry load (`live_list[16 * k]`, `k < count <= K`).
-    fn span_global(&self, st: &mut State, pos: usize, run: &mut Run, field: u8) {
+    /// A global load in span mode: through the span table pointer (`n_spans`, a descriptor)
+    /// or through a pointer a descriptor held (the count cell, the live-list entry
+    /// `live_list + 16 * k` with `k < count <= K`). Returns whether the load was one of
+    /// these (then fully handled here).
+    fn span_global(&self, st: &mut State, pos: usize, run: &mut Run) -> bool {
         let ins = &self.ins[pos];
         let Some((Rk::V, dst, len)) = parse_reg(&ins.ops[0]) else {
-            return;
+            return false;
         };
         let clear = |s: &Self, st: &mut State| {
             for i in 0..len {
                 s.put_dword(st, Rk::V, dst + i, None);
             }
         };
-        let va = self.value(st, &ins.ops[1]);
-        let ctx = st.exec == Exec::One
-            && st.facts & (SP1 | SPN) == (SP1 | SPN)
-            && ins.offset() == 0
-            && ins.scope() < 2;
-        match field {
-            8 => {
-                if !(ctx && ins.mn == "global_load_b32" && single(&va) == Some(&E::Const(0))) {
-                    self.fail(
-                        run,
-                        pos,
-                        "task_graph-span-count",
-                        "the count load is not a single-lane plain b32 load of the count cell at offset 0 on a flags == 1 path",
-                    );
-                    clear(self, st);
-                    return;
+        let ctx = st.exec == Exec::One && st.facts & (SP1 | SPN) == (SP1 | SPN) && ins.scope() < 2;
+        if ins.ops[2] == "off" {
+            // a flat-style load through a VGPR pair a descriptor field or the entry address
+            // computation produced
+            let Some((Rk::V, base, 2)) = parse_reg(&ins.ops[1]) else {
+                return false;
+            };
+            let (Some(lo), Some(hi)) = (
+                st.v.get(&base).and_then(only).cloned(),
+                st.v.get(&(base + 1)).and_then(only).cloned(),
+            ) else {
+                return false;
+            };
+            match (lo, hi) {
+                (E::SpanFld { off: 8, hi: false }, E::SpanFld { off: 8, hi: true }) => {
+                    if !(ctx && ins.mn == "global_load_b32" && ins.offset() == 0) {
+                        self.fail(
+                            run,
+                            pos,
+                            "task_graph-span-count",
+                            "the count load is not a single-lane plain b32 load of the count cell at offset 0 on a flags == 1 path",
+                        );
+                        clear(self, st);
+                        return true;
+                    }
+                    if st.facts & (ACQ | POLLED | SPP) != (ACQ | POLLED | SPP) {
+                        self.fail(
+                            run,
+                            pos,
+                            "task_graph-span-count",
+                            "the count load is reachable without the pred acquire (pred != NONE observed >= expected, then the device-scope acquire): a span header with pred == NONE must poison before it",
+                        );
+                    }
+                    run.span.count_sites.insert(pos);
+                    run.span.sites.insert(pos, (8, "vmem_load"));
+                    self.put_dword(st, Rk::V, dst, Some(one(E::SpanCount)));
                 }
-                if st.facts & (ACQ | POLLED) != (ACQ | POLLED) {
-                    run.span.count_unordered = true;
+                (E::LiveAddr { k, hi: false }, E::LiveAddr { k: k2, hi: true }) if k == k2 => {
+                    if !(ctx && ins.mn == "global_load_b128" && ins.offset() == 0) {
+                        self.fail(
+                            run,
+                            pos,
+                            "task_graph-span-entry",
+                            "the entry load is not a single-lane plain b128 load at offset 0 on a flags == 1 path",
+                        );
+                        clear(self, st);
+                        return true;
+                    }
+                    run.span.k.insert(k);
+                    run.span.entry_sites.insert(pos);
+                    run.span.sites.insert(pos, (0, "vmem_load"));
+                    for i in 0..len {
+                        self.put_dword(st, Rk::V, dst + i, Some(one(E::Entry(i as u8))));
+                    }
                 }
-                run.span.count_sites.insert(pos);
-                run.span.sites.insert(pos, (8, "vmem_load"));
-                self.put_dword(st, Rk::V, dst, Some(one(E::SpanCount)));
+                _ => return false,
             }
-            0 => {
-                let k = match single(&va) {
-                    Some(E::Shl(x, SPAN_ENTRY_SHIFT)) => match &**x {
-                        E::SpanIdx(k) => Some(*k),
-                        _ => None,
-                    },
-                    _ => None,
+            st.waited &= !WL;
+            return true;
+        }
+        // through the span table pointer: n_spans at +0, descriptor `list_id` at
+        // `32 + 32 * list_id`
+        let Some(p) = self.param_ptr(st, &ins.ops[2]) else {
+            return false;
+        };
+        if !run.span.spans_arg.contains(&p) {
+            return false;
+        }
+        run.span.table_sites.insert(pos);
+        let va = self.value(st, &ins.ops[1]);
+        if !ctx {
+            self.fail(
+                run,
+                pos,
+                "task_graph-span-table",
+                "the span table is read on a path that has not established flags == 1 and a nonzero table pointer (single lane, plain load)",
+            );
+            clear(self, st);
+            return true;
+        }
+        let off = ins.offset();
+        match (single(&va), ins.mn.as_str(), off) {
+            (Some(E::Const(0)), "global_load_b32", 0) => {
+                self.put_dword(st, Rk::V, dst, Some(one(E::SpanN)));
+            }
+            (Some(E::DescOff(l)), "global_load_b128", 0 | 16) => {
+                run.span.list.insert(*l);
+                let f = |off: u8, hi: bool| Some(one(E::SpanFld { off, hi }));
+                let words = if off == 0 {
+                    [f(0, false), f(0, true), f(8, false), f(8, true)]
+                } else {
+                    [f(16, false), f(16, true), f(24, false), None]
                 };
-                let Some(k) = k.filter(|_| ctx && ins.mn == "global_load_b128") else {
-                    self.fail(
-                        run,
-                        pos,
-                        "task_graph-span-entry",
-                        "the entry load is not a single-lane b128 load at `live_list + 16 * k` with `k < count <= K` established by compares (the count > K and k >= count checks)",
-                    );
-                    clear(self, st);
-                    return;
-                };
-                run.span.k.insert(k);
-                run.span.entry_sites.insert(pos);
-                run.span.sites.insert(pos, (0, "vmem_load"));
-                for i in 0..len {
-                    self.put_dword(st, Rk::V, dst + i, Some(one(E::Entry(i as u8))));
+                for (i, w) in words.into_iter().enumerate() {
+                    self.put_dword(st, Rk::V, dst + i as u16, w);
                 }
             }
             _ => {
@@ -4004,12 +4038,13 @@ impl Walk<'_> {
                     run,
                     pos,
                     "task_graph-span-table",
-                    "a load through the claim bitmap pointer",
+                    "a load through the span table pointer that is neither `n_spans` (offset 0) nor a descriptor `spans + 32 + 32 * list_id` with `list_id < n_spans` established by a compare",
                 );
                 clear(self, st);
             }
         }
         st.waited &= !WL;
+        true
     }
 
     /// The returning `global_atomic_or_b32` on the claim bitmap: word `bit >> 5`, mask
@@ -4097,13 +4132,6 @@ impl Walk<'_> {
             Rel::Lg => Some(!truth),
             _ => None,
         };
-        let rewrite = |st: &mut State, from: &E, to: E| {
-            if let Some(r) = cmp.a_reg {
-                if st.s.get(&r) == Some(&one(from.clone())) {
-                    st.s.insert(r, one(to));
-                }
-            }
-        };
         match (&a, &b) {
             // the flags word: == 0 static, == 1 span mode
             (E::Hdr(k), E::Const(c @ (0 | 1))) if eq.is_some() && !cmp.signed => {
@@ -4124,43 +4152,54 @@ impl Walk<'_> {
                 }
                 _ => None,
             },
-            // list_id < n_spans
-            (E::Hdr(l), E::SpanN) if cmp.rel == Rel::Ge && !cmp.signed => {
-                if !truth {
-                    rewrite(st, &a, E::SpanId(*l));
-                }
-                Some(true)
-            }
-            // count <= K
-            (E::SpanCount, E::SpanFld { off: 24, hi: false })
-                if cmp.rel == Rel::Gt && !cmp.signed =>
-            {
-                if !truth {
-                    rewrite(st, &a, E::SpanCountLe);
-                }
-                Some(true)
-            }
-            // k < count (the other edge is the NOP)
-            (E::Hdr(k), E::SpanCountLe) if cmp.rel == Rel::Ge && !cmp.signed => {
-                if truth {
-                    st.facts |= SPK;
-                } else {
-                    rewrite(st, &a, E::SpanIdx(*k));
-                }
-                Some(true)
-            }
-            // an entry axis against its header grid extent: the mask is zero on the
-            // edge where the entry is inside the grid
-            (E::GeMask(x, y), E::Const(0)) if eq.is_some() => {
-                if let (E::Entry(f @ 0..=2), E::Hdr(g)) = (&**x, &**y) {
-                    if eq == Some(true) && st.facts & SP1 != 0 {
-                        st.facts |= [SPX, SPY, SPZ][*f as usize];
-                        run.span.grid[*f as usize].insert(*g);
+            // a lane-0 vector compare mask against zero: the mask is zero on the edge where the
+            // compare is false
+            (
+                E::VCmp {
+                    gt,
+                    a: x,
+                    b: y,
+                    reg,
+                },
+                E::Const(0),
+            ) if eq.is_some() => {
+                let held = eq == Some(true);
+                let rewrite = |st: &mut State, from: &E, to: E| {
+                    if st.v.get(reg) == Some(&one(from.clone())) {
+                        st.v.insert(*reg, one(to));
                     }
-                    Some(true)
-                } else {
-                    None
+                };
+                match (*gt, &**x, &**y) {
+                    // list_id < n_spans
+                    (false, E::Hdr(l), E::SpanN) => {
+                        if held {
+                            rewrite(st, x, E::SpanId(*l));
+                        }
+                    }
+                    // count <= K
+                    (true, E::SpanCount, E::SpanFld { off: 24, hi: false }) => {
+                        if held {
+                            rewrite(st, x, E::SpanCountLe);
+                        }
+                    }
+                    // k < count (the other edge is the NOP)
+                    (false, E::Hdr(k), E::SpanCountLe) => {
+                        if held {
+                            rewrite(st, x, E::SpanIdx(*k));
+                        } else {
+                            st.facts |= SPK;
+                        }
+                    }
+                    // an entry axis against its header grid extent
+                    (false, E::Entry(f @ 0..=2), E::Hdr(g)) => {
+                        if held && st.facts & SP1 != 0 {
+                            st.facts |= [SPX, SPY, SPZ][*f as usize];
+                            run.span.grid[*f as usize].insert(*g);
+                        }
+                    }
+                    _ => return None,
                 }
+                Some(true)
             }
             // the claim bit was clear
             (E::NzMask(h), E::Const(0)) if eq.is_some() => {
@@ -4269,9 +4308,9 @@ fn span_verdict(
             ));
         }
     }
-    if sp.table_sites.len() != 5 {
+    if sp.table_sites.len() != 3 {
         why.push(format!(
-            "{} span table loads reached (n_spans and the four descriptor loads are required)",
+            "{} span table loads reached (n_spans and the two descriptor loads are required)",
             sp.table_sites.len()
         ));
     }
@@ -4402,12 +4441,10 @@ fn span_verdict(
         "protocol: {TASK_PROTO_REGION_WG_LIVE}: in span mode wg_x = entry.vx + step with step < max(1, 1) (one step, vcount forced to 1; entry values carried through the broadcast) and wg_yz = entry.vy | entry.vz << 16, for template(s) {:?}; static headers keep {TASK_PROTO_REGION_WG}; the claim bitmap index is exact only for gx*gy*gz <= 2^32 (the host sizes the bitmap from the grid)",
         sp.live_regions
     ));
-    if sp.count_unordered {
-        evidence.push(
-            "protocol: the count load follows the pred acquire on every path with pred != NONE; a span header whose pred is NONE reaches it with no acquire (the host must give span headers the producer's done event as pred)"
-                .into(),
-        );
-    }
+    evidence.push(
+        "protocol: a span header with pred == NONE poisons before the table is read; the count load is reached only after pred != NONE was observed >= expected and the device-scope acquire (the producer's release of its entries and count happens-before it)"
+            .into(),
+    );
     Ok(SpanProof {
         offsets,
         sites,

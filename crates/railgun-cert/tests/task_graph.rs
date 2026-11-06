@@ -30,8 +30,14 @@ fn dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/task_graph")
 }
 
+/// The pool object `name`: the committed fixture, or (to exercise a candidate image before it
+/// is committed) `p0_r6_pool_<name>.co` from the directory `RAILGUN_TASK_GRAPH_POOLS` names.
+/// The standalone objects always come from the fixture directory.
 fn pool(name: &str) -> Vec<u8> {
-    std::fs::read(dir().join(format!("p0_r6_pool_{name}.co"))).expect("fixture")
+    let base = std::env::var_os("RAILGUN_TASK_GRAPH_POOLS")
+        .map(PathBuf::from)
+        .unwrap_or_else(dir);
+    std::fs::read(base.join(format!("p0_r6_pool_{name}.co"))).expect("fixture")
 }
 
 fn hex(d: &[u8; 32]) -> String {
@@ -298,7 +304,7 @@ fn real_pools_are_certified() {
         // the shell is fully attributed: the three table-loaded pointers are the span
         // arena's, the `spans` argument is a read-only pointer the shell scalar-loads
         let spans = k.args.iter().find(|a| a.offset == 64).expect("spans arg");
-        assert_eq!(spans.classes, ["smem_load"], "{name}");
+        assert_eq!(spans.classes, ["vmem_load"], "{name}");
         assert_eq!(spans.role, "pointer", "{name}");
         assert_eq!(k.task_protocol.as_ref(), Some(&proof.protocol));
         let want: &[&str] = if arena.templates.iter().any(|t| !t.sealed_tables.is_empty()) {
@@ -1490,7 +1496,7 @@ fn span_pools_carry_the_span_abi_and_the_table_arena() {
             detail.contains("region_wg_from_live_entry: in span mode wg_x = entry.vx + step"),
             "{name}"
         );
-        assert!(detail.contains("pred is NONE"), "{name}");
+        assert!(detail.contains("pred == NONE poisons"), "{name}");
     }
 }
 
@@ -1513,13 +1519,25 @@ fn the_native_expand_live_region_writes_only_the_live_list_and_the_count() {
         .iter()
         .map(|p| (p.record_offset, p.classes.clone()))
         .collect();
+    // the count cell is published by a release atomic add onto the host-zeroed cell (an
+    // EventCells resource refuses plain stores); a plain `vmem_store` there is refused here
+    let count_class = loads
+        .get(&24)
+        .and_then(|c| c.first())
+        .cloned()
+        .expect("count field");
+    assert!(
+        ["atomic_release", "atomic_commutative"].contains(&count_class.as_str()),
+        "count cell class {count_class}"
+    );
+    assert_eq!(loads[&24].len(), 1, "{loads:?}");
     assert_eq!(
         loads,
         BTreeMap::from([
             (0, vec!["vmem_load".to_string()]),
             (8, vec!["vmem_load".to_string()]),
             (16, vec!["vmem_store".to_string()]),
-            (24, vec!["vmem_store".to_string()]),
+            (24, vec![count_class.clone()]),
         ])
     );
     assert!(t1.sealed_tables.is_empty() && t1.wg_footprints.is_empty());
@@ -1529,7 +1547,9 @@ fn the_native_expand_live_region_writes_only_the_live_list_and_the_count() {
         .find(|e| e.starts_with("t1: native region"))
         .expect("evidence");
     assert!(
-        line.contains("+0 vmem_load, +8 vmem_load, +16 vmem_store, +24 vmem_store"),
+        line.contains(&format!(
+            "+0 vmem_load, +8 vmem_load, +16 vmem_store, +24 {count_class}"
+        )),
         "{line}"
     );
     assert!(
@@ -1623,7 +1643,7 @@ fn removing_a_span_check_is_refused() {
         let base = pool(name);
         // the count > K check: the count is never bounded by K, so k < count <= K never holds
         span_refusal(
-            &nop_run(&base, symbol, "s_cmp_gt_u32 s101, s91", 2),
+            &nop_run(&base, symbol, "v_cmp_gt_u32_e64 s91, v28, v38", 3),
             symbol,
             "task_graph-span-entry",
             "count > K and k >= count checks",
@@ -1631,7 +1651,7 @@ fn removing_a_span_check_is_refused() {
         );
         // the k >= count branch: k is never bounded by the count
         span_refusal(
-            &nop_run(&base, symbol, "s_cmp_ge_u32 s96, s101", 2),
+            &nop_run(&base, symbol, "v_cmp_ge_u32_e64 s91, v19, v28", 3),
             symbol,
             "task_graph-span-entry",
             "k < count <= K",
@@ -1639,7 +1659,7 @@ fn removing_a_span_check_is_refused() {
         );
         // one grid compare dropped (each axis)
         for (e, g) in [(24, 8), (25, 9), (26, 10)] {
-            let line = format!("v_cmp_ge_u32_e64 s84, v{e}, v{g}");
+            let line = format!("v_cmp_ge_u32_e64 s91, v{e}, v{g}");
             span_refusal(
                 &nop_run(&base, symbol, &line, 3),
                 symbol,
@@ -1682,7 +1702,7 @@ fn removing_a_span_check_is_refused() {
     for &(name, symbol) in &all[..2] {
         let base = pool(name);
         span_refusal(
-            &nop_run(&base, symbol, "s_cmp_ge_u32 s100, s91", 2),
+            &nop_run(&base, symbol, "v_cmp_ge_u32_e64 s91, v20, v28", 3),
             symbol,
             "task_graph-span-table",
             "list_id < n_spans",
@@ -1734,5 +1754,39 @@ fn a_branch_from_the_span_poison_block_into_a_region_is_refused() {
         patch(&mut bytes, &at, poison, &[(scc1 & 0xffff_0000) | offset]);
         let r = certified(&bytes, symbol);
         expect_refused(&r, symbol, "task_graph-protocol-entry");
+    }
+}
+
+/// Nop `count` instructions starting `skip` instructions after the first dispatcher
+/// instruction that encodes `anchor`.
+fn nop_after(bytes: &[u8], symbol: &str, anchor: &str, skip: usize, count: usize) -> Vec<u8> {
+    let start = *find(bytes, symbol, anchor)
+        .iter()
+        .min()
+        .unwrap_or_else(|| panic!("no `{anchor}`"));
+    let insts = instructions(bytes, symbol);
+    let i = insts.iter().position(|(pc, _, _)| *pc == start).unwrap() + skip;
+    let mut out = bytes.to_vec();
+    let at = locate(&out, symbol);
+    for (pc, dwords, _) in &insts[i..i + count] {
+        nop_out(&mut out, symbol, &at, *pc, *dwords);
+    }
+    out
+}
+
+/// A span header with `pred == NONE` poisons right after the flags check; without that check
+/// the count load would be reachable with no pred acquire, which refuses the pool.
+#[test]
+fn removing_the_span_pred_none_poison_is_refused() {
+    for (name, symbol) in [("b32", "pm_pool_b32"), ("b64", "pm_pool_b64")] {
+        // `s_cmp_lg_u32 flags, 1; branch; v_readfirstlane pred; s_cmp_eq pred, -1; branch`
+        let bytes = nop_after(&pool(name), symbol, "s_cmp_lg_u32 s91, 1", 3, 2);
+        span_refusal(
+            &bytes,
+            symbol,
+            "task_graph-span-count",
+            "pred == NONE",
+            &format!("{name}: no pred == NONE poison"),
+        );
     }
 }

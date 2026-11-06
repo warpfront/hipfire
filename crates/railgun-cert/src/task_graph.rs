@@ -1600,9 +1600,9 @@ fn check_shell_args(
         } else if a.offset == t.events_arg_offset {
             Some(&["atomic_release", "load_acquire"])
         } else if Some(a.offset) == proof.protocol.span.map(|s| s.spans_arg_offset) {
-            // the span table: n_spans and descriptors are scalar-loaded (the pointers they
-            // hold are the span arena's)
-            Some(&["smem_load"])
+            // the span table: `n_spans` and the descriptors are read-only loads (the pointers
+            // the descriptors hold are the span arena's)
+            Some(&["vmem_load"])
         } else if a.offset == proof.arena.arena_arg_offset {
             None
         } else if proto.output_args.contains(&a.offset) {
