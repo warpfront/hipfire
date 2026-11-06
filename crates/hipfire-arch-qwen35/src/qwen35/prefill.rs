@@ -6142,6 +6142,9 @@ fn gdn_dense_scan_static_admitted(
 ) -> bool {
     let mq3_scan = mq3_wide_route(gpu, weights);
     let mq4_scan = dense_layers_are_all_mq4v2(weights);
+    // v2 §2.3: Lloyd (qt52) is admitted on exact gfx1100/gfx1151, where its qkvza
+    // producer is the MMQ-LUT route. The scan is weight-free (same f32 scratch).
+    let lloyd_scan = dense_layers_have_projection_dtype(weights, DType::MQ4G256V2Lloyd);
     gpu.flags.gfx12_gdn_chunk_scan
         && !gpu.fp8_verify_scope
         && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
@@ -6157,7 +6160,8 @@ fn gdn_dense_scan_static_admitted(
         && (mq3_scan
             || (mq4_scan
                 && (gpu.flags.iu4_prefill_enabled()
-                    || (gpu.arch == "gfx1201" && gpu.flags.gfx12_mq4v2_fp8_qkvza))))
+                    || (gpu.arch == "gfx1201" && gpu.flags.gfx12_mq4v2_fp8_qkvza)))
+            || (lloyd_scan && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151")))
         && gdn_q8_state_complete(dn_state)
         && !gpu.graphs.capture_mode
         && !gpu.replay.is_recording()
@@ -6205,6 +6209,8 @@ pub(crate) fn resolve_gdn_stream_plans(
     .admitted();
     let qkvza_dense = if mq3_wide_route(gpu, weights) {
         DType::MQ3G256V2
+    } else if dense_layers_have_projection_dtype(weights, DType::MQ4G256V2Lloyd) {
+        DType::MQ4G256V2Lloyd
     } else {
         DType::MQ4G256V2
     };
