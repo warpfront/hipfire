@@ -58,7 +58,7 @@ use crate::{
 };
 use serde::Serialize;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 pub enum Counter {
     Load,
     Store,
@@ -70,7 +70,7 @@ pub enum Counter {
     Exp,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MemoryFamily {
     Buffer,
     Global,
@@ -86,7 +86,7 @@ pub enum MemoryFamily {
 /// `global_*` loads and stores share VM_CNT's single in-order stream
 /// (`Gfx9Vmem`, CDNA3 ISA §4.4 p.19). Every other operation is ordered only
 /// within its family.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OrderClass {
     Family(MemoryFamily),
     Gfx12VmemRead,
@@ -140,6 +140,18 @@ pub struct WaitProof {
     pub count: u8,
     pub reason: Reason,
 }
+
+/// Per pending operation: counter, defs, source locks, in-order, family, order class, `maybe`
+/// (`Ledger::state_key`).
+pub(crate) type StateKey = Vec<(
+    Counter,
+    Vec<RegRef>,
+    Vec<RegRef>,
+    bool,
+    MemoryFamily,
+    OrderClass,
+    bool,
+)>;
 
 /// `arch` is the architecture of the last recorded operation (it selects the
 /// counter capacities); it is `None` until something was recorded, and a
@@ -578,6 +590,86 @@ impl Ledger {
                 )
             })
             .collect()
+    }
+
+    /// The id-free state `required`/`wait` depend on: per pending operation its
+    /// counter, registers, source locks, order class (`shape` has no order class,
+    /// which decides the count of an in-order wait) and `maybe` flag, in issue
+    /// order. Two ledgers with equal keys require and retire identically for
+    /// every later instruction, so a CFG walk (`ledger_cfg`) keys its seen
+    /// states by it and loop iterations that only advance ids do not grow.
+    pub(crate) fn state_key(&self) -> StateKey {
+        self.pending
+            .iter()
+            .map(|p| {
+                (
+                    p.counter,
+                    p.defs.clone(),
+                    p.src_locks.clone(),
+                    p.in_order,
+                    p.family,
+                    p.order,
+                    p.maybe,
+                )
+            })
+            .collect()
+    }
+
+    /// The counter with the most pending operations and that count (`None` when
+    /// nothing is pending): a CFG walk bounds it instead of dropping operations,
+    /// since dropping the oldest would lose its register hazards.
+    pub(crate) fn deepest_counter(&self) -> Option<(Counter, usize)> {
+        let mut counts: Vec<(Counter, usize)> = Vec::new();
+        for p in &self.pending {
+            match counts.iter_mut().find(|(c, _)| *c == p.counter) {
+                Some(entry) => entry.1 += 1,
+                None => counts.push((p.counter, 1)),
+            }
+        }
+        counts.into_iter().max_by_key(|&(_, n)| n)
+    }
+
+    /// The order class `wait_replay` compares. On gfx11 VMcnt (`Counter::Vm`) holds only
+    /// loads (stores are on VScnt), and `buffer_*` and `global_*` loads return in issue
+    /// order through the one counter (RDNA3 ISA ch. 11; `peacemaker_ir` `passes/waits.rs`),
+    /// so the two families share a class. The builder's `retire_count` keeps its stricter
+    /// per-family classes (emission is unchanged); gfx942 stores share `Vm` under
+    /// `Gfx9Vmem` already.
+    fn replay_class(p: &Pending) -> OrderClass {
+        match (p.counter, p.order) {
+            (Counter::Vm, OrderClass::Family(MemoryFamily::Buffer | MemoryFamily::Global)) => {
+                OrderClass::Family(MemoryFamily::Buffer)
+            }
+            (_, order) => order,
+        }
+    }
+
+    /// `wait` for replaying emitted code: a wait of zero retires everything on the
+    /// counter, but a nonzero wait retires by position only when every pending
+    /// operation of the counter is in order, certain and of one order class (the
+    /// condition under which `required` computes a nonzero count). With mixed
+    /// classes (DS with SMEM on LGKMcnt, buffer with global on gfx11, out-of-order
+    /// SMEM) completion order is not known, so nothing retires.
+    pub(crate) fn wait_replay(&mut self, counter: Counter, count: u8) {
+        if count != 0 {
+            let ordered = {
+                let mut peers = self.pending.iter().filter(|p| p.counter == counter);
+                match peers.next() {
+                    None => true,
+                    Some(first) => {
+                        let class = Self::replay_class(first);
+                        first.in_order
+                            && !first.maybe
+                            && peers
+                                .all(|p| p.in_order && !p.maybe && Self::replay_class(p) == class)
+                    }
+                }
+            };
+            if !ordered {
+                return;
+            }
+        }
+        self.wait(counter, count)
     }
 
     pub fn wait_instruction(

@@ -27,6 +27,8 @@ pub mod hip_twin;
 pub mod insn;
 pub mod lds;
 pub mod ledger;
+/// CFG-aware wait verification of an emitted program (`Builder::finish` runs it).
+pub mod ledger_cfg;
 pub mod libm;
 pub mod native;
 #[path = "kernels/npu_trunk.rs"]
@@ -1340,6 +1342,15 @@ impl Builder {
                 self.previous_wmma_dst.push(*r)
             }
         }
+    }
+    /// Verify the emitted program so far (`ledger_cfg::verify`): every use, WAR and WAW has
+    /// its wait on every control-flow path, where the builder's linear ledger only follows
+    /// the preceding instruction across raw branches. Region bodies are decoded through the
+    /// lift's instruction table (`ledger_cfg::region_spans`). Not run by `finish`: callers
+    /// and the pin/pool tests (`tests/ledger_cfg_pins.rs`) choose when a finding is fatal.
+    pub fn verify_waits(&mut self) -> Result<ledger_cfg::Stats, String> {
+        self.flush_valu()?;
+        ledger_cfg::verify(&self.program, &ledger_cfg::region_spans(&self.regions))
     }
     /// Finish only after every declared lifetime has both endpoints and all live aliases are disjoint.
     pub fn finish(mut self) -> Result<Emitted, String> {
