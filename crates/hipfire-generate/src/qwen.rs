@@ -1517,6 +1517,7 @@ pub fn ep_emit_done(
         "prefill_ms": (prefill_ms * 10.0).round() / 10.0,
         "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
         "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
+        "decode_ms": (decode_ms * 10.0).round() / 10.0,
         "ttft_ms": (prefill_ms * 10.0).round() / 10.0,
         "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
@@ -2208,6 +2209,7 @@ pub fn ep_serve_ds4(
         "prefill_ms": prefill_ms,
         "prefill_tok_s": prefill_tok_s,
         "decode_tok_s": decode_tok_s,
+        "decode_ms": (decode_ms * 10.0).round() / 10.0,
         "ttft_ms": prefill_ms,
         "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
@@ -4080,6 +4082,7 @@ pub fn generate_dflash(
                     (run.prefill_s * 1000.0 * 10.0).round() / 10.0,
                     (prefill_tok_s * 10.0).round() / 10.0,
                     (decode_tok_s * 10.0).round() / 10.0,
+                    (run.decode_s * 1000.0 * 10.0).round() / 10.0,
                     (run.prefill_s * 1000.0 * 10.0).round() / 10.0,
                     (tau * 100.0).round() / 100.0,
                     run.spec_cycles,
@@ -4226,6 +4229,7 @@ pub fn generate_dflash(
             "prefill_ms": ((run.prefill_s * 1000.0) * 10.0).round() / 10.0,
             "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
             "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
+            "decode_ms": ((run.decode_s * 1000.0) * 10.0).round() / 10.0,
             "ttft_ms": ((run.prefill_s * 1000.0) * 10.0).round() / 10.0,
             "dflash": true,
             "tau": (tau * 100.0).round() / 100.0,
@@ -7113,6 +7117,7 @@ pub fn generate_multi(
         "prefill_ms": (prefill_s * 1000.0 * 10.0).round() / 10.0,
         "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
         "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
+        "decode_ms": ((decode_s * 1000.0) * 10.0).round() / 10.0,
         "ttft_ms": (prefill_s * 1000.0 * 10.0).round() / 10.0,
         "attempt_id": active_attempt_id(),
         "finish_reason": finish.finish_reason,
@@ -7544,6 +7549,7 @@ pub fn qwen_dflash_done_value(
     prefill_ms: f64,
     prefill_tok_s: f64,
     decode_tok_s: f64,
+    decode_ms: f64,
     ttft_ms: f64,
     tau: f64,
     cycles: usize,
@@ -7560,6 +7566,7 @@ pub fn qwen_dflash_done_value(
         "prefill_ms": prefill_ms,
         "prefill_tok_s": prefill_tok_s,
         "decode_tok_s": decode_tok_s,
+        "decode_ms": decode_ms,
         "ttft_ms": ttft_ms,
         "dflash": true,
         "tau": tau,
@@ -8453,7 +8460,7 @@ mod mtp_done_fields_tests {
 
     fn done(tau: f64, cycles: usize) -> serde_json::Value {
         qwen_dflash_done_value(
-            "r", 177, 3.7, 134, 9600.0, 13.9, 4.7, 9600.0, tau, cycles, 0, "length", 1,
+            "r", 177, 3.7, 134, 9600.0, 13.9, 4.7, 37659.6, 9600.0, tau, cycles, 0, "length", 1,
         )
     }
 
