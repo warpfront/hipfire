@@ -4116,6 +4116,8 @@ impl<'k> Analyzer<'k> {
                         path,
                         cache,
                         shared,
+                        atomic_op: matches!(class, AccessClass::Atomic { commutative: false })
+                            .then(|| dec.parts[0].name.to_owned()),
                     });
                 }
                 if writes {
@@ -6900,5 +6902,31 @@ mod tests {
     fn a_kernel_without_a_u64_zero_test_replays_nothing_and_stays_unguarded() {
         let f = analyze(&kernel(&ng(&[&NG_STORE]), NG_ARGS), Arch::Gfx1201);
         assert!(f.args.iter().all(|a| !a.null_guarded));
+    }
+
+    #[test]
+    fn non_commutative_atomics_record_their_mnemonics() {
+        let swap = [0xee0cc004, 0x00900002, 0x00000000];
+        let cmpswap = [0xee0d0004, 0x00900002, 0x00000000];
+        let add = [0xee0d4004, 0x00800000, 0x00000000];
+        let ops = |words: &[u32]| -> Vec<Option<String>> {
+            let f = analyze(&kernel(words, NG_ARGS), Arch::Gfx1201);
+            assert_eq!(f.status, KernelStatus::Proven, "{:?}", f.unresolved);
+            f.arg_at(8)
+                .expect("argument")
+                .accesses
+                .iter()
+                .map(|a| a.atomic_op.clone())
+                .collect()
+        };
+        assert_eq!(
+            ops(&ng(&[&swap, &cmpswap])),
+            [
+                Some("global_atomic_swap_b32".to_owned()),
+                Some("global_atomic_cmpswap_b32".to_owned())
+            ]
+        );
+        // A commutative atomic and a plain store record none.
+        assert_eq!(ops(&ng(&[&add, &NG_STORE])), [None, None]);
     }
 }

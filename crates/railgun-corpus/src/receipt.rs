@@ -226,6 +226,9 @@ pub struct ArenaPointerRecord {
     /// a NULL field is admissible. Absent when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub null_guarded: bool,
+    /// A1 `atomic_ops` of the standalone argument at this offset. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub atomic_ops: Vec<String>,
 }
 
 /// The write footprint of one pointer field `record_offset` of a template:
@@ -934,6 +937,11 @@ pub struct ArgRecord {
     /// them). Absent when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub null_guarded: bool,
+    /// A1: the mnemonics of the non-commutative atomics (`swap`, `cmpswap`,
+    /// `cond_sub`, ...) issued through this argument; sorted, unique. Absent
+    /// when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub atomic_ops: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1262,6 +1270,7 @@ mod tests {
                     record_offset: 16,
                     classes: vec!["vmem_load".into()],
                     null_guarded: false,
+                    atomic_ops: vec![],
                 }],
                 sealed_tables: vec![],
                 wg_footprints: vec![],

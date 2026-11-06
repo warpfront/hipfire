@@ -990,6 +990,7 @@ mod tests {
             sinks: vec![],
             loaded: true,
             null_guarded: false,
+            atomic_ops: vec![],
         }
     }
 

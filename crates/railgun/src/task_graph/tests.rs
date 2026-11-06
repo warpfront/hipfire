@@ -61,6 +61,8 @@ const T_HIDU: u32 = 13;
 /// The span producer (EXPAND_LIVE): stores into the live list at field 0 and
 /// bumps the count cell at field 8 with a commutative atomic.
 const T_PROD: u32 = 30;
+/// A non-commutative atomic (swap) on field 8.
+const T_SWAP: u32 = 31;
 
 const N: u32 = NONE;
 const ALL: [u32; 4] = [T_COPY, T_READ, T_NOP, T_WRITE];
@@ -98,23 +100,27 @@ fn template(id: u32) -> ArenaTemplate {
                 record_offset: 0,
                 classes: vec![VmemLoad],
                 null_guarded: false,
+                atomic_ops: Vec::new(),
             },
             L {
                 record_offset: 8,
                 classes: vec![VmemStore],
                 null_guarded: false,
+                atomic_ops: Vec::new(),
             },
         ],
         T_READ => vec![L {
             record_offset: 0,
             classes: vec![VmemLoad],
             null_guarded: false,
+            atomic_ops: Vec::new(),
         }],
         T_NOP => vec![],
         T_WRITE => vec![L {
             record_offset: 8,
             classes: vec![VmemStore],
             null_guarded: false,
+            atomic_ops: Vec::new(),
         }],
         T_TILE_X | T_TILE_XY | T_TILE_B | T_TILE_R | T_TILE_Q | T_HID | T_HIDU | T_LE_OK
         | T_LE_BAD | T_GE_BAD | T_GRID_LE | T_TILE_Y | T_TILE_Z | T_TILE_XZ | T_TILE_YZ
@@ -122,29 +128,40 @@ fn template(id: u32) -> ArenaTemplate {
             record_offset: 8,
             classes: vec![VmemStore],
             null_guarded: false,
+            atomic_ops: Vec::new(),
         }],
         T_ATOM => vec![L {
             record_offset: 8,
             classes: vec![AtomicCommutative],
             null_guarded: false,
+            atomic_ops: Vec::new(),
         }],
         T_SEALED => vec![L {
             record_offset: 0,
             classes: vec![SmemLoad],
             null_guarded: false,
+            atomic_ops: Vec::new(),
         }],
         T_PROD => vec![
             L {
                 record_offset: 0,
                 classes: vec![VmemStore],
                 null_guarded: false,
+                atomic_ops: Vec::new(),
             },
             L {
                 record_offset: 8,
                 classes: vec![AtomicCommutative],
                 null_guarded: false,
+                atomic_ops: Vec::new(),
             },
         ],
+        T_SWAP => vec![L {
+            record_offset: 8,
+            classes: vec![Atomic],
+            null_guarded: false,
+            atomic_ops: vec!["global_atomic_swap_b32".into()],
+        }],
         other => panic!("no template {other}"),
     };
     ArenaTemplate {
@@ -1320,6 +1337,41 @@ mod lab {
         assert!(
             err.contains("proves no inter-WG write disjointness"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn a_non_commutative_atomic_is_not_commutative_across_workgroups() {
+        let two = || {
+            vec![
+                tile(T_SWAP, 0, 0, 0, 2, 4, 1),
+                tile(T_SWAP, 0, 2, 0, 2, 4, 1),
+            ]
+        };
+        // Certified: a swap/cmpswap needs happens-before or a footprint.
+        let err = tiles(T_SWAP, two(), region_wg_protocol()).unwrap_err();
+        assert!(
+            err.contains("proves no inter-WG write disjointness"),
+            "{err}"
+        );
+        // Lab: the same pair is the named pending reason, as for a plain store.
+        let fx = build(
+            vec![two()],
+            &[(T_SWAP, &[(8, X)])],
+            vec![vec![T_SWAP]],
+            None,
+            false,
+        );
+        let ordering = fx
+            .graph
+            .check_pending(&fx.program, fx.group.clone())
+            .unwrap();
+        let x = fx.data(X).0;
+        assert_eq!(
+            ordering.pending_reasons(),
+            [format!(
+                "inter-WG disjointness unproven: template {T_SWAP}, resource {x}"
+            )]
         );
     }
 

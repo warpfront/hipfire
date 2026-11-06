@@ -77,6 +77,7 @@ fn arg(offset: u32, size: u32, role: &str, mode: Option<&str>) -> ArgRecord {
         sinks: vec![],
         loaded: true,
         null_guarded: false,
+        atomic_ops: vec![],
     }
 }
 

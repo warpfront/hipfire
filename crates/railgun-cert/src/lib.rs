@@ -274,6 +274,16 @@ fn arg_record(a: &ArgFacts) -> ArgRecord {
         sinks: a.sinks.names().into_iter().map(str::to_owned).collect(),
         loaded: a.loaded,
         null_guarded: a.null_guarded,
+        atomic_ops: {
+            let mut ops: Vec<String> = a
+                .accesses
+                .iter()
+                .filter_map(|x| x.atomic_op.clone())
+                .collect();
+            ops.sort();
+            ops.dedup();
+            ops
+        },
     }
 }
 

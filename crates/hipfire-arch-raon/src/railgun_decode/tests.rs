@@ -75,6 +75,7 @@ fn arg_record(
         sinks: Vec::new(),
         loaded: true,
         null_guarded: false,
+        atomic_ops: vec![],
     }
 }
 

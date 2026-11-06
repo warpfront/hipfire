@@ -522,7 +522,7 @@ impl KernelProgram {
             if node.indexed.is_none() && !node.needs_sealed_table_witness() {
                 node.lowering = if node.effects.iter().any(|e| e.has(MemClass::Atomic)) {
                     Lowering::Graph {
-                        reason: "atomic without a commutativity certificate".to_owned(),
+                        reason: crate::kernel::ATOMIC_UNCERTIFIED.to_owned(),
                     }
                 } else {
                     Lowering::Pm4
@@ -905,6 +905,7 @@ mod tests {
                     record_offset,
                     classes: classes.to_vec(),
                     null_guarded: false,
+                    atomic_ops: Vec::new(),
                 })
                 .collect(),
             sealed: Vec::new(),
@@ -1438,6 +1439,7 @@ mod tests {
                     record_offset: 8,
                     classes: vec!["load_acquire".into(), "vmem_load".into()],
                     null_guarded: false,
+                    atomic_ops: Vec::new(),
                 }],
                 sealed_tables: vec![],
                 wg_footprints: vec![],
@@ -1459,6 +1461,7 @@ mod tests {
                 record_offset: 8,
                 classes: vec![VmemLoad, LoadAcquire],
                 null_guarded: false,
+                atomic_ops: Vec::new(),
             }]
         );
 

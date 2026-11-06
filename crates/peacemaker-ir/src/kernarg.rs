@@ -126,6 +126,9 @@ pub struct ArgAccess {
     /// The base also resolved to other arguments (e.g. `s_cselect_b64` of two
     /// kernarg pointers); every candidate gets the access.
     pub shared: bool,
+    /// The mnemonic of a non-commutative atomic (`Atomic { commutative: false }`,
+    /// e.g. `global_atomic_swap_b32`); `None` for every other access.
+    pub atomic_op: Option<String>,
 }
 
 /// A3: which read caches can hold data this kernel read from an argument.

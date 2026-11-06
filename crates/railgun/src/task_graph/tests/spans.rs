@@ -44,6 +44,7 @@ fn span_facts(known: &[u32], protocol: Option<TaskProtocolFact>) -> Arc<NodeFact
         record_offset,
         classes: vec![class],
         null_guarded: false,
+        atomic_ops: Vec::new(),
     };
     let template = |template, pointer_loads| ArenaTemplate {
         template,

@@ -45,6 +45,17 @@
 //! hidden arguments railgun does not supply, an unconsumed declared word, a
 //! non-allocation sealed table...) is a refusal that no lab state may
 //! override.
+//!
+//! One `Graph` lowering is also a pending certificate: exactly
+//! [`crate::kernel::ATOMIC_UNCERTIFIED`] ("atomic without a commutativity
+//! certificate"; a `Graph` for any other reason is refused). The node is
+//! admitted with its conservative effects (`Atomic` reads and writes), and
+//! every non-commutative atomic source is named in its pending reason as
+//! `atomic protocol unproven: template <t>, +<record offset>, <opcode>` (an
+//! arena pointer load) or `atomic protocol unproven: arg +<offset>, <opcode>`
+//! (an explicit argument), sorted and deduplicated. A source whose receipt
+//! records no opcode is refused: no reason without it. The certified path
+//! still refuses the node (`Graph`).
 
 use std::ops::Range;
 
@@ -427,7 +438,7 @@ impl crate::coresident::GroupPlan {
 mod lab {
     use std::collections::BTreeSet;
 
-    use crate::kernel::{Arg, KernelProgram, Lowering, MemClass, RegionEffect};
+    use crate::kernel::{Arg, KernelProgram, Lowering, MemClass, RegionEffect, ATOMIC_UNCERTIFIED};
     use crate::{ResourceId, ResourceKind};
 
     use super::is_pending_certificate_reason;
@@ -505,8 +516,16 @@ mod lab {
                 .get(node)
                 .ok_or_else(|| format!("lab-pending: no node {node}"))?;
             let who = format!("lab-pending: node {node} ({})", n.symbol);
+            let mut atomic = false;
             let reason = match &n.lowering {
                 Lowering::HipDirect { reason } | Lowering::Conditional { reason } => reason,
+                // Exactly one certified-but-not-PM4 case is a pending certificate:
+                // a non-commutative atomic with no commutativity certificate. Its
+                // sources are named below; any other Graph reason stays refused.
+                Lowering::Graph { reason } if reason == ATOMIC_UNCERTIFIED => {
+                    atomic = true;
+                    reason
+                }
                 Lowering::Pm4 => return Err(format!("{who} is already PM4: nothing is pending")),
                 Lowering::Graph { reason } => {
                     return Err(format!(
@@ -525,13 +544,56 @@ mod lab {
             }
             if let Some(bad) = reason
                 .split("; ")
-                .find(|fragment| !is_pending_certificate_reason(fragment))
+                .find(|fragment| !atomic && !is_pending_certificate_reason(fragment))
             {
                 return Err(format!(
                     "{who}: {bad:?} is not a pending certificate (allow-list: A1 Unknown, \
                      descriptor_arena records not bound, indexed_bind/sealed_table witness \
                      not consumed); full reason: {reason}"
                 ));
+            }
+            // Each non-commutative atomic source, by template and record offset
+            // (arena pointer loads) or argument offset, with its opcode; a
+            // source without a recorded opcode is refused.
+            let mut named: BTreeSet<String> = BTreeSet::new();
+            if atomic {
+                for fact in n.arena.iter().flat_map(|a| a.arenas.iter()) {
+                    for t in &fact.templates {
+                        for load in t
+                            .pointer_loads
+                            .iter()
+                            .filter(|l| l.classes.contains(&MemClass::Atomic))
+                        {
+                            if load.atomic_ops.is_empty() {
+                                return Err(format!(
+                                    "{who}: template {} +{} issues a non-commutative atomic with no recorded opcode",
+                                    t.template, load.record_offset
+                                ));
+                            }
+                            for op in &load.atomic_ops {
+                                named.insert(format!(
+                                    "atomic protocol unproven: template {}, +{}, {op}",
+                                    t.template, load.record_offset
+                                ));
+                            }
+                        }
+                    }
+                }
+                for (offset, ops) in &n.atomic_ops {
+                    if ops.is_empty() {
+                        return Err(format!(
+                            "{who}: arg +{offset} issues a non-commutative atomic with no recorded opcode"
+                        ));
+                    }
+                    for op in ops {
+                        named.insert(format!("atomic protocol unproven: arg +{offset}, {op}"));
+                    }
+                }
+                if named.is_empty() {
+                    return Err(format!(
+                        "{who}: {reason}, but no atomic source is recorded to name"
+                    ));
+                }
             }
 
             let mut effects = n.effects.clone();
@@ -612,7 +674,11 @@ mod lab {
                 }
             }
 
-            let pending = reason.clone();
+            let mut pending = reason.clone();
+            for source in &named {
+                pending.push_str("; ");
+                pending.push_str(source);
+            }
             let n = &mut self.nodes[node];
             n.effects = effects;
             n.lowering = Lowering::LabPending { pending };
@@ -626,7 +692,7 @@ mod lab_tests {
     use super::*;
     use crate::coresident::{GroupOrdering, OrderedEdge, WHY_ORDERED_EDGE};
     use crate::kernel::tests::{facts, launch, ptr};
-    use crate::kernel::{author, FactStatus, MemClass::*};
+    use crate::kernel::{author, FactStatus, MemClass::*, ATOMIC_UNCERTIFIED};
     use crate::plan::{plan, CacheTable, RowPolicy};
     use crate::sealed_table::SealedTableRegistry;
     use crate::{BindingField, BindingRecord, ResourceId, ResourceKind};
@@ -764,6 +830,188 @@ mod lab_tests {
             .admit_lab_pending(0, None)
             .unwrap_err()
             .contains("already lab-pending"));
+    }
+
+    /// An explicit pointer argument issuing a non-commutative atomic.
+    fn atomic_ptr(offset: u32, ops: &[&str]) -> crate::kernel::ArgFact {
+        crate::kernel::ArgFact {
+            offset,
+            size: 8,
+            role: crate::kernel::ArgRole::Pointer {
+                classes: vec![Atomic],
+                read_cache: crate::kernel::ReadCache::VmemOnly,
+                atomic_ops: ops.iter().map(|s| (*s).to_owned()).collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn a_graph_by_atomic_node_is_admitted_lab_pending_naming_each_arg_and_opcode() {
+        let mut p = author(
+            "gfx1201",
+            &[launch(
+                &[(0, A), (8, D)],
+                16,
+                vec![
+                    atomic_ptr(0, &["global_atomic_swap_b32", "global_atomic_cmpswap_b32"]),
+                    atomic_ptr(8, &["global_atomic_swap_b32"]),
+                ],
+            )],
+        );
+        let want = ATOMIC_UNCERTIFIED;
+        assert!(matches!(&p.nodes[0].lowering, Lowering::Graph { reason } if reason == want));
+        // Certified: not PM4, not lowerable, the admission is Certified only
+        // because nothing is lab-pending, and `admit` is the only way out.
+        assert!(!p.nodes[0].lowering.is_pm4() && !p.nodes[0].lowering.is_pm4_lowerable());
+        let before = p.nodes[0].effects.clone();
+        p.admit_lab_pending(0, None).unwrap();
+        let n = &p.nodes[0];
+        // Effects stay conservative: the atomics (reads and writes) are kept.
+        assert!(before.iter().all(|e| n
+            .effects
+            .iter()
+            .any(|m| m.resource == e.resource && m.has(Atomic))));
+        let Lowering::LabPending { pending } = &n.lowering else {
+            panic!("{:?}", n.lowering)
+        };
+        assert_eq!(
+            pending,
+            &format!(
+                "{want}; atomic protocol unproven: arg +0, global_atomic_cmpswap_b32; \
+                 atomic protocol unproven: arg +0, global_atomic_swap_b32; \
+                 atomic protocol unproven: arg +8, global_atomic_swap_b32"
+            )
+        );
+        assert!(n.lowering.is_pm4_lowerable() && !n.lowering.is_pm4());
+        // It flows into the admission and its receipt, which needs the witness.
+        let admission = p.admission();
+        let Admission::LabPending { reasons } = &admission else {
+            panic!("{admission:?}")
+        };
+        assert!(
+            reasons[0].starts_with("node 0 (k): atomic without"),
+            "{reasons:?}"
+        );
+        assert!(admission.receipt(None).is_err());
+        let w = DifferentialWitness::compare(b"f", b"a", b"a").unwrap();
+        assert_eq!(
+            admission.receipt(Some(&w)).unwrap().pending.as_ref(),
+            Some(reasons)
+        );
+    }
+
+    #[test]
+    fn an_arena_atomic_load_is_named_by_template_and_record_offset() {
+        use crate::kernel::{ArenaFact, ArenaPointerLoad, ArenaTemplate, ConditionalFacts};
+        let load =
+            |record_offset, classes: Vec<crate::kernel::MemClass>, ops: &[&str]| ArenaPointerLoad {
+                record_offset,
+                classes,
+                null_guarded: false,
+                atomic_ops: ops.iter().map(|s| (*s).to_owned()).collect(),
+            };
+        let program = |ops: &[&str]| {
+            let args = vec![ptr(0, &[SmemLoad])];
+            let mut arena = launch(&[(0, A)], 8, args.clone());
+            let mut f = (*facts(args, 8)).clone();
+            f.facts.status = FactStatus::Conditional(ConditionalFacts {
+                guards: Vec::new(),
+                indexed: Vec::new(),
+                tables: Vec::new(),
+                arenas: vec![ArenaFact {
+                    arena_arg_offset: 0,
+                    templates: vec![ArenaTemplate {
+                        template: 3,
+                        pointer_loads: vec![
+                            load(0, vec![VmemLoad], &[]),
+                            load(16, vec![Atomic], ops),
+                            load(8, vec![Atomic], &["global_atomic_swap_b32"]),
+                        ],
+                        sealed: Vec::new(),
+                        wg_footprints: Vec::new(),
+                        hidden_grid: Vec::new(),
+                    }],
+                }],
+                task_protocol: None,
+                witnesses: vec!["descriptor_arena".into()],
+                case_digest: "ab".repeat(32),
+            });
+            arena.facts = Ok(std::sync::Arc::new(f));
+            let toucher = launch(&[(0, D)], 8, vec![ptr(0, &[VmemLoad])]);
+            let mut p = author("gfx1201", &[arena, toucher]);
+            let field = |offset| BindingField {
+                offset,
+                resource: ResourceId(1),
+                interior: 0,
+            };
+            p.bind_records(
+                ResourceId(0),
+                vec![BindingRecord {
+                    base: 0,
+                    template: 3,
+                    fields: vec![field(0), field(8), field(16)],
+                    ..Default::default()
+                }],
+                &SealedTableRegistry::new(),
+            )
+            .unwrap();
+            p
+        };
+        let mut p = program(&["global_atomic_cmpswap_b32", "global_atomic_swap_b32"]);
+        assert!(matches!(&p.nodes[0].lowering, Lowering::Graph { .. }));
+        p.admit_lab_pending(0, None).unwrap();
+        let Lowering::LabPending { pending } = &p.nodes[0].lowering else {
+            panic!("{:?}", p.nodes[0].lowering)
+        };
+        // Sorted by name, deduplicated (the swap at +16 and +8 differ by offset).
+        assert_eq!(
+            pending,
+            &format!(
+                "{ATOMIC_UNCERTIFIED}; atomic protocol unproven: template 3, +16, global_atomic_cmpswap_b32; \
+                 atomic protocol unproven: template 3, +16, global_atomic_swap_b32; \
+                 atomic protocol unproven: template 3, +8, global_atomic_swap_b32"
+            )
+        );
+        // A load with the Atomic class and no recorded opcode is refused.
+        let mut p = program(&[]);
+        let before = p.nodes.clone();
+        let err = p.admit_lab_pending(0, None).unwrap_err();
+        assert!(
+            err.contains("template 3 +16") && err.contains("no recorded opcode"),
+            "{err}"
+        );
+        assert_eq!(p.nodes, before, "an Err leaves the nodes unchanged");
+    }
+
+    #[test]
+    fn an_atomic_without_a_recorded_opcode_and_any_other_graph_reason_are_refused() {
+        let mut p = author("gfx1201", &[launch(&[(0, A)], 8, vec![atomic_ptr(0, &[])])]);
+        let before = p.clone();
+        let err = p.admit_lab_pending(0, None).unwrap_err();
+        assert!(
+            err.contains("arg +0") && err.contains("no recorded opcode"),
+            "{err}"
+        );
+        assert_eq!(p.nodes, before.nodes);
+
+        let mut p = author(
+            "gfx1201",
+            &[launch(
+                &[(0, A)],
+                8,
+                vec![atomic_ptr(0, &["global_atomic_swap_b32"])],
+            )],
+        );
+        p.nodes[0].lowering = Lowering::Graph {
+            reason: "something else".into(),
+        };
+        let err = p.admit_lab_pending(0, None).unwrap_err();
+        assert!(err.contains("certified but not PM4"), "{err}");
+        // The exact atomic reason plus another one is no atomic node either.
+        p.nodes[0].lowering = Lowering::Graph {
+            reason: format!("{ATOMIC_UNCERTIFIED}; something else"),
+        };
+        assert!(p.admit_lab_pending(0, None).is_err());
     }
 
     #[test]

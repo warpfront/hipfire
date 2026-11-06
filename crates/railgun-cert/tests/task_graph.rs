@@ -228,6 +228,44 @@ fn the_ar_hc_debug_pointers_are_null_guarded() {
     }
 }
 
+/// The non-commutative atomic opcodes each real template pointer is accessed with. Only
+/// template 3 (`hyper_norm_gate`) swaps through its pointer at +48. The `ar_hc_write`
+/// templates (13, 15) issue `global_atomic_add_u32` only, which is commutative, so their
+/// records carry no `atomic_ops` (and serialize without it).
+#[test]
+fn real_templates_carry_their_non_commutative_atomic_opcodes() {
+    let mut got: Vec<(String, u32, u32, Vec<String>)> = Vec::new();
+    for &(name, symbol, _) in POOLS {
+        let (refusals, partial) = prove(name, symbol);
+        assert!(refusals.is_empty(), "{name}: {refusals:#?}");
+        for t in &partial.expect("proof").arena.templates {
+            for p in &t.pointer_loads {
+                let json = serde_json::to_string(p).expect("json");
+                assert_eq!(
+                    json.contains("atomic_ops"),
+                    !p.atomic_ops.is_empty(),
+                    "{json}"
+                );
+                if !p.atomic_ops.is_empty() {
+                    got.push((
+                        name.into(),
+                        t.template,
+                        p.record_offset,
+                        p.atomic_ops.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    let want = vec![(
+        "b256".to_owned(),
+        3,
+        48,
+        vec!["global_atomic_swap_b32".to_owned()],
+    )];
+    assert_eq!(got, want);
+}
+
 /// Every obligation holds on the OR-poison pools: a conditional record per pool.
 #[test]
 fn real_pools_are_certified() {

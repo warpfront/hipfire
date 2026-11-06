@@ -105,6 +105,7 @@ fn arg_facts() -> Vec<ArgFact> {
         role: ArgRole::Pointer {
             classes: classes.to_vec(),
             read_cache: ReadCache::VmemOnly,
+            atomic_ops: Vec::new(),
         },
     };
     let int = |offset| ArgFact {

@@ -117,6 +117,10 @@ pub enum ArgRole {
     /// A1: a resolved access base. `classes` is empty when the kernel never
     /// dereferences it.
     Pointer {
+        /// Mnemonics of the non-commutative atomics (`MemClass::Atomic`)
+        /// issued through it (the receipt's `atomic_ops`, sorted); empty
+        /// without one.
+        atomic_ops: Vec<String>,
         classes: Vec<MemClass>,
         read_cache: ReadCache,
     },
@@ -124,6 +128,10 @@ pub enum ArgRole {
     Integer,
     NotLoaded,
 }
+
+/// The `Lowering::Graph` reason of a node with a non-commutative atomic and
+/// no commutativity certificate.
+pub const ATOMIC_UNCERTIFIED: &str = "atomic without a commutativity certificate";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArgFact {
@@ -245,6 +253,9 @@ pub struct ArenaPointerLoad {
     /// `null_guarded`): the field may be a declared null
     /// ([`crate::BindingRecord::nulls`]).
     pub null_guarded: bool,
+    /// Mnemonics of the non-commutative atomics issued through this pointer
+    /// (the receipt's `atomic_ops`, sorted); empty without one.
+    pub atomic_ops: Vec<String>,
 }
 
 /// Writes through the pointer at `record_offset` by two workgroups `w != w'`
@@ -567,6 +578,7 @@ fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, St
                     record_offset: p.record_offset,
                     classes,
                     null_guarded: p.null_guarded,
+                    atomic_ops: p.atomic_ops.clone(),
                 });
             }
             templates.push(ArenaTemplate {
@@ -767,6 +779,7 @@ impl KernelFacts {
                     ArgRole::Pointer {
                         classes,
                         read_cache: ReadCache::parse(&arg.read_cache)?,
+                        atomic_ops: arg.atomic_ops.clone(),
                     }
                 }
                 "integer" => ArgRole::Integer,
@@ -1272,6 +1285,10 @@ pub struct KernelNode {
     /// [`KernelProgram::kernarg_image`]; every other hidden byte is zero.
     pub hidden: Vec<HiddenArg>,
     pub effects: Vec<RegionEffect>,
+    /// The mnemonics of the non-commutative atomics each explicit pointer
+    /// argument issues, `(argument offset, sorted mnemonics)` (empty when the
+    /// receipt records none): what a lab-pending admission names.
+    pub atomic_ops: Vec<(u32, Vec<String>)>,
     pub read_cache: ReadCache,
     pub lowering: Lowering,
     /// The guarded case of a `Conditional` kernel (a copy of the receipt's
@@ -1532,6 +1549,7 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
         let mut effects = Vec::new();
         let mut cursor = 0usize;
         let mut non_commutative_atomic = false;
+        let mut atomic_ops: Vec<(u32, Vec<String>)> = Vec::new();
         for arg in &f.args {
             let (start, end) = (arg.offset as usize, (arg.offset + arg.size) as usize);
             if start > cursor {
@@ -1562,7 +1580,12 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
                 }
                 continue;
             }
-            let ArgRole::Pointer { classes, .. } = &arg.role else {
+            let ArgRole::Pointer {
+                classes,
+                atomic_ops: arg_ops,
+                ..
+            } = &arg.role
+            else {
                 args.push((arg.offset, Arg::Const(bytes.to_vec())));
                 continue;
             };
@@ -1663,6 +1686,9 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
             ));
             if !classes.is_empty() {
                 non_commutative_atomic |= classes.contains(&MemClass::Atomic);
+                if classes.contains(&MemClass::Atomic) {
+                    atomic_ops.push((arg.offset, arg_ops.clone()));
+                }
                 effects.push(RegionEffect {
                     arg_offset: arg.offset,
                     resource,
@@ -1746,7 +1772,7 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
             }
         } else if non_commutative_atomic {
             Lowering::Graph {
-                reason: "atomic without a commutativity certificate".to_owned(),
+                reason: ATOMIC_UNCERTIFIED.to_owned(),
             }
         } else {
             Lowering::Pm4
@@ -1771,6 +1797,7 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
             args,
             hidden: f.hidden.clone(),
             effects,
+            atomic_ops,
             read_cache: f.read_cache,
             lowering,
             indexed: conditional
@@ -1910,6 +1937,7 @@ fn uncertified_node(launch: &LaunchRecord, reason: String) -> KernelNode {
         args: vec![(0, Arg::Const(launch.kernarg.clone()))],
         hidden: Vec::new(),
         effects: Vec::new(),
+        atomic_ops: Vec::new(),
         read_cache: ReadCache::Unknown,
         lowering: Lowering::HipDirect { reason },
         indexed: None,
@@ -2298,6 +2326,7 @@ pub(crate) mod tests {
             role: ArgRole::Pointer {
                 classes: classes.to_vec(),
                 read_cache: ReadCache::VmemOnly,
+                atomic_ops: Vec::new(),
             },
         }
     }

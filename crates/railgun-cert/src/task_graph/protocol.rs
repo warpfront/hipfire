@@ -557,14 +557,14 @@ fn join_map(a: &BTreeMap<u16, Alts>, b: &BTreeMap<u16, Alts>) -> BTreeMap<u16, A
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Default)]
-struct Ins {
-    mn: String,
-    ops: Vec<String>,
-    mods: Vec<String>,
+pub(super) struct Ins {
+    pub(super) mn: String,
+    pub(super) ops: Vec<String>,
+    pub(super) mods: Vec<String>,
 }
 
 impl Ins {
-    fn parse(text: &str) -> Ins {
+    pub(super) fn parse(text: &str) -> Ins {
         let text = text.split(';').next().unwrap_or("").trim();
         let (mn, rest) = text
             .split_once(char::is_whitespace)
@@ -612,7 +612,7 @@ impl Ins {
             .iter()
             .find_map(|m| m.strip_prefix(key)?.strip_prefix(':'))
     }
-    fn offset(&self) -> i64 {
+    pub(super) fn offset(&self) -> i64 {
         self.modifier("offset").and_then(parse_num).unwrap_or(0)
     }
     fn returns(&self) -> bool {
@@ -629,7 +629,7 @@ impl Ins {
     }
 }
 
-fn parse_num(s: &str) -> Option<i64> {
+pub(super) fn parse_num(s: &str) -> Option<i64> {
     let s = s.trim();
     let s = s
         .strip_prefix("lit(")
@@ -649,14 +649,14 @@ fn parse_num(s: &str) -> Option<i64> {
 
 /// A register operand: `s12`, `s[4:5]`, `v1`, `v[4:7]`, `exec_lo`, ...
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Rk {
+pub(super) enum Rk {
     S,
     V,
     Exec,
     Other,
 }
 
-fn parse_reg(s: &str) -> Option<(Rk, u16, u16)> {
+pub(super) fn parse_reg(s: &str) -> Option<(Rk, u16, u16)> {
     let s = s.trim();
     match s {
         "exec_lo" => return Some((Rk::Exec, 0, 1)),
