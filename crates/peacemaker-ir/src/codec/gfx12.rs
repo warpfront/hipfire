@@ -1836,7 +1836,10 @@ mod tests {
             words[1] = (words[1] & 0x00ff_ffff) | (flags << 24);
             words[2] = (words[2] & !0xff) | 2;
             let e = decode(&words).unwrap_err();
-            assert!(format!("{e:?}").contains("idxen"), "flags {flags:#x}: {e:?}");
+            assert!(
+                format!("{e:?}").contains("idxen"),
+                "flags {flags:#x}: {e:?}"
+            );
         }
     }
 
