@@ -33,8 +33,8 @@
 //! wave `w` folds and stores the accumulator indices `j` with `j % 4 == w`.
 
 use super::{
-    exec_all, exec_mask, plan, prologue, vload128, zero_regs, Fmt, Geo, Lay, ACC, KARG, LANE,
-    LB, LR, SM, SO, SP, TMP, TMP2, VT, VT2, WAVE, WG, YA, YP, k_loops, branch,
+    branch, exec_all, exec_mask, k_loops, plan, prologue, vload128, zero_regs, Fmt, Geo, Lay, ACC,
+    KARG, LANE, LB, LR, SM, SO, SP, TMP, TMP2, VT, VT2, WAVE, WG, YA, YP,
 };
 use crate::insn::{Instruction, MemoryClass};
 use crate::kernels::common::{add64, lit, op, s, smem, sop, v};
@@ -94,12 +94,7 @@ fn alu_wait(b: &mut Builder) -> R {
 /// HIP `bf16_to_f32(bf16_round(x))` in place on `val`; `t` scratch.
 fn round_trip(b: &mut Builder, val: u8, t: [u8; 3]) -> R {
     let [t0, t1, t2] = t;
-    valu(
-        b,
-        format!("v_bfe_u32 v{t0}, v{val}, 16, 1"),
-        &[t0],
-        &[val],
-    )?;
+    valu(b, format!("v_bfe_u32 v{t0}, v{val}, 16, 1"), &[t0], &[val])?;
     valu(
         b,
         format!("v_add_nc_u32_e32 v{t0}, v{val}, v{t0}"),
@@ -124,12 +119,7 @@ fn round_trip(b: &mut Builder, val: u8, t: [u8; 3]) -> R {
         &[t2],
         &[val],
     )?;
-    valu(
-        b,
-        format!("v_cmp_eq_u32_e32 vcc_lo, 0, v{t1}"),
-        &[],
-        &[t1],
-    )?;
+    valu(b, format!("v_cmp_eq_u32_e32 vcc_lo, 0, v{t1}"), &[], &[t1])?;
     alu_wait(b)?;
     valu(
         b,
@@ -184,18 +174,68 @@ fn divide(b: &mut Builder, num: Result<u8, &str>, den: Result<u8, &str>, w: [u8;
         u.extend_from_slice(extra);
         u
     };
-    valu(b, format!("v_div_scale_f32 v{w1}, null, {d}, {d}, {n}"), &[w1], &ext)?;
+    valu(
+        b,
+        format!("v_div_scale_f32 v{w1}, null, {d}, {d}, {n}"),
+        &[w1],
+        &ext,
+    )?;
     valu(b, format!("v_rcp_f32_e32 v{w2}, v{w1}"), &[w2], &[w1])?;
-    valu(b, format!("v_fma_f32 v{w3}, -v{w1}, v{w2}, 1.0"), &[w3], &[w1, w2])?;
-    valu(b, format!("v_fmac_f32_e32 v{w2}, v{w3}, v{w2}"), &[w2], &[w2, w3])?;
-    valu(b, format!("v_div_scale_f32 v{w3}, vcc_lo, {n}, {d}, {n}"), &[w3], &ext)?;
-    valu(b, format!("v_mul_f32_e32 v{w4}, v{w3}, v{w2}"), &[w4], &[w3, w2])?;
-    valu(b, format!("v_fma_f32 v{w5}, -v{w1}, v{w4}, v{w3}"), &[w5], &[w1, w4, w3])?;
-    valu(b, format!("v_fmac_f32_e32 v{w4}, v{w5}, v{w2}"), &[w4], &[w4, w5, w2])?;
-    valu(b, format!("v_fma_f32 v{w1}, -v{w1}, v{w4}, v{w3}"), &[w1], &[w1, w4, w3])?;
+    valu(
+        b,
+        format!("v_fma_f32 v{w3}, -v{w1}, v{w2}, 1.0"),
+        &[w3],
+        &[w1, w2],
+    )?;
+    valu(
+        b,
+        format!("v_fmac_f32_e32 v{w2}, v{w3}, v{w2}"),
+        &[w2],
+        &[w2, w3],
+    )?;
+    valu(
+        b,
+        format!("v_div_scale_f32 v{w3}, vcc_lo, {n}, {d}, {n}"),
+        &[w3],
+        &ext,
+    )?;
+    valu(
+        b,
+        format!("v_mul_f32_e32 v{w4}, v{w3}, v{w2}"),
+        &[w4],
+        &[w3, w2],
+    )?;
+    valu(
+        b,
+        format!("v_fma_f32 v{w5}, -v{w1}, v{w4}, v{w3}"),
+        &[w5],
+        &[w1, w4, w3],
+    )?;
+    valu(
+        b,
+        format!("v_fmac_f32_e32 v{w4}, v{w5}, v{w2}"),
+        &[w4],
+        &[w4, w5, w2],
+    )?;
+    valu(
+        b,
+        format!("v_fma_f32 v{w1}, -v{w1}, v{w4}, v{w3}"),
+        &[w1],
+        &[w1, w4, w3],
+    )?;
     alu_wait(b)?;
-    valu(b, format!("v_div_fmas_f32 v{w1}, v{w1}, v{w2}, v{w4}"), &[w1], &[w1, w2, w4])?;
-    valu(b, format!("v_div_fixup_f32 v{w0}, v{w1}, {d}, {n}"), &[w0], &with(&[w1]))
+    valu(
+        b,
+        format!("v_div_fmas_f32 v{w1}, v{w1}, v{w2}, v{w4}"),
+        &[w1],
+        &[w1, w2, w4],
+    )?;
+    valu(
+        b,
+        format!("v_div_fixup_f32 v{w0}, v{w1}, {d}, {n}"),
+        &[w0],
+        &with(&[w1]),
+    )
 }
 
 /// `gate_pre = 1.0 / (1.0 + expf(-x))` (not yet BF16-rounded) in `t0`; `x` preserved.
@@ -213,12 +253,7 @@ fn sigmoid(b: &mut Builder, x: u8, t: [u8; 6]) -> R {
         &[t1],
         &[x, t0],
     )?;
-    valu(
-        b,
-        format!("v_rndne_f32_e32 v{t2}, v{t0}"),
-        &[t2],
-        &[t0],
-    )?;
+    valu(b, format!("v_rndne_f32_e32 v{t2}, v{t0}"), &[t2], &[t0])?;
     valu(
         b,
         format!("v_sub_f32_e32 v{t0}, v{t0}, v{t2}"),
@@ -237,12 +272,7 @@ fn sigmoid(b: &mut Builder, x: u8, t: [u8; 6]) -> R {
         &[t0],
         &[t0, t1],
     )?;
-    valu(
-        b,
-        format!("v_cvt_i32_f32_e32 v{t3}, v{t2}"),
-        &[t3],
-        &[t2],
-    )?;
+    valu(b, format!("v_cvt_i32_f32_e32 v{t3}, v{t2}"), &[t3], &[t2])?;
     valu(b, format!("v_exp_f32_e32 v{t0}, v{t0}"), &[t0], &[t0])?;
     valu(
         b,
@@ -276,12 +306,7 @@ fn sigmoid(b: &mut Builder, x: u8, t: [u8; 6]) -> R {
         &[t0],
         &[t0],
     )?;
-    valu(
-        b,
-        format!("v_add_f32_e32 v{t0}, 1.0, v{t0}"),
-        &[t0],
-        &[t0],
-    )?;
+    valu(b, format!("v_add_f32_e32 v{t0}, 1.0, v{t0}"), &[t0], &[t0])?;
     // t0 = 1.0 / t0.
     divide(b, Err("1.0"), Ok(t0), t)
 }
@@ -318,13 +343,21 @@ fn epilogue(b: &mut Builder, g: &Geo, l: &Lay, slot: usize, end: &str) -> R {
 
     smem(b, OP, 2, KARG, 32)?;
     // Normalized pointer: normalized + (wave*hidden + wg*16)*4.
-    sop(b, format!("s_mul_i32 s{TMP}, s{SM}, s{WAVE}"), &[TMP], &[SM, WAVE])?;
+    sop(
+        b,
+        format!("s_mul_i32 s{TMP}, s{SM}, s{WAVE}"),
+        &[TMP],
+        &[SM, WAVE],
+    )?;
     sop(b, format!("s_lshl_b32 s{TMP}, s{TMP}, 2"), &[TMP], &[TMP])?;
     sop(b, format!("s_lshl_b32 s{TMP2}, s{WG}, 6"), &[TMP2], &[WG])?;
     let a = b.spec.arch;
     sop(
         b,
-        format!("{} s{TMP}, s{TMP}, s{TMP2}", crate::kernels::common::s_add_i32(a)),
+        format!(
+            "{} s{TMP}, s{TMP}, s{TMP2}",
+            crate::kernels::common::s_add_i32(a)
+        ),
         &[TMP],
         &[TMP, TMP2],
     )?;
@@ -542,6 +575,8 @@ pub fn emit_read_up(nt: u32) -> Result<Emitted, String> {
 /// All four exports, `n1..n4`, in [`read_up_symbol`] order.
 pub fn emit_read_ups() -> Result<Vec<Emitted>, String> {
     (1..=4)
-        .map(|nt| emit_read_up(nt).map_err(|e| format!("{}: {}: {e}", super::MODULE, read_up_symbol(nt))))
+        .map(|nt| {
+            emit_read_up(nt).map_err(|e| format!("{}: {}: {e}", super::MODULE, read_up_symbol(nt)))
+        })
         .collect()
 }

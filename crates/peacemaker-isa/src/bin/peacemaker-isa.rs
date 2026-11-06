@@ -1063,6 +1063,21 @@ fn row_image(kernel: &str, epi: &str, arch: Arch) -> Result<Option<RowImage>, St
                     });
                     image.push(e, ["ceil(M*K/256)", "1", "1"], empty(), contract)?;
                 }
+                for (nt, e) in (1..=4u32).zip(k::emit_read_ups()?) {
+                    image.push(
+                        e,
+                        ["hidden/16", "1", "1"],
+                        rows((16 * nt) as u8),
+                        json!({
+                            "shape_domain": {
+                                "hidden": "hidden % 16 == 0",
+                                "low_rank": "low_rank % 32 == 0 && 4*hidden*low_rank < 2^32",
+                            },
+                            "kernarg": "q@0 s@8 low@16 normalized@24 mixed@32 u64; hidden@40 low_rank@44 rows@48 pad@52 u32",
+                            "arithmetic_recipe": "hc8 full-K E4M3 BF16 WMMA then exact projected-read sigmoid/round/product; four branch terms folded from +0 in branch order 0..3; full divide by four and BF16 round",
+                        }),
+                    )?;
+                }
             }
         }
         "mq4_rows_x4" => {
@@ -2859,4 +2874,29 @@ fn main() {
         eprintln!("peacemaker-isa: {e}");
         std::process::exit(1)
     }
+}
+
+#[cfg(test)]
+#[test]
+fn hc8_cli_emits_exact_module_exports() {
+    use peacemaker_isa::kernels::hc8_wmma_gfx1201 as k;
+    let image = row_image("hc8_wmma_gfx1201", "all", Arch::Gfx1201)
+        .unwrap()
+        .unwrap();
+    let names: Vec<_> = image
+        .entries
+        .iter()
+        .map(|e| row_export(e).unwrap())
+        .collect();
+    assert_eq!(names, k::symbols());
+    let priority = row_image("hc8_wmma_gfx1201", "priority", Arch::Gfx1201)
+        .unwrap()
+        .unwrap();
+    let names: Vec<_> = priority
+        .entries
+        .iter()
+        .map(|e| row_export(e).unwrap())
+        .collect();
+    let expected: Vec<_> = k::priority_geos().iter().map(k::Geo::symbol).collect();
+    assert_eq!(names, expected);
 }

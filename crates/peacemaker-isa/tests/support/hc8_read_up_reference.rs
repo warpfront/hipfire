@@ -615,20 +615,14 @@ pub fn emit_projected_reference() -> Result<Emitted, String> {
         let off = V_OFF + br;
         mem_op(
             b,
-            format!(
-                "global_load_b32 v{V_X}, v{off}, s[{S_UP}:{}]",
-                S_UP + 1
-            ),
+            format!("global_load_b32 v{V_X}, v{off}, s[{S_UP}:{}]", S_UP + 1),
             &[v(V_X)],
             &[v(off), sr(S_UP, 2)],
             MemoryClass::VmemLoad,
         )?;
         mem_op(
             b,
-            format!(
-                "global_load_b32 v{V_N}, v{off}, s[{S_NORM}:{}]",
-                S_NORM + 1
-            ),
+            format!("global_load_b32 v{V_N}, v{off}, s[{S_NORM}:{}]", S_NORM + 1),
             &[v(V_N)],
             &[v(off), sr(S_NORM, 2)],
             MemoryClass::VmemLoad,

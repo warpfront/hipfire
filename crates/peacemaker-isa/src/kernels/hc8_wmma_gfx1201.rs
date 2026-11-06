@@ -1129,8 +1129,8 @@ pub fn emit_geos(geos: &[Geo]) -> Result<(Vec<Emitted>, String, ModuleProof), St
     link(emit_gemms(geos)?, &symbols)
 }
 
-/// Build the full module: every export of [`all_geos`] then `hc8_dequant_{bf16,f16}`
-/// (82 exports, [`symbols`] order).
+/// Build every GEMM export, then dequant and fused read-up exports
+/// (86 exports, [`symbols`] order).
 pub fn emit_module() -> Result<(Vec<Emitted>, String, ModuleProof), String> {
     let mut emitted = emit_gemms(&all_geos())?;
     emitted.extend(emit_dequants()?);

@@ -69,10 +69,10 @@ use peacemaker_isa::Arch;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
-#[path = "support/hc8_reference.rs"]
-mod hc8_reference;
 #[path = "support/hc8_read_up_reference.rs"]
 mod hc8_read_up_reference;
+#[path = "support/hc8_reference.rs"]
+mod hc8_reference;
 use hc8_read_up_reference::{
     bf16_rt_bits, host_read_word, projected_grid, projected_module, PROJECTED_BLOCK,
     PROJECTED_SYMBOL,
@@ -599,13 +599,7 @@ fn run_fused(
     let sp = map_guarded(&mut mem, "s", SBASE, f32_bytes(&c.sc), WGUARD);
     let xp = map_guarded(&mut mem, "x", XBASE, f32_bytes(low), XGUARD);
     let np = map_guarded(&mut mem, "n", NBASE, f32_bytes(norm), NGUARD);
-    let yp = map_guarded(
-        &mut mem,
-        "y",
-        YBASE,
-        sentinel(rows * c.hidden),
-        SENT,
-    );
+    let yp = map_guarded(&mut mem, "y", YBASE, sentinel(rows * c.hidden), SENT);
     mem.map(
         "kernarg".into(),
         KERNARG,
@@ -1110,7 +1104,10 @@ fn read_up_module_abi_resources_and_native_roundtrip() {
             "{sym}: emit_read_up == emit_read_ups"
         );
         assert!(t.contains(&format!(".globl {sym}\n")), "{sym}: globl");
-        assert!(t.contains(&format!(".name: {sym}\n")), "{sym}: metadata name");
+        assert!(
+            t.contains(&format!(".name: {sym}\n")),
+            "{sym}: metadata name"
+        );
         assert!(t.contains(".amdhsa_wavefront_size32 1"), "{sym}: wave32");
         assert!(
             t.contains(".private_segment_fixed_size: 0\n"),
@@ -1172,7 +1169,10 @@ fn read_up_module_abi_resources_and_native_roundtrip() {
             assert!(has(p), "{sym}: missing {p}");
         }
         assert!(
-            ms.iter().filter(|m| m.starts_with("v_div_fixup_f32")).count() >= 2,
+            ms.iter()
+                .filter(|m| m.starts_with("v_div_fixup_f32"))
+                .count()
+                >= 2,
             "{sym}: gate division and value / 4.0 division"
         );
     }
@@ -1261,10 +1261,10 @@ fn projected_reference_matches_host_model_and_known_answers() {
     }
     // Known answers on constant planes. normalized = 2.0 everywhere, rows 0..3 = (up, mixed expected).
     let cases: [(f32, u32); 4] = [
-        (0.0, 0x3f80_0000),      // gate .5 -> term 1.0 each -> value 4.0 -> 1.0
-        (80.0, 0x4000_0000),     // gate 1.0 (exp(-80) vanishes) -> term 2.0 -> value 8.0 -> 2.0
-        (-200.0, 0x0000_0000),   // exp(+200) clamps to +Inf -> gate 1/Inf = +0 -> +0
-        (-0.0, 0x3f80_0000),     // x = -0 behaves as 0
+        (0.0, 0x3f80_0000),    // gate .5 -> term 1.0 each -> value 4.0 -> 1.0
+        (80.0, 0x4000_0000),   // gate 1.0 (exp(-80) vanishes) -> term 2.0 -> value 8.0 -> 2.0
+        (-200.0, 0x0000_0000), // exp(+200) clamps to +Inf -> gate 1/Inf = +0 -> +0
+        (-0.0, 0x3f80_0000),   // x = -0 behaves as 0
     ];
     let rows_k = cases.len();
     let mut up_k = Vec::new();
@@ -1273,7 +1273,14 @@ fn projected_reference_matches_host_model_and_known_answers() {
     }
     let norm_k: Vec<f32> = vec![2.0; rows_k * width];
     t.launches += 1;
-    match run_projected(&env_proj, &up_k, &norm_k, hidden, rows_k, "projected known answers") {
+    match run_projected(
+        &env_proj,
+        &up_k,
+        &norm_k,
+        hidden,
+        rows_k,
+        "projected known answers",
+    ) {
         Ok(y) => {
             t.executed += 1;
             for (r, (u, want)) in cases.iter().enumerate() {
@@ -1303,7 +1310,9 @@ fn projected_reference_matches_host_model_and_known_answers() {
     ] {
         let g = bf16_rt_bits(w);
         if g != want {
-            t.fail(format!("bf16_rt_bits({w:#010x}) = {g:#010x}, want {want:#010x}"));
+            t.fail(format!(
+                "bf16_rt_bits({w:#010x}) = {g:#010x}, want {want:#010x}"
+            ));
         }
     }
     t.finish("projected_reference_sanity", 100, true);
@@ -1510,7 +1519,14 @@ fn zero_weights_give_the_hand_computed_mixed_value() {
                     }
                 }
                 t.words_vs_decomposed += y.len() as u64;
-                compare_words(&mut t, &label, "hand-computed (n0+n1+n2+n3)/8", &y, &want, hidden);
+                compare_words(
+                    &mut t,
+                    &label,
+                    "hand-computed (n0+n1+n2+n3)/8",
+                    &y,
+                    &want,
+                    hidden,
+                );
             }
             Err(e) => t.defect(&label, "fused kernel", e),
         }
@@ -1635,14 +1651,21 @@ fn exceptional_inputs() {
         for rows in rows_list {
             let label = format!("exceptional {} rows={rows}", read_up_symbol(nt));
             let toks: Vec<(Vec<f32>, Vec<f32>, bool)> = (0..rows).map(&pick).collect();
-            let low: Vec<f32> = toks.iter().flat_map(|(l, _, _)| l.iter().copied()).collect();
-            let norm: Vec<f32> = toks.iter().flat_map(|(_, n, _)| n.iter().copied()).collect();
+            let low: Vec<f32> = toks
+                .iter()
+                .flat_map(|(l, _, _)| l.iter().copied())
+                .collect();
+            let norm: Vec<f32> = toks
+                .iter()
+                .flat_map(|(_, n, _)| n.iter().copied())
+                .collect();
             let Some(y) = differential(&mut t, &label, &env, &c, nt, &low, &norm, rows) else {
                 continue;
             };
             for (r, (l, _, clean)) in toks.iter().enumerate() {
                 let out = &y[r * hidden..(r + 1) * hidden];
-                if l.iter().any(|v| v.is_nan()) && !out.iter().all(|&w| f32::from_bits(w).is_nan()) {
+                if l.iter().any(|v| v.is_nan()) && !out.iter().all(|&w| f32::from_bits(w).is_nan())
+                {
                     t.fail(format!(
                         "{label}: token {r} has a NaN activation but a non-NaN output word"
                     ));
@@ -1713,7 +1736,15 @@ fn invalid_row_counts_write_nothing_in_every_entry() {
             let norms = gen_norm_pool(&mut rng, 4 * hidden, rows, &[0, 1]);
             let label = format!("invalid rows {rows} {}", read_up_symbol(nt));
             t.launches += 1;
-            match run_fused(env.fused(nt), nt, &c, &flat(&lows), &flat(&norms), rows, &label) {
+            match run_fused(
+                env.fused(nt),
+                nt,
+                &c,
+                &flat(&lows),
+                &flat(&norms),
+                rows,
+                &label,
+            ) {
                 Ok(_) => t.executed += 1,
                 Err(e) => t.defect(&label, "fused kernel", e),
             }

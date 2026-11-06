@@ -633,11 +633,7 @@ impl Tally {
     fn cmp(&mut self, context: &str, got: &[u8], want: &[u8]) {
         assert_eq!(got.len(), want.len(), "{context}: unequal extents");
         self.comparisons += 1;
-        for (i, (g, w)) in got
-            .chunks_exact(4)
-            .zip(want.chunks_exact(4))
-            .enumerate()
-        {
+        for (i, (g, w)) in got.chunks_exact(4).zip(want.chunks_exact(4)).enumerate() {
             self.words += 1;
             if g == w {
                 continue;
@@ -802,7 +798,10 @@ fn read_up_cases(fixtures: &[Input]) -> Vec<ReadUpCase> {
             });
         }
     }
-    for f in fixtures.iter().filter(|f| f.fmt == Fmt::E4M3 && f.m % 64 == 0) {
+    for f in fixtures
+        .iter()
+        .filter(|f| f.fmt == Fmt::E4M3 && f.m % 64 == 0)
+    {
         let hidden = f.m / 4;
         for (suffix, kind) in [("", 0), ("+nan_inf_normalized", 2)] {
             cases.push(ReadUpCase {
@@ -822,12 +821,7 @@ fn read_up_cases(fixtures: &[Input]) -> Vec<ReadUpCase> {
 
 /// Kernarg of the fused read-up entry: q,s,low,normalized,mixed u64; hidden,
 /// low_rank, rows u32; pad.
-fn read_up_args(
-    p: [u64; 5],
-    hidden: usize,
-    k: usize,
-    rows: usize,
-) -> Result<Vec<u8>, String> {
+fn read_up_args(p: [u64; 5], hidden: usize, k: usize, rows: usize) -> Result<Vec<u8>, String> {
     let mut blob = Vec::with_capacity(hc8::READ_UP_KERNARG_BYTES as usize);
     for v in p {
         blob.extend(v.to_le_bytes());
@@ -986,8 +980,11 @@ fn run_read_up(out: &str, projected_object: &str, fixture_paths: &[String]) -> R
         for nt in 1..=4usize {
             let (geo, set_fn) = &sets[nt - 1];
             for rows in 1..=16 * nt {
-                for (d, p) in [(&dfused, &out_poison), (&dprod, &out_poison), (&dset, &set_poison)]
-                {
+                for (d, p) in [
+                    (&dfused, &out_poison),
+                    (&dprod, &out_poison),
+                    (&dset, &set_poison),
+                ] {
                     card.0.memcpy_htod(d, p).map_err(|e| e.to_string())?;
                 }
                 let mut set_blob = args(ptr(&dq), ptr(&ds), ptr(&dl), ptr(&dset), m, k, rows);
@@ -1150,7 +1147,9 @@ fn main() -> ExitCode {
         (true, Some(object)) => run_read_up(out, object, &positional[1..]),
         (false, None) => run(out, &positional[1..]),
         _ => {
-            eprintln!("{usage}\n--projected-object is mandatory with --read-up and only valid with it");
+            eprintln!(
+                "{usage}\n--projected-object is mandatory with --read-up and only valid with it"
+            );
             return ExitCode::from(2);
         }
     };
