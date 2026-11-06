@@ -199,6 +199,52 @@ static MOE_GU_FEW_PM_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(|| {
     }
 });
 
+/// `HIPFIRE_QWEN4_MOE_GU_C8_PM` (on unless `0`): the gfx1201 `g32` gate/up on the `_nodz` path
+/// (M 1280 x K 2560, planar experts, more than 8 source rows) runs the persistent PeaceMaker
+/// module where [`Gpu::moe_gu_c8_pm_covers`] holds; `0` keeps the hipcc `g32` entry. Read once.
+static MOE_GU_C8_PM: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_GU_C8_PM", true));
+
+/// Persistent workgroup counts of the c8 gate/up module per entry: the resident capacity of each on
+/// gfx1201 (r8: 232 VGPRs, 6 waves/SIMD = 3 workgroups/WGP x 32 WGPs = 96; r4: 176 VGPRs, 8 waves/SIMD =
+/// 128). More workgroups than fit run as a second, mostly idle wave (served rocprof j8197: r8 at 128
+/// blocks 389 us vs 326 us at 96 per 41..=48-row launch).
+pub const MOE_GU_C8_PM_BLOCKS_R8: u32 = 96;
+pub const MOE_GU_C8_PM_BLOCKS_R4: u32 = 128;
+
+/// `HIPFIRE_QWEN4_MOE_GU_C8_PM_BLOCKS`: overrides the persistent workgroup count of both c8 gate/up
+/// entries (unset: [`MOE_GU_C8_PM_BLOCKS_R8`] / [`MOE_GU_C8_PM_BLOCKS_R4`]; clamped to 1..=4096). Read once.
+static MOE_GU_C8_PM_BLOCKS: LazyLock<Option<u32>> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_QWEN4_MOE_GU_C8_PM_BLOCKS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|n| n.clamp(1, 4096))
+});
+
+/// Source-row counts the c8 gate/up module is routed at: 9..=16 (`r4`) and from 33 (`r8`). Served
+/// rocprof (j8197, kill switch vs module, per launch): rows 9..=16 0.94, 41..=48 0.87, 33..=40 0.96;
+/// rows 17..=32 stay on hipcc (1.03 at 96 workgroups, 1.21 at 128).
+pub fn moe_gu_c8_pm_rows(rows: usize) -> bool {
+    (9..=16).contains(&rows) || rows >= 33
+}
+
+/// Entry symbols of [`kernels::QWEN4_MOE_GU_C8_PM_GFX1201`]: source rows above 16 (`r8`) and 9..=16 (`r4`).
+const MOE_GU_C8_PM_ENTRY_R8: &str = "gemm_mq4g256v2p_moe_grouped_top10_g32_r8_nodz_pm_persist";
+const MOE_GU_C8_PM_ENTRY_R4: &str = "gemm_mq4g256v2p_moe_grouped_top10_g32_r4_nodz_pm_persist";
+
+static MOE_GU_C8_PM_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(|| {
+    use sha2::{Digest, Sha256};
+    let actual = format!("{:x}", Sha256::digest(kernels::QWEN4_MOE_GU_C8_PM_GFX1201));
+    if actual == kernels::QWEN4_MOE_GU_C8_PM_GFX1201_SHA256 {
+        Ok(())
+    } else {
+        Err(format!(
+            "qwen4_moe_gu_c8_pm_gfx1201 SHA256 {actual} differs from pinned {}",
+            kernels::QWEN4_MOE_GU_C8_PM_GFX1201_SHA256
+        ))
+    }
+});
+
 // Dispatch settings are process-wide, like FeatureFlags; resolve off the hot path.
 static DISPATCH_IU4_SYMFOLD: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0"));
@@ -51074,7 +51120,9 @@ impl Gpu {
     /// layout; mode 2 selects the `_nodz` entries): bit-identical to
     /// [`Self::gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_gfx1151`] (same ABI), one 256-thread block per
     /// 16-slot tile x 32 output rows (grid `[M / 32, ceil(grouped_rows / 16)]`); `g32_r8` for more
-    /// than 16 source rows, `g32_r4` for 9..=16.
+    /// than 16 source rows, `g32_r4` for 9..=16. Where [`Self::moe_gu_c8_pm_covers`] holds on the
+    /// `_nodz` path and `HIPFIRE_QWEN4_MOE_GU_C8_PM` is on, the PeaceMaker persistent twin runs
+    /// instead ([`Self::gemm_mq4g256v2_moe_grouped_top10_g32_with`]).
     #[allow(clippy::too_many_arguments)]
     fn gemm_mq4g256v2_moe_grouped_top10_g32_gfx1201(
         &mut self,
@@ -51089,14 +51137,149 @@ impl Gpu {
         grouped_rows: usize,
         x_src_rows: usize,
     ) -> HipResult<()> {
-        self.bind_thread()?;
-        let planar = self.mq4_experts_planar;
         // One dead-store switch: the default skips dead slots (HIPFIRE_QWEN4_MOE_DEAD_STORES=1 restores the
         // +0.0 stores); `HIPFIRE_QWEN4_MOE32_GU=2` forces the `_nodz` entries whatever that switch says.
         let nodz = self.moe32_gu == 2 || !self.moe_dead_stores;
-        let (module, src, func) = Self::moe32_gu_entry(planar, x_src_rows, nodz);
+        let pm = nodz
+            && *MOE_GU_C8_PM
+            && moe_gu_c8_pm_rows(x_src_rows)
+            && self.moe_gu_c8_pm_covers(m, k, x_row_div, grouped_rows);
+        let n_blocks = MOE_GU_C8_PM_BLOCKS.unwrap_or(if x_src_rows > 16 {
+            MOE_GU_C8_PM_BLOCKS_R8
+        } else {
+            MOE_GU_C8_PM_BLOCKS_R4
+        });
+        self.gemm_mq4g256v2_moe_grouped_top10_g32_run(
+            expert_weight_ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            x_src,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            grouped_rows,
+            x_src_rows,
+            nodz,
+            pm,
+            n_blocks,
+        )
+    }
+
+    /// Whether the gfx1201 PeaceMaker persistent g32 gate/up module
+    /// (`qwen4_moe_gu_c8_pm_gfx1201`) covers a call: exact gfx1201, the drop-zero planar expert
+    /// layout, the Qwen4 gate/up shape (M 1280, K 2560, sealed top-10) and at most
+    /// 1024 16-slot tiles (`grouped_rows.div_ceil(16)`). The caller also requires the `_nodz` path.
+    pub fn moe_gu_c8_pm_covers(
+        &self,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+    ) -> bool {
+        self.arch == "gfx1201"
+            && self.mq4_experts_planar
+            && m == 1280
+            && k == 2560
+            && x_row_div == 10
+            && grouped_rows.div_ceil(16) <= 1024
+    }
+
+    /// The `g32` gate/up launch (`g32_r8_nodz` above 16 source rows, `g32_r4_nodz` for 9..=16) on an
+    /// explicit kernel: `pm` runs the gfx1201 PeaceMaker persistent module with `n_blocks` workgroups
+    /// (an error where [`Self::moe_gu_c8_pm_covers`] refuses), otherwise the hipcc `_nodz` entry,
+    /// whatever the environment says. Both write the same bytes on every live slot and leave dead
+    /// slots unwritten; `moe_gu_c8_pm_oracle` pins that.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq4g256v2_moe_grouped_top10_g32_with(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+        x_src_rows: usize,
+        pm: bool,
+        n_blocks: u32,
+    ) -> HipResult<()> {
+        crate::moe::require_span(
+            y_grouped,
+            &[grouped_rows, m, 4],
+            "gemm_mq4g256v2_moe_grouped_top10_g32_with grouped rows",
+        )?;
+        self.gemm_mq4g256v2_moe_grouped_top10_g32_run(
+            expert_weight_ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            x_src,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            grouped_rows,
+            x_src_rows,
+            true,
+            pm,
+            n_blocks,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_mq4g256v2_moe_grouped_top10_g32_run(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+        x_src_rows: usize,
+        nodz: bool,
+        pm: bool,
+        n_blocks: u32,
+    ) -> HipResult<()> {
+        if pm
+            && !(nodz && x_src_rows > 8 && self.moe_gu_c8_pm_covers(m, k, x_row_div, grouped_rows))
+        {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "qwen4_moe_gu_c8_pm_gfx1201: {} planar={} nodz={nodz} rows={x_src_rows} M={m} K={k} x_row_div={x_row_div} grouped_rows={grouped_rows} outside the module",
+                    self.arch, self.mq4_experts_planar
+                ),
+            ));
+        }
+        self.bind_thread()?;
+        let planar = self.mq4_experts_planar;
+        let (module, src, func) = if pm {
+            (
+                "qwen4_moe_gu_c8_pm_gfx1201",
+                "",
+                if x_src_rows > 16 {
+                    MOE_GU_C8_PM_ENTRY_R8
+                } else {
+                    MOE_GU_C8_PM_ENTRY_R4
+                },
+            )
+        } else {
+            Self::moe32_gu_entry(planar, x_src_rows, nodz)
+        };
         crate::moe_entry_log::moe_entry_receipt("gate_up", func, x_src_rows);
-        self.ensure_kernel(module, src, func)?;
+        if pm {
+            MOE_GU_C8_PM_VERIFIED
+                .clone()
+                .map_err(|reason| hip_bridge::HipError::new(1, &reason))?;
+            self.ensure_embedded_kernel(module, kernels::QWEN4_MOE_GU_C8_PM_GFX1201, func)?;
+        } else {
+            self.ensure_kernel(module, src, func)?;
+        }
         let ep = expert_weight_ptrs.buf.as_ptr();
         let tp = expert_tile_ids.buf.as_ptr();
         let sp = sorted_slot_index.buf.as_ptr();
@@ -51107,6 +51290,7 @@ impl Gpu {
         let rd = x_row_div as i32;
         let gr = grouped_rows as i32;
         let ne = moe_expert_table_len(expert_weight_ptrs);
+        let nb = n_blocks as i32;
         let mut params: Vec<*mut c_void> = vec![
             &ep as *const _ as *mut c_void,
             &tp as *const _ as *mut c_void,
@@ -51119,12 +51303,19 @@ impl Gpu {
             &gr as *const _ as *mut c_void,
             &ne as *const _ as *mut c_void,
         ];
+        if pm {
+            params.push(&nb as *const _ as *mut c_void);
+        }
         let bytes =
             grouped_rows.saturating_mul(m.saturating_mul(4).saturating_add(k.saturating_mul(4)));
         let timer = crate::profile::begin_timer(&self.hip, "gemm", func, bytes);
         let result = self.launch_maybe_blob(
             func,
-            [(m / 32) as u32, grouped_rows.div_ceil(16) as u32, 1],
+            if pm {
+                [nb as u32, 1, 1]
+            } else {
+                [(m / 32) as u32, grouped_rows.div_ceil(16) as u32, 1]
+            },
             [256, 1, 1],
             0,
             &mut params,
@@ -51140,6 +51331,9 @@ impl Gpu {
                 b.push_i32(rd);
                 b.push_i32(gr);
                 b.push_i32(ne);
+                if pm {
+                    b.push_i32(nb);
+                }
                 b
             },
         );

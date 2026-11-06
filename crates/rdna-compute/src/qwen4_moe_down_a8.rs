@@ -62,6 +62,52 @@ const GROUPED_ENTRY: &str = "qwen4_moe_down_a8_grouped_gfx1201";
 const GROUPED_PLANAR_ENTRY: &str = "qwen4_moe_down_a8_grouped_planar_gfx1201";
 const GROUPED_NODZ_ENTRY: &str = "qwen4_moe_down_a8_grouped_nodz_gfx1201";
 const GROUPED_PLANAR_NODZ_ENTRY: &str = "qwen4_moe_down_a8_grouped_planar_nodz_gfx1201";
+/// Entry symbol of [`crate::kernels::QWEN4_MOE_DOWN_C8_PM_GFX1201`]: the persistent planar nodz grouped down.
+const GROUPED_PLANAR_NODZ_PM_PERSIST_ENTRY: &str =
+    "qwen4_moe_down_a8_grouped_planar_nodz_pm_persist_gfx1201";
+/// Down projection output width the kernels are written for.
+const DOWN_M: usize = 2560;
+
+/// `HIPFIRE_QWEN4_MOE_DOWN_C8_PM` (on unless `0`): the gfx1201 grouped A8 down on the nodz path
+/// (M 2560 x K 640, planar experts) runs the persistent PeaceMaker module where
+/// [`Gpu::qwen4_moe_down_c8_pm_covers`] holds; `0` keeps the hipcc grouped entry. Read once.
+static QWEN4_MOE_DOWN_C8_PM: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_DOWN_C8_PM", true));
+
+/// Token rows the c8 down module is routed at: from 33. Served rocprof (j8197, kill switch vs module at
+/// 256 workgroups, per launch): rows 33..=40 0.92, 41..=48 0.95; rows 9..=32 stay on hipcc (1.08 / 1.13).
+pub fn qwen4_moe_down_c8_pm_rows(rows: usize) -> bool {
+    rows >= 33
+}
+
+/// Default persistent workgroup count of the c8 down module.
+pub const QWEN4_MOE_DOWN_C8_PM_BLOCKS_DEFAULT: u32 = 256;
+
+/// `HIPFIRE_QWEN4_MOE_DOWN_C8_PM_BLOCKS`: persistent workgroup count of the c8 down module (default
+/// [`QWEN4_MOE_DOWN_C8_PM_BLOCKS_DEFAULT`], clamped to 1..=4096). Read once.
+static QWEN4_MOE_DOWN_C8_PM_BLOCKS: LazyLock<u32> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_QWEN4_MOE_DOWN_C8_PM_BLOCKS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(QWEN4_MOE_DOWN_C8_PM_BLOCKS_DEFAULT)
+        .clamp(1, 4096)
+});
+
+static QWEN4_MOE_DOWN_C8_PM_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(|| {
+    use sha2::{Digest, Sha256};
+    let actual = format!(
+        "{:x}",
+        Sha256::digest(crate::kernels::QWEN4_MOE_DOWN_C8_PM_GFX1201)
+    );
+    if actual == crate::kernels::QWEN4_MOE_DOWN_C8_PM_GFX1201_SHA256 {
+        Ok(())
+    } else {
+        Err(format!(
+            "qwen4_moe_down_c8_pm_gfx1201 SHA256 {actual} differs from pinned {}",
+            crate::kernels::QWEN4_MOE_DOWN_C8_PM_GFX1201_SHA256
+        ))
+    }
+});
 
 /// The grouped entry of a layout: `nodz` selects the twin that stores no dead row (sentinel tiles
 /// and pad slots), live rows byte-identical (see the kernel header).
@@ -513,13 +559,140 @@ impl Gpu {
         n_exp: usize,
     ) -> HipResult<()> {
         debug_assert!(self.qwen4_moe_down_a8_applies_grouped(m, k, x_row_div, x_src_rows));
+        let pm = *QWEN4_MOE_DOWN_C8_PM
+            && !self.moe_dead_stores
+            && qwen4_moe_down_c8_pm_rows(x_src_rows / DOWN_K_TOP)
+            && self.qwen4_moe_down_c8_pm_covers(m, k, x_row_div, grouped_rows);
+        self.qwen4_moe_down_a8_grouped_run(
+            expert_ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            x_src,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            grouped_rows,
+            x_src_rows,
+            n_exp,
+            !self.moe_dead_stores,
+            pm,
+            *QWEN4_MOE_DOWN_C8_PM_BLOCKS,
+        )
+    }
+
+    /// Whether the gfx1201 persistent PeaceMaker grouped down module
+    /// (`qwen4_moe_down_c8_pm_gfx1201`) covers a call: exact gfx1201, the drop-zero planar expert
+    /// layout, the Qwen4 down shape (M 2560, K 640, `x_row_div` 1) and at most 1024 16-slot tiles
+    /// (`grouped_rows.div_ceil(16)`). The caller also requires the nodz path (no dead-slot stores).
+    pub fn qwen4_moe_down_c8_pm_covers(
+        &self,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+    ) -> bool {
+        self.arch == "gfx1201"
+            && self.mq4_experts_planar
+            && m == DOWN_M
+            && k == DOWN_K
+            && x_row_div == 1
+            && grouped_rows.div_ceil(16) <= 1024
+    }
+
+    /// The D-grouped A8 down launch (the nodz entry, whatever `HIPFIRE_QWEN4_MOE_DEAD_STORES` says)
+    /// on an explicit kernel: `pm` runs the gfx1201 persistent PeaceMaker module with `n_blocks`
+    /// workgroups (an error where [`Gpu::qwen4_moe_down_c8_pm_covers`] refuses), otherwise the hipcc
+    /// nodz entry. Both write the same bytes on every live slot and leave dead slots unwritten;
+    /// `moe_down_c8_pm_oracle` pins that.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen4_moe_down_a8_grouped_with(
+        &mut self,
+        expert_ptrs: &crate::dispatch::GpuTensor,
+        expert_tile_ids: &crate::dispatch::GpuTensor,
+        sorted_slot_index: &crate::dispatch::GpuTensor,
+        x_src: &crate::dispatch::GpuTensor,
+        y_grouped: &crate::dispatch::GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+        x_src_rows: usize,
+        n_exp: usize,
+        pm: bool,
+        n_blocks: u32,
+    ) -> HipResult<()> {
+        crate::moe::require_span(
+            y_grouped,
+            &[grouped_rows, m, 4],
+            "qwen4_moe_down_a8_grouped_with grouped rows",
+        )?;
+        self.qwen4_moe_down_a8_grouped_run(
+            expert_ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            x_src,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            grouped_rows,
+            x_src_rows,
+            n_exp,
+            true,
+            pm,
+            n_blocks,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qwen4_moe_down_a8_grouped_run(
+        &mut self,
+        expert_ptrs: &crate::dispatch::GpuTensor,
+        expert_tile_ids: &crate::dispatch::GpuTensor,
+        sorted_slot_index: &crate::dispatch::GpuTensor,
+        x_src: &crate::dispatch::GpuTensor,
+        y_grouped: &crate::dispatch::GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+        x_src_rows: usize,
+        n_exp: usize,
+        nodz: bool,
+        pm: bool,
+        n_blocks: u32,
+    ) -> HipResult<()> {
+        if pm && !(nodz && self.qwen4_moe_down_c8_pm_covers(m, k, x_row_div, grouped_rows)) {
+            return Err(HipError::new(
+                1,
+                &format!(
+                    "qwen4_moe_down_c8_pm_gfx1201: {} planar={} nodz={nodz} M={m} K={k} x_row_div={x_row_div} grouped_rows={grouped_rows} outside the module",
+                    self.arch, self.mq4_experts_planar
+                ),
+            ));
+        }
         let planar = self.mq4_experts_planar;
         // Dead rows (sentinel tiles, pad slots) are not stored unless HIPFIRE_QWEN4_MOE_DEAD_STORES=1:
         // the one switch of the incumbent grouped down and of this route.
-        let nodz = !self.moe_dead_stores;
-        let entry = grouped_entry(planar, nodz);
+        let entry = if pm {
+            GROUPED_PLANAR_NODZ_PM_PERSIST_ENTRY
+        } else {
+            grouped_entry(planar, nodz)
+        };
         let xq = self.qwen4_moe_down_a8_quantize(x_src.buf.as_ptr(), x_src_rows)?;
-        self.ensure_kernel(MODULE, QWEN4_MOE_DOWN_A8_GFX1201_SRC, entry)?;
+        if pm {
+            QWEN4_MOE_DOWN_C8_PM_VERIFIED
+                .clone()
+                .map_err(|reason| HipError::new(1, &reason))?;
+            self.ensure_embedded_kernel(
+                "qwen4_moe_down_c8_pm_gfx1201",
+                crate::kernels::QWEN4_MOE_DOWN_C8_PM_GFX1201,
+                entry,
+            )?;
+        } else {
+            self.ensure_kernel(MODULE, QWEN4_MOE_DOWN_A8_GFX1201_SRC, entry)?;
+        }
         first_launch_receipt(Kind::Grouped, x_src_rows / DOWN_K_TOP, entry);
         crate::moe_entry_log::moe_entry_receipt("down", entry, x_src_rows / DOWN_K_TOP);
         let ep = expert_ptrs.buf.as_ptr();
@@ -534,7 +707,8 @@ impl Gpu {
             x_src_rows as i32,
             n_exp as i32,
         );
-        let mut params = [
+        let nb = n_blocks as i32;
+        let mut params = vec![
             &ep as *const _ as *mut c_void,
             &tp as *const _ as *mut c_void,
             &sp as *const _ as *mut c_void,
@@ -547,11 +721,18 @@ impl Gpu {
             &xr as *const _ as *mut c_void,
             &ne as *const _ as *mut c_void,
         ];
+        if pm {
+            params.push(&nb as *const _ as *mut c_void);
+        }
         let bytes = grouped_rows * (m * 4 + QWEN4_MOE_DOWN_A8_ROW_BYTES);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", entry, bytes);
         let result = self.launch_maybe_blob(
             entry,
-            [m.div_ceil(64) as u32, grouped_rows.div_ceil(16) as u32, 1],
+            if pm {
+                [nb as u32, 1, 1]
+            } else {
+                [m.div_ceil(64) as u32, grouped_rows.div_ceil(16) as u32, 1]
+            },
             [128, 1, 1],
             0,
             &mut params,
@@ -569,6 +750,14 @@ impl Gpu {
                 b.push_i32(xr);
                 b.push_i32(ne);
                 debug_assert_eq!(b.len(), 64, "D-grouped ABI: 64 explicit kernarg bytes");
+                if pm {
+                    b.push_i32(nb);
+                    debug_assert_eq!(
+                        b.len(),
+                        68,
+                        "D-grouped persist ABI: 68 explicit kernarg bytes"
+                    );
+                }
                 b
             },
         );

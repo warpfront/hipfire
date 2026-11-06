@@ -4877,6 +4877,28 @@ pub const QWEN4_MOE_GU_FEW_PM_GFX1201: &[u8] =
 /// Bare lowercase SHA-256 of [`QWEN4_MOE_GU_FEW_PM_GFX1201`], without a newline.
 pub const QWEN4_MOE_GU_FEW_PM_GFX1201_SHA256: &str =
     include_str!("../../../kernels/qwen4_moe_gu_few_pm_gfx1201.hxaco.sha256");
+/// gfx1201 PeaceMaker persistent Qwen4 MoE gate/up, the `g32` `_nodz` twin
+/// (`gemm_mq4g256v2p_moe_grouped_top10_g32_r8_nodz_pm_persist` for more than 16 source rows,
+/// `..._g32_r4_nodz_pm_persist` for 9..=16): the ABI of the hipcc `..._g32_{r8,r4}_nodz` entries
+/// (five pointers + `M, K, x_row_div, grouped_rows, n_experts`) plus `n_blocks: i32` at kernarg
+/// byte 60 (64-byte kernarg); grid `[n_blocks, 1, 1]`, block 256, no dynamic LDS; workgroups
+/// walk the 16-slot tiles persistently. Live slots bit-identical to hipcc, dead slots unwritten.
+pub const QWEN4_MOE_GU_C8_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/qwen4_moe_gu_c8_pm_gfx1201.hxaco");
+/// Bare lowercase SHA-256 of [`QWEN4_MOE_GU_C8_PM_GFX1201`], without a newline.
+pub const QWEN4_MOE_GU_C8_PM_GFX1201_SHA256: &str =
+    include_str!("../../../kernels/qwen4_moe_gu_c8_pm_gfx1201.hxaco.sha256");
+/// gfx1201 PeaceMaker persistent Qwen4 grouped A8 routed down
+/// (`qwen4_moe_down_a8_grouped_planar_nodz_pm_persist_gfx1201`): the ABI of the hipcc
+/// `qwen4_moe_down_a8_grouped_planar_nodz_gfx1201` entry (five pointers + `M, K, x_row_div,
+/// grouped_rows, x_src_rows, n_experts`, 64 bytes) plus `n_blocks: i32` at kernarg byte 64
+/// (68-byte kernarg); grid `[n_blocks, 1, 1]`, block 128; workgroups walk the 16-slot tiles
+/// persistently. Live slots bit-identical to hipcc, dead slots unwritten.
+pub const QWEN4_MOE_DOWN_C8_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/qwen4_moe_down_c8_pm_gfx1201.hxaco");
+/// Bare lowercase SHA-256 of [`QWEN4_MOE_DOWN_C8_PM_GFX1201`], without a newline.
+pub const QWEN4_MOE_DOWN_C8_PM_GFX1201_SHA256: &str =
+    include_str!("../../../kernels/qwen4_moe_down_c8_pm_gfx1201.hxaco.sha256");
 /// Genuine gfx1100 MQ6/Q8 fixed-eight-row-tile module. Each family is derived
 /// from its gfx1100 singleton object; unsupported shape recipes refuse rather
 /// than substituting another architecture's arithmetic.

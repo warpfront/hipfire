@@ -154,6 +154,8 @@ PEACEMAKER_KERNELS = [
     "qwen4_moe_iu4_sym_w3_nt4_pm_gfx1151",
     "gemv_mq2_xbatch_pm_gfx1201",
     "qwen4_moe_gu_few_pm_gfx1201",
+    "qwen4_moe_gu_c8_pm_gfx1201",
+    "qwen4_moe_down_c8_pm_gfx1201",
     "npu_trunk_pack_pm_gfx1151",
     "gated_delta_chunk_pm_gfx1151",
     "gated_delta_chunk_arena_pm_gfx1151",

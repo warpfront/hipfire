@@ -9040,6 +9040,14 @@ fn walked_embedded_image(
                 "qwen4_moe_gu_few_pm_gfx1201",
                 kernels::QWEN4_MOE_GU_FEW_PM_GFX1201,
             ),
+            (
+                "qwen4_moe_gu_c8_pm_gfx1201",
+                kernels::QWEN4_MOE_GU_C8_PM_GFX1201,
+            ),
+            (
+                "qwen4_moe_down_c8_pm_gfx1201",
+                kernels::QWEN4_MOE_DOWN_C8_PM_GFX1201,
+            ),
         ];
         if let Some(&(name, image)) = QWEN4_GFX1201.iter().find(|(name, _)| *name == module) {
             return Some((name, image, None));
