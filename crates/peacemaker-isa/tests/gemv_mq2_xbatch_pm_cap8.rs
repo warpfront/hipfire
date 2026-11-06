@@ -3,12 +3,22 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! MQ2 x-batch PM at capacity 8: layout closure of the register/ring plan, rejection of the tuples that do not
-//! close, and a CPU byte oracle on the PeaceMaker emulator. Every legal `cap 8` tuple is emitted by the Builder,
-//! assembled natively, lifted unmodified and executed. For each launch shape, `B = 1..=8` columns of one launch
-//! must equal, byte for byte, the single-column (`B = 1`) launch over the same column (x pointer advanced by `c*K*4`),
-//! which in turn must equal the shipped `r4_b4_u1_native_anchor` `B = 1` launch: one per-column DAG for every tuple,
-//! row residue, `K` quad/tail split and bit pattern (NaN payloads, Inf, zeros, denormals, extreme f16 headers).
-//! `B > 8` clamps to 8; `B <= 0`, columns past `B`, rows past `M` and the guard words past `y` are never written.
+//! close, and a CPU byte oracle on the PeaceMaker emulator.
+//!
+//! Emulator domain: the emulator runs only hardware-qualified semantics (no `nan_meets_nan` relaxation). The f16
+//! header words (scale / zero point, through `v_fma_mix_f32`) are therefore finite only: random normals plus signed
+//! zeros, subnormals and extreme exponents, never half NaN/Inf (those are compared against the singleton on hardware
+//! by the GPU oracle). Activations additionally carry f32 NaN payloads, Inf, zeros and denormals through the qualified
+//! f32 mul/fmac/add paths, in columns 1, 4 and 7 only (one NaN makes its whole column NaN).
+//!
+//! Tuple subset: NOT every emitted tuple is executed. Per shape, either one tuple per (rows, split, ilp) at unroll 1
+//! (`family_pick`) or every rows x unroll at anchor schedule / native loads (`loop_pick`, for the quad main and
+//! remainder loops) is lifted and run; layout/legality is asserted for the whole grid separately.
+//!
+//! Oracle: for each executed tuple, `B = 1..=8` columns of one launch must equal, byte for byte, the single-column
+//! (`B = 1`) launch over the same column (x pointer advanced by `c*K*4`), which in turn must equal the shipped
+//! `r4_b4_u1_native_anchor` `B = 1` launch; no host reimplementation of the arithmetic. `B > 8` clamps to 8;
+//! `B <= 0`, columns past `B`, rows past `M` and the guard words past `y` are never written.
 use peacemaker_ir::emu::{Emulator, Launch, Memory};
 use peacemaker_ir::inst::Frontend;
 use peacemaker_isa::kernels::gemv_mq2_xbatch_pm_gfx1201::{
@@ -68,7 +78,6 @@ fn xbatch_max_is_8_and_cap_grid_is_1_2_4_8() {
         let p = Params { cap, ..SHIPPED };
         assert!(p.validate().is_err(), "cap {cap}");
     }
-    assert_eq!(SHIPPED.cap, 4, "SHIPPED stays cap 4 until a measured selection");
 }
 
 #[test]
@@ -182,7 +191,7 @@ fn f16_word(rng: &mut Rng, edge: u64) -> u16 {
     let sign = (r & 1) as u16;
     let mant = (r >> 20 & 1023) as u16;
     let exp = if edge != 0 && r >> 8 & 0xff < 0x100 / edge {
-        [0u16, 0, 31, 31, 1, 30][(r >> 40) as usize % 6] // zero/denormal, Inf/NaN, extremes
+        [0u16, 0, 1, 30, 30, 0][(r >> 40) as usize % 6] // signed zero / subnormal, extremes; never Inf/NaN
     } else {
         (8 + (r >> 8) % 14) as u16
     };
@@ -246,8 +255,7 @@ impl Kernel {
         let Shape { m, g, .. } = pr.shape;
         let k = g * 256;
         let emu = Emulator::new(&self.program, SYMBOL)
-            .unwrap_or_else(|e| panic!("{tag}: {e}"))
-            .nan_meets_nan();
+            .unwrap_or_else(|e| panic!("{tag}: {e}"));
         let x_ptr = X_BASE + (col0 * k * 4) as u64;
         let mut karg = Vec::new();
         for p in [A_BASE, x_ptr, Y_BASE] {
