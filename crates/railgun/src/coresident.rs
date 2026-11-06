@@ -43,31 +43,60 @@ pub struct CoResidentGroup {
 /// The data edges of a group that a certificate orders through event cells.
 ///
 /// The fields are private and the only constructors are
-/// [`GroupOrdering::none`] and a `pub(crate)` one: an ordering must come from
-/// railgun's task-graph certificate (`crate::task_graph`, which checks event
+/// [`GroupOrdering::none`], a `pub(crate)` one and the lab-only
+/// `GroupOrdering::lab_pending`: an ordering must come from railgun's
+/// task-graph certificate (`crate::task_graph`, which checks event
 /// generation, producer cardinality and publication dominance against the
 /// emitted objects), never from host code asserting that two pools are
-/// ordered.
+/// ordered. The lab one marks the ordering uncertified
+/// ([`GroupOrdering::is_pending`]); the plan reports it in
+/// [`Pm4Plan::admission`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupOrdering {
     edges: Vec<OrderedEdge>,
+    /// The edges are not from a certificate (`lab`: differential-verified,
+    /// certificate pending).
+    pending: bool,
 }
 
 impl GroupOrdering {
     /// No data edge is ordered: the group's members may share only event
     /// cells and read-only data.
     pub fn none() -> Self {
-        Self { edges: Vec::new() }
+        Self {
+            edges: Vec::new(),
+            pending: false,
+        }
     }
 
     /// The ordering a task-graph certificate produced.
     #[allow(dead_code)] // the producer, `crate::task_graph`, does not exist yet; tests build one
     pub(crate) fn from_certificate(edges: Vec<OrderedEdge>) -> Self {
-        Self { edges }
+        Self {
+            edges,
+            pending: false,
+        }
+    }
+
+    /// Lab only: an ordering whose certificate is pending. Its edges get
+    /// exactly the validation a certificate's do
+    /// ([`KernelProgram::add_coresident_group`]); the group is reported
+    /// [`crate::admission::Admission::LabPending`].
+    #[cfg(feature = "lab")]
+    pub fn lab_pending(edges: Vec<OrderedEdge>) -> Self {
+        Self {
+            edges,
+            pending: true,
+        }
     }
 
     pub fn edges(&self) -> &[OrderedEdge] {
         &self.edges
+    }
+
+    /// The ordering is awaiting its certificate (lab builds only).
+    pub fn is_pending(&self) -> bool {
+        self.pending
     }
 }
 
@@ -96,6 +125,9 @@ pub struct GroupPlan {
     /// Member-member conflicts nothing orders; any entry blocks
     /// [`Pm4Plan::group_admission`].
     pub refusals: Vec<String>,
+    /// Why the group is not certified: its `LabPending` members and an
+    /// uncertified ordering (empty in a product build).
+    pub pending: Vec<String>,
     /// The progress proof ([`Pm4Plan::admit_residency`]); `None` until given.
     pub residency: Option<ResidencyProof>,
 }
@@ -196,7 +228,7 @@ pub(crate) fn classify(
     let mut refusals = Vec::new();
     let members: Vec<usize> = group.nodes.clone().collect();
     for &m in &members {
-        if !program.nodes[m].lowering.is_pm4() {
+        if !program.nodes[m].lowering.is_pm4_lowerable() {
             refusals.push(format!(
                 "member {m} ({}) is not PM4",
                 program.nodes[m].symbol
@@ -343,7 +375,7 @@ impl KernelProgram {
             ));
         }
         for j in nodes.clone() {
-            if !self.nodes[j].lowering.is_pm4() {
+            if !self.nodes[j].lowering.is_pm4_lowerable() {
                 return Err(format!(
                     "node {j} ({}) in a co-resident group is not PM4",
                     self.nodes[j].symbol

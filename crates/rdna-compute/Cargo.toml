@@ -7,7 +7,7 @@ description = "Compute kernel dispatch for RDNA GPUs"
 
 [features]
 # Archived research probes; see the note by the [[example]] blocks.
-lab = []
+lab = ["railgun/lab"]
 # Explicit timing instrumentation opt-in; neither default builds nor lab alone
 # enable timing state or launch-path hooks.
 kernel-timing = ["lab", "hip-bridge/kernel-timing"]

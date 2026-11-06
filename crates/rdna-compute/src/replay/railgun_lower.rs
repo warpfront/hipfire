@@ -332,7 +332,16 @@ fn lower_owned(
         .nodes
         .iter()
         .enumerate()
-        .find(|(_, n)| !n.lowering.is_pm4())
+        .find(|(_, n)| {
+            // `Lowering::LabPending` (differential-verified, certificate
+            // pending) lowers only in a lab build; a product build refuses
+            // it with the message below, exactly as before.
+            #[cfg(feature = "lab")]
+            let lowerable = n.lowering.is_pm4_lowerable();
+            #[cfg(not(feature = "lab"))]
+            let lowerable = n.lowering.is_pm4();
+            !lowerable
+        })
     {
         return Err(format!(
             "node {i} {} is not PM4-lowered: {:?}",
@@ -964,6 +973,7 @@ mod tests {
             rows_used: BTreeMap::new(),
             skips: Vec::new(),
             groups: Vec::new(),
+            pending: Vec::new(),
         }
     }
 

@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use railgun::kernel::{KernelProgram, NodeFacts};
 use railgun::plan::Pm4Plan;
 use railgun::window::{NodeImage, QueueFailure, Quiescence, ResolvedStep, WindowQueue};
-use railgun::Binding;
+use railgun::{Binding, ResourceId};
 use railgun_corpus::window::{ConditionalWitness, NodeRoute, RuntimeNode, WindowManifest};
 use railgun_corpus::{sha256_hex, JitCorpus};
 
@@ -642,7 +642,7 @@ impl Gpu {
     /// without a `kref`, or whose loaded object digest differs, refuses the
     /// whole lowering. Nothing is submitted.
     pub fn lower_railgun_window(
-        &mut self,
+        &self,
         ctx: &mut RailgunLoweringContext,
         program: &KernelProgram,
         plan: &Pm4Plan,
@@ -688,6 +688,193 @@ impl Gpu {
             artifacts,
         })
     }
+
+    /// Prove every co-resident group of `plan` can be resident at once on
+    /// this device and record the proof in `plan` (`Pm4Plan::admit_residency`).
+    ///
+    /// Per member node: the loaded function of its symbol must be owned by
+    /// exactly the code object its `kref` certifies (the same proof as
+    /// [`Self::railgun_resolve_artifacts`]); its workgroups per compute unit
+    /// are HIP's occupancy calculator over that loaded object's emitted
+    /// descriptor (VGPR, SGPR, LDS, scratch) at the node's block size and
+    /// dynamic LDS, and the compute-unit count is
+    /// `hipDeviceAttributeMultiprocessorCount`, the unit that calculator
+    /// counts in. An occupancy error or a negative answer refuses; zero is
+    /// left to the planner, which refuses it.
+    ///
+    /// Obligation (not checked here): the group runs on an exclusive device.
+    /// A fabric job owns the card while its persistent workgroups are
+    /// resident, so nothing else may hold compute units on this device for
+    /// the group's lifetime (no HIP kernel, no second queue, no other
+    /// process): the proof is a statement about an otherwise idle device.
+    pub fn railgun_admit_residency(
+        &self,
+        program: &KernelProgram,
+        plan: &mut Pm4Plan,
+    ) -> Result<(), String> {
+        if program.arch != self.arch {
+            return Err(format!(
+                "program arch {} is not the device arch {}",
+                program.arch, self.arch
+            ));
+        }
+        if plan.groups.is_empty() {
+            return Ok(());
+        }
+        self.bind_thread()
+            .map_err(|e| format!("bind device {}: {e}", self.device_id))?;
+        let units = self
+            .hip
+            .get_device_attribute(
+                crate::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                self.device_id,
+            )
+            .map_err(|e| format!("multiprocessor count of device {}: {e}", self.device_id))?;
+        let compute_units = u32::try_from(units)
+            .ok()
+            .filter(|&u| u > 0)
+            .ok_or_else(|| format!("device {} reports {units} multiprocessors", self.device_id))?;
+        let ranges: Vec<std::ops::Range<usize>> =
+            plan.groups.iter().map(|g| g.nodes.clone()).collect();
+        for (g, range) in ranges.into_iter().enumerate() {
+            let members = program.nodes.get(range.clone()).ok_or_else(|| {
+                format!(
+                    "co-resident group {g} {range:?} is past the program's {} nodes",
+                    program.nodes.len()
+                )
+            })?;
+            let mut blocks = Vec::with_capacity(members.len());
+            for (k, node) in members.iter().enumerate() {
+                let i = range.start + k;
+                let kref = node.kref.as_ref().ok_or_else(|| {
+                    format!("node {i} {}: no certified kernel reference", node.symbol)
+                })?;
+                let (_, artifact) = self
+                    .loaded_owner(&node.symbol)
+                    .map_err(|e| format!("node {i} {}: {e}", node.symbol))?;
+                let loaded = artifact.id().to_hex();
+                if loaded != kref.artifact_sha256 {
+                    return Err(format!(
+                        "node {i} {}: loaded object {loaded} is not the certified object {}",
+                        node.symbol, kref.artifact_sha256
+                    ));
+                }
+                let func = self.functions.get(&node.symbol).ok_or_else(|| {
+                    format!("node {i} {}: function is not loaded", node.symbol)
+                })?;
+                let threads = node.block[0]
+                    .checked_mul(node.block[1])
+                    .and_then(|t| t.checked_mul(node.block[2]))
+                    .filter(|&t| t > 0)
+                    .ok_or_else(|| {
+                        format!(
+                            "node {i} {}: block {:?} is not a thread count",
+                            node.symbol, node.block
+                        )
+                    })?;
+                let fits = self
+                    .hip
+                    .occupancy_max_active_blocks(func, threads, node.dynamic_lds as usize)
+                    .map_err(|e| format!("node {i} {}: occupancy: {e}", node.symbol))?;
+                blocks.push(u32::try_from(fits).map_err(|_| {
+                    format!(
+                        "node {i} {}: occupancy calculator answered {fits}",
+                        node.symbol
+                    )
+                })?);
+            }
+            plan.admit_residency(program, g, compute_units, &blocks)?;
+        }
+        Ok(())
+    }
+
+    /// Write the pointer fields of binding-record arena `arena` of `program`
+    /// (`KernelProgram::binding_record_image` over the authored bindings:
+    /// each field is `base(resource) + interior`) into the arena's device
+    /// allocation, then read every field back and compare. The arena's
+    /// binding must be exactly the live allocation HIP reports for its base.
+    /// Fields are written at their arena offsets, adjacent ones in one copy;
+    /// the non-pointer bytes of the records are the caller's. Returns the
+    /// number of pointer fields written; any readback mismatch is an `Err`.
+    /// Refused inside plan mode.
+    pub fn railgun_write_binding_records(
+        &self,
+        program: &KernelProgram,
+        arena: ResourceId,
+    ) -> Result<usize, String> {
+        if self.plan_mode_active() {
+            return Err("binding records cannot be written inside plan mode".to_owned());
+        }
+        let fields = program.binding_record_image(arena, &program.resources)?;
+        let binding = *program
+            .resources
+            .get(arena.0 as usize)
+            .ok_or_else(|| format!("no binding for arena {}", arena.0))?;
+        let live = probe(&self.hip, binding.base)?;
+        if live != binding {
+            return Err(format!(
+                "arena {} {:#x}+{} is not the live allocation {:#x}+{}",
+                arena.0, binding.base, binding.bytes, live.base, live.bytes
+            ));
+        }
+        // SAFETY: `binding` is exactly the live allocation the runtime reports
+        // for its base address; the borrowed buffer is only written inside
+        // that allocation (every field was bounds-checked by the image) and
+        // its drop never frees (it is not the owner).
+        let buf = unsafe {
+            hip_bridge::DeviceBuffer::from_raw(
+                binding.base as usize as *mut std::ffi::c_void,
+                binding.bytes as usize,
+            )
+        };
+        self.bind_thread()
+            .map_err(|e| format!("bind device {}: {e}", self.device_id))?;
+        let mut end = 0u64;
+        let mut run: Vec<u8> = Vec::new();
+        let mut run_at = 0u64;
+        for &(at, value) in &fields {
+            if at < end {
+                return Err(format!(
+                    "arena {}: pointer field at +{at} overlaps the previous field ending at +{end}",
+                    arena.0
+                ));
+            }
+            if at != end && !run.is_empty() {
+                self.hip
+                    .memcpy_htod_offset(&buf, run_at as usize, &run)
+                    .map_err(|e| format!("arena {} write +{run_at}: {e}", arena.0))?;
+                run.clear();
+            }
+            if run.is_empty() {
+                run_at = at;
+            }
+            run.extend_from_slice(&value.to_le_bytes());
+            end = at + 8;
+        }
+        if !run.is_empty() {
+            self.hip
+                .memcpy_htod_offset(&buf, run_at as usize, &run)
+                .map_err(|e| format!("arena {} write +{run_at}: {e}", arena.0))?;
+        }
+        if fields.is_empty() {
+            return Ok(0);
+        }
+        let back = self.railgun_read_allocation(binding, end as usize)?;
+        for &(at, value) in &fields {
+            let got = u64::from_le_bytes(
+                back[at as usize..at as usize + 8]
+                    .try_into()
+                    .expect("an 8-byte field"),
+            );
+            if got != value {
+                return Err(format!(
+                    "arena {} field +{at}: read back {got:#x}, wrote {value:#x}",
+                    arena.0
+                ));
+            }
+        }
+        Ok(fields.len())
+    }
 }
 
 /// The shared gfx12 lowering context of one owner (see
@@ -720,6 +907,19 @@ impl RailgunLoweringContext {
                 program.arch, artifacts.arch
             ));
         }
+        if !plan.groups.is_empty() {
+            plan.group_admission()?;
+        }
+        // The certificate slot of what is being lowered: `Certified`, or (lab
+        // builds only) `LabPending`. The plan must be the program's own.
+        let admission = program.admission();
+        if plan.admission() != admission {
+            return Err(format!(
+                "plan admission {:?} is not the program's {admission:?} (plan built from another program)",
+                plan.admission()
+            ));
+        }
+        let admitted_grids = admitted_group_grids(program, plan)?;
         let (lowering, timing) =
             self.inner
                 .lower(program, plan, arch_lowering(arch), &artifacts.artifacts)?;
@@ -734,10 +934,12 @@ impl RailgunLoweringContext {
             self_check: false,
             last: vec![None; program.nodes.len()],
             grids: program.nodes.iter().map(|n| Some(n.grid)).collect(),
+            admitted_grids,
             lowering,
             failure: None,
             in_flight: false,
             timing,
+            admission,
         })
     }
 }
@@ -792,6 +994,10 @@ pub struct RailgunWindowQueue {
     /// Per node: the grid the indirect buffer currently dispatches, `None`
     /// while unknown (a patch failed). Initially the authored grids.
     grids: Vec<Option<[u32; 3]>>,
+    /// Per node: the grid a co-resident group's residency proof admitted
+    /// (`None` for a node outside every group). A submit whose image grid
+    /// differs is refused: the proof holds only for the grids it counted.
+    admitted_grids: Vec<Option<[u32; 3]>>,
     /// The outcome of the last submit when it failed; what `wait` reports.
     failure: Option<QueueFailure>,
     /// A `submit_nowait` replay is outstanding: nothing may be written or
@@ -799,6 +1005,10 @@ pub struct RailgunWindowQueue {
     in_flight: bool,
     /// Where lowering this queue spent its time.
     timing: LowerTiming,
+    /// What the lowered program's certificate slot is (`Certified`, or lab
+    /// `LabPending`); the harness logs `admission().receipt(witness)` with
+    /// every result.
+    admission: railgun::admission::Admission,
 }
 
 // SAFETY: `RailgunWindowQueue` is only ever driven through `&mut self`, so
@@ -818,6 +1028,15 @@ pub struct RailgunWindowQueue {
 unsafe impl Send for RailgunWindowQueue {}
 
 impl RailgunWindowQueue {
+    /// The admission of the lowered program: `Certified`, or (lab builds
+    /// only) `LabPending` with the pending certificate reasons. A
+    /// `LabPending` queue's results are reportable only with
+    /// `railgun::admission::Admission::receipt` and an eager byte-identity
+    /// `DifferentialWitness`.
+    pub fn admission(&self) -> &railgun::admission::Admission {
+        &self.admission
+    }
+
     /// Command dwords of the retained indirect buffer.
     pub fn command_dwords(&self) -> u32 {
         self.lowering.command_dwords()
@@ -924,6 +1143,11 @@ impl RailgunWindowQueue {
                 nodes.len(),
                 self.last.len()
             ));
+            self.failure = Some(failure.clone());
+            return Err(failure);
+        }
+        if let Err(message) = check_admitted_grids(&self.admitted_grids, nodes) {
+            let failure = Self::proven(message);
             self.failure = Some(failure.clone());
             return Err(failure);
         }
@@ -1037,6 +1261,63 @@ impl WindowQueue for RailgunWindowQueue {
             None => Ok(()),
         }
     }
+}
+
+/// Per node, the grid of the residency proof of the co-resident group it
+/// belongs to (`None` outside every group). Every group must carry a proof
+/// whose grids are the ones `program` authors, so a proof made for another
+/// program cannot gate this lowering.
+fn admitted_group_grids(
+    program: &KernelProgram,
+    plan: &Pm4Plan,
+) -> Result<Vec<Option<[u32; 3]>>, String> {
+    let mut admitted = vec![None; program.nodes.len()];
+    for (g, group) in plan.groups.iter().enumerate() {
+        let proof = group.residency.as_ref().ok_or_else(|| {
+            format!(
+                "co-resident group {g} {:?} has no residency proof",
+                group.nodes
+            )
+        })?;
+        if group.nodes.end > program.nodes.len() || proof.grids.len() != group.nodes.len() {
+            return Err(format!(
+                "co-resident group {g} {:?}: residency proof covers {} members of a {}-node program",
+                group.nodes,
+                proof.grids.len(),
+                program.nodes.len()
+            ));
+        }
+        for (k, i) in group.nodes.clone().enumerate() {
+            if proof.grids[k] != program.nodes[i].grid {
+                return Err(format!(
+                    "co-resident group {g} member {i}: residency proof admitted grid {:?}, the program authors {:?}",
+                    proof.grids[k], program.nodes[i].grid
+                ));
+            }
+            admitted[i] = Some(proof.grids[k]);
+        }
+    }
+    Ok(admitted)
+}
+
+/// Refuse a submit image whose grid differs from the residency-admitted grid
+/// of a co-resident group member (`admitted` per node, see
+/// [`admitted_group_grids`]).
+fn check_admitted_grids(
+    admitted: &[Option<[u32; 3]>],
+    nodes: &[NodeImage<'_>],
+) -> Result<(), String> {
+    for (i, (want, image)) in admitted.iter().zip(nodes).enumerate() {
+        if let Some(want) = want {
+            if image.grid != *want {
+                return Err(format!(
+                    "grid {:?} of co-resident member {i} is not the residency-admitted {want:?}",
+                    image.grid
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The corpus directory paired with the installed pack arch directory
@@ -1426,5 +1707,24 @@ mod tests {
             local_corpus_dir(Path::new("/home/u/.hipfire/cache/gfx1201"), "gfx1201"),
             PathBuf::from("/home/u/.hipfire/cache/railgun-corpus/gfx1201")
         );
+    }
+
+    #[test]
+    fn a_group_member_grid_must_be_the_admitted_one() {
+        let node = |grid| NodeImage {
+            kernarg: &[],
+            grid,
+        };
+        let admitted = [None, Some([4, 1, 1]), Some([2, 1, 1])];
+        let ok = [node([9, 9, 9]), node([4, 1, 1]), node([2, 1, 1])];
+        assert_eq!(check_admitted_grids(&admitted, &ok), Ok(()));
+        let bad = [node([1, 1, 1]), node([4, 1, 1]), node([3, 1, 1])];
+        let e = check_admitted_grids(&admitted, &bad).unwrap_err();
+        assert_eq!(
+            e,
+            "grid [3, 1, 1] of co-resident member 2 is not the residency-admitted [2, 1, 1]"
+        );
+        // A program without groups admits nothing and constrains nothing.
+        assert_eq!(check_admitted_grids(&[None, None], &bad[..2]), Ok(()));
     }
 }

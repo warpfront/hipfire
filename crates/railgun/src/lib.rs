@@ -34,6 +34,7 @@
 //! [`ResourceKind::BindingRecords`] (pointer records railgun writes at prepare,
 //! like a `PointerTable` immutable during replay and never a copy
 //! destination); see [`descriptor`] and [`coresident`].
+pub mod admission;
 pub mod contract;
 pub mod copy;
 pub mod coresident;

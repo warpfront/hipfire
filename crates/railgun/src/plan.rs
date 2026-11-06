@@ -401,6 +401,10 @@ pub struct Pm4Plan {
     /// order, with their member-member classification and, once admitted,
     /// their residency proof.
     pub groups: Vec<GroupPlan>,
+    /// Why the program is not certified: its `LabPending` nodes and
+    /// uncertified group orderings ([`Pm4Plan::admission`]; empty in a
+    /// product build).
+    pub pending: Vec<String>,
 }
 
 /// One PM4 command of a segment, before packet encoding.
@@ -473,13 +477,19 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
     let group_plans: Vec<GroupPlan> = program
         .groups
         .iter()
-        .map(|g| {
+        .enumerate()
+        .map(|(index, g)| {
             let (admitted, refusals) = crate::coresident::classify(program, g);
             GroupPlan {
                 nodes: g.nodes.clone(),
                 admitted,
                 refusals,
                 residency: None,
+                pending: {
+                    let mut pending = crate::admission::node_pending(program, g.nodes.clone());
+                    pending.extend(crate::admission::ordering_pending(index, g));
+                    pending
+                },
             }
         })
         .collect();
@@ -502,7 +512,7 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
                 (Vec::new(), HashMap::new(), j)
             });
         }
-        if !node.lowering.is_pm4() {
+        if !node.lowering.is_pm4_lowerable() {
             open_group = None;
             if let Some(first) = segment_start.take() {
                 segments.push(Segment { first, end: j });
@@ -635,6 +645,7 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
         rows_used,
         skips,
         groups: group_plans,
+        pending: crate::admission::program_pending(program),
     }
 }
 

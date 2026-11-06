@@ -2797,6 +2797,12 @@ mod tests {
         let mut parts = parts_with(patches());
         parts.program.nodes[0].lowering = crate::kernel::Lowering::HipDirect { reason: "x".into() };
         assert!(matches!(make_plan(parts), Err(Refusal::NotPm4 { .. })));
+        // A lab-pending node is not PM4 either: the product window refuses it.
+        let mut parts = parts_with(patches());
+        parts.program.nodes[0].lowering = crate::kernel::Lowering::LabPending {
+            pending: "A1 Unknown (x)".into(),
+        };
+        assert!(matches!(make_plan(parts), Err(Refusal::NotPm4 { .. })));
         // The plan's closure and family.
         let plan = make_plan(parts_with(patches())).unwrap();
         assert!(plan.closure().reads.contains(&ResourceId(0)));

@@ -836,6 +836,7 @@ fn describe(l: &Lowering) -> String {
         Lowering::Graph { reason } => format!("graph: {reason}"),
         Lowering::HipDirect { reason } => format!("hip_direct: {reason}"),
         Lowering::Conditional { reason } => format!("conditional: {reason}"),
+        Lowering::LabPending { pending } => format!("lab_pending: {pending}"),
     }
 }
 

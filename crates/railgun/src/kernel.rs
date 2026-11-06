@@ -1049,11 +1049,36 @@ pub enum Lowering {
     Conditional {
         reason: String,
     },
+    /// Lab only (`railgun::admission`): differential-verified, certificate
+    /// pending. `pending` is the exact certificate refusal the node would
+    /// otherwise carry (its `HipDirect`/`Conditional` reason). Built only by
+    /// `KernelProgram::admit_lab_pending` (`feature = "lab"`); **not** PM4:
+    /// every product route refuses it through [`Lowering::is_pm4`], and only
+    /// the plan and the co-resident groups see it through
+    /// [`Lowering::is_pm4_lowerable`].
+    LabPending {
+        pending: String,
+    },
 }
 
 impl Lowering {
+    /// A proven PM4 node. Strict: `LabPending` is not PM4.
     pub fn is_pm4(&self) -> bool {
         matches!(self, Self::Pm4)
+    }
+
+    /// PM4 can be emitted for the node: proven PM4, or (lab builds only)
+    /// `LabPending`. Without `feature = "lab"` this is [`Lowering::is_pm4`],
+    /// so a product plan is unchanged even for a hand-built `LabPending`.
+    pub fn is_pm4_lowerable(&self) -> bool {
+        #[cfg(feature = "lab")]
+        {
+            matches!(self, Self::Pm4 | Self::LabPending { .. })
+        }
+        #[cfg(not(feature = "lab"))]
+        {
+            self.is_pm4()
+        }
     }
 }
 
