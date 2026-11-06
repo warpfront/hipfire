@@ -6925,6 +6925,117 @@ fn decode_mutation_fence_stage() -> Result<(), DispatchError> {
     Ok(())
 }
 
+/// The routed-combine arms a sealed grouped MoE call can reach (decode and prefill).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CombineArm {
+    /// The canonical top-10 slot-order combine over expanded F32 rows
+    /// (`moe_down_combine_top10_batched`): decode, path 1, the indexed-down re-entry and
+    /// the EP grouped-down unscatter. The only arm a fixed reduction partition can mask.
+    ExpandedTop10,
+    /// The k=8 expanded combine (`moe_down_combine_k8_batched`).
+    DecodeK8,
+    /// The BF16-row grouped combine (`moe_down_combine_grouped_top10_bf16in_owned`).
+    GroupedBf16InOwned,
+    /// The F32 grouped-row combine (`moe_down_combine_grouped_top10`).
+    GroupedF32,
+    /// The qt=55 FP8 grouped combine.
+    Fp8Grouped,
+    /// The row-folded tail: only the rank order is launched, the row kernel combines.
+    RankOrderOnly,
+    /// The combine rides the shared down launch (`moe_shared_down_combine`).
+    DeferredToSharedDown,
+}
+
+/// The kernel a routed combine launches for one call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CombineLeaf {
+    /// `moe_down_combine_top10_batched`: every live slot folds its expanded row.
+    Top10,
+    /// `moe_down_combine_top10_batched_partitioned`: a live slot whose expert
+    /// `e % ranks != rank` folds +0 in place (the call's fixed reduction partition).
+    Top10Partitioned { rank: usize, ranks: usize },
+}
+
+/// Select the combine leaf of `arm` under the call's fixed reduction partition
+/// (`MoeRowGather::reduction_partition` of this call's layer). A partition is honoured by the
+/// expanded top-10 arm only; every other arm folds foreign rows unmasked, so it is refused here,
+/// before any launch of the combine, never run silently. With no partition (`None`) every arm
+/// keeps its own kernel, and the returned [`CombineLeaf::Top10`] is the unmasked expanded leaf
+/// (the only one an expanded arm launches).
+pub(crate) fn combine_leaf(
+    arm: CombineArm,
+    partition: Option<(usize, usize)>,
+) -> Result<CombineLeaf, DispatchError> {
+    let Some((rank, ranks)) = partition else {
+        return Ok(CombineLeaf::Top10);
+    };
+    if ranks == 0 || rank >= ranks {
+        return Err(DispatchError::Hip(format!(
+            "sealed moe: reduction partition rank {rank} of {ranks} is invalid; refusing before launch"
+        )));
+    }
+    if arm != CombineArm::ExpandedTop10 {
+        return Err(DispatchError::Hip(format!(
+            "sealed moe: the {arm:?} combine cannot fold the call's fixed reduction partition \
+             (rank {rank} of {ranks}, e % ranks == rank); it would fold foreign experts \
+             unmasked; refusing before launch"
+        )));
+    }
+    Ok(CombineLeaf::Top10Partitioned { rank, ranks })
+}
+
+/// The decode call's fixed reduction partition `(rank, ranks)`: its row gather hook's
+/// `reduction_partition` of `layer_idx`, the layer index the decode row gather itself receives
+/// (the prefill protocol's counterpart reads `ep_layer_idx`). Per call and layer, never
+/// process-global; `None` without a hook.
+pub(crate) fn decode_reduction_partition(
+    p: &crate::families::moe::MoeParams<'_>,
+) -> Option<(usize, usize)> {
+    p.ep_row_gather
+        .and_then(|gather| gather.reduction_partition(p.layer_idx))
+}
+
+impl CombineLeaf {
+    /// Launch the leaf over `expanded` (`tokens * 10` rows of `hidden` F32) into `target`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch(
+        self,
+        gpu: &mut Gpu,
+        expanded: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        target: &GpuTensor,
+        hidden: usize,
+        tokens: usize,
+        n_experts: usize,
+    ) -> Result<(), DispatchError> {
+        match self {
+            Self::Top10 => hip!(gpu.moe_down_combine_top10_batched(
+                expanded,
+                topk_indices,
+                topk_weights,
+                target,
+                hidden,
+                tokens,
+                n_experts,
+            )),
+            Self::Top10Partitioned { rank, ranks } => {
+                hip!(gpu.moe_down_combine_top10_batched_partitioned(
+                    expanded,
+                    topk_indices,
+                    topk_weights,
+                    target,
+                    hidden,
+                    tokens,
+                    n_experts,
+                    rank,
+                    ranks,
+                ))
+            }
+        }
+    }
+}
+
 fn decode_combine_stage(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoeParams<'_>,
@@ -6934,10 +7045,21 @@ fn decode_combine_stage(
     reject_fp8_moe_unless_routed(&p.dtypes, route)?;
     check_qt53_decode_fallback(p, route)?;
     let grouped = route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped);
+    // The call's fixed reduction partition (the row gather's layer index is `layer_idx` on the
+    // decode protocol); decided before any launch of this combine.
+    let leaf = combine_leaf(
+        if grouped {
+            CombineArm::ExpandedTop10
+        } else {
+            CombineArm::DecodeK8
+        },
+        decode_reduction_partition(p),
+    )?;
     let dump = moe_dump::fold_begin(gpu, p.layer_idx as usize, p.hidden, p.x_residual, target)?;
     if grouped {
         let down_expanded = slice_moe_f32_view(p.down_expanded, 0, 10 * p.hidden);
-        hip!(gpu.moe_down_combine_top10_batched(
+        leaf.launch(
+            gpu,
             &down_expanded,
             p.topk_indices,
             p.topk_weights,
@@ -6945,7 +7067,7 @@ fn decode_combine_stage(
             p.hidden,
             1,
             p.n_exp,
-        ))?;
+        )?;
     } else {
         hip!(gpu.moe_down_combine_k8_batched(
             p.down_expanded,
@@ -7875,4 +7997,70 @@ fn prefill_mutation_fence_stage() -> Result<(), DispatchError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod combine_leaf_tests {
+    use super::{combine_leaf, CombineArm, CombineLeaf};
+
+    const ARMS: [CombineArm; 7] = [
+        CombineArm::ExpandedTop10,
+        CombineArm::DecodeK8,
+        CombineArm::GroupedBf16InOwned,
+        CombineArm::GroupedF32,
+        CombineArm::Fp8Grouped,
+        CombineArm::RankOrderOnly,
+        CombineArm::DeferredToSharedDown,
+    ];
+
+    /// No partition (the static route, the MTP head, every non-EP call): the expanded top-10
+    /// arm keeps today's unmasked leaf and no arm is refused.
+    #[test]
+    fn no_partition_keeps_the_unmasked_leaf_for_every_arm() {
+        for arm in ARMS {
+            assert_eq!(combine_leaf(arm, None).unwrap(), CombineLeaf::Top10, "{arm:?}");
+        }
+    }
+
+    /// A partition selects the partitioned leaf on the expanded top-10 arm only, for both ranks.
+    #[test]
+    fn a_partition_selects_the_partitioned_leaf_on_the_expanded_arm() {
+        for ranks in [2usize, 4, 8] {
+            for rank in 0..ranks {
+                assert_eq!(
+                    combine_leaf(CombineArm::ExpandedTop10, Some((rank, ranks))).unwrap(),
+                    CombineLeaf::Top10Partitioned { rank, ranks }
+                );
+            }
+        }
+    }
+
+    /// Every other combine reachable under a partition (the k8 combine, the grouped BF16-input /
+    /// F32 / FP8 grouped combines, the rank-order-only row fold and the combine deferred into
+    /// the shared down) fails BEFORE any launch with a message naming the arm: nothing folds
+    /// foreign experts unmasked.
+    #[test]
+    fn every_other_arm_refuses_a_partition_before_launch() {
+        for arm in ARMS {
+            if arm == CombineArm::ExpandedTop10 {
+                continue;
+            }
+            let error = combine_leaf(arm, Some((0, 2))).unwrap_err();
+            let text = format!("{error:?}");
+            assert!(
+                text.contains(&format!("{arm:?}")) && text.contains("before launch"),
+                "{arm:?}: {text}"
+            );
+        }
+    }
+
+    /// A malformed partition never reaches a launcher, on any arm.
+    #[test]
+    fn an_invalid_partition_is_refused() {
+        for arm in ARMS {
+            assert!(combine_leaf(arm, Some((0, 0))).is_err(), "{arm:?}");
+            assert!(combine_leaf(arm, Some((2, 2))).is_err(), "{arm:?}");
+            assert!(combine_leaf(arm, Some((5, 2))).is_err(), "{arm:?}");
+        }
+    }
 }

@@ -409,6 +409,9 @@ pub(crate) fn validate_scratch(
     use_path2: bool,
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
+    // A fixed reduction partition (balanced trunk EP) is honoured by the expanded top-10
+    // combine only: refuse every other arm before this call's first launch.
+    require_reduction_partition_route(gpu, p, use_path2)?;
     // qt=55 FP8: the full-route preflight (scratch, weights, experts, router).
     if is_fp8(p) {
         return fp8_validate(gpu, p, grouped_rows).map(drop);
@@ -454,6 +457,64 @@ pub(crate) fn writes_slot_ordered_rows(
         && (!use_path2
             || indexed_down(gpu, p, use_path2)
             || ep_grouped_down_unscatter(gpu, p, use_path2))
+}
+
+/// The call's fixed reduction partition `(rank, ranks)` (`MoeRowGather::reduction_partition` of
+/// the layer the row gather itself receives, `ep_layer_idx`), `None` without a gather hook or
+/// off a partitioned layer. Per call and layer, never process-global.
+pub(crate) fn reduction_partition(p: &MoePrefillParams<'_>) -> Option<(usize, usize)> {
+    p.ep_row_gather
+        .and_then(|gather| gather.reduction_partition(p.ep_layer_idx))
+}
+
+/// The combine arm of one call's routed down, from the route's pure predicates (the arm order of
+/// [`combine_stage`]): FP8 grouped rows, the expanded top-10 arms (path 1, the indexed down and
+/// the EP grouped-down unscatter), the BF16 grouped rows of the F16 WMMA / symmetric IU4 downs, or
+/// the plain F32 grouped rows.
+fn combine_arm_of(
+    fp8: bool,
+    use_path2: bool,
+    indexed_down: bool,
+    ep_unscatter: bool,
+    bf16_rows: bool,
+) -> super::CombineArm {
+    if fp8 {
+        super::CombineArm::Fp8Grouped
+    } else if !use_path2 || indexed_down || ep_unscatter {
+        super::CombineArm::ExpandedTop10
+    } else if bf16_rows {
+        super::CombineArm::GroupedBf16InOwned
+    } else {
+        super::CombineArm::GroupedF32
+    }
+}
+
+/// [`combine_arm_of`] at `p`'s actual rows on this device.
+fn combine_arm(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> super::CombineArm {
+    let use_path2 = grouped_path(gpu, p, use_path2);
+    combine_arm_of(
+        is_fp8(p),
+        use_path2,
+        indexed_down(gpu, p, use_path2),
+        ep_grouped_down_unscatter(gpu, p, use_path2),
+        down_wmma(gpu, p) || sym_iu4(gpu, p, use_path2),
+    )
+}
+
+/// Call-level preflight of the fixed reduction partition: a partitioned call's combine MUST be
+/// the expanded top-10 arm (the partitioned leaf); any other arm would fold foreign experts
+/// unmasked, so it fails here, before the call's first launch.
+fn require_reduction_partition_route(
+    gpu: &Gpu,
+    p: &MoePrefillParams<'_>,
+    use_path2: bool,
+) -> Result<(), DispatchError> {
+    match reduction_partition(p) {
+        None => Ok(()),
+        Some(partition) => {
+            super::combine_leaf(combine_arm(gpu, p, use_path2), Some(partition)).map(drop)
+        }
+    }
 }
 
 /// An EP row-gathered call whose routed down is the plain grouped F32 down
@@ -1413,6 +1474,10 @@ pub(crate) fn row_fold_applies(
     if is_fp8(p) {
         return false;
     }
+    if reduction_partition(p).is_some() {
+        // The row kernel combines inside itself, unmasked.
+        return false;
+    }
     if gpu.arch_caps.is_gfx1201() {
         return row_fold_gfx1201_applies(gpu, p, use_path2, hc);
     }
@@ -1481,6 +1546,7 @@ pub(crate) fn combine_order_only(
     p: &MoePrefillParams<'_>,
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
+    super::combine_leaf(super::CombineArm::RankOrderOnly, reduction_partition(p))?;
     require_geometry(p)?;
     validate_scratch(gpu, p, true, grouped_rows)?;
     let owners = implicit_zero_owners(gpu, p);
@@ -1552,7 +1618,9 @@ fn epilogue_operands<'a>(
 /// the chain leaves it, so nothing downstream changes. Pure: launches nothing. The caller
 /// owns the stage-level conditions (no CPU split / deferral / tile exchange / row-fold write).
 pub(crate) fn epilogue_fuse_applies(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
-    if is_fp8(p) || !grouped_geometry(p) {
+    // The fused launch combines the ten expanded rows itself, unmasked: a partitioned call
+    // declines it and runs the partitioned combine + the unfused shared down.
+    if is_fp8(p) || !grouped_geometry(p) || reduction_partition(p).is_some() {
         return false;
     }
     let Some(shared) = p.prelude.shared.as_ref() else {
@@ -1593,6 +1661,7 @@ pub(crate) fn combine_deferred(
     use_path2: bool,
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
+    super::combine_leaf(super::CombineArm::DeferredToSharedDown, reduction_partition(p))?;
     require_geometry(p)?;
     validate_scratch(gpu, p, use_path2, grouped_rows)
 }
@@ -1605,6 +1674,7 @@ pub(crate) fn shared_down_combined(
     p: &MoePrefillParams<'_>,
     use_path2: bool,
 ) -> Result<(), DispatchError> {
+    super::combine_leaf(super::CombineArm::DeferredToSharedDown, reduction_partition(p))?;
     require_geometry(p)?;
     let (hidden, expanded) = epilogue_inputs(gpu, p, use_path2).ok_or_else(|| {
         DispatchError::Hip("qt44 epilogue fuse: shared weights vanished after admission".into())
@@ -2661,11 +2731,16 @@ fn combine_stage(
     if indexed_down(gpu, p, use_path2) {
         return combine_stage(gpu, p, false, grouped_rows, false);
     }
+    // The call's fixed reduction partition (this layer's row gather hook, the same layer index
+    // the gather itself receives): only the expanded top-10 arms can mask foreign experts.
+    let partition = reduction_partition(p);
     if use_path2 && ep_grouped_down_unscatter(gpu, p, use_path2) {
         // The grouped down was unscattered to slot order for the EP gather: the
         // canonical top-10 slot-order combine reads it.
+        let leaf = super::combine_leaf(super::CombineArm::ExpandedTop10, partition)?;
         let expanded = f32_view(p.down_expanded, 0, p.batch_size * p.k_top * p.down_m);
-        hip(gpu.moe_down_combine_top10_batched(
+        leaf.launch(
+            gpu,
             &expanded,
             p.topk_indices,
             p.topk_weights,
@@ -2673,8 +2748,9 @@ fn combine_stage(
             p.down_m,
             p.batch_size,
             p.n_exp,
-        ))?;
+        )?;
     } else if use_path2 && (down_wmma(gpu, p) || sym_iu4(gpu, p, use_path2)) {
+        super::combine_leaf(super::CombineArm::GroupedBf16InOwned, partition)?;
         // Both downs store BF16 grouped rows. The rank order goes to
         // `down_expanded`: unused on this route until the shared down, which
         // runs after the combine. Under the partial mask's implicit zeros the
@@ -2695,6 +2771,7 @@ fn combine_stage(
             owners,
         ))?;
     } else if use_path2 {
+        super::combine_leaf(super::CombineArm::GroupedF32, partition)?;
         if implicit_zero_owners(gpu, p).is_some() {
             return Err(DispatchError::Hip(
                 "qt44 combine: the F32 grouped combine would read foreign rows whose clear the implicit zeros skipped".into(),
@@ -2712,8 +2789,10 @@ fn combine_stage(
             p.n_exp,
         ))?;
     } else {
+        let leaf = super::combine_leaf(super::CombineArm::ExpandedTop10, partition)?;
         let expanded = f32_view(p.down_expanded, 0, p.batch_size * p.k_top * p.down_m);
-        hip(gpu.moe_down_combine_top10_batched(
+        leaf.launch(
+            gpu,
             &expanded,
             p.topk_indices,
             p.topk_weights,
@@ -2721,7 +2800,7 @@ fn combine_stage(
             p.down_m,
             p.batch_size,
             p.n_exp,
-        ))?;
+        )?;
     }
     // A shared down placed after the combine rounds `target` to BF16 as its
     // first read, so the round trip is owed only when nothing follows.
@@ -3698,6 +3777,8 @@ fn fp8_combine(
     grouped_rows: usize,
     initial_zero: bool,
 ) -> Result<(), DispatchError> {
+    // Foreign experts would fold unmasked: refuse before any launch.
+    super::combine_leaf(super::CombineArm::Fp8Grouped, reduction_partition(p))?;
     if initial_zero {
         return Err(fp8_refuse(
             "a zero-initialized combine target is not available",
@@ -4059,6 +4140,124 @@ mod scratch_tests {
             for rows in 1..=64 {
                 assert!(grouped_path_for_rows(true, rows, limit, false));
             }
+        }
+    }
+
+    /// The combine arm of a ROW-GATHERED call (`ep_row_gather` installed, QT44/QT53 route, no
+    /// expert-stage table, not slab/FP8) over `rows` route rows, from the same pure predicates
+    /// [`combine_arm`] reads. `down_wmma` stands for the BF16-row downs (F16 WMMA / symmetric IU4).
+    fn gathered_arm(
+        rows: usize,
+        limit: usize,
+        wide_grouped_moe: bool,
+        wide_grouped_down: bool,
+        down_wmma: bool,
+    ) -> (crate::pipeline::CombineArm, bool) {
+        let use_path2 = grouped_path_for_rows(true, rows, limit, wide_grouped_moe);
+        let indexed = indexed_down_for_rows(use_path2, rows, limit, wide_grouped_down, down_wmma);
+        let unscatter = use_path2 && !down_wmma && !indexed;
+        (
+            combine_arm_of(false, use_path2, indexed, unscatter, down_wmma),
+            unscatter,
+        )
+    }
+
+    /// Every gathered width (one row, the 2..=8 verify rows and the wide-verify 9..=64 rows) on
+    /// every wide-grouped flag combination ends in the expanded top-10 arm, so a fixed reduction
+    /// partition selects the partitioned leaf for each of them and nothing runs unmasked.
+    #[test]
+    fn a_partitioned_gathered_call_selects_the_partitioned_leaf_at_every_width() {
+        use crate::pipeline::{combine_leaf, CombineArm, CombineLeaf};
+        for limit in [8usize, 16, 32, 64] {
+            for rows in 1..=limit {
+                for wide_grouped_moe in [false, true] {
+                    for wide_grouped_down in [false, true] {
+                        let (arm, _) =
+                            gathered_arm(rows, limit, wide_grouped_moe, wide_grouped_down, false);
+                        assert_eq!(
+                            arm,
+                            CombineArm::ExpandedTop10,
+                            "rows {rows} limit {limit} moe {wide_grouped_moe} down {wide_grouped_down}"
+                        );
+                        for rank in 0..2usize {
+                            assert_eq!(
+                                combine_leaf(arm, Some((rank, 2))).unwrap(),
+                                CombineLeaf::Top10Partitioned { rank, ranks: 2 }
+                            );
+                        }
+                        // No partition (static route, MTP head): today's unmasked leaf.
+                        assert_eq!(combine_leaf(arm, None).unwrap(), CombineLeaf::Top10);
+                    }
+                }
+            }
+        }
+        // The explicit widths: a single row and the default 2..=8 verify rows.
+        for rows in 1..=8usize {
+            let (arm, unscatter) = gathered_arm(rows, 8, false, false, false);
+            assert_eq!(arm, CombineArm::ExpandedTop10, "rows {rows}");
+            assert!(!unscatter, "rows {rows} take the indexed/path-1 down");
+        }
+    }
+
+    /// `HIPFIRE_QWEN4_WIDE_GROUPED_MOE` + `HIPFIRE_QWEN4_WIDE_GROUPED_DOWN` keep the grouped F32
+    /// down for 9..=limit rows (A8 grouped / C8 PM live inside that down), unscattered to slot
+    /// order for the gather: exactly that width band takes the unscatter arm, and it combines
+    /// through the expanded leaf, partitioned under a partition.
+    #[test]
+    fn the_grouped_down_unscatter_widths_combine_through_the_partitioned_leaf() {
+        use crate::pipeline::{combine_leaf, CombineArm, CombineLeaf};
+        let limit = 64usize;
+        for rows in 1..=limit {
+            let (arm, unscatter) = gathered_arm(rows, limit, true, true, false);
+            assert_eq!(unscatter, rows > 8, "rows {rows}");
+            assert_eq!(arm, CombineArm::ExpandedTop10, "rows {rows}");
+            assert_eq!(
+                combine_leaf(arm, Some((1, 2))).unwrap(),
+                CombineLeaf::Top10Partitioned { rank: 1, ranks: 2 }
+            );
+        }
+        // Without the wide-down flag the 9..=64 band stays on the indexed down (no unscatter).
+        for rows in 9..=limit {
+            let (arm, unscatter) = gathered_arm(rows, limit, true, false, false);
+            assert!(!unscatter, "rows {rows}");
+            assert_eq!(arm, CombineArm::ExpandedTop10);
+        }
+        // A chunk wider than the few-row limit keeps the grouped F32 down + unscatter.
+        let (arm, unscatter) = gathered_arm(65, 8, false, false, false);
+        assert!(unscatter);
+        assert_eq!(arm, CombineArm::ExpandedTop10);
+    }
+
+    /// The BF16-row grouped combines (F16 WMMA / symmetric IU4 downs, > few-row limit) and the
+    /// plain F32 grouped combine cannot mask a partition: refused before launch.
+    #[test]
+    fn the_grouped_row_combines_and_fp8_refuse_a_partition() {
+        use crate::pipeline::{combine_leaf, CombineArm};
+        let (bf16, _) = gathered_arm(65, 8, false, false, true);
+        assert_eq!(bf16, CombineArm::GroupedBf16InOwned);
+        let error = combine_leaf(bf16, Some((0, 2))).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("before launch"),
+            "{error:?}"
+        );
+        // Without a gather hook the grouped F32 rows are the plain combine.
+        assert_eq!(
+            combine_arm_of(false, true, false, false, false),
+            CombineArm::GroupedF32
+        );
+        assert!(combine_leaf(CombineArm::GroupedF32, Some((0, 2))).is_err());
+        assert_eq!(
+            combine_arm_of(true, true, false, false, true),
+            CombineArm::Fp8Grouped
+        );
+        assert!(combine_leaf(CombineArm::Fp8Grouped, Some((1, 2))).is_err());
+        // Off a partition every arm keeps its own kernel (nothing refuses).
+        for arm in [
+            CombineArm::GroupedBf16InOwned,
+            CombineArm::GroupedF32,
+            CombineArm::Fp8Grouped,
+        ] {
+            assert!(combine_leaf(arm, None).is_ok());
         }
     }
 

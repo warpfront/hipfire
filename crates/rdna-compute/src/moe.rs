@@ -2286,6 +2286,91 @@ impl Gpu {
         result
     }
 
+    /// `moe_down_combine_top10_batched` with a fixed reduction partition: a
+    /// live slot whose expert `e % ranks != rank` contributes +0.0 in place
+    /// (its weight keeps its position; the zero term still folds in order).
+    /// `expert_outputs` is only read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down_combine_top10_batched_partitioned(
+        &mut self,
+        expert_outputs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        residual: &GpuTensor,
+        hidden: usize,
+        tokens: usize,
+        n_experts: usize,
+        rank: usize,
+        ranks: usize,
+    ) -> HipResult<()> {
+        const FUNC: &str = "moe_down_combine_top10_batched_partitioned";
+        if ranks == 0 || ranks > 4 || rank >= ranks {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{FUNC}: need 1 <= ranks <= 4 and rank < ranks (rank={rank} ranks={ranks})"),
+            ));
+        }
+        self.bind_thread()?;
+        require_span(
+            expert_outputs,
+            &[tokens, 10, hidden, 4],
+            "moe_down_combine_top10_batched_partitioned expert outputs",
+        )?;
+        self.ensure_kernel(
+            FUNC,
+            kernels::MOE_DOWN_COMBINE_TOP10_BATCHED_PARTITIONED_SRC,
+            FUNC,
+        )?;
+        let ep = expert_outputs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let rp = residual.buf.as_ptr();
+        let hv = hidden as i32;
+        let tv = tokens as i32;
+        let nx = n_experts as i32;
+        let rk = rank as i32;
+        let rs = ranks as i32;
+        let mut params = [
+            &ep as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &hv as *const _ as *mut c_void,
+            &tv as *const _ as *mut c_void,
+            &nx as *const _ as *mut c_void,
+            &rk as *const _ as *mut c_void,
+            &rs as *const _ as *mut c_void,
+        ];
+        let block = 64u32;
+        let grid_x = (hidden as u32).div_ceil(block);
+        let bytes = (tokens * 10 * hidden + 2 * tokens * 10 + 2 * tokens * hidden) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [grid_x, tokens as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(rp);
+                b.push_i32(hv);
+                b.push_i32(tv);
+                b.push_i32(nx);
+                b.push_i32(rk);
+                b.push_i32(rs);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Qwen4 grouped combine.  `inverse_perm` is the sealed flat-to-grouped
     /// map and invalid rows are ignored by the bounds-safe kernel.  The
     /// top-k expert IDs are consumed to reproduce indexed BF16 expert order.

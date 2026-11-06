@@ -9501,6 +9501,143 @@ mod tests {
         assert!(format!("{error:?}").contains("row gather"), "{error:?}");
     }
 
+    /// A balanced-trunk gather: device-assigned ownership plus a fixed reduction partition
+    /// `(rank, ranks)` on exactly one layer (the hook decides per call and layer).
+    struct PartitionGather {
+        layer: u16,
+        rank: usize,
+        ranks: usize,
+    }
+
+    impl MoeRowGather for PartitionGather {
+        fn gather_rows(
+            &self,
+            _gpu: &mut Gpu,
+            _layer_idx: u16,
+            _slots: usize,
+            _down_expanded: &GpuTensor,
+            _topk_indices: &GpuTensor,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn assigns_owners(&self, layer_idx: u16) -> bool {
+            layer_idx == self.layer
+        }
+
+        fn reduction_partition(&self, layer_idx: u16) -> Option<(usize, usize)> {
+            (layer_idx == self.layer).then_some((self.rank, self.ranks))
+        }
+    }
+
+    /// The partition only picks the combine leaf: the lowered stage list of a partitioned
+    /// balanced call is the balanced call's, on both protocols, symmetric declaration included.
+    #[test]
+    fn a_reduction_partition_never_changes_the_lowered_stages() {
+        let grouped = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        let symmetric = Some(MoeRouteCapability::Qt44Qt53GroupedSymmetric);
+        // Layer 0 is the layer both fixtures run.
+        let partitioned = PartitionGather {
+            layer: 0,
+            rank: 1,
+            ranks: 2,
+        };
+        let balanced = decode_stages(Some(&OwnerGather), grouped).unwrap();
+        assert_eq!(decode_stages(Some(&partitioned), grouped).unwrap(), balanced);
+        let balanced = prefill_stages(Some(&OwnerGather), grouped, false).unwrap();
+        assert_eq!(
+            prefill_stages(Some(&partitioned), grouped, false).unwrap(),
+            balanced
+        );
+        assert_eq!(
+            prefill_stages(Some(&partitioned), symmetric, false).unwrap(),
+            balanced
+        );
+        // Off the grouped route a gather (partitioned or not) still refuses at lowering.
+        let error = decode_stages(Some(&partitioned), None).unwrap_err();
+        assert!(format!("{error:?}").contains("row gather"), "{error:?}");
+        let error = prefill_stages(Some(&partitioned), None, false).unwrap_err();
+        assert!(format!("{error:?}").contains("row gather"), "{error:?}");
+    }
+
+    /// The combine consults the hook with the SAME layer index the row gather receives: the
+    /// decode protocol's `layer_idx`, the prefill protocol's `ep_layer_idx`. A layer the hook
+    /// does not partition (MTP head, static layer) and a call without a hook read `None`.
+    #[test]
+    fn the_combine_reads_the_partition_of_the_gather_layer_index() {
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xE8_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        static HOOK: PartitionGather = PartitionGather {
+            layer: 7,
+            rank: 1,
+            ranks: 2,
+        };
+        let decode = decode_scratch(0xE9_0000);
+        let decode_params = |layer_idx: u16, gather: Option<&'static dyn MoeRowGather>| MoeParams {
+            ep_row_gather: gather,
+            ..ep_decode_params(
+                &decode,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                layer_idx,
+                8,
+                4,
+                MoeEpMode::None,
+                None,
+                false,
+            )
+        };
+        let hook_ref: &'static dyn MoeRowGather = &HOOK;
+        assert_eq!(
+            super::super::decode_reduction_partition(&decode_params(7, Some(hook_ref))),
+            Some((1, 2))
+        );
+        assert_eq!(
+            super::super::decode_reduction_partition(&decode_params(6, Some(hook_ref))),
+            None
+        );
+        assert_eq!(
+            super::super::decode_reduction_partition(&decode_params(7, None)),
+            None
+        );
+
+        let prefill = prefill_scratch(0xEC_0000);
+        let prefill_params = |ep_layer_idx: u16, gather: Option<&'static dyn MoeRowGather>| {
+            MoePrefillParams {
+                ep_row_gather: gather,
+                ep_layer_idx,
+                ..ep_prefill_params(
+                    &prefill,
+                    &fixture.routed,
+                    &fixture.gate_up_ptrs,
+                    &fixture.down_ptrs,
+                    None,
+                )
+            }
+        };
+        assert_eq!(
+            super::super::qt44_qt53_prefill::reduction_partition(&prefill_params(
+                7,
+                Some(hook_ref)
+            )),
+            Some((1, 2))
+        );
+        assert_eq!(
+            super::super::qt44_qt53_prefill::reduction_partition(&prefill_params(
+                6,
+                Some(hook_ref)
+            )),
+            None
+        );
+        assert_eq!(
+            super::super::qt44_qt53_prefill::reduction_partition(&prefill_params(7, None)),
+            None
+        );
+    }
+
     /// A tile exchange that never runs (lowering tests only).
     struct NoopTileExchange;
 

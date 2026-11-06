@@ -2882,6 +2882,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ["moe_down_combine_top10_batched"]
         );
         add!(
+            "moe_down_combine_top10_batched_partitioned",
+            kernels::MOE_DOWN_COMBINE_TOP10_BATCHED_PARTITIONED_SRC,
+            ["moe_down_combine_top10_batched_partitioned"]
+        );
+        add!(
             "moe_gate_up_unscatter_silu_top10",
             kernels::MOE_GATE_UP_UNSCATTER_SILU_TOP10_SRC,
             [

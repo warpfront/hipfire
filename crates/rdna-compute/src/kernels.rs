@@ -4549,6 +4549,11 @@ pub const MOE_COMBINE_ORDER_OWNED_SRC: &str =
 pub const MOE_DOWN_COMBINE_TOP10_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/moe_down_combine_top10_batched.hip");
 
+/// `moe_down_combine_top10_batched` with a fixed reduction partition
+/// `(rank, ranks)`: live slots whose expert `e % ranks != rank` fold +0 in place.
+pub const MOE_DOWN_COMBINE_TOP10_BATCHED_PARTITIONED_SRC: &str =
+    include_str!("../../../kernels/src/moe_down_combine_top10_batched_partitioned.hip");
+
 /// Qwen4 qt3/Q8F16 indexed down projection.  Produces unweighted
 /// `[tokens * 10, M]` rows; route weights belong to the dedicated combine.
 pub const GEMV_Q8_0_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC: &str =

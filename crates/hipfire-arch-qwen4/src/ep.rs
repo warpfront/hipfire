@@ -565,9 +565,34 @@ fn balanced_layer_tables(
 /// Whether the expert-row gather of MoE invocation `layer_idx` is skipped for the trunk shard's
 /// partial FFN route (`ffn_partial`: the thread's route carries the FFN all-reduce). Only
 /// TRUNK layers skip: the replicated native MTP head runs at `layer_idx >= trunk_layers` and
-/// its HC writes are local (no all-reduce), so it keeps the gather.
-fn trunk_partial_skips_gather(layer_idx: u16, trunk_layers: usize, ffn_partial: bool) -> bool {
-    ffn_partial && usize::from(layer_idx) < trunk_layers
+/// its HC writes are local (no all-reduce), so it keeps the gather. A layer with a fixed
+/// reduction partition ([`reduction_partition_of`]) never skips: it gathers the producers' rows
+/// so its combine can fold the static `e % ranks` partition of ANY compute ownership.
+fn trunk_partial_skips_gather(
+    layer_idx: u16,
+    trunk_layers: usize,
+    ffn_partial: bool,
+    reduction_partitioned: bool,
+) -> bool {
+    ffn_partial && usize::from(layer_idx) < trunk_layers && !reduction_partitioned
+}
+
+/// The fixed reduction partition `(rank, ranks)` of MoE invocation `layer_idx` (`reducer(e) =
+/// e % ranks`, the static trunk ownership): `Some` only for a BALANCED TRUNK layer on the trunk
+/// shard's partial FFN route (`partial_active`), where the compute owner of a free expert varies
+/// per call but the all-reduced partial must not. `None` for the MTP head
+/// (`layer_idx >= trunk_layers`), non-balanced (static) layers and any call off the partial
+/// route.
+fn reduction_partition_of(
+    layer_idx: u16,
+    trunk_layers: usize,
+    partial_active: bool,
+    balanced_layer: bool,
+    rank: usize,
+    ranks: usize,
+) -> Option<(usize, usize)> {
+    (usize::from(layer_idx) < trunk_layers && partial_active && balanced_layer)
+        .then_some((rank, ranks))
 }
 
 impl BalancedOwners {
@@ -892,10 +917,15 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
         // reduced by the fused all-reduce of its HC write, not gathered. Non-owned slots ran
         // on the zero dummy tables, so this rank's replicated combine yields its owned-slot
         // partial; the MTP head (layer >= trunk layers) keeps the gather (its write is local).
+        // A BALANCED trunk layer is the exception: its compute owner of a free expert varies
+        // with every other row of the call, so it gathers the producers' rows from the owners
+        // its own assignment wrote (below) and its combine folds the fixed `e % ranks`
+        // partition (`reduction_partition`).
         if trunk_partial_skips_gather(
             layer_idx,
             self.trunk_layers,
             crate::trunk_route::ffn_partial_active(),
+            self.reduction_partition(layer_idx).is_some(),
         ) {
             return Ok(());
         }
@@ -945,6 +975,17 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
         self.balanced
             .get()
             .is_some_and(|balanced| balanced.layer(layer_idx, self.trunk_layers).is_some())
+    }
+
+    fn reduction_partition(&self, layer_idx: u16) -> Option<(usize, usize)> {
+        reduction_partition_of(
+            layer_idx,
+            self.trunk_layers,
+            crate::trunk_route::ffn_partial_active(),
+            self.assigns_owners(layer_idx),
+            self.rank,
+            self.gather.spec().ranks,
+        )
     }
 
     fn assign_owners(
@@ -1079,14 +1120,80 @@ mod gather_hook_tests {
     fn the_partial_route_skips_trunk_gathers_never_the_mtp_heads() {
         let trunk_layers = 48usize;
         for layer in 0..trunk_layers as u16 {
-            assert!(trunk_partial_skips_gather(layer, trunk_layers, true));
-            assert!(!trunk_partial_skips_gather(layer, trunk_layers, false));
+            // Static (unpartitioned) trunk layers skip on the partial route only.
+            assert!(trunk_partial_skips_gather(layer, trunk_layers, true, false));
+            assert!(!trunk_partial_skips_gather(layer, trunk_layers, false, false));
+            // A layer with a fixed reduction partition gathers, route or not.
+            assert!(!trunk_partial_skips_gather(layer, trunk_layers, true, true));
+            assert!(!trunk_partial_skips_gather(layer, trunk_layers, false, true));
         }
         // the head's gather layer is `num_hidden_layers + j % 2`
         for parity in 0..2u16 {
             let head = trunk_layers as u16 + parity;
-            assert!(!trunk_partial_skips_gather(head, trunk_layers, true));
-            assert!(!trunk_partial_skips_gather(head, trunk_layers, false));
+            assert!(!trunk_partial_skips_gather(head, trunk_layers, true, false));
+            assert!(!trunk_partial_skips_gather(head, trunk_layers, false, false));
+        }
+    }
+
+    /// The fixed reduction partition `(rank, ranks)` exists only for a BALANCED TRUNK layer on
+    /// the trunk shard's partial FFN route: never the MTP head, a static (non-balanced) layer,
+    /// or a call off the partial route. The gather skip is its exact complement on the partial
+    /// route, so a `Some` layer always gathers and a `None` trunk layer keeps skipping.
+    #[test]
+    fn the_reduction_partition_is_balanced_trunk_partial_only() {
+        let trunk_layers = 48usize;
+        for rank in 0..2usize {
+            for layer in 0..trunk_layers as u16 {
+                assert_eq!(
+                    reduction_partition_of(layer, trunk_layers, true, true, rank, 2),
+                    Some((rank, 2))
+                );
+                // Static / non-balanced trunk layer.
+                assert_eq!(
+                    reduction_partition_of(layer, trunk_layers, true, false, rank, 2),
+                    None
+                );
+                // Off the partial route (full gather route, plain EP).
+                assert_eq!(
+                    reduction_partition_of(layer, trunk_layers, false, true, rank, 2),
+                    None
+                );
+                assert_eq!(
+                    reduction_partition_of(layer, trunk_layers, false, false, rank, 2),
+                    None
+                );
+            }
+            // The MTP head (`trunk_layers + parity`) never partitions, balanced or not.
+            for parity in 0..2u16 {
+                let head = trunk_layers as u16 + parity;
+                for balanced in [false, true] {
+                    for partial in [false, true] {
+                        assert_eq!(
+                            reduction_partition_of(
+                                head,
+                                trunk_layers,
+                                partial,
+                                balanced,
+                                rank,
+                                2
+                            ),
+                            None
+                        );
+                    }
+                }
+            }
+        }
+        // Skip is the complement of the partition on the partial route.
+        for layer in 0..(trunk_layers as u16 + 2) {
+            for balanced in [false, true] {
+                let partition = reduction_partition_of(layer, trunk_layers, true, balanced, 1, 2);
+                let skips = trunk_partial_skips_gather(layer, trunk_layers, true, partition.is_some());
+                assert_eq!(
+                    skips,
+                    (layer as usize) < trunk_layers && !balanced,
+                    "layer {layer} balanced {balanced}"
+                );
+            }
         }
     }
 }

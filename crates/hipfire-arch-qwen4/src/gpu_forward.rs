@@ -3807,18 +3807,30 @@ pub(crate) struct MtpEpGather<'a> {
 pub const QWEN4_EP_BALANCED_OWNERS_ENV: &str = "HIPFIRE_EP_BALANCED_OWNERS";
 
 ///
-/// Never under the trunk shard ([`crate::weights::trunk_shard::trunk_shard_requested`]): its FFN is
-/// the rank's PARTIAL (owned routed slots + its K-half of the shared expert) folded by the fused
-/// all-reduce, so which routed experts a rank sums changes the bf16 partials. Balanced ownership
-/// (`idx_free(e) % ranks` over the routed set of the CALL) depends on the other rows of the call,
-/// so a lane's decode row differed from its singleton (lane == singleton failed on every
-/// multi-lane burst, card job j7451: production 0/8 lanes equal, `HIPFIRE_EP_BALANCED_OWNERS=0`
-/// 8/8). The static `e % ranks` split is batch-invariant, and resident experts were already
-/// pinned to their holder `e % ranks`, so it only gives up balancing the host-resident tail.
+/// Under the trunk shard ([`crate::weights::trunk_shard::trunk_shard_requested`]) the rank's FFN is
+/// its PARTIAL (its share of the routed slots + its K-half of the shared expert) folded by the
+/// fused all-reduce. Balanced ownership (`idx_free(e) % ranks` over the routed set of the CALL)
+/// decides which rank COMPUTES a host expert, and that set depends on the other rows of the call
+/// (MTP draft depth is wall-time adaptive). So under the trunk shard a balanced layer gathers every
+/// slot's row from its producer and folds it under the fixed REDUCTION partition `e % ranks`
+/// (`MoeRowGather::reduction_partition`, the partitioned top-10 combine): a row's partials are then
+/// the static route's, whatever rank computed them (BalNondet, card jobs j8202/j8213: without it a
+/// verify row's logits changed with an added draft row and greedy C1 differed across loads).
+/// Admitted there only on request ([`QWEN4_EP_TRUNK_BALANCED_OWNERS_ENV`] `=1`); the default keeps
+/// the static `e % ranks` split. Resident experts stay pinned to their holder (the pinned
+/// owner-assign kernel), so only host experts move.
 fn qwen4_ep_balanced_owners_enabled() -> bool {
     hipfire_config::developer_var(QWEN4_EP_BALANCED_OWNERS_ENV).as_deref() != Ok("0")
-        && !crate::weights::trunk_shard::trunk_shard_requested()
+        && (!crate::weights::trunk_shard::trunk_shard_requested()
+            || hipfire_config::developer_var(QWEN4_EP_TRUNK_BALANCED_OWNERS_ENV).as_deref()
+                == Ok("1"))
 }
+
+/// `HIPFIRE_EP_TRUNK_BALANCED_OWNERS` (default off; exact `1` admits): balanced ownership on the
+/// trunk-shard (partial FFN) route, with the fixed `e % ranks` reduction partition. Unset or any
+/// other value keeps the static `e % ranks` split there; off the trunk shard it changes nothing
+/// (`HIPFIRE_EP_BALANCED_OWNERS` decides there).
+pub const QWEN4_EP_TRUNK_BALANCED_OWNERS_ENV: &str = "HIPFIRE_EP_TRUNK_BALANCED_OWNERS";
 
 /// Why an EP rank does not run balanced ownership, or `None` when it does. The
 /// per-call owner assignment (`qwen4_ep_owner_assign_pm`) ships for exact

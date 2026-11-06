@@ -372,7 +372,10 @@ pub enum LaneExpertRoute {
     /// static units kind (static owners) or, with pinned owners on, as the
     /// balanced units kind (the pinned owner-assign kernel). Set only from
     /// bound EP placement and the installed gather, never from arch, env or
-    /// layer counts.
+    /// layer counts. On the trunk-shard partial-FFN route the balanced kind
+    /// (`HIPFIRE_EP_TRUNK_BALANCED_OWNERS=1`, default off) gathers every slot
+    /// and folds under the fixed `e % ranks` reduction partition, so a row's
+    /// partial does not depend on the other rows of its call.
     EpPackedStaticOrBalanced,
     Unclassified,
 }

@@ -1576,6 +1576,12 @@ pub trait MoeRowGather {
         false
     }
 
+    /// Fixed reduction partition `(rank, ranks)` of this call's layer: the combine must fold
+    /// only experts with `e % ranks == rank` (others +0 in place). `None` (default): no partition.
+    fn reduction_partition(&self, _layer_idx: u16) -> Option<(usize, usize)> {
+        None
+    }
+
     /// Rewrite the layer's live expert tables and slot owners from
     /// `topk_indices` (`slots = rows * k`). Runs after routing, before the
     /// first routed-table reader of the same call.
