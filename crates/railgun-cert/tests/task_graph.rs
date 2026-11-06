@@ -202,6 +202,32 @@ fn real_templates_carry_their_hidden_grid_words() {
     }
 }
 
+/// Template 13 (`ar_hc_write_s_f32s_gfx1201`) writes `mixed_dbg` (kernarg +72) only under
+/// `if (mixed_dbg)`: A1 proves that pointer `null_guarded`. The only other pointer of any
+/// pool with the property is template 15's (`ar_hc_write_d8_f32s_gfx1201`) `mixed_dbg` at
+/// +40, guarded the same way; every other template pointer is not, so its record is
+/// byte-identical to before (the field is skipped when false).
+#[test]
+fn the_ar_hc_debug_pointers_are_null_guarded() {
+    let guarded = [("b256", 13, 72), ("b256", 15, 40)];
+    for &(name, symbol, _) in POOLS {
+        let (refusals, partial) = prove(name, symbol);
+        assert!(refusals.is_empty(), "{name}: {refusals:#?}");
+        for t in &partial.expect("proof").arena.templates {
+            for p in &t.pointer_loads {
+                let want = guarded.contains(&(name, t.template, p.record_offset));
+                assert_eq!(
+                    p.null_guarded, want,
+                    "{name} t{} +{}",
+                    t.template, p.record_offset
+                );
+                let json = serde_json::to_string(p).expect("json");
+                assert_eq!(json.contains("null_guarded"), want, "{json}");
+            }
+        }
+    }
+}
+
 /// Every obligation holds on the OR-poison pools: a conditional record per pool.
 #[test]
 fn real_pools_are_certified() {

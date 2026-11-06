@@ -8,8 +8,8 @@
 //!
 //! The ordinary plan derives a hazard edge for every RAW/WAR/WAW between
 //! nodes and answers it with a `WaitIdle` boundary: between two pools that
-//! deadlocks the window. A group changes the plan in exactly two ways and
-//! admits nothing for free:
+//! deadlocks the window. A group (of one pool, which has no inside edges, or
+//! several) changes the plan in exactly two ways and admits nothing for free:
 //!
 //! - **Outside edges** are unchanged and checked up front. Before the group's
 //!   first member the plan emits the join of *every* member's edges against
@@ -438,21 +438,26 @@ pub(crate) fn classify(
 impl KernelProgram {
     /// Declare nodes `nodes` a co-resident group: they run concurrently, so
     /// [`crate::plan::plan`] puts no boundary between them (see the module
-    /// docs). Refused (the program is unchanged) unless there are at least
-    /// two members, in bounds, every one PM4, disjoint from every other group
+    /// docs). Refused (the program is unchanged) unless there is at least
+    /// one member, in bounds, every one PM4, disjoint from every other group
     /// and from every conditional body, and every [`OrderedEdge`] of
     /// `ordering` is real: distinct members, its `event` declared
     /// `EventCells`, the producer holds an `AtomicRelease` on the event
     /// ("missing release" otherwise), the consumer a `LoadAcquire`
     /// ("missing acquire"), and the producer writes the resource.
+    ///
+    /// A one-member group is a degenerate persistent program (a single
+    /// pool): no member-member edges, but its residency proof is still
+    /// required ([`Pm4Plan::admit_residency`]) and its ordering's task-graph
+    /// coverage, span count and pending reasons attach as for a larger group.
     pub fn add_coresident_group(
         &mut self,
         nodes: Range<usize>,
         ordering: GroupOrdering,
     ) -> Result<(), String> {
-        if nodes.len() < 2 {
+        if nodes.is_empty() {
             return Err(format!(
-                "co-resident group {nodes:?} needs at least two nodes"
+                "co-resident group {nodes:?} needs at least one node"
             ));
         }
         if nodes.end > self.nodes.len() {
@@ -921,7 +926,14 @@ mod tests {
     #[test]
     fn group_shape_is_validated() {
         let mut p = ordered_program();
-        assert!(p.add_coresident_group(0..1, GroupOrdering::none()).is_err());
+        assert!(p.add_coresident_group(0..0, GroupOrdering::none()).is_err());
+        // A one-pool group is a degenerate group (it still needs a residency
+        // proof, like any other).
+        let mut single = p.clone();
+        single
+            .add_coresident_group(0..1, GroupOrdering::none())
+            .unwrap();
+        assert_eq!(single.groups[0].nodes, 0..1);
         assert!(p.add_coresident_group(0..5, GroupOrdering::none()).is_err());
         p.nodes[1].lowering = Lowering::HipDirect { reason: "x".into() };
         assert!(p.add_coresident_group(0..2, GroupOrdering::none()).is_err());

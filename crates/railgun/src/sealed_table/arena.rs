@@ -65,6 +65,7 @@ fn pool_facts(bound: TableBound) -> Arc<NodeFacts> {
                 pointer_loads: vec![ArenaPointerLoad {
                     record_offset: 0,
                     classes: vec![SmemLoad],
+                    null_guarded: false,
                 }],
                 sealed: vec![sealed_fact(bound)],
                 wg_footprints: Vec::new(),
@@ -107,6 +108,7 @@ fn record(p: &KernelProgram, scalars: Vec<(u32, u32)>) -> BindingRecord {
             resource: res(p, st::TABLE),
             interior: 0,
         }],
+        nulls: Vec::new(),
         scalars,
     }
 }
@@ -468,6 +470,7 @@ fn a_writer_added_by_the_same_or_a_later_bind_refuses() {
         pointer_loads: vec![ArenaPointerLoad {
             record_offset: 0,
             classes: vec![VmemStore],
+            null_guarded: false,
         }],
         sealed: Vec::new(),
         wg_footprints: Vec::new(),
@@ -494,6 +497,7 @@ fn a_writer_added_by_the_same_or_a_later_bind_refuses() {
             resource: res(&p, st::W1),
             interior: 0,
         }],
+        nulls: Vec::new(),
         scalars: Vec::new(),
     };
     let err = p

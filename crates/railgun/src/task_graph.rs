@@ -216,6 +216,7 @@ pub fn span_table_records(spans: &[SpanDescriptor]) -> Result<Vec<BindingRecord>
         base: 0,
         template: SPAN_HEADER_TEMPLATE,
         fields: Vec::new(),
+        nulls: Vec::new(),
         scalars: vec![(0, n)],
     }];
     for (i, s) in spans.iter().enumerate() {
@@ -232,6 +233,7 @@ pub fn span_table_records(spans: &[SpanDescriptor]) -> Result<Vec<BindingRecord>
                 field(8, s.count),
                 field(16, s.bitmap),
             ],
+            nulls: Vec::new(),
             scalars: vec![(24, s.k), (28, 0)],
         });
     }
@@ -1559,6 +1561,16 @@ impl TaskGraph {
             obligations
                 .push("lab: dispatcher protocol and per-template effects are pending".into());
         }
+        // Evidence: pointer loads admitted at declared null record fields.
+        for pool in &self.pools {
+            let node = &program.nodes[pool.node];
+            for n in node.arena.iter().flat_map(|a| a.null_guarded.iter()) {
+                obligations.push(format!(
+                    "node {} ({}): template {} loads a pointer at record +{}, a declared null field, admitted with no effect on the certificate's null_guarded fact (every access through it is control-dependent on a nonzero test of that field)",
+                    pool.node, node.symbol, n.template, n.record_offset
+                ));
+            }
+        }
         if !spans.is_empty() {
             let cells: Vec<String> = spans
                 .iter()
@@ -2217,6 +2229,20 @@ impl TaskGraph {
                     )
                 })?;
                 for load in loads {
+                    if record.nulls.contains(&load.record_offset)
+                        && !record.fields.iter().any(|f| f.offset == load.record_offset)
+                    {
+                        // A declared null pointer: no resource, no effect, if A1
+                        // proved every access through it is guarded by a nonzero
+                        // test (`bind_records` checks the same for receipt facts).
+                        if !load.null_guarded {
+                            return Err(format!(
+                                "{what}: null field +{} of template {}: no null-guard proof",
+                                load.record_offset, record.template
+                            ));
+                        }
+                        continue;
+                    }
                     let field = record
                         .fields
                         .iter()

@@ -989,6 +989,7 @@ mod tests {
             read_cache: String::new(),
             sinks: vec![],
             loaded: true,
+            null_guarded: false,
         }
     }
 

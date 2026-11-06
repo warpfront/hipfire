@@ -472,6 +472,7 @@ fn pointer_loads(facts: &KernargFacts) -> Vec<ArenaPointerRecord> {
             ArenaPointerRecord {
                 record_offset: r.offset,
                 classes: r.classes,
+                null_guarded: r.null_guarded,
             }
         })
         .collect();
@@ -1147,6 +1148,7 @@ fn template_from_standalone(
         .map(|a| ArenaPointerRecord {
             record_offset: a.offset,
             classes: a.classes.clone(),
+            null_guarded: a.null_guarded,
         })
         .collect();
     for s in &sealed {
@@ -1157,6 +1159,7 @@ fn template_from_standalone(
             loads.push(ArenaPointerRecord {
                 record_offset: s.table_arg_offset,
                 classes,
+                null_guarded: false,
             });
         }
     }
@@ -1550,6 +1553,7 @@ fn span_arena(span: &protocol::SpanProof) -> DescriptorArenaRecord {
             ArenaPointerRecord {
                 record_offset: field,
                 classes,
+                null_guarded: false,
             }
         })
         .collect();
@@ -2003,6 +2007,7 @@ mod sealed_tests {
             read_cache: "not_read".into(),
             sinks: vec![],
             loaded: true,
+            null_guarded: false,
         }
     }
 

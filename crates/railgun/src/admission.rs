@@ -801,6 +801,7 @@ mod lab_tests {
                     interior: 0,
                 },
             ],
+            nulls: Vec::new(),
             scalars: Vec::new(),
         };
         p.bind_records(ResourceId(0), vec![rec], &SealedTableRegistry::new())

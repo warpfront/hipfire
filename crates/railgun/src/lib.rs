@@ -182,9 +182,9 @@ pub const EVENT_CELL_BYTES: u64 = 16;
 pub const LIVE_ENTRY_BYTES: u64 = 16;
 
 /// One record of a [`ResourceKind::BindingRecords`] arena: an instance of
-/// `template` at `base`, whose pointer `fields` and `u32` `scalars` railgun
-/// writes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `template` at `base`, whose pointer `fields`, declared `nulls` and `u32`
+/// `scalars` railgun writes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BindingRecord {
     /// Byte offset of the record in the arena.
     pub base: u64,
@@ -192,6 +192,19 @@ pub struct BindingRecord {
     /// from it (`ArenaFact::templates`).
     pub template: u32,
     pub fields: Vec<BindingField>,
+    /// Declared **null** pointer fields: record-relative byte offsets
+    /// (8-aligned) where railgun writes the 8 bytes `0` (and reads them back).
+    /// A template's pointer load at one of them is admitted with **no effect
+    /// on any resource**, and only if the template's facts say the load is
+    /// `null_guarded` ([`kernel::ArenaPointerLoad::null_guarded`]): A1 proved
+    /// every access through the pointer is control-dependent on a test of
+    /// that same field against zero, so with the field zero the body makes no
+    /// access through it. An unguarded load at a null field is refused ("no
+    /// null-guard proof"). `bind_records` records each admitted load
+    /// ([`kernel::ArenaNode::null_guarded`]) and the task-graph proof lists it
+    /// among its obligations. Never overlaps a pointer field, another null or
+    /// a scalar of the record.
+    pub nulls: Vec<u32>,
     /// Declared `u32` scalar fields, `(record-relative byte offset
     /// (4-aligned), value)`, written by railgun exactly like the pointer
     /// fields. A certified kernel may bound a sealed-table index by one of
@@ -213,11 +226,14 @@ pub struct BindingField {
 
 /// What railgun writes into a binding-record arena
 /// ([`KernelProgram::binding_record_image`]): the little-endian bytes of
-/// every declared pointer field and scalar, by arena byte offset.
+/// every declared pointer field, null field and scalar, by arena byte offset.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BindingRecordImage {
     /// `(arena byte offset, pointer value)`, sorted by offset.
     pub pointers: Vec<(u64, u64)>,
+    /// Arena byte offsets of the declared null fields (8 zero bytes each),
+    /// sorted.
+    pub nulls: Vec<u64>,
     /// `(arena byte offset, value)`, sorted by offset.
     pub scalars: Vec<(u64, u32)>,
 }
@@ -231,6 +247,11 @@ impl BindingRecordImage {
             .iter()
             .map(|&(at, v)| (at, v.to_le_bytes().to_vec()))
             .chain(
+                self.nulls
+                    .iter()
+                    .map(|&at| (at, 0u64.to_le_bytes().to_vec())),
+            )
+            .chain(
                 self.scalars
                     .iter()
                     .map(|&(at, v)| (at, v.to_le_bytes().to_vec())),
@@ -240,9 +261,9 @@ impl BindingRecordImage {
         out
     }
 
-    /// Number of fields (pointers plus scalars).
+    /// Number of fields (pointers, nulls and scalars).
     pub fn len(&self) -> usize {
-        self.pointers.len() + self.scalars.len()
+        self.pointers.len() + self.nulls.len() + self.scalars.len()
     }
 
     pub fn is_empty(&self) -> bool {

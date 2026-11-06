@@ -1241,6 +1241,10 @@ struct Rec {
     sealed_accesses: Vec<TableAccessRec>,
     /// Write accesses attributed to an argument, with their address witnesses.
     wsites: BTreeMap<InstId, WriteSite>,
+    /// Must-facts (scalar, lane) at every attributed access (workgroup replay).
+    nfacts: BTreeMap<InstId, (Vec<(Ix, bool)>, Vec<(Ix, bool)>)>,
+    /// Declared arguments proved `null_guarded`.
+    null_args: BTreeSet<Target>,
 }
 impl Rec {
     fn new(loaded: DwSet) -> Self {
@@ -1259,6 +1263,8 @@ impl Rec {
             sealed_entries: BTreeMap::new(),
             sealed_accesses: Vec::new(),
             wsites: BTreeMap::new(),
+            nfacts: BTreeMap::new(),
+            null_args: BTreeSet::new(),
         }
     }
     fn sink(&mut self, taint: DwSet, tf: u8, bit: u8) {
@@ -1640,6 +1646,21 @@ fn analyze_core(
             sealed_uses = an.assemble_sealed(&rec);
         }
     }
+    if wg {
+        rec.null_args = an.null_guarded_args(&rec);
+    }
+    // The plain analysis has no must-facts: a kernel that tests a 64-bit
+    // kernarg against zero is replayed once more with them for `null_guarded`.
+    let probe_null = !wg
+        && !sealed
+        && guards.is_none()
+        && an.decoded.iter().flatten().any(|d| {
+            d.parts.len() == 1
+                && matches!(
+                    norm_name(d.parts[0].name).as_str(),
+                    "s_cmp_lg_u64" | "s_cmp_eq_u64"
+                )
+        });
     rejected.append(&mut rec.unresolved);
     facts.unresolved = rejected;
     let supplied = an.guard.take().map(|g| g.supplied).unwrap_or_default();
@@ -1654,10 +1675,19 @@ fn analyze_core(
         it: an.ix.take(),
         sites: std::mem::take(&mut rec.wsites),
     };
-    (
-        finish(facts, &layout, Some(rec), &supplied, sealed_uses),
-        Some(wg),
-    )
+    let mut out = finish(facts, &layout, Some(rec), &supplied, sealed_uses);
+    if probe_null && out.status != KernelStatus::Unknown {
+        let (replay, _) = analyze_core(kernel, arch, None, false, excluded, true, budget);
+        for a in &mut out.args {
+            a.null_guarded = replay.args.iter().any(|b| {
+                b.null_guarded
+                    && b.offset == a.offset
+                    && b.index == a.index
+                    && b.accesses == a.accesses
+            });
+        }
+    }
+    (out, Some(wg))
 }
 
 /// The result of an analysis stopped by its work bound: `Unknown`, with the measured counts
@@ -2468,7 +2498,8 @@ impl<'k> Analyzer<'k> {
         }
         match name.as_str() {
             "s_and_b32" | "s_or_b32" => {
-                let (a, b) = (src_ix(0, it), src_ix(1, it));
+                let (a0, b0) = (src_ix(0, it), src_ix(1, it));
+                let (a, b) = (null_lane_mask(it, a0), null_lane_mask(it, b0));
                 let r = if name == "s_and_b32" {
                     it.mask_and(a, b)
                 } else {
@@ -2486,7 +2517,8 @@ impl<'k> Analyzer<'k> {
                 }
             }
             "s_and_saveexec_b32" => {
-                let x = src_ix(0, it);
+                let x0 = src_ix(0, it);
+                let x = null_lane_mask(it, x0);
                 out.push((LaneTgt::Exec, it.mask_and(exec_ix, x)));
                 if let Some(LaneTgt::S(i)) = part
                     .fields
@@ -3683,6 +3715,7 @@ impl<'k> Analyzer<'k> {
                         addr,
                         access_width(name),
                     );
+                    self.note_facts(st, dec, rec);
                 }
                 if let Some(d) = dst {
                     self.write(st, d.op, &vals);
@@ -3863,6 +3896,7 @@ impl<'k> Analyzer<'k> {
                         addr,
                         access_width(name),
                     );
+                    self.note_facts(st, dec, rec);
                     if let Some(site) = rec.wsites.get_mut(&dec.id) {
                         site.facts = st.facts.clone();
                         site.lane_facts = self.lane_facts_of(st);
@@ -5046,6 +5080,63 @@ impl<'k> Analyzer<'k> {
     }
 }
 
+impl<'k> Analyzer<'k> {
+    /// A1 `null_guarded` (workgroup-footprint replay only: it needs the
+    /// must-facts of [`State::facts`]/[`State::lane_facts`], which add the
+    /// facts of every branch edge and drop them at a join the guard does not
+    /// dominate). A declared 8-byte pointer argument is `null_guarded` when it
+    /// has at least one access and, at every one, the facts holding on every
+    /// path to it include "the 64-bit kernarg value is nonzero" (the edge of
+    /// an exact `s_cmp_lg/eq_u64 w, 0` that is taken only for `w != 0`,
+    /// possibly through an SCC mask copy and an EXEC mask). The facts are over
+    /// the immutable witness `K64(offset)`, so a register redefined after the
+    /// test cannot carry the guard to another value; a base derived from another
+    /// argument is attributed to that argument, not this one.
+    fn null_guarded_args(&self, rec: &Rec) -> BTreeSet<Target> {
+        let mut out = BTreeSet::new();
+        for (target, accesses) in &rec.accesses {
+            let Target::Declared(i) = *target else {
+                continue;
+            };
+            let arg = &self.layout.args[i];
+            if accesses.is_empty() || arg.size != 8 || arg.offset % 8 != 0 {
+                continue;
+            }
+            let w = {
+                let mut it = self.ix.borrow_mut();
+                let (lo, hi) = (it.k32(arg.offset), it.k32(arg.offset + 4));
+                it.as64(lo, hi)
+            };
+            if w.is_none() {
+                continue;
+            }
+            let it = self.ix.borrow();
+            let nonzero = |&(f, pol): &(Ix, bool)| match it.node(f) {
+                Some(Node::Zero64(x)) => !pol && x == w,
+                Some(Node::Not(g)) => pol && matches!(it.node(g), Some(Node::Zero64(x)) if x == w),
+                _ => false,
+            };
+            let all = accesses.iter().all(|a| {
+                rec.nfacts
+                    .get(&a.inst)
+                    .is_some_and(|(s, l)| s.iter().any(nonzero) || l.iter().any(nonzero))
+            });
+            if all {
+                out.insert(*target);
+            }
+        }
+        out
+    }
+
+    /// Record the must-facts holding at an attributed access.
+    fn note_facts(&self, st: &State, dec: &Dec, rec: &mut Rec) {
+        if self.wgf {
+            rec.nfacts
+                .insert(dec.id, (st.facts.clone(), self.lane_facts_of(st)));
+        }
+    }
+}
+
 /// The exact scalar results the sealed analysis adds to one instruction's
 /// ordinary transfer (see [`Analyzer::sealed_scalar`]).
 #[derive(Default)]
@@ -5089,6 +5180,25 @@ struct GuardWalk {
     steps: usize,
     err: Option<&'static str>,
     goal: Goal,
+}
+
+/// A uniform all-ones/zero mask of "a 64-bit kernarg value is nonzero"
+/// (`s_cmp_lg_u64 w, 0; s_cselect_b32 m, -1, 0`) as the lane mask whose set
+/// lanes satisfy that fact (`null_guarded`); any other value is unchanged.
+fn null_lane_mask(it: &mut Interner, ix: Ix) -> Ix {
+    let Some(Node::Mask(f)) = it.node(ix) else {
+        return ix;
+    };
+    let mut facts = Vec::new();
+    it.assume(f, true, &mut facts);
+    if facts
+        .iter()
+        .any(|&(a, _)| matches!(it.node(a), Some(Node::Zero64(_))))
+    {
+        it.lane_mask(facts, None)
+    } else {
+        ix
+    }
 }
 
 fn other_is_negative(op: &Operand) -> bool {
@@ -5379,6 +5489,7 @@ fn finish(
             accesses,
             sinks,
             loaded: was_loaded,
+            null_guarded: rec.null_args.contains(&target),
         }
     };
     let mut args: Vec<ArgFacts> = layout
@@ -6717,5 +6828,77 @@ mod tests {
             .accesses
             .iter()
             .any(|a| a.class == AccessClass::VmemLoad));
+    }
+
+    // `null_guarded` (declared pointer arguments). Kernels assembled with
+    // llvm-mc (gfx1201, wave32): `dbg` at +8 and `other` at +16 are loaded into
+    // s[4:5] / s[6:7]; stores go through `global_store_b32 v0, v1, s[4:5]`.
+    const NG_ARGS: &[(&str, u32, u32, &str)] = &[
+        ("out", 0, 8, "global_buffer"),
+        ("dbg", 8, 8, "global_buffer"),
+        ("other", 16, 8, "global_buffer"),
+    ];
+    const NG_LOADS: [u32; 5] = [0xf4002100, 0xf8000008, 0xf4002180, 0xf8000010, 0xbfc70000];
+    const NG_STORE: [u32; 3] = [0xee068004, 0x00800000, 0x00000000];
+    const NG_STORE_4: [u32; 3] = [0xee068004, 0x00800000, 0x00000400];
+    const NG_END: u32 = 0xbfb00000;
+    fn ng(parts: &[&[u32]]) -> Vec<u32> {
+        let mut w = NG_LOADS.to_vec();
+        for p in parts {
+            w.extend_from_slice(p);
+        }
+        w.push(NG_END);
+        w
+    }
+    fn null_guarded(words: &[u32], offset: u32) -> bool {
+        let f = analyze(&kernel(words, NG_ARGS), Arch::Gfx1201);
+        assert_eq!(f.status, KernelStatus::Proven, "{:?}", f.unresolved);
+        f.arg_at(offset).expect("argument").null_guarded
+    }
+
+    #[test]
+    fn an_access_dominated_by_the_nonzero_edge_of_the_argument_test_is_null_guarded() {
+        // s_cmp_lg_u64 s[4:5], 0; s_cbranch_scc0 over the store.
+        let lg = ng(&[&[0xbf118004, 0xbfa10003], &NG_STORE]);
+        assert!(null_guarded(&lg, 8));
+        // s_cmp_eq_u64 s[4:5], 0; s_cbranch_scc1 over the store.
+        let eq = ng(&[&[0xbf108004, 0xbfa20003], &NG_STORE]);
+        assert!(null_guarded(&eq, 8));
+        // The other arguments carry no access, so no property.
+        assert!(!null_guarded(&lg, 0) && !null_guarded(&lg, 16));
+        // A load and a store under the same guard.
+        let both = ng(&[
+            &[0xbf118004, 0xbfa10006],
+            &[0xee050004, 0x00000002, 0x00000000],
+            &NG_STORE,
+        ]);
+        assert!(null_guarded(&both, 8));
+    }
+
+    #[test]
+    fn near_misses_of_the_null_guard_are_not_null_guarded() {
+        // No test at all.
+        assert!(!null_guarded(&ng(&[&NG_STORE]), 8));
+        // The test is of another argument.
+        let other = ng(&[&[0xbf118006, 0xbfa10003], &NG_STORE]);
+        assert!(!null_guarded(&other, 8));
+        // The guard dominates the first store only: the NULL path rejoins and
+        // reaches the second store without passing the nonzero edge.
+        let join = ng(&[&[0xbf118004, 0xbfa10003], &NG_STORE, &NG_STORE_4]);
+        assert!(!null_guarded(&join, 8));
+        // The branch jumps the wrong way: the store is reached on the NULL edge.
+        let inverted = ng(&[&[0xbf118004, 0xbfa20003], &NG_STORE]);
+        assert!(!null_guarded(&inverted, 8));
+        // The register is redefined (another argument's value) after the test:
+        // the store is an access of that argument, which was never tested.
+        let redef = ng(&[&[0xbf118004, 0xbfa10004, 0xbe840106], &NG_STORE]);
+        assert!(!null_guarded(&redef, 8));
+        assert!(!null_guarded(&redef, 16));
+    }
+
+    #[test]
+    fn a_kernel_without_a_u64_zero_test_replays_nothing_and_stays_unguarded() {
+        let f = analyze(&kernel(&ng(&[&NG_STORE]), NG_ARGS), Arch::Gfx1201);
+        assert!(f.args.iter().all(|a| !a.null_guarded));
     }
 }

@@ -222,6 +222,10 @@ pub struct ArgFacts {
     /// A4: union over the argument's dwords.
     pub sinks: Sinks,
     pub loaded: bool,
+    /// Every access attributed to this argument executes only on a path where
+    /// the argument's 64-bit value was tested nonzero (a NULL argument reaches
+    /// none of them). False when the argument has no access.
+    pub null_guarded: bool,
 }
 impl ArgFacts {
     pub fn classes(&self) -> Vec<AccessClass> {

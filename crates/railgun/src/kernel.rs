@@ -240,6 +240,11 @@ pub struct ArenaPointerLoad {
     /// Sorted, deduplicated; empty when the pointer is loaded and never
     /// dereferenced.
     pub classes: Vec<MemClass>,
+    /// A1 proved every access through this pointer is control-dependent on a
+    /// test of the same record field against zero (the receipt's
+    /// `null_guarded`): the field may be a declared null
+    /// ([`crate::BindingRecord::nulls`]).
+    pub null_guarded: bool,
 }
 
 /// Writes through the pointer at `record_offset` by two workgroups `w != w'`
@@ -561,6 +566,7 @@ fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, St
                 pointer_loads.push(ArenaPointerLoad {
                     record_offset: p.record_offset,
                     classes,
+                    null_guarded: p.null_guarded,
                 });
             }
             templates.push(ArenaTemplate {
@@ -1331,6 +1337,10 @@ pub struct ArenaNode {
     /// all carry a zero bound). A node with any needs the `sealed_table`
     /// witness of a window bind ([`KernelNode::needs_sealed_table_witness`]).
     pub sealed: Vec<ArenaSealedBinding>,
+    /// The null-guarded pointer loads `bind_records` admitted at declared
+    /// null record fields: the evidence that no access goes through them
+    /// without a nonzero test (sorted, deduplicated).
+    pub null_guarded: Vec<ArenaNullLoad>,
     /// The receipt's required witness kinds (digest-bound).
     pub witnesses: Vec<String>,
     pub case_digest: String,
@@ -1340,6 +1350,17 @@ impl ArenaNode {
     pub fn all_bound(&self) -> bool {
         self.bound.iter().all(|b| *b)
     }
+}
+
+/// A pointer load at a declared null field ([`crate::BindingRecord::nulls`])
+/// that `bind_records` admitted with no effect because the template's facts
+/// prove it `null_guarded`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ArenaNullLoad {
+    /// Index into [`ArenaNode::arenas`].
+    pub arena: usize,
+    pub template: u32,
+    pub record_offset: u32,
 }
 
 /// One sealed pointer table of an arena template, as
@@ -1776,6 +1797,7 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
                     task_protocol: c.task_protocol.clone(),
                     bound: vec![false; c.arenas.len()],
                     sealed: Vec::new(),
+                    null_guarded: Vec::new(),
                     witnesses: c.witnesses.clone(),
                     case_digest: c.case_digest.clone(),
                 }),

@@ -815,16 +815,18 @@ impl Gpu {
         Ok(())
     }
 
-    /// Write the pointer fields and declared `u32` scalars of binding-record
-    /// arena `arena` of `program` (`KernelProgram::binding_record_image` over
-    /// the authored bindings: each pointer field is `base(resource) +
-    /// interior`, each scalar its declared value) into the arena's device
-    /// allocation, then read every field back and compare. The arena's
+    /// Write the pointer fields, declared null fields and declared `u32`
+    /// scalars of binding-record arena `arena` of `program`
+    /// (`KernelProgram::binding_record_image` over the authored bindings:
+    /// each pointer field is `base(resource) + interior`, each null field 8
+    /// zero bytes, each scalar its declared value) into the arena's device
+    /// allocation, then read every field back and compare (a null field must
+    /// read back as zero). The arena's
     /// binding must be exactly the live allocation HIP reports for its base.
     /// Fields are written at their arena offsets, adjacent ones in one copy;
     /// the other bytes of the records are the caller's. Returns the number
-    /// of fields (pointers plus scalars) written; any readback mismatch is
-    /// an `Err`.
+    /// of fields (pointers, nulls and scalars) written; any readback
+    /// mismatch is an `Err`.
     /// Refused inside plan mode.
     pub fn railgun_write_binding_records(
         &self,

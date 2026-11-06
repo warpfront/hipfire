@@ -273,6 +273,7 @@ fn arg_record(a: &ArgFacts) -> ArgRecord {
         read_cache: read_cache_name(a.read_cache).into(),
         sinks: a.sinks.names().into_iter().map(str::to_owned).collect(),
         loaded: a.loaded,
+        null_guarded: a.null_guarded,
     }
 }
 

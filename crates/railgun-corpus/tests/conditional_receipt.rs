@@ -76,6 +76,7 @@ fn arg(offset: u32, size: u32, role: &str, mode: Option<&str>) -> ArgRecord {
         read_cache: "not_read".into(),
         sinks: vec![],
         loaded: true,
+        null_guarded: false,
     }
 }
 

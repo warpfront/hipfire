@@ -97,43 +97,52 @@ fn template(id: u32) -> ArenaTemplate {
             L {
                 record_offset: 0,
                 classes: vec![VmemLoad],
+                null_guarded: false,
             },
             L {
                 record_offset: 8,
                 classes: vec![VmemStore],
+                null_guarded: false,
             },
         ],
         T_READ => vec![L {
             record_offset: 0,
             classes: vec![VmemLoad],
+            null_guarded: false,
         }],
         T_NOP => vec![],
         T_WRITE => vec![L {
             record_offset: 8,
             classes: vec![VmemStore],
+            null_guarded: false,
         }],
         T_TILE_X | T_TILE_XY | T_TILE_B | T_TILE_R | T_TILE_Q | T_HID | T_HIDU | T_LE_OK
         | T_LE_BAD | T_GE_BAD | T_GRID_LE | T_TILE_Y | T_TILE_Z | T_TILE_XZ | T_TILE_YZ
         | T_TILE_XYZ => vec![L {
             record_offset: 8,
             classes: vec![VmemStore],
+            null_guarded: false,
         }],
         T_ATOM => vec![L {
             record_offset: 8,
             classes: vec![AtomicCommutative],
+            null_guarded: false,
         }],
         T_SEALED => vec![L {
             record_offset: 0,
             classes: vec![SmemLoad],
+            null_guarded: false,
         }],
         T_PROD => vec![
             L {
                 record_offset: 0,
                 classes: vec![VmemStore],
+                null_guarded: false,
             },
             L {
                 record_offset: 8,
                 classes: vec![AtomicCommutative],
+                null_guarded: false,
             },
         ],
         other => panic!("no template {other}"),
@@ -625,6 +634,7 @@ fn build_with(
                     interior: 0,
                 })
                 .collect(),
+            nulls: Vec::new(),
             scalars: if *template == T_SEALED {
                 vec![(SEALED_BOUND_AT, SEALED_N)]
             } else if matches!(

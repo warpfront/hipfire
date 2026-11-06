@@ -43,6 +43,7 @@ fn span_facts(known: &[u32], protocol: Option<TaskProtocolFact>) -> Arc<NodeFact
     let load = |record_offset, class| ArenaPointerLoad {
         record_offset,
         classes: vec![class],
+        null_guarded: false,
     };
     let template = |template, pointer_loads| ArenaTemplate {
         template,
@@ -156,6 +157,14 @@ impl Spec {
         self
     }
 
+    /// All tasks in pool 0 (one pool node): producer, spans, reader.
+    fn single(mut self) -> Spec {
+        let mut rest = self.pools.split_off(1);
+        self.pools[0].append(&mut rest[0]);
+        self.known = vec![vec![T_PROD, self.records[1].0, T_READ]];
+        self
+    }
+
     fn build(self) -> Result<Fixture, String> {
         let mut launches = vec![launch(
             &[(0, X), (8, Y), (16, Z)],
@@ -215,6 +224,7 @@ impl Spec {
                         interior: 0,
                     })
                     .collect(),
+                nulls: Vec::new(),
                 scalars: Vec::new(),
             })
             .collect();
@@ -305,6 +315,36 @@ fn a_valid_span_is_admitted_with_its_properties_and_counts_in_the_ordering() {
     assert_eq!(plan.groups[0].spans, 1);
     assert_eq!(plan.admission().spans(), 1);
     assert_eq!(plan.groups[0].admission().spans(), 1);
+}
+
+#[test]
+fn null_guarded_loads_admitted_at_declared_null_fields_are_listed_as_evidence() {
+    let mut fx = Spec::std(4, 2, 2).build().unwrap();
+    let plain = fx.check().unwrap();
+    assert!(!plain
+        .obligations
+        .iter()
+        .any(|o| o.contains("declared null")));
+    fx.program.nodes[1]
+        .arena
+        .as_mut()
+        .unwrap()
+        .null_guarded
+        .push(crate::kernel::ArenaNullLoad {
+            arena: 0,
+            template: T_PROD,
+            record_offset: 72,
+        });
+    let proof = fx.check().unwrap();
+    assert!(
+        proof
+            .obligations
+            .iter()
+            .any(|o| o.contains("template 30 loads a pointer at record +72")
+                && o.contains("declared null field")),
+        "{:?}",
+        proof.obligations
+    );
 }
 
 #[test]
@@ -814,12 +854,95 @@ fn a_static_instance_grid_must_fit_the_dispatchers_yz_packing() {
     }
 }
 
+#[test]
+fn a_single_pool_span_program_carries_its_ordering_as_a_one_node_group() {
+    use crate::coresident::GroupOrdering;
+    let fx = Spec::std(4, 2, 2).single().build().unwrap();
+    let proof = fx.check().unwrap();
+    assert_eq!(proof.spans.len(), 1);
+    let mut program = fx.program.clone();
+    assert!(program
+        .add_coresident_group(1..1, GroupOrdering::none())
+        .is_err());
+    program
+        .add_coresident_group(1..2, proof.ordering())
+        .unwrap();
+    assert_eq!(program.groups[0].ordering.task_graph(), Some(&(1..2)));
+    let admission = program.admission();
+    assert!(matches!(
+        &admission,
+        Admission::Spans { base, lists: 1 } if **base == Admission::Certified
+    ));
+    assert!(admission.receipt(None).is_err());
+    let evidence = CompletenessEvidence {
+        producer: "p".into(),
+        oracle: "o".into(),
+        p0_vs_eager: "e".into(),
+    };
+    let receipt = admission
+        .receipt_with_completeness(None, Some(&evidence))
+        .unwrap();
+    assert_eq!(receipt.completeness, Some(COMPLETENESS_FUNCTIONAL));
+    // The plan: no boundary of its own for the lone member, no inside edges,
+    // a residency proof required through the same path.
+    let mut plan = plan(
+        &program,
+        &CacheTable::for_arch("gfx1201").unwrap(),
+        RowPolicy::TierD,
+    );
+    assert_eq!(plan.groups[0].spans, 1);
+    assert_eq!(plan.admission().spans(), 1);
+    assert!(plan.groups[0].refusals.is_empty() && plan.groups[0].admitted.is_empty());
+    assert!(plan
+        .group_admission()
+        .unwrap_err()
+        .contains("no residency proof"));
+    assert!(
+        plan.admit_residency(&program, 0, 8, &[1, 2]).is_err(),
+        "one value per member"
+    );
+    assert!(plan.admit_residency(&program, 0, 8, &[0]).is_err());
+    plan.admit_residency(&program, 0, 8, &[4]).unwrap();
+    plan.group_admission().unwrap();
+    // Without the task-graph coverage the lone pool is still refused.
+    let mut bare = fx.program.clone();
+    bare.add_coresident_group(1..2, GroupOrdering::none())
+        .unwrap();
+    let plan = crate::plan::plan(
+        &bare,
+        &CacheTable::for_arch("gfx1201").unwrap(),
+        RowPolicy::TierD,
+    );
+    assert!(!plan.groups[0].refusals.is_empty());
+}
+
 #[cfg(feature = "lab")]
 mod lab {
     use super::*;
 
     fn pending(fx: &Fixture) -> Result<crate::coresident::GroupOrdering, String> {
         fx.graph.check_pending(&fx.program, fx.group.clone())
+    }
+
+    #[test]
+    fn a_single_pool_lab_program_keeps_its_pending_reasons_and_spans() {
+        let fx = Spec::std(12, 4, 3)
+            .template(T_TILE_X)
+            .single()
+            .build()
+            .unwrap();
+        let ordering = pending(&fx).unwrap();
+        let x = fx.data(X).0;
+        let reason = format!("inter-WG disjointness unproven: template {T_TILE_X}, resource {x}");
+        let mut program = fx.program.clone();
+        program.add_coresident_group(1..2, ordering).unwrap();
+        let Admission::Spans { base, lists: 1 } = program.admission() else {
+            panic!("not a span admission")
+        };
+        let Admission::LabPending { reasons } = *base else {
+            panic!("not lab-pending")
+        };
+        assert!(reasons.iter().any(|r| r.ends_with(&reason)), "{reasons:?}");
     }
 
     #[test]

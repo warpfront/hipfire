@@ -221,6 +221,11 @@ pub struct ArenaPointerRecord {
     /// Record-relative byte offset of the pointer (8-aligned).
     pub record_offset: u32,
     pub classes: Vec<String>,
+    /// A1 `null_guarded` of the standalone argument at this offset: the kernel
+    /// touches memory through the pointer only where it was tested nonzero, so
+    /// a NULL field is admissible. Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub null_guarded: bool,
 }
 
 /// The write footprint of one pointer field `record_offset` of a template:
@@ -879,6 +884,11 @@ pub struct ArgRecord {
     /// A4 sinks over the argument's dwords.
     pub sinks: Vec<String>,
     pub loaded: bool,
+    /// A1: every access through this argument executes only where its 64-bit
+    /// value was tested nonzero (a declared-NULL argument reaches none of
+    /// them). Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub null_guarded: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1206,6 +1216,7 @@ mod tests {
                 pointer_loads: vec![ArenaPointerRecord {
                     record_offset: 16,
                     classes: vec!["vmem_load".into()],
+                    null_guarded: false,
                 }],
                 sealed_tables: vec![],
                 wg_footprints: vec![],

@@ -24,8 +24,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::kernel::{
-    ArenaSealedBinding, Arg, KernelProgram, Lowering, MemClass, RegionEffect, SealedTableFact,
-    TableBound, ARENA_UNBOUND,
+    ArenaNullLoad, ArenaSealedBinding, Arg, KernelProgram, Lowering, MemClass, RegionEffect,
+    SealedTableFact, TableBound, ARENA_UNBOUND,
 };
 use crate::sealed_table::{overlaps, SealedTableError, SealedTableRegistry, MAX_BOUND};
 use crate::{
@@ -286,6 +286,53 @@ impl KernelProgram {
                     })?;
                 end = end.max(scalar_end);
             }
+            let mut null_offsets = BTreeSet::new();
+            for &offset in &rec.nulls {
+                if offset % 8 != 0 {
+                    return Err(format!(
+                        "record @{} null field +{offset}: offset is not 8-byte aligned",
+                        rec.base
+                    ));
+                }
+                if !null_offsets.insert(offset) {
+                    return Err(format!(
+                        "record @{} null field +{offset} is declared twice",
+                        rec.base
+                    ));
+                }
+                if rec
+                    .fields
+                    .iter()
+                    .any(|f| offset < f.offset + 8 && f.offset < offset + 8)
+                {
+                    return Err(format!(
+                        "record @{} null field +{offset} overlaps a pointer field",
+                        rec.base
+                    ));
+                }
+                if rec
+                    .scalars
+                    .iter()
+                    .any(|&(s, _)| offset < s + 4 && s < offset + 8)
+                {
+                    return Err(format!(
+                        "record @{} null field +{offset} overlaps a scalar",
+                        rec.base
+                    ));
+                }
+                let null_end = rec
+                    .base
+                    .checked_add(u64::from(offset))
+                    .and_then(|at| at.checked_add(8))
+                    .filter(|&e| e <= arena_bytes)
+                    .ok_or_else(|| {
+                        format!(
+                            "out-of-bounds descriptor: record @{} null field +{offset} ends past the {arena_bytes}-byte arena {}",
+                            rec.base, arena.0
+                        )
+                    })?;
+                end = end.max(null_end);
+            }
             extents.push((rec.base, end));
         }
         extents.sort_unstable();
@@ -299,8 +346,13 @@ impl KernelProgram {
         // Effects, per node and arena fact, computed before anything changes.
         let mut known_templates: BTreeSet<u32> = BTreeSet::new();
         let mut readers = false;
-        let mut planned: Vec<(usize, usize, Vec<RegionEffect>, Vec<ArenaSealedBinding>)> =
-            Vec::new();
+        let mut planned: Vec<(
+            usize,
+            usize,
+            Vec<RegionEffect>,
+            Vec<ArenaSealedBinding>,
+            Vec<ArenaNullLoad>,
+        )> = Vec::new();
         for (i, node) in self.nodes.iter().enumerate() {
             let Some(arena_node) = &node.arena else {
                 continue;
@@ -316,6 +368,7 @@ impl KernelProgram {
                 readers = true;
                 let mut per_resource: BTreeMap<ResourceId, BTreeSet<MemClass>> = BTreeMap::new();
                 let mut bindings: Vec<ArenaSealedBinding> = Vec::new();
+                let mut null_loads: Vec<ArenaNullLoad> = Vec::new();
                 for t in &fact.templates {
                     known_templates.insert(t.template);
                     for rec in records.iter().filter(|r| r.template == t.template) {
@@ -323,6 +376,23 @@ impl KernelProgram {
                             let Some(field) =
                                 rec.fields.iter().find(|f| f.offset == load.record_offset)
                             else {
+                                if rec.nulls.contains(&load.record_offset) {
+                                    // A declared null: no resource, so no effect, but only
+                                    // where A1 proved every access through the pointer is
+                                    // control-dependent on a nonzero test of this field.
+                                    if !load.null_guarded {
+                                        return Err(format!(
+                                            "null field +{} of template {}: no null-guard proof (node {i} ({}), record @{})",
+                                            load.record_offset, t.template, node.symbol, rec.base
+                                        ));
+                                    }
+                                    null_loads.push(ArenaNullLoad {
+                                        arena: k,
+                                        template: t.template,
+                                        record_offset: load.record_offset,
+                                    });
+                                    continue;
+                                }
                                 return Err(format!(
                                     "undeclared arena entry: node {i} ({}) loads a pointer at +{} of template {}, which is not a declared field of the record @{}",
                                     node.symbol, load.record_offset, t.template, rec.base
@@ -384,7 +454,9 @@ impl KernelProgram {
                         classes: classes.into_iter().collect(),
                     });
                 }
-                planned.push((i, k, effects, bindings));
+                null_loads.sort_unstable();
+                null_loads.dedup();
+                planned.push((i, k, effects, bindings, null_loads));
             }
         }
         if readers {
@@ -409,14 +481,14 @@ impl KernelProgram {
             .iter()
             .filter_map(|n| n.arena.as_ref())
             .flat_map(|a| a.sealed.iter())
-            .chain(planned.iter().flat_map(|(_, _, _, b)| b.iter()))
+            .chain(planned.iter().flat_map(|(_, _, _, b, _)| b.iter()))
         {
             protected.insert(b.resource, "table allocation");
             for p in &b.pointees {
                 protected.entry(*p).or_insert("pointee allocation");
             }
         }
-        for (i, _, effects, _) in &planned {
+        for (i, _, effects, _, _) in &planned {
             if let Some(e) = effects
                 .iter()
                 .find(|e| e.writes() && protected.contains_key(&e.resource))
@@ -427,7 +499,7 @@ impl KernelProgram {
                 ));
             }
         }
-        for (i, k, effects, bindings) in planned {
+        for (i, k, effects, bindings, null_loads) in planned {
             let node = &mut self.nodes[i];
             node.effects.extend(effects);
             let Some(arena_node) = node.arena.as_mut() else {
@@ -435,6 +507,9 @@ impl KernelProgram {
             };
             arena_node.bound[k] = true;
             arena_node.sealed.extend(bindings);
+            arena_node.null_guarded.extend(null_loads);
+            arena_node.null_guarded.sort_unstable();
+            arena_node.null_guarded.dedup();
             if !arena_node.all_bound() {
                 continue;
             }
@@ -688,8 +763,9 @@ impl KernelProgram {
     /// ([`BindingRecordImage`]): `(arena byte offset, pointer value)` per
     /// pointer field, where the value is `base(field.resource) + interior`
     /// under `resources` (the authored [`KernelProgram::resources`], or a
-    /// window's live bindings), and `(arena byte offset, value)` per declared
-    /// `u32` scalar; both sorted by offset. Checked arithmetic; a field or
+    /// window's live bindings), `at` for each declared null field (written as
+    /// 8 zero bytes) and `(arena byte offset, value)` per declared
+    /// `u32` scalar; all sorted by offset. Checked arithmetic; a field or
     /// scalar whose interior or whose slot falls outside the given bindings,
     /// or that overlaps another write, is an "out-of-bounds descriptor". The
     /// writer of the arena uses exactly this image.
@@ -736,6 +812,19 @@ impl KernelProgram {
                     .ok_or_else(|| "pointer overflows".to_owned())?;
                 image.pointers.push((at, value));
             }
+            for &offset in &rec.nulls {
+                let at = rec
+                    .base
+                    .checked_add(u64::from(offset))
+                    .filter(|at| at.checked_add(8).is_some_and(|e| e <= arena_bytes))
+                    .ok_or_else(|| {
+                        format!(
+                            "out-of-bounds descriptor: record @{} null field +{offset} past the {arena_bytes}-byte arena",
+                            rec.base
+                        )
+                    })?;
+                image.nulls.push(at);
+            }
             for &(offset, value) in &rec.scalars {
                 let at = rec
                     .base
@@ -751,6 +840,7 @@ impl KernelProgram {
             }
         }
         image.pointers.sort_unstable();
+        image.nulls.sort_unstable();
         image.scalars.sort_unstable();
         let writes = image.writes();
         if let Some(w) = writes
@@ -814,6 +904,7 @@ mod tests {
                 .map(|&(record_offset, classes)| ArenaPointerLoad {
                     record_offset,
                     classes: classes.to_vec(),
+                    null_guarded: false,
                 })
                 .collect(),
             sealed: Vec::new(),
@@ -868,8 +959,120 @@ mod tests {
                     interior,
                 })
                 .collect(),
+            nulls: Vec::new(),
             scalars: Vec::new(),
         }
+    }
+
+    /// Template 9 loads +0 (read), +8 (store) and +16 (store, `guarded`):
+    /// resources 0 = arena, 1 = B, 2 = C.
+    fn null_program(guarded: bool) -> KernelProgram {
+        let args = vec![ptr(0, &[SmemLoad])];
+        let mut t = template(
+            9,
+            &[(0, &[VmemLoad]), (8, &[VmemStore]), (16, &[VmemStore])],
+        );
+        t.pointer_loads[2].null_guarded = guarded;
+        let mut arena = launch(&[(0, A)], 8, args.clone());
+        arena.facts = Ok(arena_facts(args, 8, 0, vec![t]));
+        let toucher = launch(
+            &[(0, B), (8, C)],
+            16,
+            vec![ptr(0, &[VmemLoad]), ptr(8, &[VmemLoad])],
+        );
+        author("gfx1201", &[arena, toucher])
+    }
+
+    fn null_record(nulls: Vec<u32>) -> BindingRecord {
+        BindingRecord {
+            nulls,
+            ..rec(0, 9, &[(0, 1, 0), (8, 2, 0)])
+        }
+    }
+
+    #[test]
+    fn a_null_guarded_load_at_a_declared_null_field_has_no_effect_and_writes_zero() {
+        let mut p = null_program(true);
+        p.bind_records(
+            ResourceId(0),
+            vec![null_record(vec![16])],
+            &SealedTableRegistry::new(),
+        )
+        .unwrap();
+        // Effects: the arena itself, B (read) and C (store): nothing for the
+        // null pointer.
+        let resources: BTreeSet<u32> = p.nodes[0].effects.iter().map(|e| e.resource.0).collect();
+        assert_eq!(resources, BTreeSet::from([0, 1, 2]));
+        let store = p.nodes[0]
+            .effects
+            .iter()
+            .find(|e| e.resource.0 == 2)
+            .unwrap();
+        assert_eq!(store.classes, [VmemStore]);
+        assert_eq!(
+            p.nodes[0].arena.as_ref().unwrap().null_guarded,
+            [crate::kernel::ArenaNullLoad {
+                arena: 0,
+                template: 9,
+                record_offset: 16,
+            }]
+        );
+        assert_eq!(p.nodes[0].lowering, Lowering::Pm4);
+        // The image writes 8 zero bytes there.
+        let image = p.binding_record_image(ResourceId(0), &p.resources).unwrap();
+        assert_eq!(image.nulls, [16]);
+        assert_eq!(image.len(), 3);
+        let writes = image.writes();
+        assert!(writes.contains(&(16, vec![0; 8])), "{writes:?}");
+        assert_eq!(writes.len(), 3);
+    }
+
+    #[test]
+    fn an_unguarded_load_at_a_declared_null_field_is_refused_and_a_bad_null_is_too() {
+        let sealed = SealedTableRegistry::new();
+        let mut p = null_program(false);
+        let before = p.clone();
+        let err = p
+            .bind_records(ResourceId(0), vec![null_record(vec![16])], &sealed)
+            .unwrap_err();
+        assert!(
+            err.contains("null field +16 of template 9: no null-guard proof"),
+            "{err}"
+        );
+        assert_eq!(p, before, "an Err leaves the program unchanged");
+        // Without the declaration the load is still an undeclared entry.
+        let err = null_program(true)
+            .bind_records(ResourceId(0), vec![null_record(vec![])], &sealed)
+            .unwrap_err();
+        assert!(err.contains("undeclared arena entry"), "{err}");
+
+        let bad = |nulls: Vec<u32>, scalars: Vec<(u32, u32)>| {
+            let mut r = null_record(nulls);
+            r.scalars = scalars;
+            null_program(true)
+                .bind_records(ResourceId(0), vec![r], &sealed)
+                .unwrap_err()
+        };
+        assert!(bad(vec![8, 16], vec![]).contains("overlaps a pointer field"));
+        assert!(bad(vec![4, 16], vec![]).contains("not 8-byte aligned"));
+        assert!(bad(vec![16, 16], vec![]).contains("declared twice"));
+        assert!(bad(vec![16], vec![(20, 1)]).contains("overlaps a scalar"));
+        assert!(bad(vec![16, 0x1_0000], vec![]).contains("ends past"));
+        // Records may not overlap through a null either.
+        let err = null_program(true)
+            .bind_records(
+                ResourceId(0),
+                vec![
+                    null_record(vec![16]),
+                    BindingRecord {
+                        base: 8,
+                        ..null_record(vec![16])
+                    },
+                ],
+                &sealed,
+            )
+            .unwrap_err();
+        assert!(err.contains("overlap"), "{err}");
     }
 
     #[test]
@@ -1234,6 +1437,7 @@ mod tests {
                 pointer_loads: vec![ArenaPointerRecord {
                     record_offset: 8,
                     classes: vec!["load_acquire".into(), "vmem_load".into()],
+                    null_guarded: false,
                 }],
                 sealed_tables: vec![],
                 wg_footprints: vec![],
@@ -1254,6 +1458,7 @@ mod tests {
             vec![ArenaPointerLoad {
                 record_offset: 8,
                 classes: vec![VmemLoad, LoadAcquire],
+                null_guarded: false,
             }]
         );
 

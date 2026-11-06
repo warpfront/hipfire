@@ -74,6 +74,7 @@ fn arg_record(
         read_cache: "scalar_and_vmem".into(),
         sinks: Vec::new(),
         loaded: true,
+        null_guarded: false,
     }
 }
 
