@@ -42,6 +42,8 @@ pub mod railgun_guard;
 pub mod reg;
 pub mod regalloc;
 pub mod sync;
+#[cfg(test)]
+pub(crate) mod test_tmp;
 pub mod valu_sched;
 pub mod vopd;
 pub mod kernels {

@@ -173,15 +173,12 @@ fn committed_bundle_and_contracts_equal_fresh_emission() {
 fn m7_certifies_every_export_and_matches_the_committed_receipts() {
     let (_, text, _) = emit_module(Arch::Gfx1201).unwrap();
     let elf = crate::native::assemble(&text, Arch::Gfx1201).unwrap();
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
-        "../../kernels/mq4_fp8_verify.test-{}.co",
-        std::process::id()
-    ));
-    std::fs::write(&path, elf).unwrap();
+    let object = crate::test_tmp::TmpObject::write("mq4_fp8_verify", elf);
+    let path = object.path();
     let mut receipts = serde_json::Map::new();
     let mut result = Ok(());
     for spec in Spec::all(Arch::Gfx1201) {
-        match crate::pm_check::m7(&path, "gfx1201", &spec.symbol()) {
+        match crate::pm_check::m7(path, "gfx1201", &spec.symbol()) {
             Ok(r) => {
                 if r["lift"] != "byte-exact"
                     || r["obligations"] != serde_json::json!({})
@@ -194,7 +191,7 @@ fn m7_certifies_every_export_and_matches_the_committed_receipts() {
             Err(e) => result = Err(e),
         }
     }
-    std::fs::remove_file(&path).unwrap();
+    drop(object);
     result.unwrap();
     let committed: serde_json::Value = serde_json::from_slice(
         &std::fs::read(concat!(
