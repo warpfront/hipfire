@@ -2764,6 +2764,8 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
             let mask = 1u32.checked_shl(width).unwrap_or(0).wrapping_sub(1);
             nonzero((a >> (b & 31)) & mask)
         }
+        // D = ((1U << S0.u32[4:0]) - 1U) << S1.u32[4:0] (wrapping 32 bits; width 0 or a multiple of 32 gives 0). SCC is unchanged.
+        "s_bfm_b32" => ((1u32 << (a & 31)).wrapping_sub(1) << (b & 31), None),
         // gfx1151 scalar float: D = f16_to_f32(S0.f16) of the low/high half. NaN payload handling is not measured.
         "s_cvt_f32_f16" | "s_cvt_hi_f32_f16" => (
             f16_in(

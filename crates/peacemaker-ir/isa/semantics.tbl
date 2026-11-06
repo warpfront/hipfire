@@ -65,6 +65,7 @@ s_barrier	control
 s_barrier_signal	control
 s_barrier_wait	control
 s_bfe_u32	alu
+s_bfm_b32	alu
 s_brev_b32	alu
 s_bitcmp1_b32	alu
 s_branch	control
