@@ -126,6 +126,11 @@ required-features = ["lab"]
 name = "qwen4_moe_sym_gfx1100_p1"
 required-features = ["lab"]
 
+# MQ2 x-batch PM variant grid / shipped-artifact emitter (native writer only).
+[[example]]
+name = "mq2_xbatch_pm_sweep"
+required-features = ["lab"]
+
 [features]
 # Opt-in research harnesses (examples). Not part of any product build; the
 # UNGATED example count is ratcheted, see scripts/leanup-ratchets.sh.

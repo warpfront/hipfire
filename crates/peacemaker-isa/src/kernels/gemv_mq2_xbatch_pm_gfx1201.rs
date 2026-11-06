@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //! PeaceMaker x-batched MQ2G256V2 GEMV for gfx1201 (WideNet F05 `r4_b4_u1_native_anchor`, shipped as
 //! `kernels/gemv_mq2_xbatch_pm_gfx1201.hxaco`): byte-exact PM twin and bounded variants of `gemv_mq2g256v2_xbatch`
-//! (`kernels/src/gemv_mq2g256v2.hip`, `XBATCH_MAX = 4`; the MTP draft-head ranking GEMV).
+//! (`kernels/src/gemv_mq2g256v2.hip`; the MTP draft-head ranking GEMV). The hipcc anchor itself is fixed at
+//! `XBATCH_MAX = 4` (it clamps `B > 4` to 4); this emitter admits capacities up to [`XBATCH_MAX`] = 8.
 //!
-//! Lab only: nothing here is registered in a shipping registry or reachable from a product route.
+//! The product PM kernel is the [`SHIPPED`] tuple's committed `.hxaco`, pinned byte-for-byte by
+//! `tests/gemv_mq2_xbatch_pm.rs`. Every other tuple (in particular any `cap` 8 tuple) is lab output until a
+//! measured selection replaces [`SHIPPED`] and re-pins the artifact.
 //!
 //! ABI (36 B, identical to the anchor): `A` (read-only), `x[B][K]` (read-only), `y[B][M]` (write-only)
 //! pointers at 0/8/16, `M`/`K`/`B` i32 at 24/28/32. Anchor launch: wave32, block 32, grid `M`, no LDS/scratch.
@@ -17,18 +20,21 @@
 //! .. `w7*x7`; group `g` accumulates `acc[g % 4] += dot` in increasing `g` (quads, then scalar tail groups
 //! into streams 0..2); the row result is `(a0 + a1) + (a2 + a3)` followed by the frozen wave32 shfl_down
 //! tree (swizzle `1pppp`, then self-reading bpermutes 8/4/2/1, each `own + other`); lane 0 stores
-//! `y[b*M + row]`. No reassociation, no FMA-contraction change. `B > 4` computes four columns and `B <= 0`
-//! stores nothing, as the anchor does.
+//! `y[b*M + row]`. No reassociation, no FMA-contraction change. `B > cap` computes `cap` columns (the hipcc anchor
+//! is cap 4) and `B <= 0` stores nothing, as the anchor does.
 //!
-//! Grammar (`variant_grid`, 108 tuples, canonical lexicographic order of
+//! Grammar (`rows x cap x unroll x split x ilp` tuples, canonical order of
 //! `(rows, cap, unroll, load, schedule)`): rows per workgroup `{1,2,4}` (workgroup `w` owns rows
 //! `R*w..`, loads of rows past `M` clamp to `M-1`, stores only valid rows; launch grid `ceil(M/R)`);
-//! x-batch capacity `{1,2,4}` (code paths for `B = 1..=cap`; `B > cap` is host-rejected, the kernel clamps);
+//! x-batch capacity `{1,2,4,8}` (code paths for `B = 1..=cap`; the kernel clamps `B > cap`; column offsets use
+//! `s28..s35`);
 //! quads per loop trip `{1,2,4}` (main loop, then a one-quad remainder loop; tail groups unchanged);
 //! activation load decomposition `{native 2xb128, split 4xb64}` (same bytes, same registers);
 //! schedule `{anchor, quad_ILP}` (`quad_ILP` decodes group pairs `(0,1),(2,3)` into two weight sets and
 //! interleaves their dependent fmac chains term by term; each chain's own order is unchanged).
-//! The twin is `(rows 1, cap 4, unroll 1, native, anchor)`: launch-identical to the anchor.
+//! The twin of the hipcc anchor is `(rows 1, cap 4, unroll 1, native, anchor)`: launch-identical to it.
+//! Not every tuple closes: [`Params::validate`] checks the grid, then the builder rejects tuples whose ring/register
+//! plan does not fit (e.g. `r4_b8` with `quad_ILP` has 1 ring slot but needs 4; `r4_b8` anchor schedule has 6).
 //!
 //! Domain of the byte-exact claim: `K % 256 == 0`, `K >= 0`, `M >= 1`, `A` addressed by a 32-bit
 //! row/group byte offset (`< 4 GiB`), `y` offsets `B*M*4 < 4 GiB` (the real FN shape is 178.8 MB / 3.0 MB).
@@ -40,7 +46,7 @@ use crate::{Arch, Builder, KernargLayout, KernelSpec, RegPlan};
 
 pub const SYMBOL: &str = "gemv_mq2g256v2_xbatch_pm";
 pub const ANCHOR_SYMBOL: &str = "gemv_mq2g256v2_xbatch";
-pub const XBATCH_MAX: u8 = 4;
+pub const XBATCH_MAX: u8 = 8;
 pub const GROUP_BYTES: u32 = 72;
 const VGPR_BUDGET: u16 = 256;
 
@@ -48,14 +54,14 @@ const VGPR_BUDGET: u16 = 256;
 pub const ORDERED_DAG: &str = "gemv_mq2g256v2_xbatch/gfx1201/v1;\
 w_n=fma_mix(f16lo(h),f32(q_n),f16hi(h)) h=lane<16?hdr0:hdr1 q_n=(pk>>2n)&3 pk=u32@group+8+2*lane;\
 dot=mul(w1,x1);dot=fmac(w0,x0);dot=fmac(w2,x2)..fmac(w7,x7);acc[g%4]=acc[g%4]+dot;g ascending(quads then tail);\
-row=(a0+a1)+(a2+a3);reduce=swizzle(1pppp);then bpermute 8,4,2,1 each own+other;lane0 store y[b*M+row];B>4=>4";
+row=(a0+a1)+(a2+a3);reduce=swizzle(1pppp);then bpermute 8,4,2,1 each own+other;lane0 store y[b*M+row];B>8=>8";
 
 /// One point of the finite variant grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Params {
     /// output rows per workgroup (`1`, `2`, `4`)
     pub rows: u8,
-    /// x-batch capacity (`1`, `2`, `4`)
+    /// x-batch capacity (`1`, `2`, `4`, `8`)
     pub cap: u8,
     /// quads per main-loop trip (`1`, `2`, `4`)
     pub unroll: u8,
@@ -82,8 +88,8 @@ impl Params {
         if ![1, 2, 4].contains(&self.rows) {
             return Err(format!("rows {} not in {{1,2,4}}", self.rows));
         }
-        if ![1, 2, 4].contains(&self.cap) {
-            return Err(format!("cap {} not in {{1,2,4}}", self.cap));
+        if ![1, 2, 4, 8].contains(&self.cap) {
+            return Err(format!("cap {} not in {{1,2,4,8}}", self.cap));
         }
         if ![1, 2, 4].contains(&self.unroll) {
             return Err(format!("unroll {} not in {{1,2,4}}", self.unroll));
@@ -121,6 +127,12 @@ pub fn emit_bundle(params: &Params) -> Result<Vec<u8>, String> {
         Arch::Gfx1201,
         HOST_TARGET,
     ))
+}
+
+/// The CFG wait-ledger verification (`ledger_cfg::verify_emitted`) of one tuple's emitted program.
+pub fn verify_waits(params: &Params) -> Result<crate::ledger_cfg::Stats, String> {
+    params.validate()?;
+    crate::ledger_cfg::verify_emitted(&build(params)?)
 }
 
 /// The assembly text of one tuple.
@@ -510,7 +522,7 @@ pub fn emit_body(b: &mut Builder, p: &Params, wg: WgId, prefix: &str) -> Result<
             &[],
         )?;
     }
-    // B > cap clamps to cap (the anchor clamps B > 4 to 4); B <= 0 matches no path and stores nothing.
+    // B > cap clamps to cap (the hipcc anchor clamps B > 4 to 4); B <= 0 matches no path and stores nothing.
     salu(b, &format!("s_min_i32 s3, s3, {}", p.cap), &[S_B], &[S_B])?;
     for nb in 1..=p.cap {
         salu(b, &format!("s_cmp_eq_u32 s3, {nb}"), &[], &[S_B])?;
