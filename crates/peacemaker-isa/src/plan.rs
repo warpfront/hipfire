@@ -233,4 +233,6 @@ pub struct Emitted {
     pub shape: IsaShape,
     /// The instruction list the proofs' `pc_index` fields index (labels included).
     pub program: crate::insn::Program,
+    /// What `Builder::record_vgpr_stream` recorded (pass 1 of `regalloc::compact_vgprs`).
+    pub vgpr_record: Option<crate::regalloc::Recording>,
 }

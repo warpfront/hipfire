@@ -37,6 +37,7 @@ pub mod profile;
 #[path = "kernels/railgun_guard.rs"]
 pub mod railgun_guard;
 pub mod reg;
+pub mod regalloc;
 pub mod sync;
 pub mod valu_sched;
 pub mod vopd;
@@ -167,6 +168,16 @@ pub struct Builder {
     delay_alu: Option<DelayAlu>,
     /// `enable_valu_schedule`: the buffered run of plain VALU instructions.
     valu_window: Option<Vec<Instruction>>,
+    /// `vgpr_pass(Pass::Record)`: the final-order instruction stream, the submission hashes and the VALU window schedules.
+    vgpr_rec: Option<regalloc::Recording>,
+    /// `set_vgpr_map`: the renaming applied to each submission by its id.
+    vgpr_map: Option<regalloc::VgprMap>,
+    /// Number of `emit` calls so far (the submission id of the next one).
+    vgpr_sub: usize,
+    /// Submission id of the first instruction buffered in `valu_window`.
+    vgpr_win_start: usize,
+    /// Index of the next window schedule of the installed map (`flush_valu` replays them in order).
+    vgpr_cursor: usize,
     /// The last single-slot `s_delay_alu` (pc, its target pc) a later hint may merge into.
     delay_merge: Option<(usize, usize)>,
     labels: Vec<String>,
@@ -250,6 +261,11 @@ impl Builder {
             gfx11_hazard: Gfx11Hazards::for_arch(arch),
             delay_alu: None,
             valu_window: None,
+            vgpr_rec: None,
+            vgpr_map: None,
+            vgpr_sub: 0,
+            vgpr_win_start: 0,
+            vgpr_cursor: 0,
             delay_merge: None,
             labels: vec!["entry".into()],
             current_label: "entry".into(),
@@ -296,6 +312,22 @@ impl Builder {
         self.valu_window = Some(vec![]);
         Ok(())
     }
+    /// Record every submitted instruction for `regalloc::vgpr_compaction` (pass 1 of `compact_vgprs`).
+    pub fn record_vgpr_stream(&mut self) {
+        self.vgpr_rec = Some(Default::default());
+    }
+    /// Rename every VGPR operand by `map`, keyed by submission id (pass 2 of `compact_vgprs`). The wait
+    /// ledger, hazard trackers and the VALU scheduler see the renamed program.
+    pub fn set_vgpr_map(&mut self, map: regalloc::VgprMap) {
+        self.vgpr_map = Some(map);
+    }
+    /// Enter pass `pass` of `regalloc::compact_vgprs`.
+    pub fn vgpr_pass(&mut self, pass: regalloc::Pass) {
+        match pass {
+            regalloc::Pass::Record => self.record_vgpr_stream(),
+            regalloc::Pass::Apply(map) => self.set_vgpr_map(map.clone()),
+        }
+    }
     /// Emit the buffered VALU run in scheduled order. Every point that reads or
     /// appends the program other than a buffered VALU flushes first; emitters
     /// that compare `ledger()` across a body call this before reading it.
@@ -305,11 +337,34 @@ impl Builder {
             _ => return Ok(()),
         };
         let arch = self.spec.arch;
+        let start = self.vgpr_win_start;
+        if let Some(map) = self.vgpr_map.clone() {
+            // Pass 2 of `compact_vgprs`: replay the schedule pass 1 chose (the renaming was proven on that order).
+            let units = map.window(self.vgpr_cursor, pending.len())?;
+            self.vgpr_cursor += 1;
+            for &(a, b) in units {
+                match b {
+                    None => self.emit_now(pending[a].clone(), [start + a, usize::MAX])?,
+                    Some(b) => {
+                        let packet =
+                            valu_sched::pair(arch, &pending[a], &pending[b]).ok_or_else(|| {
+                                format!(
+                                    "vgpr map: `{}` and `{}` no longer form a VOPD packet",
+                                    pending[a].text, pending[b].text
+                                )
+                            })?;
+                        self.emit_now(packet, [start + a, start + b])?
+                    }
+                }
+            }
+            return Ok(());
+        }
         let dag = valu_sched::Dag::new(pending);
         let n = dag.len();
         let mut issued: Vec<Option<usize>> = vec![None; n];
         let mut done = 0;
         let mut now = 0;
+        let mut window: Vec<(usize, Option<usize>)> = vec![];
         // A wait the ledger would need before the instruction: none sorts first,
         // then the weakest (largest remaining count).
         let wait_key = |b: &Builder, i: &Instruction| -> usize {
@@ -345,11 +400,18 @@ impl Builder {
                 Some((b, packet)) => {
                     issued[b] = Some(now);
                     done += 1;
-                    self.emit_now(packet)?
+                    window.push((a, Some(b)));
+                    self.emit_now(packet, [start + a, start + b])?
                 }
-                None => self.emit_now(dag.insns[a].clone())?,
+                None => {
+                    window.push((a, None));
+                    self.emit_now(dag.insns[a].clone(), [start + a, usize::MAX])?
+                }
             }
             now += 1;
+        }
+        if let Some(rec) = &mut self.vgpr_rec {
+            rec.windows.push(window);
         }
         Ok(())
     }
@@ -385,6 +447,9 @@ impl Builder {
         }
         self.labels.push(name.into());
         self.current_label = name.into();
+        if let Some(rec) = &mut self.vgpr_rec {
+            rec.stream.push(regalloc::StreamItem::Label(name.into()));
+        }
         // Obligations at the label: the forward branches' joined with the fall-through
         // (absent after an unconditional `s_branch`/`s_endpgm`).
         let falls_through = !self
@@ -578,21 +643,40 @@ impl Builder {
     }
     /// Every instruction goes through here; with `enable_valu_schedule` a plain
     /// VALU instruction is checked and buffered, anything else flushes the run.
-    fn emit(&mut self, insn: Instruction) -> Result<(), String> {
+    fn emit(&mut self, mut insn: Instruction) -> Result<(), String> {
+        if let Some(map) = &self.vgpr_map {
+            insn = map.rewrite(self.vgpr_sub, insn)?;
+        }
+        if let Some(rec) = &mut self.vgpr_rec {
+            rec.hashes.push(regalloc::text_hash(&insn.text));
+        }
+        let sub = self.vgpr_sub;
+        self.vgpr_sub += 1;
         if self.valu_window.is_some() && valu_sched::schedulable(&insn) {
             insn.validate(self.spec.arch)?;
             for r in insn.defs.iter().chain(&insn.uses) {
                 self.regs
                     .verify_access(*r, &self.current_label, &self.labels)?
             }
-            self.valu_window.as_mut().unwrap().push(insn);
+            let window = self.valu_window.as_mut().unwrap();
+            if window.is_empty() {
+                self.vgpr_win_start = sub;
+            }
+            window.push(insn);
             return Ok(());
         }
         self.flush_valu()?;
-        self.emit_now(insn)
+        self.emit_now(insn, [sub, usize::MAX])
     }
     /// Waits, hazard guards, ledger.
-    fn emit_now(&mut self, insn: Instruction) -> Result<(), String> {
+    /// `subs`: the submission ids this instruction (or VOPD packet) carries (`usize::MAX` for none).
+    fn emit_now(&mut self, insn: Instruction, subs: [usize; 2]) -> Result<(), String> {
+        if let Some(rec) = &mut self.vgpr_rec {
+            rec.stream.push(regalloc::StreamItem::Insn {
+                insn: insn.clone(),
+                subs,
+            });
+        }
         insn.validate(self.spec.arch)?;
         if self
             .program
@@ -1135,6 +1219,17 @@ impl Builder {
         if let Some(target) = self.sync_forward.keys().next() {
             return Err(format!("branch to {target}, which is never placed"));
         }
+        if let Some(map) = &self.vgpr_map {
+            if self.vgpr_sub != map.len() || self.vgpr_cursor != map.windows() {
+                return Err(format!(
+                    "vgpr map: {} instructions / {} windows submitted, {} / {} recorded (emission is not deterministic)",
+                    self.vgpr_sub,
+                    self.vgpr_cursor,
+                    map.len(),
+                    map.windows()
+                ));
+            }
+        }
         global_sync::check_region_entries(&self.program, &self.regions)?;
         if !self.syncs.is_empty() {
             sync::verify(&self.program, &self.syncs)
@@ -1223,6 +1318,7 @@ impl Builder {
             proof,
             shape,
             program: self.program,
+            vgpr_record: self.vgpr_rec,
         })
     }
 }
