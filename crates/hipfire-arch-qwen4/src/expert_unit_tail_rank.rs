@@ -554,6 +554,67 @@ struct Inner {
     /// The policy forgets the unit of a `Quarantined` slot, whose bytes a peer's full table may
     /// still name, so a borrow restore reads it here.
     slot_units: Vec<Option<UnitKey>>,
+    /// Developer skew census (`HIPFIRE_EP_SKEW_LOG=<dir>`, off by default): every retirement writes
+    /// the routed ids of the group's calls with how this rank serves each one. `None` when unset.
+    skew: Option<SkewLog>,
+}
+
+/// `HIPFIRE_EP_SKEW_LOG=<dir>` (developer diagnostic, off by default): at every D2 retirement each
+/// rank appends one text line per logged trunk MoE call of the group to `<dir>/skew-rank<r>.log`:
+/// `rank retirement call host_monotonic_ns layer slots` then one token per slot, `<expert><class>`
+/// with class `F` (another rank's expert), `C` (static VRAM core), `L` (tail unit served from a
+/// live VRAM slot), `T` (tail unit read from pinned host) or `H` (host-only unit). It reads only
+/// what the retirement already downloaded (no added sync, no device work) and never changes an
+/// output; the host timestamp is taken when the call's copy is enqueued.
+pub(crate) const EP_SKEW_LOG_ENV: &str = "HIPFIRE_EP_SKEW_LOG";
+
+struct SkewLog {
+    out: std::io::BufWriter<std::fs::File>,
+    /// Host CLOCK_MONOTONIC ns of each entry of `Inner::calls`, in order.
+    ns: Vec<u64>,
+    call: u64,
+}
+
+impl SkewLog {
+    fn open(rank: usize) -> Option<Self> {
+        let dir = hipfire_config::developer_var(EP_SKEW_LOG_ENV).ok()?;
+        let dir = std::path::PathBuf::from(dir.trim());
+        let opened = std::fs::create_dir_all(&dir).and_then(|()| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(format!("skew-rank{rank}.log")))
+        });
+        match opened {
+            Ok(file) => Some(Self {
+                out: std::io::BufWriter::new(file),
+                ns: Vec::new(),
+                call: 0,
+            }),
+            Err(error) => {
+                eprintln!("qwen4 EP rank {rank}: {EP_SKEW_LOG_ENV}: {error}; skew log off");
+                None
+            }
+        }
+    }
+}
+
+/// CLOCK_MONOTONIC in ns (the clock rocprofv3 timestamps use).
+fn monotonic_ns() -> u64 {
+    #[repr(C)]
+    struct Timespec {
+        sec: i64,
+        nsec: i64,
+    }
+    extern "C" {
+        fn clock_gettime(clock: i32, ts: *mut Timespec) -> i32;
+    }
+    let mut ts = Timespec { sec: 0, nsec: 0 };
+    // SAFETY: libc `clock_gettime(CLOCK_MONOTONIC = 1, &mut ts)` writes only `ts`.
+    if unsafe { clock_gettime(1, &mut ts) } != 0 {
+        return 0;
+    }
+    ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
 }
 
 /// The rank's tail (installed in the row-gather hook).
@@ -888,6 +949,7 @@ impl UnitTailRank {
             released: false,
             suspended: false,
             slot_units: vec![None; slots],
+            skew: SkewLog::open(rank),
         };
         let built = state.build_device(gpu, slots, &seeds);
         if let Err(error) = built {
@@ -1369,6 +1431,9 @@ impl Inner {
             Ok(()) => {
                 self.calls.push((layer_idx, slots as u32, at as u32));
                 self.log_used += slots * 4;
+                if let Some(skew) = self.skew.as_mut() {
+                    skew.ns.push(monotonic_ns());
+                }
             }
             Err(error) => self.freeze(&format!("usage log copy: {error}")),
         }
@@ -1475,6 +1540,76 @@ impl Inner {
         }
     }
 
+    /// [`EP_SKEW_LOG_ENV`]: one line per call of the group just downloaded into `log_host`, the
+    /// class of every slot as the tables served it during the group (the images and kinds are
+    /// those of the last retirement, unchanged since). A write error turns the log off.
+    fn write_skew_log(&mut self, calls: &[(u16, u32, u32)]) {
+        use std::io::Write;
+        let Some(mut skew) = self.skew.take() else {
+            return;
+        };
+        let ns = std::mem::take(&mut skew.ns);
+        let retirement = self.policy.stats().retirements;
+        let mut line = String::new();
+        let mut result = Ok(());
+        for (i, &(label, slots, at)) in calls.iter().enumerate() {
+            let layer = label as usize;
+            line.clear();
+            line.push_str(&format!(
+                "{} {} {} {} {} {}",
+                self.rank,
+                retirement,
+                skew.call,
+                if ns.len() == calls.len() { ns[i] } else { 0 },
+                layer,
+                slots
+            ));
+            skew.call += 1;
+            let ids = &self.log_host[at as usize..at as usize + slots as usize * 4];
+            for raw in ids.chunks_exact(4) {
+                let id = i32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                let class = match usize::try_from(id) {
+                    Err(_) => 'X',
+                    Ok(expert) => match self.kind(layer, expert) {
+                        Kind::Foreign => 'F',
+                        Kind::Core => 'C',
+                        Kind::HostOnly => 'H',
+                        Kind::Tail => {
+                            let live = self.layer_of[layer].is_some_and(|index| {
+                                let tail = &self.layers[index];
+                                let at = expert * 8;
+                                let entry = u64::from_le_bytes(
+                                    tail.image_gate_up[at..at + 8]
+                                        .try_into()
+                                        .expect("8-byte table entry"),
+                                );
+                                entry != tail.canon_gate_up[expert]
+                            });
+                            if live {
+                                'L'
+                            } else {
+                                'T'
+                            }
+                        }
+                    },
+                };
+                line.push_str(&format!(" {id}{class}"));
+            }
+            line.push('\n');
+            result = skew.out.write_all(line.as_bytes());
+            if result.is_err() {
+                break;
+            }
+        }
+        match result.and_then(|()| skew.out.flush()) {
+            Ok(()) => self.skew = Some(skew),
+            Err(error) => eprintln!(
+                "qwen4 EP rank {}: {EP_SKEW_LOG_ENV}: {error}; skew log off",
+                self.rank
+            ),
+        }
+    }
+
     /// One retirement of the tail: the log's D2H, the policy step, the table uploads, the peer
     /// protocol and the fills. Returns the pin deltas of the retirement (its publications `on`,
     /// its evictions `off`; empty without the pins lever and when nothing was retired): only a
@@ -1498,6 +1633,7 @@ impl Inner {
         }
         let calls = std::mem::take(&mut self.calls);
         self.log_used = 0;
+        self.write_skew_log(&calls);
         let t_log = Instant::now();
 
         // The window's units: slot reads per distinct (layer, expert) this rank holds.
@@ -3146,6 +3282,7 @@ mod tests {
             released: false,
             suspended,
             slot_units: vec![None; slots],
+            skew: None,
         }
     }
 
