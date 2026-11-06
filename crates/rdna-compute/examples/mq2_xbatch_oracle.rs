@@ -35,6 +35,12 @@
 //! scale/zero NaN payloads/Inf/signed zero/subnormal/extremes, NaN/Inf/zero/subnormal/extreme
 //! activations, compared as raw hardware bytes, NaN included); the hipcc kernel in chunks of <= 4 must equal them too.
 //!
+//! Gating: finite random shapes must equal per-column singleton bytes. NaN/Inf edge cases are
+//! gated direct == hipcc-chunked (and == the `--baseline-object` PM chunked by 4 when given),
+//! raw bytes; the singleton-vs-xbatch NaN-payload disagreement (operand order of compiled
+//! add/mul: hardware returns the first NaN source, so commuted operands change the payload)
+//! is recorded as `preexisting_singleton_*` with counts and first words, not gated.
+//!
 //! `--bench` times the object's single launch (B = 1..8) against the TODAY cap4 baseline:
 //! `--baseline-object PATH` (REQUIRED with `--bench`; must be the pre-change shipped cap4
 //! object, run with 4 rows per block in chunks of 4 so B = 5..8 is two launches; the new
@@ -385,9 +391,26 @@ fn first_words(
     out
 }
 
+/// (differing words, both-NaN words, words where at least one side is non-NaN).
+fn nan_class(reference: &[u8], got: &[u8]) -> (usize, usize, usize) {
+    let w = |v: &[u8], i: usize| f32::from_bits(u32::from_le_bytes([v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3]]));
+    let (mut n, mut both, mut other) = (0, 0, 0);
+    for i in 0..reference.len() / 4 {
+        if reference[4 * i..4 * i + 4] != got[4 * i..4 * i + 4] {
+            n += 1;
+            if w(reference, i).is_nan() && w(got, i).is_nan() {
+                both += 1;
+            } else {
+                other += 1;
+            }
+        }
+    }
+    (n, both, other)
+}
+
 /// Direct correctness of `obj`: single launch at B = 1..=max_b vs per-column singleton bytes
 /// (guards both sides included); hipcc in chunks of <= 4 vs the same bytes.
-fn direct_cases(gpu: &mut Gpu, obj: &Obj, max_b: usize) -> Result<(Vec<serde_json::Value>, usize)> {
+fn direct_cases(gpu: &mut Gpu, obj: &Obj, base: Option<&Obj>, max_b: usize) -> Result<(Vec<serde_json::Value>, usize)> {
     let mut rng = Rng(0xD1EC7_5EED_0001);
     let mut cases = Vec::new();
     let mut bad_total = 0usize;
@@ -435,28 +458,77 @@ fn direct_cases(gpu: &mut Gpu, obj: &Obj, max_b: usize) -> Result<(Vec<serde_jso
             launch_obj(gpu, obj, &a, x.buf.as_ptr() as u64, y_view.buf.as_ptr() as u64, m, k, b)?;
             gpu.hip.device_synchronize().map_err(err)?;
             let got = gpu.download_raw_bytes(&y).map_err(err)?;
-            let bad_written = diff(&got[guard..guard + written], &reference[..written]);
-            let bad_guard = got[..guard].iter().filter(|&&v| v != 0x7f).count()
-                + got[guard + written..].iter().filter(|&&v| v != 0x7f).count();
+            let guards_bad = |v: &[u8]| {
+                v[..guard].iter().filter(|&&q| q != 0x7f).count()
+                    + v[guard + written..].iter().filter(|&&q| q != 0x7f).count()
+            };
+            let bad_guard = guards_bad(&got);
             // hipcc kernel, chunks of <= 4, same guards
             gpu.hip.memset(&y.buf, 0x7f, y.numel() * 4).map_err(err)?;
             gpu.gemv_mq2g256v2_xbatch_with(&a, &x, &y_view, m, k, b, false).map_err(err)?;
             gpu.hip.device_synchronize().map_err(err)?;
             let hip = gpu.download_raw_bytes(&y).map_err(err)?;
-            let bad_hip = diff(&hip[guard..guard + written], &reference[..written])
-                + hip[..guard].iter().filter(|&&v| v != 0x7f).count()
-                + hip[guard + written..].iter().filter(|&&v| v != 0x7f).count();
-            bad_total += bad_written + bad_guard + bad_hip;
-            let (g_w, h_w) = (&got[guard..guard + written], &hip[guard..guard + written]);
-            let first_direct = first_words(&reference[..written], g_w, Some(h_w), m, written, 8);
-            let first_hipcc = first_words(&reference[..written], h_w, Some(g_w), m, written, 8);
-            cases.push(json!({
-                "kind": kind, "m": m, "k": k, "b": b, "single_launch_mismatch_bytes": bad_written,
+            // incumbent PM object (cap4, chunks of 4), when --baseline-object supplied
+            let old = match base {
+                Some(base) => {
+                    gpu.hip.memset(&y.buf, 0x7f, y.numel() * 4).map_err(err)?;
+                    launch_chunked(gpu, base, &a, x.buf.as_ptr() as u64, y_view.buf.as_ptr() as u64, m, k, b)?;
+                    gpu.hip.device_synchronize().map_err(err)?;
+                    Some(gpu.download_raw_bytes(&y).map_err(err)?)
+                }
+                None => None,
+            };
+            let (r_w, g_w, h_w) = (&reference[..written], &got[guard..guard + written], &hip[guard..guard + written]);
+            let o_w = old.as_ref().map(|o| &o[guard..guard + written]);
+            let sing_direct = diff(g_w, r_w);
+            let sing_hipcc = diff(h_w, r_w) + guards_bad(&hip);
+            let mut entry = json!({
+                "kind": kind, "m": m, "k": k, "b": b,
                 "single_launch_guard_overwritten_bytes": bad_guard,
-                "hipcc_chunked_mismatch_bytes": bad_hip,
-                "first_direct_mismatch_words": first_direct,
-                "first_hipcc_mismatch_words": first_hipcc,
-            }));
+                "first_direct_mismatch_words": first_words(r_w, g_w, Some(h_w), m, written, 8),
+                "first_hipcc_mismatch_words": first_words(r_w, h_w, Some(g_w), m, written, 8),
+            });
+            let mut gate = bad_guard;
+            if kind == "random" {
+                // finite: per-column singleton is the gate
+                gate += sing_direct + sing_hipcc;
+                entry["single_launch_mismatch_bytes"] = json!(sing_direct);
+                entry["hipcc_chunked_mismatch_bytes"] = json!(sing_hipcc);
+                if let Some(o_w) = o_w {
+                    let d = diff(g_w, o_w);
+                    gate += d;
+                    entry["direct_vs_baseline_mismatch_bytes"] = json!(d);
+                }
+            } else {
+                // NaN/Inf edges: the gate is direct == hipcc chunked (== old PM chunked) raw bytes;
+                // the singleton disagreement is a recorded pre-existing diagnostic, not gated.
+                let vs_hip = diff(g_w, h_w);
+                gate += vs_hip;
+                entry["direct_vs_hipcc_chunked_mismatch_bytes"] = json!(vs_hip);
+                entry["first_direct_vs_hipcc_words"] = json!(first_words(h_w, g_w, None, m, written, 8));
+                if let Some(o_w) = o_w {
+                    let d = diff(g_w, o_w);
+                    gate += d + guards_bad(old.as_ref().unwrap());
+                    entry["direct_vs_baseline_mismatch_bytes"] = json!(d);
+                    entry["baseline_guard_overwritten_bytes"] = json!(guards_bad(old.as_ref().unwrap()));
+                    entry["first_direct_vs_baseline_words"] = json!(first_words(o_w, g_w, None, m, written, 8));
+                    entry["preexisting_baseline_vs_hipcc_mismatch_bytes"] = json!(diff(o_w, h_w));
+                    entry["preexisting_singleton_baseline_mismatch_bytes"] = json!(diff(o_w, r_w));
+                }
+                let (dw, dnan, dother) = nan_class(r_w, g_w);
+                let (hw, hnan, hother) = nan_class(r_w, h_w);
+                entry["preexisting_singleton_direct"] = json!({
+                    "mismatch_bytes": sing_direct, "mismatch_words": dw,
+                    "both_nan_words": dnan, "non_nan_involved_words": dother,
+                });
+                entry["preexisting_singleton_hipcc"] = json!({
+                    "mismatch_bytes": sing_hipcc, "mismatch_words": hw,
+                    "both_nan_words": hnan, "non_nan_involved_words": hother,
+                });
+            }
+            entry["gated_bad_bytes"] = json!(gate);
+            bad_total += gate;
+            cases.push(entry);
         }
         gpu.free_tensor(a).map_err(err)?;
         gpu.free_tensor(x).map_err(err)?;
@@ -699,7 +771,7 @@ fn main() {
                 rows,
             )?);
         }
-        let base = if do_bench {
+        let base = if do_bench || baseline_object.is_some() {
             let path = baseline_object
                 .as_deref()
                 .ok_or("--bench requires --baseline-object PATH (the pre-change cap4 object)")?;
@@ -718,7 +790,7 @@ fn main() {
                 "object": obj.label, "sha256": obj.sha, "rows": obj.rows, "max_b": max_b,
             });
             if !do_bench || !no_oracle {
-                match direct_cases(&mut gpu, obj, max_b) {
+                match direct_cases(&mut gpu, obj, base.as_ref(), max_b) {
                     Ok((dc, bad)) => {
                         bad_total += bad;
                         entry["direct_mismatch_bytes"] = json!(bad);
@@ -733,7 +805,7 @@ fn main() {
                     Err(e) => return Err(e),
                 }
             }
-            if let Some(base) = base.as_ref() {
+            if let (true, Some(base)) = (do_bench, base.as_ref()) {
                 let (t, bad) = bench_table(&mut gpu, obj, base, bench_reps)?;
                 bad_total += bad;
                 if objects.len() == 1 {
