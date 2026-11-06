@@ -1124,3 +1124,188 @@ pub const UNSUPPORTED: &[Allow] = &[
         why: "lift_region refuses the kernel (the printed instruction does not re-encode to its original words), so no pool region exists; not a verifier finding",
     },
 ];
+
+/// How the ledger's report on a hosted body is classified; the same two classes as the
+/// `pins` findings it is mapped to (`why` starts "MODEL LIMITATION" or "UNPROVEN").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Category {
+    /// The verifier's model, not the code, produces the report.
+    ModelLimit,
+    /// A path the ledger reports; feasibility and hardware behavior not established.
+    /// NOT a proven race.
+    Candidate,
+}
+
+/// One finding of a hosted body inside a pool, exact: the template id the dispatcher hosts
+/// it under, the pc within the body (the index into the lifted region's lines, i.e. the pc
+/// of the same line in the standalone kernel as the `pins` scan prints it), the category,
+/// and the instruction and need the verifier names. There is no wildcard and no dispatcher
+/// entry: a dispatcher instruction is outside every body span and is fatal.
+pub struct PoolBody {
+    pub tid: u32,
+    /// The `pins` target of the hosted kernel (`file#symbol`).
+    pub target: &'static str,
+    pub body_pc: usize,
+    pub category: Category,
+    pub insn: &'static str,
+    pub need: &'static str,
+}
+
+/// Every hosted body whose strict verification reports, one entry per template (the walk
+/// reports the first). Each is the pool-hosted copy of an existing `pins` finding (same
+/// target, instruction, need and category; the label differs: `.LBBn` vs `.Lt<tid>b_n`),
+/// at the same pc. Sources: the strict pool run `artifact://97452` (its `POOL VERIFY
+/// FAILED` lines name templates 28, 34, 35, 38, 39, 40, 45, 46, 47, 48 with the pool pc;
+/// every one is 128 above the `pins` pc, the dispatcher's offset to the first body line)
+/// and, for templates 27, 33, 36, 37, 43, 44 whose pool stopped at the (since fixed)
+/// dispatcher T_READY finding before reaching the body, the `pins` rows
+/// (`local://ledger-join-finding.md` rows 2, 4, 3, 5, 14, 11; their pool pc is INFERRED
+/// from the same offset and is checked by the test, which fails on any mismatch). No entry
+/// is a proven race.
+pub const POOL_BODY: &[PoolBody] = &[
+    // pins row 2, W2
+    PoolBody {
+        tid: 27,
+        target: "gated_delta_vector_pm_gfx1201.hxaco#gated_delta_net_vector_serial_f32_pm_gfx1201",
+        body_pc: 367,
+        category: Category::Candidate,
+        insn: "`v_add_co_u32 v25, s3, v25, s14`",
+        need: "needs Store wait 0 (War { reg: \"v[25:26]\" })",
+    },
+    // pins row 1, W1; artifact://97452 pm_pool_28 pc 673
+    PoolBody {
+        tid: 28,
+        target:
+            "gated_delta_vector_pm_gfx1201.hxaco#causal_conv_depthwise_silu_rows_f32_pm_gfx1201",
+        body_pc: 545,
+        category: Category::Candidate,
+        insn: "`v_add_co_u32 v22, vcc_lo, v22, s38`",
+        need: "needs Store wait 0 (War { reg: \"v[22:23]\" })",
+    },
+    // pins row 4
+    PoolBody {
+        tid: 33,
+        target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q4_k_f16_gfx1201",
+        body_pc: 143,
+        category: Category::ModelLimit,
+        insn: "`global_load_d16_hi_u8 v6, v[3:4], off offset:4`",
+        need: "needs Load wait 0 (Use { reg: \"v6\" })",
+    },
+    // pins row 6; artifact://97452 pm_pool_34 pc 271
+    PoolBody {
+        tid: 34,
+        target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q5_k_f16_gfx1201",
+        body_pc: 143,
+        category: Category::ModelLimit,
+        insn: "`global_load_d16_hi_u8 v7, v[3:4], off offset:4`",
+        need: "needs Load wait 0 (Use { reg: \"v7\" })",
+    },
+    // pins row 8, W4; artifact://97452 pm_pool_35 pc 323
+    PoolBody {
+        tid: 35,
+        target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q6_k_f16_gfx1201",
+        body_pc: 195,
+        category: Category::Candidate,
+        insn: "`global_load_d16_hi_u8 v0, v[7:8], off offset:32`",
+        need: "needs Store wait 0 (War { reg: \"v0\" })",
+    },
+    // pins row 3, W3
+    PoolBody {
+        tid: 36,
+        target: "ggml_convert_shim_gfx1201.co#ggml_dequant_iq4_xs_f32_gfx1201",
+        body_pc: 252,
+        category: Category::Candidate,
+        insn: "`v_and_b32_e32 v8, 0x7fffffff, v7`",
+        need: "needs Store wait 1 (War { reg: \"v8\" })",
+    },
+    // pins row 5
+    PoolBody {
+        tid: 37,
+        target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q4_k_f32_gfx1201",
+        body_pc: 152,
+        category: Category::ModelLimit,
+        insn: "`global_load_d16_hi_u8 v5, v[1:2], off offset:4`",
+        need: "needs Load wait 0 (Use { reg: \"v5\" })",
+    },
+    // pins row 7; artifact://97452 pm_pool_38 pc 280
+    PoolBody {
+        tid: 38,
+        target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q5_k_f32_gfx1201",
+        body_pc: 152,
+        category: Category::ModelLimit,
+        insn: "`global_load_d16_hi_u8 v5, v[3:4], off offset:4`",
+        need: "needs Load wait 0 (Use { reg: \"v5\" })",
+    },
+    // pins row 9; artifact://97452 pm_pool_39 pc 289
+    PoolBody {
+        tid: 39,
+        target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q6_k_f32_gfx1201",
+        body_pc: 161,
+        category: Category::ModelLimit,
+        insn: "`global_load_d16_hi_u8 v1, v[2:3], off`",
+        need: "needs Load wait 0 (Use { reg: \"v1\" })",
+    },
+    // pins row 10, W5; artifact://97452 pm_pool_40 pc 295
+    PoolBody {
+        tid: 40,
+        target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q8_0_f32_gfx1201",
+        body_pc: 167,
+        category: Category::Candidate,
+        insn: "`v_bfe_u32 v2, v5, 16, 1`",
+        need: "needs Store wait 0 (War { reg: \"v2\" })",
+    },
+    // pins row 14
+    PoolBody {
+        tid: 43,
+        target: "ggml_convert_shim_gfx1201.co#ggml_get_row_q4_k_f32_gfx1201",
+        body_pc: 45,
+        category: Category::ModelLimit,
+        insn: "`global_load_d16_hi_u8 v4, v[1:2], off offset:4`",
+        need: "needs Load wait 0 (Use { reg: \"v4\" })",
+    },
+    // pins row 11
+    PoolBody {
+        tid: 44,
+        target: "ggml_convert_shim_gfx1201.co#ggml_get_row1_q4_k_f32_gfx1201",
+        body_pc: 38,
+        category: Category::ModelLimit,
+        insn: "`global_load_d16_hi_u8 v4, v[1:2], off offset:4`",
+        need: "needs Load wait 0 (Use { reg: \"v4\" })",
+    },
+    // pins row 15; artifact://97452 pm_pool_45 pc 173
+    PoolBody {
+        tid: 45,
+        target: "ggml_convert_shim_gfx1201.co#ggml_get_row_q5_k_f32_gfx1201",
+        body_pc: 45,
+        category: Category::ModelLimit,
+        insn: "`global_load_d16_hi_u8 v5, v[1:2], off offset:4`",
+        need: "needs Load wait 0 (Use { reg: \"v5\" })",
+    },
+    // pins row 12; artifact://97452 pm_pool_46 pc 166
+    PoolBody {
+        tid: 46,
+        target: "ggml_convert_shim_gfx1201.co#ggml_get_row1_q5_k_f32_gfx1201",
+        body_pc: 38,
+        category: Category::ModelLimit,
+        insn: "`global_load_d16_hi_u8 v5, v[1:2], off offset:4`",
+        need: "needs Load wait 0 (Use { reg: \"v5\" })",
+    },
+    // pins row 16; artifact://97452 pm_pool_47 pc 194
+    PoolBody {
+        tid: 47,
+        target: "ggml_convert_shim_gfx1201.co#ggml_get_row_q6_k_f32_gfx1201",
+        body_pc: 66,
+        category: Category::ModelLimit,
+        insn: "`global_load_d16_hi_u8 v0, v[4:5], off`",
+        need: "needs Load wait 1 (Use { reg: \"v0\" })",
+    },
+    // pins row 13; artifact://97452 pm_pool_48 pc 146
+    PoolBody {
+        tid: 48,
+        target: "ggml_convert_shim_gfx1201.co#ggml_get_row1_q6_k_f32_gfx1201",
+        body_pc: 18,
+        category: Category::ModelLimit,
+        insn: "`v_sub_co_u32 v2, s3, v0, v1`",
+        need: "needs Km wait 0 (Waw { reg: \"s[4:6]\" })",
+    },
+];

@@ -672,6 +672,35 @@ impl Ledger {
         self.wait(counter, count)
     }
 
+    /// Verifier-only (`ledger_cfg`; the Builder never calls it, its emission is unchanged):
+    /// retire what the architecture's issue bound retires. A counter field holds at most
+    /// `cap(counter)` outstanding operations (63 for LOADcnt/STOREcnt/DScnt and gfx11
+    /// VMcnt/VScnt/LGKMcnt, 31 for KMcnt, the `Caps` maxima on CDNA), and a wave stalls issue
+    /// at that maximum: when the next operation would exceed it, the oldest has retired. So a
+    /// counter with more than `cap` recorded operations keeps only its youngest `cap`, **but
+    /// only when its whole queue is ordered, known and of one class** (`wait_replay`'s
+    /// condition: every operation in order, none `maybe`, one order class). A mixed queue
+    /// (DS with SMEM, buffer with global on gfx11, atomics, out-of-order SMEM) retires in an
+    /// order the model does not know and is never clipped: its depth stays unbounded and
+    /// fails closed at the walk's `COUNTER_CAP`. A counter without a cap is never clipped.
+    pub(crate) fn clip_to_issue_bound(&mut self, cap: impl Fn(Counter) -> Option<u8>) {
+        let mut counters: Vec<Counter> = Vec::new();
+        for p in &self.pending {
+            if !counters.contains(&p.counter) {
+                counters.push(p.counter);
+            }
+        }
+        for counter in counters {
+            let Some(cap) = cap(counter).filter(|&c| c > 0) else {
+                continue;
+            };
+            let depth = self.pending.iter().filter(|p| p.counter == counter).count();
+            if depth > usize::from(cap) {
+                self.wait_replay(counter, cap);
+            }
+        }
+    }
+
     pub fn wait_instruction(
         arch: Arch,
         waits: &[(Counter, u8, Reason)],

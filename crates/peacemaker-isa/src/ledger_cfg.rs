@@ -50,13 +50,53 @@
 //!   operation is an error, not a skipped line (`ttmp` operands of other
 //!   instructions, e.g. workgroup-id reads, are not tracked). Outside `foreign`, an instruction with empty metadata is taken
 //!   at its word: it has no memory effect.
-//! * No operation is ever dropped: more than [`COUNTER_CAP`] pending operations
-//!   on one counter, more than [`MAX_STATES_PER_LABEL`] distinct states at one
-//!   label, more than [`MAX_STEPS`] instruction visits, or control flow the walk
-//!   cannot follow (indirect branches, calls) fail closed.
+//! * Architectural issue bound (`Ledger::clip_to_issue_bound`, applied after every
+//!   recorded memory operation; verifier only, the Builder's emission is unchanged): a
+//!   counter field holds at most its maximum of outstanding operations (63 on
+//!   LOADcnt/STOREcnt/DScnt and gfx11 VMcnt/VScnt/LGKMcnt, 31 on KMcnt, the `Caps` maxima
+//!   on CDNA) and a wave stalls issue at that maximum, so the oldest operation has retired
+//!   when the one past the maximum issues. A counter's queue is clipped to its youngest
+//!   maximum **only when every operation on it is in order, certain and of one order
+//!   class**; a mixed or out-of-order queue (atomics, SMEM, DS with SMEM, buffer with global
+//!   on gfx11) is never clipped, since its retirement order is unknown. This is what bounds
+//!   the fixpoint of a loop that issues ordered stores or loads without a wait, and it
+//!   frees exactly the oldest operation's registers (the 64th store issued retires the
+//!   first; the second stays locked).
+//! * Label dedup after a wait-only prefix: a label's contiguous run of `s_wait*` lines
+//!   (ended by the next label or any other instruction, so a branch target is never inside
+//!   it) is applied to the path's ledger first, counting its steps, and the label's seen
+//!   states are keyed on the ledger after it. Nothing uses a register or branches between
+//!   the label and those waits, so this is the walk it would do anyway; distinct incoming
+//!   states that a full drain collapses are one state. General rule, no label is special
+//!   and the state bound is unchanged.
+//! * No operation is ever dropped except by that bound: more than [`COUNTER_CAP`] pending
+//!   operations on one counter (reachable only for unclipped mixed or out-of-order queues),
+//!   more than [`MAX_STATES_PER_LABEL`] distinct states at one label, more than
+//!   [`MAX_STEPS`] instruction visits, or control flow the walk cannot follow (indirect
+//!   branches, calls) fail closed.
 //!
 //! A violation names the instruction, the counter wait it lacks, and the branch
 //! edges of the path that reaches it.
+//!
+//! [`verify_dispatcher`] runs the same walk for a pool whose hosted bodies are foreign
+//! lifted text with findings of their own: it tracks every body memory operation and wait
+//! (so the dispatcher after a body sees the state the body leaves) but does not report a
+//! hazard whose pc lies inside a body span; every hazard outside the exact spans is
+//! fatal and all are reported. It proves the dispatcher only, never a body.
+//!
+//! Region summary (dispatcher mode only): a body whose every exiting path provably leaves
+//! every memory counter drained is not walked; the walk goes from its entry label to its
+//! exit label with an empty ledger. The proof is a finite may-pending dataflow over the
+//! body's exact CFG (`region_exit_is_drained`): every counter of the architecture is
+//! potentially pending at the entry, a memory operation sets its counter's bit, a wait of
+//! count zero clears it, joins are bitwise OR and loops reach a fixed point. Every branch
+//! must stay inside the body or land on the exit label, and nothing may be undecodable or
+//! indirect; otherwise (and for any counter bit left at the exit) there is no summary and
+//! the body is walked as before, so the effect of an unproven body on the dispatcher is
+//! unchanged. The summary says the emitted waits retire any incoming or body operation
+//! on every exiting path; it says nothing about the body's uses, which only the strict
+//! [`verify`] checks. It is general (all counters, no label names) and finite, so it
+//! bounds the walk without raising [`MAX_STATES_PER_LABEL`].
 
 use crate::{
     arch::Arch,
@@ -86,6 +126,12 @@ pub struct Stats {
     pub steps: u64,
     /// Distinct (label, in-flight state) pairs reached.
     pub label_states: usize,
+    /// Distinct hazards (pc, counter, count, reason) found inside the body spans of
+    /// [`verify_dispatcher`] and not reported there; always 0 for [`verify`].
+    pub suppressed: usize,
+    /// Regions [`verify_dispatcher`] did not walk because their exit is proven to leave every
+    /// memory counter drained on every path (module docs); always 0 for [`verify`].
+    pub summarized: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -422,9 +468,26 @@ pub fn region_spans(regions: &[RegionProof]) -> Vec<Range<usize>> {
 }
 
 /// `verify` of a finished emission, its region bodies decoded through the lift's
-/// instruction table.
+/// instruction table. Strict: the bodies' findings are findings.
 pub fn verify_emitted(emitted: &Emitted) -> Result<Stats, String> {
     verify(&emitted.program, &region_spans(&emitted.proof.regions))
+}
+
+/// [`verify_dispatcher`] of a finished emission: its region bodies are exactly the
+/// `entry_pc + 1 .. exit_pc` spans of its `RegionProof`s (`region_spans`).
+pub fn verify_dispatcher_emitted(emitted: &Emitted) -> Result<Stats, String> {
+    verify_dispatcher(&emitted.program, &region_spans(&emitted.proof.regions))
+}
+
+/// How the walk treats a hazard (a use, WAR or WAW whose wait is missing on a path).
+#[derive(Clone, Copy)]
+enum Mode<'a> {
+    /// Every hazard is a finding; the first stops the walk.
+    Strict,
+    /// Hazards at a pc inside `body` are not reported (only counted); every other hazard
+    /// is collected and the walk goes on, so a later dispatcher hazard is found even when
+    /// a body has findings.
+    Dispatcher { body: &'a [Range<usize>] },
 }
 
 /// Check that every instruction of `program` has every wait it needs on every
@@ -432,6 +495,159 @@ pub fn verify_emitted(emitted: &Emitted) -> Result<Stats, String> {
 /// ranges of foreign text, decoded through the lift's instruction table. `Err`
 /// names the first violation found, or the bound that stopped the walk.
 pub fn verify(program: &Program, foreign: &[Range<usize>]) -> Result<Stats, String> {
+    walk(program, foreign, Mode::Strict)
+}
+
+/// Prove the **dispatcher** of `program` and nothing of its bodies: `body` are the
+/// instruction ranges of the hosted bodies (foreign lifted text, decoded as in [`verify`]).
+/// The walk is the same as [`verify`]'s, so every body's memory operations and waits are
+/// tracked and their pending state reaches the dispatcher code after the body exactly as
+/// it would at run time; the only difference is that a hazard at a pc inside one of the
+/// `body` ranges is not reported (it is counted in [`Stats::suppressed`]). Every other
+/// hazard, anywhere outside those exact spans (including a region's entry and exit
+/// labels and the drains around them), is fatal with no allowance, and all of them are
+/// reported, not only the first. Decode errors, indirect control flow and the walk's
+/// bounds are errors everywhere, bodies included.
+///
+/// `Ok` therefore says nothing about the bodies' own waits: use [`verify`] for those.
+///
+/// A region whose exit is proven to leave every counter drained (`Stats::summarized`) is not
+/// walked, so its body hazards are not even counted in `Stats::suppressed`.
+pub fn verify_dispatcher(program: &Program, body: &[Range<usize>]) -> Result<Stats, String> {
+    walk(program, body, Mode::Dispatcher { body })
+}
+
+/// The bit of `counter` in a may-pending set.
+fn counter_bit(counter: Counter) -> u8 {
+    match counter {
+        Counter::Load => 1,
+        Counter::Store => 2,
+        Counter::Ds => 4,
+        Counter::Km => 8,
+        Counter::Vm => 16,
+        Counter::Vs => 32,
+        Counter::Lgkm => 64,
+        Counter::Exp => 128,
+    }
+}
+
+/// Every counter that a recorded operation can occupy.
+const COUNTERS: [Counter; 8] = [
+    Counter::Load,
+    Counter::Store,
+    Counter::Ds,
+    Counter::Km,
+    Counter::Vm,
+    Counter::Vs,
+    Counter::Lgkm,
+    Counter::Exp,
+];
+
+/// Whether the region whose body is `span` (`entry_pc + 1 .. exit_pc`, the entry label at
+/// `span.start - 1` and the exit label at `span.end`) leaves every memory counter at zero on
+/// every path that reaches its exit label, whatever was in flight at its entry.
+///
+/// A finite forward may-pending dataflow over the body's exact CFG: at the entry every
+/// counter is potentially pending; a memory operation sets its counter's bit (taken from the
+/// ledger's own classification of the decoded instruction); a wait of count zero clears the
+/// bit of its counter (a nonzero wait and `depctr_vm_vsrc` clear nothing: conservative);
+/// joins are bitwise OR, loops reach a fixed point since a state only grows. Every branch
+/// must land inside the body or on the exit label, and nothing may be undecodable or
+/// indirect; any such failure, or a nonzero set at the exit label, is `false` (no summary,
+/// the caller walks the body instead). It proves only that the emitted waits retire any
+/// incoming and body operation on every exiting path; it says nothing about the body's uses.
+fn region_exit_is_drained(
+    insns: &[Instruction],
+    decoded: &HashMap<usize, Instruction>,
+    labels: &HashMap<&str, usize>,
+    arch: Arch,
+    span: &Range<usize>,
+) -> bool {
+    let (start, end) = (span.start, span.end);
+    if start == 0
+        || start > end
+        || end >= insns.len()
+        || is_label(insns[start - 1].text.trim()).is_none()
+        || is_label(insns[end].text.trim()).is_none()
+    {
+        return false;
+    }
+    let mut may: Vec<Option<u8>> = vec![None; end - start + 1];
+    // Every counter the architecture has may hold an incoming operation (`capacity` is `Some`
+    // exactly for those); a bit of a counter it lacks could never be cleared by a wait.
+    let entry_bits = COUNTERS
+        .into_iter()
+        .filter(|&counter| capacity(arch, counter).is_some())
+        .fold(0u8, |bits, counter| bits | counter_bit(counter));
+    may[0] = Some(entry_bits);
+    let mut work = vec![start];
+    while let Some(pc) = work.pop() {
+        if pc == end {
+            continue;
+        }
+        let Some(bits) = may[pc - start] else {
+            continue;
+        };
+        let text = insns[pc].text.trim();
+        let mut out = bits;
+        let mut successors: Vec<usize> = Vec::new();
+        if is_label(text).is_some() {
+            successors.push(pc + 1);
+        } else {
+            let insn = decoded.get(&pc).unwrap_or(&insns[pc]);
+            let mnemonic = insn.mnemonic();
+            if mnemonic.starts_with("s_endpgm") {
+                continue;
+            }
+            if let Some(target) = sync::branch_target(text) {
+                let Some(&target_pc) = labels.get(target) else {
+                    return false;
+                };
+                successors.push(target_pc);
+                if mnemonic != "s_branch" {
+                    successors.push(pc + 1);
+                }
+            } else {
+                if indirect(mnemonic) {
+                    return false;
+                }
+                if text.starts_with("s_wait") {
+                    let Ok(effects) = decode(text, arch) else {
+                        return false;
+                    };
+                    for effect in effects {
+                        if let Effect::Wait(counter, 0) = effect {
+                            out &= !counter_bit(counter);
+                        }
+                    }
+                } else if insn.memory.is_some() {
+                    let mut probe = Ledger::default();
+                    probe.record(arch, insn);
+                    for counter in COUNTERS {
+                        if probe.has_pending(counter) {
+                            out |= counter_bit(counter);
+                        }
+                    }
+                }
+                successors.push(pc + 1);
+            }
+        }
+        for next in successors {
+            if next < start || next > end {
+                return false;
+            }
+            let slot = &mut may[next - start];
+            let merged = slot.unwrap_or(0) | out;
+            if *slot != Some(merged) {
+                *slot = Some(merged);
+                work.push(next);
+            }
+        }
+    }
+    may[end - start].is_none_or(|bits| bits == 0)
+}
+
+fn walk(program: &Program, foreign: &[Range<usize>], mode: Mode) -> Result<Stats, String> {
     let insns = &program.instructions;
     let arch = program.arch;
     let labels: HashMap<&str, usize> = insns
@@ -453,6 +669,23 @@ pub fn verify(program: &Program, foreign: &[Range<usize>]) -> Result<Stats, Stri
     let mut seen: HashMap<usize, HashSet<StateKey>> = HashMap::new();
     let mut witness = Witness::default();
     let mut stats = Stats::default();
+    // Dispatcher mode: the hazards reported (deduplicated per pc and need), their messages,
+    // and the distinct hazards left unreported inside the body spans.
+    let mut reported: HashSet<(usize, String)> = HashSet::new();
+    let mut collected: Vec<String> = Vec::new();
+    let mut suppressed: HashSet<(usize, String)> = HashSet::new();
+    // Dispatcher mode: a region whose exit is proven drained on every path (see
+    // `region_exit_is_drained`) is not walked; the walk goes from its entry label to its exit
+    // label with an empty ledger. An unproven region is walked as before.
+    let mut summaries: HashMap<usize, usize> = HashMap::new();
+    if let Mode::Dispatcher { body } = mode {
+        for span in body {
+            if region_exit_is_drained(insns, &decoded, &labels, arch, span) {
+                summaries.insert(span.start - 1, span.end);
+            }
+        }
+    }
+    stats.summarized = summaries.len();
     let mut stack: Vec<(usize, Ledger, Option<usize>)> = vec![(0, Ledger::default(), None)];
     while let Some((mut pc, mut ledger, mut path)) = stack.pop() {
         // The label this walk last passed: the block a violation sits in.
@@ -469,6 +702,29 @@ pub fn verify(program: &Program, foreign: &[Range<usize>]) -> Result<Stats, Stri
             }
             let text = emitted.text.trim();
             if let Some(label) = is_label(text) {
+                // The contiguous wait-only prefix right after the label (no use, def or
+                // branch between the label and these waits, and the next label or any other
+                // instruction ends it, so a branch target is never inside it) runs on every
+                // path that reaches the label. Apply it first, counting its steps, and
+                // dedup on the state after it: distinct in-flight states that the prefix
+                // collapses (a full drain) are one state, and the walk continues after the
+                // prefix with exactly the ledger it would have had passing through it.
+                let mut end = pc + 1;
+                while let Some(next) = insns.get(end) {
+                    let next_text = next.text.trim();
+                    if !next_text.starts_with("s_wait") || is_label(next_text).is_some() {
+                        break;
+                    }
+                    let effects = decode(next_text, arch).map_err(|e| format!("pc {end} {e}"))?;
+                    for effect in effects {
+                        match effect {
+                            Effect::Wait(counter, count) => ledger.wait_replay(counter, count),
+                            Effect::ReleaseStoreSources => ledger.release_store_sources(),
+                        }
+                    }
+                    stats.steps += 1;
+                    end += 1;
+                }
                 let states = seen.entry(pc).or_default();
                 if !states.insert(ledger.state_key()) {
                     break;
@@ -482,7 +738,13 @@ pub fn verify(program: &Program, foreign: &[Range<usize>]) -> Result<Stats, Stri
                     ));
                 }
                 block = label;
-                pc += 1;
+                pc = match summaries.get(&pc) {
+                    Some(&exit) => {
+                        ledger = Ledger::default();
+                        exit
+                    }
+                    None => end,
+                };
                 continue;
             }
             let mnemonic = insn.mnemonic();
@@ -525,18 +787,47 @@ pub fn verify(program: &Program, foreign: &[Range<usize>]) -> Result<Stats, Stri
             // wait: the counter cannot hold the operation plus that many younger ones, so
             // the operation has retired (`Ledger::retire_count` reports the exact count up
             // to 63 younger on RDNA). The pending operations stay in the ledger.
-            if let Some((counter, count, reason)) = ledger
+            let unmet: Vec<_> = ledger
                 .required(insn)
                 .into_iter()
-                .find(|(counter, count, _)| capacity(arch, *counter).is_none_or(|cap| *count < cap))
-            {
-                return Err(format!(
-                    "pc {pc} `{text}` (after label `{block}`): needs {counter:?} wait {count} \
-                     ({reason:?}) but a path reaches it without one: {}",
-                    witness.describe(path, insns)
-                ));
+                .filter(|(counter, count, _)| {
+                    capacity(arch, *counter).is_none_or(|cap| *count < cap)
+                })
+                .collect();
+            if !unmet.is_empty() {
+                match mode {
+                    Mode::Strict => {
+                        let (counter, count, reason) = &unmet[0];
+                        return Err(format!(
+                            "pc {pc} `{text}` (after label `{block}`): needs {counter:?} wait {count} \
+                             ({reason:?}) but a path reaches it without one: {}",
+                            witness.describe(path, insns)
+                        ));
+                    }
+                    Mode::Dispatcher { body } => {
+                        let in_body = body.iter().any(|span| span.contains(&pc));
+                        for (counter, count, reason) in &unmet {
+                            let need = format!("{counter:?} wait {count} ({reason:?})");
+                            if in_body {
+                                suppressed.insert((pc, need));
+                            } else if reported.insert((pc, need.clone())) {
+                                collected.push(format!(
+                                    "pc {pc} `{text}` (after label `{block}`): needs {need} but a \
+                                     path reaches it without one: {}",
+                                    witness.describe(path, insns)
+                                ));
+                            }
+                        }
+                    }
+                }
             }
             ledger.record(arch, insn);
+            if insn.memory.is_some() {
+                // The architectural issue bound (module docs): the oldest operation of an
+                // ordered same-class queue has retired when the one past the counter field's
+                // maximum issues; mixed or out-of-order queues are never clipped.
+                ledger.clip_to_issue_bound(|counter| capacity(arch, counter));
+            }
             if insn.memory.is_some() {
                 if let Some((counter, depth)) = ledger.deepest_counter() {
                     if depth > COUNTER_CAP {
@@ -553,6 +844,14 @@ pub fn verify(program: &Program, foreign: &[Range<usize>]) -> Result<Stats, Stri
             pc += 1;
         }
     }
+    if !collected.is_empty() {
+        return Err(format!(
+            "{} dispatcher hazard(s) outside the body spans:\n{}",
+            collected.len(),
+            collected.join("\n")
+        ));
+    }
+    stats.suppressed = suppressed.len();
     Ok(stats)
 }
 
@@ -950,32 +1249,105 @@ mod tests {
         assert!(e.contains("needs Load wait 0"), "{e}");
     }
 
-    /// Past the per-counter bound the walk fails closed; below it the oldest
-    /// pending operation's hazards are still checked.
+    /// A returnless atomic: STOREcnt, never assumed in order, its sources locked until it retires.
+    fn atomic(src: u8) -> Instruction {
+        Instruction::new(
+            format!("global_atomic_add_u32 v0, v{src}, s[0:1]"),
+            vec![],
+            vec![v(0), v(src)],
+        )
+        .memory(MemoryClass::VmemAtomic { returns: false })
+    }
+
+    /// Below the architectural issue bound the oldest pending operation's hazards are still
+    /// checked; at it the oldest has retired and only it (the stores here use distinct
+    /// source registers v1..).
     #[test]
-    fn pending_depth_is_bounded_without_dropping_the_oldest_operation() {
+    fn issue_bound_retires_exactly_the_oldest_of_an_ordered_queue() {
         // The oldest store locks v1; 10 younger stores do not hide it.
         let mut insns = vec![store(1)];
         insns.extend((0..10).map(|_| store(2)));
         insns.extend([mov(1, 5), ins("s_endpgm")]);
         let e = check(&gfx12(insns)).unwrap_err();
         assert!(e.contains("War"), "{e}");
-        // More than the cap pending on one counter is refused, never truncated.
-        let mut insns = vec![store(1)];
-        insns.extend((0..=COUNTER_CAP).map(|_| store(2)));
+        let stores = |n: u8, tail: Instruction| {
+            let mut insns: Vec<Instruction> = (1..=n).map(store).collect();
+            insns.extend([tail, ins("s_endpgm")]);
+            gfx12(insns)
+        };
+        // 63 outstanding stores is the counter maximum: the oldest is still locked.
+        let e = check(&stores(63, mov(1, 5))).unwrap_err();
+        assert!(e.contains("War"), "{e}");
+        // The 64th issues only after the oldest retired: its source is free, the second's
+        // is still locked.
+        check(&stores(64, mov(1, 5))).unwrap();
+        let e = check(&stores(64, mov(2, 5))).unwrap_err();
+        assert!(e.contains("War") && e.contains("v2"), "{e}");
+        // Loads retire the same way (LOADcnt, one order class).
+        let loads = |n: u8, use_reg: u8| {
+            let mut insns: Vec<Instruction> = (1..=n).map(load).collect();
+            insns.extend([mov(100, use_reg), ins("s_endpgm")]);
+            gfx12(insns)
+        };
+        check(&loads(64, 1)).unwrap();
+        assert!(check(&loads(64, 2)).is_err());
+    }
+
+    /// A mixed or out-of-order queue is never clipped: one atomic among in-order stores, or
+    /// out-of-order SMEM past the KMcnt maximum, keeps its oldest operation pending.
+    #[test]
+    fn issue_bound_never_clips_mixed_or_out_of_order_queues() {
+        let mut insns = vec![atomic(1)];
+        insns.extend((2..=64).map(store));
+        insns.extend([mov(1, 5), ins("s_endpgm")]);
+        let e = check(&gfx12(insns)).unwrap_err();
+        assert!(e.contains("War"), "{e}");
+        // 32 SMEM loads (KMcnt maximum 31): out of order, so the first stays pending.
+        let smem = |dst: u8| {
+            Instruction::new(
+                format!("s_load_b32 s{dst}, s[0:1], 0x0"),
+                vec![s(dst)],
+                vec![],
+            )
+            .memory(MemoryClass::SmemLoad)
+        };
+        let mut insns: Vec<Instruction> = (4..36).map(smem).collect();
+        insns.extend([
+            Instruction::new("s_mov_b32 s100, s4", vec![s(100)], vec![s(4)]),
+            ins("s_endpgm"),
+        ]);
+        let e = check(&gfx12(insns)).unwrap_err();
+        assert!(e.contains("needs Km wait"), "{e}");
+    }
+
+    /// What the issue bound does not bound still fails closed: more than the cap pending on
+    /// one counter is refused, never truncated, when its queue is unclipped (atomics).
+    #[test]
+    fn unclipped_pending_depth_fails_closed() {
+        let mut insns = vec![atomic(1)];
+        insns.extend((0..=COUNTER_CAP).map(|_| atomic(2)));
         insns.extend([mov(1, 5), ins("s_endpgm")]);
         let e = check(&gfx12(insns)).unwrap_err();
         assert!(e.contains("pending") && e.contains("unbounded"), "{e}");
-        // A loop issuing a store per iteration without waiting grows without bound.
+        // A loop issuing an atomic per iteration without waiting grows without bound.
+        let p = gfx12(vec![
+            ins("H:"),
+            atomic(1),
+            ins("s_cbranch_scc1 H"),
+            ins("s_endpgm"),
+        ]);
+        let e = check(&p).unwrap_err();
+        assert!(e.contains("unbounded"), "{e}");
+        // An in-order store per iteration is bounded by the issue bound: the queue reaches the
+        // 63-deep maximum and stays there (the store only reads its source: no hazard).
         let p = gfx12(vec![
             ins("H:"),
             store(1),
             ins("s_cbranch_scc1 H"),
             ins("s_endpgm"),
         ]);
-        let e = check(&p).unwrap_err();
-        assert!(e.contains("unbounded"), "{e}");
-        // ... and passes once the iteration waits.
+        check(&p).unwrap();
+        // ... and still passes once the iteration waits.
         let p = gfx12(vec![
             ins("H:"),
             store(1),
@@ -999,6 +1371,55 @@ mod tests {
         insns.push(ins("s_endpgm"));
         let e = check(&gfx12(insns)).unwrap_err();
         assert!(e.contains("state explosion"), "{e}");
+    }
+
+    /// More than `MAX_STATES_PER_LABEL` distinct states reach the last label: it fails closed
+    /// unless the label starts with a wait-only prefix that drains them (the walk dedups on
+    /// the state after that prefix), and a label that merely follows the prefix does not
+    /// count as part of it.
+    #[test]
+    fn label_starting_with_a_drain_collapses_incoming_states() {
+        // Ten diamonds: the intermediate labels hold at most 512 states, the last 1024.
+        let diamonds = |tail: &[&str]| {
+            let mut insns = Vec::new();
+            for k in 0..10u8 {
+                insns.push(ins(&format!("s_cbranch_scc1 J{k}")));
+                insns.push(store(10 + k));
+                insns.push(ins(&format!("J{k}:")));
+            }
+            insns.extend(tail.iter().map(|t| ins(t)));
+            insns.push(ins("s_endpgm"));
+            gfx12(insns)
+        };
+        let e = check(&diamonds(&[])).unwrap_err();
+        assert!(e.contains("state explosion") && e.contains("J9"), "{e}");
+        check(&diamonds(&["s_wait_storecnt 0x0"])).unwrap();
+        // A prefix that does not drain the stores does not collapse the states.
+        let e = check(&diamonds(&["s_wait_loadcnt 0x0"])).unwrap_err();
+        assert!(e.contains("state explosion"), "{e}");
+        // The prefix ends at the next label: a branch to that label skips the drain.
+        let p = gfx12(vec![
+            store(1),
+            ins("s_cbranch_scc1 B"),
+            ins("A:"),
+            ins("s_wait_storecnt 0x0"),
+            ins("B:"),
+            mov(1, 5),
+            ins("s_endpgm"),
+        ]);
+        let e = check(&p).unwrap_err();
+        assert!(e.contains("War"), "{e}");
+        // ... while the same drain right after B (its actual prefix) covers every path.
+        let p = gfx12(vec![
+            store(1),
+            ins("s_cbranch_scc1 B"),
+            ins("A:"),
+            ins("B:"),
+            ins("s_wait_alu depctr_vm_vsrc(0)"),
+            mov(1, 5),
+            ins("s_endpgm"),
+        ]);
+        check(&p).unwrap();
     }
 
     #[test]
@@ -1044,5 +1465,259 @@ mod tests {
         // A foreign line the table cannot decode fails closed.
         let e = verify(&text(&["v_not_an_instruction v1"]), &[0..1]).unwrap_err();
         assert!(e.contains("not decodable"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod dispatcher_tests {
+    use super::*;
+
+    fn v(base: u8) -> RegRef {
+        RegRef {
+            kind: Kind::V,
+            base,
+            len: 1,
+        }
+    }
+    fn ins(text: &str) -> Instruction {
+        Instruction::new(text, vec![], vec![])
+    }
+    /// A dispatcher store: it carries its own metadata and locks v1 until its store wait.
+    fn store_v1() -> Instruction {
+        Instruction::new("global_store_b32 v0, v1, s[0:1]", vec![], vec![v(0), v(1)])
+            .memory(MemoryClass::VmemStore)
+    }
+    /// A dispatcher instruction that overwrites v1 (a WAR on a pending store of v1).
+    fn set_v1(imm: u32) -> Instruction {
+        Instruction::new(format!("v_mov_b32_e32 v1, {imm}"), vec![v(1)], vec![])
+    }
+    /// A dispatcher instruction that defines `dst` and uses `src` (a RAW on a pending load of
+    /// `src`).
+    fn dispatcher_mov(dst: u8, src: u8) -> Instruction {
+        Instruction::new(
+            format!("v_mov_b32 v{dst}, v{src}"),
+            vec![v(dst)],
+            vec![v(src)],
+        )
+    }
+    fn gfx12(insns: Vec<Instruction>) -> Program {
+        Program {
+            arch: Arch::Gfx1201,
+            instructions: insns,
+        }
+    }
+
+    /// A hazard inside the body span is not reported (counted); the same hazard one pc
+    /// outside the span is fatal. Strict mode reports the body's.
+    #[test]
+    fn only_hazards_inside_the_exact_span_are_suppressed() {
+        // pc 0 dispatcher store locking v1; pc 1 and pc 2 each write v1 with no wait.
+        let p = gfx12(vec![store_v1(), set_v1(5), set_v1(6), ins("s_endpgm")]);
+        assert!(verify(&p, &[1..3]).is_err(), "strict reports the body");
+        let stats = verify_dispatcher(&p, &[1..3]).unwrap();
+        assert_eq!(stats.suppressed, 2, "{stats:?}");
+        // One pc too short: pc 2 is dispatcher code and its hazard is fatal, pc 1's is not.
+        let e = verify_dispatcher(&p, &[1..2]).unwrap_err();
+        assert!(e.contains("1 dispatcher hazard(s)"), "{e}");
+        assert!(e.contains("pc 2 `v_mov_b32_e32 v1, 6`"), "{e}");
+        assert!(!e.contains("pc 1 `"), "{e}");
+        // One pc late: pc 1 is dispatcher code.
+        let e = verify_dispatcher(&p, &[2..3]).unwrap_err();
+        assert!(e.contains("pc 1 `v_mov_b32_e32 v1, 5`"), "{e}");
+        assert!(!e.contains("pc 2 `"), "{e}");
+        // No span at all: nothing is allowed.
+        let e = verify_dispatcher(&p, &[]).unwrap_err();
+        assert!(e.contains("2 dispatcher hazard(s)"), "{e}");
+    }
+
+    /// A body's memory operations are tracked: the load a body leaves pending is a hazard
+    /// for dispatcher code that uses it, and a body finding does not hide a later
+    /// dispatcher one (every dispatcher hazard is collected, not the first).
+    #[test]
+    fn body_effects_reach_the_dispatcher_and_body_findings_hide_nothing() {
+        let p = gfx12(vec![
+            // body span 0..2: a load and its unwaited use (a body finding)
+            ins("global_load_b32 v1, v0, s[0:1]"),
+            ins("v_mov_b32_e32 v3, v1"),
+            // dispatcher: still pending from the body, two distinct uses
+            dispatcher_mov(4, 1),
+            dispatcher_mov(5, 1),
+            ins("s_endpgm"),
+        ]);
+        let e = verify_dispatcher(&p, &[0..2]).unwrap_err();
+        assert!(e.contains("2 dispatcher hazard(s)"), "{e}");
+        assert!(e.contains("pc 2 `v_mov_b32 v4, v1`"), "{e}");
+        assert!(e.contains("pc 3 `v_mov_b32 v5, v1`"), "{e}");
+        assert!(!e.contains("v_mov_b32_e32 v3, v1"), "{e}");
+        // The body waited for itself before exit: only its finding remains, suppressed.
+        let p = gfx12(vec![
+            ins("global_load_b32 v1, v0, s[0:1]"),
+            ins("v_mov_b32_e32 v3, v1"),
+            ins("s_wait_loadcnt 0x0"),
+            dispatcher_mov(4, 1),
+            ins("s_endpgm"),
+        ]);
+        let stats = verify_dispatcher(&p, &[0..3]).unwrap();
+        assert_eq!(stats.suppressed, 1, "{stats:?}");
+    }
+
+    /// Only hazards are suppressed in a body: a line the lift table cannot decode and
+    /// unfollowable control flow stay errors.
+    #[test]
+    fn body_decode_errors_stay_fatal() {
+        let e = verify_dispatcher(
+            &gfx12(vec![ins("v_not_an_instruction v1"), ins("s_endpgm")]),
+            &[0..1],
+        )
+        .unwrap_err();
+        assert!(e.contains("not decodable"), "{e}");
+        let e = verify_dispatcher(
+            &gfx12(vec![ins("s_setpc_b64 s[0:1]"), ins("s_endpgm")]),
+            &[0..1],
+        )
+        .unwrap_err();
+        assert!(e.contains("cannot follow"), "{e}");
+    }
+
+    /// With no hazard anywhere dispatcher mode agrees with strict mode and suppresses nothing.
+    #[test]
+    fn clean_program_is_identical_in_both_modes() {
+        let p = gfx12(vec![
+            ins("global_load_b32 v1, v0, s[0:1]"),
+            ins("s_wait_loadcnt 0x0"),
+            ins("v_mov_b32_e32 v3, v1"),
+            ins("s_endpgm"),
+        ]);
+        let strict = verify(&p, &[0..3]).unwrap();
+        let dispatcher = verify_dispatcher(&p, &[0..3]).unwrap();
+        assert_eq!(strict, dispatcher);
+        assert_eq!(dispatcher.suppressed, 0);
+    }
+
+    fn sreg(base: u8) -> RegRef {
+        RegRef {
+            kind: Kind::S,
+            base,
+            len: 1,
+        }
+    }
+    /// A dispatcher load into `dst` (VMEM, LOADcnt).
+    fn dispatcher_load(dst: u8) -> Instruction {
+        Instruction::new(
+            format!("global_load_b32 v{dst}, v0, s[0:1]"),
+            vec![v(dst)],
+            vec![v(0)],
+        )
+        .memory(MemoryClass::VmemLoad)
+    }
+    /// `before`, a region (entry label, `body`, exit label) and `after`; the span is the body.
+    fn region(
+        before: Vec<Instruction>,
+        body: &[&str],
+        after: Vec<Instruction>,
+    ) -> (Program, Range<usize>) {
+        let mut insns = before;
+        insns.push(ins("R_entry:"));
+        let start = insns.len();
+        insns.extend(body.iter().map(|t| ins(t)));
+        let end = insns.len();
+        insns.push(ins("R_exit:"));
+        insns.extend(after);
+        insns.push(ins("s_endpgm"));
+        (gfx12(insns), start..end)
+    }
+    const DRAIN: [&str; 4] = [
+        "s_wait_loadcnt 0x0",
+        "s_wait_storecnt 0x0",
+        "s_wait_dscnt 0x0",
+        "s_wait_kmcnt 0x0",
+    ];
+
+    /// A region whose every exiting path ends in a full drain is not walked: the dispatcher
+    /// continues from its exit with nothing in flight, so what was pending at its entry is
+    /// retired, whatever the loop inside did.
+    #[test]
+    fn draining_suffix_region_is_summarized_to_an_empty_exit() {
+        let mut body = vec![
+            "LOOP:",
+            "global_load_b32 v1, v0, s[0:1]",
+            "global_store_b32 v0, v2, s[0:1]",
+            "s_cbranch_scc1 LOOP",
+        ];
+        body.extend(DRAIN);
+        let (p, span) = region(vec![dispatcher_load(7)], &body, vec![dispatcher_mov(3, 7)]);
+        let stats = verify_dispatcher(&p, &[span]).unwrap();
+        assert_eq!(stats.summarized, 1, "{stats:?}");
+    }
+
+    /// No summary, and the dispatcher hazard is still caught by walking the body, when a
+    /// branch bypasses the drain, when one counter's drain is missing on one branch, when a
+    /// wait is nonzero, and when a branch leaves the body; and a region with no drain at all
+    /// is never summarized.
+    #[test]
+    fn unproven_regions_are_walked_and_dispatcher_hazards_are_caught() {
+        // A branch around the whole drain: the load pending at entry stays pending.
+        let mut body = vec!["s_cbranch_scc1 SKIP"];
+        body.extend(DRAIN);
+        body.push("SKIP:");
+        let (p, span) = region(vec![dispatcher_load(7)], &body, vec![dispatcher_mov(3, 7)]);
+        let e = verify_dispatcher(&p, &[span]).unwrap_err();
+        assert!(e.contains("v_mov_b32 v3, v7") && e.contains("Load"), "{e}");
+        // One branch misses the KMcnt drain only: the SMEM load pending at entry is not retired.
+        let smem = Instruction::new("s_load_b32 s4, s[0:1], 0x0", vec![sreg(4)], vec![])
+            .memory(MemoryClass::SmemLoad);
+        let use_s4 = Instruction::new("s_mov_b32 s5, s4", vec![sreg(5)], vec![sreg(4)]);
+        let body = [
+            "s_cbranch_scc1 P",
+            "s_wait_kmcnt 0x0",
+            "P:",
+            "s_wait_loadcnt 0x0",
+            "s_wait_storecnt 0x0",
+            "s_wait_dscnt 0x0",
+        ];
+        let (p, span) = region(vec![smem.clone()], &body, vec![use_s4.clone()]);
+        let e = verify_dispatcher(&p, &[span]).unwrap_err();
+        assert!(
+            e.contains("s_mov_b32 s5, s4") && e.contains("Km wait"),
+            "{e}"
+        );
+        // The same body with the KMcnt drain on every path is summarized and passes.
+        let body = [
+            "s_cbranch_scc1 P",
+            "P:",
+            "s_wait_kmcnt 0x0",
+            "s_wait_loadcnt 0x0",
+            "s_wait_storecnt 0x0",
+            "s_wait_dscnt 0x0",
+        ];
+        let (p, span) = region(vec![smem], &body, vec![use_s4]);
+        assert_eq!(verify_dispatcher(&p, &[span]).unwrap().summarized, 1);
+        // A nonzero wait clears nothing; a branch out of the body and a body with no waits
+        // are not summarized either (they pass here only because nothing is used after).
+        let (p, span) = region(
+            vec![],
+            &[
+                "s_wait_loadcnt 0x1",
+                "s_wait_storecnt 0x0",
+                "s_wait_dscnt 0x0",
+                "s_wait_kmcnt 0x0",
+            ],
+            vec![],
+        );
+        assert_eq!(verify_dispatcher(&p, &[span]).unwrap().summarized, 0);
+        let (p, span) = region(
+            vec![],
+            &[
+                "s_cbranch_scc1 OUT",
+                "s_wait_loadcnt 0x0",
+                "s_wait_storecnt 0x0",
+                "s_wait_dscnt 0x0",
+                "s_wait_kmcnt 0x0",
+            ],
+            vec![ins("OUT:")],
+        );
+        assert_eq!(verify_dispatcher(&p, &[span]).unwrap().summarized, 0);
+        let (p, span) = region(vec![], &["global_load_b32 v1, v0, s[0:1]"], vec![]);
+        assert_eq!(verify_dispatcher(&p, &[span]).unwrap().summarized, 0);
     }
 }

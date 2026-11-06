@@ -12,7 +12,11 @@
 //!   does not depend on the builder's metadata.
 //! * `lifted_pools_...`: every gfx1201 kernel that `lift_region` converts is hosted by the
 //!   existing dispatcher (`lifted_dispatch_gfx1201::pool`), alone and with every other
-//!   converted kernel of its blockDim, and each pool is verified (`verify_emitted`).
+//!   converted kernel of its blockDim. Every pool must pass the dispatcher-only verifier
+//!   (`verify_dispatcher_emitted`: any hazard outside the exact body spans is fatal, no
+//!   allowance) and then the strict one (`verify_emitted`): a strict report is accepted only
+//!   inside a body span and only through an exact `POOL_BODY` entry (template id, body pc,
+//!   category).
 //!
 //! Every outcome lands in exactly one bucket: verified, finding (a real missing wait on a
 //! feasible path) or unsupported (an input the verifier refuses rather than skips). A finding
@@ -25,7 +29,7 @@ use peacemaker_ir::inst::{Abi, Arch as IrArch, Frontend, Kernel, Program as IrPr
 use peacemaker_isa::insn::{Instruction, Program};
 use peacemaker_isa::kernels::lifted_dispatch_gfx1201 as ld;
 use peacemaker_isa::ledger_cfg::{self, Stats};
-use peacemaker_isa::Arch;
+use peacemaker_isa::{Arch, Emitted};
 use peacemaker_lift::rewrite::region::{lift_region, LiftedRegion, RegionInputs};
 use peacemaker_lift::{lift_object, Options};
 use std::collections::BTreeMap;
@@ -33,26 +37,19 @@ use std::path::{Path, PathBuf};
 
 #[path = "ledger_cfg_pins/allowlist.rs"]
 mod allowlist;
-use allowlist::{FINDINGS, UNSUPPORTED};
+use allowlist::{Category, FINDINGS, POOL_BODY, UNSUPPORTED};
 
 /// gfx942 images: `lift_object` has no opcode table for them (they are emitted by the typed
 /// `cdna` builder and encoded by `peacemaker_cdna`), so there is no instruction text to
 /// verify here. They are counted, never verified.
 const GFX942: &str = "gfx942";
 
-/// The proof of the dispatcher finding every pool shares (`.Lnext`, `v_mov_b32_e32 v1, 0`,
-/// `needs Store wait 0`): the publish path of the dispatcher with a done event (a
-/// non-returning `global_atomic_add_u32 v1, v2, s[PTR_B]` that counts on STOREcnt and locks
-/// v1) takes `.Ltraced` with `TRACE_ON = 0`, which skips the trace block's `release(Dev)`
-/// (`storecnt 0`); the builder's linear `wait_all` at `.Ltraced` then emits no store wait
-/// (its linear path drained the atomic in the trace block), and the back edge `s_branch
-/// .Lnext` reaches `v_mov_b32_e32 v1, 0` while the atomic may still read v1. Both inputs are
-/// independent runtime values (task descriptor done_event, kernarg trace_on). The
-/// timeout-path witness the verifier first prints is scalar-infeasible (timeout forces
-/// `.Ldone`); this one is feasible. Source: `kernels/lifted_dispatch_gfx1201.rs` publish and
-/// trace blocks, `global_sync.rs` release/atomic accounting. No product fix is applied.
-const DISPATCHER_WAR: &str = "(after label `.Lnext`): needs Store wait 0";
-const DISPATCHER_WAR_INSN: &str = "`v_mov_b32_e32 v1, 0`";
+/// The dispatcher store-source WAR once shared by every pool (`.Lnext`, `v_mov_b32_e32 v1,
+/// 0`, `needs Store wait 0`) is FIXED by `1fc3fc059d` (the dispatcher backedge drains all
+/// counters before `s_branch .Lnext`) and kept only as history in
+/// `local://ledger-join-finding.md`; no pool allowlist entry for it remains.
+/// Marker `ld::pool` puts in the error of an emission its fatal verifier rejected.
+const POOL_VERIFY_FAILED: &str = "CFG wait verification failed";
 
 struct Image {
     file: String,
@@ -230,8 +227,117 @@ struct Region {
     region: LiftedRegion,
 }
 
+/// The pc a verifier report names (`pc <n> ...`).
+fn error_pc(error: &str) -> Option<usize> {
+    error
+        .strip_prefix("pc ")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// The `POOL_BODY` entry a strict report of a pool is, by template id, body pc and the exact
+/// instruction and need, or why it is none. A pc outside every body span (a dispatcher pc,
+/// a region's entry or exit label) has no entry by construction.
+fn classify_body(emitted: &Emitted, error: &str) -> Result<usize, String> {
+    let pc = error_pc(error).ok_or("not a hazard report")?;
+    let region = emitted
+        .proof
+        .regions
+        .iter()
+        .find(|r| (r.entry_pc + 1..r.exit_pc).contains(&pc))
+        .ok_or_else(|| {
+            format!("pc {pc} is outside every body span: a dispatcher finding has no allowance")
+        })?;
+    let tid = region
+        .template_id
+        .ok_or_else(|| format!("region {} has no template id", region.name))?;
+    // Region body lines follow the entry label and its `s_wait_alu 0x0`.
+    let body_pc = pc
+        .checked_sub(region.entry_pc + 2)
+        .ok_or_else(|| format!("pc {pc} is the region entry of template {tid}"))?;
+    let i = POOL_BODY
+        .iter()
+        .position(|a| a.tid == tid && a.body_pc == body_pc)
+        .ok_or_else(|| format!("unlisted body finding: template {tid}, body pc {body_pc}"))?;
+    let a = &POOL_BODY[i];
+    if !error.contains(a.insn) || !error.contains(a.need) {
+        return Err(format!(
+            "template {tid} body pc {body_pc} is listed for {} {} but the report differs",
+            a.insn, a.need
+        ));
+    }
+    Ok(i)
+}
+
+#[derive(Default)]
+struct PoolCounts {
+    built: usize,
+    clean: usize,
+    body_findings: usize,
+    suppressed: usize,
+    summarized: usize,
+}
+
+/// One built pool: dispatcher-only verification must pass; strict verification must be clean
+/// or report exactly one listed body finding. `hosted` are the template ids it hosts; `used`
+/// collects the entries a single-template pool reproduced.
+fn check_pool(
+    report: &mut Report,
+    counts: &mut PoolCounts,
+    used: &mut Vec<usize>,
+    target: &str,
+    emitted: &Emitted,
+    hosted: &[u32],
+) {
+    counts.built += 1;
+    let dispatcher = match ledger_cfg::verify_dispatcher_emitted(emitted) {
+        Ok(stats) => stats,
+        Err(e) => {
+            report.unmatched.push(format!("[DISPATCHER] {target}: {e}"));
+            return;
+        }
+    };
+    counts.suppressed += dispatcher.suppressed;
+    counts.summarized += dispatcher.summarized;
+    match ledger_cfg::verify_emitted(emitted) {
+        Ok(_) => {
+            let listed: Vec<u32> = hosted
+                .iter()
+                .copied()
+                .filter(|t| POOL_BODY.iter().any(|a| a.tid == *t))
+                .collect();
+            if dispatcher.suppressed != 0 || !listed.is_empty() {
+                report.unmatched.push(format!(
+                    "[POOL BODY] {target}: strict verification is clean but {} body hazard(s) \
+                     were suppressed and templates {listed:?} are listed (stale entries)",
+                    dispatcher.suppressed
+                ));
+            } else {
+                report.verified += 1;
+                counts.clean += 1;
+            }
+        }
+        Err(e) => match classify_body(emitted, &e) {
+            // A summarized region is not walked by the dispatcher-only verifier, so whether
+            // it counted this body finding as suppressed depends on the summary; the strict
+            // walk is what finds it and the exact entry is what accepts it.
+            Ok(i) => {
+                counts.body_findings += 1;
+                if hosted.len() == 1 {
+                    used.push(i);
+                }
+            }
+            Err(why) => report
+                .unmatched
+                .push(format!("[POOL BODY] {target}: {why}: {e}")),
+        },
+    }
+}
+
 #[test]
-fn lifted_pools_are_verified_and_share_exactly_the_dispatcher_finding() {
+fn lifted_pools_dispatcher_is_fatal_and_bodies_match_exact_entries() {
     let images = scan();
     let mut report = Report::default();
     let mut by_block: BTreeMap<u32, Vec<Region>> = BTreeMap::new();
@@ -272,25 +378,50 @@ fn lifted_pools_are_verified_and_share_exactly_the_dispatcher_finding() {
         }
     }
     assert!(!by_block.is_empty(), "no kernel converts to a region");
-    // The dispatcher finding is expected in every pool that builds; any other outcome needs
-    // its own allowlist entry.
-    let (mut pools, mut dispatcher) = (0usize, 0usize);
-    let mut outcome = |report: &mut Report, target: String, built: Result<_, String>| {
-        let result = built.and_then(|e| ledger_cfg::verify_emitted(&e));
-        match &result {
-            Err(e) if e.contains(DISPATCHER_WAR) && e.contains(DISPATCHER_WAR_INSN) => {
-                pools += 1;
-                dispatcher += 1;
-            }
-            Ok(_) => pools += 1,
-            // The pool itself was refused: no emission to verify.
-            Err(_) => {}
-        }
-        if !matches!(&result, Err(e) if e.contains(DISPATCHER_WAR) && e.contains(DISPATCHER_WAR_INSN))
+    // The body entries are literal: each names a template id of this scan and the `pins`
+    // finding it is the pool-hosted copy of (same target, instruction, need and category),
+    // and each template has at most one.
+    for a in POOL_BODY {
+        if !by_block
+            .values()
+            .flatten()
+            .any(|r| r.tid == a.tid && r.target == a.target)
         {
-            report.record("pools", &target, result);
+            report.unmatched.push(format!(
+                "[POOL BODY ENTRY] template {} is not {} in this scan",
+                a.tid, a.target
+            ));
         }
-    };
+        let prefix = match a.category {
+            Category::ModelLimit => "MODEL LIMITATION",
+            Category::Candidate => "UNPROVEN",
+        };
+        if !FINDINGS.iter().any(|f| {
+            f.scope == "pins"
+                && f.target == a.target
+                && f.needle.contains(a.insn)
+                && f.needle.contains(a.need)
+                && f.why.starts_with(prefix)
+        }) {
+            report.unmatched.push(format!(
+                "[POOL BODY ENTRY] template {}: no `pins` finding of {} with {} {} and category {:?}",
+                a.tid, a.target, a.insn, a.need, a.category
+            ));
+        }
+        if POOL_BODY.iter().filter(|b| b.tid == a.tid).count() != 1 {
+            report.unmatched.push(format!(
+                "[POOL BODY ENTRY] template {} has more than one entry",
+                a.tid
+            ));
+        }
+    }
+    // `ld::pool` already verifies its own emission with the dispatcher-only verifier and
+    // refuses it on any dispatcher hazard (`POOL_VERIFY_FAILED`); that is never a refusal
+    // with an allowlist entry. Preconstruction refusals (blockDim, SGPR limit, ...) are not
+    // verifier findings and keep their exact `UNSUPPORTED` entries.
+    let mut counts = PoolCounts::default();
+    let mut used: Vec<usize> = Vec::new();
+    let mut first_single: Option<Emitted> = None;
     for (&block, regions) in &by_block {
         let mut built = Vec::new();
         for r in regions {
@@ -303,14 +434,25 @@ fn lifted_pools_are_verified_and_share_exactly_the_dispatcher_finding() {
                 }],
                 None,
             );
-            if single.is_ok() {
-                built.push(r);
+            let target = format!("pool:b{block}:{}", r.target);
+            match single {
+                Ok(emitted) => {
+                    built.push(r);
+                    check_pool(
+                        &mut report,
+                        &mut counts,
+                        &mut used,
+                        &target,
+                        &emitted,
+                        &[r.tid],
+                    );
+                    first_single.get_or_insert(emitted);
+                }
+                Err(e) if e.contains(POOL_VERIFY_FAILED) => report
+                    .unmatched
+                    .push(format!("[DISPATCHER FATAL] {target}: {e}")),
+                Err(e) => report.record("pools", &target, Err(format!("pool refused: {e}"))),
             }
-            outcome(
-                &mut report,
-                format!("pool:b{block}:{}", r.target),
-                single.map_err(|e| format!("pool refused: {e}")),
-            );
         }
         if !built.is_empty() {
             let hosted: Vec<ld::Hosted> = built
@@ -320,23 +462,76 @@ fn lifted_pools_are_verified_and_share_exactly_the_dispatcher_finding() {
                     region: &r.region,
                 })
                 .collect();
-            outcome(
-                &mut report,
-                format!("pool:b{block}:multi"),
-                ld::pool(&format!("pm_pool_b{block}"), block, &hosted, None)
-                    .map_err(|e| format!("pool refused: {e}")),
-            );
+            let tids: Vec<u32> = built.iter().map(|r| r.tid).collect();
+            let target = format!("pool:b{block}:multi");
+            match ld::pool(&format!("pm_pool_b{block}"), block, &hosted, None) {
+                Ok(emitted) => check_pool(
+                    &mut report,
+                    &mut counts,
+                    &mut used,
+                    &target,
+                    &emitted,
+                    &tids,
+                ),
+                Err(e) if e.contains(POOL_VERIFY_FAILED) => report
+                    .unmatched
+                    .push(format!("[DISPATCHER FATAL] {target}: {e}")),
+                Err(e) => report.record("pools", &target, Err(format!("pool refused: {e}"))),
+            }
         }
     }
-    assert!(pools > 0, "no pool was built");
-    // Fail closed both ways: a pool without the dispatcher finding means it was fixed (drop
-    // `DISPATCHER_WAR`); a finding in only some pools means they are not one family.
-    let summary = vec![format!(
-        "{dispatcher} of {pools} pools carry the dispatcher WAR finding ({DISPATCHER_WAR_INSN} {DISPATCHER_WAR})"
-    )];
-    report.finish("pools", &summary);
-    assert_eq!(
-        dispatcher, pools,
-        "the dispatcher finding must be exactly the pool family"
+    assert!(counts.built > 0, "no pool was built");
+    // Fail closed: an entry no single-template pool reproduced is stale.
+    for (i, a) in POOL_BODY.iter().enumerate() {
+        if !used.contains(&i) {
+            report.unmatched.push(format!(
+                "[STALE POOL BODY] template {} body pc {} ({}) no longer occurs",
+                a.tid, a.body_pc, a.target
+            ));
+        }
+    }
+    // The dispatcher is fatal outside the body spans, with no allowance: removing the one
+    // KMcnt wait that retires `t_ready` before the trace record reads it (the dispatcher
+    // finding fixed in this tree: unmatched template id -> `.Lpublish` -> `.Lsignaled`) must be
+    // rejected by the dispatcher-only verifier, with the body spans' findings still unreported.
+    let mut mutated = first_single.expect("a single-template pool was built");
+    let signaled = mutated
+        .program
+        .instructions
+        .iter()
+        .position(|i| i.text.trim() == ".Lsignaled:")
+        .expect("the dispatcher has a `.Lsignaled` label");
+    let traced = mutated
+        .program
+        .instructions
+        .iter()
+        .position(|i| i.text.trim() == ".Ltraced:")
+        .expect("the dispatcher has a `.Ltraced` label");
+    let waits: Vec<usize> = (signaled..traced)
+        .filter(|&pc| {
+            mutated.program.instructions[pc]
+                .text
+                .trim()
+                .starts_with("s_wait_kmcnt")
+        })
+        .collect();
+    assert!(!waits.is_empty(), "the trace path waits KMcnt");
+    for pc in waits.into_iter().rev() {
+        mutated.program.instructions.remove(pc);
+    }
+    let e = ledger_cfg::verify_dispatcher_emitted(&mutated)
+        .expect_err("a dispatcher without the t_ready KMcnt wait must be rejected");
+    assert!(
+        e.contains("needs Km wait") && e.contains("s[86:87]"),
+        "unexpected dispatcher rejection: {e}"
+    );
+    report.finish(
+        "pools",
+        &[format!(
+            "{} pools built, dispatcher verified fatally in all ({} region exits summarized as \
+             drained, {} body hazards suppressed in the regions walked); {} strict-clean, {} with \
+             an exact body finding",
+            counts.built, counts.summarized, counts.suppressed, counts.clean, counts.body_findings
+        )],
     );
 }

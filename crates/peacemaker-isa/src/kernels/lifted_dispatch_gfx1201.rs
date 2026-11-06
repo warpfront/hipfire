@@ -29,6 +29,7 @@
 
 use crate::insn::{Instruction, MemoryClass};
 use crate::lds::Transition;
+use crate::ledger::Counter;
 use crate::plan::{region_entry_label, region_exit_label, Access, RegionAbi};
 use crate::reg::{Kind, Live, RegRef};
 use crate::sync::{AtomicOp, GlobalAddr, Ordering, Scope, Watchdog};
@@ -838,6 +839,12 @@ pub fn pool(
         )?;
         branch(b, "s_cbranch_scc1 .Ltraced")?;
         param(b, PTR_B, 0x20)?;
+        // `t_ready` (`.Lready`) is returned through KMcnt and nothing on a path through an
+        // unmatched template id (it is skipped, not refused: `.Lpublish` straight from the
+        // switch) waits for it before the record below reads it; the trace block also reads
+        // `t_publish` and the `PTR_B` load, so one KMcnt wait here retires all three and the
+        // builder's own later wait (before the first of them it reads) is not emitted twice.
+        b.wait(Counter::Km, 0)?;
         op(
             b,
             &format!("s_mul_i32 s{TEMP}, s{IDX}, {TRACE_BYTES}"),
@@ -897,7 +904,14 @@ pub fn pool(
     })?;
     b.label(".Ldone")?;
     branch(&mut b, "s_endpgm")?;
-    b.finish()
+    let emitted = b.finish()?;
+    // Dispatcher-only fatal verification: every instruction outside the hosted regions'
+    // bodies is checked with no allowance; the bodies (foreign lifted text) are walked for
+    // their memory and wait effects but their findings are not reported here (they are the
+    // hosted kernel's own, listed per template by `tests/ledger_cfg_pins.rs`).
+    crate::ledger_cfg::verify_dispatcher_emitted(&emitted)
+        .map_err(|e| format!("{symbol}: CFG wait verification failed: {e}"))?;
+    Ok(emitted)
 }
 
 /// COPY (`M0CopyArgs {u64 dst, u64 src, u64 bytes}` at the task's kernarg block):
