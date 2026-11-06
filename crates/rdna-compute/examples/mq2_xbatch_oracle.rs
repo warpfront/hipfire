@@ -4,8 +4,8 @@
 
 //! Byte oracle of `Gpu::gemv_mq2g256v2_xbatch` (the MTP draft head's batched ranking
 //! GEMV over the MQ2G256V2 copy): for every shape and B = 1..8, the whole `y` of the
-//! x-batched kernel (launched as production does, in chunks of four, on the product
-//! route: the PeaceMaker module on gfx1201 unless `HIPFIRE_QWEN4_MTP_DRAFT_HEAD_PM=0`)
+//! x-batched kernel (production chunks of eight on the gfx1201 PeaceMaker route,
+//! four on hipcc; `HIPFIRE_QWEN4_MTP_DRAFT_HEAD_PM=0` selects hipcc)
 //! must equal the bytes of `Gpu::gemv_mq2g256v2` launched once per column. Random
 //! weights (finite f16 scale / zero-point headers, random packed 2-bit payloads) and
 //! random activations; shapes cover K = 256 .. 4352 and every M residue mod 4.
@@ -28,12 +28,11 @@
 //! one launch must cover, default 8; pass 4 for a cap4 object), `--symbol S` (default
 //! `gemv_mq2g256v2_xbatch_pm`).
 //!
-//! Correctness (runs unless `--bench --no-oracle`): for every shape (K = 256 .. 4352, every M
-//! residue, small shapes) and every B = 1..=max-b, ONE launch of the object into a y buffer
-//! guarded by 0x7f on both sides must equal, byte for byte including guards, the per-column
-//! `Gpu::gemv_mq2g256v2` bytes (plus M7 K768/K1280 and M33 K768 edge cases: half header
-//! scale/zero NaN payloads/Inf/signed zero/subnormal/extremes, NaN/Inf/zero/subnormal/extreme
-//! activations, compared as raw hardware bytes, NaN included); the hipcc kernel in chunks of <= 4 must equal them too.
+//! Correctness (runs unless `--bench --no-oracle`): for every finite random shape (K = 256 .. 4352,
+//! every M residue, small and served-size shapes) and B = 1..=max-b, ONE object launch into
+//! a y buffer guarded by 0x7f on both sides must equal per-column `Gpu::gemv_mq2g256v2` bytes.
+//! Additional M7 K768/K1280 and M33 K768 cases exercise half-header NaN payloads/Inf/zeros/
+//! subnormals/extremes and activation NaN/Inf/zero/subnormal/extreme words.
 //!
 //! Gating: finite random shapes must equal per-column singleton bytes. NaN/Inf edge cases are
 //! gated direct == hipcc-chunked (and == the `--baseline-object` PM chunked by 4 when given),

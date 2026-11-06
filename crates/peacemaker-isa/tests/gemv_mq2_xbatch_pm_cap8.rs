@@ -17,7 +17,7 @@
 //!
 //! Oracle: for each executed tuple, `B = 1..=8` columns of one launch must equal, byte for byte, the single-column
 //! (`B = 1`) launch over the same column (x pointer advanced by `c*K*4`), which in turn must equal the shipped
-//! `r4_b4_u1_native_anchor` `B = 1` launch; no host reimplementation of the arithmetic. `B > 8` clamps to 8;
+//! `r4_b8_u1_native_anchor` `B = 1` launch; no host reimplementation of the arithmetic. `B > 8` clamps to 8;
 //! `B <= 0`, columns past `B`, rows past `M` and the guard words past `y` are never written.
 use peacemaker_ir::emu::{Emulator, Launch, Memory};
 use peacemaker_ir::inst::Frontend;

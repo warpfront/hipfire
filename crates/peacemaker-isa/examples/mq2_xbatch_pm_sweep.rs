@@ -12,8 +12,8 @@
 //! illegal); `error` is the emitter message (`-` when legal, tabs and newlines flattened to spaces).
 //!
 //! `mq2_xbatch_pm_sweep --shipped OUT_DIR`: emit the current `SHIPPED` tuple as
-//! `OUT_DIR/gemv_mq2_xbatch_pm_gfx1201.hxaco` plus `.hxaco.sha256` (hex, no newline, the committed format) and print
-//! the tag, the SHA-256 of the bundle and of its ELF for the pins in `tests/gemv_mq2_xbatch_pm.rs`.
+//! `OUT_DIR/gemv_mq2_xbatch_pm_gfx1201.hxaco` plus `.hxaco.sha256` (hex, no newline, the committed format),
+//! the device `.co`, and print the tag and SHA-256 of the bundle and ELF for the artifact pins.
 //!
 //! Run with `--features lab`.
 
@@ -41,6 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bundle_sha = format!("{:x}", Sha256::digest(&bundle));
         fs::write(out.join("gemv_mq2_xbatch_pm_gfx1201.hxaco"), &bundle)?;
         fs::write(out.join("gemv_mq2_xbatch_pm_gfx1201.hxaco.sha256"), &bundle_sha)?;
+        fs::write(out.join("gemv_mq2_xbatch_pm_gfx1201.co"), &elf)?;
         println!("tag {}", SHIPPED.tag());
         println!("bundle_sha256 {bundle_sha}");
         println!("elf_sha256 {:x}", Sha256::digest(&elf));

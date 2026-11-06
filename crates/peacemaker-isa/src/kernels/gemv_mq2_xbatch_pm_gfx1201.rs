@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! PeaceMaker x-batched MQ2G256V2 GEMV for gfx1201 (WideNet F05 `r4_b4_u1_native_anchor`, shipped as
+//! PeaceMaker x-batched MQ2G256V2 GEMV for gfx1201 (`r4_b8_u1_native_anchor`, shipped as
 //! `kernels/gemv_mq2_xbatch_pm_gfx1201.hxaco`): byte-exact PM twin and bounded variants of `gemv_mq2g256v2_xbatch`
 //! (`kernels/src/gemv_mq2g256v2.hip`; the MTP draft-head ranking GEMV). The hipcc anchor itself is fixed at
 //! `XBATCH_MAX = 4` (it clamps `B > 4` to 4); this emitter admits capacities up to [`XBATCH_MAX`] = 8.
@@ -98,10 +98,10 @@ impl Params {
     }
 }
 
-/// The shipped tuple `r4_b4_u1_native_anchor`.
+/// The shipped tuple `r4_b8_u1_native_anchor` (measured cap-eight sweep winner).
 pub const SHIPPED: Params = Params {
     rows: 4,
-    cap: 4,
+    cap: 8,
     unroll: 1,
     split: false,
     ilp: false,
