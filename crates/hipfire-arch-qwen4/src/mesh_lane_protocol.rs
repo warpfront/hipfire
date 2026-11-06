@@ -5376,10 +5376,7 @@ mod tests {
             48 * 8
         );
         // No EP gather installed: the groups stay.
-        assert_eq!(
-            planned(all_rows_rule(None, false), &eight, &greedy),
-            48 * 8
-        );
+        assert_eq!(planned(all_rows_rule(None, false), &eight, &greedy), 48 * 8);
         // A wide-class lane keeps its classed group; the step takes no all-rows MoE.
         let mut wide_mixed = [false; 8];
         wide_mixed[3] = true;

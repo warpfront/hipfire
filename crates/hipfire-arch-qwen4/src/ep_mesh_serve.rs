@@ -107,11 +107,7 @@ impl Qwen4Bundle {
     /// Idempotent refusal: an already armed bundle errors. The serve driver
     /// owns request termination (EOS/stop/length), so the root never closes
     /// a lane and drafts through an EOS draft, as the single-card route.
-    pub fn ep_mesh_lanes_arm(
-        &mut self,
-        gpu: &Gpu,
-        topology_generation: u64,
-    ) -> Result<(), String> {
+    pub fn ep_mesh_lanes_arm(&mut self, gpu: &Gpu, topology_generation: u64) -> Result<(), String> {
         if self.mesh_lanes.is_some() {
             return Err("EP mesh lanes are already armed".to_string());
         }

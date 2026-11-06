@@ -6621,7 +6621,11 @@ mod tests {
                                 "{tag}"
                             );
                             if ar {
-                                assert_eq!(rule.moe_all_rows(&group_rows, any_wide), moe_all, "{tag}");
+                                assert_eq!(
+                                    rule.moe_all_rows(&group_rows, any_wide),
+                                    moe_all,
+                                    "{tag}"
+                                );
                             }
                         }
                     }
