@@ -1122,16 +1122,31 @@ mod gather_hook_tests {
         for layer in 0..trunk_layers as u16 {
             // Static (unpartitioned) trunk layers skip on the partial route only.
             assert!(trunk_partial_skips_gather(layer, trunk_layers, true, false));
-            assert!(!trunk_partial_skips_gather(layer, trunk_layers, false, false));
+            assert!(!trunk_partial_skips_gather(
+                layer,
+                trunk_layers,
+                false,
+                false
+            ));
             // A layer with a fixed reduction partition gathers, route or not.
             assert!(!trunk_partial_skips_gather(layer, trunk_layers, true, true));
-            assert!(!trunk_partial_skips_gather(layer, trunk_layers, false, true));
+            assert!(!trunk_partial_skips_gather(
+                layer,
+                trunk_layers,
+                false,
+                true
+            ));
         }
         // the head's gather layer is `num_hidden_layers + j % 2`
         for parity in 0..2u16 {
             let head = trunk_layers as u16 + parity;
             assert!(!trunk_partial_skips_gather(head, trunk_layers, true, false));
-            assert!(!trunk_partial_skips_gather(head, trunk_layers, false, false));
+            assert!(!trunk_partial_skips_gather(
+                head,
+                trunk_layers,
+                false,
+                false
+            ));
         }
     }
 
@@ -1169,14 +1184,7 @@ mod gather_hook_tests {
                 for balanced in [false, true] {
                     for partial in [false, true] {
                         assert_eq!(
-                            reduction_partition_of(
-                                head,
-                                trunk_layers,
-                                partial,
-                                balanced,
-                                rank,
-                                2
-                            ),
+                            reduction_partition_of(head, trunk_layers, partial, balanced, rank, 2),
                             None
                         );
                     }
@@ -1187,7 +1195,8 @@ mod gather_hook_tests {
         for layer in 0..(trunk_layers as u16 + 2) {
             for balanced in [false, true] {
                 let partition = reduction_partition_of(layer, trunk_layers, true, balanced, 1, 2);
-                let skips = trunk_partial_skips_gather(layer, trunk_layers, true, partition.is_some());
+                let skips =
+                    trunk_partial_skips_gather(layer, trunk_layers, true, partition.is_some());
                 assert_eq!(
                     skips,
                     (layer as usize) < trunk_layers && !balanced,

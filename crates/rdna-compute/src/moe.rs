@@ -2307,7 +2307,9 @@ impl Gpu {
         if ranks == 0 || ranks > 4 || rank >= ranks {
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!("{FUNC}: need 1 <= ranks <= 4 and rank < ranks (rank={rank} ranks={ranks})"),
+                &format!(
+                    "{FUNC}: need 1 <= ranks <= 4 and rank < ranks (rank={rank} ranks={ranks})"
+                ),
             ));
         }
         self.bind_thread()?;

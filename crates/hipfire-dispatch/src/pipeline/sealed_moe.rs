@@ -9543,7 +9543,10 @@ mod tests {
             ranks: 2,
         };
         let balanced = decode_stages(Some(&OwnerGather), grouped).unwrap();
-        assert_eq!(decode_stages(Some(&partitioned), grouped).unwrap(), balanced);
+        assert_eq!(
+            decode_stages(Some(&partitioned), grouped).unwrap(),
+            balanced
+        );
         let balanced = prefill_stages(Some(&OwnerGather), grouped, false).unwrap();
         assert_eq!(
             prefill_stages(Some(&partitioned), grouped, false).unwrap(),
@@ -9605,8 +9608,8 @@ mod tests {
         );
 
         let prefill = prefill_scratch(0xEC_0000);
-        let prefill_params = |ep_layer_idx: u16, gather: Option<&'static dyn MoeRowGather>| {
-            MoePrefillParams {
+        let prefill_params =
+            |ep_layer_idx: u16, gather: Option<&'static dyn MoeRowGather>| MoePrefillParams {
                 ep_row_gather: gather,
                 ep_layer_idx,
                 ..ep_prefill_params(
@@ -9616,8 +9619,7 @@ mod tests {
                     &fixture.down_ptrs,
                     None,
                 )
-            }
-        };
+            };
         assert_eq!(
             super::super::qt44_qt53_prefill::reduction_partition(&prefill_params(
                 7,

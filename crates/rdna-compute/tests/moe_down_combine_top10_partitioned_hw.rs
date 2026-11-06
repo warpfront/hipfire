@@ -157,10 +157,12 @@ fn gen_case(s: Scenario, rng: &mut Lcg, tokens: usize, hidden: usize) -> Case {
         }
         Scenario::Subnormals => {
             for v in outputs.iter_mut() {
-                *v = f32::from_bits(rng.below(0x80_0000)) * if rng.below(2) == 0 { 1.0 } else { -1.0 };
+                *v = f32::from_bits(rng.below(0x80_0000))
+                    * if rng.below(2) == 0 { 1.0 } else { -1.0 };
             }
             for w in weights.iter_mut() {
-                *w = f32::from_bits(rng.below(0x80_0000)) * if rng.below(2) == 0 { 1.0 } else { -1.0 };
+                *w = f32::from_bits(rng.below(0x80_0000))
+                    * if rng.below(2) == 0 { 1.0 } else { -1.0 };
             }
             for v in residual.iter_mut() {
                 *v = f32::from_bits(rng.below(0x80_0000));
@@ -190,12 +192,20 @@ fn gen_case(s: Scenario, rng: &mut Lcg, tokens: usize, hidden: usize) -> Case {
         }
     }
     // most scenarios also exercise a nonzero seed
-    if !matches!(s, Scenario::Subnormals | Scenario::SignedZeros | Scenario::NonzeroResidual) {
+    if !matches!(
+        s,
+        Scenario::Subnormals | Scenario::SignedZeros | Scenario::NonzeroResidual
+    ) {
         for v in residual.iter_mut() {
             *v = rng.signed();
         }
     }
-    Case { outputs, ids, weights, residual }
+    Case {
+        outputs,
+        ids,
+        weights,
+        residual,
+    }
 }
 
 fn is_foreign(id: i32, rank: usize, ranks: usize) -> bool {
@@ -216,7 +226,9 @@ fn partitioned_combine_matches_zeroed_original_hw() {
                 let w = upload_f32(&mut gpu, &case.weights);
                 for ranks in 2usize..=4 {
                     for rank in 0..ranks {
-                        let tag = format!("{s:?} tokens={tokens} hidden={hidden} ranks={ranks} rank={rank}");
+                        let tag = format!(
+                            "{s:?} tokens={tokens} hidden={hidden} ranks={ranks} rank={rank}"
+                        );
                         // Reference: foreign live slots replaced by +0.0.
                         let mut zeroed = case.outputs.clone();
                         // Garbage in foreign rows: must not matter.
@@ -255,7 +267,9 @@ fn partitioned_combine_matches_zeroed_original_hw() {
                             .expect("partitioned combine");
                             gpu.hip.device_synchronize().expect("sync");
                             let got = download_u32(&gpu, &res, tokens * hidden + hidden);
-                            for (i, (g, e)) in got[..tokens * hidden].iter().zip(&expect).enumerate() {
+                            for (i, (g, e)) in
+                                got[..tokens * hidden].iter().zip(&expect).enumerate()
+                            {
                                 assert_eq!(
                                     g, e,
                                     "{tag} [{label}] residual word {i}: got {g:#010x} want {e:#010x}"
@@ -266,7 +280,11 @@ fn partitioned_combine_matches_zeroed_original_hw() {
                                 "{tag} [{label}]: canary row past the residual was written"
                             );
                             let after = download_u32(&gpu, &eo, src.len());
-                            assert_eq!(after, bits(src), "{tag} [{label}]: expert_outputs was modified");
+                            assert_eq!(
+                                after,
+                                bits(src),
+                                "{tag} [{label}]: expert_outputs was modified"
+                            );
                             compared += 1;
                         }
                     }

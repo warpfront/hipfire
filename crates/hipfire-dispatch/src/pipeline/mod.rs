@@ -8018,7 +8018,11 @@ mod combine_leaf_tests {
     #[test]
     fn no_partition_keeps_the_unmasked_leaf_for_every_arm() {
         for arm in ARMS {
-            assert_eq!(combine_leaf(arm, None).unwrap(), CombineLeaf::Top10, "{arm:?}");
+            assert_eq!(
+                combine_leaf(arm, None).unwrap(),
+                CombineLeaf::Top10,
+                "{arm:?}"
+            );
         }
     }
 

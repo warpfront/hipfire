@@ -1661,7 +1661,10 @@ pub(crate) fn combine_deferred(
     use_path2: bool,
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
-    super::combine_leaf(super::CombineArm::DeferredToSharedDown, reduction_partition(p))?;
+    super::combine_leaf(
+        super::CombineArm::DeferredToSharedDown,
+        reduction_partition(p),
+    )?;
     require_geometry(p)?;
     validate_scratch(gpu, p, use_path2, grouped_rows)
 }
@@ -1674,7 +1677,10 @@ pub(crate) fn shared_down_combined(
     p: &MoePrefillParams<'_>,
     use_path2: bool,
 ) -> Result<(), DispatchError> {
-    super::combine_leaf(super::CombineArm::DeferredToSharedDown, reduction_partition(p))?;
+    super::combine_leaf(
+        super::CombineArm::DeferredToSharedDown,
+        reduction_partition(p),
+    )?;
     require_geometry(p)?;
     let (hidden, expanded) = epilogue_inputs(gpu, p, use_path2).ok_or_else(|| {
         DispatchError::Hip("qt44 epilogue fuse: shared weights vanished after admission".into())
@@ -4236,10 +4242,7 @@ mod scratch_tests {
         let (bf16, _) = gathered_arm(65, 8, false, false, true);
         assert_eq!(bf16, CombineArm::GroupedBf16InOwned);
         let error = combine_leaf(bf16, Some((0, 2))).unwrap_err();
-        assert!(
-            format!("{error:?}").contains("before launch"),
-            "{error:?}"
-        );
+        assert!(format!("{error:?}").contains("before launch"), "{error:?}");
         // Without a gather hook the grouped F32 rows are the plain combine.
         assert_eq!(
             combine_arm_of(false, true, false, false, false),
