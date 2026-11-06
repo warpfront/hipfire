@@ -727,6 +727,10 @@ impl Builder {
             self.sync.write()
         }
         let mnemonic = insn.mnemonic();
+        if insn::control_flow(mnemonic) {
+            // a merged hint's consumer must stay inside its block
+            self.delay_merge = None;
+        }
         let pipe = if matches!(
             insn.memory,
             Some(MemoryClass::VmemLoad | MemoryClass::VmemStore | MemoryClass::VmemAtomic { .. })
