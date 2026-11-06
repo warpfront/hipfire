@@ -33,6 +33,7 @@ mod gfx12_decode_gap_tests;
 mod hw;
 #[cfg(test)]
 mod hw_replay;
+pub use alu::f32_nan_swap_payload_safe;
 pub use hw::RunReport;
 mod memory;
 pub mod mma;

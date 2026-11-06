@@ -203,6 +203,19 @@ fn first_nan(ops: &[u32]) -> Option<u32> {
     ops.iter().find(|&&x| is_nan(x)).map(|&x| x | QUIET)
 }
 
+/// Whether swapping the two multiplicand/addend factors of an f32 `v_add_f32`, `v_mul_f32` or `v_fmac_f32` (VOP2, VOP3
+/// and both VOPD halves alike) leaves the result bits unchanged, judged from the raw f32 input words alone.
+///
+/// Measured on gfx1201 (j8200, all 16 FP_DENORM x FP_ROUND modes, 13,089,298,944 op-cases): the first NaN factor in
+/// source order (src0, then src1) is quieted with sign and payload kept, with no signalling-NaN priority, so a swap is
+/// payload-safe unless both factors are NaN and differ beyond the quiet bit: `!is_nan(a) || !is_nan(b) ||
+/// (a | QUIET) == (b | QUIET)`. The rule is mode-independent; it says nothing about finite results, so it is not a
+/// commutativity claim in general (not subtraction, no source modifiers, no omod/clamp) and no claim about FP
+/// exceptions or traps. Every other architecture answers `false` conservatively.
+pub fn f32_nan_swap_payload_safe(arch: Arch, a: u32, b: u32) -> bool {
+    arch == Arch::Gfx1201 && (!is_nan(a) || !is_nan(b) || (a | QUIET) == (b | QUIET))
+}
+
 /// `a + b` of post-modifier operand words (qualified arches: measured NaN rules; others: NaN is an error).
 fn add_bits(arch: Arch, a: u32, b: u32) -> Result<u32> {
     if !edge_qualified(arch) {
@@ -6837,5 +6850,351 @@ mod tests {
             st.vcc, 0b1000_0111,
             "lanes 0,1,2 and the negative denormal 7; inactive lanes clear"
         );
+    }
+
+    // ---- NaN-swap payload rule (j8200 gfx1201 receipt, tests/fixtures/nan_swap_receipt_j8200.tsv) ----
+
+    const NAN_SWAP_RECEIPT: &str = include_str!("../../tests/fixtures/nan_swap_receipt_j8200.tsv");
+
+    struct SwapRow {
+        suite: String,
+        mode: u32,
+        op: String,
+        a: u32,
+        b: u32,
+        c: u32,
+        native: [u32; 2],
+        dual: [u32; 4],
+        safe: bool,
+    }
+
+    fn swap_rows() -> Vec<SwapRow> {
+        let hex = |s: &str| u32::from_str_radix(s, 16).unwrap();
+        NAN_SWAP_RECEIPT
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.starts_with("suite\t"))
+            .map(|l| {
+                let f: Vec<&str> = l.split('\t').collect();
+                assert_eq!(f.len(), 13, "{l}");
+                SwapRow {
+                    suite: f[0].into(),
+                    mode: f[1].parse().unwrap(),
+                    op: f[2].into(),
+                    a: hex(f[3]),
+                    b: hex(f[4]),
+                    c: hex(f[5]),
+                    native: [hex(f[6]), hex(f[7])],
+                    dual: [hex(f[8]), hex(f[9]), hex(f[10]), hex(f[11])],
+                    safe: f[12] == "1",
+                }
+            })
+            .collect()
+    }
+
+    /// The six emulated opcodes of one receipt `op`: the VOP2 form and the VOPD (`v_dual_*`) form.
+    fn swap_opcodes(op: &str) -> &'static [&'static str] {
+        match op {
+            "add" => &["v_add_f32_e32", "v_dual_add_f32"],
+            "mul" => &["v_mul_f32_e32", "v_dual_mul_f32"],
+            "fmac" => &["v_fmac_f32_e32", "v_dual_fmac_f32"],
+            _ => panic!("{op}"),
+        }
+    }
+
+    /// Runs the VOP2 opcode, or both VOPD halves (X: v0 = v4 op v5, Y: v1 = v2 op v3, accumulators v0/v1 preset to `c`),
+    /// asserting the two halves agree, and returns the result word.
+    fn swap_run(name: &str, x: u32, y: u32, c: u32) -> u32 {
+        let arch = Arch::Gfx1201;
+        if !name.starts_with("v_dual_") {
+            let r = match name {
+                "v_fmac_f32_e32" => lane_on(arch, name, &[x, y], c, |_| {}),
+                _ => lane_on(arch, name, &[x, y], 0, |_| {}),
+            };
+            return r.unwrap_or_else(|e| panic!("{name} {x:#010x} {y:#010x} {c:#010x}: {e}"));
+        }
+        let t = table(arch);
+        let row = t.iter().find(|r| r.name == name).unwrap();
+        let i = Inst::from_parts(
+            arch,
+            row.op,
+            row.form,
+            FormFields::Vopd {
+                y_op: row.op,
+                x_operands: 3,
+            },
+            vec![v(0), v(4), v(5), v(1), v(2), v(3)]
+                .into_iter()
+                .collect(),
+            Default::default(),
+            None,
+            Default::default(),
+        )
+        .unwrap();
+        let mut st = state();
+        st.exec = 1;
+        (st.v[0][0], st.v[1][0]) = (c, c);
+        (st.v[4][0], st.v[5][0], st.v[2][0], st.v[3][0]) = (x, y, x, y);
+        execute(arch, name, &i, &mut st)
+            .unwrap_or_else(|e| panic!("{name} {x:#010x} {y:#010x} {c:#010x}: {e}"));
+        assert_eq!(
+            st.v[0][0], st.v[1][0],
+            "{name} X vs Y half {x:#010x} {y:#010x} {c:#010x}"
+        );
+        st.v[0][0]
+    }
+
+    fn is_denorm_bits(x: u32) -> bool {
+        x & 0x7f80_0000 == 0 && x & 0x007f_ffff != 0
+    }
+
+    #[test]
+    fn nan_swap_predicate_arch_and_vectors() {
+        let (q, s1, s2) = (0x7fc0_0000u32, 0x7fa0_0000u32, 0x7fa0_0001u32);
+        for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+            assert!(
+                !f32_nan_swap_payload_safe(arch, 1, 2),
+                "{arch:?} stays conservative"
+            );
+            assert!(!f32_nan_swap_payload_safe(arch, q, q));
+        }
+        let g = |a, b| f32_nan_swap_payload_safe(Arch::Gfx1201, a, b);
+        // At most one NaN: always safe (NaN vs +/-zero, +/-inf, denormal, normal).
+        for n in [q, s1, 0xffa0_0001, 0xffc0_0123] {
+            for o in [
+                0,
+                0x8000_0000,
+                0x7f80_0000,
+                0xff80_0000,
+                1,
+                0x8000_0001,
+                0x3f80_0000,
+            ] {
+                assert!(g(n, o) && g(o, n), "{n:#x} {o:#x}");
+            }
+        }
+        assert!(g(1, 2) && g(0x7f80_0000, 0));
+        // Both NaN: safe iff identical up to the quiet bit (sign and payload compared).
+        assert!(g(q, q) && g(s1, s1) && g(s1, s1 | QUIET) && g(s1 | QUIET, s1));
+        assert!(!g(s1, s2) && !g(q, q | 1) && !g(q, q | SIGN) && !g(s1, s1 | SIGN));
+        assert!(!g(s1, q | 0x0001_0000));
+    }
+
+    // Exhausts a small NaN lattice (sign x quiet bit x 4 low payload bits x 2 high payload bits): the helper must agree
+    // with the emulated add/mul/fmac-factor swap bit-for-bit, and the winner is always the first NaN, quieted.
+    #[test]
+    fn nan_swap_predicate_matches_emulated_swap_exhaustive() {
+        let mut nans = vec![];
+        for sign in [0, SIGN] {
+            for q in [0, QUIET] {
+                for hi in [0, 0x0010_0000, 0x0020_0000, 0x0030_0000] {
+                    for lo in 0..16u32 {
+                        let x = sign | 0x7f80_0000 | q | hi | lo;
+                        if is_nan(x) {
+                            nans.push(x);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(nans.len(), 254);
+        for &a in &nans {
+            for &b in &nans {
+                let safe = f32_nan_swap_payload_safe(Arch::Gfx1201, a, b);
+                let fwd = add_bits(Arch::Gfx1201, a, b).unwrap();
+                let rev = add_bits(Arch::Gfx1201, b, a).unwrap();
+                assert_eq!(fwd, a | QUIET);
+                assert_eq!(rev, b | QUIET);
+                assert_eq!(fwd == rev, safe, "{a:#010x} {b:#010x}");
+                assert_eq!(mul_bits(Arch::Gfx1201, a, b).unwrap(), fwd);
+                assert_eq!(fma_bits(Arch::Gfx1201, a, b, 0x3f80_0000).unwrap(), fwd);
+            }
+        }
+        // And through the real executor on a sparse subset of the same lattice, all six opcodes.
+        for &a in nans.iter().step_by(7) {
+            for &b in nans.iter().step_by(11) {
+                let safe = f32_nan_swap_payload_safe(Arch::Gfx1201, a, b);
+                for op in ["add", "mul", "fmac"] {
+                    for name in swap_opcodes(op) {
+                        let (f, r) = (swap_run(name, a, b, 0), swap_run(name, b, a, 0));
+                        assert_eq!((f, r), (a | QUIET, b | QUIET), "{name}");
+                        assert_eq!(f == r, safe, "{name} {a:#010x} {b:#010x}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nan_swap_source_order_sign_payload_and_special_operands() {
+        let ops = ["add", "mul", "fmac"];
+        let (snan, qnan) = (0x7fa0_0001u32, 0xffc0_0002u32);
+        let others = [
+            0u32,
+            0x8000_0000,
+            0x7f80_0000,
+            0xff80_0000,
+            0x0000_0001,
+            0x8000_0001,
+            0x3f80_0000,
+            0xc000_0000,
+        ];
+        for op in ops {
+            for name in swap_opcodes(op) {
+                // src0 wins when both are NaN, even SNaN against QNaN; sign and payload kept, bit 22 set.
+                assert_eq!(swap_run(name, snan, qnan, 0), 0x7fe0_0001, "{name}");
+                assert_eq!(swap_run(name, qnan, snan, 0), qnan, "{name}");
+                // Quiet-identical SNaN/QNaN: both orders agree.
+                assert_eq!(swap_run(name, 0x7fa0_0003, 0x7fe0_0003, 0), 0x7fe0_0003);
+                assert_eq!(swap_run(name, 0x7fe0_0003, 0x7fa0_0003, 0), 0x7fe0_0003);
+                // NaN against zero / inf / denormal / normal keeps the NaN in either slot (swap-safe).
+                for o in others {
+                    for n in [snan, qnan] {
+                        assert_eq!(swap_run(name, n, o, 0), n | QUIET, "{name} {n:#x} {o:#x}");
+                        assert_eq!(swap_run(name, o, n, 0), n | QUIET, "{name} {o:#x} {n:#x}");
+                    }
+                }
+            }
+        }
+        // Sign-only difference is not swap-safe; neither is any payload difference.
+        assert_eq!(
+            swap_run("v_add_f32_e32", 0x7fc0_0000, 0xffc0_0000, 0),
+            0x7fc0_0000
+        );
+        assert_eq!(
+            swap_run("v_add_f32_e32", 0xffc0_0000, 0x7fc0_0000, 0),
+            0xffc0_0000
+        );
+    }
+
+    #[test]
+    fn nan_swap_fmac_accumulator_precedence_and_invalid_product() {
+        let (cs, cq) = (0x7fa0_0007u32, 0xffc0_0009u32);
+        let default_nan = 0xffc0_0000u32;
+        for name in ["v_fmac_f32_e32", "v_dual_fmac_f32"] {
+            // Factors win over a NaN accumulator, in order.
+            assert_eq!(swap_run(name, 0x7fa0_0001, 0x7fc0_0002, cs), 0x7fe0_0001);
+            assert_eq!(swap_run(name, 0x3f80_0000, 0x7fa0_0004, cs), 0x7fe0_0004);
+            assert_eq!(swap_run(name, 0x7fa0_0004, 0x3f80_0000, cq), 0x7fe0_0004);
+            // A NaN accumulator is quieted, sign and payload kept, when the product is valid.
+            assert_eq!(swap_run(name, 0x3f80_0000, 0x4000_0000, cs), 0x7fe0_0007);
+            assert_eq!(swap_run(name, 0, 0x7f7f_ffff, cq), cq);
+            // inf*0 (either order, either sign) is the default negative NaN even over a NaN accumulator.
+            for (x, y) in [
+                (0x7f80_0000u32, 0u32),
+                (0, 0x7f80_0000),
+                (0xff80_0000, 0x8000_0000),
+                (0x8000_0000, 0xff80_0000),
+            ] {
+                for c in [cs, cq, 0x3f80_0000] {
+                    assert_eq!(
+                        swap_run(name, x, y, c),
+                        default_nan,
+                        "{name} {x:#x} {y:#x} {c:#x}"
+                    );
+                }
+            }
+            // Denormals flush-free in the supported mode: denormal * inf is inf, not an invalid product.
+            assert_eq!(
+                swap_run(name, 0x0000_0001, 0x7f80_0000, 0x3f80_0000),
+                0x7f80_0000
+            );
+        }
+        for arch in [Arch::Gfx1151, Arch::Gfx1201] {
+            assert_eq!(
+                lane_on(
+                    arch,
+                    "v_fmac_f32_e32",
+                    &[0x7f80_0000, 0],
+                    0x7fa0_0007,
+                    |_| {}
+                ),
+                Ok(default_nan),
+                "{arch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nan_swap_receipt_fixture_shape() {
+        let rows = swap_rows();
+        assert!(rows.len() > 2000);
+        let mut modes = [false; 16];
+        let mut ops = std::collections::BTreeSet::new();
+        for r in &rows {
+            modes[r.mode as usize] = true;
+            ops.insert(r.op.clone());
+        }
+        assert!(modes.iter().all(|m| *m), "all16 mode witness");
+        assert_eq!(ops.len(), 3);
+        // Mode 3 (FP_DENORM 3, RNE) carries the full edge table: 279 triples per op.
+        for op in ["add", "mul", "fmac"] {
+            let n = rows
+                .iter()
+                .filter(|r| r.suite == "edge" && r.mode == 3 && r.op == op)
+                .count();
+            assert_eq!(n, 279, "{op}");
+        }
+    }
+
+    // Replays the receipt through the real executor. Mode 3 (denorm preserved, RNE) is the only mode the emulator models:
+    // every row there is replayed in full. Other modes only pin the mode-independent NaN payload rule (NaN results of
+    // denormal-free rows), without enabling any unsupported emulator mode.
+    #[test]
+    fn nan_swap_receipt_replay_and_predicate() {
+        let mut replayed = 0usize;
+        let mut witness = 0usize;
+        let mut unsafe_rows = 0usize;
+        for r in swap_rows() {
+            let pred = f32_nan_swap_payload_safe(Arch::Gfx1201, r.a, r.b);
+            assert_eq!(
+                pred, r.safe,
+                "{} m{} {:#010x} {:#010x}",
+                r.op, r.mode, r.a, r.b
+            );
+            // Native and both VOPD halves agree with each other, and a safe swap leaves every word unchanged.
+            assert_eq!(r.dual[0], r.native[0], "dual X orig vs native");
+            assert_eq!(r.dual[1], r.native[0], "dual Y orig vs native");
+            assert_eq!(r.dual[2], r.native[1], "dual X swap vs native");
+            assert_eq!(r.dual[3], r.native[1], "dual Y swap vs native");
+            if r.safe {
+                assert_eq!(
+                    r.native[0], r.native[1],
+                    "{} {:#010x} {:#010x}",
+                    r.op, r.a, r.b
+                );
+            } else {
+                unsafe_rows += 1;
+                if r.suite != "edge" {
+                    assert_ne!(
+                        r.native[0], r.native[1],
+                        "{} {:#010x} {:#010x}",
+                        r.op, r.a, r.b
+                    );
+                }
+            }
+            let denorm_free = ![r.a, r.b, r.c].into_iter().any(is_denorm_bits);
+            for (x, y, want) in [(r.a, r.b, r.native[0]), (r.b, r.a, r.native[1])] {
+                if r.mode == 3 {
+                    replayed += 1;
+                } else if is_nan(want) && denorm_free {
+                    witness += 1;
+                } else {
+                    continue;
+                }
+                for name in swap_opcodes(&r.op) {
+                    assert_eq!(
+                        swap_run(name, x, y, r.c),
+                        want,
+                        "{name} m{} {x:#010x} {y:#010x} {:#010x}",
+                        r.mode,
+                        r.c
+                    );
+                }
+            }
+        }
+        // Counted once per row and order: 2 x the 1035 mode-3 rows; 2216 NaN-result witness orders in the other modes.
+        assert_eq!(replayed, 2 * 1035);
+        assert_eq!(witness, 2216);
+        assert_eq!(unsafe_rows, 438);
     }
 }

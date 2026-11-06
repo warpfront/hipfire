@@ -26,6 +26,41 @@ impl VopdF32 {
         }
     }
 }
+
+/// Arch/op-wide answer to "may the two multiplicand/addend factors of this VOPD F32 half be swapped without changing
+/// the NaN payload/sign the hardware returns?". Always `false`.
+///
+/// On gfx1201 (AMD Radeon AI PRO R9700, fabric j8207, receipt `nan-swap-receipt-final`, build
+/// `nan-swap-build-final/build.json`; evidence in `peacemaker-ir/isa/emu/float_edges.md`) native VOP2
+/// and both VOPD halves, in all 16 FP32 denorm x round `MODE` settings, return the *first* NaN source (src0, then
+/// src1) quieted with sign and payload preserved. Swapping `Add`/`Mul`/`Fmac` factors that are two NaNs with
+/// different sign or quieted payload therefore changes the result (2,421,565,968 unequal swaps over the 13,089,298,944
+/// measured op-cases), so no arch/op-wide swap is sound. `Sub`/`Subrev` are not commutative at all, and no other arch
+/// has been measured. Callers that know the concrete input bit patterns use [`swap_payload_safe_for_inputs`].
+pub const fn swap_payload_safe(_arch: Arch, _op: VopdF32) -> bool {
+    false
+}
+
+/// Input-conditional swap legality for the two factors `a`, `b` (raw f32 bits, src0 and src1 of the half).
+///
+/// Returns `true` only for gfx1201 `Add`/`Mul`/`Fmac` and only when
+/// `peacemaker_ir::emu::f32_nan_swap_payload_safe` holds: not both inputs are NaN, or both are NaN and
+/// `(a | 0x0040_0000) == (b | 0x0040_0000)` (quieted bit pattern *including sign* identical, i.e. both quieted
+/// payload bits and sign match). Everything else (`Sub`, `Subrev`, other arches) is `false`.
+///
+/// Scope of the measured claim: the factors are unmodified (no abs/neg/clamp/omod source or result modifier applied
+/// to them), for `Fmac` only the two multiplicand factors are swapped (never the accumulator/destination `c`), and
+/// the predicate makes no statement about source modifiers or FP exception traps. The receipt covers 16,777,214 NaN
+/// encodings x 16 partners, a 64,000-triple grid and 4,194,304 random triples per op and mode, not the full
+/// NaN-pair Cartesian product.
+pub fn swap_payload_safe_for_inputs(arch: Arch, op: VopdF32, a: u32, b: u32) -> bool {
+    match (arch, op) {
+        (Arch::Gfx1201, VopdF32::Add | VopdF32::Mul | VopdF32::Fmac) => {
+            peacemaker_ir::emu::f32_nan_swap_payload_safe(peacemaker_ir::Arch::Gfx1201, a, b)
+        }
+        _ => false,
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Src0<const B: u8> {
     V(Vb<B>),
@@ -262,5 +297,110 @@ mod tests {
             validate_pair(Arch::Gfx1151, mul(0, 2, 4), mul(1, 2, 5)).unwrap_err(),
             "VOPD src0 bank collision"
         );
+    }
+}
+
+#[cfg(test)]
+mod swap_payload_tests {
+    use super::*;
+
+    const ALL_OPS: [VopdF32; 5] = [
+        VopdF32::Add,
+        VopdF32::Sub,
+        VopdF32::Subrev,
+        VopdF32::Mul,
+        VopdF32::Fmac,
+    ];
+    const ALL_ARCHES: [Arch; 4] = [Arch::Gfx1201, Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx942];
+    const SWAPPABLE: [VopdF32; 3] = [VopdF32::Add, VopdF32::Mul, VopdF32::Fmac];
+
+    #[test]
+    fn coarse_predicate_is_always_false() {
+        for arch in ALL_ARCHES {
+            for op in ALL_OPS {
+                assert!(!swap_payload_safe(arch, op), "{arch:?} {op:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn gfx1201_safe_inputs_are_true() {
+        let cases = [
+            // no NaN
+            (0x3f80_0000, 0x4000_0000),
+            (0x7f80_0000, 0xff80_0000),
+            // exactly one NaN, either side, either sign
+            (0x7fc0_0000, 0x3f80_0000),
+            (0x3f80_0000, 0xffa0_beef),
+            (0x7f80_0001, 0x0000_0000),
+            // both NaN, identical bits
+            (0x7fc0_beef, 0x7fc0_beef),
+            (0xffc0_0000, 0xffc0_0000),
+            // both NaN, differ only in the quiet bit (same sign, same payload)
+            (0x7f80_0001, 0x7fc0_0001),
+            (0x7fc0_0001, 0x7f80_0001),
+            (0xff80_0b61, 0xffc0_0b61),
+        ];
+        for op in SWAPPABLE {
+            for (a, b) in cases {
+                assert!(
+                    swap_payload_safe_for_inputs(Arch::Gfx1201, op, a, b),
+                    "{op:?} {a:#010x} {b:#010x}"
+                );
+                assert!(
+                    swap_payload_safe_for_inputs(Arch::Gfx1201, op, b, a),
+                    "{op:?} {b:#010x} {a:#010x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gfx1201_distinct_payload_or_sign_is_false() {
+        let cases = [
+            // measured hardware witnesses (j8200 nan-swap receipt samples): sign differs, payload equal
+            (0x7f80_0b61, 0xff80_0b61),
+            (0x7f80_1601, 0xff80_1601),
+            (0x7f80_0001, 0xff80_0001),
+            // quieted payload differs
+            (0x7fc0_0001, 0x7fc0_0002),
+            (0x7fdc_cbec, 0x7fda_2209),
+            (0x7fc0_beef, 0x7fc0_0000),
+            // sign differs on quiet NaNs
+            (0x7fc0_0000, 0xffc0_0000),
+            // sign and payload differ
+            (0xfffa_60dd, 0x7fc0_0000),
+        ];
+        for op in SWAPPABLE {
+            for (a, b) in cases {
+                assert!(
+                    !swap_payload_safe_for_inputs(Arch::Gfx1201, op, a, b),
+                    "{op:?} {a:#010x} {b:#010x}"
+                );
+                assert!(
+                    !swap_payload_safe_for_inputs(Arch::Gfx1201, op, b, a),
+                    "{op:?} {b:#010x} {a:#010x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn subtraction_and_other_arches_are_false() {
+        // inputs that are safe on gfx1201 add/mul/fmac
+        let (a, b) = (0x3f80_0000, 0x4000_0000);
+        for arch in ALL_ARCHES {
+            for op in ALL_OPS {
+                let expect = arch == Arch::Gfx1201 && SWAPPABLE.contains(&op);
+                assert_eq!(
+                    swap_payload_safe_for_inputs(arch, op, a, b),
+                    expect,
+                    "{arch:?} {op:?}"
+                );
+            }
+        }
+        for op in [VopdF32::Sub, VopdF32::Subrev] {
+            assert!(!swap_payload_safe_for_inputs(Arch::Gfx1201, op, a, b));
+        }
     }
 }
