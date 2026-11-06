@@ -18,9 +18,24 @@
 //!
 //! `mq2_xbatch_oracle [--captures MANIFEST] --out FILE.json`; exit 0 only when every
 //! case matches.
+//!
+//! `--bench` adds a launch-cost bench on a SYNTHETIC M=100276 K=2560 MQ2 g256 v2 weight (this
+//! file loads no real draft head), through `gemv_mq2g256v2_xbatch` (the product route; PM when
+//! `mq2_xbatch_pm_active`): median us per call at B = 1, 2, 3, 4 (ONE launch each) and B = 8
+//! (two launches), the line us(B) = a + b*B fitted over B = 1..4 and the implied one-launch
+//! B = 8 estimate a + 8b against the measured two-launch B = 8. Calls are captured in a HIP
+//! graph (`--bench-reps N` replays, default 15, each `BENCH_CALLS` calls) rotating over 3 weight
+//! copies (3 x 72 MB > the 64 MB MALL, so each call is cold-ish; rotation is not a flush).
+//! `--no-oracle` skips the oracle sweep (bench only; `--out` still writes the JSON):
+//!   cargo run --release -p rdna-compute --features lab --example mq2_xbatch_oracle -- \
+//!     --bench --no-oracle [--bench-reps N] --out mq2_bench.json
 
 use rdna_compute::{DType, Gpu};
 use serde_json::json;
+use std::time::Instant;
+
+const BENCH_CALLS: usize = 18;
+const BENCH_COPIES: usize = 3;
 
 type Result<T, E = String> = std::result::Result<T, E>;
 
@@ -150,6 +165,94 @@ fn capture_cases(
     Ok(bad_total)
 }
 
+/// Median us per call of `calls` launches captured in one graph (`reps` synchronized replays).
+fn graph_us(
+    gpu: &mut Gpu,
+    reps: usize,
+    mut f: impl FnMut(&mut Gpu, usize) -> Result<()>,
+) -> Result<f64> {
+    for i in 0..BENCH_COPIES {
+        f(gpu, i)?;
+    }
+    gpu.ensure_capture_stream().map_err(err)?;
+    gpu.hip.device_synchronize().map_err(err)?;
+    gpu.begin_stream_capture().map_err(err)?;
+    for i in 0..BENCH_CALLS {
+        f(gpu, i)?;
+    }
+    let graph = gpu.end_stream_capture().map_err(err)?;
+    let exec = gpu.hip.graph_instantiate(&graph).map_err(err)?;
+    for _ in 0..3 {
+        gpu.launch_graph(&exec).map_err(err)?;
+    }
+    let mut s = Vec::new();
+    for _ in 0..reps {
+        gpu.hip.device_synchronize().map_err(err)?;
+        let t = Instant::now();
+        gpu.launch_graph(&exec).map_err(err)?;
+        gpu.hip.device_synchronize().map_err(err)?;
+        s.push(t.elapsed().as_secs_f64() * 1e6 / BENCH_CALLS as f64);
+    }
+    gpu.hip.graph_exec_destroy(exec).map_err(err)?;
+    gpu.hip.graph_destroy(graph).map_err(err)?;
+    s.sort_by(f64::total_cmp);
+    Ok(s[s.len() / 2])
+}
+
+fn bench(gpu: &mut Gpu, rng: &mut Rng, reps: usize) -> Result<serde_json::Value> {
+    let (m, k) = (100276usize, 2560usize);
+    let pm = gpu.mq2_xbatch_pm_active(m, k);
+    let mut ws = Vec::new();
+    for _ in 0..BENCH_COPIES {
+        let bytes = weights(rng, m, k);
+        ws.push(gpu.upload_raw(&bytes, &[bytes.len()]).map_err(err)?);
+    }
+    let x_host: Vec<f32> = (0..8 * k).map(|_| rng.f32() * 3.0).collect();
+    let x = gpu.upload_f32(&x_host, &[x_host.len()]).map_err(err)?;
+    let y = gpu.zeros(&[8 * m], DType::F32).map_err(err)?;
+    let mut us = Vec::new();
+    for b in [1usize, 2, 3, 4, 8] {
+        let v = graph_us(gpu, reps, |g, i| {
+            g.gemv_mq2g256v2_xbatch(&ws[i % BENCH_COPIES], &x, &y, m, k, b)
+                .map_err(err)
+        })?;
+        us.push((b, v));
+    }
+    // Least-squares line over B = 1..4.
+    let n = 4.0;
+    let (sx, sy): (f64, f64) = us[..4].iter().fold((0.0, 0.0), |a, &(b, v)| (a.0 + b as f64, a.1 + v));
+    let sxx: f64 = us[..4].iter().map(|&(b, _)| (b * b) as f64).sum();
+    let sxy: f64 = us[..4].iter().map(|&(b, v)| b as f64 * v).sum();
+    let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+    let icpt = (sy - slope * sx) / n;
+    println!("mq2 xbatch bench: M={m} K={k} pm_active={pm} reps={reps} calls/replay={BENCH_CALLS} copies={BENCH_COPIES}");
+    for &(b, v) in &us {
+        println!(
+            "  B={b}: {v:.2} us ({} launch{})",
+            if b <= 4 { 1 } else { 2 },
+            if b <= 4 { "" } else { "es" }
+        );
+    }
+    let est8 = icpt + 8.0 * slope;
+    let meas8 = us[4].1;
+    println!(
+        "  fit us(B) = {icpt:.2} + {slope:.2}*B (B=1..4); one-launch B=8 estimate {est8:.2} us vs measured 2-launch {meas8:.2} us (ratio {:.3})",
+        meas8 / est8
+    );
+    for t in ws {
+        gpu.free_tensor(t).map_err(err)?;
+    }
+    gpu.free_tensor(x).map_err(err)?;
+    gpu.free_tensor(y).map_err(err)?;
+    Ok(json!({
+        "m": m, "k": k, "pm_active": pm, "reps": reps, "calls_per_replay": BENCH_CALLS,
+        "weight_copies": BENCH_COPIES, "weight": "synthetic",
+        "us": us.iter().map(|&(b, v)| json!({"b": b, "us": v})).collect::<Vec<_>>(),
+        "fit_a_us": icpt, "fit_b_us": slope,
+        "est_one_launch_b8_us": est8, "measured_two_launch_b8_us": meas8,
+    }))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let flag = |name: &str| {
@@ -160,6 +263,9 @@ fn main() {
     };
     let out = flag("--out");
     let captures = flag("--captures");
+    let do_bench = args.iter().any(|a| a == "--bench");
+    let no_oracle = args.iter().any(|a| a == "--no-oracle");
+    let bench_reps: usize = flag("--bench-reps").map_or(15, |v| v.parse().expect("--bench-reps N"));
     let run = || -> Result<(serde_json::Value, usize)> {
         let mut gpu = Gpu::init().map_err(err)?;
         let mut rng = Rng(0x9E3779B97F4A7C15);
@@ -178,7 +284,10 @@ fn main() {
             (33, 4352),
             (100003, 2560),
             (100276, 2560),
-        ] {
+        ]
+        .into_iter()
+        .filter(|_| !no_oracle)
+        {
             let a_bytes = weights(&mut rng, m, k);
             let a = gpu.upload_raw(&a_bytes, &[a_bytes.len()]).map_err(err)?;
             let x_host: Vec<f32> = (0..8 * k).map(|_| rng.f32() * 3.0).collect();
@@ -231,14 +340,20 @@ fn main() {
             gpu.free_tensor(y).map_err(err)?;
         }
         let pm_module = gpu.arch == "gfx1201";
-        if pm_module && pm_cases.is_empty() {
+        if pm_module && !no_oracle && pm_cases.is_empty() {
             return Err("gfx1201: the PeaceMaker module covered no case".into());
         }
         if let Some(manifest) = captures.as_deref() {
             bad_total += capture_cases(&mut gpu, manifest, &mut pm_cases)?;
         }
+        let bench_json = if do_bench {
+            bench(&mut gpu, &mut rng, bench_reps)?
+        } else {
+            serde_json::Value::Null
+        };
         Ok((
             json!({
+                "bench": bench_json,
                 "schema": "mq2-xbatch-oracle-v2", "arch": gpu.arch,
                 "pm_image_sha256": rdna_compute::kernels::GEMV_MQ2_XBATCH_PM_GFX1201_SHA256,
                 "cases": cases, "pm_cases": pm_cases, "mismatch_bytes_total": bad_total,
