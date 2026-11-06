@@ -354,6 +354,37 @@ fn edge_x(rng: &mut Rng, k: usize) -> Vec<f32> {
     x
 }
 
+/// First `limit` differing f32 words of the written region (`b` columns of `m` rows), as
+/// `{col,row,reference,got}` hex bit patterns; `other` (when given) adds the third arm's word.
+fn first_words(
+    reference: &[u8],
+    got: &[u8],
+    other: Option<&[u8]>,
+    m: usize,
+    written: usize,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    let word = |v: &[u8], i: usize| u32::from_le_bytes([v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3]]);
+    let mut out = Vec::new();
+    for i in 0..written / 4 {
+        if reference[4 * i..4 * i + 4] != got[4 * i..4 * i + 4] {
+            let mut e = json!({
+                "col": i / m, "row": i % m,
+                "reference": format!("{:#010x}", word(reference, i)),
+                "got": format!("{:#010x}", word(got, i)),
+            });
+            if let Some(o) = other {
+                e["other"] = json!(format!("{:#010x}", word(o, i)));
+            }
+            out.push(e);
+            if out.len() == limit {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Direct correctness of `obj`: single launch at B = 1..=max_b vs per-column singleton bytes
 /// (guards both sides included); hipcc in chunks of <= 4 vs the same bytes.
 fn direct_cases(gpu: &mut Gpu, obj: &Obj, max_b: usize) -> Result<(Vec<serde_json::Value>, usize)> {
@@ -416,10 +447,15 @@ fn direct_cases(gpu: &mut Gpu, obj: &Obj, max_b: usize) -> Result<(Vec<serde_jso
                 + hip[..guard].iter().filter(|&&v| v != 0x7f).count()
                 + hip[guard + written..].iter().filter(|&&v| v != 0x7f).count();
             bad_total += bad_written + bad_guard + bad_hip;
+            let (g_w, h_w) = (&got[guard..guard + written], &hip[guard..guard + written]);
+            let first_direct = first_words(&reference[..written], g_w, Some(h_w), m, written, 8);
+            let first_hipcc = first_words(&reference[..written], h_w, Some(g_w), m, written, 8);
             cases.push(json!({
                 "kind": kind, "m": m, "k": k, "b": b, "single_launch_mismatch_bytes": bad_written,
                 "single_launch_guard_overwritten_bytes": bad_guard,
                 "hipcc_chunked_mismatch_bytes": bad_hip,
+                "first_direct_mismatch_words": first_direct,
+                "first_hipcc_mismatch_words": first_hipcc,
             }));
         }
         gpu.free_tensor(a).map_err(err)?;
