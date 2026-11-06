@@ -30,6 +30,8 @@
 //! Formats: the token-layout activations are generic_gemm's `block_i4_128.kb_x_n.72b` (record
 //! `kb * N + token`), the F32 `[N][M]` outputs mq6_i8's `f32.n_x_m`.
 //!
+//! The `N <= 104857` bound (32-bit raw-row / q,k,v descriptor sizes) is inferred from `gdn_epilogue.rs`, not hardware-observed.
+//!
 //! Domain: the Qwen3.5 GDN geometry the epilogue hard-codes (QKV 10240 = 16 + 16 + 48 heads of 128,
 //! Z 6144, beta/alpha 48), `K % 256 == 0`, `0 < N`. `QScale` and `Eps` are passed as their f32 bit
 //! patterns (`f32::to_bits`), which the contract's integer expressions carry as `U32` params.
@@ -410,7 +412,7 @@ const DOMAIN: &[DomainRuleV1] = &[
     },
     DomainRuleV1 {
         rule: Rule::AtMost(X_BYTES, U32_MAX),
-        why: "gdn_epilogue.rs RAWD num_records = N * 0xa000 is a 32-bit s_mul_i32",
+        why: "gdn_epilogue.rs RAWD num_records = N * 0xa000 is a 32-bit s_mul_i32 (inferred from the generator source, not hardware-observed)",
     },
     DomainRuleV1 {
         rule: Rule::AtMost(V_DESC_BYTES, U32_MAX),
