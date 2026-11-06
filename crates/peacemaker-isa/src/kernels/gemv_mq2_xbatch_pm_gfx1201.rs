@@ -459,7 +459,14 @@ pub fn emit_body(b: &mut Builder, p: &Params, wg: WgId, prefix: &str) -> Result<
     }
     b.wait_all()?;
     salu(b, "s_cmp_ge_i32 s12, s10", &[], &[S_ROW0, S_M])?;
-    branch(b, &format!("s_cbranch_scc1 {pre}_end"))?;
+    if hops(p) {
+        // `row0 >= M` leaves through the first exit hop, one section away, not a far `_end`.
+        branch(b, &format!("s_cbranch_scc0 {pre}_in"))?;
+        branch(b, &format!("s_branch {}", exit_label(p, pre, 1)))?;
+        b.label(&format!("{pre}_in"))?;
+    } else {
+        branch(b, &format!("s_cbranch_scc1 {pre}_end"))?;
+    }
     smem(b, "s_load_b128 s[4:7], s[0:1], 0x0", &[4, 5, 6, 7], &[0, 1])?;
     smem(b, "s_load_b64 s[8:9], s[0:1], 0x10", &[8, 9], &[0, 1])?;
     smem(b, "s_load_b32 s3, s[0:1], 0x20", &[S_B], &[0, 1])?;
@@ -524,6 +531,29 @@ pub fn emit_body(b: &mut Builder, p: &Params, wg: WgId, prefix: &str) -> Result<
     }
     // B > cap clamps to cap (the hipcc anchor clamps B > 4 to 4); B <= 0 matches no path and stores nothing.
     salu(b, &format!("s_min_i32 s3, s3, {}", p.cap), &[S_B], &[S_B])?;
+    if hops(p) {
+        // Distributed gates: the code is larger than one `s_branch` reach (+-128 KiB), so every branch spans at
+        // most one section. Gate `nb` skips its section to gate `nb+1` (the last to `_end`) unless `B == nb`; a
+        // finished section falls into its exit hop, a chain of one-section jumps to `_end`.
+        for nb in 1..=p.cap {
+            if nb > 1 {
+                b.label(&format!("{pre}_d{nb}"))?;
+            }
+            salu(b, &format!("s_cmp_lg_u32 s3, {nb}"), &[], &[S_B])?;
+            let next = if nb < p.cap {
+                format!("{pre}_d{}", nb + 1)
+            } else {
+                format!("{pre}_end")
+            };
+            branch(b, &format!("s_cbranch_scc1 {next}"))?;
+            section(b, p, &lay, nb, pre)?;
+            if nb < p.cap {
+                b.label(&format!("{pre}_x{nb}"))?;
+                branch(b, &format!("s_branch {}", exit_label(p, pre, nb + 1)))?;
+            }
+        }
+        return b.label(&format!("{pre}_end"));
+    }
     for nb in 1..=p.cap {
         salu(b, &format!("s_cmp_eq_u32 s3, {nb}"), &[], &[S_B])?;
         branch(b, &format!("s_cbranch_scc1 {pre}_b{nb}"))?;
@@ -533,6 +563,21 @@ pub fn emit_body(b: &mut Builder, p: &Params, wg: WgId, prefix: &str) -> Result<
         section(b, p, &lay, nb, pre)?;
     }
     b.label(&format!("{pre}_end"))
+}
+
+/// Capacities above 4 outgrow one branch reach; the body uses the distributed-gate layout ([`emit_body`]).
+/// Capacities <= 4 keep the pinned shipped layout.
+fn hops(p: &Params) -> bool {
+    p.cap > 4
+}
+
+/// Entry of the exit-hop chain at section `nb`: the hop after section `nb`, or `_end` past the last section.
+fn exit_label(p: &Params, pre: &str, nb: u8) -> String {
+    if nb >= p.cap {
+        format!("{pre}_end")
+    } else {
+        format!("{pre}_x{nb}")
+    }
 }
 
 /// The complete kernel body for `nb` columns.
@@ -1065,7 +1110,11 @@ fn store(b: &mut Builder, p: &Params, lay: &Lay, nb: u8, pre: &str) -> Result<()
     }
     b.label(&format!("{pre}_b{nb}_stored"))?;
     b.wait_all()?;
-    branch(b, &format!("s_branch {pre}_end"))
+    if hops(p) {
+        Ok(()) // falls into the exit hop (`exit_label`) that follows the section
+    } else {
+        branch(b, &format!("s_branch {pre}_end"))
+    }
 }
 
 fn refs(kind: Kind, indices: &[u8]) -> Vec<crate::reg::RegRef> {
