@@ -391,3 +391,92 @@ fn probe_receipt_replay() {
     println!("TOTAL words {total_words} mismatches {total_bad}");
     assert_eq!(total_bad, 0, "hardware replay mismatches");
 }
+
+/// One streamed chunk of the `sfu_full` probe suite (opt-in; run by the probe as an external command). Environment:
+/// `PM_SFU_FILE` (the GPU's raw output words), `PM_SFU_OP` (`exp|rcp|rcp_iflag|log|rsq|sqrt`), `PM_SFU_ARCH`
+/// (`gfx1151|gfx1201`), `PM_SFU_BASE`, `PM_SFU_STRIDE` (input of word `i` is `base + i * stride`, modulo 2^32),
+/// `PM_SFU_MODE` (the probe's MODE index and readback, for the log line), optional `PM_SFU_CSV` (first mismatches
+/// written as `input,hardware,model`, capped at 100,000 rows) and `PM_REPLAY_THREADS`. Prints one `SFU ...` line and
+/// fails on any mismatch. The model is `emu::trans`, the same integer function `v_exp_f32` etc. execute.
+#[test]
+#[ignore]
+fn probe_sfu_chunk() {
+    use super::trans;
+    let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k}"));
+    let model: fn(Arch, u32) -> u32 = match var("PM_SFU_OP").as_str() {
+        "exp" => trans::exp_f32,
+        "rcp" => trans::rcp_f32,
+        "rcp_iflag" => trans::rcp_iflag_f32,
+        "log" => trans::log_f32,
+        "rsq" => trans::rsq_f32,
+        "sqrt" => trans::sqrt_f32,
+        op => panic!("op {op}"),
+    };
+    let arch = match var("PM_SFU_ARCH").as_str() {
+        "gfx1151" => Arch::Gfx1151,
+        "gfx1201" => Arch::Gfx1201,
+        a => panic!("arch {a}"),
+    };
+    let (base, stride): (u32, u32) = (
+        var("PM_SFU_BASE").parse().unwrap(),
+        var("PM_SFU_STRIDE").parse().unwrap(),
+    );
+    let data = std::fs::read(var("PM_SFU_FILE")).unwrap();
+    let n = data.len() / 4;
+    let threads = std::env::var("PM_REPLAY_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16usize);
+    let per = n.div_ceil(threads);
+    let rows: Vec<(Vec<(u32, u32, u32)>, u64)> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..threads)
+            .map(|t| {
+                let data = &data;
+                sc.spawn(move || {
+                    let mut bad = Vec::new();
+                    let mut count = 0u64;
+                    for i in t * per..((t + 1) * per).min(n) {
+                        let x = base.wrapping_add((i as u32).wrapping_mul(stride));
+                        let hw = word(data, i);
+                        let m = model(arch, x);
+                        if hw != m {
+                            count += 1;
+                            if bad.len() < 100_000 / 16 {
+                                bad.push((x, hw, m));
+                            }
+                        }
+                    }
+                    (bad, count)
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut total = 0u64;
+    let mut listed: Vec<(u32, u32, u32)> = Vec::new();
+    for (r, count) in rows {
+        total += count;
+        listed.extend(r);
+    }
+    if let Ok(csv) = std::env::var("PM_SFU_CSV") {
+        if !listed.is_empty() {
+            let mut s = String::from("input,hardware,model\n");
+            for (x, h, m) in &listed {
+                s.push_str(&format!("{x:08x},{h:08x},{m:08x}\n"));
+            }
+            std::fs::write(csv, s).unwrap();
+        }
+    }
+    println!(
+        "SFU arch={} op={} mode={} base={base:#010x} stride={stride} checked={n} mismatches={total} first={}",
+        var("PM_SFU_ARCH"),
+        var("PM_SFU_OP"),
+        std::env::var("PM_SFU_MODE").unwrap_or_default(),
+        listed
+            .iter()
+            .min_by_key(|r| r.0)
+            .map(|(x, h, m)| format!("{x:08x}:hw={h:08x}:model={m:08x}"))
+            .unwrap_or_else(|| "none".into())
+    );
+    assert_eq!(total, 0, "SFU model mismatches");
+}
