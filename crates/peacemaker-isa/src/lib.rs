@@ -621,6 +621,21 @@ impl Builder {
         let required = self.ledger.clone().drain();
         self.emit_required(required)
     }
+    /// Wait every memory counter of the arch to zero whatever the ledger holds. The ledger
+    /// runs linearly across raw branches, so a label entered from a dispatch switch may see a
+    /// state that is not its predecessors' join (e.g. a previous task's release increment
+    /// still in flight); a task-body region's entry uses this to start from the kernel-start
+    /// counter state on every path.
+    pub fn drain_all_counters(&mut self) -> Result<(), String> {
+        let counters: &[Counter] = if self.spec.arch.gfx12() {
+            &[Counter::Load, Counter::Store, Counter::Ds, Counter::Km]
+        } else if self.spec.arch == Arch::Gfx942 {
+            &[Counter::Vm, Counter::Lgkm]
+        } else {
+            &[Counter::Vm, Counter::Vs, Counter::Lgkm]
+        };
+        self.emit_required(counters.iter().map(|&c| (c, 0, Reason::Barrier)).collect())
+    }
     /// Emit now the waits an instruction defining `regs` would need (the hazards of loads still
     /// in flight into them, of stores still reading them): the minimal counter waits of the
     /// ledger, nothing when there is none. A caller about to open a clause settles its members'

@@ -529,6 +529,8 @@ global_store_b8	memory
 global_store_d16_hi_b16	memory
 global_load_b96	memory
 global_atomic_add_u32	memory
+global_atomic_swap_b32	memory
+global_atomic_or_b32	memory
 flat_load_b64	memory
 flat_load_b128	memory
 # Scratch: per-lane private memory (emu/memory.rs `scratch_access`, State::scratch sized from the kernel descriptor).

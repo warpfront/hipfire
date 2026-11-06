@@ -824,6 +824,25 @@ fn lifted_shipped_mq2_module_runs_as_a_p0_pool_region_on_the_emulator() {
     let elf =
         native::assemble_with_regions(&pool.s_text, Arch::Gfx1201, &pool.proof.regions).unwrap();
     assert!(check_carried(&elf, "pm_pool_mq2", &region).unwrap() > 1000);
+    // every region entry starts from drained counters on every dispatch path (the previous
+    // task's release increment included), not from the linear ledger's state
+    let lines: Vec<&str> = pool.s_text.lines().map(str::trim).collect();
+    let entries: Vec<usize> = (0..lines.len())
+        .filter(|&i| lines[i].starts_with(".Lt") && lines[i].ends_with("_entry:"))
+        .collect();
+    assert!(!entries.is_empty());
+    for i in entries {
+        let before = &lines[i.saturating_sub(4)..i];
+        for counter in ["loadcnt", "storecnt", "dscnt", "kmcnt"] {
+            assert!(
+                before.iter().any(|l| l.starts_with("s_wait_")
+                    && l.contains(counter)
+                    && l.ends_with(" 0x0")),
+                "{} is not preceded by a {counter} drain: {before:?}",
+                lines[i]
+            );
+        }
+    }
     // `.note.pm_regions` names the region, its lift request and its source object
     let notes = peacemaker_lift::regions_note::read_regions(&elf).unwrap();
     assert_eq!(notes.len(), 1);

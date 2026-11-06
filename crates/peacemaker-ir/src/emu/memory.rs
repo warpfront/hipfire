@@ -216,7 +216,11 @@ fn raw_srd_word3(word3: u32) -> Result<()> {
 /// adds commute, so the non-returning form applies them lane by lane, but a returning form with two active lanes on one
 /// dword (each would observe a different intermediate value) is an error. Memory is written with `Memory::write` and the
 /// returned dword lands through `State::put`, like the generic loads and stores.
-fn global_atomic_add_u32(i: &Inst, s: &mut State, mem: &mut Memory) -> Result<()> {
+///
+/// `global_atomic_or_b32` (`MEM[addr] |= DATA`) commutes like the add. `global_atomic_swap_b32` (`MEM[addr] = DATA`)
+/// does not: two active lanes swapping different values into one dword leave an unspecified winner, an error too.
+fn global_atomic_u32(i: &Inst, s: &mut State, mem: &mut Memory, name: &str) -> Result<()> {
+    let swap = name == "global_atomic_swap_b32";
     let regs: Vec<&Operand> = i
         .operands
         .iter()
@@ -225,7 +229,7 @@ fn global_atomic_add_u32(i: &Inst, s: &mut State, mem: &mut Memory) -> Result<()
     let ret = match regs.len() {
         4 => true,
         3 => false,
-        _ => return Err("global_atomic_add_u32: unexpected operand shape".into()),
+        _ => return Err(format!("{name}: unexpected operand shape").into()),
     };
     let (vaddr, vdata, saddr) = (
         regs[usize::from(ret)],
@@ -253,17 +257,26 @@ fn global_atomic_add_u32(i: &Inst, s: &mut State, mem: &mut Memory) -> Result<()
             s.read64(vaddr, lane)?
         }
         .wrapping_add_signed(offset);
-        if ret && lanes.iter().any(|(_, a)| *a == addr) {
-            return Err("global_atomic_add_u32: two active lanes return from one dword: the order is not specified".into());
+        if lanes.iter().any(|&(other, a)| {
+            a == addr
+                && (ret || (swap && s.read(vdata, other, 0).ok() != s.read(vdata, lane, 0).ok()))
+        }) {
+            return Err(format!(
+                "{name}: two active lanes meet in one dword where the order is observable and not specified"
+            )
+            .into());
         }
         lanes.push((lane, addr));
     }
     for (lane, addr) in lanes {
         let old = u32::from_le_bytes(mem.read(addr, 4)?.try_into().unwrap());
-        mem.write(
-            addr,
-            &old.wrapping_add(s.read(vdata, lane, 0)?).to_le_bytes(),
-        )?;
+        let data = s.read(vdata, lane, 0)?;
+        let new = match name {
+            "global_atomic_swap_b32" => data,
+            "global_atomic_or_b32" => old | data,
+            _ => old.wrapping_add(data),
+        };
+        mem.write(addr, &new.to_le_bytes())?;
         if ret {
             s.put(regs[0], lane, 0, old)?;
         }
@@ -551,8 +564,11 @@ pub(super) fn execute_tracked(
     if name.starts_with("scratch_") {
         return scratch_access(name, i, s);
     }
-    if name == "global_atomic_add_u32" {
-        return global_atomic_add_u32(i, s, mem);
+    if matches!(
+        name,
+        "global_atomic_add_u32" | "global_atomic_swap_b32" | "global_atomic_or_b32"
+    ) {
+        return global_atomic_u32(i, s, mem, name);
     }
     if name == "global_load_tr_b64" {
         return global_load_tr_b64(i, s, mem);

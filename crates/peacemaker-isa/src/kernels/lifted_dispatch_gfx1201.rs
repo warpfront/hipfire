@@ -346,7 +346,7 @@ pub fn pool(
             .pointer_access("events", 16, Access::ReadWrite)
             .pointer_access("kernargs", 24, Access::ReadOnly)
             .pointer_access("trace", 32, Access::WriteOnly)
-            .pointer_access("poison", 40, Access::ReadWrite) // set by an atomic swap
+            .pointer_access("poison", 40, Access::ReadWrite) // set by an atomic OR
             .hidden("spin_ticks", 48, 8, "by_value")
             .hidden("n_tasks", 56, 4, "by_value")
             .hidden("trace_on", 60, 4, "by_value")
@@ -500,9 +500,10 @@ pub fn pool(
         param(b, PTR_B, 0x28)?;
         op(b, "v_mov_b32_e32 v1, 0", &[v(1)], &[])?;
         op(b, "v_mov_b32_e32 v2, 1", &[v(2)], &[])?;
-        // poison is an event cell: written only by an atomic, released (railgun EventCells)
+        // poison is an event cell: railgun EventCells admit only commutative atomics, so it
+        // is set by a released (idempotent) atomic OR
         b.event_rmw(
-            AtomicOp::SwapB32,
+            AtomicOp::OrB32,
             None,
             v(2),
             GlobalAddr {

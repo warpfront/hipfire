@@ -431,6 +431,8 @@ impl Builder {
             crate::plan::region_entry_label(name),
             crate::plan::region_exit_label(name),
         );
+        // the entry may be reached from any dispatch path: start from drained counters
+        self.drain_all_counters()?;
         self.label(&entry)?;
         let entry_pc = self.program.instructions.len() - 1;
         for (meaning, r) in &abi.inputs {
@@ -597,6 +599,8 @@ impl Builder {
                 at += piece;
             }
         }
+        // the entry may be reached from any dispatch path: start from drained counters
+        self.drain_all_counters()?;
         self.label(&entry)?;
         let entry_pc = self.program.instructions.len() - 1;
         for (meaning, r) in &abi.inputs {
