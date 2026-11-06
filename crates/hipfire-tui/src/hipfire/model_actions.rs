@@ -335,7 +335,7 @@ fn remove_inner(tag: &str) -> RmOutcome {
 mod tests {
     use super::*;
     use crate::hipfire::ENV_LOCK;
-    use std::{env, fs, os::unix::fs::PermissionsExt, path::Path, path::PathBuf};
+    use std::{env, fs, path::Path, path::PathBuf};
 
     #[test]
     fn parse_percent_handles_real_line() {
@@ -393,12 +393,10 @@ mod tests {
     /// the script ignores anything but `pull` (fails fast, like no binary).
     fn install_fake_cli(dir: &Path, body: &str) {
         let script = dir.join("hipfire");
-        fs::write(
+        crate::test_support::write_executable(
             &script,
-            format!("#!/bin/sh\n[ \"$1\" = pull ] || exit 1\n{body}\n"),
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            &format!("#!/bin/sh\n[ \"$1\" = pull ] || exit 1\n{body}\n"),
+        );
         env::set_var("HIPFIRE_CLI_BIN", &script);
     }
 

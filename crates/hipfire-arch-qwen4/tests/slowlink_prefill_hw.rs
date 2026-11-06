@@ -138,7 +138,18 @@ fn load(purpose: Purpose) -> Hw {
     // No resident floor: the actual count must be the maximal count that fits
     // (selected fits, one more does not, a host layer remains), judged from
     // the scalar witness of the shared quote against the bundle's own counts.
-    {
+    // A tier profile (HIPFIRE_QWEN4_S1_TIER) keeps no whole layer resident by design: the
+    // ranked hot set takes the capacity, so there is no maximal-resident-layers witness.
+    let tier_profile = bundle
+        .slowlink_profile()
+        .is_some_and(|profile| profile.tier);
+    if tier_profile {
+        assert_eq!(
+            resident_layers, 0,
+            "a tier profile keeps no whole layer resident"
+        );
+        println!("S1 tier profile: hot set takes the slack at zero resident layers");
+    } else {
         let profile = bundle.slowlink_profile().expect("an admitted S1 profile");
         let witness = admission_witness(profile);
         let bad = admission_witness_problems(

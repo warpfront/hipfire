@@ -1744,6 +1744,7 @@ fn dims_of(c: &CaseData) -> RaonMoeDims {
         value_beta,
         router_eps: ROUTER_EPS,
         router_scale: ROUTER_SCALE,
+        tiers: hipfire_arch_raon::precision::RaonSiteTiers::ALL_F16,
     }
 }
 
@@ -1752,6 +1753,7 @@ fn proto_label(p: GroupedMoeProtocol) -> &'static str {
         GroupedMoeProtocol::Indexed => "indexed",
         GroupedMoeProtocol::Grouped => "grouped",
         GroupedMoeProtocol::Auto => "auto",
+        GroupedMoeProtocol::RowsExact => "rows_exact",
     }
 }
 
@@ -1788,11 +1790,11 @@ fn gated_refs<'a>(
     mi: usize,
     down_k: usize,
 ) -> GroupedMoeShared<'a> {
-    GroupedMoeShared {
-        gate: qt44_ref(&d.gate, mi, c, awq_in),
-        up: qt44_ref(&d.up, mi, c, awq_in),
-        down: qt44_ref(&d.down, c, down_k, d.awq_down.as_ref()),
-    }
+    GroupedMoeShared::new(
+        qt44_ref(&d.gate, mi, c, awq_in),
+        qt44_ref(&d.up, mi, c, awq_in),
+        qt44_ref(&d.down, c, down_k, d.awq_down.as_ref()),
+    )
 }
 
 struct DevIn {
@@ -1804,7 +1806,16 @@ struct DevIn {
 impl DevIn {
     fn new(gpu: &mut Gpu, c: &CaseData) -> Result<Self, String> {
         let x = up_f32(gpu, &c.x)?;
-        let router_w = up_f32(gpu, &c.router_w)?;
+        // The production loader path: BF16 when every value is BF16-exact (the
+        // generator rounds, as the checkpoint is BF16), else F32.
+        let router_w = hipfire_arch_raon::upload_rows_weight(
+            gpu,
+            &c.router_w,
+            c.geom.e,
+            c.geom.c,
+            "router_w",
+        )?
+        .buf;
         let bias = up_f32(gpu, &c.e_bias)?;
         Ok(Self { x, router_w, bias })
     }
@@ -1884,11 +1895,11 @@ fn gpu_moe_run_inner(
     }
     let shared_refs = match &wd.shared {
         Some(d) => gated_refs(d, wd.awq_gu.as_ref(), g.c, g.i, g.ipad),
-        None => GroupedMoeShared {
-            gate: qt44_ref(&wd.gate_up_ptrs, g.i, g.c, None),
-            up: qt44_ref(&wd.gate_up_ptrs, g.i, g.c, None),
-            down: qt44_ref(&wd.down_ptrs, g.c, g.ipad, None),
-        },
+        None => GroupedMoeShared::new(
+            qt44_ref(&wd.gate_up_ptrs, g.i, g.c, None),
+            qt44_ref(&wd.gate_up_ptrs, g.i, g.c, None),
+            qt44_ref(&wd.down_ptrs, g.c, g.ipad, None),
+        ),
     };
     let layer = RaonMoeLayerRefs {
         router_weight: &dev.router_w,
@@ -1898,6 +1909,7 @@ fn gpu_moe_run_inner(
         gate_up_awq: wd.awq_gu.as_ref(),
         down_awq_ptrs: wd.awq_down_ptrs.as_ref(),
         shared: shared_refs,
+        iu4_symmetric: false,
     };
     let mut op = raon_moe_op(
         ctx,
@@ -2546,8 +2558,10 @@ fn gpu_shared_only(
                 rot: &ts[4],
                 out: &ts[5],
                 tables: &ts[6],
+                table_cache: None,
             },
             out: &ts[5],
+            rows_exact: false,
         };
         let t0 = Instant::now();
         execute_gated_ffn(gpu, &op).map_err(classify)?;

@@ -231,6 +231,24 @@ pub fn bload(
         MemoryClass::VmemLoad,
     )
 }
+/// Raw buffer load of one zero-extended 16-bit value into `v{dst}` at `v{voff} + offset` (soffset zero).
+pub fn bload_u16(b: &mut Builder, dst: u8, voff: u8, srd: u8, offset: u32) -> Result<(), String> {
+    if offset > b.spec.arch.buffer_offset_max() {
+        return Err(format!("buffer offset {offset} exceeds the field"));
+    }
+    mem(
+        b,
+        format!(
+            "buffer_load_u16 v{dst}, v{voff}, s[{srd}:{}], {} offen{}",
+            srd + 3,
+            zero_soffset(b.spec.arch),
+            imm_offset(offset)
+        ),
+        &[v(dst)],
+        &[v(voff), sr(srd, 4)],
+        MemoryClass::VmemLoad,
+    )
+}
 /// Raw buffer store of four dwords at `v{voff} + offset` (soffset zero).
 pub fn bstore_b128(
     b: &mut Builder,

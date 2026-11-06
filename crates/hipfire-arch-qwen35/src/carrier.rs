@@ -333,12 +333,14 @@ fn placement_capacity_inputs(
     ctx: &LoadCtx,
     plan: &Qwen35KvPlan,
 ) -> Result<PlacementCapacity, String> {
-    // Capped sizing query (UMA-safe clamp, then the HIPFIRE_EMU cap).
-    let free_vram = ctx
+    // Planned capacity (total - own - reserve; UMA/emu keep their capped free
+    // figure): a transient foreign allocation must not change placement.
+    let planned = ctx
         .gpu
-        .device_mem_info()
-        .map_err(|e| format!("Qwen pre-weight VRAM query: {e}"))?
-        .0 as u64;
+        .planned_capacity()
+        .map_err(|e| format!("Qwen pre-weight VRAM query: {e}"))?;
+    eprintln!("qwen35: admission decision: weight/KV placement capacity from {planned}");
+    let free_vram = planned.bytes as u64;
     let rows = plan.dims.physical_cap.unwrap_or(plan.dims.max_seq);
     let stride =
         crate::qwen35::prefill::vmm_kv_token_bytes(config, plan.pair, plan.adaptive.is_some())
@@ -518,10 +520,12 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     if let Some(mut sequence) = ctx.sequence {
         let reserve = sequence.reserve_bytes;
         let capacity = (|| -> Result<(usize, usize, usize, usize, u64), String> {
-            let (free, _) = ctx
+            let planned = ctx
                 .gpu
-                .device_mem_info()
+                .planned_capacity()
                 .map_err(|e| format!("Qwen post-weight VRAM query: {e}"))?;
+            eprintln!("qwen35: admission decision: max_seq/KV budget capacity from {planned}");
+            let free = planned.bytes;
             let minimum =
                 crate::qwen35::prefill::minimum_prefill_reservation_bytes(&config, &ctx.gpu.arch)
                     .ok_or("Qwen minimum PBS sizing overflow")?;

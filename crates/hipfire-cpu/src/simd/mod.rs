@@ -22,7 +22,9 @@
 //! for the per-format map.
 //!
 //! **Exactness tiers.** `Mq4G256V2` and `Mq4G128V2` (the D2 host-slot expert
-//! path's gate/up and down formats) additionally have an AVX-512F tier
+//! path's gate/up and down formats) and the planar W3 pair (`Mq3I4G128R256` /
+//! `Mq3I4G128R128`, the `mq3-xts` cold experts; with a decode-once multi-token
+//! row dot, [`row_dot_multi_planar`]) additionally have an AVX-512 tier
 //! ([`x86_512`]) that is *bit-identical* to their AVX2 kernels — each lane runs
 //! the same FMA sequence its AVX2 chain does — so which tier ran never changes
 //! an output bit. [`resolve_tier`] picks the tier once, beside [`features_for`];
@@ -166,6 +168,9 @@ pub(crate) fn avx512_available() -> bool {
     avx2_f16c_available()
         && std::arch::is_x86_feature_detected!("avx512f")
         && std::arch::is_x86_feature_detected!("avx512vbmi")
+        // The planar W3 unpack uses a byte-masked 24-byte load (BW + VL); every VBMI part has both.
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -176,7 +181,13 @@ pub(crate) fn avx512_available() -> bool {
 /// Whether `q` has an AVX-512 kernel ([`x86_512`]).
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn has_avx512_kernel(q: CpuQuant) -> bool {
-    matches!(q, CpuQuant::Mq4G256V2 | CpuQuant::Mq4G128V2)
+    matches!(
+        q,
+        CpuQuant::Mq4G256V2
+            | CpuQuant::Mq4G128V2
+            | CpuQuant::Mq3I4G128R256
+            | CpuQuant::Mq3I4G128R128
+    )
 }
 
 /// The tier for `q` given what the CPU offers — the single place tier
@@ -689,11 +700,97 @@ pub(crate) fn row_dot_tier(
             match q {
                 CpuQuant::Mq4G256V2 => x86_512::mq4g256v2_row_dot(p, k, xp),
                 CpuQuant::Mq4G128V2 => x86_512::mq4g128v2_row_dot(p, k, xp),
+                CpuQuant::Mq3I4G128R256 | CpuQuant::Mq3I4G128R128 => {
+                    x86_512::w3_row_dot512(p, scales_row.as_ptr(), k, xp)
+                }
                 _ => unreachable!("has_avx512_kernel admitted {q:?}"),
             }
         };
     }
     row_dot_avx2_kernel(q, row, scales_row, k, x)
+}
+
+/// Most activation rows one [`row_dot_multi_planar`] call decodes the weights once for.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const PLANAR_MULTI_MAX: usize = x86_512::W3_MULTI_TOKENS;
+
+/// Whether `q` has a decode-once multi-token row dot over its planar planes
+/// ([`row_dot_multi_planar`]): the W3 formats on an AVX-512 CPU. Everything else
+/// (and a CPU without AVX-512 VBMI) takes the per-token row dots, which compute
+/// the same bits.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn has_planar_multi_kernel(q: CpuQuant) -> bool {
+    matches!(q, CpuQuant::Mq3I4G128R256 | CpuQuant::Mq3I4G128R128)
+        && avx512_available()
+        && row_dot_enabled(q, None)
+}
+
+/// One planar W3 weight row dotted with several activation rows (`xs[t]`), the
+/// weights decoded once per group of up to [`x86_512::W3_MULTI_TOKENS`] rows.
+/// `out[t]` is bit-identical to [`row_dot_avx2`]`(q, row, scales_row, k, xs[t])`
+/// (and so to the AVX2 kernel): each token runs the single-token kernel's FMA
+/// sequence, chain split, lane join and affine association on its own
+/// accumulators.
+///
+/// Requires [`has_planar_multi_kernel`]`(q)`, `row` / `scales_row` as
+/// [`crate::gemv`]'s planar row slices of a `k`-wide row and every `xs[t].len() >= k`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn row_dot_multi_planar(
+    q: CpuQuant,
+    row: &[u8],
+    scales_row: &[u8],
+    k: usize,
+    xs: &[&[f32]],
+    out: &mut [f32],
+) {
+    assert!(
+        has_planar_multi_kernel(q),
+        "row_dot_multi_planar: {q:?} has no multi-token planar kernel on this CPU"
+    );
+    assert!(xs.len() == out.len(), "token count mismatch");
+    assert!(
+        k.is_multiple_of(crate::quant::PLANAR_GROUP)
+            && row.len() >= crate::gemv::row_bytes(q, k)
+            && scales_row.len() >= 2 * (k / crate::quant::PLANAR_GROUP)
+            && xs.iter().all(|x| x.len() >= k),
+        "row_dot_multi_planar({q:?}): row, scales or activation shorter than the shape"
+    );
+    let (cp, sp) = (row.as_ptr(), scales_row.as_ptr());
+    let mut t0 = 0;
+    while t0 < xs.len() {
+        let g = (xs.len() - t0).min(x86_512::W3_MULTI_TOKENS);
+        let mut p = [core::ptr::null::<f32>(); x86_512::W3_MULTI_TOKENS];
+        for i in 0..g {
+            p[i] = xs[t0 + i].as_ptr();
+        }
+        let o = out[t0..].as_mut_ptr();
+        // SAFETY: AVX-512 F/BW/VL/VBMI + AVX2/FMA/F16C by `has_planar_multi_kernel`, bounds
+        // asserted above; `o` has `g` slots.
+        unsafe {
+            macro_rules! run {
+                ($t:literal) => {
+                    x86_512::w3_row_dot512_multi::<$t>(
+                        cp,
+                        sp,
+                        k,
+                        &*(p.as_ptr() as *const [*const f32; $t]),
+                        o,
+                    )
+                };
+            }
+            match g {
+                1 => run!(1),
+                2 => run!(2),
+                3 => run!(3),
+                4 => run!(4),
+                5 => run!(5),
+                6 => run!(6),
+                7 => run!(7),
+                _ => run!(8),
+            }
+        }
+        t0 += g;
+    }
 }
 
 /// The AVX2 format→kernel map.

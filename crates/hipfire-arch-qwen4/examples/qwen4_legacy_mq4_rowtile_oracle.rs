@@ -387,7 +387,7 @@ fn shared_request(gpu: &Gpu, path: &Path, n_ctx: usize) -> Result<Qwen4RankShare
         hipfire_arch_qwen4::Qwen4KvBackend::Legacy => 1,
     };
     Ok(Qwen4RankShared {
-        continuous_batch: false,
+        batch: Default::default(),
         path: path.to_str().ok_or("model path is not UTF-8")?.to_owned(),
         max_seq: n_ctx,
         sequence: None,

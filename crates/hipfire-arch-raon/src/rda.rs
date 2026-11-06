@@ -26,7 +26,11 @@ use hipfire_dispatch::ops::delta_net::{
     execute_gated_delta, DecayAxis, GatedDeltaOp, GatedDeltaStrides,
 };
 use rdna_compute::gated_delta_vector::{
-    CausalConvRowsGeom, GatedRmsnormRowsGeom, RdaPrepareLaunch,
+    rda_conv_prepare_rows_per_wave, CausalConvRowsGeom, GatedRmsnormRowsGeom, RdaConvPrepareLaunch,
+    RdaPrepareLaunch, GATED_DELTA_VECTOR_HEAD_DIM,
+};
+use rdna_compute::gated_delta_vector_chunk::{
+    chunked_enabled, GatedDeltaVectorChunkScratch, GATED_DELTA_VECTOR_CHUNK_MIN_ROWS,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -128,6 +132,16 @@ pub struct RdaScratch {
     pub beta: GpuTensor,
     /// BF16-rounded recurrence output (`out = cast_model(y)`) `[N, P]`.
     pub y: GpuTensor,
+    /// Chunked-RDA workspace, allocated unless `HIPFIRE_GATED_DELTA_VECTOR_CHUNKED=0`, on a
+    /// device that has the chunked kernel; `None` keeps the serial recurrence.
+    pub chunk: Option<GatedDeltaVectorChunkScratch>,
+}
+
+/// Rows per chunked-RDA scratch segment (a longer prefill chunk runs as several segments).
+pub const RDA_CHUNK_SCRATCH_ROWS: usize = 512;
+
+fn chunk_scratch_rows(max_rows: usize) -> usize {
+    max_rows.min(RDA_CHUNK_SCRATCH_ROWS)
 }
 
 impl RdaScratch {
@@ -148,8 +162,106 @@ impl RdaScratch {
             log_alpha: plane(gpu, p)?,
             beta: plane(gpu, geom.n_heads)?,
             y: plane(gpu, p)?,
+            chunk: if chunked_enabled() && gpu.gated_delta_vector_chunked_arch_supported() {
+                Some(
+                    gpu.alloc_gated_delta_vector_chunk_scratch(
+                        chunk_scratch_rows(max_rows),
+                        geom.n_heads,
+                    )
+                    .map_err(|e| format!("rda chunk scratch alloc: {e:?}"))?,
+                )
+            } else {
+                None
+            },
         })
     }
+
+    /// Device bytes [`Self::new`] allocates for `max_rows` rows (pool allocations
+    /// are exact, minimum 256 B each). `chunked_arch`: the device has the chunked kernel
+    /// ([`Gpu::gated_delta_vector_chunked_arch_supported`]), so [`Self::new`] allocates its workspace.
+    pub fn required_bytes(geom: &RdaGeometry, max_rows: usize, chunked_arch: bool) -> usize {
+        let p = geom.proj();
+        // qconv, kconv, vconv, q, k, vprime, log_alpha, y: `[rows, P]`; beta: `[rows, heads]`.
+        let mut elems = [max_rows * p; 8].to_vec();
+        elems.push(max_rows * geom.n_heads);
+        let planes: usize = elems.into_iter().map(|e| (e * 4).max(256)).sum();
+        // Charged exactly when `new` allocates it: flag on and an arch with the kernel.
+        let chunk = if chunked_enabled() && chunked_arch {
+            GatedDeltaVectorChunkScratch::required_bytes(chunk_scratch_rows(max_rows), geom.n_heads)
+        } else {
+            0
+        };
+        planes + chunk
+    }
+}
+
+/// Per-layer recurrence-input tape: non-owning `[max_rows, *]` plane views the
+/// verify forward writes INSTEAD of the scratch planes, so a partial accept can
+/// rerun the recurrence of the kept prefix ([`crate::rollback`]). `q`, `k`,
+/// `vprime`, `log_alpha` are `raon_rda_prepare`'s outputs (`[rows, P]`) and
+/// `beta` its `[rows, H]` output, exactly what [`execute_gated_delta`] consumes;
+/// `q_raw`/`k_raw`/`v_raw` are the pre-conv projections (`[rows, P]`) whose last
+/// rows rebuild the conv history. Every plane is row-contiguous with a row
+/// stride equal to its width.
+pub struct RdaTape {
+    pub q_raw: GpuTensor,
+    pub k_raw: GpuTensor,
+    pub v_raw: GpuTensor,
+    pub q: GpuTensor,
+    pub k: GpuTensor,
+    pub vprime: GpuTensor,
+    pub log_alpha: GpuTensor,
+    pub beta: GpuTensor,
+}
+
+/// The recurrence of one RDA layer: [`execute_gated_delta`] over `n` rows of
+/// `q, k, vprime, log_alpha, beta` (contiguous planes, row stride = plane
+/// width) from and into `st.state`, `output` receiving the BF16-rounded
+/// `[n, P]` result. The ONE launch shared by [`rda_forward_rows_taped`] and the
+/// rollback replay, so both run the same geometry, strides and slot.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rda_recurrence(
+    gpu: &mut Gpu,
+    geom: &RdaGeometry,
+    st: &RdaLayerState<'_>,
+    q: &GpuTensor,
+    k: &GpuTensor,
+    vprime: &GpuTensor,
+    log_alpha: &GpuTensor,
+    beta: &GpuTensor,
+    output: &GpuTensor,
+    n: usize,
+    chunk: Option<&GatedDeltaVectorChunkScratch>,
+) -> Result<(), String> {
+    let h = geom.n_heads;
+    let kd = geom.head_dim;
+    let mut strides = GatedDeltaStrides::contiguous(h, 1, kd, kd, DecayAxis::PerKeyChannel);
+    strides.state_slot = st.state_slot_stride;
+    execute_gated_delta(
+        gpu,
+        &GatedDeltaOp {
+            query: q,
+            key: k,
+            value: vprime,
+            log_decay: log_alpha,
+            beta,
+            state: st.state,
+            output,
+            slot_idx: None,
+            n_dev: None,
+            n_tokens: n,
+            n_heads: h,
+            qk_group: 1,
+            key_dim: kd,
+            value_dim: kd,
+            decay_axis: DecayAxis::PerKeyChannel,
+            round_output_bf16: geom.round_bf16,
+            slot: st.slot,
+            strides,
+            chunk_scratch: chunk,
+        },
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Run one RDA layer over `n` rows. Writes `gated [N, P]` (input of the output
@@ -166,6 +278,26 @@ pub fn rda_forward_rows(
     gated: &GpuTensor,
     n: usize,
 ) -> Result<(), String> {
+    rda_forward_rows_taped(gpu, geom, layer, st, x, scratch, gated, n, None)
+}
+
+/// [`rda_forward_rows`] with an optional [`RdaTape`]: when present,
+/// `raon_rda_prepare` writes `q, k, vprime, log_alpha, beta` into the tape's
+/// planes and the recurrence reads them from there (the launch sequence is
+/// identical, only the pointers differ). The caller supplies the tape's
+/// `q_raw`/`k_raw`/`v_raw` planes as `x.q_raw`/`x.k_raw`/`x.v_raw`.
+#[allow(clippy::too_many_arguments)]
+pub fn rda_forward_rows_taped(
+    gpu: &mut Gpu,
+    geom: &RdaGeometry,
+    layer: &RaonRdaLayer<'_>,
+    st: &RdaLayerState<'_>,
+    x: &RdaProjected<'_>,
+    scratch: &RdaScratch,
+    gated: &GpuTensor,
+    n: usize,
+    tape: Option<&RdaTape>,
+) -> Result<(), String> {
     if n == 0 {
         return Ok(());
     }
@@ -178,101 +310,323 @@ pub fn rda_forward_rows(
     let p = geom.proj();
     let h = geom.n_heads;
     let kd = geom.head_dim;
-    let err = |what: &str, e: String| format!("rda_forward_rows {what}: {e}");
 
-    // Three independent depthwise convs: raw -> SiLU -> BF16, history in place.
-    for (input, weight, hist, out, what) in [
-        (x.q_raw, layer.conv_w_q, st.hist_q, &scratch.qconv, "conv q"),
-        (x.k_raw, layer.conv_w_k, st.hist_k, &scratch.kconv, "conv k"),
-        (x.v_raw, layer.conv_w_v, st.hist_v, &scratch.vconv, "conv v"),
-    ] {
-        let g = CausalConvRowsGeom {
-            n_rows: n,
-            n_channels: p,
-            ksize: geom.conv_kernel,
-            in_row_stride: p,
-            out_row_stride: p,
-            w_ch_stride: geom.conv_kernel,
-            w_tap_stride: 1,
-            hist_tap_stride: p,
-            apply_silu: true,
-            round_bf16: geom.round_bf16,
+    let (q, k, vprime, log_alpha, beta) = match tape {
+        Some(t) => (&t.q, &t.k, &t.vprime, &t.log_alpha, &t.beta),
+        None => (
+            &scratch.q,
+            &scratch.k,
+            &scratch.vprime,
+            &scratch.log_alpha,
+            &scratch.beta,
+        ),
+    };
+
+    // Wave-per-tile conv+prepare (exact gfx1201 / gfx1100) and gated norm (exact gfx1201): ordinary prefill rows,
+    // no tape.
+    let wave_ok = tape.is_none()
+        && n >= RDA_WAVE_MIN_ROWS
+        && fused_prep_enabled()
+        && kd == GATED_DELTA_VECTOR_HEAD_DIM
+        && geom.conv_kernel == 4
+        && p % 4 == 0;
+    let wave_prep = wave_ok && gpu.rda_conv_prepare_arch_supported();
+    let wave_norm = wave_ok && gpu.rda_wave_kernels_arch_supported();
+    // Segmented producer -> core -> norm: each segment's planes are produced right before the chunked core
+    // consumes them and the norm right after, so the segment's working set stays in the last-level cache.
+    let seg_rows = match scratch.chunk.as_ref() {
+        Some(c) if tape.is_none() && segment_enabled() => c.segment_rows().min(RDA_SEGMENT_ROWS),
+        _ => usize::MAX,
+    };
+
+    if n <= seg_rows {
+        let io = RowsIo {
+            q_raw: x.q_raw,
+            k_raw: x.k_raw,
+            v_raw: x.v_raw,
+            z: x.z,
+            b: x.b,
+            delta: x.delta,
+            f: x.f,
+            gated,
+            qconv: &scratch.qconv,
+            kconv: &scratch.kconv,
+            vconv: &scratch.vconv,
+            q,
+            k,
+            vprime,
+            log_alpha,
+            beta,
+            y: &scratch.y,
         };
-        gpu.causal_conv_depthwise_silu_rows_f32(out, input, weight, hist, hist, &g)
-            .map_err(|e| err(what, format!("{e:?}")))?;
+        return rda_rows(
+            gpu,
+            geom,
+            layer,
+            st,
+            &io,
+            scratch.chunk.as_ref(),
+            n,
+            wave_prep,
+            wave_norm,
+        );
     }
 
-    gpu.raon_rda_prepare_f32(&RdaPrepareLaunch {
-        q_out: &scratch.q,
-        k_out: &scratch.k,
-        vprime_out: &scratch.vprime,
-        log_alpha_out: &scratch.log_alpha,
-        beta_out: &scratch.beta,
-        qconv: &scratch.qconv,
-        kconv: &scratch.kconv,
-        vconv: &scratch.vconv,
-        f: x.f,
-        b: x.b,
-        delta: x.delta,
-        a_log: layer.a_log,
-        dt_bias: layer.dt_bias,
-        n_rows: n,
-        n_heads: h,
-        head_dim: kd,
-        conv_row_stride: p,
-        f_row_stride: p,
-        bd_row_stride: h,
-        out_row_stride: p,
-        beta_row_stride: h,
-        q_scale: (kd as f64).powf(-0.5) as f32,
-        norm_eps: geom.norm_eps,
-        lower_bound: geom.gate_lower_bound,
-        round_bf16: geom.round_bf16,
-    })
-    .map_err(|e| err("prepare", format!("{e:?}")))?;
+    // Segments reuse the first `seg_rows` rows of the scratch planes (bounded by `max_rows >= seg_rows`).
+    let mut row0 = 0usize;
+    while row0 < n {
+        let mut len = (n - row0).min(seg_rows);
+        // A trailing range under the chunked core's admission floor would run the serial kernel (different
+        // bits): fold it into this segment (the core splits a longer launch at its own capacity).
+        if n - row0 - len > 0 && n - row0 - len < GATED_DELTA_VECTOR_CHUNK_MIN_ROWS {
+            len = n - row0;
+        }
+        let rows_p = |t: &GpuTensor| t.sub_offset(row0 * p, len * p);
+        let rows_h = |t: &GpuTensor| t.sub_offset(row0 * h, len * h);
+        let head_p = |t: &GpuTensor| t.sub_offset(0, len * p);
+        let (q_raw, k_raw, v_raw, z, b, delta, f, gated_seg) = (
+            rows_p(x.q_raw),
+            rows_p(x.k_raw),
+            rows_p(x.v_raw),
+            rows_p(x.z),
+            rows_h(x.b),
+            rows_h(x.delta),
+            rows_p(x.f),
+            rows_p(gated),
+        );
+        let (qconv, kconv, vconv, q_s, k_s, vp_s, la_s, y_s) = (
+            head_p(&scratch.qconv),
+            head_p(&scratch.kconv),
+            head_p(&scratch.vconv),
+            head_p(q),
+            head_p(k),
+            head_p(vprime),
+            head_p(log_alpha),
+            head_p(&scratch.y),
+        );
+        let beta_s = beta.sub_offset(0, len * h);
+        let io = RowsIo {
+            q_raw: &q_raw,
+            k_raw: &k_raw,
+            v_raw: &v_raw,
+            z: &z,
+            b: &b,
+            delta: &delta,
+            f: &f,
+            gated: &gated_seg,
+            qconv: &qconv,
+            kconv: &kconv,
+            vconv: &vconv,
+            q: &q_s,
+            k: &k_s,
+            vprime: &vp_s,
+            log_alpha: &la_s,
+            beta: &beta_s,
+            y: &y_s,
+        };
+        rda_rows(
+            gpu,
+            geom,
+            layer,
+            st,
+            &io,
+            scratch.chunk.as_ref(),
+            len,
+            wave_prep,
+            wave_norm,
+        )?;
+        row0 += len;
+    }
+    Ok(())
+}
 
-    let mut strides = GatedDeltaStrides::contiguous(h, 1, kd, kd, DecayAxis::PerKeyChannel);
-    strides.state_slot = st.state_slot_stride;
-    execute_gated_delta(
-        gpu,
-        &GatedDeltaOp {
-            query: &scratch.q,
-            key: &scratch.k,
-            value: &scratch.vprime,
-            log_decay: &scratch.log_alpha,
-            beta: &scratch.beta,
-            state: st.state,
-            output: &scratch.y,
-            slot_idx: None,
-            n_dev: None,
-            n_tokens: n,
-            n_heads: h,
-            qk_group: 1,
-            key_dim: kd,
-            value_dim: kd,
-            decay_axis: DecayAxis::PerKeyChannel,
-            round_output_bf16: geom.round_bf16,
-            slot: st.slot,
-            strides,
-        },
-    )
-    .map_err(|e| err("recurrence", e.to_string()))?;
+// selector-receipt: receipts/selectors/rda_wave_min_rows.json
+/// Smallest row count the wave-per-tile conv+prepare and gated-norm kernels are used for (ordinary prefill;
+/// decode and verify rows keep the incumbent launches).
+pub const RDA_WAVE_MIN_ROWS: usize = 64;
 
-    gpu.gated_rmsnorm_sigmoid_rows_f32(
-        gated,
-        &scratch.y,
-        x.z,
-        layer.o_norm_gamma,
-        &GatedRmsnormRowsGeom {
+/// Rows per segment of the segmented RDA layer (a whole number of C64 chunks, at most the chunked core's own
+/// segment). 192-256 rows measured best (R9700, 4096-row layer: 3.60-3.65 ms vs 3.84 ms at 512 and 4.84 ms
+/// unsegmented/unfused); at 256 a segment's producer planes, `y` and the core workspace stay cache-resident.
+pub const RDA_SEGMENT_ROWS: usize = 256;
+
+/// `HIPFIRE_RAON_RDA_FUSED_PREP` (developer, exact gfx1201; conv+prepare also exact gfx1100): the three RDA convs + `raon_rda_prepare` run as one
+/// launch (no conv planes) and the gated norm as one wave per (row, head); both bit-identical to the
+/// incumbent launches. `=0` restores them.
+fn fused_prep_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| hipfire_config::developer_bool("HIPFIRE_RAON_RDA_FUSED_PREP", true))
+}
+
+/// `HIPFIRE_RAON_RDA_SEGMENT` (developer): with the chunked core, an ordinary prefill chunk runs its RDA layer
+/// as consecutive core-segment-sized row ranges (producer, core, gated norm per range) so the planes the core
+/// consumes are still cache-resident. Bit-identical (segments are whole C64 chunks). `=0` restores one pass.
+fn segment_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| hipfire_config::developer_bool("HIPFIRE_RAON_RDA_SEGMENT", true))
+}
+
+/// Tensors of one row range of an RDA layer (all row-contiguous, row stride = plane width).
+struct RowsIo<'a> {
+    q_raw: &'a GpuTensor,
+    k_raw: &'a GpuTensor,
+    v_raw: &'a GpuTensor,
+    z: &'a GpuTensor,
+    b: &'a GpuTensor,
+    delta: &'a GpuTensor,
+    f: &'a GpuTensor,
+    gated: &'a GpuTensor,
+    qconv: &'a GpuTensor,
+    kconv: &'a GpuTensor,
+    vconv: &'a GpuTensor,
+    q: &'a GpuTensor,
+    k: &'a GpuTensor,
+    vprime: &'a GpuTensor,
+    log_alpha: &'a GpuTensor,
+    beta: &'a GpuTensor,
+    y: &'a GpuTensor,
+}
+
+/// conv(q,k,v) -> prepare -> recurrence -> gated norm over `n` rows of `io` (the conv histories and the
+/// recurrent state advance by exactly these rows, so consecutive ranges chain).
+#[allow(clippy::too_many_arguments)]
+fn rda_rows(
+    gpu: &mut Gpu,
+    geom: &RdaGeometry,
+    layer: &RaonRdaLayer<'_>,
+    st: &RdaLayerState<'_>,
+    io: &RowsIo<'_>,
+    chunk: Option<&GatedDeltaVectorChunkScratch>,
+    n: usize,
+    wave_prep: bool,
+    wave_norm: bool,
+) -> Result<(), String> {
+    let p = geom.proj();
+    let h = geom.n_heads;
+    let kd = geom.head_dim;
+    let err = |what: &str, e: String| format!("rda_forward_rows {what}: {e}");
+    let q_scale = (kd as f64).powf(-0.5) as f32;
+
+    if wave_prep {
+        gpu.raon_rda_conv_prepare_w128_f32(&RdaConvPrepareLaunch {
+            q_out: io.q,
+            k_out: io.k,
+            vprime_out: io.vprime,
+            log_alpha_out: io.log_alpha,
+            beta_out: io.beta,
+            q_raw: io.q_raw,
+            k_raw: io.k_raw,
+            v_raw: io.v_raw,
+            conv_w_q: layer.conv_w_q,
+            conv_w_k: layer.conv_w_k,
+            conv_w_v: layer.conv_w_v,
+            hist_q: st.hist_q,
+            hist_k: st.hist_k,
+            hist_v: st.hist_v,
+            f: io.f,
+            b: io.b,
+            delta: io.delta,
+            a_log: layer.a_log,
+            dt_bias: layer.dt_bias,
             n_rows: n,
             n_heads: h,
             head_dim: kd,
-            x_row_stride: p,
-            gate_row_stride: p,
+            conv_kernel: geom.conv_kernel,
+            rows_per_wave: rda_conv_prepare_rows_per_wave(n),
+            raw_row_stride: p,
+            f_row_stride: p,
+            bd_row_stride: h,
             out_row_stride: p,
-            eps: geom.rms_eps,
+            beta_row_stride: h,
+            hist_tap_stride: p,
+            q_scale,
+            norm_eps: geom.norm_eps,
+            lower_bound: geom.gate_lower_bound,
             round_bf16: geom.round_bf16,
-        },
+        })
+        .map_err(|e| err("conv+prepare", format!("{e:?}")))?;
+    } else {
+        // Three independent depthwise convs: raw -> SiLU -> BF16, history in place.
+        for (input, weight, hist, out, what) in [
+            (io.q_raw, layer.conv_w_q, st.hist_q, io.qconv, "conv q"),
+            (io.k_raw, layer.conv_w_k, st.hist_k, io.kconv, "conv k"),
+            (io.v_raw, layer.conv_w_v, st.hist_v, io.vconv, "conv v"),
+        ] {
+            let g = CausalConvRowsGeom {
+                n_rows: n,
+                n_channels: p,
+                ksize: geom.conv_kernel,
+                in_row_stride: p,
+                out_row_stride: p,
+                w_ch_stride: geom.conv_kernel,
+                w_tap_stride: 1,
+                hist_tap_stride: p,
+                apply_silu: true,
+                round_bf16: geom.round_bf16,
+            };
+            gpu.causal_conv_depthwise_silu_rows_f32(out, input, weight, hist, hist, &g)
+                .map_err(|e| err(what, format!("{e:?}")))?;
+        }
+
+        gpu.raon_rda_prepare_f32(&RdaPrepareLaunch {
+            q_out: io.q,
+            k_out: io.k,
+            vprime_out: io.vprime,
+            log_alpha_out: io.log_alpha,
+            beta_out: io.beta,
+            qconv: io.qconv,
+            kconv: io.kconv,
+            vconv: io.vconv,
+            f: io.f,
+            b: io.b,
+            delta: io.delta,
+            a_log: layer.a_log,
+            dt_bias: layer.dt_bias,
+            n_rows: n,
+            n_heads: h,
+            head_dim: kd,
+            conv_row_stride: p,
+            f_row_stride: p,
+            bd_row_stride: h,
+            out_row_stride: p,
+            beta_row_stride: h,
+            q_scale,
+            norm_eps: geom.norm_eps,
+            lower_bound: geom.gate_lower_bound,
+            round_bf16: geom.round_bf16,
+        })
+        .map_err(|e| err("prepare", format!("{e:?}")))?;
+    }
+
+    rda_recurrence(
+        gpu,
+        geom,
+        st,
+        io.q,
+        io.k,
+        io.vprime,
+        io.log_alpha,
+        io.beta,
+        io.y,
+        n,
+        chunk,
     )
+    .map_err(|e| err("recurrence", e))?;
+
+    let norm = GatedRmsnormRowsGeom {
+        n_rows: n,
+        n_heads: h,
+        head_dim: kd,
+        x_row_stride: p,
+        gate_row_stride: p,
+        out_row_stride: p,
+        eps: geom.rms_eps,
+        round_bf16: geom.round_bf16,
+    };
+    if wave_norm {
+        gpu.gated_rmsnorm_sigmoid_rows_w128_f32(io.gated, io.y, io.z, layer.o_norm_gamma, &norm)
+    } else {
+        gpu.gated_rmsnorm_sigmoid_rows_f32(io.gated, io.y, io.z, layer.o_norm_gamma, &norm)
+    }
     .map_err(|e| err("output gate", format!("{e:?}")))
 }

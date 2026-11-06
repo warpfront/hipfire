@@ -1,0 +1,96 @@
+{
+ "schema": "mtp-parity-mix-v1",
+ "description": "W2: the eight diverse prompts (code_py, code_rust, prose_story, prose_explain, tool_agentic, multi_zh, multi_es_ja, math_reason) of competitive/r9700x2/prompts/diverse.json, byte-identical texts and tools. Stream i of a W2 cell sends request i % 8 as one user message (plus its tools), so C8 is eight different prompts, C4 the first four.",
+ "requests": [
+  {
+   "name": "code_py",
+   "text": "from typing import List\n\n\ndef has_close_elements(numbers: List[float], threshold: float) -> bool:\n    \"\"\" Check if in given list of numbers, are any two numbers closer to each other than\n    given threshold.\n    >>> has_close_elements([1.0, 2.0, 3.0], 0.5)\n    False\n    >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)\n    True\n    \"\"\"\n"
+  },
+  {
+   "name": "code_rust",
+   "text": "Write a Rust function `parse_csv_line(line: &str) -> Vec<String>` that handles quoted fields containing commas and escaped double quotes (\"\"). Include three unit tests and a short explanation of the edge cases."
+  },
+  {
+   "name": "prose_story",
+   "text": "Write a short story about a lighthouse keeper who finds a sealed brass canister washed ashore after a storm. Keep it under 250 words.\n"
+  },
+  {
+   "name": "prose_explain",
+   "text": "Explain in about 300 words why the sky is blue during the day and why sunsets look red, for a curious high-school student. Use one everyday analogy."
+  },
+  {
+   "name": "tool_agentic",
+   "text": "I'm flying from Seattle to Tokyo next Tuesday and I will land in the evening. Find out what the weather will be like in Tokyo then, and look up the cheapest flights. Use the tools you have.",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather forecast for a city on a date",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "date": {
+         "type": "string",
+         "description": "ISO date"
+        }
+       },
+       "required": [
+        "city",
+        "date"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "search_flights",
+      "description": "Search flights between two airports",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "origin": {
+         "type": "string"
+        },
+        "destination": {
+         "type": "string"
+        },
+        "date": {
+         "type": "string"
+        },
+        "sort": {
+         "type": "string",
+         "enum": [
+          "price",
+          "duration"
+         ]
+        }
+       },
+       "required": [
+        "origin",
+        "destination",
+        "date"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "multi_zh",
+   "text": "请用中文写一段关于杭州西湖四季变化的描写,约300字,要有画面感,并在结尾加上一句诗。"
+  },
+  {
+   "name": "multi_es_ja",
+   "text": "Traduce al japonés la frase «Ayer fui al mercado con mi hermana y compramos manzanas y pan», y explica brevemente la gramática de cada parte en español."
+  },
+  {
+   "name": "math_reason",
+   "text": "A train leaves city A at 3:00 pm travelling at 60 mph. A second train leaves city B, 270 miles away, at 3:45 pm travelling toward A at 75 mph. At what time do they meet and how far from A? Work step by step and double-check the arithmetic."
+  }
+ ]
+}

@@ -1,0 +1,302 @@
+{
+  "arch": "gfx1201",
+  "candidate": "contract:gemm_bf16_xf32_tiled_rows",
+  "classes": [
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio": 7.183756070831598,
+      "rows": 1,
+      "shape": "M=128,K=2560,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio": 2.42238422267678,
+      "rows": 1,
+      "shape": "M=17,K=10240,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio": 7.3664455694229805,
+      "rows": 2,
+      "shape": "M=128,K=2560,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio": 2.542530975967625,
+      "rows": 2,
+      "shape": "M=17,K=10240,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio": 7.532534101852747,
+      "rows": 4,
+      "shape": "M=128,K=2560,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio": 2.7619582465757064,
+      "rows": 4,
+      "shape": "M=17,K=10240,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio": 7.477716851931134,
+      "rows": 8,
+      "shape": "M=128,K=2560,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio": 2.744409040089648,
+      "rows": 8,
+      "shape": "M=17,K=10240,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio": 6.868478278949636,
+      "rows": 16,
+      "shape": "M=128,K=2560,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio": 2.758997642682207,
+      "rows": 16,
+      "shape": "M=17,K=10240,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio": 4.368049178490508,
+      "rows": 32,
+      "shape": "M=128,K=2560,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio": 2.7473636317880725,
+      "rows": 32,
+      "shape": "M=17,K=10240,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio": 2.578717388115029,
+      "rows": 64,
+      "shape": "M=128,K=2560,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio": 2.64125169673211,
+      "rows": 64,
+      "shape": "M=17,K=10240,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio": 1.4144375211745932,
+      "rows": 128,
+      "shape": "M=128,K=2560,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio": 1.45068068522515,
+      "rows": 128,
+      "shape": "M=17,K=10240,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 0.000244140625,
+      "p_slower": 1.0,
+      "ratio": 0.7507049340852681,
+      "rows": 256,
+      "shape": "M=128,K=2560,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": false,
+      "p_faster": 0.003173828125,
+      "p_slower": 0.999755859375,
+      "ratio": 0.9995179413102464,
+      "rows": 256,
+      "shape": "M=17,K=10240,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "tie"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000244140625,
+      "p_slower": 1.0,
+      "ratio": 0.39553636121728375,
+      "rows": 512,
+      "shape": "M=128,K=2560,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000244140625,
+      "p_slower": 1.0,
+      "ratio": 0.6191421484319803,
+      "rows": 512,
+      "shape": "M=17,K=10240,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000244140625,
+      "p_slower": 1.0,
+      "ratio": 0.3607336736441311,
+      "rows": 1024,
+      "shape": "M=128,K=2560,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000244140625,
+      "p_slower": 1.0,
+      "ratio": 0.38907511612146706,
+      "rows": 1024,
+      "shape": "M=17,K=10240,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000244140625,
+      "p_slower": 1.0,
+      "ratio": 0.2822288838103302,
+      "rows": 2048,
+      "shape": "M=128,K=2560,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000244140625,
+      "p_slower": 1.0,
+      "ratio": 0.39314444266190207,
+      "rows": 2048,
+      "shape": "M=17,K=10240,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000244140625,
+      "p_slower": 1.0,
+      "ratio": 0.28875671079347887,
+      "rows": 4096,
+      "shape": "M=128,K=2560,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000244140625,
+      "p_slower": 1.0,
+      "ratio": 0.3740317558005694,
+      "rows": 4096,
+      "shape": "M=17,K=10240,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000244140625,
+      "p_slower": 1.0,
+      "ratio": 0.19289006719316631,
+      "rows": 16384,
+      "shape": "M=128,K=2560,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000244140625,
+      "p_slower": 1.0,
+      "ratio": 0.35542217550032906,
+      "rows": 16384,
+      "shape": "M=17,K=10240,vs=contract:gemm_bf16_xf32_batched,pool=1",
+      "verdict": "faster"
+    }
+  ],
+  "constant": "BF16_TILED_ROWS_MIN_N",
+  "covers": true,
+  "derived_max_rows": 16384,
+  "derived_min_rows": 512,
+  "incumbent": "contract:generic_gemm.bf16_xf32_batched.wave_per_output",
+  "judge_argv": [
+    "pm-census",
+    "tune",
+    "selector-receipt",
+    "--record",
+    "receipts/selectors/evidence/bf16_tiled/tvb_M_128_K_2560.json",
+    "--record",
+    "receipts/selectors/evidence/bf16_tiled/tvb_M_17_K_10240.json",
+    "--constant",
+    "BF16_TILED_ROWS_MIN_N",
+    "--path",
+    "crates/hipfire-dispatch/src/pipeline/stream_mix.rs",
+    "--value",
+    "512",
+    "--kind",
+    "min",
+    "--out",
+    "receipts/selectors/bf16_tiled_rows_min_n.json"
+  ],
+  "kind": "min",
+  "min_effect": 0.005,
+  "path": "crates/hipfire-dispatch/src/pipeline/stream_mix.rs",
+  "records": [
+    {
+      "path": "receipts/selectors/evidence/bf16_tiled/tvb_M_128_K_2560.json",
+      "sha256": "8eb17c57320f874ebb5a419f754477d67ad770e52d4a6ce259f23b9cf8aec09f"
+    },
+    {
+      "path": "receipts/selectors/evidence/bf16_tiled/tvb_M_17_K_10240.json",
+      "sha256": "62860e3e714faaf7cd0079a50dec807b3f16568fd2dcfad8d141f730199a6cda"
+    }
+  ],
+  "schema": "pm.selector_receipt.v1",
+  "shapes": [
+    "M=128,K=2560,vs=contract:gemm_bf16_xf32_batched,pool=1",
+    "M=17,K=10240,vs=contract:gemm_bf16_xf32_batched,pool=1"
+  ],
+  "sign_p_max": 0.001,
+  "value": 512
+}

@@ -36,13 +36,27 @@ fn footer(output: &Output) -> Vec<&str> {
         .filter(|s| s.starts_with("[stats]"))
         .collect()
 }
+
+/// Install `text` at `path` as an executable script without this process ever
+/// holding a write descriptor on it: a script written with `fs::write` and
+/// exec'd fails `ETXTBSY` while another test thread's fork (the `hipfire` child
+/// of a sibling test) still holds a copy of the descriptor. A short-lived `sh`
+/// does the write and has exited when this returns.
+fn write_executable(path: &std::path::Path, text: &str) {
+    let status = Command::new("sh")
+        .args(["-c", "printf %s \"$1\" > \"$2\" && chmod 755 \"$2\"", "sh"])
+        .arg(text)
+        .arg(path)
+        .status()
+        .expect("spawn sh to install the script");
+    assert!(status.success(), "installing {}: {status}", path.display());
+}
+
 #[test]
 fn fake_local_daemon_stats_and_json() {
-    use std::os::unix::fs::PermissionsExt;
     let root = root("local");
     let daemon = root.join("daemon.py");
-    fs::write(&daemon, include_str!("../src/serve/fake_daemon.py")).unwrap();
-    fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(&daemon, include_str!("../src/serve/fake_daemon.py"));
     let model = root.join("fixture.mq4");
     fs::write(&model, b"fixture").unwrap();
     for flags in [
@@ -96,8 +110,7 @@ fn fake_local_daemon_stats_and_json() {
         "\"tok_s\": 12.0,",
         "\"tok_s\": 12.0, \"decode_tok_s\":123.3, \"ttft_ms\":42.1, \"tau\":7.15, \"dflash\":True,",
     );
-    fs::write(&metric_daemon, script).unwrap();
-    fs::set_permissions(&metric_daemon, fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(&metric_daemon, &script);
     for flags in [vec!["--stats"], vec!["--stats", "--no-stream"]] {
         let output = cli(&root)
             .env("HIPFIRE_LOCAL", "1")

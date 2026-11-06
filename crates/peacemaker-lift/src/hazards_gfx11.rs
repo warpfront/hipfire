@@ -352,6 +352,7 @@ fn class_of(inst: &Inst) -> Class {
         Form::Smem => Class::Smem,
         Form::Vop1
         | Form::Vop1Dpp
+        | Form::Vop1Dpp8
         | Form::Vop2
         | Form::Vop2Dpp
         | Form::Vopc

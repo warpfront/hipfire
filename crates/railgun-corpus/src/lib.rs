@@ -435,32 +435,14 @@ impl JitCorpus {
                 "receipt SHA-256 does not match the corpus index".into(),
             ));
         }
-        let receipt: Receipt =
-            serde_json::from_slice(&bytes).map_err(|source| CorpusError::Json {
-                path: path.clone(),
-                source,
+        let receipt =
+            parse_receipt(&bytes, key.arch, key.artifact_sha256).map_err(|e| match e {
+                ReceiptError::Json(source) => CorpusError::Json {
+                    path: path.clone(),
+                    source,
+                },
+                ReceiptError::Invalid(detail) => invalid(detail),
             })?;
-        if receipt.schema != RECEIPT_SCHEMA
-            || receipt.schema_version != RECEIPT_SCHEMA_VERSION
-            || receipt.railgun.section_version != RAILGUN_SECTION_VERSION
-        {
-            return Err(invalid(format!("receipt schema {} v{} section v{} is not {RECEIPT_SCHEMA} v{RECEIPT_SCHEMA_VERSION} section v{RAILGUN_SECTION_VERSION}",
-                receipt.schema, receipt.schema_version, receipt.railgun.section_version)));
-        }
-        for k in &receipt.railgun.kernels {
-            k.validate_case(
-                &receipt.object_sha256,
-                &receipt.device_elf_sha256,
-                &receipt.arch,
-            )
-            .map_err(invalid)?;
-        }
-        if receipt.object_sha256 != key.artifact_sha256 || receipt.arch != key.arch {
-            return Err(invalid(format!(
-                "receipt certifies {} {}, not {} {}",
-                receipt.arch, receipt.object_sha256, key.arch, key.artifact_sha256
-            )));
-        }
         Ok(Lookup::Hit(Box::new(Hit {
             record: record.clone(),
             receipt,
@@ -519,5 +501,95 @@ impl JitCorpus {
                 missing,
             })
         }
+    }
+}
+
+/// Why receipt bytes were refused by [`parse_receipt`].
+#[derive(Debug, thiserror::Error)]
+pub enum ReceiptError {
+    #[error("receipt JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    Invalid(String),
+}
+
+/// Parse and verify one receipt for the object whose SHA-256 is
+/// `artifact_sha256` on `arch`: the schema, receipt and railgun-section
+/// versions, every kernel record's case binding, and that the receipt
+/// certifies exactly these bytes. The one verification every receipt passes,
+/// whether a corpus indexes it ([`JitCorpus::lookup`]) or it is pinned beside
+/// an externally emitted object ([`PinnedReceipt::admit`]).
+pub fn parse_receipt(
+    bytes: &[u8],
+    arch: &str,
+    artifact_sha256: &str,
+) -> Result<Receipt, ReceiptError> {
+    let receipt: Receipt = serde_json::from_slice(bytes)?;
+    if receipt.schema != RECEIPT_SCHEMA
+        || receipt.schema_version != RECEIPT_SCHEMA_VERSION
+        || receipt.railgun.section_version != RAILGUN_SECTION_VERSION
+    {
+        return Err(ReceiptError::Invalid(format!("receipt schema {} v{} section v{} is not {RECEIPT_SCHEMA} v{RECEIPT_SCHEMA_VERSION} section v{RAILGUN_SECTION_VERSION}",
+            receipt.schema, receipt.schema_version, receipt.railgun.section_version)));
+    }
+    for k in &receipt.railgun.kernels {
+        k.validate_case(
+            &receipt.object_sha256,
+            &receipt.device_elf_sha256,
+            &receipt.arch,
+        )
+        .map_err(ReceiptError::Invalid)?;
+    }
+    if receipt.object_sha256 != artifact_sha256 || receipt.arch != arch {
+        return Err(ReceiptError::Invalid(format!(
+            "receipt certifies {} {}, not {arch} {artifact_sha256}",
+            receipt.arch, receipt.object_sha256
+        )));
+    }
+    Ok(receipt)
+}
+
+/// The receipt of an externally emitted code object (a PeaceMaker-emitted
+/// `.co`/`.hxaco`) that no JIT corpus indexes, admitted against the object's
+/// own bytes and a pinned SHA-256 the way a PM `.hxaco` is pinned by its
+/// `.hxaco.sha256`. The receipt is `railgun-cert certify`'s output for exactly
+/// those bytes; `receipt_sha256` is the digest of the admitted receipt bytes,
+/// so a node's `KernelRef` names the record it was authored from.
+#[derive(Debug)]
+pub struct PinnedReceipt {
+    pub module: String,
+    pub receipt_sha256: String,
+    pub receipt: Receipt,
+}
+
+impl PinnedReceipt {
+    /// Admit `receipt_json` for the object `image` named `module` on `arch`.
+    /// Refused unless `SHA-256(image)` is `pinned_sha256` (lowercase hex) and
+    /// the receipt passes [`parse_receipt`] for that digest.
+    pub fn admit(
+        module: &str,
+        arch: &str,
+        image: &[u8],
+        pinned_sha256: &str,
+        receipt_json: &[u8],
+    ) -> Result<Self, String> {
+        if !is_sha256(pinned_sha256) {
+            return Err(format!(
+                "{module}: pin {pinned_sha256:?} is not a lowercase SHA-256"
+            ));
+        }
+        let actual = sha256_hex(image);
+        if actual != pinned_sha256 {
+            return Err(format!(
+                "{module}: object SHA-256 {actual} is not the pinned {pinned_sha256}"
+            ));
+        }
+        let receipt = parse_receipt(receipt_json, arch, pinned_sha256)
+            .map_err(|e| format!("{module}: {e}"))?;
+        Ok(Self {
+            module: module.to_owned(),
+            receipt_sha256: sha256_hex(receipt_json),
+            receipt,
+        })
     }
 }

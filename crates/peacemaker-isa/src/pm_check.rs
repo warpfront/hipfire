@@ -374,6 +374,77 @@ pub fn lds_bounds_host(
     limit: u32,
     host_bounded: &[u16],
 ) -> Result<(u32, usize)> {
+    lds_bounds_windows(source, symbol, waves, limit, host_bounded, &[])
+}
+
+pub use crate::lds::{private_windows, PrivateWindow};
+
+/// The access `[lo, hi)` of `wave`'s lane `lane` against every private
+/// window: whatever it overlaps must lie inside that wave's own slice.
+fn check_private(
+    windows: &[PrivateWindow],
+    wave: u32,
+    lane: usize,
+    lo: u32,
+    hi: u32,
+) -> std::result::Result<(), String> {
+    for w in windows {
+        if hi <= w.base || lo >= w.end() {
+            continue;
+        }
+        if wave >= w.waves {
+            return Err(format!(
+                "wave {wave} lane {lane} touches wave-private window {w:?}, which has no slice for it"
+            ));
+        }
+        let (own_lo, own_hi) = (w.base + wave * w.stride, w.base + (wave + 1) * w.stride);
+        if lo < own_lo || hi > own_hi {
+            let at = if lo >= w.base {
+                (lo - w.base) / w.stride
+            } else {
+                0
+            };
+            return Err(format!(
+                "wave {wave} lane {lane} accesses bytes [{lo}, {hi}) of wave-private window {w:?}, outside its own slice [{own_lo}, {own_hi}) (reaches wave {at}'s slice or past the window)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// [`lds_bounds`] plus the wave-private ownership proof: every DS access of
+/// every lane of every wave that overlaps a window of `windows` lies inside
+/// the issuing wave's own slice of it (the address is derived per wave from
+/// the work-item id, so the slice index is derived from the wave id). A
+/// masked address, which may land anywhere below its mask, is refused when
+/// it can reach a window. Each window must also fit in `limit`. A kernel
+/// with no private window passes through [`lds_bounds_host`]'s rules
+/// unchanged. Returns the maximum end.
+pub fn lds_wave_private(
+    source: &str,
+    symbol: &str,
+    waves: u32,
+    limit: u32,
+    windows: &[PrivateWindow],
+) -> Result<u32> {
+    for w in windows {
+        if w.stride == 0 || w.waves == 0 || w.end() > limit {
+            return Err(format!(
+                "wave-private window {w:?} is empty or exceeds the {limit}-byte allocation"
+            ));
+        }
+    }
+    lds_bounds_windows(source, symbol, waves, limit, &[], windows).map(|(end, _)| end)
+}
+
+fn lds_bounds_windows(
+    source: &str,
+    symbol: &str,
+    waves: u32,
+    limit: u32,
+    host_bounded: &[u16],
+    windows: &[PrivateWindow],
+) -> Result<(u32, usize)> {
     let marker = format!("\n{symbol}:\n");
     let start = source
         .find(&marker)
@@ -536,6 +607,13 @@ pub fn lds_bounds_host(
                             "{name} {rest}: masked address reaches byte {e} of {limit}"
                         ));
                     }
+                    // A masked address is any submask of `mask`: it may land anywhere in
+                    // `[0, e)`, so it cannot be proven to stay out of a private window.
+                    if let Some(w) = windows.iter().find(|w| e > w.base) {
+                        return Err(format!(
+                            "{name} {rest}: masked address reaches byte {e}, into wave-private window {w:?}: a mask cannot prove it stays in one wave's slice"
+                        ));
+                    }
                     end = end.max(e);
                 }
                 checked += 1;
@@ -560,6 +638,8 @@ pub fn lds_bounds_host(
                             "{name} {rest}: wave {wave} lane {lane} reaches byte {e} of {limit}"
                         ));
                     }
+                    check_private(windows, wave, lane, base + offset, e)
+                        .map_err(|why| format!("{name} {rest}: {why}"))?;
                     end = end.max(e);
                 }
             }

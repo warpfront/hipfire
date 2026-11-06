@@ -692,6 +692,30 @@ fn run_shared_jobs<S: SharedJobSource + Sync>(
                 for (within_block, chunk) in rows.chunks_mut(n).enumerate() {
                     let r = first_row + within_block;
                     let (row, srow) = row_slices(q, src.packed(j), m, k, r);
+                    #[cfg(target_arch = "x86_64")]
+                    if n > 1 && use_simd && simd::has_planar_multi_kernel(q) {
+                        // Planar W3: each weight group is decoded once for all `n` rows
+                        // instead of once per row; every output is the per-row dot's bits.
+                        let mut xs: [&[f32]; simd::PLANAR_MULTI_MAX] =
+                            [&[]; simd::PLANAR_MULTI_MAX];
+                        let mut t0 = 0;
+                        while t0 < n {
+                            let g = (n - t0).min(simd::PLANAR_MULTI_MAX);
+                            for i in 0..g {
+                                xs[i] = &src.xs_row(j, t0 + i)[..k];
+                            }
+                            simd::row_dot_multi_planar(
+                                q,
+                                row,
+                                srow,
+                                k,
+                                &xs[..g],
+                                &mut chunk[t0..t0 + g],
+                            );
+                            t0 += g;
+                        }
+                        continue;
+                    }
                     for (t, v) in chunk.iter_mut().enumerate() {
                         *v = dot_row_simd(q, row, srow, k, &src.xs_row(j, t)[..k], use_simd);
                     }
@@ -1209,7 +1233,8 @@ mod test {
         }
     }
 
-    /// D2 admits verify windows of 2..4 rows. A routed expert selected by `w`
+    /// D2 admits verify windows of 2..4 rows by default and 5..8 rows under
+    /// `HIPFIRE_QWEN4_D2_WINDOW_ROWS`. A routed expert selected by `w`
     /// window rows is ONE grouped job of `n = w` activation rows; each row's
     /// bytes must equal a one-row (`n = 1`) job and independent `gemv` at every
     /// token position, with the Σx cache seeing aliased pointers (identical
@@ -1242,8 +1267,8 @@ mod test {
         }
         let (m, k) = (37usize, 1024usize);
         let base = x_of(k);
-        let copies: Vec<Vec<f32>> = (0..4).map(|_| base.clone()).collect();
-        let distinct: Vec<Vec<f32>> = (0..4)
+        let copies: Vec<Vec<f32>> = (0..8).map(|_| base.clone()).collect();
+        let distinct: Vec<Vec<f32>> = (0..8)
             .map(|t| {
                 base.iter()
                     .map(|v| v * (1.0 + 0.37 * t as f32) - 0.01 * t as f32)
@@ -1281,7 +1306,7 @@ mod test {
                     );
                     y
                 };
-                for width in 2..=4usize {
+                for width in 2..=8usize {
                     // Rows alias one buffer / copy one token / differ.
                     let aliased: Vec<&[f32]> = vec![&copies[0][..]; width];
                     let copied: Vec<&[f32]> = copies[..width].iter().map(|v| &v[..]).collect();

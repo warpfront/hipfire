@@ -13,8 +13,9 @@
 
 use crate::Carrier;
 pub use hipfire_arch_qwen4::admission::{
-    qwen4_pp_auto_fit, qwen4_pp_edge_max_bytes, qwen4_pp_rank_lines, Qwen4PpAutoFit,
-    Qwen4PpBudgetInputs, Qwen4PpRankFit, QWEN4_PP_FIRST_BAND_MIN_LAYERS, QWEN4_PP_RESERVE_BYTES,
+    qwen4_pp_auto_fit, qwen4_pp_chunk_ladder, qwen4_pp_edge_max_bytes, qwen4_pp_negotiate_chunk,
+    qwen4_pp_rank_lines, Qwen4PpAutoFit, Qwen4PpBudgetInputs, Qwen4PpRankFit,
+    QWEN4_PP_FIRST_BAND_MIN_LAYERS, QWEN4_PP_RESERVE_BYTES,
 };
 use hipfire_arch_qwen4::config::{Qwen4Config, ARCH_ID as QWEN4_ARCH_ID};
 use hipfire_arch_qwen4::{InputModality, Qwen4Capabilities};
@@ -743,15 +744,14 @@ pub fn qwen4_ep_preflight(hip: &hip_bridge::HipRuntime, ep: usize) -> Result<Vec
     Ok(devices)
 }
 
-/// The expert-parallel degree a loaded model of `arch_id` runs with: `1`
-/// everywhere except Qwen4 with `topology.ep` > 1 (and no `HIPFIRE_QWEN4_EP=0`
-/// kill switch). An invalid configured value was refused at admission, so it
-/// reads as `1` here.
+/// The expert-parallel degree a loaded model of `arch_id` runs with: the
+/// generic `topology.ep` resolver (with the carrier's declared kill switch)
+/// for a carrier that declares `ep`, `1` for every other. An invalid
+/// configured value was refused at admission, so it reads as `1` here.
 pub fn effective_ep(arch_id: u32) -> usize {
-    if arch_id == QWEN4_ARCH_ID {
-        hipfire_config::topology::qwen4_ep().unwrap_or(1)
-    } else {
-        1
+    match crate::carrier_for(arch_id).and_then(|carrier| carrier.topology_caps().ep) {
+        Some(ep) => hipfire_config::topology::ep_with_kill_switch(ep.kill_switch_env).unwrap_or(1),
+        None => 1,
     }
 }
 
@@ -1421,6 +1421,24 @@ fn resolve_carrier(src: &ModelSource) -> Result<&'static dyn Carrier, String> {
     Ok(carrier)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-thread stand-in for the process-wide `topology.ep` snapshot, which
+    /// cannot be varied between unit tests.
+    static TEST_EP_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The requested `topology.ep`: the one generic resolver, with the kill switch
+/// the carrier declared (if any). Resolved once per admission, before any
+/// other topology verdict, so a malformed value refuses before teardown.
+fn requested_ep(kill_switch_env: Option<&str>) -> Result<usize, String> {
+    #[cfg(test)]
+    if let Some(ep) = TEST_EP_OVERRIDE.with(std::cell::Cell::get) {
+        return Ok(ep);
+    }
+    hipfire_config::topology::ep_with_kill_switch(kill_switch_env)
+}
+
 /// Pure DFlash lm-head refusal: `Some(message)` when a draft is attached but the
 /// target's lm_head/embed quant type is not admitted for DFlash's batched
 /// lm-head verify on `gpu_arch`. MQ V2 (qt 44/47/48/49/50) and MQ3 (qt 17)
@@ -1504,20 +1522,6 @@ fn flux_arch_refusal(arch_id: u32, gpu_arch: &str) -> Option<String> {
     })
 }
 
-/// #666 G11: Muse Glimmer (arch 14) is served on one device only until the
-/// G13 dense axes give it a pipeline/tensor placement. Any parallel degree
-/// (`pp`, `tp`, `topology.ep`) is refused here, before teardown or
-/// allocation, instead of reaching a generic EP or carrier refusal or being
-/// ignored (`topology.ep`).
-fn muse_glimmer_topology_refusal(arch_id: u32, pp: usize, tp: usize, ep: usize) -> Option<String> {
-    (arch_id == 14 && (pp > 1 || tp > 1 || ep > 1)).then(|| {
-        format!(
-            "muse_glimmer: single-device only; pp={pp}, tp={tp}, topology.ep={ep} requested \
-             (no pipeline, tensor or expert parallel placement exists for arch 14)"
-        )
-    })
-}
-
 /// Pipeline/tensor-parallel geometry admission (#666 G2). `Gpus::init_uniform`
 /// refuses `n_layers < n_devices` deep inside GPU init (`multi_gpu.rs`) —
 /// after the daemon has already torn down the resident model for the pp path
@@ -1534,8 +1538,8 @@ fn muse_glimmer_topology_refusal(arch_id: u32, pp: usize, tp: usize, ep: usize) 
 /// the HF-convention key every pp-capable source carries, descending into
 /// `text_config` exactly as qwen35 `from_config_value` does) rather than
 /// parsed per-arch. A source with no layer key fails this gate open (`None`)
-/// — the visible-device gate below still guards it, and every non-qwen35
-/// `pp > 1` is already refused by `admit_topology` before this runs.
+/// — the visible-device gate below still guards it, and every carrier that
+/// does not declare `pp` is already refused by the front door before this runs.
 fn n_layers_from_metadata_json(metadata_json: &str) -> Option<usize> {
     let meta: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
     let config = meta.get("config").unwrap_or(&meta);
@@ -1558,7 +1562,7 @@ fn n_layers_from_metadata_json(metadata_json: &str) -> Option<usize> {
 /// Layer count declared by an already-open source, via the metadata envelope
 /// probe above. Read-only: parses the in-memory JSON the open already
 /// returned; touches no GPU state.
-fn source_n_layers(source: &ModelSource) -> Option<usize> {
+pub(crate) fn source_n_layers(source: &ModelSource) -> Option<usize> {
     match source {
         ModelSource::Hfq(hfq) => n_layers_from_metadata_json(&hfq.metadata_json),
         ModelSource::Dir(dir) => n_layers_from_metadata_json(
@@ -2284,15 +2288,17 @@ pub(crate) fn qwen4_pp_env_refusal(
     }
 }
 
-/// The admitted ranks of a Qwen4 PP mesh: known PCI identity on every rank,
-/// one homogeneous gfx1100 or gfx1201, and the output owner (last logical
-/// rank = the daemon's device 0) agreeing with the daemon's architecture.
-pub(crate) fn qwen4_pp_rank_refusal(
-    pp: usize,
+/// The admitted ranks of a pipeline mesh: known PCI identity on every rank,
+/// one homogeneous architecture (`arch_allow`, when a route admits only some
+/// architectures: predicate plus the requirement as worded in the refusal),
+/// and the output owner (last logical rank = the daemon's device 0) agreeing
+/// with the daemon's architecture. `prefix` is the route's refusal prefix.
+fn pp_rank_refusal(
+    prefix: &str,
     ranks: &[AdmittedRank],
     gpu_arch: &str,
+    arch_allow: Option<(&dyn Fn(&str) -> bool, &str)>,
 ) -> Result<(), String> {
-    let prefix = format!("qwen4: pipeline parallelism (topology.pp = {pp})");
     let Some(first) = ranks.first() else {
         return Err(format!("{prefix} needs at least one rank"));
     };
@@ -2303,11 +2309,13 @@ pub(crate) fn qwen4_pp_rank_refusal(
                 rank.logical, rank.device_ordinal
             ));
         }
-        if !qwen4_ep_arch_admitted(&rank.arch, false) {
-            return Err(format!(
-                "{prefix} requires gfx1100 or gfx1201 on every rank; rank {} is {}",
-                rank.logical, rank.arch
-            ));
+        if let Some((allowed, requirement)) = arch_allow {
+            if !allowed(&rank.arch) {
+                return Err(format!(
+                    "{prefix} requires {requirement} on every rank; rank {} is {}",
+                    rank.logical, rank.arch
+                ));
+            }
         }
         if rank.arch != first.arch {
             return Err(format!(
@@ -2325,19 +2333,35 @@ pub(crate) fn qwen4_pp_rank_refusal(
     Ok(())
 }
 
-/// The admitted Qwen4 PP mesh and bands. Pure: no HIP, no peer probing, no
-/// allocation. `visible` is the HIP-order device identity; ranks bind
-/// `OutputCardLast` (the primary device owns the output band). Transport per
-/// directed edge comes from `policy` and `qualified_peer` (logical rank ids,
-/// pre-side-effect byte-qualification evidence: there is none in production,
-/// so `auto` resolves to host-mapped and a forced `peer` refuses). Bands come
-/// from `requested_layers` (`HIPFIRE_PP_LAYERS`) or the uniform split, with
-/// the PLE layer pinned to the first band (`with_first_band_min(2)`).
+/// What a pipeline route adds to the generic mesh admission: a per-rank
+/// architecture allow-list and the worded reason for its first-band pin.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PpMeshRules<'a> {
+    /// Predicate plus the requirement as worded in the refusal; `None` admits
+    /// any homogeneous architecture matching the daemon device.
+    arch_allow: Option<(&'a dyn Fn(&str) -> bool, &'a str)>,
+    /// Parenthetical appended to a first-band-pin refusal; `None` uses the
+    /// generic wording.
+    first_band_note: Option<&'a str>,
+}
+
+/// The admitted pipeline mesh and bands of any carrier that declares
+/// [`crate::PpExecutor::Mesh`]. Pure: no HIP, no peer probing, no
+/// allocation. `family` is the carrier name (refusal prefix and admitted
+/// family) and `numerical_policy` its cut-safe policy identity. `visible` is
+/// the HIP-order device identity; ranks bind `OutputCardLast` (the primary
+/// device owns the output band) and must be one homogeneous architecture
+/// matching `gpu_arch`. Transport per directed edge comes from `policy` and
+/// `qualified_peer` (logical rank ids, pre-side-effect byte-qualification
+/// evidence: there is none in production, so `auto` resolves to host-mapped
+/// and a forced `peer` refuses). Bands come from `requested_layers`
+/// (`HIPFIRE_PP_LAYERS`) or the uniform split, with the first band holding at
+/// least `first_band_min_layers` layers.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn admit_qwen4_pp_mesh(
+pub fn admit_pp_mesh(
+    family: &str,
+    numerical_policy: &str,
     pp: usize,
-    tp: usize,
-    ep: usize,
     n_layers: usize,
     visible: &[AdmittedRank],
     gpu_arch: &str,
@@ -2345,14 +2369,42 @@ pub(crate) fn admit_qwen4_pp_mesh(
     policy: EdgeTransportPolicy,
     qualified_peer: &dyn Fn(usize, usize) -> bool,
     requested_layers: Option<&str>,
+    first_band_min_layers: usize,
 ) -> Result<(AdmittedMesh, PpBands), String> {
-    let prefix = format!("qwen4: pipeline parallelism (topology.pp = {pp})");
-    let stages = hipfire_arch_qwen4::EffectiveMesh::PP_MIN_DEGREE
-        ..=hipfire_arch_qwen4::EffectiveMesh::PP_MAX_DEGREE;
-    if !stages.contains(&pp) || tp != 1 || ep != 1 {
-        return Err(format!(
-            "{prefix} is admitted for 2..=8 stages with tp = ep = 1 (tp={tp}, ep={ep})"
-        ));
+    admit_pp_mesh_with(
+        family,
+        numerical_policy,
+        pp,
+        n_layers,
+        visible,
+        gpu_arch,
+        emulated,
+        policy,
+        qualified_peer,
+        requested_layers,
+        first_band_min_layers,
+        PpMeshRules::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_pp_mesh_with(
+    family: &str,
+    numerical_policy: &str,
+    pp: usize,
+    n_layers: usize,
+    visible: &[AdmittedRank],
+    gpu_arch: &str,
+    emulated: bool,
+    policy: EdgeTransportPolicy,
+    qualified_peer: &dyn Fn(usize, usize) -> bool,
+    requested_layers: Option<&str>,
+    first_band_min_layers: usize,
+    rules: PpMeshRules<'_>,
+) -> Result<(AdmittedMesh, PpBands), String> {
+    let prefix = format!("{family}: pipeline parallelism (topology.pp = {pp})");
+    if pp < 2 {
+        return Err(format!("{prefix} needs at least 2 stages"));
     }
     if emulated {
         return Err(format!(
@@ -2366,12 +2418,12 @@ pub(crate) fn admit_qwen4_pp_mesh(
         ));
     }
     let ordered = pp_rank_order(&visible[..pp]).map_err(|e| format!("{prefix}: {e}"))?;
-    qwen4_pp_rank_refusal(pp, &ordered, gpu_arch)?;
+    pp_rank_refusal(&prefix, &ordered, gpu_arch, rules.arch_allow)?;
     let shape = normalize_mesh_shape(pp, 1, 1).map_err(|e| format!("{prefix}: {e}"))?;
     let mesh = admit_mesh(
         shape,
-        "qwen4",
-        QWEN4_PP_NUMERICAL_POLICY,
+        family,
+        numerical_policy,
         visible,
         RankBinding::OutputCardLast,
         Some(EdgeAdmission {
@@ -2392,8 +2444,13 @@ pub(crate) fn admit_qwen4_pp_mesh(
         .map_err(|e| format!("{prefix}: {e}"))?;
     let placement = bands
         .placement
-        .with_first_band_min(QWEN4_PP_FIRST_BAND_MIN_LAYERS)
-        .map_err(|e| format!("{prefix}: {e} (the PLE layer lives in the first band)"))?;
+        .with_first_band_min(first_band_min_layers)
+        .map_err(|e| match rules.first_band_note {
+            Some(note) => format!("{prefix}: {e} {note}"),
+            None => format!(
+                "{prefix}: {e} (the first band must hold at least {first_band_min_layers} layers)"
+            ),
+        })?;
     Ok((
         mesh,
         PpBands {
@@ -2401,6 +2458,52 @@ pub(crate) fn admit_qwen4_pp_mesh(
             explicit_counts: bands.explicit_counts,
         },
     ))
+}
+
+/// The admitted Qwen4 PP mesh and bands: the generic [`admit_pp_mesh`] with
+/// Qwen4's stage range (2..=8, tp = ep = 1), its gfx1100/gfx1201 rank
+/// restriction and the PLE layer pinned to the first band
+/// (`QWEN4_PP_FIRST_BAND_MIN_LAYERS`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn admit_qwen4_pp_mesh(
+    pp: usize,
+    tp: usize,
+    ep: usize,
+    n_layers: usize,
+    visible: &[AdmittedRank],
+    gpu_arch: &str,
+    emulated: bool,
+    policy: EdgeTransportPolicy,
+    qualified_peer: &dyn Fn(usize, usize) -> bool,
+    requested_layers: Option<&str>,
+) -> Result<(AdmittedMesh, PpBands), String> {
+    let stages = hipfire_arch_qwen4::EffectiveMesh::PP_MIN_DEGREE
+        ..=hipfire_arch_qwen4::EffectiveMesh::PP_MAX_DEGREE;
+    if !stages.contains(&pp) || tp != 1 || ep != 1 {
+        return Err(format!(
+            "qwen4: pipeline parallelism (topology.pp = {pp}) is admitted for 2..=8 stages with tp = ep = 1 (tp={tp}, ep={ep})"
+        ));
+    }
+    admit_pp_mesh_with(
+        "qwen4",
+        QWEN4_PP_NUMERICAL_POLICY,
+        pp,
+        n_layers,
+        visible,
+        gpu_arch,
+        emulated,
+        policy,
+        qualified_peer,
+        requested_layers,
+        QWEN4_PP_FIRST_BAND_MIN_LAYERS,
+        PpMeshRules {
+            arch_allow: Some((
+                &|arch| qwen4_ep_arch_admitted(arch, false),
+                "gfx1100 or gfx1201",
+            )),
+            first_band_note: Some("(the PLE layer lives in the first band)"),
+        },
+    )
 }
 
 /// Read-only source admission: open the source, classify `arch_id` + vision,
@@ -2502,12 +2605,17 @@ pub fn admit_source_with_options(
     if let Some(refusal) = flux_arch_refusal(arch_id, gpu_arch) {
         return Err(refusal);
     }
-    if arch_id == 14 {
-        let ep = hipfire_config::topology::ep()?;
-        if let Some(refusal) = muse_glimmer_topology_refusal(arch_id, pp, tp, ep) {
-            return Err(refusal);
-        }
-    }
+    // The carrier is resolved once for every topology; its declared axes
+    // decide every multi-card request before any other topology verdict
+    // (`ep`, then `tp`, then `pp`; one uniform sentence per refused axis). A
+    // source no carrier claims declares nothing. `topology.ep` is the one
+    // generic resolver, with the carrier's declared kill switch if any.
+    let carrier_res = resolve_carrier(&source);
+    let carrier_decl: Option<&'static dyn Carrier> = carrier_res.as_ref().ok().copied();
+    let caps = carrier_decl.map(|c| c.topology_caps()).unwrap_or_default();
+    let ep = requested_ep(caps.ep_kill_switch_env())?;
+    let family = carrier_decl.map_or_else(|| format!("arch{arch_id}"), |c| c.name().to_string());
+    crate::topology_axes_refusal(&family, &caps, is_dir, pp, tp, ep)?;
     // Weight-host v1 (HIPFIRE_WEIGHT_HOST=1) imports only a dense Qwen3.5 HFQ
     // (arch 5) on one device; anything else would be a private load, which
     // the opt-in forbids. Refused before teardown, so the prior model stays.
@@ -2529,7 +2637,7 @@ pub fn admit_source_with_options(
     } else {
         max_seq
     };
-    let mut qwen35_ep_experts = None;
+    let mut tp_moe = false;
     let mut qwen4_sequence = None;
     let mut qwen4_pp: Option<(AdmittedMesh, PpBands)> = None;
     let mesh_shape: DeviceMesh;
@@ -2545,10 +2653,9 @@ pub fn admit_source_with_options(
         }
         let qwen4_kv =
             hipfire_runtime::kv_mode::resolve_qwen4(hints.kv_mode.unwrap_or(""), gpu_arch)?;
-        // Expert-parallel degree: `topology.ep`, forced to 1 by the
-        // `HIPFIRE_QWEN4_EP=0` kill switch. Resolved once, before any
-        // teardown, and re-resolved identically by the carrier at load.
-        let ep = hipfire_config::topology::qwen4_ep()?;
+        // `topology.ep` (kill switch included) was resolved once above,
+        // before any teardown, and is re-resolved identically by the carrier
+        // at load.
         let native_mtp = qwen4_native_mtp(options.spec, gpu_arch, path, pp, tp, ep)?;
         let spec_mtp = options.spec.mtp;
         let carrier =
@@ -2646,58 +2753,28 @@ pub fn admit_source_with_options(
         } else {
             EffectiveTopology::Single
         };
-        (topology, Some(resolve_carrier(&source)?))
+        (topology, Some(carrier_res?))
     } else if tp > 1 {
-        // Expert-parallel admission (HFQ-only). Mirrors
-        // `load_model_ep_with_kv_mode`'s arch_id dispatch + per-arch VMM
-        // refusal: DeepSeek V4 (9) serves vmm by design; Qwen3.5-MoE (5|6)
-        // and MiniMax (10) refuse it (replicated-KV EP has no VMM path).
-        if is_dir {
-            return Err(
-                "expert/tensor parallelism (tp>1) is not supported for safetensors directory sources; load a single HFQ file or set tp=1"
-                    .into(),
-            );
-        }
-        if !matches!(arch_id, 5 | 6 | 9 | 10) {
-            return Err(crate::ep_unsupported_arch_message(arch_id));
-        }
-        // Qwen3.5 density probe (HFQ-only past the `is_dir` refusal above, so
-        // the destructure is infallible): dense (`num_experts == 0`) runs the
-        // dense-TP path with one VMM arena per rank device, so the MoE/EP VMM
-        // refusal below does not apply to it. Parsed once here; the MoE
-        // topology gate below reuses it instead of re-opening the source.
-        let qwen35_num_experts: Option<usize> = if matches!(arch_id, 5 | 6) {
-            let ModelSource::Hfq(hfq) = &source else {
-                return Err("expert parallelism for Qwen3.5 needs an HFQ model file, not a safetensors directory; load a single HFQ file or set tp=1".to_string());
-            };
-            Some(
-                hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
-                    .map_err(|e| format!("qwen35 config: {e}"))?
-                    .num_experts,
-            )
-        } else {
-            None
-        };
-        qwen35_ep_experts = qwen35_num_experts;
+        // Expert/tensor-parallel admission (HFQ-only; the front door already
+        // refused every carrier that does not declare `tp` and every
+        // directory source). Mirrors `load_model_ep_with_kv_mode`'s carrier
+        // dispatch + per-carrier VMM refusal: DeepSeek V4 serves vmm by
+        // design; Qwen3.5-MoE and MiniMax refuse it (replicated-KV EP has no
+        // VMM path); dense Qwen3.5 runs dense-TP with one VMM arena per rank
+        // device.
+        let carrier = carrier_res?;
         // #666 G2: refuse an unsatisfiable rank count before any teardown or
-        // GPU init (`init_ep` needs one device per rank). Runs after the
-        // arch/VMM refusals above so their messages are unchanged.
+        // GPU init (`init_ep` needs one device per rank).
         if let Some(refusal) = tp_geometry_refusal(tp, visible_device_count()) {
             return Err(refusal);
         }
-        // Qwen3.5 MoE EP topology gate: admit tp=2|4 where the sealed
-        // per-rank loader admits (experts divide evenly), using the loader's
-        // established predicate and exact error text. Runs after the
-        // arch/VMM/geometry refusals above so their messages are unchanged.
-        // Dense Qwen3.5 (num_experts == 0) is unaffected. Must stay paired
-        // with the loader backstop text.
-        if let Some(num_experts) = qwen35_num_experts {
-            if let Some(refusal) = crate::qwen35_ep_moe_topology_refusal(arch_id, num_experts, tp) {
-                return Err(refusal);
-            }
-        }
-        let moe = matches!(arch_id, 9 | 10) || qwen35_num_experts.is_some_and(|n| n > 0);
-        mesh_shape = if moe {
+        // The mesh axis (MoE -> Ep, dense -> Tp) and the carrier's own
+        // topology gate on it (Qwen3.5 MoE: tp=2|4 where experts divide
+        // evenly, the loader's exact predicate and error text, paired with
+        // the loader backstop).
+        let axis = carrier.tp_mesh_axis(&source, tp)?;
+        tp_moe = axis == DimKind::Ep;
+        mesh_shape = if tp_moe {
             normalize_mesh_shape(1, 1, tp)?
         } else {
             normalize_mesh_shape(1, tp, 1)?
@@ -2705,7 +2782,7 @@ pub fn admit_source_with_options(
         (EffectiveTopology::Expert(tp), None)
     } else {
         // Single / pipeline-parallel via the carrier registry.
-        let carrier = resolve_carrier(&source)?;
+        let carrier = carrier_res?;
         // Selection follows topology validation; unsupported automatic requests
         // fall back rather than making a non-Qwen source unloadable.
         // #666 G2: refuse an impossible pipeline degree before any teardown
@@ -2729,7 +2806,9 @@ pub fn admit_source_with_options(
     // Partial GPU offload: fail closed where the arch is dispatched, before any
     // teardown, so a source that cannot honour a configured spill never receives
     // a resident load.
-    partial_offload_refusal(arch_id, &source, tp, pp, qwen35_ep_experts)?;
+    // `ep_experts` is `None`: every tp>1 load (the only expert-parallel
+    // route) is refused by `spill_support`'s tp dimension first.
+    partial_offload_refusal(arch_id, &source, tp, pp, None)?;
     let heterogeneous_reason = hints.deepseek4_heterogeneous && arch_id == 9;
     // Qwen4 owns its own VMM QSA layout and certification (gfx1151/gfx1201), so
     // its capability replaces the Qwen/KvCache predicates below; its
@@ -2765,10 +2844,10 @@ pub fn admit_source_with_options(
         ))
     } else if pp > 1 {
         Some("pipeline parallelism (topology.pp > 1) does not support VMM KV".to_string())
-    } else if tp > 1 && (arch_id == 10 || qwen35_ep_experts.is_some_and(|n| n > 0)) {
-        Some("multi-GPU MoE/expert-parallel loads keep a full KV copy on every GPU, which VMM KV does not support".to_string())
-    } else if tp > 1 && arch_id == 9 {
+    } else if tp_moe && arch_id == 9 {
         Some("DeepSeek expert parallelism with VMM KV needs VMM support on every GPU, and at least one GPU lacks it".to_string())
+    } else if tp_moe {
+        Some("multi-GPU MoE/expert-parallel loads keep a full KV copy on every GPU, which VMM KV does not support".to_string())
     } else if carrier.is_some_and(|c| !matches!(c.name(), "qwen35" | "deepseek4" | "muse_glimmer"))
     {
         Some(format!(
@@ -2799,7 +2878,11 @@ pub fn admit_source_with_options(
         return Err("kv_adaptive -> CASK handoff needs the VMM KV backend, which is not available for this load; disable the CASK sidecar/handoff or use a GPU that supports VMM KV".into());
     }
     if let Some(carrier) = carrier {
+        crate::pp_degree_refusal(carrier.name(), &caps, pp)?;
         carrier.admit_topology(arch_id, is_dir, pp, kv_backend)?;
+        if pp > 1 {
+            carrier.admit_pp_options(pp, draft_path, options)?;
+        }
     }
     // Qwen MoE on a discrete card keeps the prior 32768 CLI/config default:
     // automatic context there is not validated against expert placement. On
@@ -2914,7 +2997,6 @@ pub fn admit_source_with_options(
             "--kv-k/--kv-v are Qwen-only (arch_id={arch_id}); use --kv-mode for this model"
         ));
     }
-    let mut qwen_n_layers: Option<usize> = None;
     if matches!(arch_id, 1 | 5 | 6) {
         use hipfire_runtime::kv_mode::{self, KvMode};
         let policy = if arch_id == 1 {
@@ -2943,7 +3025,6 @@ pub fn admit_source_with_options(
         } else {
             None
         };
-        qwen_n_layers = qwen_cfg.as_ref().map(|cfg| cfg.n_layers);
         let adaptive = hints.kv_adaptive.is_some_and(|v| !matches!(v, "" | "off"));
         let auto_native = qwen_cfg.as_ref().is_some_and(|cfg| {
             kv_mode::qwen35_native_auto_eligible(
@@ -3073,10 +3154,53 @@ pub fn admit_source_with_options(
 
     // One admitted mesh. Visible-device identity (HIP ordinal + PCI id + arch)
     // is bound here once; placement and carriers consume it and never reread
-    // the raw pp/tp/ep request. Existing routes keep their rank order and
-    // transports (`RankBinding::Visible`/`Emulated`, no edge decisions); the
-    // Qwen4 PP route arrives with its mesh and bands already admitted.
-    let (mesh, pp_bands, pp_layer_counts) = match qwen4_pp {
+    // the raw pp/tp/ep request. Legacy routes keep their rank order and
+    // transports (`RankBinding::Visible`/`Emulated`, no edge decisions); a
+    // carrier declaring `PpExecutor::Mesh` arrives with its mesh and bands
+    // already admitted (Qwen4 in its own branch above, every other carrier
+    // through the generic `admit_pp_mesh`).
+    let pp_mesh = match (qwen4_pp, topology, carrier) {
+        (Some(admitted), _, _) => Some(admitted),
+        (None, EffectiveTopology::Pipeline(_), Some(carrier)) => {
+            match caps.pp.map(|pp_caps| pp_caps.executor) {
+                Some(crate::PpExecutor::Mesh {
+                    numerical_policy,
+                    first_band_min_layers,
+                }) => {
+                    let transport = parse_mesh_transport(
+                        hipfire_config::developer_var(MESH_TRANSPORT_ENV)
+                            .ok()
+                            .as_deref(),
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "{}: pipeline parallelism (topology.pp = {pp}): {error}",
+                            carrier.name()
+                        )
+                    })?;
+                    // No pre-side-effect byte-qualification evidence exists:
+                    // `auto` resolves to host-mapped edges, a forced `peer`
+                    // refuses.
+                    Some(admit_pp_mesh(
+                        carrier.name(),
+                        numerical_policy,
+                        pp,
+                        carrier.pp_layer_count(&source)?,
+                        &visible_device_ranks(gpu_arch, pp),
+                        gpu_arch,
+                        hipfire_runtime::config::get().emulate_gpus.is_some(),
+                        transport,
+                        &|_, _| false,
+                        pp_layers_request().as_deref(),
+                        first_band_min_layers,
+                    )?)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let (mesh, pp_bands, pp_layer_counts) = match pp_mesh {
         Some((mesh, bands)) => (mesh, Some(bands.placement), bands.explicit_counts),
         None => {
             let shape = mesh_shape;
@@ -3095,19 +3219,19 @@ pub fn admit_source_with_options(
                 binding,
                 None,
             )?;
-            // Qwen3.5 pipeline bands: `HIPFIRE_PP_LAYERS` is read here, once,
+            // Legacy pipeline bands: `HIPFIRE_PP_LAYERS` is read here, once,
             // after every other admission verdict, and normalized through
             // `BandPlacement`.
-            let (pp_bands, pp_layer_counts) = if matches!(topology, EffectiveTopology::Pipeline(_))
-            {
-                let n_layers = qwen_n_layers.ok_or_else(|| {
-                    "qwen35 pipeline admission: layer count unavailable".to_string()
-                })?;
-                let bands =
-                    normalize_pp_bands(&mesh.mesh, n_layers, pp_layers_request().as_deref())?;
-                (Some(bands.placement), bands.explicit_counts)
-            } else {
-                (None, None)
+            let (pp_bands, pp_layer_counts) = match (topology, carrier) {
+                (EffectiveTopology::Pipeline(_), Some(carrier)) => {
+                    let bands = normalize_pp_bands(
+                        &mesh.mesh,
+                        carrier.pp_layer_count(&source)?,
+                        pp_layers_request().as_deref(),
+                    )?;
+                    (Some(bands.placement), bands.explicit_counts)
+                }
+                _ => (None, None),
             };
             (mesh, pp_bands, pp_layer_counts)
         }
@@ -4352,15 +4476,28 @@ mod tests {
     }
 
     #[test]
-    fn muse_glimmer_refuses_every_parallel_axis() {
-        for (pp, tp, ep) in [(2, 1, 1), (1, 2, 1), (1, 4, 1), (1, 1, 2), (1, 1, 4)] {
-            let err = muse_glimmer_topology_refusal(14, pp, tp, ep)
-                .unwrap_or_else(|| panic!("pp={pp} tp={tp} ep={ep} must refuse"));
-            assert!(err.contains("single-device only"), "{err}");
+    fn muse_glimmer_declares_no_topology_and_gets_the_uniform_sentences() {
+        use hipfire_runtime::loader_api::{topology_refusal, TopologyAxis};
+        let carrier = crate::carrier_for(14).expect("glimmer carrier");
+        let caps = carrier.topology_caps();
+        assert_eq!(caps, crate::TopologyCaps::default());
+        for (pp, tp, ep, axis, degree) in [
+            (2, 1, 1, TopologyAxis::Pipeline, 2),
+            (1, 2, 1, TopologyAxis::Tp, 2),
+            (1, 4, 1, TopologyAxis::Tp, 4),
+            (1, 1, 2, TopologyAxis::Expert, 2),
+            (1, 1, 4, TopologyAxis::Expert, 4),
+        ] {
+            assert_eq!(
+                crate::topology_axes_refusal(carrier.name(), &caps, false, pp, tp, ep),
+                Err(topology_refusal(carrier.name(), axis, degree, false)),
+                "pp={pp} tp={tp} ep={ep}"
+            );
         }
-        assert_eq!(muse_glimmer_topology_refusal(14, 1, 1, 1), None);
-        // Other architectures keep their own topology gates.
-        assert_eq!(muse_glimmer_topology_refusal(5, 2, 2, 2), None);
+        assert_eq!(
+            crate::topology_axes_refusal(carrier.name(), &caps, false, 1, 1, 1),
+            Ok(())
+        );
     }
 
     /// #666 G2 geometry gates: the metadata probe reads the HF `{config}`
@@ -6059,6 +6196,377 @@ mod tests {
 }
 
 #[cfg(test)]
+mod topology_caps_tests {
+    use super::*;
+    use crate::{EpCaps, PpBenchRoute, PpCaps, PpExecutor, TopologyCaps, TpCaps};
+    use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+    use hipfire_runtime::loader_api::{topology_refusal, TopologyAxis};
+
+    /// Every registered carrier's declaration, by name. A carrier absent from
+    /// the table must declare nothing.
+    fn expected(name: &str) -> TopologyCaps {
+        match name {
+            "qwen35" => TopologyCaps {
+                pp: Some(PpCaps {
+                    dir_sources: false,
+                    max_degree: 8,
+                    executor: PpExecutor::Legacy,
+                    bench: PpBenchRoute::Qwen35Pp,
+                }),
+                ep: None,
+                tp: Some(TpCaps { dir_sources: false }),
+            },
+            "qwen4" => TopologyCaps {
+                pp: Some(PpCaps {
+                    dir_sources: false,
+                    max_degree: 8,
+                    executor: PpExecutor::Mesh {
+                        numerical_policy: QWEN4_PP_NUMERICAL_POLICY,
+                        first_band_min_layers: QWEN4_PP_FIRST_BAND_MIN_LAYERS,
+                    },
+                    bench: PpBenchRoute::Qwen4Pp,
+                }),
+                ep: Some(EpCaps {
+                    kill_switch_env: Some("HIPFIRE_QWEN4_EP"),
+                }),
+                tp: None,
+            },
+            "raon1_mini" => TopologyCaps {
+                pp: Some(PpCaps {
+                    dir_sources: false,
+                    max_degree: 8,
+                    executor: PpExecutor::Mesh {
+                        numerical_policy: "raon-pp-cut-exact-v1",
+                        first_band_min_layers: 1,
+                    },
+                    bench: PpBenchRoute::Carrier,
+                }),
+                ep: None,
+                tp: None,
+            },
+            "deepseek4" | "minimax" => TopologyCaps {
+                pp: None,
+                ep: None,
+                tp: Some(TpCaps { dir_sources: false }),
+            },
+            _ => TopologyCaps::default(),
+        }
+    }
+
+    #[test]
+    fn every_carriers_caps_are_the_documented_declaration() {
+        let mut declaring = Vec::new();
+        for carrier in crate::registry_carriers() {
+            let caps = carrier.topology_caps();
+            assert_eq!(caps, expected(carrier.name()), "{}", carrier.name());
+            if caps != TopologyCaps::default() {
+                declaring.push(carrier.name());
+            }
+        }
+        declaring.sort_unstable();
+        assert_eq!(
+            declaring,
+            ["deepseek4", "minimax", "qwen35", "qwen4", "raon1_mini"]
+        );
+    }
+
+    #[test]
+    fn a_carrier_without_caps_gets_exactly_the_uniform_sentence_per_axis() {
+        for carrier in crate::registry_carriers() {
+            let caps = carrier.topology_caps();
+            for is_dir in [false, true] {
+                for (axis, pp, tp, ep) in [
+                    (TopologyAxis::Pipeline, 3, 1, 1),
+                    (TopologyAxis::Tp, 1, 3, 1),
+                    (TopologyAxis::Expert, 1, 1, 3),
+                ] {
+                    let verdict =
+                        crate::topology_axes_refusal(carrier.name(), &caps, is_dir, pp, tp, ep);
+                    if caps.declares(axis) {
+                        continue;
+                    }
+                    assert_eq!(
+                        verdict,
+                        Err(topology_refusal(carrier.name(), axis, 3, is_dir)),
+                        "{} {axis:?} dir={is_dir}",
+                        carrier.name()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn qwen4_declares_no_tp_so_tp_gets_the_uniform_tp_sentence() {
+        let carrier = crate::carrier_for(16).expect("qwen4 carrier");
+        assert_eq!(
+            crate::topology_axes_refusal("qwen4", &carrier.topology_caps(), false, 1, 2, 1),
+            Err(topology_refusal("qwen4", TopologyAxis::Tp, 2, false))
+        );
+    }
+
+    /// Raon declares the generic mesh pipeline route from its carrier alone:
+    /// the front door passes an HFQ at any degree up to the bound, refuses a
+    /// directory with the uniform sentence, and the generic admission yields
+    /// the mesh and bands (no per-arch admission code).
+    #[test]
+    fn raon_pp_is_admitted_through_the_generic_mesh_branch() {
+        let carrier = crate::carrier_for(19).expect("raon carrier");
+        let caps = carrier.topology_caps();
+        assert_eq!(
+            crate::topology_axes_refusal("raon1_mini", &caps, false, 2, 1, 1),
+            Ok(())
+        );
+        assert_eq!(
+            crate::topology_axes_refusal("raon1_mini", &caps, true, 2, 1, 1),
+            Err(topology_refusal(
+                "raon1_mini",
+                TopologyAxis::Pipeline,
+                2,
+                true
+            ))
+        );
+        assert_eq!(
+            crate::topology_axes_refusal("raon1_mini", &caps, false, 1, 2, 1),
+            Err(topology_refusal("raon1_mini", TopologyAxis::Tp, 2, false))
+        );
+        assert_eq!(crate::pp_degree_refusal("raon1_mini", &caps, 8), Ok(()));
+        assert!(crate::pp_degree_refusal("raon1_mini", &caps, 9).is_err());
+        let Some(PpCaps {
+            executor:
+                PpExecutor::Mesh {
+                    numerical_policy,
+                    first_band_min_layers,
+                },
+            ..
+        }) = caps.pp
+        else {
+            panic!("raon declares a mesh pipeline route");
+        };
+        let visible: Vec<AdmittedRank> = (0..2)
+            .map(|i| AdmittedRank {
+                logical: i,
+                device_ordinal: i as i32,
+                pci_bus_id: Some(format!("0000:{:02x}:00.0", i + 3)),
+                arch: "gfx1201".to_string(),
+            })
+            .collect();
+        let (mesh, bands) = admit_pp_mesh(
+            "raon1_mini",
+            numerical_policy,
+            2,
+            25,
+            &visible,
+            "gfx1201",
+            false,
+            EdgeTransportPolicy::Auto,
+            &|_, _| false,
+            None,
+            first_band_min_layers,
+        )
+        .expect("raon pp2 admits");
+        assert_eq!(mesh.ranks.len(), 2);
+        // OutputCardLast: the primary device owns the last band.
+        assert_eq!(mesh.ranks[1].device_ordinal, 0);
+        let placement = bands.placement;
+        assert_eq!(placement.stages(), 2);
+        assert_eq!(placement.band(0).start, 0);
+        assert_eq!(placement.band(1).end, 25);
+        assert_eq!(placement.band(0).end, placement.band(1).start);
+    }
+
+    fn write_hfq(name: &str, arch_id: u32, metadata: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-tp-axis-{}-{}", std::process::id(), name));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.hfq"));
+        let tensors = vec![HfqMemTensor {
+            name: "model.embed_tokens.weight".into(),
+            quant_type: 1,
+            shape: vec![4, 4],
+            group_size: 0,
+            data: vec![0u8; 32],
+        }];
+        write_hfqm_package_mem(&path, arch_id, metadata, &tensors).unwrap();
+        path
+    }
+
+    fn axis(arch_id: u32, name: &str, metadata: &str, tp: usize) -> Result<DimKind, String> {
+        let path = write_hfq(name, arch_id, metadata);
+        let source = ModelSource::from_path(path.to_str().unwrap()).unwrap();
+        let result = crate::carrier_for(arch_id)
+            .expect("carrier")
+            .tp_mesh_axis(&source, tp);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(path.parent().unwrap());
+        result
+    }
+
+    fn qwen35_metadata(num_experts: usize) -> String {
+        format!(
+            r#"{{"config":{{"text_config":{{"hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"num_key_value_heads":4,"vocab_size":1000,"intermediate_size":4096,"num_experts":{num_experts},"num_experts_per_tok":2,"moe_intermediate_size":1024,"max_position_embeddings":131072}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn qwen35_tp_axis_is_tp_for_dense_and_ep_for_moe() {
+        assert_eq!(axis(5, "dense", &qwen35_metadata(0), 2), Ok(DimKind::Tp));
+        assert_eq!(axis(5, "dense4", &qwen35_metadata(0), 4), Ok(DimKind::Tp));
+        assert_eq!(axis(6, "moe2", &qwen35_metadata(8), 2), Ok(DimKind::Ep));
+        assert_eq!(axis(6, "moe4", &qwen35_metadata(8), 4), Ok(DimKind::Ep));
+    }
+
+    #[test]
+    fn qwen35_moe_keeps_its_topology_gate_in_tp_mesh_axis() {
+        // tp must be 2|4 and divide the expert count; dense is not gated.
+        let err = axis(6, "moe3", &qwen35_metadata(8), 3).unwrap_err();
+        assert!(err.contains("EP supports tp=2|4"), "{err}");
+        let err = axis(6, "moe-odd", &qwen35_metadata(6), 4).unwrap_err();
+        assert!(err.contains("does not divide num_experts=6"), "{err}");
+        assert_eq!(axis(5, "dense3", &qwen35_metadata(0), 3), Ok(DimKind::Tp));
+    }
+
+    #[test]
+    fn deepseek4_and_minimax_tp_shard_the_expert_axis() {
+        assert_eq!(axis(9, "ds4", "{}", 2), Ok(DimKind::Ep));
+        assert_eq!(axis(10, "minimax", "{}", 4), Ok(DimKind::Ep));
+    }
+
+    #[test]
+    fn a_carrier_without_tp_refuses_tp_mesh_axis_with_the_uniform_sentence() {
+        // The default (reached only if a caller skipped the front door).
+        let err = axis(19, "raon", "{}", 2).unwrap_err();
+        assert_eq!(
+            err,
+            topology_refusal("raon1_mini", TopologyAxis::Tp, 2, false)
+        );
+    }
+}
+
+#[cfg(test)]
+mod non_qwen4_ep_admission_tests {
+    use super::*;
+    use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+    use hipfire_runtime::loader_api::{topology_refusal, TopologyAxis};
+
+    /// LFM2-MoE (arch 11) carries a registered carrier that declares no
+    /// pp/ep/tp route, so it exercises both non-Qwen4 topology branches.
+    const UNDECLARED_ARCH: u32 = 11;
+
+    fn write_fake_hfq(name: &str, arch_id: u32) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-ep-admit-{}-{}", std::process::id(), name));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.hfq"));
+        let tensors = vec![HfqMemTensor {
+            name: "model.embed_tokens.weight".into(),
+            quant_type: 1,
+            shape: vec![4, 4],
+            group_size: 0,
+            data: vec![0u8; 32],
+        }];
+        write_hfqm_package_mem(&path, arch_id, "{}", &tensors).unwrap();
+        path
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir(path.parent().unwrap());
+    }
+
+    fn admit(path: &std::path::Path, tp: usize, pp: usize) -> Result<SourceAdmission, String> {
+        admit_source(
+            path.to_str().unwrap(),
+            tp,
+            pp,
+            KvBackendRequest::Automatic,
+            None,
+            "gfx1201",
+            None,
+            "auto",
+            None,
+            4096,
+            KvBackendHints::without_device(),
+        )
+    }
+
+    fn undeclared_family() -> String {
+        crate::carrier_for(UNDECLARED_ARCH)
+            .expect("lfm2moe carrier is registered")
+            .name()
+            .to_string()
+    }
+
+    #[test]
+    fn ep_above_one_is_refused_in_the_single_pp_branch_before_the_pp_verdict() {
+        let path = write_fake_hfq("ep-single", UNDECLARED_ARCH);
+        TEST_EP_OVERRIDE.with(|cell| cell.set(Some(2)));
+        // pp=2 would otherwise get the pipeline sentence: ep wins.
+        for pp in [1usize, 2] {
+            let err = admit(&path, 1, pp)
+                .map(|_| ())
+                .expect_err("ep=2 must refuse");
+            assert_eq!(
+                err,
+                topology_refusal(&undeclared_family(), TopologyAxis::Expert, 2, false),
+                "pp={pp}"
+            );
+        }
+        TEST_EP_OVERRIDE.with(|cell| cell.set(None));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn ep_above_one_is_refused_in_the_tp_branch_before_the_arch_allow_list() {
+        let path = write_fake_hfq("ep-tp", UNDECLARED_ARCH);
+        TEST_EP_OVERRIDE.with(|cell| cell.set(Some(4)));
+        let err = admit(&path, 2, 1)
+            .map(|_| ())
+            .expect_err("ep=4 must refuse");
+        assert_eq!(
+            err,
+            topology_refusal(&undeclared_family(), TopologyAxis::Expert, 4, false)
+        );
+        TEST_EP_OVERRIDE.with(|cell| cell.set(None));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn tp_on_an_arch_without_a_route_gets_the_tp_sentence_with_the_family() {
+        let path = write_fake_hfq("tp-undeclared", UNDECLARED_ARCH);
+        TEST_EP_OVERRIDE.with(|cell| cell.set(Some(1)));
+        let err = admit(&path, 2, 1)
+            .map(|_| ())
+            .expect_err("tp=2 must refuse");
+        assert_eq!(
+            err,
+            topology_refusal(&undeclared_family(), TopologyAxis::Tp, 2, false)
+        );
+        assert!(err.starts_with("lfm2moe: "), "{err}");
+        TEST_EP_OVERRIDE.with(|cell| cell.set(None));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn ep_of_one_never_yields_the_expert_sentence() {
+        let path = write_fake_hfq("pp-undeclared", UNDECLARED_ARCH);
+        TEST_EP_OVERRIDE.with(|cell| cell.set(Some(1)));
+        // pp=2 is refused by the geometry gate or the carrier, per the visible
+        // device count of the host; either way it is not the expert refusal.
+        let err = admit(&path, 1, 2)
+            .map(|_| ())
+            .expect_err("pp=2 must refuse");
+        assert!(!err.contains("expert-parallel mode"), "{err}");
+        assert!(
+            err.contains("pp=2") || err.contains("topology.pp = 2"),
+            "{err}"
+        );
+        TEST_EP_OVERRIDE.with(|cell| cell.set(None));
+        cleanup(&path);
+    }
+}
+
+#[cfg(test)]
 mod qwen4_pp_admission_tests {
     use super::*;
     use hipfire_arch_qwen4::npu_trunk::NpuTrunkMode;
@@ -6863,7 +7371,8 @@ mod qwen4_pp_admission_tests {
                     "{error}"
                 );
             }
-            // tp with pp is refused at the request boundary, before the source.
+            // Qwen4 declares no tp: `--tp N` is refused first by the front
+            // door with the uniform tp sentence, before the source.
             let error = admit(
                 &path,
                 2,
@@ -6874,8 +7383,31 @@ mod qwen4_pp_admission_tests {
                 },
             )
             .unwrap_err();
+            assert_eq!(
+                error,
+                hipfire_runtime::loader_api::topology_refusal(
+                    "qwen4",
+                    hipfire_runtime::loader_api::TopologyAxis::Tp,
+                    2,
+                    false
+                )
+            );
+            // ep with pp (both declared) is refused at the request boundary
+            // by Qwen4's own combination rule, before the source.
+            TEST_EP_OVERRIDE.with(|cell| cell.set(Some(2)));
+            let error = admit(
+                &path,
+                1,
+                2,
+                SourceAdmissionOptions {
+                    spec: defaults,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            TEST_EP_OVERRIDE.with(|cell| cell.set(None));
             assert!(
-                error.contains("topology.pp from 2 to 8")
+                error.contains("topology.ep = 2) cannot combine with pipeline/tensor parallelism")
                     && !error.contains("config admission failed"),
                 "{error}"
             );

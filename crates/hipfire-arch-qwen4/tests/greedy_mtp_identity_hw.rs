@@ -2338,7 +2338,7 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
     // MTP reserve of the placement with this test's K for every arm, the AR arm
     // included. `state_quant` is the GDN test mode's canonical request.
     let shared = Qwen4RankShared {
-        continuous_batch: false,
+        batch: Default::default(),
         path: model_str.to_string(),
         max_seq: MAX_SEQ,
         sequence: None,

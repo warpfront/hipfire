@@ -49,6 +49,47 @@ impl Backend for Builder {
         self.seal.check(auth)?;
         self.lds.relayout()
     }
+    fn lds_slot_private(
+        &mut self,
+        auth: &Auth,
+        name: &str,
+        base: u32,
+        stride: u32,
+        waves: u32,
+    ) -> Result<usize, String> {
+        self.seal.check(auth)?;
+        self.lds.add_wave_private(name, base, stride, waves)
+    }
+    fn ds_store_private(
+        &mut self,
+        auth: &Auth,
+        slot: usize,
+        insn: Instruction,
+    ) -> Result<EventId, String> {
+        self.seal.check(auth)?;
+        self.ds_store_private_slot(slot, insn)?;
+        self.ledger
+            .last_id()
+            .map(EventId)
+            .ok_or_else(|| "LDS store left no ledger entry".into())
+    }
+    fn ds_load_private(
+        &mut self,
+        auth: &Auth,
+        slot: usize,
+        insn: Instruction,
+    ) -> Result<(), String> {
+        self.seal.check(auth)?;
+        self.ds_load_private_slot(slot, insn)
+    }
+    fn lds_private_publish(&mut self, auth: &Auth, slot: usize) -> Result<(), String> {
+        self.seal.check(auth)?;
+        self.lds.private_publish(slot)
+    }
+    fn lds_private_retire(&mut self, auth: &Auth, slot: usize) -> Result<(), String> {
+        self.seal.check(auth)?;
+        self.lds.private_retire(slot)
+    }
     fn ds_store(
         &mut self,
         auth: &Auth,
@@ -224,6 +265,12 @@ impl Backend for Builder {
         self.seal.check(auth)?;
         for &id in slots {
             let slot = self.lds.slots.get_mut(id).ok_or("unknown LDS slot")?;
+            if slot.wave_private.is_some() {
+                return Err(format!(
+                    "{} is wave-private: other waves never store into it",
+                    slot.name
+                ));
+            }
             if slot.state != SlotState::Free {
                 return Err(format!(
                     "{} cannot be stored by other waves while {:?}",

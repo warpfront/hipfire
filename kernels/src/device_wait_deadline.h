@@ -59,6 +59,7 @@ struct hf_device_wait_block {
 #define HF_WAIT_SITE_HC_CONTROL_RSQRT_ONCE 8u
 #define HF_WAIT_SITE_TP_PEER_PUSH_GFX1201 9u
 #define HF_WAIT_SITE_TP_PEER_PUSHN_GFX1201 10u
+#define HF_WAIT_SITE_AR_HC_WRITE_GFX1201 11u
 
 // Polls between counter reads. A wait that ends within this many polls never
 // reads the counter.

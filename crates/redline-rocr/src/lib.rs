@@ -30,6 +30,7 @@ pub mod packet;
 mod pm4;
 pub mod pm4_decode;
 mod pm4_gfx10;
+mod pm4_gfx10_scratch;
 mod runtime;
 
 pub use abi::{MissingSymbol, Symbols};
@@ -45,6 +46,10 @@ pub use pm4_gfx10::{
     Gfx10DispatchInitiatorPolicy, Gfx10KernelImage, Gfx10Pm4BuildError, Gfx10Pm4CommandBuffer,
     Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave,
     Gfx11Pm4CommandBuffer,
+};
+pub use pm4_gfx10_scratch::{
+    Gfx10Scratch, Gfx10ScratchError, Gfx10ScratchFamily, Gfx10ScratchPlan, Gfx10ScratchTopology,
+    MIN_SCRATCH_SLOTS_PER_ENGINE,
 };
 pub use runtime::DEFAULT_WAIT_TIMEOUT;
 pub use runtime::{

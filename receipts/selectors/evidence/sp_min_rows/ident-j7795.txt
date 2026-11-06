@@ -1,0 +1,5 @@
+off exit=0 secs=57 ids_md5=c3da3214d347df629dabd7938b1a448d verdict=PASS
+on exit=0 secs=61 ids_md5=c3da3214d347df629dabd7938b1a448d verdict=PASS
+on2 exit=0 secs=61 ids_md5=c3da3214d347df629dabd7938b1a448d verdict=PASS
+cmp off vs on: identical_files=3 differing_files=0
+cmp off vs on2: identical_files=3 differing_files=0

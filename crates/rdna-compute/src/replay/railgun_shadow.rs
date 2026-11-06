@@ -871,6 +871,7 @@ fn facts_summary(program: &rk::KernelProgram) -> FactsSummary {
             Lowering::Graph { reason } => ("graph", Some(reason.clone())),
             Lowering::HipDirect { reason } => ("hip_direct", Some(reason.clone())),
             Lowering::Conditional { reason } => ("conditional", Some(reason.clone())),
+            Lowering::LabPending { pending } => ("lab_pending", Some(pending.clone())),
         };
         if let Some(reason) = &reason {
             not_pm4.push(format!("{k} {}: {reason}", node.symbol));

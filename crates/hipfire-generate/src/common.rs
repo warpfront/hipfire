@@ -199,6 +199,17 @@ pub fn production_fail_closed_rollback(
             return epilogue;
         }
     }
+    // A pipeline-mesh model that owns its lifecycle (`ArchModel::
+    // owns_mesh_lifecycle`) resets every rank through the PP epilogue.
+    if slot.is_none()
+        && spec.is_none()
+        && m.pp > 1
+        && m.state
+            .as_deref()
+            .is_some_and(|state| state.owns_mesh_lifecycle())
+    {
+        return production_pp_fail_closed_rollback(m, gpu);
+    }
     m.seq_pos = 0;
     m.conversation_tokens.clear();
     fail_closed_reset_target_and_spec(m, gpu, slot, spec)
@@ -386,6 +397,17 @@ pub fn production_pp_fail_closed_rollback(
     if m.pp > 1 {
         match m.pp_gpus.as_mut() {
             Some(gpus) => {
+                // The mesh-owning model resets its ranks first (drained), then
+                // the per-device graph invalidation and sync below attest it.
+                if let Some(state) = m
+                    .state
+                    .as_deref_mut()
+                    .filter(|state| state.owns_mesh_lifecycle())
+                {
+                    if let Err(e) = state.reset_session_state_mesh(gpu, gpus) {
+                        push_reset_err(&mut first_err, "pp mesh reset", e);
+                    }
+                }
                 for (rank, dev) in gpus.devices.iter_mut().enumerate() {
                     if let Err(e) = dev.bind_thread() {
                         push_reset_err(
@@ -489,6 +511,24 @@ fn emit_active_error_route_aware(
     }
 }
 
+/// The HIP runtime's out-of-memory text (`hipMalloc: out of memory`, `hipMemCreate: out of memory`).
+pub(crate) const DEVICE_OUT_OF_MEMORY: &str = "out of memory";
+
+/// The wire class and retryability of a fail-closed error. A device that ran out of memory is a
+/// capacity condition, never the client's fault: `overload` + retryable (HTTP 503 with
+/// `Retry-After`), whatever class the failing step names. Every other failure keeps its class.
+pub(crate) fn fail_closed_wire<'a>(
+    message: &str,
+    class: &'a str,
+    retryable: bool,
+) -> (&'a str, bool) {
+    if message.contains(DEVICE_OUT_OF_MEMORY) {
+        ("overload", true)
+    } else {
+        (class, retryable)
+    }
+}
+
 /// Emit one correlated fail-closed error (no done). Appends epilogue context
 /// when rollback could not be attested.
 pub fn emit_fail_closed_error(
@@ -503,6 +543,7 @@ pub fn emit_fail_closed_error(
         Some(ctx) if !epilogue.rolled_back => format!("{message} ({ctx})"),
         _ => message.to_string(),
     };
+    let (class, retryable) = fail_closed_wire(message, class, retryable);
     emit_active_error_route_aware(stdout, id, &full, class, retryable, epilogue.rolled_back);
     let _ = stdout.flush();
 }
@@ -523,6 +564,7 @@ pub fn emit_fail_closed_error_for_route(
         Some(ctx) if !epilogue.rolled_back => format!("{message} ({ctx})"),
         _ => message.to_string(),
     };
+    let (class, retryable) = fail_closed_wire(message, class, retryable);
     crate::ar::emit_generation_error(
         route,
         stdout,
@@ -1597,6 +1639,8 @@ pub struct SpecEmitRequest {
     /// runs when `tools` is `Some`).
     pub enable_grammar: bool,
     pub stop: Vec<String>,
+    /// vLLM-compatible `min_tokens` (0 ⇒ none); see `SpecEmitCtx::min_tokens`.
+    pub min_tokens: usize,
     pub max_think: usize,
     pub assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     /// Reasoning-effort level (consumed by the ds4 emitter; ignored by ChatML).
@@ -2212,5 +2256,38 @@ mod tests {
         super::emit_prefill_progress(&mut none, "r1", Some(4), 4096, 4096);
         super::emit_prefill_progress(&mut none, "r1", Some(4), 512, 512);
         assert!(none.is_empty(), "no event at done == total");
+    }
+
+    #[test]
+    fn device_out_of_memory_fails_closed_as_a_retryable_overload() {
+        // cp9 j8160: a single-card singleton prefill that ran out of device memory reached the
+        // client as HTTP 400 `invalid_request_error` (class `validation`).
+        let oom = "prefill: Qwen4 bundle forward: Qwen4 GPU forward dispatch error: execute Qwen4 \
+                   layer program: Hip(\"HipError(2): hipMalloc: out of memory\")";
+        assert_eq!(
+            super::fail_closed_wire(oom, "validation", false),
+            ("overload", true)
+        );
+        assert_eq!(
+            super::fail_closed_wire(
+                "QSA context map failed: HipError(2): hipMemCreate: out of memory",
+                "gpu",
+                false
+            ),
+            ("overload", true)
+        );
+        // Every other failure keeps the class and retryability its call site names.
+        assert_eq!(
+            super::fail_closed_wire(
+                "think token budget exceeded (validation)",
+                "validation",
+                false
+            ),
+            ("validation", false)
+        );
+        assert_eq!(
+            super::fail_closed_wire("busy", "transient", true),
+            ("transient", true)
+        );
     }
 }

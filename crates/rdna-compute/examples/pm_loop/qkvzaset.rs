@@ -52,22 +52,22 @@ use std::cell::OnceCell;
 
 const GROUP_BYTES: usize = 136;
 /// The 27B GDN dims the product admits: `[qkv_m, z_m, beta_m, alpha_m]`.
-const DIMS: [usize; 4] = [10240, 6144, 48, 48];
-const QKV_M: usize = DIMS[0];
-const Z_M: usize = DIMS[1];
-const BA: usize = DIMS[2];
+pub(crate) const DIMS: [usize; 4] = [10240, 6144, 48, 48];
+pub(crate) const QKV_M: usize = DIMS[0];
+pub(crate) const Z_M: usize = DIMS[1];
+pub(crate) const BA: usize = DIMS[2];
 /// Rows of the Z fold (`Gpu::iu4_gdn_fold_rows`): Z, then one 128-row tile for beta and alpha.
-const FOLD_ROWS: usize = Z_M + 128;
-const BETA_ROW: usize = Z_M;
-const ALPHA_ROW: usize = Z_M + 64;
+pub(crate) const FOLD_ROWS: usize = Z_M + 128;
+pub(crate) const BETA_ROW: usize = Z_M;
+pub(crate) const ALPHA_ROW: usize = Z_M + 64;
 /// Bytes of the explicit kernarg (`GDN_KERNARG_BYTES`).
 pub const KERNARG_BYTES: usize = 120;
 /// Dynamic LDS the product launches the kernel with.
 const LDS: u32 = 20480;
 const MAX_N: usize = 128;
 const DEFAULT_K: usize = 5120;
-const QKV_SEED: u64 = 0x51ec_7a11_0001_0001;
-const Z_SEED: u64 = 0x51ec_7a11_0002_0002;
+pub(crate) const QKV_SEED: u64 = 0x51ec_7a11_0001_0001;
+pub(crate) const Z_SEED: u64 = 0x51ec_7a11_0002_0002;
 const X_SEED_M: usize = 4;
 const SAMPLE_ROWS: usize = 192;
 
@@ -137,7 +137,7 @@ fn pack(
 
 /// The Z fold weights: `FOLD_ROWS` seeded rows, with the rows the fold leaves empty (beta's and
 /// alpha's tile padding) zeroed like the loader's fold.
-fn fold_weights(k: usize, seed: u64) -> Vec<u8> {
+pub(crate) fn fold_weights(k: usize, seed: u64) -> Vec<u8> {
     let row = k / 256 * GROUP_BYTES;
     let mut w = synth_weights(FOLD_ROWS, k, seed);
     for rows in [BETA_ROW + BA..ALPHA_ROW, ALPHA_ROW + BA..FOLD_ROWS] {
@@ -147,7 +147,7 @@ fn fold_weights(k: usize, seed: u64) -> Vec<u8> {
 }
 
 /// Fold rows the reference checks: sampled Z rows, every beta and every alpha row.
-fn fold_ref_rows() -> Vec<usize> {
+pub(crate) fn fold_ref_rows() -> Vec<usize> {
     let mut rows = sample_rows(Z_M, SAMPLE_ROWS);
     rows.extend(BETA_ROW..BETA_ROW + BA);
     rows.extend(ALPHA_ROW..ALPHA_ROW + BA);

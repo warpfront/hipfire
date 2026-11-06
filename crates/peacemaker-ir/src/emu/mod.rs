@@ -26,10 +26,22 @@ pub mod convert;
 mod dot;
 #[cfg(test)]
 mod gate_ops_tests;
+#[cfg(test)]
+mod gfx11_decode_gap_tests;
+#[cfg(test)]
+mod gfx12_decode_gap_tests;
 mod hw;
+#[cfg(test)]
+mod hw_replay;
+pub use alu::f32_nan_swap_payload_safe;
 pub use hw::RunReport;
 mod memory;
 pub mod mma;
+#[cfg(test)]
+#[rustfmt::skip]
+mod fp8_fixtures;
+#[cfg(test)]
+mod fp8_receipts;
 #[cfg(test)]
 mod swmmac_fixtures;
 pub mod trans;
@@ -468,6 +480,11 @@ impl State {
         })
     }
     fn read64(&self, op: &Operand, lane: usize) -> Result<u64> {
+        // An explicit 64-bit `vcc` (SGPR pair 106:107 as scalar DATA, e.g. an SMEM base) is VCC_LO and VCC_HI in full,
+        // also in wave32, where VCC_HI is an ordinary 32-bit register above the lane mask.
+        if let Operand::Special(Special::Vcc) = op {
+            return Ok(self.vcc);
+        }
         Ok(u64::from(self.read(op, lane, 0)?) | u64::from(self.read(op, lane, 1)?) << 32)
     }
     /// 64-bit source of a 64-bit vector/scalar operation. `Reg` is a register pair, a wave32 `vcc`/`exec` pair has a
@@ -481,7 +498,8 @@ impl State {
             }
             Operand::Special(Special::SrcSharedBase) => u64::from(SHARED_APERTURE_HI) << 32,
             Operand::Special(Special::SrcPrivateBase) => u64::from(PRIVATE_APERTURE_HI) << 32,
-            Operand::Special(Special::Vcc | Special::VccLo) => self.vcc & self.lane_mask(),
+            Operand::Special(Special::Vcc) => self.vcc,
+            Operand::Special(Special::VccLo) => self.vcc & self.lane_mask(),
             Operand::Special(Special::Exec | Special::ExecLo) => self.exec & self.lane_mask(),
             Operand::Special(Special::Null) => 0,
             Operand::Inline(InlineConst::Integer(n)) => i64::from(*n) as u64,
@@ -507,8 +525,13 @@ impl State {
                 self.exec = value & self.lane_mask();
                 Ok(())
             }
-            Operand::Special(Special::Vcc | Special::VccLo) => {
-                self.vcc = value & self.lane_mask();
+            // Explicit 64-bit `vcc`: both halves are data (see `read64`).
+            Operand::Special(Special::Vcc) => {
+                self.vcc = value;
+                Ok(())
+            }
+            Operand::Special(Special::VccLo) => {
+                self.set_vcc_mask(value);
                 Ok(())
             }
             Operand::Special(Special::Null) => Ok(()),
@@ -560,11 +583,17 @@ impl State {
             _ => return Err(format!("not a lane-mask operand {op}")),
         })
     }
+    /// Write VCC as a lane mask: only the wave's lanes change. In wave32 VCC_HI is an ordinary 32-bit register above
+    /// the lane mask (scalar data, readable as `vcc` / `vcc_hi`), so a mask write must not clear it.
+    fn set_vcc_mask(&mut self, mask: u64) {
+        let lanes = self.lane_mask();
+        self.vcc = (self.vcc & !lanes) | (mask & lanes);
+    }
     fn put_mask(&mut self, op: &Operand, value: u64) -> Result<()> {
         let wide = self.lanes == 64;
         let value = value & self.lane_mask();
         match op {
-            Operand::Special(Special::Vcc | Special::VccLo) => self.vcc = value,
+            Operand::Special(Special::Vcc | Special::VccLo) => self.set_vcc_mask(value),
             Operand::Special(Special::Exec | Special::ExecLo) => self.exec = value,
             Operand::Special(Special::Null) => (),
             Operand::Reg(r) if r.kind != Kind::V => {
@@ -610,10 +639,10 @@ impl State {
                 Special::ExecHi if self.lanes == 64 => {
                     self.exec = (self.exec & 0xffff_ffff) | u64::from(value) << 32
                 }
-                Special::VccHi if self.lanes == 64 => {
-                    self.vcc = (self.vcc & 0xffff_ffff) | u64::from(value) << 32
-                }
-                Special::ExecHi | Special::VccHi => (),
+                // wave32: VCC_HI is ordinary scalar data (hipcc allocates it as a general SGPR); only wave64 aliases it
+                // with the mask, but in both cases the write must land, never be dropped.
+                Special::VccHi => self.vcc = (self.vcc & 0xffff_ffff) | u64::from(value) << 32,
+                Special::ExecHi => (),
                 Special::Scc => self.scc = value != 0,
                 Special::M0 => self.m0 = value,
                 Special::Null => (),
@@ -662,6 +691,9 @@ pub struct Emulator<'a> {
     hw: Option<Vec<hw::StepHw>>,
     /// Workgroups run so far (the gate model's schedule budget).
     runs: std::sync::atomic::AtomicU64,
+    /// Wave-private LDS windows `(base, stride, waves)`: wave `w` owns `[base + w * stride, base + (w + 1) * stride)`.
+    /// The gate model refuses any access of another wave (or past a slice) to such a window (see `wave_private_lds`).
+    private_lds: Vec<(u32, u32, u32)>,
 }
 impl<'a> Emulator<'a> {
     pub fn new(program: &'a Program, symbol: &str) -> Result<Self> {
@@ -700,12 +732,23 @@ impl<'a> Emulator<'a> {
             decode_arch: program.target.arch,
             hw: None,
             runs: std::sync::atomic::AtomicU64::new(0),
+            private_lds: Vec::new(),
         })
     }
     /// Track which LDS bytes the workgroup has written; a read of any other LDS byte (including by an LDS atomic) is an
     /// error. Off by default so existing differential tests keep their (zero-initialised LDS) behaviour.
     pub fn strict_lds(mut self) -> Self {
         self.strict_lds = true;
+        self
+    }
+    /// Declare a wave-private LDS window (the builder's `LdsSlot::wave_private`): wave `w` owns bytes `[base + w *
+    /// stride, base + (w + 1) * stride)` and no other wave may touch them. The gate model (`hw_model`) checks every
+    /// LDS access that overlaps the window: it must come from the owning wave and stay inside that wave's slice,
+    /// else the run fails with a `[private]` error naming both waves. Within one wave the gate model needs no
+    /// ordering between accesses to its slice (one wave's DS instructions stay in issue order); a *different* wave's
+    /// access is refused here even when a barrier would order it, because ownership never crosses a barrier.
+    pub fn wave_private_lds(mut self, base: u32, stride: u32, waves: u32) -> Self {
+        self.private_lds.push((base, stride, waves));
         self
     }
     /// The lab's exactness contract for the lane kernels: non-NaN words bit-equal, a NaN must meet a NaN (payload and

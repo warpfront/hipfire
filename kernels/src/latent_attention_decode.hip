@@ -51,6 +51,34 @@
 #define LA_DEC_MAX_SPLITS 64
 #define LA_DEC_SPLIT_ALIGN 16
 
+// Multi-row decode build (`-DLA_DEC_ROWS`, module `latent_attention_decode_rows`):
+// the SAME kernel bodies with a row dimension in grid z. Row r is the rows == 1
+// call made at `pos_offset + r`: its visible length is
+// min(*pos + pos_offset + r + 1, max_rows), and q / ws / y are offset by r planes
+// (q [rows, n_heads, wa+wb], ws [rows][n_heads][splits][dv+2], y [rows, n_heads, dv]).
+// Every arithmetic statement below is shared, so each row's partials and merge are
+// bit-identical to the singleton at that length. Without LA_DEC_ROWS every macro
+// expands to the original token (the singleton text is unchanged).
+#ifdef LA_DEC_ROWS
+#define LA_DEC_PARTIAL latent_attention_decode_partial_rows
+#define LA_DEC_PARTIAL_Q8 latent_attention_decode_partial_q8_rows
+#define LA_DEC_MERGE latent_attention_decode_merge_rows
+#define LA_DEC_POS_OFFSET (pos_offset + (int)blockIdx.z)
+#define LA_DEC_ROW_Q + (size_t)blockIdx.z * (size_t)gridDim.y * (size_t)dq
+#define LA_DEC_ROW_WS_P + (size_t)blockIdx.z * (size_t)gridDim.y * (size_t)splits * (size_t)(dv + 2)
+#define LA_DEC_ROW_Y + (size_t)blockIdx.z * (size_t)gridDim.x * (size_t)dv
+#define LA_DEC_ROW_WS_M + (size_t)blockIdx.z * (size_t)gridDim.x * (size_t)splits * rec_stride
+#else
+#define LA_DEC_PARTIAL latent_attention_decode_partial
+#define LA_DEC_PARTIAL_Q8 latent_attention_decode_partial_q8
+#define LA_DEC_MERGE latent_attention_decode_merge
+#define LA_DEC_POS_OFFSET pos_offset
+#define LA_DEC_ROW_Q
+#define LA_DEC_ROW_WS_P
+#define LA_DEC_ROW_Y
+#define LA_DEC_ROW_WS_M
+#endif
+
 static __device__ __forceinline__ uint16_t la_f32_to_bf16(float f) {
     uint32_t u = __float_as_uint(f);
     if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t)((u >> 16) | 0x40u);
@@ -118,7 +146,7 @@ static __device__ __forceinline__ void la_dec_axpy8(float* acc, float p, uint4 u
     acc[7] = fmaf(p, la_dec_hi(u.w), acc[7]);
 }
 
-extern "C" __global__ __launch_bounds__(LA_DEC_THREADS) void latent_attention_decode_partial(
+extern "C" __global__ __launch_bounds__(LA_DEC_THREADS) void LA_DEC_PARTIAL(
     const float* __restrict__ q,         // [n_heads, wa + wb] F32
     const uint16_t* __restrict__ ka,     // k_a view base (offset applied)
     const uint16_t* __restrict__ kb,     // k_b view base
@@ -133,7 +161,7 @@ extern "C" __global__ __launch_bounds__(LA_DEC_THREADS) void latent_attention_de
     const int split = blockIdx.x;
     const int h = blockIdx.y;
 
-    const int len = la_dec_visible(pos_ptr, pos_offset, max_rows);
+    const int len = la_dec_visible(pos_ptr, LA_DEC_POS_OFFSET, max_rows);
     const int per = la_dec_per(len, splits);
     const long long begin_ll = (long long)split * (long long)per;
     if (begin_ll >= (long long)len) return;  // empty split (also len == 0): nothing touched
@@ -156,7 +184,7 @@ extern "C" __global__ __launch_bounds__(LA_DEC_THREADS) void latent_attention_de
     const int vl = tid - vg * nvv;
     const bool v_active = vg < vgroups;
 
-    const float* qr = q + (size_t)h * (size_t)dq;
+    const float* qr = q + (size_t)h * (size_t)dq LA_DEC_ROW_Q;
     for (int d = tid; d < dq; d += LA_DEC_THREADS) sq[d] = qr[d];
 
     const uint16_t* ka_h = ka + (size_t)h * (size_t)ka_head;
@@ -275,7 +303,7 @@ extern "C" __global__ __launch_bounds__(LA_DEC_THREADS) void latent_attention_de
     }
     __syncthreads();
 
-    float* rec = ws + ((size_t)h * (size_t)splits + (size_t)split) * (size_t)(dv + 2);
+    float* rec = ws + ((size_t)h * (size_t)splits + (size_t)split) * (size_t)(dv + 2) LA_DEC_ROW_WS_P;
     if (tid == 0) {
         rec[0] = m;
         rec[1] = l;
@@ -287,7 +315,7 @@ extern "C" __global__ __launch_bounds__(LA_DEC_THREADS) void latent_attention_de
     }
 }
 
-extern "C" __global__ __launch_bounds__(LA_DEC_THREADS) void latent_attention_decode_merge(
+extern "C" __global__ __launch_bounds__(LA_DEC_THREADS) void LA_DEC_MERGE(
     const float* __restrict__ ws,        // [n_heads][splits][dv + 2]
     float* __restrict__ y,               // [n_heads, dv]
     const int* __restrict__ pos_ptr,     // device scalar
@@ -298,9 +326,9 @@ extern "C" __global__ __launch_bounds__(LA_DEC_THREADS) void latent_attention_de
 
     const int h = blockIdx.x;
     const int tid = threadIdx.x;
-    float* yr = y + (size_t)h * (size_t)dv;
+    float* yr = y + (size_t)h * (size_t)dv LA_DEC_ROW_Y;
 
-    const int len = la_dec_visible(pos_ptr, pos_offset, max_rows);
+    const int len = la_dec_visible(pos_ptr, LA_DEC_POS_OFFSET, max_rows);
     if (len == 0) {
         for (int d = tid; d < dv; d += LA_DEC_THREADS) yr[d] = 0.0f;
         return;
@@ -308,7 +336,7 @@ extern "C" __global__ __launch_bounds__(LA_DEC_THREADS) void latent_attention_de
     const int per = la_dec_per(len, splits);
     const int ns = (len + per - 1) / per;  // non-empty splits, ascending [0, ns)
     const size_t rec_stride = (size_t)(dv + 2);
-    const float* wh = ws + (size_t)h * (size_t)splits * rec_stride;
+    const float* wh = ws + (size_t)h * (size_t)splits * rec_stride LA_DEC_ROW_WS_M;
 
     float M = -INFINITY;
     for (int s = 0; s < ns; ++s) M = fmaxf(M, wh[(size_t)s * rec_stride]);
@@ -380,7 +408,7 @@ static __device__ __forceinline__ void la_dec_axpy8_q8(float* acc, float p, uint
     acc[7] = fmaf(p, la_dec_i8(u.y, 3), acc[7]);
 }
 
-extern "C" __global__ __launch_bounds__(LA_DEC_THREADS) void latent_attention_decode_partial_q8(
+extern "C" __global__ __launch_bounds__(LA_DEC_THREADS) void LA_DEC_PARTIAL_Q8(
     const float* __restrict__ q,         // [n_heads, wa + wb] F32
     const uint8_t* __restrict__ ka,      // INT8 K_nope plane view base
     const uint16_t* __restrict__ kb,     // BF16 tail view base
@@ -396,7 +424,7 @@ extern "C" __global__ __launch_bounds__(LA_DEC_THREADS) void latent_attention_de
     const int split = blockIdx.x;
     const int h = blockIdx.y;
 
-    const int len = la_dec_visible(pos_ptr, pos_offset, max_rows);
+    const int len = la_dec_visible(pos_ptr, LA_DEC_POS_OFFSET, max_rows);
     const int per = la_dec_per(len, splits);
     const long long begin_ll = (long long)split * (long long)per;
     if (begin_ll >= (long long)len) return;  // empty split (also len == 0): nothing touched
@@ -419,7 +447,7 @@ extern "C" __global__ __launch_bounds__(LA_DEC_THREADS) void latent_attention_de
     const int vl = tid - vg * nvv;
     const bool v_active = vg < vgroups;
 
-    const float* qr = q + (size_t)h * (size_t)dq;
+    const float* qr = q + (size_t)h * (size_t)dq LA_DEC_ROW_Q;
     for (int d = tid; d < dq; d += LA_DEC_THREADS) sq[d] = qr[d];
 
     const uint8_t* ka_h = ka + (size_t)h * (size_t)ka_head;
@@ -563,7 +591,7 @@ extern "C" __global__ __launch_bounds__(LA_DEC_THREADS) void latent_attention_de
     }
     __syncthreads();
 
-    float* rec = ws + ((size_t)h * (size_t)splits + (size_t)split) * (size_t)(dv + 2);
+    float* rec = ws + ((size_t)h * (size_t)splits + (size_t)split) * (size_t)(dv + 2) LA_DEC_ROW_WS_P;
     if (tid == 0) {
         rec[0] = m;
         rec[1] = l;

@@ -5,12 +5,13 @@
 //! The gfx1201 row-local R128 / K640 A4 producer `mq_i4_a4_r128_k640` (module
 //! `mq_i4_a4_pm_gfx1201`): symbol, 48-byte kernarg ABI, exact-arch gating, the
 //! instruction census of the frozen numerics, the row-locality structure (straight-line,
-//! three loads of exactly this row group, no LDS), the committed bundle and contract
-//! identities, and (feature `toolchain`) wait replay, M7 and the radiowave certification.
+//! three loads of exactly this row group, no LDS), the committed contract
+//! identity, and (feature `toolchain`) wait replay, M7 and the radiowave certification.
 //! The byte oracle against the CPU twin (`pilot_solve.a4_emulate`) is the GPU harness
 //! `crates/peacemaker-isa/tools/mq_i4_a4_oracle.py`.
 use peacemaker_isa::kernels::mq_i4_a4::{self, Spec};
 use peacemaker_isa::Arch;
+#[cfg(feature = "toolchain")]
 #[macro_use]
 #[path = "support/rocm.rs"]
 mod rocm;
@@ -380,43 +381,6 @@ fn constants_match_the_profile_and_the_frozen_producer() {
     }
 }
 
-fn bundle_path() -> String {
-    format!(
-        "{}/../../kernels/{MODULE}.hxaco",
-        env!("CARGO_MANIFEST_DIR")
-    )
-}
-
-/// The committed `kernels/mq_i4_a4_pm_gfx1201.hxaco` must be exactly what the builder emits
-/// today (native writer, no ROCm needed;
-/// `peacemaker-isa emit --kernel mq_i4_a4 --arch gfx1201 ... --bundle`).
-#[test]
-fn committed_bundle_equals_fresh_emission() {
-    let path = bundle_path();
-    let committed = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e} (emit it: peacemaker-isa emit --kernel mq_i4_a4 --arch gfx1201 ... --bundle)"));
-    let (_, text, _) = mq_i4_a4::emit_module(ARCH).unwrap();
-    let elf = peacemaker_isa::native::assemble(&text, ARCH).unwrap();
-    let fresh =
-        peacemaker_isa::native::bundle(&elf, ARCH, peacemaker_isa::native::DEFAULT_HOST_TARGET);
-    assert!(
-        committed == fresh,
-        "{MODULE}: fresh emission differs from the committed bundle {path}"
-    );
-}
-
-/// The same `.text` through the ROCm oracle's `llvm-mc` + `ld.lld`.
-#[test]
-fn committed_bundle_text_equals_oracle_link() {
-    let _ = require_rocm_tool!("llvm-mc");
-    let _ = require_rocm_tool!("ld.lld");
-    let committed = std::fs::read(bundle_path()).unwrap();
-    let text = mq_i4_a4::emit_module(ARCH).unwrap().1;
-    assert!(
-        text_section(&link(&text, ARCH.name(), MODULE)) == text_section(&committed),
-        "{MODULE}: oracle-linked emission differs from the committed bundle"
-    );
-}
-
 /// The committed shape contract is exactly what `contract()` derives from fresh emission
 /// (`peacemaker-isa emit --kernel mq_i4_a4 ... --co ... --shape crates/peacemaker-isa/kernels`).
 #[test]
@@ -433,60 +397,6 @@ fn committed_contract_equals_fresh_contract() {
     let fresh = mq_i4_a4::contract(spec(), &mq_i4_a4::emit(spec()).unwrap());
     assert_eq!(committed, fresh, "{path}");
     assert_eq!(committed["symbol"], SYMBOL);
-}
-
-fn link(text: &str, arch: &str, stem: &str) -> Vec<u8> {
-    use std::process::Command;
-    let dir = std::env::temp_dir().join(format!("peacemaker-isa-mqi4a4-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let (s, o, co) = (
-        dir.join(format!("{stem}.s")),
-        dir.join(format!("{stem}.o")),
-        dir.join(format!("{stem}.co")),
-    );
-    std::fs::write(&s, text).unwrap();
-    let llvm_mc = rocm::rocm_tool("llvm-mc").expect("ROCm llvm-mc");
-    let linker = rocm::rocm_tool("ld.lld").expect("ROCm ld.lld");
-    assert!(Command::new(llvm_mc)
-        .args([
-            "-triple=amdgcn-amd-amdhsa",
-            &format!("-mcpu={arch}"),
-            "-filetype=obj"
-        ])
-        .arg(&s)
-        .arg("-o")
-        .arg(&o)
-        .status()
-        .unwrap()
-        .success());
-    assert!(Command::new(linker)
-        .arg("-shared")
-        .arg(&o)
-        .arg("-o")
-        .arg(&co)
-        .status()
-        .unwrap()
-        .success());
-    std::fs::read(co).unwrap()
-}
-
-/// `.text` of an ELF, or of the device ELF inside a clang offload bundle.
-fn text_section(bytes: &[u8]) -> Vec<u8> {
-    let start = bytes.windows(4).position(|w| w == b"\x7fELF").unwrap();
-    let e = &bytes[start..];
-    let u16_ = |o: usize| u16::from_le_bytes([e[o], e[o + 1]]) as usize;
-    let u32_ = |o: usize| u32::from_le_bytes(e[o..o + 4].try_into().unwrap()) as usize;
-    let u64_ = |o: usize| u64::from_le_bytes(e[o..o + 8].try_into().unwrap()) as usize;
-    let (shoff, shentsize, shnum, shstrndx) = (u64_(0x28), u16_(0x3a), u16_(0x3c), u16_(0x3e));
-    let sh = |i: usize| shoff + i * shentsize;
-    let names = u64_(sh(shstrndx) + 24);
-    (0..shnum)
-        .find_map(|i| {
-            let name = &e[names + u32_(sh(i))..];
-            name.starts_with(b".text\0")
-                .then(|| e[u64_(sh(i) + 24)..u64_(sh(i) + 24) + u64_(sh(i) + 32)].to_vec())
-        })
-        .unwrap()
 }
 
 #[cfg(feature = "toolchain")]

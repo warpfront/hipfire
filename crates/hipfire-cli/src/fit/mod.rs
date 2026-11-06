@@ -21,6 +21,7 @@ use hipfire_loader::admission::{
     SourceAdmissionOptions, QWEN35_MIN_AUTO_CONTEXT,
 };
 use hipfire_registry::{receipts, ModelEntry, RegistryV1};
+use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
 use hipfire_runtime::loader_api::{CaskConfig, ModelSource, SpecLoadCfg};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -67,6 +68,10 @@ pub(crate) struct FitArgs {
         value_parser = ["off", "auto", "ngram", "dflash", "mtp", "dspark"]
     )]
     pub spec: Option<String>,
+    /// Tensor/expert-parallel degree for this load (same parser and range as
+    /// `run --tp`); admission answers for it exactly as the daemon would.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
+    pub tp: Option<u64>,
 }
 
 impl FitArgs {
@@ -90,6 +95,7 @@ struct OverridesEcho {
     kv_k: Option<String>,
     kv_v: Option<String>,
     spec: Option<String>,
+    tp: Option<u64>,
 }
 
 impl From<&FitArgs> for OverridesEcho {
@@ -99,6 +105,7 @@ impl From<&FitArgs> for OverridesEcho {
             kv_k: args.kv_k.clone(),
             kv_v: args.kv_v.clone(),
             spec: args.spec.clone(),
+            tp: args.tp,
         }
     }
 }
@@ -114,6 +121,7 @@ impl OverridesEcho {
         ]
         .iter()
         .filter_map(|(flag, value)| value.as_deref().map(|value| format!(" {flag} {value}")))
+        .chain(self.tp.map(|tp| format!(" --tp {tp}")))
         .collect()
     }
 }
@@ -670,7 +678,7 @@ fn analyze_model(
     let mut plan = Plan {
         basis: PLAN_BASIS,
         device_index: device.index,
-        topology: topology_key(admitted.topology),
+        topology: plan_topology_key(&admitted),
         kv_backend: admitted.kv_backend.as_str().into(),
         kv_backend_reason: admitted.kv_backend_reason.clone(),
         kv_mode: match admitted.sequence.as_ref() {
@@ -895,6 +903,11 @@ fn model_params(
     if let Some(ctx) = args.ctx {
         params["max_seq"] = json!(ctx);
     }
+    // run_command forwards `--tp` after load_params the same way; a degree of
+    // 1 is the default and is not sent.
+    if let Some(tp) = args.tp.filter(|&tp| tp > 1) {
+        params["tp"] = json!(tp);
+    }
     // daemon/main.rs:1675-1693 and vision_ladder.rs:49-59: sample the
     // developer override ladders outside the pure params mapper, including
     // explicit empty values (opt out). The mapper applies each mode gate.
@@ -998,6 +1011,21 @@ fn source_context(source: &ModelSource) -> Option<usize> {
         .or_else(|| metadata.pointer("/config/max_position_embeddings"))
         .and_then(Value::as_u64)
         .and_then(|v| usize::try_from(v).ok())
+}
+
+/// The plan's topology string. Qwen4 expert parallelism admits as `Single`
+/// with an Ep axis on the admitted mesh; the plan names it `ep<N>` so it is not
+/// read (or matched against receipts) as a single-GPU load.
+fn plan_topology_key(admitted: &SourceAdmission) -> String {
+    ep_axis_key(admitted.topology, &admitted.mesh.mesh)
+}
+
+fn ep_axis_key(topology: EffectiveTopology, mesh: &DeviceMesh) -> String {
+    let ep = mesh.size_of(DimKind::Ep);
+    match topology {
+        EffectiveTopology::Single if ep > 1 => format!("ep{ep}"),
+        topology => topology_key(topology),
+    }
 }
 
 fn topology_key(topology: EffectiveTopology) -> String {
@@ -1226,8 +1254,12 @@ fn admission_fix(message: &str) -> String {
         format!("apply the setting or reload change named above: {message}")
     } else if message.contains("kv") || message.contains("KV") {
         "change `--kv-mode`/`--kv-k`/`--kv-v`, or select a KV mode/backend supported by this model and GPU using `hipfire config set memory.kv_cache q8` and `hipfire config set memory.kv_backend vmm`; apply the admission message if it names a different required mode".into()
-    } else if message.contains("topology") || message.contains("pp=") || message.contains("tp=") {
-        "use a supported topology (`hipfire config set topology.pp 1` and `hipfire config set topology.ep 1`) or select the model/topology named above".into()
+    } else if message.contains("topology")
+        || message.contains("pp=")
+        || message.contains("tp=")
+        || message.contains("--tp")
+    {
+        "use a supported topology (`hipfire config set topology.pp 1`, `hipfire config set topology.ep 1`, and no `--tp`) or select the model/topology named above".into()
     } else {
         "see the message; change the named load setting or choose a supported smaller tier with `hipfire ls`, then rerun `hipfire fit`".into()
     }
@@ -1947,6 +1979,7 @@ mod tests {
                 kv_k: None,
                 kv_v: None,
                 spec: None,
+                tp: None,
             },
             model: ModelInfo {
                 tag: "example:mq4".into(),
@@ -2301,7 +2334,7 @@ mod tests {
         assert_eq!(value["input"], "example:mq4");
         assert_eq!(
             value["overrides"],
-            json!({"kv_mode": null, "kv_k": null, "kv_v": null, "spec": null})
+            json!({"kv_mode": null, "kv_k": null, "kv_v": null, "spec": null, "tp": null})
         );
         let encoded = serde_json::to_string(&value).unwrap();
         assert!(!encoded.contains("/home/"));
@@ -2523,6 +2556,63 @@ mod tests {
     }
 
     #[test]
+    fn tp_flag_matches_run_range_and_reaches_the_admission_inputs() {
+        let (paths, model) = fixture("tp");
+        let args = fit_args(&["--tp", "2"]);
+        assert_eq!(args.tp, Some(2));
+        assert_eq!(OverridesEcho::from(&args).flags(), " --tp 2");
+        let load = model_params(&paths, "example:mq4", None, None, &model, &args).unwrap();
+        assert_eq!(load.params["tp"], 2);
+        assert_eq!(admission_inputs(&load.params).tp, 2);
+        // One rank is the default: nothing is sent, admission reads tp = 1.
+        let one = fit_args(&["--tp", "1"]);
+        let load = model_params(&paths, "example:mq4", None, None, &model, &one).unwrap();
+        assert!(load.params.get("tp").is_none());
+        assert_eq!(admission_inputs(&load.params).tp, 1);
+        // The same 1..=64 range as `run --tp`.
+        for bad in ["0", "65"] {
+            assert!(
+                crate::Cli::try_parse_from(["hipfire", "fit", "example", "--tp", bad]).is_err(),
+                "--tp {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen4_ep_plans_report_the_ep_degree_not_single_gpu() {
+        assert_eq!(topology_key(EffectiveTopology::Single), "single");
+        assert_eq!(topology_key(EffectiveTopology::Pipeline(2)), "pp2");
+        assert_eq!(topology_key(EffectiveTopology::Expert(4)), "ep4");
+        // Qwen4 EP admits as `Single` with an Ep axis on the admitted mesh.
+        let mesh = DeviceMesh::rect(&[(DimKind::Ep, 2)]).expect("ep mesh");
+        let key = ep_axis_key(EffectiveTopology::Single, &mesh);
+        assert_eq!(key, "ep2");
+        // The receipt key follows the plan string exactly: an `ep2` receipt
+        // matches this plan and a single-GPU receipt no longer does.
+        let ep_receipt = receipts::Receipt {
+            topology: "ep2".into(),
+            ..receipt()
+        };
+        assert!(receipt_matches(
+            &ep_receipt,
+            "example:mq4",
+            "gfx1201",
+            &key,
+            "resident"
+        ));
+        assert!(!receipt_matches(
+            &receipt(),
+            "example:mq4",
+            "gfx1201",
+            &key,
+            "resident"
+        ));
+        let single = DeviceMesh::single().unwrap();
+        assert_eq!(ep_axis_key(EffectiveTopology::Single, &single), "single");
+        assert_eq!(ep_axis_key(EffectiveTopology::Pipeline(2), &single), "pp2");
+    }
+
+    #[test]
     fn model_params_without_overrides_follow_the_config_selector() {
         let (paths, model) = fixture("config");
         let resolved = crate::resolved_for_model(&paths, "example:mq4", None, None).unwrap();
@@ -2736,6 +2826,7 @@ mod tests {
             kv_k: None,
             kv_v: None,
             spec: Some("mtp".into()),
+            tp: None,
         };
         let text = render_text(&report, false);
         assert!(
@@ -2747,7 +2838,7 @@ mod tests {
         let value = json_report(&report).unwrap();
         assert_eq!(
             value["overrides"],
-            json!({"kv_mode": "q8", "kv_k": null, "kv_v": null, "spec": "mtp"})
+            json!({"kv_mode": "q8", "kv_k": null, "kv_v": null, "spec": "mtp", "tp": null})
         );
     }
 

@@ -276,6 +276,23 @@ class Gfx1100FlashNext(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 run_build(root / "p.tsv", "--model", str(model), "--walk", f"ar={walk}", "--accept-partial")
 
+    def test_walks_at_two_context_ceilings_need_union_max_seq_and_take_the_largest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            model = root / "fn.hfq"
+            write_hfqm(model, 16, TRUNK)
+            low = make_walk(root, "low", "ar", model, [self.STATE, *audit("gfx1100", [("add", "add_f32"), ("s1", "k_s1")], [])],
+                            max_seq=32768)
+            high = make_walk(root, "high", "ar", model, [self.STATE, *audit("gfx1100", [("add", "add_f32")], [])], max_seq=262144)
+            with self.assertRaises(SystemExit):
+                run_build(root / "p.tsv", "--model", str(model), "--walk", f"ar={low}", "--walk", f"ar={high}")
+            text = run_build(root / "p.tsv", "--model", str(model), "--walk", f"ar={low}", "--walk", f"ar={high}",
+                             "--union-max-seq")
+            lines = text.splitlines()
+            self.assertIn("#! max_seq 262144", lines)
+            self.assertIn("# max_seq union of walks at [32768, 262144]", lines)
+            self.assertIn("ar\thip\ts1\tk_s1\t" + HIP_SHA, lines, "the lower walk's kernels join the closure")
+
     def test_plan_axes_open_seal_and_trace_rows(self):
         spec = importlib.util.spec_from_file_location("route_plan_trace_rows",
                                                       pathlib.Path(__file__).with_name("route_plan_trace_rows.py"))

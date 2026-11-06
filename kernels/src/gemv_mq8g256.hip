@@ -4,6 +4,16 @@
 
 #include <hip/hip_runtime.h>
 
+// RDNA3/RDNA4 have no dot1-insts: `__builtin_amdgcn_sdot4` does not compile for them (this kernel never built
+// on gfx1100/gfx1201 before). The signed x signed int32 dot is `sudot4` with both operands signed: the same
+// exact integer result (|dot| <= 4*128*128 per instruction), so every call below stays `sdot4`.
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || \
+    defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__) || \
+    defined(__gfx1200__) || defined(__gfx1201__)
+#define __builtin_amdgcn_sdot4(a, b, c, clamp) \
+    __builtin_amdgcn_sudot4(true, (a), true, (b), (c), (clamp))
+#endif
+
 // MagnumQuant MQ8 GEMV: FWHT-rotated symmetric INT8 with dp4a.
 // x_rot is PRE-ROTATED and PRE-QUANTIZED to INT8 by the caller.
 // Inner loop uses v_dot4_i32_i8 (sdot4) for 4x VALU throughput vs FP32.
@@ -76,7 +86,7 @@ extern "C" __global__ void gemv_mq8g256(
             int xp1 = *(const int*)(xb + w_off + 4); \
             int dot = __builtin_amdgcn_sdot4(wp0, xp0, 0, false); \
             dot = __builtin_amdgcn_sdot4(wp1, xp1, dot, false); \
-            acc_var += ws * xs * (float)dot; \
+            acc_var = __builtin_fmaf(ws * xs, (float)dot, acc_var); \
         }
 
         LOAD_DP4A(0, acc0) LOAD_DP4A(1, acc1) LOAD_DP4A(2, acc2) LOAD_DP4A(3, acc3)
@@ -96,7 +106,7 @@ extern "C" __global__ void gemv_mq8g256(
         int xp1 = *(const int*)(xb + w_off + 4);
         int dot = __builtin_amdgcn_sdot4(wp0, xp0, 0, false);
         dot = __builtin_amdgcn_sdot4(wp1, xp1, dot, false);
-        acc0 += ws * xs * (float)dot;
+        acc0 = __builtin_fmaf(ws * xs, (float)dot, acc0);
     }
 
     float acc = (acc0+acc1)+(acc2+acc3);

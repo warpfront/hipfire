@@ -1,0 +1,15 @@
+{
+  "schema": "pm.selector_receipt.v1",
+  "constant": "RDA_WAVE_MIN_ROWS",
+  "value": 64,
+  "covers": true,
+  "arch": "gfx1201",
+  "card": "R9700 (fabric j5910, confounded=false)",
+  "summary": "Node bench rda_layer_node (one RDA layer incl. the chunked core, 3 fresh processes per arm alternating, bit-identical outputs): the fused conv+prepare / wave gated-norm layer is faster than the incumbent at every measured row count at or above the floor, ms per layer rows 64/128/192/256/384/512/1024/2048/4096/16384: incumbent 0.122/0.172/0.223/0.286/0.429/0.604/1.232/2.439/4.841/19.34, fused 0.083/0.132/0.172/0.232/0.367/0.461/0.923/1.806/3.610/14.58 (-32% ... -25%). The floor 64 is the chunked core's own admission floor (GATED_DELTA_VECTOR_CHUNK_MIN_ROWS); decode and speculative verify rows (< 64, or a taped verify) keep the incumbent launches, which the digest check shows are unchanged at rows 1/2/3/16/63.",
+  "records": [
+    {
+      "path": "receipts/selectors/evidence/rda_wave_min_rows_gfx1201.txt",
+      "sha256": "0a276614ba5b6e0d773b985896e120eff99c619c7d5b906fb649ffcf9c86c08c"
+    }
+  ]
+}

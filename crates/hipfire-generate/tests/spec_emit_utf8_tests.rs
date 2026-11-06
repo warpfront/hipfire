@@ -45,6 +45,7 @@ fn ctx(tokenizer: &Tokenizer) -> SpecEmitCtx<'_> {
         tools: None,
         enable_grammar: false,
         stop: Vec::new(),
+        min_tokens: 0,
         max_think: 0,
         max_tokens: 256,
         assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,

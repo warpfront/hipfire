@@ -107,6 +107,7 @@ pub enum Form {
     Smem,
     Vop1,
     Vop1Dpp,
+    Vop1Dpp8,
     Vop2,
     Vop2Dpp,
     Vopc,
@@ -922,10 +923,13 @@ impl Program {
                     })?;
                 let matches_term = match &block.term {
                     Terminator::EndPgm => name == "s_endpgm",
-                    Terminator::Jump(_) => name == "s_branch",
+                    Terminator::Jump(_) => name == "s_branch" || name == "s_setpc_b64",
                     Terminator::Branch { .. } => name.starts_with("s_cbranch_"),
                     Terminator::FallThrough => {
-                        name != "s_endpgm" && name != "s_branch" && !name.starts_with("s_cbranch_")
+                        name != "s_endpgm"
+                            && name != "s_branch"
+                            && name != "s_setpc_b64"
+                            && !name.starts_with("s_cbranch_")
                     }
                     Terminator::Unreachable => true,
                 };

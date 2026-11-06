@@ -874,7 +874,8 @@ pub(crate) fn layer_major_receipt(inputs: &ReceiptInputs<'_>) -> Value {
         .reports
         .first()
         .map_or(0, |report| report.sweep_bytes);
-    json!({
+    let device_copied = sum_u(&|r| r.stats.device_payload_bytes);
+    let mut receipt = json!({
         "schema": RECEIPT_SCHEMA,
         "route": "layer-major",
         "selected_by": mode_label(inputs.mode),
@@ -933,7 +934,14 @@ pub(crate) fn layer_major_receipt(inputs: &ReceiptInputs<'_>) -> Value {
             "method": "hipMemGetInfo_post_request_sample",
             "continuous_peak": false,
         },
-    })
+    });
+    // Only a tier load (HIPFIRE_QWEN4_S1_TIER) copies any hot expert device-to-device: the
+    // key is absent otherwise, so every other receipt is byte for byte as before. The link
+    // bytes of a tier request are `submitted_bytes - device_copied_bytes`.
+    if device_copied > 0 {
+        receipt["device_copied_bytes"] = json!(device_copied);
+    }
+    receipt
 }
 
 /// The C2 `moe_iu4.tiles` counts of a request's tiles by dispatch class `[aggregate_iu4,
@@ -1998,8 +2006,10 @@ pub(crate) fn bind_at_load(
     let sp_bind = if sp_knob {
         let pages = plan.spec.as_ref().map_or(0, |spec| spec.pages());
         // The F16 `Aggregate` route dry run: only a hybrid SP on a symmetric-IU4 profile needs
-        // it (its windows run the F16 route); every other load is ready by construction.
-        let f16_route_ready = if hybrid_knob {
+        // it (its windows run the F16 route); every other load is ready by construction (a
+        // slab profile's hybrid windows keep the slab route and never run the F16 arm).
+        let f16_route_ready = if hybrid_knob && profile.geometry.route != dsp::WindowRoute::SlabIu4
+        {
             match sp_f16_route_probe(&*forward, &*bundle, gpu, &profile) {
                 Ok(()) => true,
                 Err(why) => {
@@ -3195,6 +3205,7 @@ fn with_tile_frames<T>(
                 &forward.decode_q8,
                 tile.routing.route_rows,
                 geo.few_row_limit,
+                rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
                 None,
             )?;
             if let Qwen4FfnBinding::Moe(moe) = &mut description.ffn {
@@ -3240,6 +3251,8 @@ fn with_tile_frames<T>(
             start_position: tile.position,
             streams: tile_streams,
             gates: &forward.scratch.hc_gates,
+            ffn_partial: false,
+            sp: None,
         })
         .collect();
     let frames: Vec<TileFrame<'_>> = (0..tiles.len())
@@ -5308,7 +5321,12 @@ fn resident_check_layer(forward: &Qwen4GpuForward, geo: &RunGeo, what: &str) -> 
                 .moe
                 .get(layer)
                 .and_then(Option::as_ref)
-                .is_some_and(|runtime| !runtime.s1_host_mapped() && runtime.s1_layer_check().is_ok())
+                .is_some_and(|runtime| {
+                    // A tier layer's own pointer tables are an all-expert binding too (hot
+                    // experts in VRAM, cold ones read through their mapped alias).
+                    (!runtime.s1_host_mapped() || runtime.s1_is_tier())
+                        && runtime.s1_layer_check().is_ok()
+                })
         })
         .ok_or_else(|| {
             invalid(format!(
@@ -7380,6 +7398,9 @@ mod slowlink_overlap {
         }
         fn copy_payload(&mut self, _: &(), _: usize, _: usize, _: usize, len: usize) -> R<()> {
             record(|log| log.payload_bytes += len as u64);
+            Ok(())
+        }
+        fn copy_payload_device(&mut self, _: &(), _: usize, _: usize, _: usize, _: usize) -> R<()> {
             Ok(())
         }
         fn copy_zero(&mut self, _: &(), _: usize, _: usize, _: usize) -> R<()> {

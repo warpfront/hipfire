@@ -62,6 +62,15 @@ impl Gfx12Sgpr {
         self.vcc_salu = false;
         self.vcc_valu = false;
     }
+    /// Assume every SGPR VALU-read and every write pending a guard (after foreign
+    /// code the builder did not track): the next reads take their waits.
+    pub(crate) fn saturate(&mut self) {
+        self.tracked.fill(true);
+        self.salu.fill(true);
+        self.valu.fill(true);
+        self.vcc_salu = true;
+        self.vcc_valu = true;
+    }
     pub fn step(
         &mut self,
         pipe: Pipeline,
@@ -242,6 +251,10 @@ impl DelayAlu {
     const TRANS: [&'static str; 7] = [
         "v_rcp_", "v_sqrt_", "v_rsq_", "v_sin_", "v_cos_", "v_exp_", "v_log_",
     ];
+    /// Destinations of the last (up to four) VALU instructions, newest first.
+    pub fn recent_defs(&self) -> Vec<Vec<RegRef>> {
+        self.recent.iter().rev().map(|(d, _)| d.clone()).collect()
+    }
     /// A branch target may be reached from another stream: forget producers.
     pub fn label(&mut self) {
         self.recent.clear()

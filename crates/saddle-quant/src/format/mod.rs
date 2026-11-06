@@ -65,6 +65,10 @@ pub enum QuantType {
     Mq3G256V2 = 49,
     Mq2G256V2 = 50,
     Mq2G256LloydU = 51,
+    /// HC8E4M3Row (qt=57): wire constant, Qwen4 HC8 sidecar only. Swizzled OCP
+    /// E4M3 bytes (`m*k`) then f32 per-row scales (`4*m`); see
+    /// `docs/quant-formats/hc8-e4m3-row.md`.
+    Hc8E4m3Row = 57,
     /// MQ3-I4 gate/up (qt=131): 3-bit planar codes + per-128 f16 scales, R256 FWHT.
     /// Typed-qwen4 expert-slab only; no GPU kernel yet.
     Mq3I4G128R256 = 131,
@@ -118,6 +122,7 @@ impl QuantType {
             49 => Mq3G256V2,
             50 => Mq2G256V2,
             51 => Mq2G256LloydU,
+            57 => Hc8E4m3Row,
             131 => Mq3I4G128R256,
             132 => Mq3I4G128R128,
             133 => Mq2I4G128R256,

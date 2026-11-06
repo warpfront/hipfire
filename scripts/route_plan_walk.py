@@ -12,7 +12,7 @@ route plan (crates/rdna-compute/src/route_plans/). Never used by product loading
 
 usage: route_plan_walk.py --run DIR --daemon BIN --model M --route ar|mtp
                           [--prompt-dir DIR] [--max-seq N] [--env K=V ...]
-                          [--profile full|xtx-fn-bounded] [--load-param K=JSON ...]
+                          [--profile full|xtx-fn-bounded|xtx-fn-product] [--load-param K=JSON ...]
 The environment (device selection, HIPFIRE_PLE_FORMAT, ...) is inherited; the
 run gets its own HOME/HIPFIRE_HOME, lock dir and an empty kernel cache (`--env
 HIPFIRE_KERNEL_CACHE=DIR` points it at a warm one). Walks of Qwen3.5
@@ -22,6 +22,8 @@ Flash-Next walks only need the older `qwen4 state:` line.
 `--profile xtx-fn-bounded` is the gfx1100 Flash-Next walk: one fabric job's worth of requests
 (every generate decodes at most 8 tokens; prompts from short rows to the 8K / 16.9K / 32K depth
 prompts in `--prompt-dir`), instead of the full walk's ~640 requests and 128K prompt.
+`--profile xtx-fn-product` is the bounded plan plus the SP / S1 row classes of the 0.4.5 single-card product
+(PRODUCT_EXTRA_WORDS: 96..5000 words, the 1105-row prompt class included), still at most 8 decoded tokens per request.
 `--load-param K=JSON` adds a key to the `load` request's params (e.g. kv_mode='"q8"').
 The daemon runs in its own process group and is killed when `--timeout` expires or the walk exits
 abnormally, so a hung or aborted walk never leaves a daemon holding the card.
@@ -51,6 +53,10 @@ BOUNDED_WORDS = (1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 32, 48, 64, 128, 256, 384, 512
 # Depth prompts of the XtxGap PF screens (8,204 / 16,896 / 32,780 framed rows): one partial S1 window, exactly
 # one 16,896-row window, one full window plus a 15,884-row second window and tail.
 BOUNDED_DEPTH_PROMPTS = ("depth_8192.txt", "depth_16884.txt", "depth_32768.txt")
+# `--profile xtx-fn-product` adds, to the bounded plan, the prompt rows the 0.4.5 single-card product reaches that the
+# bounded sweep strides over: the short-prompt SP window range (5..5,376 rows; SP is default on for the slab route) at
+# several row classes (the 1105-row product prompt included), and the first multi-window S1 sizes.
+PRODUCT_EXTRA_WORDS = (96, 192, 320, 640, 900, 1000, 1093, 1300, 2000, 2600, 3300, 5000)
 
 SAMPLING = [
     {"temperature": 0},
@@ -129,6 +135,20 @@ def bounded_plan(prompt_dir):
         plan.append({"type": "generate", "prompt": (prompt_dir / name).read_text(),
                      "max_tokens": BOUNDED_LONG_TOKENS, "temperature": 0, "_name": name})
     assert all(m["max_tokens"] <= cap for m in plan if m["type"] == "generate")
+    return plan
+
+
+def product_plan(prompt_dir):
+    """`--profile xtx-fn-product`: the bounded plan plus the SP / S1 row classes of PRODUCT_EXTRA_WORDS, inserted before the
+    session resumes so the resume chain still follows its own short prompt. Every request still decodes at most
+    BOUNDED_MAX_TOKENS (BOUNDED_LONG_TOKENS from BOUNDED_LONG_WORDS words)."""
+    plan = bounded_plan(prompt_dir)
+    at = next(i for i, m in enumerate(plan) if m.get("_name") == "think-short")
+    extra = [{"type": "generate", "prompt": filler_words(n),
+              "max_tokens": BOUNDED_LONG_TOKENS if n >= BOUNDED_LONG_WORDS else BOUNDED_MAX_TOKENS,
+              "temperature": 0, "_words": n} for n in PRODUCT_EXTRA_WORDS]
+    plan[at:at] = extra
+    assert all(m["max_tokens"] <= BOUNDED_MAX_TOKENS for m in plan if m["type"] == "generate")
     return plan
 
 
@@ -214,7 +234,7 @@ def main():
                                                 / "benchmarks" / "prompts"))
     ap.add_argument("--max-seq", type=int, default=40960)
     ap.add_argument("--env", action="append", default=[])
-    ap.add_argument("--profile", choices=["full", "xtx-fn-bounded"], default="full",
+    ap.add_argument("--profile", choices=["full", "xtx-fn-bounded", "xtx-fn-product"], default="full",
                     help="full: the ~640-request walk of the gfx1201 plans; xtx-fn-bounded: the gfx1100 "
                          "Flash-Next walk (at most 8 decoded tokens per request, depth prompts from --prompt-dir)")
     ap.add_argument("--load-param", action="append", default=[], metavar="K=JSON",
@@ -233,6 +253,7 @@ def main():
     for name in ("home/.hipfire", "lockdir", "kcache"):
         (run / name).mkdir(parents=True)
     plan = (bounded_plan(pathlib.Path(a.prompt_dir)) if a.profile == "xtx-fn-bounded"
+            else product_plan(pathlib.Path(a.prompt_dir)) if a.profile == "xtx-fn-product"
             else walk_plan(a.route, pathlib.Path(a.prompt_dir), a.max_seq))
     env = os.environ.copy()
     env.update(HOME=str(run / "home"), HIPFIRE_HOME=str(run / "home" / ".hipfire"),

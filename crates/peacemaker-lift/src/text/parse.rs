@@ -84,7 +84,14 @@ pub fn parse_line(line: &str, arch: Arch) -> Result<Inst, ParseError> {
         return parse_vopd(x, y, arch);
     }
     let (name, rest) = split_name(line)?;
-    let row = find_row(name, arch)?;
+    let mut row = find_row(name, arch)?;
+    // DPP8 shares its mnemonic with DPP16; the `dpp8:[..]` modifier selects the encoding.
+    if row.form == Form::Vop1Dpp && rest.contains("dpp8:[") {
+        row = isa::table(arch)
+            .iter()
+            .find(|r| r.name == name && r.form == Form::Vop1Dpp8)
+            .ok_or_else(|| ParseError::UnknownMnemonic(name.into()))?;
+    }
     if row.form == Form::Sopp && row.name == "s_delay_alu" {
         return parse_delay(row, rest, arch);
     }
@@ -167,6 +174,12 @@ fn is_suffix_token(token: &str) -> bool {
         || token.starts_with("row_shl:")
         || token.starts_with("row_share:")
         || token.starts_with("row_xmask:")
+        || token.starts_with("row_shr:")
+        || token.starts_with("row_ror:")
+        || token == "row_mirror"
+        || token == "row_half_mirror"
+        || token.starts_with("quad_perm:[")
+        || token.starts_with("dpp8:[")
         || token.starts_with("row_mask:")
         || token.starts_with("bank_mask:")
         || token.starts_with("bound_ctrl:")
@@ -215,10 +228,12 @@ struct ParsedOperands {
     operands: Vec<Operand>,
     mods: Modifiers,
     literal: Option<u32>,
+    /// Lane selects of a `dpp8:[..]` modifier, three bits per lane, lane 0 lowest.
+    dpp8_sel: Option<u32>,
 }
 
 fn parse_single(row: &'static OpRow, rest: &str, arch: Arch) -> Result<Inst, ParseError> {
-    let slots = grammar_slots(row);
+    let mut slots = grammar_slots(row);
     let segments = if rest.is_empty() {
         Vec::new()
     } else {
@@ -245,11 +260,22 @@ fn parse_single(row: &'static OpRow, rest: &str, arch: Arch) -> Result<Inst, Par
             operand_texts.push(segment.clone());
         }
     }
+    // A VMEM atomic's `VDST@rtn` slot is spelled only in the returning form:
+    // `th:TH_ATOMIC_RETURN` on gfx12, the `glc` suffix on gfx11.
+    if row.grammar.contains("@rtn") {
+        let returns = if arch == Arch::Gfx1201 {
+            extras.iter().any(|text| text == "th:TH_ATOMIC_RETURN")
+        } else {
+            suffixes.iter().any(|text| text == "glc")
+        };
+        slots = row.slots(returns).collect();
+    }
     let mut parsed = ParsedOperands {
         arch,
         operands: Vec::new(),
         mods: Modifiers::default(),
         literal: None,
+        dpp8_sel: None,
     };
     // FMAMK/FMAAK spell their K constant as a fourth operand (`literal@last`
     // in the grammar): fmamk `D, S0, K, S1`, fmaak `D, S0, S1, K`. The constant
@@ -373,11 +399,27 @@ fn parse_single(row: &'static OpRow, rest: &str, arch: Arch) -> Result<Inst, Par
             ));
         }
         let operand = parse_extra(row, text)?;
-        // Only VBUFFER carries TH as an operand; GLOBAL keeps it in the cache policy.
-        if let Operand::CacheTh(th) = operand {
-            if row.form == Form::Vmem(peacemaker_ir::inst::VmemForm::Global) {
-                parsed.mods.cpol.th = th;
-                continue;
+        // Only VBUFFER carries TH and scope as operands; GLOBAL loads, stores
+        // and atomics keep them in the cache policy (`global_inv`/`global_wb`
+        // spell their scope as an operand).
+        if row.form == Form::Vmem(peacemaker_ir::inst::VmemForm::Global)
+            && !matches!(row.name, "global_inv" | "global_wb")
+        {
+            match operand {
+                Operand::CacheTh(th) => {
+                    parsed.mods.cpol.th = th;
+                    continue;
+                }
+                Operand::Scope(scope) => {
+                    parsed.mods.cpol.scope = match scope {
+                        CacheScope::Cu => 0,
+                        CacheScope::Se => 1,
+                        CacheScope::Dev => 2,
+                        CacheScope::Sys => 3,
+                    };
+                    continue;
+                }
+                _ => {}
             }
         }
         if !matches!(
@@ -426,6 +468,9 @@ fn parse_single(row: &'static OpRow, rest: &str, arch: Arch) -> Result<Inst, Par
         }
     }
     parse_suffixes(row, &suffixes, &mut parsed.mods)?;
+    if row.form == Form::Vop1Dpp8 {
+        parsed.dpp8_sel = Some(parse_dpp8(row, &suffixes)?);
+    }
     imply_op_sel(row, &suffixes, &mut parsed.mods, &parsed.operands)?;
     // Packed arithmetic and WMMA default high-half selects to all-ones;
     // mixed-precision FMA defaults them to zero. Explicit spellings win.
@@ -537,6 +582,7 @@ fn parse_waitcnt(row: &'static OpRow, rest: &str, arch: Arch) -> Result<Inst, Pa
         operands: vec![Operand::Imm(ImmField::Sopp(raw as i16))],
         mods: Modifiers::default(),
         literal: None,
+        dpp8_sel: None,
     };
     parse_wait_clause(row, &mut parsed)?;
     finish(row, parsed)
@@ -608,6 +654,7 @@ fn parse_delay(row: &'static OpRow, rest: &str, arch: Arch) -> Result<Inst, Pars
         operands: vec![Operand::Imm(ImmField::Sopp(raw as i16))],
         mods: Modifiers::default(),
         literal: None,
+        dpp8_sel: None,
     };
     parsed.mods.delay = Some(DelayAluHint {
         instid0: (raw & 15) as u8,
@@ -665,6 +712,7 @@ fn parse_wait_alu(row: &'static OpRow, rest: &str, arch: Arch) -> Result<Inst, P
                 ..Modifiers::default()
             },
             literal: None,
+            dpp8_sel: None,
         },
     )
 }
@@ -696,6 +744,7 @@ fn parse_vopd(x: &str, y: &str, arch: Arch) -> Result<Inst, ParseError> {
         operands: Vec::new(),
         mods: Modifiers::default(),
         literal: None,
+        dpp8_sel: None,
     };
     for (text, (slot, bits)) in x_texts.iter().zip(x_slots.iter()) {
         parsed
@@ -788,13 +837,6 @@ fn parse_operand(
         return Ok(Operand::Special(special));
     }
     if text == "off" {
-        if slot == "VADDR" && row.form == Form::Vmem(peacemaker_ir::inst::VmemForm::Buffer) {
-            return Ok(Operand::Reg(RegRef {
-                kind: Kind::V,
-                base: 0,
-                len: width,
-            }));
-        }
         return Ok(Operand::Vmem(VmemToken::Off));
     }
     if text == "offen" {
@@ -1048,6 +1090,46 @@ fn parse_scope(text: &str) -> Option<CacheScope> {
     }
 }
 
+/// gfx12 `s_sendmsg_rtn_*` message ids and their llvm-mc `MSG_RTN_*` names.
+pub(super) const GFX12_RTN_MSGS: [(u8, &str); 8] = [
+    (128, "MSG_RTN_GET_DOORBELL"),
+    (129, "MSG_RTN_GET_DDID"),
+    (130, "MSG_RTN_GET_TMA"),
+    (131, "MSG_RTN_GET_REALTIME"),
+    (132, "MSG_RTN_SAVE_WAVE"),
+    (133, "MSG_RTN_GET_TBA"),
+    (134, "MSG_RTN_GET_TBA_TO_PC"),
+    (135, "MSG_RTN_GET_SE_AID_ID"),
+];
+
+/// gfx12 hardware-register ids and the names llvm-mc prints for them (ids it
+/// has no name for print numerically).
+pub(super) const GFX12_HWREGS: [(u8, &str); 23] = [
+    (1, "HW_REG_WAVE_MODE"),
+    (2, "HW_REG_WAVE_STATUS"),
+    (4, "HW_REG_WAVE_STATE_PRIV"),
+    (5, "HW_REG_WAVE_GPR_ALLOC"),
+    (6, "HW_REG_WAVE_LDS_ALLOC"),
+    (7, "HW_REG_IB_STS"),
+    (10, "HW_REG_PERF_SNAPSHOT_DATA"),
+    (11, "HW_REG_PERF_SNAPSHOT_PC_LO"),
+    (12, "HW_REG_PERF_SNAPSHOT_PC_HI"),
+    (15, "HW_REG_PERF_SNAPSHOT_DATA1"),
+    (16, "HW_REG_PERF_SNAPSHOT_DATA2"),
+    (17, "HW_REG_WAVE_EXCP_FLAG_PRIV"),
+    (18, "HW_REG_WAVE_EXCP_FLAG_USER"),
+    (19, "HW_REG_WAVE_TRAP_CTRL"),
+    (20, "HW_REG_WAVE_SCRATCH_BASE_LO"),
+    (21, "HW_REG_WAVE_SCRATCH_BASE_HI"),
+    (23, "HW_REG_WAVE_HW_ID1"),
+    (24, "HW_REG_WAVE_HW_ID2"),
+    (26, "HW_REG_WAVE_SCHED_MODE"),
+    (29, "HW_REG_SHADER_CYCLES_LO"),
+    (30, "HW_REG_SHADER_CYCLES_HI"),
+    (31, "HW_REG_WAVE_DVGPR_ALLOC_LO"),
+    (32, "HW_REG_WAVE_DVGPR_ALLOC_HI"),
+];
+
 fn parse_sendmsg(text: &str) -> Result<Option<Msg>, ParseError> {
     if text == "sendmsg(MSG_DEALLOC_VGPRS)" {
         return Ok(Some(Msg { id: 3, op: 0 }));
@@ -1058,8 +1140,11 @@ fn parse_sendmsg(text: &str) -> Result<Option<Msg>, ParseError> {
     else {
         return Ok(None);
     };
-    if inner == "MSG_RTN_GET_REALTIME" {
-        return Ok(Some(Msg { id: 131, op: 0 }));
+    if let Some((id, _)) = GFX12_RTN_MSGS
+        .iter()
+        .find(|(_, name)| *name == inner.trim())
+    {
+        return Ok(Some(Msg { id: *id, op: 0 }));
     }
     let (id, op) = inner
         .split_once(',')
@@ -1096,7 +1181,10 @@ fn parse_hwreg(text: &str, arch: Arch) -> Result<Option<HwReg>, ParseError> {
             "HW_REG_WAVE_HW_ID2" | "HW_REG_HW_ID2" => Some(24),
             "HW_REG_SHADER_CYCLES_LO" => Some(29),
             "HW_REG_SHADER_CYCLES_HI" => Some(30),
-            _ => None,
+            _ => GFX12_HWREGS
+                .iter()
+                .find(|(_, known)| *known == name)
+                .map(|(id, _)| *id),
         }
     } else {
         match name {
@@ -1149,6 +1237,13 @@ fn parse_extra(row: &OpRow, text: &str) -> Result<Operand, ParseError> {
     }
     if let Some(th) = text.strip_prefix("th:") {
         let global = row.form == Form::Vmem(peacemaker_ir::inst::VmemForm::Global);
+        if global && row.name.starts_with("global_atomic") {
+            // gfx12 atomics: TH bit 0 selects the returning form.
+            return match th {
+                "TH_ATOMIC_RETURN" => Ok(Operand::CacheTh(1)),
+                _ => Err(bad_operand(row.name, text, "bad cache TH")),
+            };
+        }
         let load =
             row.name.starts_with("buffer_load") || global && row.name.starts_with("global_load");
         let store =
@@ -1387,6 +1482,39 @@ fn parse_suffixes(
                 .as_mut()
                 .ok_or_else(|| bad_operand(row.name, suffix, "DPP control on non-DPP row"))?
                 .ctrl = 0x160 + mask;
+        } else if let Some(value) = suffix.strip_prefix("row_shr:") {
+            let shift = parse_number(value, row.name, suffix)?;
+            if !(1..=15).contains(&shift) {
+                return Err(bad_operand(row.name, suffix, "DPP shift outside 1..=15"));
+            }
+            set_dpp_ctrl(row, mods, suffix, 0x110 + shift)?;
+        } else if let Some(value) = suffix.strip_prefix("row_ror:") {
+            let shift = parse_number(value, row.name, suffix)?;
+            if !(1..=15).contains(&shift) {
+                return Err(bad_operand(row.name, suffix, "DPP rotate outside 1..=15"));
+            }
+            set_dpp_ctrl(row, mods, suffix, 0x120 + shift)?;
+        } else if suffix == "row_mirror" {
+            set_dpp_ctrl(row, mods, suffix, 0x140)?;
+        } else if suffix == "row_half_mirror" {
+            set_dpp_ctrl(row, mods, suffix, 0x141)?;
+        } else if let Some(list) = suffix.strip_prefix("quad_perm:[") {
+            let lanes = parse_lane_list(row, suffix, list, 4)?;
+            set_dpp_ctrl(
+                row,
+                mods,
+                suffix,
+                lanes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, lane)| u16::from(*lane) << (2 * i))
+                    .sum(),
+            )?;
+        } else if suffix.starts_with("dpp8:[") {
+            // The lane selects live in the row's `dpp8_sel` field (see `parse_dpp8`).
+            if row.form != Form::Vop1Dpp8 {
+                return Err(bad_operand(row.name, suffix, "dpp8 on a non-DPP8 row"));
+            }
         } else if let Some(value) = suffix.strip_prefix("row_mask:") {
             let mask = parse_number(value, row.name, suffix)?;
             if mask > 15 {
@@ -1601,6 +1729,65 @@ fn parse_wait_clause(row: &OpRow, parsed: &mut ParsedOperands) -> Result<(), Par
     Ok(())
 }
 
+/// Set the DPP16 control of a DPP row.
+fn set_dpp_ctrl(
+    row: &OpRow,
+    mods: &mut Modifiers,
+    suffix: &str,
+    ctrl: u16,
+) -> Result<(), ParseError> {
+    mods.dpp
+        .as_mut()
+        .ok_or_else(|| bad_operand(row.name, suffix, "DPP control on non-DPP row"))?
+        .ctrl = ctrl;
+    Ok(())
+}
+
+/// A bracketed list of `count` lane selects, each `0..count` (`quad_perm:[a,b,c,d]`, `dpp8:[a,..,h]`).
+fn parse_lane_list(
+    row: &OpRow,
+    suffix: &str,
+    list: &str,
+    count: u8,
+) -> Result<Vec<u8>, ParseError> {
+    let list = list
+        .strip_suffix(']')
+        .ok_or_else(|| bad_operand(row.name, suffix, "unterminated lane list"))?;
+    let lanes = list
+        .split(',')
+        .map(|lane| {
+            lane.trim()
+                .parse::<u8>()
+                .ok()
+                .filter(|lane| *lane < count)
+                .ok_or_else(|| bad_operand(row.name, suffix, "lane select out of range"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if lanes.len() != usize::from(count) {
+        return Err(bad_operand(
+            row.name,
+            suffix,
+            format!("expected {count} lane selects"),
+        ));
+    }
+    Ok(lanes)
+}
+
+/// The `dpp8:[..]` lane selects, three bits per lane starting at lane 0, shifted into word-1 bit 8 (`dpp8_sel`).
+fn parse_dpp8(row: &OpRow, suffixes: &[String]) -> Result<u32, ParseError> {
+    let suffix = suffixes
+        .iter()
+        .find(|s| s.starts_with("dpp8:["))
+        .ok_or_else(|| bad_operand(row.name, "", "DPP8 row needs its dpp8:[..] lane selects"))?;
+    let lanes = parse_lane_list(row, suffix, &suffix["dpp8:[".len()..], 8)?;
+    Ok(lanes
+        .iter()
+        .enumerate()
+        .map(|(i, lane)| u32::from(*lane) << (3 * i))
+        .sum::<u32>()
+        << 8)
+}
+
 /// Bare numbers for delay/wait_alu lines: hex, negative hex, or decimal.
 fn parse_number(text: &str, name: &str, operand: &str) -> Result<u16, ParseError> {
     let text = text.trim();
@@ -1693,6 +1880,13 @@ fn push_rule(
         "op_sel_hi" => u32::from(parsed.mods.op_sel_hi),
         "global_scope" => u32::from(parsed.mods.cpol.scope) << 18,
         "dpp_fi" => 0,
+        "dpp8_sel" => parsed.dpp8_sel.ok_or_else(|| {
+            bad_operand(
+                row.name,
+                "dpp8_sel",
+                "DPP8 row needs its dpp8:[..] lane selects",
+            )
+        })?,
         "global_th" => u32::from(parsed.mods.cpol.th) << 20,
         "global_nv" | "global_sve" => 0,
         "vbuffer_format" => 0x800000,

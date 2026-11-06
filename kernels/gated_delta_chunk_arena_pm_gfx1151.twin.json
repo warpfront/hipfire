@@ -1,0 +1,167 @@
+{
+  "module": "gated_delta_chunk_arena_pm_gfx1151",
+  "arch": "gfx1151",
+  "reports": [
+    {
+      "abi": {
+        "args": [
+          {
+            "name": "",
+            "offset": 0,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 8,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 16,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 24,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 32,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 40,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 48,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 56,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 64,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 72,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 76,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 80,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 84,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 88,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 92,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 96,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 100,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          }
+        ],
+        "compared_to_incumbent": true,
+        "incumbent_sha256": "b88f0d60c14e70cbe36e0be9830c6c05c5f792aafcc9863e30fafacd71b56650",
+        "incumbent_symbol": "gated_delta_chunk_gate_wmma_arena",
+        "kernarg_segment_size": 104
+      },
+      "arch": "gfx1151",
+      "elf_bytes": 27920,
+      "elf_sha256": "ea1ddac1c2b3053ab920a00df19744a176057f3a76c2f72f932dc5b766d7bf26",
+      "hazards": {
+        "advisory": 190,
+        "blocking": 0,
+        "checked": true,
+        "findings": 190,
+        "pm_ir_obligations": 0
+      },
+      "hxaco_bytes": 32016,
+      "hxaco_sha256": "ccaadf100fda128b575d01e174cb47ba6ddd974e90c8ceb2ec375866bf2b38dc",
+      "kernel": "gated_delta_chunk_gate_wmma_arena_pm_gfx1151",
+      "lds": 31168,
+      "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+      "rsrc2": 132,
+      "scratch": 0,
+      "sgprs": 80,
+      "text_bytes": 22904,
+      "text_sha256": "511a65b5f2e4c3718c1dd6201382e35887a161df1f0039be5f92d11a662777c5",
+      "user_sgprs": 2,
+      "vgprs": 240,
+      "wavefront_size": 32
+    }
+  ],
+  "judged_text_check": [
+    {
+      "symbol": "gated_delta_chunk_gate_wmma_arena_pm_gfx1151",
+      "judged_candidate": "incumbent-hipcc",
+      "judged_code_sha256": "511a65b5f2e4c3718c1dd6201382e35887a161df1f0039be5f92d11a662777c5",
+      "twin_text_sha256": "511a65b5f2e4c3718c1dd6201382e35887a161df1f0039be5f92d11a662777c5",
+      "equal": true
+    }
+  ]
+}

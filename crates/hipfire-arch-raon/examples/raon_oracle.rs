@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
-//! Raon oracle CLI (PLAN §6.2): module | state | logits | bench. Owner: slice O.
+//! Raon oracle CLI (PLAN §6.2): module | state | logits | generate | bench | session | railgun-state. Owner: slice O.
 //!
 //! This file is argument parsing, dispatch and verdict logic only. Each
 //! subcommand calls `raon_oracle::<module>::run(fixtures, &opts)` in
@@ -11,10 +11,16 @@
 //!
 //! ```text
 //! raon_oracle module --module mhc|rda|mla|moe|norm|head --fixtures DIR --out FILE [--negative] [--k v ...]
-//! raon_oracle state  --model M --tokens F --mode serial|batched|graph|state-only --out FILE [--k v ...]
+//! raon_oracle state  --model M --tokens F --mode serial|batched|batched-fp|graph|state-only --out FILE [--k v ...]
 //! raon_oracle logits --model M --tokens F (--teacher F | --kld REF.kldref.bin) --out FILE [--k v ...]
 //! raon_oracle generate --model M [--k v ...]   (generate::run streams text to stdout, exit 0/1; `--json 1` also prints the result object; no --out)
 //! raon_oracle bench  --model M --pp 512,8192 --tg 128 --out FILE [--k v ...]
+//! raon_oracle session --model M --tokens F --out FILE [--split N] [--decode 16] [--budget-mib 4096] [--prefill serial|batched] [--k v ...]
+//!     (a session-cache hit is bit-identical to a cold prefill: resident follow-up, pool restore after an unrelated prompt, budget; per-case verdict)
+//! raon_oracle railgun-state --model M --arm graph|railgun [--corpus DIR] --ctx 127,128,129 --steps 256 --out FILE [--k v ...]
+//! raon_oracle railgun-state --compare A.json B.json [--flip-byte STEP:TENSOR:OFFSET]
+//!     (product railgun state oracle: one arm per fresh process, then a byte-for-byte comparison of the dumps;
+//!      railgun_state::main owns its arguments, verdict, JSON and exit status; see its module docs)
 //! ```
 //!
 //! `--negative` points the module at `<fixtures>/negative_controls` and
@@ -35,7 +41,9 @@ mod raon_oracle {
     pub mod mhc;
     pub mod mla;
     pub mod moe;
+    pub mod railgun_state;
     pub mod rda;
+    pub mod session;
     pub mod state;
 }
 
@@ -43,11 +51,14 @@ type RunFn = fn(&Path, &BTreeMap<String, String>) -> Result<Value, String>;
 
 const USAGE: &str = "usage:
   raon_oracle module --module mhc|rda|mla|moe|norm|head --fixtures DIR --out FILE [--negative]
-  raon_oracle state  --model M --tokens F --mode serial|batched|graph|state-only --out FILE
+  raon_oracle state  --model M --tokens F --mode serial|batched|batched-fp|graph|state-only --out FILE
   raon_oracle logits --model M (--tokens F --teacher F | --kld REF.kldref.bin) --out FILE
   raon_oracle generate --model M ... (streams text to stdout; no --out)
   raon_oracle bench  --model M --pp 512,8192 --tg 128 [--reps 3] [--warmup 1] [--profile] --out FILE
   raon_oracle bench  --bucket-json PROFILE.json --out FILE   (CPU-only re-bucketing of a saved --profile result)
+  raon_oracle session --model M --tokens F [--split N] [--decode 16] [--budget-mib 4096] [--prefill serial|batched] --out FILE
+  raon_oracle railgun-state --model M --arm graph|railgun [--corpus DIR] --ctx 127,128,129 --steps 256 --out FILE (see railgun-state module docs)
+  raon_oracle railgun-state --compare GRAPH.json RAILGUN.json [--flip-byte STEP:TENSOR:OFFSET]
 (extra `--key value` pairs are forwarded to the module as opts)";
 
 struct Cli {
@@ -61,7 +72,7 @@ fn parse_cli() -> Result<Cli, String> {
     let sub = argv.first().cloned().ok_or("missing subcommand")?;
     if !matches!(
         sub.as_str(),
-        "module" | "state" | "logits" | "bench" | "generate"
+        "module" | "state" | "logits" | "bench" | "generate" | "session"
     ) {
         return Err(format!("unknown subcommand `{sub}`"));
     }
@@ -230,8 +241,13 @@ fn run(cli: &Cli) -> Result<(bool, Value), String> {
             require(&cli.opts, "model")?;
             require(&cli.opts, "tokens")?;
             let mode = require(&cli.opts, "mode")?;
-            if !matches!(mode, "serial" | "batched" | "graph" | "state-only") {
-                return Err(format!("--mode `{mode}`: serial|batched|graph|state-only"));
+            if !matches!(
+                mode,
+                "serial" | "batched" | "batched-fp" | "graph" | "state-only"
+            ) {
+                return Err(format!(
+                    "--mode `{mode}`: serial|batched|batched-fp|graph|state-only"
+                ));
             }
             run_fn = raon_oracle::state::run;
             fixtures = PathBuf::from(cli.opts.get("fixtures").map(String::as_str).unwrap_or("."));
@@ -242,8 +258,13 @@ fn run(cli: &Cli) -> Result<(bool, Value), String> {
             if !cli.opts.contains_key("kld") {
                 require(&cli.opts, "tokens")?;
             }
-            if !cli.opts.contains_key("teacher") && !cli.opts.contains_key("kld") {
-                return Err("logits needs --teacher F or --kld REF.kldref.bin".into());
+            if !cli.opts.contains_key("teacher")
+                && !cli.opts.contains_key("kld")
+                && !cli.opts.contains_key("dump-layers")
+            {
+                return Err(
+                    "logits needs --teacher F, --dump-layers DIR or --kld REF.kldref.bin".into(),
+                );
             }
             run_fn = raon_oracle::logits::run;
             fixtures = PathBuf::from(cli.opts.get("fixtures").map(String::as_str).unwrap_or("."));
@@ -261,12 +282,25 @@ fn run(cli: &Cli) -> Result<(bool, Value), String> {
             fixtures = PathBuf::from(cli.opts.get("fixtures").map(String::as_str).unwrap_or("."));
             label = "bench".into();
         }
+        "session" => {
+            require(&cli.opts, "model")?;
+            require(&cli.opts, "tokens")?;
+            run_fn = raon_oracle::session::run;
+            fixtures = PathBuf::from(cli.opts.get("fixtures").map(String::as_str).unwrap_or("."));
+            label = "session".into();
+        }
         _ => unreachable!(),
     }
 
     let result = run_fn(&fixtures, &opts).map_err(|e| format!("{label}: {e}"))?;
     let (ok, lines) = match cli.sub.as_str() {
         "module" => case_verdict(&result, cli.negative),
+        "session" => {
+            // Per-case verdicts; the top-level `pass` must also be an explicit true.
+            let (ok, lines) = case_verdict(&result, false);
+            let top = result.get("pass").and_then(Value::as_bool) == Some(true);
+            (ok && top, lines)
+        }
         "bench" => {
             // A measurement probe: verdict is "ran without error and did not
             // self-report failure".
@@ -293,6 +327,23 @@ fn run(cli: &Cli) -> Result<(bool, Value), String> {
 }
 
 fn main() {
+    // `railgun-state` owns its arguments (two-path `--compare`, boolean `--boundaries`),
+    // verdict, JSON and exit status; it is not a `run_fn` module.
+    if std::env::args().nth(1).as_deref() == Some("railgun-state") {
+        let argv: Vec<String> = std::env::args().skip(2).collect();
+        match raon_oracle::railgun_state::main(&argv) {
+            Ok(true) => return,
+            Ok(false) => std::process::exit(1),
+            Err(raon_oracle::railgun_state::Exit::Usage(e)) => {
+                eprintln!("raon_oracle: {e}\n{}", raon_oracle::railgun_state::USAGE);
+                std::process::exit(2);
+            }
+            Err(raon_oracle::railgun_state::Exit::Fail(e)) => {
+                eprintln!("raon_oracle: ERROR {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     let cli = match parse_cli() {
         Ok(c) => c,
         Err(e) => {

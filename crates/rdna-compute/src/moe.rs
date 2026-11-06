@@ -10,6 +10,14 @@ use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::HipResult;
 
+/// `HIPFIRE_QWEN4_MOE_ROUTE_SCATTER` (developer, default off): the sealed grouped MoE route
+/// stage of a 1..=8 row exact-gfx1201 call runs the E512/top-10 router and the grouped scatter
+/// as one launch ([`Gpu::moe_route_scatter_top10_f32`]); the scatter stage then launches
+/// nothing. Read once.
+static QWEN4_MOE_ROUTE_SCATTER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_ROUTE_SCATTER", true)
+});
+
 /// The shared expert's BF16 activation carried by a fused MoE launch: the
 /// operands of [`Gpu::shared_expert_activation_bf16_f32`].
 pub struct SharedExpertActivation<'a> {
@@ -51,6 +59,8 @@ enum MoeDownKernel {
     /// gfx1151 X-in-LDS twin of [`Self::O8R16`] (four waves share each
     /// group's X).
     XsTwin,
+    /// DESIGN F1 drop-zero planar (`MQ4G128V2P`) twin of [`Self::O8R16`].
+    PlanarO8R16,
 }
 
 impl Gpu {
@@ -2276,6 +2286,93 @@ impl Gpu {
         result
     }
 
+    /// `moe_down_combine_top10_batched` with a fixed reduction partition: a
+    /// live slot whose expert `e % ranks != rank` contributes +0.0 in place
+    /// (its weight keeps its position; the zero term still folds in order).
+    /// `expert_outputs` is only read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down_combine_top10_batched_partitioned(
+        &mut self,
+        expert_outputs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        residual: &GpuTensor,
+        hidden: usize,
+        tokens: usize,
+        n_experts: usize,
+        rank: usize,
+        ranks: usize,
+    ) -> HipResult<()> {
+        const FUNC: &str = "moe_down_combine_top10_batched_partitioned";
+        if ranks == 0 || ranks > 4 || rank >= ranks {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{FUNC}: need 1 <= ranks <= 4 and rank < ranks (rank={rank} ranks={ranks})"
+                ),
+            ));
+        }
+        self.bind_thread()?;
+        require_span(
+            expert_outputs,
+            &[tokens, 10, hidden, 4],
+            "moe_down_combine_top10_batched_partitioned expert outputs",
+        )?;
+        self.ensure_kernel(
+            FUNC,
+            kernels::MOE_DOWN_COMBINE_TOP10_BATCHED_PARTITIONED_SRC,
+            FUNC,
+        )?;
+        let ep = expert_outputs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let rp = residual.buf.as_ptr();
+        let hv = hidden as i32;
+        let tv = tokens as i32;
+        let nx = n_experts as i32;
+        let rk = rank as i32;
+        let rs = ranks as i32;
+        let mut params = [
+            &ep as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &hv as *const _ as *mut c_void,
+            &tv as *const _ as *mut c_void,
+            &nx as *const _ as *mut c_void,
+            &rk as *const _ as *mut c_void,
+            &rs as *const _ as *mut c_void,
+        ];
+        let block = 64u32;
+        let grid_x = (hidden as u32).div_ceil(block);
+        let bytes = (tokens * 10 * hidden + 2 * tokens * 10 + 2 * tokens * hidden) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [grid_x, tokens as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(rp);
+                b.push_i32(hv);
+                b.push_i32(tv);
+                b.push_i32(nx);
+                b.push_i32(rk);
+                b.push_i32(rs);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Qwen4 grouped combine.  `inverse_perm` is the sealed flat-to-grouped
     /// map and invalid rows are ignored by the bounds-safe kernel.  The
     /// top-k expert IDs are consumed to reproduce indexed BF16 expert order.
@@ -2326,6 +2423,42 @@ impl Gpu {
         initial_zero: bool,
         n_experts: usize,
     ) -> HipResult<()> {
+        self.moe_down_combine_grouped_top10_bf16in_owned(
+            grouped_down,
+            inverse_perm,
+            topk_indices,
+            topk_weights,
+            residual,
+            order,
+            hidden,
+            grouped_rows,
+            tokens,
+            initial_zero,
+            n_experts,
+            None,
+        )
+    }
+
+    /// [`Gpu::moe_down_combine_grouped_top10_bf16in`] whose rank order is owner-masked
+    /// ([`Gpu::moe_combine_order_top10_owned`]) when `owners` is given: the foreign
+    /// experts' grouped rows are never read, each such rank adds a +0 BF16 row with its
+    /// own weight and rounding in the ten-term order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down_combine_grouped_top10_bf16in_owned(
+        &mut self,
+        grouped_down: &GpuTensor,
+        inverse_perm: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        residual: &GpuTensor,
+        order: &GpuTensor,
+        hidden: usize,
+        grouped_rows: usize,
+        tokens: usize,
+        initial_zero: bool,
+        n_experts: usize,
+        owners: Option<crate::hc_row_fold::CombineOwners<'_>>,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         if hidden % 8 != 0 || order.buf.size() < tokens * 10 * 8 {
             return Err(hip_bridge::HipError::new(
@@ -2356,46 +2489,22 @@ impl Gpu {
         } else {
             "moe_down_combine_grouped_top10_bf16in"
         };
-        for func in ["moe_combine_order_top10", combine] {
-            self.ensure_kernel(MODULE, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, func)?;
-        }
+        self.ensure_kernel(MODULE, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, combine)?;
+        self.moe_combine_order_top10_owned(
+            inverse_perm,
+            topk_indices,
+            topk_weights,
+            order,
+            grouped_rows,
+            tokens,
+            n_experts,
+            owners,
+        )?;
         let gp = grouped_down.buf.as_ptr();
-        let ip = inverse_perm.buf.as_ptr();
-        let tp = topk_indices.buf.as_ptr();
-        let wp = topk_weights.buf.as_ptr();
         let rp = residual.buf.as_ptr();
         let op = order.buf.as_ptr();
         let hv = hidden as i32;
-        let gr = grouped_rows as i32;
         let tv = tokens as i32;
-        let nx = n_experts as i32;
-        let mut params = [
-            &ip as *const _ as *mut c_void,
-            &tp as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &op as *const _ as *mut c_void,
-            &gr as *const _ as *mut c_void,
-            &tv as *const _ as *mut c_void,
-            &nx as *const _ as *mut c_void,
-        ];
-        self.launch_maybe_blob(
-            "moe_combine_order_top10",
-            [(tokens as u32).div_ceil(64), 1, 1],
-            [64, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ip);
-                b.push_ptr(tp);
-                b.push_ptr(wp);
-                b.push_ptr(op);
-                b.push_i32(gr);
-                b.push_i32(tv);
-                b.push_i32(nx);
-                b
-            },
-        )?;
         let mut params = [
             &gp as *const _ as *mut c_void,
             &op as *const _ as *mut c_void,
@@ -2513,8 +2622,20 @@ impl Gpu {
         block_m: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        const FUNC: &str = "moe_scatter_fused_top10";
-        self.ensure_kernel(FUNC, kernels::MOE_SCATTER_FUSED_TOP10_SRC, FUNC)?;
+        // `HIPFIRE_QWEN4_MOE_SCATTER_SCAN=0` (exact gfx1201): the serial thread-0
+        // prefix walk symbol of the same module; the default symbol scans
+        // block-wide (bytewise the same counts, offsets, tile ids, sorted slots
+        // and inverse).
+        let func: &str = if self.flags.qwen4_moe_scatter_serial_walk() {
+            "moe_scatter_fused_top10_serial"
+        } else {
+            "moe_scatter_fused_top10"
+        };
+        self.ensure_kernel(
+            "moe_scatter_fused_top10",
+            kernels::MOE_SCATTER_FUSED_TOP10_SRC,
+            func,
+        )?;
         let ip = topk_indices.buf.as_ptr();
         let cp = expert_token_counts.buf.as_ptr();
         let op = expert_offsets.buf.as_ptr();
@@ -2539,9 +2660,9 @@ impl Gpu {
         ];
         let lds_bytes = (num_experts * 4) as u32;
         let bytes = (total_slots + 2 * num_experts + 2 * total_slots + num_experts) * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", func, bytes);
         let result =
-            self.launch_maybe_blob(FUNC, [1, 1, 1], [256, 1, 1], lds_bytes, &mut params, || {
+            self.launch_maybe_blob(func, [1, 1, 1], [256, 1, 1], lds_bytes, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(ip);
                 b.push_ptr(cp);
@@ -2559,6 +2680,133 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// The fused route + scatter launch ([`Gpu::moe_route_scatter_top10_f32`]) is admitted for
+    /// this call: `HIPFIRE_QWEN4_MOE_ROUTE_SCATTER` set, exact gfx1201, the block-wide-scan
+    /// scatter (not the `HIPFIRE_QWEN4_MOE_SCATTER_SCAN=0` serial walk), eager launch (not
+    /// recording a replay, not capturing a graph), 1..=8 rows (one router workgroup) and the
+    /// fixed E512/top-10 grammar. Pure: reads flags and device state only.
+    pub fn moe_route_scatter_top10_admitted(
+        &self,
+        tokens: usize,
+        n_experts: usize,
+        k_top: usize,
+    ) -> bool {
+        *QWEN4_MOE_ROUTE_SCATTER
+            && self.arch_caps.is_gfx1201()
+            && !self.flags.qwen4_moe_scatter_serial_walk()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && (1..=8).contains(&tokens)
+            && n_experts == 512
+            && k_top == 10
+    }
+
+    /// Qwen4's E512/top-10 router and grouped scatter as ONE launch (single CTA of 256
+    /// threads: wave `w` routes token `w`, a workgroup barrier, then the scatter body over the
+    /// `tokens * 10` slots). Outputs are byte for byte those of
+    /// [`Gpu::moe_router_softmax_top10_f32`] followed by [`Gpu::moe_scatter_fused_top10`]
+    /// (`topk_idx`, `topk_w`, the five scatter tables, the router fault word); the router arm
+    /// is `moe_router_softmax_top10_f32_fast`'s. Returns `Ok(false)` and launches nothing when
+    /// [`Gpu::moe_route_scatter_top10_admitted`] is false: the caller runs the two-launch chain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_route_scatter_top10_f32(
+        &mut self,
+        logits: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        tokens: usize,
+        normalize_topk_prob: bool,
+        round_logits: bool,
+        layer: usize,
+        row_base: usize,
+        expert_token_counts: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        inverse_perm: &GpuTensor,
+        n_experts: usize,
+        k_top: usize,
+        grouped_rows: usize,
+        block_m: usize,
+    ) -> HipResult<bool> {
+        if !self.moe_route_scatter_top10_admitted(tokens, n_experts, k_top) {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        let func = "moe_route_scatter_top10_f32";
+        self.ensure_kernel(func, kernels::MOE_ROUTE_SCATTER_TOP10_F32_SRC, func)?;
+        let lp = logits.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let norm = i32::from(normalize_topk_prob);
+        let round = i32::from(round_logits);
+        let token_count = tokens as i32;
+        // Same fault word and (layer, row_base) stamping as the router launcher.
+        let fault = self.router_fault_ptr();
+        let layer_arg = layer as i32;
+        let row_base_arg = row_base as i32;
+        let cp = expert_token_counts.buf.as_ptr();
+        let op = expert_offsets.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let invp = inverse_perm.buf.as_ptr();
+        let gr = grouped_rows as i32;
+        let bm = block_m as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &norm as *const _ as *mut c_void,
+            &round as *const _ as *mut c_void,
+            &token_count as *const _ as *mut c_void,
+            &fault as *const _ as *mut c_void,
+            &layer_arg as *const _ as *mut c_void,
+            &row_base_arg as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &invp as *const _ as *mut c_void,
+            &gr as *const _ as *mut c_void,
+            &bm as *const _ as *mut c_void,
+        ];
+        // Scatter's dynamic histogram LDS (512 ints); the router rows are static LDS.
+        let lds_bytes = (n_experts * 4) as u32;
+        let bytes = (tokens * 512
+            + tokens * 10 * 2
+            + tokens * 10
+            + 2 * n_experts
+            + 2 * tokens * 10
+            + n_experts)
+            * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", func, bytes);
+        let result =
+            self.launch_maybe_blob(func, [1, 1, 1], [256, 1, 1], lds_bytes, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_i32(norm);
+                b.push_i32(round);
+                b.push_i32(token_count);
+                b.push_ptr(fault as *const c_void);
+                b.push_i32(layer_arg);
+                b.push_i32(row_base_arg);
+                b.push_ptr(cp);
+                b.push_ptr(op);
+                b.push_ptr(sp);
+                b.push_ptr(tp);
+                b.push_ptr(invp);
+                b.push_i32(gr);
+                b.push_i32(bm);
+                b
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result.map(|()| true)
     }
 
     /// Qwen4's independent top-10 gate/up unscatter entry.  The underlying
@@ -3098,24 +3346,84 @@ impl Gpu {
             &[batch_size, k_top, 4],
             "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded indices",
         )?;
+        // Exact gfx1201 symmetric experts, 1..=48 tokens: the int8 A8 routed down (one fold for
+        // every row count, bytewise equal to the grouped A8 entry); see qwen4_moe_down_a8.rs.
+        if self.qwen4_moe_down_a8_applies_indexed(m, k, batch_size, k_top) {
+            require_span(
+                expert_ptrs,
+                &[n_exp, 8],
+                "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded A8 pointer table",
+            )?;
+            return self.qwen4_moe_down_a8_indexed(
+                expert_ptrs,
+                topk_indices,
+                hidden_batch,
+                expert_outputs,
+                m,
+                k,
+                batch_size,
+                n_exp,
+                k_top,
+            );
+        }
         // K = 640 on exact gfx1151, eager: four weight rows per wave reuse the
         // pick's x (bitwise the one-row kernel).
         let r4 = k == 640
             && self.flags.qwen4_moe_down_r4_enabled()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode;
-        const MODULE: &str = "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded";
-        let (func, rows_per_block) = if r4 {
+        // DESIGN F1: drop-zero planar experts bind the planar twin module (same ABI, grid and
+        // arithmetic); the physical row-tile PM twin reads the shipped layout only.
+        let planar = self.mq4_experts_planar;
+        let (module, src, planar_func): (&'static str, &'static str, bool) = if planar {
             (
-                "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_k640_r4",
-                4,
+                "gemv_mq4g128v2p_moe_down_top10_indexed_batched_expanded",
+                kernels::GEMV_MQ4G128V2P_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC,
+                true,
             )
         } else {
-            (MODULE, 1)
+            (
+                "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded",
+                kernels::GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC,
+                false,
+            )
+        };
+        // HIPFIRE_QWEN4_MOE_DOWN_DNI: gfx1201 per-pick K = 640 down, <= 8 rows, eager: eight weight
+        // rows per wave, four waves per block (32 rows), software-pipelined loads (bitwise the r4
+        // kernel). Grid [M / 32, k_top, N], block 128.
+        let dni = r4
+            && self.moe_down_dni
+            && self.arch_caps.is_gfx1201()
+            && m % 32 == 0
+            && k == 640
+            && batch_size <= 8;
+        let (module, src) = if dni {
+            (
+                "gemv_mq4g128v2_moe_down_top10_dni",
+                kernels::GEMV_MQ4G128V2_MOE_DOWN_TOP10_DNI_GFX1201_SRC,
+            )
+        } else {
+            (module, src)
+        };
+        let (func, rows_per_block, block_threads) = match (dni, r4, planar_func) {
+            (true, _, true) => ("gemv_mq4g128v2p_moe_down_top10_dni_k640", 32, 128u32),
+            (true, _, false) => ("gemv_mq4g128v2_moe_down_top10_dni_k640", 32, 128u32),
+            (false, true, true) => (
+                "gemv_mq4g128v2p_moe_down_top10_indexed_batched_expanded_k640_r4",
+                4,
+                32u32,
+            ),
+            (false, true, false) => (
+                "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_k640_r4",
+                4,
+                32u32,
+            ),
+            (false, false, _) => (module, 1, 32u32),
         };
         // Only the frozen eager admission selects the physical eight-row PM
         // tile. Narrow, capture and generic prefill keep their original ABI.
         if batch_size > 8
+            && !planar
             && self.row_tile_twin_enabled(crate::gemv::WideTwinFamily::Mq4, batch_size)
         {
             if m != 2560 || k != 640 || k_top != 10 {
@@ -3148,6 +3456,7 @@ impl Gpu {
                 hip_bridge::HipError::new(1, "MQ4 down pointer-table count exceeds i32")
             })?;
             require_span(expert_ptrs, &[n_exp, 8], "MQ4 down row-tile pointer table")?;
+            crate::moe_entry_log::moe_entry_receipt("down", symbol, batch_size);
             let rows_val = i32::try_from(batch_size)
                 .map_err(|_| hip_bridge::HipError::new(1, "MQ4 down row count exceeds i32"))?;
             // Device indexing is signed i32, including the complete window.
@@ -3232,11 +3541,8 @@ impl Gpu {
             ))?;
             return Ok(());
         }
-        self.ensure_kernel(
-            MODULE,
-            kernels::GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC,
-            func,
-        )?;
+        crate::moe_entry_log::moe_entry_receipt("down", func, batch_size);
+        self.ensure_kernel(module, src, func)?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let xp = hidden_batch.buf.as_ptr();
@@ -3270,7 +3576,7 @@ impl Gpu {
                 k_top as u32,
                 batch_size as u32,
             ],
-            [32, 1, 1],
+            [block_threads, 1, 1],
             0,
             &mut params,
             || {
@@ -3326,6 +3632,34 @@ impl Gpu {
         x_src_rows: usize,
         n_exp: usize,
     ) -> HipResult<()> {
+        // Exact gfx1201 symmetric experts, one X row per pick, 1..=48 tokens: the int8 A8
+        // grouped down with the incumbent Y contract; see qwen4_moe_down_a8.rs.
+        if self.qwen4_moe_down_a8_applies_grouped(m, k, x_row_div, x_src_rows) {
+            self.bind_thread()?;
+            require_span(
+                y_grouped,
+                &[grouped_rows, m, 4],
+                "gemm_mq4g128v2_moe_grouped_top10 A8 grouped rows",
+            )?;
+            require_span(
+                x_src,
+                &[x_src_rows, k, 4],
+                "gemm_mq4g128v2_moe_grouped_top10 A8 activations",
+            )?;
+            return self.qwen4_moe_down_a8_grouped(
+                expert_ptrs,
+                expert_tile_ids,
+                sorted_slot_index,
+                x_src,
+                y_grouped,
+                m,
+                k,
+                x_row_div,
+                grouped_rows,
+                x_src_rows,
+                n_exp,
+            );
+        }
         // gfx1151, >= 512 tokens (x_row_div == 1: one X row per top-10 slot):
         // F16 WMMA grouped down, 8.6 -> 5.4 ms at 1131 tokens.  Not
         // bit-exact (F16 dequant/inputs); gated by KLD against the BF16
@@ -3379,6 +3713,8 @@ impl Gpu {
     /// top-10 slot, >= QWEN4_F16_WMMA_MIN_TOKENS tokens, not opted out).
     pub fn qwen4_moe_down_wmma_applies(&self, m: usize, k: usize, x_src_rows: usize) -> bool {
         self.arch_caps.has_wmma_w32()
+            // The WMMA down kernel reads the shipped layout only (DESIGN F1).
+            && !self.mq4_experts_planar
             && m == 2560
             && k == 640
             && self.route_rows(x_src_rows) >= 10 * crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
@@ -3450,6 +3786,7 @@ impl Gpu {
         bf16_out: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        self.require_shipped_mq4_experts("gemm_mq4g128v2_moe_grouped_wmma_gfx1151")?;
         require_span(
             y_grouped,
             &[grouped_rows, m, if bf16_out { 2 } else { 4 }],
@@ -3555,7 +3892,36 @@ impl Gpu {
             &[grouped_rows, m, 4],
             "gemm_mq4g128v2_moe_grouped_top10 grouped rows",
         )?;
+        // DESIGN F1: drop-zero planar experts bind the planar O8R16 twin; the other down arms
+        // (X-in-LDS twin, generic multirow) read the shipped layout only and refuse.
+        let kernel =
+            if self.mq4_experts_planar {
+                match kernel {
+                    MoeDownKernel::O8R16 => MoeDownKernel::PlanarO8R16,
+                    _ => return Err(hip_bridge::HipError::new(
+                        1,
+                        "gemm_mq4g128v2_moe_grouped_top10: this arm has no drop-zero planar twin \
+                         (only the gfx11+/gfx12 O8R16 arm at M=2560, K=640)",
+                    )),
+                }
+            } else {
+                kernel
+            };
+        // HIPFIRE_QWEN4_MOE_DEAD_STORES (default: skip): the exact gfx1201 O8R16 arms (shipped and F1 planar) leave dead
+        // rows (sentinel tiles, pad slots) unwritten; live rows are bitwise the production words.
+        let nodz = !self.moe_dead_stores
+            && self.arch_caps.is_gfx1201()
+            && matches!(kernel, MoeDownKernel::O8R16 | MoeDownKernel::PlanarO8R16);
+        self.moe_dead_poison_fill(y_grouped, grouped_rows.saturating_mul(m))?;
         let (func, module, source, grid_x, grid_z, block_x) = match kernel {
+            MoeDownKernel::PlanarO8R16 => (
+                "gemm_mq4g128v2p_moe_grouped_top10_o8_r16_gfx1201",
+                "gemm_mq4g128v2p_moe_grouped_top10_o8_r16_gfx1201",
+                kernels::GEMM_MQ4G128V2P_MOE_GROUPED_TOP10_O8_R16_GFX1201_SRC,
+                m.div_ceil(8),
+                1u32,
+                32u32,
+            ),
             MoeDownKernel::XsTwin => (
                 "gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs4_gfx1151",
                 "gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs",
@@ -3581,6 +3947,17 @@ impl Gpu {
                 32u32,
             ),
         };
+        let timer_name: &'static str = func;
+        let (module_nodz, source_nodz, func_nodz);
+        let (module, source, func): (&str, &str, &str) = if nodz {
+            module_nodz = format!("{module}_nodz");
+            func_nodz = format!("{func}_nodz");
+            source_nodz = format!("#define HF_NODZ 1\n#define {func} {func_nodz}\n{source}");
+            (&module_nodz, &source_nodz, &func_nodz)
+        } else {
+            (module, source, func)
+        };
+        crate::moe_entry_log::moe_entry_receipt("down", func, x_src_rows / 10);
         self.ensure_kernel(module, source, func)?;
         let ep = expert_ptrs.buf.as_ptr();
         let tp = expert_tile_ids.buf.as_ptr();
@@ -3608,7 +3985,7 @@ impl Gpu {
         ];
         let bytes =
             grouped_rows.saturating_mul(m.saturating_mul(4).saturating_add(k.saturating_mul(4)));
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", func, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", timer_name, bytes);
         let result = self.launch_maybe_blob(
             func,
             [grid_x as u32, grouped_rows.div_ceil(16) as u32, grid_z],
@@ -3746,6 +4123,128 @@ impl Gpu {
         }
         result
     }
+    /// Pinned-owner variant of [`Self::qwen4_ep_owner_assign`] (the certified builder kernel
+    /// [`QWEN4_EP_OWNER_ASSIGN_PINNED_PM_SYMBOL`], whose output bytes are
+    /// [`qwen4_ep_owner_map_pinned`]'s). gfx1201 only, like the unpinned launcher.
+    ///
+    /// `pins` is a device `u8[512]`: per expert the owner rank it is pinned to, or
+    /// [`QWEN4_EP_OWNER_PIN_FREE`] (`0xFF`). A routed pinned expert is owned by its pin; the routed
+    /// free experts are dealt `idx_free % ranks` in ascending id order (`idx_free` counts routed
+    /// free experts only); `live_*` and `slot_owner` derive from those owners exactly as in the
+    /// unpinned law. With all pins `0xFF` every output byte equals the unpinned launcher's.
+    ///
+    /// Pin validity (`0xFF` or `< ranks`, see [`qwen4_ep_owner_pins_check`]) is the caller's
+    /// host-side check of its host copy: the launcher holds only the device tensor (reading it back
+    /// would stall the stream). The kernel is safe on an unchecked table: a byte `>= ranks` other
+    /// than `0xFF` is treated as free, never as an out-of-range owner.
+    /// Stream-ordered on the active stream; the next launcher reading the live tables, and any
+    /// later writer of `pins`, must follow it on the same stream.
+    pub fn qwen4_ep_owner_assign_pinned(
+        &mut self,
+        topk_indices: &GpuTensor,
+        slots: usize,
+        ranks: usize,
+        self_rank: usize,
+        tables: &Qwen4EpOwnerTables,
+        pins: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let refuse = |what: &str| {
+            Err(hip_bridge::HipError::new(
+                0,
+                &format!("qwen4_ep_owner_assign_pinned: {what}"),
+            ))
+        };
+        if !qwen4_ep_owner_assign_pm_arch(&self.arch) {
+            return refuse(&format!(
+                "the pinned-ownership kernel is a gfx1201 builder module (device is {}); no hipcc fallback",
+                self.arch
+            ));
+        }
+        if !(2..=QWEN4_EP_OWNER_ASSIGN_MAX_RANKS).contains(&ranks) || self_rank >= ranks {
+            return refuse(&format!(
+                "ranks must be 2..={QWEN4_EP_OWNER_ASSIGN_MAX_RANKS} and self_rank < ranks"
+            ));
+        }
+        if slots == 0 || slots > QWEN4_EP_OWNER_EXPERTS {
+            return refuse("slots must be 1..=512");
+        }
+        if topk_indices.buf.size() < slots * std::mem::size_of::<i32>() {
+            return refuse("topk_indices holds fewer than `slots` ids");
+        }
+        if pins.buf.size() < QWEN4_EP_OWNER_EXPERTS {
+            return refuse("pins holds fewer than 512 bytes");
+        }
+        if !tables.is_complete() {
+            return refuse("a table address is null");
+        }
+        self.ensure_embedded_kernel(
+            QWEN4_EP_OWNER_ASSIGN_PINNED_PM_MODULE,
+            kernels::QWEN4_EP_OWNER_ASSIGN_PINNED_PM_GFX1201,
+            QWEN4_EP_OWNER_ASSIGN_PINNED_PM_SYMBOL,
+        )?;
+        let ids = topk_indices.buf.as_ptr();
+        let full_gate_up = tables.full_gate_up as *mut c_void;
+        let full_down = tables.full_down as *mut c_void;
+        let live_gate_up = tables.live_gate_up as *mut c_void;
+        let live_down = tables.live_down as *mut c_void;
+        let slot_owner = tables.slot_owner as *mut c_void;
+        let dummy_gate_up = tables.dummy_gate_up as u64;
+        let dummy_down = tables.dummy_down as u64;
+        let pins_ptr = pins.buf.as_ptr();
+        let slots_i32 = slots as i32;
+        let ranks_i32 = ranks as i32;
+        let self_i32 = self_rank as i32;
+        let mut params = [
+            &ids as *const _ as *mut c_void,
+            &full_gate_up as *const _ as *mut c_void,
+            &full_down as *const _ as *mut c_void,
+            &live_gate_up as *const _ as *mut c_void,
+            &live_down as *const _ as *mut c_void,
+            &slot_owner as *const _ as *mut c_void,
+            &dummy_gate_up as *const _ as *mut c_void,
+            &dummy_down as *const _ as *mut c_void,
+            &slots_i32 as *const _ as *mut c_void,
+            &ranks_i32 as *const _ as *mut c_void,
+            &self_i32 as *const _ as *mut c_void,
+            &pins_ptr as *const _ as *mut c_void,
+        ];
+        let bytes = QWEN4_EP_OWNER_EXPERTS * 9 * 4 + slots * 8;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "elementwise",
+            QWEN4_EP_OWNER_ASSIGN_PINNED_PM_SYMBOL,
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            QWEN4_EP_OWNER_ASSIGN_PINNED_PM_SYMBOL,
+            [1, 1, 1],
+            [QWEN4_EP_OWNER_EXPERTS as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ids);
+                b.push_ptr(full_gate_up);
+                b.push_ptr(full_down);
+                b.push_ptr(live_gate_up);
+                b.push_ptr(live_down);
+                b.push_ptr(slot_owner);
+                b.push_u64(dummy_gate_up);
+                b.push_u64(dummy_down);
+                b.push_i32(slots_i32);
+                b.push_i32(ranks_i32);
+                b.push_i32(self_i32);
+                // `pins` is the 8-byte-aligned pointer at 80; the blob pads the 4 bytes at 76.
+                b.push_ptr(pins_ptr);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
 }
 
 /// Experts per layer `qwen4_ep_owner_assign` handles (Flash-Next's 512; one
@@ -3758,6 +4257,12 @@ pub const QWEN4_EP_OWNER_EXPERTS: usize = 512;
 pub const QWEN4_EP_OWNER_ASSIGN_PM_MODULE: &str = "qwen4_ep_owner_assign_pm_gfx1201";
 /// Device symbol of the builder kernel.
 pub const QWEN4_EP_OWNER_ASSIGN_PM_SYMBOL: &str = "qwen4_ep_owner_assign_pm_gfx1201";
+/// Module key of the embedded certified builder (PeaceMaker) image of
+/// [`Gpu::qwen4_ep_owner_assign_pinned`] (`peacemaker-isa emit --kernel
+/// qwen4_ep_owner_assign_pinned_pm --arch gfx1201`).
+pub const QWEN4_EP_OWNER_ASSIGN_PINNED_PM_MODULE: &str = "qwen4_ep_owner_assign_pinned_pm_gfx1201";
+/// Device symbol of the pinned builder kernel.
+pub const QWEN4_EP_OWNER_ASSIGN_PINNED_PM_SYMBOL: &str = "qwen4_ep_owner_assign_pinned_pm_gfx1201";
 
 /// The balanced-ownership kernel ships as a gfx1201 builder module only
 /// (expert parallelism is a gfx1201 feature); every other device refuses.
@@ -4176,6 +4681,88 @@ pub fn qwen4_ep_owner_map(
     (owners, slot_owners)
 }
 
+/// Pin byte of an expert the pinned assignment may place freely.
+pub const QWEN4_EP_OWNER_PIN_FREE: u8 = 0xFF;
+
+/// Host-side validation of a pin table for [`Gpu::qwen4_ep_owner_assign_pinned`]: exactly
+/// [`QWEN4_EP_OWNER_EXPERTS`] bytes, each [`QWEN4_EP_OWNER_PIN_FREE`] or an owner rank `< ranks`.
+/// The device kernel never trusts a pin: a byte `>= ranks` that is not `0xFF` is treated as free,
+/// so a table that fails this check cannot index out of range, but it is a caller bug and the
+/// code that fills the device table from its host copy MUST refuse it here (the launcher holds
+/// only the device tensor and cannot read it back without stalling the stream).
+pub fn qwen4_ep_owner_pins_check(pins: &[u8], ranks: usize) -> Result<(), String> {
+    if pins.len() != QWEN4_EP_OWNER_EXPERTS {
+        return Err(format!(
+            "pins hold {} bytes, expected {QWEN4_EP_OWNER_EXPERTS}",
+            pins.len()
+        ));
+    }
+    match pins
+        .iter()
+        .enumerate()
+        .find(|&(_, &pin)| pin != QWEN4_EP_OWNER_PIN_FREE && usize::from(pin) >= ranks)
+    {
+        Some((expert, pin)) => Err(format!(
+            "expert {expert} pinned to rank {pin}, but only {ranks} ranks (a free expert is 0xFF)"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Host reference of `qwen4_ep_owner_assign_pinned` (the byte twin of the kernel): `owners[e]`
+/// for a routed expert is its pin when `pins[e]` is a rank (`< ranks`, not `0xFF`), otherwise
+/// `idx_free(e) % ranks` with `idx_free(e)` the number of routed FREE experts with a smaller id
+/// (a pin byte `>= ranks` other than `0xFF` is treated as free, as on the device); `None` for an
+/// expert no slot routes to. `slot_owners[s]` is the owner of `ids[s]`, `-1` for a negative or
+/// out-of-range id. With every pin [`QWEN4_EP_OWNER_PIN_FREE`] the result equals
+/// [`qwen4_ep_owner_map`]. `pins.len()` must equal `n_exp`.
+pub fn qwen4_ep_owner_map_pinned(
+    ids: &[i32],
+    n_exp: usize,
+    ranks: usize,
+    pins: &[u8],
+) -> (Vec<Option<usize>>, Vec<i32>) {
+    assert!(
+        ranks >= 1,
+        "qwen4_ep_owner_map_pinned: ranks must be at least 1"
+    );
+    assert_eq!(
+        pins.len(),
+        n_exp,
+        "qwen4_ep_owner_map_pinned: one pin byte per expert"
+    );
+    let in_range = |id: i32| usize::try_from(id).ok().filter(|&expert| expert < n_exp);
+    let mut routed = vec![false; n_exp];
+    for &id in ids {
+        if let Some(expert) = in_range(id) {
+            routed[expert] = true;
+        }
+    }
+    let mut owners = vec![None; n_exp];
+    let mut dealt = 0usize;
+    for (expert, &is_routed) in routed.iter().enumerate() {
+        if !is_routed {
+            continue;
+        }
+        let pin = usize::from(pins[expert]);
+        if pins[expert] != QWEN4_EP_OWNER_PIN_FREE && pin < ranks {
+            owners[expert] = Some(pin);
+        } else {
+            owners[expert] = Some(dealt % ranks);
+            dealt += 1;
+        }
+    }
+    let slot_owners = ids
+        .iter()
+        .map(|&id| {
+            in_range(id)
+                .and_then(|expert| owners[expert])
+                .map_or(-1, |owner| owner as i32)
+        })
+        .collect();
+    (owners, slot_owners)
+}
+
 #[cfg(test)]
 mod owner_map_tests {
     use super::*;
@@ -4465,6 +5052,313 @@ mod owner_map_tests {
                 }
             }
         }
+    }
+    fn pinned_pins(state: &mut u64, ranks: usize, kind: usize) -> Vec<u8> {
+        (0..EXPERTS)
+            .map(|_| {
+                let r = lcg(state);
+                let rank = ((r >> 8) % ranks as u64) as u8;
+                match kind {
+                    // Every expert free.
+                    0 => QWEN4_EP_OWNER_PIN_FREE,
+                    // Every expert pinned.
+                    1 => rank,
+                    // About half pinned.
+                    2 => {
+                        if r % 2 == 0 {
+                            rank
+                        } else {
+                            QWEN4_EP_OWNER_PIN_FREE
+                        }
+                    }
+                    // About one in ten pinned.
+                    3 => {
+                        if r % 10 == 0 {
+                            rank
+                        } else {
+                            QWEN4_EP_OWNER_PIN_FREE
+                        }
+                    }
+                    // Invalid pin bytes (`ranks..=254`) mixed in: the kernel treats them as free.
+                    _ => match r % 4 {
+                        0 => rank,
+                        1 => ranks as u8 + ((r >> 16) % (255 - ranks as u64)) as u8,
+                        _ => QWEN4_EP_OWNER_PIN_FREE,
+                    },
+                }
+            })
+            .collect()
+    }
+
+    fn pinned_ids(state: &mut u64, slots: usize, kind: usize) -> Vec<i32> {
+        (0..slots)
+            .map(|_| match (kind, lcg(state) % 11) {
+                (_, 0) => -1,
+                (_, 1) => [512, 513, i32::MIN, i32::MAX, -513][(lcg(state) % 5) as usize],
+                // Uniform with repeats.
+                (0, _) => (lcg(state) % EXPERTS as u64) as i32,
+                // A narrow range: many duplicates.
+                (1, _) => (lcg(state) % 24) as i32,
+                // Wave boundaries.
+                _ => ((lcg(state) % 16) * 32 + [0, 31][(lcg(state) % 2) as usize] as u64) as i32,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pinned_reference_with_every_expert_free_equals_the_unpinned_reference() {
+        let mut state = 0xA11F_AEE0_5EED_0001u64;
+        let free = vec![QWEN4_EP_OWNER_PIN_FREE; EXPERTS];
+        for ranks in [2usize, 3, 4] {
+            for slots in [0usize, 1, 10, 40, 80, 200, 512] {
+                for kind in 0..3 {
+                    let ids = pinned_ids(&mut state, slots, kind);
+                    assert_eq!(
+                        qwen4_ep_owner_map_pinned(&ids, EXPERTS, ranks, &free),
+                        qwen4_ep_owner_map(&ids, EXPERTS, ranks),
+                        "ranks {ranks} slots {slots} kind {kind}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_experts_keep_their_pin_and_free_experts_deal_among_the_free() {
+        // Routed ids sorted: 3, 17, 40, 41, 100. Experts 17 and 41 pinned to rank 1 and rank 0.
+        let ids = [100, 3, 41, 17, 40, 17, -1, 600];
+        let mut pins = vec![QWEN4_EP_OWNER_PIN_FREE; EXPERTS];
+        pins[17] = 1;
+        pins[41] = 0;
+        // A pin on an unrouted expert changes nothing.
+        pins[250] = 1;
+        let (owners, slots) = qwen4_ep_owner_map_pinned(&ids, EXPERTS, 2, &pins);
+        // Free routed: 3, 40, 100 dealt 0, 1, 0.
+        assert_eq!(owners[3], Some(0));
+        assert_eq!(owners[17], Some(1));
+        assert_eq!(owners[40], Some(1));
+        assert_eq!(owners[41], Some(0));
+        assert_eq!(owners[100], Some(0));
+        assert_eq!(owners.iter().flatten().count(), 5);
+        assert_eq!(owners[250], None);
+        assert_eq!(slots, vec![0, 0, 0, 1, 1, 1, -1, -1]);
+    }
+
+    #[test]
+    fn pinned_reference_all_pinned_follows_the_pins() {
+        let mut state = 0xA11F_AEE0_5EED_0002u64;
+        for ranks in [2usize, 3, 4] {
+            let pins = pinned_pins(&mut state, ranks, 1);
+            let ids = pinned_ids(&mut state, 80, 0);
+            let (owners, slots) = qwen4_ep_owner_map_pinned(&ids, EXPERTS, ranks, &pins);
+            for (expert, owner) in owners.iter().enumerate() {
+                if let Some(owner) = owner {
+                    assert_eq!(*owner, usize::from(pins[expert]));
+                }
+            }
+            for (slot, id) in ids.iter().enumerate() {
+                let expected = usize::try_from(*id)
+                    .ok()
+                    .filter(|&e| e < EXPERTS)
+                    .map_or(-1, |e| i32::from(pins[e]));
+                assert_eq!(slots[slot], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_reference_deals_the_free_experts_in_balance() {
+        let mut state = 0xA11F_AEE0_5EED_0003u64;
+        for ranks in [2usize, 3, 4] {
+            for kind in [2usize, 3] {
+                let pins = pinned_pins(&mut state, ranks, kind);
+                let ids = pinned_ids(&mut state, 200, 0);
+                let (owners, _) = qwen4_ep_owner_map_pinned(&ids, EXPERTS, ranks, &pins);
+                let mut free = vec![0usize; ranks];
+                for (expert, owner) in owners.iter().enumerate() {
+                    if let (Some(owner), true) = (owner, pins[expert] == QWEN4_EP_OWNER_PIN_FREE) {
+                        free[*owner] += 1;
+                    }
+                }
+                let (lo, hi) = (free.iter().min().unwrap(), free.iter().max().unwrap());
+                assert!(hi - lo <= 1, "ranks {ranks} kind {kind}: {free:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_reference_treats_out_of_range_pin_bytes_as_free() {
+        let ids = [5, 9, 12];
+        let mut pins = vec![QWEN4_EP_OWNER_PIN_FREE; EXPERTS];
+        pins[9] = 2;
+        let free =
+            qwen4_ep_owner_map_pinned(&ids, EXPERTS, 2, &vec![QWEN4_EP_OWNER_PIN_FREE; EXPERTS]);
+        assert_eq!(
+            qwen4_ep_owner_map_pinned(&ids, EXPERTS, 2, &pins),
+            free,
+            "a pin >= n_ranks is free, never an out-of-range owner"
+        );
+        assert!(qwen4_ep_owner_pins_check(&pins, 2).is_err());
+        assert!(qwen4_ep_owner_pins_check(&pins, 3).is_ok());
+        assert!(qwen4_ep_owner_pins_check(&pins[..EXPERTS - 1], 3).is_err());
+        assert!(qwen4_ep_owner_pins_check(&[QWEN4_EP_OWNER_PIN_FREE; EXPERTS], 2).is_ok());
+    }
+
+    #[test]
+    fn the_pinned_image_exports_the_launcher_symbol() {
+        let image = kernels::QWEN4_EP_OWNER_ASSIGN_PINNED_PM_GFX1201;
+        let symbol = QWEN4_EP_OWNER_ASSIGN_PINNED_PM_SYMBOL.as_bytes();
+        assert!(image.windows(4).any(|w| w == b"\x7fELF"), "no device ELF");
+        assert!(
+            image.windows(symbol.len()).any(|w| w == symbol),
+            "symbol missing from the image"
+        );
+        assert_eq!(
+            QWEN4_EP_OWNER_ASSIGN_PINNED_PM_MODULE,
+            "qwen4_ep_owner_assign_pinned_pm_gfx1201"
+        );
+    }
+
+    /// Device oracle of `Gpu::qwen4_ep_owner_assign_pinned` against the host reference
+    /// `qwen4_ep_owner_map_pinned`: ranks 2, 3 and 4 (every self rank), every pin pattern (all free,
+    /// all pinned, mixed, sparse, invalid bytes), uniform / duplicate-heavy / wave-boundary ids with
+    /// negative and out-of-range ids, slot counts 1..=512. The all-free pattern is also compared
+    /// byte for byte with the unpinned device kernel. Prints the mismatching-byte total (must be 0).
+    /// Needs a gfx1201 GPU; never run by the CPU-only gate.
+    #[test]
+    #[ignore = "requires a gfx1201 GPU and working HIP toolchain"]
+    fn pinned_kernel_matches_the_host_reference() {
+        let mut gpu = match crate::gpu_test::init() {
+            Ok(gpu) if qwen4_ep_owner_assign_pm_arch(&gpu.arch) => gpu,
+            _ => panic!("pinned oracle: no gfx1201 device (the pinned kernel is gfx1201 only)"),
+        };
+        const TAIL: usize = 16;
+        let to_bytes = |v: &[u64]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let full_gate_up: Vec<u64> = (0..EXPERTS as u64)
+            .map(|e| 0x1_0000_0000 + e * 0x100)
+            .collect();
+        let full_down: Vec<u64> = (0..EXPERTS as u64)
+            .map(|e| 0x2_0000_0000 + e * 0x80)
+            .collect();
+        let (dummy_gate_up, dummy_down) = (0xD000_0000u64, 0xE000_0000u64);
+        let upload =
+            |gpu: &mut Gpu, bytes: &[u8]| gpu.upload_raw(bytes, &[bytes.len()]).expect("upload");
+        let download = |gpu: &mut Gpu, tensor: &GpuTensor, len: usize| {
+            let mut raw = vec![0u8; len];
+            gpu.hip
+                .memcpy_dtoh(&mut raw, &tensor.buf)
+                .expect("download");
+            raw
+        };
+        let full_gate_up_gpu = upload(&mut gpu, &to_bytes(&full_gate_up));
+        let full_down_gpu = upload(&mut gpu, &to_bytes(&full_down));
+        let mut state = 0x7E57_0D18_91A5_C0DEu64;
+        let (mut launches, mut mismatching_bytes, mut identity_launches) = (0usize, 0usize, 0usize);
+        let differing = |a: &[u8], b: &[u8]| {
+            a.iter().zip(b).filter(|(x, y)| x != y).count() + a.len().abs_diff(b.len())
+        };
+        for ranks in [2usize, 3, 4] {
+            for slots in [10usize, 40, 80, 1, 7, 33, 200, 512] {
+                for rep in 0..15usize {
+                    let pin_kind = rep % 5;
+                    let ids = pinned_ids(&mut state, slots, rep % 3);
+                    let pins = pinned_pins(&mut state, ranks, pin_kind);
+                    let id_bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+                    let ids_gpu = upload(&mut gpu, &id_bytes);
+                    let pins_gpu = upload(&mut gpu, &pins);
+                    let (owners, slot_owners) =
+                        qwen4_ep_owner_map_pinned(&ids, EXPERTS, ranks, &pins);
+                    let expected_slots: Vec<u8> = slot_owners
+                        .iter()
+                        .flat_map(|o| o.to_le_bytes())
+                        .chain(std::iter::repeat(0x5Au8).take(4 * (EXPERTS - slots) + TAIL))
+                        .collect();
+                    for rank in 0..ranks {
+                        // Fresh sentinel-filled outputs per launch: a missed write is a mismatch.
+                        let live_gate_up_gpu = upload(&mut gpu, &vec![0xAAu8; EXPERTS * 8]);
+                        let live_down_gpu = upload(&mut gpu, &vec![0xAAu8; EXPERTS * 8]);
+                        let owners_gpu = upload(&mut gpu, &vec![0x5Au8; 4 * EXPERTS + TAIL]);
+                        let tables = Qwen4EpOwnerTables {
+                            full_gate_up: full_gate_up_gpu.buf.as_ptr() as usize,
+                            full_down: full_down_gpu.buf.as_ptr() as usize,
+                            live_gate_up: live_gate_up_gpu.buf.as_ptr() as usize,
+                            live_down: live_down_gpu.buf.as_ptr() as usize,
+                            slot_owner: owners_gpu.buf.as_ptr() as usize,
+                            dummy_gate_up: dummy_gate_up as usize,
+                            dummy_down: dummy_down as usize,
+                        };
+                        gpu.qwen4_ep_owner_assign_pinned(
+                            &ids_gpu, slots, ranks, rank, &tables, &pins_gpu,
+                        )
+                        .expect("pinned launch");
+                        gpu.hip.device_synchronize().expect("sync");
+                        let live_gu = download(&mut gpu, &live_gate_up_gpu, EXPERTS * 8);
+                        let live_dn = download(&mut gpu, &live_down_gpu, EXPERTS * 8);
+                        let slot_raw = download(&mut gpu, &owners_gpu, 4 * EXPERTS + TAIL);
+                        let expected_gu: Vec<u8> = (0..EXPERTS)
+                            .flat_map(|e| {
+                                let mine = owners[e] == Some(rank);
+                                (if mine { full_gate_up[e] } else { dummy_gate_up }).to_le_bytes()
+                            })
+                            .collect();
+                        let expected_dn: Vec<u8> = (0..EXPERTS)
+                            .flat_map(|e| {
+                                let mine = owners[e] == Some(rank);
+                                (if mine { full_down[e] } else { dummy_down }).to_le_bytes()
+                            })
+                            .collect();
+                        let bad = differing(&live_gu, &expected_gu)
+                            + differing(&live_dn, &expected_dn)
+                            + differing(&slot_raw, &expected_slots);
+                        mismatching_bytes += bad;
+                        assert_eq!(
+                            bad, 0,
+                            "ranks {ranks} rank {rank} slots {slots} rep {rep} pin kind {pin_kind}: {bad} mismatching bytes\nids {ids:?}\npins {pins:?}"
+                        );
+                        // All experts free: byte for byte the unpinned device kernel.
+                        if pin_kind == 0 {
+                            let old_live_gate_up = upload(&mut gpu, &vec![0xAAu8; EXPERTS * 8]);
+                            let old_live_down = upload(&mut gpu, &vec![0xAAu8; EXPERTS * 8]);
+                            let old_owners = upload(&mut gpu, &vec![0x5Au8; 4 * EXPERTS + TAIL]);
+                            let old_tables = Qwen4EpOwnerTables {
+                                live_gate_up: old_live_gate_up.buf.as_ptr() as usize,
+                                live_down: old_live_down.buf.as_ptr() as usize,
+                                slot_owner: old_owners.buf.as_ptr() as usize,
+                                ..tables
+                            };
+                            gpu.qwen4_ep_owner_assign(&ids_gpu, slots, ranks, rank, &old_tables)
+                                .expect("unpinned launch");
+                            gpu.hip.device_synchronize().expect("sync");
+                            let old_gu = download(&mut gpu, &old_live_gate_up, EXPERTS * 8);
+                            let old_dn = download(&mut gpu, &old_live_down, EXPERTS * 8);
+                            let old_slots = download(&mut gpu, &old_owners, 4 * EXPERTS + TAIL);
+                            let bad_identity = differing(&live_gu, &old_gu)
+                                + differing(&live_dn, &old_dn)
+                                + differing(&slot_raw, &old_slots);
+                            mismatching_bytes += bad_identity;
+                            assert_eq!(
+                                bad_identity, 0,
+                                "all-free pinned kernel differs from the unpinned kernel: ranks {ranks} rank {rank} slots {slots} rep {rep}"
+                            );
+                            identity_launches += 1;
+                            for t in [old_live_gate_up, old_live_down, old_owners] {
+                                gpu.free_tensor(t).expect("free old");
+                            }
+                        }
+                        launches += 1;
+                        for t in [live_gate_up_gpu, live_down_gpu, owners_gpu] {
+                            gpu.free_tensor(t).expect("free");
+                        }
+                    }
+                    gpu.free_tensor(ids_gpu).expect("free ids");
+                    gpu.free_tensor(pins_gpu).expect("free pins");
+                }
+            }
+        }
+        println!(
+            "pinned oracle: {launches} launches ({identity_launches} also byte-identical to the unpinned kernel), {mismatching_bytes} mismatching bytes"
+        );
+        assert_eq!(mismatching_bytes, 0);
     }
 }
 
@@ -4777,6 +5671,226 @@ mod tests {
                 differing, 0,
                 "zero-init combine differs in {differing} cells, tokens={tokens}"
             );
+        }
+    }
+
+    /// Owner-masked combine over poisoned (NaN) foreign/padding rows must be
+    /// bytewise the unmasked combine over the same rows cleared to +0, and the
+    /// masked order must equal the plain order with foreign rows -> -1.
+    #[test]
+    fn combine_bf16in_owned_is_bytewise_the_cleared_foreign_rows() {
+        use std::io::Write;
+        let Ok(mut gpu) = crate::gpu_test::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        const HIDDEN: usize = 2560;
+        const N_EXP: usize = 512;
+        let to_bytes = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let pairs = |b: &[u8]| -> Vec<(i32, u32)> {
+            b.chunks_exact(8)
+                .map(|c| {
+                    (
+                        i32::from_le_bytes(c[0..4].try_into().unwrap()),
+                        u32::from_le_bytes(c[4..8].try_into().unwrap()),
+                    )
+                })
+                .collect()
+        };
+        // (owner of expert, rank)
+        let cases: [(&str, fn(usize) -> i32, usize); 5] = [
+            ("mod2_r0", |e| (e % 2) as i32, 0),
+            ("mod2_r1", |e| (e % 2) as i32, 1),
+            ("mod5_r0", |e| if e % 5 == 0 { 0 } else { 1 }, 0),
+            ("none_owned", |_| 1, 0),
+            ("all_owned", |_| 0, 0),
+        ];
+        for tokens in [1usize, 37, 530, 4096] {
+            let slots = tokens * 10;
+            let mut state = 0x9E37_79B9u64 ^ tokens as u64;
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (state >> 33) as usize
+            };
+            let mut experts = vec![-1i32; slots];
+            for t in 0..tokens {
+                for r in 0..10 {
+                    let slot = t * 10 + r;
+                    if slot % 17 == 0 {
+                        continue;
+                    }
+                    loop {
+                        let e = (next() % N_EXP) as i32;
+                        if !experts[t * 10..slot].contains(&e) {
+                            experts[slot] = e;
+                            break;
+                        }
+                    }
+                }
+            }
+            let weights: Vec<f32> = (0..slots)
+                .map(|i| {
+                    if i % 23 == 3 {
+                        0.0
+                    } else {
+                        ((i.wrapping_mul(2_654_435_761) % 3001) as f32 - 1500.0) / 1000.0
+                    }
+                })
+                .collect();
+            // Grouped layout: experts ascending, rows padded to 16.
+            let mut inverse = vec![-1i32; slots];
+            let mut row_expert: Vec<i32> = Vec::new();
+            for e in 0..N_EXP as i32 {
+                let start = row_expert.len();
+                for s in 0..slots {
+                    if experts[s] == e {
+                        inverse[s] = row_expert.len() as i32;
+                        row_expert.push(e);
+                    }
+                }
+                if row_expert.len() > start {
+                    row_expert.resize(start + (row_expert.len() - start).div_ceil(16) * 16, -1);
+                }
+            }
+            let grouped_rows = row_expert.len().max(16);
+            row_expert.resize(grouped_rows, -1);
+            let inverse_t = gpu
+                .upload_raw(&to_bytes(&inverse), &[slots * 4])
+                .expect("inverse");
+            let experts_t = gpu
+                .upload_raw(&to_bytes(&experts), &[slots * 4])
+                .expect("experts");
+            let weights_t = gpu.upload_f32(&weights, &[slots]).expect("weights");
+            for (name, owner_of, rank) in cases {
+                let table: Vec<i32> = (0..N_EXP).map(owner_of).collect();
+                let owner_t = gpu
+                    .upload_raw(&to_bytes(&table), &[N_EXP * 4])
+                    .expect("owners");
+                let foreign = |r: i32| r >= 0 && table[r as usize] != rank as i32;
+                let build = |poison: bool| -> Vec<u8> {
+                    let mut out = Vec::with_capacity(grouped_rows * HIDDEN * 2);
+                    for (row, &e) in row_expert.iter().enumerate() {
+                        for c in 0..HIDDEN {
+                            let bits: u16 = if e >= 0 && table[e as usize] == rank as i32 {
+                                let h = (row * 7919 + c * 31 + 1) % 4093;
+                                let v =
+                                    (h as f32 + 1.0) / 1024.0 * if h % 3 == 0 { -1.0 } else { 1.0 };
+                                (v.to_bits() >> 16) as u16
+                            } else if poison {
+                                0xFFFF
+                            } else {
+                                0x0000
+                            };
+                            out.extend_from_slice(&bits.to_le_bytes());
+                        }
+                    }
+                    out
+                };
+                let clean = build(false);
+                let poison = build(true);
+                let clean_t = gpu.upload_raw(&clean, &[clean.len()]).expect("clean");
+                let poison_t = gpu.upload_raw(&poison, &[poison.len()]).expect("poison");
+                for initial_zero in [false, true] {
+                    let garbage: Vec<f32> = (0..tokens * HIDDEN)
+                        .map(|i| (i % 977) as f32 / 61.0 - 7.0)
+                        .collect();
+                    let prep = |gpu: &mut Gpu| {
+                        if initial_zero {
+                            gpu.upload_f32(&garbage, &[tokens * HIDDEN])
+                                .expect("garbage")
+                        } else {
+                            gpu.zeros(&[tokens * HIDDEN], DType::F32).expect("zeros")
+                        }
+                    };
+                    let base_t = prep(&mut gpu);
+                    let cand_t = prep(&mut gpu);
+                    let order_base = gpu
+                        .upload_raw(&vec![0u8; slots * 8], &[slots * 8])
+                        .expect("order");
+                    let order_cand = gpu
+                        .upload_raw(&vec![0u8; slots * 8], &[slots * 8])
+                        .expect("order");
+                    gpu.moe_down_combine_grouped_top10_bf16in(
+                        &clean_t,
+                        &inverse_t,
+                        &experts_t,
+                        &weights_t,
+                        &base_t,
+                        &order_base,
+                        HIDDEN,
+                        grouped_rows,
+                        tokens,
+                        initial_zero,
+                        N_EXP,
+                    )
+                    .expect("baseline combine");
+                    gpu.moe_down_combine_grouped_top10_bf16in_owned(
+                        &poison_t,
+                        &inverse_t,
+                        &experts_t,
+                        &weights_t,
+                        &cand_t,
+                        &order_cand,
+                        HIDDEN,
+                        grouped_rows,
+                        tokens,
+                        initial_zero,
+                        N_EXP,
+                        Some(crate::hc_row_fold::CombineOwners {
+                            table: &owner_t,
+                            rank,
+                        }),
+                    )
+                    .expect("owned combine");
+                    let a = gpu.download_f32(&base_t).expect("download");
+                    let b = gpu.download_f32(&cand_t).expect("download");
+                    assert!(
+                        !b.iter().any(|v| v.is_nan()),
+                        "NaN leaked: {name} tokens={tokens}"
+                    );
+                    if name != "none_owned" {
+                        assert!(a.iter().any(|v| *v != 0.0), "baseline all zero: {name}");
+                    }
+                    let differing = a
+                        .iter()
+                        .zip(&b)
+                        .filter(|(x, y)| x.to_bits() != y.to_bits())
+                        .count();
+                    assert_eq!(
+                        differing, 0,
+                        "owned combine differs in {differing} cells: {name} tokens={tokens} zinit={initial_zero}"
+                    );
+                    let ob = pairs(&gpu.download_raw_bytes(&order_base).expect("order"));
+                    let oc = pairs(&gpu.download_raw_bytes(&order_cand).expect("order"));
+                    assert_eq!(ob.len(), oc.len());
+                    for (i, (x, y)) in ob.iter().zip(&oc).enumerate() {
+                        assert_eq!(
+                            x.1, y.1,
+                            "weight bits differ at {i}: {name} tokens={tokens}"
+                        );
+                        let want = if x.0 >= 0 && foreign(row_expert[x.0 as usize]) {
+                            -1
+                        } else {
+                            x.0
+                        };
+                        assert_eq!(y.0, want, "order row at {i}: {name} tokens={tokens}");
+                    }
+                    if let Ok(path) = std::env::var("OWNED_COMBINE_RECEIPT") {
+                        let mut f = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                            .expect("receipt");
+                        writeln!(
+                            f,
+                            "tokens={tokens} case={name} initial_zero={initial_zero} differing=0"
+                        )
+                        .expect("receipt write");
+                    }
+                }
+            }
         }
     }
 

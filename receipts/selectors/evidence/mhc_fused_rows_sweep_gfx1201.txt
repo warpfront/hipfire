@@ -1,0 +1,72 @@
+uptime  09:18:24 up 16 days, 12:48,  6 users,  load average: 26.74, 39.12, 32.13
+== rows 16
+round=0 arm=u rows=16 gemm=0.1300ms(5GB/s,0.7MB) route=0.0153ms(43GB/s,0.7MB) aggregate=0.0209ms(39GB/s,0.8MB) postmix=0.0081ms(183GB/s,1.5MB) nonmatrix/site=0.0442ms nonmatrix50=2.21ms chain/site=0.1742ms chain50=8.71ms
+round=0 arm=f rows=16 gemm=0.1300ms(5GB/s,0.7MB) route=0.0121ms(68GB/s,0.8MB) postmix=0.0080ms(184GB/s,1.5MB) nonmatrix/site=0.0201ms nonmatrix50=1.00ms chain/site=0.1501ms chain50=7.50ms
+round=0 arm=b rows=16 gemm=0.0332ms(10GB/s,0.3MB) route=0.0118ms(42GB/s,0.5MB) postmix=0.0081ms(101GB/s,0.8MB) nonmatrix/site=0.0199ms nonmatrix50=1.00ms chain/site=0.0532ms chain50=2.66ms
+round=1 arm=u rows=16 gemm=0.1300ms(5GB/s,0.7MB) route=0.0153ms(43GB/s,0.7MB) aggregate=0.0155ms(53GB/s,0.8MB) postmix=0.0081ms(183GB/s,1.5MB) nonmatrix/site=0.0389ms nonmatrix50=1.94ms chain/site=0.1689ms chain50=8.45ms
+round=1 arm=f rows=16 gemm=0.1302ms(5GB/s,0.7MB) route=0.0121ms(68GB/s,0.8MB) postmix=0.0080ms(184GB/s,1.5MB) nonmatrix/site=0.0201ms nonmatrix50=1.01ms chain/site=0.1503ms chain50=7.52ms
+round=1 arm=b rows=16 gemm=0.0333ms(10GB/s,0.3MB) route=0.0119ms(42GB/s,0.5MB) postmix=0.0082ms(100GB/s,0.8MB) nonmatrix/site=0.0201ms nonmatrix50=1.00ms chain/site=0.0533ms chain50=2.67ms
+round=2 arm=u rows=16 gemm=0.1302ms(5GB/s,0.7MB) route=0.0154ms(43GB/s,0.7MB) aggregate=0.0154ms(53GB/s,0.8MB) postmix=0.0081ms(182GB/s,1.5MB) nonmatrix/site=0.0389ms nonmatrix50=1.95ms chain/site=0.1691ms chain50=8.45ms
+round=2 arm=f rows=16 gemm=0.1300ms(5GB/s,0.7MB) route=0.0121ms(68GB/s,0.8MB) postmix=0.0080ms(185GB/s,1.5MB) nonmatrix/site=0.0201ms nonmatrix50=1.00ms chain/site=0.1501ms chain50=7.50ms
+round=2 arm=b rows=16 gemm=0.0334ms(10GB/s,0.3MB) route=0.0119ms(41GB/s,0.5MB) postmix=0.0082ms(100GB/s,0.8MB) nonmatrix/site=0.0202ms nonmatrix50=1.01ms chain/site=0.0535ms chain50=2.68ms
+== rows 32
+round=0 arm=u rows=32 gemm=0.1288ms(10GB/s,1.3MB) route=0.0152ms(87GB/s,1.3MB) aggregate=0.0155ms(105GB/s,1.6MB) postmix=0.0095ms(311GB/s,3.0MB) nonmatrix/site=0.0402ms nonmatrix50=2.01ms chain/site=0.1690ms chain50=8.45ms
+round=0 arm=f rows=32 gemm=0.1289ms(10GB/s,1.3MB) route=0.0125ms(131GB/s,1.6MB) postmix=0.0094ms(312GB/s,3.0MB) nonmatrix/site=0.0220ms nonmatrix50=1.10ms chain/site=0.1509ms chain50=7.54ms
+round=0 arm=b rows=32 gemm=0.0339ms(19GB/s,0.7MB) route=0.0123ms(80GB/s,1.0MB) postmix=0.0088ms(186GB/s,1.6MB) nonmatrix/site=0.0211ms nonmatrix50=1.06ms chain/site=0.0550ms chain50=2.75ms
+round=1 arm=u rows=32 gemm=0.1287ms(10GB/s,1.3MB) route=0.0151ms(87GB/s,1.3MB) aggregate=0.0154ms(107GB/s,1.6MB) postmix=0.0094ms(314GB/s,3.0MB) nonmatrix/site=0.0398ms nonmatrix50=1.99ms chain/site=0.1685ms chain50=8.43ms
+round=1 arm=f rows=32 gemm=0.1291ms(10GB/s,1.3MB) route=0.0127ms(129GB/s,1.6MB) postmix=0.0097ms(304GB/s,3.0MB) nonmatrix/site=0.0225ms nonmatrix50=1.12ms chain/site=0.1516ms chain50=7.58ms
+round=1 arm=b rows=32 gemm=0.0335ms(20GB/s,0.7MB) route=0.0121ms(82GB/s,1.0MB) postmix=0.0086ms(190GB/s,1.6MB) nonmatrix/site=0.0207ms nonmatrix50=1.04ms chain/site=0.0543ms chain50=2.71ms
+round=2 arm=u rows=32 gemm=0.1286ms(10GB/s,1.3MB) route=0.0151ms(87GB/s,1.3MB) aggregate=0.0155ms(106GB/s,1.6MB) postmix=0.0094ms(314GB/s,3.0MB) nonmatrix/site=0.0400ms nonmatrix50=2.00ms chain/site=0.1687ms chain50=8.43ms
+round=2 arm=f rows=32 gemm=0.1291ms(10GB/s,1.3MB) route=0.0127ms(130GB/s,1.6MB) postmix=0.0096ms(308GB/s,3.0MB) nonmatrix/site=0.0222ms nonmatrix50=1.11ms chain/site=0.1513ms chain50=7.56ms
+round=2 arm=b rows=32 gemm=0.0335ms(20GB/s,0.7MB) route=0.0121ms(82GB/s,1.0MB) postmix=0.0085ms(192GB/s,1.6MB) nonmatrix/site=0.0206ms nonmatrix50=1.03ms chain/site=0.0541ms chain50=2.70ms
+== rows 48
+round=0 arm=u rows=48 gemm=0.1410ms(14GB/s,2.0MB) route=0.0231ms(85GB/s,2.0MB) aggregate=0.0166ms(148GB/s,2.5MB) postmix=0.0110ms(403GB/s,4.4MB) nonmatrix/site=0.0508ms nonmatrix50=2.54ms chain/site=0.1918ms chain50=9.59ms
+round=0 arm=f rows=48 gemm=0.1304ms(15GB/s,2.0MB) route=0.0128ms(193GB/s,2.5MB) postmix=0.0105ms(423GB/s,4.4MB) nonmatrix/site=0.0232ms nonmatrix50=1.16ms chain/site=0.1536ms chain50=7.68ms
+round=0 arm=b rows=48 gemm=0.0342ms(29GB/s,1.0MB) route=0.0124ms(120GB/s,1.5MB) postmix=0.0094ms(262GB/s,2.5MB) nonmatrix/site=0.0217ms nonmatrix50=1.09ms chain/site=0.0559ms chain50=2.80ms
+round=1 arm=u rows=48 gemm=0.1281ms(15GB/s,2.0MB) route=0.0152ms(130GB/s,2.0MB) aggregate=0.0154ms(159GB/s,2.5MB) postmix=0.0103ms(429GB/s,4.4MB) nonmatrix/site=0.0410ms nonmatrix50=2.05ms chain/site=0.1691ms chain50=8.45ms
+round=1 arm=f rows=48 gemm=0.1287ms(15GB/s,2.0MB) route=0.0128ms(192GB/s,2.5MB) postmix=0.0106ms(419GB/s,4.4MB) nonmatrix/site=0.0234ms nonmatrix50=1.17ms chain/site=0.1521ms chain50=7.60ms
+round=1 arm=b rows=48 gemm=0.0339ms(29GB/s,1.0MB) route=0.0123ms(121GB/s,1.5MB) postmix=0.0092ms(268GB/s,2.5MB) nonmatrix/site=0.0215ms nonmatrix50=1.07ms chain/site=0.0554ms chain50=2.77ms
+round=2 arm=u rows=48 gemm=0.1279ms(15GB/s,2.0MB) route=0.0152ms(130GB/s,2.0MB) aggregate=0.0154ms(160GB/s,2.5MB) postmix=0.0103ms(428GB/s,4.4MB) nonmatrix/site=0.0409ms nonmatrix50=2.05ms chain/site=0.1688ms chain50=8.44ms
+round=2 arm=f rows=48 gemm=0.1286ms(15GB/s,2.0MB) route=0.0129ms(191GB/s,2.5MB) postmix=0.0106ms(416GB/s,4.4MB) nonmatrix/site=0.0236ms nonmatrix50=1.18ms chain/site=0.1522ms chain50=7.61ms
+round=2 arm=b rows=48 gemm=0.0338ms(29GB/s,1.0MB) route=0.0121ms(122GB/s,1.5MB) postmix=0.0091ms(271GB/s,2.5MB) nonmatrix/site=0.0212ms nonmatrix50=1.06ms chain/site=0.0550ms chain50=2.75ms
+== rows 64
+round=0 arm=u rows=64 gemm=0.1416ms(19GB/s,2.6MB) route=0.0176ms(149GB/s,2.6MB) aggregate=0.0179ms(183GB/s,3.3MB) postmix=0.0136ms(434GB/s,5.9MB) nonmatrix/site=0.0492ms nonmatrix50=2.46ms chain/site=0.1908ms chain50=9.54ms
+round=0 arm=f rows=64 gemm=0.1420ms(18GB/s,2.6MB) route=0.0147ms(223GB/s,3.3MB) postmix=0.0138ms(428GB/s,5.9MB) nonmatrix/site=0.0285ms nonmatrix50=1.43ms chain/site=0.1706ms chain50=8.53ms
+round=0 arm=b rows=64 gemm=0.0390ms(34GB/s,1.3MB) route=0.0144ms(138GB/s,2.0MB) postmix=0.0123ms(267GB/s,3.3MB) nonmatrix/site=0.0266ms nonmatrix50=1.33ms chain/site=0.0656ms chain50=3.28ms
+round=1 arm=u rows=64 gemm=0.1300ms(20GB/s,2.6MB) route=0.0165ms(160GB/s,2.6MB) aggregate=0.0170ms(193GB/s,3.3MB) postmix=0.0130ms(453GB/s,5.9MB) nonmatrix/site=0.0465ms nonmatrix50=2.32ms chain/site=0.1765ms chain50=8.82ms
+round=1 arm=f rows=64 gemm=0.1296ms(20GB/s,2.6MB) route=0.0139ms(236GB/s,3.3MB) postmix=0.0129ms(458GB/s,5.9MB) nonmatrix/site=0.0268ms nonmatrix50=1.34ms chain/site=0.1564ms chain50=7.82ms
+round=1 arm=b rows=64 gemm=0.0366ms(36GB/s,1.3MB) route=0.0138ms(144GB/s,2.0MB) postmix=0.0119ms(275GB/s,3.3MB) nonmatrix/site=0.0257ms nonmatrix50=1.28ms chain/site=0.0622ms chain50=3.11ms
+round=2 arm=u rows=64 gemm=0.1297ms(20GB/s,2.6MB) route=0.0165ms(160GB/s,2.6MB) aggregate=0.0167ms(196GB/s,3.3MB) postmix=0.0130ms(455GB/s,5.9MB) nonmatrix/site=0.0461ms nonmatrix50=2.31ms chain/site=0.1758ms chain50=8.79ms
+round=2 arm=f rows=64 gemm=0.1295ms(20GB/s,2.6MB) route=0.0138ms(238GB/s,3.3MB) postmix=0.0128ms(461GB/s,5.9MB) nonmatrix/site=0.0266ms nonmatrix50=1.33ms chain/site=0.1561ms chain50=7.81ms
+round=2 arm=b rows=64 gemm=0.0358ms(37GB/s,1.3MB) route=0.0136ms(145GB/s,2.0MB) postmix=0.0122ms(269GB/s,3.3MB) nonmatrix/site=0.0259ms nonmatrix50=1.29ms chain/site=0.0617ms chain50=3.08ms
+== rows 128
+round=0 arm=u rows=128 gemm=0.1406ms(37GB/s,5.3MB) route=0.0165ms(319GB/s,5.3MB) aggregate=0.0171ms(384GB/s,6.6MB) postmix=0.0165ms(713GB/s,11.8MB) nonmatrix/site=0.0501ms nonmatrix50=2.51ms chain/site=0.1907ms chain50=9.54ms
+round=0 arm=f rows=128 gemm=0.1402ms(37GB/s,5.3MB) route=0.0156ms(421GB/s,6.6MB) postmix=0.0165ms(714GB/s,11.8MB) nonmatrix/site=0.0321ms nonmatrix50=1.61ms chain/site=0.1723ms chain50=8.62ms
+round=0 arm=b rows=128 gemm=0.0690ms(38GB/s,2.6MB) route=0.0141ms(280GB/s,4.0MB) postmix=0.0141ms(466GB/s,6.6MB) nonmatrix/site=0.0282ms nonmatrix50=1.41ms chain/site=0.0972ms chain50=4.86ms
+round=1 arm=u rows=128 gemm=0.1311ms(40GB/s,5.3MB) route=0.0155ms(339GB/s,5.3MB) aggregate=0.0162ms(404GB/s,6.6MB) postmix=0.0159ms(742GB/s,11.8MB) nonmatrix/site=0.0477ms nonmatrix50=2.38ms chain/site=0.1788ms chain50=8.94ms
+round=1 arm=f rows=128 gemm=0.1278ms(41GB/s,5.3MB) route=0.0148ms(445GB/s,6.6MB) postmix=0.0157ms(754GB/s,11.8MB) nonmatrix/site=0.0304ms nonmatrix50=1.52ms chain/site=0.1582ms chain50=7.91ms
+round=1 arm=b rows=128 gemm=0.0625ms(42GB/s,2.6MB) route=0.0132ms(298GB/s,4.0MB) postmix=0.0132ms(498GB/s,6.6MB) nonmatrix/site=0.0264ms nonmatrix50=1.32ms chain/site=0.0889ms chain50=4.45ms
+round=2 arm=u rows=128 gemm=0.1277ms(41GB/s,5.3MB) route=0.0153ms(345GB/s,5.3MB) aggregate=0.0160ms(411GB/s,6.6MB) postmix=0.0159ms(744GB/s,11.8MB) nonmatrix/site=0.0471ms nonmatrix50=2.36ms chain/site=0.1748ms chain50=8.74ms
+round=2 arm=f rows=128 gemm=0.1278ms(41GB/s,5.3MB) route=0.0147ms(446GB/s,6.6MB) postmix=0.0157ms(752GB/s,11.8MB) nonmatrix/site=0.0304ms nonmatrix50=1.52ms chain/site=0.1582ms chain50=7.91ms
+round=2 arm=b rows=128 gemm=0.0625ms(42GB/s,2.6MB) route=0.0133ms(298GB/s,4.0MB) postmix=0.0132ms(499GB/s,6.6MB) nonmatrix/site=0.0264ms nonmatrix50=1.32ms chain/site=0.0889ms chain50=4.45ms
+== rows 512
+round=0 arm=u rows=512 gemm=0.1414ms(149GB/s,21.0MB) route=0.0385ms(547GB/s,21.1MB) aggregate=0.0371ms(707GB/s,26.2MB) postmix=0.0396ms(1193GB/s,47.2MB) nonmatrix/site=0.1151ms nonmatrix50=5.76ms chain/site=0.2566ms chain50=12.83ms
+round=0 arm=f rows=512 gemm=0.1411ms(149GB/s,21.0MB) route=0.0429ms(614GB/s,26.3MB) postmix=0.0387ms(1221GB/s,47.2MB) nonmatrix/site=0.0815ms nonmatrix50=4.08ms chain/site=0.2226ms chain50=11.13ms
+round=0 arm=b rows=512 gemm=0.1380ms(76GB/s,10.5MB) route=0.0318ms(498GB/s,15.8MB) postmix=0.0291ms(903GB/s,26.3MB) nonmatrix/site=0.0609ms nonmatrix50=3.04ms chain/site=0.1989ms chain50=9.94ms
+round=1 arm=u rows=512 gemm=0.1271ms(165GB/s,21.0MB) route=0.0284ms(741GB/s,21.1MB) aggregate=0.0297ms(884GB/s,26.2MB) postmix=0.0360ms(1313GB/s,47.2MB) nonmatrix/site=0.0941ms nonmatrix50=4.70ms chain/site=0.2212ms chain50=11.06ms
+round=1 arm=f rows=512 gemm=0.1281ms(164GB/s,21.0MB) route=0.0418ms(629GB/s,26.3MB) postmix=0.0368ms(1282GB/s,47.2MB) nonmatrix/site=0.0787ms nonmatrix50=3.93ms chain/site=0.2068ms chain50=10.34ms
+round=1 arm=b rows=512 gemm=0.1303ms(81GB/s,10.5MB) route=0.0372ms(425GB/s,15.8MB) postmix=0.0290ms(906GB/s,26.3MB) nonmatrix/site=0.0662ms nonmatrix50=3.31ms chain/site=0.1965ms chain50=9.82ms
+round=2 arm=u rows=512 gemm=0.1280ms(164GB/s,21.0MB) route=0.0331ms(636GB/s,21.1MB) aggregate=0.0348ms(754GB/s,26.2MB) postmix=0.0367ms(1287GB/s,47.2MB) nonmatrix/site=0.1046ms nonmatrix50=5.23ms chain/site=0.2326ms chain50=11.63ms
+round=2 arm=f rows=512 gemm=0.1272ms(165GB/s,21.0MB) route=0.0366ms(718GB/s,26.3MB) postmix=0.0360ms(1313GB/s,47.2MB) nonmatrix/site=0.0726ms nonmatrix50=3.63ms chain/site=0.1998ms chain50=9.99ms
+round=2 arm=b rows=512 gemm=0.1290ms(82GB/s,10.5MB) route=0.0309ms(512GB/s,15.8MB) postmix=0.0279ms(942GB/s,26.3MB) nonmatrix/site=0.0588ms nonmatrix50=2.94ms chain/site=0.1878ms chain50=9.39ms
+== rows 4096
+round=0 arm=u rows=4096 gemm=0.7142ms(235GB/s,168.1MB) route=0.3220ms(523GB/s,168.4MB) aggregate=0.3834ms(547GB/s,209.8MB) postmix=0.6280ms(602GB/s,377.8MB) nonmatrix/site=1.3334ms nonmatrix50=66.67ms chain/site=2.0476ms chain50=102.38ms
+round=0 arm=f rows=4096 gemm=0.7182ms(234GB/s,168.1MB) route=0.3594ms(585GB/s,210.4MB) postmix=0.6285ms(601GB/s,377.8MB) nonmatrix/site=0.9879ms nonmatrix50=49.40ms chain/site=1.7061ms chain50=85.31ms
+round=0 arm=b rows=4096 gemm=0.6373ms(132GB/s,84.2MB) route=0.2176ms(581GB/s,126.5MB) postmix=0.3512ms(598GB/s,210.0MB) nonmatrix/site=0.5688ms nonmatrix50=28.44ms chain/site=1.2061ms chain50=60.30ms
+round=1 arm=u rows=4096 gemm=0.7153ms(235GB/s,168.1MB) route=0.3226ms(522GB/s,168.4MB) aggregate=0.3833ms(547GB/s,209.8MB) postmix=0.6280ms(602GB/s,377.8MB) nonmatrix/site=1.3338ms nonmatrix50=66.69ms chain/site=2.0491ms chain50=102.46ms
+round=1 arm=f rows=4096 gemm=0.7190ms(234GB/s,168.1MB) route=0.3591ms(586GB/s,210.4MB) postmix=0.6286ms(601GB/s,377.8MB) nonmatrix/site=0.9878ms nonmatrix50=49.39ms chain/site=1.7068ms chain50=85.34ms
+round=1 arm=b rows=4096 gemm=0.6381ms(132GB/s,84.2MB) route=0.2183ms(580GB/s,126.5MB) postmix=0.3514ms(598GB/s,210.0MB) nonmatrix/site=0.5697ms nonmatrix50=28.49ms chain/site=1.2078ms chain50=60.39ms
+round=2 arm=u rows=4096 gemm=0.7170ms(234GB/s,168.1MB) route=0.3205ms(526GB/s,168.4MB) aggregate=0.3828ms(548GB/s,209.8MB) postmix=0.6279ms(602GB/s,377.8MB) nonmatrix/site=1.3313ms nonmatrix50=66.56ms chain/site=2.0483ms chain50=102.41ms
+round=2 arm=f rows=4096 gemm=0.7199ms(233GB/s,168.1MB) route=0.3593ms(585GB/s,210.4MB) postmix=0.6287ms(601GB/s,377.8MB) nonmatrix/site=0.9880ms nonmatrix50=49.40ms chain/site=1.7080ms chain50=85.40ms
+round=2 arm=b rows=4096 gemm=0.6385ms(132GB/s,84.2MB) route=0.2176ms(581GB/s,126.5MB) postmix=0.3515ms(598GB/s,210.0MB) nonmatrix/site=0.5690ms nonmatrix50=28.45ms chain/site=1.2076ms chain50=60.38ms
+uptime  09:18:40 up 16 days, 12:48,  6 users,  load average: 25.90, 38.12, 31.95

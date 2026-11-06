@@ -927,6 +927,24 @@ impl<'a> Emulator<'a> {
                     Err("no barrier orders them (same barrier epoch)")
                 }
             };
+            // Wave-private windows: only the owning wave, only inside its own slice.
+            for t in log.iter() {
+                for &(base, stride, n) in &self.private_lds {
+                    let (base, stride, n) = (base as usize, stride as usize, n as usize);
+                    let (lo, hi) = (t.lo, t.lo + t.len);
+                    if hi <= base || lo >= base + stride * n {
+                        continue;
+                    }
+                    let (own_lo, own_hi) = (base + wave * stride, base + (wave + 1) * stride);
+                    if wave >= n || lo < own_lo || hi > own_hi {
+                        return Err(format!(
+                            "[private] LDS {} of bytes [{lo}, {hi}) by wave {wave} ({} at inst {pc}) leaves its own slice [{own_lo}, {own_hi}) of the wave-private window at {base} ({n} slices of {stride} bytes)",
+                            if t.write { "write" } else { "read" },
+                            step.name,
+                        ));
+                    }
+                }
+            }
             for t in log.iter() {
                 if let Err(r) = race.access(wave, id, t, &ord) {
                     let other = &hws[r.other_wave].accs[r.other_acc as usize];

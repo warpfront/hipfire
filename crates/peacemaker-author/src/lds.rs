@@ -26,6 +26,12 @@
 //!    `next` takes stores; a rotation retires `cur`, publishes `next` and
 //!    moves `cur` to `(cur + 1) % D`. Which buffers hold data, and which is
 //!    `cur`, are build-time values: a read of a vacant `cur` is refused.
+//! 5. A `WaveRegion<R, P>` is wave-private: wave `w` owns slice `w` of a
+//!    `stride x waves` window and no other wave touches it. Its states
+//!    (`Free`, `Writing`, `Owned`) change by wave-local steps that never pass a
+//!    barrier (`Wave::private_publish`, `private_retire`), so they are legal
+//!    under wave-uniform control; no barrier transition, shared store/load or
+//!    handoff accepts one, so no other wave can be given access to it.
 //!
 //! Exact addresses and bounds stay value-level (backend slot machine,
 //! certifier LDS facts).
@@ -39,6 +45,7 @@ mod sealed {
     pub trait State {}
     pub trait Store {}
     pub trait Join {}
+    pub trait Private {}
     pub trait Transition {}
 }
 /// No wave reads the region.
@@ -740,3 +747,78 @@ all_free_tuple!(A, B, C, D, E);
 all_free_tuple!(A, B, C, D, E, F);
 all_free_tuple!(A, B, C, D, E, F, G);
 all_free_tuple!(A, B, C, D, E, F, G, H);
+impl<R> AllFree for WaveRegion<R, Free> {}
+
+/// The wave-private ownership states: [`Free`], [`Writing`] and [`Owned`]
+/// (readable by the owning wave only).
+pub trait PrivState: sealed::Private + 'static {}
+impl<S: sealed::Private + 'static> PrivState for S {}
+impl sealed::Private for Free {}
+impl sealed::Private for Writing {}
+/// Readable by the owning wave only; not writable until retired.
+pub enum Owned {}
+impl sealed::Private for Owned {}
+
+/// Validate a wave-private layout (shared by the typed core and the runtime
+/// `Driver`): at most 32 slices (a workgroup is at most 1024 work-items),
+/// `base` and `stride` nonzero multiples of 16, the window inside the LDS.
+pub(crate) fn check_private_layout(
+    name: &str,
+    base: u32,
+    stride: u32,
+    waves: u32,
+    lds_bytes: u32,
+    target: &str,
+) -> Result<(), String> {
+    if waves == 0 || waves > MAX_PRIVATE_WAVES {
+        return Err(format!(
+            "wave-private LDS region {name}: {waves} waves (a workgroup has 1 to {MAX_PRIVATE_WAVES})"
+        ));
+    }
+    if stride == 0 || stride % 16 != 0 || base % 16 != 0 {
+        return Err(format!(
+            "wave-private LDS region {name}: base {base} and stride {stride} must be a nonzero multiple of 16 bytes"
+        ));
+    }
+    let end = stride
+        .checked_mul(waves)
+        .and_then(|len| base.checked_add(len));
+    if end.is_none_or(|end| end > lds_bytes) {
+        return Err(format!(
+            "wave-private LDS region {name} [{base}, +{stride} x {waves}) exceeds {lds_bytes} bytes on {target}"
+        ));
+    }
+    Ok(())
+}
+/// A workgroup is at most 1024 work-items: 32 wave32 waves.
+pub(crate) const MAX_PRIVATE_WAVES: u32 = 32;
+
+/// Something a wave-private store may write: a `Free` or `Writing` slice.
+pub trait PrivWritable: PrivState {}
+impl PrivWritable for Free {}
+impl PrivWritable for Writing {}
+
+/// A typed wave-private LDS region `R` in state `P`: wave `w` owns bytes
+/// `[base + w * stride, base + (w + 1) * stride)` of its window and nobody
+/// else touches them. It is not an [`LdsRegion`]: it cannot take part in a
+/// barrier `Transition`, a shared store/load, a join or a ring, so no other
+/// wave can be given access to it.
+pub struct WaveRegion<R, P: PrivState> {
+    pub(crate) slot: usize,
+    /// This wave's youngest store into its slice (what `Wave::private_drain`
+    /// asks the backend about).
+    pub(crate) last: Option<EventId>,
+    _p: PhantomData<fn() -> (R, P)>,
+}
+impl<R, P: PrivState> WaveRegion<R, P> {
+    pub(crate) fn new(slot: usize, last: Option<EventId>) -> Self {
+        Self {
+            slot,
+            last,
+            _p: PhantomData,
+        }
+    }
+    pub(crate) fn to<Q: PrivState>(self) -> WaveRegion<R, Q> {
+        WaveRegion::new(self.slot, self.last)
+    }
+}

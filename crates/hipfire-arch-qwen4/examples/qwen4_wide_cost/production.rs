@@ -223,7 +223,7 @@ pub(super) fn load(args: &Args) -> Result<Model, String> {
         Qwen4KvBackend::Legacy => 1,
     };
     let shared = Qwen4RankShared {
-        continuous_batch: false,
+        batch: Default::default(),
         path: model_str.to_string(),
         max_seq: args.n_ctx,
         sequence: None,
@@ -532,7 +532,7 @@ pub(super) fn preload_plan(args: &Args) -> Result<Value, String> {
         false
     };
     let shared = Qwen4RankShared {
-        continuous_batch: false,
+        batch: Default::default(),
         path: path_str,
         max_seq: planning_n_ctx,
         sequence: None,

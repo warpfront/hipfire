@@ -86,10 +86,12 @@ fn sync_gpus(gpus: &mut Gpus, waits: bool) -> Result<(), String> {
 pub fn quiesce_mesh(route: BenchRoute, m: &mut LoadedModel) -> Result<(), String> {
     match route {
         BenchRoute::Single | BenchRoute::Qwen4Ep => Ok(()),
-        BenchRoute::Qwen35Pp | BenchRoute::Qwen4Pp => match m.pp_gpus.as_mut() {
-            Some(gpus) => sync_gpus(gpus, false),
-            None => Err("pipeline-parallel model has no Gpus".to_string()),
-        },
+        BenchRoute::Qwen35Pp | BenchRoute::Qwen4Pp | BenchRoute::CarrierPp => {
+            match m.pp_gpus.as_mut() {
+                Some(gpus) => sync_gpus(gpus, false),
+                None => Err("pipeline-parallel model has no Gpus".to_string()),
+            }
+        }
         BenchRoute::Qwen35DenseTp => match m.ep.as_mut() {
             Some(ep) => {
                 // The mesh route only enqueues: retire its epochs (a device
@@ -269,7 +271,9 @@ pub fn bench_prefill_mesh(
     tokens: &[u32],
 ) -> Result<(), String> {
     let run = match route {
-        BenchRoute::Single | BenchRoute::Qwen4Ep => return Err(not_a_mesh_route(route)),
+        BenchRoute::Single | BenchRoute::Qwen4Ep | BenchRoute::CarrierPp => {
+            return Err(not_a_mesh_route(route))
+        }
         BenchRoute::Qwen35Pp => qwen35_pp_prefill(m, tokens),
         BenchRoute::Qwen4Pp => qwen4_pp_prefill(m, gpu, tokens),
         BenchRoute::Qwen35MoeEp => {
@@ -313,7 +317,9 @@ pub fn bench_decode_run_mesh(
     iterations: usize,
 ) -> Result<(), String> {
     let run = match route {
-        BenchRoute::Single | BenchRoute::Qwen4Ep => return Err(not_a_mesh_route(route)),
+        BenchRoute::Single | BenchRoute::Qwen4Ep | BenchRoute::CarrierPp => {
+            return Err(not_a_mesh_route(route))
+        }
         BenchRoute::Qwen4Pp => qwen4_pp_decode(m, gpu, context, iterations),
         _ => (0..iterations).try_for_each(|i| {
             let (token, pos) = (decode_token(i), context + i);
@@ -323,9 +329,10 @@ pub fn bench_decode_run_mesh(
                 BenchRoute::Qwen35DenseTp => dense_tp_decode_forward(m, token, pos),
                 BenchRoute::Ds4Ep => ds4_ep_decode(m, token, pos),
                 BenchRoute::MinimaxEp => minimax_ep_forward(m, token, pos, "decode"),
-                BenchRoute::Single | BenchRoute::Qwen4Ep | BenchRoute::Qwen4Pp => {
-                    Err(not_a_mesh_route(route))
-                }
+                BenchRoute::Single
+                | BenchRoute::Qwen4Ep
+                | BenchRoute::Qwen4Pp
+                | BenchRoute::CarrierPp => Err(not_a_mesh_route(route)),
             };
             step.map_err(|e| format!("iter {i} pos {pos}: {e}"))
         }),
@@ -348,10 +355,18 @@ mod tests {
 
     #[test]
     fn carrier_routes_are_not_mesh_entries() {
-        for route in [BenchRoute::Single, BenchRoute::Qwen4Ep] {
+        for route in [
+            BenchRoute::Single,
+            BenchRoute::Qwen4Ep,
+            BenchRoute::CarrierPp,
+        ] {
             assert!(route.uses_carrier_hooks());
             assert!(not_a_mesh_route(route).contains("carrier"));
         }
+        // A carrier-hook pp route is still a mesh route: its devices are not
+        // the daemon `Gpu`.
+        assert!(BenchRoute::CarrierPp.is_mesh());
+        assert!(!BenchRoute::Single.is_mesh() && BenchRoute::Qwen4Ep.is_mesh());
         for route in [
             BenchRoute::Qwen35Pp,
             BenchRoute::Qwen4Pp,

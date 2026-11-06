@@ -1,0 +1,12 @@
+{
+  "schema": "pm.selector_receipt.v1",
+  "constant": "QWEN4_HC_UP_TWIN_GFX1201_MAX_ROWS",
+  "value": 8,
+  "covers": true,
+  "arch": "gfx1201",
+  "card": "R9700 x2 (fabric j6015 kE1, j6027 kF1, j6028 kFC1; confounded=false)",
+  "summary": "Raw f32 bit gate crates/rdna-compute/tests/hyper_read_up_twin_hw.rs: hyper_read_up_fused_f32_sx vs hyper_read_up_fused_f32, 156 cases (rows 1..9,15,16,17,33; F32 and BF16 normalized), 3,870,720 words, 0 mismatches. EP2 Flash-Next mq4 c512 C8 AR step (rows 8): both twins on 62.30/62.67/62.20 ms vs both off 63.66/63.97 ms, text md5 identical; C1 (rows 1) TPOT 18.88 vs 19.04 ms. The cap 8 is the largest decode, verify (K=7) and fn-lane row count; rows 9..16 and the prefill batches keep the incumbent and are not measured here, so the cap is conservative.",
+  "records": [
+    {"path": "receipts/selectors/evidence/qwen4_hc_up_twin_gfx1201_rows.txt", "sha256": "0f4ea514aa134556dd5ef074c5d70159ed605eaa4fcc00f5e8e88671bbdeec48"}
+  ]
+}

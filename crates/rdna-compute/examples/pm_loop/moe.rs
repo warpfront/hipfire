@@ -91,7 +91,11 @@
 //!   aliases synthetic expert `e % D`, a memory cap), `seed` (default 1),
 //!   `route` = `uniform` (default: `TOP` distinct uniform experts per token) |
 //!   `skew` (experts 0..min(5,TOP) on every token, rest uniform distinct) |
-//!   `all` (flat slot `f` -> expert `f % E`) | `one` (every slot to expert 0).
+//!   `all` (flat slot `f` -> expert `f % E`) | `one` (every slot to expert 0) |
+//!   `hist:<route_hist.json>[@L]` (replay the recorded per-token expert lists of a pinned
+//!   `route_hist.v1`, layer `L` or all layers' records in record order, cycling past the recording;
+//!   E and TOP must equal the recording's `n_experts`/`topk`, the ids bin is sha256-verified, the
+//!   record gets `route: {kind:"hist", path, id, layer}` and the shape `route_id`/`route_layer`).
 //!
 //! The kind (`gate_up` or `down`) comes from `--epi`; the GEMM dims follow
 //! `ExpertGeometry::plan` (so its admission rules apply):
@@ -274,6 +278,135 @@ enum Route {
     Skew,
     All,
     One,
+    Hist,
+}
+
+/// `--shape route=hist:<route_hist.json>[@L]`: the expert ids of a pinned `route_hist.v1`
+/// (`HIPFIRE_MOE_ROUTE_DUMP` records, headerless `i32` LE bin), layer `L` or every layer's
+/// records concatenated in record order. Token `t` takes recorded row `t % rows` (cycled).
+#[derive(Clone, Debug, PartialEq)]
+struct Hist {
+    path: String,
+    id: String,
+    layer: Option<u32>,
+    n_experts: usize,
+    topk: usize,
+    /// Row-major `rows x topk`.
+    ids: Vec<i32>,
+}
+
+impl Hist {
+    fn parse(spec: &str) -> Result<Hist> {
+        let (path, layer) = match spec.rsplit_once('@') {
+            Some((p, l)) => (
+                p,
+                Some(
+                    l.parse::<u32>()
+                        .map_err(|e| format!("--shape route=hist:{spec}: layer `{l}`: {e}"))?,
+                ),
+            ),
+            None => (spec, None),
+        };
+        Self::load(std::path::Path::new(path), layer)
+    }
+
+    fn load(path: &std::path::Path, layer: Option<u32>) -> Result<Hist> {
+        let err = |m: String| format!("--shape route=hist:{}: {m}", path.display());
+        let doc: Value =
+            serde_json::from_slice(&std::fs::read(path).map_err(|e| err(e.to_string()))?)
+                .map_err(|e| err(e.to_string()))?;
+        if doc["schema"] != "route_hist.v1" {
+            return Err(err(format!(
+                "schema {}: expected route_hist.v1",
+                doc["schema"]
+            )));
+        }
+        let id = crate::iu4::artefact_id(&doc).map_err(err)?;
+        let num = |v: &Value, what: &str| {
+            v.as_u64()
+                .map(|x| x as usize)
+                .ok_or_else(|| err(format!("missing or non-integer {what}")))
+        };
+        let n_experts = num(&doc["n_experts"], "n_experts")?;
+        let topk = num(&doc["topk"], "topk")?;
+        let bin_path = crate::iu4::sibling_path(
+            path,
+            doc["ids"]["path"]
+                .as_str()
+                .ok_or_else(|| err("missing ids.path".into()))?,
+        );
+        let bin =
+            std::fs::read(&bin_path).map_err(|e| err(format!("{}: {e}", bin_path.display())))?;
+        let (want, got) = (
+            doc["ids"]["sha256"].as_str().unwrap_or(""),
+            sha256_hex(&bin),
+        );
+        if want != got {
+            return Err(err(format!(
+                "ids sha256 mismatch ({}): manifest {want}, file {got}",
+                bin_path.display()
+            )));
+        }
+        let records = doc["records"]
+            .as_array()
+            .ok_or_else(|| err("missing records".into()))?;
+        let mut at = 0usize;
+        let mut ids = Vec::new();
+        for (i, r) in records.iter().enumerate() {
+            let (l, n, k) = (
+                num(&r["layer"], "record layer")?,
+                num(&r["n"], "record n")?,
+                num(&r["k"], "record k")?,
+            );
+            if k != topk {
+                return Err(err(format!("record {i}: k={k}, topk={topk}")));
+            }
+            let end = at + n * k * 4;
+            let part = bin.get(at..end).ok_or_else(|| {
+                err(format!(
+                    "record {i} runs past the ids bin ({} bytes)",
+                    bin.len()
+                ))
+            })?;
+            at = end;
+            if layer.is_some_and(|want| want as usize != l) {
+                continue;
+            }
+            for c in part.chunks_exact(4) {
+                let e = i32::from_le_bytes(c.try_into().unwrap());
+                if e < 0 || e as usize >= n_experts {
+                    return Err(err(format!(
+                        "record {i}: expert id {e} outside [0,{n_experts})"
+                    )));
+                }
+                ids.push(e);
+            }
+        }
+        if at != bin.len() {
+            return Err(err(format!(
+                "ids bin has {} bytes, records cover {at}",
+                bin.len()
+            )));
+        }
+        if ids.is_empty() {
+            return Err(err(match layer {
+                Some(l) => format!("no records for layer {l}"),
+                None => "no rows".into(),
+            }));
+        }
+        Ok(Hist {
+            path: path.display().to_string(),
+            id,
+            layer,
+            n_experts,
+            topk,
+            ids,
+        })
+    }
+
+    fn json(&self) -> Value {
+        json!({"kind": "hist", "path": self.path, "id": self.id, "layer": self.layer})
+    }
 }
 
 impl Route {
@@ -283,6 +416,7 @@ impl Route {
             Route::Skew => "skew",
             Route::All => "all",
             Route::One => "one",
+            Route::Hist => "hist",
         }
     }
 }
@@ -298,6 +432,8 @@ struct Geo {
     inter: usize,
     distinct: usize,
     route: Route,
+    /// `route=hist:<file>`: the recorded per-token expert lists (`Route::Hist`).
+    hist: Option<Hist>,
     seed: u64,
 }
 
@@ -341,6 +477,7 @@ impl Geo {
             inter: preset.4,
             distinct: 0,
             route: Route::Uniform,
+            hist: None,
             seed: 1,
         };
         let mut distinct = None;
@@ -357,14 +494,20 @@ impl Geo {
                 "D" => distinct = Some(num::<usize>(k, v)?),
                 "seed" => g.seed = num(k, v)?,
                 "route" => {
-                    g.route = match v.trim() {
+                    let v = v.trim();
+                    if let Some(spec) = v.strip_prefix("hist:") {
+                        g.hist = Some(Hist::parse(spec)?);
+                        g.route = Route::Hist;
+                        continue;
+                    }
+                    g.route = match v {
                         "uniform" => Route::Uniform,
                         "skew" => Route::Skew,
                         "all" => Route::All,
                         "one" => Route::One,
                         other => {
                             return Err(format!(
-                                "--shape route={other}: expected uniform|skew|all|one"
+                                "--shape route={other}: expected uniform|skew|all|one|hist:<route_hist.json>[@L]"
                             ))
                         }
                     }
@@ -428,6 +571,14 @@ impl Geo {
         if hot > self.experts {
             return Err("--shape route=skew needs E >= min(5, TOP)".into());
         }
+        if let Some(h) = &self.hist {
+            if h.n_experts != self.experts || h.topk != self.top {
+                return Err(format!(
+                    "--shape route=hist:{}: recording has E={} TOP={}, the shape has E={} TOP={}",
+                    h.path, h.n_experts, h.topk, self.experts, self.top
+                ));
+            }
+        }
         self.expert_geometry()?
             .plan(plan_arch(self.arch), WeightCodec::Mq4Sym)?;
         Ok(())
@@ -449,6 +600,14 @@ impl Geo {
         match self.route {
             Route::One => vec![0; l],
             Route::All => (0..l).map(|f| (f % self.experts) as u32).collect(),
+            Route::Hist => {
+                let ids = &self
+                    .hist
+                    .as_ref()
+                    .expect("Route::Hist carries its recording")
+                    .ids;
+                (0..l).map(|f| ids[f % ids.len()] as u32).collect()
+            }
             Route::Uniform | Route::Skew => {
                 let hot = self.hot();
                 let mut v = Vec::with_capacity(l);
@@ -1268,7 +1427,7 @@ impl Problem {
 
     fn shape_json(&self) -> Value {
         let g = &self.geo;
-        json!({
+        let mut v = json!({
             "preset": g.preset, "experts": g.experts, "top_k": g.top, "tokens": g.tokens,
             "hidden": g.hidden, "intermediate": g.inter, "distinct_experts": g.distinct,
             "route": g.route.name(), "seed": g.seed,
@@ -1278,7 +1437,12 @@ impl Problem {
             "live_slots": g.slots(), "total_slots": self.total_slots(),
             "expert_tensor_bytes": self.stride, "y_bytes_per_arm": self.y_bytes(),
             "device_bytes": self.device_bytes(),
-        })
+        });
+        if let Some(h) = &g.hist {
+            v["route_id"] = json!(h.id);
+            v["route_layer"] = json!(h.layer);
+        }
+        v
     }
 }
 
@@ -1659,24 +1823,43 @@ fn cand_object_object(entry: Entry, path: &str, bytes: &[u8]) -> Result<Object> 
     let gen_elf = peacemaker_isa::native::assemble(&generator.s_text, entry.spec.arch)?;
     let got = crate::iu4::abi_signature(bytes, &symbol)
         .map_err(|e| format!("--cand-object {path}: not a code object exposing {symbol}: {e}"))?;
-    let want = crate::iu4::abi_signature(&gen_elf, &symbol)?;
+    // gfx1201: the reference is the shipped image's own entry (the object the baseline launches),
+    // when that image exports the symbol; otherwise (an NT the shipped image lacks) the emit's.
+    let (want, want_what) = match shipped_reference(entry) {
+        Some(image) if crate::iu4::abi_signature(image, &symbol).is_ok() => (
+            crate::iu4::abi_signature(image, &symbol)?,
+            "shipped baseline image",
+        ),
+        _ => (
+            crate::iu4::abi_signature(&gen_elf, &symbol)?,
+            "in-tree emit",
+        ),
+    };
     if got != want {
         return Err(format!(
-            "--cand-object {path}: ABI mismatch with the in-tree emit of {}:\n  object:    {got}\n  generator: {want}",
-            entry.variant()
+            "--cand-object {path}: ABI mismatch with the {want_what} of {} in field {}:\n  object:    {got}\n  reference: {want}",
+            entry.variant(),
+            abi_diff_field(&got, &want),
         ));
     }
+    let text_sha256 = kernel_text_sha256(bytes, &symbol)?;
     Ok(Object {
         source: json!({
             "source": format!("--cand-object {path} (prebuilt candidate code object)"),
             "variant": entry.variant(),
             "sha256": sha256_hex(bytes),
+            "symbol": symbol,
+            "text_sha256": text_sha256,
         }),
         desc: json!({
             "knobs": spec_json(entry),
             "cand_object": {
                 "path": path,
                 "sha256": sha256_hex(bytes),
+                "co_sha256": sha256_hex(bytes),
+                "symbol": symbol,
+                "text_sha256": text_sha256,
+                "abi_reference": want_what,
                 "variant": entry.variant(),
                 "identical_to_generator": bytes == gen_elf.as_slice(),
             },
@@ -1685,6 +1868,56 @@ fn cand_object_object(entry: Entry, path: &str, bytes: &[u8]) -> Result<Object> 
         launch_symbol: symbol,
         bytes: bytes.to_vec(),
     })
+}
+
+/// The shipped gfx1201 image holding `entry`'s symbol (None off gfx1201).
+fn shipped_reference(entry: Entry) -> Option<&'static [u8]> {
+    if entry.spec.arch != Arch::Gfx1201 {
+        return None;
+    }
+    Some(if entry.gp {
+        rdna_compute::kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201
+    } else {
+        rdna_compute::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201
+    })
+}
+
+/// sha256 of `symbol`'s re-encoded instruction stream (the `.text` of that kernel).
+fn kernel_text_sha256(bytes: &[u8], symbol: &str) -> Result<String> {
+    let program = crate::lift(bytes)?;
+    let kernel = program
+        .kernels
+        .iter()
+        .find(|k| k.symbol.0 == symbol)
+        .ok_or_else(|| format!("object has no kernel {symbol}"))?;
+    let code = peacemaker_lift::emit::bytes(kernel, program.target.arch).map_err(err)?;
+    Ok(sha256_hex(&code))
+}
+
+/// Name of the first `abi_signature` field that differs between `a` and `b`.
+fn abi_diff_field(a: &str, b: &str) -> String {
+    const KEYS: [&str; 8] = [
+        "symbol",
+        "args",
+        "kernarg_bytes",
+        "kernarg_align",
+        "lds_bytes",
+        "max_flat_workgroup_size",
+        "wavefront_size",
+        "workgroup_processor_mode",
+    ];
+    let field = |s: &str, i: usize| -> String {
+        let start = s.find(&format!("{}=", KEYS[i])).unwrap_or(s.len());
+        let end = KEYS
+            .get(i + 1)
+            .and_then(|k| s.find(&format!(" {k}=")))
+            .unwrap_or(s.len());
+        s[start..end.max(start)].to_string()
+    };
+    (0..KEYS.len())
+        .find(|&i| field(a, i) != field(b, i))
+        .map(|i| KEYS[i].to_string())
+        .unwrap_or_else(|| "unknown".into())
 }
 
 /// Constructor for `--kernel qwen4_moe_sym` without `--rip` (gfx1201).
@@ -1718,9 +1951,9 @@ pub fn new_with_cand_object(
 ) -> Result<Box<dyn Workload>> {
     let cand_object = match cand_object {
         Some(p) => {
-            if arch != Arch::Gfx1100 {
+            if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1201) {
                 return Err(format!(
-                    "--cand-object is supported on gfx1100 only (got {})",
+                    "--cand-object is supported on gfx1100 and gfx1201 only (got {})",
                     arch.name()
                 ));
             }
@@ -2096,6 +2329,7 @@ impl Moe {
             inter: 128,
             distinct: 2,
             route: Route::Uniform,
+            hist: None,
             seed: 7,
         };
         let p = Problem::new(&geo, self.cand.spec.kind)?;
@@ -2520,6 +2754,13 @@ impl Workload for Moe {
         v
     }
 
+    fn record_extra(&self) -> Vec<(String, Value)> {
+        match &self.problem.geo.hist {
+            Some(h) => vec![("route".to_owned(), h.json())],
+            None => Vec::new(),
+        }
+    }
+
     fn candidate_knobs(&self) -> Value {
         spec_json(self.cand)
     }
@@ -2670,6 +2911,76 @@ mod tests {
     use super::*;
 
     const ARCH: Arch = Arch::Gfx1201;
+
+    /// Write a synthetic `route_hist.v1` (2 records: layer 0 rows 3, layer 1 rows 2; E=256 TOP=8).
+    fn hist_fixture(tag: &str, tamper: bool) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pm_loop_hist_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bin = Vec::new();
+        for r in 0..5i32 {
+            for j in 0..8i32 {
+                bin.extend(((r * 17 + j * 3) % 256).to_le_bytes());
+            }
+        }
+        let sha = sha256_hex(&bin);
+        if tamper {
+            bin[0] ^= 1;
+        }
+        std::fs::write(dir.join("h.ids.bin"), &bin).unwrap();
+        let doc = json!({
+            "schema": "route_hist.v1", "n_experts": 256, "topk": 8,
+            "records": [
+                {"layer": 0, "n": 3, "k": 8, "position": 0},
+                {"layer": 1, "n": 2, "k": 8, "position": 0},
+            ],
+            "ids": {"path": "h.ids.bin", "sha256": sha},
+            "id": "cd".repeat(32),
+        });
+        let p = dir.join("h.json");
+        std::fs::write(&p, serde_json::to_vec(&doc).unwrap()).unwrap();
+        p
+    }
+
+    #[test]
+    fn route_hist_replays_deterministically_and_cycles() {
+        let p = hist_fixture("det", false);
+        let shape = format!("a3b,T=7,route=hist:{}", p.display());
+        let a = Geo::parse(&shape, ARCH).unwrap();
+        let b = Geo::parse(&shape, ARCH).unwrap();
+        assert_eq!(a, b);
+        let (ra, rb) = (a.route_table(), b.route_table());
+        assert_eq!(ra, rb);
+        assert_eq!(ra.len(), 7 * 8);
+        // 5 recorded rows: token 5 replays row 0.
+        assert_eq!(ra[5 * 8..6 * 8], ra[..8]);
+        assert_eq!(ra[8], 17);
+        assert_eq!(a.route, Route::Hist);
+        let h = a.hist.as_ref().unwrap().json();
+        assert_eq!(
+            (h["kind"].as_str(), h["id"].as_str()),
+            (Some("hist"), Some("cd".repeat(32).as_str()))
+        );
+        assert!(h["layer"].is_null());
+        // `@1` selects layer 1's two rows.
+        let l1 = Geo::parse(&format!("{shape}@1"), ARCH).unwrap();
+        assert_eq!(l1.hist.as_ref().unwrap().json()["layer"], 1);
+        assert_eq!(l1.route_table()[..8], ra[3 * 8..4 * 8]);
+        assert_eq!(l1.route_table()[16..24], ra[3 * 8..4 * 8]);
+        assert!(Geo::parse(&format!("{shape}@9"), ARCH).is_err());
+    }
+
+    #[test]
+    fn route_hist_refuses_sha_and_shape_mismatch() {
+        let p = hist_fixture("sha", true);
+        let e = Geo::parse(&format!("a3b,route=hist:{}", p.display()), ARCH).unwrap_err();
+        assert!(e.contains("sha256 mismatch"), "{e}");
+        let p = hist_fixture("shape", false);
+        let e = Geo::parse(&format!("fn,route=hist:{}", p.display()), ARCH).unwrap_err();
+        assert!(
+            e.contains("E=256 TOP=8") && e.contains("E=512 TOP=10"),
+            "{e}"
+        );
+    }
 
     fn knobs(pairs: &[(&str, &str)]) -> Knobs {
         let mut k = Knobs::default();
@@ -3776,7 +4087,7 @@ mod tests {
             "{e}"
         );
         let e = build("gate_up", &junk, Arch::Gfx1151).err().unwrap();
-        assert!(e.contains("gfx1100 only"), "{e}");
+        assert!(e.contains("gfx1100 and gfx1201 only"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3833,5 +4144,96 @@ mod tests {
             .unwrap()
             .candidate()
             .is_err());
+    }
+
+    fn cand_object_on(epi: &str, shape: &str, tag: &str, bytes: &[u8]) -> Result<Object> {
+        let p =
+            std::env::temp_dir().join(format!("pm_loop_candobj_{}_{tag}.co", std::process::id()));
+        std::fs::write(&p, bytes).unwrap();
+        let mut k = knobs(&[("epi", epi)]);
+        let w = new_with_cand_object(shape, &mut k, None, Arch::Gfx1201, Some(&p));
+        let r = w.and_then(|w| w.candidate());
+        let _ = std::fs::remove_file(&p);
+        r
+    }
+
+    #[test]
+    fn gfx1201_cand_object_accepts_the_shipped_hxaco_for_every_flat_epi() {
+        let image = rdna_compute::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201;
+        for epi in [
+            "gate_up",
+            "gate_up_nt4",
+            "gate_up_nt8",
+            "down",
+            "down_nt4",
+            "down_nt8",
+        ] {
+            let o =
+                cand_object_on(epi, "T=64", epi, image).unwrap_or_else(|e| panic!("{epi}: {e}"));
+            let c = &o.desc["cand_object"];
+            assert_eq!(c["co_sha256"], sha256_hex(image), "{epi}");
+            assert_eq!(c["abi_reference"], "shipped baseline image", "{epi}");
+            assert_eq!(c["text_sha256"].as_str().unwrap().len(), 64, "{epi}");
+            assert_eq!(c["symbol"], o.launch_symbol, "{epi}");
+        }
+    }
+
+    #[test]
+    fn gfx1201_cand_object_accepts_the_shipped_gp_hxaco() {
+        let image = rdna_compute::kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201;
+        for epi in ["down_gp_nt4"] {
+            let o =
+                cand_object_on(epi, "T=64", epi, image).unwrap_or_else(|e| panic!("{epi}: {e}"));
+            assert_eq!(o.desc["cand_object"]["co_sha256"], sha256_hex(image));
+        }
+    }
+
+    #[test]
+    fn gfx1201_cand_object_refuses_a_missing_symbol_and_non_objects() {
+        // The gp image has no flat gate_up_nt8 export.
+        let e = cand_object_on(
+            "gate_up_nt8",
+            "T=64",
+            "missing",
+            rdna_compute::kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201,
+        )
+        .err()
+        .unwrap();
+        assert!(e.contains("not a code object exposing"), "{e}");
+        let e = cand_object_on("gate_up_nt8", "T=64", "junk", b"not an object")
+            .err()
+            .unwrap();
+        assert!(e.contains("--cand-object"), "{e}");
+    }
+
+    #[test]
+    fn abi_diff_field_names_the_differing_field() {
+        let a = "symbol=s args=[A, B] kernarg_bytes=64 kernarg_align=8 lds_bytes=0 max_flat_workgroup_size=256 wavefront_size=32 workgroup_processor_mode=false";
+        assert_eq!(abi_diff_field(a, a), "unknown");
+        assert_eq!(
+            abi_diff_field(a, &a.replace("args=[A, B]", "args=[A]")),
+            "args"
+        );
+        assert_eq!(
+            abi_diff_field(a, &a.replace("kernarg_bytes=64", "kernarg_bytes=72")),
+            "kernarg_bytes"
+        );
+        assert_eq!(
+            abi_diff_field(a, &a.replace("size=256", "size=128")),
+            "max_flat_workgroup_size"
+        );
+    }
+
+    /// The pre-lockstep shipped object (a full hxaco from before NT8 lockstep).
+    #[test]
+    fn gfx1201_cand_object_pre_lockstep_object() {
+        let p = "/home/kaden/qcal/release-0.4.3/pm-krsi/land/moe-route/obj/baseline.0eea1673a5308805.co";
+        let Ok(bytes) = std::fs::read(p) else {
+            eprintln!("pre-lockstep object absent: {p}");
+            return;
+        };
+        let o = cand_object_on("gate_up_nt8", "T=64", "prelock", &bytes)
+            .unwrap_or_else(|e| panic!("pre-lockstep gate_up_nt8: {e}"));
+        eprintln!("pre-lockstep cand_object: {}", o.desc["cand_object"]);
     }
 }

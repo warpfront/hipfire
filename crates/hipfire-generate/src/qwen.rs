@@ -43,6 +43,7 @@ use hipfire_engine::redline::*;
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
 use hipfire_engine::turn_cache::*;
+use hipfire_loader::bench_topology::EpKind;
 use hipfire_loader::{AsstTurnCache, EpArch, EpState, Eviction, LoadedModel};
 use hipfire_runtime::spec::{
     ClientEvent, EmitOutcome, EvictRetain, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit,
@@ -153,17 +154,22 @@ pub enum EpServeTarget {
     UnsupportedArch(u32),
 }
 
-/// EP serve dispatch by arch_id: the arch-level default. 5|6 default to the
-/// MoE server; a dense-TP load (`EpArch::Qwen35DenseTp`) is refined to its own
-/// server by the `EpArch` match in [`generate_ep`] — arch_id alone cannot
-/// distinguish them, and a MoE model must never enter the dense-TP server.
-/// Anything else is an explicit refusal, never a wrong-server fallthrough.
-pub fn ep_serve_target(arch_id: u32) -> EpServeTarget {
-    match arch_id {
-        10 => EpServeTarget::Minimax,
-        5 | 6 => EpServeTarget::Qwen35Moe,
-        9 => EpServeTarget::Deepseek4,
-        other => EpServeTarget::UnsupportedArch(other),
+/// EP serve dispatch by the loaded EP state's kind. The loaded `EpArch` alone
+/// selects the server (a dense-TP load and a MoE load of the same arch family
+/// are different kinds). No loaded EP state is an explicit refusal naming
+/// `arch_id`, never a wrong-server fallthrough.
+pub fn ep_serve_target(ep: Option<&EpArch>, arch_id: u32) -> EpServeTarget {
+    ep_serve_target_of(ep.map(EpArch::kind), arch_id)
+}
+
+/// Pure core of [`ep_serve_target`], keyed on the loaded [`EpKind`].
+fn ep_serve_target_of(kind: Option<EpKind>, arch_id: u32) -> EpServeTarget {
+    match kind {
+        Some(EpKind::Ds4) => EpServeTarget::Deepseek4,
+        Some(EpKind::Minimax) => EpServeTarget::Minimax,
+        Some(EpKind::Qwen35Moe) => EpServeTarget::Qwen35Moe,
+        Some(EpKind::Qwen35DenseTp) => EpServeTarget::Qwen35DenseTp,
+        None => EpServeTarget::UnsupportedArch(arch_id),
     }
 }
 
@@ -192,7 +198,8 @@ pub fn generate_ep(
     // `primed_think` records whether the render ended on the MiniMax `<think>`
     // generation primer (re-emitted display-only in ep_serve_minimax). ──
     let mut primed_think = false;
-    let prompt_ids: Vec<u32> = match hipfire_loader::ep_prompt_route(m.arch_id) {
+    let prompt_route = hipfire_loader::ep_prompt_route(m.ep.as_ref().map(|ep| &ep.inner));
+    let prompt_ids: Vec<u32> = match prompt_route {
         hipfire_loader::EpPromptRoute::Dsml => {
             primed_think = false;
             let tokenizer = m.tokenizer.as_ref().unwrap();
@@ -312,7 +319,7 @@ pub fn generate_ep(
         let _ = stdout.flush();
         return;
     }
-    let eos_tok = match hipfire_loader::ep_eos_route(m.arch_id) {
+    let eos_tok = match hipfire_loader::ep_eos_route(m.ep.as_ref().map(|ep| &ep.inner)) {
         hipfire_loader::EpEosRoute::Minimax => {
             // MiniMax EP state lives in `m.ep`, not `m.state`, so `minimax()` is
             // None here — read the EP eos carried on LoadedModel (set at load).
@@ -321,20 +328,11 @@ pub fn generate_ep(
         hipfire_loader::EpEosRoute::Qwen35 => m.qwen35_eos_tok,
         hipfire_loader::EpEosRoute::Deepseek4 => m.deepseek4_eos_tok,
     };
-    // Route by the loaded `EpArch`, never by arch_id alone: arch 5|6 covers
+    // Route by the loaded `EpArch` kind, never by arch_id: arch 5|6 covers
     // both the MoE server (`EpArch::Qwen35`) and the dense-TP server
     // (`EpArch::Qwen35DenseTp`), and a MoE model must never enter the
-    // dense-TP server (nor vice versa). `ep_serve_target` above is the
-    // arch-level default used when no EP state is loaded.
-    let serve_target = match m.ep.as_ref().map(|ep| &ep.inner) {
-        Some(EpArch::Minimax { .. }) => EpServeTarget::Minimax,
-        Some(EpArch::Qwen35 { .. }) => EpServeTarget::Qwen35Moe,
-        Some(EpArch::Qwen35DenseTp { .. } | EpArch::Qwen35MeshTp { .. }) => {
-            EpServeTarget::Qwen35DenseTp
-        }
-        Some(EpArch::Ds4 { .. }) => EpServeTarget::Deepseek4,
-        None => ep_serve_target(m.arch_id),
-    };
+    // dense-TP server (nor vice versa).
+    let serve_target = ep_serve_target(m.ep.as_ref().map(|ep| &ep.inner), m.arch_id);
     match serve_target {
         EpServeTarget::Minimax => ep_serve_minimax(
             m,
@@ -384,17 +382,16 @@ pub fn generate_ep(
             sampling,
         ),
         EpServeTarget::UnsupportedArch(arch) => {
-            // Fail closed: no EpArch exists for this arch_id (LFM2, Cohere2,
-            // anything new), so there is no correct server to call. Name the
-            // arch rather than running another arch's EP protocol against
-            // foreign weights.
+            // Fail closed: no EP state is loaded for this model (LFM2,
+            // Cohere2, anything new), so there is no correct server to call.
+            // Name the arch rather than running another arch's EP protocol
+            // against foreign weights.
             emit_active_attempt_error(
                 stdout,
                 Some(id),
                 &format!(
                     "EP generate not supported for arch_id={arch} \
-                     (only 9/DeepSeek4, 10/MiniMax and 5|6 Qwen3.5 \
-                     have an EP serve path)"
+                     (no loaded expert/tensor-parallel model)"
                 ),
                 "unsupported",
                 false,
@@ -2633,7 +2630,11 @@ fn qwen4_session_target(pp_mesh_active: bool, has_gpus: bool) -> Qwen4SessionTar
 /// mesh with its `Gpus` for the AR route; native MTP never reuses a session
 /// under a mesh, and a mesh without `Gpus` plans no reuse. Disjoint field
 /// borrows, as [`qwen4_bundle_and_mesh`].
-fn plan_qwen4_session(model: &mut LoadedModel, prompt: &[u32], route: SessionRoute) -> usize {
+pub(crate) fn plan_qwen4_session(
+    model: &mut LoadedModel,
+    prompt: &[u32],
+    route: SessionRoute,
+) -> usize {
     let LoadedModel { state, pp_gpus, .. } = model;
     let Some(state) = state.as_deref_mut() else {
         return 0;
@@ -3288,6 +3289,7 @@ pub fn generate_dflash(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     stop: &[String],
+    min_tokens: usize,
     // Request-resolved sampling temperature. 0.0 → greedy/argmax-accept (the
     // historical DFlash posture). >0 → distribution-preserving spec decode.
     // MTP (name=="mtp") honors temp>0 including user-explicit sampling and min_p
@@ -3871,6 +3873,9 @@ pub fn generate_dflash(
     // (greedy or sampled, thinking on or off) when `speculation.mtp_ngram`
     // (env HIPFIRE_MTP_NGRAM) resolves on for this model and GPU: `auto`, the
     // default, arms native Qwen4 MTP on gfx1151/gfx1201 only.
+    // Raon's AR producer penalizes generated tokens only
+    // (`penalty_generated_only`); the speculative route must follow.
+    let penalty_generated_only = m.raon().is_some();
     if let Some(spec) = m.speculator.as_mut() {
         spec.configure_request(SpecRequestConfig {
             temp,
@@ -3892,6 +3897,7 @@ pub fn generate_dflash(
             stop_sequences: !stop.is_empty(),
             // The Qwen spec routes emit no logprobs.
             logprobs: false,
+            penalty_generated_only,
         });
     }
     let prefill_tokens_full = prefill_tokens.len();
@@ -3923,6 +3929,7 @@ pub fn generate_dflash(
             tools: emit_tools,
             enable_grammar: grammar_enabled,
             stop: stop.to_vec(),
+            min_tokens,
             max_think: max_think_tokens,
             assistant_prefix: spec_assistant_prefix(started_in_think),
             think_mode: ThinkMode::NonThink,
@@ -4345,15 +4352,21 @@ fn spec_retire_done_fields(done: &mut serde_json::Value, run: &SpecRun) {
     }
 }
 
-/// Break-even line of the spec → AR retirement policy from `HIPFIRE_SPEC_RETIRE`
-/// (see [`hipfire_runtime::spec_retire::parse_break_even`]). A malformed value
-/// turns retirement off and says so, rather than guessing a line.
-fn spec_retire_break_even() -> Option<hipfire_runtime::spec_retire::BreakEven> {
+/// Break-even line of the spec → AR retirement policy: `HIPFIRE_SPEC_RETIRE`
+/// when set (see [`hipfire_runtime::spec_retire::parse_break_even`]), else the
+/// drafter's measured line (`drafter`), else the shared default. A malformed
+/// value turns retirement off and says so, rather than guessing a line.
+fn spec_retire_break_even(
+    drafter: Option<hipfire_runtime::spec_retire::BreakEven>,
+) -> Option<hipfire_runtime::spec_retire::BreakEven> {
     let raw = hipfire_config::developer_var("HIPFIRE_SPEC_RETIRE").ok();
-    hipfire_runtime::spec_retire::parse_break_even(raw.as_deref()).unwrap_or_else(|e| {
-        eprintln!("[spec-retire] {e}; retirement off");
-        None
-    })
+    match hipfire_runtime::spec_retire::parse_break_even(raw.as_deref()) {
+        Ok(parsed) => hipfire_runtime::spec_retire::resolve_break_even(parsed, drafter),
+        Err(e) => {
+            eprintln!("[spec-retire] {e}; retirement off");
+            None
+        }
+    }
 }
 
 /// Arch-generic spec-decode core extracted from `generate_dflash` (Phase 4 T4a).
@@ -4795,9 +4808,12 @@ pub fn generate_spec(
     // `SpecEmitRequest`; the arch's carrier turns it into the concrete
     // `Box<dyn SpecEmit>` (extracting its own grammar schema from `tools`).
     // VMM promotion needs a request whose spec emitter state an AR producer
-    // can reproduce: no tools/grammar, no stop strings, no think budget.
-    let promo_shape_ok =
-        emit_req.tools.is_none() && emit_req.stop.is_empty() && emit_req.max_think == 0;
+    // can reproduce: no tools/grammar, no stop strings, no `min_tokens`, no
+    // think budget.
+    let promo_shape_ok = emit_req.tools.is_none()
+        && emit_req.stop.is_empty()
+        && emit_req.min_tokens == 0
+        && emit_req.max_think == 0;
     let logprobs_top_k = emit_req.logprobs_top_k;
     // Logprob fields of emission token `index` (`tok`), from the target row
     // the speculator kept for it.
@@ -4818,6 +4834,7 @@ pub fn generate_spec(
         tools: emit_req.tools.as_deref(),
         enable_grammar: emit_req.enable_grammar,
         stop: emit_req.stop,
+        min_tokens: emit_req.min_tokens,
         max_think: emit_req.max_think,
         max_tokens,
         assistant_prefix: emit_req.assistant_prefix,
@@ -5088,11 +5105,13 @@ pub fn generate_spec(
     // first sampled token was already a terminator (see the guard above).
     let mut terminal_cache_invalidated = false;
     // Spec → AR retirement (`hipfire_runtime::spec_retire`) for greedy requests
-    // on a speculator with an AR step. It reads token counts only, so a greedy
-    // request retires at the same cycle on every run.
+    // on a speculator with an AR step, and sampled ones when that AR step
+    // samples with the request's law. It reads token and verified-row counts
+    // only, so a request retires at the same cycle on every run with the same
+    // draws.
     let mut retire = hipfire_runtime::spec_retire::SpecRetire::new(
-        (temp <= 1e-6 && spec.supports_ar_step())
-            .then(spec_retire_break_even)
+        ((temp <= 1e-6 || spec.supports_sampled_ar_step()) && spec.supports_ar_step())
+            .then(|| spec_retire_break_even(spec.retire_break_even()))
             .flatten(),
     );
     let mut ar_steps = 0usize;
@@ -5380,7 +5399,7 @@ pub fn generate_spec(
         let mtp_outer_t0 = std::time::Instant::now();
         let ar_step = retire.is_retired();
         let step_result = if ar_step {
-            spec.ar_step(gpu, slot, position, seed_token)
+            spec.ar_step(gpu, slot, position, seed_token, &emitted)
                 .map(|t| hipfire_runtime::spec::SpecStep::new([t], t, 0, 0))
         } else {
             spec_step(
@@ -5552,7 +5571,8 @@ pub fn generate_spec(
         } else {
             host.seed_token
         };
-        if !ar_step && retire.observe(committed_tail.len(), position) {
+        // A window verifies its seed row plus the drafts it proposed.
+        if !ar_step && retire.observe(committed_tail.len(), step.proposed + 1, position) {
             eprintln!(
                 "[spec-retire] id={id} drafter={} retired to AR at position {position} (generated {generated}, {spec_cycles} cycles, tau {:.2})",
                 spec.name(),
@@ -8971,24 +8991,33 @@ mod deepseek4_reasoning_prefix_tests {
 
 #[cfg(test)]
 mod ep_serve_target_tests {
-    use super::{ep_serve_target, EpServeTarget};
+    use super::{ep_serve_target_of, EpServeTarget};
+    use hipfire_loader::bench_topology::EpKind;
 
     #[test]
-    fn known_ep_archs_keep_their_servers_but_all_others_refuse() {
-        // Adjacent supported: DS4, MiniMax and Qwen3.5-MoE keep their servers.
-        // (A dense-TP load refines 5|6 to `Qwen35DenseTp` via its `EpArch` in
-        // `generate_ep`; arch_id alone defaults to the MoE server so MoE
-        // never enters the dense-TP server.)
-        assert_eq!(ep_serve_target(9), EpServeTarget::Deepseek4);
-        assert_eq!(ep_serve_target(10), EpServeTarget::Minimax);
-        assert_eq!(ep_serve_target(5), EpServeTarget::Qwen35Moe);
-        assert_eq!(ep_serve_target(6), EpServeTarget::Qwen35Moe);
-        // No EpArch exists for these: explicit refusal naming the arch,
-        // never the old wrong-server DS4 fallthrough.
-        assert_eq!(ep_serve_target(11), EpServeTarget::UnsupportedArch(11));
-        assert_eq!(ep_serve_target(12), EpServeTarget::UnsupportedArch(12));
-        assert_eq!(ep_serve_target(13), EpServeTarget::UnsupportedArch(13));
-        assert_eq!(ep_serve_target(0), EpServeTarget::UnsupportedArch(0));
+    fn every_loaded_ep_kind_keeps_its_server() {
+        // The loaded `EpKind` alone selects the server: a dense-TP load never
+        // enters the MoE server (nor vice versa), whatever its arch_id.
+        for (kind, target) in [
+            (EpKind::Ds4, EpServeTarget::Deepseek4),
+            (EpKind::Minimax, EpServeTarget::Minimax),
+            (EpKind::Qwen35Moe, EpServeTarget::Qwen35Moe),
+            (EpKind::Qwen35DenseTp, EpServeTarget::Qwen35DenseTp),
+        ] {
+            assert_eq!(ep_serve_target_of(Some(kind), 0), target, "{kind:?}");
+            assert_eq!(ep_serve_target_of(Some(kind), 42), target, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn no_loaded_ep_state_refuses_naming_the_arch() {
+        // Explicit refusal, never a wrong-server (the old DS4) fallthrough.
+        for arch_id in [0, 11, 13, u32::MAX] {
+            assert_eq!(
+                ep_serve_target_of(None, arch_id),
+                EpServeTarget::UnsupportedArch(arch_id)
+            );
+        }
     }
 }
 
@@ -9786,6 +9815,7 @@ mod qwen_history_chain_tests {
                     tools: None,
                     enable_grammar: false,
                     stop: Vec::new(),
+                    min_tokens: 0,
                     max_think: 0,
                     max_tokens: 4096,
                     assistant_prefix: AssistantPrefix::OpenThink,
@@ -10782,6 +10812,7 @@ pub fn generate_qwen4_ar(
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     think_mode: ThinkMode,
     stop: &[String],
+    min_tokens: usize,
     reasoning_effort: Option<&str>,
     enable_thinking: bool,
     _request_seed: u32,
@@ -10937,6 +10968,7 @@ pub fn generate_qwen4_ar(
         max_think_tokens,
         started_in_think,
         stop,
+        min_tokens,
         // Same predicate as the native MTP emitter (`Qwen35Emit::from_ctx`
         // enables its tool router on `tools.is_some()`), so both Qwen4 routes
         // classify `<tool_call>` markup identically.
@@ -11168,7 +11200,8 @@ fn qwen4_pp_mtp_parts<'a>(
 pub enum SpecPrefillTerminal {
     /// The client aborted mid-prefill: a cancel, never a validation error.
     Cancelled,
-    /// A real prefill failure: the fail-closed `validation` error.
+    /// A real prefill failure: the fail-closed `validation` error (a device out-of-memory one
+    /// answers a retryable `overload`, [`crate::common::fail_closed_wire`]).
     Failed(String),
 }
 

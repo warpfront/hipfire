@@ -20,8 +20,9 @@
 //! | `res.b_z`                  | `[9]`       | chart bias                         |
 //! | `res.eta`                  | scalar F32  | identity/chart blend `sigmoid(eta)`|
 //!
-//! The selector is uploaded as one `[17, 10240]` F32 matrix (BF16 values
-//! widened losslessly, rows `pre|post|z`); alphas, biases and `eta` as one F32
+//! The selector is uploaded as one `[17, 10240]` BF16 matrix (rows `pre|post|z`;
+//! F32 only when a value is not BF16-representable, see
+//! [`crate::weights::upload_rows_weight`]); alphas, biases and `eta` as one F32
 //! vector `[alpha_pre, alpha_post, alpha_z, eta, b_pre, b_post, b_z]`.
 
 use hipfire_dispatch::pipeline::stream_mix::{
@@ -38,6 +39,19 @@ pub const RAON_HIDDEN: usize = 2560;
 pub const RAON_POST_FACTOR: f32 = 2.0;
 /// Weightless selector RMS epsilon (`raon_mhc_selector_eps`).
 pub const RAON_SELECTOR_EPS: f32 = 1e-5;
+
+/// Whether the mHC stream ping-pong planes are stored as BF16 bits (the values
+/// they carry are bf16-rounded at every write, so this is lossless and halves
+/// every four-stream pass). Default ON (bit-identical values); requires `HIPFIRE_RAON_MHC_FUSED` not `0` (the
+/// fused route+aggregate is the only reader besides the selector GEMM, postmix
+/// and mean) and `HIPFIRE_RAON_MHC_BF16_STREAMS=1`, and a geometry the fused
+/// kernel is instantiated for. `HIPFIRE_RAON_MHC_FUSED=0` kills both.
+pub fn bf16_streams_enabled(streams: usize, width: usize) -> bool {
+    Gpu::stream_mix_route_aggregate_supported(streams, width)
+        && hipfire_config::developer_bool("HIPFIRE_RAON_MHC_FUSED", true)
+        && hipfire_config::developer_bool("HIPFIRE_RAON_MHC_BF16_STREAMS", true)
+        && crate::weights::mhc_selectors_all_bf16()
+}
 
 /// Geometry and numerics of every mHC site of one model.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -144,6 +158,16 @@ impl RaonMhcWork {
         })
     }
 
+    /// Device bytes [`Self::new`] allocates for `max_rows` rows (pool allocations
+    /// are exact, minimum 256 B each).
+    pub fn required_bytes(shape: &RaonMhcShape, max_rows: usize) -> usize {
+        let (n, z) = (shape.streams, shape.selector_rows());
+        [max_rows * z, max_rows * n, max_rows * n, max_rows * n * n]
+            .into_iter()
+            .map(|elems| (elems * 4).max(256))
+            .sum()
+    }
+
     pub fn max_rows(&self) -> usize {
         self.max_rows
     }
@@ -205,9 +229,14 @@ impl RaonMhcSite {
         if selector.iter().chain(params.iter()).any(|v| !v.is_finite()) {
             return Err("mhc: non-finite site parameter".into());
         }
-        let selector_t = gpu
-            .upload_f32(&selector, &[shape.selector_rows(), cols])
-            .map_err(|e| herr("mhc selector upload", e))?;
+        let selector_t = crate::weights::upload_rows_weight(
+            gpu,
+            &selector,
+            shape.selector_rows(),
+            cols,
+            "mhc selector",
+        )?
+        .buf;
         let params_t = match gpu.upload_f32(&params, &[params.len()]) {
             Ok(t) => t,
             Err(e) => {
@@ -293,6 +322,38 @@ impl RaonMhcSite {
             rows,
             StreamMixStage::Aggregate {
                 streams,
+                controls: work.controls(),
+                norm: Some(norm),
+                out,
+            },
+        );
+        execute_stream_mix(gpu, &op).map_err(|e| e.to_string())
+    }
+
+    /// [`Self::route`] then [`Self::aggregate`] as one stage (`pre/post/res` into
+    /// `work`, `out[rows, width]` the normed aggregate). Bit-identical to the two
+    /// calls; with `HIPFIRE_RAON_MHC_FUSED=1` the old streams are read once.
+    pub fn route_aggregate(
+        &self,
+        gpu: &mut Gpu,
+        rows: usize,
+        streams: &GpuTensor,
+        work: &RaonMhcWork,
+        norm: StreamNorm<'_>,
+        out: &GpuTensor,
+    ) -> Result<(), String> {
+        self.check_rows(rows, work)?;
+        let op = self.op(
+            rows,
+            StreamMixStage::RouteAggregate {
+                streams,
+                chart: StreamChart::HelmertBounded {
+                    selector: &self.selector,
+                    params: &self.params,
+                    post_factor: self.shape.post_factor,
+                    selector_eps: self.shape.selector_eps,
+                },
+                selector_out: &work.selector_out,
                 controls: work.controls(),
                 norm: Some(norm),
                 out,

@@ -8,7 +8,7 @@
 //   for each routed rank j (rank order, or ascending expert id):
 //       v = down_rows[r(j), col]            r = row_of_slot[row*top_k + j] or the slot itself
 //       v = bf16(v)                         if round_expert_outputs
-//       acc = acc + v * w[j]                (separate rounded multiply and add: no fma)
+//       acc = fma(v, w[j], acc)             (the shipped object contracts __fadd_rn(acc, __fmul_rn(v, w)) into v_fmac_f32)
 //   acc = bf16(acc)                         if round_routed_sum
 //   routed_out[row, col] = acc              if routed_out
 //   acc = acc + shared[row, col]            if shared

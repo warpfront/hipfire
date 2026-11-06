@@ -1405,7 +1405,7 @@ unsafe fn e8p_group(cp: *const u8, xp: *const f32, sp: *const f32) -> __m256 {
 /// The f16 at `p` widened to f32 and broadcast to all eight lanes.
 #[inline]
 #[target_feature(enable = "avx2,fma,f16c")]
-unsafe fn f16_broadcast(p: *const u8) -> __m256 {
+pub(super) unsafe fn f16_broadcast(p: *const u8) -> __m256 {
     let bits = (p as *const u16).read_unaligned();
     _mm256_cvtph_ps(_mm_set1_epi16(bits as i16))
 }

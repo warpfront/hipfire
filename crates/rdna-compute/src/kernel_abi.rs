@@ -9,6 +9,7 @@
 
 use crate::dispatch::{Gpu, GpuTensor};
 use hip_bridge::{HipError, HipResult, KernargBlob};
+use hipfire_kernel_abi::families::iu4_gdn as gdn;
 use hipfire_kernel_abi::families::qwen4_moe_sym as moe;
 use hipfire_kernel_abi::{
     families, Arch, FormatId, InvocationV1, KernelAbiV1, OperandBinding, ValidatedInvocationV1,
@@ -97,6 +98,8 @@ pub(crate) enum MoeSymCodec {
     E8p,
     /// MQ3-I4 (W3) planar tensors.
     W3,
+    /// Drop-zero planar MQ4 tensors (`MQ4G256V2P` gate/up, `MQ4G128V2P` down, DESIGN F1).
+    Mq4Planar,
 }
 
 /// Storage formats of the five operands of a `qwen4_moe_sym` launch, in contract
@@ -112,6 +115,7 @@ pub(crate) fn moe_sym_formats(
         (MoeSymCodec::Mq4, true) => moe::FORMAT_EXPERT_PTRS_DOWN_QT53,
         (MoeSymCodec::E8p, _) => moe::FORMAT_EXPERT_PTRS_E8P_PLANAR,
         (MoeSymCodec::W3, _) => moe::FORMAT_EXPERT_PTRS_W3_PLANAR,
+        (MoeSymCodec::Mq4Planar, _) => moe::FORMAT_EXPERT_PTRS_MQ4_PLANAR,
     };
     let (x_format, y_format) = if !down {
         (
@@ -186,7 +190,103 @@ pub(crate) fn validate_moe_sym(
     )
 }
 
+/// Symbol of the fused A4 GDN input projection for token (`_b1`) or slab (`_b1s`) activations.
+pub(crate) fn iu4_gdn_symbol(slab: bool) -> &'static str {
+    if slab {
+        "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s"
+    } else {
+        "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1"
+    }
+}
+
+/// The twelve operand bindings of a fused A4 GDN input projection in contract order (`Wqkv, Wz, Xq,
+/// Yz, Ybeta, Yalpha, ConvW, ConvState, Q, K16, V, X`), each `(device address, bytes bound)`: formats
+/// by activation layout.
+pub(crate) fn iu4_gdn_bindings(
+    slab: bool,
+    raw: [(*const c_void, Option<u64>); 12],
+) -> [OperandBinding; 12] {
+    use hipfire_kernel_abi::families::generic_gemm::FORMAT_BLOCK_I4_128_KB_N;
+    use hipfire_kernel_abi::families::mq6_i8::FORMAT_F32_N_M;
+    let formats = [
+        gdn::FORMAT_MQ4G256V2_WEIGHTS,
+        gdn::FORMAT_MQ4G256V2_Z_FOLD,
+        if slab {
+            gdn::FORMAT_BLOCK_I4_128_SLAB
+        } else {
+            FORMAT_BLOCK_I4_128_KB_N
+        },
+        FORMAT_F32_N_M,
+        FORMAT_F32_N_M,
+        FORMAT_F32_N_M,
+        gdn::FORMAT_F32_CONV_WEIGHT_4,
+        gdn::FORMAT_F32_CONV_STATE_3,
+        gdn::FORMAT_F16_TOKEN_HEADS_128,
+        gdn::FORMAT_F16_TOKEN_HEADS_128,
+        gdn::FORMAT_F16_TOKEN_HEADS_128,
+        gdn::FORMAT_F32_QKV_RAW_ROWS,
+    ];
+    std::array::from_fn(|i| binding_raw(raw[i].0, raw[i].1, formats[i]))
+}
+
+/// The contract params of a fused A4 GDN input projection (`iu4_gdn::PARAMS` order: `M0, Mz, Mbeta,
+/// Malpha, K, N, QScaleBits, EpsBits`).
+pub(crate) fn iu4_gdn_params(
+    dims: [usize; 4],
+    k: usize,
+    n: usize,
+    q_scale: f32,
+    eps: f32,
+) -> [u64; 8] {
+    [
+        dims[0] as u64,
+        dims[1] as u64,
+        dims[2] as u64,
+        dims[3] as u64,
+        k as u64,
+        n as u64,
+        u64::from(q_scale.to_bits()),
+        u64::from(eps.to_bits()),
+    ]
+}
+
+/// Validate one fused A4 GDN input projection launch: the 120-byte explicit image, grid, block and
+/// dynamic LDS are the contract's (`iu4_gemm.qkvzagdn.b1` / `.b1s`).
+pub(crate) fn validate_iu4_gdn(
+    arch: &str,
+    slab: bool,
+    params: [u64; 8],
+    operands: &[OperandBinding; 12],
+    grid: [u32; 3],
+) -> HipResult<ValidatedInvocationV1<'static>> {
+    let parsed = parse_arch(arch)?;
+    let symbol = iu4_gdn_symbol(slab);
+    let abi = contract(arch, symbol)?;
+    validate(
+        abi,
+        &InvocationV1 {
+            arch: parsed,
+            symbol,
+            params: &params,
+            operands,
+            grid,
+            block: [256, 1, 1],
+            dynamic_lds: gdn::DYNAMIC_LDS,
+        },
+    )
+}
+
 impl Gpu {
+    /// Bytes bound at `xq` when it is the live int4 MMQ activation scratch (its whole allocation);
+    /// `None` for any other pointer, which the validator records as an unchecked extent.
+    pub(crate) fn int4_mmq_xq_bytes(&self, xq: *mut c_void) -> Option<u64> {
+        self.scratch
+            .int4_mmq_x_scratch
+            .as_ref()
+            .filter(|b| b.as_ptr() == xq)
+            .map(|b| b.size() as u64)
+    }
+
     /// Bytes bound at `xq` when it is the live INT8 MMQ activation scratch
     /// (its whole allocation); `None` for any other pointer, which the
     /// validator records as an unchecked extent.

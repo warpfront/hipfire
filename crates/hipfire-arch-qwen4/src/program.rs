@@ -293,7 +293,6 @@ pub struct Qwen4MoeBinding<'a> {
     pub router: WeightRef<'a>,
     pub shared: MoeSharedWeights<'a>,
     pub route_policy: MoeRoutePolicy,
-    pub intermediate: usize,
     pub experts_all_gate_up_mq4: bool,
     /// Expert-slab layers whose experts mix codecs: every expert's gate/up and
     /// down dtype, and the codec-tag tensor. `None` on every other layer (a
@@ -457,19 +456,33 @@ pub fn validate_final_hyper(
     let wide_rows = checked_mul(rows, wide, "final hyper input")?;
     let hidden = checked_mul(rows, dims.hidden, "final hyper output")?;
     require_tensor(weights.norm, wide, DType::BF16, "final HC norm")?;
-    require_projection_weight(
-        &weights.input_mix_down,
-        low,
-        wide,
-        "final HC input mix down",
-    )?;
-    require_dense_weight(
-        &weights.input_mix_up,
-        wide,
-        low,
-        DType::BF16,
-        "final HC input mix up",
-    )?;
+    if weights.input_mix_down.dtype == DType::HC8E4M3Row
+        || weights.input_mix_up.dtype == DType::HC8E4M3Row
+    {
+        // The HC8 sidecar mixers (exact gfx1201): `execute_hyper_read_inner` reads them through the
+        // `hc8_gemm` decode route or expands them exactly to BF16.
+        require_hc8_weight(
+            &weights.input_mix_down,
+            low,
+            wide,
+            "final HC input mix down",
+        )?;
+        require_hc8_weight(&weights.input_mix_up, wide, low, "final HC input mix up")?;
+    } else {
+        require_projection_weight(
+            &weights.input_mix_down,
+            low,
+            wide,
+            "final HC input mix down",
+        )?;
+        require_dense_weight(
+            &weights.input_mix_up,
+            wide,
+            low,
+            DType::BF16,
+            "final HC input mix up",
+        )?;
+    }
     require_tensor(streams, wide_rows, DType::F32, "final hyper streams")?;
     require_tensor(scratch.hc_mixed, hidden, DType::F32, "final hyper mixed")
 }
@@ -824,6 +837,34 @@ fn require_projection_weight(
     }
 }
 
+/// An HC mixer that is the HC8 sidecar's `[m, k]` E4M3 payload (`m * k + 4 * m` bytes) or plain BF16.
+fn require_hc8_weight(
+    weight: &WeightRef<'_>,
+    m: usize,
+    k: usize,
+    name: &'static str,
+) -> Result<(), DispatchError> {
+    if weight.dtype == DType::BF16 {
+        return require_dense_weight(weight, m, k, DType::BF16, name);
+    }
+    require_weight(weight, m, k, name)?;
+    let bytes = rdna_compute::hc8_weight::hc8_payload_bytes(m, k)
+        .filter(|_| weight.dtype == DType::HC8E4M3Row)
+        .ok_or_else(|| {
+            DispatchError::Hip(format!(
+                "Qwen4 {name} dtype mismatch: expected BF16 or HC8E4M3Row [{m}x{k}], got {:?}",
+                weight.dtype
+            ))
+        })?;
+    if weight.buf.buf.size() < bytes {
+        return Err(DispatchError::Hip(format!(
+            "Qwen4 {name} capacity too small: need {bytes} bytes, have {}",
+            weight.buf.buf.size()
+        )));
+    }
+    Ok(())
+}
+
 fn require_weight(
     weight: &WeightRef<'_>,
     m: usize,
@@ -1097,8 +1138,10 @@ fn build_moe_decode<'a>(
             down: moe.shared.down.dtype,
         }),
         experts_all_gate_up_mq4,
-        routed_gate_up: first_gate_up.dtype,
-        routed_down: first_down.dtype,
+        // DESIGN F1: route selection reads the shipped layout; the launchers branch on the
+        // device-wide planar binding, not on the dtype.
+        routed_gate_up: first_gate_up.dtype.shipped_layout(),
+        routed_down: first_down.dtype.shipped_layout(),
         routed_has_mixed_experts: moe.expert_codec_tags.is_some(),
         has_paro_shared: false,
         per_expert_gate_up: moe.expert_gate_up_dtypes,
@@ -1193,7 +1236,9 @@ fn build_moe_prefill<'a>(
             up: moe.shared.up,
             down: moe.shared.down,
         },
-        intermediate: moe.intermediate,
+        // The shared expert's own width: the rank-local K-slice under the trunk shard (384 /
+        // 256 of 640), never the routed expert width the two coincide at on one card.
+        intermediate: moe_dims.shared_intermediate,
         scalar: scratch.moe_scalar,
         gate_out: scratch.moe_gate,
         up_out: scratch.moe_up,
@@ -1208,8 +1253,10 @@ fn build_moe_prefill<'a>(
             down: moe.shared.down.dtype,
         }),
         experts_all_gate_up_mq4: moe.experts_all_gate_up_mq4,
-        routed_gate_up: first_gate_up.dtype,
-        routed_down: first_down.dtype,
+        // DESIGN F1: route selection reads the shipped layout; the launchers branch on the
+        // device-wide planar binding, not on the dtype.
+        routed_gate_up: first_gate_up.dtype.shipped_layout(),
+        routed_down: first_down.dtype.shipped_layout(),
         routed_has_mixed_experts: moe.expert_codec_tags.is_some(),
         has_paro_shared: false,
         per_expert_gate_up: moe.expert_gate_up_dtypes,
@@ -1800,6 +1847,26 @@ mod expert_iu4_binding_tests {
         assert_eq!(production.matches("MoePrefillParams {").count(), 1);
         assert_eq!(production.matches("expert_iu4:").count(), 1);
         assert_eq!(production.matches("expert_iu4: None,").count(), 1);
+    }
+
+    /// The sealed MoE declares its shared expert at the config's own (rank-local, under the
+    /// trunk shard 384 / 256) shared width in BOTH protocols: the decode and the grouped
+    /// prefill constructors read it from the program dims, and no constructor reads the routed
+    /// expert width (what `Qwen4MoeBinding::intermediate` carried) for the shared expert -- the
+    /// two coincide at 640 on one card only, and a call that disagrees with its route policy's
+    /// shared width selects no grouped route.
+    #[test]
+    fn decode_and_prefill_bind_the_shared_expert_at_the_dims_shared_width() {
+        let src = include_str!("program.rs");
+        let production = src.split(concat!("#[cfg", "(test)]")).next().unwrap();
+        assert_eq!(
+            production
+                .matches("intermediate: moe_dims.shared_intermediate,")
+                .count(),
+            2
+        );
+        assert!(!production.contains("moe.intermediate"));
+        assert!(!production.contains("pub intermediate: usize,\n    pub experts_all_gate_up_mq4"));
     }
 }
 

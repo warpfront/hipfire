@@ -38,6 +38,50 @@ fn dpp_text_roundtrips_and_assembles_to_the_shipped_words() {
             [0x7fb2_02fa, 0xff01_50ed],
             "v_mov_b32_dpp v217, v237 row_share:0 row_mask:0xf bank_mask:0xf",
         ),
+        (
+            [0x7e02_02fa, 0xff00_e402],
+            "v_mov_b32_dpp v1, v2 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+        ),
+        (
+            [0x7e02_02fa, 0xff00_1b02],
+            "v_mov_b32_dpp v1, v2 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+        ),
+        (
+            [0x7e02_02fa, 0xff01_1302],
+            "v_mov_b32_dpp v1, v2 row_shr:3 row_mask:0xf bank_mask:0xf",
+        ),
+        (
+            [0x7e02_02fa, 0xff01_2302],
+            "v_mov_b32_dpp v1, v2 row_ror:3 row_mask:0xf bank_mask:0xf",
+        ),
+        (
+            [0x7e02_02fa, 0xff01_4002],
+            "v_mov_b32_dpp v1, v2 row_mirror row_mask:0xf bank_mask:0xf",
+        ),
+        (
+            [0x7e02_02fa, 0xff01_4102],
+            "v_mov_b32_dpp v1, v2 row_half_mirror row_mask:0xf bank_mask:0xf",
+        ),
+        (
+            [0x7e02_02fa, 0xff01_5302],
+            "v_mov_b32_dpp v1, v2 row_share:3 row_mask:0xf bank_mask:0xf",
+        ),
+        (
+            [0x7e02_02fa, 0xff01_6302],
+            "v_mov_b32_dpp v1, v2 row_xmask:3 row_mask:0xf bank_mask:0xf",
+        ),
+        (
+            [0x7e02_02fa, 0x3509_0302],
+            "v_mov_b32_dpp v1, v2 row_shl:3 row_mask:0x3 bank_mask:0x5 bound_ctrl:1",
+        ),
+        (
+            [0x7e06_02e9, 0x688f_ac03],
+            "v_mov_b32_dpp v3, v3 dpp8:[4,5,6,7,0,1,2,3]",
+        ),
+        (
+            [0x7e0a_02e9, 0xffff_ff05],
+            "v_mov_b32_dpp v5, v5 dpp8:[7,7,7,7,7,7,7,7]",
+        ),
     ] {
         let (inst, used) = gfx12::decode(&words).expect("shipped DPP encoding");
         assert_eq!(used, 2);
@@ -477,5 +521,52 @@ fn swmmac_index_key_prints_before_neg_lo_and_roundtrips() {
         assert_eq!(canonical(&inst, Arch::Gfx1201).unwrap(), expected);
         let parsed = crate::text::parse_line(expected, Arch::Gfx1201).unwrap();
         assert_eq!(gfx12::encode(&parsed).unwrap().as_slice(), &words);
+    }
+}
+
+/// gfx1201 words print as llvm-objdump spells them: GLOBAL `th:`/`scope:` from
+/// the cache policy, an atomic's `vdst` only when it returns, `s_sleep`'s
+/// decimal-up-to-64 immediate, and the symbolic `hwreg`/`MSG_RTN_*` names.
+#[test]
+fn gfx1201_global_sleep_hwreg_and_rtn_message_print_like_objdump() {
+    for (words, line) in [
+        (
+            &[0xee050006, 0x000c0001, 0x00000802][..],
+            "global_load_b32 v1, v2, s[6:7] offset:8 scope:SCOPE_SYS",
+        ),
+        (
+            &[0xee06c004, 0x01040000, 0x00000000][..],
+            "global_store_b64 v0, v[2:3], s[4:5] scope:SCOPE_SE",
+        ),
+        (
+            &[0xee0a401c, 0x77900000, 0xfffff800][..],
+            "global_store_addtid_b32 v239, s[28:29] offset:-8 th:TH_STORE_NT",
+        ),
+        (
+            &[0xee0d4002, 0x009c0006, 0x00001000][..],
+            "global_atomic_add_u32 v6, v0, v1, s[2:3] offset:16 th:TH_ATOMIC_RETURN scope:SCOPE_SYS",
+        ),
+        (
+            &[0xee0d4002, 0x008c0000, 0x00001000][..],
+            "global_atomic_add_u32 v0, v1, s[2:3] offset:16 scope:SCOPE_SYS",
+        ),
+        (&[0xbf830040][..], "s_sleep 64"),
+        (&[0xbf830041][..], "s_sleep 0x41"),
+        (&[0xbf83007f][..], "s_sleep 0x7f"),
+        (
+            &[0xb88208c1][..],
+            "s_getreg_b32 s2, hwreg(HW_REG_WAVE_MODE, 3, 2)",
+        ),
+        (&[0xb882f83f][..], "s_getreg_b32 s2, hwreg(63)"),
+        (
+            &[0xbe804d81][..],
+            "s_sendmsg_rtn_b64 s[0:1], sendmsg(MSG_RTN_GET_DDID)",
+        ),
+    ] {
+        let (inst, used) = gfx12::decode(words).unwrap();
+        assert_eq!(used, words.len(), "{line}");
+        assert_eq!(canonical(&inst, Arch::Gfx1201).unwrap(), line);
+        let parsed = crate::text::parse_line(line, Arch::Gfx1201).unwrap();
+        assert_eq!(gfx12::encode(&parsed).unwrap().as_slice(), words, "{line}");
     }
 }

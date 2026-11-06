@@ -1,0 +1,4 @@
+27b8380cd5911fddd4b190a545e38c2f  /home/kaden/qcal/release-0.4.3/pmrip/pkd-fa2-cand/bin/hip_loop-pkdint
+80415e92db928269a244e9acd028e4f6  /home/kaden/qcal/release-0.4.3/pmrip/pkd-fa2-cand/bin/pm-census-pkdint
+f28e07704c4860380e95f04478f46277  /home/kaden/qcal/release-0.4.3/pmrip/pkd-comb/kernels/src/latent_attention_flash_fa2_q8.hip
+dc97c2e250473a4aa916f3fda6e123ce  /home/kaden/qcal/release-0.4.3/pmrip/pkd-comb/kernels/src/latent_attention_flash.hip

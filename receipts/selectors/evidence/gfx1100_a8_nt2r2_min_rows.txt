@@ -1,0 +1,69 @@
+XTX (gfx1100) grouped W4A8 node bench, kernel us per call (median of 5 batches of 8 back-to-back launches after a 100-launch clock warm-up, two weight sets alternating), default entry of the incumbent (base) and of this change (new). Raw logs: raon/pfx/ev/xmoe/xtx/node-*
+--- uni-base
+== site routed tokens 64 route uniform slots 384 bound 2304 m_total 1952 live_tiles 122 arch gfx1100
+  gate_up: default nt2r1 499 us; best nt4r1 487 us
+  down: default nt2r1 327 us; best nt4r1 315 us
+== site routed tokens 256 route uniform slots 1536 bound 3456 m_total 2192 live_tiles 137 arch gfx1100
+  gate_up: default nt2r1 533 us; best nt4r1 527 us
+  down: default nt2r1 351 us; best nt4r1 347 us
+== site routed tokens 512 route uniform slots 3072 bound 4992 m_total 4048 live_tiles 253 arch gfx1100
+  gate_up: default nt2r1 698 us; best nt2r2 671 us
+  down: default nt2r1 443 us; best nt2r2 426 us
+== site routed tokens 4096 route uniform slots 24576 bound 26496 m_total 25552 live_tiles 1597 arch gfx1100
+  gate_up: default nt2r2 3645 us; best nt2r2 3645 us
+  down: default nt2r2 2192 us; best nt2r2 2192 us
+--- skew-base
+== site routed tokens 64 route skew slots 384 bound 2304 m_total 1728 live_tiles 108 arch gfx1100
+  gate_up: default nt2r1 439 us; best nt4r1 430 us
+  down: default nt2r1 289 us; best nt4r1 279 us
+== site routed tokens 256 route skew slots 1536 bound 3456 m_total 2704 live_tiles 169 arch gfx1100
+  gate_up: default nt2r1 568 us; best nt2r1 568 us
+  down: default nt2r1 369 us; best nt1r2 365 us
+== site routed tokens 512 route skew slots 3072 bound 4992 m_total 4048 live_tiles 253 arch gfx1100
+  gate_up: default nt2r1 738 us; best nt2r2 706 us
+  down: default nt2r1 472 us; best nt2r2 452 us
+== site routed tokens 4096 route skew slots 24576 bound 26496 m_total 25488 live_tiles 1593 arch gfx1100
+  gate_up: default nt2r2 3648 us; best nt2r2 3648 us
+  down: default nt2r2 2189 us; best nt2r2 2189 us
+--- real1-base
+== site routed tokens 512 route file-L1c3 slots 3072 bound 4992 m_total 4064 live_tiles 254 arch gfx1100
+  gate_up: default nt2r1 741 us; best nt2r2 701 us
+  down: default nt2r1 473 us; best nt2r2 442 us
+--- real12-base
+== site routed tokens 512 route file-L12c3 slots 3072 bound 4992 m_total 4064 live_tiles 254 arch gfx1100
+  gate_up: default nt2r1 733 us; best nt2r2 696 us
+  down: default nt2r1 471 us; best nt2r2 440 us
+--- f-uni-new
+== site routed tokens 64 route uniform slots 384 bound 2304 m_total 1952 live_tiles 122 arch gfx1100
+  gate_up: default nt2r1 497 us; best nt4r1 483 us
+  down: default nt2r1 326 us; best nt4r1 314 us
+== site routed tokens 256 route uniform slots 1536 bound 3456 m_total 2192 live_tiles 137 arch gfx1100
+  gate_up: default nt2r1 527 us; best nt4r1 516 us
+  down: default nt2r1 348 us; best nt4r1 342 us
+== site routed tokens 512 route uniform slots 3072 bound 4992 m_total 4048 live_tiles 253 arch gfx1100
+  gate_up: default nt2r2 633 us; best nt2r2 633 us
+  down: default nt2r2 410 us; best nt2r2 410 us
+== site routed tokens 4096 route uniform slots 24576 bound 26496 m_total 25552 live_tiles 1597 arch gfx1100
+  gate_up: default nt2r2 3408 us; best nt2r2 3408 us
+  down: default nt2r2 2068 us; best nt2r2 2068 us
+--- f-skew-new
+== site routed tokens 64 route skew slots 384 bound 2304 m_total 1728 live_tiles 108 arch gfx1100
+  gate_up: default nt2r1 439 us; best nt4r1 427 us
+  down: default nt2r1 290 us; best nt4r1 279 us
+== site routed tokens 256 route skew slots 1536 bound 3456 m_total 2704 live_tiles 169 arch gfx1100
+  gate_up: default nt2r1 558 us; best nt4r1 554 us
+  down: default nt2r1 365 us; best nt4r1 359 us
+== site routed tokens 512 route skew slots 3072 bound 4992 m_total 4048 live_tiles 253 arch gfx1100
+  gate_up: default nt2r2 664 us; best nt2r2 664 us
+  down: default nt2r2 430 us; best nt2r2 430 us
+== site routed tokens 4096 route skew slots 24576 bound 26496 m_total 25488 live_tiles 1593 arch gfx1100
+  gate_up: default nt2r2 3413 us; best nt2r2 3413 us
+  down: default nt2r2 2071 us; best nt2r2 2071 us
+--- f-real1-new
+== site routed tokens 512 route file-L1c3 slots 3072 bound 4992 m_total 4064 live_tiles 254 arch gfx1100
+  gate_up: default nt2r2 665 us; best nt2r2 665 us
+  down: default nt2r2 429 us; best nt2r2 429 us
+--- f-real12-new
+== site routed tokens 512 route file-L12c3 slots 3072 bound 4992 m_total 4064 live_tiles 254 arch gfx1100
+  gate_up: default nt2r2 658 us; best nt2r2 658 us
+  down: default nt2r2 425 us; best nt2r2 425 us

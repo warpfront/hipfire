@@ -149,6 +149,21 @@ pub trait Workload {
     /// NaN-ness. 0.0 iff element-wise equal.
     fn max_abs_diff(&self, a: &[u8], b: &[u8]) -> Result<f64>;
 
+    /// Per-buffer comparison of the downloaded baseline and candidate outputs, recorded as
+    /// `correctness.identity_by_buffer` (`Null`: the workload has a single output and the record's
+    /// `identical_to_baseline` is the whole story).
+    fn identity_detail(&self, _base: &[u8], _cand: &[u8]) -> Value {
+        Value::Null
+    }
+
+    /// Run the PRODUCT launcher on the same inputs as the arms and compare its outputs with the
+    /// shipped baseline arm's payload `base_out`; recorded as `correctness.product_launcher`
+    /// (`Null`: the workload has no product launcher to cross-check). A record with
+    /// `"pass": false` fails correctness.
+    fn product_oracle(&self, _gpu: &mut Gpu, _base_out: &[u8]) -> Value {
+        Value::Null
+    }
+
     /// `true` when correctness requires the candidate's output to be bitwise
     /// equal to the shipped baseline in addition to passing the CPU reference.
     fn requires_baseline_identity(&self) -> bool {

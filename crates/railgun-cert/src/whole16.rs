@@ -1032,6 +1032,8 @@ mod tests {
             unguarded_unresolved: vec![],
             guards: vec![],
             indexed_effects: vec![],
+            sealed_tables: vec![],
+            descriptor_arenas: vec![],
             required_witnesses: vec![],
             case_digest: String::new(),
             guard_flag: None,

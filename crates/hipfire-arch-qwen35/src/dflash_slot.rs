@@ -192,6 +192,12 @@ pub fn load_dflash_shared(
     let draft_hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("{e}"))?;
     let draft_config = DflashConfig::from_hfq(&draft_hfq)
         .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
+    if draft_config.target_streams_per_layer != 1 {
+        return Err(format!(
+            "DFlash draft expects {} target streams per layer; this target captures one",
+            draft_config.target_streams_per_layer
+        ));
+    }
 
     // Window resolution mirrors load_dflash_state: env override wins, else
     // the draft-declared window, else Legacy. Split (non-all-sliding) drafts

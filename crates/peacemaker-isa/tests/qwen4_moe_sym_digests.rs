@@ -103,6 +103,18 @@ fn module_digests() -> Vec<(String, String)> {
     }
     let (_, text, _) = qwen4_moe_down_gp::emit_module(Arch::Gfx1201).unwrap();
     out.push((qwen4_moe_down_gp::module_name(Arch::Gfx1201), sha(&text)));
+    // F1 drop-zero planar twins (gfx1201).
+    let (_, text, _) = moe::emit_module_codec(Arch::Gfx1201, WeightCodec::Mq4SymPlanar).unwrap();
+    out.push((
+        Spec::module_codec(Arch::Gfx1201, WeightCodec::Mq4SymPlanar),
+        sha(&text),
+    ));
+    let (_, text, _) =
+        qwen4_moe_down_gp::emit_module_codec(Arch::Gfx1201, WeightCodec::Mq4SymPlanar).unwrap();
+    out.push((
+        qwen4_moe_down_gp::module_name_codec(Arch::Gfx1201, WeightCodec::Mq4SymPlanar),
+        sha(&text),
+    ));
     out
 }
 
@@ -395,6 +407,14 @@ const MODULES: &[(&str, &str)] = &[
     (
         "qwen4_moe_down_gp_pm_gfx1201",
         "a745708078c40797dc4fae02d8d2162fbf4c339f90644a5dd870c93b4ce70a78",
+    ),
+    (
+        "qwen4_moe_iu4_sym_p_pm_gfx1201",
+        "be2cd77565503dac50bf3e1c248203398477ea1484a92ba3a4e36c315e955c9e",
+    ),
+    (
+        "qwen4_moe_down_gp_p_pm_gfx1201",
+        "f50bfdda13ecb1648541c32470f93ee32efee9bf1bb481afeac6c94d597c0d71",
     ),
 ];
 

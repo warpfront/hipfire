@@ -149,8 +149,13 @@ const USAGE: &str = "usage: HIPFIRE_OFFLOAD_EXEC=cpu qwen4_cpu_split_parity MODE
     HIPFIRE_QWEN4_D2_DEFAULT=1 [HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N optional diagnostic override; unset/auto = product placement] (HIPFIRE_OFFLOAD_EXEC unset) \
     qwen4_cpu_split_parity MODEL.mq4 TEXT.txt --untiered [same options, no --hot-budget-mib/--hotset]";
 
-/// Rows the split serves at most (`CPU_SPLIT_MAX_ROWS`).
-const MAX_SPLIT_ROWS: usize = 4;
+/// Rows the split serves at most: `CPU_SPLIT_MAX_ROWS` (4), or the wider
+/// `HIPFIRE_QWEN4_D2_WINDOW_ROWS` window (`5..=8`; set it for a `--rows 5..8`
+/// run, the executor is then built for that many rows).
+fn max_split_rows() -> usize {
+    hipfire_config::memory::qwen4_d2_window_rows()
+        .max(hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS)
+}
 
 // ── arguments ────────────────────────────────────────────────────────
 
@@ -264,17 +269,19 @@ fn parse_args() -> R<Args> {
             return Err("--hot-budget-mib must be > 0".into());
         }
     }
-    if rows == 0 || rows > MAX_SPLIT_ROWS {
+    if rows == 0 || rows > max_split_rows() {
         return Err(format!(
-            "--rows {rows}: the split serves 1..={MAX_SPLIT_ROWS} rows"
+            "--rows {rows}: the split serves 1..={} rows (5..8 need HIPFIRE_QWEN4_D2_WINDOW_ROWS)",
+            max_split_rows()
         ));
     }
     if greedy && rows != 1 {
         return Err("--greedy feeds one argmax token per step: it needs --rows 1".into());
     }
-    if prompt_rows <= MAX_SPLIT_ROWS {
+    if prompt_rows <= max_split_rows() {
         return Err(format!(
-            "--prompt-rows {prompt_rows}: the prefill must be wider than {MAX_SPLIT_ROWS} rows so only decode/verify steps take the split"
+            "--prompt-rows {prompt_rows}: the prefill must be wider than {} rows so only decode/verify steps take the split",
+            max_split_rows()
         ));
     }
     if steps == 0 {
@@ -534,6 +541,13 @@ fn load(args: &Args, max_seq: usize) -> R<Model> {
     let trunk_overlay =
         hipfire_arch_qwen4::resolve_trunk_overlay(&hfq, path, &gpu.arch, &receipt.config)
             .map_err(|x| format!("qwen4 trunk overlay: {x}"))?;
+    let hc8_sidecar = hipfire_arch_qwen4::resolve_hc8_sidecar(
+        &hfq,
+        path,
+        gpu.flags.qwen4_hc8_enabled(),
+        &receipt.config,
+    )
+    .map_err(|x| format!("qwen4 hc8 sidecar: {x}"))?;
     let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
         &gpu,
         &hfq,
@@ -845,6 +859,11 @@ fn load(args: &Args, max_seq: usize) -> R<Model> {
             .attach_trunk_overlay(overlay)
             .map_err(|x| format!("qwen4 trunk overlay: {x}"))?;
     }
+    if let Some(sidecar) = hc8_sidecar {
+        bundle
+            .attach_hc8_sidecar(sidecar)
+            .map_err(|x| format!("qwen4 hc8 sidecar: {x}"))?;
+    }
     bundle
         .attach_forward(&mut gpu, max_seq, scratch_mode)
         .map_err(|x| format!("qwen4 forward setup: {x}"))?;
@@ -1021,7 +1040,7 @@ fn analyze(rec: &SplitParityRecord, shadow: &HfqShadow, agg: &mut LayerAgg) -> R
     let n_experts = rec.placement.len();
     let slots = rows * top_k;
     if rows == 0
-        || rows > MAX_SPLIT_ROWS
+        || rows > max_split_rows()
         || rec.x_rot.len() != rows * dim
         || rec.ids.len() != slots
         || rec.weights.len() != slots

@@ -43,6 +43,11 @@ cond-probe = []
 # `railgun::npu`: the XDNA2 / AIE2P NPU runtime (amdxdna DRM ioctls, BOs, submit, ring, tape, FCLK guard,
 # dlopen'd HIP interop). Experimental and dark: no hipfire runtime path enables it.
 npu = ["dep:parking_lot", "dep:hipfire-config"]
+# Lab-only admission state `lab: differential-verified, certificate pending`
+# (`railgun::admission`, `KernelProgram::admit_lab_pending`): a node whose only
+# missing certificate is a task-graph/arena one runs through the same pipeline
+# with the certificate slot marked pending. Never enabled by a product build.
+lab = []
 
 [[example]]
 name = "g4_probe"

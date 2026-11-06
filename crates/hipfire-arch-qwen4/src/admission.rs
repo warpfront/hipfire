@@ -1381,6 +1381,198 @@ where
         .unwrap_or_else(|| format!("qwen4: pipeline parallelism: {note}")))
 }
 
+/// Every prefill chunk a PP mesh may settle on, largest first (each a whole
+/// 256-row tile multiple): the union of the ordinary admission rungs
+/// (8192, 4096, 2048, 1536) and the auto-fit rungs (2048, 1024, 512, 256).
+/// [`qwen4_pp_chunk_ladder`] keeps the rungs at or below a ceiling.
+pub const QWEN4_PP_CHUNK_LADDER: [usize; 7] = [8192, 4096, 2048, 1536, 1024, 512, 256];
+
+/// The rungs the mesh-wide chunk negotiation ([`qwen4_pp_negotiate_chunk`])
+/// tries, largest first: `ceiling` itself (the chunk the auto-fit settled on,
+/// the requested chunk when it fit), then every [`QWEN4_PP_CHUNK_LADDER`]
+/// rung below it. A `pinned` chunk (`HIPFIRE_PREFILL_CHUNK_ROWS`) is the only
+/// rung: it is never lowered.
+pub fn qwen4_pp_chunk_ladder(ceiling: usize, pinned: bool) -> Vec<usize> {
+    if pinned {
+        return vec![ceiling];
+    }
+    std::iter::once(ceiling)
+        .chain(
+            QWEN4_PP_CHUNK_LADDER
+                .into_iter()
+                .filter(|&rows| rows < ceiling),
+        )
+        .collect()
+}
+
+/// One band's line of the chunk negotiation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Qwen4PpBandChunk {
+    pub stage: usize,
+    pub band: std::ops::Range<usize>,
+    /// The capacity this band was judged against (bytes).
+    pub capacity: u64,
+    /// The largest rung of the ladder whose census fits `capacity`; `None`
+    /// when not even the smallest rung does.
+    pub max_rows: Option<usize>,
+    /// The census bytes at the ladder's first (largest) rung and at the
+    /// smallest one, for the refusal text.
+    pub required_largest: u64,
+    pub required_smallest: u64,
+}
+
+/// The mesh-wide canonical prefill chunk and the per-band admissible rungs it
+/// was the minimum of.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Qwen4PpChunkNegotiation {
+    /// The chunk every band and the mesh load at: the minimum over the bands
+    /// of each band's largest admissible rung.
+    pub chunk_rows: usize,
+    /// The chunk the load asked for (the ladder's first rung).
+    pub requested: usize,
+    pub bands: Vec<Qwen4PpBandChunk>,
+}
+
+impl Qwen4PpChunkNegotiation {
+    /// The one log line naming every band's admissible rung and the chosen
+    /// canonical chunk.
+    pub fn log_line(&self) -> String {
+        let bands = self
+            .bands
+            .iter()
+            .map(|band| {
+                format!(
+                    "band {} (layers {}..{}) {}",
+                    band.stage,
+                    band.band.start,
+                    band.band.end,
+                    band.max_rows
+                        .map_or_else(|| "none".to_string(), |rows| rows.to_string())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let limit = self
+            .bands
+            .iter()
+            .filter(|band| band.max_rows == Some(self.chunk_rows))
+            .map(|band| band.stage.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        if self.chunk_rows == self.requested {
+            format!(
+                "qwen4 PP canonical chunk: {} rows (every band admits it; per-band largest admissible rung: {bands})",
+                self.chunk_rows
+            )
+        } else {
+            format!(
+                "qwen4 PP canonical chunk: {} rows, lowered from {} for the whole mesh by band {limit} (per-band largest admissible rung: {bands})",
+                self.chunk_rows, self.requested
+            )
+        }
+    }
+}
+
+/// The mesh-wide canonical prefill chunk, decided once before any band loads.
+///
+/// Every band must prefill the same chunk (the bands' chunk is the mesh's
+/// canonical chunk: an edge carries one chunk's streams and a different
+/// chunking changes the numerics), but each band's VRAM budget admits a
+/// different largest rung. `tables` holds, for each ladder rung largest first
+/// ([`qwen4_pp_chunk_ladder`]), every rank's census line at that rung
+/// ([`qwen4_pp_rank_lines`]); `capacity[stage]` is the VRAM that rank can hold
+/// (the load passes the smaller of its free VRAM and its freshly opened
+/// device's planned capacity, the figure the band's own admission reads). A
+/// band admits a rung when its census at that rung fits `capacity`; the
+/// canonical chunk is the smallest of the bands' largest admitted rungs, so a
+/// band that is tighter than the rest lowers the chunk for everyone instead
+/// of failing its own load.
+///
+/// With `pinned` (a single-rung ladder: the operator's chunk) nothing is
+/// lowered: a band that cannot admit it is a refusal naming that band and the
+/// chunk it could admit.
+pub fn qwen4_pp_negotiate_chunk(
+    tables: &[(usize, Vec<Qwen4PpRankFit>)],
+    capacity: &[u64],
+    pinned: bool,
+) -> Result<Qwen4PpChunkNegotiation, String> {
+    let (requested, first) = tables
+        .first()
+        .ok_or_else(|| "qwen4: topology.pp chunk negotiation without a rung".to_string())?;
+    let stages = first.len();
+    if capacity.len() != stages || tables.iter().any(|(_, lines)| lines.len() != stages) {
+        return Err(format!(
+            "qwen4: topology.pp chunk negotiation: {} capacity readings for {stages} ranks",
+            capacity.len()
+        ));
+    }
+    let smallest = &tables[tables.len() - 1].1;
+    let bands: Vec<Qwen4PpBandChunk> = (0..stages)
+        .map(|stage| Qwen4PpBandChunk {
+            stage,
+            band: first[stage].band.clone(),
+            capacity: capacity[stage],
+            max_rows: tables
+                .iter()
+                .find(|(_, lines)| lines[stage].required <= capacity[stage])
+                .map(|(rows, _)| *rows),
+            required_largest: first[stage].required,
+            required_smallest: smallest[stage].required,
+        })
+        .collect();
+    let unfit: Vec<String> = bands
+        .iter()
+        .filter(|band| band.max_rows.is_none())
+        .map(|band| {
+            format!(
+                "band {} (layers {}..{}) needs {} MiB even at the smallest chunk ({} rows) but its device holds {} MiB",
+                band.stage,
+                band.band.start,
+                band.band.end,
+                band.required_smallest.div_ceil(1 << 20),
+                tables[tables.len() - 1].0,
+                band.capacity >> 20
+            )
+        })
+        .collect();
+    if !pinned && !unfit.is_empty() {
+        return Err(format!(
+            "qwen4: topology.pp: no prefill chunk fits every band: {}; rebalance HIPFIRE_PP_LAYERS or lower memory.max_seq",
+            unfit.join("; ")
+        ));
+    }
+    let chunk_rows = bands
+        .iter()
+        .filter_map(|band| band.max_rows)
+        .min()
+        .unwrap_or(*requested);
+    if pinned && bands.iter().any(|band| band.max_rows != Some(*requested)) {
+        let short: Vec<String> = bands
+            .iter()
+            .filter(|band| band.max_rows != Some(*requested))
+            .map(|band| {
+                format!(
+                    "band {} (layers {}..{}) needs {} MiB at {requested} rows but its device holds {} MiB",
+                    band.stage,
+                    band.band.start,
+                    band.band.end,
+                    band.required_largest.div_ceil(1 << 20),
+                    band.capacity >> 20
+                )
+            })
+            .collect();
+        return Err(format!(
+            "qwen4: topology.pp: the explicit prefill chunk HIPFIRE_PREFILL_CHUNK_ROWS={requested} is not admitted by every band and a band never shrinks the canonical chunk: {}",
+            short.join("; ")
+        ));
+    }
+    Ok(Qwen4PpChunkNegotiation {
+        chunk_rows,
+        requested: *requested,
+        bands,
+    })
+}
+
 /// Largest streams payload of one band edge at `chunk_rows` canonical rows:
 /// `rows * hc_count * hidden * 4` (the F32 worst case; BF16 halves it), the
 /// `max_bytes` for `Gpus::provision_mesh_edges`.
@@ -1975,6 +2167,332 @@ mod tests {
             assert_eq!(qwen4_pp_edge_max_bytes(&config, 4096), Ok(167_772_160));
             assert!(qwen4_pp_edge_max_bytes(&config, 0).is_err());
             assert!(qwen4_pp_edge_max_bytes(&config, usize::MAX).is_err());
+        }
+    }
+
+    /// The mesh-wide canonical prefill chunk ([`qwen4_pp_negotiate_chunk`]) on
+    /// the field-reported box: Flash-Next PP5 on 24 GB 7900 XTX cards, pure CPU.
+    ///
+    /// The reported load (`dg-pp6` receipt, build f648d3a9a8): six cards of
+    /// 24,560 MiB, PP5 on the first five, the host link measured narrow
+    /// (7.1 GB/s) so the requested chunk is 8192, bands 0..10, 10..19,
+    /// 19..29, 29..39, 39..48 (the band loads logged 19..29 and 29..39, the
+    /// refusal named 39..48). Bands 0 to 3 loaded at the 8192-row chunk; the
+    /// output band (39..48) picked 4096 in its own rung search and the load
+    /// died on `band 39..48 allocated chunk rows Some(4096) but the canonical
+    /// chunk is 8192`.
+    ///
+    /// Root cause pinned here: the PP census charges every band its own
+    /// forward scratch (`forward_census_scope`: the PLE input buffers only on
+    /// the input band, the head only on the output band) while the band's own
+    /// rung search charged the WHOLE-model forward
+    /// (`qwen4_forward_device_bytes`), 2 GiB more on a middle band at 8192
+    /// rows, so the tightest band (the output band: head and MTP weights)
+    /// failed the search the census had admitted. The receipt records the
+    /// cards' total (24,560 MiB) and per-card peaks, not each rank's free
+    /// VRAM, so the per-rank capacity is emulated from the census itself (see
+    /// `Fixture::dg_capacity`).
+    mod pp_chunk_negotiation {
+        use super::*;
+        use crate::gpu_forward::Qwen4ForwardScratchMode::Full;
+        use crate::gpu_forward::QWEN4_FORWARD_HEADROOM_BYTES;
+        use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
+        use hipfire_runtime::mesh_placement::BandPlacement;
+        use hipfire_runtime::weight_manifest::WeightEntry;
+        use rdna_compute::tensor_ops::QsaKvFormat;
+
+        const MIB: u64 = 1 << 20;
+        /// The reported PP5 split (band 4 is the output band).
+        const COUNTS: [usize; 5] = [10, 9, 10, 10, 9];
+        const REQUESTED: usize = 8192;
+
+        fn bytes_of(entry: &WeightEntry) -> Option<u64> {
+            Some(entry.logical_shape.iter().product::<usize>() as u64 * 2)
+        }
+
+        fn lines(
+            config: &Qwen4Config,
+            weights: &[WeightEntry],
+            rows: usize,
+        ) -> Vec<Qwen4PpRankFit> {
+            let mesh = DeviceMesh::rect(&[(DimKind::Pp, COUNTS.len())]).unwrap();
+            let placement = BandPlacement::from_counts(&mesh, 48, &COUNTS).unwrap();
+            let context = crate::Qwen4ContextCommit::legacy(8192);
+            qwen4_pp_rank_lines(&Qwen4PpBudgetInputs {
+                config,
+                placement: &placement,
+                weights,
+                bytes_of: &bytes_of,
+                format: crate::Qwen4StateFormat {
+                    qsa: QsaKvFormat::Fp8,
+                    gdn: crate::GdnStateFormat::Q8,
+                    qsa_f16_arena: false,
+                    qsa_pooled_bf16: false,
+                },
+                context: &context,
+                chunk_rows: rows,
+                mode: Full,
+                free_per_rank: &[u64::MAX; 5],
+                reserve_bytes: QWEN4_PP_RESERVE_BYTES,
+                native_mtp: None,
+            })
+            .unwrap()
+        }
+
+        struct Fixture {
+            config: Qwen4Config,
+            /// The census of every ladder rung, largest first.
+            tables: Vec<(usize, Vec<Qwen4PpRankFit>)>,
+            scopes: Vec<crate::weights::Qwen4BandScope>,
+        }
+
+        impl Fixture {
+            fn at(&self, rows: usize) -> &[Qwen4PpRankFit] {
+                &self.tables.iter().find(|(r, _)| *r == rows).unwrap().1
+            }
+
+            /// Bytes a band holds besides its chunk-sized forward and the
+            /// reserve: weights, F16 shadows, QSA context, request state.
+            fn resident(&self, stage: usize) -> u64 {
+                let line = &self.at(REQUESTED)[stage];
+                line.required - line.forward - line.reserve
+            }
+
+            /// Planned capacity left after the band's resident bytes.
+            fn free_after(&self, capacity: &[u64], stage: usize) -> u64 {
+                capacity[stage] - self.resident(stage)
+            }
+
+            /// The field-reported box, emulated: bands 0 to 3 have the room the
+            /// OLD per-band rung search (whole-model forward plus 1 GiB
+            /// headroom) needed to take 8192 rows, and at least their census;
+            /// the output band has
+            /// exactly its census at 8192 rows (forward scratch of its own
+            /// plus the 2 GiB reserve), which the census admits and the old
+            /// search did not.
+            fn dg_capacity(&self) -> Vec<u64> {
+                let whole =
+                    crate::gpu_forward::qwen4_forward_device_bytes(&self.config, 8192, Full)
+                        .unwrap()
+                        + QWEN4_FORWARD_HEADROOM_BYTES;
+                (0..COUNTS.len())
+                    .map(|stage| {
+                        if stage < 4 {
+                            (self.resident(stage) + whole).max(self.at(8192)[stage].required)
+                        } else {
+                            self.at(8192)[stage].required
+                        }
+                    })
+                    .collect()
+            }
+
+            /// A box whose output card genuinely cannot hold 8192 rows: it
+            /// has exactly its 4096-row census.
+            fn tight_output_capacity(&self) -> Vec<u64> {
+                let mut capacity = self.dg_capacity();
+                capacity[4] = self.at(4096)[4].required;
+                assert!(self.at(8192)[4].required > capacity[4] + 512 * MIB);
+                capacity
+            }
+
+            /// Every band's own attach at `canonical` rows (the pure rung
+            /// choice `Qwen4Bundle::attach_forward_canonical` makes), against
+            /// what the band has left after its resident bytes.
+            fn attach_all(&self, capacity: &[u64], canonical: usize) -> Vec<Result<usize, String>> {
+                (0..COUNTS.len())
+                    .map(|stage| {
+                        crate::bundle::attach_chunk_rows(
+                            &self.config,
+                            canonical,
+                            Full,
+                            self.free_after(capacity, stage),
+                            Some(&self.scopes[stage]),
+                        )
+                    })
+                    .collect()
+            }
+        }
+
+        fn fixture() -> Fixture {
+            let config = crate::config::compact_test_config();
+            let manifest = crate::weights::Qwen4Manifest::build(&config).unwrap();
+            let tables: Vec<_> = qwen4_pp_chunk_ladder(REQUESTED, false)
+                .into_iter()
+                .map(|rows| (rows, lines(&config, &manifest.weights, rows)))
+                .collect();
+            let mesh = DeviceMesh::rect(&[(DimKind::Pp, COUNTS.len())]).unwrap();
+            let placement = BandPlacement::from_counts(&mesh, 48, &COUNTS).unwrap();
+            let scopes = (0..COUNTS.len())
+                .map(|stage| {
+                    crate::weights::Qwen4BandScope::from_placement(&config, &placement, stage)
+                        .unwrap()
+                })
+                .collect();
+            Fixture {
+                config,
+                tables,
+                scopes,
+            }
+        }
+
+        #[test]
+        fn the_ladder_is_the_ceiling_then_every_smaller_rung_and_a_pinned_chunk_is_alone() {
+            assert_eq!(
+                qwen4_pp_chunk_ladder(8192, false),
+                [8192, 4096, 2048, 1536, 1024, 512, 256]
+            );
+            assert_eq!(qwen4_pp_chunk_ladder(4096, false)[0], 4096);
+            assert_eq!(qwen4_pp_chunk_ladder(1024, false), [1024, 512, 256]);
+            assert_eq!(qwen4_pp_chunk_ladder(3072, false)[..3], [3072, 2048, 1536]);
+            assert_eq!(qwen4_pp_chunk_ladder(8192, true), [8192]);
+        }
+
+        /// The reported load. Each band's own (pre-fix) rung search, run on
+        /// the emulated DG capacities, picks 8192 on bands 0 to 3 and 4096 on
+        /// the output band: the disagreement the old loader turned into
+        /// `allocated chunk rows Some(4096) but the canonical chunk is 8192`.
+        /// The census charged the output band's forward 2 GiB less than that
+        /// search did.
+        #[test]
+        fn dg_pp5_old_per_band_rung_search_disagreed_on_the_chunk() {
+            let fx = fixture();
+            let capacity = fx.dg_capacity();
+            let whole =
+                crate::gpu_forward::qwen4_forward_device_bytes(&fx.config, 8192, Full).unwrap();
+            // The middle bands' census forward is 2 GiB under the whole model's.
+            assert!(whole - fx.at(8192)[2].forward >= 2000 * MIB);
+            // The census admits 8192 on every band.
+            assert!(fx
+                .at(8192)
+                .iter()
+                .zip(&capacity)
+                .all(|(line, capacity)| line.required <= *capacity));
+            let independent: Vec<usize> = (0..COUNTS.len())
+                .map(|stage| {
+                    crate::bundle::attach_chunk_rows(
+                        &fx.config,
+                        8192,
+                        Full,
+                        fx.free_after(&capacity, stage),
+                        None,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            assert_eq!(independent, [8192, 8192, 8192, 8192, 4096]);
+        }
+
+        /// The fix on that box: one mesh chunk, decided before any band
+        /// loads, and every band attaches exactly it. The band's forward is
+        /// charged as the census charges it, so the output band keeps 8192.
+        #[test]
+        fn dg_pp5_every_band_loads_the_identical_canonical_chunk() {
+            let fx = fixture();
+            let capacity = fx.dg_capacity();
+            let negotiation = qwen4_pp_negotiate_chunk(&fx.tables, &capacity, false).unwrap();
+            assert_eq!(negotiation.requested, 8192);
+            assert_eq!(negotiation.chunk_rows, 8192);
+            assert!(negotiation
+                .log_line()
+                .starts_with("qwen4 PP canonical chunk: 8192 rows (every band admits it;"));
+            let chunks: Vec<usize> = fx
+                .attach_all(&capacity, negotiation.chunk_rows)
+                .into_iter()
+                .enumerate()
+                .map(|(stage, chunk)| chunk.unwrap_or_else(|error| panic!("band {stage}: {error}")))
+                .collect();
+            assert_eq!(chunks, [8192; 5]);
+        }
+
+        /// A box whose output card truly cannot hold 8192 rows: the whole mesh
+        /// settles on 4096 before any band loads, and the output band's own
+        /// attach agrees (no band disagrees with the mesh).
+        #[test]
+        fn a_tight_output_band_lowers_the_mesh_chunk_for_every_band() {
+            let fx = fixture();
+            let capacity = fx.tight_output_capacity();
+            let negotiation = qwen4_pp_negotiate_chunk(&fx.tables, &capacity, false).unwrap();
+            assert_eq!(negotiation.chunk_rows, 4096);
+            let per_band: Vec<Option<usize>> =
+                negotiation.bands.iter().map(|band| band.max_rows).collect();
+            assert_eq!(
+                per_band,
+                [Some(8192), Some(8192), Some(8192), Some(8192), Some(4096)]
+            );
+            assert_eq!(negotiation.bands[4].band, 39..48);
+            assert_eq!(
+                negotiation.log_line(),
+                "qwen4 PP canonical chunk: 4096 rows, lowered from 8192 for the whole mesh by band 4 \
+                 (per-band largest admissible rung: band 0 (layers 0..10) 8192, band 1 (layers 10..19) 8192, \
+                 band 2 (layers 19..29) 8192, band 3 (layers 29..39) 8192, band 4 (layers 39..48) 4096)"
+            );
+            let chunks: Vec<usize> = fx
+                .attach_all(&capacity, negotiation.chunk_rows)
+                .into_iter()
+                .enumerate()
+                .map(|(stage, chunk)| chunk.unwrap_or_else(|error| panic!("band {stage}: {error}")))
+                .collect();
+            assert_eq!(chunks, [4096; 5]);
+        }
+
+        /// A band attach never shrinks the canonical chunk: the output band of
+        /// the tight box asked for 8192 refuses with the bytes.
+        #[test]
+        fn a_band_attach_never_shrinks_the_canonical_chunk() {
+            let fx = fixture();
+            let capacity = fx.tight_output_capacity();
+            let attached = fx.attach_all(&capacity, 8192);
+            assert!(attached[..4].iter().all(|chunk| chunk == &Ok(8192)));
+            let error = attached[4].clone().unwrap_err();
+            assert!(
+                error.contains("canonical prefill chunk of 8192 rows")
+                    && error.contains("never shrinks the canonical chunk"),
+                "{error}"
+            );
+        }
+
+        #[test]
+        fn an_explicit_chunk_a_band_cannot_admit_is_refused_naming_the_band() {
+            let fx = fixture();
+            let capacity = fx.tight_output_capacity();
+            let pinned = vec![fx.tables[0].clone()];
+            let error = qwen4_pp_negotiate_chunk(&pinned, &capacity, true).unwrap_err();
+            assert!(
+                error.contains("HIPFIRE_PREFILL_CHUNK_ROWS=8192")
+                    && error.contains("band 4 (layers 39..48)")
+                    && error.contains("never shrinks the canonical chunk")
+                    && !error.contains("band 0 ")
+                    && !error.contains("band 3 "),
+                "{error}"
+            );
+            // The same pin at a chunk every band admits is taken as given.
+            let at_4096 = vec![fx.tables[1].clone()];
+            let kept = qwen4_pp_negotiate_chunk(&at_4096, &capacity, true).unwrap();
+            assert_eq!((kept.chunk_rows, kept.requested), (4096, 4096));
+        }
+
+        #[test]
+        fn the_chunk_steps_down_the_ladder_until_every_band_fits_or_refuses_naming_the_bands() {
+            let fx = fixture();
+            // Band 2 only holds 1536: it sets the mesh chunk, whatever the rest hold.
+            let mut capacity = fx.tight_output_capacity();
+            capacity[2] = fx.at(1536)[2].required;
+            let negotiation = qwen4_pp_negotiate_chunk(&fx.tables, &capacity, false).unwrap();
+            assert_eq!(negotiation.chunk_rows, 1536);
+            assert_eq!(negotiation.bands[2].max_rows, Some(1536));
+            assert_eq!(negotiation.bands[4].max_rows, Some(4096));
+            // Nothing fits band 1 even at 256 rows: refused, naming that band only.
+            capacity[1] = fx.at(256)[1].required - 1;
+            let error = qwen4_pp_negotiate_chunk(&fx.tables, &capacity, false).unwrap_err();
+            assert!(
+                error.contains("no prefill chunk fits every band")
+                    && error.contains("band 1 (layers 10..19)")
+                    && !error.contains("band 2 (layers"),
+                "{error}"
+            );
+            // Mismatched readings are malformed input, not a fit.
+            assert!(qwen4_pp_negotiate_chunk(&fx.tables, &capacity[..4], false).is_err());
+            assert!(qwen4_pp_negotiate_chunk(&[], &capacity, false).is_err());
         }
     }
 

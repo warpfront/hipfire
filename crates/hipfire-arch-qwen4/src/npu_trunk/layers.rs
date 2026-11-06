@@ -87,6 +87,7 @@ pub(super) fn build_program<'a>(
                 kernel_size: dims.ple_conv_kernel_dim,
                 dilation: config.ple_conv_dilation(),
                 epsilon: EPSILON,
+                lane_states: &[],
             }));
         }
 
@@ -102,6 +103,7 @@ pub(super) fn build_program<'a>(
             &owner.decode_q8,
             route_n,
             few_row_limit,
+            rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
             expert_stage,
         )?;
         if let (Some(gather), Qwen4FfnBinding::Moe(binding)) = (ep_gather, &mut description.ffn) {
@@ -207,6 +209,7 @@ pub(super) fn build_program<'a>(
                     _ => return Err(invalid("QSA descriptor kind mismatch")),
                 };
                 steps.push(Step::IndexedAttention(IndexedAttentionOp {
+                    sp_select: None,
                     rotation: &scratch.rotation,
                     mode: IndexedAttentionMode::Full,
                     indexer_qk: weights.indexer_qk,
@@ -272,6 +275,7 @@ pub(super) fn build_program<'a>(
 
         let attn_write = &description.attn_hyper.write;
         steps.push(Step::HyperWrite(HyperWriteOp {
+            ar: None,
             rotation: &scratch.rotation,
             state_bf16: bf16_state,
             input: &scratch.streams,
@@ -355,6 +359,7 @@ pub(super) fn build_program<'a>(
 
         let mlp_write = &description.mlp_hyper.write;
         steps.push(Step::HyperWrite(HyperWriteOp {
+            ar: None,
             rotation: &scratch.rotation,
             state_bf16: bf16_state,
             input: &scratch.streams,

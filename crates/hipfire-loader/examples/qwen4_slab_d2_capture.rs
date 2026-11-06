@@ -578,7 +578,7 @@ fn run() -> R<()> {
         .ok_or("MODEL path must be UTF-8")?
         .to_string();
     let shared = Qwen4RankShared {
-        continuous_batch: false,
+        batch: Default::default(),
         path: path.clone(),
         max_seq: MAX_SEQ,
         sequence: None,

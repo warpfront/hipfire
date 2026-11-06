@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-use crate::{insn::Program, plan::KernelSpec, reg::RegPlan};
+use crate::{insn::Program, lds::PrivateWindow, plan::KernelSpec, reg::RegPlan};
 
 // Imported regions can mention scalar operands outside the authored RegPlan.
 // Scan the final operands (not labels/opcodes); explicit pairs/ranges include
@@ -60,7 +60,7 @@ pub const CODE_END_TAIL: &str = ".text\n\t.p2alignl 7, 3214868480\n\t.fill 96, 4
 
 pub fn assembly(spec: &KernelSpec, regs: &RegPlan, program: &Program) -> Result<String, String> {
     let ns = sgpr_high_water(spec, regs, program, false);
-    assembly_with_workgroup_id_z(spec, regs, program, false, ns)
+    assembly_with_workgroup_id_z(spec, regs, program, false, ns, &[])
 }
 
 pub(crate) fn assembly_with_workgroup_id_z(
@@ -69,8 +69,9 @@ pub(crate) fn assembly_with_workgroup_id_z(
     program: &Program,
     workgroup_id_z: bool,
     next_free_sgpr: u16,
+    private: &[PrivateWindow],
 ) -> Result<String, String> {
-    let mut s = kernel_assembly(spec, regs, program, workgroup_id_z, next_free_sgpr)?;
+    let mut s = kernel_assembly(spec, regs, program, workgroup_id_z, next_free_sgpr, private)?;
     s.push_str(CODE_END_TAIL);
     Ok(s)
 }
@@ -111,6 +112,7 @@ fn kernel_assembly(
     program: &Program,
     workgroup_id_z: bool,
     next_free_sgpr: u16,
+    private: &[PrivateWindow],
 ) -> Result<String, String> {
     spec.kernargs.validate()?;
     if spec.arch != program.arch {
@@ -127,7 +129,19 @@ fn kernel_assembly(
     // matching hipcc accounting on gfx11 and gfx12.
     let vcc = program.instructions.iter().any(|i| i.text.contains("vcc"));
     let meta_sgprs = ns + if vcc { 2 } else { 0 };
-    let mut s=format!(".amdgcn_target \"amdgcn-amd-amdhsa--{}\"\n.amdhsa_code_object_version 6\n.text\n.protected {symbol}\n.globl {symbol}\n.p2align 8\n.type {symbol},@function\n{symbol}:\n",arch.name());
+    let mut s = format!(
+        ".amdgcn_target \"amdgcn-amd-amdhsa--{}\"\n.amdhsa_code_object_version 6\n.text\n",
+        arch.name()
+    );
+    // One marker per wave-private LDS window, derived from the builder's slots (`lds::private_marker`):
+    // `toolchain::certify` re-derives the ownership proof's windows from these, so no contract can omit them.
+    for w in private {
+        s.push_str(&crate::lds::private_marker(symbol, w));
+        s.push('\n')
+    }
+    s.push_str(&format!(
+        ".protected {symbol}\n.globl {symbol}\n.p2align 8\n.type {symbol},@function\n{symbol}:\n"
+    ));
     for i in &program.instructions {
         s.push_str("\t");
         s.push_str(&i.text);

@@ -38,6 +38,10 @@ fn main() {
 
     // ---- GPU init ----
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    // The product loader packs the weight uploads into slabs
+    // (`HIPFIRE_WEIGHT_SLAB`); this harness calls the arch loader directly, so
+    // it opens the same scope.
+    gpu.weight_slab_scope_begin();
 
     // ---- Load model (HFQ or safetensors) ----
     let model = Path::new(model_path);
@@ -67,6 +71,7 @@ fn main() {
         };
         (config, weights, Some(hfq))
     };
+    gpu.weight_slab_scope_end();
 
     // ---- Tokenizer ----
     let metadata_json = hfq_opt
@@ -134,6 +139,23 @@ fn main() {
     } else {
         Box::new(std::io::stdout())
     };
+    // LOGITS_OUT=<path>: every step's raw f32 logits, little-endian, back to
+    // back (byte-exact comparison across HIPFIRE_WEIGHT_SLAB arms).
+    let mut logits_out = std::env::var("LOGITS_OUT")
+        .ok()
+        .map(|p| std::fs::File::create(p).expect("create LOGITS_OUT"));
+    let dump_logits = |file: &mut Option<std::fs::File>, logits: &[f32]| {
+        if let Some(f) = file.as_mut() {
+            // SAFETY: f32 has no padding and any alignment suffices for u8.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    logits.as_ptr() as *const u8,
+                    std::mem::size_of_val(logits),
+                )
+            };
+            f.write_all(bytes).expect("write LOGITS_OUT");
+        }
+    };
 
     // ---- Prefill ----
     qwen35::forward_prefill_batch(
@@ -154,6 +176,7 @@ fn main() {
 
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
     let mut next_token = llama::argmax(&logits);
+    dump_logits(&mut logits_out, &logits);
     writeln!(out, "{next_token}").ok();
     prompt_tokens.push(next_token);
 
@@ -176,6 +199,7 @@ fn main() {
         .expect("forward failed");
         logits = gpu.download_f32(&scratch.logits).unwrap();
         next_token = llama::argmax(&logits);
+        dump_logits(&mut logits_out, &logits);
         writeln!(out, "{next_token}").ok();
         prompt_tokens.push(next_token);
         if next_token == config.eos_token {

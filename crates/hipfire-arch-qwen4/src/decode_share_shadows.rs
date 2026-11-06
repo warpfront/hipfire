@@ -90,6 +90,13 @@ pub fn shadow_flags(
     shared_i8_enabled: bool,
     chunk_rows: usize,
 ) -> Result<(bool, bool), &'static str> {
+    // The shadow region is laid out from the MANIFEST's (global) tensor shapes; the trunk shard
+    // cuts the shared-expert tensors the shadows copy, so a donor-hosted region would copy
+    // past the sliced weights. The shadows stay dedicated (lazily built from the sliced
+    // weights, censused as dedicated VRAM).
+    if crate::weights::trunk_shard::trunk_shard_requested() {
+        return Err("the trunk shard cuts the shared-expert tensors the shadows copy");
+    }
     let min_rows = rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS;
     if crate::expert_residency::f16_shadow_route_rows(
         arch,

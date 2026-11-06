@@ -41,6 +41,12 @@ use rdna_compute::kernel_registry::{self, KernelEntry};
 use rdna_compute::{pm_decode_twins, FeatureFlags, KernelCompiler};
 use serde::{Deserialize, Serialize};
 
+mod from_cache;
+pub use from_cache::{
+    from_cache, from_cache_program, EmbeddedProgram, FromCacheOk, FromCacheOptions,
+    FromCacheOutcome, MissingObject, Refusal, EMBEDDED_PROGRAMS,
+};
+
 pub const PROGRAMS_JSON: &str = include_str!("../programs.json");
 pub const PROGRAMS_SCHEMA: &str = "railgun-admitted-programs";
 
@@ -58,6 +64,11 @@ pub struct Inventory {
     /// ([`Inventory::add_window_sequence`]); never part of `programs.json`.
     #[serde(skip)]
     pub window_sets: Vec<WindowSet>,
+    /// Program node sets added at run time from a program owner's recorded
+    /// launch sequence ([`Inventory::add_program_sequence`]); never part of
+    /// `programs.json`.
+    #[serde(skip)]
+    pub sequence_sets: Vec<SequenceSet>,
 }
 
 /// A certified-window node set (`DFlash Whole16`), from the sequence the
@@ -68,6 +79,24 @@ pub struct WindowSet {
     pub arch: String,
     /// Distinct `(symbol, module)`, first-seen order.
     pub nodes: Vec<(String, String)>,
+}
+
+/// The node set of a program owner's recorded launch sequence (the Raon
+/// plain-AR decode body: `sequence.jsonl` of the probe's inventory phase),
+/// with the SHA-256 of the exact code object each node loaded in that run.
+#[derive(Clone, Debug)]
+pub struct SequenceSet {
+    pub id: String,
+    pub arch: String,
+    /// Distinct `(symbol, module)`, first-seen order.
+    pub nodes: Vec<(String, String)>,
+    /// `loaded_sha256[i]` is the object node `i` ran from; empty for a plain
+    /// checked program list ([`Inventory::add_program_nodes`]).
+    pub loaded_sha256: Vec<String>,
+    /// Kernel launches in the sequence (every node counted once per launch).
+    pub launches: usize,
+    /// Device fills in the sequence (no object: railgun's own fill kernel).
+    pub fills: usize,
 }
 
 /// The kernels railgun's own lowering launches, on every arch in `archs`.
@@ -87,6 +116,9 @@ pub struct NodeSet<'a> {
     pub arch: &'a str,
     /// `(symbol, module)`.
     pub nodes: &'a [(String, String)],
+    /// SHA-256 of the object each node loaded in the recorded run, when the
+    /// node set comes from a recorded sequence ([`SequenceSet`]).
+    pub loaded_sha256: Option<&'a [String]>,
 }
 
 impl Inventory {
@@ -96,18 +128,31 @@ impl Inventory {
             id: p.id.clone(),
             arch: &p.arch,
             nodes: &p.nodes,
+            loaded_sha256: None,
         });
         let railgun = self.railgun_kernels.archs.iter().map(|arch| NodeSet {
             id: format!("railgun-kernels-{arch}"),
             arch,
             nodes: &self.railgun_kernels.nodes,
+            loaded_sha256: None,
         });
         let windows = self.window_sets.iter().map(|w| NodeSet {
             id: w.id.clone(),
             arch: &w.arch,
             nodes: &w.nodes,
+            loaded_sha256: None,
         });
-        programs.chain(railgun).chain(windows).collect()
+        let sequences = self.sequence_sets.iter().map(|w| NodeSet {
+            id: w.id.clone(),
+            arch: &w.arch,
+            nodes: &w.nodes,
+            loaded_sha256: (!w.loaded_sha256.is_empty()).then_some(&w.loaded_sha256[..]),
+        });
+        programs
+            .chain(railgun)
+            .chain(windows)
+            .chain(sequences)
+            .collect()
     }
 
     /// Add the node set of a window plan on `arch`. `jsonl` is the sequence
@@ -151,6 +196,144 @@ impl Inventory {
         });
         Ok(())
     }
+
+    /// Keep only the node sets named in `ids` (admitted programs, window and
+    /// sequence sets) plus railgun's own kernels, which every railgun program
+    /// needs. An id that names no node set is an error.
+    pub fn retain_programs(&mut self, ids: &[String]) -> Result<()> {
+        let known: Vec<String> = self
+            .programs
+            .iter()
+            .map(|p| p.id.clone())
+            .chain(self.window_sets.iter().map(|w| w.id.clone()))
+            .chain(self.sequence_sets.iter().map(|w| w.id.clone()))
+            .collect();
+        if let Some(id) = ids.iter().find(|id| !known.contains(id)) {
+            return Err(format!(
+                "--only-program {id}: no such program (known: {})",
+                known.join(", ")
+            ));
+        }
+        self.programs.retain(|p| ids.contains(&p.id));
+        self.window_sets.retain(|w| ids.contains(&w.id));
+        self.sequence_sets.retain(|w| ids.contains(&w.id));
+        Ok(())
+    }
+
+    /// Add the node set of a program owner's recorded launch sequence on
+    /// `arch` under its own `id` (never a DFlash window label). `jsonl` is the
+    /// sequence the Raon probe's inventory phase writes: one object per line,
+    /// `{"kind":"kernel","symbol","module","sha256",..}` for a launch (grid,
+    /// block, LDS and kernarg bytes are ignored here) or `{"kind":"fill",..}`
+    /// for a device fill (no object). Every kernel line must name `symbol`,
+    /// `module` and the SHA-256 of the object it loaded. Duplicates collapse,
+    /// but one `(symbol, module)` loading two different objects, or one
+    /// `symbol` under two modules, is an error: the node set would not name
+    /// one object per node. Every module must then resolve in the registry
+    /// (`plan` names each one that does not).
+    pub fn add_program_sequence(&mut self, id: &str, arch: &str, jsonl: &str) -> Result<()> {
+        self.add_sequence(id, arch, jsonl, true)
+    }
+
+    /// Add a checked program list (`programs/<id>.jsonl`, the same line format
+    /// as [`Inventory::add_program_sequence`]) as a plain node set: the
+    /// `(symbol, module)` nodes only. A `sha256` on a line is the recorded
+    /// run's object digest, kept as provenance; it is neither required nor
+    /// recorded, so a corpus over the user's own objects may differ in bytes.
+    pub fn add_program_nodes(&mut self, id: &str, arch: &str, jsonl: &str) -> Result<()> {
+        self.add_sequence(id, arch, jsonl, false)
+    }
+
+    fn add_sequence(&mut self, id: &str, arch: &str, jsonl: &str, digests: bool) -> Result<()> {
+        #[derive(Deserialize)]
+        struct Line {
+            kind: String,
+            symbol: Option<String>,
+            module: Option<String>,
+            sha256: Option<String>,
+        }
+        let mut nodes: Vec<(String, String)> = Vec::new();
+        let mut loaded: Vec<String> = Vec::new();
+        let (mut launches, mut fills) = (0usize, 0usize);
+        for (n, line) in jsonl.lines().enumerate() {
+            let at = n + 1;
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            let l: Line = serde_json::from_str(line)
+                .map_err(|e| format!("program sequence line {at}: {e}"))?;
+            match l.kind.as_str() {
+                "fill" => {
+                    fills += 1;
+                    continue;
+                }
+                "kernel" => {}
+                other => {
+                    return Err(format!(
+                        "program sequence line {at}: unknown node kind `{other}` (expected `kernel` or `fill`)"
+                    ))
+                }
+            }
+            let field = |value: Option<String>, name: &str| {
+                value
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| format!("program sequence line {at}: kernel node has no {name}"))
+            };
+            let symbol = field(l.symbol, "symbol")?;
+            let module = field(l.module, "module")?;
+            let sha256 = if digests {
+                field(l.sha256, "sha256")?
+            } else {
+                String::new()
+            };
+            if digests
+                && (sha256.len() != 64
+                    || !sha256
+                        .bytes()
+                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+            {
+                return Err(format!(
+                    "program sequence line {at}: node {symbol}: sha256 `{sha256}` is not 64 lowercase hex digits"
+                ));
+            }
+            launches += 1;
+            if let Some(i) = nodes.iter().position(|(s, m)| *s == symbol && *m == module) {
+                if digests && loaded[i] != sha256 {
+                    return Err(format!(
+                        "program sequence line {at}: node {symbol} (module {module}) loaded object {sha256}, but an earlier launch loaded {}",
+                        loaded[i]
+                    ));
+                }
+                continue;
+            }
+            if let Some((_, other)) = nodes.iter().find(|(s, _)| *s == symbol) {
+                return Err(format!(
+                    "program sequence line {at}: symbol {symbol} appears under modules {other} and {module}"
+                ));
+            }
+            nodes.push((symbol, module));
+            if digests {
+                loaded.push(sha256);
+            }
+        }
+        if nodes.is_empty() {
+            return Err("program sequence names no kernel node".into());
+        }
+        if self.sequence_sets.iter().any(|s| s.id == id) {
+            return Err(format!(
+                "program sequence id {id} is already in the inventory"
+            ));
+        }
+        self.sequence_sets.push(SequenceSet {
+            id: id.to_owned(),
+            arch: arch.to_owned(),
+            nodes,
+            loaded_sha256: loaded,
+            launches,
+            fills,
+        });
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -185,6 +368,16 @@ pub struct NodesFrom {
     pub note: String,
 }
 
+/// Corpus program id of the `ordinal`-th (0-based) Raon plain-AR decode
+/// sequence on `arch`: `raon-ar-decode-gfx1201`, then `raon-ar-decode-gfx1201-2`.
+pub fn raon_ar_program_id(arch: &str, ordinal: usize) -> String {
+    if ordinal == 0 {
+        format!("raon-ar-decode-{arch}")
+    } else {
+        format!("raon-ar-decode-{arch}-{}", ordinal + 1)
+    }
+}
+
 pub fn inventory() -> Result<Inventory> {
     let inventory: Inventory =
         serde_json::from_str(PROGRAMS_JSON).map_err(|e| format!("programs.json: {e}"))?;
@@ -207,6 +400,10 @@ fn product_config() -> ProcessConfig {
 /// Pin the process to the product-default configuration before anything
 /// reads it, so no user TOML or `HIPFIRE_*` override reaches a recipe.
 pub fn install_product_defaults() -> Result<()> {
+    // Concurrent callers (threads of one process) must not race the install: a
+    // loser could otherwise read the active configuration before the winner set it.
+    static INSTALL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
     match hipfire_config::install_process_config(product_config()) {
         Ok(()) => Ok(()),
         Err(_) if hipfire_config::active_process_config() == Some(&product_config()) => Ok(()),
@@ -237,6 +434,10 @@ pub struct ArchPlan {
     /// The embedded PeaceMaker twins the product default loads instead of the
     /// hipcc objects of some `entries` (`pm_decode_twins::pm_decode_module`).
     pub twins: Vec<&'static pm_decode_twins::NativeKernelBundle>,
+    /// Embedded native objects a node set loads that have no hipcc module and
+    /// are not accepted `pm_decode` twins (the Raon `gated_delta_vector_pm` twin;
+    /// `kernel_registry::native_object_entries`), keyed by image digest.
+    pub embedded: Vec<kernel_registry::NativeObject>,
 }
 
 /// Resolve every node of every node set on `arch` to its registry entry.
@@ -253,15 +454,27 @@ pub fn plan(inventory: &Inventory, arch: &str) -> Result<ArchPlan> {
             ));
         }
     }
+    let natives =
+        kernel_registry::native_object_entries(arch).map_err(|e| format!("{arch}: {e:?}"))?;
     let mut needed = BTreeSet::new();
+    let mut needed_native = BTreeSet::new();
     let mut errors = Vec::new();
     for set in inventory.node_sets().iter().filter(|s| s.arch == arch) {
         for (symbol, module) in set.nodes {
             match all.iter().find(|e| e.module == module) {
-                None => errors.push(format!(
-                    "{}: node {symbol}: module {module} is not in the {arch} registry",
-                    set.id
-                )),
+                None => match natives.iter().find(|n| n.module == module) {
+                    Some(n) if n.symbols.contains(&symbol.as_str()) => {
+                        needed_native.insert(n.module);
+                    }
+                    Some(_) => errors.push(format!(
+                        "{}: node {symbol}: embedded native module {module} does not export it",
+                        set.id
+                    )),
+                    None => errors.push(format!(
+                        "{}: node {symbol}: module {module} is not in the {arch} registry",
+                        set.id
+                    )),
+                },
                 Some(e) if !e.symbols.contains(&symbol.as_str()) => errors.push(format!(
                     "{}: node {symbol}: registry module {module} does not export it",
                     set.id
@@ -294,11 +507,26 @@ pub fn plan(inventory: &Inventory, arch: &str) -> Result<ArchPlan> {
         }
         twins.push(twin);
     }
+    let mut embedded = Vec::new();
+    for native in natives
+        .into_iter()
+        .filter(|n| needed_native.contains(n.module))
+    {
+        let actual = sha256_hex(native.image);
+        if actual != native.image_sha256 {
+            return Err(format!(
+                "{arch}: embedded native module {}: image sha256 {actual} is not the pinned {}",
+                native.module, native.image_sha256
+            ));
+        }
+        embedded.push(native);
+    }
     Ok(ArchPlan {
         arch: arch.to_owned(),
         extra_flags,
         entries,
         twins,
+        embedded,
     })
 }
 
@@ -320,6 +548,10 @@ pub struct ProgramKeys {
     pub arch: String,
     /// `(symbol, module, key)`.
     pub nodes: Vec<(String, String, NodeKey)>,
+    /// For a recorded sequence ([`SequenceSet`]): the SHA-256 of the object
+    /// each node loaded in the recorded run, parallel to `nodes`. The check
+    /// then requires the corpus record to be for exactly that object.
+    pub loaded_sha256: Option<Vec<String>>,
 }
 
 /// How the runtime's current configuration identifies the object a node loads.
@@ -339,7 +571,7 @@ pub fn current_program_keys(inventory: &Inventory) -> Result<Vec<ProgramKeys>> {
     let mut out = Vec::new();
     for arch in archs(inventory) {
         let plan = plan(inventory, &arch)?;
-        let keys: BTreeMap<&str, NodeKey> = plan
+        let mut keys: BTreeMap<&str, NodeKey> = plan
             .entries
             .iter()
             .map(|e| {
@@ -359,6 +591,14 @@ pub fn current_program_keys(inventory: &Inventory) -> Result<Vec<ProgramKeys>> {
                 )
             })
             .collect();
+        for native in &plan.embedded {
+            keys.insert(
+                native.module,
+                NodeKey::Native {
+                    artifact_sha256: native.image_sha256.to_owned(),
+                },
+            );
+        }
         for set in inventory.node_sets().iter().filter(|s| s.arch == arch) {
             let nodes = set
                 .nodes
@@ -369,6 +609,7 @@ pub fn current_program_keys(inventory: &Inventory) -> Result<Vec<ProgramKeys>> {
                 id: set.id.clone(),
                 arch: arch.clone(),
                 nodes,
+                loaded_sha256: set.loaded_sha256.map(<[String]>::to_vec),
             });
         }
     }
@@ -385,7 +626,20 @@ pub struct Coverage {
     /// Covered nodes whose A1 verdict is `proven` / `unknown`.
     pub proven: usize,
     pub unknown: usize,
+    /// Covered nodes whose A1 verdict is `conditional`: valid only under a
+    /// generation-bound witness the runtime must supply before submit. Reported,
+    /// never an error here.
+    pub conditional: usize,
+    /// Every covered node whose verdict is not `proven`, with that verdict.
+    pub unproven: Vec<NodeVerdict>,
     pub missing: Vec<MissingNode>,
+}
+
+/// A covered node and its A1 verdict (`proven` / `conditional` / `unknown`).
+#[derive(Clone, Debug, Serialize)]
+pub struct NodeVerdict {
+    pub symbol: String,
+    pub status: String,
 }
 
 /// The CI check: every node must resolve under its current key to a record
@@ -395,7 +649,13 @@ pub fn check(corpus: &JitCorpus, programs: &[ProgramKeys]) -> Vec<Coverage> {
     programs.iter().map(|program| {
         let mut missing = Vec::new();
         let mut resolved: Vec<(&str, String, &CorpusRecord)> = Vec::new();
-        for (symbol, module, key) in &program.nodes {
+        if let Some(loaded) = &program.loaded_sha256 {
+            if loaded.len() != program.nodes.len() {
+                missing.push(MissingNode { symbol: String::new(), artifact_sha256: String::new(),
+                    reason: format!("program {} has {} nodes but {} recorded object digests", program.id, program.nodes.len(), loaded.len()) });
+            }
+        }
+        for (index, (symbol, module, key)) in program.nodes.iter().enumerate() {
             let found = match key {
                 NodeKey::Hipcc(packaging_key) => corpus.record_for_module(&program.arch, module, packaging_key).ok_or_else(|| {
                     match corpus.index().rejected.iter()
@@ -425,6 +685,16 @@ pub fn check(corpus: &JitCorpus, programs: &[ProgramKeys]) -> Vec<Coverage> {
                     continue;
                 }
             };
+            // A recorded sequence names the exact object each node loaded: a record for
+            // other bytes of the same module (another toolchain, build path or source) is
+            // not a record of what the body runs.
+            if let Some(recorded) = program.loaded_sha256.as_ref().and_then(|l| l.get(index)) {
+                if *recorded != record.artifact_sha256 {
+                    missing.push(MissingNode { symbol: symbol.clone(), artifact_sha256: recorded.clone(),
+                        reason: format!("the recorded run loaded object {recorded} for module {module}, but the corpus record under the runtime's current key is object {} (the body would not run the certified bytes)", record.artifact_sha256) });
+                    continue;
+                }
+            }
             let object = corpus.root().join(&record.object);
             match std::fs::read(&object) {
                 Ok(bytes) if sha256_hex(&bytes) == record.artifact_sha256 => resolved.push((symbol, record.artifact_sha256.clone(), record)),
@@ -439,11 +709,14 @@ pub fn check(corpus: &JitCorpus, programs: &[ProgramKeys]) -> Vec<Coverage> {
             missing.extend(e.missing);
         }
         let failed: BTreeSet<&str> = missing.iter().map(|m| m.symbol.as_str()).collect();
-        let verdict = |s: &str, r: &CorpusRecord| r.kernels.iter().find(|k| k.symbol == s).map(|k| k.status.clone()).unwrap_or_default();
-        let ok: Vec<String> = resolved.iter().filter(|(s, ..)| !failed.contains(s)).map(|(s, _, r)| verdict(s, r)).collect();
+        let verdict = |s: &str, r: &CorpusRecord| r.kernels.iter().find(|k| k.symbol == s).map(|k| k.status.clone()).unwrap_or_else(|| "no-verdict".to_owned());
+        let ok: Vec<(String, String)> = resolved.iter().filter(|(s, ..)| !failed.contains(s)).map(|(s, _, r)| ((*s).to_owned(), verdict(s, r))).collect();
+        let count = |status: &str| ok.iter().filter(|(_, v)| v == status).count();
         Coverage {
             program: program.id.clone(), arch: program.arch.clone(), nodes: program.nodes.len(), covered: ok.len(),
-            proven: ok.iter().filter(|v| *v == "proven").count(), unknown: ok.iter().filter(|v| *v == "unknown").count(), missing,
+            proven: count(railgun_corpus::STATUS_PROVEN), unknown: count(railgun_corpus::STATUS_UNKNOWN), conditional: count(railgun_corpus::STATUS_CONDITIONAL),
+            unproven: ok.iter().filter(|(_, v)| v != railgun_corpus::STATUS_PROVEN).map(|(s, v)| NodeVerdict { symbol: s.clone(), status: v.clone() }).collect(),
+            missing,
         }
     }).collect()
 }
@@ -458,6 +731,19 @@ pub struct BuildOptions {
     pub build_dir: PathBuf,
     pub archs: Vec<String>,
     pub jobs: usize,
+}
+
+/// An embedded native code object the corpus records as `pm_native`: an accepted
+/// `pm_decode` twin (with its incumbent source digest and Radiowave manifest) or
+/// another sealed embedded image (no HIP source, no manifest).
+struct NativeImage {
+    module: &'static str,
+    image: &'static [u8],
+    image_sha256: String,
+    /// SHA-256 of the incumbent HIP source; empty for a sealed image without one.
+    source_sha256: String,
+    radiowave_json: Option<&'static str>,
+    symbols: &'static [&'static str],
 }
 
 struct Compiled {
@@ -633,6 +919,183 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Certify every embedded native object `plan` loads (accepted `pm_decode`
+/// twins and sealed embedded images), write their bytes and Radiowave manifests
+/// under `<staging>/native/<arch>/` and their receipts under
+/// `<staging>/receipts/<arch>/`, and record each as `pm_native` in `records`
+/// (or `rejected` when railgun-cert refuses it). Shared by `build` and
+/// `from_cache`: embedded objects are identical on every host.
+fn certify_natives(
+    arch: &String,
+    plan: &ArchPlan,
+    jobs: usize,
+    staging: &Path,
+    records: &mut Vec<CorpusRecord>,
+    rejected: &mut Vec<RejectedObject>,
+) -> Result<()> {
+    let natives: Vec<NativeImage> = plan
+        .twins
+        .iter()
+        .map(|t| NativeImage {
+            module: t.module,
+            image: t.image,
+            image_sha256: hex(&t.image_sha256),
+            source_sha256: hex(&t.source_sha256),
+            radiowave_json: Some(t.radiowave_json),
+            symbols: t.symbols,
+        })
+        .chain(plan.embedded.iter().map(|n| NativeImage {
+            module: n.module,
+            image: n.image,
+            image_sha256: n.image_sha256.to_owned(),
+            source_sha256: String::new(),
+            radiowave_json: None,
+            symbols: n.symbols,
+        }))
+        .collect();
+    if !natives.is_empty() {
+        eprintln!(
+            "{arch}: {} embedded native object(s) ({} pm_decode twin(s))",
+            natives.len(),
+            plan.twins.len()
+        );
+    }
+    let certified = run_parallel(&natives, jobs, |n| {
+        railgun_cert::certify(n.image, n.radiowave_json).map_err(|e| e.to_string())
+    });
+    for (twin, receipt) in natives.iter().zip(certified) {
+        let artifact = twin.image_sha256.clone();
+        let symbols: Vec<String> = twin.symbols.iter().map(|s| (*s).to_owned()).collect();
+        let object_rel = format!("native/{arch}/{}.hxaco", twin.module);
+        let radiowave_rel = format!("native/{arch}/{}.radiowave.json", twin.module);
+        let write_native = |rel: &str, bytes: &[u8]| -> Result<()> {
+            let path = staging.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap())
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))
+        };
+        write_native(&object_rel, twin.image)?;
+        if let Some(json) = twin.radiowave_json {
+            write_native(&radiowave_rel, json.as_bytes())?;
+        }
+        let receipt = match receipt {
+            Ok(receipt) => receipt,
+            Err(reason) => {
+                eprintln!(
+                    "{arch}: pm_native object {} rejected by railgun-cert: {reason}",
+                    twin.module
+                );
+                rejected.push(RejectedObject {
+                    arch: arch.clone(),
+                    artifact_sha256: artifact,
+                    module: twin.module.to_owned(),
+                    origin: ObjectOrigin::PmNative,
+                    symbols,
+                    source_sha256: twin.source_sha256.clone(),
+                    packaging_key: String::new(),
+                    object: object_rel,
+                    reason,
+                });
+                continue;
+            }
+        };
+        let missing: Vec<&str> = twin
+            .symbols
+            .iter()
+            .copied()
+            .filter(|s| !receipt.railgun.kernels.iter().any(|k| k.symbol == *s))
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "{arch}: pm_native object {}: receipt has no kernel for symbol(s) {}",
+                twin.module,
+                missing.join(", ")
+            ));
+        }
+        let receipt_rel = format!("receipts/{arch}/{artifact}.receipt.json");
+        let receipt_bytes = write_json(&staging.join(&receipt_rel), &receipt)?;
+        records.push(CorpusRecord {
+            arch: arch.clone(),
+            artifact_sha256: artifact,
+            module: twin.module.to_owned(),
+            origin: ObjectOrigin::PmNative,
+            symbols,
+            source_sha256: twin.source_sha256.clone(),
+            extra_flags: String::new(),
+            flags: Vec::new(),
+            scheduler_profile: String::new(),
+            packaging_key: String::new(),
+            jit_cache_key: String::new(),
+            argv: Vec::new(),
+            object: object_rel,
+            receipt: receipt_rel,
+            receipt_sha256: sha256_hex(&receipt_bytes),
+            kernels: receipt
+                .railgun
+                .kernels
+                .iter()
+                .map(|k| KernelVerdict {
+                    symbol: k.symbol.clone(),
+                    status: k.status.clone(),
+                    differential: k.differential.status.clone(),
+                })
+                .collect(),
+        });
+    }
+    Ok(())
+}
+
+/// One [`ProgramRecord`] per node set on `archs`, each node naming the object the
+/// product default loads: the embedded native object where the module has one,
+/// else the hipcc object (a rejected one still names its digest).
+fn program_records(
+    inventory: &Inventory,
+    archs: &[String],
+    records: &[CorpusRecord],
+    rejected: &[RejectedObject],
+) -> Vec<ProgramRecord> {
+    inventory
+        .node_sets()
+        .iter()
+        .filter(|s| archs.iter().any(|a| a == s.arch))
+        .map(|p| ProgramRecord {
+            id: p.id.clone(),
+            arch: p.arch.to_owned(),
+            nodes: p
+                .nodes
+                .iter()
+                .map(|(symbol, module)| {
+                    // The product default loads the twin where the module has one, else the hipcc object.
+                    let of = |origin: ObjectOrigin| {
+                        records
+                            .iter()
+                            .find(|r| r.origin == origin && r.arch == p.arch && &r.module == module)
+                            .map(|r| &r.artifact_sha256)
+                            .or_else(|| {
+                                rejected
+                                    .iter()
+                                    .find(|r| {
+                                        r.origin == origin
+                                            && r.arch == p.arch
+                                            && &r.module == module
+                                    })
+                                    .map(|r| &r.artifact_sha256)
+                            })
+                    };
+                    NodeRecord {
+                        symbol: symbol.clone(),
+                        module: module.clone(),
+                        artifact_sha256: of(ObjectOrigin::PmNative)
+                            .or_else(|| of(ObjectOrigin::Hipcc))
+                            .expect("planned module built")
+                            .clone(),
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 /// Compile, certify and index every module the inventory's node sets use
 /// on `opts.archs`, plus the embedded pm_decode twin images the product
 /// default loads in their place. Returns the corpus directory.
@@ -778,89 +1241,14 @@ pub fn build(inventory: &Inventory, opts: &BuildOptions) -> Result<PathBuf> {
                     .collect(),
             });
         }
-        if !plan.twins.is_empty() {
-            eprintln!("{arch}: {} embedded pm_decode twin(s)", plan.twins.len());
-        }
-        let certified = run_parallel(&plan.twins, opts.jobs, |twin| {
-            railgun_cert::certify(twin.image, Some(twin.radiowave_json)).map_err(|e| e.to_string())
-        });
-        for (twin, receipt) in plan.twins.iter().zip(certified) {
-            let artifact = hex(&twin.image_sha256);
-            let symbols: Vec<String> = twin.symbols.iter().map(|s| (*s).to_owned()).collect();
-            let object_rel = format!("native/{arch}/{}.hxaco", twin.module);
-            let radiowave_rel = format!("native/{arch}/{}.radiowave.json", twin.module);
-            let write_native = |rel: &str, bytes: &[u8]| -> Result<()> {
-                let path = staging.join(rel);
-                std::fs::create_dir_all(path.parent().unwrap())
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
-                std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))
-            };
-            write_native(&object_rel, twin.image)?;
-            write_native(&radiowave_rel, twin.radiowave_json.as_bytes())?;
-            let receipt = match receipt {
-                Ok(receipt) => receipt,
-                Err(reason) => {
-                    eprintln!(
-                        "{arch}: pm_native twin {} rejected by railgun-cert: {reason}",
-                        twin.module
-                    );
-                    rejected.push(RejectedObject {
-                        arch: arch.clone(),
-                        artifact_sha256: artifact,
-                        module: twin.module.to_owned(),
-                        origin: ObjectOrigin::PmNative,
-                        symbols,
-                        source_sha256: hex(&twin.source_sha256),
-                        packaging_key: String::new(),
-                        object: object_rel,
-                        reason,
-                    });
-                    continue;
-                }
-            };
-            let missing: Vec<&str> = twin
-                .symbols
-                .iter()
-                .copied()
-                .filter(|s| !receipt.railgun.kernels.iter().any(|k| k.symbol == *s))
-                .collect();
-            if !missing.is_empty() {
-                return Err(format!(
-                    "{arch}: pm_native twin {}: receipt has no kernel for symbol(s) {}",
-                    twin.module,
-                    missing.join(", ")
-                ));
-            }
-            let receipt_rel = format!("receipts/{arch}/{artifact}.receipt.json");
-            let receipt_bytes = write_json(&staging.join(&receipt_rel), &receipt)?;
-            records.push(CorpusRecord {
-                arch: arch.clone(),
-                artifact_sha256: artifact,
-                module: twin.module.to_owned(),
-                origin: ObjectOrigin::PmNative,
-                symbols,
-                source_sha256: hex(&twin.source_sha256),
-                extra_flags: String::new(),
-                flags: Vec::new(),
-                scheduler_profile: String::new(),
-                packaging_key: String::new(),
-                jit_cache_key: String::new(),
-                argv: Vec::new(),
-                object: object_rel,
-                receipt: receipt_rel,
-                receipt_sha256: sha256_hex(&receipt_bytes),
-                kernels: receipt
-                    .railgun
-                    .kernels
-                    .iter()
-                    .map(|k| KernelVerdict {
-                        symbol: k.symbol.clone(),
-                        status: k.status.clone(),
-                        differential: k.differential.status.clone(),
-                    })
-                    .collect(),
-            });
-        }
+        certify_natives(
+            arch,
+            &plan,
+            opts.jobs,
+            &staging,
+            &mut records,
+            &mut rejected,
+        )?;
     }
     let (id, rocm_env_root, hipcc) = toolchain.ok_or("no arch selected")?;
     let version = run(&hipcc, &["--version".into()], rocm_env_root.as_deref())?;
@@ -900,46 +1288,7 @@ pub fn build(inventory: &Inventory, opts: &BuildOptions) -> Result<PathBuf> {
     );
     std::fs::write(staging.join("headers.tsv"), &header_lines).map_err(|e| e.to_string())?;
 
-    let programs = inventory
-        .node_sets()
-        .iter()
-        .filter(|s| opts.archs.iter().any(|a| a == s.arch))
-        .map(|p| ProgramRecord {
-            id: p.id.clone(),
-            arch: p.arch.to_owned(),
-            nodes: p
-                .nodes
-                .iter()
-                .map(|(symbol, module)| {
-                    // The product default loads the twin where the module has one, else the hipcc object.
-                    let of = |origin: ObjectOrigin| {
-                        records
-                            .iter()
-                            .find(|r| r.origin == origin && r.arch == p.arch && &r.module == module)
-                            .map(|r| &r.artifact_sha256)
-                            .or_else(|| {
-                                rejected
-                                    .iter()
-                                    .find(|r| {
-                                        r.origin == origin
-                                            && r.arch == p.arch
-                                            && &r.module == module
-                                    })
-                                    .map(|r| &r.artifact_sha256)
-                            })
-                    };
-                    NodeRecord {
-                        symbol: symbol.clone(),
-                        module: module.clone(),
-                        artifact_sha256: of(ObjectOrigin::PmNative)
-                            .or_else(|| of(ObjectOrigin::Hipcc))
-                            .expect("planned module built")
-                            .clone(),
-                    }
-                })
-                .collect(),
-        })
-        .collect();
+    let programs = program_records(inventory, &opts.archs, &records, &rejected);
     let index = CorpusIndex {
         schema: CORPUS_SCHEMA.into(),
         version: CORPUS_VERSION,
@@ -956,6 +1305,171 @@ pub fn build(inventory: &Inventory, opts: &BuildOptions) -> Result<PathBuf> {
     std::fs::rename(&staging, &dest).map_err(|e| format!("{}: {e}", dest.display()))?;
     JitCorpus::open(&dest).map_err(|e| e.to_string())?;
     Ok(dest)
+}
+
+// ---------------------------------------------------------------- install
+
+/// What the runtime loads for one module of an installed pack.
+#[derive(Clone, Debug, Serialize)]
+pub struct InstallVerdict {
+    pub arch: String,
+    pub module: String,
+    /// `pack` (the object file the runtime verified and loads),
+    /// `embedded` (a sealed image compiled into the binary), or `elsewhere`
+    /// (the runtime would JIT-compile or take a hot-cache object instead).
+    pub source: String,
+    /// SHA-256 of the object the runtime would load, when known.
+    pub loaded_sha256: Option<String>,
+    /// SHA-256 of the corpus record of that module under the runtime's current key.
+    pub corpus_sha256: Option<String>,
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// Load every hipcc module of `inventory` on `archs` through the runtime's own
+/// loader (`KernelCompiler::compile_for_symbol`) with the current directory set to
+/// `install_root` (the runtime probes `kernels/compiled/<arch>` under its CWD) and
+/// report, per module, whether the object it resolves to is a file of that pack
+/// whose SHA-256 is the corpus record's. Embedded images are checked against the
+/// corpus' `pm_native` record by digest. The hot JIT cache is whatever
+/// `HIPFIRE_KERNEL_CACHE` names; the loader tries the verified pack first, so a hot
+/// object can never mask a pack miss here: it is reported as `elsewhere`.
+/// Changes the process working directory.
+pub fn verify_install(
+    inventory: &Inventory,
+    corpus: &JitCorpus,
+    install_root: &Path,
+    archs: &[String],
+) -> Result<Vec<InstallVerdict>> {
+    install_product_defaults()?;
+    let root = std::fs::canonicalize(install_root)
+        .map_err(|e| format!("{}: {e}", install_root.display()))?;
+    std::env::set_current_dir(&root).map_err(|e| format!("{}: {e}", root.display()))?;
+    let pin = corpus.toolchain_pin().to_owned();
+    let mut out = Vec::new();
+    for arch in archs {
+        let plan = plan(inventory, arch)?;
+        let pack = root.join("kernels").join("compiled").join(arch);
+        let mut compiler = KernelCompiler::new(arch, plan.extra_flags.clone())
+            .map_err(|e| format!("{arch}: {e}"))?;
+        // The owner opens the corpus only under the toolchain it was built with.
+        let now = sha256_hex(compiler.toolchain_id().as_bytes());
+        out.push(InstallVerdict {
+            arch: arch.clone(),
+            module: "<toolchain pin>".to_owned(),
+            source: "toolchain".into(),
+            loaded_sha256: Some(now.clone()),
+            corpus_sha256: Some(pin.clone()),
+            ok: now == pin,
+            detail: if now == pin {
+                String::new()
+            } else {
+                format!("the runtime compiles with toolchain `{}` (pin {now}), the corpus pin is {pin}: the owner would refuse the corpus", compiler.toolchain_id())
+            },
+        });
+        for entry in &plan.entries {
+            let verdict = |source: &str,
+                           loaded: Option<String>,
+                           corpus_sha: Option<String>,
+                           ok: bool,
+                           detail: String| InstallVerdict {
+                arch: arch.clone(),
+                module: entry.module.to_owned(),
+                source: source.to_owned(),
+                loaded_sha256: loaded,
+                corpus_sha256: corpus_sha,
+                ok,
+                detail,
+            };
+            if let Some(twin) = plan.twins.iter().find(|t| t.module == entry.module) {
+                let sha = hex(&twin.image_sha256);
+                let key = ArtifactKey {
+                    arch,
+                    toolchain_pin: &pin,
+                    artifact_sha256: &sha,
+                };
+                let found = corpus
+                    .record(&key)
+                    .is_some_and(|r| r.origin == ObjectOrigin::PmNative);
+                out.push(verdict(
+                    "embedded",
+                    Some(sha.clone()),
+                    found.then(|| sha.clone()),
+                    found,
+                    if found {
+                        String::new()
+                    } else {
+                        "no pm_native record for the embedded twin".into()
+                    },
+                ));
+                continue;
+            }
+            let packaging_key = KernelCompiler::packaging_hash_for(
+                arch,
+                entry.module,
+                entry.source(),
+                &plan.extra_flags,
+            );
+            let record = corpus.record_for_module(arch, entry.module, &packaging_key);
+            let corpus_sha = record.map(|r| r.artifact_sha256.clone());
+            let symbol = entry.symbols.first().copied().unwrap_or(entry.module);
+            let path = match compiler.compile_for_symbol(entry.module, entry.source(), symbol) {
+                Ok(p) => p.to_path_buf(),
+                Err(e) => {
+                    out.push(verdict(
+                        "elsewhere",
+                        None,
+                        corpus_sha,
+                        false,
+                        format!("the runtime loader failed: {e}"),
+                    ));
+                    continue;
+                }
+            };
+            let canonical = std::fs::canonicalize(&path).unwrap_or(path.clone());
+            let in_pack = canonical.parent() == std::fs::canonicalize(&pack).ok().as_deref();
+            let loaded = std::fs::read(&canonical).ok().map(|b| sha256_hex(&b));
+            let (ok, detail) = match (&record, in_pack, &loaded) {
+                (None, ..) => (false, format!("no corpus record under the runtime's current key {packaging_key}")),
+                (Some(_), false, _) => (false, format!("the runtime loads {} (not a file of {}): it would not run the corpus bytes", canonical.display(), pack.display())),
+                (Some(_), true, None) => (false, format!("{} is unreadable", canonical.display())),
+                (Some(r), true, Some(l)) if *l != r.artifact_sha256 => (false, format!("the pack object {} has sha256 {l}, the corpus record is {}", canonical.display(), r.artifact_sha256)),
+                (Some(_), true, Some(_)) => (true, String::new()),
+            };
+            out.push(verdict(
+                if in_pack { "pack" } else { "elsewhere" },
+                loaded,
+                corpus_sha,
+                ok,
+                detail,
+            ));
+        }
+        // Embedded images that are not accepted twins (never loaded from a pack).
+        for native in &plan.embedded {
+            let key = ArtifactKey {
+                arch,
+                toolchain_pin: &pin,
+                artifact_sha256: native.image_sha256,
+            };
+            let found = corpus
+                .record(&key)
+                .is_some_and(|r| r.origin == ObjectOrigin::PmNative);
+            out.push(InstallVerdict {
+                arch: arch.clone(),
+                module: native.module.to_owned(),
+                source: "embedded".into(),
+                loaded_sha256: Some(native.image_sha256.to_owned()),
+                corpus_sha256: found.then(|| native.image_sha256.to_owned()),
+                ok: found,
+                detail: if found {
+                    String::new()
+                } else {
+                    "no pm_native record for the embedded image".into()
+                },
+            });
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- repro

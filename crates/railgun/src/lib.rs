@@ -27,14 +27,25 @@
 //! (see [`copy`]); where inside each resource the accesses land is the
 //! table's content, which `prepare` bounds-checks entry by entry
 //! ([`Via::Slot`]).
+//!
+//! Kernel programs ([`kernel::KernelProgram`]) also name three resource kinds a
+//! persistent kernel needs: [`ResourceKind::EventCells`] (atomics and acquire
+//! loads only), [`ResourceKind::TaskArena`] (GPU-rewritten task records) and
+//! [`ResourceKind::BindingRecords`] (pointer records railgun writes at prepare,
+//! like a `PointerTable` immutable during replay and never a copy
+//! destination); see [`descriptor`] and [`coresident`].
+pub mod admission;
 pub mod contract;
 pub mod copy;
+pub mod coresident;
+pub mod descriptor;
 pub mod index_bind;
 pub mod kernel;
 pub mod mq6;
 #[cfg(feature = "npu")]
 pub mod npu;
 pub mod plan;
+pub mod sealed_table;
 pub mod shadow;
 pub mod window;
 
@@ -117,6 +128,59 @@ pub enum ResourceKind {
     /// static (only offsets and lengths depend on words), so each table has
     /// one slot map for every assignment.
     PointerTable(Vec<CopySpec>),
+    /// Event cells (design §8.1 `EventCell`, [`EVENT_CELL_BYTES`] each):
+    /// device-written only by atomics, observed by acquire loads, so
+    /// concurrently running kernels may share them without a hazard
+    /// boundary. `cells` is the capacity the resource is sized for
+    /// ([`KernelProgram::declare_event_cells`] checks it and that no node
+    /// stores into them with a plain store).
+    ///
+    /// [`KernelProgram::declare_event_cells`]: crate::kernel::KernelProgram::declare_event_cells
+    EventCells {
+        cells: u32,
+    },
+    /// GPU-rewritten task records (design §8.1 `TaskDesc`): the device may
+    /// write them. No loaded value is an address base — A1 attributes every
+    /// access to an explicit pointer argument or a descriptor arena, so a
+    /// task record cannot redirect an access to an unnamed allocation.
+    TaskArena,
+    /// Binding records railgun writes at prepare: each record is an instance
+    /// of a template whose pointer fields railgun fills from the program's
+    /// own bindings ([`KernelProgram::bind_records`], image from
+    /// [`KernelProgram::binding_record_image`]). Immutable during replay and
+    /// never a copy destination, exactly like [`ResourceKind::PointerTable`]
+    /// but its entries are pointers, so each field is bounds-checked against
+    /// the resource it names.
+    ///
+    /// [`KernelProgram::bind_records`]: crate::kernel::KernelProgram::bind_records
+    /// [`KernelProgram::binding_record_image`]: crate::kernel::KernelProgram::binding_record_image
+    BindingRecords(Vec<BindingRecord>),
+}
+
+/// Bytes of one event cell (design §8.1 `EventCell`: four `u32`).
+pub const EVENT_CELL_BYTES: u64 = 16;
+
+/// One record of a [`ResourceKind::BindingRecords`] arena: an instance of
+/// `template` at `base`, whose pointer `fields` railgun writes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindingRecord {
+    /// Byte offset of the record in the arena.
+    pub base: u64,
+    /// The record's template: which pointer offsets a certified kernel loads
+    /// from it (`ArenaFact::templates`).
+    pub template: u32,
+    pub fields: Vec<BindingField>,
+}
+
+/// One 8-byte pointer field of a [`BindingRecord`]: written as
+/// `base(resource) + interior` from the program's bindings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindingField {
+    /// Record-relative byte offset (8-aligned).
+    pub offset: u32,
+    pub resource: ResourceId,
+    /// Byte offset of the pointee inside `resource` (below its size).
+    pub interior: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -388,6 +452,8 @@ pub enum PrepareError {
     SelfOverlap { node: usize },
     #[error("node {node}: writes pointer table {label}")]
     WritesTable { node: usize, label: String },
+    #[error("node {node}: writes binding records {label}")]
+    WritesBindingRecords { node: usize, label: String },
     #[error("node {node}: resource {label} is not a PointerTable")]
     NotATable { node: usize, label: String },
     #[error("node {node}: pointer table {label} is already used by another CopyBatch")]
@@ -685,6 +751,12 @@ impl Env<'_> {
         let dst_resource = self.program.resource(dst.resource)?;
         if len > 0 && matches!(dst_resource.kind, ResourceKind::PointerTable(_)) {
             return Err(PrepareError::WritesTable {
+                node,
+                label: dst_resource.label.clone(),
+            });
+        }
+        if len > 0 && matches!(dst_resource.kind, ResourceKind::BindingRecords(_)) {
+            return Err(PrepareError::WritesBindingRecords {
                 node,
                 label: dst_resource.label.clone(),
             });
@@ -1126,5 +1198,19 @@ mod tests {
             ),
             (0, None)
         );
+    }
+
+    #[test]
+    fn copies_may_not_write_binding_records() {
+        let mut p = program(rows(), 96);
+        p.resources[DST.0 as usize].kind = ResourceKind::BindingRecords(Vec::new());
+        p.nodes = vec![Node::Copy(spec(at(RING, 0), at(DST, 0), 24))];
+        assert!(matches!(
+            p.prepare(&[0, 1], &bind()),
+            Err(PrepareError::WritesBindingRecords { node: 0, .. })
+        ));
+        // A zero-length copy writes nothing.
+        p.nodes = vec![Node::Copy(spec(at(RING, 0), at(DST, 0), 0))];
+        assert!(p.prepare(&[0, 1], &bind()).is_ok());
     }
 }

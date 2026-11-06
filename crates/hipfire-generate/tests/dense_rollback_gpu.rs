@@ -295,6 +295,7 @@ fn run_generate_with(
             None,
             hipfire_runtime::prompt_frame::ThinkMode::NonThink,
             &[],
+            0,
             None,
             false,
             None,

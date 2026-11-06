@@ -1,0 +1,15 @@
+{
+  "schema": "pm.selector_receipt.v1",
+  "constant": "SMALL_ROWS_GFX1100_F32_ROWS8_MIN_ROWS",
+  "value": 384,
+  "covers": true,
+  "arch": "gfx1100",
+  "card": "RX 7900 XTX (fabric j3211 + j3213 hipx, confounded=false)",
+  "summary": "Node bench (standalone hipcc harness built for gfx1100, bit-identical to gemm_bf16_xf32_batched/_xbf16_batched at every row count 1..4096, odd M/K/N included; guard run j3210 OK). Router shape (M128 K2560, F32 x). 4 rows/CTA vs 8 rows/CTA, us per call (p4/p8) at N=288/352/384/448: 23.0/27.7, 28.6/28.3, 29.3/28.9, 34.3/35.1: p4 wins clearly at 288, the two profiles are within 3% of each other at 352..448; 384 is the chosen floor (p8 28.9 vs p4 29.3 at 384; p8 also leads by 1% at 352, p4 leads by 2% at 448). Previous route (gemm_bf16_xf32_batched, the only BF16 route on gfx1100) measured 13-3548 us (router) / 32-1453 us (selector) over the swept row counts; the small-rows kernels are 2.8x-18x faster at every measured row count.",
+  "records": [
+    {
+      "path": "receipts/selectors/evidence/small_rows_node_gfx1100.txt",
+      "sha256": "0970aca486de6948237d921962696d6f3d26116abc20761aa5681e3ec573033d"
+    }
+  ]
+}

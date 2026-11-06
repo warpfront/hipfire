@@ -70,13 +70,78 @@ pub const SIDECAR_VERSION: u64 = 1;
 pub const HOTSET_ARCH: &str = "gfx1201";
 
 /// Whether a hotset applies on `arch`: the default sibling sidecar only on
-/// [`HOTSET_ARCH`]; an explicit [`HOTSET_ENV`] sidecar path on any arch (the
+/// [`HOTSET_ARCH`] and, as part of the gfx1100 tier package, exact
+/// [`HOTSET_GFX1100_ARCH`] unless [`HOTSET_GFX1100_ENV`]`=0`; an explicit [`HOTSET_ENV`] sidecar path on any arch (the
 /// MQ4 tier kernels carry no arch guard; the other environment skips and the
 /// tier plan's per-arch format check still apply). The single arch rule of the
 /// loader's [`decide_environment`]; the CPU tier split has no arch gate of its
 /// own, since a tier plan exists only where this held at load.
 pub fn hotset_arch_admits(arch: &str, explicit_path: bool) -> bool {
-    arch == HOTSET_ARCH || explicit_path
+    hotset_arch_admits_with(
+        arch,
+        explicit_path,
+        hipfire_config::memory::qwen4_gfx1100_tier_package(arch),
+    )
+}
+
+/// The one switch of the gfx1100 (7900 XTX) tier package, default ON on exact `gfx1100` (see
+/// [`hipfire_config::memory::QWEN4_GFX1100_TIER_PACKAGE_ENV`]): the default sibling sidecar also
+/// applies on [`HOTSET_GFX1100_ARCH`], and the package's other members (S1 over the tier plan,
+/// the census reserve, event readiness and the mixed CP-wait join of tier D2 splits) take their
+/// gfx1100 defaults. `=0` turns the whole package off and returns gfx1100 to the
+/// explicit-path-only rule. It changes nothing on any other arch and nothing for an explicit
+/// [`HOTSET_ENV`] path.
+pub const HOTSET_GFX1100_ENV: &str = hipfire_config::memory::QWEN4_GFX1100_TIER_PACKAGE_ENV;
+/// The architecture [`HOTSET_GFX1100_ENV`] admits.
+pub const HOTSET_GFX1100_ARCH: &str = "gfx1100";
+
+/// Pure body of [`hotset_arch_admits`] with the gfx1100 tier package as an argument.
+pub fn hotset_arch_admits_with(arch: &str, explicit_path: bool, gfx1100_default: bool) -> bool {
+    arch == HOTSET_ARCH || explicit_path || (gfx1100_default && arch == HOTSET_GFX1100_ARCH)
+}
+
+/// Package member (default ON on [`HOTSET_GFX1100_ARCH`] with the gfx1100 tier package, `=0` kills
+/// it, `=1` is inert off gfx1100): on [`HOTSET_GFX1100_ARCH`] only, size the
+/// hot-expert payload from the bottom-up reserve census plus the 1 GiB HIP
+/// runtime budget the gfx1100 S1 admission already charges
+/// ([`crate::slowlink_admission::S1_RUNTIME_OVERHEAD_BYTES`], verified against
+/// the measured peak by the S1 Hold 1 gate) instead of `max(historical floor,
+/// census)`. The historical floor is an R9700 measurement that dominates the
+/// census on a 24 GB XTX (a 262,144-token load: 15,806 MiB floor against
+/// 14,452 MiB census). Read once per load from the process snapshot; inert on every other arch
+/// and for every other reserve consumer. Where S1 over the tier plan is admitted the profile's own
+/// reserve decides instead; this applies to a hot set whose load does not take S1.
+/// The 512 MiB safety margin ([`crate::expert_residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES`]),
+/// the tier tables and the stage buffers are charged exactly as before, and the
+/// knob can only lower the reserve (`min` with the default), never raise it.
+pub const HOTSET_CENSUS_RESERVE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_HOTSET_CENSUS_RESERVE";
+
+/// The reserve a hotset load subtracts from free VRAM: `reserve.bytes()`
+/// unless [`HOTSET_CENSUS_RESERVE_ENV`] is `1` on [`HOTSET_GFX1100_ARCH`].
+pub fn hotset_reserve_bytes(arch: &str, reserve: &crate::expert_residency::AutoReserve) -> u64 {
+    hotset_reserve_bytes_with(
+        arch,
+        hipfire_config::developer_bool(
+            HOTSET_CENSUS_RESERVE_ENV,
+            hipfire_config::memory::qwen4_gfx1100_tier_package(arch),
+        ),
+        reserve,
+    )
+}
+
+/// Pure body of [`hotset_reserve_bytes`] with the opt-in as an argument.
+pub fn hotset_reserve_bytes_with(
+    arch: &str,
+    census_reserve: bool,
+    reserve: &crate::expert_residency::AutoReserve,
+) -> u64 {
+    let default = reserve.bytes();
+    if !census_reserve || arch != HOTSET_GFX1100_ARCH {
+        return default;
+    }
+    let runtime =
+        crate::slowlink_admission::S1_RUNTIME_OVERHEAD_BYTES.saturating_sub(reserve.census.runtime);
+    reserve.census_total.saturating_add(runtime).min(default)
 }
 
 /// Log prefix of every hotset line.
@@ -362,6 +427,12 @@ impl fmt::Display for HotsetSkip {
         match self {
             Self::Disabled => write!(f, "{HOTSET_ENV}=0"),
             Self::Missing { .. } => f.write_str("sidecar not found"),
+            Self::NotGfx1201(arch) if arch == HOTSET_GFX1100_ARCH => write!(
+                f,
+                "gpu is {arch}; the default hotset runs on {HOTSET_ARCH} only \
+                 (other archs need an explicit {HOTSET_ENV} path; {HOTSET_GFX1100_ARCH} takes the \
+                 default sidecar unless {HOTSET_GFX1100_ENV}=0 turned the gfx1100 tier package off)"
+            ),
             Self::NotGfx1201(arch) => write!(
                 f,
                 "gpu is {arch}; the default hotset runs on {HOTSET_ARCH} only \
@@ -509,6 +580,24 @@ impl HotsetBase {
     /// Lowercase hex sha256 of the base's header/index span.
     pub fn index_sha256(&self) -> &str {
         &self.index_sha256
+    }
+
+    /// Check a sidecar's binding keys (`base_size`, then `base_index_sha256`) name this base.
+    fn check_binding(&self, base_size: u64, base_index_sha256: &str) -> Result<(), String> {
+        if base_size != self.size {
+            return Err(format!(
+                "base is {} bytes, sidecar binds {base_size}",
+                self.size
+            ));
+        }
+        if base_index_sha256 != self.index_sha256 {
+            return Err(format!(
+                "base index sha256 {} differs from the sidecar's {}",
+                short(&self.index_sha256),
+                short(base_index_sha256)
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -736,20 +825,34 @@ impl HotsetSidecar {
 
     /// Check the sidecar is bound to exactly `base` (size, then index hash).
     pub fn check_base(&self, base: &HotsetBase) -> Result<(), String> {
-        if self.base_size != base.size {
-            return Err(format!(
-                "base is {} bytes, sidecar binds {}",
-                base.size, self.base_size
-            ));
+        base.check_binding(self.base_size, &self.base_index_sha256)
+    }
+
+    /// Cheap pre-check used where a sidecar is only a candidate (default discovery): the file at
+    /// `path` is a v1 sidecar bound to exactly `base`. Reads the file and its binding keys; the
+    /// ranking itself is not validated here (the load's [`Self::load_bound`] does that).
+    pub fn peek_bound(path: impl AsRef<Path>, base: &HotsetBase) -> Result<(), HotsetSkip> {
+        #[derive(Deserialize)]
+        struct Binding {
+            version: u64,
+            kind: String,
+            base_size: u64,
+            base_index_sha256: String,
         }
-        if self.base_index_sha256 != base.index_sha256 {
-            return Err(format!(
-                "base index sha256 {} differs from the sidecar's {}",
-                short(&base.index_sha256),
-                short(&self.base_index_sha256)
-            ));
+        let path = path.as_ref();
+        let bytes = std::fs::read(path).map_err(|e| {
+            HotsetSkip::InvalidSidecar(format!("cannot read {}: {e}", path.display()))
+        })?;
+        let binding: Binding = serde_json::from_slice(&bytes)
+            .map_err(|e| HotsetSkip::InvalidSidecar(format!("not a v1 hotset JSON: {e}")))?;
+        if binding.kind != SIDECAR_KIND || binding.version != SIDECAR_VERSION {
+            return Err(HotsetSkip::InvalidSidecar(format!(
+                "kind {:?} version {}, expected {SIDECAR_KIND:?} version {SIDECAR_VERSION}",
+                binding.kind, binding.version
+            )));
         }
-        Ok(())
+        base.check_binding(binding.base_size, &binding.base_index_sha256)
+            .map_err(HotsetSkip::BaseMismatch)
     }
 
     /// [`Self::load`] then [`Self::check_base`], as a skip.
@@ -1187,6 +1290,40 @@ mod tests {
     }
 
     #[test]
+    fn peek_bound_checks_only_the_binding_of_a_candidate_file() {
+        let dir = temp_dir("peek");
+        let path = dir.join("candidate.json");
+        std::fs::write(&path, sidecar().to_string()).unwrap();
+        assert_eq!(HotsetSidecar::peek_bound(&path, &base()), Ok(()));
+        // A different base (size, then index) is a base mismatch.
+        assert!(matches!(
+            HotsetSidecar::peek_bound(&path, &HotsetBase::new(BASE_SIZE + 1, [0xab; 32])),
+            Err(HotsetSkip::BaseMismatch(_))
+        ));
+        assert!(matches!(
+            HotsetSidecar::peek_bound(&path, &HotsetBase::new(BASE_SIZE, [0xcd; 32])),
+            Err(HotsetSkip::BaseMismatch(_))
+        ));
+        // Not a v1 sidecar / unreadable: invalid, never a panic.
+        let mut other = sidecar();
+        other["kind"] = json!("something.else");
+        std::fs::write(&path, other.to_string()).unwrap();
+        assert!(matches!(
+            HotsetSidecar::peek_bound(&path, &base()),
+            Err(HotsetSkip::InvalidSidecar(_))
+        ));
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(matches!(
+            HotsetSidecar::peek_bound(&path, &base()),
+            Err(HotsetSkip::InvalidSidecar(_))
+        ));
+        assert!(matches!(
+            HotsetSidecar::peek_bound(dir.join("absent"), &base()),
+            Err(HotsetSkip::InvalidSidecar(_))
+        ));
+    }
+
+    #[test]
     fn binding_size_mismatch_is_a_base_mismatch_skip() {
         let parsed = parse(&sidecar()).unwrap();
         let other = HotsetBase::new(BASE_SIZE + 1, [0xab; 32]);
@@ -1240,6 +1377,52 @@ mod tests {
             }
             other => panic!("expected InvalidSidecar, got {other:?}"),
         }
+    }
+
+    /// A K0-shaped ranking (48 layers x 512 experts, top_k 10, as written by
+    /// `scripts/k0rank.py`) loads bound from a file for the EP2 tier: the
+    /// parser needs no EP-specific input, the rank is a permutation, and the
+    /// static parity ownership (`expert % 2`) splits it into two disjoint
+    /// halves of 12,288 units each. The default environment decision still
+    /// skips expert-parallel placement; that gate belongs to the caller.
+    #[test]
+    fn k0_shaped_ranking_loads_bound_and_splits_by_parity_for_ep2() {
+        const L: usize = 48;
+        const E: usize = 512;
+        let counts: Vec<u64> = (0..L * E)
+            .map(|id| ((id * 2_654_435_761) % 997) as u64)
+            .collect();
+        let mut value = sidecar();
+        let o = value.as_object_mut().unwrap();
+        o.insert("layers".into(), json!(L));
+        o.insert("experts_per_layer".into(), json!(E));
+        o.insert("top_k".into(), json!(10));
+        o.insert("rank".into(), json!(ranked(&counts)));
+        o.insert("counts".into(), json!(counts));
+        let dir = temp_dir("k0-shaped");
+        let path = dir.join("k0.expert-hotset");
+        std::fs::write(&path, value.to_string()).unwrap();
+
+        let parsed = HotsetSidecar::load_bound(&path, L, E, 10, &base()).unwrap();
+        assert_eq!(parsed.rank().len(), L * E);
+        let mut halves = [Vec::new(), Vec::new()];
+        for &id in parsed.rank() {
+            let (_, expert) = parsed.split_id(id);
+            halves[expert % 2].push(id);
+        }
+        assert_eq!((halves[0].len(), halves[1].len()), (L * E / 2, L * E / 2));
+        for half in &halves {
+            assert!(half
+                .windows(2)
+                .all(|w| parsed.count(w[0]) >= parsed.count(w[1])));
+        }
+
+        let mut env = good_env();
+        env.expert_parallel = true;
+        assert_eq!(
+            decide(&HotsetPolicy::Default, true, &env),
+            Err(HotsetSkip::ExpertParallel)
+        );
     }
 
     #[test]
@@ -1319,12 +1502,19 @@ mod tests {
             Err(HotsetSkip::Missing { explicit: true })
         );
         let mut env = good_env();
+        env.gpu_arch = "gfx1151";
+        assert_eq!(
+            decide(&policy, true, &env),
+            Err(HotsetSkip::NotGfx1201("gfx1151".to_owned()))
+        );
+        // Exact gfx1100 takes the default sidecar (the tier package, default on).
         env.gpu_arch = "gfx1100";
         assert_eq!(
             decide(&policy, true, &env),
-            Err(HotsetSkip::NotGfx1201("gfx1100".to_owned()))
+            Ok(PathBuf::from("/m/q.mq4-xts.expert-hotset"))
         );
-        // A non-gfx1201 arch is opt-in: an explicit sidecar path applies there.
+        env.gpu_arch = "gfx1151";
+        // A non-gfx1201, non-gfx1100 arch is opt-in: an explicit sidecar path applies there.
         let explicit = HotsetPolicy::Explicit(PathBuf::from("/x/h.json"));
         assert_eq!(
             decide(&explicit, true, &env),
@@ -1365,11 +1555,14 @@ mod tests {
     #[test]
     fn hotset_arch_truth_table() {
         // (arch, explicit path, admitted): the default sibling sidecar runs on
-        // gfx1201 only; an explicit path runs on any arch.
+        // gfx1201 and (the gfx1100 tier package, default on) exact gfx1100; an
+        // explicit path runs on any arch. Every other arch is byte-unchanged.
         for (arch, explicit, admitted) in [
             ("gfx1201", false, true),
             ("gfx1201", true, true),
-            ("gfx1100", false, false),
+            ("gfx1100", false, true),
+            ("gfx1101", false, false),
+            ("gfx1102", false, false),
             ("gfx1100", true, true),
             ("gfx1151", false, false),
             ("gfx1151", true, true),
@@ -1400,9 +1593,46 @@ mod tests {
     }
 
     #[test]
+    fn gfx1100_default_opt_in_truth_table() {
+        // (arch, explicit path, HIPFIRE_QWEN4_EXPERT_HOTSET_GFX1100=1, admitted): the opt-in
+        // adds exactly the default sibling sidecar on gfx1100; nothing else moves.
+        for (arch, explicit, opt_in, admitted) in [
+            ("gfx1100", false, false, false),
+            ("gfx1100", false, true, true),
+            ("gfx1100", true, false, true),
+            ("gfx1100", true, true, true),
+            ("gfx1201", false, false, true),
+            ("gfx1201", false, true, true),
+            ("gfx1151", false, true, false),
+            ("gfx1101", false, true, false),
+            ("gfx942", false, true, false),
+            ("gfx1151", true, true, true),
+        ] {
+            assert_eq!(
+                hotset_arch_admits_with(arch, explicit, opt_in),
+                admitted,
+                "{arch} explicit={explicit} opt_in={opt_in}"
+            );
+        }
+        // The public rule is the pure rule fed the process snapshot: default ON for exact
+        // gfx1100 (the tier package), never for another arch whatever the switch says.
+        assert!(hotset_arch_admits("gfx1100", false));
+        for arch in ["gfx1151", "gfx1101", "gfx942"] {
+            assert!(!hotset_arch_admits(arch, false), "{arch}");
+        }
+        assert!(hotset_arch_admits("gfx1201", false));
+        assert_eq!(
+            HotsetSkip::NotGfx1201("gfx1100".to_owned()).to_string(),
+            "gpu is gfx1100; the default hotset runs on gfx1201 only (other archs need an \
+             explicit HIPFIRE_QWEN4_EXPERT_HOTSET path; gfx1100 takes the default sidecar \
+             unless HIPFIRE_QWEN4_EXPERT_HOTSET_GFX1100=0 turned the gfx1100 tier package off)"
+        );
+    }
+
+    #[test]
     fn environment_skip_precedence_is_disabled_missing_arch_then_placement() {
         let bad = HotsetEnv {
-            gpu_arch: "gfx1100",
+            gpu_arch: "gfx1151",
             unified_memory: true,
             expert_parallel: true,
             explicit_vram_layers: true,
@@ -1423,7 +1653,7 @@ mod tests {
         );
         assert_eq!(
             decide(&HotsetPolicy::Default, true, &bad),
-            Err(HotsetSkip::NotGfx1201("gfx1100".to_owned()))
+            Err(HotsetSkip::NotGfx1201("gfx1151".to_owned()))
         );
         let mut env = bad.clone();
         env.gpu_arch = "gfx1201";
@@ -1596,11 +1826,11 @@ mod tests {
              (sidecar not found); whole-layer placement"
         );
         assert_eq!(
-            HotsetSkip::NotGfx1201("gfx1100".to_owned())
+            HotsetSkip::NotGfx1201("gfx1151".to_owned())
                 .log_line(path)
                 .unwrap(),
             "  qwen4 expert hot set: /m/q.mq4-xts.expert-hotset present, not applied (gpu is \
-             gfx1100; the default hotset runs on gfx1201 only (other archs need an explicit \
+             gfx1151; the default hotset runs on gfx1201 only (other archs need an explicit \
              HIPFIRE_QWEN4_EXPERT_HOTSET path)); whole-layer placement"
         );
         for skip in [
@@ -1623,6 +1853,91 @@ mod tests {
                 "{line}"
             );
             assert!(!line.contains("HOTCACHE"), "{line}");
+        }
+    }
+
+    /// The 7900 XTX record (24,376 MiB free, 262,144 tokens, 8192-row narrow-link chunk):
+    /// 14,452 MiB census, 15,806 MiB historical floor wins.
+    fn xtx_reserve(historical: Option<u64>) -> crate::expert_residency::AutoReserve {
+        use crate::expert_residency::{AutoReserve, ReserveCensus, WORKSPACE_TERM_COUNT};
+        let mib = 1u64 << 20;
+        let mut workspace = [("workspace", 0u64); WORKSPACE_TERM_COUNT];
+        workspace[0].1 = (160 + 40 + 11 + 1 + 28) * mib;
+        let census = ReserveCensus {
+            qsa_context: 4224 * mib,
+            state: 65 * mib,
+            forward: 8603 * mib,
+            f16_shadows: 1238 * mib,
+            shared_i8_shadows: 0,
+            workspace,
+            qsa_selector: 80 * mib,
+            mtp: 0,
+            gather: 0,
+            runtime: 0,
+        };
+        AutoReserve::new(historical, census).unwrap()
+    }
+
+    #[test]
+    fn census_reserve_knob_only_lowers_the_gfx1100_reserve() {
+        let mib = 1u64 << 20;
+        let reserve = xtx_reserve(Some(15806 * mib));
+        let census = reserve.census_total;
+        assert_eq!(
+            census,
+            (4224 + 65 + 8603 + 1238 + 80 + 160 + 40 + 11 + 1 + 28) * mib
+        );
+        assert_eq!(reserve.bytes(), 15806 * mib);
+        // Off: byte-identical on every arch.
+        for arch in ["gfx1100", "gfx1201", "gfx1151"] {
+            assert_eq!(
+                hotset_reserve_bytes_with(arch, false, &reserve),
+                reserve.bytes()
+            );
+        }
+        // On: only gfx1100 changes, to census + the 1 GiB S1 runtime budget.
+        assert_eq!(
+            hotset_reserve_bytes_with("gfx1100", true, &reserve),
+            census + crate::slowlink_admission::S1_RUNTIME_OVERHEAD_BYTES
+        );
+        assert_eq!(
+            hotset_reserve_bytes_with("gfx1201", true, &reserve),
+            reserve.bytes()
+        );
+        assert_eq!(
+            hotset_reserve_bytes_with("gfx1151", true, &reserve),
+            reserve.bytes()
+        );
+        // A runtime term already in the census is not charged twice.
+        let mut with_runtime = reserve;
+        with_runtime.census.runtime = 1500 * mib;
+        with_runtime.census_total += 1500 * mib;
+        with_runtime.historical = None;
+        assert_eq!(with_runtime.bytes(), with_runtime.census_total);
+        assert_eq!(
+            hotset_reserve_bytes_with("gfx1100", true, &with_runtime),
+            with_runtime.census_total
+        );
+        // The knob never raises the reserve: where the census plus the runtime budget
+        // is above the default, the default stands.
+        let low_floor = xtx_reserve(None);
+        assert_eq!(low_floor.bytes(), census);
+        assert_eq!(
+            hotset_reserve_bytes_with("gfx1100", true, &low_floor),
+            census
+        );
+        // Default (unset snapshot): the census reserve on exact gfx1100 (the tier package),
+        // the unchanged reserve on every other arch.
+        assert_eq!(
+            hotset_reserve_bytes("gfx1100", &reserve),
+            hotset_reserve_bytes_with("gfx1100", true, &reserve)
+        );
+        for arch in ["gfx1201", "gfx1151", "gfx1101", "gfx942"] {
+            assert_eq!(
+                hotset_reserve_bytes(arch, &reserve),
+                reserve.bytes(),
+                "{arch}"
+            );
         }
     }
 }

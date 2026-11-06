@@ -57,6 +57,11 @@
 //!
 //! Only `Gfx1151` and `Gfx1201` are supported by this value API; every other
 //! [`Arch`] panics. Hardware qualification requires the own exhaustive gate above.
+//!
+//! Hardware qualification status (`isa/emu/float_edges.md`, "gfx1151 SFU full domain"): on Strix Halo (gfx1151, BDF
+//! `0000:c0:00.0`, fabric job j4443) `exp`, `rcp`, `rcp_iflag`, `log`, `rsq` and `sqrt` equal the hardware instruction for
+//! every one of the 2^32 f32 bit patterns in the default MODE (0 mismatches) and for 2^28 inputs in each of the seven other
+//! probed MODE settings; `emu::hw_replay::probe_sfu_chunk` is the comparator. gfx1201: only `exp` has a full-domain receipt.
 
 use crate::Arch;
 

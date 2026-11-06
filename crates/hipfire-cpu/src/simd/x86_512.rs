@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 //! AVX-512F row dots for the two MQ4 V2 formats the D2 host-slot expert path
 //! reads: qt 44 `Mq4G256V2` (gate/up, `k = 2560`) and qt 53 `Mq4G128V2` (down,
-//! `k = 640`).
+//! `k = 640`), and (at the end of the file) the planar W3 pair, qt 131 / 132.
 //!
 //! This tier is **bit-identical** to the AVX2 kernels in [`super::x86`], not
 //! merely close to them — it is a wider execution of the *same* arithmetic, so
@@ -31,7 +31,7 @@
 //! `zmm` with the identical lane mapping, and the cached variants take the same
 //! per-128 sums [`super::x86::activation_sums_v2`] prepares for the AVX2 tier.
 
-use super::x86::{f16_pair, f16_quad, hsum256};
+use super::x86::{f16_broadcast, f16_pair, f16_quad, hsum256};
 use core::arch::x86_64::*;
 
 /// Mask selecting lanes 0‥7 — chain 0's half of the accumulator.
@@ -390,4 +390,206 @@ pub(super) unsafe fn mq4g128v2_row_dot_cached_multi<const T: usize>(
         }
     }
     acc
+}
+
+// ---- planar W3 (qt 131 / 132) -------------------------------------------------------
+//
+// The same widening as the MQ4 V2 kernels above, over [`super::x86::w3_row_dot`]'s law. The
+// AVX2 kernel keeps two 8-lane FMA chains per 128-group: chain 0 takes the even 8-code chunks
+// (`cp + 6c`, activations `x[16c..16c + 8]`), chain 1 the odd ones (`cp + 6c + 3`,
+// `x[16c + 8..16c + 16]`), joins them `a0 + a1`, folds `2·f32(d_g)` in with one FMA per
+// group into an 8-lane row accumulator and finishes with `hsum256`. A chunk pair is 16
+// contiguous codes (6 bytes) against 16 contiguous activations, so one `zmm` carries both
+// chains: lanes 0‥7 *are* chain 0 and lanes 8‥15 chain 1, every lane runs the FMA sequence
+// its AVX2 chain runs, and the join/affine/`hsum256` tree is the AVX2 kernel's. Nothing is
+// reassociated; the weights are the same exact `c - 3.5` floats.
+//
+// Unpack (VBMI): the codes of a group are one little-endian 3-bit stream (code `i` at bit
+// `3i`). 24 bytes hold 64 codes: `vpermb` lays qword `q` over bytes `3q‥3q + 8` (its low 24
+// bits are codes `8q‥8q + 8`), `vpmultishiftqb` with control `3j` puts code `8q + j` (plus
+// five garbage bits above it) in byte `8q + j`, a masked `vpermb` widens 16 of those bytes to
+// dword lanes, and `vpermps` against the 16-entry table `(i & 7) - 3.5` (it reads only the
+// low four index bits, so the garbage above bit 2 is folded away by the table's period)
+// yields the 16 weights. The 24-byte load is masked, so it never reads past the row's codes.
+
+const PF: usize = 1280;
+
+/// Tokens one [`w3_row_dot512_multi`] call decodes the weights once for.
+pub(super) const W3_MULTI_TOKENS: usize = 8;
+
+/// 64-byte alignment wrapper: each table is then one aligned cache line.
+#[repr(C, align(64))]
+struct Aligned64<T>(T);
+
+/// `vpermb` spread: byte `8q + i` reads source byte `3q + i`, so qword `q` starts at the
+/// bit `24q` of the 24-byte block.
+static W3_SPREAD: Aligned64<[u8; 64]> = Aligned64({
+    let mut t = [0u8; 64];
+    let mut i = 0;
+    while i < 64 {
+        t[i] = (3 * (i / 8) + i % 8) as u8;
+        i += 1;
+    }
+    t
+});
+
+/// `vpmultishiftqb` control: byte `8q + j` takes the eight bits at bit `3j` of its qword.
+static W3_CTRL: Aligned64<[u8; 64]> = Aligned64({
+    let mut t = [0u8; 64];
+    let mut i = 0;
+    while i < 64 {
+        t[i] = (3 * (i % 8)) as u8;
+        i += 1;
+    }
+    t
+});
+
+/// Byte→dword widening permutations: slice `s` puts source byte `16s + j` in byte `4j`.
+static W3_WIDEN: Aligned64<[[u8; 64]; 4]> = Aligned64({
+    let mut t = [[0u8; 64]; 4];
+    let mut s = 0;
+    while s < 4 {
+        let mut j = 0;
+        while j < 16 {
+            t[s][4 * j] = (16 * s + j) as u8;
+            j += 1;
+        }
+        s += 1;
+    }
+    t
+});
+
+/// Weight table: entry `i` is `(i & 7) - 3.5`.
+static W3_TABLE: Aligned64<[f32; 16]> = Aligned64({
+    let mut t = [0.0f32; 16];
+    let mut i = 0;
+    while i < 16 {
+        t[i] = (i & 7) as f32 - 3.5;
+        i += 1;
+    }
+    t
+});
+
+/// The unpack constants, loaded once per row (they stay in registers across its groups).
+struct W3Consts {
+    spread: __m512i,
+    ctrl: __m512i,
+    widen: [__m512i; 4],
+    table: __m512,
+}
+
+#[inline]
+#[target_feature(enable = "avx512f,avx512vbmi,avx512bw,avx512vl,avx2,fma,f16c")]
+unsafe fn w3_consts() -> W3Consts {
+    let w = W3_WIDEN.0.as_ptr() as *const __m512i;
+    W3Consts {
+        spread: _mm512_load_si512(W3_SPREAD.0.as_ptr() as *const _),
+        ctrl: _mm512_load_si512(W3_CTRL.0.as_ptr() as *const _),
+        widen: [
+            _mm512_load_si512(w as *const _),
+            _mm512_load_si512(w.add(1) as *const _),
+            _mm512_load_si512(w.add(2) as *const _),
+            _mm512_load_si512(w.add(3) as *const _),
+        ],
+        table: _mm512_load_ps(W3_TABLE.0.as_ptr()),
+    }
+}
+
+/// 64 W3 codes (the 24 bytes at `p`), one per byte lane in code order, each byte's low three
+/// bits the code.
+///
+/// # Safety
+///
+/// Requires AVX-512 F/BW/VL/VBMI; 24 readable bytes at `p`, and 32 when `WIDE` (the plain
+/// 32-byte load; the bytes past the 24th are never selected by the spread). `!WIDE` masks the
+/// load to exactly the 24 bytes, for the row's last 24.
+#[inline]
+#[target_feature(enable = "avx512f,avx512vbmi,avx512bw,avx512vl,avx2,fma,f16c")]
+unsafe fn w3_codes64<const WIDE: bool>(p: *const u8, c: &W3Consts) -> __m512i {
+    let bytes = if WIDE {
+        _mm512_zextsi256_si512(_mm256_loadu_si256(p as *const __m256i))
+    } else {
+        _mm512_maskz_loadu_epi8(0x00FF_FFFF, p as *const i8)
+    };
+    _mm512_multishift_epi64_epi8(c.ctrl, _mm512_permutexvar_epi8(c.spread, bytes))
+}
+
+/// Sixteen weights `c - 3.5` of the 16-code slice `s` of `codes`, one per dword lane.
+#[inline]
+#[target_feature(enable = "avx512f,avx512vbmi,avx512bw,avx512vl,avx2,fma,f16c")]
+unsafe fn w3_weights16(codes: __m512i, s: usize, c: &W3Consts) -> __m512 {
+    let idx = _mm512_maskz_permutexvar_epi8(0x1111_1111_1111_1111, c.widen[s], codes);
+    _mm512_permutexvar_ps(idx, c.table)
+}
+
+/// `Σ_g 2·f32(d_g) · Σ (c - 3.5)·x` of one planar W3 row against `T` activation rows, the
+/// weights decoded once for all of them. `out[t]` is bit-identical to
+/// [`super::x86::w3_row_dot`]`(codes, scales, k, xs[t])`: every token runs that kernel's FMA
+/// sequence, chain split, lane join and affine association on its own accumulators.
+///
+/// # Safety
+///
+/// Requires AVX-512 F/BW/VL/VBMI and AVX2/FMA/F16C; `k % 128 == 0`; `3k/8` readable bytes at
+/// `codes`, `2 * (k / 128)` at `scales`, `k` readable `f32` at every `xs[t]`; `out` valid for
+/// `T` floats.
+#[target_feature(enable = "avx512f,avx512vbmi,avx512bw,avx512vl,avx2,fma,f16c")]
+pub(super) unsafe fn w3_row_dot512_multi<const T: usize>(
+    codes: *const u8,
+    scales: *const u8,
+    k: usize,
+    xs: &[*const f32; T],
+    out: *mut f32,
+) {
+    let c = w3_consts();
+    let mut row = [_mm256_setzero_ps(); T];
+    let groups = k / 128;
+    for g in 0..groups {
+        let cp = codes.add(g * 48);
+        _mm_prefetch::<_MM_HINT_T0>(cp.wrapping_add(PF) as *const i8);
+        let mut z = [_mm512_setzero_ps(); T];
+        for h in 0..2 {
+            // Only the row's last 24 bytes lack 8 readable bytes after them.
+            let b = if g + 1 < groups || h == 0 {
+                w3_codes64::<true>(cp.add(24 * h), &c)
+            } else {
+                w3_codes64::<false>(cp.add(24 * h), &c)
+            };
+            for s in 0..4 {
+                let w = w3_weights16(b, s, &c);
+                let at = 128 * g + 64 * h + 16 * s;
+                for t in 0..T {
+                    z[t] = _mm512_fmadd_ps(w, _mm512_loadu_ps(xs[t].add(at)), z[t]);
+                }
+            }
+        }
+        let d = f16_broadcast(scales.add(2 * g));
+        let d2 = _mm256_add_ps(d, d);
+        for t in 0..T {
+            let grp = _mm256_add_ps(
+                _mm512_castps512_ps256(z[t]),
+                _mm256_castpd_ps(_mm512_extractf64x4_pd::<1>(_mm512_castps_pd(z[t]))),
+            );
+            row[t] = _mm256_fmadd_ps(grp, d2, row[t]);
+        }
+    }
+    for t in 0..T {
+        *out.add(t) = hsum256(row[t]);
+    }
+}
+
+/// [`w3_row_dot512_multi`] for one token.
+///
+/// # Safety
+///
+/// As [`w3_row_dot512_multi`] with `T = 1`.
+#[target_feature(enable = "avx512f,avx512vbmi,avx512bw,avx512vl,avx2,fma,f16c")]
+pub(super) unsafe fn w3_row_dot512(
+    codes: *const u8,
+    scales: *const u8,
+    k: usize,
+    x: *const f32,
+) -> f32 {
+    let mut o = 0.0f32;
+    w3_row_dot512_multi::<1>(codes, scales, k, &[x], &mut o);
+    o
 }

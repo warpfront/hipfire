@@ -15,6 +15,7 @@
 //! or any toolchain/arch mismatch refuses the whole plan.
 use serde::{Deserialize, Serialize};
 
+use crate::receipt::KNOWN_WITNESSES;
 use crate::sha256_hex;
 
 pub const WINDOW_MANIFEST_SCHEMA: &str = "railgun-window-manifest";
@@ -235,6 +236,22 @@ impl WindowManifest {
                             &n.symbol,
                             "conditional node lacks a case digest or required witnesses",
                         ));
+                    }
+                    for (j, kind) in n.required_witnesses.iter().enumerate() {
+                        if !KNOWN_WITNESSES.contains(&kind.as_str()) {
+                            out.push(WindowRefusal::node(
+                                i,
+                                &n.symbol,
+                                format!("conditional node requires unknown witness kind {kind:?}"),
+                            ));
+                        }
+                        if n.required_witnesses[..j].contains(kind) {
+                            out.push(WindowRefusal::node(
+                                i,
+                                &n.symbol,
+                                format!("conditional node lists witness kind {kind:?} twice"),
+                            ));
+                        }
                     }
                 }
                 other => out.push(WindowRefusal::node(

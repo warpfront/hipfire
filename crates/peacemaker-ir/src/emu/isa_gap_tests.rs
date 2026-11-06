@@ -153,6 +153,8 @@ const V_CMP_EQ_F32: &[u32] = &[0x7c241103];
 const V_CMP_NEQ_F32: &[u32] = &[0x7c3a88ff, 0xff800000];
 /// `v_cmp_o_f32_e32 vcc_lo, v10, v10`
 const V_CMP_O_F32: &[u32] = &[0x7c2e150a];
+/// `v_cmp_o_f32_e64 s4, v10, v10` (the SGPR-mask form of the ordered test; used by the `libm` powf lowering)
+const V_CMP_O_F32_E64: &[u32] = &[0xd4170004, 0x0202150a];
 /// `v_cmp_le_f32_e32 vcc_lo, v1, v2`
 const V_CMP_LE_F32: &[u32] = &[0x7c260501];
 /// `v_cmp_ge_i32_e32 vcc_lo, s9, v1`
@@ -201,6 +203,10 @@ const GLOBAL_LOAD_B96: &[u32] = &[0xdc5a0000, 0x287c0024];
 const GLOBAL_ATOMIC_ADD_RTN: &[u32] = &[0xdcd64000, 0x02040302];
 /// `global_atomic_add_u32 v[0:1], v2, off`
 const GLOBAL_ATOMIC_ADD: &[u32] = &[0xdcd60000, 0x007c0200];
+/// `global_atomic_swap_b32 v13, v12, s[6:7] offset:4`
+const GLOBAL_ATOMIC_SWAP: &[u32] = &[0xdcce0004, 0x00060c0d];
+/// `global_atomic_swap_b32 v2, v13, v12, s[6:7] offset:4 glc`
+const GLOBAL_ATOMIC_SWAP_RTN: &[u32] = &[0xdcce4004, 0x02060c0d];
 /// `flat_load_b64 v[36:37], v[9:10]`
 const FLAT_LOAD_B64: &[u32] = &[0xdc540000, 0x247c0009];
 /// `flat_load_b128 v[33:36], v[22:23]`
@@ -401,6 +407,29 @@ fn v_med3_i32_is_the_signed_median() {
     }
 }
 
+/// `v_med3_u32 v1, s9, 1, 0x100`
+const V_MED3_U32: &[u32] = &[0xd6210001, 0x03fd0209, 0x00000100];
+
+/// V_MED3_U32: the unsigned median (max3 chain of the pseudocode); 0x8000_0000 is above 0x100 unsigned.
+#[test]
+fn v_med3_u32_is_the_unsigned_median() {
+    let mut st = state();
+    st.exec = 1;
+    // median(S0, 1, 0x100)
+    for (s9, want) in [
+        (5u32, 5u32),
+        (0, 1),
+        (1000, 0x100),
+        (1, 1),
+        (0x100, 0x100),
+        (0x8000_0000, 0x100),
+    ] {
+        st.s[9] = s9;
+        run(V_MED3_U32, &mut st).unwrap();
+        assert_eq!(st.v[1][0], want, "median({s9}, 1, 256)");
+    }
+}
+
 /// RDNA3 ISA V_MOVRELS_B32: `D0 = VGPR[laneId][SRC0 + M0]`.
 #[test]
 fn v_movrels_b32_reads_the_vgpr_offset_by_m0() {
@@ -561,6 +590,11 @@ fn f32_compares_follow_ieee_ordering() {
     setv(&mut st, 10, &[ONE, NAN, INF]);
     run(V_CMP_O_F32, &mut st).unwrap();
     assert_eq!(st.vcc, 0b101);
+    // v_cmp_o_f32_e64 s4, v10, v10: the same ordered test into an SGPR lane mask.
+    st.s[4] = 0xdead_beef;
+    st.exec = 0b111;
+    run(V_CMP_O_F32_E64, &mut st).unwrap();
+    assert_eq!(st.s[4] & 0b111, 0b101);
     // v_cmp_le_f32 vcc, v1, v2: (1,2) true, (2,1) false, (-0,0) true, NaN false.
     st.exec = 0b1111;
     setv(&mut st, 1, &[ONE, TWO, NEG_ZERO, NAN]);
@@ -1204,6 +1238,40 @@ fn global_atomic_add_u32_adds_in_memory_and_returns_the_old_value() {
     assert_eq!(mem.read(0x2008, 4).unwrap(), [1, 0, 0, 0]);
 }
 
+/// RDNA3 ISA GLOBAL_ATOMIC_SWAP_B32: `tmp = MEM[ADDR]; MEM[ADDR] = DATA; RETURN_DATA = tmp`.
+#[test]
+fn global_atomic_swap_b32_stores_and_returns_the_old_value() {
+    let mut st = state();
+    let mut mem = Memory::default();
+    let mut lds = [];
+    mem.map(
+        "buf".into(),
+        0x3000,
+        [0u32, 11, 22]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect(),
+    )
+    .unwrap();
+    st.s[6] = 0x3000;
+    st.s[7] = 0;
+    // Returning: lanes swap into dwords 1 and 2 (offset:4 + v13), the old values come back in v2.
+    st.exec = 0b11;
+    setv(&mut st, 13, &[0, 4]);
+    setv(&mut st, 12, &[5, 7]);
+    mem_run(GLOBAL_ATOMIC_SWAP_RTN, &mut st, &mut mem, &mut lds).unwrap();
+    assert_eq!(getv(&st, 2, 2), vec![11, 22]);
+    assert_eq!(mem.read(0x3004, 8).unwrap(), [5, 0, 0, 0, 7, 0, 0, 0]);
+    // Non-returning, two lanes swapping the same value into one dword: one outcome.
+    setv(&mut st, 13, &[0, 0]);
+    setv(&mut st, 12, &[1, 1]);
+    mem_run(GLOBAL_ATOMIC_SWAP, &mut st, &mut mem, &mut lds).unwrap();
+    assert_eq!(mem.read(0x3004, 4).unwrap(), [1, 0, 0, 0]);
+    // Different values into one dword: the winner is not specified: refused.
+    setv(&mut st, 12, &[1, 2]);
+    assert!(mem_run(GLOBAL_ATOMIC_SWAP, &mut st, &mut mem, &mut lds).is_err());
+}
+
 #[test]
 fn buffer_gl1_inv_is_a_wait_class_no_op_and_every_new_row_is_in_the_table() {
     assert_eq!(
@@ -1435,7 +1503,7 @@ fn scratch_access_is_lane_private_and_addressed_by_sgpr_vgpr_and_offset() {
 /// the generic load/store path and silently do the wrong thing: every such row must be a named, dedicated handler.
 #[test]
 fn every_gfx1100_memory_row_is_a_plain_access_or_a_dedicated_handler() {
-    const DEDICATED: [&str; 7] = [
+    const DEDICATED: [&str; 8] = [
         "ds_swizzle_b32",
         "ds_bpermute_b32",
         "ds_add_u32",
@@ -1443,6 +1511,7 @@ fn every_gfx1100_memory_row_is_a_plain_access_or_a_dedicated_handler() {
         "ds_or_b32",
         "ds_add_f32",
         "global_atomic_add_u32",
+        "global_atomic_swap_b32",
     ];
     let mut bad = Vec::new();
     let mut checked = 0;

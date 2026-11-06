@@ -15,7 +15,8 @@
 //! 2. **Qualification** ([`capability`]): the raw inventory minus the explicit, named
 //!    [`HOLD_CELLS`]. A cell is [`Verdict::Admitted`] only when its raw inventory is present and
 //!    no active hold names it. [`Verdict::NoKernel`] means no kernel exists (W2 everywhere,
-//!    gfx1100 W3, every other architecture); [`Verdict::Held`] means a kernel exists and a named
+//!    gfx1100 W3 outside the K1 decode route, every other architecture); [`Verdict::Held`] means a
+//!    kernel exists and a named
 //!    qualification refuses it (a registry-present, beta-refused cell).
 //!
 //! # Key
@@ -48,10 +49,20 @@
 //! |---|---|---|---|---|
 //! | gfx1201 | K2 K1 Stage Tier | K2 K1 Stage Tier | none | K2 K1 Stage (Tier held) |
 //! | gfx1151 | K2 K1 Stage Tier | K2 K1 Stage (Tier held) | none | K2 K1 Stage (Tier held) |
-//! | gfx1100 | K2 K1 Stage Tier | none | none | K2 K1 Stage (Tier held) |
+//! | gfx1100 | K2 K1 Stage Tier | K1 only (no K2: no prefill, stage or tier) | none | K2 K1 Stage (Tier held) |
 //! | other | Tier only (arch-neutral) | none | none | none |
 //!
 //! Every registry-present / refused cell is a named row of [`HOLD_CELLS`].
+//!
+//! # Slab serve levels
+//!
+//! The sealed slab has two serve levels per cell. DECODE ([`slab_decodes`]) needs the K1
+//! lane-union GEMV alone: decode, MTP verify and every window of at most
+//! [`crate::Gpu::few_row_limit`] routing rows. PREFILL ([`slab_prefills`]) needs the K2 grouped
+//! GEMMs. [`slab_serves`] is both (and, with them, the stage). The artifact load, the arena and
+//! route selection admit at the decode level (`slab_admission::qwen4_slab_codec_admitted`); a
+//! decode-only cell (gfx1100 W3) loads, and its loads cap the prompt tile at the K1 width
+//! instead of ever reaching a K2.
 
 use crate::dispatch::DType;
 use crate::slab_admission::SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED;
@@ -224,6 +235,10 @@ pub enum Hold {
     TierPlanE8pRefused,
     /// Tier plans refuse W3 experts anywhere but gfx1201 (`ExpertTierPlan::check_executable`).
     TierPlanW3Gfx1151Refused,
+    /// Tier plans refuse gfx1100 W3: the K1 and K2 exist, but no host-mapped tier width of W3 is
+    /// qualified there (the MQ3 tier is the slab arena route; a tier hot set over W3 cold experts on
+    /// gfx1100 is not admitted).
+    TierPlanW3Gfx1100Refused,
     /// The gfx1151 E8P-I4 kernels exist but their admission switch
     /// ([`SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`]) is off. Inactive while the switch is true.
     Gfx1151E8pReceiptsPending,
@@ -233,7 +248,9 @@ impl Hold {
     /// Whether this hold refuses its cells under `holds`.
     pub const fn active(self, holds: &Holds) -> bool {
         match self {
-            Hold::TierPlanE8pRefused | Hold::TierPlanW3Gfx1151Refused => true,
+            Hold::TierPlanE8pRefused
+            | Hold::TierPlanW3Gfx1151Refused
+            | Hold::TierPlanW3Gfx1100Refused => true,
             Hold::Gfx1151E8pReceiptsPending => !holds.gfx1151_e8p_landed,
         }
     }
@@ -242,6 +259,7 @@ impl Hold {
         match self {
             Hold::TierPlanE8pRefused => "tier-plan-e8p-refused",
             Hold::TierPlanW3Gfx1151Refused => "tier-plan-w3-gfx1151-refused",
+            Hold::TierPlanW3Gfx1100Refused => "tier-plan-w3-gfx1100-refused",
             Hold::Gfx1151E8pReceiptsPending => "gfx1151-e8p-receipts-pending",
         }
     }
@@ -268,7 +286,7 @@ const fn cell(arch: &'static str, qt: ExpertQt, route: Route, hold: Hold) -> Hol
 /// The explicit hold list: every cell whose raw kernels exist and which beta qualification
 /// refuses (the three `Gfx1151E8pReceiptsPending` rows only while that switch is false).
 /// The first matching active row names the verdict.
-pub const HOLD_CELLS: [HoldCell; 7] = [
+pub const HOLD_CELLS: [HoldCell; 8] = [
     cell(
         "gfx1100",
         QT_E8P,
@@ -292,6 +310,12 @@ pub const HOLD_CELLS: [HoldCell; 7] = [
         QT_W3,
         Route::TierStage,
         Hold::TierPlanW3Gfx1151Refused,
+    ),
+    cell(
+        "gfx1100",
+        QT_W3,
+        Route::TierStage,
+        Hold::TierPlanW3Gfx1100Refused,
     ),
     cell(
         "gfx1151",
@@ -492,6 +516,52 @@ pub fn slab_serves_codec(arch: &str, codec: u8) -> bool {
     slab_serves_codec_with(arch, codec, &Holds::BETA)
 }
 
+/// Whether the sealed slab DECODES `qt` on `arch`: its K1 lane-union GEMV is admitted. Decode,
+/// MTP verify and every window of at most [`crate::Gpu::few_row_limit`] routing rows run on K1
+/// alone (resident or host-mapped arena, D2 CPU arm included), so a codec whose K2 prefill kernels
+/// are missing is still loadable and decodable: the "decode-only tier" cell. A cell with a K2 but
+/// no K1 is not decodable (the route has no way to launch it).
+pub fn slab_decodes_with(arch: &str, qt: ExpertQt, holds: &Holds) -> bool {
+    capability_with(arch, qt, Route::DecodeGemv, holds).admitted()
+}
+
+/// [`slab_decodes_with`] under the shipped holds.
+pub fn slab_decodes(arch: &str, qt: ExpertQt) -> bool {
+    slab_decodes_with(arch, qt, &Holds::BETA)
+}
+
+/// [`slab_decodes_with`] keyed by slab codec byte; an unknown byte is refused.
+pub fn slab_decodes_codec_with(arch: &str, codec: u8, holds: &Holds) -> bool {
+    ExpertQt::of_slab_codec(codec).is_some_and(|qt| slab_decodes_with(arch, qt, holds))
+}
+
+/// [`slab_decodes_codec_with`] under the shipped holds.
+pub fn slab_decodes_codec(arch: &str, codec: u8) -> bool {
+    slab_decodes_codec_with(arch, codec, &Holds::BETA)
+}
+
+/// Whether the sealed slab PREFILLS `qt` on `arch`: its K2 grouped GEMMs are admitted. A window of
+/// more than [`crate::Gpu::few_row_limit`] routing rows needs this for every codec of the layer;
+/// without it the layer serves decode-width windows only ([`slab_decodes_with`]).
+pub fn slab_prefills_with(arch: &str, qt: ExpertQt, holds: &Holds) -> bool {
+    capability_with(arch, qt, Route::PrefillK2, holds).admitted()
+}
+
+/// [`slab_prefills_with`] under the shipped holds.
+pub fn slab_prefills(arch: &str, qt: ExpertQt) -> bool {
+    slab_prefills_with(arch, qt, &Holds::BETA)
+}
+
+/// [`slab_prefills_with`] keyed by slab codec byte; an unknown byte is refused.
+pub fn slab_prefills_codec_with(arch: &str, codec: u8, holds: &Holds) -> bool {
+    ExpertQt::of_slab_codec(codec).is_some_and(|qt| slab_prefills_with(arch, qt, holds))
+}
+
+/// [`slab_prefills_codec_with`] under the shipped holds.
+pub fn slab_prefills_codec(arch: &str, codec: u8) -> bool {
+    slab_prefills_codec_with(arch, codec, &Holds::BETA)
+}
+
 /// Whether a slab artifact may load on `arch`: the architecture serves MQ4 and its artifact-load
 /// receipts flag is set ([`Holds::shared_receipts_landed`] for gfx1100 / gfx1201,
 /// [`Holds::gfx1151_receipts_landed`] for gfx1151). The flags gate the artifact load only, never
@@ -661,11 +731,14 @@ mod tests {
         let slab = match (arch, qt) {
             ("gfx1201", QT_MQ4_XTS | QT_W3 | QT_E8P) => true,
             ("gfx1151", QT_MQ4_XTS | QT_W3 | QT_E8P) => true,
-            ("gfx1100", QT_MQ4_XTS | QT_E8P) => true,
+            ("gfx1100", QT_MQ4_XTS | QT_E8P | QT_W3) => true,
             _ => false,
         };
+        // gfx1100 W3 (the lossy opt-in MQ3 tier) has K1 and K2: decode, prefill and stage.
+        let decode = slab;
         match route {
-            Route::PrefillK2 | Route::DecodeGemv | Route::Stage => slab,
+            Route::PrefillK2 | Route::Stage => slab,
+            Route::DecodeGemv => decode,
             Route::TierStage => match qt {
                 QT_MQ4_XTS => true,
                 QT_W3 => arch == "gfx1201",
@@ -706,9 +779,9 @@ mod tests {
         for arch in arches() {
             for qt in REGISTRY_PAIRS {
                 for route in all_slab {
-                    let want = match (arch, qt) {
-                        ("gfx1201" | "gfx1151", QT_MQ4_XTS | QT_W3 | QT_E8P)
-                        | ("gfx1100", QT_MQ4_XTS | QT_E8P) => Admitted,
+                    let want = match (arch, qt, route) {
+                        ("gfx1201" | "gfx1151", QT_MQ4_XTS | QT_W3 | QT_E8P, _)
+                        | ("gfx1100", QT_MQ4_XTS | QT_E8P | QT_W3, _) => Admitted,
                         _ => NoKernel,
                     };
                     assert_eq!(
@@ -721,6 +794,7 @@ mod tests {
                     (_, QT_MQ4_XTS) => Admitted,
                     ("gfx1201", QT_W3) => Admitted,
                     ("gfx1151", QT_W3) => Held(TierPlanW3Gfx1151Refused),
+                    ("gfx1100", QT_W3) => Held(Hold::TierPlanW3Gfx1100Refused),
                     ("gfx1100" | "gfx1151" | "gfx1201", QT_E8P) => Held(TierPlanE8pRefused),
                     _ => NoKernel,
                 };
@@ -731,20 +805,20 @@ mod tests {
                 );
             }
         }
-        // W2 has no kernel anywhere; gfx1100 W3 has none either.
+        // W2 has no kernel anywhere; gfx1100 W3 has a K1 and a K2 (decode, prefill, stage) and its tier
+        // cell is held (Hold::TierPlanW3Gfx1100Refused).
         for arch in arches() {
             for route in Route::ALL {
                 assert_eq!(capability(arch, QT_W2, route).verdict, NoKernel);
             }
         }
-        for route in [
-            Route::PrefillK2,
-            Route::DecodeGemv,
-            Route::Stage,
-            Route::TierStage,
-        ] {
-            assert_eq!(capability("gfx1100", QT_W3, route).verdict, NoKernel);
+        for route in [Route::DecodeGemv, Route::PrefillK2, Route::Stage] {
+            assert_eq!(capability("gfx1100", QT_W3, route).verdict, Admitted);
         }
+        assert_eq!(
+            capability("gfx1100", QT_W3, Route::TierStage).verdict,
+            Held(Hold::TierPlanW3Gfx1100Refused)
+        );
     }
 
     #[test]
@@ -779,6 +853,12 @@ mod tests {
                     QT_W3,
                     Route::TierStage,
                     Hold::TierPlanW3Gfx1151Refused
+                ),
+                (
+                    "gfx1100",
+                    QT_W3,
+                    Route::TierStage,
+                    Hold::TierPlanW3Gfx1100Refused
                 ),
             ]
         );
@@ -837,7 +917,7 @@ mod tests {
             slab_serves_codec_with("gfx1151", 0, &off)
                 && slab_serves_codec_with("gfx1151", 1, &off)
         );
-        assert_eq!(held_cells(&off).len(), 4 + 3);
+        assert_eq!(held_cells(&off).len(), 5 + 3);
         assert_eq!(
             capability_with_external("gfx1151", QT_MQ4_XTS, Route::D2CpuSplit, Some("cpu"), &off)
                 .verdict,
@@ -925,7 +1005,7 @@ mod tests {
                 let old = match arch {
                     "gfx1201" => matches!(codec, 0 | 1 | 3),
                     "gfx1151" => matches!(codec, 0 | 1 | 3),
-                    "gfx1100" => matches!(codec, 0 | 3),
+                    "gfx1100" => matches!(codec, 0 | 1 | 3),
                     _ => false,
                 };
                 assert_eq!(slab_serves_codec(arch, codec), old, "{arch:?} {codec}");
@@ -1015,7 +1095,7 @@ mod tests {
             ("gfx1201", QT_E8P, true),
             ("gfx1151", QT_W3, true),
             ("gfx1100", QT_E8P, true),
-            ("gfx1100", QT_W3, false),
+            ("gfx1100", QT_W3, true),
             ("gfx942", QT_MQ4_XTS, false),
             ("", QT_MQ4_XTS, false),
             ("gfx1201", QT_W2, false),
@@ -1028,6 +1108,6 @@ mod tests {
             );
         }
         assert!(stage_eligible("gfx1201", [QT_MQ4_XTS, QT_W3]));
-        assert!(!stage_eligible("gfx1100", [QT_MQ4_XTS, QT_W3]));
+        assert!(stage_eligible("gfx1100", [QT_MQ4_XTS, QT_W3]));
     }
 }

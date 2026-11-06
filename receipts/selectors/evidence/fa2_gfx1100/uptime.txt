@@ -1,0 +1,13 @@
+== fa2-vs-inc-p0 00:45:41 uptime:  00:45:41 up 1 day, 11 min,  3 users,  load average: 1.06, 0.87, 0.68 | sclk: S: 0Mhz *  mclk: 0: 96Mhz *  | GPU_MAX_HW_QUEUES=unset FABRIC_JOB=1193047:8707323:xtx
+rc=0 00:46:02 uptime:  00:46:02 up 1 day, 12 min,  3 users,  load average: 1.04, 0.88, 0.68 | sclk: 1: 1787Mhz *  mclk: 2: 772Mhz *  | GPU_MAX_HW_QUEUES=unset FABRIC_JOB=1193047:8707323:xtx
+== aa-fa2-p0 00:46:02 uptime:  00:46:02 up 1 day, 12 min,  3 users,  load average: 1.04, 0.88, 0.68 | sclk: S: 19Mhz *  mclk: 1: 456Mhz *  | GPU_MAX_HW_QUEUES=unset FABRIC_JOB=1193047:8707323:xtx
+rc=0 00:46:18 uptime:  00:46:18 up 1 day, 12 min,  3 users,  load average: 1.03, 0.89, 0.69 | sclk: 1: 1809Mhz *  mclk: 2: 772Mhz *  | GPU_MAX_HW_QUEUES=unset FABRIC_JOB=1193047:8707323:xtx
+== fa2-vs-inc-p4096 00:46:18 uptime:  00:46:18 up 1 day, 12 min,  3 users,  load average: 1.03, 0.89, 0.69 | sclk: 1: 277Mhz *  mclk: 1: 456Mhz *  | GPU_MAX_HW_QUEUES=unset FABRIC_JOB=1193047:8707323:xtx
+rc=0 00:47:26 uptime:  00:47:26 up 1 day, 13 min,  3 users,  load average: 1.16, 0.95, 0.73 | sclk: 1: 1771Mhz *  mclk: 2: 772Mhz *  | GPU_MAX_HW_QUEUES=unset FABRIC_JOB=1193047:8707323:xtx
+== aa-fa2-p4096 00:47:26 uptime:  00:47:26 up 1 day, 13 min,  3 users,  load average: 1.16, 0.95, 0.73 | sclk: S: 31Mhz *  mclk: 1: 456Mhz *  | GPU_MAX_HW_QUEUES=unset FABRIC_JOB=1193047:8707323:xtx
+rc=0 00:48:11 uptime:  00:48:11 up 1 day, 14 min,  3 users,  load average: 1.07, 0.96, 0.74 | sclk: 1: 1798Mhz *  mclk: 2: 772Mhz *  | GPU_MAX_HW_QUEUES=unset FABRIC_JOB=1193047:8707323:xtx
+== fa2-vs-inc-p12288 00:48:11 uptime:  00:48:11 up 1 day, 14 min,  3 users,  load average: 1.07, 0.96, 0.74 | sclk: S: 166Mhz *  mclk: 1: 456Mhz *  | GPU_MAX_HW_QUEUES=unset FABRIC_JOB=1193047:8707323:xtx
+rc=0 00:50:45 uptime:  00:50:45 up 1 day, 16 min,  3 users,  load average: 1.04, 1.00, 0.79 | sclk: 1: 1838Mhz *  mclk: 2: 772Mhz *  | GPU_MAX_HW_QUEUES=unset FABRIC_JOB=1193047:8707323:xtx
+== aa-fa2-p12288 00:50:45 uptime:  00:50:45 up 1 day, 16 min,  3 users,  load average: 1.04, 1.00, 0.79 | sclk: S: 28Mhz *  mclk: 1: 456Mhz *  | GPU_MAX_HW_QUEUES=unset FABRIC_JOB=1193047:8707323:xtx
+rc=0 00:52:19 uptime:  00:52:19 up 1 day, 18 min,  3 users,  load average: 1.06, 1.02, 0.83 | sclk: 1: 1802Mhz *  mclk: 2: 772Mhz *  | GPU_MAX_HW_QUEUES=unset FABRIC_JOB=1193047:8707323:xtx
+job done 00:52:19

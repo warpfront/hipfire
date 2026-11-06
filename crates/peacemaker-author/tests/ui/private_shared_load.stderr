@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/private_shared_load.rs:19:20
+   |
+19 |         wg.ds_load(&o, "ds_load_b32 v3, v1".into())?;
+   |            ------- ^^ expected `&LdsRegion<_, Published>`, found `&WaveRegion<Scratch, Owned>`
+   |            |
+   |            arguments to this method are incorrect
+   |
+   = note: expected reference `&LdsRegion<_, Published>`
+              found reference `&WaveRegion<Scratch, peacemaker_author::Owned>`
+note: method defined here
+  --> src/scope.rs
+   |
+   |     pub fn ds_load<R>(&mut self, r: &LdsRegion<R, Published>, insn: B::Insn) -> Result<(), String> {
+   |            ^^^^^^^

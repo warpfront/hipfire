@@ -26,7 +26,7 @@
     "argv": [],
     "object": "native/gfx1151/qwen4_lane_rows_pm.hxaco",
     "receipt": "receipts/gfx1151/bc34ee389bd990386bdfc93d94b66752affcd3fbd33bec212a6b4edcaa51a963.receipt.json",
-    "receipt_sha256": "944c38d5c8e974992d77f32ea2ee77c3741c3d3dcdd4b936518db27d65cc47e6",
+    "receipt_sha256": "525add472630d0fc63d701710a8383c4174956ffaae2670e97f9693234589a52",
     "kernels": [
       {
         "symbol": "gemv_mq6g256v2_xbatch_pm",
@@ -87,7 +87,7 @@
   },
   "receipt": {
     "schema": "peacemaker-receipt",
-    "schema_version": 8,
+    "schema_version": 9,
     "object_sha256": "bc34ee389bd990386bdfc93d94b66752affcd3fbd33bec212a6b4edcaa51a963",
     "device_elf_sha256": "b0a702507aa5420261ac90742e3665403e47636c24e034918507997bb14c53dc",
     "arch": "gfx1151",
@@ -95,13 +95,13 @@
     "tier": "D",
     "lifter": {
       "name": "peacemaker-lift",
-      "crate_version": "0.4.4",
-      "git_sha": "847130e7a1177fdc29105d13d4055464082dddfb"
+      "crate_version": "0.4.5",
+      "git_sha": "cbb287f056a7c0cf912221422b55941b32ec9e04"
     },
     "certifier": {
       "name": "railgun-cert",
-      "crate_version": "0.4.4",
-      "git_sha": "847130e7a1177fdc29105d13d4055464082dddfb"
+      "crate_version": "0.4.5",
+      "git_sha": "cbb287f056a7c0cf912221422b55941b32ec9e04"
     },
     "round_trip_proof_sha256": "f79e477edeb94f34f5c5842dc130926e93ba86b30f282661480c27e86c38745e",
     "kernels": [
@@ -238,11 +238,12 @@
       "InBoundsNoAlias"
     ],
     "railgun": {
-      "section_version": 2,
+      "section_version": 3,
       "analysis": "peacemaker_ir::passes::kernargs (A1/A3/A4)",
       "assumptions": [
         "AddressArithmetic: a pointer is never rebuilt by multiplication, shifting or bit-field extraction of a value loaded from memory",
-        "AllocationWide: every recognised pointer effect covers its whole allocation (A2 bounds are M0b)"
+        "AllocationWide: every recognised pointer effect covers its whole allocation (A2 bounds are M0b)",
+        "SealedTable: a value loaded from a sealed table is only used as a whole 64-bit pointer base of reads that stay inside the pointee allocation the entry names (halves are never recombined across entries, an entry is never added to another pointer, and a read whose base may be an entry or an argument pointer reads whichever it names; a table whose certificate records `null_guarded` may hold null entries, every other table holds none; the loader keeps the table and every pointee immutable)"
       ],
       "kernels": [
         {

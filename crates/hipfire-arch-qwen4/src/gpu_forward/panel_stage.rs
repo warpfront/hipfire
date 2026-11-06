@@ -54,6 +54,9 @@ const EXTENT_ALIGN: usize = 256;
 pub(crate) const MAX_GROUP_EXPERTS: usize = 32;
 /// Largest per-layer expert table.
 pub(crate) const MAX_TABLE_EXPERTS: usize = 1024;
+/// Range key of a tier layer's device-resident extents in [`plan_group_layout`] (the host
+/// ranges are 0 and 1).
+const DEVICE_RANGE: usize = 2;
 
 fn align_up(value: usize, align: usize) -> Option<usize> {
     value.checked_add(align - 1).map(|v| v & !(align - 1))
@@ -99,7 +102,18 @@ pub(crate) struct LayerExpertSources {
     /// (gate/up, then down: separate pinned allocations).
     ranges: SmallVec<[(usize, usize); 2]>,
     experts: Vec<Option<ExpertSource>>,
+    /// A tier layer's device-resident experts (S1 over a ranked hot set): their extents are
+    /// DEVICE addresses inside `device.range`, copied into the page by a device-to-device copy
+    /// instead of an H2D copy. `None` for every other layer.
+    device: Option<DeviceSet>,
     owner: Arc<dyn Any + Send + Sync>,
+}
+
+/// The device-resident experts of one tier layer: the tier's device owner range
+/// `(base, bytes)` and, per expert id, whether that expert's extents live in it.
+struct DeviceSet {
+    range: (usize, usize),
+    experts: Vec<bool>,
 }
 
 impl LayerExpertSources {
@@ -119,7 +133,41 @@ impl LayerExpertSources {
         let mut ranges = SmallVec::new();
         ranges.push((host_base, host_bytes));
         // SAFETY: forwarded from this function's contract.
-        unsafe { Self::build(layer, ranges, experts, owner) }
+        unsafe { Self::build(layer, ranges, experts, None, owner) }
+    }
+
+    /// A hot-set TIER layer: cold experts' extents are CPU addresses inside the one pinned host
+    /// owner `host = (cpu_base, bytes)`; `device_experts[id]` experts' extents are device
+    /// addresses inside the tier's device owner `device = (base, bytes)`, which the ring copies
+    /// device-to-device (VRAM bandwidth, no link bytes). Every projection of every held expert is
+    /// bounds checked against the range of its own kind.
+    ///
+    /// # Safety
+    /// As [`Self::new`] for `host`, and `[device.0, device.0 + device.1)` must be live device
+    /// memory that stays valid and unmodified for as long as `owner` (or a clone) lives.
+    pub(crate) unsafe fn new_tier(
+        layer: usize,
+        host: (usize, usize),
+        device: (usize, usize),
+        experts: Vec<Option<ExpertSource>>,
+        device_experts: Vec<bool>,
+        owner: Arc<dyn Any + Send + Sync>,
+    ) -> R<Self> {
+        if device_experts.len() != experts.len() {
+            return Err(invalid(format!(
+                "panel sources layer {layer}: {} device flags for {} experts",
+                device_experts.len(),
+                experts.len()
+            )));
+        }
+        let mut ranges = SmallVec::new();
+        ranges.push(host);
+        let set = DeviceSet {
+            range: device,
+            experts: device_experts,
+        };
+        // SAFETY: forwarded from this function's contract.
+        unsafe { Self::build(layer, ranges, experts, Some(set), owner) }
     }
 
     /// Gate/up extents in `gate_up` and down extents in `down`: two separate
@@ -139,7 +187,7 @@ impl LayerExpertSources {
         ranges.push(gate_up);
         ranges.push(down);
         // SAFETY: forwarded from this function's contract.
-        unsafe { Self::build(layer, ranges, experts, owner) }
+        unsafe { Self::build(layer, ranges, experts, None, owner) }
     }
 
     /// `ranges[0]` bounds gate/up extents; `ranges[last]` bounds down extents.
@@ -147,6 +195,7 @@ impl LayerExpertSources {
         layer: usize,
         ranges: SmallVec<[(usize, usize); 2]>,
         experts: Vec<Option<ExpertSource>>,
+        device: Option<DeviceSet>,
         owner: Arc<dyn Any + Send + Sync>,
     ) -> R<Self> {
         if experts.is_empty() || experts.len() > MAX_TABLE_EXPERTS {
@@ -169,21 +218,35 @@ impl LayerExpertSources {
                 )));
             }
         }
+        let device_end = match device.as_ref() {
+            Some(set) => Some(set.range.0.checked_add(set.range.1).ok_or_else(|| {
+                invalid(format!(
+                    "panel sources layer {layer}: device range overflows"
+                ))
+            })?),
+            None => None,
+        };
         for (id, expert) in experts.iter().enumerate() {
             let Some(expert) = expert else { continue };
+            let on_device = device
+                .as_ref()
+                .is_some_and(|set| set.experts.get(id).copied().unwrap_or(false));
             for (name, extent, range) in [
                 ("gate_up", expert.gate_up, 0),
                 ("down", expert.down, ranges.len() - 1),
             ] {
-                let (host_base, host_bytes) = ranges[range];
+                let (kind, base, bytes, limit) = match (on_device, device.as_ref(), device_end) {
+                    (true, Some(set), Some(end)) => ("device", set.range.0, set.range.1, end),
+                    _ => ("host", ranges[range].0, ranges[range].1, ends[range]),
+                };
                 let end = extent.addr.checked_add(extent.len).ok_or_else(|| {
                     invalid(format!(
                         "panel sources layer {layer} expert {id} {name} extent overflows"
                     ))
                 })?;
-                if extent.len == 0 || extent.addr < host_base || end > ends[range] {
+                if extent.len == 0 || extent.addr < base || end > limit {
                     return Err(invalid(format!(
-                        "panel sources layer {layer} expert {id} {name} extent [{:#x}, +{}) is outside the host owner [{host_base:#x}, +{host_bytes})",
+                        "panel sources layer {layer} expert {id} {name} extent [{:#x}, +{}) is outside the {kind} owner [{base:#x}, +{bytes})",
                         extent.addr, extent.len
                     )));
                 }
@@ -193,6 +256,7 @@ impl LayerExpertSources {
             layer,
             ranges,
             experts,
+            device,
             owner,
         })
     }
@@ -246,6 +310,24 @@ impl LayerExpertSources {
 
     pub(crate) fn expert(&self, id: usize) -> Option<&ExpertSource> {
         self.experts.get(id).and_then(Option::as_ref)
+    }
+
+    /// Whether expert `id`'s extents are device addresses of a tier layer's device owner.
+    pub(crate) fn is_device(&self, id: usize) -> bool {
+        self.device
+            .as_ref()
+            .is_some_and(|set| set.experts.get(id).copied().unwrap_or(false))
+    }
+
+    /// Number of held experts served by device-to-device copy.
+    pub(crate) fn device_experts(&self) -> usize {
+        self.device.as_ref().map_or(0, |set| {
+            set.experts
+                .iter()
+                .zip(&self.experts)
+                .filter(|(device, held)| **device && held.is_some())
+                .count()
+        })
     }
 
     /// Provenance: the gate/up (or only) host range `(base, bytes)`.
@@ -371,6 +453,8 @@ struct CopyRun {
     src: usize,
     dst: usize,
     len: usize,
+    /// `src` is a device address (copied device-to-device), not pinned host memory.
+    device: bool,
 }
 
 /// Where a group's bytes sit in a page.
@@ -388,8 +472,21 @@ struct GroupLayout {
 }
 
 impl GroupLayout {
+    /// Bytes copied into the page: every run, host (over the link) and device (tier layer's
+    /// hot experts, device-to-device) alike, so a window's one-sweep and useful-bytes
+    /// invariants hold unchanged over a tier layer.
     fn submitted_bytes(&self) -> usize {
         self.runs.iter().map(|run| run.len).sum()
+    }
+
+    /// The part of [`Self::submitted_bytes`] copied device-to-device from a tier layer's device
+    /// owner; the link bytes of the group are the difference.
+    fn device_bytes(&self) -> usize {
+        self.runs
+            .iter()
+            .filter(|run| run.device)
+            .map(|run| run.len)
+            .sum()
     }
 }
 
@@ -410,15 +507,25 @@ fn plan_group_layout(experts: &[usize], sources: &LayerExpertSources) -> R<Group
                 sources.layer()
             ))
         })?;
+        // A device-resident expert (tier layer) sorts and merges in its own range key.
+        let on_device = sources.is_device(id);
         items.push((
-            sources.range_of(false),
+            if on_device {
+                DEVICE_RANGE
+            } else {
+                sources.range_of(false)
+            },
             expert.gate_up.addr,
             expert.gate_up.len,
             index,
             false,
         ));
         items.push((
-            sources.range_of(true),
+            if on_device {
+                DEVICE_RANGE
+            } else {
+                sources.range_of(true)
+            },
             expert.down.addr,
             expert.down.len,
             index,
@@ -451,10 +558,11 @@ fn plan_group_layout(experts: &[usize], sources: &LayerExpertSources) -> R<Group
     let mut layout = GroupLayout {
         runs: runs
             .iter()
-            .map(|&(_, start, end, dst)| CopyRun {
+            .map(|&(range, start, end, dst)| CopyRun {
                 src: start,
                 dst,
                 len: end - start,
+                device: range == DEVICE_RANGE,
             })
             .collect(),
         gate_up: SmallVec::from_elem(0, experts.len()),
@@ -679,8 +787,12 @@ pub(crate) struct PanelStats {
     pub(crate) retired: u64,
     /// Retired without ever being acquired (prefetched, then unused).
     pub(crate) discarded: u64,
-    /// Bytes H2D-copied as payload (submitted).
+    /// Bytes copied into pages as payload (submitted): host bytes over the link plus a tier
+    /// layer's device-to-device bytes ([`Self::device_payload_bytes`]).
     pub(crate) submitted_payload_bytes: u64,
+    /// The part of the submitted bytes copied device-to-device from a tier layer's device owner
+    /// (no link bytes): the link bytes are `submitted_payload_bytes - device_payload_bytes`.
+    pub(crate) device_payload_bytes: u64,
     /// Sum of the experts' own extent lengths of those groups.
     pub(crate) extent_bytes: u64,
     pub(crate) table_bytes: u64,
@@ -860,6 +972,16 @@ pub(crate) trait PanelBackend {
         rec: Option<usize>,
     ) -> R<()>;
     fn copy_payload(
+        &mut self,
+        ctx: &Self::Ctx,
+        slot: usize,
+        src: usize,
+        dst: usize,
+        len: usize,
+    ) -> R<()>;
+    /// Copy stream: copy `len` bytes from DEVICE address `src` (a tier layer's device-resident
+    /// expert) into the page at `dst`.
+    fn copy_payload_device(
         &mut self,
         ctx: &Self::Ctx,
         slot: usize,
@@ -1346,8 +1468,13 @@ impl<B: PanelBackend> RingCore<B> {
         fill_tables(layout, &group.experts, base, gate_up, down)?;
         self.backend.copy_begin(ctx, slot, wait_free, rec)?;
         for run in &layout.runs {
-            self.backend
-                .copy_payload(ctx, slot, run.src, run.dst, run.len)?;
+            if run.device {
+                self.backend
+                    .copy_payload_device(ctx, slot, run.src, run.dst, run.len)?;
+            } else {
+                self.backend
+                    .copy_payload(ctx, slot, run.src, run.dst, run.len)?;
+            }
         }
         self.backend
             .copy_zero(ctx, slot, layout.used, ARENA_TAIL_PAD_BYTES)?;
@@ -1356,6 +1483,7 @@ impl<B: PanelBackend> RingCore<B> {
         self.pages[slot].state = PageState::Ready;
         self.stats.enqueued += 1;
         self.stats.submitted_payload_bytes += layout.submitted_bytes() as u64;
+        self.stats.device_payload_bytes += layout.device_bytes() as u64;
         self.stats.extent_bytes += layout.extent_bytes as u64;
         self.stats.table_bytes += (2 * self.spec.num_experts * std::mem::size_of::<u64>()) as u64;
         Ok(())
@@ -2331,6 +2459,24 @@ impl PanelBackend for HipPanelBackend {
         Ok(())
     }
 
+    fn copy_payload_device(
+        &mut self,
+        gpu: &Gpu,
+        slot: usize,
+        src: usize,
+        dst: usize,
+        len: usize,
+    ) -> R<()> {
+        // SAFETY: `src..src+len` was checked against the tier layer's device owner range in
+        // `LayerExpertSources::new_tier`; the ring retains the owner until this copy is known
+        // complete, and the borrowed view is never freed.
+        let source =
+            unsafe { hip_bridge::DeviceBuffer::from_raw(src as *mut std::ffi::c_void, len) };
+        gpu.hip
+            .memcpy_dtod_async_at(&self.payloads[slot].buf, dst, &source, 0, len, &self.copy)?;
+        Ok(())
+    }
+
     fn copy_zero(&mut self, gpu: &Gpu, slot: usize, dst: usize, len: usize) -> R<()> {
         gpu.hip.memset_async(
             &self.payloads[slot].buf.byte_view(dst, len),
@@ -2615,6 +2761,10 @@ pub(crate) struct ImageCheck {
 /// entry, rebased onto `page_base`) must equal the source extent byte for
 /// byte, the tail pad must be zero, group entries must point inside the
 /// payload and every other table entry must be zero.
+///
+/// A device-resident expert of a tier layer (see [`LayerExpertSources::new_tier`]) has no
+/// pinned host source: `device_source` reads `len` bytes at a device address (the selftest
+/// passes a D2H download); `None` makes such an expert an error.
 fn verify_page_image(
     image: &[u8],
     used: usize,
@@ -2623,6 +2773,7 @@ fn verify_page_image(
     sources: &LayerExpertSources,
     gate_up_table: &[u64],
     down_table: &[u64],
+    device_source: Option<&dyn Fn(usize, usize) -> R<Vec<u8>>>,
 ) -> R<ImageCheck> {
     let layer = sources.layer();
     let fail = |what: String| invalid(format!("panel image layer {layer}: {what}"));
@@ -2690,10 +2841,20 @@ fn verify_page_image(
                         extent.len
                     ))
                 })?;
-            // SAFETY: the extent was bounds-checked against the pinned host
-            // range of `sources`, which its owner keeps alive and unmodified.
-            let source =
-                unsafe { std::slice::from_raw_parts(extent.addr as *const u8, extent.len) };
+            let device_bytes;
+            let source: &[u8] = if sources.is_device(id) {
+                let read = device_source.ok_or_else(|| {
+                    fail(format!(
+                        "expert {id} is device-resident and no device reader was given"
+                    ))
+                })?;
+                device_bytes = read(extent.addr, extent.len)?;
+                &device_bytes
+            } else {
+                // SAFETY: the extent was bounds-checked against the pinned host
+                // range of `sources`, which its owner keeps alive and unmodified.
+                unsafe { std::slice::from_raw_parts(extent.addr as *const u8, extent.len) }
+            };
             if let Some(at) = source
                 .iter()
                 .zip(&image[offset..end])
@@ -2967,6 +3128,15 @@ fn run_selftest(
         let gate_up = decode(&image[page_bytes..page_bytes + table_bytes]);
         let down = decode(&image[page_bytes + table_bytes..page_bytes + 2 * table_bytes]);
         let sources = &schedule.layers[reader.layer_index].sources;
+        let device_source = |addr: usize, len: usize| -> R<Vec<u8>> {
+            // SAFETY: `addr..addr+len` was bounds checked against the tier layer's device
+            // owner in `LayerExpertSources::new_tier`; the borrowed view is never freed.
+            let view =
+                unsafe { hip_bridge::DeviceBuffer::from_raw(addr as *mut std::ffi::c_void, len) };
+            let mut bytes = vec![0u8; len];
+            gpu.hip.memcpy_dtoh(bytes.as_mut_slice(), &view)?;
+            Ok(bytes)
+        };
         let check = verify_page_image(
             &image[..page_bytes],
             reader.used,
@@ -2975,6 +3145,7 @@ fn run_selftest(
             sources,
             &gate_up,
             &down,
+            Some(&device_source),
         )?;
         report.groups_checked += 1;
         report.payload_bytes_compared += check.payload_bytes;
@@ -3778,6 +3949,7 @@ mod slowlink_ring {
         AwaitCopyDone(usize),
         Begin(usize, bool),
         Payload(usize, usize, usize, usize),
+        PayloadDevice(usize, usize, usize, usize),
         Zero(usize, usize, usize),
         Tables(usize),
         End(usize),
@@ -3879,6 +4051,16 @@ mod slowlink_ring {
             len: usize,
         ) -> R<()> {
             self.op(Op::Payload(slot, src, dst, len))
+        }
+        fn copy_payload_device(
+            &mut self,
+            _: &(),
+            slot: usize,
+            src: usize,
+            dst: usize,
+            len: usize,
+        ) -> R<()> {
+            self.op(Op::PayloadDevice(slot, src, dst, len))
         }
         fn copy_zero(&mut self, _: &(), slot: usize, dst: usize, len: usize) -> R<()> {
             self.op(Op::Zero(slot, dst, len))
@@ -3991,6 +4173,204 @@ mod slowlink_ring {
 
     fn err_text(error: Qwen4GpuForwardError) -> String {
         error.to_string()
+    }
+
+    const DEVICE: usize = 0x5_0000_0000;
+
+    /// A tier layer: experts `0..EXPERTS`, every third one device-resident (device owner packs
+    /// them in REVERSE id order with a gap between experts, so no two are adjacent), the others cold in the pinned host
+    /// owner in id order.
+    fn tier_sources(layer: usize) -> LayerExpertSources {
+        let hot: Vec<usize> = (0..EXPERTS).filter(|id| id % 3 == 0).collect();
+        let experts: Vec<_> = (0..EXPERTS)
+            .map(|id| {
+                let (gate_up, down) = match hot.iter().rev().position(|&h| h == id) {
+                    Some(slot) => {
+                        let base = DEVICE + slot * 2 * (GU + DN);
+                        (base, base + GU)
+                    }
+                    None => {
+                        let base = HOST + id * (GU + DN);
+                        (base, base + GU)
+                    }
+                };
+                Some(ExpertSource {
+                    codec: PanelCodec(0),
+                    gate_up: ExpertExtent {
+                        addr: gate_up,
+                        len: GU,
+                    },
+                    down: ExpertExtent {
+                        addr: down,
+                        len: DN,
+                    },
+                })
+            })
+            .collect();
+        let on_device = (0..EXPERTS).map(|id| id % 3 == 0).collect();
+        // SAFETY: the mock backend never dereferences a source address.
+        unsafe {
+            LayerExpertSources::new_tier(
+                layer,
+                (HOST, EXPERTS * (GU + DN)),
+                (DEVICE, hot.len() * 2 * (GU + DN)),
+                experts,
+                on_device,
+                Arc::new(0u8),
+            )
+        }
+        .unwrap()
+    }
+
+    #[test]
+    fn s1_tier_layout_copies_hot_experts_device_to_device_and_cold_over_the_link() {
+        let s = tier_sources(5);
+        assert_eq!(
+            s.device_experts(),
+            (0..EXPERTS).filter(|id| id % 3 == 0).count()
+        );
+        assert!(s.is_device(3) && !s.is_device(4));
+        // One group of 4 consecutive experts: ids 12..16 -> 12 hot, 13/14/15: 15 hot.
+        let g = group(&s, 3);
+        assert_eq!(g.experts.as_slice(), &[12, 13, 14, 15]);
+        let layout = plan_group_layout(&g.experts, &s).unwrap();
+        let device_bytes: usize = layout.runs.iter().filter(|r| r.device).map(|r| r.len).sum();
+        let host_bytes: usize = layout
+            .runs
+            .iter()
+            .filter(|r| !r.device)
+            .map(|r| r.len)
+            .sum();
+        // Two hot experts (12, 15), two cold (13, 14).
+        assert_eq!(device_bytes, 2 * (GU + DN));
+        assert_eq!(host_bytes, 2 * (GU + DN));
+        assert_eq!(layout.device_bytes(), device_bytes);
+        assert_eq!(
+            layout.submitted_bytes(),
+            host_bytes + device_bytes,
+            "submitted counts every run; the link bytes are the host runs"
+        );
+        assert_eq!(layout.extent_bytes, device_bytes + host_bytes);
+        // The two cold experts are adjacent in the host owner: one merged host run.
+        assert_eq!(layout.runs.iter().filter(|r| !r.device).count(), 1);
+        // Hot experts 12 and 15 sit at device slots (reverse order) with a gap: two runs.
+        assert_eq!(layout.runs.iter().filter(|r| r.device).count(), 2);
+        // Every run keeps the source address congruence and runs never overlap in the page.
+        let mut spans: Vec<_> = layout.runs.iter().map(|r| (r.dst, r.dst + r.len)).collect();
+        spans.sort_unstable();
+        assert!(spans.windows(2).all(|w| w[0].1 <= w[1].0));
+        for run in &layout.runs {
+            assert_eq!(run.dst % EXTENT_ALIGN, run.src % EXTENT_ALIGN);
+        }
+        // The tables point every group expert (hot and cold) into the page, others zero.
+        let (mut gu, mut dn) = (vec![u64::MAX; EXPERTS], vec![u64::MAX; EXPERTS]);
+        let base = 0x2_0000_0000usize;
+        fill_tables(&layout, &g.experts, base, &mut gu, &mut dn).unwrap();
+        for &id in &g.experts {
+            assert!(gu[id] as usize >= base && gu[id] as usize <= base + layout.used);
+            assert_eq!(dn[id] - gu[id], GU as u64);
+        }
+        assert_eq!(gu.iter().filter(|&&v| v != 0).count(), 4);
+    }
+
+    #[test]
+    fn s1_tier_ring_issues_device_copies_and_counts_device_bytes_apart() {
+        let mut ring = core(2, 0);
+        ring.begin_window(&()).unwrap();
+        ring.set_layers(Some(0), None).unwrap();
+        let s = tier_sources(0);
+        let g = group(&s, 3);
+        let ticket = ring.enqueue(&(), &g, &s).unwrap();
+        let ops = &ring.backend.ops;
+        let device: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::PayloadDevice(_, src, _, len) => Some((*src, *len)),
+                _ => None,
+            })
+            .collect();
+        let host: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Payload(_, src, _, len) => Some((*src, *len)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(device.len(), 2);
+        assert!(device.iter().all(|(src, _)| *src >= DEVICE));
+        assert_eq!(host.len(), 1);
+        assert!(host.iter().all(|(src, _)| (HOST..DEVICE).contains(src)));
+        assert_eq!(ring.stats.submitted_payload_bytes, 4 * (GU + DN) as u64);
+        assert_eq!(ring.stats.device_payload_bytes, 2 * (GU + DN) as u64);
+        ring.acquire(&(), ticket).unwrap();
+        ring.retire(&(), ticket).unwrap();
+    }
+
+    #[test]
+    fn s1_tier_sources_bound_every_extent_by_its_own_kind_of_owner() {
+        // A hot expert whose extent lies in the HOST range (or a cold one in the device range) is
+        // refused: the kind decides which owner bounds the extent.
+        let one = |gate_up: usize, down: usize, device: bool| {
+            let experts = vec![Some(ExpertSource {
+                codec: PanelCodec(0),
+                gate_up: ExpertExtent {
+                    addr: gate_up,
+                    len: GU,
+                },
+                down: ExpertExtent {
+                    addr: down,
+                    len: DN,
+                },
+            })];
+            // SAFETY: never dereferenced.
+            unsafe {
+                LayerExpertSources::new_tier(
+                    0,
+                    (HOST, 4 * (GU + DN)),
+                    (DEVICE, 4 * (GU + DN)),
+                    experts,
+                    vec![device],
+                    Arc::new(0u8),
+                )
+            }
+        };
+        assert!(one(DEVICE, DEVICE + GU, true).is_ok());
+        assert!(one(HOST, HOST + GU, false).is_ok());
+        let hot_in_host = err_text(one(HOST, HOST + GU, true).err().unwrap());
+        assert!(hot_in_host.contains("device owner"), "{hot_in_host}");
+        let cold_in_device = err_text(one(DEVICE, DEVICE + GU, false).err().unwrap());
+        assert!(cold_in_device.contains("host owner"), "{cold_in_device}");
+        // Past the end of the device owner.
+        assert!(one(DEVICE + 4 * (GU + DN) - GU, DEVICE + 4 * (GU + DN), true).is_err());
+        // Flags must cover every expert.
+        let experts = vec![None, None];
+        // SAFETY: never dereferenced.
+        let bad = unsafe {
+            LayerExpertSources::new_tier(
+                0,
+                (HOST, 1),
+                (DEVICE, 1),
+                experts,
+                vec![false],
+                Arc::new(0u8),
+            )
+        };
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn s1_tier_pages_stay_within_the_admitted_worst_case_payload() {
+        // The admission sizes a page for 32 experts plus the worst-case unmerged-run slack
+        // (`2 * experts_per_page` extents of at most `2 * 255` bytes each); an all-unmerged
+        // mixed group (alternating hot/cold, device owner in reverse order) must fit it.
+        let s = tier_sources(0);
+        for group in ExpertGroupPlan::partition(&s, MAX_GROUP_EXPERTS).unwrap() {
+            let layout = plan_group_layout(&group.experts, &s).unwrap();
+            let bound = group.experts.len() * (GU + DN) + 2 * group.experts.len() * 2 * 255;
+            assert!(layout.used <= bound, "{} > {bound}", layout.used);
+            assert_eq!(layout.submitted_bytes(), group.experts.len() * (GU + DN));
+            assert!(layout.device_bytes() <= layout.submitted_bytes());
+        }
     }
 
     #[test]
@@ -4301,6 +4681,64 @@ mod slowlink_ring {
             }
             .is_err());
         }
+    }
+
+    /// A mixed MQ4 + W3 slab arena (mq3-xts): each expert's panel source is its OWN codec
+    /// extent (`codec_slot_bytes`), so the last expert ends exactly at the arena's end. The
+    /// dense-dtype stride the expert view carries (`m * row_stride`: 1,280 rows x 2,560 B =
+    /// 3,276,800 B for a planar W3 gate/up) overruns the host owner on the last W3 expert, the
+    /// 'extent is outside the host owner' load failure of the first S1 slab card run.
+    #[test]
+    fn slowlink_ring_slab_alias_uses_each_experts_own_codec_extent() {
+        use crate::expert_arena::{codec_slot_bytes, CODEC_MQ4, CODEC_W3};
+        const EXPERTS: usize = 512;
+        let alias_base = 0x5000_0000usize;
+        // Every third expert MQ4 (hot), the rest W3: expert 511 is W3 (511 % 3 == 1).
+        let codecs: Vec<u8> = (0..EXPERTS)
+            .map(|id| if id % 3 == 0 { CODEC_MQ4 } else { CODEC_W3 })
+            .collect();
+        let mut cursor = 0usize;
+        let mut real = Vec::new();
+        let mut dense = Vec::new();
+        for codec in &codecs {
+            let (gate_up, down) = codec_slot_bytes(*codec).unwrap();
+            real.push(Some(AliasExpert {
+                codec: PanelCodec(0),
+                gate_up_addr: alias_base + cursor,
+                gate_up_len: gate_up,
+                down_addr: alias_base + cursor + gate_up,
+                down_len: down,
+            }));
+            // The dense row-stride arithmetic: 1,280 x 2,560 and 2,560 x 640 bytes for W3.
+            let (dense_gate_up, dense_down) = if *codec == CODEC_MQ4 {
+                (gate_up, down)
+            } else {
+                (1280 * 2560, 2560 * 640)
+            };
+            dense.push(Some(AliasExpert {
+                codec: PanelCodec(0),
+                gate_up_addr: alias_base + cursor,
+                gate_up_len: dense_gate_up,
+                down_addr: alias_base + cursor + gate_up,
+                down_len: dense_down,
+            }));
+            cursor += gate_up + down;
+        }
+        let arena_bytes = cursor;
+        assert_eq!(arena_bytes, 171 * 2_611_200 + 341 * 1_920_000);
+        // SAFETY: never dereferenced.
+        let sources = unsafe {
+            LayerExpertSources::from_alias(15, HOST, alias_base, arena_bytes, &real, Arc::new(0u8))
+        }
+        .unwrap();
+        let last = sources.expert(EXPERTS - 1).unwrap();
+        assert_eq!(last.gate_up.len, 1_280_000);
+        assert_eq!(last.down.addr + last.down.len, HOST + arena_bytes);
+        // SAFETY: construction must fail.
+        let overrun = unsafe {
+            LayerExpertSources::from_alias(15, HOST, alias_base, arena_bytes, &dense, Arc::new(0u8))
+        };
+        assert!(overrun.is_err());
     }
 
     #[test]
@@ -4655,7 +5093,7 @@ mod slowlink_ring {
         let experts = [3usize, 4, 9, 40];
         let base = 0x2_0000_0000usize;
         let (image, used, gu, dn) = page_image(&s, &experts, base);
-        let check = verify_page_image(&image, used, base, &experts, &s, &gu, &dn).unwrap();
+        let check = verify_page_image(&image, used, base, &experts, &s, &gu, &dn, None).unwrap();
         assert_eq!(check.payload_bytes, (4 * (GU + DN)) as u64);
         assert_eq!(check.table_entries, 2 * EXPERTS as u64);
         assert_eq!(check.pad_bytes, ARENA_TAIL_PAD_BYTES as u64);
@@ -4669,7 +5107,7 @@ mod slowlink_ring {
         let base = 0x2_0000_0000usize;
         let (image, used, gu, dn) = page_image(&s, &experts, base);
         let ok = |image: &[u8], gu: &[u64], dn: &[u64]| {
-            verify_page_image(image, used, base, &experts, &s, gu, dn)
+            verify_page_image(image, used, base, &experts, &s, gu, dn, None)
         };
         assert!(ok(&image, &gu, &dn).is_ok());
         // A refilled page: any payload byte differing from the pinned source.
@@ -4719,10 +5157,10 @@ mod slowlink_ring {
         let (img_a, used_a, gu_a, dn_a) = page_image(&s, &a, base);
         let (img_b, used_b, gu_b, dn_b) = page_image(&s, &b, base);
         assert_eq!(used_a, used_b);
-        verify_page_image(&img_a, used_a, base, &a, &s, &gu_a, &dn_a).unwrap();
-        verify_page_image(&img_b, used_b, base, &b, &s, &gu_b, &dn_b).unwrap();
-        assert!(verify_page_image(&img_b, used_a, base, &a, &s, &gu_a, &dn_a).is_err());
-        assert!(verify_page_image(&img_a, used_a, base, &a, &s, &gu_b, &dn_b).is_err());
+        verify_page_image(&img_a, used_a, base, &a, &s, &gu_a, &dn_a, None).unwrap();
+        verify_page_image(&img_b, used_b, base, &b, &s, &gu_b, &dn_b, None).unwrap();
+        assert!(verify_page_image(&img_b, used_a, base, &a, &s, &gu_a, &dn_a, None).is_err());
+        assert!(verify_page_image(&img_a, used_a, base, &a, &s, &gu_b, &dn_b, None).is_err());
     }
 
     #[test]

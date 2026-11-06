@@ -1,0 +1,4902 @@
+{
+  "arch": "gfx1201",
+  "baseline": {
+    "code_bytes": 7672,
+    "code_sha256": "3bae4930ca25185da2bf5f67be67246a2bdfb2fe9495960c0c5136ba2c27695f",
+    "explicit_args": [
+      {
+        "class": "pointer",
+        "offset": 0,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 8,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 16,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 24,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 32,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 40,
+        "size": 8
+      },
+      {
+        "class": "value",
+        "offset": 48,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 52,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 56,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 60,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 64,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 68,
+        "size": 4
+      }
+    ],
+    "hipcc_argv": [
+      "/opt/rocm/core/bin/hipcc",
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "--rocm-path=/opt/rocm/core",
+      "--hip-path=/opt/rocm/core",
+      "-I/opt/rocm/core/include",
+      "-fmacro-prefix-map=/home/kaden/qcal/release-0.4.3/pmrip/moe-cand/run/receipt2/dn-A/baseline/=",
+      "-o",
+      "/home/kaden/qcal/release-0.4.3/pmrip/moe-cand/run/receipt2/dn-A/baseline/moe_grouped_qt44_a8_sym_gfx12.hsaco",
+      "/home/kaden/qcal/release-0.4.3/pmrip/moe-cand/run/receipt2/dn-A/baseline/moe_grouped_qt44_a8_sym_gfx12.hip"
+    ],
+    "kernarg_bytes": 72,
+    "kernels_in_object": 4,
+    "lds_bytes": 0,
+    "max_flat_workgroup_size": 128,
+    "object_bytes": 41344,
+    "object_path": "/home/kaden/qcal/release-0.4.3/pmrip/moe-cand/run/receipt2/dn-A/baseline/moe_grouped_qt44_a8_sym_gfx12.hsaco",
+    "object_sha256": "ed67a1ef435e9f9a47b80713cd6a4359156d052edfc134ef47808e345c128fa5",
+    "occupancy_basis": "vgpr (gfx11 wave32: 1536 VGPR/SIMD, granule 8, 16 slots)",
+    "occupancy_waves_per_simd": 8,
+    "scratch_bytes": 0,
+    "sgpr_spill": 0,
+    "sgprs": 25,
+    "source_path": "/home/kaden/qcal/release-0.4.3/pmrip/moe-cand/run/receipt2/dn-A/baseline/moe_grouped_qt44_a8_sym_gfx12.hip",
+    "spill": 0,
+    "symbol": "moe_grouped_qt44_a8_sym_gfx1201_nt2r1",
+    "vgpr_spill": 0,
+    "vgprs": 174,
+    "vgprs_allocated": 176,
+    "wavefront_size": 32
+  },
+  "baseline_co": {
+    "path": "/home/kaden/qcal/release-0.4.3/pmrip/moe-cand/run/receipt2/dn-A/baseline.co",
+    "sha256": "ed67a1ef435e9f9a47b80713cd6a4359156d052edfc134ef47808e345c128fa5",
+    "sidecar": "/home/kaden/qcal/release-0.4.3/pmrip/moe-cand/run/receipt2/dn-A/baseline.co.json"
+  },
+  "candidate": {
+    "code_bytes": 12060,
+    "code_sha256": "62d77540ea273272da215ffd3702ebab6917705f51c224d6152251621cc35580",
+    "explicit_args": [
+      {
+        "class": "pointer",
+        "offset": 0,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 8,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 16,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 24,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 32,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 40,
+        "size": 8
+      },
+      {
+        "class": "value",
+        "offset": 48,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 52,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 56,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 60,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 64,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 68,
+        "size": 4
+      }
+    ],
+    "hipcc_argv": [
+      "/opt/rocm/core/bin/hipcc",
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "--rocm-path=/opt/rocm/core",
+      "--hip-path=/opt/rocm/core",
+      "-I/opt/rocm/core/include",
+      "-fmacro-prefix-map=/home/kaden/qcal/release-0.4.3/pmrip/moe-cand/run/receipt2/dn-A/candidate/=",
+      "-o",
+      "/home/kaden/qcal/release-0.4.3/pmrip/moe-cand/run/receipt2/dn-A/candidate/moe_grouped_qt44_a8_sym_xlds_gfx12.hsaco",
+      "/home/kaden/qcal/release-0.4.3/pmrip/moe-cand/run/receipt2/dn-A/candidate/moe_grouped_qt44_a8_sym_xlds_gfx12.hip"
+    ],
+    "kernarg_bytes": 72,
+    "kernels_in_object": 1,
+    "lds_bytes": 0,
+    "max_flat_workgroup_size": 256,
+    "object_bytes": 20752,
+    "object_path": "/home/kaden/qcal/release-0.4.3/pmrip/moe-cand/run/receipt2/dn-A/candidate/moe_grouped_qt44_a8_sym_xlds_gfx12.hsaco",
+    "object_sha256": "9ed48d8b0b9ab23566e32b1441ec7ba5ef0d1e4aafd8ca61bfca2964a3c86293",
+    "occupancy_basis": "vgpr (gfx11 wave32: 1536 VGPR/SIMD, granule 8, 16 slots)",
+    "occupancy_waves_per_simd": 6,
+    "scratch_bytes": 0,
+    "sgpr_spill": 0,
+    "sgprs": 32,
+    "source_path": "/home/kaden/qcal/release-0.4.3/pmrip/moe-cand/run/receipt2/dn-A/candidate/moe_grouped_qt44_a8_sym_xlds_gfx12.hip",
+    "spill": 0,
+    "symbol": "moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8",
+    "vgpr_spill": 0,
+    "vgprs": 226,
+    "vgprs_allocated": 232,
+    "wavefront_size": 32
+  },
+  "candidate_co": {
+    "path": "/home/kaden/qcal/release-0.4.3/pmrip/moe-cand/run/receipt2/dn-A/candidate.co",
+    "sha256": "9ed48d8b0b9ab23566e32b1441ec7ba5ef0d1e4aafd8ca61bfca2964a3c86293",
+    "sidecar": "/home/kaden/qcal/release-0.4.3/pmrip/moe-cand/run/receipt2/dn-A/candidate.co.json"
+  },
+  "candidate_geometry_arg": "",
+  "candidate_header": {},
+  "clipped_classes": [],
+  "contract": {
+    "admit": {
+      "kill_env": "HIPFIRE_MOE_A8_XLDS",
+      "max_rows": null,
+      "min_rows": 16,
+      "predicate": "crates/rdna-compute/src/moe_grouped_qt44_iu4.rs::MOE_A8_XLDS_MIN_ROWS"
+    },
+    "arch": "gfx1201",
+    "digest": "db19e780a690ca55aeb9882df82e1fd070a7a02c362db8e88d1e84d299c50a85",
+    "explicit_bytes": 72,
+    "hidden_words": 0,
+    "id": "generic_gemm.moe_grouped_qt44_a8_sym_xlds_nt4r1w8",
+    "module": "moe_grouped_qt44_a8_sym_xlds_gfx12",
+    "numeric": "generic_gemm.qt44_sym_x_i8_128.wmma_iu8.epoch_fold_f32",
+    "segment_bytes": 72,
+    "symbol": "moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8",
+    "version": 1,
+    "work_op_class": "grouped_gemm"
+  },
+  "contract_vs": {
+    "admit": {
+      "kill_env": null,
+      "max_rows": null,
+      "min_rows": 64,
+      "predicate": "crates/hipfire-dispatch/src/pipeline/q8_prefill.rs::PREFILL_QUANT_MIN_ROWS"
+    },
+    "arch": "gfx1201",
+    "digest": "44dd776d74832e6946dcdeb7dfc501b94b29a8bdad0ce3f1faa9a5ac34f0b55f",
+    "explicit_bytes": 72,
+    "hidden_words": 0,
+    "id": "generic_gemm.moe_grouped_qt44_a8_sym",
+    "module": "moe_grouped_qt44_a8_sym_gfx12",
+    "numeric": "generic_gemm.qt44_sym_x_i8_128.wmma_iu8.epoch_fold_f32",
+    "segment_bytes": 72,
+    "symbol": "moe_grouped_qt44_a8_sym_gfx1201_nt2r1",
+    "version": 1,
+    "work_op_class": "grouped_gemm"
+  },
+  "device": {
+    "arch": "gfx1201",
+    "device_id": 0,
+    "fabric_job": "1893782:152789890:A",
+    "uuid": "GPU-9eb7aeda51c88ffd"
+  },
+  "error": null,
+  "identical_code": false,
+  "identical_to_baseline": true,
+  "llc_bytes": 67108864,
+  "module": "moe_grouped_qt44_a8_sym_gfx12",
+  "node": "contract:moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8",
+  "offline": false,
+  "out_dir": "/home/kaden/qcal/release-0.4.3/pmrip/moe-cand/run/receipt2/dn-A",
+  "regime": "pool",
+  "rowclasses": [
+    {
+      "admitted": {
+        "baseline": false,
+        "candidate": false
+      },
+      "bytes_per_call": 1810400,
+      "footprint_bytes": 11436924,
+      "geometry_base": {
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          5120,
+          6,
+          1
+        ],
+        "grid_workgroups": [
+          40,
+          6,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          5120,
+          6,
+          1
+        ],
+        "grid_workgroups": [
+          20,
+          6,
+          1
+        ],
+        "lds_dynamic_bytes": 17920
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 983040
+      },
+      "identity_mode": "full",
+      "launch_rows": 96,
+      "p_faster": 0.003692626953125,
+      "p_slower": 0.9995117187499999,
+      "ratio_median": 0.9683184983041888,
+      "regime": "hot",
+      "rows": 1,
+      "same_geometry": false,
+      "shape": "M2560-K1280-n_experts128-tokens1-topk6",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1024,
+            "format": "moe_grouped.expert_ptr_table.u64",
+            "name": "expert_weight_ptrs",
+            "recipe": "ExpertPtrTable"
+          },
+          {
+            "access": "read_only",
+            "bytes": 24,
+            "format": "moe_grouped.expert_tile_ids.i32.per_tile16",
+            "name": "expert_tile_ids",
+            "recipe": "TileIds"
+          },
+          {
+            "access": "read_only",
+            "bytes": 516,
+            "format": "moe_grouped.expert_offsets.i32.e_plus_1",
+            "name": "expert_offsets",
+            "recipe": "ExpertOffsets"
+          },
+          {
+            "access": "read_only",
+            "bytes": 384,
+            "format": "moe_grouped.sorted_slot_index.i32.minus1_padding",
+            "name": "sorted_slot_index",
+            "recipe": "SortedSlots"
+          },
+          {
+            "access": "read_only",
+            "bytes": 8160,
+            "format": "block_i8_128.kb_x_n.136b",
+            "name": "Xq",
+            "recipe": "BlockI8"
+          },
+          {
+            "access": "write_only",
+            "bytes": 983040,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 1280,
+          "M": 2560,
+          "m_total": 96,
+          "n_experts": 128,
+          "x_row_div": 1,
+          "x_src_rows": 6
+        },
+        "routing": {
+          "live_rows": 96,
+          "live_tiles": 6,
+          "max_tiles_per_expert": 1,
+          "n_experts": 128,
+          "partial_tiles": 6,
+          "route": {
+            "id": "f04870667e6b905ca0cd23753ded809981fe19f563f488dbbf3de223068a60ab",
+            "kind": "hist",
+            "layer": null,
+            "path": "/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json"
+          },
+          "route_seed": 7885632933165233524,
+          "slab_bytes": 1740800,
+          "tokens": 1,
+          "topk": 6,
+          "touched_experts": 6
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3176Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "S: 60Mhz * | 1: 500Mhz  | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "clock_summary": {
+          "power_w": {
+            "max": 140.0,
+            "median": 132.0,
+            "min": 22.0,
+            "n": 16
+          },
+          "samples": 16,
+          "sclk_mhz": {
+            "max": 3189.0,
+            "median": 3174.5,
+            "min": 60.0,
+            "n": 16
+          },
+          "temp_c": {
+            "max": 55.0,
+            "median": 55.0,
+            "min": 55.0,
+            "n": 16
+          }
+        },
+        "p_faster": 0.003692626953125,
+        "p_slower": 0.9995117187499999,
+        "ratio_max": 1.0018199609382454,
+        "ratio_median": 0.9683184983041888,
+        "ratio_min": 0.9603375274031837,
+        "rounds": [
+          {
+            "base_us": 21.840750705450773,
+            "cand_us": 21.88050001859665,
+            "clock_end": {
+              "power_w": 94.0,
+              "sclk_dpm_mhz": 2778.0,
+              "sclk_hwmon_mhz": 2778.0,
+              "sclk_mhz": 2778.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733856,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 22.0,
+              "sclk_dpm_mhz": 60.0,
+              "sclk_hwmon_mhz": 60.0,
+              "sclk_mhz": 60.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733848,
+              "temp_c": 55.0
+            },
+            "ratio": 1.0018199609382454,
+            "round": 0
+          },
+          {
+            "base_us": 21.560249850153923,
+            "cand_us": 21.57999947667122,
+            "clock_end": {
+              "power_w": 102.0,
+              "sclk_dpm_mhz": 2827.0,
+              "sclk_hwmon_mhz": 2827.0,
+              "sclk_mhz": 2827.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733864,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 94.0,
+              "sclk_dpm_mhz": 2778.0,
+              "sclk_hwmon_mhz": 2778.0,
+              "sclk_mhz": 2778.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733856,
+              "temp_c": 55.0
+            },
+            "ratio": 1.0009160202991412,
+            "round": 1
+          },
+          {
+            "base_us": 20.920249167829752,
+            "cand_us": 20.090500358492136,
+            "clock_end": {
+              "power_w": 131.0,
+              "sclk_dpm_mhz": 3171.0,
+              "sclk_hwmon_mhz": 3171.0,
+              "sclk_mhz": 3171.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733871,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 102.0,
+              "sclk_dpm_mhz": 2827.0,
+              "sclk_hwmon_mhz": 2827.0,
+              "sclk_mhz": 2827.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733864,
+              "temp_c": 55.0
+            },
+            "ratio": 0.9603375274031837,
+            "round": 2
+          },
+          {
+            "base_us": 20.90999949723482,
+            "cand_us": 20.14025067910552,
+            "clock_end": {
+              "power_w": 139.0,
+              "sclk_dpm_mhz": 3189.0,
+              "sclk_hwmon_mhz": 3189.0,
+              "sclk_mhz": 3189.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733879,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 131.0,
+              "sclk_dpm_mhz": 3171.0,
+              "sclk_hwmon_mhz": 3171.0,
+              "sclk_mhz": 3171.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733871,
+              "temp_c": 55.0
+            },
+            "ratio": 0.9631875257466603,
+            "round": 3
+          },
+          {
+            "base_us": 20.890249870717525,
+            "cand_us": 20.27024980634451,
+            "clock_end": {
+              "power_w": 128.0,
+              "sclk_dpm_mhz": 3175.0,
+              "sclk_hwmon_mhz": 3175.0,
+              "sclk_mhz": 3175.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733886,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 139.0,
+              "sclk_dpm_mhz": 3189.0,
+              "sclk_hwmon_mhz": 3189.0,
+              "sclk_mhz": 3189.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733879,
+              "temp_c": 55.0
+            },
+            "ratio": 0.9703210795366268,
+            "round": 4
+          },
+          {
+            "base_us": 20.97999956458807,
+            "cand_us": 20.25999967008829,
+            "clock_end": {
+              "power_w": 140.0,
+              "sclk_dpm_mhz": 3175.0,
+              "sclk_hwmon_mhz": 3175.0,
+              "sclk_mhz": 3175.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733894,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 128.0,
+              "sclk_dpm_mhz": 3175.0,
+              "sclk_hwmon_mhz": 3175.0,
+              "sclk_mhz": 3175.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733886,
+              "temp_c": 55.0
+            },
+            "ratio": 0.9656816058416389,
+            "round": 5
+          },
+          {
+            "base_us": 20.999999716877937,
+            "cand_us": 20.290750078856945,
+            "clock_end": {
+              "power_w": 129.0,
+              "sclk_dpm_mhz": 3174.0,
+              "sclk_hwmon_mhz": 3174.0,
+              "sclk_mhz": 3174.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733901,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 140.0,
+              "sclk_dpm_mhz": 3175.0,
+              "sclk_hwmon_mhz": 3175.0,
+              "sclk_mhz": 3175.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733894,
+              "temp_c": 55.0
+            },
+            "ratio": 0.9662262072579477,
+            "round": 6
+          },
+          {
+            "base_us": 20.919999107718468,
+            "cand_us": 20.280499942600727,
+            "clock_end": {
+              "power_w": 139.0,
+              "sclk_dpm_mhz": 3174.0,
+              "sclk_hwmon_mhz": 3174.0,
+              "sclk_mhz": 3174.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733908,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 129.0,
+              "sclk_dpm_mhz": 3174.0,
+              "sclk_hwmon_mhz": 3174.0,
+              "sclk_mhz": 3174.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733901,
+              "temp_c": 55.0
+            },
+            "ratio": 0.9694312049524995,
+            "round": 7
+          },
+          {
+            "base_us": 20.84025042131543,
+            "cand_us": 20.179999992251396,
+            "clock_end": {
+              "power_w": 138.0,
+              "sclk_dpm_mhz": 3177.0,
+              "sclk_hwmon_mhz": 3177.0,
+              "sclk_mhz": 3177.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733915,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 139.0,
+              "sclk_dpm_mhz": 3174.0,
+              "sclk_hwmon_mhz": 3174.0,
+              "sclk_mhz": 3174.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733908,
+              "temp_c": 55.0
+            },
+            "ratio": 0.9683184983041888,
+            "round": 8
+          },
+          {
+            "base_us": 20.950249396264553,
+            "cand_us": 20.24099975824356,
+            "clock_end": {
+              "power_w": 140.0,
+              "sclk_dpm_mhz": 3175.0,
+              "sclk_hwmon_mhz": 3175.0,
+              "sclk_mhz": 3175.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733923,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 138.0,
+              "sclk_dpm_mhz": 3177.0,
+              "sclk_hwmon_mhz": 3177.0,
+              "sclk_mhz": 3177.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733915,
+              "temp_c": 55.0
+            },
+            "ratio": 0.9661460050137899,
+            "round": 9
+          },
+          {
+            "base_us": 20.95024986192584,
+            "cand_us": 20.29050001874566,
+            "clock_end": {
+              "power_w": 132.0,
+              "sclk_dpm_mhz": 3177.0,
+              "sclk_hwmon_mhz": 3177.0,
+              "sclk_mhz": 3177.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733930,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 140.0,
+              "sclk_dpm_mhz": 3175.0,
+              "sclk_hwmon_mhz": 3175.0,
+              "sclk_mhz": 3175.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733923,
+              "temp_c": 55.0
+            },
+            "ratio": 0.9685087362905784,
+            "round": 10
+          },
+          {
+            "base_us": 20.959999412298203,
+            "cand_us": 20.280499942600727,
+            "clock_end": {
+              "power_w": 139.0,
+              "sclk_dpm_mhz": 3171.0,
+              "sclk_hwmon_mhz": 3171.0,
+              "sclk_mhz": 3171.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733937,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 132.0,
+              "sclk_dpm_mhz": 3177.0,
+              "sclk_hwmon_mhz": 3177.0,
+              "sclk_mhz": 3177.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733930,
+              "temp_c": 55.0
+            },
+            "ratio": 0.9675811312619226,
+            "round": 11
+          },
+          {
+            "base_us": 20.900249481201172,
+            "cand_us": 20.27999982237816,
+            "clock_end": {
+              "power_w": 136.0,
+              "sclk_dpm_mhz": 3174.0,
+              "sclk_hwmon_mhz": 3174.0,
+              "sclk_mhz": 3174.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733945,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 139.0,
+              "sclk_dpm_mhz": 3171.0,
+              "sclk_hwmon_mhz": 3171.0,
+              "sclk_mhz": 3171.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733937,
+              "temp_c": 55.0
+            },
+            "ratio": 0.9703233370787798,
+            "round": 12
+          },
+          {
+            "base_us": 20.87050024420023,
+            "cand_us": 20.27999982237816,
+            "clock_end": {
+              "power_w": 131.0,
+              "sclk_dpm_mhz": 3175.0,
+              "sclk_hwmon_mhz": 3175.0,
+              "sclk_mhz": 3175.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733952,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 136.0,
+              "sclk_dpm_mhz": 3174.0,
+              "sclk_hwmon_mhz": 3174.0,
+              "sclk_mhz": 3174.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733945,
+              "temp_c": 55.0
+            },
+            "ratio": 0.971706455767098,
+            "round": 13
+          },
+          {
+            "base_us": 20.94024932011962,
+            "cand_us": 20.200500264763832,
+            "clock_end": {
+              "power_w": 132.0,
+              "sclk_dpm_mhz": 3176.0,
+              "sclk_hwmon_mhz": 3176.0,
+              "sclk_mhz": 3176.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733960,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 131.0,
+              "sclk_dpm_mhz": 3175.0,
+              "sclk_hwmon_mhz": 3175.0,
+              "sclk_mhz": 3175.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537733952,
+              "temp_c": 55.0
+            },
+            "ratio": 0.9646733406060726,
+            "round": 14
+          }
+        ],
+        "rounds_faster": 13,
+        "rounds_slower": 2,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 86.37404822338661,
+          "baseline_tflops": 1.8760305869535565,
+          "baseline_us": {
+            "max": 34.32000055909157,
+            "mean": 21.291344374832235,
+            "median": 20.959999412298203,
+            "min": 20.400000736117363,
+            "p90": 21.800000220537186
+          },
+          "calls_per_arm": 900,
+          "candidate_gbps": 89.27021774439548,
+          "candidate_tflops": 1.9389349282247135,
+          "candidate_us": {
+            "max": 23.719999939203262,
+            "mean": 20.501063331547698,
+            "median": 20.27999982237816,
+            "min": 19.840000197291374,
+            "p90": 21.68099954724312
+          },
+          "flush": false,
+          "n": 30,
+          "rounds": 15,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 1810400.0,
+        "flops": 39321600.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": false,
+        "candidate": false
+      },
+      "bytes_per_call": 1880000,
+      "footprint_bytes": 21132532,
+      "geometry_base": {
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          5120,
+          12,
+          1
+        ],
+        "grid_workgroups": [
+          40,
+          12,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          5120,
+          12,
+          1
+        ],
+        "grid_workgroups": [
+          20,
+          12,
+          1
+        ],
+        "lds_dynamic_bytes": 17920
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 1966080
+      },
+      "identity_mode": "full",
+      "launch_rows": 192,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio_median": 1.0350306907296754,
+      "regime": "hot",
+      "rows": 2,
+      "same_geometry": false,
+      "shape": "M2560-K1280-n_experts128-tokens2-topk6",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1024,
+            "format": "moe_grouped.expert_ptr_table.u64",
+            "name": "expert_weight_ptrs",
+            "recipe": "ExpertPtrTable"
+          },
+          {
+            "access": "read_only",
+            "bytes": 48,
+            "format": "moe_grouped.expert_tile_ids.i32.per_tile16",
+            "name": "expert_tile_ids",
+            "recipe": "TileIds"
+          },
+          {
+            "access": "read_only",
+            "bytes": 516,
+            "format": "moe_grouped.expert_offsets.i32.e_plus_1",
+            "name": "expert_offsets",
+            "recipe": "ExpertOffsets"
+          },
+          {
+            "access": "read_only",
+            "bytes": 768,
+            "format": "moe_grouped.sorted_slot_index.i32.minus1_padding",
+            "name": "sorted_slot_index",
+            "recipe": "SortedSlots"
+          },
+          {
+            "access": "read_only",
+            "bytes": 16320,
+            "format": "block_i8_128.kb_x_n.136b",
+            "name": "Xq",
+            "recipe": "BlockI8"
+          },
+          {
+            "access": "write_only",
+            "bytes": 1966080,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 1280,
+          "M": 2560,
+          "m_total": 192,
+          "n_experts": 128,
+          "x_row_div": 1,
+          "x_src_rows": 12
+        },
+        "routing": {
+          "live_rows": 176,
+          "live_tiles": 11,
+          "max_tiles_per_expert": 1,
+          "n_experts": 128,
+          "partial_tiles": 11,
+          "route": {
+            "id": "f04870667e6b905ca0cd23753ded809981fe19f563f488dbbf3de223068a60ab",
+            "kind": "hist",
+            "layer": null,
+            "path": "/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json"
+          },
+          "route_seed": 7885632933165233524,
+          "slab_bytes": 1740800,
+          "tokens": 2,
+          "topk": 6,
+          "touched_experts": 11
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3121Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 2896Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "clock_summary": {
+          "power_w": {
+            "max": 172.0,
+            "median": 167.0,
+            "min": 68.0,
+            "n": 16
+          },
+          "samples": 16,
+          "sclk_mhz": {
+            "max": 3135.0,
+            "median": 3120.0,
+            "min": 2767.0,
+            "n": 16
+          },
+          "temp_c": {
+            "max": 56.0,
+            "median": 55.5,
+            "min": 55.0,
+            "n": 16
+          }
+        },
+        "p_faster": 1.0,
+        "p_slower": 0.000030517578125,
+        "ratio_max": 1.0892743476860007,
+        "ratio_median": 1.0350306907296754,
+        "ratio_min": 1.0309525303558658,
+        "rounds": [
+          {
+            "base_us": 27.360749896615744,
+            "cand_us": 29.42024962976575,
+            "clock_end": {
+              "power_w": 129.0,
+              "sclk_dpm_mhz": 2768.0,
+              "sclk_hwmon_mhz": 2768.0,
+              "sclk_mhz": 2768.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734034,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 68.0,
+              "sclk_dpm_mhz": 2896.0,
+              "sclk_hwmon_mhz": 2896.0,
+              "sclk_mhz": 2896.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734026,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0752720499595936,
+            "round": 0
+          },
+          {
+            "base_us": 27.180250268429518,
+            "cand_us": 29.47074919939041,
+            "clock_end": {
+              "power_w": 137.0,
+              "sclk_dpm_mhz": 2767.0,
+              "sclk_hwmon_mhz": 2767.0,
+              "sclk_mhz": 2767.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734043,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 129.0,
+              "sclk_dpm_mhz": 2768.0,
+              "sclk_hwmon_mhz": 2768.0,
+              "sclk_mhz": 2768.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734034,
+              "temp_c": 55.0
+            },
+            "ratio": 1.0842707078978358,
+            "round": 1
+          },
+          {
+            "base_us": 27.319999411702156,
+            "cand_us": 29.510250315070152,
+            "clock_end": {
+              "power_w": 134.0,
+              "sclk_dpm_mhz": 2769.0,
+              "sclk_hwmon_mhz": 2769.0,
+              "sclk_mhz": 2769.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734052,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 137.0,
+              "sclk_dpm_mhz": 2767.0,
+              "sclk_hwmon_mhz": 2767.0,
+              "sclk_mhz": 2767.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734043,
+              "temp_c": 55.0
+            },
+            "ratio": 1.0801702397705701,
+            "round": 2
+          },
+          {
+            "base_us": 27.110249735414982,
+            "cand_us": 29.53049959614873,
+            "clock_end": {
+              "power_w": 136.0,
+              "sclk_dpm_mhz": 2769.0,
+              "sclk_hwmon_mhz": 2769.0,
+              "sclk_mhz": 2769.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734060,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 134.0,
+              "sclk_dpm_mhz": 2769.0,
+              "sclk_hwmon_mhz": 2769.0,
+              "sclk_mhz": 2769.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734052,
+              "temp_c": 55.0
+            },
+            "ratio": 1.0892743476860007,
+            "round": 3
+          },
+          {
+            "base_us": 26.5002497471869,
+            "cand_us": 27.320499531924725,
+            "clock_end": {
+              "power_w": 169.0,
+              "sclk_dpm_mhz": 3068.0,
+              "sclk_hwmon_mhz": 3068.0,
+              "sclk_mhz": 3068.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734069,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 136.0,
+              "sclk_dpm_mhz": 2769.0,
+              "sclk_hwmon_mhz": 2769.0,
+              "sclk_mhz": 2769.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734060,
+              "temp_c": 55.0
+            },
+            "ratio": 1.0309525303558658,
+            "round": 4
+          },
+          {
+            "base_us": 26.550000067800283,
+            "cand_us": 27.46049966663122,
+            "clock_end": {
+              "power_w": 164.0,
+              "sclk_dpm_mhz": 3135.0,
+              "sclk_hwmon_mhz": 3135.0,
+              "sclk_mhz": 3135.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734077,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 169.0,
+              "sclk_dpm_mhz": 3068.0,
+              "sclk_hwmon_mhz": 3068.0,
+              "sclk_mhz": 3068.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734069,
+              "temp_c": 55.0
+            },
+            "ratio": 1.0342937701132133,
+            "round": 5
+          },
+          {
+            "base_us": 26.57999936491251,
+            "cand_us": 27.49000024050474,
+            "clock_end": {
+              "power_w": 162.0,
+              "sclk_dpm_mhz": 3120.0,
+              "sclk_hwmon_mhz": 3120.0,
+              "sclk_mhz": 3120.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734085,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 164.0,
+              "sclk_dpm_mhz": 3135.0,
+              "sclk_hwmon_mhz": 3135.0,
+              "sclk_mhz": 3135.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734077,
+              "temp_c": 55.0
+            },
+            "ratio": 1.0342363016303717,
+            "round": 6
+          },
+          {
+            "base_us": 26.56049933284521,
+            "cand_us": 27.690500020980835,
+            "clock_end": {
+              "power_w": 167.0,
+              "sclk_dpm_mhz": 3120.0,
+              "sclk_hwmon_mhz": 3120.0,
+              "sclk_mhz": 3120.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734093,
+              "temp_c": 55.0
+            },
+            "clock_start": {
+              "power_w": 162.0,
+              "sclk_dpm_mhz": 3120.0,
+              "sclk_hwmon_mhz": 3120.0,
+              "sclk_mhz": 3120.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734085,
+              "temp_c": 55.0
+            },
+            "ratio": 1.0425444067890035,
+            "round": 7
+          },
+          {
+            "base_us": 26.541000232100487,
+            "cand_us": 27.47074980288744,
+            "clock_end": {
+              "power_w": 170.0,
+              "sclk_dpm_mhz": 3121.0,
+              "sclk_hwmon_mhz": 3121.0,
+              "sclk_mhz": 3121.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734101,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 167.0,
+              "sclk_dpm_mhz": 3120.0,
+              "sclk_hwmon_mhz": 3120.0,
+              "sclk_mhz": 3120.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734093,
+              "temp_c": 55.0
+            },
+            "ratio": 1.0350306907296754,
+            "round": 8
+          },
+          {
+            "base_us": 26.580999605357647,
+            "cand_us": 27.47000055387616,
+            "clock_end": {
+              "power_w": 170.0,
+              "sclk_dpm_mhz": 3119.0,
+              "sclk_hwmon_mhz": 3119.0,
+              "sclk_mhz": 3119.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734109,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 170.0,
+              "sclk_dpm_mhz": 3121.0,
+              "sclk_hwmon_mhz": 3121.0,
+              "sclk_mhz": 3121.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734101,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0334449780564057,
+            "round": 9
+          },
+          {
+            "base_us": 26.580249425023794,
+            "cand_us": 27.500249911099672,
+            "clock_end": {
+              "power_w": 172.0,
+              "sclk_dpm_mhz": 3120.0,
+              "sclk_hwmon_mhz": 3120.0,
+              "sclk_mhz": 3120.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734117,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 170.0,
+              "sclk_dpm_mhz": 3119.0,
+              "sclk_hwmon_mhz": 3119.0,
+              "sclk_mhz": 3119.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734109,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0346121840831843,
+            "round": 10
+          },
+          {
+            "base_us": 26.569999754428864,
+            "cand_us": 27.509999461472034,
+            "clock_end": {
+              "power_w": 168.0,
+              "sclk_dpm_mhz": 3121.0,
+              "sclk_hwmon_mhz": 3121.0,
+              "sclk_mhz": 3121.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734125,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 172.0,
+              "sclk_dpm_mhz": 3120.0,
+              "sclk_hwmon_mhz": 3120.0,
+              "sclk_mhz": 3120.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734117,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0353782354433965,
+            "round": 11
+          },
+          {
+            "base_us": 26.569999288767576,
+            "cand_us": 27.530749328434467,
+            "clock_end": {
+              "power_w": 168.0,
+              "sclk_dpm_mhz": 3120.0,
+              "sclk_hwmon_mhz": 3120.0,
+              "sclk_mhz": 3120.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734133,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 168.0,
+              "sclk_dpm_mhz": 3121.0,
+              "sclk_hwmon_mhz": 3121.0,
+              "sclk_mhz": 3121.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734125,
+              "temp_c": 56.0
+            },
+            "ratio": 1.036159204568479,
+            "round": 12
+          },
+          {
+            "base_us": 26.57024934887886,
+            "cand_us": 27.450249530375004,
+            "clock_end": {
+              "power_w": 167.0,
+              "sclk_dpm_mhz": 3122.0,
+              "sclk_hwmon_mhz": 3122.0,
+              "sclk_mhz": 3122.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734141,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 168.0,
+              "sclk_dpm_mhz": 3120.0,
+              "sclk_hwmon_mhz": 3120.0,
+              "sclk_mhz": 3120.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734133,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0331197562334233,
+            "round": 13
+          },
+          {
+            "base_us": 26.580749545246363,
+            "cand_us": 27.49024983495474,
+            "clock_end": {
+              "power_w": 168.0,
+              "sclk_dpm_mhz": 3121.0,
+              "sclk_hwmon_mhz": 3121.0,
+              "sclk_mhz": 3121.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734149,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 167.0,
+              "sclk_dpm_mhz": 3122.0,
+              "sclk_hwmon_mhz": 3122.0,
+              "sclk_mhz": 3122.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734141,
+              "temp_c": 56.0
+            },
+            "ratio": 1.03421650274234,
+            "round": 14
+          }
+        ],
+        "rounds_faster": 0,
+        "rounds_slower": 15,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 70.57057104267786,
+          "baseline_tflops": 2.952072091821023,
+          "baseline_us": {
+            "max": 30.60000017285347,
+            "mean": 26.828832133776622,
+            "median": 26.639999821782112,
+            "min": 26.200000196695328,
+            "p90": 27.44000032544136
+          },
+          "calls_per_arm": 900,
+          "candidate_gbps": 67.81861921832336,
+          "candidate_tflops": 2.8369538483566212,
+          "candidate_us": {
+            "max": 31.560000032186508,
+            "mean": 28.175212099320337,
+            "median": 27.721000835299492,
+            "min": 27.000000700354576,
+            "p90": 29.559999704360962
+          },
+          "flush": false,
+          "n": 30,
+          "rounds": 15,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 1880000.0,
+        "flops": 78643200.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": false,
+        "candidate": false
+      },
+      "bytes_per_call": 2019200,
+      "footprint_bytes": 35301348,
+      "geometry_base": {
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          5120,
+          24,
+          1
+        ],
+        "grid_workgroups": [
+          40,
+          24,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          5120,
+          24,
+          1
+        ],
+        "grid_workgroups": [
+          20,
+          24,
+          1
+        ],
+        "lds_dynamic_bytes": 17920
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 3932160
+      },
+      "identity_mode": "full",
+      "launch_rows": 384,
+      "p_faster": 0.9999694824218749,
+      "p_slower": 0.00048828125,
+      "ratio_median": 1.0061220844518022,
+      "regime": "hot",
+      "rows": 4,
+      "same_geometry": false,
+      "shape": "M2560-K1280-n_experts128-tokens4-topk6",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1024,
+            "format": "moe_grouped.expert_ptr_table.u64",
+            "name": "expert_weight_ptrs",
+            "recipe": "ExpertPtrTable"
+          },
+          {
+            "access": "read_only",
+            "bytes": 96,
+            "format": "moe_grouped.expert_tile_ids.i32.per_tile16",
+            "name": "expert_tile_ids",
+            "recipe": "TileIds"
+          },
+          {
+            "access": "read_only",
+            "bytes": 516,
+            "format": "moe_grouped.expert_offsets.i32.e_plus_1",
+            "name": "expert_offsets",
+            "recipe": "ExpertOffsets"
+          },
+          {
+            "access": "read_only",
+            "bytes": 1536,
+            "format": "moe_grouped.sorted_slot_index.i32.minus1_padding",
+            "name": "sorted_slot_index",
+            "recipe": "SortedSlots"
+          },
+          {
+            "access": "read_only",
+            "bytes": 32640,
+            "format": "block_i8_128.kb_x_n.136b",
+            "name": "Xq",
+            "recipe": "BlockI8"
+          },
+          {
+            "access": "write_only",
+            "bytes": 3932160,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 1280,
+          "M": 2560,
+          "m_total": 384,
+          "n_experts": 128,
+          "x_row_div": 1,
+          "x_src_rows": 24
+        },
+        "routing": {
+          "live_rows": 288,
+          "live_tiles": 18,
+          "max_tiles_per_expert": 1,
+          "n_experts": 128,
+          "partial_tiles": 18,
+          "route": {
+            "id": "f04870667e6b905ca0cd23753ded809981fe19f563f488dbbf3de223068a60ab",
+            "kind": "hist",
+            "layer": null,
+            "path": "/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json"
+          },
+          "route_seed": 7885632933165233524,
+          "slab_bytes": 1740800,
+          "tokens": 4,
+          "topk": 6,
+          "touched_experts": 18
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3162Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 2904Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "clock_summary": {
+          "power_w": {
+            "max": 222.0,
+            "median": 218.0,
+            "min": 70.0,
+            "n": 16
+          },
+          "samples": 16,
+          "sclk_mhz": {
+            "max": 3164.0,
+            "median": 3159.5,
+            "min": 2761.0,
+            "n": 16
+          },
+          "temp_c": {
+            "max": 56.0,
+            "median": 56.0,
+            "min": 56.0,
+            "n": 16
+          }
+        },
+        "p_faster": 0.9999694824218749,
+        "p_slower": 0.00048828125,
+        "ratio_max": 1.0551336048125526,
+        "ratio_median": 1.0061220844518022,
+        "ratio_min": 0.9976300336700039,
+        "rounds": [
+          {
+            "base_us": 38.91074936836958,
+            "cand_us": 40.79024959355593,
+            "clock_end": {
+              "power_w": 155.0,
+              "sclk_dpm_mhz": 2761.0,
+              "sclk_hwmon_mhz": 2761.0,
+              "sclk_mhz": 2761.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734229,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 70.0,
+              "sclk_dpm_mhz": 2904.0,
+              "sclk_hwmon_mhz": 2904.0,
+              "sclk_mhz": 2904.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734219,
+              "temp_c": 56.0
+            },
+            "ratio": 1.048302853470979,
+            "round": 0
+          },
+          {
+            "base_us": 38.780249655246735,
+            "cand_us": 40.90050049126148,
+            "clock_end": {
+              "power_w": 165.0,
+              "sclk_dpm_mhz": 2761.0,
+              "sclk_hwmon_mhz": 2761.0,
+              "sclk_mhz": 2761.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734239,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 155.0,
+              "sclk_dpm_mhz": 2761.0,
+              "sclk_hwmon_mhz": 2761.0,
+              "sclk_mhz": 2761.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734229,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0546734705130474,
+            "round": 1
+          },
+          {
+            "base_us": 38.81025034934282,
+            "cand_us": 40.94999935477972,
+            "clock_end": {
+              "power_w": 168.0,
+              "sclk_dpm_mhz": 2765.0,
+              "sclk_hwmon_mhz": 2765.0,
+              "sclk_mhz": 2765.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734249,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 165.0,
+              "sclk_dpm_mhz": 2761.0,
+              "sclk_hwmon_mhz": 2761.0,
+              "sclk_mhz": 2761.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734239,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0551336048125526,
+            "round": 2
+          },
+          {
+            "base_us": 37.87000011652708,
+            "cand_us": 37.78024949133396,
+            "clock_end": {
+              "power_w": 214.0,
+              "sclk_dpm_mhz": 3052.0,
+              "sclk_hwmon_mhz": 3052.0,
+              "sclk_mhz": 3052.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734259,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 168.0,
+              "sclk_dpm_mhz": 2765.0,
+              "sclk_hwmon_mhz": 2765.0,
+              "sclk_mhz": 2765.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734249,
+              "temp_c": 56.0
+            },
+            "ratio": 0.9976300336700039,
+            "round": 3
+          },
+          {
+            "base_us": 37.610750645399094,
+            "cand_us": 37.88049891591072,
+            "clock_end": {
+              "power_w": 216.0,
+              "sclk_dpm_mhz": 3158.0,
+              "sclk_hwmon_mhz": 3158.0,
+              "sclk_mhz": 3158.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734269,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 214.0,
+              "sclk_dpm_mhz": 3052.0,
+              "sclk_hwmon_mhz": 3052.0,
+              "sclk_mhz": 3052.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734259,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0071721054720462,
+            "round": 4
+          },
+          {
+            "base_us": 37.66000084578991,
+            "cand_us": 37.88074851036072,
+            "clock_end": {
+              "power_w": 218.0,
+              "sclk_dpm_mhz": 3163.0,
+              "sclk_hwmon_mhz": 3163.0,
+              "sclk_mhz": 3163.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734279,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 216.0,
+              "sclk_dpm_mhz": 3158.0,
+              "sclk_hwmon_mhz": 3158.0,
+              "sclk_mhz": 3158.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734269,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0058615947852663,
+            "round": 5
+          },
+          {
+            "base_us": 37.56024967879057,
+            "cand_us": 37.74050064384937,
+            "clock_end": {
+              "power_w": 221.0,
+              "sclk_dpm_mhz": 3164.0,
+              "sclk_hwmon_mhz": 3164.0,
+              "sclk_mhz": 3164.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734289,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 218.0,
+              "sclk_dpm_mhz": 3163.0,
+              "sclk_hwmon_mhz": 3163.0,
+              "sclk_mhz": 3163.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734279,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0047989820781353,
+            "round": 6
+          },
+          {
+            "base_us": 37.590750493109226,
+            "cand_us": 37.91025001555681,
+            "clock_end": {
+              "power_w": 219.0,
+              "sclk_dpm_mhz": 3160.0,
+              "sclk_hwmon_mhz": 3160.0,
+              "sclk_mhz": 3160.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734299,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 221.0,
+              "sclk_dpm_mhz": 3164.0,
+              "sclk_hwmon_mhz": 3164.0,
+              "sclk_mhz": 3164.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734289,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0084994185605887,
+            "round": 7
+          },
+          {
+            "base_us": 37.620251066982746,
+            "cand_us": 37.760499864816666,
+            "clock_end": {
+              "power_w": 220.0,
+              "sclk_dpm_mhz": 3162.0,
+              "sclk_hwmon_mhz": 3162.0,
+              "sclk_mhz": 3162.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734309,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 219.0,
+              "sclk_dpm_mhz": 3160.0,
+              "sclk_hwmon_mhz": 3160.0,
+              "sclk_mhz": 3160.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734299,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0037280133400548,
+            "round": 8
+          },
+          {
+            "base_us": 37.64025121927261,
+            "cand_us": 37.82074898481369,
+            "clock_end": {
+              "power_w": 218.0,
+              "sclk_dpm_mhz": 3160.0,
+              "sclk_hwmon_mhz": 3160.0,
+              "sclk_mhz": 3160.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734319,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 220.0,
+              "sclk_dpm_mhz": 3162.0,
+              "sclk_hwmon_mhz": 3162.0,
+              "sclk_mhz": 3162.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734309,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0047953390238973,
+            "round": 9
+          },
+          {
+            "base_us": 37.65050042420626,
+            "cand_us": 37.880999967455864,
+            "clock_end": {
+              "power_w": 221.0,
+              "sclk_dpm_mhz": 3161.0,
+              "sclk_hwmon_mhz": 3161.0,
+              "sclk_mhz": 3161.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734329,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 218.0,
+              "sclk_dpm_mhz": 3160.0,
+              "sclk_hwmon_mhz": 3160.0,
+              "sclk_mhz": 3160.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734319,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0061220844518022,
+            "round": 10
+          },
+          {
+            "base_us": 37.63999976217747,
+            "cand_us": 37.890249863266945,
+            "clock_end": {
+              "power_w": 213.0,
+              "sclk_dpm_mhz": 3159.0,
+              "sclk_hwmon_mhz": 3159.0,
+              "sclk_mhz": 3159.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734339,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 221.0,
+              "sclk_dpm_mhz": 3161.0,
+              "sclk_hwmon_mhz": 3161.0,
+              "sclk_mhz": 3161.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734329,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0066485149487419,
+            "round": 11
+          },
+          {
+            "base_us": 37.640249356627464,
+            "cand_us": 37.74075023829937,
+            "clock_end": {
+              "power_w": 222.0,
+              "sclk_dpm_mhz": 3163.0,
+              "sclk_hwmon_mhz": 3163.0,
+              "sclk_mhz": 3163.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734349,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 213.0,
+              "sclk_dpm_mhz": 3159.0,
+              "sclk_hwmon_mhz": 3159.0,
+              "sclk_mhz": 3159.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734339,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0026700376163744,
+            "round": 12
+          },
+          {
+            "base_us": 37.62050066143274,
+            "cand_us": 37.86024916917086,
+            "clock_end": {
+              "power_w": 218.0,
+              "sclk_dpm_mhz": 3159.0,
+              "sclk_hwmon_mhz": 3159.0,
+              "sclk_mhz": 3159.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734359,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 222.0,
+              "sclk_dpm_mhz": 3163.0,
+              "sclk_hwmon_mhz": 3163.0,
+              "sclk_mhz": 3163.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734349,
+              "temp_c": 56.0
+            },
+            "ratio": 1.006372815446975,
+            "round": 13
+          },
+          {
+            "base_us": 37.57050074636936,
+            "cand_us": 37.770750001072884,
+            "clock_end": {
+              "power_w": 219.0,
+              "sclk_dpm_mhz": 3162.0,
+              "sclk_hwmon_mhz": 3162.0,
+              "sclk_mhz": 3162.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734369,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 218.0,
+              "sclk_dpm_mhz": 3159.0,
+              "sclk_hwmon_mhz": 3159.0,
+              "sclk_mhz": 3159.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734359,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0053299596951173,
+            "round": 14
+          }
+        ],
+        "rounds_faster": 1,
+        "rounds_slower": 14,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 53.53128525534584,
+          "baseline_tflops": 4.169841098051916,
+          "baseline_us": {
+            "max": 41.039999574422836,
+            "mean": 37.971009856296845,
+            "median": 37.71999850869179,
+            "min": 37.039998918771744,
+            "p90": 38.92099857330322
+          },
+          "calls_per_arm": 900,
+          "candidate_gbps": 53.24894771892762,
+          "candidate_tflops": 4.147848301554248,
+          "candidate_us": {
+            "max": 42.87999868392944,
+            "mean": 38.51522544191934,
+            "median": 37.91999816894531,
+            "min": 37.1210016310215,
+            "p90": 40.92000052332878
+          },
+          "flush": false,
+          "n": 30,
+          "rounds": 15,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 2019200.0,
+        "flops": 157286400.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": false,
+        "candidate": false
+      },
+      "bytes_per_call": 2297600,
+      "footprint_bytes": 60157380,
+      "geometry_base": {
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          5120,
+          48,
+          1
+        ],
+        "grid_workgroups": [
+          40,
+          48,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          5120,
+          48,
+          1
+        ],
+        "grid_workgroups": [
+          20,
+          48,
+          1
+        ],
+        "lds_dynamic_bytes": 17920
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 7864320
+      },
+      "identity_mode": "full",
+      "launch_rows": 768,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio_median": 1.0940665248450703,
+      "regime": "hot",
+      "rows": 8,
+      "same_geometry": false,
+      "shape": "M2560-K1280-n_experts128-tokens8-topk6",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1024,
+            "format": "moe_grouped.expert_ptr_table.u64",
+            "name": "expert_weight_ptrs",
+            "recipe": "ExpertPtrTable"
+          },
+          {
+            "access": "read_only",
+            "bytes": 192,
+            "format": "moe_grouped.expert_tile_ids.i32.per_tile16",
+            "name": "expert_tile_ids",
+            "recipe": "TileIds"
+          },
+          {
+            "access": "read_only",
+            "bytes": 516,
+            "format": "moe_grouped.expert_offsets.i32.e_plus_1",
+            "name": "expert_offsets",
+            "recipe": "ExpertOffsets"
+          },
+          {
+            "access": "read_only",
+            "bytes": 3072,
+            "format": "moe_grouped.sorted_slot_index.i32.minus1_padding",
+            "name": "sorted_slot_index",
+            "recipe": "SortedSlots"
+          },
+          {
+            "access": "read_only",
+            "bytes": 65280,
+            "format": "block_i8_128.kb_x_n.136b",
+            "name": "Xq",
+            "recipe": "BlockI8"
+          },
+          {
+            "access": "write_only",
+            "bytes": 7864320,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 1280,
+          "M": 2560,
+          "m_total": 768,
+          "n_experts": 128,
+          "x_row_div": 1,
+          "x_src_rows": 48
+        },
+        "routing": {
+          "live_rows": 480,
+          "live_tiles": 30,
+          "max_tiles_per_expert": 1,
+          "n_experts": 128,
+          "partial_tiles": 30,
+          "route": {
+            "id": "f04870667e6b905ca0cd23753ded809981fe19f563f488dbbf3de223068a60ab",
+            "kind": "hist",
+            "layer": null,
+            "path": "/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json"
+          },
+          "route_seed": 7885632933165233524,
+          "slab_bytes": 1740800,
+          "tokens": 8,
+          "topk": 6,
+          "touched_experts": 30
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3173Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 2851Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "clock_summary": {
+          "power_w": {
+            "max": 277.0,
+            "median": 157.5,
+            "min": 70.0,
+            "n": 16
+          },
+          "samples": 16,
+          "sclk_mhz": {
+            "max": 3173.0,
+            "median": 2755.5,
+            "min": 2511.0,
+            "n": 16
+          },
+          "temp_c": {
+            "max": 56.0,
+            "median": 56.0,
+            "min": 56.0,
+            "n": 16
+          }
+        },
+        "p_faster": 1.0,
+        "p_slower": 0.000030517578125,
+        "ratio_max": 1.1122874676341976,
+        "ratio_median": 1.0940665248450703,
+        "ratio_min": 1.0627303211207577,
+        "rounds": [
+          {
+            "base_us": 60.59075053781271,
+            "cand_us": 66.48074835538864,
+            "clock_end": {
+              "power_w": 159.0,
+              "sclk_dpm_mhz": 2511.0,
+              "sclk_hwmon_mhz": 2511.0,
+              "sclk_mhz": 2511.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734468,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 70.0,
+              "sclk_dpm_mhz": 2851.0,
+              "sclk_hwmon_mhz": 2851.0,
+              "sclk_mhz": 2851.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734449,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0972095206825367,
+            "round": 0
+          },
+          {
+            "base_us": 59.5704996958375,
+            "cand_us": 65.13099931180477,
+            "clock_end": {
+              "power_w": 193.0,
+              "sclk_dpm_mhz": 2757.0,
+              "sclk_hwmon_mhz": 2757.0,
+              "sclk_mhz": 2757.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734482,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 159.0,
+              "sclk_dpm_mhz": 2511.0,
+              "sclk_hwmon_mhz": 2511.0,
+              "sclk_mhz": 2511.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734468,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0933431756382566,
+            "round": 1
+          },
+          {
+            "base_us": 59.66074950993061,
+            "cand_us": 65.57049788534641,
+            "clock_end": {
+              "power_w": 119.0,
+              "sclk_dpm_mhz": 2645.0,
+              "sclk_hwmon_mhz": 2645.0,
+              "sclk_mhz": 2645.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734518,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 193.0,
+              "sclk_dpm_mhz": 2757.0,
+              "sclk_hwmon_mhz": 2757.0,
+              "sclk_mhz": 2757.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734482,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0990558855522274,
+            "round": 2
+          },
+          {
+            "base_us": 59.700749814510345,
+            "cand_us": 65.92075154185295,
+            "clock_end": {
+              "power_w": 121.0,
+              "sclk_dpm_mhz": 2684.0,
+              "sclk_hwmon_mhz": 2684.0,
+              "sclk_mhz": 2684.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734550,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 119.0,
+              "sclk_dpm_mhz": 2645.0,
+              "sclk_hwmon_mhz": 2645.0,
+              "sclk_mhz": 2645.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734518,
+              "temp_c": 56.0
+            },
+            "ratio": 1.1041863250741086,
+            "round": 3
+          },
+          {
+            "base_us": 59.21075027436018,
+            "cand_us": 64.78049978613853,
+            "clock_end": {
+              "power_w": 139.0,
+              "sclk_dpm_mhz": 2534.0,
+              "sclk_hwmon_mhz": 2534.0,
+              "sclk_mhz": 2534.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734578,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 121.0,
+              "sclk_dpm_mhz": 2684.0,
+              "sclk_hwmon_mhz": 2684.0,
+              "sclk_mhz": 2684.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734550,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0940665248450703,
+            "round": 4
+          },
+          {
+            "base_us": 59.810749255120754,
+            "cand_us": 65.93075022101402,
+            "clock_end": {
+              "power_w": 125.0,
+              "sclk_dpm_mhz": 2702.0,
+              "sclk_hwmon_mhz": 2702.0,
+              "sclk_mhz": 2702.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734607,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 139.0,
+              "sclk_dpm_mhz": 2534.0,
+              "sclk_hwmon_mhz": 2534.0,
+              "sclk_mhz": 2534.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734578,
+              "temp_c": 56.0
+            },
+            "ratio": 1.1023227604086452,
+            "round": 5
+          },
+          {
+            "base_us": 59.340749867260456,
+            "cand_us": 64.92049992084503,
+            "clock_end": {
+              "power_w": 208.0,
+              "sclk_dpm_mhz": 2766.0,
+              "sclk_hwmon_mhz": 2766.0,
+              "sclk_mhz": 2766.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734621,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 125.0,
+              "sclk_dpm_mhz": 2702.0,
+              "sclk_hwmon_mhz": 2702.0,
+              "sclk_mhz": 2702.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734607,
+              "temp_c": 56.0
+            },
+            "ratio": 1.094028977828321,
+            "round": 6
+          },
+          {
+            "base_us": 59.670500457286835,
+            "cand_us": 66.37074984610081,
+            "clock_end": {
+              "power_w": 98.0,
+              "sclk_dpm_mhz": 2573.0,
+              "sclk_hwmon_mhz": 2573.0,
+              "sclk_mhz": 2573.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734672,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 208.0,
+              "sclk_dpm_mhz": 2766.0,
+              "sclk_hwmon_mhz": 2766.0,
+              "sclk_mhz": 2766.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734621,
+              "temp_c": 56.0
+            },
+            "ratio": 1.1122874676341976,
+            "round": 7
+          },
+          {
+            "base_us": 59.730750508606434,
+            "cand_us": 64.98074904084206,
+            "clock_end": {
+              "power_w": 156.0,
+              "sclk_dpm_mhz": 2754.0,
+              "sclk_hwmon_mhz": 2754.0,
+              "sclk_mhz": 2754.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734695,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 98.0,
+              "sclk_dpm_mhz": 2573.0,
+              "sclk_hwmon_mhz": 2573.0,
+              "sclk_mhz": 2573.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734672,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0878944009163114,
+            "round": 8
+          },
+          {
+            "base_us": 59.59025118499994,
+            "cand_us": 65.43100066483021,
+            "clock_end": {
+              "power_w": 155.0,
+              "sclk_dpm_mhz": 2719.0,
+              "sclk_hwmon_mhz": 2719.0,
+              "sclk_mhz": 2719.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734715,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 156.0,
+              "sclk_dpm_mhz": 2754.0,
+              "sclk_hwmon_mhz": 2754.0,
+              "sclk_mhz": 2754.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734695,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0980151847606325,
+            "round": 9
+          },
+          {
+            "base_us": 59.46074891835451,
+            "cand_us": 65.07099978625774,
+            "clock_end": {
+              "power_w": 215.0,
+              "sclk_dpm_mhz": 2777.0,
+              "sclk_hwmon_mhz": 2777.0,
+              "sclk_mhz": 2777.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734729,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 155.0,
+              "sclk_dpm_mhz": 2719.0,
+              "sclk_hwmon_mhz": 2719.0,
+              "sclk_mhz": 2719.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734715,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0943521729873713,
+            "round": 10
+          },
+          {
+            "base_us": 57.87074938416481,
+            "cand_us": 61.501000076532364,
+            "clock_end": {
+              "power_w": 269.0,
+              "sclk_dpm_mhz": 3072.0,
+              "sclk_hwmon_mhz": 3072.0,
+              "sclk_mhz": 3072.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734742,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 215.0,
+              "sclk_dpm_mhz": 2777.0,
+              "sclk_hwmon_mhz": 2777.0,
+              "sclk_mhz": 2777.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734729,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0627303211207577,
+            "round": 11
+          },
+          {
+            "base_us": 57.330249808728695,
+            "cand_us": 61.41025014221668,
+            "clock_end": {
+              "power_w": 273.0,
+              "sclk_dpm_mhz": 3173.0,
+              "sclk_hwmon_mhz": 3173.0,
+              "sclk_mhz": 3173.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734756,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 269.0,
+              "sclk_dpm_mhz": 3072.0,
+              "sclk_hwmon_mhz": 3072.0,
+              "sclk_mhz": 3072.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734742,
+              "temp_c": 56.0
+            },
+            "ratio": 1.071166624026585,
+            "round": 12
+          },
+          {
+            "base_us": 57.30024911463261,
+            "cand_us": 61.39050051569939,
+            "clock_end": {
+              "power_w": 269.0,
+              "sclk_dpm_mhz": 3173.0,
+              "sclk_hwmon_mhz": 3173.0,
+              "sclk_mhz": 3173.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734769,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 273.0,
+              "sclk_dpm_mhz": 3173.0,
+              "sclk_hwmon_mhz": 3173.0,
+              "sclk_mhz": 3173.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734756,
+              "temp_c": 56.0
+            },
+            "ratio": 1.071382785664404,
+            "round": 13
+          },
+          {
+            "base_us": 57.2504997253418,
+            "cand_us": 61.490499414503574,
+            "clock_end": {
+              "power_w": 277.0,
+              "sclk_dpm_mhz": 3173.0,
+              "sclk_hwmon_mhz": 3173.0,
+              "sclk_mhz": 3173.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734782,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 269.0,
+              "sclk_dpm_mhz": 3173.0,
+              "sclk_hwmon_mhz": 3173.0,
+              "sclk_mhz": 3173.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734769,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0740604834805476,
+            "round": 14
+          }
+        ],
+        "rounds_faster": 0,
+        "rounds_slower": 15,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 38.67948477627374,
+          "baseline_tflops": 5.295749403129267,
+          "baseline_us": {
+            "max": 9071.171760559082,
+            "mean": 93.31771348499596,
+            "median": 59.400998055934906,
+            "min": 56.63999915122986,
+            "p90": 60.201000422239304
+          },
+          "calls_per_arm": 900,
+          "candidate_gbps": 35.32541112481535,
+          "candidate_tflops": 4.8365309404092605,
+          "candidate_us": {
+            "max": 8805.69076538086,
+            "mean": 101.32465364618423,
+            "median": 65.04099816083908,
+            "min": 60.56100130081177,
+            "p90": 66.40099734067917
+          },
+          "flush": false,
+          "n": 30,
+          "rounds": 15,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 2297600.0,
+        "flops": 314572800.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": false,
+        "candidate": true
+      },
+      "bytes_per_call": 2854400,
+      "footprint_bytes": 99424644,
+      "geometry_base": {
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          5120,
+          96,
+          1
+        ],
+        "grid_workgroups": [
+          40,
+          96,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          5120,
+          96,
+          1
+        ],
+        "grid_workgroups": [
+          20,
+          96,
+          1
+        ],
+        "lds_dynamic_bytes": 17920
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 15728640
+      },
+      "identity_mode": "full",
+      "launch_rows": 1536,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio_median": 1.0046634630281288,
+      "regime": "pool",
+      "rows": 16,
+      "same_geometry": false,
+      "shape": "M2560-K1280-n_experts128-tokens16-topk6",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1024,
+            "format": "moe_grouped.expert_ptr_table.u64",
+            "name": "expert_weight_ptrs",
+            "recipe": "ExpertPtrTable"
+          },
+          {
+            "access": "read_only",
+            "bytes": 384,
+            "format": "moe_grouped.expert_tile_ids.i32.per_tile16",
+            "name": "expert_tile_ids",
+            "recipe": "TileIds"
+          },
+          {
+            "access": "read_only",
+            "bytes": 516,
+            "format": "moe_grouped.expert_offsets.i32.e_plus_1",
+            "name": "expert_offsets",
+            "recipe": "ExpertOffsets"
+          },
+          {
+            "access": "read_only",
+            "bytes": 6144,
+            "format": "moe_grouped.sorted_slot_index.i32.minus1_padding",
+            "name": "sorted_slot_index",
+            "recipe": "SortedSlots"
+          },
+          {
+            "access": "read_only",
+            "bytes": 130560,
+            "format": "block_i8_128.kb_x_n.136b",
+            "name": "Xq",
+            "recipe": "BlockI8"
+          },
+          {
+            "access": "write_only",
+            "bytes": 15728640,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 1280,
+          "M": 2560,
+          "m_total": 1536,
+          "n_experts": 128,
+          "x_row_div": 1,
+          "x_src_rows": 96
+        },
+        "routing": {
+          "live_rows": 768,
+          "live_tiles": 48,
+          "max_tiles_per_expert": 1,
+          "n_experts": 128,
+          "partial_tiles": 48,
+          "route": {
+            "id": "f04870667e6b905ca0cd23753ded809981fe19f563f488dbbf3de223068a60ab",
+            "kind": "hist",
+            "layer": null,
+            "path": "/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json"
+          },
+          "route_seed": 7885632933165233524,
+          "slab_bytes": 1740800,
+          "tokens": 16,
+          "topk": 6,
+          "touched_experts": 48
+        },
+        "timing_pool": {
+          "bytes_per_set": 222952960,
+          "dispatch_i_uses_set": "i % sets",
+          "sets": 1,
+          "total_bytes": 222952960
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3191Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 2685Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "clock_summary": {
+          "power_w": {
+            "max": 266.0,
+            "median": 256.0,
+            "min": 73.0,
+            "n": 16
+          },
+          "samples": 16,
+          "sclk_mhz": {
+            "max": 3191.0,
+            "median": 3180.5,
+            "min": 2653.0,
+            "n": 16
+          },
+          "temp_c": {
+            "max": 57.0,
+            "median": 57.0,
+            "min": 56.0,
+            "n": 16
+          }
+        },
+        "p_faster": 1.0,
+        "p_slower": 0.000030517578125,
+        "ratio_max": 1.0102439813049882,
+        "ratio_median": 1.0046634630281288,
+        "ratio_min": 1.0034273196232775,
+        "rounds": [
+          {
+            "base_us": 170.83200067281723,
+            "cand_us": 172.5820004940033,
+            "clock_end": {
+              "power_w": 224.0,
+              "sclk_dpm_mhz": 2653.0,
+              "sclk_hwmon_mhz": 2653.0,
+              "sclk_mhz": 2653.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734912,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 73.0,
+              "sclk_dpm_mhz": 2685.0,
+              "sclk_hwmon_mhz": 2685.0,
+              "sclk_mhz": 2685.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734881,
+              "temp_c": 57.0
+            },
+            "ratio": 1.0102439813049882,
+            "round": 0
+          },
+          {
+            "base_us": 169.20200362801552,
+            "cand_us": 170.05174607038498,
+            "clock_end": {
+              "power_w": 250.0,
+              "sclk_dpm_mhz": 3155.0,
+              "sclk_hwmon_mhz": 3155.0,
+              "sclk_mhz": 3155.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734942,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 224.0,
+              "sclk_dpm_mhz": 2653.0,
+              "sclk_hwmon_mhz": 2653.0,
+              "sclk_mhz": 2653.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734912,
+              "temp_c": 56.0
+            },
+            "ratio": 1.005022058983637,
+            "round": 1
+          },
+          {
+            "base_us": 169.20199990272522,
+            "cand_us": 169.89199817180634,
+            "clock_end": {
+              "power_w": 250.0,
+              "sclk_dpm_mhz": 3181.0,
+              "sclk_hwmon_mhz": 3181.0,
+              "sclk_mhz": 3181.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734973,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 250.0,
+              "sclk_dpm_mhz": 3155.0,
+              "sclk_hwmon_mhz": 3155.0,
+              "sclk_mhz": 3155.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734942,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0040779557539379,
+            "round": 2
+          },
+          {
+            "base_us": 169.30175200104713,
+            "cand_us": 170.00174894928932,
+            "clock_end": {
+              "power_w": 255.0,
+              "sclk_dpm_mhz": 3179.0,
+              "sclk_hwmon_mhz": 3179.0,
+              "sclk_mhz": 3179.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735003,
+              "temp_c": 56.0
+            },
+            "clock_start": {
+              "power_w": 250.0,
+              "sclk_dpm_mhz": 3181.0,
+              "sclk_hwmon_mhz": 3181.0,
+              "sclk_mhz": 3181.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537734973,
+              "temp_c": 56.0
+            },
+            "ratio": 1.004134611366797,
+            "round": 3
+          },
+          {
+            "base_us": 169.3117506802082,
+            "cand_us": 170.13199999928474,
+            "clock_end": {
+              "power_w": 257.0,
+              "sclk_dpm_mhz": 3179.0,
+              "sclk_hwmon_mhz": 3179.0,
+              "sclk_mhz": 3179.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735034,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 255.0,
+              "sclk_dpm_mhz": 3179.0,
+              "sclk_hwmon_mhz": 3179.0,
+              "sclk_mhz": 3179.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735003,
+              "temp_c": 56.0
+            },
+            "ratio": 1.0048446095193109,
+            "round": 4
+          },
+          {
+            "base_us": 169.30175200104713,
+            "cand_us": 169.88200321793556,
+            "clock_end": {
+              "power_w": 255.0,
+              "sclk_dpm_mhz": 3180.0,
+              "sclk_hwmon_mhz": 3180.0,
+              "sclk_mhz": 3180.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735064,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 257.0,
+              "sclk_dpm_mhz": 3179.0,
+              "sclk_hwmon_mhz": 3179.0,
+              "sclk_mhz": 3179.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735034,
+              "temp_c": 57.0
+            },
+            "ratio": 1.0034273196232775,
+            "round": 5
+          },
+          {
+            "base_us": 169.3519987165928,
+            "cand_us": 170.17199844121933,
+            "clock_end": {
+              "power_w": 256.0,
+              "sclk_dpm_mhz": 3179.0,
+              "sclk_hwmon_mhz": 3179.0,
+              "sclk_mhz": 3179.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735095,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 255.0,
+              "sclk_dpm_mhz": 3180.0,
+              "sclk_hwmon_mhz": 3180.0,
+              "sclk_mhz": 3180.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735064,
+              "temp_c": 57.0
+            },
+            "ratio": 1.004841984333464,
+            "round": 6
+          },
+          {
+            "base_us": 169.26199570298195,
+            "cand_us": 169.9719987809658,
+            "clock_end": {
+              "power_w": 262.0,
+              "sclk_dpm_mhz": 3183.0,
+              "sclk_hwmon_mhz": 3183.0,
+              "sclk_mhz": 3183.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735125,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 256.0,
+              "sclk_dpm_mhz": 3179.0,
+              "sclk_hwmon_mhz": 3179.0,
+              "sclk_mhz": 3179.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735095,
+              "temp_c": 57.0
+            },
+            "ratio": 1.0041946987274672,
+            "round": 7
+          },
+          {
+            "base_us": 169.23200339078903,
+            "cand_us": 170.13199627399445,
+            "clock_end": {
+              "power_w": 251.0,
+              "sclk_dpm_mhz": 3177.0,
+              "sclk_hwmon_mhz": 3177.0,
+              "sclk_mhz": 3177.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735156,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 262.0,
+              "sclk_dpm_mhz": 3183.0,
+              "sclk_hwmon_mhz": 3183.0,
+              "sclk_mhz": 3183.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735125,
+              "temp_c": 57.0
+            },
+            "ratio": 1.0053181009807415,
+            "round": 8
+          },
+          {
+            "base_us": 169.30200159549713,
+            "cand_us": 169.99199613928795,
+            "clock_end": {
+              "power_w": 262.0,
+              "sclk_dpm_mhz": 3183.0,
+              "sclk_hwmon_mhz": 3183.0,
+              "sclk_mhz": 3183.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735186,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 251.0,
+              "sclk_dpm_mhz": 3177.0,
+              "sclk_hwmon_mhz": 3177.0,
+              "sclk_mhz": 3177.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735156,
+              "temp_c": 57.0
+            },
+            "ratio": 1.0040755250220808,
+            "round": 9
+          },
+          {
+            "base_us": 169.22199726104736,
+            "cand_us": 169.98199746012688,
+            "clock_end": {
+              "power_w": 260.0,
+              "sclk_dpm_mhz": 3181.0,
+              "sclk_hwmon_mhz": 3181.0,
+              "sclk_mhz": 3181.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735217,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 262.0,
+              "sclk_dpm_mhz": 3183.0,
+              "sclk_hwmon_mhz": 3183.0,
+              "sclk_mhz": 3183.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735186,
+              "temp_c": 57.0
+            },
+            "ratio": 1.0044911430628438,
+            "round": 10
+          },
+          {
+            "base_us": 169.40199956297874,
+            "cand_us": 170.19199952483177,
+            "clock_end": {
+              "power_w": 261.0,
+              "sclk_dpm_mhz": 3181.0,
+              "sclk_hwmon_mhz": 3181.0,
+              "sclk_mhz": 3181.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735247,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 260.0,
+              "sclk_dpm_mhz": 3181.0,
+              "sclk_hwmon_mhz": 3181.0,
+              "sclk_mhz": 3181.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735217,
+              "temp_c": 57.0
+            },
+            "ratio": 1.0046634630281288,
+            "round": 11
+          },
+          {
+            "base_us": 169.2420020699501,
+            "cand_us": 170.16199976205826,
+            "clock_end": {
+              "power_w": 258.0,
+              "sclk_dpm_mhz": 3181.0,
+              "sclk_hwmon_mhz": 3181.0,
+              "sclk_mhz": 3181.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735278,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 261.0,
+              "sclk_dpm_mhz": 3181.0,
+              "sclk_hwmon_mhz": 3181.0,
+              "sclk_mhz": 3181.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735247,
+              "temp_c": 57.0
+            },
+            "ratio": 1.0054359891803213,
+            "round": 12
+          },
+          {
+            "base_us": 169.30174455046654,
+            "cand_us": 169.92149502038956,
+            "clock_end": {
+              "power_w": 256.0,
+              "sclk_dpm_mhz": 3186.0,
+              "sclk_hwmon_mhz": 3186.0,
+              "sclk_mhz": 3186.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735308,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 258.0,
+              "sclk_dpm_mhz": 3181.0,
+              "sclk_hwmon_mhz": 3181.0,
+              "sclk_mhz": 3181.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735278,
+              "temp_c": 57.0
+            },
+            "ratio": 1.0036606266023342,
+            "round": 13
+          },
+          {
+            "base_us": 169.23175379633904,
+            "cand_us": 170.03199458122253,
+            "clock_end": {
+              "power_w": 266.0,
+              "sclk_dpm_mhz": 3191.0,
+              "sclk_hwmon_mhz": 3191.0,
+              "sclk_mhz": 3191.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735339,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 256.0,
+              "sclk_dpm_mhz": 3186.0,
+              "sclk_hwmon_mhz": 3186.0,
+              "sclk_mhz": 3186.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735308,
+              "temp_c": 57.0
+            },
+            "ratio": 1.0047286680361804,
+            "round": 14
+          }
+        ],
+        "rounds_faster": 0,
+        "rounds_slower": 15,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 16.857821296915507,
+          "baseline_tflops": 3.71567548155153,
+          "baseline_us": {
+            "max": 175.6419986486435,
+            "mean": 169.46100733346404,
+            "median": 169.32199895381927,
+            "min": 168.12199354171753,
+            "p90": 170.36199569702148
+          },
+          "calls_per_arm": 900,
+          "candidate_gbps": 16.782492866363356,
+          "candidate_tflops": 3.6990721496300076,
+          "candidate_us": {
+            "max": 177.40200459957123,
+            "mean": 170.26163626048287,
+            "median": 170.0820028781891,
+            "min": 168.4419959783554,
+            "p90": 171.32200300693512
+          },
+          "flush": false,
+          "n": 30,
+          "rounds": 15,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 2854400.0,
+        "flops": 629145600.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": false,
+        "candidate": true
+      },
+      "bytes_per_call": 3968000,
+      "footprint_bytes": 133308692,
+      "geometry_base": {
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          5120,
+          132,
+          1
+        ],
+        "grid_workgroups": [
+          40,
+          132,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          5120,
+          132,
+          1
+        ],
+        "grid_workgroups": [
+          20,
+          132,
+          1
+        ],
+        "lds_dynamic_bytes": 17920
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 21626880
+      },
+      "identity_mode": "full",
+      "launch_rows": 2112,
+      "p_faster": 0.00048828125,
+      "p_slower": 0.9999694824218749,
+      "ratio_median": 0.9940928966235401,
+      "regime": "pool",
+      "rows": 32,
+      "same_geometry": false,
+      "shape": "M2560-K1280-n_experts128-tokens32-topk6",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1024,
+            "format": "moe_grouped.expert_ptr_table.u64",
+            "name": "expert_weight_ptrs",
+            "recipe": "ExpertPtrTable"
+          },
+          {
+            "access": "read_only",
+            "bytes": 528,
+            "format": "moe_grouped.expert_tile_ids.i32.per_tile16",
+            "name": "expert_tile_ids",
+            "recipe": "TileIds"
+          },
+          {
+            "access": "read_only",
+            "bytes": 516,
+            "format": "moe_grouped.expert_offsets.i32.e_plus_1",
+            "name": "expert_offsets",
+            "recipe": "ExpertOffsets"
+          },
+          {
+            "access": "read_only",
+            "bytes": 8448,
+            "format": "moe_grouped.sorted_slot_index.i32.minus1_padding",
+            "name": "sorted_slot_index",
+            "recipe": "SortedSlots"
+          },
+          {
+            "access": "read_only",
+            "bytes": 261120,
+            "format": "block_i8_128.kb_x_n.136b",
+            "name": "Xq",
+            "recipe": "BlockI8"
+          },
+          {
+            "access": "write_only",
+            "bytes": 21626880,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 1280,
+          "M": 2560,
+          "m_total": 2112,
+          "n_experts": 128,
+          "x_row_div": 1,
+          "x_src_rows": 192
+        },
+        "routing": {
+          "live_rows": 1040,
+          "live_tiles": 65,
+          "max_tiles_per_expert": 2,
+          "n_experts": 128,
+          "partial_tiles": 64,
+          "route": {
+            "id": "f04870667e6b905ca0cd23753ded809981fe19f563f488dbbf3de223068a60ab",
+            "kind": "hist",
+            "layer": null,
+            "path": "/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json"
+          },
+          "route_seed": 7885632933165233524,
+          "slab_bytes": 1740800,
+          "tokens": 32,
+          "topk": 6,
+          "touched_experts": 64
+        },
+        "timing_pool": {
+          "bytes_per_set": 223083520,
+          "dispatch_i_uses_set": "i % sets",
+          "sets": 1,
+          "total_bytes": 223083520
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3192Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 2586Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "clock_summary": {
+          "power_w": {
+            "max": 274.0,
+            "median": 267.5,
+            "min": 70.0,
+            "n": 16
+          },
+          "samples": 16,
+          "sclk_mhz": {
+            "max": 3197.0,
+            "median": 3177.5,
+            "min": 2586.0,
+            "n": 16
+          },
+          "temp_c": {
+            "max": 58.0,
+            "median": 57.0,
+            "min": 57.0,
+            "n": 16
+          }
+        },
+        "p_faster": 0.00048828125,
+        "p_slower": 0.9999694824218749,
+        "ratio_max": 1.001440913735331,
+        "ratio_median": 0.9940928966235401,
+        "ratio_min": 0.9935278290624862,
+        "rounds": [
+          {
+            "base_us": 229.19275239109993,
+            "cand_us": 229.52299937605858,
+            "clock_end": {
+              "power_w": 212.0,
+              "sclk_dpm_mhz": 2731.0,
+              "sclk_hwmon_mhz": 2731.0,
+              "sclk_mhz": 2731.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735495,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 70.0,
+              "sclk_dpm_mhz": 2586.0,
+              "sclk_hwmon_mhz": 2586.0,
+              "sclk_mhz": 2586.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735455,
+              "temp_c": 57.0
+            },
+            "ratio": 1.001440913735331,
+            "round": 0
+          },
+          {
+            "base_us": 228.5727523267269,
+            "cand_us": 227.24299877882004,
+            "clock_end": {
+              "power_w": 266.0,
+              "sclk_dpm_mhz": 3179.0,
+              "sclk_hwmon_mhz": 3179.0,
+              "sclk_mhz": 3179.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735534,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 212.0,
+              "sclk_dpm_mhz": 2731.0,
+              "sclk_hwmon_mhz": 2731.0,
+              "sclk_mhz": 2731.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735495,
+              "temp_c": 57.0
+            },
+            "ratio": 0.9941823619203478,
+            "round": 1
+          },
+          {
+            "base_us": 228.73249650001526,
+            "cand_us": 227.30249911546707,
+            "clock_end": {
+              "power_w": 268.0,
+              "sclk_dpm_mhz": 3179.0,
+              "sclk_hwmon_mhz": 3179.0,
+              "sclk_mhz": 3179.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735574,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 266.0,
+              "sclk_dpm_mhz": 3179.0,
+              "sclk_hwmon_mhz": 3179.0,
+              "sclk_mhz": 3179.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735534,
+              "temp_c": 57.0
+            },
+            "ratio": 0.9937481669354835,
+            "round": 2
+          },
+          {
+            "base_us": 228.81299629807472,
+            "cand_us": 227.47249901294708,
+            "clock_end": {
+              "power_w": 267.0,
+              "sclk_dpm_mhz": 3177.0,
+              "sclk_hwmon_mhz": 3177.0,
+              "sclk_mhz": 3177.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735613,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 268.0,
+              "sclk_dpm_mhz": 3179.0,
+              "sclk_hwmon_mhz": 3179.0,
+              "sclk_mhz": 3179.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735574,
+              "temp_c": 57.0
+            },
+            "ratio": 0.9941415159679944,
+            "round": 3
+          },
+          {
+            "base_us": 228.752750903368,
+            "cand_us": 227.35249996185303,
+            "clock_end": {
+              "power_w": 268.0,
+              "sclk_dpm_mhz": 3177.0,
+              "sclk_hwmon_mhz": 3177.0,
+              "sclk_mhz": 3177.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735653,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 267.0,
+              "sclk_dpm_mhz": 3177.0,
+              "sclk_hwmon_mhz": 3177.0,
+              "sclk_mhz": 3177.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735613,
+              "temp_c": 57.0
+            },
+            "ratio": 0.9938787580215528,
+            "round": 4
+          },
+          {
+            "base_us": 228.63249853253365,
+            "cand_us": 227.26299986243248,
+            "clock_end": {
+              "power_w": 263.0,
+              "sclk_dpm_mhz": 3172.0,
+              "sclk_hwmon_mhz": 3172.0,
+              "sclk_mhz": 3172.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735692,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 268.0,
+              "sclk_dpm_mhz": 3177.0,
+              "sclk_hwmon_mhz": 3177.0,
+              "sclk_mhz": 3177.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735653,
+              "temp_c": 57.0
+            },
+            "ratio": 0.9940100437212941,
+            "round": 5
+          },
+          {
+            "base_us": 228.62249985337257,
+            "cand_us": 227.38250344991684,
+            "clock_end": {
+              "power_w": 267.0,
+              "sclk_dpm_mhz": 3176.0,
+              "sclk_hwmon_mhz": 3176.0,
+              "sclk_mhz": 3176.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735732,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 263.0,
+              "sclk_dpm_mhz": 3172.0,
+              "sclk_hwmon_mhz": 3172.0,
+              "sclk_mhz": 3172.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735692,
+              "temp_c": 57.0
+            },
+            "ratio": 0.9945762276055462,
+            "round": 6
+          },
+          {
+            "base_us": 228.66274788975716,
+            "cand_us": 227.23200172185898,
+            "clock_end": {
+              "power_w": 268.0,
+              "sclk_dpm_mhz": 3175.0,
+              "sclk_hwmon_mhz": 3175.0,
+              "sclk_mhz": 3175.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735771,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 267.0,
+              "sclk_dpm_mhz": 3176.0,
+              "sclk_hwmon_mhz": 3176.0,
+              "sclk_mhz": 3176.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735732,
+              "temp_c": 57.0
+            },
+            "ratio": 0.9937429853305709,
+            "round": 7
+          },
+          {
+            "base_us": 228.49274799227715,
+            "cand_us": 227.33249887824059,
+            "clock_end": {
+              "power_w": 270.0,
+              "sclk_dpm_mhz": 3178.0,
+              "sclk_hwmon_mhz": 3178.0,
+              "sclk_mhz": 3178.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735811,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 268.0,
+              "sclk_dpm_mhz": 3175.0,
+              "sclk_hwmon_mhz": 3175.0,
+              "sclk_mhz": 3175.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735771,
+              "temp_c": 57.0
+            },
+            "ratio": 0.9949221621945052,
+            "round": 8
+          },
+          {
+            "base_us": 228.60275208950043,
+            "cand_us": 227.24299877882004,
+            "clock_end": {
+              "power_w": 266.0,
+              "sclk_dpm_mhz": 3174.0,
+              "sclk_hwmon_mhz": 3174.0,
+              "sclk_mhz": 3174.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735851,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 270.0,
+              "sclk_dpm_mhz": 3178.0,
+              "sclk_hwmon_mhz": 3178.0,
+              "sclk_mhz": 3178.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735811,
+              "temp_c": 57.0
+            },
+            "ratio": 0.9940518943964942,
+            "round": 9
+          },
+          {
+            "base_us": 228.63250225782394,
+            "cand_us": 227.1527536213398,
+            "clock_end": {
+              "power_w": 266.0,
+              "sclk_dpm_mhz": 3184.0,
+              "sclk_hwmon_mhz": 3184.0,
+              "sclk_mhz": 3184.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735890,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 266.0,
+              "sclk_dpm_mhz": 3174.0,
+              "sclk_hwmon_mhz": 3174.0,
+              "sclk_mhz": 3174.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735851,
+              "temp_c": 57.0
+            },
+            "ratio": 0.9935278290624862,
+            "round": 10
+          },
+          {
+            "base_us": 228.6127507686615,
+            "cand_us": 227.47224941849709,
+            "clock_end": {
+              "power_w": 271.0,
+              "sclk_dpm_mhz": 3186.0,
+              "sclk_hwmon_mhz": 3186.0,
+              "sclk_mhz": 3186.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735930,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 266.0,
+              "sclk_dpm_mhz": 3184.0,
+              "sclk_hwmon_mhz": 3184.0,
+              "sclk_mhz": 3184.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735890,
+              "temp_c": 58.0
+            },
+            "ratio": 0.9950112084897726,
+            "round": 11
+          },
+          {
+            "base_us": 228.69249433279037,
+            "cand_us": 227.3625023663044,
+            "clock_end": {
+              "power_w": 268.0,
+              "sclk_dpm_mhz": 3188.0,
+              "sclk_hwmon_mhz": 3188.0,
+              "sclk_mhz": 3188.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735969,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 271.0,
+              "sclk_dpm_mhz": 3186.0,
+              "sclk_hwmon_mhz": 3186.0,
+              "sclk_mhz": 3186.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735930,
+              "temp_c": 58.0
+            },
+            "ratio": 0.9941843654713451,
+            "round": 12
+          },
+          {
+            "base_us": 228.80249843001366,
+            "cand_us": 227.44249925017357,
+            "clock_end": {
+              "power_w": 274.0,
+              "sclk_dpm_mhz": 3197.0,
+              "sclk_hwmon_mhz": 3197.0,
+              "sclk_mhz": 3197.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736009,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 268.0,
+              "sclk_dpm_mhz": 3188.0,
+              "sclk_hwmon_mhz": 3188.0,
+              "sclk_mhz": 3188.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537735969,
+              "temp_c": 58.0
+            },
+            "ratio": 0.9940560125471878,
+            "round": 13
+          },
+          {
+            "base_us": 228.62299904227257,
+            "cand_us": 227.27249935269356,
+            "clock_end": {
+              "power_w": 270.0,
+              "sclk_dpm_mhz": 3192.0,
+              "sclk_hwmon_mhz": 3192.0,
+              "sclk_mhz": 3192.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736048,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 274.0,
+              "sclk_dpm_mhz": 3197.0,
+              "sclk_hwmon_mhz": 3197.0,
+              "sclk_mhz": 3197.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736009,
+              "temp_c": 58.0
+            },
+            "ratio": 0.9940928966235401,
+            "round": 14
+          }
+        ],
+        "rounds_faster": 14,
+        "rounds_slower": 1,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 17.348571167079303,
+          "baseline_tflops": 5.501399806479237,
+          "baseline_us": {
+            "max": 235.24199426174164,
+            "mean": 228.75894587900837,
+            "median": 228.7220060825348,
+            "min": 227.0829975605011,
+            "p90": 229.52300310134888
+          },
+          "calls_per_arm": 900,
+          "candidate_gbps": 17.45230644331162,
+          "candidate_tflops": 5.534295266462276,
+          "candidate_us": {
+            "max": 234.04300212860107,
+            "mean": 227.51573493083322,
+            "median": 227.3624986410141,
+            "min": 225.5219966173172,
+            "p90": 228.72300446033478
+          },
+          "flush": false,
+          "n": 30,
+          "rounds": 15,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 3968000.0,
+        "flops": 1258291200.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": true
+      },
+      "bytes_per_call": 6195200,
+      "footprint_bytes": 165130308,
+      "geometry_base": {
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          5120,
+          144,
+          1
+        ],
+        "grid_workgroups": [
+          40,
+          144,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          5120,
+          144,
+          1
+        ],
+        "grid_workgroups": [
+          20,
+          144,
+          1
+        ],
+        "lds_dynamic_bytes": 17920
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 23592960
+      },
+      "identity_mode": "full",
+      "launch_rows": 2304,
+      "p_faster": 0.000030517578125,
+      "p_slower": 1.0,
+      "ratio_median": 0.9905139801258783,
+      "regime": "pool",
+      "rows": 64,
+      "same_geometry": false,
+      "shape": "M2560-K1280-n_experts128-tokens64-topk6",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1024,
+            "format": "moe_grouped.expert_ptr_table.u64",
+            "name": "expert_weight_ptrs",
+            "recipe": "ExpertPtrTable"
+          },
+          {
+            "access": "read_only",
+            "bytes": 576,
+            "format": "moe_grouped.expert_tile_ids.i32.per_tile16",
+            "name": "expert_tile_ids",
+            "recipe": "TileIds"
+          },
+          {
+            "access": "read_only",
+            "bytes": 516,
+            "format": "moe_grouped.expert_offsets.i32.e_plus_1",
+            "name": "expert_offsets",
+            "recipe": "ExpertOffsets"
+          },
+          {
+            "access": "read_only",
+            "bytes": 9216,
+            "format": "moe_grouped.sorted_slot_index.i32.minus1_padding",
+            "name": "sorted_slot_index",
+            "recipe": "SortedSlots"
+          },
+          {
+            "access": "read_only",
+            "bytes": 522240,
+            "format": "block_i8_128.kb_x_n.136b",
+            "name": "Xq",
+            "recipe": "BlockI8"
+          },
+          {
+            "access": "write_only",
+            "bytes": 23592960,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 1280,
+          "M": 2560,
+          "m_total": 2304,
+          "n_experts": 128,
+          "x_row_div": 1,
+          "x_src_rows": 384
+        },
+        "routing": {
+          "live_rows": 1392,
+          "live_tiles": 87,
+          "max_tiles_per_expert": 4,
+          "n_experts": 128,
+          "partial_tiles": 80,
+          "route": {
+            "id": "f04870667e6b905ca0cd23753ded809981fe19f563f488dbbf3de223068a60ab",
+            "kind": "hist",
+            "layer": null,
+            "path": "/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json"
+          },
+          "route_seed": 7885632933165233524,
+          "slab_bytes": 1740800,
+          "tokens": 64,
+          "topk": 6,
+          "touched_experts": 81
+        },
+        "timing_pool": {
+          "bytes_per_set": 223344640,
+          "dispatch_i_uses_set": "i % sets",
+          "sets": 1,
+          "total_bytes": 223344640
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3193Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 2574Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "clock_summary": {
+          "power_w": {
+            "max": 286.0,
+            "median": 279.0,
+            "min": 73.0,
+            "n": 16
+          },
+          "samples": 16,
+          "sclk_mhz": {
+            "max": 3193.0,
+            "median": 3169.0,
+            "min": 2574.0,
+            "n": 16
+          },
+          "temp_c": {
+            "max": 58.0,
+            "median": 58.0,
+            "min": 57.0,
+            "n": 16
+          }
+        },
+        "p_faster": 0.000030517578125,
+        "p_slower": 1.0,
+        "ratio_max": 0.995959055485075,
+        "ratio_median": 0.9905139801258783,
+        "ratio_min": 0.9891578708048523,
+        "rounds": [
+          {
+            "base_us": 287.1232479810715,
+            "cand_us": 285.9629988670349,
+            "clock_end": {
+              "power_w": 230.0,
+              "sclk_dpm_mhz": 2793.0,
+              "sclk_hwmon_mhz": 2793.0,
+              "sclk_mhz": 2793.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736212,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 73.0,
+              "sclk_dpm_mhz": 2574.0,
+              "sclk_hwmon_mhz": 2574.0,
+              "sclk_mhz": 2574.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736164,
+              "temp_c": 58.0
+            },
+            "ratio": 0.995959055485075,
+            "round": 0
+          },
+          {
+            "base_us": 286.82350367307663,
+            "cand_us": 283.9132472872734,
+            "clock_end": {
+              "power_w": 281.0,
+              "sclk_dpm_mhz": 3178.0,
+              "sclk_hwmon_mhz": 3178.0,
+              "sclk_mhz": 3178.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736259,
+              "temp_c": 57.0
+            },
+            "clock_start": {
+              "power_w": 230.0,
+              "sclk_dpm_mhz": 2793.0,
+              "sclk_hwmon_mhz": 2793.0,
+              "sclk_mhz": 2793.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736212,
+              "temp_c": 57.0
+            },
+            "ratio": 0.9898534940528432,
+            "round": 1
+          },
+          {
+            "base_us": 286.78325563669205,
+            "cand_us": 283.83350372314453,
+            "clock_end": {
+              "power_w": 279.0,
+              "sclk_dpm_mhz": 3170.0,
+              "sclk_hwmon_mhz": 3170.0,
+              "sclk_mhz": 3170.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736306,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 281.0,
+              "sclk_dpm_mhz": 3178.0,
+              "sclk_hwmon_mhz": 3178.0,
+              "sclk_mhz": 3178.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736259,
+              "temp_c": 57.0
+            },
+            "ratio": 0.9897143509756219,
+            "round": 2
+          },
+          {
+            "base_us": 286.6532430052757,
+            "cand_us": 284.0832471847534,
+            "clock_end": {
+              "power_w": 277.0,
+              "sclk_dpm_mhz": 3168.0,
+              "sclk_hwmon_mhz": 3168.0,
+              "sclk_mhz": 3168.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736353,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 279.0,
+              "sclk_dpm_mhz": 3170.0,
+              "sclk_hwmon_mhz": 3170.0,
+              "sclk_mhz": 3170.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736306,
+              "temp_c": 58.0
+            },
+            "ratio": 0.9910344784744856,
+            "round": 3
+          },
+          {
+            "base_us": 286.8432477116585,
+            "cand_us": 283.7332561612129,
+            "clock_end": {
+              "power_w": 279.0,
+              "sclk_dpm_mhz": 3163.0,
+              "sclk_hwmon_mhz": 3163.0,
+              "sclk_mhz": 3163.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736400,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 277.0,
+              "sclk_dpm_mhz": 3168.0,
+              "sclk_hwmon_mhz": 3168.0,
+              "sclk_mhz": 3168.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736353,
+              "temp_c": 58.0
+            },
+            "ratio": 0.9891578708048523,
+            "round": 4
+          },
+          {
+            "base_us": 286.5635007619858,
+            "cand_us": 284.0132489800453,
+            "clock_end": {
+              "power_w": 279.0,
+              "sclk_dpm_mhz": 3157.0,
+              "sclk_hwmon_mhz": 3157.0,
+              "sclk_mhz": 3157.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736447,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 279.0,
+              "sclk_dpm_mhz": 3163.0,
+              "sclk_hwmon_mhz": 3163.0,
+              "sclk_mhz": 3163.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736400,
+              "temp_c": 58.0
+            },
+            "ratio": 0.9911005701174113,
+            "round": 5
+          },
+          {
+            "base_us": 286.6229861974716,
+            "cand_us": 283.96324813365936,
+            "clock_end": {
+              "power_w": 279.0,
+              "sclk_dpm_mhz": 3163.0,
+              "sclk_hwmon_mhz": 3163.0,
+              "sclk_mhz": 3163.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736494,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 279.0,
+              "sclk_dpm_mhz": 3157.0,
+              "sclk_hwmon_mhz": 3157.0,
+              "sclk_mhz": 3157.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736447,
+              "temp_c": 58.0
+            },
+            "ratio": 0.9907204300007544,
+            "round": 6
+          },
+          {
+            "base_us": 286.74349933862686,
+            "cand_us": 283.9932590723038,
+            "clock_end": {
+              "power_w": 279.0,
+              "sclk_dpm_mhz": 3158.0,
+              "sclk_hwmon_mhz": 3158.0,
+              "sclk_mhz": 3158.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736541,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 279.0,
+              "sclk_dpm_mhz": 3163.0,
+              "sclk_hwmon_mhz": 3163.0,
+              "sclk_mhz": 3163.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736494,
+              "temp_c": 58.0
+            },
+            "ratio": 0.9904087092726896,
+            "round": 7
+          },
+          {
+            "base_us": 286.67350113391876,
+            "cand_us": 284.013494849205,
+            "clock_end": {
+              "power_w": 282.0,
+              "sclk_dpm_mhz": 3176.0,
+              "sclk_hwmon_mhz": 3176.0,
+              "sclk_mhz": 3176.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736588,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 279.0,
+              "sclk_dpm_mhz": 3158.0,
+              "sclk_hwmon_mhz": 3158.0,
+              "sclk_mhz": 3158.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736541,
+              "temp_c": 58.0
+            },
+            "ratio": 0.9907211295282184,
+            "round": 8
+          },
+          {
+            "base_us": 286.68349981307983,
+            "cand_us": 283.86299312114716,
+            "clock_end": {
+              "power_w": 279.0,
+              "sclk_dpm_mhz": 3167.0,
+              "sclk_hwmon_mhz": 3167.0,
+              "sclk_mhz": 3167.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736635,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 282.0,
+              "sclk_dpm_mhz": 3176.0,
+              "sclk_hwmon_mhz": 3176.0,
+              "sclk_mhz": 3176.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736588,
+              "temp_c": 58.0
+            },
+            "ratio": 0.9901616008812099,
+            "round": 9
+          },
+          {
+            "base_us": 286.8737503886223,
+            "cand_us": 284.04349833726883,
+            "clock_end": {
+              "power_w": 282.0,
+              "sclk_dpm_mhz": 3175.0,
+              "sclk_hwmon_mhz": 3175.0,
+              "sclk_mhz": 3175.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736682,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 279.0,
+              "sclk_dpm_mhz": 3167.0,
+              "sclk_hwmon_mhz": 3167.0,
+              "sclk_mhz": 3167.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736635,
+              "temp_c": 58.0
+            },
+            "ratio": 0.9901341546672731,
+            "round": 10
+          },
+          {
+            "base_us": 286.81349754333496,
+            "cand_us": 284.11325067281723,
+            "clock_end": {
+              "power_w": 280.0,
+              "sclk_dpm_mhz": 3174.0,
+              "sclk_hwmon_mhz": 3174.0,
+              "sclk_mhz": 3174.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736729,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 282.0,
+              "sclk_dpm_mhz": 3175.0,
+              "sclk_hwmon_mhz": 3175.0,
+              "sclk_mhz": 3175.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736682,
+              "temp_c": 58.0
+            },
+            "ratio": 0.9905853563599818,
+            "round": 11
+          },
+          {
+            "base_us": 286.763496696949,
+            "cand_us": 284.04325246810913,
+            "clock_end": {
+              "power_w": 282.0,
+              "sclk_dpm_mhz": 3183.0,
+              "sclk_hwmon_mhz": 3183.0,
+              "sclk_mhz": 3183.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736776,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 280.0,
+              "sclk_dpm_mhz": 3174.0,
+              "sclk_hwmon_mhz": 3174.0,
+              "sclk_mhz": 3174.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736729,
+              "temp_c": 58.0
+            },
+            "ratio": 0.9905139801258783,
+            "round": 12
+          },
+          {
+            "base_us": 286.7335006594658,
+            "cand_us": 284.14350003004074,
+            "clock_end": {
+              "power_w": 286.0,
+              "sclk_dpm_mhz": 3188.0,
+              "sclk_hwmon_mhz": 3188.0,
+              "sclk_mhz": 3188.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736823,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 282.0,
+              "sclk_dpm_mhz": 3183.0,
+              "sclk_hwmon_mhz": 3183.0,
+              "sclk_mhz": 3183.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736776,
+              "temp_c": 58.0
+            },
+            "ratio": 0.990967220002308,
+            "round": 13
+          },
+          {
+            "base_us": 286.89349442720413,
+            "cand_us": 283.8829979300499,
+            "clock_end": {
+              "power_w": 284.0,
+              "sclk_dpm_mhz": 3193.0,
+              "sclk_hwmon_mhz": 3193.0,
+              "sclk_mhz": 3193.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736870,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 286.0,
+              "sclk_dpm_mhz": 3188.0,
+              "sclk_hwmon_mhz": 3188.0,
+              "sclk_mhz": 3188.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537736823,
+              "temp_c": 58.0
+            },
+            "ratio": 0.9895065710598812,
+            "round": 14
+          }
+        ],
+        "rounds_faster": 15,
+        "rounds_slower": 0,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 21.603901939624844,
+          "baseline_tflops": 8.775826348235045,
+          "baseline_us": {
+            "max": 293.7229871749878,
+            "mean": 286.82651691966595,
+            "median": 286.7630124092102,
+            "min": 285.00300645828247,
+            "p90": 287.6429855823517
+          },
+          "calls_per_arm": 900,
+          "candidate_gbps": 21.81078109148536,
+          "candidate_tflops": 8.859863737261886,
+          "candidate_us": {
+            "max": 292.8830087184906,
+            "mean": 284.16167146629743,
+            "median": 284.04301404953003,
+            "min": 282.12401270866394,
+            "p90": 285.28401255607605
+          },
+          "flush": false,
+          "n": 30,
+          "rounds": 15,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 6195200.0,
+        "flops": 2516582400.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": true
+      },
+      "bytes_per_call": 19558400,
+      "footprint_bytes": 244648804,
+      "geometry_base": {
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          5120,
+          216,
+          1
+        ],
+        "grid_workgroups": [
+          40,
+          216,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          5120,
+          216,
+          1
+        ],
+        "grid_workgroups": [
+          20,
+          216,
+          1
+        ],
+        "lds_dynamic_bytes": 17920
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 35389440
+      },
+      "identity_mode": "full",
+      "launch_rows": 3456,
+      "p_faster": 0.000030517578125,
+      "p_slower": 1.0,
+      "ratio_median": 0.9778726520466194,
+      "regime": "pool",
+      "rows": 256,
+      "same_geometry": false,
+      "shape": "M2560-K1280-n_experts128-tokens256-topk6",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1024,
+            "format": "moe_grouped.expert_ptr_table.u64",
+            "name": "expert_weight_ptrs",
+            "recipe": "ExpertPtrTable"
+          },
+          {
+            "access": "read_only",
+            "bytes": 864,
+            "format": "moe_grouped.expert_tile_ids.i32.per_tile16",
+            "name": "expert_tile_ids",
+            "recipe": "TileIds"
+          },
+          {
+            "access": "read_only",
+            "bytes": 516,
+            "format": "moe_grouped.expert_offsets.i32.e_plus_1",
+            "name": "expert_offsets",
+            "recipe": "ExpertOffsets"
+          },
+          {
+            "access": "read_only",
+            "bytes": 13824,
+            "format": "moe_grouped.sorted_slot_index.i32.minus1_padding",
+            "name": "sorted_slot_index",
+            "recipe": "SortedSlots"
+          },
+          {
+            "access": "read_only",
+            "bytes": 2088960,
+            "format": "block_i8_128.kb_x_n.136b",
+            "name": "Xq",
+            "recipe": "BlockI8"
+          },
+          {
+            "access": "write_only",
+            "bytes": 35389440,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 1280,
+          "M": 2560,
+          "m_total": 3456,
+          "n_experts": 128,
+          "x_row_div": 1,
+          "x_src_rows": 1536
+        },
+        "routing": {
+          "live_rows": 2656,
+          "live_tiles": 166,
+          "max_tiles_per_expert": 11,
+          "n_experts": 128,
+          "partial_tiles": 115,
+          "route": {
+            "id": "f04870667e6b905ca0cd23753ded809981fe19f563f488dbbf3de223068a60ab",
+            "kind": "hist",
+            "layer": null,
+            "path": "/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json"
+          },
+          "route_seed": 7885632933165233524,
+          "slab_bytes": 1740800,
+          "tokens": 256,
+          "topk": 6,
+          "touched_experts": 119
+        },
+        "timing_pool": {
+          "bytes_per_set": 224911360,
+          "dispatch_i_uses_set": "i % sets",
+          "sets": 1,
+          "total_bytes": 224911360
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3078Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 1434Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "clock_summary": {
+          "power_w": {
+            "max": 308.0,
+            "median": 300.0,
+            "min": 60.0,
+            "n": 16
+          },
+          "samples": 16,
+          "sclk_mhz": {
+            "max": 3132.0,
+            "median": 3080.0,
+            "min": 1434.0,
+            "n": 16
+          },
+          "temp_c": {
+            "max": 59.0,
+            "median": 59.0,
+            "min": 58.0,
+            "n": 16
+          }
+        },
+        "p_faster": 0.000030517578125,
+        "p_slower": 1.0,
+        "ratio_max": 0.9790346885783757,
+        "ratio_median": 0.9778726520466194,
+        "ratio_min": 0.9749297225357958,
+        "rounds": [
+          {
+            "base_us": 444.2952498793602,
+            "cand_us": 433.18499624729156,
+            "clock_end": {
+              "power_w": 273.0,
+              "sclk_dpm_mhz": 2895.0,
+              "sclk_hwmon_mhz": 2895.0,
+              "sclk_mhz": 2895.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737116,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 60.0,
+              "sclk_dpm_mhz": 1434.0,
+              "sclk_hwmon_mhz": 1434.0,
+              "sclk_mhz": 1434.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737046,
+              "temp_c": 58.0
+            },
+            "ratio": 0.9749935349633259,
+            "round": 0
+          },
+          {
+            "base_us": 442.7250027656555,
+            "cand_us": 431.66500329971313,
+            "clock_end": {
+              "power_w": 307.0,
+              "sclk_dpm_mhz": 3132.0,
+              "sclk_hwmon_mhz": 3132.0,
+              "sclk_mhz": 3132.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737186,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 273.0,
+              "sclk_dpm_mhz": 2895.0,
+              "sclk_hwmon_mhz": 2895.0,
+              "sclk_mhz": 2895.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737116,
+              "temp_c": 58.0
+            },
+            "ratio": 0.9750183536126223,
+            "round": 1
+          },
+          {
+            "base_us": 442.2449991106987,
+            "cand_us": 431.8149983882904,
+            "clock_end": {
+              "power_w": 307.0,
+              "sclk_dpm_mhz": 3127.0,
+              "sclk_hwmon_mhz": 3127.0,
+              "sclk_mhz": 3127.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737256,
+              "temp_c": 58.0
+            },
+            "clock_start": {
+              "power_w": 307.0,
+              "sclk_dpm_mhz": 3132.0,
+              "sclk_hwmon_mhz": 3132.0,
+              "sclk_mhz": 3132.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737186,
+              "temp_c": 58.0
+            },
+            "ratio": 0.9764157859481017,
+            "round": 2
+          },
+          {
+            "base_us": 442.64525175094604,
+            "cand_us": 431.73499405384064,
+            "clock_end": {
+              "power_w": 307.0,
+              "sclk_dpm_mhz": 3121.0,
+              "sclk_hwmon_mhz": 3121.0,
+              "sclk_mhz": 3121.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737326,
+              "temp_c": 59.0
+            },
+            "clock_start": {
+              "power_w": 307.0,
+              "sclk_dpm_mhz": 3127.0,
+              "sclk_hwmon_mhz": 3127.0,
+              "sclk_mhz": 3127.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737256,
+              "temp_c": 58.0
+            },
+            "ratio": 0.9753521411244144,
+            "round": 3
+          },
+          {
+            "base_us": 442.7652433514595,
+            "cand_us": 431.66499584913254,
+            "clock_end": {
+              "power_w": 308.0,
+              "sclk_dpm_mhz": 3121.0,
+              "sclk_hwmon_mhz": 3121.0,
+              "sclk_mhz": 3121.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737396,
+              "temp_c": 59.0
+            },
+            "clock_start": {
+              "power_w": 307.0,
+              "sclk_dpm_mhz": 3121.0,
+              "sclk_hwmon_mhz": 3121.0,
+              "sclk_mhz": 3121.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737326,
+              "temp_c": 59.0
+            },
+            "ratio": 0.9749297225357958,
+            "round": 4
+          },
+          {
+            "base_us": 441.9250041246414,
+            "cand_us": 431.62499368190765,
+            "clock_end": {
+              "power_w": 306.0,
+              "sclk_dpm_mhz": 3120.0,
+              "sclk_hwmon_mhz": 3120.0,
+              "sclk_mhz": 3120.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737465,
+              "temp_c": 59.0
+            },
+            "clock_start": {
+              "power_w": 308.0,
+              "sclk_dpm_mhz": 3121.0,
+              "sclk_hwmon_mhz": 3121.0,
+              "sclk_mhz": 3121.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737396,
+              "temp_c": 59.0
+            },
+            "ratio": 0.9766928543381792,
+            "round": 5
+          },
+          {
+            "base_us": 441.4054974913597,
+            "cand_us": 431.8550005555153,
+            "clock_end": {
+              "power_w": 298.0,
+              "sclk_dpm_mhz": 3063.0,
+              "sclk_hwmon_mhz": 3063.0,
+              "sclk_mhz": 3063.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737535,
+              "temp_c": 59.0
+            },
+            "clock_start": {
+              "power_w": 306.0,
+              "sclk_dpm_mhz": 3120.0,
+              "sclk_hwmon_mhz": 3120.0,
+              "sclk_mhz": 3120.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737465,
+              "temp_c": 59.0
+            },
+            "ratio": 0.9783634390823794,
+            "round": 6
+          },
+          {
+            "base_us": 441.515251994133,
+            "cand_us": 432.0550039410591,
+            "clock_end": {
+              "power_w": 298.0,
+              "sclk_dpm_mhz": 3072.0,
+              "sclk_hwmon_mhz": 3072.0,
+              "sclk_mhz": 3072.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737604,
+              "temp_c": 59.0
+            },
+            "clock_start": {
+              "power_w": 298.0,
+              "sclk_dpm_mhz": 3063.0,
+              "sclk_hwmon_mhz": 3063.0,
+              "sclk_mhz": 3063.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737535,
+              "temp_c": 59.0
+            },
+            "ratio": 0.9785732247972272,
+            "round": 7
+          },
+          {
+            "base_us": 441.53499603271484,
+            "cand_us": 431.76499754190445,
+            "clock_end": {
+              "power_w": 300.0,
+              "sclk_dpm_mhz": 3075.0,
+              "sclk_hwmon_mhz": 3075.0,
+              "sclk_mhz": 3075.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737674,
+              "temp_c": 59.0
+            },
+            "clock_start": {
+              "power_w": 298.0,
+              "sclk_dpm_mhz": 3072.0,
+              "sclk_hwmon_mhz": 3072.0,
+              "sclk_mhz": 3072.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737604,
+              "temp_c": 59.0
+            },
+            "ratio": 0.9778726520466194,
+            "round": 8
+          },
+          {
+            "base_us": 441.46525114774704,
+            "cand_us": 431.62499368190765,
+            "clock_end": {
+              "power_w": 300.0,
+              "sclk_dpm_mhz": 3091.0,
+              "sclk_hwmon_mhz": 3091.0,
+              "sclk_mhz": 3091.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737743,
+              "temp_c": 59.0
+            },
+            "clock_start": {
+              "power_w": 300.0,
+              "sclk_dpm_mhz": 3075.0,
+              "sclk_hwmon_mhz": 3075.0,
+              "sclk_mhz": 3075.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737674,
+              "temp_c": 59.0
+            },
+            "ratio": 0.977710006755331,
+            "round": 9
+          },
+          {
+            "base_us": 441.73524528741837,
+            "cand_us": 431.97499960660934,
+            "clock_end": {
+              "power_w": 299.0,
+              "sclk_dpm_mhz": 3069.0,
+              "sclk_hwmon_mhz": 3069.0,
+              "sclk_mhz": 3069.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737813,
+              "temp_c": 59.0
+            },
+            "clock_start": {
+              "power_w": 300.0,
+              "sclk_dpm_mhz": 3091.0,
+              "sclk_hwmon_mhz": 3091.0,
+              "sclk_mhz": 3091.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737743,
+              "temp_c": 59.0
+            },
+            "ratio": 0.977904761313627,
+            "round": 10
+          },
+          {
+            "base_us": 441.4054974913597,
+            "cand_us": 431.8950027227402,
+            "clock_end": {
+              "power_w": 299.0,
+              "sclk_dpm_mhz": 3088.0,
+              "sclk_hwmon_mhz": 3088.0,
+              "sclk_mhz": 3088.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737882,
+              "temp_c": 59.0
+            },
+            "clock_start": {
+              "power_w": 299.0,
+              "sclk_dpm_mhz": 3069.0,
+              "sclk_hwmon_mhz": 3069.0,
+              "sclk_mhz": 3069.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737813,
+              "temp_c": 59.0
+            },
+            "ratio": 0.9784540636157217,
+            "round": 11
+          },
+          {
+            "base_us": 441.50499254465103,
+            "cand_us": 431.7749962210655,
+            "clock_end": {
+              "power_w": 299.0,
+              "sclk_dpm_mhz": 3082.0,
+              "sclk_hwmon_mhz": 3082.0,
+              "sclk_mhz": 3082.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737952,
+              "temp_c": 59.0
+            },
+            "clock_start": {
+              "power_w": 299.0,
+              "sclk_dpm_mhz": 3088.0,
+              "sclk_hwmon_mhz": 3088.0,
+              "sclk_mhz": 3088.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737882,
+              "temp_c": 59.0
+            },
+            "ratio": 0.9779617524424676,
+            "round": 12
+          },
+          {
+            "base_us": 441.3052424788475,
+            "cand_us": 431.7149892449379,
+            "clock_end": {
+              "power_w": 300.0,
+              "sclk_dpm_mhz": 3056.0,
+              "sclk_hwmon_mhz": 3056.0,
+              "sclk_mhz": 3056.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537738021,
+              "temp_c": 59.0
+            },
+            "clock_start": {
+              "power_w": 299.0,
+              "sclk_dpm_mhz": 3082.0,
+              "sclk_hwmon_mhz": 3082.0,
+              "sclk_mhz": 3082.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537737952,
+              "temp_c": 59.0
+            },
+            "ratio": 0.978268435742933,
+            "round": 13
+          },
+          {
+            "base_us": 441.2049949169159,
+            "cand_us": 431.9549947977066,
+            "clock_end": {
+              "power_w": 300.0,
+              "sclk_dpm_mhz": 3078.0,
+              "sclk_hwmon_mhz": 3078.0,
+              "sclk_mhz": 3078.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537738091,
+              "temp_c": 59.0
+            },
+            "clock_start": {
+              "power_w": 300.0,
+              "sclk_dpm_mhz": 3056.0,
+              "sclk_hwmon_mhz": 3056.0,
+              "sclk_mhz": 3056.0,
+              "sclk_source": "pp_dpm_sclk",
+              "t_unix_ms": 1793537738021,
+              "temp_c": 59.0
+            },
+            "ratio": 0.9790346885783757,
+            "round": 14
+          }
+        ],
+        "rounds_faster": 15,
+        "rounds_slower": 0,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 44.26129025229308,
+          "baseline_tflops": 22.780428675190677,
+          "baseline_us": {
+            "max": 448.5650062561035,
+            "mean": 442.1275877952568,
+            "median": 441.88499450683594,
+            "min": 439.3649995326996,
+            "p90": 443.6050057411194
+          },
+          "calls_per_arm": 900,
+          "candidate_gbps": 45.29452111049156,
+          "candidate_tflops": 23.312212582438548,
+          "candidate_us": {
+            "max": 440.8450126647949,
+            "mean": 431.9473100039687,
+            "median": 431.80498480796814,
+            "min": 428.9650022983551,
+            "p90": 433.32499265670776
+          },
+          "flush": false,
+          "n": 30,
+          "rounds": 15,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 19558400.0,
+        "flops": 10066329600.0
+      }
+    }
+  ],
+  "rowclasses_requested": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    256
+  ],
+  "rows_param": "tokens",
+  "same_geometry": false,
+  "schema": 1,
+  "selection": "generic_gemm.moe_grouped_qt44_a8_sym",
+  "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+  "symbol": "moe_grouped_qt44_a8_sym_gfx1201_nt2r1",
+  "tool": "hip_loop",
+  "vs": {
+    "baseline": {
+      "contract": "generic_gemm.moe_grouped_qt44_a8_sym",
+      "module": "moe_grouped_qt44_a8_sym_gfx12",
+      "symbol": "moe_grouped_qt44_a8_sym_gfx1201_nt2r1"
+    },
+    "candidate": {
+      "contract": "generic_gemm.moe_grouped_qt44_a8_sym_xlds_nt4r1w8",
+      "module": "moe_grouped_qt44_a8_sym_xlds_gfx12",
+      "symbol": "moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8"
+    }
+  }
+}

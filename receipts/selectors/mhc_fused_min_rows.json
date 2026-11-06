@@ -1,0 +1,12 @@
+{
+  "schema": "pm.selector_receipt.v1",
+  "constant": "MHC_FUSED_MIN_ROWS",
+  "value": 64,
+  "covers": true,
+  "arch": "gfx1201",
+  "card": "R9700 (fabric j5841, confounded=false)",
+  "summary": "Node bench bench_stream_mix_chain_gfx1201 (50 sites, 3 rounds, bit-identical to the unfused chain): the fused route+aggregate chain is faster than the unfused chain at every measured row count, chain ms/site rows 16/32/48/64/128/512/4096: unfused 0.169/0.169/0.169/0.177/0.179/0.233/2.048, fused-F32 0.150/0.151/0.152/0.156/0.158/0.207/1.707. The floor 64 is therefore conservative (the fused chain never loses at or above it); it is kept so decode and speculative verify rows (<= 16) keep the two-stage chain on the F32-stream path. BF16 stream planes (default) use the fused kernel at every row count.",
+  "records": [
+    {"path": "receipts/selectors/evidence/mhc_fused_rows_sweep_gfx1201.txt", "sha256": "b9485f0c0cc1a12df39c0c6431757cec823adf850cc52bdb6d45afbeb02fcc42"}
+  ]
+}

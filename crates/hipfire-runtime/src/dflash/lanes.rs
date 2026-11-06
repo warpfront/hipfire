@@ -247,12 +247,12 @@ fn lane_fc_fill(
     cached_rows: usize,
 ) -> HipResult<()> {
     let h = cfg.hidden;
-    let ne = cfg.num_extract();
+    let fw = cfg.feature_width();
     let eps = cfg.norm_eps;
     let fc_start = cached_rows.max(l.saturating_sub(swa_w));
     if l.saturating_sub(fc_start) > 0 {
         for (_row0, slot0, len) in ring_segments(fc_start, l, swa_w) {
-            let th_slice = ls.target_hidden.sub_offset(slot0 * ne * h, len * ne * h);
+            let th_slice = ls.target_hidden.sub_offset(slot0 * fw, len * fw);
             let thp_slice = ls.target_hidden_proj.sub_offset(slot0 * h, len * h);
             // Per-lane fc projection (`len` rows): singleton route, outside
             // the batched 64-row scope.
@@ -549,8 +549,8 @@ fn plan_fc(
     lanes: &[DraftLane<'_>],
 ) -> Option<RowPlan> {
     let ws = shared.lane_ws.as_ref()?;
-    let (h, ne) = (cfg.hidden, cfg.num_extract());
-    if weights.fc.k != ne * h || weights.fc.m != h || ne * h > ws.input_width {
+    let (h, fw) = (cfg.hidden, cfg.feature_width());
+    if weights.fc.k != fw || weights.fc.m != h || fw > ws.input_width {
         return None;
     }
     let mut plan = RowPlan::new();
@@ -571,7 +571,7 @@ fn plan_fc(
         plan.begin_lane();
         for (_row0, slot0, len) in ring_segments(fc_start, l, swa_w) {
             let seg = RowSeg {
-                src: elem_ptr(&ls.target_hidden, slot0 * ne * h),
+                src: elem_ptr(&ls.target_hidden, slot0 * fw),
                 dst0: elem_ptr(&ls.target_hidden_proj, slot0 * h),
                 dst1: 0,
                 positions: 0,
@@ -602,7 +602,7 @@ fn fc_batched(
 ) -> HipResult<()> {
     let ws = shared.lane_ws.as_ref().expect("lane workspace");
     let h = cfg.hidden;
-    let k = cfg.num_extract() * h;
+    let k = cfg.feature_width();
     let gather = gather_spans(plan);
     gpu.draft_rows_gather_f32(&ws.input, None, &gather[..plan.ns], k)?;
     pool_gemm(gpu, shared, &weights.fc, &ws.input, &ws.fc_out, plan)?;
@@ -869,7 +869,7 @@ fn lane_attention(
 /// the GEMM reads them, in the same call and on the single stream, and
 /// nothing reads it afterwards), and `gemm_dispatch` chunks by the element
 /// count of the buffer, which is identical for every `DflashScratch`
-/// (`MQ_X_ROT_CHUNK_ROWS × max(inter, q_dim, num_extract × hidden)`,
+/// (`MQ_X_ROT_CHUNK_ROWS × max(inter, q_dim, feature_width)`,
 /// independent of block/context size) — so chunking, kernels and row order
 /// are unchanged. A lane that does own a rotation buffer must match the
 /// shared one in shape (checked), and MQ draft weights with no shared

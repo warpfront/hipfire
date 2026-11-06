@@ -519,6 +519,8 @@ impl Model {
         // The GPU arch drives `memory.ple_format = auto` and the S1 selector;
         // initialising it allocates no model memory, so admission still
         // precedes every upload.
+        // Daemon parity: keep host-mapped expert memory out of reclaim before the first HIP call (KFD userptr eviction stalls, ROCm/rocm-systems#12528).
+        hipfire_loader::prepare_host_memory_for(path);
         let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
         if s1_mode != hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::Off
             && !hot_flags
@@ -575,6 +577,13 @@ impl Model {
         let trunk_overlay =
             hipfire_arch_qwen4::resolve_trunk_overlay(&hfq, path, &gpu.arch, &receipt.config)
                 .map_err(|e| format!("qwen4 trunk overlay: {e}"))?;
+        let hc8_sidecar = hipfire_arch_qwen4::resolve_hc8_sidecar(
+            &hfq,
+            path,
+            gpu.flags.qwen4_hc8_enabled(),
+            &receipt.config,
+        )
+        .map_err(|e| format!("qwen4 hc8 sidecar: {e}"))?;
         // A rank-order table is served through its store (no shard
         // descriptors); every other source reads through 128 descriptors.
         let rank_table = receipt.ple_rows.rank_table().is_some();
@@ -948,6 +957,12 @@ impl Model {
             bundle
                 .attach_trunk_overlay(overlay)
                 .map_err(|e| format!("qwen4 trunk overlay: {e}"))?;
+        }
+        // `<model>.hc8` (E4M3 HC mixer rows): controlled only by HIPFIRE_QWEN4_HC8.
+        if let Some(sidecar) = hc8_sidecar {
+            bundle
+                .attach_hc8_sidecar(sidecar)
+                .map_err(|e| format!("qwen4 hc8 sidecar: {e}"))?;
         }
         bundle
             .attach_forward(&mut gpu, n_ctx, scratch_mode)

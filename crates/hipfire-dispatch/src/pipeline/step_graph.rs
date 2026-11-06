@@ -148,6 +148,8 @@ pub enum OpKind {
     SwaStage = 54,
     /// [`Step::LaneAttention`] (#666 G10 slice 2, LFM2 decode lanes).
     LaneAttention = 55,
+    /// [`Step::RowGather`] (Flash-Next EP2 sequence-parallel prefill row all-gather).
+    RowGather = 56,
     /// Hand-route ops with no `Step` variant yet (dense TP decode): residual add.
     ResidualAdd = 1000,
     /// [`Step::SiluMul`]; also the hand-route SiLU-mul.
@@ -215,6 +217,7 @@ pub fn op_kind_of(step: &Step<'_>) -> OpKind {
         Step::BlockStage(..) => OpKind::BlockStage,
         Step::SwaStage(..) => OpKind::SwaStage,
         Step::LaneAttention(..) => OpKind::LaneAttention,
+        Step::RowGather(..) => OpKind::RowGather,
         Step::CompressorProject(..) => OpKind::CompressorProject,
     }
 }
@@ -686,6 +689,7 @@ mod tests {
             (OpKind::BlockStage, 53),
             (OpKind::SwaStage, 54),
             (OpKind::LaneAttention, 55),
+            (OpKind::RowGather, 56),
             (OpKind::ResidualAdd, 1000),
             (OpKind::SiluMul, 1001),
             (OpKind::Argmax, 1002),

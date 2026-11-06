@@ -1,0 +1,39 @@
+{
+ "schema": "mtp-parity-cell/1",
+ "cell": "math-C1-greedy",
+ "engine": "hipfire EP2 mq4-xts singleton MTP",
+ "build": "beta-35461ed399",
+ "rep": 2,
+ "depths": [
+  {
+   "depth": 1,
+   "offered": 171,
+   "reached": 171,
+   "accepted": 153
+  },
+  {
+   "depth": 2,
+   "offered": 171,
+   "reached": 153,
+   "accepted": 141
+  },
+  {
+   "depth": 3,
+   "offered": 162,
+   "reached": 138,
+   "accepted": 132
+  }
+ ],
+ "steps": 171,
+ "committed": 762,
+ "window_ms": 41.66509659704889,
+ "window_ms_source": "client (wall-first token) / trace windows",
+ "extra": {
+  "requests": 3,
+  "concurrency": 1,
+  "source": "HIPFIRE_MTP_TRACE",
+  "windows_by_source": {
+   "mtp": 171
+  }
+ }
+}

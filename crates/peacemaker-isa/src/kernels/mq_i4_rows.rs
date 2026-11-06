@@ -5,7 +5,8 @@
 //! Exact one-row-per-workgroup decode GEMV over MQ3-I4 / MQ2-I4 planar tensors
 //! (HFQ qt=131..=134), emitted with the checked ISA builder for gfx1201 only:
 //! four symbols `mq_i4_rows_{w3,w2}_{r256,r128}` in the module
-//! `mq_i4_rows_pm_gfx1201` (committed image `kernels/mq_i4_rows_pm_gfx1201.hxaco`).
+//! `mq_i4_rows_pm_gfx1201` (no standalone image is committed: its W3 arithmetic ships inside the
+//! dispatched `mq_i4_moe_gemv_pm_gfx1201` K1 lane-union GEMV).
 //!
 //! ABI (32-byte kernarg segment, identical for all four symbols): `codes@0`
 //! (read-only pointer to the planar tensor), `x@8` (read-only pointer, `K` f32,

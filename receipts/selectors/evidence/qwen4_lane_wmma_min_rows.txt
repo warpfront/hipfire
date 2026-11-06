@@ -1,0 +1,8 @@
+R9700 gfx1201, Flash-Next layer 4, cold weights, min us. Source: hcwmma_screen job t3 (+ t1 for shared down), /home/kaden/qcal/release-0.4.5/hcwmma/screen/t3/0/bench.json
+rows  hc_down(incumbent vs lane_wmma)  hc_up(incumbent vs lane_wmma)
+8     15.91 vs 16.74                   17.36 vs 16.22
+16    21.28 vs 17.72                   24.03 vs 16.47
+24    27.30 vs 20.52                   31.25 vs 19.81
+32    31.43 vs 22.04                   37.91 vs 19.93
+48    44.77 vs 26.25                   51.34 vs 23.04
+shared down (t1, incumbent vs lane_wmma): 16: 11.13 vs 7.12 (2 terms); 48: 24.93 vs 10.79

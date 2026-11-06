@@ -24,7 +24,7 @@
 
 use crate::families::moe::MOE_GROUPED_BLOCK_M;
 use crate::pipeline::slowlink_prefill::{LayerRoutePlan, PanelRange};
-use crate::sp_plan::{plan_layer_split, SplitCost, SplitPlan, NUM_EXPERTS, ROUTE_TOPK};
+use crate::sp_plan::{plan_layer_split_weighted, SplitCost, SplitPlan, NUM_EXPERTS, ROUTE_TOPK};
 use crate::types::DispatchError;
 
 fn bail(message: impl std::fmt::Display) -> DispatchError {
@@ -153,8 +153,71 @@ pub fn plan_sp_layer(
     cost: &SplitCost,
     limits: SpLimits,
 ) -> Result<SpLayerPlan, DispatchError> {
+    plan_sp_layer_pinned(plan, sorted, rows, cost, limits, &[])
+}
+
+/// [`plan_sp_layer`] where `pinned[e]` experts can never run on the CPU arm (a hot-set tier
+/// layer's device-resident experts have no host bytes; the ring copies them device-to-device at
+/// VRAM speed). The placement is planned over the other experts' counts, then every active pinned
+/// expert joins the streamed set (`stream_ids` ascending, `k`/`n_active` counting it), so the GPU
+/// arm reads it from its group page exactly like a streamed one. An empty `pinned` is
+/// [`plan_sp_layer`].
+pub fn plan_sp_layer_pinned(
+    plan: &LayerRoutePlan,
+    sorted: &[i32],
+    rows: usize,
+    cost: &SplitCost,
+    limits: SpLimits,
+    pinned: &[bool],
+) -> Result<SpLayerPlan, DispatchError> {
+    plan_sp_layer_weighted(plan, sorted, rows, cost, limits, pinned, &[])
+}
+
+/// [`plan_sp_layer_pinned`] where expert `e` costs `stream_scale[e]` streamed-expert units
+/// ([`plan_layer_split_weighted`]): a mixed-codec slab layer streams its W3 experts for less
+/// link time than its MQ4 ones. An empty `stream_scale` is [`plan_sp_layer_pinned`].
+pub fn plan_sp_layer_weighted(
+    plan: &LayerRoutePlan,
+    sorted: &[i32],
+    rows: usize,
+    cost: &SplitCost,
+    limits: SpLimits,
+    pinned: &[bool],
+    stream_scale: &[f64],
+) -> Result<SpLayerPlan, DispatchError> {
+    if !stream_scale.is_empty() && stream_scale.len() != NUM_EXPERTS {
+        return Err(bail(format!(
+            "the stream scale has {} entries, the layer {NUM_EXPERTS}",
+            stream_scale.len()
+        )));
+    }
     let exact = validated_counts(plan, sorted, rows, limits)?;
-    let split = plan_layer_split(&exact, cost);
+    if !pinned.is_empty() && pinned.len() != NUM_EXPERTS {
+        return Err(bail(format!(
+            "the pinned mask has {} entries, the layer {NUM_EXPERTS}",
+            pinned.len()
+        )));
+    }
+    let mut split = if pinned.iter().any(|&p| p) {
+        let free: Vec<u32> = exact
+            .iter()
+            .zip(pinned)
+            .map(|(&count, &pin)| if pin { 0 } else { count })
+            .collect();
+        let mut split = plan_layer_split_weighted(&free, cost, stream_scale);
+        let extra: Vec<u16> = (0..NUM_EXPERTS)
+            .filter(|&e| pinned[e] && exact[e] > 0)
+            .map(|e| e as u16)
+            .collect();
+        split.k += extra.len();
+        split.n_active += extra.len();
+        split.stream_ids.extend(extra);
+        split.stream_ids.sort_unstable();
+        split
+    } else {
+        plan_layer_split_weighted(&exact, cost, stream_scale)
+    };
+    split.stream_ids.dedup();
     assemble(plan, sorted, rows, split, limits)
 }
 
@@ -688,6 +751,48 @@ mod tests {
             .unwrap()
             .iter()
             .all(|&c| c == 0));
+    }
+
+    #[test]
+    fn sp_layer_pinned_experts_never_take_a_cpu_slot_and_always_stream() {
+        let mut rng = Rng(0x7157);
+        let ids = random_ids(&mut rng, 64, NUM_EXPERTS, 40, false);
+        let g = group_reference(&ids, NUM_EXPERTS, 0);
+        let cost = SplitCost::sp_hook_xtx(64, 2560, 16);
+        // Every third expert is pinned (a tier layer's device-resident ones).
+        let pinned: Vec<bool> = (0..NUM_EXPERTS).map(|e| e % 3 == 0).collect();
+        let free = plan_sp_layer(&g.plan, &g.sorted, 64, &cost, SpLimits::S1_XTX).unwrap();
+        let p =
+            plan_sp_layer_pinned(&g.plan, &g.sorted, 64, &cost, SpLimits::S1_XTX, &pinned).unwrap();
+        // The generic property checker holds on the merged plan.
+        check(&g, &ids, &p, SpLimits::S1_XTX);
+        for e in 0..NUM_EXPERTS {
+            if pinned[e] && g.truth[e] > 0 {
+                assert!(
+                    p.split.stream_ids.binary_search(&(e as u16)).is_ok(),
+                    "expert {e}"
+                );
+            }
+            if pinned[e] {
+                assert_eq!(p.split.cpu_mask[e], 0, "pinned expert {e} on the CPU");
+            }
+        }
+        assert!(p.split.stream_ids.windows(2).all(|w| w[0] < w[1]));
+        // No pinned expert is ever worse off than unpinned on the others: the CPU set only
+        // shrinks to non-pinned experts.
+        assert!(p.cpu_rows.len() <= free.cpu_rows.len() + g.truth.iter().sum::<u32>() as usize);
+        // An empty or all-false mask is the unpinned plan.
+        let none = vec![false; NUM_EXPERTS];
+        assert_eq!(
+            plan_sp_layer_pinned(&g.plan, &g.sorted, 64, &cost, SpLimits::S1_XTX, &none)
+                .unwrap()
+                .split,
+            free.split
+        );
+        // A mask of the wrong length is refused.
+        assert!(
+            plan_sp_layer_pinned(&g.plan, &g.sorted, 64, &cost, SpLimits::S1_XTX, &[true]).is_err()
+        );
     }
 
     #[test]

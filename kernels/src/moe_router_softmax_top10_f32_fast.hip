@@ -91,29 +91,24 @@ __device__ __forceinline__ void router_wave_sync() {
 
 #define ROUTER_TOKENS_PER_BLOCK 8
 
-__launch_bounds__(256)
-extern "C" __global__ void moe_router_softmax_top10_f32_fast(
+// One wave32's whole token: logits -> top ten -> softmax -> weights.  Shared by the
+// standalone kernel below and the fused route+scatter kernel
+// (moe_route_scatter_top10_f32_gfx1201.hip), so both run the same text.  `s_exp` is the
+// wave's own 512-float LDS row.  No workgroup barrier; every `return` leaves only this wave's
+// work (the caller owns any barrier that follows).
+__device__ __forceinline__ void router_fast_token(
     const float* __restrict__ logits, // [tokens, 512]
     int* __restrict__ topk_idx,       // [tokens, 10]
     float* __restrict__ topk_w,       // [tokens, 10]
-    int n_exp,
-    int top_k,
+    float* __restrict__ s_exp,        // this wave's [512] LDS row
     int normalize_topk_prob,
     int round_logits,
-    int tokens,
-    unsigned long long* __restrict__ fault, // host-mapped router fault word, or null
-    int layer,                              // sealed call layer index
-    int row_base                            // global row of this launch's row 0
+    int token,
+    int lane,
+    unsigned long long* __restrict__ fault,
+    int layer,
+    int row_base
 ) {
-    __shared__ float s_exps[ROUTER_TOKENS_PER_BLOCK][512];
-
-    // Uniform across the workgroup; no workgroup barrier is used below.
-    if (n_exp != 512 || top_k != 10) return;
-    const int lane = threadIdx.x & 31;
-    const int wave = threadIdx.x >> 5;
-    const int token = blockIdx.x * ROUTER_TOKENS_PER_BLOCK + wave;
-    if (token >= tokens) return;
-
     const float* row = logits + (size_t)token * 512;
     float x[16];
 #pragma unroll
@@ -167,10 +162,10 @@ extern "C" __global__ void moe_router_softmax_top10_f32_fast(
     // 512 exponentials in parallel, then the incumbent's left-to-right sum.
     const float max_logit = bv[0];
 #pragma unroll
-    for (int j = 0; j < 16; ++j) s_exps[wave][lane + 32 * j] = expf(x[j] - max_logit);
+    for (int j = 0; j < 16; ++j) s_exp[lane + 32 * j] = expf(x[j] - max_logit);
     router_wave_sync();
     if (lane == 0) {
-        const float4* e4 = reinterpret_cast<const float4*>(s_exps[wave]);
+        const float4* e4 = reinterpret_cast<const float4*>(s_exp);
         float denom = 0.0f;
 #pragma unroll 8
         for (int q = 0; q < 128; ++q) {
@@ -209,4 +204,30 @@ extern "C" __global__ void moe_router_softmax_top10_f32_fast(
             topk_w[output_base + rank] =
                 round_logits != 0 ? router_bf16_rt(probabilities[rank]) : probabilities[rank];
     }
+}
+
+__launch_bounds__(256)
+extern "C" __global__ void moe_router_softmax_top10_f32_fast(
+    const float* __restrict__ logits, // [tokens, 512]
+    int* __restrict__ topk_idx,       // [tokens, 10]
+    float* __restrict__ topk_w,       // [tokens, 10]
+    int n_exp,
+    int top_k,
+    int normalize_topk_prob,
+    int round_logits,
+    int tokens,
+    unsigned long long* __restrict__ fault, // host-mapped router fault word, or null
+    int layer,                              // sealed call layer index
+    int row_base                            // global row of this launch's row 0
+) {
+    __shared__ float s_exps[ROUTER_TOKENS_PER_BLOCK][512];
+
+    // Uniform across the workgroup; no workgroup barrier is used below.
+    if (n_exp != 512 || top_k != 10) return;
+    const int lane = threadIdx.x & 31;
+    const int wave = threadIdx.x >> 5;
+    const int token = blockIdx.x * ROUTER_TOKENS_PER_BLOCK + wave;
+    if (token >= tokens) return;
+    router_fast_token(logits, topk_idx, topk_w, s_exps[wave], normalize_topk_prob, round_logits,
+                      token, lane, fault, layer, row_base);
 }

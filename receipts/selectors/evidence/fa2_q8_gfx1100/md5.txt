@@ -1,0 +1,3 @@
+12380680b6f80767620b5386623d20fa  /home/kaden/qcal/release-0.4.5/xtx-longctx/bin/g11a/hip_loop
+33c90d946ba09e5178dbece79bf9b781  /home/kaden/qcal/release-0.4.5/xtx-longctx/wt/kernels/src/latent_attention_flash_fa2_q8.gfx1100.hip
+dc97c2e250473a4aa916f3fda6e123ce  /home/kaden/qcal/release-0.4.5/xtx-longctx/wt/kernels/src/latent_attention_flash.hip

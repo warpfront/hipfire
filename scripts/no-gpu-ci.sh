@@ -74,6 +74,10 @@ python3 scripts/check-env-docs.py
 echo "== Lifecycle check (deprecated surfaces opt-in; env/config lifecycle status) =="
 python3 scripts/check-lifecycle.py
 
+echo "== MTP parity fixture bytes + ratchet self-test =="
+python3 scripts/check-mtp-parity-ratchet.py --self-test
+python3 scripts/check-mtp-parity-ratchet.py fixture
+
 echo "== Leaked hipfire processes =="
 # A test that execs a workspace-built hipfire/daemon must not leave it running.
 if leaked=$(pgrep -af "(^| )$ROOT/target/[^ ]*/(hipfire|daemon)( |$)"); then

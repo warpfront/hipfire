@@ -66,10 +66,13 @@ pub enum DeviceWaitSite {
     HcControlRsqrtOnce = 8,
     TpPeerPushGfx1201 = 9,
     TpPeerPushNGfx1201 = 10,
+    ArHcWriteGfx1201 = 11,
+    SpHcRsGfx1201 = 12,
+    SpAgRowsGfx1201 = 13,
 }
 
 impl DeviceWaitSite {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 13] = [
         Self::TpSignalWait2Gfx1201,
         Self::TpSignalWait3Gfx1201,
         Self::TpSignalBarrierGfx1100,
@@ -80,6 +83,9 @@ impl DeviceWaitSite {
         Self::HcControlRsqrtOnce,
         Self::TpPeerPushGfx1201,
         Self::TpPeerPushNGfx1201,
+        Self::ArHcWriteGfx1201,
+        Self::SpHcRsGfx1201,
+        Self::SpAgRowsGfx1201,
     ];
 
     pub fn from_code(code: u32) -> Option<Self> {
@@ -99,6 +105,9 @@ impl DeviceWaitSite {
             Self::HcControlRsqrtOnce => "HC_CONTROL_RSQRT_ONCE",
             Self::TpPeerPushGfx1201 => "TP_PEER_PUSH_GFX1201",
             Self::TpPeerPushNGfx1201 => "TP_PEER_PUSHN_GFX1201",
+            Self::ArHcWriteGfx1201 => "AR_HC_WRITE_GFX1201",
+            Self::SpHcRsGfx1201 => "SP_HC_RS_GFX1201",
+            Self::SpAgRowsGfx1201 => "SP_AG_ROWS_GFX1201",
         }
     }
 
@@ -116,6 +125,9 @@ impl DeviceWaitSite {
             Self::HcControlRsqrtOnce => "hc_compute_control_vec4_finalize (rsqrt_once)",
             Self::TpPeerPushGfx1201 => "tp2_peer_push_reduce_gfx1201",
             Self::TpPeerPushNGfx1201 => "tp_peer_pushn_reduce_bf16_gfx1201",
+            Self::ArHcWriteGfx1201 => "ar_hc_write_gfx1201",
+            Self::SpHcRsGfx1201 => "sp_hc_rs_d8_gfx1201",
+            Self::SpAgRowsGfx1201 => "sp_ag_rows_bf16_d8_gfx1201",
         }
     }
 
@@ -126,8 +138,11 @@ impl DeviceWaitSite {
             | Self::TpSignalWait3Gfx1201
             | Self::TpSignalBarrierGfx1100
             | Self::TpSignalReduceGfx1100 => "a peer TP rank's barrier signal",
-            Self::TpPeerPushGfx1201 | Self::TpPeerPushNGfx1201 => {
+            Self::TpPeerPushGfx1201 | Self::TpPeerPushNGfx1201 | Self::ArHcWriteGfx1201 => {
                 "a peer TP rank's tagged partial granules"
+            }
+            Self::SpHcRsGfx1201 | Self::SpAgRowsGfx1201 => {
+                "a peer rank's dense sequence-parallel granules"
             }
             Self::RmsnormWavegridReady
             | Self::RmsnormAwqWavegridReady
@@ -144,7 +159,10 @@ impl DeviceWaitSite {
             Self::TpSignalBarrierGfx1100
             | Self::TpSignalReduceGfx1100
             | Self::TpPeerPushGfx1201
-            | Self::TpPeerPushNGfx1201 => "generation",
+            | Self::TpPeerPushNGfx1201
+            | Self::ArHcWriteGfx1201
+            | Self::SpHcRsGfx1201
+            | Self::SpAgRowsGfx1201 => "generation",
             Self::RmsnormAwqWavegridArrivals => "arrival",
             Self::RmsnormWavegridReady
             | Self::RmsnormAwqWavegridReady
@@ -320,7 +338,9 @@ mod tests {
     #[test]
     fn site_codes_match_the_device_header() {
         let mut defines = Vec::new();
-        for line in crate::kernels::DEVICE_WAIT_DEADLINE_H.lines() {
+        // The header defines sites 1..=11; the SP kernel file defines the rest. The SP module
+        // source is header + ar_hc_write + sp, so scanning it sees every define once.
+        for line in crate::kernels::SP_HC_RS_AG_GFX1201_SRC.lines() {
             let Some(rest) = line.strip_prefix("#define HF_WAIT_SITE_") else {
                 continue;
             };

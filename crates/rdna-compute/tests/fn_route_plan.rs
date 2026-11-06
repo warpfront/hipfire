@@ -169,11 +169,19 @@ fn layouts() -> Vec<Layout> {
         .collect()
 }
 
-/// Every (arch, layout) with a walked plan: the gfx1201 layouts, and the canonical
-/// header on gfx1100 (the XTX route walk, `route_plans/qwen3.8-flash-next.gfx1100.tsv`).
+/// Every (arch, layout) with a walked plan whose header the fixtures can rebuild: the gfx1201 layouts,
+/// the canonical header on gfx1100 (the old XTX route walk, `route_plans/qwen3.8-flash-next.gfx1100.tsv`)
+/// and the split header on gfx1100 (`route_plans/qwen3.8-flash-next-base.mq4-xts.gfx1100.tsv`: the shipped
+/// mq4-xts and the symtrunk-calib artifact share it). The mq3-xts slab header has no fixture; its plan is
+/// pinned by layout constant in `gfx1100_mq3_xts_plan`.
 fn cases() -> Vec<Layout> {
     let mut out = layouts();
     out.push(layout("canonical", "gfx1100", flash_next_header()));
+    out.push(layout(
+        "split",
+        "gfx1100",
+        split_header(&flash_next_header()),
+    ));
     out
 }
 
@@ -220,6 +228,7 @@ fn plan(load: &Load<'_>) -> Result<RouteKernelPlan, RegistryError> {
         hipcc_extra_flags: &load.flags.hipcc_extra_flags,
         flags: load.flags,
         route_axes: load.axes,
+        hc8_sidecar: false,
     })
 }
 
@@ -619,13 +628,14 @@ fn unknown_header_layout_has_no_walked_route() {
     }
 }
 
-/// The gfx1100 plan: the canonical header walked once on the XTX (q8 QSA and GDN
+/// The old gfx1100 plan: the canonical header walked on the XTX (q8 QSA and GDN
 /// state, legacy KV backend, `max_seq` 262,144), left open (a bounded walk never
-/// seals a route), and no other header has a gfx1100 route.
+/// seals a route); the split and mq3 slab headers have their own plans, any other
+/// header none.
 #[test]
 fn gfx1100_plan_is_the_canonical_header_walked_open_at_q8_legacy() {
     let canonical = layout("canonical", "gfx1100", flash_next_header());
-    assert_eq!(walked_plans("gfx1100").len(), 1);
+    assert_eq!(walked_plans("gfx1100").len(), GFX1100_PLANS);
     let plan = walked("gfx1100", &canonical.sha);
     assert_eq!(plan.max_seq, 262_144);
     assert!(plan.sealed.is_empty(), "a bounded walk never seals");
@@ -640,10 +650,11 @@ fn gfx1100_plan_is_the_canonical_header_walked_open_at_q8_legacy() {
             ("qsa_pooled_bf16", vec!["off"]),
         ]
     );
-    // The split header was walked on gfx1201 only.
-    let split = layouts().remove(1);
+    // A header none of the gfx1100 plans walked (the canonical one minus a single tensor) has no route.
+    let mut unknown = flash_next_header();
+    unknown.pop();
     let flags = builtin_flags("gfx1100");
-    let tensors = metas(&split.header);
+    let tensors = metas(&unknown);
     let axes = walked_axes(plan);
     for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
         match self::plan(&Load {
@@ -658,12 +669,15 @@ fn gfx1100_plan_is_the_canonical_header_walked_open_at_q8_legacy() {
                 assert!(why.contains("has no walked route"), "{spec:?}: {why}")
             }
             other => panic!(
-                "split on gfx1100 {spec:?}: {:?}",
+                "unknown header on gfx1100 {spec:?}: {:?}",
                 other.map(|p| p.entries.len())
             ),
         }
     }
 }
+
+/// Walked gfx1100 plans: the old canonical header, the split mq4-xts / symtrunk-calib header, the mq3-xts slab header.
+const GFX1100_PLANS: usize = 3;
 
 /// The gfx1100 route includes the kernels the XTX default route binds since the
 /// landed Peacemaker/lite work: the embedded MQ6 residual PM twin (`_w4`, `_w8`;
@@ -771,9 +785,11 @@ fn gfx1100_plan_carries_the_bf16_split_qsa_modules_on_both_routes() {
 /// a stale digest nor a source the loader would not load.
 #[test]
 fn gfx1100_hip_rows_hash_the_effective_source_the_loader_binds() {
-    let canonical = layout("canonical", "gfx1100", flash_next_header());
-    let walked = walked("gfx1100", &canonical.sha);
-    let (ar, mtp) = route_plans(&canonical);
+    // The split-header plan, walked on today's registry: the canonical plan's rows are historical walk-time
+    // digests (`moe_scatter_fused_top10` has changed source since) and are no longer this test's subject.
+    let split = layout("split", "gfx1100", split_header(&flash_next_header()));
+    let walked = walked("gfx1100", &split.sha);
+    let (ar, mtp) = route_plans(&split);
     let inventory = entries("gfx1100", &builtin_flags("gfx1100").hipcc_extra_flags).unwrap();
     let mut checked = 0;
     for (route, plan, native_mtp) in [("ar", &ar, false), ("native_mtp", &mtp, true)] {
@@ -836,5 +852,110 @@ fn gfx1100_hip_rows_hash_the_effective_source_the_loader_binds() {
             assert_eq!(sha_hex(source), row_sha, "{module}");
             assert!(plan.entries.iter().any(|e| e.module() == module));
         }
+    }
+}
+
+/// Header layout of the mq3-xts slab artifact (`qwen3.8-flash-next-base.mq3-xts`, 50,253 header tensors: per-expert
+/// slab entries; no fixture, pinned by this constant like `SPLIT_LAYOUT`).
+const MQ3_SLAB_LAYOUT: &str = "b59be130284d8667c8f519ab6696dcb35e7a1295f009f6c303cbfabcc87bdab3";
+
+/// Sorted `(route, module, symbol)` rows of a walked plan.
+fn plan_rows(plan: &WalkedRoutePlan) -> Vec<(bool, &'static str, &'static str)> {
+    let mut rows: Vec<_> = plan
+        .rows
+        .iter()
+        .flat_map(|row| {
+            row.symbols
+                .iter()
+                .map(move |symbol| (row.native_mtp, row.module, *symbol))
+        })
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
+/// The gfx1100 split-header plan (shipped mq4-xts and the symtrunk-calib artifact share the 65811e8a header):
+/// walked on the XTX at the product defaults (q8 QSA and GDN state, the VMM KV backend), open, with the
+/// S1 slow-link prefill, the BF16 split QSA selector and the IU4 sym route on both spec routes, so a cold
+/// load binds nothing after ready.
+#[test]
+fn gfx1100_split_plan_is_the_shipped_mq4_and_symtrunk_header_walked_at_the_product_defaults() {
+    assert_eq!(
+        SPLIT_LAYOUT,
+        layout("split", "gfx1100", split_header(&flash_next_header())).sha
+    );
+    let plan = walked("gfx1100", SPLIT_LAYOUT);
+    assert_eq!(
+        plan.max_seq, 262_144,
+        "walked at 40,960 (S1 + SP, the 32K depth prompt) and at 262,144"
+    );
+    assert!(plan.sealed.is_empty(), "a walk never seals a route");
+    assert_eq!(
+        plan.axes,
+        vec![
+            ("gdn", vec!["q8"]),
+            ("kv_backend", vec!["vmm"]),
+            ("qsa", vec!["q8"]),
+            ("qsa_f16_arena", vec!["off"]),
+            ("qsa_pooled_bf16", vec!["off"]),
+        ]
+    );
+    let split = layout("split", "gfx1100", split_header(&flash_next_header()));
+    let (ar, mtp) = route_plans(&split);
+    for (route, plan) in [("ar", &ar), ("native_mtp", &mtp)] {
+        let bound = bindings(plan);
+        for symbol in [
+            "slowlink_remap_sorted",
+            "slowlink_combine_panel",
+            "slowlink_combine_pad",
+            "indexed_attention_select_scores_rows8_bf16",
+            "qsa_filter_compact",
+            "qwen4_moe_sym_check_gfx1100",
+            "shared_expert_activation_bf16_f32",
+            "copy_f32_buffer",
+        ] {
+            assert!(
+                bound.contains_key(symbol),
+                "{route}: {symbol} is not planned"
+            );
+        }
+    }
+}
+
+/// The gfx1100 mq3-xts plan: the slab header walked on the XTX (S1 over the slab, the hybrid SP, the W3 / MQ4
+/// PM images, the D2 tier package), open, binding the embedded W3 PM images on both spec routes.
+#[test]
+fn gfx1100_mq3_xts_plan() {
+    let plan = walked("gfx1100", MQ3_SLAB_LAYOUT);
+    assert_eq!(plan.max_seq, 262_144);
+    assert!(plan.sealed.is_empty());
+    assert!(plan.heads.is_none());
+    assert_eq!(plan.axes, walked("gfx1100", SPLIT_LAYOUT).axes);
+    for native_mtp in [false, true] {
+        let embedded: Vec<&str> = plan
+            .rows
+            .iter()
+            .filter(|row| row.native_mtp == native_mtp && row.embedded)
+            .map(|row| row.module)
+            .collect();
+        for module in [
+            "qwen4_moe_iu4_sym_w3_pm_gfx1100",
+            "mq_i4_moe_gemv_mq3only_pm_gfx1100",
+            "mq_i4_moe_gemv_mq4only_pm_gfx1100",
+            "mq_i4_a4_pm_gfx1100",
+        ] {
+            assert!(
+                embedded.contains(&module),
+                "native_mtp={native_mtp}: {module} is not an embedded row"
+            );
+        }
+    }
+    // The MTP route carries every AR row (the walked MTP route falls back to AR).
+    let rows = plan_rows(plan);
+    for (_, module, symbol) in rows.iter().filter(|r| !r.0) {
+        assert!(
+            rows.iter().any(|r| r.0 && r.1 == *module && r.2 == *symbol),
+            "AR {module}::{symbol} missing from the MTP rows"
+        );
     }
 }

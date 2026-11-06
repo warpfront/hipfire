@@ -20,14 +20,15 @@
 //! out   = bf16( bf16( sum_{e ascending} bf16(expert_e) * w_e ) + shared )
 //! ```
 
+use crate::precision::{RaonPrecisionSite, RaonSiteTiers};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::moe::{GroupedMoeGeometry, MOE_GROUPED_MAX_TOP_K};
 use hipfire_dispatch::pipeline::{
     execute_gated_ffn, execute_grouped_moe, CastPolicy, CombineOrder, FfnActivation, GatedFfnOp,
     GroupedMoeGroupedScratch, GroupedMoeIndexedScratch, GroupedMoeOp, GroupedMoePolicy,
     GroupedMoeProtocol, GroupedMoeRouted, GroupedMoeRouter, GroupedMoeScratch,
-    GroupedMoeScratchPlan, GroupedMoeShared, GroupedMoeSharedScratch, RouterKind,
-    SharedExpertPolicy,
+    GroupedMoeScratchPlan, GroupedMoeShared, GroupedMoeSharedScratch, GroupedMoeSiteTiers,
+    RouterKind, SharedExpertPolicy, SingleExpertTableCache,
 };
 use hipfire_runtime::llama::WeightTensor;
 use rdna_compute::ffn_activation::single_expert_table_words;
@@ -52,6 +53,9 @@ pub struct RaonMoeDims {
     pub value_beta: f32,
     pub router_eps: f32,
     pub router_scale: f32,
+    /// Resolved prefill activation tier of every site (`HIPFIRE_RAON_PREFILL_PRECISION`, set by the
+    /// bundle at load; all `F16` = the F16 WMMA core). Only the FFN sites are read here.
+    pub tiers: RaonSiteTiers,
 }
 
 impl RaonMoeDims {
@@ -70,6 +74,7 @@ impl RaonMoeDims {
             value_beta: 25.0,
             router_eps: 1e-20,
             router_scale: 1.0,
+            tiers: RaonSiteTiers::ALL_F16,
         }
     }
 
@@ -131,7 +136,7 @@ impl RaonMoeDims {
 /// Borrowed tensors of one MoE layer (layers 1..24).
 #[derive(Clone, Copy)]
 pub struct RaonMoeLayerRefs<'a> {
-    /// F32 `[n_experts, hidden]` router weight (BF16 values expanded).
+    /// BF16 `[n_experts, hidden]` router weight (F32 when the loader kept an inexact tensor in F32).
     pub router_weight: &'a GpuTensor,
     /// F32 `[n_experts]` selection-only correction bias.
     pub correction_bias: &'a GpuTensor,
@@ -148,6 +153,9 @@ pub struct RaonMoeLayerRefs<'a> {
     /// Shared expert projections (qt44): gate/up `[logical_mi, hidden]`, down
     /// `[hidden, down_k]`. Gate/up `awq_scale` equals `gate_up_awq`.
     pub shared: GroupedMoeShared<'a>,
+    /// Every routed gate/up and down header is loader-verified symmetric
+    /// (`zp == -8 * sc`); with a quantized routed tier selected, admits the grouped W4A8/W4A4 core.
+    pub iu4_symmetric: bool,
 }
 
 impl<'a> RaonMoeLayerRefs<'a> {
@@ -169,8 +177,14 @@ impl<'a> RaonMoeLayerRefs<'a> {
     ) -> Self {
         let mut gate = shared_gate.dispatch_ref();
         let mut up = shared_up.dispatch_ref();
-        gate.awq_scale = gate_up_awq;
-        up.awq_scale = gate_up_awq;
+        // Only a qt44 shared gate/up consumes the rotated, AWQ-divided basis;
+        // Q8_0/F16/F32 projections read the plain activation and take no scale.
+        if gate.dtype == DType::MQ4G256V2 {
+            gate.awq_scale = gate_up_awq;
+        }
+        if up.dtype == DType::MQ4G256V2 {
+            up.awq_scale = gate_up_awq;
+        }
         Self {
             router_weight: &router.buf,
             correction_bias,
@@ -178,12 +192,18 @@ impl<'a> RaonMoeLayerRefs<'a> {
             down_ptrs,
             gate_up_awq,
             down_awq_ptrs,
-            shared: GroupedMoeShared {
-                gate,
-                up,
-                down: shared_down.dispatch_ref(),
-            },
+            shared: GroupedMoeShared::new(gate, up, shared_down.dispatch_ref()),
+            iu4_symmetric: false,
         }
+    }
+
+    /// Bind the loader's symmetric-header verdicts: the routed experts
+    /// ([`MoeFfnWeights::iu4_symmetric`](crate::weights::MoeFfnWeights)) and the shared expert
+    /// ([`GatedFfnWeights::iu4_symmetric`](crate::weights::GatedFfnWeights)).
+    pub fn with_iu4_symmetric(mut self, routed: bool, shared: bool) -> Self {
+        self.iu4_symmetric = routed;
+        self.shared.iu4_symmetric_verified = shared;
+        self
     }
 }
 
@@ -212,12 +232,19 @@ impl<'a> RaonDenseRefs<'a> {
         }
         Ok(Self {
             input_awq: gate.awq_scale.as_ref(),
-            weights: GroupedMoeShared {
-                gate: gate.dispatch_ref(),
-                up: up.dispatch_ref(),
-                down: down.dispatch_ref(),
-            },
+            weights: GroupedMoeShared::new(
+                gate.dispatch_ref(),
+                up.dispatch_ref(),
+                down.dispatch_ref(),
+            ),
         })
+    }
+
+    /// Bind the loader's symmetric-header verdict of the dense MLP
+    /// ([`GatedFfnWeights::iu4_symmetric`](crate::weights::GatedFfnWeights)).
+    pub fn with_iu4_symmetric(mut self, verified: bool) -> Self {
+        self.weights.iu4_symmetric_verified = verified;
+        self
     }
 }
 
@@ -248,12 +275,54 @@ pub struct RaonMoeScratch {
     pub shared_out: GpuTensor,
     /// Single-expert grouping tables of the shared expert projections.
     pub shared_tables: GpuTensor,
+    /// Shared-expert single-expert tables, built once per (layer, rows).
+    pub shared_table_cache: SingleExpertTableCache,
 }
 
 fn alloc_words(gpu: &mut Gpu, words: usize) -> Result<GpuTensor, String> {
     // i32 tables are four-byte words like F32; the kernels only use the extent.
     gpu.alloc_tensor(&[words.max(1)], DType::F32)
         .map_err(|e| format!("raon moe scratch alloc: {e}"))
+}
+
+/// Bytes of one `alloc_words` tensor (exact size, 256 B minimum).
+fn word_bytes(words: usize) -> usize {
+    (words.max(1) * 4).max(256)
+}
+
+impl RaonMoeScratch {
+    /// Device bytes [`Self::new`] allocates for `max_rows` rows.
+    pub fn required_bytes(dims: &RaonMoeDims, max_rows: usize) -> Result<usize, String> {
+        dims.validate()?;
+        let p = GroupedMoeScratchPlan::for_rows(&dims.geometry(), max_rows.max(1))
+            .map_err(|e| e.to_string())?;
+        Ok([
+            p.router_logits,
+            p.topk_indices,
+            p.topk_weights,
+            p.x_rot,
+            p.act,
+            p.rot,
+            p.down_rows,
+            p.indexed_gate,
+            p.indexed_up,
+            p.gate_up_rows,
+            p.expert_token_counts,
+            p.expert_offsets,
+            p.sorted_slot_index,
+            p.expert_tile_ids,
+            p.inverse_perm,
+            p.shared_gate,
+            p.shared_up,
+            p.shared_act,
+            p.shared_rot,
+            p.shared_out,
+            p.shared_tables,
+        ]
+        .into_iter()
+        .map(word_bytes)
+        .sum())
+    }
 }
 
 impl RaonMoeScratch {
@@ -284,6 +353,7 @@ impl RaonMoeScratch {
             shared_rot: alloc_words(gpu, plan.shared_rot)?,
             shared_out: alloc_words(gpu, plan.shared_out)?,
             shared_tables: alloc_words(gpu, plan.shared_tables)?,
+            shared_table_cache: SingleExpertTableCache::new(),
         })
     }
 
@@ -316,12 +386,14 @@ impl RaonMoeScratch {
                 rot: &self.shared_rot,
                 out: &self.shared_out,
                 tables: &self.shared_tables,
+                table_cache: Some(&self.shared_table_cache),
             }),
         }
     }
 
     /// Release every tensor.
     pub fn free(self, gpu: &mut Gpu) {
+        self.shared_table_cache.free(gpu);
         for t in [
             self.router_logits,
             self.topk_indices,
@@ -350,6 +422,12 @@ impl RaonMoeScratch {
     }
 }
 
+/// `rows` rounded up to whole 16-row tiles: the quantized one-expert GEMMs write whole tiles of
+/// their outputs.
+fn pad_rows(rows: usize) -> usize {
+    rows.div_ceil(16) * 16
+}
+
 /// Persistent scratch of the first-layer dense MLP (`dense_mi` wide).
 pub struct RaonDenseScratch {
     pub max_rows: usize,
@@ -360,24 +438,45 @@ pub struct RaonDenseScratch {
     pub rot: GpuTensor,
     /// Single-expert grouping tables of the dense projections.
     pub tables: GpuTensor,
+    /// Dense single-expert tables, built once per rows.
+    pub table_cache: SingleExpertTableCache,
 }
 
 impl RaonDenseScratch {
+    /// Device bytes [`Self::new`] allocates for `max_rows` rows.
+    pub fn required_bytes(dims: &RaonMoeDims, max_rows: usize) -> Result<usize, String> {
+        dims.validate()?;
+        let rows = max_rows.max(1);
+        Ok([
+            rows * dims.hidden,
+            pad_rows(rows) * dims.dense_mi,
+            pad_rows(rows) * dims.dense_mi,
+            rows * dims.dense_mi,
+            rows * dims.dense_mi,
+            single_expert_table_words(rows),
+        ]
+        .into_iter()
+        .map(word_bytes)
+        .sum())
+    }
+
     pub fn new(gpu: &mut Gpu, dims: &RaonMoeDims, max_rows: usize) -> Result<Self, String> {
         dims.validate()?;
         let rows = max_rows.max(1);
         Ok(Self {
             max_rows,
             x_rot: alloc_words(gpu, rows * dims.hidden)?,
-            gate_out: alloc_words(gpu, rows * dims.dense_mi)?,
-            up_out: alloc_words(gpu, rows * dims.dense_mi)?,
+            gate_out: alloc_words(gpu, pad_rows(rows) * dims.dense_mi)?,
+            up_out: alloc_words(gpu, pad_rows(rows) * dims.dense_mi)?,
             act: alloc_words(gpu, rows * dims.dense_mi)?,
             rot: alloc_words(gpu, rows * dims.dense_mi)?,
             tables: alloc_words(gpu, single_expert_table_words(rows))?,
+            table_cache: SingleExpertTableCache::new(),
         })
     }
 
     pub fn free(self, gpu: &mut Gpu) {
+        self.table_cache.free(gpu);
         for t in [
             self.x_rot,
             self.gate_out,
@@ -422,8 +521,16 @@ pub fn raon_moe_op<'a>(
             down_ptrs: layer.down_ptrs,
             input_awq: layer.gate_up_awq,
             down_awq_ptrs: layer.down_awq_ptrs,
+            iu4_symmetric_verified: layer.iu4_symmetric,
+            act_tiers: GroupedMoeSiteTiers {
+                gate_up: dims.tiers.get(RaonPrecisionSite::RoutedGateUp),
+                down: dims.tiers.get(RaonPrecisionSite::RoutedDown),
+            },
         },
-        shared: Some(layer.shared),
+        shared: Some(layer.shared.with_tier(
+            dims.tiers.get(RaonPrecisionSite::Shared),
+            layer.shared.iu4_symmetric_verified,
+        )),
         scratch: scratch.view(),
         out,
         routed_out,
@@ -463,6 +570,41 @@ pub fn forward_moe(
     execute_grouped_moe(gpu, &op).map_err(|e| e.to_string())
 }
 
+/// Run one MoE layer with every row bit-identical to the same row run alone as
+/// a `rows == 1` decode call ([`GroupedMoeProtocol::RowsExact`]): the routed
+/// experts on the indexed core, the shared expert per row. For speculative
+/// verify blocks of up to 16 rows; slower than [`forward_moe`] at wide batches.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_moe_rows_exact(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    dims: &RaonMoeDims,
+    layer: &RaonMoeLayerRefs<'_>,
+    rows: usize,
+    x: &GpuTensor,
+    scratch: &RaonMoeScratch,
+    out: &GpuTensor,
+) -> Result<(), String> {
+    if rows > scratch.max_rows {
+        return Err(format!(
+            "raon moe: {rows} rows exceed the scratch capacity {}",
+            scratch.max_rows
+        ));
+    }
+    let op = raon_moe_op(
+        ctx,
+        dims,
+        layer,
+        GroupedMoeProtocol::RowsExact,
+        rows,
+        x,
+        scratch,
+        out,
+        None,
+    );
+    execute_grouped_moe(gpu, &op).map_err(|e| e.to_string())
+}
+
 /// Build the [`GatedFfnOp`] of the dense layer-0 MLP (SiTU, down K 12032).
 #[allow(clippy::too_many_arguments)]
 pub fn raon_dense_op<'a>(
@@ -485,7 +627,10 @@ pub fn raon_dense_op<'a>(
         down_k: dims.dense_mi,
         x,
         input_awq: dense.input_awq,
-        weights: dense.weights,
+        weights: dense.weights.with_tier(
+            dims.tiers.get(RaonPrecisionSite::Dense),
+            dense.weights.iu4_symmetric_verified,
+        ),
         x_rot: &scratch.x_rot,
         scratch: GroupedMoeSharedScratch {
             gate_out: &scratch.gate_out,
@@ -494,8 +639,10 @@ pub fn raon_dense_op<'a>(
             rot: &scratch.rot,
             out: shared_out,
             tables: &scratch.tables,
+            table_cache: Some(&scratch.table_cache),
         },
         out,
+        rows_exact: false,
     }
 }
 
@@ -518,6 +665,34 @@ pub fn forward_dense(
         ));
     }
     let op = raon_dense_op(ctx, dims, dense, rows, x, scratch, out, out);
+    execute_gated_ffn(gpu, &op).map_err(|e| e.to_string())
+}
+
+/// [`forward_dense`] with every row bit-identical to the same row run alone as a
+/// `rows == 1` decode call (pass the decode weight copies, `projections(1)`): Q8_0
+/// projections read their weights once for all rows (`gemv_q8_0_rows_exact`), any
+/// other dtype runs per row. For speculative verify blocks of up to 16 rows.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_dense_rows_exact(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    dims: &RaonMoeDims,
+    dense: &RaonDenseRefs<'_>,
+    rows: usize,
+    x: &GpuTensor,
+    scratch: &RaonDenseScratch,
+    out: &GpuTensor,
+) -> Result<(), String> {
+    if rows > scratch.max_rows {
+        return Err(format!(
+            "raon dense ffn: {rows} rows exceed the scratch capacity {}",
+            scratch.max_rows
+        ));
+    }
+    let op = GatedFfnOp {
+        rows_exact: true,
+        ..raon_dense_op(ctx, dims, dense, rows, x, scratch, out, out)
+    };
     execute_gated_ffn(gpu, &op).map_err(|e| e.to_string())
 }
 
@@ -613,5 +788,9 @@ pub fn moe_scratch_bytes(dims: &RaonMoeDims, max_rows: usize) -> Result<usize, S
 /// Bytes of [`RaonDenseScratch::new`] for `max_rows` rows.
 pub fn dense_scratch_bytes(dims: &RaonMoeDims, max_rows: usize) -> usize {
     let rows = max_rows.max(1);
-    (rows * dims.hidden + 4 * rows * dims.dense_mi + single_expert_table_words(rows)) * 4
+    (rows * dims.hidden
+        + 2 * pad_rows(rows) * dims.dense_mi
+        + 2 * rows * dims.dense_mi
+        + single_expert_table_words(rows))
+        * 4
 }

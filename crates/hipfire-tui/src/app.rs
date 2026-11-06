@@ -2783,15 +2783,12 @@ mod tests {
 
     /// Fake `hipfire` that appends its arguments to `<dir>/serve-calls.log`.
     fn fake_cli(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let log = dir.join("serve-calls.log");
         let bin = dir.join("fake-hipfire");
-        std::fs::write(
+        crate::test_support::write_executable(
             &bin,
-            format!("#!/bin/sh\necho \"$@\" >> '{}'\n", log.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            &format!("#!/bin/sh\necho \"$@\" >> '{}'\n", log.display()),
+        );
         (bin, log)
     }
 
@@ -3095,18 +3092,15 @@ mod tests {
     /// Install a fake CLI that records `"$@"` (one line per call) and exits 1
     /// unless `$1` is `pull`; returns the record path.
     fn pull_recorder(dir: &std::path::Path) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let record = dir.join("pull-argv.txt");
         let bin = dir.join("hipfire-fake");
-        std::fs::write(
+        crate::test_support::write_executable(
             &bin,
-            format!(
+            &format!(
                 "#!/bin/sh\n[ \"$1\" = pull ] || exit 1\necho \"$@\" >> '{}'\nexit 0\n",
                 record.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         std::env::set_var("HIPFIRE_CLI_BIN", &bin);
         record
     }

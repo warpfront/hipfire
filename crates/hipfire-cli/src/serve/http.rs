@@ -1047,7 +1047,7 @@ async fn handle_request(
         }
         (Method::GET, "/stats") => {
             let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "model": meta.current_model,
                 "uptime_sec": meta.started.elapsed().as_secs(),
                 "queue_depth": shared.admission.inflight(),
@@ -1058,6 +1058,14 @@ async fn handle_request(
                 "loaded_config": loaded_config_json(&meta),
                 "swap": meta.loaded.swap.clone(),
             });
+            // Per-position speculative acceptance folded from lane done events
+            // (`draft_positions`, `spec_cycles`, `spec_committed_tokens`).
+            if let (Some(obj), Some(spec)) = (
+                body.as_object_mut(),
+                shared.metrics.spec_positions.stats_json().as_object(),
+            ) {
+                obj.extend(spec.clone());
+            }
             json_response(body, 200)
         }
         (Method::GET, "/metrics") => {

@@ -214,6 +214,9 @@ fn profile_token(
         llama::EmbeddingFormat::F32 => gpu
             .embedding_lookup(&weights.token_embd, &scratch.x, token, dim)
             .unwrap(),
+        llama::EmbeddingFormat::Ggml(_) => {
+            panic!("profile_layers: GGML-typed token embeddings are not supported")
+        }
     }
     timings.embedding_us = sync_us(gpu, t);
 

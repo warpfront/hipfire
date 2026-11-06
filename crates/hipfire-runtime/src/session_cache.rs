@@ -186,6 +186,13 @@ pub trait SessionState {
         route: SessionRoute,
         meta: &[u8],
     ) -> Result<(), String>;
+    /// Rows at and above `first_row` of the row streams were just rewritten
+    /// by a restore copy (a snapshot chain or a parked conversation; a
+    /// resident restore copies fixed parts only and never calls this). Runs
+    /// after the copies, before [`Self::finish_restore`]. A state that keeps
+    /// device data derived from its rows (an expansion of them) drops what it
+    /// derived from `first_row` up; the default derives nothing.
+    fn rows_overwritten(&mut self, _route: SessionRoute, _first_row: usize) {}
     /// The position every owner of `route` sits at when the live state can
     /// continue in place; `None` when it cannot (an owner lags, or verify
     /// state is armed).
@@ -376,6 +383,15 @@ impl Segment {
     fn bytes(&self) -> usize {
         (self.to - self.from) * self.row_bytes
     }
+}
+
+/// Lowest row a copy of `segments` writes (`None` when every one is empty).
+fn first_written_row<'a>(segments: impl IntoIterator<Item = &'a Segment>) -> Option<usize> {
+    segments
+        .into_iter()
+        .filter(|segment| segment.bytes() > 0)
+        .map(|segment| segment.from)
+        .min()
 }
 
 /// Fixed parts whole, then each stream's segment, packed at [`PART_ALIGN`].
@@ -2535,6 +2551,9 @@ impl SessionCache {
         copy_regions(gpu, &regions).map_err(|e| e.to_string())?;
         host_transfer(gpu, Dir::ToLive, &moves)?;
         let used_host = !moves.is_empty();
+        if let Some(first) = first_written_row(links.iter().flat_map(|link| &link.segments)) {
+            state.rows_overwritten(route, first);
+        }
         state.finish_restore(gpu, route, &leaf.meta)?;
         Ok(used_host)
     }
@@ -3430,6 +3449,9 @@ impl SessionCache {
         if parked.buf.is_host() {
             *host_restores = host_restores.saturating_add(1);
         }
+        if let Some(first) = first_written_row(&plan.segments) {
+            state.rows_overwritten(parked.route, first);
+        }
         state.finish_restore(gpu, parked.route, &parked.meta)
     }
 
@@ -4300,6 +4322,20 @@ mod tests {
     use super::*;
 
     const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn first_written_row_is_the_lowest_non_empty_segment_start() {
+        let seg = |from, to| Segment {
+            row_bytes: 8,
+            from,
+            to,
+        };
+        // A chain restore writes from its root (0) up; empty segments write nothing.
+        assert_eq!(first_written_row(&[seg(512, 1024), seg(0, 512)]), Some(0));
+        assert_eq!(first_written_row(&[seg(0, 0), seg(512, 768)]), Some(512));
+        assert_eq!(first_written_row(&[seg(256, 256)]), None);
+        assert_eq!(first_written_row(&[]), None);
+    }
 
     #[test]
     fn uma_headroom_scales_with_host_ram_inside_the_clamp() {

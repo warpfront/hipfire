@@ -2154,6 +2154,7 @@ impl NpuForward {
         // No tape can contain relay/host operations. Decode retains its old route.
         gpu.replay.set_forward_eligible(false);
         owner.uploaded_id_rows = 0;
+        owner.lane_uploaded_ids.1.clear();
         // Bank A adopts the first-tile PLE ticket started at admission; bank
         // B's rows are enqueued once A's fetch owns the epoch and adopted by
         // B's initialization (rows are a pure function of their ids).

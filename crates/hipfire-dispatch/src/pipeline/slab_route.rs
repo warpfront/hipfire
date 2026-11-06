@@ -233,6 +233,122 @@ pub(crate) fn k1_down(
     ))
 }
 
+/// The K2 passes a layer's codec layout needs: `(cold, mq4, masked)`. A uniform cold layer
+/// (bucket 0) runs the cold codec's kernel on every tile, a uniform MQ4 layer the MQ4 kernel,
+/// and a mixed layer both on codec-masked (disjoint) tile ids. Pure.
+pub(crate) fn k2_passes(buckets: &SlabBuckets<'_>) -> (bool, bool, bool) {
+    match buckets {
+        SlabBuckets::Uniform(0) => (true, false, false),
+        SlabBuckets::Uniform(_) => (false, true, false),
+        SlabBuckets::Table(_) => (true, true, true),
+    }
+}
+
+/// The codec-masked tile lists `[cold, mq4]` of a mixed layer's panel (`tile_count` tiles of
+/// `tiles`); `None` for a uniform layer, whose passes use the panel's tiles as they are.
+fn k2_masks(
+    gpu: &mut Gpu,
+    layer: &SlabLayer<'_>,
+    tiles: &GpuTensor,
+    tile_count: usize,
+) -> Result<Option<[GpuTensor; 2]>, DispatchError> {
+    let SlabBuckets::Table(tags) = layer.buckets else {
+        return Ok(None);
+    };
+    let owner = codec_i32(tags)?;
+    hip(gpu.qwen4_slab_tile_masks(tiles, &owner, tile_count, layer.cold_codec)).map(Some)
+}
+
+/// K2 gate/up of one S1 panel over the layer's codec buckets (the window's A4 sidecar `xq`,
+/// the panel's sorted-slot and tile views, pointer tables of the binding): the cold codec's
+/// kernel on its tiles and the MQ4 kernel on the rest, exactly the ordinary slab tile
+/// lowering's pair (`qwen4_slab_tile_masks` split) but over the binding's device tables.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn k2_panel_gate_up(
+    gpu: &mut Gpu,
+    layer: SlabLayer<'_>,
+    ptrs: &GpuTensor,
+    tiles: &GpuTensor,
+    sorted: &GpuTensor,
+    xq: &rdna_compute::scratch::Int4MmqPrepared,
+    y: &GpuTensor,
+    (m, k, k_top): (usize, usize, usize),
+    (rows, batch): (usize, usize),
+) -> Result<(), DispatchError> {
+    let (cold, mq4, _) = k2_passes(&layer.buckets);
+    let masks = k2_masks(
+        gpu,
+        &layer,
+        tiles,
+        rows / crate::families::moe::MOE_GROUPED_BLOCK_M,
+    )?;
+    let cold_tiles = masks.as_ref().map_or(tiles, |masks| &masks[0]);
+    let mq4_tiles = masks.as_ref().map_or(tiles, |masks| &masks[1]);
+    if cold {
+        hip(match layer.cold_codec {
+            3 => gpu.gemm_qwen4_moe_e8p_gate_up_silu_iu4_sym(
+                ptrs, cold_tiles, sorted, xq, y, m, k, k_top, rows, batch,
+            ),
+            1 => gpu.gemm_qwen4_moe_w3_gate_up_silu_iu4_sym(
+                ptrs, cold_tiles, sorted, xq, y, m, k, k_top, rows, batch,
+            ),
+            other => {
+                return Err(refuse(&format!(
+                    "cold codec {other} has no K2 gate/up kernel"
+                )))
+            }
+        })?;
+    }
+    if mq4 {
+        hip(gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
+            ptrs, mq4_tiles, sorted, xq, y, m, k, k_top, rows, batch, false,
+        ))?;
+    }
+    Ok(())
+}
+
+/// K2 down of one S1 panel over the layer's codec buckets: [`k2_panel_gate_up`]'s counterpart
+/// on the rotated BF16 SwiGLU rows' A4 sidecar `xq`, writing the panel's down rows `y`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn k2_panel_down(
+    gpu: &mut Gpu,
+    layer: SlabLayer<'_>,
+    ptrs: &GpuTensor,
+    tiles: &GpuTensor,
+    sorted: &GpuTensor,
+    xq: &rdna_compute::scratch::Int4MmqPrepared,
+    y: &GpuTensor,
+    (m, k): (usize, usize),
+    (rows, slots): (usize, usize),
+) -> Result<(), DispatchError> {
+    let (cold, mq4, _) = k2_passes(&layer.buckets);
+    let masks = k2_masks(
+        gpu,
+        &layer,
+        tiles,
+        rows / crate::families::moe::MOE_GROUPED_BLOCK_M,
+    )?;
+    let cold_tiles = masks.as_ref().map_or(tiles, |masks| &masks[0]);
+    let mq4_tiles = masks.as_ref().map_or(tiles, |masks| &masks[1]);
+    if cold {
+        hip(match layer.cold_codec {
+            3 => gpu.gemm_qwen4_moe_e8p_down_iu4_sym(
+                ptrs, cold_tiles, sorted, xq, y, m, k, 1, rows, slots,
+            ),
+            1 => gpu.gemm_qwen4_moe_w3_down_iu4_sym(
+                ptrs, cold_tiles, sorted, xq, y, m, k, 1, rows, slots,
+            ),
+            other => return Err(refuse(&format!("cold codec {other} has no K2 down kernel"))),
+        })?;
+    }
+    if mq4 {
+        hip(gpu.gemm_qwen4_moe_down_iu4_sym(
+            ptrs, mq4_tiles, sorted, xq, y, m, k, 1, rows, slots, false,
+        ))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::slab_moe_decode::{self as k1, BucketKey, Codec, Kind};
@@ -429,5 +545,18 @@ mod tests {
         }
         assert_eq!(qwen4_slab_rowtile_words_checked(64), Some(3856));
         assert_eq!(qwen4_slab_rowtile_bytes(64), Some(15_424));
+    }
+
+    /// The S1 K2 panel's pass plan per codec layout: the production K2 panel used to launch the
+    /// MQ4 kernel on EVERY tile, which read W3 payload as MQ4 (non-finite router logits one layer
+    /// later on the first card run of S1 over mq3-xts). A uniform MQ4 layer keeps the single MQ4
+    /// pass over the panel's own tiles; a cold-only layer runs the cold codec alone.
+    #[test]
+    fn k2_panel_passes_follow_the_codec_layout() {
+        use super::k2_passes;
+        use rdna_compute::slab_moe::SlabBuckets;
+        // Buckets: cold = 0, MQ4 = 1.
+        assert_eq!(k2_passes(&SlabBuckets::Uniform(1)), (false, true, false));
+        assert_eq!(k2_passes(&SlabBuckets::Uniform(0)), (true, false, false));
     }
 }

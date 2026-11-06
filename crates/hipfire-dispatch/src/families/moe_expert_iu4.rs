@@ -164,6 +164,9 @@ impl ExpertIu4Spec {
         if self.gate_up_codec != DType::MQ4G256V2 {
             return Err(R::GateUpCodec);
         }
+        // Kernel format: the PM down entries read 68 B per K128 (`qwen4_moe_sym` `Kind::Down`
+        // addressing, `emit_down_gp`) and the A4 producer is an R128 rotation; qt44 (136 B per K256,
+        // FWHT256) down experts are served by the generic grouped W4A4 core in `execute_grouped_moe`.
         if self.down_codec != DType::MQ4G128V2 {
             return Err(R::DownCodec);
         }
@@ -185,6 +188,8 @@ impl ExpertIu4Spec {
         if !(2 * u64::from(self.intermediate)).is_multiple_of(64) {
             return Err(R::GateUpRowsNotMultipleOf64);
         }
+        // Kernel format: the PM down K loop is whole K128 epochs with no pad lane in the down A4
+        // producer (`moe_rotate_i4_pm` row width is K); a padded physical K is the generic core's.
         if !self.intermediate.is_multiple_of(128) {
             return Err(R::IntermediateNotMultipleOf128);
         }
@@ -255,6 +260,8 @@ pub fn expert_iu4_admission(
     if inputs.has_dtype_tags {
         return Err(R::MixedTags);
     }
+    // Kernel format: the PM down A4 producer (`moe_rotate_i4_pm`) has no AWQ divide input, so a
+    // per-expert down AWQ vector cannot be folded into the activation record on this route.
     if inputs.has_down_awq {
         return Err(R::DownAwq);
     }

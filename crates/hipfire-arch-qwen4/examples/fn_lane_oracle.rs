@@ -76,6 +76,29 @@
 //! 2-lane run that skips `commit_promotion` (the lane keeps its fresh trunk
 //! state; must fail the comparison).
 //!
+//! `--spec mtp --copy [--repeat P] [--lag-rows N]` (lab; copy stays OFF
+//! everywhere else): the store is staged with the opt-in copy lane
+//! (`Qwen4Bundle::stage_lanes_with_copy`: every lane's verify rows and ring
+//! widen to `1 + max(k, take cap)`, `N` owed head rows per lane, the root's
+//! copy lane armed with the production n-gram triple and its env overrides),
+//! so the root plans copy windows (verified as `Verify` rows on whatever
+//! route the window had, a confirmation probe at the seed for an
+//! unestablished source), retired-lane head lag with its round-0 catch-up and
+//! its owed-row flushes, all executed by `mesh_rank_copy`. `--repeat P` builds
+//! every prompt from the first `P` tokens of its text offset cycled to the
+//! context length, so a greedy continuation copies it. The singleton cannot
+//! replay these windows (its takeover chooser is its own), so the reference
+//! phase checks, per lane: (a) the committed stream equals the AR singleton's
+//! ids; (b) the final trunk checkpoint (QSA/GDN/PLE/position) equals the state
+//! of an AR singleton that forwarded exactly the lane's consumed tokens; (d)
+//! the head is self-consistent (aligned: at the target with nothing owed,
+//! lagging: at the lag start with the root's owed tokens and `start + owed ==
+//! target`, the live head's pending hidden finite and written); and over the
+//! whole run (c) at least one copy window was taken, else the run FAILS.
+//! The head items themselves are not compared (the singleton's head after a
+//! takeover is a different, batched-fill state), nor is the pending hidden
+//! against a reference. No `--controls`, `--bench`, `--promote` or `--g0`.
+//!
 //! Exit 0 only when every compared run passes and every control is detected.
 //! Nothing is written outside OUT_DIR.
 //!
@@ -91,8 +114,11 @@
 use hipfire_arch_qwen4::admit_hfqm_artifact_on;
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::gpu_forward_lanes::{LaneStagePolicy, StageName, StageShare};
-use hipfire_arch_qwen4::lane::{LabRoutes, LaneSpecConfig};
+use hipfire_arch_qwen4::lane::{
+    LabHeadFacts, LabRoutes, LaneCopyConfig, LaneSpecConfig, LaneSpecStats,
+};
 use hipfire_arch_qwen4::lane_exec::{LaneDraft, LaneRoute};
+use hipfire_arch_qwen4::mesh_lane_protocol::HeadState;
 use hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter;
 use hipfire_arch_qwen4::state::Qwen4State;
 use hipfire_runtime::device_mesh::DeviceMesh;
@@ -143,6 +169,16 @@ struct Args {
     promote: Option<usize>,
     /// Staged lane capacity override; `None` stages exactly the lanes the run drives.
     lane_capacity: Option<usize>,
+    /// `--copy` (with `--spec mtp`): the store arms the copy lane; windows,
+    /// forced rows and retired-lane head lag run through the shared rank
+    /// helper. The run must take at least one copy window.
+    copy: bool,
+    /// `--repeat P`: every prompt is the first `P` tokens of its text offset
+    /// repeated to the context length, so a greedy continuation copies it.
+    repeat: Option<usize>,
+    /// `--lag-rows N`: owed head rows a retired lane holds before the root
+    /// flushes them (`LaneCopyConfig.head_lag_rows`).
+    lag_rows: usize,
 }
 
 fn parse_list(s: &str, what: &str) -> R<Vec<usize>> {
@@ -164,7 +200,8 @@ fn parse_args() -> R<Args> {
 fn parse_args_from(raw: &[String]) -> R<Args> {
     let usage = "usage: fn_lane_oracle MODEL.mq4 TEXT.txt OUT_DIR [--ks 1,2,4,8] [--contexts 512,2048,8192] \
                  [--steps 64] [--max-seq 16384] [--policy production|per-lane|<spec>] [--g0] [--controls] [--bench N] \
-                 [--spec ar|mtp] [--k K] [--routes floor|cycle|batched] [--promote P] [--lane-capacity N]";
+                 [--spec ar|mtp] [--k K] [--routes floor|cycle|batched] [--promote P] [--lane-capacity N] \
+                 [--copy [--repeat P] [--lag-rows N]]";
     let mut pos = Vec::new();
     let mut a = Args {
         model: PathBuf::new(),
@@ -183,6 +220,9 @@ fn parse_args_from(raw: &[String]) -> R<Args> {
         routes: RoutesArg::Cycle,
         promote: None,
         lane_capacity: None,
+        copy: false,
+        repeat: None,
+        lag_rows: 8,
     };
     let mut i = 0;
     let value = |i: &mut usize, flag: &str| -> R<String> {
@@ -214,6 +254,9 @@ fn parse_args_from(raw: &[String]) -> R<Args> {
             }
             "--g0" => a.g0 = true,
             "--controls" => a.controls = true,
+            "--copy" => a.copy = true,
+            "--repeat" => a.repeat = Some(value(&mut i, "--repeat")?.parse().map_err(e)?),
+            "--lag-rows" => a.lag_rows = value(&mut i, "--lag-rows")?.parse().map_err(e)?,
             flag if flag.starts_with("--") => return Err(format!("unknown flag {flag}\n{usage}")),
             other => pos.push(other.to_string()),
         }
@@ -253,6 +296,24 @@ fn parse_args_from(raw: &[String]) -> R<Args> {
                 a.steps
             ));
         }
+    }
+    if a.copy {
+        if !a.spec_mtp {
+            return Err(format!("--copy needs --spec mtp\n{usage}"));
+        }
+        if a.promote.is_some() || a.controls || a.bench > 0 || a.g0 {
+            return Err(
+                "--copy checks the copy lane's own identity (stream, state, copy windows, head); \
+                 it does not combine with --promote, --controls, --bench or --g0"
+                    .into(),
+            );
+        }
+        if a.lag_rows == 0 {
+            return Err("--lag-rows must be >= 1".into());
+        }
+    }
+    if a.repeat == Some(0) {
+        return Err("--repeat must be >= 1".into());
     }
     Ok(a)
 }
@@ -1332,6 +1393,9 @@ struct App {
     lanes_dir: PathBuf,
     /// AR singleton ids per request (spec mode, route-independent greedy ids).
     ar_ids: Vec<Vec<u32>>,
+    /// `--copy`: the store arms the copy lane and the reference phase checks the copy lane's
+    /// identity instead of replaying the windows on the singleton.
+    copy: bool,
 }
 
 impl App {
@@ -1733,6 +1797,18 @@ struct SpecRun {
     drafter: Option<Qwen4MtpDrafter>,
     /// Negative control: zero the promoted lane's pending hidden right after the promotion.
     zero_pending: bool,
+    /// Per lane (request, counters, head facts) read from the store before release
+    /// (`--copy` checks them).
+    finals: Vec<LaneFinal>,
+}
+
+/// A lane's store-side facts at the end of its run.
+struct LaneFinal {
+    req: usize,
+    stats: LaneSpecStats,
+    head: Option<LabHeadFacts>,
+    /// `pending_hidden` bytes (F32 LE).
+    pending: Vec<u8>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -1746,6 +1822,8 @@ struct SpecStats {
     drafts: usize,
     accepted: usize,
     committed: usize,
+    /// Verify windows on a route other than `Batched`: windows carrying the root's copy candidates.
+    copy_verify: usize,
 }
 
 fn spec_stats(lanes: &[SpecLane]) -> SpecStats {
@@ -1763,8 +1841,21 @@ fn spec_stats(lanes: &[SpecLane]) -> SpecStats {
                         s.rejected += 1;
                     }
                 }
-                LaneRoute::ArSynced => s.ar_synced += 1,
-                LaneRoute::ArRetired => s.ar_retired += 1,
+                LaneRoute::ArSynced | LaneRoute::ArRetired => {
+                    if w.route == LaneRoute::ArSynced {
+                        s.ar_synced += 1;
+                    } else {
+                        s.ar_retired += 1;
+                    }
+                    if !w.drafts.is_empty() {
+                        s.copy_verify += 1;
+                        s.drafts += w.offered;
+                        s.accepted += w.accepted;
+                        if w.accepted < w.offered {
+                            s.rejected += 1;
+                        }
+                    }
+                }
                 LaneRoute::Ar => {}
             }
         }
@@ -1875,12 +1966,14 @@ fn spec_row(
         .ok_or_else(|| format!("lane of request {req} has no pending seed"))?;
     let start = lane.state.position;
     match d.route {
-        LaneRoute::Batched { .. } => {
-            if d.drafts.is_empty() {
-                return Err(format!(
-                    "request {req}: a Batched window came back with no drafts"
-                ));
-            }
+        LaneRoute::Batched { .. } if d.drafts.is_empty() => Err(format!(
+            "request {req}: a Batched window came back with no drafts"
+        )),
+        // A Batched window, or (a copy-armed store) a copy window of any
+        // route: `[seed, drafts..]` verify rows.
+        LaneRoute::Batched { .. } | LaneRoute::ArSynced | LaneRoute::ArRetired
+            if !d.drafts.is_empty() =>
+        {
             let mut tokens = Vec::with_capacity(1 + d.drafts.len());
             tokens.push(seed);
             tokens.extend_from_slice(&d.drafts);
@@ -1901,7 +1994,7 @@ fn spec_row(
             start,
             kind: RequestStepKind::Ar,
         }),
-        LaneRoute::Ar => Err(format!(
+        LaneRoute::Ar | LaneRoute::Batched { .. } => Err(format!(
             "request {req}: a spec lane was routed as a plain Ar row"
         )),
     }
@@ -2248,6 +2341,7 @@ fn write_windows(dir: &Path, l: &SpecLane) -> R<()> {
         .map(|x| {
             json!({
                 "route": route_name(x.route),
+                "copy_like": !matches!(x.route, LaneRoute::Batched { .. }) && !x.drafts.is_empty(),
                 "k_max": match x.route { LaneRoute::Batched { k_max } => k_max, _ => 0 },
                 "drafts": x.drafts,
                 "offered": x.offered,
@@ -2402,6 +2496,103 @@ impl App {
         result.map(|_| compared)
     }
 
+    /// `--copy`: the copy lane's own identity for one finished lane.
+    ///
+    /// - (b) the lane's final trunk checkpoint (QSA, GDN, PLE, position; head items left out) equals the
+    ///   state of an AR singleton that forwarded exactly the lane's consumed tokens;
+    /// - (d) the head is self-consistent: an aligned head stands at the target position with nothing owed
+    ///   and the root agrees, a lagging head stands at the lag's start with the root's owed tokens and
+    ///   `start + owed == target`, a head-free lane is not checked; the pending hidden of a live head is
+    ///   finite and was written (not all zero).
+    ///
+    /// (a) the committed stream against the AR ids is [`Self::compare_ar_ids`]; (c) at least one copy
+    /// window is checked over the whole run by the caller. Returns the checkpoints compared.
+    fn check_copy_lane(&mut self, diff: &mut Diff, l: &SpecLane, finals: &[LaneFinal]) -> R<usize> {
+        let req = l.req;
+        let consumed: usize = l.wins.iter().map(|w| w.committed.len()).sum();
+        let f = finals
+            .iter()
+            .find(|f| f.req == req)
+            .ok_or_else(|| format!("req {req}: no final lane facts were read"))?;
+        match &f.head {
+            None => diff.note(format!("req {req}: the store reports no head facts")),
+            Some(h) => {
+                diff.counts(
+                    &format!("req {req} target position"),
+                    l.prompt_len + consumed,
+                    h.target_position,
+                );
+                match h.root_head {
+                    HeadState::Aligned => {
+                        diff.counts(
+                            &format!("req {req} aligned head position"),
+                            h.target_position,
+                            h.head_position,
+                        );
+                        diff.counts(&format!("req {req} aligned head owed rows"), 0, h.owed_rows);
+                        diff.counts(&format!("req {req} root owed rows"), 0, h.root_owed.len());
+                        let finite_written = f
+                            .pending
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .fold((true, false), |(finite, written), v| {
+                                (finite && v.is_finite(), written || v != 0.0)
+                            });
+                        if f.pending.is_empty() || !finite_written.0 || !finite_written.1 {
+                            diff.note(format!(
+                                "req {req}: the live head's pending hidden is not finite and written ({} bytes)",
+                                f.pending.len()
+                            ));
+                        }
+                    }
+                    HeadState::Lag { from } => {
+                        diff.counts(&format!("req {req} lag start"), from, h.owed_start);
+                        diff.counts(
+                            &format!("req {req} lagging head position"),
+                            from,
+                            h.head_position,
+                        );
+                        diff.counts(
+                            &format!("req {req} owed rows"),
+                            h.root_owed.len(),
+                            h.owed_rows,
+                        );
+                        diff.counts(
+                            &format!("req {req} lag end"),
+                            h.target_position,
+                            from + h.owed_rows,
+                        );
+                    }
+                    HeadState::Free => {}
+                }
+            }
+        }
+        // (b): the AR singleton forwarded the lane's consumed tokens.
+        let Some(ckpt) = l.ckpts.iter().find(|c| c.step == l.wins.len()) else {
+            return Err(format!("req {req}: no final lane checkpoint was written"));
+        };
+        let prompt = self.prompts[req].clone();
+        let World {
+            gpu, bundle, row, ..
+        } = &mut self.w;
+        bundle.reset(gpu).map_err(e)?;
+        bundle.prefill_final(gpu, &prompt, 0, row).map_err(e)?;
+        for s in 1..=consumed {
+            bundle
+                .forward_token_or_argmax(gpu, None, row)
+                .map_err(|x| format!("req {req} AR reference step {s}: {x}"))?;
+        }
+        let live = capture(gpu, &bundle.state)?;
+        compare_live(
+            diff,
+            &format!("req {req} final state vs the AR singleton"),
+            ckpt,
+            &live,
+            true,
+        )?;
+        Ok(1)
+    }
+
     /// The lane's committed stream against the AR singleton's ids.
     fn compare_ar_ids(&mut self, diff: &mut Diff, l: &SpecLane, k: usize, steps: usize) -> R<()> {
         let stream = l.stream();
@@ -2439,6 +2630,7 @@ impl App {
             steps_run: 0,
             drafter: None,
             zero_pending,
+            finals: Vec::new(),
         };
         let mut ckpt_windows = vec![0, 1, steps];
         ckpt_windows.sort_unstable();
@@ -2539,10 +2731,30 @@ impl App {
                         json!({
                             "windows": s.windows, "ar_windows": s.ar_windows, "drafts": s.drafts,
                             "accepted": s.accepted, "retired": s.retired,
+                            "copy_windows": s.copy_windows, "copy_drafts": s.copy_drafts,
+                            "copy_accepted": s.copy_accepted, "copy_confirmed": s.copy_confirmed,
+                            "copy_missed": s.copy_missed, "forced_windows": s.forced_windows,
                         })
                     })
             })
             .collect();
+        if self.copy && run.error.is_none() {
+            for l in &run.lanes {
+                let store = self.w.bundle.lanes();
+                run.finals.push(LaneFinal {
+                    req: l.req,
+                    stats: store
+                        .and_then(|s| s.lane_spec_stats(&l.epoch))
+                        .unwrap_or_default(),
+                    head: store.and_then(|s| s.lab_head_facts(&l.epoch)),
+                    pending: store
+                        .and_then(|s| s.lab_lane_items(&self.w.gpu, &l.epoch).ok())
+                        .and_then(|items| items.into_iter().find(|(n, _)| n == "pending_hidden"))
+                        .map(|(_, bytes)| bytes)
+                        .unwrap_or_default(),
+                });
+            }
+        }
         for l in run.lanes.iter().filter(|l| !l.pending_promotion()) {
             if let Err(x) = self.w.bundle.release_lane(&l.epoch) {
                 run.release_errors
@@ -2559,16 +2771,35 @@ impl App {
             let mut diff = std::mem::take(&mut run.diff);
             let lanes_done = std::mem::take(&mut run.lanes);
             for l in &lanes_done {
-                match self.replay_lane(&mut diff, l, k) {
+                // A copy window is not a window the singleton's `mtp_step`
+                // can replay: the copy run is checked against the AR
+                // singleton instead (ids, final state) and the copy lane's
+                // own invariants.
+                let reference = if self.copy {
+                    self.check_copy_lane(&mut diff, l, &run.finals)
+                } else {
+                    self.replay_lane(&mut diff, l, k)
+                };
+                match reference {
                     Ok(c) => ckpts += c,
                     Err(m) => {
-                        run.error = Some(format!("replay of request {}: {m}", l.req));
+                        run.error = Some(format!("reference of request {}: {m}", l.req));
                         break;
                     }
                 }
                 if let Err(m) = self.compare_ar_ids(&mut diff, l, k, steps) {
                     run.error = Some(format!("AR ids of request {}: {m}", l.req));
                     break;
+                }
+            }
+            if self.copy && run.error.is_none() {
+                let taken: u64 = run.finals.iter().map(|f| f.stats.copy_windows).sum();
+                if taken == 0 {
+                    diff.note(
+                        "--copy was asked but the run took no copy window (the copy lane never \
+                         took a window: no repetitive text, or the chooser declined every proposal)"
+                            .to_string(),
+                    );
                 }
             }
             run.diff = diff;
@@ -2622,6 +2853,8 @@ impl App {
                 "batched": stats.batched, "ar_synced": stats.ar_synced, "ar_retired": stats.ar_retired,
             },
             "rejected_windows": stats.rejected,
+            "copy_verify_windows": stats.copy_verify,
+            "copy_windows_taken": run.finals.iter().map(|f| f.stats.copy_windows).sum::<u64>(),
             "drafts": stats.drafts,
             "accepted": stats.accepted,
             "committed_tokens": stats.committed,
@@ -2802,7 +3035,14 @@ fn spec_main(
 ) -> R<bool> {
     let k = args.k;
     let prompts: Vec<Vec<u32>> = (0..max_k)
-        .map(|i| prompt_for(&toks, i, args.contexts[i % args.contexts.len()]))
+        .map(|i| {
+            prompt_for(
+                &toks,
+                i,
+                args.contexts[i % args.contexts.len()],
+                args.repeat,
+            )
+        })
         .collect();
     let mut app = App {
         w,
@@ -2815,6 +3055,7 @@ fn spec_main(
         max_seq: args.max_seq,
         lanes_dir: args.out.join("lanes"),
         ar_ids: Vec::new(),
+        copy: args.copy,
     };
     let short_steps = args.steps.min(16);
     let mut all_pass = true;
@@ -3015,6 +3256,7 @@ fn spec_main(
             "policy": args.policy, "policy_described": primary.describe(), "g0": false,
             "controls": args.controls, "bench": args.bench,
             "spec": "mtp", "k": args.k, "routes": args.routes.name(), "promote": args.promote,
+            "copy": args.copy, "repeat": args.repeat, "lag_rows": args.lag_rows,
         },
         "policy_evidence": app.w.bundle.lanes().map_or("", |store| store.evidence()),
         "loaded_policy_evidence": loaded_evidence,
@@ -3074,10 +3316,13 @@ fn load(
     max_seq: usize,
     lane_capacity: usize,
     spec: Option<LaneSpecConfig>,
+    copy: Option<LaneCopyConfig>,
     attach_mtp: bool,
 ) -> R<(HfqModelSource, World, Tokenizer)> {
     let mut hfq = HfqFile::open(path).map_err(e)?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(e)?;
+    // Daemon parity: keep host-mapped expert memory out of reclaim before the first HIP call (KFD userptr eviction stalls, ROCm/rocm-systems#12528).
+    hipfire_loader::prepare_host_memory_for(path);
     let mut gpu = Gpu::init().map_err(e)?;
     // The PLE rows source (`memory.ple_format` / `HIPFIRE_PLE_FORMAT`), bound
     // while the base is open and before admission, exactly as `qwen4_kld`,
@@ -3215,7 +3460,7 @@ fn load(
         bundle.attach_mtp(&mut gpu, max_seq).map_err(e)?;
     }
     bundle
-        .stage_lanes(&mut gpu, lane_capacity, lane_capacity, spec)
+        .stage_lanes_with_copy(&mut gpu, lane_capacity, lane_capacity, spec, copy)
         .map_err(e)?;
     let row = gpu.zeros(&[vocab], DType::F32).map_err(e)?;
     let max_lanes = bundle
@@ -3235,9 +3480,15 @@ fn load(
     ))
 }
 
-fn prompt_for(tokens: &[u32], i: usize, ctx: usize) -> Vec<u32> {
+/// Request `i`'s prompt: `ctx` tokens of the text from offset `i * 997`; with `repeat` the first
+/// `repeat` of them cycle to the context length (a repetitive prompt, so a greedy continuation
+/// copies it and the copy lane has candidates to take).
+fn prompt_for(tokens: &[u32], i: usize, ctx: usize, repeat: Option<usize>) -> Vec<u32> {
     (0..ctx)
-        .map(|j| tokens[(i * 997 + j) % tokens.len()])
+        .map(|j| {
+            let j = repeat.map_or(j, |period| j % period);
+            tokens[(i * 997 + j) % tokens.len()]
+        })
         .collect()
 }
 
@@ -3263,10 +3514,14 @@ fn real_main() -> R<bool> {
     fs::create_dir_all(&args.out).map_err(e)?;
     let primary = LaneStagePolicy::parse(&args.policy)?;
     let spec_cfg = if args.spec_mtp {
-        if !matches!(
-            hipfire_config::developer_var("HIPFIRE_MTP_INCREMENTAL").as_deref(),
-            Ok("0")
-        ) {
+        // The copy run replays nothing on the singleton (its windows are not
+        // the singleton's), so it does not need the batched singleton route.
+        if !args.copy
+            && !matches!(
+                hipfire_config::developer_var("HIPFIRE_MTP_INCREMENTAL").as_deref(),
+                Ok("0")
+            )
+        {
             return Err(
                 "--spec mtp requires HIPFIRE_MTP_INCREMENTAL=0 so the singleton reference window runs the batched \
                  route at depth k"
@@ -3276,6 +3531,21 @@ fn real_main() -> R<bool> {
         Some(LaneSpecConfig {
             k: args.k,
             end_of_turn: None,
+            spec_lanes: None,
+        })
+    } else {
+        None
+    };
+    // `--copy`: the store arms the opt-in copy lane (the production triple
+    // and its env overrides, clamped to the verify rows).
+    let copy_cfg = if args.copy {
+        let ngram = hipfire_arch_qwen4::mtp_spec::qwen4_ngram_mod_config(
+            hipfire_config::ngram_mod_copy_triple(),
+        )?;
+        Some(LaneCopyConfig {
+            ngram,
+            head_lag_rows: args.lag_rows,
+            wide_lanes: usize::MAX,
         })
     } else {
         None
@@ -3283,7 +3553,14 @@ fn real_main() -> R<bool> {
     let max_k = required_lanes(&args);
     let lane_capacity = resolve_lane_capacity(args.lane_capacity, max_k)?;
     let max_ctx = *args.contexts.iter().max().unwrap();
-    let per_window = if args.spec_mtp { args.k + 1 } else { 1 };
+    // A copy window verifies up to eight rows whatever `k` is.
+    let per_window = if args.copy {
+        8
+    } else if args.spec_mtp {
+        args.k + 1
+    } else {
+        1
+    };
     let longest_run = args.steps.max(args.bench + 3) * per_window;
     if max_ctx + longest_run + 2 > args.max_seq {
         return Err(format!(
@@ -3301,6 +3578,7 @@ fn real_main() -> R<bool> {
         args.max_seq,
         lane_capacity,
         spec_cfg,
+        copy_cfg,
         attach_mtp,
     )?;
     log.say(format!("gpu arch: {}", w.gpu.arch));
@@ -3377,7 +3655,7 @@ fn real_main() -> R<bool> {
     let mut refs = Vec::with_capacity(max_k);
     for i in 0..max_k {
         let ctx = args.contexts[i % args.contexts.len()];
-        let prompt = prompt_for(&toks, i, ctx);
+        let prompt = prompt_for(&toks, i, ctx, args.repeat);
         let dir = args.out.join("ref").join(format!("req{i}"));
         let t = Instant::now();
         let rq = record_ref(&mut w, i, prompt, args.steps, &ckpt_steps, &dir)?;
@@ -3402,6 +3680,7 @@ fn real_main() -> R<bool> {
         max_seq: args.max_seq,
         lanes_dir: args.out.join("lanes"),
         ar_ids: Vec::new(),
+        copy: false,
     };
     let full = RunOpts { prefill_ckpt: true };
     let mut all_pass = true;

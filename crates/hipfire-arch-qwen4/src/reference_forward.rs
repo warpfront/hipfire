@@ -213,7 +213,9 @@ pub struct ReferenceMoeWeights {
     pub shared_gate: Vec<f32>,
     pub shared_up: Vec<f32>,
     pub shared_down: Vec<f32>,
-    pub shared_gate_scalar: Vec<f32>,
+    /// Row of the `[1, hidden]` `shared_expert_gate` Linear; the gate is
+    /// `sigmoid(dot(selector, input))`, one scalar per token.
+    pub shared_gate_selector: Vec<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -870,13 +872,12 @@ impl ReferenceQwen4Forward {
             shared_hidden[i] = silu(shared_gate[i]) * shared_up[i];
         }
         let shared = matvec(&weights.shared_down, h, smi, &shared_hidden)?;
+        if weights.shared_gate_selector.len() != h {
+            return Err(ForwardError::Shape("shared gate selector"));
+        }
+        let gate = sigmoid(dot(&weights.shared_gate_selector, input));
         for i in 0..h {
-            let scalar = weights
-                .shared_gate_scalar
-                .get(i)
-                .copied()
-                .ok_or(ForwardError::Shape("shared gate scalar"))?;
-            output[i] += sigmoid(scalar) * shared[i];
+            output[i] += gate * shared[i];
         }
         Ok(output)
     }
@@ -1049,7 +1050,7 @@ mod tests {
             shared_gate: vec![0.01; config.shared_intermediate * config.hidden],
             shared_up: vec![0.01; config.shared_intermediate * config.hidden],
             shared_down: vec![0.01; config.hidden * config.shared_intermediate],
-            shared_gate_scalar: vec![0.0; config.hidden],
+            shared_gate_selector: (0..config.hidden).map(|i| 0.3 * (i as f32 - 3.5)).collect(),
         }
     }
 
@@ -1095,5 +1096,29 @@ mod tests {
             .zip(combined.iter())
             .all(|(a, b)| (a - b).abs() < 1.0e-5));
         assert!(first.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn shared_expert_gate_is_one_token_scalar_from_selector_dot_input() {
+        let config = tiny_config();
+        let h = config.hidden;
+        let mut weights = moe(&config);
+        weights.experts_down = vec![0.0; config.experts * h * config.moe_intermediate];
+        let input = (0..h).map(|i| 0.1 * (i as f32 + 1.0)).collect::<Vec<_>>();
+        let forward = ReferenceQwen4Forward::new(config.clone(), &[]).unwrap();
+        let output = forward.moe_layer(&weights, &input).unwrap();
+        let x_sum = input.iter().sum::<f32>();
+        let u = 0.01 * x_sum;
+        let shared_each = 0.01 * config.shared_intermediate as f32 * (u / (1.0 + (-u).exp())) * u;
+        let gate_dot = weights
+            .shared_gate_selector
+            .iter()
+            .zip(&input)
+            .map(|(a, b)| a * b)
+            .sum::<f32>();
+        let expected = shared_each / (1.0 + (-gate_dot).exp());
+        for v in &output {
+            assert!((v - expected).abs() < 1.0e-6, "{v} vs {expected}");
+        }
     }
 }

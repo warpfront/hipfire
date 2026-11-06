@@ -209,6 +209,15 @@ while read -r _k _v; do
   case "$_k" in [a-z]*) p "$_k" "$_v" ;; esac
 done < <(python3 scripts/check-dispatch-bypass.py 2>/dev/null | grep -E '^[a-z_]+[[:space:]]+[0-9]+$')
 
+# --- multi-card arch-id arms -------------------------------------------------
+# Multi-GPU routing is a carrier declaration (Carrier::topology_caps), not an
+# arch-id match. check-topology-arch-arms.sh counts the arch-id match forms
+# that remain in the multi-card front-door files; the ceilings are
+# topology_arch_arms_* in scripts/leanup-thresholds.txt.
+while read -r _k _v; do
+  case "$_k" in [a-z]*) p "$_k" "$_v" ;; esac
+done < <(bash scripts/check-topology-arch-arms.sh --metrics 2>/dev/null | grep -E '^[a-z_]+[[:space:]]+[0-9]+$')
+
 # --- assertion -------------------------------------------------------------
 # The point of the file. A metric named in scripts/leanup-thresholds.txt must
 # satisfy its threshold or this exits non-zero.

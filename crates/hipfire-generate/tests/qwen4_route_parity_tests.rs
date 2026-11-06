@@ -147,6 +147,7 @@ fn mtp_turn(
         tools,
         enable_grammar: false,
         stop: stop.to_vec(),
+        min_tokens: 0,
         max_think: 0,
         max_tokens: 4096,
         assistant_prefix: if open_think {

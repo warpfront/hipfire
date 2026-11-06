@@ -21,7 +21,7 @@ s_rndne_f32	sop1	0x63	SDST:32,SSRC0:32	SDST	SSRC0	-	-	s_rndne_f32 s15, s13	BE8F6
 s_sub_f32	sop2	0x41	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	-	-	s_sub_f32 s12, s12, s18	A08C120C	-
 s_max_f32	sop2	0x43	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	-	-	s_max_f32 s3, s3, s21	A1831503	-
 v_subrev_f32_e32	vop2	0x5	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_subrev_f32_e32 v22, s22, v24	0A2C3016	-
-s_fmamk_f32	sop2	0x46	SDST:32,SSRC0:32,SSRC1:32,literal@last	SDST	SSRC0,SSRC1,SDST	-	-	s_fmamk_f32 s18, s13, 0x3fb8aa3b, s18	A312120D 3FB8AA3B	-
+s_fmamk_f32	sop2	0x46	SDST:32,SSRC0:32,SSRC1:32,literal@last	SDST	SSRC0,SSRC1	-	-	s_fmamk_f32 s18, s13, 0x3fb8aa3b, s18	A312120D 3FB8AA3B	-
 # pm-opcode-fill (2026-10-12): gfx1151-only (llvm-mc -mcpu=gfx1100 rejects them: "instruction not supported on this GPU"; MR-ISA amdgpu_isa_rdna3_5.xml has them, rdna3.xml does not). Opcodes = Mesa aco_opcodes.py gfx11 column.
 s_cvt_f32_f16	sop1	0x69	SDST:32,SSRC0:32	SDST	SSRC0	-	-	s_cvt_f32_f16 s16, s3	BE906903	-
 s_cvt_hi_f32_f16	sop1	0x6a	SDST:32,SSRC0:32	SDST	SSRC0	-	-	s_cvt_hi_f32_f16 s0, s0	BE806A00	-

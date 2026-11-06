@@ -25,7 +25,7 @@ use hipfire_runtime::prompt_frame::AssistantPrefix;
 use hipfire_runtime::spec::{
     ClientEvent, EmitOutcome, FinishSummary, SpecEmit, SpecEmitCtx, StopReason,
 };
-use hipfire_runtime::stop_sequence::StopMatcher;
+use hipfire_runtime::stop_sequence::{MinTokens, StopMatcher};
 use hipfire_runtime::tokenizer::Tokenizer;
 
 pub struct Qwen35Emit<'a> {
@@ -56,6 +56,13 @@ pub struct Qwen35Emit<'a> {
     im_end_token: Option<u32>,
     /// User `stop` sequences, matched on answer text before it is emitted.
     stop: StopMatcher,
+    /// vLLM-compatible `min_tokens`: EOS, decoded end-of-turn markers and user
+    /// stop sequences stay inactive until this many tokens are committed.
+    min_tokens: MinTokens,
+    /// Whether the most recently pushed token was sampled with stops active
+    /// (`min_tokens` already reached). A token sampled before that is an
+    /// ordinary token even when it is the EOS id.
+    stops_active: bool,
     /// Explicit `max_think_tokens` accounting (shared with the AR producer).
     think_budget: ThinkBudget,
     open_think_prefix: bool,
@@ -149,6 +156,8 @@ impl<'a> Qwen35Emit<'a> {
             eos_token: ctx.eos,
             im_end_token: ctx.im_end,
             stop: StopMatcher::new(&ctx.stop),
+            min_tokens: MinTokens(ctx.min_tokens),
+            stops_active: ctx.min_tokens == 0,
             think_budget: ThinkBudget::new(ctx.max_think),
             open_think_prefix,
             think_close,
@@ -243,6 +252,12 @@ impl<'a> Qwen35Emit<'a> {
     /// tail of `begin`'s first-token emit and `observe`'s per-token emit.
     fn push_and_filter(&mut self, token: u32) -> Vec<ClientEvent> {
         let mut events = Vec::new();
+        // `min_tokens`: the token about to be committed is the
+        // `streamed_tokens.len() + 1`-th; EOS and stops apply only once
+        // `min_tokens` tokens precede it.
+        self.stops_active = self.min_tokens.stops_active(self.streamed_tokens.len());
+        self.filter.set_stops_suspended(!self.stops_active);
+        self.stop.set_suspended(!self.stops_active);
         self.streamed_tokens.push(token);
         events.push(ClientEvent::Committed {
             id: token,
@@ -282,12 +297,13 @@ impl<'a> Qwen35Emit<'a> {
     /// True when this turn ended on a decoded EOT (token id or filter stop_at).
     pub fn decoded_eot(&self) -> bool {
         self.filter_stopped
-            || self
-                .streamed_tokens
-                .last()
-                .copied()
-                .map(|t| self.token_is_eot(t))
-                .unwrap_or(false)
+            || (self.stops_active
+                && self
+                    .streamed_tokens
+                    .last()
+                    .copied()
+                    .map(|t| self.token_is_eot(t))
+                    .unwrap_or(false))
     }
 
     /// Count the just-pushed token against the think budget. Queues the close
@@ -334,7 +350,7 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
         // !first_token_is_eos`). Surface as a stop so the caller skips the loop.
         // Same precedence as `observe`: EOT token id, then filter stop_at, then
         // user stop-sequence — so generate_spec never enters spec.step.
-        if self.token_is_eot(first_token) || self.filter_stopped {
+        if (self.stops_active && self.token_is_eot(first_token)) || self.filter_stopped {
             return EmitOutcome {
                 events,
                 stop: Some(StopReason::Eos),
@@ -397,8 +413,8 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
         // Emit the token (committed + filtered + routed).
         let mut events = self.push_and_filter(token);
 
-        // EOS check (token id). Mirrors 4608-4612.
-        if self.token_is_eot(token) {
+        // EOS check (token id). Mirrors 4608-4612. Inactive below `min_tokens`.
+        if self.stops_active && self.token_is_eot(token) {
             return EmitOutcome {
                 events,
                 stop: Some(StopReason::Eos),
@@ -661,6 +677,7 @@ mod tests {
             tools: Some(&[]),
             enable_grammar: true,
             stop: Vec::new(),
+            min_tokens: 0,
             max_think: 0,
             max_tokens: 256,
             assistant_prefix: AssistantPrefix::Plain,
@@ -775,6 +792,7 @@ mod tests {
             tools: Some(&tools),
             enable_grammar: false,
             stop: Vec::new(),
+            min_tokens: 0,
             max_think: 0,
             max_tokens: 256,
             assistant_prefix: AssistantPrefix::Plain,
@@ -894,6 +912,125 @@ mod tests {
         assert_eq!(finish.tool_calls, 0);
     }
 
+    fn min_tokens_emit<'a>(
+        tok: &'a Tokenizer,
+        min_tokens: usize,
+        stop: Vec<String>,
+    ) -> Box<dyn SpecEmit + 'a> {
+        Qwen35Emit::from_ctx(SpecEmitCtx {
+            tokenizer: tok,
+            eos: 9,
+            im_end: Some(1),
+            tools: None,
+            enable_grammar: false,
+            stop,
+            min_tokens,
+            max_think: 0,
+            max_tokens: 256,
+            assistant_prefix: AssistantPrefix::Plain,
+            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
+            decoded_vocab: None,
+        })
+    }
+
+    /// Feed `ids` (first through `begin`); returns (events, index of the token
+    /// that stopped, its reason).
+    fn drive_ids(
+        emit: &mut Box<dyn SpecEmit + '_>,
+        ids: &[u32],
+    ) -> (Vec<ClientEvent>, Option<(usize, StopReason)>) {
+        let mut stream = Vec::new();
+        for (i, id) in ids.iter().enumerate() {
+            let outcome = if i == 0 {
+                emit.begin(*id)
+            } else {
+                emit.observe(*id)
+            };
+            stream.extend(outcome.events);
+            if let Some(reason) = outcome.stop {
+                return (stream, Some((i, reason)));
+            }
+        }
+        (stream, None)
+    }
+
+    #[test]
+    fn min_tokens_holds_eos_inactive_until_reached() {
+        let tok = test_tokenizer();
+        let a = tok.encode("a")[0];
+        let b = tok.encode("b")[0];
+        // <|im_end|> (1) and <|endoftext|> (9) as 2nd and 3rd token, then a
+        // real stop as the 5th: min_tokens = 4 keeps the first two ordinary.
+        let ids = [a, 1, 9, b, 1];
+        let mut emit = min_tokens_emit(&tok, 4, Vec::new());
+        let (stream, stop) = drive_ids(&mut emit, &ids);
+        assert_eq!(stop, Some((4, StopReason::Eos)), "stops on the 5th token");
+        let committed = stream
+            .iter()
+            .filter(|e| matches!(e, ClientEvent::Committed { .. }))
+            .count();
+        assert_eq!(committed, 5, "every token below the limit is committed");
+        let visible = tokens_text(&stream);
+        assert_eq!(visible, "ab", "suppressed EOS markers are never shown");
+        assert!(emit.decoded_eot());
+    }
+
+    #[test]
+    fn min_tokens_boundary_token_is_the_first_that_may_stop() {
+        let tok = test_tokenizer();
+        let a = tok.encode("a")[0];
+        // min_tokens = 2: tokens 1 and 2 are ordinary, the 3rd may stop.
+        let mut emit = min_tokens_emit(&tok, 2, Vec::new());
+        let (_, stop) = drive_ids(&mut emit, &[a, a, 1]);
+        assert_eq!(stop, Some((2, StopReason::Eos)));
+        // An EOS as the 2nd token does not stop.
+        let mut emit = min_tokens_emit(&tok, 2, Vec::new());
+        let (_, stop) = drive_ids(&mut emit, &[a, 1]);
+        assert_eq!(stop, None);
+        // min_tokens = 1: the first token cannot stop, the second can.
+        let mut emit = min_tokens_emit(&tok, 1, Vec::new());
+        let (_, stop) = drive_ids(&mut emit, &[1, 1]);
+        assert_eq!(stop, Some((1, StopReason::Eos)));
+    }
+
+    #[test]
+    fn min_tokens_unreached_ends_as_length_not_decoded_eot() {
+        let tok = test_tokenizer();
+        let a = tok.encode("a")[0];
+        let mut emit = min_tokens_emit(&tok, 8, Vec::new());
+        // The cap arrives (the loop stops feeding) after a suppressed EOS.
+        let (_, stop) = drive_ids(&mut emit, &[a, 1]);
+        assert_eq!(stop, None);
+        assert!(
+            !emit.decoded_eot(),
+            "an EOS below min_tokens is not a decoded end of turn"
+        );
+    }
+
+    #[test]
+    fn min_tokens_zero_stops_on_the_first_token_like_before() {
+        let tok = test_tokenizer();
+        let mut emit = min_tokens_emit(&tok, 0, Vec::new());
+        let (_, stop) = drive_ids(&mut emit, &[1]);
+        assert_eq!(stop, Some((0, StopReason::Eos)));
+    }
+
+    #[test]
+    fn min_tokens_holds_stop_sequences_inactive_until_reached() {
+        let tok = test_tokenizer();
+        let z = tok.encode("Z")[0];
+        // `Z` is the stop: the first two are ordinary text, the 3rd stops.
+        let mut emit = min_tokens_emit(&tok, 2, vec!["Z".to_string()]);
+        let (stream, stop) = drive_ids(&mut emit, &[z, z, z]);
+        assert_eq!(stop, Some((2, StopReason::StopSequence)));
+        assert_eq!(tokens_text(&stream), "ZZ");
+        // Reached before the stop completes: matching resumes mid-stream.
+        let mut emit = min_tokens_emit(&tok, 1, vec!["ZZ".to_string()]);
+        let (stream, stop) = drive_ids(&mut emit, &[z, z, z]);
+        assert_eq!(stop, Some((2, StopReason::StopSequence)));
+        assert_eq!(tokens_text(&stream), "Z", "text after resume is trimmed");
+    }
+
     #[test]
     fn raw_committed_once_per_token_including_markers() {
         let body = format!("x{}", hermes_call("t", r#"{}"#));
@@ -937,6 +1074,7 @@ mod tests {
             tools: None,
             enable_grammar: false,
             stop: vec![first_text.clone()],
+            min_tokens: 0,
             max_think: 0,
             max_tokens: 256,
             assistant_prefix: AssistantPrefix::Plain,
@@ -966,6 +1104,7 @@ mod tests {
             tools: None,
             enable_grammar: false,
             stop: vec!["STOP".to_string()],
+            min_tokens: 0,
             max_think: 0,
             max_tokens: 256,
             assistant_prefix: AssistantPrefix::Plain,
@@ -1008,6 +1147,7 @@ mod tests {
             tools: None,
             enable_grammar: false,
             stop: vec!["STOP".to_string()],
+            min_tokens: 0,
             max_think: 0,
             max_tokens: 256,
             assistant_prefix: AssistantPrefix::Plain,
@@ -1066,6 +1206,7 @@ mod tests {
             tools: None,
             enable_grammar: false,
             stop: Vec::new(),
+            min_tokens: 0,
             max_think,
             max_tokens: 256,
             assistant_prefix,

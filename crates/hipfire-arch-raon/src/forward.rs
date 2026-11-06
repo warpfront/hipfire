@@ -54,17 +54,22 @@ use crate::config::{LayerKind, RaonConfig};
 use crate::mhc::{broadcast_embedding, final_mean_norm, RaonMhcShape, RaonMhcWork};
 use crate::mla::{raon_mla_scale, MlaRoute, RaonMlaWork, RAON_MLA_EPS};
 use crate::moe::{
-    forward_dense, forward_moe, RaonDenseRefs, RaonDenseScratch, RaonMoeDims, RaonMoeLayerRefs,
-    RaonMoeScratch,
+    forward_dense, forward_dense_rows_exact, forward_moe, forward_moe_rows_exact, RaonDenseRefs,
+    RaonDenseScratch, RaonMoeDims, RaonMoeLayerRefs, RaonMoeScratch,
 };
-use crate::projection::{project, OutRound};
+use crate::precision::{RaonPrecisionSite, RaonSiteTiers};
+use crate::projection::{
+    is_mq8, prepare_a8, project, project_prepared, project_shared_f16, share_f16_x, OutRound,
+};
 use crate::rda::{
-    rda_forward_rows, RaonRdaLayer, RdaGeometry, RdaLayerState, RdaProjected, RdaScratch,
+    rda_forward_rows_taped, RaonRdaLayer, RdaGeometry, RdaLayerState, RdaProjected, RdaScratch,
+    RdaTape,
 };
 use crate::state::{RaonPrefillScratch, RaonState, MLA_TILE_ROWS};
 use crate::weights::{
     MhcSiteWeights, MlaWeights, RaonFfn, RaonLayerWeights, RaonMixer, RaonWeights, RdaWeights,
 };
+use hipfire_dispatch::pipeline::PrefillActTier;
 
 // ───────────────────────── module scratch ─────────────────────────
 
@@ -82,14 +87,22 @@ pub struct RaonWork {
     dense: RaonDenseScratch,
     /// MLA route controls, split-KV workspace and absorbed-route operands.
     pub mla: RaonMlaWork,
+    /// Effective prefill activation tier of every site, resolved once at load
+    /// ([`crate::precision`]).
+    site_tiers: RaonSiteTiers,
 }
 
 impl RaonWork {
-    /// Allocate the module scratch for at most `rows` rows.
-    pub fn new(gpu: &mut Gpu, cfg: &RaonConfig, rows: usize) -> Result<Self, String> {
-        if rows == 0 {
-            return Err("raon work: rows == 0".into());
-        }
+    /// Install the load-resolved effective prefill tier of every site (bundle load, once). The
+    /// FFN sites are carried to the MoE/dense programs through the dims; the mixer sites are
+    /// read by the projections.
+    pub fn set_site_tiers(&mut self, tiers: RaonSiteTiers) {
+        self.site_tiers = tiers;
+        self.moe_dims.tiers = tiers;
+    }
+
+    /// Module geometries every work buffer is derived from.
+    fn shapes(cfg: &RaonConfig) -> Result<(RaonMhcShape, RdaGeometry, RaonMoeDims), String> {
         let mhc_shape = RaonMhcShape {
             streams: cfg.mhc_streams,
             width: cfg.hidden,
@@ -121,8 +134,38 @@ impl RaonWork {
             value_beta: cfg.situ_linear_beta,
             router_eps: cfg.router_eps,
             router_scale: cfg.routed_scale,
+            tiers: RaonSiteTiers::ALL_F16,
         };
         moe_dims.validate()?;
+        Ok((mhc_shape, rda_geom, moe_dims))
+    }
+
+    /// Device bytes of the work for `rows` rows once the bundle is assembled
+    /// (every module buffer plus the packed absorbed MLA weights): what the
+    /// prefill chunk admission charges against free memory. `chunked_rda_arch`: the device has
+    /// the chunked RDA kernel ([`Gpu::gated_delta_vector_chunked_arch_supported`]).
+    pub fn required_bytes(
+        cfg: &RaonConfig,
+        rows: usize,
+        chunked_rda_arch: bool,
+    ) -> Result<usize, String> {
+        if rows == 0 {
+            return Err("raon work: rows == 0".into());
+        }
+        let (mhc_shape, rda_geom, moe_dims) = Self::shapes(cfg)?;
+        Ok(RaonMhcWork::required_bytes(&mhc_shape, rows)
+            + RdaScratch::required_bytes(&rda_geom, rows, chunked_rda_arch)
+            + RaonMoeScratch::required_bytes(&moe_dims, rows)?
+            + RaonDenseScratch::required_bytes(&moe_dims, rows)?
+            + RaonMlaWork::required_bytes(cfg, rows)?)
+    }
+
+    /// Allocate the module scratch for at most `rows` rows.
+    pub fn new(gpu: &mut Gpu, cfg: &RaonConfig, rows: usize) -> Result<Self, String> {
+        if rows == 0 {
+            return Err("raon work: rows == 0".into());
+        }
+        let (mhc_shape, rda_geom, moe_dims) = Self::shapes(cfg)?;
         let mhc = RaonMhcWork::new(gpu, &mhc_shape, rows)?;
         let rda = match RdaScratch::new(gpu, &rda_geom, rows) {
             Ok(r) => r,
@@ -168,12 +211,25 @@ impl RaonWork {
             moe,
             dense,
             mla,
+            site_tiers: RaonSiteTiers::ALL_F16,
         })
     }
 
     /// Rows this scratch supports.
     pub fn rows(&self) -> usize {
         self.rows
+    }
+
+    /// RDA geometry (state elements per slot, head count, width): the rollback
+    /// replay launches the recurrence with the verify's own geometry.
+    pub(crate) fn rda_geom(&self) -> &RdaGeometry {
+        &self.rda_geom
+    }
+
+    /// The `[rows, P]` recurrence-output scratch: the rollback replay discards
+    /// its recurrence output here (only the state update matters).
+    pub(crate) fn rda_discard(&self) -> &GpuTensor {
+        &self.rda.y
     }
 
     /// Return every device buffer.
@@ -202,6 +258,9 @@ fn free_rda_scratch(gpu: &mut Gpu, r: RdaScratch) {
     ] {
         let _ = gpu.free_tensor(t);
     }
+    if let Some(c) = r.chunk {
+        let _ = gpu.free_gated_delta_vector_chunk_scratch(c);
+    }
 }
 
 // ───────────────────────── taps ─────────────────────────
@@ -215,10 +274,16 @@ pub enum TapSite {
     Attn(usize),
     /// After the FFN-site postmix of this layer.
     Ffn(usize),
+    /// An intermediate buffer of this layer (census taps): `Stage(layer, name)`
+    /// with a `[rows, width]` F32 view (`width = numel / rows`). The head uses
+    /// layer `n_layers`. Fired only when a tap is armed; never under capture.
+    Stage(usize, &'static str),
 }
 
 /// Observer of the stream state (`[rows, streams, hidden]` F32 holding BF16
-/// values). Oracle only: a tap downloads and is not graph-capturable.
+/// values). Oracle only: a tap downloads and is not graph-capturable. With BF16
+/// stream planes (`HIPFIRE_RAON_MHC_BF16_STREAMS=1`) the forward widens them
+/// exactly into a temporary F32 tensor first, so a tap always sees F32.
 pub type LayerTap<'a> =
     &'a mut dyn FnMut(&mut Gpu, TapSite, &GpuTensor, usize) -> Result<(), String>;
 
@@ -228,11 +293,397 @@ fn fire(
     site: TapSite,
     streams: &GpuTensor,
     rows: usize,
+    width: usize,
 ) -> Result<(), String> {
-    if let Some(t) = tap.as_mut() {
-        (**t)(gpu, site, streams, rows)?;
+    let Some(t) = tap.as_mut() else {
+        return Ok(());
+    };
+    if streams.dtype != rdna_compute::DType::BF16 {
+        return (**t)(gpu, site, streams, rows);
+    }
+    let wide = gpu
+        .alloc_tensor(&[rows, width], rdna_compute::DType::F32)
+        .map_err(|e| format!("raon1_mini: tap staging alloc: {e:?}"))?;
+    let r = gpu
+        .stream_mix_widen_rows(streams, &wide, rows, width, width, 0)
+        .map_err(|e| format!("raon1_mini: tap widen: {e:?}"))
+        .and_then(|()| (**t)(gpu, site, &wide, rows));
+    let _ = gpu.free_tensor(wide);
+    r
+}
+
+/// Fire a stage tap with the first `rows` rows of a `[cap_rows, width]` plane
+/// (`width = numel / cap_rows`) as a `[rows, width]` view.
+fn fire_stage_scratch(
+    tap: &mut Option<LayerTap<'_>>,
+    gpu: &mut Gpu,
+    layer: usize,
+    name: &'static str,
+    t: &GpuTensor,
+    rows: usize,
+    cap_rows: usize,
+) -> Result<(), String> {
+    if tap.is_none() {
+        return Ok(());
+    }
+    fire_stage_width(tap, gpu, layer, name, t, rows, t.numel() / cap_rows)
+}
+
+/// [`fire_stage_scratch`] with an explicit row width (ring planes).
+fn fire_stage_width(
+    tap: &mut Option<LayerTap<'_>>,
+    gpu: &mut Gpu,
+    layer: usize,
+    name: &'static str,
+    t: &GpuTensor,
+    rows: usize,
+    width: usize,
+) -> Result<(), String> {
+    if tap.is_none() {
+        return Ok(());
+    }
+    let view = t.sub_offset(0, rows * width);
+    fire(tap, gpu, TapSite::Stage(layer, name), &view, rows, width)
+}
+
+/// Census taps of an mHC site's controls (`prefix` is `attn` or `ffn`).
+fn stage_route(
+    tap: &mut Option<LayerTap<'_>>,
+    gpu: &mut Gpu,
+    work: &RaonWork,
+    l: usize,
+    rows: usize,
+    prefix: &'static str,
+) -> Result<(), String> {
+    if tap.is_none() {
+        return Ok(());
+    }
+    let names: [&'static str; 4] = if prefix == "attn" {
+        [
+            "attn.route.sel",
+            "attn.route.pre",
+            "attn.route.post",
+            "attn.route.res",
+        ]
+    } else {
+        [
+            "ffn.route.sel",
+            "ffn.route.pre",
+            "ffn.route.post",
+            "ffn.route.res",
+        ]
+    };
+    let c = work.mhc.controls();
+    let planes = [work.mhc.selector_out(), c.pre, c.post, c.res];
+    for (name, t) in names.into_iter().zip(planes) {
+        fire_stage_scratch(tap, gpu, l, name, t, rows, work.rows)?;
     }
     Ok(())
+}
+
+/// Census taps of an RDA layer's intermediates (after `rda_mixer`): the
+/// projections, the conv / prepare / recurrence outputs and the gated plane.
+/// With an armed ring the raw projections and prepare outputs live in the ring
+/// planes, not the scratch ones.
+#[allow(clippy::too_many_arguments)]
+fn stage_rda(
+    tap: &mut Option<LayerTap<'_>>,
+    gpu: &mut Gpu,
+    l: usize,
+    rows: usize,
+    scratch: &RaonPrefillScratch,
+    work: &RaonWork,
+    ring: Option<&RdaRing<'_>>,
+    ri: usize,
+) -> Result<(), String> {
+    if tap.is_none() {
+        return Ok(());
+    }
+    let proj = work.rda_geom.proj();
+    let heads = work.rda_geom.n_heads;
+    let cap = scratch.rows;
+    let rcap = work.rda.max_rows;
+    let tape = ring.map(|r| r.tape(ri, &work.rda_geom));
+    match &tape {
+        Some(t) => {
+            for (name, p, w) in [
+                ("rda.q_raw", &t.q_raw, proj),
+                ("rda.k_raw", &t.k_raw, proj),
+                ("rda.v_raw", &t.v_raw, proj),
+            ] {
+                fire_stage_width(tap, gpu, l, name, p, rows, w)?;
+            }
+        }
+        None => {
+            fire_stage_scratch(tap, gpu, l, "rda.q_raw", &scratch.rda_q_raw, rows, cap)?;
+            fire_stage_scratch(tap, gpu, l, "rda.k_raw", &scratch.rda_k_raw, rows, cap)?;
+            fire_stage_scratch(tap, gpu, l, "rda.v_raw", &scratch.rda_v_raw, rows, cap)?;
+        }
+    }
+    for (name, t) in [
+        ("rda.z", &scratch.rda_z),
+        ("rda.b", &scratch.rda_b),
+        ("rda.delta", &scratch.rda_delta),
+        ("rda.f_lat", &scratch.rda_f_lat),
+        ("rda.f", &scratch.rda_f),
+    ] {
+        fire_stage_scratch(tap, gpu, l, name, t, rows, cap)?;
+    }
+    fire_stage_scratch(tap, gpu, l, "rda.qconv", &work.rda.qconv, rows, rcap)?;
+    fire_stage_scratch(tap, gpu, l, "rda.kconv", &work.rda.kconv, rows, rcap)?;
+    fire_stage_scratch(tap, gpu, l, "rda.vconv", &work.rda.vconv, rows, rcap)?;
+    match &tape {
+        Some(t) => {
+            for (name, p, w) in [
+                ("rda.q", &t.q, proj),
+                ("rda.k", &t.k, proj),
+                ("rda.vprime", &t.vprime, proj),
+                ("rda.log_alpha", &t.log_alpha, proj),
+                ("rda.beta", &t.beta, heads),
+            ] {
+                fire_stage_width(tap, gpu, l, name, p, rows, w)?;
+            }
+        }
+        None => {
+            for (name, p) in [
+                ("rda.q", &work.rda.q),
+                ("rda.k", &work.rda.k),
+                ("rda.vprime", &work.rda.vprime),
+                ("rda.log_alpha", &work.rda.log_alpha),
+                ("rda.beta", &work.rda.beta),
+            ] {
+                fire_stage_scratch(tap, gpu, l, name, p, rows, rcap)?;
+            }
+        }
+    }
+    fire_stage_scratch(tap, gpu, l, "rda.y", &work.rda.y, rows, rcap)?;
+    fire_stage_scratch(tap, gpu, l, "rda.gated", &scratch.rda_gated, rows, cap)
+}
+
+/// Census taps of an MLA layer's intermediates (after `mla_mixer`): the
+/// projections, the normed q_a, q, and the gated attention output.
+fn stage_mla(
+    tap: &mut Option<LayerTap<'_>>,
+    gpu: &mut Gpu,
+    l: usize,
+    rows: usize,
+    scratch: &RaonPrefillScratch,
+) -> Result<(), String> {
+    if tap.is_none() {
+        return Ok(());
+    }
+    let cap = scratch.rows;
+    for (name, t) in [
+        ("mla.qa", &scratch.mla_qa),
+        ("mla.kv_a", &scratch.mla_kv_a),
+        ("mla.g", &scratch.mla_g),
+        ("mla.qa_norm", &scratch.mla_qa_norm),
+        ("mla.q", &scratch.mla_q),
+        ("mla.attn_gated", &scratch.mla_attn),
+    ] {
+        fire_stage_scratch(tap, gpu, l, name, t, rows, cap)?;
+    }
+    Ok(())
+}
+
+/// Device-side capture of the post-FFN mHC carrier for the DFlash2 drafter.
+///
+/// After the FFN site of every listed layer (the buffer `fire(.., TapSite::Ffn(l), ..)`
+/// sees: the layer's OUTPUT, i.e. the input of layer `l + 1`) the forward copies that
+/// layer's `[rows, streams, hidden]` rows into `dst` with one strided device copy, no
+/// download. The drafter's feature of a row is the concatenation, over the listed
+/// layers in order, of the four streams of that layer, stream-major
+/// (`[s0|s1|s2|s3]`, each `hidden` wide): `layers.len() * streams * hidden` F32 per
+/// row, layer `layers[k]` at column offset `k * streams * hidden`.
+///
+/// This is the representation KRAFTON's DFlash2 draft for Raon-1-mini-preview was
+/// trained against (design notes `raon/dflash2/PLAN.md` §2.1): the vLLM fork's
+/// `raon1_mini/model.py` appends `s.flatten(1)` (`[T, 4*H]`, "tap-major,
+/// stream-major") of the carrier after `layer(positions, s)` for every layer in
+/// `aux_hidden_state_layers`, and the llama.cpp port's `raon1.cpp` hands the
+/// drafter `t_layer_inp[il]`, "the output of layer il-1 after its MLP hc_post,
+/// stream-major per token", concatenated per token with layer k at offset
+/// `k * n_embd_tgt`. The raw (un-normalized, pre-final-mean) residual is kept.
+///
+/// No capture means no extra launch: the decode graph and the AR prefill never
+/// pass one.
+#[derive(Clone, Copy)]
+pub struct DflashCapture<'a> {
+    /// Zero-based layers to capture: non-empty, strictly ascending, below the
+    /// layer count ([`validate_extract_layers`]).
+    pub layers: &'a [usize],
+    /// F32 `[>= row0 + rows, layers.len() * streams * hidden]` destination.
+    pub dst: &'a GpuTensor,
+    /// Destination row of the call's first row.
+    pub row0: usize,
+}
+
+/// DFlash extract layers must be non-empty, strictly ascending and below
+/// `n_layers`: one capture slot per layer, in the drafter's `fc` input order.
+pub fn validate_extract_layers(layers: &[usize], n_layers: usize) -> Result<(), String> {
+    if layers.is_empty() {
+        return Err("raon1_mini: DFlash extract layer list is empty".into());
+    }
+    if layers.windows(2).any(|pair| pair[0] >= pair[1]) || layers.iter().any(|&l| l >= n_layers) {
+        return Err(format!(
+            "raon1_mini: DFlash extract layers {layers:?} must be strictly ascending and below \
+             the {n_layers} layers"
+        ));
+    }
+    Ok(())
+}
+
+/// `(dst_row_stride, dst_col_offset)` in F32 elements of the strided copy that
+/// lands layer slot `k` of a `layers`-layer capture of `width`-wide stream rows
+/// at destination row `row0`.
+fn capture_geometry(layers: usize, width: usize, row0: usize, k: usize) -> (usize, usize) {
+    let stride = layers * width;
+    (stride, row0 * stride + k * width)
+}
+
+impl DflashCapture<'_> {
+    fn check(&self, cfg: &RaonConfig, rows: usize) -> Result<(), String> {
+        validate_extract_layers(self.layers, cfg.n_layers)?;
+        let width = cfg.mhc_streams * cfg.hidden;
+        let need = (self.row0 + rows) * self.layers.len() * width;
+        if self.dst.dtype != rdna_compute::DType::F32 || self.dst.numel() < need {
+            return Err(format!(
+                "raon1_mini: DFlash capture buffer holds {} F32 elements, rows {}..{} of {} layers \
+                 need {need}",
+                self.dst.numel(),
+                self.row0,
+                self.row0 + rows,
+                self.layers.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Identity words of the capture a recorded graph baked in: the layer
+    /// list, the destination buffer, its first row and its extent.
+    pub(crate) fn binding_words(&self, out: &mut Vec<u64>) {
+        out.push(self.layers.len() as u64);
+        out.extend(self.layers.iter().map(|&l| l as u64));
+        out.push(self.dst.buf.as_ptr() as u64);
+        out.push(self.dst.numel() as u64);
+        out.push(self.row0 as u64);
+    }
+}
+
+/// Copy the `rows` stream rows of `streams` into capture slot `k`.
+fn capture_streams(
+    gpu: &mut Gpu,
+    cfg: &RaonConfig,
+    cap: &DflashCapture<'_>,
+    k: usize,
+    streams: &GpuTensor,
+    rows: usize,
+) -> Result<(), String> {
+    let width = cfg.mhc_streams * cfg.hidden;
+    let (dst_stride, dst_col) = capture_geometry(cap.layers.len(), width, cap.row0, k);
+    if streams.dtype == rdna_compute::DType::BF16 {
+        return gpu
+            .stream_mix_widen_rows(streams, cap.dst, rows, width, dst_stride, dst_col)
+            .map_err(|e| {
+                format!(
+                    "raon1_mini: DFlash capture of layer {}: {e:?}",
+                    cap.layers[k]
+                )
+            });
+    }
+    gpu.copy_rows_strided_f32(
+        streams, cap.dst, rows, width, width, dst_stride, dst_col, None,
+    )
+    .map_err(|e| {
+        format!(
+            "raon1_mini: DFlash capture of layer {}: {e:?}",
+            cap.layers[k]
+        )
+    })
+}
+
+/// Per-RDA-layer recurrence-input ring of an armed verify (rollback source,
+/// [`crate::rollback`]). One F32 tensor per RDA layer ordinal holding, each as
+/// a row-contiguous `[max_rows, *]` plane and in this order, `q_raw`, `k_raw`,
+/// `v_raw`, `q`, `k`, `vprime`, `log_alpha` (`P = heads * head_dim` wide) and
+/// `beta` (`heads` wide): `max_rows * (7 P + heads)` elements per layer.
+///
+/// Armed, the forward points its RDA projections (raw q/k/v) and
+/// `raon_rda_prepare`'s outputs at these planes instead of the scratch ones: the
+/// launch sequence is the unarmed one (no extra copy), only the pointers differ.
+/// The addresses never move after allocation, so an armed verify is
+/// graph-capture safe.
+#[derive(Clone, Copy)]
+pub struct RdaRing<'a> {
+    /// One tensor per RDA layer ordinal.
+    pub layers: &'a [GpuTensor],
+    /// Rows each plane holds.
+    pub max_rows: usize,
+}
+
+impl RdaRing<'_> {
+    /// Planes of `max_rows * P` elements per layer (the `beta` plane follows them).
+    pub const WIDE_PLANES: usize = 7;
+
+    /// F32 elements of one layer's ring for `max_rows` rows.
+    pub fn layer_elems(max_rows: usize, proj: usize, heads: usize) -> usize {
+        max_rows * (Self::WIDE_PLANES * proj + heads)
+    }
+
+    /// Non-owning plane views of RDA layer `ri`.
+    pub(crate) fn tape(&self, ri: usize, geom: &RdaGeometry) -> RdaTape {
+        let plane = self.max_rows * geom.proj();
+        let t = &self.layers[ri];
+        RdaTape {
+            q_raw: t.sub_offset(0, plane),
+            k_raw: t.sub_offset(plane, plane),
+            v_raw: t.sub_offset(2 * plane, plane),
+            q: t.sub_offset(3 * plane, plane),
+            k: t.sub_offset(4 * plane, plane),
+            vprime: t.sub_offset(5 * plane, plane),
+            log_alpha: t.sub_offset(6 * plane, plane),
+            beta: t.sub_offset(7 * plane, self.max_rows * geom.n_heads),
+        }
+    }
+
+    pub(crate) fn check(
+        &self,
+        geom: &RdaGeometry,
+        n_rda: usize,
+        rows: usize,
+    ) -> Result<(), String> {
+        let need = Self::layer_elems(self.max_rows, geom.proj(), geom.n_heads);
+        if self.layers.len() != n_rda || rows > self.max_rows {
+            return Err(format!(
+                "raon1_mini: RDA ring holds {} layers x {} rows, call needs {n_rda} layers x {rows} rows",
+                self.layers.len(),
+                self.max_rows
+            ));
+        }
+        if let Some(t) = self
+            .layers
+            .iter()
+            .find(|t| t.dtype != rdna_compute::DType::F32 || t.numel() < need)
+        {
+            return Err(format!(
+                "raon1_mini: RDA ring layer holds {} {:?} elements, {need} F32 needed",
+                t.numel(),
+                t.dtype
+            ));
+        }
+        Ok(())
+    }
+
+    /// Every buffer address and extent the armed forward bakes into a launch
+    /// (graph-key words).
+    pub(crate) fn binding_words(&self, out: &mut Vec<u64>) {
+        out.push(self.max_rows as u64);
+        out.push(self.layers.len() as u64);
+        for t in self.layers {
+            out.push(t.buf.as_ptr() as usize as u64);
+            out.push(t.numel() as u64);
+        }
+    }
 }
 
 // ───────────────────────── mHC site bindings ─────────────────────────
@@ -252,19 +703,24 @@ fn run_mix(gpu: &mut Gpu, op: &StreamMixOp<'_>) -> Result<(), String> {
 }
 
 /// Controls of one site from the OLD streams (selector/params are the loaded
-/// `[17, n*hidden]` F32 matrix and the F32 parameter vector of the site).
-fn mhc_route(
+/// `[17, n*hidden]` BF16 (or F32) matrix and the F32 parameter vector of the
+/// site) and its branch input `out = RMSNorm(round(sum_s pre_s X_s))`. One stage:
+/// with `HIPFIRE_RAON_MHC_FUSED=1` the old streams are read once for the weightless
+/// RMS and the aggregate; otherwise the stage launches route then aggregate.
+fn mhc_route_aggregate(
     gpu: &mut Gpu,
     work: &RaonWork,
     site: &MhcSiteWeights,
     rows: usize,
     streams: &GpuTensor,
+    norm: StreamNorm<'_>,
+    out: &GpuTensor,
 ) -> Result<(), String> {
     let shape = &work.mhc_shape;
     let op = mix_op(
         shape,
         rows,
-        StreamMixStage::Route {
+        StreamMixStage::RouteAggregate {
             streams,
             chart: StreamChart::HelmertBounded {
                 selector: &site.selector.buf,
@@ -273,25 +729,6 @@ fn mhc_route(
                 selector_eps: shape.selector_eps,
             },
             selector_out: work.mhc.selector_out(),
-            controls: work.mhc.controls(),
-        },
-    );
-    run_mix(gpu, &op)
-}
-
-fn mhc_aggregate(
-    gpu: &mut Gpu,
-    work: &RaonWork,
-    rows: usize,
-    streams: &GpuTensor,
-    norm: StreamNorm<'_>,
-    out: &GpuTensor,
-) -> Result<(), String> {
-    let op = mix_op(
-        &work.mhc_shape,
-        rows,
-        StreamMixStage::Aggregate {
-            streams,
             controls: work.mhc.controls(),
             norm: Some(norm),
             out,
@@ -324,7 +761,10 @@ fn mhc_postmix(
 // ───────────────────────── mixers ─────────────────────────
 
 /// RDA layer: projections (BF16-rounded) -> `rda_forward_rows` -> `o` projection.
-/// Reads `scratch.branch_in`, writes `scratch.branch_out`.
+/// Reads `scratch.branch_in`, writes `scratch.branch_out`. With a `ring` the raw
+/// q/k/v projections and `raon_rda_prepare`'s outputs land in the ring's planes
+/// (same launches, different pointers).
+#[allow(clippy::too_many_arguments)]
 fn rda_mixer(
     gpu: &mut Gpu,
     w: &RdaWeights,
@@ -333,16 +773,41 @@ fn rda_mixer(
     scratch: &RaonPrefillScratch,
     work: &RaonWork,
     rows: usize,
+    ring: Option<&RdaRing<'_>>,
 ) -> Result<(), String> {
     let x = &scratch.branch_in;
     let b = OutRound::Bf16;
-    project(gpu, &w.q_proj, x, &scratch.rda_q_raw, rows, b)?;
-    project(gpu, &w.k_proj, x, &scratch.rda_k_raw, rows, b)?;
-    project(gpu, &w.v_proj, x, &scratch.rda_v_raw, rows, b)?;
-    project(gpu, &w.g_proj, x, &scratch.rda_z, rows, b)?;
-    project(gpu, &w.b_proj, x, &scratch.rda_b, rows, b)?;
-    project(gpu, &w.rda_w_proj, x, &scratch.rda_delta, rows, b)?;
-    project(gpu, &w.f_a_proj, x, &scratch.rda_f_lat, rows, b)?;
+    let tape = ring.map(|r| r.tape(ri, &work.rda_geom));
+    let (q_raw, k_raw, v_raw) = match &tape {
+        Some(t) => (&t.q_raw, &t.k_raw, &t.v_raw),
+        None => (&scratch.rda_q_raw, &scratch.rda_k_raw, &scratch.rda_v_raw),
+    };
+    let qkvg = work.site_tiers.get(RaonPrecisionSite::RdaQkvg);
+    let f16 = PrefillActTier::F16;
+    // One A8 quantization of `x` serves q/k/v/g (same tier, same input); `None` -> each projection
+    // takes its ordinary route (reuse off, rows < 64, graph capture, non-A8 tier).
+    let prep = prepare_a8(gpu, &w.q_proj, x, rows, qkvg)?;
+    let prep = prep.as_ref();
+    project_prepared(gpu, &w.q_proj, x, q_raw, rows, b, qkvg, prep)?;
+    project_prepared(gpu, &w.k_proj, x, k_raw, rows, b, qkvg, prep)?;
+    project_prepared(gpu, &w.v_proj, x, v_raw, rows, b, qkvg, prep)?;
+    project_prepared(gpu, &w.g_proj, x, &scratch.rda_z, rows, b, qkvg, prep)?;
+    // b / w / f_a read the same plane through the F16 WMMA GEMM: convert it to F16 once and hand
+    // the plane to all three (each launcher would convert it for itself), when all three take that
+    // route; `None` leaves every projection on its ordinary route.
+    // `scratch.x_rot` is never read by the Raon forward: its leading `rows * hidden` words hold the F16 plane.
+    let x16_plane = scratch.x_rot.as_f16_view(rows * w.b_proj.k);
+    let x16 = share_f16_x(
+        gpu,
+        x,
+        x16_plane.as_ref(),
+        rows,
+        f16,
+        &[&w.b_proj, &w.rda_w_proj, &w.f_a_proj],
+    )?;
+    project_shared_f16(gpu, &w.b_proj, x, x16, &scratch.rda_b, rows, b, f16)?;
+    project_shared_f16(gpu, &w.rda_w_proj, x, x16, &scratch.rda_delta, rows, b, f16)?;
+    project_shared_f16(gpu, &w.f_a_proj, x, x16, &scratch.rda_f_lat, rows, b, f16)?;
     project(
         gpu,
         &w.f_b_proj,
@@ -350,6 +815,7 @@ fn rda_mixer(
         &scratch.rda_f,
         rows,
         b,
+        PrefillActTier::F16,
     )?;
 
     let layer = RaonRdaLayer {
@@ -369,15 +835,15 @@ fn rda_mixer(
         state_slot_stride: work.rda_geom.state_elems(),
     };
     let proj = RdaProjected {
-        q_raw: &scratch.rda_q_raw,
-        k_raw: &scratch.rda_k_raw,
-        v_raw: &scratch.rda_v_raw,
+        q_raw,
+        k_raw,
+        v_raw,
         z: &scratch.rda_z,
         b: &scratch.rda_b,
         delta: &scratch.rda_delta,
         f: &scratch.rda_f,
     };
-    rda_forward_rows(
+    rda_forward_rows_taped(
         gpu,
         &work.rda_geom,
         &layer,
@@ -386,6 +852,7 @@ fn rda_mixer(
         &work.rda,
         &scratch.rda_gated,
         rows,
+        tape.as_ref(),
     )?;
     project(
         gpu,
@@ -394,6 +861,7 @@ fn rda_mixer(
         &scratch.branch_out,
         rows,
         b,
+        work.site_tiers.get(RaonPrecisionSite::RdaO),
     )
 }
 
@@ -425,6 +893,7 @@ fn mla_expand(
     mirror: DMirror<'_>,
     range: RowRange,
     count: usize,
+    tier: PrefillActTier,
 ) -> Result<(), String> {
     let geometry = latent_geometry(cfg);
     run_latent(
@@ -443,6 +912,7 @@ fn mla_expand(
         &scratch.mla_kv_tile,
         count,
         OutRound::Exact,
+        tier,
     )?;
     run_latent(
         gpu,
@@ -505,9 +975,29 @@ fn mla_mixer(
         host_pos: Some(start),
     };
 
-    project(gpu, &w.q_a_proj, x, &scratch.mla_qa, rows, b)?;
-    project(gpu, &w.kv_a_proj, x, &scratch.mla_kv_a, rows, b)?;
-    project(gpu, &w.g_proj, x, &scratch.mla_g, rows, b)?;
+    let q_tier = work.site_tiers.get(RaonPrecisionSite::MlaQ);
+    let kv_tier = work.site_tiers.get(RaonPrecisionSite::MlaKv);
+    let go_tier = work.site_tiers.get(RaonPrecisionSite::MlaGo);
+    // q_a / kv_a / g read the same `x`: quantize it once for whichever of them runs A8, or for the
+    // MQ8G256 weights (whose rotated int8 route does not depend on the tier).
+    let prep = if is_mq8(&w.q_a_proj) || [q_tier, kv_tier, go_tier].contains(&PrefillActTier::A8) {
+        prepare_a8(gpu, &w.q_a_proj, x, rows, PrefillActTier::A8)?
+    } else {
+        None
+    };
+    let prep = prep.as_ref();
+    project_prepared(gpu, &w.q_a_proj, x, &scratch.mla_qa, rows, b, q_tier, prep)?;
+    project_prepared(
+        gpu,
+        &w.kv_a_proj,
+        x,
+        &scratch.mla_kv_a,
+        rows,
+        b,
+        kv_tier,
+        prep,
+    )?;
+    project_prepared(gpu, &w.g_proj, x, &scratch.mla_g, rows, b, go_tier, prep)?;
 
     run_latent(
         gpu,
@@ -527,6 +1017,7 @@ fn mla_mixer(
         &scratch.mla_q,
         rows,
         b,
+        q_tier,
     )?;
     run_latent(
         gpu,
@@ -540,16 +1031,43 @@ fn mla_mixer(
         },
     )?;
     if let Some(dm) = dmirror {
-        mla_expand(
-            gpu,
-            cfg,
-            w,
-            scratch,
-            cache,
-            dm,
-            RowRange::NewRows { count: rows },
-            rows,
-        )?;
+        if rows <= MLA_TILE_ROWS {
+            mla_expand(
+                gpu,
+                cfg,
+                w,
+                scratch,
+                cache,
+                dm,
+                RowRange::NewRows { count: rows },
+                rows,
+                kv_tier,
+            )?;
+        } else {
+            // A chunk wider than the decompression tile: expand the new rows
+            // tile by tile at their absolute positions (`start` is the host
+            // copy of the device position `NewRows` would read). Prefill only,
+            // never captured.
+            let mut done = 0;
+            while done < rows {
+                let count = MLA_TILE_ROWS.min(rows - done);
+                mla_expand(
+                    gpu,
+                    cfg,
+                    w,
+                    scratch,
+                    cache,
+                    dm,
+                    RowRange::Absolute {
+                        start: start + done,
+                        count,
+                    },
+                    count,
+                    kv_tier,
+                )?;
+                done += count;
+            }
+        }
     }
     run_latent(
         gpu,
@@ -561,7 +1079,7 @@ fn mla_mixer(
             y: &scratch.mla_attn,
             rows,
             scale: raon_mla_scale(&geometry),
-            route: work.mla.attention_route(route, mi)?,
+            route: work.mla.attention_route(route, mi, rows)?,
         },
     )?;
     run_latent(
@@ -580,6 +1098,7 @@ fn mla_mixer(
         &scratch.branch_out,
         rows,
         b,
+        work.site_tiers.get(RaonPrecisionSite::MlaGo),
     )
 }
 
@@ -594,8 +1113,28 @@ fn ffn_block(
     rows: usize,
 ) -> Result<(), String> {
     match &layer.ffn {
+        RaonFfn::Dense(d) if crate::projection::rows_exact(&gpu.arch, rows) => {
+            // Row-exact verify: every row equals the decode step's MLP row bit for
+            // bit: the decode weight copy (`projections(1)`), Q8 projections through
+            // the multi-row row-exact GEMV (weights read once), other dtypes per row.
+            let (gate, up, down) = d.projections(1);
+            let refs =
+                RaonDenseRefs::from_parts(gate, up, down)?.with_iu4_symmetric(d.iu4_symmetric);
+            forward_dense_rows_exact(
+                gpu,
+                ctx,
+                &work.moe_dims,
+                &refs,
+                rows,
+                &scratch.branch_in,
+                &work.dense,
+                &scratch.ffn_out,
+            )
+        }
         RaonFfn::Dense(d) => {
-            let refs = RaonDenseRefs::from_parts(&d.gate, &d.up, &d.down)?;
+            let (gate, up, down) = d.projections(rows);
+            let refs =
+                RaonDenseRefs::from_parts(gate, up, down)?.with_iu4_symmetric(d.iu4_symmetric);
             forward_dense(
                 gpu,
                 ctx,
@@ -608,18 +1147,29 @@ fn ffn_block(
             )
         }
         RaonFfn::Moe(m) => {
+            // Row-exact verify blocks run every row as the decode step does,
+            // shared expert included: its single-row weights.
+            let rows_exact = crate::projection::rows_exact(&gpu.arch, rows);
+            let (shared_gate, shared_up, shared_down) =
+                m.shared.projections(if rows_exact { 1 } else { rows });
             let refs = RaonMoeLayerRefs::from_parts(
                 &m.router,
                 &m.e_bias,
-                &m.shared.gate,
-                &m.shared.up,
-                &m.shared.down,
+                shared_gate,
+                shared_up,
+                shared_down,
                 &m.expert_gate_up_ptrs,
                 &m.expert_down_ptrs,
                 m.gate_up_awq.as_ref(),
                 m.expert_down_awq_ptrs.as_ref(),
-            );
-            forward_moe(
+            )
+            .with_iu4_symmetric(m.iu4_symmetric, m.shared.iu4_symmetric);
+            let run = if rows_exact {
+                forward_moe_rows_exact
+            } else {
+                forward_moe
+            };
+            run(
                 gpu,
                 ctx,
                 &work.moe_dims,
@@ -701,6 +1251,7 @@ fn ensure_context(
                             dmirror,
                             RowRange::Absolute { start: done, count },
                             count,
+                            work.site_tiers.get(RaonPrecisionSite::MlaKv),
                         )?;
                         done += count;
                     }
@@ -733,8 +1284,36 @@ fn stage_tokens(
         }
         bytes.extend_from_slice(&t.to_le_bytes());
     }
-    gpu.memcpy_htod_auto(&scratch.token_ids.buf, &bytes)
+    // Ordered on the decode stream when there is one (no null-stream hop); blocking otherwise.
+    gpu.htod_stream_ordered(&scratch.token_ids.buf, 0, &bytes)
         .map_err(|e| format!("raon1_mini: upload token ids: {e:?}"))
+}
+
+/// Embedding lookup of the first `rows` staged ids into `out` (`[rows, hidden]`
+/// F32): the raw table rows, no scaling. Device work only; capture-safe.
+pub(crate) fn embed_lookup(
+    cfg: &RaonConfig,
+    w: &RaonWeights,
+    scratch: &RaonPrefillScratch,
+    gpu: &mut Gpu,
+    rows: usize,
+    out: &GpuTensor,
+) -> Result<(), String> {
+    let embed = w.embed_table()?;
+    let res = match w.embed_format {
+        EmbeddingFormat::Q8_0 => {
+            gpu.embedding_lookup_q8_batched(embed, out, &scratch.token_ids, rows, cfg.hidden)
+        }
+        EmbeddingFormat::F32 => {
+            gpu.embedding_lookup_f32_batched(embed, out, &scratch.token_ids, rows, cfg.hidden)
+        }
+        other => {
+            return Err(format!(
+                "raon1_mini: embedding format {other:?} is not routed (expected Q8F16 or F32)"
+            ));
+        }
+    };
+    res.map_err(|e| format!("raon1_mini: embedding lookup: {e:?}"))
 }
 
 /// Embedding lookup of the first `rows` staged ids + stream broadcast. Device
@@ -747,28 +1326,7 @@ fn embed_staged(
     gpu: &mut Gpu,
     rows: usize,
 ) -> Result<(), String> {
-    let res = match w.embed_format {
-        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
-            &w.embed,
-            &scratch.branch_out,
-            &scratch.token_ids,
-            rows,
-            cfg.hidden,
-        ),
-        EmbeddingFormat::F32 => gpu.embedding_lookup_f32_batched(
-            &w.embed,
-            &scratch.branch_out,
-            &scratch.token_ids,
-            rows,
-            cfg.hidden,
-        ),
-        other => {
-            return Err(format!(
-                "raon1_mini: embedding format {other:?} is not routed (expected Q8F16 or F32)"
-            ));
-        }
-    };
-    res.map_err(|e| format!("raon1_mini: embedding lookup: {e:?}"))?;
+    embed_lookup(cfg, w, scratch, gpu, rows, &scratch.branch_out)?;
     broadcast_embedding(
         gpu,
         &work.mhc_shape,
@@ -802,17 +1360,18 @@ pub fn readout_logits(
     let width = cfg.mhc_streams * cfg.hidden;
     let view = scratch.stream_a.sub_offset(row0 * width, count * width);
     let norm = StreamNorm {
-        gamma: &w.final_norm,
+        gamma: w.final_norm_weight()?,
         eps: cfg.rms_eps,
     };
     final_mean_norm(gpu, &work.mhc_shape, count, &view, norm, &scratch.branch_in)?;
     project(
         gpu,
-        &w.lm_head,
+        w.lm_head_weight()?,
         &scratch.branch_in,
         out,
         count,
         OutRound::Bf16,
+        PrefillActTier::F16,
     )
 }
 
@@ -830,7 +1389,10 @@ fn forward_impl(
     start_pos: u32,
     want_logits: bool,
     mut tap: Option<LayerTap<'_>>,
+    capture: Option<&DflashCapture<'_>>,
+    ring: Option<&RdaRing<'_>>,
 ) -> Result<(), String> {
+    require_whole_band(w, "token/row forward")?;
     let rows = tokens.len();
     if rows == 0 || rows > scratch.rows || rows > work.rows {
         return Err(format!(
@@ -847,10 +1409,11 @@ fn forward_impl(
             cfg.n_layers
         ));
     }
-    if cfg.n_mla() > 0 && rows > MLA_TILE_ROWS {
-        return Err(format!(
-            "raon1_mini: {rows} rows exceed the {MLA_TILE_ROWS}-row MLA decompression tile"
-        ));
+    if let Some(cap) = capture {
+        cap.check(cfg, rows)?;
+    }
+    if let Some(r) = ring {
+        r.check(&work.rda_geom, cfg.n_rda(), rows)?;
     }
     let start = start_pos as usize;
     if start != s.n_tokens() {
@@ -873,6 +1436,8 @@ fn forward_impl(
         start,
         want_logits,
         &mut tap,
+        capture,
+        ring,
     )?;
     // One advance per call, after every MLA layer consumed the old length.
     s.set_n_tokens(gpu, end)
@@ -954,10 +1519,53 @@ pub fn decode_body(
         gpu,
         1,
         s.n_tokens(),
-        true,
+        w.band.is_last(),
         &mut None,
+        None,
+        None,
     )?;
     gpu.device_counter_add_i32(&s.seq_len, 1)
+        .map_err(|e| format!("raon1_mini: device seq_len advance: {e:?}"))
+}
+
+/// Device-only verify body: `rows` rows from the slot's current position, no
+/// logits, optional DFlash capture and RDA ring, then a device-side
+/// `seq_len += rows` (graph-recordable like [`decode_body`]; the host mirror is
+/// the caller's). The ring arms the rollback replay ([`RdaRing`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_body(
+    cfg: &RaonConfig,
+    w: &RaonWeights,
+    s: &RaonState,
+    scratch: &RaonPrefillScratch,
+    work: &RaonWork,
+    gpu: &mut Gpu,
+    rows: usize,
+    capture: Option<&DflashCapture<'_>>,
+    ring: Option<&RdaRing<'_>>,
+) -> Result<(), String> {
+    require_whole_band(w, "verify forward")?;
+    if let Some(cap) = capture {
+        cap.check(cfg, rows)?;
+    }
+    if let Some(r) = ring {
+        r.check(&work.rda_geom, cfg.n_rda(), rows)?;
+    }
+    forward_body(
+        cfg,
+        w,
+        s,
+        scratch,
+        work,
+        gpu,
+        rows,
+        s.n_tokens(),
+        false,
+        &mut None,
+        capture,
+        ring,
+    )?;
+    gpu.device_counter_add_i32(&s.seq_len, rows as i32)
         .map_err(|e| format!("raon1_mini: device seq_len advance: {e:?}"))
 }
 
@@ -971,10 +1579,24 @@ pub fn decode_binding(
     scratch: &RaonPrefillScratch,
     work: &RaonWork,
 ) -> u64 {
+    rows_binding(w, s, scratch, work, 1, &[])
+}
+
+/// [`decode_binding`] of a body over `rows` rows (the MLA route is the one of
+/// the context `s.n_tokens() + rows`), with the caller's `extra` identity words
+/// (row count, capture/readout buffers, ...) mixed in last.
+pub(crate) fn rows_binding(
+    w: &RaonWeights,
+    s: &RaonState,
+    scratch: &RaonPrefillScratch,
+    work: &RaonWork,
+    rows: usize,
+    extra: &[u64],
+) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     let mut mix = |v: u64| h = (h ^ v).wrapping_mul(0x100_0000_01b3);
-    mix(w.embed.buf.as_ptr() as u64);
-    mix(w.lm_head.buf.buf.as_ptr() as u64);
+    mix(w.embed.as_ref().map_or(0, |t| t.buf.as_ptr() as u64));
+    mix(w.lm_head.as_ref().map_or(0, |t| t.buf.buf.as_ptr() as u64));
     mix(s.seq_len.buf.as_ptr() as u64);
     for t in s
         .rda
@@ -994,7 +1616,7 @@ pub fn decode_binding(
         }
     }
     // Route (decompressed vs absorbed), split-KV workspace and absorbed operands.
-    mix(mla_route(work, s, s.n_tokens() + 1) as u64);
+    mix(mla_route(work, s, s.n_tokens() + rows) as u64);
     for a in work.mla.binding_key() {
         mix(a as u64);
     }
@@ -1002,6 +1624,9 @@ pub fn decode_binding(
     mix(scratch.logits.buf.as_ptr() as u64);
     mix(scratch.stream_a.buf.as_ptr() as u64);
     mix(scratch.stream_b.buf.as_ptr() as u64);
+    for &e in extra {
+        mix(e);
+    }
     h | 1
 }
 
@@ -1020,9 +1645,22 @@ fn forward_body(
     start: usize,
     want_logits: bool,
     tap: &mut Option<LayerTap<'_>>,
+    capture: Option<&DflashCapture<'_>>,
+    ring: Option<&RdaRing<'_>>,
 ) -> Result<(), String> {
-    embed_staged(cfg, w, scratch, work, gpu, rows)?;
-    fire(tap, gpu, TapSite::Embedding, &scratch.stream_a, rows)?;
+    // A band past the first receives its streams in `scratch.stream_a` (rows
+    // `[0, rows)`) from the previous band instead of embedding.
+    if w.band.is_first() {
+        embed_staged(cfg, w, scratch, work, gpu, rows)?;
+        fire(
+            tap,
+            gpu,
+            TapSite::Embedding,
+            &scratch.stream_a,
+            rows,
+            cfg.mhc_streams * cfg.hidden,
+        )?;
+    }
 
     let mut ctx = DispatchCtx::new(gpu);
     ctx.batch_size = rows;
@@ -1040,10 +1678,10 @@ fn forward_body(
             } else {
                 (&scratch.stream_b, &scratch.stream_a)
             };
-            mhc_route(gpu, work, &layer.attn_mhc, rows, cur)?;
-            mhc_aggregate(
+            mhc_route_aggregate(
                 gpu,
                 work,
+                &layer.attn_mhc,
                 rows,
                 cur,
                 StreamNorm {
@@ -1052,13 +1690,26 @@ fn forward_body(
                 },
                 &scratch.branch_in,
             )?;
+            // The fused stage still writes the selector and control planes, so the census taps
+            // them after it (one stage, same planes as the unfused route).
+            stage_route(tap, gpu, work, l, rows, "attn")?;
+            fire_stage_scratch(
+                tap,
+                gpu,
+                l,
+                "attn.agg",
+                &scratch.branch_in,
+                rows,
+                scratch.rows,
+            )?;
             match (kind, &layer.mixer) {
                 (LayerKind::Rda, RaonMixer::Rda(rw)) => {
                     let ri = cfg
                         .rda_index(l)
                         .ok_or_else(|| format!("raon1_mini: layer {l} has no RDA slot"))?;
-                    rda_mixer(gpu, rw, ri, s, scratch, work, rows)
+                    rda_mixer(gpu, rw, ri, s, scratch, work, rows, ring)
                         .map_err(|e| format!("raon1_mini L{l} rda: {e}"))?;
+                    stage_rda(tap, gpu, l, rows, scratch, work, ring, ri)?;
                 }
                 (LayerKind::Mla, RaonMixer::Mla(mw)) => {
                     let mi = cfg
@@ -1066,6 +1717,7 @@ fn forward_body(
                         .ok_or_else(|| format!("raon1_mini: layer {l} has no MLA slot"))?;
                     mla_mixer(gpu, cfg, mw, mi, s, scratch, work, rows, start)
                         .map_err(|e| format!("raon1_mini L{l} mla: {e}"))?;
+                    stage_mla(tap, gpu, l, rows, scratch)?;
                 }
                 _ => {
                     return Err(format!(
@@ -1073,6 +1725,15 @@ fn forward_body(
                     ))
                 }
             }
+            fire_stage_scratch(
+                tap,
+                gpu,
+                l,
+                "attn.out",
+                &scratch.branch_out,
+                rows,
+                scratch.rows,
+            )?;
             mhc_postmix(gpu, work, rows, cur, &scratch.branch_out, oth)?;
         }
         cur_is_a = !cur_is_a;
@@ -1086,6 +1747,7 @@ fn forward_body(
                 &scratch.stream_b
             },
             rows,
+            cfg.mhc_streams * cfg.hidden,
         )?;
 
         // ── FFN site ──
@@ -1095,10 +1757,10 @@ fn forward_body(
             } else {
                 (&scratch.stream_b, &scratch.stream_a)
             };
-            mhc_route(gpu, work, &layer.ffn_mhc, rows, cur)?;
-            mhc_aggregate(
+            mhc_route_aggregate(
                 gpu,
                 work,
+                &layer.ffn_mhc,
                 rows,
                 cur,
                 StreamNorm {
@@ -1107,8 +1769,22 @@ fn forward_body(
                 },
                 &scratch.branch_in,
             )?;
+            stage_route(tap, gpu, work, l, rows, "ffn")?;
+            // Developer capture (`HIPFIRE_MOE_ROUTE_DUMP` / `HIPFIRE_MOE_ACT_CAPTURE`):
+            // names this layer and its first row's position; a no-op when both are unset.
+            hipfire_dispatch::pipeline::moe_capture::set_site(l, start);
+            fire_stage_scratch(
+                tap,
+                gpu,
+                l,
+                "ffn.agg",
+                &scratch.branch_in,
+                rows,
+                scratch.rows,
+            )?;
             ffn_block(gpu, &ctx, work, layer, scratch, rows)
                 .map_err(|e| format!("raon1_mini L{l} ffn: {e}"))?;
+            fire_stage_scratch(tap, gpu, l, "ffn.out", &scratch.ffn_out, rows, scratch.rows)?;
             mhc_postmix(gpu, work, rows, cur, &scratch.ffn_out, oth)?;
         }
         cur_is_a = !cur_is_a;
@@ -1122,7 +1798,18 @@ fn forward_body(
                 &scratch.stream_b
             },
             rows,
+            cfg.mhc_streams * cfg.hidden,
         )?;
+        if let Some(cap) = capture {
+            if let Some(k) = cap.layers.iter().position(|&id| id == l) {
+                let streams = if cur_is_a {
+                    &scratch.stream_a
+                } else {
+                    &scratch.stream_b
+                };
+                capture_streams(gpu, cfg, cap, k, streams, rows)?;
+            }
+        }
     }
     debug_assert!(
         cur_is_a,
@@ -1139,17 +1826,18 @@ fn forward_body(
         let width = cfg.mhc_streams * cfg.hidden;
         let view = scratch.stream_a.sub_offset(last * width, width);
         let norm = StreamNorm {
-            gamma: &w.final_norm,
+            gamma: w.final_norm_weight()?,
             eps,
         };
         final_mean_norm(gpu, &work.mhc_shape, 1, &view, norm, &scratch.final_norm)?;
         project(
             gpu,
-            &w.lm_head,
+            w.lm_head_weight()?,
             &scratch.final_norm,
             &scratch.logits,
             1,
             OutRound::Bf16,
+            PrefillActTier::F16,
         )?;
     }
     Ok(())
@@ -1197,6 +1885,8 @@ pub fn forward_token_tapped(
         pos,
         want_logits,
         tap,
+        None,
+        None,
     )
 }
 
@@ -1256,5 +1946,271 @@ pub fn forward_rows_tapped(
         start_pos,
         want_logits,
         tap,
+        None,
+        None,
     )
+}
+
+/// [`forward_rows`] with the DFlash2 device capture ([`DflashCapture`]: the
+/// post-FFN carrier of the listed layers lands in `capture.dst` rows
+/// `capture.row0..capture.row0 + tokens.len()`, one strided copy per listed
+/// layer) and the rollback ring ([`RdaRing`]) armed (the RDA recurrence inputs
+/// of every row land in `ring`; same launch sequence). This is the verify
+/// forward (`crate::rollback`); `capture` is present when the drafter wants
+/// this window's features.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_rows_verify(
+    cfg: &RaonConfig,
+    w: &RaonWeights,
+    s: &mut RaonState,
+    scratch: &mut RaonPrefillScratch,
+    work: &mut RaonWork,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+    start_pos: u32,
+    want_logits: bool,
+    capture: Option<&DflashCapture<'_>>,
+    ring: Option<&RdaRing<'_>>,
+) -> Result<(), String> {
+    forward_rows_verify_tapped(
+        cfg,
+        w,
+        s,
+        scratch,
+        work,
+        gpu,
+        tokens,
+        start_pos,
+        want_logits,
+        capture,
+        ring,
+        None,
+    )
+}
+
+/// [`forward_rows_verify`] with an optional observer (census: the same verify
+/// launch sequence, every stage tapped; not graph-capturable).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_rows_verify_tapped(
+    cfg: &RaonConfig,
+    w: &RaonWeights,
+    s: &mut RaonState,
+    scratch: &mut RaonPrefillScratch,
+    work: &mut RaonWork,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+    start_pos: u32,
+    want_logits: bool,
+    capture: Option<&DflashCapture<'_>>,
+    ring: Option<&RdaRing<'_>>,
+    tap: Option<LayerTap<'_>>,
+) -> Result<(), String> {
+    forward_impl(
+        cfg,
+        w,
+        s,
+        scratch,
+        work,
+        gpu,
+        tokens,
+        start_pos,
+        want_logits,
+        tap,
+        capture,
+        ring,
+    )
+}
+
+// ───────────────────────── band forward ─────────────────────────
+//
+// A band ([`crate::band::RaonBand`]) runs its layers only: the first band
+// embeds staged token ids into `scratch.stream_a`, every other band expects the
+// previous band's streams already in `scratch.stream_a` rows `[0, rows)` (the
+// edge, [`crate::band::edge_view`]); the last band reads the logits out. Each
+// band keeps its own `seq_len` / `n_tokens` and advances them once per call.
+//
+// The host work (context admission / map-ahead, token staging) is split from
+// the device-only body so a mesh executor can run the body per rank with no
+// host wait in it.
+
+/// `Err` unless `w` covers the whole model: whole-model logits, speculation
+/// (DFlash capture, verify, rollback) and session snapshots are not defined
+/// under a partial band.
+pub(crate) fn require_whole_band(w: &RaonWeights, what: &str) -> Result<(), String> {
+    if w.band.is_whole() {
+        Ok(())
+    } else {
+        Err(format!(
+            "raon1_mini: {what} is not supported on a partial band ({}): the whole-model \
+             forward, DFlash/speculation, rollback and session snapshots need the whole model \
+             on one device; drive the band with the band forward",
+            w.band.label()
+        ))
+    }
+}
+
+/// What one band call consumes.
+#[derive(Clone, Copy, Debug)]
+pub enum BandInput<'a> {
+    /// The first band: token ids to embed (`1..=scratch rows`).
+    Tokens(&'a [u32]),
+    /// A later band: `rows` stream rows already in `scratch.stream_a`.
+    Streams { rows: usize },
+}
+
+impl BandInput<'_> {
+    /// Rows of the call.
+    pub fn rows(&self) -> usize {
+        match self {
+            BandInput::Tokens(t) => t.len(),
+            BandInput::Streams { rows } => *rows,
+        }
+    }
+}
+
+/// Host phase of a band call: validate the input against the band, admit the
+/// context (map-ahead of the band's latent caches and expanded mirror) for
+/// `n_tokens + rows`, and stage the token ids on the first band. Returns the
+/// rows of the call. Outside capture only.
+#[allow(clippy::too_many_arguments)]
+pub fn band_admit(
+    cfg: &RaonConfig,
+    w: &RaonWeights,
+    s: &mut RaonState,
+    scratch: &RaonPrefillScratch,
+    work: &RaonWork,
+    gpu: &mut Gpu,
+    input: BandInput<'_>,
+) -> Result<usize, String> {
+    let rows = input.rows();
+    if rows == 0 || rows > scratch.rows || rows > work.rows {
+        return Err(format!(
+            "raon1_mini: {rows} rows outside 1..={} (scratch rows {}, work rows {})",
+            scratch.rows.min(work.rows),
+            scratch.rows,
+            work.rows
+        ));
+    }
+    if w.layers.len() != cfg.n_layers || w.layers.len() != w.band.len() {
+        return Err(format!(
+            "raon1_mini: weights hold {} layers, config view {}, {}",
+            w.layers.len(),
+            cfg.n_layers,
+            w.band.label()
+        ));
+    }
+    match input {
+        BandInput::Tokens(_) if !w.band.is_first() => {
+            return Err(format!(
+                "raon1_mini: token input on {}: only the first band embeds",
+                w.band.label()
+            ))
+        }
+        BandInput::Streams { .. } if w.band.is_first() => {
+            return Err(format!(
+                "raon1_mini: stream input on {}: the first band takes tokens",
+                w.band.label()
+            ))
+        }
+        _ => {}
+    }
+    ensure_context(cfg, w, s, scratch, work, gpu, s.n_tokens() + rows)?;
+    if let BandInput::Tokens(tokens) = input {
+        stage_tokens(cfg, scratch, gpu, tokens)?;
+    }
+    Ok(rows)
+}
+
+/// Device-only body of a band call over `rows` rows from the slot's current
+/// position: (first band) embedding of the staged ids, the band's layers,
+/// (last band, `want_logits`) final norm + `lm_head` of the last row into
+/// `scratch.logits`, then a device-side `seq_len += rows`. Issues launches over
+/// stable device buffers only (no host wait), so it is recordable into a
+/// hipGraph at `rows == 1` exactly like [`decode_body`]. The host mirror
+/// ([`RaonState::note_host_tokens`]) is the caller's.
+#[allow(clippy::too_many_arguments)]
+pub fn band_body(
+    cfg: &RaonConfig,
+    w: &RaonWeights,
+    s: &RaonState,
+    scratch: &RaonPrefillScratch,
+    work: &RaonWork,
+    gpu: &mut Gpu,
+    rows: usize,
+    want_logits: bool,
+) -> Result<(), String> {
+    if want_logits && !w.band.is_last() {
+        return Err(format!(
+            "raon1_mini: logits requested on {}: only the last band reads them out",
+            w.band.label()
+        ));
+    }
+    forward_body(
+        cfg,
+        w,
+        s,
+        scratch,
+        work,
+        gpu,
+        rows,
+        s.n_tokens(),
+        want_logits,
+        &mut None,
+        None,
+        None,
+    )?;
+    gpu.device_counter_add_i32(&s.seq_len, rows as i32)
+        .map_err(|e| format!("raon1_mini: device seq_len advance: {e:?}"))
+}
+
+/// One band call: [`band_admit`], [`band_body`], then the host mirror advance.
+/// The slot advances by the call's rows exactly once.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_band(
+    cfg: &RaonConfig,
+    w: &RaonWeights,
+    s: &mut RaonState,
+    scratch: &mut RaonPrefillScratch,
+    work: &mut RaonWork,
+    gpu: &mut Gpu,
+    input: BandInput<'_>,
+    want_logits: bool,
+) -> Result<(), String> {
+    if want_logits && !w.band.is_last() {
+        return Err(format!(
+            "raon1_mini: logits requested on {}: only the last band reads them out",
+            w.band.label()
+        ));
+    }
+    let rows = band_admit(cfg, w, s, scratch, work, gpu, input)?;
+    band_body(cfg, w, s, scratch, work, gpu, rows, want_logits)?;
+    s.note_host_tokens(rows);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_layers_must_be_ascending_and_in_range() {
+        assert!(validate_extract_layers(&[1, 6, 11, 16, 21], 25).is_ok());
+        assert!(validate_extract_layers(&[24], 25).is_ok());
+        assert!(validate_extract_layers(&[], 25).is_err());
+        assert!(validate_extract_layers(&[6, 1], 25).is_err());
+        assert!(validate_extract_layers(&[1, 1], 25).is_err());
+        assert!(validate_extract_layers(&[1, 25], 25).is_err());
+    }
+
+    #[test]
+    fn capture_geometry_is_layer_major_within_a_row() {
+        let width = 4 * 2560;
+        let (stride, col) = capture_geometry(5, width, 0, 0);
+        assert_eq!((stride, col), (51200, 0));
+        let (stride, col) = capture_geometry(5, width, 0, 3);
+        assert_eq!((stride, col), (51200, 3 * 10240));
+        // A later call row offsets by whole destination rows.
+        let (stride, col) = capture_geometry(5, width, 7, 4);
+        assert_eq!((stride, col), (51200, 7 * 51200 + 4 * 10240));
+    }
 }

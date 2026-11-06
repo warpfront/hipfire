@@ -51,8 +51,8 @@ fn writer_is_conditional_with_guards_effects_and_a_witness_requirement() {
         !k.unguarded_unresolved.is_empty(),
         "unguarded refusals stay as diagnostics"
     );
-    assert_eq!(r.schema_version, 8);
-    assert_eq!(r.railgun.section_version, 2);
+    assert_eq!(r.schema_version, 9);
+    assert_eq!(r.railgun.section_version, 3);
     // The object's actual stores into dst (+0): one 8-byte code store
     // (global_store_b64, the compiler merges the 4+4 code words) and one
     // 2-byte scale store; the index load is a 4-byte i32 of positions (+16).

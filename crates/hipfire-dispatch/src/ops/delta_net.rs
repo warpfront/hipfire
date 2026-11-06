@@ -391,10 +391,16 @@ pub struct GatedDeltaOp<'a> {
     pub round_output_bf16: bool,
     pub slot: usize,
     pub strides: GatedDeltaStrides,
+    /// Preallocated chunked-RDA workspace. `Some` offers the launch to the chunked kernel
+    /// (`HIPFIRE_GATED_DELTA_VECTOR_CHUNKED`, default on, exact gfx1201, `head_dim` 128, host slot and
+    /// token count, `n_tokens >= 64`); `None`, flag off or any other shape runs the serial kernel.
+    pub chunk_scratch:
+        Option<&'a rdna_compute::gated_delta_vector_chunk::GatedDeltaVectorChunkScratch>,
 }
 
-/// Execute `op` with the generic serial vector-decay kernel. Unsupported
-/// geometry is a named refusal, never a per-token loop.
+/// Execute `op` with the generic vector-decay kernels: the chunked kernel for admitted
+/// prefill launches (see [`GatedDeltaOp::chunk_scratch`]), otherwise the serial kernel.
+/// Unsupported geometry is a named refusal, never a per-token loop.
 pub fn execute_gated_delta(
     gpu: &mut Gpu,
     op: &GatedDeltaOp<'_>,
@@ -438,6 +444,21 @@ pub fn execute_gated_delta(
         state_row_stride: s.state_row,
         state_slot_stride: s.state_slot,
     };
+    if let Some(scratch) = op.chunk_scratch {
+        if rdna_compute::gated_delta_vector_chunk::chunked_admission(
+            rdna_compute::gated_delta_vector_chunk::chunked_enabled(),
+            &gpu.arch,
+            op.key_dim,
+            op.n_tokens,
+            op.slot_idx.is_some() || op.n_dev.is_some(),
+        )
+        .is_ok()
+        {
+            return gpu
+                .gated_delta_net_vector_chunked_f32(&launch, scratch)
+                .map_err(|e| DispatchError::Hip(e.to_string()));
+        }
+    }
     gpu.gated_delta_net_vector_serial_f32(&launch)
         .map_err(|e| DispatchError::Hip(e.to_string()))
 }

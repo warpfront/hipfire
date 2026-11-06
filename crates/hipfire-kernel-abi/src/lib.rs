@@ -40,6 +40,7 @@ mod check;
 mod expr;
 pub mod families;
 mod validate;
+pub mod work;
 
 pub use check::{check_export, ArgEvidence, Drift, EvidenceSource, ExportEvidence};
 pub use expr::eval;

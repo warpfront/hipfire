@@ -2,7 +2,9 @@
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-// Dense i8-WMMA MMQ GEMM for Q8_0 weights — 4-warp 64x64 tile (gfx1151).
+// Dense i8-WMMA MMQ GEMM for Q8_0 weights — 4-warp 64x64 tile (gfx1151 and gfx1100: RDNA3 and
+// RDNA3.5 share the wave32 `v_wmma_i32_16x16x16_iu8` operand/C layout; the file keeps its
+// gfx1151 name and symbol for the existing DeepSeek4 route).
 //
 // i8 port of gemm_q8_0_wmma_4w: same 64 M-row × 64 N-col tile and LDS-staged
 // activations, but runs i8 WMMA (i32_16x16x16_iu8, ~2x FP16 rate) on Q8_1
@@ -19,7 +21,7 @@
 //
 // Grid: [ceil(M/64), ceil(N/64)]. Block: [128]. LDS: 2KB int8 + 256B scales.
 
-#if defined(__gfx1151__)
+#if defined(__gfx1151__) || defined(__gfx1100__)
 
 #define M_TILE 64
 #define N_TILE 64

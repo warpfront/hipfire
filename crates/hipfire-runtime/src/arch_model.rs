@@ -47,6 +47,7 @@
 //! acknowledgement, session reset, unload — stops branching on architecture.
 
 use crate::llama::KvCache;
+use crate::multi_gpu::Gpus;
 use rdna_compute::Gpu;
 
 /// A loaded model, viewed without knowing its architecture.
@@ -154,6 +155,48 @@ pub trait ArchModel: Send + std::any::Any {
     /// Consumes the box: unload is terminal, and taking `self` by value makes
     /// use-after-free a compile error rather than a runtime one.
     fn free_gpu(self: Box<Self>, gpu: &mut Gpu);
+
+    /// Whether this model runs on a `topology.pp` mesh and so owns its
+    /// lifecycle over the load's [`Gpus`] (`LoadedModel::pp_gpus`): the
+    /// loader and the generation layer then call the `*_mesh` hooks below
+    /// with the daemon's `gpu` and the mesh devices, instead of the
+    /// single-device methods. Default `false`: every other model keeps its
+    /// existing single-device and Qwen3.5/Qwen4 route-specific lifecycle.
+    fn owns_mesh_lifecycle(&self) -> bool {
+        false
+    }
+
+    /// [`Self::reset_session_state`] for a model that owns a mesh lifecycle:
+    /// the reset runs on every rank's device and is drained. Default is the
+    /// single-device reset on the daemon `gpu`.
+    fn reset_session_state_mesh(&mut self, gpu: &mut Gpu, _gpus: &mut Gpus) -> Result<(), String> {
+        self.reset_session_state(gpu)
+    }
+
+    /// [`Self::map_ahead_for_decode`] for a model that owns a mesh lifecycle:
+    /// grow every rank's context-sized state. Default is the single-device
+    /// map-ahead on the daemon `gpu`.
+    fn map_ahead_for_decode_mesh(
+        &mut self,
+        gpu: &mut Gpu,
+        _gpus: &mut Gpus,
+        position: usize,
+        remaining_new_tokens: usize,
+        max_draft_rows: usize,
+    ) {
+        self.map_ahead_for_decode(gpu, position, remaining_new_tokens, max_draft_rows)
+    }
+
+    /// [`Self::free_gpu`] for a model that owns a mesh lifecycle. Drains the
+    /// mesh before freeing anything an epoch could still read, then frees
+    /// every rank on its own device. `Err` means the drain failed and the
+    /// model's resources were leaked on purpose (quarantine): the caller must
+    /// then leak the `Gpus` too and never free under possibly in-flight work.
+    /// Default is the single-device free on the daemon `gpu`.
+    fn free_gpu_mesh(self: Box<Self>, gpu: &mut Gpu, _gpus: &mut Gpus) -> Result<(), String> {
+        self.free_gpu(gpu);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +235,17 @@ mod tests {
         let m = Minimal { dim: 8 };
         assert_eq!(m.dim(), 8);
         assert_eq!(m.arch_key(), "minimal");
+    }
+
+    /// A model that says nothing about meshes owns no mesh lifecycle, so the
+    /// loader and generation layer keep their single-device and Qwen3.5/Qwen4
+    /// routes for it.
+    #[test]
+    fn a_model_owns_no_mesh_lifecycle_by_default() {
+        let m = Minimal { dim: 8 };
+        assert!(!m.owns_mesh_lifecycle());
+        let boxed: Box<dyn ArchModel> = Box::new(m);
+        assert!(!boxed.owns_mesh_lifecycle());
     }
 
     #[test]

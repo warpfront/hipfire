@@ -2543,7 +2543,7 @@ fn wide_case_route_bytes(name: &str) -> &'static [u8] {
 fn wide_case_admitted_on(arch: &str, name: &str) -> bool {
     wide_case_route_bytes(name)
         .iter()
-        .all(|&b| qwen4_slab_codec_admitted(arch, b))
+        .all(|&b| qwen4_slab_codec_admitted(arch, b) && !(arch == "gfx1100" && b == 1))
 }
 /// Invalid-ID slot positions for R rows: the union of the ragged tail (last absolute slot),
 /// every tile-boundary slot inside `10*R` (79/80, 159/160, 319/320, 639), and a fixed 1/13
@@ -4360,14 +4360,8 @@ fn run() -> Result<(Value, bool)> {
             })
             .collect(),
     };
-    if arch == "gfx1100" {
-        for codec in [Codec::W3] {
-            assert!(
-                !qwen4_slab_codec_admitted(&arch, codec.route_byte()),
-                "gfx1100 must not admit W3"
-            );
-        }
-    }
+    // gfx1100 W3 is admitted (decode and prefill) but this oracle's gfx1100 image is the MQ4-only K1
+    // (no mq3i4 symbols): W3 narrow cases are covered by `mq_i4_moe_gemv_gfx1100_w3_g1`, not here.
     let mut funcs = Vec::new();
     let mut loads = Vec::new();
     for (codec, kind, name) in &narrow {
@@ -5482,12 +5476,12 @@ mod tests {
     }
 
     /// Source admission is authoritative: per-arch MQ4/W3/E8P matrix, W2 refused everywhere,
-    /// W3 refused on gfx1100, one cold codec per layer. C1 serves cold 0/1 only (cold 3 is K1).
+    /// W3 admitted on gfx1100 (K1 + K2; its own oracle is `mq_i4_moe_gemv_gfx1100_w3_g1`), one cold codec per layer. C1 serves cold 0/1 only (cold 3 is K1).
     #[test]
     fn source_admission_matrix_and_single_cold() {
         for (arch, mq4, w3, e8p) in [
             ("gfx1201", true, true, true),
-            ("gfx1100", true, false, true),
+            ("gfx1100", true, true, true),
             ("gfx1151", true, true, true),
         ] {
             assert_eq!(qwen4_slab_codec_admitted(arch, 0), mq4, "{arch} MQ4");
@@ -5500,7 +5494,7 @@ mod tests {
         assert_eq!(qwen4_slab_layer_cold_codec("gfx1201", &[3, 0]), Ok(3));
         assert_eq!(qwen4_slab_layer_cold_codec("gfx1100", &[0, 0]), Ok(0));
         assert_eq!(qwen4_slab_layer_cold_codec("gfx1100", &[0, 3]), Ok(3));
-        assert!(qwen4_slab_layer_cold_codec("gfx1100", &[0, 1]).is_err());
+        assert_eq!(qwen4_slab_layer_cold_codec("gfx1100", &[0, 1]), Ok(1));
         assert!(qwen4_slab_layer_cold_codec("gfx1201", &[0, 2]).is_err());
         assert!(slab_moe::k1_rows8_cold_codec(0) && slab_moe::k1_rows8_cold_codec(1));
         assert!(!slab_moe::k1_rows8_cold_codec(3));
@@ -5631,7 +5625,11 @@ mod tests {
             for arch in ["gfx1201", "gfx1100", "gfx1151"] {
                 assert_eq!(
                     wide_case_admitted_on(arch, name),
-                    want.iter().all(|&b| qwen4_slab_codec_admitted(arch, b)),
+                    // This oracle's gfx1100 image is MQ4-only/E8P: W3 wide cases stay out there even
+                    // though gfx1100 W3 is admitted (its own oracle: `mq_i4_moe_gemv_gfx1100_w3_g1`).
+                    want.iter()
+                        .all(|&b| qwen4_slab_codec_admitted(arch, b)
+                            && !(arch == "gfx1100" && b == 1)),
                     "{arch} {name}"
                 );
             }

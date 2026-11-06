@@ -386,18 +386,18 @@ fn config_error(error: hipfire_config::ConfigError) -> WriteError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempHome;
     use std::fs;
 
-    fn temp_config() -> (std::path::PathBuf, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!(
-            "hipfire-tui-writer-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&root).unwrap();
+    /// A private config root per test. `hipfire-config` stages every write in
+    /// `<root>/config.tmp.<pid>`, so two tests that ever share a root race on
+    /// that one file (one test's rename finds it gone; one test's
+    /// read-modify-write is lost). [`TempHome`] names the directory from a
+    /// process-wide counter, which never repeats, and removes it on drop even
+    /// when the test panics. The old pid + wall-clock-nanos name collided when
+    /// two tests read the same nanosecond.
+    fn temp_config() -> (TempHome, std::path::PathBuf) {
+        let root = TempHome::new("writer");
         let path = root.join("config.toml");
         (root, path)
     }
@@ -407,7 +407,7 @@ mod tests {
         let (root, path) = temp_config();
         write_value(&path, "kv_cache", "q8").unwrap();
         write_value(&path, "max_tokens", "8192").unwrap();
-        let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
+        let loaded = load_global(&ConfigPaths::under(&*root)).unwrap();
         assert_eq!(
             loaded.layer.get("memory.kv_cache"),
             Some(&ConfigValue::String("q8".into()))
@@ -416,17 +416,15 @@ mod tests {
             loaded.layer.get("generation.max_tokens"),
             Some(&ConfigValue::Integer(8192))
         );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn shared_validation_rejects_invalid_values() {
-        let (root, path) = temp_config();
+        let (_root, path) = temp_config();
         assert!(write_value(&path, "top_p", "0").is_err());
         assert!(write_value(&path, "port", "70000").is_err());
         assert!(write_value(&path, "kv_cache", "magic4").is_err());
         assert!(!path.exists());
-        let _ = fs::remove_dir_all(root);
     }
 
     /// An empty buffer is the *unset* spelling on a field that cannot hold the
@@ -447,7 +445,7 @@ mod tests {
             Value::Null,
             "whitespace-only input is the same unset spelling"
         );
-        let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
+        let loaded = load_global(&ConfigPaths::under(&*root)).unwrap();
         assert!(
             loaded.layer.get("gpu_layer_budget").is_none(),
             "cleared key is off disk"
@@ -466,7 +464,6 @@ mod tests {
             write_value(&path, "offload_exec", "").is_err(),
             "empty input must not make a non-nullable enum clearable"
         );
-        let _ = fs::remove_dir_all(root);
     }
 
     /// The option list a user can cycle through must be what the schema accepts:
@@ -474,7 +471,7 @@ mod tests {
     /// TUI offers but the schema rejects is a dead end.
     #[test]
     fn offload_exec_options_are_the_schema_values() {
-        let (root, path) = temp_config();
+        let (_root, path) = temp_config();
         let spec = field_spec("offload_exec").expect("offload_exec has a spec");
         let FieldKind::Enum(options) = spec.kind else {
             panic!("offload_exec must be an enum row, got {:?}", spec.kind);
@@ -485,7 +482,6 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{value} must be writable: {e:?}"));
         }
         assert!(write_value(&path, "offload_exec", "gpu").is_err());
-        let _ = fs::remove_dir_all(root);
     }
 
     /// `ple_format` is editable and lands under its canonical schema key.
@@ -498,7 +494,7 @@ mod tests {
             write_value(&path, "ple_format", "q4").unwrap(),
             Value::String("q4".into())
         );
-        let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
+        let loaded = load_global(&ConfigPaths::under(&*root)).unwrap();
         assert_eq!(
             loaded.layer.get("memory.ple_format"),
             Some(&ConfigValue::String("q4".into()))
@@ -506,7 +502,6 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("ple_format"), "{text}");
         assert!(write_value(&path, "ple_format", "q5").is_err());
-        let _ = fs::remove_dir_all(root);
     }
 
     /// The `speculation` row offers exactly the schema's mode list.
@@ -522,12 +517,11 @@ mod tests {
             write_value(&path, "speculation", value)
                 .unwrap_or_else(|e| panic!("{value} must be writable: {e:?}"));
         }
-        let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
+        let loaded = load_global(&ConfigPaths::under(&*root)).unwrap();
         assert_eq!(
             loaded.layer.get("speculation.mode"),
             Some(&ConfigValue::String("dspark".into()))
         );
-        let _ = fs::remove_dir_all(root);
     }
 
     /// Deprecated CASK/PFlash keys are not editable rows.
@@ -570,10 +564,9 @@ mod tests {
         assert!(schema_range("max_seq")
             .unwrap()
             .ends_with(&format!("..={max}")));
-        let (root, path) = temp_config();
+        let (_root, path) = temp_config();
         assert!(write_value(&path, "max_seq", &(max + 1).to_string()).is_err());
         assert!(write_value(&path, "max_seq", &max.to_string()).is_ok());
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -582,13 +575,12 @@ mod tests {
         write_value(&path, "kv_cache", "q8").unwrap();
         write_value(&path, "thinking", "off").unwrap();
         assert!(delete_key(&path, "kv_cache").unwrap());
-        let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
+        let loaded = load_global(&ConfigPaths::under(&*root)).unwrap();
         assert!(loaded.layer.get("kv_cache").is_none());
         assert_eq!(
             loaded.layer.get("thinking"),
             Some(&ConfigValue::String("off".into()))
         );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -626,12 +618,11 @@ mod tests {
         for mode in ["fp8", "bf16", "f16", "f32"] {
             assert!(options.contains(&mode), "{mode}");
         }
-        let (root, path) = temp_config();
+        let (_root, path) = temp_config();
         for mode in options {
             write_value(&path, "memory.kv_cache", mode)
                 .unwrap_or_else(|e| panic!("{mode} must be writable: {e:?}"));
         }
-        let _ = fs::remove_dir_all(root);
     }
 
     /// Every non-deprecated schema field is editable and its kind follows its
@@ -688,7 +679,7 @@ mod tests {
             !text.contains("\"false\"") && !text.contains("\"0\""),
             "{text}"
         );
-        let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
+        let loaded = load_global(&ConfigPaths::under(&*root)).unwrap();
         assert_eq!(
             loaded.layer.get(SYM_IU4_KEY),
             Some(&ConfigValue::Bool(false))
@@ -700,7 +691,6 @@ mod tests {
         );
         assert!(write_value(&path, SYM_IU4_KEY, "maybe").is_err());
         assert!(delete_key(&path, SYM_IU4_KEY).unwrap());
-        let _ = fs::remove_dir_all(root);
     }
 
     /// A virtual row's choice sets or removes each of its keys in one write.
@@ -718,7 +708,7 @@ mod tests {
         let (root, path) = temp_config();
         write_value(&path, "max_tokens", "8192").unwrap();
         write_choice(&path, &choices[1]).unwrap();
-        let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
+        let loaded = load_global(&ConfigPaths::under(&*root)).unwrap();
         assert_eq!(
             loaded.layer.get("kernel.iu4_prefill"),
             Some(&ConfigValue::Bool(false))
@@ -726,13 +716,48 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("iu4_prefill = false"), "{text}");
         write_choice(&path, &choices[0]).unwrap();
-        let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
+        let loaded = load_global(&ConfigPaths::under(&*root)).unwrap();
         assert!(loaded.layer.get("kernel.iu4_prefill").is_none());
         assert_eq!(
             loaded.layer.get("generation.max_tokens"),
             Some(&ConfigValue::Integer(8192)),
             "unrelated keys survive a choice write"
         );
-        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Tests running in parallel must never be handed the same directory.
+    /// Many threads minting roots at the same instant (released together by a
+    /// barrier) get pairwise-distinct paths; a clock-derived name repeats
+    /// within a few thousand draws.
+    #[test]
+    fn temp_config_roots_are_unique_across_threads() {
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 256;
+        let start = std::sync::Barrier::new(THREADS);
+        let roots: Vec<std::path::PathBuf> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        (0..PER_THREAD)
+                            .map(|_| temp_config().0.to_path_buf())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect()
+        });
+        let distinct: std::collections::BTreeSet<_> = roots.iter().collect();
+        for root in &roots {
+            let _ = fs::remove_dir_all(root);
+        }
+        assert_eq!(
+            distinct.len(),
+            THREADS * PER_THREAD,
+            "two temp_config() calls returned the same directory"
+        );
     }
 }

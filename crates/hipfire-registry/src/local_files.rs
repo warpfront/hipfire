@@ -11,7 +11,7 @@
 
 use crate::{
     grandfathered_monolithic_in, is_ple_format_token, GrandfatheredMonolithic, RegistryV1, Sidecar,
-    EXPERT_HOTSET_PINS, RETIRED_MODELS, TRUNK_OVERLAY_PINS,
+    EP_EXPERT_HOTSET_PINS, EXPERT_HOTSET_PINS, RETIRED_MODELS, TRUNK_OVERLAY_PINS,
 };
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -165,6 +165,7 @@ pub fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
     // These sidecars are compiled-in pins, not registry fields.
     files.extend(TRUNK_OVERLAY_PINS.iter().map(|pin| pin.file));
     files.extend(EXPERT_HOTSET_PINS.iter().map(|pin| pin.file));
+    files.extend(EP_EXPERT_HOTSET_PINS.iter().map(|pin| pin.file));
     files
 }
 

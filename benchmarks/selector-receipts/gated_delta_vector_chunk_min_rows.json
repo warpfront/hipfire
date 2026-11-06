@@ -1,0 +1,17 @@
+{
+ "schema": "pm.selector_receipt.v1",
+ "constant": "GATED_DELTA_VECTOR_CHUNK_MIN_ROWS",
+ "value": 64,
+ "covers": true,
+ "arch": "gfx1201",
+ "node": "gated_delta_net_vector_chunked_f32",
+ "vs": "gated_delta_net_vector_serial_f32",
+ "claim": "chunked is faster than the serial PM kernel at every measured row count >= 64 (chunked/serial time 0.59-0.75); rows below 64 are not admitted (a single partial chunk)",
+ "producer": "self-measured by the node bench, not the pm-census sign-test judge",
+ "records": [
+  {
+   "path": "benchmarks/selector-receipts/gated_delta_vector_chunk_min_rows.records.json",
+   "sha256": "fdf52eba59602229d899327a13049a4d0de01f2376e58556a3368a0789d3d2fd"
+  }
+ ]
+}

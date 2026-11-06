@@ -1,0 +1,1 @@
+A train leaves city A at 3:00 pm travelling at 60 mph. A second train leaves city B, 270 miles away, at 3:45 pm travelling toward A at 75 mph. At what time do they meet and how far from A? Work step by step and double-check the arithmetic.

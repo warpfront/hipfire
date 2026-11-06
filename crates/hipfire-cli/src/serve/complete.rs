@@ -1704,6 +1704,10 @@ pub(crate) struct RequestContract {
     /// default and only a ceiling; the daemon fits it to the context left
     /// after the prompt (wire `max_tokens_fit`).
     pub max_tokens_fit: bool,
+    /// vLLM-compatible `min_tokens` (0 = none): EOS and stop sequences stay
+    /// inactive until this many completion tokens are emitted. Never above
+    /// `max_tokens`.
+    pub min_tokens: u64,
     pub messages: serde_json::Value,
     /// Multi-slot only: normalized/default-system-projected messages before
     /// tool-choice prompt instructions are added. Slot ownership uses this
@@ -1768,6 +1772,7 @@ pub(crate) fn project_request_contract(
     if max_tokens == 0 || max_tokens > MAX_TOKENS_CEILING {
         bail_invalid!("max_tokens must be between 1 and 393216");
     }
+    let min_tokens = project_min_tokens(body, max_tokens)?;
     validate_single_choice(body)?;
     if multi_slot {
         validate_multi_slot_request_fields(body)?;
@@ -1786,12 +1791,29 @@ pub(crate) fn project_request_contract(
     Ok(RequestContract {
         max_tokens,
         max_tokens_fit: explicit_max_tokens.is_none(),
+        min_tokens,
         messages,
         conversation_messages,
         tool_choice_policy,
         forwarded_tools,
         response_format,
     })
+}
+
+/// vLLM-compatible `min_tokens`: absent or `null` is 0; otherwise a
+/// non-negative integer no larger than `max_tokens` (400 otherwise, never a
+/// silent clamp).
+fn project_min_tokens(body: &serde_json::Value, max_tokens: u64) -> Result<u64> {
+    let Some(value) = body.get("min_tokens").filter(|v| !v.is_null()) else {
+        return Ok(0);
+    };
+    let Some(min_tokens) = value.as_u64() else {
+        bail_invalid!("min_tokens must be an integer >= 0");
+    };
+    if min_tokens > max_tokens {
+        bail_invalid!("min_tokens ({min_tokens}) must not exceed max_tokens ({max_tokens})");
+    }
+    Ok(min_tokens)
 }
 
 /// Every serve route returns one completion per request: `n` other than 1
@@ -2318,6 +2340,9 @@ pub(crate) fn complete_request_attempt(
         });
         if contract.max_tokens_fit {
             generate["max_tokens_fit"] = serde_json::Value::Bool(true);
+        }
+        if contract.min_tokens > 0 {
+            generate["min_tokens"] = contract.min_tokens.into();
         }
         if let Some(image) = image_base64 {
             generate["image_base64"] = serde_json::Value::String(image);
@@ -2890,6 +2915,13 @@ pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(
     };
     if stop_nonempty {
         return Err("stop sequences are not supported".to_owned());
+    }
+    // `min_tokens` is a daemon decode-loop control; the slot engine has none.
+    if body
+        .get("min_tokens")
+        .is_some_and(|v| !v.is_null() && v.as_u64() != Some(0))
+    {
+        return Err("min_tokens is not supported".to_owned());
     }
     if body.get("logprobs").and_then(serde_json::Value::as_bool) == Some(true)
         || body
@@ -3542,6 +3574,14 @@ pub(crate) fn completion_timings(completion: &Completion) -> serde_json::Value {
         "mtp_windows": done.get("mtp_windows"),
         "ar_windows": done.get("ar_windows"),
         "mtp_retired": done.get("mtp_retired"),
+        "mtp_drafts": done.get("mtp_drafts"),
+        "mtp_accepted": done.get("mtp_accepted"),
+        "mtp_depth_offered": done.get("mtp_depth_offered"),
+        "mtp_depth_reached": done.get("mtp_depth_reached"),
+        "mtp_depth_accepted": done.get("mtp_depth_accepted"),
+        "mtp_copy_windows": done.get("mtp_copy_windows"),
+        "mtp_copy_drafts": done.get("mtp_copy_drafts"),
+        "mtp_copy_accepted": done.get("mtp_copy_accepted"),
         "spec_retired": done.get("spec_retired"),
         "spec_retired_at": done.get("spec_retired_at"),
         "ar_tokens": done.get("ar_tokens"),
@@ -7943,6 +7983,64 @@ mod tests {
                 .unwrap_or_else(|e| panic!("expected ok for {ok}: {e}"));
             assert_eq!(contract.max_tokens, ok);
         }
+    }
+
+    /// vLLM-compatible `min_tokens`: absent/null/0 is neutral, an integer up
+    /// to `max_tokens` passes through, anything else (above `max_tokens`,
+    /// negative, fractional, string) is a typed 400.
+    #[test]
+    fn project_request_contract_validates_min_tokens() {
+        let resolved = contract_resolved_with_system("");
+        let project = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "max_tokens": 16,
+                "messages": [{ "role": "user", "content": "hi" }]
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            project_request_contract(&body, &resolved, false, false)
+        };
+        for neutral in [
+            serde_json::json!({}),
+            serde_json::json!({ "min_tokens": null }),
+            serde_json::json!({ "min_tokens": 0 }),
+        ] {
+            assert_eq!(project(neutral).expect("neutral").min_tokens, 0);
+        }
+        for ok in [1u64, 8, 16] {
+            let contract = project(serde_json::json!({ "min_tokens": ok })).expect("in range");
+            assert_eq!(contract.min_tokens, ok);
+        }
+        let over = project(serde_json::json!({ "min_tokens": 17 })).expect_err("above max_tokens");
+        assert!(
+            over.to_string().contains("must not exceed max_tokens"),
+            "{over}"
+        );
+        for bad in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("3"),
+            serde_json::json!([1]),
+        ] {
+            let err = project(serde_json::json!({ "min_tokens": bad })).expect_err("malformed");
+            assert!(
+                err.to_string().contains("min_tokens must be an integer"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    /// The slot engine has no EOS gate: `min_tokens > 0` is refused, zero and
+    /// null are neutral.
+    #[test]
+    fn multi_slot_refuses_min_tokens_but_not_zero() {
+        let ok = |v: serde_json::Value| multi_slot_request_supported(&v).is_ok();
+        assert!(ok(serde_json::json!({ "min_tokens": 0 })));
+        assert!(ok(serde_json::json!({ "min_tokens": null })));
+        let err = multi_slot_request_supported(&serde_json::json!({ "min_tokens": 4 }))
+            .expect_err("refused");
+        assert!(err.contains("min_tokens"), "{err}");
     }
 
     /// A PRESENT-but-malformed max_tokens must be a typed 400, never a

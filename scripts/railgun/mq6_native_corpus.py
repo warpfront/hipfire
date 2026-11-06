@@ -34,10 +34,10 @@ def main():
     bundle = repo / "kernels/qwen4_lane_rows_pm_gfx1151.hxaco"
     raw = args.receipt.read_bytes()
     receipt = json.loads(raw)
-    if not (receipt.get("schema_version") == 8 and receipt.get("arch") == "gfx1151"
+    if not (receipt.get("schema_version") == 9 and receipt.get("arch") == "gfx1151"
             and receipt.get("object_sha256") == sha(bundle.read_bytes()) == BUNDLE
             and receipt.get("device_elf_sha256") == DEVICE):
-        parser.error("schema-8 receipt must bind the pinned gfx1151 MQ6 bundle/device ELF")
+        parser.error("schema-9 receipt must bind the pinned gfx1151 MQ6 bundle/device ELF")
     kernels = receipt["railgun"]["kernels"]
     selected = [k for k in kernels if k["symbol"] in SYMBOLS]
     if not (len(selected) == 2 and {k["symbol"] for k in selected} == SYMBOLS

@@ -844,6 +844,7 @@ fn decode_run_sequential(
                     state: &mut lane.state,
                     tokens: &plan.batch.tokens[r.rows.begin..r.rows.end()],
                     kind: LaneRowKind::Ar,
+                    wide: false,
                 })
                 .collect();
             let out = LaneOutputs {
@@ -885,6 +886,7 @@ fn decode_run_sequential(
                     state: &mut lane.state,
                     tokens: &plan.batch.tokens[r.rows.begin..r.rows.end()],
                     kind: LaneRowKind::Ar,
+                    wide: false,
                 })
                 .collect();
             launched = true;
@@ -1155,6 +1157,7 @@ fn decode_run_overlap(
                     state: &mut lane.state,
                     tokens: &call.plan.batch.tokens[r.rows.begin..r.rows.end()],
                     kind: LaneRowKind::Ar,
+                    wide: false,
                 })
                 .collect();
             let out = LaneOutputs {
@@ -1180,6 +1183,7 @@ fn decode_run_overlap(
                     state: &mut lane.state,
                     tokens: &call.plan.batch.tokens[r.rows.begin..r.rows.end()],
                     kind: LaneRowKind::Ar,
+                    wide: false,
                 })
                 .collect();
             launched = true;

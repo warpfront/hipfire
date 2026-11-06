@@ -743,6 +743,7 @@ fn ds4_empty_event_eos_seed_not_terminal_flushed_or_history() {
             tools: None,
             enable_grammar: false,
             stop: Vec::new(),
+            min_tokens: 0,
             max_think: 0,
             max_tokens: 16,
             assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,

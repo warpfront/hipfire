@@ -704,6 +704,8 @@ impl RaonConfig {
             // An unparsable value is reported by `MlaPolicy::from_env` at load.
             mirror_q8: crate::mla::MlaPolicy::from_env()
                 .map_or(crate::mla::MlaPolicy::DEFAULT.mirror_q8, |p| p.mirror_q8),
+            // Set by the loader from the speculation mode (`carrier::assemble_raon_bundle`).
+            mirror_bf16_if_covered: false,
         }
     }
 }

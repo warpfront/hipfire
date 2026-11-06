@@ -1030,6 +1030,13 @@ impl Rig {
             .device_mem_info()
             .map_err(|e| format!("vram info: {e}"))?;
 
+        // Placement is decided from planned capacity, never the instantaneous
+        // free figure; the preflight below still refuses on real free bytes.
+        let planned = gpu
+            .planned_capacity()
+            .map_err(|e| format!("vram info: {e}"))?;
+        eprintln!("slots: admission decision: weight placement capacity from {planned}");
+
         let cap_rounded = cfg.cap_tokens.div_ceil(128) * 128;
         let kv_pages = paged_pages.unwrap_or(cfg.n_slots * cap_rounded / 128);
         let kv_rows = n_fa_layers
@@ -1051,7 +1058,7 @@ impl Rig {
             &config,
             cfg,
             &gpu,
-            vram_free as u64,
+            planned.bytes as u64,
             kv,
             hfq.arch_id,
         )?;

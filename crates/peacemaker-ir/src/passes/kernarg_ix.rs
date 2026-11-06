@@ -89,11 +89,52 @@ pub(super) enum Node {
     Add64(Ix, Ix),
     Mul64(Ix, Ix),
     Shl64(Ix, u8),
+    /// The 64-bit pointer a sealed-table entry load produced (dynamic instance
+    /// unique: such loads never sit in CFG cycles).
+    Ent(InstId),
+    // Boolean flags (1 bit): SCC and lane-uniform masks the sealed analysis
+    // follows exactly. Atoms compare exact 32-bit operands (or a 64-bit value
+    // against zero); connectives combine flags.
+    Ltu {
+        a: Ix,
+        b: Ix,
+    },
+    Lts {
+        a: Ix,
+        b: Ix,
+    },
+    Eq {
+        a: Ix,
+        b: Ix,
+    },
+    /// The 64-bit value is zero.
+    Zero64(Ix),
+    /// The flag that always holds.
+    True,
+    Not(Ix),
+    Or(Ix, Ix),
+    And(Ix, Ix),
+    // 32-bit values holding a flag.
+    /// `-1` if the flag holds, else `0`.
+    Mask(Ix),
+    /// `1` if the flag holds, else `0`.
+    Bit(Ix),
+    /// Some value that is nonzero exactly when the flag holds.
+    NzFlag(Ix),
 }
 impl Node {
     fn bits(self) -> u8 {
         match self {
-            Node::C64(_)
+            Node::Ltu { .. }
+            | Node::Lts { .. }
+            | Node::Eq { .. }
+            | Node::Zero64(_)
+            | Node::True
+            | Node::Not(_)
+            | Node::Or(..)
+            | Node::And(..) => 1,
+            Node::Ent(_)
+            | Node::C64(_)
             | Node::K64(_)
             | Node::Sext(_)
             | Node::Zext(_)
@@ -247,6 +288,111 @@ impl Interner {
             return Ix::NONE;
         }
         self.mk(Node::Carry { a, b, lvl }, &[a, b])
+    }
+
+    pub fn ent(&mut self, inst: InstId) -> Ix {
+        self.mk(Node::Ent(inst), &[])
+    }
+    pub fn flag_true(&mut self) -> Ix {
+        self.mk(Node::True, &[])
+    }
+    pub fn is_flag(&self, ix: Ix) -> bool {
+        self.bits(ix) == Some(1)
+    }
+    fn flag_atom(&mut self, n: Node, a: Ix, b: Ix) -> Ix {
+        if !self.is32(a) || !self.is32(b) {
+            return Ix::NONE;
+        }
+        self.mk(n, &[a, b])
+    }
+    /// `a <u b`.
+    pub fn ltu(&mut self, a: Ix, b: Ix) -> Ix {
+        self.flag_atom(Node::Ltu { a, b }, a, b)
+    }
+    /// `a <s b`.
+    pub fn lts(&mut self, a: Ix, b: Ix) -> Ix {
+        self.flag_atom(Node::Lts { a, b }, a, b)
+    }
+    /// `a == b` (operands ordered: equality is symmetric).
+    pub fn eq32(&mut self, a: Ix, b: Ix) -> Ix {
+        let (a, b) = if b < a { (b, a) } else { (a, b) };
+        self.flag_atom(Node::Eq { a, b }, a, b)
+    }
+    /// The 64-bit `w` is zero.
+    pub fn zero64(&mut self, w: Ix) -> Ix {
+        if !self.is64(w) {
+            return Ix::NONE;
+        }
+        self.mk(Node::Zero64(w), &[w])
+    }
+    pub fn flag_not(&mut self, f: Ix) -> Ix {
+        if !self.is_flag(f) {
+            return Ix::NONE;
+        }
+        match self.node(f) {
+            Some(Node::Not(g)) => g,
+            _ => self.mk(Node::Not(f), &[f]),
+        }
+    }
+    pub fn flag_or(&mut self, f: Ix, g: Ix) -> Ix {
+        if !self.is_flag(f) || !self.is_flag(g) {
+            return Ix::NONE;
+        }
+        let (f, g) = if g < f { (g, f) } else { (f, g) };
+        self.mk(Node::Or(f, g), &[f, g])
+    }
+    pub fn flag_and(&mut self, f: Ix, g: Ix) -> Ix {
+        if !self.is_flag(f) || !self.is_flag(g) {
+            return Ix::NONE;
+        }
+        let (f, g) = if g < f { (g, f) } else { (f, g) };
+        self.mk(Node::And(f, g), &[f, g])
+    }
+    pub fn mask(&mut self, f: Ix) -> Ix {
+        if !self.is_flag(f) {
+            return Ix::NONE;
+        }
+        self.mk(Node::Mask(f), &[f])
+    }
+    pub fn bit(&mut self, f: Ix) -> Ix {
+        if !self.is_flag(f) {
+            return Ix::NONE;
+        }
+        self.mk(Node::Bit(f), &[f])
+    }
+    pub fn nz_flag(&mut self, f: Ix) -> Ix {
+        if !self.is_flag(f) {
+            return Ix::NONE;
+        }
+        self.mk(Node::NzFlag(f), &[f])
+    }
+    /// `(flag, value when it holds)` of a flag-holding 32-bit value.
+    pub fn flag_value(&self, ix: Ix) -> Option<(Ix, u32)> {
+        match self.node(ix)? {
+            Node::Mask(f) => Some((f, u32::MAX)),
+            Node::Bit(f) => Some((f, 1)),
+            _ => None,
+        }
+    }
+    /// The atoms (with polarity) that must hold for `flag` to evaluate to
+    /// `value`: through `Not`, a true `And`, a false `Or`. Nothing else is
+    /// concluded (a false `And` or true `Or` implies no single atom).
+    pub fn assume(&self, flag: Ix, value: bool, out: &mut Vec<(Ix, bool)>) {
+        match self.node(flag) {
+            Some(Node::Not(g)) => self.assume(g, !value, out),
+            Some(Node::And(f, g)) if value => {
+                self.assume(f, true, out);
+                self.assume(g, true, out);
+            }
+            Some(Node::Or(f, g)) if !value => {
+                self.assume(f, false, out);
+                self.assume(g, false, out);
+            }
+            Some(Node::Ltu { .. } | Node::Lts { .. } | Node::Eq { .. } | Node::Zero64(_)) => {
+                out.push((flag, value))
+            }
+            _ => {}
+        }
     }
 
     fn sext(&mut self, a: Ix) -> Ix {
@@ -542,6 +688,18 @@ fn to_expr(
         Node::Lo(_) | Node::Hi(_) | Node::Sra31(_) | Node::Carry { .. } => {
             return Err("witness-unmatched-half")
         }
+        Node::Ent(_)
+        | Node::Ltu { .. }
+        | Node::Lts { .. }
+        | Node::Eq { .. }
+        | Node::Zero64(_)
+        | Node::True
+        | Node::Not(_)
+        | Node::Or(..)
+        | Node::And(..)
+        | Node::Mask(_)
+        | Node::Bit(_)
+        | Node::NzFlag(_) => return Err("witness-boolean-in-address"),
     })
 }
 
@@ -579,4 +737,60 @@ pub(super) fn load_ext(e: &IdxExpr, out: &mut std::collections::BTreeMap<u16, Ve
         }
     }
     go(e, None, out);
+}
+
+/// The shape of a sealed-table entry address: `table pointer argument +
+/// (ext(index) << 3)` with a 32-bit `index` that is the value loaded by one
+/// instruction, or a kernarg scalar. The entry stride is the 8-byte pointer.
+pub(super) struct TableShape {
+    pub table_arg_offset: u32,
+    /// The 32-bit index value (`Load(_)` or `K32(_)`).
+    pub index: Ix,
+}
+
+/// Qualify the 64-bit address of a sealed-table entry load. Anything else
+/// (an extra term, another scale, a second pointer, a loaded address word)
+/// refuses; nothing widens to a guess.
+pub(super) fn table_entry(
+    it: &Interner,
+    addr: Ix,
+    classify: &dyn Fn(u32) -> KargKind,
+) -> Result<TableShape, &'static str> {
+    if !it.is64(addr) {
+        return Err("sealed-entry-not-64bit");
+    }
+    let mut terms = Vec::new();
+    it.terms(addr, &mut terms);
+    if terms.len() != 2 {
+        return Err("sealed-entry-shape");
+    }
+    let mut table = None;
+    let mut scaled = None;
+    for t in terms {
+        match it.node(t) {
+            Some(Node::K64(o)) => match classify(o) {
+                KargKind::Pointer { arg_offset } if arg_offset == o && table.is_none() => {
+                    table = Some(o)
+                }
+                _ => return Err("sealed-entry-shape"),
+            },
+            Some(Node::Shl64(x, 3)) if scaled.is_none() => scaled = Some(x),
+            _ => return Err("sealed-entry-shape"),
+        }
+    }
+    let (Some(table_arg_offset), Some(scaled)) = (table, scaled) else {
+        return Err("sealed-entry-shape");
+    };
+    let Some(Node::Sext(index) | Node::Zext(index)) = it.node(scaled) else {
+        return Err("sealed-entry-shape");
+    };
+    match it.node(index) {
+        Some(Node::Load(_)) => {}
+        Some(Node::K32(o)) if classify(o) == KargKind::Scalar => {}
+        _ => return Err("sealed-entry-index"),
+    }
+    Ok(TableShape {
+        table_arg_offset,
+        index,
+    })
 }

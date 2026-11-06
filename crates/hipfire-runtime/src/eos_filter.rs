@@ -115,6 +115,9 @@ struct EosFilterState {
 pub struct EosFilter {
     config: EosFilterConfig,
     state: EosFilterState,
+    /// `min_tokens` not reached yet: `stop_at` markers are dropped from the
+    /// stream instead of ending it.
+    stops_suspended: bool,
 }
 
 impl EosFilter {
@@ -130,6 +133,7 @@ impl EosFilter {
         let in_think = config.strip_think && config.started_in_think;
         Self {
             config,
+            stops_suspended: false,
             state: EosFilterState {
                 in_think,
                 ..EosFilterState::default()
@@ -190,6 +194,13 @@ impl EosFilter {
         };
         self.state.finished = true;
         pending
+    }
+
+    /// Suspend (`true`) or resume (`false`) the `stop_at` end-of-turn markers,
+    /// for `min_tokens`. While suspended a complete marker is dropped from the
+    /// stream (never emitted, never latching `stopped`) and decoding goes on.
+    pub fn set_stops_suspended(&mut self, suspended: bool) {
+        self.stops_suspended = suspended;
     }
 
     /// Compatibility spelling for existing generation callers. This is the
@@ -340,6 +351,11 @@ impl EosFilter {
                     }
                     self.state.cursor = cursor + ev.at + ev.len;
                     match ev.kind {
+                        EventKind::Stop if self.stops_suspended => {
+                            // `min_tokens` not reached: the marker is not a
+                            // stop yet; its bytes are discarded.
+                            continue;
+                        }
                         EventKind::Stop => {
                             // Commit stop. Drain any newly pushed visible
                             // that is safe, then Stop / EmitAndStop.
@@ -724,6 +740,23 @@ mod tests {
     fn stop_at_full_match_returns_stop() {
         let mut f = EosFilter::new(cfg_im_end());
         assert_eq!(f.observe(b"hi"), FilterAction::Emit(b"hi".to_vec()));
+        assert_eq!(f.observe(b"<|im_end|>"), FilterAction::Stop);
+    }
+
+    #[test]
+    fn suspended_stop_markers_are_dropped_then_stop_once_resumed() {
+        // `min_tokens` not reached: the marker is neither shown nor a stop.
+        let mut f = EosFilter::new(cfg_im_end());
+        f.set_stops_suspended(true);
+        assert_eq!(f.observe(b"hi"), FilterAction::Emit(b"hi".to_vec()));
+        assert_eq!(f.observe(b"<|im_end|>"), FilterAction::Hold);
+        assert_eq!(f.observe(b"more"), FilterAction::Emit(b"more".to_vec()));
+        // Marker and prose in one chunk: the prose survives, the marker is gone.
+        assert_eq!(
+            f.observe(b"a<|im_end|>b"),
+            FilterAction::Emit(b"ab".to_vec())
+        );
+        f.set_stops_suspended(false);
         assert_eq!(f.observe(b"<|im_end|>"), FilterAction::Stop);
     }
 
