@@ -34,7 +34,7 @@
 //!
 //! Also checked on every launch: weights, scale and activations are byte-identical and never written; the written
 //! byte set of `y` is exactly `rows * M * 4` (dead columns and capacity padding never stored, sentinel words intact,
-//! guard words intact); `rows == 0` and `rows > 16*NT` write nothing and terminate. Structural test: 80 GEMM + 2 dequant symbols,
+//! guard words intact); `rows == 0` and `rows > 16*NT` write nothing and terminate. Structural test: 80 GEMM + 2 dequant + 4 fused read-up (`tests/hc8_read_up_gfx1201.rs` owns their semantics) symbols,
 //! ABI 48 B, offsets, no scratch/spills/atomics/flat, deterministic emission, native assemble + lift + `Emulator::new`
 //! of every entry.
 //!
@@ -1046,22 +1046,31 @@ fn module_record_abi_resources_and_native_roundtrip() {
     assert_eq!(want_set.len(), 80);
     let got: Vec<String> = symbols();
     let dequant_syms = ["hc8_dequant_bf16", "hc8_dequant_f16"];
+    let read_up_syms: Vec<String> = (1..=4)
+        .map(|nt| format!("hc8_read_up_e4m3_n{nt}"))
+        .collect();
     let mut all_set = want_set.clone();
     all_set.extend(dequant_syms.iter().map(|s| s.to_string()));
+    all_set.extend(read_up_syms.iter().cloned());
     assert_eq!(
         got.iter().cloned().collect::<BTreeSet<_>>(),
         all_set,
-        "exported symbols (spec naming rule + 2 dequant)"
+        "exported symbols (spec naming rule + 2 dequant + 4 fused read-up)"
     );
     assert_eq!(
         got.len(),
-        82,
-        "80 GEMM + 2 dequant, no duplicate or missing export"
+        86,
+        "80 GEMM + 2 dequant + 4 read-up, no duplicate or missing export"
     );
     assert_eq!(
-        &got[80..],
+        &got[80..82],
         &dequant_syms.map(String::from)[..],
         "dequant entries appended after the 80 GEMMs"
+    );
+    assert_eq!(
+        &got[82..],
+        &read_up_syms[..],
+        "fused read-up entries n1..n4 appended after the dequants"
     );
     for g in expected_geos() {
         assert_eq!(g.symbol(), expected_symbol(g), "Geo::symbol");
@@ -1072,8 +1081,8 @@ fn module_record_abi_resources_and_native_roundtrip() {
             assert_eq!(g.grid(m), m / (16 * g.mw), "{}: grid", expected_symbol(g));
         }
     }
-    assert_eq!(emitted.len(), 82);
-    assert_eq!(proof.kernels.len(), 82);
+    assert_eq!(emitted.len(), 86);
+    assert_eq!(proof.kernels.len(), 86);
     let forbidden = [
         "scratch_",
         "buffer_atomic",

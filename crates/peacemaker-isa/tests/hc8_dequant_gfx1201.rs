@@ -303,8 +303,8 @@ fn oracle_covers_edges() {
 #[test]
 fn module_exports_and_resources() {
     let (emitted, text, proof) = emit_module().unwrap();
-    assert_eq!(emitted.len(), 82);
-    assert_eq!(proof.kernels.len(), 82);
+    assert_eq!(emitted.len(), 86);
+    assert_eq!(proof.kernels.len(), 86);
     assert!(
         text.contains(".globl hc8_dequant_bf16\n") && text.contains(".globl hc8_dequant_f16\n")
     );
