@@ -67,6 +67,11 @@ pub struct GroupOrdering {
     /// is refused by the plan unless this covers it, so the node-level edges
     /// above are never the only evidence for a persistent pool.
     task_graph: Option<Range<usize>>,
+    /// Span lists ([`crate::task_graph::TaskGraphProof::spans`]) the check
+    /// proved: GPU-generated routed tasks whose completeness no certificate
+    /// covers, so the admission receipt must carry evidence for it
+    /// ([`crate::admission::Admission::receipt_with_completeness`]).
+    spans: usize,
 }
 
 impl GroupOrdering {
@@ -78,6 +83,7 @@ impl GroupOrdering {
             pending: false,
             pending_reasons: Vec::new(),
             task_graph: None,
+            spans: 0,
         }
     }
 
@@ -89,6 +95,7 @@ impl GroupOrdering {
             pending: false,
             pending_reasons: Vec::new(),
             task_graph: None,
+            spans: 0,
         }
     }
 
@@ -96,6 +103,17 @@ impl GroupOrdering {
     pub(crate) fn with_task_graph(mut self, nodes: Range<usize>) -> Self {
         self.task_graph = Some(nodes);
         self
+    }
+
+    /// The ordering of a proof that covers `lists` span lists.
+    pub(crate) fn with_spans(mut self, lists: usize) -> Self {
+        self.spans = lists;
+        self
+    }
+
+    /// The number of span lists the ordering's task-graph proof covered.
+    pub fn spans(&self) -> usize {
+        self.spans
     }
 
     /// The member range a task-graph check covered, if any.
@@ -114,6 +132,7 @@ impl GroupOrdering {
             pending: true,
             pending_reasons: Vec::new(),
             task_graph: None,
+            spans: 0,
         }
     }
 
@@ -170,6 +189,15 @@ pub struct GroupPlan {
     pub pending: Vec<String>,
     /// The progress proof ([`Pm4Plan::admit_residency`]); `None` until given.
     pub residency: Option<ResidencyProof>,
+    /// Span lists the group's task-graph proof covered
+    /// ([`GroupOrdering::spans`]); the admission then needs completeness
+    /// evidence.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub spans: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// Evidence that every member of a group can be resident at once.

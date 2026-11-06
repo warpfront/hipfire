@@ -58,6 +58,9 @@ const T_TILE_YZ: u32 = 21;
 const T_TILE_XYZ: u32 = 22;
 const T_HID: u32 = 12;
 const T_HIDU: u32 = 13;
+/// The span producer (EXPAND_LIVE): stores into the live list at field 0 and
+/// bumps the count cell at field 8 with a commutative atomic.
+const T_PROD: u32 = 30;
 
 const N: u32 = NONE;
 const ALL: [u32; 4] = [T_COPY, T_READ, T_NOP, T_WRITE];
@@ -81,6 +84,9 @@ fn t(template: u32, record: u32, pred: u32, expected: u32, done: u32) -> TaskHea
         gy: 1,
         gz: 1,
         vcount: 0,
+        flags: 0,
+        k: 0,
+        list_id: 0,
     }
 }
 
@@ -120,6 +126,16 @@ fn template(id: u32) -> ArenaTemplate {
             record_offset: 0,
             classes: vec![SmemLoad],
         }],
+        T_PROD => vec![
+            L {
+                record_offset: 0,
+                classes: vec![VmemStore],
+            },
+            L {
+                record_offset: 8,
+                classes: vec![AtomicCommutative],
+            },
+        ],
         other => panic!("no template {other}"),
     };
     ArenaTemplate {
@@ -1154,6 +1170,10 @@ fn headers_parse_from_the_uploaded_bytes() {
     put(0, l.pred_event_offset, 3);
     put(0, l.expected_offset, 2);
     put(0, l.done_event_offset, 9);
+    // ... as span task 2 of list 3.
+    put(0, l.flags_offset, TASK_FLAG_SPAN);
+    put(0, l.k_offset, 2);
+    put(0, l.list_id_offset, 3);
     // Task 1: no events.
     put(1, l.template_offset, 1);
     put(1, l.pred_event_offset, NONE);
@@ -1175,21 +1195,16 @@ fn headers_parse_from_the_uploaded_bytes() {
                 ka_off: 64,
                 pred_event: 3,
                 expected: 2,
-                done_event: 9
+                done_event: 9,
+                flags: 1,
+                k: 2,
+                list_id: 3,
             },
             TaskHeader {
-                vx: 0,
-                vy: 0,
-                vz: 0,
-                gx: 0,
-                gy: 0,
-                gz: 0,
-                vcount: 0,
                 template: 1,
-                ka_off: 0,
                 pred_event: NONE,
-                expected: 0,
-                done_event: NONE
+                done_event: NONE,
+                ..Default::default()
             },
         ]
     );
@@ -1240,6 +1255,8 @@ fn the_host_grid_must_equal_the_records_hidden_block_counts() {
         "{err}"
     );
 }
+
+mod spans;
 
 #[cfg(feature = "lab")]
 mod lab {

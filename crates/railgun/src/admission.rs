@@ -23,6 +23,19 @@
 //!   `LabPending` admission without a [`DifferentialWitness`], the
 //!   byte-identity of the node's output against Eager on the same fixture.
 //!
+//! # Completeness of GPU-generated task spans
+//!
+//! A task-graph proof with span lists ([`crate::task_graph`], span mode)
+//! proves **safety** only: no out-of-grid or duplicate tile runs, the count
+//! never overflows, the GPU writes no authority. It does not prove that the
+//! producer's live list holds every live tile; that is a functional property
+//! of EXPAND_LIVE. So the admission of such a program is
+//! [`Admission::Spans`] (over whatever its certificates say), and it renders
+//! a receipt only through [`Admission::receipt_with_completeness`] with the
+//! harness-attached [`CompletenessEvidence`] (producer, byte oracle, P0 vs
+//! eager), as `"completeness": ` [`COMPLETENESS_FUNCTIONAL`]; without it
+//! (or via [`Admission::receipt`]) the receipt refuses.
+//!
 //! # What `admit_lab_pending` accepts
 //!
 //! The node must be a registered, receipted kernel (it has a `kref`) whose
@@ -83,6 +96,12 @@ pub fn is_pending_certificate_reason(fragment: &str) -> bool {
     })
 }
 
+/// What the receipt says about a program with GPU-generated task spans: the
+/// certificate proves **safety** (no out-of-grid or duplicate tile, no count
+/// overflow, no GPU-written authority), never that the producer's live list
+/// holds every live tile.
+pub const COMPLETENESS_FUNCTIONAL: &str = "functional (EXPAND_LIVE), not certified";
+
 /// Whether a program (or plan, or group) is certified, or lab-pending.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum Admission {
@@ -91,6 +110,12 @@ pub enum Admission {
     /// At least one node or group ordering awaits its certificate; `reasons`
     /// names each (the exact refusals the certificate would discharge).
     LabPending { reasons: Vec<String> },
+    /// `base`, for a program with `lists` GPU-generated task span lists
+    /// ([`crate::task_graph::TaskGraphProof::spans`]). Whatever `base` says,
+    /// the receipt also names the completeness of the live lists, which no
+    /// certificate covers: it needs harness evidence
+    /// ([`CompletenessEvidence`], [`Admission::receipt_with_completeness`]).
+    Spans { base: Box<Admission>, lists: usize },
 }
 
 impl Admission {
@@ -103,25 +128,88 @@ impl Admission {
         }
     }
 
+    /// This admission for a program with `lists` span lists (itself for
+    /// none).
+    pub fn with_spans(self, lists: usize) -> Self {
+        match self {
+            _ if lists == 0 => self,
+            Self::Spans { base, lists: have } => Self::Spans {
+                base,
+                lists: have + lists,
+            },
+            base => Self::Spans {
+                base: Box::new(base),
+                lists,
+            },
+        }
+    }
+
+    /// The number of span lists whose completeness the receipt must name.
+    pub fn spans(&self) -> usize {
+        match self {
+            Self::Spans { lists, .. } => *lists,
+            _ => 0,
+        }
+    }
+
+    /// Safety rests on certificates only. (Completeness of span lists never
+    /// does: [`Admission::spans`].)
     pub fn is_certified(&self) -> bool {
-        matches!(self, Self::Certified)
+        match self {
+            Self::Certified => true,
+            Self::LabPending { .. } => false,
+            Self::Spans { base, .. } => base.is_certified(),
+        }
     }
 
     /// The receipt record the harness logs. `Certified` is
     /// `{"admission":"proven"}`. `LabPending` needs the eager byte-identity
     /// `witness` ("lab-pending results need the eager byte-identity witness"
     /// otherwise) and renders [`LAB_PENDING`], `"certified": false`, the
-    /// pending reasons and the differential digests.
+    /// pending reasons and the differential digests. An admission with span
+    /// lists never renders here: it needs
+    /// [`Admission::receipt_with_completeness`].
     pub fn receipt(
         &self,
         witness: Option<&DifferentialWitness>,
     ) -> Result<AdmissionReceipt, String> {
+        self.receipt_with_completeness(witness, None)
+    }
+
+    /// [`Admission::receipt`] with the harness-attached completeness
+    /// `evidence`. A program with span lists renders only with it
+    /// (`"completeness": ` [`COMPLETENESS_FUNCTIONAL`] and the evidence next
+    /// to the base admission); evidence for a program without spans is
+    /// refused, so a receipt never claims evidence it has nothing to say
+    /// about.
+    pub fn receipt_with_completeness(
+        &self,
+        witness: Option<&DifferentialWitness>,
+        evidence: Option<&CompletenessEvidence>,
+    ) -> Result<AdmissionReceipt, String> {
         match self {
+            Self::Spans { base, lists } => {
+                let evidence = evidence.ok_or_else(|| {
+                    format!(
+                        "{lists} span list(s): completeness is {COMPLETENESS_FUNCTIONAL} and needs the producer, oracle and P0-vs-eager evidence"
+                    )
+                })?;
+                evidence.validate()?;
+                let mut receipt = base.receipt_with_completeness(witness, None)?;
+                receipt.completeness = Some(COMPLETENESS_FUNCTIONAL);
+                receipt.completeness_evidence = Some(evidence.clone());
+                Ok(receipt)
+            }
+            _ if evidence.is_some() => {
+                Err("completeness evidence given for a program without GPU-generated spans".into())
+            }
             Self::Certified => Ok(AdmissionReceipt {
                 admission: "proven",
                 certified: None,
                 pending: None,
                 differential: None,
+                completeness: None,
+                completeness_evidence: None,
             }),
             Self::LabPending { reasons } => {
                 let witness = witness.ok_or_else(|| {
@@ -132,6 +220,8 @@ impl Admission {
                     certified: Some(false),
                     pending: Some(reasons.clone()),
                     differential: Some(witness.clone()),
+                    completeness: None,
+                    completeness_evidence: None,
                 })
             }
         }
@@ -153,6 +243,43 @@ pub struct AdmissionReceipt {
     /// The eager byte-identity witness; absent when proven.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub differential: Option<DifferentialWitness>,
+    /// [`COMPLETENESS_FUNCTIONAL`] for a program with span lists; absent
+    /// otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completeness: Option<&'static str>,
+    /// The evidence behind `completeness`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completeness_evidence: Option<CompletenessEvidence>,
+}
+
+/// The harness-attached evidence that a span producer's live list is the
+/// eager live set (the one thing the certificate does not prove). Railgun
+/// cannot check it; it only refuses to render without it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CompletenessEvidence {
+    /// The producer (EXPAND_LIVE) the evidence is about: template, object
+    /// digest or job id.
+    pub producer: String,
+    /// The byte oracle that checked the live list (job id or digest).
+    pub oracle: String,
+    /// The P0 (railgun, spans) vs eager byte-identity run (job id or digest).
+    pub p0_vs_eager: String,
+}
+
+impl CompletenessEvidence {
+    /// Every field names something.
+    fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("producer", &self.producer),
+            ("oracle", &self.oracle),
+            ("p0_vs_eager", &self.p0_vs_eager),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("completeness evidence {name} is empty"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The railgun output was compared with Eager's on the same fixture and the
@@ -268,9 +395,15 @@ pub(crate) fn program_pending(program: &KernelProgram) -> Vec<String> {
 
 impl KernelProgram {
     /// [`Admission::Certified`], or [`Admission::LabPending`] naming every
-    /// `LabPending` node and uncertified group ordering.
+    /// `LabPending` node and uncertified group ordering; with span lists, an
+    /// [`Admission::Spans`] over it.
     pub fn admission(&self) -> Admission {
-        Admission::from_reasons(program_pending(self))
+        Admission::from_reasons(program_pending(self)).with_spans(
+            self.groups
+                .iter()
+                .map(|g| g.ordering.spans())
+                .sum::<usize>(),
+        )
     }
 }
 
@@ -279,13 +412,14 @@ impl Pm4Plan {
     /// [`crate::plan::plan`]).
     pub fn admission(&self) -> Admission {
         Admission::from_reasons(self.pending.clone())
+            .with_spans(self.groups.iter().map(|g| g.spans).sum::<usize>())
     }
 }
 
 impl crate::coresident::GroupPlan {
     /// The admission of this group: its `LabPending` members and its ordering.
     pub fn admission(&self) -> Admission {
-        Admission::from_reasons(self.pending.clone())
+        Admission::from_reasons(self.pending.clone()).with_spans(self.spans)
     }
 }
 
@@ -937,5 +1071,43 @@ mod tests {
         assert_eq!(w.eager_sha256(), w.railgun_sha256());
         assert_ne!(w.fixture_sha256(), w.eager_sha256());
         assert_eq!(w.eager_sha256().len(), 64);
+    }
+
+    #[test]
+    fn span_lists_wrap_any_admission_and_never_render_without_evidence() {
+        assert_eq!(Admission::Certified.with_spans(0), Admission::Certified);
+        let once = Admission::Certified.with_spans(1);
+        assert_eq!(once.spans(), 1);
+        assert_eq!(once.clone().with_spans(2).spans(), 3, "lists add up");
+        assert!(once.is_certified());
+        let lab = Admission::LabPending {
+            reasons: vec!["r".into()],
+        }
+        .with_spans(1);
+        assert!(!lab.is_certified());
+        let evidence = CompletenessEvidence {
+            producer: "p".into(),
+            oracle: "o".into(),
+            p0_vs_eager: "e".into(),
+        };
+        let witness = DifferentialWitness::compare(b"f", b"a", b"a").unwrap();
+        for admission in [&once, &lab] {
+            assert!(admission.receipt(Some(&witness)).is_err());
+            assert!(admission
+                .receipt_with_completeness(Some(&witness), None)
+                .is_err());
+        }
+        let r = once
+            .receipt_with_completeness(None, Some(&evidence))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            r#"{"admission":"proven","completeness":"functional (EXPAND_LIVE), not certified","completeness_evidence":{"producer":"p","oracle":"o","p0_vs_eager":"e"}}"#
+        );
+        let r = lab
+            .receipt_with_completeness(Some(&witness), Some(&evidence))
+            .unwrap();
+        assert_eq!(r.admission, LAB_PENDING);
+        assert_eq!(r.completeness, Some(COMPLETENESS_FUNCTIONAL));
     }
 }

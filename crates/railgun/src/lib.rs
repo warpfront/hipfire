@@ -28,12 +28,14 @@
 //! table's content, which `prepare` bounds-checks entry by entry
 //! ([`Via::Slot`]).
 //!
-//! Kernel programs ([`kernel::KernelProgram`]) also name three resource kinds a
+//! Kernel programs ([`kernel::KernelProgram`]) also name four resource kinds a
 //! persistent kernel needs: [`ResourceKind::EventCells`] (atomics and acquire
-//! loads only), [`ResourceKind::TaskArena`] (GPU-rewritten task records) and
+//! loads only), [`ResourceKind::TaskArena`] (GPU-rewritten task records),
 //! [`ResourceKind::BindingRecords`] (pointer records railgun writes at prepare,
 //! like a `PointerTable` immutable during replay and never a copy
-//! destination); see [`descriptor`] and [`coresident`].
+//! destination) and [`ResourceKind::LiveList`] (GPU-generated routed task
+//! coordinates, written only by one producer kernel); see [`descriptor`],
+//! [`coresident`] and [`task_graph`] (span mode).
 pub mod admission;
 pub mod contract;
 pub mod copy;
@@ -157,10 +159,27 @@ pub enum ResourceKind {
     /// [`KernelProgram::bind_records`]: crate::kernel::KernelProgram::bind_records
     /// [`KernelProgram::binding_record_image`]: crate::kernel::KernelProgram::binding_record_image
     BindingRecords(Vec<BindingRecord>),
+    /// A GPU-generated list of routed task coordinates
+    /// ([`KernelProgram::declare_live_list`]): `cap` entries of `stride`
+    /// bytes, entry `k` = `{ vx, vy, vz, pad }` as four little-endian `u32`
+    /// ([`LIVE_ENTRY_BYTES`]). Written **only** by the span producer
+    /// template's kernel (DYNAMIC.md), never by a copy, and read only by the
+    /// pool dispatcher, which validates every entry at consume time
+    /// ([`crate::task_graph`], `span_entry_validated`): the GPU writes data,
+    /// never authority.
+    ///
+    /// [`KernelProgram::declare_live_list`]: crate::kernel::KernelProgram::declare_live_list
+    LiveList {
+        cap: u32,
+        stride: u32,
+    },
 }
 
 /// Bytes of one event cell (design §8.1 `EventCell`: four `u32`).
 pub const EVENT_CELL_BYTES: u64 = 16;
+
+/// Bytes of one [`ResourceKind::LiveList`] entry: `{ vx, vy, vz, pad }`.
+pub const LIVE_ENTRY_BYTES: u64 = 16;
 
 /// One record of a [`ResourceKind::BindingRecords`] arena: an instance of
 /// `template` at `base`, whose pointer `fields` and `u32` `scalars` railgun
@@ -502,6 +521,8 @@ pub enum PrepareError {
     WritesTable { node: usize, label: String },
     #[error("node {node}: writes binding records {label}")]
     WritesBindingRecords { node: usize, label: String },
+    #[error("node {node}: writes live list {label}: only the span producer kernel writes it")]
+    WritesLiveList { node: usize, label: String },
     #[error("node {node}: resource {label} is not a PointerTable")]
     NotATable { node: usize, label: String },
     #[error("node {node}: pointer table {label} is already used by another CopyBatch")]
@@ -805,6 +826,12 @@ impl Env<'_> {
         }
         if len > 0 && matches!(dst_resource.kind, ResourceKind::BindingRecords(_)) {
             return Err(PrepareError::WritesBindingRecords {
+                node,
+                label: dst_resource.label.clone(),
+            });
+        }
+        if len > 0 && matches!(dst_resource.kind, ResourceKind::LiveList { .. }) {
+            return Err(PrepareError::WritesLiveList {
                 node,
                 label: dst_resource.label.clone(),
             });

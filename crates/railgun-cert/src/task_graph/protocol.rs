@@ -70,6 +70,33 @@
 //!   and not provable here. `wg_yz` is `vy | vz << 16` without masking: it equals the
 //!   hardware `ttmp7` only for `vy, vz < 65536`.
 //!
+//! Span mode (railgunmega/DYNAMIC.md; a dispatcher that has it proves the two properties below or
+//! the pool is refused, because its table accesses would be unattributed): the header's flags word
+//! is `0` (a static task, `region_wg_from_header` as before) or `1` (span mode), anything else
+//! poisons (the task's template becomes NONE, so no region runs). A span task reads the table at a
+//! params pointer (null poisons) and descriptor `list_id` (`list_id >= n_spans` poisons) =
+//! `{live_list, count_cell, bitmap, K}`; every one of these is a symbolic value (`E::SpanId`,
+//! `E::SpanFld`, `E::SpanCountLe`, `E::SpanIdx`, `E::Entry`) that exists only on the edge of its
+//! compare, so the proof is structural:
+//!
+//! * `span_entry_validated`: the count load is a single-lane plain load of the descriptor's count
+//!   cell (ordered after the pred acquire whenever `pred != NONE`: the evidence says so), `count >
+//!   K` branches to poison, `k >= count` branches to the NOP template (a constant outside the
+//!   note's table: no region, the done release is reached without a body), the entry load's
+//!   address is `live_list + 16 * k` with `k < count <= K`, the three entry coordinates are
+//!   compared against the header grid (`vx < gx`, `vy < gy`, `vz < gz`, failing edges to poison),
+//!   the claim bitmap word `bit >> 5` of `bit = vx + gx * (vy + gy * vz)` is OR-ed with `1 << (bit &
+//!   31)` by a returning device-scope atomic and a set bit branches to poison. Each compare edge
+//!   sets a fact bit (`SP_ALL`); a region entry on a span-mode path (the facts the slot's store
+//!   event, or the single wave's path, carries) needs all of them.
+//! * `region_wg_from_live_entry`: on those paths `wg_x = entry.vx + step` with the step counter
+//!   bounded by the constant 1 (the dispatcher forces `vcount := 1`) and `wg_yz = entry.vy |
+//!   entry.vz << 16`, the entry values carried through the broadcast.
+//!
+//! Poison is the existing `tmpl == NONE` path; its edges never reach a region for the same reason
+//! the watchdog's do (no `tmpl == t` edge is feasible). The accesses through table-loaded pointers
+//! are returned as [`SpanSite`]s for the shell attribution (`task_graph`).
+//!
 //! Multi-wave pools: waves other than 0 run no claim code and take the
 //! descriptor from the LDS slot wave 0 filled before a barrier; the check proves
 //! the two roles reach the same first barrier, that control is wave-uniform from
@@ -90,8 +117,9 @@ use peacemaker_ir::wait::Counter;
 use peacemaker_lift::regions_note::KernelRegions;
 use peacemaker_lift::text::print::canonical;
 use railgun_corpus::receipt::{
-    TaskGridOffsets, TaskProtocolRecord, TASK_PROTO_ACQUIRE, TASK_PROTO_BOUNDED, TASK_PROTO_CLAIM,
-    TASK_PROTO_COMPLETE, TASK_PROTO_ONCE, TASK_PROTO_REGION_WG, TASK_PROTO_RELEASE,
+    TaskGridOffsets, TaskProtocolRecord, TaskSpanOffsets, TASK_PROTO_ACQUIRE, TASK_PROTO_BOUNDED,
+    TASK_PROTO_CLAIM, TASK_PROTO_COMPLETE, TASK_PROTO_ONCE, TASK_PROTO_REGION_WG,
+    TASK_PROTO_REGION_WG_LIVE, TASK_PROTO_RELEASE, TASK_PROTO_SPAN_ENTRY,
 };
 
 use super::{refuse, Placed, Refusal, RegionFacts};
@@ -115,6 +143,18 @@ const DIV2: u32 = 1 << 14; // in the wave-0-only tail after the release barrier
 const STORED: u32 = 1 << 15; // this wave stored the LDS slot, no barrier since
 const LOADED: u32 = 1 << 16; // this wave loaded the LDS slot, no barrier since
 const RAN: u32 = 1 << 17; // the region of the current step-loop trip was entered
+/// Span mode facts (DYNAMIC.md): what the path of a span-mode header has established.
+const SP0: u32 = 1 << 18; // header flags == 0 (a static task)
+const SP1: u32 = 1 << 19; // header flags == 1 (span mode)
+const SPN: u32 = 1 << 20; // the span table pointer is nonzero
+const SPX: u32 = 1 << 21; // entry.vx < header gx
+const SPY: u32 = 1 << 22; // entry.vy < header gy
+const SPZ: u32 = 1 << 23; // entry.vz < header gz
+const SPC: u32 = 1 << 24; // the claim bitmap's bit of the entry was clear (returning atomic OR)
+const SPK: u32 = 1 << 25; // on the `k >= count` (NOP) edge
+/// Every fact a span-mode path needs before a region (the live-list index, the count
+/// bound and the table index are proved structurally, by the value of the address).
+const SP_ALL: u32 = SP1 | SPN | SPX | SPY | SPZ | SPC;
 
 const NONE: u32 = u32::MAX;
 const MAX_ALTS: usize = 6;
@@ -204,6 +244,58 @@ enum E {
         head: usize,
         bound: Box<E>,
     },
+    /// Span mode: `n_spans`, the u32 at byte 0 of the span table.
+    SpanN,
+    /// Header dword at this offset (the list id) after `list_id < n_spans` held.
+    SpanId(u32),
+    /// Dword of span descriptor `list_id`: `off` is its byte offset in the descriptor
+    /// (0 live list, 8 count cell, 16 bitmap: pointer pairs, `hi` the upper dword; 24: K).
+    SpanFld {
+        off: u8,
+        hi: bool,
+    },
+    /// The live count the count load read.
+    SpanCount,
+    /// The live count after `count <= K` held.
+    SpanCountLe,
+    /// Header dword at this offset (the span-relative index k) after `k < count <= K` held.
+    SpanIdx(u32),
+    /// Dword `.0` (0 vx, 1 vy, 2 vz, 3 pad) of the live entry the entry load read.
+    Entry(u8),
+    /// `a * b` (32-bit, low half) of the claim-bitmap index computation.
+    Mul(Box<E>, Box<E>),
+    /// A stage of the claim-bitmap index of an entry; `gx`/`gy` are the header offsets of
+    /// the grid extents it multiplies by.
+    Tile {
+        st: TileSt,
+        gx: u32,
+        gy: u32,
+    },
+    /// Lane 0's mask of `a >= b` (unsigned), and of `x != 0`.
+    GeMask(Box<E>, Box<E>),
+    NzMask(Box<E>),
+}
+
+/// A stage of the claim-bitmap index computation `bit = vx + gx * (vy + gy * vz)` of a span
+/// entry (`gx`/`gy` the header offsets of the grid extents it multiplies by).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum TileSt {
+    /// `vy + gy * vz`
+    Yz,
+    /// `bit`
+    Idx,
+    /// `bit >> 5`
+    Word,
+    /// `(bit >> 5) << 2`
+    WordOff,
+    /// `bit & 31`
+    Low,
+    /// `1 << (bit & 31)`
+    Mask,
+    /// The bitmap word the returning atomic OR read.
+    Old,
+    /// `old & mask`
+    Hit,
 }
 
 impl E {
@@ -225,6 +317,8 @@ impl E {
             E::EventAt { idx, .. } => 1 + idx.depth(),
             E::PtrLo { add, .. } | E::PtrHi { add, .. } => 1 + add.depth(),
             E::Or(a, b) | E::Add(a, b) => 1 + a.depth().max(b.depth()),
+            E::Mul(a, b) | E::GeMask(a, b) => 1 + a.depth().max(b.depth()),
+            E::NzMask(x) => 1 + x.depth(),
             E::Trip { bound, .. } | E::TripNext { bound, .. } | E::TripCont { bound, .. } => {
                 1 + bound.depth()
             }
@@ -242,10 +336,20 @@ impl E {
             | E::EventAt { .. }
             | E::Trip { .. }
             | E::TripNext { .. }
-            | E::TripCont { .. } => true,
-            E::Shl(x, _) | E::MaxOne(x) => x.per_claim(),
+            | E::TripCont { .. }
+            | E::SpanN
+            | E::SpanId(_)
+            | E::SpanFld { .. }
+            | E::SpanCount
+            | E::SpanCountLe
+            | E::SpanIdx(_)
+            | E::Entry(_)
+            | E::Tile { .. } => true,
+            E::Shl(x, _) | E::MaxOne(x) | E::NzMask(x) => x.per_claim(),
             E::PtrLo { add, .. } | E::PtrHi { add, .. } => add.per_claim(),
-            E::Or(a, b) | E::Add(a, b) => a.per_claim() || b.per_claim(),
+            E::Or(a, b) | E::Add(a, b) | E::Mul(a, b) | E::GeMask(a, b) => {
+                a.per_claim() || b.per_claim()
+            }
             _ => false,
         }
     }
@@ -782,6 +886,40 @@ struct Walk<'a> {
     steps: BTreeMap<usize, StepLoop>,
 }
 
+/// What the walk saw of span mode (DYNAMIC.md).
+#[derive(Default)]
+struct SpanRun {
+    /// Header offsets compared against 0/1 as the flags word, used as the span-relative
+    /// index k, used as the list id (each must resolve to exactly one).
+    flags: BTreeSet<u32>,
+    k: BTreeSet<u32>,
+    list: BTreeSet<u32>,
+    /// Params offsets of the span table pointer (null-checked).
+    spans_arg: BTreeSet<u32>,
+    /// Header offsets of the grid extent each entry axis was compared against.
+    grid: [BTreeSet<u32>; 3],
+    /// `(gx, gy)` header offsets of the bitmap index and of its tested bit.
+    tile: BTreeSet<(u32, u32)>,
+    /// The count load can be reached without a pred acquire (pred == NONE).
+    count_unordered: bool,
+    /// The done release was reached on the `k >= count` edge without a body.
+    nop_release: bool,
+    /// Constants written over a register holding header dword `.0`.
+    overwrites: BTreeSet<(u32, u32)>,
+    /// Span-table accesses: position -> (descriptor field byte offset, A1 class).
+    sites: BTreeMap<usize, (u8, &'static str)>,
+    /// Positions of the count load, the entry load and the bitmap atomic.
+    count_sites: BTreeSet<usize>,
+    entry_sites: BTreeSet<usize>,
+    claim_sites: BTreeSet<usize>,
+    /// Table loads (n_spans and descriptor fields).
+    table_sites: BTreeSet<usize>,
+    /// Region entries whose path is neither a static (flags == 0) nor a span-mode one.
+    unclassified: BTreeSet<u32>,
+    /// Span entries checked at region entry, by template.
+    live_regions: BTreeSet<u32>,
+}
+
 #[derive(Default)]
 struct Run {
     refusals: BTreeSet<(usize, &'static str, String)>,
@@ -799,6 +937,7 @@ struct Run {
     /// Header dwords the three b128 loads produced.
     hdr_loaded: BTreeSet<u32>,
     wg: WgRun,
+    span: SpanRun,
 }
 
 fn set_once<T: PartialEq + Copy + std::fmt::Debug>(
@@ -1053,6 +1192,15 @@ impl Walk<'_> {
                     };
                 } else {
                     let v = self.value(st, &ops[1]);
+                    // a constant written over a header dword (the template VGPR's NOP and
+                    // poison values)
+                    if let (Some((Rk::V, r, 1)), Some(E::Const(c))) =
+                        (parse_reg(&ops[0]), single(&v))
+                    {
+                        if let Some(E::Hdr(k)) = st.v.get(&r).and_then(only) {
+                            run.span.overwrites.insert((*k, *c));
+                        }
+                    }
                     self.put(st, &ops[0], v);
                 }
             }
@@ -1095,9 +1243,38 @@ impl Walk<'_> {
                 let lane = self.value(st, &ops[2]) == Some(one(E::Lane));
                 if wave && lane && st.exec == Exec::Full {
                     self.put(st, &ops[0], Some(one(E::Tid)));
+                } else if let Some(e) = self.tile_add(st, &ops[1], &ops[2]) {
+                    self.put(st, &ops[0], Some(one(e)));
                 } else {
                     handled = false;
                 }
+            }
+            "v_mul_lo_u32" | "v_and_b32_e32" | "v_and_b32" | "v_and_b32_e64"
+            | "v_lshrrev_b32_e32" | "v_lshrrev_b32" | "v_lshlrev_b32_e32" | "v_lshlrev_b32"
+            | "v_lshlrev_b32_e64"
+                if ops.len() == 3 && st.exec != Exec::Top =>
+            {
+                match self.tile_op(st, mn, &ops[1], &ops[2]) {
+                    Some(e) => self.put(st, &ops[0], Some(one(e))),
+                    None => handled = false,
+                }
+            }
+            "v_cmp_ge_u32_e64" | "v_cmp_ne_u32_e64" if ops.len() == 3 && st.exec == Exec::One => {
+                match self.mask_op(st, mn, &ops[1], &ops[2]) {
+                    Some(e) => self.put(st, &ops[0], Some(one(e))),
+                    None => handled = false,
+                }
+            }
+            "s_or_b32" if ops.len() == 3 => {
+                let (a, b) = (self.value(st, &ops[1]), self.value(st, &ops[2]));
+                match (single(&a), single(&b)) {
+                    (Some(x @ E::Param(_)), Some(y @ E::Param(_))) => {
+                        let v = E::or(x.clone(), y.clone());
+                        self.put(st, &ops[0], Some(one(v)));
+                    }
+                    _ => handled = false,
+                }
+                st.scc = None;
             }
             "s_max_u32" if ops.len() == 3 && parse_num(&ops[2]) == Some(1) => {
                 let r = self.value(st, &ops[1]).map(|a| {
@@ -1157,6 +1334,7 @@ impl Walk<'_> {
                         let v = (off >= 0).then(|| one(E::Param(off as u32 + 4 * i as u32)));
                         self.put_dword(st, Rk::S, db + i, v);
                     }
+                } else if dk == Rk::S && self.span_load(st, pos, run, n, db, &ops[1], &ops[2]) {
                 } else {
                     for i in 0..n {
                         self.put_dword(st, Rk::S, db + i, None);
@@ -1247,7 +1425,13 @@ impl Walk<'_> {
                 }
             }
             "global_atomic_add_u32" => self.atomic(st, pos, run),
-            "global_atomic_or_b32" => self.poison_or(st, pos, run),
+            "global_atomic_or_b32" => {
+                if self.ins[pos].returns() {
+                    self.span_claim(st, pos, run)
+                } else {
+                    self.poison_or(st, pos, run)
+                }
+            }
             "global_store_b32" => {
                 let ins = &self.ins[pos];
                 if ins.ops.len() == 3 {
@@ -1493,6 +1677,9 @@ impl Walk<'_> {
                     self.fail(run, pos, "task_graph-complete", "the body's memory operations are not waited (and, multi-wave, barriered) before the release");
                 }
             } else {
+                if st.facts & SPK != 0 {
+                    run.span.nop_release = true;
+                }
                 // a template outside the note's table: released without a body
                 let missing: Vec<u32> = self
                     .template_ids
@@ -1535,6 +1722,10 @@ impl Walk<'_> {
                 s.put_dword(st, Rk::V, dst + i, None);
             }
         };
+        if let Some(f) = self.span_ptr(st, &ins.ops[2]) {
+            self.span_global(st, pos, run, f);
+            return;
+        }
         let Some(ptr) = self.param_ptr(st, &ins.ops[2]) else {
             clear(self, st);
             return;
@@ -1821,6 +2012,12 @@ impl Walk<'_> {
         let need = CL | BD | HD | PO;
         let mut errs: Vec<&str> = Vec::new();
         run.reached_entries.insert(pos);
+        // (single-wave: the registers carry the path's own values; multi-wave, the values
+        // come from the slot's store events and are checked per event, never by the
+        // loading wave's own path facts)
+        if !self.multi() && st.facts & SPK != 0 {
+            errs.push("entered on the `k >= count` (NOP) edge of a span task");
+        }
         if st.tmpl_eq != Some(t) {
             errs.push(
                 "not entered on the taken edge of `tmpl == t` (or tmpl is rewritten in between)",
@@ -1996,6 +2193,9 @@ impl Walk<'_> {
                     );
                 }
             }
+        }
+        if let Some(feasible) = self.refine_span(st, cmp, truth, run) {
+            return feasible;
         }
         // wave role
         if a == Some(E::WaveId) && b == Some(E::Const(0)) {
@@ -2364,6 +2564,8 @@ pub struct ProtocolProof {
     /// OR with release (the poison contract refuses it).
     pub poison_plain_stores: Vec<(Option<u32>, u32)>,
     pub evidence: Vec<String>,
+    /// Span mode, when the dispatcher has it and every check of it is proved.
+    pub span: Option<SpanProof>,
 }
 
 pub(super) fn check(
@@ -2422,7 +2624,12 @@ pub(super) fn check(
             return Err(vec![refuse("task_graph-protocol-cfg", format!("{e:?}"))]);
         }
     };
-    let ticket_candidate = atomic_positions.iter().copied().find(|&p| ins[p].returns());
+    // the ticket is the returning `global_atomic_add_u32` (a span claim bitmap's returning
+    // OR, later in the object, is not)
+    let ticket_candidate = atomic_positions
+        .iter()
+        .copied()
+        .find(|&p| ins[p].returns() && ins[p].mn == "global_atomic_add_u32");
     let Some(cand) = ticket_candidate else {
         return Err(vec![refuse(
             "task_graph-claim",
@@ -2590,12 +2797,16 @@ pub(super) fn check(
             ),
         ));
     }
-    if run.header_sites.len() != 3 {
+    let span_present =
+        !run.span.flags.is_empty() || !run.span.sites.is_empty() || !run.span.spans_arg.is_empty();
+    let want_headers = if span_present { 4 } else { 3 };
+    if run.header_sites.len() != want_headers {
         out.push(refuse(
             "task_graph-claim",
             format!(
-                "{} header loads reached (the three b128 loads of the 48-byte head are required)",
-                run.header_sites.len()
+                "{} header loads reached ({want_headers} b128 loads of the header are required: three for the 48-byte head{})",
+                run.header_sites.len(),
+                if span_present { ", one for the span words" } else { "" }
             ),
         ));
     }
@@ -2603,6 +2814,7 @@ pub(super) fn check(
         if !run.ticket_sites.contains(&p)
             && !run.signal_sites.contains(&p)
             && !run.poison_sites.contains(&p)
+            && !run.span.claim_sites.contains(&p)
         {
             let swap = ins[p].mn.contains("swap");
             out.push(Refusal {
@@ -2722,7 +2934,7 @@ pub(super) fn check(
         return Err(out);
     }
     let roles_set: BTreeSet<u32> = roles.into_iter().collect();
-    let output_args: BTreeSet<u32> = shell
+    let mut output_args: BTreeSet<u32> = shell
         .args
         .iter()
         .filter(|a| !a.accesses.is_empty() && !roles_set.contains(&a.offset))
@@ -2754,6 +2966,44 @@ pub(super) fn check(
             ),
         ),
     };
+    // span mode: proved or the pool is refused (its table accesses are unattributed
+    // otherwise)
+    let mut span_proof: Option<SpanProof> = None;
+    if span_present {
+        if grid.is_none() {
+            return Err(vec![refuse(
+                "task_graph-span-region",
+                format!("span mode needs the header grid fields: {wg_evidence}"),
+            )]);
+        }
+        match span_verdict(
+            kernel,
+            &run,
+            notes,
+            grid.as_ref(),
+            [template_offset, ka_off_offset, pred, expected, done],
+            stride_shift,
+        ) {
+            Ok(p) => {
+                proved.push(TASK_PROTO_SPAN_ENTRY);
+                proved.push(TASK_PROTO_REGION_WG_LIVE);
+                // the span table is read through a read-only pointer argument of the
+                // shell's A1 (n_spans and descriptors), never written
+                output_args.remove(&p.offsets.spans_arg_offset);
+                if !ptr_arg(p.offsets.spans_arg_offset) {
+                    return Err(vec![refuse(
+                        "task_graph-span-table",
+                        format!(
+                            "the span table's params dword +{} is not an 8-byte pointer argument of the shell's A1",
+                            p.offsets.spans_arg_offset
+                        ),
+                    )]);
+                }
+                span_proof = Some(p);
+            }
+            Err(rs) => return Err(rs),
+        }
+    }
     proved.sort_unstable();
     let record = TaskProtocolRecord {
         grid,
@@ -2770,12 +3020,16 @@ pub(super) fn check(
         none_event: NONE,
         event_stride: 1 << event_shift,
         proved: proved.into_iter().map(str::to_owned).collect(),
+        span: span_proof.as_ref().map(|s| s.offsets),
     };
     let mut evidence = vec![format!(
         "protocol: claim fetch-add on +{ticket}, header tasks(+{tasks})[claim<<{stride_shift}] fields tmpl@{template_offset} ka_off@{ka_off_offset} pred@{pred} expected@{expected} done@{done}, events(+{events})[i<<{event_shift}], n_tasks@+{n_tasks}, arena kernargs(+{kernargs}); {} wave(s)",
         waves
     )];
     evidence.push(wg_evidence);
+    if let Some(s) = &span_proof {
+        evidence.extend(s.evidence.iter().cloned());
+    }
     if run.unmatched_signal {
         evidence.push(format!(
             "protocol: a task whose template is not one of {:?} is released without running a body (the host must not submit one)",
@@ -2801,6 +3055,7 @@ pub(super) fn check(
             })
             .collect(),
         evidence,
+        span: span_proof,
     })
 }
 
@@ -2898,6 +3153,39 @@ fn parts_yz(e: &E) -> Option<(u32, u32)> {
         if let (E::Shl(z, 16), E::Hdr(vy)) = (s, l) {
             if let E::Hdr(vz) = &**z {
                 return Some((*vy, *vz));
+            }
+        }
+    }
+    None
+}
+
+/// `entry.vx + step` with `step` the counter of a step loop whose bound is the constant 1
+/// (`vcount` forced to 1: `step < 1`, so `step == 0` and the region runs once at `entry.vx`):
+/// the head block of the loop.
+fn parts_x_live(e: &E) -> Option<usize> {
+    let E::Add(a, b) = e else { return None };
+    for (h, t) in [(&**a, &**b), (&**b, &**a)] {
+        if let (E::Entry(0), E::Trip { head, bound }) = (h, t) {
+            let one_step = match &**bound {
+                E::Const(1) => true,
+                E::MaxOne(x) => **x == E::Const(1),
+                _ => false,
+            };
+            if one_step {
+                return Some(*head);
+            }
+        }
+    }
+    None
+}
+
+/// `entry.vy | entry.vz << 16`.
+fn parts_yz_live(e: &E) -> Option<()> {
+    let E::Or(a, b) = e else { return None };
+    for (s, l) in [(&**a, &**b), (&**b, &**a)] {
+        if let (E::Shl(z, 16), E::Entry(1)) = (s, l) {
+            if **z == E::Entry(2) {
+                return Some(());
             }
         }
     }
@@ -3031,7 +3319,12 @@ fn wg_verdict(
     let mut candidates: BTreeSet<(u16, u32)> = BTreeSet::new();
     for e in &run.wg.entries {
         for (&r, &k) in &e.plain {
-            if !known.contains(&k) {
+            // the span header words (flags, k, list id) the dispatcher keeps live while
+            // it validates a span entry are not grid fields
+            let span_word = run.span.flags.contains(&k)
+                || run.span.k.contains(&k)
+                || run.span.list.contains(&k);
+            if !known.contains(&k) && !span_word {
                 candidates.insert((r, k));
             }
         }
@@ -3190,11 +3483,44 @@ impl Walk<'_> {
     /// region's `wg_x`/`wg_yz` registers and the header dwords the dispatcher keeps
     /// live. Failures only withhold the property; the pool's other proofs stand.
     fn check_wg(&self, st: &State, pos: usize, placed: &Placed, run: &mut Run) {
+        // each store event of the claim slot that may hold the region's descriptor is its own
+        // class of path: a static task (flags == 0) or a validated span entry
+        match &st.choice {
+            Some(c) if !c.is_empty() => {
+                for &id in c {
+                    let mut one_event = st.clone();
+                    one_event.choice = Some(BTreeSet::from([id]));
+                    let facts = self.lds_in.get(id).map_or(0, |e| e.facts);
+                    self.check_wg_one(&one_event, pos, placed, run, facts);
+                }
+            }
+            _ => self.check_wg_one(st, pos, placed, run, st.facts),
+        }
+    }
+
+    /// [`Walk::check_wg`] for one path class, `facts` the facts the descriptor was stored
+    /// (or held) under: a span entry (`SP1`) must be proved `region_wg_from_live_entry`
+    /// (a failure is a refusal: the region would run on unvalidated coordinates), a
+    /// static one `region_wg_from_header`.
+    fn check_wg_one(&self, st: &State, pos: usize, placed: &Placed, run: &mut Run, facts: u32) {
         let t = placed.region.template_id;
         let d = &self.notes.dispatcher;
         let need = CL | BD | HD | PO;
+        let live = facts & SP1 != 0;
         let mut why: Vec<String> = Vec::new();
         let mut found: Vec<(&'static str, u32)> = Vec::new();
+        if live {
+            run.span.live_regions.insert(t);
+            if facts & SP_ALL != SP_ALL {
+                why.push(format!(
+                    "a span-mode path reaches the region without every check (missing fact bits {:#x} of {:#x}: flags, table pointer, vx/vy/vz < grid, bitmap bit clear)",
+                    SP_ALL & !facts,
+                    SP_ALL
+                ));
+            }
+        } else if facts & SP0 == 0 {
+            run.span.unclassified.insert(t);
+        }
         if !placed.region.is_native()
             && (placed.region.wg_x != d.wg_x || placed.region.wg_yz != d.wg_yz)
         {
@@ -3208,10 +3534,16 @@ impl Walk<'_> {
             (f & need == need).then_some(e)
         };
         match held(d.wg_x) {
-            Some(e) => match parts_x(&e) {
-                Some((vx, vc, head)) => {
-                    found.push(("vx", vx));
-                    found.push(("vcount", vc));
+            Some(e) => match if live {
+                parts_x_live(&e).map(|h| (None, h))
+            } else {
+                parts_x(&e).map(|(vx, vc, h)| (Some((vx, vc)), h))
+            } {
+                Some((fields, head)) => {
+                    if let Some((vx, vc)) = fields {
+                        found.push(("vx", vx));
+                        found.push(("vcount", vc));
+                    }
                     match self.steps.get(&head) {
                         Some(sl) if sl.members.contains(&self.block_of[pos]) => {
                             run.wg.heads.entry(head).or_default().insert(t);
@@ -3221,6 +3553,10 @@ impl Walk<'_> {
                         ),
                     }
                 }
+                None if live => why.push(format!(
+                    "wg_x register s{} is not `entry.vx + step` with step < max(1, 1) (vcount forced to 1): {e:?}",
+                    d.wg_x
+                )),
                 None => why.push(format!(
                     "wg_x register s{} is not `header[vx] + step` with step < max(header[vcount], 1): {e:?}",
                     d.wg_x
@@ -3232,11 +3568,21 @@ impl Walk<'_> {
             )),
         }
         match held(d.wg_yz) {
-            Some(e) => match parts_yz(&e) {
-                Some((vy, vz)) => {
-                    found.push(("vy", vy));
-                    found.push(("vz", vz));
+            Some(e) => match if live {
+                parts_yz_live(&e).map(|()| None)
+            } else {
+                parts_yz(&e).map(Some)
+            } {
+                Some(fields) => {
+                    if let Some((vy, vz)) = fields {
+                        found.push(("vy", vy));
+                        found.push(("vz", vz));
+                    }
                 }
+                None if live => why.push(format!(
+                    "wg_yz register s{} is not `entry.vy | entry.vz << 16`: {e:?}",
+                    d.wg_yz
+                )),
                 None => why.push(format!(
                     "wg_yz register s{} is not `header[vy] | header[vz] << 16`: {e:?}",
                     d.wg_yz
@@ -3271,13 +3617,800 @@ impl Walk<'_> {
         for (name, v) in found {
             self.wg_set(run, t, name, v);
         }
-        run.wg
-            .unproven
-            .extend(why.into_iter().map(|w| format!("region {t}: {w}")));
+        if live {
+            for w in why {
+                self.fail(
+                    run,
+                    pos,
+                    "task_graph-span-region",
+                    format!("region {t}: {w}"),
+                );
+            }
+        } else {
+            run.wg
+                .unproven
+                .extend(why.into_iter().map(|w| format!("region {t}: {w}")));
+        }
         run.wg.entries.push(WgEntry {
             template: t,
             plain,
             native_reads,
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// span mode (railgunmega/DYNAMIC.md)
+// ---------------------------------------------------------------------------
+
+/// Byte offset of descriptor 0 of the span table (`n_spans` and 28 reserved bytes first).
+const SPAN_DESC_BASE: i64 = 0x20;
+/// log2 of a span descriptor's size and of a live entry's size.
+const SPAN_DESC_SHIFT: u8 = 5;
+const SPAN_ENTRY_SHIFT: u8 = 4;
+
+impl Walk<'_> {
+    fn singles(&self, st: &State, a: &str, b: &str) -> Option<(E, E)> {
+        let x = self.value(st, a)?;
+        let y = self.value(st, b)?;
+        Some((only(&x)?.clone(), only(&y)?.clone()))
+    }
+
+    /// `bit = vx + gx * (vy + gy * vz)`: the sum that completes one stage.
+    fn tile_add(&self, st: &State, a: &str, b: &str) -> Option<E> {
+        let (x, y) = self.singles(st, a, b)?;
+        for (m, e) in [(&x, &y), (&y, &x)] {
+            if let (E::Mul(p, q), E::Entry(f)) = (m, e) {
+                match (&**p, &**q, f) {
+                    (E::Entry(2), E::Hdr(gy), 1) => {
+                        return Some(E::Tile {
+                            st: TileSt::Yz,
+                            gx: 0,
+                            gy: *gy,
+                        })
+                    }
+                    (
+                        E::Tile {
+                            st: TileSt::Yz, gy, ..
+                        },
+                        E::Hdr(gx),
+                        0,
+                    ) => {
+                        return Some(E::Tile {
+                            st: TileSt::Idx,
+                            gx: *gx,
+                            gy: *gy,
+                        })
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+
+    /// The multiplies, shifts and masks of the bitmap index and of the claim test.
+    fn tile_op(&self, st: &State, mn: &str, a: &str, b: &str) -> Option<E> {
+        let (x, y) = self.singles(st, a, b)?;
+        let tile = |t: TileSt, gx: u32, gy: u32| E::Tile { st: t, gx, gy };
+        if mn == "v_mul_lo_u32" {
+            let (m, h) = match (&x, &y) {
+                (E::Hdr(_), o) => (o, &x),
+                (o, E::Hdr(_)) => (o, &y),
+                _ => return None,
+            };
+            return match m {
+                E::Entry(2) | E::Tile { st: TileSt::Yz, .. } => {
+                    Some(E::Mul(Box::new(m.clone()), Box::new(h.clone())))
+                }
+                _ => None,
+            };
+        }
+        if mn.starts_with("v_and_b32") {
+            for (p, q) in [(&x, &y), (&y, &x)] {
+                match (p, q) {
+                    (
+                        E::Const(31),
+                        E::Tile {
+                            st: TileSt::Idx,
+                            gx,
+                            gy,
+                        },
+                    ) => return Some(tile(TileSt::Low, *gx, *gy)),
+                    (
+                        E::Tile {
+                            st: TileSt::Old,
+                            gx,
+                            gy,
+                        },
+                        E::Tile {
+                            st: TileSt::Mask,
+                            gx: hx,
+                            gy: hy,
+                        },
+                    ) if gx == hx && gy == hy => return Some(tile(TileSt::Hit, *gx, *gy)),
+                    _ => {}
+                }
+            }
+            return None;
+        }
+        // `v_lshrrev dst, count, value` / `v_lshlrev dst, count, value`
+        if mn.starts_with("v_lshrrev_b32") {
+            return match (&x, &y) {
+                (
+                    E::Const(5),
+                    E::Tile {
+                        st: TileSt::Idx,
+                        gx,
+                        gy,
+                    },
+                ) => Some(tile(TileSt::Word, *gx, *gy)),
+                _ => None,
+            };
+        }
+        if mn.starts_with("v_lshlrev_b32") {
+            return match (&x, &y) {
+                (
+                    E::Const(2),
+                    E::Tile {
+                        st: TileSt::Word,
+                        gx,
+                        gy,
+                    },
+                ) => Some(tile(TileSt::WordOff, *gx, *gy)),
+                (
+                    E::Tile {
+                        st: TileSt::Low,
+                        gx,
+                        gy,
+                    },
+                    E::Const(1),
+                ) => Some(tile(TileSt::Mask, *gx, *gy)),
+                _ => None,
+            };
+        }
+        None
+    }
+
+    /// Lane 0's `a >= b` (an entry dword against a header dword) and `0 != x` masks.
+    fn mask_op(&self, st: &State, mn: &str, a: &str, b: &str) -> Option<E> {
+        let (x, y) = self.singles(st, a, b)?;
+        match (mn, &x, &y) {
+            ("v_cmp_ge_u32_e64", E::Entry(_), E::Hdr(_)) => {
+                Some(E::GeMask(Box::new(x), Box::new(y)))
+            }
+            (
+                "v_cmp_ne_u32_e64",
+                E::Const(0),
+                h @ E::Tile {
+                    st: TileSt::Hit, ..
+                },
+            )
+            | (
+                "v_cmp_ne_u32_e64",
+                h @ E::Tile {
+                    st: TileSt::Hit, ..
+                },
+                E::Const(0),
+            ) => Some(E::NzMask(Box::new(h.clone()))),
+            _ => None,
+        }
+    }
+
+    /// A pointer pair `s[b:b+1]` that is `Param(base) + add`: `(base, add)`.
+    fn ptr_pair(&self, st: &State, op: &str) -> Option<(u32, E)> {
+        let (k, base, len) = parse_reg(op)?;
+        if k != Rk::S || len != 2 {
+            return None;
+        }
+        match (only(st.s.get(&base)?)?, only(st.s.get(&(base + 1))?)?) {
+            (E::PtrLo { base: b1, add: a1 }, E::PtrHi { base: b2, add: a2 })
+                if b1 == b2 && a1 == a2 =>
+            {
+                Some((*b1, (**a1).clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The descriptor field (byte offset 0, 8, 16) whose pointer pair `op` holds.
+    fn span_ptr(&self, st: &State, op: &str) -> Option<u8> {
+        let (k, base, len) = parse_reg(op)?;
+        if k != Rk::S || len != 2 {
+            return None;
+        }
+        match (only(st.s.get(&base)?)?, only(st.s.get(&(base + 1))?)?) {
+            (E::SpanFld { off: a, hi: false }, E::SpanFld { off: b, hi: true })
+                if a == b && matches!(a, 0 | 8 | 16) =>
+            {
+                Some(*a)
+            }
+            _ => None,
+        }
+    }
+
+    /// `s_load` through the span table pointer (`n_spans`) or through the descriptor of the
+    /// claimed header's list id. Returns whether the base was a span-table pointer (the
+    /// load is then fully handled here).
+    fn span_load(
+        &self,
+        st: &mut State,
+        pos: usize,
+        run: &mut Run,
+        n: u16,
+        db: u16,
+        base: &str,
+        off_op: &str,
+    ) -> bool {
+        let off = parse_num(off_op).unwrap_or(-1);
+        let clear = |s: &Self, st: &mut State| {
+            for i in 0..n {
+                s.put_dword(st, Rk::S, db + i, None);
+            }
+        };
+        let need = SPN | SP1;
+        if let Some(p) = self.param_ptr(st, base) {
+            if !run.span.spans_arg.contains(&p) {
+                return false;
+            }
+            run.span.table_sites.insert(pos);
+            if st.facts & need != need {
+                self.fail(
+                    run,
+                    pos,
+                    "task_graph-span-table",
+                    "the span table is read on a path that has not established flags == 1 and a nonzero table pointer",
+                );
+                clear(self, st);
+            } else if off == 0 && n == 1 {
+                self.put_dword(st, Rk::S, db, Some(one(E::SpanN)));
+            } else {
+                self.fail(
+                    run,
+                    pos,
+                    "task_graph-span-table",
+                    format!(
+                        "a table load other than the u32 n_spans at +0 (offset {off}, {n} dwords)"
+                    ),
+                );
+                clear(self, st);
+            }
+            return true;
+        }
+        let Some((b, add)) = self.ptr_pair(st, base) else {
+            return false;
+        };
+        if !run.span.spans_arg.contains(&b) {
+            return false;
+        }
+        run.span.table_sites.insert(pos);
+        if st.facts & need != need {
+            self.fail(
+                run,
+                pos,
+                "task_graph-span-table",
+                "a descriptor is read on a path that has not established flags == 1 and a nonzero table pointer",
+            );
+            clear(self, st);
+            return true;
+        }
+        let list = match &add {
+            E::Shl(x, SPAN_DESC_SHIFT) => match &**x {
+                E::SpanId(l) => Some(*l),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(list) = list else {
+            self.fail(
+                run,
+                pos,
+                "task_graph-span-table",
+                "the descriptor address is not `spans + 32 * list_id` with `list_id < n_spans` established by a compare",
+            );
+            clear(self, st);
+            return true;
+        };
+        run.span.list.insert(list);
+        let field = off - SPAN_DESC_BASE;
+        match (field, n) {
+            (0 | 8 | 16, 2) => {
+                let f = field as u8;
+                self.put_dword(st, Rk::S, db, Some(one(E::SpanFld { off: f, hi: false })));
+                self.put_dword(
+                    st,
+                    Rk::S,
+                    db + 1,
+                    Some(one(E::SpanFld { off: f, hi: true })),
+                );
+            }
+            (24, 1) => self.put_dword(st, Rk::S, db, Some(one(E::SpanFld { off: 24, hi: false }))),
+            _ => {
+                self.fail(
+                    run,
+                    pos,
+                    "task_graph-span-table",
+                    format!("a descriptor load of {n} dwords at descriptor byte {field}: only the pointer pairs at 0/8/16 and the u32 K at 24 are read"),
+                );
+                clear(self, st);
+            }
+        }
+        true
+    }
+
+    /// A global load through a descriptor pointer: the count load (`count_cell`) or the
+    /// entry load (`live_list[16 * k]`, `k < count <= K`).
+    fn span_global(&self, st: &mut State, pos: usize, run: &mut Run, field: u8) {
+        let ins = &self.ins[pos];
+        let Some((Rk::V, dst, len)) = parse_reg(&ins.ops[0]) else {
+            return;
+        };
+        let clear = |s: &Self, st: &mut State| {
+            for i in 0..len {
+                s.put_dword(st, Rk::V, dst + i, None);
+            }
+        };
+        let va = self.value(st, &ins.ops[1]);
+        let ctx = st.exec == Exec::One
+            && st.facts & (SP1 | SPN) == (SP1 | SPN)
+            && ins.offset() == 0
+            && ins.scope() < 2;
+        match field {
+            8 => {
+                if !(ctx && ins.mn == "global_load_b32" && single(&va) == Some(&E::Const(0))) {
+                    self.fail(
+                        run,
+                        pos,
+                        "task_graph-span-count",
+                        "the count load is not a single-lane plain b32 load of the count cell at offset 0 on a flags == 1 path",
+                    );
+                    clear(self, st);
+                    return;
+                }
+                if st.facts & (ACQ | POLLED) != (ACQ | POLLED) {
+                    run.span.count_unordered = true;
+                }
+                run.span.count_sites.insert(pos);
+                run.span.sites.insert(pos, (8, "vmem_load"));
+                self.put_dword(st, Rk::V, dst, Some(one(E::SpanCount)));
+            }
+            0 => {
+                let k = match single(&va) {
+                    Some(E::Shl(x, SPAN_ENTRY_SHIFT)) => match &**x {
+                        E::SpanIdx(k) => Some(*k),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some(k) = k.filter(|_| ctx && ins.mn == "global_load_b128") else {
+                    self.fail(
+                        run,
+                        pos,
+                        "task_graph-span-entry",
+                        "the entry load is not a single-lane b128 load at `live_list + 16 * k` with `k < count <= K` established by compares (the count > K and k >= count checks)",
+                    );
+                    clear(self, st);
+                    return;
+                };
+                run.span.k.insert(k);
+                run.span.entry_sites.insert(pos);
+                run.span.sites.insert(pos, (0, "vmem_load"));
+                for i in 0..len {
+                    self.put_dword(st, Rk::V, dst + i, Some(one(E::Entry(i as u8))));
+                }
+            }
+            _ => {
+                self.fail(
+                    run,
+                    pos,
+                    "task_graph-span-table",
+                    "a load through the claim bitmap pointer",
+                );
+                clear(self, st);
+            }
+        }
+        st.waited &= !WL;
+    }
+
+    /// The returning `global_atomic_or_b32` on the claim bitmap: word `bit >> 5`, mask
+    /// `1 << (bit & 31)` of the validated entry's `bit`.
+    fn span_claim(&self, st: &mut State, pos: usize, run: &mut Run) {
+        let ins = &self.ins[pos];
+        let ops = &ins.ops;
+        let dst = ops.first().and_then(|o| parse_reg(o));
+        let kill = |s: &Self, st: &mut State| {
+            if let Some((Rk::V, d, 1)) = dst {
+                s.put_dword(st, Rk::V, d, None);
+            }
+        };
+        let field = if ops.len() == 4 {
+            self.span_ptr(st, &ops[3])
+        } else {
+            None
+        };
+        let Some(16) = field else {
+            self.fail(
+                run,
+                pos,
+                "task_graph-protocol-memory",
+                "a returning OR that is not on the claim bitmap pointer of a span descriptor",
+            );
+            kill(self, st);
+            return;
+        };
+        let bounds = SP1 | SPN | SPX | SPY | SPZ;
+        let va = self.value(st, &ops[1]);
+        let data = self.value(st, &ops[2]);
+        let dims = match (single(&va), single(&data)) {
+            (
+                Some(E::Tile {
+                    st: TileSt::WordOff,
+                    gx,
+                    gy,
+                }),
+                Some(E::Tile {
+                    st: TileSt::Mask,
+                    gx: hx,
+                    gy: hy,
+                }),
+            ) if gx == hx && gy == hy => Some((*gx, *gy)),
+            _ => None,
+        };
+        let ok = st.exec == Exec::One
+            && ins.scope() >= 2
+            && ins.offset() == 0
+            && st.facts & bounds == bounds;
+        let (true, Some((gx, gy))) = (ok, dims) else {
+            self.fail(
+                run,
+                pos,
+                "task_graph-span-claim",
+                "the claim is not a single-lane device-scope returning OR of bit `vx + gx * (vy + gy * vz)` of the entry on a path where all three grid compares held",
+            );
+            kill(self, st);
+            return;
+        };
+        run.span.claim_sites.insert(pos);
+        run.span.sites.insert(pos, (16, "atomic_commutative"));
+        if let Some((Rk::V, d, 1)) = dst {
+            self.put_dword(
+                st,
+                Rk::V,
+                d,
+                Some(one(E::Tile {
+                    st: TileSt::Old,
+                    gx,
+                    gy,
+                })),
+            );
+        }
+        st.waited &= !WL;
+    }
+
+    /// Facts and rewritten values a compare's edge establishes in span mode; `Some(feasible)`
+    /// when the compare is a span-mode one.
+    fn refine_span(&self, st: &mut State, cmp: &Cmp, truth: bool, run: &mut Run) -> Option<bool> {
+        let a = single(&cmp.a).cloned()?;
+        let b = single(&cmp.b).cloned()?;
+        let eq = match cmp.rel {
+            Rel::Eq => Some(truth),
+            Rel::Lg => Some(!truth),
+            _ => None,
+        };
+        let rewrite = |st: &mut State, from: &E, to: E| {
+            if let Some(r) = cmp.a_reg {
+                if st.s.get(&r) == Some(&one(from.clone())) {
+                    st.s.insert(r, one(to));
+                }
+            }
+        };
+        match (&a, &b) {
+            // the flags word: == 0 static, == 1 span mode
+            (E::Hdr(k), E::Const(c @ (0 | 1))) if eq.is_some() && !cmp.signed => {
+                run.span.flags.insert(*k);
+                if eq == Some(true) && st.facts & HD != 0 {
+                    st.facts |= if *c == 0 { SP0 } else { SP1 };
+                }
+                Some(true)
+            }
+            // the span table pointer is nonzero
+            (E::Or(p, q), E::Const(0)) if eq.is_some() => match (&**p, &**q) {
+                (E::Param(x), E::Param(y)) if *y == *x + 4 => {
+                    run.span.spans_arg.insert(*x);
+                    if eq == Some(false) && st.facts & SP1 != 0 {
+                        st.facts |= SPN;
+                    }
+                    Some(true)
+                }
+                _ => None,
+            },
+            // list_id < n_spans
+            (E::Hdr(l), E::SpanN) if cmp.rel == Rel::Ge && !cmp.signed => {
+                if !truth {
+                    rewrite(st, &a, E::SpanId(*l));
+                }
+                Some(true)
+            }
+            // count <= K
+            (E::SpanCount, E::SpanFld { off: 24, hi: false })
+                if cmp.rel == Rel::Gt && !cmp.signed =>
+            {
+                if !truth {
+                    rewrite(st, &a, E::SpanCountLe);
+                }
+                Some(true)
+            }
+            // k < count (the other edge is the NOP)
+            (E::Hdr(k), E::SpanCountLe) if cmp.rel == Rel::Ge && !cmp.signed => {
+                if truth {
+                    st.facts |= SPK;
+                } else {
+                    rewrite(st, &a, E::SpanIdx(*k));
+                }
+                Some(true)
+            }
+            // an entry axis against its header grid extent: the mask is zero on the
+            // edge where the entry is inside the grid
+            (E::GeMask(x, y), E::Const(0)) if eq.is_some() => {
+                if let (E::Entry(f @ 0..=2), E::Hdr(g)) = (&**x, &**y) {
+                    if eq == Some(true) && st.facts & SP1 != 0 {
+                        st.facts |= [SPX, SPY, SPZ][*f as usize];
+                        run.span.grid[*f as usize].insert(*g);
+                    }
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+            // the claim bit was clear
+            (E::NzMask(h), E::Const(0)) if eq.is_some() => {
+                if let E::Tile {
+                    st: TileSt::Hit,
+                    gx,
+                    gy,
+                } = &**h
+                {
+                    if eq == Some(true) && st.facts & SP1 != 0 {
+                        st.facts |= SPC;
+                        run.span.tile.insert((*gx, *gy));
+                    }
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// One access through a span-table-loaded pointer: attributed to the `spans` argument's
+/// descriptor arena at descriptor byte `field` with the A1 memory class `class`.
+#[derive(Clone, Debug)]
+pub struct SpanSite {
+    pub inst: peacemaker_ir::InstId,
+    pub pc: Option<u32>,
+    pub field: u32,
+    pub class: &'static str,
+}
+
+/// What the span-mode check proved (the dispatcher side of DYNAMIC.md).
+#[derive(Clone, Debug)]
+pub struct SpanProof {
+    /// The span ABI the object implements (header words, table layout), as derived.
+    pub offsets: TaskSpanOffsets,
+    /// The accesses through pointers loaded from the span table (live list, count cell,
+    /// claim bitmap): the dispatcher shell's accesses that A1 cannot resolve itself.
+    pub sites: Vec<SpanSite>,
+    pub evidence: Vec<String>,
+}
+
+/// The span-mode properties (`span_entry_validated`, `region_wg_from_live_entry`) after the
+/// walk: every span check was reached on its path class (the per-operation checks refuse
+/// at their own sites; here the walk-wide consistency), or the refusals.
+fn span_verdict(
+    kernel: &Kernel,
+    run: &Run,
+    notes: &KernelRegions,
+    grid: Option<&TaskGridOffsets>,
+    other: [u32; 5],
+    stride_shift: u8,
+) -> Result<SpanProof, Vec<Refusal>> {
+    let sp = &run.span;
+    let mut why: Vec<String> = Vec::new();
+    let mut one_of = |name: &str, set: &BTreeSet<u32>| -> Option<u32> {
+        if set.len() == 1 {
+            set.iter().next().copied()
+        } else {
+            why.push(format!(
+                "{name} resolves to {set:?} (exactly one is required)"
+            ));
+            None
+        }
+    };
+    let flags = one_of("the span flags header word", &sp.flags);
+    let k = one_of("the span-relative index k", &sp.k);
+    let list = one_of("the span list id", &sp.list);
+    let spans = one_of("the span table pointer", &sp.spans_arg);
+    let Some(grid) = grid else {
+        why.push(
+            "region_wg_from_header is not proved, so the header grid fields are not derived (span mode needs them)"
+                .into(),
+        );
+        return Err(why
+            .into_iter()
+            .map(|w| refuse("task_graph-span-region", w))
+            .collect());
+    };
+    let gx = [grid.gx_offset, grid.gy_offset, grid.gz_offset];
+    for (i, axis) in ["x", "y", "z"].iter().enumerate() {
+        if sp.grid[i] != BTreeSet::from([gx[i]]) {
+            why.push(format!(
+                "entry.v{axis} was compared against header dwords {:?}, not the grid extent g{axis}@{}",
+                sp.grid[i], gx[i]
+            ));
+        }
+    }
+    if sp.tile != BTreeSet::from([(grid.gx_offset, grid.gy_offset)]) {
+        why.push(format!(
+            "the claim bitmap index was built over grid extents {:?}, not (gx@{}, gy@{})",
+            sp.tile, grid.gx_offset, grid.gy_offset
+        ));
+    }
+    for (name, set) in [
+        ("count load", &sp.count_sites),
+        ("entry load", &sp.entry_sites),
+        ("claim bitmap atomic", &sp.claim_sites),
+    ] {
+        if set.len() != 1 {
+            why.push(format!(
+                "{} {name} sites reached (exactly one is required)",
+                set.len()
+            ));
+        }
+    }
+    if sp.table_sites.len() != 5 {
+        why.push(format!(
+            "{} span table loads reached (n_spans and the four descriptor loads are required)",
+            sp.table_sites.len()
+        ));
+    }
+    if !sp.unclassified.is_empty() {
+        why.push(format!(
+            "regions {:?} are reachable on a path that is neither a static task (flags == 0) nor a span-mode one",
+            sp.unclassified
+        ));
+    }
+    if !sp.nop_release {
+        why.push("the `k >= count` edge does not reach the done release without a region".into());
+    }
+    let template_ids: BTreeSet<u32> = notes.regions.iter().map(|r| r.template_id).collect();
+    let template_off = other[0];
+    let nops: Vec<u32> = sp
+        .overwrites
+        .iter()
+        .filter(|&&(off, c)| off == template_off && c != NONE)
+        .map(|&(_, c)| c)
+        .collect();
+    let nop = match nops.as_slice() {
+        [c] if !template_ids.contains(c) => Some(*c),
+        other => {
+            why.push(format!(
+                "the NOP template (a constant over the template register other than {NONE:#x}) is {other:?}: exactly one outside the note's table {template_ids:?} is required"
+            ));
+            None
+        }
+    };
+    let desc_stride = 1u32 << stride_shift;
+    let fields = [other[0], other[1], other[2], other[3], other[4]];
+    let known = [
+        fields[0],
+        fields[1],
+        fields[2],
+        fields[3],
+        fields[4],
+        grid.vx_offset,
+        grid.vy_offset,
+        grid.vz_offset,
+        grid.vcount_offset,
+        grid.gx_offset,
+        grid.gy_offset,
+        grid.gz_offset,
+    ];
+    let words = [flags, k, list];
+    for (i, w) in words.iter().enumerate() {
+        if let Some(w) = w {
+            if known.contains(w)
+                || words[..i].contains(&Some(*w))
+                || w % 4 != 0
+                || w + 4 > desc_stride
+            {
+                why.push(format!(
+                    "span header word @{w} overlaps another header field or lies outside the {desc_stride}-byte header"
+                ));
+            }
+        }
+    }
+    if !why.is_empty() {
+        return Err(why
+            .into_iter()
+            .map(|w| refuse("task_graph-span-protocol", w))
+            .collect());
+    }
+    let (flags, k, list, spans, nop) = (
+        flags.unwrap(),
+        k.unwrap(),
+        list.unwrap(),
+        spans.unwrap(),
+        nop.unwrap(),
+    );
+    let offsets = TaskSpanOffsets {
+        flags_offset: flags,
+        k_offset: k,
+        list_id_offset: list,
+        spans_arg_offset: spans,
+        n_spans_offset: 0,
+        desc_base: SPAN_DESC_BASE as u32,
+        desc_stride: 1 << SPAN_DESC_SHIFT,
+        live_list_field: 0,
+        count_cell_field: 8,
+        bitmap_field: 16,
+        cap_field: 24,
+        entry_stride: 1 << SPAN_ENTRY_SHIFT,
+        nop_template: nop,
+    };
+    let body = &kernel.body;
+    let sites: Vec<SpanSite> = sp
+        .sites
+        .iter()
+        .map(|(&pos, &(field, class))| SpanSite {
+            inst: body.layout[pos],
+            pc: super::rel_pc(
+                kernel,
+                body.insts.get(body.layout[pos]).and_then(|x| x.prov.pc),
+            ),
+            field: u32::from(field),
+            class,
+        })
+        .collect();
+    let pcs = |set: &BTreeSet<usize>| -> String {
+        set.iter()
+            .map(|&p| {
+                let pc = super::rel_pc(
+                    kernel,
+                    body.insts.get(body.layout[p]).and_then(|x| x.prov.pc),
+                )
+                .unwrap_or(0);
+                format!("{pc:#x}")
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let mut evidence = vec![format!(
+        "protocol: {TASK_PROTO_SPAN_ENTRY}: span headers (flags@{flags}: 0 static / 1 span, any other value poisons; k@{k}; list id@{list}) read the table at kernarg +{spans}: null table pointer and list_id >= n_spans poison before any descriptor load; descriptor i at +{}+{}*i = {{live_list@0, count_cell@8, bitmap@16, K@24}}; count load (pc {}) of count_cell; count > K poisons, k >= count turns the task into NOP template {nop:#x} (no region, done released; reaches the release without a body); entry load (pc {}) at live_list + {}*k with k < count <= K; entry.vx/vy/vz < header gx@{}/gy@{}/gz@{} else poison; bitmap word bit = vx + gx*(vy + gy*vz) claimed by a returning device-scope OR (pc {}), a set bit poisons; the validated entry replaces vx/vy/vz and vcount := 1 (poison never reaches a region: its template is NONE)",
+        SPAN_DESC_BASE,
+        1 << SPAN_DESC_SHIFT,
+        pcs(&sp.count_sites),
+        pcs(&sp.entry_sites),
+        1 << SPAN_ENTRY_SHIFT,
+        grid.gx_offset,
+        grid.gy_offset,
+        grid.gz_offset,
+        pcs(&sp.claim_sites),
+    )];
+    evidence.push(format!(
+        "protocol: {TASK_PROTO_REGION_WG_LIVE}: in span mode wg_x = entry.vx + step with step < max(1, 1) (one step, vcount forced to 1; entry values carried through the broadcast) and wg_yz = entry.vy | entry.vz << 16, for template(s) {:?}; static headers keep {TASK_PROTO_REGION_WG}; the claim bitmap index is exact only for gx*gy*gz <= 2^32 (the host sizes the bitmap from the grid)",
+        sp.live_regions
+    ));
+    if sp.count_unordered {
+        evidence.push(
+            "protocol: the count load follows the pred acquire on every path with pred != NONE; a span header whose pred is NONE reaches it with no acquire (the host must give span headers the producer's done event as pred)"
+                .into(),
+        );
+    }
+    Ok(SpanProof {
+        offsets,
+        sites,
+        evidence,
+    })
 }

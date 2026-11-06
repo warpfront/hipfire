@@ -488,8 +488,25 @@ pub const TASK_PROTO_ONCE: &str = "one_release_per_task";
 /// proving it is what lets a host treat one launch's tile claims as the
 /// intra-grid concurrency of a single launch.
 pub const TASK_PROTO_REGION_WG: &str = "region_wg_from_header";
+/// Span mode (`M0TaskDesc` flags bit 0): on every path from a span-mode
+/// header into a region, the live-list count load follows the `pred`
+/// acquire; `count > K` and `k >= count` never reach a region (the latter
+/// still releases `done`); the entry loads index the live list with `k <
+/// count <= K`; the three bound compares of the entry against the header
+/// grid dominate the region with the failing edges going to poison; the claim
+/// bitmap's returning atomic-or is tested and a set bit goes to poison; and
+/// any other flag bit, `list_id >= n_spans` or a null span table poisons.
+/// Optional: it is what lets a host admit tasks whose workgroup coordinates
+/// the GPU produced ([`TASK_PROTO_REGION_WG_LIVE`] is its companion). The
+/// grid offsets ([`TaskProtocolRecord::grid`]) are needed.
+pub const TASK_PROTO_SPAN_ENTRY: &str = "span_entry_validated";
+/// In span mode the dispatcher runs the region at `(vx, vy | vz << 16)` of
+/// the **validated live entry** (one step, `vcount == 1`), never at the
+/// header's own coordinates ([`TASK_PROTO_REGION_WG`] extended to span
+/// headers).
+pub const TASK_PROTO_REGION_WG_LIVE: &str = "region_wg_from_live_entry";
 /// Every property a consumer may find in [`TaskProtocolRecord::proved`].
-pub const TASK_PROTO_KNOWN: [&str; 7] = [
+pub const TASK_PROTO_KNOWN: [&str; 9] = [
     TASK_PROTO_ACQUIRE,
     TASK_PROTO_BOUNDED,
     TASK_PROTO_CLAIM,
@@ -497,6 +514,8 @@ pub const TASK_PROTO_KNOWN: [&str; 7] = [
     TASK_PROTO_ONCE,
     TASK_PROTO_RELEASE,
     TASK_PROTO_REGION_WG,
+    TASK_PROTO_REGION_WG_LIVE,
+    TASK_PROTO_SPAN_ENTRY,
 ];
 /// Every property a task-graph proof needs, sorted.
 pub const TASK_PROTO_REQUIRED: [&str; 6] = [
@@ -544,6 +563,13 @@ pub struct TaskProtocolRecord {
     /// (and skipped when serializing) on receipts that do not prove it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grid: Option<TaskGridOffsets>,
+    /// The span-mode layout (flag, index and list-id words of the header, the
+    /// `spans` argument, the span table's records), present exactly when the
+    /// certificate proved [`TASK_PROTO_SPAN_ENTRY`] or
+    /// [`TASK_PROTO_REGION_WG_LIVE`]. Absent (and skipped when serializing)
+    /// otherwise, so receipts written before span mode are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<TaskSpanOffsets>,
 }
 
 /// Byte offsets, inside one task header, of the `u32` virtual-grid fields.
@@ -556,6 +582,56 @@ pub struct TaskGridOffsets {
     pub gy_offset: u32,
     pub gz_offset: u32,
     pub vcount_offset: u32,
+}
+
+/// The span-mode ABI of a pool dispatcher (`M0TaskDesc` words and the span
+/// table, DYNAMIC.md) the certificate read from the object.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct TaskSpanOffsets {
+    /// Header offsets of the flag word (bit 0 = span mode; any other bit
+    /// poisons), the span-relative index `k` and the span-table list id.
+    pub flags_offset: u32,
+    pub k_offset: u32,
+    pub list_id_offset: u32,
+    /// Kernarg offset of the read-only pointer to the span table.
+    pub spans_arg_offset: u32,
+    /// Offset in the table of the `u32` `n_spans`, of descriptor 0, and the
+    /// bytes between descriptors.
+    pub n_spans_offset: u32,
+    pub desc_base: u32,
+    pub desc_stride: u32,
+    /// Offsets inside a descriptor: the three `u64` pointers (live list,
+    /// count cell, claim bitmap) and the `u32` `K`.
+    pub live_list_field: u32,
+    pub count_cell_field: u32,
+    pub bitmap_field: u32,
+    pub cap_field: u32,
+    /// Bytes per live-list entry (`vx@0, vy@4, vz@8`).
+    pub entry_stride: u32,
+    /// The template id of the span descriptor record the table's arena
+    /// fact names.
+    pub nop_template: u32,
+}
+
+impl TaskSpanOffsets {
+    /// The M0 ABI: flags @48, `k` @52, list id @56, `spans` kernarg @64; the
+    /// table holds `n_spans` @0 and 32-byte descriptors from @32 (`live_list`
+    /// @0, `count` @8, `bitmap` @16, `K` @24) of 16-byte entries.
+    pub const M0: TaskSpanOffsets = TaskSpanOffsets {
+        flags_offset: 48,
+        k_offset: 52,
+        list_id_offset: 56,
+        spans_arg_offset: 64,
+        n_spans_offset: 0,
+        desc_base: 32,
+        desc_stride: 32,
+        live_list_field: 0,
+        count_cell_field: 8,
+        bitmap_field: 16,
+        cap_field: 24,
+        entry_stride: 16,
+        nop_template: 0xFFFF_FFFE,
+    };
 }
 
 impl TaskProtocolRecord {
@@ -627,8 +703,74 @@ impl TaskProtocolRecord {
                 }
             }
         }
+        let span_props = [TASK_PROTO_SPAN_ENTRY, TASK_PROTO_REGION_WG_LIVE]
+            .into_iter()
+            .find(|s| self.proved.iter().any(|p| p == s));
         if self.proved.iter().any(|p| p == TASK_PROTO_REGION_WG) && self.grid.is_none() {
             return bad("region_wg_from_header is proved without the grid field offsets");
+        }
+        match (&self.span, span_props) {
+            (None, Some(p)) => {
+                return bad(&format!("{p} is proved without the span layout offsets"))
+            }
+            (Some(_), None) => return bad("span layout offsets without a proved span property"),
+            _ => {}
+        }
+        if span_props.is_some() && self.grid.is_none() {
+            return bad("a span property is proved without the grid field offsets");
+        }
+        if let Some(s) = &self.span {
+            let words = [s.flags_offset, s.k_offset, s.list_id_offset];
+            let mut taken: Vec<u32> = fields.to_vec();
+            taken.extend(self.grid.iter().flat_map(|g| {
+                [
+                    g.vx_offset,
+                    g.vy_offset,
+                    g.vz_offset,
+                    g.gx_offset,
+                    g.gy_offset,
+                    g.gz_offset,
+                    g.vcount_offset,
+                ]
+            }));
+            for &at in &words {
+                if at % 4 != 0 || at.checked_add(4).is_none_or(|end| end > self.desc_stride) {
+                    return bad("a span header word is misaligned or outside the descriptor");
+                }
+                if taken.contains(&at) {
+                    return bad("a span header word shares an offset with another header field");
+                }
+                taken.push(at);
+            }
+            if s.spans_arg_offset % 8 != 0 || args.contains(&s.spans_arg_offset) {
+                return bad(
+                    "the spans argument is misaligned or shares an offset with an argument",
+                );
+            }
+            let d = s.desc_stride;
+            let ptrs = [s.live_list_field, s.count_cell_field, s.bitmap_field];
+            let in_desc = |at: u32, len: u32| at.checked_add(len).is_some_and(|end| end <= d);
+            if s.n_spans_offset % 4 != 0
+                || s.n_spans_offset
+                    .checked_add(4)
+                    .is_none_or(|e| e > s.desc_base)
+                || d == 0
+                || d % 8 != 0
+                || s.desc_base % 8 != 0
+                || ptrs.iter().any(|&p| p % 8 != 0 || !in_desc(p, 8))
+                || ptrs.iter().enumerate().any(|(i, p)| ptrs[..i].contains(p))
+                || s.cap_field % 4 != 0
+                || !in_desc(s.cap_field, 4)
+                || ptrs
+                    .iter()
+                    .any(|&p| s.cap_field < p + 8 && p < s.cap_field + 4)
+                || s.entry_stride < 12
+                || s.entry_stride % 4 != 0
+            {
+                return bad(
+                    "the span table layout is misaligned, overlapping or outside its descriptor",
+                );
+            }
         }
         Ok(())
     }
@@ -1315,6 +1457,7 @@ mod tests {
                 .map(|s| (*s).to_owned())
                 .collect(),
             grid: None,
+            span: None,
         }
     }
 
@@ -1340,6 +1483,63 @@ mod tests {
         assert_eq!(back, q);
         q.grid.as_mut().unwrap().vx_offset = 28;
         assert!(q.validate("k").is_err(), "grid field overlaps ka_off");
+    }
+
+    #[test]
+    fn span_properties_need_the_span_layout_and_grid_offsets() {
+        let mut q = protocol();
+        q.proved.push(TASK_PROTO_REGION_WG_LIVE.into());
+        q.proved.push(TASK_PROTO_SPAN_ENTRY.into());
+        q.proved.sort_unstable();
+        let err = q.validate("k").unwrap_err();
+        assert!(err.contains("without the span layout offsets"), "{err}");
+        q.span = Some(TaskSpanOffsets::M0);
+        let err = q.validate("k").unwrap_err();
+        assert!(err.contains("without the grid field offsets"), "{err}");
+        q.grid = Some(TaskGridOffsets {
+            vx_offset: 4,
+            vy_offset: 8,
+            vz_offset: 12,
+            gx_offset: 16,
+            gy_offset: 20,
+            gz_offset: 24,
+            vcount_offset: 44,
+        });
+        q.validate("k").unwrap();
+        assert_eq!(TASK_PROTO_SPAN_ENTRY, "span_entry_validated");
+        assert_eq!(TASK_PROTO_REGION_WG_LIVE, "region_wg_from_live_entry");
+        let back: TaskProtocolRecord =
+            serde_json::from_value(serde_json::to_value(&q).unwrap()).unwrap();
+        assert_eq!(back, q);
+        // Layout offsets must be aligned, inside the descriptor and distinct.
+        for (what, tweak) in [
+            (
+                "flags overlaps pred",
+                (|s: &mut TaskSpanOffsets| s.flags_offset = 32) as fn(&mut _),
+            ),
+            ("flags outside", |s| s.flags_offset = 128),
+            ("k misaligned", |s| s.k_offset = 50),
+            ("list id is grid vcount", |s| s.list_id_offset = 44),
+            ("spans arg is ticket", |s| s.spans_arg_offset = 8),
+            ("spans arg misaligned", |s| s.spans_arg_offset = 68),
+            ("pointer fields overlap", |s| s.count_cell_field = 4),
+            ("K overlaps a pointer", |s| s.cap_field = 16),
+            ("pointer outside descriptor", |s| s.bitmap_field = 32),
+            ("zero descriptor stride", |s| s.desc_stride = 0),
+            ("n_spans overlaps descriptor 0", |s| s.n_spans_offset = 32),
+            ("short entry", |s| s.entry_stride = 8),
+        ] {
+            let mut r = q.clone();
+            tweak(r.span.as_mut().unwrap());
+            assert!(r.validate("k").is_err(), "{what}");
+        }
+        // Offsets without a proved span property, and a record without any
+        // of it serializing exactly as before.
+        let mut r = protocol();
+        r.span = Some(TaskSpanOffsets::M0);
+        assert!(r.validate("k").is_err());
+        let plain = serde_json::to_string(&protocol()).unwrap();
+        assert!(!plain.contains("span"), "{plain}");
     }
 
     #[test]

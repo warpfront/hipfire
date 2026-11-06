@@ -61,6 +61,19 @@
 //!    them. The tasks' arena and header buffers are never written, the claim
 //!    tickets of the pools are distinct cells outside the event ids, and
 //!    each pool's `events` argument is the declared event cells.
+//! 6. **Spans (GPU-generated routed tasks, `DYNAMIC.md`).** A header with
+//!    flag bit 0 is a *span task*: the dispatcher, not the header, picks the
+//!    workgroup (entry `k` of a producer-written live list, validated at
+//!    consume time). The `K` span tasks of one list are one launch
+//!    instance; see [`SpanDescriptor`] for the table they name. Because the
+//!    live coordinates are unknown on the host, the runtime claim bitmap
+//!    (certificate property `span_entry_validated`) replaces the `W`-set
+//!    disjointness of (4), and a same-instance conflict is admitted only
+//!    if its template separates **every** pair of distinct workgroups of
+//!    the grid. The live list and count cell are written only by the
+//!    producer, the bitmap only by the pool nodes. The result is a safety
+//!    proof, **not** a completeness proof (the admission receipt says so,
+//!    see `Admission::receipt_with_completeness`).
 //!
 //! The proof records what it cannot establish from the program as
 //! `obligations` (counters and tickets zero at every submit; header bytes
@@ -141,8 +154,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use railgun_corpus::receipt::{
-    ArgRecord, RequireOp, TaskGridOffsets, TaskProtocolRecord, TASK_PROTO_REGION_WG,
-    TASK_PROTO_REQUIRED,
+    ArgRecord, RequireOp, TaskGridOffsets, TaskProtocolRecord, TaskSpanOffsets,
+    TASK_PROTO_REGION_WG, TASK_PROTO_REGION_WG_LIVE, TASK_PROTO_REQUIRED, TASK_PROTO_SPAN_ENTRY,
 };
 
 use crate::coresident::{GroupOrdering, OrderedEdge};
@@ -150,10 +163,191 @@ use crate::kernel::{
     ArenaPointerLoad, ArenaSealedBinding, Arg, KernelNode, KernelProgram, MemClass, RegionEffect,
     WgFootprint,
 };
-use crate::{BindingRecord, ResourceId, ResourceKind};
+use crate::{BindingField, BindingRecord, ResourceId, ResourceKind, LIVE_ENTRY_BYTES};
 
 /// The "no event" value of the M0 task ABI.
 pub const NONE: u32 = u32::MAX;
+
+/// Header flag bit 0 (`M0TaskDesc::flags`): the task is a span task. Any
+/// other bit set makes the dispatcher poison, so a header with one is refused.
+pub const TASK_FLAG_SPAN: u32 = 1;
+
+/// Kernarg offset of `M0Params::spans`, the read-only pointer to the span
+/// table (zero when no task is in span mode).
+pub const M0_SPANS_ARG_OFFSET: u32 = 64;
+
+/// Template ids of the span table's binding records. The table is an
+/// ordinary [`ResourceKind::BindingRecords`] arena railgun writes at prepare:
+/// a header record at byte 0 (template [`SPAN_HEADER_TEMPLATE`], no pointer
+/// loads) carrying the scalar `n_spans` at +0, then one descriptor record
+/// (template [`SPAN_DESC_TEMPLATE`] = the receipt's
+/// `TaskSpanOffsets::nop_template`) per list at `32 + 32 * i`
+/// ([`span_table_records`]). The pool's arena fact at the `spans` argument
+/// names both templates.
+pub const SPAN_HEADER_TEMPLATE: u32 = 0xFFFF_FFFD;
+pub const SPAN_DESC_TEMPLATE: u32 = TaskSpanOffsets::M0.nop_template;
+/// Bytes of the span table's header and of each descriptor.
+pub const SPAN_TABLE_HEADER_BYTES: u64 = 32;
+pub const SPAN_DESC_BYTES: u64 = 32;
+
+/// One span list of the span table (descriptor `i` at `spans + 32 + 32 * i`:
+/// `{ u64 live_list, u64 count_cell, u64 bitmap, u32 K, u32 0 }`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpanDescriptor {
+    /// The [`ResourceKind::LiveList`] the producer writes (`cap >= K`).
+    pub live_list: ResourceId,
+    /// The `u32` count cell of valid entries (declared `EventCells`),
+    /// written only by the producer.
+    pub count: ResourceId,
+    /// The claim bitmap, `ceil(gx * gy * gz / 32)` `u32` words (declared
+    /// `EventCells`), written only by the dispatcher (atomic OR).
+    pub bitmap: ResourceId,
+    /// The host upper bound on live entries, and the number of span tasks.
+    pub k: u32,
+}
+
+/// The binding records of a span table over `spans`, to pass to
+/// [`crate::kernel::KernelProgram::bind_records`] (railgun writes the
+/// pointers and scalars with [`crate::kernel::KernelProgram::binding_record_image`]
+/// like any record arena). The arena needs [`span_table_bytes`] bytes.
+pub fn span_table_records(spans: &[SpanDescriptor]) -> Result<Vec<BindingRecord>, String> {
+    let n = u32::try_from(spans.len()).map_err(|_| "more spans than a u32 counts".to_owned())?;
+    let mut records = vec![BindingRecord {
+        base: 0,
+        template: SPAN_HEADER_TEMPLATE,
+        fields: Vec::new(),
+        scalars: vec![(0, n)],
+    }];
+    for (i, s) in spans.iter().enumerate() {
+        let field = |offset, resource| BindingField {
+            offset,
+            resource,
+            interior: 0,
+        };
+        records.push(BindingRecord {
+            base: SPAN_TABLE_HEADER_BYTES + SPAN_DESC_BYTES * i as u64,
+            template: SPAN_DESC_TEMPLATE,
+            fields: vec![
+                field(0, s.live_list),
+                field(8, s.count),
+                field(16, s.bitmap),
+            ],
+            scalars: vec![(24, s.k), (28, 0)],
+        });
+    }
+    Ok(records)
+}
+
+/// Bytes a span table of `n_spans` lists occupies.
+pub fn span_table_bytes(n_spans: usize) -> u64 {
+    SPAN_TABLE_HEADER_BYTES + SPAN_DESC_BYTES * n_spans as u64
+}
+
+/// The span table of binding-record arena `arena`: the exact inverse of
+/// [`span_table_records`] (anything else is refused), inside the arena's
+/// declared size.
+fn read_span_table(
+    program: &KernelProgram,
+    arena: ResourceId,
+) -> Result<Vec<SpanDescriptor>, String> {
+    let Some(ResourceKind::BindingRecords(records)) = program.kinds.get(&arena) else {
+        return Err(format!(
+            "span table resource {} is not a bound binding-record arena",
+            arena.0
+        ));
+    };
+    let bad = |what: String| Err(format!("span table {}: {what}", arena.0));
+    let by_base: BTreeMap<u64, &BindingRecord> = records.iter().map(|r| (r.base, r)).collect();
+    let Some(header) = by_base.get(&0) else {
+        return bad("no header record at +0".into());
+    };
+    if header.template != SPAN_HEADER_TEMPLATE
+        || !header.fields.is_empty()
+        || header.scalars.len() != 1
+        || header.scalars[0].0 != 0
+    {
+        return bad(format!(
+            "the header record must be template {SPAN_HEADER_TEMPLATE:#x} with the one scalar n_spans at +0"
+        ));
+    }
+    let n = header.scalars[0].1 as usize;
+    if records.len() != n + 1 {
+        return bad(format!(
+            "n_spans is {n}, but the table has {} descriptor records",
+            records.len() - 1
+        ));
+    }
+    let need = span_table_bytes(n);
+    let have = program.resources[arena.0 as usize].bytes;
+    if have < need {
+        return bad(format!(
+            "{n} spans need {need} bytes, the arena holds {have}"
+        ));
+    }
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let base = SPAN_TABLE_HEADER_BYTES + SPAN_DESC_BYTES * i as u64;
+        let Some(rec) = by_base.get(&base) else {
+            return bad(format!("no descriptor record at +{base}"));
+        };
+        let mut fields: Vec<(u32, ResourceId, u64)> = rec
+            .fields
+            .iter()
+            .map(|f| (f.offset, f.resource, f.interior))
+            .collect();
+        fields.sort_unstable_by_key(|f| f.0);
+        let mut scalars = rec.scalars.clone();
+        scalars.sort_unstable();
+        let ok = rec.template == SPAN_DESC_TEMPLATE
+            && fields.len() == 3
+            && fields.iter().map(|f| f.0).eq([0, 8, 16])
+            && fields.iter().all(|f| f.2 == 0)
+            && scalars.len() == 2
+            && scalars[0].0 == 24
+            && scalars[1] == (28, 0);
+        if !ok {
+            return bad(format!(
+                "descriptor record @{base} must be template {SPAN_DESC_TEMPLATE:#x} with pointers at +0/+8/+16 (interior 0), the scalar K at +24 and 0 at +28"
+            ));
+        }
+        out.push(SpanDescriptor {
+            live_list: fields[0].1,
+            count: fields[1].1,
+            bitmap: fields[2].1,
+            k: scalars[0].1,
+        });
+    }
+    Ok(out)
+}
+
+/// What [`TaskGraph::check`] established about one span list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpanListProof {
+    pub list_id: u32,
+    /// The consumer template and its record (one launch instance).
+    pub template: u32,
+    pub ka_off: u32,
+    /// `K`: the number of span tasks, and the bound the dispatcher checks
+    /// the count cell against; the virtual grid every entry is checked in.
+    pub k: u32,
+    pub grid: (u32, u32, u32),
+    /// The producer: `(pool index, task index in the pool)`, the only
+    /// releaser of the list's pred event, with `expected = 1`.
+    pub producer: (usize, usize),
+    pub live_list: ResourceId,
+    pub count: ResourceId,
+    pub bitmap: ResourceId,
+}
+
+/// Who may write a resource of a span list.
+enum SpanRole {
+    /// The live list or the count cell: the producer's task (global index)
+    /// and node only.
+    Producer { gid: usize, node: usize },
+    /// The claim bitmap: the pool nodes only (every dispatcher carries the
+    /// span code, whose atomic OR is the one writer), no task.
+    Bitmap { nodes: BTreeSet<usize> },
+}
 
 /// Bytes a claim ticket occupies (a `u32` counter; 8 reserved).
 const TICKET_BYTES: u64 = 8;
@@ -170,6 +364,11 @@ pub struct TaskLayout {
     pub done_event_offset: u32,
     pub none_event: u32,
     pub event_stride: u32,
+    /// Header offsets of the span-mode words: the flags (bit 0 = span mode),
+    /// the span-relative index `k` and the span-table list id.
+    pub flags_offset: u32,
+    pub k_offset: u32,
+    pub list_id_offset: u32,
     /// Offsets of the virtual-grid fields (`vx, vy, vz, gx, gy, gz, vcount`).
     pub grid: TaskGridOffsets,
 }
@@ -196,6 +395,9 @@ impl TaskLayout {
             gz_offset: 24,
             vcount_offset: 44,
         },
+        flags_offset: 48,
+        k_offset: 52,
+        list_id_offset: 56,
     };
 }
 
@@ -235,6 +437,15 @@ impl TaskProtocolFact {
         arg(record.ticket_arg_offset, 8, "ticket")?;
         arg(record.events_arg_offset, 8, "events")?;
         arg(record.n_tasks_arg_offset, 4, "n_tasks")?;
+        if let Some(span) = &record.span {
+            // The host writes the span table and reads the span words at the
+            // M0 layout only; another certified ABI is not one it implements.
+            if *span != TaskSpanOffsets::M0 {
+                return Err(format!(
+                    "{symbol}: task protocol span layout {span:?} is not the M0 span ABI"
+                ));
+            }
+        }
         Ok(Self {
             layout: TaskLayout {
                 desc_stride: record.desc_stride,
@@ -247,6 +458,9 @@ impl TaskProtocolFact {
                 event_stride: record.event_stride,
                 // A receipt that does not carry the offsets reads the M0 ones;
                 // `region_wg_from_header` is only honoured with them proved.
+                flags_offset: TaskLayout::M0.flags_offset,
+                k_offset: TaskLayout::M0.k_offset,
+                list_id_offset: TaskLayout::M0.list_id_offset,
                 grid: record.grid.unwrap_or(TaskLayout::M0.grid),
             },
             tasks_arg_offset: record.tasks_arg_offset,
@@ -272,6 +486,15 @@ impl TaskProtocolFact {
     /// `(vx + step, vyz)` for `step < max(vcount, 1)` from the header fields.
     pub fn proves_region_wg(&self) -> bool {
         self.proved.iter().any(|p| p == TASK_PROTO_REGION_WG)
+    }
+
+    /// The certificate proved the dispatcher's span mode: the entry
+    /// validation (`span_entry_validated`) and the region's workgroup taken
+    /// from the validated live entry (`region_wg_from_live_entry`).
+    pub fn proves_span(&self) -> bool {
+        [TASK_PROTO_SPAN_ENTRY, TASK_PROTO_REGION_WG_LIVE]
+            .iter()
+            .all(|p| self.proved.iter().any(|q| q == p))
     }
 
     /// The M0 pool ABI (`M0Params`: tasks @0, ticket @8, events @16, task
@@ -362,7 +585,7 @@ impl TaskProtocol {
 }
 
 /// One task header (`M0TaskDesc`'s scheduling fields).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TaskHeader {
     /// The body template (receipt arena template id).
     pub template: u32,
@@ -384,6 +607,12 @@ pub struct TaskHeader {
     pub gy: u32,
     pub gz: u32,
     pub vcount: u32,
+    /// Span mode: header flags (bit 0 = span task, any other bit is refused),
+    /// the span-relative index `k` and the span-table list id. All zero for
+    /// an ordinary task.
+    pub flags: u32,
+    pub k: u32,
+    pub list_id: u32,
 }
 
 /// The tasks of one pool, in claim order: task `k` is the one the pool's
@@ -429,6 +658,9 @@ impl PoolTasks {
                     gy: word(rec, layout.grid.gy_offset)?,
                     gz: word(rec, layout.grid.gz_offset)?,
                     vcount: word(rec, layout.grid.vcount_offset)?,
+                    flags: word(rec, layout.flags_offset)?,
+                    k: word(rec, layout.k_offset)?,
+                    list_id: word(rec, layout.list_id_offset)?,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -449,6 +681,10 @@ pub struct TaskGraph {
     /// The bound binding-record arena the headers' `ka_off` index.
     pub arena: ResourceId,
     pub layout: TaskLayout,
+    /// The binding-record arena holding the span table the pools' `spans`
+    /// argument points at ([`TaskGraph::with_spans`]); `None` when no task
+    /// is in span mode.
+    pub spans: Option<ResourceId>,
 }
 
 /// What [`TaskGraph::check`] established. Only `check` (and the lab
@@ -470,6 +706,8 @@ pub struct TaskGraphProof {
     /// protocol (`inter-WG disjointness unproven: template <t>, resource
     /// <r>`, one per pair, sorted); empty for a certified proof.
     pub pending: Vec<String>,
+    /// The span lists proved (empty without span tasks).
+    pub spans: Vec<SpanListProof>,
 }
 
 impl TaskGraphProof {
@@ -486,7 +724,9 @@ impl TaskGraphProof {
     /// The ordering `add_coresident_group` consumes: the edges, marked as
     /// covered by a task-graph proof of this group.
     pub fn ordering(&self) -> GroupOrdering {
-        GroupOrdering::from_certificate(self.edges.clone()).with_task_graph(self.group.clone())
+        GroupOrdering::from_certificate(self.edges.clone())
+            .with_task_graph(self.group.clone())
+            .with_spans(self.spans.len())
     }
 }
 
@@ -646,7 +886,15 @@ impl TaskGraph {
             event_cells,
             arena,
             layout: TaskLayout::M0,
+            spans: None,
         }
+    }
+
+    /// This graph's span tasks index the span table in binding-record arena
+    /// `arena` ([`span_table_records`]).
+    pub fn with_spans(mut self, arena: ResourceId) -> Self {
+        self.spans = Some(arena);
+        self
     }
 
     /// Prove the group `group` of `program` from its task headers and the
@@ -699,9 +947,11 @@ impl TaskGraph {
         };
         let proof = self.prove(program, group.clone(), &protocol, mode)?;
         let reasons = proof.pending.clone();
+        let lists = proof.spans.len();
         Ok(GroupOrdering::lab_pending(proof.edges)
             .with_pending_reasons(reasons)
-            .with_task_graph(group))
+            .with_task_graph(group)
+            .with_spans(lists))
     }
 
     fn prove(
@@ -766,6 +1016,7 @@ impl TaskGraph {
         pass: RacePass,
     ) -> Result<TaskGraphProof, String> {
         let pending = mode.pending;
+        let mut pending_reasons: Option<BTreeSet<String>> = pending.then(BTreeSet::new);
         let layout = &self.layout;
 
         // ---- Shape: the pools are exactly the group's members.
@@ -1014,6 +1265,17 @@ impl TaskGraph {
                 consumers.entry(t.pred_event).or_default().push(gid);
             }
         }
+        // ---- Span lists: header validation, table, producer and writers.
+        let spans = self.check_spans(
+            program,
+            protocol,
+            &pool_effects,
+            &by_base,
+            &flat,
+            &index,
+            (&producers, &consumers),
+            pending_reasons.as_mut(),
+        )?;
         for (gid, t) in flat.iter().enumerate() {
             if t.pred_event == layout.none_event {
                 continue;
@@ -1208,7 +1470,6 @@ impl TaskGraph {
                 n.1 |= e.writes();
             }
         }
-        let mut pending_reasons: Option<BTreeSet<String>> = pending.then(BTreeSet::new);
         let races = Races {
             graph: self,
             flat: &flat,
@@ -1298,12 +1559,28 @@ impl TaskGraph {
             obligations
                 .push("lab: dispatcher protocol and per-template effects are pending".into());
         }
+        if !spans.is_empty() {
+            let cells: Vec<String> = spans
+                .iter()
+                .flat_map(|s| [s.count.0, s.bitmap.0])
+                .map(|r| r.to_string())
+                .collect();
+            obligations.push(format!(
+                "span count cells and claim bitmaps (resources {}) are zero at every submit",
+                cells.join(", ")
+            ));
+            obligations.push(
+                "span completeness is not certified: the live lists are exactly the eager live set only by functional evidence (EXPAND_LIVE), which the admission receipt must carry"
+                    .to_owned(),
+            );
+        }
         Ok(TaskGraphProof {
             group,
             edges,
             tasks: total,
             events_used: event_ids.len(),
             ordered_pairs,
+            spans,
             obligations,
             pending: pending_reasons
                 .map(|s| s.into_iter().collect())
@@ -1332,8 +1609,18 @@ impl TaskGraph {
         };
         let mut of = vec![None; flat.len()];
         for (key, gids) in by_key {
+            // A span list is one instance by construction (`check_spans`):
+            // the dispatcher picks each task's workgroup and the claim bitmap
+            // keeps them distinct, so its header coordinates are not `W` sets.
+            let span = flat[gids[0]].flags == TASK_FLAG_SPAN;
             // One task is no concurrency; without the proof the rule is off.
-            if gids.len() < 2 || gids.iter().any(|&g| !wg_ok[index.pool_of(g)]) {
+            if gids.len() < 2 || (!span && gids.iter().any(|&g| !wg_ok[index.pool_of(g)])) {
+                continue;
+            }
+            if span {
+                for &g in &gids {
+                    of[g] = Some(key);
+                }
                 continue;
             }
             let first = flat[gids[0]];
@@ -1372,6 +1659,423 @@ impl TaskGraph {
             }
         }
         Ok(Instances(of))
+    }
+
+    /// Span mode (see the module docs, item 6): the headers, the span table,
+    /// the producer's cardinality and the writers of the live lists, count
+    /// cells and claim bitmaps. `Ok(vec![])` when no task is in span mode.
+    /// In a lab build (`pending`) a pool whose certificate lacks the span
+    /// properties is a named pending reason, not a refusal.
+    #[allow(clippy::too_many_arguments)]
+    fn check_spans(
+        &self,
+        program: &KernelProgram,
+        protocol: &TaskProtocol,
+        pool_effects: &[PoolEffects],
+        by_base: &BTreeMap<u64, &BindingRecord>,
+        flat: &[&TaskHeader],
+        index: &Index,
+        (producers, consumers): (&BTreeMap<u32, Vec<usize>>, &BTreeMap<u32, Vec<usize>>),
+        mut pending: Option<&mut BTreeSet<String>>,
+    ) -> Result<Vec<SpanListProof>, String> {
+        let layout = &self.layout;
+        let place = |gid: usize| {
+            let pi = index.pool_of(gid);
+            (pi, gid - index.base[pi])
+        };
+        let who = |gid: usize| {
+            let (pi, k) = place(gid);
+            format!("task {k} of pool {pi} (node {})", self.pools[pi].node)
+        };
+
+        // ---- Flags: 0 or exactly the span bit.
+        let mut lists: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for (gid, t) in flat.iter().enumerate() {
+            match t.flags {
+                0 => {}
+                TASK_FLAG_SPAN => lists.entry(t.list_id).or_default().push(gid),
+                f => {
+                    return Err(format!(
+                        "{}: header flags {f:#x}: only bit 0 (span mode) is defined, the dispatcher poisons any other bit",
+                        who(gid)
+                    ))
+                }
+            }
+        }
+        let Some(first_span) = lists.values().flatten().next().copied() else {
+            return Ok(Vec::new());
+        };
+
+        // ---- The span table.
+        let Some(arena) = self.spans else {
+            return Err(format!(
+                "{}: span-mode task, but the graph names no span table (TaskGraph::with_spans)",
+                who(first_span)
+            ));
+        };
+        if arena == self.arena || arena == self.events {
+            return Err(format!(
+                "span table {} is the graph's own arena or events",
+                arena.0
+            ));
+        }
+        let table = read_span_table(program, arena)?;
+        if let Some(n) = program
+            .nodes
+            .iter()
+            .position(|n| n.effects.iter().any(|e| e.resource == arena && e.writes()))
+        {
+            return Err(format!("node {n} writes span table {}", arena.0));
+        }
+
+        // ---- The pools hosting span tasks: protocol properties and `spans` argument.
+        let hosting: BTreeSet<usize> = lists
+            .values()
+            .flatten()
+            .map(|&g| index.pool_of(g))
+            .collect();
+        let mut tickets: BTreeSet<ResourceId> = BTreeSet::new();
+        for pool in &self.pools {
+            let node = &program.nodes[pool.node];
+            if let Some(fact) = protocol.node(pool.node) {
+                if let Some((_, Arg::Resource { resource, .. })) =
+                    node.args.iter().find(|(o, _)| *o == fact.ticket_arg_offset)
+                {
+                    tickets.insert(*resource);
+                }
+            }
+        }
+        for &pi in &hosting {
+            let pool = &self.pools[pi];
+            let node = &program.nodes[pool.node];
+            let who_pool = format!("pool {pi} (node {}, {})", pool.node, node.symbol);
+            let fact = protocol
+                .node(pool.node)
+                .ok_or_else(|| format!("{who_pool}: no proven task protocol"))?;
+            for prop in [TASK_PROTO_SPAN_ENTRY, TASK_PROTO_REGION_WG_LIVE] {
+                if fact.proved.iter().any(|p| p == prop) {
+                    continue;
+                }
+                match pending.as_deref_mut() {
+                    Some(set) => {
+                        set.insert(format!(
+                            "span protocol pending: node {} ({}): {prop} not proven",
+                            pool.node, node.symbol
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "{who_pool}: span-mode tasks need protocol property {prop:?}, which its certificate does not prove"
+                        ))
+                    }
+                }
+            }
+            match node
+                .args
+                .iter()
+                .find(|(o, _)| *o == M0_SPANS_ARG_OFFSET)
+                .map(|(_, a)| a)
+            {
+                Some(Arg::Resource { resource, interior: 0 }) if *resource == arena => {}
+                other => {
+                    return Err(format!(
+                        "{who_pool}: spans argument +{M0_SPANS_ARG_OFFSET} is {other:?}, not the span table {} at 0",
+                        arena.0
+                    ))
+                }
+            }
+        }
+
+        // ---- Each list.
+        let mut span_keys: BTreeMap<(u32, u32), u32> = BTreeMap::new();
+        let mut seen_res: BTreeMap<ResourceId, (u32, &str)> = BTreeMap::new();
+        let mut roles: BTreeMap<ResourceId, (u32, &str, SpanRole)> = BTreeMap::new();
+        let mut proofs = Vec::with_capacity(lists.len());
+        for (&list_id, gids) in &lists {
+            let first = flat[gids[0]];
+            let what = format!("span list {list_id}");
+            let Some(d) = table.get(list_id as usize) else {
+                return Err(format!(
+                    "{}: list_id {list_id} is not below n_spans {} of the span table",
+                    who(gids[0]),
+                    table.len()
+                ));
+            };
+            for &g in gids {
+                let t = flat[g];
+                let uniform = (
+                    t.template,
+                    t.ka_off,
+                    t.gx,
+                    t.gy,
+                    t.gz,
+                    t.pred_event,
+                    t.expected,
+                    t.done_event,
+                ) == (
+                    first.template,
+                    first.ka_off,
+                    first.gx,
+                    first.gy,
+                    first.gz,
+                    first.pred_event,
+                    first.expected,
+                    first.done_event,
+                );
+                if !uniform {
+                    return Err(format!(
+                        "{}: differs from {} in template, ka_off, virtual grid, pred or done: the tasks of {what} are one launch instance",
+                        who(g),
+                        who(gids[0])
+                    ));
+                }
+                if t.vcount != 1 {
+                    return Err(format!(
+                        "{}: vcount {} in span mode: a span task runs exactly one workgroup (vcount 1)",
+                        who(g),
+                        t.vcount
+                    ));
+                }
+            }
+            if let Some(prev) = span_keys.insert((first.template, first.ka_off), list_id) {
+                return Err(format!(
+                    "{what} and span list {prev} share template {} record @{}: one record is one instance",
+                    first.template, first.ka_off
+                ));
+            }
+            let k_total = d.k;
+            let grid = u128::from(first.gx) * u128::from(first.gy) * u128::from(first.gz);
+            if u128::from(k_total) > grid {
+                return Err(format!(
+                    "{what}: K = {k_total} exceeds the {grid} workgroups of the ({}, {}, {}) grid of template {}",
+                    first.gx, first.gy, first.gz, first.template
+                ));
+            }
+            if gids.len() != k_total as usize {
+                return Err(format!(
+                    "{what}: the span table says K = {k_total}, but {} tasks carry the list: exactly K tasks with k = 0..K-1 are needed (NOP tasks still release done)",
+                    gids.len()
+                ));
+            }
+            let mut seen = vec![false; k_total as usize];
+            for &g in gids {
+                let k = flat[g].k;
+                match seen.get_mut(k as usize) {
+                    None => {
+                        return Err(format!(
+                            "{}: span index k = {k} is not below K = {k_total} of {what}",
+                            who(g)
+                        ))
+                    }
+                    Some(s) if *s => {
+                        return Err(format!(
+                            "{}: span index k = {k} of {what} is carried by two tasks, so some index below K = {k_total} has none",
+                            who(g)
+                        ))
+                    }
+                    Some(s) => *s = true,
+                }
+            }
+
+            // The resources the descriptor names.
+            for (role, r) in [
+                ("live list", d.live_list),
+                ("count cell", d.count),
+                ("claim bitmap", d.bitmap),
+            ] {
+                if program.resources.get(r.0 as usize).is_none() {
+                    return Err(format!("{what}: {role} resource {} does not exist", r.0));
+                }
+                if r == self.events || r == self.arena || r == arena || tickets.contains(&r) {
+                    return Err(format!(
+                        "{what}: {role} resource {} is a protocol resource (events, arena, span table or ticket)",
+                        r.0
+                    ));
+                }
+                if let Some((other, theirs)) = seen_res.insert(r, (list_id, role)) {
+                    return Err(format!(
+                        "{what}: {role} resource {} is also the {theirs} of span list {other}",
+                        r.0
+                    ));
+                }
+            }
+            match program.kinds.get(&d.live_list) {
+                Some(ResourceKind::LiveList { cap, stride })
+                    if u64::from(*stride) == LIVE_ENTRY_BYTES && *cap >= k_total => {}
+                other => {
+                    return Err(format!(
+                        "{what}: live list resource {} is {other:?}, not a LiveList of stride {LIVE_ENTRY_BYTES} with capacity >= K = {k_total}",
+                        d.live_list.0
+                    ))
+                }
+            }
+            let bitmap_bytes = grid.div_ceil(32) * 4;
+            for (role, r, need) in [
+                ("count cell", d.count, 4u128),
+                ("claim bitmap", d.bitmap, bitmap_bytes),
+            ] {
+                let have = u128::from(program.resources[r.0 as usize].bytes);
+                if !matches!(program.kinds.get(&r), Some(ResourceKind::EventCells { .. }))
+                    || have < need
+                {
+                    return Err(format!(
+                        "{what}: {role} resource {} must be declared EventCells and hold {need} bytes (holds {have})",
+                        r.0
+                    ));
+                }
+            }
+
+            // The producer and the consumers.
+            if first.pred_event == layout.none_event || first.expected != 1 {
+                return Err(format!(
+                    "{what}: span tasks wait for the producer's done event with expected 1, not event {} expected {}",
+                    first.pred_event, first.expected
+                ));
+            }
+            let released = producers
+                .get(&first.pred_event)
+                .map_or(&[][..], Vec::as_slice);
+            let [producer] = released else {
+                return Err(format!(
+                    "{what}: pred event {} is released by {} tasks: the producer must be its only releaser",
+                    first.pred_event,
+                    released.len()
+                ));
+            };
+            let producer = *producer;
+            if first.done_event != layout.none_event {
+                if let Some(waiting) = consumers.get(&first.done_event) {
+                    for &c in waiting {
+                        if u64::from(flat[c].expected) != u64::from(k_total) {
+                            return Err(format!(
+                                "{} waits for event {} to reach {}, but {what} releases it K = {k_total} times (NOP tasks release too): expected must equal K exactly",
+                                who(c),
+                                first.done_event,
+                                flat[c].expected
+                            ));
+                        }
+                    }
+                    let all = producers.get(&first.done_event).map_or(0, Vec::len);
+                    if all != k_total as usize {
+                        return Err(format!(
+                            "event {} is released by {all} tasks, {what} accounts for K = {k_total}: the span's done event has other releasers",
+                            first.done_event
+                        ));
+                    }
+                }
+            }
+
+            let nodes: BTreeSet<usize> = self.pools.iter().map(|p| p.node).collect();
+            let (pp, pk) = place(producer);
+            for (name, r) in [("live list", d.live_list), ("count cell", d.count)] {
+                roles.insert(
+                    r,
+                    (
+                        list_id,
+                        name,
+                        SpanRole::Producer {
+                            gid: producer,
+                            node: self.pools[pp].node,
+                        },
+                    ),
+                );
+            }
+            roles.insert(
+                d.bitmap,
+                (list_id, "claim bitmap", SpanRole::Bitmap { nodes }),
+            );
+            proofs.push(SpanListProof {
+                list_id,
+                template: first.template,
+                ka_off: first.ka_off,
+                k: k_total,
+                grid: (first.gx, first.gy, first.gz),
+                producer: (pp, pk),
+                live_list: d.live_list,
+                count: d.count,
+                bitmap: d.bitmap,
+            });
+        }
+        // An instance is span or not: no ordinary task shares a span record.
+        for (gid, t) in flat.iter().enumerate() {
+            if t.flags == 0 {
+                if let Some(list) = span_keys.get(&(t.template, t.ka_off)) {
+                    return Err(format!(
+                        "{}: ordinary task on template {} record @{}, which span list {list} owns",
+                        who(gid),
+                        t.template,
+                        t.ka_off
+                    ));
+                }
+            }
+        }
+
+        // ---- Writers: the live list and count only by the producer, the
+        // bitmap only by the pool nodes. A pool node's effects through its
+        // arena records are the union over every record of the templates it
+        // knows (every pool of a megakernel knows the producer's), so for
+        // them the per-task pass below is the precise check; what a node
+        // reaches through an argument of its own is checked here.
+        let pool_node = |n: usize| self.pools.iter().any(|p| p.node == n);
+        for (n, node) in program.nodes.iter().enumerate() {
+            for e in node.effects.iter().filter(|e| e.writes()) {
+                if pool_node(n) && self.through_arena(node, e) {
+                    continue;
+                }
+                let Some((list, name, role)) = roles.get(&e.resource) else {
+                    continue;
+                };
+                let (allowed, who_may) = match role {
+                    SpanRole::Producer { node: pn, .. } => (n == *pn, "the producer's node"),
+                    SpanRole::Bitmap { nodes } => (nodes.contains(&n), "the pool nodes"),
+                };
+                if !allowed {
+                    return Err(format!(
+                        "node {n} ({}) writes the {name} (resource {}) of span list {list}: only {who_may} may",
+                        node.symbol, e.resource.0
+                    ));
+                }
+            }
+        }
+        let mut memo: BTreeMap<(usize, u32, u32), Vec<ResourceId>> = BTreeMap::new();
+        for (gid, t) in flat.iter().enumerate() {
+            let pi = index.pool_of(gid);
+            let written = memo.entry((pi, t.template, t.ka_off)).or_insert_with(|| {
+                by_base
+                    .get(&u64::from(t.ka_off))
+                    .map(|rec| Self::raw_writes(&pool_effects[pi], rec))
+                    .unwrap_or_default()
+            });
+            for r in written.iter() {
+                let Some((list, name, role)) = roles.get(r) else {
+                    continue;
+                };
+                if !matches!(role, SpanRole::Producer { gid: p, .. } if *p == gid) {
+                    return Err(format!(
+                        "{} writes the {name} (resource {}) of span list {list}: only the producer task writes it, the claim bitmap only the dispatcher",
+                        who(gid),
+                        r.0
+                    ));
+                }
+            }
+        }
+        Ok(proofs)
+    }
+
+    /// The resources a task of `record` may write through its pointer
+    /// fields, event cells included (unlike [`TaskGraph::task_effects`]).
+    fn raw_writes(source: &PoolEffects, record: &BindingRecord) -> Vec<ResourceId> {
+        match source {
+            PoolEffects::Conservative => record.fields.iter().map(|f| f.resource).collect(),
+            PoolEffects::Templates { loads, .. } => loads
+                .get(&record.template)
+                .into_iter()
+                .flatten()
+                .filter(|l| l.classes.iter().any(|c| c.writes()))
+                .filter_map(|l| record.fields.iter().find(|f| f.offset == l.record_offset))
+                .map(|f| f.resource)
+                .collect(),
+        }
     }
 
     /// The per-template pointer loads of a pool node's task records.
@@ -1612,12 +2316,17 @@ impl TaskGraph {
 
     /// Whether node effect `e` is reached through the binding-record arena
     /// (an arena pointer load, so covered by the task headers) rather than a
-    /// pointer argument of its own.
+    /// pointer argument of its own. The span table's records are the second
+    /// such arena: the dispatcher reaches the live lists, count cells and
+    /// claim bitmaps through it, which [`TaskGraph::check_spans`] covers.
     fn through_arena(&self, node: &KernelNode, e: &RegionEffect) -> bool {
-        e.resource != self.arena && node.args.iter().any(|(o, a)| {
-            *o == e.arg_offset
-                && matches!(a, Arg::Resource { resource, interior: 0 } if *resource == self.arena)
-        })
+        e.resource != self.arena
+            && Some(e.resource) != self.spans
+            && node.args.iter().any(|(o, a)| {
+                *o == e.arg_offset
+                    && matches!(a, Arg::Resource { resource, interior: 0 }
+                        if *resource == self.arena || Some(*resource) == self.spans)
+            })
     }
 
     /// Accesses a pool makes outside the arena (through its explicit
@@ -2430,7 +3139,41 @@ impl Races<'_> {
                 ));
             }
         }
+        if ta.flags == TASK_FLAG_SPAN {
+            return self.span_rule(resource, a, fp.axes, pending);
+        }
         Ok(PairRule::Axes(fp.axes))
+    }
+
+    /// A footprint over `axes` for a pair of span tasks. The live
+    /// coordinates are unknown on the host (the dispatcher's claim bitmap
+    /// only keeps them distinct), so the footprint must separate every pair
+    /// of distinct workgroups of the grid: its axes cover every axis the grid
+    /// has extent > 1 on. Then any pair is admitted; otherwise refused, or
+    /// (lab) a named pending reason.
+    fn span_rule(
+        &self,
+        resource: ResourceId,
+        a: usize,
+        axes: u8,
+        pending: Option<&mut BTreeSet<String>>,
+    ) -> Result<PairRule, String> {
+        let t = self.flat[a];
+        let required = u8::from(t.gx > 1) | (u8::from(t.gy > 1) << 1) | (u8::from(t.gz > 1) << 2);
+        if axes & required == required {
+            return Ok(PairRule::Admit);
+        }
+        if let Some(set) = pending {
+            set.insert(format!(
+                "inter-WG disjointness unproven: template {}, resource {}",
+                t.template, resource.0
+            ));
+            return Ok(PairRule::Admit);
+        }
+        Err(format!(
+            "race on resource {}: inter-WG disjointness unproven: template {}, resource {}: the live workgroups of span list {} are unknown on the host, so the footprint (axes mask {axes:#05b}) must separate every pair of workgroups of the ({}, {}, {}) grid, which needs axes mask {required:#05b}",
+            resource.0, t.template, resource.0, t.list_id, t.gx, t.gy, t.gz
+        ))
     }
 
     /// A footprint over `axes` admits the pair `a < b` iff it differs on an

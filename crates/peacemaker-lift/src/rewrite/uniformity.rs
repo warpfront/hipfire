@@ -1212,10 +1212,7 @@ fn defined_in(body: &Body, g: &Graph, nodes: &BTreeSet<usize>) -> Taint {
 
 /// The barrier-participation obligation of a `block`-thread (wave32) region body.
 /// Returns (uniform branch nodes, per-wave branch nodes, verdict).
-pub(crate) fn barrier_participation(
-    body: &Body,
-    block: u32,
-) -> Result<(usize, usize, String), String> {
+pub fn barrier_participation(body: &Body, block: u32) -> Result<(usize, usize, String), String> {
     let waves = block.div_ceil(32);
     let index: BTreeMap<_, usize> = body
         .blocks

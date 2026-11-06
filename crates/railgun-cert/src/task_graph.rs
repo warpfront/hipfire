@@ -175,6 +175,9 @@ pub(crate) fn refuse(rule: &'static str, detail: impl Into<String>) -> Refusal {
 #[derive(Clone, Debug)]
 pub struct PoolProof {
     pub arena: DescriptorArenaRecord,
+    /// The span table (`spans` argument) as a binding arena, when the dispatcher has span
+    /// mode and it is proved: its pointer fields are loaded from descriptor records.
+    pub span_arena: Option<DescriptorArenaRecord>,
     pub protocol: TaskProtocolRecord,
     /// Human-readable evidence lines (the `task-graph` check detail).
     pub evidence: Vec<String>,
@@ -345,7 +348,8 @@ fn mnemonic(kernel: &Kernel, arch: Arch, pos: usize) -> &'static str {
 /// Structural checks of one placed region over the lifted CFG: the region is
 /// entered only at its entry and left only through its exit, no instruction
 /// names a trap temporary, none ends or traps the wave, and a native region touches
-/// no LDS and no barrier.
+/// no LDS (its barriers are admitted by [`derive_native`] only with the barrier-participation
+/// proof: every wave of the pool's workgroup reaches each one the same number of times).
 fn check_region_structure(kernel: &Kernel, arch: Arch, p: &Placed) -> Vec<Refusal> {
     let body = &kernel.body;
     let t = p.region.template_id;
@@ -424,6 +428,7 @@ fn check_region_structure(kernel: &Kernel, arch: Arch, p: &Placed) -> Vec<Refusa
             ));
         }
         if p.region.is_native() {
+            // (a barrier is admitted by `derive_native` only with its participation proof)
             let lds = inst.effects.lds.is_some()
                 || matches!(
                     inst.effects.mem.map(|m| m.class),
@@ -434,10 +439,10 @@ fn check_region_structure(kernel: &Kernel, arch: Arch, p: &Placed) -> Vec<Refusa
                             | peacemaker_ir::effects::MemClass::LdsDma
                     )
                 );
-            if lds || matches!(inst.effects.control, Control::Barrier(_)) {
+            if lds {
                 out.push(refuse(
                     "task_graph-region-native",
-                    format!("template {t}: native region `{text}` uses LDS or a barrier, which its declared geometry does not cover"),
+                    format!("template {t}: native region `{text}` uses LDS, which its declared geometry does not cover"),
                 ));
             }
         }
@@ -1163,6 +1168,7 @@ fn derive_native(
     kernel: &Kernel,
     arch: Arch,
     p: &Placed,
+    block: u32,
     budget: &PoolBudget,
 ) -> Result<RegionFacts, Refusal> {
     let t = p.region.template_id;
@@ -1176,6 +1182,44 @@ fn derive_native(
             format!("template {t}: the native region dereferences no record pointer"),
         ));
     }
+    // A barrier in a native region must be executed by every wave of the pool's workgroup
+    // the same number of times (a wave that skipped it would pair its next dispatcher
+    // barrier with another wave's): the lifted bodies' barrier-participation proof, over
+    // the region cut out of the pool.
+    let barriers = (p.p_entry..p.p_exit.min(kernel.body.layout.len()))
+        .filter(|&pos| {
+            kernel
+                .body
+                .insts
+                .get(kernel.body.layout[pos])
+                .is_some_and(|i| matches!(i.effects.control, Control::Barrier(_)))
+        })
+        .count();
+    let mut participation = String::new();
+    if barriers > 0 {
+        let sub = region_kernel(kernel, p).map_err(|e| {
+            refuse(
+                "task_graph-region-native",
+                format!("template {t}: region cannot be cut out: {e}"),
+            )
+        })?;
+        let (uniform, divergent, verdict) =
+            peacemaker_lift::rewrite::uniformity::barrier_participation(&sub.body, block)
+                .map_err(|reason| {
+                    refuse(
+                        "task_graph-region-native",
+                        format!("template {t}: native region barrier is not reached by every wave: {reason}"),
+                    )
+                })?;
+        participation = format!(
+            "; {barriers} barrier instruction(s) reached by every wave of the {block}-thread workgroup ({uniform} uniform / {divergent} per-wave branch nodes: {verdict})"
+        );
+    }
+    let access = loads
+        .iter()
+        .map(|l| format!("+{} {}", l.record_offset, l.classes.join("|")))
+        .collect::<Vec<_>>()
+        .join(", ");
     Ok(RegionFacts {
         template: ArenaTemplateRecord {
             template: t,
@@ -1189,7 +1233,7 @@ fn derive_native(
         },
         lds_bytes: 0,
         evidence: format!(
-            "t{t}: native region [{:#x},{:#x}) analysed by region-scoped A1 (s[0:1] = record base)",
+            "t{t}: native region [{:#x},{:#x}) analysed by region-scoped A1 (s[0:1] = record base): record pointer fields {access}{participation}",
             p.region.entry_pc, p.region.exit_pc
         ),
     })
@@ -1325,7 +1369,7 @@ fn prove_pool_in(
                 return;
             }
             let result = if p.region.is_native() {
-                derive_native(kernel, arch, p, &budget)
+                derive_native(kernel, arch, p, block, &budget)
             } else {
                 derive_lifted(kernel, arch, text, waves, Some(rsrc1_modes), p, sources)
             };
@@ -1346,9 +1390,10 @@ fn prove_pool_in(
             )
         })
         .collect();
-    let shell = crate::timing::timed("shell A1 (analyze_excluding)", || {
+    let mut shell = crate::timing::timed("shell A1 (analyze_excluding)", || {
         kernargs::analyze_excluding_budgeted(kernel, arch, &ranges, &budget.a1)
     });
+    let mut shell_refusal: Option<Refusal> = None;
     if shell.status != KernelStatus::Proven {
         if let Some(r) = a1_budget(
             "the dispatcher shell's A1",
@@ -1358,7 +1403,9 @@ fn prove_pool_in(
             refusals.push(r);
             return Err(refusals);
         }
-        refusals.push(refuse(
+        // refused unless the protocol proves span mode and attributes every unresolved
+        // access to the span table's arena (below)
+        shell_refusal = Some(refuse(
             "task_graph-shell-unresolved",
             format!(
                 "the dispatcher shell's A1 is {:?}: {}",
@@ -1388,10 +1435,20 @@ fn prove_pool_in(
     }) {
         Ok(p) => p,
         Err(rs) => {
+            refusals.extend(shell_refusal);
             refusals.extend(rs);
             return Err(refusals);
         }
     };
+    if let Some(r) = shell_refusal {
+        let attributed = proto
+            .span
+            .as_ref()
+            .is_some_and(|s| attribute_span_shell(&mut shell, s));
+        if !attributed {
+            refusals.push(r);
+        }
+    }
     // LDS: the dispatcher's claim slot lies above every body's LDS
     if let Some(slot) = proto.lds_slot_base {
         let top = facts.iter().map(|f| f.lds_bytes).max().unwrap_or(0);
@@ -1417,11 +1474,13 @@ fn prove_pool_in(
     templates.sort_by_key(|t| t.template);
     let mut evidence: Vec<String> = facts.iter().map(|f| f.evidence.clone()).collect();
     evidence.extend(proto.evidence.iter().cloned());
+    let span_arena = proto.span.as_ref().map(span_arena);
     let proof = PoolProof {
         arena: DescriptorArenaRecord {
             arena_arg_offset: proto.kernargs_arg_offset,
             templates,
         },
+        span_arena,
         protocol: proto.record.clone(),
         evidence,
     };
@@ -1444,6 +1503,69 @@ fn prove_pool_in(
     } else {
         *partial = Some(proof);
         Err(refusals)
+    }
+}
+
+/// The span table's descriptor records (the arena fact of the `spans` argument).
+pub const SPAN_DESC_TEMPLATE: u32 = 0xFFFF_FFFE;
+/// The span table's header record (`n_spans`): no pointer is loaded from it.
+pub const SPAN_HEADER_TEMPLATE: u32 = 0xFFFF_FFFD;
+
+/// The dispatcher shell's accesses through span-table-loaded pointers (the live list, the
+/// count cell, the claim bitmap) that A1 cannot resolve itself (`base-memory-derived`) are
+/// exactly the sites the protocol check attributed to descriptor fields of the span table;
+/// they are then the arena's pointer loads and the shell is attributed. False when the shell
+/// has any other unresolved access.
+fn attribute_span_shell(shell: &mut KernargFacts, span: &protocol::SpanProof) -> bool {
+    let sites: BTreeSet<peacemaker_ir::InstId> = span.sites.iter().map(|s| s.inst).collect();
+    let covered = !shell.unresolved.is_empty()
+        && shell
+            .unresolved
+            .iter()
+            .all(|u| u.rule == "base-memory-derived" && u.inst.is_some_and(|i| sites.contains(&i)));
+    if covered {
+        shell.unresolved.clear();
+        shell.status = KernelStatus::Proven;
+    }
+    covered
+}
+
+/// The `spans` argument as a binding arena: a descriptor record (template
+/// [`SPAN_DESC_TEMPLATE`]) holds the pointers at +0 (live list), +8 (count cell), +16 (claim
+/// bitmap) with the classes the dispatcher accesses them with, and the table header record
+/// ([`SPAN_HEADER_TEMPLATE`], `n_spans`) holds none.
+fn span_arena(span: &protocol::SpanProof) -> DescriptorArenaRecord {
+    let o = &span.offsets;
+    let loads = [o.live_list_field, o.count_cell_field, o.bitmap_field]
+        .into_iter()
+        .map(|field| {
+            let mut classes: Vec<String> = span
+                .sites
+                .iter()
+                .filter(|s| s.field == field)
+                .map(|s| s.class.to_owned())
+                .collect();
+            classes.sort();
+            classes.dedup();
+            ArenaPointerRecord {
+                record_offset: field,
+                classes,
+            }
+        })
+        .collect();
+    let record = |template, pointer_loads| ArenaTemplateRecord {
+        template,
+        pointer_loads,
+        sealed_tables: Vec::new(),
+        wg_footprints: Vec::new(),
+        hidden_grid: Vec::new(),
+    };
+    DescriptorArenaRecord {
+        arena_arg_offset: o.spans_arg_offset,
+        templates: vec![
+            record(SPAN_HEADER_TEMPLATE, Vec::new()),
+            record(SPAN_DESC_TEMPLATE, loads),
+        ],
     }
 }
 
@@ -1477,6 +1599,10 @@ fn check_shell_args(
             Some(&["atomic_commutative"])
         } else if a.offset == t.events_arg_offset {
             Some(&["atomic_release", "load_acquire"])
+        } else if Some(a.offset) == proof.protocol.span.map(|s| s.spans_arg_offset) {
+            // the span table: n_spans and descriptors are scalar-loaded (the pointers they
+            // hold are the span arena's)
+            Some(&["smem_load"])
         } else if a.offset == proof.arena.arena_arg_offset {
             None
         } else if proto.output_args.contains(&a.offset) {
@@ -1610,7 +1736,9 @@ pub fn certify_pool_with(
                 record.guard_flag = old.guard_flag;
                 record.differential.guarded = true;
                 record.differential.guards = Vec::new();
-                record.descriptor_arenas = vec![proof.arena.clone()];
+                record.descriptor_arenas = std::iter::once(proof.arena.clone())
+                    .chain(proof.span_arena.clone())
+                    .collect();
                 record.task_protocol = Some(proof.protocol.clone());
                 record.required_witnesses = record.implied_witnesses();
                 let sealed = proof

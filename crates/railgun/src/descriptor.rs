@@ -30,7 +30,7 @@ use crate::kernel::{
 use crate::sealed_table::{overlaps, SealedTableError, SealedTableRegistry, MAX_BOUND};
 use crate::{
     Binding, BindingField, BindingRecord, BindingRecordImage, ResourceId, ResourceKind,
-    EVENT_CELL_BYTES,
+    EVENT_CELL_BYTES, LIVE_ENTRY_BYTES,
 };
 
 fn event_class_violation(class: MemClass) -> &'static str {
@@ -112,6 +112,37 @@ impl KernelProgram {
         self.resource_bytes(resource)?;
         self.require_undeclared(resource, "a task arena")?;
         self.kinds.insert(resource, ResourceKind::TaskArena);
+        Ok(())
+    }
+
+    /// Declare `resource` as a live list of `cap` entries of
+    /// [`LIVE_ENTRY_BYTES`] (`{ vx, vy, vz, pad }`, DYNAMIC.md): GPU-written
+    /// only by the span producer kernel, read only by the pool dispatcher,
+    /// which validates every entry it consumes. Refused unless the resource
+    /// exists, `cap` is nonzero, it holds at least `cap * 16` bytes and is not
+    /// otherwise declared. Who may write it is decided per task graph
+    /// ([`crate::task_graph::TaskGraph::check`]); the declaration only
+    /// records the role (and makes a copy into it a `WritesLiveList`).
+    pub fn declare_live_list(&mut self, resource: ResourceId, cap: u32) -> Result<(), String> {
+        let bytes = self.resource_bytes(resource)?;
+        if cap == 0 {
+            return Err(format!("live list {}: zero capacity", resource.0));
+        }
+        let need = u64::from(cap) * LIVE_ENTRY_BYTES;
+        if bytes < need {
+            return Err(format!(
+                "live list {}: {cap} entries need {need} bytes, the resource holds {bytes}",
+                resource.0
+            ));
+        }
+        self.require_undeclared(resource, "a live list")?;
+        self.kinds.insert(
+            resource,
+            ResourceKind::LiveList {
+                cap,
+                stride: LIVE_ENTRY_BYTES as u32,
+            },
+        );
         Ok(())
     }
 
@@ -894,6 +925,36 @@ mod tests {
         );
         p.declare_task_arena(ResourceId(0)).unwrap();
         assert_eq!(p.kinds[&ResourceId(0)], ResourceKind::TaskArena);
+    }
+
+    #[test]
+    fn a_live_list_needs_room_a_capacity_and_is_declared_once() {
+        let mut p = author(
+            "gfx1201",
+            &[launch(&[(0, A)], 8, vec![ptr(0, &[VmemStore])])],
+        );
+        let cap = (SIZE / LIVE_ENTRY_BYTES) as u32;
+        assert!(p.declare_live_list(ResourceId(0), 0).is_err(), "no entries");
+        assert!(
+            p.declare_live_list(ResourceId(0), cap + 1).is_err(),
+            "no room"
+        );
+        assert!(
+            p.declare_live_list(ResourceId(9), 1).is_err(),
+            "no resource"
+        );
+        assert!(p.kinds.is_empty(), "an Err declares nothing");
+        p.declare_live_list(ResourceId(0), cap).unwrap();
+        assert_eq!(
+            p.kinds[&ResourceId(0)],
+            ResourceKind::LiveList { cap, stride: 16 }
+        );
+        assert!(p.declare_live_list(ResourceId(0), 1).is_err(), "twice");
+        assert!(p.declare_task_arena(ResourceId(0)).is_err(), "redeclared");
+        assert!(
+            p.declare_event_cells(ResourceId(0), 1).is_err(),
+            "redeclared"
+        );
     }
 
     #[test]

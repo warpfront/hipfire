@@ -21,9 +21,9 @@ use peacemaker_lift::{lift_object, Options};
 use railgun_cert::task_graph::certify_pool;
 use railgun_cert::{KernelRecord, Receipt};
 use railgun_corpus::receipt::{
-    TaskGridOffsets, SEALED_BOUND_KERNARG, TASK_PROTO_ACQUIRE, TASK_PROTO_BOUNDED,
+    TaskGridOffsets, TaskSpanOffsets, SEALED_BOUND_KERNARG, TASK_PROTO_ACQUIRE, TASK_PROTO_BOUNDED,
     TASK_PROTO_CLAIM, TASK_PROTO_COMPLETE, TASK_PROTO_ONCE, TASK_PROTO_REGION_WG,
-    TASK_PROTO_RELEASE, TASK_PROTO_REQUIRED,
+    TASK_PROTO_REGION_WG_LIVE, TASK_PROTO_RELEASE, TASK_PROTO_REQUIRED, TASK_PROTO_SPAN_ENTRY,
 };
 
 fn dir() -> PathBuf {
@@ -71,7 +71,7 @@ fn explain(k: &KernelRecord) -> String {
 const POOLS: &[(&str, &str, &[u32])] = &[
     ("b32", "pm_pool_b32", &[8, 10, 11, 17]),
     ("b64", "pm_pool_b64", &[6]),
-    ("b128", "pm_pool_b128", &[7, 12, 16, 18]),
+    ("b128", "pm_pool_b128", &[1, 7, 12, 16, 18]),
     ("b256", "pm_pool_b256", &[2, 3, 4, 5, 9, 13, 14, 15]),
     ("b320", "pm_pool_b320", &[19]),
 ];
@@ -221,8 +221,14 @@ fn real_pools_are_certified() {
         // each region at (header[vx] + step, header[vy] | header[vz] << 16)
         let mut want: Vec<String> = TASK_PROTO_REQUIRED.iter().map(|s| s.to_string()).collect();
         want.push(TASK_PROTO_REGION_WG.to_string());
+        // span mode (DYNAMIC.md): every span pool proves the entry validation and the
+        // live-entry workgroup
+        want.push(TASK_PROTO_SPAN_ENTRY.to_string());
+        want.push(TASK_PROTO_REGION_WG_LIVE.to_string());
         want.sort();
         assert_eq!(p.proved, want, "{name}");
+        assert_eq!(p.span, Some(TaskSpanOffsets::M0), "{name}");
+        p.validate(symbol).expect("the protocol record validates");
         assert_eq!(
             p.grid,
             Some(TaskGridOffsets {
@@ -281,7 +287,19 @@ fn real_pools_are_certified() {
         let k = kernel(&receipt, symbol);
         assert_eq!(k.status, "conditional", "{name}:\n{}", explain(k));
         assert!(k.unresolved.is_empty(), "{name}:\n{}", explain(k));
-        assert_eq!(k.descriptor_arenas, [proof.arena.clone()]);
+        assert_eq!(
+            k.descriptor_arenas,
+            [
+                proof.arena.clone(),
+                proof.span_arena.clone().expect("span arena")
+            ],
+            "{name}"
+        );
+        // the shell is fully attributed: the three table-loaded pointers are the span
+        // arena's, the `spans` argument is a read-only pointer the shell scalar-loads
+        let spans = k.args.iter().find(|a| a.offset == 64).expect("spans arg");
+        assert_eq!(spans.classes, ["smem_load"], "{name}");
+        assert_eq!(spans.role, "pointer", "{name}");
         assert_eq!(k.task_protocol.as_ref(), Some(&proof.protocol));
         let want: &[&str] = if arena.templates.iter().any(|t| !t.sealed_tables.is_empty()) {
             &["descriptor_arena", "sealed_table"]
@@ -940,36 +958,35 @@ fn mutate(name: &str, symbol: &str, from: &str, to: &str, nth: usize) -> Vec<u8>
     bytes
 }
 
-/// The pool still proves its six required properties (the mutation lives in the
-/// optional seventh) but not `region_wg_from_header`, for a stated reason.
+/// `region_wg_from_header` is withheld. These pools have span mode, which stands on the
+/// workgroup derivation of both path classes (static header, live entry) and on the header
+/// grid fields: the pool is refused with `task_graph-span-region` (its span table accesses
+/// would be unattributed otherwise), carrying the withheld note with `why` when the failure
+/// is the static class's.
 fn expect_wg_withheld(bytes: &[u8], symbol: &str, why: &str, what: &str) {
-    let (refusals, partial) = prove_bytes(bytes, symbol);
-    assert!(refusals.is_empty(), "{what}: {refusals:#?}");
-    let proof = partial.expect("the proof");
-    let mut want: Vec<String> = TASK_PROTO_REQUIRED.iter().map(|s| s.to_string()).collect();
-    want.sort();
-    assert_eq!(proof.protocol.proved, want, "{what}");
-    assert!(proof.protocol.grid.is_none(), "{what}");
-    let note = proof
-        .evidence
+    let (refusals, _) = prove_bytes(bytes, symbol);
+    let span: Vec<&String> = refusals
         .iter()
-        .find(|e| e.contains("region_wg_from_header NOT proved"))
-        .unwrap_or_else(|| panic!("{what}: no withheld note in {:#?}", proof.evidence));
-    assert!(note.contains(why), "{what}: expected `{why}` in:\n{note}");
-    // the record still validates
-    proof.protocol.validate(symbol).expect("validates");
+        .filter(|r| r.starts_with("task_graph-span-region"))
+        .collect();
+    assert!(
+        !span.is_empty(),
+        "{what}: no span-region refusal in {refusals:#?}"
+    );
+    if let Some(note) = span.iter().find(|r| r.contains("NOT proved")) {
+        assert!(note.contains(why), "{what}: expected `{why}` in:\n{note}");
+    }
 }
 
-/// The certified receipt of a pool whose `region_wg_from_header` is withheld stays
-/// `conditional` and carries the record without the property.
+/// The certified receipt of such a pool stays `unknown`, naming the span rule.
 fn expect_conditional_without_wg(bytes: &[u8], symbol: &str, what: &str) {
     let receipt = certify_pool(bytes, &from_disk).expect("certify");
     let k = kernel(&receipt, symbol);
-    assert_eq!(k.status, "conditional", "{what}:\n{}", explain(k));
-    let record = k.task_protocol.as_ref().expect("record");
+    assert_eq!(k.status, "unknown", "{what}:\n{}", explain(k));
     assert!(
-        !record.proved.iter().any(|p| p == TASK_PROTO_REGION_WG) && record.grid.is_none(),
-        "{what}"
+        rules(k).contains(&"task_graph-span-region") && k.task_protocol.is_none(),
+        "{what}:\n{}",
+        explain(k)
     );
 }
 
@@ -1390,4 +1407,332 @@ fn each_standalone_object_is_used_once_per_call_and_only_for_its_kernel() {
         .map(|r| r.digest)
         .collect();
     assert!(digests.len() < notes[0].regions.iter().filter(|r| !r.is_native()).count());
+}
+
+// ---------------------------------------------------------------------------
+// span mode (railgunmega/DYNAMIC.md): `span_entry_validated`, `region_wg_from_live_entry`
+// ---------------------------------------------------------------------------
+
+/// The span descriptor offsets, the live-entry workgroup and the table arena the pools
+/// carry; the table is a binding arena on the `spans` argument whose three pointers are the
+/// accesses the dispatcher shell makes through table-loaded pointers.
+#[test]
+fn span_pools_carry_the_span_abi_and_the_table_arena() {
+    for &(name, symbol, _) in POOLS {
+        let receipt = certify_pool(&pool(name), &from_disk).expect("certify");
+        let k = kernel(&receipt, symbol);
+        assert_eq!(k.status, "conditional", "{name}:\n{}", explain(k));
+        let p = k.task_protocol.as_ref().expect("record");
+        for prop in [
+            TASK_PROTO_SPAN_ENTRY,
+            TASK_PROTO_REGION_WG_LIVE,
+            TASK_PROTO_REGION_WG,
+        ] {
+            assert!(p.proved.iter().any(|x| x == prop), "{name}: {prop}");
+        }
+        let span = p.span.expect("span offsets");
+        assert_eq!(span, TaskSpanOffsets::M0, "{name}");
+        // flags @48, k @52, list id @56 (header words), grid gx/gy/gz @16/20/24
+        assert_eq!(
+            [span.flags_offset, span.k_offset, span.list_id_offset],
+            [48, 52, 56]
+        );
+        assert_eq!(span.spans_arg_offset, 64);
+        // the table arena: header record with no pointer, descriptor record with the
+        // live list (+0), count cell (+8) and claim bitmap (+16)
+        assert_eq!(k.descriptor_arenas.len(), 2, "{name}");
+        let arena = &k.descriptor_arenas[1];
+        assert_eq!(arena.arena_arg_offset, 64, "{name}");
+        let by: BTreeMap<u32, Vec<(u32, Vec<String>)>> = arena
+            .templates
+            .iter()
+            .map(|t| {
+                (
+                    t.template,
+                    t.pointer_loads
+                        .iter()
+                        .map(|l| (l.record_offset, l.classes.clone()))
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(by[&0xFFFF_FFFD], vec![], "{name}");
+        assert_eq!(
+            by[&0xFFFF_FFFE],
+            vec![
+                (0, vec!["vmem_load".to_string()]),
+                (8, vec!["vmem_load".to_string()]),
+                (16, vec!["atomic_commutative".to_string()]),
+            ],
+            "{name}"
+        );
+        arena.validate(symbol).expect("the arena validates");
+        // the shell: no unattributed access remains
+        assert!(k.unresolved.is_empty(), "{name}:\n{}", explain(k));
+        k.validate_case(
+            &receipt.object_sha256,
+            &receipt.device_elf_sha256,
+            &receipt.arch,
+        )
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+        // the evidence names both properties and the pred caveat
+        let detail = &receipt
+            .checks
+            .iter()
+            .find(|c| c.id == "task-graph")
+            .expect("check")
+            .detail;
+        assert!(
+            detail.contains("span_entry_validated: span headers"),
+            "{name}"
+        );
+        assert!(
+            detail.contains("region_wg_from_live_entry: in span mode wg_x = entry.vx + step"),
+            "{name}"
+        );
+        assert!(detail.contains("pred is NONE"), "{name}");
+    }
+}
+
+/// The native EXPAND_LIVE region (b128, template 1): region-scoped A1 shows it reads the two
+/// route inputs of its own record (+0, +8) and writes only the live list (+16) and the count
+/// cell (+24); its barrier is admitted only with the participation proof.
+#[test]
+fn the_native_expand_live_region_writes_only_the_live_list_and_the_count() {
+    let (refusals, partial) = prove("b128", "pm_pool_b128");
+    assert!(refusals.is_empty(), "{refusals:#?}");
+    let proof = partial.expect("the proof");
+    let t1 = proof
+        .arena
+        .templates
+        .iter()
+        .find(|t| t.template == 1)
+        .expect("EXPAND_LIVE");
+    let loads: BTreeMap<u32, Vec<String>> = t1
+        .pointer_loads
+        .iter()
+        .map(|p| (p.record_offset, p.classes.clone()))
+        .collect();
+    assert_eq!(
+        loads,
+        BTreeMap::from([
+            (0, vec!["vmem_load".to_string()]),
+            (8, vec!["vmem_load".to_string()]),
+            (16, vec!["vmem_store".to_string()]),
+            (24, vec!["vmem_store".to_string()]),
+        ])
+    );
+    assert!(t1.sealed_tables.is_empty() && t1.wg_footprints.is_empty());
+    let line = proof
+        .evidence
+        .iter()
+        .find(|e| e.starts_with("t1: native region"))
+        .expect("evidence");
+    assert!(
+        line.contains("+0 vmem_load, +8 vmem_load, +16 vmem_store, +24 vmem_store"),
+        "{line}"
+    );
+    assert!(
+        line.contains("2 barrier instruction(s) reached by every wave of the 128-thread workgroup"),
+        "{line}"
+    );
+}
+
+/// A wave that skips the native region's barrier would pair its next dispatcher barrier with
+/// another wave's: a per-wave branch around the barrier (wave 0 alone skips it) is refused.
+#[test]
+fn a_native_barrier_that_a_wave_can_skip_is_refused() {
+    let (name, symbol) = ("b128", "pm_pool_b128");
+    let base = pool(name);
+    let (lo, hi) = region_range(&base, symbol, 1);
+    let insts = instructions(&base, symbol);
+    let signal = insts
+        .iter()
+        .find(|(pc, _, m)| m == "s_barrier_signal" && (lo..hi).contains(&u64::from(*pc)))
+        .expect("the native region's barrier")
+        .0;
+    // `s_cbranch_scc1` opcode bits, read off the dispatcher's own branch
+    let at = locate(&base, symbol);
+    let word_at = |pc: u32| {
+        let o = at.file_at + pc as usize;
+        u32::from_le_bytes(base[o..o + 4].try_into().unwrap())
+    };
+    let scc1 = insts
+        .iter()
+        .find(|(_, _, m)| m == "s_cbranch_scc1")
+        .map(|(pc, _, _)| word_at(*pc))
+        .expect("a branch");
+    let branch_over = (scc1 & 0xffff_0000) | 2; // over the signal and the wait
+    let mut bytes = base.clone();
+    patch(
+        &mut bytes,
+        &at,
+        signal - 12,
+        &words_of("v_readfirstlane_b32 s5, v0"),
+    );
+    patch(&mut bytes, &at, signal - 8, &words_of("s_cmp_eq_u32 s5, 0"));
+    patch(&mut bytes, &at, signal - 4, &[branch_over]);
+    let r = certified(&bytes, symbol);
+    expect_refused(&r, symbol, "task_graph-region-native");
+    let detail = explain(kernel(&r, symbol));
+    assert!(detail.contains("barrier participation"), "{detail}");
+}
+
+/// Nop `count` instructions from the first dispatcher instruction that encodes `first`.
+fn nop_run(bytes: &[u8], symbol: &str, first: &str, count: usize) -> Vec<u8> {
+    let pcs = find(bytes, symbol, first);
+    let start = *pcs.iter().min().unwrap_or_else(|| panic!("no `{first}`"));
+    let insts = instructions(bytes, symbol);
+    let i = insts.iter().position(|(pc, _, _)| *pc == start).unwrap();
+    let mut out = bytes.to_vec();
+    let at = locate(&out, symbol);
+    for (pc, dwords, _) in &insts[i..i + count] {
+        nop_out(&mut out, symbol, &at, *pc, *dwords);
+    }
+    out
+}
+
+/// Each span check is a mutation target: with it removed the pool is refused (a pool whose
+/// span checks are not all proved stays `unknown`: its table accesses would be unattributed).
+fn span_refusal(bytes: &[u8], symbol: &str, rule: &str, needle: &str, what: &str) {
+    let r = certified(bytes, symbol);
+    expect_refused(&r, symbol, rule);
+    let k = kernel(&r, symbol);
+    let hit = k
+        .unresolved
+        .iter()
+        .filter(|u| u.rule == rule)
+        .any(|u| u.detail.contains(needle));
+    assert!(
+        hit,
+        "{what}: expected `{needle}` under {rule}:\n{}",
+        explain(k)
+    );
+}
+
+#[test]
+fn removing_a_span_check_is_refused() {
+    let all = [
+        ("b32", "pm_pool_b32"),
+        ("b64", "pm_pool_b64"),
+        ("b128", "pm_pool_b128"),
+        ("b256", "pm_pool_b256"),
+        ("b320", "pm_pool_b320"),
+    ];
+    for &(name, symbol) in &all {
+        let base = pool(name);
+        // the count > K check: the count is never bounded by K, so k < count <= K never holds
+        span_refusal(
+            &nop_run(&base, symbol, "s_cmp_gt_u32 s101, s91", 2),
+            symbol,
+            "task_graph-span-entry",
+            "count > K and k >= count checks",
+            &format!("{name}: no count > K"),
+        );
+        // the k >= count branch: k is never bounded by the count
+        span_refusal(
+            &nop_run(&base, symbol, "s_cmp_ge_u32 s96, s101", 2),
+            symbol,
+            "task_graph-span-entry",
+            "k < count <= K",
+            &format!("{name}: no k >= count"),
+        );
+        // one grid compare dropped (each axis)
+        for (e, g) in [(24, 8), (25, 9), (26, 10)] {
+            let line = format!("v_cmp_ge_u32_e64 s84, v{e}, v{g}");
+            span_refusal(
+                &nop_run(&base, symbol, &line, 3),
+                symbol,
+                "task_graph-span-claim",
+                "all three grid compares held",
+                &format!("{name}: no `{line}`"),
+            );
+        }
+        // the atomic-or's result ignored: the set-bit edge is gone
+        span_refusal(
+            &nop_run(&base, symbol, "v_and_b32_e32 v3, v3, v2", 4),
+            symbol,
+            "task_graph-span-region",
+            "without every check",
+            &format!("{name}: atomic result ignored"),
+        );
+        // s102 from the header's vx, then vy, then vz, not from the entry
+        for (to, from, needle) in [
+            ("v5", "v24", "entry.vx"),
+            ("v6", "v25", "entry.vy"),
+            ("v7", "v26", "entry.vy"),
+        ] {
+            let bytes = mutate(
+                name,
+                symbol,
+                &format!("v_mov_b32_e32 {to}, {from}"),
+                &format!("v_mov_b32_e32 {to}, {to}"),
+                0,
+            );
+            span_refusal(
+                &bytes,
+                symbol,
+                "task_graph-span-region",
+                needle,
+                &format!("{name}: {to} not from the entry"),
+            );
+        }
+    }
+    // the table checks (b32 single wave, b64 multi-wave)
+    for &(name, symbol) in &all[..2] {
+        let base = pool(name);
+        span_refusal(
+            &nop_run(&base, symbol, "s_cmp_ge_u32 s100, s91", 2),
+            symbol,
+            "task_graph-span-table",
+            "list_id < n_spans",
+            &format!("{name}: no list_id < n_spans"),
+        );
+        span_refusal(
+            &nop_run(&base, symbol, "s_or_b32 s91, s78, s79", 3),
+            symbol,
+            "task_graph-span-region",
+            "without every check",
+            &format!("{name}: no null check"),
+        );
+        // a flags word other than 0 and 1 reaches the span path
+        span_refusal(
+            &nop_run(&base, symbol, "s_cmp_lg_u32 s91, 1", 2),
+            symbol,
+            "task_graph-span-table",
+            "flags == 1",
+            &format!("{name}: no flags check"),
+        );
+    }
+}
+
+/// `.Lspan_poison` sets the template to NONE and falls into `.Lready`; a branch from it into
+/// a region is refused (the region is not entered on the taken edge of `tmpl == t`).
+#[test]
+fn a_branch_from_the_span_poison_block_into_a_region_is_refused() {
+    for (name, symbol, template) in [("b32", "pm_pool_b32", 8u32), ("b64", "pm_pool_b64", 6)] {
+        let base = pool(name);
+        let (entry, _) = region_range(&base, symbol, template);
+        // the poison block's `tmpl := -1` is the last such move before the first region
+        let poison = find(&base, symbol, "v_mov_b32_e32 v4, -1")
+            .into_iter()
+            .filter(|&pc| u64::from(pc) < entry)
+            .max()
+            .expect("the poison block");
+        let at = locate(&base, symbol);
+        let insts = instructions(&base, symbol);
+        let scc1 = insts
+            .iter()
+            .find(|(_, _, m)| m == "s_branch")
+            .map(|(pc, _, _)| {
+                let o = at.file_at + *pc as usize;
+                u32::from_le_bytes(base[o..o + 4].try_into().unwrap())
+            })
+            .expect("a branch");
+        let offset = ((entry as i64 - (i64::from(poison) + 4)) / 4) as u32 & 0xffff;
+        let mut bytes = base.clone();
+        patch(&mut bytes, &at, poison, &[(scc1 & 0xffff_0000) | offset]);
+        let r = certified(&bytes, symbol);
+        expect_refused(&r, symbol, "task_graph-protocol-entry");
+    }
 }
