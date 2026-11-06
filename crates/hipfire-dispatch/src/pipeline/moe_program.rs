@@ -102,6 +102,10 @@ pub enum MoeStage {
     /// expert device's BF16 cold partial into the residual (skipped after a
     /// timed-out wait). Last: after the hot `Combine` and `SharedDown`.
     JoinColdRows,
+    /// Hetero decode with the BF16 shared down deferred
+    /// (`decode_shared_down_defers`): `SharedDown` ran its GEMV inside the
+    /// cold wait; this folds it into the residual after the routed combine.
+    SharedAdd,
 }
 
 fn router_shared_fuse_allowed(
@@ -861,6 +865,7 @@ impl<'a> SealedMoeOp<'a> {
             MoeStage::PublishColdRows => self.publish_cold_rows(gpu),
             MoeStage::SendColdRows => self.send_cold_rows(gpu),
             MoeStage::JoinColdRows => self.join_cold_rows(gpu),
+            MoeStage::SharedAdd => self.shared_add(gpu),
         }
     }
 
@@ -1691,9 +1696,21 @@ impl<'a> SealedMoeOp<'a> {
         Ok(())
     }
 
+    /// `SharedAdd`: the deferred shared down's BF16 fold into the residual.
+    pub(super) fn shared_add(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let (params, selection) = self.state.decode_parts()?;
+        if !decode_shared_deferred(params, selection) {
+            return Err(split_error("SharedAdd lowered without a deferred shared down"));
+        }
+        super::decode_shared_add(gpu, params, params.routed_out.unwrap_or(params.x_residual))
+    }
+
     pub(super) fn shared_down(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         if let Ok((params, selection)) = self.state.decode_parts() {
             let (shared_gate, shared_up) = self.state.shared_views()?;
+            if decode_shared_deferred(params, selection) {
+                return super::decode_shared_down_deferred(gpu, params, shared_gate, shared_up, selection.route);
+            }
             let target = if params.ep_mode == crate::families::moe::MoeEpMode::RootRoutedPartial {
                 params.x_residual
             } else {
@@ -2598,6 +2615,16 @@ fn append_step<'a>(
     Ok(())
 }
 
+/// Whether a hetero decode call runs its shared down inside the cold wait
+/// (`SharedDown` before `AwaitCold`, `SharedAdd` after `Combine`): one
+/// predicate for the lowering and both stages.
+fn decode_shared_deferred(params: &MoeParams<'_>, selection: &MoeDecodeSelection) -> bool {
+    selection.hetero_device
+        && params.ep_mode == crate::families::moe::MoeEpMode::None
+        && params.routed_out.is_none()
+        && super::decode_shared_down_defers(params, selection.route)
+}
+
 fn lower_decode<'a>(
     state: &'a MoeStepState<'a>,
 ) -> Result<SmallVec<[Step<'a>; INLINE_STEP_CAPACITY]>, DispatchError> {
@@ -2705,7 +2732,13 @@ fn lower_decode<'a>(
             &mut steps,
             Step::MoeStage(op(state), MoeStage::MutationFence),
         )?;
+        let shared_deferred = decode_shared_deferred(params, selection);
         if selection.hetero_device {
+            // The shared down's GEMV runs while the expert device answers;
+            // its fold waits for the routed combine (`SharedAdd`).
+            if shared_deferred {
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
+            }
             // The expert device's cold rows join the expanded rows the
             // canonical combine folds.
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::AwaitCold))?;
@@ -2762,7 +2795,9 @@ fn lower_decode<'a>(
         if combine_after_down {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
         }
-        if params.recipe.shared_after_combine() && !params.skip_shared {
+        if shared_deferred {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedAdd))?;
+        } else if params.recipe.shared_after_combine() && !params.skip_shared {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
         }
         if selection.cpu_deferred_experts && !splice_first {

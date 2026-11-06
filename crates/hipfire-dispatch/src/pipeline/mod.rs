@@ -5549,6 +5549,67 @@ fn decode_route_gpu_stage(
     Ok(())
 }
 
+/// Under the hetero device split the one-row BF16 shared down runs inside the
+/// cold wait: [`decode_shared_down_deferred`] (activation + plain GEMV into
+/// `ffn_out`) before `AwaitCold`, [`decode_shared_add`] (the BF16 scaled add)
+/// after the canonical combine. Bitwise the fused
+/// `gemv_bf16_xf32_bf16_scaled_add` (same row body, same rounded expression)
+/// in the same accumulation order: routed first, shared second.
+pub(super) fn decode_shared_down_defers(
+    p: &crate::families::moe::MoeParams<'_>,
+    route: Option<MoeRouteCapability>,
+) -> bool {
+    cfg!(feature = "deltanet")
+        && route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
+        && !p.skip_shared
+        && p.recipe.bf16_round_trip()
+        && p.recipe.shared_after_combine()
+        && p
+            .shared
+            .as_ref()
+            .is_some_and(|s| s.weights.down.dtype == DType::BF16 && s.weights.down.awq_scale.is_none())
+}
+
+/// The deferred shared down's first half (see [`decode_shared_down_defers`]):
+/// the shared activation (unless the routed launch ran it) and the BF16 GEMV
+/// into `ffn_out`; the residual is not touched.
+pub(super) fn decode_shared_down_deferred(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoeParams<'_>,
+    shared_gate: &GpuTensor,
+    shared_up: &GpuTensor,
+    route: Option<MoeRouteCapability>,
+) -> Result<(), DispatchError> {
+    let shared = p
+        .shared
+        .as_ref()
+        .ok_or_else(|| DispatchError::Hip("shared down stage requires shared weights".into()))?;
+    let w = &shared.weights.down;
+    let scalar_live = slice_moe_f32_view(shared.scalar, 0, 1);
+    let shared_hid = slice_moe_f32_view(p.ffn_hidden, 0, shared.intermediate);
+    if !qt44_shared_activation_in_routed(p, route) {
+        hip!(gpu.shared_expert_activation_bf16_f32(shared_gate, shared_up, &shared_hid, &scalar_live, 1))?;
+    }
+    hip!(gpu.gemv_bf16_xf32(w.buf, &shared_hid, p.ffn_out, w.m, w.k))
+}
+
+/// The deferred shared down's second half: `target = bf16(bf16(target) +
+/// bf16(bf16(scalar) * bf16(ffn_out)))`, after the canonical combine.
+pub(super) fn decode_shared_add(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoeParams<'_>,
+    target: &GpuTensor,
+) -> Result<(), DispatchError> {
+    let shared = p
+        .shared
+        .as_ref()
+        .ok_or_else(|| DispatchError::Hip("shared add stage requires shared weights".into()))?;
+    hip!(bf16_scaled_add(
+        gpu,
+        &Bf16ScaledAdd { residual: target, value: p.ffn_out, scalar: shared.scalar, elements: p.hidden },
+    ))
+}
+
 fn decode_shared_down_stage(
     ctx: &DispatchCtx,
     gpu: &mut Gpu,
