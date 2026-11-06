@@ -637,7 +637,18 @@ fn ordinary_prefill_static_ceiling(
     }
     let native_mq4 = native_mq4_widened_route(gpu, weights);
     let mq3 = mq3_wide_route(gpu, weights);
-    if !dense_layers_are_all_mq4v2(weights) && !native_mq4 && !mq3 {
+    // Lloyd staged-i8 twin route (opt-in HIPFIRE_LLOYD_MMQ_A4=1, exact
+    // gfx1100): the twin SET consumes any N natively (descriptor bounds +
+    // tok<N masking, no padding) and the X128/BT arms cover every fallback
+    // shape, so the ceiling needs no N/K shape beyond the dense-27B gate
+    // above (all 27B K are K%256==0; per-launch gates fail closed).
+    let lloyd_twin_widened = gpu.arch.as_str() == "gfx1100"
+        && hipfire_config::developer_var("HIPFIRE_LLOYD_MMQ_A4")
+            .ok()
+            .as_deref()
+            == Some("1")
+        && dense_layers_have_projection_dtype(weights, DType::MQ4G256V2Lloyd);
+    if !dense_layers_are_all_mq4v2(weights) && !native_mq4 && !mq3 && !lloyd_twin_widened {
         return None;
     }
     // gfx1201 keeps all four FP8 projection routes for qt44; symmetric qt49
@@ -645,7 +656,8 @@ fn ordinary_prefill_static_ceiling(
     // gfx1100 A4 flag already implies the IU4 prefill gate. gfx11 substitutes
     // the existing IU4 K16 projection route; its full-attention layers remain
     // on Q8 FA2 because the packet kernel and FP8 KV format are gfx1201-only.
-    let projection_route_admitted = if native_mq4 || mq3 {
+    // The Lloyd twin is its own admitted projection route (same predicate).
+    let projection_route_admitted = if native_mq4 || mq3 || lloyd_twin_widened {
         true
     } else if gpu.arch == "gfx1201" {
         gpu.flags.gfx12_mq4v2_fp8_gateup
@@ -7257,6 +7269,11 @@ pub(crate) fn forward_batch_chunk_impl(
     }
     let mq3_scan = mq3_wide_route(gpu, weights);
     let mq4_scan = dense_layers_are_all_mq4v2(weights);
+    // v2 §2.3: Lloyd (qt52) uses the X128-LUT qkvza producer, admitted on
+    // exact gfx1100/gfx1151 by `lloyd_mmq_family_gate` (K%256; staged twin
+    // when flagged, X128 otherwise — every scan shape covered, same f32
+    // scratch). The dtype predicate is the only structural blocker.
+    let lloyd_scan = dense_layers_have_projection_dtype(weights, DType::MQ4G256V2Lloyd);
     let gdn_chunk_scan_common_admitted = gpu.flags.gfx12_gdn_chunk_scan
         // The GDN chunk-scan arm has no `SingletonWmma` producer.
         && !gpu.fp8_verify_scope
@@ -7276,7 +7293,9 @@ pub(crate) fn forward_batch_chunk_impl(
         && (mq3_scan
             || (mq4_scan
                 && (gpu.flags.iu4_prefill_enabled()
-                    || (gpu.arch == "gfx1201" && gpu.flags.gfx12_mq4v2_fp8_qkvza))))
+                    || (gpu.arch == "gfx1201" && gpu.flags.gfx12_mq4v2_fp8_qkvza)))
+            || (lloyd_scan
+                && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151")))
         // The scan never reads KV, so the clause only names qualified tiers:
         // native FP8 (gfx1201-only), Q8 on gfx11, and the fwht4/fwht3 4/3-bit
         // K tiers (`quant_asym4`/`quant_asym3`, any V) on every scan arch.
@@ -7370,6 +7389,8 @@ pub(crate) fn forward_batch_chunk_impl(
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
                 let qkvza_dtype = if mq3_scan {
                     DType::MQ3G256V2
+                } else if lloyd_scan {
+                    DType::MQ4G256V2Lloyd
                 } else {
                     DType::MQ4G256V2
                 };

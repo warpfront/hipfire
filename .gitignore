@@ -82,6 +82,11 @@ artifacts/
 .codeinsight
 .codeinsight+research/
 .local-bench-scratch/
+# Local-only plan/design drafts (reviewed elsewhere first; promote to
+# docs/plans/ by explicit decision only, never by wildcard add).
+docs/plans/local/
+# Machine-local agent ops notes (per-box tooling mishaps, never committed).
+AGENTS.local.md
 .gm/rs-learn.db
 .plugkit-browser-profile/
 .plugkit-browser-profile-*/
