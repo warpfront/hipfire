@@ -359,45 +359,18 @@ fn entry_state(kernel: &peacemaker_ir::inst::Kernel, arch: Arch) -> ([bool; LOCA
 }
 
 /// The SGPR reads of `inst` as a definedness check sees them. A wave32 kernel reads only the low
-/// register of a lane-mask source: the table models the select / carry-in slot (`SRC2` of
-/// `v_cndmask_*` and of the `v_*_co_ci_*` / `v_addc_*` / `v_subb_*` family) as a 64-bit pair and the
-/// parser widens `s5` to `s[5:6]`, exactly as the codec decodes it, so a check over the widened pair
-/// would demand a write of a half the hardware never reads (`s_mov_b32 s5, mask` defines the whole
-/// wave32 mask).
+/// register of a lane-mask source: the table models the select / carry-in slot as a 64-bit pair and
+/// the parser widens `s5` to `s[5:6]`, so a check over the widened pair would demand a write of a
+/// half the hardware never reads (`s_mov_b32 s5, mask` defines the whole wave32 mask).
+/// [`peacemaker_ir::effects::wave_effects`] narrows it.
 fn definedness_uses(
     arch: IrArch,
     inst: &Inst,
     wave: peacemaker_ir::inst::Wave,
 ) -> Vec<peacemaker_ir::reg::RegRef> {
-    use peacemaker_ir::{operand::Operand, reg::Kind as K};
-    let mut uses = inst.effects.uses.to_vec();
-    if wave != peacemaker_ir::inst::Wave::Wave32 {
-        return uses;
-    }
-    let Some(row) = isa::lookup(arch, inst.op, inst.form) else {
-        return uses;
-    };
-    let name = row.name;
-    let carry = name.starts_with("v_cndmask_")
-        || name.contains("_co_ci_")
-        || name.starts_with("v_addc_")
-        || name.starts_with("v_subb_");
-    if !carry {
-        return uses;
-    }
-    let mask = row
-        .slots(false)
-        .zip(inst.operands.iter())
-        .find_map(|((slot, _), operand)| match (slot, operand) {
-            ("SRC2", Operand::Reg(reg)) if reg.kind == K::S && reg.len == 2 => Some(*reg),
-            _ => None,
-        });
-    if let Some(mask) = mask {
-        if let Some(read) = uses.iter_mut().find(|r| **r == mask) {
-            read.len = 1;
-        }
-    }
-    uses
+    peacemaker_ir::effects::wave_effects(arch, wave, inst)
+        .uses
+        .to_vec()
 }
 
 /// Validate the final bytes, not just declarations. Used after every successful
@@ -432,11 +405,11 @@ pub(crate) fn emitted(
         let (mut defined, entry) = entry_state(kernel, arch);
         for &id in &kernel.body.layout {
             let inst = kernel.body.insts.get(id).expect("laid-out instruction");
-            for location in effect_locations(
-                &inst.effects.defs,
-                inst.effects.implicit.writes,
-                kernel.wave,
-            ) {
+            // A wave32 compare / carry-out into `s5` defines `s5` only, never `s6`.
+            let effects = peacemaker_ir::effects::wave_effects(arch_ir, kernel.wave, inst);
+            for location in
+                effect_locations(&effects.defs, inst.effects.implicit.writes, kernel.wave)
+            {
                 defined[location] = true;
             }
         }

@@ -30,14 +30,7 @@ pub fn operand_register(
         Operand::Reg(r) | Operand::Half(r, _) => *r,
         _ => return None,
     };
-    let name = inst.op.name(arch).unwrap_or("");
-    let mask_output = (name.starts_with("v_cmp") && index == 0)
-        || ((name.starts_with("v_div_scale_") || name.starts_with("v_") && name.contains("_co_"))
-            && index == 1);
-    let mask_input = (name.starts_with("v_cndmask_")
-        || name.starts_with("v_") && name.contains("_co_ci_"))
-        && index + 1 == inst.operands.len();
-    if reg.kind == Kind::S && (mask_output || mask_input) {
+    if reg.kind == Kind::S && crate::effects::lane_mask_role(arch, inst, index).is_some() {
         reg.len = if wave == crate::inst::Wave::Wave32 {
             1
         } else {

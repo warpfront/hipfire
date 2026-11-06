@@ -270,7 +270,7 @@ fn convert(
     }
     let body = &kernel.body;
     let entry = BlockId(0);
-    let live = Liveness::analyze(body);
+    let live = Liveness::analyze(body, arch, kernel.wave);
     let declared = |l: &Loc| {
         matches!(
             l,
@@ -338,7 +338,9 @@ fn convert(
                 reason: format!("print: {e}"),
             })?;
             let mnemonic = text.split_whitespace().next().unwrap_or("").to_owned();
-            for r in inst.effects.defs.iter().chain(&inst.effects.uses) {
+            // wave-width lane masks, or a wave32 compare into `s5` would count `s6`
+            let fx = peacemaker_ir::effects::wave_effects(arch, kernel.wave, inst);
+            for r in fx.defs.iter().chain(&fx.uses) {
                 let end = r.base + u16::from(r.len);
                 match r.kind {
                     Kind::S if r.base < 106 => max_s = max_s.max(end),

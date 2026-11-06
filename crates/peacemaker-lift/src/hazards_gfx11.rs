@@ -472,7 +472,9 @@ struct WaitFields {
     vscnt0: bool,
 }
 
-fn facts_of(inst: &Inst, arch: Arch) -> Facts {
+fn facts_of(inst: &Inst, arch: Arch, wave: Wave) -> Facts {
+    // VALU lane masks are one SGPR in wave32: the table's 64-bit slot would invent a write of the next SGPR.
+    let effects = peacemaker_ir::effects::wave_effects(arch, wave, inst);
     let name = inst.op.name(arch).unwrap_or("?");
     let base = base_name(name);
     let class = class_of(inst);
@@ -521,7 +523,7 @@ fn facts_of(inst: &Inst, arch: Arch) -> Facts {
     let reads_exec = matches!(class, Class::Vmem | Class::Ds | Class::Export)
         || inst.effects.implicit.reads & peacemaker_ir::effects::ImplicitSet::EXEC != 0
         || special_exec(&inst.operands) && !writes_exec;
-    let v_uses: Vec<RegRef> = v_regs(&inst.effects.uses).collect();
+    let v_uses: Vec<RegRef> = v_regs(&effects.uses).collect();
     let v_uses_sans_mad_hi = if matches!(base, "v_mad_u64_u32" | "v_mad_i64_i32") {
         inst.operands
             .iter()
@@ -548,11 +550,11 @@ fn facts_of(inst: &Inst, arch: Arch) -> Facts {
         nop_v: base == "v_nop",
         depctr,
         wait,
-        v_defs: v_regs(&inst.effects.defs).collect(),
+        v_defs: v_regs(&effects.defs).collect(),
         v_uses,
         v_uses_sans_mad_hi,
-        s_defs: s_regs(&inst.effects.defs).collect(),
-        s_uses: s_regs(&inst.effects.uses).collect(),
+        s_defs: s_regs(&effects.defs).collect(),
+        s_uses: s_regs(&effects.uses).collect(),
         writes_exec,
         reads_exec,
     }
@@ -584,7 +586,7 @@ pub struct Stream<'a> {
 }
 
 impl<'a> Stream<'a> {
-    pub fn new(symbol: &'a str, body: &'a Body, arch: Arch) -> Self {
+    pub fn new(symbol: &'a str, body: &'a Body, arch: Arch, wave: Wave) -> Self {
         let insts: Vec<&Inst> = body
             .layout
             .iter()
@@ -594,7 +596,7 @@ impl<'a> Stream<'a> {
                     .expect("layout names a live instruction")
             })
             .collect();
-        let facts = insts.iter().map(|i| facts_of(i, arch)).collect();
+        let facts = insts.iter().map(|i| facts_of(i, arch, wave)).collect();
         let pcs = insts
             .iter()
             .enumerate()
@@ -1331,7 +1333,7 @@ pub fn check_body(
     advisory: bool,
 ) -> Vec<Finding> {
     let mut out = Vec::new();
-    let stream = Stream::new(symbol, body, arch);
+    let stream = Stream::new(symbol, body, arch, wave);
     rule_user_sgpr(symbol, arch, wave, rsrc2, &mut out);
     rule_wave64(symbol, arch, wave, &mut out);
     if arch == Arch::Gfx1201 {

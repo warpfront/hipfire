@@ -736,7 +736,14 @@ struct RegionDefs {
     v: BTreeSet<u16>,
 }
 
-fn region_defs(kernel: &Kernel, ins: &[Ins], p: &Placed, lo: u16, hi: u16) -> RegionDefs {
+fn region_defs(
+    kernel: &Kernel,
+    arch: Arch,
+    ins: &[Ins],
+    p: &Placed,
+    lo: u16,
+    hi: u16,
+) -> RegionDefs {
     use peacemaker_ir::reg::Kind;
     let body = &kernel.body;
     let mut out = RegionDefs::default();
@@ -744,7 +751,8 @@ fn region_defs(kernel: &Kernel, ins: &[Ins], p: &Placed, lo: u16, hi: u16) -> Re
         let Some(inst) = body.insts.get(body.layout[pos]) else {
             continue;
         };
-        for d in &inst.effects.defs {
+        // wave-width lane masks: a wave32 compare into `s5` does not write `s6`
+        for d in &peacemaker_ir::effects::wave_effects(arch, kernel.wave, inst).defs {
             for r in d.base..d.base + u16::from(d.len) {
                 match d.kind {
                     Kind::S if (lo..=hi).contains(&r) => {
@@ -989,6 +997,11 @@ impl Walk<'_> {
         )
         .unwrap_or(0)
     }
+    /// The instruction's effects with VALU lane masks at this kernel's wave width.
+    fn fx(&self, inst: &Inst) -> peacemaker_ir::effects::Effects {
+        peacemaker_ir::effects::wave_effects(self.arch, self.kernel.wave, inst)
+    }
+
     fn inst(&self, pos: usize) -> &Inst {
         self.kernel
             .body
@@ -1090,7 +1103,7 @@ impl Walk<'_> {
 
     /// Whether the instruction's explicit scalar/vector inputs are all uniform.
     fn inputs_uniform(&self, st: &State, inst: &Inst) -> bool {
-        inst.effects.uses.iter().all(|r| {
+        self.fx(inst).uses.iter().all(|r| {
             let map = match r.kind {
                 peacemaker_ir::reg::Kind::S if r.base < 106 => &st.s,
                 peacemaker_ir::reg::Kind::V => &st.v,
@@ -1117,7 +1130,7 @@ impl Walk<'_> {
         // the entry, `v_readlane_b32 sK, vN, lane` after the exit): a lane write records the
         // copy, a read of a clobbered SGPR's own lane restores its symbolic value, and every
         // other write of either register kills the copy.
-        for r in &inst.effects.uses {
+        for r in &self.fx(inst).uses {
             if r.kind != peacemaker_ir::reg::Kind::S {
                 continue;
             }
@@ -1540,7 +1553,7 @@ impl Walk<'_> {
         }
         // the equality knowledge about `tmpl` dies with a write to its register
         let tmpl = self.notes.dispatcher.tmpl;
-        if inst.effects.defs.iter().any(|d| {
+        if self.fx(inst).defs.iter().any(|d| {
             d.kind == peacemaker_ir::reg::Kind::S
                 && d.base <= tmpl
                 && d.base + u16::from(d.len) > tmpl
@@ -1569,7 +1582,7 @@ impl Walk<'_> {
     /// replaced the value it would have restored).
     fn kill_copies(&self, st: &mut State, inst: &Inst) {
         use peacemaker_ir::reg::Kind;
-        for d in &inst.effects.defs {
+        for d in &self.fx(inst).defs {
             let (a, b) = (d.base, d.base + u16::from(d.len));
             match d.kind {
                 Kind::V => {
@@ -1594,7 +1607,7 @@ impl Walk<'_> {
             && inst.effects.implicit.reads == 0
             && self.inputs_uniform(st, inst)
             && !matches!(inst.effects.control, Control::Barrier(_));
-        for d in &inst.effects.defs {
+        for d in &self.fx(inst).defs {
             match d.kind {
                 peacemaker_ir::reg::Kind::S if d.base >= 126 || d.base + u16::from(d.len) > 126 => {
                     st.exec = Exec::Top;
@@ -2768,7 +2781,16 @@ pub(super) fn check(
         .collect();
     let region_defs: Vec<RegionDefs> = placed
         .iter()
-        .map(|p| region_defs(kernel, &ins, p, notes.dispatcher.lo, notes.dispatcher.hi))
+        .map(|p| {
+            region_defs(
+                kernel,
+                arch,
+                &ins,
+                p,
+                notes.dispatcher.lo,
+                notes.dispatcher.hi,
+            )
+        })
         .collect();
     let mut lds_in: Vec<Event> = Vec::new();
     let mut result: Option<Run> = None;
@@ -3696,7 +3718,7 @@ impl Walk<'_> {
         let mut native_reads = BTreeSet::new();
         if placed.region.is_native() {
             for p in placed.p_entry..placed.p_exit.min(self.kernel.body.layout.len()) {
-                for r in &self.inst(p).effects.uses {
+                for r in &self.fx(self.inst(p)).uses {
                     if r.kind == peacemaker_ir::reg::Kind::S {
                         for i in 0..u16::from(r.len) {
                             let g = r.base + i;
