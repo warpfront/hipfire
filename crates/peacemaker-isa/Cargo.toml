@@ -71,6 +71,10 @@ required-features = ["lab"]
 name = "pm_lift_pools"
 required-features = ["lab"]
 
+[[example]]
+name = "hc8_byte_oracle"
+required-features = ["lab"]
+
 # Native gfx1100 emitters that also run the ROCm oracle/certify path (M7, radiowave): need `--features toolchain`.
 [[example]]
 name = "e8p_i4_moe_gemv_gfx1100_emit"
