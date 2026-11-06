@@ -33,8 +33,8 @@
 
 use crate::backend::{Auth, Backend, SlotTransition};
 use crate::lds::{
-    check_private_layout, ready, AllFree, Free, LdsRegion, Lowering, Owned, PrivState, PrivWritable,
-    Published, Ring, Slots, State, StoreTarget, Transitions, WaveRegion, Writing,
+    check_private_layout, ready, AllFree, Free, LdsRegion, Lowering, Owned, PrivState,
+    PrivWritable, Published, Ring, Slots, State, StoreTarget, Transitions, WaveRegion, Writing,
 };
 use crate::target::{SplitBarrier, Target, WaitModel};
 use crate::wait::{Drained, Event, LdsWrite, Pending, Pendings};

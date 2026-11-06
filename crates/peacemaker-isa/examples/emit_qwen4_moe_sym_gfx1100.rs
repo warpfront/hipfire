@@ -455,6 +455,7 @@ mod app {
             require_zero_private: true,
             launch_dynamic_lds_bytes: Some(0),
             group_segment_fixed_bytes: spec.codec.lds_bytes(),
+            wave_private_windows: vec![],
         }
     }
 

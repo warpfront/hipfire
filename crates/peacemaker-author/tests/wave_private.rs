@@ -82,15 +82,7 @@ fn round_trip_under_wave_uniform_control_needs_no_barrier_and_no_wait() {
         assert_eq!((b.count("ds_store_b32"), b.count("ds_load_b32")), (2, 2));
         assert_eq!(
             b.text,
-            [
-                CMP,
-                "s_cbranch_scc1 .Lskip",
-                ST,
-                LD,
-                ST,
-                LD,
-                ".Lskip:"
-            ]
+            [CMP, "s_cbranch_scc1 .Lskip", ST, LD, ST, LD, ".Lskip:"]
         );
     }
 }
@@ -257,7 +249,9 @@ fn layouts_must_be_aligned_in_range_and_wave_scope_is_refused() {
     d.lds_private("full", 0, 2048, 32).unwrap();
     // Declaring a region is workgroup scope: not under wave-uniform control.
     let c = d.scmp(CMP.into()).unwrap();
-    let e = err(d.skip_if(c, ".Lskip", |d| d.lds_private("late", 4096, 256, 2).map(drop)));
+    let e = err(d.skip_if(c, ".Lskip", |d| {
+        d.lds_private("late", 4096, 256, 2).map(drop)
+    }));
     assert!(e.contains("workgroup scope"), "{e}");
 }
 
@@ -307,10 +301,13 @@ fn typed_states_are_names_of_the_same_machine() {
     let p: WaveRegion<Scratch, Free> = wg.private_retire(o).unwrap();
     // A workgroup barrier for a shared region beside it.
     let tile = wg.lds::<Scratch>("tile", 4096, 2048).unwrap();
-    let (tile, st) = wg.ds_store(tile, "ds_store_b128 v1, v[2:5]".into()).unwrap();
+    let (tile, st) = wg
+        .ds_store(tile, "ds_store_b128 v1, v[2:5]".into())
+        .unwrap();
     let st = wg.wait(st).unwrap();
     let (tile,) = wg.barrier((ready(tile, st),)).unwrap();
-    wg.ds_load(&tile, "ds_load_b128 v[8:11], v6".into()).unwrap();
+    wg.ds_load(&tile, "ds_load_b128 v[8:11], v6".into())
+        .unwrap();
     // `AllFree`: the private region relayouts like a shared one.
     let (tile,) = wg.barrier((peacemaker_author::retire(tile),)).unwrap();
     wg.relayout((p, tile)).unwrap();

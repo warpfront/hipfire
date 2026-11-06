@@ -947,7 +947,10 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         self.b.lds_relayout(&self.auth)?;
         self.st.regions.iter_mut().for_each(|r| r.hold = Hold::Gone);
         self.st.rings.iter_mut().for_each(|g| g.hold = Hold::Gone);
-        self.st.privates.iter_mut().for_each(|r| r.hold = Hold::Gone);
+        self.st
+            .privates
+            .iter_mut()
+            .for_each(|r| r.hold = Hold::Gone);
         Ok(())
     }
     /// Re-carve `Free` regions into one region (a store or load then covers

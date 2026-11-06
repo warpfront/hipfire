@@ -181,7 +181,12 @@ impl Backend for Trace {
         self.private.push(true);
         Ok(self.slots.len() - 1)
     }
-    fn ds_store_private(&mut self, auth: &Auth, slot: usize, insn: String) -> Result<EventId, String> {
+    fn ds_store_private(
+        &mut self,
+        auth: &Auth,
+        slot: usize,
+        insn: String,
+    ) -> Result<EventId, String> {
         self.seal.check(auth)?;
         let private = self.private.get(slot) == Some(&true);
         let s = self.slots.get_mut(slot).ok_or("unknown LDS slot")?;
@@ -216,7 +221,10 @@ impl Backend for Trace {
         let private = self.private.get(slot) == Some(&true);
         let s = self.slots.get_mut(slot).ok_or("unknown LDS slot")?;
         if !private || s.1 != Slot::Publishing {
-            return Err(format!("{} cannot be published to its wave ({:?})", s.0, s.1));
+            return Err(format!(
+                "{} cannot be published to its wave ({:?})",
+                s.0, s.1
+            ));
         }
         s.1 = Slot::Published;
         Ok(())

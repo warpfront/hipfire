@@ -105,7 +105,10 @@ fn no_cross_wave_path_reaches_a_private_slot() {
     l.private_store(p).unwrap();
     for t in [Transition::Ready(p), Transition::Retire(p)] {
         let e = err(l.barrier(&[t], true));
-        assert!(e.contains("wave-private") && e.contains("barrier transition"), "{e}");
+        assert!(
+            e.contains("wave-private") && e.contains("barrier transition"),
+            "{e}"
+        );
     }
     // Shared store/load entry points refuse it (a store naming it, or a load).
     assert!(err(l.store(p)).contains("wave-private"));
@@ -287,7 +290,8 @@ fn kernel<T: Target>(
 fn emit(arch: Arch, variant: Variant) -> Result<Emitted, String> {
     let mut plan = RegPlan::new(16, 104)?;
     const NAMES: [&str; 16] = [
-        "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
+        "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+        "v14", "v15",
     ];
     for (n, name) in NAMES.iter().enumerate() {
         plan.v::<1>(name, n as u8, Live::Whole)?;
@@ -314,9 +318,21 @@ fn emit(arch: Arch, variant: Variant) -> Result<Emitted, String> {
     );
     let gfx12 = arch.gfx12();
     match arch {
-        Arch::Gfx1100 => kernel(&mut Workgroup::<Gfx1100, Builder>::new(&mut b)?, gfx12, variant)?,
-        Arch::Gfx1151 => kernel(&mut Workgroup::<Gfx1151, Builder>::new(&mut b)?, gfx12, variant)?,
-        Arch::Gfx1201 => kernel(&mut Workgroup::<Gfx1201, Builder>::new(&mut b)?, gfx12, variant)?,
+        Arch::Gfx1100 => kernel(
+            &mut Workgroup::<Gfx1100, Builder>::new(&mut b)?,
+            gfx12,
+            variant,
+        )?,
+        Arch::Gfx1151 => kernel(
+            &mut Workgroup::<Gfx1151, Builder>::new(&mut b)?,
+            gfx12,
+            variant,
+        )?,
+        Arch::Gfx1201 => kernel(
+            &mut Workgroup::<Gfx1201, Builder>::new(&mut b)?,
+            gfx12,
+            variant,
+        )?,
         a => return Err(format!("{a:?}")),
     }
     b.finish()
@@ -337,7 +353,10 @@ fn builder_emits_no_barrier_and_no_wait_inside_the_private_protocol() {
         let e = emit(arch, Variant::Good).unwrap();
         let text = lines(&e);
         // The wave-uniform body is [s_cbranch_scc1 .Lskip, .Lskip:).
-        let from = text.iter().position(|l| *l == "s_cbranch_scc1 .Lskip").unwrap();
+        let from = text
+            .iter()
+            .position(|l| *l == "s_cbranch_scc1 .Lskip")
+            .unwrap();
         let to = text.iter().position(|l| *l == ".Lskip:").unwrap();
         let body = &text[from + 1..to];
         for l in body {
@@ -358,7 +377,10 @@ fn builder_emits_no_barrier_and_no_wait_inside_the_private_protocol() {
         let waits: Vec<&&str> = body.iter().filter(|l| l.starts_with("s_wait")).collect();
         assert_eq!(waits.len(), 2, "{arch:?}: {waits:?}");
         // One workgroup barrier in the kernel: the shared tile's publication.
-        let barriers = text.iter().filter(|l| mnemonic(l) == "s_barrier" || mnemonic(l) == "s_barrier_signal").count();
+        let barriers = text
+            .iter()
+            .filter(|l| mnemonic(l) == "s_barrier" || mnemonic(l) == "s_barrier_signal")
+            .count();
         assert_eq!(barriers, 1, "{arch:?}");
         // The proof records the private window for a certifier.
         let slots = &e.proof.lds_slots;
@@ -371,7 +393,9 @@ fn builder_emits_no_barrier_and_no_wait_inside_the_private_protocol() {
                 waves: WAVES
             }]
         );
-        assert!(slots.iter().any(|s| s.name == "tile" && s.wave_private.is_none()));
+        assert!(slots
+            .iter()
+            .any(|s| s.name == "tile" && s.wave_private.is_none()));
     }
 }
 
@@ -557,7 +581,8 @@ mod pipeline {
 
     fn run_pipeline(arch: Arch, variant: Variant, windows: bool) -> Result<(), String> {
         let e = emit(arch, variant)?;
-        let (text, _) = peacemaker_isa::kernels::iu4_gemm::module(&[e.clone()], "wave_private_demo")?;
+        let (text, _) =
+            peacemaker_isa::kernels::iu4_gemm::module(&[e.clone()], "wave_private_demo")?;
         let dir = std::env::temp_dir().join(format!(
             "peacemaker-isa-wave-private-{}-{}-{variant:?}-{windows}",
             std::process::id(),
@@ -582,7 +607,13 @@ mod pipeline {
 
     macro_rules! need_rocm {
         () => {
-            for t in ["llvm-mc", "ld.lld", "clang-offload-bundler", "llvm-objdump", "llvm-readobj"] {
+            for t in [
+                "llvm-mc",
+                "ld.lld",
+                "clang-offload-bundler",
+                "llvm-objdump",
+                "llvm-readobj",
+            ] {
                 let _ = require_rocm_tool!(t);
             }
         };
@@ -608,4 +639,3 @@ mod pipeline {
         assert!(e.contains("wave-private LDS windows"), "{e}");
     }
 }
-

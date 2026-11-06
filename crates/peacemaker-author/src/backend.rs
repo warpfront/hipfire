@@ -131,12 +131,8 @@ pub trait Backend: Sized {
     ) -> Result<EventId, String>;
     /// One DS load from the issuing wave's slice (`Published | Reading ->
     /// Reading`).
-    fn ds_load_private(
-        &mut self,
-        auth: &Auth,
-        slot: usize,
-        insn: Self::Insn,
-    ) -> Result<(), String>;
+    fn ds_load_private(&mut self, auth: &Auth, slot: usize, insn: Self::Insn)
+        -> Result<(), String>;
     /// `Publishing -> Published` for the owning wave: a state step with no
     /// instruction (one wave's DS instructions execute in issue order).
     fn lds_private_publish(&mut self, auth: &Auth, slot: usize) -> Result<(), String>;

@@ -399,7 +399,11 @@ fn check_private(
         }
         let (own_lo, own_hi) = (w.base + wave * w.stride, w.base + (wave + 1) * w.stride);
         if lo < own_lo || hi > own_hi {
-            let at = if lo >= w.base { (lo - w.base) / w.stride } else { 0 };
+            let at = if lo >= w.base {
+                (lo - w.base) / w.stride
+            } else {
+                0
+            };
             return Err(format!(
                 "wave {wave} lane {lane} accesses bytes [{lo}, {hi}) of wave-private window {w:?}, outside its own slice [{own_lo}, {own_hi}) (reaches wave {at}'s slice or past the window)"
             ));
