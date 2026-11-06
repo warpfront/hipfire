@@ -451,7 +451,7 @@ mod tests {
         let (m, k) = (3, 8);
         let mut w = vec![bf(0.0); m * k];
         w[0] = bf(448.0); // row 0: s = 1
-        w[k] = bf(449.0); // row 1: ratio just above 1 -> s = 2
+        w[k] = bf(450.0); // row 1: first bf16 above 448 (449 rounds to 448) -> s = 2
         w[2 * k + 3] = bf(-0.01); // row 2
         let (q, s) = quantize_e4m3_rows_rowmajor(&w, m, k);
         assert_eq!(s[0], 1.0);
@@ -465,7 +465,7 @@ mod tests {
         }
         // Dequant error bounded by half an E4M3 ulp of the row max.
         let dq = dequant_rowmajor(Hc8Fmt::E4m3, &q, &s, m, k);
-        assert!((dq[k] - 449.0).abs() <= 16.0 * s[1]);
+        assert!((dq[k] - 450.0).abs() <= 16.0 * s[1]);
     }
 
     #[test]
