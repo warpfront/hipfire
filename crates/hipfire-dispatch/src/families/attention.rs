@@ -2055,6 +2055,12 @@ fn dispatch_attend(
                 // Same gates as the fwht3 gfx11 arm below; the launcher
                 // pre-rotates/pre-converts Q into f16 scratch (replay-idempotent,
                 // capture-safe). Falls through to the incumbent otherwise.
+                // v_mode 4 (lloyd4 V) takes the (4,4) combo module: same K
+                // fill, V dequantized from lloyd4 records, post-inverse
+                // restores O in place. Requires the 256-element V sign
+                // tables (reallocated at lloyd-V load); anything smaller
+                // falls through to the scalar path. Mixed pairs (e.g. K=4
+                // with V=3) are not registered — scalar fallback.
                 if gpu.flags.gfx11_fa2_prefill
                     && matches!(
                         gpu.arch.as_str(),
@@ -2066,22 +2072,40 @@ fn dispatch_attend(
                     && gpu.fa2_gfx11_batch_admitted(io.batch_size)
                     && gpu.fa2_gfx11_ctx_admitted(io.max_ctx_len)
                     && io.tree_bias.is_none()
-                    && plan.v_mode_bits == 8
+                    && (plan.v_mode_bits == 8
+                        || (plan.v_mode_bits == 4 && ct.numel() >= 256 && st.numel() >= 256))
                 {
-                    hip!(gpu.attention_q8_0_fa2_gqa_fwht4k_gfx11(
-                        io.q,
-                        io.k_cache,
-                        io.v_cache,
-                        io.output,
-                        io.positions(),
-                        ct,
-                        st,
-                        io.n_heads,
-                        io.n_kv_heads,
-                        io.head_dim,
-                        io.max_ctx_len,
-                        io.batch_size,
-                    ))?;
+                    if plan.v_mode_bits == 8 {
+                        hip!(gpu.attention_q8_0_fa2_gqa_fwht4k_gfx11(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.positions(),
+                            ct,
+                            st,
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.max_ctx_len,
+                            io.batch_size,
+                        ))?;
+                    } else {
+                        hip!(gpu.attention_q8_0_fa2_gqa_fwht4k_lloydv4_gfx11(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.positions(),
+                            ct,
+                            st,
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.max_ctx_len,
+                            io.batch_size,
+                        ))?;
+                    }
                     return Ok(());
                 }
                 #[cfg(feature = "flash-attn-ck")]
@@ -2256,6 +2280,9 @@ fn dispatch_attend(
                 // gfx1151 only (shared predicate with the Q8 ingress); every
                 // other batch keeps the 64..=512 gate. Falls through to the
                 // incumbent below otherwise.
+                // v_mode 3 (lloyd3 V) takes the (3,3) combo module; same
+                // 256-element sign-table requirement as the (4,4) combo
+                // (fwht3 tables are already 256, the check is belt-and-braces).
                 if gpu.flags.gfx11_fa2_prefill
                     && matches!(
                         gpu.arch.as_str(),
@@ -2267,22 +2294,40 @@ fn dispatch_attend(
                     && gpu.fa2_gfx11_batch_admitted(io.batch_size)
                     && gpu.fa2_gfx11_ctx_admitted(io.max_ctx_len)
                     && io.tree_bias.is_none()
-                    && plan.v_mode_bits == 8
+                    && (plan.v_mode_bits == 8
+                        || (plan.v_mode_bits == 3 && ct.numel() >= 256 && st.numel() >= 256))
                 {
-                    hip!(gpu.attention_q8_0_fa2_gqa_fwht3k_gfx11(
-                        io.q,
-                        io.k_cache,
-                        io.v_cache,
-                        io.output,
-                        io.positions(),
-                        ct,
-                        st,
-                        io.n_heads,
-                        io.n_kv_heads,
-                        io.head_dim,
-                        io.max_ctx_len,
-                        io.batch_size,
-                    ))?;
+                    if plan.v_mode_bits == 8 {
+                        hip!(gpu.attention_q8_0_fa2_gqa_fwht3k_gfx11(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.positions(),
+                            ct,
+                            st,
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.max_ctx_len,
+                            io.batch_size,
+                        ))?;
+                    } else {
+                        hip!(gpu.attention_q8_0_fa2_gqa_fwht3k_lloydv3_gfx11(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.positions(),
+                            ct,
+                            st,
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.max_ctx_len,
+                            io.batch_size,
+                        ))?;
+                    }
                     return Ok(());
                 }
                 #[cfg(feature = "flash-attn-ck")]

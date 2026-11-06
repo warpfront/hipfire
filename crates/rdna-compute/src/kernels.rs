@@ -8821,6 +8821,33 @@ pub const ATTENTION_Q8_0_FA2_GQA_FWHT4K_GFX11_SRC: &str = concat!(
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
 );
 
+/// gfx11 fwht4-K + lloyd4-V FA2 source (`HIPFIRE_FA2_KMODE=4`,
+/// `HIPFIRE_FA2_VMODE=4`): K fill identical to the FWHT4K module; V
+/// dequantizes lloyd4 records (`TURBO_C4_256`, 132 B/head) into the unchanged
+/// V plane. The body writes rotated-space O; the host launches
+/// `attention_fa2_o_postinvert_lloyd_gfx11` (same module build) on the same
+/// stream immediately after. Entries
+/// `attention_q8_0_fa2_gqa_fwht4k_lloydv4_gfx11` (+ combo-specific
+/// pre-convert symbol; the post-invert symbol is shared across the lloyd-V
+/// combos — its body is (K,V)MODE-independent, first registration wins, and
+/// any future MODE dependence must mint distinct symbols like the
+/// pre-convert lane does). `turbo_common.h` prepended. JIT-only.
+pub const ATTENTION_Q8_0_FA2_GQA_FWHT4K_LLOYDV4_GFX11_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KMODE 4\n#define HIPFIRE_FA2_VMODE 4\n",
+    include_str!("../../../kernels/src/turbo_common.h"),
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
+);
+
+/// gfx11 fwht3-K + lloyd3-V FA2 source (`HIPFIRE_FA2_KMODE=3`,
+/// `HIPFIRE_FA2_VMODE=3`): K fill identical to the FWHT3K module; V
+/// dequantizes lloyd3 records (`TURBO_C3_256`, 100 B/head). Same
+/// post-inverse discipline as the (4,4) combo. JIT-only.
+pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_LLOYDV3_GFX11_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KMODE 3\n#define HIPFIRE_FA2_VMODE 3\n",
+    include_str!("../../../kernels/src/turbo_common.h"),
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
+);
+
 /// Benchmark-only gfx1201 LongSpec partition WMMA flash: same arithmetic as
 /// `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC` but writes retained online-
 /// softmax state `[m,l,O_unnormalized]` per query/head instead of normalized O.

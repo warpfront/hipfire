@@ -76,6 +76,15 @@
 #define HIPFIRE_FA2_KMODE 0
 #endif
 
+// V-cache mode, selected at JIT time alongside KMODE. 8 = Q8_0 (the
+// incumbent fill below); 4/3 = lloyd4/lloyd3 V (signed-FWHT-rotated
+// [f32 cnorm][packed indices], 132/100 B/head — byte-identical layout to
+// fwht4/fwht3 K, so the V fill mirrors the KMODE=4/3 K fill into the V
+// plane). KMODE=2 has no FA2 arm, so VMODE=2 is unreachable here.
+#ifndef HIPFIRE_FA2_VMODE
+#define HIPFIRE_FA2_VMODE 8
+#endif
+
 // The 16-position screen covers exact gfx1100 and gfx1151 only. Other gfx11
 // targets keep the eight-position layout; fwht3 always keeps its old layout.
 #ifndef HIPFIRE_FA2_Q16
@@ -981,6 +990,7 @@ __device__ __forceinline__ void fa2_gqa_body(
 #endif
         // Q16 uses four cooperative lanes per (key-pair, 32-dim block);
         // other modes keep the one-lane-per-key-pair V fill.
+        // VMODE 4/3 (lloyd V) imply KMODE != 0, hence non-Q16 here.
         for (int t = 0; t < KT_VITERS; ++t) {
             const int slot = tid + t * WG_THREADS;
             const int pair = FA2_Q16 ? slot >> 2 : slot;
@@ -988,6 +998,7 @@ __device__ __forceinline__ void fa2_gqa_body(
             const int m = pair >> 3;
             const int b = pair & 7;
             const int k0 = ktile + 2 * m;
+#if HIPFIRE_FA2_VMODE == 8
             const unsigned char* blk0 = (k0 < seq_len)
                 ? v_cache + (unsigned long long)k0 * (unsigned long long)row_stride
                     + (unsigned long long)(kv_blk + b) * 34ULL
@@ -1024,6 +1035,96 @@ __device__ __forceinline__ void fa2_gqa_body(
                     Vdw[d * V_ROW + ((m + fa2_swiz(d & 15)) & V_MASK)] = dw.u;
                 }
             }
+#elif HIPFIRE_FA2_VMODE == 4
+            // lloyd4 V: per (pos, kv head) record = [f32 cnorm][128 B
+            // nibbles] (132 B/head — the same contract as fwht4 K, mirrored
+            // here into the V plane). Slot (m, b) covers key pair
+            // (k0, k0+1) x dims b*32..+31 = 16 bytes per key at
+            // rec+4+b*16; byte j low nibble = even dim, high = odd dim;
+            // value = cnorm * TURBO_C4_256[nibble]. Dword packs (key0 dim d,
+            // key1 dim d), stored at V_T[d][(m + S(d&15)) & V_MASK].
+            // n_kv_heads is 4 in every admitted geometry (entries early-out
+            // otherwise), so the row stride is 4*132 = 528 B.
+            const unsigned char* rec0 = (k0 < seq_len)
+                ? v_cache + (unsigned long long)k0 * 528ULL
+                    + (unsigned long long)kv_h * 132ULL
+                : nullptr;
+            const unsigned char* rec1 = (k0 + 1 < seq_len)
+                ? v_cache + (unsigned long long)(k0 + 1) * 528ULL
+                    + (unsigned long long)kv_h * 132ULL
+                : nullptr;
+            float cnorm0 = 0.0f, cnorm1 = 0.0f;
+            if (rec0 != nullptr)
+                __builtin_memcpy(&cnorm0, rec0, 4);
+            if (rec1 != nullptr)
+                __builtin_memcpy(&cnorm1, rec1, 4);
+#pragma unroll 1
+            for (int m2 = 0; m2 < 4; ++m2) {
+                uint32_t u0 = 0, u1 = 0;
+                if (rec0 != nullptr)
+                    __builtin_memcpy(&u0, rec0 + 4 + b * 16 + m2 * 4, 4);
+                if (rec1 != nullptr)
+                    __builtin_memcpy(&u1, rec1 + 4 + b * 16 + m2 * 4, 4);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int d = b * 32 + m2 * 8 + i * 2;
+                    const uint32_t by0 = (u0 >> (8 * i)) & 0xFFu;
+                    const uint32_t by1 = (u1 >> (8 * i)) & 0xFFu;
+                    fa2_dw_t dw;
+                    dw.h[0] = (_Float16)(cnorm0 * TURBO_C4_256[by0 & 15u]);
+                    dw.h[1] = (_Float16)(cnorm1 * TURBO_C4_256[by1 & 15u]);
+                    Vdw[d * V_ROW + ((m + fa2_swiz(d & 15)) & V_MASK)] = dw.u;
+                    dw.h[0] = (_Float16)(cnorm0 * TURBO_C4_256[by0 >> 4]);
+                    dw.h[1] = (_Float16)(cnorm1 * TURBO_C4_256[by1 >> 4]);
+                    Vdw[(d + 1) * V_ROW + ((m + fa2_swiz((d + 1) & 15)) & V_MASK)] = dw.u;
+                }
+            }
+#elif HIPFIRE_FA2_VMODE == 3
+            // lloyd3 V: per (pos, kv head) record = [f32 cnorm][96 B 3-bit
+            // codes] (100 B/head — the same contract as fwht3 K). Slot (m, b)
+            // covers key pair (k0, k0+1) x dims b*32..+31 = 12 bytes per key
+            // at rec+4+(b*4+m2)*3 (m2 over 4); code (packed >> 3*i)&7 pairs
+            // with (packed >> (3*i+3))&7, value = cnorm * TURBO_C3_256[code].
+            // Row stride is 4*100 = 400 B (n_kv_heads == 4, entries check).
+            const unsigned char* rec0 = (k0 < seq_len)
+                ? v_cache + (unsigned long long)k0 * 400ULL
+                    + (unsigned long long)kv_h * 100ULL
+                : nullptr;
+            const unsigned char* rec1 = (k0 + 1 < seq_len)
+                ? v_cache + (unsigned long long)(k0 + 1) * 400ULL
+                    + (unsigned long long)kv_h * 100ULL
+                : nullptr;
+            float cnorm0 = 0.0f, cnorm1 = 0.0f;
+            if (rec0 != nullptr)
+                __builtin_memcpy(&cnorm0, rec0, 4);
+            if (rec1 != nullptr)
+                __builtin_memcpy(&cnorm1, rec1, 4);
+#pragma unroll 1
+            for (int m2 = 0; m2 < 4; ++m2) {
+                uint32_t p0 = 0, p1 = 0;
+                if (rec0 != nullptr)
+                    __builtin_memcpy(&p0, rec0 + 4 + (b * 4 + m2) * 3, 3);
+                if (rec1 != nullptr)
+                    __builtin_memcpy(&p1, rec1 + 4 + (b * 4 + m2) * 3, 3);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int d = b * 32 + m2 * 8 + i * 2;
+                    const int c00 = (p0 >> (6 * i)) & 7;
+                    const int c01 = (p0 >> (6 * i + 3)) & 7;
+                    const int c10 = (p1 >> (6 * i)) & 7;
+                    const int c11 = (p1 >> (6 * i + 3)) & 7;
+                    fa2_dw_t dw;
+                    dw.h[0] = (_Float16)(cnorm0 * TURBO_C3_256[c00]);
+                    dw.h[1] = (_Float16)(cnorm1 * TURBO_C3_256[c10]);
+                    Vdw[d * V_ROW + ((m + fa2_swiz(d & 15)) & V_MASK)] = dw.u;
+                    dw.h[0] = (_Float16)(cnorm0 * TURBO_C3_256[c01]);
+                    dw.h[1] = (_Float16)(cnorm1 * TURBO_C3_256[c11]);
+                    Vdw[(d + 1) * V_ROW + ((m + fa2_swiz((d + 1) & 15)) & V_MASK)] = dw.u;
+                }
+            }
+#else
+#error "HIPFIRE_FA2_VMODE must be 8, 4 or 3"
+#endif
         }
         __syncthreads();
 #if HIPFIRE_FA2_KT == 32
@@ -1544,7 +1645,11 @@ __device__ __forceinline__ void fa2_gqa_body(
 // deterministic near-miss on both cards (near-uniform softmax hides the
 // missing rotation to ~1e-3), not an op-order race. Distinct symbols make
 // each launcher resolve its own module's build.
-#if HIPFIRE_FA2_KMODE == 3
+#if HIPFIRE_FA2_KMODE == 4 && HIPFIRE_FA2_VMODE == 4
+#define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_fwht4_lloydv4_gfx11
+#elif HIPFIRE_FA2_KMODE == 3 && HIPFIRE_FA2_VMODE == 3
+#define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_fwht3_lloydv3_gfx11
+#elif HIPFIRE_FA2_KMODE == 3
 #define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_fwht3_gfx11
 #elif HIPFIRE_FA2_KMODE == 4
 #define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_fwht4_gfx11
@@ -1787,6 +1892,103 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht
 // attention_fa2_q_preconvert_fwht4_gfx11.
 #if HIPFIRE_FA2_KMODE == 4
 extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht4k_gfx11(
+    const _Float16* __restrict__ q16,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn)
+{
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+        return;
+    const int kv_h = blockIdx.y;
+    if (kv_h >= 4)
+        return;
+    const int q_base = blockIdx.x * 8;
+    if (q_base >= batch_size)
+        return;
+    fa2_gqa_body<false>(q16, k_cache, v_cache, out, positions, batch_size,
+                        scale_attn, kv_h, q_base, 0, 1);
+}
+#endif
+
+// ---- lloyd-V post-inverse epilogue ----
+// The FA2 body writes the normalized rotated output O_rot (V stayed in
+// FWHT-rotated space through QK/softmax/PV). H^{-1} commutes with the scalar
+// softmax weights, so one post-pass over out[] recovers O exactly:
+//   O = H^{-1}(O_rot).
+// Kept OUT of fa2_gqa_body: that body distributes 16 query rows across the
+// 32 lanes of a wave (ml = lane & 15), while fwht_shfl_inverse_256 needs one
+// query row distributed across all 32 lanes (lane*8 .. lane*8+7). A separate
+// kernel avoids an LDS transpose + kernarg growth in the hot body and keeps
+// its VGPR pressure and signature untouched. Same kernarg list as the body
+// entries plus the two sign tables (device pointers, same buffers the KV
+// writer used); replay-idempotent (pure function of out[] + signs).
+// Grid: batch*24 rows / 4 rows per block; block 128 (4 waves, 0 LDS).
+#if HIPFIRE_FA2_VMODE == 4 || HIPFIRE_FA2_VMODE == 3
+extern "C" __global__ __launch_bounds__(128, 1) void attention_fa2_o_postinvert_lloyd_gfx11(
+    float* __restrict__ out,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    int batch_size)
+{
+    const int tid = (int)threadIdx.x;
+    const int r = (int)blockIdx.x * 4 + (tid >> 5);
+    if (r >= batch_size * 24)
+        return;
+    const int lane = tid & 31;
+    float* row = out + (unsigned)r * 256u;
+    const int d0 = lane * 8;
+    float v0 = row[d0 + 0], v1 = row[d0 + 1];
+    float v2 = row[d0 + 2], v3 = row[d0 + 3];
+    float v4 = row[d0 + 4], v5 = row[d0 + 5];
+    float v6 = row[d0 + 6], v7 = row[d0 + 7];
+    fwht_shfl_inverse_256(v0, v1, v2, v3, v4, v5, v6, v7,
+                           signs1, signs2, lane);
+    row[d0 + 0] = v0; row[d0 + 1] = v1;
+    row[d0 + 2] = v2; row[d0 + 3] = v3;
+    row[d0 + 4] = v4; row[d0 + 5] = v5;
+    row[d0 + 6] = v6; row[d0 + 7] = v7;
+}
+#endif
+
+// ---- KMODE=4 + VMODE=4 entry: fwht4 K, lloyd4 V ----
+// Same kernarg list as the fwht4k entry (the post-inverse is a separate
+// launch by the host, same stream, immediately after). Q pre-rotation is
+// the KMODE=4 helper (V rotation does not touch Q/K).
+#if HIPFIRE_FA2_KMODE == 4 && HIPFIRE_FA2_VMODE == 4
+extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht4k_lloydv4_gfx11(
+    const _Float16* __restrict__ q16,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn)
+{
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+        return;
+    const int kv_h = blockIdx.y;
+    if (kv_h >= 4)
+        return;
+    const int q_base = blockIdx.x * 8;
+    if (q_base >= batch_size)
+        return;
+    fa2_gqa_body<false>(q16, k_cache, v_cache, out, positions, batch_size,
+                        scale_attn, kv_h, q_base, 0, 1);
+}
+#endif
+
+// ---- KMODE=3 + VMODE=3 entry: fwht3 K, lloyd3 V ----
+#if HIPFIRE_FA2_KMODE == 3 && HIPFIRE_FA2_VMODE == 3
+extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht3k_lloydv3_gfx11(
     const _Float16* __restrict__ q16,
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,

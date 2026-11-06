@@ -9942,6 +9942,437 @@ impl Gpu {
         result
     }
 
+    /// lloyd-V post-inverse epilogue launcher (shared by the (4,4) and (3,3)
+    /// combos): `attention_fa2_o_postinvert_lloyd_gfx11` in place over `out`
+    /// on the same stream. Pure function of out[] + the V sign tables, so
+    /// capture-safe via launch_maybe_blob. The sign tables are the same
+    /// `givens_cos`/`givens_sin` buffers the KV writer used (256-element after
+    /// the lloyd realloc; LCG-prefix consistent with the K tables) — NOT the
+    /// Q-preconvert tables. Grid covers batch*24 rows / 4 per block.
+    fn launch_fa2_o_postinvert_lloyd_gfx11(
+        &mut self,
+        out: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if signs1.numel() < 256 || signs2.numel() < 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fa2_o_postinvert_lloyd_gfx11 requires 256-element sign tables, got {} and {}",
+                    signs1.numel(),
+                    signs2.numel()
+                ),
+            ));
+        }
+        let need = batch_size
+            .checked_mul(24)
+            .and_then(|r| r.checked_mul(256))
+            .ok_or_else(|| hip_bridge::HipError::new(0, "postinvert out capacity overflow"))?;
+        if out.numel() < need {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fa2_o_postinvert_lloyd_gfx11 out too small: {} < {need}",
+                    out.numel()
+                ),
+            ));
+        }
+        let grid_x = (batch_size * 24).div_ceil(4) as u32;
+        let mut out_ptr = out.buf.as_ptr();
+        let mut s1_ptr = signs1.buf.as_ptr();
+        let mut s2_ptr = signs2.buf.as_ptr();
+        let mut bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut s1_ptr as *mut _ as *mut c_void,
+            &mut s2_ptr as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "attention_fa2_o_postinvert_lloyd_gfx11",
+            [grid_x, 1, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(out_ptr);
+                b.push_ptr(s1_ptr);
+                b.push_ptr(s2_ptr);
+                b.push_i32(bs);
+                b
+            },
+        )
+    }
+
+    /// gfx11 fwht4-K + lloyd4-V FA2 prefill: the (4,4) combo module. K fill
+    /// identical to `attention_q8_0_fa2_gqa_fwht4k_gfx11`; V dequantizes
+    /// lloyd4 records into the unchanged V plane; the body writes
+    /// rotated-space O and the post-inverse restores O in place on the same
+    /// stream. Q rotation is the KMODE=4 pre-convert (combo-specific symbol;
+    /// V rotation never touches Q). Signs are the 256-element V tables
+    /// (>= 256 validated — the K-side 128 check is insufficient here).
+    /// Same admission envelope as the fwht4k launcher otherwise.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_fa2_gqa_fwht4k_lloydv4_gfx11(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !matches!(
+            self.arch.as_str(),
+            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+        ) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht4k_lloydv4_gfx11 requires a gfx11 arch, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht4k_lloydv4_gfx11 requires H24/KV4/D256, got \
+                     H{n_heads}/KV{n_kv_heads}/D{head_dim}"
+                ),
+            ));
+        }
+        let max_fa2_batch: usize = if self.arch.as_str() == "gfx1151" {
+            1024
+        } else {
+            512
+        };
+        if batch_size == 0 || batch_size > max_fa2_batch {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht4k_lloydv4_gfx11 requires 1 <= batch <= {max_fa2_batch}, got {batch_size}"
+                ),
+            ));
+        }
+        let max_fa2_ctx = self.fa2_gfx11_max_ctx();
+        if max_ctx_len == 0 || max_ctx_len > max_fa2_ctx {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht4k_lloydv4_gfx11 requires 1 <= max_ctx_len <= {max_fa2_ctx}, got {max_ctx_len}"
+                ),
+            ));
+        }
+        let need_qo = batch_size * n_heads * head_dim;
+        if q.numel() < need_qo || out.numel() < need_qo || positions.numel() < batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht4k_lloydv4_gfx11 capacity mismatch: \
+                     q={} out={} positions={} (need qo>={need_qo}, pos>={batch_size})",
+                    q.numel(),
+                    out.numel(),
+                    positions.numel()
+                ),
+            ));
+        }
+        if signs1.numel() < 256 || signs2.numel() < 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht4k_lloydv4_gfx11 requires 256-element sign tables, got \
+                     {} and {}",
+                    signs1.numel(),
+                    signs2.numel()
+                ),
+            ));
+        }
+        let module = "attention_q8_0_fa2_gqa_fwht4k_lloydv4_gfx11";
+        const PRECONVERT: &str = "attention_fa2_q_preconvert_fwht4_lloydv4_gfx11";
+        const POSTINVERT: &str = "attention_fa2_o_postinvert_lloyd_gfx11";
+        if !self.functions.contains_key(module)
+            || !self.functions.contains_key(PRECONVERT)
+            || !self.functions.contains_key(POSTINVERT)
+        {
+            let src = format!(
+                "#define HIPFIRE_FA2_KT 32\n{}",
+                kernels::ATTENTION_Q8_0_FA2_GQA_FWHT4K_LLOYDV4_GFX11_SRC
+            );
+            self.ensure_kernel(module, &src, module)?;
+            self.ensure_kernel(module, &src, PRECONVERT)?;
+            self.ensure_kernel(module, &src, POSTINVERT)?;
+        }
+        let need_q16_bytes = batch_size * n_heads * head_dim * 2;
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fa2_q16_scratch_bytes,
+            self.scratch.fa2_q16_scratch.is_some(),
+            need_q16_bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        let q16_ptr = self
+            .scratch
+            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
+        let grid_x = batch_size.div_ceil(8) as u32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q16_arg = q16_ptr;
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q16_arg as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+        );
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "attention",
+            "attention_q8_0_fa2_gqa_fwht4k_lloydv4_gfx11",
+            bytes,
+        );
+        self.launch_fa2_q_preconvert_gfx11(
+            PRECONVERT,
+            q.buf.as_ptr(),
+            q16_ptr,
+            signs1.buf.as_ptr(),
+            signs2.buf.as_ptr(),
+            batch_size,
+            1,
+        )?;
+        let result = self.launch_maybe_blob(
+            module,
+            [grid_x, 4, 1],
+            [128, 1, 1],
+            32768,
+            &mut params,
+            || {
+                pack_attention_q8_0_fa2_gqa_gfx11_kernarg(
+                    q16_arg, k_ptr, v_ptr, out_ptr, pos_ptr, nh, nkv, hd, bs, sc,
+                )
+            },
+        );
+        if result.is_ok() {
+            self.launch_fa2_o_postinvert_lloyd_gfx11(out, signs1, signs2, batch_size)?;
+        }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx11 fwht3-K + lloyd3-V FA2 prefill: the (3,3) combo module. K fill
+    /// identical to `attention_q8_0_fa2_gqa_fwht3k_gfx11`; V dequantizes
+    /// lloyd3 records. Same post-inverse discipline as the (4,4) combo.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_fa2_gqa_fwht3k_lloydv3_gfx11(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !matches!(
+            self.arch.as_str(),
+            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+        ) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht3k_lloydv3_gfx11 requires a gfx11 arch, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht3k_lloydv3_gfx11 requires H24/KV4/D256, got \
+                     H{n_heads}/KV{n_kv_heads}/D{head_dim}"
+                ),
+            ));
+        }
+        let max_fa2_batch: usize = if self.arch.as_str() == "gfx1151" {
+            1024
+        } else {
+            512
+        };
+        if batch_size == 0 || batch_size > max_fa2_batch {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht3k_lloydv3_gfx11 requires 1 <= batch <= {max_fa2_batch}, got {batch_size}"
+                ),
+            ));
+        }
+        let max_fa2_ctx = self.fa2_gfx11_max_ctx();
+        if max_ctx_len == 0 || max_ctx_len > max_fa2_ctx {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht3k_lloydv3_gfx11 requires 1 <= max_ctx_len <= {max_fa2_ctx}, got {max_ctx_len}"
+                ),
+            ));
+        }
+        let need_qo = batch_size * n_heads * head_dim;
+        if q.numel() < need_qo || out.numel() < need_qo || positions.numel() < batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht3k_lloydv3_gfx11 capacity mismatch: \
+                     q={} out={} positions={} (need qo>={need_qo}, pos>={batch_size})",
+                    q.numel(),
+                    out.numel(),
+                    positions.numel()
+                ),
+            ));
+        }
+        if signs1.numel() < 256 || signs2.numel() < 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht3k_lloydv3_gfx11 requires 256-element sign tables, got \
+                     {} and {}",
+                    signs1.numel(),
+                    signs2.numel()
+                ),
+            ));
+        }
+        let module = "attention_q8_0_fa2_gqa_fwht3k_lloydv3_gfx11";
+        const PRECONVERT: &str = "attention_fa2_q_preconvert_fwht3_lloydv3_gfx11";
+        const POSTINVERT: &str = "attention_fa2_o_postinvert_lloyd_gfx11";
+        if !self.functions.contains_key(module)
+            || !self.functions.contains_key(PRECONVERT)
+            || !self.functions.contains_key(POSTINVERT)
+        {
+            let src = format!(
+                "#define HIPFIRE_FA2_KT 32\n{}",
+                kernels::ATTENTION_Q8_0_FA2_GQA_FWHT3K_LLOYDV3_GFX11_SRC
+            );
+            self.ensure_kernel(module, &src, module)?;
+            self.ensure_kernel(module, &src, PRECONVERT)?;
+            self.ensure_kernel(module, &src, POSTINVERT)?;
+        }
+        let need_q16_bytes = batch_size * n_heads * head_dim * 2;
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fa2_q16_scratch_bytes,
+            self.scratch.fa2_q16_scratch.is_some(),
+            need_q16_bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        let q16_ptr = self
+            .scratch
+            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
+        let grid_x = batch_size.div_ceil(8) as u32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q16_arg = q16_ptr;
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q16_arg as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+        );
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "attention",
+            "attention_q8_0_fa2_gqa_fwht3k_lloydv3_gfx11",
+            bytes,
+        );
+        self.launch_fa2_q_preconvert_gfx11(
+            PRECONVERT,
+            q.buf.as_ptr(),
+            q16_ptr,
+            signs1.buf.as_ptr(),
+            signs2.buf.as_ptr(),
+            batch_size,
+            1,
+        )?;
+        let result = self.launch_maybe_blob(
+            module,
+            [grid_x, 4, 1],
+            [128, 1, 1],
+            32768,
+            &mut params,
+            || {
+                pack_attention_q8_0_fa2_gqa_gfx11_kernarg(
+                    q16_arg, k_ptr, v_ptr, out_ptr, pos_ptr, nh, nkv, hd, bs, sc,
+                )
+            },
+        );
+        if result.is_ok() {
+            self.launch_fa2_o_postinvert_lloyd_gfx11(out, signs1, signs2, batch_size)?;
+        }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// F32 elements of caller-owned scratch that
     /// [`Self::attention_q8_0_fa2_gqa_split_gfx1201`] needs: one LSE plane
     /// (`n_splits * batch * n_heads`) plus normalized-O accumulators
