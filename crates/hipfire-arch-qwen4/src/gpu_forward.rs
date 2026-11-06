@@ -13633,6 +13633,13 @@ impl Qwen4GpuForward {
         })
     }
 
+    /// Trunk MoE layers that run balanced ownership on this rank (0 off EP or when none is).
+    pub(crate) fn ep_balanced_layer_count(&self) -> usize {
+        self.ep
+            .as_ref()
+            .map_or(0, |ep| ep.balanced.iter().flatten().count())
+    }
+
     /// Whether trunk layer `layer` runs balanced ownership on this rank.
     pub(crate) fn ep_layer_is_balanced(&self, layer: usize) -> bool {
         self.ep

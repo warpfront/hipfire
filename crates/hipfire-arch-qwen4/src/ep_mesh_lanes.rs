@@ -1009,13 +1009,14 @@ impl DraftReadPlan {
 }
 
 /// MoE layers whose expert-row gather the sealed ledger plans per row group. The trunk shard's FFN
-/// is a partial route with the all-reduce fused into the HC write: trunk layers run NO gather, so
-/// the plan holds zero target exchanges, exactly what each rank's gather tally measures (the
-/// head's gathers are tallied as head ones). Sealing `moe_count` aborted every drafted step on an
-/// `OpLedger` mismatch (planned 48, measured 0).
-fn planned_gather_layers(moe_count: usize, trunk_shard: bool) -> usize {
+/// is a partial route with the all-reduce fused into the HC write: its static trunk layers run NO
+/// gather, so only its balanced trunk layers (`balanced_trunk`, `HIPFIRE_EP_TRUNK_BALANCED_OWNERS=1`)
+/// gather (each slot's row from its producer, for the fixed `e % ranks` reduction partition), exactly
+/// what each rank's gather tally measures (the head's gathers are tallied as head ones). Sealing
+/// `moe_count` aborted every drafted step on an `OpLedger` mismatch (planned 48, measured 0).
+fn planned_gather_layers(moe_count: usize, trunk_shard: bool, balanced_trunk: usize) -> usize {
     if trunk_shard {
-        0
+        balanced_trunk
     } else {
         moe_count
     }
@@ -1922,12 +1923,16 @@ impl EpMeshLanes {
         let store = bundle
             .lanes()
             .ok_or_else(|| "Qwen4 lanes are not staged".to_string())?;
-        let moe_layers = bundle
+        let (moe_layers, balanced_trunk) = bundle
             .execution
             .as_ref()
-            .map(|forward| forward.moe_count())
+            .map(|forward| (forward.moe_count(), forward.ep_balanced_layer_count()))
             .ok_or_else(|| "Qwen4 forward resources are not attached".to_string())?;
-        let moe_layers = planned_gather_layers(moe_layers, bundle.config.trunk_shard.is_some());
+        let moe_layers = planned_gather_layers(
+            moe_layers,
+            bundle.config.trunk_shard.is_some(),
+            balanced_trunk,
+        );
         let moe_once = store.stage_policy().share(StageName::Moe) == StageShare::OnceAllRows;
         let world: Vec<RankOwnership> = (0..ranks).map(RankOwnership::ep).collect();
         let mut root = MeshRoot::new(

@@ -519,12 +519,17 @@ fn mesh_lane_ep_ranks_replay_identical_ordered_calls_and_the_ledger_merges() {
 
 /// The trunk shard's gatherless trunk: the sealed plan holds zero target exchanges, the verify
 /// crosses the row-gather barrier zero times, and the merged ledger agrees (production sealed 48
-/// against a measured 0 and aborted every drafted step).
+/// against a measured 0 and aborted every drafted step). Balanced trunk layers
+/// (`HIPFIRE_EP_TRUNK_BALANCED_OWNERS=1`) gather for the fixed reduction partition, so the plan
+/// holds one exchange per balanced layer there.
 #[test]
 fn mesh_lane_trunk_shard_plans_zero_target_exchanges() {
-    assert_eq!(planned_gather_layers(48, false), 48);
-    assert_eq!(planned_gather_layers(48, true), 0);
-    let mut root = root_with_moe_layers(false, planned_gather_layers(48, true));
+    assert_eq!(planned_gather_layers(48, false, 0), 48);
+    assert_eq!(planned_gather_layers(48, false, 48), 48);
+    assert_eq!(planned_gather_layers(48, true, 0), 0);
+    assert_eq!(planned_gather_layers(48, true, 48), 48);
+    assert_eq!(planned_gather_layers(48, true, 15), 15);
+    let mut root = root_with_moe_layers(false, planned_gather_layers(48, true, 0));
     let mut fan = fanout_with(
         vec![script(1, 0, &[10, 11, 12], &[10, 77, 5, 6])],
         |_, _| {},
