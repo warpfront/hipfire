@@ -2434,6 +2434,7 @@ fn qwen4_placement_inputs(
     ranks: usize,
     chunk_rows: usize,
     forward: Qwen4PlacementForward<'_>,
+    hc8: &[(String, u64, u64)],
 ) -> Result<
     (
         u64,
@@ -2454,6 +2455,9 @@ fn qwen4_placement_inputs(
     // the unit ranking walk, the whole-layer split and each rank's own fit check all read this
     // one `non_expert`, so the trunk's expert budget shrinks by exactly the owned bytes.
     let ep_mtp = qwen4_ep_mtp_resident(weights, bytes_of, ranks, mtp_kept)?;
+    // `HIPFIRE_EP_HC8_PLAN_CHARGE`: the replicated HC mixers the applied `.hc8` sidecar shrinks
+    // are charged at their E4M3 size, the bytes the rank actually keeps allocated.
+    let ep_hc8_saving = qwen4_ep_hc8_saving(weights, bytes_of, hc8, config, ranks, mtp_kept)?;
     let args = hipfire_arch_qwen4::expert_residency::PlacementInputsArgs {
         gpu,
         config,
@@ -2503,7 +2507,8 @@ fn qwen4_placement_inputs(
     Ok((
         inputs
             .non_expert
-            .saturating_add(ep_mtp.map_or(0, |mtp| mtp.bytes)),
+            .saturating_add(ep_mtp.map_or(0, |mtp| mtp.bytes))
+            .saturating_sub(ep_hc8_saving),
         inputs.layer_experts,
         inputs.reserve,
         inputs.mtp_bytes,
@@ -2526,6 +2531,33 @@ fn qwen4_mtp_kept(
             arch,
             usize::from(routed_experts),
         )
+}
+
+/// `HIPFIRE_EP_HC8_PLAN_CHARGE` (default on, exact `0` off): the device bytes the applied
+/// `.hc8` sidecar frees on one EP rank ([`hipfire_arch_qwen4::expert_residency::ep_hc8_plan_saving`]
+/// over `hc8`, the sidecar's `(name, BF16 bytes, E4M3 bytes)` per tensor, empty for no sidecar
+/// or a pipeline band), subtracted from the non-expert census next to the MTP charge. The
+/// plan-time split and every rank call this over the same manifest and sidecar, so the two
+/// agree byte for byte; `0` for a single device, no head attached, or the switch off.
+fn qwen4_ep_hc8_saving(
+    weights: &[hipfire_runtime::weight_manifest::WeightEntry],
+    bytes_of: &dyn Fn(&hipfire_runtime::weight_manifest::WeightEntry) -> Option<u64>,
+    hc8: &[(String, u64, u64)],
+    config: &hipfire_arch_qwen4::Qwen4Config,
+    ranks: usize,
+    mtp_kept: bool,
+) -> Result<u64, String> {
+    let trunk = hipfire_arch_qwen4::weights::trunk_shard::census_trunk(config, ranks);
+    hipfire_arch_qwen4::expert_residency::ep_hc8_plan_saving(
+        weights,
+        bytes_of,
+        hc8,
+        trunk.as_ref().map(|(dims, mode)| (dims, *mode)),
+        ranks,
+        hipfire_config::memory::ep_hc8_plan_charge(),
+        mtp_kept,
+    )
+    .map_err(|error| format!("qwen4: {error}"))
 }
 
 /// `HIPFIRE_EP_MTP_EXPERTS_RESIDENT` (default on, exact `0` off) for one load of `ranks`
@@ -3163,18 +3195,31 @@ pub fn qwen4_ep_vram_layers(
         shared.max_seq,
         scratch_mode,
     );
-    // `HIPFIRE_EP_MTP_EXPERTS_RESIDENT`: decided here exactly as `qwen4_placement_inputs` does
-    // (it charges these bytes into `non_expert` below, so every budget below shrinks by them).
-    let ep_mtp = qwen4_ep_mtp_resident(
+    // `HIPFIRE_EP_MTP_EXPERTS_RESIDENT` / `HIPFIRE_EP_HC8_PLAN_CHARGE`: decided here exactly as
+    // `qwen4_placement_inputs` does (it charges the MTP bytes into `non_expert` and subtracts the
+    // hc8 saving below, so every budget below shrinks / grows by them).
+    let mtp_kept = qwen4_mtp_kept(
+        shared.spec,
+        &gpu.arch,
+        shared.native_mtp,
+        !config.ffn.is_dense(),
+    );
+    let ep_mtp = qwen4_ep_mtp_resident(&manifest.weights, &bytes_of, ranks, mtp_kept)?;
+    // The sidecar every rank will resolve (silently: each rank logs the outcome itself).
+    let hc8_plan: Vec<(String, u64, u64)> = hipfire_arch_qwen4::hc8_sidecar::peek_hc8_sidecar(
+        hfq,
+        std::path::Path::new(&shared.path),
+        gpu.flags.qwen4_hc8_enabled(),
+        &config,
+    )?
+    .map_or_else(Vec::new, |sidecar| sidecar.plan_tensors());
+    let hc8_saving = qwen4_ep_hc8_saving(
         &manifest.weights,
         &bytes_of,
+        &hc8_plan,
+        &config,
         ranks,
-        qwen4_mtp_kept(
-            shared.spec,
-            &gpu.arch,
-            shared.native_mtp,
-            !config.ffn.is_dense(),
-        ),
+        mtp_kept,
     )?;
     // The ordinary (non-decoupled) placement inputs at one prefill chunk, with
     // the AR-lane store that chunk commits: the per-rank non-expert and
@@ -3221,6 +3266,7 @@ pub fn qwen4_ep_vram_layers(
             ranks,
             chunk,
             qwen4_ep_ordinary_forward(&config, scratch_mode, chunk)?,
+            &hc8_plan,
         )?;
         // A bound trunk overlay (Q8F16 replaces six-bit trunk tensors with
         // owned, larger copies) adds resident bytes after placement runs: every
@@ -3411,6 +3457,7 @@ pub fn qwen4_ep_vram_layers(
             ranks,
             chunk_rows,
             qwen4_ep_reserve_forward_charge(forward, shadows_in_donors),
+            &hc8_plan,
         )?;
         qwen4_shared_charges(layer_experts, false, false, 0)
             .and_then(|charges| charges.reserve(reserve.bytes()))
@@ -3695,6 +3742,13 @@ pub fn qwen4_ep_vram_layers(
         }
     }
     split.mtp_experts = ep_mtp;
+    if hc8_saving > 0 {
+        eprintln!(
+            "qwen4 EP plan: the hc8 sidecar's HC mixers are charged at their E4M3 size: -{} MiB per rank in the non-expert census ({} sidecar tensors; HIPFIRE_EP_HC8_PLAN_CHARGE=0 charges BF16)",
+            hc8_saving >> 20,
+            hc8_plan.len()
+        );
+    }
     Ok(split)
 }
 
@@ -6963,6 +7017,13 @@ fn load_qwen4_rank_unscoped(
     let preallocation_mem_available = rdna_compute::kv_slots::mem_available_bytes();
     let preallocation_ttm_pool = residency::ttm_pool_estimate_on(&*ctx.gpu);
     let preallocation_gtt = residency::gtt_budget();
+    // The `.hc8` sidecar's per-tensor sizes, resolved once above (`hc8_sidecar`): the expert-
+    // parallel census charges the HC mixers at their E4M3 size (`qwen4_ep_hc8_saving`). A
+    // pipeline band (and an EP-less load, whose saving is 0) charges nothing.
+    let hc8_plan: Vec<(String, u64, u64)> = match (&hc8_sidecar, band) {
+        (Some(sidecar), None) => sidecar.plan_tensors(),
+        _ => Vec::new(),
+    };
     // Exactly one owner of the planning inputs, including explicit-layers and
     // whole-first resident paths that previously never invoked `auto`.
     let placement_inputs = if band.is_none() {
@@ -6984,6 +7045,7 @@ fn load_qwen4_rank_unscoped(
             ep_ranks,
             placement_chunk,
             placement_forward,
+            &hc8_plan,
         )?)
     } else {
         None
@@ -7000,6 +7062,20 @@ fn load_qwen4_rank_unscoped(
         )?
     } else {
         None
+    };
+    // `HIPFIRE_EP_HC8_PLAN_CHARGE` for this rank: the saving `qwen4_placement_inputs` just
+    // subtracted (same function, manifest and sidecar sizes as the plan-time split).
+    let ep_hc8_saving = if band.is_none() {
+        qwen4_ep_hc8_saving(
+            &manifest.weights,
+            &bytes_of,
+            &hc8_plan,
+            &config,
+            ep_ranks,
+            qwen4_mtp_kept(ctx.spec, &ctx.gpu.arch, placement_native_mtp, routed_experts),
+        )?
+    } else {
+        0
     };
     // The bound trunk overlay's net resident bytes (owned Q8F16 copies larger
     // than the MQ6 tensors they replace) land after placement: charge them as
@@ -7130,6 +7206,7 @@ fn load_qwen4_rank_unscoped(
                         shadows_borrowed: decode_share_shadow_bytes,
                     },
                 ),
+                &hc8_plan,
             )
             .ok(),
             _ => None,
@@ -8438,6 +8515,7 @@ fn load_qwen4_rank_unscoped(
                 reserve,
                 applied_layers,
                 ep_mtp.map_or(0, |mtp| mtp.bytes),
+                ep_hc8_saving,
             )
         );
         if let Some(mtp) = &ep_mtp {
@@ -9152,6 +9230,26 @@ fn load_qwen4_rank_unscoped(
         let detail = error.to_string();
         let _ = bundle.free_gpu(ctx.gpu);
         return Err(format!("qwen4: forward setup failed: {detail}"));
+    }
+    // `HIPFIRE_EP_HC8_PLAN_CHARGE`: the placement above charged the sidecar's HC mixers at
+    // their E4M3 size. Compare what the forward attach actually replaced; a refused or partly
+    // skipped sidecar leaves BF16 bytes the plan did not charge. Not a failure: the placement's
+    // safety margin covers a few tensors.
+    if ep_hc8_saving > 0 {
+        let applied = bundle.hc8_applied().map_or(0, |applied| {
+            applied.before_bytes.saturating_sub(applied.after_bytes) as u64
+        });
+        if applied < ep_hc8_saving {
+            eprintln!(
+                "qwen4 EP rank {}: WARNING: the plan charged -{} B ({:.1} MiB) for the hc8 sidecar but only -{} B ({:.1} MiB) was applied; the BF16 HC mixers it left cost {:.1} MiB of VRAM the placement did not budget (HIPFIRE_EP_HC8_PLAN_CHARGE=0 charges BF16)",
+                ep.map_or(0, |placement| placement.rank),
+                ep_hc8_saving,
+                ep_hc8_saving as f64 / MIB as f64,
+                applied,
+                applied as f64 / MIB as f64,
+                (ep_hc8_saving - applied) as f64 / MIB as f64
+            );
+        }
     }
     // `apply_pending_trunk_overlay` writes this marker only on Applied. A
     // pre-existing marker cannot distinguish Applied from Refused, so that

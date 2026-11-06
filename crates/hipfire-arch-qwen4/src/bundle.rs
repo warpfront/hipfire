@@ -251,6 +251,8 @@ pub struct Qwen4Bundle {
     /// Accepted `.hc8` sidecar (`attach_hc8_sidecar`), consumed by
     /// `attach_forward`; `None` = none pending.
     pub(crate) hc8_sidecar: Option<crate::hc8_sidecar::Qwen4Hc8Sidecar>,
+    /// The outcome of applying `hc8_sidecar` (`None` until applied, or when refused).
+    pub(crate) hc8_applied: Option<crate::weights::Hc8Applied>,
     pub(crate) npu_model_index: Option<Result<String, String>>,
     /// Actually reserved D1 CPU-owned expert window rows (logical window rows; 0 =
     /// none). Stored only by the loader after the real prewarm lands (see
@@ -977,6 +979,7 @@ impl Qwen4Bundle {
             ep_seal: None,
             trunk_overlay: None,
             hc8_sidecar: None,
+            hc8_applied: None,
             npu_model_index: None,
             cpu_d1_storage_rows: 0,
         })
@@ -1184,6 +1187,13 @@ impl Qwen4Bundle {
         Ok(())
     }
 
+    /// What the pending `.hc8` sidecar replaced once `attach_forward` applied it (`None`:
+    /// none attached, or it was refused: BF16 weights run). The expert-parallel loader checks
+    /// it against the saving the plan charged.
+    pub fn hc8_applied(&self) -> Option<crate::weights::Hc8Applied> {
+        self.hc8_applied
+    }
+
     /// Apply the pending hc8 sidecar, if any.  A refusal (payload digest,
     /// weight pre-check) is logged and leaves the BF16 weights; a failure
     /// after replacement started is an error.
@@ -1214,6 +1224,7 @@ impl Qwen4Bundle {
             }
             crate::weights::Hc8Outcome::Applied(applied) => {
                 eprintln!("{}", crate::hc8_sidecar::hc8_applied_line(&applied));
+                self.hc8_applied = Some(applied);
             }
         }
         Ok(())

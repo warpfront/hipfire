@@ -3331,6 +3331,88 @@ pub fn ep_mtp_experts_line(resident: Option<&EpMtpResident>, why_host: &str) -> 
     }
 }
 
+/// Device bytes the applied `.hc8` sidecar saves on ONE rank of an expert-parallel load, for
+/// the plan and every rank's fit census (`HIPFIRE_EP_HC8_PLAN_CHARGE`, default on). The BF16 HC
+/// mixers are replicated, charged in full in the non-expert census; the sidecar replaces each
+/// with its E4M3 payload, so the census subtracts `base - payload` per tensor.
+///
+/// `sidecar` is `(name, base BF16 bytes, E4M3 payload bytes)` per sidecar tensor
+/// (`Qwen4Hc8Sidecar::plan_tensors`). `0` (today's BF16 charge) unless `enabled`, `ranks >= 2`
+/// (the caller passes an empty `sidecar` for a pipeline band) and the native MTP head is
+/// attached (`head_kept`: every sidecar tensor, the head's own included, is loaded on every
+/// rank). A tensor counts only when it is exactly what the runtime would replace
+/// (`weights::plan_hc8_sidecar`'s checks) AND what `non_expert` charged for it on this rank:
+/// one device-resident, non-tied manifest entry of that name, BF16 `[m, k]`, whose census
+/// bytes (`bytes_of`, cut by the trunk shard when `trunk` is given) equal the sidecar's base
+/// bytes and `m*k*2`, with the payload `hc8_payload_bytes(m, k)`. A tensor the shard cuts
+/// (its rank share differs from the full bytes), or any mismatch, saves 0 rather than a
+/// guess, so the sum never exceeds what an applied sidecar frees: it is NOT the upper bound
+/// `hc8_sidecar_saved_bytes`, which also counts tensors a load leaves out.
+pub fn ep_hc8_plan_saving(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    sidecar: &[(String, u64, u64)],
+    trunk: Option<(
+        &crate::weights::trunk_shard::TrunkDims,
+        crate::weights::trunk_shard::QsaMode,
+    )>,
+    ranks: usize,
+    enabled: bool,
+    head_kept: bool,
+) -> Result<u64, String> {
+    if !enabled || !head_kept || ranks < 2 || sidecar.is_empty() {
+        return Ok(0);
+    }
+    let mut by_name = std::collections::HashMap::<&str, Vec<&WeightEntry>>::new();
+    for entry in weights {
+        by_name.entry(entry.name.as_str()).or_default().push(entry);
+    }
+    let mut saved = 0u64;
+    for (name, base, payload) in sidecar {
+        let [entry] = by_name.get(name.as_str()).map_or(&[][..], Vec::as_slice) else {
+            continue;
+        };
+        if entry.residency.is_external()
+            || entry.residency == WeightResidency::HostMapped
+            || matches!(entry.policy, ShardPolicy::Tied { .. })
+            || entry.dtype != rdna_compute::DType::BF16
+        {
+            continue;
+        }
+        let &[m, k] = entry.logical_shape.as_slice() else {
+            continue;
+        };
+        let census = bytes_of(entry).ok_or_else(|| format!("no payload size for '{name}'"))?;
+        let bf16 = (m as u64).checked_mul(k as u64).and_then(|n| n.checked_mul(2));
+        if Some(census) != bf16
+            || census != *base
+            || rdna_compute::hc8_weight::hc8_payload_bytes(m, k).map(|n| n as u64) != Some(*payload)
+        {
+            continue;
+        }
+        if let Some((dims, mode)) = trunk {
+            let share = crate::weights::trunk_shard::trunk_share_bytes(
+                dims,
+                mode,
+                &entry.name,
+                &entry.logical_shape,
+                census,
+                ranks,
+            )?;
+            if share != census {
+                continue;
+            }
+        }
+        let Some(delta) = base.checked_sub(*payload) else {
+            continue;
+        };
+        saved = saved
+            .checked_add(delta)
+            .ok_or_else(|| "hc8 saving byte census overflows".to_string())?;
+    }
+    Ok(saved)
+}
+
 /// Mark the replicated token embedding table ([`crate::weights::QWEN4_EMBED`])
 /// [`WeightResidency::HostMapped`]: an expert-parallel rank pins its own copy in
 /// host RAM and the embedding kernels read the rows they gather (one row per
@@ -3900,15 +3982,18 @@ pub fn ep_fit_rank_line(
         reserve_bytes,
         applied_layers,
         0,
+        0,
     )
 }
 
 /// [`ep_fit_rank_line`] for a load whose `non_expert_bytes` already carries
 /// `mtp_resident_bytes`, the rank's owned slice of the MTP head's routed experts kept
-/// VRAM-resident ([`ep_mtp_resident_decision`]): the line names the charge beside the trunk and
-/// counts only the trunk's MoE layers in the split (the MTP layer is no longer one of the
-/// layers a split leaves in host RAM), so no byte is counted twice in the headroom. `0` is
-/// exactly [`ep_fit_rank_line`].
+/// VRAM-resident ([`ep_mtp_resident_decision`]), and is already net of `hc8_saved_bytes`, the
+/// device bytes the applied `.hc8` sidecar saves on this rank ([`ep_hc8_plan_saving`]): the
+/// line names both charges beside the trunk and, with the MTP charge, counts only the trunk's
+/// MoE layers in the split (the MTP layer is no longer one of the layers a split leaves in
+/// host RAM), so no byte is counted twice in the headroom. `0, 0` is exactly
+/// [`ep_fit_rank_line`].
 pub fn ep_fit_rank_line_mtp(
     config: &Qwen4Config,
     rank: usize,
@@ -3919,6 +4004,7 @@ pub fn ep_fit_rank_line_mtp(
     reserve_bytes: u64,
     applied_layers: usize,
     mtp_resident_bytes: u64,
+    hc8_saved_bytes: u64,
 ) -> String {
     let moe_layers = if mtp_resident_bytes > 0 {
         config.num_hidden_layers
@@ -3940,13 +4026,23 @@ pub fn ep_fit_rank_line_mtp(
         - i128::from(resident_bytes)
         - i128::from(reserve_bytes);
     let gib = |bytes: u64| bytes as f64 / GIB;
-    let mtp_note = if mtp_resident_bytes > 0 {
-        format!(
-            " (incl. {:.1} MiB MTP head experts, this rank's owned slice VRAM-resident)",
+    let mut charges = Vec::new();
+    if mtp_resident_bytes > 0 {
+        charges.push(format!(
+            "incl. {:.1} MiB MTP head experts, this rank's owned slice VRAM-resident",
             mtp_resident_bytes as f64 / (1u64 << 20) as f64
-        )
-    } else {
+        ));
+    }
+    if hc8_saved_bytes > 0 {
+        charges.push(format!(
+            "-{} MiB hc8 sidecar applied",
+            hc8_saved_bytes >> 20
+        ));
+    }
+    let mtp_note = if charges.is_empty() {
         String::new()
+    } else {
+        format!(" ({})", charges.join("; "))
     };
     format!(
         "qwen4 EP rank {rank}/{ranks}: free {:.2} GiB | trunk {:.2} GiB{mtp_note} | experts {:.2} GiB/rank \
@@ -4853,10 +4949,10 @@ mod tests {
         let (free, trunk, layer, reserve) = (30u64 << 30, 6u64 << 30, 512u64 << 20, 4u64 << 30);
         let mtp = layer;
         let off = ep_fit_rank_line(&config, 0, 2, free, trunk, layer, reserve, 30);
-        let on = ep_fit_rank_line_mtp(&config, 0, 2, free, trunk + mtp, layer, reserve, 30, mtp);
+        let on = ep_fit_rank_line_mtp(&config, 0, 2, free, trunk + mtp, layer, reserve, 30, mtp, 0);
         assert_eq!(
             off,
-            ep_fit_rank_line_mtp(&config, 0, 2, free, trunk, layer, reserve, 30, 0)
+            ep_fit_rank_line_mtp(&config, 0, 2, free, trunk, layer, reserve, 30, 0, 0)
         );
         assert!(off.contains("resident expert layers 30 of 49"), "{off}");
         assert!(on.contains("resident expert layers 30 of 48"), "{on}");
@@ -4865,6 +4961,133 @@ mod tests {
         // headroom is the MTP-less one less exactly the owned bytes.
         assert!(off.ends_with("headroom +5.00 GiB"), "{off}");
         assert!(on.ends_with("headroom +4.50 GiB"), "{on}");
+    }
+
+    const HC_M: usize = 32;
+    const HC_K: usize = 64;
+
+    fn hc_entry(name: &str, dtype: DType) -> WeightEntry {
+        WeightEntry::model(name, vec![HC_M, HC_K], dtype, ShardPolicy::Replicate)
+    }
+
+    fn hc_names() -> [&'static str; 3] {
+        [
+            "model.language_model.layers.0.hyper_connection.input_mix_weight_down.weight",
+            "model.language_model.layers.0.hyper_connection.input_mix_weight_up.weight",
+            "mtp.layers.0.hyper_connection.input_mix_weight_up.weight",
+        ]
+    }
+
+    fn hc_weights() -> Vec<WeightEntry> {
+        let mut weights: Vec<WeightEntry> = hc_names()
+            .into_iter()
+            .map(|name| hc_entry(name, DType::BF16))
+            .collect();
+        weights.push(entry("model.language_model.layers.0.mlp.experts.down_proj", 0));
+        weights
+    }
+
+    fn hc_bf16(entry: &WeightEntry) -> Option<u64> {
+        Some(entry.logical_shape.iter().product::<usize>() as u64 * 2)
+    }
+
+    fn hc_sidecar() -> Vec<(String, u64, u64)> {
+        let base = (HC_M * HC_K * 2) as u64;
+        let payload = rdna_compute::hc8_weight::hc8_payload_bytes(HC_M, HC_K).unwrap() as u64;
+        hc_names()
+            .into_iter()
+            .map(|name| (name.to_string(), base, payload))
+            .collect()
+    }
+
+    #[test]
+    fn ep_hc8_plan_saving_is_the_exact_charged_bf16_minus_e4m3_bytes() {
+        let weights = hc_weights();
+        let sidecar = hc_sidecar();
+        let each = sidecar[0].1 - sidecar[0].2;
+        assert!(each > 0);
+        let saving = |weights: &[WeightEntry], sidecar: &[(String, u64, u64)]| {
+            ep_hc8_plan_saving(weights, hc_bf16, sidecar, None, 2, true, true).unwrap()
+        };
+        // Every sidecar tensor is charged BF16 on every rank (the head's included).
+        assert_eq!(saving(&weights, &sidecar), 3 * each);
+        // The trunk shard's census agrees: the HC mixers are replicated (no cut role).
+        let config = crate::config::compact_test_config();
+        let (dims, mode) =
+            crate::weights::trunk_shard::census_trunk_for(true, &config, 2).expect("2-rank shard");
+        assert_eq!(
+            ep_hc8_plan_saving(&weights, hc_bf16, &sidecar, Some((&dims, mode)), 2, true, true),
+            Ok(3 * each)
+        );
+        // A sidecar tensor the manifest does not declare is skipped at apply time: not saved.
+        assert_eq!(saving(&weights[1..], &sidecar), 2 * each);
+        // Not device-resident BF16 as charged (host-mapped, another dtype, another census size
+        // than the sidecar binds): the runtime would not replace it, so it saves nothing.
+        let mut host = hc_weights();
+        host[0].residency = WeightResidency::HostMapped;
+        assert_eq!(saving(&host, &sidecar), 2 * each);
+        let mut f16 = hc_weights();
+        f16[1] = hc_entry(hc_names()[1], DType::F16);
+        assert_eq!(saving(&f16, &sidecar), 2 * each);
+        let mut wrong = sidecar.clone();
+        wrong[2].1 += 2;
+        assert_eq!(saving(&weights, &wrong), 2 * each);
+        let mut bad_payload = sidecar.clone();
+        bad_payload[0].2 += 1;
+        assert_eq!(saving(&weights, &bad_payload), 2 * each);
+    }
+
+    #[test]
+    fn ep_hc8_plan_saving_is_zero_without_its_conditions() {
+        let (weights, sidecar) = (hc_weights(), hc_sidecar());
+        let saving = |ranks, enabled, head_kept, sidecar: &[(String, u64, u64)]| {
+            ep_hc8_plan_saving(&weights, hc_bf16, sidecar, None, ranks, enabled, head_kept)
+        };
+        assert!(saving(2, true, true, &sidecar).unwrap() > 0);
+        // Kill switch, single device, no head attached (a head-less load does not load every
+        // sidecar tensor), no sidecar (or a pipeline band's empty one).
+        assert_eq!(saving(2, false, true, &sidecar), Ok(0));
+        assert_eq!(saving(1, true, true, &sidecar), Ok(0));
+        assert_eq!(saving(2, true, false, &sidecar), Ok(0));
+        assert_eq!(saving(2, true, true, &[]), Ok(0));
+        // A missing payload size is an error, never a guess.
+        assert!(ep_hc8_plan_saving(&weights, |_| None, &sidecar, None, 2, true, true).is_err());
+    }
+
+    #[test]
+    fn ep_hc8_saving_grows_the_unit_budget_by_exactly_the_saved_bytes_and_shows_in_the_line() {
+        use crate::expert_ep_units::ep_unit_rank_budgets;
+        let (weights, sidecar) = (hc_weights(), hc_sidecar());
+        let saved = ep_hc8_plan_saving(&weights, hc_bf16, &sidecar, None, 2, true, true).unwrap();
+        // The loader subtracts the saving from the BF16 non-expert census the walk reads.
+        let (free, non_expert, reserve) = (20u64 << 30, 5u64 << 30, 4u64 << 30);
+        let bf16 = ep_unit_rank_budgets(&[free; 2], non_expert, reserve);
+        let e4m3 = ep_unit_rank_budgets(&[free; 2], non_expert - saved, reserve);
+        for rank in 0..2 {
+            assert_eq!(e4m3[rank] - bf16[rank], saved);
+        }
+        let config = crate::config::compact_test_config();
+        let layer = 512u64 << 20;
+        let line = ep_fit_rank_line_mtp(
+            &config,
+            0,
+            2,
+            free,
+            non_expert - (621 << 20),
+            layer,
+            reserve,
+            20,
+            0,
+            621 << 20,
+        );
+        assert!(line.contains("(-621 MiB hc8 sidecar applied)"), "{line}");
+        let both = ep_fit_rank_line_mtp(&config, 0, 2, free, non_expert, layer, reserve, 20, layer, 621 << 20);
+        assert!(
+            both.contains(
+                "(incl. 512.0 MiB MTP head experts, this rank's owned slice VRAM-resident; -621 MiB hc8 sidecar applied)"
+            ),
+            "{both}"
+        );
     }
 
     #[test]

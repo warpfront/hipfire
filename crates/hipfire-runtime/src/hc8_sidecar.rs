@@ -358,6 +358,18 @@ impl BoundHc8Sidecar {
         self.payload_bytes() as i64 - self.replaced_bytes() as i64
     }
 
+    /// Per sidecar tensor `(name, base BF16 bytes it replaces, E4M3 payload bytes)`, in
+    /// manifest order: what a load that applies every tensor saves tensor by tensor
+    /// (`base - payload`).
+    pub fn tensor_sizes(&self) -> Vec<(String, u64, u64)> {
+        self.manifest
+            .tensors
+            .iter()
+            .zip(self.sidecar.tensors())
+            .map(|(entry, info)| (entry.name.clone(), entry.base_data_size, info.data_size as u64))
+            .collect()
+    }
+
     /// Read every payload with positional I/O and verify its sha256 against the
     /// manifest. All-or-nothing: the first mismatch names its tensor.
     pub fn read_verified(&self) -> Result<Vec<Hc8Payload>, String> {
