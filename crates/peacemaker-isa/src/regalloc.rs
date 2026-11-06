@@ -74,6 +74,9 @@ pub struct Recording {
     pub stream: Vec<StreamItem>,
     pub hashes: Vec<u64>,
     pub windows: Vec<Vec<Step>>,
+    /// Every submitted instruction in submission order (the program the emitter wrote, labels in place), as it
+    /// reached `Builder::emit` after the pass's renaming.
+    pub submitted: Vec<StreamItem>,
 }
 
 /// What an emitter's build function does with the VGPR map.
@@ -81,15 +84,17 @@ pub struct Recording {
 pub enum Pass<'a> {
     /// First pass: build with the emitter's own layout and record the submission stream.
     Record,
-    /// Second pass: build with the compacted layout.
+    /// Intermediate pass: rename by the (pre-scheduling) map, schedule afresh and record the resulting stream.
+    Spread(&'a VgprMap),
+    /// Last pass: build with the compacted layout.
     Apply(&'a VgprMap),
 }
 impl Pass<'_> {
-    /// The VGPR count of the compacted plan (`None` on the recording pass).
+    /// The VGPR count of the renamed plan (`None` when the emitter keeps its own layout).
     pub fn vgprs(&self) -> Option<u16> {
         match self {
             Pass::Record => None,
-            Pass::Apply(m) => Some(m.vgprs),
+            Pass::Spread(m) | Pass::Apply(m) => (m.vgprs != 0).then_some(m.vgprs),
         }
     }
 }
@@ -107,14 +112,29 @@ pub struct Stats {
     pub groups: usize,
     pub pinned_webs: usize,
     pub order: &'static str,
+    /// VGPRs of the renamed plan the scheduler saw (0: the emitter's own layout).
+    pub pre_vgprs: u16,
+    /// Independent VOPD candidate pairs the bank assignment looked at, and how many it made legal.
+    pub cand_edges: usize,
+    pub cand_ok: usize,
+    /// Register groups that changed bank.
+    pub rotated: usize,
+    /// Covering definitions tied to the register of the web they cover.
+    pub ties: usize,
+    /// The same in the compaction of the scheduled program (spread renamings).
+    pub ties_post: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Inner {
     /// Per submitted instruction: `(hash of its original text, [(old unit, new unit)] sorted by old unit)`.
     per_insn: Vec<(u64, Box<[(u8, u8)]>)>,
-    /// The VALU window schedules of pass 1, replayed by pass 2.
+    /// The VALU window schedules of pass 1, replayed by pass 2 (empty when `replay` is off).
     windows: Vec<Vec<Step>>,
+    /// Pass 2 replays the recorded window schedules; off for the renaming that precedes scheduling.
+    replay: bool,
+    /// The covering definitions of the renaming (spread only: the compaction of the scheduled program inherits them).
+    covers: Vec<Cover>,
 }
 /// The renaming of one kernel, keyed by submission id (the n-th `Builder::emit` call), not by final pc.
 #[derive(Clone, Debug)]
@@ -221,6 +241,10 @@ impl VgprMap {
     /// Number of VALU window schedules the map replays.
     pub fn windows(&self) -> usize {
         self.inner.windows.len()
+    }
+    /// Pass 2 replays the recorded window schedules (off for the renaming that precedes scheduling).
+    pub fn replays(&self) -> bool {
+        self.inner.replay
     }
     /// The schedule of the `n`-th non-empty VALU window, which must hold `len` instructions.
     pub(crate) fn window(&self, n: usize, len: usize) -> Result<&[Step], String> {
@@ -333,16 +357,16 @@ impl VgprMap {
 
 // ------------------------------------------------------------------------------------------------ operands
 
-const UNITS: usize = 256;
+pub(crate) const UNITS: usize = 256;
 /// The reaching value of a register no instruction wrote and the dispatch did not define (garbage).
-const UNDEF: u32 = u32::MAX;
+pub(crate) const UNDEF: u32 = u32::MAX;
 
 /// Operand units of one instruction.
-struct Op {
+pub(crate) struct Op {
     /// Units written, in operand order.
-    defs: Vec<u8>,
+    pub(crate) defs: Vec<u8>,
     /// Units read: the declared sources plus, for a def that is not a plain full-register write, the def itself.
-    uses: Vec<u8>,
+    pub(crate) uses: Vec<u8>,
     /// `uses[k]` is also a def of this instruction (the def continues the web it updates).
     /// Multi-register operand ranges of the text: `(base, len)`.
     ranges: Vec<(u8, u8)>,
@@ -424,7 +448,7 @@ fn granule(base: u8, len: u8) -> Option<u8> {
         .find(|&g| g >= len && base / g == (base + len - 1) / g)
 }
 
-fn operands(insn: &Instruction, exec_written: bool) -> Result<Op, String> {
+pub(crate) fn operands(insn: &Instruction, exec_written: bool) -> Result<Op, String> {
     let mut defs = vec![];
     let mut uses = vec![];
     let mut declared = vec![];
@@ -487,17 +511,17 @@ fn operands(insn: &Instruction, exec_written: bool) -> Result<Op, String> {
 
 // ------------------------------------------------------------------------------------------------ CFG and reaching definitions
 
-enum Item {
+pub(crate) enum Item {
     Label(String),
     Insn(usize),
 }
-struct Block {
-    first: usize,
-    last: usize,
-    succ: Vec<usize>,
+pub(crate) struct Block {
+    pub(crate) first: usize,
+    pub(crate) last: usize,
+    pub(crate) succ: Vec<usize>,
 }
 
-fn build_cfg(items: &[Item], insns: &[&Instruction]) -> Result<Vec<Block>, String> {
+pub(crate) fn build_cfg(items: &[Item], insns: &[&Instruction]) -> Result<Vec<Block>, String> {
     let terminator = |it: &Item| match it {
         Item::Insn(i) => {
             let m = insns[*i].mnemonic();
@@ -579,15 +603,32 @@ fn merge(into: &mut Vec<u32>, from: &[u32]) -> bool {
 }
 
 /// Reaching definitions per used unit of every reachable instruction.
-struct Reaching {
+pub(crate) struct Reaching {
     /// `use_rd[insn][k]`: the dense def ids reaching `ops[insn].uses[k]` (sorted; ids below `UNITS` are the dispatch-defined entry values, `UNDEF` garbage).
-    use_rd: Vec<Vec<Vec<u32>>>,
+    pub(crate) use_rd: Vec<Vec<Vec<u32>>>,
     /// `def_id[insn][j]`: the dense id of `ops[insn].defs[j]`.
-    def_id: Vec<Vec<u32>>,
-    reachable: Vec<bool>,
+    pub(crate) def_id: Vec<Vec<u32>>,
+    pub(crate) reachable: Vec<bool>,
+    /// `use_rd` before the correlated-branch refinement (`reaching_refined`); empty otherwise.
+    pub(crate) base_use_rd: Vec<Vec<Vec<u32>>>,
 }
 
-fn reaching(items: &[Item], blocks: &[Block], ops: &[Op], live_in: &[bool]) -> Reaching {
+/// Reaching definitions with the correlated branches of [`crate::corr`] taken into account.
+pub(crate) fn reaching_refined(
+    items: &[Item],
+    blocks: &[Block],
+    insns: &[&Instruction],
+    ops: &[Op],
+    live_in: &[bool],
+) -> Reaching {
+    let mut rd = reaching(items, blocks, ops, live_in);
+    let base = rd.use_rd.clone();
+    crate::corr::refine(items, blocks, insns, ops, live_in, &mut rd);
+    rd.base_use_rd = base;
+    rd
+}
+
+pub(crate) fn reaching(items: &[Item], blocks: &[Block], ops: &[Op], live_in: &[bool]) -> Reaching {
     let mut next = UNITS as u32;
     let mut def_id = Vec::with_capacity(ops.len());
     for op in ops {
@@ -620,6 +661,7 @@ fn reaching(items: &[Item], blocks: &[Block], ops: &[Op], live_in: &[bool]) -> R
             use_rd: vec![],
             def_id,
             reachable: vec![],
+            base_use_rd: vec![],
         };
     }
     ins[0] = Some(
@@ -671,6 +713,7 @@ fn reaching(items: &[Item], blocks: &[Block], ops: &[Op], live_in: &[bool]) -> R
         use_rd,
         def_id,
         reachable,
+        base_use_rd: vec![],
     }
 }
 
@@ -767,11 +810,89 @@ fn writes_exec(i: &Instruction) -> bool {
             .is_some_and(|(_, rest)| rest.trim_start().starts_with("exec"))
 }
 
+/// Instructions that may run with a partial EXEC (reachable from a write of it) do not write whole registers.
+pub(crate) fn exec_dirty_of(items: &[Item], blocks: &[Block], insns: &[&Instruction]) -> Vec<bool> {
+    let mut exec_dirty = vec![false; insns.len()];
+    let mut dirty_in = vec![false; blocks.len()];
+    loop {
+        let mut changed = false;
+        for (b, blk) in blocks.iter().enumerate() {
+            let mut dirty = dirty_in[b];
+            for item in &items[blk.first..=blk.last] {
+                if let Item::Insn(i) = item {
+                    dirty |= writes_exec(insns[*i]);
+                    exec_dirty[*i] |= dirty;
+                }
+            }
+            if dirty {
+                for &s in &blk.succ {
+                    if !dirty_in[s] {
+                        dirty_in[s] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    exec_dirty
+}
+
+/// How the allocator places webs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// Pack the scheduled program: every web keeps its bank (`unit mod 4`), first-fit.
+    Compact,
+    /// Rename the program in submission order, before it is scheduled, so the scheduler sees only true
+    /// dependences and VOPD-legal banks: webs may change bank (single-register webs freely), reuse goes to the
+    /// register freed longest ago, and the banks may be picked to make independent VOPD candidates legal.
+    Spread(Spread),
+}
+
+/// The choices of the [`Mode::Spread`] renaming.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spread {
+    /// Pick the banks that make the independent same-op VOPD candidates legal (never past the register count the
+    /// original banks reach).
+    pub banks: bool,
+    /// Keep every web defined inside a VALU window off the registers of all the webs the window touches, so the
+    /// scheduler meets no false dependence there (as far as 256 registers allow).
+    pub windows: bool,
+}
+
 /// Compact the VGPRs of the recorded pass-1 stream.
 ///
 /// `live_in` lists the registers defined by the dispatch (their identity is kept); `v0` (the workitem id) is
 /// always live-in.
 pub fn vgpr_compaction(rec: &Recording, live_in: &[RegRef]) -> Result<VgprMap, String> {
+    allocate(rec, live_in, Mode::Compact, None)
+}
+
+/// A definition that covers a read for definedness only (see `allocate`): the submissions of the definition and of
+/// the read, and the unit the read names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Cover {
+    def_sub: usize,
+    use_sub: usize,
+    unit: u8,
+}
+
+/// `inherit`: the renaming this program was recorded after; its covering definitions bind here too (the scheduled
+/// program no longer shows the control correlation that made them dead, but the definedness they provide must
+/// survive).
+pub(crate) fn allocate(
+    rec: &Recording,
+    live_in: &[RegRef],
+    mode: Mode,
+    inherit: Option<&VgprMap>,
+) -> Result<VgprMap, String> {
+    let spread = matches!(mode, Mode::Spread(_));
+    let spread_opts = match mode {
+        Mode::Spread(o) => Some(o),
+        Mode::Compact => None,
+    };
     let mut insns: Vec<&Instruction> = vec![];
     let mut subs_of: Vec<[usize; 2]> = vec![];
     let mut items: Vec<Item> = vec![];
@@ -786,34 +907,7 @@ pub fn vgpr_compaction(rec: &Recording, live_in: &[RegRef]) -> Result<VgprMap, S
         }
     }
     let blocks = build_cfg(&items, &insns)?;
-    // Instructions that may run with a partial EXEC (reachable from a write of it) do not write whole registers.
-    let mut exec_dirty = vec![false; insns.len()];
-    {
-        let mut dirty_in = vec![false; blocks.len()];
-        loop {
-            let mut changed = false;
-            for (b, blk) in blocks.iter().enumerate() {
-                let mut dirty = dirty_in[b];
-                for item in &items[blk.first..=blk.last] {
-                    if let Item::Insn(i) = item {
-                        dirty |= writes_exec(insns[*i]);
-                        exec_dirty[*i] |= dirty;
-                    }
-                }
-                if dirty {
-                    for &s in &blk.succ {
-                        if !dirty_in[s] {
-                            dirty_in[s] = true;
-                            changed = true;
-                        }
-                    }
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-    }
+    let exec_dirty = exec_dirty_of(&items, &blocks, &insns);
     let ops: Vec<Op> = insns
         .iter()
         .enumerate()
@@ -826,7 +920,7 @@ pub fn vgpr_compaction(rec: &Recording, live_in: &[RegRef]) -> Result<VgprMap, S
             live_units[(r.base + k) as usize] = true;
         }
     }
-    let rd = reaching(&items, &blocks, &ops, &live_units);
+    let rd = reaching_refined(&items, &blocks, &insns, &ops, &live_units);
 
     // Webs: def-use connected components.
     let n_ids = UNITS + rd.def_id.iter().map(Vec::len).sum::<usize>();
@@ -904,6 +998,76 @@ pub fn vgpr_compaction(rec: &Recording, live_in: &[RegRef]) -> Result<VgprMap, S
 
     // Rigid groups of webs: the units of a multi-register operand.
     let mut guf = Uf::new(n_webs);
+    let mut ties = 0usize;
+    let mut tied: std::collections::HashSet<u32> = Default::default();
+    let mut covers: Vec<Cover> = vec![];
+    // Definedness: the checked program (and the independent definedness replay) asks every read to have a
+    // definition of its register on every path from the entry, whichever path can really run. A definition the
+    // correlated branches show can never reach a read (the prologue zero of an accumulator) is such a covering
+    // definition: its web keeps the register of the web it covers, so the renamed program is defined wherever the
+    // original was.
+    {
+        let mut web_used = vec![false; n_webs];
+        for uw in &use_web {
+            for &w in uw {
+                web_used[w as usize] = true;
+            }
+        }
+        for (i, op) in ops.iter().enumerate() {
+            if !rd.reachable[i] || rd.base_use_rd.is_empty() {
+                continue;
+            }
+            for k in 0..op.uses.len() {
+                for &d in &rd.base_use_rd[i][k] {
+                    if d == UNDEF || (d as usize) < UNITS || rd.use_rd[i][k].contains(&d) {
+                        continue;
+                    }
+                    if let Some(&dw) = web_of_root.get(&uf.find(d)) {
+                        if !web_used[dw as usize] {
+                            guf.union(dw, use_web[i][k]);
+                            tied.insert(dw);
+                            ties += 1;
+                            let di = def_insn[d as usize] as usize;
+                            if subs_of[di][0] != usize::MAX && subs_of[i][0] != usize::MAX {
+                                covers.push(Cover {
+                                    def_sub: subs_of[di][0],
+                                    use_sub: subs_of[i][0],
+                                    unit: op.uses[k],
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // the covers of the renaming this program came from, in this program's names
+        if let Some(pre) = inherit {
+            let mut idx_of_sub: std::collections::HashMap<usize, usize> = Default::default();
+            for (i, sb) in subs_of.iter().enumerate() {
+                for &x in sb.iter().filter(|x| **x != usize::MAX) {
+                    idx_of_sub.insert(x, i);
+                }
+            }
+            for c in &pre.inner.covers {
+                let renamed = pre.inner.per_insn[c.use_sub]
+                    .1
+                    .binary_search_by_key(&c.unit, |p| p.0)
+                    .map(|k| pre.inner.per_insn[c.use_sub].1[k].1);
+                let (Ok(unit), Some(&di), Some(&ui)) =
+                    (renamed, idx_of_sub.get(&c.def_sub), idx_of_sub.get(&c.use_sub))
+                else {
+                    continue;
+                };
+                if !rd.reachable[di] || !rd.reachable[ui] || def_web[di].is_empty() {
+                    continue;
+                }
+                if let Some(k) = ops[ui].uses.iter().position(|u| *u == unit) {
+                    guf.union(def_web[di][0], use_web[ui][k]);
+                    ties += 1;
+                }
+            }
+        }
+    }
     let web_at =
         |i: usize, u: u8, op: &Op, use_web: &[Vec<u32>], def_web: &[Vec<u32>]| -> Option<u32> {
             if let Some(j) = op.defs.iter().position(|d| *d == u) {
@@ -912,14 +1076,14 @@ pub fn vgpr_compaction(rec: &Recording, live_in: &[RegRef]) -> Result<VgprMap, S
                 op.uses.iter().position(|d| *d == u).map(|k| use_web[i][k])
             }
         };
-    let mut galign = vec![4u8; n_webs];
+    let mut galign = vec![if spread { 1u8 } else { 4u8 }; n_webs];
     for (i, op) in ops.iter().enumerate() {
         if !rd.reachable[i] {
             continue;
         }
         for &(base, len) in &op.ranges {
             let first = web_at(i, base, op, &use_web, &def_web).ok_or("range without a web")?;
-            let g = granule(base, len).unwrap().max(4);
+            let g = if spread { granule(base, len).unwrap() } else { granule(base, len).unwrap().max(4) };
             for k in 0..len {
                 let w = web_at(i, base + k, op, &use_web, &def_web).ok_or("range without a web")?;
                 guf.union(first, w);
@@ -1028,6 +1192,9 @@ pub fn vgpr_compaction(rec: &Recording, live_in: &[RegRef]) -> Result<VgprMap, S
     let mut max_live = 0usize;
     let mut bank_peak = [0usize; 4];
     let mut peak: Option<(usize, usize, Vec<usize>)> = None;
+    let want_hot = spread_opts.is_some_and(|o| o.banks);
+    let mut held_at: Vec<(usize, Vec<u32>)> = vec![];
+    let mut web_last = vec![0u32; n_webs];
     let add = |adj: &mut Vec<Vec<u32>>, a: u32, b: u32| {
         if a != b {
             adj[a as usize].push(b);
@@ -1059,7 +1226,13 @@ pub fn vgpr_compaction(rec: &Recording, live_in: &[RegRef]) -> Result<VgprMap, S
             for (h, a) in held.0.iter_mut().zip(&after[pos].0) {
                 *h &= *a;
             }
+            for w in held.iter().chain(use_web[i].iter().map(|w| *w as usize)) {
+                web_last[w] = web_last[w].max(i as u32);
+            }
             let count = held.count();
+            if want_hot {
+                held_at.push((count, held.iter().map(|w| w as u32).collect()));
+            }
             if count > max_live {
                 peak = Some((count, i, held.iter().collect()));
             }
@@ -1092,6 +1265,29 @@ pub fn vgpr_compaction(rec: &Recording, live_in: &[RegRef]) -> Result<VgprMap, S
             }
             for &u in &use_web[i] {
                 live.set(u as usize);
+            }
+        }
+    }
+    // Spread: the scheduler reorders every window, so a web defined inside one must not share a register with any
+    // web the window touches (no false dependence for it to respect), as far as the 256 registers allow.
+    if spread_opts.is_some_and(|o| o.windows) {
+        for w in valu_windows(&items, &insns, &rd.reachable) {
+            let mut touched: Vec<u32> = w
+                .iter()
+                .flat_map(|&i| def_web[i].iter().chain(&use_web[i]).copied())
+                .collect();
+            touched.sort_unstable();
+            touched.dedup();
+            if touched.len() > 384 {
+                continue;
+            }
+            let mut defd: Vec<u32> = w.iter().flat_map(|&i| def_web[i].iter().copied()).collect();
+            defd.sort_unstable();
+            defd.dedup();
+            for &d in &defd {
+                for &t in &touched {
+                    add(&mut adj, d, t);
+                }
             }
         }
     }
@@ -1166,6 +1362,33 @@ pub fn vgpr_compaction(rec: &Recording, live_in: &[RegRef]) -> Result<VgprMap, S
         })
         .collect();
 
+    // Banks (Spread): the shift mod 4 of every group so that the independent VOPD candidates are legal.
+    let mut shift = vec![0u8; n_groups];
+    let (mut cand_edges, mut cand_ok, mut rotated) = (0usize, 0usize, 0usize);
+    if want_hot {
+        let edges = bank_edges(&items, &insns, &ops, &def_web, &use_web, &rd.reachable);
+        let allowed: Vec<u8> = groups
+            .iter()
+            .map(|g| match (g.pinned, g.align) {
+                (true, _) => 0b0001,
+                (false, 1) => 0b1111,
+                (false, 2) => 0b0101,
+                _ => 0b0001,
+            })
+            .collect();
+        // the positions where a bank could exceed the original bank peak: those with nearly that many live webs
+        let cap = bank_peak.iter().copied().max().unwrap_or(0);
+        let hot: Vec<Vec<u32>> = held_at
+            .into_iter()
+            .filter(|(c, _)| *c * 4 > cap * 3 && *c > cap)
+            .map(|(_, h)| h)
+            .collect();
+        let r = solve_banks(&edges, &web_unit, &web_group, &group_members, &allowed, &hot, cap);
+        cand_edges = edges.len();
+        cand_ok = r.1;
+        shift = r.0;
+        rotated = shift.iter().filter(|s| **s != 0).count();
+    }
     // Placement: lowest feasible shift per group, several orders, keep the smallest.
     let mut unreachable_top = 0i32;
     for (i, op) in ops.iter().enumerate() {
@@ -1189,6 +1412,7 @@ pub fn vgpr_compaction(rec: &Recording, live_in: &[RegRef]) -> Result<VgprMap, S
             }
         }
         let mut forbidden = vec![false; 2 * UNITS + 1];
+        let mut last_end = vec![-1i64; UNITS];
         for &g in order {
             let grp = &groups[g];
             if grp.pinned {
@@ -1209,21 +1433,51 @@ pub fn vgpr_compaction(rec: &Recording, live_in: &[RegRef]) -> Result<VgprMap, S
                     }
                 }
             }
-            let mut d = (-grp.umin + grp.align - 1).div_euclid(grp.align) * grp.align;
+            let step = grp.align.max(4);
+            let off = i32::from(shift[g]);
+            let mut d = -grp.umin;
+            while d.rem_euclid(step) != off {
+                d += 1;
+            }
+            // `Compact`: the lowest feasible shift. `Spread`: among the feasible registers below the current top,
+            // the one whose last occupant is the oldest (no false dependence between near uses), else the lowest.
+            let mut chosen: Option<(i64, i32)> = None;
             loop {
                 if grp.umax + d >= UNITS as i32 {
-                    return Err(
-                        "vgpr compaction: no feasible placement within 256 registers".into(),
-                    );
-                }
-                if !forbidden[(d + UNITS as i32) as usize] {
                     break;
                 }
-                d += grp.align;
+                if !forbidden[(d + UNITS as i32) as usize] {
+                    if !spread {
+                        chosen = Some((0, d));
+                        break;
+                    }
+                    if grp.umax + d < top {
+                        let key = group_members[g]
+                            .iter()
+                            .map(|&w| last_end[(i32::from(web_unit[w as usize]) + d) as usize])
+                            .max()
+                            .unwrap();
+                        if chosen.map_or(true, |c| key < c.0) {
+                            chosen = Some((key, d));
+                        }
+                    } else {
+                        if chosen.is_none() {
+                            chosen = Some((0, d));
+                        }
+                        break;
+                    }
+                }
+                d += step;
             }
+            let Some((_, d)) = chosen else {
+                return Err("vgpr compaction: no feasible placement within 256 registers".into());
+            };
             delta[g] = d;
             for &w in &group_members[g] {
-                placed[w as usize] = i32::from(web_unit[w as usize]) + d;
+                let t = i32::from(web_unit[w as usize]) + d;
+                placed[w as usize] = t;
+                let e = &mut last_end[t as usize];
+                *e = (*e).max(i64::from(web_last[w as usize]));
             }
             top = top.max(grp.umax + d + 1);
         }
@@ -1286,7 +1540,9 @@ pub fn vgpr_compaction(rec: &Recording, live_in: &[RegRef]) -> Result<VgprMap, S
     }
     // Seeded perturbations of the best linear-scan order.
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
-    for round in 0..24 {
+    // more perturbations for the small kernels, where one more register is a larger share and a trial is cheap
+    let rounds = (150_000 / n_groups.max(1)).clamp(24, 600);
+    for round in 0..rounds {
         let mut o = orders[0].1.clone();
         for _ in 0..(o.len() / 16 + 1) {
             seed ^= seed << 13;
@@ -1347,7 +1603,7 @@ pub fn vgpr_compaction(rec: &Recording, live_in: &[RegRef]) -> Result<VgprMap, S
         pairs.sort_unstable();
         // Checks of the renaming of this instruction.
         for (x, p) in pairs.iter().enumerate() {
-            if p.1 % 4 != p.0 % 4 || u16::from(p.1) >= vgprs {
+            if (!spread && p.1 % 4 != p.0 % 4) || u16::from(p.1) >= vgprs {
                 return Err(format!(
                     "vgpr compaction: `{}`: v{} -> v{} violates the bank or plan constraint",
                     insns[i].text, p.0, p.1
@@ -1413,7 +1669,7 @@ pub fn vgpr_compaction(rec: &Recording, live_in: &[RegRef]) -> Result<VgprMap, S
         .collect::<Result<_, _>>()?;
     // Proof: the renamed program has the def-use chains of the original, instruction for instruction. A read
     // that may see garbage (`UNDEF`) may see any other value in the renamed program.
-    let rd2 = reaching(&items, &blocks, &new_ops, &live_units);
+    let rd2 = reaching_refined(&items, &blocks, &insns, &new_ops, &live_units);
     for i in 0..ops.len() {
         if !rd.reachable[i] {
             continue;
@@ -1444,10 +1700,17 @@ pub fn vgpr_compaction(rec: &Recording, live_in: &[RegRef]) -> Result<VgprMap, S
             groups: n_groups,
             pinned_webs,
             order: order_name,
+            cand_edges,
+            cand_ok,
+            rotated,
+            ties,
+            ..Stats::default()
         },
         inner: Arc::new(Inner {
             per_insn,
-            windows: rec.windows.clone(),
+            windows: if spread { vec![] } else { rec.windows.clone() },
+            replay: !spread,
+            covers,
         }),
     })
 }
@@ -1473,20 +1736,437 @@ pub fn declare_vgprs(regs: &mut crate::RegPlan, n: u16) -> Result<(), String> {
     Ok(())
 }
 
-/// Two-pass driver: pass 1 builds and records, pass 2 re-emits with the renaming installed.
+// ------------------------------------------------------------------------------------------------ banks
+
+/// The maximal runs of schedulable VALU instructions of a submission-order program: the windows the Builder's
+/// scheduler reorders.
+fn valu_windows(items: &[Item], insns: &[&Instruction], reachable: &[bool]) -> Vec<Vec<usize>> {
+    let mut windows: Vec<Vec<usize>> = vec![];
+    let mut cur: Vec<usize> = vec![];
+    for it in items {
+        match it {
+            Item::Insn(i) if reachable[*i] && crate::valu_sched::schedulable(insns[*i]) => {
+                cur.push(*i)
+            }
+            _ => windows.push(std::mem::take(&mut cur)),
+        }
+    }
+    windows.push(cur);
+    windows.retain(|w| !w.is_empty());
+    windows
+}
+
+/// Two independent VOPD-able instructions the scheduler may pair: the webs behind the packet's operands.
+struct BankEdge {
+    dx: u32,
+    dy: u32,
+    s0: Option<(u32, u32)>,
+    s1: (u32, u32),
+}
+
+/// The candidate pairs of a program in submission order: per maximal run of schedulable VALU instructions (the
+/// Builder's VALU window), two f32 add/sub/mul/fmac instructions of nearly the same dependence depth, neither
+/// reading what the other writes (through the webs), of the same op, that the packet rules could join (one SGPR
+/// at most).
+fn bank_edges(
+    items: &[Item],
+    insns: &[&Instruction],
+    ops: &[Op],
+    def_web: &[Vec<u32>],
+    use_web: &[Vec<u32>],
+    reachable: &[bool],
+) -> Vec<BankEdge> {
+    use crate::vopd::Operand;
+    const MAX_WINDOW: usize = 4096;
+    const REACH: usize = 192;
+    const PER_NODE: usize = 8;
+    let windows = valu_windows(items, insns, reachable);
+    let mut edges = vec![];
+    for w in windows.iter().filter(|w| w.len() > 1 && w.len() <= MAX_WINDOW) {
+        let n = w.len();
+        let words = n.div_ceil(64);
+        let mut anc = vec![0u64; n * words];
+        let mut level = vec![0usize; n];
+        let mut last_def: std::collections::HashMap<u32, usize> = Default::default();
+        for (k, &i) in w.iter().enumerate() {
+            let mut preds: Vec<usize> = use_web[i]
+                .iter()
+                .filter_map(|u| last_def.get(u).copied())
+                .collect();
+            preds.sort_unstable();
+            preds.dedup();
+            for &p in &preds {
+                level[k] = level[k].max(level[p] + 1);
+                for x in 0..words {
+                    anc[k * words + x] |= anc[p * words + x];
+                }
+                anc[k * words + p / 64] |= 1 << (p % 64);
+            }
+            for &d in &def_web[i] {
+                last_def.insert(d, k);
+            }
+        }
+        let half: Vec<_> = w
+            .iter()
+            .map(|&i| crate::valu_sched::vopd_half(insns[i]))
+            .collect();
+        let web_of = |i: usize, unit: u8| -> Option<u32> {
+            ops[i]
+                .uses
+                .iter()
+                .position(|u| *u == unit)
+                .map(|k| use_web[i][k])
+        };
+        for k in 0..n {
+            let Some(x) = half[k] else { continue };
+            let i = w[k];
+            let mut taken = 0;
+            for l in k + 1..n.min(k + REACH) {
+                let Some(y) = half[l] else { continue };
+                let j = w[l];
+                if taken >= PER_NODE
+                    || level[k].abs_diff(level[l]) > 1
+                    || x.op != y.op
+                    || anc[l * words + k / 64] >> (k % 64) & 1 == 1
+                {
+                    continue;
+                }
+                let sgpr = [x.src0, y.src0]
+                    .iter()
+                    .filter(|s| matches!(s, Operand::S(_)))
+                    .count();
+                if sgpr > 1 {
+                    continue;
+                }
+                let (Some(&dx), Some(&dy)) = (def_web[i].first(), def_web[j].first()) else {
+                    continue;
+                };
+                if dx == dy {
+                    continue;
+                }
+                let (Some(bx), Some(by)) = (web_of(i, x.src1), web_of(j, y.src1)) else {
+                    continue;
+                };
+                let s0 = match (x.src0, y.src0) {
+                    (Operand::V(a), Operand::V(b)) => match (web_of(i, a), web_of(j, b)) {
+                        (Some(a), Some(b)) if a != b => Some((a, b)),
+                        (Some(_), Some(_)) => continue, // the same source can never pair (src0 banks)
+                        _ => continue,
+                    },
+                    _ => None,
+                };
+                edges.push(BankEdge {
+                    dx,
+                    dy,
+                    s0,
+                    s1: (bx, by),
+                });
+                taken += 1;
+            }
+        }
+    }
+    edges
+}
+
+/// Banks (shift mod 4 of every group) that make the most candidate pairs legal without letting any bank hold
+/// more than `cap` live webs at the `hot` positions (the lists of live webs where the pressure is highest): the
+/// register count the original banks reach stays reachable. Coordinate descent from the original banks with
+/// seeded visiting orders. `allowed[g]`: bit `s` set when group `g` may shift by `s`.
+fn solve_banks(
+    edges: &[BankEdge],
+    web_unit: &[u8],
+    web_group: &[usize],
+    group_members: &[Vec<u32>],
+    allowed: &[u8],
+    hot: &[Vec<u32>],
+    cap: usize,
+) -> (Vec<u8>, usize) {
+    let n_groups = group_members.len();
+    let mut inc: Vec<Vec<u32>> = vec![vec![]; n_groups];
+    for (e, edge) in edges.iter().enumerate() {
+        let mut ws = vec![edge.dx, edge.dy, edge.s1.0, edge.s1.1];
+        if let Some((a, b)) = edge.s0 {
+            ws.push(a);
+            ws.push(b);
+        }
+        let mut gs: Vec<usize> = ws.iter().map(|w| web_group[*w as usize]).collect();
+        gs.sort_unstable();
+        gs.dedup();
+        for g in gs {
+            if allowed[g].count_ones() > 1 {
+                inc[g].push(e as u32);
+            }
+        }
+    }
+    // The three packet rules of an edge: destination parity, src0 banks, src1 banks (the same register is fine).
+    let rules = |shift: &[u8], e: &BankEdge| -> (usize, usize) {
+        let r = |w: u32| (web_unit[w as usize] + shift[web_group[w as usize]]) & 3;
+        let mut met = [
+            (r(e.dx) ^ r(e.dy)) & 1 == 1,
+            e.s1.0 == e.s1.1 || r(e.s1.0) != r(e.s1.1),
+        ]
+        .iter()
+        .filter(|b| **b)
+        .count();
+        let mut n = 2;
+        if let Some((a, b)) = e.s0 {
+            n += 1;
+            met += usize::from(r(a) != r(b));
+        }
+        (met, n)
+    };
+    let ok = |shift: &[u8], e: &BankEdge| -> bool {
+        let (met, n) = rules(shift, e);
+        met == n
+    };
+    // what the descent maximises: the rules met, and the whole edge again when all are (a plateau-free ladder)
+    let score = |shift: &[u8], e: &BankEdge| -> usize {
+        let (met, n) = rules(shift, e);
+        met + if met == n { n } else { 0 }
+    };
+    let total = |shift: &[u8]| edges.iter().filter(|e| ok(shift, e)).count();
+    // hot positions each web is live at
+    let n_webs = web_unit.len();
+    let mut web_hot: Vec<Vec<u32>> = vec![vec![]; n_webs];
+    for (p, h) in hot.iter().enumerate() {
+        for &w in h {
+            web_hot[w as usize].push(p as u32);
+        }
+    }
+    let movable: Vec<usize> = (0..n_groups).filter(|&g| !inc[g].is_empty()).collect();
+    let descend = |seed: &mut u64| -> Vec<u8> {
+        let mut shift = vec![0u8; n_groups];
+        let mut counts: Vec<[u16; 4]> = hot
+            .iter()
+            .map(|h| {
+                let mut c = [0u16; 4];
+                for &w in h {
+                    c[(web_unit[w as usize] & 3) as usize] += 1;
+                }
+                c
+            })
+            .collect();
+        for _ in 0..24 {
+            let mut order = movable.clone();
+            for k in (1..order.len()).rev() {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 7;
+                *seed ^= *seed << 17;
+                order.swap(k, (*seed % (k as u64 + 1)) as usize);
+            }
+            let mut improved = false;
+            for &g in &order {
+                let keep = shift[g];
+                let mut scored: Vec<(usize, u8)> = vec![];
+                for s in 0..4u8 {
+                    if s == keep || allowed[g] >> s & 1 == 1 {
+                        shift[g] = s;
+                        let sc = inc[g]
+                            .iter()
+                            .map(|e| score(&shift, &edges[*e as usize]))
+                            .sum::<usize>();
+                        scored.push((sc, s));
+                    }
+                }
+                shift[g] = keep;
+                let cur = scored.iter().find(|x| x.1 == keep).unwrap().0;
+                scored.retain(|x| x.0 > cur);
+                scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+                for (_, s) in scored {
+                    // move the group's webs between banks at the hot positions, keep it when no bank exceeds `cap`
+                    let mut moved: Vec<(u32, usize, usize)> = vec![];
+                    let mut fits = true;
+                    'apply: for &w in &group_members[g] {
+                        let (from, to) = (
+                            ((web_unit[w as usize] + keep) & 3) as usize,
+                            ((web_unit[w as usize] + s) & 3) as usize,
+                        );
+                        if from == to {
+                            continue;
+                        }
+                        for &p in &web_hot[w as usize] {
+                            let c = &mut counts[p as usize];
+                            c[from] -= 1;
+                            c[to] += 1;
+                            if c[to] as usize > cap {
+                                fits = false;
+                            }
+                        }
+                        moved.push((w, from, to));
+                        if !fits {
+                            break 'apply;
+                        }
+                    }
+                    if fits {
+                        shift[g] = s;
+                        improved = true;
+                        break;
+                    }
+                    for (w, from, to) in moved {
+                        for &p in &web_hot[w as usize] {
+                            let c = &mut counts[p as usize];
+                            c[from] += 1;
+                            c[to] -= 1;
+                        }
+                    }
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+        shift
+    };
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut best_shift = vec![0u8; n_groups];
+    let mut best_total = total(&best_shift);
+    for _ in 0..8 {
+        let shift = descend(&mut seed);
+        let t = total(&shift);
+        if t > best_total {
+            best_total = t;
+            best_shift = shift;
+        }
+    }
+    (best_shift, best_total)
+}
+
+// ------------------------------------------------------------------------------------------------ driver
+
+/// The renaming of the recorded scheduled program (`post`, over the names `pre` gave) as one map over the
+/// emitter's names.
+fn compose(pre: &VgprMap, post: &VgprMap, hashes0: &[u64]) -> Result<VgprMap, String> {
+    if pre.len() != post.len() || post.len() != hashes0.len() {
+        return Err("vgpr compose: the passes submitted different numbers of instructions".into());
+    }
+    let mut per_insn = Vec::with_capacity(pre.len());
+    for n in 0..pre.len() {
+        let a = &pre.inner.per_insn[n].1;
+        let b = &post.inner.per_insn[n].1;
+        let mut out = Vec::with_capacity(a.len());
+        for &(u, v) in a.iter() {
+            let w = b
+                .binary_search_by_key(&v, |p| p.0)
+                .map(|k| b[k].1)
+                .map_err(|_| {
+                    format!("vgpr compose: submission {n} names v{v} the second pass does not map")
+                })?;
+            out.push((u, w));
+        }
+        per_insn.push((hashes0[n], out.into_boxed_slice()));
+    }
+    Ok(VgprMap {
+        vgprs: post.vgprs,
+        stats: Stats {
+            before: pre.stats.before,
+            pre_vgprs: pre.vgprs,
+            cand_edges: pre.stats.cand_edges,
+            cand_ok: pre.stats.cand_ok,
+            rotated: pre.stats.rotated,
+            ties: pre.stats.ties,
+            ties_post: post.stats.ties,
+            ..post.stats.clone()
+        },
+        inner: Arc::new(Inner {
+            per_insn,
+            windows: post.inner.windows.clone(),
+            replay: true,
+            covers: vec![],
+        }),
+    })
+}
+
+/// How [`compact_vgprs_as`] renames the program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Renaming {
+    /// Spread renaming with bank assignment and window-wide separation, then compaction of its schedule.
+    Full,
+    /// As `Full` without the window-wide separation.
+    Spread,
+    /// Compaction of the emitter's own schedule.
+    Plain,
+}
+
+/// Three-pass driver for one [`Renaming`]: pass 0 builds and records the program as the emitter wrote it; the
+/// spread renaming is computed on it; pass 1 re-emits through that renaming, scheduling afresh, and records the
+/// scheduled program; the compaction of that stream is the final renaming that pass 2 applies (replaying pass 1's
+/// schedule). `Plain` skips pass 1.
 ///
 /// `build(Pass::Record)` must build the kernel with `Builder::vgpr_pass(Pass::Record)` and its own layout;
-/// `build(Pass::Apply(map))` must declare a plan of `map.vgprs` registers and call
-/// `Builder::vgpr_pass(Pass::Apply(map))`. The emitter must be deterministic in the instruction sequence it submits.
+/// `build(Pass::Spread(map))` and `build(Pass::Apply(map))` must declare a plan of `map.vgprs` registers and call
+/// `Builder::vgpr_pass` with the pass. The emitter must be deterministic in the instruction sequence it submits.
+pub fn compact_vgprs_as<T>(
+    how: Renaming,
+    build: &impl Fn(Pass) -> Result<(T, Emitted), String>,
+) -> Result<(T, Emitted), String> {
+    let (_, first) = build(Pass::Record)?;
+    let rec0 = first
+        .vgpr_record
+        .ok_or("compact_vgprs: pass 1 did not record (call Builder::vgpr_pass)")?;
+    let map = match how {
+        Renaming::Plain => vgpr_compaction(&rec0, &[])?,
+        Renaming::Full | Renaming::Spread => {
+            let rec = Recording {
+                stream: rec0.submitted.clone(),
+                hashes: rec0.hashes.clone(),
+                ..Default::default()
+            };
+            let pre = allocate(
+                &rec,
+                &[],
+                Mode::Spread(Spread {
+                    banks: true,
+                    windows: how == Renaming::Full,
+                }),
+                None,
+            )?;
+            let (_, second) = build(Pass::Spread(&pre))?;
+            let rec1 = second.vgpr_record.ok_or(
+                "compact_vgprs: the spread pass did not record (call Builder::vgpr_pass)",
+            )?;
+            compose(&pre, &allocate(&rec1, &[], Mode::Compact, Some(&pre))?, &rec0.hashes)?
+        }
+    };
+    let (t, mut emitted) = build(Pass::Apply(&map))?;
+    emitted.vgpr_stats = Some(map.stats.clone());
+    Ok((t, emitted))
+}
+
+/// Occupancy (waves per SIMD) of a kernel that declares `vgprs` registers: a 1536-register file per SIMD in
+/// 8-register granules, at most 16 waves.
+fn waves(vgprs: u16) -> u16 {
+    (1536 / (vgprs.max(1).div_ceil(8) * 8)).min(16)
+}
+
+/// Compact the VGPRs of the kernel `build` emits: every [`Renaming`] is tried and the one with the most waves,
+/// then the fewest instructions, wins (a spread that costs registers never costs occupancy).
 pub fn compact_vgprs<T>(
     build: impl Fn(Pass) -> Result<(T, Emitted), String>,
 ) -> Result<(T, Emitted), String> {
-    let (t, first) = build(Pass::Record)?;
-    let record = first
-        .vgpr_record
-        .ok_or("compact_vgprs: pass 1 did not record (call Builder::vgpr_pass)")?;
-    let map = vgpr_compaction(&record, &[])?;
-    build(Pass::Apply(&map))
+    let mut best: Option<(T, Emitted, (u16, usize, u16))> = None;
+    let mut first_err = None;
+    // on a tie the plain compaction, which leaves the emitter's own schedule alone, wins
+    for how in [Renaming::Plain, Renaming::Spread, Renaming::Full] {
+        match compact_vgprs_as(how, &build) {
+            Ok((t, emitted)) => {
+                let key = (
+                    u16::MAX - waves(emitted.shape.next_free_vgpr),
+                    emitted.program.instructions.len(),
+                    emitted.shape.next_free_vgpr,
+                );
+                if best.as_ref().map_or(true, |b| key < b.2) {
+                    best = Some((t, emitted, key));
+                }
+            }
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    match best {
+        Some((t, emitted, _)) => Ok((t, emitted)),
+        None => Err(first_err.unwrap_or_else(|| "vgpr compaction: no renaming".into())),
+    }
 }
 
 #[cfg(test)]
@@ -1687,6 +2367,193 @@ mod tests {
         let t = renamed(&m, 0, "v_mov_b32_e32 v21, 3", &[v(21, 1)], &[]);
         assert_eq!(a.defs[0].base, b.defs[0].base);
         assert_ne!(a.defs[0].base, t.defs[0].base);
+    }
+
+    fn w1(base: u8) -> RegRef {
+        v(base, 1)
+    }
+    fn sg(base: u8) -> RegRef {
+        RegRef {
+            kind: Kind::S,
+            base,
+            len: 1,
+        }
+    }
+    fn alloc_spread(stream: Vec<StreamItem>, opts: Spread) -> VgprMap {
+        let mut rec = recording(stream);
+        rec.hashes = (0..rec.hashes.len()).map(|k| rec.hashes[k]).collect();
+        allocate(&rec, &[], Mode::Spread(opts), None).unwrap()
+    }
+
+    #[test]
+    fn a_prologue_zero_under_repeated_guards_is_a_web_of_its_own() {
+        // v5 = 0 (prologue); if (bit B of s1) v5 = 0 + v6; v9 = 1; if (bit 3 of s1) v8 = v5 + v6; use v9.
+        // With B = 3 the zero never reaches the guarded read: it is a lone definition, the accumulator another web.
+        let prog = |bit: u32| {
+            vec![
+                i("v_mov_b32_e32 v5, 0", &[w1(5)], &[]),
+                i("v_mov_b32_e32 v6, 2", &[w1(6)], &[]),
+                i(&format!("s_bitcmp0_b32 s1, {bit}"), &[], &[sg(1)]),
+                i("s_cbranch_scc1 .L1", &[], &[]),
+                i("v_add_f32_e32 v5, 0, v6", &[w1(5)], &[w1(6)]),
+                lbl(".L1"),
+                i("v_mov_b32_e32 v9, 1", &[w1(9)], &[]),
+                i("s_bitcmp0_b32 s1, 3", &[], &[sg(1)]),
+                i("s_cbranch_scc1 .L2", &[], &[]),
+                i("v_add_f32_e32 v8, v5, v6", &[w1(8)], &[w1(5), w1(6)]),
+                lbl(".L2"),
+                i("v_add_f32_e32 v10, v9, v9", &[w1(10)], &[w1(9), w1(9)]),
+                i("s_endpgm", &[], &[]),
+            ]
+        };
+        let correlated = vgpr_compaction(&recording(prog(3)), &[]).unwrap();
+        let unrelated = vgpr_compaction(&recording(prog(4)), &[]).unwrap();
+        assert_eq!(correlated.stats.webs, unrelated.stats.webs + 1);
+        // the guarded accumulator stays live across v9's definition, whichever web the zero is in
+        let acc = renamed(&correlated, 4, "v_add_f32_e32 v5, 0, v6", &[w1(5)], &[w1(6)]);
+        let nine = renamed(&correlated, 5, "v_mov_b32_e32 v9, 1", &[w1(9)], &[]);
+        assert_ne!(acc.defs[0].base, nine.defs[0].base);
+    }
+
+    #[test]
+    fn a_covering_zero_keeps_the_register_of_the_accumulator_it_covers() {
+        let prog = vec![
+            i("v_mov_b32_e32 v5, 0", &[w1(5)], &[]),
+            i("v_mov_b32_e32 v6, 2", &[w1(6)], &[]),
+            i("s_bitcmp0_b32 s1, 3", &[], &[sg(1)]),
+            i("s_cbranch_scc1 .L1", &[], &[]),
+            i("v_add_f32_e32 v5, 0, v6", &[w1(5)], &[w1(6)]),
+            lbl(".L1"),
+            i("v_mov_b32_e32 v9, 1", &[w1(9)], &[]),
+            i("s_bitcmp0_b32 s1, 3", &[], &[sg(1)]),
+            i("s_cbranch_scc1 .L2", &[], &[]),
+            i("v_add_f32_e32 v8, v5, v6", &[w1(8)], &[w1(5), w1(6)]),
+            lbl(".L2"),
+            i("v_add_f32_e32 v10, v9, v9", &[w1(10)], &[w1(9), w1(9)]),
+            i("s_endpgm", &[], &[]),
+        ];
+        let reg = |m: &VgprMap, n: usize, text: &str, d: u8, u: &[u8]| {
+            let uses: Vec<RegRef> = u.iter().map(|&x| w1(x)).collect();
+            renamed(m, n, text, &[w1(d)], &uses).defs[0].base
+        };
+        let check = |m: &VgprMap| {
+            let zero = reg(m, 0, "v_mov_b32_e32 v5, 0", 5, &[]);
+            let acc = reg(m, 4, "v_add_f32_e32 v5, 0, v6", 5, &[6]);
+            assert_eq!(zero, acc, "the zero defines the register the guarded read reads");
+        };
+        check(&vgpr_compaction(&recording(prog.clone()), &[]).unwrap());
+        for windows in [false, true] {
+            check(&alloc_spread(prog.clone(), Spread { banks: true, windows }));
+            // both passes, as `compact_vgprs_as` runs them
+            let rec = recording(prog.clone());
+            let pre = allocate(&rec, &[], Mode::Spread(Spread { banks: true, windows }), None).unwrap();
+            let mut second = Recording::default();
+            for it in &rec.stream {
+                match it {
+                    StreamItem::Insn { insn, subs } => {
+                        let r = pre.rewrite(subs[0], insn.clone()).unwrap();
+                        second.hashes.push(text_hash(&r.text));
+                        second.stream.push(StreamItem::Insn { insn: r, subs: *subs });
+                    }
+                    l => second.stream.push(l.clone()),
+                }
+            }
+            let post = allocate(&second, &[], Mode::Compact, Some(&pre)).unwrap();
+            check(&compose(&pre, &post, &rec.hashes).unwrap());
+        }
+    }
+
+    #[test]
+    fn spread_gives_each_reuse_of_a_temporary_its_own_register_inside_a_window() {
+        // two rows decoded through one temporary v10: the scheduler would see a WAR/WAW chain between the rows
+        let s = vec![
+            i("v_mov_b32_e32 v1, s2", &[w1(1)], &[sg(2)]),
+            i("v_mov_b32_e32 v2, s3", &[w1(2)], &[sg(3)]),
+            i("v_add_f32_e32 v10, v1, v2", &[w1(10)], &[w1(1), w1(2)]),
+            i("v_mul_f32_e32 v11, v10, v1", &[w1(11)], &[w1(10), w1(1)]),
+            i("v_add_f32_e32 v10, v2, v2", &[w1(10)], &[w1(2), w1(2)]),
+            i("v_mul_f32_e32 v12, v10, v2", &[w1(12)], &[w1(10), w1(2)]),
+            i("s_endpgm", &[], &[]),
+        ];
+        let reg = |m: &VgprMap, n: usize, text: &str, d: u8, u: &[u8]| {
+            let uses: Vec<RegRef> = u.iter().map(|&x| w1(x)).collect();
+            renamed(m, n, text, &[w1(d)], &uses).defs[0].base
+        };
+        for (opts, apart) in [
+            (Spread { banks: false, windows: true }, true),
+            (Spread { banks: false, windows: false }, false),
+        ] {
+            let m = alloc_spread(s.clone(), opts);
+            let a = reg(&m, 2, "v_add_f32_e32 v10, v1, v2", 10, &[1, 2]);
+            let b = reg(&m, 4, "v_add_f32_e32 v10, v2, v2", 10, &[2, 2]);
+            if apart {
+                assert_ne!(a, b, "{opts:?}");
+            }
+            assert!(m.vgprs <= 32);
+            assert!(!m.replays());
+        }
+    }
+
+    #[test]
+    fn spread_picks_banks_so_that_independent_adds_can_dual_issue() {
+        use crate::arch::Arch;
+        // both rows have the same banks: equal destination parity, equal src0 and src1 banks
+        let s = vec![
+            i("v_mov_b32_e32 v16, s2", &[w1(16)], &[sg(2)]),
+            i("v_mov_b32_e32 v20, s3", &[w1(20)], &[sg(3)]),
+            i("v_mov_b32_e32 v24, s4", &[w1(24)], &[sg(4)]),
+            i("v_mov_b32_e32 v28, s5", &[w1(28)], &[sg(5)]),
+            i("v_add_f32_e32 v4, v16, v24", &[w1(4)], &[w1(16), w1(24)]),
+            i("v_add_f32_e32 v8, v20, v28", &[w1(8)], &[w1(20), w1(28)]),
+            i("v_mov_b32_e32 v1, v4", &[w1(1)], &[w1(4)]),
+            i("v_mov_b32_e32 v2, v8", &[w1(2)], &[w1(8)]),
+            i("s_endpgm", &[], &[]),
+        ];
+        let m = alloc_spread(s, Spread { banks: true, windows: false });
+        let a = renamed(&m, 4, "v_add_f32_e32 v4, v16, v24", &[w1(4)], &[w1(16), w1(24)]);
+        let b = renamed(&m, 5, "v_add_f32_e32 v8, v20, v28", &[w1(8)], &[w1(20), w1(28)]);
+        assert!(
+            crate::valu_sched::pair(Arch::Gfx1201, &a, &b).is_some(),
+            "`{}` and `{}` should pair: {:?}",
+            a.text,
+            b.text,
+            m.stats
+        );
+        assert!(m.stats.rotated > 0 && m.stats.cand_ok == m.stats.cand_edges, "{:?}", m.stats);
+    }
+
+    #[test]
+    fn composed_renaming_maps_the_emitters_names_to_the_final_ones() {
+        let s = vec![
+            i("v_mov_b32_e32 v16, s2", &[w1(16)], &[sg(2)]),
+            i("v_add_f32_e32 v17, v16, v16", &[w1(17)], &[w1(16), w1(16)]),
+            i("s_endpgm", &[], &[]),
+        ];
+        let rec = recording(s);
+        let pre = allocate(&rec, &[], Mode::Spread(Spread { banks: false, windows: false }), None).unwrap();
+        // the program as the second pass records it: renamed by `pre`
+        let mut second = Recording::default();
+        for it in &rec.stream {
+            match it {
+                StreamItem::Insn { insn, subs } => {
+                    let r = pre.rewrite(subs[0], insn.clone()).unwrap();
+                    second.hashes.push(text_hash(&r.text));
+                    second.stream.push(StreamItem::Insn { insn: r, subs: *subs });
+                }
+                l => second.stream.push(l.clone()),
+            }
+        }
+        let post = vgpr_compaction(&second, &[]).unwrap();
+        let both = compose(&pre, &post, &rec.hashes).unwrap();
+        assert!(both.replays());
+        assert_eq!(both.vgprs, post.vgprs);
+        for (n, ins) in rec.stream.iter().enumerate().filter_map(|(n, it)| match it {
+            StreamItem::Insn { insn, .. } => Some((n, insn)),
+            _ => None,
+        }) {
+            let via = post.rewrite(n, pre.rewrite(n, ins.clone()).unwrap()).unwrap();
+            assert_eq!(both.rewrite(n, ins.clone()).unwrap().text, via.text);
+        }
     }
 
     #[test]

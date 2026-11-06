@@ -235,4 +235,6 @@ pub struct Emitted {
     pub program: crate::insn::Program,
     /// What `Builder::record_vgpr_stream` recorded (pass 1 of `regalloc::compact_vgprs`).
     pub vgpr_record: Option<crate::regalloc::Recording>,
+    /// What the VGPR compaction measured (set by `regalloc::compact_vgprs`).
+    pub vgpr_stats: Option<crate::regalloc::Stats>,
 }

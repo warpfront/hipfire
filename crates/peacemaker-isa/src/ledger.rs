@@ -527,6 +527,17 @@ impl Ledger {
             .retain(|p| !matches!(p.counter, Counter::Store | Counter::Vs));
     }
 
+    /// The vector registers the pending VMEM stores have not yet been shown to have read: only a full drain of the
+    /// store counter or `depctr_vm_vsrc(0)` frees them for a redefinition (a partial count is never trusted for
+    /// stores: their completion order is never inferred).
+    pub fn pending_store_sources(&self) -> Vec<RegRef> {
+        self.pending
+            .iter()
+            .filter(|p| matches!(p.counter, Counter::Store | Counter::Vs))
+            .flat_map(|p| p.src_locks.iter().copied())
+            .filter(|r| r.kind == crate::reg::Kind::V)
+            .collect()
+    }
     /// An LDS store not yet retired (DScnt on gfx12, LGKMcnt on gfx11 and
     /// gfx942): a barrier that publishes LDS must drain it first.
     pub fn pending_stores(&self) -> bool {

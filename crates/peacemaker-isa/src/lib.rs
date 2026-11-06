@@ -18,6 +18,7 @@ pub mod arch;
 pub mod author;
 /// The CDNA (wave64, gfx942 first) arm: checked builder, hazard pass, code-object emission.
 pub mod cdna;
+mod corr;
 pub mod emit;
 /// Builder methods of the global memory model and the task-body region ABI.
 mod global_sync;
@@ -175,8 +176,8 @@ pub struct Builder {
     vgpr_map: Option<regalloc::VgprMap>,
     /// Number of `emit` calls so far (the submission id of the next one).
     vgpr_sub: usize,
-    /// Submission id of the first instruction buffered in `valu_window`.
-    vgpr_win_start: usize,
+    /// Submission ids of the instructions buffered in `valu_window`, in buffer order.
+    window_subs: Vec<usize>,
     /// Index of the next window schedule of the installed map (`flush_valu` replays them in order).
     vgpr_cursor: usize,
     /// The last single-slot `s_delay_alu` (pc, its target pc) a later hint may merge into.
@@ -265,7 +266,7 @@ impl Builder {
             vgpr_rec: None,
             vgpr_map: None,
             vgpr_sub: 0,
-            vgpr_win_start: 0,
+            window_subs: vec![],
             vgpr_cursor: 0,
             delay_merge: None,
             labels: vec!["entry".into()],
@@ -326,6 +327,10 @@ impl Builder {
     pub fn vgpr_pass(&mut self, pass: regalloc::Pass) {
         match pass {
             regalloc::Pass::Record => self.record_vgpr_stream(),
+            regalloc::Pass::Spread(map) => {
+                self.record_vgpr_stream();
+                self.set_vgpr_map(map.clone())
+            }
             regalloc::Pass::Apply(map) => self.set_vgpr_map(map.clone()),
         }
     }
@@ -338,15 +343,15 @@ impl Builder {
             _ => return Ok(()),
         };
         let arch = self.spec.arch;
-        let start = self.vgpr_win_start;
-        if let Some(map) = self.vgpr_map.clone() {
+        let subs = std::mem::take(&mut self.window_subs);
+        if let Some(map) = self.vgpr_map.clone().filter(|m| m.replays()) {
             // Pass 2 of `compact_vgprs`: replay the schedule pass 1 chose (the renaming was proven on that order).
             let steps = map.window(self.vgpr_cursor, pending.len())?;
             self.vgpr_cursor += 1;
             for step in steps {
                 match step {
                     regalloc::Step::One(a) => {
-                        self.emit_now(pending[*a].clone(), [start + a, usize::MAX])?
+                        self.emit_now(pending[*a].clone(), [subs[*a], usize::MAX])?
                     }
                     regalloc::Step::Pair(a, b) => {
                         let packet = valu_sched::pair(arch, &pending[*a], &pending[*b])
@@ -356,7 +361,7 @@ impl Builder {
                                     pending[*a].text, pending[*b].text
                                 )
                             })?;
-                        self.emit_now(packet, [start + a, start + b])?
+                        self.emit_now(packet, [subs[*a], subs[*b]])?
                     }
                     regalloc::Step::Wait(set) => {
                         let required = self.merged_wait(set.iter().map(|k| &pending[*k]));
@@ -426,11 +431,11 @@ impl Builder {
                     done += 1;
                     press.issue(b);
                     window.push(regalloc::Step::Pair(a, b));
-                    self.emit_now(packet, [start + a, start + b])?
+                    self.emit_now(packet, [subs[a], subs[b]])?
                 }
                 None => {
                     window.push(regalloc::Step::One(a));
-                    self.emit_now(dag.insns[a].clone(), [start + a, usize::MAX])?
+                    self.emit_now(dag.insns[a].clone(), [subs[a], usize::MAX])?
                 }
             }
             now += 1;
@@ -491,6 +496,7 @@ impl Builder {
         self.current_label = name.into();
         if let Some(rec) = &mut self.vgpr_rec {
             rec.stream.push(regalloc::StreamItem::Label(name.into()));
+            rec.submitted.push(regalloc::StreamItem::Label(name.into()));
         }
         // Obligations at the label: the forward branches' joined with the fall-through
         // (absent after an unconditional `s_branch`/`s_endpgm`).
@@ -517,8 +523,28 @@ impl Builder {
             .push(Instruction::new(format!("{name}:"), vec![], vec![]));
         Ok(())
     }
+    /// `Pass::Record`/`Spread`: the pending VMEM stores' source registers stay locked until here (a full drain of the
+    /// store counter or `depctr_vm_vsrc(0)`), so the program records a read of them: no renaming may put a
+    /// redefinition between the store and the release.
+    fn note_store_release(&mut self) {
+        let Some(rec) = &mut self.vgpr_rec else { return };
+        let uses = self.ledger.pending_store_sources();
+        if uses.is_empty() {
+            return;
+        }
+        let marker = Instruction::new("; store sources released", vec![], uses);
+        for stream in [&mut rec.stream, &mut rec.submitted] {
+            stream.push(regalloc::StreamItem::Insn {
+                insn: marker.clone(),
+                subs: [usize::MAX, usize::MAX],
+            });
+        }
+    }
     fn emit_wait(&mut self, c: Counter, n: u8, reason: Reason) -> Result<(), String> {
         self.flush_valu()?;
+        if n == 0 && matches!(c, Counter::Store | Counter::Vs) {
+            self.note_store_release();
+        }
         let entries = Ledger::wait_instruction(self.spec.arch, &[(c, n, reason.clone())])?;
         for (_, _, text, _) in entries {
             let pc_index = self.program.instructions.len();
@@ -541,6 +567,12 @@ impl Builder {
     }
     fn emit_required(&mut self, mut required: Vec<(Counter, u8, Reason)>) -> Result<(), String> {
         self.flush_valu()?;
+        if required
+            .iter()
+            .any(|(c, n, _)| *n == 0 && matches!(c, Counter::Store | Counter::Vs))
+        {
+            self.note_store_release();
+        }
         let (first_counter, second_counter, _) = combined_wait(self.spec.arch, 0, 0);
         let first = required
             .iter()
@@ -608,6 +640,7 @@ impl Builder {
         if !self.spec.arch.gfx12() {
             return Err("depctr_vm_vsrc requires gfx12".into());
         }
+        self.note_store_release();
         let pc_index = self.program.instructions.len();
         let text = "s_wait_alu depctr_vm_vsrc(0)".to_string();
         self.program
@@ -697,22 +730,27 @@ impl Builder {
         if let Some(map) = &self.vgpr_map {
             insn = map.rewrite(self.vgpr_sub, insn)?;
         }
+        let sub = self.vgpr_sub;
         if let Some(rec) = &mut self.vgpr_rec {
             rec.hashes.push(regalloc::text_hash(&insn.text));
+            rec.submitted.push(regalloc::StreamItem::Insn {
+                insn: insn.clone(),
+                subs: [sub, usize::MAX],
+            });
         }
-        let sub = self.vgpr_sub;
         self.vgpr_sub += 1;
+        self.emit_submitted(sub, insn)
+    }
+    /// A renamed submission reaches the program (or the VALU window).
+    fn emit_submitted(&mut self, sub: usize, insn: Instruction) -> Result<(), String> {
         if self.valu_window.is_some() && valu_sched::schedulable(&insn) {
             insn.validate(self.spec.arch)?;
             for r in insn.defs.iter().chain(&insn.uses) {
                 self.regs
                     .verify_access(*r, &self.current_label, &self.labels)?
             }
-            let window = self.valu_window.as_mut().unwrap();
-            if window.is_empty() {
-                self.vgpr_win_start = sub;
-            }
-            window.push(insn);
+            self.window_subs.push(sub);
+            self.valu_window.as_mut().unwrap().push(insn);
             return Ok(());
         }
         self.flush_valu()?;
@@ -1299,7 +1337,7 @@ impl Builder {
             return Err(format!("branch to {target}, which is never placed"));
         }
         if let Some(map) = &self.vgpr_map {
-            if self.vgpr_sub != map.len() || self.vgpr_cursor != map.windows() {
+            if self.vgpr_sub != map.len() || (map.replays() && self.vgpr_cursor != map.windows()) {
                 return Err(format!(
                     "vgpr map: {} instructions / {} windows submitted, {} / {} recorded (emission is not deterministic)",
                     self.vgpr_sub,
@@ -1399,6 +1437,7 @@ impl Builder {
             shape,
             program: self.program,
             vgpr_record: self.vgpr_rec,
+            vgpr_stats: None,
         })
     }
 }
