@@ -193,3 +193,17 @@ bypass_slack                == 0
 # entry points avoid head gathers and carry the same encoder-attention
 # registry-key debt; the existing gfx11 route is unchanged.
 bypass_total                <= 366
+
+# --- multi-card front doors: arch-id match forms (check-topology-arch-arms.sh) ---
+# Multi-GPU routing is declared by the carrier (Carrier::topology_caps); the
+# loader's bench classification, the topology caps module and the generate EP
+# dispatch name no arch id. The admission/lib ceilings are the arms that remain
+# for NON-topology policy (VMM KV, spill, vision, KV-mode families, route
+# tables), measured after the TopoG0 slice; they only go down.
+topology_arch_arms_admission     <= 27
+topology_arch_arms_lib           <= 16
+topology_arch_arms_bench_loader  == 0
+topology_arch_arms_caps          == 0
+topology_arch_arms_generate_qwen == 0
+topology_arch_arms_generate_bench == 0
+topology_arch_arms_total         <= 43

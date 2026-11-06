@@ -128,6 +128,10 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         // is fixed by the profile's rotation width (R256 / R128).
         MQ3I4G128R256 | MQ2I4G128R256 | E8PI4G128R256 => RotationPlan::FwhtG256,
         MQ3I4G128R128 | MQ2I4G128R128 | E8PI4G128R128 => RotationPlan::FwhtG128,
+        // Drop-zero planar routed experts (qt=137/138): the activation basis of
+        // the shipped MQ4G256V2 / MQ4G128V2 payload they were repacked from.
+        MQ4G256V2P => RotationPlan::FwhtG256,
+        MQ4G128V2P => RotationPlan::FwhtG128,
         // MQ4G128 and MQ4G128V2 carry their own G128 activation basis.  V2
         // uses the qt53 68-byte row format; it must not fall through to the
         // natural-basis default.
@@ -153,6 +157,8 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         // FP8E4M3B128 / FP8E4M3PT are unrotated (natural basis): the expert
         // GEMM consumes BF16 activations as they are.
         FP8E4M3B128 | FP8E4M3PT => RotationPlan::None,
+        // HC8E4M3Row (qt=57) is natural-basis: the HC mixer consumes unrotated activations.
+        HC8E4M3Row => RotationPlan::None,
         _ => RotationPlan::None,
     }
 }
@@ -1064,10 +1070,14 @@ impl KernelKey {
             // gfx942 FP8 MoE route reads qt=55; qt=56 is the PLE row store).
             // Explicit so a future generic route has to decide its arch gate.
             FP8E4M3B128 | FP8E4M3PT => ArchPredicate::Always,
+            // qt=57 HC8E4M3Row (Qwen4 HC mixer sidecar): no generic family
+            // implementation (only the typed Qwen4 HC route reads it, gated by
+            // `qwen4_hc8_enabled()` = exact gfx1201). Same stance as qt=55/56.
+            HC8E4M3Row => ArchPredicate::Always,
             // MQ-I4 (qt=131..=136): typed-qwen4-only, no generic kernel; same
             // explicit stance as qt=53.
             MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
-            | E8PI4G128R128 => ArchPredicate::Always,
+            | E8PI4G128R128 | MQ4G256V2P | MQ4G128V2P => ArchPredicate::Always,
             // ggml block formats (GGUF-native, no kernel yet): no key resolves
             // them, so resolution fails with MissingImpl; explicit so a future
             // ggml route has to decide its arch gate.

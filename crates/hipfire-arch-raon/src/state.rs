@@ -62,6 +62,9 @@ pub const MIRROR_RESERVE_BYTES: usize = 2 << 30;
 /// Scratch, work, packed weights and the split-KV workspace already exist when
 /// the budget is fitted, so they are measured, not reserved.
 pub const MIRROR_POST_ASSEMBLY_RESERVE_BYTES: usize = 512 << 20;
+/// Device bytes the lazily growing expanded mirror must always leave really free
+/// (measured cliff: a card filled to 100% by lazy growth slows ~5-6x).
+pub const MIRROR_REAL_FLOOR_BYTES: usize = 1 << 30;
 /// Largest `max_rows` accepted by [`RaonPrefillScratch::new`].
 pub const MAX_SCRATCH_ROWS: usize = 4096;
 /// Rows of one bounded decompression tile (`mla_kv_tile`).
@@ -137,6 +140,10 @@ pub struct RaonStateDims {
     /// Expanded K/V mirror stored as INT8 codes + one F16 scale per (row, head,
     /// plane) instead of BF16 ([`crate::mla::MlaPolicy::mirror_q8`]).
     pub mirror_q8: bool,
+    /// Keep the BF16 mirror while it covers the whole reserved context (Q8
+    /// otherwise). Set at load for a speculative slot whose Q8 mirror is not forced:
+    /// its verify rows run the tiled kernel, which is faster on BF16 operands.
+    pub mirror_bf16_if_covered: bool,
 }
 
 impl RaonStateDims {
@@ -170,6 +177,7 @@ impl RaonStateDims {
             mhc_controls: 17,
             decay_bottleneck: 128,
             mirror_q8: true,
+            mirror_bf16_if_covered: false,
         }
     }
 
@@ -524,7 +532,11 @@ fn copy_d2d(
 }
 
 fn check_free(gpu: &Gpu, need: usize, headroom: usize, what: &str) -> Result<(), String> {
-    let (free, total) = hip(gpu.device_mem_info(), "query device memory")?;
+    // Planned capacity (total - own - reserve), not the instantaneous free
+    // figure: a transient foreign allocation must not flip the route. The
+    // allocation that follows is the real check.
+    let cap = hip(gpu.planned_capacity(), "query device memory")?;
+    let (free, total) = (cap.bytes, cap.total);
     let required = need
         .checked_add(headroom)
         .ok_or_else(|| format!("raon state: {what}: byte overflow"))?;
@@ -617,9 +629,39 @@ pub fn mirror_rows_for_budget(d: &RaonStateDims, budget_bytes: usize) -> usize {
     budget_bytes / mirror_row_bytes(d).max(1)
 }
 
+/// The mirror format rule, decided once per slot before any mirror memory exists:
+/// Q8 whenever it is allowed ([`RaonStateDims::mirror_q8`]); a slot with
+/// [`RaonStateDims::mirror_bf16_if_covered`] keeps BF16 while `usable` bytes back a
+/// BF16 mirror for all `max_seq` rows. An already backed mirror keeps its format.
+pub fn mirror_is_q8(d: &RaonStateDims, max_seq: usize, usable: usize, backed: bool) -> bool {
+    if !d.mirror_q8 || backed || !d.mirror_bf16_if_covered {
+        return d.mirror_q8;
+    }
+    let bf16 = RaonStateDims {
+        mirror_q8: false,
+        ..d.clone()
+    };
+    mirror_rows_for_budget(&bf16, usable) < max_seq
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // RaonState
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Uniform q/k/v conv-history geometry of the persistent slab, see
+/// [`RaonState::conv_slab_layout`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConvSlabLayout {
+    pub conv_off: usize,
+    /// Bytes between RDA layers' conv blocks.
+    pub layer_stride: usize,
+    /// Bytes between the q, k and v planes of one layer.
+    pub plane_pitch: usize,
+    /// Channels (F32 columns) per history row.
+    pub cols: usize,
+    /// History rows (`kernel - 1`).
+    pub hist: usize,
+}
 
 /// Snapshot of the recurrent block (RDA matrices, conv history, device token
 /// count) for graph warmup/capture: warm up, then [`RaonState::restore`].
@@ -637,6 +679,11 @@ impl RaonStateSnapshot {
     }
     pub fn n_tokens(&self) -> usize {
         self.n_tokens
+    }
+    /// The snapshot bytes: a verbatim copy of the persistent slab
+    /// ([`RaonState::persist_tensor`]), same offsets.
+    pub fn tensor(&self) -> &GpuTensor {
+        &self.buf
     }
     pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), String> {
         hip(gpu.free_tensor(self.buf), "free snapshot")
@@ -876,7 +923,7 @@ impl RaonState {
         let pending_latent = budget
             .full_physical(dims)
             .saturating_sub(budget.initial_physical(dims));
-        let (free, _) = hip(gpu.device_mem_info(), "query device memory")?;
+        let free = hip(gpu.planned_capacity(), "query device memory")?.bytes;
         let usable = free
             .saturating_sub(pending_latent)
             .saturating_sub(ADMISSION_HEADROOM_BYTES)
@@ -992,8 +1039,11 @@ impl RaonState {
             ));
         }
         let v = i32::try_from(n).map_err(|_| "raon state: n_tokens exceeds i32".to_string())?;
+        // The length is the immediate of one memset-d32 enqueued on the decode stream (the
+        // legacy stream when there is none): ordered with the kernels that read it, no
+        // blocking null-stream copy between two graph replays.
         hip(
-            gpu.hip.memcpy_htod(&self.seq_len.buf, &v.to_le_bytes()),
+            gpu.write_u32_stream_ordered(&self.seq_len.buf, v as u32),
             "write seq_len",
         )?;
         self.n_tokens = n;
@@ -1060,7 +1110,10 @@ impl RaonState {
         Ok(())
     }
 
-    /// Restore the recurrent block and length from `snap`.
+    /// Restore the recurrent block and length from `snap`. Latent rows at or
+    /// beyond the restored length are dead, so the expanded mirror's valid-row
+    /// watermark drops to the restored length too (it never exceeds
+    /// `n_tokens`); the next forward re-expands anything it needs.
     pub fn restore(&mut self, gpu: &Gpu, snap: &RaonStateSnapshot) -> Result<(), String> {
         if snap.bytes != self.layout.total {
             return Err("raon state: snapshot was taken with different dims".into());
@@ -1071,13 +1124,112 @@ impl RaonState {
             "restore",
         )?;
         self.n_tokens = snap.n_tokens;
+        self.clamp_mirror_valid_rows(snap.n_tokens);
         Ok(())
+    }
+
+    /// The persistent slab (RDA matrices, conv histories, device `seq_len`).
+    pub fn persist_tensor(&self) -> &GpuTensor {
+        &self.persist
+    }
+
+    /// The persistent slab as one session-cache state part: the buffer and the
+    /// bytes of it that are state (RDA matrices, conv histories, device
+    /// `seq_len`), overwritten in place by every forward.
+    pub fn persist_part(&self) -> (&hip_bridge::DeviceBuffer, usize) {
+        (&self.persist.buf, self.layout.total)
+    }
+
+    /// Set the host token count after a session restore. The device `seq_len`
+    /// came with the restored slab, so nothing is written to the device (use
+    /// [`Self::set_n_tokens`] when the device count must change too).
+    pub fn set_host_tokens(&mut self, n: usize) -> Result<(), String> {
+        if n > self.max_seq {
+            return Err(format!(
+                "raon state: n_tokens {n} exceeds reserved max_seq {}",
+                self.max_seq
+            ));
+        }
+        self.n_tokens = n;
+        Ok(())
+    }
+
+    /// Uniform q/k/v conv-history layout of the slab (identical in any
+    /// [`RaonStateSnapshot`] of it): layer `ri`'s plane `p` (0 q, 1 k, 2 v)
+    /// starts at `conv_off + ri * layer_stride + p * plane_pitch` bytes and is
+    /// `[conv_hist, cols]` F32, oldest -> newest. The three planes share one
+    /// pitch and width (`heads*k_dim == heads*v_dim`), so one pitched copy
+    /// moves all three; any other geometry is refused.
+    pub fn conv_slab_layout(&self) -> Result<ConvSlabLayout, String> {
+        let d = &self.dims;
+        let planes = conv_plane_bytes(d)?;
+        let elems = d.conv_plane_elems();
+        if planes[0] != planes[1]
+            || planes[1] != planes[2]
+            || elems[0] != elems[1]
+            || elems[1] != elems[2]
+        {
+            return Err("raon state: q/k/v conv history planes differ in size".into());
+        }
+        Ok(ConvSlabLayout {
+            conv_off: self.layout.conv_off,
+            layer_stride: self.layout.conv_stride,
+            plane_pitch: planes[0],
+            cols: elems[0] / d.conv_hist,
+            hist: d.conv_hist,
+        })
+    }
+
+    /// Download the whole persistent slab (RDA matrices, conv histories, device
+    /// `seq_len`, alignment padding) after draining the device. Oracle use.
+    pub fn download_persist(&self, gpu: &Gpu) -> Result<Vec<u8>, String> {
+        hip(
+            gpu.hip.device_synchronize(),
+            "synchronize before slab download",
+        )?;
+        let mut out = vec![0u8; self.layout.total];
+        hip(
+            gpu.hip.memcpy_dtoh(&mut out, &self.persist.buf),
+            "download persistent slab",
+        )?;
+        Ok(out)
     }
 
     /// Most rows the decompressed (mirror) MLA route can serve on this
     /// device: fixed at slot admission from the free device memory.
     pub fn mirror_budget_rows(&self) -> usize {
         self.mirror_budget_rows
+    }
+
+    /// Device bytes this slot may still map before it holds `through` tokens:
+    /// the unmapped latent growth of every MLA layer (VMM backend; the dense
+    /// backend committed `max_seq` rows up front) plus the expanded mirror's
+    /// growth up to `min(through, mirror_budget_rows)` rows, rounded up to
+    /// the mirror's growth chunk. An upper bound: a context that ends up on
+    /// the absorbed route backs no more mirror than this.
+    pub fn context_growth_bytes(&self, gpu: &Gpu, through: usize) -> u64 {
+        let through = through.min(self.max_seq);
+        let latent: usize = match (self.backend, self.plan) {
+            (LatentBackend::Vmm, Some(plan)) => {
+                let want = plan.mapped_bytes_for_tokens(through).unwrap_or(0);
+                self.mla_cache
+                    .iter()
+                    .map(|t| want.saturating_sub(gpu.vmm_mapped_bytes(t).unwrap_or(0)))
+                    .sum()
+            }
+            _ => 0,
+        };
+        let mirror = if self.dims.n_mla == 0 {
+            0
+        } else {
+            let rows = through
+                .min(self.mirror_budget_rows)
+                .next_multiple_of(MIRROR_CHUNK_ROWS)
+                .min(self.mirror_budget_rows);
+            mirror_row_bytes(&self.dims)
+                .saturating_mul(rows.saturating_sub(self.mirror_backed_rows()))
+        };
+        (latent as u64).saturating_add(mirror as u64)
     }
 
     /// Latent-cache bytes this slot may still map up to `max_seq`.
@@ -1100,29 +1252,85 @@ impl RaonState {
     /// latent growth to `max_seq`, [`ADMISSION_HEADROOM_BYTES`] and
     /// [`MIRROR_POST_ASSEMBLY_RESERVE_BYTES`]. Returns the new budget in rows.
     ///
-    /// Format selection (capacity-based): while no mirror is backed yet and the Q8
-    /// mirror is allowed ([`RaonStateDims::mirror_q8`]), the BF16 mirror is kept
-    /// whenever its budget covers the whole reserved context (`max_seq`; it is
-    /// 1-2% faster), and Q8 is chosen otherwise (it backs about twice the rows).
-    /// The choice is made here, once, before any mirror memory exists.
+    /// Format selection ([`mirror_is_q8`]): Q8 whenever it is allowed
+    /// ([`RaonStateDims::mirror_q8`]), except that a speculative slot
+    /// ([`RaonStateDims::mirror_bf16_if_covered`]) keeps BF16 while its budget covers
+    /// the whole reserved context. The choice is made here, once, before any mirror
+    /// memory exists.
     pub fn fit_mirror_budget(&mut self, gpu: &Gpu) -> Result<usize, String> {
-        let (free, _) = hip(gpu.device_mem_info(), "query device memory")?;
-        let usable = free
-            .saturating_sub(self.pending_latent_bytes(gpu))
+        let usable = self.mirror_available_bytes(gpu)?;
+        let (q8, rows) = self.plan_mirror(usable);
+        self.dims.mirror_q8 = q8;
+        self.mirror_budget_rows = rows;
+        Ok(self.mirror_budget_rows)
+    }
+
+    /// Device bytes the expanded mirror, the prefill scratch and the module work
+    /// buffers may still claim together right now: free memory minus the latent
+    /// growth to `max_seq`, [`ADMISSION_HEADROOM_BYTES`] and
+    /// [`MIRROR_POST_ASSEMBLY_RESERVE_BYTES`]. The chunk admission subtracts a
+    /// candidate's scratch+work bytes from this and asks
+    /// [`Self::projected_mirror_budget_rows`] what is left for the mirror.
+    pub fn mirror_available_bytes(&self, gpu: &Gpu) -> Result<usize, String> {
+        self.mirror_available_with_input(gpu).map(|(b, _)| b)
+    }
+
+    /// [`Self::mirror_available_bytes`] plus the planned-capacity input it was
+    /// decided from (for the load log). Planned from device total minus this
+    /// process's own allocations and a fixed reserve, never the instantaneous
+    /// free figure.
+    pub fn mirror_available_with_input(
+        &self,
+        gpu: &Gpu,
+    ) -> Result<(usize, rdna_compute::PlannedCapacity), String> {
+        let cap = hip(gpu.planned_capacity(), "query device memory")?;
+        let pending = self.pending_latent_bytes(gpu);
+        let planned = cap
+            .bytes
+            .saturating_sub(pending)
             .saturating_sub(ADMISSION_HEADROOM_BYTES)
             .saturating_sub(MIRROR_POST_ASSEMBLY_RESERVE_BYTES);
-        if self.dims.mirror_q8 && self.mirror.is_none() {
-            let bf16 = RaonStateDims {
-                mirror_q8: false,
-                ..self.dims.clone()
-            };
-            if mirror_rows_for_budget(&bf16, usable) >= self.max_seq {
-                self.dims.mirror_q8 = false;
-            }
+        // The planned figure ignores a foreign holder and any runtime residency
+        // beyond its reserve, so a mirror that grows lazily into physically
+        // absent memory would fill the card (measured: VRAM 100% full -> pp4096
+        // 5.8k -> 1.0k, decode 73 -> 12 tok/s at 3.3 GiB foreign). Cap by what
+        // the device can really still back, less a fixed floor. Applied here, in
+        // the one place both the chunk admission (before scratch exists; the
+        // candidate's bytes are subtracted later) and `fit_mirror_budget` read,
+        // so the chunk rung is picked against the same mirror the fit will give
+        // (otherwise a rung that "preserves" a planned-only mirror wins and the
+        // fit then shrinks it below what a smaller rung would have kept).
+        let real = hip(gpu.device_mem_info(), "query device memory")?.0;
+        let real_cap = real
+            .saturating_sub(pending)
+            .saturating_sub(MIRROR_REAL_FLOOR_BYTES);
+        if real_cap < planned {
+            eprintln!(
+                "raon1_mini: expanded K/V mirror capacity capped by real free memory: planned {:.0} MiB, still allocatable {:.0} MiB after the {:.0} MiB floor",
+                mib(planned),
+                mib(real_cap),
+                mib(MIRROR_REAL_FLOOR_BYTES)
+            );
         }
-        let rows = self.mirror_backed_rows() + mirror_rows_for_budget(&self.dims, usable);
-        self.mirror_budget_rows = rows.min(self.max_seq);
-        Ok(self.mirror_budget_rows)
+        Ok((planned.min(real_cap), cap))
+    }
+
+    /// Mirror budget in rows [`Self::fit_mirror_budget`] would settle on if
+    /// `usable` bytes were available to it (pure: no device query, no state
+    /// change; same capacity-based BF16/Q8 choice).
+    pub fn projected_mirror_budget_rows(&self, usable: usize) -> usize {
+        self.plan_mirror(usable).1
+    }
+
+    /// `(mirror is Q8, budget rows)` for `usable` bytes.
+    fn plan_mirror(&self, usable: usize) -> (bool, usize) {
+        let q8 = mirror_is_q8(&self.dims, self.max_seq, usable, self.mirror.is_some());
+        let dims = RaonStateDims {
+            mirror_q8: q8,
+            ..self.dims.clone()
+        };
+        let rows = self.mirror_backed_rows() + mirror_rows_for_budget(&dims, usable);
+        (q8, rows.min(self.max_seq))
     }
 
     /// Override the admission-time budget (oracle/test control: a lower value
@@ -1511,6 +1719,21 @@ impl ElemKind {
     }
 }
 
+/// `HIPFIRE_RAON_MHC_FUSED=1` + `HIPFIRE_RAON_MHC_BF16_STREAMS=1` (see
+/// [`crate::mhc::bf16_streams_enabled`]): the mHC stream ping-pong planes are
+/// BF16 bits instead of F32 planes carrying BF16 values (same values, half the
+/// bytes). Every other scratch buffer is unchanged.
+fn retarget_stream_kinds(d: &RaonStateDims, specs: &mut [(&'static str, ElemKind, Vec<usize>)]) {
+    if !crate::mhc::bf16_streams_enabled(d.n_streams, d.hidden) {
+        return;
+    }
+    for (name, kind, _) in specs.iter_mut() {
+        if matches!(*name, "stream_a" | "stream_b") {
+            *kind = ElemKind::BF16;
+        }
+    }
+}
+
 /// One planned scratch buffer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScratchEntry {
@@ -1609,7 +1832,9 @@ macro_rules! scratch_buffers {
         fn scratch_specs($d: &RaonStateDims, $r: usize)
             -> Vec<(&'static str, ElemKind, Vec<usize>)>
         {
-            vec![ $( (stringify!($name), ElemKind::$kind, vec![$($dim),+]) ),+ ]
+            let mut specs = vec![ $( (stringify!($name), ElemKind::$kind, vec![$($dim),+]) ),+ ];
+            retarget_stream_kinds($d, &mut specs);
+            specs
         }
 
         impl RaonPrefillScratch {
@@ -1826,7 +2051,15 @@ mod tests {
             p512.entry("moe_act").is_none(),
             "FFN/MoE work buffers are module-owned, not scratch fields"
         );
-        assert_eq!(p512.entry("stream_a").unwrap().bytes, 512 * 4 * 2560 * 4);
+        let stream_elem = if crate::mhc::bf16_streams_enabled(d.n_streams, d.hidden) {
+            2
+        } else {
+            4
+        };
+        assert_eq!(
+            p512.entry("stream_a").unwrap().bytes,
+            512 * 4 * 2560 * stream_elem
+        );
         assert!(scratch_plan(&d, 0).is_err());
         assert!(scratch_plan(&d, MAX_SCRATCH_ROWS + 1).is_err());
     }
@@ -1842,6 +2075,28 @@ mod tests {
         assert_eq!(mirror_plane_row_bytes(&d), [5200, 5200]);
         assert_eq!(expanded_mirror_bytes(&d, 8192).unwrap(), 8192 * 72_800);
         assert!(d.validate().is_ok());
+    }
+
+    #[test]
+    fn mirror_format_rule() {
+        let max_seq = 32_832;
+        let covers = 143_360 * max_seq; // BF16 backs exactly max_seq rows
+        let short = covers - 1;
+        let mut d = RaonStateDims::raon();
+        // Non-speculative slot: Q8 even when BF16 would cover the context.
+        assert!(mirror_is_q8(&d, max_seq, covers * 2, false));
+        assert!(mirror_is_q8(&d, max_seq, short, false));
+        // Speculative slot: BF16 while it covers, Q8 once it cannot.
+        d.mirror_bf16_if_covered = true;
+        assert!(!mirror_is_q8(&d, max_seq, covers, false));
+        assert!(mirror_is_q8(&d, max_seq, short, false));
+        // A backed mirror keeps its format.
+        assert!(mirror_is_q8(&d, max_seq, covers, true));
+        // Q8 disallowed (HIPFIRE_RAON_MIRROR_Q8=0): BF16 regardless.
+        d.mirror_q8 = false;
+        assert!(!mirror_is_q8(&d, max_seq, short, false));
+        d.mirror_bf16_if_covered = false;
+        assert!(!mirror_is_q8(&d, max_seq, short, false));
     }
 
     #[test]

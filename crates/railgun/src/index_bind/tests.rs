@@ -184,6 +184,8 @@ pub(crate) fn writer_facts() -> Arc<NodeFacts> {
                     guard("grid_dim", 2, 0, "1"),
                 ],
                 indexed: vec![effect],
+                tables: Vec::new(),
+                arenas: Vec::new(),
                 witnesses: vec!["indexed_bind".into()],
                 case_digest: "ef".repeat(32),
             }),

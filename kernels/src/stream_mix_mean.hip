@@ -28,9 +28,15 @@ __device__ __forceinline__ float sm_round_bf16(float x) {
     return __uint_as_float(u & 0xffff0000u);
 }
 
-extern "C" __launch_bounds__(SM_THREADS)
-__global__ void stream_mix_mean(
-    const float* __restrict__ x,      // [rows, n, width]
+__device__ __forceinline__ float sm_ld(const float* p) { return *p; }
+__device__ __forceinline__ float sm_ld(const unsigned short* p) {
+    return __uint_as_float(((unsigned int)*p) << 16);
+}
+
+// XT = float (F32 plane) or unsigned short (BF16 bits, exact widening).
+template <typename XT>
+__device__ __forceinline__ void stream_mix_mean_body(
+    const XT* __restrict__ x,         // [rows, n, width]
     const void*  __restrict__ gamma,  // [width] or null
     float*       __restrict__ out,    // [rows, width]
     int n,
@@ -45,13 +51,13 @@ __global__ void stream_mix_mean(
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
 
-    const float* xr = x + (size_t)row * n * width;
+    const XT* xr = x + (size_t)row * n * width;
     const float n_f = (float)n;
 
     float ss = 0.0f;
     for (int c = tid; c < width; c += SM_THREADS) {
         float a = 0.0f;
-        for (int s = 0; s < n; ++s) a += xr[(size_t)s * width + c];
+        for (int s = 0; s < n; ++s) a += sm_ld(xr + (size_t)s * width + c);
         a = a / n_f;
         if (bf16) a = sm_round_bf16(a);
         mean[c] = a;
@@ -84,4 +90,22 @@ __global__ void stream_mix_mean(
         }
         o[c] = v;
     }
+}
+
+extern "C" __launch_bounds__(SM_THREADS)
+__global__ void stream_mix_mean(
+    const float* __restrict__ x, const void* __restrict__ gamma,
+    float* __restrict__ out, int n, int width, float eps, int bf16, int has_norm,
+    int gamma_kind
+) {
+    stream_mix_mean_body<float>(x, gamma, out, n, width, eps, bf16, has_norm, gamma_kind);
+}
+
+extern "C" __launch_bounds__(SM_THREADS)
+__global__ void stream_mix_mean_bf16(
+    const unsigned short* __restrict__ x, const void* __restrict__ gamma,
+    float* __restrict__ out, int n, int width, float eps, int bf16, int has_norm,
+    int gamma_kind
+) {
+    stream_mix_mean_body<unsigned short>(x, gamma, out, n, width, eps, bf16, has_norm, gamma_kind);
 }

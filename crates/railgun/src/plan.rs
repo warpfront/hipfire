@@ -22,14 +22,21 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
 
+use crate::coresident::GroupPlan;
 use crate::kernel::{CondLowering, Conditional, KernelProgram, MemClass};
 use crate::ResourceId;
 
-/// gfx12 `ACQUIRE_MEM` cache rungs railgun lowers to, ordered by what they
-/// invalidate: `InterNode` = scalar + vector L0 (`acquire_inter_node_gfx12`,
-/// GCR 0x10180); `System` = the ownership-boundary acquire
-/// (`acquire_system_gfx12`, GCR 0xc3b1: adds GL1 and GL2 writeback +
-/// invalidate).
+/// `ACQUIRE_MEM` cache rungs railgun lowers to, ordered by what they
+/// invalidate. The packet each rung lowers to per arch:
+///
+/// | rung | gfx12 | exact gfx1100 (gfx11 legacy PM4) |
+/// |---|---|---|
+/// | `InterNode` | `acquire_inter_node_gfx12`, GCR 0x10180 (scalar + vector L0) | `acquire_inter_node_same_agent`, GCR 0x380 (scalar + vector L0/GL1; no GL2 writeback) |
+/// | `System` | `acquire_system_gfx12`, GCR 0xc3b1 (adds GL1 and GL2 writeback + invalidate) | ROCr's gfx10+ system `ACQUIRE_MEM` (`acquire_system`: GL2 writeback + invalidate) |
+///
+/// `WaitIdle` is `EVENT_WRITE CS_PARTIAL_FLUSH` on both families. The G4
+/// probe names (`wait_inter_node`, `wait_system`) are the same on both: on
+/// gfx11 the probe resolves them to the packets above.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Rung {
@@ -103,11 +110,23 @@ const GFX12_PARITY: &str = "Redline gfx1201 retained PM4 at WaitIdle + acquire_i
      decode-1201-r2/report.md §1); replay.rs:5349-5389";
 const GFX12_PRE_WRITER: &str = "Redline's name-keyed writer-side system acquire before mq_rotate_x / fused_silu_mul_mq_rotate \
      (replay.rs:2987-2989, 5343-5376: a retained GC12 vector-cache line of the reused rotate destination), parity as above";
+const GFX1100_PARITY: &str = "Redline gfx1100 retained PM4 (prepare_pm4_prefix_inner): CS_PARTIAL_FLUSH + acquire_inter_node_same_agent (GCR 0x380) \
+     on every resource-dependent boundary (the HIPFIRE_REPLAY_PM4_GFX11_VMEM_ACQUIRE rung is opt-in, default off and not modelled); \
+     tier-D evidence class only: no railgun G4 silicon receipt exists for gfx1100";
+const GFX1100_PRE_WRITER: &str = "Redline gfx11 has NO writer-side pre-dispatch acquire (requires_gfx12_pre_dispatch_vmem_acquire is gfx12-only); \
+     the tier-D row is a bare WaitIdle (G4 probe rung `wait`, the weakest rung that is safe for war_pre_writer on gfx1100 in the September run), \
+     so a boundary joined with the dependent row is byte-identical to Redline's. Until it is receipted the strict policy \
+     (RowPolicy::UnreceiptedSystem) lowers this hazard WaitIdle + System";
 
 impl CacheTable {
-    /// The table for `arch`, or `None` where M1 has no rows (only gfx12 is
-    /// authored in M1).
+    /// The table for `arch`, or `None` where railgun has no rows: gfx12
+    /// (`gfx1200`, `gfx1201`) and exact `gfx1100`. Every other gfx11 part
+    /// (gfx1101/1102/1150/1151/1152) has no rows: their command processors
+    /// and caches are unverified here.
     pub fn for_arch(arch: &str) -> Option<Self> {
+        if arch == "gfx1100" {
+            return Some(Self::gfx1100());
+        }
         if !matches!(arch, "gfx1200" | "gfx1201") {
             return None;
         }
@@ -139,6 +158,46 @@ impl CacheTable {
                 ),
             ],
         })
+    }
+
+    /// Exact gfx1100 (RDNA3 Navi 31, 7900 XTX), tier-D: Redline's gfx11
+    /// retained-PM4 policy (`CS_PARTIAL_FLUSH` + `acquire_inter_node_same_agent`
+    /// per dependent boundary). The writer-side row is a bare `WaitIdle`
+    /// (probe rung `wait`; the empty row would probe as `none`, which
+    /// removes the WAR wait itself and is stale by construction): Redline
+    /// gfx11 has no counterpart of the gfx12 pre-dispatch acquire. Joined
+    /// with a WAR/WAW/RAW row it lowers byte-identically to Redline. A
+    /// product MUST lower under [`RowPolicy::UnreceiptedSystem`] until
+    /// [`Self::attach_receipts`] has attached a gfx1100 G4 probe table.
+    fn gfx1100() -> Self {
+        let dependent = Visibility {
+            wait_idle: true,
+            acquire: Rung::InterNode,
+            pre_writer: false,
+        };
+        let row = |hazard, visibility, evidence| CacheRow {
+            hazard,
+            visibility,
+            evidence,
+            g4_receipt: None,
+        };
+        Self {
+            arch: "gfx1100".to_owned(),
+            rows: vec![
+                row(Hazard::Raw, dependent, GFX1100_PARITY),
+                row(Hazard::War, dependent, GFX1100_PARITY),
+                row(Hazard::Waw, dependent, GFX1100_PARITY),
+                row(
+                    Hazard::WarPreWriter,
+                    Visibility {
+                        wait_idle: true,
+                        acquire: Rung::None,
+                        pre_writer: true,
+                    },
+                    GFX1100_PRE_WRITER,
+                ),
+            ],
+        }
     }
 
     /// Attach G4 silicon receipts (design §5 G4) from a probe cache table
@@ -237,11 +296,17 @@ pub const GFX1201_POST_DISPATCH_NOP: u32 = 64;
 
 impl ArchLowering {
     /// The lowering parameters for `arch`. Only exact gfx1201 is paced: the
-    /// sweep ran there, and gfx1200 has no bench card.
+    /// sweep ran there, and gfx1200 has no bench card. Exact gfx1100 is
+    /// explicitly unpaced: the post-dispatch `NOP` is a gfx12 command
+    /// processor property (`Gfx12DispatchPacing`; the gfx11 builder has no
+    /// pacing packet), and nothing has measured one on gfx1100.
     pub fn for_arch(arch: &str) -> Self {
         match arch {
             "gfx1201" => Self {
                 post_dispatch_nop: GFX1201_POST_DISPATCH_NOP,
+            },
+            "gfx1100" => Self {
+                post_dispatch_nop: 0,
             },
             _ => Self {
                 post_dispatch_nop: 0,
@@ -332,6 +397,14 @@ pub struct Pm4Plan {
     pub rows_used: BTreeMap<Hazard, usize>,
     /// #867 `CpSkip` conditionals, in node order.
     pub skips: Vec<Conditional>,
+    /// Co-resident groups ([`KernelProgram::add_coresident_group`]), in node
+    /// order, with their member-member classification and, once admitted,
+    /// their residency proof.
+    pub groups: Vec<GroupPlan>,
+    /// Why the program is not certified: its `LabPending` nodes and
+    /// uncertified group orderings ([`Pm4Plan::admission`]; empty in a
+    /// product build).
+    pub pending: Vec<String>,
 }
 
 /// One PM4 command of a segment, before packet encoding.
@@ -400,6 +473,26 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
     // entry is kept and joined back at its end (a skipped body is treated as
     // executed: its own effects stay open).
     let mut entry_state: Option<(Vec<usize>, HashMap<ResourceId, usize>, usize)> = None;
+    let mut open_group: Option<usize> = None;
+    let group_plans: Vec<GroupPlan> = program
+        .groups
+        .iter()
+        .enumerate()
+        .map(|(index, g)| {
+            let (admitted, refusals) = crate::coresident::classify(program, g);
+            GroupPlan {
+                nodes: g.nodes.clone(),
+                admitted,
+                refusals,
+                residency: None,
+                pending: {
+                    let mut pending = crate::admission::node_pending(program, g.nodes.clone());
+                    pending.extend(crate::admission::ordering_pending(index, g));
+                    pending
+                },
+            }
+        })
+        .collect();
     for (j, node) in program.nodes.iter().enumerate() {
         if skips.iter().any(|c| c.body.end == j) {
             if let Some((was_open, loads, system)) = entry_state.take() {
@@ -419,7 +512,8 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
                 (Vec::new(), HashMap::new(), j)
             });
         }
-        if !node.lowering.is_pm4() {
+        if !node.lowering.is_pm4_lowerable() {
+            open_group = None;
             if let Some(first) = segment_start.take() {
                 segments.push(Segment { first, end: j });
             }
@@ -430,12 +524,31 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
             });
             continue;
         }
+        let group_member = program.groups.iter().position(|g| g.nodes.contains(&j));
+        // A later member of the group whose first member already emitted the
+        // join of every member's pre-group edges: no boundary of its own
+        // (members run concurrently; their mutual edges are classified in
+        // `GroupPlan`, never answered by a wait).
+        if let (Some(g), Some(open_g)) = (group_member, open_group) {
+            if g == open_g && segment_start.is_some() {
+                boundaries.push(Boundary {
+                    visibility: Visibility::default(),
+                    edges: Vec::new(),
+                    split: false,
+                });
+                open.push(j);
+                note_loads(program, j, &mut last_vmem_load);
+                continue;
+            }
+        }
+        let group_start = group_member.filter(|&g| program.groups[g].nodes.start == j);
         let Some(first) = segment_start else {
             segment_start = Some(j);
             open.clear();
             open.push(j);
             last_vmem_load.clear();
             last_system = j;
+            open_group = group_start;
             // After a non-PM4 node the entry follows a drained HIP stream.
             let after_barrier = j > 0;
             let visibility = if after_barrier { BARRIER } else { ENTRY };
@@ -448,46 +561,54 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
             continue;
         };
         debug_assert!(first < j);
+        // The first member of a group answers for every member: all of them
+        // run after this boundary, against the nodes that precede the group.
+        let consumers = match group_start {
+            Some(g) => program.groups[g].nodes.clone(),
+            None => j..j + 1,
+        };
         let mut edges = Vec::new();
-        for effect in &program.nodes[j].effects {
-            for &i in &open {
-                for earlier in &program.nodes[i].effects {
-                    if earlier.resource != effect.resource {
-                        continue;
-                    }
-                    let mut push = |hazard| {
-                        edges.push(Edge {
-                            producer: i,
-                            consumer: j,
-                            hazard,
-                            resource: effect.resource.0,
-                        })
-                    };
-                    if earlier.writes() && effect.reads() {
-                        push(Hazard::Raw);
-                    }
-                    if earlier.reads() && effect.writes() {
-                        push(Hazard::War);
-                    }
-                    if earlier.writes() && effect.writes() {
-                        push(Hazard::Waw);
+        for m in consumers {
+            for effect in &program.nodes[m].effects {
+                for &i in &open {
+                    for earlier in &program.nodes[i].effects {
+                        if earlier.resource != effect.resource {
+                            continue;
+                        }
+                        let mut push = |hazard| {
+                            edges.push(Edge {
+                                producer: i,
+                                consumer: m,
+                                hazard,
+                                resource: effect.resource.0,
+                            })
+                        };
+                        if earlier.writes() && effect.reads() {
+                            push(Hazard::Raw);
+                        }
+                        if earlier.reads() && effect.writes() {
+                            push(Hazard::War);
+                        }
+                        if earlier.writes() && effect.writes() {
+                            push(Hazard::Waw);
+                        }
                     }
                 }
-            }
-            if effect.has(MemClass::VmemStore) {
-                if let Some(&i) = last_vmem_load.get(&effect.resource) {
-                    if i >= last_system && i < j {
-                        edges.push(Edge {
-                            producer: i,
-                            consumer: j,
-                            hazard: Hazard::WarPreWriter,
-                            resource: effect.resource.0,
-                        });
+                if effect.has(MemClass::VmemStore) {
+                    if let Some(&i) = last_vmem_load.get(&effect.resource) {
+                        if i >= last_system && i < j {
+                            edges.push(Edge {
+                                producer: i,
+                                consumer: m,
+                                hazard: Hazard::WarPreWriter,
+                                resource: effect.resource.0,
+                            });
+                        }
                     }
                 }
             }
         }
-        edges.sort_by_key(|e| (e.hazard, e.producer, e.resource));
+        edges.sort_by_key(|e| (e.hazard, e.producer, e.consumer, e.resource));
         edges.dedup();
         let visibility = edges.iter().fold(Visibility::default(), |acc, e| {
             acc.join(visibility_of(e.hazard))
@@ -507,6 +628,7 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
             last_system = j;
         }
         note_loads(program, j, &mut last_vmem_load);
+        open_group = group_start;
         boundaries.push(Boundary {
             visibility,
             edges,
@@ -522,6 +644,8 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
         boundaries,
         rows_used,
         skips,
+        groups: group_plans,
+        pending: crate::admission::program_pending(program),
     }
 }
 
@@ -717,6 +841,219 @@ mod tests {
             RowPolicy::UnreceiptedSystem,
         );
         assert_eq!(strict.boundaries[2].visibility.acquire, Rung::System);
+    }
+
+    fn chain_gfx1100() -> crate::kernel::KernelProgram {
+        let mut p = chain();
+        p.arch = "gfx1100".into();
+        p
+    }
+
+    #[test]
+    fn gfx1100_table_is_exact_and_mirrors_redline_gfx11() {
+        let t = CacheTable::for_arch("gfx1100").expect("gfx1100 table");
+        assert_eq!(t.arch, "gfx1100");
+        let dependent = Visibility {
+            wait_idle: true,
+            acquire: Rung::InterNode,
+            pre_writer: false,
+        };
+        for hazard in [Hazard::Raw, Hazard::War, Hazard::Waw] {
+            assert_eq!(t.row(hazard).visibility, dependent, "{hazard:?}");
+            assert!(t.row(hazard).evidence.contains("same_agent"));
+            assert!(t.row(hazard).g4_receipt.is_none());
+        }
+        // The writer-side row is a bare WaitIdle: probe rung `wait`. (The
+        // empty row would probe as `none`, which removes the WAR wait itself
+        // and is stale by construction.)
+        assert_eq!(
+            t.row(Hazard::WarPreWriter).visibility,
+            Visibility {
+                wait_idle: true,
+                acquire: Rung::None,
+                pre_writer: true
+            }
+        );
+        assert_eq!(probe_rung(t.row(Hazard::WarPreWriter).visibility), "wait");
+        assert!(t.row(Hazard::WarPreWriter).g4_receipt.is_none());
+        // Exact device only: no other gfx11 part is a table.
+        for other in [
+            "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx11", "GFX1100",
+            "gfx1100 ", "",
+        ] {
+            assert!(CacheTable::for_arch(other).is_none(), "{other:?}");
+        }
+        // The gfx12 table is untouched.
+        assert_eq!(
+            CacheTable::for_arch("gfx1201")
+                .unwrap()
+                .row(Hazard::WarPreWriter)
+                .visibility,
+            Visibility {
+                wait_idle: true,
+                acquire: Rung::System,
+                pre_writer: true
+            }
+        );
+    }
+
+    #[test]
+    fn gfx1100_tier_d_plan_has_no_gfx12_pre_writer_system_acquire() {
+        let table = CacheTable::for_arch("gfx1100").unwrap();
+        let p = plan(&chain_gfx1100(), &table, RowPolicy::TierD);
+        assert!(p.is_single_segment(4));
+        assert_eq!(p.boundaries[0].visibility, ENTRY);
+        assert_eq!(
+            p.boundaries[1].visibility,
+            Visibility {
+                wait_idle: true,
+                acquire: Rung::InterNode,
+                pre_writer: false
+            }
+        );
+        // n2 stores A (n0 loaded it): the derived pre-writer edge's gfx11
+        // tier-D row is a bare WaitIdle (probe rung `wait`), unlike gfx1201's
+        // System row: no gfx12 system acquire on gfx11.
+        assert_eq!(
+            p.boundaries[2]
+                .edges
+                .iter()
+                .map(|e| (e.hazard, e.producer))
+                .collect::<Vec<_>>(),
+            [(Hazard::WarPreWriter, 0)]
+        );
+        assert_eq!(
+            p.boundaries[2].visibility,
+            Visibility {
+                wait_idle: true,
+                acquire: Rung::None,
+                pre_writer: true
+            }
+        );
+        assert!(p.boundaries[3].visibility.is_empty());
+        let c = p.counts();
+        assert_eq!(
+            (c.waits, c.inter_node, c.system, c.pre_writer),
+            (2, 1, 0, 1)
+        );
+        // Joined with a WAR/WAW/RAW row the boundary is exactly Redline's
+        // dependent boundary (wait + same-agent acquire).
+        assert_eq!(
+            table
+                .row(Hazard::War)
+                .visibility
+                .join(table.row(Hazard::WarPreWriter).visibility)
+                .acquire,
+            Rung::InterNode
+        );
+    }
+
+    #[test]
+    fn gfx1100_unreceipted_rows_lower_wait_idle_plus_system() {
+        let table = CacheTable::for_arch("gfx1100").unwrap();
+        let p = plan(&chain_gfx1100(), &table, RowPolicy::UnreceiptedSystem);
+        let system = Visibility {
+            wait_idle: true,
+            acquire: Rung::System,
+            pre_writer: false,
+        };
+        // Every row without a receipt is WaitIdle + the strongest acquire.
+        assert_eq!(p.boundaries[1].visibility, system);
+        // n1's System acquire is behind n0's load, so n2's store to A raises
+        // no pre-writer edge at all (the same coverage rule as gfx1201).
+        assert!(p.boundaries[2].edges.is_empty());
+        assert!(p.boundaries[2].visibility.is_empty());
+        assert!(p.boundaries[3].visibility.is_empty());
+        // A store into an allocation loaded earlier in the same open epoch
+        // is a WAR edge on its own row: unreceipted, hence System.
+        let a = 0x7000_0000u64;
+        let launches = vec![
+            launch(&[(0, a)], 16, vec![ptr(0, &[VmemLoad])]),
+            launch(&[(8, a)], 16, vec![ptr(8, &[VmemStore])]),
+        ];
+        let program = author("gfx1100", &launches);
+        let p = plan(&program, &table, RowPolicy::UnreceiptedSystem);
+        // WaitIdle + System, flagged as a writer-side boundary (the pre-writer
+        // row's own flag survives the strict policy).
+        assert_eq!(
+            p.boundaries[1].visibility,
+            Visibility {
+                pre_writer: true,
+                ..system
+            }
+        );
+        assert_eq!(
+            p.boundaries[1]
+                .edges
+                .iter()
+                .map(|e| e.hazard)
+                .collect::<Vec<_>>(),
+            [Hazard::War, Hazard::WarPreWriter]
+        );
+    }
+
+    #[test]
+    fn gfx1100_receipts_attach_against_the_gfx1100_probe_table() {
+        const M: u64 = 1 << 20;
+        let clean: &[(&str, u64, u64)] = &[("wait_inter_node", M, 0), ("wait", M, 0)];
+        let probe = |arch: &str| {
+            let mut g = g4(&[
+                ("raw_vmem", clean),
+                ("raw_smem", clean),
+                ("war", clean),
+                ("waw", clean),
+                ("war_pre_writer", clean),
+            ]);
+            g.identity.arch = arch.into();
+            g
+        };
+        // A gfx1201 probe never receipts the gfx1100 table.
+        let mut t = CacheTable::for_arch("gfx1100").unwrap();
+        assert!(t.attach_receipts(&probe("gfx1201"), "p", M).is_err());
+        // A clean gfx1100 probe receipts all four rows (the pre-writer row
+        // against the probe's `wait` rung), after which the strict policy
+        // keeps each row's own visibility.
+        assert_eq!(t.attach_receipts(&probe("gfx1100"), "p", M), Ok(4));
+        let p = plan(&chain_gfx1100(), &t, RowPolicy::UnreceiptedSystem);
+        assert_eq!(
+            p.boundaries[1].visibility,
+            Visibility {
+                wait_idle: true,
+                acquire: Rung::InterNode,
+                pre_writer: false
+            }
+        );
+        assert_eq!(
+            p.boundaries[2].visibility,
+            Visibility {
+                wait_idle: true,
+                acquire: Rung::None,
+                pre_writer: true
+            }
+        );
+        // A stale `wait` rung on the pre-writer probe row refuses the attach.
+        let mut t = CacheTable::for_arch("gfx1100").unwrap();
+        let mut stale = probe("gfx1100");
+        stale
+            .rows
+            .iter_mut()
+            .find(|r| r.row == "war_pre_writer")
+            .unwrap()
+            .trials
+            .iter_mut()
+            .find(|x| x.rung == "wait")
+            .unwrap()
+            .stale_trials = 5;
+        assert!(t.attach_receipts(&stale, "p", M).is_err());
+    }
+
+    #[test]
+    fn gfx1100_is_unpaced_and_cp_skip_is_refused() {
+        assert_eq!(ArchLowering::for_arch("gfx1100").post_dispatch_nop, 0);
+        assert_eq!(ArchLowering::for_arch("gfx1201").post_dispatch_nop, 64);
+        assert!(!cp_skip_admitted("gfx1100"));
+        assert!(!cp_skip_admitted("gfx1201"));
+        assert!(cp_skip_admitted("gfx1151"));
     }
 
     fn g4(rows: &[(&str, &[(&str, u64, u64)])]) -> G4Table {

@@ -9,6 +9,24 @@ static PM_VERIFIED: LazyLock<bool> = LazyLock::new(|| {
     let digest = Sha256::digest(kernels::NPU_TRUNK_PM_GFX1151);
     format!("{digest:x}") == kernels::NPU_TRUNK_PM_GFX1151_SHA256
 });
+static PACK_PM_VERIFIED: LazyLock<bool> = LazyLock::new(|| {
+    let digest = Sha256::digest(kernels::NPU_TRUNK_PACK_PM_GFX1151);
+    format!("{digest:x}") == kernels::NPU_TRUNK_PACK_PM_GFX1151_SHA256.trim()
+});
+/// `HIPFIRE_NPU_TRUNK_PACK_A_PM` (developer, default on; `0` restores the hipcc A-pack producers).
+static PACK_PM_FLAG: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_NPU_TRUNK_PACK_A_PM", true));
+
+/// Which kernel produces the G80 A stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackRoute {
+    /// Retained generic-K scalar hipcc producer (`npu_trunk_pack_a_bf16_old`).
+    Scalar,
+    /// The K = 2560 / 5120 wave32/register hipcc producer (JIT of `kernels/src/npu_trunk.hip`).
+    Hipcc,
+    /// The route-A sealed PM twin of that producer (`.text` byte-identical to the hipcc symbol).
+    Pm,
+}
 
 /// G80 panel geometry. All panels use the same padded row count.
 /// `n512 = false`: the N1280 program (256-row waves, 4 A segments, 1280-column native-tile panels; the GPU consume and
@@ -128,6 +146,24 @@ impl Gpu {
             symbol,
         )
     }
+    /// Bind a symbol of the sealed A-pack twin module (`kernels/npu_trunk_pack_pm_gfx1151.hxaco`).
+    fn npu_pack_pm(&mut self, symbol: &str) -> HipResult<()> {
+        if !self.arch_caps.is_gfx1151() {
+            return Err(HipError::new(1, "npu trunk pack PM requires gfx1151"));
+        }
+        if !*PACK_PM_VERIFIED {
+            return Err(HipError::new(
+                1,
+                "npu trunk: embedded pack PM image differs from certified pin",
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_embedded_kernel(
+            "npu_trunk_pack_pm_gfx1151",
+            kernels::NPU_TRUNK_PACK_PM_GFX1151,
+            symbol,
+        )
+    }
     fn npu_launch(
         &mut self,
         symbol: &str,
@@ -170,7 +206,36 @@ impl Gpu {
     ) -> HipResult<()> {
         layout.validate()?;
         need(a, layout.a_bytes())?;
-        unsafe { self.npu_trunk_pack_a_impl(x, rows, layout, a.buf.as_ptr(), d, false) }
+        unsafe { self.npu_trunk_pack_a_impl(x, rows, layout, a.buf.as_ptr(), d, PackRoute::Scalar) }
+    }
+    /// Lab-only: the hipcc K = 2560 / 5120 producer regardless of `HIPFIRE_NPU_TRUNK_PACK_A_PM`
+    /// (the byte and timing oracle of the PM twin).
+    #[cfg(feature = "lab")]
+    pub fn npu_trunk_pack_a_bf16_hipcc(
+        &mut self,
+        x: &GpuTensor,
+        rows: usize,
+        layout: NpuBf16Layout,
+        a: &GpuTensor,
+        d: &GpuTensor,
+    ) -> HipResult<()> {
+        layout.validate()?;
+        need(a, layout.a_bytes())?;
+        unsafe { self.npu_trunk_pack_a_impl(x, rows, layout, a.buf.as_ptr(), d, PackRoute::Hipcc) }
+    }
+    /// Lab-only: the sealed PM twin regardless of `HIPFIRE_NPU_TRUNK_PACK_A_PM`.
+    #[cfg(feature = "lab")]
+    pub fn npu_trunk_pack_a_bf16_pm(
+        &mut self,
+        x: &GpuTensor,
+        rows: usize,
+        layout: NpuBf16Layout,
+        a: &GpuTensor,
+        d: &GpuTensor,
+    ) -> HipResult<()> {
+        layout.validate()?;
+        need(a, layout.a_bytes())?;
+        unsafe { self.npu_trunk_pack_a_impl(x, rows, layout, a.buf.as_ptr(), d, PackRoute::Pm) }
     }
     /// Same producer into a device-accessible host-registered NPU arena.
     /// # Safety
@@ -184,7 +249,12 @@ impl Gpu {
         d: &GpuTensor,
     ) -> HipResult<()> {
         let fast = matches!(layout.k, 2560 | 5120) && self.arch_caps.is_gfx1151();
-        unsafe { self.npu_trunk_pack_a_impl(x, rows, layout, a, d, fast) }
+        let route = match (fast, *PACK_PM_FLAG) {
+            (false, _) => PackRoute::Scalar,
+            (true, true) => PackRoute::Pm,
+            (true, false) => PackRoute::Hipcc,
+        };
+        unsafe { self.npu_trunk_pack_a_impl(x, rows, layout, a, d, route) }
     }
     unsafe fn npu_trunk_pack_a_impl(
         &mut self,
@@ -193,7 +263,7 @@ impl Gpu {
         layout: NpuBf16Layout,
         a: *mut c_void,
         d: &GpuTensor,
-        fast: bool,
+        route: PackRoute,
     ) -> HipResult<()> {
         layout.validate()?;
         if x.dtype != DType::F16 || rows == 0 || rows > layout.padded_rows || a.is_null() {
@@ -201,12 +271,25 @@ impl Gpu {
         }
         need(x, rows * layout.k * 2)?;
         need(d, rows * 4)?;
-        let symbol = match (fast, layout.k) {
-            (false, _) => "npu_trunk_pack_a_bf16_old",
-            (true, 2560) => "npu_trunk_pack_a_bf16",
-            _ => "npu_trunk_pack_a_bf16_k5120",
+        if route != PackRoute::Scalar && !matches!(layout.k, 2560 | 5120) {
+            return Err(HipError::new(
+                1,
+                "npu trunk: fast pack supports K 2560 / 5120",
+            ));
+        }
+        let fast = route != PackRoute::Scalar;
+        let symbol = match (route, layout.k) {
+            (PackRoute::Scalar, _) => "npu_trunk_pack_a_bf16_old",
+            (PackRoute::Hipcc, 2560) => "npu_trunk_pack_a_bf16",
+            (PackRoute::Hipcc, _) => "npu_trunk_pack_a_bf16_k5120",
+            (PackRoute::Pm, 2560) => "npu_trunk_pack_a_bf16_pm",
+            (PackRoute::Pm, _) => "npu_trunk_pack_a_bf16_k5120_pm",
         };
-        self.ensure_kernel_public("npu_trunk", kernels::NPU_TRUNK_SRC, symbol)?;
+        if route == PackRoute::Pm {
+            self.npu_pack_pm(symbol)?;
+        } else {
+            self.ensure_kernel_public("npu_trunk", kernels::NPU_TRUNK_SRC, symbol)?;
+        }
         let mut b = KernargBlob::new();
         b.push_ptr(x.buf.as_ptr());
         b.push_ptr(a);

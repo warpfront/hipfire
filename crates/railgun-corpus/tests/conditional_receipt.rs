@@ -116,6 +116,8 @@ fn conditional(object: &str, elf: &str) -> KernelRecord {
         pm_analyze_error: None,
         guards,
         indexed_effects: vec![effect()],
+        sealed_tables: vec![],
+        descriptor_arenas: vec![],
         required_witnesses: vec!["indexed_bind".into()],
         case_digest: String::new(),
         guard_flag: None,
@@ -376,12 +378,12 @@ fn object_digest_device_digest_arch_and_schema_fail_admission() {
     let mut r = receipt(&object, &elf, conditional(&object, &elf));
     r.arch = "gfx1100".into();
     assert!(!admits("arch", &r));
-    for (name, v) in [("v7", 7), ("v9", 9)] {
+    for (name, v) in [("v7", 7), ("v8", 8), ("v10", 10)] {
         let mut r = receipt(&object, &elf, conditional(&object, &elf));
         r.schema_version = v;
         assert!(!admits(name, &r), "{name}");
     }
-    for (name, v) in [("s1", 1), ("s3", 3)] {
+    for (name, v) in [("s1", 1), ("s2", 2), ("s4", 4)] {
         let mut r = receipt(&object, &elf, conditional(&object, &elf));
         r.railgun.section_version = v;
         assert!(!admits(name, &r), "{name}");
@@ -531,4 +533,245 @@ fn conditional_node_is_not_proven_without_a_matching_witness() {
     assert!(bad
         .admit_with("gfx1201", "pin", &plan(), &[w(1, "case1", "indexed_bind")])
         .is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Sealed-table cases (schema 9 / section 3).
+// ---------------------------------------------------------------------------
+
+const CACHE0: &str = "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0";
+
+fn sealed_table() -> SealedTableRecord {
+    SealedTableRecord {
+        table_arg_offset: 0,
+        bound_kind: SEALED_BOUND_KERNARG.into(),
+        bound_value: 52,
+        entry_bytes: 8,
+        entries: vec![SealedEntryRecord {
+            pc: 70,
+            class: "smem_load".into(),
+            path: "smem".into(),
+            cache: CACHE0.into(),
+            width: 8,
+            index_expr: "load@16".into(),
+            guard_pcs: vec![20],
+        }],
+        accesses: vec![SealedAccessRecord {
+            pc: 112,
+            class: "vmem_load".into(),
+            path: "flat".into(),
+            cache: CACHE0.into(),
+            width: 4,
+            entry_pcs: vec![70],
+        }],
+        null_guarded: false,
+    }
+}
+
+fn sealed(object: &str, elf: &str) -> KernelRecord {
+    let mut k = conditional(object, elf);
+    k.guards.clear();
+    k.differential.guards.clear();
+    k.indexed_effects.clear();
+    k.sealed_tables = vec![sealed_table()];
+    k.required_witnesses = vec![WITNESS_SEALED_TABLE.into()];
+    k.case_digest = case_digest(object, elf, "gfx1201", &k);
+    k
+}
+
+#[test]
+fn sealed_receipt_round_trips_and_is_admitted() {
+    let (object, elf) = (sha('a'), sha('b'));
+    let r = receipt(&object, &elf, sealed(&object, &elf));
+    let f = Fixture::new(
+        "sealed-roundtrip",
+        &serde_json::to_vec(&r).unwrap(),
+        &object,
+    );
+    let Ok(Lookup::Hit(hit)) = f.lookup() else {
+        panic!("admits")
+    };
+    let k = &hit.receipt.railgun.kernels[0];
+    assert_eq!(k.status, STATUS_CONDITIONAL);
+    assert_eq!(k.sealed_tables, vec![sealed_table()]);
+    assert_eq!(k.required_witnesses, [WITNESS_SEALED_TABLE]);
+    assert!(k.guards.is_empty() && k.indexed_effects.is_empty());
+    // A kernel without sealed tables serialises without the field at all.
+    let plain = serde_json::to_value(conditional(&object, &elf)).unwrap();
+    assert!(plain.get("sealed_tables").is_none());
+}
+
+#[test]
+fn every_sealed_field_the_digest_binds_fails_admission() {
+    let (object, elf) = (sha('a'), sha('b'));
+    let edits: Vec<(&str, Box<dyn Fn(&mut KernelRecord)>)> = vec![
+        (
+            "table arg",
+            Box::new(|k| k.sealed_tables[0].table_arg_offset = 8),
+        ),
+        ("bound", Box::new(|k| k.sealed_tables[0].bound_value = 56)),
+        (
+            "bound kind",
+            Box::new(|k| k.sealed_tables[0].bound_kind = SEALED_BOUND_CONST.into()),
+        ),
+        (
+            "bound kind unknown",
+            Box::new(|k| k.sealed_tables[0].bound_kind = "x".into()),
+        ),
+        (
+            "bound misaligned",
+            Box::new(|k| k.sealed_tables[0].bound_value = 53),
+        ),
+        (
+            "entry width",
+            Box::new(|k| k.sealed_tables[0].entry_bytes = 4),
+        ),
+        (
+            "entry pc",
+            Box::new(|k| k.sealed_tables[0].entries[0].pc = 71),
+        ),
+        (
+            "entry guard",
+            Box::new(|k| k.sealed_tables[0].entries[0].guard_pcs[0] = 21),
+        ),
+        (
+            "entry unguarded",
+            Box::new(|k| k.sealed_tables[0].entries[0].guard_pcs.clear()),
+        ),
+        ("no entry", Box::new(|k| k.sealed_tables[0].entries.clear())),
+        (
+            "access class store",
+            Box::new(|k| k.sealed_tables[0].accesses[0].class = "vmem_store".into()),
+        ),
+        (
+            "access entry",
+            Box::new(|k| k.sealed_tables[0].accesses[0].entry_pcs = vec![71]),
+        ),
+        (
+            "access no entry",
+            Box::new(|k| k.sealed_tables[0].accesses[0].entry_pcs.clear()),
+        ),
+        ("table dropped", Box::new(|k| k.sealed_tables.clear())),
+        (
+            "witness",
+            Box::new(|k| k.required_witnesses = vec![WITNESS_INDEXED_BIND.into()]),
+        ),
+        (
+            "witness extra",
+            Box::new(|k| k.required_witnesses.push(WITNESS_INDEXED_BIND.into())),
+        ),
+        (
+            "guards added",
+            Box::new(|k| k.guards = vec![guard("scalar_eq", 28, 4, "1")]),
+        ),
+        (
+            "duplicate table",
+            Box::new(|k| {
+                let t = k.sealed_tables[0].clone();
+                k.sealed_tables.push(t);
+            }),
+        ),
+    ];
+    for (name, edit) in &edits {
+        // Re-sealing the digest after the edit must not rescue a malformed
+        // case; an un-resealed edit fails on the digest.
+        let mut stale = sealed(&object, &elf);
+        edit(&mut stale);
+        assert!(
+            !admits(&format!("sealed-{name}"), &receipt(&object, &elf, stale)),
+            "{name}"
+        );
+        let mut resealed = sealed(&object, &elf);
+        edit(&mut resealed);
+        resealed.case_digest = case_digest(&object, &elf, "gfx1201", &resealed);
+        let structurally_valid = resealed.validate_case(&object, &elf, "gfx1201").is_ok();
+        assert!(
+            !structurally_valid
+                || matches!(
+                    *name,
+                    "entry pc" | "bound" | "bound kind" | "table arg" | "entry guard"
+                ),
+            "{name}: re-sealed malformed case must be rejected"
+        );
+    }
+    // The digest names the object and device ELF.
+    let k = sealed(&object, &elf);
+    assert!(!admits(
+        "sealed-other-elf",
+        &receipt(&object, &sha('c'), k.clone())
+    ));
+    assert!(!admits("sealed-other-object", &receipt(&sha('d'), &elf, k)));
+}
+
+#[test]
+fn an_older_schema_receipt_is_never_promoted_to_sealed() {
+    let (object, elf) = (sha('a'), sha('b'));
+    // A v8 / section 2 receipt, even carrying a perfectly valid sealed case.
+    let mut r = receipt(&object, &elf, sealed(&object, &elf));
+    r.schema_version = 8;
+    assert!(!admits("sealed-v8", &r));
+    let mut r = receipt(&object, &elf, sealed(&object, &elf));
+    r.railgun.section_version = 2;
+    assert!(!admits("sealed-s2", &r));
+    // A v8 receipt of an indexed kernel is refused too: its digest scheme
+    // (`railgun-case-v1`) is not this one's.
+    let mut r = receipt(&object, &elf, conditional(&object, &elf));
+    r.schema_version = 8;
+    r.railgun.section_version = 2;
+    assert!(!admits("indexed-v8", &r));
+    // A conditional row whose only effect field is dropped is not a
+    // sealed-table case and is not promoted into one.
+    let mut k = sealed(&object, &elf);
+    k.sealed_tables.clear();
+    assert!(!admits("sealed-without-tables", &receipt(&object, &elf, k)));
+    // `unknown`/`proven` rows carry no sealed tables.
+    for status in [STATUS_PROVEN, STATUS_UNKNOWN] {
+        let mut k = sealed(&object, &elf);
+        k.status = status.into();
+        assert!(!admits(
+            &format!("sealed-as-{status}"),
+            &receipt(&object, &elf, k)
+        ));
+    }
+}
+
+#[test]
+fn window_nodes_name_only_known_witness_kinds() {
+    let m = manifest(vec![
+        node(0, "proven", "", &[]),
+        node(1, "conditional", "case1", &[WITNESS_SEALED_TABLE]),
+    ]);
+    let w = |kind| ConditionalWitness {
+        index: 1,
+        case_sha256: "case1",
+        kind,
+    };
+    assert!(m.admit_with("gfx1201", "pin", &plan(), &[]).is_err());
+    assert!(m
+        .admit_with("gfx1201", "pin", &plan(), &[w(WITNESS_INDEXED_BIND)])
+        .is_err());
+    m.admit_with("gfx1201", "pin", &plan(), &[w(WITNESS_SEALED_TABLE)])
+        .expect("a sealed_table witness for the case admits");
+    // Both kinds may be required together; an unknown or repeated kind is
+    // not a manifest anyone generated.
+    let both = manifest(vec![
+        node(0, "proven", "", &[]),
+        node(
+            1,
+            "conditional",
+            "case1",
+            &[WITNESS_INDEXED_BIND, WITNESS_SEALED_TABLE],
+        ),
+    ]);
+    assert!(both.validate().is_empty());
+    for kinds in [
+        &["trust_me"][..],
+        &[WITNESS_SEALED_TABLE, WITNESS_SEALED_TABLE],
+    ] {
+        let bad = manifest(vec![
+            node(0, "proven", "", &[]),
+            node(1, "conditional", "case1", kinds),
+        ]);
+        assert!(!bad.validate().is_empty(), "{kinds:?}");
+    }
 }

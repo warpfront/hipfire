@@ -494,6 +494,32 @@ pub fn batch_bind_active(
     false
 }
 
+/// Return an `Active` lane owner to `Queued`: the request goes back to the inbox to be admitted again
+/// (a step failed on a capacity condition before the request emitted anything). Only when the admission
+/// token and the lane ticket both match the live entry and no abort is latched; false otherwise (the
+/// caller then fails the request instead).
+pub fn batch_requeue_active(
+    id: &str,
+    attempt_id: u64,
+    generation: BatchGeneration,
+    owner: LaneTicket,
+) -> bool {
+    let cell = batch_terminal_control();
+    let mut g = cell.mu.lock().unwrap();
+    if let Some(e) = g.entries.get_mut(&AttemptKey::new(id, attempt_id)) {
+        if e.generation == generation
+            && owner.admission == generation
+            && !e.abort_latched
+            && matches!(e.state, BatchRegistryState::Active { owner: o } if o == owner)
+        {
+            e.state = BatchRegistryState::Queued;
+            cell.cv.notify_all();
+            return true;
+        }
+    }
+    false
+}
+
 pub fn batch_mark_ready_with_pending(
     id: &str,
     attempt_id: u64,

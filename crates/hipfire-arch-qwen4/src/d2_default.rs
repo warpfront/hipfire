@@ -547,6 +547,321 @@ impl DecodeMeasurement {
     }
 }
 
+/// Minimum predicted per-layer gain (percent of the layer's D2 time with no
+/// share) for `auto` to give any cold expert to the GPU arm; below it the layer
+/// stays all-CPU (`0`, today's D2). The model is a prediction of a discrete,
+/// latency-bound arm, so a small predicted win is inside its error.
+pub const SHARE_MIN_GAIN_PERCENT: u64 = 10;
+
+/// The shares `auto` considers (parts per million): 5% steps up to 95%. `0` is
+/// the baseline, and `1.0` is excluded: an all-PCIe layer is the D2 selector's
+/// verdict (plain PCIe), not a share.
+pub fn share_grid_ppm() -> impl Iterator<Item = u32> {
+    (1..=19).map(|step| step * 50_000)
+}
+
+/// Per-expert probability that a decode row of `top_k` routed experts contains
+/// the expert, from the sidecar's routing counts of one layer: `top_k * count /
+/// total`, capped at 1. A layer with no counts routes uniformly.
+pub fn routing_probabilities(counts: &[u64], top_k: usize) -> Vec<f64> {
+    let total: u128 = counts.iter().map(|&c| u128::from(c)).sum();
+    if counts.is_empty() {
+        return Vec::new();
+    }
+    counts
+        .iter()
+        .map(|&c| {
+            let q = if total == 0 {
+                top_k as f64 / counts.len() as f64
+            } else {
+                top_k as f64 * c as f64 / total as f64
+            };
+            q.clamp(0.0, 1.0)
+        })
+        .collect()
+}
+
+/// The distribution of how many of independent events with probabilities `q`
+/// occur, as `max + 1` probabilities for counts `0..=max`; the mass of more
+/// than `max` events is lumped into `max` (a row routes `top_k` distinct
+/// experts, so `max = top_k`). Poisson-binomial dynamic programme. Pure.
+pub fn count_distribution(q: impl IntoIterator<Item = f64>, max: usize) -> Vec<f64> {
+    let mut dist = vec![0.0; max + 1];
+    dist[0] = 1.0;
+    for q in q {
+        let q = q.clamp(0.0, 1.0);
+        if q == 0.0 {
+            continue;
+        }
+        for n in (0..=max).rev() {
+            let mut next = dist[n] * (1.0 - q);
+            if n > 0 {
+                next += dist[n - 1] * q;
+            }
+            if n == max {
+                // Mass that would step past `max` stays lumped at `max`.
+                next += dist[max] * q;
+            }
+            dist[n] = next;
+        }
+    }
+    dist
+}
+
+/// A layer's predicted D2 time with and without a PCIe share.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayerSharePlan {
+    /// The share the layer takes, parts per million; `0` when no grid share
+    /// clears [`SHARE_MIN_GAIN_PERCENT`] (or the mode is not `auto`).
+    pub ppm: u32,
+    /// Predicted layer time with no share, ns.
+    pub base_ns: f64,
+    /// Predicted layer time at the best grid share, ns (equals `base_ns` when
+    /// the best share is no share).
+    pub best_ns: f64,
+    /// The best grid share before the gain threshold, ppm.
+    pub best_ppm: u32,
+}
+
+impl LayerSharePlan {
+    pub const OFF: Self = Self {
+        ppm: 0,
+        base_ns: 0.0,
+        best_ns: 0.0,
+        best_ppm: 0,
+    };
+
+    /// Predicted gain of the best grid share, percent of the no-share time.
+    pub fn best_gain_percent(&self) -> f64 {
+        if self.base_ns > 0.0 {
+            100.0 * (self.base_ns - self.best_ns) / self.base_ns
+        } else {
+            0.0
+        }
+    }
+}
+
+/// What `auto` prices a layer's two arms from. The measured quantities are the
+/// D2 selector's real CPU arm and zero-copy link samples plus a device copy
+/// sample and a single-expert zero-copy read latency probe.
+///
+/// A decode call routes a random set of experts. The CPU arm computes the
+/// `i` CPU-owned cold experts of the call (`i * cpu_ns_per_expert`); the GPU
+/// arm reads the device-resident experts (`H`, priced at `vram_ns_per_byte`)
+/// and, when the call routes any PCIe-owned expert (`j >= 1`), waits for the
+/// zero-copy read, `max(link_latency_ns, j * expert_bytes * link_ns_per_byte)`:
+/// the GPU tail is latency-bound, so one expert costs a whole read, not a
+/// byte-share of it. The two arms overlap, and the serial D2 handoff is paid
+/// every call:
+///
+/// ```text
+/// T(call) = handoff + max(i * c, H + [j >= 1] * max(l1, j * b * L))
+/// T(p)    = E[T(call)] over the layer's routed-expert distribution
+/// ```
+///
+/// where `i` and `j` are independent Poisson-binomial counts of the CPU- and
+/// PCIe-owned experts routed (probabilities from the sidecar counts,
+/// [`routing_probabilities`]), `c` is the CPU time per expert, `b` the GPU
+/// bytes per expert and `L` the link ns per byte. While both arms are busy each
+/// is slowed by `contention` (a unified-memory host sharing DRAM). `auto`
+/// evaluates `T` at no share and on [`share_grid_ppm`] and takes the minimum,
+/// but only when it beats the no-share time by [`SHARE_MIN_GAIN_PERCENT`];
+/// otherwise the layer stays all-CPU. This is an expectation of the per-call
+/// maximum, not the maximum of the expected arm times: a linear byte-balance
+/// mispredicts a discrete arm (one 2.6 MB expert over a 7 GB/s link costs
+/// ~0.4 ms of tail whatever the share).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShareModel {
+    /// Median real CPU arm per cold expert, ns ([`DecodeCosts::cpu_arm_ns`] /
+    /// `top_k`).
+    pub cpu_ns_per_expert: f64,
+    /// Median live zero-copy link read, ns per byte.
+    pub link_ns_per_byte: f64,
+    /// One cold expert read by the GPU over the zero-copy link, ns
+    /// ([`link_latency_ns`]).
+    pub link_latency_ns: f64,
+    /// Device-memory copy kernel, ns per byte read ([`device_copy_ns_per_byte`]):
+    /// a copy also writes every byte, so the hot arm is priced at no less than
+    /// its read time. The shared expert is not priced.
+    pub vram_ns_per_byte: f64,
+    /// GPU read bytes of one expert.
+    pub expert_bytes: f64,
+    /// Routed experts per row.
+    pub top_k: usize,
+    /// Serial D2 handoff per call, ns.
+    pub handoff_ns: f64,
+    /// `>= 1`: how much slower both arms run while overlapped (lab,
+    /// `HIPFIRE_QWEN4_D2_PCIE_CONTENTION`). `1.0` is no contention.
+    pub contention: f64,
+}
+
+impl ShareModel {
+    pub fn from_costs(
+        costs: &DecodeCosts,
+        vram_ns_per_byte: f64,
+        link_latency_ns: f64,
+        top_k: usize,
+    ) -> Self {
+        Self {
+            cpu_ns_per_expert: costs.cpu_arm_ns as f64 / top_k as f64,
+            link_ns_per_byte: costs.link_sample_ns as f64 / costs.link_sample_bytes as f64,
+            link_latency_ns,
+            vram_ns_per_byte,
+            expert_bytes: costs.layer_bytes as f64 / top_k as f64,
+            top_k,
+            handoff_ns: CURRENT_COPY_TRANSPORT_HANDOFF_NS as f64,
+            contention: 1.0,
+        }
+    }
+
+    /// The same model with both arms slowed by `contention` while overlapped
+    /// (`>= 1`; anything lower or non-finite is no contention).
+    pub fn with_contention(mut self, contention: f64) -> Self {
+        self.contention = if contention.is_finite() && contention >= 1.0 {
+            contention
+        } else {
+            1.0
+        };
+        self
+    }
+
+    /// Predicted per-call D2 time of a layer, ns: `cold[e]` host-mapped,
+    /// `pcie[e]` GPU-read cold experts (a subset of `cold`), `q[e]` the
+    /// per-row routing probabilities. Pure.
+    pub fn expected_layer_ns(&self, cold: &[bool], pcie: &[bool], q: &[f64]) -> f64 {
+        let owned = |e: usize| pcie.get(e).copied().unwrap_or(false);
+        let k = self.top_k;
+        let cpu = count_distribution(
+            (0..cold.len())
+                .filter(|&e| cold[e] && !owned(e))
+                .map(|e| q[e]),
+            k,
+        );
+        let gpu = count_distribution(
+            (0..cold.len())
+                .filter(|&e| cold[e] && owned(e))
+                .map(|e| q[e]),
+            k,
+        );
+        let hot: f64 = (0..cold.len()).filter(|&e| !cold[e]).map(|e| q[e]).sum();
+        let hot_ns = hot * self.expert_bytes * self.vram_ns_per_byte;
+        let mut total = 0.0;
+        for (i, &pi) in cpu.iter().enumerate() {
+            for (j, &pj) in gpu.iter().enumerate() {
+                let overlapped = if i > 0 && j > 0 { self.contention } else { 1.0 };
+                let cpu_ns = i as f64 * self.cpu_ns_per_expert * overlapped;
+                let pcie_ns = if j > 0 {
+                    self.link_latency_ns
+                        .max(j as f64 * self.expert_bytes * self.link_ns_per_byte)
+                        * overlapped
+                } else {
+                    0.0
+                };
+                total += pi * pj * (self.handoff_ns + cpu_ns.max(hot_ns + pcie_ns));
+            }
+        }
+        total
+    }
+
+    /// Plan one layer: `cold` host-mapped experts, `counts` the layer's routing
+    /// counts, `partition(ppm)` the PCIe-owned experts a share of `ppm` gives
+    /// ([`crate::gpu_forward`]'s deterministic partition).
+    pub fn plan_layer(
+        &self,
+        cold: &[bool],
+        counts: &[u64],
+        partition: &dyn Fn(u32) -> Vec<bool>,
+    ) -> LayerSharePlan {
+        let q = routing_probabilities(counts, self.top_k);
+        if q.len() != cold.len() || !cold.iter().any(|&c| c) {
+            return LayerSharePlan::OFF;
+        }
+        let base_ns = self.expected_layer_ns(cold, &[], &q);
+        let (mut best_ns, mut best_ppm) = (base_ns, 0);
+        for ppm in share_grid_ppm() {
+            let ns = self.expected_layer_ns(cold, &partition(ppm), &q);
+            if ns < best_ns {
+                (best_ns, best_ppm) = (ns, ppm);
+            }
+        }
+        let plan = LayerSharePlan {
+            ppm: 0,
+            base_ns,
+            best_ns,
+            best_ppm,
+        };
+        let enough =
+            best_ppm > 0 && (base_ns - best_ns) * 100.0 >= base_ns * SHARE_MIN_GAIN_PERCENT as f64;
+        LayerSharePlan {
+            ppm: if enough { best_ppm } else { 0 },
+            ..plan
+        }
+    }
+
+    /// Median CPU arm and link rates in GB/s (one byte per ns is 1 GB/s), for
+    /// the log.
+    pub fn rates_gbps(&self) -> (f64, f64) {
+        (
+            self.expert_bytes / self.cpu_ns_per_expert,
+            1.0 / self.link_ns_per_byte,
+        )
+    }
+}
+
+/// The resolved PCIe share of one load (`HIPFIRE_QWEN4_D2_PCIE_SHARE`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PcieShare {
+    /// Every cold expert of an armed tier layer is CPU-owned (today's D2).
+    Off,
+    /// The same share, in parts per million, on every layer.
+    Fixed(u32),
+    /// Priced per layer ([`ShareModel::plan_layer`]).
+    Auto(ShareModel),
+}
+
+impl PcieShare {
+    /// The share plan of one layer.
+    pub fn plan_layer(
+        self,
+        cold: &[bool],
+        counts: &[u64],
+        partition: &dyn Fn(u32) -> Vec<bool>,
+    ) -> LayerSharePlan {
+        match self {
+            Self::Off => LayerSharePlan::OFF,
+            Self::Fixed(ppm) => LayerSharePlan {
+                ppm: ppm.min(hipfire_config::memory::D2_PCIE_SHARE_PPM_ONE),
+                ..LayerSharePlan::OFF
+            },
+            Self::Auto(model) => model.plan_layer(cold, counts, partition),
+        }
+    }
+
+    /// Load-log text of the mode and, for `auto`, the measured inputs and the
+    /// gain threshold.
+    pub fn describe(self) -> String {
+        match self {
+            Self::Off => "off".to_owned(),
+            Self::Fixed(ppm) => format!("fixed {:.4}", f64::from(ppm) / 1e6),
+            Self::Auto(model) => {
+                let (cpu, link) = model.rates_gbps();
+                let contention = if model.contention > 1.0 {
+                    format!(", contention x{:.2}", model.contention)
+                } else {
+                    String::new()
+                };
+                format!(
+                    "auto (measured CPU arm {cpu:.1} GB/s, zero-copy link {link:.2} GB/s, one-expert \
+                     zero-copy read {:.0} us, device copy {:.0} GB/s read; a layer takes the best \
+                     grid share only when the predicted layer gain is >= {SHARE_MIN_GAIN_PERCENT}%{contention})",
+                    model.link_latency_ns / 1e3,
+                    1.0 / model.vram_ns_per_byte
+                )
+            }
+        }
+    }
+}
+
 /// Why the D2 default is on or off for one load.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum D2Default {
@@ -1100,6 +1415,177 @@ pub(crate) fn resolve(
         );
     }
     verdict.selects_d2()
+}
+
+/// Median ns per byte read of a device-to-device copy kernel (`bytes` long),
+/// net of the one-element launch floor: the hot arm's price in [`ShareModel`].
+fn device_copy_ns_per_byte(gpu: &mut Gpu, bytes: usize) -> Result<f64, String> {
+    let elems = bytes / 4;
+    if elems == 0 {
+        return Err("empty device copy sample request".to_string());
+    }
+    let src = gpu
+        .alloc_tensor(&[elems], DType::F32)
+        .map_err(|error| format!("device source: {error}"))?;
+    let dst = match gpu.alloc_tensor(&[elems], DType::F32) {
+        Ok(dst) => dst,
+        Err(error) => {
+            let _ = gpu.free_tensor(src);
+            return Err(format!("device destination: {error}"));
+        }
+    };
+    let timed = (|| -> Result<(u64, u64), String> {
+        let launch = |gpu: &mut Gpu, n: usize| -> Result<u64, String> {
+            let start = Instant::now();
+            gpu.copy_f32_buffer(&dst, &src, n)
+                .map_err(|error| format!("device copy: {error}"))?;
+            gpu.hip
+                .device_synchronize()
+                .map_err(|error| format!("synchronize: {error}"))?;
+            Ok(start.elapsed().as_nanos() as u64)
+        };
+        launch(gpu, elems)?;
+        let mut reads = [0u64; PROBE_SAMPLES];
+        for sample in &mut reads {
+            *sample = launch(gpu, elems)?;
+        }
+        launch(gpu, 1)?;
+        let mut floors = [0u64; PROBE_SAMPLES];
+        for sample in &mut floors {
+            *sample = launch(gpu, 1)?;
+        }
+        Ok((
+            SampleStats::of(&reads)
+                .ok_or("no device copy sample")?
+                .median_ns,
+            SampleStats::of(&floors)
+                .ok_or("no launch floor sample")?
+                .min_ns,
+        ))
+    })();
+    let _ = gpu.hip.device_synchronize();
+    let _ = gpu.free_tensor(dst);
+    let _ = gpu.free_tensor(src);
+    let (read_ns, floor_ns) = timed?;
+    let net = read_ns.saturating_sub(floor_ns).max(1);
+    Ok(net as f64 / (elems * 4) as f64)
+}
+
+/// Median ns of one GPU kernel reading `bytes` of host-mapped memory over the
+/// zero-copy link, net of the one-element launch floor: the cost of one cold
+/// expert in a GPU tail, the `l1` of [`ShareModel`]. Every timed sample reads
+/// its own freshly mapped buffer (after one untimed warm-up on another), so no
+/// sample is served from the GPU's caches; the copy kernel runs wide, so a
+/// narrower real GEMV can only be slower than this.
+fn link_latency_ns(gpu: &mut Gpu, bytes: usize) -> Result<f64, String> {
+    let elems = bytes / 4;
+    if elems == 0 {
+        return Err("empty link latency sample request".to_string());
+    }
+    let mut sources = Vec::with_capacity(PROBE_SAMPLES + 1);
+    let mut dst = None;
+    let timed = (|| -> Result<(u64, u64), String> {
+        for _ in 0..=PROBE_SAMPLES {
+            sources.push(
+                gpu.upload_raw_host(&vec![0u8; bytes], &[bytes])
+                    .map_err(|error| format!("host-mapped buffer: {error}"))?,
+            );
+        }
+        let dst = dst.insert(
+            gpu.alloc_tensor(&[elems], DType::F32)
+                .map_err(|error| format!("device buffer: {error}"))?,
+        );
+        let launch = |gpu: &mut Gpu, src: usize, n: usize| -> Result<u64, String> {
+            let start = Instant::now();
+            gpu.copy_f32_buffer(dst, &sources[src], n)
+                .map_err(|error| format!("zero-copy read: {error}"))?;
+            gpu.hip
+                .device_synchronize()
+                .map_err(|error| format!("synchronize: {error}"))?;
+            Ok(start.elapsed().as_nanos() as u64)
+        };
+        launch(gpu, 0, elems)?;
+        let mut reads = [0u64; PROBE_SAMPLES];
+        for (i, sample) in reads.iter_mut().enumerate() {
+            *sample = launch(gpu, i + 1, elems)?;
+        }
+        launch(gpu, 0, 1)?;
+        let mut floors = [0u64; PROBE_SAMPLES];
+        for sample in &mut floors {
+            *sample = launch(gpu, 0, 1)?;
+        }
+        Ok((
+            SampleStats::of(&reads)
+                .ok_or("no link latency sample")?
+                .median_ns,
+            SampleStats::of(&floors)
+                .ok_or("no launch floor sample")?
+                .min_ns,
+        ))
+    })();
+    let _ = gpu.hip.device_synchronize();
+    if let Some(dst) = dst {
+        let _ = gpu.free_tensor(dst);
+    }
+    for source in sources {
+        let _ = gpu.free_tensor(source);
+    }
+    let (read_ns, floor_ns) = timed?;
+    Ok(read_ns.saturating_sub(floor_ns).max(1) as f64)
+}
+
+/// Resolve `HIPFIRE_QWEN4_D2_PCIE_SHARE` for one load. Call after [`resolve`]
+/// and before any layer runtime is built; `d2_armed` is whether the load asks
+/// for the D2 split at all (the measured default or an explicit
+/// `memory.offload_exec=cpu`): a load that does not ignores the knob and runs
+/// no probe. `Fixed` needs no measurement. `auto` takes the CPU-arm and link
+/// samples of the D2 selector (the process-cached measurement when the
+/// selector already ran it, else the same live probe), a device copy sample
+/// and a single-expert zero-copy read latency sample, and any failure (an
+/// unusable sample, a failed probe) logs its reason and keeps `Off`, never a
+/// guessed split. An invalid knob value refuses the load.
+pub(crate) fn resolve_pcie_share(
+    gpu: &mut Gpu,
+    weights: &Qwen4Weights,
+    config: &Qwen4Config,
+    single_scope: bool,
+    d2_armed: bool,
+) -> Result<PcieShare, String> {
+    use hipfire_config::memory::D2PcieShare;
+    let knob = hipfire_config::memory::qwen4_d2_pcie_share()?;
+    let contention = hipfire_config::memory::qwen4_d2_pcie_contention()?;
+    if knob == D2PcieShare::Off || !d2_armed {
+        return Ok(PcieShare::Off);
+    }
+    let D2PcieShare::Fixed(ppm) = knob else {
+        let layers = host_split_layers(weights, config, single_scope);
+        let costs = measured_decode(gpu, weights, config, &layers)
+            .and_then(|measurement| measurement.costs());
+        let top_k = config.num_experts_per_tok;
+        let expert_bytes = match &costs {
+            Ok(costs) => (costs.layer_bytes / top_k as u64) as usize,
+            Err(_) => 0,
+        };
+        let probes = costs.is_ok().then(|| {
+            device_copy_ns_per_byte(gpu, LINK_SAMPLE_BYTES)
+                .and_then(|vram| link_latency_ns(gpu, expert_bytes).map(|l1| (vram, l1)))
+        });
+        return Ok(match (costs, probes) {
+            (Ok(costs), Some(Ok((vram, l1)))) => PcieShare::Auto(
+                ShareModel::from_costs(&costs, vram, l1, top_k).with_contention(contention),
+            ),
+            (Err(why), _) => {
+                eprintln!("  qwen4 D2 pcie share: auto kept off: {}", why.describe());
+                PcieShare::Off
+            }
+            (_, Some(Err(why))) => {
+                eprintln!("  qwen4 D2 pcie share: auto kept off: probe failed: {why}");
+                PcieShare::Off
+            }
+            (_, None) => PcieShare::Off,
+        });
+    };
+    Ok(PcieShare::Fixed(ppm))
 }
 
 #[cfg(test)]
@@ -2149,5 +2635,193 @@ mod tests {
         // identical CPU time and 3x the GPU bytes, the per-GPU-byte CPU cost
         // is the median CPU sample scaled by 1x (uniform batches).
         assert_eq!(gpu_costs.cpu_arm_ns, cpu_costs.cpu_arm_ns);
+    }
+
+    /// A Flash-Next-like layer: 512 experts, the first `hot` device-resident, routing
+    /// counts decaying geometrically by expert id (so the hot set holds the mass).
+    fn layer(hot: usize) -> (Vec<bool>, Vec<u64>) {
+        let cold = (0..512).map(|e| e >= hot).collect();
+        let counts = (0..512)
+            .map(|e| (1_000_000.0 * 0.992f64.powi(e as i32)) as u64 + 50)
+            .collect();
+        (cold, counts)
+    }
+
+    /// Interleaving test partition: cold expert of rank `r` goes to the GPU arm when
+    /// `floor((r+1)*ppm) > floor(r*ppm)` (the shipped rule is
+    /// `cpu_splice::pcie_partition`; the model only needs a spread partition).
+    fn spread(cold: &[bool]) -> impl Fn(u32) -> Vec<bool> + '_ {
+        move |ppm| {
+            let mut rank = 0u64;
+            cold.iter()
+                .map(|&c| {
+                    if !c {
+                        return false;
+                    }
+                    let (a, b) = (
+                        rank * u64::from(ppm) / 1_000_000,
+                        (rank + 1) * u64::from(ppm) / 1_000_000,
+                    );
+                    rank += 1;
+                    b > a
+                })
+                .collect()
+        }
+    }
+
+    /// A model from a CPU arm and link rate in GB/s (the selector's own samples), a
+    /// one-expert zero-copy read latency in us and a 700 GB/s device.
+    fn model(cpu_gbps: f64, link_gbps: f64, l1_us: f64) -> ShareModel {
+        let costs = from_rates(cpu_gbps, link_gbps).costs().unwrap();
+        ShareModel::from_costs(&costs, 1.0 / 700.0, l1_us * 1e3, 10)
+    }
+
+    #[test]
+    fn routing_probabilities_sum_to_top_k_and_cap_at_one() {
+        let q = routing_probabilities(&[10, 10, 10, 10], 2);
+        assert_eq!(q, vec![0.5; 4]);
+        let q = routing_probabilities(&[1000, 1, 1], 10);
+        assert_eq!(q[0], 1.0, "a dominant expert is capped at 1");
+        assert!(q.iter().all(|&p| (0.0..=1.0).contains(&p)));
+        // No counts: uniform over the experts.
+        assert_eq!(routing_probabilities(&[0, 0, 0, 0, 0], 10), vec![1.0; 5]);
+        assert!(routing_probabilities(&[], 10).is_empty());
+    }
+
+    #[test]
+    fn count_distribution_is_a_poisson_binomial_with_a_lumped_tail() {
+        let d = count_distribution([0.5, 0.5], 4);
+        assert_eq!(d, vec![0.25, 0.5, 0.25, 0.0, 0.0]);
+        let d = count_distribution([0.3, 0.9, 0.0, 1.0, 0.2], 10);
+        assert!((d.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        let mean: f64 = d.iter().enumerate().map(|(n, p)| n as f64 * p).sum();
+        assert!((mean - 2.4).abs() < 1e-12, "{mean}");
+        // More events than `max` lump into `max`.
+        let d = count_distribution([1.0; 5], 3);
+        assert_eq!(d, vec![0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(count_distribution([], 2), vec![1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn no_pcie_expert_prices_the_arms_as_a_per_call_maximum_plus_the_handoff() {
+        let m = model(70.0, 7.0, 400.0);
+        // One cold expert that is always routed, nothing else: handoff + one CPU expert.
+        let t = m.expected_layer_ns(&[true], &[], &[1.0]);
+        assert!(
+            (t - (m.handoff_ns + m.cpu_ns_per_expert)).abs() < 1e-6,
+            "{t}"
+        );
+        // The same expert read over PCIe: handoff + max(latency, bytes / link); no CPU work.
+        let t = m.expected_layer_ns(&[true], &[true], &[1.0]);
+        let read = m.link_latency_ns.max(m.expert_bytes * m.link_ns_per_byte);
+        assert!((t - (m.handoff_ns + read)).abs() < 1e-6, "{t}");
+        // A never-routed cold expert costs only the handoff.
+        assert!((m.expected_layer_ns(&[true], &[true], &[0.0]) - m.handoff_ns).abs() < 1e-9);
+        // Contention can only slow an overlapped call.
+        let slow = m.with_contention(2.0);
+        let (cold, pcie) = ([true, true], [false, true]);
+        assert!(
+            slow.expected_layer_ns(&cold, &pcie, &[1.0, 1.0])
+                > m.expected_layer_ns(&cold, &pcie, &[1.0, 1.0])
+        );
+        assert_eq!(
+            slow.expected_layer_ns(&cold, &[], &[1.0, 1.0]),
+            m.expected_layer_ns(&cold, &[], &[1.0, 1.0])
+        );
+    }
+
+    #[test]
+    fn xtx_class_link_resolves_every_layer_to_off() {
+        // The measured XTX arm (68.7 GB/s CPU, 7.1 GB/s zero-copy link, hundreds of us per
+        // expert read) over layers with 0..30% of the mass cold: a PCIe read costs several
+        // CPU experts, so no share clears the gain threshold.
+        let m = model(68.7, 7.1, 450.0);
+        for hot in [60, 120, 200, 300, 400] {
+            let (cold, counts) = layer(hot);
+            let plan = m.plan_layer(&cold, &counts, &spread(&cold));
+            assert_eq!(plan.ppm, 0, "hot {hot}: {plan:?}");
+            assert!(
+                plan.best_gain_percent() < SHARE_MIN_GAIN_PERCENT as f64,
+                "hot {hot}: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_slow_cpu_arm_on_a_fast_link_takes_a_share_and_the_threshold_gates_it() {
+        // CPU arm 5 GB/s against a 55 GB/s link and a 40 us read: the GPU arm is far cheaper.
+        let fast_link = model(5.0, 55.0, 40.0);
+        let (cold, counts) = layer(120);
+        let plan = fast_link.plan_layer(&cold, &counts, &spread(&cold));
+        assert!(plan.ppm > 0, "{plan:?}");
+        assert!(
+            plan.best_gain_percent() >= SHARE_MIN_GAIN_PERCENT as f64,
+            "{plan:?}"
+        );
+        assert_eq!(plan.ppm, plan.best_ppm);
+        assert!(plan.best_ns < plan.base_ns);
+        // A faster CPU arm shrinks the gain (and with it the best share) monotonically.
+        let mut last_gain = f64::MAX;
+        for cpu in [5.0, 10.0, 20.0, 40.0, 80.0, 160.0] {
+            let plan = model(cpu, 55.0, 40.0).plan_layer(&cold, &counts, &spread(&cold));
+            assert!(
+                plan.best_gain_percent() <= last_gain + 1e-9,
+                "cpu {cpu}: {plan:?}"
+            );
+            last_gain = plan.best_gain_percent();
+        }
+        // The R9700 class (CPU 75 GB/s, link 55 GB/s, short reads): whatever the model says is
+        // a valid share and never below the threshold when taken.
+        let plan = model(75.0, 55.0, 60.0).plan_layer(&cold, &counts, &spread(&cold));
+        assert!(
+            plan.ppm == 0 || plan.best_gain_percent() >= SHARE_MIN_GAIN_PERCENT as f64,
+            "{plan:?}"
+        );
+        // A layer with nothing cold, or without routing counts of its size, is left alone.
+        assert_eq!(
+            fast_link.plan_layer(&[false; 4], &[1; 4], &spread(&[false; 4])),
+            LayerSharePlan::OFF
+        );
+        assert_eq!(
+            fast_link.plan_layer(&cold, &counts[..10], &spread(&cold)),
+            LayerSharePlan::OFF
+        );
+    }
+
+    #[test]
+    fn pcie_share_mode_resolves_each_layer() {
+        let m = model(5.0, 55.0, 40.0);
+        let (cold, counts) = layer(120);
+        let part = spread(&cold);
+        assert_eq!(
+            PcieShare::Off.plan_layer(&cold, &counts, &part),
+            LayerSharePlan::OFF
+        );
+        assert_eq!(
+            PcieShare::Fixed(250_000)
+                .plan_layer(&cold, &counts, &part)
+                .ppm,
+            250_000
+        );
+        assert_eq!(
+            PcieShare::Fixed(5_000_000)
+                .plan_layer(&cold, &counts, &part)
+                .ppm,
+            1_000_000
+        );
+        assert_eq!(
+            PcieShare::Auto(m).plan_layer(&cold, &counts, &part),
+            m.plan_layer(&cold, &counts, &part)
+        );
+        assert_eq!(PcieShare::Off.describe(), "off");
+        assert_eq!(PcieShare::Fixed(250_000).describe(), "fixed 0.2500");
+        let auto = PcieShare::Auto(m.with_contention(2.0)).describe();
+        assert!(
+            auto.starts_with("auto (measured CPU arm 5.0 GB/s"),
+            "{auto}"
+        );
+        assert!(auto.contains("one-expert zero-copy read 40 us"), "{auto}");
+        assert!(auto.contains(">= 10%"), "{auto}");
+        assert!(auto.ends_with(", contention x2.00)"), "{auto}");
     }
 }

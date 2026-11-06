@@ -1106,7 +1106,21 @@ mod tests {
             assert_eq!(used, words.len(), "{words:x?}");
             body.layout.push(body.insts.insert(inst));
         }
-        crate::passes::cfg::build_blocks(&mut body, arch).expect("cfg");
+        match crate::passes::cfg::build_blocks(&mut body, arch) {
+            Ok(_) => {}
+            // A bare `s_setpc_b64 s[4:5]` has no resolvable target (the CFG builder refuses it); these tests exercise
+            // the hazard model, not control flow, so lay the stream out as the single block it textually is.
+            Err(crate::passes::cfg::CfgError::UnresolvedIndirectJump { .. }) => {
+                body.blocks = vec![crate::cfg::Block {
+                    id: crate::cfg::BlockId(0),
+                    range: (0, body.layout.len()),
+                    term: crate::cfg::Terminator::EndPgm,
+                    preds: Default::default(),
+                    succs: Default::default(),
+                }];
+            }
+            Err(error) => panic!("cfg: {error:?}"),
+        }
         body
     }
 

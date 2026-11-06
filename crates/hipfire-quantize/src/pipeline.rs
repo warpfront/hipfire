@@ -305,9 +305,12 @@ fn validate_mq4v2_xt_source(
     }
     if let Some(tensor) = source.tensors().iter().find(|tensor| {
         !matches!(tensor.quant_type, 1 | 3 | MQ4V2_FINAL_CODE_QTYPE)
-                // Raon keeps router/A_log/dt_bias/bias/eta (and non-exact
-                // gammas) as F32 (qt2); the class map is arch 19's own.
-                && !(source.arch_id == crate::raon::RAON_ARCH_ID && tensor.quant_type == 2)
+                // Raon keeps A_log/dt_bias/bias/eta (and non-exact gammas) as F32
+                // (qt2) and the router as BF16 (qt16); the class map is arch 19's own.
+                && !(source.arch_id == crate::raon::RAON_ARCH_ID
+                    && (tensor.quant_type == 2
+                        || (tensor.quant_type == 16 && tensor.name.ends_with(".moe.gate.weight"))
+                        || (tensor.quant_type == 14 && crate::raon::is_mq8_attn_class(&tensor.name))))
     }) {
         return Err(format!(
             "input is not the MQ4V2-XT type map: `{}` has qt={}",
@@ -998,6 +1001,9 @@ pub(crate) fn route_for(args: &QuantizeArgs) -> crate::cli::Route {
         Route::Qwen4
     } else if args.recipe.is_some() {
         Route::Qwen4StockFp8
+    } else if args.raon_shared_ffn.is_some() || args.raon_shared_ffn_verify.is_some() {
+        // clap makes both flags exclusive with every other recipe route.
+        Route::RaonSharedFfn
     } else if args.mq4v2_final_codes.is_some()
         || args.mq3v2_final_codes.is_some()
         || args.mq2v2_final_codes.is_some()
@@ -1191,6 +1197,65 @@ pub(crate) fn run() {
         }
     }
 
+    // ── Raon-1-mini always-active FFN swap / verify (existing qt44 artifact in) ──
+    if route_for(&args) == crate::cli::Route::RaonSharedFfn {
+        use crate::raon::{raon_hfq_diff, swap_shared_ffn, Scope, SharedFfn};
+        let input = Path::new(args.input.as_deref().expect("--input is required"));
+        let scope = match Scope::parse(args.raon_shared_ffn_scope.as_deref().unwrap_or("all")) {
+            Ok(scope) => scope,
+            Err(error) => {
+                eprintln!("error: {error}");
+                std::process::exit(2);
+            }
+        };
+        if let Some(storage) = args.raon_shared_ffn.as_deref() {
+            let source = args
+                .raon_source
+                .as_deref()
+                .expect("--raon-source is required with --raon-shared-ffn");
+            match SharedFfn::parse(storage)
+                .and_then(|t| swap_shared_ffn(input, source, Path::new(&args.output), t, scope))
+            {
+                Ok(summary) => {
+                    eprintln!("{}", summary.report());
+                    eprintln!("raon: OK {}", args.output);
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("error: raon shared-FFN swap failed: {error}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        let storage = args
+            .raon_shared_ffn_verify
+            .as_deref()
+            .expect("route implies --raon-shared-ffn-verify");
+        match SharedFfn::parse(storage)
+            .and_then(|t| raon_hfq_diff(input, Path::new(&args.output), t, scope))
+        {
+            Ok(report) => {
+                eprint!("{}", report.table());
+                if report.ok() {
+                    eprintln!("raon: shared-FFN {storage} verify OK ({})", args.output);
+                    return;
+                }
+                for v in report.violations.iter().take(50) {
+                    eprintln!("violation: {v}");
+                }
+                eprintln!(
+                    "error: raon shared-FFN verify failed: {} violation(s)",
+                    report.violations.len()
+                );
+                std::process::exit(2);
+            }
+            Err(error) => {
+                eprintln!("error: raon shared-FFN verify failed: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     if let Some(records_path) = args.mq4v2_final_codes.as_deref() {
         let input = args
             .input
@@ -1250,6 +1315,7 @@ pub(crate) fn run() {
             &args.format,
             args.mq4v2_symmetric,
             args.tier.as_deref(),
+            args.raon_attn_mq8,
         ) {
             Ok(summary) => {
                 eprintln!(

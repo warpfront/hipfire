@@ -16,6 +16,11 @@ required-features = ["toolchain"]
 name = "hip_twin"
 required-features = ["lab"]
 
+# Native emit of the Builder v_ceil_f32 device probe (kernels/ceil_probe.rs); opt-in like the other probes.
+[[example]]
+name = "ceil_probe_emit"
+required-features = ["lab"]
+
 [[example]]
 name = "pm_r4_screen"
 required-features = ["toolchain"]
@@ -29,6 +34,45 @@ required-features = ["toolchain"]
 # by the default `cargo build --all-targets`.
 [[example]]
 name = "cdna_card_tierc"
+required-features = ["lab"]
+
+# GPU exactness harness of the exact libm lowerings against hipcc (fabric job; HIP runtime).
+[[example]]
+name = "libm_exact"
+required-features = ["lab"]
+
+# One-card gfx1201 smoke of the persistent-megakernel prerequisites (fabric job; HIP runtime).
+[[example]]
+name = "pm_persistent_smoke"
+required-features = ["lab"]
+
+# Regenerates railgun-cert's PeaceMaker release/acquire fixtures (tests/event_sync.rs).
+[[example]]
+name = "railgun_cert_event_sync_fixtures"
+required-features = ["lab"]
+
+# Region-conversion survey of lifted hipcc bodies (CPU only).
+[[example]]
+name = "pm_lift_survey"
+required-features = ["lab"]
+
+# One-card gfx1201 byte-identity of lifted hipcc bodies run as pool-dispatcher regions (fabric job).
+[[example]]
+name = "pm_lift_smoke"
+required-features = ["lab"]
+
+# CPU emulator differential of the o4 gate/up body: standalone vs pool region.
+[[example]]
+name = "pm_lift_emu"
+required-features = ["lab"]
+
+# Rows-6 pool dispatchers (one per blockDim) over every convertible template (CPU only).
+[[example]]
+name = "pm_lift_pools"
+required-features = ["lab"]
+
+[[example]]
+name = "hc8_byte_oracle"
 required-features = ["lab"]
 
 # Native gfx1100 emitters that also run the ROCm oracle/certify path (M7, radiowave): need `--features toolchain`.

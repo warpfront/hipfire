@@ -90,8 +90,16 @@
 //!    and records them in the proof; this emitter never hand-places a wait. They are required by
 //!    the architecture, so the shape contract must not forbid them (it counts them instead).
 //!  * Raw buffer descriptor word 3 is `common::SRD_WORD3` (GPU-proven on gfx1100).
-//!  * `Mq3I4` and the optimized packet network are not ported: `Mq2I4` replaces `Mq3I4`
-//!    (a one-byte packet, no shift, no second load).
+//!  * `Mq3I4` (W3, planar MQ3-I4 qt131/qt132) is ported separately, as the exact `Reference` network of the
+//!    gfx1201 generator: [`mq3_specs`], module `mq_i4_moe_gemv_mq3_pm_gfx1100` (artifact stem
+//!    `mq_i4_moe_gemv_mq3only_pm_gfx1100`, `peacemaker-isa emit --kernel mq_i4_moe_gemv_mq3only`), symbols
+//!    `mq_i4_moe_gemv_mq3i4_{r256_gate_up,r128_down}[_t8]_pm_gfx1100`. A row is `K*3/8` code bytes (48 per
+//!    128-column group, eight 3-bit codes per three bytes, little-endian bit stream), the f16 scale plane starts
+//!    at `base + M*K*3/8`; lane `l` owns codes `4l..4l+3` of the group, the 12-bit packet at group bit `12l`
+//!    (bytes `(3l)>>1` and `+1` as two `global_load_u8`, `b0 | b1<<8`, `>> 4*(l&1)`), and `w = RN(float(d) *
+//!    float(2c-7))`: bit-identical to the CPU planar decoder `hipfire_cpu::quant::decode_planar_group`. The
+//!    one-`u16`-load `Optimized` packet network is not ported. It is not a member of [`Codec::ALL`] or
+//!    [`module_specs`], so the W2/MQ4 module and the MQ4-only landing object are unchanged.
 //!
 //! Read-once C8 structure is unchanged: weights are loaded and dequantized once per group, then
 //! the up-to-eight slots run their own chains on the shared weights, skipped by scalar branches
@@ -130,6 +138,9 @@ pub const USER_SGPRS: u8 = 2;
 pub enum Codec {
     /// Planar 2-bit codes, `2c - 3`, one f16 scale per row-group, plane offset `M*K/4`.
     Mq2I4,
+    /// Planar 3-bit codes (qt131/qt132), `2c - 7`, one f16 scale per row-group, plane offset `M*K*3/8`. Not a member
+    /// of [`Codec::ALL`] / [`module_specs`]: it lives in its own module (`Spec::module_mq3`, [`mq3_specs`]).
+    Mq3I4,
     /// Pointer-addressed MQ4 (qt44 gate group 136 B / qt53 down group 68 B), `d*q + z`.
     Mq4Sym,
 }
@@ -138,6 +149,7 @@ impl Codec {
     pub fn tag(self) -> &'static str {
         match self {
             Self::Mq2I4 => "mq2i4",
+            Self::Mq3I4 => "mq3i4",
             Self::Mq4Sym => "mq4sym",
         }
     }
@@ -187,6 +199,10 @@ impl Spec {
     pub fn module(arch: Arch) -> String {
         format!("mq_i4_moe_gemv_pm_{}", arch.name())
     }
+    /// The W3 K1 module (`mq_i4_moe_gemv_mq3_pm_<arch>`): the [`mq3_specs`] entries only.
+    pub fn module_mq3(arch: Arch) -> String {
+        format!("mq_i4_moe_gemv_mq3_pm_{}", arch.name())
+    }
     pub fn validate(&self) -> R {
         if self.arch != Arch::Gfx1100 {
             return Err("mq_i4_moe_gemv_gfx1100 builder is exact-gfx1100 only".into());
@@ -218,6 +234,19 @@ pub fn module_specs(arch: Arch) -> Vec<Spec> {
             Kind::ALL
                 .into_iter()
                 .map(move |kind| Spec { arch, codec, kind })
+        })
+        .collect()
+}
+
+/// The two W3 (`Mq3I4`) entries of one architecture: gate/up then down. Kept out of [`module_specs`] so the
+/// existing W2/MQ4 module and the MQ4-only landing object stay byte-identical.
+pub fn mq3_specs(arch: Arch) -> Vec<Spec> {
+    Kind::ALL
+        .into_iter()
+        .map(|kind| Spec {
+            arch,
+            codec: Codec::Mq3I4,
+            kind,
         })
         .collect()
 }
@@ -387,6 +416,14 @@ impl Lay {
     /// Accumulator register of slot `i`, chain `c`.
     fn ac(&self, i: u32, c: u8) -> u8 {
         self.acc + i as u8 * self.chains + c
+    }
+    /// Second code byte of the `Mq3I4` 12-bit packet (the otherwise unused `zero_point` register).
+    fn pkt1(&self) -> u8 {
+        self.z
+    }
+    /// Bit shift `4*(lane & 1)` of the `Mq3I4` packet (the otherwise unused `header_lane_offset` register).
+    fn shift(&self) -> u8 {
+        self.hl
     }
 }
 
@@ -811,6 +848,59 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay, rowtiles: bool) -> R {
             )?;
             add64(b, SCALE_PTR, WPTR, TMP2)?;
         }
+        (Codec::Mq3I4, _) => {
+            // Row bytes K*3/8 = (K>>3)*3; the code plane is M*K*3/8 bytes and the scale plane follows it.
+            sop(
+                b,
+                format!("s_lshr_b32 s{GROUPS}, s{SK}, 7"),
+                &[GROUPS],
+                &[SK],
+            )?;
+            sop(
+                b,
+                format!("s_lshr_b32 s{ROW_BYTES}, s{SK}, 3"),
+                &[ROW_BYTES],
+                &[SK],
+            )?;
+            sop(
+                b,
+                format!("s_mul_i32 s{ROW_BYTES}, s{ROW_BYTES}, 3"),
+                &[ROW_BYTES],
+                &[ROW_BYTES],
+            )?;
+            sop(
+                b,
+                format!("s_mul_i32 s{CODES_BYTES}, s{SM}, s{ROW_BYTES}"),
+                &[CODES_BYTES],
+                &[SM, ROW_BYTES],
+            )?;
+            sop(
+                b,
+                format!("s_mul_i32 s{TMP}, s{ROW}, s{ROW_BYTES}"),
+                &[TMP],
+                &[ROW, ROW_BYTES],
+            )?;
+            add64(b, ROW_PTR, WPTR, TMP)?;
+            sop(
+                b,
+                format!("s_mul_i32 s{TMP2}, s{ROW}, s{GROUPS}"),
+                &[TMP2],
+                &[ROW, GROUPS],
+            )?;
+            sop(
+                b,
+                format!("s_lshl_b32 s{TMP2}, s{TMP2}, 1"),
+                &[TMP2],
+                &[TMP2],
+            )?;
+            sop(
+                b,
+                format!("{} s{TMP2}, s{TMP2}, s{CODES_BYTES}", s_add_i32(a)),
+                &[TMP2],
+                &[TMP2, CODES_BYTES],
+            )?;
+            add64(b, SCALE_PTR, WPTR, TMP2)?;
+        }
         (Codec::Mq4Sym, kind) => {
             let (shift, stride) = if kind == Kind::GateUp {
                 (8, 136)
@@ -942,6 +1032,37 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay, rowtiles: bool) -> R {
             &[LANE],
             &[],
         )?,
+        (Codec::Mq3I4, _) => {
+            // Code byte (3l) >> 1 of the group and the packet's bit shift 4*(l & 1).
+            valu(
+                b,
+                &format!("v_mul_u32_u24_e32 v{}, 3, v{LANE}", l.cl),
+                &[l.cl],
+                &[LANE],
+                &[],
+            )?;
+            valu(
+                b,
+                &format!("v_lshrrev_b32_e32 v{0}, 1, v{0}", l.cl),
+                &[l.cl],
+                &[l.cl],
+                &[],
+            )?;
+            valu(
+                b,
+                &format!("v_and_b32_e32 v{}, 1, v{LANE}", l.shift()),
+                &[l.shift()],
+                &[LANE],
+                &[],
+            )?;
+            valu(
+                b,
+                &format!("v_lshlrev_b32_e32 v{0}, 2, v{0}", l.shift()),
+                &[l.shift()],
+                &[l.shift()],
+                &[],
+            )?;
+        }
         (Codec::Mq4Sym, Kind::GateUp) => {
             // Payload word 4*l; header half (bytes 0 or 4) 4*(l >> 4).
             valu(
@@ -1126,6 +1247,22 @@ fn group(b: &mut Builder, spec: Spec, l: &Lay, chain: u8, inst: &str) -> R {
                 &[GI],
             )?;
         }
+        Codec::Mq3I4 => {
+            // 128 columns * 3 bits = 48 code bytes per group; 512 X bytes; one f16 scale.
+            sop(
+                b,
+                format!("s_mul_i32 s{G_CODE}, s{GI}, 48"),
+                &[G_CODE],
+                &[GI],
+            )?;
+            sop(b, format!("s_lshl_b32 s{G_X}, s{GI}, 9"), &[G_X], &[GI])?;
+            sop(
+                b,
+                format!("s_lshl_b32 s{G_SCALE}, s{GI}, 1"),
+                &[G_SCALE],
+                &[GI],
+            )?;
+        }
         Codec::Mq4Sym => {
             sop(
                 b,
@@ -1152,7 +1289,7 @@ fn group(b: &mut Builder, spec: Spec, l: &Lay, chain: u8, inst: &str) -> R {
         &[G_CODE],
     )?;
     match (spec.codec, spec.kind) {
-        (Codec::Mq2I4, _) => valu(
+        (Codec::Mq2I4 | Codec::Mq3I4, _) => valu(
             b,
             &format!("v_mov_b32_e32 v{}, s{G_SCALE}", l.saddr),
             &[l.saddr],
@@ -1184,6 +1321,12 @@ fn group(b: &mut Builder, spec: Spec, l: &Lay, chain: u8, inst: &str) -> R {
     match (spec.codec, spec.kind) {
         (Codec::Mq2I4, _) => {
             gload(b, "global_load_u8", l.pkt, l.caddr, ROW_PTR, "")?;
+            gload(b, "global_load_u16", l.d, l.saddr, SCALE_PTR, "")?;
+        }
+        (Codec::Mq3I4, _) => {
+            // The 12-bit packet is bytes (3l)>>1 and +1 of the group (never past byte 47 of the 48-byte group).
+            gload(b, "global_load_u8", l.pkt, l.caddr, ROW_PTR, "")?;
+            gload(b, "global_load_u8", l.pkt1(), l.caddr, ROW_PTR, " offset:1")?;
             gload(b, "global_load_u16", l.d, l.saddr, SCALE_PTR, "")?;
         }
         (Codec::Mq4Sym, Kind::GateUp) => {
@@ -1224,7 +1367,7 @@ fn group(b: &mut Builder, spec: Spec, l: &Lay, chain: u8, inst: &str) -> R {
         }
         let dot = l.dot + (i % 2) as u8;
         let x = l.xr(i);
-        // Mq2I4: p = RN(w0*x0), then fma(w_j, x_j, p) for j = 1..; Mq4Sym (the production contraction of the
+        // Mq2I4 / Mq3I4: p = RN(w0*x0), then fma(w_j, x_j, p) for j = 1..; Mq4Sym (the production contraction of the
         // old MQ4 kernels): p = RN(w1*x1), then fma(w0, x0, p), then fma(w_j, x_j, p) for j = 2.. ascending.
         let first = if spec.codec == Codec::Mq4Sym { 1 } else { 0 };
         valu(
@@ -1304,6 +1447,62 @@ fn unpack(b: &mut Builder, spec: Spec, l: &Lay) -> R {
                 valu(
                     b,
                     &format!("v_add_nc_u32_e32 v{w}, -3, v{w}"),
+                    &[w],
+                    &[w],
+                    &[],
+                )?;
+                valu(b, &format!("v_cvt_f32_i32_e32 v{w}, v{w}"), &[w], &[w], &[])?;
+                valu(
+                    b,
+                    &format!("v_mul_f32_e32 v{w}, v{}, v{w}", l.d),
+                    &[w],
+                    &[l.d, w],
+                    &[],
+                )?;
+            }
+        }
+        Codec::Mq3I4 => {
+            valu(
+                b,
+                &format!("v_cvt_f32_f16_e64 v{0}, v{0}.l", l.d),
+                &[l.d],
+                &[l.d],
+                &[],
+            )?;
+            // packet = b0 | b1 << 8, then >> 4*(l&1): the lane's four 3-bit codes are bits [0, 12).
+            valu(
+                b,
+                &format!("v_lshl_or_b32 v{0}, v{1}, 8, v{0}", l.pkt, l.pkt1()),
+                &[l.pkt],
+                &[l.pkt1(), l.pkt],
+                &[],
+            )?;
+            valu(
+                b,
+                &format!("v_lshrrev_b32_e32 v{0}, v{1}, v{0}", l.pkt, l.shift()),
+                &[l.pkt],
+                &[l.shift(), l.pkt],
+                &[],
+            )?;
+            for i in 0..4u8 {
+                let w = l.w + i;
+                valu(
+                    b,
+                    &format!("v_bfe_u32 v{w}, v{}, {}, 3", l.pkt, u32::from(i) * 3),
+                    &[w],
+                    &[l.pkt],
+                    &[],
+                )?;
+                valu(
+                    b,
+                    &format!("v_lshlrev_b32_e32 v{w}, 1, v{w}"),
+                    &[w],
+                    &[w],
+                    &[],
+                )?;
+                valu(
+                    b,
+                    &format!("v_add_nc_u32_e32 v{w}, -7, v{w}"),
                     &[w],
                     &[w],
                     &[],
@@ -1620,7 +1819,10 @@ mod rowtile_tests {
 
     #[test]
     fn rowtiles_keep_the_gfx1100_singleton_dag_and_resources() {
-        for spec in module_specs(Arch::Gfx1100) {
+        for spec in module_specs(Arch::Gfx1100)
+            .into_iter()
+            .chain(mq3_specs(Arch::Gfx1100))
+        {
             let singleton = emit(spec).unwrap();
             let tiled = emit_rowtiles(spec).unwrap();
             assert_eq!(arithmetic(&tiled.s_text), arithmetic(&singleton.s_text));
@@ -1655,7 +1857,10 @@ mod rowtile_tests {
 
     #[test]
     fn rowtile_descriptor_abi_uses_z_and_full_window_bases() {
-        for spec in module_specs(Arch::Gfx1100) {
+        for spec in module_specs(Arch::Gfx1100)
+            .into_iter()
+            .chain(mq3_specs(Arch::Gfx1100))
+        {
             let e = emit_rowtiles(spec).unwrap();
             let t = &e.s_text;
             assert!(t.contains(".amdhsa_system_sgpr_workgroup_id_z 1"));

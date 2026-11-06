@@ -1,0 +1,181 @@
+{
+  "module": "gated_delta_chunk_q8_arena_pm_gfx1151",
+  "arch": "gfx1151",
+  "reports": [
+    {
+      "abi": {
+        "args": [
+          {
+            "name": "",
+            "offset": 0,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 8,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 16,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 24,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 32,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 40,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 48,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 56,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 64,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 72,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 76,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 80,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 84,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 88,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 92,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 96,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 100,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 104,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 108,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          }
+        ],
+        "compared_to_incumbent": true,
+        "incumbent_sha256": "db4e8a09f8c434a0d7dc697935bcdcb6016119d6f0589c3f0fdd30e514749337",
+        "incumbent_symbol": "gated_delta_chunk_gate_q8_wmma_arena",
+        "kernarg_segment_size": 112
+      },
+      "arch": "gfx1151",
+      "elf_bytes": 36504,
+      "elf_sha256": "e568e16e5d1546ed80af8f54d2b356e017f6cd7de0abaddf46adee7e182a480c",
+      "hazards": {
+        "advisory": 192,
+        "blocking": 0,
+        "checked": true,
+        "findings": 192,
+        "pm_ir_obligations": 0
+      },
+      "hxaco_bytes": 40600,
+      "hxaco_sha256": "99567ed88287eb592bc121b28c31dc9198ce55a6f4ed9a50d7a9b3d51aa5a6bd",
+      "kernel": "gated_delta_chunk_gate_q8_wmma_arena_pm_gfx1151",
+      "lds": 31168,
+      "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+      "rsrc2": 132,
+      "scratch": 0,
+      "sgprs": 89,
+      "text_bytes": 31460,
+      "text_sha256": "d5224e204671e653d8a908c4a2da32a41d50b66cb86507ed4d4fdc897aae7d3a",
+      "user_sgprs": 2,
+      "vgprs": 240,
+      "wavefront_size": 32
+    }
+  ],
+  "judged_text_check": [
+    {
+      "symbol": "gated_delta_chunk_gate_q8_wmma_arena_pm_gfx1151",
+      "judged_candidate": "incumbent-hipcc",
+      "judged_code_sha256": "d5224e204671e653d8a908c4a2da32a41d50b66cb86507ed4d4fdc897aae7d3a",
+      "twin_text_sha256": "d5224e204671e653d8a908c4a2da32a41d50b66cb86507ed4d4fdc897aae7d3a",
+      "equal": true
+    }
+  ]
+}

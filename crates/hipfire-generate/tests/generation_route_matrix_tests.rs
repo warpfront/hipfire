@@ -27,6 +27,7 @@ fn base() -> GenerationRouteInputs {
         has_speculator: false,
         speculator_is_mtp: false,
         speculator_is_dflash2: false,
+        speculator_supports_penalties: false,
         deepseek4_spec_requested: false,
         ngram_can_sample: false,
         temp: 0.0,
@@ -318,6 +319,18 @@ fn capability_rows() -> Vec<(GenerationRoute, GenerationRouteInputs)> {
             },
         ),
         (
+            // Raon with the shared DFlash2 drafter loaded: a greedy request
+            // takes the spec route (an unrelated speculator would not).
+            GenerationRoute::RaonSpec,
+            GenerationRouteInputs {
+                arch_id: 19,
+                has_speculator: true,
+                speculator_is_dflash2: true,
+                temp: 0.0,
+                ..base()
+            },
+        ),
+        (
             GenerationRoute::Unknown,
             GenerationRouteInputs {
                 arch_id: 99,
@@ -356,6 +369,9 @@ const SAFE_ROUTES: &[GenerationRoute] = &[
     // producer: XML `<tool_call><function=..>` through the strict
     // `ToolOutputRouter`, semantic contract v2 via the carrier caps.
     GenerationRoute::RaonAr,
+    // Arch 19 with the shared DFlash2 drafter: the same router over committed
+    // tokens (`Qwen35Emit` via the Raon carrier, grammar off).
+    GenerationRoute::RaonSpec,
 ];
 
 /// Pure gate model mirroring generate()'s tools preflight:
@@ -1182,7 +1198,7 @@ fn exact_safe_set_is_qwen_ar_qwen4_ar_mtp_dflash_ds4_ar_ep_spec_glimmer_ar_spec_
     let mut expected = SAFE_ROUTES.to_vec();
     expected.sort_by_key(|r| r.name());
     assert_eq!(from_all, expected);
-    assert_eq!(from_all.len(), 12);
+    assert_eq!(from_all.len(), 13);
     // Negative: every other ALL member is denied for tools.
     for &r in GenerationRoute::ALL {
         if !SAFE_ROUTES.contains(&r) {
@@ -1228,6 +1244,40 @@ fn gemma4_is_classified_and_routes_tools() {
 }
 
 #[test]
+fn min_tokens_rides_exactly_the_routes_that_honour_stop() {
+    // `min_tokens` holds EOS and stops inactive in the same producers
+    // (`QwenArSemanticProducer`, `Qwen35Emit`); any other route refuses it.
+    for route in GenerationRoute::ALL {
+        assert_eq!(
+            route.supports_min_tokens(),
+            route.supports_stop(),
+            "{route:?}"
+        );
+    }
+}
+
+#[test]
+fn min_tokens_over_max_tokens_or_malformed_is_a_validation_error() {
+    use serde_json::json;
+    let mut sink = Vec::new();
+    for ok in [
+        json!({}),
+        json!({"min_tokens": null}),
+        json!({"min_tokens": 0}),
+    ] {
+        assert_eq!(
+            hipfire_generate::ar::min_tokens_or_reject(&mut sink, "r", &ok, 8),
+            Some(0)
+        );
+    }
+    assert_eq!(
+        hipfire_generate::ar::min_tokens_or_reject(&mut sink, "r", &json!({"min_tokens": 8}), 8),
+        Some(8)
+    );
+    assert!(sink.is_empty(), "valid values write nothing");
+}
+
+#[test]
 fn stop_sequences_are_honoured_exactly_on_the_qwen_semantic_producers() {
     // Qwen4 AR and native MTP joined the Qwen3.5-family AR/DFlash routes: an
     // eval request with `stop` on Flash-Next used to be refused with 400.
@@ -1244,7 +1294,8 @@ fn stop_sequences_are_honoured_exactly_on_the_qwen_semantic_producers() {
             "qwen4_spec",
             "qwen_ar",
             "qwen_dflash",
-            "raon_ar"
+            "raon_ar",
+            "raon_spec"
         ]
     );
     // Both Qwen4 routes a Flash-Next load can select carry tools AND stop, so

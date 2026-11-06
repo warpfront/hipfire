@@ -2377,14 +2377,28 @@ fn main() {
                     0,
                 );
                 // The continuous-batch request staged after this load, so a
-                // Qwen4 expert-parallel load reserves the AR lane store's
-                // bytes before it splits the experts. Only the exact VMM
-                // route stages Qwen4 lanes; `vmm_batch` is false for the
-                // non-exact route and without `serve_vmm_batch`.
+                // Qwen4 expert-parallel load reserves the lane store's bytes
+                // before it splits the experts: the native-MTP lane store
+                // (default copy lane included) when the staging will stage it
+                // (`serve.batch_spec`, explicit `--spec mtp`, no
+                // `HIPFIRE_EP_MTP_LANES=0`), else the AR
+                // store. Only the exact VMM route stages Qwen4 lanes;
+                // `vmm_batch` is false for the non-exact route and without
+                // `serve_vmm_batch`.
+                // Only Qwen4 expert-parallel loads read it (the topology comes
+                // from `topology.ep`, not the `tp` param).
+                let (ep_spec_k, ep_spec_copy) =
+                    hipfire_loader::batch_staging::ep_spec_lane_reservation(
+                        parsed_vmm_batch.is_some_and(|params| params.spec),
+                        spec_cfg,
+                        gpu.arch.as_str(),
+                    );
                 admission.batch_request = hipfire_loader::admission::BatchLoadRequest {
                     vmm_batch: parsed_vmm_batch.is_some_and(|params| !params.nonexact),
                     continuous_batch_size: parsed_continuous_batch_size,
                     row_budget: parsed_vmm_batch.map_or(0, |params| params.max_batch_tokens),
+                    spec_k: ep_spec_k,
+                    spec_copy: ep_spec_copy,
                 };
                 // Only tp>1 EP loads defer prior retirement. Every single-device
                 // or pp load (Qwen4/Flash-Next included) is unload-first: after
@@ -2769,15 +2783,19 @@ fn main() {
                         batch_scheduler = staged_batch_scheduler;
                         vmm_batch = if staging.vmm { parsed_vmm_batch } else { None };
                         // `cache_capable` is the daemon's prompt-cache source of truth.
-                        // Gemma 4 (13) and Qwen4 (16) only with their attached
-                        // session cache (`ArchModel::session_cache_attached`).
+                        // Beyond the Qwen-family / legacy LCP routes listed here, any
+                        // architecture is cache-capable exactly when its bundle has the
+                        // engine session cache attached
+                        // (`ArchModel::session_cache_attached`: Gemma 4, Qwen4,
+                        // Raon-1-mini). The serve layer cold-resets the daemon before
+                        // every request of a model that is not, which would drop the
+                        // cache's resident follow-up snapshot.
                         let cache_capable = match m.arch_id {
                             5 | 6 | 9 | 10 | 12 | 14 => true,
-                            13 | 16 => m
+                            _ => m
                                 .state
                                 .as_deref()
                                 .is_some_and(|state| state.session_cache_attached()),
-                            _ => false,
                         };
                         let retry_reset_eligible = model_retry_reset_eligible(m.arch_id);
                         let continuous_batch_capable = staged_batch_capable;
@@ -3381,6 +3399,14 @@ fn main() {
                     .map(|v| v as usize)
                     .unwrap_or(hipfire_engine::scheduler::DEFAULT_GENERATE_MAX_TOKENS);
                 let _fit = request_guards::fit_max_tokens(&msg);
+                // vLLM-compatible `min_tokens`: EOS and stop sequences stay
+                // inactive until this many tokens are committed. Must not
+                // exceed `max_tokens`; an invalid value is rejected.
+                let Some(min_tokens) =
+                    hipfire_generate::ar::min_tokens_or_reject(&mut stdout, id, &msg, max_tokens)
+                else {
+                    continue;
+                };
                 // CACTUS acceptance-boost δ — OPT-IN (request `cactus_delta`), 0.0
                 // default = lossless/distribution-preserving. >0 is deliberately lossy
                 // (higher acceptance τ, KL-bounded distortion) and applies only to a
@@ -3585,6 +3611,20 @@ fn main() {
                     tp_penalties,
                     has_image,
                 ) {
+                    continue;
+                }
+                // The vision routes end on their own EOS checks and never see
+                // `min_tokens`; refuse it instead of silently ignoring it.
+                if min_tokens > 0 && has_image {
+                    hipfire_generate::dense::emit_active_attempt_error(
+                        &mut stdout,
+                        Some(id),
+                        "min_tokens is not supported on image requests",
+                        "unsupported",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
                     continue;
                 }
 
@@ -3883,6 +3923,32 @@ fn main() {
                     let pflash_active = pf_cfg_owned.as_ref().is_some_and(|c| {
                         !matches!(c.mode, hipfire_pflash::pflash::PflashMode::Off)
                     });
+                    // `min_tokens` is honoured by the singleton routes and the
+                    // Flash-Next fn-lanes only. On any other batching serve it is
+                    // refused (400), never rerouted to a serialized singleton.
+                    if min_tokens > 0 {
+                        let qwen4_batch = hipfire_loader::continuous_batch_route(m.arch_id)
+                            == Some(hipfire_loader::ContinuousBatchRoute::Qwen4);
+                        if let Some(message) = hipfire_generate::batch::min_tokens_batch_refusal(
+                            min_tokens,
+                            continuous_batch_size > 1 && batch_scheduler.is_some(),
+                            qwen4_batch,
+                            m.pp,
+                            hipfire_generate::batch::vmm_route_active(vmm_batch, m),
+                            m.ep.is_some(),
+                        ) {
+                            hipfire_generate::dense::emit_active_attempt_error(
+                                &mut stdout,
+                                Some(id),
+                                &message,
+                                "unsupported",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    }
                     let ep_batch_eligible =
                         if !singleton_handoff && batch_scheduler.is_some() && m.ep.is_some() {
                             is_qwen_ep_batch_request_eligible(
@@ -4372,6 +4438,7 @@ fn main() {
                         messages_history.as_deref(),
                         think_mode,
                         &stop_seqs, // hunt3 M-F
+                        min_tokens,
                         reasoning_effort_jinja.as_deref(),
                         enable_thinking_jinja,
                         logprobs_top_k,

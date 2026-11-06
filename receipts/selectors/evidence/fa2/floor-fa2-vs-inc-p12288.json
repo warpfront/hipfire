@@ -1,0 +1,1779 @@
+{
+  "arch": "gfx1201",
+  "baseline": {
+    "code_bytes": 27260,
+    "code_sha256": "b06b815e111f533a2b7944b1d108e931b760711c51345a791b203809c53b7d43",
+    "explicit_args": [
+      {
+        "class": "pointer",
+        "offset": 0,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 8,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 16,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 24,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 32,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 40,
+        "size": 8
+      },
+      {
+        "class": "value",
+        "offset": 48,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 52,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 56,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 60,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 64,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 68,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 72,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 76,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 80,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 84,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 88,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 92,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 96,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 100,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 104,
+        "size": 4
+      }
+    ],
+    "hipcc_argv": [
+      "/opt/rocm/core/bin/hipcc",
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "--rocm-path=/opt/rocm/core",
+      "--hip-path=/opt/rocm/core",
+      "-I/opt/rocm/core/include",
+      "-fmacro-prefix-map=/home/kaden/qcal/release-0.4.3/pmrip/fa2-cand/run/card4/fa2-vs-inc-p12288/baseline/=",
+      "-o",
+      "/home/kaden/qcal/release-0.4.3/pmrip/fa2-cand/run/card4/fa2-vs-inc-p12288/baseline/latent_attention_flash.hsaco",
+      "/home/kaden/qcal/release-0.4.3/pmrip/fa2-cand/run/card4/fa2-vs-inc-p12288/baseline/latent_attention_flash.hip"
+    ],
+    "kernarg_bytes": 368,
+    "kernels_in_object": 3,
+    "lds_bytes": 0,
+    "max_flat_workgroup_size": 128,
+    "object_bytes": 105960,
+    "object_path": "/home/kaden/qcal/release-0.4.3/pmrip/fa2-cand/run/card4/fa2-vs-inc-p12288/baseline/latent_attention_flash.hsaco",
+    "object_sha256": "78eb408e6de48289723407f04e13c0130dc62fcdea286a7e1ed4de689746c915",
+    "occupancy_basis": "vgpr (gfx11 wave32: 1536 VGPR/SIMD, granule 8, 16 slots)",
+    "occupancy_waves_per_simd": 8,
+    "scratch_bytes": 0,
+    "sgpr_spill": 0,
+    "sgprs": 74,
+    "source_path": "/home/kaden/qcal/release-0.4.3/pmrip/fa2-cand/run/card4/fa2-vs-inc-p12288/baseline/latent_attention_flash.hip",
+    "spill": 0,
+    "symbol": "latent_attention_flash_prefill",
+    "vgpr_spill": 0,
+    "vgprs": 182,
+    "vgprs_allocated": 184,
+    "wavefront_size": 32
+  },
+  "baseline_co": {
+    "path": "/home/kaden/qcal/release-0.4.3/pmrip/fa2-cand/run/card4/fa2-vs-inc-p12288/baseline.co",
+    "sha256": "78eb408e6de48289723407f04e13c0130dc62fcdea286a7e1ed4de689746c915",
+    "sidecar": "/home/kaden/qcal/release-0.4.3/pmrip/fa2-cand/run/card4/fa2-vs-inc-p12288/baseline.co.json"
+  },
+  "candidate": {
+    "code_bytes": 33732,
+    "code_sha256": "93d4da447d53927aefb82a3edef8692dfe8dd8edffceb659d37205bea62eecaf",
+    "explicit_args": [
+      {
+        "class": "pointer",
+        "offset": 0,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 8,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 16,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 24,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 32,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 40,
+        "size": 8
+      },
+      {
+        "class": "value",
+        "offset": 48,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 52,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 56,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 60,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 64,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 68,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 72,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 76,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 80,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 84,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 88,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 92,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 96,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 100,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 104,
+        "size": 4
+      }
+    ],
+    "hipcc_argv": [
+      "/opt/rocm/core/bin/hipcc",
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "--rocm-path=/opt/rocm/core",
+      "--hip-path=/opt/rocm/core",
+      "-I/opt/rocm/core/include",
+      "-fmacro-prefix-map=/home/kaden/qcal/release-0.4.3/pmrip/fa2-cand/run/card4/fa2-vs-inc-p12288/candidate/=",
+      "-o",
+      "/home/kaden/qcal/release-0.4.3/pmrip/fa2-cand/run/card4/fa2-vs-inc-p12288/candidate/latent_attention_flash_fa2.hsaco",
+      "/home/kaden/qcal/release-0.4.3/pmrip/fa2-cand/run/card4/fa2-vs-inc-p12288/candidate/latent_attention_flash_fa2.hip"
+    ],
+    "kernarg_bytes": 368,
+    "kernels_in_object": 1,
+    "lds_bytes": 0,
+    "max_flat_workgroup_size": 256,
+    "object_bytes": 43664,
+    "object_path": "/home/kaden/qcal/release-0.4.3/pmrip/fa2-cand/run/card4/fa2-vs-inc-p12288/candidate/latent_attention_flash_fa2.hsaco",
+    "object_sha256": "05dac1bb5a559ec1d7c7d244110203ef08ebd9ab514a45891ac2c10e76eee4c3",
+    "occupancy_basis": "vgpr (gfx11 wave32: 1536 VGPR/SIMD, granule 8, 16 slots)",
+    "occupancy_waves_per_simd": 6,
+    "scratch_bytes": 0,
+    "sgpr_spill": 0,
+    "sgprs": 34,
+    "source_path": "/home/kaden/qcal/release-0.4.3/pmrip/fa2-cand/run/card4/fa2-vs-inc-p12288/candidate/latent_attention_flash_fa2.hip",
+    "spill": 0,
+    "symbol": "latent_attention_flash_prefill_fa2_q128w8",
+    "vgpr_spill": 0,
+    "vgprs": 239,
+    "vgprs_allocated": 240,
+    "wavefront_size": 32
+  },
+  "candidate_co": {
+    "path": "/home/kaden/qcal/release-0.4.3/pmrip/fa2-cand/run/card4/fa2-vs-inc-p12288/candidate.co",
+    "sha256": "05dac1bb5a559ec1d7c7d244110203ef08ebd9ab514a45891ac2c10e76eee4c3",
+    "sidecar": "/home/kaden/qcal/release-0.4.3/pmrip/fa2-cand/run/card4/fa2-vs-inc-p12288/candidate.co.json"
+  },
+  "candidate_geometry_arg": "",
+  "candidate_header": {},
+  "clipped_classes": [],
+  "contract": {
+    "admit": {
+      "kill_env": "HIPFIRE_ATTN_FA2_GENERIC",
+      "max_rows": null,
+      "min_rows": 17,
+      "predicate": "crates/rdna-compute/src/latent_attention_flash.rs::FA2_MIN_ROWS"
+    },
+    "arch": "gfx1201",
+    "digest": "21c5e9bf2db9960658bc12dcd31216c5d7ece6b662321bad69f3d5670ad4b429",
+    "explicit_bytes": 108,
+    "hidden_words": 14,
+    "id": "generic_seq.latent_attention_flash_prefill_fa2_q128w8",
+    "module": "latent_attention_flash_fa2",
+    "numeric": "latent_attention.flash_prefill.bf16_wmma_f32",
+    "segment_bytes": 368,
+    "symbol": "latent_attention_flash_prefill_fa2_q128w8",
+    "version": 1,
+    "work_op_class": "attention"
+  },
+  "contract_vs": {
+    "admit": {
+      "kill_env": null,
+      "max_rows": null,
+      "min_rows": 1,
+      "predicate": ""
+    },
+    "arch": "gfx1201",
+    "digest": "918694604c4468639b85bb113cf943f1099a11e2eb91ed8563a1102c4c72a200",
+    "explicit_bytes": 108,
+    "hidden_words": 14,
+    "id": "generic_seq.latent_attention_flash_prefill",
+    "module": "latent_attention_flash",
+    "numeric": "latent_attention.flash_prefill.bf16_wmma_f32",
+    "segment_bytes": 368,
+    "symbol": "latent_attention_flash_prefill",
+    "version": 1,
+    "work_op_class": "attention"
+  },
+  "device": {
+    "arch": "gfx1201",
+    "device_id": 0,
+    "fabric_job": "4185255:150678054:E",
+    "uuid": "GPU-05f92432f2312a0e"
+  },
+  "error": null,
+  "identical_code": false,
+  "identical_to_baseline": true,
+  "llc_bytes": 67108864,
+  "module": "latent_attention_flash",
+  "node": "contract:latent_attention_flash_prefill_fa2_q128w8",
+  "offline": false,
+  "out_dir": "/home/kaden/qcal/release-0.4.3/pmrip/fa2-cand/run/card4/fa2-vs-inc-p12288",
+  "regime": "pool",
+  "rowclasses": [
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": true
+      },
+      "bytes_per_call": 315878400,
+      "footprint_bytes": 355288068,
+      "geometry_base": {
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          128,
+          40,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          40,
+          1
+        ],
+        "lds_dynamic_bytes": 44032
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          256,
+          40,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          40,
+          1
+        ],
+        "lds_dynamic_bytes": 44032
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 348160
+      },
+      "identity_mode": "full",
+      "p_faster": 0.000030517578125,
+      "p_slower": 1.0,
+      "ratio_median": 0.4800261382722433,
+      "regime": "pool",
+      "rows": 17,
+      "same_geometry": false,
+      "shape": "n_rows17-n_heads40-wa128-wb64-dv128-pos_offset0-max_rows16384-ka_tok5120-ka_head128-kb_tok576-kb_head0-v_tok5120-v_head128-scale_bits1033096506-round_y1-prefix12288",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 522240,
+            "format": "f32.flat",
+            "name": "q",
+            "recipe": "F32"
+          },
+          {
+            "access": "write_only",
+            "bytes": 348160,
+            "format": "f32.flat",
+            "name": "y",
+            "recipe": "Poison"
+          },
+          {
+            "access": "read_only",
+            "bytes": 167772160,
+            "format": "bf16.token_head_view",
+            "name": "ka",
+            "recipe": "Bf16"
+          },
+          {
+            "access": "read_only",
+            "bytes": 18873344,
+            "format": "bf16.token_head_view",
+            "name": "kb",
+            "recipe": "Bf16"
+          },
+          {
+            "access": "read_only",
+            "bytes": 167772160,
+            "format": "bf16.token_head_view",
+            "name": "vv",
+            "recipe": "Bf16"
+          },
+          {
+            "access": "read_only",
+            "bytes": 4,
+            "format": "i32.device_scalar",
+            "name": "pos_ptr",
+            "recipe": "DeviceScalar"
+          }
+        ],
+        "params": {
+          "dv": 128,
+          "ka_head": 128,
+          "ka_tok": 5120,
+          "kb_head": 0,
+          "kb_tok": 576,
+          "max_rows": 16384,
+          "n_heads": 40,
+          "n_rows": 17,
+          "pos_offset": 0,
+          "round_y": 1,
+          "scale_bits": 1033096506,
+          "v_head": 128,
+          "v_tok": 5120,
+          "wa": 128,
+          "wb": 64
+        },
+        "prefix": 12288,
+        "timing_pool": {
+          "bytes_per_set": 354939904,
+          "dispatch_i_uses_set": "i % sets",
+          "sets": 1,
+          "total_bytes": 354939904
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:c3:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3136Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:c3:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "S: 83Mhz * | 1: 500Mhz  | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "p_faster": 0.000030517578125,
+        "p_slower": 1.0,
+        "ratio_max": 0.49034823117705423,
+        "ratio_median": 0.4800261382722433,
+        "ratio_min": 0.4789399462028003,
+        "rounds": [
+          {
+            "base_us": 1202.3450136184692,
+            "cand_us": 589.5677506923676,
+            "ratio": 0.49034823117705423,
+            "round": 0
+          },
+          {
+            "base_us": 1203.7655115127563,
+            "cand_us": 578.4572511911392,
+            "ratio": 0.48053981083425423,
+            "round": 1
+          },
+          {
+            "base_us": 1203.6259770393372,
+            "cand_us": 577.1979987621307,
+            "ratio": 0.4795493033325141,
+            "round": 2
+          },
+          {
+            "base_us": 1203.2760083675385,
+            "cand_us": 579.1077464818954,
+            "ratio": 0.4812759021660873,
+            "round": 3
+          },
+          {
+            "base_us": 1202.615737915039,
+            "cand_us": 577.2869884967804,
+            "ratio": 0.4800261382722433,
+            "round": 4
+          },
+          {
+            "base_us": 1202.3557722568512,
+            "cand_us": 576.0277509689331,
+            "ratio": 0.47908261785753725,
+            "round": 5
+          },
+          {
+            "base_us": 1202.345222234726,
+            "cand_us": 577.6574909687042,
+            "ratio": 0.4804422891913251,
+            "round": 6
+          },
+          {
+            "base_us": 1201.985478401184,
+            "cand_us": 576.7175108194351,
+            "ratio": 0.4798040585203687,
+            "round": 7
+          },
+          {
+            "base_us": 1201.6057670116425,
+            "cand_us": 575.4970014095306,
+            "ratio": 0.4789399462028003,
+            "round": 8
+          },
+          {
+            "base_us": 1201.93549990654,
+            "cand_us": 578.0977606773376,
+            "ratio": 0.480972365590574,
+            "round": 9
+          },
+          {
+            "base_us": 1201.3254761695862,
+            "cand_us": 577.1175026893616,
+            "ratio": 0.48040061926389405,
+            "round": 10
+          },
+          {
+            "base_us": 1201.1555135250092,
+            "cand_us": 575.9280025959015,
+            "ratio": 0.4794782991136061,
+            "round": 11
+          },
+          {
+            "base_us": 1200.7355093955994,
+            "cand_us": 576.8875181674957,
+            "ratio": 0.48044512188856403,
+            "round": 12
+          },
+          {
+            "base_us": 1200.9657621383667,
+            "cand_us": 576.0777443647385,
+            "ratio": 0.4796787406653537,
+            "round": 13
+          },
+          {
+            "base_us": 1200.7155120372772,
+            "cand_us": 576.2177407741547,
+            "ratio": 0.4798953082537219,
+            "round": 14
+          }
+        ],
+        "rounds_faster": 15,
+        "rounds_slower": 0,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 262.7994784898824,
+          "baseline_tflops": 4.452384162317159,
+          "baseline_us": {
+            "max": 1294.0959930419922,
+            "mean": 1203.2590938938995,
+            "median": 1201.9749879837036,
+            "min": 1190.614938735962,
+            "p90": 1208.616018295288
+          },
+          "calls_per_arm": 900,
+          "candidate_gbps": 546.8738018055041,
+          "candidate_tflops": 9.26520961128445,
+          "candidate_us": {
+            "max": 612.7669811248779,
+            "mean": 577.9861738284426,
+            "median": 577.6074826717377,
+            "min": 563.3270144462585,
+            "p90": 586.5280032157898
+          },
+          "flush": false,
+          "n": 30,
+          "rounds": 15,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 315878400.0,
+        "flops": 5351654400.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": true
+      },
+      "bytes_per_call": 316416000,
+      "footprint_bytes": 355646468,
+      "geometry_base": {
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          128,
+          40,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          40,
+          1
+        ],
+        "lds_dynamic_bytes": 44032
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          256,
+          40,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          40,
+          1
+        ],
+        "lds_dynamic_bytes": 44032
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 491520
+      },
+      "identity_mode": "full",
+      "p_faster": 0.000030517578125,
+      "p_slower": 1.0,
+      "ratio_median": 0.4822200138629123,
+      "regime": "pool",
+      "rows": 24,
+      "same_geometry": false,
+      "shape": "n_rows24-n_heads40-wa128-wb64-dv128-pos_offset0-max_rows16384-ka_tok5120-ka_head128-kb_tok576-kb_head0-v_tok5120-v_head128-scale_bits1033096506-round_y1-prefix12288",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 737280,
+            "format": "f32.flat",
+            "name": "q",
+            "recipe": "F32"
+          },
+          {
+            "access": "write_only",
+            "bytes": 491520,
+            "format": "f32.flat",
+            "name": "y",
+            "recipe": "Poison"
+          },
+          {
+            "access": "read_only",
+            "bytes": 167772160,
+            "format": "bf16.token_head_view",
+            "name": "ka",
+            "recipe": "Bf16"
+          },
+          {
+            "access": "read_only",
+            "bytes": 18873344,
+            "format": "bf16.token_head_view",
+            "name": "kb",
+            "recipe": "Bf16"
+          },
+          {
+            "access": "read_only",
+            "bytes": 167772160,
+            "format": "bf16.token_head_view",
+            "name": "vv",
+            "recipe": "Bf16"
+          },
+          {
+            "access": "read_only",
+            "bytes": 4,
+            "format": "i32.device_scalar",
+            "name": "pos_ptr",
+            "recipe": "DeviceScalar"
+          }
+        ],
+        "params": {
+          "dv": 128,
+          "ka_head": 128,
+          "ka_tok": 5120,
+          "kb_head": 0,
+          "kb_tok": 576,
+          "max_rows": 16384,
+          "n_heads": 40,
+          "n_rows": 24,
+          "pos_offset": 0,
+          "round_y": 1,
+          "scale_bits": 1033096506,
+          "v_head": 128,
+          "v_tok": 5120,
+          "wa": 128,
+          "wb": 64
+        },
+        "prefix": 12288,
+        "timing_pool": {
+          "bytes_per_set": 355154944,
+          "dispatch_i_uses_set": "i % sets",
+          "sets": 1,
+          "total_bytes": 355154944
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:c3:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3127Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:c3:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 1040Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "p_faster": 0.000030517578125,
+        "p_slower": 1.0,
+        "ratio_max": 0.4838120949371142,
+        "ratio_median": 0.4822200138629123,
+        "ratio_min": 0.47728395591270545,
+        "rounds": [
+          {
+            "base_us": 1242.3159778118134,
+            "cand_us": 592.9374843835831,
+            "ratio": 0.47728395591270545,
+            "round": 0
+          },
+          {
+            "base_us": 1202.4657726287842,
+            "cand_us": 581.7674845457077,
+            "ratio": 0.4838120949371142,
+            "round": 1
+          },
+          {
+            "base_us": 1203.4155130386353,
+            "cand_us": 580.4477334022522,
+            "ratio": 0.4823335972598661,
+            "round": 2
+          },
+          {
+            "base_us": 1203.0655145645142,
+            "cand_us": 579.127237200737,
+            "ratio": 0.4813763092614034,
+            "round": 3
+          },
+          {
+            "base_us": 1202.7654945850372,
+            "cand_us": 580.2579969167709,
+            "ratio": 0.48243651778268226,
+            "round": 4
+          },
+          {
+            "base_us": 1202.1859884262085,
+            "cand_us": 579.0077447891235,
+            "ratio": 0.48162909097543827,
+            "round": 5
+          },
+          {
+            "base_us": 1201.9054889678955,
+            "cand_us": 578.2672464847565,
+            "ratio": 0.48112538946912387,
+            "round": 6
+          },
+          {
+            "base_us": 1201.805740594864,
+            "cand_us": 579.7772407531738,
+            "ratio": 0.48242176016416644,
+            "round": 7
+          },
+          {
+            "base_us": 1201.6454935073853,
+            "cand_us": 579.4575065374374,
+            "ratio": 0.4822200138629123,
+            "round": 8
+          },
+          {
+            "base_us": 1201.325535774231,
+            "cand_us": 579.657256603241,
+            "ratio": 0.4825147217316605,
+            "round": 9
+          },
+          {
+            "base_us": 1201.3755142688751,
+            "cand_us": 579.6879827976227,
+            "ratio": 0.482520224453222,
+            "round": 10
+          },
+          {
+            "base_us": 1201.2655138969421,
+            "cand_us": 578.6875039339066,
+            "ratio": 0.48173155496375364,
+            "round": 11
+          },
+          {
+            "base_us": 1200.6852626800537,
+            "cand_us": 578.7779986858368,
+            "ratio": 0.48203972904101816,
+            "round": 12
+          },
+          {
+            "base_us": 1200.6657421588898,
+            "cand_us": 579.0079981088638,
+            "ratio": 0.4822391259933532,
+            "round": 13
+          },
+          {
+            "base_us": 1200.8457481861115,
+            "cand_us": 577.5770097970963,
+            "ratio": 0.4809751882533886,
+            "round": 14
+          }
+        ],
+        "rounds_faster": 15,
+        "rounds_slower": 0,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 263.24674237255425,
+          "baseline_tflops": 6.287507872919618,
+          "baseline_us": {
+            "max": 1294.456958770752,
+            "mean": 1205.2176645067032,
+            "median": 1201.9749879837036,
+            "min": 1192.5749778747559,
+            "p90": 1208.5360288619995
+          },
+          "calls_per_arm": 900,
+          "candidate_gbps": 545.7254845977883,
+          "candidate_tflops": 13.03436179280601,
+          "candidate_us": {
+            "max": 621.0479736328125,
+            "mean": 580.9988880157468,
+            "median": 579.8079967498779,
+            "min": 564.8069977760315,
+            "p90": 591.6479825973511
+          },
+          "flush": false,
+          "n": 30,
+          "rounds": 15,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 316416000.0,
+        "flops": 7557427200.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": true
+      },
+      "bytes_per_call": 317030400,
+      "footprint_bytes": 356056068,
+      "geometry_base": {
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          128,
+          40,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          40,
+          1
+        ],
+        "lds_dynamic_bytes": 44032
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          256,
+          40,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          40,
+          1
+        ],
+        "lds_dynamic_bytes": 44032
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 655360
+      },
+      "identity_mode": "full",
+      "p_faster": 0.000030517578125,
+      "p_slower": 1.0,
+      "ratio_median": 0.4823188239561047,
+      "regime": "pool",
+      "rows": 32,
+      "same_geometry": false,
+      "shape": "n_rows32-n_heads40-wa128-wb64-dv128-pos_offset0-max_rows16384-ka_tok5120-ka_head128-kb_tok576-kb_head0-v_tok5120-v_head128-scale_bits1033096506-round_y1-prefix12288",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 983040,
+            "format": "f32.flat",
+            "name": "q",
+            "recipe": "F32"
+          },
+          {
+            "access": "write_only",
+            "bytes": 655360,
+            "format": "f32.flat",
+            "name": "y",
+            "recipe": "Poison"
+          },
+          {
+            "access": "read_only",
+            "bytes": 167772160,
+            "format": "bf16.token_head_view",
+            "name": "ka",
+            "recipe": "Bf16"
+          },
+          {
+            "access": "read_only",
+            "bytes": 18873344,
+            "format": "bf16.token_head_view",
+            "name": "kb",
+            "recipe": "Bf16"
+          },
+          {
+            "access": "read_only",
+            "bytes": 167772160,
+            "format": "bf16.token_head_view",
+            "name": "vv",
+            "recipe": "Bf16"
+          },
+          {
+            "access": "read_only",
+            "bytes": 4,
+            "format": "i32.device_scalar",
+            "name": "pos_ptr",
+            "recipe": "DeviceScalar"
+          }
+        ],
+        "params": {
+          "dv": 128,
+          "ka_head": 128,
+          "ka_tok": 5120,
+          "kb_head": 0,
+          "kb_tok": 576,
+          "max_rows": 16384,
+          "n_heads": 40,
+          "n_rows": 32,
+          "pos_offset": 0,
+          "round_y": 1,
+          "scale_bits": 1033096506,
+          "v_head": 128,
+          "v_tok": 5120,
+          "wa": 128,
+          "wb": 64
+        },
+        "prefix": 12288,
+        "timing_pool": {
+          "bytes_per_set": 355400704,
+          "dispatch_i_uses_set": "i % sets",
+          "sets": 1,
+          "total_bytes": 355400704
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:c3:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3087Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:c3:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 1050Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "p_faster": 0.000030517578125,
+        "p_slower": 1.0,
+        "ratio_max": 0.49396534225378735,
+        "ratio_median": 0.4823188239561047,
+        "ratio_min": 0.4779839231239744,
+        "rounds": [
+          {
+            "base_us": 1244.0957427024841,
+            "cand_us": 594.657763838768,
+            "ratio": 0.4779839231239744,
+            "round": 0
+          },
+          {
+            "base_us": 1204.605221748352,
+            "cand_us": 581.2277495861053,
+            "ratio": 0.48250475682192145,
+            "round": 1
+          },
+          {
+            "base_us": 1204.0455043315887,
+            "cand_us": 580.1677405834198,
+            "ratio": 0.4818486830408398,
+            "round": 2
+          },
+          {
+            "base_us": 1203.815758228302,
+            "cand_us": 578.5074979066849,
+            "ratio": 0.4805614928634052,
+            "round": 3
+          },
+          {
+            "base_us": 1202.9755115509033,
+            "cand_us": 580.2177339792252,
+            "ratio": 0.4823188239561047,
+            "round": 4
+          },
+          {
+            "base_us": 1203.0660212039948,
+            "cand_us": 577.4179995059967,
+            "ratio": 0.47995537179924086,
+            "round": 5
+          },
+          {
+            "base_us": 1202.755719423294,
+            "cand_us": 579.6577632427216,
+            "ratio": 0.48194138999452024,
+            "round": 6
+          },
+          {
+            "base_us": 1202.4457454681396,
+            "cand_us": 579.9470096826553,
+            "ratio": 0.482306176281466,
+            "round": 7
+          },
+          {
+            "base_us": 1202.3257315158844,
+            "cand_us": 580.887496471405,
+            "ratio": 0.48313654215736185,
+            "round": 8
+          },
+          {
+            "base_us": 1245.3262209892273,
+            "cand_us": 615.1479929685593,
+            "ratio": 0.49396534225378735,
+            "round": 9
+          },
+          {
+            "base_us": 1203.844964504242,
+            "cand_us": 583.4074914455414,
+            "ratio": 0.4846201202376551,
+            "round": 10
+          },
+          {
+            "base_us": 1203.7760019302368,
+            "cand_us": 580.6175023317337,
+            "ratio": 0.4823301855168422,
+            "round": 11
+          },
+          {
+            "base_us": 1203.5357356071472,
+            "cand_us": 581.0070037841797,
+            "ratio": 0.48275010587124717,
+            "round": 12
+          },
+          {
+            "base_us": 1203.5557627677917,
+            "cand_us": 579.9575001001358,
+            "ratio": 0.4818700703708317,
+            "round": 13
+          },
+          {
+            "base_us": 1202.9260098934174,
+            "cand_us": 581.2072604894638,
+            "ratio": 0.4831612715240569,
+            "round": 14
+          }
+        ],
+        "rounds_faster": 15,
+        "rounds_slower": 0,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 263.3984054906086,
+          "baseline_tflops": 8.374640000928148,
+          "baseline_us": {
+            "max": 13939.230918884277,
+            "mean": 1290.1732369263955,
+            "median": 1203.6154866218567,
+            "min": 1187.615990638733,
+            "p90": 1211.8560075759888
+          },
+          "calls_per_arm": 900,
+          "candidate_gbps": 545.5065574337942,
+          "candidate_tflops": 17.344148413292302,
+          "candidate_us": {
+            "max": 646.0880041122437,
+            "mean": 583.6900677283603,
+            "median": 581.1669826507568,
+            "min": 565.047025680542,
+            "p90": 598.0479717254639
+          },
+          "flush": false,
+          "n": 30,
+          "rounds": 15,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 317030400.0,
+        "flops": 10079846400.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": true
+      },
+      "bytes_per_call": 318259200,
+      "footprint_bytes": 356875268,
+      "geometry_base": {
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          128,
+          40,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          40,
+          1
+        ],
+        "lds_dynamic_bytes": 44032
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          256,
+          40,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          40,
+          1
+        ],
+        "lds_dynamic_bytes": 44032
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 983040
+      },
+      "identity_mode": "full",
+      "p_faster": 0.000030517578125,
+      "p_slower": 1.0,
+      "ratio_median": 0.4826636472295349,
+      "regime": "pool",
+      "rows": 48,
+      "same_geometry": false,
+      "shape": "n_rows48-n_heads40-wa128-wb64-dv128-pos_offset0-max_rows16384-ka_tok5120-ka_head128-kb_tok576-kb_head0-v_tok5120-v_head128-scale_bits1033096506-round_y1-prefix12288",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1474560,
+            "format": "f32.flat",
+            "name": "q",
+            "recipe": "F32"
+          },
+          {
+            "access": "write_only",
+            "bytes": 983040,
+            "format": "f32.flat",
+            "name": "y",
+            "recipe": "Poison"
+          },
+          {
+            "access": "read_only",
+            "bytes": 167772160,
+            "format": "bf16.token_head_view",
+            "name": "ka",
+            "recipe": "Bf16"
+          },
+          {
+            "access": "read_only",
+            "bytes": 18873344,
+            "format": "bf16.token_head_view",
+            "name": "kb",
+            "recipe": "Bf16"
+          },
+          {
+            "access": "read_only",
+            "bytes": 167772160,
+            "format": "bf16.token_head_view",
+            "name": "vv",
+            "recipe": "Bf16"
+          },
+          {
+            "access": "read_only",
+            "bytes": 4,
+            "format": "i32.device_scalar",
+            "name": "pos_ptr",
+            "recipe": "DeviceScalar"
+          }
+        ],
+        "params": {
+          "dv": 128,
+          "ka_head": 128,
+          "ka_tok": 5120,
+          "kb_head": 0,
+          "kb_tok": 576,
+          "max_rows": 16384,
+          "n_heads": 40,
+          "n_rows": 48,
+          "pos_offset": 0,
+          "round_y": 1,
+          "scale_bits": 1033096506,
+          "v_head": 128,
+          "v_tok": 5120,
+          "wa": 128,
+          "wb": 64
+        },
+        "prefix": 12288,
+        "timing_pool": {
+          "bytes_per_set": 355892224,
+          "dispatch_i_uses_set": "i % sets",
+          "sets": 1,
+          "total_bytes": 355892224
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:c3:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3126Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:c3:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 1057Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "p_faster": 0.000030517578125,
+        "p_slower": 1.0,
+        "ratio_max": 0.485336347684067,
+        "ratio_median": 0.4826636472295349,
+        "ratio_min": 0.4776690920288788,
+        "rounds": [
+          {
+            "base_us": 1247.3860085010529,
+            "cand_us": 595.8377420902252,
+            "ratio": 0.4776690920288788,
+            "round": 0
+          },
+          {
+            "base_us": 1207.225739955902,
+            "cand_us": 583.6477428674698,
+            "ratio": 0.48346197695286836,
+            "round": 1
+          },
+          {
+            "base_us": 1206.8859934806824,
+            "cand_us": 584.7577452659607,
+            "ratio": 0.48451779905035447,
+            "round": 2
+          },
+          {
+            "base_us": 1206.975758075714,
+            "cand_us": 582.0879936218262,
+            "ratio": 0.4822698299672988,
+            "round": 3
+          },
+          {
+            "base_us": 1206.3555121421814,
+            "cand_us": 580.3277492523193,
+            "ratio": 0.48105864598886316,
+            "round": 4
+          },
+          {
+            "base_us": 1206.085741519928,
+            "cand_us": 585.3572487831116,
+            "ratio": 0.485336347684067,
+            "round": 5
+          },
+          {
+            "base_us": 1205.295979976654,
+            "cand_us": 581.4877599477768,
+            "ratio": 0.48244395535031975,
+            "round": 6
+          },
+          {
+            "base_us": 1205.1252126693726,
+            "cand_us": 582.757756114006,
+            "ratio": 0.4835661473077871,
+            "round": 7
+          },
+          {
+            "base_us": 1204.965740442276,
+            "cand_us": 583.797499537468,
+            "ratio": 0.48449302743096107,
+            "round": 8
+          },
+          {
+            "base_us": 1205.0859928131104,
+            "cand_us": 581.2270045280457,
+            "ratio": 0.48231164248391084,
+            "round": 9
+          },
+          {
+            "base_us": 1204.495519399643,
+            "cand_us": 580.8575004339218,
+            "ratio": 0.4822413127144207,
+            "round": 10
+          },
+          {
+            "base_us": 1204.2554914951324,
+            "cand_us": 583.1674933433533,
+            "ratio": 0.4842556230483342,
+            "round": 11
+          },
+          {
+            "base_us": 1204.4357657432556,
+            "cand_us": 581.1177492141724,
+            "ratio": 0.4824813126132679,
+            "round": 12
+          },
+          {
+            "base_us": 1204.30526137352,
+            "cand_us": 582.0072591304779,
+            "ratio": 0.48327220497790896,
+            "round": 13
+          },
+          {
+            "base_us": 1204.6857178211212,
+            "cand_us": 581.4580023288727,
+            "ratio": 0.4826636472295349,
+            "round": 14
+          }
+        ],
+        "rounds_faster": 15,
+        "rounds_slower": 0,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 263.9893420648695,
+          "baseline_tflops": 12.549686386771066,
+          "baseline_us": {
+            "max": 1298.2970476150513,
+            "mean": 1208.3625038464854,
+            "median": 1205.575942993164,
+            "min": 1192.5760507583618,
+            "p90": 1212.2160196304321
+          },
+          "calls_per_arm": 900,
+          "candidate_gbps": 545.9113334411148,
+          "candidate_tflops": 25.951865996114776,
+          "candidate_us": {
+            "max": 624.3280172348022,
+            "mean": 583.8892711533434,
+            "median": 582.986980676651,
+            "min": 567.7670240402222,
+            "p90": 595.2079892158508
+          },
+          "flush": false,
+          "n": 30,
+          "rounds": 15,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 318259200.0,
+        "flops": 15129600000.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": true
+      },
+      "bytes_per_call": 319488000,
+      "footprint_bytes": 357694468,
+      "geometry_base": {
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          128,
+          40,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          40,
+          1
+        ],
+        "lds_dynamic_bytes": 44032
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          256,
+          40,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          40,
+          1
+        ],
+        "lds_dynamic_bytes": 44032
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 1310720
+      },
+      "identity_mode": "full",
+      "p_faster": 0.000030517578125,
+      "p_slower": 1.0,
+      "ratio_median": 0.48376453820198984,
+      "regime": "pool",
+      "rows": 64,
+      "same_geometry": false,
+      "shape": "n_rows64-n_heads40-wa128-wb64-dv128-pos_offset0-max_rows16384-ka_tok5120-ka_head128-kb_tok576-kb_head0-v_tok5120-v_head128-scale_bits1033096506-round_y1-prefix12288",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1966080,
+            "format": "f32.flat",
+            "name": "q",
+            "recipe": "F32"
+          },
+          {
+            "access": "write_only",
+            "bytes": 1310720,
+            "format": "f32.flat",
+            "name": "y",
+            "recipe": "Poison"
+          },
+          {
+            "access": "read_only",
+            "bytes": 167772160,
+            "format": "bf16.token_head_view",
+            "name": "ka",
+            "recipe": "Bf16"
+          },
+          {
+            "access": "read_only",
+            "bytes": 18873344,
+            "format": "bf16.token_head_view",
+            "name": "kb",
+            "recipe": "Bf16"
+          },
+          {
+            "access": "read_only",
+            "bytes": 167772160,
+            "format": "bf16.token_head_view",
+            "name": "vv",
+            "recipe": "Bf16"
+          },
+          {
+            "access": "read_only",
+            "bytes": 4,
+            "format": "i32.device_scalar",
+            "name": "pos_ptr",
+            "recipe": "DeviceScalar"
+          }
+        ],
+        "params": {
+          "dv": 128,
+          "ka_head": 128,
+          "ka_tok": 5120,
+          "kb_head": 0,
+          "kb_tok": 576,
+          "max_rows": 16384,
+          "n_heads": 40,
+          "n_rows": 64,
+          "pos_offset": 0,
+          "round_y": 1,
+          "scale_bits": 1033096506,
+          "v_head": 128,
+          "v_tok": 5120,
+          "wa": 128,
+          "wb": 64
+        },
+        "prefix": 12288,
+        "timing_pool": {
+          "bytes_per_set": 356383744,
+          "dispatch_i_uses_set": "i % sets",
+          "sets": 1,
+          "total_bytes": 356383744
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:c3:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3115Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:c3:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 1066Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "p_faster": 0.000030517578125,
+        "p_slower": 1.0,
+        "ratio_max": 0.4855875421417635,
+        "ratio_median": 0.48376453820198984,
+        "ratio_min": 0.48157831562707326,
+        "rounds": [
+          {
+            "base_us": 1249.8860359191895,
+            "cand_us": 601.9180119037628,
+            "ratio": 0.48157831562707326,
+            "round": 0
+          },
+          {
+            "base_us": 1209.3957364559174,
+            "cand_us": 587.2675031423569,
+            "ratio": 0.4855875421417635,
+            "round": 1
+          },
+          {
+            "base_us": 1209.905743598938,
+            "cand_us": 585.3874981403351,
+            "ratio": 0.48382901001780887,
+            "round": 2
+          },
+          {
+            "base_us": 1209.135502576828,
+            "cand_us": 585.0879848003387,
+            "ratio": 0.48388950911906786,
+            "round": 3
+          },
+          {
+            "base_us": 1208.7059617042542,
+            "cand_us": 585.297480225563,
+            "ratio": 0.4842347922238291,
+            "round": 4
+          },
+          {
+            "base_us": 1209.095984697342,
+            "cand_us": 583.4274888038635,
+            "ratio": 0.482531987689882,
+            "round": 5
+          },
+          {
+            "base_us": 1208.9160084724426,
+            "cand_us": 584.3974947929382,
+            "ratio": 0.4834062008421652,
+            "round": 6
+          },
+          {
+            "base_us": 1208.7157368659973,
+            "cand_us": 584.2677503824234,
+            "ratio": 0.4833789554997723,
+            "round": 7
+          },
+          {
+            "base_us": 1208.5660099983215,
+            "cand_us": 584.4374895095825,
+            "ratio": 0.48357928708452935,
+            "round": 8
+          },
+          {
+            "base_us": 1208.5257172584534,
+            "cand_us": 584.9279910326004,
+            "ratio": 0.4840012774899921,
+            "round": 9
+          },
+          {
+            "base_us": 1208.3954811096191,
+            "cand_us": 583.787739276886,
+            "ratio": 0.48310983316556105,
+            "round": 10
+          },
+          {
+            "base_us": 1207.9557478427887,
+            "cand_us": 585.5679959058762,
+            "ratio": 0.48475947645566053,
+            "round": 11
+          },
+          {
+            "base_us": 1207.535743713379,
+            "cand_us": 584.537997841835,
+            "ratio": 0.4840751098963586,
+            "round": 12
+          },
+          {
+            "base_us": 1208.1657350063324,
+            "cand_us": 584.467738866806,
+            "ratio": 0.48376453820198984,
+            "round": 13
+          },
+          {
+            "base_us": 1207.8557312488556,
+            "cand_us": 583.9475095272064,
+            "ratio": 0.48345799454330296,
+            "round": 14
+          }
+        ],
+        "rounds_faster": 15,
+        "rounds_slower": 0,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 264.31579361261555,
+          "baseline_tflops": 16.700014026688358,
+          "baseline_us": {
+            "max": 1301.697015762329,
+            "mean": 1211.7772510316654,
+            "median": 1208.7359428405762,
+            "min": 1196.895956993103,
+            "p90": 1214.4160270690918
+          },
+          "calls_per_arm": 900,
+          "candidate_gbps": 545.9392227737965,
+          "candidate_tflops": 34.49355997017722,
+          "candidate_us": {
+            "max": 7658.659934997559,
+            "mean": 594.2933328284165,
+            "median": 585.207998752594,
+            "min": 569.8879957199097,
+            "p90": 597.9679822921753
+          },
+          "flush": false,
+          "n": 30,
+          "rounds": 15,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 319488000.0,
+        "flops": 20185907200.0
+      }
+    }
+  ],
+  "rowclasses_requested": [
+    17,
+    24,
+    32,
+    48,
+    64
+  ],
+  "rows_param": "n_rows",
+  "same_geometry": false,
+  "schema": 1,
+  "selection": "generic_seq.latent_attention_flash_prefill",
+  "shape": "n_heads=40,wa=128,wb=64,dv=128,pos_offset=0,max_rows=16384,ka_tok=5120,ka_head=128,kb_tok=576,kb_head=0,v_tok=5120,v_head=128,scale_bits=1033096506,round_y=1,prefix=12288,vs=contract:latent_attention_flash_prefill,pool=1",
+  "symbol": "latent_attention_flash_prefill",
+  "tool": "hip_loop",
+  "vs": {
+    "baseline": {
+      "contract": "generic_seq.latent_attention_flash_prefill",
+      "module": "latent_attention_flash",
+      "symbol": "latent_attention_flash_prefill"
+    },
+    "candidate": {
+      "contract": "generic_seq.latent_attention_flash_prefill_fa2_q128w8",
+      "module": "latent_attention_flash_fa2",
+      "symbol": "latent_attention_flash_prefill_fa2_q128w8"
+    }
+  }
+}

@@ -547,7 +547,11 @@ fn ask_draft(prompt: &mut dyn Prompt, entry: &ModelEntry) -> Result<bool> {
 /// Per-sidecar yes/no for the expert hot set, default on. The size is fixed
 /// text because the summary's GB rounding would print it as 0.00 GB.
 fn ask_expert_hotset(prompt: &mut dyn Prompt) -> Result<bool> {
-    match confirm(prompt, "Fetch Expert hot set (R9700 decode, 213 KB)", true)? {
+    match confirm(
+        prompt,
+        "Fetch Expert hot set (R9700 and 7900 XTX decode, 213 KB)",
+        true,
+    )? {
         Some(answer) => Ok(answer),
         None => bail!("pull cancelled: no answer for the expert hot set (end of input)"),
     }
@@ -594,6 +598,23 @@ pub(crate) fn plan_items(
     ctx: &PullContext<'_, '_>,
     choice: &PullChoice<'_>,
     force: bool,
+) -> Vec<PlanItem> {
+    plan_items_with_ep(
+        ctx,
+        choice,
+        force,
+        hipfire_registry::EP_EXPERT_HOTSET_PINS,
+        hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON,
+    )
+}
+
+/// [`plan_items`] with the EP2 ranking pin table and its gate supplied.
+fn plan_items_with_ep(
+    ctx: &PullContext<'_, '_>,
+    choice: &PullChoice<'_>,
+    force: bool,
+    ep_pins: &[ExpertHotsetPin],
+    ep_gate: bool,
 ) -> Vec<PlanItem> {
     let entry = choice.entry;
     let item = |label: String, file: &str, size: Option<u64>| PlanItem {
@@ -696,6 +717,19 @@ pub(crate) fn plan_items(
                 "Expert hot set".to_owned(),
                 &local,
                 hotset.sidecar.size_bytes,
+            ));
+        }
+    }
+    if choice.expert_hotset {
+        if let Some(ep) = hipfire_registry::ep_expert_hotset_in(identity, ep_pins, ep_gate) {
+            let local = format!(
+                "{model_file}{}",
+                hipfire_config::memory::EP_EXPERT_HOTSET_SIDECAR_SUFFIX
+            );
+            items.push(item(
+                "EP expert hot set".to_owned(),
+                &local,
+                ep.sidecar.size_bytes,
             ));
         }
     }
@@ -844,6 +878,22 @@ fn confirm(prompt: &mut dyn Prompt, question: &str, default: bool) -> Result<Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`plan_items`] without the EP2 ranking sidecar (the shipped gate adds it to every
+    /// Flash-Next plan): the tests that assert exact file lists of the other sidecars.
+    fn plan_items_no_ep(
+        ctx: &PullContext<'_, '_>,
+        choice: &PullChoice<'_>,
+        force: bool,
+    ) -> Vec<PlanItem> {
+        plan_items_with_ep(
+            ctx,
+            choice,
+            force,
+            hipfire_registry::EP_EXPERT_HOTSET_PINS,
+            false,
+        )
+    }
     use crate::{Cli, Commands};
     use clap::Parser;
     use std::io::Cursor;
@@ -1268,7 +1318,7 @@ mod tests {
             ("qwen3.8:flash-next", true, true)
         );
         for expected in [
-            "Fetch Expert hot set (R9700 decode, 213 KB)? [Y/n]",
+            "Fetch Expert hot set (R9700 and 7900 XTX decode, 213 KB)? [Y/n]",
             LOCAL_HOTSET_FILE,
             "Total download: 125.70 GB",
         ] {
@@ -1283,6 +1333,112 @@ mod tests {
             .find(|line| line.contains(LOCAL_HOTSET_FILE))
             .unwrap();
         assert!(line.contains("Expert hot set") && line.ends_with("download"));
+    }
+
+    #[test]
+    fn the_ep_expert_hotset_rides_the_expert_hotset_choice_behind_its_gate() {
+        const EP_SIZE: u64 = 312_036;
+        const EP_PINS: &[ExpertHotsetPin] = &[ExpertHotsetPin {
+            base_sha256: BASE_DIGEST,
+            base_size: 70_900_000_000,
+            repo: "hipfire-models/qwen3.8-flash-next",
+            file: "ignored-remote-name.ep.expert-hotset",
+            sha256: HOTSET_DIGEST,
+            size_bytes: EP_SIZE,
+        }];
+        const LOCAL_EP_FILE: &str = "qwen3.8-flash-next-base.mq4-xts.ep.expert-hotset";
+        let registry = registry();
+        let host = host();
+        let (tag, entry) = registry.model("qwen3.8:flash-next").unwrap();
+        let ctx = PullContext {
+            registry: &registry,
+            host: &host,
+            overlay_pins: &[],
+            grandfather_pins: &[],
+            hotset_pins: HOTSET_PINS,
+            present: &absent,
+        };
+        let mut choice = PullChoice {
+            tag,
+            entry,
+            ple: PleSelection::Skip,
+            draft: false,
+            expert_hotset: true,
+        };
+        let baseline = plan_items(&ctx, &choice, false);
+        let off = plan_items_with_ep(&ctx, &choice, false, EP_PINS, false);
+        assert_eq!(off, baseline);
+        assert!(off.iter().all(|item| item.label != "EP expert hot set"));
+
+        let on = plan_items_with_ep(&ctx, &choice, false, EP_PINS, true);
+        let extra: Vec<&PlanItem> = on
+            .iter()
+            .filter(|item| item.label == "EP expert hot set")
+            .collect();
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].file, LOCAL_EP_FILE);
+        assert_eq!(extra[0].size, Some(EP_SIZE));
+        assert_eq!(on.len(), baseline.len() + 1);
+
+        choice.expert_hotset = false;
+        let declined = plan_items_with_ep(&ctx, &choice, false, EP_PINS, true);
+        assert!(declined
+            .iter()
+            .all(|item| item.label != "EP expert hot set"));
+    }
+
+    #[test]
+    fn the_expert_hotset_is_planned_on_every_host_so_a_gfx1100_pull_fetches_it() {
+        // The pin is keyed by the base artifact identity, never by GPU architecture: a 7900 XTX
+        // (gfx1100) host plans the same single 217,675-byte sidecar as an R9700 (gfx1201), and a
+        // host with no detected GPU or another arch plans exactly that one file as well (no
+        // additional download on any arch).
+        let registry = registry();
+        let (tag, entry) = registry.model("qwen3.8:flash-next").unwrap();
+        let mut planned: Vec<Vec<(String, Option<u64>)>> = Vec::new();
+        for arches in [
+            vec!["gfx1100".to_owned()],
+            vec!["gfx1201".to_owned()],
+            vec!["gfx1151".to_owned()],
+            vec!["gfx1100".to_owned(), "gfx1151".to_owned()],
+            Vec::new(),
+        ] {
+            let host = HostFacts {
+                gpu_arches: arches.clone(),
+                ..host()
+            };
+            let ctx = PullContext {
+                registry: &registry,
+                host: &host,
+                overlay_pins: &[],
+                grandfather_pins: &[],
+                hotset_pins: HOTSET_PINS,
+                present: &absent,
+            };
+            let choice = PullChoice {
+                tag,
+                entry,
+                ple: PleSelection::Skip,
+                draft: false,
+                expert_hotset: true,
+            };
+            let items = plan_items(&ctx, &choice, false);
+            let hot: Vec<_> = items
+                .iter()
+                .filter(|item| item.label.contains("hot set"))
+                .map(|item| (item.file.clone(), item.size))
+                .collect();
+            assert_eq!(
+                hot,
+                vec![(LOCAL_HOTSET_FILE.to_owned(), Some(HOTSET_SIZE))],
+                "{arches:?}"
+            );
+            planned.push(items.iter().map(|i| (i.file.clone(), i.size)).collect());
+        }
+        assert!(
+            planned.windows(2).all(|pair| pair[0] == pair[1]),
+            "plan differs by host arch"
+        );
     }
 
     #[test]
@@ -1600,7 +1756,7 @@ mod tests {
                     present: &absent,
                 };
                 let choice = PullChoice::defaults(tag, entry, &PullFlags::default());
-                let items = plan_items(&ctx, &choice, false);
+                let items = plan_items_no_ep(&ctx, &choice, false);
                 let files: Vec<&str> = items.iter().map(|item| item.file.as_str()).collect();
                 assert_eq!(files, [STOCK_BASE, sidecar.file.as_str()], "{input} {arch}");
                 assert_eq!(
@@ -1610,7 +1766,7 @@ mod tests {
                 );
             }
             // The exact sums a pull reports.
-            let q4 = plan_items(
+            let q4 = plan_items_no_ep(
                 &PullContext {
                     registry: &registry,
                     host: &host_with_arch("gfx1151"),
@@ -1625,7 +1781,7 @@ mod tests {
             assert_eq!(download_total(&q4), (100_008_416_792, 0));
         }
         let (tag, entry) = registry.model("qwen3.8:flash-next").unwrap();
-        let rdna4 = plan_items(
+        let rdna4 = plan_items_no_ep(
             &PullContext {
                 registry: &registry,
                 host: &host_with_arch("gfx1201"),
@@ -1660,7 +1816,7 @@ mod tests {
             grandfather_pins: hipfire_registry::GRANDFATHERED_MONOLITHICS,
             present: &absent,
         };
-        let items = plan_items(
+        let items = plan_items_no_ep(
             &ctx,
             &PullChoice::defaults(tag, entry, &PullFlags::default()),
             false,
@@ -1745,7 +1901,7 @@ mod tests {
             grandfather_pins: GF_PINS,
             present,
         };
-        plan_items(
+        plan_items_no_ep(
             &ctx,
             &PullChoice::defaults(tag, entry, &PullFlags::default()),
             force,
@@ -1872,7 +2028,7 @@ mod tests {
                 grandfather_pins: hipfire_registry::GRANDFATHERED_MONOLITHICS,
                 present: &absent,
             };
-            let items = plan_items(
+            let items = plan_items_no_ep(
                 &ctx,
                 &PullChoice::defaults(tag, entry, &PullFlags::default()),
                 false,
@@ -1904,7 +2060,7 @@ mod tests {
             ..host_with_arch("")
         };
         let plan = |present: &dyn Fn(&str, Option<u64>) -> bool| {
-            plan_items(
+            plan_items_no_ep(
                 &PullContext {
                     registry: &registry,
                     host: &hipx,

@@ -40,6 +40,7 @@ pub(super) fn handles(name: &str) -> bool {
             | "v_add_f64"
             | "v_min_f64"
             | "v_lshrrev_b64"
+            | "v_ashrrev_i64"
             | "v_lshlrev_b64"
             | "v_subrev_co_u32"
             | "v_sub_co_ci_u32"
@@ -190,6 +191,11 @@ pub(super) fn execute(_arch: Arch, name: &str, i: &Inst, s: &mut State) -> Resul
             "v_lshlrev_b64" => {
                 s.read_wide(src(2)?, lane, Wide::Unsigned)? << (s.read(src(1)?, lane, 0)? & 63)
             }
+            // D0.i64 = (S1.i64 >> S0[5:0]), arithmetic (sign-filling) shift
+            "v_ashrrev_i64" => {
+                ((s.read_wide(src(2)?, lane, Wide::Signed)? as i64)
+                    >> (s.read(src(1)?, lane, 0)? & 63)) as u64
+            }
             // { carry, D0.u64 } = 65'(S0.u32) * 65'(S1.u32) + 65'(S2.u64); the carry bit goes to the SDST lane mask.
             "v_mad_u64_u32" => {
                 let (a, b) = (s.read(src(2)?, lane, 0)?, s.read(src(3)?, lane, 0)?);
@@ -263,6 +269,7 @@ pub(super) fn execute(_arch: Arch, name: &str, i: &Inst, s: &mut State) -> Resul
                 | "v_add_f64"
                 | "v_min_f64"
                 | "v_lshrrev_b64"
+                | "v_ashrrev_i64"
                 | "v_lshlrev_b64"
                 | "v_mad_u64_u32"
                 | "v_mad_i64_i32"
@@ -278,7 +285,7 @@ pub(super) fn execute(_arch: Arch, name: &str, i: &Inst, s: &mut State) -> Resul
         {
             s.put_mask(src(1)?, carry)?
         }
-        "v_sub_co_ci_u32" | "v_subrev_co_ci_u32" => s.vcc = carry,
+        "v_sub_co_ci_u32" | "v_subrev_co_ci_u32" => s.set_vcc_mask(carry),
         "v_mad_u64_u32" if !sdst_null => s.put_mask(src(1)?, carry)?,
         _ => {}
     }

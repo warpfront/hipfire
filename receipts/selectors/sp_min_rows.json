@@ -1,0 +1,65 @@
+{
+  "schema": "pm.selector_receipt.v1",
+  "arch": "gfx1201",
+  "candidate": "sequence-parallel prefill (own-row HC reads, sp_hc_rs_d8 reduce-scatter write, sp_ag_rows all-gathers)",
+  "incumbent": "ar_hc_write_d8 all-reduce route (replicated HC reads)",
+  "constant": "SP_MIN_ROWS",
+  "value": 3072,
+  "kind": "min",
+  "row_key": "rows",
+  "covers": true,
+  "derived_min_rows": 3072,
+  "note": "SP_MIN_ROWS is an exactness floor: both row halves (>= 1536) must stay on the same side of every HC read/write route threshold as the whole tile (binding: HC_DOWN_FUSED_MIN_ROWS = 1536 on gfx1201; pinned by trunk_route::tests::sp_min_rows_covers_every_hc_route_threshold), so smaller tiles are not admitted. Admitted class measured: served EP2 lane prefill tiles of 4096 rows (pp4k/pp16k/pp32k prompts), j7795, same binary A = HIPFIRE_QWEN4_EP_SEQ_PARALLEL=0 vs B default, 3 loads/arm; ratio = B/A tile time (1 / tok/s ratio). Byte identity: fn_mesh_lane_oracle raw logits off/on/on2 identical (ident), sp_rs_ag_oracle PASS.",
+  "classes": [
+    {
+      "rows": 4096,
+      "stream": "bf16",
+      "prompt": "pp4k",
+      "ratio": 0.9071,
+      "ci95_tok_s_ratio": [
+        1.0876,
+        1.1208
+      ],
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 4096,
+      "stream": "bf16",
+      "prompt": "pp16k",
+      "ratio": 0.9079,
+      "ci95_tok_s_ratio": [
+        1.0926,
+        1.1136
+      ],
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 4096,
+      "stream": "bf16",
+      "prompt": "pp32k",
+      "ratio": 0.8974,
+      "ci95_tok_s_ratio": [
+        1.0879,
+        1.1648
+      ],
+      "verdict": "faster",
+      "admitted": true
+    }
+  ],
+  "records": [
+    {
+      "path": "receipts/selectors/evidence/sp_min_rows/served-ab-j7795.txt",
+      "sha256": "9bf3620a1addf901435a6cd8c04aef02727ac1316a4869bf7feaa4561293885d"
+    },
+    {
+      "path": "receipts/selectors/evidence/sp_min_rows/ident-j7795.txt",
+      "sha256": "1522bbc1b554f8031b34148ebb8230f5f5758bf23e0a6b84c7c21d98a2de5e92"
+    },
+    {
+      "path": "receipts/selectors/evidence/sp_min_rows/sp-oracle-j7795.json",
+      "sha256": "e6408df896a960bb6ba5def99a0e31f84bbecec00ce9c0d5c11b63d76da4c450"
+    }
+  ]
+}

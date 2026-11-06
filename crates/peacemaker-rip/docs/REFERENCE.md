@@ -331,7 +331,7 @@ The tables are the supported PeaceMaker vocabulary, not a complete silicon ISA c
 | v_permlane16_b32 | in gfx11 tables | absent |
 | v_permlanex16_b32 | available | available |
 | DPP row_xmask / row_shl | v_mov_b32_dpp | v_mov_b32_dpp |
-| DPP quad_perm:[...] syntax | rejected by current modifier parser | rejected by current modifier parser |
+| DPP quad_perm:[...] syntax | accepted on `v_mov_b32_dpp`; still rejected on `v_max_f32_dpp` | accepted on `v_mov_b32_dpp`; still rejected on `v_max_num_f32_dpp` |
 | f16 WMMA 16x16x16 operands | dst/acc 8 VGPRs, A/B 8 each | dst/acc 8 VGPRs, A/B 4 each |
 
 Inline integer constants are -16..64. A larger integer is a literal, spelled canonically with `lit`, not a decimal inline constant. There is one literal word per instruction (reusing the same literal is different from requesting two distinct literal words). VOP2 `_e32` has VGPR-only src1: use `_e64` when that source must be scalar or constant, or commute operands if valid. Not every opcode has both encodings in the tables. DPP controls are instruction modifiers, not standalone cross-lane instructions. `row_shr` is not a supported substitute for `row_shl`.
@@ -372,8 +372,8 @@ gfx1151: v_permlanex16_b32 v1, v2, s12, 0xfedcba98
 gfx1201: v_permlanex16_b32 v1, v2, s12, 0xfedcba98
 gfx1151: v_mov_b32_dpp v1, v2 row_xmask:1 row_mask:0xf bank_mask:0xf
 gfx1201: v_mov_b32_dpp v1, v2 row_xmask:1 row_mask:0xf bank_mask:0xf
-!gfx1151: v_mov_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
-!gfx1201: v_mov_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+gfx1151: v_mov_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+gfx1201: v_mov_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
 gfx1151: v_mov_b32_dpp v1, v2 row_shl:1 row_mask:0xf bank_mask:0xf
 gfx1201: v_mov_b32_dpp v1, v2 row_shl:1 row_mask:0xf bank_mask:0xf
 gfx1151: v_add_nc_u32_e32 v1, 0x80, v2

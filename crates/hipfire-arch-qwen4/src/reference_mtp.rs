@@ -10,11 +10,17 @@
 //! [`crate::weights::Qwen4Weights`] owns the distinct lm_head.
 //!
 //! [`ReferenceMtpWeights`] and [`mtp_forward_step`] are deliberately small,
-//! deterministic equation-level helpers.  They are useful for layerwise
-//! parity fixtures and define the ordering the HIP lowering must preserve:
-//! separate zero-centred norms, shared `fc_hidden` over all four branches,
-//! one full-attention QSA layer, normalized top-10 MoE, and the final HC mix.
-//! No acceptance policy or generation loop lives here.
+//! deterministic equation-level helpers.  They are the runtime oracle for the
+//! HIP head lowering (`mtp_gpu::head_block`) and follow its equations exactly:
+//! the embedding norm over `H` and `pre_fc_norm_hidden` applied **per branch**
+//! (the `[4H]` weight sliced into four `[H]` rows, `hyper_norm_rows`), a shared
+//! `fc_hidden` over all four branches, the learned attention HC read, one
+//! full-attention QSA layer whose `q_proj` rows are interleaved per head
+//! (`[q(hd) | gate(hd)]` x heads), HC writes whose gate dots read the
+//! **per-branch** normalised streams, the learned **MLP HC read** (per-branch
+//! norm -> low-rank SiLU -> sigmoid mix -> branch mean) as the MoE input,
+//! normalized top-10 MoE, and the final HC read.  No acceptance policy or
+//! generation loop lives here.
 
 use crate::ops;
 use rdna_compute::rope::{Rope, RopeScaling};
@@ -912,9 +918,11 @@ pub fn mtp_forward_step(
         return Err(MtpError::Capacity(state.qsa.geometry.max_seq_len));
     }
 
-    // 1. Normalize embedding H and wide hidden 4H separately, then apply the
-    // two residual-linear projections.  The embedding projection is shared by
-    // all four branches; fc_hidden is one shared matrix applied per branch.
+    // 1. Normalize the embedding over H and the wide hidden per branch (the
+    // [4H] pre_fc_norm_hidden weight is sliced per branch, exactly the GPU
+    // `hyper_norm_rows`), then apply the two residual-linear projections.  The
+    // embedding projection is shared by all four branches; fc_hidden is one
+    // shared matrix applied per branch.
     let mut embedding_norm = vec![0.0f32; hidden];
     ops::zero_centered_rms_norm(
         input.token_embedding,
@@ -925,10 +933,10 @@ pub fn mtp_forward_step(
     .map_err(|_| MtpError::Shape("MTP embedding norm"))?;
     let projected_embedding = weights.fc_embedding.mul_vec(&embedding_norm)?;
     let mut hidden_norm = vec![0.0f32; branches * hidden];
-    ops::zero_centered_rms_norm(
+    per_branch_zero_centered_norm(
         input.backbone_hidden,
         &weights.pre_fc_norm_hidden,
-        MTP_RMS_EPS,
+        hidden,
         &mut hidden_norm,
     )
     .map_err(|_| MtpError::Shape("MTP wide hidden norm"))?;
@@ -942,8 +950,9 @@ pub fn mtp_forward_step(
         }
     }
 
-    // 2. Read the HC branches for attention.  This is the vLLM native order:
-    // per-branch norm → low-rank SiLU → sigmoid mix → branch mean.
+    // 2. Read the HC branches for attention.  Per-branch norm → low-rank SiLU
+    // → sigmoid mix → branch mean (the same `hc_read` the MLP and final reads
+    // use).
     let attn_input = hc_read(
         &weights.attention_hyper.norm,
         &weights.attention_hyper.down,
@@ -953,8 +962,10 @@ pub fn mtp_forward_step(
         hidden,
     )?;
 
-    // 3. Full-attention QSA.  q_proj contains Q followed by its gate half;
-    // k/v use two KV heads.  The indexer has four query heads plus one key.
+    // 3. Full-attention QSA.  q_proj rows are interleaved per head
+    // ([q(hd) | gate(hd)] x q_heads, the runtime `head_stride = 2 * head_dim`
+    // layout); k/v use two KV heads.  The indexer has four query heads plus
+    // one key.
     let q_and_gate = weights.attention.q_proj.mul_vec(&attn_input)?;
     let key = weights.attention.k_proj.mul_vec(&attn_input)?;
     let value = weights.attention.v_proj.mul_vec(&attn_input)?;
@@ -964,8 +975,8 @@ pub fn mtp_forward_step(
         return Err(MtpError::Shape("MTP Q/gate projection"));
     }
     for head in 0..weights.qsa_geometry.q_heads {
-        let q = &q_and_gate
-            [head * weights.qsa_geometry.head_dim..(head + 1) * weights.qsa_geometry.head_dim];
+        let q_off = head * 2 * weights.qsa_geometry.head_dim;
+        let q = &q_and_gate[q_off..q_off + weights.qsa_geometry.head_dim];
         let mut norm = vec![0.0f32; weights.qsa_geometry.head_dim];
         ops::rms_norm(q, &weights.attention.q_norm, MTP_RMS_EPS, &mut norm)
             .map_err(|_| MtpError::Shape("MTP Q norm"))?;
@@ -1025,16 +1036,14 @@ pub fn mtp_forward_step(
     } else {
         state.qsa.reuse_selection(input.position)?
     };
-    let mut q_with_gate = vec![0.0f32; 2 * q_width];
+    // Same interleaved layout in, with the normed + rotated Q replacing the
+    // raw Q half of each head; the gate half passes through untouched.
+    let mut q_with_gate = q_and_gate;
     for head in 0..weights.qsa_geometry.q_heads {
         let q_off = head * weights.qsa_geometry.head_dim;
         let out = head * 2 * weights.qsa_geometry.head_dim;
         q_with_gate[out..out + weights.qsa_geometry.head_dim]
             .copy_from_slice(&q_rot[q_off..q_off + weights.qsa_geometry.head_dim]);
-        q_with_gate[out + weights.qsa_geometry.head_dim..out + 2 * weights.qsa_geometry.head_dim]
-            .copy_from_slice(
-                &q_and_gate[q_width + q_off..q_width + q_off + weights.qsa_geometry.head_dim],
-            );
     }
     let mut attn_heads = vec![0.0f32; q_width];
     ops::qsa_attention(
@@ -1050,9 +1059,10 @@ pub fn mtp_forward_step(
     .map_err(|_| MtpError::Shape("MTP QSA attention"))?;
     let attn_output = weights.attention.o_proj.mul_vec(&attn_heads)?;
 
-    // 4. Inject attention output into each HC branch, then route the collapsed
-    // branch view through normalized top-10 MoE.  The MLP HC stage repeats the
-    // same ordered inject operation; the final mixer performs a learned read.
+    // 4. Inject attention output into each HC branch, then route the learned
+    // MLP HC read of the branches (not their plain mean) through normalized
+    // top-10 MoE.  The MLP HC stage repeats the same ordered inject operation;
+    // the final mixer performs a learned read.
     hc_inject_output(
         &mut wide,
         &weights.attention_hyper,
@@ -1060,12 +1070,14 @@ pub fn mtp_forward_step(
         branches,
         hidden,
     )?;
-    let mut moe_input = vec![0.0f32; hidden];
-    for branch in 0..branches {
-        for j in 0..hidden {
-            moe_input[j] += wide[branch * hidden + j] / branches as f32;
-        }
-    }
+    let moe_input = hc_read(
+        &weights.mlp_hyper.norm,
+        &weights.mlp_hyper.down,
+        &weights.mlp_hyper.up,
+        &wide,
+        branches,
+        hidden,
+    )?;
     let router_logits = weights.moe.router.mul_vec(&moe_input)?;
     let (selected_experts, routing_weights) =
         ops::route_top10(&router_logits).map_err(|_| MtpError::Shape("MTP top-10 router"))?;
@@ -1138,6 +1150,32 @@ pub fn mtp_forward_step(
     })
 }
 
+/// Zero-centred RMSNorm applied independently to each `hidden`-wide branch row
+/// of `input`, with the matching `hidden`-wide slice of `weight` (`[branches *
+/// hidden]`): the GPU `hyper_norm_rows` kernel.
+fn per_branch_zero_centered_norm(
+    input: &[f32],
+    weight: &[f32],
+    hidden: usize,
+    output: &mut [f32],
+) -> Result<(), ops::OpError> {
+    if hidden == 0 || input.len() % hidden != 0 || weight.len() != input.len() {
+        return Err(ops::OpError::Length {
+            what: "per-branch zero-centered RMSNorm",
+            expected: input.len(),
+            actual: weight.len(),
+        });
+    }
+    for ((row, w), out) in input
+        .chunks_exact(hidden)
+        .zip(weight.chunks_exact(hidden))
+        .zip(output.chunks_exact_mut(hidden))
+    {
+        ops::zero_centered_rms_norm(row, w, MTP_RMS_EPS, out)?;
+    }
+    Ok(())
+}
+
 fn hc_read(
     norm: &[f32],
     down: &MtpMatrix,
@@ -1188,8 +1226,10 @@ fn hc_inject_output(
     if wide.len() != branches * hidden || output.len() != hidden {
         return Err(MtpError::Shape("MTP HC inject dimensions"));
     }
+    // The write gate reads the per-branch normalised streams (hyper_norm_rows),
+    // not one norm over the whole 4H.
     let mut normed = vec![0.0f32; wide.len()];
-    ops::zero_centered_rms_norm(wide, &weights.norm, MTP_RMS_EPS, &mut normed)
+    per_branch_zero_centered_norm(wide, &weights.norm, hidden, &mut normed)
         .map_err(|_| MtpError::Shape("MTP HC inject norm"))?;
     if weights.block_inject.rows != branches || weights.block_inject.cols != wide.len() {
         return Err(MtpError::Shape("MTP HC block injection dimensions"));
@@ -1208,6 +1248,43 @@ fn hc_inject_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn branch_norms_are_per_branch_not_joint() {
+        // Two branches of H = 2 with very different scales: a joint norm
+        // would give the small branch a near-zero row.
+        let input = [3.0f32, 4.0, 0.3, 0.4];
+        let weight = [0.0f32; 4];
+        let mut per_branch = [0.0f32; 4];
+        per_branch_zero_centered_norm(&input, &weight, 2, &mut per_branch).unwrap();
+        let big = 1.0 / (12.5f32 + MTP_RMS_EPS).sqrt();
+        let small = 1.0 / (0.125f32 + MTP_RMS_EPS).sqrt();
+        let expect = [3.0 * big, 4.0 * big, 0.3 * small, 0.4 * small];
+        for (a, b) in per_branch.iter().zip(expect) {
+            assert!((a - b).abs() < 1.0e-5, "{a} vs {b}");
+        }
+        let mut joint = [0.0f32; 4];
+        ops::zero_centered_rms_norm(&input, &weight, MTP_RMS_EPS, &mut joint).unwrap();
+        assert!((joint[2] - per_branch[2]).abs() > 0.5);
+
+        // The HC write gate dot reads the per-branch rows.
+        let weights = MtpHyperWeights {
+            norm: vec![0.0; 4],
+            down: MtpMatrix::new(1, 4, vec![0.0; 4]).unwrap(),
+            up: MtpMatrix::new(4, 1, vec![0.0; 4]).unwrap(),
+            block_inject: MtpMatrix::new(2, 4, vec![0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+                .unwrap(),
+        };
+        let mut wide = input;
+        hc_inject_output(&mut wide, &weights, &[1.0, 1.0], 2, 2).unwrap();
+        let dot = (0.3 * small + 0.4 * small) / 2.0;
+        let scale = 2.0 * ops::sigmoid(dot);
+        assert!((wide[0] - (3.0 + scale)).abs() < 1.0e-5);
+        assert!(
+            (wide[2] - (0.3 + 1.0)).abs() < 1.0e-5,
+            "zero row -> 2*sigmoid(0) = 1"
+        );
+    }
 
     #[test]
     fn final_hc_read_uses_learned_branch_mix() {

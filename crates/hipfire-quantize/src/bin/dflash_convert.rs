@@ -814,6 +814,51 @@ fn parse_int_array(json: &serde_json::Value) -> Vec<i64> {
         .unwrap_or_default()
 }
 
+/// Geometry the DFlash fc input must satisfy when the draft declares
+/// `target_streams_per_layer`.
+struct FcGeometry {
+    /// K (columns) of `fc.weight`.
+    fc_k: usize,
+    hidden_size: usize,
+    num_layers: usize,
+    streams: usize,
+    target_embedding_size: Option<usize>,
+    target_feature_size: Option<usize>,
+    target_hidden_size: Option<usize>,
+}
+
+fn validate_fc_geometry(g: &FcGeometry) -> Result<(), String> {
+    if g.streams == 0 {
+        return Err("target_streams_per_layer must be >= 1".into());
+    }
+    let embed = g.target_embedding_size.unwrap_or(g.hidden_size);
+    let expected = g.num_layers * g.streams * embed;
+    if g.fc_k != expected {
+        return Err(format!(
+            "fc.weight K {} != len(target_layer_ids) {} x target_streams_per_layer {} x \
+             target_embedding_size {embed} = {expected}",
+            g.fc_k, g.num_layers, g.streams
+        ));
+    }
+    if let Some(feature) = g.target_feature_size {
+        if feature != g.fc_k {
+            return Err(format!(
+                "target_feature_size {feature} != fc.weight K {}",
+                g.fc_k
+            ));
+        }
+    }
+    if let Some(th) = g.target_hidden_size {
+        if th != g.streams * embed {
+            return Err(format!(
+                "target_hidden_size {th} != target_streams_per_layer {} x target_embedding_size {embed}",
+                g.streams
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_symmetric_flags(
     use_mq4v2: bool,
     use_mq3v2: bool,
@@ -1015,6 +1060,7 @@ fn main() {
     let conv_kernel_size = dflash_u64(&dflash_cfg, &config, "conv_kernel_size");
     let selector_rank = dflash_u64(&dflash_cfg, &config, "selector_rank");
     let selector_top_k = dflash_u64(&dflash_cfg, &config, "selector_top_k");
+    let target_streams_per_layer = dflash_u64(&dflash_cfg, &config, "target_streams_per_layer");
 
     let num_hidden_layers = config
         .get("num_hidden_layers")
@@ -1143,6 +1189,12 @@ fn main() {
         if let Some(v) = selector_top_k {
             obj.insert("selector_top_k".into(), serde_json::Value::from(v));
         }
+        if let Some(v) = target_streams_per_layer {
+            obj.insert(
+                "target_streams_per_layer".into(),
+                serde_json::Value::from(v),
+            );
+        }
         for key in [
             "layer_types",
             "sliding_window",
@@ -1183,6 +1235,39 @@ fn main() {
     name_to_file.sort_by_key(|(name, _)| name.clone());
     eprintln!("  tensors: {}", name_to_file.len());
 
+    if let Some(streams) = target_streams_per_layer {
+        let (_, fi) = name_to_file
+            .iter()
+            .find(|(name, _)| name == "fc.weight")
+            .expect("draft has no fc.weight tensor");
+        let (fc_meta, _) = st_files[*fi]
+            .tensor_data("fc.weight")
+            .expect("tensor lookup failed");
+        if fc_meta.shape.len() != 2 {
+            eprintln!(
+                "error: fc.weight must be 2-D, got shape {:?}",
+                fc_meta.shape
+            );
+            std::process::exit(1);
+        }
+        let geometry = FcGeometry {
+            fc_k: fc_meta.shape[1],
+            hidden_size,
+            num_layers: target_layer_ids.len(),
+            streams: streams as usize,
+            target_embedding_size: dflash_u64(&dflash_cfg, &config, "target_embedding_size")
+                .map(|v| v as usize),
+            target_feature_size: dflash_u64(&dflash_cfg, &config, "target_feature_size")
+                .map(|v| v as usize),
+            target_hidden_size: dflash_u64(&dflash_cfg, &config, "target_hidden_size")
+                .map(|v| v as usize),
+        };
+        if let Err(error) = validate_fc_geometry(&geometry) {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+    }
+
     let mut hfq_tensors: Vec<HfqTensor> = Vec::with_capacity(name_to_file.len());
     let mut total_params = 0u64;
     let mut total_bytes_out = 0usize;
@@ -1219,8 +1304,14 @@ fn main() {
             (QuantType::F32, 0u32, f32_slice_to_f32_bytes(&f32_data))
         } else if keep_f32 {
             (QuantType::F32, 0u32, f32_slice_to_f32_bytes(&f32_data))
-        } else if mq_mode && is_lossless_non_mq_tensor(name) {
+        } else if mq_mode
+            && (is_lossless_non_mq_tensor(name)
+                || (name == "fc.weight" && target_streams_per_layer.is_some_and(|s| s > 1)))
+        {
             // Dynamic-conv base kernels + selector codebooks: F16 container default.
+            // A multi-stream draft's fc reads the target's raw hyper-connection
+            // residual (un-normalized, per-channel outliers in the hundreds), so
+            // a 4-bit fc wrecks the context features; it stays F16 too.
             (QuantType::F16, 0u32, f32_slice_to_f16_bytes(&f32_data))
         } else if use_mq4 && n_elements >= 256 {
             let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
@@ -1373,5 +1464,71 @@ mod symmetric_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fc_geometry_tests {
+    use super::*;
+
+    fn raon(fc_k: usize) -> Result<(), String> {
+        validate_fc_geometry(&FcGeometry {
+            fc_k,
+            hidden_size: 2560,
+            num_layers: 5,
+            streams: 4,
+            target_embedding_size: Some(2560),
+            target_feature_size: Some(51200),
+            target_hidden_size: Some(10240),
+        })
+    }
+
+    #[test]
+    fn accepts_the_raon_shapes() {
+        assert_eq!(raon(51200), Ok(()));
+    }
+
+    #[test]
+    fn embedding_size_defaults_to_hidden() {
+        let geometry = FcGeometry {
+            fc_k: 4 * 2 * 8,
+            hidden_size: 8,
+            num_layers: 4,
+            streams: 2,
+            target_embedding_size: None,
+            target_feature_size: None,
+            target_hidden_size: None,
+        };
+        assert_eq!(validate_fc_geometry(&geometry), Ok(()));
+    }
+
+    #[test]
+    fn rejects_a_mismatched_fc_k() {
+        let err = raon(12800).unwrap_err();
+        assert!(err.contains("fc.weight"), "{err}");
+    }
+
+    #[test]
+    fn rejects_inconsistent_config_fields() {
+        let bad_feature = FcGeometry {
+            fc_k: 51200,
+            hidden_size: 2560,
+            num_layers: 5,
+            streams: 4,
+            target_embedding_size: Some(2560),
+            target_feature_size: Some(25600),
+            target_hidden_size: Some(10240),
+        };
+        assert!(validate_fc_geometry(&bad_feature)
+            .unwrap_err()
+            .contains("target_feature_size"));
+        let bad_hidden = FcGeometry {
+            target_feature_size: Some(51200),
+            target_hidden_size: Some(2560),
+            ..bad_feature
+        };
+        assert!(validate_fc_geometry(&bad_hidden)
+            .unwrap_err()
+            .contains("target_hidden_size"));
     }
 }

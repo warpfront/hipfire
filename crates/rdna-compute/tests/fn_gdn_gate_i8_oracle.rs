@@ -9,12 +9,17 @@
 //! (`mq_rotate_x_i8_gfx12`), and the out-projection GEMM on them must therefore
 //! produce the same bytes.
 //!
+//! The same checks run for both value-head counts the kernel is compiled for: the 48 heads
+//! of Flash-Next (K = 6144, 24 head pairs per row, `fn_gdn_dense_gate_i8`) and the 24 heads of
+//! the TP2 trunk shard's rank-local geometry (K = 3072, 12 pairs, `fn_gdn_dense_gate_i8_p12`).
+//!
 //! Every output byte of the whole `[K/128][rows]` block array is compared, for
-//! row counts {1, 16, 777, 4093, 4096, 16384} (K = 6144), on random inputs with
+//! row counts {1, 16, 777, 4093, 4096, 16384}, on random inputs with
 //! injected NaN / +-inf / +-0 / subnormal / extreme-magnitude BF16 recurrent and F32
 //! gate values and all-zero, all-special and outlier rows. The destination scratch
 //! is poisoned between the two producers, so a byte the fused kernel left unwritten
-//! cannot pass. The GEMM output is compared bitwise at M = 2560 on two shapes.
+//! cannot pass. The GEMM output is compared bitwise at M = 2560 on two shapes (the shard's
+//! out projection is K = 3072 over the same 2560 rows).
 //!
 //! `#[ignore]`d: needs an exact gfx1201 with a working HIP toolchain.
 //!
@@ -33,9 +38,9 @@ use rdna_compute::tensor_ops::GatedDeltaGateBatched;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::ffi::c_void;
 
-const HEADS: usize = 48;
+/// Value-head counts under test: Flash-Next's 48 and the TP2 trunk shard's rank-local 24.
+const HEAD_COUNTS: [usize; 2] = [48, 24];
 const DIM: usize = 128;
-const K: usize = HEADS * DIM;
 const BLOCK_BYTES: usize = 136;
 const GROUP_BYTES: usize = 200;
 
@@ -69,15 +74,16 @@ fn bf16_bits(x: f32) -> u16 {
     (rounded >> 16) as u16
 }
 
-/// `rows * K` BF16 recurrent bits, `rows * K` F32 gate inputs: row classes keep the
-/// zero-block, all-special, outlier and plain paths all exercised at every row count.
-fn gen_inputs(rows: usize, seed: u64) -> (Vec<u16>, Vec<f32>) {
+/// `rows * K` BF16 recurrent bits, `rows * K` F32 gate inputs (`K = heads * 128`): row classes
+/// keep the zero-block, all-special, outlier and plain paths all exercised at every row count.
+fn gen_inputs(rows: usize, heads: usize, seed: u64) -> (Vec<u16>, Vec<f32>) {
+    let k = heads * DIM;
     let mut r = Rng(seed | 1);
-    let mut rec = vec![0u16; rows * K];
-    let mut z = vec![0f32; rows * K];
+    let mut rec = vec![0u16; rows * k];
+    let mut z = vec![0f32; rows * k];
     for row in 0..rows {
         let class = (row + 4) % 16;
-        for i in 0..K {
+        for i in 0..k {
             let scale = 1.0 + 4.0 * (((i / DIM) % 7) as f32);
             let mut a = bf16_bits(r.unit() * scale);
             let mut b = r.unit() * 6.0;
@@ -136,8 +142,8 @@ fn gen_inputs(rows: usize, seed: u64) -> (Vec<u16>, Vec<f32>) {
                     ][r.below(7) as usize],
                 );
             }
-            rec[row * K + i] = a;
-            z[row * K + i] = b;
+            rec[row * k + i] = a;
+            z[row * k + i] = b;
         }
     }
     (rec, z)
@@ -172,25 +178,27 @@ struct Operands {
     out: GpuTensor,
     rotated: GpuTensor,
     rows: usize,
+    heads: usize,
 }
 
-fn operands(gpu: &mut Gpu, rows: usize, seed: u64) -> Operands {
-    let (rec, z) = gen_inputs(rows, seed);
+fn operands(gpu: &mut Gpu, rows: usize, heads: usize, seed: u64) -> Operands {
+    let k = heads * DIM;
+    let (rec, z) = gen_inputs(rows, heads, seed);
     let rec_bytes: Vec<u8> = rec.iter().flat_map(|v| v.to_le_bytes()).collect();
     let norm_bytes: Vec<u8> = norm_bits(seed ^ 0x9e37)
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect();
-    let rec = gpu.upload_raw(&rec_bytes, &[rows * K * 2]).expect("rec");
+    let rec = gpu.upload_raw(&rec_bytes, &[rows * k * 2]).expect("rec");
     let norm = gpu.upload_raw(&norm_bytes, &[DIM * 2]).expect("norm");
     let norm = GpuTensor {
         dtype: DType::BF16,
         shape: vec![DIM],
         ..norm
     };
-    let z = gpu.upload_f32(&z, &[rows * K]).expect("z");
-    let out = gpu.zeros(&[rows * K], DType::F32).expect("out");
-    let rotated = gpu.zeros(&[rows * K], DType::F32).expect("rotated");
+    let z = gpu.upload_f32(&z, &[rows * k]).expect("z");
+    let out = gpu.zeros(&[rows * k], DType::F32).expect("out");
+    let rotated = gpu.zeros(&[rows * k], DType::F32).expect("rotated");
     Operands {
         rec,
         z,
@@ -198,10 +206,25 @@ fn operands(gpu: &mut Gpu, rows: usize, seed: u64) -> Operands {
         out,
         rotated,
         rows,
+        heads,
     }
 }
 
 impl Operands {
+    /// The out projection's K (`value_heads * 128`).
+    fn k(&self) -> usize {
+        self.heads * DIM
+    }
+
+    /// The fused kernel's entry for this head count.
+    fn entry(&self) -> &'static str {
+        match self.heads {
+            48 => "fn_gdn_dense_gate_i8",
+            24 => "fn_gdn_dense_gate_i8_p12",
+            heads => panic!("no gate_i8 entry for {heads} value heads"),
+        }
+    }
+
     fn gate_args(&self) -> GatedDeltaGateBatched<'_> {
         GatedDeltaGateBatched {
             recurrent_output: &self.rec,
@@ -209,7 +232,7 @@ impl Operands {
             norm: &self.norm,
             output: &self.out,
             rows: self.rows,
-            value_heads: HEADS,
+            value_heads: self.heads,
             value_dim: DIM,
         }
     }
@@ -234,24 +257,26 @@ fn require_gfx1201() -> Option<Gpu> {
 /// Returns the (reference, fused) block bytes.
 fn compare_blocks(gpu: &mut Gpu, o: &Operands) -> (Vec<u8>, Vec<u8>) {
     let rows = o.rows;
-    let bytes = (K / 128) * rows * BLOCK_BYTES;
+    let k = o.k();
+    let bytes = (k / 128) * rows * BLOCK_BYTES;
     let args = o.gate_args();
     fn_gdn_dense::gate(gpu, &args, None).expect("reference gate");
     let ref_ptr = gpu
-        .mq6_i8_prepare_x(&o.out, K, rows)
+        .mq6_i8_prepare_x(&o.out, k, rows)
         .expect("reference producer");
     assert_eq!(gpu.last_launched_kernel(), Some("mq_rotate_x_i8_gfx12"));
     let reference = dtoh(gpu, ref_ptr, bytes);
     poison(gpu, ref_ptr, bytes);
     let fused_ptr = fn_gdn_dense::gate_i8(gpu, &args).expect("fused gate");
-    assert_eq!(gpu.last_launched_kernel(), Some("fn_gdn_dense_gate_i8"));
+    assert_eq!(gpu.last_launched_kernel(), Some(o.entry()));
     assert_eq!(fused_ptr, ref_ptr, "both producers use the one A8 scratch");
     let fused = dtoh(gpu, fused_ptr, bytes);
     let bad = reference.iter().zip(&fused).filter(|(a, b)| a != b).count();
     let first = reference.iter().zip(&fused).position(|(a, b)| a != b);
     assert_eq!(
         bad, 0,
-        "rows {rows}: {bad} of {bytes} block bytes differ (first at {first:?} = block {:?}, byte {:?})",
+        "{} heads, rows {rows}: {bad} of {bytes} block bytes differ (first at {first:?} = block {:?}, byte {:?})",
+        o.heads,
         first.map(|p| p / BLOCK_BYTES),
         first.map(|p| p % BLOCK_BYTES),
     );
@@ -264,8 +289,13 @@ fn blocks_are_bytewise_the_two_launch_chain() {
     let Some(mut gpu) = require_gfx1201() else {
         return;
     };
-    for (n, rows) in [1usize, 16, 777, 4093, 4096, 16384].into_iter().enumerate() {
-        let o = operands(&mut gpu, rows, 0x1234_5678 + n as u64);
+    for (heads, (n, rows)) in HEAD_COUNTS.into_iter().flat_map(|heads| {
+        [1usize, 16, 777, 4093, 4096, 16384]
+            .into_iter()
+            .enumerate()
+            .map(move |row| (heads, row))
+    }) {
+        let o = operands(&mut gpu, rows, heads, 0x1234_5678 + n as u64);
         let (reference, fused) = compare_blocks(&mut gpu, &o);
         // Not vacuous: real blocks (non-zero scales) were produced and compared.
         let nonzero_d = reference
@@ -274,16 +304,19 @@ fn blocks_are_bytewise_the_two_launch_chain() {
             .iter()
             .filter(|b| b[..4] != [0; 4])
             .count();
-        assert!(nonzero_d > 0, "rows {rows}: no block has a scale");
+        assert!(
+            nonzero_d > 0,
+            "{heads} heads, rows {rows}: no block has a scale"
+        );
         if rows >= 16 {
             assert!(
                 nonzero_d < reference.len() / BLOCK_BYTES,
-                "rows {rows}: no all-zero block"
+                "{heads} heads, rows {rows}: no all-zero block"
             );
         }
         assert_eq!(reference.len(), fused.len());
         eprintln!(
-            "rows {rows:>6}: {} block bytes identical ({} blocks, {nonzero_d} with scale)",
+            "{heads} heads, rows {rows:>6}: {} block bytes identical ({} blocks, {nonzero_d} with scale)",
             reference.len(),
             reference.len() / BLOCK_BYTES
         );
@@ -291,9 +324,9 @@ fn blocks_are_bytewise_the_two_launch_chain() {
     }
 }
 
-fn gen_weights(m: usize, seed: u64) -> Vec<u8> {
+fn gen_weights(m: usize, k: usize, seed: u64) -> Vec<u8> {
     let mut r = Rng(seed | 1);
-    let mut w = vec![0u8; m * (K / 256) * GROUP_BYTES];
+    let mut w = vec![0u8; m * (k / 256) * GROUP_BYTES];
     for g in w.as_chunks_mut::<GROUP_BYTES>().0 {
         for h in 0..2 {
             let s = f16::from_f32(1e-4 + r.unit().abs() * 1e-3);
@@ -316,48 +349,52 @@ fn out_projection_gemm_bytes_are_unchanged() {
         return;
     };
     let m = 2560;
-    let w = gpu
-        .upload_raw(&gen_weights(m, 0x77), &[m * (K / 256) * GROUP_BYTES])
-        .expect("w");
-    for (n, rows) in [4096usize, 777].into_iter().enumerate() {
-        let o = operands(&mut gpu, rows, 0xabcd_0000 + n as u64);
-        let args = o.gate_args();
-        let y_ref = gpu.zeros(&[rows * m], DType::F32).expect("y_ref");
-        let y_fused = gpu.zeros(&[rows * m], DType::F32).expect("y_fused");
-        let y_ref16 = gpu.zeros(&[rows * m], DType::BF16).expect("y_ref16");
-        let y_fused16 = gpu.zeros(&[rows * m], DType::BF16).expect("y_fused16");
-        fn_gdn_dense::gate(&mut gpu, &args, None).expect("gate");
-        let xq = gpu.mq6_i8_prepare_x(&o.out, K, rows).expect("producer");
-        gpu.gemm_mq6g256v2_i8_prequant(&w, xq, &y_ref, m, K, rows)
-            .expect("gemm ref");
-        gpu.gemm_mq6g256v2_i8_prequant(&w, xq, &y_ref16, m, K, rows)
-            .expect("gemm ref bf16");
-        let xq = fn_gdn_dense::gate_i8(&mut gpu, &args).expect("fused");
-        gpu.gemm_mq6g256v2_i8_prequant(&w, xq, &y_fused, m, K, rows)
-            .expect("gemm fused");
-        gpu.gemm_mq6g256v2_i8_prequant(&w, xq, &y_fused16, m, K, rows)
-            .expect("gemm fused bf16");
-        for (a, b, what) in [(&y_ref, &y_fused, "F32"), (&y_ref16, &y_fused16, "BF16")] {
-            let (a, b) = (
-                gpu.download_raw_bytes(a).unwrap(),
-                gpu.download_raw_bytes(b).unwrap(),
-            );
-            let bad = a.iter().zip(&b).filter(|(x, y)| x != y).count();
-            assert_eq!(
-                bad,
-                0,
-                "rows {rows} {what}: {bad} of {} output bytes differ",
+    for heads in HEAD_COUNTS {
+        let k = heads * DIM;
+        let w = gpu
+            .upload_raw(&gen_weights(m, k, 0x77), &[m * (k / 256) * GROUP_BYTES])
+            .expect("w");
+        for (n, rows) in [4096usize, 777].into_iter().enumerate() {
+            let o = operands(&mut gpu, rows, heads, 0xabcd_0000 + n as u64);
+            let args = o.gate_args();
+            let y_ref = gpu.zeros(&[rows * m], DType::F32).expect("y_ref");
+            let y_fused = gpu.zeros(&[rows * m], DType::F32).expect("y_fused");
+            let y_ref16 = gpu.zeros(&[rows * m], DType::BF16).expect("y_ref16");
+            let y_fused16 = gpu.zeros(&[rows * m], DType::BF16).expect("y_fused16");
+            fn_gdn_dense::gate(&mut gpu, &args, None).expect("gate");
+            let xq = gpu.mq6_i8_prepare_x(&o.out, k, rows).expect("producer");
+            gpu.gemm_mq6g256v2_i8_prequant(&w, xq, &y_ref, m, k, rows)
+                .expect("gemm ref");
+            gpu.gemm_mq6g256v2_i8_prequant(&w, xq, &y_ref16, m, k, rows)
+                .expect("gemm ref bf16");
+            let xq = fn_gdn_dense::gate_i8(&mut gpu, &args).expect("fused");
+            gpu.gemm_mq6g256v2_i8_prequant(&w, xq, &y_fused, m, k, rows)
+                .expect("gemm fused");
+            gpu.gemm_mq6g256v2_i8_prequant(&w, xq, &y_fused16, m, k, rows)
+                .expect("gemm fused bf16");
+            for (a, b, what) in [(&y_ref, &y_fused, "F32"), (&y_ref16, &y_fused16, "BF16")] {
+                let (a, b) = (
+                    gpu.download_raw_bytes(a).unwrap(),
+                    gpu.download_raw_bytes(b).unwrap(),
+                );
+                let bad = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+                assert_eq!(
+                    bad,
+                    0,
+                    "{heads} heads, rows {rows} {what}: {bad} of {} output bytes differ",
+                    a.len()
+                );
+                eprintln!(
+                "{heads} heads, rows {rows:>5} M={m} K={k} {what}: {} GEMM output bytes identical",
                 a.len()
             );
-            eprintln!(
-                "rows {rows:>5} M={m} {what}: {} GEMM output bytes identical",
-                a.len()
-            );
+            }
+            for t in [y_ref, y_fused, y_ref16, y_fused16] {
+                gpu.free_tensor(t).unwrap();
+            }
+            free(&mut gpu, o);
         }
-        for t in [y_ref, y_fused, y_ref16, y_fused16] {
-            gpu.free_tensor(t).unwrap();
-        }
-        free(&mut gpu, o);
+        gpu.free_tensor(w).unwrap();
     }
 }
 
@@ -388,8 +425,12 @@ fn microbench() {
     let Some(mut gpu) = require_gfx1201() else {
         return;
     };
-    for rows in [4096usize, 16384] {
-        let o = operands(&mut gpu, rows, 0x5eed);
+    for (heads, rows) in HEAD_COUNTS
+        .into_iter()
+        .flat_map(|heads| [4096usize, 16384].map(move |rows| (heads, rows)))
+    {
+        let o = operands(&mut gpu, rows, heads, 0x5eed);
+        let k = o.k();
         let args = o.gate_args();
         // JIT every kernel and fill the F32 gate output for the producer-only timing.
         fn_gdn_dense::gate(&mut gpu, &args, Some(&o.rotated)).unwrap();
@@ -401,18 +442,18 @@ fn microbench() {
             fn_gdn_dense::gate(g, &args, None).unwrap();
         });
         let t_i8 = median_us(&mut gpu, 30, |g| {
-            let r = g.reserve_int8_mmq(K, rows).unwrap();
-            g.rotate_x_mq_i8_batched(&o.out, None, r, K, rows).unwrap();
+            let r = g.reserve_int8_mmq(k, rows).unwrap();
+            g.rotate_x_mq_i8_batched(&o.out, None, r, k, rows).unwrap();
         });
         let t_fused = median_us(&mut gpu, 30, |g| {
             fn_gdn_dense::gate_i8(g, &args).unwrap();
         });
         let sum_rot = t_gate_rot + t_i8;
         let sum_plain = t_gate + t_i8;
-        let row_before = (K * 2 + K * 4 + K * 4 + K * 4) + (K * 4 + (K / 128) * BLOCK_BYTES);
-        let row_after = K * 2 + K * 4 + (K / 128) * BLOCK_BYTES;
+        let row_before = (k * 2 + k * 4 + k * 4 + k * 4) + (k * 4 + (k / 128) * BLOCK_BYTES);
+        let row_after = k * 2 + k * 4 + (k / 128) * BLOCK_BYTES;
         println!(
-            "MICROBENCH rows={rows} gate_rotate_bf16in={t_gate_rot:.1}us gate_bf16in={t_gate:.1}us \
+            "MICROBENCH heads={heads} rows={rows} gate_rotate_bf16in={t_gate_rot:.1}us gate_bf16in={t_gate:.1}us \
              mq_rotate_x_i8_gfx12={t_i8:.1}us | chain(rotate+i8)={sum_rot:.1}us \
              chain(plain+i8)={sum_plain:.1}us | fused={t_fused:.1}us | \
              fused/chain(rotate)={:.3} fused/chain(plain)={:.3} | DRAM bytes/row before={row_before} after={row_after}",

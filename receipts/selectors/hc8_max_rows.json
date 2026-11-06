@@ -1,0 +1,13 @@
+{
+  "schema": "pm.selector_receipt.v1",
+  "constant": "MAX_ROWS",
+  "value": 64,
+  "row_key": "rows",
+  "covers": true,
+  "arch": "gfx1201",
+  "card": "R9700 (hc8 screen jobs t3 and t4; Flash-Next layer 4 attn and mlp HC mixers, cold weights, device us)",
+  "summary": "HC8 E4M3 vs BF16 full route, us: HC down rows 1/8/16/32/64 (attn) = 7.24 vs 19.24, 7.28 vs 14.16, 7.68 vs 15.60, 9.88 vs 18.20, 17.52 vs 22.12 (mlp 7.08 vs 17.00 at 1); fused read-up 8.68/8.48/8.68/10.56/15.00 vs 15.80/16.32/15.08/18.08/22.92 for the BF16 up route at the same rows. The E4M3 route wins at every row count 1..=64 (t3), and the 64-row ceiling is the four 16-column WMMA tiles of the kernel's row-invariant DAG (K split and fold order independent of rows, so every row is bitwise equal to its rows=1 value; t4 split arms 456 word mismatches act/set 0 0). Above 64 rows the route expands to exact BF16.",
+  "records": [
+    {"path": "receipts/selectors/evidence/hc8_max_rows.txt", "sha256": "7bd5356f655039eb2644a04102742d74a04db85d33043d3c00ab3b98e77cf406"}
+  ]
+}

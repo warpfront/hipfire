@@ -6,7 +6,8 @@
 # It does NOT select runtime defaults. Current automatic runtime selection
 # is only retained_redline_default: mq4r_redline_default (single-GPU .mq4r on
 # exact gfx1100/gfx1151/gfx1201 with pp=tp=1; model-family agnostic),
-# Qwen3.5 dense and Qwen4 (MTP-off) plain-AR decode on exact gfx1201, and
+# Qwen3.5 dense and Qwen4 (MTP-off) plain-AR decode on exact gfx1201,
+# Qwen3.5 dense .mq3-xt plain-AR decode on exact gfx1100, and
 # DeepSeek4 .mq2r AR on gfx1151. Existing LFM .mq4 evidence is not
 # auto-selected because it is not .mq4r; any usable LFM retained route
 # remains explicit opt-in and must still prove route support.

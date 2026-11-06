@@ -678,6 +678,26 @@ impl SingleQueuePm4Ib {
     }
 
     unsafe fn replay_and_wait_inner_checked(&mut self) -> Result<(), (ReplayError, Quiescence)> {
+        // SAFETY: forwarded from this method's caller.
+        unsafe { self.replay_submit_checked()? };
+        self.wait_replay_checked()
+    }
+
+    /// Publish one replay of the retained indirect buffer and return without
+    /// waiting: the first half of [`Self::replay_and_wait_checked`], with the
+    /// same state transitions on failure. `Ok(())` means the replay is in
+    /// flight ([`Self::in_flight`]); quiescence is only reached by
+    /// [`Self::wait_replay_checked`], [`Self::quiesce`] or drop. Until then the
+    /// queue refuses another replay (`AlreadyInFlight`).
+    ///
+    /// # Safety
+    ///
+    /// All code, kernarg, and pointee addresses encoded in the retained IB
+    /// must remain live and GPU-accessible until a later
+    /// [`Self::wait_replay_checked`] returns `Ok` (or, after any error, through
+    /// this object's destruction), and no host write to the memory the IB
+    /// reads may race the in-flight replay.
+    pub unsafe fn replay_submit_checked(&mut self) -> Result<(), (ReplayError, Quiescence)> {
         if !self.usable {
             return Err((ReplayError::GraphInactive, Quiescence::Proven));
         }
@@ -706,6 +726,28 @@ impl SingleQueuePm4Ib {
                 QuiescenceTransition::Cancelled,
             );
             return Err((error.into(), Quiescence::Proven));
+        }
+        Ok(())
+    }
+
+    /// `true` when [`Self::wait_replay_checked`] would return without
+    /// polling: no replay is in flight, the completion signal has reached
+    /// zero, or a queue fault is latched (the wait reports it). Non-blocking;
+    /// it changes no state, so quiescence is still only established by the
+    /// wait.
+    pub fn replay_complete(&self) -> bool {
+        !self.in_flight || self.completion.is_complete() || self.queues.check_faults().is_err()
+    }
+
+    /// Wait, with the finite default bound, for the replay published by
+    /// [`Self::replay_submit_checked`]: the second half of
+    /// [`Self::replay_and_wait_checked`] with unchanged timeout, watchdog
+    /// and quiescence semantics. `Ok(())` immediately when no replay is in
+    /// flight. On timeout or queue fault the queues are inactivated and the
+    /// error carries `Proven` only when that teardown succeeded.
+    pub fn wait_replay_checked(&mut self) -> Result<(), (ReplayError, Quiescence)> {
+        if !self.in_flight {
+            return Ok(());
         }
         match self
             .queues
@@ -3572,6 +3614,66 @@ mod tests {
             .flat_map(|word| word.to_le_bytes())
             .collect::<Vec<_>>();
         assert_eq!(pm4_dispatch_workgroup_offsets(&bytes).unwrap(), vec![16]);
+    }
+
+    #[test]
+    fn gfx11_builder_streams_decode_and_patch_in_workgroup_counts() {
+        use redline_rocr::{Gfx10KernelImage, Gfx10Pm4CommandBuffer};
+        let image = Gfx10KernelImage {
+            code_entry: 0x1_0000_0000,
+            compute_pgm_rsrc1: 0x60af_0000,
+            compute_pgm_rsrc2: 0x84,
+            compute_pgm_rsrc3: 0,
+            group_segment_size: 0,
+            private_segment_size: 0,
+            dynamic_callstack: false,
+            wave32: true,
+            kernel_code_properties: 1 << 10,
+        };
+        let mut commands = Gfx10Pm4CommandBuffer::new_stateful();
+        for (grid, block) in [([5, 2, 1], [256, 1, 1]), ([96, 1, 1], [128, 1, 1])] {
+            commands
+                .dispatch_image(
+                    &image,
+                    crate::aql::LaunchGeometry::from_hip_workgroups(grid, block).unwrap(),
+                    0,
+                    &[0x1000, 0],
+                )
+                .unwrap();
+            commands.wait_compute_idle();
+        }
+        let mut bytes = commands
+            .dwords()
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        // gfx10/gfx11 `DISPATCH_DIRECT` carries workgroup COUNTS, and the
+        // workgroup size in force comes from COMPUTE_NUM_THREAD.
+        let decoded = decode_pm4_dispatches(&bytes).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].dimensions, [5, 2, 1]);
+        assert_eq!(decoded[0].workgroup, Some([256, 1, 1]));
+        assert_eq!(decoded[1].dimensions, [96, 1, 1]);
+        assert_eq!(decoded[1].workgroup, Some([128, 1, 1]));
+        // The patch offsets address exactly those three dimension dwords.
+        let offsets = pm4_dispatch_workgroup_offsets(&bytes).unwrap();
+        assert_eq!(offsets.len(), 2);
+        for (&offset, want) in offsets.iter().zip([[5u32, 2, 1], [96, 1, 1]]) {
+            let got: Vec<u32> = bytes[offset..offset + 12]
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                .collect();
+            assert_eq!(got, want);
+        }
+        // Patching the first dispatch's workgroup counts changes only it.
+        for (axis, value) in [9u32, 3, 1].into_iter().enumerate() {
+            bytes[offsets[0] + axis * 4..offsets[0] + axis * 4 + 4]
+                .copy_from_slice(&value.to_le_bytes());
+        }
+        let decoded = decode_pm4_dispatches(&bytes).unwrap();
+        assert_eq!(decoded[0].dimensions, [9, 3, 1]);
+        assert_eq!(decoded[1].dimensions, [96, 1, 1]);
+        assert_eq!(decoded[0].workgroup, Some([256, 1, 1]));
     }
 
     #[test]

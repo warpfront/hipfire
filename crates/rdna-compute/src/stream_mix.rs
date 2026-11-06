@@ -33,6 +33,10 @@ pub const STREAM_MIX_ROUTE_HELMERT_SRC: &str =
     include_str!("../../../kernels/src/stream_mix_route_helmert.hip");
 pub const STREAM_MIX_AGGREGATE_SRC: &str =
     include_str!("../../../kernels/src/stream_mix_aggregate.hip");
+pub const STREAM_MIX_ROUTE_AGGREGATE_SRC: &str =
+    include_str!("../../../kernels/src/stream_mix_route_aggregate.hip");
+pub const GEMM_BF16_XBF16_ROWS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_xbf16_rows.hip");
 pub const STREAM_MIX_MIX_SRC: &str = include_str!("../../../kernels/src/stream_mix_mix.hip");
 pub const STREAM_MIX_MEAN_SRC: &str = include_str!("../../../kernels/src/stream_mix_mean.hip");
 
@@ -45,7 +49,17 @@ const FUNC_BROADCAST: &str = "stream_mix_broadcast";
 const FUNC_ROUTE_HELMERT: &str = "stream_mix_route_helmert";
 const FUNC_AGGREGATE: &str = "stream_mix_aggregate";
 const FUNC_POSTMIX: &str = "stream_mix_postmix";
+const FUNC_ROUTE_AGG_F32: &str = "stream_mix_route_aggregate_n4_k10";
+const FUNC_POSTMIX_BF16: &str = "stream_mix_postmix_bf16";
+const GEMM_BF16_XBF16_MODULE: &str = "gemm_bf16_xbf16_rows";
+const GEMM_BF16_XBF16_BATCHED: &str = "gemm_bf16_xbf16_batched";
+const GEMM_BF16_XBF16_TILED: &str = "gemm_bf16_xbf16_tiled_rows";
+const GEMM_BF16_XBF16_TILED_MP4: &str = "gemm_bf16_xbf16_tiled_rows_mp4";
+const FUNC_ROUTE_AGG_BF16: &str = "stream_mix_route_aggregate_n4_k10_bf16";
 const FUNC_MEAN: &str = "stream_mix_mean";
+const FUNC_MEAN_BF16: &str = "stream_mix_mean_bf16";
+const FUNC_BROADCAST_BF16: &str = "stream_mix_broadcast_bf16";
+const FUNC_WIDEN: &str = "stream_mix_widen_rows";
 
 /// Where stages round their outputs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +99,34 @@ pub struct StreamRouteHelmert<'a> {
     pub post: &'a GpuTensor,
     /// `[rows, n, n]` destination/source (written).
     pub res: &'a GpuTensor,
+    pub rows: usize,
+    pub n: usize,
+    pub width: usize,
+    pub post_factor: f32,
+    pub selector_eps: f32,
+    pub rounding: StreamRounding,
+}
+
+/// Operands of [`Gpu::stream_mix_route_aggregate`]: the Helmert route finalize
+/// and the aggregate of one site in a single pass over the old streams.
+pub struct StreamRouteAggregate<'a> {
+    /// Old streams `[rows, n, width]` (read); F32 planes or BF16 bits.
+    pub streams: &'a GpuTensor,
+    /// Raw selector projection `[rows, 2n + (n-1)^2]` F32 (read).
+    pub z_raw: &'a GpuTensor,
+    /// `[alpha_pre, alpha_post, alpha_z, eta, b_pre[n], b_post[n], b_z[(n-1)^2]]`
+    /// F32 (read).
+    pub params: &'a GpuTensor,
+    /// `[rows, n]` (written).
+    pub pre: &'a GpuTensor,
+    /// `[rows, n]` (written).
+    pub post: &'a GpuTensor,
+    /// `[rows, n, n]` destination/source (written).
+    pub res: &'a GpuTensor,
+    /// Optional norm applied to the rounded aggregate.
+    pub norm: Option<StreamGamma<'a>>,
+    /// `[rows, width]` F32 (written).
+    pub out: &'a GpuTensor,
     pub rows: usize,
     pub n: usize,
     pub width: usize,
@@ -231,12 +273,26 @@ impl Gpu {
             return Err(err("stream_mix_broadcast: src_stride < width"));
         }
         f32_tensor(src, (rows - 1) * src_stride + width, "broadcast src")?;
-        f32_tensor(dst, rows * n_streams * width, "broadcast dst")?;
+        let (func, dbytes) = match dst.dtype {
+            DType::F32 => (FUNC_BROADCAST, rows * n_streams * width * 4),
+            DType::BF16 => {
+                if rounding != StreamRounding::Bf16 {
+                    return Err(err("stream_mix_broadcast: BF16 streams need Bf16 rounding"));
+                }
+                (FUNC_BROADCAST_BF16, rows * n_streams * width * 2)
+            }
+            other => {
+                return Err(err(format!(
+                    "stream_mix_broadcast: dst dtype {other:?} must be F32 or BF16"
+                )))
+            }
+        };
+        need(dst, dbytes, "broadcast dst")?;
         if !disjoint(src, src.buf.size(), dst, dst.buf.size()) {
             return Err(err("stream_mix_broadcast: src and dst alias"));
         }
         self.bind_thread()?;
-        self.ensure_kernel(FUNC_BROADCAST, STREAM_MIX_BROADCAST_SRC, FUNC_BROADCAST)?;
+        self.ensure_kernel(FUNC_BROADCAST, STREAM_MIX_BROADCAST_SRC, func)?;
         let sp = src.buf.as_ptr();
         let dp = dst.buf.as_ptr();
         let ns = n_streams as i32;
@@ -253,7 +309,7 @@ impl Gpu {
         ];
         launch_params_blob!(
             self,
-            FUNC_BROADCAST,
+            func,
             [(width as u32).div_ceil(256), rows as u32, 1],
             [256, 1, 1],
             0,
@@ -317,6 +373,94 @@ impl Gpu {
         )
     }
 
+    /// Geometries [`Self::stream_mix_route_aggregate`] is instantiated for:
+    /// `(streams, width)` with `width = KPER * 256`. Anything else must run
+    /// route + aggregate as two stages.
+    pub fn stream_mix_route_aggregate_supported(n: usize, width: usize) -> bool {
+        n == 4 && width == 2560
+    }
+
+    /// Helmert route finalize + aggregate (+ norm) for `rows` rows in one pass over
+    /// the old streams; see `kernels/src/stream_mix_route_aggregate.hip`. Writes
+    /// `pre`, `post`, `res` and `out` bit-identically to
+    /// [`Self::stream_mix_route_helmert`] followed by
+    /// [`Self::stream_mix_aggregate`]. `streams` is F32 planes or BF16 bits.
+    pub fn stream_mix_route_aggregate(&mut self, p: &StreamRouteAggregate<'_>) -> HipResult<()> {
+        const W: &str = "stream_mix_route_aggregate";
+        check_geometry(W, p.rows, p.n, p.width)?;
+        if !Self::stream_mix_route_aggregate_supported(p.n, p.width) {
+            return Err(err(format!(
+                "{W}: no instantiation for n={} width={}",
+                p.n, p.width
+            )));
+        }
+        let nm = p.n - 1;
+        let zdim = 2 * p.n + nm * nm;
+        let x_dim = p.n * p.width;
+        let (func, sbytes) = match p.streams.dtype {
+            DType::F32 => (FUNC_ROUTE_AGG_F32, p.rows * x_dim * 4),
+            DType::BF16 => (FUNC_ROUTE_AGG_BF16, p.rows * x_dim * 2),
+            other => {
+                return Err(err(format!(
+                    "{W}: streams dtype {other:?} unsupported (F32 or BF16)"
+                )))
+            }
+        };
+        need(p.streams, sbytes, "streams")?;
+        f32_tensor(p.z_raw, p.rows * zdim, "z_raw")?;
+        f32_tensor(p.params, 4 + zdim, "params")?;
+        f32_tensor(p.pre, p.rows * p.n, "pre")?;
+        f32_tensor(p.post, p.rows * p.n, "post")?;
+        f32_tensor(p.res, p.rows * p.n * p.n, "res")?;
+        f32_tensor(p.out, p.rows * p.width, "out")?;
+        if !disjoint(p.streams, p.streams.buf.size(), p.out, p.out.buf.size()) {
+            return Err(err(format!("{W}: streams and out alias")));
+        }
+        let (gp, gk, eps, has_norm) = norm_args(W, &p.norm, p.width)?;
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "stream_mix_route_aggregate",
+            STREAM_MIX_ROUTE_AGGREGATE_SRC,
+            func,
+        )?;
+        let xp = p.streams.buf.as_ptr();
+        let zp = p.z_raw.buf.as_ptr();
+        let qp = p.params.buf.as_ptr();
+        let pre = p.pre.buf.as_ptr();
+        let post = p.post.buf.as_ptr();
+        let res = p.res.buf.as_ptr();
+        let op = p.out.buf.as_ptr();
+        let pf = p.post_factor;
+        let se = p.selector_eps;
+        let bf = p.rounding.flag();
+        let nr = p.n as i32;
+        let mut params = [
+            &xp as *const _ as *mut c_void,
+            &zp as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &pre as *const _ as *mut c_void,
+            &post as *const _ as *mut c_void,
+            &res as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &pf as *const _ as *mut c_void,
+            &se as *const _ as *mut c_void,
+            &eps as *const _ as *mut c_void,
+            &bf as *const _ as *mut c_void,
+            &has_norm as *const _ as *mut c_void,
+            &gk as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+        ];
+        launch_params_blob!(
+            self,
+            func,
+            [p.rows as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            params; xp, zp, qp, pre, post, res, gp, op, pf, se, eps, bf, has_norm, gk, nr
+        )
+    }
+
     /// `out = [norm](round(sum_s pre[s] * streams[s]))` per row.
     pub fn stream_mix_aggregate(&mut self, p: &StreamAggregate<'_>) -> HipResult<()> {
         const W: &str = "stream_mix_aggregate";
@@ -359,21 +503,47 @@ impl Gpu {
     }
 
     /// `out[i] = round(sum_j res[i, j] * streams[j] + post[i] * branch)`.
+    ///
+    /// `streams` and `out` are both F32 planes or both BF16 bits. BF16 streams
+    /// require [`StreamRounding::Bf16`] and an even width (each thread owns two
+    /// columns); the result is the exact BF16 image of the F32-plane result.
     pub fn stream_mix_postmix(&mut self, p: &StreamPostmix<'_>) -> HipResult<()> {
         const W: &str = "stream_mix_postmix";
         check_geometry(W, p.rows, p.n, p.width)?;
-        let sbytes = p.rows * p.n * p.width * 4;
-        f32_tensor(p.streams, p.rows * p.n * p.width, "streams")?;
+        let elems = p.rows * p.n * p.width;
+        let bf16_streams = match (p.streams.dtype, p.out.dtype) {
+            (DType::F32, DType::F32) => false,
+            (DType::BF16, DType::BF16) => {
+                if p.rounding != StreamRounding::Bf16 || p.width % 2 != 0 {
+                    return Err(err(format!(
+                        "{W}: BF16 streams need Bf16 rounding and an even width"
+                    )));
+                }
+                true
+            }
+            (a, b) => {
+                return Err(err(format!(
+                    "{W}: streams/out dtypes {a:?}/{b:?} must both be F32 or both BF16"
+                )))
+            }
+        };
+        let sbytes = elems * if bf16_streams { 2 } else { 4 };
+        need(p.streams, sbytes, "streams")?;
+        need(p.out, sbytes, "out")?;
         f32_tensor(p.branch, p.rows * p.width, "branch")?;
         f32_tensor(p.post, p.rows * p.n, "post")?;
         f32_tensor(p.res, p.rows * p.n * p.n, "res")?;
-        f32_tensor(p.out, p.rows * p.n * p.width, "out")?;
         // Every output stream reads every old stream: ping-pong, never in place.
         if !disjoint(p.streams, sbytes, p.out, sbytes) {
             return Err(err(format!("{W}: out aliases the old streams")));
         }
         self.bind_thread()?;
-        self.ensure_kernel(FUNC_POSTMIX, STREAM_MIX_MIX_SRC, FUNC_POSTMIX)?;
+        let (func, cols_per_block) = if bf16_streams {
+            (FUNC_POSTMIX_BF16, 512u32)
+        } else {
+            (FUNC_POSTMIX, 256u32)
+        };
+        self.ensure_kernel(FUNC_POSTMIX, STREAM_MIX_MIX_SRC, func)?;
         let xp = p.streams.buf.as_ptr();
         let bp = p.branch.buf.as_ptr();
         let pp = p.post.buf.as_ptr();
@@ -394,8 +564,8 @@ impl Gpu {
         ];
         launch_params_blob!(
             self,
-            FUNC_POSTMIX,
-            [(p.width as u32).div_ceil(256), p.rows as u32, 1],
+            func,
+            [(p.width as u32).div_ceil(cols_per_block), p.rows as u32, 1],
             [256, 1, 1],
             0,
             params; xp, bp, pp, rp, op, nn, wd, bf
@@ -406,14 +576,23 @@ impl Gpu {
     pub fn stream_mix_mean(&mut self, p: &StreamMean<'_>) -> HipResult<()> {
         const W: &str = "stream_mix_mean";
         check_geometry(W, p.rows, p.n, p.width)?;
-        f32_tensor(p.streams, p.rows * p.n * p.width, "streams")?;
+        let (func, sbytes) = match p.streams.dtype {
+            DType::F32 => (FUNC_MEAN, p.rows * p.n * p.width * 4),
+            DType::BF16 => (FUNC_MEAN_BF16, p.rows * p.n * p.width * 2),
+            other => {
+                return Err(err(format!(
+                    "{W}: streams dtype {other:?} must be F32 or BF16"
+                )))
+            }
+        };
+        need(p.streams, sbytes, "streams")?;
         f32_tensor(p.out, p.rows * p.width, "out")?;
         if !disjoint(p.streams, p.streams.buf.size(), p.out, p.out.buf.size()) {
             return Err(err(format!("{W}: streams and out alias")));
         }
         let (gp, gk, eps, has_norm) = norm_args(W, &p.norm, p.width)?;
         self.bind_thread()?;
-        self.ensure_kernel(FUNC_MEAN, STREAM_MIX_MEAN_SRC, FUNC_MEAN)?;
+        self.ensure_kernel(FUNC_MEAN, STREAM_MIX_MEAN_SRC, func)?;
         let xp = p.streams.buf.as_ptr();
         let op = p.out.buf.as_ptr();
         let nn = p.n as i32;
@@ -432,11 +611,56 @@ impl Gpu {
         ];
         launch_params_blob!(
             self,
-            FUNC_MEAN,
+            func,
             [p.rows as u32, 1, 1],
             [256, 1, 1],
             (p.width * 4) as u32,
             params; xp, gp, op, nn, wd, eps, bf, has_norm, gk
+        )
+    }
+
+    /// Exact BF16 -> F32 widening of `rows` rows of `width` BF16 columns into
+    /// `dst[r * dst_stride + dst_col + c]` (stream taps, DFlash capture).
+    pub fn stream_mix_widen_rows(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        rows: usize,
+        width: usize,
+        dst_stride: usize,
+        dst_col: usize,
+    ) -> HipResult<()> {
+        const W: &str = "stream_mix_widen_rows";
+        check_geometry(W, rows, 1, width)?;
+        if src.dtype != DType::BF16 {
+            return Err(err(format!("{W}: src must be BF16")));
+        }
+        need(src, rows * width * 2, "src")?;
+        f32_tensor(dst, (rows - 1) * dst_stride + dst_col + width, "dst")?;
+        if !disjoint(src, src.buf.size(), dst, dst.buf.size()) {
+            return Err(err(format!("{W}: src and dst alias")));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(FUNC_BROADCAST, STREAM_MIX_BROADCAST_SRC, FUNC_WIDEN)?;
+        let sp = src.buf.as_ptr();
+        let dp = dst.buf.as_ptr();
+        let wd = width as i32;
+        let ds = dst_stride as i32;
+        let dc = dst_col as i32;
+        let mut params = [
+            &sp as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &wd as *const _ as *mut c_void,
+            &ds as *const _ as *mut c_void,
+            &dc as *const _ as *mut c_void,
+        ];
+        launch_params_blob!(
+            self,
+            FUNC_WIDEN,
+            [(width as u32).div_ceil(256), rows as u32, 1],
+            [256, 1, 1],
+            0,
+            params; sp, dp, wd, ds, dc
         )
     }
 }
@@ -454,7 +678,108 @@ impl Gpu {
         )?;
         self.ensure_kernel(FUNC_AGGREGATE, STREAM_MIX_AGGREGATE_SRC, FUNC_AGGREGATE)?;
         self.ensure_kernel(FUNC_POSTMIX, STREAM_MIX_MIX_SRC, FUNC_POSTMIX)?;
-        self.ensure_kernel(FUNC_MEAN, STREAM_MIX_MEAN_SRC, FUNC_MEAN)
+        self.ensure_kernel(FUNC_POSTMIX, STREAM_MIX_MIX_SRC, FUNC_POSTMIX_BF16)?;
+        self.ensure_kernel(FUNC_MEAN, STREAM_MIX_MEAN_SRC, FUNC_MEAN)?;
+        self.ensure_kernel(FUNC_MEAN, STREAM_MIX_MEAN_SRC, FUNC_MEAN_BF16)?;
+        self.ensure_kernel(
+            FUNC_BROADCAST,
+            STREAM_MIX_BROADCAST_SRC,
+            FUNC_BROADCAST_BF16,
+        )?;
+        self.ensure_kernel(FUNC_BROADCAST, STREAM_MIX_BROADCAST_SRC, FUNC_WIDEN)?;
+        self.ensure_kernel(
+            "stream_mix_route_aggregate",
+            STREAM_MIX_ROUTE_AGGREGATE_SRC,
+            FUNC_ROUTE_AGG_F32,
+        )?;
+        self.ensure_kernel(
+            "stream_mix_route_aggregate",
+            STREAM_MIX_ROUTE_AGGREGATE_SRC,
+            FUNC_ROUTE_AGG_BF16,
+        )?;
+        for f in [
+            GEMM_BF16_XBF16_BATCHED,
+            GEMM_BF16_XBF16_TILED,
+            GEMM_BF16_XBF16_TILED_MP4,
+        ] {
+            self.ensure_kernel(GEMM_BF16_XBF16_MODULE, GEMM_BF16_XBF16_ROWS_SRC, f)?;
+        }
+        Ok(())
+    }
+
+    /// `y[n, m] = a[m, :] . x[n, :]` with a BF16 weight `a` and BF16 activation
+    /// rows `x` (the BF16-stream mHC selector), F32 output. Bit-identical per
+    /// output to [`Self::gemm_bf16_xf32_batched`] / [`Self::gemm_bf16_xf32_tiled_rows`]
+    /// on the widened `x`; `tiled` selects the x-stationary 4-row kernel (prefill)
+    /// over the one-wave-per-output kernel (decode, verify).
+    pub fn gemm_bf16_xbf16_rows(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        tiled: bool,
+    ) -> HipResult<()> {
+        const W: &str = "gemm_bf16_xbf16_rows";
+        const MAX_GRID_Y: usize = 65535;
+        const NT: usize = 4;
+        if m == 0 || n == 0 {
+            return Ok(());
+        }
+        if a.dtype != DType::BF16 || x.dtype != DType::BF16 {
+            return Err(err(format!("{W}: weight and activation must be BF16")));
+        }
+        need(a, m * k * 2, "weight")?;
+        need(x, n * k * 2, "x")?;
+        f32_tensor(y, n * m, "y")?;
+        if m * k > i32::MAX as usize || n * k > i32::MAX as usize {
+            return Err(err(format!("{W}: extent overflows i32 index")));
+        }
+        self.bind_thread()?;
+        let (kname, grid_x, rows_per_launch, y_per_block) = if !tiled {
+            (GEMM_BF16_XBF16_BATCHED, m, MAX_GRID_Y, 1)
+        } else if m <= 32 {
+            (
+                GEMM_BF16_XBF16_TILED_MP4,
+                m.div_ceil(32),
+                MAX_GRID_Y * NT,
+                NT,
+            )
+        } else {
+            (GEMM_BF16_XBF16_TILED, m.div_ceil(128), MAX_GRID_Y * NT, NT)
+        };
+        self.ensure_kernel(GEMM_BF16_XBF16_MODULE, GEMM_BF16_XBF16_ROWS_SRC, kname)?;
+        let block = if tiled { 256u32 } else { 32u32 };
+        let mut off = 0usize;
+        while off < n {
+            let take = (n - off).min(rows_per_launch);
+            let wp = a.buf.as_ptr();
+            let xp = x.buf.as_ptr().wrapping_byte_add(off * k * 2);
+            let yp = y.buf.as_ptr().wrapping_byte_add(off * m * 4);
+            let mi = m as i32;
+            let ki = k as i32;
+            let ni = take as i32;
+            let mut params = [
+                &wp as *const _ as *mut c_void,
+                &xp as *const _ as *mut c_void,
+                &yp as *const _ as *mut c_void,
+                &mi as *const _ as *mut c_void,
+                &ki as *const _ as *mut c_void,
+                &ni as *const _ as *mut c_void,
+            ];
+            launch_params_blob!(
+                self,
+                kname,
+                [grid_x as u32, take.div_ceil(y_per_block) as u32, 1],
+                [block, 1, 1],
+                0,
+                params; wp, xp, yp, mi, ki, ni
+            )?;
+            off += take;
+        }
+        Ok(())
     }
 }
 

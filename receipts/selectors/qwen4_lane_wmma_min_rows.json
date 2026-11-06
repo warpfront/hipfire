@@ -1,0 +1,13 @@
+{
+  "schema": "pm.selector_receipt.v1",
+  "constant": "LANE_WMMA_MIN_ROWS",
+  "value": 16,
+  "row_key": "rows",
+  "covers": true,
+  "arch": "gfx1201",
+  "card": "R9700 (hcwmma_screen jobs t3 and t1; Flash-Next layer 4, cold weights, min us)",
+  "summary": "Lane WMMA vs incumbent SIMT, us: HC down rows 8/16/24/32/48 = 15.91 vs 16.74, 21.28 vs 17.72, 27.30 vs 20.52, 31.43 vs 22.04, 44.77 vs 26.25; HC up = 17.36 vs 16.22, 24.03 vs 16.47, 31.25 vs 19.81, 37.91 vs 19.93, 51.34 vs 23.04; shared down (t1) 16: 11.13 vs 7.12 (2 terms), 48: 24.93 vs 10.79. 16 is the lowest row count where every routed family wins; <= 8 rows keep the bitwise SIMT path by design.",
+  "records": [
+    {"path": "receipts/selectors/evidence/qwen4_lane_wmma_min_rows.txt", "sha256": "0c807c6ed7a72f0444a64a9ea962b10b4c197b0d56931974e426f5db11450c57"}
+  ]
+}

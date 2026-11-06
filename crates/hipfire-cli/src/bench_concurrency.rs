@@ -497,12 +497,17 @@ impl Driver {
 
     /// Requests the daemon is given at once. The sequential baseline holds
     /// the other lanes' requests client-side, the way `hipfire serve` queues
-    /// them with batching off; their queue time stays in TTFT.
+    /// them with batching off; their wait is the `queue` column, not TTFT.
     fn max_inflight(&self, k: usize) -> usize {
         match self.kind {
             DriverKind::Sequential => 1,
             DriverKind::Slots | DriverKind::Batch => k,
         }
+    }
+
+    /// The no-batching baseline serves one request at a time by design.
+    pub fn serialized_by_design(&self) -> bool {
+        self.kind == DriverKind::Sequential
     }
 
     /// Reject `k` above the started maximum instead of clamping. A clamped
@@ -612,6 +617,9 @@ pub struct RequestRecord {
     /// When its lane sent it (for the sequential baseline: when the lane
     /// would have sent it; it may wait client-side for the daemon).
     pub t_send: f64,
+    /// When the request was written to the daemon (`submit_streaming`
+    /// returned). `t_dispatch - t_send` is the client-side queue wait.
+    pub t_dispatch: Option<f64>,
     pub t_first: Option<f64>,
     pub t_end: f64,
     /// Arrival time of every `token` frame.
@@ -737,6 +745,7 @@ pub fn closed_loop(
                 .submit_streaming(&req)
                 .map_err(|e| anyhow!("{label} submit (conversation {}): {e}", records[r].conv))?;
             inflight.insert(r, Inflight { id, attempt });
+            records[r].t_dispatch = Some(secs(Instant::now()));
             let tx = tx.clone();
             std::thread::spawn(move || {
                 for frame in stream.iter() {
@@ -916,6 +925,241 @@ fn pctl_ms(mut xs: Vec<f64>) -> Option<Pctl> {
     })
 }
 
+/// Wire times of one request, seconds from loop start: the proof a receipt
+/// carries for the overlap verdict. `t_send` is queue entry, `t_dispatch`
+/// the moment the request was written to the daemon; the decode interval of
+/// the stream is `[t_first, t_end]`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StreamTimes {
+    pub conv: usize,
+    pub turn: usize,
+    pub t_send: f64,
+    pub t_dispatch: Option<f64>,
+    pub t_first: Option<f64>,
+    pub t_end: f64,
+    pub tokens: u64,
+    pub ok: bool,
+}
+
+impl StreamTimes {
+    fn json(&self) -> Value {
+        serde_json::json!({
+            "conv": self.conv,
+            "turn": self.turn,
+            "t_send": self.t_send,
+            "t_dispatch": self.t_dispatch,
+            "t_first": self.t_first,
+            "t_end": self.t_end,
+            "tokens": self.tokens,
+            "ok": self.ok,
+        })
+    }
+}
+
+/// A K>1 sample counts as concurrent only if all K streams were decoding
+/// together for at least this fraction of its steady window.
+pub const OVERLAP_MIN_FRAC: f64 = 0.5;
+/// TTFT growing linearly with dispatch order (R² above this and max/min above
+/// [`TTFT_SERIAL_RATIO`]) is the signature of streams served one after another.
+pub const TTFT_SERIAL_R2: f64 = 0.9;
+pub const TTFT_SERIAL_RATIO: f64 = 3.0;
+
+/// Did the K streams of a sample actually decode simultaneously? Judged over
+/// the steady window; decode interval of a stream = `[t_first, t_end]`.
+/// Adapted from the lab harness `overlap_check.py` to a closed loop with more
+/// requests than K.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OverlapVerdict {
+    pub k: usize,
+    /// Only K>1 samples are judged; K=1 always passes.
+    pub required: bool,
+    pub pass: bool,
+    /// Steady window `(start, end)`; `None` when degenerate.
+    pub window: Option<(f64, f64)>,
+    /// Fraction of the window with at least K streams in decode.
+    pub frac_all_decoding: Option<f64>,
+    /// Time-weighted mean number of streams in decode over the window.
+    pub decode_concurrency: Option<f64>,
+    /// R² of TTFT against dispatch order over the first K dispatched requests.
+    pub ttft_r2: Option<f64>,
+    /// max/min TTFT over the same requests.
+    pub ttft_max_min: Option<f64>,
+    pub ttft_linear: bool,
+    /// Why it failed; `None` on a pass.
+    pub reason: Option<String>,
+}
+
+fn steady_window(recs: &[RequestRecord], k: usize) -> Option<(f64, f64)> {
+    let mut by_send: Vec<&RequestRecord> = recs.iter().collect();
+    by_send.sort_by(|a, b| a.t_send.total_cmp(&b.t_send));
+    let w0 = by_send
+        .iter()
+        .take(k)
+        .map(|r| r.t_first.unwrap_or(r.t_end))
+        .fold(f64::NEG_INFINITY, f64::max);
+    let last_send = by_send.last()?.t_send;
+    let w1 = recs
+        .iter()
+        .map(|r| r.t_end)
+        .filter(|&t| t >= last_send)
+        .fold(f64::INFINITY, f64::min);
+    (w1.is_finite() && w0.is_finite() && w1 > w0).then_some((w0, w1))
+}
+
+/// (fraction of the window with >= k streams in decode, time-weighted mean
+/// number of streams in decode).
+fn decode_occupancy(recs: &[RequestRecord], k: usize, (w0, w1): (f64, f64)) -> (f64, f64) {
+    let mut ev: Vec<(f64, i32)> = Vec::new();
+    for r in recs.iter().filter(|r| r.err.is_none()) {
+        if let Some(first) = r.t_first {
+            let (s, e) = (first.max(w0), r.t_end.min(w1));
+            if e > s {
+                ev.push((s, 1));
+                ev.push((e, -1));
+            }
+        }
+    }
+    ev.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let (mut n, mut prev, mut all, mut area) = (0i32, w0, 0.0, 0.0);
+    for (t, d) in ev {
+        let dt = t - prev;
+        area += n as f64 * dt;
+        if n >= k as i32 {
+            all += dt;
+        }
+        n += d;
+        prev = t;
+    }
+    let dt = w1 - prev;
+    area += n as f64 * dt;
+    if n >= k as i32 {
+        all += dt;
+    }
+    let span = w1 - w0;
+    (all / span, area / span)
+}
+
+fn r_squared(y: &[f64]) -> f64 {
+    let n = y.len() as f64;
+    let mx = (n - 1.0) / 2.0;
+    let my = y.iter().sum::<f64>() / n;
+    let (mut sxy, mut sxx, mut syy) = (0.0, 0.0, 0.0);
+    for (i, v) in y.iter().enumerate() {
+        let (dx, dy) = (i as f64 - mx, v - my);
+        sxy += dx * dy;
+        sxx += dx * dx;
+        syy += dy * dy;
+    }
+    if sxx == 0.0 || syy == 0.0 {
+        0.0
+    } else {
+        sxy * sxy / (sxx * syy)
+    }
+}
+
+/// TTFT (from queue entry, so a serial daemon's queue wait shows) of the first
+/// K dispatched requests against dispatch order: (R², max/min, serialized?).
+fn ttft_linearity(recs: &[RequestRecord], k: usize) -> (Option<f64>, Option<f64>, bool) {
+    let mut wave: Vec<&RequestRecord> = recs
+        .iter()
+        .filter(|r| r.err.is_none() && r.t_first.is_some())
+        .collect();
+    wave.sort_by(|a, b| {
+        let da = a.t_dispatch.unwrap_or(a.t_send);
+        let db = b.t_dispatch.unwrap_or(b.t_send);
+        da.total_cmp(&db).then(a.t_send.total_cmp(&b.t_send))
+    });
+    let ttft: Vec<f64> = wave
+        .iter()
+        .take(k)
+        .filter_map(|r| Some(r.t_first? - r.t_send))
+        .collect();
+    if ttft.len() < 2 {
+        return (None, None, false);
+    }
+    let r2 = r_squared(&ttft);
+    let max = ttft.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let min = ttft.iter().cloned().fold(f64::INFINITY, f64::min);
+    let ratio = max / min.max(1e-9);
+    (
+        Some(r2),
+        Some(ratio),
+        r2 > TTFT_SERIAL_R2 && ratio > TTFT_SERIAL_RATIO,
+    )
+}
+
+impl OverlapVerdict {
+    pub fn compute(recs: &[RequestRecord], k: usize) -> Self {
+        let window = steady_window(recs, k);
+        let occ = window.map(|w| decode_occupancy(recs, k, w));
+        let (r2, ratio, linear) = ttft_linearity(recs, k);
+        let required = k > 1;
+        let mut why: Vec<String> = Vec::new();
+        if required {
+            match occ {
+                None => why.push("no steady window (degenerate)".to_owned()),
+                Some((f, _)) if f < OVERLAP_MIN_FRAC => why.push(format!(
+                    "all {k} streams decoded together for only {:.0}% of the steady window \
+                     (need >= {:.0}%)",
+                    f * 100.0,
+                    OVERLAP_MIN_FRAC * 100.0
+                )),
+                Some(_) => {}
+            }
+            if linear {
+                why.push(format!(
+                    "TTFT grows linearly with dispatch order (R2 {:.2}, max/min {:.1})",
+                    r2.unwrap_or(0.0),
+                    ratio.unwrap_or(0.0)
+                ));
+            }
+        }
+        OverlapVerdict {
+            k,
+            required,
+            pass: why.is_empty(),
+            window,
+            frac_all_decoding: occ.map(|o| o.0),
+            decode_concurrency: occ.map(|o| o.1),
+            ttft_r2: r2,
+            ttft_max_min: ratio,
+            ttft_linear: linear,
+            reason: (!why.is_empty()).then(|| why.join("; ")),
+        }
+    }
+
+    fn summary(&self) -> String {
+        if !self.required {
+            return "n/a (k=1)".to_owned();
+        }
+        let f = self
+            .frac_all_decoding
+            .map_or("-".to_owned(), |f| format!("{:.0}%", f * 100.0));
+        format!(
+            "{} (all-{} {f})",
+            if self.pass { "PASS" } else { "FAIL" },
+            self.k
+        )
+    }
+
+    fn json(&self) -> Value {
+        serde_json::json!({
+            "k": self.k,
+            "required": self.required,
+            "pass": self.pass,
+            "window_start_s": self.window.map(|w| w.0),
+            "window_end_s": self.window.map(|w| w.1),
+            "frac_all_decoding": self.frac_all_decoding,
+            "min_frac_all_decoding": OVERLAP_MIN_FRAC,
+            "decode_concurrency": self.decode_concurrency,
+            "ttft_r2": self.ttft_r2,
+            "ttft_max_min": self.ttft_max_min,
+            "ttft_linear": self.ttft_linear,
+            "reason": self.reason,
+        })
+    }
+}
+
 /// The metrics of one sample (`conc_steady.py` `metrics`).
 #[derive(Clone, Debug, Default)]
 pub struct SampleMetrics {
@@ -930,10 +1174,15 @@ pub struct SampleMetrics {
     pub bb_tok_s: f64,
     /// Throughput while every lane is busy (ramp and drain excluded).
     pub steady_tok_s: Option<f64>,
+    /// First token − dispatch (the request on the daemon's wire).
     pub ttft: Option<Pctl>,
+    /// Dispatch − queue entry: the client-side wait before the daemon saw it.
+    pub queue_wait: Option<Pctl>,
     pub tpot: Option<Pctl>,
-    /// SGLang achieved concurrency: Σ end-to-end / duration.
-    pub concurrency: f64,
+    /// Time-weighted mean number of streams in decode over the steady window.
+    pub decode_concurrency: Option<f64>,
+    pub overlap: OverlapVerdict,
+    pub streams: Vec<StreamTimes>,
     /// Output tokens per verify window over the whole sample.
     pub tau: Option<f64>,
     pub finish: BTreeMap<String, usize>,
@@ -960,40 +1209,25 @@ impl SampleMetrics {
         let duration_s = if recs.is_empty() { 0.0 } else { t1 - t0 };
         let output_tokens: u64 = ok.iter().map(|r| r.tokens).sum();
         let rate = |toks: u64, secs: f64| if secs > 0.0 { toks as f64 / secs } else { 0.0 };
+        let dispatched = |r: &RequestRecord| r.t_dispatch.unwrap_or(r.t_send);
 
         let ttft = pctl_ms(
             ok.iter()
-                .filter_map(|r| Some(r.t_first? - r.t_send))
+                .filter_map(|r| Some(r.t_first? - dispatched(r)))
                 .collect(),
         );
+        let queue_wait = pctl_ms(ok.iter().map(|r| dispatched(r) - r.t_send).collect());
         let tpot = pctl_ms(
             ok.iter()
                 .filter(|r| r.tokens > 1)
                 .filter_map(|r| Some((r.t_end - r.t_first?) / (r.tokens - 1) as f64))
                 .collect(),
         );
-        let e2e: f64 = ok.iter().map(|r| r.t_end - r.t_send).sum();
 
         // Steady window: from the moment every one of the first K requests
         // has its first token to the first completion at/after the last send
         // (in-flight drops below K for good).
-        let steady_tok_s = (|| {
-            let mut by_send: Vec<&RequestRecord> = recs.iter().collect();
-            by_send.sort_by(|a, b| a.t_send.total_cmp(&b.t_send));
-            let w0 = by_send
-                .iter()
-                .take(s.k)
-                .map(|r| r.t_first.unwrap_or(r.t_end))
-                .fold(f64::NEG_INFINITY, f64::max);
-            let last_send = by_send.last()?.t_send;
-            let w1 = recs
-                .iter()
-                .map(|r| r.t_end)
-                .filter(|&t| t >= last_send)
-                .fold(f64::INFINITY, f64::min);
-            if !w1.is_finite() || w1 <= w0 {
-                return None;
-            }
+        let steady_tok_s = steady_window(recs, s.k).map(|(w0, w1)| {
             let toks: f64 = ok
                 .iter()
                 .filter(|r| !r.token_times.is_empty())
@@ -1006,8 +1240,9 @@ impl SampleMetrics {
                         .count() as f64
                 })
                 .sum();
-            Some(toks / (w1 - w0))
-        })();
+            toks / (w1 - w0)
+        });
+        let overlap = OverlapVerdict::compute(recs, s.k);
 
         let tw: Vec<(f64, f64)> = ok
             .iter()
@@ -1037,6 +1272,24 @@ impl SampleMetrics {
         let mut by_order: Vec<&RequestRecord> = recs.iter().collect();
         by_order.sort_by_key(|r| (r.conv, r.turn));
         let joined: Vec<&str> = by_order.iter().map(|r| r.text.as_str()).collect();
+        let mut streams: Vec<StreamTimes> = recs
+            .iter()
+            .map(|r| StreamTimes {
+                conv: r.conv,
+                turn: r.turn,
+                t_send: r.t_send,
+                t_dispatch: r.t_dispatch,
+                t_first: r.t_first,
+                t_end: r.t_end,
+                tokens: r.tokens,
+                ok: r.err.is_none(),
+            })
+            .collect();
+        streams.sort_by(|a, b| {
+            a.t_send
+                .total_cmp(&b.t_send)
+                .then((a.conv, a.turn).cmp(&(b.conv, b.turn)))
+        });
 
         SampleMetrics {
             n: recs.len(),
@@ -1047,12 +1300,11 @@ impl SampleMetrics {
             bb_tok_s: rate(output_tokens, s.wall_s),
             steady_tok_s,
             ttft,
+            queue_wait,
             tpot,
-            concurrency: if duration_s > 0.0 {
-                e2e / duration_s
-            } else {
-                0.0
-            },
+            decode_concurrency: overlap.decode_concurrency,
+            overlap,
+            streams,
             tau,
             finish,
             routes,
@@ -1069,6 +1321,12 @@ impl SampleMetrics {
         }
     }
 
+    /// A K>1 sample whose streams did not actually decode together: invalid,
+    /// never aggregated.
+    pub fn overlap_failed(&self) -> bool {
+        self.overlap.required && !self.overlap.pass
+    }
+
     fn summary(map: &BTreeMap<String, usize>) -> String {
         map.iter()
             .map(|(k, v)| format!("{k}={v}"))
@@ -1076,21 +1334,46 @@ impl SampleMetrics {
             .join(",")
     }
 
-    /// One progress line per sample.
+    /// One progress line per sample. A sample that failed the overlap check
+    /// prints its verdict only: no throughput, no TTFT, nothing that could be
+    /// read as a C=k result.
     pub fn line(&self) -> String {
+        if self.overlap_failed() {
+            let v = &self.overlap;
+            let f = |x: Option<f64>, d: usize| x.map_or("-".to_owned(), |x| format!("{x:.d$}"));
+            return format!(
+                "FAIL (serialized): {}  [all-{} decoding {}  decode-conc {}  ttft R2 {} max/min {}]  \
+                 {}/{} ok  text_md5 {}",
+                v.reason.as_deref().unwrap_or("-"),
+                v.k,
+                v.frac_all_decoding
+                    .map_or("-".to_owned(), |x| format!("{:.0}%", x * 100.0)),
+                f(v.decode_concurrency, 2),
+                f(v.ttft_r2, 2),
+                f(v.ttft_max_min, 1),
+                self.n_ok,
+                self.n,
+                self.text_md5,
+            );
+        }
         let p =
             |x: Option<Pctl>| x.map_or("-".to_owned(), |x| format!("{:.0}/{:.0}", x.p50, x.p99));
         let q =
             |x: Option<Pctl>| x.map_or("-".to_owned(), |x| format!("{:.2}/{:.2}", x.p50, x.p99));
         format!(
-            "out {:.2} tok/s  bb {:.2}  steady {}  ttft {} ms  tpot {} ms  in-flight {:.2}  tau {}  \
+            "out {:.2} tok/s  bb {:.2}  steady {}  ttft {} ms  queue {} ms  tpot {} ms  \
+             decode-conc {}  overlap {}  tau {}  \
              {}/{} ok  {} tok in {:.1} s  finish {}  routes {}  cached {}  prompt {}  text_md5 {}",
             self.output_tok_s,
             self.bb_tok_s,
-            self.steady_tok_s.map_or("-".to_owned(), |x| format!("{x:.2}")),
+            self.steady_tok_s
+                .map_or("-".to_owned(), |x| format!("{x:.2}")),
             p(self.ttft),
+            p(self.queue_wait),
             q(self.tpot),
-            self.concurrency,
+            self.decode_concurrency
+                .map_or("-".to_owned(), |x| format!("{x:.2}")),
+            self.overlap.summary(),
             self.tau.map_or("-".to_owned(), |x| format!("{x:.3}")),
             self.n_ok,
             self.n,
@@ -1099,18 +1382,60 @@ impl SampleMetrics {
             Self::summary(&self.finish),
             Self::summary(&self.routes),
             self.cached_tokens,
-            self.prompt_tokens_mean.map_or("-".to_owned(), |x| format!("{x:.1}")),
+            self.prompt_tokens_mean
+                .map_or("-".to_owned(), |x| format!("{x:.1}")),
             self.text_md5,
         )
     }
+
+    fn json(&self, with_numbers: bool) -> Value {
+        let pj = |x: Option<Pctl>| {
+            x.map_or(
+                Value::Null,
+                |x| serde_json::json!({ "p50_ms": x.p50, "p99_ms": x.p99 }),
+            )
+        };
+        let mut v = serde_json::json!({
+            "n": self.n,
+            "n_ok": self.n_ok,
+            "text_md5": self.text_md5,
+            "overlap": self.overlap.json(),
+            "streams": self.streams.iter().map(StreamTimes::json).collect::<Vec<_>>(),
+        });
+        if with_numbers {
+            let o = v.as_object_mut().expect("object");
+            o.insert("output_tokens".into(), self.output_tokens.into());
+            o.insert("duration_s".into(), self.duration_s.into());
+            o.insert("output_tok_s".into(), self.output_tok_s.into());
+            o.insert("bb_tok_s".into(), self.bb_tok_s.into());
+            o.insert("steady_tok_s".into(), self.steady_tok_s.into());
+            o.insert("ttft_from_dispatch".into(), pj(self.ttft));
+            o.insert("queue_wait".into(), pj(self.queue_wait));
+            o.insert("tpot".into(), pj(self.tpot));
+            o.insert("decode_concurrency".into(), self.decode_concurrency.into());
+            o.insert("tau".into(), self.tau.into());
+            o.insert("finish".into(), serde_json::json!(self.finish));
+            o.insert("routes".into(), serde_json::json!(self.routes));
+            o.insert("batched".into(), self.batched.into());
+            o.insert("cached_tokens".into(), self.cached_tokens.into());
+            o.insert("errors".into(), serde_json::json!(self.errors));
+        }
+        v
+    }
 }
 
-/// All samples for one (backend, workload, k).
+/// All samples for one (backend, workload, k). `samples` holds only samples
+/// that passed every validity gate; `rejected` the ones that failed the
+/// overlap check, kept as evidence and never aggregated.
 pub struct Point {
     pub backend: &'static str,
     pub workload: &'static str,
     pub k: usize,
     pub samples: Vec<SampleMetrics>,
+    pub rejected: Vec<SampleMetrics>,
+    /// The no-batching baseline serves one request at a time on purpose. Its
+    /// K>1 cells still read `FAIL (serialized)`, but they do not fail the run.
+    pub serialized_by_design: bool,
 }
 
 fn med(samples: &[SampleMetrics], f: impl Fn(&SampleMetrics) -> Option<f64>) -> Option<f64> {
@@ -1118,15 +1443,49 @@ fn med(samples: &[SampleMetrics], f: impl Fn(&SampleMetrics) -> Option<f64>) -> 
     median(&mut xs)
 }
 
+/// K>1 cells with no passing sample because every sample was serialized,
+/// as `backend/workload k=K`. Any entry makes the run fail. The no-batching
+/// baseline is exempt: it is serialized by construction.
+pub fn failed_overlap_cells(points: &[Point]) -> Vec<String> {
+    points
+        .iter()
+        .filter(|p| {
+            p.k > 1 && p.samples.is_empty() && !p.rejected.is_empty() && !p.serialized_by_design
+        })
+        .map(|p| format!("{}/{} k={}", p.backend, p.workload, p.k))
+        .collect()
+}
+
+/// The sweep as JSON: every cell with its passing samples, and its rejected
+/// samples as verdict + per-stream times only (no throughput).
+pub fn render_json(points: &[Point], shape: BenchShape) -> Value {
+    let cells: Vec<Value> = points
+        .iter()
+        .map(|p| {
+            let failed = p.k > 1 && p.samples.is_empty() && !p.rejected.is_empty();
+            serde_json::json!({
+                "backend": p.backend,
+                "workload": p.workload,
+                "k": p.k,
+                "status": if failed { "FAIL (serialized)" } else { "ok" },
+                "serialized_by_design": p.serialized_by_design,
+                "samples": p.samples.iter().map(|m| m.json(true)).collect::<Vec<_>>(),
+                "rejected_samples": p.rejected.iter().map(|m| m.json(false)).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    serde_json::json!({ "shape": shape.label(), "cells": cells })
+}
+
 /// Render the comparison table: per point, the median over samples of each
 /// metric, and the min–max of output throughput.
 pub fn render_table(points: &[Point], shape: BenchShape) -> String {
     let bb = shape == BenchShape::BetterBench;
     let mut out = String::new();
-    fn row(cells: [&str; 3], out_tok_s: &str, bb_col: Option<&str>, rest: [&str; 8]) -> String {
+    fn row(cells: [&str; 3], out_tok_s: &str, bb_col: Option<&str>, rest: [&str; 9]) -> String {
         let bb_col = bb_col.map_or(String::new(), |c| format!("{c:>12}  "));
         format!(
-            "  {:<8} {:<10} {:>2}  {:<26}  {}{:>12}  {:>15}  {:>15}  {:>9}  {:>5}  {:>6}  {:<20}  {}\n",
+            "  {:<8} {:<10} {:>2}  {:<26}  {}{:>12}  {:>15}  {:>15}  {:>15}  {:>11}  {:>5}  {:>6}  {:<20}  {}\n",
             cells[0],
             cells[1],
             cells[2],
@@ -1139,7 +1498,8 @@ pub fn render_table(points: &[Point], shape: BenchShape) -> String {
             rest[4],
             rest[5],
             rest[6],
-            rest[7]
+            rest[7],
+            rest[8]
         )
     }
     out.push('\n');
@@ -1150,8 +1510,9 @@ pub fn render_table(points: &[Point], shape: BenchShape) -> String {
         [
             "steady tok/s",
             "TTFT p50/p99 ms",
+            "queue p50/p99 ms",
             "TPOT p50/p99 ms",
-            "in-flight",
+            "decode conc",
             "tau",
             "tokens",
             "finish",
@@ -1159,9 +1520,29 @@ pub fn render_table(points: &[Point], shape: BenchShape) -> String {
         ],
     ));
     let f2 = |x: Option<f64>| x.map_or("-".to_owned(), |x| format!("{x:.2}"));
+    let mut notes: Vec<String> = Vec::new();
     for p in points {
         let s = &p.samples;
+        if !p.rejected.is_empty() {
+            notes.push(format!(
+                "{}/{} k={}: {} of {} samples failed the overlap check (serialized) and are \
+                 excluded from every column",
+                p.backend,
+                p.workload,
+                p.k,
+                p.rejected.len(),
+                p.rejected.len() + s.len()
+            ));
+        }
         let Some(m) = med(s, |x| Some(x.output_tok_s)) else {
+            if !p.rejected.is_empty() {
+                out.push_str(&row(
+                    [p.backend, p.workload, &p.k.to_string()],
+                    "FAIL (serialized)",
+                    bb.then_some("-"),
+                    ["-"; 9],
+                ));
+            }
             continue;
         };
         let lo = s
@@ -1169,15 +1550,27 @@ pub fn render_table(points: &[Point], shape: BenchShape) -> String {
             .map(|x| x.output_tok_s)
             .fold(f64::INFINITY, f64::min);
         let hi = s.iter().map(|x| x.output_tok_s).fold(0.0, f64::max);
-        let ttft = format!(
-            "{}/{}",
-            med(s, |x| x.ttft.map(|t| t.p50)).map_or("-".to_owned(), |x| format!("{x:.0}")),
-            med(s, |x| x.ttft.map(|t| t.p99)).map_or("-".to_owned(), |x| format!("{x:.0}")),
+        let pair = |a: Option<f64>, b: Option<f64>, prec: usize| {
+            format!(
+                "{}/{}",
+                a.map_or("-".to_owned(), |x| format!("{x:.prec$}")),
+                b.map_or("-".to_owned(), |x| format!("{x:.prec$}"))
+            )
+        };
+        let ttft = pair(
+            med(s, |x| x.ttft.map(|t| t.p50)),
+            med(s, |x| x.ttft.map(|t| t.p99)),
+            0,
         );
-        let tpot = format!(
-            "{}/{}",
-            f2(med(s, |x| x.tpot.map(|t| t.p50))),
-            f2(med(s, |x| x.tpot.map(|t| t.p99))),
+        let queue = pair(
+            med(s, |x| x.queue_wait.map(|t| t.p50)),
+            med(s, |x| x.queue_wait.map(|t| t.p99)),
+            0,
+        );
+        let tpot = pair(
+            med(s, |x| x.tpot.map(|t| t.p50)),
+            med(s, |x| x.tpot.map(|t| t.p99)),
+            2,
         );
         // Finish/batched/cached/errors are summed over samples: one
         // `stop` or one unbatched request in any sample must be visible.
@@ -1200,8 +1593,9 @@ pub fn render_table(points: &[Point], shape: BenchShape) -> String {
             [
                 &f2(med(s, |x| x.steady_tok_s)),
                 &ttft,
+                &queue,
                 &tpot,
-                &f2(med(s, |x| Some(x.concurrency))),
+                &f2(med(s, |x| x.decode_concurrency)),
                 &med(s, |x| x.tau).map_or("-".to_owned(), |x| format!("{x:.3}")),
                 &med(s, |x| Some(x.output_tokens as f64))
                     .map_or("-".to_owned(), |x| format!("{x:.0}")),
@@ -1213,11 +1607,20 @@ pub fn render_table(points: &[Point], shape: BenchShape) -> String {
     out.push_str(
         "\n  out tok/s: vLLM output throughput, output tokens / (last end - first send), median\n\
          \x20 of the samples (min-max in brackets). steady: throughput while all k lanes were\n\
-         \x20 busy. TTFT/TPOT: medians of per-sample percentiles. in-flight: achieved\n\
-         \x20 concurrency, sum of request latencies / duration. tau: output tokens per verify\n\
+         \x20 busy. TTFT: first token - dispatch (the request written to the daemon); queue:\n\
+         \x20 dispatch - queue entry, the client-side wait, reported separately. TPOT: per-request\n\
+         \x20 decode step. TTFT/queue/TPOT: medians of per-sample percentiles. decode conc:\n\
+         \x20 time-weighted mean number of streams in decode ([first token, end]) over the steady\n\
+         \x20 window; a serialized run reads ~1 whatever k says. tau: output tokens per verify\n\
          \x20 window. tokens: median output tokens per sample. finish/batched/cached/errors:\n\
-         \x20 summed over samples (cached = prompt tokens served from the daemon's cache).\n",
+         \x20 summed over samples (cached = prompt tokens served from the daemon's cache).\n\
+         \x20 FAIL (serialized): no k>1 sample of the cell passed the overlap check (all k\n\
+         \x20 streams decoding together for >= 50% of the steady window, TTFT not linear in\n\
+         \x20 dispatch order); its numbers are not a C=k result and are not shown.\n",
     );
+    for n in notes {
+        out.push_str(&format!("  note: {n}\n"));
+    }
     if bb {
         out.push_str(
             "  bb agg: BetterBench aggregate_tps, output tokens / closed-loop wall clock.\n",
@@ -1263,6 +1666,7 @@ pub fn sweep_backend(
             continue;
         }
         let mut by_k: BTreeMap<usize, Vec<SampleMetrics>> = BTreeMap::new();
+        let mut rejected: BTreeMap<usize, Vec<SampleMetrics>> = BTreeMap::new();
         for (i, k) in sweep_order(points, runs).into_iter().enumerate() {
             d.check_k(k)?;
             d.sample_seq += 1;
@@ -1307,17 +1711,28 @@ pub fn sweep_backend(
                     m.errors.len()
                 );
             }
+            if m.overlap_failed() {
+                // Not a C=k result: kept only as evidence (verdict + per-stream
+                // times), never aggregated and never printed as throughput.
+                eprintln!("  [FAIL (serialized)] {label}/{} k={k}", arm.label());
+                rejected.entry(k).or_default().push(m);
+                continue;
+            }
             match sample_is_valid(arm, label, &m) {
                 Ok(()) => by_k.entry(k).or_default().push(m),
                 Err(why) => eprintln!("  [invalid] {label}/{} k={k}: {why}", arm.label()),
             }
         }
-        for (k, samples) in by_k {
+        let ks: std::collections::BTreeSet<usize> =
+            by_k.keys().chain(rejected.keys()).copied().collect();
+        for k in ks {
             out.push(Point {
                 backend: label,
                 workload: arm.label(),
                 k,
-                samples,
+                samples: by_k.remove(&k).unwrap_or_default(),
+                rejected: rejected.remove(&k).unwrap_or_default(),
+                serialized_by_design: d.serialized_by_design(),
             });
         }
     }
@@ -1518,8 +1933,9 @@ mod tests {
         assert!((m.ttft.unwrap().p50 - 500.0).abs() < 1e-9);
         // TPOT: 2.0/4, 4.0/4, 2.0/4 s → p50 0.5 s.
         assert!((m.tpot.unwrap().p50 - 500.0).abs() < 1e-9);
-        // Σ e2e = 2.5 + 4.5 + 2.5 = 9.5 over 5 s.
-        assert!((m.concurrency - 1.9).abs() < 1e-12);
+        // Window [0.5, 2.5]: both of the first two requests decode all of it.
+        assert!((m.decode_concurrency.unwrap() - 2.0).abs() < 1e-12);
+        assert!(m.overlap.pass && m.overlap.required);
         assert_eq!(m.tau, Some(2.0));
         assert_eq!(m.finish.get("length"), Some(&3));
         assert_eq!(m.batched, 3);
@@ -1560,6 +1976,8 @@ mod tests {
             workload: "stateless",
             k: 1,
             samples: vec![mk(1.0), mk(2.0), mk(4.0)],
+            rejected: vec![],
+            serialized_by_design: false,
         }];
         let table = render_table(&points, BenchShape::Steady);
         // 101 tokens over 1/2/4 s → 101 / 50.5 / 25.25; median 50.50.
@@ -1580,6 +1998,194 @@ mod tests {
         assert!(sample_is_valid(WorkloadSel::Multiturn, "slots", &hits).is_ok());
         assert!(sample_is_valid(WorkloadSel::Multiturn, "batch", &none).is_ok());
         assert!(sample_is_valid(WorkloadSel::Stateless, "slots", &none).is_ok());
+    }
+
+    fn recd(send: f64, disp: f64, first: f64, end: f64, tokens: u64) -> RequestRecord {
+        let mut r = rec(send, first, end, tokens);
+        r.t_dispatch = Some(disp);
+        r
+    }
+
+    /// K=8 closed loop: 8 lanes start at 0 and decode together; each lane
+    /// refills when its stream ends. Lanes in `early` hit EOS at `early_end`
+    /// and their replacement's first token takes `refill_ttft`.
+    fn overlapped_sample(early: &[usize], early_end: f64, refill_ttft: f64) -> Sample {
+        let mut records = Vec::new();
+        for i in 0..8 {
+            let end = if early.contains(&i) {
+                early_end
+            } else {
+                4.0 + 0.1 * i as f64
+            };
+            records.push(recd(0.0, 0.0, 0.3 + 0.01 * i as f64, end, 64));
+            records.push(recd(end, end, end + refill_ttft, end + 4.0, 64));
+        }
+        Sample {
+            k: 8,
+            records,
+            wall_s: 9.0,
+        }
+    }
+
+    /// Back-to-back decode intervals, one request on the daemon at a time:
+    /// what the no-batching path (or a broken batch route) does at K=8.
+    fn serialized_sample(requests: usize) -> Sample {
+        let mut records = Vec::new();
+        for i in 0..requests {
+            let t = i as f64 * 4.0;
+            let send = if i < 8 {
+                0.0
+            } else {
+                (i - 8) as f64 * 4.0 + 4.0
+            };
+            records.push(recd(send, t, t + 0.3, t + 4.0, 64));
+        }
+        Sample {
+            k: 8,
+            records,
+            wall_s: requests as f64 * 4.0,
+        }
+    }
+
+    #[test]
+    fn overlapped_k8_sample_passes() {
+        let m = SampleMetrics::from_sample(&overlapped_sample(&[], 0.0, 0.3));
+        let v = &m.overlap;
+        assert!(v.required && v.pass, "{v:?}");
+        assert!(v.frac_all_decoding.unwrap() >= 0.5, "{v:?}");
+        assert!(m.decode_concurrency.unwrap() > 7.0, "{v:?}");
+        assert!(!v.ttft_linear, "{v:?}");
+        assert!(!m.overlap_failed());
+    }
+
+    #[test]
+    fn serialized_k8_sample_fails() {
+        let m = SampleMetrics::from_sample(&serialized_sample(16));
+        let v = &m.overlap;
+        assert!(m.overlap_failed(), "{v:?}");
+        // One stream in decode at a time, TTFT (from queue entry) linear in
+        // dispatch order.
+        assert!(v.frac_all_decoding.unwrap() < 0.1, "{v:?}");
+        assert!((m.decode_concurrency.unwrap() - 1.0).abs() < 1e-9, "{v:?}");
+        assert!(v.ttft_linear, "{v:?}");
+        let reason = v.reason.as_deref().unwrap();
+        assert!(
+            reason.contains("steady window") && reason.contains("TTFT"),
+            "{reason}"
+        );
+        // TTFT is from dispatch (0.3 s each); the wait is reported apart.
+        assert!((m.ttft.unwrap().p50 - 300.0).abs() < 1e-6);
+        assert!(m.queue_wait.unwrap().p50 > 1000.0);
+        // A failing sample's line carries no throughput.
+        let line = m.line();
+        assert!(line.starts_with("FAIL (serialized)"), "{line}");
+        assert!(!line.contains("tok/s"), "{line}");
+    }
+
+    #[test]
+    fn degenerate_steady_window_at_k_gt_1_fails() {
+        // Eight serial requests, nothing after: the window is empty.
+        let m = SampleMetrics::from_sample(&serialized_sample(8));
+        assert!(m.overlap.window.is_none());
+        assert!(m.steady_tok_s.is_none());
+        assert!(m.overlap_failed());
+        assert!(m.overlap.reason.as_deref().unwrap().contains("degenerate"));
+    }
+
+    /// Documents early-EOS behaviour. A brief straggler (one lane hits EOS,
+    /// its refill reaches first token 0.3 s later) dips below K for a moment
+    /// and still passes; half the lanes ending early with slow refills leave
+    /// K streams together for too little of the window and fail, because
+    /// that sample did not hold K streams in decode.
+    #[test]
+    fn early_eos_straggler_behaviour() {
+        let brief = SampleMetrics::from_sample(&overlapped_sample(&[3], 1.0, 0.3));
+        assert!(brief.overlap.pass, "{:?}", brief.overlap);
+        let f = brief.overlap.frac_all_decoding.unwrap();
+        assert!(f < 1.0 && f >= 0.5, "{f}");
+        assert!(brief.decode_concurrency.unwrap() < 8.0);
+
+        let many = SampleMetrics::from_sample(&overlapped_sample(&[0, 1, 2, 3], 0.5, 3.0));
+        assert!(many.overlap_failed(), "{:?}", many.overlap);
+        assert!(many.overlap.frac_all_decoding.unwrap() < 0.5);
+        assert!(!many.overlap.ttft_linear);
+    }
+
+    #[test]
+    fn k1_is_never_judged() {
+        let s = Sample {
+            k: 1,
+            records: vec![recd(0.0, 0.0, 0.5, 2.0, 5), recd(2.0, 2.0, 2.5, 4.0, 5)],
+            wall_s: 4.0,
+        };
+        let m = SampleMetrics::from_sample(&s);
+        assert!(!m.overlap.required && m.overlap.pass);
+        assert!(!m.overlap_failed());
+        assert!(m.line().contains("n/a (k=1)"));
+    }
+
+    #[test]
+    fn failed_cell_is_marked_not_aggregated_and_fails_the_run() {
+        let bad = || SampleMetrics::from_sample(&serialized_sample(16));
+        let good = SampleMetrics::from_sample(&overlapped_sample(&[], 0.0, 0.3));
+        let mk = |samples, rejected, by_design| Point {
+            backend: "batch",
+            workload: "stateless",
+            k: 8,
+            samples,
+            rejected,
+            serialized_by_design: by_design,
+        };
+        // No passing sample: FAIL cell, no numbers, run fails.
+        let points = vec![mk(vec![], vec![bad(), bad()], false)];
+        let table = render_table(&points, BenchShape::Steady);
+        assert!(table.contains("FAIL (serialized)"), "{table}");
+        assert!(
+            !table
+                .lines()
+                .any(|l| l.trim_start().starts_with("batch ") && l.contains("tok/s")),
+            "{table}"
+        );
+        assert_eq!(failed_overlap_cells(&points), vec!["batch/stateless k=8"]);
+        // The no-batching baseline reads FAIL but does not fail the run.
+        let by_design = vec![mk(vec![], vec![bad()], true)];
+        assert!(failed_overlap_cells(&by_design).is_empty());
+        assert!(render_table(&by_design, BenchShape::Steady).contains("FAIL (serialized)"));
+        // A passing sample keeps the cell; the failed one is excluded and noted.
+        let mixed = vec![mk(vec![good], vec![bad()], false)];
+        assert!(failed_overlap_cells(&mixed).is_empty());
+        let table = render_table(&mixed, BenchShape::Steady);
+        assert!(!table.contains("FAIL (serialized)  "), "{table}");
+        assert!(
+            table.contains("1 of 2 samples failed the overlap check"),
+            "{table}"
+        );
+    }
+
+    #[test]
+    fn json_carries_per_stream_times_and_verdict() {
+        let bad = SampleMetrics::from_sample(&serialized_sample(16));
+        let points = vec![Point {
+            backend: "batch",
+            workload: "stateless",
+            k: 8,
+            samples: vec![],
+            rejected: vec![bad],
+            serialized_by_design: false,
+        }];
+        let j = render_json(&points, BenchShape::Steady);
+        let cell = &j["cells"][0];
+        assert_eq!(cell["status"], "FAIL (serialized)");
+        let rej = &cell["rejected_samples"][0];
+        assert_eq!(rej["overlap"]["pass"], false);
+        assert!(rej["overlap"]["frac_all_decoding"].is_number());
+        assert!(rej["overlap"]["reason"].is_string());
+        let s0 = &rej["streams"][0];
+        for key in ["t_send", "t_dispatch", "t_first", "t_end"] {
+            assert!(s0[key].is_number(), "{key}");
+        }
+        // No throughput for a failed sample.
+        assert!(rej.get("output_tok_s").is_none());
     }
 
     #[test]

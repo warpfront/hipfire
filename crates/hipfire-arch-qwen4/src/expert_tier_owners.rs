@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use hip_bridge::{DeviceBuffer, HipRuntime, HIP_HOST_MALLOC_MAPPED};
 use hipfire_runtime::hfq_parallel::{
-    self, DeviceRangeCopy, DirectSource, HostRangeCopy, HFQ_READER_LANES,
+    self, reader_tuning, DeviceRangeCopy, DirectSource, HostRangeCopy,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -564,6 +564,11 @@ pub struct ExpertTierBinding {
     /// Raw SHA-256 (hex) of the hot-set sidecar, identity metadata bound once
     /// by the loader after materialization.
     hotset_sidecar_sha256: std::sync::OnceLock<String>,
+    /// Per-expert routing counts of the hot-set sidecar (`layer * 512 +
+    /// expert`), bound once by the loader after materialization. Read only by
+    /// the D2 PCIe-share partition ([`ExpertTierLease::hotset_layer_counts`]);
+    /// never part of the plan, its digest or any table.
+    hotset_counts: std::sync::OnceLock<Arc<[u64]>>,
     logical_digest: [u8; 32],
     /// Set while one forward owns the donor tail's borrow protocol
     /// ([`ExpertTierLease::claim_decode_share`]).
@@ -659,6 +664,35 @@ impl ExpertTierLease {
                 "hot-set sidecar digest already bound to {bound}, refusing {sha256_hex}"
             ))
         }
+    }
+
+    /// Record the sidecar's per-expert routing counts (`layer * 512 + expert`,
+    /// all `24,576` of them). The loader calls it once after `materialize`,
+    /// next to [`Self::bind_hotset_sidecar_sha256`]. Recording the same counts
+    /// again is accepted; different counts or a wrong length are refused.
+    pub fn bind_hotset_counts(&self, counts: &[u64]) -> Result<(), String> {
+        if counts.len() != TOTAL_EXPERTS {
+            return Err(format!(
+                "hot-set counts hold {} entries, expected {TOTAL_EXPERTS}",
+                counts.len()
+            ));
+        }
+        let bound = self
+            .binding
+            .hotset_counts
+            .get_or_init(|| Arc::from(counts.to_vec()));
+        if &**bound == counts {
+            Ok(())
+        } else {
+            Err("hot-set counts already bound to different values".to_string())
+        }
+    }
+
+    /// Routing counts of trunk `layer`'s 512 experts from the bound sidecar;
+    /// `None` when none were bound or `layer` is not a trunk layer.
+    pub fn hotset_layer_counts(&self, layer: usize) -> Option<&[u64]> {
+        let counts = self.binding.hotset_counts.get()?;
+        counts.get(layer * EXPERTS..(layer + 1) * EXPERTS)
     }
 
     /// The sidecar SHA-256 bound by [`Self::bind_hotset_sidecar_sha256`], if any.
@@ -1222,7 +1256,7 @@ unsafe fn fill_host_spans(
         })
         .collect::<Result<Vec<_>, ExpertTierOwnerError>>()?;
     // SAFETY: forwarded from the caller's contract.
-    unsafe { hfq_parallel::read_ranges_into_host(source, &copies, HFQ_READER_LANES) }
+    unsafe { hfq_parallel::read_ranges_into_host(source, &copies, reader_tuning()) }
         .map_err(|error| ExpertTierOwnerError::Source(error.to_string()))
 }
 
@@ -1240,6 +1274,7 @@ impl ExpertTierOwners {
             return Ok(());
         }
         let bytes = usize::try_from(bytes).map_err(|_| ExpertTierOwnerError::Overflow)?;
+        hip_bridge::declare_qwen4_host_mapping("Qwen4 expert-tier host payload");
         let alloc_started = std::time::Instant::now();
         let _alloc_phase = AllocPhase(alloc_started, bytes as u64);
         let cpu = self
@@ -1343,7 +1378,7 @@ impl ExpertTierOwners {
                 })
                 .collect::<Result<Vec<_>, ExpertTierOwnerError>>()?;
             let stats =
-                hfq_parallel::upload_ranges_to_device(gpu, source, &copies, HFQ_READER_LANES)
+                hfq_parallel::upload_ranges_to_device(gpu, source, &copies, reader_tuning())
                     .map_err(ExpertTierOwnerError::Source)?;
             record_direct_stats(stats);
             rdna_compute::load_phases::add(
@@ -1754,6 +1789,7 @@ fn materialize_impl<'src>(
     };
     let binding = Arc::new(ExpertTierBinding {
         hotset_sidecar_sha256: std::sync::OnceLock::new(),
+        hotset_counts: std::sync::OnceLock::new(),
         decode_share_claimed: std::sync::atomic::AtomicBool::new(false),
         owner_ranges,
         host_cpu_range: owners
@@ -2683,7 +2719,14 @@ mod tests {
                 })
                 .collect();
             // SAFETY: every extent was checked inside the device owner image.
-            unsafe { hfq_parallel::read_ranges_into_host(&source, &device_reads, 4) }.unwrap();
+            unsafe {
+                hfq_parallel::read_ranges_into_host(
+                    &source,
+                    &device_reads,
+                    hfq_parallel::ReaderTuning::LEGACY,
+                )
+            }
+            .unwrap();
             for (tier, image) in [
                 (Placement::HostMapped, &owner),
                 (Placement::Device, &device),
@@ -3040,6 +3083,7 @@ mod decode_share_tests {
             }
         });
         ExpertTierBinding {
+            hotset_counts: std::sync::OnceLock::new(),
             logical_digest: plan.logical_digest(),
             plan,
             tables,

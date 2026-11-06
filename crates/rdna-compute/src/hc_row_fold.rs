@@ -49,6 +49,15 @@ pub struct HcRowFold<'a> {
     pub hidden: usize,
 }
 
+/// The EP partial tile mask's owner table, for the owner-masked rank order
+/// ([`Gpu::moe_combine_order_top10_owned`]): an i32 owner rank per expert and
+/// this rank. A rank whose expert another rank owns gets grouped row `-1`.
+#[derive(Clone, Copy)]
+pub struct CombineOwners<'a> {
+    pub table: &'a GpuTensor,
+    pub rank: usize,
+}
+
 impl Gpu {
     /// `moe_combine_order_top10` alone: the per-token rank order (`order`, at
     /// least `tokens * 10 * 8` bytes) the BF16-row combine and the HC row fold
@@ -64,6 +73,36 @@ impl Gpu {
         tokens: usize,
         n_experts: usize,
     ) -> HipResult<()> {
+        self.moe_combine_order_top10_owned(
+            inverse_perm,
+            topk_indices,
+            topk_weights,
+            order,
+            grouped_rows,
+            tokens,
+            n_experts,
+            None,
+        )
+    }
+
+    /// [`Gpu::moe_combine_order_top10`], with `owners` (the EP partial tile mask,
+    /// `HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO`) the owner-masked symbol
+    /// `moe_combine_order_top10_owned`: every rank whose expert another rank owns
+    /// keeps its place and BF16 weight with grouped row `-1`, which every consumer
+    /// reads as a +0 BF16 row. Bytewise the unmasked order over a grouped buffer
+    /// whose foreign rows are +0, without reading those rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_combine_order_top10_owned(
+        &mut self,
+        inverse_perm: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        order: &GpuTensor,
+        grouped_rows: usize,
+        tokens: usize,
+        n_experts: usize,
+        owners: Option<CombineOwners<'_>>,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         if order.buf.size() < tokens * 10 * 8 {
             return Err(HipError::new(
@@ -71,12 +110,6 @@ impl Gpu {
                 "moe_combine_order_top10: order scratch too small",
             ));
         }
-        const FUNC: &str = "moe_combine_order_top10";
-        self.ensure_kernel(
-            "moe_down_combine_grouped_top10",
-            kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC,
-            FUNC,
-        )?;
         let ip = inverse_perm.buf.as_ptr();
         let tp = topk_indices.buf.as_ptr();
         let wp = topk_weights.buf.as_ptr();
@@ -84,6 +117,54 @@ impl Gpu {
         let gr = grouped_rows as i32;
         let tv = tokens as i32;
         let nx = n_experts as i32;
+        let grid = [(tokens as u32).div_ceil(64), 1, 1];
+        let Some(owners) = owners else {
+            self.ensure_kernel(
+                "moe_down_combine_grouped_top10",
+                kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC,
+                "moe_combine_order_top10",
+            )?;
+            let mut params = [
+                &ip as *const _ as *mut c_void,
+                &tp as *const _ as *mut c_void,
+                &wp as *const _ as *mut c_void,
+                &op as *const _ as *mut c_void,
+                &gr as *const _ as *mut c_void,
+                &tv as *const _ as *mut c_void,
+                &nx as *const _ as *mut c_void,
+            ];
+            return self.launch_maybe_blob(
+                "moe_combine_order_top10",
+                grid,
+                [64, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = KernargBlob::new();
+                    b.push_ptr(ip);
+                    b.push_ptr(tp);
+                    b.push_ptr(wp);
+                    b.push_ptr(op);
+                    b.push_i32(gr);
+                    b.push_i32(tv);
+                    b.push_i32(nx);
+                    b
+                },
+            );
+        };
+        if owners.table.buf.size() < n_experts * 4 || owners.rank > i32::MAX as usize {
+            return Err(HipError::new(
+                0,
+                "moe_combine_order_top10_owned: owner table holds fewer than n_experts i32 or rank exceeds i32",
+            ));
+        }
+        self.ensure_kernel(
+            "moe_combine_order_owned",
+            kernels::MOE_COMBINE_ORDER_OWNED_SRC,
+            "moe_combine_order_top10_owned",
+        )?;
+        let owner = owners.table.buf.as_ptr();
+        let rank = owners.rank as i32;
         let mut params = [
             &ip as *const _ as *mut c_void,
             &tp as *const _ as *mut c_void,
@@ -92,10 +173,12 @@ impl Gpu {
             &gr as *const _ as *mut c_void,
             &tv as *const _ as *mut c_void,
             &nx as *const _ as *mut c_void,
+            &owner as *const _ as *mut c_void,
+            &rank as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            FUNC,
-            [(tokens as u32).div_ceil(64), 1, 1],
+            "moe_combine_order_top10_owned",
+            grid,
             [64, 1, 1],
             0,
             &mut params,
@@ -108,6 +191,8 @@ impl Gpu {
                 b.push_i32(gr);
                 b.push_i32(tv);
                 b.push_i32(nx);
+                b.push_ptr(owner);
+                b.push_i32(rank);
                 b
             },
         )

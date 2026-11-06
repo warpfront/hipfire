@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/private_load_before_publish.rs:17:25
+   |
+17 |         wg.private_load(&w, "ds_load_b32 v3, v1".into())?;
+   |            ------------ ^^ expected `&WaveRegion<_, Owned>`, found `&WaveRegion<Scratch, Writing>`
+   |            |
+   |            arguments to this method are incorrect
+   |
+   = note: expected reference `&WaveRegion<_, peacemaker_author::Owned>`
+              found reference `&WaveRegion<Scratch, Writing>`
+note: method defined here
+  --> src/scope.rs
+   |
+   |     pub fn private_load<R>(
+   |            ^^^^^^^^^^^^

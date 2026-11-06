@@ -78,6 +78,13 @@ impl Qwen4TrunkOverlay {
         self.default
     }
 
+    /// Device bytes the overlay adds to the base weights once applied (see
+    /// [`BoundTrunkOverlay::net_extra_bytes`]); a placement that budgets before
+    /// `attach_forward` charges `max(0, ..)` of it.
+    pub fn net_extra_bytes(&self) -> i64 {
+        self.bound.net_extra_bytes()
+    }
+
     pub fn bound(&self) -> &BoundTrunkOverlay {
         &self.bound
     }
@@ -168,10 +175,14 @@ fn applied_line_for(
     base: &TrunkOverlayBase,
     applied: &TrunkOverlayApplied,
 ) -> String {
+    let tensors = match (applied.tensors - applied.qt3_tensors, applied.qt3_tensors) {
+        (qt44, 0) => format!("{qt44} QT44"),
+        (0, qt3) => format!("{qt3} QT3 (Q8F16)"),
+        (qt44, qt3) => format!("{qt44} QT44 + {qt3} QT3 (Q8F16)"),
+    };
     format!(
-        "{LOG_PREFIX}applied {} QT44 tensors from {} (default {}; bound to base {} B, \
+        "{LOG_PREFIX}applied {tensors} tensors from {} (default {}; bound to base {} B, \
          index sha256 {}, file sha256 {}; {} -> {} bytes)",
-        applied.tensors,
         path.display(),
         default.marker(),
         base.file_bytes,
@@ -199,30 +210,64 @@ pub fn resolve_trunk_overlay(
     gpu_arch: &str,
     config: &Qwen4Config,
 ) -> Result<Option<Qwen4TrunkOverlay>, String> {
+    resolve_overlay(hfq, model_path, gpu_arch, config, true)
+}
+
+/// Resident device bytes the sidecar next to `model_path` adds to the base
+/// weights once applied: `max(0, net_extra_bytes)` of the overlay
+/// [`resolve_trunk_overlay`] would accept for this load, `0` when none applies.
+/// Silent (it logs nothing: the load's own resolve logs the outcome once), so
+/// plan-time placement and per-rank budgets can charge the same number the
+/// load will add after placement ran.
+pub fn trunk_overlay_extra_bytes(
+    hfq: &HfqFile,
+    model_path: &Path,
+    gpu_arch: &str,
+    config: &Qwen4Config,
+) -> Result<u64, String> {
+    Ok(
+        resolve_overlay(hfq, model_path, gpu_arch, config, false)?.map_or(0, |overlay| {
+            u64::try_from(overlay.net_extra_bytes()).unwrap_or(0)
+        }),
+    )
+}
+
+fn resolve_overlay(
+    hfq: &HfqFile,
+    model_path: &Path,
+    gpu_arch: &str,
+    config: &Qwen4Config,
+    log: bool,
+) -> Result<Option<Qwen4TrunkOverlay>, String> {
+    let say = |line: String| {
+        if log {
+            eprintln!("{line}");
+        }
+    };
     let policy = TrunkOverlayPolicy::from_env()?;
     let path = trunk_overlay_sidecar_path(model_path);
     match std::fs::metadata(&path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            eprintln!(
-                "{}",
-                overlay_refusal_line(&path, &format!("cannot stat the sidecar: {error}"))
-            );
+            say(overlay_refusal_line(
+                &path,
+                &format!("cannot stat the sidecar: {error}"),
+            ));
             return Ok(None);
         }
     }
     if policy == TrunkOverlayPolicy::Off {
         let decision = decide_overlay(policy, gpu_arch, "", false, None);
         if let Some(line) = overlay_line(&path, &decision) {
-            eprintln!("{line}");
+            say(line);
         }
         return Ok(None);
     }
     let bound = match bind_trunk_overlay(hfq, &path) {
         Ok(bound) => bound,
         Err(reason) => {
-            eprintln!("{}", overlay_refusal_line(&path, &reason));
+            say(overlay_refusal_line(&path, &reason));
             return Ok(None);
         }
     };
@@ -237,7 +282,7 @@ pub fn resolve_trunk_overlay(
         OverlayDecision::Apply(default) => Ok(Some(Qwen4TrunkOverlay { bound, default })),
         other => {
             if let Some(line) = overlay_line(&path, &other) {
-                eprintln!("{line}");
+                say(line);
             }
             Ok(None)
         }
@@ -285,6 +330,23 @@ mod tests {
             decide_overlay(auto, "gfx1201", MARKER, true, None),
             OverlayDecision::Skip(
                 "not applied on gfx1201 (overlay default gfx1151-zab-v1 is gfx1151 only; \
+                 HIPFIRE_QWEN4_TRUNK_OVERLAY=1 applies it)"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn the_q8f16_marker_applies_under_auto_on_gfx1201_only() {
+        let auto = TrunkOverlayPolicy::Auto;
+        assert_eq!(
+            decide_overlay(auto, "gfx1201", "gfx1201-q8f16-v1", true, None),
+            OverlayDecision::Apply(TrunkIu4Default::Gfx1201Q8f16V1)
+        );
+        assert_eq!(
+            decide_overlay(auto, "gfx1151", "gfx1201-q8f16-v1", true, None),
+            OverlayDecision::Skip(
+                "not applied on gfx1151 (overlay default gfx1201-q8f16-v1 is gfx1201 only; \
                  HIPFIRE_QWEN4_TRUNK_OVERLAY=1 applies it)"
                     .to_string()
             )
@@ -346,6 +408,7 @@ mod tests {
         };
         let applied = TrunkOverlayApplied {
             tensors: 108,
+            qt3_tensors: 0,
             before_bytes: 400,
             after_bytes: 300,
         };
@@ -360,6 +423,31 @@ mod tests {
              (default gfx1151-zab-v1; bound to base 125144775192 B, index sha256 0123456789ab, \
              file sha256 fedcba987654; 400 -> 300 bytes)"
         );
+    }
+
+    #[test]
+    fn applied_line_names_the_q8f16_tensors() {
+        let base = TrunkOverlayBase {
+            file_bytes: 7,
+            index_sha256: "0123456789abcdef".repeat(4),
+            sha256: "fedcba9876543210".repeat(4),
+        };
+        let line = |tensors, qt3_tensors| {
+            applied_line_for(
+                Path::new("/m/q.trunk-overlay"),
+                TrunkIu4Default::Gfx1151ZabV1,
+                &base,
+                &TrunkOverlayApplied {
+                    tensors,
+                    qt3_tensors,
+                    before_bytes: 1,
+                    after_bytes: 2,
+                },
+            )
+        };
+        assert!(line(60, 60).contains("applied 60 QT3 (Q8F16) tensors from "));
+        assert!(line(60, 12).contains("applied 48 QT44 + 12 QT3 (Q8F16) tensors from "));
+        assert!(line(60, 0).contains("applied 60 QT44 tensors from "));
     }
 
     #[test]

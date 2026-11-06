@@ -67,6 +67,9 @@ const VOP1_DPP: &[Field] = &[
     f!("BANK_MASK", 56, 4),
     f!("ROW_MASK", 60, 4),
 ];
+// DPP8 (SRC0 selector 0xe9): word 1 is VSRC0[7:0] and eight 3-bit lane selects in [31:8]. FI is carried by the
+// separate selector 0xea (DPP8FI), which no table row models.
+const VOP1_DPP8: &[Field] = &[f!("VDST", 17, 8), f!("SRC0", 32, 8), f!("LANE_SEL", 40, 24)];
 const VOP2_DPP: &[Field] = &[
     f!("VDST", 17, 8),
     f!("SRC0", 32, 8),
@@ -168,6 +171,7 @@ pub(super) fn layout(form: Form) -> &'static [Field] {
         Form::Smem => SMEM,
         Form::Vop1 => VOP1,
         Form::Vop1Dpp => VOP1_DPP,
+        Form::Vop1Dpp8 => VOP1_DPP8,
         Form::Vop2 => VOP2,
         Form::Vop2Dpp => VOP2_DPP,
         Form::Vopc => VOPC,
@@ -199,7 +203,7 @@ pub(super) fn opcode(form: Form) -> Option<Field> {
         Form::Sopc | Form::Sopp => f!("OP", 16, 7),
         Form::Sopk => f!("OP", 23, 5),
         Form::Smem => f!("OP", 13, 6),
-        Form::Vop1 | Form::Vop1Dpp => f!("OP", 9, 7),
+        Form::Vop1 | Form::Vop1Dpp | Form::Vop1Dpp8 => f!("OP", 9, 7),
         Form::Vop2 | Form::Vop2Dpp => f!("OP", 25, 6),
         Form::Vopc => f!("OP", 17, 8),
         Form::Vop3 => f!("OP", 16, 10),
@@ -227,7 +231,7 @@ pub(super) fn prefix(form: Form) -> Option<(u32, u32)> {
         Form::Sopk => (0xf000_0000, 0xb000_0000),
         Form::Sopp => (0xff80_0000, 0xbf80_0000),
         Form::Smem => (0xfc00_0000, 0xf400_0000),
-        Form::Vop1 | Form::Vop1Dpp => (0xfe00_0000, 0x7e00_0000),
+        Form::Vop1 | Form::Vop1Dpp | Form::Vop1Dpp8 => (0xfe00_0000, 0x7e00_0000),
         Form::Vop2 | Form::Vop2Dpp => (0x8000_0000, 0),
         Form::Vopc => (0xfe00_0000, 0x7c00_0000),
         Form::Vop3 => (0xfc00_0000, 0xd400_0000),

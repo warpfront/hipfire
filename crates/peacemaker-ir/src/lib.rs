@@ -537,6 +537,76 @@ mod tests {
         }));
     }
 
+    /// FMAMK/FMAAK write `D = S0*K+S1` / `S0*S1+K`: the destination is never
+    /// read. (True FMAC accumulators keep reading it.)
+    #[test]
+    fn literal_fma_destination_is_not_a_use_but_fmac_accumulator_is() {
+        use effects::Effects;
+        use operand::Operand;
+        use reg::{Kind, RegRef};
+        let tables: [(Arch, &[isa::OpRow]); 3] = [
+            (Arch::Gfx1201, isa::gfx12()),
+            (Arch::Gfx1100, isa::gfx1100()),
+            (Arch::Gfx1151, isa::gfx1151()),
+        ];
+        let mut checked = 0;
+        for (arch, table) in tables {
+            for row in table {
+                let literal_fma = matches!(
+                    row.name,
+                    "s_fmamk_f32"
+                        | "s_fmaak_f32"
+                        | "v_fmamk_f32"
+                        | "v_fmaak_f32"
+                        | "v_dual_fmamk_f32"
+                        | "v_dual_fmaak_f32"
+                );
+                let accumulator = matches!(row.name, "v_fmac_f32_e32" | "v_dual_fmac_f32");
+                if !literal_fma && !accumulator {
+                    continue;
+                }
+                // Slot order is the operand order; distinct registers per slot.
+                let mut dst = None;
+                let mut srcs = Vec::new();
+                let mut operands = Vec::new();
+                for (i, (slot, _)) in row.slots(false).enumerate() {
+                    let base = 100 + i as u16;
+                    let kind = if slot.starts_with('S') && !slot.starts_with("SRC") {
+                        Kind::S
+                    } else {
+                        Kind::V
+                    };
+                    let r = RegRef { kind, base, len: 1 };
+                    if slot == "LITERAL" {
+                        operands.push(Operand::Literal(0x3b80_0000));
+                    } else if matches!(slot, "VDST" | "VDSTX" | "SDST") {
+                        dst = Some(r);
+                        operands.push(Operand::Reg(r));
+                    } else {
+                        srcs.push(r);
+                        operands.push(Operand::Reg(r));
+                    }
+                }
+                let dst = dst.unwrap();
+                let fx =
+                    Effects::from_table(arch, row.op, row.form, &operands, &Default::default())
+                        .unwrap_or_else(|e| panic!("{arch:?} {}: {e}", row.name));
+                assert_eq!(fx.defs.as_slice(), &[dst], "{arch:?} {}", row.name);
+                for src in &srcs {
+                    assert!(fx.uses.contains(src), "{arch:?} {} reads {src:?}", row.name);
+                }
+                assert_eq!(
+                    fx.uses.contains(&dst),
+                    accumulator,
+                    "{arch:?} {}: destination read iff accumulator",
+                    row.name
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 16, "only {checked} rows checked");
+    }
+
     #[test]
     fn partial_writes_and_hidden_compare_destination_have_real_dependencies() {
         use effects::{Effects, ImplicitSet};

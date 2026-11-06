@@ -20,8 +20,9 @@ use crate::{
 
 /// Largest explicit kernarg image a contract may declare.
 pub const MAX_EXPLICIT_BYTES: usize = 512;
-/// Largest number of params / explicit fields a contract may declare.
-pub const MAX_FIELDS: usize = 32;
+/// Largest number of params / explicit fields a contract may declare (`raon_rda_conv_prepare_w128_f32`
+/// takes 33 kernel arguments).
+pub const MAX_FIELDS: usize = 40;
 /// Operands are tracked in a `u64` bitmask.
 const MAX_OPERANDS: usize = 64;
 /// Per-workgroup LDS limit of every supported arch.

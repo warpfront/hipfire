@@ -32,7 +32,8 @@ use peacemaker_ir::edit::analyze;
 use peacemaker_ir::inst::{Abi, Arch, Frontend, Kernel, KernelOrigin, Program};
 use peacemaker_ir::kernarg::{
     AccessClass, AccessMode, ArgFacts, ArgRole, Guard, IndexExt, IndexLoad, IndexedArgEffect,
-    KernargFacts, KernelStatus, MemPath, ReadCacheClass, RegionBound,
+    KernargFacts, KernelStatus, MemPath, ReadCacheClass, RegionBound, SealedAccess, SealedBound,
+    SealedEntryLoad, SealedTableUse,
 };
 use peacemaker_ir::passes::kernargs;
 use peacemaker_lift::kd::DescriptorCodec;
@@ -46,14 +47,17 @@ use sha2::{Digest, Sha256};
 pub use railgun_corpus::receipt::{
     case_digest, ArgCheck, ArgRecord, Check, Differential, DwordRecord, GuardRecord,
     ImplicitRecord, IndexLoadRecord, IndexedEffectRecord, KernelIdentity, KernelRecord,
-    RailgunSection, Receipt, SideRecord, Tool, UnresolvedRecord, RAILGUN_SECTION_VERSION,
-    RECEIPT_SCHEMA, RECEIPT_SCHEMA_VERSION, STATUS_CONDITIONAL, STATUS_PROVEN, STATUS_UNKNOWN,
+    RailgunSection, Receipt, SealedAccessRecord, SealedEntryRecord, SealedTableRecord, SideRecord,
+    Tool, UnresolvedRecord, KNOWN_WITNESSES, RAILGUN_SECTION_VERSION, RECEIPT_SCHEMA,
+    RECEIPT_SCHEMA_VERSION, SEALED_BOUND_CONST, SEALED_BOUND_KERNARG, STATUS_CONDITIONAL,
+    STATUS_PROVEN, STATUS_UNKNOWN, WITNESS_INDEXED_BIND, WITNESS_SEALED_TABLE,
 };
 
 /// Stated in every receipt: what a `Proven` A1 verdict rests on.
 pub const ASSUMPTIONS: &[&str] = &[
     "AddressArithmetic: a pointer is never rebuilt by multiplication, shifting or bit-field extraction of a value loaded from memory",
     "AllocationWide: every recognised pointer effect covers its whole allocation (A2 bounds are M0b)",
+    "SealedTable: a value loaded from a sealed table is only used as a whole 64-bit pointer base of reads that stay inside the pointee allocation the entry names (halves are never recombined across entries, an entry is never added to another pointer, and a read whose base may be an entry or an argument pointer reads whichever it names; a table whose certificate records `null_guarded` may hold null entries, every other table holds none; the loader keeps the table and every pointee immutable)",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -113,6 +117,8 @@ fn class_name(class: AccessClass) -> String {
             format!("atomic{}", if commutative { "_commutative" } else { "" })
         }
         AccessClass::LdsDma => "lds_dma".into(),
+        AccessClass::AtomicRelease => "atomic_release".into(),
+        AccessClass::LoadAcquire => "load_acquire".into(),
     }
 }
 fn path_name(path: MemPath) -> &'static str {
@@ -340,19 +346,89 @@ pub fn kernel_record(
         } else {
             Vec::new()
         },
-        required_witnesses: if conditional {
-            vec![WITNESS_INDEXED_BIND.to_owned()]
+        sealed_tables: if conditional {
+            facts.sealed.iter().map(sealed_record).collect()
         } else {
             Vec::new()
+        },
+        descriptor_arenas: Vec::new(),
+        required_witnesses: {
+            let mut w = Vec::new();
+            if conditional && !facts.indexed.is_empty() {
+                w.push(WITNESS_INDEXED_BIND.to_owned());
+            }
+            if conditional && !facts.sealed.is_empty() {
+                w.push(WITNESS_SEALED_TABLE.to_owned());
+            }
+            w.sort();
+            w
         },
         case_digest: String::new(),
         guard_flag: None,
     }
 }
 
-/// The witness kind a Conditional indexed summary needs (design A §A9.2
-/// `IndexedBindWitness`); the runtime bind supplies it.
-pub const WITNESS_INDEXED_BIND: &str = "indexed_bind";
+/// Canonical kernel record of one sealed-table entry load.
+fn sealed_entry_record(e: &SealedEntryLoad) -> SealedEntryRecord {
+    SealedEntryRecord {
+        pc: e.pc,
+        class: class_name(e.class),
+        path: path_name(e.path).into(),
+        cache: cache_text(e.cache),
+        width: u32::from(e.width_bytes),
+        index_expr: e.index.to_string(),
+        guard_pcs: e.guard_pcs.clone(),
+    }
+}
+fn sealed_access_record(a: &SealedAccess) -> SealedAccessRecord {
+    SealedAccessRecord {
+        pc: a.pc,
+        class: class_name(a.class),
+        path: path_name(a.path).into(),
+        cache: cache_text(a.cache),
+        width: u32::from(a.width_bytes),
+        entry_pcs: a.entry_pcs.clone(),
+    }
+}
+fn sealed_record(t: &SealedTableUse) -> SealedTableRecord {
+    let (bound_kind, bound_value) = match t.bound {
+        SealedBound::Kernarg { offset } => (SEALED_BOUND_KERNARG, u64::from(offset)),
+        SealedBound::Const(c) => (SEALED_BOUND_CONST, u64::from(c)),
+    };
+    SealedTableRecord {
+        table_arg_offset: t.table_arg_offset,
+        bound_kind: bound_kind.into(),
+        bound_value,
+        entry_bytes: u32::from(t.entry_bytes),
+        entries: t.entries.iter().map(sealed_entry_record).collect(),
+        accesses: t.accesses.iter().map(sealed_access_record).collect(),
+        null_guarded: t.null_guarded,
+    }
+}
+
+/// The sealed-table case of `kernel` (design: `SealedTable` certificate) when
+/// its unguarded analysis is `Unknown` and the sealed analysis resolves every
+/// access (`Conditional`, with the `sealed_table` witness required). When the
+/// sealed analysis finds a table-shaped entry load but cannot prove it, the
+/// unguarded refusals are replaced by its exact `sealed-*` rules (still
+/// `Unknown`); a kernel with no table-shaped load keeps the unguarded result.
+fn sealed_facts(kernel: &Kernel, arch: Arch, unguarded: &mut KernargFacts) -> Option<KernargFacts> {
+    if unguarded.status != KernelStatus::Unknown {
+        return None;
+    }
+    let sealed = kernargs::analyze_sealed(kernel, arch);
+    if sealed.status == KernelStatus::Conditional && !sealed.sealed.is_empty() {
+        return Some(sealed);
+    }
+    if sealed
+        .unresolved
+        .iter()
+        .any(|u| u.rule.starts_with("sealed-"))
+    {
+        unguarded.unresolved = sealed.unresolved;
+    }
+    None
+}
 
 fn guard_record(g: &Guard) -> GuardRecord {
     match *g {
@@ -895,9 +971,10 @@ pub fn certify(bytes: &[u8], sidecar: Option<&str>) -> Result<Receipt, CertError
         let (identity, device) = kernel_identity(kernel, &lifted.proof);
         device_sha = device;
         identities.push(identity);
-        let (facts, pm, pm_error) = kernel_facts(program, index);
+        let (mut facts, pm, pm_error) = kernel_facts(program, index);
         let meta = metadata_effects(&source, cert.as_ref(), &kernel.symbol.0);
-        let guarded = guarded_facts(kernel, arch, &facts);
+        let guarded =
+            guarded_facts(kernel, arch, &facts).or_else(|| sealed_facts(kernel, arch, &mut facts));
         let mut record = kernel_record(kernel, guarded.as_ref().unwrap_or(&facts), &meta);
         if guarded.is_some() {
             record.unguarded_unresolved = kernel_record(kernel, &facts, &meta).unresolved;
@@ -916,7 +993,12 @@ pub fn certify(bytes: &[u8], sidecar: Option<&str>) -> Result<Receipt, CertError
                 obligations.insert("AddressArithmetic".to_owned());
             }
             KernelStatus::Conditional => {
-                obligations.insert("IndexedBindWitness".to_owned());
+                if !facts.indexed.is_empty() {
+                    obligations.insert("IndexedBindWitness".to_owned());
+                }
+                if !facts.sealed.is_empty() {
+                    obligations.insert("SealedTableWitness".to_owned());
+                }
             }
             KernelStatus::Unknown => {}
         }

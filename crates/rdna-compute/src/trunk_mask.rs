@@ -260,6 +260,11 @@ pub enum TrunkIu4Default {
     /// `gfx1151-zab-v1`: the GDN Z, alpha and beta projections (the `zab`
     /// fold) on exact gfx1151.
     Gfx1151ZabV1,
+    /// `gfx1201-q8f16-v1`: a Q8F16 (QT3) trunk overlay whose Q8_0 consumers
+    /// carry G0 row-twin proofs on exact gfx1201. It selects no IU4 route (an
+    /// empty mask): the marker only gates the overlay's `auto` application to
+    /// the architecture its proofs cover.
+    Gfx1201Q8f16V1,
 }
 
 impl TrunkIu4Default {
@@ -267,12 +272,13 @@ impl TrunkIu4Default {
     pub const fn marker(self) -> &'static str {
         match self {
             Self::Gfx1151ZabV1 => "gfx1151-zab-v1",
+            Self::Gfx1201Q8f16V1 => "gfx1201-q8f16-v1",
         }
     }
 
     /// The marker's default, or `None` for a value this build does not know.
     pub fn from_marker(marker: &str) -> Option<Self> {
-        [Self::Gfx1151ZabV1]
+        [Self::Gfx1151ZabV1, Self::Gfx1201Q8f16V1]
             .into_iter()
             .find(|default| default.marker() == marker)
     }
@@ -281,6 +287,7 @@ impl TrunkIu4Default {
     pub const fn arch(self) -> &'static str {
         match self {
             Self::Gfx1151ZabV1 => "gfx1151",
+            Self::Gfx1201Q8f16V1 => "gfx1201",
         }
     }
 
@@ -288,6 +295,7 @@ impl TrunkIu4Default {
     pub const fn mask_spec(self) -> &'static str {
         match self {
             Self::Gfx1151ZabV1 => "gdn.z,gdn.a,gdn.b",
+            Self::Gfx1201Q8f16V1 => "",
         }
     }
 }
@@ -511,6 +519,24 @@ mod tests {
             assert_eq!(mask.bits(layer), ZAB_BITS, "layer {layer}");
         }
         assert_eq!(mask.canonical(), "gdn.z,gdn.a,gdn.b");
+    }
+
+    #[test]
+    fn q8f16_marker_gates_on_gfx1201_and_selects_no_iu4_route() {
+        let q8 = TrunkIu4Default::Gfx1201Q8f16V1;
+        assert_eq!(q8.marker(), "gfx1201-q8f16-v1");
+        assert_eq!(q8.arch(), "gfx1201");
+        assert_eq!(TrunkIu4Default::from_marker("gfx1201-q8f16-v1"), Some(q8));
+        for other in ["gfx1201-q8f16-v2", "GFX1201-Q8F16-V1", "gfx1201", "q8f16"] {
+            assert_eq!(TrunkIu4Default::from_marker(other), None, "{other:?}");
+        }
+        assert!(Qwen4TrunkMask::parse(q8.mask_spec()).unwrap().is_empty());
+        let on = route(None, "gfx1201", Some(q8));
+        assert_eq!(on.source, TrunkIu4MaskSource::ArtifactDefault(q8));
+        assert!(on.mask.is_empty(), "the Q8F16 marker turns no IU4 route on");
+        for arch in ["gfx1151", "gfx1100", "gfx1201x", ""] {
+            assert_eq!(route(None, arch, Some(q8)).source, TrunkIu4MaskSource::Off);
+        }
     }
 
     #[test]

@@ -204,6 +204,29 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Run `pm_loop` with `args`, stdin closed. Linux refuses `execve` with
+/// ETXTBSY while any process still holds the executable open for writing; a
+/// sibling thread's fork can inherit a write descriptor of a just-written
+/// binary until that child execs. That window is milliseconds, so ETXTBSY is
+/// retried a bounded number of times; every other error returns at once.
+fn run_pm_loop(pm_loop: &Path, args: &[String]) -> std::io::Result<std::process::Output> {
+    const ETXTBSY: i32 = 26;
+    let mut attempt = 0;
+    loop {
+        match std::process::Command::new(pm_loop)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+        {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) && attempt < 20 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            r => return r,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Process driver
 
@@ -344,10 +367,7 @@ impl Driver<'_> {
         }
 
         let t0 = Instant::now();
-        let out = std::process::Command::new(&self.cfg.pm_loop)
-            .args(&args)
-            .stdin(std::process::Stdio::null())
-            .output()
+        let out = run_pm_loop(&self.cfg.pm_loop, &args)
             .map_err(|e| format!("{}: {e}", self.cfg.pm_loop.display()))?;
         let wall_s = t0.elapsed().as_secs_f64();
         self.processes += 1;
@@ -877,7 +897,6 @@ pub fn cli(args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::tune::domain::test_case;
-    use std::os::unix::fs::PermissionsExt;
 
     const NODE: &str = "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8";
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -961,9 +980,24 @@ mod tests {
         std::fs::write(d.join(format!("{mode}-{epi}.exit")), exit.to_string()).unwrap();
     }
 
+    /// Install `text` as an executable script without this process ever holding
+    /// a write descriptor on it: a script written with `fs::write` and exec'd
+    /// fails `ETXTBSY` while another test thread's fork still holds a copy of
+    /// the descriptor. A short-lived `sh` does the write and has exited when
+    /// this returns, so no fork of this process can inherit a writer.
+    fn write_executable(path: &Path, text: &str) {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "printf %s \"$1\" > \"$2\" && chmod 755 \"$2\"", "sh"])
+            .arg(text)
+            .arg(path)
+            .status()
+            .expect("spawn sh to install the script");
+        assert!(status.success(), "installing {}: {status}", path.display());
+    }
+
     fn script(dir: &Path) -> PathBuf {
         let p = dir.join("fake_pm_loop.sh");
-        std::fs::write(
+        write_executable(
             &p,
             "#!/bin/sh\n\
              d=\"$(dirname \"$0\")/canned\"\n\
@@ -978,9 +1012,7 @@ mod tests {
              done\n\
              cat \"$d/$mode-$epi.json\"\n\
              exit \"$(cat \"$d/$mode-$epi.exit\")\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         p
     }
 
