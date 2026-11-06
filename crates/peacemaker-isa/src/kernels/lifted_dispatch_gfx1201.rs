@@ -262,14 +262,6 @@ pub fn pool(
     // Bodies above BODY_SGPR_LIMIT: the dispatcher SGPRs they overlap are parked in
     // lanes of `spill_v` (above every body's and dispatcher temporary's VGPRs) from just
     // before the region entry to just after its exit; those SGPRs' ranges exclude it.
-    let spill_v: u8 = hosted
-        .iter()
-        .map(|h| h.region.vgprs)
-        .max()
-        .unwrap_or(0)
-        .max(19)
-        .try_into()
-        .map_err(|_| "no VGPR left to park dispatcher SGPRs".to_string())?;
     let spilling: Vec<(u32, String, String, u16)> = hosted
         .iter()
         .filter(|h| h.region.sgprs > BODY_SGPR_LIMIT)
@@ -283,6 +275,19 @@ pub fn pool(
             )
         })
         .collect();
+    // unused (0) when no body spills
+    let spill_v: u8 = if spilling.is_empty() {
+        0
+    } else {
+        hosted
+            .iter()
+            .map(|h| h.region.vgprs)
+            .max()
+            .unwrap_or(0)
+            .max(19)
+            .try_into()
+            .map_err(|_| "no VGPR left to park dispatcher SGPRs".to_string())?
+    };
     for &(name, base, len) in DISPATCHER_SGPRS {
         let parked: Vec<&(u32, String, String, u16)> = spilling
             .iter()
