@@ -557,6 +557,60 @@ fn emulator_refuses_a_wave_touching_another_waves_slice() {
     }
 }
 
+// ---- the assembly marker ------------------------------------------------------------
+
+#[test]
+fn assembly_declares_each_private_window_and_certify_can_read_it_back() {
+    use peacemaker_isa::lds::{private_marker, private_markers};
+    for arch in ARCHES {
+        let e = emit(arch, Variant::Good).unwrap();
+        let windows = private_windows(&e.proof.lds_slots);
+        assert_eq!(
+            windows,
+            [PrivateWindow {
+                base: 0,
+                stride: STRIDE,
+                waves: WAVES
+            }]
+        );
+        let marker = private_marker(SYMBOL, &windows[0]);
+        assert_eq!(
+            marker,
+            format!("; pm.wave_private symbol={SYMBOL} base=0 stride=512 waves=8")
+        );
+        assert_eq!(e.s_text.matches("pm.wave_private").count(), 1, "{arch:?}");
+        assert!(e
+            .s_text
+            .contains(&format!("{marker}\n.protected {SYMBOL}\n")));
+        assert_eq!(private_markers(&e.s_text, SYMBOL).unwrap(), windows);
+        // A marker belongs to its own kernel symbol.
+        assert!(private_markers(&e.s_text, "other_kernel")
+            .unwrap()
+            .is_empty());
+        // It survives the module combiner.
+        let (module, _) =
+            peacemaker_isa::kernels::iu4_gemm::module(&[e.clone()], "wave_private_demo").unwrap();
+        assert_eq!(private_markers(&module, SYMBOL).unwrap(), windows);
+    }
+}
+
+#[test]
+fn malformed_markers_are_refused_not_skipped() {
+    use peacemaker_isa::lds::private_markers;
+    for bad in [
+        "; pm.wave_private symbol=k base=0 stride=512",
+        "; pm.wave_private symbol=k base=x stride=512 waves=8",
+        "; pm.wave_private symbol=k stride=512 base=0 waves=8",
+        "; pm.wave_private symbol=k base=0 stride=512 waves=8 extra=1",
+        "; pm.wave_private",
+    ] {
+        assert!(
+            err(private_markers(bad, "k")).contains("malformed wave-private marker"),
+            "{bad}"
+        );
+    }
+}
+
 // ---- the contract pipeline (`toolchain::certify`) ---------------------------------
 
 #[cfg(feature = "toolchain")]
@@ -564,27 +618,47 @@ mod pipeline {
     use super::*;
     use peacemaker_isa::toolchain::{build, certify, IsaShapeContract, Toolchain};
 
-    fn contract(e: &Emitted, windows: bool) -> IsaShapeContract {
+    /// What the contract says about the wave-private windows.
+    #[derive(Clone, Copy, Debug)]
+    enum Windows {
+        /// No windows declared: `certify` must derive them from the emission.
+        Omitted,
+        /// The emission's own windows.
+        Exact,
+        /// The emission's windows with the first slice stride shortened.
+        Narrower,
+        /// An extra window the emission never declared.
+        Extra,
+    }
+
+    fn contract(e: &Emitted, windows: Windows) -> IsaShapeContract {
+        let mut declared = private_windows(&e.proof.lds_slots);
+        match windows {
+            Windows::Omitted => declared.clear(),
+            Windows::Exact => {}
+            Windows::Narrower => declared[0].stride -= 4,
+            Windows::Extra => declared.push(PrivateWindow {
+                base: TILE_BASE,
+                stride: 4,
+                waves: 1,
+            }),
+        }
         IsaShapeContract {
             symbol: SYMBOL.into(),
             launch_dynamic_lds_bytes: Some(0),
             group_segment_fixed_bytes: TILE_BASE + TILE_BYTES,
             require_wave32: true,
-            wave_private_windows: if windows {
-                private_windows(&e.proof.lds_slots)
-            } else {
-                vec![]
-            },
+            wave_private_windows: declared,
             ..Default::default()
         }
     }
 
-    fn run_pipeline(arch: Arch, variant: Variant, windows: bool) -> Result<(), String> {
+    fn run_pipeline(arch: Arch, variant: Variant, windows: Windows) -> Result<(), String> {
         let e = emit(arch, variant)?;
         let (text, _) =
             peacemaker_isa::kernels::iu4_gemm::module(&[e.clone()], "wave_private_demo")?;
         let dir = std::env::temp_dir().join(format!(
-            "peacemaker-isa-wave-private-{}-{}-{variant:?}-{windows}",
+            "peacemaker-isa-wave-private-{}-{}-{variant:?}-{windows:?}",
             std::process::id(),
             arch.name()
         ));
@@ -623,10 +697,40 @@ mod pipeline {
     fn pipeline_certifies_an_own_slice_kernel_and_refuses_foreign_slice_emits() {
         need_rocm!();
         for arch in [Arch::Gfx1100, Arch::Gfx1151] {
-            run_pipeline(arch, Variant::Good, true).unwrap_or_else(|e| panic!("{arch:?}: {e}"));
+            run_pipeline(arch, Variant::Good, Windows::Exact)
+                .unwrap_or_else(|e| panic!("{arch:?}: {e}"));
             for bad in [Variant::CrossWave, Variant::Overrun, Variant::Collide] {
-                let e = err(run_pipeline(arch, bad, true));
+                let e = err(run_pipeline(arch, bad, Windows::Exact));
                 assert!(e.contains("outside its own slice"), "{arch:?} {bad:?}: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn pipeline_derives_the_windows_when_the_contract_omits_them() {
+        need_rocm!();
+        for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+            run_pipeline(arch, Variant::Good, Windows::Omitted)
+                .unwrap_or_else(|e| panic!("{arch:?}: {e}"));
+            // Omitting the windows must not fall back to the plain bound check: the foreign-slice
+            // emissions are still refused by the ownership proof.
+            for bad in [Variant::CrossWave, Variant::Overrun, Variant::Collide] {
+                let e = err(run_pipeline(arch, bad, Windows::Omitted));
+                assert!(e.contains("outside its own slice"), "{arch:?} {bad:?}: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn pipeline_refuses_a_contract_whose_windows_disagree_with_the_emission() {
+        need_rocm!();
+        for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+            for wrong in [Windows::Narrower, Windows::Extra] {
+                let e = err(run_pipeline(arch, Variant::Good, wrong));
+                assert!(
+                    e.contains("disagree with the windows the emission declares"),
+                    "{arch:?} {wrong:?}: {e}"
+                );
             }
         }
     }
@@ -634,8 +738,11 @@ mod pipeline {
     #[test]
     fn pipeline_refuses_windows_it_cannot_prove() {
         need_rocm!();
-        // gfx1201 `wave_private_demo` is not an M7-certified symbol: nothing would prove ownership.
-        let e = err(run_pipeline(Arch::Gfx1201, Variant::Good, true));
-        assert!(e.contains("wave-private LDS windows"), "{e}");
+        // gfx1201 `wave_private_demo` is not an M7-certified symbol: nothing would prove ownership,
+        // whether the contract declares the windows or leaves them to the emission.
+        for windows in [Windows::Exact, Windows::Omitted] {
+            let e = err(run_pipeline(Arch::Gfx1201, Variant::Good, windows));
+            assert!(e.contains("wave-private LDS windows"), "{windows:?}: {e}");
+        }
     }
 }

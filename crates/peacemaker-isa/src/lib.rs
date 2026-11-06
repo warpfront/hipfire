@@ -1287,6 +1287,7 @@ impl Builder {
             &self.program,
             self.workgroup_id_z,
             next_free_sgpr,
+            &lds::private_windows(&self.lds.all_slots()),
         )?;
         let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
         let mut shape = IsaShape {

@@ -336,3 +336,52 @@ pub fn private_windows(slots: &[LdsSlot]) -> Vec<PrivateWindow> {
         })
         .collect()
 }
+
+/// Prefix of the assembly comment that records one wave-private window of a kernel.
+const PRIVATE_MARKER: &str = "; pm.wave_private";
+
+/// The assembly line the builder emits for one wave-private window of `symbol` (before the kernel's
+/// `.protected` line): `; pm.wave_private symbol=<name> base=<u32> stride=<u32> waves=<u32>`. It is
+/// derived from the builder's LDS slots on every emission, so a kernel that has wave-private slots
+/// cannot omit it; [`private_markers`] reads it back.
+pub fn private_marker(symbol: &str, w: &PrivateWindow) -> String {
+    format!(
+        "{PRIVATE_MARKER} symbol={symbol} base={} stride={} waves={}",
+        w.base, w.stride, w.waves
+    )
+}
+
+/// The wave-private windows `source` declares for `symbol` (in emission order; markers of other
+/// kernels in a combined module are ignored). A malformed marker line is an error, not a skip.
+pub fn private_markers(source: &str, symbol: &str) -> Result<Vec<PrivateWindow>, String> {
+    let mut out = Vec::new();
+    for line in source.lines() {
+        let Some(rest) = line.trim().strip_prefix(PRIVATE_MARKER) else {
+            continue;
+        };
+        let bad = || format!("malformed wave-private marker `{}`", line.trim());
+        let mut fields = rest.split_whitespace();
+        let mut field = |key: &str| -> Result<&str, String> {
+            fields
+                .next()
+                .and_then(|f| f.strip_prefix(key))
+                .and_then(|f| f.strip_prefix('='))
+                .ok_or_else(bad)
+        };
+        let name = field("symbol")?;
+        let base = field("base")?.parse().map_err(|_| bad())?;
+        let stride = field("stride")?.parse().map_err(|_| bad())?;
+        let waves = field("waves")?.parse().map_err(|_| bad())?;
+        if fields.next().is_some() {
+            return Err(bad());
+        }
+        if name == symbol {
+            out.push(PrivateWindow {
+                base,
+                stride,
+                waves,
+            })
+        }
+    }
+    Ok(out)
+}

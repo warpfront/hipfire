@@ -147,9 +147,14 @@ pub struct IsaShapeContract {
     /// Kernel-descriptor fixed LDS the symbol must declare (0 unless set).
     #[serde(default)]
     pub group_segment_fixed_bytes: u32,
-    /// Wave-private LDS windows of the emission (`lds::private_windows(&emitted.proof.lds_slots)`): when
-    /// nonempty, the M7 pipeline proves from the object that every access of every wave stays in its own
-    /// slice (`pm_check::lds_wave_private`) and refuses a contract it cannot prove that for.
+    /// Wave-private LDS windows of the emission (`lds::private_windows(&emitted.proof.lds_slots)`). The
+    /// builder writes one `; pm.wave_private` marker per wave-private slot into the assembly
+    /// (`lds::private_marker`) and `certify` derives the windows from those markers: whenever any exist, the
+    /// M7 pipeline proves from the object that every access of every wave stays in its own slice
+    /// (`pm_check::lds_wave_private`) and refuses a symbol it cannot prove that for. This field is therefore
+    /// optional: empty (the default) uses the derived windows, and a nonempty list must equal them (as a
+    /// set) or `certify` refuses. It can never switch the proof off, and a nonempty list for a kernel the
+    /// assembly declares no windows for is refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wave_private_windows: Vec<crate::lds::PrivateWindow>,
 }
@@ -958,12 +963,35 @@ pub fn certify(
             shape.launch_dynamic_lds_bytes = Some(dynamic);
             shape.max_lds_access_end = Some(max_end);
         }
-        if !contract.wave_private_windows.is_empty() && !m7_cert {
-            return Err(format!(
-                "{}: the contract declares wave-private LDS windows, but this symbol is not M7-certified, so nothing would prove each wave stays in its own slice",
-                contract.symbol
-            ));
-        }
+        // The wave-private windows come from the emission itself: the builder writes one marker per
+        // wave-private slot into the assembly (`lds::private_marker`). A contract may omit its windows
+        // (the derived ones apply) or restate them exactly; it cannot opt a kernel out of the proof.
+        let private_windows = {
+            let source_text = fs::read_to_string(source).map_err(|e| e.to_string())?;
+            let derived = crate::lds::private_markers(&source_text, &contract.symbol)?;
+            if !contract.wave_private_windows.is_empty() || !derived.is_empty() {
+                let sorted = |w: &[crate::lds::PrivateWindow]| {
+                    let mut w = w.to_vec();
+                    w.sort_by_key(|w| (w.base, w.stride, w.waves));
+                    w
+                };
+                if !contract.wave_private_windows.is_empty()
+                    && sorted(&contract.wave_private_windows) != sorted(&derived)
+                {
+                    return Err(format!(
+                        "{}: the contract's wave-private LDS windows {:?} disagree with the windows the emission declares {:?}",
+                        contract.symbol, contract.wave_private_windows, derived
+                    ));
+                }
+                if !m7_cert {
+                    return Err(format!(
+                        "{}: the kernel has wave-private LDS windows, but this symbol is not M7-certified, so nothing would prove each wave stays in its own slice",
+                        contract.symbol
+                    ));
+                }
+            }
+            derived
+        };
         if m7_cert {
             // An all-lane LDS bound over the launch allocation, then M7's
             // lift/emit identity and analyses.
@@ -976,7 +1004,7 @@ pub fn certify(
             let token_list = qsa_pm
                 && (contract.symbol.starts_with("indexed_attention_gathered_")
                     || contract.symbol.starts_with("indexed_attention_kv_f16vb"));
-            let private = !contract.wave_private_windows.is_empty();
+            let private = !private_windows.is_empty();
             if private && (token_list || mq6_pm) {
                 return Err(format!(
                     "{}: wave-private LDS windows are certified by `lds_wave_private`, which has no host-bounded address mode",
@@ -991,7 +1019,7 @@ pub fn certify(
                     &contract.symbol,
                     waves,
                     kd.group_segment_size + dynamic,
-                    &contract.wave_private_windows,
+                    &private_windows,
                 )?
             } else if token_list {
                 // The token list is the launch's dynamic LDS (`launch_dynamic_lds_bytes`
