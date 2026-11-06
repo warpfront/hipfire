@@ -206,8 +206,9 @@ struct Graphs {
     /// One graph per slot and row count: `execs[slot][rows - 1]`; empty for a
     /// slot not (yet) registered, whose request word no primary writes.
     execs: Vec<Vec<hip_bridge::GraphExec>>,
-    /// Decode scratch every slot's graphs share: masked ids, gate, up, rot.
-    scratch: [rdna_compute::GpuTensor; 4],
+    /// Decode scratch every slot's graphs share: masked ids, gate, up, rot,
+    /// and the request's rows copied out of the mailbox.
+    scratch: [rdna_compute::GpuTensor; 5],
     prefill: Option<Prefill>,
     _keep: Vec<rdna_compute::GpuTensor>,
 }
@@ -370,7 +371,7 @@ fn stream(gpu: &rdna_compute::Gpu) -> &hip_bridge::Stream {
 fn record_slot(
     gpu: &mut rdna_compute::Gpu,
     cfg: &ResponderConfig,
-    scratch: &[rdna_compute::GpuTensor; 4],
+    scratch: &[rdna_compute::GpuTensor; 5],
     tables: &(rdna_compute::GpuTensor, rdna_compute::GpuTensor, rdna_compute::GpuTensor),
     slot: usize,
     rows: usize,
@@ -380,14 +381,17 @@ fn record_slot(
     let o = g.slot(slot);
     let base = cfg.mailbox_base;
     let (gu, dn, bm) = tables;
-    let [masked, gate, up, rot] = scratch;
+    let [masked, gate, up, rot, x_local] = scratch;
     let slots = rows * g.top_k;
     // SAFETY: mailbox fields of slot `slot`, live for the responder's lifetime.
     let (x, out) = unsafe {
         (view(base + o.x_rot as u64, rows * g.dim * 4), view(base + o.cold_out as u64, slots * g.dim * 4))
     };
     gpu.hetero_mask_hot(base + o.ids as u64, bm, cfg.n_experts as i32, slots as i32, masked).map_err(s)?;
-    gpu.gemv_mq4g256v2_moe_gate_up_top10_indexed_batched(gu, masked, &x, gate, up, 2 * cfg.mi, g.dim, rows)
+    // One read of the rows across the coherent (uncached) mailbox; every
+    // gate/up block then reads them from device memory.
+    gpu.copy_f32_buffer(x_local, &x, rows * g.dim).map_err(s)?;
+    gpu.gemv_mq4g256v2_moe_gate_up_top10_indexed_batched(gu, masked, x_local, gate, up, 2 * cfg.mi, g.dim, rows)
         .map_err(s)?;
     gpu.silu_mul_bf16_rt_rotate_x_mq_128_v2_shared(gate, up, rot, cfg.mi, slots, None).map_err(s)?;
     gpu.gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(
@@ -479,7 +483,13 @@ fn build(cfg: &ResponderConfig, layers: &[ColdLayer]) -> Result<Graphs, String> 
     let f32s = |gpu: &mut rdna_compute::Gpu, n: usize| {
         gpu.alloc_tensor(&[n], rdna_compute::DType::F32).map_err(|e| e.to_string())
     };
-    let scratch = [f32s(&mut gpu, slots)?, f32s(&mut gpu, slots * cfg.mi)?, f32s(&mut gpu, slots * cfg.mi)?, f32s(&mut gpu, slots * cfg.mi)?];
+    let scratch = [
+        f32s(&mut gpu, slots)?,
+        f32s(&mut gpu, slots * cfg.mi)?,
+        f32s(&mut gpu, slots * cfg.mi)?,
+        f32s(&mut gpu, slots * cfg.mi)?,
+        f32s(&mut gpu, g.max_rows * g.dim)?,
+    ];
     gpu.active_stream = Some(gpu.hip.stream_create_non_blocking().map_err(s)?);
     let mut graphs = Graphs { gpu, execs: (0..g.layers).map(|_| Vec::new()).collect(), scratch, prefill: None, _keep: Vec::new() };
     for (slot, layer) in layers.iter().enumerate() {
