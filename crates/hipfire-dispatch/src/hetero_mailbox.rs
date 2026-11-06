@@ -27,6 +27,9 @@ pub struct SlotOffsets {
     pub req_seq: usize,
     pub resp_seq: usize,
     pub error: usize,
+    /// Rows of the current request (1..=`max_rows`), written with the route
+    /// before the request word.
+    pub rows: usize,
     pub x_rot: usize,
     pub ids: usize,
     pub weights: usize,
@@ -50,7 +53,7 @@ impl MailboxGeometry {
         let cold_out = align(weights + slots * 4);
         let end = align(cold_out + slots * self.dim * 4);
         (
-            SlotOffsets { req_seq: 0, resp_seq: 64, error: 128, x_rot, ids, weights, cold_out },
+            SlotOffsets { req_seq: 0, resp_seq: 64, error: 128, rows: 192, x_rot, ids, weights, cold_out },
             end,
         )
     }
@@ -62,6 +65,7 @@ impl MailboxGeometry {
             req_seq: base + o.req_seq,
             resp_seq: base + o.resp_seq,
             error: base + o.error,
+            rows: base + o.rows,
             x_rot: base + o.x_rot,
             ids: base + o.ids,
             weights: base + o.weights,
@@ -395,9 +399,10 @@ mod tests {
     fn words_have_their_own_cache_lines() {
         for l in [0, 1, 47] {
             let s = G.slot(l);
-            let lines: Vec<usize> = [s.req_seq, s.resp_seq, s.error].iter().map(|o| o / 64).collect();
-            assert_eq!(lines.len(), 3);
-            assert!(lines[0] != lines[1] && lines[1] != lines[2] && lines[0] != lines[2]);
+            let lines: Vec<usize> = [s.req_seq, s.resp_seq, s.error, s.rows].iter().map(|o| o / 64).collect();
+            let mut distinct = lines.clone();
+            distinct.dedup();
+            assert_eq!(distinct.len(), 4, "the slot's words share a line: {lines:?}");
             for &(off, _) in &ranges(&G, l)[3..] {
                 assert!(!lines.contains(&(off / 64)), "array shares a word's line");
             }

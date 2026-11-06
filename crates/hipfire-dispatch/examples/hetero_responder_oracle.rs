@@ -39,6 +39,8 @@ const MI: usize = 640;
 const LAYERS: usize = 2;
 const SENTINEL: f32 = -7.0;
 const PREFILL_ROWS: usize = 2048;
+/// Decode-slot rows (an MTP verify window); the multi-row case uses them all.
+const DECODE_ROWS: usize = 8;
 /// Symmetric headers (`zp = -8 sc`: sc 1/16, zp -1/2), as Flash-Next's
 /// verified experts, so the prefill takes the symmetric IU4 route.
 const F16_QUAD: [u16; 4] = [0x2c00, 0xb800, 0x2c00, 0xb800];
@@ -180,7 +182,8 @@ fn main() {
     drop(arm);
 
     // Responder over a 2-layer mailbox.
-    let geom = MailboxGeometry { layers: LAYERS, max_rows: 1, top_k: TOP_K, dim: DIM };
+    // One spare slot past the trunk layers, registered after start (the MTP head's).
+    let geom = MailboxGeometry { layers: LAYERS + 1, max_rows: DECODE_ROWS, top_k: TOP_K, dim: DIM };
     // The slot carries MAX_SUB_CHUNKS sub-chunks; a chunk may use fewer.
     let pgeom = PrefillGeometry { max_rows: PREFILL_ROWS, top_k: TOP_K, dim: DIM, sub_chunks: MAX_SUB_CHUNKS };
     let po = pgeom.offsets(geom.total_bytes());
@@ -231,6 +234,7 @@ fn main() {
             req_seq: b + o.req_seq as u64,
             resp_seq: b + o.resp_seq as u64,
             error: b + o.error as u64,
+            rows: b + o.rows as u64,
             x_rot: b + o.x_rot as u64,
             ids: b + o.ids as u64,
             weights: b + o.weights as u64,
@@ -280,6 +284,108 @@ fn main() {
     if unsafe { *(s0.error as *const u32) } != 0 {
         fail(format!("timed loop hit a timeout (responder: {:?})", responder.failure()));
     }
+    // A verify-width request on the same slot: every row routes a rotation of
+    // the same ten experts (so each row has its own cold slots) over its own
+    // activation; the responder must pick the DECODE_ROWS-row graph.
+    let rows = DECODE_ROWS;
+    let ids_r: Vec<i32> = (0..rows * TOP_K).map(|s| ids[(s % TOP_K + s / TOP_K) % TOP_K]).collect();
+    let w_r: Vec<f32> = (0..rows * TOP_K).map(|s| 0.1 * ((s % TOP_K) as f32 + 1.0) + 0.01 * (s / TOP_K) as f32).collect();
+    let x_r: Vec<f32> = (0..rows * DIM).map(|i| (((i * 13) % 101) as f32 - 50.0) * 0.01).collect();
+    let cold_r: Vec<bool> = ids_r.iter().map(|&e| bitmap[e as usize] != 0).collect();
+    let x_pin_r = pinned(&r, rows * DIM * 4, false).cast::<f32>();
+    let ref_pin_r = pinned(&r, rows * TOP_K * DIM * 4, false).cast::<f32>();
+    // SAFETY: pinned buffers of the sizes used.
+    let (x_host_r, ref_rows_r) = unsafe {
+        std::ptr::copy_nonoverlapping(x_r.as_ptr(), x_pin_r, rows * DIM);
+        (std::slice::from_raw_parts(x_pin_r, rows * DIM), std::slice::from_raw_parts_mut(ref_pin_r, rows * TOP_K * DIM))
+    };
+    let host_slots_r: Vec<u32> = (0..(rows * TOP_K) as u32).filter(|&s| cold_r[s as usize]).collect();
+    let experts_r: Vec<CpuMoeExpert<'_>> = host_slots_r
+        .iter()
+        .map(|&s| {
+            let e = ids_r[s as usize] as usize;
+            // SAFETY: spans inside `experts_mem`.
+            unsafe {
+                CpuMoeExpert {
+                    gate_up_quant: CpuQuant::Mq4G256V2,
+                    gate_up: std::slice::from_raw_parts(gate_up[e] as *const u8, gu.len()),
+                    down_quant: CpuQuant::Mq4G128V2,
+                    down: std::slice::from_raw_parts(down[e] as *const u8, dn.len()),
+                }
+            }
+        })
+        .collect();
+    let arm = IgpuColdArm::new(1, ColdArmDims { dim: DIM, mi: MI, top_k: TOP_K, n_experts: N_EXP, max_rows: rows })
+        .unwrap_or_else(|e| fail(format!("arm ({rows} rows): {e:?}")));
+    arm.host_slot_outputs(rows, &ids_r, &host_slots_r, &experts_r, x_host_r, ref_rows_r, std::time::Duration::from_secs(5))
+        .unwrap_or_else(|e| fail(format!("arm call ({rows} rows): {e:?}")));
+    drop(arm);
+    let x_rt = r.upload_f32(&x_r, &[rows * DIM]).unwrap();
+    let ids_rt = upload_bytes(&mut r, &ids_r.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<u8>>());
+    let w_rt = r.upload_f32(&w_r, &[rows * TOP_K]).unwrap();
+    let masked_rt = r.alloc_tensor(&[rows * TOP_K], DType::F32).unwrap();
+    let expanded_r = r.upload_f32(&vec![SENTINEL; rows * TOP_K * DIM], &[rows * TOP_K * DIM]).unwrap();
+    r.hetero_token_advance(&counter).unwrap();
+    r.hetero_publish_cold(
+        &counter, 0, LAYERS as u32, &x_rt, &ids_rt, &w_rt, &bm_t, N_EXP as i32, rows as i32, TOP_K as i32, DIM as i32, &s0, &masked_rt,
+    )
+    .unwrap();
+    r.hetero_await_cold(&counter, 0, LAYERS as u32, &s0, 50_000_000).unwrap();
+    r.hetero_install_cold(&s0, &ids_rt, &bm_t, N_EXP as i32, (rows * TOP_K) as u32, DIM as i32, &expanded_r).unwrap();
+    r.hip.device_synchronize().unwrap();
+    // SAFETY: the slot's error word.
+    if unsafe { *(s0.error as *const u32) } != 0 {
+        fail(format!("{rows}-row await timed out (responder: {:?})", responder.failure()));
+    }
+    let got = r.download_f32(&expanded_r).unwrap();
+    for s in 0..rows * TOP_K {
+        for i in 0..DIM {
+            let want = if cold_r[s] { ref_rows_r[s * DIM + i] } else { SENTINEL };
+            if got[s * DIM + i].to_bits() != want.to_bits() {
+                fail(format!("{rows} rows: slot {s} elem {i}: {} != {want}", got[s * DIM + i]));
+            }
+        }
+    }
+    let masked_got: Vec<i32> = r.download_f32(&masked_rt).unwrap().iter().map(|v| v.to_bits() as i32).collect();
+    for s in 0..rows * TOP_K {
+        let want = if cold_r[s] { -1 } else { ids_r[s] };
+        if masked_got[s] != want {
+            fail(format!("{rows} rows: masked id {s}: {} != {want}", masked_got[s]));
+        }
+    }
+    eprintln!("  {rows}-row decode request: {} cold slots bitwise == IgpuColdArm", host_slots_r.len());
+
+    // A slot registered after start, with its own counter (the MTP head's
+    // shape: several requests between trunk forwards).
+    responder.add_slot(LAYERS, layer.clone()).unwrap_or_else(|e| fail(format!("add_slot: {e:?}")));
+    let late = slot(LAYERS);
+    let late_counter = upload_bytes(&mut r, &0u32.to_ne_bytes());
+    for round in 0..3 {
+        let expanded_l = r.upload_f32(&vec![SENTINEL; TOP_K * DIM], &[TOP_K * DIM]).unwrap();
+        r.hetero_token_advance(&late_counter).unwrap();
+        r.hetero_publish_cold(&late_counter, 0, 1, &x_t, &ids_t, &w_t, &bm_t, N_EXP as i32, 1, TOP_K as i32, DIM as i32, &late, &masked_t)
+            .unwrap();
+        r.hetero_await_cold(&late_counter, 0, 1, &late, 50_000_000).unwrap();
+        r.hetero_install_cold(&late, &ids_t, &bm_t, N_EXP as i32, TOP_K as u32, DIM as i32, &expanded_l).unwrap();
+        r.hip.device_synchronize().unwrap();
+        // SAFETY: the late slot's error word.
+        if unsafe { *(late.error as *const u32) } != 0 {
+            fail(format!("late slot round {round}: await timed out (responder: {:?})", responder.failure()));
+        }
+        let got = r.download_f32(&expanded_l).unwrap();
+        for s in 0..TOP_K {
+            for i in 0..DIM {
+                let want = if cold[s] { ref_rows[s * DIM + i] } else { SENTINEL };
+                if got[s * DIM + i].to_bits() != want.to_bits() {
+                    fail(format!("late slot round {round}: slot {s} elem {i}: {} != {want}", got[s * DIM + i]));
+                }
+            }
+        }
+    }
+    if responder.add_slot(LAYERS, layer.clone()).is_ok() {
+        fail("a served slot was registered twice".into());
+    }
+    eprintln!("  late slot {LAYERS}: 3 rounds on its own counter bitwise == IgpuColdArm; a second registration refused");
     let decode_answered = responder.answered();
 
     // Prefill round trips. The reference runs the same call directly on a
@@ -393,7 +499,7 @@ fn main() {
                     continue;
                 }
                 let wd = po.sub[i];
-                let slot = HeteroSlotPtrs { req_seq: b + wd.req_seq as u64, resp_seq: b + wd.resp_seq as u64, error: b + po.error as u64, x_rot: 0, ids: 0, weights: 0, cold_out: 0 };
+                let slot = HeteroSlotPtrs { req_seq: b + wd.req_seq as u64, resp_seq: b + wd.resp_seq as u64, error: b + po.error as u64, rows: 0, x_rot: 0, ids: 0, weights: 0, cold_out: 0 };
                 r.hetero_await_cold(&counter, l, LAYERS as u32, &slot, 50_000_000).unwrap();
                 mark(r, format!("back {i} answered"));
                 let st = r.active_stream.as_ref().unwrap();

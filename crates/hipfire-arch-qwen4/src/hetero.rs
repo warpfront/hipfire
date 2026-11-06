@@ -85,6 +85,11 @@ use hipfire_dispatch::hetero_mailbox::{MailboxGeometry, PrefillGeometry, MAX_SUB
 use hipfire_dispatch::hetero_prefill::ColdPrefillConfig;
 use hipfire_dispatch::hetero_responder::{ColdLayer, HeteroResponder, PrefillServe, ResponderConfig};
 
+/// Rows of the decode exchange: single-token decode and MTP verify windows up
+/// to this width take the decode slot (one round trip per layer, no staging);
+/// wider calls take the prefill exchange.
+pub const HETERO_DECODE_ROWS: usize = 8;
+
 /// The prefill chunk under the split: the mailbox's prefill slot and the expert
 /// device's scratch are sized for it, and the load's prefill chunk is clamped
 /// to it (`gpu_forward::qwen4_prefill_chunk_requested`).
@@ -157,6 +162,8 @@ struct DeviceContext {
     mi: usize,
     pending: Vec<Option<ColdLayer>>,
     responder: Option<HeteroResponder>,
+    /// The MTP head's own request counter, once its slot is served.
+    head_counter: Option<rdna_compute::GpuTensor>,
     prefill: Arc<HeteroPrefillShared>,
     prefill_cold: ColdPrefillConfig,
     prefill_offsets: Vec<hipfire_dispatch::hetero_mailbox::PrefillOffsets>,
@@ -198,7 +205,9 @@ pub(crate) fn attach_device_layer(
     let hip = |e: hip_bridge::HipError| format!("topology.hetero_experts: {e}");
     let mut guard = lock_device()?;
     if guard.is_none() {
-        let geom = MailboxGeometry { layers, max_rows: 1, top_k, dim };
+        // One slot per trunk layer, then the MTP head's (served once a head
+        // attaches: `attach_head_layer`).
+        let geom = MailboxGeometry { layers: layers + HEAD_SLOTS, max_rows: HETERO_DECODE_ROWS, top_k, dim };
         let pgeom = PrefillGeometry { max_rows: prefill_cold.max_rows, top_k, dim, sub_chunks: MAX_SUB_CHUNKS };
         let mut poffs = Vec::with_capacity(HETERO_PREFILL_SLOTS);
         let mut end = geom.total_bytes();
@@ -232,6 +241,7 @@ pub(crate) fn attach_device_layer(
             mi,
             pending: (0..layers).map(|_| None).collect(),
             responder: None,
+            head_counter: None,
             prefill: Arc::new(prefill),
             prefill_cold,
             prefill_offsets: poffs,
@@ -242,24 +252,15 @@ pub(crate) fn attach_device_layer(
         );
     }
     let ctx = guard.as_mut().expect("initialized above");
-    if ctx.geom.layers != layers || layer >= layers || ctx.n_experts != placement.len() {
+    if ctx.pending.len() != layers || layer >= layers || ctx.n_experts != placement.len() {
         return Err(format!("topology.hetero_experts: layer {layer} of {layers} does not match the load's geometry"));
     }
     ctx.pending[layer] = Some(ColdLayer { gate_up: tables.0, down: tables.1, cold_bitmap: placement.to_vec() });
     let bitmap = gpu.alloc_tensor(&[placement.len().div_ceil(4)], rdna_compute::DType::F32).map_err(hip)?;
     gpu.memcpy_htod_auto(&bitmap.buf, placement).map_err(hip)?;
-    let masked_ids = gpu.alloc_tensor(&[top_k], rdna_compute::DType::F32).map_err(hip)?;
-    let o = ctx.geom.slot(layer);
+    let masked_ids = gpu.alloc_tensor(&[HETERO_DECODE_ROWS * top_k], rdna_compute::DType::F32).map_err(hip)?;
+    let slot = slot_ptrs(ctx, layer);
     let b = ctx.mailbox as u64;
-    let slot = rdna_compute::HeteroSlotPtrs {
-        req_seq: b + o.req_seq as u64,
-        resp_seq: b + o.resp_seq as u64,
-        error: b + o.error as u64,
-        x_rot: b + o.x_rot as u64,
-        ids: b + o.ids as u64,
-        weights: b + o.weights as u64,
-        cold_out: b + o.cold_out as u64,
-    };
     // SAFETY: a non-owning view of the load's counter, which outlives the load.
     let counter = unsafe {
         rdna_compute::GpuTensor {
@@ -314,9 +315,95 @@ pub(crate) fn attach_device_layer(
             masked_ids,
             n_experts: placement.len() as i32,
             max_polls: AWAIT_MAX_POLLS,
+            max_rows: HETERO_DECODE_ROWS,
+            advance: false,
         },
         prefill,
     ))
+}
+
+/// Mailbox slots after the trunk layers': the MTP head's.
+const HEAD_SLOTS: usize = 1;
+
+fn slot_ptrs(ctx: &DeviceContext, index: usize) -> rdna_compute::HeteroSlotPtrs {
+    let o = ctx.geom.slot(index);
+    let b = ctx.mailbox as u64;
+    rdna_compute::HeteroSlotPtrs {
+        req_seq: b + o.req_seq as u64,
+        resp_seq: b + o.resp_seq as u64,
+        error: b + o.error as u64,
+        rows: b + o.rows as u64,
+        x_rot: b + o.x_rot as u64,
+        ids: b + o.ids as u64,
+        weights: b + o.weights as u64,
+        cold_out: b + o.cold_out as u64,
+    }
+}
+
+/// Attach the native MTP head's MoE to the device split, after every trunk
+/// layer attached (the responder runs): the responder records graphs for the
+/// head's slot, and the returned split advances its own counter on every
+/// publish (the head drafts several times between trunk forwards).
+/// `placement`/`tables` as for [`attach_device_layer`].
+pub(crate) fn attach_head_layer(
+    gpu: &mut rdna_compute::Gpu,
+    dim: usize,
+    top_k: usize,
+    placement: &[u8],
+    tables: (Vec<u64>, Vec<u64>),
+) -> Result<HeteroDeviceSplit, String> {
+    check_primary(&gpu.arch)?;
+    let hip = |e: hip_bridge::HipError| format!("topology.hetero_experts: MTP head: {e}");
+    let mut guard = lock_device()?;
+    let ctx = guard
+        .as_mut()
+        .ok_or_else(|| "topology.hetero_experts: MTP head attached before the trunk layers".to_owned())?;
+    let index = ctx.pending.len();
+    if ctx.head_counter.is_some()
+        || ctx.n_experts != placement.len()
+        || ctx.geom.dim != dim
+        || ctx.geom.top_k != top_k
+        || index >= ctx.geom.layers
+    {
+        return Err("topology.hetero_experts: the MTP head does not match the load's split (or attached twice)".into());
+    }
+    let responder = ctx
+        .responder
+        .as_ref()
+        .ok_or_else(|| "topology.hetero_experts: MTP head attached before the responder started".to_owned())?;
+    responder
+        .add_slot(index, ColdLayer { gate_up: tables.0, down: tables.1, cold_bitmap: placement.to_vec() })
+        .map_err(|e| format!("topology.hetero_experts: MTP head: {e:?}"))?;
+    let counter = gpu.alloc_tensor(&[1], rdna_compute::DType::F32).map_err(hip)?;
+    gpu.memcpy_htod_auto(&counter.buf, &0u32.to_ne_bytes()).map_err(hip)?;
+    // SAFETY: a non-owning view of the head's counter, which the context keeps.
+    let counter_view = unsafe {
+        rdna_compute::GpuTensor {
+            buf: hip_bridge::DeviceBuffer::from_raw(counter.buf.as_ptr(), 4),
+            shape: vec![1],
+            dtype: rdna_compute::DType::F32,
+        }
+    };
+    ctx.head_counter = Some(counter);
+    let bitmap = gpu.alloc_tensor(&[placement.len().div_ceil(4)], rdna_compute::DType::F32).map_err(hip)?;
+    gpu.memcpy_htod_auto(&bitmap.buf, placement).map_err(hip)?;
+    let masked_ids = gpu.alloc_tensor(&[HETERO_DECODE_ROWS * top_k], rdna_compute::DType::F32).map_err(hip)?;
+    eprintln!(
+        "  qwen4 hetero experts: MTP head on the device split (slot {index}, {} cold experts)",
+        placement.iter().filter(|&&c| c != 0).count()
+    );
+    Ok(HeteroDeviceSplit {
+        layer: 0,
+        layers: 1,
+        slot: slot_ptrs(ctx, index),
+        counter: counter_view,
+        cold_bitmap: bitmap,
+        masked_ids,
+        n_experts: placement.len() as i32,
+        max_polls: AWAIT_MAX_POLLS,
+        max_rows: HETERO_DECODE_ROWS,
+        advance: true,
+    })
 }
 
 /// Start of every forward (decode token or prefill chunk): fail closed on an

@@ -55,6 +55,7 @@ impl Mailbox {
             req_seq: b,
             resp_seq: b + 64,
             error: b + 128,
+            rows: b + 192,
             x_rot: b + x_rot as u64,
             ids: b + ids as u64,
             weights: b + weights as u64,
@@ -326,7 +327,7 @@ fn main() {
         }
         for i in 0..SUBS {
             let (off, n) = sub_range(rows, i);
-            let slot = HeteroSlotPtrs { req_seq: req(i), resp_seq: resp(i), error: p_err, x_rot: 0, ids: 0, weights: 0, cold_out: 0 };
+            let slot = HeteroSlotPtrs { req_seq: req(i), resp_seq: resp(i), error: p_err, rows: 0, x_rot: 0, ids: 0, weights: 0, cold_out: 0 };
             gpu.hetero_await_cold(&counter, layer, LAYERS, &slot, polls).unwrap();
             gpu.hip.memcpy_dtod_async_default_at(&part_local.buf, off * DIM * 2, &mb_part, off * DIM * 2, n * DIM * 2).unwrap();
         }
