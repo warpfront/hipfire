@@ -346,7 +346,7 @@ pub fn pool(
             .pointer_access("events", 16, Access::ReadWrite)
             .pointer_access("kernargs", 24, Access::ReadOnly)
             .pointer_access("trace", 32, Access::WriteOnly)
-            .pointer_access("poison", 40, Access::WriteOnly)
+            .pointer_access("poison", 40, Access::ReadWrite) // set by an atomic swap
             .hidden("spin_ticks", 48, 8, "by_value")
             .hidden("n_tasks", 56, 4, "by_value")
             .hidden("trace_on", 60, 4, "by_value")
@@ -500,13 +500,18 @@ pub fn pool(
         param(b, PTR_B, 0x28)?;
         op(b, "v_mov_b32_e32 v1, 0", &[v(1)], &[])?;
         op(b, "v_mov_b32_e32 v2, 1", &[v(2)], &[])?;
-        b.push(
-            Instruction::new(
-                format!("global_store_b32 v1, v2, s[{PTR_B}:{}]", PTR_B + 1),
-                vec![],
-                vec![v(1), v(2), sp(PTR_B)],
-            )
-            .memory(MemoryClass::VmemStore),
+        // poison is an event cell: written only by an atomic, released (railgun EventCells)
+        b.event_rmw(
+            AtomicOp::SwapB32,
+            None,
+            v(2),
+            GlobalAddr {
+                vaddr: V::<1>(1),
+                base: ptr(PTR_B),
+                offset: 0,
+            },
+            Scope::Dev,
+            Ordering::Release,
         )?;
         op(b, "v_mov_b32_e32 v4, -1", &[v(4)], &[])?;
         b.label(".Lready")?;
