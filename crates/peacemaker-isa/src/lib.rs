@@ -527,7 +527,9 @@ impl Builder {
     /// store counter or `depctr_vm_vsrc(0)`), so the program records a read of them: no renaming may put a
     /// redefinition between the store and the release.
     fn note_store_release(&mut self) {
-        let Some(rec) = &mut self.vgpr_rec else { return };
+        let Some(rec) = &mut self.vgpr_rec else {
+            return;
+        };
         let uses = self.ledger.pending_store_sources();
         if uses.is_empty() {
             return;

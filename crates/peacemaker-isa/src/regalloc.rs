@@ -1053,9 +1053,11 @@ pub(crate) fn allocate(
                     .1
                     .binary_search_by_key(&c.unit, |p| p.0)
                     .map(|k| pre.inner.per_insn[c.use_sub].1[k].1);
-                let (Ok(unit), Some(&di), Some(&ui)) =
-                    (renamed, idx_of_sub.get(&c.def_sub), idx_of_sub.get(&c.use_sub))
-                else {
+                let (Ok(unit), Some(&di), Some(&ui)) = (
+                    renamed,
+                    idx_of_sub.get(&c.def_sub),
+                    idx_of_sub.get(&c.use_sub),
+                ) else {
                     continue;
                 };
                 if !rd.reachable[di] || !rd.reachable[ui] || def_web[di].is_empty() {
@@ -1083,7 +1085,11 @@ pub(crate) fn allocate(
         }
         for &(base, len) in &op.ranges {
             let first = web_at(i, base, op, &use_web, &def_web).ok_or("range without a web")?;
-            let g = if spread { granule(base, len).unwrap() } else { granule(base, len).unwrap().max(4) };
+            let g = if spread {
+                granule(base, len).unwrap()
+            } else {
+                granule(base, len).unwrap().max(4)
+            };
             for k in 0..len {
                 let w = web_at(i, base + k, op, &use_web, &def_web).ok_or("range without a web")?;
                 guf.union(first, w);
@@ -1383,7 +1389,15 @@ pub(crate) fn allocate(
             .filter(|(c, _)| *c * 4 > cap * 3 && *c > cap)
             .map(|(_, h)| h)
             .collect();
-        let r = solve_banks(&edges, &web_unit, &web_group, &group_members, &allowed, &hot, cap);
+        let r = solve_banks(
+            &edges,
+            &web_unit,
+            &web_group,
+            &group_members,
+            &allowed,
+            &hot,
+            cap,
+        );
         cand_edges = edges.len();
         cand_ok = r.1;
         shift = r.0;
@@ -1782,7 +1796,10 @@ fn bank_edges(
     const PER_NODE: usize = 8;
     let windows = valu_windows(items, insns, reachable);
     let mut edges = vec![];
-    for w in windows.iter().filter(|w| w.len() > 1 && w.len() <= MAX_WINDOW) {
+    for w in windows
+        .iter()
+        .filter(|w| w.len() > 1 && w.len() <= MAX_WINDOW)
+    {
         let n = w.len();
         let words = n.div_ceil(64);
         let mut anc = vec![0u64; n * words];
@@ -2121,10 +2138,14 @@ pub fn compact_vgprs_as<T>(
                 None,
             )?;
             let (_, second) = build(Pass::Spread(&pre))?;
-            let rec1 = second.vgpr_record.ok_or(
-                "compact_vgprs: the spread pass did not record (call Builder::vgpr_pass)",
-            )?;
-            compose(&pre, &allocate(&rec1, &[], Mode::Compact, Some(&pre))?, &rec0.hashes)?
+            let rec1 = second
+                .vgpr_record
+                .ok_or("compact_vgprs: the spread pass did not record (call Builder::vgpr_pass)")?;
+            compose(
+                &pre,
+                &allocate(&rec1, &[], Mode::Compact, Some(&pre))?,
+                &rec0.hashes,
+            )?
         }
     };
     let (t, mut emitted) = build(Pass::Apply(&map))?;
@@ -2410,7 +2431,13 @@ mod tests {
         let unrelated = vgpr_compaction(&recording(prog(4)), &[]).unwrap();
         assert_eq!(correlated.stats.webs, unrelated.stats.webs + 1);
         // the guarded accumulator stays live across v9's definition, whichever web the zero is in
-        let acc = renamed(&correlated, 4, "v_add_f32_e32 v5, 0, v6", &[w1(5)], &[w1(6)]);
+        let acc = renamed(
+            &correlated,
+            4,
+            "v_add_f32_e32 v5, 0, v6",
+            &[w1(5)],
+            &[w1(6)],
+        );
         let nine = renamed(&correlated, 5, "v_mov_b32_e32 v9, 1", &[w1(9)], &[]);
         assert_ne!(acc.defs[0].base, nine.defs[0].base);
     }
@@ -2439,21 +2466,42 @@ mod tests {
         let check = |m: &VgprMap| {
             let zero = reg(m, 0, "v_mov_b32_e32 v5, 0", 5, &[]);
             let acc = reg(m, 4, "v_add_f32_e32 v5, 0, v6", 5, &[6]);
-            assert_eq!(zero, acc, "the zero defines the register the guarded read reads");
+            assert_eq!(
+                zero, acc,
+                "the zero defines the register the guarded read reads"
+            );
         };
         check(&vgpr_compaction(&recording(prog.clone()), &[]).unwrap());
         for windows in [false, true] {
-            check(&alloc_spread(prog.clone(), Spread { banks: true, windows }));
+            check(&alloc_spread(
+                prog.clone(),
+                Spread {
+                    banks: true,
+                    windows,
+                },
+            ));
             // both passes, as `compact_vgprs_as` runs them
             let rec = recording(prog.clone());
-            let pre = allocate(&rec, &[], Mode::Spread(Spread { banks: true, windows }), None).unwrap();
+            let pre = allocate(
+                &rec,
+                &[],
+                Mode::Spread(Spread {
+                    banks: true,
+                    windows,
+                }),
+                None,
+            )
+            .unwrap();
             let mut second = Recording::default();
             for it in &rec.stream {
                 match it {
                     StreamItem::Insn { insn, subs } => {
                         let r = pre.rewrite(subs[0], insn.clone()).unwrap();
                         second.hashes.push(text_hash(&r.text));
-                        second.stream.push(StreamItem::Insn { insn: r, subs: *subs });
+                        second.stream.push(StreamItem::Insn {
+                            insn: r,
+                            subs: *subs,
+                        });
                     }
                     l => second.stream.push(l.clone()),
                 }
@@ -2480,8 +2528,20 @@ mod tests {
             renamed(m, n, text, &[w1(d)], &uses).defs[0].base
         };
         for (opts, apart) in [
-            (Spread { banks: false, windows: true }, true),
-            (Spread { banks: false, windows: false }, false),
+            (
+                Spread {
+                    banks: false,
+                    windows: true,
+                },
+                true,
+            ),
+            (
+                Spread {
+                    banks: false,
+                    windows: false,
+                },
+                false,
+            ),
         ] {
             let m = alloc_spread(s.clone(), opts);
             let a = reg(&m, 2, "v_add_f32_e32 v10, v1, v2", 10, &[1, 2]);
@@ -2509,9 +2569,27 @@ mod tests {
             i("v_mov_b32_e32 v2, v8", &[w1(2)], &[w1(8)]),
             i("s_endpgm", &[], &[]),
         ];
-        let m = alloc_spread(s, Spread { banks: true, windows: false });
-        let a = renamed(&m, 4, "v_add_f32_e32 v4, v16, v24", &[w1(4)], &[w1(16), w1(24)]);
-        let b = renamed(&m, 5, "v_add_f32_e32 v8, v20, v28", &[w1(8)], &[w1(20), w1(28)]);
+        let m = alloc_spread(
+            s,
+            Spread {
+                banks: true,
+                windows: false,
+            },
+        );
+        let a = renamed(
+            &m,
+            4,
+            "v_add_f32_e32 v4, v16, v24",
+            &[w1(4)],
+            &[w1(16), w1(24)],
+        );
+        let b = renamed(
+            &m,
+            5,
+            "v_add_f32_e32 v8, v20, v28",
+            &[w1(8)],
+            &[w1(20), w1(28)],
+        );
         assert!(
             crate::valu_sched::pair(Arch::Gfx1201, &a, &b).is_some(),
             "`{}` and `{}` should pair: {:?}",
@@ -2519,7 +2597,11 @@ mod tests {
             b.text,
             m.stats
         );
-        assert!(m.stats.rotated > 0 && m.stats.cand_ok == m.stats.cand_edges, "{:?}", m.stats);
+        assert!(
+            m.stats.rotated > 0 && m.stats.cand_ok == m.stats.cand_edges,
+            "{:?}",
+            m.stats
+        );
     }
 
     #[test]
@@ -2530,7 +2612,16 @@ mod tests {
             i("s_endpgm", &[], &[]),
         ];
         let rec = recording(s);
-        let pre = allocate(&rec, &[], Mode::Spread(Spread { banks: false, windows: false }), None).unwrap();
+        let pre = allocate(
+            &rec,
+            &[],
+            Mode::Spread(Spread {
+                banks: false,
+                windows: false,
+            }),
+            None,
+        )
+        .unwrap();
         // the program as the second pass records it: renamed by `pre`
         let mut second = Recording::default();
         for it in &rec.stream {
@@ -2538,7 +2629,10 @@ mod tests {
                 StreamItem::Insn { insn, subs } => {
                     let r = pre.rewrite(subs[0], insn.clone()).unwrap();
                     second.hashes.push(text_hash(&r.text));
-                    second.stream.push(StreamItem::Insn { insn: r, subs: *subs });
+                    second.stream.push(StreamItem::Insn {
+                        insn: r,
+                        subs: *subs,
+                    });
                 }
                 l => second.stream.push(l.clone()),
             }
@@ -2547,11 +2641,18 @@ mod tests {
         let both = compose(&pre, &post, &rec.hashes).unwrap();
         assert!(both.replays());
         assert_eq!(both.vgprs, post.vgprs);
-        for (n, ins) in rec.stream.iter().enumerate().filter_map(|(n, it)| match it {
-            StreamItem::Insn { insn, .. } => Some((n, insn)),
-            _ => None,
-        }) {
-            let via = post.rewrite(n, pre.rewrite(n, ins.clone()).unwrap()).unwrap();
+        for (n, ins) in rec
+            .stream
+            .iter()
+            .enumerate()
+            .filter_map(|(n, it)| match it {
+                StreamItem::Insn { insn, .. } => Some((n, insn)),
+                _ => None,
+            })
+        {
+            let via = post
+                .rewrite(n, pre.rewrite(n, ins.clone()).unwrap())
+                .unwrap();
             assert_eq!(both.rewrite(n, ins.clone()).unwrap().text, via.text);
         }
     }

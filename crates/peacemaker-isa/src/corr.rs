@@ -43,7 +43,8 @@ fn sgpr_tokens(text: &str) -> Vec<u8> {
             if j < b.len() && b[j] == b'[' {
                 if let Some(close) = text[j..].find(']').map(|k| k + j) {
                     if let Some((lo, hi)) = text[j + 1..close].split_once(':') {
-                        if let (Ok(lo), Ok(hi)) = (lo.trim().parse::<u8>(), hi.trim().parse::<u8>()) {
+                        if let (Ok(lo), Ok(hi)) = (lo.trim().parse::<u8>(), hi.trim().parse::<u8>())
+                        {
                             out.extend(lo..=hi);
                             i = close + 1;
                             continue;
@@ -129,11 +130,7 @@ fn predicate(insn: &Instruction) -> Option<(String, bool, Vec<u8>)> {
     Some((key, sense, sg))
 }
 
-fn guards(
-    items: &[Item],
-    blocks: &[Block],
-    insns: &[&Instruction],
-) -> (Vec<Option<Guard>>, Keys) {
+fn guards(items: &[Item], blocks: &[Block], insns: &[&Instruction]) -> (Vec<Option<Guard>>, Keys) {
     let mut keys = Keys {
         ids: HashMap::new(),
         sgprs: vec![],
@@ -146,10 +143,13 @@ fn guards(
             if m == "s_cbranch_scc0" || m == "s_cbranch_scc1" {
                 let scc1 = m == "s_cbranch_scc1";
                 // the nearest preceding scalar instruction decides SCC (VALU never writes it)
-                let cmp = items[blk.first..blk.last].iter().rev().find_map(|it| match it {
-                    Item::Insn(k) if !insns[*k].mnemonic().starts_with("v_") => Some(*k),
-                    _ => None,
-                });
+                let cmp = items[blk.first..blk.last]
+                    .iter()
+                    .rev()
+                    .find_map(|it| match it {
+                        Item::Insn(k) if !insns[*k].mnemonic().starts_with("v_") => Some(*k),
+                        _ => None,
+                    });
                 if let Some(k) = cmp {
                     if let Some((key, sense, sg)) = predicate(insns[k]) {
                         let n = keys.ids.len();
@@ -232,7 +232,11 @@ pub(crate) fn refine(
         match &guard[b] {
             Some(g) if g.key == key && blocks[b].succ.len() == 2 => {
                 let on_taken = si == 0;
-                let want = if on_taken { g.taken_when } else { !g.taken_when };
+                let want = if on_taken {
+                    g.taken_when
+                } else {
+                    !g.taken_when
+                };
                 let opposite = val(!want);
                 if at_end == opposite {
                     None
@@ -257,7 +261,9 @@ pub(crate) fn refine(
                     let Some(pin) = must[p][key] else { continue };
                     let at_end = if killed[p][key] { U } else { pin };
                     let si = blocks[p].succ.iter().position(|&s| s == b).unwrap();
-                    let Some(v) = edge_value(p, si, key, at_end) else { continue };
+                    let Some(v) = edge_value(p, si, key, at_end) else {
+                        continue;
+                    };
                     acc = Some(match acc {
                         None => v,
                         Some(a) if a == v => a,
@@ -335,9 +341,13 @@ pub(crate) fn refine(
             let mut work: std::collections::VecDeque<(usize, u8)> = [(0usize, U)].into();
             let out_of = |b: usize, s: &Vec<u32>| -> Vec<u32> {
                 match block_refs.get(&b).and_then(|r| {
-                    r.iter()
-                        .rev()
-                        .find_map(|&i| ops[i].defs.iter().position(|x| *x as usize == u).map(|j| rd.def_id[i][j]))
+                    r.iter().rev().find_map(|&i| {
+                        ops[i]
+                            .defs
+                            .iter()
+                            .position(|x| *x as usize == u)
+                            .map(|j| rd.def_id[i][j])
+                    })
                 }) {
                     Some(d) => vec![d],
                     None => s.clone(),
@@ -348,7 +358,9 @@ pub(crate) fn refine(
                 let s_out = out_of(b, &s_in);
                 let at_end = if killed[b][key] { U } else { ctx };
                 for (si, &s) in blocks[b].succ.iter().enumerate() {
-                    let Some(v) = edge_value(b, si, key, at_end) else { continue };
+                    let Some(v) = edge_value(b, si, key, at_end) else {
+                        continue;
+                    };
                     let slot = &mut st[s][v as usize];
                     let mut changed = false;
                     match slot {
@@ -411,8 +423,10 @@ pub(crate) fn refine(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::regalloc::{build_cfg, exec_dirty_of, operands, reaching, reaching_refined, StreamItem};
     use crate::reg::RegRef;
+    use crate::regalloc::{
+        build_cfg, exec_dirty_of, operands, reaching, reaching_refined, StreamItem,
+    };
 
     fn v(base: u8) -> RegRef {
         RegRef {
@@ -502,9 +516,17 @@ mod tests {
         let st = guarded("s_bitcmp0_b32 s1, 3", "s_cbranch_scc1 .L2", false);
         let (plain, refined, ids) = chains(&st);
         let both = use_of_v5(&st, &plain);
-        assert_eq!(both.len(), 2, "the CFG alone lets both definitions reach: {both:?}");
+        assert_eq!(
+            both.len(),
+            2,
+            "the CFG alone lets both definitions reach: {both:?}"
+        );
         let only = use_of_v5(&st, &refined);
-        assert_eq!(only, vec![ids[3][0]], "only the guarded definition reaches the guarded read");
+        assert_eq!(
+            only,
+            vec![ids[3][0]],
+            "only the guarded definition reaches the guarded read"
+        );
     }
 
     #[test]
