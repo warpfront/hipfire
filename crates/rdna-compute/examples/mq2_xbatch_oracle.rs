@@ -19,19 +19,36 @@
 //! `mq2_xbatch_oracle [--captures MANIFEST] --out FILE.json`; exit 0 only when every
 //! case matches.
 //!
-//! `--bench` adds a launch-cost bench on a SYNTHETIC M=100276 K=2560 MQ2 g256 v2 weight (this
-//! file loads no real draft head), through `gemv_mq2g256v2_xbatch` (the product route; PM when
-//! `mq2_xbatch_pm_active`): median us per call at B = 1, 2, 3, 4 (ONE launch each) and B = 8
-//! (two launches), the line us(B) = a + b*B fitted over B = 1..4 and the implied one-launch
-//! B = 8 estimate a + 8b against the measured two-launch B = 8. Calls are captured in a HIP
-//! graph (`--bench-reps N` replays, default 15, each `BENCH_CALLS` calls) rotating over 3 weight
-//! copies (3 x 72 MB > the 64 MB MALL, so each call is cold-ish; rotation is not a flush).
-//! `--no-oracle` skips the oracle sweep (bench only; `--out` still writes the JSON):
-//!   cargo run --release -p rdna-compute --features lab --example mq2_xbatch_oracle -- \
-//!     --bench --no-oracle [--bench-reps N] --out mq2_bench.json
+//! DIRECT single-launch proof and bench of an arbitrary emitted PM object (no Gpu wrapper, so
+//! no 4-row chunking): the object is loaded with `hipModuleLoadData` and launched through the
+//! normal kernel ABI (`A, x, y, M, K, B`, grid `ceil(M/rows)`, 32 lanes). Default object is the
+//! shipped `GEMV_MQ2_XBATCH_PM_GFX1201`; `--object PATH` replaces it, `--sweep-dir DIR` runs
+//! every `*.hxaco` in DIR (rows taken from an `r1`/`r2`/`r4` token in the file stem, else
+//! `--rows`). Options: `--rows N` (output rows per block, default 4), `--max-b N` (largest B
+//! one launch must cover, default 8; pass 4 for a cap4 object), `--symbol S` (default
+//! `gemv_mq2g256v2_xbatch_pm`).
+//!
+//! Correctness (runs unless `--bench --no-oracle`): for every shape (K = 256 .. 4352, every M
+//! residue, small shapes) and every B = 1..=max-b, ONE launch of the object into a y buffer
+//! guarded by 0x7f on both sides must equal, byte for byte including guards, the per-column
+//! `Gpu::gemv_mq2g256v2` bytes; the hipcc kernel in chunks of <= 4 must equal them too.
+//!
+//! `--bench` times the object's single launch (B = 1..8) against the TODAY cap4 baseline:
+//! `--baseline-object PATH` (REQUIRED with `--bench`; must be the pre-change shipped cap4
+//! object, run with 4 rows per block in chunks of 4 so B = 5..8 is two launches; the new
+//! kernel is never timed as the baseline). Synthetic M=100276 K=2560 weights, 3 rotating copies
+//! (3 x 72 MB > the 64 MB MALL), 18 calls per HIP graph, `--bench-reps N` replays (default 15),
+//! median. JSON per B: `single_us`, `chunked_us`, `saving_us = chunked - single`; no fit. The
+//! single-launch y must equal the chunked y bytes. `--no-oracle` skips the legacy wrapper
+//! sweep and, with `--bench`, correctness (timing mode). Correctness mode and timing mode are
+//! separate invocations:
+//!   mq2_xbatch_oracle --sweep-dir DIR --out verify.json
+//!   mq2_xbatch_oracle --sweep-dir DIR --bench --no-oracle \
+//!       --baseline-object baseline_cap4.hxaco --out time.json
 
 use rdna_compute::{DType, Gpu};
 use serde_json::json;
+use std::path::Path;
 use std::time::Instant;
 
 const BENCH_CALLS: usize = 18;
@@ -199,58 +216,219 @@ fn graph_us(
     Ok(s[s.len() / 2])
 }
 
-fn bench(gpu: &mut Gpu, rng: &mut Rng, reps: usize) -> Result<serde_json::Value> {
+const GUARD_F: usize = 64;
+const DEFAULT_SYMBOL: &str = "gemv_mq2g256v2_xbatch_pm";
+
+/// One emitted object loaded through the HIP module loader.
+struct Obj {
+    label: String,
+    sha: String,
+    rows: usize,
+    _module: hip_bridge::Module,
+    func: hip_bridge::Function,
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn load_obj(gpu: &Gpu, label: &str, bytes: &[u8], symbol: &str, rows: usize) -> Result<Obj> {
+    if !matches!(rows, 1 | 2 | 4) {
+        return Err(format!("{label}: --rows must be 1, 2 or 4, got {rows}"));
+    }
+    let module = gpu.hip.module_load_data(bytes).map_err(err)?;
+    let func = gpu.hip.module_get_function(&module, symbol).map_err(err)?;
+    Ok(Obj { label: label.to_string(), sha: sha256_hex(bytes), rows, _module: module, func })
+}
+
+/// ONE launch of `obj` over columns `first..first + b` (x/y column strides `k`/`m`), on the
+/// active stream (so it is captured by `graph_us`).
+#[allow(clippy::too_many_arguments)]
+fn launch_obj(
+    gpu: &Gpu,
+    obj: &Obj,
+    a: &rdna_compute::GpuTensor,
+    x: u64,
+    y: u64,
+    m: usize,
+    k: usize,
+    b: usize,
+) -> Result<()> {
+    let mut ka = Vec::with_capacity(40);
+    for p in [a.buf.as_ptr() as u64, x, y] {
+        ka.extend_from_slice(&p.to_le_bytes());
+    }
+    for d in [m, k, b] {
+        ka.extend_from_slice(&(d as i32).to_le_bytes());
+    }
+    ka.resize(40, 0);
+    // SAFETY: kernarg follows the A,x,y,M,K,B ABI and addresses live allocations.
+    unsafe {
+        gpu.hip.launch_kernel_blob(
+            &obj.func,
+            [m.div_ceil(obj.rows) as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            gpu.active_stream.as_ref(),
+            &mut ka,
+        )
+    }
+    .map_err(err)
+}
+
+/// Baseline: the cap4 object in chunks of 4 columns (production chunking).
+#[allow(clippy::too_many_arguments)]
+fn launch_chunked(
+    gpu: &Gpu,
+    obj: &Obj,
+    a: &rdna_compute::GpuTensor,
+    x: u64,
+    y: u64,
+    m: usize,
+    k: usize,
+    b: usize,
+) -> Result<()> {
+    let mut start = 0;
+    while start < b {
+        let rows = 4.min(b - start);
+        launch_obj(gpu, obj, a, x + (start * k * 4) as u64, y + (start * m * 4) as u64, m, k, rows)?;
+        start += rows;
+    }
+    Ok(())
+}
+
+/// Direct correctness of `obj`: single launch at B = 1..=max_b vs per-column singleton bytes
+/// (guards both sides included); hipcc in chunks of <= 4 vs the same bytes.
+fn direct_cases(gpu: &mut Gpu, obj: &Obj, max_b: usize) -> Result<(Vec<serde_json::Value>, usize)> {
+    let mut rng = Rng(0xD1EC7_5EED_0001);
+    let mut cases = Vec::new();
+    let mut bad_total = 0usize;
+    for (m, k) in [
+        (1usize, 256usize), (2, 512), (3, 1024), (4, 256), (5, 256), (6, 512), (7, 256), (8, 256),
+        (9, 768), (15, 256), (31, 768), (130, 2560), (1001, 2560), (4093, 2048), (33, 4352),
+        (100003, 2560), (100276, 2560),
+    ] {
+        let a_bytes = weights(&mut rng, m, k);
+        let a = gpu.upload_raw(&a_bytes, &[a_bytes.len()]).map_err(err)?;
+        let x_host: Vec<f32> = (0..8 * k).map(|_| rng.f32() * 3.0).collect();
+        let x = gpu.upload_f32(&x_host, &[x_host.len()]).map_err(err)?;
+        let y_ref = gpu.zeros(&[8 * m], DType::F32).map_err(err)?;
+        let y = gpu.zeros(&[8 * m + 2 * GUARD_F], DType::F32).map_err(err)?;
+        let y_view = y.sub_offset(GUARD_F, 8 * m);
+        for column in 0..8 {
+            gpu.gemv_mq2g256v2(&a, &x.sub_offset(column * k, k), &y_ref.sub_offset(column * m, m), m, k)
+                .map_err(err)?;
+        }
+        gpu.hip.device_synchronize().map_err(err)?;
+        let reference = gpu.download_raw_bytes(&y_ref).map_err(err)?;
+        for b in 1..=max_b.min(8) {
+            let written = b * m * 4;
+            let guard = GUARD_F * 4;
+            // single launch of the object
+            gpu.hip.memset(&y.buf, 0x7f, y.numel() * 4).map_err(err)?;
+            launch_obj(gpu, obj, &a, x.buf.as_ptr() as u64, y_view.buf.as_ptr() as u64, m, k, b)?;
+            gpu.hip.device_synchronize().map_err(err)?;
+            let got = gpu.download_raw_bytes(&y).map_err(err)?;
+            let bad_written = diff(&got[guard..guard + written], &reference[..written]);
+            let bad_guard = got[..guard].iter().filter(|&&v| v != 0x7f).count()
+                + got[guard + written..].iter().filter(|&&v| v != 0x7f).count();
+            // hipcc kernel, chunks of <= 4, same guards
+            gpu.hip.memset(&y.buf, 0x7f, y.numel() * 4).map_err(err)?;
+            gpu.gemv_mq2g256v2_xbatch_with(&a, &x, &y_view, m, k, b, false).map_err(err)?;
+            gpu.hip.device_synchronize().map_err(err)?;
+            let hip = gpu.download_raw_bytes(&y).map_err(err)?;
+            let bad_hip = diff(&hip[guard..guard + written], &reference[..written])
+                + hip[..guard].iter().filter(|&&v| v != 0x7f).count()
+                + hip[guard + written..].iter().filter(|&&v| v != 0x7f).count();
+            bad_total += bad_written + bad_guard + bad_hip;
+            cases.push(json!({
+                "m": m, "k": k, "b": b, "single_launch_mismatch_bytes": bad_written,
+                "single_launch_guard_overwritten_bytes": bad_guard,
+                "hipcc_chunked_mismatch_bytes": bad_hip,
+            }));
+        }
+        gpu.free_tensor(a).map_err(err)?;
+        gpu.free_tensor(x).map_err(err)?;
+        gpu.free_tensor(y_ref).map_err(err)?;
+        gpu.free_tensor(y).map_err(err)?;
+    }
+    Ok((cases, bad_total))
+}
+
+/// B = 1..8 single launch of `obj` vs `base` (cap4, chunked by 4) at the bench shape.
+fn bench_table(
+    gpu: &mut Gpu,
+    obj: &Obj,
+    base: &Obj,
+    reps: usize,
+) -> Result<(serde_json::Value, usize)> {
+    let mut rng = Rng(0x9E3779B97F4A7C15);
     let (m, k) = (100276usize, 2560usize);
-    let pm = gpu.mq2_xbatch_pm_active(m, k);
     let mut ws = Vec::new();
     for _ in 0..BENCH_COPIES {
-        let bytes = weights(rng, m, k);
+        let bytes = weights(&mut rng, m, k);
         ws.push(gpu.upload_raw(&bytes, &[bytes.len()]).map_err(err)?);
     }
     let x_host: Vec<f32> = (0..8 * k).map(|_| rng.f32() * 3.0).collect();
     let x = gpu.upload_f32(&x_host, &[x_host.len()]).map_err(err)?;
     let y = gpu.zeros(&[8 * m], DType::F32).map_err(err)?;
-    let mut us = Vec::new();
-    for b in [1usize, 2, 3, 4, 8] {
-        let v = graph_us(gpu, reps, |g, i| {
-            g.gemv_mq2g256v2_xbatch(&ws[i % BENCH_COPIES], &x, &y, m, k, b)
-                .map_err(err)
-        })?;
-        us.push((b, v));
-    }
-    // Least-squares line over B = 1..4.
-    let n = 4.0;
-    let (sx, sy): (f64, f64) = us[..4].iter().fold((0.0, 0.0), |a, &(b, v)| (a.0 + b as f64, a.1 + v));
-    let sxx: f64 = us[..4].iter().map(|&(b, _)| (b * b) as f64).sum();
-    let sxy: f64 = us[..4].iter().map(|&(b, v)| b as f64 * v).sum();
-    let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
-    let icpt = (sy - slope * sx) / n;
-    println!("mq2 xbatch bench: M={m} K={k} pm_active={pm} reps={reps} calls/replay={BENCH_CALLS} copies={BENCH_COPIES}");
-    for &(b, v) in &us {
-        println!(
-            "  B={b}: {v:.2} us ({} launch{})",
-            if b <= 4 { 1 } else { 2 },
-            if b <= 4 { "" } else { "es" }
-        );
-    }
-    let est8 = icpt + 8.0 * slope;
-    let meas8 = us[4].1;
+    let y2 = gpu.zeros(&[8 * m], DType::F32).map_err(err)?;
+    let (xp, yp, y2p) = (x.buf.as_ptr() as u64, y.buf.as_ptr() as u64, y2.buf.as_ptr() as u64);
+    let mut rows_json = Vec::new();
+    let mut bad = 0usize;
     println!(
-        "  fit us(B) = {icpt:.2} + {slope:.2}*B (B=1..4); one-launch B=8 estimate {est8:.2} us vs measured 2-launch {meas8:.2} us (ratio {:.3})",
-        meas8 / est8
+        "mq2 xbatch bench: M={m} K={k} object={} rows={} vs baseline={} rows={} reps={reps} calls/replay={BENCH_CALLS} copies={BENCH_COPIES}",
+        obj.label, obj.rows, base.label, base.rows
     );
+    for b in 1..=8usize {
+        // same bytes check on copy 0
+        gpu.hip.memset(&y.buf, 0x7f, 8 * m * 4).map_err(err)?;
+        gpu.hip.memset(&y2.buf, 0x7f, 8 * m * 4).map_err(err)?;
+        launch_obj(gpu, obj, &ws[0], xp, yp, m, k, b)?;
+        launch_chunked(gpu, base, &ws[0], xp, y2p, m, k, b)?;
+        gpu.hip.device_synchronize().map_err(err)?;
+        let same = diff(&gpu.download_raw_bytes(&y).map_err(err)?, &gpu.download_raw_bytes(&y2).map_err(err)?);
+        bad += same;
+        // interleaved arms: single, chunked
+        let single = graph_us(gpu, reps, |g, i| {
+            launch_obj(g, obj, &ws[i % BENCH_COPIES], xp, yp, m, k, b)
+        })?;
+        let chunked = graph_us(gpu, reps, |g, i| {
+            launch_chunked(g, base, &ws[i % BENCH_COPIES], xp, y2p, m, k, b)
+        })?;
+        println!(
+            "  B={b}: single {single:.2} us | chunked({} launch) {chunked:.2} us | saving {:.2} us | bytes_diff {same}",
+            b.div_ceil(4), chunked - single
+        );
+        rows_json.push(json!({
+            "b": b, "single_us": single, "chunked_us": chunked, "saving_us": chunked - single,
+            "chunked_launches": b.div_ceil(4), "single_vs_chunked_mismatch_bytes": same,
+        }));
+    }
     for t in ws {
         gpu.free_tensor(t).map_err(err)?;
     }
-    gpu.free_tensor(x).map_err(err)?;
-    gpu.free_tensor(y).map_err(err)?;
-    Ok(json!({
-        "m": m, "k": k, "pm_active": pm, "reps": reps, "calls_per_replay": BENCH_CALLS,
+    for t in [x, y, y2] {
+        gpu.free_tensor(t).map_err(err)?;
+    }
+    Ok((json!({
+        "m": m, "k": k, "reps": reps, "calls_per_replay": BENCH_CALLS,
         "weight_copies": BENCH_COPIES, "weight": "synthetic",
-        "us": us.iter().map(|&(b, v)| json!({"b": b, "us": v})).collect::<Vec<_>>(),
-        "fit_a_us": icpt, "fit_b_us": slope,
-        "est_one_launch_b8_us": est8, "measured_two_launch_b8_us": meas8,
-    }))
+        "baseline": base.label, "baseline_sha256": base.sha, "baseline_rows": base.rows,
+        "table": rows_json,
+    }), bad))
+}
+
+/// Rows per block from an `r1`/`r2`/`r4` token of a file stem.
+fn rows_from_stem(stem: &str) -> Option<usize> {
+    stem.split(|c: char| !c.is_ascii_alphanumeric())
+        .find_map(|t| match t {
+            "r1" => Some(1),
+            "r2" => Some(2),
+            "r4" => Some(4),
+            _ => None,
+        })
 }
 
 fn main() {
@@ -265,6 +443,12 @@ fn main() {
     let captures = flag("--captures");
     let do_bench = args.iter().any(|a| a == "--bench");
     let no_oracle = args.iter().any(|a| a == "--no-oracle");
+    let object = flag("--object");
+    let sweep_dir = flag("--sweep-dir");
+    let baseline_object = flag("--baseline-object");
+    let symbol = flag("--symbol").unwrap_or_else(|| DEFAULT_SYMBOL.to_string());
+    let rows: usize = flag("--rows").map_or(4, |v| v.parse().expect("--rows N"));
+    let max_b: usize = flag("--max-b").map_or(8, |v| v.parse().expect("--max-b N"));
     let bench_reps: usize = flag("--bench-reps").map_or(15, |v| v.parse().expect("--bench-reps N"));
     let run = || -> Result<(serde_json::Value, usize)> {
         let mut gpu = Gpu::init().map_err(err)?;
@@ -286,7 +470,7 @@ fn main() {
             (100276, 2560),
         ]
         .into_iter()
-        .filter(|_| !no_oracle)
+        .filter(|_| !no_oracle && sweep_dir.is_none())
         {
             let a_bytes = weights(&mut rng, m, k);
             let a = gpu.upload_raw(&a_bytes, &[a_bytes.len()]).map_err(err)?;
@@ -340,22 +524,121 @@ fn main() {
             gpu.free_tensor(y).map_err(err)?;
         }
         let pm_module = gpu.arch == "gfx1201";
-        if pm_module && !no_oracle && pm_cases.is_empty() {
+        if pm_module && !no_oracle && sweep_dir.is_none() && pm_cases.is_empty() {
             return Err("gfx1201: the PeaceMaker module covered no case".into());
         }
         if let Some(manifest) = captures.as_deref() {
             bad_total += capture_cases(&mut gpu, manifest, &mut pm_cases)?;
         }
-        let bench_json = if do_bench {
-            bench(&mut gpu, &mut rng, bench_reps)?
+        // Objects under test: --sweep-dir entries, else --object, else the shipped PM image.
+        let mut objects: Vec<Obj> = Vec::new();
+        let mut load_errors: Vec<serde_json::Value> = Vec::new();
+        if let Some(dir) = sweep_dir.as_deref() {
+            let mut paths: Vec<_> = std::fs::read_dir(dir)
+                .map_err(|e| format!("{dir}: {e}"))?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "hxaco"))
+                .collect();
+            paths.sort();
+            if paths.is_empty() {
+                return Err(format!("{dir}: no *.hxaco"));
+            }
+            // Optional DIR/manifest.json: `[{"file","rows","symbol"?}]` or `{"objects":[..]}`;
+            // entries override the stem token / --rows / --symbol for that file.
+            let manifest: Vec<serde_json::Value> = match std::fs::read(Path::new(dir).join("manifest.json")) {
+                Ok(b) => {
+                    let v: serde_json::Value = serde_json::from_slice(&b).map_err(err)?;
+                    v.get("objects").unwrap_or(&v).as_array().cloned().ok_or("manifest.json: no object array")?
+                }
+                Err(_) => Vec::new(),
+            };
+            for p in paths {
+                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                let ent = manifest.iter().find(|e| {
+                    e["file"].as_str().is_some_and(|f| Path::new(f).file_name().is_some_and(|n| *n == *name))
+                });
+                let r = ent
+                    .and_then(|e| e["rows"].as_u64())
+                    .map(|v| v as usize)
+                    .or_else(|| rows_from_stem(stem))
+                    .unwrap_or(rows);
+                let sym = ent.and_then(|e| e["symbol"].as_str()).unwrap_or(&symbol);
+                let loaded = std::fs::read(&p)
+                    .map_err(|e| format!("{}: {e}", p.display()))
+                    .and_then(|bytes| load_obj(&gpu, &p.display().to_string(), &bytes, sym, r));
+                match loaded {
+                    Ok(o) => objects.push(o),
+                    Err(e) => {
+                        // a tuple that fails to load is recorded, never aborts the sweep
+                        eprintln!("load failed {}: {e}", p.display());
+                        bad_total += 1;
+                        load_errors.push(json!({"object": p.display().to_string(), "error": e}));
+                    }
+                }
+            }
+        } else if let Some(path) = object.as_deref() {
+            let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+            objects.push(load_obj(&gpu, path, &bytes, &symbol, rows)?);
         } else {
-            serde_json::Value::Null
+            objects.push(load_obj(
+                &gpu,
+                "shipped:GEMV_MQ2_XBATCH_PM_GFX1201",
+                rdna_compute::kernels::GEMV_MQ2_XBATCH_PM_GFX1201,
+                &symbol,
+                rows,
+            )?);
+        }
+        let base = if do_bench {
+            let path = baseline_object
+                .as_deref()
+                .ok_or("--bench requires --baseline-object PATH (the pre-change cap4 object)")?;
+            if flag("--baseline-rows").is_some_and(|v| v != "4") {
+                return Err("the cap4 baseline must run with 4 rows per block".into());
+            }
+            let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+            Some(load_obj(&gpu, path, &bytes, &symbol, 4)?)
+        } else {
+            None
         };
+        let mut object_json = Vec::new();
+        let mut bench_json = serde_json::Value::Null;
+        for obj in &objects {
+            let mut entry = json!({
+                "object": obj.label, "sha256": obj.sha, "rows": obj.rows, "max_b": max_b,
+            });
+            if !do_bench || !no_oracle {
+                match direct_cases(&mut gpu, obj, max_b) {
+                    Ok((dc, bad)) => {
+                        bad_total += bad;
+                        entry["direct_mismatch_bytes"] = json!(bad);
+                        entry["direct_cases"] = json!(dc);
+                    }
+                    Err(e) if sweep_dir.is_some() => {
+                        bad_total += 1;
+                        entry["error"] = json!(e);
+                        object_json.push(entry);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            if let Some(base) = base.as_ref() {
+                let (t, bad) = bench_table(&mut gpu, obj, base, bench_reps)?;
+                bad_total += bad;
+                if objects.len() == 1 {
+                    bench_json = t.clone();
+                }
+                entry["bench"] = t;
+            }
+            object_json.push(entry);
+        }
         Ok((
             json!({
                 "bench": bench_json,
                 "schema": "mq2-xbatch-oracle-v2", "arch": gpu.arch,
                 "pm_image_sha256": rdna_compute::kernels::GEMV_MQ2_XBATCH_PM_GFX1201_SHA256,
+                "objects": object_json, "load_errors": load_errors,
                 "cases": cases, "pm_cases": pm_cases, "mismatch_bytes_total": bad_total,
             }),
             bad_total,
