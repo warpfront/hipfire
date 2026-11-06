@@ -92,6 +92,8 @@ pub mod kernels {
     pub mod mq_i4_rows;
     pub mod mtp_dense_det_gfx11;
     pub mod mtp_q8_det_gfx11;
+    /// EXPAND_LIVE (P0 template 1) standalone wrapper around the native `expand_body` region.
+    pub mod p0_expand_gfx1201;
     /// A trivial persistent dispatcher around the MQ2 xbatch body region, and the
     /// two-workgroup event handoff smoke kernels (lab only; no product route).
     pub mod persistent_dispatch_gfx1201;
