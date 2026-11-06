@@ -997,3 +997,34 @@ fn gfx1201_global_scope_th_and_atomic_return_form() {
         );
     }
 }
+
+/// The unused MUBUF address of the `off` form is the `off` token, not a
+/// `v[0:1]` register pair: it parses to `Operand::Vmem(Off)`, prints as
+/// `off`, and the text round-trips to the same bytes.
+#[test]
+fn gfx1201_buffer_off_is_a_vmem_token_and_roundtrips() {
+    const WORDS: &[u32] = &[0xc4050008, 0x00800801, 0x00001000];
+    let text = "buffer_load_b32 v1, off, s[4:7], s8 offset:16";
+    let inst = parse_line(text, Arch::Gfx1201).expect("parse");
+    assert!(
+        inst.operands.iter().any(|op| matches!(
+            op,
+            peacemaker_ir::operand::Operand::Vmem(peacemaker_ir::operand::VmemToken::Off)
+        )),
+        "{:?}",
+        inst.operands
+    );
+    assert!(
+        !inst.operands.iter().any(|op| matches!(
+            op,
+            peacemaker_ir::operand::Operand::Reg(r) if r.len > 1 && r.base == 0
+        )),
+        "off must not synthesise v[0:1]: {:?}",
+        inst.operands
+    );
+    assert_eq!(canonical(&inst, Arch::Gfx1201).unwrap(), text);
+    assert_eq!(encode_for_arch(Arch::Gfx1201, &inst).as_deref(), Ok(WORDS));
+    let (decoded, n) = gfx12::decode(WORDS).expect("decode");
+    assert_eq!(n, WORDS.len());
+    assert_eq!(canonical(&decoded, Arch::Gfx1201).unwrap(), text);
+}

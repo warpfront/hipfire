@@ -254,6 +254,20 @@ fn operand(
         }
         return Ok(Operand::Vmem(VmemToken::Off));
     }
+    // MUBUF with OFFEN and IDXEN both clear does not read VADDR; the byte is
+    // unused and only its canonical zero round-trips through `off`.
+    if name == "VADDR"
+        && form == Form::Vmem(crate::inst::VmemForm::Buffer)
+        && field_value(arch, "OFFEN", row, words) == 0
+        && field_value(arch, "IDXEN", row, words) == 0
+    {
+        if code != 0 {
+            return Err(reject(
+                "buffer VADDR must be zero when OFFEN and IDXEN are clear",
+            ));
+        }
+        return Ok(Operand::Vmem(VmemToken::Off));
+    }
     if name == "SRC0" && matches!(form, Form::Vop1Dpp | Form::Vop2Dpp) {
         return Ok(reg(Kind::V, code, bits));
     }
@@ -377,7 +391,10 @@ fn encoded_operand(
         ("SBASE", Operand::Special(Special::Vcc | Special::VccLo)) => Ok(53),
         ("SADDR", Operand::Vmem(VmemToken::Off)) => Ok(124),
         ("VADDR", Operand::Vmem(VmemToken::Off))
-            if form == Form::Vmem(crate::inst::VmemForm::Scratch) =>
+            if matches!(
+                form,
+                Form::Vmem(crate::inst::VmemForm::Scratch | crate::inst::VmemForm::Buffer)
+            ) =>
         {
             Ok(0)
         }
@@ -1765,6 +1782,57 @@ mod tests {
             .counters
             .contains(Counter::Load));
         assert_eq!(atomic.mods.cpol.th & 1, 1);
+    }
+
+    /// LLVM gfx1201 `buffer_load_b32 v14, off, s[48:51], s63 offset:80` (OFFEN=IDXEN=0, VADDR byte 0).
+    const BUFFER_OFF_WORDS: [u32; 3] = [0xc405_003f, 0x0080_600e, 0x0000_5000];
+
+    #[test]
+    fn buffer_off_decodes_vaddr_as_off_and_reads_no_vgpr() {
+        let (inst, consumed) = decode(&BUFFER_OFF_WORDS).unwrap();
+        assert_eq!(consumed, 3);
+        assert_eq!(inst.operands[1], Operand::Vmem(VmemToken::Off));
+        assert!(!inst.operands.contains(&Operand::Vmem(VmemToken::Offen)));
+        let v = |r: &RegRef| r.kind == Kind::V;
+        assert_eq!(inst.effects.uses.iter().filter(|r| v(r)).count(), 0);
+        assert_eq!(
+            inst.effects.defs.as_slice(),
+            &[RegRef {
+                kind: Kind::V,
+                base: 14,
+                len: 1
+            }]
+        );
+        assert_eq!(encode(&inst).unwrap().as_slice(), &BUFFER_OFF_WORDS);
+    }
+
+    #[test]
+    fn buffer_off_rejects_nonzero_vaddr_byte() {
+        let mut words = BUFFER_OFF_WORDS;
+        words[2] |= 3; // VADDR byte = 3 with OFFEN=IDXEN=0
+        let e = decode(&words).unwrap_err();
+        assert!(format!("{e:?}").contains("VADDR must be zero"), "{e:?}");
+    }
+
+    #[test]
+    fn buffer_offen_idxen_flags_keep_register_vaddr() {
+        // offen: one VGPR; idxen: one VGPR; idxen+offen: v[2:3] pair. Each round-trips.
+        for (flags, vaddr, len) in [(0x40u32, 3u32, 1u8), (0x80, 3, 1), (0xc0, 2, 2)] {
+            let mut words = BUFFER_OFF_WORDS;
+            words[1] = (words[1] & 0x00ff_ffff) | (flags << 24);
+            words[2] = (words[2] & !0xff) | vaddr;
+            let (inst, _) = decode(&words).unwrap();
+            assert_eq!(
+                inst.operands[1],
+                Operand::Reg(RegRef {
+                    kind: Kind::V,
+                    base: vaddr as u16,
+                    len
+                }),
+                "flags {flags:#x}"
+            );
+            assert_eq!(encode(&inst).unwrap().as_slice(), &words);
+        }
     }
 
     #[test]

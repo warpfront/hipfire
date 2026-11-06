@@ -814,13 +814,6 @@ fn parse_operand(
         return Ok(Operand::Special(special));
     }
     if text == "off" {
-        if slot == "VADDR" && row.form == Form::Vmem(peacemaker_ir::inst::VmemForm::Buffer) {
-            return Ok(Operand::Reg(RegRef {
-                kind: Kind::V,
-                base: 0,
-                len: width,
-            }));
-        }
         return Ok(Operand::Vmem(VmemToken::Off));
     }
     if text == "offen" {

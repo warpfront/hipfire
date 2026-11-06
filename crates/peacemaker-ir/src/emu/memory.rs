@@ -148,9 +148,10 @@ fn ds_atomic_execute(
     Ok(())
 }
 /// Validates the MUBUF operand shape and returns whether OFFEN supplies a vector offset.
-/// IDXEN is not representable in the IR: the decoder narrows the VADDR register to one
-/// dword for IDXEN xor OFFEN, so a one-dword VADDR without OFFEN, or a wider VADDR
-/// with OFFEN (index+offset pair), can only be an index-addressed access and is refused.
+/// Neither OFFEN nor IDXEN is spelled `Operand::Vmem(Off)` (VADDR unused). IDXEN is not
+/// representable otherwise: the decoder narrows the VADDR register to one dword for
+/// IDXEN xor OFFEN, so a register VADDR without OFFEN, or a wider VADDR with OFFEN
+/// (index+offset pair), can only be an index-addressed access and is refused.
 fn buffer_shape(ops: &[Operand]) -> Result<bool> {
     if ops.len() < 4 {
         return Err("buffer instruction requires data, address, SRD and soffset operands".into());
@@ -175,7 +176,6 @@ fn buffer_shape(ops: &[Operand]) -> Result<bool> {
             Err("buffer OFFEN requires one 32-bit VGPR; IDXEN addressing unsupported".into())
         }
         (Operand::Vmem(VmemToken::Off), false) => Ok(false),
-        (Operand::Reg(r), false) if r.kind == crate::reg::Kind::V && r.len > 1 => Ok(false),
         (Operand::Reg(_), false) => Err("buffer IDXEN addressing unsupported".into()),
         _ => Err("unsupported buffer address operand".into()),
     }
@@ -912,6 +912,7 @@ mod tests {
     fn idxen_shaped_addresses_are_hard_errors() {
         for (vaddr, extra) in [
             (reg(Kind::V, 2, 1), vec![]),
+            (reg(Kind::V, 2, 2), vec![]),
             (reg(Kind::V, 2, 2), vec![offen()]),
         ] {
             let (mut st, mut mem) = setup(0x3100_4000);
