@@ -420,11 +420,12 @@ impl SpecTarget for LlamaBundle {
     ///
     /// Runs a 1-token capture-armed forward via
     /// `forward_scratch_embed` + `forward_scratch_compute_capture`, reusing the
-    /// same `HiddenCaptureSink` path as `spec_advance`. The `layers` parameter
-    /// comes from the generic drafter's `DsparkConfig::target_layer_ids` and may
-    /// differ from `self.dflash_extract_layers` (e.g. when the bundle was not
-    /// configured as a DFlash target), so we use the argument directly rather
-    /// than `self.dflash_extract_layers`.
+    /// same `HiddenCaptureSink` path as `spec_advance`. `layers` comes from the
+    /// generic drafter's `DsparkConfig::target_layer_ids`; it is also recorded as
+    /// the bundle's extract layers (as qwen35 does), so every later
+    /// `verify_block_capture_gpu` hands DSpark its accepted-prefix hidden. Without
+    /// that the daemon's DSpark verify captured nothing: every window re-ran this
+    /// bootstrap forward and drafted from a single context slot.
     fn capture_seed_main_hidden(
         &mut self,
         gpu: &mut Gpu,
@@ -432,6 +433,7 @@ impl SpecTarget for LlamaBundle {
         position: usize,
         layers: &[usize],
     ) -> Result<Vec<f32>, String> {
+        self.set_dflash_extract_layers(layers.to_vec());
         let mut hidden_out: Vec<f32> = Vec::new();
         let mut sink = llama::HiddenCaptureSink {
             extract_layers: layers,
