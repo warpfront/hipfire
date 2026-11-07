@@ -159,3 +159,12 @@ pub use crate::serve_contract::{
     PublishLease, ReleaseDisposition, ReservationError, ResumeBundle, ResumePlan, ResumePlanError,
     SharingNamespace, StepNeeds, StepReservation, StepTicket, TemplateIdentity, TokenizerIdentity,
 };
+
+/// Wall-clock milliseconds (UNIX epoch, 0.1 ms) for cross-process trace lines:
+/// the serve gateway, this process and its threads stamp the same clock.
+pub fn trace_clock_ms() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{:.1}", now.as_secs_f64() * 1e3)
+}

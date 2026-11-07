@@ -858,7 +858,10 @@ fn main() {
         (0u32, PREFILL_ROWS, 4usize, true),
         (1, PREFILL_ROWS, 4, false),
         (0, 1525, 2, true),
-        (1, 37, 4, true),
+        // A short block runs whole, as production sends it (`sub_chunks_for`:
+        // no split below 512 rows): on the IU4 route since its floor dropped to
+        // 16, which a 4-way split into 9-10-row blocks would leave.
+        (1, 37, 1, true),
         (0, 2000, 1, true),
         (1, 5, 8, false),
     ] {

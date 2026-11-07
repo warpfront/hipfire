@@ -792,6 +792,57 @@ fn report_gpu_init_failure(err: &hip_bridge::HipError) {
 /// Validate and install process policy, resolving `hardware.devices` against
 /// the KFD topology before any GPU runtime initializes. `claim` reserves each
 /// resolved card as part of that same step.
+/// `HIPFIRE_QWEN_CACHE_TRACE=1`: how long the process sat idle before a
+/// `generate` arm (since the previous arm ended) and how long the arm ran,
+/// to tell a client-side wait from work done here after a `done`.
+struct GenerateArmTrace {
+    id: Option<String>,
+    started: std::time::Instant,
+}
+
+static LAST_GENERATE_END: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+impl GenerateArmTrace {
+    fn begin(id: &str) -> Self {
+        let started = std::time::Instant::now();
+        if !hipfire_config::developer_bool("HIPFIRE_QWEN_CACHE_TRACE", false) {
+            return Self { id: None, started };
+        }
+        let idle = LAST_GENERATE_END
+            .lock()
+            .ok()
+            .and_then(|last| *last)
+            .map(|end| format!("{:.1} ms", started.duration_since(end).as_secs_f64() * 1e3))
+            .unwrap_or_else(|| "n/a".into());
+        eprintln!(
+            "  request {id}: arm start at t={}, idle {idle} since the previous arm",
+            hipfire_runtime::trace_clock_ms()
+        );
+        Self {
+            id: Some(id.to_owned()),
+            started,
+        }
+    }
+}
+
+impl Drop for GenerateArmTrace {
+    fn drop(&mut self) {
+        let Some(id) = self.id.take() else {
+            return;
+        };
+        let end = std::time::Instant::now();
+        eprintln!(
+            "  request {id}: arm end at t={} after {:.1} ms",
+            hipfire_runtime::trace_clock_ms(),
+            end.duration_since(self.started).as_secs_f64() * 1e3
+        );
+        if let Ok(mut last) = LAST_GENERATE_END.lock() {
+            *last = Some(end);
+        }
+    }
+}
+
 fn install_process_config(
     config: hipfire_config::ProcessConfig,
     claim: &mut hipfire_config::devices::ClaimFn<'_>,
@@ -3096,6 +3147,7 @@ fn main() {
                 set_active_attempt_id(gen_attempt_id);
                 let _attempt_guard = ActiveAttemptGuard;
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("0");
+                let _arm_trace = GenerateArmTrace::begin(id);
                 let singleton_handoff = singleton_transfer_from_message.is_some();
                 let admission = match admission_from_message {
                     Some(admission) => admission,
