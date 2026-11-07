@@ -3335,6 +3335,7 @@ pub fn generate_dflash(
     // so the caller must fall through to the arch's AR path. Every other exit
     // (success, abort, error) has already written its envelope → true.
 ) -> bool {
+    let t_request = Instant::now();
     // Zero-budget reject before Jinja/render, configure_request, gen_start, or any
     // GPU/host mutation. Handled (true) so the caller does not fall through to AR.
     // Inner generate_spec keeps the same guard as defense-in-depth.
@@ -3915,6 +3916,13 @@ pub fn generate_dflash(
         id,
         started_in_think,
     );
+    if hipfire_config::developer_bool("HIPFIRE_QWEN_CACHE_TRACE", false) {
+        eprintln!(
+            "  request {id}: {:.1} ms render + tokenize before prefill ({} prompt tokens)",
+            t_request.elapsed().as_secs_f64() * 1e3,
+            prompt_tokens.len()
+        );
+    }
     let run = match generate_spec(
         m,
         gpu,

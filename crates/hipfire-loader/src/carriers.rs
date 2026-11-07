@@ -638,7 +638,9 @@ pub fn prepare_host_memory_for(model: &std::path::Path) {
 pub fn prepare_dispatch() {
     if hipfire_arch_qwen4::hetero_split_requested() {
         hip_bridge::dispatch_on_worker_threads("topology.hetero_experts");
-        hip_bridge::keep_host_memory_out_of_reclaim("topology.hetero_experts: experts host-mapped through gfx1201");
+        hip_bridge::keep_host_memory_out_of_reclaim(
+            "topology.hetero_experts: experts host-mapped through gfx1201",
+        );
     }
 }
 
@@ -9683,8 +9685,13 @@ fn load_qwen4_rank_unscoped(
         );
         bundle.set_turn_end_token(seed.tokenizer.special_token_id("<|im_end|>"));
         if bundle.turn_snapshots_active() {
+            let which = if bundle.final_turn_snapshots() {
+                "final message end"
+            } else {
+                "every message end"
+            };
             eprintln!(
-                "  qwen4 session cache{band_tag}: message-end snapshots on (HIPFIRE_QWEN4_TURN_SNAPSHOTS)"
+                "  qwen4 session cache{band_tag}: message-end snapshots on ({which}; HIPFIRE_QWEN4_TURN_SNAPSHOTS)"
             );
         }
     }
