@@ -1048,6 +1048,16 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
         })
     }
 
+    /// An owned (lane-local) MTP draft call: no rows cross, but the D2 tail still
+    /// sees the call, so the first call after a retirement issues its deferred
+    /// fills under the draft phase exactly as the replicated head gather does
+    /// (a head layer index logs no ids and counts no routed slots).
+    fn note_local_call(&self, gpu: &mut Gpu, layer_idx: u16, slots: usize, topk: &GpuTensor) {
+        if let Some(tail) = self.tail.get() {
+            tail.note_call(gpu, layer_idx, slots, topk);
+        }
+    }
+
     fn decode_step_end(&self, gpu: &mut Gpu) {
         if let Some(tail) = self.tail.get() {
             tail.step_end(gpu);
@@ -1202,6 +1212,33 @@ mod gather_hook_tests {
                     (layer as usize) < trunk_layers && !balanced,
                     "layer {layer} balanced {balanced}"
                 );
+            }
+        }
+    }
+
+    /// The lane-local head hook (`mtp_gpu::LaneLocalRowGather`, the no-op gather of an owned
+    /// draft lane) answers exactly what `Qwen4EpRowGatherHook` answers for the head's layer
+    /// indices (`trunk_layers + parity`): no owner assignment, no reduction partition, whatever
+    /// the rank, the partial route or a balanced trunk plan.
+    #[test]
+    fn the_lane_local_head_hook_answers_what_the_ep_hook_answers_for_head_layers() {
+        let trunk_layers = 48usize;
+        let hook = crate::mtp_gpu::LaneLocalRowGather { ep: None };
+        for rank in 0..2usize {
+            for parity in 0..2u16 {
+                let head = trunk_layers as u16 + parity;
+                // The real hook: a head layer is never a balanced layer (the tables are
+                // indexed by trunk layer label only) and never partitions.
+                assert!(balanced_layer_tables(&[], head, trunk_layers).is_none());
+                assert!(!hook.assigns_owners(head));
+                for balanced in [false, true] {
+                    for partial in [false, true] {
+                        assert_eq!(
+                            hook.reduction_partition(head),
+                            reduction_partition_of(head, trunk_layers, partial, balanced, rank, 2)
+                        );
+                    }
+                }
             }
         }
     }
@@ -2038,6 +2075,22 @@ impl Qwen4Bundle {
             Err(error) => return Err(release_rank0(gpu, error)),
         };
 
+        // 4a. Every rank's MTP head compact expert source (the lane-local head MoE's
+        // full table names this rank's tensors for its owned experts and the peer's
+        // for the rest). The set is identical on every rank, so every rank reaches
+        // the same install decision in step 5.
+        let head_sources = {
+            let me = &*self;
+            pool.run_all(
+                || me.mtp_ep_expert_source(),
+                &|_, peer: &mut Qwen4EpPeer| peer.bundle.mtp_ep_expert_source(),
+            )
+        };
+        let head_sources: Vec<Option<Qwen4PeerLayerSource>> = match head_sources {
+            Ok(sources) => sources,
+            Err(error) => return Err(release_rank0(gpu, error)),
+        };
+
         // 5. Full tables + hooks.
         let attach = |rank: usize, bundle: &mut Qwen4Bundle, gpu: &mut Gpu| -> Result<(), String> {
             let buffers = bundle
@@ -2097,6 +2150,11 @@ impl Qwen4Bundle {
                     .settle_moe_down_a8_head(gpu, true)
                     .map_err(|error| format!("settle the MoE down A8 head verdict: {error}"))
             });
+            // The head's lane-local (full-table) MoE runtime, once the forward, its
+            // row gather and the head's pending verdict are in place (a no-op under
+            // `HIPFIRE_QWEN4_EP_DRAFT_SPLIT=0` or without an EP-bound MoE head).
+            let result =
+                result.and_then(|()| bundle.install_mtp_lane_local_moe(gpu, &head_sources));
             if result.is_ok() {
                 crate::trunk_route::install(ar_hc.as_ref().map(|exchange| {
                     crate::trunk_route::TrunkShardRoute::new(exchange.clone(), rank, true, true)

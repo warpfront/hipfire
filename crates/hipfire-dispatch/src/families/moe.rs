@@ -1595,6 +1595,20 @@ pub trait MoeRowGather {
         Err("owner assignment not supported".into())
     }
 
+    /// A rank-local MoE call that replaces this hook's row gather (an X2 owned
+    /// MTP draft lane computes every slot itself and crosses nothing) reports
+    /// itself here at the point the gather would run, so per-call bookkeeping
+    /// that rides on the gather (the D2 expert tail's deferred fill issue) keeps
+    /// its timing. Must not touch the call's rows. No-op by default.
+    fn note_local_call(
+        &self,
+        _gpu: &mut rdna_compute::Gpu,
+        _layer_idx: u16,
+        _slots: usize,
+        _topk_indices: &GpuTensor,
+    ) {
+    }
+
     /// End of one decode window (a trunk forward over every lane's rows) on this
     /// rank, after its D2H sync and before the next window's launches: the D2
     /// expert tail retires the window here. No-op by default.

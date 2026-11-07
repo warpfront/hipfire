@@ -12,11 +12,21 @@
 //!   reads the target picks and decides the accepted prefix. Nothing else
 //!   chooses: a follower owns no RNG, no chooser and no cost model.
 //! * **Every rank** is a [`LaneMeshExecutor`] ([`RankLane`] over a
-//!   [`RankExec`]): it replays the root's messages on its own replicated lane
-//!   store, in the same order, with the same op lists, so every row gather
-//!   (target and head) has a matched crossing on both ranks. A follower's
-//!   answers are receipts only (state positions, the operation ledger it
-//!   actually executed, evidence): `proposals`/`sampler` stay `None`.
+//!   [`RankExec`]): it validates the root's messages on its own lane store,
+//!   in the same order, and runs the head work of **the lanes it heads**
+//!   ([`heads_lane`]). A replicated lane (`LanePlan::head_rank == None`: every
+//!   lane of a window with fewer than two head lanes) is replayed by every
+//!   rank with the same op lists, so every row gather (target and head) has a
+//!   matched crossing on both ranks. An owned lane (`Some(rank)`: the X2 draft
+//!   split, promoted by the root once a window carries two or more head lanes,
+//!   split evenly) is drafted, caught up, probed and head-repaired by its owner
+//!   alone: the owner runs the head MoE lane-local (full expert table, no
+//!   crossing), the peer keeps only the target side of the lane (a head-free
+//!   [`rank_view`]). A rank answers the ops of its owned lanes (and, if it is
+//!   the sampler owner, the replicated ones): `proposals` carry exactly the
+//!   answered ops, the root merges them in round order. Receipts (state
+//!   positions, the operation ledger the rank actually executed, evidence)
+//!   are per rank; `sampler` output stays the sampler owner's.
 //! * Each phase is dispatched to every rank **concurrently**
 //!   ([`Qwen4EpMesh::run`] over the existing [`RankPool`]): rank 0 runs on the
 //!   caller's thread, peers on their workers. A phase that contains a
@@ -30,9 +40,11 @@
 //!
 //! `begin_window` validates the lane tables against the plan, maps capacity
 //! (trunk and head arenas) and, for every native lane, takes the head ticket
-//! and arms the GDN ring and takes the target ticket. `run_draft_round` runs
-//! the root's ordered head `Draft` ops (one deferred head step per op, then
-//! one download; only the root reads proposals). `run_verify` runs the one
+//! and arms the GDN ring and takes the target ticket (a lane a peer owns takes
+//! no head ticket here). `run_draft_round` runs
+//! the root's ordered head `Draft` ops of the lanes the rank heads (one
+//! deferred head step per op, or one batched call over them, then one
+//! download; only the answering rank reads a proposal). `run_verify` runs the one
 //! trunk forward over the sealed rows of every lane (`forward_lanes`, row
 //! groups of whole lanes) and returns the executed ledger. `prepare_commit`
 //! repairs the rank's own target and head to the root's decision with
@@ -86,14 +98,15 @@ use crate::lane::download_lane_rows;
 use crate::lane::{LabRoutes, LaneSpec, LaneStatus, Qwen4LaneState, Qwen4LaneStore, StepParts};
 use crate::lane_exec::pick_at;
 use crate::mesh_lane_protocol::SamplingMode;
+use crate::mesh_lane_protocol::{ep_draft_split_enabled, heads_lane};
 use crate::mesh_lane_protocol::{
     AbortRecord, AcceptRule, CommitDecision, ControllerInterval, DevicePick, DraftProposal,
-    DraftRound, EvidenceError, HeadState, LaneAdmission, LaneAdmit, LaneKind, LaneMeshExecutor,
-    LanePlan, LaneRequest, LaneWindowKey, MergedCostEvidence, MeshRoot, MeshStepKey, OpCounts,
-    OpLedger, PhaseTiming, PreparedReceipt, ProposalSource, ProtocolError, RankCostEvidence,
-    RankDraftResult, RankError, RankOwnership, RankReady, RankSession, RankVerifyResult,
-    ReadyStatus, RootConfig, SamplerOutput, StagePolicy, StepOutput, StepPhase, TimedPhase,
-    VerifyPlan, WindowBudgets, WindowStart,
+    DraftRound, EvidenceError, HeadAppend, HeadEnd, HeadState, LaneAdmission, LaneAdmit,
+    LaneDecision, LaneKind, LaneMeshExecutor, LanePlan, LaneRequest, LaneWindowKey,
+    MergedCostEvidence, MeshRoot, MeshStepKey, OpCounts, OpLedger, PhaseTiming, PreparedReceipt,
+    ProposalSource, ProtocolError, RankCostEvidence, RankDraftResult, RankError, RankOwnership,
+    RankReady, RankSession, RankVerifyResult, ReadyStatus, RootConfig, SamplerOutput, StagePolicy,
+    StepOutput, StepPhase, TimedPhase, VerifyPlan, WindowBudgets, WindowStart,
 };
 use crate::mesh_rank_copy::{
     arm_lane_verify, begin_lane_window, catch_up_lane, head_ticket_point, is_probe_op,
@@ -109,6 +122,7 @@ use hipfire_runtime::lane_draw::{lane_draws, LaneDraw, LaneDrawArena, LaneDrawJo
 use hipfire_runtime::slot_batch::RequestEpoch;
 use hipfire_runtime::spec::SpecRequestConfig;
 use rdna_compute::{Gpu, GpuTensor};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -163,9 +177,10 @@ struct LaneWin {
 }
 
 impl LaneWin {
-    fn new(plan: &LanePlan) -> Self {
+    /// `own`'s window of `plan` ([`rank_view`]).
+    fn new(plan: &LanePlan, own: &RankOwnership) -> Self {
         Self {
-            plan: plan.clone(),
+            plan: rank_view(own, plan).into_owned(),
             prefix: 1.0,
             local_drafts: Vec::new(),
             rows: Vec::new(),
@@ -173,6 +188,46 @@ impl LaneWin {
             picks: Vec::new(),
         }
     }
+}
+
+/// This rank's view of a lane's plan. A lane whose head a peer owns
+/// ([`heads_lane`] is false though the window touches the head) is head-free
+/// here: no head arena mapping, ticket, catch-up, append or owed row (the same
+/// treatment as a head-free lane, which already runs target-only). Every other
+/// lane's plan is unchanged.
+fn rank_view<'a>(own: &RankOwnership, plan: &'a LanePlan) -> Cow<'a, LanePlan> {
+    if plan.head == HeadState::Free || heads_lane(own, plan) {
+        Cow::Borrowed(plan)
+    } else {
+        Cow::Owned(LanePlan {
+            head: HeadState::Free,
+            catch_up: None,
+            ..plan.clone()
+        })
+    }
+}
+
+/// The decision as this rank repairs it: a head-free view of a lane
+/// ([`rank_view`]) carries no head schedule.
+fn rank_decision<'a>(d: &'a LaneDecision, view: &LanePlan) -> Cow<'a, LaneDecision> {
+    if view.head == HeadState::Free
+        && (d.head_append != HeadAppend::default() || d.head_end != HeadEnd::Free)
+    {
+        Cow::Owned(LaneDecision {
+            head_append: HeadAppend::default(),
+            head_end: HeadEnd::Free,
+            ..d.clone()
+        })
+    } else {
+        Cow::Borrowed(d)
+    }
+}
+
+/// Whether the rank that executes an op of `plan` answers it (reads its
+/// proposal): the owner of an owned lane, the sampler owner for a replicated
+/// one.
+fn answers_op(plan: &LanePlan, sampler: bool) -> bool {
+    plan.head_rank.is_some() || sampler
 }
 
 struct ExecStep {
@@ -334,6 +389,9 @@ struct OpRead {
     abandoned: bool,
     /// The head's rescored candidates (rank 0, native Leviathan lane only).
     read: Option<DraftRead>,
+    /// FNV-1a of the op's `draft_top1` slot (lab draft trace).
+    #[cfg(feature = "lab")]
+    top1_fnv: u64,
 }
 
 /// The sampler owner's resident verify logits, read one row at a time by the
@@ -454,6 +512,7 @@ impl RankLane<'_> {
                 self.exec.rank, start.stage.all_rows
             ));
         }
+        let own = self.own();
         let Self { bundle, gpu, .. } = self;
         let (spec_k, rows_cap, max_lanes) = {
             let store = bundle
@@ -535,7 +594,8 @@ impl RankLane<'_> {
                         crate::lane_exec::PROVISION_MAP_REFUSED
                     )
                 })?;
-                begin_lane_window(bundle, gpu, lane, plan)?;
+                let view = rank_view(&own, plan);
+                begin_lane_window(bundle, gpu, lane, &view)?;
             }
             Ok(())
         })
@@ -593,89 +653,161 @@ impl RankLane<'_> {
             if round.ops.is_empty() {
                 return Ok((catch_rows, Vec::new()));
             }
-            let epochs: Vec<RequestEpoch> = round.ops.iter().map(|o| o.key.request_epoch).collect();
-            let (mut lanes, spec_store) = store.draft_parts(&epochs)?;
-            let spec_store =
-                spec_store.ok_or_else(|| "head draft in a store without MTP lanes".to_string())?;
-            let slot_bytes = Gpu::TOPK8_OUT_BYTES;
-            let bytes = round.ops.len() * slot_bytes;
-            if bytes > spec_store.draft_top1_host.len() {
-                return Err(format!(
-                    "{} draft ops exceed the {} draft slots",
-                    round.ops.len(),
-                    spec_store.draft_top1_host.len() / slot_bytes
-                ));
-            }
-            // Lab settling test of the draft-history mask (PARITY.md 4.3): head
-            // arena rows beyond each lane's valid lengths are overwritten
-            // (`HIPFIRE_LAB_MTP_STALE_FILL`); every output must stay identical.
-            #[cfg(feature = "lab")]
-            crate::lab_draft_rounds::fill_stale(gpu, &lanes)?;
-            // Lab oracle of the batched head round: compare this round's lanes'
-            // serial and batched head steps on scratch twins of their states
-            // (no effect on the lanes; armed by env only, `lab` builds only).
-            #[cfg(feature = "lab")]
-            if crate::lab_draft_rounds::probe_enabled()
-                && round.ops.len() >= 2
-                && !round.ops.iter().try_fold(false, |any, op| {
-                    Ok::<_, String>(any || is_probe_op(plan_of(&op.key)?, op.position))
-                })?
-            {
-                let ops: Vec<(u32, usize)> =
-                    round.ops.iter().map(|op| (op.input, op.position)).collect();
-                crate::lab_draft_rounds::probe_round(
-                    bundle,
-                    gpu,
-                    &mut lanes,
-                    &ops,
-                    exec.rank,
-                    round.round,
-                )?;
-            }
-            // The draft head's logit row is one shared buffer: a sampled lane's
-            // read of a head without re-scoring is that whole row, so with
-            // more than one op in the round each op must be enqueued, finished
-            // and read before the next op's enqueue overwrites it. Candidate
-            // reads are host-resident after each finish and keep the one
-            // batched download. Ops of a round are distinct lanes, so the
-            // order of finishing does not move any lane's state.
-            let want_read_any = round.ops.iter().try_fold(false, |any, op| {
-                let plan = plan_of(&op.key)?;
-                Ok::<_, String>(any || (sampler && plan.wants_candidate_read()))
+            // The round's ops are every op this rank executes: all owned by this
+            // rank's lanes, or all replicated (the protocol refuses a mix). An
+            // owned round runs the head lane-local (the full-table MoE runtime:
+            // no crossing, no `moe_steps` advance); the mode is restored on every
+            // path out.
+            let lane_local = round.ops.iter().try_fold(false, |any, op| {
+                Ok::<_, String>(any || plan_of(&op.key)?.head_rank.is_some())
             })?;
-            // One batched head call per round (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`):
-            // decided from the root's plan alone (every rank takes the same
-            // branch: the head's gather parity advances once per batched call).
-            let any_distribution_read = round.ops.iter().try_fold(false, |any, op| {
-                let plan = plan_of(&op.key)?;
-                Ok::<_, String>(any || plan.wants_candidate_read())
-            })?;
-            let batched = crate::mtp_lanes::draft_round_batchable(
-                bundle,
-                round.ops.len(),
-                any_distribution_read,
-            );
-            let chunks =
-                draft_read_plan(want_read_any, bundle.mtp_draft_rescored(), round.ops.len())
-                    .chunks(round.ops.len());
-            let mut reads = Vec::with_capacity(round.ops.len());
-            for chunk in chunks {
-                if batched {
-                    let mut inputs = Vec::with_capacity(round.ops.len());
-                    for (slot, op) in round.ops.iter().enumerate() {
-                        if is_probe_op(plan_of(&op.key)?, op.position) {
-                            save_probe_state(&mut *lanes[slot]);
-                        }
-                        inputs.push((op.input, op.position));
-                    }
-                    crate::mtp_lanes::enqueue_batched_draft(
+            if lane_local {
+                bundle
+                    .mtp_set_lane_local(true)
+                    .map_err(|e| format!("head lane-local mode: {e}"))?;
+            }
+            let ran = (|| -> R<Vec<OpRead>> {
+                let epochs: Vec<RequestEpoch> =
+                    round.ops.iter().map(|o| o.key.request_epoch).collect();
+                let (mut lanes, spec_store) = store.draft_parts(&epochs)?;
+                let spec_store = spec_store
+                    .ok_or_else(|| "head draft in a store without MTP lanes".to_string())?;
+                let slot_bytes = Gpu::TOPK8_OUT_BYTES;
+                let bytes = round.ops.len() * slot_bytes;
+                if bytes > spec_store.draft_top1_host.len() {
+                    return Err(format!(
+                        "{} draft ops exceed the {} draft slots",
+                        round.ops.len(),
+                        spec_store.draft_top1_host.len() / slot_bytes
+                    ));
+                }
+                // Lab settling test of the draft-history mask (PARITY.md 4.3): head
+                // arena rows beyond each lane's valid lengths are overwritten
+                // (`HIPFIRE_LAB_MTP_STALE_FILL`); every output must stay identical.
+                #[cfg(feature = "lab")]
+                crate::lab_draft_rounds::fill_stale(gpu, &lanes)?;
+                // Lab oracle of the batched head round: compare this round's lanes'
+                // serial and batched head steps on scratch twins of their states
+                // (no effect on the lanes; armed by env only, `lab` builds only).
+                #[cfg(feature = "lab")]
+                if crate::lab_draft_rounds::probe_enabled()
+                    && round.ops.len() >= 2
+                    && !round.ops.iter().try_fold(false, |any, op| {
+                        Ok::<_, String>(any || is_probe_op(plan_of(&op.key)?, op.position))
+                    })?
+                {
+                    let ops: Vec<(u32, usize)> =
+                        round.ops.iter().map(|op| (op.input, op.position)).collect();
+                    crate::lab_draft_rounds::probe_round(
                         bundle,
                         gpu,
                         &mut lanes,
-                        &inputs,
-                        &spec_store.draft_top1,
+                        &ops,
+                        exec.rank,
+                        round.round,
                     )?;
-                } else {
+                }
+                // The draft head's logit row is one shared buffer: a sampled lane's
+                // read of a head without re-scoring is that whole row, so with
+                // more than one op in the round each op must be enqueued, finished
+                // and read before the next op's enqueue overwrites it. Candidate
+                // reads are host-resident after each finish and keep the one
+                // batched download. Ops of a round are distinct lanes, so the
+                // order of finishing does not move any lane's state.
+                let want_read_any = round.ops.iter().try_fold(false, |any, op| {
+                    let plan = plan_of(&op.key)?;
+                    Ok::<_, String>(
+                        any || (answers_op(plan, sampler) && plan.wants_candidate_read()),
+                    )
+                })?;
+                // One batched head call per round (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`):
+                // decided from the root's plan alone over the ops this rank executes
+                // (a replicated round: every rank takes the same branch, the head's
+                // gather parity advances once per batched call).
+                let any_distribution_read = round.ops.iter().try_fold(false, |any, op| {
+                    let plan = plan_of(&op.key)?;
+                    Ok::<_, String>(any || plan.wants_candidate_read())
+                })?;
+                let batched = crate::mtp_lanes::draft_round_batchable(
+                    bundle,
+                    round.ops.len(),
+                    any_distribution_read,
+                );
+                let chunks =
+                    draft_read_plan(want_read_any, bundle.mtp_draft_rescored(), round.ops.len())
+                        .chunks(round.ops.len());
+                let mut reads = Vec::with_capacity(round.ops.len());
+                for chunk in chunks {
+                    if batched {
+                        let mut inputs = Vec::with_capacity(round.ops.len());
+                        for (slot, op) in round.ops.iter().enumerate() {
+                            if is_probe_op(plan_of(&op.key)?, op.position) {
+                                save_probe_state(&mut *lanes[slot]);
+                            }
+                            inputs.push((op.input, op.position));
+                        }
+                        crate::mtp_lanes::enqueue_batched_draft(
+                            bundle,
+                            gpu,
+                            &mut lanes,
+                            &inputs,
+                            &spec_store.draft_top1,
+                        )?;
+                    } else {
+                        for (slot, op) in round
+                            .ops
+                            .iter()
+                            .enumerate()
+                            .skip(chunk.start)
+                            .take(chunk.len())
+                        {
+                            // The confirmation probe's Draft is abandoned on a hit: save
+                            // the head's request state it is about to move.
+                            if is_probe_op(plan_of(&op.key)?, op.position) {
+                                save_probe_state(&mut *lanes[slot]);
+                            }
+                            let Qwen4LaneState { state, spec, .. } = &mut *lanes[slot];
+                            let spec = spec
+                                .as_mut()
+                                .ok_or_else(|| "drafting lane lost its MTP state".to_string())?;
+                            let LaneSpec {
+                                head,
+                                draft,
+                                pending_hidden,
+                                window,
+                                ..
+                            } = spec;
+                            let window_position = window
+                                .as_ref()
+                                .ok_or_else(|| "draft op without a pending window".to_string())?
+                                .position;
+                            let top1 = spec_store
+                                .draft_top1
+                                .sub_offset(slot * slot_bytes, slot_bytes);
+                            let j = op.position - window_position;
+                            let hidden = (j == 0).then_some(&*pending_hidden);
+                            lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
+                                b.mtp_forward_token_deferred(
+                                    gpu,
+                                    op.input,
+                                    hidden,
+                                    op.position,
+                                    j == 0,
+                                    &top1,
+                                )
+                            }))
+                            .map_err(|e| format!("draft step {j}: {e}"))?;
+                        }
+                    }
+                    let (from, to) = (chunk.start * slot_bytes, chunk.end * slot_bytes);
+                    let chunk_top1 = spec_store.draft_top1.sub_offset(from, to - from);
+                    gpu.dtoh_stream_ordered(
+                        &mut spec_store.draft_top1_host[from..to],
+                        &chunk_top1.buf,
+                    )
+                    .map_err(|e| format!("draft download: {e}"))?;
+                    gpu.take_device_wait_error()
+                        .map_err(|e| format!("draft download: {e}"))?;
                     for (slot, op) in round
                         .ops
                         .iter()
@@ -683,125 +815,92 @@ impl RankLane<'_> {
                         .skip(chunk.start)
                         .take(chunk.len())
                     {
-                        // The confirmation probe's Draft is abandoned on a hit: save
-                        // the head's request state it is about to move.
-                        if is_probe_op(plan_of(&op.key)?, op.position) {
-                            save_probe_state(&mut *lanes[slot]);
-                        }
-                        let Qwen4LaneState { state, spec, .. } = &mut *lanes[slot];
-                        let spec = spec
-                            .as_mut()
-                            .ok_or_else(|| "drafting lane lost its MTP state".to_string())?;
-                        let LaneSpec {
-                            head,
-                            draft,
-                            pending_hidden,
-                            window,
-                            ..
-                        } = spec;
-                        let window_position = window
-                            .as_ref()
-                            .ok_or_else(|| "draft op without a pending window".to_string())?
-                            .position;
-                        let top1 = spec_store
-                            .draft_top1
-                            .sub_offset(slot * slot_bytes, slot_bytes);
-                        let j = op.position - window_position;
-                        let hidden = (j == 0).then_some(&*pending_hidden);
-                        lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
-                            b.mtp_forward_token_deferred(
-                                gpu,
-                                op.input,
-                                hidden,
-                                op.position,
-                                j == 0,
-                                &top1,
+                        let top =
+                            &spec_store.draft_top1_host[slot * slot_bytes..(slot + 1) * slot_bytes];
+                        let plan = plan_of(&op.key)?;
+                        let want_read = answers_op(plan, sampler) && plan.wants_candidate_read();
+                        let (token, margin, read) = if batched {
+                            let (token, margin) = crate::mtp_lanes::finish_batched_draft(
+                                bundle,
+                                &mut *lanes[slot],
+                                top,
                             )
-                        }))
-                        .map_err(|e| format!("draft step {j}: {e}"))?;
-                    }
-                }
-                let (from, to) = (chunk.start * slot_bytes, chunk.end * slot_bytes);
-                let chunk_top1 = spec_store.draft_top1.sub_offset(from, to - from);
-                gpu.dtoh_stream_ordered(&mut spec_store.draft_top1_host[from..to], &chunk_top1.buf)
-                    .map_err(|e| format!("draft download: {e}"))?;
-                gpu.take_device_wait_error()
-                    .map_err(|e| format!("draft download: {e}"))?;
-                for (slot, op) in round
-                    .ops
-                    .iter()
-                    .enumerate()
-                    .skip(chunk.start)
-                    .take(chunk.len())
-                {
-                    let top =
-                        &spec_store.draft_top1_host[slot * slot_bytes..(slot + 1) * slot_bytes];
-                    let plan = plan_of(&op.key)?;
-                    let want_read = sampler && plan.wants_candidate_read();
-                    let (token, margin, read) = if batched {
-                        let (token, margin) =
-                            crate::mtp_lanes::finish_batched_draft(bundle, &mut *lanes[slot], top)
-                                .map_err(|e| format!("draft finish: {e}"))?;
-                        let read = if want_read {
-                            Some(
-                                bundle
-                                    .mtp_draft_read(gpu)
-                                    .map_err(|e| format!("draft finish: {e}"))?,
-                            )
-                        } else {
-                            None
-                        };
-                        (token, margin, read)
-                    } else {
-                        let Qwen4LaneState { state, spec, .. } = &mut *lanes[slot];
-                        let spec = spec
-                            .as_mut()
-                            .ok_or_else(|| "drafting lane lost its MTP state".to_string())?;
-                        let LaneSpec { head, draft, .. } = spec;
-                        lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
-                            let token = b.mtp_draft_finish(top)?;
+                            .map_err(|e| format!("draft finish: {e}"))?;
                             let read = if want_read {
-                                Some(b.mtp_draft_read(gpu)?)
+                                Some(
+                                    bundle
+                                        .mtp_draft_read(gpu)
+                                        .map_err(|e| format!("draft finish: {e}"))?,
+                                )
                             } else {
                                 None
                             };
-                            Ok::<_, BundleError>((token, b.mtp_draft_margin(), read))
-                        }))
-                        .map_err(|e| format!("draft finish: {e}"))?
-                    };
-                    let j = {
-                        let w = lanes[slot]
-                            .spec
-                            .as_ref()
-                            .and_then(|s| s.window.as_ref())
-                            .ok_or_else(|| "draft op without a pending window".to_string())?;
-                        op.position - w.position
-                    };
-                    // The probe: the head's argmax at the seed against the first
-                    // candidate (the root's own rule, evaluated on this rank's
-                    // read; the verify rows the root seals validate it). A hit,
-                    // or a miss with no native route, abandons the probe's step.
-                    let mut abandoned = false;
-                    if is_probe_op(plan, op.position) {
-                        let outcome = probe_outcome(&plan.copy_drafts, token, plan.native_depth);
-                        settle_probe(bundle, gpu, &mut *lanes[slot], outcome)?;
-                        abandoned = outcome.restores_head();
-                    }
-                    if !abandoned {
-                        if let Some(w) = lanes[slot].spec.as_mut().and_then(|s| s.window.as_mut()) {
-                            w.steps += 1;
+                            (token, margin, read)
+                        } else {
+                            let Qwen4LaneState { state, spec, .. } = &mut *lanes[slot];
+                            let spec = spec
+                                .as_mut()
+                                .ok_or_else(|| "drafting lane lost its MTP state".to_string())?;
+                            let LaneSpec { head, draft, .. } = spec;
+                            lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
+                                let token = b.mtp_draft_finish(top)?;
+                                let read = if want_read {
+                                    Some(b.mtp_draft_read(gpu)?)
+                                } else {
+                                    None
+                                };
+                                Ok::<_, BundleError>((token, b.mtp_draft_margin(), read))
+                            }))
+                            .map_err(|e| format!("draft finish: {e}"))?
+                        };
+                        let j = {
+                            let w = lanes[slot]
+                                .spec
+                                .as_ref()
+                                .and_then(|s| s.window.as_ref())
+                                .ok_or_else(|| "draft op without a pending window".to_string())?;
+                            op.position - w.position
+                        };
+                        // The probe: the head's argmax at the seed against the first
+                        // candidate (the root's own rule, evaluated on this rank's
+                        // read; the verify rows the root seals validate it). A hit,
+                        // or a miss with no native route, abandons the probe's step.
+                        let mut abandoned = false;
+                        if is_probe_op(plan, op.position) {
+                            let outcome =
+                                probe_outcome(&plan.copy_drafts, token, plan.native_depth);
+                            settle_probe(bundle, gpu, &mut *lanes[slot], outcome)?;
+                            abandoned = outcome.restores_head();
                         }
+                        if !abandoned {
+                            if let Some(w) =
+                                lanes[slot].spec.as_mut().and_then(|s| s.window.as_mut())
+                            {
+                                w.steps += 1;
+                            }
+                        }
+                        reads.push(OpRead {
+                            token,
+                            margin,
+                            j,
+                            abandoned,
+                            read: if abandoned { None } else { read },
+                            #[cfg(feature = "lab")]
+                            top1_fnv: lab_trace::fnv1a(top),
+                        });
                     }
-                    reads.push(OpRead {
-                        token,
-                        margin,
-                        j,
-                        abandoned,
-                        read: if abandoned { None } else { read },
-                    });
                 }
+                Ok(reads)
+            })();
+            if lane_local {
+                let off = bundle
+                    .mtp_set_lane_local(false)
+                    .map_err(|e| format!("head lane-local mode off: {e}"));
+                let reads = ran?;
+                off?;
+                return Ok((catch_rows, reads));
             }
-            Ok((catch_rows, reads))
+            ran.map(|reads| (catch_rows, reads))
         })
     }
 
@@ -954,6 +1053,8 @@ impl RankLane<'_> {
                     continue;
                 }
                 let win = &step.lanes[i];
+                // A lane a peer owns repairs target-only here (no head schedule).
+                let local_decision = rank_decision(d, &win.plan);
                 let config = spec_config
                     .ok_or_else(|| "MTP lane in a store without MTP lanes".to_string())?;
                 let hidden =
@@ -964,7 +1065,7 @@ impl RankLane<'_> {
                     &mut **lane,
                     RankPrepare {
                         plan: &win.plan,
-                        decision: d,
+                        decision: &local_decision,
                         verify: &verify.lanes[i],
                         config,
                         hidden,
@@ -1117,7 +1218,12 @@ impl LaneMeshExecutor for RankLane<'_> {
             }
             return ready;
         }
-        let lanes: Vec<LaneWin> = start.lanes.iter().map(LaneWin::new).collect();
+        let own = self.own();
+        let lanes: Vec<LaneWin> = start
+            .lanes
+            .iter()
+            .map(|plan| LaneWin::new(plan, &own))
+            .collect();
         let unpriced = !self.exec.stepped
             || lanes
                 .iter()
@@ -1157,12 +1263,55 @@ impl LaneMeshExecutor for RankLane<'_> {
 
     fn run_draft_round(&mut self, round: &DraftRound) -> Result<RankDraftResult, RankError> {
         let rank = self.rank();
-        let sampler = self.own().sampler;
+        let own = self.own();
+        let sampler = own.sampler;
         let mut result = self.exec.session.on_draft_round(round)?;
+        // This rank's slice of the round: the catch-ups and ops of the lanes it
+        // heads (every replicated lane's, and its own lanes'). The reducer
+        // validated the whole round and counted the same slice.
+        let exec_round = {
+            let step = self
+                .exec
+                .step
+                .as_ref()
+                .ok_or_else(|| rank_err(rank, "draft round without a begun window"))?;
+            let heads = |key: &LaneWindowKey| {
+                step.lanes
+                    .iter()
+                    .find(|w| w.plan.key == *key)
+                    .is_some_and(|w| heads_lane(&own, &w.plan))
+            };
+            DraftRound {
+                key: round.key.clone(),
+                round: round.round,
+                ops: round
+                    .ops
+                    .iter()
+                    .filter(|op| heads(&op.key))
+                    .copied()
+                    .collect(),
+                catch_up: round
+                    .catch_up
+                    .iter()
+                    .filter(|(key, _)| heads(key))
+                    .cloned()
+                    .collect(),
+            }
+        };
+        if exec_round.ops.len() != result.ops_executed {
+            return Err(rank_err(
+                rank,
+                format!(
+                    "the rank's window heads {} ops of the round, the reducer counted {}",
+                    exec_round.ops.len(),
+                    result.ops_executed
+                ),
+            ));
+        }
         let before = gather_tally();
         let t0 = Instant::now();
         let (catch_rows, reads) = self
-            .draft_round_device(round, sampler)
+            .draft_round_device(&exec_round, sampler)
             .map_err(|e| rank_err(rank, e))?;
         let tally = gather_tally().since(before);
         if catch_rows != result.catch_up_rows {
@@ -1183,48 +1332,69 @@ impl LaneMeshExecutor for RankLane<'_> {
             head: step.draft_tally.head + tally.head,
             bytes: step.draft_tally.bytes + tally.bytes,
         };
-        step.head_calls += round.ops.len();
+        step.head_calls += exec_round.ops.len();
         step.catch_up_rows += catch_rows;
         result.head_gathers = tally.head as usize;
-        let mut proposals = Vec::with_capacity(round.ops.len());
-        for (op, read) in round.ops.iter().zip(reads) {
+        let mut proposals = Vec::with_capacity(exec_round.ops.len());
+        #[cfg(feature = "lab")]
+        let mut traced: Vec<serde_json::Value> = Vec::new();
+        for (op, read) in exec_round.ops.iter().zip(reads) {
             let win = step
                 .lanes
                 .iter_mut()
                 .find(|w| w.plan.key == op.key)
                 .ok_or_else(|| rank_err(rank, "draft op for a lane outside the plan"))?;
-            if read.abandoned {
+            let (keep_going, drop_last) = if read.abandoned {
                 // The probe's head step was abandoned: the root confirms (or
                 // falls back) from this token; no draft step stays.
-                proposals.push(DraftProposal {
-                    key: op.key,
-                    token: read.token,
-                    keep_going: false,
-                    drop_last: false,
-                    read: None,
-                });
+                (false, false)
+            } else {
+                win.local_drafts.push(read.token);
+                // The singleton's early stop, statement for statement: a token
+                // after the first whose prefix acceptance fell below the row worth
+                // is drafted but not kept; deeper drafting stops once even the
+                // best per-draft acceptance cannot make the next row worth it.
+                win.prefix *= draft_accept_estimate(read.margin);
+                let drop_last = read.j > 0 && win.prefix < MTP_ROW_WORTH;
+                let done = win.prefix * DRAFT_ACCEPT_MAX < MTP_ROW_WORTH
+                    || read.j + 1 >= native_keep_cap(&win.plan);
+                (!drop_last && !done, drop_last)
+            };
+            // The ops this rank answers: its own lanes', and the replicated
+            // ones on the sampler owner (every other rank only keeps its own
+            // head state in step).
+            if !answers_op(&win.plan, sampler) {
                 continue;
             }
-            win.local_drafts.push(read.token);
-            // The singleton's early stop, statement for statement: a token
-            // after the first whose prefix acceptance fell below the row worth
-            // is drafted but not kept; deeper drafting stops once even the
-            // best per-draft acceptance cannot make the next row worth it.
-            win.prefix *= draft_accept_estimate(read.margin);
-            let drop_last = read.j > 0 && win.prefix < MTP_ROW_WORTH;
-            let done = win.prefix * DRAFT_ACCEPT_MAX < MTP_ROW_WORTH
-                || read.j + 1 >= native_keep_cap(&win.plan);
+            #[cfg(feature = "lab")]
+            traced.push(serde_json::json!({
+                "step_seq": round.key.step_seq,
+                "round": round.round,
+                "request_tag": op.key.request_epoch.request_tag,
+                "position": op.position,
+                "input": op.input,
+                "token": read.token,
+                "margin_bits": read.margin.to_bits(),
+                "top1_fnv": format!("{:016x}", read.top1_fnv),
+                "keep_going": keep_going,
+                "drop_last": drop_last,
+                "owned": win.plan.head_rank.is_some(),
+            }));
             proposals.push(DraftProposal {
                 key: op.key,
                 token: read.token,
-                keep_going: !drop_last && !done,
+                keep_going,
                 drop_last,
                 // Greedy lanes propose the head's argmax; a sampled lane's
-                // distribution read (S4) is the sampler owner's alone.
+                // distribution read (S4) is the answering rank's alone.
                 read: read.read,
             });
         }
-        if sampler {
+        #[cfg(feature = "lab")]
+        if let Some(dir) = lab_trace::dir() {
+            lab_trace::append(&dir, rank, &traced).map_err(|e| rank_err(rank, e))?;
+        }
+        if !proposals.is_empty() {
             result.proposals = Some(proposals);
         }
         Ok(result)
@@ -1284,6 +1454,7 @@ impl LaneMeshExecutor for RankLane<'_> {
             target_exchanges: tally.trunk as usize,
             microbatches: 0,
             head_draft_calls: plan.ledger.head_draft_calls,
+            head_draft_calls_by_rank: plan.ledger.head_draft_calls_by_rank.clone(),
         };
         if sampler {
             let mut out = SamplerOutput::picks_only(
@@ -1883,6 +2054,9 @@ pub struct EpMeshLanes {
     last_merged: Option<MergedCostEvidence>,
     steps: u64,
     sampler: Option<LaneSampler>,
+    /// Whether the root's draft-split setting has been decided from every
+    /// rank's head ([`Self::decide_draft_split`]); done once, at the first step.
+    draft_split_decided: bool,
 }
 
 /// What [`EpMeshLanes::step`] reports besides the output.
@@ -2004,6 +2178,7 @@ impl EpMeshLanes {
             last_merged: None,
             steps: 0,
             sampler: Some(LaneSampler::new(bundle.lane_vocab())),
+            draft_split_decided: false,
         })
     }
 
@@ -2047,6 +2222,48 @@ impl EpMeshLanes {
     /// decode price.
     pub fn note_prefill(&mut self) {
         self.prefill_ran = true;
+    }
+
+    /// Decide the X2 draft split once, at the first step: the root may give a
+    /// window's head lanes owners only while `HIPFIRE_QWEN4_EP_DRAFT_SPLIT` is not
+    /// `0` and every rank's MTP head can run lane-local
+    /// ([`Qwen4Bundle::mtp_lane_local_ready`]: rank 0 and every peer, asked
+    /// through the pool). Logs the decision once.
+    fn decide_draft_split(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+    ) -> Result<(), MeshStepError> {
+        let ready = {
+            let (mut fan, _) = self.fan(bundle, gpu);
+            fan.soft(&|lane| lane.bundle.mtp_lane_local_ready())
+        }
+        .map_err(|e| {
+            MeshStepError::Protocol(ProtocolError::Config(format!(
+                "draft split readiness, rank {}: {}",
+                e.rank, e.reason
+            )))
+        })?;
+        let (want, reason) = if !ep_draft_split_enabled() {
+            (false, "HIPFIRE_QWEN4_EP_DRAFT_SPLIT=0".to_string())
+        } else if let Some(rank) = ready.iter().position(|ready| !ready) {
+            (
+                false,
+                format!("rank {rank}'s MTP head has no lane-local MoE"),
+            )
+        } else {
+            (
+                true,
+                format!("every one of {} ranks is lane-local ready", ready.len()),
+            )
+        };
+        let on = self.root.set_draft_split(want);
+        eprintln!(
+            "qwen4 EP draft split: {} ({reason})",
+            if on { "on" } else { "off" }
+        );
+        self.draft_split_decided = true;
+        Ok(())
     }
 
     fn fan<'a>(
@@ -2150,6 +2367,9 @@ impl EpMeshLanes {
         self.interval_start = Some(now);
         let prior_priced = prior.as_ref().map(|m| m.priced);
         self.last_merged = prior.clone().or(self.last_merged.take());
+        if !self.draft_split_decided {
+            self.decide_draft_split(bundle, gpu)?;
+        }
         let (mut fan, root) = self.fan(bundle, gpu);
         let driven = drive_step(root, &mut fan, prior.as_ref(), requests, budgets, rule)?;
         self.steps += 1;
@@ -2361,6 +2581,54 @@ fn device_draws(
         });
     }
     Ok(device)
+}
+
+/// Lab draft trace (`HIPFIRE_LAB_MTP_DRAFT_TRACE=<dir>`): one JSON line per
+/// answered draft op per rank, appended to `<dir>/rank<r>.jsonl`, so the ops of
+/// a split run merge into the incumbent's (`HIPFIRE_QWEN4_EP_DRAFT_SPLIT=0`) rank 0
+/// trace op for op.
+#[cfg(feature = "lab")]
+mod lab_trace {
+    use std::io::Write;
+
+    /// Directory the per-rank trace files are written to.
+    const TRACE_DIR_ENV: &str = "HIPFIRE_LAB_MTP_DRAFT_TRACE";
+
+    pub(super) fn dir() -> Option<String> {
+        hipfire_config::developer_var(TRACE_DIR_ENV)
+            .ok()
+            .filter(|dir| !dir.is_empty())
+    }
+
+    pub(super) fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut hash = 0xcbf29ce484222325u64;
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
+    pub(super) fn append(
+        dir: &str,
+        rank: usize,
+        lines: &[serde_json::Value],
+    ) -> Result<(), String> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(dir).map_err(|e| format!("draft trace dir {dir}: {e}"))?;
+        let path = std::path::Path::new(dir).join(format!("rank{rank}.jsonl"));
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("draft trace {}: {e}", path.display()))?;
+        for line in lines {
+            writeln!(file, "{line}").map_err(|e| format!("draft trace: {e}"))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

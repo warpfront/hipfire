@@ -4786,8 +4786,37 @@ impl Qwen4MoeLayerRuntime {
         peers_for_layer: &[Qwen4PeerLayerSource],
         seal: &Qwen4EpRankSeal,
     ) -> Result<Self, Qwen4GpuForwardError> {
+        Self::from_moe_full_group(
+            gpu,
+            weights,
+            moe,
+            layer_label,
+            config,
+            placement,
+            peers_for_layer,
+            seal,
+            layer_label,
+        )
+    }
+
+    /// [`Self::from_moe_full`] binding the sealed plan of expert group `group`
+    /// while the runtime keeps `layer_label`. The MTP head's lane-local runtime
+    /// is `layer_label` 0 over group `num_hidden_layers`, exactly the label and
+    /// group [`Self::from_moe_ep`] gives the head's decode runtime.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_moe_full_group(
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        moe: &MoeWeights,
+        layer_label: usize,
+        config: &Qwen4Config,
+        placement: Qwen4EpPlacement,
+        peers_for_layer: &[Qwen4PeerLayerSource],
+        seal: &Qwen4EpRankSeal,
+        group: usize,
+    ) -> Result<Self, Qwen4GpuForwardError> {
         let sealed = seal
-            .expert_binding(layer_label, placement, gpu.device_id)
+            .expert_binding(group, placement, gpu.device_id)
             .map_err(invalid)?;
         // Compact peers everywhere (no unit layer on any rank): today's table, unchanged.
         let table_peers: Vec<PeerLayerSource<'_>> = peers_for_layer

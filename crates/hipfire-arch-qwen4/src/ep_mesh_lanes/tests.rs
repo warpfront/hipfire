@@ -149,7 +149,8 @@ impl Rendezvous {
 }
 
 /// A scripted rank whose collective phases cross the simulated gather: a
-/// draft round once per op, a verify once per target exchange the sealed
+/// draft round once per REPLICATED op it executed (an owned op runs lane-local
+/// and crosses nothing), a verify once per target exchange the sealed
 /// ledger names (a rank replaying a different op list stalls its peer).
 struct GatherSim {
     inner: ScriptedExecutor,
@@ -175,7 +176,7 @@ impl LaneMeshExecutor for GatherSim {
     fn run_draft_round(&mut self, round: &DraftRound) -> Result<RankDraftResult, RankError> {
         let rank = self.ownership().rank;
         let result = self.inner.run_draft_round(round)?;
-        for _ in 0..round.ops.len() {
+        for _ in 0..result.head_gathers {
             self.rv.cross(rank)?;
         }
         Ok(result)
@@ -829,25 +830,149 @@ fn mesh_lane_ep_a_repair_failure_after_verify_aborts_before_any_publication() {
     assert!(sims.iter().all(|s| s.published.is_empty()));
 }
 
+/// A rank answering an op it does not answer is an abort: the follower of a
+/// replicated lane, and a rank answering a peer's owned lane.
 #[test]
 fn mesh_lane_ep_a_follower_that_returns_proposals_is_an_abort() {
+    for (lanes, split) in [(1u64, false), (2, true)] {
+        let mut root = root(false);
+        assert_eq!(root.set_draft_split(split), split);
+        let windows = (1..=lanes)
+            .map(|t| script(t, 0, &[10], &[10, 4]))
+            .collect::<Vec<_>>();
+        let mut fan = fanout_with(windows, |rank, setup| {
+            setup.rogue = rank == 1;
+        });
+        for t in 1..=lanes {
+            admit(&mut root, &mut fan, t, 10, 9, None, Some(1));
+        }
+        let reqs: Vec<LaneRequest> = (1..=lanes).map(|t| req(t, 16)).collect();
+        let error = drive_step(
+            &mut root,
+            &mut fan,
+            None,
+            &reqs,
+            &budgets(LabRoutes::Batched, 1),
+            &mut GreedyRule,
+        )
+        .expect_err("only the answering rank reads a proposal");
+        assert!(
+            matches!(error, ProtocolError::Aborted(_)),
+            "{lanes} lanes, split {split}: {error}"
+        );
+        let sims = fan.finish();
+        assert!(sims.iter().all(|s| s.published.is_empty()));
+    }
+}
+
+/// One step of `lanes` one-draft lanes on two scripted ranks (the root's draft split
+/// as `split`): the driven step, its merged evidence, the barrier crossings and the
+/// ranks' call logs.
+fn split_run(lanes: u64, split: bool) -> (DrivenStep, MergedCostEvidence, u64, Vec<SimView>) {
     let mut root = root(false);
-    let mut fan = fanout_with(vec![script(1, 0, &[10], &[10, 4])], |rank, setup| {
-        setup.rogue = rank == 1;
-    });
-    admit(&mut root, &mut fan, 1, 10, 9, None, Some(1));
-    let error = drive_step(
+    assert_eq!(root.set_draft_split(split), split);
+    let windows = (1..=lanes)
+        .map(|t| script(t, 0, &[10 + t as u32], &[10 + t as u32, 4]))
+        .collect::<Vec<_>>();
+    let mut fan = fanout_with(windows, |_, _| {});
+    for t in 1..=lanes {
+        admit(&mut root, &mut fan, t, 10, 9, None, Some(1));
+    }
+    let reqs: Vec<LaneRequest> = (1..=lanes).map(|t| req(t, 64)).collect();
+    let driven = drive_step(
         &mut root,
         &mut fan,
         None,
-        &[req(1, 16)],
+        &reqs,
         &budgets(LabRoutes::Batched, 1),
         &mut GreedyRule,
     )
-    .expect_err("the root alone reads proposals");
-    assert!(matches!(error, ProtocolError::Aborted(_)), "{error}");
+    .expect("a clean two-rank step");
+    let merged = root
+        .merge_evidence(
+            &driven.receipts,
+            ControllerInterval {
+                wall_us: 40_000.0,
+                prefill_ran: false,
+            },
+        )
+        .expect("coherent rank receipts");
+    let crossings = fan.rv.crossings();
     let sims = fan.finish();
-    assert!(sims.iter().all(|s| s.published.is_empty()));
+    (driven, merged, crossings, sims)
+}
+
+fn draft_ops(sim: &SimView) -> Vec<Vec<(LaneWindowKey, usize, u32)>> {
+    sim.calls
+        .iter()
+        .filter_map(|c| match c {
+            Call::Draft(_, ops) => Some(ops.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// X2: eight lanes split 4/4 between the ranks. Each rank drafts only its own lanes'
+/// ops, no head op crosses the gather, the root merges the owners' proposals in op
+/// order (every lane emits its own scripted token) and the ledger shares agree.
+#[test]
+fn mesh_lane_ep_draft_split_runs_only_owned_ops_with_no_head_crossings() {
+    let (driven, merged, crossings, sims) = split_run(8, true);
+    assert_eq!(merged.counts.head_draft_calls, 8);
+    assert_eq!(
+        crossings, merged.counts.target_exchanges as u64,
+        "an owned head op crosses no rank: only the verify exchanges remain"
+    );
+    for (rank, sim) in sims.iter().enumerate() {
+        let rounds = draft_ops(sim);
+        assert_eq!(rounds.len(), 1, "rank {rank}");
+        let tags: Vec<u64> = rounds[0]
+            .iter()
+            .map(|(key, _, _)| key.request_epoch.request_tag)
+            .collect();
+        let want: Vec<u64> = (1..=8u64).filter(|t| (t - 1) % 2 == rank as u64).collect();
+        assert_eq!(
+            tags, want,
+            "rank {rank} drafts only its own lanes, in op order"
+        );
+    }
+    for receipt in &driven.receipts {
+        assert_eq!(receipt.counts.head_draft_calls, 4, "rank {}", receipt.rank);
+    }
+    for (i, lane) in driven.output.lanes.iter().enumerate() {
+        let token = i as u32 + 1 + 10;
+        assert_eq!(lane.emitted, vec![token, 4], "lane {i}");
+    }
+    // The replicated incumbent serves the same step: both ranks replay every op and every
+    // op crosses the gather.
+    let (base, base_merged, base_crossings, base_sims) = split_run(8, false);
+    assert_eq!(base_merged.counts.head_draft_calls, 8);
+    assert_eq!(
+        base_crossings,
+        8 + base_merged.counts.target_exchanges as u64
+    );
+    assert_eq!(base_sims[0].calls, base_sims[1].calls);
+    assert!(base.receipts.iter().all(|r| r.counts.head_draft_calls == 8));
+    assert_eq!(driven.output.lanes, base.output.lanes);
+}
+
+/// A window of one head lane gains nothing from a split: it stays replicated (today's
+/// calls, one crossing per op) with the split on, and the kill switch (`false`) keeps
+/// every lane replicated.
+#[test]
+fn mesh_lane_ep_a_lone_lane_and_the_kill_switch_keep_todays_replicated_calls() {
+    let (driven, merged, crossings, sims) = split_run(1, true);
+    assert_eq!(merged.counts.head_draft_calls, 1);
+    assert_eq!(crossings, 1 + merged.counts.target_exchanges as u64);
+    assert_eq!(sims[0].calls, sims[1].calls);
+    assert!(driven
+        .receipts
+        .iter()
+        .all(|r| r.counts.head_draft_calls == 1));
+    let (_, merged, crossings, sims) = split_run(4, false);
+    assert_eq!(merged.counts.head_draft_calls, 4);
+    assert_eq!(crossings, 4 + merged.counts.target_exchanges as u64);
+    assert_eq!(sims[0].calls, sims[1].calls);
 }
 
 #[test]

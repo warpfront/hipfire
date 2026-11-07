@@ -13,6 +13,7 @@ use crate::config::Qwen4Config;
 use crate::gpu_forward::{
     dense_ref, hyper_desc, hyper_read_desc, program_dims, qsa_desc, seal_moe_decode, MtpEpGather,
     Qwen4EpDummyExpert, Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
+    Qwen4PeerLayerSource,
 };
 use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
 use crate::lane_token_ring::LaneTokenRing;
@@ -69,6 +70,59 @@ mod rows;
 pub(crate) use rows::{draft_rounds_enabled, DraftRow, MtpRowsScratch};
 #[cfg(feature = "lab")]
 mod lab;
+#[cfg(feature = "lab")]
+mod lab_expert_trace;
+
+/// The row gather of a lane-local head MoE call (an owned draft lane, see
+/// [`Qwen4MtpGpu::set_lane_local`]). The lane-local head runtime's expert
+/// table names every expert's bytes (this rank's compact tensors, the peer's
+/// through UVA), so the rows a slot needs are computed on this rank and there
+/// is nothing to exchange: `gather_rows` does no device work and no host
+/// rendezvous. It stays an installed `row_gather` (`Some`) so the lowering
+/// keeps every stage, kernel and buffer role of the EP head call (the unfused
+/// shared down, the canonical slot-order combine).
+///
+/// The other answers are exactly `Qwen4EpRowGatherHook`'s (`ep.rs`) for a
+/// head layer index (`num_hidden_layers + parity`, at or past the trunk
+/// layers): the head is never a balanced layer (`assigns_owners` false) and
+/// has no fixed reduction partition (`None`: its HC writes are local, the
+/// combine folds every expert); `decode_step_end` and `release_gpu` are the
+/// trait's no-ops, as the hook's tail is only ever driven by trunk windows.
+pub(crate) struct LaneLocalRowGather<'a> {
+    /// The forward's EP row gather this call stands in for: told about the call
+    /// (`note_local_call`, the D2 tail's deferred-fill issue point) at the point
+    /// its gather would run. `None` only in tests.
+    pub(crate) ep: Option<&'a (dyn MoeRowGather + Send + Sync)>,
+}
+
+impl MoeRowGather for LaneLocalRowGather<'_> {
+    fn gather_rows(
+        &self,
+        gpu: &mut Gpu,
+        layer_idx: u16,
+        slots: usize,
+        _down_expanded: &GpuTensor,
+        topk_indices: &GpuTensor,
+    ) -> Result<(), String> {
+        if let Some(ep) = self.ep {
+            ep.note_local_call(gpu, layer_idx, slots, topk_indices);
+        }
+        Ok(())
+    }
+
+    fn assigns_owners(&self, _layer_idx: u16) -> bool {
+        false
+    }
+
+    fn reduction_partition(&self, _layer_idx: u16) -> Option<(usize, usize)> {
+        None
+    }
+
+    fn decode_step_end(&self, _gpu: &mut Gpu) {}
+
+    fn release_gpu(&self, _gpu: &mut Gpu) {}
+}
+
 /// Metadata words of an MTP head session snapshot: the boundary-row word
 /// (the boundary position plus one, or 0) and the state mark.
 const MTP_SESSION_WORDS: usize = 7;
@@ -2373,6 +2427,16 @@ pub struct Qwen4MtpGpu {
     /// The batched head rounds' scratch (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`,
     /// MoE head); `None` otherwise.
     pub(crate) rows: Option<MtpRowsScratch>,
+    /// The head's MoE runtime over every expert (`Some` once
+    /// [`Self::install_lane_local_moe`] ran, EP MoE head only): the same
+    /// sealed expert group as [`Self::moe`], but owned experts name this
+    /// rank's compact tensors and every other expert the peer's, so a head
+    /// step reads all of them locally and crosses no rank.
+    pub(crate) moe_full: Option<Qwen4MoeLayerRuntime>,
+    /// Lane-local mode ([`Self::set_lane_local`]): every Predict-step MoE of
+    /// this head runs on [`Self::moe_full`] with the no-op row gather and does
+    /// not advance [`Self::moe_steps`]. Off = the incumbent EP head call.
+    pub(crate) lane_local: bool,
 }
 
 /// Draft-head front: tokens below this id, plus EOS and the control ids
@@ -3030,6 +3094,8 @@ impl Qwen4MtpGpu {
             draft,
             ep_bound,
             moe_steps: 0,
+            moe_full: None,
+            lane_local: false,
             rows,
         })
     }
@@ -3082,11 +3148,85 @@ impl Qwen4MtpGpu {
         ))
     }
 
+    /// Whether lane-local head MoE calls can run: the head's MoE runtime is
+    /// EP-bound and its full-table runtime was installed, or the head has no
+    /// MoE at all (a dense profile has nothing to cross).
+    pub(crate) fn lane_local_ready(&self) -> bool {
+        match self.moe.as_ref() {
+            None => true,
+            Some(_) => self.ep_bound && self.moe_full.is_some(),
+        }
+    }
+
+    /// Switch lane-local mode. On is refused for a MoE head without the
+    /// full-table runtime.
+    pub(crate) fn set_lane_local(&mut self, on: bool) -> Result<(), MtpGpuError> {
+        if on && !self.lane_local_ready() {
+            return Err(invalid(
+                "lane-local MTP head MoE needs the EP full-table head runtime (not installed)",
+            ));
+        }
+        self.lane_local = on;
+        Ok(())
+    }
+
+    /// Build the head's full-table MoE runtime for lane-local calls (EP attach,
+    /// after every rank's head compact source is known): the head's own sealed
+    /// expert group (`num_hidden_layers`, the one [`Self::new_with_backend`]
+    /// binds for the decode table) and runtime label 0 over `peers`, one
+    /// compact source per rank (this rank's is its own head tensors).
+    pub(crate) fn install_lane_local_moe(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+        placement: Qwen4EpPlacement,
+        peers: &[Qwen4PeerLayerSource],
+        seal: &crate::ep_seal::Qwen4EpRankSeal,
+    ) -> Result<(), MtpGpuError> {
+        if !self.ep_bound || self.moe.is_none() {
+            return Err(invalid(
+                "a lane-local head MoE runtime needs an EP-bound MoE head",
+            ));
+        }
+        if self.moe_full.is_some() {
+            return Err(invalid(
+                "the lane-local head MoE runtime is already installed",
+            ));
+        }
+        let config = config.mtp_geometry();
+        let head = bound_mtp(weights)?;
+        let moe_weights = head
+            .ffn
+            .moe()
+            .ok_or_else(|| invalid("a dense MTP head has no lane-local MoE runtime"))?;
+        let full = Qwen4MoeLayerRuntime::from_moe_full_group(
+            gpu,
+            weights,
+            moe_weights,
+            0,
+            config,
+            placement,
+            peers,
+            seal,
+            config.num_hidden_layers,
+        )?;
+        if full.tier_lease().is_some() {
+            let _ = full.free_gpu(gpu);
+            return Err(invalid(
+                "the MTP head's lane-local MoE runtime must be untiered (its experts are the `mtp.` tensors)",
+            ));
+        }
+        self.moe_full = Some(full);
+        Ok(())
+    }
+
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
         let Self {
             scratch,
             state,
             moe,
+            moe_full,
             draft,
             rows,
             ..
@@ -3095,11 +3235,13 @@ impl Qwen4MtpGpu {
         let scratch_error = scratch.free_gpu(gpu);
         let state_error = state.free_gpu(gpu);
         let moe_error = moe.and_then(|moe| moe.free_gpu(gpu));
+        let moe_full_error = moe_full.and_then(|moe| moe.free_gpu(gpu));
         let rows_error = rows.and_then(|rows| rows.free_gpu(gpu));
         draft_error
             .or(scratch_error)
             .or(state_error)
             .or(moe_error)
+            .or(moe_full_error)
             .or(rows_error)
             .map_or(Ok(()), |error| Err(MtpGpuError::Hip(error)))
     }
@@ -3555,6 +3697,13 @@ impl Qwen4MtpGpu {
             // forward's row gather: gather buffer `2 + j % 2` and layer index
             // `trunk_layers + j % 2` for the head's monotonic MoE invocation
             // counter `j` (one increment per MoE head step, never rewound).
+            // A lane-local step (`set_lane_local`: an owned draft lane) keeps
+            // the same layer index and gather buffer (the lowering and every
+            // buffer role are the EP call's) but runs on the full-table
+            // runtime with the no-op row gather, and leaves `j` alone so the
+            // replicated calls keep their parity in lockstep on every rank.
+            let lane_local = self.lane_local && self.ep_bound;
+            let mut local_hook: Option<LaneLocalRowGather<'_>> = None;
             let moe_ep: Option<(usize, &GpuTensor, &dyn MoeRowGather)> = if self.ep_bound
                 && step != MtpStep::Append
                 && matches!(&mtp.ffn, Qwen4FfnWeights::Moe(_))
@@ -3562,21 +3711,31 @@ impl Qwen4MtpGpu {
                 let ep = ep
                     .ok_or_else(|| invalid("an EP MTP head step needs the forward's row gather"))?;
                 let parity = (self.moe_steps % 2) as usize;
-                self.moe_steps = self.moe_steps.wrapping_add(1);
+                let hook: &dyn MoeRowGather = if lane_local {
+                    local_hook.insert(LaneLocalRowGather { ep: Some(ep.hook) })
+                } else {
+                    self.moe_steps = self.moe_steps.wrapping_add(1);
+                    ep.hook as &dyn MoeRowGather
+                };
                 Some((
                     config.num_hidden_layers + parity,
                     ep.buffers[2 + parity],
-                    ep.hook as &dyn MoeRowGather,
+                    hook,
                 ))
             } else {
                 None
+            };
+            let head_moe = if lane_local {
+                self.moe_full.as_ref()
+            } else {
+                self.moe.as_ref()
             };
             // The MTP layer's FFN is the trunk's kind (`attach` refuses a
             // head whose FFN weights disagree with the profile).
             let ffn = if step == MtpStep::Append {
                 None
             } else {
-                Some(match (&mtp.ffn, self.moe.as_ref()) {
+                Some(match (&mtp.ffn, head_moe) {
                     (Qwen4FfnWeights::Moe(_), Some(runtime)) => {
                         MtpFfnCall::Moe(seal_moe_decode(
                             &ctx,
@@ -3665,6 +3824,17 @@ impl Qwen4MtpGpu {
             );
             validate_steps(gpu, &steps)?;
             execute_validated_steps(gpu, &ctx, &steps)?;
+            #[cfg(feature = "lab")]
+            if moe_ep.is_some() {
+                lab_expert_trace::record(
+                    gpu,
+                    &scratch.moe_topk_indices,
+                    1,
+                    config.num_experts_per_tok,
+                    weights.ep_placement(),
+                    lane_local,
+                )?;
+            }
             lengths
         };
         Ok(lengths)

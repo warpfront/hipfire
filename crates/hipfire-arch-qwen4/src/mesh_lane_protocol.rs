@@ -44,6 +44,15 @@
 //! - **Identity.** Slot numbers never identify a request: every message is
 //!   keyed by [`LaneWindowKey`] (full [`RequestEpoch`], lane generation,
 //!   window sequence) inside a [`MeshStepKey`].
+//! - **Head ownership (X2 draft split).** A lane's head is replicated on every
+//!   EP head rank (`LanePlan::head_rank == None`: today's protocol) until the
+//!   root's `plan_window` sees two or more live head lanes in one window and
+//!   gives each an owner rank (`MeshRoot::set_draft_split`, kill switch
+//!   `HIPFIRE_QWEN4_EP_DRAFT_SPLIT=0`). An owned lane's head work (draft
+//!   ops, catch-up, probe, head repair, tickets) belongs to its owner alone
+//!   ([`heads_lane`]); each draft op is answered by its owner (the sampler
+//!   owner for a replicated lane) and the root merges the answers in op
+//!   order. Ownership is one-way and ends with the lane.
 
 use crate::gpu_forward_lanes::{LaneAllRowsRule, StageName, LANE_MAX_ROWS};
 use crate::lane::LabRoutes;
@@ -589,6 +598,11 @@ pub struct LanePlan {
     /// future is `Free`; `Lag` exists only while a copy future keeps the owed
     /// rows.
     pub head: HeadState,
+    /// Which rank alone holds this lane's live head (`Some`; X2 draft split),
+    /// or `None`: replicated, every head rank runs the lane's head work.
+    /// Root-assigned ([`MeshRoot::plan_window`]), one-way (never back to
+    /// `None`, never moves) and part of the plan digest.
+    pub head_rank: Option<usize>,
 }
 
 impl LanePlan {
@@ -656,6 +670,11 @@ fn lane_plan_digest(d: &mut Digest, l: &LanePlan) {
         LaneKind::Forced(t) => d.usize(1).slice(t),
     };
     d.u64(l.eos.map_or(u64::MAX, u64::from));
+    // Replicated lanes (today's plans) add nothing: the digest of a plan
+    // without owners is unchanged.
+    if let Some(r) = l.head_rank {
+        d.usize(1).usize(r);
+    }
 }
 
 fn start_digest(key: &MeshStepKey, lanes: &[LanePlan], b: &WindowBudgets, s: &StagePolicy) -> u64 {
@@ -718,8 +737,9 @@ pub enum DraftOpKind {
     Draft,
 }
 
-/// One ordered head call: all EP ranks execute the whole list; a PP output
-/// band alone does.
+/// One ordered head call. A replicated lane's op is executed by every EP
+/// head rank; an owned lane's op (`LanePlan::head_rank`) only by its owner;
+/// a PP output band alone executes all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DraftOp {
     pub key: LaneWindowKey,
@@ -770,11 +790,14 @@ pub struct RankDraftResult {
     pub round: u32,
     pub rank: usize,
     pub ops_executed: usize,
-    /// Head gathers this rank crossed in the round.
+    /// Head gathers this rank crossed in the round (replicated ops only; an
+    /// owned op runs lane-local with no crossing).
     pub head_gathers: usize,
     /// Owed head rows this rank appended (the round's catch-ups; no gather).
     pub catch_up_rows: usize,
-    /// `Some` only from the sampler owner.
+    /// `Some` iff this rank answers at least one op of the round: exactly its
+    /// answered ops in round order. An op is answered by its lane's owner, or
+    /// (replicated lane) by the sampler owner.
     pub proposals: Option<Vec<DraftProposal>>,
 }
 
@@ -811,7 +834,7 @@ pub struct RowGroup {
 
 /// The expected per-rank operation ledger of a verify (counts only; no
 /// timing).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OpLedger {
     /// Row groups, summed over microbatches.
     pub row_groups: usize,
@@ -820,8 +843,12 @@ pub struct OpLedger {
     pub target_exchanges: usize,
     /// PP pipeline microbatches (0 on EP).
     pub microbatches: usize,
-    /// Head Draft invocations over the step's draft rounds.
+    /// Head Draft invocations over the step's draft rounds (the step total).
     pub head_draft_calls: usize,
+    /// Per rank id: the head Draft invocations that rank executes. Empty when
+    /// no lane of the window is owned (every head rank then executes the
+    /// whole `head_draft_calls`, as before the draft split).
+    pub head_draft_calls_by_rank: Vec<usize>,
     /// Of `row_groups`, the wide-class groups (the ledger's greedy/seeded vs
     /// unseeded-sampled split; `row_groups - wide_groups` are row-exact).
     pub wide_groups: usize,
@@ -1390,6 +1417,9 @@ pub struct EvidenceExpectation {
     pub world: Vec<RankOwnership>,
     pub ledger: OpLedger,
     pub head_append_rows: usize,
+    /// Per rank id: the head append rows that rank runs. Empty when no lane
+    /// of the window is owned (head ranks then each run `head_append_rows`).
+    pub head_append_rows_by_rank: Vec<usize>,
     pub drafts_generated: usize,
     pub accepted: usize,
     pub consumed_rows: usize,
@@ -1467,14 +1497,26 @@ pub fn merge_evidence(
                 w.rank, c.target_exchanges, l.target_exchanges
             ));
         }
-        let want_head = if w.head { l.head_draft_calls } else { 0 };
+        let want_head = if w.head {
+            rank_share(l.head_draft_calls, &l.head_draft_calls_by_rank, w.rank)
+        } else {
+            0
+        };
         if c.head_draft_calls != want_head {
             return incoherent(format!(
                 "rank {} head draft calls {} != expected {}",
                 w.rank, c.head_draft_calls, want_head
             ));
         }
-        let want_append = if w.head { expect.head_append_rows } else { 0 };
+        let want_append = if w.head {
+            rank_share(
+                expect.head_append_rows,
+                &expect.head_append_rows_by_rank,
+                w.rank,
+            )
+        } else {
+            0
+        };
         if c.head_append_rows != want_append {
             return incoherent(format!(
                 "rank {} head append rows {} != expected {}",
@@ -1652,6 +1694,10 @@ struct RootLane {
     /// `HeadLag`; the head owners hold the matching hidden rows).
     lag: HeadLag,
     status: LaneStatus,
+    /// The rank that alone holds this lane's live head, `None` while
+    /// replicated (every admission path). Set once by the draft-split
+    /// promotion in `plan_window`; cleared only with the lane's release.
+    head_rank: Option<usize>,
 }
 
 /// What a finished window leaves for the next step's price.
@@ -1719,6 +1765,9 @@ struct StepState {
     draft: Vec<DraftLane>,
     round: u32,
     head_calls: usize,
+    /// Per rank id: head Draft ops the rank executes so far this step
+    /// (grown on demand; empty until a round ran).
+    head_calls_by_rank: Vec<usize>,
     verify: Option<VerifyPlan>,
     picks: Option<SamplerOutput>,
     decision: Option<CommitDecision>,
@@ -1767,6 +1816,9 @@ pub struct MeshRoot {
     /// (the first of a row count binds its specialised verify symbols and is
     /// observed unpriced, as the singleton's `ngram_warm_depths`).
     copy_warm: u64,
+    /// X2: this root may give a window's head lanes owners
+    /// ([`MeshRoot::set_draft_split`]); off = every lane stays replicated.
+    draft_split: bool,
 }
 
 impl MeshRoot {
@@ -1803,6 +1855,7 @@ impl MeshRoot {
             copy_pool: None,
             copy_max_lanes: usize::MAX,
             copy_warm: 0,
+            draft_split: false,
         })
     }
 
@@ -2085,6 +2138,7 @@ impl MeshRoot {
                 head,
                 lag,
                 status: LaneStatus::Live,
+                head_rank: None,
             },
         );
         Ok(LaneAdmit {
@@ -2382,6 +2436,7 @@ impl MeshRoot {
                 remaining: r.remaining,
                 budget: 0,
                 head: lane.head,
+                head_rank: lane.head_rank,
             };
             let sl = staged.get_mut(&lane.epoch).expect("staged lane");
             // A crowded step runs no copy window, so a retired lane owes the
@@ -2496,6 +2551,33 @@ impl MeshRoot {
                 budgets.max_rows
             )));
         }
+        // X2 draft split: a window with two or more live heads gives every
+        // replicated head lane an owner (the least-loaded head rank). Past the
+        // last fallible point, so a rejected plan promotes nothing.
+        if self.draft_split {
+            let mut owners: Vec<usize> = self
+                .world
+                .iter()
+                .filter(|w| w.head)
+                .map(|w| w.rank)
+                .collect();
+            owners.sort_unstable();
+            let mut owned: Vec<usize> = owners
+                .iter()
+                .map(|&r| {
+                    self.lanes
+                        .values()
+                        .filter(|l| l.head_rank == Some(r))
+                        .count()
+                })
+                .collect();
+            promote_head_owners(&owners, &mut owned, &mut plans);
+            for p in &plans {
+                if let Some(l) = self.lanes.get_mut(&p.key.request_epoch) {
+                    l.head_rank = p.head_rank;
+                }
+            }
+        }
 
         // Commit the plan.
         self.step_seq += 1;
@@ -2557,6 +2639,7 @@ impl MeshRoot {
             draft,
             round: 0,
             head_calls: 0,
+            head_calls_by_rank: Vec::new(),
             verify: None,
             picks: None,
             decision: None,
@@ -2641,7 +2724,7 @@ impl MeshRoot {
                 && t.iter().zip(&lanes).all(|(t, l)| {
                     t.key == l.key
                         && t.target.is_some() == w.target
-                        && t.head.is_some() == (w.head && lane_needs_head(l))
+                        && t.head.is_some() == heads_lane(w, l)
                 });
             if !ok {
                 return Err(self.fail(
@@ -2722,9 +2805,11 @@ impl MeshRoot {
         Ok(Some(round))
     }
 
-    /// Fold the head owners' answers to `round`. Followers acknowledge; only
-    /// the sampler owner reads proposals. A proposal from anyone else, a
-    /// missing/duplicate answer or a count mismatch aborts.
+    /// Fold the head owners' answers to `round`. Every op is answered by its
+    /// lane's owner rank, or by the sampler owner for a replicated lane; the
+    /// root rebuilds the proposal list in round order. A rank answering an op
+    /// it does not answer, a missing/duplicate answer or a count mismatch
+    /// aborts.
     pub fn collect_draft(
         &mut self,
         round: &DraftRound,
@@ -2752,42 +2837,94 @@ impl MeshRoot {
             }
         }
         let owners: Vec<RankOwnership> = self.world.iter().copied().filter(|w| w.head).collect();
+        let sampler = *owners.iter().find(|w| w.sampler).expect("validated world");
+        // Per op: the rank holding its lane's head (`None`: replicated); per
+        // catch-up: its token count and lane head rank.
+        let looked_up: Result<(Vec<Option<usize>>, Vec<(usize, Option<usize>)>), String> = {
+            let lanes = &self.step_ref().start.lanes;
+            let mut op_head = Vec::with_capacity(round.ops.len());
+            let mut bad = None;
+            for op in &round.ops {
+                match lanes.iter().find(|l| l.key == op.key) {
+                    Some(l) if lane_needs_head(l) => match l.head_rank {
+                        Some(r) if !owners.iter().any(|w| w.rank == r) => {
+                            bad = Some(format!("draft op owner rank {r} holds no head"));
+                            break;
+                        }
+                        h => op_head.push(h),
+                    },
+                    _ => {
+                        bad = Some("draft op for a lane without a live head".to_string());
+                        break;
+                    }
+                }
+            }
+            let mut catch_head = Vec::with_capacity(round.catch_up.len());
+            if bad.is_none() {
+                for (key, c) in &round.catch_up {
+                    match lanes.iter().find(|l| l.key == *key) {
+                        Some(l) => catch_head.push((c.tokens.len(), l.head_rank)),
+                        None => {
+                            bad = Some("catch-up for a lane outside the plan".to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+            match bad {
+                Some(m) => Err(m),
+                None => Ok((op_head, catch_head)),
+            }
+        };
+        let (op_head, catch_head) = match looked_up {
+            Ok(v) => v,
+            Err(m) => return Err(self.fail(None, m)),
+        };
+        let replicated_ops = op_head.iter().filter(|h| h.is_none()).count();
         let mut by_rank: HashMap<usize, &RankDraftResult> = HashMap::new();
         for r in results {
             if r.key != round.key || r.round != round.round {
                 return Err(self.fail(Some(r.rank), "draft answer for a stale key/round".into()));
             }
-            let Some(owner) = owners.iter().find(|w| w.rank == r.rank) else {
+            if !owners.iter().any(|w| w.rank == r.rank) {
                 return Err(self.fail(
                     Some(r.rank),
                     "draft answer from a rank without the head".into(),
                 ));
-            };
+            }
             if by_rank.insert(r.rank, r).is_some() {
                 return Err(self.fail(Some(r.rank), "duplicate draft answer".into()));
             }
-            // One row gather per op, or (a batched head round,
-            // HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS) one for the whole round of two
-            // or more ops; every rank must have taken the same shape.
+            // A rank executes the ops of the lanes it heads: every replicated
+            // op, and its own lanes' ops.
+            let want_ops = op_head
+                .iter()
+                .filter(|h| h.map_or(true, |o| o == r.rank))
+                .count();
+            // One row gather per replicated op, or (a batched head round,
+            // HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS) one for a round of two or more
+            // replicated ops; every rank must have taken the same shape. An
+            // owned op crosses nothing.
             let gathers_ok =
-                r.head_gathers == round.ops.len() || (round.ops.len() >= 2 && r.head_gathers == 1);
+                r.head_gathers == replicated_ops || (replicated_ops >= 2 && r.head_gathers == 1);
             let peer_gathers = by_rank
                 .values()
                 .map(|p| p.head_gathers)
                 .find(|&g| g != r.head_gathers);
-            if r.ops_executed != round.ops.len() || !gathers_ok || peer_gathers.is_some() {
+            if r.ops_executed != want_ops || !gathers_ok || peer_gathers.is_some() {
                 return Err(self.fail(
                     Some(r.rank),
                     format!(
-                        "executed {} ops/{} gathers (peer {:?}), scheduled {}",
-                        r.ops_executed,
-                        r.head_gathers,
-                        peer_gathers,
-                        round.ops.len()
+                        "executed {} ops/{} gathers (peer {:?}), scheduled {} ({} replicated)",
+                        r.ops_executed, r.head_gathers, peer_gathers, want_ops, replicated_ops
                     ),
                 ));
             }
-            let want_catch_up: usize = round.catch_up.iter().map(|(_, c)| c.tokens.len()).sum();
+            let want_catch_up: usize = catch_head
+                .iter()
+                .filter(|(_, h)| h.map_or(true, |o| o == r.rank))
+                .map(|(n, _)| n)
+                .sum();
             if r.catch_up_rows != want_catch_up {
                 return Err(self.fail(
                     Some(r.rank),
@@ -2797,15 +2934,48 @@ impl MeshRoot {
                     ),
                 ));
             }
-            if r.proposals.is_some() != owner.sampler {
-                return Err(self.fail(
-                    Some(r.rank),
-                    if owner.sampler {
-                        "the sampler owner returned no proposals".to_string()
-                    } else {
-                        "a follower returned proposals: only the root reads/samples q".to_string()
-                    },
-                ));
+            // The ops this rank answers, in round order: its own lanes' ops
+            // and, on the sampler owner, every replicated op.
+            let answered: Vec<usize> = (0..op_head.len())
+                .filter(|&i| match op_head[i] {
+                    Some(o) => o == r.rank,
+                    None => r.rank == sampler.rank,
+                })
+                .collect();
+            match &r.proposals {
+                None if answered.is_empty() => {}
+                // A rank answering nothing may acknowledge with an empty list
+                // (a round of owed-row catch-ups alone).
+                Some(p) if answered.is_empty() && p.is_empty() => {}
+                Some(_) if answered.is_empty() => {
+                    return Err(self.fail(
+                        Some(r.rank),
+                        "a follower returned proposals for ops it does not answer: only a \
+                         lane's owner (the sampler for a replicated lane) reads/samples q"
+                            .to_string(),
+                    ));
+                }
+                None => {
+                    return Err(self.fail(
+                        Some(r.rank),
+                        format!(
+                            "no proposals for the {} ops this rank answers",
+                            answered.len()
+                        ),
+                    ));
+                }
+                Some(p) => {
+                    if p.len() != answered.len()
+                        || p.iter()
+                            .zip(&answered)
+                            .any(|(p, &i)| p.key != round.ops[i].key)
+                    {
+                        return Err(self.fail(
+                            Some(r.rank),
+                            "proposals do not match the ops this rank answers".into(),
+                        ));
+                    }
+                }
             }
         }
         if let Some(rk) = owners
@@ -2815,12 +2985,28 @@ impl MeshRoot {
         {
             return Err(self.fail(Some(rk), "no draft answer".into()));
         }
-        let sampler = owners.iter().find(|w| w.sampler).expect("validated world");
-        let proposals = by_rank[&sampler.rank]
-            .proposals
-            .as_ref()
-            .expect("checked above")
-            .clone();
+        // Rebuild the round's proposals in op order from the answering ranks.
+        let mut cursor: HashMap<usize, usize> = HashMap::new();
+        let mut proposals: Vec<DraftProposal> = Vec::with_capacity(round.ops.len());
+        for &h in &op_head {
+            let answerer = h.unwrap_or(sampler.rank);
+            let next = cursor.entry(answerer).or_insert(0);
+            let p = by_rank[&answerer]
+                .proposals
+                .as_ref()
+                .and_then(|p| p.get(*next))
+                .cloned();
+            *next += 1;
+            match p {
+                Some(p) => proposals.push(p),
+                None => {
+                    return Err(self.fail(
+                        Some(answerer),
+                        "proposals do not match the scheduled ops".into(),
+                    ))
+                }
+            }
+        }
         if proposals.len() != round.ops.len()
             || proposals
                 .iter()
@@ -2922,6 +3108,14 @@ impl MeshRoot {
             if failure.is_none() {
                 s.round += 1;
                 s.head_calls += n_ops;
+                for &h in &op_head {
+                    match h {
+                        Some(r) => bump_rank(&mut s.head_calls_by_rank, r),
+                        None => owners
+                            .iter()
+                            .for_each(|w| bump_rank(&mut s.head_calls_by_rank, w.rank)),
+                    }
+                }
             }
         }
         if let Some(reason) = failure {
@@ -3031,6 +3225,11 @@ impl MeshRoot {
                 MeshKind::Ep | MeshKind::Single => 0,
             },
             head_draft_calls: s.head_calls,
+            head_draft_calls_by_rank: draft_calls_by_rank(
+                &self.world,
+                &s.start.lanes,
+                &s.head_calls_by_rank,
+            ),
         };
         let mut d = Digest::new();
         d.u64(s.start.key.step_seq)
@@ -3365,7 +3564,7 @@ impl MeshRoot {
         let expect = EvidenceExpectation {
             key: start.key.clone(),
             world: self.world.clone(),
-            ledger: plan.ledger,
+            ledger: plan.ledger.clone(),
             head_append_rows: decision
                 .lanes
                 .iter()
@@ -3375,6 +3574,18 @@ impl MeshRoot {
                     l.catch_up.as_ref().map_or(0, |c| c.tokens.len()) + d.head_append.total()
                 })
                 .sum(),
+            head_append_rows_by_rank: append_rows_by_rank(
+                &self.world,
+                &start.lanes,
+                &decision
+                    .lanes
+                    .iter()
+                    .zip(&start.lanes)
+                    .map(|(d, l)| {
+                        l.catch_up.as_ref().map_or(0, |c| c.tokens.len()) + d.head_append.total()
+                    })
+                    .collect::<Vec<usize>>(),
+            ),
             drafts_generated: verified,
             accepted: decision.lanes.iter().map(|d| d.source.accepted).sum(),
             consumed_rows: decision.lanes.iter().map(|d| d.consumed_rows).sum(),
@@ -3443,8 +3654,8 @@ impl MeshRoot {
                     ));
                 }
                 let want_target = w.target.then_some(d.target_end);
-                let want_head = (w.head && lane_needs_head(plan)).then_some(d.head_end);
-                let want_append = (w.head && lane_needs_head(plan)).then_some(d.head_append);
+                let want_head = heads_lane(w, plan).then_some(d.head_end);
+                let want_append = heads_lane(w, plan).then_some(d.head_append);
                 if pl.target_end != want_target
                     || pl.head_end != want_head
                     || pl.head_append != want_append
@@ -3565,6 +3776,27 @@ impl MeshRoot {
             .evidence_expectation()
             .ok_or_else(|| EvidenceError::Stale("no published step awaits evidence".to_string()))?;
         merge_evidence(expect, receipts, interval)
+    }
+}
+
+impl MeshRoot {
+    /// Allow the X2 draft split: a window with two or more live head lanes
+    /// then gives each an owner rank (see `plan_window`). The split exists
+    /// only on an EP mesh of two or more head ranks and only while the kill
+    /// switch (`HIPFIRE_QWEN4_EP_DRAFT_SPLIT=0`) is not set; the caller sets
+    /// it only when every rank's head can run lane-local. Returns the
+    /// effective setting. Call before the first step.
+    pub fn set_draft_split(&mut self, on: bool) -> bool {
+        self.draft_split = on
+            && ep_draft_split_enabled()
+            && self.world[0].kind == MeshKind::Ep
+            && self.world.iter().filter(|w| w.head).count() >= 2;
+        self.draft_split
+    }
+
+    /// Whether the draft split is on at this root.
+    pub fn draft_split(&self) -> bool {
+        self.draft_split
     }
 }
 
@@ -3769,6 +4001,98 @@ impl RankSession {
 /// lane or non-spec lane allocates/uses none).
 fn lane_needs_head(l: &LanePlan) -> bool {
     l.head != HeadState::Free
+}
+
+/// `HIPFIRE_QWEN4_EP_DRAFT_SPLIT` (developer var; default on, exactly `0`
+/// kills it): whether an EP root may give a window's head lanes owner ranks
+/// ([`MeshRoot::set_draft_split`]). Off, every lane stays replicated and every
+/// rank and device path is today's.
+const EP_DRAFT_SPLIT_ENV: &str = "HIPFIRE_QWEN4_EP_DRAFT_SPLIT";
+
+pub(crate) fn ep_draft_split_enabled() -> bool {
+    hipfire_config::developer_var(EP_DRAFT_SPLIT_ENV).as_deref() != Ok("0")
+}
+
+/// Whether rank `own` runs the head work of lane `l`: it owns a head, the
+/// lane's window touches the head, and the lane is replicated or owned by this
+/// rank. Every per-lane head check of the protocol and the executors goes
+/// through this one rule.
+pub(crate) fn heads_lane(own: &RankOwnership, l: &LanePlan) -> bool {
+    own.head && lane_needs_head(l) && l.head_rank.map_or(true, |r| r == own.rank)
+}
+
+/// Per-rank slots (`max rank + 1`) of a world.
+fn rank_slots(world: &[RankOwnership]) -> usize {
+    world.iter().map(|w| w.rank + 1).max().unwrap_or(0)
+}
+
+fn bump_rank(counts: &mut Vec<usize>, rank: usize) {
+    if counts.len() <= rank {
+        counts.resize(rank + 1, 0);
+    }
+    counts[rank] += 1;
+}
+
+/// A rank's share of a per-step total: the whole total while no lane is owned
+/// (`by_rank` empty), else its own slot.
+fn rank_share(total: usize, by_rank: &[usize], rank: usize) -> usize {
+    if by_rank.is_empty() {
+        total
+    } else {
+        by_rank.get(rank).copied().unwrap_or(0)
+    }
+}
+
+/// The ledger's per-rank head Draft calls: empty while no lane of the window
+/// is owned, else `calls` (counted per op at the root) padded to every rank.
+fn draft_calls_by_rank(world: &[RankOwnership], lanes: &[LanePlan], calls: &[usize]) -> Vec<usize> {
+    if !lanes.iter().any(|l| l.head_rank.is_some()) {
+        return Vec::new();
+    }
+    let mut by_rank = calls.to_vec();
+    by_rank.resize(rank_slots(world).max(by_rank.len()), 0);
+    by_rank
+}
+
+/// The per-rank head append rows of a step: `rows[i]` is lane `i`'s catch-up
+/// plus decision rows, run by the rank(s) that head it. Empty while no lane is
+/// owned.
+fn append_rows_by_rank(world: &[RankOwnership], lanes: &[LanePlan], rows: &[usize]) -> Vec<usize> {
+    if !lanes.iter().any(|l| l.head_rank.is_some()) {
+        return Vec::new();
+    }
+    let mut by_rank = vec![0usize; rank_slots(world)];
+    for w in world {
+        by_rank[w.rank] = lanes
+            .iter()
+            .zip(rows)
+            .filter(|(l, _)| heads_lane(w, l))
+            .map(|(_, n)| *n)
+            .sum();
+    }
+    by_rank
+}
+
+/// The draft-split promotion (pure): when the window has two or more lanes
+/// whose head is live, every such lane still replicated gets an owner: the
+/// rank (of `owners`, ascending rank ids) holding the fewest lanes, ties to
+/// the lower rank, promoting in plan order. `owned[k]` is the number of live
+/// lanes `owners[k]` already owns and is updated. A lane keeps its owner for
+/// good: owned lanes are never touched.
+fn promote_head_owners(owners: &[usize], owned: &mut [usize], plans: &mut [LanePlan]) {
+    if owners.len() < 2 || plans.iter().filter(|p| lane_needs_head(p)).count() < 2 {
+        return;
+    }
+    for p in plans.iter_mut() {
+        if !lane_needs_head(&*p) || p.head_rank.is_some() {
+            continue;
+        }
+        let k = (0..owners.len())
+            .min_by_key(|&k| (owned[k], owners[k]))
+            .expect("two or more owners");
+        p.head_rank = Some(owners[k]);
+        owned[k] += 1;
+    }
 }
 
 /// A window's final source: a confirmed-copy plan whose first-candidate
@@ -4063,6 +4387,9 @@ impl RankSession {
             if l.max_rows() > start.budgets.verify_rows_per_lane {
                 return reject("lane rows exceed the admitted verify width".into());
             }
+            if l.head_rank.is_some() && self.own.kind != MeshKind::Ep {
+                return reject("an owned head lane outside an EP mesh".into());
+            }
         }
         if let Err(e) = capacity {
             return reject(e);
@@ -4077,7 +4404,7 @@ impl RankSession {
             tickets.push(LaneTickets {
                 key: l.key,
                 target: self.own.target.then(&mut take),
-                head: (self.own.head && lane_needs_head(l)).then(&mut take),
+                head: heads_lane(&self.own, l).then(&mut take),
             });
         }
         let ready = RankReady {
@@ -4135,6 +4462,7 @@ impl RankSession {
     /// the ack with `proposals: None`; a sampler owner attaches its own.
     pub fn on_draft_round(&mut self, round: &DraftRound) -> Result<RankDraftResult, RankError> {
         let rank = self.own.rank;
+        let own = self.own;
         if !self.own.head {
             return Err(RankError::new(
                 rank,
@@ -4161,6 +4489,10 @@ impl RankSession {
                 "owed head rows differ from the planned catch-up",
             ));
         }
+        // Every op is validated (the rank tracks the plan's positions for the
+        // lanes it does not head too); only the ops of the lanes this rank
+        // heads execute here: every replicated op and its own lanes' ops.
+        let (mut executed, mut replicated, mut owned) = (0usize, 0usize, 0usize);
         for op in &round.ops {
             let Some(i) = s.start.lanes.iter().position(|l| l.key == op.key) else {
                 return Err(RankError::new(rank, "draft op for a lane outside the plan"));
@@ -4180,17 +4512,48 @@ impl RankSession {
                     "first draft input is not the planned seed",
                 ));
             }
+            if !lane_needs_head(l) {
+                return Err(RankError::new(
+                    rank,
+                    "draft op for a lane without a live head",
+                ));
+            }
+            if heads_lane(&own, l) {
+                executed += 1;
+                if l.head_rank.is_some() {
+                    owned += 1;
+                } else {
+                    replicated += 1;
+                }
+            }
             s.next_pos[i] += 1;
         }
-        let catch_up_rows: usize = round.catch_up.iter().map(|(_, c)| c.tokens.len()).sum();
+        if owned > 0 && replicated > 0 {
+            return Err(RankError::new(
+                rank,
+                "a draft round mixes owned and replicated head lanes on one rank",
+            ));
+        }
+        let catch_up_rows: usize = round
+            .catch_up
+            .iter()
+            .filter(|(key, _)| {
+                s.start
+                    .lanes
+                    .iter()
+                    .find(|l| l.key == *key)
+                    .is_some_and(|l| heads_lane(&own, l))
+            })
+            .map(|(_, c)| c.tokens.len())
+            .sum();
         s.round += 1;
-        s.head_calls += round.ops.len();
+        s.head_calls += executed;
         Ok(RankDraftResult {
             key: round.key.clone(),
             round: round.round,
             rank,
-            ops_executed: round.ops.len(),
-            head_gathers: round.ops.len(),
+            ops_executed: executed,
+            head_gathers: replicated,
             catch_up_rows,
             proposals: None,
         })
@@ -4232,7 +4595,14 @@ impl RankSession {
                 "verify lane outside the row-exact width",
             ));
         }
-        if own_head && s.head_calls != plan.ledger.head_draft_calls {
+        if own_head
+            && s.head_calls
+                != rank_share(
+                    plan.ledger.head_draft_calls,
+                    &plan.ledger.head_draft_calls_by_rank,
+                    rank,
+                )
+        {
             return Err(RankError::new(
                 rank,
                 "head call count differs from the ledger",
@@ -4249,7 +4619,7 @@ impl RankSession {
                 .iter()
                 .map(|l| (l.key, l.position + l.rows.len()))
                 .collect(),
-            ledger: plan.ledger,
+            ledger: plan.ledger.clone(),
             sampler: None,
         })
     }
@@ -4302,7 +4672,7 @@ impl RankSession {
                     "decision head schedule departs from the plan",
                 ));
             }
-            let heads = own.head && lane_needs_head(l);
+            let heads = heads_lane(&own, l);
             lanes.push(PreparedLane {
                 key: d.key,
                 target_end: own.target.then_some(d.target_end),
@@ -4311,19 +4681,13 @@ impl RankSession {
                 tickets: *t,
             });
         }
-        let head_append_rows = if own.head {
-            decision
-                .lanes
-                .iter()
-                .zip(&s.start.lanes)
-                .filter(|(_, l)| l.head != HeadState::Free)
-                .map(|(d, l)| {
-                    l.catch_up.as_ref().map_or(0, |c| c.tokens.len()) + d.head_append.total()
-                })
-                .sum()
-        } else {
-            0
-        };
+        let head_append_rows = decision
+            .lanes
+            .iter()
+            .zip(&s.start.lanes)
+            .filter(|(_, l)| heads_lane(&own, l))
+            .map(|(d, l)| l.catch_up.as_ref().map_or(0, |c| c.tokens.len()) + d.head_append.total())
+            .sum();
         s.decision = Some(decision.clone());
         s.phase = StepPhase::Prepared;
         Ok(PreparedReceipt {
@@ -4639,20 +5003,26 @@ pub(crate) mod scripted {
         }
 
         fn run_draft_round(&mut self, round: &DraftRound) -> Result<RankDraftResult, RankError> {
-            if !round.catch_up.is_empty() {
-                self.calls.push(Call::CatchUp(
-                    round
-                        .catch_up
-                        .iter()
-                        .map(|(k, c)| (*k, c.from, c.tokens.len()))
-                        .collect(),
-                ));
+            let own = self.ownership();
+            // This rank runs the catch-ups and ops of the lanes it heads.
+            let heads = |plans: &HashMap<LaneWindowKey, LanePlan>, k: &LaneWindowKey| {
+                plans.get(k).is_some_and(|l| heads_lane(&own, l))
+            };
+            let catch_up: Vec<(LaneWindowKey, usize, usize)> = round
+                .catch_up
+                .iter()
+                .filter(|(k, _)| heads(&self.plans, k))
+                .map(|(k, c)| (*k, c.from, c.tokens.len()))
+                .collect();
+            if !catch_up.is_empty() {
+                self.calls.push(Call::CatchUp(catch_up));
             }
             self.calls.push(Call::Draft(
                 round.round,
                 round
                     .ops
                     .iter()
+                    .filter(|o| heads(&self.plans, &o.key))
                     .map(|o| (o.key, o.position, o.input))
                     .collect(),
             ));
@@ -4660,37 +5030,46 @@ pub(crate) mod scripted {
                 return Err(RankError::new(self.rank(), "scripted head failure"));
             }
             let mut res = self.session.on_draft_round(round)?;
-            let own = self.ownership();
-            if own.sampler || self.rogue_sampler_output {
-                let mut props = Vec::new();
-                for op in &round.ops {
-                    let w = self.window(&op.key);
-                    let j = *self
-                        .draft_idx
-                        .entry(op.key)
-                        .and_modify(|j| *j += 1)
-                        .or_insert(0);
-                    let token = *w
-                        .drafts
-                        .get(j)
-                        .ok_or_else(|| RankError::new(self.rank(), "script exhausted"))?;
-                    props.push(DraftProposal {
-                        key: op.key,
-                        token,
-                        keep_going: w.keep_going.get(j).copied().unwrap_or(true),
-                        drop_last: w.drop_last.get(j).copied().unwrap_or(false),
-                        read: (self.device_reads
-                            && self
-                                .plans
-                                .get(&op.key)
-                                .is_some_and(LanePlan::wants_candidate_read))
-                        .then(|| crate::sampled_lane::DraftRead::Candidates(vec![(token, 0.0)])),
-                    });
+            let mut props = Vec::new();
+            for op in &round.ops {
+                // An op is answered by its lane's owner, or by the sampler
+                // owner for a replicated lane (a rogue follower answers all).
+                let answers = self.rogue_sampler_output
+                    || match self.plans.get(&op.key).and_then(|l| l.head_rank) {
+                        Some(r) => r == own.rank,
+                        None => own.sampler,
+                    };
+                if !answers {
+                    continue;
                 }
+                let w = self.window(&op.key);
+                let j = *self
+                    .draft_idx
+                    .entry(op.key)
+                    .and_modify(|j| *j += 1)
+                    .or_insert(0);
+                let token = *w
+                    .drafts
+                    .get(j)
+                    .ok_or_else(|| RankError::new(self.rank(), "script exhausted"))?;
+                props.push(DraftProposal {
+                    key: op.key,
+                    token,
+                    keep_going: w.keep_going.get(j).copied().unwrap_or(true),
+                    drop_last: w.drop_last.get(j).copied().unwrap_or(false),
+                    read: (self.device_reads
+                        && self
+                            .plans
+                            .get(&op.key)
+                            .is_some_and(LanePlan::wants_candidate_read))
+                    .then(|| crate::sampled_lane::DraftRead::Candidates(vec![(token, 0.0)])),
+                });
+            }
+            if !props.is_empty() {
                 res.proposals = Some(props);
             }
             let key = round.key.clone();
-            let n = round.ops.len();
+            let n = res.ops_executed;
             let e = self.counts.entry(key).or_default();
             e.head_draft_calls += n;
             Ok(res)
@@ -7160,6 +7539,325 @@ mod tests {
                 .iter()
                 .all(|r| r.published.is_empty() && r.session.is_quarantined()));
         }
+    }
+
+    // ---- X2: the draft split ----------------------------------------------------
+
+    /// An EP mesh with `lanes` spec lanes admitted and scripted; the root's draft-split flag
+    /// set directly (the env kill switch is read by `MeshRoot::set_draft_split`, not here).
+    fn split_mesh(lanes: u64, split: bool) -> Mesh {
+        let mut m = Mesh::new(MeshKind::Ep, false);
+        m.root.draft_split = split;
+        for tag in 1..=lanes {
+            m.admit(tag, 10, 7, None, Some(3));
+            script_matching(&m, tag, 0, 8);
+        }
+        m
+    }
+
+    fn split_reqs(lanes: u64) -> Vec<LaneRequest> {
+        (1..=lanes).map(|t| req(t, 99)).collect()
+    }
+
+    fn plain_plans(lanes: u64) -> Vec<LanePlan> {
+        let mut m = split_mesh(lanes, false);
+        m.s_plan(None, &split_reqs(lanes), &budgets(LabRoutes::Batched, 3))
+            .unwrap()
+            .lanes
+    }
+
+    fn owners_of(plans: &[LanePlan]) -> Vec<Option<usize>> {
+        plans.iter().map(|l| l.head_rank).collect()
+    }
+
+    #[test]
+    fn mesh_lane_protocol_promotion_splits_head_lanes_evenly_in_plan_order() {
+        let mut plans = plain_plans(8);
+        assert!(plans.iter().all(|l| l.head_rank.is_none()));
+        let mut owned = [0usize, 0];
+        promote_head_owners(&[0, 1], &mut owned, &mut plans);
+        let want: Vec<Option<usize>> = (0..8).map(|i| Some(i % 2)).collect();
+        assert_eq!(owners_of(&plans), want);
+        assert_eq!(owned, [4, 4]);
+        // A second promotion changes nothing: owners are one-way and never move.
+        promote_head_owners(&[0, 1], &mut owned, &mut plans);
+        assert_eq!(owners_of(&plans), want);
+        assert_eq!(owned, [4, 4]);
+    }
+
+    #[test]
+    fn mesh_lane_protocol_promotion_fills_the_least_loaded_rank_and_ties_go_low() {
+        let mut plans = plain_plans(8);
+        for l in &mut plans[..3] {
+            l.head_rank = Some(0);
+        }
+        let mut owned = [3usize, 0];
+        promote_head_owners(&[0, 1], &mut owned, &mut plans);
+        assert_eq!(
+            owners_of(&plans),
+            [0, 0, 0, 1, 1, 1, 0, 1].map(Some).to_vec()
+        );
+        assert_eq!(owned, [4, 4]);
+    }
+
+    #[test]
+    fn mesh_lane_protocol_promotion_needs_two_live_heads_and_skips_free_lanes() {
+        // One head lane in the window: it stays replicated.
+        let mut plans = plain_plans(4);
+        for l in &mut plans[1..] {
+            l.head = HeadState::Free;
+        }
+        let mut owned = [0usize, 0];
+        promote_head_owners(&[0, 1], &mut owned, &mut plans);
+        assert!(plans.iter().all(|l| l.head_rank.is_none()));
+        assert_eq!(owned, [0, 0]);
+        // Two head lanes among four: the Free lanes keep `None`.
+        let mut plans = plain_plans(4);
+        plans[1].head = HeadState::Free;
+        plans[3].head = HeadState::Free;
+        promote_head_owners(&[0, 1], &mut owned, &mut plans);
+        assert_eq!(owners_of(&plans), vec![Some(0), None, Some(1), None]);
+        // A single head rank never splits.
+        let mut plans = plain_plans(4);
+        let mut one = [0usize];
+        promote_head_owners(&[0], &mut one, &mut plans);
+        assert!(plans.iter().all(|l| l.head_rank.is_none()));
+    }
+
+    #[test]
+    fn mesh_lane_protocol_heads_lane_follows_ownership_and_the_plan_digest_carries_it() {
+        let mut plans = plain_plans(2);
+        let (r0, r1) = (RankOwnership::ep(0), RankOwnership::ep(1));
+        assert!(heads_lane(&r0, &plans[0]) && heads_lane(&r1, &plans[0]));
+        let replicated = {
+            let mut d = Digest::new();
+            lane_plan_digest(&mut d, &plans[0]);
+            d.finish()
+        };
+        plans[0].head_rank = Some(1);
+        assert!(!heads_lane(&r0, &plans[0]) && heads_lane(&r1, &plans[0]));
+        let owned = {
+            let mut d = Digest::new();
+            lane_plan_digest(&mut d, &plans[0]);
+            d.finish()
+        };
+        assert_ne!(replicated, owned);
+        plans[0].head_rank = Some(0);
+        let other = {
+            let mut d = Digest::new();
+            lane_plan_digest(&mut d, &plans[0]);
+            d.finish()
+        };
+        assert_ne!(owned, other);
+        // A head-free lane is headed by nobody, owned or not.
+        plans[0].head = HeadState::Free;
+        assert!(!heads_lane(&r0, &plans[0]) && !heads_lane(&r1, &plans[0]));
+    }
+
+    #[test]
+    fn mesh_lane_protocol_draft_split_runs_each_lane_on_its_owner_with_no_gathers() {
+        let b = budgets(LabRoutes::Batched, 3);
+        let reqs = split_reqs(8);
+        let mut m = split_mesh(8, true);
+        let start = m.s_plan(None, &reqs, &b).unwrap();
+        assert_eq!(
+            owners_of(&start.lanes),
+            (0..8).map(|i| Some(i % 2)).collect::<Vec<_>>()
+        );
+        m.s_ready().unwrap();
+        for (r, rd) in m.ready.iter().enumerate() {
+            let ReadyStatus::Ready { tickets } = &rd.status else {
+                panic!("{rd:?}")
+            };
+            for (t, l) in tickets.iter().zip(&start.lanes) {
+                assert!(t.target.is_some());
+                assert_eq!(t.head.is_some(), l.head_rank == Some(r), "rank {r}");
+            }
+        }
+        let mut rounds = 0usize;
+        while let Some(round) = m.root.next_draft_round().unwrap() {
+            assert_eq!(round.ops.len(), 8);
+            let mut res = Vec::new();
+            for r in m.ranks.iter_mut() {
+                let x = r.run_draft_round(&round).unwrap();
+                assert_eq!((x.ops_executed, x.head_gathers), (4, 0), "rank {}", x.rank);
+                assert_eq!(x.proposals.as_ref().map(Vec::len), Some(4));
+                res.push(x);
+            }
+            m.root.collect_draft(&round, &res).unwrap();
+            rounds += 1;
+        }
+        assert!(rounds >= 1);
+        let plan = m.s_verify().unwrap();
+        assert_eq!(plan.ledger.head_draft_calls, 8 * rounds);
+        assert_eq!(
+            plan.ledger.head_draft_calls_by_rank,
+            vec![4 * rounds, 4 * rounds]
+        );
+        m.s_decide(&mut GreedyRule).unwrap();
+        m.s_prepare().unwrap();
+        for (r, rc) in m.receipts.iter().enumerate() {
+            for (pl, l) in rc.lanes.iter().zip(&start.lanes) {
+                assert_eq!(pl.head_end.is_some(), l.head_rank == Some(r), "rank {r}");
+                assert_eq!(pl.head_append.is_some(), l.head_rank == Some(r));
+            }
+        }
+        let out = m.s_publish();
+        // Each rank ran only its own lanes' ops, in round order.
+        for (r, ex) in m.ranks.iter().enumerate() {
+            let mut ops = 0;
+            for c in &ex.calls {
+                if let Call::Draft(_, o) = c {
+                    ops += o.len();
+                    assert!(o.iter().all(|(k, _, _)| start
+                        .lanes
+                        .iter()
+                        .find(|l| l.key == *k)
+                        .unwrap()
+                        .head_rank
+                        == Some(r)));
+                }
+            }
+            assert_eq!(ops, 4 * rounds);
+            assert_eq!(ex.counts[&out.key].head_draft_calls, 4 * rounds);
+        }
+        let merged = m.merged(&out);
+        assert_eq!(merged.counts.head_draft_calls, 8 * rounds);
+        // The served window is the replicated incumbent's, lane for lane.
+        let mut base = split_mesh(8, false);
+        let (base_start, base_out) = base.step(&reqs, &b);
+        assert!(base_start.lanes.iter().all(|l| l.head_rank.is_none()));
+        assert_eq!(out.lanes, base_out.lanes);
+        assert_eq!(base.merged(&base_out).counts.head_draft_calls, 8 * rounds);
+    }
+
+    #[test]
+    fn mesh_lane_protocol_draft_split_evidence_checks_each_rank_against_its_share() {
+        let b = budgets(LabRoutes::Batched, 3);
+        let mut m = split_mesh(4, true);
+        let (_, out) = m.step(&split_reqs(4), &b);
+        let ev = m.evidence(&out.key);
+        assert!(m.root.merge_evidence(&ev, interval()).is_ok());
+        for rank in 0..2 {
+            let mut bad = ev.clone();
+            bad[rank].counts.head_draft_calls += 1;
+            assert!(m.root.merge_evidence(&bad, interval()).is_err());
+            let mut bad = ev.clone();
+            bad[rank].counts.head_append_rows += 1;
+            assert!(m.root.merge_evidence(&bad, interval()).is_err());
+        }
+        // The replicated total on one rank is wrong for an owned window.
+        let mut bad = ev.clone();
+        bad[0].counts.head_draft_calls = ev[0].counts.head_draft_calls * 2;
+        assert!(m.root.merge_evidence(&bad, interval()).is_err());
+    }
+
+    #[test]
+    fn mesh_lane_protocol_a_lone_head_lane_stays_replicated() {
+        let b = budgets(LabRoutes::Batched, 3);
+        let mut m = split_mesh(1, true);
+        let (start, out) = m.step(&split_reqs(1), &b);
+        assert!(start.lanes.iter().all(|l| l.head_rank.is_none()));
+        assert_eq!(m.ranks[0].calls, m.ranks[1].calls);
+        let total = m.merged(&out).counts.head_draft_calls;
+        assert!(total >= 1);
+        for r in &m.ranks {
+            assert_eq!(r.counts[&out.key].head_draft_calls, total);
+        }
+    }
+
+    #[test]
+    fn mesh_lane_protocol_kill_switch_off_replays_todays_ledger() {
+        let b = budgets(LabRoutes::Batched, 3);
+        let mut m = split_mesh(8, false);
+        let start = m.s_plan(None, &split_reqs(8), &b).unwrap();
+        assert!(start.lanes.iter().all(|l| l.head_rank.is_none()));
+        m.s_ready().unwrap();
+        m.s_draft().unwrap();
+        let plan = m.s_verify().unwrap();
+        assert!(plan.ledger.head_draft_calls > 0);
+        assert!(plan.ledger.head_draft_calls_by_rank.is_empty());
+        m.s_decide(&mut GreedyRule).unwrap();
+        m.s_prepare().unwrap();
+        let out = m.s_publish();
+        assert_eq!(m.ranks[0].calls, m.ranks[1].calls);
+        for r in &m.ranks {
+            assert_eq!(
+                r.counts[&out.key].head_draft_calls,
+                plan.ledger.head_draft_calls
+            );
+        }
+        assert!(m
+            .root
+            .evidence_expectation()
+            .is_some_and(|e| e.head_append_rows_by_rank.is_empty()));
+    }
+
+    #[test]
+    fn mesh_lane_protocol_draft_split_a_rank_answering_a_peers_op_aborts() {
+        let mut m = split_mesh(8, true);
+        m.ranks[1].rogue_sampler_output = true;
+        let err = m
+            .run_greedy(&split_reqs(8), &budgets(LabRoutes::Batched, 3))
+            .unwrap_err();
+        let ProtocolError::Aborted(rec) = err else {
+            panic!("{err:?}")
+        };
+        assert!(
+            rec.reason
+                .contains("proposals do not match the ops this rank answers"),
+            "{rec:?}"
+        );
+        assert_eq!(rec.rank, Some(1));
+        assert!(m
+            .ranks
+            .iter()
+            .all(|r| r.published.is_empty() && r.session.is_quarantined()));
+    }
+
+    #[test]
+    fn mesh_lane_protocol_a_round_mixing_owned_and_replicated_lanes_is_refused_by_the_rank() {
+        let mut m = split_mesh(2, true);
+        let mut start = m
+            .root
+            .plan_window(None, &split_reqs(2), &budgets(LabRoutes::Batched, 3))
+            .unwrap();
+        assert_eq!(owners_of(&start.lanes), vec![Some(0), Some(1)]);
+        // The promotion rule never produces this window: forge it (and its digest).
+        start.lanes[1].head_rank = None;
+        start.digest = start_digest(&start.key, &start.lanes, &start.budgets, &start.stage);
+        let mut s = RankSession::new(RankOwnership::ep(0));
+        for l in &start.lanes {
+            s.admit(&LaneAdmit {
+                epoch: l.key.request_epoch,
+                lane_generation: l.key.lane_generation,
+                position: l.position,
+                spec: true,
+            })
+            .unwrap();
+        }
+        let ready = s.begin(&start, Ok(()));
+        assert!(
+            matches!(ready.status, ReadyStatus::Ready { .. }),
+            "{ready:?}"
+        );
+        let round = DraftRound {
+            key: start.key.clone(),
+            round: 0,
+            ops: start
+                .lanes
+                .iter()
+                .map(|l| DraftOp {
+                    key: l.key,
+                    position: l.position,
+                    input: l.seed,
+                    kind: DraftOpKind::Draft,
+                })
+                .collect(),
+            catch_up: Vec::new(),
+        };
+        let err = s.on_draft_round(&round).unwrap_err();
+        assert!(err.reason.contains("mixes owned and replicated"), "{err:?}");
     }
 
     #[test]

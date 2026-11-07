@@ -1144,6 +1144,7 @@ mod tests {
             remaining: 100,
             budget: 0,
             head: HeadState::Aligned,
+            head_rank: None,
         }
     }
 

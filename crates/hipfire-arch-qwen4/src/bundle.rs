@@ -15,7 +15,7 @@ use crate::ep::{Qwen4EpMesh, ReplicaFingerprint};
 use crate::gpu_forward::{
     qwen4_forward_device_bytes, qwen4_prefill_chunk_requested, qwen4_prefill_chunk_rungs,
     qwen4_spec_logit_rows, Qwen4ForwardScratchMode, Qwen4GpuForward, Qwen4GpuForwardError,
-    Qwen4OutputRows, QWEN4_FORWARD_HEADROOM_BYTES,
+    Qwen4OutputRows, Qwen4PeerExpertSource, Qwen4PeerLayerSource, QWEN4_FORWARD_HEADROOM_BYTES,
 };
 use crate::kv_backend::Qwen4KvBackend;
 use crate::mtp_gpu::{MtpAppendScratch, MtpFillContext, MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
@@ -2070,6 +2070,105 @@ impl Qwen4Bundle {
             announce,
         )
         .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// This rank's MTP head routed-expert compact source (its `mtp.` gate/up and
+    /// down tensors: what every peer's lane-local head table names for the experts
+    /// this rank owns), exchanged at EP attach beside the trunk's
+    /// [`Qwen4GpuForward::ep_expert_sources`]. `None`: no head attached, a head that
+    /// is not EP-bound, or a dense head (no routed experts to name).
+    pub(crate) fn mtp_ep_expert_source(&self) -> Result<Option<Qwen4PeerLayerSource>, String> {
+        if !self.mtp.as_ref().is_some_and(|head| head.ep_bound) {
+            return Ok(None);
+        }
+        let Some(moe) = self.weights.mtp.as_ref().and_then(|mtp| mtp.ffn.moe()) else {
+            return Ok(None);
+        };
+        let gate_up = self
+            .weights
+            .resident(&moe.experts_gate_up)
+            .map_err(|error| format!("MTP head expert source: {error}"))?;
+        let down = self
+            .weights
+            .resident(&moe.experts_down)
+            .map_err(|error| format!("MTP head expert source: {error}"))?;
+        Ok(Some(Qwen4PeerLayerSource::Compact(Qwen4PeerExpertSource {
+            gate_up_base: gate_up.buf.as_ptr() as usize,
+            gate_up_bytes: gate_up.buf.size(),
+            down_base: down.buf.as_ptr() as usize,
+            down_bytes: down.buf.size(),
+        })))
+    }
+
+    /// Install the head's lane-local (full-table) MoE runtime once every rank's
+    /// head source (`head_sources`, rank order, from [`Self::mtp_ep_expert_source`])
+    /// is known: the EP mesh attach calls it on every rank after the forward's
+    /// tables and row gather are installed. Installs nothing (the head stays
+    /// not-ready for lane-local calls, every call keeps today's path) when
+    /// `HIPFIRE_QWEN4_EP_DRAFT_SPLIT=0`, when no EP-bound MoE head is attached, or
+    /// when any rank published no head source; that decision reads only the
+    /// gathered sources and the rank's own head, so every rank takes it alike.
+    pub(crate) fn install_mtp_lane_local_moe(
+        &mut self,
+        gpu: &mut Gpu,
+        head_sources: &[Option<Qwen4PeerLayerSource>],
+    ) -> Result<(), String> {
+        if !crate::mesh_lane_protocol::ep_draft_split_enabled() {
+            return Ok(());
+        }
+        let Some(placement) = self
+            .execution
+            .as_ref()
+            .and_then(Qwen4GpuForward::ep_placement)
+        else {
+            return Ok(());
+        };
+        let Some(head) = self.mtp.as_mut() else {
+            return Ok(());
+        };
+        if !head.ep_bound || head.moe.is_none() {
+            return Ok(());
+        }
+        let Some(peers) = head_sources
+            .iter()
+            .cloned()
+            .collect::<Option<Vec<Qwen4PeerLayerSource>>>()
+        else {
+            return Ok(());
+        };
+        if peers.len() != placement.ranks {
+            return Err(format!(
+                "MTP head sources cover {} ranks, the mesh has {}",
+                peers.len(),
+                placement.ranks
+            ));
+        }
+        let seal = self
+            .ep_seal
+            .as_ref()
+            .ok_or("the rank is not bound to an EP seal")?;
+        head.install_lane_local_moe(gpu, &self.weights, &self.config, placement, &peers, seal)
+            .map_err(|error| format!("install the lane-local MTP head MoE: {error}"))
+    }
+
+    /// Whether the attached MTP head can run lane-local MoE calls: its MoE
+    /// runtime is EP-bound and the full-table runtime was installed at EP attach
+    /// ([`Self::install_mtp_lane_local_moe`]), or it has no MoE (dense profile).
+    pub(crate) fn mtp_lane_local_ready(&self) -> bool {
+        self.mtp.as_ref().is_some_and(Qwen4MtpGpu::lane_local_ready)
+    }
+
+    /// Switch the head's lane-local mode: while on, every Predict-step MoE of the
+    /// head (serial and batched) runs on the full-table runtime with a rank-local
+    /// no-op row gather, crosses no rank and does not advance `moe_steps`. Off is
+    /// the incumbent EP head call. On is refused when [`Self::mtp_lane_local_ready`]
+    /// is false.
+    pub(crate) fn mtp_set_lane_local(&mut self, on: bool) -> Result<(), BundleError> {
+        let head = self.mtp.as_mut().ok_or_else(|| {
+            BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+        })?;
+        head.set_lane_local(on)
+            .map_err(|error| BundleError::Forward(error.to_string()))
     }
 
     /// Reserve the GDN capture ring the first native MTP window captures into,

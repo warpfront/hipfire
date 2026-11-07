@@ -571,11 +571,13 @@ impl Qwen4MtpGpu {
         let Self {
             scratch,
             moe,
+            moe_full,
             rows: rows_scratch,
             max_seq,
             draft,
             ep_bound,
             moe_steps,
+            lane_local,
             ..
         } = self;
         let rs = rows_scratch.as_mut().ok_or_else(|| {
@@ -584,7 +586,16 @@ impl Qwen4MtpGpu {
             ))
         })?;
         let mtp = bound_mtp(weights)?;
-        let runtime = match (&mtp.ffn, moe.as_ref()) {
+        // A lane-local call (an owned draft lane) runs the full-table runtime.
+        let local = *lane_local && *ep_bound;
+        let runtime = match (
+            &mtp.ffn,
+            if local {
+                moe_full.as_ref()
+            } else {
+                moe.as_ref()
+            },
+        ) {
             (Qwen4FfnWeights::Moe(_), Some(runtime)) => runtime,
             _ => return Err(invalid("batched MTP head rounds need the MoE head")),
         };
@@ -752,16 +763,25 @@ impl Qwen4MtpGpu {
             };
             // Under EP the batched call is one MoE invocation: the gather
             // buffer `2 + j % 2` and layer index `trunk_layers + j % 2` for
-            // the head's monotonic invocation counter `j`, advanced once.
+            // the head's monotonic invocation counter `j`, advanced once. A
+            // lane-local call keeps the layer index and buffer (every buffer
+            // role of the EP call) with the no-op row gather and leaves `j`
+            // alone, so replicated calls keep their parity in lockstep.
+            let mut local_hook: Option<LaneLocalRowGather<'_>> = None;
             let moe_ep: Option<(usize, &GpuTensor, &dyn MoeRowGather)> = if *ep_bound {
                 let ep = ep
                     .ok_or_else(|| invalid("an EP MTP head step needs the forward's row gather"))?;
                 let parity = (*moe_steps % 2) as usize;
-                *moe_steps = moe_steps.wrapping_add(1);
+                let hook: &dyn MoeRowGather = if local {
+                    local_hook.insert(LaneLocalRowGather { ep: Some(ep.hook) })
+                } else {
+                    *moe_steps = moe_steps.wrapping_add(1);
+                    ep.hook as &dyn MoeRowGather
+                };
                 Some((
                     config.num_hidden_layers + parity,
                     ep.buffers[2 + parity],
-                    ep.hook as &dyn MoeRowGather,
+                    hook,
                 ))
             } else {
                 None
@@ -811,6 +831,15 @@ impl Qwen4MtpGpu {
             );
             validate_steps(gpu, &steps)?;
             execute_validated_steps(gpu, &ctx, &steps)?;
+            #[cfg(feature = "lab")]
+            lab_expert_trace::record(
+                gpu,
+                &rs.moe_topk_indices,
+                n,
+                config.num_experts_per_tok,
+                weights.ep_placement(),
+                local,
+            )?;
             lengths
         };
 
