@@ -2457,10 +2457,11 @@ fn qwen4_placement_inputs(
     // experts in VRAM, so those bytes are replicated, non-expert-style charge of every rank:
     // the unit ranking walk, the whole-layer split and each rank's own fit check all read this
     // one `non_expert`, so the trunk's expert budget shrinks by exactly the owned bytes.
-    let ep_mtp = qwen4_ep_mtp_resident(weights, bytes_of, ranks, mtp_kept)?;
+    let ep_mtp = qwen4_ep_mtp_resident(weights, bytes_of, spans.ranks(), mtp_kept)?;
     // `HIPFIRE_EP_HC8_PLAN_CHARGE`: the replicated HC mixers the applied `.hc8` sidecar shrinks
     // are charged at their E4M3 size, the bytes the rank actually keeps allocated.
-    let ep_hc8_saving = qwen4_ep_hc8_saving(weights, bytes_of, hc8, config, ranks, mtp_kept)?;
+    let ep_hc8_saving =
+        qwen4_ep_hc8_saving(weights, bytes_of, hc8, config, spans.ranks(), mtp_kept)?;
     let args = hipfire_arch_qwen4::expert_residency::PlacementInputsArgs {
         gpu,
         config,
@@ -3212,7 +3213,7 @@ pub fn qwen4_ep_vram_layers(
         shared.native_mtp,
         !config.ffn.is_dense(),
     );
-    let ep_mtp = qwen4_ep_mtp_resident(&manifest.weights, &bytes_of, ranks, mtp_kept)?;
+    let ep_mtp = qwen4_ep_mtp_resident(&manifest.weights, &bytes_of, spans.ranks(), mtp_kept)?;
     // The sidecar every rank will resolve (silently: each rank logs the outcome itself).
     let hc8_plan: Vec<(String, u64, u64)> = hipfire_arch_qwen4::hc8_sidecar::peek_hc8_sidecar(
         hfq,
@@ -3226,7 +3227,7 @@ pub fn qwen4_ep_vram_layers(
         &bytes_of,
         &hc8_plan,
         &config,
-        ranks,
+        spans.ranks(),
         mtp_kept,
     )?;
     // The ordinary (non-decoupled) placement inputs at one prefill chunk, with
@@ -18359,7 +18360,8 @@ mod qwen4_ep_mtp_resident_tests {
         // Layer 0 resident, layer 1 and the head host-mapped by the placement.
         assert_eq!(qwen4_shared_apply_placement(&mut weights, 1, None), 4);
         let pinned = |weights: &[WeightEntry]| {
-            residency::host_mapped_bytes_ranks(weights, bytes_of, 2).unwrap()[0]
+            let ep2 = residency::EpExpertSpans::stride(512, 2).unwrap();
+            residency::host_mapped_bytes_ranks(weights, bytes_of, &ep2).unwrap()[0]
         };
         let with_head_host = pinned(&weights);
         // The rank load restores exactly the head's two stacks.
