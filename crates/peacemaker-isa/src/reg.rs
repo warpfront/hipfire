@@ -297,28 +297,55 @@ impl RegPlan {
         Ok(())
     }
     pub fn verify_lifetimes(&self, order: &[String]) -> Result<(), String> {
+        // First occurrence of every label, once: `Live::contains` resolves each label to
+        // its first position in `order`, so a label is live in a range exactly when that
+        // position lies in the range's half-open interval `[first, last)`.
+        let mut position: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::with_capacity(order.len());
+        let mut firsts: Vec<usize> = Vec::with_capacity(order.len());
+        for (i, l) in order.iter().enumerate() {
+            if let std::collections::hash_map::Entry::Vacant(v) = position.entry(l.as_str()) {
+                v.insert(i);
+                firsts.push(i);
+            }
+        }
         for r in &self.ranges {
             if let Live::Between(first, last) = &r.live {
-                let a = order
-                    .iter()
-                    .position(|l| l == first)
+                let a = *position
+                    .get(first.as_str())
                     .ok_or_else(|| format!("missing lifetime label {first}"))?;
-                let b = order
-                    .iter()
-                    .position(|l| l == last)
+                let b = *position
+                    .get(last.as_str())
                     .ok_or_else(|| format!("missing lifetime label {last}"))?;
                 if a >= b {
                     return Err(format!("invalid lifetime for {}", r.name));
                 }
             }
         }
+        // `Live::contains`' interval over positions in `order`; empty when the start
+        // label is absent (it never is here: the loop above rejected that).
+        let span = |live: &Live| -> (usize, usize) {
+            match live {
+                Live::Whole => (0, usize::MAX),
+                Live::Between(start, end) => match position.get(start.as_str()) {
+                    Some(&first) => (
+                        first,
+                        position.get(end.as_str()).copied().unwrap_or(order.len()),
+                    ),
+                    None => (0, 0),
+                },
+            }
+        };
+        let spans: Vec<(usize, usize)> = self.ranges.iter().map(|r| span(&r.live)).collect();
         for (i, a) in self.ranges.iter().enumerate() {
-            for b in self.ranges.iter().skip(i + 1) {
-                if a.reg().overlaps(b.reg())
-                    && order
-                        .iter()
-                        .any(|label| a.live.contains(label, order) && b.live.contains(label, order))
-                {
+            for (j, b) in self.ranges.iter().enumerate().skip(i + 1) {
+                if !a.reg().overlaps(b.reg()) {
+                    continue;
+                }
+                let lo = spans[i].0.max(spans[j].0);
+                let hi = spans[i].1.min(spans[j].1);
+                let k = firsts.partition_point(|&p| p < lo);
+                if firsts.get(k).is_some_and(|&p| p < hi) {
                     return Err(format!("live ranges {} and {} overlap", a.name, b.name));
                 }
             }

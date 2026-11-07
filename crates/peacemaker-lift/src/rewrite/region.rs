@@ -170,23 +170,48 @@ fn substitute(text: &str, from: &str, to: &str) -> (String, usize) {
     (out, count)
 }
 
+/// A hipcc object lifted once (Hipcc frontend) with the digest the receipt records, so the
+/// kernels of one object convert without re-lifting and re-emitting the whole object each time.
+pub struct HipccObject {
+    program: peacemaker_ir::inst::Program,
+    sha256: [u8; 32],
+}
+
+impl HipccObject {
+    /// Lift `object`; the error is the `reason` [`lift_region`] reports for an object that
+    /// does not lift.
+    pub fn lift(object: &[u8]) -> Result<Self, String> {
+        let lifted = lift_object(
+            object,
+            Options {
+                frontend: Frontend::Hipcc,
+            },
+        )
+        .map_err(|e| format!("lift: {e}"))?;
+        Ok(Self {
+            program: lifted.program,
+            sha256: sha256(object),
+        })
+    }
+
+    /// [`lift_region_in`] on this object.
+    pub fn region(&self, symbol: &str, inputs: &RegionInputs) -> Result<LiftedRegion, RegionError> {
+        lift_region_in(&self.program, self.sha256, symbol, inputs)
+    }
+}
+
 /// Convert kernel `symbol` of the hipcc object `object` into a region.
 pub fn lift_region(
     object: &[u8],
     symbol: &str,
     inputs: &RegionInputs,
 ) -> Result<LiftedRegion, RegionError> {
-    let lifted = lift_object(
-        object,
-        Options {
-            frontend: Frontend::Hipcc,
-        },
-    )
-    .map_err(|e| RegionError {
-        symbol: symbol.into(),
-        reason: format!("lift: {e}"),
-    })?;
-    lift_region_in(&lifted.program, sha256(object), symbol, inputs)
+    HipccObject::lift(object)
+        .map_err(|reason| RegionError {
+            symbol: symbol.into(),
+            reason,
+        })?
+        .region(symbol, inputs)
 }
 
 /// [`lift_region`] for an object already lifted: `program` is the Hipcc-frontend lift of

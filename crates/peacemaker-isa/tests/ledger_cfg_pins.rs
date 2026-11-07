@@ -30,7 +30,7 @@ use peacemaker_isa::insn::{Instruction, Program};
 use peacemaker_isa::kernels::lifted_dispatch_gfx1201 as ld;
 use peacemaker_isa::ledger_cfg::{self, Stats};
 use peacemaker_isa::{Arch, Emitted};
-use peacemaker_lift::rewrite::region::{lift_region, LiftedRegion, RegionInputs};
+use peacemaker_lift::rewrite::region::{HipccObject, LiftedRegion, RegionError, RegionInputs};
 use peacemaker_lift::{lift_object, Options};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -347,6 +347,9 @@ fn lifted_pools_dispatcher_is_fatal_and_bodies_match_exact_entries() {
         if program.target.arch != IrArch::Gfx1201 {
             continue;
         }
+        // The Hipcc lift of the object, once for all its kernels (`lift_region` would lift
+        // and re-emit the whole object per kernel).
+        let mut hipcc: Option<Result<HipccObject, String>> = None;
         for kernel in &program.kernels {
             let Abi::Hsa { metadata, .. } = &kernel.abi else {
                 continue;
@@ -360,7 +363,15 @@ fn lifted_pools_dispatcher_is_fatal_and_bodies_match_exact_entries() {
                 block,
                 dynamic_lds: 0,
             };
-            match lift_region(&image.bytes, &kernel.symbol.0, &inputs) {
+            let object = hipcc.get_or_insert_with(|| HipccObject::lift(&image.bytes));
+            let lifted = match object {
+                Ok(object) => object.region(&kernel.symbol.0, &inputs),
+                Err(reason) => Err(RegionError {
+                    symbol: kernel.symbol.0.clone(),
+                    reason: reason.clone(),
+                }),
+            };
+            match lifted {
                 Ok(region) => {
                     by_block.entry(block).or_default().push(Region {
                         target,
