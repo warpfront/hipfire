@@ -1349,6 +1349,7 @@ fn finish_lane(
         ctl.prefill_ms,
         batch_finite_rate(lane.prompt_len, ctl.prefill_ms / 1000.0),
         batch_finite_rate(generated, decode),
+        decode * 1000.0,
         ctl.prefill_ms,
         0,
         "",
