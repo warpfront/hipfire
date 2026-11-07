@@ -5,8 +5,8 @@
 //! `XBATCH_MAX = 4` (it clamps `B > 4` to 4); this emitter admits capacities up to [`XBATCH_MAX`] = 8.
 //!
 //! The product PM kernel is the [`SHIPPED`] tuple's committed `.hxaco`, pinned byte-for-byte by
-//! `tests/gemv_mq2_xbatch_pm.rs`. Every other tuple (in particular any `cap` 8 tuple) is lab output until a
-//! measured selection replaces [`SHIPPED`] and re-pins the artifact.
+//! `tests/gemv_mq2_xbatch_pm.rs`. Other tuples remain lab output; shipping a different tuple requires a
+//! measured selection and re-pinning the artifact.
 //!
 //! ABI (36 B, identical to the anchor): `A` (read-only), `x[B][K]` (read-only), `y[B][M]` (write-only)
 //! pointers at 0/8/16, `M`/`K`/`B` i32 at 24/28/32. Anchor launch: wave32, block 32, grid `M`, no LDS/scratch.

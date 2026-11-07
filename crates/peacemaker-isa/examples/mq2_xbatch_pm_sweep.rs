@@ -33,21 +33,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if shipped {
         args.remove(0);
     }
-    let out = PathBuf::from(args.first().ok_or("usage: mq2_xbatch_pm_sweep [--shipped] OUT_DIR")?);
+    let out = PathBuf::from(
+        args.first()
+            .ok_or("usage: mq2_xbatch_pm_sweep [--shipped] OUT_DIR")?,
+    );
     fs::create_dir_all(&out)?;
     if shipped {
         let bundle = emit_bundle(&SHIPPED)?;
         let elf = emit_elf(&SHIPPED)?;
         let bundle_sha = format!("{:x}", Sha256::digest(&bundle));
         fs::write(out.join("gemv_mq2_xbatch_pm_gfx1201.hxaco"), &bundle)?;
-        fs::write(out.join("gemv_mq2_xbatch_pm_gfx1201.hxaco.sha256"), &bundle_sha)?;
+        fs::write(
+            out.join("gemv_mq2_xbatch_pm_gfx1201.hxaco.sha256"),
+            &bundle_sha,
+        )?;
         fs::write(out.join("gemv_mq2_xbatch_pm_gfx1201.co"), &elf)?;
         println!("tag {}", SHIPPED.tag());
         println!("bundle_sha256 {bundle_sha}");
         println!("elf_sha256 {:x}", Sha256::digest(&elf));
         return Ok(());
     }
-    let mut manifest = String::from("tag\trows\tcap\tunroll\tsplit\tilp\ttop\tlegal\tobject\terror\n");
+    let mut manifest =
+        String::from("tag\trows\tcap\tunroll\tsplit\tilp\ttop\tlegal\tobject\terror\n");
     let (mut legal, mut total) = (0usize, 0usize);
     for rows in [1u8, 2, 4] {
         for unroll in [1u8, 2, 4] {
@@ -87,6 +94,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     fs::write(out.join("manifest.tsv"), manifest)?;
-    println!("{legal}/{total} tuples legal; manifest {}", out.join("manifest.tsv").display());
+    println!(
+        "{legal}/{total} tuples legal; manifest {}",
+        out.join("manifest.tsv").display()
+    );
     Ok(())
 }

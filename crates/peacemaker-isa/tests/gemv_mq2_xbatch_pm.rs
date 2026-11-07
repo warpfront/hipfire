@@ -27,9 +27,9 @@ fn shipped_elf_matches_embedded_elf() {
     let embedded = bundle_elf(SHIPPED_HXACO);
     assert_eq!(elf, embedded);
     let sha = format!("{:x}", Sha256::digest(&elf));
-    assert!(
-        sha.starts_with("3cb0e724") && sha.ends_with("eaf0"),
-        "{sha}"
+    assert_eq!(
+        sha,
+        "0e9b63c7e3ac07c9f73e3c9e1ad86451c81c24a2ec58e24741a38d876b221bd4"
     );
 }
 

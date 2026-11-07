@@ -237,7 +237,10 @@ struct Obj {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn load_obj(gpu: &Gpu, label: &str, bytes: &[u8], symbol: &str, rows: usize) -> Result<Obj> {
@@ -246,7 +249,13 @@ fn load_obj(gpu: &Gpu, label: &str, bytes: &[u8], symbol: &str, rows: usize) -> 
     }
     let module = gpu.hip.module_load_data(bytes).map_err(err)?;
     let func = gpu.hip.module_get_function(&module, symbol).map_err(err)?;
-    Ok(Obj { label: label.to_string(), sha: sha256_hex(bytes), rows, _module: module, func })
+    Ok(Obj {
+        label: label.to_string(),
+        sha: sha256_hex(bytes),
+        rows,
+        _module: module,
+        func,
+    })
 }
 
 /// ONE launch of `obj` over columns `first..first + b` (x/y column strides `k`/`m`), on the
@@ -299,7 +308,16 @@ fn launch_chunked(
     let mut start = 0;
     while start < b {
         let rows = 4.min(b - start);
-        launch_obj(gpu, obj, a, x + (start * k * 4) as u64, y + (start * m * 4) as u64, m, k, rows)?;
+        launch_obj(
+            gpu,
+            obj,
+            a,
+            x + (start * k * 4) as u64,
+            y + (start * m * 4) as u64,
+            m,
+            k,
+            rows,
+        )?;
         start += rows;
     }
     Ok(())
@@ -308,8 +326,8 @@ fn launch_chunked(
 /// Half bit patterns for header scale/zero-point: distinct NaN payloads (quiet, signalling,
 /// negative), +-Inf, +-0, subnormals, extremes, min normal, ordinary values.
 const EDGE_HALF: [u16; 20] = [
-    0x7e00, 0x7c01, 0xfe55, 0x7dff, 0xfc01, 0x7c00, 0xfc00, 0x0000, 0x8000, 0x0001, 0x8001,
-    0x03ff, 0x83ff, 0x7bff, 0xfbff, 0x0400, 0x8400, 0x3c00, 0xbc00, 0x3555,
+    0x7e00, 0x7c01, 0xfe55, 0x7dff, 0xfc01, 0x7c00, 0xfc00, 0x0000, 0x8000, 0x0001, 0x8001, 0x03ff,
+    0x83ff, 0x7bff, 0xfbff, 0x0400, 0x8400, 0x3c00, 0xbc00, 0x3555,
 ];
 
 /// MQ2 weights whose every (scale, zero-point) half is drawn from `EDGE_HALF`; payloads random.
@@ -332,8 +350,20 @@ fn edge_weights(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
 /// possible); signed zeros; subnormals; +-f32::MAX; dense distinct NaN payloads; Inf+NaN mix.
 fn edge_x(rng: &mut Rng, k: usize) -> Vec<f32> {
     const SPECIAL: [u32; 14] = [
-        0x7fc0_0001, 0xffc0_1234, 0x7f80_0001, 0xff80_0abc, 0x7f80_0000, 0xff80_0000, 0x0000_0000,
-        0x8000_0000, 0x0000_0001, 0x8000_0001, 0x007f_ffff, 0x7f7f_ffff, 0xff7f_ffff, 0x0080_0000,
+        0x7fc0_0001,
+        0xffc0_1234,
+        0x7f80_0001,
+        0xff80_0abc,
+        0x7f80_0000,
+        0xff80_0000,
+        0x0000_0000,
+        0x8000_0000,
+        0x0000_0001,
+        0x8000_0001,
+        0x007f_ffff,
+        0x7f7f_ffff,
+        0xff7f_ffff,
+        0x0080_0000,
     ];
     let mut x = Vec::with_capacity(8 * k);
     for col in 0..8usize {
@@ -348,7 +378,9 @@ fn edge_x(rng: &mut Rng, k: usize) -> Vec<f32> {
                 3 => pick(&SPECIAL[4..6]),
                 4 => pick(&SPECIAL[6..8]),
                 5 => pick(&SPECIAL[8..11]),
-                6 => f32::from_bits(0x7fc0_0000 | ((i as u32 * 2654435761 ^ col as u32) & 0x003f_ffff)),
+                6 => f32::from_bits(
+                    0x7fc0_0000 | ((i as u32 * 2654435761 ^ col as u32) & 0x003f_ffff),
+                ),
                 7 if (r & 7) == 0 => pick(&SPECIAL),
                 7 => pick(&SPECIAL[11..13]),
                 _ => rng.f32() * 3.0,
@@ -369,7 +401,9 @@ fn first_words(
     written: usize,
     limit: usize,
 ) -> Vec<serde_json::Value> {
-    let word = |v: &[u8], i: usize| u32::from_le_bytes([v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3]]);
+    let word = |v: &[u8], i: usize| {
+        u32::from_le_bytes([v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3]])
+    };
     let mut out = Vec::new();
     for i in 0..written / 4 {
         if reference[4 * i..4 * i + 4] != got[4 * i..4 * i + 4] {
@@ -392,7 +426,14 @@ fn first_words(
 
 /// (differing words, both-NaN words, words where at least one side is non-NaN).
 fn nan_class(reference: &[u8], got: &[u8]) -> (usize, usize, usize) {
-    let w = |v: &[u8], i: usize| f32::from_bits(u32::from_le_bytes([v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3]]));
+    let w = |v: &[u8], i: usize| {
+        f32::from_bits(u32::from_le_bytes([
+            v[4 * i],
+            v[4 * i + 1],
+            v[4 * i + 2],
+            v[4 * i + 3],
+        ]))
+    };
     let (mut n, mut both, mut other) = (0, 0, 0);
     for i in 0..reference.len() / 4 {
         if reference[4 * i..4 * i + 4] != got[4 * i..4 * i + 4] {
@@ -409,16 +450,35 @@ fn nan_class(reference: &[u8], got: &[u8]) -> (usize, usize, usize) {
 
 /// Direct correctness of `obj`: single launch at B = 1..=max_b vs per-column singleton bytes
 /// (guards both sides included); hipcc in chunks of <= 4 vs the same bytes.
-fn direct_cases(gpu: &mut Gpu, obj: &Obj, base: Option<&Obj>, max_b: usize) -> Result<(Vec<serde_json::Value>, usize)> {
+fn direct_cases(
+    gpu: &mut Gpu,
+    obj: &Obj,
+    base: Option<&Obj>,
+    max_b: usize,
+) -> Result<(Vec<serde_json::Value>, usize)> {
     let mut rng = Rng(0xD1EC7_5EED_0001);
     let mut cases = Vec::new();
     let mut bad_total = 0usize;
     // (kind, m, k): "random" = finite synthetic; "edge_hdr" = edge half headers + edge x;
     // "edge_x" = finite headers + edge x.
     let mut specs: Vec<(&str, usize, usize)> = [
-        (1usize, 256usize), (2, 512), (3, 1024), (4, 256), (5, 256), (6, 512), (7, 256), (8, 256),
-        (9, 768), (15, 256), (31, 768), (130, 2560), (1001, 2560), (4093, 2048), (33, 4352),
-        (100003, 2560), (100276, 2560),
+        (1usize, 256usize),
+        (2, 512),
+        (3, 1024),
+        (4, 256),
+        (5, 256),
+        (6, 512),
+        (7, 256),
+        (8, 256),
+        (9, 768),
+        (15, 256),
+        (31, 768),
+        (130, 2560),
+        (1001, 2560),
+        (4093, 2048),
+        (33, 4352),
+        (100003, 2560),
+        (100276, 2560),
     ]
     .into_iter()
     .map(|(m, k)| ("random", m, k))
@@ -444,8 +504,14 @@ fn direct_cases(gpu: &mut Gpu, obj: &Obj, base: Option<&Obj>, max_b: usize) -> R
         let y = gpu.zeros(&[8 * m + 2 * GUARD_F], DType::F32).map_err(err)?;
         let y_view = y.sub_offset(GUARD_F, 8 * m);
         for column in 0..8 {
-            gpu.gemv_mq2g256v2(&a, &x.sub_offset(column * k, k), &y_ref.sub_offset(column * m, m), m, k)
-                .map_err(err)?;
+            gpu.gemv_mq2g256v2(
+                &a,
+                &x.sub_offset(column * k, k),
+                &y_ref.sub_offset(column * m, m),
+                m,
+                k,
+            )
+            .map_err(err)?;
         }
         gpu.hip.device_synchronize().map_err(err)?;
         let reference = gpu.download_raw_bytes(&y_ref).map_err(err)?;
@@ -454,7 +520,16 @@ fn direct_cases(gpu: &mut Gpu, obj: &Obj, base: Option<&Obj>, max_b: usize) -> R
             let guard = GUARD_F * 4;
             // single launch of the object
             gpu.hip.memset(&y.buf, 0x7f, y.numel() * 4).map_err(err)?;
-            launch_obj(gpu, obj, &a, x.buf.as_ptr() as u64, y_view.buf.as_ptr() as u64, m, k, b)?;
+            launch_obj(
+                gpu,
+                obj,
+                &a,
+                x.buf.as_ptr() as u64,
+                y_view.buf.as_ptr() as u64,
+                m,
+                k,
+                b,
+            )?;
             gpu.hip.device_synchronize().map_err(err)?;
             let got = gpu.download_raw_bytes(&y).map_err(err)?;
             let guards_bad = |v: &[u8]| {
@@ -464,20 +539,34 @@ fn direct_cases(gpu: &mut Gpu, obj: &Obj, base: Option<&Obj>, max_b: usize) -> R
             let bad_guard = guards_bad(&got);
             // hipcc kernel, chunks of <= 4, same guards
             gpu.hip.memset(&y.buf, 0x7f, y.numel() * 4).map_err(err)?;
-            gpu.gemv_mq2g256v2_xbatch_with(&a, &x, &y_view, m, k, b, false).map_err(err)?;
+            gpu.gemv_mq2g256v2_xbatch_with(&a, &x, &y_view, m, k, b, false)
+                .map_err(err)?;
             gpu.hip.device_synchronize().map_err(err)?;
             let hip = gpu.download_raw_bytes(&y).map_err(err)?;
             // incumbent PM object (cap4, chunks of 4), when --baseline-object supplied
             let old = match base {
                 Some(base) => {
                     gpu.hip.memset(&y.buf, 0x7f, y.numel() * 4).map_err(err)?;
-                    launch_chunked(gpu, base, &a, x.buf.as_ptr() as u64, y_view.buf.as_ptr() as u64, m, k, b)?;
+                    launch_chunked(
+                        gpu,
+                        base,
+                        &a,
+                        x.buf.as_ptr() as u64,
+                        y_view.buf.as_ptr() as u64,
+                        m,
+                        k,
+                        b,
+                    )?;
                     gpu.hip.device_synchronize().map_err(err)?;
                     Some(gpu.download_raw_bytes(&y).map_err(err)?)
                 }
                 None => None,
             };
-            let (r_w, g_w, h_w) = (&reference[..written], &got[guard..guard + written], &hip[guard..guard + written]);
+            let (r_w, g_w, h_w) = (
+                &reference[..written],
+                &got[guard..guard + written],
+                &hip[guard..guard + written],
+            );
             let o_w = old.as_ref().map(|o| &o[guard..guard + written]);
             let sing_direct = diff(g_w, r_w);
             let sing_hipcc = diff(h_w, r_w) + guards_bad(&hip);
@@ -504,13 +593,16 @@ fn direct_cases(gpu: &mut Gpu, obj: &Obj, base: Option<&Obj>, max_b: usize) -> R
                 let vs_hip = diff(g_w, h_w);
                 gate += vs_hip;
                 entry["direct_vs_hipcc_chunked_mismatch_bytes"] = json!(vs_hip);
-                entry["first_direct_vs_hipcc_words"] = json!(first_words(h_w, g_w, None, m, written, 8));
+                entry["first_direct_vs_hipcc_words"] =
+                    json!(first_words(h_w, g_w, None, m, written, 8));
                 if let Some(o_w) = o_w {
                     let d = diff(g_w, o_w);
                     gate += d + guards_bad(old.as_ref().unwrap());
                     entry["direct_vs_baseline_mismatch_bytes"] = json!(d);
-                    entry["baseline_guard_overwritten_bytes"] = json!(guards_bad(old.as_ref().unwrap()));
-                    entry["first_direct_vs_baseline_words"] = json!(first_words(o_w, g_w, None, m, written, 8));
+                    entry["baseline_guard_overwritten_bytes"] =
+                        json!(guards_bad(old.as_ref().unwrap()));
+                    entry["first_direct_vs_baseline_words"] =
+                        json!(first_words(o_w, g_w, None, m, written, 8));
                     entry["preexisting_baseline_vs_hipcc_mismatch_bytes"] = json!(diff(o_w, h_w));
                     entry["preexisting_singleton_baseline_mismatch_bytes"] = json!(diff(o_w, r_w));
                 }
@@ -555,7 +647,11 @@ fn bench_table(
     let x = gpu.upload_f32(&x_host, &[x_host.len()]).map_err(err)?;
     let y = gpu.zeros(&[8 * m], DType::F32).map_err(err)?;
     let y2 = gpu.zeros(&[8 * m], DType::F32).map_err(err)?;
-    let (xp, yp, y2p) = (x.buf.as_ptr() as u64, y.buf.as_ptr() as u64, y2.buf.as_ptr() as u64);
+    let (xp, yp, y2p) = (
+        x.buf.as_ptr() as u64,
+        y.buf.as_ptr() as u64,
+        y2.buf.as_ptr() as u64,
+    );
     let mut rows_json = Vec::new();
     let mut bad = 0usize;
     println!(
@@ -569,7 +665,10 @@ fn bench_table(
         launch_obj(gpu, obj, &ws[0], xp, yp, m, k, b)?;
         launch_chunked(gpu, base, &ws[0], xp, y2p, m, k, b)?;
         gpu.hip.device_synchronize().map_err(err)?;
-        let same = diff(&gpu.download_raw_bytes(&y).map_err(err)?, &gpu.download_raw_bytes(&y2).map_err(err)?);
+        let same = diff(
+            &gpu.download_raw_bytes(&y).map_err(err)?,
+            &gpu.download_raw_bytes(&y2).map_err(err)?,
+        );
         bad += same;
         // interleaved arms: single, chunked
         let single = graph_us(gpu, reps, |g, i| {
@@ -593,12 +692,15 @@ fn bench_table(
     for t in [x, y, y2] {
         gpu.free_tensor(t).map_err(err)?;
     }
-    Ok((json!({
-        "m": m, "k": k, "reps": reps, "calls_per_replay": BENCH_CALLS,
-        "weight_copies": BENCH_COPIES, "weight": "synthetic",
-        "baseline": base.label, "baseline_sha256": base.sha, "baseline_rows": base.rows,
-        "table": rows_json,
-    }), bad))
+    Ok((
+        json!({
+            "m": m, "k": k, "reps": reps, "calls_per_replay": BENCH_CALLS,
+            "weight_copies": BENCH_COPIES, "weight": "synthetic",
+            "baseline": base.label, "baseline_sha256": base.sha, "baseline_rows": base.rows,
+            "table": rows_json,
+        }),
+        bad,
+    ))
 }
 
 /// Rows per block from an `r1`/`r2`/`r4` token of a file stem.
@@ -726,18 +828,29 @@ fn main() {
             }
             // Optional DIR/manifest.json: `[{"file","rows","symbol"?}]` or `{"objects":[..]}`;
             // entries override the stem token / --rows / --symbol for that file.
-            let manifest: Vec<serde_json::Value> = match std::fs::read(Path::new(dir).join("manifest.json")) {
-                Ok(b) => {
-                    let v: serde_json::Value = serde_json::from_slice(&b).map_err(err)?;
-                    v.get("objects").unwrap_or(&v).as_array().cloned().ok_or("manifest.json: no object array")?
-                }
-                Err(_) => Vec::new(),
-            };
+            let manifest: Vec<serde_json::Value> =
+                match std::fs::read(Path::new(dir).join("manifest.json")) {
+                    Ok(b) => {
+                        let v: serde_json::Value = serde_json::from_slice(&b).map_err(err)?;
+                        v.get("objects")
+                            .unwrap_or(&v)
+                            .as_array()
+                            .cloned()
+                            .ok_or("manifest.json: no object array")?
+                    }
+                    Err(_) => Vec::new(),
+                };
             for p in paths {
-                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                let name = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
                 let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                 let ent = manifest.iter().find(|e| {
-                    e["file"].as_str().is_some_and(|f| Path::new(f).file_name().is_some_and(|n| *n == *name))
+                    e["file"]
+                        .as_str()
+                        .is_some_and(|f| Path::new(f).file_name().is_some_and(|n| *n == *name))
                 });
                 let r = ent
                     .and_then(|e| e["rows"].as_u64())

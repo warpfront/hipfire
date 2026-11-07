@@ -4860,10 +4860,11 @@ pub const LANE_ROWS_BF16_PM_GFX1201: &[u8] =
 pub const LANE_ROWS_BF16_PM_GFX1201_SHA256: &str =
     include_str!("../../../kernels/lane_rows_bf16_pm_gfx1201.hxaco.sha256");
 /// gfx1201 PeaceMaker x-batched MQ2G256V2 GEMV (`gemv_mq2g256v2_xbatch_pm`,
-/// WideNet F05 `r4_b4_u1_native_anchor`, ELF sha256 `3cb0e724…eaf0`): the
+/// `r4_b8_u1_native_anchor`, ELF sha256 `0e9b63c7…1bd4`): the
 /// ABI (`A, x, y, M, K, B`, 36-byte kernarg) and per-row reduction order of
 /// [`GEMV_MQ2G256V2_XBATCH_SRC`], four output rows per 32-lane wave (grid
-/// `ceil(M/4)`). Byte-identical to the hipcc kernel on the differential and
+/// `ceil(M/4)`), up to eight input columns per launch. Byte-identical to the
+/// incumbent cap-four PM/hipcc path on the finite and NaN/Inf differential
 /// `mq2_xbatch_oracle` corpora; tested, not yet proven anchor-relative.
 pub const GEMV_MQ2_XBATCH_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/gemv_mq2_xbatch_pm_gfx1201.hxaco");

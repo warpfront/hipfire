@@ -87,8 +87,14 @@ fn r4_b8_anchor_closes_with_six_ring_slots() {
     assert_eq!(p.tag(), "r4_b8_u1_native_anchor");
     assert_eq!(vgpr_top(&p), 256);
     let text = emit_text(&p).expect("r4_b8 anchor must close");
-    assert!(text.contains("v_mov_b32_e32 v128, 0"), "first accumulator v128");
-    assert!(text.contains("v_mov_b32_e32 v255, 0"), "last accumulator v255");
+    assert!(
+        text.contains("v_mov_b32_e32 v128, 0"),
+        "first accumulator v128"
+    );
+    assert!(
+        text.contains("v_mov_b32_e32 v255, 0"),
+        "last accumulator v255"
+    );
     assert!(emit_bundle(&p).is_ok());
 }
 
@@ -254,8 +260,7 @@ impl Kernel {
     fn run(&self, pr: &Problem, col0: usize, b: i32, tag: &str) -> Vec<u32> {
         let Shape { m, g, .. } = pr.shape;
         let k = g * 256;
-        let emu = Emulator::new(&self.program, SYMBOL)
-            .unwrap_or_else(|e| panic!("{tag}: {e}"));
+        let emu = Emulator::new(&self.program, SYMBOL).unwrap_or_else(|e| panic!("{tag}: {e}"));
         let x_ptr = X_BASE + (col0 * k * 4) as u64;
         let mut karg = Vec::new();
         for p in [A_BASE, x_ptr, Y_BASE] {
@@ -315,8 +320,16 @@ fn check_tuple(p: &Params, pr: &Problem, refs: &[Vec<u32>], bs: &[i32]) {
     // B = 1 over every column equals the reference column.
     for (c, want) in refs.iter().enumerate() {
         let y = k.run(pr, c, 1, &tag);
-        assert_eq!(&y[..m], &want[..], "{tag} m={m} g={} B=1 col {c}", pr.shape.g);
-        assert!(y[m..].iter().all(|&w| w == SENTINEL), "{tag} B=1 col {c}: stray write");
+        assert_eq!(
+            &y[..m],
+            &want[..],
+            "{tag} m={m} g={} B=1 col {c}",
+            pr.shape.g
+        );
+        assert!(
+            y[m..].iter().all(|&w| w == SENTINEL),
+            "{tag} B=1 col {c}: stray write"
+        );
     }
     for &b in bs {
         let y = k.run(pr, 0, b, &tag);
