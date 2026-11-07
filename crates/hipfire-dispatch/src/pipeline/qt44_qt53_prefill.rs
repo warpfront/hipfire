@@ -1835,6 +1835,21 @@ fn ep_a8_wide_geometry(
     gate_up_k == 2560 && mi == 640 && down_k == 640 && down_m == 2560 && k_top == 10
 }
 
+/// Whether a layer declaring `capability` on a device whose experts are drop-zero planar
+/// (`planar`, [`Gpu::mq4_experts_planar`]) has the symmetric experts the int8 chain's `_sym`
+/// GEMMs need. Below the IU4 row floor a verified layer still declares the plain
+/// `Qt44Qt53Grouped` (the loader couples the symmetric variant to that floor), so at 9..=64 rows
+/// the verdict is the planar layout itself: the host repack verified `z == -8 s` on every header
+/// and dropped the zero plane, and the incumbent planar kernels (g32 gate/up, PM A8 down) read no
+/// zero point either. Pure.
+fn ep_a8_wide_symmetric(capability: MoeRouteCapability, planar: bool) -> bool {
+    planar
+        && matches!(
+            capability,
+            MoeRouteCapability::Qt44Qt53Grouped | MoeRouteCapability::Qt44Qt53GroupedSymmetric
+        )
+}
+
 /// Whether the shared expert's selector / gate / up read the FWHT-rotated basis `x_rot_batch`
 /// (only the F32 `MQ4G256V2` projections do; BF16, F32 and Q8_0 read `x_norm_batch`). The one
 /// conditional reader of `x_rot_batch` on the wide-verify int8 route
@@ -1861,8 +1876,8 @@ fn shared_reads_x_rot(p: &MoePrefillParams<'_>) -> bool {
 /// * the grouped path 2 at a route above the few-row limit (not the indexed per-slot down, not
 ///   the wide-exact singleton route), not FP8 / slab, not the symmetric IU4 route (prefill keeps
 ///   its own A4 / A8 chain), not the F16 WMMA arms (gfx11);
-/// * drop-zero planar experts ([`Gpu::mq4_experts_planar`]: the EP decode tables) with the
-///   loader's symmetric verdict (`Qt44Qt53GroupedSymmetric`, `z == -8 s`), the BF16 recipe, an F32
+/// * drop-zero planar QT44/QT53 experts ([`Gpu::mq4_experts_planar`]: the EP decode tables,
+///   symmetric by construction, [`ep_a8_wide_symmetric`]), the BF16 recipe, an F32
 ///   `x_norm_batch`, and the Flash-Next geometry ([`ep_a8_wide_geometry`]);
 /// * an EP row-gathered call whose gather is a no-op ([`MoeRowGather::gather_skipped`]: the trunk
 ///   shard's partial FFN, owned-slot partial completed by the HC all-reduce, non-owned experts on
@@ -1878,9 +1893,8 @@ pub(crate) fn ep_a8_wide(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -
         && gpu.qwen4_moe_gu_a8_applies(p.batch_size)
         && !super::layer_ops::wide_exact_moe_rows(gpu, p.batch_size)
         && !indexed_down(gpu, p, use_path2)
-        && gpu.mq4_experts_planar()
         && p.route_policy
-            .is_some_and(|policy| policy.capability == MoeRouteCapability::Qt44Qt53GroupedSymmetric)
+            .is_some_and(|policy| ep_a8_wide_symmetric(policy.capability, gpu.mq4_experts_planar()))
         && p.recipe.bf16_round_trip()
         && p.x_norm_batch.dtype == DType::F32
         && ep_a8_wide_geometry(p.gate_up_k, p.mi, p.down_k, p.down_m, p.k_top)
@@ -4648,6 +4662,20 @@ mod scratch_tests {
         assert!(!ep_a8_wide_geometry(2560, 640, 512, 2560, 10));
         assert!(!ep_a8_wide_geometry(2560, 640, 640, 2048, 10));
         assert!(!ep_a8_wide_geometry(2560, 640, 640, 2560, 8));
+    }
+
+    /// The symmetric verdict of the wide-verify int8 chain: the planar layout with either QT44/QT53
+    /// capability (below the IU4 floor a verified layer declares the plain one); never a shipped
+    /// (non-planar) layout, FP8 or slab layer.
+    #[test]
+    fn wide_verify_int8_route_symmetric_verdict_is_the_planar_layout() {
+        use MoeRouteCapability::*;
+        assert!(ep_a8_wide_symmetric(Qt44Qt53Grouped, true));
+        assert!(ep_a8_wide_symmetric(Qt44Qt53GroupedSymmetric, true));
+        assert!(!ep_a8_wide_symmetric(Qt44Qt53Grouped, false));
+        assert!(!ep_a8_wide_symmetric(Qt44Qt53GroupedSymmetric, false));
+        assert!(!ep_a8_wide_symmetric(Fp8B128Grouped, true));
+        assert!(!ep_a8_wide_symmetric(SlabCodecGrouped, true));
     }
 
     #[test]
