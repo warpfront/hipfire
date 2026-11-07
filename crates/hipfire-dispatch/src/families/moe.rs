@@ -1582,6 +1582,16 @@ pub trait MoeRowGather {
         None
     }
 
+    /// Whether [`Self::gather_rows`] of this layer is a no-op for the call: the trunk shard's partial FFN
+    /// route, where the all-reduce of the HC write completes the routed FFN and this rank's combine folds
+    /// its own owned-slot partial (non-owned experts ran on the zero dummy tables). The slot-ordered
+    /// expanded rows a gather would exchange are then never read by a peer, so a down that writes BF16
+    /// grouped rows instead (the int8 wide-verify chain) is exact. `false` by default (every call
+    /// gathers); implementations decide it exactly as `gather_rows` does.
+    fn gather_skipped(&self, _layer_idx: u16) -> bool {
+        false
+    }
+
     /// Rewrite the layer's live expert tables and slot owners from
     /// `topk_indices` (`slots = rows * k`). Runs after routing, before the
     /// first routed-table reader of the same call.

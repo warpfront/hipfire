@@ -2404,11 +2404,15 @@ impl<'a> SealedMoeOp<'a> {
                 if !selection
                     .route
                     .is_some_and(MoeRouteCapability::is_sealed_grouped)
-                    || !super::qt44_qt53_prefill::writes_slot_ordered_rows(
+                    || !(super::qt44_qt53_prefill::writes_slot_ordered_rows(
                         gpu,
                         params,
                         selection.uses_grouped_rows(),
-                    )
+                    ) || super::qt44_qt53_prefill::ep_a8_wide(
+                        gpu,
+                        params,
+                        selection.uses_grouped_rows(),
+                    ))
                 {
                     return Err(DispatchError::Hip(
                             "sealed moe: an EP row gather needs the grouped QT44/QT53 down to have written slot-ordered expanded rows".into(),

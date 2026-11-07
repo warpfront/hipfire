@@ -268,6 +268,9 @@ pub(crate) struct ScratchRoute {
     /// The qt=55 FP8E4M3B128 grouped route (every other flag is then false).
     pub(crate) fp8: bool,
     pub(crate) sym_iu4: bool,
+    /// The wide-verify int8 chain (`HIPFIRE_QWEN4_MOE_GU_A8`, [`ep_a8_wide`]): BF16 grouped rows in
+    /// both grouped buffers, the combine's rank order in `down_expanded`; exclusive of `sym_iu4`.
+    pub(crate) ep_a8_wide: bool,
     pub(crate) gateup_bf16: bool,
     pub(crate) gateup_silu: bool,
     pub(crate) down_wmma: bool,
@@ -285,6 +288,7 @@ impl ScratchRoute {
             path2: use_path2,
             fp8: false,
             sym_iu4: sym_iu4(gpu, p, use_path2),
+            ep_a8_wide: ep_a8_wide(gpu, p, use_path2),
             gateup_bf16: use_path2 && gateup_bf16(gpu, p),
             gateup_silu: use_path2 && gateup_silu(gpu, p),
             down_wmma: use_path2 && down_wmma(gpu, p),
@@ -298,6 +302,7 @@ impl ScratchRoute {
             path2: true,
             fp8: true,
             sym_iu4: false,
+            ep_a8_wide: false,
             gateup_bf16: false,
             gateup_silu: false,
             down_wmma: false,
@@ -347,7 +352,7 @@ impl ScratchRoute {
             scratch_mul(scratch_mul(grouped, width)?, elem)
         };
         let order = combine_order_bytes(dims.rows, dims.k_top)?;
-        if self.sym_iu4 {
+        if self.sym_iu4 || self.ep_a8_wide {
             need.y_gate_up_grouped = grouped_bytes(dims.mi, BF16_BYTES)?;
             need.y_down_grouped = grouped_bytes(dims.down_m, BF16_BYTES)?;
             need.down_expanded = need.down_expanded.max(order);
@@ -454,6 +459,7 @@ pub(crate) fn writes_slot_ordered_rows(
     !is_fp8(p)
         && p.expert_stage_ptrs.is_none()
         && !sym_iu4(gpu, p, use_path2)
+        && !ep_a8_wide(gpu, p, use_path2)
         && (!use_path2
             || indexed_down(gpu, p, use_path2)
             || ep_grouped_down_unscatter(gpu, p, use_path2))
@@ -497,7 +503,7 @@ fn combine_arm(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> super::C
         use_path2,
         indexed_down(gpu, p, use_path2),
         ep_grouped_down_unscatter(gpu, p, use_path2),
-        down_wmma(gpu, p) || sym_iu4(gpu, p, use_path2),
+        down_wmma(gpu, p) || sym_iu4(gpu, p, use_path2) || ep_a8_wide(gpu, p, use_path2),
     )
 }
 
@@ -529,6 +535,7 @@ fn ep_grouped_down_unscatter(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: boo
         && !is_fp8(p)
         && p.expert_stage_ptrs.is_none()
         && !sym_iu4(gpu, p, use_path2)
+        && !ep_a8_wide(gpu, p, use_path2)
         && !down_wmma(gpu, p)
         && !indexed_down(gpu, p, use_path2)
 }
@@ -547,6 +554,12 @@ pub(crate) fn input_basis(
     }
     require_geometry(p)?;
     if gateup_rotates_f16(gpu, p, use_path2) {
+        return Ok(());
+    }
+    if ep_a8_wide(gpu, p, use_path2) && !shared_reads_x_rot(p) {
+        // The wide-verify int8 chain quantizes `x_norm_batch` itself (`qwen4_moe_rotate256_i8`);
+        // the router and the BF16 shared expert read the natural activation. `x_rot_batch` has no
+        // reader on this route: see [`shared_reads_x_rot`] for the one conditional reader.
         return Ok(());
     }
     hip(gpu.rotate_x_mq_batched(p.x_norm_batch, p.x_rot_batch, p.gate_up_k, p.batch_size))
@@ -779,7 +792,7 @@ fn router_shares_f16(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
 fn shared_gu_pm(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
     router_shares_f16(gpu, p)
         && p.recipe.bf16_round_trip()
-        && !(use_path2 && shared_in_unscatter(gpu, p))
+        && !(use_path2 && shared_in_unscatter_base(gpu, p))
         && p.prelude.shared.as_ref().is_some_and(|shared| {
             let w = &shared.weights;
             w.gate.m == shared.intermediate
@@ -842,7 +855,7 @@ fn shared_i8_weights<'a>(shared: &MoeSharedPrefill<'a>) -> SharedI8Weights<'a> {
 fn shared_int8(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
     router_shares_f16(gpu, p)
         && p.recipe.bf16_round_trip()
-        && !(use_path2 && shared_in_unscatter(gpu, p))
+        && !(use_path2 && shared_in_unscatter_base(gpu, p))
         && p.prelude.shared.as_ref().is_some_and(|shared| {
             let w = &shared.weights;
             w.gate.m == shared.intermediate
@@ -1810,6 +1823,77 @@ fn sym_iu4(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
         && gpu.qwen4_moe_sym_iu4_applies(p.batch_size)
 }
 
+/// Whether `p` has the Flash-Next geometry the wide-verify int8 chain's GEMMs serve: gate/up
+/// `M = 2 * 640`, `K = 2560`, down `M = 2560`, `K = 640`, top-10. Pure.
+fn ep_a8_wide_geometry(
+    gate_up_k: usize,
+    mi: usize,
+    down_k: usize,
+    down_m: usize,
+    k_top: usize,
+) -> bool {
+    gate_up_k == 2560 && mi == 640 && down_k == 640 && down_m == 2560 && k_top == 10
+}
+
+/// Whether the shared expert's selector / gate / up read the FWHT-rotated basis `x_rot_batch`
+/// (only the F32 `MQ4G256V2` projections do; BF16, F32 and Q8_0 read `x_norm_batch`). The one
+/// conditional reader of `x_rot_batch` on the wide-verify int8 route
+/// ([`shared_gate_up_front`]); the router reads `x_norm_batch`.
+fn shared_reads_x_rot(p: &MoePrefillParams<'_>) -> bool {
+    p.prelude.shared.as_ref().is_some_and(|shared| {
+        [
+            &shared.weights.selector,
+            &shared.weights.gate,
+            &shared.weights.up,
+        ]
+        .iter()
+        .any(|w| w.dtype == DType::MQ4G256V2)
+    })
+}
+
+/// Whether path 2 takes the wide-verify int8 chain of the Flash-Next EP2 decode / verify MoE
+/// (`HIPFIRE_QWEN4_MOE_GU_A8`, default on, exact `0` off): `qwen4_moe_rotate256_i8` + the signed-IU8
+/// gate/up with the SwiGLU epilogue, `qwen4_moe_rotate128_i8` + the signed-IU8 down, BF16 grouped
+/// rows, and the BF16-row grouped combine, in place of the g32 gate/up, the unscatter + FWHT128,
+/// the PM A8 down, the down unscatter and the expanded top-10 combine. All of:
+/// * [`Gpu::qwen4_moe_gu_a8_applies`]: exact gfx1201, the switch not `0`, eager (no capture or
+///   replay record), `batch_size` source rows in the g32 window 9..=64;
+/// * the grouped path 2 at a route above the few-row limit (not the indexed per-slot down, not
+///   the wide-exact singleton route), not FP8 / slab, not the symmetric IU4 route (prefill keeps
+///   its own A4 / A8 chain), not the F16 WMMA arms (gfx11);
+/// * drop-zero planar experts ([`Gpu::mq4_experts_planar`]: the EP decode tables) with the
+///   loader's symmetric verdict (`Qt44Qt53GroupedSymmetric`, `z == -8 s`), the BF16 recipe, an F32
+///   `x_norm_batch`, and the Flash-Next geometry ([`ep_a8_wide_geometry`]);
+/// * an EP row-gathered call whose gather is a no-op ([`MoeRowGather::gather_skipped`]: the trunk
+///   shard's partial FFN, owned-slot partial completed by the HC all-reduce, non-owned experts on
+///   the zero dummy tables: every grouped row is written, +0 for dummy tiles, so the combine needs
+///   no owner mask). A call that gathers (the MTP head, a non-shard EP, a balanced / partitioned
+///   layer) needs F32 slot-ordered rows and keeps the incumbent chain;
+/// * no tile exchange, no CPU split / deferral (their consumers need F32 slot-ordered rows).
+pub(crate) fn ep_a8_wide(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
+    let use_path2 = grouped_path(gpu, p, use_path2);
+    use_path2
+        && !is_fp8(p)
+        && !is_slab(p)
+        && gpu.qwen4_moe_gu_a8_applies(p.batch_size)
+        && !super::layer_ops::wide_exact_moe_rows(gpu, p.batch_size)
+        && !indexed_down(gpu, p, use_path2)
+        && gpu.mq4_experts_planar()
+        && p.route_policy
+            .is_some_and(|policy| policy.capability == MoeRouteCapability::Qt44Qt53GroupedSymmetric)
+        && p.recipe.bf16_round_trip()
+        && p.x_norm_batch.dtype == DType::F32
+        && ep_a8_wide_geometry(p.gate_up_k, p.mi, p.down_k, p.down_m, p.k_top)
+        && !sym_iu4(gpu, p, use_path2)
+        && !down_wmma(gpu, p)
+        && !gateup_bf16(gpu, p)
+        && p.ep_tile_exchange.is_none()
+        && !p.cpu_deferred_experts
+        && p.routed_experts.cpu_split().is_none()
+        && p.ep_row_gather
+            .is_some_and(|gather| gather.gather_skipped(p.ep_layer_idx))
+}
+
 /// Whether [`scatter`] would launch the plain `moe_scatter_fused_top10` for this call, with
 /// nothing else to do and no error to raise: the fused router + scatter launch
 /// (`HIPFIRE_QWEN4_MOE_ROUTE_SCATTER`) replaces exactly that launch. Mirrors [`scatter`]'s own
@@ -2175,6 +2259,24 @@ pub(crate) fn gate_up_front(
             experts_host_mapped(p),
         ));
     }
+    if ep_a8_wide(gpu, p, use_path2) {
+        // HIPFIRE_QWEN4_MOE_GU_A8 (EP2 decode / verify, 9..=64 rows): int8 per-128 gate/up with the
+        // SwiGLU epilogue (BF16 grouped rows, every grouped row written: dummy tiles give +0).
+        gpu.qwen4_moe_gu_a8_receipt(p.batch_size, grouped_rows);
+        let xq = hip(gpu.qwen4_moe_rotate256_i8(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
+        return hip(gpu.gemm_qwen4_moe_gate_up_silu_a8_sym(
+            gate_up_ptrs,
+            gemm_tile_ids(p),
+            p.sorted_slot_index,
+            &xq,
+            p.y_gate_up_grouped,
+            2 * p.mi,
+            p.gate_up_k,
+            p.k_top,
+            grouped_rows,
+            p.batch_size,
+        ));
+    }
     if use_path2 && gateup_bf16(gpu, p) {
         let x_f16 = if gateup_rotates_f16(gpu, p, use_path2) {
             Some(hip(gpu.rotate_x_mq_batched_f16(
@@ -2300,6 +2402,10 @@ pub(crate) fn unscatter(
     if sym_iu4(gpu, p, true) {
         return Ok(());
     }
+    // Wide-verify int8 chain: SiLU in the gate/up epilogue, rotation + A8 in `down`.
+    if ep_a8_wide(gpu, p, true) {
+        return Ok(());
+    }
     // SiLU in the gate/up epilogue, unscatter + rotation in the down stage.
     if gateup_silu(gpu, p) {
         return Ok(());
@@ -2363,6 +2469,13 @@ pub(crate) fn unscatter(
 /// Whether path 2's F32 unscatter also applies the down's 128-wide rotation
 /// (in the same launch), leaving [`activation`] nothing to do.
 fn unscatter_rotates(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
+    unscatter_rotates_base(gpu, p) && !ep_a8_wide(gpu, p, true)
+}
+
+/// [`unscatter_rotates`] ignoring the wide-verify int8 chain, which replaces the unscatter: the
+/// incumbent F32 chain's own decision, kept for the shared-expert routes that key on it
+/// ([`shared_in_unscatter_base`]) so they stay what they are on the incumbent chain.
+fn unscatter_rotates_base(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
     !super::layer_ops::wide_exact_moe_rows(gpu, p.batch_size)
         && !is_slab(p)
         && !sym_iu4(gpu, p, true)
@@ -2374,10 +2487,20 @@ fn unscatter_rotates(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
 /// Whether path 2's fused unscatter launch also runs the BF16 shared expert
 /// activation: its only reader, a natural-basis shared down, runs after the
 /// combine (so after the unscatter). A CPU-deferred call lowers no unscatter,
-/// so its shared activation always runs in its own stage.
+/// so its shared activation always runs in its own stage. The wide-verify int8 chain
+/// runs no unscatter: the shared activation then runs in its own stage
+/// ([`shared_activation`], the same `shared_expert_activation_bf16_f32` launch the fused
+/// unscatter folds in).
 fn shared_in_unscatter(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
+    shared_in_unscatter_base(gpu, p) && !ep_a8_wide(gpu, p, true)
+}
+
+/// [`shared_in_unscatter`] as the incumbent F32 chain decides it. [`shared_gu_pm`] and
+/// [`shared_int8`] key on this, not on the launch that actually runs, so the wide-verify int8
+/// chain leaves the shared expert's projections and down exactly the incumbent chain's.
+fn shared_in_unscatter_base(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
     !p.cpu_deferred_experts
-        && unscatter_rotates(gpu, p)
+        && unscatter_rotates_base(gpu, p)
         && p.recipe.bf16_round_trip()
         && p.recipe.shared_after_combine()
         && p.prelude
@@ -2408,7 +2531,10 @@ pub(crate) fn activation(
     // (see `down`); the F32 unscatter may already have rotated.
     let path2_done = !wide_exact
         && use_path2
-        && (sym_iu4(gpu, p, use_path2) || down_wmma(gpu, p) || unscatter_rotates(gpu, p));
+        && (sym_iu4(gpu, p, use_path2)
+            || ep_a8_wide(gpu, p, use_path2)
+            || down_wmma(gpu, p)
+            || unscatter_rotates(gpu, p));
     // The batch views are owed only when this stage runs a kernel over them.
     // The symmetric IU4 route's compact scratch holds no gate/up/rot rows
     // beyond the fallback cap, so viewing `batch_size * k_top * mi` eagerly
@@ -2588,6 +2714,30 @@ fn down_stage(
         ))?;
         return release_stage(gpu, p);
     }
+    if ep_a8_wide(gpu, p, use_path2) {
+        // HIPFIRE_QWEN4_MOE_GU_A8: grouped BF16 SwiGLU rows -> FWHT128 -> flat-slot A8 -> signed-IU8
+        // down; BF16 rows for the BF16-input combine (no unscatter to slot order: the gather is a no-op).
+        let xq = hip(gpu.qwen4_moe_rotate128_i8(
+            p.y_gate_up_grouped,
+            p.sorted_slot_index,
+            p.down_k,
+            grouped_rows,
+            total_slots,
+        ))?;
+        hip(gpu.gemm_qwen4_moe_down_a8_sym(
+            down_ptrs,
+            gemm_tile_ids(p),
+            p.sorted_slot_index,
+            &xq,
+            p.y_down_grouped,
+            p.down_m,
+            p.down_k,
+            1,
+            grouped_rows,
+            total_slots,
+        ))?;
+        return release_stage(gpu, p);
+    }
     if indexed_down(gpu, p, use_path2) {
         return down_stage(gpu, p, false, grouped_rows);
     }
@@ -2755,7 +2905,9 @@ fn combine_stage(
             p.batch_size,
             p.n_exp,
         )?;
-    } else if use_path2 && (down_wmma(gpu, p) || sym_iu4(gpu, p, use_path2)) {
+    } else if use_path2
+        && (down_wmma(gpu, p) || sym_iu4(gpu, p, use_path2) || ep_a8_wide(gpu, p, use_path2))
+    {
         super::combine_leaf(super::CombineArm::GroupedBf16InOwned, partition)?;
         // Both downs store BF16 grouped rows. The rank order goes to
         // `down_expanded`: unused on this route until the shared down, which
@@ -4334,6 +4486,7 @@ mod scratch_tests {
             path2,
             fp8: false,
             sym_iu4: false,
+            ep_a8_wide: false,
             gateup_bf16: false,
             gateup_silu: false,
             down_wmma: false,
@@ -4455,6 +4608,46 @@ mod scratch_tests {
         assert_eq!(need.down_expanded, rows * HIDDEN * 4);
         assert!(need.down_expanded > rows * 80);
         assert_eq!((need.gate_batch, need.up_batch, need.rot_batch), (0, 0, 0));
+    }
+
+    /// The wide-verify int8 chain (`HIPFIRE_QWEN4_MOE_GU_A8`) writes the symmetric arm's BF16 grouped
+    /// rows and rank order, over the verify window: its requirement is the symmetric one, and both
+    /// BF16 grouped buffers fit inside the F32 buffers the incumbent grouped decode chain already holds.
+    #[test]
+    fn wide_verify_int8_route_needs_the_symmetric_sizes_and_fits_the_incumbent_buffers() {
+        let a8 = ScratchRoute {
+            ep_a8_wide: true,
+            ..route(true)
+        };
+        for rows in [9usize, 16, 32, 48, 64] {
+            let need = a8.requirement(&dims(rows)).unwrap();
+            assert_eq!(need, sym().requirement(&dims(rows)).unwrap(), "rows {rows}");
+            let g = grouped_rows(rows * K_TOP);
+            assert_eq!(need.y_gate_up_grouped, g * MI * 2);
+            assert_eq!(need.y_down_grouped, g * HIDDEN * 2);
+            assert_eq!((need.gate_batch, need.up_batch, need.rot_batch), (0, 0, 0));
+            let incumbent = route(true).requirement(&dims(rows)).unwrap();
+            assert!(
+                need.y_gate_up_grouped <= incumbent.y_gate_up_grouped,
+                "rows {rows}"
+            );
+            assert!(
+                need.y_down_grouped <= incumbent.y_down_grouped,
+                "rows {rows}"
+            );
+        }
+    }
+
+    /// The geometry the wide-verify int8 chain serves: Flash-Next gate/up K 2560, `mi == down_k == 640`,
+    /// down `M = 2560`, top-10; anything else keeps the incumbent chain.
+    #[test]
+    fn wide_verify_int8_route_geometry_is_the_flash_next_shape() {
+        assert!(ep_a8_wide_geometry(2560, 640, 640, 2560, 10));
+        assert!(!ep_a8_wide_geometry(2048, 640, 640, 2560, 10));
+        assert!(!ep_a8_wide_geometry(2560, 512, 640, 2560, 10));
+        assert!(!ep_a8_wide_geometry(2560, 640, 512, 2560, 10));
+        assert!(!ep_a8_wide_geometry(2560, 640, 640, 2048, 10));
+        assert!(!ep_a8_wide_geometry(2560, 640, 640, 2560, 8));
     }
 
     #[test]

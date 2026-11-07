@@ -1141,8 +1141,8 @@ module	quick_gelu_f32	non-core-family	Non-core family route: Flux/VAE; rdna-comp
 module	qwen35_fa_prep_kvwrite_gfx1100	developer-opt-in	Non-default developer override: HIPFIRE_FA_KVWRITE_FOLD; hipfire-arch-qwen35/src/qwen35/forward.rs:6709-6711
 module	qwen36_27b_fa_prep_gfx1201_rows	config-opt-in	Non-default configuration: serve.vmm_batch; hipfire-config/src/lib.rs:1370-1377
 module	qwen4_moe_down_a8_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_QWEN4_MOE_DOWN_A8; rdna-compute/src/qwen4_moe_down_a8.rs:343
-module	qwen4_moe_ep_a8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_QWEN4_MOE_EP_A8; rdna-compute/src/qwen4_moe_ep_a8.rs:407
-module	qwen4_moe_rotate128_i8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_QWEN4_MOE_EP_A8; rdna-compute/src/qwen4_moe_ep_a8.rs:256
+module	qwen4_moe_ep_a8_gfx12	developer-opt-in	Developer overrides HIPFIRE_QWEN4_MOE_EP_A8 (EP prefill) and HIPFIRE_QWEN4_MOE_GU_A8 (default-on kill switch, EP2 9..=64-row verify), like qwen4_moe_down_a8_gfx1201; rdna-compute/src/qwen4_moe_ep_a8.rs:525
+module	qwen4_moe_rotate128_i8_gfx12	developer-opt-in	Developer overrides HIPFIRE_QWEN4_MOE_EP_A8 (EP prefill) and HIPFIRE_QWEN4_MOE_GU_A8 (default-on kill switch, EP2 9..=64-row verify); rdna-compute/src/qwen4_moe_ep_a8.rs:359
 module	rmsnorm_f32_at_slot_buf	non-core-family	Non-core family route: DeepSeek4; hipfire-arch-deepseek4/src/forward.rs:2362
 module	rmsnorm_f32_staged_buf	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:19388
 module	rmsnorm_f32_warp_reduce	no-caller	Dead branch: warp_reduce=false; no production caller; rdna-compute/src/norm.rs:188-191

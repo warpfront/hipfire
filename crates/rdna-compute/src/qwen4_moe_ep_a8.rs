@@ -26,6 +26,11 @@
 //!
 //! Developer env `HIPFIRE_QWEN4_MOE_EP_A8` (default on only for EP prefill forwards below 512 rows, `=0` off, `=1` on everywhere; exact gfx1201 only): when the chain runs,
 //! [`Gpu::qwen4_moe_ep_a8_requested`] routes it through these kernels, any row count the chain serves.
+//!
+//! The same kernels also serve the Flash-Next EP2 decode / verify MoE of 9..=64 source rows on the trunk
+//! shard's partial-FFN route (developer env `HIPFIRE_QWEN4_MOE_GU_A8`, default on, `=0` off; exact gfx1201):
+//! [`Gpu::qwen4_moe_gu_a8_applies`] is the launcher half of that route's predicate, the dispatch stage
+//! predicate (`ep_a8_wide`, `qt44_qt53_prefill.rs`) the per-call half.
 
 use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::gemm::moe_expert_table_len;
@@ -44,6 +49,13 @@ use std::sync::LazyLock;
 /// switch (the A4 chain everywhere).
 pub const QWEN4_MOE_EP_A8_FLAG: &str = "HIPFIRE_QWEN4_MOE_EP_A8";
 
+/// Developer kill switch of the wide-verify int8 routed-MoE chain of the Qwen4 Flash-Next EP2 decode /
+/// verify path (exact gfx1201, source rows in the g32 window [`Gpu::moe_wide_verify_rows`]: 9..=64): this
+/// module's A8 gate/up + down kernels and the BF16-row grouped combine replace the g32 gate/up, the
+/// unscatter + rotation, the PM A8 down, the down unscatter and the expanded top-10 combine
+/// ([`Gpu::qwen4_moe_gu_a8_applies`]). Default ON; exact `0` restores the incumbent chain, byte-identical.
+pub const QWEN4_MOE_GU_A8_FLAG: &str = "HIPFIRE_QWEN4_MOE_GU_A8";
+
 /// Module of the gate/up and down GEMM entries.
 pub const EP_A8_GEMM_MODULE: &str = "qwen4_moe_ep_a8_gfx12";
 /// Module and entry of the down A8 producer.
@@ -60,6 +72,18 @@ pub const QWEN4_MOE_EP_A8_NT_ENV: &str = "HIPFIRE_QWEN4_MOE_EP_A8_NT";
 
 static EP_A8: LazyLock<Option<bool>> = LazyLock::new(|| {
     match hipfire_config::developer_var(QWEN4_MOE_EP_A8_FLAG)
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    }
+});
+/// `HIPFIRE_QWEN4_MOE_GU_A8`, parsed once: exact `1` / `0`, anything else (unset included) is `None`
+/// (the default: on). Same parse as [`EP_A8`].
+static GU_A8: LazyLock<Option<bool>> = LazyLock::new(|| {
+    match hipfire_config::developer_var(QWEN4_MOE_GU_A8_FLAG)
         .as_deref()
         .map(str::trim)
     {
@@ -154,6 +178,18 @@ fn ep_a8_requested(arch: &str, flag: Option<bool>, ep_scope: bool) -> bool {
     arch == "gfx1201" && flag.unwrap_or(ep_scope)
 }
 
+/// Pure form of [`Gpu::qwen4_moe_gu_a8_applies`]: exact gfx1201, the switch not `0`, an eager launch
+/// (no graph capture, no replay record), and `rows` source rows in the g32 verify window.
+fn gu_a8_applies(arch: &str, flag: Option<bool>, rows: usize, eager: bool) -> bool {
+    gu_a8_enabled(arch, flag) && eager && Gpu::moe_wide_verify_rows(rows)
+}
+
+/// The switch half of [`gu_a8_applies`]: exact gfx1201 and not killed. Also the load-time condition
+/// of the int8 scratch reservation ([`Gpu::reserve_qwen4_moe_ep_a8`]).
+fn gu_a8_enabled(arch: &str, flag: Option<bool>) -> bool {
+    arch == "gfx1201" && flag != Some(false)
+}
+
 /// `(k, n)` int8-scratch reservations of a chain of up to `max_rows` tokens: the gate sidecar and the down
 /// sidecar ([`ep_a8_down_reserve_k`] rounding), `n` saturating at `usize::MAX`.
 pub fn ep_a8_reserve_shapes(
@@ -179,6 +215,42 @@ fn first_launch_receipt(stage: usize, line: impl FnOnce() -> String) {
     static SEEN: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
     if !SEEN[stage].swap(true, Ordering::Relaxed) {
         eprintln!("[INFO] qwen4 moe EP A8: first launch {}", line());
+    }
+}
+
+impl Gpu {
+    /// Whether the Flash-Next EP2 decode / verify MoE of `rows` source rows runs the int8 gate/up + down
+    /// chain instead of the g32 + PM A8 down chain (`HIPFIRE_QWEN4_MOE_GU_A8`, default on, exact `0`
+    /// kills; exact gfx1201; `rows` in 9..=[`crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS`], the g32
+    /// window; eager only, like [`Gpu::qwen4_moe_ep_a8_requested`]: the EP row gather and the
+    /// A8 chain's int8 scratch cannot be captured or recorded). Flag read once per process. The
+    /// per-call conditions (grouped path, symmetric experts, geometry, no row gather) are the
+    /// dispatch stage predicate's.
+    pub fn qwen4_moe_gu_a8_applies(&self, rows: usize) -> bool {
+        gu_a8_applies(
+            &self.arch,
+            *GU_A8,
+            rows,
+            !self.graphs.capture_mode && !self.replay.is_recording(),
+        )
+    }
+
+    /// Whether the wide-verify int8 chain's switch is on for this device (flag and arch only).
+    pub fn qwen4_moe_gu_a8_enabled(&self) -> bool {
+        gu_a8_enabled(&self.arch, *GU_A8)
+    }
+
+    /// One stderr line, once per process, the first time the wide-verify int8 chain launches:
+    /// served logs prove the route ran. Per-stage entries are the `[INFO] qwen4 moe EP A8: first launch`
+    /// lines and, under `HIPFIRE_CB_PHASES=1`, the `[moe-entry]` receipts of the A8 GEMMs.
+    pub fn qwen4_moe_gu_a8_receipt(&self, rows: usize, grouped_rows: usize) {
+        static SEEN: AtomicBool = AtomicBool::new(false);
+        if !SEEN.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[INFO] qwen4 moe GU A8: first wide-verify launch rows={rows} grouped_rows={grouped_rows} \
+                 (int8 per-128 gate/up + down, BF16 grouped combine; {QWEN4_MOE_GU_A8_FLAG}=0 restores the g32 + PM A8 down chain)"
+            );
+        }
     }
 }
 
@@ -214,9 +286,18 @@ impl Gpu {
         intermediate: usize,
     ) -> HipResult<()> {
         // Load-time (no forward scope yet): the caller is the EP load, so the unset flag counts as on.
-        if !ep_a8_requested(&self.arch, *EP_A8, true) {
+        // The wide-verify chain (`HIPFIRE_QWEN4_MOE_GU_A8`) reads the same scratch, so it reserves
+        // it even when the prefill switch is off.
+        if !ep_a8_requested(&self.arch, *EP_A8, true) && !gu_a8_enabled(&self.arch, *GU_A8) {
             return Ok(());
         }
+        // The wide-verify window never exceeds the chunk cap, but a smaller `max_rows` must still
+        // cover it when the wide-verify chain is on: no lazy growth inside a decode step.
+        let max_rows = if gu_a8_enabled(&self.arch, *GU_A8) {
+            max_rows.max(crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS)
+        } else {
+            max_rows
+        };
         for (k, n) in ep_a8_reserve_shapes(max_rows, k_top, hidden, intermediate) {
             self.reserve_int8_mmq(k, n)?;
         }
@@ -475,6 +556,13 @@ impl Gpu {
                 if down { "down" } else { "gate_up" }
             )
         });
+        // `HIPFIRE_CB_PHASES=1`: the same `[moe-entry]` receipt the g32 / PM A8 down launchers print,
+        // rows = tokens (the down's source rows are flat slots, ten per token).
+        crate::moe_entry_log::moe_entry_receipt(
+            if down { "down" } else { "gate_up" },
+            func,
+            if down { x_src_rows / 10 } else { x_src_rows },
+        );
         let timer = crate::profile::begin_timer(
             &self.hip,
             "gemm",
@@ -605,5 +693,65 @@ mod tests {
             assert!(!ep_a8_requested(arch, Some(true), true), "{arch}");
         }
         assert_eq!(QWEN4_MOE_EP_A8_FLAG, "HIPFIRE_QWEN4_MOE_EP_A8");
+    }
+
+    /// `HIPFIRE_QWEN4_MOE_GU_A8`: default on (unset / exact `1`), exact `0` kills, exact gfx1201 only,
+    /// eager only, and the row window is the g32 window (9..=WIDE_VERIFY_MAX_ROWS), never wider.
+    #[test]
+    fn gu_a8_window_kill_switch_and_arch_gating() {
+        let max = crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
+        for rows in 0..=max + 8 {
+            let in_window = (9..=max).contains(&rows);
+            // The window is exactly the g32 gate/up family's.
+            assert_eq!(
+                gu_a8_applies("gfx1201", None, rows, true),
+                in_window,
+                "default, rows {rows}"
+            );
+            assert_eq!(
+                gu_a8_applies("gfx1201", None, rows, true),
+                Gpu::moe32_gu_applies(1, rows, true),
+                "g32 window, rows {rows}"
+            );
+            assert_eq!(gu_a8_applies("gfx1201", Some(true), rows, true), in_window);
+            // Exact `0`: the incumbent chain at every row count.
+            assert!(
+                !gu_a8_applies("gfx1201", Some(false), rows, true),
+                "kill, rows {rows}"
+            );
+            // Graph capture / replay record: never.
+            assert!(
+                !gu_a8_applies("gfx1201", None, rows, false),
+                "eager, rows {rows}"
+            );
+            for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx942", "gfx1030", ""] {
+                assert!(!gu_a8_applies(arch, None, rows, true), "{arch} rows {rows}");
+                assert!(
+                    !gu_a8_applies(arch, Some(true), rows, true),
+                    "{arch} rows {rows}"
+                );
+            }
+        }
+        // The row-gather-sized decode and the singleton few-row window keep the incumbent chain.
+        for rows in 0..=8 {
+            assert!(
+                !gu_a8_applies("gfx1201", Some(true), rows, true),
+                "rows {rows}"
+            );
+        }
+        assert_eq!(max, 64);
+        assert_eq!(QWEN4_MOE_GU_A8_FLAG, "HIPFIRE_QWEN4_MOE_GU_A8");
+    }
+
+    /// The load-time scratch reservation follows the switch alone (arch + not killed), whatever the
+    /// prefill switch says.
+    #[test]
+    fn gu_a8_enabled_is_the_switch_half() {
+        assert!(gu_a8_enabled("gfx1201", None));
+        assert!(gu_a8_enabled("gfx1201", Some(true)));
+        assert!(!gu_a8_enabled("gfx1201", Some(false)));
+        for arch in ["gfx1100", "gfx1151", "gfx942", ""] {
+            assert!(!gu_a8_enabled(arch, None), "{arch}");
+        }
     }
 }

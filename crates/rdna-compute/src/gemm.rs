@@ -51071,12 +51071,20 @@ impl Gpu {
         )
     }
 
+    /// The verify window the wide gfx1201 MoE routes serve: more than eight source rows, up to
+    /// [`crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS`]. One definition for the `g32` gate/up family
+    /// ([`Gpu::moe32_gu_applies`]) and the int8 gate/up + down chain (`HIPFIRE_QWEN4_MOE_GU_A8`,
+    /// [`Gpu::qwen4_moe_gu_a8_applies`]).
+    pub(crate) fn moe_wide_verify_rows(rows: usize) -> bool {
+        rows > 8 && rows <= crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS
+    }
+
     /// Whether the gfx1201 `g32` gate/up family serves a call of `rows` source rows
     /// (`HIPFIRE_QWEN4_MOE32_GU` not `0`): 9..=[`crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS`] rows,
     /// the verify window. The family is bit-identical to `o4_r8_x4` (same ABI and arithmetic), so the bound
     /// is a performance choice: rows 49..=64 take it too (the wide verify pass reaches them).
     pub(crate) fn moe32_gu_applies(mode: u8, rows: usize, gfx1201: bool) -> bool {
-        mode != 0 && gfx1201 && rows > 8 && rows <= crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS
+        mode != 0 && gfx1201 && Self::moe_wide_verify_rows(rows)
     }
 
     /// `(module, source, entry)` of the `g32` gate/up family for `rows` source rows (`g32_r8` above 16

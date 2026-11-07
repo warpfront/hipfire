@@ -921,12 +921,7 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
         // with every other row of the call, so it gathers the producers' rows from the owners
         // its own assignment wrote (below) and its combine folds the fixed `e % ranks`
         // partition (`reduction_partition`).
-        if trunk_partial_skips_gather(
-            layer_idx,
-            self.trunk_layers,
-            crate::trunk_route::ffn_partial_active(),
-            self.reduction_partition(layer_idx).is_some(),
-        ) {
+        if self.gather_skipped(layer_idx) {
             return Ok(());
         }
         // A balanced layer gathers from the owners its own assignment wrote
@@ -969,6 +964,15 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
                 self.rank
             )
         })
+    }
+
+    fn gather_skipped(&self, layer_idx: u16) -> bool {
+        trunk_partial_skips_gather(
+            layer_idx,
+            self.trunk_layers,
+            crate::trunk_route::ffn_partial_active(),
+            self.reduction_partition(layer_idx).is_some(),
+        )
     }
 
     fn assigns_owners(&self, layer_idx: u16) -> bool {
