@@ -2654,20 +2654,24 @@ impl Qwen4Bundle {
         }
     }
 
-    /// The reuse point every rank can serve: each rank plans over the prompt
-    /// prefix `cap` allows, and `cap` drops to the lowest answer until all
+    /// The reuse point `<= cap` every rank can serve: each rank plans over the
+    /// prompt prefix `cap` allows, and `cap` drops to the lowest answer until all
     /// ranks agree (each rank's cache evicts independently under memory
     /// pressure, so they may hold different snapshots). A mesh failure plans 0;
     /// the following replicated call reports the poisoning.
-    pub(crate) fn ep_session_plan(&self, prompt: &[u32], route: SessionRoute) -> usize {
+    pub(crate) fn ep_session_plan(
+        &self,
+        prompt: &[u32],
+        route: SessionRoute,
+        mut cap: usize,
+    ) -> usize {
         let Some(mesh) = self.ep.as_ref() else {
-            return self.session_plan_capped(prompt, route, prompt.len());
+            return self.rank_session_plan(prompt, route, cap);
         };
-        let mut cap = prompt.len();
         loop {
             let plans = mesh.run(
-                || Ok(self.session_plan_capped(prompt, route, cap)),
-                &|bundle, _, _| Ok(bundle.session_plan_capped(prompt, route, cap)),
+                || Ok(self.rank_session_plan(prompt, route, cap)),
+                &|bundle, _, _| Ok(bundle.rank_session_plan(prompt, route, cap)),
             );
             let Ok(plans) = plans else {
                 return 0;
