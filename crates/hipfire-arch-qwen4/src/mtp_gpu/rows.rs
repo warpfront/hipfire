@@ -648,7 +648,10 @@ impl Qwen4MtpGpu {
         // once over all rows). Everything the program borrows lives in this scope.
         let lengths = {
             let tensors = rs.tensors(&view);
-            let views = HeadRowViews::new(&tensors, config, n);
+            let one_launch = gpu.flags.qwen4_mtp_fc_one_launch_enabled()
+                && weights.resident(&mtp.fc_hidden)?.dtype == DType::BF16
+                && gpu.bf16_rows_exact_one_launch(n * config.hc_count);
+            let views = HeadRowViews::new(&tensors, config, n, one_launch);
             let ctx = DispatchCtx::new(gpu);
             let attn = hyper_desc(weights, &mtp.attn_hyper)?;
             let mlp = hyper_desc(weights, &mtp.mlp_hyper)?;

@@ -2405,12 +2405,16 @@ struct HeadRowViews {
     /// projection: (`hidden_norm` rows, `projected_hidden` rows, row count).
     /// No chunk is wider than the few-row route (`FEW_ROW_ROUTE_ROWS`) unless
     /// one lane's own `hc_count` rows are, so every projected row stays on the
-    /// route whose per-row bytes are the one-row step's.
+    /// route whose per-row bytes are the one-row step's. With `one_launch`
+    /// (`HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH`, BF16 fc_hidden, and
+    /// `Gpu::bf16_rows_exact_one_launch(rows * hc_count)`) there is ONE chunk over all
+    /// `rows * hc_count` rows: it runs `ProjectLadder::TrunkRowExact`, whose all-rows arm is
+    /// bitwise the singleton, so every projected row is still bitwise the one-row step's.
     fc_hidden: SmallVec<[(GpuTensor, GpuTensor, usize); 4]>,
 }
 
 impl HeadRowViews {
-    fn new(t: &HeadRowTensors<'_>, config: &Qwen4Config, rows: usize) -> Self {
+    fn new(t: &HeadRowTensors<'_>, config: &Qwen4Config, rows: usize, one_launch: bool) -> Self {
         let mut views = Self {
             broadcast: SmallVec::new(),
             fc_hidden: SmallVec::new(),
@@ -2429,7 +2433,11 @@ impl HeadRowViews {
             ));
         }
         let total = rows * hc;
-        let chunk = (rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS / hc).max(1) * hc;
+        let chunk = if one_launch {
+            total
+        } else {
+            (rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS / hc).max(1) * hc
+        };
         let mut first = 0;
         while first < total {
             let count = chunk.min(total - first);
@@ -2523,7 +2531,7 @@ fn push_head_rows_front<'a>(
                 output,
                 rows: *count,
                 rotation: Some(t.rotation),
-                ladder: ProjectLadder::Trunk,
+                ladder: ProjectLadder::TrunkRowExact,
                 residual: None,
             }));
         }
@@ -3629,7 +3637,7 @@ impl Qwen4MtpGpu {
                     _ => return Err(invalid("MTP FFN weights and runtime disagree")),
                 })
             };
-            let views = HeadRowViews::new(&row_tensors, config, MTP_HC_ROWS);
+            let views = HeadRowViews::new(&row_tensors, config, MTP_HC_ROWS, false);
             let mut steps: SmallVec<[Step<'_>; 16]> = SmallVec::new();
             push_head_rows_front(
                 &mut steps,

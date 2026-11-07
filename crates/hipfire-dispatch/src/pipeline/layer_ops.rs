@@ -6405,6 +6405,11 @@ pub enum ProjectLadder {
     /// [`project_weights`]: shared F16 rotation, few-row verify GEMVs, gfx942
     /// BF16 MFMA. Qwen4.
     Trunk,
+    /// [`Self::Trunk`] except a BF16 weight of 2..=`WIDE_VERIFY_MAX_ROWS` rows on gfx11+ SIMT
+    /// runs `Gpu::gemv_bf16_xf32_x4_rows_exact` (one launch when
+    /// `Gpu::bf16_rows_exact_one_launch`, never lane WMMA): every output row is bitwise the
+    /// one-row GEMV's. Other payloads and row counts take the `Trunk` path.
+    TrunkRowExact,
     /// The dispatcher-entry batched GEMMs, each keeping its own arch routing:
     /// `gemm_q8_0_batched_chunked`, `gemm_hfq4g256` (MQ4G256 after its batched
     /// FWHT), `gemm_f32_batched`, gfx942 BF16 MFMA. LFM2 decode lanes.
@@ -6437,7 +6442,10 @@ impl ProjectOp<'_> {
             return Err(DispatchError::Hip("projection has no rows".into()));
         }
         // The `Gemm` ladders admit their payloads in `gemm_ladder_rotation` below.
-        if self.ladder == ProjectLadder::Trunk {
+        if matches!(
+            self.ladder,
+            ProjectLadder::Trunk | ProjectLadder::TrunkRowExact
+        ) {
             require_weight(&self.weight, m, k, "projection")?;
         }
         let input = checked_mul(self.rows, k, "projection input")?;
@@ -6448,7 +6456,9 @@ impl ProjectOp<'_> {
             require_tensor(residual, output, DType::F32, "projection residual")?;
         }
         let rotated = match self.ladder {
-            ProjectLadder::Trunk => !matches!(self.weight.dtype, DType::BF16 | DType::Q8_0),
+            ProjectLadder::Trunk | ProjectLadder::TrunkRowExact => {
+                !matches!(self.weight.dtype, DType::BF16 | DType::Q8_0)
+            }
             ladder => gemm_ladder_rotation(self.weight.dtype, ladder == ProjectLadder::GemmLmHead)?,
         };
         if rotated {
@@ -6465,6 +6475,27 @@ pub fn execute_project(gpu: &mut Gpu, op: &ProjectOp<'_>) -> Result<(), Dispatch
     match op.ladder {
         ProjectLadder::Trunk => {
             project_weight(gpu, &op.weight, op.input, op.output, op.rows, op.rotation)?
+        }
+        ProjectLadder::TrunkRowExact => {
+            let w = &op.weight;
+            if w.dtype == DType::BF16
+                && (2..=rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS).contains(&op.rows)
+                && gpu.arch_caps.has_gfx11_plus_simt()
+                && gpu.bf16_rows_exact_one_launch(op.rows)
+                // A rank-banded weight keeps the Trunk entry, which owns the band exchange.
+                && !is_split(gpu, w, op.rows)
+            {
+                let part = (w.buf, op.output, w.m);
+                let none = (w.buf, op.output, 0);
+                hip(gpu.gemv_bf16_xf32_x4_rows_exact(
+                    [part, none, none, none],
+                    op.input,
+                    w.k,
+                    op.rows,
+                ))?
+            } else {
+                project_weight(gpu, w, op.input, op.output, op.rows, op.rotation)?
+            }
         }
         ProjectLadder::Gemm | ProjectLadder::GemmLmHead => project_gemm(gpu, op)?,
     }

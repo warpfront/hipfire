@@ -24337,13 +24337,39 @@ impl Gpu {
         k: usize,
         rows: usize,
     ) -> HipResult<()> {
-        self.gemv_bf16_xf32_x4_rows_route(parts, x, k, rows, true)
+        self.gemv_bf16_xf32_x4_rows_route(parts, x, k, rows, true, true)
+    }
+
+    /// [`Gpu::gemv_bf16_xf32_x4_rows`] for 2..=[`WIDE_VERIFY_MAX_ROWS`] rows that is never the
+    /// lane-WMMA route (f32 summation order differs) and never the lab row-tile twin: rows <= 8
+    /// take today's route (otile when enabled, else `r<R>`); rows 9..=64 take the one-launch
+    /// [`Gpu::gemv_bf16_xf32_x4_rows_allrows`] when [`Gpu::bf16_allrows_applies`], else the
+    /// existing eight-row-group loop with `otile = false` (exactly the incumbent fallback).
+    /// Every output word is bitwise the single-row `gemv_bf16_xf32` value: the row-group
+    /// launches are the singleton per row (CHANGELOG.md:224) and the all-rows arm is bitwise
+    /// the singleton / row-group value (see its header), so the call is interchangeable with
+    /// any split of its rows into smaller exact calls.
+    pub fn gemv_bf16_xf32_x4_rows_exact(
+        &mut self,
+        parts: [(&GpuTensor, &GpuTensor, usize); 4],
+        x: &GpuTensor,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        self.gemv_bf16_xf32_x4_rows_route(parts, x, k, rows, true, false)
+    }
+
+    /// Whether [`Gpu::gemv_bf16_xf32_x4_rows_exact`] runs `rows` as ONE launch: at most
+    /// [`FEW_ROW_ROUTE_ROWS`] rows, or [`Gpu::bf16_allrows_applies`]. Pure.
+    pub fn bf16_rows_exact_one_launch(&self, rows: usize) -> bool {
+        rows <= FEW_ROW_ROUTE_ROWS || self.bf16_allrows_applies(rows)
     }
 
     /// Body of [`Gpu::gemv_bf16_xf32_x4_rows`]; `otile` admits the output-tiled
     /// entries (`HIPFIRE_QWEN4_BF16_ROWS_OTILE`) for 2..=[`FEW_ROW_ROUTE_ROWS`]
     /// rows. The eight-row groups of a wider call pass `false`, so rows above
-    /// eight stay on the incumbent route.
+    /// eight stay on the incumbent route. `lane_wmma` admits the (non-bitwise) lane-WMMA and
+    /// lab row-tile routes above eight rows; the `_exact` entry passes `false`.
     fn gemv_bf16_xf32_x4_rows_route(
         &mut self,
         parts: [(&GpuTensor, &GpuTensor, usize); 4],
@@ -24351,6 +24377,7 @@ impl Gpu {
         k: usize,
         rows: usize,
         otile: bool,
+        lane_wmma: bool,
     ) -> HipResult<()> {
         const FUNCS: [&str; 7] = [
             "gemv_bf16_xf32_x4_rows_r2",
@@ -24374,7 +24401,8 @@ impl Gpu {
                     "gemv_bf16_xf32_x4_rows x / y views too small for the rows",
                 ));
             }
-            if self.lane_wmma_applies(rows)
+            if lane_wmma
+                && self.lane_wmma_applies(rows)
                 && x.dtype == DType::F32
                 && parts
                     .iter()
@@ -24386,7 +24414,7 @@ impl Gpu {
                 }
                 return Ok(());
             }
-            if self.row_tile_twin_enabled(WideTwinFamily::Bf16, rows) {
+            if lane_wmma && self.row_tile_twin_enabled(WideTwinFamily::Bf16, rows) {
                 return self.lab_gemv_bf16_xf32_rows_x4_t8(parts, x, k, rows);
             }
             if self.bf16_allrows_applies(rows) {
@@ -24399,7 +24427,7 @@ impl Gpu {
                 if n == 1 {
                     self.gemv_bf16_xf32_x4(pg, &xg, k)?;
                 } else {
-                    self.gemv_bf16_xf32_x4_rows_route(pg, &xg, k, n, false)?;
+                    self.gemv_bf16_xf32_x4_rows_route(pg, &xg, k, n, false, lane_wmma)?;
                 }
             }
             return Ok(());
