@@ -1652,6 +1652,36 @@ fn dispatch_attend(
                 let ct = io.givens_cos.unwrap();
                 let st = io.givens_sin.unwrap();
                 let fp = io.flash_partials.unwrap();
+                // GQA-shared decode for Q8_0 V (P4b): one 256-thread workgroup
+                // per (kv head, tile) serves all six query heads — one K/V
+                // read instead of six. Measured positive on q8 at every ctx
+                // (short +1.7%, medium +5.6%, long +10-12%, no overlap);
+                // lloyd4 V keeps the scalar tile (GQA loses there at every
+                // ctx). Exact H24/KV4/D256 geometry, v_mode 8 only.
+                if gpu.arch.as_str() == "gfx1100"
+                    && io.n_heads == 24
+                    && io.n_kv_heads == 4
+                    && io.head_dim == 256
+                    && plan.v_mode_bits == 8
+                {
+                    hip!(gpu.attention_flash_fwht4_tile_gqa_gfx11(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.pos_buf,
+                        ct,
+                        st,
+                        seq_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.physical_cap,
+                        fp,
+                        plan.v_mode_bits,
+                    ))?;
+                    return Ok(());
+                }
                 hip!(gpu.attention_flash_fwht4(
                     io.q,
                     io.k_cache,

@@ -2537,13 +2537,19 @@ pub const GEMV_MQ4G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq4
 /// symbol (`gemv_mq4g256v2_lloyd`) so the module cannot alias the uniform one.
 pub const GEMV_MQ4G256V2_LUT_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_MQ4G256V2_KERNEL gemv_mq4g256v2_lloyd\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
 );
 /// Residual-epilogue twin of `GEMV_MQ4G256V2_LUT_SRC` (`y +=`, symbol
-/// `gemv_mq4g256v2_residual_lloyd`).
+/// `gemv_mq4g256v2_residual_lloyd`): dual-row residual body (2 rows/wave,
+/// hoisted float4 x reused across both rows, SRD buffer loads) with the LUT
+/// decode folded in. Same symbol and kernarg ABI as before.
 pub const GEMV_MQ4G256V2_RESIDUAL_LUT_SRC: &str = concat!(
-    "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE 1\n#define HIPFIRE_MQ4G256V2_KERNEL gemv_mq4g256v2_residual_lloyd\n",
-    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+    "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE 1\n#define HIPFIRE_RESIDUAL_KERNEL gemv_mq4g256v2_residual_lloyd\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq4g256v2_residual.hip")
 );
 /// MQ5G256V2: dual-scale 5-bit (qt=48). Same 168 B stride and 5-bit payload as MQ5G256, header dual fp16.
 pub const GEMV_MQ5G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq5g256v2.hip");
@@ -5139,6 +5145,12 @@ pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
 /// unchanged.
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX11_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_gfx11_bt.hip");
+/// T0 experiment twin for the gfx11 MQ4V2-Lloyd prefill port: the BT residual
+/// with a `-DHIPFIRE_MQ4G256V2_LUT`-style kernarg codebook (8 dwords, 16
+/// centered f16 levels staged to LDS) replacing the uniform affine dequant.
+/// Distinct `_lloyd` symbols so the module cannot alias the uniform one.
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX11_BT_LUT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_gfx11_bt_lloyd.hip");
 /// Shared gfx1100/gfx1151 weight-reuse kernels for MQ{2,3,5,6}V2.
 /// The source compile-time specializes the bit decoder while preserving the
 /// format-specific base WMMA order and gfx11 interleaved-C contract.
@@ -5709,6 +5721,13 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX11_T256_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx11.hip")
 );
+/// gfx1100 Lloyd A8 twin: the i8 schedule with publish-time v_perm codebook
+/// expansion (amortized like the X128 pack stage), signed-B codes and the zp'
+/// analytic correction. Tile128-only (36864 B LDS = 1 CTA/WGP).
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_LLOYD_GFX11_SRC: &str = concat!(
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8_lloyd.gfx11.hip")
+);
 /// gfx1100/gfx1151 exact-INT8 MQ6G256V2 prefill GEMM (`gemm_mq6g256v2_mmq_i8_set{,_bf16}_gfx11`,
 /// 128x128 tile, 512 threads; dynamic LDS `MQ6_I8_GFX11_LDS_BYTES` = 32768): the `block_i8_128`
 /// prelude without its standalone quantizer, then the kernel.
@@ -5890,6 +5909,11 @@ pub const GEMM_MQ4G256V2_WMMA_GFX1151_XLDS_SRC: &str =
 /// file/module so the opt-in path cannot alter the certified base gfx11 object.
 pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX11_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_gfx11_bt.hip");
+/// T0 experiment twin for the gfx11 MQ4V2-Lloyd prefill port: the gate/up BT
+/// TU with per-tensor centered f16 codebooks (16 kernarg dwords staged to
+/// LDS). Distinct `_lloyd` symbols so the module cannot alias uniform.
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX11_BT_LUT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_gfx11_bt_lloyd.hip");
 /// Exact-gfx1100 multi-wave same-row LDS gate+up (MW4/MW8).
 /// Sister of GEMM_GATE_UP_MQ4G256V2_WMMA_GFX11_BT_SRC and residual MW_LDS:
 /// half16 + interleaved-C, 136 B dual-half headers, static 8 KiB tile-major
@@ -6370,6 +6394,11 @@ pub const GEMM_QKVZA_MQ4G256V2_WMMA_SRC: &str =
 /// unchanged.
 pub const GEMM_QKVZA_MQ4G256V2_WMMA_GFX11_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_mq4g256v2_wmma_gfx11_bt.hip");
+/// T0 experiment twin for the gfx11 MQ4V2-Lloyd prefill port: the QKVZA BT
+/// TU with per-tensor centered f16 codebooks (32 kernarg dwords staged to
+/// LDS). Distinct `_lloyd` symbols so the module cannot alias uniform.
+pub const GEMM_QKVZA_MQ4G256V2_WMMA_GFX11_BT_LUT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq4g256v2_wmma_gfx11_bt_lloyd.hip");
 pub const GEMM_QKVZA_MQ5G256V2_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_mq5g256v2_wmma.hip");
 pub const GEMM_QKVZA_MQ6G256V2_WMMA_SRC: &str =
@@ -6490,6 +6519,11 @@ pub const GEMM_QKV_MQ4G256V2_WMMA_SRC: &str =
 /// leaves the base gfx11 and other-arch objects unchanged.
 pub const GEMM_QKV_MQ4G256V2_WMMA_GFX11_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_mq4g256v2_wmma_gfx11_bt.hip");
+/// T0 experiment twin for the gfx11 MQ4V2-Lloyd prefill port: the QKV BT TU
+/// with per-tensor centered f16 codebooks (24 kernarg dwords staged to LDS).
+/// Distinct `_lloyd` symbols so the module cannot alias uniform.
+pub const GEMM_QKV_MQ4G256V2_WMMA_GFX11_BT_LUT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq4g256v2_wmma_gfx11_bt_lloyd.hip");
 /// Exact-gfx1201 MQ4V2 QKV batch-tiled production kernel (BT8).
 /// Sister of GEMM_QKV_MQ4G256V2_WMMA_GFX11_BT_SRC / gfx12 base: half8 +
 /// gfx12 WMMA, 136 B dual-half headers, with the validated BT8 default.
@@ -7018,6 +7052,15 @@ pub const GEMV_MQ4G256V2_RESIDUAL_LANES_GFX1201_SRC: &str = concat!(
 /// alpha codebooks in row-source order). See `FUSED_GATE_UP_MQ4G256V2_LUT_SRC`.
 pub const FUSED_QKVZA_MQ4G256V2_LUT_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_mq4g256v2_lloyd\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_mq4g256v2.hip")
+);
+/// Lloyd LUT + R-hoist_x32 twin (D4): same as `FUSED_QKVZA_MQ4G256V2_LUT_SRC`
+/// plus the plain-float4 x-hoist schedule (K-agnostic; selected for exact
+/// gfx1100). Distinct symbol so the module cannot alias the generic one.
+pub const FUSED_QKVZA_MQ4G256V2_LUT_HOIST_X32_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_RDNA3_QKVZA_HOIST_X32 1\n#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_mq4g256v2_lloyd_hoist_x32_gfx1100\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_qkvza_mq4g256v2.hip")
@@ -9103,6 +9146,10 @@ pub const KV_CACHE_WRITE_ASYM_K_FWHT4_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_asym_k_fwht4_batched.hip");
 pub const ATTENTION_FLASH_FWHT4_TILE_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_fwht4_tile.hip");
+pub const ATTENTION_FLASH_FWHT4_TILE_GQA_GFX11_SRC: &str = concat!(
+    include_str!("../../../kernels/src/turbo_common.h"),
+    include_str!("../../../kernels/src/attention_flash_fwht4_tile_gqa.gfx11.hip")
+);
 pub const ATTENTION_FLASH_FWHT4_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_fwht4_tile_batched.hip");
 pub const KV_CACHE_WRITE_ASYM_K_FWHT3_SRC: &str =

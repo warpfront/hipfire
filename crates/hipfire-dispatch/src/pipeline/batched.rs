@@ -324,7 +324,12 @@ pub(crate) fn try_a8_rmsnorm_prepared(
     eps: f32,
     n: usize,
 ) -> HipResult<Option<rdna_compute::Int8MmqPrepared>> {
-    if !gpu.flags.a8_fused_prod || !gpu.a8_prefill_active(n, k) || next.dtype != DType::MQ4G256V2 {
+    // Lloyd (qt=52) rides the staged-i8 twin route: the A4 predicate replaces
+    // the symmetric-file requirement (the producer is weight-independent; the
+    // twin consumer enforces the same A4 predicate).
+    let lloyd_next = next.dtype == DType::MQ4G256V2Lloyd && lloyd_mmq_a4_route(gpu, n, k);
+    let next_is_a8 = next.dtype == DType::MQ4G256V2 || lloyd_next;
+    if !gpu.flags.a8_fused_prod || (!gpu.a8_prefill_active(n, k) && !lloyd_next) || !next_is_a8 {
         return Ok(None);
     }
     let reservation = gpu.reserve_int8_mmq(k, n)?;
@@ -339,7 +344,12 @@ fn try_a8_hin_prepared(
     k: usize,
     n: usize,
 ) -> HipResult<Option<rdna_compute::Int8MmqPrepared>> {
-    if !gpu.flags.a8_fused_prod || !gpu.a8_prefill_active(n, k) || down.dtype != DType::MQ4G256V2 {
+    // AWQ-only (mirrors the uniform arm): base mq4l without AWQ sidecars
+    // keeps the rotate + standalone-quantize path, same as uniform non-AWQ.
+    // Lloyd rides the A4 predicate in place of the symmetric-file requirement.
+    let lloyd_down = down.dtype == DType::MQ4G256V2Lloyd && lloyd_mmq_a4_route(gpu, n, k);
+    let down_is_a8 = down.dtype == DType::MQ4G256V2 || lloyd_down;
+    if !gpu.flags.a8_fused_prod || (!gpu.a8_prefill_active(n, k) && !lloyd_down) || !down_is_a8 {
         return Ok(None);
     }
     let Some(awq) = down.awq_scale else {
@@ -465,6 +475,33 @@ pub(crate) fn out_proj_residual_i8_prepared(
     result
 }
 
+/// Lloyd twin of [`out_proj_residual_i8_prepared`]: same residual-fold dance,
+/// Lloyd ADD twin with the weight's codebook. Callers admit Lloyd preps only
+/// under `lloyd_mmq_a4_route` (the sigmoid/gdn producers enforce the same
+/// predicate), so the twin's K%256/arch gates always hold here.
+pub(crate) fn out_proj_residual_i8_prepared_lloyd(
+    gpu: &mut Gpu,
+    pbs: &BatchScratch<'_>,
+    wo: &WeightRef<'_>,
+    w_gate: &WeightRef<'_>,
+    prep: &rdna_compute::Int8MmqPrepared,
+    fusion: DflashFusionCtx,
+    n: usize,
+) -> HipResult<()> {
+    let fold = residual_fold_consumer_ready(gpu, w_gate, fusion, n, wo.m);
+    if fold {
+        gpu.arm_residual_fold(&pbs.gate_ffn_batch)?;
+    }
+    let xq = gpu.int8_mmq_prepared_ptr(prep, wo.k, n)?;
+    let c16 = lloyd_c16_or_fail(wo, "out_proj_residual_i8_prepared_lloyd")?;
+    let result =
+        gpu.gemm_mq4g256v2_mmq_add_prequant_i8_lloyd(&wo.buf, xq, &pbs.x_batch, wo.m, wo.k, n, c16);
+    if fold {
+        gpu.disarm_residual_fold();
+    }
+    result
+}
+
 /// C2: SwiGLU/FWHT IU4 producer for w_down. `None` → incumbent path.
 fn try_iu4_silu_prepared(
     gpu: &mut Gpu,
@@ -503,6 +540,11 @@ enum FfnGateOutput {
     Iu4H,
     Fp8H,
     A8H,
+    /// Lloyd A8 twin (opt-in `HIPFIRE_LLOYD_MMQ_A4=1`, exact gfx1100): the
+    /// gate/up epilogue wrote fused h into `gate_ffn_batch`, same contract
+    /// as A8H but carrying Lloyd codebook weights. The down arm consumes h
+    /// through the twin residual worker (never the uniform i8 path).
+    LloydA8H,
 }
 
 fn packed_mq4_down_admitted(
@@ -1222,9 +1264,35 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
                     n,
                 );
             } else if matches!(w.dtype, DType::MQ4G256V2Lloyd) {
-                // qt=52: gfx11 → MMQ-LUT residual; gfx12 keeps FP8-LUT; else
+                // qt=52: small-N gfx1100 → F16-BT-LUT (native masking);
+                // N>=128 or other gfx11 → MMQ-LUT; gfx12 keeps FP8-LUT; else
                 // fail-closed inside the FP8 launcher (never uniform).
+                if lloyd_f16_bt_route(gpu, n) {
+                    let lut = lloyd_f16_or_fail(w, "dispatch_batched_gemm_epilogue")?;
+                    return gpu.gemm_mq4g256v2_residual_wmma_gfx11_lloyd(
+                        &w.buf,
+                        input,
+                        &pbs.x_batch,
+                        m,
+                        k,
+                        n,
+                        lut,
+                    );
+                }
                 if lloyd_mmq_lut_route(gpu) {
+                    if lloyd_mmq_a4_route(gpu, n, k) {
+                        let c16 = lloyd_c16_or_fail(w, "dispatch_batched_gemm_epilogue")?;
+                        let xq = gpu.ensure_int8_mmq_x(input, n, k)?;
+                        return gpu.gemm_mq4g256v2_mmq_add_prequant_i8_lloyd(
+                            &w.buf,
+                            xq,
+                            &pbs.x_batch,
+                            m,
+                            k,
+                            n,
+                            c16,
+                        );
+                    }
                     let c16 = lloyd_c16_or_fail(w, "dispatch_batched_gemm_epilogue")?;
                     return gpu.gemm_hfq4g256_residual_mmq_lloyd(
                         &w.buf,
@@ -1341,10 +1409,25 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
                     n,
                 );
             } else if matches!(w.dtype, DType::MQ4G256V2Lloyd) {
-                // qt=52 Partial: zero then residual (== plain GEMM). gfx11 →
+                // qt=52 Partial: zero then residual (== plain GEMM).
+                // Small-N gfx1100 → F16-BT-LUT; N>=128 or other gfx11 →
                 // MMQ-LUT ADD into zeroed Y; gfx12 keeps FP8-LUT.
                 zero_partial_for_residual(gpu, out, n, m)?;
+                if lloyd_f16_bt_route(gpu, n) {
+                    let lut = lloyd_f16_or_fail(w, "dispatch_batched_gemm_epilogue")?;
+                    return gpu.gemm_mq4g256v2_residual_wmma_gfx11_lloyd(
+                        &w.buf, input, &out_n, m, k, n, lut,
+                    );
+                }
                 if lloyd_mmq_lut_route(gpu) {
+                    if lloyd_mmq_a4_route(gpu, n, k) {
+                        // Staged i8 twin ADD into the zeroed Y (== plain GEMM).
+                        let c16 = lloyd_c16_or_fail(w, "dispatch_batched_gemm_epilogue")?;
+                        let xq = gpu.ensure_int8_mmq_x(input, n, k)?;
+                        return gpu.gemm_mq4g256v2_mmq_add_prequant_i8_lloyd(
+                            &w.buf, xq, &out_n, m, k, n, c16,
+                        );
+                    }
                     let c16 = lloyd_c16_or_fail(w, "dispatch_batched_gemm_epilogue")?;
                     return gpu
                         .gemm_hfq4g256_residual_mmq_lloyd(&w.buf, input, &out_n, m, k, n, c16);
@@ -1601,6 +1684,66 @@ pub(crate) fn lloyd_mmq_lut_route(gpu: &Gpu) -> bool {
             .ok()
             .as_deref()
             != Some("1")
+}
+
+/// Twin route (T3, default OFF): exact gfx1100 only (the twin TU is V2C-free
+/// and tile-pinned for gfx1100; gfx1151 keeps X128 until the V2B follow-up),
+/// K%256, N>=64, eager-only (no replay/capture — same bar as the twin
+/// worker's siblings). Explicit opt-in `HIPFIRE_LLOYD_MMQ_A4=1`; distinct
+/// from the fail-closed `HIPFIRE_LLOYD_MMQ_OFF` and the uniform
+/// `HIPFIRE_IU4_PREFILL`. qkv/qkvza/partial/single-weight ride the existing
+/// single-matrix SET/ADD entries (no new TU); only gate/up has a fused SILU
+/// twin entry.
+#[inline]
+pub(crate) fn lloyd_mmq_a4_route(gpu: &Gpu, n: usize, k: usize) -> bool {
+    gpu.arch.as_str() == "gfx1100"
+        && hipfire_config::developer_var("HIPFIRE_LLOYD_MMQ_A4")
+            .ok()
+            .as_deref()
+            == Some("1")
+        && !gpu.graphs.capture_mode
+        && !gpu.replay.is_recording()
+        && n >= 64
+        && k > 0
+        && k % 256 == 0
+}
+
+/// qt=52 (MQ4G256V2Lloyd) prefill: extract the per-tensor centered f16
+/// codebook LUT or fail closed naming the prefill family. Sibling of
+/// [`lloyd_e4m3_or_fail`]; consumed by the gfx1100 F16-BT-LUT launchers.
+#[inline]
+pub(crate) fn lloyd_f16_or_fail(w: &WeightRef<'_>, family: &'static str) -> HipResult<[u32; 8]> {
+    w.lloyd_lut_f16.ok_or_else(|| {
+        hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{family}: MQ4G256V2Lloyd weight (m={} k={}) reached prefill with lloyd_lut_f16=None — \
+                 re-quantize with a build that emits lloyd_levels (F32[16]); refusing uniform decode",
+                w.m, w.k
+            ),
+        )
+    })
+}
+
+/// Small-batch F16-BT-LUT route for qt=52 on exact gfx1100: the BT twins
+/// natively mask any N (no padding), beating per-row GEMV below 64 and
+/// pad-to-128 waste up to 127. N>=128 stays on the MMQ-LUT route; other
+/// arches keep their existing behavior. Kill switch
+/// `HIPFIRE_LLOYD_F16_GFX11=0` restores the MMQ/GEMV path.
+#[inline]
+/// Small-N F16-BT-LUT route for qt=52 on exact gfx1100: BT-tiled WMMA with
+/// per-tensor centered codebooks, valid at any N via masking. Covers N<64,
+/// where the MMQ path falls back to per-row GEMV; N>=64 stays on the
+/// (possibly padded) MMQ-LUT route. Kill switch `HIPFIRE_LLOYD_F16_GFX11=0`
+/// restores the MMQ/GEMV path (default is on).
+#[inline]
+pub(crate) fn lloyd_f16_bt_route(gpu: &Gpu, n: usize) -> bool {
+    gpu.arch.as_str() == "gfx1100"
+        && n < 64
+        && hipfire_config::developer_var("HIPFIRE_LLOYD_F16_GFX11")
+            .ok()
+            .as_deref()
+            != Some("0")
 }
 
 /// True when all listed projection dtypes are the Lloyd-V2 dtype.
@@ -1949,6 +2092,21 @@ fn swiglu_ffn_gate_up_batched(
             norm_eps,
             n,
         )?
+    } else if ffn_is_mq4v2_lloyd
+        && lloyd_mmq_a4_route(gpu, n, layer.w_gate.k)
+        && layer.w_gate.m == layer.w_up.m
+        && layer.w_gate.m % 128 == 0
+    {
+        // Lloyd twin producer: same conditions as the twin consumer below.
+        try_a8_rmsnorm_prepared(
+            gpu,
+            &pbs.x_batch,
+            &layer.ffn_norm,
+            &layer.w_gate,
+            dim,
+            norm_eps,
+            n,
+        )?
     } else {
         None
     };
@@ -2034,6 +2192,22 @@ fn swiglu_ffn_gate_up_batched(
     // re-derives it from gpu.arch_caps.has_wmma() (== arch_has_wmma).
     if let Some(prep) = &a8_prep {
         let xq = gpu.int8_mmq_prepared_ptr(prep, layer.w_gate.k, n)?;
+        if ffn_is_mq4v2_lloyd {
+            // Lloyd twin: same prepared int8 X into the fused SILU twin.
+            // (f1lite is uniform-only, so no interaction.)
+            gpu.gemm_gate_up_silu_mq4g256v2_i8_lloyd(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                xq,
+                &pbs.gate_ffn_batch,
+                layer.w_gate.m,
+                layer.w_gate.k,
+                n,
+                lloyd_c16_or_fail(&layer.w_gate, "swiglu_ffn_gate_up_batched")?,
+                lloyd_c16_or_fail(&layer.w_up, "swiglu_ffn_gate_up_batched")?,
+            )?;
+            return Ok(FfnGateOutput::LloydA8H);
+        }
         if f1lite {
             gpu.gemm_gate_up_silu_mq4g256v2_i8_prequant(
                 &layer.w_gate.buf,
@@ -2253,8 +2427,41 @@ fn swiglu_ffn_gate_up_batched(
             n,
         )?;
     } else if ffn_is_mq4v2_lloyd {
-        // qt=52: gate+up both Lloyd. gfx11 → MMQ-LUT; gfx12 FP8-LUT.
-        if lloyd_mmq_lut_route(gpu) {
+        // qt=52: gate+up both Lloyd. Small-N gfx1100 → F16-BT-LUT;
+        // N>=128 or other gfx11 → MMQ-LUT; gfx12 FP8-LUT.
+        if lloyd_f16_bt_route(gpu, n) {
+            gpu.gemm_gate_up_mq4g256v2_wmma_gfx11_lloyd(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                &pbs.x_rot_batch,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                n,
+                lloyd_f16_or_fail(&layer.w_gate, "swiglu_ffn_gate_up_batched")?,
+                lloyd_f16_or_fail(&layer.w_up, "swiglu_ffn_gate_up_batched")?,
+            )?;
+        } else if lloyd_mmq_lut_route(gpu) {
+            if lloyd_mmq_a4_route(gpu, n, layer.w_gate.k)
+                && layer.w_gate.m == layer.w_up.m
+                && layer.w_gate.m % 128 == 0
+            {
+                let xq = gpu.ensure_int8_mmq_x(&pbs.x_rot_batch, n, layer.w_gate.k)?;
+                gpu.gemm_gate_up_silu_mq4g256v2_i8_lloyd(
+                    &layer.w_gate.buf,
+                    &layer.w_up.buf,
+                    xq,
+                    &pbs.gate_ffn_batch,
+                    layer.w_gate.m,
+                    layer.w_gate.k,
+                    n,
+                    lloyd_c16_or_fail(&layer.w_gate, "swiglu_ffn_gate_up_batched")?,
+                    lloyd_c16_or_fail(&layer.w_up, "swiglu_ffn_gate_up_batched")?,
+                )?;
+                return Ok(FfnGateOutput::LloydA8H);
+            }
             gpu.gemm_gate_up_mq4g256v2_mmq_lloyd(
                 &layer.w_gate.buf,
                 &layer.w_up.buf,
@@ -2500,6 +2707,39 @@ fn swiglu_ffn_down_batched(
             layer.w_down.m,
             hidden_dim,
             n,
+        );
+    }
+    if h_source == FfnGateOutput::LloydA8H
+        && matches!(&epilogue, BatchEpilogue::Residual)
+        && layer.w_down.dtype == DType::MQ4G256V2Lloyd
+        && lloyd_mmq_a4_route(gpu, n, hidden_dim)
+    {
+        let c16 = lloyd_c16_or_fail(&layer.w_down, "swiglu_ffn_down_batched")?;
+        // Fused hin producer when admitted (AWQ sidecars only, mirroring
+        // the uniform A8H arm); otherwise the rotate + standalone quantize.
+        let xq = if let Some(prep) =
+            try_a8_hin_prepared(gpu, &layer.w_down, &pbs.gate_ffn_batch, hidden_dim, n)?
+        {
+            gpu.int8_mmq_prepared_ptr(&prep, hidden_dim, n)?
+        } else {
+            rotate_x_mq_batched_for(
+                gpu,
+                &layer.w_down,
+                &pbs.gate_ffn_batch,
+                &pbs.ffn_hidden_batch,
+                hidden_dim,
+                n,
+            )?;
+            gpu.ensure_int8_mmq_x(&pbs.ffn_hidden_batch, n, hidden_dim)?
+        };
+        return gpu.gemm_mq4g256v2_mmq_add_prequant_i8_lloyd(
+            &layer.w_down.buf,
+            xq,
+            &pbs.x_batch,
+            layer.w_down.m,
+            hidden_dim,
+            n,
+            c16,
         );
     }
     if let FfnGateOutput::Iu4A4(prep) = h_source {

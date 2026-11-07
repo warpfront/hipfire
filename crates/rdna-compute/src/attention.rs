@@ -17024,6 +17024,149 @@ impl Gpu {
         Ok(())
     }
 
+    /// GQA-shared fwht4-K decode (gfx1100, H24/KV4/D256, GQA group 6).
+    /// One 256-thread workgroup per (kv head, tile) serves all six query
+    /// heads: each K/V tile is read once instead of once per head. Same
+    /// partials ABI and reduce as [`Self::attention_flash_fwht4`]; the
+    /// tile kernel covers v_mode 8 (Q8_0 V) and 4 (lloyd4 V). Other modes
+    /// keep the scalar tile (host-gated at the dispatch site).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_fwht4_tile_gqa_gfx11(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+        v_mode_bits: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch.as_str() != "gfx1100" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "attention_flash_fwht4_tile_gqa_gfx11 requires gfx1100",
+            ));
+        }
+        if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "attention_flash_fwht4_tile_gqa_gfx11 requires H24/KV4/D256",
+            ));
+        }
+        if v_mode_bits != 8 && v_mode_bits != 4 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "attention_flash_fwht4_tile_gqa_gfx11 requires v_mode 8 or 4",
+            ));
+        }
+        const TILE_SIZE: usize = 128;
+        let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
+        let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
+        let launch_tiles = replay_stable_tile_count(
+            actual_tiles,
+            max_tiles,
+            self.graphs.capture_mode,
+            self.replay.is_recording(),
+        );
+
+        self.ensure_kernel(
+            "attention_flash_fwht4_tile_gqa_gfx11",
+            kernels::ATTENTION_FLASH_FWHT4_TILE_GQA_GFX11_SRC,
+            "attention_flash_fwht4_tile_gqa_gfx11",
+        )?;
+        {
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let mut q_ptr = q.buf.as_ptr();
+            let mut k_ptr = k_cache.buf.as_ptr();
+            let mut v_ptr = v_cache.buf.as_ptr();
+            let mut p_ptr = partials.buf.as_ptr();
+            let mut pos_ptr = pos_buf.as_ptr();
+            let mut s1_ptr = signs1.buf.as_ptr();
+            let mut s2_ptr = signs2.buf.as_ptr();
+            let mut nh = n_heads as i32;
+            let mut nkv = n_kv_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut ms = max_seq as i32;
+            let mut sc = scale;
+            let mut ts = TILE_SIZE as i32;
+            let mut mt = max_tiles as i32;
+            let mut vm = v_mode_bits;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut q_ptr as *mut _ as *mut c_void,
+                &mut k_ptr as *mut _ as *mut c_void,
+                &mut v_ptr as *mut _ as *mut c_void,
+                &mut p_ptr as *mut _ as *mut c_void,
+                &mut pos_ptr as *mut _ as *mut c_void,
+                &mut s1_ptr as *mut _ as *mut c_void,
+                &mut s2_ptr as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut nkv as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut ms as *mut _ as *mut c_void,
+                &mut sc as *mut _ as *mut c_void,
+                &mut ts as *mut _ as *mut c_void,
+                &mut mt as *mut _ as *mut c_void,
+                &mut vm as *mut _ as *mut c_void,
+            ];
+            // One workgroup per (kv head, tile); block 256. Static LDS only
+            // (~17.5 KB: V slab + Q + scores, worst-case Q8 V; lloyd4 V
+            // is smaller); no dynamic shared use. No K LDS — keys are
+            // partitioned across the 8 waves (16 each) and read straight
+            // from global with scalar-identical addressing.
+            // Cap Y like the Q8 GQA tile so a graph-captured grid does not
+            // dispatch thousands of idle workgroups.
+            let grid_y = launch_tiles.min(512);
+            self.launch_maybe_blob(
+                "attention_flash_fwht4_tile_gqa_gfx11",
+                [n_kv_heads as u32, grid_y as u32, 1],
+                [256, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(q_ptr);
+                    b.push_ptr(k_ptr);
+                    b.push_ptr(v_ptr);
+                    b.push_ptr(p_ptr);
+                    b.push_ptr(pos_ptr);
+                    b.push_ptr(s1_ptr);
+                    b.push_ptr(s2_ptr);
+                    b.push_i32(nh);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(ms);
+                    b.push_f32(sc);
+                    b.push_i32(ts);
+                    b.push_i32(mt);
+                    b.push_i32(vm);
+                    b
+                },
+            )?;
+        }
+
+        self.attention_flash_fwht_reduce(
+            partials,
+            out,
+            pos_buf,
+            signs1,
+            signs2,
+            n_heads,
+            head_dim,
+            TILE_SIZE,
+            max_tiles,
+            v_mode_bits,
+        )?;
+        Ok(())
+    }
+
     /// Flash attention for asym2 KV (K at rotated 2-bit, V at Q8_0 normal space).
     /// Flash attention for fwht2 KV (K FWHT-rotated 2-bit, V at Q8_0).
     pub fn attention_flash_fwht2(
