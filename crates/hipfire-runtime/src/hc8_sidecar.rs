@@ -366,7 +366,13 @@ impl BoundHc8Sidecar {
             .tensors
             .iter()
             .zip(self.sidecar.tensors())
-            .map(|(entry, info)| (entry.name.clone(), entry.base_data_size, info.data_size as u64))
+            .map(|(entry, info)| {
+                (
+                    entry.name.clone(),
+                    entry.base_data_size,
+                    info.data_size as u64,
+                )
+            })
             .collect()
     }
 

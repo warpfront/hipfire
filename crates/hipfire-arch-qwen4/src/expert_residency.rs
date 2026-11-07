@@ -3532,7 +3532,9 @@ pub fn ep_hc8_plan_saving(
             continue;
         };
         let census = bytes_of(entry).ok_or_else(|| format!("no payload size for '{name}'"))?;
-        let bf16 = (m as u64).checked_mul(k as u64).and_then(|n| n.checked_mul(2));
+        let bf16 = (m as u64)
+            .checked_mul(k as u64)
+            .and_then(|n| n.checked_mul(2));
         if Some(census) != bf16
             || census != *base
             || rdna_compute::hc8_weight::hc8_payload_bytes(m, k).map(|n| n as u64) != Some(*payload)
@@ -5168,7 +5170,9 @@ mod tests {
             "qwen4 EP expert tier: the MTP head's experts: 256 owned units VRAM-resident on every rank (618 MiB, charged before the ranking walk)"
         );
         let host = ep_mtp_experts_line(None, "HIPFIRE_EP_MTP_EXPERTS_RESIDENT=0");
-        assert!(host.contains("stay host-mapped") && host.contains("HIPFIRE_EP_MTP_EXPERTS_RESIDENT=0"));
+        assert!(
+            host.contains("stay host-mapped") && host.contains("HIPFIRE_EP_MTP_EXPERTS_RESIDENT=0")
+        );
     }
 
     #[test]
@@ -5212,7 +5216,10 @@ mod tests {
             .into_iter()
             .map(|name| hc_entry(name, DType::BF16))
             .collect();
-        weights.push(entry("model.language_model.layers.0.mlp.experts.down_proj", 0));
+        weights.push(entry(
+            "model.language_model.layers.0.mlp.experts.down_proj",
+            0,
+        ));
         weights
     }
 
@@ -5245,7 +5252,15 @@ mod tests {
         let (dims, mode) =
             crate::weights::trunk_shard::census_trunk_for(true, &config, 2).expect("2-rank shard");
         assert_eq!(
-            ep_hc8_plan_saving(&weights, hc_bf16, &sidecar, Some((&dims, mode)), 2, true, true),
+            ep_hc8_plan_saving(
+                &weights,
+                hc_bf16,
+                &sidecar,
+                Some((&dims, mode)),
+                2,
+                true,
+                true
+            ),
             Ok(3 * each)
         );
         // A sidecar tensor the manifest does not declare is skipped at apply time: not saved.
@@ -5310,7 +5325,18 @@ mod tests {
             621 << 20,
         );
         assert!(line.contains("(-621 MiB hc8 sidecar applied)"), "{line}");
-        let both = ep_fit_rank_line_mtp(&config, 0, 2, free, non_expert, layer, reserve, 20, layer, 621 << 20);
+        let both = ep_fit_rank_line_mtp(
+            &config,
+            0,
+            2,
+            free,
+            non_expert,
+            layer,
+            reserve,
+            20,
+            layer,
+            621 << 20,
+        );
         assert!(
             both.contains(
                 "(incl. 512.0 MiB MTP head experts, this rank's owned slice VRAM-resident; -621 MiB hc8 sidecar applied)"
@@ -6621,9 +6647,15 @@ mod tests {
                 Some(QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES)
             );
             for ranks in [3, 4, 8] {
-                assert_eq!(runtime_overhead_bytes_ep("gfx1201", false, ranks, ep_census), None);
+                assert_eq!(
+                    runtime_overhead_bytes_ep("gfx1201", false, ranks, ep_census),
+                    None
+                );
             }
-            assert_eq!(runtime_overhead_bytes_ep("gfx1201", true, 2, ep_census), None);
+            assert_eq!(
+                runtime_overhead_bytes_ep("gfx1201", true, 2, ep_census),
+                None
+            );
         }
         assert_eq!(
             runtime_overhead_bytes_ep("gfx1201", false, 2, true),
@@ -6632,7 +6664,11 @@ mod tests {
         assert_eq!(runtime_overhead_bytes_ep("gfx1201", false, 2, false), None);
         for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx942", "gfx12010", ""] {
             assert_eq!(runtime_overhead_bytes(arch, false, 1), None, "{arch}");
-            assert_eq!(runtime_overhead_bytes_ep(arch, false, 2, true), None, "{arch}");
+            assert_eq!(
+                runtime_overhead_bytes_ep(arch, false, 2, true),
+                None,
+                "{arch}"
+            );
         }
     }
 
@@ -10816,12 +10852,10 @@ mod tests {
         // `=0`: the global-config census, no runtime term, so the historical floor stays.
         assert_eq!(off.runtime, 0);
         assert_eq!(runtime_overhead_bytes_ep("gfx1201", false, 2, false), None);
-        assert!(
-            ep_census_local(&config, None, 2, false)
-                .unwrap()
-                .config
-                .is_none()
-        );
+        assert!(ep_census_local(&config, None, 2, false)
+            .unwrap()
+            .config
+            .is_none());
         let trunk = census_trunk_for(true, &config, 2);
         let none = ep_census_local(&config, trunk.as_ref(), 2, false).unwrap();
         assert!(none.config.is_none() && none.shared_width.is_none());
@@ -10838,7 +10872,10 @@ mod tests {
         );
 
         // Today's EP2 census at the shipped shape (audit census-audit.md).
-        assert_eq!(off.shared_i8_shadows, 250_675_200, "239.06 MiB: 48 x 640 wide");
+        assert_eq!(
+            off.shared_i8_shadows, 250_675_200,
+            "239.06 MiB: 48 x 640 wide"
+        );
 
         // On: the busiest rank's shared width and rank 0's GDN heads.
         let (dims, mode) = trunk.expect("2-rank shard");
@@ -10913,14 +10950,20 @@ mod tests {
         let text = retired.describe();
         assert!(text.contains("EP census ["), "{text}");
         assert!(text.contains("HIP runtime 1088 MiB"), "{text}");
-        assert!(text.contains("historical single-device floor retired"), "{text}");
+        assert!(
+            text.contains("historical single-device floor retired"),
+            "{text}"
+        );
         assert!(text.contains("HIPFIRE_EP_RESERVE_CENSUS=0"), "{text}");
         let today = AutoReserve::new(Some(5490 << 20), off).unwrap();
         let today_text = today.describe();
         assert!(!today_text.contains("EP census"), "{today_text}");
         assert!(today_text.contains("historical floor, "), "{today_text}");
         assert!(today_text.contains("MiB census ["), "{today_text}");
-        assert!(today_text.ends_with("historical floor wins"), "{today_text}");
+        assert!(
+            today_text.ends_with("historical floor wins"),
+            "{today_text}"
+        );
         assert_eq!(today.winner(), "historical floor");
         assert_eq!(retired.winner(), "census (historical floor retired)");
     }
@@ -11081,11 +11124,7 @@ mod tests {
                 println!("  {name:<32} {bytes:>14} B {:>10} MiB", mib(bytes));
             }
             let census_total = census.total().unwrap();
-            let reserve = AutoReserve::new(
-                (!on).then_some(historical),
-                census,
-            )
-            .unwrap();
+            let reserve = AutoReserve::new((!on).then_some(historical), census).unwrap();
             println!(
                 "  EP census TOTAL {census_total} B = {} MiB; reserve {} MiB ({})",
                 mib(census_total),

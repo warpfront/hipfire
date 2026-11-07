@@ -2519,12 +2519,7 @@ fn qwen4_placement_inputs(
 /// Whether the native MTP head is still attached after an expert placement that host-maps at
 /// least its routed experts: `native_mtp` and the host-mapped MTP policy
 /// ([`crate::admission::qwen4_mtp_with_host_mapped_experts`], worst case one host blob).
-fn qwen4_mtp_kept(
-    spec: SpecLoadCfg,
-    arch: &str,
-    native_mtp: bool,
-    routed_experts: bool,
-) -> bool {
+fn qwen4_mtp_kept(spec: SpecLoadCfg, arch: &str, native_mtp: bool, routed_experts: bool) -> bool {
     native_mtp
         && crate::admission::qwen4_mtp_with_host_mapped_experts(
             spec,
@@ -7062,7 +7057,12 @@ fn load_qwen4_rank_unscoped(
             &manifest.weights,
             &bytes_of,
             ep_ranks,
-            qwen4_mtp_kept(ctx.spec, &ctx.gpu.arch, placement_native_mtp, routed_experts),
+            qwen4_mtp_kept(
+                ctx.spec,
+                &ctx.gpu.arch,
+                placement_native_mtp,
+                routed_experts,
+            ),
         )?
     } else {
         None
@@ -7076,7 +7076,12 @@ fn load_qwen4_rank_unscoped(
             &hc8_plan,
             &config,
             ep_ranks,
-            qwen4_mtp_kept(ctx.spec, &ctx.gpu.arch, placement_native_mtp, routed_experts),
+            qwen4_mtp_kept(
+                ctx.spec,
+                &ctx.gpu.arch,
+                placement_native_mtp,
+                routed_experts,
+            ),
         )?
     } else {
         0
@@ -18359,7 +18364,13 @@ mod qwen4_ep_mtp_resident_tests {
     #[test]
     fn no_charge_without_ep_or_without_the_head_attached() {
         let weights = manifest();
-        assert_eq!(qwen4_ep_mtp_resident(&weights, &bytes_of, 1, true), Ok(None));
-        assert_eq!(qwen4_ep_mtp_resident(&weights, &bytes_of, 2, false), Ok(None));
+        assert_eq!(
+            qwen4_ep_mtp_resident(&weights, &bytes_of, 1, true),
+            Ok(None)
+        );
+        assert_eq!(
+            qwen4_ep_mtp_resident(&weights, &bytes_of, 2, false),
+            Ok(None)
+        );
     }
 }
