@@ -74,9 +74,13 @@ fn a8_gdn_admitted(
     n: usize,
     epilogue: &BatchEpilogue<'_>,
 ) -> bool {
+    // Lloyd (qt=52) rides the A4 predicate in place of the symmetric-file
+    // requirement (the producer is weight-independent; the twin consumer
+    // enforces the same A4 predicate).
+    let lloyd_wo = wo.dtype == DType::MQ4G256V2Lloyd && lloyd_mmq_a4_route(gpu, n, k);
     gpu.flags.a8_fused_prod
-        && gpu.a8_prefill_active(n, k)
-        && wo.dtype == DType::MQ4G256V2
+        && (gpu.a8_prefill_active(n, k) || lloyd_wo)
+        && (wo.dtype == DType::MQ4G256V2 || lloyd_wo)
         && matches!(epilogue, BatchEpilogue::Residual)
         && head_dim == 128
         && n_heads * head_dim == k
@@ -521,6 +525,7 @@ pub fn batch_chunk_delta_net_input_projection(
         layer.w_beta.dtype,
         layer.w_alpha.dtype,
     ] == [DType::MQ4G256V2; 4]
+        || (is_mq4v2_lloyd && lloyd_mmq_a4_route(gpu, n, layer.wqkv.k))
     {
         try_a8_rmsnorm_prepared(
             gpu,
@@ -623,38 +628,78 @@ pub fn batch_chunk_delta_net_input_projection(
     // Batched 4-way LA projection (wqkv + wz + w_beta + w_alpha).
     if let Some(prep) = &a8_prep {
         let xq = gpu.int8_mmq_prepared_ptr(prep, layer.wqkv.k, n)?;
-        gpu.gemm_mq4g256v2_mmq_set_prequant_i8(
-            &layer.wqkv.buf,
-            xq,
-            &pbs.dn_qkv_batch,
-            layer.wqkv.m,
-            layer.wqkv.k,
-            n,
-        )?;
-        gpu.gemm_mq4g256v2_mmq_set_prequant_i8(
-            &layer.wz.buf,
-            xq,
-            &pbs.dn_z_batch,
-            layer.wz.m,
-            layer.wz.k,
-            n,
-        )?;
-        gpu.gemm_mq4g256v2_mmq_set_prequant_i8(
-            &layer.w_beta.buf,
-            xq,
-            &pbs.dn_beta_batch,
-            layer.w_beta.m,
-            layer.w_beta.k,
-            n,
-        )?;
-        gpu.gemm_mq4g256v2_mmq_set_prequant_i8(
-            &layer.w_alpha.buf,
-            xq,
-            &pbs.dn_alpha_batch,
-            layer.w_alpha.m,
-            layer.w_alpha.k,
-            n,
-        )?;
+        if is_mq4v2_lloyd {
+            // Lloyd twin: same prepared int8 X, per-tensor codebooks.
+            gpu.gemm_mq4g256v2_mmq_set_prequant_i8_lloyd(
+                &layer.wqkv.buf,
+                xq,
+                &pbs.dn_qkv_batch,
+                layer.wqkv.m,
+                layer.wqkv.k,
+                n,
+                lloyd_c16_or_fail(&layer.wqkv, "batch_chunk_delta_net_input_projection")?,
+            )?;
+            gpu.gemm_mq4g256v2_mmq_set_prequant_i8_lloyd(
+                &layer.wz.buf,
+                xq,
+                &pbs.dn_z_batch,
+                layer.wz.m,
+                layer.wz.k,
+                n,
+                lloyd_c16_or_fail(&layer.wz, "batch_chunk_delta_net_input_projection")?,
+            )?;
+            gpu.gemm_mq4g256v2_mmq_set_prequant_i8_lloyd(
+                &layer.w_beta.buf,
+                xq,
+                &pbs.dn_beta_batch,
+                layer.w_beta.m,
+                layer.w_beta.k,
+                n,
+                lloyd_c16_or_fail(&layer.w_beta, "batch_chunk_delta_net_input_projection")?,
+            )?;
+            gpu.gemm_mq4g256v2_mmq_set_prequant_i8_lloyd(
+                &layer.w_alpha.buf,
+                xq,
+                &pbs.dn_alpha_batch,
+                layer.w_alpha.m,
+                layer.w_alpha.k,
+                n,
+                lloyd_c16_or_fail(&layer.w_alpha, "batch_chunk_delta_net_input_projection")?,
+            )?;
+        } else {
+            gpu.gemm_mq4g256v2_mmq_set_prequant_i8(
+                &layer.wqkv.buf,
+                xq,
+                &pbs.dn_qkv_batch,
+                layer.wqkv.m,
+                layer.wqkv.k,
+                n,
+            )?;
+            gpu.gemm_mq4g256v2_mmq_set_prequant_i8(
+                &layer.wz.buf,
+                xq,
+                &pbs.dn_z_batch,
+                layer.wz.m,
+                layer.wz.k,
+                n,
+            )?;
+            gpu.gemm_mq4g256v2_mmq_set_prequant_i8(
+                &layer.w_beta.buf,
+                xq,
+                &pbs.dn_beta_batch,
+                layer.w_beta.m,
+                layer.w_beta.k,
+                n,
+            )?;
+            gpu.gemm_mq4g256v2_mmq_set_prequant_i8(
+                &layer.w_alpha.buf,
+                xq,
+                &pbs.dn_alpha_batch,
+                layer.w_alpha.m,
+                layer.w_alpha.k,
+                n,
+            )?;
+        }
     } else if let Some(prep) = iu4_prep.as_ref().filter(|_| {
         mq3v25_a4_weight(gpu, layer.wqkv.dtype)
             && [layer.wz.dtype, layer.w_beta.dtype, layer.w_alpha.dtype]
@@ -913,9 +958,10 @@ pub fn batch_chunk_delta_net_input_projection(
             n,
         )?;
     } else if is_mq4v2_lloyd {
-        // qt=52: all four projections Lloyd. gfx11 → MMQ-LUT; gfx12 FP8-LUT.
-        if lloyd_mmq_lut_route(gpu) {
-            gpu.gemm_qkvza_mq4g256v2_mmq_lloyd(
+        // qt=52: all four projections Lloyd. Small-N gfx1100 → F16-BT-LUT;
+        // N>=128 or other gfx11 → MMQ-LUT; gfx12 FP8-LUT.
+        if lloyd_f16_bt_route(gpu, n) {
+            gpu.gemm_qkvza_mq4g256v2_wmma_gfx11_lloyd(
                 &layer.wqkv.buf,
                 &layer.wz.buf,
                 &layer.w_beta.buf,
@@ -931,11 +977,78 @@ pub fn batch_chunk_delta_net_input_projection(
                 layer.w_alpha.m,
                 layer.wqkv.k,
                 n,
-                lloyd_c16_or_fail(&layer.wqkv, "batch_chunk_delta_net_input_projection")?,
-                lloyd_c16_or_fail(&layer.wz, "batch_chunk_delta_net_input_projection")?,
-                lloyd_c16_or_fail(&layer.w_beta, "batch_chunk_delta_net_input_projection")?,
-                lloyd_c16_or_fail(&layer.w_alpha, "batch_chunk_delta_net_input_projection")?,
+                [
+                    lloyd_f16_or_fail(&layer.wqkv, "batch_chunk_delta_net_input_projection")?,
+                    lloyd_f16_or_fail(&layer.wz, "batch_chunk_delta_net_input_projection")?,
+                    lloyd_f16_or_fail(&layer.w_beta, "batch_chunk_delta_net_input_projection")?,
+                    lloyd_f16_or_fail(&layer.w_alpha, "batch_chunk_delta_net_input_projection")?,
+                ],
             )?;
+        } else if lloyd_mmq_lut_route(gpu) {
+            if lloyd_mmq_a4_route(gpu, n, layer.wqkv.k) {
+                // Staged i8 twin: one int8 quantize of X, then the existing
+                // single-matrix SET per projection — no pad-128 allocs.
+                // w_beta/w_alpha (M=48) run as two masked SETs for now.
+                let xq = gpu.ensure_int8_mmq_x(&pbs.x_rot_batch, n, layer.wqkv.k)?;
+                gpu.gemm_mq4g256v2_mmq_set_prequant_i8_lloyd(
+                    &layer.wqkv.buf,
+                    xq,
+                    &pbs.dn_qkv_batch,
+                    layer.wqkv.m,
+                    layer.wqkv.k,
+                    n,
+                    lloyd_c16_or_fail(&layer.wqkv, "batch_chunk_delta_net_input_projection")?,
+                )?;
+                gpu.gemm_mq4g256v2_mmq_set_prequant_i8_lloyd(
+                    &layer.wz.buf,
+                    xq,
+                    &pbs.dn_z_batch,
+                    layer.wz.m,
+                    layer.wz.k,
+                    n,
+                    lloyd_c16_or_fail(&layer.wz, "batch_chunk_delta_net_input_projection")?,
+                )?;
+                gpu.gemm_mq4g256v2_mmq_set_prequant_i8_lloyd(
+                    &layer.w_beta.buf,
+                    xq,
+                    &pbs.dn_beta_batch,
+                    layer.w_beta.m,
+                    layer.w_beta.k,
+                    n,
+                    lloyd_c16_or_fail(&layer.w_beta, "batch_chunk_delta_net_input_projection")?,
+                )?;
+                gpu.gemm_mq4g256v2_mmq_set_prequant_i8_lloyd(
+                    &layer.w_alpha.buf,
+                    xq,
+                    &pbs.dn_alpha_batch,
+                    layer.w_alpha.m,
+                    layer.w_alpha.k,
+                    n,
+                    lloyd_c16_or_fail(&layer.w_alpha, "batch_chunk_delta_net_input_projection")?,
+                )?;
+            } else {
+                gpu.gemm_qkvza_mq4g256v2_mmq_lloyd(
+                    &layer.wqkv.buf,
+                    &layer.wz.buf,
+                    &layer.w_beta.buf,
+                    &layer.w_alpha.buf,
+                    &pbs.x_rot_batch,
+                    &pbs.dn_qkv_batch,
+                    &pbs.dn_z_batch,
+                    &pbs.dn_beta_batch,
+                    &pbs.dn_alpha_batch,
+                    layer.wqkv.m,
+                    layer.wz.m,
+                    layer.w_beta.m,
+                    layer.w_alpha.m,
+                    layer.wqkv.k,
+                    n,
+                    lloyd_c16_or_fail(&layer.wqkv, "batch_chunk_delta_net_input_projection")?,
+                    lloyd_c16_or_fail(&layer.wz, "batch_chunk_delta_net_input_projection")?,
+                    lloyd_c16_or_fail(&layer.w_beta, "batch_chunk_delta_net_input_projection")?,
+                    lloyd_c16_or_fail(&layer.w_alpha, "batch_chunk_delta_net_input_projection")?,
+                )?;
+            }
         } else if let Some(prep) = &fp8_prep {
             // gfx1201 FP8-stream: the producer already emitted the fp8
             // pre-pass planes; consume them directly, no pack launch.
@@ -1793,7 +1906,19 @@ pub fn batch_chunk_delta_net_output_projection(
         &pbs.dn_normed_batch
     };
     if let Some(prep) = &a8_gdn_prep {
-        out_proj_residual_i8_prepared(gpu, pbs, &layer.wo, &layer.w_gate, prep, fusion, n)?;
+        if layer.wo.dtype == DType::MQ4G256V2Lloyd {
+            out_proj_residual_i8_prepared_lloyd(
+                gpu,
+                pbs,
+                &layer.wo,
+                &layer.w_gate,
+                prep,
+                fusion,
+                n,
+            )?;
+        } else {
+            out_proj_residual_i8_prepared(gpu, pbs, &layer.wo, &layer.w_gate, prep, fusion, n)?;
+        }
     } else if let Some(prep) = gdn_fused_prep.as_ref().or(iu4_wo_prep.as_ref()) {
         out_proj_residual_iu4_prepared(gpu, pbs, &layer.wo, &layer.w_gate, prep, fusion, n)?;
     } else if let Some(prep) = &fp8_gdn_prep {
