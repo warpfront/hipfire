@@ -98,7 +98,7 @@ extern "C" __global__ void HIPFIRE_QKV_KERNEL_NAME(
 
     const int tid = threadIdx.x;
 #ifdef HIPFIRE_MQ4G256V2_LUT
-    __shared__ unsigned short LUT_SMEM[48];
+    __shared__ float LUT_SMEM[48];
     if (tid < 24) {
         unsigned int d;
         switch (tid) {
@@ -109,10 +109,11 @@ extern "C" __global__ void HIPFIRE_QKV_KERNEL_NAME(
             case 16: d = L16; break; case 17: d = L17; break; case 18: d = L18; break; case 19: d = L19; break;
             case 20: d = L20; break; case 21: d = L21; break; case 22: d = L22; break; default: d = L23; break;
         }
-        ((unsigned int*)LUT_SMEM)[tid] = d;
+        LUT_SMEM[tid * 2] = __half2float(__ushort_as_half((unsigned short)(d & 0xFFFFu)));
+        LUT_SMEM[tid * 2 + 1] = __half2float(__ushort_as_half((unsigned short)(d >> 16)));
     }
     __syncthreads();
-    #define MQ4V2_DEQ(q) (__half2float(__ushort_as_half(LUT_SMEM[lut_base + (q)])))
+    #define MQ4V2_DEQ(q) (LUT_SMEM[lut_base + (q)])
 #else
     (void)lut_base;
     #define MQ4V2_DEQ(q) ((float)(q))
@@ -210,25 +211,40 @@ extern "C" __global__ void HIPFIRE_QKV_KERNEL_NAME(
         DOG_V(pk3, sc3, zp3, acc3, xv3a.x,xv3a.y,xv3a.z,xv3a.w,xv3b.x,xv3b.y,xv3b.z,xv3b.w);
         #undef DOG_V
 #else
-        #define DOG(pk, sc, zp, b, a) \
-            (a) += (sc * MQ4V2_DEQ((pk) & 0xFu)        + zp) * x[(b)]     \
-                 + (sc * MQ4V2_DEQ(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
-                 + (sc * MQ4V2_DEQ(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
-                 + (sc * MQ4V2_DEQ(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
-                 + (sc * MQ4V2_DEQ(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
-                 + (sc * MQ4V2_DEQ(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
-                 + (sc * MQ4V2_DEQ(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
-                 + (sc * MQ4V2_DEQ(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+        // Plain float4 x-hoist (all arches, LUT and uniform): 8 vector loads
+        // replace 32 scalar loads per quad; FMA order untouched, bit-exact.
+        const float4 xv0a = *reinterpret_cast<const float4*>(x + base);
+        const float4 xv0b = *reinterpret_cast<const float4*>(x + base + 4);
+        const float4 xv1a = *reinterpret_cast<const float4*>(x + base + 256);
+        const float4 xv1b = *reinterpret_cast<const float4*>(x + base + 260);
+        const float4 xv2a = *reinterpret_cast<const float4*>(x + base + 512);
+        const float4 xv2b = *reinterpret_cast<const float4*>(x + base + 516);
+        const float4 xv3a = *reinterpret_cast<const float4*>(x + base + 768);
+        const float4 xv3b = *reinterpret_cast<const float4*>(x + base + 772);
+        #define DOG_X(pk, sc, zp, a, x0, x1, x2, x3, x4, x5, x6, x7) \
+            (a) += (sc * MQ4V2_DEQ((pk) & 0xFu)        + zp) * (x0) \
+                  + (sc * MQ4V2_DEQ(((pk) >> 4) & 0xFu)  + zp) * (x1) \
+                  + (sc * MQ4V2_DEQ(((pk) >> 8) & 0xFu)  + zp) * (x2) \
+                  + (sc * MQ4V2_DEQ(((pk) >> 12) & 0xFu) + zp) * (x3) \
+                  + (sc * MQ4V2_DEQ(((pk) >> 16) & 0xFu) + zp) * (x4) \
+                  + (sc * MQ4V2_DEQ(((pk) >> 20) & 0xFu) + zp) * (x5) \
+                  + (sc * MQ4V2_DEQ(((pk) >> 24) & 0xFu) + zp) * (x6) \
+                  + (sc * MQ4V2_DEQ(((pk) >> 28) & 0xFu) + zp) * (x7)
 
-        DOG(pk0, sc0, zp0, base,       acc0);
-        DOG(pk1, sc1, zp1, base + 256, acc1);
-        DOG(pk2, sc2, zp2, base + 512, acc2);
-        DOG(pk3, sc3, zp3, base + 768, acc3);
-        #undef DOG
+        DOG_X(pk0, sc0, zp0, acc0,
+              xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
+        DOG_X(pk1, sc1, zp1, acc1,
+              xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
+        DOG_X(pk2, sc2, zp2, acc2,
+              xv2a.x, xv2a.y, xv2a.z, xv2a.w, xv2b.x, xv2b.y, xv2b.z, xv2b.w);
+        DOG_X(pk3, sc3, zp3, acc3,
+              xv3a.x, xv3a.y, xv3a.z, xv3a.w, xv3b.x, xv3b.y, xv3b.z, xv3b.w);
+        #undef DOG_X
 #endif
     }
 
-    // Tail handling: preserve acc[gi] interleaving. See 5302926 bug report.
+    // Tail handling (scalar x; tails only fire on K%1024 != 0 shapes, never on
+    // the 27B dense projections): preserve acc[gi] interleaving. See 5302926.
     #define TAIL_DOG(pk, sc, zp, b, a) \
         (a) += (sc * MQ4V2_DEQ((pk) & 0xFu)        + zp) * x[(b)]     \
              + (sc * MQ4V2_DEQ(((pk) >>  4) & 0xFu) + zp) * x[(b) + 1] \

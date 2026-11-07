@@ -19,6 +19,7 @@ pub mod trunk;
 use core::ffi::c_void;
 use core::mem::size_of;
 
+#[cfg(unix)]
 mod sys {
     use core::ffi::c_void;
     extern "C" {
@@ -43,6 +44,82 @@ mod sys {
         /// `struct rlimit { rlim_t rlim_cur, rlim_max; }` with 64-bit `rlim_t` (x86_64 Linux).
         pub fn getrlimit(resource: i32, rlim: *mut [u64; 2]) -> i32;
         pub fn setrlimit(resource: i32, rlim: *const [u64; 2]) -> i32;
+    }
+    pub const O_RDWR: i32 = 2;
+    pub const SEEK_SET: i32 = 0;
+    pub const SEEK_END: i32 = 2;
+    pub const O_CLOEXEC: i32 = 0o2000000;
+    pub const PROT_RW: i32 = 3;
+    pub const PROT_NONE: i32 = 0;
+    pub const MAP_SHARED: i32 = 1;
+    pub const MAP_PRIVATE: i32 = 2;
+    pub const MAP_FIXED: i32 = 0x10;
+    pub const MAP_ANON: i32 = 0x20;
+    pub const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
+    pub const MADV_HUGEPAGE: i32 = 14;
+    pub const CLOCK_MONOTONIC: i32 = 1;
+    pub const RLIMIT_MEMLOCK: i32 = 8;
+}
+
+/// Windows has no amdxdna driver, dma-buf, `/dev/accel/*`, POSIX VM syscalls or
+/// monotonic-clock UAPI: every entry fails closed with the caller's own
+/// sentinel (fd -1, null/`MAP_FAILED`, rc -1), which the existing checks turn
+/// into `Err`. `clock_gettime` is the exception: it is real (wall clock) so
+/// the shared `monotonic_ns` assert holds and trace deltas stay ordered; the
+/// NPU backend itself can never succeed here. Linux behavior is unchanged.
+#[cfg(windows)]
+mod sys {
+    use core::ffi::{c_char, c_void};
+
+    pub unsafe fn open(_path: *const c_char, _flags: i32) -> i32 {
+        -1
+    }
+    pub unsafe fn close(_fd: i32) -> i32 {
+        -1
+    }
+    pub unsafe fn ioctl(_fd: i32, _request: u64, _arg: *mut c_void) -> i32 {
+        -1
+    }
+    pub unsafe fn mmap(
+        _addr: *mut c_void,
+        _len: usize,
+        _prot: i32,
+        _flags: i32,
+        _fd: i32,
+        _off: i64,
+    ) -> *mut c_void {
+        MAP_FAILED
+    }
+    pub unsafe fn munmap(_addr: *mut c_void, _len: usize) -> i32 {
+        -1
+    }
+    pub unsafe fn madvise(_addr: *mut c_void, _len: usize, _advice: i32) -> i32 {
+        // Hint only; the caller ignores the result. The mapping itself
+        // already failed closed above.
+        -1
+    }
+    pub unsafe fn lseek(_fd: i32, _off: i64, _whence: i32) -> i64 {
+        -1
+    }
+    pub unsafe fn __errno_location() -> *mut i32 {
+        use core::sync::atomic::AtomicI32;
+        static ERRNO: AtomicI32 = AtomicI32::new(2); // ENOENT: no NPU driver
+        ERRNO.as_ptr()
+    }
+    pub unsafe fn clock_gettime(_clock_id: i32, tp: *mut [i64; 2]) -> i32 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        unsafe {
+            *tp = [now.as_secs() as i64, now.subsec_nanos() as i64];
+        }
+        0
+    }
+    pub unsafe fn getrlimit(_resource: i32, _rlim: *mut [u64; 2]) -> i32 {
+        -1
+    }
+    pub unsafe fn setrlimit(_resource: i32, _rlim: *const [u64; 2]) -> i32 {
+        -1
     }
     pub const O_RDWR: i32 = 2;
     pub const SEEK_SET: i32 = 0;
@@ -605,6 +682,7 @@ impl Device {
     /// `Bo` owns the GEM handle and mapping. The mmap is required: under identity SVA the NPU
     /// reaches the buffer through this host VA. Importing a dma-buf this fd's file already
     /// imported yields the same GEM handle, so keep one live `Bo` per dma-buf.
+    #[cfg(unix)]
     pub fn import_dmabuf(&self, fd: std::os::fd::RawFd, size: usize) -> std::io::Result<Bo> {
         use std::io::{Error, ErrorKind};
         if size == 0 {

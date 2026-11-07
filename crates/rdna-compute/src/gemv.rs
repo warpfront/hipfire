@@ -13305,9 +13305,9 @@ impl Gpu {
         result
     }
 
-    /// MQ4G256V2-Lloyd (qt=52) residual GEMV (`y +=`): LUT twin of
-    /// `gemv_mq4g256v2_lloyd` over `GEMV_MQ4G256V2_RESIDUAL_LUT_SRC`. Same
-    /// unconditional single-row scope (see above for the rows-1 rationale).
+    /// MQ4G256V2-Lloyd (qt=52) residual GEMV (`y +=`): LUT twin over the
+    /// dual-row residual body (2 rows/wave, `row0 = blockIdx.x << 1`;
+    /// grid is `m.div_ceil(2)` so no empty exiting blocks launch).
     pub fn gemv_hfq4g256_residual_mq4v2_lloyd(
         &mut self,
         a_raw: &GpuTensor,
@@ -13327,7 +13327,8 @@ impl Gpu {
             ));
         }
         // No multirow LUT variant exists (fail-open to uniform multirow would
-        // decode on the wrong grid); rows pinned to 1 unconditionally.
+        // decode on the wrong grid); the dual-row residual body covers two
+        // rows per wave, so the grid is halved (odd M exits cleanly).
         let func_name = "gemv_mq4g256v2_residual_lloyd";
         self.ensure_kernel(
             func_name,
@@ -13366,7 +13367,7 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "gemv", func_name, bytes);
         let result = self.launch_maybe_blob(
             func_name,
-            [m as u32, 1, 1],
+            [m.div_ceil(2) as u32, 1, 1],
             [32, 1, 1],
             0,
             &mut params,

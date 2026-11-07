@@ -987,6 +987,17 @@ name = "tmp_scratch_leak_probe"
 required-features = ["lab"]
 
 [[example]]
+name = "tmp_lloyd_i8_twin_t0"
+required-features = ["lab"]
+
+# T0 experiment (throwaway): gated behind `lab` at merge prep (was the last
+# ungated example keeping the ungated_examples ratchet at 69; see
+# scripts/leanup-thresholds.txt). Run with `--features lab`.
+[[example]]
+name = "tmp_lloyd_gfx11_t0"
+required-features = ["lab"]
+
+[[example]]
 name = "test_kv_slot_desc_ports"
 required-features = ["lab"]
 
