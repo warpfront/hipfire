@@ -9861,6 +9861,7 @@ impl<'a> LayerPhaseEnv<'a> {
             dilation: config.ple_conv_dilation(),
             epsilon: EPSILON,
             lane_states: &[],
+            projected: false,
         });
         Ok((step, rows_f16))
     }

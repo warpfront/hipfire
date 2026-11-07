@@ -3322,6 +3322,11 @@ pub fn execute_grouped_depthwise_rows(
             "lane-batched PLE has no row window".into(),
         ));
     }
+    if op.projected {
+        return Err(DispatchError::Hip(
+            "projected PLE key / value have no row window".into(),
+        ));
+    }
     let CoreWindow { lo, rows } = window;
     let channels = op.branches * op.hidden;
     if channels % 2 != 0 || op.embed_dim % 2 != 0 {
@@ -3375,6 +3380,7 @@ pub fn execute_grouped_depthwise_rows(
         dilation: op.dilation,
         epsilon: op.epsilon,
         lane_states: &[],
+        projected: false,
         rotation: op.rotation,
     };
     if window.lo == 0 && window.rows == op.rows {
@@ -5832,6 +5838,12 @@ pub struct GroupedDepthwiseOp<'a> {
     /// lane rows) with its own convolution state `lane_states[i]` (`state` is
     /// then unused). Bitwise the per-lane steps in lane order.
     pub lane_states: &'a [&'a GpuTensor],
+    /// The key / value projections already ran: `key_scratch` / `value_scratch` hold this
+    /// op's `rows` rows of them (one row-exact `ProjectOp` over a superset of rows, e.g. every
+    /// lane of a lane step, wrote them in place, each row bitwise this op's own projection),
+    /// so the op runs only its gate / norm / convolution / stream-add tail. Needs F32-staged
+    /// rows (`rows_f16 == false`) and the ordinary single-stream form (empty `lane_states`).
+    pub projected: bool,
 }
 
 impl GroupedDepthwiseOp<'_> {
@@ -5906,6 +5918,11 @@ impl GroupedDepthwiseOp<'_> {
                 require_tensor(state, state_elements, DType::F32, "grouped lane state")?;
             }
         }
+        if self.projected && (self.rows_f16 || !self.lane_states.is_empty()) {
+            return Err(DispatchError::Hip(
+                "projected PLE key / value need F32 rows and the single-stream form".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -5946,7 +5963,9 @@ pub fn execute_grouped_depthwise(
             "PLE rows were staged as F16 but the fused PLE tail is not admitted".into(),
         ));
     }
-    if op.rows_f16 {
+    if op.projected {
+        // The caller's row-exact projection already wrote `key` / `value`.
+    } else if op.rows_f16 {
         // SAFETY: `rows_tensor` holds `rows * embed_dim` F32 elements
         // (`embed_dim == hidden`, validated), so its first
         // `rows * embed_dim * 2` bytes hold the F16 rows; the view is non-owning.
@@ -7593,6 +7612,7 @@ mod tests {
             epsilon: 1e-6,
             rotation: &rotation,
             lane_states: &[],
+            projected: false,
         };
         assert!(op().validate_layout().is_ok());
 
@@ -7631,6 +7651,21 @@ mod tests {
         assert!(fn_like.validate_layout().is_ok());
         fn_like.rows_f16 = true;
         assert!(fn_like.validate_layout().is_ok());
+        // A projected op (the key / value rows were written by a lane-wide projection) is the
+        // ordinary F32-rows single-stream form: F16 staging and lane batching refuse it.
+        let mut projected = op();
+        projected.projected = true;
+        assert!(projected.validate_layout().is_ok());
+        let mut bad = op();
+        bad.projected = true;
+        bad.rows_f16 = true;
+        assert!(refusal(&bad).contains("single-stream form") || refusal(&bad).contains("F16 rows"));
+        let lane_state = f32s(state.numel());
+        let lane_states = [&lane_state, &lane_state, &lane_state];
+        let mut bad = op();
+        bad.projected = true;
+        bad.lane_states = &lane_states;
+        assert!(refusal(&bad).contains("single-stream form"));
     }
 }
 

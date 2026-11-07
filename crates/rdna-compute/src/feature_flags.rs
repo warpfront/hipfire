@@ -226,6 +226,9 @@ pub struct FeatureFlags {
     /// One `gemv_bf16_xf32_x4_rows_exact` launch for the MTP fc_hidden branch rows of all lanes
     /// (`HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH`). Default on for exact gfx1201 (`=0` kills it).
     pub qwen4_mtp_fc_one_launch: bool,
+    /// Lane-wide PLE projection (`HIPFIRE_QWEN4_LANE_PLE_PROJECT`). Default on for exact gfx1201
+    /// (`=0` kills it).
+    pub qwen4_lane_ple_project: bool,
     /// OCP E4M3 HC mixer sidecar (`HIPFIRE_QWEN4_HC8`): the load applies the `<model>.hc8`
     /// sidecar (per-row power-of-two scaled E4M3 HC down / up weights, dtype
     /// `DType::HC8E4M3Row`) and decode reads it through the PeaceMaker `hc8_gemm` kernel.
@@ -1199,6 +1202,7 @@ impl FeatureFlags {
             qwen4_hc_k4_allrows: parse_bool("HIPFIRE_QWEN4_HC_K4_ALLROWS").unwrap_or(true),
             qwen4_lane_wmma: parse_bool("HIPFIRE_QWEN4_LANE_WMMA").unwrap_or(true),
             qwen4_mtp_fc_one_launch: parse_bool("HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH").unwrap_or(true),
+            qwen4_lane_ple_project: parse_bool("HIPFIRE_QWEN4_LANE_PLE_PROJECT").unwrap_or(true),
             qwen4_hc8: parse_bool("HIPFIRE_QWEN4_HC8").unwrap_or(true),
             ep_ar_fast_apply: parse_bool("HIPFIRE_EP_AR_FAST_APPLY").unwrap_or(true),
             ep_ar_wide_grid: parse_bool("HIPFIRE_EP_AR_WIDE_GRID").unwrap_or(true),
@@ -2020,6 +2024,12 @@ impl FeatureFlags {
         self.qwen4_mtp_fc_one_launch && self.arch == "gfx1201"
     }
 
+    /// Lane-wide PLE projection (`HIPFIRE_QWEN4_LANE_PLE_PROJECT`, default on, `=0` kills it).
+    /// Exact gfx1201 only.
+    pub fn qwen4_lane_ple_project_enabled(&self) -> bool {
+        self.qwen4_lane_ple_project && self.arch == "gfx1201"
+    }
+
     /// E4M3 HC mixer sidecar (`HIPFIRE_QWEN4_HC8`, default on, `=0` kills it). Exact gfx1201
     /// only: the PeaceMaker `hc8_wmma_pm_gfx1201` module has no other target.
     pub fn qwen4_hc8_enabled(&self) -> bool {
@@ -2225,6 +2235,7 @@ impl FeatureFlags {
             qwen4_hc_k4_allrows: false,
             qwen4_lane_wmma: false,
             qwen4_mtp_fc_one_launch: false,
+            qwen4_lane_ple_project: false,
             qwen4_hc8: false,
             ep_ar_fast_apply: false,
             ep_ar_wide_grid: false,
@@ -3695,35 +3706,48 @@ mod tests {
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_lane_wmma_enabled());
     }
 
-    /// The MTP one-launch fc_hidden flag is default on (`=0` kills) and reaches exact gfx1201
-    /// only.
+    /// The MTP one-launch fc_hidden and lane PLE project flags are default on (`=0` kills) and
+    /// reach exact gfx1201 only.
     #[test]
-    fn qwen4_mtp_fc_flag_default_on_exact_gfx1201() {
+    fn qwen4_mtp_fc_and_lane_ple_flags_default_on_exact_gfx1201() {
         for arch in [
             "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
         ] {
-            let name = "HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH";
-            let with = |value: &'static str| {
-                move |n: &str| -> std::result::Result<String, ()> {
-                    if n == name {
-                        Ok(value.into())
-                    } else {
-                        Err(())
+            for name in [
+                "HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH",
+                "HIPFIRE_QWEN4_LANE_PLE_PROJECT",
+            ] {
+                let with = |value: &'static str| {
+                    move |n: &str| -> std::result::Result<String, ()> {
+                        if n == name {
+                            Ok(value.into())
+                        } else {
+                            Err(())
+                        }
                     }
-                }
-            };
-            let get = |f: &FeatureFlags| f.qwen4_mtp_fc_one_launch_enabled();
-            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
-            assert_eq!(get(&unset), arch == "gfx1201", "{name} {arch}: unset");
-            assert!(!get(&FeatureFlags::from_lookup(arch, with("0"))), "{name} {arch}: 0");
-            assert_eq!(
-                get(&FeatureFlags::from_lookup(arch, with("1"))),
-                arch == "gfx1201",
-                "{name} {arch}: 1"
-            );
+                };
+                let get = |f: &FeatureFlags| {
+                    if name == "HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH" {
+                        f.qwen4_mtp_fc_one_launch_enabled()
+                    } else {
+                        f.qwen4_lane_ple_project_enabled()
+                    }
+                };
+                let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+                assert_eq!(get(&unset), arch == "gfx1201", "{name} {arch}: unset");
+                assert!(
+                    !get(&FeatureFlags::from_lookup(arch, with("0"))),
+                    "{name} {arch}: 0"
+                );
+                assert_eq!(
+                    get(&FeatureFlags::from_lookup(arch, with("1"))),
+                    arch == "gfx1201",
+                    "{name} {arch}: 1"
+                );
+            }
         }
         let t = FeatureFlags::for_test("gfx1201");
-        assert!(!t.qwen4_mtp_fc_one_launch_enabled());
+        assert!(!t.qwen4_mtp_fc_one_launch_enabled() && !t.qwen4_lane_ple_project_enabled());
     }
 
     /// The HC8 sidecar route is default on (`=0` kills) and reaches exact gfx1201 only.

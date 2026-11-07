@@ -484,6 +484,11 @@ struct StageFacts {
     output: bool,
     embedding: Bound,
     ple_rows: StagedRows,
+    /// The input band's PLE key / value projection weight dtypes, resolved via
+    /// `weights.resident` like the other sources. `None` = the stage does not
+    /// exist (model has no PLE); a `None` dtype = the weight did not resolve
+    /// (Unclassified).
+    ple_project: Option<[Bound; 2]>,
     /// Whole-band expert class ([`lane_expert_route`]); only the MoE stage
     /// falls back to it.
     experts: LaneExpertRoute,
@@ -662,6 +667,23 @@ fn gather_stage_facts(bundle: &Qwen4Bundle) -> StageFacts {
         })
         .collect();
     let root = &weights.root;
+    // The lane forward projects PLE through the first PLE layer's key/value
+    // weights; a model without PLE has no such stage.
+    let ple_project = if scope.input && config.ple.is_some() {
+        let ple = config
+            .ple_layer_ids
+            .first()
+            .and_then(|id| id.checked_sub(1))
+            .filter(|&layer| layer < config.num_hidden_layers)
+            .and_then(|layer| weights.layer(layer))
+            .and_then(|layer| layer.ple.as_ref());
+        Some(match ple {
+            Some(ple) => [source(&ple.key), source(&ple.value)],
+            None => [None, None],
+        })
+    } else {
+        None
+    };
     StageFacts {
         topology,
         input: scope.input,
@@ -675,6 +697,7 @@ fn gather_stage_facts(bundle: &Qwen4Bundle) -> StageFacts {
             (None, Some(_)) => StagedRows::Unresolved,
             (None, None) => StagedRows::Absent,
         },
+        ple_project,
         experts,
         layers,
         final_hyper: HyperFacts {
@@ -774,6 +797,13 @@ fn derive_stage_routes(arch: &str, facts: &StageFacts) -> LaneStageRoutes {
             StagedRows::Known(dtype) => {
                 add_route(&mut routes, StageName::PleRows, StageRoute::PleRows(dtype))
             }
+        }
+        if let Some(dtypes) = facts.ple_project {
+            add_route(
+                &mut routes,
+                StageName::PleProject,
+                all_bound(dtypes).map_or(StageRoute::Unclassified, StageRoute::PleProject),
+            );
         }
     }
     for layer in &facts.layers {
@@ -3913,6 +3943,7 @@ mod tests {
             output: true,
             embedding: Some(DType::Q8_0),
             ple_rows: StagedRows::Known(DType::BF16),
+            ple_project: Some([Some(DType::BF16), Some(DType::BF16)]),
             experts: LaneExpertRoute::ResidentPacked,
             layers: vec![
                 layer_facts(gdn(), moe_ffn(qts())),
@@ -3939,6 +3970,10 @@ mod tests {
             vec![StageRoute::Embed(DType::Q8_0)]
         );
         assert_eq!(stage(StageName::PleRows), vec![StageRoute::PleRows(bf16)]);
+        assert_eq!(
+            stage(StageName::PleProject),
+            vec![StageRoute::PleProject([bf16; 2])]
+        );
         assert_eq!(
             stage(StageName::HcRead),
             vec![StageRoute::HyperRead([bf16; 3])]
@@ -4070,6 +4105,12 @@ mod tests {
                 StageName::HcWrite,
                 Box::new(|facts: &mut StageFacts| facts.layers[1].mlp_inject = None),
             ),
+            (
+                StageName::PleProject,
+                Box::new(|facts: &mut StageFacts| {
+                    facts.ple_project = Some([Some(DType::BF16), None])
+                }),
+            ),
         ];
         for (stage, mutate) in cases {
             let mut facts = stage_facts();
@@ -4117,6 +4158,7 @@ mod tests {
         for name in [
             StageName::Embed,
             StageName::PleRows,
+            StageName::PleProject,
             StageName::QsaInProj,
             StageName::QsaOutProj,
             StageName::FinalHyper,
@@ -4140,6 +4182,13 @@ mod tests {
         );
         facts.ple_rows = StagedRows::Absent;
         assert!(derive_stage_routes(ARCH, &facts)[StageName::PleRows.index()].is_empty());
+        facts.ple_project = None;
+        assert!(derive_stage_routes(ARCH, &facts)[StageName::PleProject.index()].is_empty());
+        facts.ple_project = Some([None, Some(DType::BF16)]);
+        assert_eq!(
+            derive_stage_routes(ARCH, &facts)[StageName::PleProject.index()],
+            vec![StageRoute::Unclassified]
+        );
     }
 
     #[test]
@@ -4151,6 +4200,7 @@ mod tests {
         for name in [
             StageName::Embed,
             StageName::PleRows,
+            StageName::PleProject,
             StageName::FinalHyper,
             StageName::Head,
             StageName::Argmax,

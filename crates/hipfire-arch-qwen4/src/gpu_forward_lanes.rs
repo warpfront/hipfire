@@ -44,6 +44,14 @@
 //! group's ops), so every lane sees the singleton's operation sequence, and
 //! the step interpreter's fusions apply exactly where the singleton's do.
 //!
+//! The PLE convolution splits the same way: its stateless key / value projections are the
+//! row-local stage [`StageName::PleProject`] (under `HIPFIRE_QWEN4_LANE_PLE_PROJECT`, exact
+//! gfx1201, BF16 weights and a total row count one row-exact launch covers: ONE
+//! `gemv_bf16_xf32_x4_rows_exact` launch each over every lane's rows, written in place into
+//! the lanes' own key / value slices), and only the gate / norm / convolution tail
+//! ([`StageName::PleConv`], `GroupedDepthwiseOp::projected`) runs per lane on the lane's own
+//! convolution state.
+//!
 //! Lane steps run eager HIP (no retained tape) and never touch the resident
 //! `bundle.state` / `bundle.mtp`; QSA arenas must already cover the step
 //! (mapping happens in the executor's `provision_step`, never here).
@@ -120,7 +128,7 @@ use hipfire_dispatch::pipeline::{
     execute_embedding, execute_validated_steps, execute_validated_steps_with_moe_hooks,
     validate_steps, ClearOp, EmbeddingOp, GatedDeltaNetOp, GroupedDepthwiseOp, HyperReadOp,
     HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, MixerPhase,
-    MoeStepHooks, Step,
+    MoeStepHooks, ProjectLadder, ProjectOp, Step,
 };
 use hipfire_runtime::external_rows::RowFetch;
 use rdna_compute::prefill_invariant::QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP;
@@ -160,10 +168,16 @@ pub enum StageName {
     Head,
     /// Greedy top-1.
     Argmax,
+    /// PLE key / value projections of every lane's rows, once per step
+    /// (stateless: the grouped gate / norm / convolution tail that consumes
+    /// them is [`StageName::PleConv`], per lane). Placed on its own all-rows
+    /// segment when the BF16 projections run one row-exact launch over every row
+    /// (`HIPFIRE_QWEN4_LANE_PLE_PROJECT`).
+    PleProject,
 }
 
 impl StageName {
-    pub const ALL: [StageName; 15] = [
+    pub const ALL: [StageName; 16] = [
         StageName::Embed,
         StageName::PleRows,
         StageName::HcRead,
@@ -179,6 +193,7 @@ impl StageName {
         StageName::FinalHyper,
         StageName::Head,
         StageName::Argmax,
+        StageName::PleProject,
     ];
 
     pub fn key(self) -> &'static str {
@@ -198,6 +213,7 @@ impl StageName {
             StageName::FinalHyper => "final_hyper",
             StageName::Head => "head",
             StageName::Argmax => "argmax",
+            StageName::PleProject => "ple_project",
         }
     }
 
@@ -270,7 +286,7 @@ pub const LANE_MAX_ROWS: usize = 8;
 /// and argmax — produced the per-lane bytes once over all rows; the stateful
 /// cores stay per lane. S0's chunk-vs-singles mismatch therefore lives in the
 /// multi-row GDN/QSA cores of consecutive positions, which a lane never runs.
-pub const STAGE_SHARE: [(StageName, StageShare); 15] = [
+pub const STAGE_SHARE: [(StageName, StageShare); 16] = [
     (StageName::Embed, StageShare::OnceAllRows),
     (StageName::PleRows, StageShare::OnceAllRows),
     (StageName::HcRead, StageShare::OnceAllRows),
@@ -286,6 +302,7 @@ pub const STAGE_SHARE: [(StageName, StageShare); 15] = [
     (StageName::FinalHyper, StageShare::OnceAllRows),
     (StageName::Head, StageShare::OnceAllRows),
     (StageName::Argmax, StageShare::OnceAllRows),
+    (StageName::PleProject, StageShare::OnceAllRows),
 ];
 
 /// G0 oracle receipt behind [`STAGE_SHARE`] (`fn-batch/S3-RESULT.md`): each
@@ -358,6 +375,16 @@ pub const GFX1201_Q8_TRUNK_ROWS_RECEIPT: &str =
 pub const GFX1201_HC8_ROWS_RECEIPT: &str =
     "g0 hc8/proof/oracle1 j8251 2026-11-06 gfx1201 hc8 e4m3 hc read rows1-64";
 
+/// Byte-oracle receipt behind the gfx1201 PLE key / value projection row-twin proofs
+/// (`PleProject([BF16, BF16])`; PP and EP domains): the lane-wide projection is ONE
+/// `gemv_bf16_xf32_x4_rows_exact` launch over every lane's rows (all-rows arm above eight
+/// rows), each output word bitwise the per-lane incumbent's (CHANGELOG.md:224, the allrows
+/// header): `bf16_allrows_oracle --reread` on the real layer-1 key / value weights, lanes
+/// 2 / 4 / 8 x 2 / 6 rows, incumbent per-lane chunks and the one launch both 0 mismatching
+/// words against the per-row singleton.
+pub const GFX1201_PLE_PROJECT_RECEIPT: &str =
+    "g0 reread/runs/oracle1 j8313 2026-11-06 gfx1201 bf16 ple key/value lanes2-8 rows4-48";
+
 /// Device topology a lane step runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LaneTopology {
@@ -406,6 +433,8 @@ pub enum StageRoute {
     Unclassified,
     Embed(DType),
     PleRows(DType),
+    /// PLE key / value projection weight dtypes, in that order.
+    PleProject([DType; 2]),
     /// Hyper-connection read operand dtypes.
     HyperRead([DType; 3]),
     HyperWrite(DType),
@@ -424,7 +453,7 @@ pub enum StageRoute {
 }
 
 /// The route instances a lane owns, indexed by [`StageName::index`].
-pub type LaneStageRoutes = [Vec<StageRoute>; 15];
+pub type LaneStageRoutes = [Vec<StageRoute>; 16];
 
 /// One G0 row-twin proof: on `arch`, over every topology of `domain`, a
 /// shared launch of `stage` over instances of `route` was byte-identical to
@@ -798,6 +827,20 @@ pub static LANE_ROW_TWIN_PROOFS: &[RowTwinProof] = &[
         LANE_EP_ONLY,
         GFX1201_EP2_MQ4_RECEIPT,
     ),
+    proof(
+        "gfx1201",
+        StageName::PleProject,
+        StageRoute::PleProject([DType::BF16; 2]),
+        LANE_PP_ONLY,
+        GFX1201_PLE_PROJECT_RECEIPT,
+    ),
+    proof(
+        "gfx1201",
+        StageName::PleProject,
+        StageRoute::PleProject([DType::BF16; 2]),
+        LANE_EP_ONLY,
+        GFX1201_PLE_PROJECT_RECEIPT,
+    ),
 ];
 
 /// A resolved lane policy: the policy, the receipts of the proofs behind
@@ -900,7 +943,7 @@ fn resolve_with_proofs(
 /// One share per [`StageName`], indexed in [`StageName::ALL`] order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LaneStagePolicy {
-    shares: [StageShare; 15],
+    shares: [StageShare; 16],
 }
 
 impl LaneStagePolicy {
@@ -917,7 +960,7 @@ impl LaneStagePolicy {
     /// The G0-evidenced share table: every row-local stage shared. It is not
     /// route-bound; [`Self::for_bound_routes`] resolves it per stage.
     pub fn production() -> Self {
-        let mut shares = [StageShare::PerLane; 15];
+        let mut shares = [StageShare::PerLane; 16];
         for (stage, share) in STAGE_SHARE {
             shares[stage.index()] = share;
         }
@@ -926,7 +969,7 @@ impl LaneStagePolicy {
 
     pub fn all_per_lane() -> Self {
         Self {
-            shares: [StageShare::PerLane; 15],
+            shares: [StageShare::PerLane; 16],
         }
     }
 
@@ -1571,6 +1614,9 @@ enum Placement {
     /// The routed MoE as one call over every row: the segment after the all-rows one (the
     /// same rows, bound to the descriptions of `n` rows the wide-group MoE binds).
     AllRowsMoe,
+    /// The PLE key / value projections over every row of the step: the PLE project segment
+    /// (rows `[0, n)`), or the groups when the step has none.
+    PleProject,
 }
 
 /// Split one run of consecutive once-over-all-rows operations into pieces of
@@ -1584,6 +1630,7 @@ fn run_pieces(
     all_rows: Option<AllRowsPlan>,
 ) -> Vec<(std::ops::Range<usize>, Placement)> {
     let place = |op: LaneOp, stage: StageName| match (op, all_rows) {
+        (LaneOp::PleProject, _) => Placement::PleProject,
         (_, None) => Placement::Groups,
         (LaneOp::HcRead { .. }, Some(_)) => Placement::AllRows,
         (LaneOp::HcWrite { mlp, .. }, Some(plan)) if plan.hc_writes[usize::from(mlp)] => {
@@ -1611,7 +1658,8 @@ fn run_pieces(
 /// starts at program index `start`, `segs` are the segments its share places
 /// it over (every group, or every lane), `all_rows` is `Some((all-rows segment,
 /// plan))` for a once-over-all-rows run of an all-rows step (the MoE all-rows segment, when
-/// the plan has one, is `all-rows segment + 1`). Every piece is emitted
+/// the plan has one, is `all-rows segment + 1`), `ple_seg` the PLE project segment (every
+/// row of the step) when the step projects PLE once. Every piece is emitted
 /// segment-major over its own segments, pieces in order; without `all_rows` that is the
 /// whole run over `segs` (today's emission).
 fn run_items(
@@ -1619,6 +1667,7 @@ fn run_items(
     run: &[(LaneOp, StageName)],
     segs: std::ops::Range<usize>,
     all_rows: Option<(usize, AllRowsPlan)>,
+    ple_seg: Option<usize>,
 ) -> Vec<(usize, std::ops::Range<usize>)> {
     let mut items = Vec::new();
     for (piece, placement) in run_pieces(run, all_rows.map(|(_, plan)| plan)) {
@@ -1626,6 +1675,10 @@ fn run_items(
         match (placement, all_rows) {
             (Placement::AllRows, Some((seg, _))) => items.push((seg, ops)),
             (Placement::AllRowsMoe, Some((seg, _))) => items.push((seg + 1, ops)),
+            (Placement::PleProject, _) => match ple_seg {
+                Some(seg) => items.push((seg, ops)),
+                None => items.extend(segs.clone().map(|i| (i, ops.clone()))),
+            },
             _ => items.extend(segs.clone().map(|i| (i, ops.clone()))),
         }
     }
@@ -1931,6 +1984,9 @@ enum LaneOp {
         layer: usize,
         mlp: bool,
     },
+    /// Every lane's PLE key / value projections in one row-exact launch each, ahead of the
+    /// per-lane [`LaneOp::PleConv`] tails that consume their rows (see [`with_ple_project`]).
+    PleProject,
     PleConv,
     Gdn {
         layer: usize,
@@ -2038,6 +2094,17 @@ fn layer_program(
         policy,
         ple_layer,
     ))
+}
+
+/// Split the PLE conv's key / value projections out of a lane program: a
+/// [`LaneOp::PleProject`] ([`StageName::PleProject`], once over every row) goes right before
+/// the program's [`LaneOp::PleConv`], which then runs only its per-lane gate / norm /
+/// convolution tail (`GroupedDepthwiseOp::projected`) on the rows it projected. A program
+/// without the PLE layer (a band that is not the input band) is unchanged.
+fn with_ple_project(program: &mut Vec<(LaneOp, StageName)>) {
+    if let Some(at) = program.iter().position(|&(op, _)| op == LaneOp::PleConv) {
+        program.insert(at, (LaneOp::PleProject, StageName::PleProject));
+    }
 }
 
 /// QSA lengths a lane's state commits after the step (the singleton's
@@ -2705,6 +2772,32 @@ fn forward_lanes_scoped(
         });
         seg_desc_rows.push(n);
     }
+    // `HIPFIRE_QWEN4_LANE_PLE_PROJECT` (default on, exact gfx1201): the PLE key / value
+    // projections of every lane run ONCE over all `n` rows, on their own all-rows segment (the
+    // lane-wide `PleProject` stage), instead of once per lane. The PLE rows and the key / value
+    // scratch are laid out row after row in lane order (`SegViews`: dedicated fields address
+    // row `begin` at `begin * width`, the compact PLE arena members at a pitch equal to their
+    // width), so a projection over rows `[0, n)` writes every lane's own slice in place and each
+    // lane's tail reads it through its own views. Taken for 2+ lanes of a decode step whose `n`
+    // rows run ONE row-exact BF16 launch (`Gpu::bf16_rows_exact_one_launch`) under a policy that
+    // shares the stage; the weights' dtype and the 1-row-lane PLE batch are checked where the
+    // weights are known (`ple_project`).
+    let ple_seg: Option<usize> = (band_scope.input
+        && !prefill
+        && lanes.len() >= 2
+        && policy.share(StageName::PleProject) == StageShare::OnceAllRows
+        && gpu.flags.qwen4_lane_ple_project_enabled()
+        && (2..=rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS).contains(&n)
+        && gpu.bf16_rows_exact_one_launch(n))
+    .then(|| {
+        all_segs.push(Segment {
+            begin: 0,
+            rows: n,
+            first_lane: 0,
+        });
+        seg_desc_rows.push(seg_desc_rows[lane_segs.len()]);
+        all_segs.len() - 1
+    });
 
     // Token ids: one upload for every row, in lane order (the input band
     // embeds them; every other band runs from received HC streams). Outside a
@@ -3020,7 +3113,7 @@ fn forward_lanes_scoped(
             DispatchCtx::new(gpu)
         };
         let band_first = band_scope.band.start;
-        let program = layer_program(bundle, policy, band_scope.input.then_some(ple_layer))?;
+        let mut program = layer_program(bundle, policy, band_scope.input.then_some(ple_layer))?;
         // `HIPFIRE_QWEN4_LANE_PLE_BATCH` (exact gfx1201, default off): AR lane
         // steps of one row per lane run the PLE chain of up to
         // `PLE_LANES_MAX` consecutive lanes as ONE op (key / value projections
@@ -3099,6 +3192,20 @@ fn forward_lanes_scoped(
                 )
             })
             .collect::<Result<_, _>>()?;
+        // The lane-wide PLE projection (`ple_seg`) runs when the weights are the BF16 pair the
+        // row-exact one-launch route covers and the 1-row-lane PLE batch took no chunk (it
+        // already runs one projection over its chunk); the program then carries `PleProject`
+        // ahead of the per-lane tails, which skip their own projections. Anything else keeps
+        // today's per-lane chain.
+        let ple_project = ple_seg.is_some()
+            && ple_chunks.is_empty()
+            && !ple_rows_f16
+            && ple_w.as_ref().is_some_and(|ple_w| {
+                ple_w.key.dtype == DType::BF16 && ple_w.value.dtype == DType::BF16
+            });
+        if ple_project {
+            with_ple_project(&mut program);
+        }
         let mut steps: Vec<Step<'_>> = Vec::with_capacity(program.len() * lanes.len() * 2);
         let mut qsa_commits: Vec<QsaCommit> = Vec::new();
         let mut ple_split: Option<usize> = None;
@@ -3133,6 +3240,7 @@ fn forward_lanes_scoped(
                 &program[start..end],
                 segs_for(share),
                 all_rows_plan.filter(|_| share == StageShare::OnceAllRows),
+                ple_seg.filter(|_| ple_project),
             );
             for (i, ops) in items {
                 let (seg, v) = (&all_segs[i], &views[i]);
@@ -3224,6 +3332,31 @@ fn forward_lanes_scoped(
                                 hidden: config.hidden_size,
                             }));
                         }
+                        LaneOp::PleProject => {
+                            let ple_w = ple_w
+                                .as_ref()
+                                .ok_or_else(|| invalid("PLE weights missing"))?;
+                            if ple_split.is_none() {
+                                ple_split = Some(steps.len());
+                            }
+                            // Key then value, each ONE row-exact launch over this segment's
+                            // rows (`ProjectLadder::TrunkRowExact`: every output row is
+                            // bitwise the per-lane projection's); the PLE rows are converted
+                            // at the split, before these steps run.
+                            for (weight, output) in
+                                [(ple_w.key, &v.ple_key), (ple_w.value, &v.ple_value)]
+                            {
+                                steps.push(Step::Project(ProjectOp {
+                                    weight,
+                                    input: &v.ple_rows,
+                                    output,
+                                    rows: r,
+                                    rotation: Some(&scratch.rotation),
+                                    ladder: ProjectLadder::TrunkRowExact,
+                                    residual: None,
+                                }));
+                            }
+                        }
                         LaneOp::PleConv => {
                             let ple_w = ple_w
                                 .as_ref()
@@ -3268,6 +3401,7 @@ fn forward_lanes_scoped(
                                         dilation: config.ple_conv_dilation(),
                                         epsilon: EPSILON,
                                         lane_states: chunk.as_slice(),
+                                        projected: false,
                                     }));
                                 }
                             } else {
@@ -3302,6 +3436,7 @@ fn forward_lanes_scoped(
                                     dilation: config.ple_conv_dilation(),
                                     epsilon: EPSILON,
                                     lane_states: &[],
+                                    projected: ple_project,
                                 }));
                             }
                         }
@@ -4288,13 +4423,18 @@ mod tests {
     #[test]
     fn row_twin_table_has_one_row_per_shared_stage_arch_and_domain() {
         let shared = shared_stages();
-        assert_eq!(shared.len(), 12);
+        assert_eq!(shared.len(), 13);
         // gfx1151: one all-topology row per shared stage. gfx1201: one PP row
         // and one EP row per shared stage, plus the second PP MoE row (the
         // mq3 slab class), the two EP Q8F16 QSA overlay rows (qsa_in x4,
         // qsa_out) and the three EP Q8F16 trunk rows (gdn_in x4, gdn_out,
         // head), and the two EP HC8 rows (hc_read, final_hyper).
-        assert_eq!(LANE_ROW_TWIN_PROOFS.len(), 3 * shared.len() + 1 + 2 + 3 + 2);
+        // `ple_project` (the lane-wide PLE key / value projection) has no gfx1151 row: its flag is
+        // exact-gfx1201-only, so gfx1151 carries one row per shared stage but that one.
+        assert_eq!(
+            LANE_ROW_TWIN_PROOFS.len(),
+            (shared.len() - 1) + 2 * shared.len() + 1 + 2 + 3 + 2
+        );
         for arch in ["gfx1151", "gfx1201"] {
             for stage in StageName::ALL {
                 for topology in ALL_TOPOLOGIES {
@@ -4307,7 +4447,7 @@ mod tests {
                         })
                         .collect();
                     let expected = match (arch, topology) {
-                        ("gfx1151", _) => shared.contains(&stage),
+                        ("gfx1151", _) => shared.contains(&stage) && stage != StageName::PleProject,
                         ("gfx1201", LaneTopology::Pp) => shared.contains(&stage),
                         ("gfx1201", LaneTopology::Ep) => shared.contains(&stage),
                         _ => false,
@@ -4359,6 +4499,12 @@ mod tests {
                                     )
                                 {
                                     assert_eq!(proof.receipt, GFX1201_PP2_MQ3_RECEIPT);
+                                } else if stage == StageName::PleProject {
+                                    assert_eq!(
+                                        proof.route,
+                                        StageRoute::PleProject([DType::BF16; 2])
+                                    );
+                                    assert_eq!(proof.receipt, GFX1201_PLE_PROJECT_RECEIPT);
                                 } else {
                                     assert_eq!(proof.receipt, GFX1201_PP2_MQ2_RECEIPT);
                                 }
@@ -4378,6 +4524,12 @@ mod tests {
                                             dense: [DType::BF16; 5],
                                             decode_admitted: true,
                                         }
+                                    );
+                                }
+                                if stage == StageName::PleProject {
+                                    assert_eq!(
+                                        proof.route,
+                                        StageRoute::PleProject([DType::BF16; 2])
                                     );
                                 }
                                 assert_eq!(proof.domain, [LaneTopology::Ep]);
@@ -4402,6 +4554,7 @@ mod tests {
                                     ]) | StageRoute::Projection(DType::Q8_0)
                                 );
                                 let want = match (q8_row, stage) {
+                                    (false, StageName::PleProject) => GFX1201_PLE_PROJECT_RECEIPT,
                                     (false, _) if hc8_row => GFX1201_HC8_ROWS_RECEIPT,
                                     (false, _) => GFX1201_EP2_MQ4_RECEIPT,
                                     (true, StageName::QsaInProj | StageName::QsaOutProj) => {
@@ -4420,6 +4573,7 @@ mod tests {
         assert!(GFX1201_EP2_MQ4_RECEIPT.contains("j1570"));
         assert!(GFX1201_EP2_MQ4_RECEIPT.contains("gfx1201 ep2 mq4-xts k1,2,4,8"));
         assert_ne!(GFX1201_EP2_MQ4_RECEIPT, GFX1201_PP2_MQ2_RECEIPT);
+        assert!(GFX1201_PLE_PROJECT_RECEIPT.contains("j8313"));
     }
 
     #[test]
@@ -4446,12 +4600,18 @@ mod tests {
                 (diverse.clone(), true),
             ] {
                 let resolution = LaneStagePolicy::for_bound_routes("gfx1151", topology, &routes);
+                // No gfx1151 row for the PLE project stage (exact-gfx1201 flag): the one stage
+                // that stays per lane there.
                 assert_eq!(
                     resolution.policy,
-                    LaneStagePolicy::production(),
+                    production_without(&[StageName::PleProject]),
                     "{topology:?}"
                 );
-                assert!(fallback_stages(&resolution).is_empty(), "{topology:?}");
+                assert_eq!(
+                    fallback_stages(&resolution),
+                    [StageName::PleProject],
+                    "{topology:?}"
+                );
                 assert_stateful_reasons(&resolution);
                 let expected: &[&str] = if populated {
                     &[GFX1151_LANE_RECEIPT]
@@ -4472,6 +4632,10 @@ mod tests {
         let mut table = table_routes("gfx1201", LaneTopology::Pp);
         assert_eq!(table[StageName::Moe.index()].len(), 2);
         table[StageName::Moe.index()].truncate(1);
+        // The PLE project route has its own test (`ple_project_is_shared_only_for_the_bf16_pair...`):
+        // this fixture carries the artifact header's other stages.
+        assert_eq!(table[StageName::PleProject.index()].len(), 1);
+        table[StageName::PleProject.index()].clear();
         assert_eq!(routes, table);
         assert!(matches!(
             routes[StageName::Moe.index()].as_slice(),
@@ -4497,6 +4661,101 @@ mod tests {
         assert_eq!(empty.policy, LaneStagePolicy::production());
         assert!(empty.receipts.is_empty());
         assert!(fallback_stages(&empty).is_empty());
+    }
+
+    /// The PLE key / value projections' route is the BF16 pair, on gfx1201 PP and EP only: a
+    /// differing, unclassified or foreign instance demotes only `ple_project`, the receipt is
+    /// the j8313 byte-oracle one and comes last, and Single / other arches have no row.
+    #[test]
+    fn ple_project_is_shared_only_for_the_bf16_pair_on_gfx1201_pp_and_ep() {
+        let bf16 = DType::BF16;
+        let pair = StageRoute::PleProject([bf16; 2]);
+        for (topology, base, receipt) in [
+            (LaneTopology::Pp, pp2_mq2_routes(), GFX1201_PP2_MQ2_RECEIPT),
+            (
+                LaneTopology::Ep,
+                ep_production_routes(),
+                GFX1201_EP2_MQ4_RECEIPT,
+            ),
+        ] {
+            let mut routes = base.clone();
+            routes[StageName::PleProject.index()] = vec![pair];
+            let resolution = LaneStagePolicy::for_bound_routes("gfx1201", topology, &routes);
+            assert_eq!(
+                resolution.policy,
+                LaneStagePolicy::production(),
+                "{topology:?}"
+            );
+            assert!(fallback_stages(&resolution).is_empty(), "{topology:?}");
+            assert_eq!(
+                resolution.receipts,
+                [receipt, GFX1201_PLE_PROJECT_RECEIPT],
+                "{topology:?}"
+            );
+            assert_stateful_reasons(&resolution);
+            for bad in [
+                StageRoute::PleProject([bf16, DType::F16]),
+                StageRoute::PleProject([DType::Q8_0; 2]),
+                StageRoute::Unclassified,
+                StageRoute::PleRows(bf16),
+            ] {
+                // One bad instance among proven ones refuses the stage.
+                let mut routes = base.clone();
+                routes[StageName::PleProject.index()] = vec![pair, bad];
+                let resolution = LaneStagePolicy::for_bound_routes("gfx1201", topology, &routes);
+                assert_eq!(
+                    fallback_stages(&resolution),
+                    [StageName::PleProject],
+                    "{topology:?} {bad:?}"
+                );
+                assert_eq!(
+                    resolution.policy,
+                    production_without(&[StageName::PleProject]),
+                    "{topology:?} {bad:?}"
+                );
+                assert!(!resolution.receipts.contains(&GFX1201_PLE_PROJECT_RECEIPT));
+                let reason = reason_of(&resolution, StageName::PleProject);
+                assert!(reason.contains("gfx1201"), "{reason}");
+                assert!(reason.contains(StageName::PleProject.key()), "{reason}");
+            }
+        }
+        // Single and every other arch have no PLE project row: per lane, nothing inherited.
+        let mut routes = pp2_mq2_routes();
+        routes[StageName::PleProject.index()] = vec![pair];
+        for (arch, topology) in [
+            ("gfx1201", LaneTopology::Single),
+            ("gfx1151", LaneTopology::Pp),
+            ("gfx1151", LaneTopology::Ep),
+            ("gfx1100", LaneTopology::Pp),
+        ] {
+            let resolution = LaneStagePolicy::for_bound_routes(arch, topology, &routes);
+            assert_eq!(
+                resolution.policy.share(StageName::PleProject),
+                StageShare::PerLane,
+                "{arch} {topology:?}"
+            );
+            assert!(
+                !resolution.receipts.contains(&GFX1201_PLE_PROJECT_RECEIPT),
+                "{arch} {topology:?}"
+            );
+        }
+        // The stage is stateless (only the conv tail is) and its key parses back.
+        assert!(!StageName::PleProject.stateful());
+        assert!(StageName::PleConv.stateful());
+        assert_eq!(
+            LaneStagePolicy::production().share(StageName::PleConv),
+            StageShare::PerLane
+        );
+        assert_eq!(
+            LaneStagePolicy::production().share(StageName::PleProject),
+            StageShare::OnceAllRows
+        );
+        assert_eq!(
+            LaneStagePolicy::parse("production:ple_project=lane")
+                .unwrap()
+                .share(StageName::PleProject),
+            StageShare::PerLane
+        );
     }
 
     #[test]
@@ -4696,7 +4955,8 @@ mod tests {
                 GFX1201_EP2_MQ4_RECEIPT,
                 GFX1201_HC8_ROWS_RECEIPT,
                 GFX1201_Q8_TRUNK_ROWS_RECEIPT,
-                GFX1201_Q8_QSA_ROWS_RECEIPT
+                GFX1201_Q8_QSA_ROWS_RECEIPT,
+                GFX1201_PLE_PROJECT_RECEIPT
             ]
         );
         let empty = LaneStagePolicy::for_bound_routes(
@@ -4935,7 +5195,10 @@ mod tests {
     fn gfx1201_ep_routes_equal_the_pp_routes_and_each_domain_binds_only_its_topology() {
         let pp = pp2_mq2_routes();
         let ep = ep_production_routes();
-        for stage in shared_stages().into_iter().filter(|s| *s != StageName::Moe) {
+        for stage in shared_stages()
+            .into_iter()
+            .filter(|s| *s != StageName::Moe && *s != StageName::PleProject)
+        {
             // EP reuses the PP row's typed route for every non-MoE stage; a
             // multi-instance EP stage repeats the PP signature.
             let pp_route = pp[stage.index()][0];
@@ -5810,7 +6073,7 @@ mod tests {
                                 assert!(scope.band.contains(&layer));
                                 *op
                             }
-                            LaneOp::PleConv => *op,
+                            LaneOp::PleConv | LaneOp::PleProject => *op,
                         };
                         covered.push((global, *stage));
                     }
@@ -5883,7 +6146,7 @@ mod tests {
             let hc = all_rows
                 .filter(|_| !per_lane)
                 .map(|plan| (lanes + groups, plan));
-            for (seg, ops) in run_items(start, &program[start..end], segs, hc) {
+            for (seg, ops) in run_items(start, &program[start..end], segs, hc, None) {
                 emitted.extend(program[ops].iter().map(|&(op, _)| (seg, op)));
             }
             start = end;
@@ -5922,6 +6185,116 @@ mod tests {
 
     fn is_hc(op: LaneOp) -> bool {
         matches!(op, LaneOp::HcRead { .. } | LaneOp::HcWrite { .. })
+    }
+
+    /// `PleProject` goes right before the program's `PleConv` and nowhere else; a band without
+    /// the PLE layer keeps its program.
+    #[test]
+    fn with_ple_project_precedes_the_ple_conv_and_leaves_other_programs_alone() {
+        let config = crate::config::compact_test_config();
+        let single = Qwen4BandScope::single(&config);
+        let ple_layer = ple_layer_of(&config);
+        for policy in test_policies() {
+            let base = lane_program(
+                band_kinds(&config, single.band.clone()),
+                &policy,
+                Some(ple_layer),
+            );
+            let mut with = base.clone();
+            with_ple_project(&mut with);
+            assert_eq!(with.len(), base.len() + 1);
+            let conv = with
+                .iter()
+                .position(|&(op, _)| op == LaneOp::PleConv)
+                .unwrap();
+            assert_eq!(with[conv - 1], (LaneOp::PleProject, StageName::PleProject));
+            let mut without = with.clone();
+            without.remove(conv - 1);
+            assert_eq!(without, base, "{}", policy.describe());
+            // No PLE layer (a band that is not the input band): unchanged.
+            let band = lane_program(band_kinds(&config, single.band.clone()), &policy, None);
+            let mut same = band.clone();
+            with_ple_project(&mut same);
+            assert_eq!(same, band);
+        }
+    }
+
+    /// The PLE project piece is ONE item on its own segment (every row of the step) right
+    /// before the per-lane conv tails (stage `ple_conv`, still one per lane, in lane order);
+    /// every other `(segment, op)` item is today's emission, with and without the all-rows HC
+    /// segment. Without a PLE segment the piece falls back to the groups.
+    #[test]
+    fn ple_project_is_one_item_on_its_own_segment_ahead_of_the_per_lane_conv_tails() {
+        let config = crate::config::compact_test_config();
+        let single = Qwen4BandScope::single(&config);
+        let ple_layer = ple_layer_of(&config);
+        let policy = LaneStagePolicy::production();
+        assert_eq!(policy.share(StageName::PleProject), StageShare::OnceAllRows);
+        assert_eq!(policy.share(StageName::PleConv), StageShare::PerLane);
+        let base = lane_program(
+            band_kinds(&config, single.band.clone()),
+            &policy,
+            Some(ple_layer),
+        );
+        let mut program = base.clone();
+        with_ple_project(&mut program);
+        for (lanes, groups) in [(2, 1), (8, 4), (8, 8)] {
+            for all_rows in [None, plan([true, true], false), plan([true, true], true)] {
+                // The PLE project segment is appended after the groups and the all-rows one.
+                let ple_seg = lanes + groups + usize::from(all_rows.is_some());
+                let mut emitted: Vec<(usize, LaneOp)> = Vec::new();
+                let mut start = 0;
+                while start < program.len() {
+                    let per_lane = policy.share(program[start].1).per_lane();
+                    let mut end = start + 1;
+                    while end < program.len() && policy.share(program[end].1).per_lane() == per_lane
+                    {
+                        end += 1;
+                    }
+                    let segs = if per_lane {
+                        0..lanes
+                    } else {
+                        lanes..lanes + groups
+                    };
+                    let hc = all_rows
+                        .filter(|_| !per_lane)
+                        .map(|plan| (lanes + groups, plan));
+                    for (seg, ops) in
+                        run_items(start, &program[start..end], segs, hc, Some(ple_seg))
+                    {
+                        emitted.extend(program[ops].iter().map(|&(op, _)| (seg, op)));
+                    }
+                    start = end;
+                }
+                let tag = format!(
+                    "lanes {lanes} groups {groups} all_rows {}",
+                    all_rows.is_some()
+                );
+                let projects: Vec<usize> = (0..emitted.len())
+                    .filter(|&i| emitted[i].1 == LaneOp::PleProject)
+                    .collect();
+                assert_eq!(projects.len(), 1, "{tag}");
+                assert_eq!(emitted[projects[0]].0, ple_seg, "{tag}");
+                let convs: Vec<usize> = (0..emitted.len())
+                    .filter(|&i| emitted[i].1 == LaneOp::PleConv)
+                    .collect();
+                assert_eq!(convs.len(), lanes, "{tag}");
+                for (lane, &at) in convs.iter().enumerate() {
+                    assert_eq!(emitted[at], (lane, LaneOp::PleConv), "{tag}");
+                    assert_eq!(at, projects[0] + 1 + lane, "{tag}");
+                }
+                let mut rest = emitted.clone();
+                rest.remove(projects[0]);
+                assert_eq!(
+                    rest,
+                    program_items(&base, &policy, lanes, groups, all_rows),
+                    "{tag}"
+                );
+            }
+        }
+        let run = [(LaneOp::PleProject, StageName::PleProject)];
+        assert_eq!(run_items(0, &run, 3..5, None, None), [(3, 0..1), (4, 0..1)]);
+        assert_eq!(run_items(0, &run, 3..5, None, Some(9)), [(9, 0..1)]);
     }
 
     #[test]
