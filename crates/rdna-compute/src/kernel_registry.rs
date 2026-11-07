@@ -791,6 +791,12 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         kernels::LANE_LEVIATHAN_SRC,
         ["lane_leviathan_verify"]
     );
+    // Vocab-shard argmax merge (`Gpu::argmax_f32_pair_merge`).
+    add!(
+        "argmax_pair_merge",
+        kernels::ARGMAX_PAIR_MERGE_SRC,
+        ["argmax_f32_pair_merge"]
+    );
     // Qwen4 logit-policy penalty prepass (AR greedy rows, sampled-MTP verify
     // rows; `Gpu::apply_penalty_table`).
     add!(
@@ -2987,6 +2993,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemv_q8_0_k8_rows_r8",
                 "quantize_bf16_q8_0",
                 "topk8_partial_f32",
+                "topk8_partial_f32_blocks",
                 "topk8_rescore_q8_0_k2560",
             ]
         );
@@ -11950,6 +11957,20 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // `HIPFIRE_QWEN4_EP_VOCAB_SHARD` (X1): the vocab-shard argmax merge.
+        const ARGMAX_PAIR_MERGE_ADDED_MODULES: [&str; 1] = ["argmax_pair_merge"];
+        for module in ARGMAX_PAIR_MERGE_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing vocab-shard argmax merge module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         // `HIPFIRE_QWEN4_MOE_DOWN_DNI` (default on, exact gfx1201, <=8 rows): the per-pick K=640 down kernel.
         const MOE_DOWN_DNI_ADDED_MODULES: [&str; 1] = ["gemv_mq4g128v2_moe_down_top10_dni"];
         for module in MOE_DOWN_DNI_ADDED_MODULES {
@@ -12050,6 +12071,7 @@ mod tests {
                 + MQ6_R8_PK_ADDED_MODULES.len()
                 + PMASK_IMPLICIT_ZERO_ADDED_MODULES.len()
                 + LANE_LEVIATHAN_ADDED_MODULES.len()
+                + ARGMAX_PAIR_MERGE_ADDED_MODULES.len()
                 + TRUNK_REDUCTION_PARTITION_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );

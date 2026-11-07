@@ -1995,6 +1995,7 @@ pub(crate) fn lane_sample_device(
                     logits: &r.logits,
                     rows: drafts.len() + 1,
                     vocab,
+                    base: 0,
                     drafts,
                     q: &[],
                     history: &[],

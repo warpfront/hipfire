@@ -563,7 +563,10 @@ pub struct PoolBody {
 /// at the same body pc. Template ids are those the single-template pools of the scan
 /// `artifact://98021` (observed on the prior `pmprereq/uniform` base, before the rebase onto
 /// the current beta with its new hc8 modules) reported: the gfx1201 ggml shim bodies moved
-/// from 33-48 to 55-70, templates 27 and 28 are unchanged. The next run on the rebased tree
+/// from 33-48 to 55-70, templates 27 and 28 are unchanged. X1 then added the committed
+/// `argmax_pair_merge_pm_gfx1201.co` and `.hxaco` (one template each, sorted before every
+/// hosted entry below), so every id below is the earlier one plus 2 (27-28 -> 29-30, 55-62 ->
+/// 57-64, 65-70 -> 67-72). The next run on the rebased tree
 /// may enumerate the templates differently; a changed id then fails as an unlisted body
 /// finding plus a stale entry here and is fixed by editing the `tid` only (body pc, insn and
 /// need are the same). Witnesses: `local://ledger-join-finding.md`. No entry is a proven
@@ -571,7 +574,7 @@ pub struct PoolBody {
 pub const POOL_BODY: &[PoolBody] = &[
     // pins row 2, W2
     PoolBody {
-        tid: 27,
+        tid: 29,
         target: "gated_delta_vector_pm_gfx1201.hxaco#gated_delta_net_vector_serial_f32_pm_gfx1201",
         body_pc: 367,
         category: Category::Candidate,
@@ -580,7 +583,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 1, W1; artifact://97452 pm_pool_28 pc 673
     PoolBody {
-        tid: 28,
+        tid: 30,
         target:
             "gated_delta_vector_pm_gfx1201.hxaco#causal_conv_depthwise_silu_rows_f32_pm_gfx1201",
         body_pc: 545,
@@ -590,7 +593,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 4
     PoolBody {
-        tid: 55,
+        tid: 57,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q4_k_f16_gfx1201",
         body_pc: 143,
         category: Category::ModelLimit,
@@ -599,7 +602,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 6; artifact://97452 pm_pool_34 pc 271
     PoolBody {
-        tid: 56,
+        tid: 58,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q5_k_f16_gfx1201",
         body_pc: 143,
         category: Category::ModelLimit,
@@ -608,7 +611,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 8, W4; artifact://97452 pm_pool_35 pc 323
     PoolBody {
-        tid: 57,
+        tid: 59,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q6_k_f16_gfx1201",
         body_pc: 195,
         category: Category::Candidate,
@@ -617,7 +620,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 3, W3
     PoolBody {
-        tid: 58,
+        tid: 60,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_iq4_xs_f32_gfx1201",
         body_pc: 252,
         category: Category::Candidate,
@@ -626,7 +629,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 5
     PoolBody {
-        tid: 59,
+        tid: 61,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q4_k_f32_gfx1201",
         body_pc: 152,
         category: Category::ModelLimit,
@@ -635,7 +638,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 7; artifact://97452 pm_pool_38 pc 280
     PoolBody {
-        tid: 60,
+        tid: 62,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q5_k_f32_gfx1201",
         body_pc: 152,
         category: Category::ModelLimit,
@@ -644,7 +647,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 9; artifact://97452 pm_pool_39 pc 289
     PoolBody {
-        tid: 61,
+        tid: 63,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q6_k_f32_gfx1201",
         body_pc: 161,
         category: Category::ModelLimit,
@@ -653,7 +656,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 10, W5; artifact://97452 pm_pool_40 pc 295
     PoolBody {
-        tid: 62,
+        tid: 64,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q8_0_f32_gfx1201",
         body_pc: 167,
         category: Category::Candidate,
@@ -662,7 +665,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 14
     PoolBody {
-        tid: 65,
+        tid: 67,
         target: "ggml_convert_shim_gfx1201.co#ggml_get_row_q4_k_f32_gfx1201",
         body_pc: 45,
         category: Category::ModelLimit,
@@ -671,7 +674,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 11
     PoolBody {
-        tid: 66,
+        tid: 68,
         target: "ggml_convert_shim_gfx1201.co#ggml_get_row1_q4_k_f32_gfx1201",
         body_pc: 38,
         category: Category::ModelLimit,
@@ -680,7 +683,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 15; artifact://97452 pm_pool_45 pc 173
     PoolBody {
-        tid: 67,
+        tid: 69,
         target: "ggml_convert_shim_gfx1201.co#ggml_get_row_q5_k_f32_gfx1201",
         body_pc: 45,
         category: Category::ModelLimit,
@@ -689,7 +692,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 12; artifact://97452 pm_pool_46 pc 166
     PoolBody {
-        tid: 68,
+        tid: 70,
         target: "ggml_convert_shim_gfx1201.co#ggml_get_row1_q5_k_f32_gfx1201",
         body_pc: 38,
         category: Category::ModelLimit,
@@ -698,7 +701,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 16; artifact://97452 pm_pool_47 pc 194
     PoolBody {
-        tid: 69,
+        tid: 71,
         target: "ggml_convert_shim_gfx1201.co#ggml_get_row_q6_k_f32_gfx1201",
         body_pc: 66,
         category: Category::ModelLimit,
@@ -707,7 +710,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 13; artifact://97452 pm_pool_48 pc 146
     PoolBody {
-        tid: 70,
+        tid: 72,
         target: "ggml_convert_shim_gfx1201.co#ggml_get_row1_q6_k_f32_gfx1201",
         body_pc: 18,
         category: Category::ModelLimit,

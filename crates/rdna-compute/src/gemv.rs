@@ -15,6 +15,10 @@ use std::sync::LazyLock;
 // selector-receipt: receipts/selectors/qwen4_lane_wmma_min_rows.json
 pub const LANE_WMMA_MIN_ROWS: usize = 16;
 
+/// Groups (partial blocks) of the draft-head top-8 reduction: `topk8_partial_f32` always
+/// runs 128 blocks of `ceil(n / 128)` layout rows, whichever launches produce them.
+pub const TOPK8_GROUPS: usize = 128;
+
 // The hybrid-buffer MoE gate/up kernel stays compiled but is never selected:
 // see `crate::gemm::miscompiled_optin_decision`.
 static GFX1151_GATE_UP_HYBRID_BUFFER: LazyLock<bool> = LazyLock::new(|| {
@@ -22376,26 +22380,8 @@ impl Gpu {
         partial: &GpuTensor,
         out: &GpuTensor,
     ) -> HipResult<()> {
-        const GROUPS: usize = 128;
-        let chunk = n.div_ceil(GROUPS);
-        let (module, src, rescore) = match head.dtype {
-            DType::Q8_0 => (
-                "qwen4_gemv_q8_0",
-                kernels::QWEN4_GEMV_Q8_0_SRC,
-                "topk8_rescore_q8_0_k2560",
-            ),
-            DType::MQ6G256V2 => (
-                "topk8_rescore_mq6g256v2",
-                kernels::TOPK8_RESCORE_MQ6G256V2_SRC,
-                "topk8_rescore_mq6g256v2_k2560",
-            ),
-            _ => {
-                return Err(hip_bridge::HipError::new(
-                    1,
-                    "topk8_rescore_k2560 head dtype",
-                ));
-            }
-        };
+        let chunk = n.div_ceil(TOPK8_GROUPS);
+        let (module, src, rescore) = Self::topk8_rescore_target(head)?;
         if chunk > 2048
             || partial.buf.size() < Self::TOPK8_PARTIAL_BYTES
             || out.buf.size() < Self::TOPK8_OUT_BYTES
@@ -22413,7 +22399,7 @@ impl Gpu {
         let v_ptr = logits.buf.as_ptr();
         let pv_ptr = partial.buf.as_ptr();
         let pi_ptr =
-            unsafe { (partial.buf.as_ptr() as *mut u8).add(GROUPS * 8 * 4) as *mut c_void };
+            unsafe { (partial.buf.as_ptr() as *mut u8).add(TOPK8_GROUPS * 8 * 4) as *mut c_void };
         let n_val = n as i32;
         let chunk_val = chunk as i32;
         let (front, special, tail) = (order.0 as i32, order.1 as i32, order.2 as i32);
@@ -22429,7 +22415,7 @@ impl Gpu {
         ];
         self.launch_maybe_blob(
             "topk8_partial_f32",
-            [GROUPS as u32, 1, 1],
+            [TOPK8_GROUPS as u32, 1, 1],
             [256, 1, 1],
             0,
             &mut params,
@@ -22446,7 +22432,146 @@ impl Gpu {
                 b
             },
         )?;
-        let m_val = (GROUPS * 8) as i32;
+        self.topk8_rescore_only(partial, head, x, out)
+    }
+
+    /// (module, source, entry) of the exact re-score kernel for `head`'s dtype.
+    fn topk8_rescore_target(
+        head: &GpuTensor,
+    ) -> HipResult<(&'static str, &'static str, &'static str)> {
+        match head.dtype {
+            DType::Q8_0 => Ok((
+                "qwen4_gemv_q8_0",
+                kernels::QWEN4_GEMV_Q8_0_SRC,
+                "topk8_rescore_q8_0_k2560",
+            )),
+            DType::MQ6G256V2 => Ok((
+                "topk8_rescore_mq6g256v2",
+                kernels::TOPK8_RESCORE_MQ6G256V2_SRC,
+                "topk8_rescore_mq6g256v2_k2560",
+            )),
+            _ => Err(hip_bridge::HipError::new(
+                1,
+                "topk8_rescore_k2560 head dtype",
+            )),
+        }
+    }
+
+    /// Blocks `block0 .. block0 + blocks` of [`Gpu::topk8_rescore_k2560`]'s 128-group
+    /// partial reduction: launches `topk8_partial_f32_blocks`, whose block `b` is group
+    /// `block0 + b` of the full launch (same `chunk = ceil(n / 128)`, same `begin`, same
+    /// pv/pi slot), so two launches covering `[0, 64)` and `[64, 128)` leave `partial`
+    /// byte-identical to one `topk8_partial_f32` of grid 128. `logits[0]` is layout row
+    /// `row0` (`0`: the whole ranked row; a vocabulary shard's packed half passes the layout
+    /// row its first logit is): only the rows of the launched groups,
+    /// `[block0 * chunk, min(n, (block0 + blocks) * chunk))`, are read, and they must lie inside
+    /// `[row0, row0 + logits.numel())`. `partial` is [`Gpu::TOPK8_PARTIAL_BYTES`] of scratch
+    /// laid out as the full launch's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn topk8_partial_blocks(
+        &mut self,
+        logits: &GpuTensor,
+        row0: usize,
+        n: usize,
+        order: (usize, usize, usize),
+        partial: &GpuTensor,
+        block0: usize,
+        blocks: usize,
+    ) -> HipResult<()> {
+        let chunk = n.div_ceil(TOPK8_GROUPS);
+        // Rows the launched groups read (empty when the groups lie past `n`).
+        let first_row = (block0 * chunk).min(n);
+        let end_row = ((block0 + blocks) * chunk).min(n);
+        if n == 0
+            || blocks == 0
+            || block0 + blocks > TOPK8_GROUPS
+            || chunk > 2048
+            || (end_row > first_row && (first_row < row0 || end_row > row0 + logits.numel()))
+            || partial.buf.size() < Self::TOPK8_PARTIAL_BYTES
+        {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "topk8_partial_blocks shape: n {n} block0 {block0} blocks {blocks} logits {} partial {}B",
+                    logits.numel(),
+                    partial.buf.size()
+                ),
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "qwen4_gemv_q8_0",
+            kernels::QWEN4_GEMV_Q8_0_SRC,
+            "topk8_partial_f32_blocks",
+        )?;
+        // The kernel indexes `v` from layout row 0; `logits[0]` is layout row `row0`, so the
+        // pointer is rebased by `row0` floats. Only the launched groups' rows are dereferenced,
+        // and those are validated above to lie inside the view.
+        let v_ptr = (logits.buf.as_ptr() as *mut u8).wrapping_sub(row0 * std::mem::size_of::<f32>())
+            as *mut c_void;
+        let pv_ptr = partial.buf.as_ptr();
+        let pi_ptr =
+            unsafe { (partial.buf.as_ptr() as *mut u8).add(TOPK8_GROUPS * 8 * 4) as *mut c_void };
+        let n_val = n as i32;
+        let chunk_val = chunk as i32;
+        let (front, special, tail) = (order.0 as i32, order.1 as i32, order.2 as i32);
+        let block0_val = block0 as i32;
+        let mut params = [
+            &v_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &chunk_val as *const _ as *mut c_void,
+            &pv_ptr as *const _ as *mut c_void,
+            &pi_ptr as *const _ as *mut c_void,
+            &front as *const _ as *mut c_void,
+            &special as *const _ as *mut c_void,
+            &tail as *const _ as *mut c_void,
+            &block0_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "topk8_partial_f32_blocks",
+            [blocks as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(v_ptr);
+                b.push_i32(n_val);
+                b.push_i32(chunk_val);
+                b.push_ptr(pv_ptr);
+                b.push_ptr(pi_ptr);
+                b.push_i32(front);
+                b.push_i32(special);
+                b.push_i32(tail);
+                b.push_i32(block0_val);
+                b
+            },
+        )
+    }
+
+    /// The exact re-score of [`Gpu::topk8_rescore_k2560`] over an already filled
+    /// `partial` (all 128 groups' pv/pi): one block of 256 scores the best 8 of the
+    /// 1,024 pairs against `head`'s rows and writes `out`.
+    pub fn topk8_rescore_only(
+        &mut self,
+        partial: &GpuTensor,
+        head: &GpuTensor,
+        x: &GpuTensor,
+        out: &GpuTensor,
+    ) -> HipResult<()> {
+        let (module, src, rescore) = Self::topk8_rescore_target(head)?;
+        if partial.buf.size() < Self::TOPK8_PARTIAL_BYTES
+            || out.buf.size() < Self::TOPK8_OUT_BYTES
+            || x.numel() < 2560
+        {
+            return Err(hip_bridge::HipError::new(1, "topk8_rescore_only shape"));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(module, src, rescore)?;
+        let pv_ptr = partial.buf.as_ptr();
+        let pi_ptr =
+            unsafe { (partial.buf.as_ptr() as *mut u8).add(TOPK8_GROUPS * 8 * 4) as *mut c_void };
+        let m_val = (TOPK8_GROUPS * 8) as i32;
         let a_ptr = head.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let o_ptr = out.buf.as_ptr();

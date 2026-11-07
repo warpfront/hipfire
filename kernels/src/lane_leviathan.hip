@@ -48,6 +48,22 @@
 // yields the top-G. A set beyond LDS capacity (massive exact ties) is reduced
 // tile by tile with the same keys, so the result never depends on order.
 // Logits are read only: no row is mutated.
+//
+// Vocab-sharded draws (X1, EP2 mesh): `mode` (kernarg) selects one of
+//   mode 0  today's kernel, whole row, byte for byte (cand ptrs null, LL_BASE 0).
+//   mode 1  SELECT: the row workgroup scans its row L[0..LL_VOCAB) as the shard
+//           [LL_BASE, LL_BASE + LL_VOCAB) of the full vocabulary (sort keys,
+//           scope and blocked lookups use global ids = index + LL_BASE; tokens
+//           outside the shard are skipped), then publishes g and the g sorted
+//           keys to its candidate row and returns (no p table, no ticket).
+//   mode 2  MERGED: the row workgroup skips the scan, merges the local and the
+//           peer candidate rows into s.cand[0..g), g = min(G, g0 + g1), and runs
+//           today's p table, ticket and lane verdict (llv_tail) unchanged.
+// Candidate row (LLV_CAND_WORDS u32 words, row = blockIdx.x of the launch):
+//   word 0 = g, word 1 = 0, words 2.. = 64 u64 sort keys (ascending = value
+//   descending, global id ascending; entries >= g are not written). The top-G of
+//   a union is the top-G of the union of each part's top-G under one total
+//   order, so the merged list equals the unsharded kernel's.
 // ---------------------------------------------------------------------------
 
 #define LLV_BLOCK 512
@@ -78,6 +94,7 @@
 #define LL_BLOCKED 14
 #define LL_NBLOCKED 15
 #define LL_OUT 16
+#define LL_BASE 17
 #define LLV_LANE_WORDS 20
 
 // Row record (u32 words).
@@ -109,6 +126,12 @@
 #define LO_RNG 4
 #define LO_TOKENS 8
 #define LLV_OUT_WORDS (8 + LLV_MAX_ROWS)
+
+// Candidate row (modes 1 and 2): g, 0, then LLV_G_MAX u64 sort keys.
+#define LLV_CAND_WORDS (2 + 2 * LLV_G_MAX)
+#define LLV_MODE_FULL 0
+#define LLV_MODE_SELECT 1
+#define LLV_MODE_MERGED 2
 
 static __device__ __forceinline__ unsigned llv_key(float v) {
     v = (v == 0.0f) ? 0.0f : v;
@@ -313,248 +336,57 @@ static __device__ unsigned llv_draw_residual(const unsigned* Pu, const float* P,
     return last;
 }
 
-extern "C" __global__ __launch_bounds__(LLV_BLOCK) void lane_leviathan_verify(
-    unsigned* __restrict__ region,  // [out | lanes | rows | inputs], u32 words
-    int lanes_off,                  // word offset of the lane records
-    int rows_off,                   // word offset of the row records
-    float* __restrict__ ptab        // [n_rows * LLV_P_WORDS]
-) {
-    __shared__ LlvShared s;
-    const int tid = (int)threadIdx.x;
-    const int row = (int)blockIdx.x;
-    const unsigned* R = region + rows_off + row * LLV_ROW_WORDS;
-    const int lane = (int)R[LR_LANE];
-    const unsigned* Ln = region + lanes_off + lane * LLV_LANE_WORDS;
-    const float* L = (const float*)(((unsigned long long)R[LR_PTR_HI] << 32) | (unsigned long long)R[LR_PTR_LO]);
-    const int vocab = (int)Ln[LL_VOCAB];
-    const float temp = __uint_as_float(Ln[LL_TEMP]);
-    const float top_p = __uint_as_float(Ln[LL_TOP_P]);
-    const int top_k_req = (int)Ln[LL_TOP_K];
-    const float min_p = __uint_as_float(Ln[LL_MIN_P]);
-    const float rep = __uint_as_float(Ln[LL_REP]);
-    const float pres = __uint_as_float(Ln[LL_PRES]);
-    const float freq = __uint_as_float(Ln[LL_FREQ]);
-    const int n_blocked = (int)Ln[LL_NBLOCKED];
-    const int pen_len = (int)R[LR_PEN_LEN];
-    const bool penalty = (rep > 1.0f || pres > 0.0f || freq > 0.0f) && pen_len > 0;
-    const int n_scope = penalty ? pen_len : 0;
-    const int G = (top_k_req <= 20) ? 20 : LLV_G_MAX;
-
-    // ---- Scope / blocked token table (sorted keys, penalized values). ----
-    // Scope key (tok << 32 | i), blocked key (tok << 32 | 0x80000000 | b): a token's
-    // scope occurrences sort before its blocked marks.
-    const int nk = n_scope + n_blocked;
+// Mode 1 tail: publish the sorted top-g of the shard (s.cand[0..g), synced).
+static __device__ void llv_store_cands(const LlvShared& s, unsigned long long* cand_local, int row, int g,
+                                       int tid) {
+    unsigned* w = (unsigned*)cand_local + (size_t)row * LLV_CAND_WORDS;
+    unsigned long long* keys = (unsigned long long*)(w + 2);
     if (tid == 0) {
-        s.ncand = 0;
-        s.nh = nk > 0 ? llv_pow2(nk) : 0;
-        s.last = 0;
+        w[0] = (unsigned)g;
+        w[1] = 0u;
     }
-    for (int t = tid; t < LLV_FILTER_BITS / 32; t += LLV_BLOCK) s.filter[t] = 0u;
-    __syncthreads();
-    if (nk > 0) {
-        const unsigned* scope = region + R[LR_PEN_OFF];
-        const unsigned* blocked = region + Ln[LL_BLOCKED];
-        const int n = s.nh;
-        for (int t = tid; t < n; t += LLV_BLOCK) {
-            unsigned long long k = 0xffffffffffffffffull;
-            if (t < n_scope) {
-                k = ((unsigned long long)scope[t] << 32) | (unsigned)t;
-            } else if (t < nk) {
-                k = ((unsigned long long)blocked[t - n_scope] << 32) | (0x80000000u | (unsigned)(t - n_scope));
-            }
-            s.hkey[t] = k;
-        }
-        __syncthreads();
-        llv_bitonic(s.hkey, n, tid);
-        const float window_len = (float)pen_len;
-        for (int p = tid; p < nk; p += LLV_BLOCK) {
-            unsigned long long key = s.hkey[p];
-            unsigned tok = (unsigned)(key >> 32);
-            s.hval[p] = 0.0f;
-            if (tok >= (unsigned)vocab) continue;
-            if (p + 1 < n && (unsigned)(s.hkey[p + 1] >> 32) == tok) continue;
-            unsigned long long first = (unsigned long long)tok << 32;
-            int lo = 0, hi = p;
-            while (lo < hi) {
-                int mid = (lo + hi) >> 1;
-                if (s.hkey[mid] < first) lo = mid + 1; else hi = mid;
-            }
-            int wcount = 0;
-            while (lo + wcount <= p && !((unsigned)s.hkey[lo + wcount] & 0x80000000u)) wcount++;
-            bool is_blocked = ((unsigned)key & 0x80000000u) != 0u;
-            float v = L[tok];
-            if (is_blocked) {
-                v = -INFINITY;
-            } else if (wcount > 0) {
-                int i = (int)(unsigned)s.hkey[lo + wcount - 1];
-                if (rep > 1.0f) {
-                    float recency = ((float)i + 1.0f) / window_len;
-                    float effective = powf(rep, (float)wcount * recency);
-                    if (effective > 1.5f) effective = 1.5f;
-                    v = (v > 0.0f) ? (v / effective) : (v * effective);
-                }
-                if (pres > 0.0f || freq > 0.0f) v -= freq * (float)wcount + pres;
-            }
-            s.hval[p] = v;
-            atomicOr(&s.filter[(tok >> 5) & (LLV_FILTER_BITS / 32 - 1)], 1u << (tok & 31));
-        }
-        __syncthreads();
-    }
-    const bool has_h = nk > 0;
+    for (int t = tid; t < g; t += LLV_BLOCK) keys[t] = s.cand[t];
+}
 
-    // ---- Pass 1: per-thread maximum over unpenalized tokens. ----
-    const bool vec = ((((unsigned long long)L) & 15ull) == 0ull);
-    const int n4 = vec ? (vocab >> 2) : 0;
-    const float4* L4 = (const float4*)L;
-    float m = -INFINITY;
-#define LLV_P1(v, ix)                                                              \
-    if ((v) > m) {                                                                 \
-        if (!has_h || llv_h_find(s, (unsigned)(ix)) < 0) m = (v);                  \
-    }
-    {
-        int i = tid;
-        for (; i + 3 * LLV_BLOCK < n4; i += 4 * LLV_BLOCK) {
-            float4 a = L4[i];
-            float4 b = L4[i + LLV_BLOCK];
-            float4 c = L4[i + 2 * LLV_BLOCK];
-            float4 d = L4[i + 3 * LLV_BLOCK];
-            int ia = i * 4, ib = (i + LLV_BLOCK) * 4, ic = (i + 2 * LLV_BLOCK) * 4, id = (i + 3 * LLV_BLOCK) * 4;
-            LLV_P1(a.x, ia) LLV_P1(a.y, ia + 1) LLV_P1(a.z, ia + 2) LLV_P1(a.w, ia + 3)
-            LLV_P1(b.x, ib) LLV_P1(b.y, ib + 1) LLV_P1(b.z, ib + 2) LLV_P1(b.w, ib + 3)
-            LLV_P1(c.x, ic) LLV_P1(c.y, ic + 1) LLV_P1(c.z, ic + 2) LLV_P1(c.w, ic + 3)
-            LLV_P1(d.x, id) LLV_P1(d.y, id + 1) LLV_P1(d.z, id + 2) LLV_P1(d.w, id + 3)
-        }
-        for (; i < n4; i += LLV_BLOCK) {
-            float4 a = L4[i];
-            int ia = i * 4;
-            LLV_P1(a.x, ia) LLV_P1(a.y, ia + 1) LLV_P1(a.z, ia + 2) LLV_P1(a.w, ia + 3)
-        }
-        for (int ix = n4 * 4 + tid; ix < vocab; ix += LLV_BLOCK) {
-            float v = L[ix];
-            LLV_P1(v, ix)
-        }
-    }
-#undef LLV_P1
-    // tau = G-th largest thread maximum.
-    s.cand[tid] = llv_sortkey(m, (unsigned)tid);
+// Mode 2 head: merge the two ascending candidate rows into s.cand[0..g) and
+// return g = min(G, g0 + g1). Keys are unique (distinct global ids), so a
+// key's merged position is its own index plus the count of the other list's
+// smaller keys. Ends synced.
+static __device__ int llv_merge_cands(LlvShared& s, const unsigned long long* cand_local,
+                                      const unsigned long long* cand_peer, int row, int G, int tid) {
+    const unsigned* w0 = (const unsigned*)cand_local + (size_t)row * LLV_CAND_WORDS;
+    const unsigned* w1 = (const unsigned*)cand_peer + (size_t)row * LLV_CAND_WORDS;
+    int g0 = (int)w0[0];
+    int g1 = (int)w1[0];
+    if (g0 > LLV_G_MAX) g0 = LLV_G_MAX;
+    if (g1 > LLV_G_MAX) g1 = LLV_G_MAX;
+    const unsigned long long* k0 = (const unsigned long long*)(w0 + 2);
+    const unsigned long long* k1 = (const unsigned long long*)(w1 + 2);
+    // Stage both lists in LDS (hkey is free in this mode): one parallel load round.
+    if (tid < g0) s.hkey[tid] = k0[tid];
+    if (tid < g1) s.hkey[LLV_G_MAX + tid] = k1[tid];
     __syncthreads();
-    llv_bitonic(s.cand, LLV_BLOCK, tid);
-    const float tau = llv_sk_val(s.cand[G - 1]);
+    if (tid < g0) {
+        unsigned long long key = s.hkey[tid];
+        int pos = tid;
+        for (int j = 0; j < g1; j++) pos += (s.hkey[LLV_G_MAX + j] < key) ? 1 : 0;
+        if (pos < G) s.cand[pos] = key;
+    }
+    if (tid < g1) {
+        unsigned long long key = s.hkey[LLV_G_MAX + tid];
+        int pos = tid;
+        for (int j = 0; j < g0; j++) pos += (s.hkey[j] < key) ? 1 : 0;
+        if (pos < G) s.cand[pos] = key;
+    }
     __syncthreads();
+    const int tot = g0 + g1;
+    return tot < G ? tot : G;
+}
 
-    // ---- Pass 2: collect { v >= tau } over unpenalized tokens. ----
-#define LLV_P2(v, ix)                                                              \
-    if ((v) >= tau && (v) > LLV_NEG_FLOOR) {                                       \
-        if (!has_h || llv_h_find(s, (unsigned)(ix)) < 0) {                         \
-            int slot = atomicAdd(&s.ncand, 1);                                     \
-            if (slot < LLV_CAND_CAP) s.cand[slot] = llv_sortkey((v), (unsigned)(ix)); \
-        }                                                                          \
-    }
-    {
-        int i = tid;
-        for (; i + 3 * LLV_BLOCK < n4; i += 4 * LLV_BLOCK) {
-            float4 a = L4[i];
-            float4 b = L4[i + LLV_BLOCK];
-            float4 c = L4[i + 2 * LLV_BLOCK];
-            float4 d = L4[i + 3 * LLV_BLOCK];
-            int ia = i * 4, ib = (i + LLV_BLOCK) * 4, ic = (i + 2 * LLV_BLOCK) * 4, id = (i + 3 * LLV_BLOCK) * 4;
-            LLV_P2(a.x, ia) LLV_P2(a.y, ia + 1) LLV_P2(a.z, ia + 2) LLV_P2(a.w, ia + 3)
-            LLV_P2(b.x, ib) LLV_P2(b.y, ib + 1) LLV_P2(b.z, ib + 2) LLV_P2(b.w, ib + 3)
-            LLV_P2(c.x, ic) LLV_P2(c.y, ic + 1) LLV_P2(c.z, ic + 2) LLV_P2(c.w, ic + 3)
-            LLV_P2(d.x, id) LLV_P2(d.y, id + 1) LLV_P2(d.z, id + 2) LLV_P2(d.w, id + 3)
-        }
-        for (; i < n4; i += LLV_BLOCK) {
-            float4 a = L4[i];
-            int ia = i * 4;
-            LLV_P2(a.x, ia) LLV_P2(a.y, ia + 1) LLV_P2(a.z, ia + 2) LLV_P2(a.w, ia + 3)
-        }
-        for (int ix = n4 * 4 + tid; ix < vocab; ix += LLV_BLOCK) {
-            float v = L[ix];
-            LLV_P2(v, ix)
-        }
-    }
-#undef LLV_P2
-    __syncthreads();
-    // Penalized / blocked scope tokens with v >= tau.
-    if (has_h) {
-        for (int p = tid; p < nk; p += LLV_BLOCK) {
-            unsigned tok = (unsigned)(s.hkey[p] >> 32);
-            if (tok >= (unsigned)vocab) continue;
-            if (p + 1 < s.nh && (unsigned)(s.hkey[p + 1] >> 32) == tok) continue;
-            float v = s.hval[p];
-            if (v >= tau && v > LLV_NEG_FLOOR) {
-                int slot = atomicAdd(&s.ncand, 1);
-                if (slot < LLV_CAND_CAP) s.cand[slot] = llv_sortkey(v, tok);
-            }
-        }
-        __syncthreads();
-    }
-    int nc = s.ncand;
-    int g;
-    if (nc <= LLV_CAND_CAP) {
-        int n = llv_pow2(nc);
-        for (int t = nc + tid; t < n; t += LLV_BLOCK) s.cand[t] = 0xffffffffffffffffull;
-        __syncthreads();
-        llv_bitonic(s.cand, n, tid);
-        g = nc < G ? nc : G;
-    } else {
-        // Tile reduction (exact ties beyond LDS): keep the running top-G in
-        // cand[0..G), merge each tile's {sortkey <= kth} and re-sort.
-        __syncthreads();
-        for (int t = tid; t < LLV_G_MAX; t += LLV_BLOCK) s.cand[t] = 0xffffffffffffffffull;
-        unsigned long long kth = llv_sortkey(tau, 0xffffffffu);
-        if (tid == 0) s.ncand = G;
-        __syncthreads();
-        for (int base = 0; base < vocab; base += LLV_TILE) {
-            for (int ix = base + tid; ix < base + LLV_TILE && ix < vocab; ix += LLV_BLOCK) {
-                float v = L[ix];
-                if (v > LLV_NEG_FLOOR) {
-                    unsigned long long sk = llv_sortkey(v, (unsigned)ix);
-                    if (sk <= kth && (!has_h || llv_h_find(s, (unsigned)ix) < 0)) {
-                        int slot = atomicAdd(&s.ncand, 1);
-                        s.cand[slot] = sk;
-                    }
-                }
-            }
-            __syncthreads();
-            int cnt = s.ncand;
-            if (cnt > G) {
-                int n = llv_pow2(cnt);
-                for (int t = cnt + tid; t < n; t += LLV_BLOCK) s.cand[t] = 0xffffffffffffffffull;
-                __syncthreads();
-                llv_bitonic(s.cand, n, tid);
-                if (s.cand[G - 1] < kth) kth = s.cand[G - 1];
-                __syncthreads();
-                if (tid == 0) s.ncand = G;
-                __syncthreads();
-            }
-        }
-        if (has_h) {
-            for (int p = tid; p < nk; p += LLV_BLOCK) {
-                unsigned tok = (unsigned)(s.hkey[p] >> 32);
-                if (tok >= (unsigned)vocab) continue;
-                if (p + 1 < s.nh && (unsigned)(s.hkey[p + 1] >> 32) == tok) continue;
-                float v = s.hval[p];
-                if (v > LLV_NEG_FLOOR) {
-                    unsigned long long sk = llv_sortkey(v, tok);
-                    if (sk <= kth) {
-                        int slot = atomicAdd(&s.ncand, 1);
-                        s.cand[slot] = sk;
-                    }
-                }
-            }
-            __syncthreads();
-            int cnt = s.ncand;
-            int n = llv_pow2(cnt);
-            for (int t = cnt + tid; t < n; t += LLV_BLOCK) s.cand[t] = 0xffffffffffffffffull;
-            __syncthreads();
-            llv_bitonic(s.cand, n, tid);
-        }
-        g = 0;
-        while (g < G && s.cand[g] != 0xffffffffffffffffull) g++;
-    }
-
-    // ---- p table, then the lane ticket. ----
+// p table of the row, the lane ticket and (last row of the lane) the lane verdict.
+// `g` and s.cand[0..g) are final and visible to the whole workgroup.
+static __device__ void llv_tail(LlvShared& s, unsigned* region, float* ptab, const unsigned* Ln, int row,
+                                int tid, int g, float temp, float top_p, int top_k_req, float min_p, int G) {
     float* P = ptab + (size_t)row * LLV_P_WORDS;
     if (tid == 0) {
         llv_build_p(s, g, temp, top_p, top_k_req, min_p, G, P);
@@ -631,4 +463,264 @@ extern "C" __global__ __launch_bounds__(LLV_BLOCK) void lane_leviathan_verify(
     out[LO_NTOK] = (unsigned)ntok;
     out[LO_RNG] = rng;
     out[LO_DONE] = 1u;
+}
+
+extern "C" __global__ __launch_bounds__(LLV_BLOCK) void lane_leviathan_verify(
+    unsigned* __restrict__ region,  // [out | lanes | rows | inputs], u32 words
+    int lanes_off,                  // word offset of the lane records
+    int rows_off,                   // word offset of the row records
+    float* __restrict__ ptab,       // [n_rows * LLV_P_WORDS]
+    int mode,                       // LLV_MODE_*: 0 full row (today), 1 select, 2 merged
+    unsigned long long* cand_local, // modes 1/2: [rows][LLV_CAND_WORDS] u32 (null in mode 0)
+    const unsigned long long* cand_peer // mode 2: peer rank's table, same layout (null otherwise)
+) {
+    __shared__ LlvShared s;
+    const int tid = (int)threadIdx.x;
+    const int row = (int)blockIdx.x;
+    const unsigned* R = region + rows_off + row * LLV_ROW_WORDS;
+    const int lane = (int)R[LR_LANE];
+    const unsigned* Ln = region + lanes_off + lane * LLV_LANE_WORDS;
+    const float* L = (const float*)(((unsigned long long)R[LR_PTR_HI] << 32) | (unsigned long long)R[LR_PTR_LO]);
+    const int vocab = (int)Ln[LL_VOCAB];
+    const float temp = __uint_as_float(Ln[LL_TEMP]);
+    const float top_p = __uint_as_float(Ln[LL_TOP_P]);
+    const int top_k_req = (int)Ln[LL_TOP_K];
+    const float min_p = __uint_as_float(Ln[LL_MIN_P]);
+    const float rep = __uint_as_float(Ln[LL_REP]);
+    const float pres = __uint_as_float(Ln[LL_PRES]);
+    const float freq = __uint_as_float(Ln[LL_FREQ]);
+    const int n_blocked = (int)Ln[LL_NBLOCKED];
+    const int pen_len = (int)R[LR_PEN_LEN];
+    const bool penalty = (rep > 1.0f || pres > 0.0f || freq > 0.0f) && pen_len > 0;
+    const int n_scope = penalty ? pen_len : 0;
+    const int G = (top_k_req <= 20) ? 20 : LLV_G_MAX;
+    // Global id of L[0] (mode 1 only; modes 0 and 2 index the row from 0).
+    const unsigned base = (mode == LLV_MODE_SELECT) ? Ln[LL_BASE] : 0u;
+    if (mode == LLV_MODE_MERGED) {
+        const int gm = llv_merge_cands(s, cand_local, cand_peer, row, G, tid);
+        llv_tail(s, region, ptab, Ln, row, tid, gm, temp, top_p, top_k_req, min_p, G);
+        return;
+    }
+
+    // ---- Scope / blocked token table (sorted keys, penalized values). ----
+    // Scope key (tok << 32 | i), blocked key (tok << 32 | 0x80000000 | b): a token's
+    // scope occurrences sort before its blocked marks.
+    const int nk = n_scope + n_blocked;
+    if (tid == 0) {
+        s.ncand = 0;
+        s.nh = nk > 0 ? llv_pow2(nk) : 0;
+        s.last = 0;
+    }
+    for (int t = tid; t < LLV_FILTER_BITS / 32; t += LLV_BLOCK) s.filter[t] = 0u;
+    __syncthreads();
+    if (nk > 0) {
+        const unsigned* scope = region + R[LR_PEN_OFF];
+        const unsigned* blocked = region + Ln[LL_BLOCKED];
+        const int n = s.nh;
+        for (int t = tid; t < n; t += LLV_BLOCK) {
+            unsigned long long k = 0xffffffffffffffffull;
+            if (t < n_scope) {
+                k = ((unsigned long long)scope[t] << 32) | (unsigned)t;
+            } else if (t < nk) {
+                k = ((unsigned long long)blocked[t - n_scope] << 32) | (0x80000000u | (unsigned)(t - n_scope));
+            }
+            s.hkey[t] = k;
+        }
+        __syncthreads();
+        llv_bitonic(s.hkey, n, tid);
+        const float window_len = (float)pen_len;
+        for (int p = tid; p < nk; p += LLV_BLOCK) {
+            unsigned long long key = s.hkey[p];
+            unsigned tok = (unsigned)(key >> 32);
+            s.hval[p] = 0.0f;
+            if (tok - base >= (unsigned)vocab) continue;
+            if (p + 1 < n && (unsigned)(s.hkey[p + 1] >> 32) == tok) continue;
+            unsigned long long first = (unsigned long long)tok << 32;
+            int lo = 0, hi = p;
+            while (lo < hi) {
+                int mid = (lo + hi) >> 1;
+                if (s.hkey[mid] < first) lo = mid + 1; else hi = mid;
+            }
+            int wcount = 0;
+            while (lo + wcount <= p && !((unsigned)s.hkey[lo + wcount] & 0x80000000u)) wcount++;
+            bool is_blocked = ((unsigned)key & 0x80000000u) != 0u;
+            float v = L[tok - base];
+            if (is_blocked) {
+                v = -INFINITY;
+            } else if (wcount > 0) {
+                int i = (int)(unsigned)s.hkey[lo + wcount - 1];
+                if (rep > 1.0f) {
+                    float recency = ((float)i + 1.0f) / window_len;
+                    float effective = powf(rep, (float)wcount * recency);
+                    if (effective > 1.5f) effective = 1.5f;
+                    v = (v > 0.0f) ? (v / effective) : (v * effective);
+                }
+                if (pres > 0.0f || freq > 0.0f) v -= freq * (float)wcount + pres;
+            }
+            s.hval[p] = v;
+            atomicOr(&s.filter[(tok >> 5) & (LLV_FILTER_BITS / 32 - 1)], 1u << (tok & 31));
+        }
+        __syncthreads();
+    }
+    const bool has_h = nk > 0;
+
+    // ---- Pass 1: per-thread maximum over unpenalized tokens. ----
+    const bool vec = ((((unsigned long long)L) & 15ull) == 0ull);
+    const int n4 = vec ? (vocab >> 2) : 0;
+    const float4* L4 = (const float4*)L;
+    float m = -INFINITY;
+#define LLV_P1(v, ix)                                                              \
+    if ((v) > m) {                                                                 \
+        if (!has_h || llv_h_find(s, (unsigned)(ix) + base) < 0) m = (v);           \
+    }
+    {
+        int i = tid;
+        for (; i + 3 * LLV_BLOCK < n4; i += 4 * LLV_BLOCK) {
+            float4 a = L4[i];
+            float4 b = L4[i + LLV_BLOCK];
+            float4 c = L4[i + 2 * LLV_BLOCK];
+            float4 d = L4[i + 3 * LLV_BLOCK];
+            int ia = i * 4, ib = (i + LLV_BLOCK) * 4, ic = (i + 2 * LLV_BLOCK) * 4, id = (i + 3 * LLV_BLOCK) * 4;
+            LLV_P1(a.x, ia) LLV_P1(a.y, ia + 1) LLV_P1(a.z, ia + 2) LLV_P1(a.w, ia + 3)
+            LLV_P1(b.x, ib) LLV_P1(b.y, ib + 1) LLV_P1(b.z, ib + 2) LLV_P1(b.w, ib + 3)
+            LLV_P1(c.x, ic) LLV_P1(c.y, ic + 1) LLV_P1(c.z, ic + 2) LLV_P1(c.w, ic + 3)
+            LLV_P1(d.x, id) LLV_P1(d.y, id + 1) LLV_P1(d.z, id + 2) LLV_P1(d.w, id + 3)
+        }
+        for (; i < n4; i += LLV_BLOCK) {
+            float4 a = L4[i];
+            int ia = i * 4;
+            LLV_P1(a.x, ia) LLV_P1(a.y, ia + 1) LLV_P1(a.z, ia + 2) LLV_P1(a.w, ia + 3)
+        }
+        for (int ix = n4 * 4 + tid; ix < vocab; ix += LLV_BLOCK) {
+            float v = L[ix];
+            LLV_P1(v, ix)
+        }
+    }
+#undef LLV_P1
+    // tau = G-th largest thread maximum.
+    s.cand[tid] = llv_sortkey(m, (unsigned)tid);
+    __syncthreads();
+    llv_bitonic(s.cand, LLV_BLOCK, tid);
+    const float tau = llv_sk_val(s.cand[G - 1]);
+    __syncthreads();
+
+    // ---- Pass 2: collect { v >= tau } over unpenalized tokens. ----
+#define LLV_P2(v, ix)                                                              \
+    if ((v) >= tau && (v) > LLV_NEG_FLOOR) {                                       \
+        if (!has_h || llv_h_find(s, (unsigned)(ix) + base) < 0) {                  \
+            int slot = atomicAdd(&s.ncand, 1);                                     \
+            if (slot < LLV_CAND_CAP) s.cand[slot] = llv_sortkey((v), (unsigned)(ix) + base); \
+        }                                                                          \
+    }
+    {
+        int i = tid;
+        for (; i + 3 * LLV_BLOCK < n4; i += 4 * LLV_BLOCK) {
+            float4 a = L4[i];
+            float4 b = L4[i + LLV_BLOCK];
+            float4 c = L4[i + 2 * LLV_BLOCK];
+            float4 d = L4[i + 3 * LLV_BLOCK];
+            int ia = i * 4, ib = (i + LLV_BLOCK) * 4, ic = (i + 2 * LLV_BLOCK) * 4, id = (i + 3 * LLV_BLOCK) * 4;
+            LLV_P2(a.x, ia) LLV_P2(a.y, ia + 1) LLV_P2(a.z, ia + 2) LLV_P2(a.w, ia + 3)
+            LLV_P2(b.x, ib) LLV_P2(b.y, ib + 1) LLV_P2(b.z, ib + 2) LLV_P2(b.w, ib + 3)
+            LLV_P2(c.x, ic) LLV_P2(c.y, ic + 1) LLV_P2(c.z, ic + 2) LLV_P2(c.w, ic + 3)
+            LLV_P2(d.x, id) LLV_P2(d.y, id + 1) LLV_P2(d.z, id + 2) LLV_P2(d.w, id + 3)
+        }
+        for (; i < n4; i += LLV_BLOCK) {
+            float4 a = L4[i];
+            int ia = i * 4;
+            LLV_P2(a.x, ia) LLV_P2(a.y, ia + 1) LLV_P2(a.z, ia + 2) LLV_P2(a.w, ia + 3)
+        }
+        for (int ix = n4 * 4 + tid; ix < vocab; ix += LLV_BLOCK) {
+            float v = L[ix];
+            LLV_P2(v, ix)
+        }
+    }
+#undef LLV_P2
+    __syncthreads();
+    // Penalized / blocked scope tokens with v >= tau.
+    if (has_h) {
+        for (int p = tid; p < nk; p += LLV_BLOCK) {
+            unsigned tok = (unsigned)(s.hkey[p] >> 32);
+            if (tok - base >= (unsigned)vocab) continue;
+            if (p + 1 < s.nh && (unsigned)(s.hkey[p + 1] >> 32) == tok) continue;
+            float v = s.hval[p];
+            if (v >= tau && v > LLV_NEG_FLOOR) {
+                int slot = atomicAdd(&s.ncand, 1);
+                if (slot < LLV_CAND_CAP) s.cand[slot] = llv_sortkey(v, tok);
+            }
+        }
+        __syncthreads();
+    }
+    int nc = s.ncand;
+    int g;
+    if (nc <= LLV_CAND_CAP) {
+        int n = llv_pow2(nc);
+        for (int t = nc + tid; t < n; t += LLV_BLOCK) s.cand[t] = 0xffffffffffffffffull;
+        __syncthreads();
+        llv_bitonic(s.cand, n, tid);
+        g = nc < G ? nc : G;
+    } else {
+        // Tile reduction (exact ties beyond LDS): keep the running top-G in
+        // cand[0..G), merge each tile's {sortkey <= kth} and re-sort.
+        __syncthreads();
+        for (int t = tid; t < LLV_G_MAX; t += LLV_BLOCK) s.cand[t] = 0xffffffffffffffffull;
+        unsigned long long kth = llv_sortkey(tau, 0xffffffffu);
+        if (tid == 0) s.ncand = G;
+        __syncthreads();
+        for (int tbase = 0; tbase < vocab; tbase += LLV_TILE) {
+            for (int ix = tbase + tid; ix < tbase + LLV_TILE && ix < vocab; ix += LLV_BLOCK) {
+                float v = L[ix];
+                if (v > LLV_NEG_FLOOR) {
+                    unsigned long long sk = llv_sortkey(v, (unsigned)ix + base);
+                    if (sk <= kth && (!has_h || llv_h_find(s, (unsigned)ix + base) < 0)) {
+                        int slot = atomicAdd(&s.ncand, 1);
+                        s.cand[slot] = sk;
+                    }
+                }
+            }
+            __syncthreads();
+            int cnt = s.ncand;
+            if (cnt > G) {
+                int n = llv_pow2(cnt);
+                for (int t = cnt + tid; t < n; t += LLV_BLOCK) s.cand[t] = 0xffffffffffffffffull;
+                __syncthreads();
+                llv_bitonic(s.cand, n, tid);
+                if (s.cand[G - 1] < kth) kth = s.cand[G - 1];
+                __syncthreads();
+                if (tid == 0) s.ncand = G;
+                __syncthreads();
+            }
+        }
+        if (has_h) {
+            for (int p = tid; p < nk; p += LLV_BLOCK) {
+                unsigned tok = (unsigned)(s.hkey[p] >> 32);
+                if (tok - base >= (unsigned)vocab) continue;
+                if (p + 1 < s.nh && (unsigned)(s.hkey[p + 1] >> 32) == tok) continue;
+                float v = s.hval[p];
+                if (v > LLV_NEG_FLOOR) {
+                    unsigned long long sk = llv_sortkey(v, tok);
+                    if (sk <= kth) {
+                        int slot = atomicAdd(&s.ncand, 1);
+                        s.cand[slot] = sk;
+                    }
+                }
+            }
+            __syncthreads();
+            int cnt = s.ncand;
+            int n = llv_pow2(cnt);
+            for (int t = cnt + tid; t < n; t += LLV_BLOCK) s.cand[t] = 0xffffffffffffffffull;
+            __syncthreads();
+            llv_bitonic(s.cand, n, tid);
+        }
+        g = 0;
+        while (g < G && s.cand[g] != 0xffffffffffffffffull) g++;
+    }
+
+    if (mode == LLV_MODE_SELECT) {
+        llv_store_cands(s, cand_local, row, g, tid);
+        return;
+    }
+
+    // ---- p table, then the lane ticket and verdict. ----
+    llv_tail(s, region, ptab, Ln, row, tid, g, temp, top_p, top_k_req, min_p, G);
 }

@@ -89,10 +89,11 @@
 //! tokens, exactly as for greedy lanes.
 
 use crate::bundle::{BundleError, Qwen4Bundle};
-use crate::ep::{gather_tally, GatherTally};
+use crate::ep::{gather_tally, GatherTally, PeerMirrors};
+use crate::ep_vocab_shard::{VocabExchange, SLOT_CAND, SLOT_LOGITS, SLOT_PARTIAL, SLOT_TOP1};
 use crate::gpu_forward_lanes::{
     forward_lanes, row_group_count, LaneAllRowsRule, LaneOutputs, LaneRowKind, LaneRows, StageName,
-    StageShare,
+    StageShare, VocabShardView,
 };
 use crate::lane::download_lane_rows;
 use crate::lane::{LabRoutes, LaneSpec, LaneStatus, Qwen4LaneState, Qwen4LaneStore, StepParts};
@@ -118,9 +119,14 @@ use crate::mtp_spec::{
     draft_accept_estimate, HeadTicket, TargetTicket, DRAFT_ACCEPT_MAX, MTP_ROW_WORTH,
 };
 use crate::sampled_lane::{DraftRead, LaneSampler, RowBuf, RowHandle, TargetRowSource};
-use hipfire_runtime::lane_draw::{lane_draws, LaneDraw, LaneDrawArena, LaneDrawJob};
+use hipfire_dispatch::pipeline::DraftShard;
+use hipfire_dispatch::types::DispatchError;
+use hipfire_runtime::lane_draw::{
+    lane_draws, LaneDraw, LaneDrawArena, LaneDrawJob, LaneDrawStaged,
+};
 use hipfire_runtime::slot_batch::RequestEpoch;
 use hipfire_runtime::spec::SpecRequestConfig;
+use rdna_compute::tensor_ops::ArgmaxPairMerge;
 use rdna_compute::{Gpu, GpuTensor};
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -269,6 +275,8 @@ pub struct RankExec {
     abort_reason: Option<String>,
     /// Validity flag of the row source the last verify handed out.
     rows_valid: Option<Arc<AtomicBool>>,
+    /// The vocabulary-shard exchange of this rank's mesh, when attached.
+    vocab: Option<Arc<VocabExchange>>,
 }
 
 impl RankExec {
@@ -287,7 +295,15 @@ impl RankExec {
             fatal: None,
             abort_reason: None,
             rows_valid: None,
+            vocab: None,
         }
+    }
+
+    /// This rank's vocabulary-shard exchange (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`; `None`: the switch
+    /// is off or the load declined it, so a sharded plan is refused).
+    pub(crate) fn with_vocab(mut self, vocab: Option<Arc<VocabExchange>>) -> Self {
+        self.vocab = vocab;
+        self
     }
 
     pub fn stats(&self) -> RankLaneStats {
@@ -633,7 +649,18 @@ impl RankLane<'_> {
                 .map(|w| &w.plan)
                 .ok_or_else(|| "draft op for a lane outside the plan".to_string())
         };
-        with_store(bundle, |store, bundle| {
+        // A vocabulary-sharded head round (`DraftRound::vocab_shard`): every draft of the round
+        // splits its ranked rows with the peer rank ([`draft_shard`]). The root decided it from
+        // the plan alone, so both ranks make the same number of exchange calls in the same order
+        // (the same replicated ops, the same batched / serial branch).
+        let shard_round = round.vocab_shard && !round.ops.is_empty();
+        if shard_round {
+            let shard = draft_shard(exec)?;
+            bundle
+                .mtp_set_draft_shard(Some(shard))
+                .map_err(|e| e.to_string())?;
+        }
+        let result = with_store(bundle, |store, bundle| {
             // Round 0: owed-row catch-ups, then the head tickets that follow one.
             let mut catch_rows = 0usize;
             if !round.catch_up.is_empty() {
@@ -901,7 +928,13 @@ impl RankLane<'_> {
                 return Ok((catch_rows, reads));
             }
             ran.map(|reads| (catch_rows, reads))
-        })
+        });
+        if shard_round {
+            // Removed on every path out of the round (an error aborts the mesh anyway).
+            let removed = bundle.mtp_set_draft_shard(None).map_err(|e| e.to_string());
+            return result.and_then(|ok| removed.map(|()| ok));
+        }
+        result
     }
 
     /// The one trunk forward over every lane's sealed rows (arming the ring and
@@ -910,8 +943,23 @@ impl RankLane<'_> {
     /// right after the forward on the same stream, every lane the root lent a
     /// [`crate::mesh_lane_protocol::DeviceSampleSpec`] is drawn on device
     /// ([`device_draws`]): only ids, accept counts and RNG states come back.
+    ///
+    /// With [`VerifyPlan::vocab_shard`] every rank runs only its half of the LM head
+    /// (`LaneOutputs::vocab_shard`) and the sampler owner merges the two halves into the whole
+    /// head's picks and draws ([`sharded_tail`]; the ordering and its reuse-safety argument are
+    /// in [`crate::ep_vocab_shard`]). The non-sampler rank's picks are then shard-local ids.
     fn verify_device(&mut self, plan: &VerifyPlan) -> R<VerifyOut> {
         let sampler = self.own().sampler;
+        let rank = self.rank();
+        // A sharded plan runs only where the mesh attached its exchange (the rank refuses a plan
+        // it cannot run: never a fallback to the whole head, the ranks' halves would not meet).
+        let shard_exchange: Option<Arc<VocabExchange>> = if plan.vocab_shard {
+            Some(self.exec.vocab.clone().ok_or_else(|| {
+                "a vocabulary-sharded verify on a rank without the shard exchange".to_string()
+            })?)
+        } else {
+            None
+        };
         let Self { bundle, gpu, .. } = self;
         let vocab = bundle.lane_vocab();
         let epochs: Vec<RequestEpoch> = plan.lanes.iter().map(|l| l.key.request_epoch).collect();
@@ -934,6 +982,11 @@ impl RankLane<'_> {
                     "{n_dec} decode rows exceed the step buffers ({rows_cap})"
                 ));
             }
+            // A vocabulary-sharded verify (`VerifyPlan::vocab_shard`): this rank's head buffers.
+            let shard = match &shard_exchange {
+                Some(exchange) => Some(shard_head(exchange, rank, sampler, n_dec, logits, top1)?),
+                None => None,
+            };
             for (vl, lane) in plan.lanes.iter().zip(lanes.iter_mut()) {
                 if vl.rows.len() > 1 && lane.spec.is_some() {
                     // The sealed rows are the window's proposals (the root's
@@ -960,10 +1013,13 @@ impl RankLane<'_> {
                         },
                     });
                 }
+                let full_logits = logits.sub_offset(0, n_dec * vocab);
+                let full_top1 = top1.sub_offset(0, n_dec * std::mem::size_of::<i32>());
                 let out = LaneOutputs {
-                    logits: &logits.sub_offset(0, n_dec * vocab),
-                    top1: &top1.sub_offset(0, n_dec * std::mem::size_of::<i32>()),
+                    logits: shard.as_ref().map_or(&full_logits, |s| &s.logits),
+                    top1: shard.as_ref().map_or(&full_top1, |s| &s.top1),
                     wide_hidden: hidden,
+                    vocab_shard: shard.as_ref().map(|s| s.view),
                 };
                 forward_lanes(gpu, bundle, &mut rows, &out, &policy).map_err(|e| e.to_string())
             };
@@ -973,15 +1029,23 @@ impl RankLane<'_> {
             }
             forwarded?;
             // The sampled lanes' device draws, enqueued right behind the
-            // forward on its stream (the sampler owner only).
-            let device = if sampler {
-                device_draws(gpu, sample_arena, plan, logits, vocab)?
-            } else {
-                vec![None; plan.lanes.len()]
+            // forward on its stream (the sampler owner only); a vocabulary-
+            // sharded verify instead runs its select / exchange / merge
+            // ([`sharded_tail`]) on every rank.
+            let device = match &shard {
+                Some(s) => sharded_tail(gpu, sample_arena, plan, s, sampler)?,
+                None if sampler => device_draws(gpu, sample_arena, plan, logits, vocab)?,
+                None => vec![None; plan.lanes.len()],
+            };
+            // The top-1 ids the host reads: the lane store's (the whole head's, or the sampler
+            // owner's merged ids), or a shard-local rank's own (evidence only).
+            let top1_src: &GpuTensor = match &shard {
+                Some(s) => &s.top1,
+                None => top1,
             };
             gpu.dtoh_stream_ordered(
                 &mut top1_host[..n_dec * std::mem::size_of::<i32>()],
-                &top1.buf,
+                &top1_src.buf,
             )
             .map_err(|e| e.to_string())?;
             gpu.take_device_wait_error().map_err(|e| e.to_string())?;
@@ -1032,6 +1096,9 @@ impl RankLane<'_> {
             .verify
             .as_ref()
             .ok_or_else(|| "prepare: the verify was never sealed".to_string())?;
+        // A non-sampler rank of a vocabulary-sharded verify holds shard-local picks: its greedy
+        // windows replay the root's decision as a sampled window does.
+        let shard_local_picks = verify.vocab_shard && !exec.session.ownership().sampler;
         let epochs: Vec<RequestEpoch> = verify.lanes.iter().map(|l| l.key.request_epoch).collect();
         let mut head_rows = step.catch_up_rows;
         with_store(bundle, |store, bundle| {
@@ -1071,6 +1138,7 @@ impl RankLane<'_> {
                         hidden,
                         row_begin: win.row_begin,
                         picks: &win.picks,
+                        shard_local_picks,
                         skip_rollback,
                         fill: fill.as_deref_mut(),
                     },
@@ -1296,6 +1364,9 @@ impl LaneMeshExecutor for RankLane<'_> {
                     .filter(|(key, _)| heads(key))
                     .cloned()
                     .collect(),
+                // A sharded round holds replicated ops only (`draft_vocab_shard_decision`), so
+                // the filter keeps every op on both ranks and the halves line up.
+                vocab_shard: round.vocab_shard,
             }
         };
         if exec_round.ops.len() != result.ops_executed {
@@ -1472,6 +1543,13 @@ impl LaneMeshExecutor for RankLane<'_> {
                     .zip(&device)
                     .any(|(w, d)| w.plan.sampling != SamplingMode::Greedy && d.is_none())
             });
+            if host_rows && plan.vocab_shard {
+                // Unreachable by the root's decision; refused rather than run on half a head.
+                return Err(rank_err(
+                    rank,
+                    "a vocabulary-sharded verify left a sampled lane without a device draw",
+                ));
+            }
             if host_rows {
                 out.rows = Some(self.rows_handle(plan, logits));
             }
@@ -1500,7 +1578,15 @@ impl LaneMeshExecutor for RankLane<'_> {
         }
         // Evidence only: the emitted tokens against this rank's own picks.
         let mut mismatches = 0u64;
-        if let Some(step) = self.exec.step.as_ref() {
+        // The emitted-vs-own-picks evidence needs this rank's picks to be target picks: a
+        // non-sampler rank of a vocabulary-sharded verify holds shard-local ids, so it skips it.
+        let sampler = self.own().sampler;
+        if let Some(step) = self
+            .exec
+            .step
+            .as_ref()
+            .filter(|s| sampler || !s.verify.as_ref().is_some_and(|v| v.vocab_shard))
+        {
             for (win, d) in step.lanes.iter().zip(&decision.lanes) {
                 if d.forced {
                     continue;
@@ -1846,6 +1932,15 @@ fn peer_rank(bundle: &Qwen4Bundle) -> usize {
         .map_or(0, |placement| placement.rank)
 }
 
+/// A peer's lane executor state, built on its first call (holding the mesh's vocabulary-shard
+/// exchange).
+fn peer_exec(mirrors: &mut PeerMirrors, rank: usize) -> &mut RankExec {
+    let vocab = mirrors.vocab.clone();
+    mirrors
+        .mesh_lanes
+        .get_or_insert_with(|| RankExec::new(RankOwnership::ep(rank)).with_vocab(vocab))
+}
+
 impl EpFanout<'_> {
     /// Run `local` (rank 0) and `job` (every peer) concurrently, results in
     /// rank order. The mesh is detached from the bundle for the call so the
@@ -1873,9 +1968,7 @@ impl EpFanout<'_> {
                 },
                 &|peer_bundle, peer_gpu, mirrors| {
                     let rank = peer_rank(peer_bundle);
-                    let exec = mirrors
-                        .mesh_lanes
-                        .get_or_insert_with(|| RankExec::new(RankOwnership::ep(rank)));
+                    let exec = peer_exec(mirrors, rank);
                     job(&mut RankLane {
                         exec,
                         bundle: peer_bundle,
@@ -1996,9 +2089,7 @@ impl MeshFanout for EpFanout<'_> {
             },
             &|peer_bundle, peer_gpu, mirrors| {
                 let rank = peer_rank(peer_bundle);
-                let exec = mirrors
-                    .mesh_lanes
-                    .get_or_insert_with(|| RankExec::new(RankOwnership::ep(rank)));
+                let exec = peer_exec(mirrors, rank);
                 RankLane {
                     exec,
                     bundle: peer_bundle,
@@ -2167,10 +2258,25 @@ impl EpMeshLanes {
             }
             None => false,
         };
+        // The vocabulary-sharded verify (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`): armed when the mesh
+        // attached its exchange and the forward is eager (no replay recording or graph capture:
+        // the exchange is host-ordered and never replayed); the root then seals
+        // `VerifyPlan::vocab_shard` for every step the exchange's buffers hold whose sampled
+        // lanes are all device-drawn.
+        let vocab = bundle
+            .ep_mesh()
+            .and_then(|mesh| mesh.vocab_exchange().cloned());
+        if let Some(exchange) = vocab.as_ref().filter(|_| all_rows.eager) {
+            root = root
+                .with_vocab_shard_rows(exchange.rows())
+                // The MQ2 draft head's shard (`HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD`): the exchange
+                // carries its partial scratch only when that switch is on (0 rows: never sharded).
+                .with_draft_vocab_shard_rows(exchange.draft_rows());
+        }
         Ok(Self {
             copy_armed,
             root,
-            rank0: RankExec::new(RankOwnership::ep(0)),
+            rank0: RankExec::new(RankOwnership::ep(0)).with_vocab(vocab),
             ranks,
             pending: None,
             interval_start: None,
@@ -2442,9 +2548,7 @@ impl EpMeshLanes {
             },
             &|peer_bundle, _, mirrors| {
                 let rank = peer_rank(peer_bundle);
-                let exec = mirrors
-                    .mesh_lanes
-                    .get_or_insert_with(|| RankExec::new(RankOwnership::ep(rank)));
+                let exec = peer_exec(mirrors, rank);
                 exec.session
                     .release(&epoch)
                     .map_err(|e| format!("rank {}: {}", e.rank, e.reason))
@@ -2555,6 +2659,7 @@ fn device_draws(
                 logits: view,
                 rows: vl.rows.len(),
                 vocab,
+                base: 0,
                 drafts: &vl.rows[1..],
                 q: &spec.q,
                 history: &spec.history,
@@ -2631,5 +2736,246 @@ mod lab_trace {
     }
 }
 
+/// This rank's side of a vocabulary-sharded head round: its partial scratch (a view of the
+/// exchange's), the peer's scratch address and device, and the exchange of one draft call —
+/// publish this rank's event on its stream, meet the peer's host at the barrier, make the stream
+/// wait for the peer's event on the device. `Err` when the rank has no exchange (the mesh did
+/// not attach one, or its draft scratch is off): a sharded round is refused, never run unsharded.
+fn draft_shard(exec: &RankExec) -> R<DraftShard> {
+    let exchange = exec.vocab.clone().ok_or_else(|| {
+        "a vocabulary-sharded head round on a rank without the shard exchange".to_string()
+    })?;
+    let rank = exec.rank;
+    if exchange.draft_rows() == 0 {
+        return Err("a vocabulary-sharded head round without the exchange's draft scratch".into());
+    }
+    let partial = exchange.own_view(rank, SLOT_PARTIAL)?;
+    let peer_partial = exchange.peer_slot(rank, SLOT_PARTIAL)?;
+    let peer_device = exchange
+        .device_of(1 - rank)
+        .ok_or_else(|| "the peer rank registered no device".to_string())?;
+    let gate = exchange.clone();
+    let hip = |e: hip_bridge::HipError| DispatchError::Hip(e.to_string());
+    DraftShard::new(
+        rank,
+        partial,
+        peer_partial,
+        peer_device,
+        Box::new(move |gpu: &mut Gpu| {
+            gate.publish(rank, gpu).map_err(hip)?;
+            gate.barrier().map_err(DispatchError::Hip)?;
+            gate.wait_peer(rank, gpu).map_err(hip)
+        }),
+    )
+    .map_err(|e| format!("{e:?}"))
+}
+
+/// One rank's head buffers of a vocabulary-sharded verify ([`VerifyPlan::vocab_shard`]).
+struct ShardHead<'a> {
+    exchange: &'a VocabExchange,
+    rank: usize,
+    /// The head rows this rank projects and scans.
+    view: VocabShardView,
+    /// Packed `[n_dec][width]` shard logits and `n_dec` shard-local top-1 ids, as the head and
+    /// the argmax write them: the lane store's own buffers on the sampler owner (nobody reads
+    /// its half), the exchange's peer-readable ones on the other rank.
+    logits: GpuTensor,
+    top1: GpuTensor,
+    /// Decode rows of the step.
+    rows: usize,
+}
+
+/// [`ShardHead`] of `rank` for a step of `n_dec` rows; `store_*` are the lane store's step
+/// buffers (the sampler owner's head destination). `Err` when the rank is not one of the two
+/// shard ranks, the sampler owner is not rank 0, or the exchange's buffers cannot hold the rows.
+fn shard_head<'a>(
+    exchange: &'a VocabExchange,
+    rank: usize,
+    sampler: bool,
+    n_dec: usize,
+    store_logits: &GpuTensor,
+    store_top1: &GpuTensor,
+) -> R<ShardHead<'a>> {
+    if rank >= crate::ep_vocab_shard::VOCAB_SHARD_RANKS || sampler != (rank == 0) {
+        return Err(format!(
+            "a vocabulary-sharded verify needs the sampler owner to be rank 0 of two ranks \
+             (rank {rank}, sampler owner: {sampler})"
+        ));
+    }
+    if n_dec == 0 || n_dec > exchange.rows() {
+        return Err(format!(
+            "{n_dec} decode rows do not fit the vocabulary-shard exchange ({} rows)",
+            exchange.rows()
+        ));
+    }
+    let width = exchange.width();
+    let int = std::mem::size_of::<i32>();
+    let (logits, top1) = if sampler {
+        (
+            store_logits.sub_offset(0, n_dec * width),
+            store_top1.sub_offset(0, n_dec * int),
+        )
+    } else {
+        (
+            exchange
+                .own_view(rank, SLOT_LOGITS)?
+                .sub_offset(0, n_dec * width),
+            exchange
+                .own_view(rank, SLOT_TOP1)?
+                .sub_offset(0, n_dec * int),
+        )
+    };
+    Ok(ShardHead {
+        exchange,
+        rank,
+        view: exchange.view(rank),
+        logits,
+        top1,
+        rows: n_dec,
+    })
+}
+
+/// Stage every sampled lane's draw on THIS rank's shard and run the select mode over it: the
+/// jobs' row pointers are views of the rank's packed shard logits, `base` is the shard's first
+/// global id and `vocab` its width, and each row's sorted top-g lands in row `r` of the rank's
+/// candidate table (`r` counts sampled rows in plan order, the same on both ranks). `None` when
+/// no lane is sampled. Returns the staged jobs (for the merged launch and the readback) and the
+/// sampled lanes' plan indices.
+fn shard_select(
+    gpu: &mut Gpu,
+    arena: &mut Option<LaneDrawArena>,
+    plan: &VerifyPlan,
+    shard: &ShardHead<'_>,
+) -> R<Option<(LaneDrawStaged, Vec<usize>)>> {
+    if plan.samples.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    if plan.samples.len() != plan.lanes.len() {
+        return Err(format!(
+            "{} device-sample entries for {} lanes",
+            plan.samples.len(),
+            plan.lanes.len()
+        ));
+    }
+    let arena = arena.get_or_insert_with(LaneDrawArena::new);
+    let width = shard.view.width;
+    let mut views: Vec<(usize, GpuTensor)> = Vec::new();
+    let mut first = 0usize;
+    for (i, vl) in plan.lanes.iter().enumerate() {
+        if plan.samples[i].is_some() {
+            views.push((
+                i,
+                shard
+                    .logits
+                    .sub_offset(first * width, vl.rows.len() * width),
+            ));
+        }
+        first += vl.rows.len();
+    }
+    let jobs: Vec<LaneDrawJob<'_>> = views
+        .iter()
+        .map(|(i, view)| {
+            let vl = &plan.lanes[*i];
+            let spec = plan.samples[*i].as_ref().expect("view of a sampled lane");
+            LaneDrawJob {
+                logits: view,
+                rows: vl.rows.len(),
+                vocab: width,
+                base: shard.view.base,
+                drafts: &vl.rows[1..],
+                q: &spec.q,
+                history: &spec.history,
+                cfg: &spec.cfg,
+                rng_state: spec.rng_state,
+                eos: spec.eos,
+            }
+        })
+        .collect();
+    let staged = arena
+        .stage(gpu, &jobs)
+        .map_err(|e| format!("vocab-shard lane select: {e}"))?;
+    let cand = shard.exchange.own_view(shard.rank, SLOT_CAND)?;
+    arena
+        .launch_select(gpu, &staged, &cand)
+        .map_err(|e| format!("vocab-shard lane select: {e}"))?;
+    Ok(Some((staged, views.into_iter().map(|(i, _)| i).collect())))
+}
+
+/// What a vocabulary-sharded verify does after the shard head on one rank, in the order the
+/// exchange's module docs prove ([`crate::ep_vocab_shard`]):
+///
+/// 1. Both ranks stage and launch the select mode over their shard for every sampled lane.
+/// 2. A rank other than the sampler owner records its event on its stream, meets the barrier
+///    and is done: its top-1 ids stay shard-local (evidence only) and it returns no draws.
+/// 3. The sampler owner meets the barrier, makes its stream wait on the peer's event on the
+///    device, merges the two shards' per-row argmax into the whole head's picks
+///    (`argmax_f32_pair_merge`, written over its top-1 ids) and, for the sampled lanes, merges
+///    the two candidate tables, runs the verdicts and reads the draws back.
+///
+/// Every rank reaches the barrier exactly once whatever the lanes (an error before it aborts
+/// the mesh, which releases the other rank).
+fn sharded_tail(
+    gpu: &mut Gpu,
+    arena: &mut Option<LaneDrawArena>,
+    plan: &VerifyPlan,
+    shard: &ShardHead<'_>,
+    sampler: bool,
+) -> R<Vec<Option<DevicePick>>> {
+    let exchange = shard.exchange;
+    let rank = shard.rank;
+    let mut device: Vec<Option<DevicePick>> = vec![None; plan.lanes.len()];
+    let selected = shard_select(gpu, arena, plan, shard)?;
+    if !sampler {
+        exchange
+            .publish(rank, gpu)
+            .map_err(|e| format!("vocab-shard publish: {e}"))?;
+        exchange.barrier()?;
+        return Ok(device);
+    }
+    exchange.barrier()?;
+    exchange
+        .wait_peer(rank, gpu)
+        .map_err(|e| format!("vocab-shard peer wait: {e}"))?;
+    let peer = exchange.peer(rank)?;
+    let width = shard.view.width;
+    gpu.argmax_f32_pair_merge(&ArgmaxPairMerge {
+        local_logits: &shard.logits,
+        local_top1: &shard.top1,
+        peer_logits: peer.logits,
+        peer_top1: peer.top1,
+        out_top1: &shard.top1,
+        rows: shard.rows,
+        w0: width,
+        w1: width,
+    })
+    .map_err(|e| format!("vocab-shard argmax merge: {e}"))?;
+    if let Some((staged, lanes)) = selected {
+        let arena = arena
+            .as_mut()
+            .ok_or_else(|| "vocab-shard select left no draw arena".to_string())?;
+        let cand = exchange.own_view(rank, SLOT_CAND)?;
+        arena
+            .launch_merged(gpu, &staged, &cand, peer.cand)
+            .map_err(|e| format!("vocab-shard lane verdict: {e}"))?;
+        let draws = arena
+            .readback(gpu, &staged)
+            .map_err(|e| format!("vocab-shard lane verdict: {e}"))?;
+        if draws.len() != lanes.len() {
+            return Err(format!(
+                "vocab-shard lane verdict returned {} draws for {} lanes",
+                draws.len(),
+                lanes.len()
+            ));
+        }
+        for (i, draw) in lanes.into_iter().zip(draws) {
+            device[i] = Some(DevicePick {
+                tokens: draw.tokens,
+                accepted: draw.accepted,
+                advanced_rng: draw.advanced_rng,
+            });
+        }
+    }
+    Ok(device)
+}
 #[cfg(test)]
 mod tests;

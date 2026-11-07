@@ -3863,6 +3863,27 @@ impl Qwen4Bundle {
             .is_some_and(|mtp| mtp.draft.rescored_candidates().is_some())
     }
 
+    /// Install (or remove) the vocabulary-shard context of the MQ2 draft head's drafts
+    /// ([`hipfire_dispatch::pipeline::DraftShard`], `HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD`): the
+    /// drafts enqueued while it is installed split their ranked rows between the two EP ranks.
+    /// The resident head owns it (a lane swap-in leaves it in place). Without MTP resources an
+    /// install is an error and a removal a no-op.
+    pub(crate) fn mtp_set_draft_shard(
+        &mut self,
+        shard: Option<hipfire_dispatch::pipeline::DraftShard>,
+    ) -> Result<(), BundleError> {
+        match (self.mtp.as_mut(), shard) {
+            (Some(mtp), shard) => {
+                mtp.draft.set_shard(shard);
+                Ok(())
+            }
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(BundleError::Forward(
+                "Qwen4 MTP resources are not attached".to_string(),
+            )),
+        }
+    }
+
     /// The batched head round's rows scratch is allocated
     /// (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1` at load, MoE head).
     pub(crate) fn mtp_rows_ready(&self) -> bool {

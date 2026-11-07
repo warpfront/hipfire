@@ -22,6 +22,7 @@ use crate::ep_reserve::EpReserveMeshReceipt;
 use crate::ep_trunk_split::{
     agree_layouts, split_buffer_bytes, split_census, SplitWeight, TrunkSplitMode, TrunkSplitRank,
 };
+use crate::ep_vocab_shard::{self, AttachDecision, VocabExchange};
 use crate::gpu_forward::{
     ep_gather_slots, qwen4_ep_gather_rows, Qwen4BalancedPlan, Qwen4PeerLayerSource,
     QWEN4_EP_GATHER_BUFFERS,
@@ -87,6 +88,9 @@ pub struct PeerMirrors {
     /// This peer's native-MTP lane executor state (mesh lane protocol), built
     /// on the first mesh lane call.
     pub(crate) mesh_lanes: Option<crate::ep_mesh_lanes::RankExec>,
+    /// The vocabulary-shard exchange of this peer's mesh (set at attach; `None` when off), read
+    /// by the mesh lane executor of the rank.
+    pub(crate) vocab: Option<Arc<VocabExchange>>,
 }
 
 impl PeerMirrors {
@@ -186,6 +190,8 @@ pub struct Qwen4EpPeer {
     split: Option<TrunkSplitRank>,
     /// Trunk-shard fused all-reduce mailboxes (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`).
     ar_hc: Option<Arc<ArHcExchange>>,
+    /// The vocabulary-shard exchange (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`).
+    vocab: Option<Arc<VocabExchange>>,
 }
 
 impl Qwen4EpPeer {
@@ -221,6 +227,13 @@ impl Qwen4EpPeer {
                 ar_hc
                     .release(self.rank, &mut self.gpu)
                     .map_err(|error| format!("release trunk-shard mailboxes: {error}")),
+            );
+        }
+        if let Some(vocab) = self.vocab.take() {
+            note(
+                vocab
+                    .release(self.rank, &mut self.gpu)
+                    .map_err(|error| format!("release vocab-shard buffers: {error}")),
             );
         }
         note(
@@ -1414,6 +1427,9 @@ pub struct Qwen4EpMesh {
     split: Option<TrunkSplitRank>,
     /// Rank 0's handle of the trunk-shard fused all-reduce mailboxes; `None` when off.
     ar_hc: Option<Arc<ArHcExchange>>,
+    /// The vocabulary-shard exchange (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`); `None` when off or
+    /// declined.
+    vocab: Option<Arc<VocabExchange>>,
     ranks: usize,
     /// The EP reserve-sharing plan receipt every rank agreed on at attach;
     /// `None` on an ordinary (non-reserve-sharing) load.
@@ -1440,6 +1456,12 @@ impl Qwen4EpMesh {
     /// with a receipt refuses dynamic lane staging.
     pub fn reserve_receipt(&self) -> Option<&EpReserveMeshReceipt> {
         self.reserve.as_ref()
+    }
+
+    /// The EP2 vocabulary-shard exchange (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`); `None` when the switch
+    /// is off or the load declined it.
+    pub fn vocab_exchange(&self) -> Option<&Arc<VocabExchange>> {
+        self.vocab.as_ref()
     }
 
     /// Device memory in use on every rank's GPU when the mesh was attached
@@ -1518,6 +1540,7 @@ impl Qwen4EpMesh {
             tile,
             split,
             ar_hc,
+            vocab,
             ..
         } = self;
         let mut first: Option<String> = None;
@@ -1547,6 +1570,11 @@ impl Qwen4EpMesh {
         if let Some(ar_hc) = ar_hc {
             if let Err(error) = ar_hc.release(0, gpu) {
                 first.get_or_insert(format!("rank 0: release trunk-shard mailboxes: {error}"));
+            }
+        }
+        if let Some(vocab) = vocab {
+            if let Err(error) = vocab.release(0, gpu) {
+                first.get_or_insert(format!("rank 0: release vocab-shard buffers: {error}"));
             }
         }
         first.map_or(Ok(()), Err)
@@ -1721,6 +1749,7 @@ impl Qwen4Bundle {
                         tile: None,
                         split: None,
                         ar_hc: None,
+                        vocab: None,
                     };
                     let checked = peer
                         .check_seal(&seal)
@@ -1798,6 +1827,7 @@ impl Qwen4Bundle {
         let ar_hc_slot: Mutex<Option<Arc<ArHcExchange>>> = Mutex::new(None);
         let peer_board_slot: Mutex<Option<Arc<crate::expert_unit_tail::PeerBoard>>> =
             Mutex::new(None);
+        let vocab_slot: Mutex<Option<Arc<VocabExchange>>> = Mutex::new(None);
         let release_rank0 = |gpu: &mut Gpu, error: String| -> String {
             gather.abort();
             let _ = gather.release(0, gpu);
@@ -1805,6 +1835,10 @@ impl Qwen4Bundle {
             if let Some(ar_hc) = lock(&ar_hc_slot).as_ref() {
                 ar_hc.disable();
                 let _ = ar_hc.release(0, gpu);
+            }
+            if let Some(vocab) = lock(&vocab_slot).as_ref() {
+                vocab.abort();
+                let _ = vocab.release(0, gpu);
             }
             if let Some(tile) = lock(&tile_slot).as_ref() {
                 tile.abort();
@@ -2038,6 +2072,90 @@ impl Qwen4Bundle {
                 None
             };
 
+        // 2e. Vocabulary-sharded target LM head (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`, X1): every rank
+        // allocates its exchange buffers (the packed shard logits and top-1 ids rank 0 reads
+        // through peer pointers, the candidate table) and its event now, before P2P is enabled
+        // below (ROCm does not map later allocations). A forced switch on a load that cannot run
+        // it refuses the attach; the default only declines.
+        let vocab_exchange: Option<Arc<VocabExchange>> = {
+            let vocab = self.config.vocab_size;
+            let decision = ep_vocab_shard::attach_decision(
+                ep_vocab_shard::vocab_shard_switch(),
+                crate::weights::trunk_shard::default_applies(),
+                ranks,
+                vocab,
+                ep_vocab_shard::blocker(split_mode.is_some()),
+            );
+            // The MQ2 draft head's shard rides the same exchange (its partial scratch is
+            // allocated with it, before P2P): `HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD=1` without an
+            // attached exchange refuses the attach.
+            let draft_shard = match ep_vocab_shard::draft_attach_decision(
+                ep_vocab_shard::draft_vocab_shard_switch(),
+                matches!(decision, Ok(AttachDecision::Attach)),
+            ) {
+                Ok(decision) => decision == AttachDecision::Attach,
+                Err(error) => return Err(release_rank0(gpu, error)),
+            };
+            match decision {
+                Err(error) => return Err(release_rank0(gpu, error)),
+                Ok(AttachDecision::Off) => None,
+                Ok(AttachDecision::Declined(reason)) => {
+                    eprintln!(
+                        "qwen4 EP: vocabulary-sharded head declined ({reason}); both ranks keep \
+                         the whole head"
+                    );
+                    None
+                }
+                Ok(AttachDecision::Attach) => {
+                    let exchange = match VocabExchange::new(vocab, ep_vocab_shard::VOCAB_SHARD_ROWS)
+                    {
+                        Ok(exchange) => Arc::new(exchange.with_draft_rows(if draft_shard {
+                            ep_vocab_shard::DRAFT_SHARD_ROWS
+                        } else {
+                            0
+                        })),
+                        Err(error) => return Err(release_rank0(gpu, error)),
+                    };
+                    *lock(&vocab_slot) = Some(exchange.clone());
+                    // A failed rank never reaches the exchange's barrier: release the other one
+                    // at once.
+                    let gate = exchange.clone();
+                    pool.set_abort(move || gate.abort());
+                    let registered = {
+                        let gpu0 = &mut *gpu;
+                        pool.run_all(
+                            || {
+                                exchange
+                                    .register_rank(0, gpu0)
+                                    .map_err(|e| format!("register vocab-shard buffers: {e}"))
+                            },
+                            &|rank, peer: &mut Qwen4EpPeer| {
+                                peer.vocab = Some(exchange.clone());
+                                exchange
+                                    .register_rank(rank, &mut peer.gpu)
+                                    .map_err(|e| format!("register vocab-shard buffers: {e}"))
+                            },
+                        )
+                    };
+                    if let Err(error) = registered {
+                        return Err(release_rank0(gpu, error));
+                    }
+                    eprintln!(
+                        "qwen4 EP: vocabulary-sharded target head on (each rank projects and scans \
+                         {} of {vocab} head rows; HIPFIRE_QWEN4_EP_VOCAB_SHARD=0 restores the whole \
+                         head on both); MQ2 draft head shard {}",
+                        exchange.width(),
+                        if draft_shard {
+                            "on (HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD=0 restores the whole draft head)"
+                        } else {
+                            "off"
+                        }
+                    );
+                    Some(exchange)
+                }
+            }
+        };
+
         // 3. P2P after every load/allocation exists.
         let tile = lock(&tile_slot).clone();
         let split_transport = lock(&split_transport).clone();
@@ -2059,6 +2177,11 @@ impl Qwen4Bundle {
                     .enable_peers(rank, gpu)
                     .map_err(|error| format!("enable trunk-shard peer access: {error}"))?;
             }
+            if let Some(vocab) = vocab_exchange.as_ref() {
+                vocab
+                    .enable_peers(rank, gpu)
+                    .map_err(|error| format!("enable vocab-shard peer access: {error}"))?;
+            }
             Ok(())
         };
         let enabled = {
@@ -2066,6 +2189,7 @@ impl Qwen4Bundle {
             pool.run_all(|| enable(0, gpu0), &|rank, peer: &mut Qwen4EpPeer| {
                 peer.gather = Some(gather.clone());
                 peer.tile = tile.clone();
+                peer.mirrors.vocab = vocab_exchange.clone();
                 enable(rank, &mut peer.gpu)
             })
         };
@@ -2414,6 +2538,7 @@ impl Qwen4Bundle {
             tile,
             split,
             ar_hc,
+            vocab: vocab_exchange,
             reserve,
             ranks,
             device_ids,

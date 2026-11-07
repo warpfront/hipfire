@@ -47,6 +47,9 @@ pub const LL_Q: usize = 13;
 pub const LL_BLOCKED: usize = 14;
 pub const LL_NBLOCKED: usize = 15;
 pub const LL_OUT: usize = 16;
+/// Global vocabulary id of the row pointer's element 0 (mode 1 only; the host
+/// writes 0 for every other lane).
+pub const LL_BASE: usize = 17;
 pub const LLV_LANE_WORDS: usize = 20;
 
 /// Row record fields (u32 words).
@@ -71,6 +74,17 @@ pub const LO_NTOK: usize = 3;
 pub const LO_RNG: usize = 4;
 pub const LO_TOKENS: usize = 8;
 pub const LLV_OUT_WORDS: usize = 8 + LLV_ROWS_CAP;
+
+/// Candidate row per verify row (modes 1 and 2): `g`, 0, then 64 u64 sort keys
+/// (`(~key(value) << 32) | global id`, ascending), in u32 words.
+pub const LLV_CAND_WORDS: usize = 2 + 2 * 64;
+
+/// `mode` kernarg: today's whole-row kernel.
+const MODE_FULL: i32 = 0;
+/// `mode` kernarg: scan the row as a vocabulary shard, publish the candidate row.
+const MODE_SELECT: i32 = 1;
+/// `mode` kernarg: merge two candidate rows, then today's p table and verdict.
+const MODE_MERGED: i32 = 2;
 
 /// "No EOS" marker of [`LL_EOS`].
 pub const LLV_NO_EOS: u32 = u32::MAX;
@@ -111,22 +125,92 @@ impl Gpu {
     /// Enqueue the lane-wide verify over `layout.rows` rows. `region` holds
     /// the uploaded `[out | lanes | rows | inputs]` words (every out record
     /// zeroed); `ptab` holds `layout.rows * LLV_P_WORDS` floats. No readback.
+    /// Mode 0: the whole row, every lane's [`LL_BASE`] word 0.
     pub fn lane_leviathan_verify_enqueue(
         &mut self,
         region: &GpuTensor,
         layout: LaneLeviathanLayout,
         ptab: &GpuTensor,
     ) -> HipResult<()> {
-        if layout.rows == 0 {
-            return Ok(());
+        self.lane_leviathan_launch(region, layout, Some(ptab), MODE_FULL, 0, 0)
+    }
+
+    /// Mode 1 (select): each row's workgroup scans its row `L[0..LL_VOCAB)` as the
+    /// vocabulary shard starting at global id [`LL_BASE`] and writes its sorted
+    /// top-g to row `r` of `cand` (`layout.rows * LLV_CAND_WORDS` words). No p
+    /// table, no ticket: the `out` records are untouched.
+    pub fn lane_leviathan_select_enqueue(
+        &mut self,
+        region: &GpuTensor,
+        layout: LaneLeviathanLayout,
+        cand: &GpuTensor,
+    ) -> HipResult<()> {
+        let cand_ptr = Self::lane_leviathan_cand_ptr(layout, cand, "select")?;
+        self.lane_leviathan_launch(region, layout, None, MODE_SELECT, cand_ptr, 0)
+    }
+
+    /// Mode 2 (merged): each row's workgroup merges row `r` of `cand_local` with row
+    /// `r` of the peer table at device address `cand_peer` (same layout), then runs
+    /// today's p table (into `ptab`), ticket and lane verdict.
+    pub fn lane_leviathan_merged_enqueue(
+        &mut self,
+        region: &GpuTensor,
+        layout: LaneLeviathanLayout,
+        ptab: &GpuTensor,
+        cand_local: &GpuTensor,
+        cand_peer: u64,
+    ) -> HipResult<()> {
+        if cand_peer == 0 {
+            return Err(HipError::new(
+                0,
+                "lane_leviathan_merged: null peer candidate table",
+            ));
         }
-        if ptab.numel() < layout.rows * LLV_P_WORDS || region.numel() < layout.inputs_off() {
+        let cand_ptr = Self::lane_leviathan_cand_ptr(layout, cand_local, "merged")?;
+        self.lane_leviathan_launch(region, layout, Some(ptab), MODE_MERGED, cand_ptr, cand_peer)
+    }
+
+    fn lane_leviathan_cand_ptr(
+        layout: LaneLeviathanLayout,
+        cand: &GpuTensor,
+        what: &str,
+    ) -> HipResult<u64> {
+        if layout.rows > 0 && cand.numel() < layout.rows * LLV_CAND_WORDS {
             return Err(HipError::new(
                 0,
                 &format!(
-                    "lane_leviathan_verify: region {} / ptab {} words too small for {:?}",
+                    "lane_leviathan_{what}: cand {} words too small for {} rows x {LLV_CAND_WORDS}",
+                    cand.numel(),
+                    layout.rows
+                ),
+            ));
+        }
+        Ok(cand.buf.as_ptr() as u64)
+    }
+
+    fn lane_leviathan_launch(
+        &mut self,
+        region: &GpuTensor,
+        layout: LaneLeviathanLayout,
+        ptab: Option<&GpuTensor>,
+        mode: i32,
+        cand_local: u64,
+        cand_peer: u64,
+    ) -> HipResult<()> {
+        if layout.rows == 0 {
+            return Ok(());
+        }
+        if region.numel() < layout.inputs_off()
+            || ptab.is_some_and(|p| p.numel() < layout.rows * LLV_P_WORDS)
+            || (mode == MODE_SELECT && ptab.is_some())
+            || (mode != MODE_SELECT && ptab.is_none())
+        {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "lane_leviathan_verify: region {} / ptab {:?} words too small for {:?} (mode {mode})",
                     region.numel(),
-                    ptab.numel(),
+                    ptab.map(|p| p.numel()),
                     layout
                 ),
             ));
@@ -136,12 +220,18 @@ impl Gpu {
         let mut region_ptr = region.buf.as_ptr();
         let mut lanes_off = layout.lanes_off() as i32;
         let mut rows_off = layout.rows_off() as i32;
-        let mut ptab_ptr = ptab.buf.as_ptr();
+        let mut ptab_ptr = ptab.map_or(std::ptr::null_mut(), |p| p.buf.as_ptr());
+        let mut mode_arg = mode;
+        let mut cand_local_arg = cand_local;
+        let mut cand_peer_arg = cand_peer;
         let mut params: Vec<*mut c_void> = vec![
             &mut region_ptr as *mut _ as *mut c_void,
             &mut lanes_off as *mut _ as *mut c_void,
             &mut rows_off as *mut _ as *mut c_void,
             &mut ptab_ptr as *mut _ as *mut c_void,
+            &mut mode_arg as *mut _ as *mut c_void,
+            &mut cand_local_arg as *mut _ as *mut c_void,
+            &mut cand_peer_arg as *mut _ as *mut c_void,
         ];
         let func = &self.functions[FUNC];
         unsafe {
@@ -201,6 +291,7 @@ mod tests {
             ("LL_BLOCKED", LL_BLOCKED),
             ("LL_NBLOCKED", LL_NBLOCKED),
             ("LL_OUT", LL_OUT),
+            ("LL_BASE", LL_BASE),
             ("LR_PTR_LO", LR_PTR_LO),
             ("LR_PTR_HI", LR_PTR_HI),
             ("LR_LANE", LR_LANE),
@@ -224,5 +315,7 @@ mod tests {
         assert_eq!(LLV_P_WORDS, 4 + 2 * numeric("LLV_G_MAX"));
         assert_eq!(defines["LLV_OUT_WORDS"], "(8 + LLV_MAX_ROWS)");
         assert_eq!(LLV_OUT_WORDS, 8 + LLV_ROWS_CAP);
+        assert_eq!(defines["LLV_CAND_WORDS"], "(2 + 2 * LLV_G_MAX)");
+        assert_eq!(LLV_CAND_WORDS, 2 + 2 * numeric("LLV_G_MAX"));
     }
 }

@@ -800,6 +800,9 @@ pub(crate) struct RankPrepare<'a> {
     pub row_begin: usize,
     /// The lane's target pick at every verify row.
     pub picks: &'a [u32],
+    /// `picks` are shard-local ids of a vocabulary-sharded head (not target picks): no window
+    /// acceptance may be computed from them, the decision is replayed instead.
+    pub shard_local_picks: bool,
     /// Lab negative control (rejected verify keeps its rows).
     pub skip_rollback: bool,
     /// The store's Append scratch when the lane commit fill is on
@@ -904,11 +907,19 @@ pub(crate) fn prepare_rank_lane(
                 LaneKind::Forced(t) => Some(forced_acceptance(t)),
                 // A sampled window's tokens are the root's draws: the rank
                 // replays the decision (its own argmax picks are evidence only).
-                LaneKind::Decode if p.plan.sampling != SamplingMode::Greedy => Some(GreedyAccept {
-                    committed: d.emitted.clone(),
-                    accepted: d.accepted,
-                    hit_eos: d.hit_eos,
-                }),
+                // A rank whose head ran a vocabulary shard (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`,
+                // a non-sampler rank of a `VerifyPlan::vocab_shard` step) holds shard-local
+                // picks that are no acceptance input at all: a greedy window replays the
+                // root's decision the same way.
+                LaneKind::Decode
+                    if p.plan.sampling != SamplingMode::Greedy || p.shard_local_picks =>
+                {
+                    Some(GreedyAccept {
+                        committed: d.emitted.clone(),
+                        accepted: d.accepted,
+                        hit_eos: d.hit_eos,
+                    })
+                }
                 LaneKind::Decode => None,
             };
             let prepared = prepare_lane_window_with(

@@ -1615,6 +1615,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "qwen4-ep-vocab-shard-eager-only",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "hipfire-arch-qwen4 forward_lanes_scoped (gpu_forward_lanes.rs): a step carrying a Flash-Next EP2 vocabulary shard (`LaneOutputs::vocab_shard`, HIPFIRE_QWEN4_EP_VOCAB_SHARD) errors before any launch when `gpu.replay.is_recording() || gpu.graphs.capture_mode`; the shard's peer exchange is host-ordered and runs only eager",
+        effect: Refusal,
+        switches: "error before any launch vs the eager sharded head stage (half-width MQ6 projection, shard-local argmax, peer merge)",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "the refused branch launches nothing; the root plans a shard only for eager AR / verify steps, so no recorded or captured program contains the sharded head or its exchange",
+        reaches: &[],
+    },
+    Decision {
         id: "qwen4-lane-hc-allrows-eager-only",
         predicates: &[IsRecording, CaptureMode],
         condition: "hipfire-arch-qwen4 forward_lanes_scoped (gpu_forward_lanes.rs) via LaneAllRowsRule::from_parts (its `eager` fact, also the mesh root's plan-time rule) and hc_all_rows_applies: an AR / verify lane step of more than LANE_MAX_ROWS rows runs its HC stages (layer reads, the writes no TP2 all-reduce carries, the final read) as ONE all-rows segment under HIPFIRE_QWEN4_LANE_HC_ALLROWS (exact gfx1201, default on, `=0` kills it) only while `!(gpu.replay.is_recording() || gpu.graphs.capture_mode)` and outside the prefill-invariant scope; a recorded or captured step keeps the per <= 8-row group emission",
@@ -2330,8 +2341,12 @@ pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-arch-qwen4/src/gpu_forward_lanes.rs",
         function: "forward_lanes_scoped",
-        occurrences: 2,
-        decisions: &["qwen4-ple-async-upload", "qwen4-lane-token-ids-async"],
+        occurrences: 4,
+        decisions: &[
+            "qwen4-ple-async-upload",
+            "qwen4-lane-token-ids-async",
+            "qwen4-ep-vocab-shard-eager-only",
+        ],
     },
     Site {
         file: "hipfire-arch-qwen4/src/gpu_forward_lanes.rs",

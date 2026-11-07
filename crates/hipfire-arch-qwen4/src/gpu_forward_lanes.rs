@@ -124,6 +124,7 @@ use crate::program::{
 };
 use crate::state::Qwen4State;
 use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::pipeline::{
     execute_embedding, execute_validated_steps, execute_validated_steps_with_moe_hooks,
     validate_steps, ClearOp, EmbeddingOp, GatedDeltaNetOp, GroupedDepthwiseOp, HyperReadOp,
@@ -1062,6 +1063,18 @@ pub struct LaneRows<'a> {
     pub wide: bool,
 }
 
+/// A vocabulary shard of the step's LM head (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`): the rank projects
+/// and scans only the head rows `[base, base + width)`. The step's logits are PACKED
+/// `[rows][width]` in the first `rows * width` elements of [`LaneOutputs::logits`] and the top-1
+/// ids are LOCAL to the shard (`0..width`); the caller adds `base` where it merges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VocabShardView {
+    /// Global id of the shard's first head row.
+    pub base: usize,
+    /// Head rows in the shard (the logits row width).
+    pub width: usize,
+}
+
 /// The step's outputs; row `r` belongs to the lanes concatenated in order.
 pub struct LaneOutputs<'a> {
     /// F32, at least `total_rows * vocab` elements.
@@ -1072,6 +1085,11 @@ pub struct LaneOutputs<'a> {
     /// final HC streams (the trunk output before the final hyper read),
     /// exactly what the singleton's wide-hidden capture writes.
     pub wide_hidden: Option<&'a GpuTensor>,
+    /// The vocabulary shard this rank's head runs ([`VocabShardView`]): `logits` then hold
+    /// `total_rows * width` packed elements and `top1` holds shard-local ids. `None`: the whole
+    /// head, today's layout. Only an AR / verify step of the output band takes a shard (refused
+    /// for prefill waves, recorded or captured steps).
+    pub vocab_shard: Option<VocabShardView>,
 }
 
 /// Which logits a prefill wave writes.
@@ -1130,6 +1148,57 @@ impl<'a> StepOutputs<'a> {
     fn prefill(&self) -> bool {
         matches!(self, Self::Wave(_) | Self::Edge { prefill: true })
     }
+}
+
+/// The head rows `[shard.base, shard.base + shard.width)` of the resident LM head as a
+/// non-owning byte sub-tensor of the same allocation (rows are contiguous, `row_stride` bytes
+/// each). Refuses any head whose allocation is not exactly `m * row_stride` bytes (a padded or
+/// sidecar-carrying layout has no per-row slice) and any slice that is not 256-byte aligned.
+fn lm_head_row_slice(
+    full: &WeightRef<'_>,
+    shard: VocabShardView,
+    vocab: usize,
+) -> Result<GpuTensor, Qwen4GpuForwardError> {
+    let overflow = || invalid("vocabulary shard byte range overflows");
+    if full.m != vocab {
+        return Err(invalid(format!(
+            "vocabulary shard: the LM head has {} rows, the vocabulary is {vocab}",
+            full.m
+        )));
+    }
+    if full.rotation.is_some() || full.awq_scale.is_some() {
+        return Err(invalid(
+            "vocabulary shard: the LM head carries a rotation / scale sidecar",
+        ));
+    }
+    let row_bytes = full.row_stride;
+    let total = full.m.checked_mul(row_bytes).ok_or_else(overflow)?;
+    if row_bytes == 0 || full.buf.buf.size() != total {
+        return Err(invalid(format!(
+            "vocabulary shard: the LM head allocation is {} bytes, {} rows of {row_bytes} bytes \
+             are {total}",
+            full.buf.buf.size(),
+            full.m
+        )));
+    }
+    let offset = shard.base.checked_mul(row_bytes).ok_or_else(overflow)?;
+    let len = shard.width.checked_mul(row_bytes).ok_or_else(overflow)?;
+    if shard
+        .base
+        .checked_add(shard.width)
+        .map_or(true, |end| end > vocab)
+        || offset % 256 != 0
+    {
+        return Err(invalid(format!(
+            "vocabulary shard [{}, +{}) is not a 256-byte aligned slice of the {vocab}-row head",
+            shard.base, shard.width
+        )));
+    }
+    Ok(GpuTensor {
+        buf: full.buf.buf.byte_view(offset, len),
+        shape: vec![len / full.dtype.size().max(1)],
+        dtype: full.dtype,
+    })
 }
 
 /// A contiguous row range of the step: one lane, or a group of lanes a
@@ -2383,6 +2452,38 @@ fn forward_lanes_scoped(
     let config = &bundle.config;
     let dims = program_dims(config);
     let vocab = config.vocab_size;
+    // The logits row width of the head stage: the vocabulary, or the rank's vocabulary shard
+    // (`LaneOutputs::vocab_shard`, packed `[rows][width]`, shard-local top-1 ids). A shard is
+    // an eager AR / verify step of the output band: a prefill wave, an edge step, a recorded
+    // or captured step refuses it (the exchange around it is host-ordered, never replayed).
+    let vocab_shard = match out {
+        StepOutputs::Ar(out) => out.vocab_shard,
+        StepOutputs::Wave(_) | StepOutputs::Edge { .. } => None,
+    };
+    if let Some(shard) = vocab_shard {
+        if out.prefill() || !band_scope.output {
+            return Err(invalid(
+                "a vocabulary shard is an AR / verify step of the output band",
+            ));
+        }
+        if gpu.replay.is_recording() || gpu.graphs.capture_mode {
+            return Err(invalid(
+                "a vocabulary shard cannot be recorded or captured (its exchange is host-ordered)",
+            ));
+        }
+        if shard.width == 0
+            || shard
+                .base
+                .checked_add(shard.width)
+                .map_or(true, |end| end > vocab)
+        {
+            return Err(invalid(format!(
+                "vocabulary shard [{}, +{}) is outside the {vocab}-row head",
+                shard.base, shard.width
+            )));
+        }
+    }
+    let head_width = vocab_shard.map_or(vocab, |shard| shard.width);
     let rows: Vec<usize> = lanes.iter().map(|lane| lane.tokens.len()).collect();
     let n: usize = rows.iter().sum();
     let prefill = out.prefill();
@@ -2497,9 +2598,9 @@ fn forward_lanes_scoped(
     fwd.scratch.note_forward_rows(n);
     match out {
         StepOutputs::Ar(out) => {
-            if out.logits.dtype != DType::F32 || out.logits.numel() < n * vocab {
+            if out.logits.dtype != DType::F32 || out.logits.numel() < n * head_width {
                 return Err(invalid(
-                    "lane logits must be F32 with total_rows * vocab elements",
+                    "lane logits must be F32 with total_rows * vocab (or shard width) elements",
                 ));
             }
             if out.top1.dtype != DType::Raw || out.top1.buf.size() < n * std::mem::size_of::<i32>()
@@ -2798,6 +2899,28 @@ fn forward_lanes_scoped(
         seg_desc_rows.push(seg_desc_rows[lane_segs.len()]);
         all_segs.len() - 1
     });
+    if vocab_shard.is_some() {
+        // The packed `[rows][width]` layout holds only if the head stages' segments tile the
+        // step's rows contiguously in order (each segment writes its rows at `begin * width`):
+        // the all-rows segment, the lanes, or the packed groups. Anything else refuses.
+        for stage in [StageName::Head, StageName::Argmax] {
+            let mut next = 0usize;
+            for i in ar_segs(policy.share(stage)) {
+                let seg = &all_segs[i];
+                if seg.begin != next {
+                    return Err(invalid(
+                        "a vocabulary shard needs head segments that tile the step's rows in order",
+                    ));
+                }
+                next += seg.rows;
+            }
+            if next != n {
+                return Err(invalid(
+                    "a vocabulary shard needs head segments that cover every row of the step",
+                ));
+            }
+        }
+    }
 
     // Token ids: one upload for every row, in lane order (the input band
     // embeds them; every other band runs from received HC streams). Outside a
@@ -2873,7 +2996,7 @@ fn forward_lanes_scoped(
             views.push(SegViews::new(
                 scratch,
                 dims,
-                vocab,
+                head_width,
                 ar_out,
                 *seg,
                 ple_head_count * ple_row_width,
@@ -3020,13 +3143,33 @@ fn forward_lanes_scoped(
             false
         };
         // The head descriptions exist on the output band only.
-        let head = if band_scope.output {
-            Some((
-                hyper_read_desc(&bundle.weights, &bundle.weights.root.final_hyper)?,
-                dense_ref(&bundle.weights, &bundle.weights.root.lm_head)?,
-            ))
+        // The vocabulary shard's rows of the resident head ([`LaneOutputs::vocab_shard`]): a byte
+        // sub-tensor of the same allocation, `width` rows long.
+        let lm_full = if band_scope.output {
+            Some(dense_ref(&bundle.weights, &bundle.weights.root.lm_head)?)
         } else {
             None
+        };
+        let lm_slice: Option<GpuTensor> = match (vocab_shard, lm_full.as_ref()) {
+            (Some(shard), Some(full)) => Some(lm_head_row_slice(full, shard, vocab)?),
+            _ => None,
+        };
+        let head = match lm_full {
+            Some(full) => {
+                let lm_head = match lm_slice.as_ref() {
+                    Some(slice) => WeightRef {
+                        buf: slice,
+                        m: head_width,
+                        ..full
+                    },
+                    None => full,
+                };
+                Some((
+                    hyper_read_desc(&bundle.weights, &bundle.weights.root.final_hyper)?,
+                    lm_head,
+                ))
+            }
+            None => None,
         };
         let head_ref = || {
             head.as_ref()
@@ -3179,7 +3322,7 @@ fn forward_lanes_scoped(
                 SegViews::new(
                     scratch,
                     dims,
-                    vocab,
+                    head_width,
                     ar_out,
                     Segment {
                         begin: lane_segs[*first].begin,
@@ -3966,7 +4109,7 @@ fn forward_lanes_scoped(
                 gpu,
                 &lm_head,
                 &hidden,
-                &view(&v.logits, 0, seg.rows * vocab),
+                &view(&v.logits, 0, seg.rows * head_width),
                 seg.rows,
                 seg.rows,
                 Some(&rotation),
@@ -3984,10 +4127,10 @@ fn forward_lanes_scoped(
             argmax_f32(
                 gpu,
                 &ArgmaxF32 {
-                    logits: &view(&v.logits, 0, seg.rows * vocab),
+                    logits: &view(&v.logits, 0, seg.rows * head_width),
                     indices: &v.top1,
                     rows: seg.rows,
-                    vocab,
+                    vocab: head_width,
                 },
             )?;
         }

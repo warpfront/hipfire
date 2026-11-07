@@ -47,6 +47,7 @@ pub(crate) mod test_tmp;
 pub mod valu_sched;
 pub mod vopd;
 pub mod kernels {
+    pub mod argmax_pair_merge_pm;
     pub mod argmax_regrid_pm;
     pub mod bf16;
     pub mod ceil_probe;
@@ -130,6 +131,7 @@ pub mod kernels {
     pub mod qwen4_slab_union_plan;
     pub mod spec_accept_pm;
     pub mod spec_sampling_rows_pm;
+    pub mod topk8_partial_blocks_pm;
     /// gfx942 (CDNA3) kernels built with `crate::cdna::builder`.
     pub mod cdna {
         pub mod fp8_act_producer;

@@ -13,8 +13,11 @@
 use super::layer_ops::{execute_argmax, hip, project_weight};
 use crate::families::gemv::WeightRef;
 use crate::types::DispatchError;
+use hip_bridge::DeviceBuffer;
+use rdna_compute::gemv::TOPK8_GROUPS;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use smallvec::SmallVec;
+use std::ffi::c_void;
 
 /// Ranking-copy policy: an optional lower-bit copy of the language head
 /// that drafts rank the vocabulary with, and whether its top 8 are
@@ -97,6 +100,173 @@ pub struct DraftHead {
     /// Last draft's re-scored `(token, exact logit)` candidates (re-scoring
     /// only; zeroed otherwise).
     candidates: [(u32, f32); 8],
+    /// The vocabulary-shard context of the current replicated head round (`None` outside one);
+    /// see [`DraftShard`].
+    shard: Option<DraftShard>,
+}
+
+/// Groups (partial blocks) each EP rank reduces of a sharded draft: half of the 128.
+const SHARD_GROUPS: usize = TOPK8_GROUPS / 2;
+
+/// This rank's `(first row, rows)` of a ranked row of `ranked` rows: the split falls on the
+/// partial-block boundary `64 * ceil(ranked / 128)`, so each rank owns exactly 64 of the 128
+/// groups and every group's rows are its own.
+fn shard_range(ranked: usize, rank: usize) -> (usize, usize) {
+    let split = (SHARD_GROUPS * ranked.div_ceil(TOPK8_GROUPS)).min(ranked);
+    if rank == 0 {
+        (0, split)
+    } else {
+        (split, ranked - split)
+    }
+}
+
+/// A non-owning view of rows `[lo, lo + rows)` of a ranking copy (rows are contiguous, in the
+/// copy's layout order).
+fn copy_rows(
+    copy: &GpuTensor,
+    hidden: usize,
+    lo: usize,
+    rows: usize,
+) -> Result<GpuTensor, DispatchError> {
+    let row_bytes = copy.dtype.row_bytes(hidden).ok_or_else(|| {
+        DispatchError::Hip(format!("draft shard: {:?} has no row size", copy.dtype))
+    })?;
+    let (offset, len) = (lo * row_bytes, rows * row_bytes);
+    if offset + len > copy.buf.size() {
+        return Err(DispatchError::Hip(format!(
+            "draft shard: rows [{lo}, {}) of the ranking copy exceed its {} bytes",
+            lo + rows,
+            copy.buf.size()
+        )));
+    }
+    Ok(GpuTensor {
+        buf: copy.buf.byte_view(offset, len),
+        shape: vec![len],
+        dtype: copy.dtype,
+    })
+}
+
+/// The cross-rank context of a vocabulary-sharded draft round ([`DraftHead::set_shard`]).
+///
+/// The two EP ranks each rank HALF of a draft's ranked rows: rank `r` runs the MQ2 GEMV over
+/// the rows of its 64 partial blocks and reduces those blocks into its half of a partial slot;
+/// the halves are copied into the peer's identical slot, `exchange` orders them (publish, host
+/// barrier, device wait on the peer), and both ranks then run the same exact re-score over the
+/// same 1,024 pairs, so both hold today's 72-byte slot. Every draft row of the round claims its
+/// own slot of `partial_rows` (the round has at most one draft per lane), so a peer's copy of
+/// one draft never lands on a slot another draft's re-score still reads.
+pub struct DraftShard {
+    rank: usize,
+    /// This rank's partial scratch: `rows` slots of [`Gpu::TOPK8_PARTIAL_BYTES`] (Raw, a view).
+    partial_rows: GpuTensor,
+    /// Device address of the peer's identical scratch (valid on this rank's device).
+    peer_partial_rows: u64,
+    /// HIP device id the peer's scratch lives on.
+    peer_device: i32,
+    /// One exchange: publish this rank's event, meet the peer's host, wait on the peer's event
+    /// on the device. Called once per draft call (a batched class is one call), in the same
+    /// order on both ranks.
+    exchange: Box<dyn FnMut(&mut Gpu) -> Result<(), DispatchError> + Send>,
+    /// Slots claimed so far in this round.
+    used: usize,
+}
+
+impl DraftShard {
+    /// Ranks a draft shard splits the head between.
+    pub const RANKS: usize = 2;
+
+    pub fn new(
+        rank: usize,
+        partial_rows: GpuTensor,
+        peer_partial_rows: u64,
+        peer_device: i32,
+        exchange: Box<dyn FnMut(&mut Gpu) -> Result<(), DispatchError> + Send>,
+    ) -> Result<Self, DispatchError> {
+        if rank >= Self::RANKS
+            || peer_partial_rows == 0
+            || partial_rows.dtype != DType::Raw
+            || partial_rows.byte_size() < Gpu::TOPK8_PARTIAL_BYTES
+        {
+            return Err(DispatchError::Hip(format!(
+                "draft shard: rank {rank}, peer scratch {peer_partial_rows:#x}, local scratch \
+                 {:?} x {} bytes",
+                partial_rows.dtype,
+                partial_rows.byte_size()
+            )));
+        }
+        Ok(Self {
+            rank,
+            partial_rows,
+            peer_partial_rows,
+            peer_device,
+            exchange,
+            used: 0,
+        })
+    }
+
+    /// Draft rows the partial scratch holds.
+    pub fn rows(&self) -> usize {
+        self.partial_rows.byte_size() / Gpu::TOPK8_PARTIAL_BYTES
+    }
+
+    /// Claim `rows` consecutive slots for one draft call; the index of the first.
+    fn claim(&mut self, rows: usize) -> Result<usize, DispatchError> {
+        let first = self.used;
+        if first + rows > self.rows() {
+            return Err(DispatchError::Hip(format!(
+                "draft shard: {} draft rows in one round exceed the {} partial slots",
+                first + rows,
+                self.rows()
+            )));
+        }
+        self.used += rows;
+        Ok(first)
+    }
+}
+
+/// Push this rank's halves of slots `first..first + rows` (pv words `[512 r, 512 r + 512)` and the
+/// same words of pi) into the peer's identical slots on the active stream, then run the
+/// exchange: the peer's copies into this rank's scratch are complete on the device once the
+/// exchange's wait returns.
+fn shard_exchange(
+    shard: &mut DraftShard,
+    gpu: &mut Gpu,
+    first: usize,
+    rows: usize,
+) -> Result<(), DispatchError> {
+    let half = SHARD_GROUPS * 8 * std::mem::size_of::<f32>();
+    let pi_base = TOPK8_GROUPS * 8 * std::mem::size_of::<f32>();
+    // SAFETY: the peer's scratch is a live device allocation of the same size as this rank's
+    // (the exchange allocated both before peer access was enabled); the view is non-owning.
+    let peer = unsafe {
+        DeviceBuffer::from_raw(
+            shard.peer_partial_rows as *mut c_void,
+            shard.partial_rows.buf.size(),
+        )
+    };
+    for slot in first..first + rows {
+        for base in [0, pi_base] {
+            let offset = slot * Gpu::TOPK8_PARTIAL_BYTES + base + shard.rank * half;
+            let src = shard.partial_rows.buf.byte_view(offset, half);
+            let dst = peer.byte_view(offset, half);
+            match gpu.active_stream.as_ref() {
+                Some(stream) => hip(gpu.hip.memcpy_peer_async(
+                    &dst,
+                    shard.peer_device,
+                    &src,
+                    gpu.device_id,
+                    half,
+                    stream,
+                ))?,
+                None => {
+                    hip(gpu
+                        .hip
+                        .memcpy_peer(&dst, shard.peer_device, &src, gpu.device_id, half))?
+                }
+            }
+        }
+    }
+    (shard.exchange)(gpu)
 }
 
 /// Ranked row count and the `(front, special, tail)` order the re-score
@@ -242,6 +412,7 @@ impl DraftHead {
             full_steps: 0,
             margin: f32::INFINITY,
             candidates: [(0, f32::NEG_INFINITY); 8],
+            shard: None,
         })
     }
 
@@ -412,6 +583,23 @@ impl DraftHead {
                     self.rank_row(gpu, head, &hidden_row, &out, holds[row])?;
                 }
                 count => {
+                    if self.shard_applies() {
+                        let mut shard = self.shard.take().expect("draft shard");
+                        let result = self.rank_class_sharded(
+                            &mut shard,
+                            gpu,
+                            head,
+                            hidden_rows,
+                            rotation_rows,
+                            logits_rows,
+                            top1_out,
+                            &members,
+                            holds[members[0]],
+                        );
+                        self.shard = Some(shard);
+                        result?;
+                        continue;
+                    }
                     let (ranked, order) =
                         ranking(self.front, self.special, self.vocab, holds[members[0]]);
                     let copy = self.copy.as_ref().expect("MQ2 ranking copy");
@@ -464,6 +652,12 @@ impl DraftHead {
         top1_out: &GpuTensor,
         full_steps: u32,
     ) -> Result<(), DispatchError> {
+        if self.shard_applies() {
+            let mut shard = self.shard.take().expect("draft shard");
+            let result = self.rank_row_sharded(&mut shard, gpu, head, hidden, top1_out, full_steps);
+            self.shard = Some(shard);
+            return result;
+        }
         let (ranked, order) = ranking(self.front, self.special, self.vocab, full_steps);
         let ranking_head = self.copy.as_ref().unwrap_or(head);
         if ranking_head.dtype == DType::MQ2G256V2 && gpu.mq2_xbatch_pm_active(ranked, self.hidden) {
@@ -515,6 +709,179 @@ impl DraftHead {
             execute_argmax(gpu, &self.logits, top1_out, 1, ranked)?;
         }
         Ok(())
+    }
+
+    /// Whether this call ranks through the vocabulary shard: a shard context is installed
+    /// ([`Self::set_shard`]), the re-score path is active (`partial`) and the ranking copy is
+    /// MQ2G256V2. Anything else runs the launches of the unsharded head, byte for byte.
+    fn shard_applies(&self) -> bool {
+        self.shard.is_some()
+            && self.partial.is_some()
+            && self
+                .copy
+                .as_ref()
+                .is_some_and(|copy| copy.dtype == DType::MQ2G256V2)
+    }
+
+    /// [`Self::rank_row`] on this rank's half of the ranked rows (see [`DraftShard`]): the MQ2
+    /// GEMV over rows `[lo, lo + m)` of the copy (the route the one-row call picks for the whole
+    /// ranked row), the partial blocks of this rank's half of the 128 groups into the call's
+    /// slot of the shard's partial scratch, one exchange of the halves, then the unchanged exact
+    /// re-score over the full partial. Both ranks run it with the same arguments.
+    fn rank_row_sharded(
+        &self,
+        shard: &mut DraftShard,
+        gpu: &mut Gpu,
+        head: &GpuTensor,
+        hidden: &GpuTensor,
+        top1_out: &GpuTensor,
+        full_steps: u32,
+    ) -> Result<(), DispatchError> {
+        let (ranked, order) = ranking(self.front, self.special, self.vocab, full_steps);
+        let copy = self.copy.as_ref().expect("MQ2 ranking copy");
+        let (lo, m) = shard_range(ranked, shard.rank);
+        let first = shard.claim(1)?;
+        let pm = gpu.mq2_xbatch_pm_active(ranked, self.hidden);
+        if m > 0 && !pm {
+            let half = copy_rows(copy, self.hidden, lo, m)?;
+            project_weight(
+                gpu,
+                &WeightRef {
+                    buf: &half,
+                    dtype: half.dtype,
+                    m,
+                    k: self.hidden,
+                    row_stride: half
+                        .dtype
+                        .row_bytes(self.hidden)
+                        .unwrap_or(self.hidden * half.dtype.size()),
+                    rotation: None,
+                    awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
+                },
+                hidden,
+                &self.logits,
+                1,
+                Some(&self.rotation),
+            )?;
+        } else {
+            // The gfx1201 PeaceMaker x-batch module at one row (or this rank's empty half): the
+            // rotated input is left in `self.rotation` exactly as `project_weight` leaves it.
+            hip(gpu.rotate_x_mq(hidden, &self.rotation, self.hidden))?;
+            if m > 0 {
+                let half = copy_rows(copy, self.hidden, lo, m)?;
+                hip(gpu.gemv_mq2g256v2_xbatch(
+                    &half,
+                    &self.rotation,
+                    &self.logits,
+                    m,
+                    self.hidden,
+                    1,
+                ))?;
+            }
+        }
+        let partial = shard
+            .partial_rows
+            .sub_offset(first * Gpu::TOPK8_PARTIAL_BYTES, Gpu::TOPK8_PARTIAL_BYTES);
+        hip(gpu.topk8_partial_blocks(
+            &self.logits,
+            lo,
+            ranked,
+            order,
+            &partial,
+            SHARD_GROUPS * shard.rank,
+            SHARD_GROUPS,
+        ))?;
+        shard_exchange(shard, gpu, first, 1)?;
+        // An MQ6 head reads the ranking copy's FWHT-rotated input.
+        let x = if head.dtype == DType::Q8_0 {
+            hidden
+        } else {
+            &self.rotation
+        };
+        hip(gpu.topk8_rescore_only(&partial, head, x, top1_out))
+    }
+
+    /// [`Self::draft_rows_enqueue`]'s batched class on this rank's half of the ranked rows: each
+    /// member row is rotated as the unsharded class does, ONE x-batched MQ2 GEMV runs over the
+    /// copy's rows `[lo, lo + m)` (`y` packed `[count][m]`), each member's partial blocks of this
+    /// rank's groups land in its own slot of the partial scratch, ONE exchange moves every
+    /// member's half, and each member's exact re-score runs on the full partial. The slots of
+    /// the class are consecutive; the result slots are the bytes a one-row call writes.
+    #[allow(clippy::too_many_arguments)]
+    fn rank_class_sharded(
+        &self,
+        shard: &mut DraftShard,
+        gpu: &mut Gpu,
+        head: &GpuTensor,
+        hidden_rows: &GpuTensor,
+        rotation_rows: &GpuTensor,
+        logits_rows: &GpuTensor,
+        top1_out: &GpuTensor,
+        members: &[usize],
+        full_steps: u32,
+    ) -> Result<(), DispatchError> {
+        let hidden = self.hidden;
+        let slot = Gpu::TOPK8_OUT_BYTES;
+        let count = members.len();
+        let (ranked, order) = ranking(self.front, self.special, self.vocab, full_steps);
+        let copy = self.copy.as_ref().expect("MQ2 ranking copy");
+        let (lo, m) = shard_range(ranked, shard.rank);
+        let first = shard.claim(count)?;
+        for (slot_in_batch, &row) in members.iter().enumerate() {
+            let hidden_row = hidden_rows.sub_offset(row * hidden, hidden);
+            let rotated = rotation_rows.sub_offset(slot_in_batch * hidden, hidden);
+            hip(gpu.rotate_x_mq(&hidden_row, &rotated, hidden))?;
+        }
+        let y = logits_rows.sub_offset(0, count * m);
+        if m > 0 {
+            let half = copy_rows(copy, hidden, lo, m)?;
+            let x = rotation_rows.sub_offset(0, count * hidden);
+            hip(gpu.gemv_mq2g256v2_xbatch(&half, &x, &y, m, hidden, count))?;
+        }
+        for slot_in_batch in 0..count {
+            let logits_row = y.sub_offset(slot_in_batch * m, m);
+            let partial = shard.partial_rows.sub_offset(
+                (first + slot_in_batch) * Gpu::TOPK8_PARTIAL_BYTES,
+                Gpu::TOPK8_PARTIAL_BYTES,
+            );
+            hip(gpu.topk8_partial_blocks(
+                &logits_row,
+                lo,
+                ranked,
+                order,
+                &partial,
+                SHARD_GROUPS * shard.rank,
+                SHARD_GROUPS,
+            ))?;
+        }
+        shard_exchange(shard, gpu, first, count)?;
+        for (slot_in_batch, &row) in members.iter().enumerate() {
+            let partial = shard.partial_rows.sub_offset(
+                (first + slot_in_batch) * Gpu::TOPK8_PARTIAL_BYTES,
+                Gpu::TOPK8_PARTIAL_BYTES,
+            );
+            let out = top1_out.sub_offset(row * slot, slot);
+            let hidden_row = hidden_rows.sub_offset(row * hidden, hidden);
+            let rotated = rotation_rows.sub_offset(slot_in_batch * hidden, hidden);
+            // An MQ6 head reads the ranking copy's FWHT-rotated input.
+            let x = if head.dtype == DType::Q8_0 {
+                &hidden_row
+            } else {
+                &rotated
+            };
+            hip(gpu.topk8_rescore_only(&partial, head, x, &out))?;
+        }
+        Ok(())
+    }
+
+    /// Install (or, with `None`, remove) the vocabulary-shard context of the drafts that follow
+    /// ([`DraftShard`]). Installed for the span of one replicated head round on both EP ranks;
+    /// without it, or without the MQ2 re-score path, every draft runs today's launches.
+    pub fn set_shard(&mut self, shard: Option<DraftShard>) {
+        self.shard = shard;
     }
 
     /// Parse a downloaded `top1_out` of [`Self::draft_enqueue`] (its first
@@ -656,5 +1023,26 @@ mod tests {
             ranking(front, special, vocab, 1),
             (vocab, (front, special, vocab - special))
         );
+    }
+
+    /// The two ranks' ranges tile the ranked rows, and the split is the partial-block
+    /// boundary: rank 0 owns exactly the rows of groups 0..64, rank 1 those of groups 64..128.
+    #[test]
+    fn shard_ranges_split_at_the_partial_block_boundary() {
+        for ranked in [1usize, 100, 128, 129, 8_192, 100_276, 248_320, 248_321] {
+            let chunk = ranked.div_ceil(TOPK8_GROUPS);
+            let (lo0, m0) = shard_range(ranked, 0);
+            let (lo1, m1) = shard_range(ranked, 1);
+            assert_eq!((lo0, lo0 + m0), (0, lo1), "ranked {ranked}");
+            assert_eq!(lo1 + m1, ranked, "ranked {ranked}");
+            // Group g covers rows [g * chunk, min(n, (g + 1) * chunk)): rank 0's 64 groups end at
+            // the split, rank 1's begin there.
+            assert_eq!(lo1, (SHARD_GROUPS * chunk).min(ranked), "ranked {ranked}");
+        }
+        // The production shapes.
+        assert_eq!(shard_range(100_276, 0), (0, 50_176));
+        assert_eq!(shard_range(100_276, 1), (50_176, 50_100));
+        assert_eq!(shard_range(248_320, 0), (0, 124_160));
+        assert_eq!(shard_range(248_320, 1), (124_160, 124_160));
     }
 }

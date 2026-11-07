@@ -41,6 +41,9 @@ pub mod ep_mesh_serve;
 pub mod ep_reserve;
 pub mod ep_seal;
 pub mod ep_trunk_split;
+/// EP2 vocabulary-sharded target LM head (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`): switch, admission and
+/// the cross-rank exchange.
+pub mod ep_vocab_shard;
 pub mod expert_keep;
 pub use expert_keep::{ExpertKeep, EXPERT_KEEP_METADATA_KEY, EXPERT_KEEP_SCHEMA};
 /// Per-layer contiguous expert slab arenas (K4 loader plan + fulfillment payload).

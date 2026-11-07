@@ -12485,6 +12485,89 @@ pub fn argmax_f32(gpu: &mut Gpu, p: &ArgmaxF32<'_>) -> HipResult<()> {
     )
 }
 
+/// Merge of two vocabulary-shard argmaxes into the full-row [`argmax_f32`] answer
+/// (`argmax_f32_pair_merge`): shard 0 is this rank's packed `[rows][w0]` logits
+/// (global ids `[0, w0)`), shard 1 the peer's packed `[rows][w1]` logits (global ids
+/// `[w0, w0 + w1)`), read through its device address (UVA peer pointer).
+pub struct ArgmaxPairMerge<'a> {
+    /// `[rows][w0]` f32 (a larger buffer is fine: the first `rows * w0` floats).
+    pub local_logits: &'a GpuTensor,
+    /// Raw, `rows` i32 local ids: [`argmax_f32`] over the packed shard (`vocab = w0`).
+    pub local_top1: &'a GpuTensor,
+    /// Device address of the peer's `[rows][w1]` f32 logits.
+    pub peer_logits: u64,
+    /// Device address of the peer's `rows` i32 local ids.
+    pub peer_top1: u64,
+    /// Raw, `rows` i32 global ids; may alias `local_top1`.
+    pub out_top1: &'a GpuTensor,
+    pub rows: usize,
+    pub w0: usize,
+    pub w1: usize,
+}
+
+impl Gpu {
+    /// Per row: the first index of the largest finite value over shard 0 ++ shard 1
+    /// (shard 0 wins ties, `+0 == -0` included), `0` when neither shard has a finite
+    /// value. One thread per row; the peer pointers must be mapped on this device.
+    pub fn argmax_f32_pair_merge(&mut self, p: &ArgmaxPairMerge<'_>) -> HipResult<()> {
+        ensure_f32(p.local_logits)?;
+        if p.rows == 0
+            || p.w0 == 0
+            || p.w1 == 0
+            || p.peer_logits == 0
+            || p.peer_top1 == 0
+            || p.local_top1.dtype != DType::Raw
+            || p.out_top1.dtype != DType::Raw
+        {
+            return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+        }
+        let local_elements = checked_product(p.rows, p.w0, "argmax pair-merge local extent")?;
+        checked_product(p.rows, p.w1, "argmax pair-merge peer extent")?;
+        checked_i32(
+            p.w0.checked_add(p.w1)
+                .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?,
+            "argmax pair-merge global vocabulary",
+        )?;
+        let top1_bytes = p
+            .rows
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
+        let rows = checked_i32(p.rows, "argmax pair-merge row count")?;
+        let w0 = checked_i32(p.w0, "argmax pair-merge local width")?;
+        let w1 = checked_i32(p.w1, "argmax pair-merge peer width")?;
+        let grid = checked_u32(p.rows.div_ceil(256), "argmax pair-merge row grid")?;
+        if p.local_logits.numel() < local_elements
+            || p.local_top1.numel() < top1_bytes
+            || p.out_top1.numel() < top1_bytes
+        {
+            return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+        }
+        self.ensure_kernel(
+            "argmax_pair_merge",
+            crate::kernels::ARGMAX_PAIR_MERGE_SRC,
+            "argmax_f32_pair_merge",
+        )?;
+        let mut args = KernargBlob::new();
+        args.push_ptr(p.local_logits.buf.as_ptr());
+        args.push_ptr(p.local_top1.buf.as_ptr());
+        args.push_ptr(p.peer_logits as *mut std::ffi::c_void);
+        args.push_ptr(p.peer_top1 as *mut std::ffi::c_void);
+        args.push_ptr(p.out_top1.buf.as_ptr());
+        args.push_i32(rows);
+        args.push_i32(w0);
+        args.push_i32(w1);
+        args.pad_to(16);
+        self.launch_blob_recorded(
+            "argmax_f32_pair_merge",
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )
+    }
+}
+
 /// [`argmax_f32`] of one logits row, read back: `llama::argmax(logits)`
 /// without downloading the row. Uses a lazily allocated 4-byte scratch.
 pub fn argmax_f32_host(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {

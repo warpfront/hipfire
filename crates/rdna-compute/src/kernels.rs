@@ -10238,6 +10238,10 @@ pub const SAMPLE_TOP_P_PARALLEL_SRC: &str =
 /// sampler's law; the last row of each lane runs its Leviathan verdict.
 pub const LANE_LEVIATHAN_SRC: &str = include_str!("../../../kernels/src/lane_leviathan.hip");
 
+/// Vocabulary-shard argmax merge (`Gpu::argmax_f32_pair_merge`): one thread per
+/// row combines two shard argmaxes into the full-row `argmax_f32` answer.
+pub const ARGMAX_PAIR_MERGE_SRC: &str = include_str!("../../../kernels/src/argmax_pair_merge.hip");
+
 /// Penalty stage of the host logit policy (repeat, presence, frequency)
 /// applied in place to logit rows from a host-built token table
 /// (`logit_penalty_table_rows`, launched by `Gpu::apply_penalty_table`): the

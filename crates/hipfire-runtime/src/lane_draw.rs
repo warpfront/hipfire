@@ -27,11 +27,11 @@
 use crate::sampler::SamplerConfig;
 use hip_bridge::{HipError, HipResult};
 use rdna_compute::lane_leviathan::{
-    LaneLeviathanLayout, LLV_H_CAP, LLV_LANE_WORDS, LLV_NO_EOS, LLV_OUT_WORDS, LLV_P_WORDS,
-    LLV_Q_MAX, LLV_Q_WORDS, LLV_ROWS_CAP, LLV_ROW_WORDS, LL_BLOCKED, LL_DRAFTS, LL_EOS, LL_FREQ,
-    LL_MIN_P, LL_NBLOCKED, LL_NROWS, LL_OUT, LL_PRES, LL_Q, LL_REP, LL_RNG, LL_ROW0, LL_TEMP,
-    LL_TOP_K, LL_TOP_P, LL_VOCAB, LO_ACCEPTED, LO_DONE, LO_NTOK, LO_RNG, LO_TICKET, LO_TOKENS,
-    LR_J, LR_LANE, LR_PEN_LEN, LR_PEN_OFF, LR_PTR_HI, LR_PTR_LO,
+    LaneLeviathanLayout, LLV_CAND_WORDS, LLV_H_CAP, LLV_LANE_WORDS, LLV_NO_EOS, LLV_OUT_WORDS,
+    LLV_P_WORDS, LLV_Q_MAX, LLV_Q_WORDS, LLV_ROWS_CAP, LLV_ROW_WORDS, LL_BASE, LL_BLOCKED,
+    LL_DRAFTS, LL_EOS, LL_FREQ, LL_MIN_P, LL_NBLOCKED, LL_NROWS, LL_OUT, LL_PRES, LL_Q, LL_REP,
+    LL_RNG, LL_ROW0, LL_TEMP, LL_TOP_K, LL_TOP_P, LL_VOCAB, LO_ACCEPTED, LO_DONE, LO_NTOK, LO_RNG,
+    LO_TICKET, LO_TOKENS, LR_J, LR_LANE, LR_PEN_LEN, LR_PEN_OFF, LR_PTR_HI, LR_PTR_LO,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::ffi::c_void;
@@ -54,7 +54,14 @@ pub struct LaneDrawJob<'a> {
     pub logits: &'a GpuTensor,
     /// `1..=LANE_DRAW_MAX_ROWS`; `1` is a plain AR draw.
     pub rows: usize,
+    /// Row WIDTH read from the logits view (the full vocabulary, or a shard's
+    /// width when `base != 0` or the draw is vocab-sharded).
     pub vocab: usize,
+    /// Global token id of the view's element 0 of every row: `0` for a full
+    /// row (every draw today); a vocab shard's first id for a staged select
+    /// ([`LaneDrawArena::launch_select`]). Scope and blocked tokens outside
+    /// `[base, base + vocab)` belong to the other shard and are skipped.
+    pub base: usize,
     /// `rows - 1` drafted tokens.
     pub drafts: &'a [u32],
     /// Per draft, the distribution it was drawn from as `(token, prob)`
@@ -202,6 +209,19 @@ fn check_job(i: usize, job: &LaneDrawJob<'_>) -> HipResult<()> {
             ),
         ));
     }
+    if job
+        .base
+        .checked_add(job.vocab)
+        .is_none_or(|end| end > u32::MAX as usize)
+    {
+        return Err(malformed(
+            i,
+            format!(
+                "shard [{}, +{}) exceeds the u32 id space",
+                job.base, job.vocab
+            ),
+        ));
+    }
     if !job.q.is_empty() && job.q.len() != job.drafts.len() {
         return Err(malformed(
             i,
@@ -311,6 +331,7 @@ fn pack(jobs: &[LaneDrawJob<'_>], w: &mut Vec<u32>) -> LaneLeviathanLayout {
         w[lr + LL_PRES] = cfg.presence_penalty.to_bits();
         w[lr + LL_FREQ] = cfg.frequency_penalty.to_bits();
         w[lr + LL_VOCAB] = job.vocab as u32;
+        w[lr + LL_BASE] = job.base as u32;
         w[lr + LL_DRAFTS] = drafts_off as u32;
         w[lr + LL_Q] = q_off as u32;
         w[lr + LL_BLOCKED] = blocked_off as u32;
@@ -339,50 +360,134 @@ fn pack(jobs: &[LaneDrawJob<'_>], w: &mut Vec<u32>) -> LaneLeviathanLayout {
     layout
 }
 
-/// Draw every job in ONE launch: one async H2D of the packed inputs, the
-/// lane-wide verify kernel over all rows, one D2H of every lane's
-/// `{tokens, accepted, rng}`, one stream sync. Draws are in job order.
-pub fn lane_draws(
-    gpu: &mut Gpu,
-    arena: &mut LaneDrawArena,
-    jobs: &[LaneDrawJob<'_>],
-) -> HipResult<Vec<LaneDraw>> {
-    for (i, job) in jobs.iter().enumerate() {
-        check_job(i, job)?;
+/// Words of one candidate table (`LLV_CAND_WORDS` per verify row) for `rows` verify
+/// rows: the size of the `cand` tensors of [`LaneDrawArena::launch_select`] /
+/// [`LaneDrawArena::launch_merged`].
+pub fn cand_table_words(rows: usize) -> usize {
+    rows * LLV_CAND_WORDS
+}
+
+/// One staged lane, kept for [`LaneDrawArena::readback`]'s validation.
+#[derive(Debug, Clone)]
+struct StagedLane {
+    rows: usize,
+    drafts: Vec<u32>,
+}
+
+/// A step's inputs packed and uploaded by [`LaneDrawArena::stage`]. Valid until the
+/// arena's next `stage`: the region it describes is reused.
+#[derive(Debug, Clone)]
+pub struct LaneDrawStaged {
+    layout: LaneLeviathanLayout,
+    lanes: Vec<StagedLane>,
+}
+
+impl LaneDrawStaged {
+    pub fn layout(&self) -> LaneLeviathanLayout {
+        self.layout
     }
-    if jobs.is_empty() {
-        return Ok(Vec::new());
+    /// Verify rows over all lanes (the rows of a candidate table).
+    pub fn rows(&self) -> usize {
+        self.layout.rows
     }
-    if !lane_draws_supported(gpu) {
-        return Err(HipError::new(
-            0,
-            &format!(
-                "lane_draws: the lane-wide verify kernel does not run on {}",
-                gpu.arch
-            ),
-        ));
-    }
-    gpu.bind_thread()?;
-    let mut stage = std::mem::take(&mut arena.stage);
-    let layout = pack(jobs, &mut stage);
-    let result = (|| {
-        arena.ensure(gpu, stage.len(), layout.rows)?;
-        // SAFETY: `ensure` sized the pinned stage to >= `stage.len()` u32s; the
-        // previous call's final sync left no copy reading or writing it.
-        let host = unsafe { std::slice::from_raw_parts_mut(arena.host as *mut u32, stage.len()) };
-        host.copy_from_slice(&stage);
-        let region = arena.region.as_ref().expect("ensure allocated the region");
-        let ptab = arena.ptab.as_ref().expect("ensure allocated the p tables");
-        // SAFETY: `stage.len()` initialized u32s of the live pinned stage.
-        let bytes = unsafe { std::slice::from_raw_parts(arena.host as *const u8, stage.len() * 4) };
-        match gpu.active_stream.as_ref() {
-            Some(stream) => gpu.hip.memcpy_htod_async(&region.buf, bytes, stream)?,
-            None => gpu.hip.memcpy_htod_async_default(&region.buf, bytes)?,
+}
+
+impl LaneDrawArena {
+    /// Validate `jobs`, pack `[out | lanes | rows | inputs]` and upload it with one async
+    /// H2D (out records zeroed, every lane's `LL_BASE` from its job). No launch.
+    pub fn stage(&mut self, gpu: &mut Gpu, jobs: &[LaneDrawJob<'_>]) -> HipResult<LaneDrawStaged> {
+        for (i, job) in jobs.iter().enumerate() {
+            check_job(i, job)?;
         }
-        gpu.lane_leviathan_verify_enqueue(region, layout, ptab)?;
+        if jobs.is_empty() {
+            return Err(HipError::new(0, "lane_draws: stage of zero jobs"));
+        }
+        if !lane_draws_supported(gpu) {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "lane_draws: the lane-wide verify kernel does not run on {}",
+                    gpu.arch
+                ),
+            ));
+        }
+        gpu.bind_thread()?;
+        let mut stage = std::mem::take(&mut self.stage);
+        let layout = pack(jobs, &mut stage);
+        let result = (|| {
+            self.ensure(gpu, stage.len(), layout.rows)?;
+            // SAFETY: `ensure` sized the pinned stage to >= `stage.len()` u32s; the
+            // previous call's final sync left no copy reading or writing it.
+            let host =
+                unsafe { std::slice::from_raw_parts_mut(self.host as *mut u32, stage.len()) };
+            host.copy_from_slice(&stage);
+            let region = self.region.as_ref().expect("ensure allocated the region");
+            // SAFETY: `stage.len()` initialized u32s of the live pinned stage.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(self.host as *const u8, stage.len() * 4) };
+            match gpu.active_stream.as_ref() {
+                Some(stream) => gpu.hip.memcpy_htod_async(&region.buf, bytes, stream)?,
+                None => gpu.hip.memcpy_htod_async_default(&region.buf, bytes)?,
+            }
+            Ok(LaneDrawStaged {
+                layout,
+                lanes: jobs
+                    .iter()
+                    .map(|j| StagedLane {
+                        rows: j.rows,
+                        drafts: j.drafts.to_vec(),
+                    })
+                    .collect(),
+            })
+        })();
+        self.stage = stage;
+        result
+    }
+
+    /// Mode 0: the whole-row kernel over the staged rows (`base` 0 jobs).
+    fn launch_full(&mut self, gpu: &mut Gpu, staged: &LaneDrawStaged) -> HipResult<()> {
+        let region = self.region.as_ref().expect("stage allocated the region");
+        let ptab = self.ptab.as_ref().expect("stage allocated the p tables");
+        gpu.lane_leviathan_verify_enqueue(region, staged.layout, ptab)
+    }
+
+    /// Mode 1 over the staged rows: each row is scanned as the shard starting at its
+    /// job's `base`, and its sorted top-g lands in row `r` of `cand`
+    /// ([`cand_table_words`]`(staged.rows())` words). The out records are untouched:
+    /// a select-only arena never reads back.
+    pub fn launch_select(
+        &mut self,
+        gpu: &mut Gpu,
+        staged: &LaneDrawStaged,
+        cand: &GpuTensor,
+    ) -> HipResult<()> {
+        let region = self.region.as_ref().expect("stage allocated the region");
+        gpu.lane_leviathan_select_enqueue(region, staged.layout, cand)
+    }
+
+    /// Mode 2 over the staged rows: merge row `r` of `cand_local` (this rank's select
+    /// table) with row `r` of the peer table at device address `cand_peer`, then run
+    /// the p tables, tickets and verdicts. Pair with [`LaneDrawArena::readback`].
+    pub fn launch_merged(
+        &mut self,
+        gpu: &mut Gpu,
+        staged: &LaneDrawStaged,
+        cand_local: &GpuTensor,
+        cand_peer: u64,
+    ) -> HipResult<()> {
+        let region = self.region.as_ref().expect("stage allocated the region");
+        let ptab = self.ptab.as_ref().expect("stage allocated the p tables");
+        gpu.lane_leviathan_merged_enqueue(region, staged.layout, ptab, cand_local, cand_peer)
+    }
+
+    /// D2H of every lane's `{tokens, accepted, rng}` out record and a stream sync;
+    /// draws are in staged job order.
+    pub fn readback(&mut self, gpu: &mut Gpu, staged: &LaneDrawStaged) -> HipResult<Vec<LaneDraw>> {
+        let layout = staged.layout;
+        let region = self.region.as_ref().expect("stage allocated the region");
         let out_bytes = layout.out_words() * 4;
         // SAFETY: the out prefix fits the stage (`out_words <= stage.len()`).
-        let dst = unsafe { std::slice::from_raw_parts_mut(arena.host as *mut u8, out_bytes) };
+        let dst = unsafe { std::slice::from_raw_parts_mut(self.host as *mut u8, out_bytes) };
         match gpu.active_stream.as_ref() {
             Some(stream) => {
                 gpu.hip.memcpy_dtoh_async(dst, &region.buf, Some(stream))?;
@@ -393,25 +498,25 @@ pub fn lane_draws(
         gpu.take_device_wait_error()?;
         // SAFETY: the D2H just refreshed the out prefix.
         let out =
-            unsafe { std::slice::from_raw_parts(arena.host as *const u32, layout.out_words()) };
-        let mut draws = Vec::with_capacity(jobs.len());
-        for (i, job) in jobs.iter().enumerate() {
+            unsafe { std::slice::from_raw_parts(self.host as *const u32, layout.out_words()) };
+        let mut draws = Vec::with_capacity(staged.lanes.len());
+        for (i, lane) in staged.lanes.iter().enumerate() {
             let o = &out[layout.out_off(i)..layout.out_off(i) + LLV_OUT_WORDS];
             let ntok = o[LO_NTOK] as usize;
             let accepted = o[LO_ACCEPTED] as usize;
             let ok = o[LO_DONE] == 1
-                && o[LO_TICKET] as usize == job.rows
-                && (1..=job.rows).contains(&ntok)
-                && accepted <= job.drafts.len()
+                && o[LO_TICKET] as usize == lane.rows
+                && (1..=lane.rows).contains(&ntok)
+                && accepted <= lane.drafts.len()
                 && accepted <= ntok
-                && o[LO_TOKENS..LO_TOKENS + accepted] == job.drafts[..accepted]
+                && o[LO_TOKENS..LO_TOKENS + accepted] == lane.drafts[..accepted]
                 && o[LO_RNG] != 0;
             if !ok {
                 return Err(malformed(
                     i,
                     format!(
                         "corrupt result record {:?}",
-                        &o[..LO_TOKENS + ntok.min(job.rows)]
+                        &o[..LO_TOKENS + ntok.min(lane.rows)]
                     ),
                 ));
             }
@@ -422,9 +527,32 @@ pub fn lane_draws(
             });
         }
         Ok(draws)
-    })();
-    arena.stage = stage;
-    result
+    }
+}
+
+/// Draw every job in ONE launch: one async H2D of the packed inputs, the
+/// lane-wide verify kernel over all rows, one D2H of every lane's
+/// `{tokens, accepted, rng}`, one stream sync. Draws are in job order. Every
+/// job reads a full row (`base == 0`); a shard draw is the staged API's.
+pub fn lane_draws(
+    gpu: &mut Gpu,
+    arena: &mut LaneDrawArena,
+    jobs: &[LaneDrawJob<'_>],
+) -> HipResult<Vec<LaneDraw>> {
+    for (i, job) in jobs.iter().enumerate() {
+        if job.base != 0 {
+            return Err(malformed(
+                i,
+                format!("shard base {} in a whole-row draw", job.base),
+            ));
+        }
+    }
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let staged = arena.stage(gpu, jobs)?;
+    arena.launch_full(gpu, &staged)?;
+    arena.readback(gpu, &staged)
 }
 
 // ───────────────────────── host model of the kernel law ─────────────────────────
@@ -762,6 +890,7 @@ mod tests {
                     logits: &logits,
                     rows: 4,
                     vocab: 10,
+                    base: 0,
                     drafts: &drafts,
                     q: &q,
                     history: &history,
@@ -805,6 +934,7 @@ mod tests {
             logits: &logits,
             rows: 3,
             vocab: 10,
+            base: 0,
             drafts: &[1, 2],
             q: &ok_q,
             history: &[],

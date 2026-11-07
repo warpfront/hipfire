@@ -851,6 +851,7 @@ fn decode_run_sequential(
                 logits: &logits.sub_offset(0, n_dec * vocab),
                 top1: &top1.sub_offset(0, n_dec * int),
                 wide_hidden: None,
+                vocab_shard: None,
             };
             launched = true;
             let forwarded = forward_lanes(gpu, band, &mut rows, &out, &policy);
@@ -1168,6 +1169,7 @@ fn decode_run_overlap(
                     .top1
                     .sub_offset(batch.first_row * int, batch.rows * int),
                 wide_hidden: None,
+                vocab_shard: None,
             };
             launched = true;
             forward_lanes(gpu, band, &mut rows, &out, &policy)

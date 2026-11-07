@@ -757,6 +757,55 @@ pub struct DraftRound {
     /// append first (the plan's [`CatchUp`]s, in plan lane order), before any
     /// op of the round and before the lane's head ticket is taken.
     pub catch_up: Vec<(LaneWindowKey, CatchUp)>,
+    /// The MQ2 draft head's ranked rows are split between the two EP ranks for every draft of
+    /// this round (`HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD`): each rank projects and reduces its half
+    /// of the partial blocks, the halves are exchanged and the unchanged exact re-score runs on
+    /// both ranks. Decided by the root ([`draft_vocab_shard_decision`]) and refused by a rank
+    /// that cannot run it ([`draft_vocab_shard_refusal`]).
+    pub vocab_shard: bool,
+}
+
+/// Whether a head op runs on every head owner (the replicated EP head): only such a round can
+/// split the draft head's rows between the ranks. An op of a lane one rank owns alone (X2's
+/// `head_rank = Some(r)`) or of a lane outside `lanes` is not, and a round holding one never
+/// shards.
+fn draft_op_replicated(op: &DraftOp, lanes: &[LanePlan]) -> bool {
+    lanes
+        .iter()
+        .find(|l| l.key == op.key)
+        .is_some_and(|l| l.head_rank.is_none())
+}
+
+/// The root's vocabulary-shard decision for a head round: an EP mesh whose draft exchange
+/// ([`MeshRoot::with_draft_vocab_shard_rows`], `armed_rows` rows of partial scratch) holds the
+/// round's draft rows (one per op) and whose every op is replicated (`lanes`: the step's plan).
+pub fn draft_vocab_shard_decision(
+    kind: MeshKind,
+    armed_rows: usize,
+    ops: &[DraftOp],
+    lanes: &[LanePlan],
+) -> bool {
+    kind == MeshKind::Ep
+        && armed_rows > 0
+        && !ops.is_empty()
+        && ops.len() <= armed_rows
+        && ops.iter().all(|op| draft_op_replicated(op, lanes))
+}
+
+/// Why a rank cannot run a head round that sets [`DraftRound::vocab_shard`] (`None`: it can, as
+/// far as the round itself shows; the executor adds the exchange and the head).
+pub fn draft_vocab_shard_refusal(
+    kind: MeshKind,
+    ops: &[DraftOp],
+    lanes: &[LanePlan],
+) -> Option<&'static str> {
+    if kind != MeshKind::Ep {
+        return Some("a vocabulary-sharded head round is an EP round");
+    }
+    if ops.is_empty() || !ops.iter().all(|op| draft_op_replicated(op, lanes)) {
+        return Some("a vocabulary-sharded head round needs replicated draft ops");
+    }
+    None
 }
 
 /// What the sampler owner read for one op: the head's argmax and keep-going
@@ -915,6 +964,13 @@ pub struct VerifyPlan {
     /// Per lane (plan order): the device draw the sampler owner makes for the
     /// lane's rows (`None`: the lane is greedy or drawn on the host).
     pub samples: Vec<Option<DeviceSampleSpec>>,
+    /// The target LM head and the sampled lanes' device draws are vocabulary-sharded across the
+    /// two EP ranks (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`): each rank projects and scans its half of the
+    /// head, and the sampler owner merges the halves into exactly the unsharded picks and draws
+    /// (`argmax_f32_pair_merge`, `lane_leviathan_verify` select / merged modes). Decided by the
+    /// root ([`vocab_shard_decision`]), part of the digest, refused by a rank that cannot run it
+    /// ([`vocab_shard_refusal`]). A non-sampler rank's own picks are then shard-local.
+    pub vocab_shard: bool,
     pub digest: u64,
 }
 
@@ -922,6 +978,55 @@ impl VerifyPlan {
     pub fn total_rows(&self) -> usize {
         self.lanes.iter().map(|l| l.rows.len()).sum()
     }
+}
+
+/// Mixed into the plan digest of a vocabulary-sharded verify only.
+const VOCAB_SHARD_DIGEST_TAG: u64 = 0x5648_4f43_5348_4152;
+
+/// Whether a lane's verify draw is a device draw: a sampled decode lane (never a forced or a
+/// greedy one; the rule [`MeshRoot::seal_verify_with`] asks [`AcceptRule::device_sample`] by).
+fn lane_needs_device_sample(lane: &LanePlan) -> bool {
+    !matches!(lane.kind, LaneKind::Forced(_)) && lane.sampling != SamplingMode::Greedy
+}
+
+/// The root's vocabulary-shard decision for a sealed verify: an EP mesh whose exchange (armed
+/// through [`MeshRoot::with_vocab_shard_rows`], `exchange_rows` rows capacity) holds the step's
+/// `total_rows`, and every sampled lane has a device sample (a lane the root draws on the host
+/// needs full logits rows).
+pub fn vocab_shard_decision(
+    kind: MeshKind,
+    exchange_rows: usize,
+    total_rows: usize,
+    sampled_without_spec: bool,
+) -> bool {
+    kind == MeshKind::Ep
+        && exchange_rows > 0
+        && total_rows > 0
+        && total_rows <= exchange_rows
+        && !sampled_without_spec
+}
+
+/// Why a rank cannot run a plan that sets [`VerifyPlan::vocab_shard`] (`None`: it can, as far as
+/// the plan itself shows; the executor adds the exchange and the device).
+pub fn vocab_shard_refusal(
+    kind: MeshKind,
+    lanes: &[LanePlan],
+    samples: &[Option<DeviceSampleSpec>],
+) -> Option<&'static str> {
+    if kind != MeshKind::Ep {
+        return Some("a vocabulary-sharded verify is an EP step");
+    }
+    if samples.len() != lanes.len() {
+        return Some("a vocabulary-sharded verify names a device-sample entry per lane");
+    }
+    if lanes
+        .iter()
+        .zip(samples)
+        .any(|(l, spec)| spec.is_none() && lane_needs_device_sample(l))
+    {
+        return Some("a vocabulary-sharded verify needs a device sample for every sampled lane");
+    }
+    None
 }
 
 /// Consecutive whole lanes packed into groups of at most `max_rows` rows
@@ -1819,6 +1924,11 @@ pub struct MeshRoot {
     /// X2: this root may give a window's head lanes owners
     /// ([`MeshRoot::set_draft_split`]); off = every lane stays replicated.
     draft_split: bool,
+    /// Rows of the EP vocab-shard exchange ([`Self::with_vocab_shard_rows`]); `0`: never shard.
+    vocab_shard_rows: usize,
+    /// Draft rows per round the EP draft-shard partial scratch holds
+    /// ([`Self::with_draft_vocab_shard_rows`]); `0`: never shard.
+    draft_vocab_shard_rows: usize,
 }
 
 impl MeshRoot {
@@ -1856,6 +1966,8 @@ impl MeshRoot {
             copy_max_lanes: usize::MAX,
             copy_warm: 0,
             draft_split: false,
+            vocab_shard_rows: 0,
+            draft_vocab_shard_rows: 0,
         })
     }
 
@@ -1874,6 +1986,23 @@ impl MeshRoot {
         if self.step_seq == 0 && self.lanes.is_empty() {
             self.cost = LaneCostModel::with_prior(self.profile.prior_us());
         }
+    }
+
+    /// Arm the root's vocabulary-sharded verify (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`): an EP step whose
+    /// total rows fit the exchange's `rows` capacity and whose sampled lanes all carry a device
+    /// sample seals [`VerifyPlan::vocab_shard`]. `0` rows (the default) never shards. The root
+    /// decides, the plan carries it; a rank that cannot run it refuses the plan.
+    pub fn with_vocab_shard_rows(mut self, rows: usize) -> Self {
+        self.vocab_shard_rows = rows;
+        self
+    }
+
+    /// Arm the root's vocabulary-sharded MQ2 draft head (`HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD`): an
+    /// EP head round of at most `rows` ops, every op replicated, seals
+    /// [`DraftRound::vocab_shard`]. `0` rows (the default) never shards.
+    pub fn with_draft_vocab_shard_rows(mut self, rows: usize) -> Self {
+        self.draft_vocab_shard_rows = rows;
+        self
     }
 
     /// Give the root a copy lane: requests that arm it (`LaneAdmission.copy`)
@@ -2796,11 +2925,20 @@ impl MeshRoot {
             self.phase = StepPhase::Drafted;
             return Ok(None);
         }
+        // The vocabulary-sharded head round (`HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD`): a root-only
+        // fact every rank must execute identically.
+        let vocab_shard = draft_vocab_shard_decision(
+            self.world[0].kind,
+            self.draft_vocab_shard_rows,
+            &ops,
+            &s.start.lanes,
+        );
         let round = DraftRound {
             key: s.start.key.clone(),
             round: s.round,
             ops,
             catch_up,
+            vocab_shard,
         };
         Ok(Some(round))
     }
@@ -3248,6 +3386,24 @@ impl MeshRoot {
                 .usize(g.rows)
                 .bool(g.wide);
         }
+        // The vocabulary-shard decision (a root-only fact the ranks must execute identically):
+        // mixed into the digest only when set, so an unsharded plan's digest is today's.
+        let total_rows: usize = lanes.iter().map(|l| l.rows.len()).sum();
+        let sampled_without_spec = s
+            .start
+            .lanes
+            .iter()
+            .zip(&samples)
+            .any(|(l, spec)| spec.is_none() && lane_needs_device_sample(l));
+        let vocab_shard = vocab_shard_decision(
+            self.world[0].kind,
+            self.vocab_shard_rows,
+            total_rows,
+            sampled_without_spec,
+        );
+        if vocab_shard {
+            d.u64(VOCAB_SHARD_DIGEST_TAG);
+        }
         let plan = VerifyPlan {
             key: s.start.key.clone(),
             lanes,
@@ -3255,6 +3411,7 @@ impl MeshRoot {
             microbatches,
             ledger,
             samples,
+            vocab_shard,
             digest: d.finish(),
         };
         self.step_mut().verify = Some(plan.clone());
@@ -4463,6 +4620,7 @@ impl RankSession {
     pub fn on_draft_round(&mut self, round: &DraftRound) -> Result<RankDraftResult, RankError> {
         let rank = self.own.rank;
         let own = self.own;
+        let own_kind = own.kind;
         if !self.own.head {
             return Err(RankError::new(
                 rank,
@@ -4488,6 +4646,11 @@ impl RankSession {
                 rank,
                 "owed head rows differ from the planned catch-up",
             ));
+        }
+        if round.vocab_shard {
+            if let Some(why) = draft_vocab_shard_refusal(own_kind, &round.ops, &s.start.lanes) {
+                return Err(RankError::new(rank, why));
+            }
         }
         // Every op is validated (the rank tracks the plan's positions for the
         // lanes it does not head too); only the ops of the lanes this rank
@@ -4571,6 +4734,7 @@ impl RankSession {
             ));
         }
         let own_head = self.own.head;
+        let own_kind = self.own.kind;
         let s = self.step_for(&plan.key, StepPhase::Armed, "verify")?;
         if plan.lanes.len() != s.start.lanes.len()
             || plan.lanes.iter().zip(&s.start.lanes).any(|(v, l)| {
@@ -4607,6 +4771,11 @@ impl RankSession {
                 rank,
                 "head call count differs from the ledger",
             ));
+        }
+        if plan.vocab_shard {
+            if let Some(why) = vocab_shard_refusal(own_kind, &s.start.lanes, &plan.samples) {
+                return Err(RankError::new(rank, why));
+            }
         }
         s.verify = Some(plan.clone());
         s.phase = StepPhase::Verified;
@@ -5606,6 +5775,237 @@ mod tests {
                 hit_eos: false,
             })
         }
+    }
+
+    // ---- the vocabulary-sharded verify (X1): root decision, digest, rank refusal --------------
+
+    /// A rule that lends every sampled lane a device draw (or none), the root's decision input.
+    struct ShardSampleRule {
+        lend: bool,
+    }
+
+    impl AcceptRule for ShardSampleRule {
+        fn accept(
+            &mut self,
+            lane: &LanePlan,
+            drafts: &[u32],
+            picks: &[u32],
+            _rng: &mut LaneRng,
+        ) -> Result<GreedyAccept, String> {
+            Ok(accept_greedy_prefix(drafts, picks, lane.eos))
+        }
+
+        fn device_sample(
+            &mut self,
+            _lane: &LanePlan,
+            _drafts: &[u32],
+            _rng: &LaneRng,
+        ) -> Result<Option<DeviceSampleSpec>, String> {
+            Ok(self.lend.then(|| DeviceSampleSpec {
+                cfg: SamplerConfig::default(),
+                rng_state: 1,
+                history: vec![1, 2, 3],
+                q: Vec::new(),
+                eos: None,
+            }))
+        }
+    }
+
+    /// One AR lane sealed on a `kind` mesh whose root is armed for `shard_rows` rows of vocab
+    /// shard exchange; the lane is sampled (Leviathan) or greedy, and the rule lends its device
+    /// draw or not. Returns the mesh (its ranks begun) and the sealed plan.
+    fn sealed_shard_plan(
+        kind: MeshKind,
+        shard_rows: usize,
+        sampled: bool,
+        lend: bool,
+    ) -> (Mesh, VerifyPlan) {
+        let mut m = Mesh::new(kind, false);
+        m.root = m.root.with_vocab_shard_rows(shard_rows);
+        m.admit(1, 100, 7, None, None);
+        let mut request = req(1, 99);
+        if sampled {
+            request.sampling = SamplingMode::Leviathan;
+        }
+        m.s_plan(None, &[request], &budgets(LabRoutes::Batched, 3))
+            .unwrap();
+        m.s_ready().unwrap();
+        m.s_draft().unwrap();
+        let plan = m
+            .root
+            .seal_verify_with(&mut ShardSampleRule { lend })
+            .unwrap();
+        (m, plan)
+    }
+
+    #[test]
+    fn vocab_shard_decision_needs_ep_capacity_and_every_sampled_lane_device_drawn() {
+        // The shipped shape: EP, the exchange holds the rows, nothing is drawn on the host.
+        assert!(vocab_shard_decision(MeshKind::Ep, 64, 16, false));
+        assert!(vocab_shard_decision(MeshKind::Ep, 64, 64, false));
+        // Not armed (the switch is off or the exchange is not attached).
+        assert!(!vocab_shard_decision(MeshKind::Ep, 0, 16, false));
+        // More rows than the exchange's buffers hold.
+        assert!(!vocab_shard_decision(MeshKind::Ep, 64, 65, false));
+        assert!(!vocab_shard_decision(MeshKind::Ep, 64, 0, false));
+        // A sampled lane the root draws on the host needs the full logits row.
+        assert!(!vocab_shard_decision(MeshKind::Ep, 64, 16, true));
+        // Only an EP mesh shards.
+        assert!(!vocab_shard_decision(MeshKind::Pp, 64, 16, false));
+        assert!(!vocab_shard_decision(MeshKind::Single, 64, 16, false));
+    }
+
+    #[test]
+    fn vocab_shard_is_sealed_by_the_root_and_part_of_the_plan_digest() {
+        let (_, off) = sealed_shard_plan(MeshKind::Ep, 0, false, false);
+        assert!(!off.vocab_shard, "an unarmed root never shards");
+        let (_, on) = sealed_shard_plan(MeshKind::Ep, 64, false, false);
+        assert!(on.vocab_shard, "an armed EP root shards a greedy step");
+        assert_ne!(on.digest, off.digest, "the decision is in the digest");
+        assert_ne!(on, off, "and in the plan's equality");
+        // The unsharded digest is today's: nothing was mixed in.
+        let (_, again) = sealed_shard_plan(MeshKind::Ep, 0, false, false);
+        assert_eq!(again.digest, off.digest);
+        // Only an EP mesh shards, however it is armed.
+        let (_, pp) = sealed_shard_plan(MeshKind::Pp, 64, false, false);
+        assert!(!pp.vocab_shard);
+    }
+
+    #[test]
+    fn a_sampled_lane_without_a_device_draw_keeps_the_full_head() {
+        let (_, lent) = sealed_shard_plan(MeshKind::Ep, 64, true, true);
+        assert!(lent.samples[0].is_some());
+        assert!(lent.vocab_shard, "a lent device draw is sharded too");
+        let (_, host) = sealed_shard_plan(MeshKind::Ep, 64, true, false);
+        assert!(host.samples[0].is_none());
+        assert!(
+            !host.vocab_shard,
+            "a host-drawn sampled lane needs the whole logits row"
+        );
+    }
+
+    #[test]
+    fn a_rank_refuses_a_vocab_shard_plan_it_cannot_run() {
+        // A well-formed plan: the follower accepts it.
+        let (mut m, plan) = sealed_shard_plan(MeshKind::Ep, 64, false, false);
+        assert!(plan.vocab_shard);
+        m.ranks[1].run_verify(&plan).expect("a runnable plan");
+
+        // A sampled lane with no device draw: refused, never run on a half head.
+        let (mut m, mut plan) = sealed_shard_plan(MeshKind::Ep, 64, true, false);
+        assert!(!plan.vocab_shard);
+        plan.vocab_shard = true;
+        let error = m.ranks[1].run_verify(&plan).expect_err("no device draw");
+        assert!(error.reason.contains("device sample"), "{}", error.reason);
+
+        // A plan whose device-sample entries do not cover its lanes.
+        let (mut m, mut plan) = sealed_shard_plan(MeshKind::Ep, 64, false, false);
+        plan.samples.clear();
+        let error = m.ranks[1].run_verify(&plan).expect_err("short samples");
+        assert!(error.reason.contains("per lane"), "{}", error.reason);
+
+        // A PP band has no vocabulary exchange.
+        let (mut m, mut plan) = sealed_shard_plan(MeshKind::Pp, 64, false, false);
+        assert!(!plan.vocab_shard);
+        plan.vocab_shard = true;
+        let error = m.ranks[0].run_verify(&plan).expect_err("a PP step");
+        assert!(error.reason.contains("EP step"), "{}", error.reason);
+    }
+
+    /// The first head round of one native lane (`k` = 3) on a `kind` mesh whose root is armed
+    /// for `draft_rows` rows of draft-shard partial scratch, and the step's lane plans.
+    fn first_draft_round(kind: MeshKind, draft_rows: usize) -> (Mesh, DraftRound, Vec<LanePlan>) {
+        let mut m = Mesh::new(kind, false);
+        m.root = m.root.with_draft_vocab_shard_rows(draft_rows);
+        m.admit(1, 101, 7, None, Some(3));
+        script_matching(&m, 1, 0, 8);
+        let lanes = m
+            .s_plan(None, &[req(1, 99)], &budgets(LabRoutes::Batched, 3))
+            .unwrap()
+            .lanes;
+        m.s_ready().unwrap();
+        let round = m.root.next_draft_round().unwrap().expect("a head round");
+        (m, round, lanes)
+    }
+
+    #[test]
+    fn draft_vocab_shard_decision_needs_ep_capacity_and_replicated_ops() {
+        let (_, round, lanes) = first_draft_round(MeshKind::Ep, 8);
+        let ops = round.ops;
+        assert_eq!(ops.len(), 1);
+        assert!(draft_vocab_shard_decision(MeshKind::Ep, 8, &ops, &lanes));
+        // Not armed.
+        assert!(!draft_vocab_shard_decision(MeshKind::Ep, 0, &ops, &lanes));
+        // More ops than the partial scratch holds rows.
+        let many: Vec<DraftOp> = (0..9).map(|_| ops[0]).collect();
+        assert!(draft_vocab_shard_decision(MeshKind::Ep, 9, &many, &lanes));
+        assert!(!draft_vocab_shard_decision(MeshKind::Ep, 8, &many, &lanes));
+        // Nothing to draft (a catch-up only round).
+        assert!(!draft_vocab_shard_decision(MeshKind::Ep, 8, &[], &lanes));
+        // Only an EP mesh shards.
+        assert!(!draft_vocab_shard_decision(MeshKind::Pp, 8, &ops, &lanes));
+        assert!(!draft_vocab_shard_decision(
+            MeshKind::Single,
+            8,
+            &ops,
+            &lanes
+        ));
+        // An op of a lane one rank owns alone (X2 draft split) is not replicated.
+        for r in 0..2 {
+            let mut owned = lanes.clone();
+            owned[0].head_rank = Some(r);
+            assert!(!draft_vocab_shard_decision(MeshKind::Ep, 8, &ops, &owned));
+        }
+        // An op of a lane outside the plan never shards.
+        assert!(!draft_vocab_shard_decision(MeshKind::Ep, 8, &ops, &[]));
+    }
+
+    #[test]
+    fn a_head_round_is_sealed_sharded_by_the_armed_ep_root_only() {
+        let (_, on, _) = first_draft_round(MeshKind::Ep, 8);
+        assert!(on.vocab_shard);
+        let (_, off, _) = first_draft_round(MeshKind::Ep, 0);
+        assert!(!off.vocab_shard, "an unarmed root never shards the head");
+        let (_, pp, _) = first_draft_round(MeshKind::Pp, 8);
+        assert!(!pp.vocab_shard, "a PP head is not replicated");
+    }
+
+    #[test]
+    fn a_rank_refuses_a_sharded_head_round_it_cannot_run() {
+        // A well-formed round: the follower acknowledges it.
+        let (mut m, round, _) = first_draft_round(MeshKind::Ep, 8);
+        assert!(round.vocab_shard);
+        m.ranks[1]
+            .run_draft_round(&round)
+            .expect("a runnable round");
+
+        // A PP head round marked sharded: refused, never run on half a head.
+        let (mut m, mut round, _) = first_draft_round(MeshKind::Pp, 8);
+        assert!(!round.vocab_shard);
+        round.vocab_shard = true;
+        let head_rank = m.ranks.iter().position(|r| r.ownership().head).unwrap();
+        let error = m.ranks[head_rank]
+            .run_draft_round(&round)
+            .expect_err("a PP round");
+        assert!(error.reason.contains("EP round"), "{}", error.reason);
+
+        // A round with no op to split, and a round whose lane one rank owns alone.
+        let (_, round, lanes) = first_draft_round(MeshKind::Ep, 8);
+        let replicated = Some("a vocabulary-sharded head round needs replicated draft ops");
+        assert_eq!(
+            draft_vocab_shard_refusal(MeshKind::Ep, &[], &lanes),
+            replicated
+        );
+        assert_eq!(
+            draft_vocab_shard_refusal(MeshKind::Ep, &round.ops, &lanes),
+            None
+        );
+        let mut owned = lanes.clone();
+        owned[0].head_rank = Some(1);
+        assert_eq!(
+            draft_vocab_shard_refusal(MeshKind::Ep, &round.ops, &owned),
+            replicated
+        );
     }
 
     const BOTH: [MeshKind; 2] = [MeshKind::Ep, MeshKind::Pp];
@@ -7855,6 +8255,7 @@ mod tests {
                 })
                 .collect(),
             catch_up: Vec::new(),
+            vocab_shard: false,
         };
         let err = s.on_draft_round(&round).unwrap_err();
         assert!(err.reason.contains("mixes owned and replicated"), "{err:?}");

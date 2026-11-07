@@ -363,6 +363,7 @@ impl LocalLaneRank<'_> {
                 logits: &logits.sub_offset(0, n_dec * vocab),
                 top1: &top1.sub_offset(0, n_dec * std::mem::size_of::<i32>()),
                 wide_hidden: hidden,
+                vocab_shard: None,
             };
             let forwarded =
                 forward_lanes(gpu, bundle, &mut rows, &out, &policy).map_err(|e| e.to_string());
@@ -826,6 +827,7 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
                         hidden,
                         row_begin: first,
                         picks: lane_picks,
+                        shard_local_picks: false,
                         skip_rollback,
                         fill: fill.as_deref_mut(),
                     },
