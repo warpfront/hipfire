@@ -1674,6 +1674,39 @@ impl MoeStepHooks for HcAllRowsScope {
     }
 }
 
+/// fn-lanes under `topology.hetero_experts`: every MoE call of a lane step
+/// publishes its own request into the layer's slot, so each takes a fresh
+/// sequence ([`crate::hetero::advance_call`]) before its first launch. Wraps
+/// the step's other hooks (the all-rows HC scope) when it has them.
+struct HeteroLaneMoe<'h> {
+    inner: Option<&'h mut dyn MoeStepHooks>,
+}
+
+impl MoeStepHooks for HeteroLaneMoe<'_> {
+    fn before_moe(&mut self, gpu: &mut Gpu) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.before_moe(gpu)?;
+        }
+        crate::hetero::advance_call(gpu).map_err(hipfire_dispatch::types::DispatchError::Hip)
+    }
+    fn after_moe(&mut self, gpu: &mut Gpu) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        match self.inner.as_mut() {
+            Some(inner) => inner.after_moe(gpu),
+            None => Ok(()),
+        }
+    }
+    fn before_step(
+        &mut self,
+        gpu: &mut Gpu,
+        step: &Step<'_>,
+    ) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        match self.inner.as_mut() {
+            Some(inner) => inner.before_step(gpu, step),
+            None => Ok(()),
+        }
+    }
+}
+
 /// The row views one segment's operations bind: every row-indexed scratch
 /// tensor offset to the segment's first row, extending to the end of its
 /// allocation (exactly what a singleton forward of these rows sees from row
@@ -3679,7 +3712,11 @@ fn forward_lanes_scoped(
         // The all-rows HC steps run under the wide few-row scope (`HcAllRowsScope`); every other
         // step keeps the step's own.
         let prior_wide = gpu.wide_verify_rows;
+        let hetero = crate::hetero::split_requested();
         let execute = |gpu: &mut Gpu, steps: &[Step<'_>]| {
+            if hetero {
+                crate::hetero::begin_token(gpu).map_err(Qwen4GpuForwardError::Dispatch)?;
+            }
             let result = if hc_seg.is_some() {
                 let mut scope = HcAllRowsScope {
                     rows: n,
@@ -3687,9 +3724,19 @@ fn forward_lanes_scoped(
                     exact: exact_scope,
                     moe: moe_all,
                 };
-                let result = execute_validated_steps_with_moe_hooks(gpu, &ctx, steps, &mut scope);
+                let result = if hetero {
+                    let mut hooks = HeteroLaneMoe {
+                        inner: Some(&mut scope),
+                    };
+                    execute_validated_steps_with_moe_hooks(gpu, &ctx, steps, &mut hooks)
+                } else {
+                    execute_validated_steps_with_moe_hooks(gpu, &ctx, steps, &mut scope)
+                };
                 gpu.set_wide_verify_rows(prior_wide);
                 result
+            } else if hetero {
+                let mut hooks = HeteroLaneMoe { inner: None };
+                execute_validated_steps_with_moe_hooks(gpu, &ctx, steps, &mut hooks)
             } else {
                 execute_validated_steps(gpu, &ctx, steps)
             };

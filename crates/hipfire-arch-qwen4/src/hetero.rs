@@ -511,6 +511,21 @@ pub(crate) fn begin_token(gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
         .map_err(|e| format!("topology.hetero_experts: {e}"))
 }
 
+/// Before each MoE call of an fn-lanes step: advance the device token counter
+/// so the call's requests carry a fresh sequence. A lane step makes one MoE
+/// call per lane (or row group) per layer, all into the same layer slot; with
+/// one advance per step ([`begin_token`]) every call after the first would
+/// repeat the sequence the responder already answered and install the
+/// earlier call's cold rows. No-op without a device split.
+pub(crate) fn advance_call(gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+    let guard = lock_device()?;
+    let Some(ctx) = guard.as_ref() else {
+        return Ok(());
+    };
+    gpu.hetero_token_advance(&ctx.counter)
+        .map_err(|e| format!("topology.hetero_experts: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
