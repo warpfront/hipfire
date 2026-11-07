@@ -33,8 +33,11 @@ fn main() {
     let mut gpu = found.expect("no gfx1100 among HIP ordinals");
     eprintln!("oracle arch: {}", gpu.arch);
 
-    for T in [1usize, 2, 16, 17, 32, 128, 256] {
+    for T in [1usize, 2, 16, 17, 32, 128, 256, 66048] {
     eprintln!("=== T={T} ===");
+    // Size the allocation cap to the case: the launcher needs
+    // max_seq >= T and partials sized for max_tiles.
+    let max_seq = ((T + 127) / 128 * 128).max(512);
 
     let mut s = 0x12345678u64;
     let mut rnd = move || {
@@ -135,20 +138,20 @@ fn main() {
     let posb = upload(&mut gpu, unsafe {
         std::slice::from_raw_parts(pos.as_ptr() as *const u8, pos.len() * 4)
     });
-    let mt = (MAX_SEQ + 127) / 128;
+    let mt = (max_seq + 127) / 128;
     let out = upload(&mut gpu, &vec![0u8; N_HEADS * HD * 4]);
 
     let run = |gpu: &mut Gpu, v: &rdna_compute::GpuTensor, vm: i32, gqa: bool| -> Vec<f32> {
         let partials = upload(gpu, &vec![0u8; N_HEADS * mt * (2 + HD) * 4]);
         if gqa {
             gpu.attention_flash_fwht4_tile_gqa_gfx11(
-                &q, &k, v, &out, &posb.buf, &s1, &s2, T, N_HEADS, N_KV, HD, MAX_SEQ,
+                &q, &k, v, &out, &posb.buf, &s1, &s2, T, N_HEADS, N_KV, HD, max_seq,
                 &partials, vm,
             )
             .expect("gqa tile");
         } else {
             gpu.attention_flash_fwht4(
-                &q, &k, v, &out, &posb.buf, &s1, &s2, T, N_HEADS, N_KV, HD, MAX_SEQ,
+                &q, &k, v, &out, &posb.buf, &s1, &s2, T, N_HEADS, N_KV, HD, max_seq,
                 &partials, vm,
             )
             .expect("scalar tile");

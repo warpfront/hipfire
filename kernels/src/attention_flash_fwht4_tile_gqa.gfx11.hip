@@ -4,17 +4,25 @@
 
 // GQA-shared fwht4-K decode flash tile (gfx1100, head_dim 256, GQA group 6,
 // tile 128, full causal). One 256-thread workgroup per (kv head, tile)
-// serves all six q heads of its kv head: each K/V tile is read from memory
-// once instead of once per q head. The K tile (128 keys x 132 B) sits
-// resident in LDS; V streams in 16-key slabs; Q is FWHT-rotated once at
-// stage-in (waves 0-5 own heads 0-5, two half-rounds).
+// serves all six q heads of its kv head, so each K/V tile is read from
+// memory once instead of once per q head.
+//
+// Occupancy design (v2): NO K tile in LDS. Keys are partitioned across all
+// 8 waves (16 keys each); each wave reads its keys straight from global
+// with scalar-identical addressing (coalesced per-lane ushorts, broadcast
+// cnorm) and shares them across the six heads through the LDS score array.
+// V streams in 32-key slabs through LDS. Q is FWHT-rotated once at stage-in
+// (waves 0-5 own heads 0-5). LDS is ~17.5 KB (Q 6 KB + scores 3 KB + V slab
+// 8.5 KB worst-case Q8) -> 3 WGs/CU instead of 2, with ~11 barriers per
+// tile instead of ~20.
 //
 // Output partials use the SAME [n_heads, max_tiles, 2 + 256] layout as
 // attention_flash_fwht4_tile (rotated space for lloyd V, Q8_0 normal space
 // for v_mode 8) and are consumed unchanged by the existing reduce kernels.
 // Per-lane arithmetic mirrors the scalar tile exactly (same DOT4 shape per
 // (head, key), same fma accumulation order in V); the bar is KLD parity +
-// greedy identity (P1 precedent), not claimed bit-identity.
+// greedy identity (P1 precedent), not claimed bit-identity — though the
+// oracle currently holds bit-identical.
 //
 // v_mode: 8 = Q8_0 V, 4 = lloyd4 V (256-wide FWHT-rotated). Other modes
 // keep the scalar path (host-gated).
@@ -34,24 +42,12 @@
 #define FGQA_THREADS 256
 // K record: [f32 cnorm][128 B nibbles] per (pos, kv head).
 #define FGQA_K_SEG 132
-// V slab: 16 keys; lloyd4 132 B/head, Q8_0 272 B/head.
-#define FGQA_V_TILE 16
-// LDS carve (dwords): K tile 128*132/4, V slab 16*272/4 (Q8 worst case),
-// Q 6*256, scores 6*128.
-#define FGQA_K_DWORDS (FGQA_TILE * FGQA_K_SEG / 4)
-// V slab: 16 keys; lloyd4 132 B/head, Q8_0 272 B/head (worst case sizes it).
+// V slab: 32 keys; lloyd4 132 B/head, Q8_0 272 B/head (worst case sizes it).
+#define FGQA_V_TILE 32
+// LDS carve: V slab (worst case) + Q 6*256 floats + scores 6*128 floats.
 #define FGQA_V_DWORDS (FGQA_V_TILE * 272 / 4)
-#define FGQA_V_DWORDS (FGQA_V_TILE * 272 / 4)
-
-// Same [n_heads, max_tiles, 2 + head_dim] partials as the scalar tile.
-__device__ __forceinline__ void fgqa_write_partials(
-    float* __restrict__ partials, int h, int tile_id, int max_tiles,
-    float tile_max, float tile_sum)
-{
-    float* p = partials + ((size_t)h * max_tiles + tile_id) * (2 + FGQA_HD);
-    p[0] = tile_max;
-    p[1] = tile_sum;
-}
+// Each of the 8 waves owns 16 keys of the tile for scoring.
+#define FGQA_KEYS_PER_WAVE (FGQA_TILE / FGQA_WAVES)
 
 extern "C" __launch_bounds__(FGQA_THREADS, 1)
 __global__ void attention_flash_fwht4_tile_gqa_gfx11(
@@ -79,7 +75,6 @@ __global__ void attention_flash_fwht4_tile_gqa_gfx11(
     const int wave = tid >> 5;
     const int lane = tid & 31;
 
-    __shared__ __attribute__((aligned(16))) unsigned int k_lds[FGQA_K_DWORDS];
     __shared__ __attribute__((aligned(16))) unsigned int v_lds[FGQA_V_DWORDS];
     __shared__ __attribute__((aligned(16))) float q_lds[FGQA_GROUP * FGQA_HD];
     __shared__ __attribute__((aligned(16))) float sc[FGQA_GROUP * FGQA_TILE];
@@ -116,58 +111,63 @@ __global__ void attention_flash_fwht4_tile_gqa_gfx11(
         const int tile_start = tile_id * FGQA_TILE;
         const int tile_len = min(FGQA_TILE, seq_len - tile_start);
 
-        // ---- K tile into LDS once (all waves cooperate) ----
-        // K records interleave across kv heads (row stride 528 B), so a
-        // flat copy would land the wrong head's bytes for every key past
-        // the first. Gather per (key, dword) with the strided source and
-        // pack each key's 132 B contiguously (33 dwords) for the readers.
+        // ---- Scores: all 8 waves participate, each wave owns 16 keys
+        // (wave*16 .. wave*16+15). K is read straight from global with
+        // scalar-identical addressing — coalesced per-lane ushorts plus a
+        // broadcast cnorm — and shared across the six heads through sc.
+        // No K LDS, no K-stage barrier. Per (head, key) the arithmetic is
+        // the scalar tile's exactly (same DOT4, same wave tree, same
+        // scale); heads run in two groups of three to bound registers.
         {
-            const int dwords_per_key = FGQA_K_SEG / 4;
-            const int n_dwords = tile_len * dwords_per_key;
-#pragma unroll 1
-            for (int i = tid; i < n_dwords; i += FGQA_THREADS) {
-                const int tl = i / dwords_per_key;
-                const int w = i - tl * dwords_per_key;
-                const unsigned char* rec = k_cache
-                    + (size_t)(tile_start + tl) * k_bytes_per_pos + k_head_off;
-                unsigned int v;
-                __builtin_memcpy(&v, rec + w * 4, 4);
-                k_lds[i] = v;
-            }
-        }
-        __syncthreads();
-
-        // ---- Scores: waves 0-5 own heads 0-5. Per key, the wave's 32
-        // lanes each dot their 8 dims (scalar-identical DOT4), then the
-        // wave tree reduces to the full 256-dim dot; lane 0 writes it.
-        // Same op order as the scalar tile, per (head, key).
-        if (wave < FGQA_GROUP) {
-            const float* qh = q_lds + (size_t)wave * FGQA_HD;
-            float mq[8];
-            for (int half = 0; half < 2; ++half) {
-                const int d0 = half * 128 + lane * 4;
-                mq[half * 4 + 0] = qh[d0 + 0];
-                mq[half * 4 + 1] = qh[d0 + 1];
-                mq[half * 4 + 2] = qh[d0 + 2];
-                mq[half * 4 + 3] = qh[d0 + 3];
-            }
-            for (int tl = 0; tl < tile_len; ++tl) {
-                const unsigned char* kb =
-                    (const unsigned char*)(k_lds + (size_t)tl * (FGQA_K_SEG / 4));
-                float cnorm;
-                __builtin_memcpy(&cnorm, kb, 4);
-                float partial = 0.0f;
-                for (int half = 0; half < 2; ++half) {
-                    unsigned short pk = *(const unsigned short*)(kb + 4 + half * 64 + lane * 2);
-                    partial += mq[half * 4 + 0] * (cnorm * TURBO_C4[(pk)       & 0xF])
-                             + mq[half * 4 + 1] * (cnorm * TURBO_C4[((pk) >> 4)  & 0xF])
-                             + mq[half * 4 + 2] * (cnorm * TURBO_C4[((pk) >> 8)  & 0xF])
-                             + mq[half * 4 + 3] * (cnorm * TURBO_C4[((pk) >> 12) & 0xF]);
+            for (int hg = 0; hg < 2; ++hg) {
+                float mq[3][8];
+#pragma unroll
+                for (int h = 0; h < 3; ++h) {
+                    const float* qh = q_lds + (size_t)(3 * hg + h) * FGQA_HD;
+                    for (int half = 0; half < 2; ++half) {
+                        const int d0 = half * 128 + lane * 4;
+                        mq[h][half * 4 + 0] = qh[d0 + 0];
+                        mq[h][half * 4 + 1] = qh[d0 + 1];
+                        mq[h][half * 4 + 2] = qh[d0 + 2];
+                        mq[h][half * 4 + 3] = qh[d0 + 3];
+                    }
                 }
-                for (int off = 16; off > 0; off >>= 1)
-                    partial += __shfl_xor(partial, off);
-                if (lane == 0)
-                    sc[wave * FGQA_TILE + tl] = partial * scale_attn;
+                for (int k = 0; k < FGQA_KEYS_PER_WAVE; ++k) {
+                    const int tl = wave * FGQA_KEYS_PER_WAVE + k;
+                    if (tl < tile_len) {
+                        const unsigned char* kb = k_cache
+                            + (size_t)(tile_start + tl) * k_bytes_per_pos + k_head_off;
+                        float cnorm;
+                        __builtin_memcpy(&cnorm, kb, 4);
+                        float partial[3] = { 0.0f, 0.0f, 0.0f };
+                        for (int half = 0; half < 2; ++half) {
+                            unsigned short pk = *(const unsigned short*)(kb + 4 + half * 64 + lane * 2);
+                            float c0 = cnorm * TURBO_C4[(pk)       & 0xF];
+                            float c1 = cnorm * TURBO_C4[((pk) >> 4)  & 0xF];
+                            float c2 = cnorm * TURBO_C4[((pk) >> 8)  & 0xF];
+                            float c3 = cnorm * TURBO_C4[((pk) >> 12) & 0xF];
+#pragma unroll
+                            for (int h = 0; h < 3; ++h) {
+                                partial[h] += mq[h][half * 4 + 0] * c0
+                                            + mq[h][half * 4 + 1] * c1
+                                            + mq[h][half * 4 + 2] * c2
+                                            + mq[h][half * 4 + 3] * c3;
+                            }
+                        }
+                        for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+                            for (int h = 0; h < 3; ++h)
+                                partial[h] += __shfl_xor(partial[h], off);
+                        }
+                        if (lane == 0) {
+#pragma unroll
+                            for (int h = 0; h < 3; ++h)
+                                sc[(3 * hg + h) * FGQA_TILE + tl] = partial[h] * scale_attn;
+                        }
+                    }
+                }
+                // Keep group 1's Q loads from hoisting above group 0 (Q8 pattern).
+                asm volatile("" ::: "memory");
             }
         }
         __syncthreads();
@@ -198,7 +198,7 @@ __global__ void attention_flash_fwht4_tile_gqa_gfx11(
         __syncthreads();
 
         // ---- V accumulation: waves 0-5 own heads 0-5. V streams in
-        // 16-key slabs through LDS (one global read per K/V tile per
+        // 32-key slabs through LDS (one global read per K/V tile per
         // kv head); accumulators live across slabs, partials are written
         // once per tile (scalar-identical rotated space for lloyd V).
         const int v_rec_b = (v_mode == 8) ? 272 : 4 + FGQA_HD * v_mode / 8;
@@ -250,7 +250,6 @@ __global__ void attention_flash_fwht4_tile_gqa_gfx11(
                             (const unsigned char*)(v_lds + (size_t)tl * (size_t)v_rec_d);
                         float cnorm;
                         __builtin_memcpy(&cnorm, vb, 4);
-                        const float wc = w * cnorm;
                         const unsigned char* base = vb + 4 + lane * (unsigned)v_mode;
                         unsigned int packed = (unsigned int)base[0];
                         if (v_mode >= 2) packed |= ((unsigned int)base[1] << 8);
@@ -262,7 +261,7 @@ __global__ void attention_flash_fwht4_tile_gqa_gfx11(
                             if (v_mode == 2)      c = TURBO_C2_256[(packed >> (i * 2)) & 3];
                             else if (v_mode == 3) c = TURBO_C3_256[(packed >> (i * 3)) & 7];
                             else                  c = TURBO_C4_256[(packed >> (i * 4)) & 15];
-                            ov[i] += wc * c;
+                            ov[i] += w * (cnorm * c);
                         }
                     }
                 }

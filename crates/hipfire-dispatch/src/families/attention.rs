@@ -1652,12 +1652,15 @@ fn dispatch_attend(
                 let ct = io.givens_cos.unwrap();
                 let st = io.givens_sin.unwrap();
                 let fp = io.flash_partials.unwrap();
-                // GQA-shared decode (P4b, PARKED — correct but slower than the
-                // scalar tile on gfx1100: the 6x traffic cut loses to phase
-                // + occupancy costs here): arm removed so nothing slow ships.
-                // Kernel + launcher + oracle remain as reference; re-enable
-                // by restoring the gated call below (exact H24/KV4/D256,
-                // v_mode 8/4, gfx1100).
+                // GQA-shared decode (P4b occupancy v2, PARKED — correct but
+                // slower than the scalar tile on gfx1100 at every measured
+                // ctx: short 48.0 vs 49.1 (-2%), medium 46.6→42.5 (-9%),
+                // long v1 28.65→16.2 (-44%)). The 6x traffic cut loses to
+                // phase + occupancy costs here, and the loss SCALES with
+                // ctx — occupancy/barriers were not the lever. Arm removed
+                // so nothing slow ships. Kernel + launcher + oracle remain
+                // as reference; re-enable by restoring the gated call below
+                // (exact H24/KV4/D256, v_mode 8/4, gfx1100).
                 hip!(gpu.attention_flash_fwht4(
                     io.q,
                     io.k_cache,

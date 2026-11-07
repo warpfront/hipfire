@@ -17117,7 +17117,10 @@ impl Gpu {
                 &mut vm as *mut _ as *mut c_void,
             ];
             // One workgroup per (kv head, tile); block 256. Static LDS only
-            // (~29 KB: K tile + Q + scores); no dynamic shared use.
+            // (~17.5 KB: V slab + Q + scores, worst-case Q8 V; lloyd4 V
+            // is smaller); no dynamic shared use. No K LDS — keys are
+            // partitioned across the 8 waves (16 each) and read straight
+            // from global with scalar-identical addressing.
             // Cap Y like the Q8 GQA tile so a graph-captured grid does not
             // dispatch thousands of idle workgroups.
             let grid_y = launch_tiles.min(512);
