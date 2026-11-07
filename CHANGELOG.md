@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Perf (default on, exact gfx1201 Flash-Next EP2, bitwise; `HIPFIRE_QWEN4_MOE_GU_C8_PM=0` / `HIPFIRE_QWEN4_MOE_DOWN_C8_PM=0` restore hipcc): ExpertKern wave 1 persistent item entry for the PM gate/up and grouped A8 down modules.**
+  - G1: the tile metadata (slot ids, live mask, expert pointer, X rows) is fetched once per item. G2: all-zero (EP dummy) chunks store their +0.0 and skip the K walk via a workgroup verdict. G3: the first weight ring goes out before the zero-scale probe wait. G4: no slot-id reloads (down: the four slot-index loads issue together with one wait; eight store offsets, no store round trip per word).
+  - Images: gate/up ELF sha256 `30a7fdab…130d` (bundle `8c98c684…2fab`), down ELF `eb614d74…acac` (bundle `925b2423…7235`); emitter expertkern/emit e8992e409e, CPI 1.
+  - VRAM-only cold bench j8332 (card C, real planar experts, rank 0 of EP2, mean µs per launch, old → new): gate/up code C4 24 rows 143.7 → 126.0, 32 rows 208.2 → 188.8, code C8 48 rows 276.3 → 246.0, 48 rows/60 experts 315.7 → 278.8; down C4 50.9 → 50.0, C8 82.6 → 80.5, 48/60 108.4 → 106.4.
+  - Byte-identical: emulator differential vs the hipcc anchor (gate/up r8 68/68, r4 68/68 cases incl. dummy tiles; down 34+1 cases), card ALTCHECK 0 mismatching words at every cell.
+  - Card byte oracles on this build (j8366, card B, real planar experts of layers 0/17/47, both ranks, non-owned half on one all-zero expert, rows 9..48, n_blocks 1..512, every Y word incl. sentinel dead rows): `moe_gu_c8_pm_oracle` 576/576, `moe_down_c8_pm_oracle` 576/576. Oracle timing at 48 rows, PM/hipcc: gate/up 321.7/395.9 µs (0.81), down 122.5/123.6 µs.
 - **Added (peacemaker lab, no product route): P0 dispatcher span mode (railgunmega/DYNAMIC.md) and EXPAND_LIVE hosted in the 128-thread pool.** A task header with flag bit 0 (+48) takes its virtual workgroup from a live list. Header +52 holds k and +56 the list id. `M0Params.spans` (+64, formerly pad) points to `u32 n_spans` and 32-byte descriptors `{live_list, count_cell, bitmap, K}`. After the predecessor acquire the dispatcher reads the count:
   - `c > K`, an unknown list id, `spans == 0`, a span header without a predecessor event, an out-of-grid entry, or an already-set claim bit poisons (set-only OR);
   - `k >= c` runs as `NOP_TMPL`: no region, but done is still released;
