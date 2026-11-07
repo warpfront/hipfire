@@ -198,6 +198,25 @@ __global__ void attention_flash_fwht4_tile(
             p[2 + d_base + 2] = out_vec[half * 4 + 2];
             p[2 + d_base + 3] = out_vec[half * 4 + 3];
         }
+    } else if (v_mode == 4) {
+        // ── lloyd4 V (4-bit): aligned dword loads, w*cnorm factored ──
+        const int d0 = tid * 8;
+        float ov[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+        const int v_bytes_per_head = 4 + (head_dim * 4) / 8;
+        const int v_bytes_per_pos  = n_kv_heads * v_bytes_per_head;
+        const int v_head_off       = kv_h * v_bytes_per_head;
+        for (int t_local = 0; t_local < tile_len; t_local++) {
+            float w = scores[t_local];
+            int t = tile_start + t_local;
+            const unsigned char* vb = v_cache + (size_t)t * v_bytes_per_pos + v_head_off;
+            float cnorm = *(const float*)vb;
+            const uint32_t packed = *(const uint32_t*)(vb + 4 + tid * 4);
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                ov[i] += w * (cnorm * TURBO_C4_256[(packed >> (i * 4)) & 15]);
+        }
+        #pragma unroll
+        for (int i = 0; i < 8; i++) p[2 + d0 + i] = ov[i];
     } else {
         // ── 256-wide lloyd2/3/4 V: FWHT-rotated centroid (head_dim==256 only).
         // Own tid*8 contiguous layout — required by fwht_shfl_inverse_256.
@@ -216,6 +235,8 @@ __global__ void attention_flash_fwht4_tile(
             if (v_mode >= 2) packed |= ((unsigned int)base[1] << 8);
             if (v_mode >= 3) packed |= ((unsigned int)base[2] << 16);
             if (v_mode >= 4) packed |= ((unsigned int)base[3] << 24);
+            // NOTE: no w*cnorm hoist here — this generic path serves v2/v3
+            // with no KV fixture to validate against; keep it bit-identical.
             #pragma unroll
             for (int i = 0; i < 8; i++) {
                 float c;
