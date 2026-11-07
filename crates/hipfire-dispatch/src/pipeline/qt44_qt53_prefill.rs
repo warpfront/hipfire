@@ -43,7 +43,8 @@
 use super::layer_ops::hip;
 use crate::families::gemv::WeightRef;
 use crate::families::moe::{
-    MoePrefillParams, MoeRouteCapability, MoeSharedPrefill, MoeTileExchangeParams,
+    MoeDecodeOwnerMask, MoePrefillParams, MoeRouteCapability, MoeSharedPrefill,
+    MoeTileExchangeParams,
 };
 use crate::types::DispatchError;
 use rdna_compute::moe::SharedExpertActivation;
@@ -1562,6 +1563,14 @@ pub(crate) fn combine_order_only(
     super::combine_leaf(super::CombineArm::RankOrderOnly, reduction_partition(p))?;
     require_geometry(p)?;
     validate_scratch(gpu, p, true, grouped_rows)?;
+    // The wide-verify int8 chain's masked down never writes the foreign grouped rows, and this order
+    // carries no owner mask on that route: a row fold over them would read unwritten rows. (Unreachable
+    // today: a gathered call has a separate shared-down output, which the row fold excludes.)
+    if ep_a8_wide(gpu, p, true) && ep_a8_owner_mask(gpu, p)?.is_some() {
+        return Err(DispatchError::Hip(
+            "qt44 combine order: the owner-masked wide-verify chain has no row-fold order".into(),
+        ));
+    }
     let owners = implicit_zero_owners(gpu, p);
     hip(gpu.moe_combine_order_top10_owned(
         p.inverse_perm,
@@ -1881,9 +1890,12 @@ fn shared_reads_x_rot(p: &MoePrefillParams<'_>) -> bool {
 ///   `x_norm_batch`, and the Flash-Next geometry ([`ep_a8_wide_geometry`]);
 /// * an EP row-gathered call whose gather is a no-op ([`MoeRowGather::gather_skipped`]: the trunk
 ///   shard's partial FFN, owned-slot partial completed by the HC all-reduce, non-owned experts on
-///   the zero dummy tables: every grouped row is written, +0 for dummy tiles, so the combine needs
-///   no owner mask). A call that gathers (the MTP head, a non-shard EP, a balanced / partitioned
-///   layer) needs F32 slot-ordered rows and keeps the incumbent chain;
+///   the zero dummy tables). Owner-masked ([`ep_a8_owner_mask`], default) both A8 GEMMs skip the
+///   tiles of every non-owned expert and the combine folds only owned rows (a foreign rank adds
+///   +0); unmasked (`HIPFIRE_QWEN4_MOE_GU_A8=2`, or a gather without a mask) every grouped row is
+///   written, +0 for dummy tiles. Both are byte-identical. A call that gathers (the MTP head, a
+///   non-shard EP, a balanced / partitioned layer) needs F32 slot-ordered rows and keeps the
+///   incumbent chain;
 /// * no tile exchange, no CPU split / deferral (their consumers need F32 slot-ordered rows).
 pub(crate) fn ep_a8_wide(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
     let use_path2 = grouped_path(gpu, p, use_path2);
@@ -1906,6 +1918,33 @@ pub(crate) fn ep_a8_wide(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -
         && p.routed_experts.cpu_split().is_none()
         && p.ep_row_gather
             .is_some_and(|gather| gather.gather_skipped(p.ep_layer_idx))
+}
+
+/// The owner mask of this call's wide-verify int8 chain ([`ep_a8_wide`] is the caller's gate): the
+/// layer's gather hook ([`crate::families::moe::MoeRowGather::decode_owner_mask`]: the static `e % ranks`
+/// ownership of the rank's compact decode table, real owned experts and zero dummies for the rest)
+/// unless `HIPFIRE_QWEN4_MOE_GU_A8=2` ([`Gpu::qwen4_moe_gu_a8_masked`]) asks for the unmasked A/B.
+/// `None`: the chain runs over unmasked tiles. A table over another expert count is an error.
+fn ep_a8_owner_mask<'p>(
+    gpu: &Gpu,
+    p: &'p MoePrefillParams<'_>,
+) -> Result<Option<MoeDecodeOwnerMask<'p>>, DispatchError> {
+    if !gpu.qwen4_moe_gu_a8_masked() {
+        return Ok(None);
+    }
+    let Some(mask) = p
+        .ep_row_gather
+        .and_then(|gather| gather.decode_owner_mask(p.ep_layer_idx))
+    else {
+        return Ok(None);
+    };
+    if mask.n_experts != p.n_exp {
+        return Err(DispatchError::Hip(format!(
+            "qt44 wide-verify owner mask: the owner table covers {} experts, the layer has {}",
+            mask.n_experts, p.n_exp
+        )));
+    }
+    Ok(Some(mask))
 }
 
 /// Whether [`scatter`] would launch the plain `moe_scatter_fused_top10` for this call, with
@@ -2275,12 +2314,31 @@ pub(crate) fn gate_up_front(
     }
     if ep_a8_wide(gpu, p, use_path2) {
         // HIPFIRE_QWEN4_MOE_GU_A8 (EP2 decode / verify, 9..=64 rows): int8 per-128 gate/up with the
-        // SwiGLU epilogue (BF16 grouped rows, every grouped row written: dummy tiles give +0).
-        gpu.qwen4_moe_gu_a8_receipt(p.batch_size, grouped_rows);
+        // SwiGLU epilogue (BF16 grouped rows). Owner-masked (default): `ep_tile_mask` copies the
+        // scatter's tile ids with every non-owned expert's tile set to the `-1` sentinel; this GEMM
+        // and the down both read the copy (the down runs later in the same call, stream-ordered), so
+        // neither touches a tile whose weights are the zero dummy. Unmasked: every grouped row is
+        // written, dummy tiles give +0.
+        let mask = ep_a8_owner_mask(gpu, p)?;
+        gpu.qwen4_moe_gu_a8_receipt(p.batch_size, grouped_rows, mask.is_some());
+        let tile_ids = match mask {
+            Some(mask) => {
+                hip(gpu.ep_tile_mask(
+                    p.expert_tile_ids,
+                    mask.tile_ids_owned,
+                    mask.owner_table,
+                    grouped_tiles(grouped_rows),
+                    mask.n_experts,
+                    mask.rank,
+                ))?;
+                mask.tile_ids_owned
+            }
+            None => gemm_tile_ids(p),
+        };
         let xq = hip(gpu.qwen4_moe_rotate256_i8(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
         return hip(gpu.gemm_qwen4_moe_gate_up_silu_a8_sym(
             gate_up_ptrs,
-            gemm_tile_ids(p),
+            tile_ids,
             p.sorted_slot_index,
             &xq,
             p.y_gate_up_grouped,
@@ -2731,6 +2789,12 @@ fn down_stage(
     if ep_a8_wide(gpu, p, use_path2) {
         // HIPFIRE_QWEN4_MOE_GU_A8: grouped BF16 SwiGLU rows -> FWHT128 -> flat-slot A8 -> signed-IU8
         // down; BF16 rows for the BF16-input combine (no unscatter to slot order: the gather is a no-op).
+        // The rotation reads the gate/up rows of every grouped slot, the rows of masked tiles
+        // included (stale: gate/up never wrote them): each lands in its own flat-slot record
+        // (`sorted_slot_index` is unique per grouped row, one CTA per row and K128 epoch), and the
+        // down reads only the records of the tiles it runs, never a masked tile's.
+        let tile_ids =
+            ep_a8_owner_mask(gpu, p)?.map_or(gemm_tile_ids(p), |mask| mask.tile_ids_owned);
         let xq = hip(gpu.qwen4_moe_rotate128_i8(
             p.y_gate_up_grouped,
             p.sorted_slot_index,
@@ -2740,7 +2804,7 @@ fn down_stage(
         ))?;
         hip(gpu.gemm_qwen4_moe_down_a8_sym(
             down_ptrs,
-            gemm_tile_ids(p),
+            tile_ids,
             p.sorted_slot_index,
             &xq,
             p.y_down_grouped,
@@ -2927,7 +2991,17 @@ fn combine_stage(
         // `down_expanded`: unused on this route until the shared down, which
         // runs after the combine. Under the partial mask's implicit zeros the
         // order marks the foreign rows -1 (their clear was skipped).
-        let owners = implicit_zero_owners(gpu, p);
+        // The wide-verify chain's owner mask (a masked down never wrote the foreign rows): the same
+        // owner table the tile mask read, so the combine folds exactly the owned rows and a foreign
+        // rank adds +0 with its own weight and rounding.
+        let owners = if ep_a8_wide(gpu, p, use_path2) {
+            ep_a8_owner_mask(gpu, p)?.map(|mask| rdna_compute::hc_row_fold::CombineOwners {
+                table: mask.owner_table,
+                rank: mask.rank,
+            })
+        } else {
+            implicit_zero_owners(gpu, p)
+        };
         hip(gpu.moe_down_combine_grouped_top10_bf16in_owned(
             p.y_down_grouped,
             p.inverse_perm,
@@ -4676,6 +4750,33 @@ mod scratch_tests {
         assert!(!ep_a8_wide_symmetric(Qt44Qt53GroupedSymmetric, false));
         assert!(!ep_a8_wide_symmetric(Fp8B128Grouped, true));
         assert!(!ep_a8_wide_symmetric(SlabCodecGrouped, true));
+    }
+
+    /// A gather that offers no owner mask (every hook but the trunk shard's static layers, and a hook
+    /// whose attach built none) leaves the wide-verify int8 chain over unmasked tiles: the trait
+    /// default is `None`, for every layer.
+    #[test]
+    fn a_gather_without_an_owner_mask_leaves_the_wide_verify_chain_unmasked() {
+        use crate::families::moe::MoeRowGather;
+        struct PlainGather;
+        impl MoeRowGather for PlainGather {
+            fn gather_rows(
+                &self,
+                _gpu: &mut Gpu,
+                _layer_idx: u16,
+                _slots: usize,
+                _down_expanded: &GpuTensor,
+                _topk_indices: &GpuTensor,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        for layer in [0u16, 3, 47, 48] {
+            assert!(
+                PlainGather.decode_owner_mask(layer).is_none(),
+                "layer {layer}"
+            );
+        }
     }
 
     #[test]

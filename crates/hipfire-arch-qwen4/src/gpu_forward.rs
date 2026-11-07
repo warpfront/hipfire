@@ -4284,6 +4284,61 @@ pub(crate) struct Qwen4BalancedPlan {
     pub(crate) slot_owner: GpuTensor,
 }
 
+/// One EP rank's owner-mask state of the wide-verify int8 chain (`HIPFIRE_QWEN4_MOE_GU_A8`, default; the
+/// trunk shard's 9..=64-row decode / verify MoE): both buffers are built once at
+/// [`Qwen4GpuForward::attach_ep`], never per step, and owned by [`Qwen4ForwardEp`] (the row-gather
+/// hook holds non-owning views, [`Qwen4GpuForward::ep_decode_owner_mask_views`]).
+pub(crate) struct Qwen4DecodeOwnerMask {
+    /// Owner rank of every expert, `i32` each: the sealed ownership (exactly `e % ranks`, the rule the
+    /// compact decode table's real-versus-dummy entries follow), read by the tile mask AND the
+    /// combine's owner mask.
+    owner_table: GpuTensor,
+    /// The masked tile ids the chain's two A8 GEMMs read, `i32` per tile of a 64-row call's padded
+    /// grouped capacity ([`ep_decode_mask_tiles`]); never aliases `expert_tile_ids`.
+    tile_ids_owned: GpuTensor,
+}
+
+/// Tiles of the wide-verify chain's masked id scratch: the padded grouped tile capacity of the
+/// widest call the chain serves (`WIDE_VERIFY_MAX_ROWS` rows at top-`k_top` of `n_experts`), the
+/// same bound the grouped scratch is sized by ([`crate::program::grouped_m_total_bound`]).
+fn ep_decode_mask_tiles(k_top: usize, n_experts: usize) -> Result<usize, Qwen4GpuForwardError> {
+    let slots = rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS
+        .checked_mul(k_top)
+        .ok_or_else(|| invalid("EP decode owner mask slot count overflows"))?;
+    let rows = crate::program::grouped_m_total_bound(slots, n_experts)
+        .map_err(|error| invalid(error.to_string()))?;
+    Ok(rows / hipfire_dispatch::families::moe::MOE_GROUPED_BLOCK_M)
+}
+
+impl Qwen4DecodeOwnerMask {
+    fn alloc(gpu: &mut Gpu, owners: &[usize], tiles: usize) -> Result<Self, Qwen4GpuForwardError> {
+        let owners = tile_owner_table_bytes(owners);
+        let owner_table = gpu.upload_raw(&owners, &[owners.len()])?;
+        let sentinels = vec![0xFFu8; tiles * std::mem::size_of::<i32>()];
+        let tile_ids_owned = match gpu.upload_raw(&sentinels, &[sentinels.len()]) {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                let _ = gpu.free_tensor(owner_table);
+                return Err(error.into());
+            }
+        };
+        Ok(Self {
+            owner_table,
+            tile_ids_owned,
+        })
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+        let mut first = None;
+        for tensor in [self.owner_table, self.tile_ids_owned] {
+            if let Err(error) = gpu.free_tensor(tensor) {
+                first.get_or_insert(error);
+            }
+        }
+        first
+    }
+}
+
 /// Expert-parallel state of one rank's forward (present iff the bundle's
 /// weights carry an EP placement).
 pub(crate) struct Qwen4ForwardEp {
@@ -4313,6 +4368,10 @@ pub(crate) struct Qwen4ForwardEp {
     /// Owner-routed chunk MoE state (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`, admitted at
     /// construction); `None` when the lever is off or refused.
     tile: Option<Qwen4TileRoute>,
+    /// The wide-verify int8 chain's owner mask (`HIPFIRE_QWEN4_MOE_GU_A8` default, trunk shard):
+    /// built at [`Qwen4GpuForward::attach_ep`], `None` when the chain is off or unmasked
+    /// (`HIPFIRE_QWEN4_MOE_GU_A8=0` / `2`), off the trunk shard, or before attach.
+    decode_mask: Option<Qwen4DecodeOwnerMask>,
 }
 
 impl Qwen4ForwardEp {
@@ -4360,6 +4419,7 @@ impl Qwen4ForwardEp {
             balanced: Vec::new(),
             slot_owner: None,
             tile: None,
+            decode_mask: None,
         };
         // The zero fills are stream-ordered; peers read the buffers over P2P
         // on their own streams.
@@ -4394,6 +4454,11 @@ impl Qwen4ForwardEp {
         }
         if let Some(tensor) = self.slot_owner {
             if let Err(error) = gpu.free_tensor(tensor) {
+                first.get_or_insert(error);
+            }
+        }
+        if let Some(mask) = self.decode_mask {
+            if let Some(error) = mask.free_gpu(gpu) {
                 first.get_or_insert(error);
             }
         }
@@ -13919,6 +13984,7 @@ impl Qwen4GpuForward {
         let mut full: Vec<Qwen4MoeLayerRuntime> = Vec::with_capacity(layers);
         let mut balanced: Vec<Option<Qwen4BalancedLayer>> = Vec::new();
         let mut slot_owner: Option<GpuTensor> = None;
+        let mut decode_mask: Option<Qwen4DecodeOwnerMask> = None;
         let result = (|| -> Result<(), Qwen4GpuForwardError> {
             let mut ordinal = 0usize;
             for layer in &bundle.weights.layer_refs {
@@ -14100,6 +14166,26 @@ impl Qwen4GpuForward {
                     gpu.hip.device_synchronize()?;
                 }
             }
+            // Wide-verify int8 chain owner mask: only the trunk shard's partial FFN route has a no-op
+            // gather (`MoeRowGather::gather_skipped`), and `HIPFIRE_QWEN4_MOE_GU_A8=2` / `0` run
+            // unmasked / off, so nothing is allocated there. The table is the SEALED ownership
+            // (`placement.owns(e)` is `e % ranks`, what the compact decode table's real entries
+            // follow); built once here, no per-step allocation or upload.
+            if gpu.qwen4_moe_gu_a8_masked() && crate::weights::trunk_shard::trunk_shard_requested()
+            {
+                let owners = seal.seal.owner_ranks();
+                if owners.len() != config.num_experts {
+                    return Err(invalid(
+                        "the sealed owner table does not cover every expert",
+                    ));
+                }
+                let tiles = ep_decode_mask_tiles(config.num_experts_per_tok, config.num_experts)?;
+                decode_mask = Some(Qwen4DecodeOwnerMask::alloc(gpu, &owners, tiles)?);
+                eprintln!(
+                    "qwen4 EP rank {}/{}: wide-verify owner mask built ({} experts, {tiles} tiles)",
+                    placement.rank, placement.ranks, config.num_experts
+                );
+            }
             Ok(())
         })();
         if let Err(error) = result {
@@ -14111,6 +14197,9 @@ impl Qwen4GpuForward {
             }
             if let Some(tensor) = slot_owner {
                 let _ = gpu.free_tensor(tensor);
+            }
+            if let Some(mask) = decode_mask {
+                let _ = mask.free_gpu(gpu);
             }
             return Err(error);
         }
@@ -14164,6 +14253,7 @@ impl Qwen4GpuForward {
         ep.moe_full = full;
         ep.balanced = balanced;
         ep.slot_owner = slot_owner;
+        ep.decode_mask = decode_mask;
         ep.gather = Some(gather);
         if let Some(verdicts) = partial_verdicts {
             for (layer, &verdict) in self.moe.iter_mut().flatten().zip(&verdicts) {
@@ -14220,6 +14310,21 @@ impl Qwen4GpuForward {
             shape: table.shape.clone(),
             dtype: table.dtype,
         })
+    }
+
+    /// Non-owning views of the rank's wide-verify owner mask, `(owner table, masked tile ids)`, for
+    /// the row-gather hook ([`MoeRowGather::decode_owner_mask`]); `None` without the mask. The forward
+    /// owns both until `free_gpu`; the hook that holds them lives inside this forward and is never
+    /// used after it is freed.
+    pub(crate) fn ep_decode_owner_mask_views(&self) -> Option<(GpuTensor, GpuTensor)> {
+        let mask = self.ep.as_ref()?.decode_mask.as_ref()?;
+        let view = |tensor: &GpuTensor| GpuTensor {
+            // SAFETY: a `Borrowed` alias of a buffer `Qwen4ForwardEp` owns until `free_gpu`.
+            buf: unsafe { tensor.buf.alias() },
+            shape: tensor.shape.clone(),
+            dtype: tensor.dtype,
+        };
+        Some((view(&mask.owner_table), view(&mask.tile_ids_owned)))
     }
 
     /// Install the agreed transport. On gfx1201 every layer's compact runtime takes the
@@ -22251,6 +22356,31 @@ mod ep_rank_generic_tests {
         assert!(!trunk_partial_mask_on(false, true));
         assert!(!trunk_partial_mask_on(true, false));
         assert!(trunk_partial_mask_on(true, true));
+    }
+
+    /// The wide-verify chain's masked tile id scratch covers the padded tile capacity of its widest
+    /// call (64 rows, top-10 of 512 experts: `ceil16(640 + 15 * 512) = 8320` grouped rows, 520 tiles) and
+    /// the owner table bytes are one little-endian `i32` per expert, `e % ranks` for the static split.
+    #[test]
+    fn decode_owner_mask_capacity_and_table_follow_the_static_split() {
+        assert_eq!(ep_decode_mask_tiles(10, 512).unwrap(), 520);
+        // The bound is the grouped scratch's: every row count the chain serves fits.
+        for rows in 9..=rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS {
+            let grouped = crate::program::grouped_m_total_bound(rows * 10, 512).unwrap() / 16;
+            assert!(
+                grouped <= ep_decode_mask_tiles(10, 512).unwrap(),
+                "rows {rows}"
+            );
+        }
+        let owners: Vec<usize> = (0..8).map(|e| e % 2).collect();
+        let bytes = tile_owner_table_bytes(&owners);
+        assert_eq!(bytes.len(), 8 * 4);
+        for (e, word) in bytes.chunks_exact(4).enumerate() {
+            assert_eq!(
+                i32::from_le_bytes([word[0], word[1], word[2], word[3]]),
+                (e % 2) as i32
+            );
+        }
     }
 
     /// The G2 expert stage is built on a compact-table chunk route: the admitted tile route

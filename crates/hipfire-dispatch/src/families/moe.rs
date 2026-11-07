@@ -1592,6 +1592,15 @@ pub trait MoeRowGather {
         false
     }
 
+    /// The owner mask of the wide-verify int8 chain (`HIPFIRE_QWEN4_MOE_GU_A8`, `ep_a8_wide`) of this
+    /// layer's call: `Some` only where [`Self::gather_skipped`] holds and the rank built its owner table
+    /// at EP attach, so the chain masks the tiles of every expert another rank owns out of both A8
+    /// GEMMs and folds only owned rows. `None` (default): the chain runs over unmasked tiles, the
+    /// non-owned experts on the zero dummy tables, byte-identical.
+    fn decode_owner_mask(&self, _layer_idx: u16) -> Option<MoeDecodeOwnerMask<'_>> {
+        None
+    }
+
     /// Rewrite the layer's live expert tables and slot owners from
     /// `topk_indices` (`slots = rows * k`). Runs after routing, before the
     /// first routed-table reader of the same call.
@@ -1627,6 +1636,19 @@ pub trait MoeRowGather {
     /// The forward is freed: release any device state the hook owns. No-op by
     /// default.
     fn release_gpu(&self, _gpu: &mut rdna_compute::Gpu) {}
+}
+
+/// The wide-verify int8 chain's owner mask ([`MoeRowGather::decode_owner_mask`]): the device table of the
+/// owner rank of every expert (`i32` per expert, at least `n_experts` words: the combine's owner mask
+/// and the tile mask read the SAME table, so their ownership predicate cannot differ), this rank, and
+/// the masked tile id scratch (`i32` per tile, never aliasing `expert_tile_ids`; at least the padded
+/// tile capacity of a 64-row call).
+#[derive(Clone, Copy)]
+pub struct MoeDecodeOwnerMask<'a> {
+    pub owner_table: &'a GpuTensor,
+    pub tile_ids_owned: &'a GpuTensor,
+    pub rank: usize,
+    pub n_experts: usize,
 }
 
 /// Expert-parallel owner-routed chunk exchange of the grouped symmetric IU4

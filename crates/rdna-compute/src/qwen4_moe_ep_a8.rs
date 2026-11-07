@@ -28,9 +28,10 @@
 //! [`Gpu::qwen4_moe_ep_a8_requested`] routes it through these kernels, any row count the chain serves.
 //!
 //! The same kernels also serve the Flash-Next EP2 decode / verify MoE of 9..=64 source rows on the trunk
-//! shard's partial-FFN route (developer env `HIPFIRE_QWEN4_MOE_GU_A8`, default on, `=0` off; exact gfx1201):
-//! [`Gpu::qwen4_moe_gu_a8_applies`] is the launcher half of that route's predicate, the dispatch stage
-//! predicate (`ep_a8_wide`, `qt44_qt53_prefill.rs`) the per-call half.
+//! shard's partial-FFN route (developer env `HIPFIRE_QWEN4_MOE_GU_A8`, default on, `=0` off, `=2` unmasked;
+//! exact gfx1201): [`Gpu::qwen4_moe_gu_a8_applies`] is the launcher half of that route's predicate, the
+//! dispatch stage predicate (`ep_a8_wide`, `qt44_qt53_prefill.rs`) the per-call half. By default that
+//! route owner-masks its decode tiles ([`Gpu::qwen4_moe_gu_a8_masked`]).
 
 use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::gemm::moe_expert_table_len;
@@ -49,11 +50,15 @@ use std::sync::LazyLock;
 /// switch (the A4 chain everywhere).
 pub const QWEN4_MOE_EP_A8_FLAG: &str = "HIPFIRE_QWEN4_MOE_EP_A8";
 
-/// Developer kill switch of the wide-verify int8 routed-MoE chain of the Qwen4 Flash-Next EP2 decode /
+/// Developer switch of the wide-verify int8 routed-MoE chain of the Qwen4 Flash-Next EP2 decode /
 /// verify path (exact gfx1201, source rows in the g32 window [`Gpu::moe_wide_verify_rows`]: 9..=64): this
 /// module's A8 gate/up + down kernels and the BF16-row grouped combine replace the g32 gate/up, the
 /// unscatter + rotation, the PM A8 down, the down unscatter and the expanded top-10 combine
-/// ([`Gpu::qwen4_moe_gu_a8_applies`]). Default ON; exact `0` restores the incumbent chain, byte-identical.
+/// ([`Gpu::qwen4_moe_gu_a8_applies`]). Default ON (unset / exact `1`): the decode tiles are owner-masked
+/// (both A8 GEMMs skip the experts another rank owns, the combine reads only owned rows; see
+/// [`Gpu::qwen4_moe_gu_a8_masked`]); exact `2`: the same chain over UNMASKED tiles (non-owned experts on the
+/// zero dummy tables), byte-identical to the masked route and kept for the byte A/B; exact `0` restores the
+/// incumbent chain, byte-identical.
 pub const QWEN4_MOE_GU_A8_FLAG: &str = "HIPFIRE_QWEN4_MOE_GU_A8";
 
 /// Module of the gate/up and down GEMM entries.
@@ -80,8 +85,8 @@ static EP_A8: LazyLock<Option<bool>> = LazyLock::new(|| {
         _ => None,
     }
 });
-/// `HIPFIRE_QWEN4_MOE_GU_A8`, parsed once: exact `1` / `0`, anything else (unset included) is `None`
-/// (the default: on). Same parse as [`EP_A8`].
+/// `HIPFIRE_QWEN4_MOE_GU_A8`, parsed once: exact `1` / `0`, anything else (unset and `2` included) is `None`
+/// (the default: on). Same parse as [`EP_A8`]; the `2` (unmasked) half is [`GU_A8_UNMASKED`].
 static GU_A8: LazyLock<Option<bool>> = LazyLock::new(|| {
     match hipfire_config::developer_var(QWEN4_MOE_GU_A8_FLAG)
         .as_deref()
@@ -91,6 +96,14 @@ static GU_A8: LazyLock<Option<bool>> = LazyLock::new(|| {
         Ok("0") => Some(false),
         _ => None,
     }
+});
+/// `HIPFIRE_QWEN4_MOE_GU_A8=2`, parsed once: the wide-verify chain runs over unmasked tiles.
+static GU_A8_UNMASKED: LazyLock<bool> = LazyLock::new(|| {
+    gu_a8_unmasked(
+        hipfire_config::developer_var(QWEN4_MOE_GU_A8_FLAG)
+            .ok()
+            .as_deref(),
+    )
 });
 static EP_A8_NT: LazyLock<Option<usize>> = LazyLock::new(|| {
     hipfire_config::developer_var(QWEN4_MOE_EP_A8_NT_ENV)
@@ -190,6 +203,17 @@ fn gu_a8_enabled(arch: &str, flag: Option<bool>) -> bool {
     arch == "gfx1201" && flag != Some(false)
 }
 
+/// Whether `HIPFIRE_QWEN4_MOE_GU_A8` is the exact value `2`: the wide-verify chain over unmasked tiles.
+fn gu_a8_unmasked(raw: Option<&str>) -> bool {
+    raw.map(str::trim) == Some("2")
+}
+
+/// Pure form of [`Gpu::qwen4_moe_gu_a8_masked`]: the switch half ([`gu_a8_enabled`]) and not the exact
+/// value `2`.
+fn gu_a8_masked(arch: &str, flag: Option<bool>, unmasked: bool) -> bool {
+    gu_a8_enabled(arch, flag) && !unmasked
+}
+
 /// `(k, n)` int8-scratch reservations of a chain of up to `max_rows` tokens: the gate sidecar and the down
 /// sidecar ([`ep_a8_down_reserve_k`] rounding), `n` saturating at `usize::MAX`.
 pub fn ep_a8_reserve_shapes(
@@ -240,15 +264,24 @@ impl Gpu {
         gu_a8_enabled(&self.arch, *GU_A8)
     }
 
+    /// Whether the wide-verify int8 chain owner-masks its decode tiles: the switch is on for this device
+    /// ([`Self::qwen4_moe_gu_a8_enabled`]) and `HIPFIRE_QWEN4_MOE_GU_A8` is not the exact value `2` (the
+    /// unmasked developer A/B). The masked route is byte-identical to the unmasked one. Flag read once
+    /// per process; also the load-time condition of the EP attach's owner table.
+    pub fn qwen4_moe_gu_a8_masked(&self) -> bool {
+        gu_a8_masked(&self.arch, *GU_A8, *GU_A8_UNMASKED)
+    }
+
     /// One stderr line, once per process, the first time the wide-verify int8 chain launches:
     /// served logs prove the route ran. Per-stage entries are the `[INFO] qwen4 moe EP A8: first launch`
     /// lines and, under `HIPFIRE_CB_PHASES=1`, the `[moe-entry]` receipts of the A8 GEMMs.
-    pub fn qwen4_moe_gu_a8_receipt(&self, rows: usize, grouped_rows: usize) {
+    pub fn qwen4_moe_gu_a8_receipt(&self, rows: usize, grouped_rows: usize, masked: bool) {
         static SEEN: AtomicBool = AtomicBool::new(false);
         if !SEEN.swap(true, Ordering::Relaxed) {
+            let tiles = if masked { "owner-masked" } else { "unmasked" };
             eprintln!(
                 "[INFO] qwen4 moe GU A8: first wide-verify launch rows={rows} grouped_rows={grouped_rows} \
-                 (int8 per-128 gate/up + down, BF16 grouped combine; {QWEN4_MOE_GU_A8_FLAG}=0 restores the g32 + PM A8 down chain)"
+                 (int8 per-128 gate/up + down, {tiles} tiles, BF16 grouped combine; {QWEN4_MOE_GU_A8_FLAG}=0 restores the g32 + PM A8 down chain)"
             );
         }
     }
@@ -752,6 +785,32 @@ mod tests {
         assert!(!gu_a8_enabled("gfx1201", Some(false)));
         for arch in ["gfx1100", "gfx1151", "gfx942", ""] {
             assert!(!gu_a8_enabled(arch, None), "{arch}");
+        }
+    }
+
+    /// `HIPFIRE_QWEN4_MOE_GU_A8`: unset / `1` run the chain owner-masked, exact `2` the same chain over
+    /// UNMASKED tiles (the byte A/B), exact `0` off; exact gfx1201 only. `2` is not `1` / `0`, so the
+    /// switch half still reads it as "on" (`GU_A8` is `None`).
+    #[test]
+    fn gu_a8_masked_is_the_default_and_two_is_the_unmasked_ab() {
+        assert!(!gu_a8_unmasked(None));
+        assert!(!gu_a8_unmasked(Some("")));
+        assert!(!gu_a8_unmasked(Some("1")));
+        assert!(!gu_a8_unmasked(Some("0")));
+        assert!(!gu_a8_unmasked(Some("22")));
+        assert!(gu_a8_unmasked(Some("2")));
+        assert!(gu_a8_unmasked(Some(" 2 ")));
+        // Masked: switch on and not `2`.
+        assert!(gu_a8_masked("gfx1201", None, false));
+        assert!(gu_a8_masked("gfx1201", Some(true), false));
+        // `2` parses to `GU_A8 = None` (on) with the unmasked bit: the chain applies, unmasked.
+        assert!(!gu_a8_masked("gfx1201", None, true));
+        assert!(gu_a8_applies("gfx1201", None, 16, true));
+        // `0`: off, so never masked either.
+        assert!(!gu_a8_masked("gfx1201", Some(false), false));
+        assert!(!gu_a8_masked("gfx1201", Some(false), true));
+        for arch in ["gfx1100", "gfx1151", "gfx942", ""] {
+            assert!(!gu_a8_masked(arch, None, false), "{arch}");
         }
     }
 }

@@ -1540,12 +1540,12 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-moe-gu-a8-wide-verify",
         predicates: &[IsRecording, CaptureMode],
-        condition: "Gpu::qwen4_moe_gu_a8_applies (HIPFIRE_QWEN4_MOE_GU_A8, qwen4_moe_ep_a8.rs): exact gfx1201, the switch not `0` (default on), 9..=64 source rows (the g32 window), and `!capture_mode && !is_recording()`; the dispatch stage predicate `ep_a8_wide` (qt44_qt53_prefill.rs) adds the per-call conditions (EP row gather that is a no-op, symmetric planar experts, Flash-Next geometry)",
+        condition: "Gpu::qwen4_moe_gu_a8_applies (HIPFIRE_QWEN4_MOE_GU_A8, qwen4_moe_ep_a8.rs): exact gfx1201, the switch not `0` (default on; exact `2` runs the same chain over unmasked tiles, the developer byte A/B), 9..=64 source rows (the g32 window), and `!capture_mode && !is_recording()`; the dispatch stage predicate `ep_a8_wide` (qt44_qt53_prefill.rs) adds the per-call conditions (EP row gather that is a no-op, symmetric planar experts, Flash-Next geometry); the owner mask (default, `MoeRowGather::decode_owner_mask`, the trunk shard's static `e % ranks` layers) is an eager launch on the same predicate",
         effect: KernelSelection,
-        switches: "eager: the EP2 decode / verify routed MoE of 9..=64 rows runs the int8-per-128 (A8) gate/up + down GEMMs and the BF16-row grouped combine; recorded/captured: the g32 gate/up, PM A8 down, down unscatter and expanded top-10 combine (EP is eager-only: the row gather refuses under capture or record)",
+        switches: "eager: the EP2 decode / verify routed MoE of 9..=64 rows runs the int8-per-128 (A8) gate/up + down GEMMs over owner-masked tiles (`ep_tile_mask` copy of the tile ids, non-owned experts' tiles `-1`, both GEMMs skip them) and the owned BF16-row grouped combine; recorded/captured: the g32 gate/up, PM A8 down, down unscatter and expanded top-10 combine (EP is eager-only: the row gather refuses under capture or record)",
         kernels: &[],
         verdict: NotEquivalent,
-        evidence: "different numerics in the gate/up input only (int8 per 128 vs 4-bit per 32 activations); for the same SwiGLU rows the A8 chain's down records, BF16 down rows and combine residuals are byte-identical to the incumbent's (A8DN, j8367); gate/up byte-checked against an independent CPU integer reference (tests/qwen4_moe_ep_a8_hw.rs); KLD-neutral (expsolve/RESULT.md E0)",
+        evidence: "different numerics in the gate/up input only (int8 per 128 vs 4-bit per 32 activations); for the same SwiGLU rows the A8 chain's down records, BF16 down rows and combine residuals are byte-identical to the incumbent's (A8DN, j8367); gate/up byte-checked against an independent CPU integer reference (tests/qwen4_moe_ep_a8_hw.rs); KLD-neutral (expsolve/RESULT.md E0); the owner mask changes no bytes by construction: a masked tile is a dummy-table tile that wrote +0 rows, and the owned combine equals the plain combine over +0 dummy rows (A8DN check c); the owner table is the sealed `e % ranks` ownership the compact decode table follows",
         reaches: &[],
     },
     Decision {

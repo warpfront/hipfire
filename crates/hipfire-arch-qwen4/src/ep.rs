@@ -27,7 +27,7 @@ use crate::gpu_forward::{
     QWEN4_EP_GATHER_BUFFERS,
 };
 use crate::weights::Qwen4EpPlacement;
-use hipfire_dispatch::families::moe::{MoeRowGather, MoeTileExchange};
+use hipfire_dispatch::families::moe::{MoeDecodeOwnerMask, MoeRowGather, MoeTileExchange};
 use hipfire_dispatch::pipeline::projection_split::split_scope;
 use hipfire_runtime::ar_hc_exchange::ArHcExchange;
 use hipfire_runtime::arch_model::ArchModel;
@@ -532,7 +532,24 @@ pub(crate) struct Qwen4EpRowGatherHook {
     /// The rank's D2 expert tail (`HIPFIRE_EP_UNIT_TAIL`), installed once after the forward
     /// attached; never set when the tail is off.
     tail: OnceLock<Arc<crate::expert_unit_tail_rank::UnitTailRank>>,
+    /// The wide-verify int8 chain's owner mask (`HIPFIRE_QWEN4_MOE_GU_A8` default, trunk shard):
+    /// non-owning views of the forward's owner table and masked tile ids, installed once after
+    /// `attach_ep`; never set when the chain is off / unmasked or off the trunk shard.
+    decode_mask: OnceLock<DecodeOwnerMaskViews>,
 }
+
+/// Non-owning views of the forward's wide-verify owner mask buffers
+/// (`Qwen4GpuForward::ep_decode_owner_mask_views`).
+struct DecodeOwnerMaskViews {
+    owner_table: GpuTensor,
+    tile_ids_owned: GpuTensor,
+}
+
+// SAFETY: both are `Borrowed` aliases of device buffers the forward owns until `free_gpu` (the
+// owner table is read-only after upload; the masked tile ids are written only by launches on this
+// rank's own stream) and the hook never outlives that forward; HIP device pointers carry no
+// thread affinity.
+unsafe impl Sync for DecodeOwnerMaskViews {}
 
 /// What the hook knows of the rank's balanced trunk layers.
 struct BalancedOwners {
@@ -637,12 +654,32 @@ impl Qwen4EpRowGatherHook {
             balanced: OnceLock::new(),
             unit_plan: OnceLock::new(),
             tail: OnceLock::new(),
+            decode_mask: OnceLock::new(),
         })
     }
 
     /// Install the load's unit plan for [`lab_unit_hits`] (once, after construction).
     fn install_unit_plan(&self, plan: Arc<crate::expert_ep_units::EpUnitPlan>) {
         let _ = self.unit_plan.set(plan);
+    }
+
+    /// Install the forward's wide-verify owner mask views (once, after `attach_ep`).
+    fn install_decode_owner_mask(
+        &self,
+        owner_table: GpuTensor,
+        tile_ids_owned: GpuTensor,
+    ) -> Result<(), String> {
+        self.decode_mask
+            .set(DecodeOwnerMaskViews {
+                owner_table,
+                tile_ids_owned,
+            })
+            .map_err(|_| {
+                format!(
+                    "qwen4 EP rank {}: the decode owner mask is already installed",
+                    self.rank
+                )
+            })
     }
 
     /// Install the rank's D2 tail (once, after `attach_ep`).
@@ -973,6 +1010,22 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
             crate::trunk_route::ffn_partial_active(),
             self.reduction_partition(layer_idx).is_some(),
         )
+    }
+
+    /// The static `e % ranks` ownership of the rank's compact decode table (real owned experts, zero
+    /// dummies for the rest; `Qwen4EpRowGatherHook::new` checks the sealed table is exactly that),
+    /// offered where the gather is a no-op (a trunk layer on the partial FFN route that is not
+    /// balanced): there a call's combine folds only owned slots, so both A8 GEMMs may skip every
+    /// non-owned tile. Never for the MTP head or a balanced / partitioned layer (they gather).
+    fn decode_owner_mask(&self, layer_idx: u16) -> Option<MoeDecodeOwnerMask<'_>> {
+        let views = self.decode_mask.get()?;
+        self.gather_skipped(layer_idx)
+            .then_some(MoeDecodeOwnerMask {
+                owner_table: &views.owner_table,
+                tile_ids_owned: &views.tile_ids_owned,
+                rank: self.rank,
+                n_experts: QWEN4_EP_OWNER_EXPERTS,
+            })
     }
 
     fn assigns_owners(&self, layer_idx: u16) -> bool {
@@ -2132,6 +2185,12 @@ impl Qwen4Bundle {
                     // more ranks run the exact static split (`attach_ep` builds no
                     // balanced layers).
                     Some(plan) => hook.install_balanced(plan),
+                    None => Ok(()),
+                })
+                .and_then(|()| match forward.ep_decode_owner_mask_views() {
+                    Some((owner_table, tile_ids_owned)) => {
+                        hook.install_decode_owner_mask(owner_table, tile_ids_owned)
+                    }
                     None => Ok(()),
                 })
                 .and_then(|()| {
