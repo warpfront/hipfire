@@ -4543,12 +4543,19 @@ impl Qwen4Bundle {
     /// Attach the session cache (`hipfire_runtime::session_cache`): prefill
     /// then restores and captures whole-chunk snapshots through it.
     pub fn attach_session_cache(&mut self, mut cache: SessionCache) {
-        if let Some(policy) = session_pair::pressure_host_snapshot_policy(
-            self.slowlink
-                .profile
-                .map(|profile| profile.device_snapshot_budget_bytes),
-            || cache.usage().budget_bytes,
-        ) {
+        // `topology.hetero_experts`: the primary's VRAM holds the trunk and the
+        // hot expert set to the last expert that fits, so the cache gets no
+        // device credit (budget 0) and every snapshot lives in pinned host
+        // memory beside the cold experts; a restore is one host-to-device copy
+        // (~0.5 s for 25K tokens over USB4) instead of a re-prefill.
+        let device_budget = self
+            .slowlink
+            .profile
+            .map(|profile| profile.device_snapshot_budget_bytes)
+            .or_else(|| crate::hetero::split_requested().then_some(0));
+        if let Some(policy) =
+            session_pair::pressure_host_snapshot_policy(device_budget, || cache.usage().budget_bytes)
+        {
             cache.enable_pressure_host_snapshots(policy);
         }
         self.session = Some(SessionDriver::new(cache));
