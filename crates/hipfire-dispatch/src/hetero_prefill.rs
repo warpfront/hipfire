@@ -399,6 +399,28 @@ pub fn run_cold_prefill(
     rows: usize,
     io: ColdPrefillIo,
 ) -> Result<(), DispatchError> {
+    // Small blocks (an agent turn appends a few hundred rows) run the grouped
+    // symmetric IU4 route down to the few-row limit instead of leaving it
+    // below 512 rows (gfx1151: ~8-12 ms per block per layer off it vs ~1 ms
+    // on it); saved and restored so nothing else on this device sees it.
+    let floor = gpu.qwen4_moe_sym_iu4_floor;
+    gpu.qwen4_moe_sym_iu4_floor = COLD_PREFILL_SYM_IU4_FLOOR;
+    let result = run_cold_prefill_inner(gpu, layer, s, rows, io);
+    gpu.qwen4_moe_sym_iu4_floor = floor;
+    result
+}
+
+/// Smallest block the expert device's cold prefill runs on the symmetric IU4
+/// route (the admission still requires rows above the few-row limit).
+pub const COLD_PREFILL_SYM_IU4_FLOOR: usize = 16;
+
+fn run_cold_prefill_inner(
+    gpu: &mut Gpu,
+    layer: &ColdPrefillLayer,
+    s: &ColdPrefillScratch,
+    rows: usize,
+    io: ColdPrefillIo,
+) -> Result<(), DispatchError> {
     let c = s.cfg;
     if rows == 0 || rows > c.max_rows {
         return Err(err(format!("{rows} rows outside 1..={}", c.max_rows)));

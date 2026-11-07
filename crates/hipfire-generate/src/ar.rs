@@ -1736,6 +1736,12 @@ pub fn emit_active_route_error(
 }
 
 pub fn emit_active_route_done(output: &mut dyn Write, id: &str, pending: &serde_json::Value) {
+    if hipfire_config::developer_bool("HIPFIRE_QWEN_CACHE_TRACE", false) {
+        eprintln!(
+            "  request {id}: done emitted at t={}",
+            hipfire_runtime::trace_clock_ms()
+        );
+    }
     if let Some(route) = active_generation_route() {
         emit_generation_done(route, output, id, pending);
     } else {
