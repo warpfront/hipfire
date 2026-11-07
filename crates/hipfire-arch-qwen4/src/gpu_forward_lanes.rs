@@ -3062,9 +3062,22 @@ fn forward_lanes_scoped(
         // laid out contiguously lane after lane, and each lane's own PLE conv
         // state; anything else keeps the per-lane chain. Declared before the
         // steps: they borrow the chunks.
+        //
+        // The op runs at its chunk's FIRST lane and reads every lane's
+        // streams and PLE rows, so whatever writes them must already have run
+        // for every lane: the PLE conv has to start its per-lane run (the op
+        // before it shared over all rows, or none). Under the Single topology
+        // every stage is per lane, the step is one run emitted lane after
+        // lane, and a later lane's rows would still hold the previous step's
+        // values (fn_lane_oracle k=2 on gfx1201: lane 1's first AR row wrong).
+        let ple_conv_starts_run = program
+            .iter()
+            .position(|(op, _)| matches!(op, LaneOp::PleConv))
+            .is_some_and(|at| at == 0 || !policy.share(program[at - 1].1).per_lane());
         let ple_chunks: Vec<(usize, Vec<&GpuTensor>)> = match &ple_w {
             Some(ple_w)
                 if band_scope.input
+                    && ple_conv_starts_run
                     && !prefill
                     && !bf16_state
                     && lane_segs.iter().all(|seg| seg.rows == 1) =>
