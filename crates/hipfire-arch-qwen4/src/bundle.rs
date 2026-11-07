@@ -1277,6 +1277,21 @@ impl Qwen4Bundle {
             applied.before_bytes >> 20,
             applied.after_bytes >> 20
         );
+        // `HIPFIRE_EP_RESERVE_CENSUS`: `replace_owned` freed each full pre-shard copy of the
+        // shared-expert tensors into the device pool, which hands bytes back to HIP only on a
+        // drain or an allocation that fails. The planner budgets the shard's saving, so return
+        // them now. `drain_pool` frees only the pool's free lists (buffers no tensor owns) and
+        // the slabs already fully retired, never a live buffer, and runs before the forward and
+        // the first request allocate anything.
+        if hipfire_config::memory::ep_reserve_census() {
+            let parked = gpu.pool_parked_bytes();
+            gpu.drain_pool();
+            eprintln!(
+                "  qwen4 trunk shard: rank {}: returned {} MiB of pooled pre-shard copies to HIP",
+                placement.rank,
+                parked >> 20
+            );
+        }
         Ok(())
     }
 

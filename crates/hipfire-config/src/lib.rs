@@ -7543,6 +7543,19 @@ mod tests {
     }
 
     #[test]
+    fn ep_reserve_census_is_on_unless_exactly_zero() {
+        use memory::parse_ep_reserve_census as parse;
+        assert!(parse(None) && parse(Some("")) && parse(Some("1")) && parse(Some("off")));
+        assert!(parse(Some("true")) && parse(Some("00")) && parse(Some("2")));
+        assert!(!parse(Some("0")) && !parse(Some(" 0 ")));
+        assert!(memory::ep_reserve_census());
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_EP_RESERVE_CENSUS").as_deref(),
+            Some("developer.ep_reserve_census")
+        );
+    }
+
+    #[test]
     fn qwen4_sp_is_a_typed_bool_developer_key_unset_follows_the_arch_default() {
         const KEY: &str = "developer.qwen4_sp";
         const ENV: &str = "HIPFIRE_QWEN4_SP";
@@ -11315,6 +11328,23 @@ pub mod memory {
 
     /// Pure truth table behind [`ep_hc8_plan_charge`]: only a trimmed `0` is off.
     pub fn parse_ep_hc8_plan_charge(raw: Option<&str>) -> bool {
+        raw.map(str::trim) != Some("0")
+    }
+
+    /// Developer kill switch `HIPFIRE_EP_RESERVE_CENSUS` for the expert-parallel (2 or more
+    /// ranks) reserve census: default on, an EP load charges the measured HIP runtime
+    /// (`QWEN4_EP2_RUNTIME_OVERHEAD_GFX1201_BYTES` on an exact gfx1201 EP2 load) and so
+    /// retires the historical single-device floor, sizes the trunk-shard rank's GDN state,
+    /// MTP capture ring and shared-expert INT8 shadows at the rank-local width instead of the
+    /// global one, and returns the pre-shard shared-expert copies from the device pool to HIP
+    /// after the shard. Exactly `0` restores the earlier EP behaviour byte for byte (floor
+    /// kept, global census terms, no pool drain). Read once per load.
+    pub fn ep_reserve_census() -> bool {
+        parse_ep_reserve_census(process_value("HIPFIRE_EP_RESERVE_CENSUS").as_deref())
+    }
+
+    /// Pure truth table behind [`ep_reserve_census`]: only a trimmed `0` is off.
+    pub fn parse_ep_reserve_census(raw: Option<&str>) -> bool {
         raw.map(str::trim) != Some("0")
     }
 

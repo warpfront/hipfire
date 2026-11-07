@@ -180,6 +180,40 @@ pub fn census_trunk_for(
     })
 }
 
+/// The rank-local config the EP reserve census sizes the GDN state and the native MTP capture
+/// ring at (`HIPFIRE_EP_RESERVE_CENSUS`): the shard of rank 0 of a two-rank load with the shard
+/// on, `None` otherwise. Every rank of the shard shares the GDN / QSA head counts (balanced
+/// halves), so rank 0 stands for the busiest rank there; the shared-expert width, which does
+/// differ per rank, is [`max_shared_width`]. `None` also where the config cannot be cut (the
+/// load itself refuses that), leaving the census on the global config.
+pub fn census_local_config(config: &Qwen4Config, ranks: usize) -> Option<Qwen4Config> {
+    census_local_config_for(trunk_shard_requested(), config, ranks)
+}
+
+/// [`census_local_config`] for an explicit `requested`.
+pub fn census_local_config_for(
+    requested: bool,
+    config: &Qwen4Config,
+    ranks: usize,
+) -> Option<Qwen4Config> {
+    if ranks != 2 || !requested {
+        return None;
+    }
+    config.replica_geometry().trunk_shard_local(0, ranks).ok()
+}
+
+/// The widest shared-expert intermediate slice any rank of a `parts`-way shard keeps
+/// ([`role_cut`] of [`Role::SharedGate`], 384 of 640 on Flash-Next EP2): the busiest rank's
+/// INT8 shadow width.
+pub fn max_shared_width(d: &TrunkDims, mode: QsaMode, parts: usize) -> Result<usize, String> {
+    let mut widest = 0;
+    for rank in 0..parts {
+        let cut = role_cut(d, mode, Role::SharedGate, rank, parts)?;
+        widest = widest.max(cut.out_shape(d.shared_inter, 1)[0]);
+    }
+    Ok(widest)
+}
+
 /// The rank-local config a two-rank EP load of rank `placement.rank` runs under when the
 /// shard is on (`Ok(None)` when it is off). Refused loudly when the switch is on but the
 /// load is not two-rank EP, or when the config carries the native MTP head the policy drops

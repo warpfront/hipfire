@@ -3022,13 +3022,17 @@ pub fn qwen4_ep_free_vram(gpu: &rdna_compute::Gpu, devices: &[i32]) -> Result<Ve
         // Planned capacity (device total minus this process's own live
         // allocations), not the instantaneous free figure: a foreign
         // process's transient allocation must not move the agreed split. The
-        // fixed planned reserve is NOT deducted here: the EP reserve census
-        // keeps the historical floor (`runtime_overhead_bytes` is `None` for
-        // ranks > 1), which stands in for the HIP runtime residency
-        // (`QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES`, 929-1,383 MiB measured on
-        // an R9700 beyond live allocations), so deducting the planned
-        // reserve as well would count it twice: one resident layer per rank
-        // lost, measured on both the default and the chunk-512 placement.
+        // fixed planned reserve is NOT deducted here: the EP reserve census carries the HIP
+        // runtime residency itself, so deducting the planned reserve as well would count it
+        // twice (one resident layer per rank lost, measured on both the default and the
+        // chunk-512 placement). With `HIPFIRE_EP_RESERVE_CENSUS` on (default) an exact gfx1201
+        // EP2 census charges the measured per-rank term
+        // (`QWEN4_EP2_RUNTIME_OVERHEAD_GFX1201_BYTES`, 1,088 MiB, which includes the 57 MiB
+        // idle baseline because this plan budgets against the device TOTAL) and retires the
+        // historical floor; with the switch `=0`, or off gfx1201 / at 3+ ranks
+        // (`runtime_overhead_bytes_ep` is `None`), the census keeps the floor, which stands in
+        // for it (`QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES`, 929-1,383 MiB measured on an R9700
+        // beyond live allocations).
         // UMA parts keep the free figure.
         let capacity = gpu
             .planned_capacity_for(device)
