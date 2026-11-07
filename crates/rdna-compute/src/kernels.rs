@@ -9146,6 +9146,10 @@ pub const KV_CACHE_WRITE_ASYM_K_FWHT4_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_asym_k_fwht4_batched.hip");
 pub const ATTENTION_FLASH_FWHT4_TILE_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_fwht4_tile.hip");
+pub const ATTENTION_FLASH_FWHT4_TILE_GQA_GFX11_SRC: &str = concat!(
+    include_str!("../../../kernels/src/turbo_common.h"),
+    include_str!("../../../kernels/src/attention_flash_fwht4_tile_gqa.gfx11.hip")
+);
 pub const ATTENTION_FLASH_FWHT4_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_fwht4_tile_batched.hip");
 pub const KV_CACHE_WRITE_ASYM_K_FWHT3_SRC: &str =

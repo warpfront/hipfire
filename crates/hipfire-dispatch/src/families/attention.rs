@@ -1652,6 +1652,12 @@ fn dispatch_attend(
                 let ct = io.givens_cos.unwrap();
                 let st = io.givens_sin.unwrap();
                 let fp = io.flash_partials.unwrap();
+                // GQA-shared decode (P4b, PARKED — correct but slower than the
+                // scalar tile on gfx1100: the 6x traffic cut loses to phase
+                // + occupancy costs here): arm removed so nothing slow ships.
+                // Kernel + launcher + oracle remain as reference; re-enable
+                // by restoring the gated call below (exact H24/KV4/D256,
+                // v_mode 8/4, gfx1100).
                 hip!(gpu.attention_flash_fwht4(
                     io.q,
                     io.k_cache,
