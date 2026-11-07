@@ -207,9 +207,13 @@ pub fn render_conversations(json: &str, template_src: &str) -> Result<Vec<String
         normalize_arguments_in_messages(&mut conv.messages);
 
         let messages_val = minijinja::Value::from_serialize(&conv.messages);
+        // Missing or empty `tools` binds `none`, as HF and the daemon do: Llama-3.x
+        // renders its tool preamble on `tools is not none`.
         let tools_val = match &conv.tools {
-            Some(v) => minijinja::Value::from_serialize(v),
-            None => minijinja::Value::from_serialize(&serde_json::Value::Array(Vec::new())),
+            Some(v) if v.as_array().is_none_or(|a| !a.is_empty()) => {
+                minijinja::Value::from_serialize(v)
+            }
+            _ => minijinja::Value::from(()),
         };
         let ctx = minijinja::context! {
             messages => messages_val,
@@ -376,6 +380,33 @@ mod tests {
             "expected 'Paris' from dict indexing, got {:?}",
             rendered[0]
         );
+    }
+
+    #[test]
+    fn missing_or_empty_tools_bind_none() {
+        // Llama-3.x renders its tool preamble on `tools is not none`.
+        let tmpl = "{% if tools is not none %}PRE{% endif %}{% for m in messages %}{{ m.content }}{% endfor %}";
+        let conv = |tools: Option<serde_json::Value>| {
+            let mut c = serde_json::json!({
+                "kept_index": 0,
+                "scenario_category": "chat",
+                "source": "unit",
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            if let Some(t) = tools {
+                c["tools"] = t;
+            }
+            c
+        };
+        let tool = serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
+        let json = serde_json::json!({
+            "recipe": "v6",
+            "n_conversations": 3,
+            "conversations": [conv(None), conv(Some(serde_json::json!([]))), conv(Some(tool))]
+        })
+        .to_string();
+        let rendered = render_conversations(&json, tmpl).expect("render");
+        assert_eq!(rendered, vec!["hi", "hi", "PREhi"]);
     }
 
     #[test]
