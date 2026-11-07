@@ -38,11 +38,35 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
+
+/// Positional exact-length read (`pread` semantics): Unix `read_exact_at`,
+/// Windows `seek_read` loop (short reads retried, EOF mapped like `read_exact`).
+#[cfg(unix)]
+fn pread_exact(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn pread_exact(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        let n = file.seek_read(buf, offset)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "failed to fill whole buffer",
+            ));
+        }
+        buf = &mut buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
 
 use hipfire_arch_qwen4::expert_slabs::{
     expert_entry_name, parse_expert_entry_name, ExpertFormat, ExpertProj, ExpertSlabsV1,
@@ -795,8 +819,7 @@ struct E8pFile {
 impl E8pFile {
     fn read_at(&self, expert: usize, off: usize, len: usize) -> io::Result<Vec<u8>> {
         let mut v = vec![0u8; len];
-        self.file
-            .read_exact_at(&mut v, self.offsets[expert] + off as u64)?;
+        pread_exact(&self.file, &mut v, self.offsets[expert] + off as u64)?;
         Ok(v)
     }
 }
@@ -1304,7 +1327,7 @@ fn copy_span(
         if buf.len() < n {
             buf.resize(n, 0);
         }
-        file.read_exact_at(&mut buf[..n], offset + done)?;
+        pread_exact(file, &mut buf[..n], offset + done)?;
         hasher.update(&buf[..n]);
         w.write_all(&buf[..n])?;
         done += n as u64;
@@ -1324,8 +1347,7 @@ fn sha256_file(path: &Path) -> Result<(String, u64), SlabError> {
     let mut off = 0u64;
     while off < len {
         let n = (len - off).min(buf.len() as u64) as usize;
-        file.read_exact_at(&mut buf[..n], off)
-            .map_err(|e| io_err(path.display(), e))?;
+        pread_exact(&file, &mut buf[..n], off).map_err(|e| io_err(path.display(), e))?;
         hasher.update(&buf[..n]);
         off += n as u64;
     }
@@ -2216,7 +2238,7 @@ fn verify_output(
         s.spawn(move || {
             let read = |off: u64, n: usize| -> io::Result<Vec<u8>> {
                 let mut v = vec![0u8; n];
-                file.read_exact_at(&mut v, off)?;
+                pread_exact(file, &mut v, off)?;
                 Ok(v)
             };
             let run = || -> io::Result<()> {
