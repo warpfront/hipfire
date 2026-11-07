@@ -107,7 +107,6 @@ impl ArchPredicate {
             Self::HasWmmaW32 => ctx.arch.has_wmma_w32(),
             Self::HasWmmaGfx12 => ctx.arch.has_wmma_w32_gfx12(),
             Self::HasDot2F32F16 => ctx.arch.has_dot2_f32_f16(),
-            Self::HasSdot4 => ctx.arch.has_hfq3_sdot4(),
             Self::HasHfq3G256Gemv => {
                 ctx.arch.has_hfq3_sdot4()
                     || ctx.arch.is_gfx1100()
