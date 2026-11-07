@@ -990,6 +990,12 @@ required-features = ["lab"]
 name = "tmp_lloyd_i8_twin_t0"
 required-features = ["lab"]
 
+# TEMPORARY diagnostic (delete before commit): fwht4 GQA vs scalar tile
+# differential. Lab-gated like the other tmp probes.
+[[example]]
+name = "tmp_fwht_gqa_oracle"
+required-features = ["lab"]
+
 # T0 experiment (throwaway): gated behind `lab` at merge prep (was the last
 # ungated example keeping the ungated_examples ratchet at 69; see
 # scripts/leanup-thresholds.txt). Run with `--features lab`.
