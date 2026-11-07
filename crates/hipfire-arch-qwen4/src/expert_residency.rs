@@ -3462,14 +3462,16 @@ pub fn ep_mtp_resident_decision(
     for entry in weights.iter().filter(|entry| is_mtp_head_routed(entry)) {
         let payload =
             bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
-        // Rank 0 owns the most experts of an uneven split: the charge every rank budgets.
-        let share = rank_share(entry, payload, 0, ranks)?;
+        // ponytail: no seal reaches this decision; the head is charged at the stride split
+        // (its largest rank, rank 0), which is what today's seal gives it.
+        let experts = entry.logical_shape.first().copied().unwrap_or(0);
+        let spans = EpExpertSpans::stride(experts, ranks)?;
+        let share = rank_share(entry, payload, spans.largest_rank(), &spans)?;
         entries += 1;
         bytes = bytes
             .checked_add(share)
             .ok_or_else(|| "MTP head owned routed-expert byte census overflows".to_string())?;
-        let experts = entry.logical_shape.first().copied().unwrap_or(0);
-        owned_experts = owned_experts.max(Qwen4EpPlacement { rank: 0, ranks }.local_count(experts));
+        owned_experts = owned_experts.max(spans.local(spans.largest_rank()).unwrap_or(experts));
     }
     Ok((entries > 0 && bytes > 0).then_some(EpMtpResident {
         entries,
@@ -3712,20 +3714,7 @@ pub fn ep_unit_host_bytes_ranks(
     }
     // ponytail: the unit plan has no seal spans; its non-trunk host entries
     // (embedding, MTP experts) are charged at the stride split it plans with.
-    let geometry = plan.geometry();
-    let spans = if ranks == 1 {
-        EpExpertSpans::single()
-    } else {
-        EpExpertSpans::new(
-            geometry.experts_per_layer,
-            (0..ranks)
-                .map(|rank| {
-                    crate::weights::Qwen4EpPlacement { rank, ranks }
-                        .local_count(geometry.experts_per_layer)
-                })
-                .collect(),
-        )?
-    };
+    let spans = EpExpertSpans::stride(plan.geometry().experts_per_layer, ranks)?;
     let mut per_rank: Vec<u64> = (0..ranks)
         .map(|rank| plan.host_pinned_bytes(rank))
         .collect();
@@ -3801,6 +3790,20 @@ impl EpExpertSpans {
             ));
         }
         Ok(Self { experts, local })
+    }
+
+    /// The `e % ranks` stride split of `experts` (what today's seal gives every group);
+    /// [`Self::single`] for one rank. For callers no seal reaches.
+    pub fn stride(experts: usize, ranks: usize) -> Result<Self, String> {
+        if ranks == 1 {
+            return Ok(Self::single());
+        }
+        Self::new(
+            experts,
+            (0..ranks)
+                .map(|rank| crate::weights::Qwen4EpPlacement { rank, ranks }.local_count(experts))
+                .collect(),
+        )
     }
 
     pub fn ranks(&self) -> usize {
