@@ -4287,7 +4287,14 @@ pub fn generate_dflash(
         stage_terminal_tool_calls(&mut pending_done, finish_reason, &wire_calls);
         let decision = await_client_terminal_commit(stdout, id, &pending_done);
         let intended_release = finish_reason == "tool_calls" && !wire_calls.is_empty();
-        let intended_store = !hit_length_cap && !open_think && !cached_seq.is_empty();
+        let cache_action = legacy_asst_turn_action(
+            hit_length_cap,
+            open_think,
+            started_in_think,
+            &decoded_full,
+            &wire_calls,
+        );
+        let intended_store = cache_action.store && !cached_seq.is_empty();
         let effects = qwen_client_commit_effects(decision, intended_release, intended_store);
         if !effects.emit_done {
             let ep = production_fail_closed_rollback(m, gpu, None, None);
@@ -4295,36 +4302,9 @@ pub fn generate_dflash(
             return true;
         }
         commit_qwen4_session(m);
-        // Safe stop/tool_calls only — length never stores; Abort suppressed above.
+        // Safe stop/tool_calls only (see legacy_asst_turn_action); Abort suppressed above.
         if effects.store_cache {
-            let stripped = strip_think_for_fingerprint(&decoded_full);
-            let emit_text =
-                hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
-            let fp = asst_turn_fingerprint(&emit_text, &wire_calls);
-            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
-                .ok()
-                .as_deref()
-                == Some("1")
-            {
-                eprintln!(
-                    "[qwen-cache store dflash] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
-                    fp, cached_seq.len(), emit_text.len(), wire_calls.len(),
-                    emit_text.chars().take(60).collect::<String>(),
-                );
-            }
-            // Legacy (non-qwen-semantic-v2) arches: content-only full body store.
-            // Rich whole-envelope reasoning text is the qwen semantic-v2 path above.
-            m.asst_turn_cache.insert(
-                fp,
-                hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                    reasoning: None,
-                    tools: Vec::new(),
-                    content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                        token_ids: cached_seq,
-                        text: String::new(),
-                    }),
-                },
-            );
+            store_legacy_asst_turn(m, &cache_action, cached_seq);
         }
         crate::ar::emit_active_route_done_value(stdout, &pending_done);
     }
@@ -7728,6 +7708,66 @@ pub fn qwen_dflash_wire_terminal(
             wire_tool_calls: Vec::new(),
         }
     }
+}
+
+/// Store decision for the legacy (non-semantic-v2) assistant-turn cache,
+/// shared by the DFlash/DSpark spec route and llama AR. The legacy entry is
+/// keyed on the visible text only, so a body that carries a think span
+/// (or started inside one) is never stored: its reasoning would splice into
+/// another conversation with the same visible answer, or into a think-off
+/// turn after the `<think></think>` primer (HIPF-227).
+pub fn legacy_asst_turn_action(
+    hit_length: bool,
+    open_think: bool,
+    started_in_think: bool,
+    decoded_full: &str,
+    wire_calls: &[hipfire_runtime::prompt_frame::ToolCall],
+) -> TurnCacheAction {
+    let has_think =
+        started_in_think || decoded_full.contains("<think>") || decoded_full.contains("</think>");
+    if hit_length || open_think || has_think {
+        return TurnCacheAction::skip();
+    }
+    // Strips the literal `<|im_end|>` the client never echoes back.
+    let visible = strip_think_for_fingerprint(decoded_full);
+    TurnCacheAction {
+        store: true,
+        fingerprint_text: hipfire_runtime::tokenizer::maybe_normalize_prompt(&visible).into_owned(),
+        tool_calls: wire_calls.to_vec(),
+    }
+}
+
+/// Publish a legacy turn: content-only full body under the action's fingerprint.
+pub fn store_legacy_asst_turn(m: &mut LoadedModel, action: &TurnCacheAction, cached_seq: Vec<u32>) {
+    let _ = apply_turn_cache_action(
+        |fp, seq| {
+            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                eprintln!(
+                    "[qwen-cache store legacy] fp={:#018x} cached_seq={} tool_calls={}",
+                    fp,
+                    seq.len(),
+                    action.tool_calls.len(),
+                );
+            }
+            m.asst_turn_cache.insert(
+                fp,
+                hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                    reasoning: None,
+                    tools: Vec::new(),
+                    content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                        token_ids: seq,
+                        text: String::new(),
+                    }),
+                },
+            );
+        },
+        action,
+        cached_seq,
+    );
 }
 
 pub fn qwen_dflash_cache_action(terminal: &QwenDflashWireTerminal) -> TurnCacheAction {
@@ -11579,5 +11619,114 @@ mod qwen_ep_sample_tests {
             2
         );
         assert_eq!(qwen_ep_sample(&mut logits, &[2], &greedy(1.0, 1.0, 0.0)), 5);
+    }
+}
+
+#[cfg(test)]
+mod legacy_asst_turn_store_tests {
+    use super::{legacy_asst_turn_action, TurnCacheAction};
+    use hipfire_engine::turn_cache::apply_turn_cache_action;
+    use std::collections::HashMap;
+
+    fn action(hit_length: bool, open_think: bool, started: bool, body: &str) -> TurnCacheAction {
+        legacy_asst_turn_action(hit_length, open_think, started, body, &[])
+    }
+
+    /// Publish through the production seam; returns the stored key.
+    fn store(
+        cache: &mut HashMap<u64, Vec<u32>>,
+        a: &TurnCacheAction,
+        seq: Vec<u32>,
+    ) -> Option<u64> {
+        apply_turn_cache_action(|fp, s| drop(cache.insert(fp, s)), a, seq)
+    }
+
+    #[test]
+    fn same_visible_text_with_different_think_bodies_never_splices() {
+        let mut cache = HashMap::new();
+        let x = action(
+            false,
+            false,
+            false,
+            "<think>\nsecret is apple\n</think>\n\nOK",
+        );
+        let y = action(
+            false,
+            false,
+            false,
+            "<think>\nsecret is pear\n</think>\n\nOK",
+        );
+        assert!(store(&mut cache, &x, vec![1, 2]).is_none());
+        assert!(store(&mut cache, &y, vec![3, 4]).is_none());
+        // Body that started inside think (prompt ended with `<think>\n`).
+        let z = action(false, false, true, "secret is plum\n</think>\n\nOK");
+        assert!(store(&mut cache, &z, vec![5]).is_none());
+        assert!(
+            cache.is_empty(),
+            "a think body must not be reachable by visible text"
+        );
+    }
+
+    #[test]
+    fn think_on_turn_cannot_be_spliced_after_a_think_off_primer() {
+        let mut cache = HashMap::new();
+        let on = action(false, false, false, "<think>\n17*3 is 51\n</think>\n\n51");
+        assert!(store(&mut cache, &on, vec![9]).is_none());
+        // Turn 2 (thinking off) looks up "51": nothing to prepend its primer to.
+        let fp = hipfire_engine::turn_cache::asst_turn_fingerprint("51", &[]);
+        assert!(!cache.contains_key(&fp));
+    }
+
+    #[test]
+    fn thinking_off_stop_stores_under_the_visible_text() {
+        let mut cache = HashMap::new();
+        let a = action(false, false, false, "Hello there.<|im_end|>");
+        assert!(a.store);
+        assert_eq!(a.fingerprint_text, "Hello there.");
+        let fp = store(&mut cache, &a, vec![7, 8]).expect("clean stop stores");
+        assert_eq!(cache[&fp], vec![7, 8]);
+        // A client echoing the visible text hits the same key.
+        assert_eq!(
+            fp,
+            hipfire_engine::turn_cache::asst_turn_fingerprint("Hello there.", &[])
+        );
+    }
+
+    #[test]
+    fn length_and_open_think_skip() {
+        assert!(!action(true, false, false, "Hello").store);
+        assert!(!action(false, true, false, "Hello").store);
+        assert!(!action(false, true, false, "<think>\nstill thinking").store);
+    }
+
+    #[test]
+    fn ar_routing_splits_reasoning_from_content() {
+        use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig};
+        let mut out = Vec::new();
+        let mut filter = EosFilter::new(EosFilterConfig::default());
+        let mut think = hipfire_runtime::emit_text::ThinkOutputRouter::new(false);
+        for piece in ["<think>", "\nplan", "\n</think>", "\n\nAnswer"] {
+            crate::vision::vl_route_decode_text(
+                &mut out,
+                "r",
+                &mut filter,
+                &mut think,
+                piece.as_bytes(),
+            );
+        }
+        crate::vision::vl_finish_think_routing(&mut out, "r", &mut filter, &mut think);
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        for line in String::from_utf8(out).unwrap().lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            let t = v["text"].as_str().unwrap();
+            match v["type"].as_str().unwrap() {
+                "reasoning" => reasoning.push_str(t),
+                "token" => content.push_str(t),
+                other => panic!("unexpected event {other}"),
+            }
+        }
+        assert!(reasoning.contains("plan") && !reasoning.contains("Answer"));
+        assert_eq!(content.trim(), "Answer");
+        assert!(!think.in_think());
     }
 }
