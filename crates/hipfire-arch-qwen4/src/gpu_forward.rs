@@ -2195,6 +2195,17 @@ impl RoutedExpertWeights for SplitlessExperts {
     fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    // The `topology.hetero_experts` splits are not the D2 executor: a call
+    // the D2 split must not serve still exchanges its cold rows with the
+    // expert device (fn-lanes bind every MoE call through this view).
+    fn hetero_split(&self) -> Option<&hipfire_dispatch::hetero_device::HeteroDeviceSplit> {
+        self.0.hetero_split()
+    }
+
+    fn hetero_prefill(&self) -> Option<&hipfire_dispatch::hetero_device::HeteroPrefillSplit> {
+        self.0.hetero_prefill()
+    }
 }
 
 impl Qwen4MoeLayerRuntime {
