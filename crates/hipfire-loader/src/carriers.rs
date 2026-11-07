@@ -916,7 +916,10 @@ impl Carrier for Qwen4Carrier {
             let split = qwen4_ep_vram_layers(
                 ctx.gpu,
                 &shared,
-                plan.seal.ranks(),
+                &plan
+                    .seal
+                    .expert_spans()
+                    .map_err(|error| format!("qwen4: {error}"))?,
                 &free,
                 &src,
                 &ctx.batch_request,
@@ -2431,7 +2434,7 @@ fn qwen4_placement_inputs(
     routed_experts: bool,
     state_format: hipfire_arch_qwen4::Qwen4StateFormat,
     scratch_mode: hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode,
-    ranks: usize,
+    spans: &hipfire_arch_qwen4::expert_residency::EpExpertSpans,
     chunk_rows: usize,
     forward: Qwen4PlacementForward<'_>,
     hc8: &[(String, u64, u64)],
@@ -2454,10 +2457,11 @@ fn qwen4_placement_inputs(
     // experts in VRAM, so those bytes are replicated, non-expert-style charge of every rank:
     // the unit ranking walk, the whole-layer split and each rank's own fit check all read this
     // one `non_expert`, so the trunk's expert budget shrinks by exactly the owned bytes.
-    let ep_mtp = qwen4_ep_mtp_resident(weights, bytes_of, ranks, mtp_kept)?;
+    let ep_mtp = qwen4_ep_mtp_resident(weights, bytes_of, spans.ranks(), mtp_kept)?;
     // `HIPFIRE_EP_HC8_PLAN_CHARGE`: the replicated HC mixers the applied `.hc8` sidecar shrinks
     // are charged at their E4M3 size, the bytes the rank actually keeps allocated.
-    let ep_hc8_saving = qwen4_ep_hc8_saving(weights, bytes_of, hc8, config, ranks, mtp_kept)?;
+    let ep_hc8_saving =
+        qwen4_ep_hc8_saving(weights, bytes_of, hc8, config, spans.ranks(), mtp_kept)?;
     let args = hipfire_arch_qwen4::expert_residency::PlacementInputsArgs {
         gpu,
         config,
@@ -2472,7 +2476,7 @@ fn qwen4_placement_inputs(
         routed_experts,
         state_format,
         scratch_mode,
-        ranks,
+        spans,
         chunk_rows,
     };
     let inputs = match forward {
@@ -3089,7 +3093,7 @@ pub fn qwen4_ep_alias_free(devices: &[i32], free: &[u64]) -> Vec<u64> {
 pub fn qwen4_ep_vram_layers(
     gpu: &rdna_compute::Gpu,
     shared: &Qwen4RankShared,
-    ranks: usize,
+    spans: &hipfire_arch_qwen4::expert_residency::EpExpertSpans,
     free_per_rank: &[u64],
     src: &ModelSource,
     batch: &hipfire_runtime::loader_api::BatchLoadRequest,
@@ -3100,7 +3104,7 @@ pub fn qwen4_ep_vram_layers(
     // carrier checks them first). The decoupled reserve, which sizes whole-layer
     // placements, is off with a note, unless `HIPFIRE_EP_UNIT_RESERVE=1` plans the
     // units under it with whole-resident donor layers (`qwen4_ep_units_donor_plan`).
-    let units_path = qwen4_ep_units_flag(src, ranks, 1, &gpu.arch, true);
+    let units_path = qwen4_ep_units_flag(src, spans.ranks(), 1, &gpu.arch, true);
     if units_path.is_none() {
         // The D2 tail only exists over a per-expert unit plan: refuse before any load work.
         use hipfire_arch_qwen4::expert_unit_tail as tail;
@@ -3118,8 +3122,11 @@ pub fn qwen4_ep_vram_layers(
         }
     }
     if units_path.is_some() {
-        hipfire_arch_qwen4::expert_ep_units::ep_units_refusal(&qwen4_ep_units_facts(ranks, 1))
-            .map_err(|error| format!("qwen4: {error}"))?;
+        hipfire_arch_qwen4::expert_ep_units::ep_units_refusal(&qwen4_ep_units_facts(
+            spans.ranks(),
+            1,
+        ))
+        .map_err(|error| format!("qwen4: {error}"))?;
     }
     let unit_reserve = units_path.is_some() && qwen4_ep_unit_reserve_on();
     let request = if units_path.is_some() && !unit_reserve && request.attempts() {
@@ -3153,7 +3160,10 @@ pub fn qwen4_ep_vram_layers(
     }
     let mut manifest = receipt
         .manifest
-        .with_expert_parallel(hipfire_arch_qwen4::weights::Qwen4EpPlacement { rank: 0, ranks })
+        .with_expert_parallel(hipfire_arch_qwen4::weights::Qwen4EpPlacement {
+            rank: 0,
+            ranks: spans.ranks(),
+        })
         .map_err(|error| format!("qwen4: {error}"))?;
     // DESIGN F1: the planner charges the planar (drop-zero) expert bytes exactly
     // when each rank's load will repack (same decision, same verdict cache).
@@ -3165,7 +3175,7 @@ pub fn qwen4_ep_vram_layers(
     )
     .map_err(|error| error.to_string())?
     .0;
-    qwen4_apply_ep_embed_host(&mut manifest.weights, ranks, &gpu.arch);
+    qwen4_apply_ep_embed_host(&mut manifest.weights, spans.ranks(), &gpu.arch);
     let state_format = hipfire_arch_qwen4::resolve_state_format(
         &shared.kv_mode,
         shared.state_quant.as_deref().unwrap_or(""),
@@ -3203,7 +3213,7 @@ pub fn qwen4_ep_vram_layers(
         shared.native_mtp,
         !config.ffn.is_dense(),
     );
-    let ep_mtp = qwen4_ep_mtp_resident(&manifest.weights, &bytes_of, ranks, mtp_kept)?;
+    let ep_mtp = qwen4_ep_mtp_resident(&manifest.weights, &bytes_of, spans.ranks(), mtp_kept)?;
     // The sidecar every rank will resolve (silently: each rank logs the outcome itself).
     let hc8_plan: Vec<(String, u64, u64)> = hipfire_arch_qwen4::hc8_sidecar::peek_hc8_sidecar(
         hfq,
@@ -3217,7 +3227,7 @@ pub fn qwen4_ep_vram_layers(
         &bytes_of,
         &hc8_plan,
         &config,
-        ranks,
+        spans.ranks(),
         mtp_kept,
     )?;
     // The ordinary (non-decoupled) placement inputs at one prefill chunk, with
@@ -3262,7 +3272,7 @@ pub fn qwen4_ep_vram_layers(
             !config.ffn.is_dense(),
             state_format,
             scratch_mode,
-            ranks,
+            spans,
             chunk,
             qwen4_ep_ordinary_forward(&config, scratch_mode, chunk)?,
             &hc8_plan,
@@ -3358,7 +3368,7 @@ pub fn qwen4_ep_vram_layers(
     let attempt = if request.attempts() {
         let geometry = hipfire_arch_qwen4::ep_reserve::EpRankGeometry::flash_next_layout(
             &config,
-            ranks,
+            spans.ranks(),
             planar_experts,
         );
         let (explicit_chunk, owner_routed_prefill, stage_min_rows) =
@@ -3377,7 +3387,7 @@ pub fn qwen4_ep_vram_layers(
             ),
             expert_bytes_match: geometry.and_then(|geometry| geometry.layer_bytes())
                 == Some(layer_experts),
-            ranks,
+            ranks: spans.ranks(),
             scratch_mode,
             prompt_rows: chunk_rows,
             explicit_chunk,
@@ -3453,7 +3463,7 @@ pub fn qwen4_ep_vram_layers(
             !config.ffn.is_dense(),
             state_format,
             scratch_mode,
-            ranks,
+            spans,
             chunk_rows,
             qwen4_ep_reserve_forward_charge(forward, shadows_in_donors),
             &hc8_plan,
@@ -3483,7 +3493,7 @@ pub fn qwen4_ep_vram_layers(
             // The head's owned slice is VRAM-resident, not pinned.
             hipfire_arch_qwen4::expert_residency::keep_mtp_head_routed_resident(&mut placed);
         }
-        hipfire_arch_qwen4::expert_residency::host_mapped_bytes_ranks(&placed, &bytes_of, ranks)
+        hipfire_arch_qwen4::expert_residency::host_mapped_bytes_ranks(&placed, &bytes_of, spans)
             .map(|per_rank| {
                 per_rank
                     .iter()
@@ -3620,7 +3630,7 @@ pub fn qwen4_ep_vram_layers(
                                 base: &base,
                                 dims,
                                 config: &config,
-                                ranks,
+                                ranks: spans.ranks(),
                                 free_per_rank,
                                 non_expert,
                                 stacks: &stacks,
@@ -3706,7 +3716,7 @@ pub fn qwen4_ep_vram_layers(
                         path,
                         &base,
                         dims,
-                        ranks,
+                        spans.ranks(),
                         free_per_rank,
                         non_expert,
                         reserve.saturating_add(lane_bytes),
@@ -3911,7 +3921,7 @@ fn qwen4_ep_unit_donors_tail() -> bool {
 
 /// Pinned host bytes of the restore copies a borrowed unit stage keeps for `rank`: both
 /// tensors (gate/up, down) of each of the two lent layers plus the four allocation pads
-/// (`expert_stage_mirror_bytes(layer_bytes, 1)`'s formula); `0` without a borrowed stage.
+/// (`expert_stage_mirror_bytes(&[layer_bytes])`'s formula); `0` without a borrowed stage.
 fn qwen4_unit_borrow_restore_bytes(
     plan: &hipfire_arch_qwen4::expert_ep_units::EpUnitPlan,
     rank: usize,
@@ -5243,7 +5253,7 @@ pub fn qwen4_preload_resource_plan(
         routed_experts,
         state_format,
         scratch_mode: Qwen4ForwardScratchMode::Full,
-        ranks: 1,
+        spans: &residency::EpExpertSpans::single(),
         chunk_rows,
     })
     .map_err(|error| format!("qwen4 preload plan: placement census: {error}"))?;
@@ -5535,7 +5545,7 @@ pub fn qwen4_preload_resource_plan(
             ),
         },
         || {
-            residency::routed_expert_bytes_ranks(&manifest.weights, &bytes_of, 1)
+            residency::routed_expert_bytes(&manifest.weights, &bytes_of)
                 .map_err(|error| format!("qwen4: {error}"))
         },
         &auto_inputs_for_plan,
@@ -5833,7 +5843,7 @@ pub fn qwen4_preload_resource_plan(
             routed_experts,
             state_format,
             scratch_mode: Qwen4ForwardScratchMode::Full,
-            ranks: 1,
+            spans: &residency::EpExpertSpans::single(),
             chunk_rows,
         },
         charges,
@@ -6508,6 +6518,14 @@ fn load_qwen4_rank_unscoped(
             ));
         }
     }
+    // Every rank's routed-expert span, read from the seal (one rank: whole stacks).
+    let ep_spans = match &ep_seal {
+        Some(bound) => bound
+            .seal
+            .expert_spans()
+            .map_err(|error| format!("qwen4: {error}"))?,
+        None => hipfire_arch_qwen4::expert_residency::EpExpertSpans::single(),
+    };
     // A band carries a session cache (`session`) like a Single load (except
     // under native MTP) and the output band the native MTP head; the other
     // Single-only features stay refused.
@@ -7041,7 +7059,7 @@ fn load_qwen4_rank_unscoped(
             routed_experts,
             state_format,
             scratch_mode,
-            ep_ranks,
+            &ep_spans,
             placement_chunk,
             placement_forward,
             &hc8_plan,
@@ -7206,7 +7224,7 @@ fn load_qwen4_rank_unscoped(
                 routed_experts,
                 state_format,
                 scratch_mode,
-                ep_ranks,
+                &ep_spans,
                 placement_chunk,
                 Qwen4PlacementForward::DecodeShare(
                     hipfire_arch_qwen4::expert_residency::DecodeShareForward {
@@ -7951,7 +7969,7 @@ fn load_qwen4_rank_unscoped(
             ),
         },
         || {
-            residency::routed_expert_bytes_ranks(&manifest.weights, bytes_of, ep_ranks)
+            residency::routed_expert_bytes_ranks(&manifest.weights, bytes_of, &ep_spans)
                 .map_err(|error| format!("qwen4: {error}"))
         },
         &auto_inputs,
@@ -8322,7 +8340,7 @@ fn load_qwen4_rank_unscoped(
         // share (an uneven split gives the low ranks one more expert).
         let rank_host_bytes = match &ep_units {
             Some(units) => residency::ep_unit_host_bytes_ranks(&manifest.weights, bytes_of, units),
-            None => residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, ep_ranks),
+            None => residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, &ep_spans),
         }
         .map_err(|error| format!("qwen4: {error}"))?;
         let own_rank = ep.map_or(0, |placement| placement.rank);
@@ -8425,7 +8443,7 @@ fn load_qwen4_rank_unscoped(
         // rank that has not pinned yet: the same host RAM/GTT checks the
         // spilled placement above makes.
         let rank_host_bytes =
-            residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, ep_ranks)
+            residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, &ep_spans)
                 .map_err(|error| format!("qwen4: {error}"))?;
         let host_check_bytes = qwen4_ep_host_check_bytes(
             &rank_host_bytes,
@@ -8600,7 +8618,7 @@ fn load_qwen4_rank_unscoped(
     } else {
         let per_rank = match &ep_units {
             Some(units) => residency::ep_unit_host_bytes_ranks(&manifest.weights, bytes_of, units),
-            None => residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, ep_ranks),
+            None => residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, &ep_spans),
         };
         per_rank
             .map(|per_rank| {
@@ -16403,18 +16421,19 @@ mod qwen4_ep_embed_host_tests {
             })
         };
         let mut weights = manifest();
-        let (resident, _) = residency::resident_split_ranks(&weights, bytes_of, 2).unwrap();
+        let spans = residency::EpExpertSpans::new(512, vec![256, 256]).unwrap();
+        let (resident, _) = residency::resident_split_ranks(&weights, bytes_of, &spans).unwrap();
         assert_eq!(
-            residency::host_mapped_bytes_ranks(&weights, bytes_of, 2),
+            residency::host_mapped_bytes_ranks(&weights, bytes_of, &spans),
             Ok(vec![0, 0])
         );
         assert!(qwen4_place_ep_embed_host(&mut weights, 2, "gfx1201", None));
-        let (host, _) = residency::resident_split_ranks(&weights, bytes_of, 2).unwrap();
+        let (host, _) = residency::resident_split_ranks(&weights, bytes_of, &spans).unwrap();
         assert_eq!(host, resident - EMBED);
         // Every rank pins its own copy of the table plus one pad.
         let pinned = EMBED + residency::HOST_MAPPED_PAD_BYTES;
         assert_eq!(
-            residency::host_mapped_bytes_ranks(&weights, bytes_of, 2),
+            residency::host_mapped_bytes_ranks(&weights, bytes_of, &spans),
             Ok(vec![pinned; 2])
         );
         assert_eq!(residency::host_mapped_bytes(&weights, bytes_of), Ok(pinned));
@@ -18341,7 +18360,8 @@ mod qwen4_ep_mtp_resident_tests {
         // Layer 0 resident, layer 1 and the head host-mapped by the placement.
         assert_eq!(qwen4_shared_apply_placement(&mut weights, 1, None), 4);
         let pinned = |weights: &[WeightEntry]| {
-            residency::host_mapped_bytes_ranks(weights, bytes_of, 2).unwrap()[0]
+            let ep2 = residency::EpExpertSpans::stride(512, 2).unwrap();
+            residency::host_mapped_bytes_ranks(weights, bytes_of, &ep2).unwrap()[0]
         };
         let with_head_host = pinned(&weights);
         // The rank load restores exactly the head's two stacks.

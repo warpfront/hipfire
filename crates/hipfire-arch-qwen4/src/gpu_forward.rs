@@ -4038,37 +4038,102 @@ fn tile_owner_table_bytes(owners: &[usize]) -> Vec<u8> {
         .collect()
 }
 
-/// Per-rank donor mirror bytes of one G2 stage layer (`[gate/up, down]`): rank `rank` of
-/// `ranks` hosts `Qwen4EpPlacement::local_count(experts)` experts of each kind, which covers
-/// slot `e / ranks` of every expert it owns.
-fn stage_donor_bytes(experts: usize, rank: usize, ranks: usize) -> [usize; 2] {
-    let local_experts = Qwen4EpPlacement { rank, ranks }.local_count(experts);
+/// Donor mirror bytes of one G2 stage layer (`[gate/up, down]`) on a rank that holds
+/// `local_experts` experts of each kind (all of them on a single card).
+fn stage_donor_bytes(local_experts: usize) -> [usize; 2] {
     [
         local_experts * qwen4_expert_stage_bytes()[0],
         local_experts * qwen4_expert_stage_bytes()[1],
     ]
 }
 
-/// Redirect the entries of the experts this rank owns (`e % ranks == rank`) into its donor
-/// buffer at `base`, slot `e / ranks`; every other entry keeps its pointer.
+/// Redirect the entries of the experts this rank owns into its donor buffer at `base`, at
+/// the compact slot the seal gives each (`slots`,
+/// [`crate::ep_seal::Qwen4EpRankSeal::local_slots`]); every other entry keeps its pointer.
+/// Refuses a slot map of another expert count, a slot outside the donor's `capacity`
+/// slots and two experts sharing one slot.
 fn redirect_owned_entries(
-    placement: Qwen4EpPlacement,
+    slots: &[Option<usize>],
+    capacity: usize,
     base: usize,
     stride: usize,
     entries: &[usize],
-) -> Vec<u8> {
-    entries
-        .iter()
-        .enumerate()
-        .flat_map(|(expert, &pointer)| {
-            let pointer = if expert % placement.ranks == placement.rank {
-                base + (expert / placement.ranks) * stride
+) -> Result<Vec<u8>, String> {
+    if slots.len() != entries.len() {
+        return Err(format!(
+            "G2 EP stage: {} sealed slots for {} table entries",
+            slots.len(),
+            entries.len()
+        ));
+    }
+    let mut taken = vec![false; capacity];
+    let mut bytes = Vec::with_capacity(entries.len() * std::mem::size_of::<usize>());
+    for (expert, (&slot, &pointer)) in slots.iter().zip(entries).enumerate() {
+        let pointer = match slot {
+            None => pointer,
+            Some(slot) => {
+                match taken.get_mut(slot) {
+                    Some(seen @ false) => *seen = true,
+                    _ => {
+                        return Err(format!(
+                            "G2 EP stage: expert {expert} slot {slot} is outside the {capacity} donor slots or taken twice"
+                        ))
+                    }
+                }
+                base + slot * stride
+            }
+        };
+        bytes.extend_from_slice(&pointer.to_ne_bytes());
+    }
+    Ok(bytes)
+}
+
+/// One rank's G2 EP stage layout, read from its seal `bound`: its own donor bytes
+/// (`[gate/up, down]`), every rank's one-layer donor share (the restore-mirror charge) and
+/// its sealed compact slots per MoE layer (empty below `first_host`). Refuses a seal of
+/// another rank or mesh and a rank without a sealed span.
+#[allow(clippy::type_complexity)]
+fn ep_stage_layout(
+    bound: Option<&crate::ep_seal::Qwen4EpRankSeal>,
+    placement: Qwen4EpPlacement,
+    moe_layers: usize,
+    first_host: usize,
+) -> Result<([usize; 2], Vec<usize>, Vec<Vec<Option<usize>>>), String> {
+    let bound = bound
+        .filter(|bound| bound.rank == placement.rank && bound.seal.ranks() == placement.ranks)
+        .ok_or("an EP stage needs the rank's own seal (bind_ep_seal)")?;
+    let spans = bound.seal.expert_spans()?;
+    let local = |rank| {
+        spans
+            .local(rank)
+            .ok_or_else(|| format!("G2 EP stage: rank {rank} has no sealed span"))
+    };
+    let rank_layer_bytes = (0..spans.ranks())
+        .map(|rank| local(rank).map(|n| stage_donor_bytes(n).iter().sum::<usize>()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let slots = (0..moe_layers)
+        .map(|layer| {
+            if layer < first_host {
+                Ok(Vec::new())
             } else {
-                pointer
-            };
-            pointer.to_ne_bytes()
+                bound.local_slots(layer)
+            }
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((
+        stage_donor_bytes(local(bound.rank)?),
+        rank_layer_bytes,
+        slots,
+    ))
+}
+
+/// Whether two of the donor parts' device spans share a byte.
+fn donor_spans_overlap(spans: &[std::ops::Range<usize>]) -> bool {
+    spans.iter().enumerate().any(|(index, span)| {
+        spans[..index]
+            .iter()
+            .any(|other| other.start < span.end && span.start < other.end)
+    })
 }
 
 /// One rank's owner-routed chunk MoE state. The buffers exist from forward construction
@@ -6770,7 +6835,11 @@ pub(crate) struct Qwen4ExpertStage {
     full_keys: Vec<std::cell::OnceCell<usize>>,
     compact_bound: Vec<std::cell::Cell<bool>>,
     first_host: usize,
-    placement: Option<Qwen4EpPlacement>,
+    /// EP only: this rank's sealed compact slot of every expert, per MoE layer
+    /// (empty below the first host layer); `None` on a single card.
+    ep_slots: Option<Vec<Vec<Option<usize>>>>,
+    /// EP rank of this stage (0 on a single card), for receipts.
+    ep_rank: usize,
     bytes: [usize; 2],
     copy_stream: hip_bridge::Stream,
     ready: Vec<hip_bridge::Event>,
@@ -6807,7 +6876,7 @@ impl Qwen4ExpertStage {
     /// waits on peer ready; peer ready follows the previous forward in the
     /// peer compute stream, so its earlier donor reads have completed.
     fn begin_forward(&self, ep_compact_all_layers: bool) -> bool {
-        self.placement.is_none() || ep_compact_all_layers
+        self.ep_slots.is_none() || ep_compact_all_layers
     }
 
     /// Before any full-table EP chunk, S1 calls this on EVERY rank, then
@@ -6967,19 +7036,21 @@ impl Qwen4ExpertStage {
         }
         let mut donors = [first_host - 2, first_host - 1];
         donors.sort_by_key(|layer| layer % 2);
-        let placement = bundle.weights.ep_placement();
-        let ranks = placement.map_or(1, |placement| placement.ranks);
-        let bytes = stage_donor_bytes(
-            config.num_experts,
-            placement.map_or(0, |placement| placement.rank),
-            ranks,
-        );
-        // The mirrors of all ranks share one host RAM/GTT budget: charge every rank at the
-        // largest (rank 0) share so an uneven split is never under-counted.
-        let layer_bytes = stage_donor_bytes(config.num_experts, 0, ranks)
-            .iter()
-            .sum::<usize>();
-        let mirror_bytes = crate::expert_residency::expert_stage_mirror_bytes(layer_bytes, ranks)
+        // An EP rank reads its spans from the load's seal: its own donor share, and every
+        // rank's share for the mirrors that all ranks pin in one host RAM/GTT budget.
+        let (bytes, rank_layer_bytes, ep_slots) = match bundle.weights.ep_placement() {
+            None => {
+                let bytes = stage_donor_bytes(config.num_experts);
+                (bytes, vec![bytes[0] + bytes[1]], None)
+            }
+            Some(placement) => {
+                let (bytes, rank_layer_bytes, slots) =
+                    ep_stage_layout(bundle.ep_seal(), placement, moe.len(), first_host)
+                        .map_err(invalid)?;
+                (bytes, rank_layer_bytes, Some(slots))
+            }
+        };
+        let mirror_bytes = crate::expert_residency::expert_stage_mirror_bytes(&rank_layer_bytes)
             .map_err(invalid)?;
         let admitted = crate::expert_residency::check_host_ram(
             mirror_bytes,
@@ -7034,14 +7105,23 @@ impl Qwen4ExpertStage {
                 }
             }
         }
+        // Each donor part must own bytes no other part does: two parts sharing a span would
+        // stage one over the other's experts.
+        let mut donor_spans = Vec::with_capacity(4);
         for layer in donors {
             for (source, bytes, _) in parts(layer)? {
                 let owner = bundle.weights.resident(source)?;
                 if owner.buf.is_host_mapped() || owner.buf.size() < bytes {
                     return off("a donor expert owner is not device memory of the stage size");
                 }
+                let start = owner.buf.as_ptr() as usize;
+                donor_spans.push(start..start + owner.buf.size());
             }
         }
+        if donor_spans_overlap(&donor_spans) {
+            return Err(invalid("G2 stage donor parts share a device allocation"));
+        }
+        let is_ep = ep_slots.is_some();
         gpu.ensure_capture_stream()?;
         let (min_rows, min_rows_source) = qwen4_expert_stage_min_rows(gpu, chunk_rows);
         let mut stage = Self {
@@ -7053,7 +7133,7 @@ impl Qwen4ExpertStage {
             mirrors: Vec::with_capacity(4),
             tables: Vec::with_capacity(4),
             compact_tables: Vec::new(),
-            compact_keys: if placement.is_some() {
+            compact_keys: if is_ep {
                 moe.iter()
                     .map(|runtime| {
                         runtime.as_ref().map_or(0, |runtime| {
@@ -7064,12 +7144,12 @@ impl Qwen4ExpertStage {
             } else {
                 Vec::new()
             },
-            full_keys: if placement.is_some() {
+            full_keys: if is_ep {
                 (0..moe.len()).map(|_| std::cell::OnceCell::new()).collect()
             } else {
                 Vec::new()
             },
-            compact_bound: if placement.is_some() {
+            compact_bound: if is_ep {
                 (0..moe.len())
                     .map(|_| std::cell::Cell::new(false))
                     .collect()
@@ -7077,7 +7157,11 @@ impl Qwen4ExpertStage {
                 Vec::new()
             },
             first_host,
-            placement,
+            ep_slots,
+            ep_rank: bundle
+                .weights
+                .ep_placement()
+                .map_or(0, |placement| placement.rank),
             bytes,
             copy_stream: gpu.hip.stream_create_non_blocking()?,
             ready: Vec::with_capacity(2),
@@ -7108,7 +7192,7 @@ impl Qwen4ExpertStage {
                         .push(gpu.upload_raw_host_mapped(&host, &[bytes])?);
                     drop(host);
                     let base = view.buf.as_ptr() as usize;
-                    if placement.is_none() {
+                    if !is_ep {
                         let entries = (0..config.num_experts)
                             .flat_map(|expert| (base + expert * stride).to_ne_bytes())
                             .collect::<Vec<_>>();
@@ -7123,7 +7207,7 @@ impl Qwen4ExpertStage {
                     stage.donor_views.push(view);
                 }
             }
-            if placement.is_some() {
+            if is_ep {
                 for (layer, runtime) in moe
                     .iter()
                     .enumerate()
@@ -7137,7 +7221,7 @@ impl Qwen4ExpertStage {
                     .into_iter()
                     .enumerate()
                     {
-                        let redirected = stage.redirect_entries(layer, kind, entries);
+                        let redirected = stage.redirect_entries(layer, kind, entries)?;
                         stage
                             .compact_tables
                             .push(gpu.alloc_tensor(&[2 * config.num_experts], DType::F32)?);
@@ -7163,7 +7247,7 @@ impl Qwen4ExpertStage {
             moe.len(),
             donors[0],
             donors[1],
-            2 * layer_bytes >> 20,
+            2 * (bytes[0] + bytes[1]) >> 20,
             if stage.capture { "stage" } else { "mapped" },
             stage.min_rows_source.label()
         );
@@ -7183,10 +7267,10 @@ impl Qwen4ExpertStage {
             return self.slab_tables(layer);
         }
         let parity = layer % 2;
-        if self.placement.is_some() && self.compact_bound[layer].get() {
+        if self.ep_slots.is_some() && self.compact_bound[layer].get() {
             return self.tables_compact(layer);
         }
-        let index = if self.placement.is_some() {
+        let index = if self.ep_slots.is_some() {
             layer - self.first_host
         } else {
             parity
@@ -7200,7 +7284,7 @@ impl Qwen4ExpertStage {
 
     /// S1 binds this accessor when its compact owner-routed runtime is used.
     fn tables_compact(&self, layer: usize) -> MoeStageTables<'_> {
-        if self.placement.is_none() {
+        if self.ep_slots.is_none() {
             return self.tables(layer);
         }
         let index = 2 * (layer - self.first_host);
@@ -7211,11 +7295,17 @@ impl Qwen4ExpertStage {
         }
     }
 
-    fn redirect_entries(&self, layer: usize, kind: usize, entries: &[usize]) -> Vec<u8> {
-        let placement = self.placement.expect("EP tables");
+    fn redirect_entries(
+        &self,
+        layer: usize,
+        kind: usize,
+        entries: &[usize],
+    ) -> Result<Vec<u8>, Qwen4GpuForwardError> {
+        let slots = &self.ep_slots.as_ref().expect("EP tables")[layer];
         let base = self.donor_views[2 * (layer % 2) + kind].buf.as_ptr() as usize;
         let stride = qwen4_expert_stage_bytes()[kind];
-        redirect_owned_entries(placement, base, stride, entries)
+        redirect_owned_entries(slots, self.bytes[kind] / stride, base, stride, entries)
+            .map_err(invalid)
     }
 
     /// Initialize a full EP table once, before any capture/tape. Compact
@@ -7228,7 +7318,7 @@ impl Qwen4ExpertStage {
     ) -> Result<(), Qwen4GpuForwardError> {
         // A unit stage (EP) stages only the compact owner-routed runtime
         // (`begin_forward`), which needs no initialization here.
-        if self.placement.is_none() || self.slab.is_some() || layer < self.first_host {
+        if self.ep_slots.is_none() || self.slab.is_some() || layer < self.first_host {
             return Ok(());
         }
         let runtime = runtime.ok_or_else(|| invalid("G2 staged EP runtime missing"))?;
@@ -7263,7 +7353,7 @@ impl Qwen4ExpertStage {
         .into_iter()
         .enumerate()
         {
-            let redirected = self.redirect_entries(layer, kind, entries);
+            let redirected = self.redirect_entries(layer, kind, entries)?;
             gpu.memcpy_htod_auto(
                 &self.tables[2 * (layer - self.first_host) + kind].buf,
                 &redirected,
@@ -22441,26 +22531,16 @@ mod ep_rank_generic_tests {
     }
 
     #[test]
-    fn stage_donor_bytes_split_by_every_rank_and_total_the_full_layer() {
-        let full = 512 * (QWEN4_EXPERT_STAGE_GATE_UP_BYTES + QWEN4_EXPERT_STAGE_DOWN_BYTES);
-        for ranks in [1usize, 2, 3, 4, 5, 6, 8] {
-            let mut total = 0;
-            for rank in 0..ranks {
-                let count = Qwen4EpPlacement { rank, ranks }.local_count(512);
-                let [gate_up, down] = stage_donor_bytes(512, rank, ranks);
-                assert_eq!(gate_up, count * QWEN4_EXPERT_STAGE_GATE_UP_BYTES);
-                assert_eq!(down, count * QWEN4_EXPERT_STAGE_DOWN_BYTES);
-                total += gate_up + down;
-            }
-            assert_eq!(total, full, "ranks={ranks}");
-        }
-    }
-
-    #[test]
     fn donor_redirect_covers_each_expert_once_and_keeps_peer_pointers() {
         for ranks in [2usize, 3, 4, 5, 6, 8] {
             donor_redirect_case(ranks);
         }
+    }
+
+    fn stride_slots(placement: Qwen4EpPlacement) -> Vec<Option<usize>> {
+        (0..512)
+            .map(|e| placement.owns(e).then(|| placement.local_index(e)))
+            .collect()
     }
 
     fn donor_redirect_case(ranks: usize) {
@@ -22470,16 +22550,14 @@ mod ep_rank_generic_tests {
         let mut claimed = vec![0usize; 512];
         for rank in 0..ranks {
             let placement = Qwen4EpPlacement { rank, ranks };
-            let bytes = redirect_owned_entries(placement, base, stride, &entries);
+            let capacity = placement.local_count(512);
+            let bytes =
+                redirect_owned_entries(&stride_slots(placement), capacity, base, stride, &entries)
+                    .unwrap();
             for (expert, word) in bytes.chunks_exact(std::mem::size_of::<usize>()).enumerate() {
                 let pointer = usize::from_ne_bytes(word.try_into().unwrap());
                 if expert % ranks == rank {
                     let slot = expert / ranks;
-                    // The donor holds `local_count` slots; the owned slot is inside it.
-                    assert!(
-                        slot < placement.local_count(512),
-                        "rank {rank} expert {expert}"
-                    );
                     assert_eq!(pointer, base + slot * stride, "rank {rank} expert {expert}");
                     claimed[expert] += 1;
                 } else {
@@ -22488,6 +22566,70 @@ mod ep_rank_generic_tests {
             }
         }
         assert!(claimed.iter().all(|&count| count == 1));
+    }
+
+    #[test]
+    fn donor_redirect_refuses_slots_outside_the_donor_or_shared() {
+        let stride = QWEN4_EXPERT_STAGE_GATE_UP_BYTES;
+        let entries: Vec<usize> = (0..512).collect();
+        let placement = Qwen4EpPlacement { rank: 1, ranks: 3 };
+        let capacity = placement.local_count(512);
+        let slots = stride_slots(placement);
+        // A donor one slot short of the rank's span.
+        assert!(redirect_owned_entries(&slots, capacity - 1, 0, stride, &entries).is_err());
+        // Two experts on one slot.
+        let mut shared = slots.clone();
+        shared[4] = shared[1];
+        assert!(redirect_owned_entries(&shared, capacity, 0, stride, &entries).is_err());
+        // A slot map of another expert count.
+        assert!(redirect_owned_entries(&slots[..511], capacity, 0, stride, &entries).is_err());
+    }
+
+    /// The stage's seal-derived layout runs GPU-free: own share, every rank's mirror
+    /// share, sealed slots per host layer; another rank's or mesh's seal is refused.
+    #[test]
+    fn ep_stage_layout_reads_the_rank_seal_and_refuses_another() {
+        use crate::ep_seal::{tests::source_of, Qwen4EpRankSeal, Qwen4EpSeal};
+        let manifest =
+            crate::weights::Qwen4Manifest::build(&crate::config::compact_test_config()).unwrap();
+        let source = source_of(&manifest, 10);
+        let seal = |ranks: usize| {
+            let devices: Vec<i32> = (0..ranks as i32).collect();
+            std::sync::Arc::new(
+                Qwen4EpSeal::seal(&manifest, 48, ranks, &devices, &source, "g").unwrap(),
+            )
+        };
+        let per = QWEN4_EXPERT_STAGE_GATE_UP_BYTES + QWEN4_EXPERT_STAGE_DOWN_BYTES;
+        let three = seal(3);
+        let bound = |seal: &std::sync::Arc<Qwen4EpSeal>, rank| Qwen4EpRankSeal {
+            seal: seal.clone(),
+            rank,
+        };
+        let own = Qwen4EpPlacement { rank: 2, ranks: 3 };
+        let (bytes, rank_layer_bytes, slots) =
+            ep_stage_layout(Some(&bound(&three, 2)), own, 48, 40).unwrap();
+        assert_eq!(bytes, stage_donor_bytes(170));
+        assert_eq!(rank_layer_bytes, [171 * per, 171 * per, 170 * per]);
+        assert_eq!(slots.len(), 48);
+        assert!(slots[..40].iter().all(Vec::is_empty));
+        for layer in &slots[40..] {
+            assert!((0..512).all(|e| layer[e] == own.owns(e).then(|| e / 3)));
+        }
+        // No seal, another rank's seal, another mesh's seal: refused.
+        assert!(ep_stage_layout(None, own, 48, 40).is_err());
+        assert!(ep_stage_layout(Some(&bound(&three, 1)), own, 48, 40).is_err());
+        assert!(ep_stage_layout(Some(&bound(&seal(4), 2)), own, 48, 40).is_err());
+        // A layer the seal has no group for: refused.
+        assert!(ep_stage_layout(Some(&bound(&three, 2)), own, 50, 40).is_err());
+    }
+
+    #[test]
+    fn donor_spans_overlap_is_any_shared_byte() {
+        assert!(!donor_spans_overlap(&[0..10, 10..20, 30..40, 20..30]));
+        assert!(donor_spans_overlap(&[0..10, 20..30, 9..12]));
+        assert!(donor_spans_overlap(&[0..100, 40..50]));
+        assert!(donor_spans_overlap(&[5..6, 0..10]));
+        assert!(donor_spans_overlap(&[0..10, 0..10]));
     }
 }
 
