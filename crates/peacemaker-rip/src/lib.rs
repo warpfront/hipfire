@@ -78,6 +78,7 @@ pub mod native;
 pub mod ops;
 pub mod preprocess;
 pub mod run;
+pub mod search;
 pub mod srcfmt;
 pub mod validate;
 pub mod value;

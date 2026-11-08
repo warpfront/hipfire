@@ -134,6 +134,8 @@ Manual VGPR granule padding is **not required by RegPlan or the emitter**: the e
 
 `SRD_WORD3: u32 = 0x31004000` selects raw untyped 32-bit buffer accesses: offsets at/past num_records read zero without touching memory. `srd_tail` uses this constant. Buffer helpers use `offen`, zero soffset (`0` gfx11, `null` gfx12), and byte immediate offsets, limited to 4095 on gfx11 and 8388607 on gfx12. They do not construct descriptor base words 0/1. Buffer and global operations are different families of addressing instructions; do not replace one spelling with the other.
 
+On an untyped `Builder` (`let mut b = Builder::new(..)`, no `Workgroup`) `b.label(name: str) -> Result<(), String>` places a branch label at the current position (a duplicate name is the builder's refusal, `duplicate label NAME`) and `b.wait_all() -> Result<(), String>` drains every counter the wait ledger holds (the builder emits exactly the waits its ledger requires, none when nothing is outstanding). Branches to the label are `b.control(Instruction::new("s_branch NAME", vec![], vec![]))?`. Both are refused on `wg.isa()` (`` `wg.isa().label` is not available: use the Workgroup's own `label` ``): a typed kernel's labels and waits belong to the Workgroup driver.
+
 `gather_offset(b,dst:u8,index:u8,div:Option<u8>,row_bytes:u32,live:u8,t:GatherTemps) -> Result<(),String>` computes signed indexed-row byte offsets and live-lane mask. `GatherTemps { v:[u8;4], mask:u8 }` supplies four dead VGPRs and scalar mask scratch. Example: `gather_offset(wg.isa(),1,0,None,16,12,GatherTemps { v:[8,9,10,11], mask:13 })?;`. Live indices must be nonnegative and below `GATHER_MAX_INDEX = 1<<22`; negative padding indices become `GATHER_OOB = 0x7fffff00`. A supplied divisor is an SGPR index (positive uniform divisor); None means one. `row_bytes` must be below 2^24. Set the descriptor's record count to the actual byte extent; the helper emits reciprocal division plus integer corrections, offset multiplication and mask selection, not a load.
 
 `Chain::new(dst:u8,width:u8,kind:str) -> Chain` describes a WMMA accumulator; width must be 8 and kind `"f16"` or `"bf16"`. Example `let c = Chain::new(0,8,"f16");`. `c.step(b,a:u8,aw:u8,b:u8,bw:u8) -> Result<(),String>` emits the kind's `v_wmma_f32_16x16x16_*` using and redefining its accumulator; example `c.step(wg.isa(),8,8,16,8)?;` on gfx11. Operand widths must match the architecture (eight on gfx11, four on gfx12); initialize the accumulator before its first step. The item keyword `chain` merely defines a function and is unrelated to this native Chain value.
@@ -779,3 +781,20 @@ The Q8_0 tile is `tile_setup`, `fill`, label `FILL_DONE`, `[ready(0), ready(1)]`
 | `gdn::conv_setup(b)?`, `gdn::conv_to_v(b)?`, `gdn::conv_to_k(b)?`, `gdn::region_setup(b, "q" \| "k" \| "v")?`, `gdn::row_body(b, region, head)?`, `gdn::to_epi(b)?`, `gdn::epilogue(b)?` | the conv unit: set-up, the unit dispatch, a region's pointers, one trip of a region's row loop, `s_branch epi`, the chunk-0 conv_state advance |
 
 Variants: `rotate`, `norm`, `sigmoid_rotate`, `norm_out` (c8), `rows`, `gp` (rotate), `chunk_prep` (gdn). gfx1201 only.
+
+## 19. Production generator on the raw `Builder` with schedule axes: `gemv_mq2_xbatch`
+
+The x-batched MQ2G256V2 GEMV (`gemv_mq2g256v2_xbatch_pm`, gfx1201; the MTP draft-head ranking GEMV; Rust generator `peacemaker_isa::kernels::gemv_mq2_xbatch_pm_gfx1201`) is written whole in [`gemv_mq2_xbatch.rip`](../../peacemaker-isa/src/kernels/gemv_mq2_xbatch.rip): no coarse natives, every instruction is a script statement over `b.push(Instruction::new(text, defs, uses))`, `b.vopd(VopdOp { op, dst, src0, src1 }, ..)`, `b.ds_crosslane`, `b.control` (branches), `b.loop_`, `b.label` and `b.wait_all` (§7). The register map (`Lay`), the ring/register `check`, the plan, the cap-gated section layout (the one-section-hop gate layout above capacity 4), the quad/tail loops, the weight decode, the VOPD row pairs, the fold, the shuffle tree and the store are script functions.
+
+The generator's grid is five consts, each one line `const NAME: TY = LITERAL;` (so a search can rewrite the literal in place). Four of them are declared in `SEARCH_AXES` with exactness class `schedule` (the arithmetic DAG of every output is the same for every point):
+
+| const | values | meaning |
+|---|---|---|
+| `ROWS: u8` | 1, 2, 4 | output rows per workgroup (grid `ceil(M/ROWS)`; a larger grid is harmless) |
+| `UNROLL: u8` | 1, 2, 4 | quads per main-loop trip |
+| `SPLIT: bool` | false, true | activation loads as 4xb64 instead of 2xb128 |
+| `ILP: bool` | false, true | two weight sets, two groups' fmac chains interleaved term by term |
+
+`CAP: u8` (1, 2, 4, 8; `B > CAP` clamps, `B <= 0` stores nothing) is not a search axis: a `CAP < 8` object equals the `CAP = 8` one only for `B <= CAP`.
+
+The declared values are the shipped tuple `r4_b8_u1_native_anchor` (`const ROWS: u8 = 4; const CAP: u8 = 8; const UNROLL: u8 = 1; const SPLIT: bool = false; const ILP: bool = false;`); the variant is `xbatch` and the `KernelSpec` variant is the tuple tag. A tuple whose ring/register plan does not fit is refused by the script's `check` with the same verdict as the Rust generator (`r4_b8` with `ILP` has one ring slot but needs four). `tests/gemv_mq2_xbatch_twin.rs` requires, for all 144 tuples of the grid, that the script refuses exactly when `emit_text` does and otherwise emits the same `s_text` byte for byte, and that the declared point assembles to the ELF inside the committed `kernels/gemv_mq2_xbatch_pm_gfx1201.hxaco`.

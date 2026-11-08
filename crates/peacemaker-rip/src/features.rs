@@ -127,6 +127,11 @@ pub fn source_sha256(source: &str) -> String {
     hex(&sha256(source.as_bytes()))
 }
 
+/// Hex SHA-256 of arbitrary bytes (the same implementation as [`source_sha256`]).
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex(&sha256(bytes))
+}
+
 // ---------------------------------------------------------------------------
 // Routes (parsed per target, validated even when no loop or symbol matches).
 // ---------------------------------------------------------------------------

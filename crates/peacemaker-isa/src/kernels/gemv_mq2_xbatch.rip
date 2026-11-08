@@ -1,0 +1,977 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+// The x-batched MQ2G256V2 GEMV (`gemv_mq2g256v2_xbatch_pm`, gfx1201; the MTP draft-head ranking GEMV),
+// transliterated from `kernels/gemv_mq2_xbatch_pm_gfx1201.rs` onto the raw `Builder` vocabulary.
+//
+// `emit_text(&Params)` of the Rust generator is the reference: for every `(rows, cap, unroll, split, ilp)`
+// tuple the script either errors exactly when the generator does, or re-emits its assembly text byte for
+// byte; the declared point below is `SHIPPED` (`r4_b8_u1_native_anchor`) and assembles to the ELF inside
+// the committed `kernels/gemv_mq2_xbatch_pm_gfx1201.hxaco`. `tests/gemv_mq2_xbatch_twin.rs` pins both.
+//
+// The grid parameters are single-line consts (`const NAME: TY = LIT;`, so a search can rewrite the literal
+// in place). `SEARCH_AXES` lists the `schedule` axes: the arithmetic DAG of every output (the generator's
+// `ORDERED_DAG`) is the same for all their tuples; only the order, grouping and register assignment of the
+// instructions differ.
+//
+//   ROWS    output rows per workgroup {1,2,4} (launch grid ceil(M/ROWS); loads past M clamp to M-1)
+//   UNROLL  quads per main-loop trip {1,2,4} (then a one-quad remainder loop; tail groups unchanged)
+//   SPLIT   activation loads as 4xb64 instead of 2xb128
+//   ILP     the quad_ILP schedule (two weight sets, two groups' fmac chains interleaved term by term)
+//
+// CAP, the x-batch capacity {1,2,4,8} (code paths for B = 1..=CAP; B > CAP clamps, B <= 0 stores nothing),
+// is NOT a schedule axis: a CAP < 8 object equals the CAP = 8 one only on B <= CAP, so it is not in
+// `SEARCH_AXES` (a domain-restricted axis needs a declared domain, phase 3).
+//
+// ABI (36 B): `A` (read-only), `x[B][K]` (read-only), `y[B][M]` (write-only) pointers at 0/8/16,
+// `M`/`K`/`B` i32 at 24/28/32. Block 32 (one wave32), grid ceil(M/ROWS) (a larger grid is harmless: a
+// workgroup with row0 >= M exits before any store). `A` is M rows of K/256 72-byte groups: two
+// (scale, zero-point) f16 pairs, then 64 payload bytes. Domain: K % 256 == 0, M >= 1.
+//
+// Not every tuple closes: `validate` checks the grid, then `check` refuses a tuple whose ring/register plan
+// does not fit (e.g. r4_b8 with ILP has one ring slot but needs four). gfx1201 only.
+
+const ARCHES: &[&str] = &["gfx1201"];
+
+const VARIANTS: &[&str] = &["xbatch"];
+
+const SEARCH_AXES: &[(&str, &str, &[&str])] = &[
+    ("ROWS", "schedule", &["1", "2", "4"]),
+    ("UNROLL", "schedule", &["1", "2", "4"]),
+    ("SPLIT", "schedule", &["false", "true"]),
+    ("ILP", "schedule", &["false", "true"]),
+];
+const ROWS: u8 = 4;
+const CAP: u8 = 8;
+const UNROLL: u8 = 1;
+const SPLIT: bool = false;
+const ILP: bool = false;
+
+const SYMBOL: &str = "gemv_mq2g256v2_xbatch_pm";
+const GROUP_BYTES: u32 = 72;
+const VGPR_BUDGET: u16 = 256;
+
+// VGPRs.
+const LANE: u8 = 0;
+// `(lane >> 4) * 4`: the lane's half-header byte offset.
+const HDR_OFF: u8 = 1;
+// `lane * 2`: the lane's payload byte offset (plus 8 immediate).
+const PK_OFF: u8 = 2;
+// `lane * 32`: the lane's eight activations.
+const X_OFF: u8 = 3;
+const SHUF_ADDR: u8 = 4;
+
+// SGPRs.
+const S_B: u8 = 3;
+const S_M: u8 = 10;
+const S_K: u8 = 11;
+const S_ROW0: u8 = 12;
+const S_NV: u8 = 13;
+const S_GROUPS: u8 = 14;
+const S_STRIDE: u8 = 15;
+const S_QUADS: u8 = 36;
+const S_TAIL: u8 = 37;
+const S_KX4: u8 = 38;
+const S_MX4: u8 = 39;
+const S_T0: u8 = 40;
+const S_T1: u8 = 41;
+const S_ROW0X4: u8 = 42;
+const S_MAIN: u8 = 43;
+
+fn s_row(r: u8) -> u8 {
+    16 + r
+}
+
+fn s_xcol(c: u8) -> u8 {
+    28 + c
+}
+
+struct Params {
+    rows: u8,
+    cap: u8,
+    unroll: u8,
+    split: bool,
+    ilp: bool,
+}
+
+fn tag(p: &Params) -> String {
+    let load = if p.split { "split" } else { "native" };
+    let sched = if p.ilp { "quadilp" } else { "anchor" };
+    format!("r{}_b{}_u{}_{}_{}", p.rows, p.cap, p.unroll, load, sched)
+}
+
+fn validate(p: &Params) -> Result<(), String> {
+    if p.rows != 1 && p.rows != 2 && p.rows != 4 {
+        return Err(format!("rows {} not in {{1,2,4}}", p.rows));
+    }
+    if p.cap != 1 && p.cap != 2 && p.cap != 4 && p.cap != 8 {
+        return Err(format!("cap {} not in {{1,2,4,8}}", p.cap));
+    }
+    if p.unroll != 1 && p.unroll != 2 && p.unroll != 4 {
+        return Err(format!("unroll {} not in {{1,2,4}}", p.unroll));
+    }
+    Ok(())
+}
+
+fn emit(spec: Spec) -> Result<Emitted, String> {
+    let p = Params { rows: ROWS, cap: CAP, unroll: UNROLL, split: SPLIT, ilp: ILP };
+    validate(&p)?;
+    let lay = Lay::new(&p);
+    check(&p, &lay)?;
+    let regs = plan_ranges(&p, &lay)?;
+    let mut b = Builder::new(kernel_spec(&p, spec.arch), regs);
+    emit_body(&mut b, &p, &lay, ".Lpx")?;
+    branch(&mut b, "s_endpgm")?;
+    b.finish()
+}
+
+fn kernel_spec(p: &Params, arch: Arch) -> KernelSpec {
+    KernelSpec {
+        kernel_id: "gemv_hfq2g256_xbatch_mq2v2".into(),
+        variant: tag(p),
+        arch: arch,
+        symbol: SYMBOL.into(),
+        kernargs: KernargLayout::new(36)
+            .pointer_access("A", 0, "read_only")
+            .pointer_access("x", 8, "read_only")
+            .pointer_access("y", 16, "write_only")
+            .hidden("M", 24, 4, "by_value")
+            .hidden("K", 28, 4, "by_value")
+            .hidden("B", 32, 4, "by_value"),
+        user_sgpr_count: 2,
+        system_sgpr_workgroup_id_y: false,
+        workgroup_size: 32,
+        group_segment_fixed_size: 0,
+        wave32: true,
+        cu_mode: false,
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ layout
+
+// Register map of one tuple.
+struct Lay {
+    r: u16,
+    cap: u16,
+    pk_base: u16,
+    wb: u16,
+    set_sz: u16,
+    ring: u16,
+    // activation loads per ring item
+    lpi: u16,
+}
+
+impl Lay {
+    fn new(p: &Params) -> Lay {
+        let r = p.rows as u16;
+        let pk_base = 8 + 4 * r;
+        let wb = (pk_base + 4 * r).next_multiple_of(4);
+        let set_sz = (10 * r).next_multiple_of(4);
+        let sets = if p.ilp { 2u16 } else { 1u16 };
+        let lpi = if p.split { 4u16 } else { 2u16 };
+        Lay {
+            r: r,
+            cap: p.cap as u16,
+            pk_base: pk_base,
+            wb: wb,
+            set_sz: set_sz,
+            ring: (wb + sets * set_sz).next_multiple_of(8),
+            lpi: lpi,
+        }
+    }
+
+    // Half header of (group slot j, row r).
+    fn hdr(&self, j: u8, r: u8) -> u8 {
+        (8 + self.r * (j as u16) + (r as u16)) as u8
+    }
+
+    // Payload dword of (group slot j, row r).
+    fn pk(&self, j: u8, r: u8) -> u8 {
+        (self.pk_base + self.r * (j as u16) + (r as u16)) as u8
+    }
+
+    // Dequantized weight `n` of (weight set, row r). Row blocks are 10 apart so the two rows of a VOPD pair
+    // have distinct src0 banks; the two spare registers of a block hold dots.
+    fn w(&self, set: u8, r: u8, n: u8) -> u8 {
+        (self.wb + (set as u16) * self.set_sz + 10 * (r as u16) + (n as u16)) as u8
+    }
+
+    // Dot register of (weight set, column slot, row r); the rows of a pair are even/odd.
+    fn dot(&self, set: u8, slot: u8, r: u8) -> u8 {
+        let base = self.wb + (set as u16) * self.set_sz;
+        let sl = slot as u16;
+        let rr = r as u16;
+        let off = if self.r == 4 {
+            10 * (2 * sl + rr / 2) + 8 + rr % 2
+        } else if self.r == 2 {
+            10 * sl + 8 + rr
+        } else {
+            8 + sl
+        };
+        (base + off) as u8
+    }
+
+    // Ring slots (8 VGPRs each) of the `nb`-column path: bounded by the items of one quad, the registers
+    // left after the accumulators and the 6-bit load counter (weight loads plus ring loads in flight).
+    fn slots(&self, nb: u8) -> u16 {
+        let n = nb as u16;
+        let regs = (VGPR_BUDGET - self.ring - 4 * self.r * n) / 8;
+        let loads = (63 - 8 * self.r) / self.lpi;
+        let mut best = 4 * n;
+        if regs < best {
+            best = regs;
+        }
+        if loads < best {
+            best = loads;
+        }
+        best
+    }
+
+    fn ring(&self, nb: u8, item: u16) -> u8 {
+        (self.ring + 8 * (item % self.slots(nb))) as u8
+    }
+
+    fn acc_base(&self, nb: u8) -> u16 {
+        self.ring + 8 * self.slots(nb)
+    }
+
+    // Stream accumulator (column c, stream st, row r) of the `nb`-column path.
+    fn acc(&self, nb: u8, c: u8, st: u8, r: u8) -> u8 {
+        (self.acc_base(nb) + 4 * self.r * (c as u16) + self.r * (st as u16) + (r as u16)) as u8
+    }
+
+    fn red_tmp(&self, c: u8, r: u8) -> u8 {
+        (8 + self.r * (c as u16) + (r as u16)) as u8
+    }
+
+    fn y_addr(&self, c: u8) -> u8 {
+        (self.wb + (c as u16)) as u8
+    }
+
+    // First VGPR past every path's accumulators.
+    fn top(&self) -> u16 {
+        let mut top = self.ring;
+        for nb in 1..=self.cap {
+            let t = self.acc_base(nb as u8) + 4 * self.r * nb;
+            if t > top {
+                top = t;
+            }
+        }
+        top
+    }
+
+    fn rowpairs(&self) -> Vec<(u8, Option<u8>)> {
+        if self.r == 4 {
+            vec![(0u8, Some(1u8)), (2u8, Some(3u8))]
+        } else if self.r == 2 {
+            vec![(0u8, Some(1u8))]
+        } else {
+            vec![(0u8, None)]
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ builder
+
+// Reject tuples whose ring/register plan does not close.
+fn check(p: &Params, lay: &Lay) -> Result<(), String> {
+    // The ring must hold one step (ILP: two groups x up to two columns) and the plan must fit.
+    for nb in 1..=p.cap {
+        let two = if nb < 2 { nb } else { 2 };
+        let step = if p.ilp { 2 * two } else { two };
+        if lay.slots(nb) < (step as u16) {
+            return Err(format!(
+                "nb={}: {} ring slots cannot hold a {}-item step",
+                nb,
+                lay.slots(nb),
+                step
+            ));
+        }
+    }
+    let top = lay.top();
+    if top > VGPR_BUDGET {
+        return Err(format!("needs {} VGPRs (> {})", top, VGPR_BUDGET));
+    }
+    Ok(())
+}
+
+// Every register range the body uses (kernarg s[0:1] and lane v0 are always `Live::Whole`).
+fn plan_ranges(p: &Params, lay: &Lay) -> Result<RegPlan, String> {
+    let mut regs = RegPlan::new(VGPR_BUDGET, 48)?;
+    let top = lay.top();
+    regs.add_range("kernarg", "s", 0, 2, Live::Whole)?;
+    let sranges = [
+        ("columns", S_B, 1u8),
+        ("matrix_activation", 4u8, 4u8),
+        ("output", 8u8, 2u8),
+        ("m", S_M, 1u8),
+        ("k", S_K, 1u8),
+        ("row0", S_ROW0, 1u8),
+        ("valid_rows", S_NV, 1u8),
+        ("groups", S_GROUPS, 1u8),
+        ("stride", S_STRIDE, 1u8),
+        ("row_offsets", 16u8, 4u8),
+        ("weight_resource", 20u8, 4u8),
+        ("activation_resource", 24u8, 4u8),
+        ("column_offsets0", 28u8, 4u8),
+        ("column_offsets1", 32u8, 4u8),
+        ("quads", S_QUADS, 1u8),
+        ("tail", S_TAIL, 1u8),
+        ("k_x4", S_KX4, 1u8),
+        ("m_x4", S_MX4, 1u8),
+        ("temp0", S_T0, 1u8),
+        ("temp1", S_T1, 1u8),
+        ("row0_x4", S_ROW0X4, 1u8),
+        ("main_trips", S_MAIN, 1u8),
+    ];
+    for (name, base, width) in sranges {
+        regs.add_range(name, "s", base, width, Live::Whole)?;
+    }
+    let r = lay.r;
+    let mut vranges = vec![
+        ("lane", 0u16, 1u16),
+        ("header_offset", 1u16, 1u16),
+        ("packed_offset", 2u16, 1u16),
+        ("activation_offset", 3u16, 1u16),
+        ("shuffle_addr", 4u16, 1u16),
+        ("headers", 8u16, 4 * r),
+        ("packed", lay.pk_base, 4 * r),
+        ("ring_accumulators", lay.ring, top - lay.ring),
+    ];
+    let sets = if p.ilp { 2u16 } else { 1u16 };
+    for st in 0..sets {
+        let name = format!("weights_set{}", st);
+        vranges.push((name, lay.wb + st * lay.set_sz, lay.set_sz));
+    }
+    for (name, base, width) in vranges {
+        let mut at = 0u16;
+        while at < width {
+            let mut piece = width - at;
+            if piece > 8 {
+                piece = 8;
+            }
+            // the allocator admits widths 1/2/4/8
+            while !piece.is_power_of_two() {
+                piece -= 1;
+            }
+            regs.add_range(&format!("{}{}", name, at), "v", (base + at) as u8, piece as u8, Live::Whole)?;
+            at += piece;
+        }
+    }
+    Ok(regs)
+}
+
+// Everything from the first `s_load_b64 s[10:11], s[0:1], 0x18` through the final `{pre}_end` label,
+// without the trailing `s_endpgm`. Labels are `{pre}_end`, `{pre}_b{nb}...`.
+fn emit_body(b: &mut Builder, p: &Params, lay: &Lay, pre: &str) -> Result<(), String> {
+    let rows = p.rows;
+    let rshift = rows.trailing_zeros();
+    smem(b, "s_load_b64 s[10:11], s[0:1], 0x18", &[S_M, S_K], &[0u8, 1u8])?;
+    // gfx12 receives the workgroup index in ttmp9.
+    salu(b, &format!("s_lshl_b32 s12, ttmp9, {}", rshift), &[S_ROW0], &[])?;
+    b.wait_all()?;
+    salu(b, "s_cmp_ge_i32 s12, s10", &[], &[S_ROW0, S_M])?;
+    if hops(p) {
+        // `row0 >= M` leaves through the first exit hop, one section away, not a far `_end`.
+        branch(b, &format!("s_cbranch_scc0 {}_in", pre))?;
+        branch(b, &format!("s_branch {}", exit_label(p, pre, 1)))?;
+        b.label(&format!("{}_in", pre))?;
+    } else {
+        branch(b, &format!("s_cbranch_scc1 {}_end", pre))?;
+    }
+    smem(b, "s_load_b128 s[4:7], s[0:1], 0x0", &[4u8, 5u8, 6u8, 7u8], &[0u8, 1u8])?;
+    smem(b, "s_load_b64 s[8:9], s[0:1], 0x10", &[8u8, 9u8], &[0u8, 1u8])?;
+    smem(b, "s_load_b32 s3, s[0:1], 0x20", &[S_B], &[0u8, 1u8])?;
+    salu(b, "s_sub_co_i32 s13, s10, s12", &[S_NV], &[S_M, S_ROW0])?;
+    salu(b, &format!("s_min_i32 s13, s13, {}", rows), &[S_NV], &[S_NV])?;
+    salu(b, "s_add_co_i32 s40, s10, -1", &[S_T0], &[S_M])?;
+    salu(b, "s_lshr_b32 s14, s11, 8", &[S_GROUPS], &[S_K])?;
+    salu(b, "s_mul_i32 s15, s14, 0x48", &[S_STRIDE], &[S_GROUPS])?;
+    for row in 0..rows {
+        salu(b, &format!("s_add_co_i32 s41, s12, {}", row), &[S_T1], &[S_ROW0])?;
+        salu(b, "s_min_i32 s41, s41, s40", &[S_T1], &[S_T1, S_T0])?;
+        salu(b, &format!("s_mul_i32 s{}, s41, s15", s_row(row)), &[s_row(row)], &[S_T1, S_STRIDE])?;
+    }
+    salu(b, "s_lshl_b32 s38, s11, 2", &[S_KX4], &[S_K])?;
+    salu(b, "s_lshl_b32 s39, s10, 2", &[S_MX4], &[S_M])?;
+    salu(b, "s_lshl_b32 s42, s12, 2", &[S_ROW0X4], &[S_ROW0])?;
+    for c in 0..p.cap {
+        salu(b, &format!("s_mul_i32 s{}, s38, {}", s_xcol(c), c), &[s_xcol(c)], &[S_KX4])?;
+    }
+    valu(b, "v_lshrrev_b32_e32 v1, 4, v0", &[HDR_OFF], &[LANE], &[])?;
+    valu(b, "v_lshlrev_b32_e32 v1, 2, v1", &[HDR_OFF], &[HDR_OFF], &[])?;
+    valu(b, "v_lshlrev_b32_e32 v2, 1, v0", &[PK_OFF], &[LANE], &[])?;
+    valu(b, "v_lshlrev_b32_e32 v3, 5, v0", &[X_OFF], &[LANE], &[])?;
+    b.wait_all()?;
+    // Raw buffer resources (stride 0, unbounded records) over A and x.
+    resource(b, 20, 4)?;
+    resource(b, 24, 6)?;
+    // B > cap clamps to cap (the hipcc anchor clamps B > 4 to 4); B <= 0 matches no path and stores nothing.
+    salu(b, &format!("s_min_i32 s3, s3, {}", p.cap), &[S_B], &[S_B])?;
+    if hops(p) {
+        // Distributed gates: the code is larger than one `s_branch` reach (+-128 KiB), so every branch spans at
+        // most one section. Gate `nb` skips its section to gate `nb+1` (the last to `_end`) unless `B == nb`; a
+        // finished section falls into its exit hop, a chain of one-section jumps to `_end`.
+        for nb in 1..=p.cap {
+            if nb > 1 {
+                b.label(&format!("{}_d{}", pre, nb))?;
+            }
+            salu(b, &format!("s_cmp_lg_u32 s3, {}", nb), &[], &[S_B])?;
+            let next = if nb < p.cap {
+                format!("{}_d{}", pre, nb + 1)
+            } else {
+                format!("{}_end", pre)
+            };
+            branch(b, &format!("s_cbranch_scc1 {}", next))?;
+            section(b, p, lay, nb, pre)?;
+            if nb < p.cap {
+                b.label(&format!("{}_x{}", pre, nb))?;
+                branch(b, &format!("s_branch {}", exit_label(p, pre, nb + 1)))?;
+            }
+        }
+        return b.label(&format!("{}_end", pre));
+    }
+    for nb in 1..=p.cap {
+        salu(b, &format!("s_cmp_eq_u32 s3, {}", nb), &[], &[S_B])?;
+        branch(b, &format!("s_cbranch_scc1 {}_b{}", pre, nb))?;
+    }
+    branch(b, &format!("s_branch {}_end", pre))?;
+    for nb in 1..=p.cap {
+        section(b, p, lay, nb, pre)?;
+    }
+    b.label(&format!("{}_end", pre))
+}
+
+// A buffer resource `s[res:res+3]` over the 64-bit pointer in `s[ptr:ptr+1]`.
+fn resource(b: &mut Builder, res: u8, ptr: u8) -> Result<(), String> {
+    salu(b, &format!("s_mov_b32 s{}, s{}", res, ptr), &[res], &[ptr])?;
+    salu(b, &format!("s_and_b32 s{}, s{}, 0xffff", res + 1, ptr + 1), &[res + 1], &[ptr + 1])?;
+    salu(b, &format!("s_mov_b32 s{}, -1", res + 2), &[res + 2], &[])?;
+    salu(b, &format!("s_mov_b32 s{}, 0x31004000", res + 3), &[res + 3], &[])
+}
+
+// Capacities above 4 outgrow one branch reach; the body uses the distributed-gate layout (`emit_body`).
+// Capacities <= 4 keep the pinned shipped layout.
+fn hops(p: &Params) -> bool {
+    p.cap > 4
+}
+
+// Entry of the exit-hop chain at section `nb`: the hop after section `nb`, or `_end` past the last section.
+fn exit_label(p: &Params, pre: &str, nb: u8) -> String {
+    if nb >= p.cap {
+        format!("{}_end", pre)
+    } else {
+        format!("{}_x{}", pre, nb)
+    }
+}
+
+// Advance every row's group offset and every column's activation offset by one quad.
+fn advance(b: &mut Builder, p: &Params, nb: u8) -> Result<(), String> {
+    for r in 0..p.rows {
+        salu(b, &format!("s_add_co_i32 s{}, s{}, 0x120", s_row(r), s_row(r)), &[s_row(r)], &[s_row(r)])?;
+    }
+    for c in 0..nb {
+        salu(b, &format!("s_add_co_i32 s{}, s{}, 0x1000", s_xcol(c), s_xcol(c)), &[s_xcol(c)], &[s_xcol(c)])?;
+    }
+    Ok(())
+}
+
+fn quad_body(b: &mut Builder, p: &Params, lay: &Lay, nb: u8) -> Result<(), String> {
+    body(b, p, lay, nb, &[0u8, 1u8, 2u8, 3u8])?;
+    advance(b, p, nb)
+}
+
+// The complete kernel body for `nb` columns.
+fn section(b: &mut Builder, p: &Params, lay: &Lay, nb: u8, pre: &str) -> Result<(), String> {
+    b.label(&format!("{}_b{}", pre, nb))?;
+    for c in 0..nb {
+        for st in 0..4u8 {
+            for r in 0..p.rows {
+                let a = lay.acc(nb, c, st, r);
+                valu(b, &format!("v_mov_b32_e32 v{}, 0", a), &[a], &[], &[])?;
+            }
+        }
+    }
+    salu(b, "s_lshr_b32 s36, s14, 2", &[S_QUADS], &[S_GROUPS])?;
+    salu(b, "s_and_b32 s37, s14, 3", &[S_TAIL], &[S_GROUPS])?;
+    if p.unroll > 1 {
+        // main loop: quads / unroll trips of `unroll` quads, then the quads % unroll remainder.
+        let shift = p.unroll.trailing_zeros();
+        let mask = p.unroll - 1;
+        salu(b, &format!("s_lshr_b32 s{}, s{}, {}", S_MAIN, S_QUADS, shift), &[S_MAIN], &[S_QUADS])?;
+        salu(b, &format!("s_and_b32 s{}, s{}, {}", S_QUADS, S_QUADS, mask), &[S_QUADS], &[S_QUADS])?;
+        salu(b, &format!("s_cmp_eq_u32 s{}, 0", S_MAIN), &[], &[S_MAIN])?;
+        branch(b, &format!("s_cbranch_scc1 {}_b{}_rem", pre, nb))?;
+        b.loop_(&format!("{}_b{}_main", pre, nb), |b| {
+            for _ in 0..p.unroll {
+                quad_body(b, p, lay, nb)?;
+            }
+            salu(b, &format!("s_add_co_i32 s{}, s{}, -1", S_MAIN, S_MAIN), &[S_MAIN], &[S_MAIN])?;
+            salu(b, &format!("s_cmp_lg_u32 s{}, 0", S_MAIN), &[], &[S_MAIN])?;
+            branch(b, &format!("s_cbranch_scc1 {}_b{}_main", pre, nb))
+        })?;
+        b.label(&format!("{}_b{}_rem", pre, nb))?;
+    }
+    salu(b, "s_cmp_eq_u32 s36, 0", &[], &[S_QUADS])?;
+    branch(b, &format!("s_cbranch_scc1 {}_b{}_tail", pre, nb))?;
+    b.loop_(&format!("{}_b{}_quad", pre, nb), |b| {
+        quad_body(b, p, lay, nb)?;
+        salu(b, "s_add_co_i32 s36, s36, -1", &[S_QUADS], &[S_QUADS])?;
+        salu(b, "s_cmp_lg_u32 s36, 0", &[], &[S_QUADS])?;
+        branch(b, &format!("s_cbranch_scc1 {}_b{}_quad", pre, nb))
+    })?;
+    b.label(&format!("{}_b{}_tail", pre, nb))?;
+    // Tail group t (at the post-quad bases) accumulates into stream t.
+    for t in 0..3u8 {
+        salu(b, &format!("s_cmp_gt_u32 s37, {}", t), &[], &[S_TAIL])?;
+        branch(b, &format!("s_cbranch_scc0 {}_b{}_fold", pre, nb))?;
+        body(b, p, lay, nb, &[t])?;
+    }
+    b.label(&format!("{}_b{}_fold", pre, nb))?;
+    fold(b, lay, nb)?;
+    reduce(b, p, lay, nb)?;
+    store(b, p, lay, nb, pre)
+}
+
+// One column-step: the groups (weight set, group slot) dotted against up to two columns
+// (each `(column, activation item)`).
+struct GroupStep {
+    set: u8,
+    j: u8,
+    cols: Vec<(u8, u16)>,
+}
+
+// Groups `js` (slot = stream = immediate index) of the rows against every column. Weights of the first
+// group and its activations issue first, then the remaining weights; activations of later items stream
+// through the ring as earlier items retire. `quad_ILP` decodes consecutive group pairs into two weight
+// sets and interleaves their fmac chains term by term.
+fn body(b: &mut Builder, p: &Params, lay: &Lay, nb: u8, js: &[u8]) -> Result<(), String> {
+    let mut packets = Vec::new();
+    if p.ilp {
+        let mut i = 0usize;
+        while i < js.len() {
+            let mut pk = Vec::new();
+            pk.push(js[i]);
+            if i + 1 < js.len() {
+                pk.push(js[i + 1]);
+            }
+            packets.push(pk);
+            i += 2;
+        }
+    } else {
+        for j in js {
+            packets.push(vec![*j]);
+        }
+    }
+    // Items (group slot, column) in consumption order, and the steps consuming them.
+    let mut items = Vec::new();
+    let mut plan = Vec::new();
+    for packet in &packets {
+        let mut groups = Vec::new();
+        for i in 0..packet.len() {
+            groups.push((i as u8, packet[i]));
+        }
+        let mut steps = Vec::new();
+        let mut c = 0u8;
+        while c < nb {
+            let mut step = Vec::new();
+            for g in &groups {
+                let set = g.0;
+                let j = g.1;
+                let mut cols = Vec::new();
+                let mut col = c;
+                let end = if nb < c + 2 { nb } else { c + 2 };
+                while col < end {
+                    items.push((j, col));
+                    cols.push((col, (items.len() - 1) as u16));
+                    col += 1;
+                }
+                step.push(GroupStep { set: set, j: j, cols: cols });
+            }
+            steps.push(step);
+            c += 2;
+        }
+        plan.push((groups, steps));
+    }
+    let total = items.len() as u16;
+    let slots = lay.slots(nb);
+    weight_loads(b, lay, p.rows, js[0])?;
+    let mut issued = 0u16;
+    let first_loads = if slots < (nb as u16) { slots } else { nb as u16 };
+    while issued < first_loads {
+        x_load(b, p, lay, nb, &items, issued)?;
+        issued += 1;
+    }
+    for k in 1..js.len() {
+        weight_loads(b, lay, p.rows, js[k])?;
+    }
+    for entry in &plan {
+        let groups = &entry.0;
+        let steps = &entry.1;
+        for g in groups {
+            dequant(b, lay, p.rows, g.0, g.1)?;
+        }
+        for step in steps {
+            let first = step[0].cols[0].1;
+            let reach = if first + slots < total { first + slots } else { total };
+            while issued < reach {
+                x_load(b, p, lay, nb, &items, issued)?;
+                issued += 1;
+            }
+            for term in 0..8usize {
+                for g in step {
+                    dot_term(b, lay, nb, g, term)?;
+                }
+            }
+            for g in step {
+                accumulate(b, lay, nb, g)?;
+            }
+        }
+    }
+    b.wait_all()
+}
+
+// Lane-selected half headers and payload dwords of group slot `j`, all rows.
+fn weight_loads(b: &mut Builder, lay: &Lay, rows: u8, j: u8) -> Result<(), String> {
+    let off: u32 = (j as u32) * GROUP_BYTES;
+    for r in 0..rows {
+        let h = lay.hdr(j, r);
+        let suffix = if off == 0 { String::new() } else { format!(" offset:{}", off) };
+        vmem(
+            b,
+            &format!("buffer_load_b32 v{}, v1, s[20:23], s{} offen{}", h, s_row(r), suffix),
+            &[h],
+            &[HDR_OFF],
+            &[20u8, 21u8, 22u8, 23u8, s_row(r)],
+            false,
+        )?;
+    }
+    for r in 0..rows {
+        let pk = lay.pk(j, r);
+        vmem(
+            b,
+            &format!("buffer_load_b32 v{}, v2, s[20:23], s{} offen offset:{}", pk, s_row(r), off + 8),
+            &[pk],
+            &[PK_OFF],
+            &[20u8, 21u8, 22u8, 23u8, s_row(r)],
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+// The eight activations of item `item` (group `items[item].0`, column `items[item].1`) into its ring slot.
+fn x_load(b: &mut Builder, p: &Params, lay: &Lay, nb: u8, items: &Vec<(u8, u8)>, item: u16) -> Result<(), String> {
+    let j = items[item as usize].0;
+    let c = items[item as usize].1;
+    let x = lay.ring(nb, item);
+    let pieces: u8 = if p.split { 4 } else { 2 };
+    let width: u8 = if p.split { 2 } else { 4 };
+    for piece in 0..pieces {
+        let off: u32 = (j as u32) * 1024 + (piece as u32) * (width as u32) * 4;
+        let suffix = if off == 0 { String::new() } else { format!(" offset:{}", off) };
+        let d = x + width * piece;
+        let mut mnemonic = "b128";
+        let mut dregs = vec![d, d + 1, d + 2, d + 3];
+        if p.split {
+            mnemonic = "b64";
+            dregs = vec![d, d + 1];
+        }
+        vmem(
+            b,
+            &format!(
+                "buffer_load_{} v[{}:{}], v3, s[24:27], s{} offen{}",
+                mnemonic,
+                d,
+                d + width - 1,
+                s_xcol(c),
+                suffix
+            ),
+            &dregs,
+            &[X_OFF],
+            &[24u8, 25u8, 26u8, 27u8, s_xcol(c)],
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+// `w[r][n] = fma_mix(h, float((pk >> 2n) & 3), h)` (scale = low f16 of `h`, zero point = high f16) for every
+// row of group slot `j`, into weight set `set`.
+fn dequant(b: &mut Builder, lay: &Lay, rows: u8, set: u8, j: u8) -> Result<(), String> {
+    for n in 0..8u8 {
+        for r in 0..rows {
+            let w = lay.w(set, r, n);
+            let pk = lay.pk(j, r);
+            valu(b, &format!("v_bfe_u32 v{}, v{}, {}, 2", w, pk, 2 * n), &[w], &[pk], &[])?;
+        }
+    }
+    for n in 0..8u8 {
+        for r in 0..rows {
+            let w = lay.w(set, r, n);
+            valu(b, &format!("v_cvt_f32_ubyte0_e32 v{}, v{}", w, w), &[w], &[w], &[])?;
+        }
+    }
+    for n in 0..8u8 {
+        for r in 0..rows {
+            let w = lay.w(set, r, n);
+            let h = lay.hdr(j, r);
+            valu(
+                b,
+                &format!("v_fma_mix_f32 v{}, v{}, v{}, v{} op_sel:[0,0,1] op_sel_hi:[1,0,1]", w, h, w, h),
+                &[w],
+                &[h, w],
+                &[],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+// A binary f32 op over the row pair `(ra, rb)` as one VOPD packet (`op` is "add", "mul" or "fmac"; the `_a`
+// / `_b` operands are the dst, src0 and src1 registers of row `ra` / row `rb`), or, for a lone row (`rb` is
+// None), a plain VALU op over the `_a` operands.
+fn pair_op(b: &mut Builder, op: &str, ra: u8, rb: Option<u8>, d_a: u8, s0_a: u8, s1_a: u8, d_b: u8, s0_b: u8, s1_b: u8) -> Result<(), String> {
+    match rb {
+        Some(_) => b.vopd(
+            VopdOp { op: op, dst: d_a, src0: v(s0_a), src1: s1_a },
+            VopdOp { op: op, dst: d_b, src0: v(s0_b), src1: s1_b },
+        ),
+        None => {
+            if op == "mul" {
+                valu(b, &format!("v_mul_f32_e32 v{}, v{}, v{}", d_a, s0_a, s1_a), &[d_a], &[s0_a, s1_a], &[])
+            } else if op == "fmac" {
+                valu(b, &format!("v_fmac_f32_e32 v{}, v{}, v{}", d_a, s0_a, s1_a), &[d_a], &[d_a, s0_a, s1_a], &[])
+            } else if op == "add" {
+                valu(b, &format!("v_add_f32_e32 v{}, v{}, v{}", d_a, s0_a, s1_a), &[d_a], &[s0_a, s1_a], &[])
+            } else {
+                Err(format!("pair_op: unsupported {}", op))
+            }
+        }
+    }
+}
+
+// Term `term` (position in the order x1, x0, x2..x7) of the dot of group step `g` against its columns.
+fn dot_term(b: &mut Builder, lay: &Lay, nb: u8, g: &GroupStep, term: usize) -> Result<(), String> {
+    let order = [1u8, 0u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8];
+    let n = order[term];
+    let op = if term == 0 { "mul" } else { "fmac" };
+    for slot in 0..g.cols.len() {
+        let x = lay.ring(nb, g.cols[slot].1);
+        for pair in lay.rowpairs() {
+            let ra = pair.0;
+            let rb = pair.1;
+            let mut rb_v = 0u8;
+            if let Some(q) = rb {
+                rb_v = q;
+            }
+            pair_op(
+                b,
+                op,
+                ra,
+                rb,
+                lay.dot(g.set, slot as u8, ra),
+                lay.w(g.set, ra, n),
+                x + n,
+                lay.dot(g.set, slot as u8, rb_v),
+                lay.w(g.set, rb_v, n),
+                x + n,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+// `acc[st] = acc[st] + dot` for the group's columns.
+fn accumulate(b: &mut Builder, lay: &Lay, nb: u8, g: &GroupStep) -> Result<(), String> {
+    for slot in 0..g.cols.len() {
+        let c = g.cols[slot].0;
+        for pair in lay.rowpairs() {
+            let ra = pair.0;
+            let rb = pair.1;
+            let mut rb_v = 0u8;
+            if let Some(q) = rb {
+                rb_v = q;
+            }
+            pair_op(
+                b,
+                "add",
+                ra,
+                rb,
+                lay.acc(nb, c, g.j, ra),
+                lay.acc(nb, c, g.j, ra),
+                lay.dot(g.set, slot as u8, ra),
+                lay.acc(nb, c, g.j, rb_v),
+                lay.acc(nb, c, g.j, rb_v),
+                lay.dot(g.set, slot as u8, rb_v),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+// `(a0 + a1) + (a2 + a3)` per column and row, into stream 0.
+fn fold(b: &mut Builder, lay: &Lay, nb: u8) -> Result<(), String> {
+    let plan = [(0u8, 1u8), (2u8, 3u8), (0u8, 2u8)];
+    for c in 0..nb {
+        for step in plan {
+            let dst = step.0;
+            let other = step.1;
+            for pair in lay.rowpairs() {
+                let ra = pair.0;
+                let rb = pair.1;
+                let mut rb_v = 0u8;
+                if let Some(q) = rb {
+                    rb_v = q;
+                }
+                pair_op(
+                    b,
+                    "add",
+                    ra,
+                    rb,
+                    lay.acc(nb, c, dst, ra),
+                    lay.acc(nb, c, dst, ra),
+                    lay.acc(nb, c, other, ra),
+                    lay.acc(nb, c, dst, rb_v),
+                    lay.acc(nb, c, dst, rb_v),
+                    lay.acc(nb, c, other, rb_v),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+// Frozen shfl_down 16/8/4/2/1 tree, batched over every (column, row) value.
+fn reduce(b: &mut Builder, p: &Params, lay: &Lay, nb: u8) -> Result<(), String> {
+    let mut values = Vec::new();
+    for c in 0..nb {
+        for r in 0..p.rows {
+            values.push((c, r));
+        }
+    }
+    for cr in &values {
+        let v_ = lay.acc(nb, cr.0, 0, cr.1);
+        let t = lay.red_tmp(cr.0, cr.1);
+        b.ds_crosslane(
+            Instruction::new(
+                format!("ds_swizzle_b32 v{}, v{} offset:swizzle(BITMASK_PERM,\"1pppp\")", t, v_),
+                vregs(&[t]),
+                vregs(&[v_]),
+            )
+            .memory(MemoryClass::DsLoad),
+        )?;
+    }
+    for cr in &values {
+        let v_ = lay.acc(nb, cr.0, 0, cr.1);
+        let t = lay.red_tmp(cr.0, cr.1);
+        valu(b, &format!("v_add_f32_e32 v{}, v{}, v{}", v_, v_, t), &[v_], &[v_, t], &[])?;
+    }
+    for offset in [8u8, 4u8, 2u8, 1u8] {
+        valu(b, &format!("v_cmp_gt_u32_e32 vcc_lo, {}, v0", 32 - offset), &[], &[LANE], &[])?;
+        b.push(Instruction::new("s_wait_alu depctr_va_vcc(0)", vec![], vec![]))?;
+        valu(b, &format!("v_cndmask_b32_e64 v4, 0, {}, vcc_lo", offset), &[SHUF_ADDR], &[], &[])?;
+        valu(b, "v_add_lshl_u32 v4, v4, v0, 2", &[SHUF_ADDR], &[SHUF_ADDR, LANE], &[])?;
+        for cr in &values {
+            let v_ = lay.acc(nb, cr.0, 0, cr.1);
+            let t = lay.red_tmp(cr.0, cr.1);
+            b.ds_crosslane(
+                Instruction::new(
+                    format!("ds_bpermute_b32 v{}, v4, v{}", t, v_),
+                    vregs(&[t]),
+                    vregs(&[SHUF_ADDR, v_]),
+                )
+                .memory(MemoryClass::DsLoad),
+            )?;
+        }
+        for cr in &values {
+            let v_ = lay.acc(nb, cr.0, 0, cr.1);
+            let t = lay.red_tmp(cr.0, cr.1);
+            valu(b, &format!("v_add_f32_e32 v{}, v{}, v{}", v_, v_, t), &[v_], &[v_, t], &[])?;
+        }
+    }
+    Ok(())
+}
+
+// Lane 0 stores `y[c][row0 + r]` for every column and each valid row.
+fn store(b: &mut Builder, p: &Params, lay: &Lay, nb: u8, pre: &str) -> Result<(), String> {
+    valu(b, "v_cmpx_eq_u32_e32 0, v0", &[], &[LANE], &[])?;
+    for c in 0..nb {
+        let a = lay.y_addr(c);
+        if c == 0 {
+            valu(b, &format!("v_mov_b32_e32 v{}, s{}", a, S_ROW0X4), &[a], &[], &[S_ROW0X4])?;
+        } else {
+            salu(b, &format!("s_mul_i32 s40, s39, {}", c), &[S_T0], &[S_MX4])?;
+            salu(b, "s_add_co_i32 s40, s40, s42", &[S_T0], &[S_T0, S_ROW0X4])?;
+            valu(b, &format!("v_mov_b32_e32 v{}, s40", a), &[a], &[], &[S_T0])?;
+        }
+    }
+    for r in 0..p.rows {
+        if r > 0 {
+            salu(b, &format!("s_cmp_le_i32 s13, {}", r), &[], &[S_NV])?;
+            branch(b, &format!("s_cbranch_scc1 {}_b{}_stored", pre, nb))?;
+        }
+        for c in 0..nb {
+            let a = lay.y_addr(c);
+            let v_ = lay.acc(nb, c, 0, r);
+            let suffix = if r == 0 { String::new() } else { format!(" offset:{}", 4 * r) };
+            vmem(b, &format!("global_store_b32 v{}, v{}, s[8:9]{}", a, v_, suffix), &[], &[a, v_], &[8u8, 9u8], true)?;
+        }
+    }
+    b.label(&format!("{}_b{}_stored", pre, nb))?;
+    b.wait_all()?;
+    if hops(p) {
+        // falls into the exit hop (`exit_label`) that follows the section
+        Ok(())
+    } else {
+        branch(b, &format!("s_branch {}_end", pre))
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ emit
+
+fn sregs(xs: &[u8]) -> Vec<RegRef> {
+    let mut o = Vec::new();
+    for x in xs {
+        o.push(s(*x));
+    }
+    o
+}
+
+fn vregs(xs: &[u8]) -> Vec<RegRef> {
+    let mut o = Vec::new();
+    for x in xs {
+        o.push(v(*x));
+    }
+    o
+}
+
+fn salu(b: &mut Builder, text: &str, defs: &[u8], uses: &[u8]) -> Result<(), String> {
+    b.push(Instruction::new(text, sregs(defs), sregs(uses)))
+}
+
+fn valu(b: &mut Builder, text: &str, defs: &[u8], uses: &[u8], scalar: &[u8]) -> Result<(), String> {
+    let mut us = vregs(uses);
+    for x in scalar {
+        us.push(s(*x));
+    }
+    b.push(Instruction::new(text, vregs(defs), us))
+}
+
+fn smem(b: &mut Builder, text: &str, defs: &[u8], uses: &[u8]) -> Result<(), String> {
+    b.push(Instruction::new(text, sregs(defs), sregs(uses)).memory(MemoryClass::SmemLoad))
+}
+
+fn vmem(b: &mut Builder, text: &str, defs: &[u8], uses: &[u8], scalar: &[u8], store: bool) -> Result<(), String> {
+    let mut us = vregs(uses);
+    for x in scalar {
+        us.push(s(*x));
+    }
+    let class = if store { MemoryClass::VmemStore } else { MemoryClass::VmemLoad };
+    b.push(Instruction::new(text, vregs(defs), us).memory(class))
+}
+
+fn branch(b: &mut Builder, text: &str) -> Result<(), String> {
+    b.control(Instruction::new(text, vec![], vec![]))
+}

@@ -189,13 +189,15 @@ fn capture_cases(
     Ok(bad_total)
 }
 
-/// Median us per call of `calls` launches captured in one graph (`reps` synchronized replays).
-fn graph_us(
+/// Per-call us of each replay (replay order) of `calls` launches captured in one graph (`reps`
+/// synchronized replays after three untimed ones); `copies` weight copies rotate across calls.
+fn graph_samples(
     gpu: &mut Gpu,
     reps: usize,
+    copies: usize,
     mut f: impl FnMut(&mut Gpu, usize) -> Result<()>,
-) -> Result<f64> {
-    for i in 0..BENCH_COPIES {
+) -> Result<Vec<f64>> {
+    for i in 0..copies {
         f(gpu, i)?;
     }
     gpu.ensure_capture_stream().map_err(err)?;
@@ -219,6 +221,16 @@ fn graph_us(
     }
     gpu.hip.graph_exec_destroy(exec).map_err(err)?;
     gpu.hip.graph_destroy(graph).map_err(err)?;
+    Ok(s)
+}
+
+/// Median us per call of `calls` launches captured in one graph (`reps` synchronized replays).
+fn graph_us(
+    gpu: &mut Gpu,
+    reps: usize,
+    f: impl FnMut(&mut Gpu, usize) -> Result<()>,
+) -> Result<f64> {
+    let mut s = graph_samples(gpu, reps, BENCH_COPIES, f)?;
     s.sort_by(f64::total_cmp);
     Ok(s[s.len() / 2])
 }
@@ -231,6 +243,11 @@ struct Obj {
     label: String,
     sha: String,
     rows: usize,
+    /// rip-search candidate id and axes (manifest objects only).
+    id: Option<String>,
+    axes: serde_json::Value,
+    /// How the bytes reached `hipModuleLoadData`: the raw image, or ELF wrapped in a bundle.
+    wrap: &'static str,
     _module: hip_bridge::Module,
     func: hip_bridge::Function,
 }
@@ -253,9 +270,31 @@ fn load_obj(gpu: &Gpu, label: &str, bytes: &[u8], symbol: &str, rows: usize) -> 
         label: label.to_string(),
         sha: sha256_hex(bytes),
         rows,
+        id: None,
+        axes: serde_json::Value::Null,
+        wrap: "raw",
         _module: module,
         func,
     })
+}
+
+/// [`load_obj`] of `bytes`; when the loader refuses the raw image (a bare ELF) on gfx1201,
+/// retry once with the same `__CLANG_OFFLOAD_BUNDLE__` writer the repo uses for `.hxaco`.
+/// `sha` stays the sha256 of the bytes given.
+fn load_elf_obj(gpu: &Gpu, label: &str, bytes: &[u8], symbol: &str, rows: usize) -> Result<Obj> {
+    match load_obj(gpu, label, bytes, symbol, rows) {
+        Ok(o) => Ok(o),
+        Err(raw_err) if gpu.arch == "gfx1201" && matches!(rows, 1 | 2 | 4) => {
+            use peacemaker_isa::{arch::Arch, native};
+            let wrapped = native::bundle(bytes, Arch::Gfx1201, native::DEFAULT_HOST_TARGET);
+            let mut o = load_obj(gpu, label, &wrapped, symbol, rows)
+                .map_err(|e| format!("{label}: raw load: {raw_err}; bundled load: {e}"))?;
+            o.sha = sha256_hex(bytes);
+            o.wrap = "bundle";
+            Ok(o)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// ONE launch of `obj` over columns `first..first + b` (x/y column strides `k`/`m`), on the
@@ -305,9 +344,25 @@ fn launch_chunked(
     k: usize,
     b: usize,
 ) -> Result<()> {
+    launch_chunked_by(gpu, obj, a, x, y, m, k, b, 4)
+}
+
+/// `obj` in chunks of `chunk` columns (`chunk >= b`: one launch).
+#[allow(clippy::too_many_arguments)]
+fn launch_chunked_by(
+    gpu: &Gpu,
+    obj: &Obj,
+    a: &rdna_compute::GpuTensor,
+    x: u64,
+    y: u64,
+    m: usize,
+    k: usize,
+    b: usize,
+    chunk: usize,
+) -> Result<()> {
     let mut start = 0;
     while start < b {
-        let rows = 4.min(b - start);
+        let rows = chunk.min(b - start);
         launch_obj(
             gpu,
             obj,
@@ -454,7 +509,8 @@ fn direct_cases(
     gpu: &mut Gpu,
     obj: &Obj,
     base: Option<&Obj>,
-    max_b: usize,
+    shapes: Option<&[(usize, usize)]>,
+    b_list: &[usize],
 ) -> Result<(Vec<serde_json::Value>, usize)> {
     let mut rng = Rng(0xD1EC7_5EED_0001);
     let mut cases = Vec::new();
@@ -483,6 +539,10 @@ fn direct_cases(
     .into_iter()
     .map(|(m, k)| ("random", m, k))
     .collect();
+    if let Some(shapes) = shapes {
+        // --shape replaces the random-finite corpus; the (tiny) NaN/Inf edge cases below stay.
+        specs = shapes.iter().map(|&(m, k)| ("random", m, k)).collect();
+    }
     for (m, k) in [(7usize, 768usize), (7, 1280), (33, 768)] {
         specs.push(("edge_hdr", m, k));
         specs.push(("edge_x", m, k));
@@ -515,7 +575,7 @@ fn direct_cases(
         }
         gpu.hip.device_synchronize().map_err(err)?;
         let reference = gpu.download_raw_bytes(&y_ref).map_err(err)?;
-        for b in 1..=max_b.min(8) {
+        for &b in b_list {
             let written = b * m * 4;
             let guard = GUARD_F * 4;
             // single launch of the object
@@ -703,6 +763,189 @@ fn bench_table(
     ))
 }
 
+/// Weight copies for one shape: `max(3, ceil(200 MB / copy bytes))` (formula), of which at
+/// most `BENCH_CALLS` can be touched by one graph replay (the rest would stay idle), so that
+/// many are allocated. Returns `(formula, allocated)`.
+fn copies_for(m: usize, k: usize) -> (usize, usize) {
+    let copy_bytes = (m * (k / 256) * 72).max(1);
+    let formula = 200_000_000usize.div_ceil(copy_bytes).max(3);
+    (formula, formula.min(BENCH_CALLS))
+}
+
+/// Linear-interpolated quantile of an ascending slice.
+fn pct(sorted: &[f64], q: f64) -> f64 {
+    let pos = q * (sorted.len() - 1) as f64;
+    let (lo, hi) = (pos.floor() as usize, pos.ceil() as usize);
+    sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo as f64)
+}
+
+/// (median = `s[len/2]` like `graph_us`, p10, p90) of per-call us replays.
+fn stats(replays: &[f64]) -> (f64, f64, f64) {
+    let mut s = replays.to_vec();
+    s.sort_by(f64::total_cmp);
+    (s[s.len() / 2], pct(&s, 0.10), pct(&s, 0.90))
+}
+
+/// Interleaved bench: per (shape, B) the arms run ref, c1, ref, c2, ..., ref. `base` is the
+/// ref (chunks of `base_cap` columns); every `objects` entry is one single launch. Each object's
+/// whole guarded `y` (0x7f memset included) must equal the ref's on weight copy 0 before it is
+/// timed; a mismatching object is not timed in that cell.
+#[allow(clippy::too_many_arguments)]
+fn interleave_bench(
+    gpu: &mut Gpu,
+    objects: &[Obj],
+    base: &Obj,
+    base_cap: usize,
+    shapes: &[(usize, usize)],
+    b_list: &[usize],
+    reps: usize,
+    seed: u64,
+) -> Result<(serde_json::Value, usize)> {
+    let mut bad = 0usize;
+    let mut shapes_json = Vec::new();
+    for &(m, k) in shapes {
+        if m == 0 || k == 0 || k % 256 != 0 {
+            return Err(format!("shape {m},{k}: K must be a positive multiple of 256"));
+        }
+        let (formula, copies) = copies_for(m, k);
+        let copy_bytes = m * (k / 256) * 72;
+        let mut rng = Rng(seed);
+        let mut ws = Vec::new();
+        for _ in 0..copies {
+            let bytes = weights(&mut rng, m, k);
+            ws.push(gpu.upload_raw(&bytes, &[bytes.len()]).map_err(err)?);
+        }
+        let x_host: Vec<f32> = (0..8 * k).map(|_| rng.f32() * 3.0).collect();
+        let x = gpu.upload_f32(&x_host, &[x_host.len()]).map_err(err)?;
+        let y_ref = gpu.zeros(&[8 * m + 2 * GUARD_F], DType::F32).map_err(err)?;
+        let y_c = gpu.zeros(&[8 * m + 2 * GUARD_F], DType::F32).map_err(err)?;
+        let (xp, yrp, ycp) = (
+            x.buf.as_ptr() as u64,
+            y_ref.sub_offset(GUARD_F, 8 * m).buf.as_ptr() as u64,
+            y_c.sub_offset(GUARD_F, 8 * m).buf.as_ptr() as u64,
+        );
+        println!(
+            "interleave: M={m} K={k} copies={copies} (formula {formula}, {copy_bytes} B each) reps={reps} calls/replay={BENCH_CALLS} ref={} cap={base_cap}",
+            base.label
+        );
+        let guard = GUARD_F * 4;
+        let mut cells = Vec::new();
+        for &b in b_list {
+            let written = b * m * 4;
+            gpu.hip.memset(&y_ref.buf, 0x7f, y_ref.numel() * 4).map_err(err)?;
+            launch_chunked_by(gpu, base, &ws[0], xp, yrp, m, k, b, base_cap)?;
+            gpu.hip.device_synchronize().map_err(err)?;
+            let ref_bytes = gpu.download_raw_bytes(&y_ref).map_err(err)?;
+            let ref_guard_bad = ref_bytes[..guard].iter().filter(|&&q| q != 0x7f).count()
+                + ref_bytes[guard + written..].iter().filter(|&&q| q != 0x7f).count();
+            bad += ref_guard_bad;
+            let mut mism = Vec::new();
+            let mut timed = Vec::new();
+            for (oi, obj) in objects.iter().enumerate() {
+                gpu.hip.memset(&y_c.buf, 0x7f, y_c.numel() * 4).map_err(err)?;
+                launch_obj(gpu, obj, &ws[0], xp, ycp, m, k, b)?;
+                gpu.hip.device_synchronize().map_err(err)?;
+                let got = gpu.download_raw_bytes(&y_c).map_err(err)?;
+                let d = diff(&got, &ref_bytes);
+                bad += d;
+                mism.push(d);
+                if d == 0 {
+                    timed.push(oi);
+                }
+            }
+            let ref_arm = |gpu: &mut Gpu| -> Result<Vec<f64>> {
+                graph_samples(gpu, reps, copies, |g, i| {
+                    launch_chunked_by(g, base, &ws[i % copies], xp, yrp, m, k, b, base_cap)
+                })
+            };
+            let mut ref_arms: Vec<Vec<f64>> = Vec::new();
+            let mut obj_arms: Vec<Vec<f64>> = Vec::new();
+            if !timed.is_empty() {
+                ref_arms.push(ref_arm(gpu)?);
+                for &oi in &timed {
+                    let obj = &objects[oi];
+                    obj_arms.push(graph_samples(gpu, reps, copies, |g, i| {
+                        launch_obj(g, obj, &ws[i % copies], xp, ycp, m, k, b)
+                    })?);
+                    ref_arms.push(ref_arm(gpu)?);
+                }
+            }
+            let ref_meds: Vec<f64> = ref_arms.iter().map(|a| stats(a).0).collect();
+            let pooled: Vec<f64> = ref_arms.iter().flatten().copied().collect();
+            let ref_json = if pooled.is_empty() {
+                serde_json::Value::Null
+            } else {
+                let (pm, p10, p90) = stats(&pooled);
+                let spread = ref_meds.iter().cloned().fold(f64::MIN, f64::max)
+                    - ref_meds.iter().cloned().fold(f64::MAX, f64::min);
+                json!({
+                    "arms": ref_arms.len(), "reps": reps, "arm_medians_us": ref_meds,
+                    "aa_spread_us": spread, "pooled_median_us": pm, "pooled_p10_us": p10,
+                    "pooled_p90_us": p90, "guard_overwritten_bytes": ref_guard_bad,
+                    "arm_replays_us": ref_arms,
+                })
+            };
+            let mut objs_json = Vec::new();
+            for (oi, obj) in objects.iter().enumerate() {
+                let mut e = json!({
+                    "object": obj.label, "sha256": obj.sha,
+                    "hw_bitwise": mism[oi] == 0, "mismatch_bytes": mism[oi],
+                    "timed": mism[oi] == 0,
+                });
+                if let Some(id) = &obj.id {
+                    e["id"] = json!(id);
+                }
+                if let Some(j) = timed.iter().position(|&t| t == oi) {
+                    let (med, p10, p90) = stats(&obj_arms[j]);
+                    e["median_us"] = json!(med);
+                    e["p10_us"] = json!(p10);
+                    e["p90_us"] = json!(p90);
+                    e["reps"] = json!(reps);
+                    e["ref_before_median_us"] = json!(ref_meds[j]);
+                    e["ref_after_median_us"] = json!(ref_meds[j + 1]);
+                    e["replays_us"] = json!(obj_arms[j]);
+                    println!(
+                        "  B={b} {}: {med:.2} us (p10 {p10:.2} p90 {p90:.2}) ref {:.2}/{:.2}",
+                        obj.label, ref_meds[j], ref_meds[j + 1]
+                    );
+                } else {
+                    println!("  B={b} {}: NOT TIMED, {} mismatching bytes", obj.label, mism[oi]);
+                }
+                objs_json.push(e);
+            }
+            cells.push(json!({"b": b, "ref": ref_json, "objects": objs_json}));
+        }
+        for t in ws {
+            gpu.free_tensor(t).map_err(err)?;
+        }
+        for t in [x, y_ref, y_c] {
+            gpu.free_tensor(t).map_err(err)?;
+        }
+        shapes_json.push(json!({
+            "m": m, "k": k, "weight_copies": copies, "weight_copies_formula": formula,
+            "copy_bytes": copy_bytes, "cells": cells,
+        }));
+    }
+    Ok((
+        json!({
+            "order": "ref,c1,ref,c2,...,ref", "reps": reps, "calls_per_replay": BENCH_CALLS,
+            "untimed_warm_replays": 3, "median": "sorted[len/2]",
+            "p10_p90": "linear-interpolated quantiles", "per_call_us_of_replay": true,
+            "ref": base.label, "ref_sha256": base.sha, "ref_rows": base.rows, "ref_cap": base_cap,
+            "shapes": shapes_json,
+        }),
+        bad,
+    ))
+}
+
+fn parse_u64(s: &str) -> u64 {
+    match s.strip_prefix("0x") {
+        Some(h) => u64::from_str_radix(h, 16),
+        None => s.parse(),
+    }
+    .unwrap_or_else(|_| panic!("bad integer {s}"))
+}
+
 /// Rows per block from an `r1`/`r2`/`r4` token of a file stem.
 fn rows_from_stem(stem: &str) -> Option<usize> {
     stem.split(|c: char| !c.is_ascii_alphanumeric())
@@ -733,6 +976,55 @@ fn main() {
     let rows: usize = flag("--rows").map_or(4, |v| v.parse().expect("--rows N"));
     let max_b: usize = flag("--max-b").map_or(8, |v| v.parse().expect("--max-b N"));
     let bench_reps: usize = flag("--bench-reps").map_or(15, |v| v.parse().expect("--bench-reps N"));
+    // rip-search flags; any of them selects schema v3 and the `inputs` record.
+    let manifest_path = flag("--manifest");
+    let interleave = args.iter().any(|a| a == "--interleave");
+    let seed_flag = flag("--seed").map(|v| parse_u64(&v));
+    let seed = seed_flag.unwrap_or(0x9E3779B97F4A7C15);
+    let baseline_cap_flag = flag("--baseline-cap").map(|v| parse_u64(&v) as usize);
+    let baseline_cap = baseline_cap_flag.unwrap_or(4);
+    let baseline_rows: usize = flag("--baseline-rows").map_or(4, |v| v.parse().expect("--baseline-rows N"));
+    let shape_args: Vec<(usize, usize)> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| *a == "--shape")
+        .map(|(i, _)| {
+            let v = args.get(i + 1).expect("--shape M,K");
+            let (m, k) = v.split_once(',').expect("--shape M,K");
+            (m.parse().expect("--shape M,K"), k.parse().expect("--shape M,K"))
+        })
+        .collect();
+    let b_list_arg: Option<Vec<usize>> = flag("--b-list").map(|v| {
+        v.split(',').map(|b| b.parse().expect("--b-list 1,2,4,8")).collect()
+    });
+    let new_flags = manifest_path.is_some()
+        || interleave
+        || seed_flag.is_some()
+        || baseline_cap_flag.is_some()
+        || !shape_args.is_empty()
+        || b_list_arg.is_some();
+    let b_list: Vec<usize> = b_list_arg.unwrap_or_else(|| (1..=max_b.min(8)).collect());
+    if b_list.is_empty() || b_list.iter().any(|&b| b == 0 || b > 8 || b > max_b) {
+        eprintln!("error: --b-list entries must be in 1..=min(8, --max-b)");
+        std::process::exit(2);
+    }
+    if interleave && !(do_bench && baseline_object.is_some()) {
+        eprintln!("error: --interleave requires --bench and --baseline-object PATH (the ref)");
+        std::process::exit(2);
+    }
+    if do_bench && !interleave && (!shape_args.is_empty() || b_list.len() != max_b.min(8)) {
+        eprintln!("error: --shape/--b-list with --bench require --interleave");
+        std::process::exit(2);
+    }
+    if baseline_cap == 0 || baseline_cap > 8 {
+        eprintln!("error: --baseline-cap must be in 1..=8");
+        std::process::exit(2);
+    }
+    let shapes: Vec<(usize, usize)> = if shape_args.is_empty() {
+        vec![(100276, 2560)]
+    } else {
+        shape_args.clone()
+    };
     let run = || -> Result<(serde_json::Value, usize)> {
         let mut gpu = Gpu::init().map_err(err)?;
         let mut rng = Rng(0x9E3779B97F4A7C15);
@@ -753,7 +1045,7 @@ fn main() {
             (100276, 2560),
         ]
         .into_iter()
-        .filter(|_| !no_oracle && sweep_dir.is_none())
+        .filter(|_| !no_oracle && sweep_dir.is_none() && manifest_path.is_none())
         {
             let a_bytes = weights(&mut rng, m, k);
             let a = gpu.upload_raw(&a_bytes, &[a_bytes.len()]).map_err(err)?;
@@ -807,7 +1099,7 @@ fn main() {
             gpu.free_tensor(y).map_err(err)?;
         }
         let pm_module = gpu.arch == "gfx1201";
-        if pm_module && !no_oracle && sweep_dir.is_none() && pm_cases.is_empty() {
+        if pm_module && !no_oracle && sweep_dir.is_none() && manifest_path.is_none() && pm_cases.is_empty() {
             return Err("gfx1201: the PeaceMaker module covered no case".into());
         }
         if let Some(manifest) = captures.as_deref() {
@@ -816,7 +1108,82 @@ fn main() {
         // Objects under test: --sweep-dir entries, else --object, else the shipped PM image.
         let mut objects: Vec<Obj> = Vec::new();
         let mut load_errors: Vec<serde_json::Value> = Vec::new();
-        if let Some(dir) = sweep_dir.as_deref() {
+        let mut manifest_sha = String::new();
+        let mut manifest_skipped: Vec<serde_json::Value> = Vec::new();
+        if let Some(mp) = manifest_path.as_deref() {
+            // rip-search manifest.tsv: tab separated, header line; `id`, `axes` (JSON with ROWS),
+            // `elf_sha256`, optional `symbol`. Objects: `<manifest dir>/objects/<id>.co`.
+            let raw = std::fs::read(mp).map_err(|e| format!("{mp}: {e}"))?;
+            manifest_sha = sha256_hex(&raw);
+            let text = String::from_utf8(raw).map_err(|e| format!("{mp}: {e}"))?;
+            let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+            let header: Vec<&str> = lines
+                .next()
+                .ok_or_else(|| format!("{mp}: empty manifest"))?
+                .split('\t')
+                .map(str::trim)
+                .collect();
+            let col = |n: &str| {
+                header
+                    .iter()
+                    .position(|h| *h == n)
+                    .ok_or_else(|| format!("{mp}: no `{n}` column"))
+            };
+            let (c_id, c_axes, c_sha) = (col("id")?, col("axes")?, col("elf_sha256")?);
+            let c_sym = header.iter().position(|h| *h == "symbol");
+            let dir = Path::new(mp).parent().unwrap_or(Path::new("."));
+            let mut seen: std::collections::HashMap<String, String> = Default::default();
+            for (n, line) in lines.enumerate() {
+                let f: Vec<&str> = line.split('\t').collect();
+                let get = |c: usize| f.get(c).copied().unwrap_or("").trim();
+                let (id, sha) = (get(c_id), get(c_sha));
+                if id.is_empty() || id.contains('/') || id.contains("..") {
+                    return Err(format!("{mp}: row {}: bad id {id:?}", n + 1));
+                }
+                if sha.is_empty() {
+                    manifest_skipped.push(json!({"id": id, "reason": "empty elf_sha256"}));
+                    continue;
+                }
+                if let Some(first) = seen.get(sha) {
+                    manifest_skipped.push(json!({"id": id, "reason": "dedup", "dedup_of": first}));
+                    continue;
+                }
+                let axes: serde_json::Value = serde_json::from_str(get(c_axes))
+                    .map_err(|e| format!("{mp}: {id}: axes: {e}"))?;
+                let r = match &axes["ROWS"] {
+                    serde_json::Value::Number(v) => v.as_u64().map(|v| v as usize),
+                    serde_json::Value::String(s) => s.parse().ok(),
+                    _ => None,
+                }
+                .ok_or_else(|| format!("{mp}: {id}: axes has no ROWS"))?;
+                let path = dir.join("objects").join(format!("{id}.co"));
+                let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                let got = sha256_hex(&bytes);
+                if got != sha {
+                    return Err(format!(
+                        "{}: sha256 {got} != manifest elf_sha256 {sha}; refusing to load",
+                        path.display()
+                    ));
+                }
+                seen.insert(sha.to_string(), id.to_string());
+                let sym = c_sym.map(get).filter(|s| !s.is_empty()).unwrap_or(&symbol);
+                match load_elf_obj(&gpu, id, &bytes, sym, r) {
+                    Ok(mut o) => {
+                        o.id = Some(id.to_string());
+                        o.axes = axes;
+                        objects.push(o);
+                    }
+                    Err(e) => {
+                        eprintln!("load failed {id}: {e}");
+                        bad_total += 1;
+                        load_errors.push(json!({"object": id, "error": e}));
+                    }
+                }
+            }
+            if objects.is_empty() {
+                return Err(format!("{mp}: no loadable object"));
+            }
+        } else if let Some(dir) = sweep_dir.as_deref() {
             let mut paths: Vec<_> = std::fs::read_dir(dir)
                 .map_err(|e| format!("{dir}: {e}"))?
                 .filter_map(|e| e.ok().map(|e| e.path()))
@@ -887,11 +1254,11 @@ fn main() {
             let path = baseline_object
                 .as_deref()
                 .ok_or("--bench requires --baseline-object PATH (the pre-change cap4 object)")?;
-            if flag("--baseline-rows").is_some_and(|v| v != "4") {
+            if !new_flags && baseline_rows != 4 {
                 return Err("the cap4 baseline must run with 4 rows per block".into());
             }
             let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-            Some(load_obj(&gpu, path, &bytes, &symbol, 4)?)
+            Some(load_elf_obj(&gpu, path, &bytes, &symbol, baseline_rows)?)
         } else {
             None
         };
@@ -901,14 +1268,20 @@ fn main() {
             let mut entry = json!({
                 "object": obj.label, "sha256": obj.sha, "rows": obj.rows, "max_b": max_b,
             });
+            if let Some(id) = &obj.id {
+                entry["id"] = json!(id);
+                entry["axes"] = obj.axes.clone();
+                entry["load_wrap"] = json!(obj.wrap);
+            }
             if !do_bench || !no_oracle {
-                match direct_cases(&mut gpu, obj, base.as_ref(), max_b) {
+                let shape_opt = (!shape_args.is_empty()).then_some(shape_args.as_slice());
+                match direct_cases(&mut gpu, obj, base.as_ref(), shape_opt, &b_list) {
                     Ok((dc, bad)) => {
                         bad_total += bad;
                         entry["direct_mismatch_bytes"] = json!(bad);
                         entry["direct_cases"] = json!(dc);
                     }
-                    Err(e) if sweep_dir.is_some() => {
+                    Err(e) if sweep_dir.is_some() || manifest_path.is_some() => {
                         bad_total += 1;
                         entry["error"] = json!(e);
                         object_json.push(entry);
@@ -917,7 +1290,7 @@ fn main() {
                     Err(e) => return Err(e),
                 }
             }
-            if let (true, Some(base)) = (do_bench, base.as_ref()) {
+            if let (true, Some(base)) = (do_bench && !interleave, base.as_ref()) {
                 let (t, bad) = bench_table(&mut gpu, obj, base, bench_reps)?;
                 bad_total += bad;
                 if objects.len() == 1 {
@@ -927,16 +1300,56 @@ fn main() {
             }
             object_json.push(entry);
         }
-        Ok((
-            json!({
-                "bench": bench_json,
-                "schema": "mq2-xbatch-oracle-v2", "arch": gpu.arch,
-                "pm_image_sha256": rdna_compute::kernels::GEMV_MQ2_XBATCH_PM_GFX1201_SHA256,
-                "objects": object_json, "load_errors": load_errors,
-                "cases": cases, "pm_cases": pm_cases, "mismatch_bytes_total": bad_total,
-            }),
-            bad_total,
-        ))
+        let mut interleave_json = serde_json::Value::Null;
+        if let (true, Some(base)) = (interleave, base.as_ref()) {
+            let (t, bad) = interleave_bench(
+                &mut gpu, &objects, base, baseline_cap, &shapes, &b_list, bench_reps, seed,
+            )?;
+            bad_total += bad;
+            interleave_json = t;
+        }
+        let mut result = json!({
+            "bench": bench_json,
+            "schema": if new_flags { "mq2-xbatch-oracle-v3" } else { "mq2-xbatch-oracle-v2" },
+            "arch": gpu.arch,
+            "pm_image_sha256": rdna_compute::kernels::GEMV_MQ2_XBATCH_PM_GFX1201_SHA256,
+            "objects": object_json, "load_errors": load_errors,
+            "cases": cases, "pm_cases": pm_cases, "mismatch_bytes_total": bad_total,
+        });
+        if new_flags {
+            let pci = gpu.hip.device_pci_bus_id(gpu.device_id).ok();
+            let sysfs = |leaf: &str| {
+                pci.as_ref().and_then(|p| {
+                    std::fs::read_to_string(format!("/sys/bus/pci/devices/{}/{leaf}", p.to_lowercase()))
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                })
+            };
+            result["inputs"] = json!({
+                "manifest": manifest_path, "manifest_sha256": manifest_sha,
+                "manifest_skipped": manifest_skipped,
+                "objects": objects.iter().map(|o| json!({
+                    "id": o.id, "object": o.label, "sha256": o.sha, "rows": o.rows,
+                    "axes": o.axes, "load_wrap": o.wrap,
+                })).collect::<Vec<_>>(),
+                "baseline": base.as_ref().map(|b| json!({
+                    "object": b.label, "sha256": b.sha, "rows": b.rows, "cap": baseline_cap,
+                })),
+                "shapes": shapes.iter().map(|&(m, k)| {
+                    let (formula, copies) = copies_for(m, k);
+                    json!({"m": m, "k": k, "weight_copies": copies, "weight_copies_formula": formula})
+                }).collect::<Vec<_>>(),
+                "b_list": b_list, "max_b": max_b, "reps": bench_reps, "seed": seed,
+                "calls_per_replay": BENCH_CALLS, "interleave": interleave,
+                "device": {
+                    "arch": gpu.arch, "device_id": gpu.device_id, "pci_bus_id": pci,
+                    "pci_vendor": sysfs("vendor"), "pci_device": sysfs("device"),
+                    "pci_revision": sysfs("revision"), "product_name": sysfs("product_name"),
+                },
+            });
+            result["interleave"] = interleave_json;
+        }
+        Ok((result, bad_total))
     };
     match run() {
         Ok((value, bad)) => {
