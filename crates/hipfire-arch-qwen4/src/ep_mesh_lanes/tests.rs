@@ -1741,3 +1741,108 @@ fn mesh_lane_ep_device_step_aborts_when_the_owner_withholds_the_lent_draws() {
     let error = result.expect_err("missing device draws must abort");
     assert!(matches!(error, ProtocolError::Aborted(_)), "{error}");
 }
+
+/// `s4_round_shape` inputs: op `i` is owned by `owners[i]` (`None` = replicated).
+fn s4_lanes(owners: &[Option<usize>]) -> Vec<(Option<usize>, bool)> {
+    owners.iter().map(|&o| (o, false)).collect()
+}
+
+#[test]
+fn s4_round_a_lone_op_keeps_its_path() {
+    for owner in [None, Some(0), Some(1)] {
+        assert_eq!(
+            s4_round_shape(&s4_lanes(&[owner]), 0, |_| true),
+            None,
+            "{owner:?}"
+        );
+    }
+    assert_eq!(s4_round_shape(&[], 0, |_| true), None);
+}
+
+#[test]
+fn s4_round_with_a_replicated_lane_keeps_its_path() {
+    let mixed = [Some(0), None, Some(1)];
+    for rank in 0..2 {
+        assert_eq!(s4_round_shape(&s4_lanes(&mixed), rank, |_| true), None);
+        assert_eq!(
+            s4_round_shape(&s4_lanes(&[None, None]), rank, |_| true),
+            None
+        );
+        assert_eq!(
+            s4_round_shape(&s4_lanes(&[Some(1), Some(0), None]), rank, |_| true),
+            None
+        );
+    }
+    // A head rank outside the two X2 ranks is not an S4 round either.
+    assert_eq!(
+        s4_round_shape(&s4_lanes(&[Some(0), Some(2)]), 0, |_| true),
+        None
+    );
+}
+
+#[test]
+fn s4_round_of_mixed_owners_is_the_same_round_on_both_ranks_with_each_ranks_rows() {
+    // Owners by op order 0,1,1,0,1: owners mask bits 2, 4 and 1 set.
+    let lanes = s4_lanes(&[Some(0), Some(1), Some(1), Some(0), Some(1)]);
+    let r0 = s4_round_shape(&lanes, 0, |_| true).expect("rank 0 round");
+    let r1 = s4_round_shape(&lanes, 1, |_| true).expect("rank 1 round");
+    assert_eq!((r0.g, r0.owners), (5, 0b10110));
+    assert_eq!((r1.g, r1.owners), (r0.g, r0.owners));
+    assert_eq!((r0.rank, r1.rank), (0, 1));
+    assert_eq!(r0.own_rows().as_slice(), &[0, 3]);
+    assert_eq!(r1.own_rows().as_slice(), &[1, 2, 4]);
+}
+
+#[test]
+fn s4_round_takes_two_to_eight_ops_only() {
+    for ops in 2..=8usize {
+        let lanes = s4_lanes(&vec![Some(0); ops]);
+        let round = s4_round_shape(&lanes, 0, |_| true).expect("two..=eight ops");
+        assert_eq!((round.g, round.owners), (ops, 0));
+    }
+    let nine = s4_lanes(&vec![Some(1); 9]);
+    assert_eq!(s4_round_shape(&nine, 1, |_| true), None);
+    // Eight ops owned by rank 1 fill every mask bit.
+    let full = s4_round_shape(&s4_lanes(&[Some(1); 8]), 1, |_| true).unwrap();
+    assert_eq!(full.owners, 0xFF);
+    assert_eq!(full.own_rows().len(), 8);
+}
+
+#[test]
+fn s4_round_with_a_participant_that_owns_no_row_still_runs() {
+    // Every op belongs to rank 0: rank 1 owns zero rows and still takes part (it
+    // joins both crossings with an empty own set), so the round exists for it.
+    let lanes = s4_lanes(&[Some(0), Some(0), Some(0)]);
+    let r1 = s4_round_shape(&lanes, 1, |_| true).expect("participant round");
+    assert_eq!((r1.g, r1.owners, r1.rank), (3, 0, 1));
+    assert!(r1.own_rows().is_empty());
+    let r0 = s4_round_shape(&lanes, 0, |_| true).expect("owner round");
+    assert_eq!(r0.own_rows().as_slice(), &[0, 1, 2]);
+    // And the mirror: rank 0 owns nothing when rank 1 owns all.
+    let lanes = s4_lanes(&[Some(1), Some(1)]);
+    assert!(s4_round_shape(&lanes, 0, |_| true)
+        .unwrap()
+        .own_rows()
+        .is_empty());
+}
+
+#[test]
+fn s4_round_asks_the_batched_head_whether_any_op_reads_a_distribution() {
+    let mut lanes = s4_lanes(&[Some(0), Some(1)]);
+    let mut seen = Vec::new();
+    assert_eq!(
+        s4_round_shape(&lanes, 0, |any_read| {
+            seen.push(any_read);
+            false
+        }),
+        None,
+        "a round the batched head refuses keeps its path"
+    );
+    lanes[1].1 = true;
+    assert!(s4_round_shape(&lanes, 0, |any_read| {
+        seen.push(any_read);
+        true
+    })
+    .is_some());
+    assert_eq!(seen, [false, true]);
+}

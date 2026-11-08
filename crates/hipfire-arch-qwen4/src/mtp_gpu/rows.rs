@@ -557,9 +557,10 @@ impl Qwen4MtpGpu {
                 "batched MTP head rounds need {MTP_DRAFT_ROUNDS_ENV}=1"
             )));
         }
-        if !(2..=MTP_DRAFT_LANES_MAX).contains(&n) {
+        let min_rows = if self.s4_round.is_some() { 1 } else { 2 };
+        if !(min_rows..=MTP_DRAFT_LANES_MAX).contains(&n) {
             return Err(invalid(format!(
-                "a batched MTP head round takes 2..={MTP_DRAFT_LANES_MAX} lanes, got {n}"
+                "a batched MTP head round takes {min_rows}..={MTP_DRAFT_LANES_MAX} lanes, got {n}"
             )));
         }
         if top1_out.dtype != DType::Raw || top1_out.byte_size() < n * Gpu::TOPK8_OUT_BYTES {
@@ -578,8 +579,19 @@ impl Qwen4MtpGpu {
             ep_bound,
             moe_steps,
             lane_local,
+            s4_round,
+            s4_owners,
             ..
         } = self;
+        let s4 = *s4_round;
+        if let Some(s4) = s4 {
+            if s4.own_rows().len() != n {
+                return Err(invalid(format!(
+                    "sharded MoE pass: this rank owns {} of the round's rows, the call carries {n}",
+                    s4.own_rows().len()
+                )));
+            }
+        }
         let rs = rows_scratch.as_mut().ok_or_else(|| {
             invalid(format!(
                 "MTP rows scratch is not allocated: set {MTP_DRAFT_ROUNDS_ENV}=1 (MoE head) before load"
@@ -768,7 +780,12 @@ impl Qwen4MtpGpu {
             // role of the EP call) with the no-op row gather and leaves `j`
             // alone, so replicated calls keep their parity in lockstep.
             let mut local_hook: Option<LaneLocalRowGather<'_>> = None;
-            let moe_ep: Option<(usize, &GpuTensor, &dyn MoeRowGather)> = if *ep_bound {
+            // A sharded-MoE pass (S4) runs its MoE as the replicated call over
+            // all the round's rows after the pre-MoE steps (below): no MoE is
+            // sealed or counted here.
+            let moe_ep: Option<(usize, &GpuTensor, &dyn MoeRowGather)> = if *ep_bound
+                && s4.is_none()
+            {
                 let ep = ep
                     .ok_or_else(|| invalid("an EP MTP head step needs the forward's row gather"))?;
                 let parity = (*moe_steps % 2) as usize;
@@ -790,15 +807,19 @@ impl Qwen4MtpGpu {
                 moe_ep.map_or(&rs.moe_down_expanded, |(_, buffer, _)| buffer),
                 &view.router_logits,
             );
-            let sealed = seal_moe_rows(
-                &ctx,
-                config,
-                moe_ep.map_or(0, |(layer, _, _)| layer),
-                runtime,
-                n,
-                &layer_scratch,
-                moe_ep.map(|(_, _, hook)| (hook, &rs.moe_down_expanded)),
-            )?;
+            let sealed = if s4.is_none() {
+                Some(seal_moe_rows(
+                    &ctx,
+                    config,
+                    moe_ep.map_or(0, |(layer, _, _)| layer),
+                    runtime,
+                    n,
+                    &layer_scratch,
+                    moe_ep.map(|(_, _, hook)| (hook, &rs.moe_down_expanded)),
+                )?)
+            } else {
+                None
+            };
             let mut steps: SmallVec<[Step<'_>; 16]> = SmallVec::new();
             push_head_rows_front(
                 &mut steps,
@@ -817,29 +838,66 @@ impl Qwen4MtpGpu {
                 steps.push(Step::IndexedAttention(attention));
             }
             steps.extend(out_proj.map(Step::IndexedAttention));
-            push_head_rows_back(
-                &mut steps,
-                config,
-                &tensors,
-                n,
-                &attn.write,
-                &mlp.read,
-                &mlp.write,
-                &final_read,
-                Some(MtpFfnCall::Moe(sealed)),
-                true,
-            );
-            validate_steps(gpu, &steps)?;
-            execute_validated_steps(gpu, &ctx, &steps)?;
-            #[cfg(feature = "lab")]
-            lab_expert_trace::record(
-                gpu,
-                &rs.moe_topk_indices,
-                n,
-                config.num_experts_per_tok,
-                weights.ep_placement(),
-                local,
-            )?;
+            if let Some(s4) = s4 {
+                // Steps up to the MLP HC read, then the activation all-gather and
+                // the global MoE pass, then the steps after the FFN.
+                push_head_rows_pre_ffn(&mut steps, config, &tensors, n, &attn.write, &mlp.read);
+                validate_steps(gpu, &steps)?;
+                execute_validated_steps(gpu, &ctx, &steps)?;
+                let ep =
+                    ep.ok_or_else(|| invalid("a sharded MoE pass needs the forward's row gather"))?;
+                let owners = s4_owners
+                    .as_ref()
+                    .ok_or_else(|| invalid("a sharded MoE pass needs the slot-owner table"))?;
+                Self::s4_moe_pass(gpu, config, runtime, rs, owners, ep, moe_steps, s4, n)?;
+                let mut post: SmallVec<[Step<'_>; 16]> = SmallVec::new();
+                push_head_rows_post_ffn(
+                    &mut post,
+                    config,
+                    &tensors,
+                    n,
+                    &mlp.write,
+                    &final_read,
+                    true,
+                );
+                validate_steps(gpu, &post)?;
+                execute_validated_steps(gpu, &ctx, &post)?;
+                #[cfg(feature = "lab")]
+                lab_expert_trace::record(
+                    gpu,
+                    &rs.moe_topk_indices,
+                    s4.g,
+                    config.num_experts_per_tok,
+                    weights.ep_placement(),
+                    false,
+                )?;
+            } else {
+                let sealed = sealed
+                    .ok_or_else(|| invalid("a batched head round without a sealed MoE call"))?;
+                push_head_rows_back(
+                    &mut steps,
+                    config,
+                    &tensors,
+                    n,
+                    &attn.write,
+                    &mlp.read,
+                    &mlp.write,
+                    &final_read,
+                    Some(MtpFfnCall::Moe(sealed)),
+                    true,
+                );
+                validate_steps(gpu, &steps)?;
+                execute_validated_steps(gpu, &ctx, &steps)?;
+                #[cfg(feature = "lab")]
+                lab_expert_trace::record(
+                    gpu,
+                    &rs.moe_topk_indices,
+                    n,
+                    config.num_experts_per_tok,
+                    weights.ep_placement(),
+                    local,
+                )?;
+            }
             lengths
         };
 
@@ -860,6 +918,186 @@ impl Qwen4MtpGpu {
             gpu.copy_d2d(&source, &lane.state.wide_hidden, wide_bytes)?;
             lane.state.commit_step(lengths[row]);
         }
+        Ok(())
+    }
+}
+
+/// Copy rows `(src_row, dst_row)` between two row-major tensors of `row_bytes`
+/// rows (distinct allocations): every maximal run of constant source and
+/// destination strides is one pitched device copy.
+fn copy_row_pairs(
+    gpu: &Gpu,
+    src: &GpuTensor,
+    dst: &GpuTensor,
+    pairs: &[(usize, usize)],
+    row_bytes: usize,
+) -> Result<(), MtpGpuError> {
+    let mut at = 0;
+    while at < pairs.len() {
+        let (src0, dst0) = pairs[at];
+        let (src_stride, dst_stride) = match pairs.get(at + 1) {
+            Some(&(s, d)) if s > src0 && d > dst0 => (s - src0, d - dst0),
+            _ => (1, 1),
+        };
+        let mut len = 1;
+        while let Some(&(s, d)) = pairs.get(at + len) {
+            let (prev_s, prev_d) = pairs[at + len - 1];
+            if s.checked_sub(prev_s) == Some(src_stride)
+                && d.checked_sub(prev_d) == Some(dst_stride)
+            {
+                len += 1;
+            } else {
+                break;
+            }
+        }
+        gpu.memcpy_dtod_2d_at_ordered_async(
+            &dst.buf,
+            dst0 * row_bytes,
+            dst_stride * row_bytes,
+            &src.buf,
+            src0 * row_bytes,
+            src_stride * row_bytes,
+            row_bytes,
+            len,
+        )?;
+        at += len;
+    }
+    Ok(())
+}
+
+impl Qwen4MtpGpu {
+    /// The MoE of one sharded draft pass (S4), the same call on every rank
+    /// whatever its own row count: the rank's own rows (`own_rows` of them, rows
+    /// `0..own_rows` of the rows scratch's MLP HC read output) are copied into
+    /// an EP gather buffer at their global slots, all-gathered through the
+    /// forward's row-gather hook (`gather_rows` over slot owners `ExpertModulo`
+    /// on the round's owner table: the unchanged bit-exact owner-slot copy), and
+    /// the replicated EP head MoE call (layer index and buffer `2 + parity`,
+    /// `moe_steps` advanced once) runs over the `s4.g` global rows; this rank's
+    /// rows of its output are copied to the rows scratch's FFN output.
+    ///
+    /// The staging buffer is the first of gather buffers 0 and 1 that is not the
+    /// rank's previous invocation's, so the transport's no-same-buffer-twice
+    /// hazard rule holds for the activation crossing and for the MoE crossing
+    /// that follows it (buffer `2 + parity`).
+    #[allow(clippy::too_many_arguments)]
+    fn s4_moe_pass(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        runtime: &Qwen4MoeLayerRuntime,
+        rs: &MtpRowsScratch,
+        owners: &GpuTensor,
+        ep: MtpEpGather<'_>,
+        moe_steps: &mut u64,
+        s4: S4Round,
+        own_rows: usize,
+    ) -> Result<(), MtpGpuError> {
+        let hidden = config.hidden_size;
+        let row_bytes = hidden * std::mem::size_of::<f32>();
+        let g = s4.g;
+        let own = s4.own_rows();
+        if own.len() != own_rows || s4.rank >= 2 || !(2..=MTP_DRAFT_LANES_MAX).contains(&g) {
+            return Err(invalid(format!(
+                "sharded MoE pass of {g} rows: rank {} owns {} rows, the call holds {own_rows}",
+                s4.rank,
+                own.len()
+            )));
+        }
+        let stage = ep.buffers[usize::from(ep.hook.last_gather_buffer() == Some(0))];
+        let parity = (*moe_steps % 2) as usize;
+        let layer = config.num_hidden_layers + parity;
+        let pack: SmallVec<[(usize, usize); MTP_DRAFT_LANES_MAX]> =
+            own.iter().enumerate().map(|(i, &s)| (i, s)).collect();
+        copy_row_pairs(gpu, &rs.hc_mixed, stage, &pack, row_bytes)?;
+        let offset = usize::from(s4.owners) * 8 * std::mem::size_of::<i32>();
+        let slot_owners = GpuTensor {
+            buf: owners.buf.byte_view(offset, 8 * std::mem::size_of::<i32>()),
+            shape: vec![8],
+            dtype: DType::Raw,
+        };
+        ep.hook
+            .gather_rows(gpu, layer as u16, g, stage, &slot_owners)
+            .map_err(|error| invalid(format!("sharded MoE activation gather: {error}")))?;
+        let x = stage.sub_offset(0, g * hidden);
+        let view = rs.view(g, config)?;
+        let mut layer_scratch = rs.layer_scratch(ep.buffers[2 + parity], &view.router_logits);
+        layer_scratch.hc_mixed = &x;
+        layer_scratch.ffn_output = &rs.projected_embedding;
+        *moe_steps = moe_steps.wrapping_add(1);
+        let ctx = DispatchCtx::new(gpu);
+        let sealed = seal_moe_rows(
+            &ctx,
+            config,
+            layer,
+            runtime,
+            g,
+            &layer_scratch,
+            Some((ep.hook as &dyn MoeRowGather, &rs.moe_down_expanded)),
+        )?;
+        let mut steps: SmallVec<[Step<'_>; 16]> = SmallVec::new();
+        steps.push(Step::Clear(ClearOp {
+            tensor: &rs.projected_embedding,
+            elements: g * hidden,
+        }));
+        steps.push(Step::Moe(sealed));
+        validate_steps(gpu, &steps)?;
+        execute_validated_steps(gpu, &ctx, &steps)?;
+        let back: SmallVec<[(usize, usize); MTP_DRAFT_LANES_MAX]> =
+            own.iter().enumerate().map(|(i, &s)| (s, i)).collect();
+        copy_row_pairs(
+            gpu,
+            &rs.projected_embedding,
+            &rs.ffn_output,
+            &back,
+            row_bytes,
+        )
+    }
+
+    /// A sharded draft pass on a rank that owns none of its rows: the
+    /// activation all-gather and the global MoE call with an empty own set
+    /// (the round's `S4Round` must be set). Writes no head state.
+    pub(crate) fn s4_participate(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+        ep: Option<MtpEpGather<'_>>,
+    ) -> Result<(), MtpGpuError> {
+        let config = config.mtp_geometry();
+        let Some(s4) = self.s4_round else {
+            return Err(invalid(
+                "a sharded MoE participant call outside a sharded pass",
+            ));
+        };
+        let mtp = bound_mtp(weights)?;
+        let Self {
+            moe,
+            rows,
+            moe_steps,
+            s4_owners,
+            ..
+        } = self;
+        let runtime = match (&mtp.ffn, moe.as_ref()) {
+            (Qwen4FfnWeights::Moe(_), Some(runtime)) => runtime,
+            _ => return Err(invalid("a sharded MoE pass needs the MoE head")),
+        };
+        let rs = rows
+            .as_ref()
+            .ok_or_else(|| invalid("a sharded MoE pass needs the rows scratch"))?;
+        let owners = s4_owners
+            .as_ref()
+            .ok_or_else(|| invalid("a sharded MoE pass needs the slot-owner table"))?;
+        let ep = ep.ok_or_else(|| invalid("a sharded MoE pass needs the forward's row gather"))?;
+        Self::s4_moe_pass(gpu, config, runtime, rs, owners, ep, moe_steps, s4, 0)?;
+        #[cfg(feature = "lab")]
+        lab_expert_trace::record(
+            gpu,
+            &rs.moe_topk_indices,
+            s4.g,
+            config.num_experts_per_tok,
+            weights.ep_placement(),
+            false,
+        )?;
         Ok(())
     }
 }

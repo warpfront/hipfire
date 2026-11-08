@@ -1628,6 +1628,15 @@ pub trait MoeRowGather {
     ) {
     }
 
+    /// Buffer index (of the transport's registered gather buffers) of this
+    /// rank's most recent row-gather invocation, `None` before the first or
+    /// when the hook has no such notion. The sharded draft-head MoE pass (S4)
+    /// picks its activation-exchange buffer to differ from it, so the
+    /// transport's no-same-buffer-twice hazard rule holds. `None` by default.
+    fn last_gather_buffer(&self) -> Option<usize> {
+        None
+    }
+
     /// End of one decode window (a trunk forward over every lane's rows) on this
     /// rank, after its D2H sync and before the next window's launches: the D2
     /// expert tail retires the window here. No-op by default.

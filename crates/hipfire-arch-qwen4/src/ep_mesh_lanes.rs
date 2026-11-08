@@ -101,9 +101,9 @@ use crate::lane_exec::pick_at;
 use crate::mesh_lane_protocol::SamplingMode;
 use crate::mesh_lane_protocol::{ep_draft_split_enabled, heads_lane};
 use crate::mesh_lane_protocol::{
-    AbortRecord, AcceptRule, CommitDecision, ControllerInterval, DevicePick, DraftProposal,
-    DraftRound, EvidenceError, HeadAppend, HeadEnd, HeadState, LaneAdmission, LaneAdmit,
-    LaneDecision, LaneKind, LaneMeshExecutor, LanePlan, LaneRequest, LaneWindowKey,
+    AbortRecord, AcceptRule, CommitDecision, ControllerInterval, DevicePick, DraftOp,
+    DraftProposal, DraftRound, EvidenceError, HeadAppend, HeadEnd, HeadState, LaneAdmission,
+    LaneAdmit, LaneDecision, LaneKind, LaneMeshExecutor, LanePlan, LaneRequest, LaneWindowKey,
     MergedCostEvidence, MeshRoot, MeshStepKey, OpCounts, OpLedger, PhaseTiming, PreparedReceipt,
     ProposalSource, ProtocolError, RankCostEvidence, RankDraftResult, RankError, RankOwnership,
     RankReady, RankSession, RankVerifyResult, ReadyStatus, RootConfig, SamplerOutput, StagePolicy,
@@ -114,6 +114,7 @@ use crate::mesh_rank_copy::{
     native_keep_cap, prepare_rank_lane, probe_outcome, publish_rank_lane, save_probe_state,
     settle_probe, take_head_ticket, HeadTicketPoint, RankPrepare,
 };
+use crate::mtp_gpu::S4Round;
 use crate::mtp_lanes::lane_call;
 use crate::mtp_spec::{
     draft_accept_estimate, HeadTicket, TargetTicket, DRAFT_ACCEPT_MAX, MTP_ROW_WORTH,
@@ -128,6 +129,7 @@ use hipfire_runtime::slot_batch::RequestEpoch;
 use hipfire_runtime::spec::SpecRequestConfig;
 use rdna_compute::tensor_ops::ArgmaxPairMerge;
 use rdna_compute::{Gpu, GpuTensor};
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -234,6 +236,66 @@ fn rank_decision<'a>(d: &'a LaneDecision, view: &LanePlan) -> Cow<'a, LaneDecisi
 /// one.
 fn answers_op(plan: &LanePlan, sampler: bool) -> bool {
     plan.head_rank.is_some() || sampler
+}
+
+/// The sharded-MoE pass (S4, `HIPFIRE_QWEN4_DRAFT_SHARDED_MOE`) of a draft
+/// round, decided from the root's whole round and the plan alone so every rank
+/// decides alike (`rank` only names this rank's share): the switch and the S4
+/// head tables are on, the round holds two to eight ops, every op is a lane one
+/// of two ranks owns (X2), and the round is one batched head call
+/// ([`crate::mtp_lanes::draft_round_batchable`] over the whole round). Any other
+/// round (a lone op, replicated lanes) keeps its X2 / replicated path unchanged.
+fn s4_round_for<'a>(
+    bundle: &Qwen4Bundle,
+    ops: &[DraftOp],
+    plan_of: impl Fn(&LaneWindowKey) -> Option<&'a LanePlan>,
+    rank: usize,
+) -> R<Option<S4Round>> {
+    if !crate::mtp_gpu::draft_sharded_moe_enabled()
+        || !bundle.mtp_s4_ready()
+        || !(2..=crate::mtp_gpu::MTP_DRAFT_LANES_MAX).contains(&ops.len())
+    {
+        return Ok(None);
+    }
+    let mut lanes: SmallVec<[(Option<usize>, bool); crate::mtp_gpu::MTP_DRAFT_LANES_MAX]> =
+        SmallVec::new();
+    for op in ops {
+        let plan =
+            plan_of(&op.key).ok_or_else(|| "draft op for a lane outside the plan".to_string())?;
+        lanes.push((plan.head_rank, plan.wants_candidate_read()));
+    }
+    Ok(s4_round_shape(&lanes, rank, |any_read| {
+        crate::mtp_lanes::draft_round_batchable(bundle, lanes.len(), any_read)
+    }))
+}
+
+/// The host-only part of [`s4_round_for`]: `lanes` holds each op's
+/// `(head_rank, wants_candidate_read)` in the root's op order. `None` unless the
+/// round holds two to eight ops, every op has an X2 owner (`head_rank` 0 or 1;
+/// a replicated lane, `None`, keeps the round on its unchanged path) and
+/// `batchable(any_candidate_read)` holds. Otherwise `owners` carries op `s`'s
+/// owner in bit `s`.
+fn s4_round_shape(
+    lanes: &[(Option<usize>, bool)],
+    rank: usize,
+    batchable: impl FnOnce(bool) -> bool,
+) -> Option<S4Round> {
+    if !(2..=crate::mtp_gpu::MTP_DRAFT_LANES_MAX).contains(&lanes.len()) {
+        return None;
+    }
+    let (mut owners, mut any_read) = (0u8, false);
+    for (slot, &(head_rank, wants_read)) in lanes.iter().enumerate() {
+        match head_rank {
+            Some(owner) if owner < 2 => owners |= (owner as u8) << slot,
+            _ => return None,
+        }
+        any_read |= wants_read;
+    }
+    batchable(any_read).then_some(S4Round {
+        g: lanes.len(),
+        owners,
+        rank,
+    })
 }
 
 struct ExecStep {
@@ -634,7 +696,12 @@ impl RankLane<'_> {
     /// Draft op), then every op's deferred head step in the root's order, one
     /// download for all of them and the head's own parse of each. Returns the
     /// catch-up rows appended and the reads per op.
-    fn draft_round_device(&mut self, round: &DraftRound, sampler: bool) -> R<(usize, Vec<OpRead>)> {
+    fn draft_round_device(
+        &mut self,
+        round: &DraftRound,
+        sampler: bool,
+        s4: Option<S4Round>,
+    ) -> R<(usize, Vec<OpRead>)> {
         let Self {
             exec, bundle, gpu, ..
         } = self;
@@ -678,6 +745,22 @@ impl RankLane<'_> {
                 }
             }
             if round.ops.is_empty() {
+                // A sharded-MoE pass (S4) is a collective: a rank that owns none of
+                // its rows still runs the activation all-gather and the global MoE
+                // call, in lockstep with the peer.
+                if let Some(s4) = s4 {
+                    bundle
+                        .mtp_set_s4_round(Some(s4))
+                        .map_err(|e| format!("sharded MoE mode: {e}"))?;
+                    let ran = bundle
+                        .mtp_s4_participate(gpu)
+                        .map_err(|e| format!("sharded MoE participant: {e}"));
+                    let off = bundle
+                        .mtp_set_s4_round(None)
+                        .map_err(|e| format!("sharded MoE mode off: {e}"));
+                    ran?;
+                    off?;
+                }
                 return Ok((catch_rows, Vec::new()));
             }
             // The round's ops are every op this rank executes: all owned by this
@@ -685,13 +768,19 @@ impl RankLane<'_> {
             // owned round runs the head lane-local (the full-table MoE runtime:
             // no crossing, no `moe_steps` advance); the mode is restored on every
             // path out.
-            let lane_local = round.ops.iter().try_fold(false, |any, op| {
-                Ok::<_, String>(any || plan_of(&op.key)?.head_rank.is_some())
-            })?;
+            let lane_local = s4.is_none()
+                && round.ops.iter().try_fold(false, |any, op| {
+                    Ok::<_, String>(any || plan_of(&op.key)?.head_rank.is_some())
+                })?;
             if lane_local {
                 bundle
                     .mtp_set_lane_local(true)
                     .map_err(|e| format!("head lane-local mode: {e}"))?;
+            }
+            if let Some(s4) = s4 {
+                bundle
+                    .mtp_set_s4_round(Some(s4))
+                    .map_err(|e| format!("sharded MoE mode: {e}"))?;
             }
             let ran = (|| -> R<Vec<OpRead>> {
                 let epochs: Vec<RequestEpoch> =
@@ -718,6 +807,7 @@ impl RankLane<'_> {
                 // (no effect on the lanes; armed by env only, `lab` builds only).
                 #[cfg(feature = "lab")]
                 if crate::lab_draft_rounds::probe_enabled()
+                    && s4.is_none()
                     && round.ops.len() >= 2
                     && !round.ops.iter().try_fold(false, |any, op| {
                         Ok::<_, String>(any || is_probe_op(plan_of(&op.key)?, op.position))
@@ -755,11 +845,12 @@ impl RankLane<'_> {
                     let plan = plan_of(&op.key)?;
                     Ok::<_, String>(any || plan.wants_candidate_read())
                 })?;
-                let batched = crate::mtp_lanes::draft_round_batchable(
-                    bundle,
-                    round.ops.len(),
-                    any_distribution_read,
-                );
+                let batched = s4.is_some()
+                    || crate::mtp_lanes::draft_round_batchable(
+                        bundle,
+                        round.ops.len(),
+                        any_distribution_read,
+                    );
                 let chunks =
                     draft_read_plan(want_read_any, bundle.mtp_draft_rescored(), round.ops.len())
                         .chunks(round.ops.len());
@@ -919,6 +1010,14 @@ impl RankLane<'_> {
                 }
                 Ok(reads)
             })();
+            if s4.is_some() {
+                let off = bundle
+                    .mtp_set_s4_round(None)
+                    .map_err(|e| format!("sharded MoE mode off: {e}"));
+                let reads = ran?;
+                off?;
+                return Ok((catch_rows, reads));
+            }
             if lane_local {
                 let off = bundle
                     .mtp_set_lane_local(false)
@@ -1379,10 +1478,29 @@ impl LaneMeshExecutor for RankLane<'_> {
                 ),
             ));
         }
+        let s4 = {
+            let step = self
+                .exec
+                .step
+                .as_ref()
+                .ok_or_else(|| rank_err(rank, "draft round without a begun window"))?;
+            s4_round_for(
+                &*self.bundle,
+                &round.ops,
+                |key| {
+                    step.lanes
+                        .iter()
+                        .find(|w| w.plan.key == *key)
+                        .map(|w| &w.plan)
+                },
+                rank,
+            )
+            .map_err(|e| rank_err(rank, e))?
+        };
         let before = gather_tally();
         let t0 = Instant::now();
         let (catch_rows, reads) = self
-            .draft_round_device(&exec_round, sampler)
+            .draft_round_device(&exec_round, sampler, s4)
             .map_err(|e| rank_err(rank, e))?;
         let tally = gather_tally().since(before);
         if catch_rows != result.catch_up_rows {
@@ -1405,7 +1523,10 @@ impl LaneMeshExecutor for RankLane<'_> {
         };
         step.head_calls += exec_round.ops.len();
         step.catch_up_rows += catch_rows;
-        result.head_gathers = tally.head as usize;
+        // A sharded-MoE pass crosses twice per pass (activation rows, then the
+        // MoE's own slot rows) for an owned op; the reducer's head-gather count
+        // is of replicated ops, of which an owned round has none.
+        result.head_gathers = if s4.is_some() { 0 } else { tally.head as usize };
         let mut proposals = Vec::with_capacity(exec_round.ops.len());
         #[cfg(feature = "lab")]
         let mut traced: Vec<serde_json::Value> = Vec::new();
@@ -1450,6 +1571,7 @@ impl LaneMeshExecutor for RankLane<'_> {
                 "keep_going": keep_going,
                 "drop_last": drop_last,
                 "owned": win.plan.head_rank.is_some(),
+                "s4": s4.is_some(),
             }));
             proposals.push(DraftProposal {
                 key: op.key,

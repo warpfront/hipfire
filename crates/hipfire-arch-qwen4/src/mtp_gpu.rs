@@ -60,6 +60,42 @@ const MTP_HC_ROWS: usize = 1;
 /// (`LANE_MAX_DRAFTS` is 7).
 pub(crate) const MTP_DRAFT_LANES_MAX: usize = 8;
 
+/// `HIPFIRE_QWEN4_DRAFT_SHARDED_MOE` (developer; default on, exactly `0`
+/// disables and restores the X2 / replicated path byte for byte): with X2
+/// active, a batched draft pass (two to eight ops in the root's round, every
+/// op owned by a rank) keeps each rank's dense and attention work on its owned
+/// rows but runs the head's MoE once over ALL the round's rows on both ranks:
+/// each rank publishes its owner rows' MoE input, both all-gather it into the
+/// root's op order, and the existing replicated EP MoE call (compact tables,
+/// row-gather hook) runs over those rows; each rank keeps its own rows' FFN
+/// output. See [`S4Round`].
+pub(crate) const DRAFT_SHARDED_MOE_ENV: &str = "HIPFIRE_QWEN4_DRAFT_SHARDED_MOE";
+
+/// Whether the sharded draft MoE pass is on ([`DRAFT_SHARDED_MOE_ENV`], default
+/// on; exactly `0` disables).
+pub(crate) fn draft_sharded_moe_enabled() -> bool {
+    hipfire_config::developer_bool(DRAFT_SHARDED_MOE_ENV, true)
+}
+
+/// One sharded-MoE draft pass (S4), the same on every rank: `g` global rows
+/// (the root's ops of the round, in order) of which row `s` is owned by rank
+/// `(owners >> s) & 1` (two ranks). A rank's own rows are its ops in that order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct S4Round {
+    pub(crate) g: usize,
+    pub(crate) owners: u8,
+    pub(crate) rank: usize,
+}
+
+impl S4Round {
+    /// Global row indices of this rank's own rows, ascending.
+    pub(crate) fn own_rows(&self) -> SmallVec<[usize; MTP_DRAFT_LANES_MAX]> {
+        (0..self.g)
+            .filter(|&s| usize::from((self.owners >> s) & 1) == self.rank)
+            .collect()
+    }
+}
+
 /// Env switch of the batched head rounds: `HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`.
 /// Default off; unset, `0` or anything else leaves the head's scratch and
 /// every code path exactly as without the feature. Read at load (the rows
@@ -2437,6 +2473,15 @@ pub struct Qwen4MtpGpu {
     /// this head runs on [`Self::moe_full`] with the no-op row gather and does
     /// not advance [`Self::moe_steps`]. Off = the incumbent EP head call.
     pub(crate) lane_local: bool,
+    /// The sharded-MoE pass the next batched head call belongs to
+    /// ([`Self::set_s4_round`]); `None` = every call is X2 / replicated as before.
+    pub(crate) s4_round: Option<S4Round>,
+    /// Device table of the sharded-MoE activation all-gather's slot owners:
+    /// 256 owner masks x 8 `i32` (slot `s` of mask `m` holds `(m >> s) & 1`),
+    /// read as the gather's `slot_experts` (expert `e` is owned by rank
+    /// `e % 2`). `Some` only with [`DRAFT_SHARDED_MOE_ENV`] on, two ranks, at
+    /// [`Self::install_lane_local_moe`].
+    pub(crate) s4_owners: Option<GpuTensor>,
 }
 
 /// Draft-head front: tokens below this id, plus EOS and the control ids
@@ -2706,14 +2751,7 @@ fn push_head_rows_back<'a>(
 ) {
     let hidden = config.hidden_size;
     if let Some(ffn) = ffn {
-        steps.push(Step::HyperWrite(hc_write(
-            attn_write,
-            t.projected_embedding,
-            t,
-            config,
-            rows,
-        )));
-        steps.push(Step::HyperRead(hc_read(mlp_read, t, config, rows)));
+        push_head_rows_pre_ffn(steps, config, t, rows, attn_write, mlp_read);
         match ffn {
             MtpFfnCall::Moe(moe) => {
                 steps.push(Step::Clear(ClearOp {
@@ -2724,16 +2762,50 @@ fn push_head_rows_back<'a>(
             }
             MtpFfnCall::Dense(dense) => steps.push(Step::GatedMlp(dense)),
         }
-        steps.push(Step::HyperWrite(hc_write(
-            mlp_write,
-            t.ffn_output,
-            t,
-            config,
-            rows,
-        )));
-        if predict {
-            steps.push(Step::HyperRead(hc_read(final_read, t, config, rows)));
-        }
+        push_head_rows_post_ffn(steps, config, t, rows, mlp_write, final_read, predict);
+    }
+}
+
+/// The steps of [`push_head_rows_back`] before the FFN: the attention HC
+/// write and the MLP HC read.
+fn push_head_rows_pre_ffn<'a>(
+    steps: &mut SmallVec<[Step<'a>; 16]>,
+    config: &Qwen4Config,
+    t: &HeadRowTensors<'a>,
+    rows: usize,
+    attn_write: &Qwen4HyperWriteWeights<'a>,
+    mlp_read: &Qwen4HyperReadWeights<'a>,
+) {
+    steps.push(Step::HyperWrite(hc_write(
+        attn_write,
+        t.projected_embedding,
+        t,
+        config,
+        rows,
+    )));
+    steps.push(Step::HyperRead(hc_read(mlp_read, t, config, rows)));
+}
+
+/// The steps of [`push_head_rows_back`] after the FFN: the MLP HC write and
+/// (Predict) the final HC read.
+fn push_head_rows_post_ffn<'a>(
+    steps: &mut SmallVec<[Step<'a>; 16]>,
+    config: &Qwen4Config,
+    t: &HeadRowTensors<'a>,
+    rows: usize,
+    mlp_write: &Qwen4HyperWriteWeights<'a>,
+    final_read: &Qwen4HyperReadWeights<'a>,
+    predict: bool,
+) {
+    steps.push(Step::HyperWrite(hc_write(
+        mlp_write,
+        t.ffn_output,
+        t,
+        config,
+        rows,
+    )));
+    if predict {
+        steps.push(Step::HyperRead(hc_read(final_read, t, config, rows)));
     }
 }
 
@@ -3096,6 +3168,8 @@ impl Qwen4MtpGpu {
             moe_steps: 0,
             moe_full: None,
             lane_local: false,
+            s4_round: None,
+            s4_owners: None,
             rows,
         })
     }
@@ -3170,6 +3244,26 @@ impl Qwen4MtpGpu {
         Ok(())
     }
 
+    /// Whether sharded-MoE draft passes can run (S4): the switch was on at
+    /// install and the head has the rows scratch, the EP MoE runtime and the
+    /// lane-local runtime (X2 active), with the slot-owner table.
+    pub(crate) fn s4_ready(&self) -> bool {
+        self.s4_owners.is_some() && self.rows.is_some() && self.ep_bound && self.lane_local_ready()
+    }
+
+    /// Mark (or clear) the sharded-MoE pass the next batched / participant
+    /// head calls belong to. Refused when [`Self::s4_ready`] is false, and
+    /// while lane-local mode is on (the S4 MoE is the replicated call).
+    pub(crate) fn set_s4_round(&mut self, round: Option<S4Round>) -> Result<(), MtpGpuError> {
+        if round.is_some() && (!self.s4_ready() || self.lane_local) {
+            return Err(invalid(
+                "sharded draft MoE needs the S4 head tables and a non-lane-local head",
+            ));
+        }
+        self.s4_round = round;
+        Ok(())
+    }
+
     /// Build the head's full-table MoE runtime for lane-local calls (EP attach,
     /// after every rank's head compact source is known): the head's own sealed
     /// expert group (`num_hidden_layers`, the one [`Self::new_with_backend`]
@@ -3217,6 +3311,15 @@ impl Qwen4MtpGpu {
                 "the MTP head's lane-local MoE runtime must be untiered (its experts are the `mtp.` tensors)",
             ));
         }
+        if draft_sharded_moe_enabled() && placement.ranks == 2 && self.rows.is_some() {
+            let mut table = Vec::with_capacity(256 * 8 * std::mem::size_of::<i32>());
+            for mask in 0u32..256 {
+                for slot in 0..8 {
+                    table.extend_from_slice(&(((mask >> slot) & 1) as i32).to_ne_bytes());
+                }
+            }
+            self.s4_owners = Some(gpu.upload_raw(&table, &[table.len()])?);
+        }
         self.moe_full = Some(full);
         Ok(())
     }
@@ -3229,6 +3332,7 @@ impl Qwen4MtpGpu {
             moe_full,
             draft,
             rows,
+            s4_owners,
             ..
         } = self;
         let draft_error = draft.free_gpu(gpu);
@@ -3237,12 +3341,14 @@ impl Qwen4MtpGpu {
         let moe_error = moe.and_then(|moe| moe.free_gpu(gpu));
         let moe_full_error = moe_full.and_then(|moe| moe.free_gpu(gpu));
         let rows_error = rows.and_then(|rows| rows.free_gpu(gpu));
+        let s4_error = s4_owners.and_then(|table| gpu.free_tensor(table).err());
         draft_error
             .or(scratch_error)
             .or(state_error)
             .or(moe_error)
             .or(moe_full_error)
             .or(rows_error)
+            .or(s4_error)
             .map_or(Ok(()), |error| Err(MtpGpuError::Hip(error)))
     }
     /// Deliberately dirty the reusable MoE buffers for the bounded profile

@@ -2171,6 +2171,42 @@ impl Qwen4Bundle {
             .map_err(|error| BundleError::Forward(error.to_string()))
     }
 
+    /// Whether sharded-MoE draft passes can run ([`crate::mtp_gpu::draft_sharded_moe_enabled`]
+    /// at install, X2 active, rows scratch).
+    pub(crate) fn mtp_s4_ready(&self) -> bool {
+        self.mtp.as_ref().is_some_and(Qwen4MtpGpu::s4_ready)
+    }
+
+    /// Mark (or clear) the sharded-MoE pass the next batched head call and
+    /// participant call belong to. Cleared on every path out of the round.
+    pub(crate) fn mtp_set_s4_round(
+        &mut self,
+        round: Option<crate::mtp_gpu::S4Round>,
+    ) -> Result<(), BundleError> {
+        let head = self.mtp.as_mut().ok_or_else(|| {
+            BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+        })?;
+        head.set_s4_round(round)
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// This rank's share of a sharded-MoE pass when it owns no live row: the
+    /// activation all-gather and the global MoE call with an empty own set.
+    pub(crate) fn mtp_s4_participate(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        let mtp = self.mtp.as_mut().ok_or_else(|| {
+            BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+        })?;
+        mtp.s4_participate(
+            gpu,
+            &self.weights,
+            &self.config,
+            self.execution
+                .as_ref()
+                .and_then(Qwen4GpuForward::mtp_ep_gather),
+        )
+        .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
     /// Reserve the GDN capture ring the first native MTP window captures into,
     /// before any window or captured graph can grow it: the support and rows of
     /// [`crate::mtp_spec::native_mtp_capture`] for a `max_k`-draft window, ensured

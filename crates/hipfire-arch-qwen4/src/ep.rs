@@ -1128,6 +1128,13 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
         }
     }
 
+    fn last_gather_buffer(&self) -> Option<usize> {
+        match self.last_buffer.load(Ordering::Relaxed) {
+            NO_BUFFER => None,
+            buffer => Some(buffer),
+        }
+    }
+
     fn decode_step_end(&self, gpu: &mut Gpu) {
         if let Some(tail) = self.tail.get() {
             tail.step_end(gpu);
