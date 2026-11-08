@@ -17,8 +17,14 @@ Explicit invocation only: no test, build script or runtime path runs this. It
 
 Tests (`crates/peacemaker-isa/tests/hip_twin_leviathan.rs`) only consume the committed files.
 
-    scripts/pm-leviathan-twin.py [--arch gfx1200|gfx1201|all] [--rocm-path DIR]
+    scripts/pm-leviathan-twin.py [--family leviathan|moe-shared-down-combine]
+        [--arch gfx1200|gfx1201|all] [--rocm-path DIR]
         [--build-wrapper 'WRAPPER ARGS'] [--seal-bin PATH] [--out-dir DIR]
+
+`--family moe-shared-down-combine` (gfx1201 only) compiles `kernels/src/moe_shared_down_combine.gfx1201.hip`
+once and seals its eight `moe_shared_down_combine_rows_r{1..8}_zinit` symbols into one
+`kernels/moe_shared_down_combine_pm_gfx1201.hxaco` (anchor `moe_shared_down_combine_hipcc_gfx1201.co`,
+manifest `moe_shared_down_combine_pm_gfx1201.twin.json`, `seal.reports` in symbol order); no math evidence.
 """
 import argparse
 import hashlib
@@ -32,9 +38,24 @@ import sys
 import tempfile
 from pathlib import Path
 
-SYMBOL = "lane_leviathan_verify"
-SOURCE_REL = "kernels/src/lane_leviathan.hip"
 ARCHES = ("gfx1200", "gfx1201")
+
+FAMILIES = {
+    "leviathan": {
+        "source": "kernels/src/lane_leviathan.hip",
+        "symbols": ("lane_leviathan_verify",),
+        "prefix": "lane_leviathan",
+        "arches": ARCHES,
+        "math": True,
+    },
+    "moe-shared-down-combine": {
+        "source": "kernels/src/moe_shared_down_combine.gfx1201.hip",
+        "symbols": tuple(f"moe_shared_down_combine_rows_r{r}_zinit" for r in range(1, 9)),
+        "prefix": "moe_shared_down_combine",
+        "arches": ("gfx1201",),
+        "math": False,
+    },
+}
 
 
 def core_hipcc_flags(arch):
@@ -158,45 +179,55 @@ def seal_cmd(args, root):
 
 
 def build_arch(args, root, hipcc, env, arch, tmp):
+    fam = FAMILIES[args.family]
+    source_rel = fam["source"]
+    symbols = fam["symbols"]
+    prefix = fam["prefix"]
     out_dir = args.out_dir
-    co = out_dir / f"lane_leviathan_hipcc_{arch}.co"
-    hxaco = out_dir / f"lane_leviathan_pm_{arch}.hxaco"
-    manifest = out_dir / f"lane_leviathan_pm_{arch}.twin.json"
+    co = out_dir / f"{prefix}_hipcc_{arch}.co"
+    hxaco = out_dir / f"{prefix}_pm_{arch}.hxaco"
+    manifest = out_dir / f"{prefix}_pm_{arch}.twin.json"
     flags = core_hipcc_flags(arch)
-    evidence = math_evidence(hipcc, env, root, arch, tmp, Path(env["ROCM_PATH"]))
+    evidence = math_evidence(hipcc, env, root, arch, tmp, Path(env["ROCM_PATH"])) if fam["math"] else None
 
     tmp_co = Path(tmp) / f"anchor_{arch}.co"
-    run([str(hipcc), *flags, "-o", str(tmp_co), SOURCE_REL], cwd=root, env=env)
+    run([str(hipcc), *flags, "-o", str(tmp_co), source_rel], cwd=root, env=env)
     shutil.copyfile(tmp_co, co)
 
     report_path = Path(tmp) / f"report_{arch}.json"
+    kernel_args = [a for s in symbols for a in ("--kernel", s)]
     run([*seal_cmd(args, root), "--in", str(co), "--arch", arch, "--out", str(hxaco),
-         "--report", str(report_path), "--kernel", SYMBOL], cwd=root, env=env)
+         "--report", str(report_path), *kernel_args], cwd=root, env=env)
     report = json.loads(report_path.read_text())
 
     rel = lambda p: p.relative_to(root).as_posix() if p.is_relative_to(root) else p.name
     doc = {
-        "module": f"lane_leviathan_pm_{arch}",
+        "module": f"{prefix}_pm_{arch}",
         "arch": arch,
-        "symbol": SYMBOL,
         "source": {
-            "path": SOURCE_REL,
-            "bytes": (root / SOURCE_REL).stat().st_size,
-            "sha256": sha256_file(root / SOURCE_REL),
+            "path": source_rel,
+            "bytes": (root / source_rel).stat().st_size,
+            "sha256": sha256_file(root / source_rel),
         },
         "compiler": {
             "version": compiler_version(hipcc, env),
             "flags": flags,
-            "invocation": "hipcc <flags> -o <anchor.co> " + SOURCE_REL,
+            "invocation": "hipcc <flags> -o <anchor.co> " + source_rel,
         },
         "anchor": {"file": co.name, "bytes": co.stat().st_size, "sha256": sha256_file(co)},
         "hxaco": {"file": hxaco.name, "bytes": hxaco.stat().st_size, "sha256": sha256_file(hxaco)},
-        "seal": {
-            "tool": "peacemaker-isa example hip_twin (Route A: lift, emit::checked, bundle)",
-            "report": report,
-        },
     }
-    doc["math_evidence"] = evidence
+    tool = "peacemaker-isa example hip_twin (Route A: lift, emit::checked, bundle)"
+    if len(symbols) == 1:
+        doc["symbol"] = symbols[0]
+        doc["seal"] = {"tool": tool, "report": report}
+    else:
+        if not isinstance(report, list) or len(report) != len(symbols):
+            die(f"expected {len(symbols)} seal reports, got {report!r:.80}")
+        doc["symbols"] = list(symbols)
+        doc["seal"] = {"tool": tool, "reports": report}
+    if evidence is not None:
+        doc["math_evidence"] = evidence
     # Supplemental receipts (m7 OPEN diagnostic, gpu_oracle) are explicit claims about one
     # exact hxaco. Carry them over only when the existing manifest is for the same hxaco and
     # each receipt's own input hash matches; otherwise omit so the CPU audit fails closed.
@@ -217,17 +248,21 @@ def build_arch(args, root, hipcc, env, arch, tmp):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--arch", default="all", choices=(*ARCHES, "all"))
+    ap.add_argument("--family", default="leviathan", choices=tuple(FAMILIES),
+                    help="twin family (default: leviathan)")
+    ap.add_argument("--arch", default=None, choices=(*ARCHES, "all"),
+                    help="default: all for leviathan, gfx1201 for moe-shared-down-combine")
     ap.add_argument("--rocm-path", help="ROCm root (default: $ROCM_PATH, $HIP_PATH, /opt/rocm, PATH)")
     ap.add_argument("--build-wrapper", default=None,
                     help="command prefix for the cargo invocation, e.g. a build-slot script")
     ap.add_argument("--seal-bin", help="prebuilt hip_twin example binary (skips cargo)")
     ap.add_argument("--out-dir", type=Path, help="artifact directory (default: <repo>/kernels)")
     args = ap.parse_args()
+    fam = FAMILIES[args.family]
 
     root = Path(__file__).resolve().parent.parent
-    if not (root / SOURCE_REL).is_file():
-        die(f"{SOURCE_REL} not found under {root}")
+    if not (root / fam["source"]).is_file():
+        die(f"{fam['source']} not found under {root}")
     args.out_dir = (args.out_dir or root / "kernels").resolve()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -235,7 +270,11 @@ def main():
     hipcc = rocm / "bin" / "hipcc"
     env = dict(os.environ, ROCM_PATH=str(rocm))
 
-    arches = ARCHES if args.arch == "all" else (args.arch,)
+    allowed = fam["arches"]
+    arch_arg = args.arch or ("all" if len(allowed) > 1 else allowed[0])
+    arches = allowed if arch_arg == "all" else (arch_arg,)
+    if any(a not in allowed for a in arches):
+        die(f"family {args.family} supports only {', '.join(allowed)}")
     work = root / "target" / "pm-leviathan-twin"
     work.mkdir(parents=True, exist_ok=True)
     env["TMPDIR"] = str(work)
