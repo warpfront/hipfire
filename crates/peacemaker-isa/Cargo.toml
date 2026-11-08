@@ -46,6 +46,11 @@ required-features = ["lab"]
 name = "libm_exact"
 required-features = ["lab"]
 
+# MI300X (gfx942) GPU bit oracle: PeaceMaker twin vs hipcc of the rows16 / rows16_x2 BF16 MFMA entries (fabric job; HIP runtime).
+[[example]]
+name = "gemm_bf16_rows16_oracle"
+required-features = ["lab"]
+
 # One-card gfx1201 smoke of the persistent-megakernel prerequisites (fabric job; HIP runtime).
 [[example]]
 name = "pm_persistent_smoke"

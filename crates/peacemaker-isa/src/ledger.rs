@@ -50,6 +50,31 @@
 //!   other counter, and counts above the counter's capacity.
 //! * `release_store_sources` is a no-op on gfx942 (no `depctr_vm_vsrc`; a
 //!   store's VM_CNT slot is also its completion).
+//! * **Store sources are not counter-held when replaying gfx942** (`required_replay`,
+//!   used by `ledger_cfg` only; the Builder's `required` still locks them, which is
+//!   conservative, and its emission is unchanged). Basis:
+//!   - CDNA3 ISA §4.4 p.19-20 defines LGKM_CNT/VM_CNT by when the memory *effect*
+//!     completes (DS write: "data has been written to LDS/GWS"), and defines exactly one
+//!     counter for source-register lifetime, EXP_CNT: "when data has been read out of the
+//!     VGPR and sent to GWS, at which time it is safe to overwrite the contents of that
+//!     VGPR", incremented for GWS instructions only. No counter says a DS (non-GWS) or
+//!     VMEM store's data VGPRs are held until completion.
+//!   - Where the ISA bounds overwrite of store data it does so in wait states: VMEM
+//!     store/atomic of more than 64 bits, writer VGPRs 1 (any writer) / 2 (VALU) wait
+//!     states (§4.5 Table 11 p.20; `cdna::hazard` `StoreDataWrite`/`StoreDataValu`,
+//!     which the lifted certification runs). No row exists for narrower VMEM stores or
+//!     for DS stores.
+//!   - LLVM agrees (cross-check, not the basis): `GCNSubtarget::vmemWriteNeedsExpWaitcnt`
+//!     is `generation < SEA_ISLANDS`, so VMEM stores lock their VGPRs (`VMW_GPR_LOCK`,
+//!     an EXP_CNT event) only before gfx7; the DS source lock (`GDS_GPR_LOCK`) is
+//!     GDS-only (`AMDGPUHWEvents.cpp`).
+//!   A pending store therefore still occupies its counter slot, keeps ordering loads and
+//!   makes a barrier wait, but does not make a younger overwrite of its data/address
+//!   registers wait for the counter. The rows16 hipcc anchor relies on this: it overwrites
+//!   `ds_write2_b64` data VGPRs 19 instructions later with no `lgkmcnt` wait.
+//!   GDS/GWS operations are rejected by the lifted certification, so the EXP_CNT rule is
+//!   never needed. [UNVERIFIED: confirm on MI300X] the ISA gives no wait-state row for DS
+//!   store data; none is modelled.
 
 use crate::{
     arch::Arch,
@@ -334,6 +359,24 @@ impl Ledger {
     }
 
     pub fn required(&self, insn: &Instruction) -> Vec<(Counter, u8, Reason)> {
+        self.required_with(insn, true)
+    }
+
+    /// `required` for replaying emitted code (`ledger_cfg`; the Builder never calls it, its
+    /// emission is unchanged). On gfx942 a store's sources are not held until its counter
+    /// slot retires: a younger write to a register a pending VMEM store, returnless VMEM
+    /// atomic or DS store reads needs no counter wait (no `Reason::War`). The operation
+    /// still occupies its counter slot, still orders in-flight loads, and still makes a
+    /// barrier wait (`pending_stores`); loads' results (RAW, WAW) are unaffected. Every
+    /// other architecture is `required` exactly. Basis, see the module docs: the CDNA3 ISA
+    /// defines the counters by when the memory *effect* completes (§4.4 p.19-20) and bounds
+    /// the consumption of store data by wait states (§4.5 Table 11 p.20, enforced by
+    /// `cdna::hazard`), not by a counter.
+    pub(crate) fn required_replay(&self, insn: &Instruction) -> Vec<(Counter, u8, Reason)> {
+        self.required_with(insn, self.arch != Some(Arch::Gfx942))
+    }
+
+    fn required_with(&self, insn: &Instruction, hold_sources: bool) -> Vec<(Counter, u8, Reason)> {
         let mut waits: Vec<(Counter, u8, Reason)> = Vec::new();
         for (index, pending) in self.pending.iter().enumerate() {
             let reason = pending
@@ -356,6 +399,9 @@ impl Ledger {
                         })
                 })
                 .or_else(|| {
+                    if !hold_sources {
+                        return None;
+                    }
                     pending.src_locks.iter().find_map(|lock| {
                         insn.defs
                             .iter()

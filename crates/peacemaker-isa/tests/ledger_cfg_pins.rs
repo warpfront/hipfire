@@ -193,18 +193,94 @@ impl Report {
     }
 }
 
+/// The gfx942 rows16 anchor (hipcc) and twin (PM): the only gfx942 artifacts with typed
+/// coverage. Each is lifted by `peacemaker_lift::cdna` and every kernel is certified by
+/// `peacemaker_isa::cdna::lifted::certify` (CDNA hazards + typed CFG wait ledger). Their
+/// absence fails the gate. Every other gfx942 image stays an explicit not-verified entry.
+const CDNA_CERTIFIED: [&str; 2] = [
+    "gemm_bf16_mfma_gfx942_rows16_hipcc_gfx942.co",
+    "gemm_bf16_mfma_gfx942_rows16_pm_gfx942.hxaco",
+];
+/// Exact kernel symbols each certified rows16 image must contain, and nothing else.
+const CDNA_EXPECTED_KERNELS: [&str; 3] = [
+    "gemm_bf16_mfma_gfx942",
+    "gemm_bf16_mfma_gfx942_rows16",
+    "gemm_bf16_mfma_gfx942_rows16_x2",
+];
+
+/// The gfx942 device ELF of `bytes`: itself when raw, else the single native
+/// `hipv4-amdgcn-amd-amdhsa--gfx942` bundle entry (an optional `:feature` suffix allowed).
+fn gfx942_elf(bytes: &[u8]) -> Result<&[u8], String> {
+    use peacemaker_ir::envelope::Bundle;
+    if !Bundle::is_bundle(bytes) {
+        return Ok(bytes);
+    }
+    let (bundle, payloads) = Bundle::read(bytes).map_err(|e| format!("bundle: {e}"))?;
+    let triple = format!("{}gfx942", peacemaker_lift::bundle::HIP_DEVICE_TRIPLE_PREFIX);
+    let mut hits = bundle.entries.iter().enumerate().filter(|(_, e)| {
+        e.triple == triple
+            || e.triple
+                .strip_prefix(&triple)
+                .is_some_and(|s| s.starts_with(':'))
+    });
+    let idx = hits.next().map(|(i, _)| i).ok_or("bundle has no gfx942 device entry")?;
+    if hits.next().is_some() {
+        return Err("bundle has multiple gfx942 device entries".into());
+    }
+    Ok(payloads[idx])
+}
+
+/// Typed lift + certify of every kernel; returns the kernel names on success.
+fn certify_gfx942(bytes: &[u8]) -> Result<Vec<String>, String> {
+    let elf = gfx942_elf(bytes)?;
+    let lifted = peacemaker_lift::cdna::lift_object(elf).map_err(|e| format!("cdna lift: {e}"))?;
+    peacemaker_lift::cdna::checked(&lifted).map_err(|e| format!("cdna checked: {e}"))?;
+    let mut names = Vec::new();
+    for kernel in &lifted.kernels {
+        peacemaker_isa::cdna::lifted::certify(kernel)
+            .map_err(|e| format!("cdna certify {}: {e}", kernel.image.name))?;
+        names.push(kernel.image.name.clone());
+    }
+    Ok(names)
+}
+
 #[test]
 fn every_committed_image_verifies_or_is_an_explicit_allowlist_entry() {
     let images = scan();
     assert!(!images.is_empty(), "no committed images found");
+    for required in CDNA_CERTIFIED {
+        assert!(
+            images.iter().any(|i| i.file == required),
+            "required gfx942 artifact {required} is absent from kernels/"
+        );
+    }
     let mut report = Report::default();
     let mut gfx942 = Vec::new();
     for image in &images {
+        if CDNA_CERTIFIED.contains(&image.file.as_str()) {
+            match certify_gfx942(&image.bytes) {
+                Ok(names) => {
+                    let mut got = names.clone();
+                    got.sort();
+                    let mut want: Vec<String> =
+                        CDNA_EXPECTED_KERNELS.iter().map(|s| s.to_string()).collect();
+                    want.sort();
+                    assert_eq!(got, want, "{}: kernel symbol set", image.file);
+                    // One verified outcome per certified kernel.
+                    for name in &names {
+                        report.verified += 1;
+                        println!("  certified (typed CDNA) {}#{name}", image.file);
+                    }
+                }
+                Err(e) => report.record("pins", &image.file, Err(e)),
+            }
+            continue;
+        }
         let program = match &image.lifted {
             Ok(program) => program,
             Err(_) if image.file.contains(GFX942) => {
                 gfx942.push(format!(
-                    "{}: gfx942, no opcode table (not verified)",
+                    "{}: gfx942, no typed CDNA certification wired (not verified)",
                     image.file
                 ));
                 continue;

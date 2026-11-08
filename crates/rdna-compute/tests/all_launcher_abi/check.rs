@@ -151,10 +151,10 @@ fn compare_params(
         ));
     } else if v.pushes.len() == pi.len() && lay.len() == pi.len() {
         for (i, (a, b)) in pi.iter().zip(lay.iter()).enumerate() {
-            if let Some((value, loc)) = a
-                .as_ref()
-                .and_then(|name| mapped_param_value(ctx, name, sloc))
-            {
+            if let Some((value, loc)) = a.as_ref().and_then(|name| {
+                mapped_param_value(ctx, name, sloc)
+                    .or_else(|| repeat_param_value(world, ctx, name, sloc))
+            }) {
                 match world.infer_kind(&value, ctx, &loc, 0) {
                     Some(kind) if kind == (b.size, b.kind) => {}
                     kind => probs.push(format!(

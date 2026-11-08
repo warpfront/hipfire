@@ -175,3 +175,33 @@ suppression and no category change. They are original LLVM output, not changes i
 twin, and none is claimed to be a race. The checked full-ELF byte identity of anchor and twin does
 not discharge the ledger's strict WAR path, and hardware source-read timing and path feasibility
 remain unproven. No stronger analysis proof is claimed.
+
+## gfx942 rows16: typed CDNA Route A
+
+The same anchor/seal/provenance pattern is used for
+`gemm_bf16_mfma_gfx942_rows16` and `gemm_bf16_mfma_gfx942_rows16_x2`
+from `kernels/src/gemm_bf16_mfma.gfx942.hip`. Production dispatch stays HIP.
+This bounded CDNA route reuses `peacemaker-cdna`'s typed codec and the shared
+ELF envelope codec; it does not alias gfx942 to an RDNA target. Every kernel
+in the object is decoded and re-encoded before full device-ELF identity is
+required. The selected entries additionally pass the existing CDNA
+software wait-state checker and typed CFG memory-ledger replay, without
+inserting NOPs or changing instructions. Unknown encodings, helper bodies,
+indirect branches, GDS and unsupported memory effects fail closed.
+
+The four artifacts under `kernels/` are
+`gemm_bf16_mfma_gfx942_rows16_hipcc_gfx942.co`,
+`gemm_bf16_mfma_gfx942_rows16_pm_gfx942.hxaco`, its `.hxaco.sha256`,
+and `.twin.json`. The manifest records source hash, portable core flags,
+compiler provenance and each symbol's seal report. Both entries have nine
+pointers followed by eight i32 arguments (104 explicit kernarg bytes).
+`hip_twin_gfx942_rows16` checks source staleness, artifact pins, ELF/text
+identity, ABI and checked evidence without invoking a compiler.
+
+Regenerate explicitly with `scripts/pm-gfx942-rows16-twin.py`; its options
+mirror the Leviathan generator. The lab example `gemm_bf16_rows16_oracle`
+loads the committed anchor and PM image directly, and compares their
+outputs with the shipped tiled MFMA kernel over rows, groups, dtypes,
+tails, random/edge/NaN/Inf inputs and poisoned output guards.
+Its full hardware receipt is bound to the image hashes in `twin.json`.
+No broader CDNA IR/rewrite, helper or emulator qualification is claimed.

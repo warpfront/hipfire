@@ -50,6 +50,12 @@
 //!   operation is an error, not a skipped line (`ttmp` operands of other
 //!   instructions, e.g. workgroup-id reads, are not tracked). Outside `foreign`, an instruction with empty metadata is taken
 //!   at its word: it has no memory effect.
+//! * CDNA (gfx942) specifics, both exercised by `cdna::lifted::certify`: `s_barrier` is not
+//!   a memory wait, so it is a violation (`Lgkm` 0, `Reason::Barrier`) while any DS operation
+//!   of the wave is still pending (LDS RAW for a pending write, WAR for a pending read);
+//!   and a pending store's source registers are not held until its counter retires
+//!   (`Ledger::required_replay`: no `Reason::War` on gfx942, the store still occupies its
+//!   counter slot and still blocks a barrier; other architectures unchanged).
 //! * Architectural issue bound (`Ledger::clip_to_issue_bound`, applied after every
 //!   recorded memory operation; verifier only, the Builder's emission is unchanged): a
 //!   counter field holds at most its maximum of outstanding operations (63 on
@@ -101,7 +107,7 @@
 use crate::{
     arch::Arch,
     insn::{Instruction, MemoryClass, Program},
-    ledger::{Counter, Ledger, StateKey},
+    ledger::{Counter, Ledger, MemoryFamily, Reason, StateKey},
     plan::{Emitted, RegionProof},
     reg::{Kind, RegRef},
     sync,
@@ -788,13 +794,29 @@ fn walk(program: &Program, foreign: &[Range<usize>], mode: Mode) -> Result<Stats
             // wait: the counter cannot hold the operation plus that many younger ones, so
             // the operation has retired (`Ledger::retire_count` reports the exact count up
             // to 63 younger on RDNA). The pending operations stay in the ledger.
-            let unmet: Vec<_> = ledger
-                .required(insn)
+            let mut unmet: Vec<_> = ledger
+                .required_replay(insn)
                 .into_iter()
                 .filter(|(counter, count, _)| {
                     capacity(arch, *counter).is_none_or(|cap| *count < cap)
                 })
                 .collect();
+            // CDNA `s_barrier` is not a memory wait (CDNA3 ISA §4.3 p.19; `ledger` module docs):
+            // it only synchronises the workgroup's waves. No DS operation of this wave may
+            // still be pending across it: a pending write is an LDS RAW for the waves released
+            // by the barrier, a pending read an LDS WAR against their next write. Which LDS
+            // addresses an operation touches is unknown, so every pending DS operation counts
+            // (the builder's `barrier` drains the same set). Global-memory visibility is not
+            // modelled here.
+            if arch.cdna().is_some()
+                && mnemonic == "s_barrier"
+                && ledger
+                    .shape()
+                    .iter()
+                    .any(|entry| entry.4 == MemoryFamily::Ds)
+            {
+                unmet.push((Counter::Lgkm, 0, Reason::Barrier));
+            }
             if !unmet.is_empty() {
                 match mode {
                     Mode::Strict => {
@@ -1421,6 +1443,58 @@ mod tests {
             ins("s_endpgm"),
         ]);
         check(&p).unwrap();
+    }
+
+    #[test]
+    fn gfx942_store_sources_are_not_counter_held_but_the_store_still_counts() {
+        // A younger write to a pending store's data register: a WAR wait on gfx12 (and gfx11),
+        // none on gfx942 (`Ledger::required_replay`).
+        let overwrite = |arch| program(arch, vec![store(1), mov(1, 5), ins("s_endpgm")]);
+        let e = check(&overwrite(Arch::Gfx1201)).unwrap_err();
+        assert!(e.contains("War"), "{e}");
+        check(&overwrite(Arch::Gfx942)).unwrap();
+        // The source-side relaxation does not touch results: a pending load's destination
+        // still needs its wait (WAW) and its uses (RAW).
+        let waw = program(Arch::Gfx942, vec![load(1), mov(1, 5), ins("s_endpgm")]);
+        assert!(check(&waw).unwrap_err().contains("Waw"));
+        let raw = program(Arch::Gfx942, vec![load(1), mov(3, 1), ins("s_endpgm")]);
+        assert!(check(&raw).unwrap_err().contains("Use"));
+        // A DS store keeps its data register free to overwrite but still blocks a barrier.
+        let ds_store = Instruction::new("ds_write_b32 v2, v3", vec![], vec![v(2), v(3)])
+            .memory(MemoryClass::DsStore);
+        let body = |tail: Vec<Instruction>| {
+            let mut insns = vec![ds_store.clone(), mov(3, 5)];
+            insns.extend(tail);
+            insns.push(ins("s_endpgm"));
+            program(Arch::Gfx942, insns)
+        };
+        check(&body(vec![])).unwrap();
+        let e = check(&body(vec![ins("s_barrier")])).unwrap_err();
+        assert!(e.contains("Barrier"), "{e}");
+        check(&body(vec![ins("s_waitcnt lgkmcnt(0)"), ins("s_barrier")])).unwrap();
+    }
+
+    #[test]
+    fn gfx942_barrier_requires_pending_ds_loads_and_stores_to_have_retired() {
+        let ds_load = Instruction::new("ds_read_b32 v2, v0", vec![v(2)], vec![v(0)])
+            .memory(MemoryClass::DsLoad);
+        let ds_store = Instruction::new("ds_write_b32 v0, v3", vec![], vec![v(0), v(3)])
+            .memory(MemoryClass::DsStore);
+        for op in [ds_load, ds_store] {
+            let body = |tail: &[&str]| {
+                let mut insns = vec![op.clone()];
+                insns.extend(tail.iter().map(|t| ins(t)));
+                insns.extend([ins("s_barrier"), ins("s_endpgm")]);
+                program(Arch::Gfx942, insns)
+            };
+            let e = check(&body(&[])).unwrap_err();
+            assert!(e.contains("Lgkm") && e.contains("Barrier"), "{e}");
+            check(&body(&["s_waitcnt lgkmcnt(0)"])).unwrap();
+        }
+        // Not a CDNA rule elsewhere: a text `s_barrier` on gfx12 is unaffected.
+        let ds_store = Instruction::new("ds_store_b32 v0, v3", vec![], vec![v(0), v(3)])
+            .memory(MemoryClass::DsStore);
+        check(&gfx12(vec![ds_store, ins("s_barrier"), ins("s_endpgm")])).unwrap();
     }
 
     #[test]

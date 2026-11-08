@@ -13,7 +13,11 @@
 //! [`lift_text`] lifts an authoritative `.s` through the object the pinned assembler made
 //! from it: the bytes are the proof, the text contributes labels and line provenance. The
 //! lifter never spawns tools; the process drivers live in `peacemaker-front`.
+//!
+//! gfx942 uses [`cdna::lift_object`] and [`cdna::checked`]: the same ELF envelope
+//! codec with the existing typed CDNA instruction model, rather than the RDNA IR.
 pub mod bundle;
+pub mod cdna;
 pub mod elf;
 pub mod hazards_gfx11;
 pub mod kd;

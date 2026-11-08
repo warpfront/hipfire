@@ -3,9 +3,10 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Route A ("lift-and-repass") sealing of a hipcc-compiled kernel as an embedded per-arch
-//! code object. The hipcc object is lifted (`Frontend::Hipcc`), re-emitted with
-//! `emit::checked`, and the emitted bytes must equal the input ELF byte for byte; the result is
-//! bundled with [`native::bundle`] and sha-pinned. See `examples/hip_twin.rs`.
+//! code object. RDNA uses the `Frontend::Hipcc` IR lift and `emit::checked`; gfx942
+//! uses the typed CDNA lift and checked envelope re-emission. In both cases the
+//! emitted bytes must equal the input ELF byte for byte, before [`native::bundle`]
+//! bundles and sha-pins them. See `examples/hip_twin.rs`.
 
 use crate::arch::Arch;
 use crate::native;
@@ -53,7 +54,7 @@ fn ir_arch(arch: Arch) -> Result<IrArch, String> {
         Arch::Gfx1151 => Ok(IrArch::Gfx1151),
         Arch::Gfx1200 => Ok(IrArch::Gfx1200),
         Arch::Gfx1201 => Ok(IrArch::Gfx1201),
-        Arch::Gfx942 => Err("hip_twin: gfx942 is not liftable (no CDNA lift target)".into()),
+        Arch::Gfx942 => Err("gfx942 uses the typed CDNA lift, not the RDNA IR".into()),
     }
 }
 
@@ -157,9 +158,22 @@ fn device_elf(input: &[u8], arch: Arch) -> Result<&[u8], String> {
         return Ok(input);
     }
     let (bundle, payloads) = Bundle::read(input).map_err(|e| format!("bundle: {e}"))?;
-    let idx = bundle
-        .device_entry(ir_arch(arch)?)
-        .map_err(|e| format!("bundle has no {} device entry: {e}", arch.name()))?;
+    let idx = if arch == Arch::Gfx942 {
+        let triple = format!("{}gfx942", peacemaker_lift::bundle::HIP_DEVICE_TRIPLE_PREFIX);
+        let mut matches = bundle.entries.iter().enumerate().filter(|(_, entry)| {
+            entry.triple == triple
+                || entry.triple.strip_prefix(&triple).is_some_and(|suffix| suffix.starts_with(':'))
+        });
+        let idx = matches.next().map(|(idx, _)| idx)
+            .ok_or("bundle has no gfx942 device entry")?;
+        if matches.next().is_some() {
+            return Err("bundle has multiple gfx942 device entries".into());
+        }
+        idx
+    } else {
+        bundle.device_entry(ir_arch(arch)?)
+            .map_err(|e| format!("bundle has no {} device entry: {e}", arch.name()))?
+    };
     Ok(payloads[idx])
 }
 
@@ -246,6 +260,9 @@ pub fn seal(
     symbol: &str,
     abi_ref: Option<(&[u8], &str)>,
 ) -> Result<Sealed, String> {
+    if arch == Arch::Gfx942 {
+        return seal_cdna(input, symbol, abi_ref);
+    }
     let ir = ir_arch(arch)?;
     let elf = device_elf(input, arch)?;
     let lifted = lift_object(elf, OPTS).map_err(|e| format!("lift: {e}"))?;
@@ -372,6 +389,81 @@ pub fn seal(
     Ok(s)
 }
 
+/// Route A for the typed CDNA model. The existing ELF envelope codec rebuilds
+/// descriptors and metadata as well as every kernel's re-encoded instructions.
+fn seal_cdna(
+    input: &[u8],
+    symbol: &str,
+    abi_ref: Option<(&[u8], &str)>,
+) -> Result<Sealed, String> {
+    let arch = Arch::Gfx942;
+    let elf = device_elf(input, arch)?;
+    let lifted = peacemaker_lift::cdna::lift_object(elf)
+        .map_err(|e| format!("CDNA lift: {e}"))?;
+    let emitted = peacemaker_lift::cdna::checked(&lifted)
+        .map_err(|e| format!("CDNA emit::checked: {e}"))?;
+    if emitted != elf {
+        let at = emitted.iter().zip(elf).position(|(a, b)| a != b)
+            .unwrap_or(emitted.len().min(elf.len()));
+        return Err(format!("CDNA re-emitted ELF differs from input at byte offset {at:#x}"));
+    }
+    let kernel = lifted.kernels.iter().find(|k| k.image.name == symbol)
+        .ok_or_else(|| format!("kernel `{symbol}` not found in CDNA object"))?;
+    let desc = &kernel.image.descriptor;
+    let meta = &kernel.image.metadata.parsed;
+    let hz = crate::cdna::lifted::certify(kernel)
+        .map_err(|e| format!("CDNA certification of `{symbol}`: {e}"))?;
+    let mut abi = json!({"kernarg_segment_size": meta.kernarg_segment_size,
+        "args": args_json(meta), "compared_to_incumbent": false});
+    if let Some((inc_bytes, inc_sym)) = abi_ref {
+        let inc_elf = device_elf(inc_bytes, arch)?;
+        let inc = peacemaker_lift::cdna::lift_object(inc_elf)
+            .map_err(|e| format!("CDNA lift abi-ref: {e}"))?;
+        let inc_k = inc.kernels.iter().find(|k| k.image.name == inc_sym)
+            .ok_or_else(|| format!("abi-ref kernel `{inc_sym}` not found"))?;
+        if let Some(diff) = abi_diff(meta, &inc_k.image.metadata.parsed) {
+            return Err(format!("kernarg ABI mismatch vs incumbent `{inc_sym}`: {diff}"));
+        }
+        abi["compared_to_incumbent"] = json!(true);
+        abi["incumbent_symbol"] = json!(inc_sym);
+        abi["incumbent_sha256"] = json!(hex(inc_elf));
+    }
+    let mut words = Vec::with_capacity(kernel.image.code.len() / 4);
+    for instruction in &kernel.instructions {
+        instruction.inst.encode(peacemaker_cdna::Arch::Gfx942, &mut words)?;
+    }
+    let text: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    if text != kernel.image.code {
+        return Err(format!("CDNA typed text differs for `{symbol}`"));
+    }
+    let hxaco = native::bundle(&emitted, arch, HOST_TRIPLE);
+    let mut sealed = Sealed {
+        elf_sha256: hex(&emitted),
+        text_sha256: hex(&text),
+        hxaco_sha256: hex(&hxaco),
+        hxaco,
+        vgprs: desc.compute_pgm_rsrc1.next_free_vgpr(false),
+        sgprs: meta.sgpr_count,
+        lds: desc.group_segment_fixed_size,
+        scratch: desc.private_segment_fixed_size,
+        user_sgprs: (desc.compute_pgm_rsrc2.0 >> 1) & 0x1f,
+        report: Value::Null,
+    };
+    sealed.report = json!({
+        "kernel": symbol, "arch": arch.name(),
+        "elf_sha256": sealed.elf_sha256, "elf_bytes": emitted.len(),
+        "text_sha256": sealed.text_sha256, "text_bytes": text.len(),
+        "hxaco_sha256": sealed.hxaco_sha256, "hxaco_bytes": sealed.hxaco.len(),
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "codec": "peacemaker_cdna", "lifted_kernels": lifted.kernels.len(),
+        "vgprs": sealed.vgprs, "sgprs": sealed.sgprs, "lds": sealed.lds,
+        "scratch": sealed.scratch, "user_sgprs": sealed.user_sgprs,
+        "rsrc2": desc.compute_pgm_rsrc2.0, "wavefront_size": meta.wavefront_size,
+        "hazards": hz, "abi": abi,
+    });
+    Ok(sealed)
+}
+
 /// Unbundle `hxaco`, [`seal`] its device ELF, and require that re-bundling reproduces `hxaco`.
 pub fn verify_hxaco(hxaco: &[u8], arch: Arch, symbol: &str) -> Result<Sealed, String> {
     if !Bundle::is_bundle(hxaco) {
@@ -439,6 +531,32 @@ pub fn verify_hxaco_many(
         .iter()
         .map(|s| verify_hxaco(hxaco, arch, s))
         .collect()
+}
+
+#[cfg(test)]
+mod gfx942_bundle_tests {
+    use super::*;
+
+    #[test]
+    fn cdna_bundle_selects_only_its_own_device() {
+        let hxaco = native::bundle(b"\x7fELF", Arch::Gfx942, HOST_TRIPLE);
+        assert_eq!(device_elf(&hxaco, Arch::Gfx942).unwrap(), b"\x7fELF");
+        assert!(device_elf(&hxaco, Arch::Gfx1201).is_err());
+        let rdna = native::bundle(b"\x7fELF", Arch::Gfx1201, HOST_TRIPLE);
+        assert!(device_elf(&rdna, Arch::Gfx942).is_err());
+    }
+
+    #[test]
+    fn cdna_bundle_accepts_features_but_not_arch_prefixes() {
+        let hxaco = native::bundle(b"\x7fELF", Arch::Gfx942, HOST_TRIPLE);
+        let (mut bundle, payloads) = Bundle::read(&hxaco).unwrap();
+        bundle.entries[1].triple.push_str(":xnack-:sramecc+");
+        let features = bundle.write(&payloads).unwrap();
+        assert_eq!(device_elf(&features, Arch::Gfx942).unwrap(), b"\x7fELF");
+        bundle.entries[1].triple = "hipv4-amdgcn-amd-amdhsa--gfx9420".into();
+        let wrong_arch = bundle.write(&payloads).unwrap();
+        assert!(device_elf(&wrong_arch, Arch::Gfx942).is_err());
+    }
 }
 
 #[cfg(test)]

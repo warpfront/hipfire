@@ -2729,6 +2729,7 @@ version = "0.4.5"
 dependencies = [
  "insta",
  "object",
+ "peacemaker-cdna",
  "peacemaker-ir",
  "proptest",
  "rmpv",

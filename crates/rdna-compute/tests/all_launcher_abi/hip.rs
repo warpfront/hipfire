@@ -48,7 +48,12 @@ impl Decl {
 #[derive(Clone, Debug)]
 enum Def {
     Obj(String),
-    Func,
+    /// Function-like macro: parameter names and replacement text. Only macros whose
+    /// replacement defines a `__global__` entry are ever expanded (see `expand_obj`).
+    Func {
+        params: Vec<String>,
+        body: String,
+    },
 }
 
 pub const ARCHES: [(&str, [&str; 2]); 6] = [
@@ -120,11 +125,21 @@ fn expand_obj(s: &str, defs: &BTreeMap<String, Def>, depth: u32) -> Result<Strin
                 j += 1;
             }
             let w: String = c[i..j].iter().collect();
+            let mut next = j;
             match defs.get(&w) {
                 Some(Def::Obj(v)) => out.push_str(&expand_obj(v, defs, depth + 1)?),
+                // A function-like macro whose replacement defines a `__global__` entry
+                // really declares kernels at every invocation: expand it, or those
+                // kernels would vanish from the declared-ABI index. Any other
+                // function-like macro is left as written (it cannot declare an entry).
+                Some(Def::Func { params, body }) if body.contains("__global__") => {
+                    let (expanded, after) = expand_kernel_macro(&w, params, body, &c, j, defs, depth)?;
+                    out.push_str(&expanded);
+                    next = after;
+                }
                 _ => out.push_str(&w),
             }
-            i = j;
+            i = next;
         } else if c[i].is_ascii_digit() {
             // Keep numeric literals (including suffix letters) intact.
             let mut j = i;
@@ -139,6 +154,130 @@ fn expand_obj(s: &str, defs: &BTreeMap<String, Def>, depth: u32) -> Result<Strin
         }
     }
     Ok(out)
+}
+
+/// Parses the `(PARAMS) BODY` text after the name of a function-like `#define`.
+fn parse_func_macro(after_name: &str) -> Result<Def, String> {
+    let close = after_name.find(')').ok_or_else(|| {
+        format!("unterminated function-like macro parameter list {after_name:?}")
+    })?;
+    let params: Vec<String> = after_name[1..close]
+        .split(',')
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    Ok(Def::Func {
+        params,
+        body: after_name[close + 1..].trim().to_string(),
+    })
+}
+
+/// Expands one invocation of a kernel-defining function-like macro starting at the
+/// identifier that ends at `c[after_name]`: returns the expansion and the index after
+/// the invocation's closing parenthesis. Fail closed on everything this reader does
+/// not model: variadics, `#`/`##`, string/char literals or unclosed (multi-line)
+/// invocation arguments, and an argument-count mismatch.
+fn expand_kernel_macro(
+    name: &str,
+    params: &[String],
+    body: &str,
+    c: &[char],
+    after_name: usize,
+    defs: &BTreeMap<String, Def>,
+    depth: u32,
+) -> Result<(String, usize), String> {
+    if params.iter().any(|p| p.contains("...")) || body.contains('#') {
+        return Err(format!(
+            "kernel-defining macro {name} uses variadics, `#` or `##`, which this reader does not expand"
+        ));
+    }
+    let mut k = after_name;
+    while k < c.len() && c[k].is_whitespace() {
+        k += 1;
+    }
+    if k >= c.len() || c[k] != '(' {
+        return Err(format!(
+            "kernel-defining function-like macro {name} is used without an argument list"
+        ));
+    }
+    let mut nest = 0i32;
+    let mut args: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut end: Option<usize> = None;
+    let mut q = k;
+    while q < c.len() {
+        let ch = c[q];
+        match ch {
+            '"' | '\'' => {
+                return Err(format!(
+                    "kernel-defining macro {name}: string or character literal in an invocation argument"
+                ))
+            }
+            '(' | '[' | '{' => {
+                nest += 1;
+                if nest > 1 {
+                    cur.push(ch);
+                }
+            }
+            ')' | ']' | '}' => {
+                nest -= 1;
+                if nest == 0 {
+                    end = Some(q + 1);
+                    break;
+                }
+                cur.push(ch);
+            }
+            ',' if nest == 1 => args.push(std::mem::take(&mut cur)),
+            _ => cur.push(ch),
+        }
+        q += 1;
+    }
+    let end = end.ok_or_else(|| {
+        format!("kernel-defining macro {name}: the invocation is not closed on its line")
+    })?;
+    args.push(cur);
+    if params.is_empty() && args.len() == 1 && args[0].trim().is_empty() {
+        args.clear();
+    }
+    if args.len() != params.len() {
+        return Err(format!(
+            "kernel-defining macro {name} takes {} arguments, invoked with {}",
+            params.len(),
+            args.len()
+        ));
+    }
+    let mut actual: BTreeMap<&str, String> = BTreeMap::new();
+    for (p, a) in params.iter().zip(args.iter()) {
+        actual.insert(p.as_str(), expand_obj(a.trim(), defs, depth + 1)?);
+    }
+    let b: Vec<char> = body.chars().collect();
+    let mut sub = String::with_capacity(body.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == '_' || b[i].is_ascii_alphabetic() {
+            let mut j = i;
+            while j < b.len() && is_ident_char(b[j]) {
+                j += 1;
+            }
+            let w: String = b[i..j].iter().collect();
+            match actual.get(w.as_str()) {
+                Some(a) => sub.push_str(a),
+                None => sub.push_str(&w),
+            }
+            i = j;
+        } else if b[i].is_ascii_digit() {
+            let mut j = i;
+            while j < b.len() && is_ident_char(b[j]) {
+                j += 1;
+            }
+            sub.extend(b[i..j].iter());
+            i = j;
+        } else {
+            sub.push(b[i]);
+            i += 1;
+        }
+    }
+    Ok((expand_obj(&sub, defs, depth + 1)?, end))
 }
 
 // ---- `#if` expression evaluator -------------------------------------------
@@ -368,7 +507,7 @@ impl<'a> Eval<'a> {
                 let defs = self.defs;
                 match defs.get(&name) {
                     None => Ok(0),
-                    Some(Def::Func) => Err(format!("function-like macro {name} in #if")),
+                    Some(Def::Func { .. }) => Err(format!("function-like macro {name} in #if")),
                     Some(Def::Obj(v)) => {
                         if v.trim().is_empty() {
                             return Ok(0);
@@ -470,7 +609,7 @@ pub fn preprocess(text: &str, predef: &BTreeMap<String, String>) -> Result<Strin
                     }
                     let after_name = &rest[name.len()..];
                     if after_name.starts_with('(') {
-                        defs.insert(name, Def::Func);
+                        defs.insert(name, parse_func_macro(after_name)?);
                     } else {
                         defs.insert(name, Def::Obj(after_name.trim().to_string()));
                     }

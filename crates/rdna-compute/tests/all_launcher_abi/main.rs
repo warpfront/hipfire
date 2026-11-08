@@ -3566,3 +3566,374 @@ fn canonical_params_map_checks_actual_few_row_launchers_against_hip() {
         analysis.checked_sites, analysis.covered
     );
 }
+
+// ---- gfx942 BF16 MFMA GEMM: tiled + few-row (rows16) entries ------------------------
+
+const GEMM_BF16_MFMA_SRC: &str = "kernels/src/gemm_bf16_mfma.gfx942.hip";
+const GEMM_BF16_MFMA_TILED: &str = "gemm_bf16_mfma_gfx942";
+const GEMM_BF16_MFMA_ROWS16: &str = "gemm_bf16_mfma_gfx942_rows16";
+const GEMM_BF16_MFMA_ROWS16_X2: &str = "gemm_bf16_mfma_gfx942_rows16_x2";
+
+/// The two real launchers (`launch_gemm_bf16_mfma_tiled`, `launch_gemm_bf16_mfma_rows16`)
+/// against the HIP source's own declarations, with only gemm.rs scanned. The few-row
+/// entries are macro-defined (`R16_ENTRY`), the 104-byte params array is built from
+/// `[x; N]` arrays and the blob from `.iter().chain(..)` / by-value loops over them.
+#[test]
+fn gemm_bf16_mfma_launchers_check_against_the_hip_source_declarations() {
+    let root = root();
+    let inv = load_inventory();
+    assert!(
+        strings(&inv, "hip_sources")
+            .iter()
+            .any(|f| f == GEMM_BF16_MFMA_SRC),
+        "{GEMM_BF16_MFMA_SRC} must be a changed HIP source of the gate"
+    );
+    let paths = vec!["crates/rdna-compute/src/gemm.rs".to_string()];
+    let world = World::load(&root, &paths).expect("gemm.rs parses");
+    let source = std::fs::read_to_string(root.join(GEMM_BF16_MFMA_SRC)).unwrap();
+    let decls = hip::decls_of(&source).expect("actual gemm_bf16_mfma HIP declarations");
+    let names = [
+        GEMM_BF16_MFMA_TILED,
+        GEMM_BF16_MFMA_ROWS16,
+        GEMM_BF16_MFMA_ROWS16_X2,
+    ];
+    assert_eq!(
+        decls.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        names.iter().copied().collect::<BTreeSet<_>>(),
+        "the source must export exactly the tiled, rows16 and rows16_x2 kernels"
+    );
+    // The few-row ABI: nine pointers (X, A0..A3, D0..D3) then eight i32 (M0..M3, K,
+    // batch, x_f32, d_bf16_mask) = 104 explicit bytes, identical for both entries.
+    for n in [GEMM_BF16_MFMA_ROWS16, GEMM_BF16_MFMA_ROWS16_X2] {
+        let d = &decls[n];
+        assert_eq!(d.args.len(), 17, "{n}");
+        assert_eq!(d.end, 104, "{n}");
+        assert_eq!(d.args.iter().filter(|a| a.kind == 'p').count(), 9, "{n}");
+        assert!(d.args[..9].iter().all(|a| a.kind == 'p' && a.size == 8), "{n}");
+        assert!(d.args[9..].iter().all(|a| a.kind == 'i' && a.size == 4), "{n}");
+        assert_eq!(d.args[9].offset, 72, "{n}");
+    }
+    assert!(
+        hip::same_layout(&decls[GEMM_BF16_MFMA_ROWS16], &decls[GEMM_BF16_MFMA_ROWS16_X2]),
+        "rows16 and rows16_x2 share one ABI"
+    );
+    assert_eq!(decls[GEMM_BF16_MFMA_TILED].args.len(), 6);
+    assert_eq!(decls[GEMM_BF16_MFMA_TILED].end, 36);
+    let mut symbols = Symbols::default();
+    for n in names {
+        symbols.hip.insert(
+            n.to_string(),
+            vec![("actual HIP".to_string(), decls[n].clone())],
+        );
+    }
+    let analysis = analyze(&world, &symbols, &no_policy());
+    let (abi, coverage) = violations(&analysis, &no_policy());
+    assert!(
+        abi.is_empty() && coverage.is_empty(),
+        "actual gemm_bf16_mfma launchers: {abi:?} {coverage:?}"
+    );
+    for n in names {
+        assert!(
+            analysis.covered.contains(n),
+            "actual live launch not checked: {n}"
+        );
+    }
+    assert!(
+        analysis.checked_sites >= 2,
+        "both real launch sites (tiled and rows16) must be checked"
+    );
+    assert!(
+        analysis.checked_pairs >= 3,
+        "the rows16 site is checked against rows16 and rows16_x2, the tiled site against the tile entry"
+    );
+    eprintln!(
+        "actual gemm_bf16_mfma checked sites={} pairs={} covered={:?}",
+        analysis.checked_sites, analysis.checked_pairs, analysis.covered
+    );
+}
+
+/// A non-production PM twin keeps the HIP entry names. It is checked only for ABI
+/// parity of its embedded metadata with the HIP declaration, and the HIP kernels it
+/// shadows must be reached by the gate's checked live launchers.
+#[test]
+fn non_production_pm_twins_match_the_hip_declarations() {
+    let f = &*FIXTURE;
+    let twins = f.inv["pm_twins"]
+        .as_object()
+        .expect("inventory key `pm_twins` must be an object");
+    assert!(!twins.is_empty(), "pm_twins must list the committed twin");
+    let hip_sources = strings(&f.inv, "hip_sources");
+    let mut production = strings(&f.inv, "pm_images");
+    production.extend(strings(&f.inv, "pm_related_images"));
+    let kernels_text = std::fs::read_to_string(f.root.join(KERNELS_RS)).unwrap();
+    let mut problems: Vec<String> = Vec::new();
+    for (image, v) in twins {
+        let reason = v["reason"]
+            .as_str()
+            .unwrap_or_else(|| panic!("pm_twins.{image}.reason"));
+        assert!(!reason.trim().is_empty(), "pm_twins.{image} needs a reason");
+        let src = v["hip_source"]
+            .as_str()
+            .unwrap_or_else(|| panic!("pm_twins.{image}.hip_source"));
+        let anchor = v["anchor"]
+            .as_str()
+            .unwrap_or_else(|| panic!("pm_twins.{image}.anchor"));
+        let symbols = strings(v, "symbols");
+        assert!(
+            hip_sources.iter().any(|h| h == src),
+            "{image}: hip_source {src} is not a changed HIP source"
+        );
+        assert!(
+            !production.contains(image),
+            "{image}: a pm_twins entry is not a production image (pm_images)"
+        );
+        let base = image.rsplit('/').next().unwrap();
+        assert!(
+            !kernels_text.contains(base),
+            "{image}: embedded by kernels.rs, so it is a production image: move it to pm_images"
+        );
+        let hip = hip::decls_of(
+            &std::fs::read_to_string(f.root.join(src)).unwrap_or_else(|e| panic!("{src}: {e}")),
+        )
+        .unwrap_or_else(|e| panic!("{src}: {e}"));
+        // Every twin symbol is a HIP symbol launched by a checked live launcher.
+        for s in &symbols {
+            assert!(
+                f.analysis.covered.contains(s),
+                "{image}: `{s}` is reached by no checked live launcher"
+            );
+        }
+        // The twin: exactly the listed symbols, each with the HIP declaration's ABI.
+        let twin_bytes =
+            std::fs::read(f.root.join(image)).unwrap_or_else(|e| panic!("{image}: {e}"));
+        let twin = read_gfx942_object(&twin_bytes).unwrap_or_else(|e| panic!("{image}: {e}"));
+        let got: BTreeSet<String> = twin.keys().cloned().collect();
+        // Full ELF identity: the sealed twin carries every kernel of the source object.
+        let all_hip: Vec<String> = hip.keys().cloned().collect();
+        let want: BTreeSet<String> = all_hip.iter().cloned().collect();
+        if got != want {
+            problems.push(format!("{image}: exports {got:?}, the HIP source declares {want:?}"));
+        }
+        for s in &symbols {
+            if !want.contains(s) {
+                problems.push(format!("{image}: listed symbol `{s}` is not a HIP kernel"));
+            }
+        }
+        problems.extend(twin_problems(image, &twin, &hip, &all_hip));
+        // The portable anchor is the hipcc object of the whole source: every kernel.
+        let anchor_bytes =
+            std::fs::read(f.root.join(anchor)).unwrap_or_else(|e| panic!("{anchor}: {e}"));
+        let anchor_kernels =
+            read_gfx942_object(&anchor_bytes).unwrap_or_else(|e| panic!("{anchor}: {e}"));
+        let all: Vec<String> = hip.keys().cloned().collect();
+        let got: BTreeSet<String> = anchor_kernels.keys().cloned().collect();
+        let want: BTreeSet<String> = all.iter().cloned().collect();
+        if got != want {
+            problems.push(format!(
+                "{anchor}: exports {got:?}, the HIP source declares {want:?}"
+            ));
+        }
+        problems.extend(twin_problems(anchor, &anchor_kernels, &hip, &all));
+    }
+    assert!(
+        problems.is_empty(),
+        "PM twin ABI problems:\n{}",
+        problems.join("\n")
+    );
+}
+
+fn twin_kernel(decl: &Decl, names: &[&str]) -> Gfx942Kernel {
+    Gfx942Kernel {
+        decl: decl.clone(),
+        names: names.iter().map(|s| s.to_string()).collect(),
+        segment: decl.end + 16,
+        hidden_start: Some(decl.end),
+    }
+}
+
+#[test]
+fn negative_pm_twin_parity_rejects_layout_name_extent_and_export_drift() {
+    let hip = hip::decls_of(
+        "extern \"C\" __global__ void k(const void* __restrict__ X, int n, float s) {}\n",
+    )
+    .expect("parse");
+    let symbols = vec!["k".to_string()];
+    let names = ["X", "n", "s"];
+    let run = |kernel: Gfx942Kernel| {
+        let mut kernels = BTreeMap::new();
+        kernels.insert("k".to_string(), kernel);
+        twin_problems("twin", &kernels, &hip, &symbols)
+    };
+    assert!(
+        run(twin_kernel(&hip["k"], &names)).is_empty(),
+        "the faithful twin must pass"
+    );
+    let mut resized = twin_kernel(&hip["k"], &names);
+    resized.decl.args[1].size = 8;
+    assert!(!run(resized).is_empty(), "a resized argument must fail");
+    let mut scalar = twin_kernel(&hip["k"], &names);
+    scalar.decl.args[0].kind = 'v';
+    assert!(!run(scalar).is_empty(), "a pointer declared by value must fail");
+    let mut shifted = twin_kernel(&hip["k"], &names);
+    shifted.decl.args[2].offset += 4;
+    assert!(!run(shifted).is_empty(), "a shifted argument must fail");
+    let mut dropped = twin_kernel(&hip["k"], &names);
+    dropped.decl.args.pop();
+    assert!(!run(dropped).is_empty(), "a dropped argument must fail");
+    assert!(
+        !run(twin_kernel(&hip["k"], &["X", "n", "t"])).is_empty(),
+        "a renamed argument must fail"
+    );
+    let mut short = twin_kernel(&hip["k"], &names);
+    short.segment = short.decl.end - 4;
+    assert!(!run(short).is_empty(), "a short kernarg segment must fail");
+    let mut hidden = twin_kernel(&hip["k"], &names);
+    hidden.hidden_start = Some(8);
+    assert!(!run(hidden).is_empty(), "a hidden argument inside the explicit bytes must fail");
+    assert!(
+        !twin_problems("twin", &BTreeMap::new(), &hip, &symbols).is_empty(),
+        "a missing export must fail"
+    );
+    assert!(
+        !twin_problems("twin", &BTreeMap::new(), &hip, &["absent".to_string()]).is_empty(),
+        "a symbol without a HIP declaration must fail"
+    );
+}
+
+#[test]
+fn hip_expands_kernel_defining_function_macros_and_fails_closed() {
+    let src = "#define THREADS (64 + 512)\n#define ENTRY(NAME, XI) \\\nextern \"C\" __global__ __launch_bounds__(THREADS, 2) \\\nvoid NAME(const void* __restrict__ X, const bf16_t* __restrict__ A0, int K, int x_f32) { body<XI>(X, A0, K, x_f32); }\nENTRY(k_one, 1)\nENTRY(k_two, 2)\n#undef ENTRY\n";
+    let d = hip::decls_of(src).expect("parse");
+    for name in ["k_one", "k_two"] {
+        let k = d
+            .get(name)
+            .unwrap_or_else(|| panic!("macro-defined kernel {name} must be declared"));
+        let layout: Vec<(u32, u32)> = k.args.iter().map(|a| (a.offset, a.size)).collect();
+        assert_eq!(layout, vec![(0, 8), (8, 8), (16, 4), (20, 4)], "{name}");
+        assert_eq!(k.end, 24, "{name}");
+    }
+    assert_eq!(d.len(), 2);
+    for bad in [
+        src.replace("ENTRY(k_two, 2)", "ENTRY(k_two)"),
+        src.replace("ENTRY(k_two, 2)", "ENTRY(k_two, 2"),
+        src.replace("#define ENTRY(NAME, XI)", "#define ENTRY(NAME, ...)"),
+        src.replace("void NAME(", "void #NAME("),
+        src.replace("ENTRY(k_two, 2)", "ENTRY(\"k_two\", 2)"),
+        src.replace("ENTRY(k_two, 2)", "ENTRY"),
+    ] {
+        assert!(
+            hip::decls_of(&bad).is_err(),
+            "unmodelled kernel macro must fail closed: {bad}"
+        );
+    }
+    // A function-like macro that does not define a kernel is left as written.
+    let plain = "#define HELPER(a, b) a + b\nextern \"C\" __global__ void k(int n) { int z = HELPER(n, 2); }\n";
+    assert!(hip::decls_of(plain).expect("parse").contains_key("k"));
+}
+
+// ---- `[x; N]` repeat arrays and `.iter().chain(..)` loops ----------------------------
+
+fn repeat_array_source() -> String {
+    r#"const MAX: usize = 2;
+impl Gpu {
+    fn few(&mut self, x: *mut c_void, members: &[(*mut c_void, usize)]) -> HipResult<()> {
+        let mut ptrs = [std::ptr::null_mut::<c_void>(); MAX];
+        let mut dims = [0i32; MAX];
+        for (j, &(p, m)) in members.iter().enumerate() {
+            ptrs[j] = p;
+            dims[j] = m as i32;
+        }
+        let k_i32 = 7i32;
+        let mut params: Vec<*mut c_void> = vec![&x as *const _ as *mut c_void];
+        params.extend(ptrs.iter().map(|p| p as *const _ as *mut c_void));
+        params.extend(dims.iter().map(|n| n as *const _ as *mut c_void));
+        params.extend([&k_i32 as *const _ as *mut c_void]);
+        self.launch_maybe_blob("repeat_symbol", g, bl, 0, &mut params, || {
+            let mut b = KernargBlob::new();
+            b.push_ptr(x);
+            for p in ptrs.iter().chain(more.iter()) { b.push_ptr(*p); }
+            for n in dims { b.push_i32(n); }
+            b.push_i32(k_i32);
+            b
+        })
+    }
+}"#
+    .to_string()
+}
+
+fn repeat_array_decl() -> Decl {
+    Decl::from_scalars(&[
+        (8, 'p'),
+        (8, 'p'),
+        (8, 'p'),
+        (8, 'p'),
+        (8, 'p'),
+        (4, 'i'),
+        (4, 'i'),
+        (4, 'i'),
+    ])
+}
+
+#[test]
+fn repeat_arrays_and_chain_loops_are_traced_per_element_and_fail_closed() {
+    // x, two `ptrs`, two `more` (chained), two `dims`, k: the blob and the params array
+    // are both followed element by element against the declaration.
+    let source = repeat_array_source()
+        .replace(
+            "        let k_i32 = 7i32;\n",
+            "        let mut more = [std::ptr::null_mut::<c_void>(); MAX];\n        let k_i32 = 7i32;\n",
+        )
+        .replace(
+            "        params.extend(dims",
+            "        params.extend(more.iter().map(|p| p as *const _ as *mut c_void));\n        params.extend(dims",
+        );
+    let symbols = [("repeat_symbol", repeat_array_decl())];
+    let (abi, coverage) = run_synth(&source, &symbols, &no_policy());
+    assert!(
+        abi.is_empty() && coverage.is_empty(),
+        "faithful repeat-array launcher: {abi:?} {coverage:?}"
+    );
+    for bad in [
+        // Element class of a repeat array is the class of its initialiser.
+        source.replace("[0i32; MAX]", "[0u64; MAX]"),
+        source.replace("let mut dims = [0i32; MAX];", "let mut dims = [0.0f32; MAX];"),
+        // Unsuffixed or unknown initialisers have no provable ABI class.
+        source.replace("[0i32; MAX]", "[0; MAX]"),
+        source.replace("[0i32; MAX]", "[make_default(); MAX]"),
+        // A repeat count that is not a constant has no provable entry count.
+        source.replace("[0i32; MAX]", "[0i32; members.len()]"),
+        // One more element on one side only.
+        source.replace("[0i32; MAX]", "[0i32; 3]"),
+        // Iterator adapters could reorder or drop elements.
+        source.replace("ptrs.iter().chain", "ptrs.iter().rev().chain"),
+        source.replace("more.iter())", "more.iter().skip(1))"),
+        source.replace("for p in ptrs.iter().chain(more.iter())", "for p in ptrs.iter().zip(more.iter())"),
+        // The pushed class must match the params entry's element class.
+        source.replace("b.push_ptr(*p);", "b.push_i32(*p);"),
+        source.replace("for n in dims { b.push_i32(n); }", "for n in dims { b.push_u64(n); }"),
+        // The params mapping must read the array the blob pushes.
+        source.replace("params.extend(more.iter()", "params.extend(ptrs.iter()"),
+        source.replace("params.extend(dims.iter()", "params.extend(ptrs.iter()"),
+        // A literal array is still never accepted as mutable; shadowing is refused.
+        source.replace("let mut dims = [0i32; MAX];", "let mut dims = [1i32, 2i32];"),
+        source.replace(
+            "        self.launch_maybe_blob",
+            "        let dims = [9i32, 11i32];\n        self.launch_maybe_blob",
+        ),
+        // Literal `params.extend([..])` entries must each be a recognised entry.
+        source.replace(
+            "params.extend([&k_i32 as *const _ as *mut c_void]);",
+            "params.extend([opaque_entry()]);",
+        ),
+        source.replace(
+            "params.extend([&k_i32 as *const _ as *mut c_void]);",
+            "params.extend([]);",
+        ),
+    ] {
+        let (abi, coverage) = run_synth(&bad, &symbols, &no_policy());
+        assert!(
+            !abi.is_empty() || !coverage.is_empty(),
+            "unproved repeat-array launcher must fail: {bad}"
+        );
+    }
+}
