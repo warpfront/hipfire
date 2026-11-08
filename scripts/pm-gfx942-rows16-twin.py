@@ -163,20 +163,22 @@ def main():
                 "reports": reports,
             },
         }
-        # Receipts (e.g. gpu_oracle) are explicit claims about one exact hxaco. Carry them over
-        # only when the existing manifest is for the same hxaco and each receipt's own input
-        # hash matches; otherwise omit so the CPU audit fails closed.
+        # A hardware receipt qualifies both exact input files, not just the PM image.
+        # Keep it only while both image hashes match; otherwise the CPU audit fails closed.
         new_sha = doc["hxaco"]["sha256"]
         if manifest.exists():
             try:
                 old = json.loads(manifest.read_text())
             except ValueError:
                 old = {}
-            if old.get("hxaco", {}).get("sha256") == new_sha:
-                for key in ("gpu_oracle",):
-                    rec = old.get(key)
-                    if isinstance(rec, dict) and rec.get("input_hxaco_sha256") == new_sha:
-                        doc[key] = rec
+            rec = old.get("gpu_oracle")
+            if (
+                old.get("hxaco", {}).get("sha256") == new_sha
+                and isinstance(rec, dict)
+                and rec.get("input_hxaco_sha256") == new_sha
+                and rec.get("hipcc_image_sha256") == doc["anchor"]["sha256"]
+            ):
+                doc["gpu_oracle"] = rec
         manifest.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n")
 
     def rel(p):

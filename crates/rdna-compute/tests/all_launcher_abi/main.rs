@@ -3703,7 +3703,7 @@ fn non_production_pm_twins_match_the_hip_declarations() {
                 "{image}: `{s}` is reached by no checked live launcher"
             );
         }
-        // The twin: exactly the listed symbols, each with the HIP declaration's ABI.
+        // Full-object twin: every HIP kernel export retains its declared ABI.
         let twin_bytes =
             std::fs::read(f.root.join(image)).unwrap_or_else(|e| panic!("{image}: {e}"));
         let twin = read_gfx942_object(&twin_bytes).unwrap_or_else(|e| panic!("{image}: {e}"));
