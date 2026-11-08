@@ -2593,7 +2593,11 @@ impl Gpu {
         } else {
             "moe_down_combine_grouped_top10_bf16in_ordered"
         };
-        self.ensure_kernel("moe_combine_ordered", kernels::MOE_COMBINE_ORDERED_SRC, combine)?;
+        self.ensure_kernel(
+            "moe_combine_ordered",
+            kernels::MOE_COMBINE_ORDERED_SRC,
+            combine,
+        )?;
         let gp = grouped_down.buf.as_ptr();
         let ip = inverse_perm.buf.as_ptr();
         let tp = topk_indices.buf.as_ptr();

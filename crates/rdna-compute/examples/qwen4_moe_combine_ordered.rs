@@ -129,7 +129,11 @@ fn build_route(tokens: usize, routing: Routing, seed: u64) -> Route {
     row_expert.resize(grouped_rows, -1);
     if routing == Routing::Hostile {
         for s in (2..slots).step_by(37) {
-            inverse[s] = if s % 2 == 0 { -1 } else { grouped_rows as i32 + 5 };
+            inverse[s] = if s % 2 == 0 {
+                -1
+            } else {
+                grouped_rows as i32 + 5
+            };
         }
     }
     Route {
@@ -153,8 +157,7 @@ fn upload_words(gpu: &mut Gpu, d: &[u32]) -> Res<GpuTensor> {
 fn download_words(gpu: &Gpu, t: &GpuTensor, words: usize) -> Res<Vec<u32>> {
     let mut b = vec![0u8; words * 4];
     gpu.hip.memcpy_dtoh(&mut b, &t.buf)?;
-    Ok(b
-        .chunks_exact(4)
+    Ok(b.chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
 }
@@ -224,7 +227,11 @@ fn cmp(
 ) {
     t.cells += 1;
     t.words += n as u64;
-    let mm = want[..n].iter().zip(&got[..n]).filter(|(a, b)| a != b).count();
+    let mm = want[..n]
+        .iter()
+        .zip(&got[..n])
+        .filter(|(a, b)| a != b)
+        .count();
     t.mismatches += mm as u64;
     let tv = got[n..].iter().filter(|&&w| w != SENTINEL).count();
     t.tail_words += TAIL_WORDS as u64;
@@ -311,11 +318,22 @@ fn oracle() -> Res<()> {
                     let n = tokens * HIDDEN;
                     let pair = download_words(&gpu, &pair_t, n + TAIL_WORDS)?;
                     let fused = download_words(&gpu, &fused_t, n + TAIL_WORDS)?;
-                    cmp("fused-vs-pair", &label, n, &pair, &fused, &mut t, &mut fails);
+                    cmp(
+                        "fused-vs-pair",
+                        &label,
+                        n,
+                        &pair,
+                        &fused,
+                        &mut t,
+                        &mut fails,
+                    );
                     // The fused result carries no NaN of the poisoned rows unless a hostile
                     // weight (NaN / inf x 0) put it there; count them only for clean routing.
                     if routing != Routing::Hostile {
-                        let nans = fused[..n].iter().filter(|w| f32::from_bits(**w).is_nan()).count();
+                        let nans = fused[..n]
+                            .iter()
+                            .filter(|w| f32::from_bits(**w).is_nan())
+                            .count();
                         t.nan_words += nans as u64;
                         if nans != 0 {
                             fails.push(format!("NaN leaked {label}: {nans}"));
@@ -339,7 +357,15 @@ fn oracle() -> Res<()> {
                         )?;
                         gpu.hip.device_synchronize()?;
                         let base = download_words(&gpu, &base_t, n + TAIL_WORDS)?;
-                        cmp("fused-vs-unmasked-cleared", &label, n, &base, &fused, &mut t, &mut fails);
+                        cmp(
+                            "fused-vs-unmasked-cleared",
+                            &label,
+                            n,
+                            &base,
+                            &fused,
+                            &mut t,
+                            &mut fails,
+                        );
                         gpu.free_tensor(base_t)?;
                     }
                     gpu.free_tensor(pair_t)?;
@@ -491,7 +517,13 @@ fn bench() -> Res<()> {
                 // order alone
                 gpu.hip.event_record(&e0, gpu.active_stream.as_ref())?;
                 gpu.moe_combine_order_top10_owned(
-                    &inv[s], &exp[s], &wts[s], &order_t, route.grouped_rows, tokens, N_EXP,
+                    &inv[s],
+                    &exp[s],
+                    &wts[s],
+                    &order_t,
+                    route.grouped_rows,
+                    tokens,
+                    N_EXP,
                     Some(owners),
                 )?;
                 gpu.hip.event_record(&e1, gpu.active_stream.as_ref())?;
@@ -502,16 +534,35 @@ fn bench() -> Res<()> {
                 let sc = (it + 1) % SETS;
                 gpu.hip.event_record(&e0, gpu.active_stream.as_ref())?;
                 gpu.moe_down_combine_grouped_top10_bf16in_owned(
-                    &gs[sc], &inv[s], &exp[s], &wts[s], &target, &order_t, HIDDEN,
-                    route.grouped_rows, tokens, initial_zero, N_EXP, Some(owners),
+                    &gs[sc],
+                    &inv[s],
+                    &exp[s],
+                    &wts[s],
+                    &target,
+                    &order_t,
+                    HIDDEN,
+                    route.grouped_rows,
+                    tokens,
+                    initial_zero,
+                    N_EXP,
+                    Some(owners),
                 )?;
                 gpu.hip.event_record(&e1, gpu.active_stream.as_ref())?;
                 gpu.hip.event_synchronize(&e1)?;
                 let pair_us = gpu.hip.event_elapsed_ms(&e0, &e1)? as f64 * 1000.0;
                 gpu.hip.event_record(&e0, gpu.active_stream.as_ref())?;
                 gpu.moe_down_combine_grouped_top10_bf16in_ordered(
-                    &gs[sf], &inv[s], &exp[s], &wts[s], &target, HIDDEN, route.grouped_rows,
-                    tokens, initial_zero, N_EXP, owners,
+                    &gs[sf],
+                    &inv[s],
+                    &exp[s],
+                    &wts[s],
+                    &target,
+                    HIDDEN,
+                    route.grouped_rows,
+                    tokens,
+                    initial_zero,
+                    N_EXP,
+                    owners,
                 )?;
                 gpu.hip.event_record(&e1, gpu.active_stream.as_ref())?;
                 gpu.hip.event_synchronize(&e1)?;
@@ -521,8 +572,18 @@ fn bench() -> Res<()> {
                 for l in 0..LAYERS {
                     let g = (it + l) % SETS;
                     gpu.moe_down_combine_grouped_top10_bf16in_owned(
-                        &gs[g], &inv[g], &exp[g], &wts[g], &target, &order_t, HIDDEN,
-                        route.grouped_rows, tokens, initial_zero, N_EXP, Some(owners),
+                        &gs[g],
+                        &inv[g],
+                        &exp[g],
+                        &wts[g],
+                        &target,
+                        &order_t,
+                        HIDDEN,
+                        route.grouped_rows,
+                        tokens,
+                        initial_zero,
+                        N_EXP,
+                        Some(owners),
                     )?;
                 }
                 gpu.hip.event_record(&e1, gpu.active_stream.as_ref())?;
@@ -532,8 +593,17 @@ fn bench() -> Res<()> {
                 for l in 0..LAYERS {
                     let g = (it + l) % SETS;
                     gpu.moe_down_combine_grouped_top10_bf16in_ordered(
-                        &gs[g], &inv[g], &exp[g], &wts[g], &target, HIDDEN, route.grouped_rows,
-                        tokens, initial_zero, N_EXP, owners,
+                        &gs[g],
+                        &inv[g],
+                        &exp[g],
+                        &wts[g],
+                        &target,
+                        HIDDEN,
+                        route.grouped_rows,
+                        tokens,
+                        initial_zero,
+                        N_EXP,
+                        owners,
                     )?;
                 }
                 gpu.hip.event_record(&e1, gpu.active_stream.as_ref())?;
