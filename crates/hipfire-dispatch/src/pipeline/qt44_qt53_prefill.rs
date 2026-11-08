@@ -3033,7 +3033,8 @@ fn combine_stage(
             implicit_zero_owners(gpu, p)
         };
         // `HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER`: the wide-verify chain's owner-masked order
-        // and combine as one launch (no order scratch, bytes identical to the pair).
+        // and combine as one launch (no order scratch, bytes identical to the pair); on by
+        // default for exact gfx1201, `=0` keeps the pair.
         let inline_order = if ep_a8_wide(gpu, p, use_path2)
             && gpu.flags.qwen4_moe_combine_inline_order_enabled()
         {

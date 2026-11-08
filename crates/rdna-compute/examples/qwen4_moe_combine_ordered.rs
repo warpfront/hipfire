@@ -21,7 +21,12 @@
 //! `bench`: order kernel, combine kernel, the pair (event-timed), the fused launch, and a
 //! 48-layer back-to-back loop of each (per-layer us including the launch gap).
 //!
-//! Usage: qwen4_moe_combine_ordered oracle | bench
+//! `oracle-twin`: the same matrix and negative control, with the candidate launched directly from
+//! the committed `kernels/moe_combine_ordered_pm_gfx1201.hxaco` (both entries, raw ABI: six
+//! pointers + five i32; grid ceil(hidden/512) x tokens x 1, block 64); reference unchanged.
+//! Prints `ORACLE ...` as `oracle` does, preceded by a `TWIN image=... bytes=...` line.
+//!
+//! Usage: qwen4_moe_combine_ordered oracle | oracle-twin | bench
 
 use rdna_compute::hc_row_fold::CombineOwners;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -241,9 +246,125 @@ fn cmp(
     }
 }
 
-fn oracle() -> Res<()> {
+/// The committed exact-gfx1201 PM image of the fused combine, dispatched directly (raw ABI:
+/// six pointers + five i32, grid ceil(hidden/512) x tokens x 1, block 64).
+struct Twin {
+    _module: hip_bridge::Module,
+    ordered: hip_bridge::Function,
+    zinit: hip_bridge::Function,
+}
+
+impl Twin {
+    fn load(gpu: &mut Gpu) -> Res<Self> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../kernels/moe_combine_ordered_pm_gfx1201.hxaco"
+        );
+        let image = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+        gpu.bind_thread()?;
+        let module = gpu.hip.module_load_data(&image)?;
+        let ordered = gpu
+            .hip
+            .module_get_function(&module, "moe_down_combine_grouped_top10_bf16in_ordered")?;
+        let zinit = gpu.hip.module_get_function(
+            &module,
+            "moe_down_combine_grouped_top10_bf16in_ordered_zinit",
+        )?;
+        println!("TWIN image={path} bytes={}", image.len());
+        Ok(Self {
+            _module: module,
+            ordered,
+            zinit,
+        })
+    }
+}
+
+/// The oracle candidate: the HIP fused launch, or (`twin`) a direct launch of the PM image.
+#[allow(clippy::too_many_arguments)]
+fn candidate(
+    gpu: &mut Gpu,
+    twin: Option<&Twin>,
+    grouped: &GpuTensor,
+    inverse: &GpuTensor,
+    experts: &GpuTensor,
+    weights: &GpuTensor,
+    residual: &GpuTensor,
+    grouped_rows: usize,
+    tokens: usize,
+    initial_zero: bool,
+    owners: CombineOwners<'_>,
+) -> Res<()> {
+    let Some(twin) = twin else {
+        gpu.moe_down_combine_grouped_top10_bf16in_ordered(
+            grouped,
+            inverse,
+            experts,
+            weights,
+            residual,
+            HIDDEN,
+            grouped_rows,
+            tokens,
+            initial_zero,
+            N_EXP,
+            owners,
+        )?;
+        return Ok(());
+    };
+    gpu.bind_thread()?;
+    let (gp, ip, tp, wp, rp, op) = (
+        grouped.buf.as_ptr(),
+        inverse.buf.as_ptr(),
+        experts.buf.as_ptr(),
+        weights.buf.as_ptr(),
+        residual.buf.as_ptr(),
+        owners.table.buf.as_ptr(),
+    );
+    let (hv, gr, tv, nx, rank) = (
+        HIDDEN as i32,
+        grouped_rows as i32,
+        tokens as i32,
+        N_EXP as i32,
+        owners.rank as i32,
+    );
+    let mut params = [
+        &gp as *const _ as *mut std::ffi::c_void,
+        &ip as *const _ as *mut std::ffi::c_void,
+        &tp as *const _ as *mut std::ffi::c_void,
+        &wp as *const _ as *mut std::ffi::c_void,
+        &rp as *const _ as *mut std::ffi::c_void,
+        &op as *const _ as *mut std::ffi::c_void,
+        &hv as *const _ as *mut std::ffi::c_void,
+        &gr as *const _ as *mut std::ffi::c_void,
+        &tv as *const _ as *mut std::ffi::c_void,
+        &nx as *const _ as *mut std::ffi::c_void,
+        &rank as *const _ as *mut std::ffi::c_void,
+    ];
+    let func = if initial_zero {
+        &twin.zinit
+    } else {
+        &twin.ordered
+    };
+    unsafe {
+        gpu.hip.launch_kernel(
+            func,
+            [(HIDDEN as u32).div_ceil(512), tokens as u32, 1],
+            [64, 1, 1],
+            0,
+            gpu.active_stream.as_ref(),
+            &mut params,
+        )?;
+    }
+    Ok(())
+}
+
+fn oracle(use_twin: bool) -> Res<()> {
     let mut gpu = Gpu::init()?;
     check_arch(&gpu)?;
+    let twin = if use_twin {
+        Some(Twin::load(&mut gpu)?)
+    } else {
+        None
+    };
     type OwnerFn = fn(usize) -> i32;
     let tables: [(&str, OwnerFn, i32); 5] = [
         ("mod2_r0", |e| (e % 2) as i32, 0),
@@ -301,17 +422,17 @@ fn oracle() -> Res<()> {
                     )?;
                     // Candidate: the fused launch over the same poisoned rows.
                     let fused_t = upload_words(&mut gpu, &init)?;
-                    gpu.moe_down_combine_grouped_top10_bf16in_ordered(
+                    candidate(
+                        &mut gpu,
+                        twin.as_ref(),
                         &poisoned_t,
                         &inverse_t,
                         &experts_t,
                         &weights_t,
                         &fused_t,
-                        HIDDEN,
                         route.grouped_rows,
                         tokens,
                         initial_zero,
-                        N_EXP,
                         owners,
                     )?;
                     gpu.hip.device_synchronize()?;
@@ -423,17 +544,17 @@ fn oracle() -> Res<()> {
             rank: 0,
         }),
     )?;
-    gpu.moe_down_combine_grouped_top10_bf16in_ordered(
+    candidate(
+        &mut gpu,
+        twin.as_ref(),
         &grouped_t,
         &inverse_t,
         &experts_t,
         &weights_t,
         &fused_t,
-        HIDDEN,
         route.grouped_rows,
         48,
         false,
-        N_EXP,
         CombineOwners {
             table: &owner_flip_t,
             rank: 0,
@@ -647,10 +768,11 @@ fn bench() -> Res<()> {
 
 fn main() -> Res<()> {
     match std::env::args().nth(1).as_deref() {
-        Some("oracle") => oracle(),
+        Some("oracle") => oracle(false),
+        Some("oracle-twin") => oracle(true),
         Some("bench") => bench(),
         _ => {
-            eprintln!("usage: qwen4_moe_combine_ordered oracle | bench");
+            eprintln!("usage: qwen4_moe_combine_ordered oracle | oracle-twin | bench");
             std::process::exit(2);
         }
     }
