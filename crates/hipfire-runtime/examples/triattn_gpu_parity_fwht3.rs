@@ -11,7 +11,7 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() {
-    use hipfire_runtime::llama::KvCache;
+    use hipfire_runtime::llama::{KvCache, VMode};
     use hipfire_runtime::triattn::{self, BandCenter, TriAttnCenters};
     use rdna_compute::{DType, Gpu};
 
@@ -71,8 +71,15 @@ fn main() {
     }
 
     let mut gpu = Gpu::init().expect("gpu init");
-    let kv = KvCache::new_gpu_fwht3_filtered(&mut gpu, &[true], N_KV_HEADS, HEAD_DIM, SEQ_LEN)
-        .expect("fwht3 cache");
+    let kv = KvCache::new_gpu_fwht3_filtered(
+        &mut gpu,
+        &[true],
+        N_KV_HEADS,
+        HEAD_DIM,
+        SEQ_LEN,
+        VMode::Q8,
+    )
+    .expect("fwht3 cache");
     let signs1 = kv.givens_cos.as_ref().expect("fwht signs1");
     let signs2 = kv.givens_sin.as_ref().expect("fwht signs2");
     let pos_dev = gpu.hip.malloc(4).expect("position buffer");

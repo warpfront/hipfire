@@ -1099,18 +1099,19 @@ fn construct_kv_cache(
                 .map_err(|e| format!("{e}"))?
             }
             (KvBackend::Legacy, kv_mode::KvPair::Split(_, vm)) => {
-                let mut kv = <KvCache as KvCacheExt>::from_mode_with_backend(
+                // V allocates at its logical stride up front (no Q8 transient
+                // that must fit contiguously before a shrink).
+                KvCache::new_gpu_fwht_filtered_with_v(
+                    ctx.gpu,
                     mode,
-                    KvBackend::Legacy,
-                    KvTarget::Single(ctx.gpu),
-                    &plan.dims,
+                    &plan.is_kv_layer,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    ctx.max_seq,
+                    physical_cap,
+                    vm,
                 )
-                .map_err(|e| format!("{e}"))?;
-                if let Err(e) = kv.set_v_mode_realloc(ctx.gpu, vm) {
-                    let cleanup = kv.free_gpu(ctx.gpu).map_err(|fe| fe.to_string());
-                    return Err(append_cleanup_context(format!("{e}"), cleanup));
-                }
-                kv
+                .map_err(|e| format!("{e}"))?
             }
         };
         if let kv_mode::KvPair::Split(_, vm) = plan.pair {

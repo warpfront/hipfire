@@ -36,7 +36,7 @@ use hipfire_pflash::pflash::{
     self, BypassReason, PflashConfig, PflashDecision, PflashMode, PflashState, RequestKind,
 };
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{self, KvCache};
+use hipfire_runtime::llama::{self, KvCache, VMode};
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -749,6 +749,7 @@ fn main() {
             config.n_kv_heads,
             config.head_dim,
             kv_seq,
+            VMode::Q8,
         )
         .expect("kv fwht4"),
         "fwht3" => KvCache::new_gpu_fwht3_filtered(
@@ -757,6 +758,7 @@ fn main() {
             config.n_kv_heads,
             config.head_dim,
             kv_seq,
+            VMode::Q8,
         )
         .expect("kv fwht3"),
         "fwht2" => KvCache::new_gpu_fwht2_filtered(
@@ -765,6 +767,7 @@ fn main() {
             config.n_kv_heads,
             config.head_dim,
             kv_seq,
+            VMode::Q8,
         )
         .expect("kv fwht2"),
         other => panic!("unknown --kv-mode: {other} (q8|asym4|asym3|asym2|fwht4|fwht3|fwht2)"),
