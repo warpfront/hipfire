@@ -410,6 +410,38 @@ fn early_first_token_enabled() -> bool {
     *LANE_EARLY_FIRST_TOKEN
 }
 
+/// `HIPFIRE_LANE_ADMIT_COALESCE_MS`: the quiet gap (ms) a lane-admission tick waits for one
+/// more arrival before its new prompts prefill (unset: [`ADMIT_COALESCE_DEFAULT_MS`]; `0`
+/// is the kill switch; values above [`ADMIT_COALESCE_MAX_MS`] are clamped). The whole wait of
+/// one tick is at most [`ADMIT_COALESCE_GAPS`] gaps.
+pub const LANE_ADMIT_COALESCE_ENV: &str = "HIPFIRE_LANE_ADMIT_COALESCE_MS";
+const ADMIT_COALESCE_DEFAULT_MS: u64 = 2;
+const ADMIT_COALESCE_MAX_MS: u64 = 20;
+const ADMIT_COALESCE_GAPS: u32 = 5;
+/// Queued requests that make a tick a burst: a lone request never waits for a gap.
+const ADMIT_COALESCE_MIN_QUEUED: usize = 2;
+
+fn admit_coalesce_from(value: Option<&str>) -> Option<Duration> {
+    let ms = match value.map(str::trim).filter(|v| !v.is_empty()) {
+        None => ADMIT_COALESCE_DEFAULT_MS,
+        Some(v) => v.parse::<u64>().unwrap_or(ADMIT_COALESCE_DEFAULT_MS),
+    };
+    (ms > 0).then(|| Duration::from_millis(ms.min(ADMIT_COALESCE_MAX_MS)))
+}
+
+static LANE_ADMIT_COALESCE: std::sync::LazyLock<Option<Duration>> =
+    std::sync::LazyLock::new(|| {
+        admit_coalesce_from(
+            hipfire_config::developer_var(LANE_ADMIT_COALESCE_ENV)
+                .ok()
+                .as_deref(),
+        )
+    });
+
+fn admit_coalesce_gap() -> Option<Duration> {
+    *LANE_ADMIT_COALESCE
+}
+
 /// A promoted request that cannot continue anywhere (its singleton state
 /// already left the resident owners): release its lane and emit one
 /// generation error for the key.
@@ -1581,7 +1613,7 @@ pub fn drive_qwen4_lane_batch(
                 }
             }
             let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer missing")?;
-            if let Some(barrier) = drain_qwen_batch_inbox(
+            let mut barrier = drain_qwen_batch_inbox(
                 sched,
                 m,
                 batch_size,
@@ -1592,7 +1624,43 @@ pub fn drive_qwen4_lane_batch(
                 stdout,
                 inbox,
                 true,
-            )? {
+            )?;
+            // Burst coalescing: a tick that already holds a burst (two or more queued requests
+            // whose front can take a free lane now) waits while arrivals keep coming (each at
+            // most `gap` after the last, the whole wait capped, and only while a free lane is
+            // left for one more), so a burst's stragglers prefill in the SAME wave instead of one
+            // wave later. A lone request never waits, and neither does a queue behind a full
+            // lane set.
+            if let Some(gap) = admit_coalesce_gap().filter(|_| barrier.is_none()) {
+                if sched.inbox.len() >= ADMIT_COALESCE_MIN_QUEUED
+                    && sched.assignable_front().is_some()
+                {
+                    let deadline = Instant::now() + gap * ADMIT_COALESCE_GAPS;
+                    while barrier.is_none() && sched.inbox.len() < sched.empty_lanes().len() {
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            break;
+                        }
+                        match inbox.recv_timeout(gap.min(left)) {
+                            Ok(msg) => inbox.push_front(msg),
+                            Err(_) => break,
+                        }
+                        barrier = drain_qwen_batch_inbox(
+                            sched,
+                            m,
+                            batch_size,
+                            is_vmm_batch_request_eligible,
+                            tokenizer,
+                            m.chat_template.as_ref(),
+                            ROUTE,
+                            stdout,
+                            inbox,
+                            true,
+                        )?;
+                    }
+                }
+            }
+            if let Some(barrier) = barrier {
                 inbox.push_front(barrier);
             }
             // The page budget gates the queue front before it takes a lane: a request
@@ -2597,6 +2665,19 @@ mod tests {
         for off in [Some("0"), Some(" 0\n")] {
             assert!(!early_first_token_from(off), "{off:?}");
         }
+    }
+
+    #[test]
+    fn admit_coalesce_gap_defaults_to_2ms_and_zero_kills_it() {
+        use super::admit_coalesce_from;
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        assert_eq!(admit_coalesce_from(None), Some(ms(2)));
+        assert_eq!(admit_coalesce_from(Some("")), Some(ms(2)));
+        assert_eq!(admit_coalesce_from(Some("x")), Some(ms(2)));
+        assert_eq!(admit_coalesce_from(Some(" 5 ")), Some(ms(5)));
+        assert_eq!(admit_coalesce_from(Some("500")), Some(ms(20)));
+        assert_eq!(admit_coalesce_from(Some("0")), None);
     }
 
     #[test]
