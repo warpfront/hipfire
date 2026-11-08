@@ -399,3 +399,21 @@ fn strict_ledger_refusals_are_open_and_image_bound() {
         assert_eq!(ledger["symbols"], serde_json::json!(SYMBOLS));
     }
 }
+
+#[test]
+fn gfx1201_hardware_receipt_is_image_bound_and_byte_exact() {
+    let twin = &TWINS[1];
+    let m = manifest(twin);
+    let receipt = &m["gpu_oracle"];
+    assert_eq!(receipt["input_hxaco_sha256"], hex(twin.hxaco));
+    assert_eq!(receipt["device_arch"], "gfx1201");
+    assert_eq!(receipt["status"], "PASS");
+    assert_eq!(receipt["cells"], 400);
+    assert_eq!(receipt["words"], 41_600_000);
+    assert_eq!(receipt["mismatches"], 0);
+    assert_eq!(receipt["tail_violations"], 0);
+    assert_eq!(receipt["nan_words"], 0);
+    assert!(receipt["negative_control_mismatches"].as_u64().unwrap() > 0);
+    assert_eq!(receipt["control"], "PASS");
+    assert!(!receipt["fabric_job"].as_str().unwrap().is_empty());
+}

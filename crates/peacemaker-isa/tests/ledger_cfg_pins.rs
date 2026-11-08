@@ -37,7 +37,10 @@ use std::path::{Path, PathBuf};
 
 #[path = "ledger_cfg_pins/allowlist.rs"]
 mod allowlist;
-use allowlist::{Allow, Category, PoolStateCap, FINDINGS, POOL_BODY, POOL_STATE_CAP, STATE_CAP_ERROR, UNSUPPORTED};
+use allowlist::{
+    Allow, Category, PoolStateCap, FINDINGS, POOL_BODY, POOL_STATE_CAP, STATE_CAP_ERROR,
+    UNSUPPORTED,
+};
 
 /// gfx942 images: `lift_object` has no opcode table for them (they are emitted by the typed
 /// `cdna` builder and encoded by `peacemaker_cdna`), so there is no instruction text to
@@ -282,7 +285,8 @@ struct PoolCounts {
     state_caps: usize,
 }
 
-const STATE_CAP_PREFIX: &str = "wait verification: more than 512 distinct in-flight memory states reach label";
+const STATE_CAP_PREFIX: &str =
+    "wait verification: more than 512 distinct in-flight memory states reach label";
 
 /// The one error class the state-cap category takes; anything else is never routed to it.
 fn is_state_cap(error: &str) -> bool {
@@ -312,7 +316,9 @@ fn classify_state_cap_with(
     let (tid, index) = rest
         .split_once("b_")
         .ok_or_else(|| format!("label {label} is not `.Lt<tid>b_<n>`"))?;
-    let tid: u32 = tid.parse().map_err(|_| format!("label {label}: bad template id"))?;
+    let tid: u32 = tid
+        .parse()
+        .map_err(|_| format!("label {label}: bad template id"))?;
     let canonical = format!(".LBB{index}");
     let template = tid_targets
         .iter()
@@ -332,14 +338,18 @@ fn classify_state_cap_with(
                 && c.body_label == canonical
         })
         .ok_or_else(|| {
-            format!("unlisted state cap: pool {pool_target}, template {template}, label {canonical}")
+            format!(
+                "unlisted state cap: pool {pool_target}, template {template}, label {canonical}"
+            )
         })?;
     let expected = table[i]
         .error
         .replace("{tid}", &tid.to_string())
         .replace("{n}", index);
     if error != expected {
-        return Err(format!("state-cap error differs from the pinned text `{expected}`"));
+        return Err(format!(
+            "state-cap error differs from the pinned text `{expected}`"
+        ));
     }
     Ok(i)
 }
@@ -377,7 +387,10 @@ fn classify_state_cap(
 fn check_state_cap_table(table: &[PoolStateCap], unsupported: &[Allow]) -> Result<(), String> {
     for (i, c) in table.iter().enumerate() {
         if !c.body_label.starts_with(".LBB") {
-            return Err(format!("entry {i}: label {} is not `.LBB<n>`", c.body_label));
+            return Err(format!(
+                "entry {i}: label {} is not `.LBB<n>`",
+                c.body_label
+            ));
         }
         let rows = unsupported
             .iter()
@@ -385,7 +398,8 @@ fn check_state_cap_table(table: &[PoolStateCap], unsupported: &[Allow]) -> Resul
                 u.scope == "pins"
                     && u.target == c.template_target
                     && u.needle.contains(&format!("`{}`", c.body_label))
-                    && u.needle.contains("more than 512 distinct in-flight memory states")
+                    && u.needle
+                        .contains("more than 512 distinct in-flight memory states")
             })
             .count();
         if rows != 1 {
@@ -394,8 +408,16 @@ fn check_state_cap_table(table: &[PoolStateCap], unsupported: &[Allow]) -> Resul
                 c.body_label, c.template_target
             ));
         }
-        if table.iter().filter(|o| o.pool_target == c.pool_target).count() != 1 {
-            return Err(format!("entry {i}: pool {} listed more than once", c.pool_target));
+        if table
+            .iter()
+            .filter(|o| o.pool_target == c.pool_target)
+            .count()
+            != 1
+        {
+            return Err(format!(
+                "entry {i}: pool {} listed more than once",
+                c.pool_target
+            ));
         }
     }
     Ok(())
@@ -449,6 +471,11 @@ fn check_pool(
                 Ok(i) => {
                     counts.state_caps += 1;
                     caps_used.push(i);
+                    let c = &POOL_STATE_CAP[i];
+                    println!(
+                        "  OPEN: verifier state cap, not proven: pool {} template {} label {}: {}",
+                        c.pool_target, c.template_target, c.body_label, c.why
+                    );
                 }
                 Err(why) => report
                     .unmatched
@@ -578,7 +605,9 @@ fn lifted_pools_dispatcher_is_fatal_and_bodies_match_exact_entries() {
         }
     }
     if let Err(why) = check_state_cap_table(POOL_STATE_CAP, UNSUPPORTED) {
-        report.unmatched.push(format!("[POOL STATE CAP ENTRY] {why}"));
+        report
+            .unmatched
+            .push(format!("[POOL STATE CAP ENTRY] {why}"));
     }
     // `ld::pool` already verifies its own emission with the dispatcher-only verifier and
     // refuses it on any dispatcher hazard (`POOL_VERIFY_FAILED`); that is never a refusal
@@ -761,9 +790,7 @@ fn state_cap_classifier_rejects_wrong_label_template_pool_and_other_errors() {
     // Wrong template (tid maps to another target).
     assert!(classify_state_cap_with(&table, &tids, pool, &err(8, 28), inside).is_err());
     // Right template, wrong pool.
-    assert!(
-        classify_state_cap_with(&table, &tids, "pool:b64:multi", &err(7, 28), inside).is_err()
-    );
+    assert!(classify_state_cap_with(&table, &tids, "pool:b64:multi", &err(7, 28), inside).is_err());
     // Label outside the template's body span (dispatcher/entry/exit).
     assert!(classify_state_cap_with(&table, &tids, pool, &err(7, 28), |_, _| false).is_err());
     // Fabricated entries with the wrong label or wrong template never match the real error.
