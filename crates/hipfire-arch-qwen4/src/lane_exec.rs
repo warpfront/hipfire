@@ -31,7 +31,7 @@
 //!    every `ArSynced` lane, then each prefill tile through the singleton
 //!    chunk program on the lane's own state (an MTP lane's tile also fills
 //!    its head; under `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=1` on an EP forward the
-//!    49..=511-row lane tiles of a burst are forwarded together as exact prefill
+//!    65..=511-row lane tiles of a burst are forwarded together as exact prefill
 //!    waves, [`plan_prefill_parts`]). A pure-decode step's wall clock (draft start to the final
 //!    sync) feeds the store's cost model, then every MTP lane's window
 //!    policy observes its window.
@@ -1265,7 +1265,7 @@ fn forward_with_proto(
 
 /// Each prefill tile of the plan through the singleton chunk program on the
 /// lane's own state (an MTP lane's tile also fills its head), or, under
-/// `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=1` on an EP forward, the step's 49..=511-row
+/// `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=1` on an EP forward, the step's 65..=511-row
 /// lane tiles as EXACT joint prefill waves ([`plan_prefill_parts`]: one
 /// [`Qwen4Bundle::prefill_wave`] per wave, every lane's rows forwarded together
 /// with the MoE once over all rows); the prompt-completing tile's pick lands in
@@ -2491,15 +2491,15 @@ mod wave_tests {
 
     #[test]
     fn the_exact_window_is_the_sub_512_full_table_lanes() {
-        assert_eq!(crate::gpu_forward::ep_wave::EXACT_WAVE_MIN_LANE_ROWS, 49);
+        assert_eq!(crate::gpu_forward::ep_wave::EXACT_WAVE_MIN_LANE_ROWS, 65);
         assert_eq!(
             crate::gpu_forward::ep_wave::EXACT_WAVE_MAX_LANE_ROWS,
             rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS - 1
         );
-        for rows in [0usize, 1, 8, 9, 48, 512, 513, 2048] {
+        for rows in [0usize, 1, 8, 9, 48, 49, 60, 64, 512, 513, 2048] {
             assert!(!ep_wave_lane_joins(rows), "{rows}");
         }
-        for rows in [49usize, 60, 149, 256, 511] {
+        for rows in [65usize, 66, 149, 256, 511] {
             assert!(ep_wave_lane_joins(rows), "{rows}");
         }
     }
@@ -2511,7 +2511,9 @@ mod wave_tests {
             // The burst: 8 code prompts of 149 rows.
             (1192, &[149; 8], true),
             // The story burst below every 512 floor.
-            (480, &[60; 8], true),
+            (520, &[65; 8], true),
+            // Lanes of at most 64 rows keep their serial tile.
+            (480, &[60; 8], false),
             // One lane is its own tile.
             (300, &[300], false),
             (0, &[], false),
@@ -2521,8 +2523,9 @@ mod wave_tests {
             // A lane at 512 keeps its serial tile (owner-routed on its own).
             (1024, &[512, 512], false),
             (700, &[100, 600], false),
-            // A lane under 49 rows or a zero-row lane is not an exact-wave tile.
-            (97, &[48, 49], false),
+            // A lane under 65 rows or a zero-row lane is not an exact-wave tile.
+            (113, &[48, 65], false),
+            (98, &[49, 49], false),
             (300, &[0, 300], false),
             // The total must be the lanes' sum.
             (1000, &[300, 300], false),
@@ -2562,10 +2565,15 @@ mod wave_tests {
 
     #[test]
     fn there_is_no_row_floor_on_the_total() {
-        // The story C8 burst (8 x 60 = 480 rows, below every 512 floor) is one wave, and so
-        // is the smallest legal pair.
-        assert_eq!(plan(&[60; 8]), vec![PrefillPart::Wave(0..8)]);
-        assert_eq!(plan(&[49, 49]), vec![PrefillPart::Wave(0..2)]);
+        // A burst of 8 x 65 = 520 rows is one wave regardless of the total, and so is the
+        // smallest legal pair.
+        assert_eq!(plan(&[65; 8]), vec![PrefillPart::Wave(0..8)]);
+        assert_eq!(plan(&[65, 65]), vec![PrefillPart::Wave(0..2)]);
+        // A 60-row lane is not exact in a wave: the story C8 burst stays serial tiles.
+        assert_eq!(
+            plan(&[60; 8]),
+            (0..8).map(PrefillPart::Serial).collect::<Vec<_>>()
+        );
         // Three 149-row lanes: 447 rows.
         assert_eq!(plan(&[149; 3]), vec![PrefillPart::Wave(0..3)]);
         assert_eq!(plan(&[200, 200]), vec![PrefillPart::Wave(0..2)]);
@@ -2575,7 +2583,7 @@ mod wave_tests {
     fn a_floor_tile_and_an_mtp_lane_split_the_runs() {
         // A 600-row tile (owner-routed on its own) keeps its serial tile; the lanes around it
         // wave separately (contiguous ordinals only, since a wave writes one contiguous head
-        // block). A lane below 49 rows keeps its serial tile the same way.
+        // block). A lane below 65 rows keeps its serial tile the same way.
         let parts = plan(&[149, 149, 600, 149, 149, 149, 149]);
         assert_eq!(
             parts,
@@ -2624,17 +2632,17 @@ mod wave_tests {
     #[test]
     fn a_single_lane_tail_merges_into_the_wave_before_it() {
         // Nine 200-row lanes (1800 rows) fit one wave; a tenth lane (2000) still fits; four
-        // 511-row lanes plus a 49-row one overflow the cap (2093) and split into two balanced
+        // 511-row lanes plus a 65-row one overflow the cap (2109) and split into two balanced
         // waves rather than leaving a one-lane serial tail.
         assert_eq!(plan(&[200; 10]), vec![PrefillPart::Wave(0..10)]);
         let mut rows = vec![511; 4];
-        rows.push(49);
+        rows.push(65);
         assert_eq!(
             plan(&rows),
             vec![PrefillPart::Wave(0..3), PrefillPart::Wave(3..5)]
         );
         let mut rows = vec![300; 6];
-        rows.push(49);
+        rows.push(65);
         assert_eq!(plan(&rows), vec![PrefillPart::Wave(0..7)]);
     }
 

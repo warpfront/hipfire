@@ -50,11 +50,15 @@ use rdna_compute::prefill_invariant::QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP;
 /// Most rows one wave carries (the plan of record's 2048-row pass).
 pub const QWEN4_EP_WAVE_ROW_CAP: usize = 2048;
 
-/// Fewest rows of a lane the exact wave takes. A lane of at most 8 rows runs the few-row routes
-/// and 9..=48 rows the g32 gate/up family in its singleton; g32 is documented bit-identical to
-/// the `o4_r8_x4` arm the wave runs, but no wave receipt covers it, so those lanes keep their
-/// serial tile until the card says otherwise.
-pub const EXACT_WAVE_MIN_LANE_ROWS: usize = 49;
+/// Fewest rows of a lane the exact wave takes: one more than the widest few-row (wide-verify)
+/// window, `WIDE_VERIFY_MAX_ROWS` (64 on gfx1201). A lane of at most 8 rows runs the few-row
+/// routes and 9..=64 rows the g32 gate/up family and the few-row-window projections in its
+/// singleton. The wave is NOT byte-identical to that serial tile for a 49..=64-row lane (j8439,
+/// `burstprefill/runs/g60`: u60x8 0/8, m8 6/8 exact; first-token KL(singleton||wave) mean 0.018,
+/// max 0.114, top-1 flip in 1/17 lanes, greedy diverges), and neither int8 MoE kill switch
+/// fixes it, so those lanes keep their serial tile.
+pub const EXACT_WAVE_MIN_LANE_ROWS: usize =
+    rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS + 1;
 
 /// Sub-switch of the TILE-route wave (default ON after its card identity receipt, j7460; the master
 /// switch `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=0` kills every route): a burst whose lanes all take
@@ -82,7 +86,7 @@ pub(crate) fn ep_wave_tile_enabled() -> bool {
 
 /// Sub-switch of the trunk-shard PARTIAL-route wave (default ON after its card identity receipt,
 /// j7464; the master switch `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=0` kills every route): a burst of
-/// 49..=511-row lanes on a trunk-shard load runs as ONE wave on the shard's partial chunk route.
+/// 65..=511-row lanes on a trunk-shard load runs as ONE wave on the shard's partial chunk route.
 /// Exact `0` refuses it (`ep wave refused:`): the burst runs as serial partial-chunk tiles.
 pub const QWEN4_EP_WAVE_SHARD_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_WAVE_SHARD";
 
@@ -105,10 +109,10 @@ pub(crate) fn ep_wave_shard_enabled() -> bool {
     *EP_WAVE_SHARD_KNOB
 }
 
-/// Lab knob (default unset: [`EXACT_WAVE_MIN_LANE_ROWS`], byte-identical): lowers the fewest
-/// rows of a lane the exact wave takes, to 9 at the lowest (a lane of at most 8 rows runs the
-/// few-row routes and is never a wave lane). A measurement switch for the g32 family: a wave
-/// of 9..=48-row lanes runs the `o4_r8_x4` arm while each lane's serial tile runs g32.
+/// Knob (default unset: [`EXACT_WAVE_MIN_LANE_ROWS`], the only value proven byte-identical):
+/// sets the fewest rows of a lane the exact wave takes, 9 at the lowest (a lane of at most 8
+/// rows runs the few-row routes and is never a wave lane). A lab value below the default runs
+/// 9..=64-row lanes as a wave, which is NOT byte-identical to their serial tile.
 pub const QWEN4_EP_WAVE_MIN_LANE_ROWS_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_WAVE_MIN_ROWS";
 
 /// [`QWEN4_EP_WAVE_MIN_LANE_ROWS_ENV`] parsed: an integer in `9..=EXACT_WAVE_MAX_LANE_ROWS`,
@@ -669,10 +673,13 @@ mod tests {
     fn the_burst_cells_are_admitted_without_any_row_floor() {
         // The code C8 burst, the story C8 burst (480 rows: below every 512 floor), a pair.
         assert_eq!(ep_wave_refusal(&facts(&[149; 8])), None);
-        assert_eq!(ep_wave_refusal(&facts(&[60; 8])), None);
-        assert_eq!(ep_wave_refusal(&facts(&[49, 49])), None);
+        assert_eq!(ep_wave_refusal(&facts(&[65; 8])), None);
+        assert_eq!(ep_wave_refusal(&facts(&[65, 65])), None);
+        // Lanes of at most 64 rows keep their serial tile (the wave is not exact for them).
+        assert!(refused(&facts(&[60; 8])).contains("lane 0"));
+        assert!(refused(&facts(&[49, 49])).contains("lane 0"));
         assert_eq!(
-            ep_wave_refusal(&facts(&[60, 60, 149, 149, 149, 256, 256, 511])),
+            ep_wave_refusal(&facts(&[65, 65, 149, 149, 149, 256, 256, 511])),
             None
         );
         // The wave cap: 2048 fits, 2049 does not.
@@ -684,6 +691,15 @@ mod tests {
 
     #[test]
     fn the_min_lane_rows_knob_only_lowers_to_the_few_row_boundary() {
+        // The default is one more than the widest few-row window (65 on gfx1201), not a literal.
+        assert_eq!(
+            EXACT_WAVE_MIN_LANE_ROWS,
+            rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS + 1
+        );
+        assert_eq!(
+            exact_wave_min_lane_rows_from(None),
+            EXACT_WAVE_MIN_LANE_ROWS
+        );
         for default in [
             None,
             Some(""),
@@ -706,13 +722,13 @@ mod tests {
         let mut f = facts(&[9, 24]);
         f.min_lane_rows = 9;
         assert_eq!(ep_wave_refusal(&f), None);
-        f.min_lane_rows = 49;
+        f.min_lane_rows = EXACT_WAVE_MIN_LANE_ROWS;
         assert!(refused(&f).contains("lane 0"));
     }
 
     #[test]
     fn lane_rows_outside_the_exact_window_refuse_the_wave() {
-        for rows in [0usize, 1, 8, 9, 48, 512, 513, 1024] {
+        for rows in [0usize, 1, 8, 9, 48, 49, 64, 512, 513, 1024] {
             let f = facts(&[149, rows]);
             assert!(
                 refused(&f).contains("lane 1"),
@@ -720,10 +736,10 @@ mod tests {
                 refused(&f)
             );
         }
-        for rows in [49usize, 50, 149, 511] {
+        for rows in [65usize, 66, 149, 511] {
             assert_eq!(ep_wave_refusal(&facts(&[149, rows])), None, "rows {rows}");
         }
-        assert_eq!(EXACT_WAVE_MIN_LANE_ROWS, 49);
+        assert_eq!(EXACT_WAVE_MIN_LANE_ROWS, 65);
         assert_eq!(EXACT_WAVE_MAX_LANE_ROWS, 511);
     }
 
@@ -819,13 +835,13 @@ mod tests {
             f.lane_a8 = vec![a8; lanes.len()];
             f
         };
-        // Default (unset knob) on the A8 chain: every 49..=511-row lane is on the tile route and
+        // Default (unset knob) on the A8 chain: every 65..=511-row lane is on the tile route and
         // the wave is the Tile wave.
         for lanes in [
             &[149usize; 8][..],
-            &[60; 8],
-            &[49, 511],
-            &[60, 60, 149, 256],
+            &[65; 8],
+            &[65, 511],
+            &[65, 65, 149, 256],
         ] {
             let f = facts_under(None, true, true, lanes);
             assert_eq!(ep_wave_route(&f), Ok(EpWaveRoute::Tile), "{lanes:?}");
@@ -843,15 +859,15 @@ mod tests {
         }
         // A lab floor above every lane keeps them all on the full table; a floor in the middle
         // of the burst splits it into two routes: refused, naming one lane of each route.
-        let f = facts_under(Some(300), true, true, &[60, 149, 256]);
+        let f = facts_under(Some(300), true, true, &[65, 149, 256]);
         assert_eq!(ep_wave_route(&f), Ok(EpWaveRoute::FullTable));
         assert_eq!(ep_wave_refusal(&f), None);
-        let f = facts_under(Some(150), true, true, &[60, 149, 150]);
+        let f = facts_under(Some(150), true, true, &[65, 149, 150]);
         let why = refused(&f);
         assert!(
             why.contains("differ")
                 && why.contains("lane 2 (150 rows) takes the owner-routed tile route")
-                && why.contains("lane 0 (60 rows) the full-table route"),
+                && why.contains("lane 0 (65 rows) the full-table route"),
             "{why}"
         );
         // A lab floor of 100 on the A4 chain puts the lanes at or above it on the tile route
@@ -986,7 +1002,7 @@ mod tests {
     #[test]
     fn the_wave_enters_the_tile_scopes_with_the_widest_lane_not_the_total() {
         assert_eq!(ep_wave_scope_rows(&[149; 8]), 149);
-        assert_eq!(ep_wave_scope_rows(&[60, 60, 149, 256, 511]), 511);
+        assert_eq!(ep_wave_scope_rows(&[65, 65, 149, 256, 511]), 511);
         assert!(ep_wave_scope_rows(&[511; 4]) < rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS);
         assert_eq!(ep_wave_scope_rows(&[]), 0);
         let src = include_str!("ep_wave.rs");
