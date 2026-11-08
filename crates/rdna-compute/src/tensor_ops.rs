@@ -2700,7 +2700,7 @@ pub fn hyper_norm_gate_outputs(gpu: &mut Gpu, p: &HyperNormGateOutputs<'_>) -> H
 /// (`hyper_norm_gate_k4_outputs_f32`, `HIPFIRE_QWEN4_HC_PAIR_DECODE`): `normalized` is
 /// bitwise [`hyper_norm`]'s and `gates` bitwise the write's `gemv_bf16_xf32_k4` /
 /// `gemv_bf16_xf32_k4_rows_r<R>` / `_otile_r<R>` launch over that `normalized` (no
-/// `hc_act`), for 1..=8 rows. Four branches, hidden 2560.
+/// `hc_act`), for 1..=64 rows (`WIDE_VERIFY_MAX_ROWS`). Four branches, hidden 2560.
 pub struct HyperNormGateK4Outputs<'a> {
     pub input: &'a GpuTensor,
     pub norm_weight: &'a GpuTensor,
@@ -2717,14 +2717,18 @@ pub struct HyperNormGateK4Outputs<'a> {
     pub state_bf16: bool,
 }
 
-/// Bytes of the per-Gpu row-completion buffer of [`hyper_norm_gate_k4_outputs`]: 8 counters
-/// (padded to 64 B) and the `[8 rows][4 gates][4 quarters]` F32 quarter scratch.
-const HC_PAIR_SYNC_BYTES: usize = 64 + 8 * 16 * 4;
+/// Rows the fused launch supports: the wide verify cap (and so the persistent sync buffer's size).
+const HC_PAIR_MAX_ROWS: usize = crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
+/// Byte offset of the quarter scratch: `HC_PAIR_MAX_ROWS` u32 counters padded to a 64-B multiple.
+const HC_PAIR_SCRATCH_OFFSET: usize = (HC_PAIR_MAX_ROWS * 4).div_ceil(64) * 64;
+/// Bytes of the per-Gpu row-completion buffer of [`hyper_norm_gate_k4_outputs`]: the counters
+/// (padded to 64 B) and the `[HC_PAIR_MAX_ROWS rows][4 gates][4 quarters]` F32 quarter scratch.
+const HC_PAIR_SYNC_BYTES: usize = HC_PAIR_SCRATCH_OFFSET + HC_PAIR_MAX_ROWS * 16 * 4;
 
 impl HyperNormGateK4Outputs<'_> {
-    /// Geometry the kernel supports: four branches, hidden 2560, 1..=8 rows.
+    /// Geometry the kernel supports: four branches, hidden 2560, 1..=64 rows.
     pub fn supports(branches: usize, hidden: usize, rows: usize) -> bool {
-        branches == 4 && hidden == 2560 && (1..=8).contains(&rows)
+        branches == 4 && hidden == 2560 && (1..=HC_PAIR_MAX_ROWS).contains(&rows)
     }
 }
 
@@ -2763,7 +2767,7 @@ pub fn hyper_norm_gate_k4_outputs(gpu: &mut Gpu, p: &HyperNormGateK4Outputs<'_>)
         TENSOR_OPS_SRC,
         "hyper_norm_gate_k4_outputs_f32",
     )?;
-    // `[8 u32 counters | pad to 64 B | 8 rows x 4 gates x 4 quarters f32]`, zeroed once.
+    // `[64 u32 counters | 64 rows x 4 gates x 4 quarters f32]`, zeroed once.
     if gpu.hc_pair_sync.is_none() {
         gpu.bind_thread()?;
         let sync = gpu.alloc_tensor(&[HC_PAIR_SYNC_BYTES / 4], DType::F32)?;
@@ -2771,8 +2775,10 @@ pub fn hyper_norm_gate_k4_outputs(gpu: &mut Gpu, p: &HyperNormGateK4Outputs<'_>)
         gpu.hc_pair_sync = Some(sync);
     }
     let counters = gpu.hc_pair_sync.as_ref().unwrap().buf.as_ptr();
-    // SAFETY: the buffer is HC_PAIR_SYNC_BYTES long; the quarter scratch starts at byte 64.
-    let scratch = unsafe { (counters as *mut u8).add(64) } as *mut std::ffi::c_void;
+    // SAFETY: the buffer is HC_PAIR_SYNC_BYTES long; the quarter scratch starts at
+    // HC_PAIR_SCRATCH_OFFSET.
+    let scratch =
+        unsafe { (counters as *mut u8).add(HC_PAIR_SCRATCH_OFFSET) } as *mut std::ffi::c_void;
     let mut args = KernargBlob::new();
     args.push_ptr(p.input.buf.as_ptr());
     args.push_ptr(p.norm_weight.buf.as_ptr());

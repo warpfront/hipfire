@@ -2530,15 +2530,27 @@ fn hyper_write_gates_k4(gpu: &Gpu, op: &HyperWriteOp<'_>) -> bool {
         ) == Some(4)
 }
 
+/// Whether the read's row count takes the fused `hyper_norm_gate_k4_outputs_f32` launch: 1..=8
+/// rows with `HIPFIRE_QWEN4_HC_PAIR_DECODE`, 9..=64 rows (wide verify) additionally with
+/// `HIPFIRE_QWEN4_HC_PAIR_WIDE` and only eagerly (the kernel's persistent counter buffer is
+/// refused under replay recording / graph capture, where the allrows pair runs instead).
+fn hyper_pair_fused_rows(gpu: &Gpu, read: &HyperReadOp<'_>) -> bool {
+    HyperNormGateK4Outputs::supports(read.branches, read.hidden, read.rows)
+        && gpu.flags.qwen4_hc_pair_decode_enabled()
+        && (read.rows <= 8
+            || (gpu.flags.qwen4_hc_pair_wide_enabled()
+                && !gpu.replay.is_recording()
+                && !gpu.graphs.capture_mode))
+}
+
 /// Whether the decode read `read` also produces its paired write's gates in the same launch
 /// (`HIPFIRE_QWEN4_HC_PAIR_DECODE`, exact gfx1201): the write's gate route is the k4 route and
 /// the geometry is the kernel's (four branches, hidden 2560, 1..=8 rows, BF16 `block_inject`
 /// `[4, 4 * hidden]` without AWQ scale, F32 gates). `hyper_norm_gate_k4_outputs_f32` is bitwise
 /// `hyper_norm` followed by that k4 gate GEMV, so the write then runs pregated.
 fn hyper_pair_decode_applies(gpu: &Gpu, read: &HyperReadOp<'_>, write: &HyperWriteOp<'_>) -> bool {
-    gpu.flags.qwen4_hc_pair_decode_enabled()
+    hyper_pair_fused_rows(gpu, read)
         && hyper_write_gates_k4(gpu, write)
-        && HyperNormGateK4Outputs::supports(read.branches, read.hidden, read.rows)
         && write.rows == read.rows
         && write.branches == read.branches
         && write.hidden == read.hidden
@@ -2551,14 +2563,16 @@ fn hyper_pair_decode_applies(gpu: &Gpu, read: &HyperReadOp<'_>, write: &HyperWri
         && write.gates.numel() >= write.rows * write.branches
 }
 
-/// Whether the k4-route read `read` (past [`hyper_pair_decode_applies`]'s 1..=8 rows) hands its
+/// Whether the k4-route read `read` (every wide row count [`hyper_pair_fused_rows`] does not take) hands its
 /// paired write the gates (`HIPFIRE_QWEN4_HC_PAIR_ALLROWS`, exact gfx1201): the write's gate
 /// route is the k4 GEMV over its own `hyper_norm` of the same streams with the same norm weight
 /// ([`hyper_read_pairs_write`]), so running that GEMV on the read's `normalized` is the write's
 /// launch on the same bytes, and the write skips its norm (`hyper_write` never reads it).
 fn hyper_pair_allrows_applies(gpu: &Gpu, read: &HyperReadOp<'_>, write: &HyperWriteOp<'_>) -> bool {
     gpu.flags.qwen4_hc_pair_allrows_enabled()
-        && !HyperNormGateK4Outputs::supports(read.branches, read.hidden, read.rows)
+        && !(read.rows <= 8
+            && HyperNormGateK4Outputs::supports(read.branches, read.hidden, read.rows))
+        && !hyper_pair_fused_rows(gpu, read)
         && hyper_write_gates_k4(gpu, write)
         && write.rows == read.rows
         && write.branches == read.branches

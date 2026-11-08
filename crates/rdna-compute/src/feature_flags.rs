@@ -251,6 +251,11 @@ pub struct FeatureFlags {
     /// (`HIPFIRE_QWEN4_HC_PAIR_DECODE`, 1..=8 rows): bitwise the unfused `hyper_norm` +
     /// `gemv_bf16_xf32_k4` sequence. Default on for exact gfx1201 (`=0` kills it).
     pub qwen4_hc_pair_decode: bool,
+    /// The fused HC read norm + paired write gate launch also serves the wide verify's
+    /// 9..=64 rows (`HIPFIRE_QWEN4_HC_PAIR_WIDE`, needs `HIPFIRE_QWEN4_HC_PAIR_DECODE`); `=0`
+    /// keeps the two-launch `hyper_norm` + `gemv_bf16_xf32_k4_rows` pair there. Byte-identical.
+    /// Default on for exact gfx1201.
+    pub qwen4_hc_pair_wide: bool,
     /// The QSA select score scratch is reserved at the call's shape bound
     /// (`HIPFIRE_QWEN4_QSA_SCORES_RESERVE`), so a growing block count never regrows the shared
     /// F16 scratch (device sync + free + malloc). Default on for exact gfx1201.
@@ -1207,6 +1212,7 @@ impl FeatureFlags {
             ep_ar_fast_apply: parse_bool("HIPFIRE_EP_AR_FAST_APPLY").unwrap_or(true),
             ep_ar_wide_grid: parse_bool("HIPFIRE_EP_AR_WIDE_GRID").unwrap_or(true),
             qwen4_hc_pair_decode: parse_bool("HIPFIRE_QWEN4_HC_PAIR_DECODE").unwrap_or(true),
+            qwen4_hc_pair_wide: parse_bool("HIPFIRE_QWEN4_HC_PAIR_WIDE").unwrap_or(true),
             qwen4_qsa_scores_reserve: parse_bool("HIPFIRE_QWEN4_QSA_SCORES_RESERVE")
                 .unwrap_or(true),
             stream_ordered_copies: parse_bool("HIPFIRE_STREAM_ORDERED_COPIES").unwrap_or(true),
@@ -2054,6 +2060,13 @@ impl FeatureFlags {
         self.qwen4_hc_pair_decode && self.arch == "gfx1201"
     }
 
+    /// Fused HC read norm + paired write gates at 9..=64 verify rows
+    /// (`HIPFIRE_QWEN4_HC_PAIR_WIDE`, default on, `=0` kills it); needs the decode flag.
+    /// Exact gfx1201 only.
+    pub fn qwen4_hc_pair_wide_enabled(&self) -> bool {
+        self.qwen4_hc_pair_wide && self.qwen4_hc_pair_decode_enabled()
+    }
+
     /// QSA select score scratch reserved at the shape bound
     /// (`HIPFIRE_QWEN4_QSA_SCORES_RESERVE`, default on, `=0` kills it). Exact gfx1201 only.
     pub fn qwen4_qsa_scores_reserve_enabled(&self) -> bool {
@@ -2240,6 +2253,7 @@ impl FeatureFlags {
             ep_ar_fast_apply: false,
             ep_ar_wide_grid: false,
             qwen4_hc_pair_decode: false,
+            qwen4_hc_pair_wide: false,
             qwen4_qsa_scores_reserve: false,
             stream_ordered_copies: false,
             qwen4_hc_pair_allrows: false,
@@ -3903,6 +3917,33 @@ mod tests {
             );
         }
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_qsa_scores_reserve_enabled());
+    }
+
+    /// The wide fused HC pair is default on (`=0` kills) and reaches exact gfx1201 only.
+    #[test]
+    fn qwen4_hc_pair_wide_defaults_on_exact_gfx1201() {
+        let with = |name: &'static str, value: &'static str| {
+            move |n: &str| -> std::result::Result<String, ()> {
+                if n == name {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in ["gfx906", "gfx1100", "gfx1151", "gfx1200", "gfx1201"] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                unset.qwen4_hc_pair_wide_enabled(),
+                arch == "gfx1201",
+                "{arch}"
+            );
+            let off = FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_HC_PAIR_WIDE", "0"));
+            assert!(!off.qwen4_hc_pair_wide_enabled(), "{arch}: 0");
+        }
+        let decode_off =
+            FeatureFlags::from_lookup("gfx1201", with("HIPFIRE_QWEN4_HC_PAIR_DECODE", "0"));
+        assert!(!decode_off.qwen4_hc_pair_wide_enabled());
     }
 
     /// The wide-verify HC read/write gate pairing is default on (`=0` kills) and reaches exact gfx1201 only.

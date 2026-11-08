@@ -2,8 +2,9 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Byte oracle of the decode HC read/write pair fusion (`HIPFIRE_QWEN4_HC_PAIR_DECODE`,
-//! `hyper_norm_gate_k4_outputs_f32`).
+//! Byte oracle of the decode / wide-verify HC read/write pair fusion
+//! (`HIPFIRE_QWEN4_HC_PAIR_DECODE`, `HIPFIRE_QWEN4_HC_PAIR_WIDE`,
+//! `hyper_norm_gate_k4_outputs_f32`), rows `1..=64`.
 //!
 //! ```text
 //! hc_pair_decode_oracle [SEEDS]        (default 32 seeds)
@@ -11,14 +12,16 @@
 //! ```
 //!
 //! On one GPU, for random HC streams (F32 words and BF16 bits, `state_bf16`), random BF16 norm
-//! weights and random BF16 `block_inject` gate weights at hidden 2560 x 4 branches, rows `1..=8`,
+//! weights and random BF16 `block_inject` gate weights at hidden 2560 x 4 branches, rows `1..=64`,
 //! several activation scale classes per seed, the fused launch is compared bit for bit with the
 //! unfused sequence the paired write would run:
 //!
 //! * `normalized`: `hyper_norm` (`hyper_norm_f32`);
 //! * `gates`: the write's k4 gate route over that `normalized` -- `Gpu::gemv_bf16_xf32_k4_rows`
 //!   (the launcher the dispatch calls: `gemv_bf16_xf32_k4` at one row, `_k4_rows_r<R>` /
-//!   `_otile_r<R>` per the flag at 2..=8), the otile entry directly at 2..=8 rows, and each
+//!   `_otile_r<R>` per the flag at 2..=8, `gemv_bf16_xf32_k4_rows_allrows_m<TM>u<U>` at 9..=64
+//!   under `HIPFIRE_QWEN4_HC_K4_ALLROWS`: exactly today's wide route, asserted per row count
+//!   via `Gpu::hc_k4_allrows_applies`), the otile entry directly at 2..=8 rows, and each
 //!   row alone through `gemv_bf16_xf32_k4`.
 //!
 //! Outputs sit in sentinel-filled allocations (`0xFF` words, a 16-word tail past the gates);
@@ -36,7 +39,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 const HIDDEN: usize = 2560;
 const BRANCHES: usize = 4;
 const WIDE: usize = HIDDEN * BRANCHES;
-const MAX_ROWS: usize = 8;
+const MAX_ROWS: usize = 64;
 const GATE_TAIL: usize = 16;
 /// Activation scale classes (each seed x class is one stream set).
 const AMPS: [f32; 4] = [1.0, 1.0 / 1024.0, 48.0, 0.0625];
@@ -184,6 +187,12 @@ fn reference(gpu: &mut Gpu, c: &Case<'_>) -> Result<(Vec<f32>, Vec<f32>, Vec<f32
         },
     )
     .map_err(err)?;
+    if c.rows > 8 && !gpu.hc_k4_allrows_applies(WIDE, c.rows) {
+        return Err(format!(
+            "rows {}: the allrows k4 entry does not apply (HIPFIRE_QWEN4_HC_K4_ALLROWS off?)",
+            c.rows
+        ));
+    }
     let gates = gpu
         .alloc_tensor(&[c.rows * BRANCHES], DType::F32)
         .map_err(err)?;
@@ -198,7 +207,7 @@ fn reference(gpu: &mut Gpu, c: &Case<'_>) -> Result<(Vec<f32>, Vec<f32>, Vec<f32
     )
     .map_err(err)?;
     let mut otile = Vec::new();
-    if c.rows >= 2 {
+    if (2..=8).contains(&c.rows) {
         let y = gpu
             .alloc_tensor(&[c.rows * BRANCHES], DType::F32)
             .map_err(err)?;
@@ -293,7 +302,7 @@ fn fused(
 }
 
 /// `--bench`: median microseconds per launch of the fused kernel and of the `hyper_norm` +
-/// k4 gate pair it replaces, at 1 and 8 rows, F32 streams. 200 samples per cell, each the
+/// k4 gate pair it replaces, at 1, 8, 24, 32, 48 and 64 rows, F32 streams. 200 samples per cell, each the
 /// hipEvent time of 10 back-to-back launches divided by 10 (so event overhead is amortised);
 /// 20 untimed warm-up launches first. No result is compared here.
 fn bench(gpu: &mut Gpu) -> Result<i32, String> {
@@ -304,7 +313,7 @@ fn bench(gpu: &mut Gpu) -> Result<i32, String> {
     let gw = gen_values(BRANCHES * WIDE, 0.05, &mut rng);
     let norm_weight = upload_typed(gpu, &bf16_bytes(&nw), WIDE, DType::BF16)?;
     let gate_weight = upload_typed(gpu, &bf16_bytes(&gw), BRANCHES * WIDE, DType::BF16)?;
-    for rows in [1usize, 8] {
+    for rows in [1usize, 8, 24, 32, 48, 64] {
         let values = gen_values(rows * WIDE, 1.0, &mut rng);
         let n = rows * WIDE;
         let input = upload_typed(gpu, &stream_bytes(&values, false), n, DType::F32)?;
@@ -355,8 +364,8 @@ fn bench(gpu: &mut Gpu) -> Result<i32, String> {
         };
         let start = gpu.hip.event_create().map_err(err)?;
         let stop = gpu.hip.event_create().map_err(err)?;
-        let mut median_us = |gpu: &mut Gpu,
-                             body: &mut dyn FnMut(&mut Gpu) -> Result<(), String>|
+        let median_us = |gpu: &mut Gpu,
+                         body: &mut dyn FnMut(&mut Gpu) -> Result<(), String>|
          -> Result<f64, String> {
             for _ in 0..20 {
                 body(gpu)?;
@@ -396,6 +405,7 @@ fn run() -> Result<i32, String> {
     };
     let mut gpu = Gpu::init().map_err(err)?;
     println!("device arch: {}", gpu.arch);
+    println!("k4 entry at rows 9..=64: gemv_bf16_xf32_k4_rows -> gemv_bf16_xf32_k4_rows_allrows_m<TM>u<U> (HIPFIRE_QWEN4_HC_K4_ALLROWS)");
     if !gpu.arch_caps.has_gfx11_plus_simt() {
         eprintln!(
             "refusing: the fused kernel is a gfx11+ route ({})",
@@ -440,13 +450,13 @@ fn run() -> Result<i32, String> {
                     st.compare(&format!("{tag} normalized"), &got_norm, &want_norm);
                     st.compare(&format!("{tag} gates/route"), &got_gates, &want_gates);
                     st.compare(&format!("{tag} gates/single"), &got_gates, &single);
-                    if rows >= 2 {
+                    if (2..=8).contains(&rows) {
                         st.compare(&format!("{tag} gates/otile"), &got_gates, &want_otile);
                     }
                     // Negative control (once per format per seed, 3 rows): flip an exponent
                     // bit of one stream element; the fused outputs must differ from the
                     // unperturbed reference.
-                    if rows == 3 && amp == AMPS[0] {
+                    if (rows == 3 || rows == 40) && amp == AMPS[0] {
                         let mut bad = values[..rows * WIDE].to_vec();
                         // 1000.0 is BF16-exact and far from any gaussian draw.
                         bad[WIDE + 17] = 1000.0;
