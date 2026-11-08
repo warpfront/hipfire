@@ -545,7 +545,8 @@ impl<'a> MoeStepState<'a> {
     }
 
     /// Whether the qt44 combine of this call can take over `clear`'s zero
-    /// fill (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`, exact gfx1151 / gfx1201):
+    /// fill (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`, exact gfx1151 / gfx1201; on the
+    /// wide-verify int8 chain also `HIPFIRE_QWEN4_FFN_CLEAR_ABSORB`, exact gfx1201):
     /// the combine writes every element `clear` zeroes, into that very
     /// tensor, nothing else writes it before the combine, and nothing is
     /// recorded or captured (a retained tape keeps the clear's shape).

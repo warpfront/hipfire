@@ -1498,7 +1498,7 @@ pub(crate) fn row_fold_applies(
     let target = p.routed_out.unwrap_or(p.x_batch);
     gpu.flags.qwen4_hc_row_fold_enabled()
         && hc.state_bf16
-        && combine_initial_zero_applies(gpu, p, use_path2)
+        && combine_initial_zero_rows_applies(gpu, p, use_path2)
         && hc_shared_down_admits(gpu, p, hc)
         && gpu.hc_row_fold_applies(hc.hidden)
         && p.k_top == 10
@@ -1529,7 +1529,7 @@ fn row_fold_gfx1201_applies(
     let target = p.routed_out.unwrap_or(p.x_batch);
     gpu.flags.qwen4_hc_row_fold_moe_gfx1201_enabled()
         && hc.state_bf16
-        && combine_initial_zero_applies(gpu, p, use_path2)
+        && combine_initial_zero_rows_applies(gpu, p, use_path2)
         && !super::layer_ops::wide_exact_rows(gpu, p.batch_size)
         && !gpu.qwen4_shared_down_epi_enabled()
         && p.shared_down_out.is_none()
@@ -2909,19 +2909,43 @@ fn down_stage(
 }
 
 /// Whether [`combine`] can start from +0.0 instead of the zero-filled target
-/// (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`): the BF16-row combine of path 2, with
-/// nothing writing the target between its zero fill and the combine (the
-/// shared down, the only other writer, runs after it).
+/// (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`; the wide-verify int8 chain also needs
+/// `HIPFIRE_QWEN4_FFN_CLEAR_ABSORB`, [`ffn_clear_absorb_a8`]): the BF16-row
+/// combine of path 2, with nothing writing the target between its zero fill and
+/// the combine (the shared down, the only other writer, runs after it).
 /// Never applies on the qt=55 FP8 route.
 pub(crate) fn combine_initial_zero_applies(
     gpu: &Gpu,
     p: &MoePrefillParams<'_>,
     use_path2: bool,
 ) -> bool {
+    combine_initial_zero_rows_applies(gpu, p, use_path2) || ffn_clear_absorb_a8(gpu, p, use_path2)
+}
+
+/// [`combine_initial_zero_applies`] without the wide-verify int8 chain: the F16 WMMA /
+/// symmetric IU4 BF16-row arms, the only ones the HC row folds were proven on.
+fn combine_initial_zero_rows_applies(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
     !is_fp8(p)
         && grouped_path(gpu, p, use_path2)
         && !indexed_down(gpu, p, use_path2)
         && (down_wmma(gpu, p) || sym_iu4(gpu, p, use_path2))
+        && p.recipe.shared_after_combine()
+}
+
+/// `HIPFIRE_QWEN4_FFN_CLEAR_ABSORB` (exact gfx1201, default on): the wide-verify int8 chain
+/// ([`ep_a8_wide`]: the 9..=64-row EP2 verify MoE, no gather, no tile exchange) combines through
+/// `moe_down_combine_grouped_top10_bf16in_owned`, the same BF16-row combine entry the F16 WMMA /
+/// symmetric IU4 arms use, so it can take its `_zinit` store arm too. That kernel visits every
+/// `(token, column)` of the target whether or not the owner mask marks a rank's grouped rows
+/// foreign (a foreign rank adds a +0 BF16 row), so every element the clear zeroes is stored.
+/// Never with [`ep_grouped_down_unscatter`] (the slot-order combine accumulates).
+fn ffn_clear_absorb_a8(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
+    gpu.flags.qwen4_ffn_clear_absorb_enabled()
+        && !is_fp8(p)
+        && grouped_path(gpu, p, use_path2)
+        && !indexed_down(gpu, p, use_path2)
+        && !ep_grouped_down_unscatter(gpu, p, use_path2)
+        && ep_a8_wide(gpu, p, use_path2)
         && p.recipe.shared_after_combine()
 }
 

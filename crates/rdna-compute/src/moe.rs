@@ -5705,7 +5705,9 @@ mod tests {
             ("none_owned", |_| 1, 0),
             ("all_owned", |_| 0, 0),
         ];
-        for tokens in [1usize, 37, 530, 4096] {
+        // 3 rows: the few-row verify; 9 / 47 / 48 / 64: the wide-verify int8 chain's rows
+        // (`HIPFIRE_QWEN4_FFN_CLEAR_ABSORB`, the 9..=64-row owner-masked EP2 verify MoE).
+        for tokens in [1usize, 3, 9, 37, 47, 48, 64, 530, 4096] {
             let slots = tokens * 10;
             let mut state = 0x9E37_79B9u64 ^ tokens as u64;
             let mut next = || {
@@ -5850,6 +5852,58 @@ mod tests {
                         !b.iter().any(|v| v.is_nan()),
                         "NaN leaked: {name} tokens={tokens}"
                     );
+                    if initial_zero {
+                        // The production route today: the FFN `zero_f32`, then the owned
+                        // combine accumulating (`initial_zero = false`) over the same poisoned
+                        // foreign rows. The absorbed arm (dirty target, `_zinit`) must store the
+                        // very same words in every (token, column), owned or foreign.
+                        let zeroed_t = gpu.zeros(&[tokens * HIDDEN], DType::F32).expect("zeros");
+                        let order_prod = gpu
+                            .upload_raw(&vec![0u8; slots * 8], &[slots * 8])
+                            .expect("order");
+                        gpu.moe_down_combine_grouped_top10_bf16in_owned(
+                            &poison_t,
+                            &inverse_t,
+                            &experts_t,
+                            &weights_t,
+                            &zeroed_t,
+                            &order_prod,
+                            HIDDEN,
+                            grouped_rows,
+                            tokens,
+                            false,
+                            N_EXP,
+                            Some(crate::hc_row_fold::CombineOwners {
+                                table: &owner_t,
+                                rank,
+                            }),
+                        )
+                        .expect("production owned combine");
+                        let prod = gpu.download_f32(&zeroed_t).expect("download");
+                        let prod_differing = prod
+                            .iter()
+                            .zip(&b)
+                            .filter(|(x, y)| x.to_bits() != y.to_bits())
+                            .count();
+                        assert_eq!(
+                            prod_differing, 0,
+                            "absorbed store differs from clear + accumulate in {prod_differing} of {} words: {name} tokens={tokens}",
+                            prod.len()
+                        );
+                        if let Ok(path) = std::env::var("OWNED_COMBINE_RECEIPT") {
+                            let mut f = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(path)
+                                .expect("receipt");
+                            writeln!(
+                                f,
+                                "tokens={tokens} case={name} absorbed_vs_clear_accumulate words={} mismatches=0",
+                                prod.len()
+                            )
+                            .expect("receipt write");
+                        }
+                    }
                     if name != "none_owned" {
                         assert!(a.iter().any(|v| *v != 0.0), "baseline all zero: {name}");
                     }
