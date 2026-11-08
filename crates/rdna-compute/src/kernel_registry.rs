@@ -4316,6 +4316,16 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "moe_shared_down_combine_rows_r6",
                 "moe_shared_down_combine_rows_r7",
                 "moe_shared_down_combine_rows_r8",
+                // `HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS` (developer, default off): the store
+                // entries that take over the FFN `zero_f32` fill.
+                "moe_shared_down_combine_rows_r1_zinit",
+                "moe_shared_down_combine_rows_r2_zinit",
+                "moe_shared_down_combine_rows_r3_zinit",
+                "moe_shared_down_combine_rows_r4_zinit",
+                "moe_shared_down_combine_rows_r5_zinit",
+                "moe_shared_down_combine_rows_r6_zinit",
+                "moe_shared_down_combine_rows_r7_zinit",
+                "moe_shared_down_combine_rows_r8_zinit",
             ]
         );
     }

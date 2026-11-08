@@ -25,6 +25,15 @@
 //! outputs is counted as a payload-only difference (reported, never a failure). Every other
 //! word must be bit-identical.
 //!
+//! `HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS` (`moe_epilogue_fuse_zinit_matches_zero_fill_hw`): the
+//! `moe_shared_down_combine_rows_r<R>_zinit` entries on a DIRTY target (NaN / garbage poison,
+//! plus a sentinel tail past the `[rows, 2560]` extent) against a zero-filled target + the plain
+//! `r<R>` entry, every word of the target compared bit for bit (NaN payloads included), rows
+//! 1..=8, the scenarios above plus EP owner masks (foreign experts as `-1` ids with NaN expert
+//! rows / weights at their slots). A negative control runs the plain entry on the garbage target
+//! and must differ from the zero-fill reference at every row count (the comparison sees a seed
+//! that is not zero). `moe_epilogue_fuse_zinit_bench_hw` times `zero_f32 + r<R>` against `r<R>_zinit`.
+//!
 //! `#[ignore]`d: needs an exact gfx1201 device. Sets the flag itself.
 //!
 //!   cargo test -p rdna-compute --release --test moe_epilogue_fuse_hw -- --ignored --nocapture
@@ -190,6 +199,13 @@ enum Scenario {
     Special,
     /// A non-zero BF16-exact combine seed (the target is not always the zero fill).
     Seeded,
+    /// EP2 owner mask, rank 0 / rank 1: the experts of the other parity are foreign, masked to
+    /// `-1` ids with NaN expert rows / weights at their slots (a dead rank's row is valid memory,
+    /// never used).
+    Foreign0,
+    Foreign1,
+    /// Every expert foreign (a rank that owns none of a row's routes).
+    ForeignAll,
 }
 
 fn special(rng: &mut Lcg, v: f32) -> f32 {
@@ -383,6 +399,7 @@ fn moe_epilogue_fuse_matches_unfused_chain_hw() {
                         weight: &w_t,
                         x: &x_t,
                         target: &got_target,
+                        initial_zero: false,
                         expert_outputs: &eo_t,
                         topk_indices: &ids_t,
                         topk_weights: &wts_t,
@@ -427,4 +444,339 @@ fn moe_epilogue_fuse_matches_unfused_chain_hw() {
         mismatches, 0,
         "the fused shared-down GEMV + combine is not bit-identical to combine + GEMV + scaled_add"
     );
+}
+
+/// The case inputs of one `(scenario, rows, seed)`: `(expanded rows, hidden, scalar, ids, weights)`.
+fn zinit_case(
+    scenario: Scenario,
+    rows: usize,
+    seed: u64,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<i32>, Vec<f32>) {
+    let mut rng = Lcg(0x21_17_00_00 + (rows as u64) * 100 + seed);
+    let exact = !matches!(scenario, Scenario::Raw | Scenario::Special);
+    let gen = |rng: &mut Lcg, scale: f32| -> f32 {
+        let v = rng.signed() * scale;
+        let v = if scenario == Scenario::Special { special(rng, v) } else { v };
+        if exact {
+            bf16_round(v)
+        } else {
+            v
+        }
+    };
+    let mut eo: Vec<f32> = (0..rows * 10 * M).map(|_| gen(&mut rng, 0.06)).collect();
+    let x: Vec<f32> = (0..rows * K).map(|_| gen(&mut rng, 1.5)).collect();
+    let scalar: Vec<f32> = (0..rows)
+        .map(|_| {
+            let v = rng.unit();
+            if exact {
+                bf16_round(v)
+            } else {
+                v
+            }
+        })
+        .collect();
+    let mut ids = vec![0i32; rows * 10];
+    let mut wts = vec![0f32; rows * 10];
+    for r in 0..rows {
+        let mut pool: Vec<i32> = (0..N_EXP as i32).collect();
+        for k in 0..10 {
+            let pick = rng.next_u32() as usize % pool.len();
+            ids[r * 10 + k] = pool.swap_remove(pick);
+            let v = rng.unit() * 0.3;
+            wts[r * 10 + k] = if exact { bf16_round(v) } else { v };
+        }
+        if scenario == Scenario::IdEdges {
+            if r % 2 == 0 {
+                ids[r * 10 + 3] = ids[r * 10 + 7];
+                ids[r * 10 + 1] = ids[r * 10 + 2];
+            }
+            if r % 3 == 0 {
+                ids[r * 10 + 5] = -1;
+                ids[r * 10 + 9] = N_EXP as i32 + 5;
+            }
+            if r % 5 == 1 {
+                for k in 0..10 {
+                    ids[r * 10 + k] = -1;
+                }
+            }
+            if r % 4 == 2 {
+                for k in 0..10 {
+                    ids[r * 10 + k] = 7;
+                }
+            }
+        }
+        let owner = match scenario {
+            Scenario::Foreign0 => Some(0),
+            Scenario::Foreign1 => Some(1),
+            _ => None,
+        };
+        for k in 0..10 {
+            let slot = r * 10 + k;
+            let foreign = scenario == Scenario::ForeignAll
+                || owner.is_some_and(|rank| (ids[slot] as usize) % 2 != rank);
+            if foreign {
+                ids[slot] = -1;
+                wts[slot] = f32::NAN;
+                for c in 0..M {
+                    eo[slot * M + c] = if c % 3 == 0 { f32::NAN } else { f32::INFINITY };
+                }
+            }
+        }
+    }
+    (eo, x, scalar, ids, wts)
+}
+
+/// `[rows * M]` target words followed by a sentinel tail of `TAIL` words, the head filled by `head`.
+const TAIL: usize = 1024;
+const SENTINEL: u32 = 0xA5A5_A5A5;
+fn tailed_target(gpu: &mut Gpu, rows: usize, mut head: impl FnMut(usize) -> u32) -> GpuTensor {
+    let words: Vec<u32> = (0..rows * M + TAIL)
+        .map(|i| if i < rows * M { head(i) } else { SENTINEL })
+        .collect();
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) };
+    upload_bytes(gpu, DType::F32, words.len(), bytes)
+}
+
+fn real_or_seeded_weights() -> Vec<(String, Vec<u16>)> {
+    let model = std::env::var("HIPFIRE_FN_MODEL").unwrap_or_else(|_| {
+        "/home/kaden/qcal/release-0.4.3/mgfn/model/qwen3.8-flash-next-base.mq4-xts".to_owned()
+    });
+    let mut weights: Vec<(String, Vec<u16>)> = Vec::new();
+    for layer in [0usize, 17, 47] {
+        let name =
+            format!("model.language_model.layers.{layer}.mlp.shared_expert.down_proj.weight");
+        if let Some(raw) = read_hfqm_tensor(&model, &name) {
+            assert_eq!(raw.len(), M * K * 2, "{name}: not [2560, 640] BF16");
+            weights.push((
+                format!("real layer {layer}"),
+                raw.chunks_exact(2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .collect(),
+            ));
+        }
+    }
+    let mut rng = Lcg(0xD0_0001);
+    weights.push((
+        "seeded".to_owned(),
+        (0..M * K).map(|_| bf16_bits(rng.signed() * 0.04)).collect(),
+    ));
+    weights
+}
+
+#[test]
+#[ignore = "needs an exact gfx1201 GPU"]
+fn moe_epilogue_fuse_zinit_matches_zero_fill_hw() {
+    std::env::set_var("HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE", "1");
+    let mut gpu = Gpu::init().expect("GPU required");
+    if !gpu.arch_caps.is_gfx1201() {
+        eprintln!("SKIP: requires exact gfx1201.");
+        return;
+    }
+    let weights = real_or_seeded_weights();
+    eprintln!("zinit oracle: {} weight matrices ({} real)", weights.len(), weights.len() - 1);
+    let scenarios = [
+        Scenario::Exact,
+        Scenario::Raw,
+        Scenario::IdEdges,
+        Scenario::Special,
+        Scenario::Foreign0,
+        Scenario::Foreign1,
+        Scenario::ForeignAll,
+    ];
+    // Dirty fills of the candidate's target head: the poison the absorbed fill must never read.
+    type Fill = (&'static str, fn(usize) -> u32);
+    let fills: [Fill; 4] = [
+        ("nan", |_| 0x7FC0_0000),
+        ("neg_snan", |_| 0xFFA0_0001),
+        ("garbage", |i| (i as u32).wrapping_mul(2654435761) ^ 0x3F80_0000),
+        ("inf_mix", |i| if i % 2 == 0 { 0x7F80_0000 } else { 0xFF80_0000 }),
+    ];
+    let (mut cells, mut words, mut mismatches, mut tail_written) = (0usize, 0usize, 0usize, 0usize);
+    let mut control_cells = 0usize;
+    let mut control_rows_seen = [false; 8];
+    for (wi, (wname, w)) in weights.iter().enumerate() {
+        let w_t = upload_bf16(&mut gpu, w);
+        for (si, scenario) in scenarios.into_iter().enumerate() {
+            // The real matrices run the headline scenarios; the seeded one runs them all.
+            if wi + 1 != weights.len() && !matches!(scenario, Scenario::Exact | Scenario::Raw) {
+                continue;
+            }
+            for rows in 1..=8usize {
+                for seed in 0..2u64 {
+                    let (eo, x, scalar, ids, wts) = zinit_case(scenario, rows, seed + 7 * si as u64);
+                    let eo_t = upload_f32(&mut gpu, &eo);
+                    let x_t = upload_f32(&mut gpu, &x);
+                    let scalar_t = upload_f32(&mut gpu, &scalar);
+                    let ids_t = upload_i32(&mut gpu, &ids);
+                    let wts_t = upload_f32(&mut gpu, &wts);
+                    let run = |gpu: &mut Gpu, target: &GpuTensor, initial_zero: bool| {
+                        let p = MoeSharedDownCombine {
+                            weight: &w_t,
+                            x: &x_t,
+                            target,
+                            initial_zero,
+                            expert_outputs: &eo_t,
+                            topk_indices: &ids_t,
+                            topk_weights: &wts_t,
+                            scalar: &scalar_t,
+                            m: M,
+                            k: K,
+                            rows,
+                            n_experts: N_EXP,
+                        };
+                        assert!(p.applies(gpu), "operands rejected: rows {rows}");
+                        moe_shared_down_combine(gpu, &p).expect("fused launch");
+                        gpu.hip.device_synchronize().expect("sync");
+                    };
+                    // Reference: today's route, `zero_f32` + the plain entry.
+                    let ref_t = tailed_target(&mut gpu, rows, |_| 0);
+                    run(&mut gpu, &ref_t, false);
+                    let want = download_u32(&gpu, &ref_t, rows * M + TAIL);
+                    for (fname, fill) in fills {
+                        let got_t = tailed_target(&mut gpu, rows, fill);
+                        run(&mut gpu, &got_t, true);
+                        let got = download_u32(&gpu, &got_t, rows * M + TAIL);
+                        let bad = got[..rows * M]
+                            .iter()
+                            .zip(&want[..rows * M])
+                            .filter(|(g, w)| g != w)
+                            .count();
+                        let tail_bad = got[rows * M..].iter().filter(|&&v| v != SENTINEL).count();
+                        if bad != 0 || tail_bad != 0 {
+                            eprintln!(
+                                "MISMATCH {wname} {scenario:?} rows {rows} seed {seed} fill {fname}: {bad} words, tail {tail_bad}"
+                            );
+                        }
+                        mismatches += bad;
+                        tail_written += tail_bad;
+                        words += rows * M;
+                        cells += 1;
+                    }
+                    // Negative control: the plain entry on the garbage target must NOT match the
+                    // zero-fill reference (the seed is read), or the oracle could not see a seed.
+                    let ctl_t = tailed_target(&mut gpu, rows, fills[2].1);
+                    run(&mut gpu, &ctl_t, false);
+                    let ctl = download_u32(&gpu, &ctl_t, rows * M);
+                    let differs = ctl.iter().zip(&want[..rows * M]).any(|(g, w)| g != w);
+                    if matches!(scenario, Scenario::Exact | Scenario::Raw) {
+                        assert!(differs, "negative control did not differ: {wname} {scenario:?} rows {rows}");
+                        control_rows_seen[rows - 1] = true;
+                        control_cells += 1;
+                    }
+                }
+            }
+        }
+    }
+    eprintln!(
+        "zinit oracle: {cells} cells, {words} words compared, mismatching words {mismatches}, sentinel tail words written {tail_written}; negative control (plain entry on garbage target differs from the zero fill): {control_cells} cells PASS, rows covered {control_rows_seen:?}"
+    );
+    assert!(control_rows_seen.iter().all(|&b| b), "negative control missed a row count");
+    assert_eq!(mismatches, 0, "_zinit on a dirty target is not bit-identical to zero fill + plain entry");
+    assert_eq!(tail_written, 0, "_zinit wrote past the [rows, 2560] target");
+}
+
+fn pct(v: &mut [f64], q: f64) -> f64 {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[((v.len() - 1) as f64 * q).round() as usize]
+}
+
+/// `zero_f32 + r<R>` against `r<R>_zinit`, per row count, events around each sequence (median
+/// of 300, 8 rotated weight sets so the shared-down weight is not L2-resident across iterations),
+/// and a 48-sequence layer loop per variant.
+#[test]
+#[ignore = "needs an exact gfx1201 GPU; timing"]
+fn moe_epilogue_fuse_zinit_bench_hw() {
+    std::env::set_var("HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE", "1");
+    let mut gpu = Gpu::init().expect("GPU required");
+    if !gpu.arch_caps.is_gfx1201() {
+        eprintln!("SKIP: requires exact gfx1201.");
+        return;
+    }
+    const SETS: usize = 8;
+    const WARM: usize = 30;
+    const ITERS: usize = 300;
+    let mut rng = Lcg(0xBE_0001);
+    let sets: Vec<GpuTensor> = (0..SETS)
+        .map(|_| {
+            let w: Vec<u16> = (0..M * K).map(|_| bf16_bits(rng.signed() * 0.04)).collect();
+            upload_bf16(&mut gpu, &w)
+        })
+        .collect();
+    let e0 = gpu.hip.event_create().expect("event");
+    let e1 = gpu.hip.event_create().expect("event");
+    println!("rows | zero_f32+r<R> us p10/p50/p90 | r<R>_zinit us p10/p50/p90 | saved p50 | loop48 per-seq us before / after");
+    for rows in 1..=8usize {
+        let (eo, x, scalar, ids, wts) = zinit_case(Scenario::Exact, rows, 3);
+        let eo_t = upload_f32(&mut gpu, &eo);
+        let x_t = upload_f32(&mut gpu, &x);
+        let scalar_t = upload_f32(&mut gpu, &scalar);
+        let ids_t = upload_i32(&mut gpu, &ids);
+        let wts_t = upload_f32(&mut gpu, &wts);
+        let target = gpu.alloc_tensor(&[rows * M], DType::F32).expect("target");
+        let launch = |gpu: &mut Gpu, set: usize, initial_zero: bool| {
+            let p = MoeSharedDownCombine {
+                weight: &sets[set],
+                x: &x_t,
+                target: &target,
+                initial_zero,
+                expert_outputs: &eo_t,
+                topk_indices: &ids_t,
+                topk_weights: &wts_t,
+                scalar: &scalar_t,
+                m: M,
+                k: K,
+                rows,
+                n_experts: N_EXP,
+            };
+            moe_shared_down_combine(gpu, &p).expect("fused launch");
+        };
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        for it in 0..WARM + ITERS {
+            let (sb, sa) = (it % SETS, (it + 3) % SETS);
+            gpu.hip.event_record(&e0, gpu.active_stream.as_ref()).unwrap();
+            gpu.zero_f32(&target).expect("zero_f32");
+            launch(&mut gpu, sb, false);
+            gpu.hip.event_record(&e1, gpu.active_stream.as_ref()).unwrap();
+            gpu.hip.event_synchronize(&e1).unwrap();
+            let b = gpu.hip.event_elapsed_ms(&e0, &e1).unwrap() as f64 * 1000.0;
+            gpu.hip.event_record(&e0, gpu.active_stream.as_ref()).unwrap();
+            launch(&mut gpu, sa, true);
+            gpu.hip.event_record(&e1, gpu.active_stream.as_ref()).unwrap();
+            gpu.hip.event_synchronize(&e1).unwrap();
+            let a = gpu.hip.event_elapsed_ms(&e0, &e1).unwrap() as f64 * 1000.0;
+            if it >= WARM {
+                before.push(b);
+                after.push(a);
+            }
+        }
+        let mut loops = [Vec::new(), Vec::new()];
+        for rep in 0..25 {
+            for (variant, out) in loops.iter_mut().enumerate() {
+                gpu.hip.event_record(&e0, gpu.active_stream.as_ref()).unwrap();
+                for layer in 0..48usize {
+                    if variant == 0 {
+                        gpu.zero_f32(&target).expect("zero_f32");
+                    }
+                    launch(&mut gpu, (layer + rep) % SETS, variant == 1);
+                }
+                gpu.hip.event_record(&e1, gpu.active_stream.as_ref()).unwrap();
+                gpu.hip.event_synchronize(&e1).unwrap();
+                if rep >= 5 {
+                    out.push(gpu.hip.event_elapsed_ms(&e0, &e1).unwrap() as f64 * 1000.0 / 48.0);
+                }
+            }
+        }
+        let (b50, a50) = (pct(&mut before, 0.5), pct(&mut after, 0.5));
+        println!(
+            "{rows} | {:.2}/{b50:.2}/{:.2} | {:.2}/{a50:.2}/{:.2} | {:.2} | {:.2} / {:.2}",
+            pct(&mut before, 0.1),
+            pct(&mut before, 0.9),
+            pct(&mut after, 0.1),
+            pct(&mut after, 0.9),
+            b50 - a50,
+            pct(&mut loops[0], 0.5),
+            pct(&mut loops[1], 0.5),
+        );
+    }
 }

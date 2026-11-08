@@ -338,6 +338,10 @@ pub(super) struct MoeStepState<'a> {
     /// H8a: the routed target's zero fill was absorbed; the qt44 combine
     /// writes it from +0.0 and clears this.
     initial_zero: Cell<bool>,
+    /// `HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS`: the absorbed fill ([`Self::initial_zero`]) is
+    /// consumed by the epilogue-fused shared down launch (`moe_shared_down_combine_rows_r<R>_zinit`),
+    /// not by the qt44 combine, so the epilogue fuse stays admitted despite `initial_zero`.
+    fuse_zinit: Cell<bool>,
     /// H4 level 3: the paired HC write the shared down may carry (taken by the
     /// stage), and whether it did.
     hc_write: RefCell<Option<super::qt44_qt53_prefill::HcSharedDown>>,
@@ -455,6 +459,7 @@ impl<'a> MoeStepState<'a> {
             shared_gate,
             shared_up,
             initial_zero: Cell::new(false),
+            fuse_zinit: Cell::new(false),
             hc_write: RefCell::new(None),
             hc_folded: Cell::new(false),
             hc_row_folded: Cell::new(false),
@@ -480,8 +485,23 @@ impl<'a> MoeStepState<'a> {
     /// ([`super::qt44_qt53_prefill::epilogue_fuse_applies`]) -- only for the plain lowering
     /// whose `Combine` is followed by the `SharedDown` that consumes the deferral: no CPU split
     /// or deferred experts (their combine / splice order differs), no tile exchange, and no
-    /// HC write or absorbed target fill already offered to those stages.
+    /// HC write or absorbed target fill already offered to those stages (the fill absorbed by
+    /// the fused launch itself, [`Self::fuse_zinit`], excepted).
     fn epilogue_fuse_admitted(
+        &self,
+        gpu: &Gpu,
+        params: &MoePrefillParams<'_>,
+        selection: &MoePrefillSelection,
+    ) -> bool {
+        (!self.initial_zero.get() || self.fuse_zinit.get())
+            && self.epilogue_fuse_route(gpu, params, selection)
+    }
+
+    /// [`Self::epilogue_fuse_admitted`] without the absorbed-fill term: whether the combine
+    /// stage of this call defers to the fused shared down launch when no fill was absorbed.
+    /// Depends on the call, the `hc_write` offer and the gpu only, so the decision made before
+    /// the combine stage ([`Self::absorbs_clear`]) is the one the stage re-derives.
+    fn epilogue_fuse_route(
         &self,
         gpu: &Gpu,
         params: &MoePrefillParams<'_>,
@@ -492,7 +512,6 @@ impl<'a> MoeStepState<'a> {
             && !selection.cpu_deferred_experts
             && params.ep_tile_exchange.is_none()
             && self.hc_write.borrow().is_none()
-            && !self.initial_zero.get()
             && super::qt44_qt53_prefill::epilogue_fuse_applies(
                 gpu,
                 params,
@@ -544,37 +563,60 @@ impl<'a> MoeStepState<'a> {
         Ok((params, selection))
     }
 
-    /// Whether the qt44 combine of this call can take over `clear`'s zero
-    /// fill (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`, exact gfx1151 / gfx1201; on the
-    /// wide-verify int8 chain also `HIPFIRE_QWEN4_FFN_CLEAR_ABSORB`, exact gfx1201):
-    /// the combine writes every element `clear` zeroes, into that very
-    /// tensor, nothing else writes it before the combine, and nothing is
-    /// recorded or captured (a retained tape keeps the clear's shape).
-    fn absorbs_clear(&self, gpu: &Gpu, clear: &super::layer_ops::ClearOp<'_>) -> bool {
-        if !gpu.flags.qwen4_moe_combine_zinit_enabled()
+    /// Whether the combine of this call can take over `clear`'s zero fill, and which launch
+    /// consumes it.
+    ///
+    /// [`ClearAbsorb::Combine`] (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`, exact gfx1151 / gfx1201; on
+    /// the wide-verify int8 chain also `HIPFIRE_QWEN4_FFN_CLEAR_ABSORB`, exact gfx1201): the qt44
+    /// combine writes every element `clear` zeroes, into that very tensor, nothing else writes
+    /// it before the combine, and nothing is recorded or captured (a retained tape keeps the
+    /// clear's shape).
+    ///
+    /// [`ClearAbsorb::SharedDownFuse`] (`HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS`, exact gfx1201): the
+    /// call's combine rides the epilogue-fused shared down launch
+    /// ([`Self::epilogue_fuse_route`]), whose `_zinit` entry stores every `(token, column)` of
+    /// the `batch * down_m` target from a +0.0 seed. The hc_write offer must already be installed
+    /// (the fuse is refused when the shared down carries an HC write).
+    fn absorbs_clear(&self, gpu: &Gpu, clear: &super::layer_ops::ClearOp<'_>) -> ClearAbsorb {
+        let combine_flag = gpu.flags.qwen4_moe_combine_zinit_enabled();
+        let rows_flag = gpu.flags.qwen4_ffn_clear_absorb_rows_enabled();
+        if !(combine_flag || rows_flag)
             || gpu.replay.is_recording()
             || gpu.replay.retained_body_active()
             || gpu.graphs.capture_mode
         {
-            return false;
+            return ClearAbsorb::No;
         }
         let Ok((params, selection)) = self.prefill_parts() else {
-            return false;
+            return ClearAbsorb::No;
         };
         let target = params.routed_out.unwrap_or(params.x_batch);
-        selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped)
+        let owns_target = selection
+            .route
+            .is_some_and(MoeRouteCapability::is_sealed_grouped)
             // A CPU-deferred call omits the combine that would consume the
             // absorbed fill, so it must never absorb one.
             && !selection.cpu_deferred_experts
             && !selection.cpu_split
             && matches!(params.prelude.normalization, MoeNormalization::Provided)
+            && clear.tensor.buf.as_ptr() == target.buf.as_ptr()
+            && Some(clear.elements) == params.batch_size.checked_mul(params.down_m);
+        if !owns_target {
+            return ClearAbsorb::No;
+        }
+        if combine_flag
             && super::qt44_qt53_prefill::combine_initial_zero_applies(
                 gpu,
                 params,
                 selection.uses_grouped_rows(),
             )
-            && clear.tensor.buf.as_ptr() == target.buf.as_ptr()
-            && Some(clear.elements) == params.batch_size.checked_mul(params.down_m)
+        {
+            return ClearAbsorb::Combine;
+        }
+        if rows_flag && self.epilogue_fuse_route(gpu, params, selection) {
+            return ClearAbsorb::SharedDownFuse;
+        }
+        ClearAbsorb::No
     }
 
     fn shared_views(&self) -> Result<(&GpuTensor, &GpuTensor), DispatchError> {
@@ -1583,10 +1625,13 @@ impl<'a> SealedMoeOp<'a> {
             // `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE`: this call's combine was deferred by the
             // combine stage; the one launch does combine, shared-down rows and shared fold.
             if self.state.combine_deferred.replace(false) {
+                // An absorbed fill reaching a deferred combine is the fused launch's own
+                // (`epilogue_fuse_admitted` admits no other): it takes the `_zinit` entry.
                 return super::qt44_qt53_prefill::shared_down_combined(
                     gpu,
                     params,
                     selection.uses_grouped_rows(),
+                    self.state.initial_zero.take(),
                 );
             }
             // H4 (`HIPFIRE_QWEN4_HC_FUSE` >= 3): the paired HC write rides the
@@ -3230,11 +3275,6 @@ pub(super) fn execute_after_clear(
     let state = MoeStepState::new(call);
     state.front_allowed.set(true);
     state.epilogue_fuse_allowed.set(true);
-    let absorbed = state.absorbs_clear(gpu, clear);
-    if !absorbed {
-        super::layer_ops::execute_clear(gpu, clear)?;
-    }
-    state.initial_zero.set(absorbed);
     if let Some(write) = hc {
         let mut offered = super::qt44_qt53_prefill::HcSharedDown::offer(write);
         if let (Some(offered), Some((read, next_write))) = (offered.as_mut(), next) {
@@ -3258,6 +3298,13 @@ pub(super) fn execute_after_clear(
         }
         *state.hc_write.borrow_mut() = offered;
     }
+    // The HC offer is decided above: `absorbs_clear` re-derives the epilogue fuse from it.
+    let absorb = state.absorbs_clear(gpu, clear);
+    if absorb == ClearAbsorb::No {
+        super::layer_ops::execute_clear(gpu, clear)?;
+    }
+    state.initial_zero.set(absorb != ClearAbsorb::No);
+    state.fuse_zinit.set(absorb == ClearAbsorb::SharedDownFuse);
     let steps = match call.protocol() {
         MoeProtocol::IndexedDecode => lower_decode(&state)?,
         MoeProtocol::GroupedPrefill => lower_prefill(&state)?,
@@ -3273,6 +3320,18 @@ pub(super) fn execute_after_clear(
         folded: state.hc_folded.get(),
         row_folded: state.hc_row_folded.get(),
     })
+}
+
+/// Who consumes the zero fill [`MoeStepState::absorbs_clear`] skipped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClearAbsorb {
+    /// The fill runs as its own `zero_f32`.
+    No,
+    /// The qt44 BF16-row combine stores from +0.0.
+    Combine,
+    /// The epilogue-fused shared down launch (`moe_shared_down_combine_rows_r<R>_zinit`) stores
+    /// from +0.0.
+    SharedDownFuse,
 }
 
 /// What [`execute_after_clear`] did beyond the call itself.

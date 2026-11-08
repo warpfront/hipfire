@@ -1614,6 +1614,7 @@ fn epilogue_operands<'a>(
     p: &'a MoePrefillParams<'_>,
     hidden: &'a GpuTensor,
     expanded: &'a GpuTensor,
+    initial_zero: bool,
 ) -> Option<rdna_compute::tensor_ops::MoeSharedDownCombine<'a>> {
     let shared = p.prelude.shared.as_ref()?;
     let down = &shared.weights.down;
@@ -1621,6 +1622,7 @@ fn epilogue_operands<'a>(
         weight: down.buf,
         x: hidden,
         target: p.routed_out.unwrap_or(p.x_batch),
+        initial_zero,
         expert_outputs: expanded,
         topk_indices: p.topk_indices,
         topk_weights: p.topk_weights,
@@ -1670,7 +1672,7 @@ pub(crate) fn epilogue_fuse_applies(gpu: &Gpu, p: &MoePrefillParams<'_>, use_pat
         && !gpu.qwen4_f16_wmma_applies(down.buf, down.k, rows)
         && epilogue_inputs(gpu, p, use_path2)
             .and_then(|(hidden, expanded)| {
-                epilogue_operands(p, &hidden, &expanded).map(|o| o.applies(gpu))
+                epilogue_operands(p, &hidden, &expanded, false).map(|o| o.applies(gpu))
             })
             .unwrap_or(false)
 }
@@ -1694,10 +1696,14 @@ pub(crate) fn combine_deferred(
 /// [`shared_down`] of a call whose combine was deferred ([`combine_deferred`]): the one launch
 /// that combines the ten expanded rows into the target, computes the shared-down rows and
 /// folds them in with the selector (`bf16_scaled_add_batched`'s expression).
+/// `initial_zero` (`HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS`): the target's zero fill was absorbed, so
+/// the launch is the `_zinit` entry that seeds +0.0 and stores every `(token, column)` instead of
+/// reading the filled target; admission ([`epilogue_fuse_applies`]) is independent of it.
 pub(crate) fn shared_down_combined(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
     use_path2: bool,
+    initial_zero: bool,
 ) -> Result<(), DispatchError> {
     super::combine_leaf(
         super::CombineArm::DeferredToSharedDown,
@@ -1707,7 +1713,7 @@ pub(crate) fn shared_down_combined(
     let (hidden, expanded) = epilogue_inputs(gpu, p, use_path2).ok_or_else(|| {
         DispatchError::Hip("qt44 epilogue fuse: shared weights vanished after admission".into())
     })?;
-    let operands = epilogue_operands(p, &hidden, &expanded).ok_or_else(|| {
+    let operands = epilogue_operands(p, &hidden, &expanded, initial_zero).ok_or_else(|| {
         DispatchError::Hip("qt44 epilogue fuse: shared weights vanished after admission".into())
     })?;
     hip(rdna_compute::tensor_ops::moe_shared_down_combine(

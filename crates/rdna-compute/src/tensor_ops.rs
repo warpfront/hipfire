@@ -2395,9 +2395,14 @@ pub struct MoeSharedDownCombine<'a> {
     pub weight: &'a GpuTensor,
     /// The shared hidden `[rows, k]` (F32).
     pub x: &'a GpuTensor,
-    /// The combine target `[rows, m]` (F32): the accumulator seed in, the final block output
-    /// out (bitwise what the three launches leave there).
+    /// The combine target `[rows, m]` (F32): the accumulator seed in (unless
+    /// [`Self::initial_zero`]), the final block output out (bitwise what the three launches leave
+    /// there).
     pub target: &'a GpuTensor,
+    /// The `_zinit` entry (`HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS`): the accumulator starts from +0.0
+    /// and `target` is never read, only fully overwritten (every `[rows, m]` element is stored), so
+    /// the caller skips the `zero_f32` fill: bitwise that fill + the plain entry.
+    pub initial_zero: bool,
     /// Unweighted expanded routed rows `[rows * 10 * m]` (`moe_down_combine_top10_batched`'s).
     pub expert_outputs: &'a GpuTensor,
     pub topk_indices: &'a GpuTensor,
@@ -2450,15 +2455,23 @@ pub fn moe_shared_down_combine(gpu: &mut Gpu, p: &MoeSharedDownCombine<'_>) -> H
     if !p.applies(gpu) {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
-    let kernel = match p.rows {
-        1 => "moe_shared_down_combine_rows_r1",
-        2 => "moe_shared_down_combine_rows_r2",
-        3 => "moe_shared_down_combine_rows_r3",
-        4 => "moe_shared_down_combine_rows_r4",
-        5 => "moe_shared_down_combine_rows_r5",
-        6 => "moe_shared_down_combine_rows_r6",
-        7 => "moe_shared_down_combine_rows_r7",
-        _ => "moe_shared_down_combine_rows_r8",
+    let kernel = match (p.rows, p.initial_zero) {
+        (1, false) => "moe_shared_down_combine_rows_r1",
+        (2, false) => "moe_shared_down_combine_rows_r2",
+        (3, false) => "moe_shared_down_combine_rows_r3",
+        (4, false) => "moe_shared_down_combine_rows_r4",
+        (5, false) => "moe_shared_down_combine_rows_r5",
+        (6, false) => "moe_shared_down_combine_rows_r6",
+        (7, false) => "moe_shared_down_combine_rows_r7",
+        (_, false) => "moe_shared_down_combine_rows_r8",
+        (1, true) => "moe_shared_down_combine_rows_r1_zinit",
+        (2, true) => "moe_shared_down_combine_rows_r2_zinit",
+        (3, true) => "moe_shared_down_combine_rows_r3_zinit",
+        (4, true) => "moe_shared_down_combine_rows_r4_zinit",
+        (5, true) => "moe_shared_down_combine_rows_r5_zinit",
+        (6, true) => "moe_shared_down_combine_rows_r6_zinit",
+        (7, true) => "moe_shared_down_combine_rows_r7_zinit",
+        (_, true) => "moe_shared_down_combine_rows_r8_zinit",
     };
     gpu.ensure_kernel_public(
         "moe_shared_down_combine",

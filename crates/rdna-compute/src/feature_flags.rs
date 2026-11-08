@@ -121,6 +121,12 @@ pub struct FeatureFlags {
     /// from +0.0 (`_zinit`) and the FFN `zero_f32` before the call is not
     /// launched.  Only widens the route set of [`Self::qwen4_moe_combine_zinit`].
     pub qwen4_ffn_clear_absorb: bool,
+    /// FFN zero-fill absorb on the few-row (1..=8 rows) epilogue-fused MoE route
+    /// (`HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS`), opt-in, default off: the fused
+    /// `moe_shared_down_combine_rows_r<R>` launch takes its `_zinit` store entry (accumulator
+    /// seed +0.0, `target` never read) and the FFN `zero_f32` before the call is not launched.
+    /// New kernel entries: needs their PeaceMaker twin before it can default on.
+    pub qwen4_ffn_clear_absorb_rows: bool,
     /// EP partial tile mask implicit zeros (`HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO`),
     /// default on for exact gfx1201, `0` is the kill switch: the foreign experts'
     /// grouped down rows are marked `-1` in the combine order instead of being
@@ -1191,6 +1197,8 @@ impl FeatureFlags {
                 .unwrap_or(exact_unit_default),
             qwen4_ffn_clear_absorb: parse_bool("HIPFIRE_QWEN4_FFN_CLEAR_ABSORB")
                 .unwrap_or(is_gfx1201),
+            qwen4_ffn_clear_absorb_rows: parse_bool("HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS")
+                .unwrap_or(false),
             qwen4_ep_pmask_implicit_zero: parse_bool("HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO")
                 .unwrap_or(is_gfx1201),
             qwen4_ep_pmask_implicit_zero_poison: parse_bool(
@@ -1882,6 +1890,12 @@ impl FeatureFlags {
         self.qwen4_ffn_clear_absorb && self.arch == "gfx1201"
     }
 
+    /// FFN zero-fill absorb on the few-row epilogue-fused MoE route
+    /// (`HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS`): exact gfx1201 only.
+    pub fn qwen4_ffn_clear_absorb_rows_enabled(&self) -> bool {
+        self.qwen4_ffn_clear_absorb_rows && self.arch == "gfx1201"
+    }
+
     /// EP partial tile mask implicit zeros (`HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO`):
     /// exact gfx1201 only.
     pub fn qwen4_ep_pmask_implicit_zero_enabled(&self) -> bool {
@@ -2258,6 +2272,7 @@ impl FeatureFlags {
             qwen4_hc_up_v2: false,
             qwen4_moe_combine_zinit: false,
             qwen4_ffn_clear_absorb: false,
+            qwen4_ffn_clear_absorb_rows: false,
             qwen4_ep_pmask_implicit_zero: false,
             qwen4_ep_pmask_implicit_zero_poison: false,
             qwen4_hc_row_fold: false,
@@ -3349,6 +3364,29 @@ mod tests {
             assert!(!killed.qwen4_ffn_clear_absorb_enabled(), "{arch}");
             let forced = FeatureFlags::from_lookup(arch, with("1"));
             assert_eq!(forced.qwen4_ffn_clear_absorb_enabled(), exact, "{arch}");
+        }
+    }
+
+    /// The few-row FFN clear absorb is opt-in (`=1` enables) and reaches exact gfx1201 only.
+    #[test]
+    fn qwen4_ffn_clear_absorb_rows_flag_is_default_off_and_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |name: &str| -> std::result::Result<String, ()> {
+                if name == "HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert!(!unset.qwen4_ffn_clear_absorb_rows_enabled(), "{arch}");
+            let off = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!off.qwen4_ffn_clear_absorb_rows_enabled(), "{arch}");
+            let on = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(on.qwen4_ffn_clear_absorb_rows_enabled(), exact, "{arch}");
         }
     }
 
