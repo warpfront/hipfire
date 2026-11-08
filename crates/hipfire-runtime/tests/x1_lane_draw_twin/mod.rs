@@ -24,10 +24,14 @@ use rdna_compute::lane_leviathan::{
     LR_PEN_LEN, LR_PEN_OFF, LR_PTR_HI, LR_PTR_LO,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::ffi::c_void;
+use std::path::PathBuf;
 
 pub const SYMBOL: &str = "lane_leviathan_verify";
-const BLOCK: u32 = 512;
+pub const BLOCK: u32 = 512;
 
 pub const MODE_FULL: i32 = 0;
 pub const MODE_SELECT: i32 = 1;
@@ -322,5 +326,334 @@ pub fn assert_words_eq(a: &[u32], b: &[u32], row_words: usize, what: &str, ctx: 
             a[at],
             b[at]
         );
+    }
+}
+
+// ───────────────────────── GPU capture for the emulator replay ─────────────────────────
+//
+// The capture format is documented in the doc comment of `x1_lane_draw_shard_gpu.rs`
+// (`leviathan_emu_capture`); `crates/peacemaker-isa/tests/leviathan_emu_replay.rs` reads it.
+
+/// Environment variable naming the directory `leviathan_emu_capture` writes.
+pub const CAPTURE_ENV: &str = "HIPFIRE_LEV_EMU_CAPTURE";
+/// The `format` field of `index.json` and of every launch header.
+pub const CAPTURE_FORMAT: &str = "leviathan_emu_capture/1";
+
+/// One kernel launch as the capture needs it: the seven kernarg values (derived from the
+/// tensors exactly as [`Impl::launch`] derives them) and every device buffer the kernel can
+/// reach: the region, the optional p table and candidate tables, and each lane's logits
+/// (the region's row records point into them).
+pub struct Call<'a> {
+    /// Which of the oracle's launches this is: `mode0_full`, `mode1_shard_a`,
+    /// `mode1_shard_b` or `mode2_merged`.
+    pub label: &'static str,
+    pub mode: i32,
+    pub region: &'a GpuTensor,
+    pub layout: LaneLeviathanLayout,
+    pub ptab: Option<&'a GpuTensor>,
+    pub cand_local: Option<&'a GpuTensor>,
+    pub cand_peer: Option<&'a GpuTensor>,
+    /// Which logits tensors `logits` are: `full` (rows of V), `shard_a` or `shard_b`
+    /// (packed halves). Names the shared on-disk blob of a launch set's logits.
+    pub logits_tag: &'static str,
+    /// Every lane's logits tensor, in lane order.
+    pub logits: &'a [GpuTensor],
+}
+
+/// Device pointer of an optional tensor, 0 when absent: the kernarg value the launch passes.
+fn device_ptr(t: Option<&GpuTensor>) -> u64 {
+    t.map_or(0, |t| t.buf.as_ptr() as u64)
+}
+
+/// One device buffer of a launch. A `logits` buffer is an input the kernel never writes.
+struct Buf<'a> {
+    role: &'static str,
+    lane: Option<usize>,
+    tensor: &'a GpuTensor,
+    read_only: bool,
+}
+
+/// Every buffer the launch can read or write, in capture order.
+fn buffers<'a>(call: &Call<'a>) -> Vec<Buf<'a>> {
+    let mut v = vec![Buf {
+        role: "region",
+        lane: None,
+        tensor: call.region,
+        read_only: false,
+    }];
+    for (role, tensor) in [
+        ("ptab", call.ptab),
+        ("cand_local", call.cand_local),
+        ("cand_peer", call.cand_peer),
+    ] {
+        if let Some(tensor) = tensor {
+            v.push(Buf {
+                role,
+                lane: None,
+                tensor,
+                read_only: false,
+            });
+        }
+    }
+    for (lane, tensor) in call.logits.iter().enumerate() {
+        v.push(Buf {
+            role: "logits",
+            lane: Some(lane),
+            tensor,
+            read_only: true,
+        });
+    }
+    v
+}
+
+/// Every whole tensor of the launch as raw words, after a device sync.
+fn snapshot(gpu: &mut Gpu, call: &Call<'_>) -> Vec<Vec<u32>> {
+    buffers(call)
+        .iter()
+        .map(|b| download_words(gpu, b.tensor, b.tensor.numel()))
+        .collect()
+}
+
+/// A blob already on disk.
+struct Blob {
+    bytes: usize,
+    sha256: String,
+}
+
+/// The launch set the next launches belong to.
+struct SetCtx {
+    vocab: usize,
+    launch: usize,
+    ctx: String,
+}
+
+/// Writes a capture directory: per launch a JSON header plus one raw `.bin` blob per
+/// buffer and phase, and `index.json`. It only observes: the launches it records are the
+/// oracle's own ([`Impl::launch_call`]).
+pub struct Capture {
+    dir: PathBuf,
+    arch: String,
+    object: &'static str,
+    object_sha256: String,
+    blobs: HashMap<String, Blob>,
+    /// One `index.json` entry per launch, in launch order.
+    launches: Vec<Value>,
+    blob_bytes: u64,
+    total_bytes: u64,
+    set: Option<SetCtx>,
+}
+
+impl Capture {
+    /// The capture directory from [`CAPTURE_ENV`]; unset or empty is an error, not a skip.
+    pub fn dir_from_env() -> PathBuf {
+        match std::env::var(CAPTURE_ENV) {
+            Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+            _ => panic!("{CAPTURE_ENV} must name the directory the capture is written to"),
+        }
+    }
+
+    /// An empty capture of `image` (the committed object `object` names) run on `gpu`.
+    /// Refuses a directory that already holds a finished capture.
+    pub fn new(dir: PathBuf, gpu: &Gpu, object: &'static str, image: &[u8]) -> Capture {
+        assert!(
+            !dir.join("index.json").exists(),
+            "{}: already holds a capture (index.json); refusing to overwrite it",
+            dir.display()
+        );
+        for sub in ["blobs", "launches"] {
+            std::fs::create_dir_all(dir.join(sub))
+                .unwrap_or_else(|e| panic!("create {}/{sub}: {e}", dir.display()));
+        }
+        Capture {
+            dir,
+            arch: gpu.arch.clone(),
+            object,
+            object_sha256: format!("{:x}", Sha256::digest(image)),
+            blobs: HashMap::new(),
+            launches: Vec::new(),
+            blob_bytes: 0,
+            total_bytes: 0,
+            set: None,
+        }
+    }
+
+    /// The launches until the next call are launch set `launch` of vocab `vocab`.
+    pub fn begin_set(&mut self, vocab: usize, launch: usize, ctx: &str) {
+        self.set = Some(SetCtx {
+            vocab,
+            launch,
+            ctx: ctx.to_string(),
+        });
+    }
+
+    fn write_file(&mut self, rel: &str, bytes: &[u8]) {
+        let path = self.dir.join(rel);
+        std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        self.total_bytes += bytes.len() as u64;
+    }
+
+    /// Write `words` (little endian) as blob `name` once and return its `{file, bytes,
+    /// sha256}` entry. A second request for the same name must carry the same bytes (the
+    /// logits of a launch set are shared by the launches that read them).
+    fn blob(&mut self, name: &str, words: &[u32]) -> Value {
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let file = format!("blobs/{name}.bin");
+        match self.blobs.get(name) {
+            Some(have) => assert!(
+                have.bytes == bytes.len() && have.sha256 == sha256,
+                "capture blob {name} changed between the launches that share it"
+            ),
+            None => {
+                self.write_file(&file, &bytes);
+                self.blob_bytes += bytes.len() as u64;
+                self.blobs.insert(
+                    name.to_string(),
+                    Blob {
+                        bytes: bytes.len(),
+                        sha256: sha256.clone(),
+                    },
+                );
+            }
+        }
+        json!({"file": file, "bytes": bytes.len(), "sha256": sha256})
+    }
+
+    /// Record the launch `call` just made: `before` is [`snapshot`] taken before it. Logits
+    /// are asserted unchanged and stored once; every other buffer stores both phases.
+    fn record(&mut self, gpu: &mut Gpu, call: &Call<'_>, before: Vec<Vec<u32>>, imp: &str) {
+        let (vocab, launch, set_ctx) = {
+            let s = self
+                .set
+                .as_ref()
+                .expect("Capture::begin_set before a launch");
+            (s.vocab, s.launch, s.ctx.clone())
+        };
+        let ctx = format!("{set_ctx} [{imp}] {}", call.label);
+        let bufs = buffers(call);
+        assert_eq!(bufs.len(), before.len(), "{ctx}: snapshot buffer count");
+        let prefix = format!("v{vocab}_l{launch:03}");
+        let mut entries = Vec::with_capacity(bufs.len());
+        for (b, before) in bufs.iter().zip(before) {
+            let after = download_words(gpu, b.tensor, b.tensor.numel());
+            let addr = b.tensor.buf.as_ptr() as u64;
+            let unchanged = before == after;
+            let (before_blob, after_blob) = if b.read_only {
+                assert_words_eq(
+                    &after,
+                    &before,
+                    1,
+                    &format!(
+                        "lane {} logits after vs before the launch",
+                        b.lane.unwrap_or(0)
+                    ),
+                    &ctx,
+                );
+                let name = format!(
+                    "{prefix}_logits_{}_l{}",
+                    call.logits_tag,
+                    b.lane.expect("logits buffers carry a lane")
+                );
+                (self.blob(&name, &before), None)
+            } else {
+                let stem = format!("{prefix}_{}_{}", call.label, b.role);
+                let before_blob = self.blob(&format!("{stem}_before"), &before);
+                let after_blob = self.blob(&format!("{stem}_after"), &after);
+                (before_blob, Some(after_blob))
+            };
+            entries.push(json!({
+                "role": b.role,
+                "lane": b.lane,
+                "addr": addr,
+                "bytes": before.len() * 4,
+                "before": before_blob,
+                "after": after_blob,
+                "after_equals_before": unchanged,
+            }));
+        }
+        let header = json!({
+            "format": CAPTURE_FORMAT,
+            "arch": self.arch,
+            "object": self.object,
+            "symbol": SYMBOL,
+            "vocab": vocab,
+            "launch": launch,
+            "ctx": set_ctx,
+            "label": call.label,
+            "mode": call.mode,
+            "grid": [call.layout.rows, 1, 1],
+            "block": [BLOCK, 1, 1],
+            "lanes": call.layout.lanes,
+            "rows": call.layout.rows,
+            "kernargs": {
+                "region_ptr": call.region.buf.as_ptr() as u64,
+                "lanes_off": call.layout.lanes_off(),
+                "rows_off": call.layout.rows_off(),
+                "ptab_ptr": device_ptr(call.ptab),
+                "mode": call.mode,
+                "cand_local": device_ptr(call.cand_local),
+                "cand_peer": device_ptr(call.cand_peer),
+            },
+            "buffers": entries,
+        });
+        let rel = format!("launches/L{:05}.json", self.launches.len());
+        let bytes = serde_json::to_vec_pretty(&header).expect("launch header json");
+        self.write_file(&rel, &bytes);
+        self.launches.push(json!({
+            "header": rel,
+            "vocab": vocab,
+            "launch": launch,
+            "label": call.label,
+            "mode": call.mode,
+        }));
+    }
+
+    /// Write `index.json` and report the bytes written.
+    pub fn finish(mut self) {
+        let index = json!({
+            "format": CAPTURE_FORMAT,
+            "arch": self.arch,
+            "object": self.object,
+            "object_sha256": self.object_sha256,
+            "symbol": SYMBOL,
+            "block": BLOCK,
+            "kernarg_order": [
+                "region_ptr", "lanes_off", "rows_off", "ptab_ptr", "mode", "cand_local", "cand_peer"
+            ],
+            "blob_bytes": self.blob_bytes,
+            "launches": self.launches,
+        });
+        let bytes = serde_json::to_vec_pretty(&index).expect("index json");
+        self.write_file("index.json", &bytes);
+        eprintln!(
+            "lane draw emu capture: {} launches, {} blob bytes, {} bytes ({:.1} MiB) in total written to {}",
+            self.launches.len(),
+            self.blob_bytes,
+            self.total_bytes,
+            self.total_bytes as f64 / (1024.0 * 1024.0),
+            self.dir.display()
+        );
+    }
+}
+
+impl Impl {
+    /// [`Impl::launch`] with the buffers and kernarg values of `call`; when `capture` is
+    /// set, every buffer is snapshotted before and after (device synchronised each time).
+    /// The launch itself is the same call either way.
+    pub fn launch_call(&self, gpu: &mut Gpu, call: &Call<'_>, capture: Option<&mut Capture>) {
+        let mut capture = capture;
+        let before = capture.as_mut().map(|_| snapshot(gpu, call));
+        self.launch(
+            gpu,
+            call.region,
+            call.layout,
+            call.ptab,
+            call.mode,
+            device_ptr(call.cand_local),
+            device_ptr(call.cand_peer),
+        );
+        if let (Some(capture), Some(before)) = (capture, before) {
+            capture.record(gpu, call, before, self.name);
+        }
     }
 }

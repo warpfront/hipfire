@@ -32,6 +32,32 @@
 //! require the PM twin byte-identical to the hipcc object in all three modes (raw out
 //! records, p tables, mode-1 candidate tables), and for each object modes 1+2 equal mode 0.
 //! They fail, not skip, on a device that is not gfx1200 or gfx1201.
+//!
+//! `leviathan_emu_capture` runs the same matrix (`TWIN_MATRIX`: same vocabs, launch counts and seeds; the same
+//! `make_lane` / `plant_edges` generator through `twin_matrix`; the same launch sequence, `twin_run`) through the
+//! committed hipcc object only, and writes every launch it makes to the directory named by `$HIPFIRE_LEV_EMU_CAPTURE`
+//! (required: unset is a panic; a directory that already holds `index.json` is refused) for the CPU replay
+//! `crates/peacemaker-isa/tests/leviathan_emu_replay.rs`. The twin test's GPU-side checks still run on the captured
+//! run (`decode_out`, modes 1+2 == mode 0, p tables) and every launch asserts its logits unchanged. It needs an exact
+//! gfx1201 device (it fails, not skips, elsewhere) and prints the total bytes written.
+//!
+//! Capture format `leviathan_emu_capture/1` (all binary data little endian u32 words):
+//! - `index.json`: `format`, `arch` (the GPU's arch name), `object` (`"hipcc"`), `object_sha256` (of the committed
+//!   `include_bytes!` object), `symbol`, `block` (512), `kernarg_order`, `blob_bytes`, and `launches`: one
+//!   `{header, vocab, launch, label, mode}` per launch, in launch order.
+//! - `launches/L<n>.json` (the `header`): `arch`, `object`, `symbol`, `vocab`, `launch` (the index of the launch set
+//!   within its vocab sweep), `ctx`, `label` (`mode0_full`, `mode1_shard_a`, `mode1_shard_b`, `mode2_merged`), `mode`,
+//!   `grid` (`[rows, 1, 1]`), `block` (`[512, 1, 1]`), `lanes`, `rows`; `kernargs`: the seven kernarg VALUES
+//!   `region_ptr`, `lanes_off` (words), `rows_off` (words), `ptab_ptr` (0 when null), `mode`, `cand_local`, `cand_peer`
+//!   (0 when null); and `buffers`: every device buffer the launch can read or write, with its real device address
+//!   `addr`, `bytes`, and `before` / `after` blob references `{file, bytes, sha256}` of the buffer's raw bytes
+//!   downloaded right before / after the launch. `role` is `region`, `ptab`, `cand_local`, `cand_peer` or `logits`
+//!   (with `lane`; one per lane, the buffer each of the region's row records points into). A `logits` buffer is
+//!   asserted unchanged by the launch at capture time, so it stores no `after` (`null`; `after_equals_before` true)
+//!   and its `before` blob is shared by every launch of the set that reads it (`blobs/v<V>_l<launch>_logits_<tag>_l<lane>.bin`,
+//!   tag `full` for mode 0, `shard_a` / `shard_b` for the halves). Other buffers store both phases
+//!   (`blobs/v<V>_l<launch>_<label>_<role>_{before,after}.bin`); `after_equals_before` records whether the launch
+//!   changed them.
 
 mod x1_lane_draw_twin;
 
@@ -377,18 +403,86 @@ struct TwinRun {
     p_merged: Vec<u32>,
 }
 
-/// Run `imp` in all three modes over the lanes' full rows and A/B halves.
-#[allow(clippy::too_many_arguments)]
+/// One launch set's device tensors and packed regions: every lane's logits (the full rows and the two shard halves)
+/// and the `[out | lanes | rows | inputs]` region of each of the three launch shapes. Shared by the PM-vs-hipcc
+/// comparison and the emulator capture, so both launch exactly the same data.
+struct LaunchSet {
+    /// Per lane `[rows][V]`.
+    full: Vec<GpuTensor>,
+    /// Per lane `[rows][V/2]`: shard A (base 0).
+    half0: Vec<GpuTensor>,
+    /// Per lane `[rows][V/2]`: shard B (base V/2).
+    half1: Vec<GpuTensor>,
+    packed_f: twin::Packed,
+    packed_a: twin::Packed,
+    packed_b: twin::Packed,
+    rows_per_lane: Vec<usize>,
+}
+
+impl LaunchSet {
+    fn upload(gpu: &mut Gpu, v: usize, lanes: &[LaneSpec]) -> LaunchSet {
+        let w = v / 2;
+        let mut full = Vec::new();
+        let mut half0 = Vec::new();
+        let mut half1 = Vec::new();
+        for l in lanes {
+            full.push(gpu.upload_f32(&l.full, &[l.full.len()]).expect("full rows"));
+            let (mut h0, mut h1) = (Vec::new(), Vec::new());
+            for r in 0..l.rows {
+                h0.extend_from_slice(&l.full[r * v..r * v + w]);
+                h1.extend_from_slice(&l.full[r * v + w..(r + 1) * v]);
+            }
+            half0.push(gpu.upload_f32(&h0, &[h0.len()]).expect("half 0"));
+            half1.push(gpu.upload_f32(&h1, &[h1.len()]).expect("half 1"));
+        }
+        let (packed_f, packed_a, packed_b) = {
+            let fjobs: Vec<LaneDrawJob<'_>> = lanes
+                .iter()
+                .zip(&full)
+                .map(|(l, t)| job(l, t, v, 0))
+                .collect();
+            let ajobs: Vec<LaneDrawJob<'_>> = lanes
+                .iter()
+                .zip(&half0)
+                .map(|(l, t)| job(l, t, w, 0))
+                .collect();
+            let bjobs: Vec<LaneDrawJob<'_>> = lanes
+                .iter()
+                .zip(&half1)
+                .map(|(l, t)| job(l, t, w, w))
+                .collect();
+            (twin::pack(&fjobs), twin::pack(&ajobs), twin::pack(&bjobs))
+        };
+        LaunchSet {
+            full,
+            half0,
+            half1,
+            packed_f,
+            packed_a,
+            packed_b,
+            rows_per_lane: lanes.iter().map(|l| l.rows).collect(),
+        }
+    }
+
+    fn free(self, gpu: &mut Gpu) {
+        for t in self.full.into_iter().chain(self.half0).chain(self.half1) {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+/// Run `imp` in all three modes over the lanes' full rows and A/B halves. With a `capture`, every launch is
+/// snapshotted around the kernel call (the launches themselves are unchanged).
 fn twin_run(
     gpu: &mut Gpu,
     imp: &twin::Impl,
-    packed_f: &twin::Packed,
-    packed_a: &twin::Packed,
-    packed_b: &twin::Packed,
-    rows_per_lane: &[usize],
+    set: &LaunchSet,
     ctx: &str,
+    mut capture: Option<&mut twin::Capture>,
 ) -> TwinRun {
     let ctx = format!("{ctx} [{}]", imp.name);
+    let (packed_f, packed_a, packed_b) = (&set.packed_f, &set.packed_a, &set.packed_b);
+    let rows_per_lane = &set.rows_per_lane[..];
     let rows = packed_f.layout.rows;
     let out_words = packed_f.layout.out_words();
     assert_eq!(packed_a.layout, packed_b.layout);
@@ -397,14 +491,20 @@ fn twin_run(
     // Mode 0: the whole row.
     let region_f = twin::upload_region(gpu, packed_f);
     let ptab_f = twin::zeros_words(gpu, rows * LLV_P_WORDS);
-    imp.launch(
+    imp.launch_call(
         gpu,
-        &region_f,
-        packed_f.layout,
-        Some(&ptab_f),
-        twin::MODE_FULL,
-        0,
-        0,
+        &twin::Call {
+            label: "mode0_full",
+            mode: twin::MODE_FULL,
+            region: &region_f,
+            layout: packed_f.layout,
+            ptab: Some(&ptab_f),
+            cand_local: None,
+            cand_peer: None,
+            logits_tag: "full",
+            logits: &set.full,
+        },
+        capture.as_deref_mut(),
     );
     let out_full = twin::download_words(gpu, &region_f, out_words);
     let p_full = twin::download_words(gpu, &ptab_f, rows * LLV_P_WORDS);
@@ -415,23 +515,35 @@ fn twin_run(
     let region_b = twin::upload_region(gpu, packed_b);
     let cand_a = twin::zeros_words(gpu, cand_table_words(rows));
     let cand_b = twin::zeros_words(gpu, cand_table_words(rows));
-    imp.launch(
+    imp.launch_call(
         gpu,
-        &region_a,
-        packed_a.layout,
-        None,
-        twin::MODE_SELECT,
-        cand_a.buf.as_ptr() as u64,
-        0,
+        &twin::Call {
+            label: "mode1_shard_a",
+            mode: twin::MODE_SELECT,
+            region: &region_a,
+            layout: packed_a.layout,
+            ptab: None,
+            cand_local: Some(&cand_a),
+            cand_peer: None,
+            logits_tag: "shard_a",
+            logits: &set.half0,
+        },
+        capture.as_deref_mut(),
     );
-    imp.launch(
+    imp.launch_call(
         gpu,
-        &region_b,
-        packed_b.layout,
-        None,
-        twin::MODE_SELECT,
-        cand_b.buf.as_ptr() as u64,
-        0,
+        &twin::Call {
+            label: "mode1_shard_b",
+            mode: twin::MODE_SELECT,
+            region: &region_b,
+            layout: packed_b.layout,
+            ptab: None,
+            cand_local: Some(&cand_b),
+            cand_peer: None,
+            logits_tag: "shard_b",
+            logits: &set.half1,
+        },
+        capture.as_deref_mut(),
     );
     for (name, region) in [("A", &region_a), ("B", &region_b)] {
         let out = twin::download_words(gpu, region, out_words);
@@ -445,14 +557,20 @@ fn twin_run(
 
     // Mode 2 on A with B's table as the peer.
     let ptab_m = twin::zeros_words(gpu, rows * LLV_P_WORDS);
-    imp.launch(
+    imp.launch_call(
         gpu,
-        &region_a,
-        packed_a.layout,
-        Some(&ptab_m),
-        twin::MODE_MERGED,
-        cand_a.buf.as_ptr() as u64,
-        cand_b.buf.as_ptr() as u64,
+        &twin::Call {
+            label: "mode2_merged",
+            mode: twin::MODE_MERGED,
+            region: &region_a,
+            layout: packed_a.layout,
+            ptab: Some(&ptab_m),
+            cand_local: Some(&cand_a),
+            cand_peer: Some(&cand_b),
+            logits_tag: "shard_a",
+            logits: &set.half0,
+        },
+        capture.as_deref_mut(),
     );
     let out_merged = twin::download_words(gpu, &region_a, out_words);
     let p_merged = twin::download_words(gpu, &ptab_m, rows * LLV_P_WORDS);
@@ -491,58 +609,9 @@ fn twin_compare_launch(
     lanes: &[LaneSpec],
     ctx: &str,
 ) {
-    let w = v / 2;
-    let mut full_t = Vec::new();
-    let mut half0 = Vec::new();
-    let mut half1 = Vec::new();
-    for l in lanes {
-        full_t.push(gpu.upload_f32(&l.full, &[l.full.len()]).expect("full rows"));
-        let (mut h0, mut h1) = (Vec::new(), Vec::new());
-        for r in 0..l.rows {
-            h0.extend_from_slice(&l.full[r * v..r * v + w]);
-            h1.extend_from_slice(&l.full[r * v + w..(r + 1) * v]);
-        }
-        half0.push(gpu.upload_f32(&h0, &[h0.len()]).expect("half 0"));
-        half1.push(gpu.upload_f32(&h1, &[h1.len()]).expect("half 1"));
-    }
-    let fjobs: Vec<LaneDrawJob<'_>> = lanes
-        .iter()
-        .zip(&full_t)
-        .map(|(l, t)| job(l, t, v, 0))
-        .collect();
-    let ajobs: Vec<LaneDrawJob<'_>> = lanes
-        .iter()
-        .zip(&half0)
-        .map(|(l, t)| job(l, t, w, 0))
-        .collect();
-    let bjobs: Vec<LaneDrawJob<'_>> = lanes
-        .iter()
-        .zip(&half1)
-        .map(|(l, t)| job(l, t, w, w))
-        .collect();
-    let packed_f = twin::pack(&fjobs);
-    let packed_a = twin::pack(&ajobs);
-    let packed_b = twin::pack(&bjobs);
-    let rows_per_lane: Vec<usize> = lanes.iter().map(|l| l.rows).collect();
-
-    let hipcc = twin_run(
-        gpu,
-        &impls[0],
-        &packed_f,
-        &packed_a,
-        &packed_b,
-        &rows_per_lane,
-        ctx,
-    );
-    let pm = twin_run(
-        gpu,
-        &impls[1],
-        &packed_f,
-        &packed_a,
-        &packed_b,
-        &rows_per_lane,
-        ctx,
-    );
+    let set = LaunchSet::upload(gpu, v, lanes);
+    let hipcc = twin_run(gpu, &impls[0], &set, ctx, None);
+    let pm = twin_run(gpu, &impls[1], &set, ctx, None);
 
     let pair = |what: &str, a: &[u32], b: &[u32], row_words: usize| {
         twin::assert_words_eq(a, b, row_words, &format!("hipcc vs pm: {what}"), ctx);
@@ -579,9 +648,7 @@ fn twin_compare_launch(
         LLV_P_WORDS,
     );
 
-    for t in full_t.into_iter().chain(half0).chain(half1) {
-        let _ = gpu.free_tensor(t);
-    }
+    set.free(gpu);
 }
 
 /// Plant the edge values the incumbent generator lacks (it plants NaN and -inf only) into
@@ -613,26 +680,45 @@ fn plant_edges(e: &mut Lcg, lane: &mut LaneSpec, v: usize) {
     }
 }
 
-/// The incumbent sweep's lane generator and launch shapes, run through the committed
-/// objects, with one edge-value lane per launch.
-fn twin_sweep(gpu: &mut Gpu, impls: &[twin::Impl; 2], v: usize, launches: usize, seed: u64) {
+/// Lanes per launch of the twin matrix.
+const TWIN_LANES: usize = 6;
+
+/// The twin matrix: `(vocab, launches, seed)` of every sweep. `leviathan_twin_*` and `leviathan_emu_capture` both run
+/// exactly these. 124,160 = 248,320 / 2 is the Flash vocab's shard boundary (hot ids V/2 - 1 and V/2 tie at 9.0 in every
+/// row); 4,098 has an odd shard width (2,049): rows past the first start off 16-byte alignment.
+const TWIN_MATRIX: [(usize, usize, u64); 3] = [
+    (248_320, 12, 0x51_0a),
+    (5_000, 24, 0x51_0b),
+    (4_098, 24, 0x51_0c),
+];
+
+/// The incumbent sweep's lane generator and launch shapes, with one edge-value lane per launch: calls `f(launch,
+/// lanes)` for each of `launches` launch sets of vocab `v`.
+fn twin_matrix(v: usize, launches: usize, seed: u64, mut f: impl FnMut(usize, &[LaneSpec])) {
     let mut g = Lcg(seed);
     let mut e = Lcg(seed ^ 0xed9e_5eed_0000_0001);
-    const LANES: usize = 6;
     let mut lane_global = 0usize;
     for launch in 0..launches {
-        let mut lanes: Vec<LaneSpec> = (0..LANES)
+        let mut lanes: Vec<LaneSpec> = (0..TWIN_LANES)
             .map(|k| {
                 let lane_id = lane_global;
                 lane_global += 1;
                 make_lane(&mut g, v, lane_id, k == 0 && launch % 3 == 0)
             })
             .collect();
-        plant_edges(&mut e, &mut lanes[launch % LANES], v);
-        twin_compare_launch(gpu, impls, v, &lanes, &format!("V {v} launch {launch}"));
+        plant_edges(&mut e, &mut lanes[launch % TWIN_LANES], v);
+        f(launch, &lanes);
     }
+}
+
+/// The incumbent sweep's lane generator and launch shapes, run through the committed
+/// objects, with one edge-value lane per launch.
+fn twin_sweep(gpu: &mut Gpu, impls: &[twin::Impl; 2], v: usize, launches: usize, seed: u64) {
+    twin_matrix(v, launches, seed, |launch, lanes| {
+        twin_compare_launch(gpu, impls, v, lanes, &format!("V {v} launch {launch}"));
+    });
     eprintln!(
-        "lane draw twin: V {v}: {launches} launches x {LANES} lanes: PM == hipcc in modes 0/1/2, modes 1+2 == mode 0"
+        "lane draw twin: V {v}: {launches} launches x {TWIN_LANES} lanes: PM == hipcc in modes 0/1/2, modes 1+2 == mode 0"
     );
 }
 
@@ -655,16 +741,52 @@ fn twin_setup() -> (Gpu, [twin::Impl; 2]) {
 #[ignore = "needs an exact gfx1200/gfx1201 GPU: run through the GPU fabric"]
 fn leviathan_twin_pm_equals_hipcc_flash_vocab() {
     let (mut gpu, impls) = twin_setup();
+    let (v, launches, seed) = TWIN_MATRIX[0];
     // The shard boundary: hot ids V/2 - 1 and V/2 tie exactly at 9.0 in every row.
-    assert_eq!(248_320 / 2, 124_160);
-    twin_sweep(&mut gpu, &impls, 248_320, 12, 0x51_0a);
+    assert_eq!(v / 2, 124_160);
+    twin_sweep(&mut gpu, &impls, v, launches, seed);
 }
 
 #[test]
 #[ignore = "needs an exact gfx1200/gfx1201 GPU: run through the GPU fabric"]
 fn leviathan_twin_pm_equals_hipcc_small_vocabs() {
     let (mut gpu, impls) = twin_setup();
-    twin_sweep(&mut gpu, &impls, 5_000, 24, 0x51_0b);
+    let (v, launches, seed) = TWIN_MATRIX[1];
+    twin_sweep(&mut gpu, &impls, v, launches, seed);
     // Odd shard width (2,049): rows past the first start off 16-byte alignment.
-    twin_sweep(&mut gpu, &impls, 4_098, 24, 0x51_0c);
+    let (v, launches, seed) = TWIN_MATRIX[2];
+    twin_sweep(&mut gpu, &impls, v, launches, seed);
+}
+
+/// Capture, from the GPU, every launch the committed hipcc object makes over the twin matrix, for
+/// `leviathan_emulator_equals_gpu_capture` (format: the file doc comment).
+#[test]
+#[ignore = "needs an exact gfx1201 GPU: run through the GPU fabric"]
+fn leviathan_emu_capture() {
+    let dir = twin::Capture::dir_from_env();
+    let mut gpu = Gpu::init().expect("gpu init");
+    assert_eq!(
+        gpu.arch, "gfx1201",
+        "the emulator replay compares against gfx1201 hardware results"
+    );
+    let objects = twin::objects_for(&gpu);
+    assert_eq!(
+        objects.arch, gpu.arch,
+        "object arch selected from the device"
+    );
+    let imp = twin::Impl::load(&mut gpu, "hipcc", objects.hipcc);
+    let mut capture = twin::Capture::new(dir, &gpu, "hipcc", objects.hipcc);
+    for (v, launches, seed) in TWIN_MATRIX {
+        twin_matrix(v, launches, seed, |launch, lanes| {
+            let ctx = format!("V {v} launch {launch}");
+            capture.begin_set(v, launch, &ctx);
+            let set = LaunchSet::upload(&mut gpu, v, lanes);
+            twin_run(&mut gpu, &imp, &set, &ctx, Some(&mut capture));
+            set.free(&mut gpu);
+        });
+        eprintln!(
+            "lane draw emu capture: V {v}: {launches} launches x {TWIN_LANES} lanes captured (decode_out, modes 1+2 == mode 0, logits unchanged)"
+        );
+    }
+    capture.finish();
 }

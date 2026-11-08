@@ -10,7 +10,8 @@
 use crate::arch::Arch;
 use crate::native;
 use peacemaker_ir::codec::gfx12::{decode_for, encode_for};
-use peacemaker_ir::envelope::{Bundle, Envelope, SectionData};
+use peacemaker_ir::envelope::{Bundle, Envelope};
+use peacemaker_ir::helpers::{helper_extents, HelperExtent};
 use peacemaker_ir::inst::{Abi, Arch as IrArch, Frontend, Kernel, Program, Wave};
 use peacemaker_ir::metadata::{Kernarg, KernelMeta};
 use peacemaker_ir::passes::hazards;
@@ -19,7 +20,6 @@ use peacemaker_lift::hazards_gfx11::{check_kernel, Severity};
 use peacemaker_lift::{emit, lift_object, Options};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
 
 /// The host entry of every committed `kernels/*_gfx1100.hxaco`.
 pub const HOST_TRIPLE: &str = "host-x86_64-unknown-linux-gnu";
@@ -57,174 +57,39 @@ fn ir_arch(arch: Arch) -> Result<IrArch, String> {
     }
 }
 
-const SHT_SYMTAB: u32 = 2;
-const SHT_STRTAB: u32 = 3;
-const SHT_NOBITS: u32 = 8;
-const SHT_DYNSYM: u32 = 11;
-const SHF_EXECINSTR: u64 = 4;
-const STT_FUNC: u8 = 2;
-const SHN_UNDEF: u16 = 0;
-const SHN_LORESERVE: u16 = 0xff00;
-
-/// A defined, nonempty, executable `STT_FUNC` extent that is not a metadata kernel (an
-/// out-of-line device helper such as LLVM's `llv_build_p`), with every symbol naming it.
+/// An out-of-line helper extent (`peacemaker_ir::helpers`) with its file offset in the original device ELF.
 struct HelperBody {
-    start: u64,
-    size: u64,
-    names: BTreeSet<String>,
-    section: usize,
+    extent: HelperExtent,
     /// File offset of the first byte in the original device ELF.
     offset: usize,
 }
 
-/// The NUL-terminated UTF-8 name of `symbol`, resolved through the string table linked from
-/// symbol-table section `table`.
-fn helper_symbol_name(
-    env: &Envelope,
-    table: usize,
-    symbol: &peacemaker_ir::envelope::Symbol,
-) -> Result<String, String> {
-    let link = env.sections[table].header.sh_link as usize;
-    let strings = env
-        .sections
-        .get(link)
-        .filter(|s| s.header.sh_type == SHT_STRTAB)
-        .ok_or_else(|| format!("symbol table section {table} links to no string table ({link})"))?;
-    let SectionData::Bytes(bytes) = &strings.data else {
-        return Err(format!("string table section {link} holds no bytes"));
-    };
-    let tail = bytes.get(symbol.st_name as usize..).ok_or_else(|| {
-        format!(
-            "symbol name offset {} is outside string table {link}",
-            symbol.st_name
-        )
-    })?;
-    let end = tail.iter().position(|&b| b == 0).ok_or_else(|| {
-        format!(
-            "symbol name at offset {} is not NUL-terminated",
-            symbol.st_name
-        )
-    })?;
-    std::str::from_utf8(&tail[..end])
-        .map(str::to_owned)
-        .map_err(|_| format!("symbol name at offset {} is not UTF-8", symbol.st_name))
-}
-
-/// Every defined `STT_FUNC` extent (dynsym and symtab) that is not exactly a metadata kernel
-/// extent. Aliases (same extent, any name) are merged; partial overlap, a zero-sized body, a
-/// non-executable or out-of-range extent, or a size/address that is not a multiple of 4 is an
-/// error (a defined function whose body cannot be established is never silently skipped).
+/// Every helper extent of `env` (see `helper_extents`: the symbol-table scan and its refusals) located in `elf`; an
+/// extent outside the ELF file is an error.
 fn helper_bodies(env: &Envelope, elf: &[u8]) -> Result<Vec<HelperBody>, String> {
-    let mut bodies: Vec<HelperBody> = Vec::new();
-    for (table, sec) in env.sections.iter().enumerate() {
-        if !matches!(sec.header.sh_type, SHT_SYMTAB | SHT_DYNSYM) {
-            continue;
-        }
-        let SectionData::Symbols(symbols) = &sec.data else {
-            return Err(format!(
-                "symbol table section {table} is not parsed as symbols"
-            ));
-        };
-        for s in symbols {
-            if s.kind() != STT_FUNC || s.st_shndx == SHN_UNDEF {
-                continue;
-            }
-            let name = helper_symbol_name(env, table, s)?;
-            let bad = |why: String| format!("function symbol `{name}`: {why}");
-            if s.st_shndx >= SHN_LORESERVE {
-                return Err(bad(format!(
-                    "defined in reserved section index {:#x}",
-                    s.st_shndx
-                )));
-            }
-            if s.st_size == 0 {
-                return Err(bad("defined with size 0; its body extent is unknown".into()));
-            }
-            let section = usize::from(s.st_shndx);
-            let h = &env
-                .sections
-                .get(section)
-                .ok_or_else(|| bad(format!("section index {section} does not exist")))?
-                .header;
-            if h.sh_flags & SHF_EXECINSTR == 0 || h.sh_type == SHT_NOBITS {
-                return Err(bad(format!("section {section} is not executable code")));
-            }
-            let (start, size) = (s.st_value, s.st_size);
-            let end = start
-                .checked_add(size)
-                .ok_or_else(|| bad("extent overflows".into()))?;
-            let sec_end = h
-                .sh_addr
-                .checked_add(h.sh_size)
-                .ok_or_else(|| bad(format!("section {section} extent overflows")))?;
-            if start < h.sh_addr || end > sec_end {
-                return Err(bad(format!(
-                    "extent [{start:#x}, {end:#x}) is outside section {section} [{:#x}, {sec_end:#x})",
-                    h.sh_addr
-                )));
-            }
-            if start % 4 != 0 || size % 4 != 0 {
-                return Err(bad(format!(
-                    "extent [{start:#x}, +{size:#x}) is not a multiple of 4"
-                )));
-            }
+    helper_extents(env)?
+        .into_iter()
+        .map(|extent| {
+            let h = &env.sections[extent.section].header;
             let offset = h
                 .sh_offset
-                .checked_add(start - h.sh_addr)
+                .checked_add(extent.start - h.sh_addr)
                 .and_then(|o| usize::try_from(o).ok())
                 .filter(|&o| {
-                    usize::try_from(size)
+                    usize::try_from(extent.size)
                         .ok()
                         .and_then(|n| o.checked_add(n))
                         .is_some_and(|e| e <= elf.len())
                 })
-                .ok_or_else(|| bad("extent is outside the ELF file".into()))?;
-            if env
-                .kernels
-                .iter()
-                .any(|k| k.entry_va == start && k.size == size)
-            {
-                continue;
-            }
-            if let Some(k) = env
-                .kernels
-                .iter()
-                .find(|k| k.entry_va < end && start < k.entry_va.saturating_add(k.size))
-            {
-                return Err(bad(format!(
-                    "extent [{start:#x}, {end:#x}) partially overlaps kernel `{}`",
-                    k.name
-                )));
-            }
-            if let Some(b) = bodies
-                .iter_mut()
-                .find(|b| b.start == start && b.size == size)
-            {
-                b.names.insert(name);
-                continue;
-            }
-            if let Some(b) = bodies
-                .iter()
-                .find(|b| b.start < end && start < b.start + b.size)
-            {
-                return Err(bad(format!(
-                    "extent [{start:#x}, {end:#x}) overlaps helper `{}` [{:#x}, {:#x}) inconsistently",
-                    b.names.iter().next().map_or("?", String::as_str),
-                    b.start,
-                    b.start + b.size
-                )));
-            }
-            bodies.push(HelperBody {
-                start,
-                size,
-                names: BTreeSet::from([name]),
-                section,
-                offset,
-            });
-        }
-    }
-    bodies.sort_by_key(|b| b.start);
-    Ok(bodies)
+                .ok_or_else(|| {
+                    format!(
+                        "function symbol `{}`: extent is outside the ELF file",
+                        extent.names.iter().next().map_or("?", String::as_str)
+                    )
+                })?;
+            Ok(HelperBody { extent, offset })
+        })
+        .collect()
 }
 
 /// Decode every instruction of every out-of-line helper body (read from the original device
@@ -234,9 +99,9 @@ fn helper_bodies(env: &Envelope, elf: &[u8]) -> Result<Vec<HelperBody>, String> 
 /// emulator proof is claimed.
 fn certify_helpers(env: &Envelope, elf: &[u8], ir: IrArch) -> Result<Vec<Value>, String> {
     let mut out = Vec::new();
-    for b in helper_bodies(env, elf)? {
+    for HelperBody { extent: b, offset } in helper_bodies(env, elf)? {
         let name = b.names.iter().next().expect("helper has a name").clone();
-        let code = &elf[b.offset..b.offset + b.size as usize];
+        let code = &elf[offset..offset + b.size as usize];
         let words: Vec<u32> = code
             .chunks_exact(4)
             .map(|w| u32::from_le_bytes(w.try_into().expect("dword")))
@@ -598,7 +463,8 @@ mod gfx1200_tests {
 #[cfg(test)]
 mod helper_tests {
     use super::*;
-    use peacemaker_ir::envelope::Symbol;
+    use peacemaker_ir::envelope::{SectionData, Symbol};
+    use peacemaker_ir::helpers::{helper_symbol_name, SHT_DYNSYM, SHT_SYMTAB, STT_FUNC};
 
     const CO: &[u8] = include_bytes!("../tests/fixtures/hip_twin_saxpy_gfx1100.co");
 
@@ -774,7 +640,7 @@ mod helper_tests {
         let env = kernelless();
         let bodies = helper_bodies(&env, device()).unwrap();
         let b = &bodies[0];
-        for w in elf[b.offset..b.offset + b.size as usize].chunks_exact_mut(4) {
+        for w in elf[b.offset..b.offset + b.extent.size as usize].chunks_exact_mut(4) {
             w.copy_from_slice(&0xffff_ffffu32.to_le_bytes());
         }
         let e = certify_helpers(&env, &elf, IrArch::Gfx1100).unwrap_err();

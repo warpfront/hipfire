@@ -122,6 +122,9 @@ run is claimed. Its checked machine-code and helper hashes equal gfx1201's, whil
 its ELF machine identifier and bundle target remain independently gfx1200.
 
 Gfx1200 encoding support does not inherit gfx1201's numerical qualification.
-The IR emulator refuses it explicitly with `gfx1200 unqualified for emulation`,
-before selecting any ABI initializer. Existing gfx1201/gfx11 emulator paths
-are unchanged; complete Leviathan helper-call execution is not claimed here.
+The IR emulator admits gfx1200 at construction (the ABI initializer is keyed on
+the gfx12 family) but refuses to run it unless `gfx1200_as_gfx1201()` is called
+explicitly; that opt-in is shared-ISA reasoning only, with numerics taken from
+gfx1201 and no gfx1200 hardware evidence. Helper calls (`s_getpc_b64`,
+`s_swappc_b64`, `s_setpc_b64`) execute in the emulator on gfx1201; the M7
+all-path obligations remain OPEN.

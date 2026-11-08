@@ -10,6 +10,7 @@ pub mod edit;
 pub mod effects;
 pub mod emu;
 pub mod envelope;
+pub mod helpers;
 pub mod inst;
 pub mod isa;
 pub mod kernarg;
