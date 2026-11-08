@@ -389,6 +389,27 @@ fn forwarded_tokens(seed: u32, committed: &[u32], skip_seed: bool) -> Vec<u32> {
     }
 }
 
+/// `HIPFIRE_LANE_EARLY_FIRST_TOKEN`: unset / anything but exact `0` streams a lane's
+/// prompt-completing pick in the step whose prefill committed it; `0` (kill switch) defers it
+/// to the lane's first decode advance (as its plan seed, after that step's window).
+pub const LANE_EARLY_FIRST_TOKEN_ENV: &str = "HIPFIRE_LANE_EARLY_FIRST_TOKEN";
+
+fn early_first_token_from(value: Option<&str>) -> bool {
+    value.map(str::trim) != Some("0")
+}
+
+static LANE_EARLY_FIRST_TOKEN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    early_first_token_from(
+        hipfire_config::developer_var(LANE_EARLY_FIRST_TOKEN_ENV)
+            .ok()
+            .as_deref(),
+    )
+});
+
+fn early_first_token_enabled() -> bool {
+    *LANE_EARLY_FIRST_TOKEN
+}
+
 /// A promoted request that cannot continue anywhere (its singleton state
 /// already left the resident owners): release its lane and emit one
 /// generation error for the key.
@@ -1997,7 +2018,80 @@ pub fn drive_qwen4_lane_batch(
                             lane.prefill_done_at = ctl.decode_start;
                         }
                     }
-                    if advance.finish.as_deref() == Some("length") {
+                    let length_finish = advance.finish.as_deref() == Some("length");
+                    // The prompt-completing pick streams in THIS step (it is the lane's
+                    // committed first token; its next decode advance then skips it as the
+                    // plan seed), not one decode step later with that step's window.
+                    // `HIPFIRE_LANE_EARLY_FIRST_TOKEN=0` restores the deferred emission.
+                    let early = early_first_token_enabled()
+                        && !advance.committed_ids.is_empty()
+                        && matches!(sched.lanes[idx], BatchLane::Running(_))
+                        && controls[idx]
+                            .as_ref()
+                            .is_some_and(|c| !c.skip_first_forward);
+                    if early {
+                        if let BatchLane::Running(lane) = &sched.lanes[idx] {
+                            if batch_check_abort(
+                                &lane.key.id,
+                                lane.key.attempt_id,
+                                lane.ticket.admission,
+                            ) {
+                                cancel_lane(sched, m, &mut controls, idx, stdout)?;
+                                continue;
+                            }
+                        }
+                        let BatchLane::Running(lane) = &mut sched.lanes[idx] else {
+                            return Err("prefilled lane is not running".into());
+                        };
+                        let _scope = BatchAttemptScope::enter_for_generation(
+                            &lane.key.id,
+                            lane.key.attempt_id,
+                            lane.ticket.admission,
+                        );
+                        let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer disappeared")?;
+                        let ctl = controls[idx].as_mut().ok_or("lane control missing")?;
+                        ctl.skip_first_forward = true;
+                        let emitted = emit_forwarded(
+                            stdout,
+                            tokenizer,
+                            lane,
+                            ctl,
+                            advance.committed_ids[0],
+                            eos,
+                            length_finish,
+                        );
+                        match emitted {
+                            Ok(Some(length)) => {
+                                if let Err(error) =
+                                    finish_lane(sched, m, &mut controls, idx, stdout, length)
+                                {
+                                    lane_error(
+                                        sched,
+                                        m,
+                                        &mut controls,
+                                        idx,
+                                        stdout,
+                                        &error,
+                                        "validation",
+                                    )?;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                lane_error(
+                                    sched,
+                                    m,
+                                    &mut controls,
+                                    idx,
+                                    stdout,
+                                    &error,
+                                    "validation",
+                                )?;
+                            }
+                        }
+                        continue;
+                    }
+                    if length_finish {
                         finish_lane(sched, m, &mut controls, idx, stdout, true)?;
                     }
                     continue;
@@ -2492,6 +2586,37 @@ mod tests {
         assert_eq!(forwarded_tokens(7, &[8, 9, 10], true), vec![8, 9]);
         assert!(forwarded_tokens(7, &[8], true).is_empty());
         assert!(forwarded_tokens(7, &[], true).is_empty());
+    }
+
+    #[test]
+    fn early_first_token_is_on_unless_exact_zero() {
+        use super::early_first_token_from;
+        for on in [None, Some(""), Some("1"), Some("on"), Some(" 1 ")] {
+            assert!(early_first_token_from(on), "{on:?}");
+        }
+        for off in [Some("0"), Some(" 0\n")] {
+            assert!(!early_first_token_from(off), "{off:?}");
+        }
+    }
+
+    #[test]
+    fn an_early_first_token_is_skipped_as_the_next_plan_seed() {
+        // The prefill step streams the pick and sets `skip_first_forward`; the source keeps
+        // that order (flag before the emit) and only for a running lane not already skipping.
+        let src = include_str!("fn_batch.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("test module")];
+        let at = prod
+            .find("let early = early_first_token_enabled()")
+            .expect("early emit");
+        let body = &prod[at..];
+        let flag = body
+            .find("ctl.skip_first_forward = true;")
+            .expect("skip flag");
+        let emit = body
+            .find("advance.committed_ids[0]")
+            .expect("emit the pick");
+        assert!(flag < emit);
+        assert!(body[..flag].contains("!c.skip_first_forward"));
     }
 
     #[test]
