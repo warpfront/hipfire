@@ -201,6 +201,30 @@ pub const FINDINGS: &[Allow] = &[
         needle: "`global_load_b128 v[9:12], v[19:20], off` (after label `.LBB26`): needs Vm wait 0 (Waw { reg: \"v[9:12]\" })",
         why: "MODEL LIMITATION, not a claimed race: this younger global_load_b128 overwrites v[9:12], the destination of an older global_load_b128 v[9:12], v[9:10] (prologue, before the loop) that nothing read in between; two same-class in-order global loads return older first, and `s_waitcnt vmcnt(0) lgkmcnt(1)` follows before any consumer. The pending queue also holds two younger flat loads (flat_load_b128 v[13:16], flat_load_b32 v23), which the ledger models as unordered (in_order false, Vm and Lgkm), so it credits no nonzero vmcnt and asks for Vm wait 0 on the whole queue; the ledger has no representation of an ordered-load destination overwrite. That the path is feasible (loop count above one) and the hardware order of this exact pair are not established here",
     },
+    Allow {
+        scope: "pins",
+        target: "lane_leviathan_hipcc_gfx1200.co#lane_leviathan_verify",
+        needle: "`v_dual_mov_b32 v0, 0x7404 :: v_dual_mov_b32 v1, s3` (after label `.LBB7`): needs Ds wait 0 (War { reg: \"v0\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM M7OPEN finding (the committed lane_leviathan_verify image is unchanged compiler output; no modified code is claimed to race). The ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one (here the dual mov of v0) on a CFG path from the entry through the not-taken branches pc 30, 42, 67, 72 and 80 that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Nothing here is discharged. The gfx1200 image is the gfx1201 image with only the ELF machine and target name changed, so this is the same instruction stream",
+    },
+    Allow {
+        scope: "pins",
+        target: "lane_leviathan_hipcc_gfx1201.co#lane_leviathan_verify",
+        needle: "`v_dual_mov_b32 v0, 0x7404 :: v_dual_mov_b32 v1, s3` (after label `.LBB7`): needs Ds wait 0 (War { reg: \"v0\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM M7OPEN finding (the committed lane_leviathan_verify image is unchanged compiler output; no modified code is claimed to race). The ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one (here the dual mov of v0) on a CFG path from the entry through the not-taken branches pc 30, 42, 67, 72 and 80 that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "lane_leviathan_pm_gfx1200.hxaco#lane_leviathan_verify",
+        needle: "`v_dual_mov_b32 v0, 0x7404 :: v_dual_mov_b32 v1, s3` (after label `.LBB7`): needs Ds wait 0 (War { reg: \"v0\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM M7OPEN finding (the committed lane_leviathan_verify image is the same instruction stream as the hipcc image; no modified code is claimed to race). The ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one (here the dual mov of v0) on a CFG path from the entry through the not-taken branches pc 30, 42, 67, 72 and 80 that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Nothing here is discharged. The gfx1200 image is the gfx1201 image with only the ELF machine and target name changed",
+    },
+    Allow {
+        scope: "pins",
+        target: "lane_leviathan_pm_gfx1201.hxaco#lane_leviathan_verify",
+        needle: "`v_dual_mov_b32 v0, 0x7404 :: v_dual_mov_b32 v1, s3` (after label `.LBB7`): needs Ds wait 0 (War { reg: \"v0\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM M7OPEN finding (the committed lane_leviathan_verify image is the same instruction stream as the hipcc image; no modified code is claimed to race). The ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one (here the dual mov of v0) on a CFG path from the entry through the not-taken branches pc 30, 42, 67, 72 and 80 that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Nothing here is discharged",
+    },
 ];
 
 /// Inputs with no verification: a verifier refusal or a refusal upstream of it (lift region, pool).
@@ -528,6 +552,18 @@ pub const UNSUPPORTED: &[Allow] = &[
         target: "pool:b32:multi",
         needle: "pool refused: no VGPR left to park dispatcher SGPRs",
         why: "ld::pool refuses the multi-template pool (no VGPR is left to park the dispatcher's SGPRs for the hosted bodies combined), so no multi pool exists for this blockDim; every hosted body is still verified in its single-template pool; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:lane_leviathan_hipcc_gfx1201.co#lane_leviathan_verify",
+        needle: "not convertible: uses a private (scratch) segment",
+        why: "UNSUPPORTED INPUT: lift_region refuses the kernel (it uses a private (scratch) segment), so no pool region exists and no pool body was verified; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:lane_leviathan_pm_gfx1201.hxaco#lane_leviathan_verify",
+        needle: "not convertible: uses a private (scratch) segment",
+        why: "UNSUPPORTED INPUT: lift_region refuses the kernel (it uses a private (scratch) segment), so no pool region exists and no pool body was verified; not a verifier finding",
     },
 ];
 

@@ -224,7 +224,7 @@ pub fn lift_region_in(
     inputs: &RegionInputs,
 ) -> Result<LiftedRegion, RegionError> {
     let arch = program.target.arch;
-    if arch != Arch::Gfx1201 {
+    if !arch.is_gfx12() {
         return refuse(symbol, format!("{arch:?}: regions are gfx1201 only"));
     }
     let kernel = program

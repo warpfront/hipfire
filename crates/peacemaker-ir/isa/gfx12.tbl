@@ -576,3 +576,9 @@ v_cmpx_le_u32_e32	vopc	0xcb	SRC0:32,VSRC1:32	implicit	SRC0,VSRC1	exec:w	-	v_cmpx
 v_cmpx_lt_u64_e32	vopc	0xd9	SRC0:64,VSRC1:64,literal@last	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_lt_u64_e32 0x270f, v[103:104]	7DB2CEFF 0000270F	-
 v_mul_hi_i32_i24_e32	vop2	0xa	VDST:32,SRC0:32,VSRC1:32,literal@last	VDST	SRC0,VSRC1	-	-	v_mul_hi_i32_i24_e32 v29, 0x5000, v25	143A32FF 00005000	-
 v_mov_b32_dpp	vop1_dpp8	0x1	VDST:32,SRC0:32	VDST	SRC0	-	-	v_mov_b32_dpp v3, v3 dpp8:[4,5,6,7,0,1,2,3]	7E0602E9 688FAC03	dpp8_sel:honored:0xffffff00
+# gfx1200 anchor (lane_leviathan): v_cmp_lt_u64_e32; sample = pinned ROCm llvm-mc -mcpu=gfx1200.
+v_cmp_lt_u64_e32	vopc	0x59	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	vcc:w	-	v_cmp_lt_u64_e32 vcc_lo, s[2:3], v[3:4]	7CB20602	-
+# gfx1200 anchor (lane_leviathan): s_swappc_b64 (call: SDST64 <- return PC, PC <- SSRC0), flat_atomic_add_u32, remaining f32 cmpx e32 rows; samples = pinned ROCm llvm-mc -mcpu=gfx1200.
+s_swappc_b64	sop1	0x49	SDST:64,SSRC0:64	SDST	SSRC0	pc:rw	-	s_swappc_b64 s[30:31], s[2:3]	BE9E4902	-
+flat_atomic_add_u32	flat	0x35	VDST@rtn:32,VADDR:64,VSRC:32,SADDR:64	VDST	VADDR,VSRC,SADDR	-	Load:1@rtn,Store:1@nortn,Ds:1	flat_atomic_add_u32 v6, v[10:11], v6 th:TH_ATOMIC_RETURN scope:SCOPE_DEV	EC0D407C 03180006 0000000A	w0_extra:ignored:0xc03f00:0x0,w1_extra:ignored:0x8001ff00:0x0,global_sve:honored:0x20000:0x0,global_scope:honored:0xc0000:0x0/0x40000/0x80000/0xc0000,global_th:honored:0x700000:0x0/0x100000,global_nv:honored:0x80:0x0
+v_cmpx_ge_f32_e32	vopc	0x96	SRC0:32,VSRC1:32	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_ge_f32_e32 v4, v6	7D2C0D04	-

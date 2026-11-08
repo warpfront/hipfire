@@ -301,7 +301,7 @@ impl Wmma {
             }
             Self::F16 => Ok("v_wmma_f32_16x16x16_f16"),
             Self::Bf16 => Ok("v_wmma_f32_16x16x16_bf16"),
-            Self::Fp8 if arch == Arch::Gfx1201 => Ok("v_wmma_f32_16x16x16_fp8_fp8"),
+            Self::Fp8 if arch.gfx12() => Ok("v_wmma_f32_16x16x16_fp8_fp8"),
             _ => Err("WMMA opcode requires gfx1201".into()),
         }
     }

@@ -353,6 +353,15 @@ impl Effects {
                         OrderType::Store
                     },
                 )
+            } else if name.starts_with("flat_atomic") {
+                (
+                    MemClass::FlatAtomic { returns },
+                    if returns {
+                        OrderType::Load
+                    } else {
+                        OrderType::Store
+                    },
+                )
             } else {
                 return Err(ValidateError::Operand(format!(
                     "unclassified memory rule for {name}"

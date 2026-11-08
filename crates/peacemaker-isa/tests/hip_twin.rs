@@ -24,6 +24,36 @@ fn seals_and_verifies() {
 }
 
 #[test]
+fn kernel_only_object_reports_no_helpers_and_keeps_every_field() {
+    let s = seal(CO, Arch::Gfx1100, "twin_saxpy", None).expect("seal");
+    assert!(s.report.get("helpers").is_none());
+    assert!(s.report.get("helper_coverage").is_none());
+    for k in [
+        "kernel",
+        "arch",
+        "elf_sha256",
+        "elf_bytes",
+        "text_sha256",
+        "text_bytes",
+        "hxaco_sha256",
+        "hxaco_bytes",
+        "lift_identity",
+        "vgprs",
+        "sgprs",
+        "lds",
+        "scratch",
+        "user_sgprs",
+        "rsrc2",
+        "wavefront_size",
+        "hazards",
+        "abi",
+    ] {
+        assert!(s.report.get(k).is_some(), "report lost `{k}`");
+    }
+    assert_eq!(s.report["hxaco_sha256"], s.hxaco_sha256);
+}
+
+#[test]
 fn abi_ref_same_object_matches_other_kernel_differs() {
     seal(CO, Arch::Gfx1100, "twin_saxpy", Some((CO, "twin_saxpy"))).expect("self abi");
     let e = seal(CO, Arch::Gfx1100, "twin_saxpy", Some((CO, "twin_saxpy2"))).unwrap_err();

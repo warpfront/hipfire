@@ -1022,7 +1022,7 @@ fn acquired_after(arch: Arch, body: &Body, block_of: &[usize], pos: usize, scope
 /// the stream proves one. gfx12 (`Gfx1201`) only; empty elsewhere.
 fn sync_classes(arch: Arch, body: &Body) -> Vec<Option<AccessClass>> {
     let mut out = vec![None; body.layout.len()];
-    if arch != Arch::Gfx1201 {
+    if !arch.is_gfx12() {
         return out;
     }
     let mut block_of = vec![0usize; body.layout.len()];
@@ -1499,7 +1499,10 @@ fn analyze_core(
         kernarg_size: size,
         ..KernargFacts::default()
     };
-    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
+    if !matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+    ) {
         facts.unresolved.push(Unresolved {
             inst: None,
             rule: "unsupported-arch",
@@ -1533,7 +1536,7 @@ fn analyze_core(
     // not preceded by an EXECZ branch.
     entry.exec_nz = sealed || wg;
     let mut interner = Interner::default();
-    if arch == Arch::Gfx1201 && matches!(kernel.abi, Abi::Hsa { .. }) {
+    if arch.is_gfx12() && matches!(kernel.abi, Abi::Hsa { .. }) {
         entry.t[9].ix = interner.entry(EntryReg::WorkgroupIdX);
         entry.t[7].ix = interner.entry(EntryReg::WorkgroupIdYZ);
         entry.v[0].ix = interner.entry(EntryReg::WorkitemIdPacked);
@@ -1851,7 +1854,7 @@ fn entry_state(kernel: &Kernel, arch: Arch) -> (State, DwSet) {
         }
         next += 1;
     }
-    if arch == Arch::Gfx1201 {
+    if arch.is_gfx12() {
         st.t[9] = Val::flags(WG);
         st.t[7] = Val::flags(WG);
     } else {

@@ -697,6 +697,10 @@ pub struct Emulator<'a> {
 }
 impl<'a> Emulator<'a> {
     pub fn new(program: &'a Program, symbol: &str) -> Result<Self> {
+        // Encoding support is not numerical or ABI qualification for emulation.
+        if program.target.arch == Arch::Gfx1200 {
+            return Err("gfx1200 unqualified for emulation".into());
+        }
         let kernel = program
             .kernels
             .iter()
@@ -1088,6 +1092,28 @@ mod tests {
             },
         }
     }
+    #[test]
+    fn gfx1200_refuses_before_selecting_an_abi_initializer() {
+        use crate::inst::{Setting, Target};
+        let mut body = crate::Body::default();
+        let end = body.insts.insert(insn("s_endpgm", vec![]));
+        body.layout.push(end);
+        let p = Program {
+            target: Target {
+                arch: Arch::Gfx1200,
+                xnack: Setting::Any,
+                sramecc: Setting::Any,
+                abi_version: 4,
+            },
+            kernels: vec![kernel(body)],
+            source: None,
+        };
+        let Err(error) = Emulator::new(&p, "exchange") else {
+            panic!("unqualified gfx1200 must not fall through to the gfx11 ABI initializer");
+        };
+        assert_eq!(error, "gfx1200 unqualified for emulation");
+    }
+
     #[test]
     fn split_barrier_rendezvous_waits_for_delayed_wave() {
         use crate::{

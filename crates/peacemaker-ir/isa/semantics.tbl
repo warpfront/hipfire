@@ -584,3 +584,5 @@ v_cmpx_gt_u16_e32	alu
 v_cmpx_lt_u64_e32	alu
 v_mul_hi_i32_i24_e32	alu
 s_sendmsg_rtn_b64	alu
+v_cmp_lt_u64_e32	alu
+v_cmpx_ge_f32_e32	alu

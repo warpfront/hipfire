@@ -9,7 +9,8 @@
 
 use crate::arch::Arch;
 use crate::native;
-use peacemaker_ir::envelope::Bundle;
+use peacemaker_ir::codec::gfx12::{decode_for, encode_for};
+use peacemaker_ir::envelope::{Bundle, Envelope, SectionData};
 use peacemaker_ir::inst::{Abi, Arch as IrArch, Frontend, Kernel, Program, Wave};
 use peacemaker_ir::metadata::{Kernarg, KernelMeta};
 use peacemaker_ir::passes::hazards;
@@ -18,6 +19,7 @@ use peacemaker_lift::hazards_gfx11::{check_kernel, Severity};
 use peacemaker_lift::{emit, lift_object, Options};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 
 /// The host entry of every committed `kernels/*_gfx1100.hxaco`.
 pub const HOST_TRIPLE: &str = "host-x86_64-unknown-linux-gnu";
@@ -49,9 +51,238 @@ fn ir_arch(arch: Arch) -> Result<IrArch, String> {
     match arch {
         Arch::Gfx1100 => Ok(IrArch::Gfx1100),
         Arch::Gfx1151 => Ok(IrArch::Gfx1151),
+        Arch::Gfx1200 => Ok(IrArch::Gfx1200),
         Arch::Gfx1201 => Ok(IrArch::Gfx1201),
         Arch::Gfx942 => Err("hip_twin: gfx942 is not liftable (no CDNA lift target)".into()),
     }
+}
+
+const SHT_SYMTAB: u32 = 2;
+const SHT_STRTAB: u32 = 3;
+const SHT_NOBITS: u32 = 8;
+const SHT_DYNSYM: u32 = 11;
+const SHF_EXECINSTR: u64 = 4;
+const STT_FUNC: u8 = 2;
+const SHN_UNDEF: u16 = 0;
+const SHN_LORESERVE: u16 = 0xff00;
+
+/// A defined, nonempty, executable `STT_FUNC` extent that is not a metadata kernel (an
+/// out-of-line device helper such as LLVM's `llv_build_p`), with every symbol naming it.
+struct HelperBody {
+    start: u64,
+    size: u64,
+    names: BTreeSet<String>,
+    section: usize,
+    /// File offset of the first byte in the original device ELF.
+    offset: usize,
+}
+
+/// The NUL-terminated UTF-8 name of `symbol`, resolved through the string table linked from
+/// symbol-table section `table`.
+fn helper_symbol_name(
+    env: &Envelope,
+    table: usize,
+    symbol: &peacemaker_ir::envelope::Symbol,
+) -> Result<String, String> {
+    let link = env.sections[table].header.sh_link as usize;
+    let strings = env
+        .sections
+        .get(link)
+        .filter(|s| s.header.sh_type == SHT_STRTAB)
+        .ok_or_else(|| format!("symbol table section {table} links to no string table ({link})"))?;
+    let SectionData::Bytes(bytes) = &strings.data else {
+        return Err(format!("string table section {link} holds no bytes"));
+    };
+    let tail = bytes.get(symbol.st_name as usize..).ok_or_else(|| {
+        format!(
+            "symbol name offset {} is outside string table {link}",
+            symbol.st_name
+        )
+    })?;
+    let end = tail.iter().position(|&b| b == 0).ok_or_else(|| {
+        format!(
+            "symbol name at offset {} is not NUL-terminated",
+            symbol.st_name
+        )
+    })?;
+    std::str::from_utf8(&tail[..end])
+        .map(str::to_owned)
+        .map_err(|_| format!("symbol name at offset {} is not UTF-8", symbol.st_name))
+}
+
+/// Every defined `STT_FUNC` extent (dynsym and symtab) that is not exactly a metadata kernel
+/// extent. Aliases (same extent, any name) are merged; partial overlap, a zero-sized body, a
+/// non-executable or out-of-range extent, or a size/address that is not a multiple of 4 is an
+/// error (a defined function whose body cannot be established is never silently skipped).
+fn helper_bodies(env: &Envelope, elf: &[u8]) -> Result<Vec<HelperBody>, String> {
+    let mut bodies: Vec<HelperBody> = Vec::new();
+    for (table, sec) in env.sections.iter().enumerate() {
+        if !matches!(sec.header.sh_type, SHT_SYMTAB | SHT_DYNSYM) {
+            continue;
+        }
+        let SectionData::Symbols(symbols) = &sec.data else {
+            return Err(format!(
+                "symbol table section {table} is not parsed as symbols"
+            ));
+        };
+        for s in symbols {
+            if s.kind() != STT_FUNC || s.st_shndx == SHN_UNDEF {
+                continue;
+            }
+            let name = helper_symbol_name(env, table, s)?;
+            let bad = |why: String| format!("function symbol `{name}`: {why}");
+            if s.st_shndx >= SHN_LORESERVE {
+                return Err(bad(format!(
+                    "defined in reserved section index {:#x}",
+                    s.st_shndx
+                )));
+            }
+            if s.st_size == 0 {
+                return Err(bad("defined with size 0; its body extent is unknown".into()));
+            }
+            let section = usize::from(s.st_shndx);
+            let h = &env
+                .sections
+                .get(section)
+                .ok_or_else(|| bad(format!("section index {section} does not exist")))?
+                .header;
+            if h.sh_flags & SHF_EXECINSTR == 0 || h.sh_type == SHT_NOBITS {
+                return Err(bad(format!("section {section} is not executable code")));
+            }
+            let (start, size) = (s.st_value, s.st_size);
+            let end = start
+                .checked_add(size)
+                .ok_or_else(|| bad("extent overflows".into()))?;
+            let sec_end = h
+                .sh_addr
+                .checked_add(h.sh_size)
+                .ok_or_else(|| bad(format!("section {section} extent overflows")))?;
+            if start < h.sh_addr || end > sec_end {
+                return Err(bad(format!(
+                    "extent [{start:#x}, {end:#x}) is outside section {section} [{:#x}, {sec_end:#x})",
+                    h.sh_addr
+                )));
+            }
+            if start % 4 != 0 || size % 4 != 0 {
+                return Err(bad(format!(
+                    "extent [{start:#x}, +{size:#x}) is not a multiple of 4"
+                )));
+            }
+            let offset = h
+                .sh_offset
+                .checked_add(start - h.sh_addr)
+                .and_then(|o| usize::try_from(o).ok())
+                .filter(|&o| {
+                    usize::try_from(size)
+                        .ok()
+                        .and_then(|n| o.checked_add(n))
+                        .is_some_and(|e| e <= elf.len())
+                })
+                .ok_or_else(|| bad("extent is outside the ELF file".into()))?;
+            if env
+                .kernels
+                .iter()
+                .any(|k| k.entry_va == start && k.size == size)
+            {
+                continue;
+            }
+            if let Some(k) = env
+                .kernels
+                .iter()
+                .find(|k| k.entry_va < end && start < k.entry_va.saturating_add(k.size))
+            {
+                return Err(bad(format!(
+                    "extent [{start:#x}, {end:#x}) partially overlaps kernel `{}`",
+                    k.name
+                )));
+            }
+            if let Some(b) = bodies
+                .iter_mut()
+                .find(|b| b.start == start && b.size == size)
+            {
+                b.names.insert(name);
+                continue;
+            }
+            if let Some(b) = bodies
+                .iter()
+                .find(|b| b.start < end && start < b.start + b.size)
+            {
+                return Err(bad(format!(
+                    "extent [{start:#x}, {end:#x}) overlaps helper `{}` [{:#x}, {:#x}) inconsistently",
+                    b.names.iter().next().map_or("?", String::as_str),
+                    b.start,
+                    b.start + b.size
+                )));
+            }
+            bodies.push(HelperBody {
+                start,
+                size,
+                names: BTreeSet::from([name]),
+                section,
+                offset,
+            });
+        }
+    }
+    bodies.sort_by_key(|b| b.start);
+    Ok(bodies)
+}
+
+/// Decode every instruction of every out-of-line helper body (read from the original device
+/// ELF, not the envelope, whose kernel holes are zeroed), re-encode it with the typed codec and
+/// require the words to be byte-exact. Returns the report entries (empty when the object has no
+/// helper). This is typed-instruction re-encode coverage only: no helper CFG, hazard or
+/// emulator proof is claimed.
+fn certify_helpers(env: &Envelope, elf: &[u8], ir: IrArch) -> Result<Vec<Value>, String> {
+    let mut out = Vec::new();
+    for b in helper_bodies(env, elf)? {
+        let name = b.names.iter().next().expect("helper has a name").clone();
+        let code = &elf[b.offset..b.offset + b.size as usize];
+        let words: Vec<u32> = code
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes(w.try_into().expect("dword")))
+            .collect();
+        let mut stream = Vec::with_capacity(code.len());
+        let (mut at, mut count) = (0usize, 0usize);
+        while at < words.len() {
+            let va = b.start + 4 * at as u64;
+            let fail = |why: String| format!("helper `{name}` at {va:#x}: {why}");
+            let (inst, n) =
+                decode_for(ir, &words[at..]).map_err(|e| fail(format!("decode: {e}")))?;
+            if n == 0 || at + n > words.len() {
+                return Err(fail(format!(
+                    "instruction of {n} dword(s) leaves the helper extent"
+                )));
+            }
+            let encoded = encode_for(ir, &inst).map_err(|e| fail(format!("re-encode: {e}")))?;
+            if encoded.as_slice() != &words[at..at + n] {
+                return Err(fail(format!(
+                    "re-encoded {encoded:08x?} != input {:08x?}",
+                    &words[at..at + n]
+                )));
+            }
+            for w in &encoded {
+                stream.extend_from_slice(&w.to_le_bytes());
+            }
+            at += n;
+            count += 1;
+        }
+        if stream != code {
+            return Err(format!(
+                "helper `{name}`: re-encoded stream differs from the ELF bytes"
+            ));
+        }
+        let mut entry = json!({
+            "symbol": name, "section_index": b.section,
+            "entry_va": b.start, "bytes": b.size, "instructions": count,
+            "stream_sha256": hex(&stream),
+            "coverage": "typed instruction re-encode",
+        });
+        if b.names.len() > 1 {
+            entry["aliases"] = json!(b.names.iter().skip(1).collect::<Vec<_>>());
+        }
+        out.push(entry);
+    }
+    Ok(out)
 }
 
 /// The device ELF of `input`: the bytes themselves when they are not a bundle, else the HIP
@@ -177,12 +408,20 @@ pub fn seal(
     let program = &lifted.program;
     let kernel = kernel_of(program, symbol)?;
     let (desc, meta) = hsa(kernel)?;
+    let source = program
+        .source
+        .as_ref()
+        .ok_or("lifted program carries no source envelope")?;
+    let helpers = certify_helpers(&source.elf, elf, ir)?;
     let text = emit::bytes(kernel, ir).map_err(|e| format!("emit text: {e}"))?;
 
     // Static hazards (gfx11 arches).
     let mut hz = json!({"checked": false});
     let mut hz_err = Vec::new();
-    if matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
+    if matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+    ) {
         let findings = check_kernel(kernel, ir, true);
         let blocking: Vec<_> = findings
             .iter()
@@ -259,6 +498,12 @@ pub fn seal(
         "wavefront_size": meta.wavefront_size,
         "hazards": hz, "abi": abi,
     });
+    if !helpers.is_empty() {
+        s.report["helpers"] = json!(helpers);
+        s.report["helper_coverage"] = json!(
+            "typed instruction re-encode (decode_for+encode_for byte-exact over each out-of-line helper's full extent); no helper CFG/emulator proof"
+        );
+    }
     Ok(s)
 }
 
@@ -329,4 +574,210 @@ pub fn verify_hxaco_many(
         .iter()
         .map(|s| verify_hxaco(hxaco, arch, s))
         .collect()
+}
+
+#[cfg(test)]
+mod gfx1200_tests {
+    use super::*;
+
+    /// gfx1200 maps to its own IR target and bundle triple, never aliasing gfx1201.
+    #[test]
+    fn gfx1200_has_its_own_ir_target_and_bundle_triple() {
+        assert_eq!(ir_arch(Arch::Gfx1200), Ok(IrArch::Gfx1200));
+        assert_eq!(ir_arch(Arch::Gfx1201), Ok(IrArch::Gfx1201));
+        let hxaco = native::bundle(b"\x7fELF", Arch::Gfx1200, HOST_TRIPLE);
+        let (bundle, payloads) = Bundle::read(&hxaco).unwrap();
+        let idx = bundle.device_entry(IrArch::Gfx1200).unwrap();
+        assert_eq!(payloads[idx], b"\x7fELF");
+        assert!(bundle.device_entry(IrArch::Gfx1201).is_err());
+        assert!(device_elf(&hxaco, Arch::Gfx1200).is_ok());
+        assert!(device_elf(&hxaco, Arch::Gfx1201).is_err());
+    }
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+    use peacemaker_ir::envelope::Symbol;
+
+    const CO: &[u8] = include_bytes!("../tests/fixtures/hip_twin_saxpy_gfx1100.co");
+
+    /// The fixture is a HIP bundle; helper extents are offsets into its device ELF payload.
+    fn device() -> &'static [u8] {
+        device_elf(CO, Arch::Gfx1100).expect("device elf")
+    }
+
+    fn envelope() -> Envelope {
+        let lifted = lift_object(CO, OPTS).expect("lift");
+        lifted.program.source.expect("source").elf
+    }
+
+    /// The same object with its metadata kernels forgotten: their `STT_FUNC` extents become
+    /// out-of-line helpers decoded from the original ELF bytes.
+    fn kernelless() -> Envelope {
+        let mut env = envelope();
+        env.kernels.clear();
+        env
+    }
+
+    /// Run `f` on every symbol table's `STT_FUNC` symbol named `twin_saxpy`, then append
+    /// `extra` clones (built by `f`) to that table.
+    fn edit_symbols(env: &mut Envelope, f: impl Fn(&Symbol) -> Vec<Symbol>) {
+        for table in 0..env.sections.len() {
+            if !matches!(env.sections[table].header.sh_type, SHT_SYMTAB | SHT_DYNSYM) {
+                continue;
+            }
+            let SectionData::Symbols(symbols) = &env.sections[table].data else {
+                continue;
+            };
+            let target = symbols
+                .iter()
+                .find(|s| {
+                    s.kind() == STT_FUNC
+                        && helper_symbol_name(env, table, s).as_deref() == Ok("twin_saxpy")
+                })
+                .copied();
+            let Some(target) = target else { continue };
+            let extra = f(&target);
+            let SectionData::Symbols(symbols) = &mut env.sections[table].data else {
+                unreachable!()
+            };
+            symbols.extend(extra);
+        }
+    }
+
+    #[test]
+    fn kernels_alone_have_no_helpers() {
+        let helpers = certify_helpers(&envelope(), device(), IrArch::Gfx1100).expect("certify");
+        assert!(helpers.is_empty());
+    }
+
+    #[test]
+    fn helper_extents_are_decoded_from_the_original_elf_and_reencoded_exactly() {
+        let sealed = seal(CO, Arch::Gfx1100, "twin_saxpy", None).expect("seal");
+        let helpers = certify_helpers(&kernelless(), device(), IrArch::Gfx1100).expect("certify");
+        assert_eq!(helpers.len(), 2, "{helpers:?}");
+        let saxpy = helpers
+            .iter()
+            .find(|h| h["symbol"] == "twin_saxpy")
+            .expect("twin_saxpy extent");
+        // The helper path reads the same instruction stream the kernel lift re-emits.
+        assert_eq!(saxpy["stream_sha256"], sealed.text_sha256);
+        assert_eq!(saxpy["bytes"], sealed.report["text_bytes"]);
+        assert!(saxpy["instructions"].as_u64().unwrap() > 0);
+        assert_eq!(saxpy["coverage"], "typed instruction re-encode");
+        assert!(saxpy.get("aliases").is_none());
+    }
+
+    #[test]
+    fn aliases_with_the_same_extent_merge_and_exact_duplicates_dedup() {
+        let mut env = kernelless();
+        edit_symbols(&mut env, |s| {
+            // Exact duplicate (same name), and the same extent under another name.
+            let mut other = *s;
+            other.st_name += 1; // tail of the same string ("win_saxpy"): a distinct, valid name
+            vec![*s, other]
+        });
+        let helpers = certify_helpers(&env, device(), IrArch::Gfx1100).expect("certify");
+        assert_eq!(helpers.len(), 2);
+        let saxpy = helpers
+            .iter()
+            .find(|h| h["symbol"] == "twin_saxpy")
+            .expect("merged extent");
+        assert_eq!(saxpy["aliases"], json!(["win_saxpy"]), "{saxpy}");
+    }
+
+    fn rejects(mutate: impl Fn(&Symbol) -> Vec<Symbol>, env: Envelope, why: &str) {
+        let mut env = env;
+        edit_symbols(&mut env, mutate);
+        let e = certify_helpers(&env, device(), IrArch::Gfx1100).unwrap_err();
+        assert!(e.contains(why), "expected `{why}` in `{e}`");
+    }
+
+    #[test]
+    fn zero_sized_defined_function_is_rejected() {
+        rejects(
+            |s| {
+                let mut z = *s;
+                z.st_size = 0;
+                vec![z]
+            },
+            envelope(),
+            "size 0",
+        );
+    }
+
+    #[test]
+    fn extent_that_is_not_a_multiple_of_four_is_rejected() {
+        rejects(
+            |s| {
+                let mut z = *s;
+                z.st_size = s.st_size - 2;
+                vec![z]
+            },
+            kernelless(),
+            "multiple of 4",
+        );
+    }
+
+    #[test]
+    fn partial_overlap_with_a_kernel_is_rejected() {
+        rejects(
+            |s| {
+                let mut z = *s;
+                z.st_size = s.st_size - 4;
+                vec![z]
+            },
+            envelope(),
+            "partially overlaps kernel",
+        );
+    }
+
+    #[test]
+    fn inconsistent_helper_overlap_is_rejected() {
+        rejects(
+            |s| {
+                let mut z = *s;
+                z.st_size = s.st_size - 4;
+                vec![z]
+            },
+            kernelless(),
+            "overlaps helper",
+        );
+    }
+
+    #[test]
+    fn extent_outside_the_section_or_with_unresolvable_name_is_rejected() {
+        rejects(
+            |s| {
+                let mut z = *s;
+                z.st_size = 1 << 40;
+                vec![z]
+            },
+            envelope(),
+            "outside section",
+        );
+        rejects(
+            |s| {
+                let mut z = *s;
+                z.st_name = u32::MAX;
+                vec![z]
+            },
+            envelope(),
+            "outside string table",
+        );
+    }
+
+    #[test]
+    fn undecodable_helper_words_are_rejected_not_passed_through() {
+        let mut elf = device().to_vec();
+        let env = kernelless();
+        let bodies = helper_bodies(&env, device()).unwrap();
+        let b = &bodies[0];
+        for w in elf[b.offset..b.offset + b.size as usize].chunks_exact_mut(4) {
+            w.copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        }
+        let e = certify_helpers(&env, &elf, IrArch::Gfx1100).unwrap_err();
+        assert!(e.contains("helper `"), "{e}");
+    }
 }

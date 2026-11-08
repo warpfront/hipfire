@@ -31,6 +31,7 @@ fn ir_arch(arch: Arch) -> Result<IrArch, String> {
         Arch::Gfx1100 => Ok(IrArch::Gfx1100),
         Arch::Gfx1151 => Ok(IrArch::Gfx1151),
         Arch::Gfx1201 => Ok(IrArch::Gfx1201),
+        Arch::Gfx1200 => Err("the .rip front end has no gfx1200 builder target".into()),
         Arch::Gfx942 => Err(CDNA_UNSUPPORTED.into()),
     }
 }

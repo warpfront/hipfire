@@ -112,7 +112,7 @@ pub fn canonical(inst: &Inst, arch: Arch) -> Result<String, PrintError> {
             PrintError::Unspellable(format!("{} is missing its {slot_name} operand", row.name))
         })?;
         let mut text = operand_text(operand, Some(slot_name), row, inst)?;
-        if arch == Arch::Gfx1201 {
+        if arch.is_gfx12() {
             match (row.name, *slot_name, operand) {
                 ("s_getreg_b32", "SIMM16", Operand::Imm(ImmField::Sopk(n))) => {
                     text = gfx12_hwreg_text(*n as u16);
@@ -162,7 +162,7 @@ pub fn canonical(inst: &Inst, arch: Arch) -> Result<String, PrintError> {
     }
     // gfx12 GLOBAL/FLAT/SCRATCH loads, stores and atomics keep TH and scope in the
     // cache policy, not as operands.
-    if arch == Arch::Gfx1201
+    if arch.is_gfx12()
         && matches!(
             inst.form,
             Form::Vmem(VmemForm::Global | VmemForm::Flat | VmemForm::Scratch)

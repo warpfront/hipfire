@@ -263,7 +263,7 @@ fn parse_single(row: &'static OpRow, rest: &str, arch: Arch) -> Result<Inst, Par
     // A VMEM atomic's `VDST@rtn` slot is spelled only in the returning form:
     // `th:TH_ATOMIC_RETURN` on gfx12, the `glc` suffix on gfx11.
     if row.grammar.contains("@rtn") {
-        let returns = if arch == Arch::Gfx1201 {
+        let returns = if arch.is_gfx12() {
             extras.iter().any(|text| text == "th:TH_ATOMIC_RETURN")
         } else {
             suffixes.iter().any(|text| text == "glc")
@@ -391,7 +391,7 @@ fn parse_single(row: &'static OpRow, rest: &str, arch: Arch) -> Result<Inst, Par
         }
     });
     for text in &extras {
-        if parsed.arch != Arch::Gfx1201 && (text.starts_with("th:") || text.starts_with("scope:")) {
+        if !parsed.arch.is_gfx12() && (text.starts_with("th:") || text.starts_with("scope:")) {
             return Err(bad_operand(
                 row.name,
                 text,
@@ -1180,7 +1180,7 @@ fn parse_hwreg(text: &str, arch: Arch) -> Result<Option<HwReg>, ParseError> {
     let name = parts
         .next()
         .ok_or_else(|| bad_operand("hwreg", text, "missing id"))?;
-    let named = if arch == Arch::Gfx1201 {
+    let named = if arch.is_gfx12() {
         match name {
             // llvm-mc also takes the gfx11 names on gfx12.
             "HW_REG_WAVE_HW_ID1" | "HW_REG_HW_ID1" => Some(23),
@@ -1660,7 +1660,7 @@ fn parse_trits(row: &OpRow, suffix: &str, list: &str) -> Result<u8, ParseError> 
 
 /// Wait/clause immediates live in `mods`, decoded per counter layout.
 fn parse_wait_clause(row: &OpRow, parsed: &mut ParsedOperands) -> Result<(), ParseError> {
-    if parsed.arch != Arch::Gfx1201 && row.name.starts_with("s_waitcnt") {
+    if !parsed.arch.is_gfx12() && row.name.starts_with("s_waitcnt") {
         let raw = parsed
             .operands
             .iter()

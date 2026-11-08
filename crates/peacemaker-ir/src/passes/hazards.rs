@@ -460,7 +460,7 @@ pub fn analyze_with(
 ) -> Result<HazardAnalysis, HazardError> {
     let mut analysis = HazardAnalysis::default();
     match arch {
-        Arch::Gfx1201 => run_sgpr_model(body, arch, wave, model, &mut analysis)?,
+        Arch::Gfx1200 | Arch::Gfx1201 => run_sgpr_model(body, arch, wave, model, &mut analysis)?,
         Arch::Gfx1100 | Arch::Gfx1151 => run_gfx11(body, arch, &mut analysis),
         _ => return Err(HazardError::Unsupported(arch, wave)),
     }
@@ -758,7 +758,7 @@ fn wmma_block(
                     .iter()
                     .take(2)
                     .any(|src| old.overlaps(*src))
-                    || (arch == Arch::Gfx1201
+                    || (arch.is_gfx12()
                         && name.starts_with("v_swmmac_")
                         && inst
                             .effects

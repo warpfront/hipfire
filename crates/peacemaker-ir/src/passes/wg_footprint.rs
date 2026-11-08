@@ -182,7 +182,7 @@ pub fn analyze_budgeted(
     else {
         return na("not an HSA kernel".into());
     };
-    if arch != Arch::Gfx1201 {
+    if !arch.is_gfx12() {
         return na(format!(
             "{arch:?}: the witness entry registers are gfx1201's"
         ));

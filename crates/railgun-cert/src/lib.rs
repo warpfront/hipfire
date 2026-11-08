@@ -85,6 +85,7 @@ pub fn arch_name(arch: Arch) -> &'static str {
         Arch::Gfx1030 => "gfx1030",
         Arch::Gfx1100 => "gfx1100",
         Arch::Gfx1151 => "gfx1151",
+        Arch::Gfx1200 => "gfx1200",
         Arch::Gfx1201 => "gfx1201",
     }
 }

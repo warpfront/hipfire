@@ -950,7 +950,7 @@ fn rule_wmma_chain(s: &Stream, out: &mut Vec<Finding>) {
             continue;
         }
         let mut srcs: Vec<RegRef> = f.v_uses.iter().take(2).copied().collect();
-        if s.arch == Arch::Gfx1201 && f.swmmac {
+        if s.arch.is_gfx12() && f.swmmac {
             if let Some(idx) = f.v_uses.get(2) {
                 srcs.push(*idx);
             }
@@ -1336,7 +1336,7 @@ pub fn check_body(
     let stream = Stream::new(symbol, body, arch, wave);
     rule_user_sgpr(symbol, arch, wave, rsrc2, &mut out);
     rule_wave64(symbol, arch, wave, &mut out);
-    if arch == Arch::Gfx1201 {
+    if arch.is_gfx12() {
         rule_gfx12_sgpr(&stream, body, arch, wave, &mut out);
     }
     rule_vcmpx_permlane(&stream, &mut out);

@@ -339,6 +339,7 @@ fn enrich(text: &str, arch: Arch) -> Result<Instruction, String> {
     let ir = match arch {
         Arch::Gfx1100 => IrArch::Gfx1100,
         Arch::Gfx1151 => IrArch::Gfx1151,
+        Arch::Gfx1200 => IrArch::Gfx1200,
         Arch::Gfx1201 => IrArch::Gfx1201,
         Arch::Gfx942 => return Err("foreign text has no gfx942 front end".into()),
     };

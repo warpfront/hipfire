@@ -25,13 +25,23 @@
 //! `#[ignore]`d: needs an exact gfx12 HIP GPU. Run explicitly:
 //!
 //!   cargo test -p hipfire-runtime --release --test x1_lane_draw_shard_gpu -- --ignored --nocapture
+//!
+//! The `leviathan_twin_*` tests run the same matrix (same generator, seeds and launch
+//! shapes) through the COMMITTED objects only (`kernels/lane_leviathan_{hipcc,pm}_gfx120{0,1}`,
+//! `include_bytes!`, loaded with `module_load_data`: no hipcc, no JIT, no dispatch) and
+//! require the PM twin byte-identical to the hipcc object in all three modes (raw out
+//! records, p tables, mode-1 candidate tables), and for each object modes 1+2 equal mode 0.
+//! They fail, not skip, on a device that is not gfx1200 or gfx1201.
+
+mod x1_lane_draw_twin;
 
 use hipfire_runtime::lane_draw::{
     cand_table_words, lane_draws, lane_draws_supported, LaneDrawArena, LaneDrawJob,
 };
 use hipfire_runtime::sampler::SamplerConfig;
-use rdna_compute::lane_leviathan::LLV_P_WORDS;
+use rdna_compute::lane_leviathan::{LLV_CAND_WORDS, LLV_OUT_WORDS, LLV_P_WORDS};
 use rdna_compute::{DType, Gpu, GpuTensor};
+use x1_lane_draw_twin as twin;
 
 struct Lcg(u64);
 impl Lcg {
@@ -350,4 +360,311 @@ fn sharded_lane_draw_equals_whole_row_small_vocabs() {
     sweep(&mut gpu, 5_000, 24, 0x51_0b);
     // Odd shard width (2,049): rows past the first start off 16-byte alignment.
     sweep(&mut gpu, 4_098, 24, 0x51_0c);
+}
+
+// ───────────────────────── committed-object twin oracle ─────────────────────────
+
+/// Every observable output word of one implementation over one launch set.
+struct TwinRun {
+    /// Mode 0 over the full rows: raw out records and p tables.
+    out_full: Vec<u32>,
+    p_full: Vec<u32>,
+    /// Mode 1 candidate tables of shard A (`[0, V/2)`) and shard B (`[V/2, V)`).
+    cand_a: Vec<u32>,
+    cand_b: Vec<u32>,
+    /// Mode 2 on A (peer = B's table): raw out records and p tables.
+    out_merged: Vec<u32>,
+    p_merged: Vec<u32>,
+}
+
+/// Run `imp` in all three modes over the lanes' full rows and A/B halves.
+#[allow(clippy::too_many_arguments)]
+fn twin_run(
+    gpu: &mut Gpu,
+    imp: &twin::Impl,
+    packed_f: &twin::Packed,
+    packed_a: &twin::Packed,
+    packed_b: &twin::Packed,
+    rows_per_lane: &[usize],
+    ctx: &str,
+) -> TwinRun {
+    let ctx = format!("{ctx} [{}]", imp.name);
+    let rows = packed_f.layout.rows;
+    let out_words = packed_f.layout.out_words();
+    assert_eq!(packed_a.layout, packed_b.layout);
+    assert_eq!(packed_a.layout.rows, rows);
+
+    // Mode 0: the whole row.
+    let region_f = twin::upload_region(gpu, packed_f);
+    let ptab_f = twin::zeros_words(gpu, rows * LLV_P_WORDS);
+    imp.launch(
+        gpu,
+        &region_f,
+        packed_f.layout,
+        Some(&ptab_f),
+        twin::MODE_FULL,
+        0,
+        0,
+    );
+    let out_full = twin::download_words(gpu, &region_f, out_words);
+    let p_full = twin::download_words(gpu, &ptab_f, rows * LLV_P_WORDS);
+    let draws_full = twin::decode_out(&out_full, rows_per_lane, &format!("{ctx} mode 0"));
+
+    // Mode 1 on both shards: candidate tables; the out records stay untouched.
+    let region_a = twin::upload_region(gpu, packed_a);
+    let region_b = twin::upload_region(gpu, packed_b);
+    let cand_a = twin::zeros_words(gpu, cand_table_words(rows));
+    let cand_b = twin::zeros_words(gpu, cand_table_words(rows));
+    imp.launch(
+        gpu,
+        &region_a,
+        packed_a.layout,
+        None,
+        twin::MODE_SELECT,
+        cand_a.buf.as_ptr() as u64,
+        0,
+    );
+    imp.launch(
+        gpu,
+        &region_b,
+        packed_b.layout,
+        None,
+        twin::MODE_SELECT,
+        cand_b.buf.as_ptr() as u64,
+        0,
+    );
+    for (name, region) in [("A", &region_a), ("B", &region_b)] {
+        let out = twin::download_words(gpu, region, out_words);
+        assert!(
+            out.iter().all(|&w| w == 0),
+            "{ctx}: mode 1 on shard {name} wrote an out record"
+        );
+    }
+    let cand_a_w = twin::download_words(gpu, &cand_a, cand_table_words(rows));
+    let cand_b_w = twin::download_words(gpu, &cand_b, cand_table_words(rows));
+
+    // Mode 2 on A with B's table as the peer.
+    let ptab_m = twin::zeros_words(gpu, rows * LLV_P_WORDS);
+    imp.launch(
+        gpu,
+        &region_a,
+        packed_a.layout,
+        Some(&ptab_m),
+        twin::MODE_MERGED,
+        cand_a.buf.as_ptr() as u64,
+        cand_b.buf.as_ptr() as u64,
+    );
+    let out_merged = twin::download_words(gpu, &region_a, out_words);
+    let p_merged = twin::download_words(gpu, &ptab_m, rows * LLV_P_WORDS);
+    let draws_merged = twin::decode_out(&out_merged, rows_per_lane, &format!("{ctx} mode 2"));
+
+    // The X1 oracle on this object: modes 1+2 equal mode 0, draws and p tables.
+    for (i, (m, f)) in draws_merged.iter().zip(&draws_full).enumerate() {
+        assert_eq!(m, f, "{ctx}: lane {i} merged draw differs from whole-row");
+    }
+    twin::assert_words_eq(
+        &p_merged,
+        &p_full,
+        LLV_P_WORDS,
+        "p tables (mode 2 vs mode 0)",
+        &ctx,
+    );
+
+    for t in [region_f, ptab_f, region_a, region_b, cand_a, cand_b, ptab_m] {
+        let _ = gpu.free_tensor(t);
+    }
+    TwinRun {
+        out_full,
+        p_full,
+        cand_a: cand_a_w,
+        cand_b: cand_b_w,
+        out_merged,
+        p_merged,
+    }
+}
+
+/// One launch set: hipcc object vs PM object, every observable word, all three modes.
+fn twin_compare_launch(
+    gpu: &mut Gpu,
+    impls: &[twin::Impl; 2],
+    v: usize,
+    lanes: &[LaneSpec],
+    ctx: &str,
+) {
+    let w = v / 2;
+    let mut full_t = Vec::new();
+    let mut half0 = Vec::new();
+    let mut half1 = Vec::new();
+    for l in lanes {
+        full_t.push(gpu.upload_f32(&l.full, &[l.full.len()]).expect("full rows"));
+        let (mut h0, mut h1) = (Vec::new(), Vec::new());
+        for r in 0..l.rows {
+            h0.extend_from_slice(&l.full[r * v..r * v + w]);
+            h1.extend_from_slice(&l.full[r * v + w..(r + 1) * v]);
+        }
+        half0.push(gpu.upload_f32(&h0, &[h0.len()]).expect("half 0"));
+        half1.push(gpu.upload_f32(&h1, &[h1.len()]).expect("half 1"));
+    }
+    let fjobs: Vec<LaneDrawJob<'_>> = lanes
+        .iter()
+        .zip(&full_t)
+        .map(|(l, t)| job(l, t, v, 0))
+        .collect();
+    let ajobs: Vec<LaneDrawJob<'_>> = lanes
+        .iter()
+        .zip(&half0)
+        .map(|(l, t)| job(l, t, w, 0))
+        .collect();
+    let bjobs: Vec<LaneDrawJob<'_>> = lanes
+        .iter()
+        .zip(&half1)
+        .map(|(l, t)| job(l, t, w, w))
+        .collect();
+    let packed_f = twin::pack(&fjobs);
+    let packed_a = twin::pack(&ajobs);
+    let packed_b = twin::pack(&bjobs);
+    let rows_per_lane: Vec<usize> = lanes.iter().map(|l| l.rows).collect();
+
+    let hipcc = twin_run(
+        gpu,
+        &impls[0],
+        &packed_f,
+        &packed_a,
+        &packed_b,
+        &rows_per_lane,
+        ctx,
+    );
+    let pm = twin_run(
+        gpu,
+        &impls[1],
+        &packed_f,
+        &packed_a,
+        &packed_b,
+        &rows_per_lane,
+        ctx,
+    );
+
+    let pair = |what: &str, a: &[u32], b: &[u32], row_words: usize| {
+        twin::assert_words_eq(a, b, row_words, &format!("hipcc vs pm: {what}"), ctx);
+    };
+    pair(
+        "mode 0 out records",
+        &hipcc.out_full,
+        &pm.out_full,
+        LLV_OUT_WORDS,
+    );
+    pair("mode 0 p tables", &hipcc.p_full, &pm.p_full, LLV_P_WORDS);
+    pair(
+        "mode 1 shard A candidates",
+        &hipcc.cand_a,
+        &pm.cand_a,
+        LLV_CAND_WORDS,
+    );
+    pair(
+        "mode 1 shard B candidates",
+        &hipcc.cand_b,
+        &pm.cand_b,
+        LLV_CAND_WORDS,
+    );
+    pair(
+        "mode 2 out records",
+        &hipcc.out_merged,
+        &pm.out_merged,
+        LLV_OUT_WORDS,
+    );
+    pair(
+        "mode 2 p tables",
+        &hipcc.p_merged,
+        &pm.p_merged,
+        LLV_P_WORDS,
+    );
+
+    for t in full_t.into_iter().chain(half0).chain(half1) {
+        let _ = gpu.free_tensor(t);
+    }
+}
+
+/// Plant the edge values the incumbent generator lacks (it plants NaN and -inf only) into
+/// every row of `lane`: +inf, +0 / -0, quiet / negative / signalling NaN payloads and -inf,
+/// in both shard halves and next to the shard boundary. Positions come from `e`, a stream
+/// separate from the matrix generator, so the base matrix is exactly the incumbent's.
+fn plant_edges(e: &mut Lcg, lane: &mut LaneSpec, v: usize) {
+    const NANS: [u32; 4] = [0x7fc0_0000, 0xffc1_2345, 0x7f80_0001, 0x7fff_ffff];
+    let w = v / 2;
+    for r in 0..lane.rows {
+        let row = &mut lane.full[r * v..(r + 1) * v];
+        if r % 2 == 0 {
+            row[e.below(w)] = f32::INFINITY;
+            row[w + e.below(w)] = f32::INFINITY;
+        }
+        row[w - 2] = -0.0;
+        row[w + 1] = 0.0;
+        row[e.below(v)] = 0.0;
+        row[e.below(v)] = -0.0;
+        for (k, bits) in NANS.iter().enumerate() {
+            let i = if k % 2 == 0 {
+                e.below(w)
+            } else {
+                w + e.below(w)
+            };
+            row[i] = f32::from_bits(*bits);
+        }
+        row[e.below(v)] = f32::NEG_INFINITY;
+    }
+}
+
+/// The incumbent sweep's lane generator and launch shapes, run through the committed
+/// objects, with one edge-value lane per launch.
+fn twin_sweep(gpu: &mut Gpu, impls: &[twin::Impl; 2], v: usize, launches: usize, seed: u64) {
+    let mut g = Lcg(seed);
+    let mut e = Lcg(seed ^ 0xed9e_5eed_0000_0001);
+    const LANES: usize = 6;
+    let mut lane_global = 0usize;
+    for launch in 0..launches {
+        let mut lanes: Vec<LaneSpec> = (0..LANES)
+            .map(|k| {
+                let lane_id = lane_global;
+                lane_global += 1;
+                make_lane(&mut g, v, lane_id, k == 0 && launch % 3 == 0)
+            })
+            .collect();
+        plant_edges(&mut e, &mut lanes[launch % LANES], v);
+        twin_compare_launch(gpu, impls, v, &lanes, &format!("V {v} launch {launch}"));
+    }
+    eprintln!(
+        "lane draw twin: V {v}: {launches} launches x {LANES} lanes: PM == hipcc in modes 0/1/2, modes 1+2 == mode 0"
+    );
+}
+
+/// Init the GPU and load both committed objects of its exact architecture.
+fn twin_setup() -> (Gpu, [twin::Impl; 2]) {
+    let mut gpu = Gpu::init().expect("gpu init");
+    let objects = twin::objects_for(&gpu);
+    assert_eq!(
+        objects.arch, gpu.arch,
+        "object arch selected from the device"
+    );
+    let impls = [
+        twin::Impl::load(&mut gpu, "hipcc", objects.hipcc),
+        twin::Impl::load(&mut gpu, "pm", objects.pm),
+    ];
+    (gpu, impls)
+}
+
+#[test]
+#[ignore = "needs an exact gfx1200/gfx1201 GPU: run through the GPU fabric"]
+fn leviathan_twin_pm_equals_hipcc_flash_vocab() {
+    let (mut gpu, impls) = twin_setup();
+    // The shard boundary: hot ids V/2 - 1 and V/2 tie exactly at 9.0 in every row.
+    assert_eq!(248_320 / 2, 124_160);
+    twin_sweep(&mut gpu, &impls, 248_320, 12, 0x51_0a);
+}
+
+#[test]
+#[ignore = "needs an exact gfx1200/gfx1201 GPU: run through the GPU fabric"]
+fn leviathan_twin_pm_equals_hipcc_small_vocabs() {
+    let (mut gpu, impls) = twin_setup();
+    twin_sweep(&mut gpu, &impls, 5_000, 24, 0x51_0b);
+    // Odd shard width (2,049): rows past the first start off 16-byte alignment.
+    twin_sweep(&mut gpu, &impls, 4_098, 24, 0x51_0c);
 }
