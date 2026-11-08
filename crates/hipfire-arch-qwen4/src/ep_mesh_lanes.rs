@@ -1103,6 +1103,7 @@ impl RankLane<'_> {
                         state: &mut lane.state,
                         tokens: &v.rows,
                         wide: v.wide,
+                        exact: v.exact,
                         kind: if v.rows.len() == 1 {
                             LaneRowKind::Ar
                         } else {

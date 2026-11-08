@@ -951,7 +951,8 @@ pub struct LaneSampling {
     /// where `reset_cpu_sampler_rng(seed)` leaves the sampler state (0 -> 1).
     pub seed: u32,
     /// The request carried an explicit seed (the wire `seed`). A seeded sampled lane
-    /// verifies row-exact (reproducible across batch compositions); an unseeded one
+    /// keeps the row-exact groups (batch-invariant only under
+    /// `HIPFIRE_QWEN4_LANE_ROW_EXACT=seeded`, or at C1); an unseeded one
     /// may take the wide verify pass (`HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY`).
     pub seeded: bool,
 }

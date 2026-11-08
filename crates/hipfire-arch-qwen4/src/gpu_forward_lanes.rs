@@ -1066,6 +1066,11 @@ pub struct LaneRows<'a> {
     /// The lane verifies in the wide pass (see [`lane_is_wide`]); `false` for AR-only
     /// steps' exact rows and every prefill lane.
     pub wide: bool,
+    /// The lane's request is in the row-exact class (`HIPFIRE_QWEN4_LANE_ROW_EXACT`: opt-in, default off: greedy, or
+    /// with `seeded` also sampled with an explicit seed): an all-rows step carrying it runs under the
+    /// row-exact scope, so its rows are bitwise its <=8-row rows whatever the batch composition.
+    /// `false` for every prefill lane.
+    pub exact: bool,
 }
 
 /// A vocabulary shard of the step's LM head (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`): the rank projects
@@ -1518,7 +1523,9 @@ pub struct AllRowsDecision {
     pub hc_all: bool,
     /// Every other non-MoE once-over-all-rows stage does too ([`all_rows_stages_apply`]).
     pub all_stages: bool,
-    /// The all-rows steps run inside the wide few-row verify scope of `n` rows.
+    /// The all-rows steps run inside the wide few-row verify scope of `n` rows (and the
+    /// row-exact lane scope, `Gpu::lane_row_exact_scope`): the lab
+    /// `HIPFIRE_QWEN4_LANE_ALLROWS_EXACT` flag or any row-exact-class lane in the step.
     pub exact_scope: bool,
     /// Why a step that asked for the all-rows MoE keeps its groups ([`all_rows_moe_refusal`]).
     pub moe_refusal: Option<String>,
@@ -1600,13 +1607,16 @@ impl LaneAllRowsRule {
 
     /// The placement of every all-rows piece of a step: `ar_step` (an AR / verify step, never a
     /// prefill wave or a band edge), the once-over-all-rows `group_rows` of the packed groups
-    /// and whether any lane is wide-class. Pure: the single predicate behind the executor's
+    /// whether any lane is wide-class and whether any lane is row-exact class
+    /// (`any_exact_lane`, which alone turns on `exact_scope` for a step that takes the all-rows
+    /// stages; no other part of the decision reads it). Pure: the single predicate behind the executor's
     /// `hc_all` / `all_stages` / `exact_scope` / `moe_all` and the root's planned exchanges.
     pub fn decide(
         &self,
         ar_step: bool,
         group_rows: &[usize],
         any_wide_lane: bool,
+        any_exact_lane: bool,
     ) -> AllRowsDecision {
         let n: usize = group_rows.iter().sum();
         let hc_all = hc_all_rows_applies(
@@ -1629,7 +1639,7 @@ impl LaneAllRowsRule {
             // `qwen4_bf16_streams(n) == qwen4_bf16_streams(1)`.
             (n >= self.bf16_min_rows) == (1 >= self.bf16_min_rows),
         );
-        let exact_scope = self.exact_flag && all_stages;
+        let exact_scope = (self.exact_flag || any_exact_lane) && all_stages;
         let moe_refusal = if self.moe_flag {
             all_rows_moe_refusal(
                 all_stages,
@@ -1658,7 +1668,7 @@ impl LaneAllRowsRule {
     /// ledger plans `target_exchanges` from this; the executor's `moe_all` is the same
     /// [`Self::decide`].
     pub fn moe_all_rows(&self, group_rows: &[usize], any_wide_lane: bool) -> bool {
-        self.decide(true, group_rows, any_wide_lane).moe_all
+        self.decide(true, group_rows, any_wide_lane, false).moe_all
     }
 }
 
@@ -1765,7 +1775,8 @@ fn run_items(
 /// ([`MoeStepHooks::before_step`]), and the scope is `rows` for an all-rows step and the
 /// step's prior value for every other step, so every other stage keeps the routes of its own
 /// (at most [`LANE_MAX_ROWS`]-row) groups. Without `exact` the all-rows steps are the HC
-/// read / write of `rows` rows; with `exact` (`HIPFIRE_QWEN4_LANE_ALLROWS_EXACT`) every step
+/// read / write of `rows` rows; with `exact` (`HIPFIRE_QWEN4_LANE_ALLROWS_EXACT`, or any row-exact-class
+/// lane in the step, `HIPFIRE_QWEN4_LANE_ROW_EXACT`) every step
 /// of `rows` rows is: the GDN / QSA mixer steps (a lane's own rows are at most
 /// [`LANE_MAX_ROWS`] < `rows`, so only the all-rows projections match) and, with `moe`, the
 /// all-rows MoE call.
@@ -2321,6 +2332,8 @@ fn forward_wave_with(
             tokens: lane.tokens,
             kind: LaneRowKind::Prefill,
             wide: false,
+            // A prefill wave never takes the all-rows segment.
+            exact: false,
         })
         .collect();
     let scope = std::mem::replace(&mut gpu.qwen4_scope, true);
@@ -2747,7 +2760,11 @@ fn forward_lanes_scoped(
     // verify scope of `n` rows (`HcAllRowsScope`, descriptions and decode copies bound at `n`
     // rows under that scope), so the projections take the row-exact singleton-derived 8-row
     // tiles in one launch instead of the unscoped wide routes. The scope is ours: a scope
-    // already in force no longer refuses the all-rows stages.
+    // already in force no longer refuses the all-rows stages. The same scope turns on for a step
+    // carrying any row-exact-class lane (`LaneRows::exact`, `HIPFIRE_QWEN4_LANE_ROW_EXACT`: greedy
+    // or, with `seeded`, also seeded sampled lanes; default off), and then also sets `Gpu::lane_row_exact_scope` so lane
+    // WMMA, the trunk A8 and the MoE int8 gate/up / down refuse for the step: every lane's rows are bitwise its
+    // <=8-row rows whatever the batch composition.
     let rule = LaneAllRowsRule::from_parts(
         gpu,
         ep_gather_cap,
@@ -2759,6 +2776,7 @@ fn forward_lanes_scoped(
         matches!(out, StepOutputs::Ar(_)),
         &group_rows,
         lanes.iter().any(|lane| lane.wide),
+        lanes.iter().any(|lane| lane.exact),
     );
     let (hc_all, all_stages, exact_scope) =
         (decision.hc_all, decision.all_stages, decision.exact_scope);
@@ -2997,6 +3015,12 @@ fn forward_lanes_scoped(
         gpu.replay.set_forward_eligible(false);
     }
 
+    // A step that runs its all-rows segment row-exact also refuses the 9..=64-row arms that are
+    // not bitwise the <=8-row route (lane WMMA, trunk A8, MoE int8 gate/up / down) for its whole execution:
+    // every launch of more than 8 rows here is an all-rows-segment launch. Restored on every exit
+    // path of the closure below (success and error).
+    let row_exact_prior =
+        exact_scope.then(|| std::mem::replace(&mut gpu.lane_row_exact_scope, true));
     let attempt = (|| -> Result<Vec<QsaCommit>, Qwen4GpuForwardError> {
         let scratch = &fwd.scratch;
         let mut views = Vec::with_capacity(all_segs.len());
@@ -4204,6 +4228,9 @@ fn forward_lanes_scoped(
         drop(steps);
         Ok(qsa_commits)
     })();
+    if let Some(prior) = row_exact_prior {
+        gpu.lane_row_exact_scope = prior;
+    }
 
     match attempt {
         Ok(qsa_commits) => {
@@ -7258,7 +7285,7 @@ mod tests {
                         for ar in [true, false] {
                             let (hc_all, all_stages, exact_scope, moe_all) =
                                 blocks_moe_all(rule, ar, &group_rows, any_wide, true);
-                            let got = rule.decide(ar, &group_rows, any_wide);
+                            let got = rule.decide(ar, &group_rows, any_wide, false);
                             let tag = format!("{rule:?} ar={ar} {group_rows:?} wide={any_wide}");
                             assert_eq!(got.hc_all, hc_all, "{tag}");
                             assert_eq!(got.all_stages, all_stages, "{tag}");
@@ -7285,6 +7312,36 @@ mod tests {
         }
     }
 
+    /// A row-exact-class lane in the step turns `exact_scope` on exactly where the all-rows stages
+    /// apply, and changes nothing else (the root's ledger and planned exchanges read the rest).
+    #[test]
+    fn lane_all_rows_rule_any_exact_lane_only_sets_exact_scope() {
+        for rule in [ep_rule(), LaneAllRowsRule::never()] {
+            for groups in [&[8usize, 8][..], &[6; 8], &[4; 4], &[8; 8], &[4]] {
+                for any_wide in [false, true] {
+                    for ar in [true, false] {
+                        let base = rule.decide(ar, groups, any_wide, false);
+                        let exact = rule.decide(ar, groups, any_wide, true);
+                        let tag = format!("{rule:?} ar={ar} {groups:?} wide={any_wide}");
+                        assert_eq!(
+                            exact.exact_scope,
+                            base.all_stages || base.exact_scope,
+                            "{tag}"
+                        );
+                        assert_eq!(exact.exact_scope, exact.all_stages, "{tag}");
+                        assert_eq!(exact.hc_all, base.hc_all, "{tag}");
+                        assert_eq!(exact.all_stages, base.all_stages, "{tag}");
+                        assert_eq!(exact.moe_all, base.moe_all, "{tag}");
+                        assert_eq!(exact.moe_refusal, base.moe_refusal, "{tag}");
+                    }
+                }
+            }
+        }
+        let rule = ep_rule();
+        assert!(rule.decide(true, &[6; 8], false, true).exact_scope);
+        assert!(!rule.decide(true, &[6; 8], false, false).exact_scope);
+    }
+
     /// `qwen4_bf16_streams(n) == qwen4_bf16_streams(1)` as a function of `n` and the load's
     /// threshold: where `n` rows would pick another HC stream storage than the singleton's one
     /// row the all-rows stages (and so the all-rows MoE) refuse.
@@ -7296,8 +7353,8 @@ mod tests {
         // A threshold at or below 48 rows (48 rows stream BF16, one row does not).
         rule.bf16_min_rows = 48;
         assert!(!rule.moe_all_rows(&groups, false));
-        assert!(rule.decide(true, &groups, false).hc_all);
-        assert!(!rule.decide(true, &groups, false).all_stages);
+        assert!(rule.decide(true, &groups, false, false).hc_all);
+        assert!(!rule.decide(true, &groups, false, false).all_stages);
         // Above 48 rows both pick the F32 storage.
         rule.bf16_min_rows = 49;
         assert!(rule.moe_all_rows(&groups, false));
@@ -7314,7 +7371,10 @@ mod tests {
         let never = LaneAllRowsRule::never();
         for groups in [&[8usize, 8][..], &[6; 8], &[4; 4], &[8; 8]] {
             assert!(!never.moe_all_rows(groups, false), "{groups:?}");
-            assert!(never.decide(true, groups, false).moe_refusal.is_none());
+            assert!(never
+                .decide(true, groups, false, false)
+                .moe_refusal
+                .is_none());
         }
         let rule = ep_rule();
         // C1: one lane of four rows (one group); two groups of eight; C8 48 rows.
@@ -7322,12 +7382,12 @@ mod tests {
         assert!(rule.moe_all_rows(&[8, 8], false));
         assert!(rule.moe_all_rows(&[6; 8], false));
         // 64 rows exceed the 48-row gather capacity: the groups stay, with a reason.
-        let refused = rule.decide(true, &[8; 8], false);
+        let refused = rule.decide(true, &[8; 8], false, false);
         assert!(!refused.moe_all);
         assert!(refused.moe_refusal.unwrap().contains("gather capacity"));
         // A wide-class lane keeps its group.
         assert!(!rule.moe_all_rows(&[6; 8], true));
         // A prefill wave / band edge (not an AR step) never takes the segment.
-        assert!(!rule.decide(false, &[6; 8], false).moe_all);
+        assert!(!rule.decide(false, &[6; 8], false, false).moe_all);
     }
 }

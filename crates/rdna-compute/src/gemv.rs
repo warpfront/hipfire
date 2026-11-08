@@ -22095,9 +22095,11 @@ impl Gpu {
 
     /// Whether a lane WMMA projection of `rows` activation rows is taken: the
     /// `HIPFIRE_QWEN4_LANE_WMMA` flag (exact gfx1201) and [`LANE_WMMA_MIN_ROWS`]..=[`WIDE_VERIFY_MAX_ROWS`] rows. Pure; outputs are NOT bitwise the SIMT
-    /// route's (f32 summation order differs), but are deterministic.
+    /// route's (f32 summation order differs), but are deterministic. Refused inside the lane row-exact
+    /// scope ([`Gpu::lane_row_exact_scope`]).
     pub fn lane_wmma_applies(&self, rows: usize) -> bool {
         self.flags.qwen4_lane_wmma_enabled()
+            && !self.lane_row_exact_scope
             && (LANE_WMMA_MIN_ROWS..=WIDE_VERIFY_MAX_ROWS).contains(&rows)
     }
 

@@ -867,6 +867,26 @@ pub struct VerifyLane {
     /// all-lanes override): its rows pack into wide groups (32 rows by default, see
     /// `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS`) with other wide lanes.
     pub wide: bool,
+    /// The lane's request is in the row-exact class (`HIPFIRE_QWEN4_LANE_ROW_EXACT`: opt-in, default off: greedy, or
+    /// with `seeded` also sampled with an explicit seed): every all-rows step carrying it runs under the
+    /// row-exact scope, so its rows are bitwise its <=8-row rows whatever the batch composition.
+    pub exact: bool,
+}
+
+/// Whether a lane's request is in the row-exact class under `mode`. `wide_verify` is the request's
+/// unseeded-sampled bit ([`LaneRequest::wide_verify`]): greedy lanes are always row-exact (unless
+/// `Off`), and seeded sampled lanes (`!wide_verify`) in `GreedySeeded` mode.
+pub fn lane_row_exact(
+    mode: hipfire_config::LaneRowExact,
+    sampling: SamplingMode,
+    wide_verify: bool,
+) -> bool {
+    use hipfire_config::LaneRowExact;
+    match mode {
+        LaneRowExact::Off => false,
+        LaneRowExact::Greedy => sampling == SamplingMode::Greedy,
+        LaneRowExact::GreedySeeded => sampling == SamplingMode::Greedy || !wide_verify,
+    }
 }
 
 /// One packed once-over-all-rows group: consecutive whole lanes, at most
@@ -3322,6 +3342,11 @@ impl MeshRoot {
                 capture: rows.len() > 1,
                 rows,
                 wide,
+                exact: lane_row_exact(
+                    hipfire_config::qwen4_lane_row_exact(),
+                    l.sampling,
+                    l.wide_verify,
+                ),
             });
         }
         let b = &s.start.budgets;
@@ -3379,6 +3404,13 @@ impl MeshRoot {
                 .slice(&l.rows)
                 .bool(l.capture)
                 .bool(l.wide);
+        }
+        // The row-exact bit is a root-only decision the ranks must execute identically: mixed in
+        // only when some lane has it, so a plan without an exact lane keeps today's digest.
+        if lanes.iter().any(|l| l.exact) {
+            for l in &lanes {
+                d.bool(l.exact);
+            }
         }
         for g in &groups {
             d.usize(g.first_lane)
@@ -5352,6 +5384,37 @@ mod tests {
     use hipfire_runtime::spec_sampling::SpecRng;
     use std::cell::RefCell;
     use std::rc::Rc;
+    /// The row-exact lane class per `HIPFIRE_QWEN4_LANE_ROW_EXACT` mode, request sampling and
+    /// unseeded-sampled bit.
+    #[test]
+    fn lane_row_exact_truth_table() {
+        use hipfire_config::LaneRowExact::{Greedy, GreedySeeded, Off};
+        for wide in [false, true] {
+            for mode in [Off, Greedy, GreedySeeded] {
+                for sampling in [
+                    SamplingMode::Greedy,
+                    SamplingMode::NaiveSampled,
+                    SamplingMode::Leviathan,
+                ] {
+                    let want = match mode {
+                        Off => false,
+                        Greedy => sampling == SamplingMode::Greedy,
+                        GreedySeeded => sampling == SamplingMode::Greedy || !wide,
+                    };
+                    assert_eq!(
+                        lane_row_exact(mode, sampling, wide),
+                        want,
+                        "{mode:?} {sampling:?} wide={wide}"
+                    );
+                }
+            }
+        }
+        assert!(lane_row_exact(GreedySeeded, SamplingMode::Leviathan, false));
+        assert!(!lane_row_exact(GreedySeeded, SamplingMode::Leviathan, true));
+        assert!(lane_row_exact(Greedy, SamplingMode::Greedy, true));
+        assert!(!lane_row_exact(Off, SamplingMode::Greedy, false));
+    }
+
     /// A C8 / C4 MTP burst of K = 1, 2, 3 (16 / 24 / 32 rows at 8 lanes, 8 / 12 / 16 at 4): the
     /// row-exact class runs `ceil(rows / 8)` serial <=8-row MoE group passes (today), the wide class
     /// ONE group over every lane row at the default 32-row cap, and the cap splits whole lanes
@@ -6044,7 +6107,7 @@ mod tests {
         let groups = pack_classed_row_groups_with_cap(rows, wide, wide_cap);
         let group_rows: Vec<usize> = groups.iter().map(|g| g.rows).collect();
         if rule
-            .decide(true, &group_rows, wide.iter().any(|&w| w))
+            .decide(true, &group_rows, wide.iter().any(|&w| w), false)
             .moe_all
         {
             1

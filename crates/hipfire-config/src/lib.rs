@@ -4684,14 +4684,66 @@ pub fn developer_var(name: &str) -> std::result::Result<String, std::env::VarErr
 /// groups). The wide group runs the ordinary prefill-class routes at its width (the
 /// verify scope stays closed: no row-exact twins, grouped expert-union MoE, never IU4
 /// on verify rows); its rows are distribution-equivalent, not byte-equal, to the
-/// row-exact ones, so a sampled request's output is reproducible across batch
-/// compositions only when it carries a seed. Implies the 32-row EP gather capacity
+/// row-exact ones. A sampled request's output is reproducible across batch
+/// compositions only with a seed AND `HIPFIRE_QWEN4_LANE_ROW_EXACT=seeded` (or at C1). Implies the 32-row EP gather capacity
 /// (`HIPFIRE_QWEN4_EP_WIDE_VERIFY`).
 pub const QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV: &str = "HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY";
 
 /// [`QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV`] read through the process snapshot.
 pub fn qwen4_ep_sampled_wide_verify() -> bool {
     developer_bool(QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV, false)
+}
+
+/// `HIPFIRE_QWEN4_LANE_ROW_EXACT` (developer, default `0` = off): which Flash-Next lane
+/// classes keep every all-rows (9..=64-row) lane step bitwise their <=8-row rows, so output
+/// does not depend on batch composition. Unset, `0`, `off`, `false`: no lane is row-exact
+/// (the default: concurrent native-MTP output at >= 3 lanes may depend on batch composition;
+/// C1 and AR steps of <= 8 rows stay exact). `greedy`: greedy lanes; `seeded` (also `1`, `on`,
+/// `true`): greedy lanes and sampled lanes with an explicit request seed. Opting in costs
+/// step time on the exact steps (CHANGELOG). Unrecognised values warn once and mean `0`.
+pub const QWEN4_LANE_ROW_EXACT_ENV: &str = "HIPFIRE_QWEN4_LANE_ROW_EXACT";
+
+/// Lane classes that run their all-rows steps row-exact ([`QWEN4_LANE_ROW_EXACT_ENV`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneRowExact {
+    /// No lane is row-exact (default).
+    Off,
+    /// Greedy lanes only.
+    Greedy,
+    /// Greedy lanes and seeded sampled lanes.
+    GreedySeeded,
+}
+
+/// Pure parse of [`QWEN4_LANE_ROW_EXACT_ENV`]: trimmed, ASCII case-insensitive; `greedy` is
+/// `Greedy`; `seeded`, `1`, `on`, `true` are `GreedySeeded`; unset, `0`, `off`, `false` and
+/// anything unrecognised are `Off`.
+pub fn parse_lane_row_exact(raw: Option<&str>) -> LaneRowExact {
+    let Some(raw) = raw else {
+        return LaneRowExact::Off;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "greedy" => LaneRowExact::Greedy,
+        "seeded" | "1" | "on" | "true" => LaneRowExact::GreedySeeded,
+        _ => LaneRowExact::Off,
+    }
+}
+
+/// [`QWEN4_LANE_ROW_EXACT_ENV`] read once per process through the developer snapshot.
+pub fn qwen4_lane_row_exact() -> LaneRowExact {
+    static MODE: LazyLock<LaneRowExact> = LazyLock::new(|| {
+        let raw = developer_var(QWEN4_LANE_ROW_EXACT_ENV).ok();
+        if let Some(v) = raw.as_deref() {
+            let t = v.trim().to_ascii_lowercase();
+            if !matches!(
+                t.as_str(),
+                "" | "seeded" | "1" | "on" | "true" | "greedy" | "0" | "off" | "false"
+            ) {
+                eprintln!("[WARN] {QWEN4_LANE_ROW_EXACT_ENV}={v} is not seeded|greedy|0; using 0");
+            }
+        }
+        parse_lane_row_exact(raw.as_deref())
+    });
+    *MODE
 }
 
 /// `HIPFIRE_QWEN4_LANE_RESERVE_TRIM` (developer, default ON, exact `0` is the kill
@@ -6922,6 +6974,21 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_lane_row_exact_values() {
+        use super::LaneRowExact::*;
+        assert_eq!(parse_lane_row_exact(None), Off);
+        for v in ["seeded", "1", "on", "true", " SEEDED ", "On"] {
+            assert_eq!(parse_lane_row_exact(Some(v)), GreedySeeded, "{v:?}");
+        }
+        for v in ["greedy", " Greedy "] {
+            assert_eq!(parse_lane_row_exact(Some(v)), Greedy, "{v:?}");
+        }
+        for v in ["0", "off", "FALSE", " 0 ", "bogus", ""] {
+            assert_eq!(parse_lane_row_exact(Some(v)), Off, "{v:?}");
+        }
+    }
 
     #[test]
     fn deprecated_key_covers_cask_and_pflash_families() {

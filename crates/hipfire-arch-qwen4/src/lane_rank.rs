@@ -350,6 +350,7 @@ impl LocalLaneRank<'_> {
                     state: &mut lane.state,
                     tokens: &vl.rows,
                     wide: vl.wide,
+                    exact: vl.exact,
                     kind: if vl.rows.len() == 1 {
                         LaneRowKind::Ar
                     } else {

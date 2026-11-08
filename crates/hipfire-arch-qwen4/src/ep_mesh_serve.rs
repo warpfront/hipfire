@@ -38,8 +38,11 @@ use std::time::{Duration, Instant};
 /// only kind a batch-sampled lane carries.
 /// Whether a lane may verify in the wide pass: only an UNSEEDED SAMPLED lane. A greedy
 /// lane (no sampling) and a sampled lane whose request carried an explicit seed keep
-/// the row-exact groups, so they reproduce across batch compositions
-/// (`HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY` still gates the wide pass itself).
+/// the row-exact groups (`HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY` still gates the wide pass
+/// itself). Row-exact groups alone do not make output batch-invariant: by default the
+/// all-rows lane step (>= 9 rows, >= 3 MTP lanes) takes non-row-exact routes, so greedy and
+/// seeded output may depend on batch composition; `HIPFIRE_QWEN4_LANE_ROW_EXACT=greedy|seeded`
+/// opts those classes into batch-invariant rows (C1 / AR steps of <= 8 rows are always exact).
 pub(crate) fn lane_wide_eligible(sampling: Option<&LaneSampling>) -> bool {
     sampling.is_some_and(|s| !s.seeded)
 }

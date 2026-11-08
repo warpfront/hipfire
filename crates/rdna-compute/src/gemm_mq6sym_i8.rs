@@ -102,6 +102,7 @@ struct TrunkA8Gate {
     prefill_invariant_scope: bool,
     recording: bool,
     capture: bool,
+    row_exact_scope: bool,
     m: usize,
     k: usize,
     route_rows: usize,
@@ -116,11 +117,19 @@ fn trunk_a8_admits(g: TrunkA8Gate) -> bool {
         && !g.prefill_invariant_scope
         && !g.recording
         && !g.capture
+        && !g.row_exact_scope
         && g.k > 0
         && g.k % 256 == 0
         && g.m > 0
         && g.route_rows > g.few_row_limit
         && (QWEN4_TRUNK_A8_MIN_ROWS..=QWEN4_TRUNK_A8_MAX_ROWS).contains(&g.route_rows)
+}
+
+/// Pure form of [`Gpu::qwen4_trunk_a8_x4_enabled`]: the multi-part A8 route is a trunk A8 route, so
+/// it is refused inside the lane row-exact scope ([`Gpu::lane_row_exact_scope`]) like
+/// [`trunk_a8_admits`].
+fn trunk_a8_x4_admits(flag: bool, arch: &str, row_exact_scope: bool) -> bool {
+    flag && arch == "gfx1201" && !row_exact_scope
 }
 
 /// One launchable tile of the symmetric A8 route.
@@ -320,7 +329,8 @@ impl Gpu {
     /// Whether one projection of `m` rows x `k` with `rows` tokens takes the trunk A8 route:
     /// requested, verified symmetric, inside the Qwen4 forward, eager (no replay recording / graph
     /// capture), outside the prefill-invariant scope, `k % 256 == 0`, and
-    /// `QWEN4_TRUNK_A8_MIN_ROWS <= route_rows <= QWEN4_TRUNK_A8_MAX_ROWS` (9..=511, and above the scope's few-row limit: an admitted wide verify keeps its row-exact twins).
+    /// `QWEN4_TRUNK_A8_MIN_ROWS <= route_rows <= QWEN4_TRUNK_A8_MAX_ROWS` (9..=511, and above the scope's few-row limit: an admitted wide verify keeps its row-exact twins),
+    /// and outside the lane row-exact scope ([`Gpu::lane_row_exact_scope`]).
     pub fn qwen4_trunk_a8_applies(&self, m: usize, k: usize, rows: usize) -> bool {
         trunk_a8_admits(TrunkA8Gate {
             requested: self.qwen4_trunk_a8_requested(),
@@ -329,6 +339,7 @@ impl Gpu {
             prefill_invariant_scope: self.prefill_invariant_scope,
             recording: self.replay.is_recording(),
             capture: self.graphs.capture_mode,
+            row_exact_scope: self.lane_row_exact_scope,
             m,
             k,
             route_rows: self.route_rows(rows),
@@ -520,7 +531,11 @@ impl Gpu {
     /// `HIPFIRE_QWEN4_TRUNK_A8_X4` (developer, default on): the F32 members of one K of the wide
     /// A8 trunk route launch as one multi-part [`Gpu::gemm_mq6sym_i8_prequant_x4`].
     pub fn qwen4_trunk_a8_x4_enabled(&self) -> bool {
-        self.flags.qwen4_trunk_a8_x4 && self.arch == "gfx1201"
+        trunk_a8_x4_admits(
+            self.flags.qwen4_trunk_a8_x4,
+            &self.arch,
+            self.lane_row_exact_scope,
+        )
     }
 
     /// Overwrite each part's `y` (`[n x m]`, F32) with `W . X` for up to four verified-symmetric
@@ -544,6 +559,12 @@ impl Gpu {
             return Err(HipError::new(
                 0,
                 "gemm_mq6sym_i8_x4: exact gfx1201 required",
+            ));
+        }
+        if self.lane_row_exact_scope {
+            return Err(HipError::new(
+                0,
+                "gemm_mq6sym_i8_x4: refused inside the lane row-exact scope",
             ));
         }
         if parts.is_empty()
@@ -1098,6 +1119,7 @@ mod tests {
             prefill_invariant_scope: false,
             recording: false,
             capture: false,
+            row_exact_scope: false,
             m: 5120,
             k: 2048,
             route_rows: 9,
@@ -1170,8 +1192,21 @@ mod tests {
             capture: true,
             ..ok
         }));
+        // The lane row-exact scope keeps every row on its <=8-row route.
+        assert!(!trunk_a8_admits(TrunkA8Gate {
+            row_exact_scope: true,
+            ..ok
+        }));
         assert!(!trunk_a8_admits(TrunkA8Gate { k: 0, ..ok }));
         assert!(!trunk_a8_admits(TrunkA8Gate { k: 2000, ..ok }));
         assert!(!trunk_a8_admits(TrunkA8Gate { m: 0, ..ok }));
+    }
+
+    #[test]
+    fn trunk_a8_x4_refused_in_lane_row_exact_scope() {
+        assert!(trunk_a8_x4_admits(true, "gfx1201", false));
+        assert!(!trunk_a8_x4_admits(true, "gfx1201", true));
+        assert!(!trunk_a8_x4_admits(false, "gfx1201", false));
+        assert!(!trunk_a8_x4_admits(true, "gfx1100", false));
     }
 }

@@ -193,6 +193,7 @@ struct DownA8Gate<'a> {
     prefill_invariant_scope: bool,
     recording: bool,
     capture: bool,
+    row_exact_scope: bool,
     arch: &'a str,
     m: usize,
     k: usize,
@@ -208,6 +209,7 @@ fn down_a8_admits(g: DownA8Gate<'_>) -> bool {
         && !g.prefill_invariant_scope
         && !g.recording
         && !g.capture
+        && !g.row_exact_scope
         && g.arch == "gfx1201"
         && g.k == DOWN_K
         && g.m > 0
@@ -336,7 +338,7 @@ impl Gpu {
 
     /// Whether one routed down of `m` rows x `k` with `k_top` picks takes the A8 route: requested,
     /// verified symmetric, head verdict settled, inside the Qwen4 forward, eager (no replay
-    /// recording / graph capture), outside the prefill-invariant scope, `K == 640`, `M % 32 == 0`,
+    /// recording / graph capture), outside the prefill-invariant scope and the lane row-exact scope ([`Gpu::lane_row_exact_scope`]), `K == 640`, `M % 32 == 0`,
     /// `k_top == 10`, exact gfx1201. The row window is checked by the launchers
     /// ([`QWEN4_MOE_DOWN_A8_ROUTE_CAP`]).
     pub fn qwen4_moe_down_a8_applies(&self, m: usize, k: usize, k_top: usize) -> bool {
@@ -348,6 +350,7 @@ impl Gpu {
             prefill_invariant_scope: self.prefill_invariant_scope,
             recording: self.replay.is_recording(),
             capture: self.graphs.capture_mode,
+            row_exact_scope: self.lane_row_exact_scope,
             arch: &self.arch,
             m,
             k,
@@ -781,6 +784,7 @@ mod tests {
             prefill_invariant_scope: false,
             recording: false,
             capture: false,
+            row_exact_scope: false,
             arch: "gfx1201",
             m: 2560,
             k: 640,
@@ -851,6 +855,7 @@ mod tests {
         off(|g| g.prefill_invariant_scope = true);
         off(|g| g.recording = true);
         off(|g| g.capture = true);
+        off(|g| g.row_exact_scope = true);
         off(|g| g.arch = "gfx1151");
         off(|g| g.k = 512);
         off(|g| g.k = 1280);

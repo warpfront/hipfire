@@ -2021,6 +2021,11 @@ pub struct Gpu {
     /// n-row verify is bitwise the sequential decode rows; prefill and every
     /// non-verify forward keep it `0`.
     pub wide_verify_rows: usize,
+    /// True while a Flash-Next lane step runs its all-rows segment for a row-exact lane class
+    /// (`HIPFIRE_QWEN4_LANE_ROW_EXACT`, set and restored by hipfire-arch-qwen4's lane step); the
+    /// 9..=64-row arms that are NOT bitwise the <=8-row route (lane WMMA, the trunk A8 projections,
+    /// the MoE int8 gate/up chain, the int8 down) refuse while it is set.
+    pub lane_row_exact_scope: bool,
     /// Actual singleton AR arithmetic for an eager verify window. The forward
     /// owner restores this host scope binding after success or error; it never
     /// changes recorder/graph state.
@@ -3395,6 +3400,7 @@ impl Gpu {
             lane_rows_scope: false,
             prefill_invariant_scope: false,
             wide_verify_rows: 0,
+            lane_row_exact_scope: false,
             qwen4_verify_reference: None,
             emu,
             qwen4_append_f16_moe_scope: false,

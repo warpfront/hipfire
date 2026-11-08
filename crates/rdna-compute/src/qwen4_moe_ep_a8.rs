@@ -192,9 +192,16 @@ fn ep_a8_requested(arch: &str, flag: Option<bool>, ep_scope: bool) -> bool {
 }
 
 /// Pure form of [`Gpu::qwen4_moe_gu_a8_applies`]: exact gfx1201, the switch not `0`, an eager launch
-/// (no graph capture, no replay record), and `rows` source rows in the g32 verify window.
-fn gu_a8_applies(arch: &str, flag: Option<bool>, rows: usize, eager: bool) -> bool {
-    gu_a8_enabled(arch, flag) && eager && Gpu::moe_wide_verify_rows(rows)
+/// (no graph capture, no replay record), outside the lane row-exact scope, and `rows` source rows in the g32
+/// verify window.
+fn gu_a8_applies(
+    arch: &str,
+    flag: Option<bool>,
+    rows: usize,
+    eager: bool,
+    row_exact_scope: bool,
+) -> bool {
+    gu_a8_enabled(arch, flag) && eager && !row_exact_scope && Gpu::moe_wide_verify_rows(rows)
 }
 
 /// The switch half of [`gu_a8_applies`]: exact gfx1201 and not killed. Also the load-time condition
@@ -247,7 +254,8 @@ impl Gpu {
     /// chain instead of the g32 + PM A8 down chain (`HIPFIRE_QWEN4_MOE_GU_A8`, default on, exact `0`
     /// kills; exact gfx1201; `rows` in 9..=[`crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS`], the g32
     /// window; eager only, like [`Gpu::qwen4_moe_ep_a8_requested`]: the EP row gather and the
-    /// A8 chain's int8 scratch cannot be captured or recorded). Flag read once per process. The
+    /// A8 chain's int8 scratch cannot be captured or recorded); refused inside the lane row-exact scope
+    /// ([`Gpu::lane_row_exact_scope`]). Flag read once per process. The
     /// per-call conditions (grouped path, symmetric experts, geometry, no row gather) are the
     /// dispatch stage predicate's.
     pub fn qwen4_moe_gu_a8_applies(&self, rows: usize) -> bool {
@@ -256,6 +264,7 @@ impl Gpu {
             *GU_A8,
             rows,
             !self.graphs.capture_mode && !self.replay.is_recording(),
+            self.lane_row_exact_scope,
         )
     }
 
@@ -737,38 +746,51 @@ mod tests {
             let in_window = (9..=max).contains(&rows);
             // The window is exactly the g32 gate/up family's.
             assert_eq!(
-                gu_a8_applies("gfx1201", None, rows, true),
+                gu_a8_applies("gfx1201", None, rows, true, false),
                 in_window,
                 "default, rows {rows}"
             );
             assert_eq!(
-                gu_a8_applies("gfx1201", None, rows, true),
+                gu_a8_applies("gfx1201", None, rows, true, false),
                 Gpu::moe32_gu_applies(1, rows, true),
                 "g32 window, rows {rows}"
             );
-            assert_eq!(gu_a8_applies("gfx1201", Some(true), rows, true), in_window);
+            assert_eq!(
+                gu_a8_applies("gfx1201", Some(true), rows, true, false),
+                in_window
+            );
             // Exact `0`: the incumbent chain at every row count.
             assert!(
-                !gu_a8_applies("gfx1201", Some(false), rows, true),
+                !gu_a8_applies("gfx1201", Some(false), rows, true, false),
                 "kill, rows {rows}"
             );
             // Graph capture / replay record: never.
             assert!(
-                !gu_a8_applies("gfx1201", None, rows, false),
+                !gu_a8_applies("gfx1201", None, rows, false, false),
                 "eager, rows {rows}"
             );
             for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx942", "gfx1030", ""] {
-                assert!(!gu_a8_applies(arch, None, rows, true), "{arch} rows {rows}");
                 assert!(
-                    !gu_a8_applies(arch, Some(true), rows, true),
+                    !gu_a8_applies(arch, None, rows, true, false),
+                    "{arch} rows {rows}"
+                );
+                assert!(
+                    !gu_a8_applies(arch, Some(true), rows, true, false),
                     "{arch} rows {rows}"
                 );
             }
         }
+        // Inside the lane row-exact scope the chain is refused at every row count.
+        for rows in 0..=max + 8 {
+            assert!(
+                !gu_a8_applies("gfx1201", Some(true), rows, true, true),
+                "row-exact scope, rows {rows}"
+            );
+        }
         // The row-gather-sized decode and the singleton few-row window keep the incumbent chain.
         for rows in 0..=8 {
             assert!(
-                !gu_a8_applies("gfx1201", Some(true), rows, true),
+                !gu_a8_applies("gfx1201", Some(true), rows, true, false),
                 "rows {rows}"
             );
         }
@@ -805,7 +827,7 @@ mod tests {
         assert!(gu_a8_masked("gfx1201", Some(true), false));
         // `2` parses to `GU_A8 = None` (on) with the unmasked bit: the chain applies, unmasked.
         assert!(!gu_a8_masked("gfx1201", None, true));
-        assert!(gu_a8_applies("gfx1201", None, 16, true));
+        assert!(gu_a8_applies("gfx1201", None, 16, true, false));
         // `0`: off, so never masked either.
         assert!(!gu_a8_masked("gfx1201", Some(false), false));
         assert!(!gu_a8_masked("gfx1201", Some(false), true));
