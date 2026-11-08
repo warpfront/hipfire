@@ -3032,20 +3032,45 @@ fn combine_stage(
         } else {
             implicit_zero_owners(gpu, p)
         };
-        hip(gpu.moe_down_combine_grouped_top10_bf16in_owned(
-            p.y_down_grouped,
-            p.inverse_perm,
-            p.topk_indices,
-            p.topk_weights,
-            target,
-            p.down_expanded,
-            p.down_m,
-            grouped_rows,
-            p.batch_size,
-            initial_zero,
-            p.n_exp,
-            owners,
-        ))?;
+        // `HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER`: the wide-verify chain's owner-masked order
+        // and combine as one launch (no order scratch, bytes identical to the pair).
+        let inline_order = if ep_a8_wide(gpu, p, use_path2)
+            && gpu.flags.qwen4_moe_combine_inline_order_enabled()
+        {
+            owners
+        } else {
+            None
+        };
+        if let Some(owners) = inline_order {
+            hip(gpu.moe_down_combine_grouped_top10_bf16in_ordered(
+                p.y_down_grouped,
+                p.inverse_perm,
+                p.topk_indices,
+                p.topk_weights,
+                target,
+                p.down_m,
+                grouped_rows,
+                p.batch_size,
+                initial_zero,
+                p.n_exp,
+                owners,
+            ))?;
+        } else {
+            hip(gpu.moe_down_combine_grouped_top10_bf16in_owned(
+                p.y_down_grouped,
+                p.inverse_perm,
+                p.topk_indices,
+                p.topk_weights,
+                target,
+                p.down_expanded,
+                p.down_m,
+                grouped_rows,
+                p.batch_size,
+                initial_zero,
+                p.n_exp,
+                owners,
+            ))?;
+        }
     } else if use_path2 {
         super::combine_leaf(super::CombineArm::GroupedF32, partition)?;
         if implicit_zero_owners(gpu, p).is_some() {

@@ -128,6 +128,11 @@ pub struct FeatureFlags {
     /// The eight `_zinit` entries have a proof-only portable PeaceMaker twin; the runtime keeps
     /// the HIP route.
     pub qwen4_ffn_clear_absorb_rows: bool,
+    /// Wide-verify BF16-row combine with its rank order inline
+    /// (`HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER`): the owner-masked order kernel and the
+    /// combine run as ONE launch (`moe_down_combine_grouped_top10_bf16in_ordered[_zinit]`),
+    /// bytes identical. Opt-in, default off (new kernel entries; needs the PM twin).
+    pub qwen4_moe_combine_inline_order: bool,
     /// EP partial tile mask implicit zeros (`HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO`),
     /// default on for exact gfx1201, `0` is the kill switch: the foreign experts'
     /// grouped down rows are marked `-1` in the combine order instead of being
@@ -1200,6 +1205,8 @@ impl FeatureFlags {
                 .unwrap_or(is_gfx1201),
             qwen4_ffn_clear_absorb_rows: parse_bool("HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS")
                 .unwrap_or(is_gfx1201),
+            qwen4_moe_combine_inline_order: parse_bool("HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER")
+                .unwrap_or(false),
             qwen4_ep_pmask_implicit_zero: parse_bool("HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO")
                 .unwrap_or(is_gfx1201),
             qwen4_ep_pmask_implicit_zero_poison: parse_bool(
@@ -1897,6 +1904,12 @@ impl FeatureFlags {
         self.qwen4_ffn_clear_absorb_rows && self.arch == "gfx1201"
     }
 
+    /// Inline-order wide-verify combine (`HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER`): exact
+    /// gfx1201 only, opt-in.
+    pub fn qwen4_moe_combine_inline_order_enabled(&self) -> bool {
+        self.qwen4_moe_combine_inline_order && self.arch == "gfx1201"
+    }
+
     /// EP partial tile mask implicit zeros (`HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO`):
     /// exact gfx1201 only.
     pub fn qwen4_ep_pmask_implicit_zero_enabled(&self) -> bool {
@@ -2274,6 +2287,7 @@ impl FeatureFlags {
             qwen4_moe_combine_zinit: false,
             qwen4_ffn_clear_absorb: false,
             qwen4_ffn_clear_absorb_rows: false,
+            qwen4_moe_combine_inline_order: false,
             qwen4_ep_pmask_implicit_zero: false,
             qwen4_ep_pmask_implicit_zero_poison: false,
             qwen4_hc_row_fold: false,
@@ -3388,6 +3402,30 @@ mod tests {
             assert!(!off.qwen4_ffn_clear_absorb_rows_enabled(), "{arch}");
             let on = FeatureFlags::from_lookup(arch, with("1"));
             assert_eq!(on.qwen4_ffn_clear_absorb_rows_enabled(), exact, "{arch}");
+        }
+    }
+
+    /// The inline-order wide-verify combine is opt-in: off unless `1`, and `1` enables it on
+    /// exact gfx1201 only.
+    #[test]
+    fn qwen4_moe_combine_inline_order_is_opt_in_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |key: &str| -> std::result::Result<String, ()> {
+                if key == "HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert!(!unset.qwen4_moe_combine_inline_order_enabled(), "{arch}");
+            let off = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!off.qwen4_moe_combine_inline_order_enabled(), "{arch}");
+            let on = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(on.qwen4_moe_combine_inline_order_enabled(), exact, "{arch}");
         }
     }
 

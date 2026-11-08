@@ -141,6 +141,7 @@
     "kernels/src/gemv_q8_0_moe_down_residual_scaled_k8_indexed.hip",
     "kernels/src/gemv_q8_0_moe_gate_up_k8_indexed.hip",
     "kernels/src/moe_combine_order_owned.hip",
+    "kernels/src/moe_combine_ordered.hip",
     "kernels/src/moe_down_combine_grouped_k8.hip",
     "kernels/src/moe_down_combine_grouped_top10.hip",
     "kernels/src/moe_down_combine_top10_batched.hip",

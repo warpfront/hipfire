@@ -2882,6 +2882,16 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::MOE_COMBINE_ORDER_OWNED_SRC,
             ["moe_combine_order_top10_owned"]
         );
+        // `HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER` (opt-in): the order computed inside the
+        // owner-masked BF16-row combine, its own module for the same reason.
+        add!(
+            "moe_combine_ordered",
+            kernels::MOE_COMBINE_ORDERED_SRC,
+            [
+                "moe_down_combine_grouped_top10_bf16in_ordered",
+                "moe_down_combine_grouped_top10_bf16in_ordered_zinit"
+            ]
+        );
         add!(
             "moe_down_combine_top10_batched",
             kernels::MOE_DOWN_COMBINE_TOP10_BATCHED_SRC,
@@ -12024,6 +12034,21 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // `HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER=1` (opt-in, exact gfx1201, wide-verify int8
+        // chain): the owner-masked BF16-row combine with its rank order computed inline.
+        const COMBINE_INLINE_ORDER_ADDED_MODULES: [&str; 1] = ["moe_combine_ordered"];
+        for module in COMBINE_INLINE_ORDER_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing inline-order combine module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         // `HIPFIRE_EP_TRUNK_BALANCED_OWNERS=1` (opt-in, exact gfx1201, EP trunk shard): the
         // partitioned top-10 combine of the fixed `e % ranks` reduction partition.
         const TRUNK_REDUCTION_PARTITION_ADDED_MODULES: [&str; 1] =
@@ -12080,6 +12105,7 @@ mod tests {
                 + MOE_DOWN_DNI_ADDED_MODULES.len()
                 + MQ6_R8_PK_ADDED_MODULES.len()
                 + PMASK_IMPLICIT_ZERO_ADDED_MODULES.len()
+                + COMBINE_INLINE_ORDER_ADDED_MODULES.len()
                 + LANE_LEVIATHAN_ADDED_MODULES.len()
                 + ARGMAX_PAIR_MERGE_ADDED_MODULES.len()
                 + TRUNK_REDUCTION_PARTITION_ADDED_MODULES.len(),

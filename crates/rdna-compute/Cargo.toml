@@ -170,6 +170,10 @@ name = "qwen4_mq6_x4_sym"
 required-features = ["lab"]
 
 [[example]]
+name = "qwen4_moe_combine_ordered"
+required-features = ["lab"]
+
+[[example]]
 name = "mtp_dense_det_pm"
 required-features = ["lab"]
 

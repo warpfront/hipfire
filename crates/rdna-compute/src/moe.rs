@@ -2530,6 +2530,118 @@ impl Gpu {
         )
     }
 
+    /// [`Gpu::moe_down_combine_grouped_top10_bf16in_owned`] as ONE launch
+    /// (`HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER`): the owner-masked rank order is resolved
+    /// inside the combine (`moe_down_combine_grouped_top10_bf16in_ordered[_zinit]`), so no
+    /// `order` scratch is written or read. Bytewise the two-launch `_owned` pair: the same ten
+    /// route ranks in ascending expert id, a foreign expert's rank keeps its place and BF16
+    /// weight but adds a +0 row (its grouped row is never read), the same multiply / add /
+    /// BF16 rounding per column.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down_combine_grouped_top10_bf16in_ordered(
+        &mut self,
+        grouped_down: &GpuTensor,
+        inverse_perm: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        residual: &GpuTensor,
+        hidden: usize,
+        grouped_rows: usize,
+        tokens: usize,
+        initial_zero: bool,
+        n_experts: usize,
+        owners: crate::hc_row_fold::CombineOwners<'_>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if hidden % 8 != 0
+            || owners.table.buf.size() < n_experts * 4
+            || owners.rank > i32::MAX as usize
+            || n_experts >= i32::MAX as usize
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "moe_down_combine_grouped_top10_bf16in_ordered: hidden % 8 != 0, owner table holds fewer than n_experts i32 or rank exceeds i32",
+            ));
+        }
+        require_span(
+            grouped_down,
+            &[grouped_rows, hidden, 2],
+            "moe_down_combine_grouped_top10_bf16in_ordered grouped rows",
+        )?;
+        require_span(
+            inverse_perm,
+            &[tokens, 10, 4],
+            "moe_down_combine_grouped_top10_bf16in_ordered inverse permutation",
+        )?;
+        require_span(
+            topk_indices,
+            &[tokens, 10, 4],
+            "moe_down_combine_grouped_top10_bf16in_ordered expert ids",
+        )?;
+        require_span(
+            topk_weights,
+            &[tokens, 10, 4],
+            "moe_down_combine_grouped_top10_bf16in_ordered weights",
+        )?;
+        require_span(
+            residual,
+            &[tokens, hidden, 4],
+            "moe_down_combine_grouped_top10_bf16in_ordered target",
+        )?;
+        let combine: &'static str = if initial_zero {
+            "moe_down_combine_grouped_top10_bf16in_ordered_zinit"
+        } else {
+            "moe_down_combine_grouped_top10_bf16in_ordered"
+        };
+        self.ensure_kernel("moe_combine_ordered", kernels::MOE_COMBINE_ORDERED_SRC, combine)?;
+        let gp = grouped_down.buf.as_ptr();
+        let ip = inverse_perm.buf.as_ptr();
+        let tp = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let rp = residual.buf.as_ptr();
+        let owner = owners.table.buf.as_ptr();
+        let hv = hidden as i32;
+        let gr = grouped_rows as i32;
+        let tv = tokens as i32;
+        let nx = n_experts as i32;
+        let rank = owners.rank as i32;
+        let mut params = [
+            &gp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &owner as *const _ as *mut c_void,
+            &hv as *const _ as *mut c_void,
+            &gr as *const _ as *mut c_void,
+            &tv as *const _ as *mut c_void,
+            &nx as *const _ as *mut c_void,
+            &rank as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            combine,
+            [(hidden as u32 / 8).div_ceil(64), tokens as u32, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp);
+                b.push_ptr(ip);
+                b.push_ptr(tp);
+                b.push_ptr(wp);
+                b.push_ptr(rp);
+                b.push_ptr(owner);
+                b.push_i32(hv);
+                b.push_i32(gr);
+                b.push_i32(tv);
+                b.push_i32(nx);
+                b.push_i32(rank);
+                b
+            },
+        )
+    }
+
     fn moe_down_combine_grouped_top10_impl(
         &mut self,
         grouped_down: &GpuTensor,

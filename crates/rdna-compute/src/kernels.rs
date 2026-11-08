@@ -4544,6 +4544,13 @@ pub const SLOWLINK_PREFILL_SRC: &str = include_str!("../../../kernels/src/slowli
 pub const MOE_COMBINE_ORDER_OWNED_SRC: &str =
     include_str!("../../../kernels/src/moe_combine_order_owned.hip");
 
+/// Owner-masked BF16-row top-10 grouped combine with the rank order computed inline
+/// (`moe_down_combine_grouped_top10_bf16in_ordered[_zinit]`,
+/// `HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER`): one launch in place of the order kernel and the
+/// combine. A module of its own, so the legacy sources above keep their recorded identity.
+pub const MOE_COMBINE_ORDERED_SRC: &str =
+    include_str!("../../../kernels/src/moe_combine_ordered.hip");
+
 /// Qwen4 top-10 fused indexed combine.  Route weights are applied once here,
 /// after the unweighted expanded down projection.
 pub const MOE_DOWN_COMBINE_TOP10_BATCHED_SRC: &str =
