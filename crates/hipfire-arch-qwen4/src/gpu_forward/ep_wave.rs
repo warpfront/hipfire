@@ -111,32 +111,83 @@ pub(crate) fn ep_wave_shard_enabled() -> bool {
     *EP_WAVE_SHARD_KNOB
 }
 
-/// Knob (default unset: [`EXACT_WAVE_MIN_LANE_ROWS`], the only value proven byte-identical):
-/// sets the fewest rows of a lane the exact wave takes, 9 at the lowest (a lane of at most 8
-/// rows runs the few-row routes and is never a wave lane). A lab value below the default runs
-/// 9..=64-row lanes as a wave, which is NOT byte-identical to their serial tile.
+/// Knob (default unset: [`SMALL_LANE_MIN_ROWS`] with the small lanes on, else
+/// [`EXACT_WAVE_MIN_LANE_ROWS`]): the fewest rows of a lane the exact wave takes, 9 at the
+/// lowest (a lane of at most 8 rows runs the few-row routes and is never a wave lane). An
+/// explicit value overrides [`QWEN4_EP_WAVE_SMALL_LANES_ENV`].
 pub const QWEN4_EP_WAVE_MIN_LANE_ROWS_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_WAVE_MIN_ROWS";
 
-/// [`QWEN4_EP_WAVE_MIN_LANE_ROWS_ENV`] parsed: an integer in `9..=EXACT_WAVE_MAX_LANE_ROWS`,
-/// anything else (unset, empty, not a number, out of range) is the default.
-pub(crate) fn exact_wave_min_lane_rows_from(value: Option<&str>) -> usize {
-    value
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|rows| (9..=EXACT_WAVE_MAX_LANE_ROWS).contains(rows))
-        .unwrap_or(EXACT_WAVE_MIN_LANE_ROWS)
-}
-
 static EXACT_WAVE_MIN_LANE_ROWS_KNOB: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    exact_wave_min_lane_rows_from(
+    exact_wave_lane_floor_from(
         hipfire_config::developer_var(QWEN4_EP_WAVE_MIN_LANE_ROWS_ENV)
             .ok()
             .as_deref(),
+        ep_wave_small_lanes_enabled(),
     )
 });
 
 /// The fewest rows of a wave lane of this process (every rank thread agrees).
 pub(crate) fn exact_wave_min_lane_rows() -> usize {
     *EXACT_WAVE_MIN_LANE_ROWS_KNOB
+}
+
+/// Kill switch of the SMALL LANES of the exact wave (default ON): lanes of 9..=64 rows
+/// ([`SMALL_LANE_MIN_ROWS`]..[`EXACT_WAVE_MIN_LANE_ROWS`]) join the wave. Their singleton tile
+/// takes the 16..=64-row lane WMMA arm of the BF16 projections (`Gpu::lane_wmma_applies`, keyed on
+/// the REAL rows, not bitwise the SIMT arm), which a joint call over the wave's rows would not;
+/// the wave therefore runs those projections once per lane (`Gpu::qwen4_wave_lane_rows`) and, when
+/// a small lane is in the wave, every other row-local stage per lane too
+/// ([`ep_wave_joint_for_lanes`]). Exact `0` restores the floor of [`EXACT_WAVE_MIN_LANE_ROWS`]
+/// (65): such lanes run serial singleton tiles. An explicit `HIPFIRE_EP_LANE_PREFILL_WAVE_MIN_ROWS`
+/// overrides either.
+pub const QWEN4_EP_WAVE_SMALL_LANES_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_WAVE_SMALL_LANES";
+
+/// [`QWEN4_EP_WAVE_SMALL_LANES_ENV`] parsed: on unless exact `0`.
+pub(crate) fn ep_wave_small_lanes_enabled_from(value: Option<&str>) -> bool {
+    value.map(str::trim) != Some("0")
+}
+
+static EP_WAVE_SMALL_LANES_KNOB: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    ep_wave_small_lanes_enabled_from(
+        hipfire_config::developer_var(QWEN4_EP_WAVE_SMALL_LANES_ENV)
+            .ok()
+            .as_deref(),
+    )
+});
+
+/// Whether small lanes join the exact wave in this process (every rank thread agrees).
+pub(crate) fn ep_wave_small_lanes_enabled() -> bool {
+    *EP_WAVE_SMALL_LANES_KNOB
+}
+
+/// Fewest rows of a lane of the small-lane wave: lanes of at most 8 rows run the few-row routes.
+pub const SMALL_LANE_MIN_ROWS: usize = rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS + 1;
+
+/// The fewest rows of a wave lane: the explicit `HIPFIRE_EP_LANE_PREFILL_WAVE_MIN_ROWS` when it
+/// parses (an integer in `9..=EXACT_WAVE_MAX_LANE_ROWS`), else [`SMALL_LANE_MIN_ROWS`] with
+/// `small_lanes` on, else [`EXACT_WAVE_MIN_LANE_ROWS`].
+pub(crate) fn exact_wave_lane_floor_from(value: Option<&str>, small_lanes: bool) -> usize {
+    let default = if small_lanes {
+        SMALL_LANE_MIN_ROWS
+    } else {
+        EXACT_WAVE_MIN_LANE_ROWS
+    };
+    value
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|rows| (SMALL_LANE_MIN_ROWS..=EXACT_WAVE_MAX_LANE_ROWS).contains(rows))
+        .unwrap_or(default)
+}
+
+/// Whether a wave of `lane_rows` runs its row-local dense stages jointly
+/// ([`ep_wave_joint_enabled`]): only when EVERY lane is wider than the few-row window
+/// (`WIDE_VERIFY_MAX_ROWS`, 64). The joint HC / GDN / QSA launches select their kernels on the
+/// real rows of the call (lane WMMA at 16..=64 rows, the HC8 decode route, the 9..=48-row MQ6
+/// tile), so a small lane's singleton bytes are only reproduced by its own per-lane launches.
+pub(crate) fn ep_wave_joint_for_lanes(joint_enabled: bool, lane_rows: &[usize]) -> bool {
+    joint_enabled
+        && lane_rows
+            .iter()
+            .all(|&rows| rows > rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS)
 }
 
 /// Most rows of a lane the exact wave takes: every lane stays below the 512-row floors (a
@@ -195,9 +246,18 @@ pub(crate) fn ep_wave_policy_for(joint: bool) -> LaneStagePolicy {
         })
 }
 
-/// The wave's stage shares in this process ([`QWEN4_EP_WAVE_JOINT_ENV`]).
-pub(crate) fn ep_wave_policy() -> LaneStagePolicy {
-    ep_wave_policy_for(ep_wave_joint_enabled())
+/// The lane-row table a wave hands `Gpu::qwen4_wave_lane_rows`: the lanes' rows when any lane
+/// is within the few-row window (64 rows), else empty (every projection of such a wave is the
+/// singleton's whatever the call's total).
+pub(crate) fn ep_wave_lane_table(lane_rows: &[usize]) -> Vec<usize> {
+    if lane_rows
+        .iter()
+        .any(|&rows| rows <= rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS)
+    {
+        lane_rows.to_vec()
+    } else {
+        Vec::new()
+    }
 }
 
 /// The route a wave reproduces: the one every lane's own singleton tile takes.
@@ -628,6 +688,7 @@ impl Qwen4GpuForward {
         gpu: &mut Gpu,
         n: usize,
         scope_rows: usize,
+        lane_rows: &[usize],
         route: EpWaveRoute,
         run: impl FnOnce(&mut Self, &mut Gpu) -> Result<(), Qwen4GpuForwardError>,
     ) -> Result<(), Qwen4GpuForwardError> {
@@ -652,6 +713,12 @@ impl Qwen4GpuForward {
             &mut gpu.qwen4_route_rows_cap,
             QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP,
         );
+        // The wave's lane-row table for the BF16 projections of its wide calls (see
+        // [`QWEN4_EP_WAVE_SMALL_LANES_ENV`]): set only when a small lane is in the wave, cleared on
+        // every return path below (the forward runs in the closure, no `?` between here and the
+        // restore after it).
+        let prior_lane_rows =
+            std::mem::replace(&mut gpu.qwen4_wave_lane_rows, ep_wave_lane_table(lane_rows));
         let bank_route = match route {
             EpWaveRoute::FullTable => EpBankRoute::FullTable,
             EpWaveRoute::Tile | EpWaveRoute::Partial => EpBankRoute::TileExchange,
@@ -672,6 +739,7 @@ impl Qwen4GpuForward {
             }
         })();
         gpu.qwen4_route_rows_cap = prior_cap;
+        gpu.qwen4_wave_lane_rows = prior_lane_rows;
         Self::leave_tile_scopes(gpu, scopes);
         let ended = self.share_prompt_end(gpu, result.is_ok());
         self.prefill_scope = prior_prefill;
@@ -748,7 +816,7 @@ mod tests {
             rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS + 1
         );
         assert_eq!(
-            exact_wave_min_lane_rows_from(None),
+            exact_wave_lane_floor_from(None, false),
             EXACT_WAVE_MIN_LANE_ROWS
         );
         for default in [
@@ -761,14 +829,14 @@ mod tests {
             Some("-1"),
         ] {
             assert_eq!(
-                exact_wave_min_lane_rows_from(default),
+                exact_wave_lane_floor_from(default, false),
                 EXACT_WAVE_MIN_LANE_ROWS,
                 "{default:?}"
             );
         }
-        assert_eq!(exact_wave_min_lane_rows_from(Some("9")), 9);
-        assert_eq!(exact_wave_min_lane_rows_from(Some(" 24 ")), 24);
-        assert_eq!(exact_wave_min_lane_rows_from(Some("511")), 511);
+        assert_eq!(exact_wave_lane_floor_from(Some("9"), false), 9);
+        assert_eq!(exact_wave_lane_floor_from(Some(" 24 "), false), 24);
+        assert_eq!(exact_wave_lane_floor_from(Some("511"), false), 511);
         // The process default (knob unset in the test environment) is the const.
         let mut f = facts(&[9, 24]);
         f.min_lane_rows = 9;
@@ -798,6 +866,69 @@ mod tests {
     fn one_lane_or_none_is_not_a_wave() {
         assert!(refused(&facts(&[])).contains("at least two lanes"));
         assert!(refused(&facts(&[149])).contains("at least two lanes"));
+    }
+
+    #[test]
+    fn the_small_lanes_switch_is_on_unless_exact_zero() {
+        for on in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("on"),
+            Some("true"),
+            Some("2"),
+        ] {
+            assert!(ep_wave_small_lanes_enabled_from(on), "{on:?}");
+        }
+        for off in [Some("0"), Some(" 0\n")] {
+            assert!(!ep_wave_small_lanes_enabled_from(off), "{off:?}");
+        }
+        assert_eq!(
+            QWEN4_EP_WAVE_SMALL_LANES_ENV,
+            "HIPFIRE_EP_LANE_PREFILL_WAVE_SMALL_LANES"
+        );
+    }
+
+    #[test]
+    fn the_lane_floor_is_9_with_small_lanes_65_without_and_an_explicit_value_wins() {
+        assert_eq!(exact_wave_lane_floor_from(None, true), SMALL_LANE_MIN_ROWS);
+        assert_eq!(SMALL_LANE_MIN_ROWS, 9);
+        assert_eq!(
+            exact_wave_lane_floor_from(None, false),
+            EXACT_WAVE_MIN_LANE_ROWS
+        );
+        for bad in [
+            Some(""),
+            Some("x"),
+            Some("8"),
+            Some("0"),
+            Some("512"),
+            Some("-1"),
+        ] {
+            assert_eq!(exact_wave_lane_floor_from(bad, true), 9, "{bad:?}");
+            assert_eq!(exact_wave_lane_floor_from(bad, false), 65, "{bad:?}");
+        }
+        // An explicit MIN_ROWS overrides the switch either way.
+        assert_eq!(exact_wave_lane_floor_from(Some("65"), true), 65);
+        assert_eq!(exact_wave_lane_floor_from(Some("100"), true), 100);
+        assert_eq!(exact_wave_lane_floor_from(Some("20"), false), 20);
+    }
+
+    #[test]
+    fn joint_dense_stages_need_every_lane_wider_than_the_few_row_window() {
+        assert!(ep_wave_joint_for_lanes(true, &[65, 149, 511]));
+        assert!(!ep_wave_joint_for_lanes(true, &[60, 149]));
+        assert!(!ep_wave_joint_for_lanes(true, &[64, 64]));
+        assert!(!ep_wave_joint_for_lanes(false, &[149, 149]));
+        assert!(ep_wave_joint_for_lanes(true, &[]));
+    }
+
+    #[test]
+    fn the_lane_table_is_handed_over_only_with_a_lane_of_at_most_64_rows() {
+        assert_eq!(ep_wave_lane_table(&[60; 8]), vec![60; 8]);
+        assert_eq!(ep_wave_lane_table(&[149, 64, 149]), vec![149, 64, 149]);
+        assert!(ep_wave_lane_table(&[65, 149]).is_empty());
+        assert!(ep_wave_lane_table(&[]).is_empty());
     }
 
     #[test]
@@ -1062,7 +1193,7 @@ mod tests {
         assert!(!body.contains("self.enter_tile_scopes(gpu, n)"));
         let lanes = include_str!("../gpu_forward_lanes.rs");
         assert!(lanes.contains("ep_wave_scope_rows(&lane_rows)"));
-        assert!(lanes.contains("fwd.ep_wave_run(gpu, total, scope_rows, route,"));
+        assert!(lanes.contains("fwd.ep_wave_run(gpu, total, scope_rows, &lane_rows, route,"));
     }
 
     #[test]

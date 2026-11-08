@@ -107,9 +107,9 @@
 use crate::bundle::Qwen4Bundle;
 use crate::config::LayerType;
 use crate::gpu_forward::ep_wave::{
-    ep_wave_expected_moe_calls, ep_wave_layer_moe, ep_wave_partial_mask, ep_wave_partial_mask_on,
-    ep_wave_policy, ep_wave_refusal, ep_wave_route, ep_wave_scope_rows, ep_wave_tile_exchange,
-    EpWaveRoute,
+    ep_wave_expected_moe_calls, ep_wave_joint_enabled, ep_wave_joint_for_lanes, ep_wave_layer_moe,
+    ep_wave_partial_mask, ep_wave_partial_mask_on, ep_wave_policy_for, ep_wave_refusal,
+    ep_wave_route, ep_wave_scope_rows, ep_wave_tile_exchange, EpWaveRoute,
 };
 use crate::gpu_forward::{
     bind_ep_lane_gather, ep_lane, ep_lane_buffer, ep_lane_check_invocations, ep_lane_moe_rows,
@@ -2352,8 +2352,10 @@ fn forward_wave_ep(
     lanes: &mut [LaneRows<'_>],
     out: &StepOutputs<'_>,
 ) -> Result<(), Qwen4GpuForwardError> {
-    let policy = ep_wave_policy();
     let lane_rows: Vec<usize> = lanes.iter().map(|lane| lane.tokens.len()).collect();
+    // Joint dense stages only when every lane is wider than the few-row window (small lanes run
+    // their row-local stages per lane: `ep_wave_joint_for_lanes`).
+    let policy = ep_wave_policy_for(ep_wave_joint_for_lanes(ep_wave_joint_enabled(), &lane_rows));
     let total: usize = lane_rows.iter().sum();
     let facts = fwd.ep_wave_facts(gpu, &bundle.config, &lane_rows);
     if let Some(why) = ep_wave_refusal(&facts) {
@@ -2368,7 +2370,7 @@ fn forward_wave_ep(
     }
     // The routing scopes are the lanes' own (the widest lane's rows), never the total's.
     let scope_rows = ep_wave_scope_rows(&lane_rows);
-    fwd.ep_wave_run(gpu, total, scope_rows, route, |fwd, gpu| {
+    fwd.ep_wave_run(gpu, total, scope_rows, &lane_rows, route, |fwd, gpu| {
         forward_lanes_scoped(gpu, fwd, bundle, lanes, out, &policy)
     })
 }

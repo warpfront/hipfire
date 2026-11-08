@@ -2044,6 +2044,13 @@ pub struct Gpu {
     /// so the wave's route / shared-expert / grouped-expert kernels are the sub-512 ones every
     /// lane's own singleton takes.
     pub qwen4_route_rows_cap: usize,
+    /// The lanes' rows of the EP prefill wave in flight when a lane of at most 64 rows is in it
+    /// (empty otherwise; set by the Qwen4 wave and cleared on every return path). A BF16
+    /// multirow projection over exactly their total rows is split into per-lane calls
+    /// ([`Gpu::wave_lane_groups`], [`crate::lane_wmma::wave_lane_groups`]): a lane's singleton
+    /// selects the lane WMMA arm on its own real rows, which one call over the wave's rows would
+    /// not.
+    pub qwen4_wave_lane_rows: Vec<usize>,
     /// Routing-row floor of the aggregate symmetric IU4 MoE route for the forward in scope:
     /// [`crate::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS`] (512) unless an expert-parallel PREFILL
     /// forward lowered it (`HIPFIRE_EP_PREFILL_TILE_MIN_ROWS`, set and restored by the Qwen4
@@ -3393,6 +3400,7 @@ impl Gpu {
             qwen4_append_f16_moe_scope: false,
             qwen4_ep_a8_scope: false,
             qwen4_route_rows_cap: 0,
+            qwen4_wave_lane_rows: Vec::new(),
             qwen4_moe_sym_iu4_floor: crate::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
         })
         .and_then(|mut gpu| {

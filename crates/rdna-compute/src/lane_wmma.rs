@@ -376,9 +376,91 @@ impl Gpu {
     }
 }
 
+/// How a BF16 multirow call over `total` rows of an EP prefill wave is split into per-lane calls
+/// (`None`: one call over all rows, the ordinary route). `table` is [`Gpu::qwen4_wave_lane_rows`],
+/// the wave's lanes' rows in order. A lane's own singleton takes the 16..=64-row lane WMMA arm
+/// (`wmma(rows)`, keyed on the call's REAL rows and not bitwise the SIMT arm), so every such lane
+/// is its own call; a lane of at most 15 rows is its own call too (it keeps its singleton's
+/// few-row arms), while consecutive lanes wider than the few-row window (64 rows) stay one call
+/// (the SIMT multirow arm is row-count invariant there, and one wide call is the wave's gain).
+/// Split only when the table is the call's (`sum == total`) and some lane takes the lane WMMA arm.
+pub fn wave_lane_groups(
+    table: &[usize],
+    total: usize,
+    wmma: impl Fn(usize) -> bool,
+) -> Option<Vec<usize>> {
+    if table.is_empty()
+        || table.iter().sum::<usize>() != total
+        || !table.iter().any(|&rows| wmma(rows))
+    {
+        return None;
+    }
+    let wide = crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
+    let mut groups = Vec::with_capacity(table.len());
+    let mut run = 0usize;
+    for &rows in table {
+        if rows > wide {
+            run += rows;
+        } else {
+            if run > 0 {
+                groups.push(run);
+                run = 0;
+            }
+            groups.push(rows);
+        }
+    }
+    if run > 0 {
+        groups.push(run);
+    }
+    Some(groups)
+}
+
+impl Gpu {
+    /// [`wave_lane_groups`] for a call of `rows` rows under this device's lane WMMA admission.
+    pub fn wave_lane_groups(&self, rows: usize) -> Option<Vec<usize>> {
+        wave_lane_groups(&self.qwen4_wave_lane_rows, rows, |r| {
+            self.lane_wmma_applies(r)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wmma(rows: usize) -> bool {
+        (crate::gemv::LANE_WMMA_MIN_ROWS..=64).contains(&rows)
+    }
+
+    #[test]
+    fn wave_lane_groups_split_only_when_a_lane_takes_the_lane_wmma_arm() {
+        // The story C8 burst: eight 60-row lanes, each its own call.
+        assert_eq!(wave_lane_groups(&[60; 8], 480, wmma), Some(vec![60; 8]));
+        // Small lanes split, consecutive wide lanes stay one call.
+        assert_eq!(
+            wave_lane_groups(&[60, 60, 149, 149, 256, 511], 1185, wmma),
+            Some(vec![60, 60, 149 + 149 + 256 + 511])
+        );
+        // A small lane between wide lanes cuts the wide run.
+        assert_eq!(
+            wave_lane_groups(&[149, 60, 149, 149], 507, wmma),
+            Some(vec![149, 60, 298])
+        );
+        // Lanes of 9..=15 rows keep their few-row arms: their own calls, but only with a WMMA lane.
+        assert_eq!(wave_lane_groups(&[12, 12], 24, wmma), None);
+        assert_eq!(wave_lane_groups(&[12, 40], 52, wmma), Some(vec![12, 40]));
+        // No small lane, no table, or a table that is not this call's rows: one call.
+        assert_eq!(wave_lane_groups(&[149, 256], 405, wmma), None);
+        assert_eq!(wave_lane_groups(&[], 0, wmma), None);
+        assert_eq!(wave_lane_groups(&[60, 60], 480, wmma), None);
+        // The groups always cover the call exactly.
+        for table in [vec![60; 8], vec![9, 16, 64, 65, 200], vec![65, 64, 65]] {
+            let total: usize = table.iter().sum();
+            if let Some(groups) = wave_lane_groups(&table, total, wmma) {
+                assert_eq!(groups.iter().sum::<usize>(), total);
+            }
+        }
+    }
 
     #[test]
     fn product_cfg_is_one_ntile_auto_split() {

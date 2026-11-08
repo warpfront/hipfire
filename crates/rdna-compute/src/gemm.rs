@@ -32222,6 +32222,26 @@ impl Gpu {
                 "gemm_bf16_xf32_multirow buffer capacity is too small",
             ));
         }
+        // An EP prefill wave with a lane of at most 64 rows: one call per lane (see
+        // `Gpu::qwen4_wave_lane_rows`), each lane's rows choosing their own arm below.
+        if let Some(groups) = self.wave_lane_groups(batch_size) {
+            let mut row0 = 0usize;
+            for rows in groups {
+                let xs = x.sub_offset(row0 * k, rows * k);
+                let ys = y.sub_offset(row0 * m, rows * m);
+                // Group calls must not split again: the table is lifted for them.
+                let table = std::mem::take(&mut self.qwen4_wave_lane_rows);
+                let result = if rows > 1 {
+                    self.gemm_bf16_xf32_multirow(weight, &xs, &ys, m, k, rows)
+                } else {
+                    self.gemv_bf16_xf32(weight, &xs, &ys, m, k)
+                };
+                self.qwen4_wave_lane_rows = table;
+                result?;
+                row0 += rows;
+            }
+            return Ok(());
+        }
         // `HIPFIRE_QWEN4_LANE_WMMA` (exact gfx1201, 16..=64 rows): the MoE call's BF16 router /
         // shared-expert projections on the lane WMMA kernel, two BF16 activation terms (hi + lo:
         // the f32 input is not BF16-exact). Not bitwise the arms below (f32 summation order).

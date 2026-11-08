@@ -2496,10 +2496,12 @@ mod wave_tests {
             crate::gpu_forward::ep_wave::EXACT_WAVE_MAX_LANE_ROWS,
             rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS - 1
         );
-        for rows in [0usize, 1, 8, 9, 48, 49, 60, 64, 512, 513, 2048] {
+        // The default (small lanes on, no explicit floor): 9..=511 rows join; at most 8 rows are
+        // few-row tiles and 512 and up keep their own owner-routed tile.
+        for rows in [0usize, 1, 8, 512, 513, 2048] {
             assert!(!ep_wave_lane_joins(rows), "{rows}");
         }
-        for rows in [65usize, 66, 149, 256, 511] {
+        for rows in [9usize, 48, 49, 60, 64, 65, 66, 149, 256, 511] {
             assert!(ep_wave_lane_joins(rows), "{rows}");
         }
     }
@@ -2512,8 +2514,8 @@ mod wave_tests {
             (1192, &[149; 8], true),
             // The story burst below every 512 floor.
             (520, &[65; 8], true),
-            // Lanes of at most 64 rows keep their serial tile.
-            (480, &[60; 8], false),
+            // Small lanes (9..=64 rows) join the wave.
+            (480, &[60; 8], true),
             // One lane is its own tile.
             (300, &[300], false),
             (0, &[], false),
@@ -2523,9 +2525,10 @@ mod wave_tests {
             // A lane at 512 keeps its serial tile (owner-routed on its own).
             (1024, &[512, 512], false),
             (700, &[100, 600], false),
-            // A lane under 65 rows or a zero-row lane is not an exact-wave tile.
-            (113, &[48, 65], false),
-            (98, &[49, 49], false),
+            // A few-row lane (at most 8 rows) or a zero-row lane is not an exact-wave tile.
+            (113, &[48, 65], true),
+            (16, &[8, 8], false),
+            (98, &[49, 49], true),
             (300, &[0, 300], false),
             // The total must be the lanes' sum.
             (1000, &[300, 300], false),
@@ -2569,10 +2572,12 @@ mod wave_tests {
         // smallest legal pair.
         assert_eq!(plan(&[65; 8]), vec![PrefillPart::Wave(0..8)]);
         assert_eq!(plan(&[65, 65]), vec![PrefillPart::Wave(0..2)]);
-        // A 60-row lane is not exact in a wave: the story C8 burst stays serial tiles.
+        // 9..=64-row lanes join the wave (the story C8 burst is one wave); a few-row lane of at
+        // most 8 rows keeps its serial tile.
+        assert_eq!(plan(&[60; 8]), vec![PrefillPart::Wave(0..8)]);
         assert_eq!(
-            plan(&[60; 8]),
-            (0..8).map(PrefillPart::Serial).collect::<Vec<_>>()
+            plan(&[8; 4]),
+            (0..4).map(PrefillPart::Serial).collect::<Vec<_>>()
         );
         // Three 149-row lanes: 447 rows.
         assert_eq!(plan(&[149; 3]), vec![PrefillPart::Wave(0..3)]);
@@ -2593,7 +2598,7 @@ mod wave_tests {
                 PrefillPart::Wave(3..7),
             ]
         );
-        let parts = plan(&[149, 48, 149, 149]);
+        let parts = plan(&[149, 8, 149, 149]);
         assert_eq!(
             parts,
             vec![
