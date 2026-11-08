@@ -19,6 +19,10 @@ pub struct Allow {
     pub why: &'static str,
 }
 
+/// Shared reason of the 32 `moe_shared_down_combine` rows below (16 hipcc originals, 16 PM
+/// twins; same instruction and need in both images).
+const MOE_SHARED_DOWN_COMBINE_WHY: &str = "UNPROVEN, not a claimed race: an original LLVM compiler obligation, OPEN (the committed moe_shared_down_combine hipcc image is unchanged compiler output; the PM twin carries the same instruction at the same pc; no modified code is claimed to race). The ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path of not-taken/taken branches from the entry that has no such wait (pending DS source lock reuse without a wait); whether that path is feasible and whether the hardware has read the DS store sources by then (store-source timing) is not established here. Text identity and hardware outputs (source twin, direct GPU run) do not discharge the ledger; nothing here is discharged";
+
 /// Reports of a missing wait on a CFG path, reviewed. None is a claimed race.
 pub const FINDINGS: &[Allow] = &[
     Allow {
@@ -441,6 +445,198 @@ pub const FINDINGS: &[Allow] = &[
         needle: "`v_lshrrev_b32_e32 v3, 2, v0` (after label `.LBB5`): needs Ds wait 0 (War { reg: \"v3\" })",
         why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the sealed twin is the same ELF as the hipcc image; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
     },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r1",
+        needle: "`v_bfe_u32 v20, v18, 16, 1` (after label `.LBB1`): needs Ds wait 0 (War { reg: \"v20\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r1_zinit",
+        needle: "`v_bfe_u32 v19, v17, 16, 1` (after label `.LBB1`): needs Ds wait 0 (War { reg: \"v19\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r2",
+        needle: "`v_dual_add_f32 v5, v10, v12 :: v_dual_add_f32 v6, v8, v9` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r2_zinit",
+        needle: "`v_dual_add_f32 v5, v10, v12 :: v_dual_add_f32 v6, v8, v9` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r3",
+        needle: "`v_add_f32_e32 v5, v29, v32` (after label `.LBB24`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r3_zinit",
+        needle: "`v_add_f32_e32 v5, v29, v32` (after label `.LBB24`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r4",
+        needle: "`v_add_f32_e32 v5, v45, v46` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r4_zinit",
+        needle: "`v_add_f32_e32 v5, v45, v46` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r5",
+        needle: "`v_add_f32_e32 v5, v43, v45` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r5_zinit",
+        needle: "`v_add_f32_e32 v5, v43, v45` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r6",
+        needle: "`v_add_f32_e32 v5, v57, v59` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r6_zinit",
+        needle: "`v_add_f32_e32 v5, v57, v59` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r7",
+        needle: "`v_add_f32_e32 v5, v56, v58` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r7_zinit",
+        needle: "`v_add_f32_e32 v5, v56, v58` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r8",
+        needle: "`v_add_f32_e32 v5, v49, v52` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r8_zinit",
+        needle: "`v_add_f32_e32 v5, v49, v52` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r1",
+        needle: "`v_bfe_u32 v20, v18, 16, 1` (after label `.LBB1`): needs Ds wait 0 (War { reg: \"v20\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r1_zinit",
+        needle: "`v_bfe_u32 v19, v17, 16, 1` (after label `.LBB1`): needs Ds wait 0 (War { reg: \"v19\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r2",
+        needle: "`v_dual_add_f32 v5, v10, v12 :: v_dual_add_f32 v6, v8, v9` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r2_zinit",
+        needle: "`v_dual_add_f32 v5, v10, v12 :: v_dual_add_f32 v6, v8, v9` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r3",
+        needle: "`v_add_f32_e32 v5, v29, v32` (after label `.LBB24`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r3_zinit",
+        needle: "`v_add_f32_e32 v5, v29, v32` (after label `.LBB24`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r4",
+        needle: "`v_add_f32_e32 v5, v45, v46` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r4_zinit",
+        needle: "`v_add_f32_e32 v5, v45, v46` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r5",
+        needle: "`v_add_f32_e32 v5, v43, v45` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r5_zinit",
+        needle: "`v_add_f32_e32 v5, v43, v45` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r6",
+        needle: "`v_add_f32_e32 v5, v57, v59` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r6_zinit",
+        needle: "`v_add_f32_e32 v5, v57, v59` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r7",
+        needle: "`v_add_f32_e32 v5, v56, v58` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r7_zinit",
+        needle: "`v_add_f32_e32 v5, v56, v58` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r8",
+        needle: "`v_add_f32_e32 v5, v49, v52` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r8_zinit",
+        needle: "`v_add_f32_e32 v5, v49, v52` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
+        why: MOE_SHARED_DOWN_COMBINE_WHY,
+    },
 ];
 
 /// Inputs with no verification: a verifier refusal or a refusal upstream of it (lift region, pool).
@@ -827,6 +1023,15 @@ pub struct PoolBody {
 /// finding plus a stale entry here and is fixed by editing the `tid` only (body pc, insn and
 /// need are the same). Witnesses: `local://ledger-join-finding.md`. No entry is a proven
 /// race, and there is no dispatcher entry.
+///
+/// Templates 219-250 (after every id above) are the 32 `moe_shared_down_combine` bodies
+/// (16 hipcc originals 219-234, 16 PM twins 235-250), observed on the F6 land-check
+/// `ledger-pins.log` run on the tree rebased onto beta with F3/S4. They are the pool-hosted
+/// copies of the 32 UNPROVEN DS-store source-register WAR `pins` rows (original LLVM
+/// obligation, OPEN, not a claimed race, not discharged by text identity or hardware
+/// outputs). The b320 multi pool hosts the same bodies; its tid-250 body finding (the last
+/// template) is covered by the tid 250 entry (same tid, body pc, instruction and need). A
+/// changed id after a later twin lands is fixed by editing the `tid` only.
 pub const POOL_BODY: &[PoolBody] = &[
     // pins row 2, W2
     PoolBody {
@@ -1296,5 +1501,263 @@ pub const POOL_BODY: &[PoolBody] = &[
         category: Category::ModelLimit,
         insn: "`v_sub_co_u32 v2, s3, v0, v1`",
         need: "needs Km wait 0 (Waw { reg: \"s[4:6]\" })",
+    },
+    // moe_shared_down_combine hipcc originals (tid 219-234)
+    PoolBody {
+        tid: 219,
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r1",
+        body_pc: 259,
+        category: Category::Candidate,
+        insn: "`v_bfe_u32 v20, v18, 16, 1`",
+        need: "needs Ds wait 0 (War { reg: \"v20\" })",
+    },
+    PoolBody {
+        tid: 220,
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r1_zinit",
+        body_pc: 254,
+        category: Category::Candidate,
+        insn: "`v_bfe_u32 v19, v17, 16, 1`",
+        need: "needs Ds wait 0 (War { reg: \"v19\" })",
+    },
+    PoolBody {
+        tid: 221,
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r2",
+        body_pc: 1304,
+        category: Category::Candidate,
+        insn: "`v_dual_add_f32 v5, v10, v12 :: v_dual_add_f32 v6, v8, v9`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 222,
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r2_zinit",
+        body_pc: 1275,
+        category: Category::Candidate,
+        insn: "`v_dual_add_f32 v5, v10, v12 :: v_dual_add_f32 v6, v8, v9`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 223,
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r3",
+        body_pc: 1402,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v29, v32`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 224,
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r3_zinit",
+        body_pc: 1373,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v29, v32`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 225,
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r4",
+        body_pc: 1509,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v45, v46`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 226,
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r4_zinit",
+        body_pc: 1480,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v45, v46`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 227,
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r5",
+        body_pc: 1618,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v43, v45`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 228,
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r5_zinit",
+        body_pc: 1589,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v43, v45`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 229,
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r6",
+        body_pc: 1727,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v57, v59`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 230,
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r6_zinit",
+        body_pc: 1698,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v57, v59`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 231,
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r7",
+        body_pc: 1824,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v56, v58`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 232,
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r7_zinit",
+        body_pc: 1795,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v56, v58`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 233,
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r8",
+        body_pc: 1928,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v49, v52`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 234,
+        target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r8_zinit",
+        body_pc: 1899,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v49, v52`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    // moe_shared_down_combine PM twins (tid 235-250)
+    PoolBody {
+        tid: 235,
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r1",
+        body_pc: 259,
+        category: Category::Candidate,
+        insn: "`v_bfe_u32 v20, v18, 16, 1`",
+        need: "needs Ds wait 0 (War { reg: \"v20\" })",
+    },
+    PoolBody {
+        tid: 236,
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r1_zinit",
+        body_pc: 254,
+        category: Category::Candidate,
+        insn: "`v_bfe_u32 v19, v17, 16, 1`",
+        need: "needs Ds wait 0 (War { reg: \"v19\" })",
+    },
+    PoolBody {
+        tid: 237,
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r2",
+        body_pc: 1304,
+        category: Category::Candidate,
+        insn: "`v_dual_add_f32 v5, v10, v12 :: v_dual_add_f32 v6, v8, v9`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 238,
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r2_zinit",
+        body_pc: 1275,
+        category: Category::Candidate,
+        insn: "`v_dual_add_f32 v5, v10, v12 :: v_dual_add_f32 v6, v8, v9`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 239,
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r3",
+        body_pc: 1402,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v29, v32`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 240,
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r3_zinit",
+        body_pc: 1373,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v29, v32`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 241,
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r4",
+        body_pc: 1509,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v45, v46`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 242,
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r4_zinit",
+        body_pc: 1480,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v45, v46`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 243,
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r5",
+        body_pc: 1618,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v43, v45`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 244,
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r5_zinit",
+        body_pc: 1589,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v43, v45`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 245,
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r6",
+        body_pc: 1727,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v57, v59`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 246,
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r6_zinit",
+        body_pc: 1698,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v57, v59`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 247,
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r7",
+        body_pc: 1824,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v56, v58`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 248,
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r7_zinit",
+        body_pc: 1795,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v56, v58`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 249,
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r8",
+        body_pc: 1928,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v49, v52`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    PoolBody {
+        tid: 250,
+        target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r8_zinit",
+        body_pc: 1899,
+        category: Category::Candidate,
+        insn: "`v_add_f32_e32 v5, v49, v52`",
+        need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
 ];
