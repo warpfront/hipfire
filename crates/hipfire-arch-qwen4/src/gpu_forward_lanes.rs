@@ -18,7 +18,10 @@
 //!   lane's own row count; the dispatch interpreter launches consecutive GDN
 //!   and QSA Core steps of several lanes (AR rows and ragged verify windows)
 //!   as one multi-lane launch per kernel (`HIPFIRE_QWEN4_GDN_LANES`,
-//!   `HIPFIRE_QWEN4_GDN_LANES_ROWS`, `HIPFIRE_QWEN4_QSA_LANES`).
+//!   `HIPFIRE_QWEN4_GDN_LANES_ROWS`, `HIPFIRE_QWEN4_QSA_LANES`). A verify lane whose GDN
+//!   in-projection is its own launch over exactly that lane's rows writes the lane's capture
+//!   ring `inputs` in place and its Core skips the projection copy
+//!   (`HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`).
 //! - **Row-local stages** run either per lane ([`StageShare::PerLane`], the
 //!   singleton's arm by construction) or once over every lane's rows
 //!   ([`StageShare::OnceAllRows`], in groups of at most [`LANE_MAX_ROWS`];
@@ -3351,6 +3354,20 @@ fn forward_lanes_scoped(
         }
         let mut steps: Vec<Step<'_>> = Vec::with_capacity(program.len() * lanes.len() * 2);
         let mut qsa_commits: Vec<QsaCommit> = Vec::new();
+        // `HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT` (exact gfx1201, default on): a verify lane's GDN
+        // qkv in-projection that runs as its own launch over exactly that lane's rows writes the
+        // lane's capture `inputs` in place, and the lane's Core skips the
+        // `copy_d2d(projection -> capture.inputs)` it otherwise issues per layer. The opt-in
+        // `HIPFIRE_QWEN4_GDN_QKV_BF16` lab prefill route decides the qkv storage dtype from the
+        // op's own row capture, which an in-projection op never carries, and a replay recorder
+        // or graph capture launches with the scratch pointers: both keep the copy.
+        let gdn_capture_direct = gpu.flags.qwen4_gdn_capture_direct_enabled()
+            && !gpu.flags.qwen4_gdn_qkv_bf16_enabled()
+            && !(gpu.replay.is_recording() || gpu.graphs.capture_mode);
+        // `(layer, lane)` of every in-projection that wrote its lane's capture directly: the
+        // InProj arm records it, the Core arm of the same layer and lane reads it, so the two
+        // phases cannot disagree (an InProj always precedes its Core in emission order).
+        let mut gdn_direct: Vec<(usize, usize)> = Vec::new();
         let mut ple_split: Option<usize> = None;
         // MoE invocations an EP prefill wave emitted (one exchange each).
         let mut wave_moe_calls = 0usize;
@@ -3594,6 +3611,24 @@ fn forward_lanes_scoped(
                                 .get(slot)
                                 .ok_or_else(|| invalid("GDN state slot missing"))?;
                             let stateful = matches!(phase, MixerPhase::Whole | MixerPhase::Core);
+                            let capture = state.gdn_row_capture(slot, r);
+                            let mut projection_target = &v.projection;
+                            if let (Some(capture), true) = (capture.as_ref(), gdn_capture_direct) {
+                                let lane = seg.first_lane;
+                                match phase {
+                                    MixerPhase::InProj => {
+                                        let own = lane_segs[lane];
+                                        if own.begin == seg.begin && own.rows == seg.rows {
+                                            gdn_direct.push((layer, lane));
+                                            projection_target = capture.inputs;
+                                        }
+                                    }
+                                    MixerPhase::Core if gdn_direct.contains(&(layer, lane)) => {
+                                        projection_target = capture.inputs;
+                                    }
+                                    _ => {}
+                                }
+                            }
                             steps.push(Step::GatedDeltaNet(GatedDeltaNetOp {
                                 rotation: &scratch.rotation,
                                 qkv: weights.qkv,
@@ -3611,7 +3646,7 @@ fn forward_lanes_scoped(
                                 format: state.gdn_format(),
                                 residual: gdn.ef_residual.as_ref(),
                                 conv_state: &gdn.conv,
-                                projection: &v.projection,
+                                projection: projection_target,
                                 projection2: &v.projection2,
                                 a: &v.gdn_a,
                                 b: &v.gdn_b,
@@ -3631,11 +3666,7 @@ fn forward_lanes_scoped(
                                 value_dim: dims.linear_value_head_dim,
                                 conv_kernel: dims.linear_conv_kernel_dim,
                                 input_width: dims.hidden,
-                                row_capture: if stateful {
-                                    state.gdn_row_capture(slot, r)
-                                } else {
-                                    None
-                                },
+                                row_capture: if stateful { capture } else { None },
                                 zba_fold: fwd.trunk_zba.get(layer).and_then(Option::as_ref),
                                 trunk_a4: fwd.trunk_a4.get(layer).copied().unwrap_or(0),
                                 phase,

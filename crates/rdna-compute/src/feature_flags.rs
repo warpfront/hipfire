@@ -150,6 +150,12 @@ pub struct FeatureFlags {
     /// default on for exact gfx1201 only (`=0` kills it), and only with
     /// `HIPFIRE_QWEN4_GDN_LANES` on.
     pub qwen4_gdn_lanes_rows: bool,
+    /// Lane-step GDN verify capture written in place (`HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`):
+    /// when a verify lane's qkv in-projection runs as its own launch (split mixer phases) over
+    /// exactly that lane's rows, it writes the lane's capture `inputs` directly and the Core
+    /// phase's `copy_d2d(projection -> capture.inputs)` is not issued. Default on for exact
+    /// gfx1201 only (`=0` kills it); never under a replay recorder or graph capture.
+    pub qwen4_gdn_capture_direct: bool,
     /// Lane-batched PLE chain of an AR lane step (`HIPFIRE_QWEN4_LANE_PLE_BATCH`):
     /// the key / value projections once over the lanes' rows and one batched
     /// tail launch instead of the per-lane chain. Default off on every arch
@@ -1194,6 +1200,7 @@ impl FeatureFlags {
             qwen4_gdn_lanes: parse_bool("HIPFIRE_QWEN4_GDN_LANES").unwrap_or(matches!(arch, "gfx1151" | "gfx1201")),
             qwen4_qsa_lanes: parse_bool("HIPFIRE_QWEN4_QSA_LANES").unwrap_or(arch == "gfx1201"),
             qwen4_gdn_lanes_rows: parse_bool("HIPFIRE_QWEN4_GDN_LANES_ROWS").unwrap_or(true),
+            qwen4_gdn_capture_direct: parse_bool("HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT").unwrap_or(true),
             qwen4_lane_ple_batch: parse_bool("HIPFIRE_QWEN4_LANE_PLE_BATCH").unwrap_or(true),
             qwen4_lane_hc_allrows: parse_bool("HIPFIRE_QWEN4_LANE_HC_ALLROWS").unwrap_or(true),
             qwen4_lane_allrows: parse_bool("HIPFIRE_QWEN4_LANE_ALLROWS").unwrap_or(true),
@@ -1923,6 +1930,12 @@ impl FeatureFlags {
         self.qwen4_gdn_lanes_rows && self.qwen4_gdn_lanes_enabled() && self.arch == "gfx1201"
     }
 
+    /// Lane-step GDN verify capture written in place (`HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`).
+    /// Exact gfx1201 only, default on (`=0` kills it).
+    pub fn qwen4_gdn_capture_direct_enabled(&self) -> bool {
+        self.qwen4_gdn_capture_direct && self.arch == "gfx1201"
+    }
+
     /// Lane-batched PLE chain of an AR lane step (`HIPFIRE_QWEN4_LANE_PLE_BATCH`).
     /// Exact gfx1201 only, default off (`=1` enables).
     pub fn qwen4_lane_ple_batch_enabled(&self) -> bool {
@@ -2246,6 +2259,7 @@ impl FeatureFlags {
             qwen4_gdn_lanes: false,
             qwen4_qsa_lanes: false,
             qwen4_gdn_lanes_rows: false,
+            qwen4_gdn_capture_direct: false,
             qwen4_lane_ple_batch: false,
             qwen4_lane_hc_allrows: false,
             qwen4_lane_allrows: false,
@@ -5684,6 +5698,39 @@ mod tests {
                 flags(arch, None, Some("1")).qwen4_gdn_lanes_rows_enabled(),
                 exact
             );
+        }
+    }
+
+    /// `HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`: exact gfx1201 only, default on, `=0` kills it; no
+    /// other arch ever enables it, whatever the value.
+    #[test]
+    fn gdn_capture_direct_is_default_on_gfx1201_only() {
+        let flags = |arch: &str, value: Option<&str>| {
+            FeatureFlags::from_lookup(arch, |name| match (name, value) {
+                ("HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT", Some(v)) => Ok(v.to_owned()),
+                _ => Err(()),
+            })
+        };
+        for arch in ["gfx1201", "gfx1151", "gfx1100", "gfx942", "gfx1201:xnack-"] {
+            let exact = arch == "gfx1201";
+            assert_eq!(
+                flags(arch, None).qwen4_gdn_capture_direct_enabled(),
+                exact,
+                "{arch}: unset"
+            );
+            for on in ["1", "true", "on"] {
+                assert_eq!(
+                    flags(arch, Some(on)).qwen4_gdn_capture_direct_enabled(),
+                    exact,
+                    "{arch}: {on}"
+                );
+            }
+            for off in ["0", "false", "off"] {
+                assert!(
+                    !flags(arch, Some(off)).qwen4_gdn_capture_direct_enabled(),
+                    "{arch}: {off}"
+                );
+            }
         }
     }
 

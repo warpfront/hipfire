@@ -3892,6 +3892,9 @@ pub const GDN_CORE_LANE_ROWS: usize = 8;
 pub struct GdnCoreRowsLane<'a> {
     /// The qkv projection rows `[rows, qkv]` the per-lane route copies into
     /// `conv.input` (the capture's `inputs`); the lanes kernel does that copy.
+    /// When the in-projection wrote the capture in place
+    /// (`HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`) this IS `conv.input` and the kernel's copy
+    /// stores each element onto itself (the same bits), as the per-lane route skips it.
     pub projection: &'a GpuTensor,
     pub conv: GatedDeltaConvBatched<'a>,
     pub params: GatedDeltaParamsBatched<'a>,

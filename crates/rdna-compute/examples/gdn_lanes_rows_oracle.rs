@@ -395,10 +395,14 @@ struct Arm {
     out: Guarded,
     rot: Guarded,
     lanes: Vec<LaneBufs>,
+    /// Per logical lane: a verify lane's qkv projection rows sit IN its capture `inputs`
+    /// (`HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`: the in-projection wrote the capture in place), so
+    /// its lane's `projection` IS its `conv.input` and the per-lane chain issues no copy.
+    alias: Vec<bool>,
 }
 
 impl Arm {
-    fn new(gpu: &mut Gpu, cap: usize, host: &[LaneHost]) -> Self {
+    fn new(gpu: &mut Gpu, cap: usize, host: &[LaneHost], alias: &[bool]) -> Self {
         let sent = |gpu: &mut Gpu, w: usize| Guarded::new_f32(gpu, cap * w, None);
         let lanes = host
             .iter()
@@ -428,6 +432,7 @@ impl Arm {
             out: sent(gpu, VALUE),
             rot: sent(gpu, VALUE),
             lanes,
+            alias: alias.to_vec(),
         }
     }
 
@@ -499,6 +504,14 @@ impl Arm {
         for l in &self.lanes {
             l.inputs.write(gpu, None);
             l.recurrence.write(gpu, None);
+        }
+        for (lane, l) in self.lanes.iter().enumerate() {
+            if self.alias[lane] && rows[lane] >= 2 {
+                let data = &host[lane].steps[step].qkv;
+                let mut body = vec![f32::from_bits(F32_SENTINEL); RING_ROWS * QKV];
+                body[..data.len()].copy_from_slice(data);
+                l.inputs.write(gpu, Some(&f32_bytes(&body)));
+            }
         }
     }
 }
@@ -607,7 +620,11 @@ impl Vw {
         Self {
             rows: r,
             pos: s.pos,
-            proj: arm.projection.view(s.seg * QKV, r * QKV),
+            proj: if arm.alias[lane] && r >= 2 {
+                lb.inputs.view(0, r * QKV)
+            } else {
+                arm.projection.view(s.seg * QKV, r * QKV)
+            },
             q: proj2.sub_offset(0, QK),
             k: proj2.sub_offset(QK, QK),
             v: proj2.sub_offset(2 * QK, VALUE),
@@ -745,8 +762,12 @@ fn verify_lane<'a>(v: &'a Vw, w: &'a Weights) -> GdnCoreRowsLane<'a> {
 /// `execute_gated_delta_net_hc_impl` issues it (`rotate`: the FWHT-basis
 /// output projection's rotating gate).
 fn verify_per_lane(gpu: &mut Gpu, l: &GdnCoreRowsLane<'_>, rot: &GpuTensor, rotate: bool) {
-    gpu.copy_d2d(l.projection, l.conv.input, l.conv.input.byte_size())
-        .expect("capture input copy");
+    // As `execute_gated_delta_net_hc_impl`: no copy when the in-projection already wrote the
+    // capture's `inputs` (`HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`, `projection` IS `conv.input`).
+    if l.projection.buf.as_ptr() != l.conv.input.buf.as_ptr() {
+        gpu.copy_d2d(l.projection, l.conv.input, l.conv.input.byte_size())
+            .expect("capture input copy");
+    }
     gated_delta_conv_params_batched(gpu, &l.conv, &l.params).expect("conv + params");
     gated_delta_step_batched(gpu, &l.step).expect("capture step");
     if rotate {
@@ -1031,6 +1052,25 @@ fn expected_counts(rows: &[usize], fuse: bool) -> ((u64, u64), (u64, u64)) {
     (per_lane, (ar_launches + verify_launches, verify_copies))
 }
 
+/// [`expected_counts`] where the verify lanes flagged in `alias` (by logical lane) carry their
+/// projection rows in their capture `inputs`: the per-lane chain issues no capture copy for
+/// them (a lone verify lane takes that chain in the grouped arm too; the grouped kernel's own
+/// copy is no dtod either way).
+fn expected_counts_aliased(rows: &[usize], fuse: bool, alias: &[bool]) -> ((u64, u64), (u64, u64)) {
+    let (mut per_lane, mut grouped) = expected_counts(rows, fuse);
+    let verify = rows.iter().filter(|&&r| r >= 2).count();
+    let aliased = rows
+        .iter()
+        .zip(alias)
+        .filter(|(&r, &a)| r >= 2 && a)
+        .count() as u64;
+    per_lane.1 -= aliased;
+    if verify < 2 {
+        grouped.1 -= aliased;
+    }
+    (per_lane, grouped)
+}
+
 // ---------------------------------------------------------------------------
 // Snapshots and comparison
 // ---------------------------------------------------------------------------
@@ -1151,6 +1191,10 @@ struct CaseSpec {
     steps: usize,
     control: Option<Control>,
     rotate: bool,
+    /// Every even logical lane's verify steps carry their projection rows in their capture
+    /// `inputs` (the in-projection wrote the capture in place); odd lanes copy as before, so
+    /// grouped sets mix aliased and copied lanes.
+    alias: bool,
 }
 
 struct CaseResult {
@@ -1179,8 +1223,9 @@ fn run_case(gpu: &mut Gpu, w: &Weights, rng: &mut Rng, spec: &CaseSpec) -> CaseR
     // One row of slack: the rows control lays the candidate's segments out by
     // the claimed rows, so a lane's full view may end one row past the packed total.
     let cap = spec.n * GDN_CORE_LANE_ROWS + 1;
-    let ref_arm = Arm::new(gpu, cap, &host);
-    let cand_arm = Arm::new(gpu, cap, &host);
+    let alias_mask: Vec<bool> = (0..spec.n).map(|l| spec.alias && l % 2 == 0).collect();
+    let ref_arm = Arm::new(gpu, cap, &host, &alias_mask);
+    let cand_arm = Arm::new(gpu, cap, &host, &alias_mask);
     let carry0: Vec<Carry> = host
         .iter()
         .map(|h| Carry {
@@ -1311,7 +1356,7 @@ fn run_case(gpu: &mut Gpu, w: &Weights, rng: &mut Rng, spec: &CaseSpec) -> CaseR
     let (mut want_ref, mut want_cand) = ((0u64, 0u64), (0u64, 0u64));
     for step in 0..spec.steps {
         let rows: Vec<usize> = (0..spec.n).map(|l| spec.rows[l][step]).collect();
-        let (p, g) = expected_counts(&rows, fuse);
+        let (p, g) = expected_counts_aliased(&rows, fuse, &alias_mask);
         want_ref = (want_ref.0 + p.0, want_ref.1 + p.1);
         want_cand = (want_cand.0 + g.0, want_cand.1 + g.1);
     }
@@ -1430,7 +1475,7 @@ struct ProbeSet {
 
 fn probe_set(gpu: &mut Gpu, rng: &mut Rng, rows: &[usize]) -> ProbeSet {
     let host: Vec<LaneHost> = rows.iter().map(|&r| make_lane_host(rng, 5, &[r])).collect();
-    let arm = Arm::new(gpu, rows.len() * RING_ROWS, &host);
+    let arm = Arm::new(gpu, rows.len() * RING_ROWS, &host, &vec![false; rows.len()]);
     let carry: Vec<Carry> = rows
         .iter()
         .enumerate()
@@ -1673,7 +1718,7 @@ fn bench(
     let host: Vec<LaneHost> = (0..n)
         .map(|l| make_lane_host(rng, 3 + l, &[rows[l]]))
         .collect();
-    let arm = Arm::new(gpu, n * GDN_CORE_LANE_ROWS + 1, &host);
+    let arm = Arm::new(gpu, n * GDN_CORE_LANE_ROWS + 1, &host, &vec![false; n]);
     let carry: Vec<Carry> = (0..n)
         .map(|l| Carry {
             pos: 3 + l,
@@ -1763,6 +1808,10 @@ struct Cli {
     /// plus the mixed window), ITERS replays per run, `bench_runs` runs.
     bench: Option<usize>,
     bench_runs: usize,
+    /// `--alias-capture`: every even lane's verify rows are projected into its capture `inputs`
+    /// in place (`HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`), so grouped sets mix aliased and copied
+    /// lanes; the matrix only (no controls, no timing).
+    alias: bool,
 }
 
 fn parse_list(s: &str, what: &str, max: usize) -> Vec<usize> {
@@ -1788,6 +1837,7 @@ fn parse_cli() -> Cli {
         reps: 50,
         bench: None,
         bench_runs: 7,
+        alias: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -1823,6 +1873,11 @@ fn parse_cli() -> Cli {
             }
             "--skip-controls" => cli.controls = false,
             "--skip-timing" => cli.timing = false,
+            "--alias-capture" => {
+                cli.alias = true;
+                cli.controls = false;
+                cli.timing = false;
+            }
             "-h" | "--help" => usage(""),
             other => usage(&format!("unknown argument {other}")),
         }
@@ -1842,7 +1897,7 @@ fn usage(msg: &str) -> ! {
     }
     eprintln!(
         "usage: gdn_lanes_rows_oracle [--out DIR] [--steps S=4] [--lanes 1,2,3,4,8] [--seed U64] \
-         [--skip-controls] [--skip-timing] [--time-rows 2,3,4] [--reps 50] \
+         [--skip-controls] [--skip-timing] [--time-rows 2,3,4] [--reps 50] [--alias-capture] \
          [--bench ITERS [--bench-runs 7]]"
     );
     std::process::exit(if msg.is_empty() { 0 } else { 2 });
@@ -1955,6 +2010,7 @@ fn build_spec(
         steps,
         control,
         rotate,
+        alias: false,
     }
 }
 
@@ -2068,7 +2124,7 @@ fn main() {
     ];
     for &n in &cli.lanes {
         for (i, (pattern, variant, pool_kind)) in matrix.into_iter().enumerate() {
-            let spec = build_spec(
+            let mut spec = build_spec(
                 &mut rng,
                 n,
                 pattern,
@@ -2078,6 +2134,10 @@ fn main() {
                 None,
                 i % 2 == 0,
             );
+            spec.alias = cli.alias;
+            if cli.alias {
+                spec.name.push_str(".alias");
+            }
             let r = run_case(&mut gpu, &w, &mut rng, &spec);
             print_case(&r, false);
             counts.0 += 1;

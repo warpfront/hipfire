@@ -133,6 +133,13 @@ pub(super) fn view(source: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
     source.sub_offset(offset, len)
 }
 
+/// Whether two views cover the same device bytes: same base address and same byte size
+/// (so a copy from one to the other is the identity).
+#[inline]
+fn is_same_extent(a: &GpuTensor, b: &GpuTensor) -> bool {
+    a.buf.as_ptr() == b.buf.as_ptr() && a.byte_size() == b.byte_size()
+}
+
 /// Weight projection used by the stateful operations.  Multi-row calls use the
 /// batched GEMM launcher and decode uses the GEMV launcher, for whichever of
 /// the admissible payloads the tensor carries.
@@ -2777,8 +2784,11 @@ impl GatedDeltaNetOp<'_> {
 
     /// A row capture spans the stateful part of the op: the whole mixer, or
     /// its core when the input projections ran in an earlier call (the core
-    /// then copies the qkv projection rows into the capture's `inputs`). The
-    /// projection-only phases cannot honor one.
+    /// then copies the qkv projection rows into the capture's `inputs`, or
+    /// skips the copy when `projection` already is those `inputs`: the input
+    /// phase wrote the capture in place). The projection-only phases cannot
+    /// honor one (their op carries the capture's `inputs` as `projection`,
+    /// never as a `row_capture`).
     fn check_phase(&self) -> Result<(), DispatchError> {
         if matches!(self.phase, MixerPhase::InProj | MixerPhase::OutProj)
             && self.row_capture.is_some()
@@ -3774,11 +3784,14 @@ fn execute_gated_delta_net_hc_impl(
     // A row capture keeps the qkv projection and the recurrence inputs:
     // write them straight into it. A split core receives the projection
     // the input phase left in `op.projection`, copied into the capture
-    // unchanged (the convolution reads the same values either way).
+    // unchanged (the convolution reads the same values either way), unless
+    // the input phase already wrote the capture: `op.projection` then IS the
+    // capture's `inputs` (`HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`, handed to both
+    // phases by the lane builder) and there is nothing to copy.
     let mut conv_output = view(op.projection2, 0, rows * qkv);
     if let Some(capture) = capture {
         let inputs = view(capture.inputs, 0, op.rows * qkv);
-        if phase == MixerPhase::Core {
+        if phase == MixerPhase::Core && !is_same_extent(&projection, &inputs) {
             hip(gpu.copy_d2d(&projection, &inputs, inputs.byte_size()))?;
         }
         projection = inputs;
@@ -7680,6 +7693,189 @@ mod tests {
         bad.projected = true;
         bad.lane_states = &lane_states;
         assert!(refusal(&bad).contains("single-stream form"));
+    }
+
+    /// `HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`: a split GDN mixer (`InProj` then `Core`) under an armed
+    /// row capture whose in-projection writes the capture's `inputs` in place (both phases carry
+    /// that tensor as `projection`, so the Core issues no `copy_d2d`) leaves the capture inputs,
+    /// the recurrence inputs, the state ring, the live state, the convolution history and every
+    /// scratch output bytewise as the in-projection into scratch followed by the Core's copy.
+    #[test]
+    fn split_gdn_capture_in_place_is_bytewise_the_copy() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if gpu.arch != "gfx1201" || !gpu.arch_caps.has_qwen4_parallel_qsa_gdn() {
+            eprintln!("skip: needs exact gfx1201");
+            return;
+        }
+        let gpu = &mut gpu;
+        // The same-extent predicate the Core's elision rests on.
+        let probe = gpu.zeros(&[16], DType::F32).expect("probe");
+        assert!(is_same_extent(&view(&probe, 0, 8), &view(&probe, 0, 8)));
+        assert!(!is_same_extent(&view(&probe, 0, 8), &view(&probe, 8, 8)));
+        assert!(!is_same_extent(&view(&probe, 0, 8), &view(&probe, 0, 4)));
+
+        let (rows, ring_rows) = (3usize, 4usize);
+        let (key_heads, value_heads, dim, k) = (2usize, 6usize, 128usize, 256usize);
+        let (qk, value) = (key_heads * dim, value_heads * dim);
+        let qkv = 2 * qk + value;
+        let format = GdnStateFormat::Q8;
+        let units = format.state_units(value_heads, dim, dim);
+        let wave = |seed: usize, n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let h = i.wrapping_mul(2_654_435_761).wrapping_add(seed * 97) % 10007;
+                    (h as f32 - 5003.0) / 5003.0 * scale
+                })
+                .collect()
+        };
+        let bf16 = |gpu: &mut Gpu, values: &[f32]| -> GpuTensor {
+            let bytes: Vec<u8> = values
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect();
+            let mut t = gpu.upload_raw(&bytes, &[bytes.len()]).expect("bf16");
+            t.dtype = DType::BF16;
+            t.shape = vec![values.len()];
+            t
+        };
+        let input = gpu
+            .upload_f32(&wave(1, rows * k, 1.0), &[rows * k])
+            .expect("input");
+        let qkv_w = bf16(gpu, &wave(2, qkv * k, 0.1));
+        let z_w = bf16(gpu, &wave(3, value * k, 0.1));
+        let a_w = bf16(gpu, &wave(4, value_heads * k, 0.1));
+        let b_w = bf16(gpu, &wave(5, value_heads * k, 0.1));
+        let out_w = bf16(gpu, &wave(6, k * value, 0.1));
+        let conv = bf16(gpu, &wave(7, qkv * 4, 0.5));
+        let a_log = bf16(gpu, &wave(8, value_heads, 0.5));
+        let dt_bias = bf16(gpu, &wave(9, value_heads, 0.5));
+        let norm = bf16(gpu, &wave(10, dim, 1.0));
+
+        let run = |gpu: &mut Gpu, in_proj_in_place: bool, core_in_place: bool| -> Vec<Vec<u8>> {
+            let f32s = |gpu: &mut Gpu, n: usize| gpu.zeros(&[n], DType::F32).expect("scratch");
+            let recurrent = gpu.zeros(&[units], format.dtype()).expect("state");
+            let conv_state = gpu
+                .upload_f32(&wave(11, 3 * qkv, 0.7), &[3 * qkv])
+                .expect("history");
+            let projection = f32s(gpu, rows * qkv);
+            let projection2 = f32s(gpu, rows * qkv);
+            let (a, b) = (f32s(gpu, rows * value_heads), f32s(gpu, rows * value_heads));
+            let (gate, beta) = (f32s(gpu, rows * value_heads), f32s(gpu, rows * value_heads));
+            let recurrent_output = f32s(gpu, rows * value);
+            let z_output = f32s(gpu, rows * value);
+            let output_scratch = f32s(gpu, rows * value);
+            let rotation = f32s(gpu, rows * k);
+            let output_tensor = f32s(gpu, rows * k);
+            let bf16_scratch = gpu
+                .zeros(&[value.max(k)], DType::BF16)
+                .expect("bf16 scratch");
+            let ring = gpu
+                .zeros(&[ring_rows * units], format.dtype())
+                .expect("ring");
+            let inputs = f32s(gpu, ring_rows * qkv);
+            let recurrence = f32s(gpu, ring_rows * (qkv + 2 * value_heads));
+            let in_target = if in_proj_in_place {
+                &inputs
+            } else {
+                &projection
+            };
+            let core_target = if core_in_place { &inputs } else { &projection };
+            macro_rules! op {
+                ($phase:expr, $capture:expr, $target:expr) => {
+                    GatedDeltaNetOp {
+                        qkv: plain_weight(&qkv_w, DType::BF16, qkv, k),
+                        conv: &conv,
+                        in_proj_a: plain_weight(&a_w, DType::BF16, value_heads, k),
+                        in_proj_b: plain_weight(&b_w, DType::BF16, value_heads, k),
+                        a_log: &a_log,
+                        dt_bias: &dt_bias,
+                        z: plain_weight(&z_w, DType::BF16, value, k),
+                        norm: &norm,
+                        output: plain_weight(&out_w, DType::BF16, k, value),
+                        recurrent: &recurrent,
+                        format,
+                        residual: None,
+                        conv_state: &conv_state,
+                        projection: $target,
+                        projection2: &projection2,
+                        a: &a,
+                        b: &b,
+                        gate: &gate,
+                        beta: &beta,
+                        recurrent_output: &recurrent_output,
+                        bf16_scratch: &bf16_scratch,
+                        rotation: &rotation,
+                        z_output: &z_output,
+                        output_scratch: &output_scratch,
+                        input: &input,
+                        output_tensor: &output_tensor,
+                        rows,
+                        start_position: 5,
+                        key_heads,
+                        value_heads,
+                        key_dim: dim,
+                        value_dim: dim,
+                        conv_kernel: 4,
+                        input_width: k,
+                        row_capture: $capture,
+                        zba_fold: None,
+                        trunk_a4: 0,
+                        phase: $phase,
+                    }
+                };
+            }
+            execute_gated_delta_net(gpu, &op!(MixerPhase::InProj, None, in_target))
+                .expect("in-projection");
+            let capture = GdnRowCapture {
+                states: ring.sub_offset(0, rows * units),
+                inputs: &inputs,
+                recurrence: &recurrence,
+            };
+            execute_gated_delta_net(gpu, &op!(MixerPhase::Core, Some(capture), core_target))
+                .expect("core");
+            gpu.hip.device_synchronize().expect("sync");
+            [
+                &inputs,
+                &recurrence,
+                &ring,
+                &recurrent,
+                &conv_state,
+                &z_output,
+                &a,
+                &b,
+                &recurrent_output,
+                &output_scratch,
+            ]
+            .iter()
+            .map(|t| {
+                let mut out = vec![0u8; t.byte_size()];
+                gpu.hip.memcpy_dtoh(&mut out, &t.buf).expect("download");
+                out
+            })
+            .collect()
+        };
+        let copied = run(gpu, false, false);
+        let in_place = run(gpu, true, true);
+        for (i, (c, d)) in copied.iter().zip(&in_place).enumerate() {
+            assert_eq!(
+                c, d,
+                "tensor {i} differs between the copy and the in-place capture"
+            );
+        }
+        for i in [0usize, 1, 2, 5, 8, 9] {
+            assert!(copied[i].iter().any(|b| *b != 0), "tensor {i} stayed zero");
+        }
+        // Negative control: a Core handed the capture while its in-projection wrote scratch
+        // skips the copy, so it convolves the (zero) capture rows: the comparison is sensitive
+        // to the copy being skipped and to the input phase writing the capture.
+        let torn = run(gpu, false, true);
+        assert!(
+            torn.iter().zip(&copied).any(|(t, c)| t != c),
+            "a Core over an unwritten capture matched the copy: the oracle cannot see a skipped copy"
+        );
     }
 }
 

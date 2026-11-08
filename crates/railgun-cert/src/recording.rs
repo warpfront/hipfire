@@ -1626,6 +1626,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "qwen4-gdn-capture-direct-eager-only",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "hipfire-arch-qwen4 forward_lanes_scoped (gpu_forward_lanes.rs): a verify lane's GDN in-projection that runs as its own launch over exactly that lane's rows writes the lane's capture ring `inputs` in place and its Core skips the `copy_d2d(projection -> capture.inputs)` (HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT, exact gfx1201, default on) only with `!(gpu.replay.is_recording() || gpu.graphs.capture_mode)`; recorded / captured steps keep the scratch projection + copy",
+        effect: LaunchShape,
+        switches: "eager: in-projection stored straight into the capture slot, no projection copy; recorded/captured: scratch projection + copyBuffer into the capture slot",
+        kernels: &[],
+        verdict: ByteExact,
+        evidence: "hipfire-dispatch split_gdn_capture_in_place_is_bytewise_the_copy (j8456: 0 mismatching bytes over 10 tensors) and gdn_lanes_rows_oracle --alias-capture (j8460: 70 cases, 0 failures); lane oracle verify dumps 32/32 identical flag on vs off",
+        reaches: &[],
+    },
+    Decision {
         id: "qwen4-lane-hc-allrows-eager-only",
         predicates: &[IsRecording, CaptureMode],
         condition: "hipfire-arch-qwen4 forward_lanes_scoped (gpu_forward_lanes.rs) via LaneAllRowsRule::from_parts (its `eager` fact, also the mesh root's plan-time rule) and hc_all_rows_applies: an AR / verify lane step of more than LANE_MAX_ROWS rows runs its HC stages (layer reads, the writes no TP2 all-reduce carries, the final read) as ONE all-rows segment under HIPFIRE_QWEN4_LANE_HC_ALLROWS (exact gfx1201, default on, `=0` kills it) only while `!(gpu.replay.is_recording() || gpu.graphs.capture_mode)` and outside the prefill-invariant scope; a recorded or captured step keeps the per <= 8-row group emission",
@@ -2341,11 +2352,12 @@ pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-arch-qwen4/src/gpu_forward_lanes.rs",
         function: "forward_lanes_scoped",
-        occurrences: 4,
+        occurrences: 6,
         decisions: &[
             "qwen4-ple-async-upload",
             "qwen4-lane-token-ids-async",
             "qwen4-ep-vocab-shard-eager-only",
+            "qwen4-gdn-capture-direct-eager-only",
         ],
     },
     Site {
