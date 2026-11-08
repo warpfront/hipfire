@@ -1219,14 +1219,14 @@ fn g942_trunk_gemv() -> bool {
 /// Whether a BF16-weight projection takes the gfx942 MFMA GEMM
 /// (`KernelKey::GemmBf16Mfma`) at `rows` batch rows.
 ///
-/// gfx942 only, at every row count including one: the kernel's 32-row batch
-/// tile masks the tail, each output element is one fixed-order K walk of its
-/// own activation row (128-wide K chunks ascending, MFMA 16-wide steps
-/// ascending, no split-K, no atomics), so a row's bytes do not depend on
-/// `rows`. The activation is F32 (staged to BF16) or already BF16; the output
-/// is F32, or BF16 via an F32 landing in the op's rotation scratch. The one
+/// gfx942 only, at every row count including one: each output element is one
+/// fixed-order K walk of its own activation row (128-wide K chunks ascending,
+/// MFMA 16-wide steps ascending, no split-K, no atomics) in both the 32-row
+/// tile entry and the 1..=16-row entry decode takes, so a row's bytes do not
+/// depend on `rows`. The activation is F32 (staged to BF16, in-kernel on the
+/// few-row entry) or already BF16; the output is F32 or BF16. The one
 /// exception is `gemv_opt_out` (`HIPFIRE_G942_TRUNK_GEMV=1`) at `rows == 1`,
-/// which keeps the legacy GEMV arm.
+/// which keeps the legacy GEMV arm (F32 activation, its own reduction order).
 fn g942_trunk_mfma_route(
     gfx942: bool,
     gemv_opt_out: bool,
@@ -1244,9 +1244,17 @@ fn g942_trunk_mfma_route(
 }
 
 /// The gfx942 MFMA arm of [`project_weights_inner`] for the `group` (indices
-/// into `projections`) of BF16 weights sharing `input` and `k`: one F32 -> BF16
-/// staging of the activation in the shared 2-byte activation scratch (no
-/// per-call allocation; none when `input` is BF16), then one
+/// into `projections`) of BF16 weights sharing `input` and `k`.
+///
+/// 1..=16 rows (decode, few-row tails): one `Gpu::gemm_bf16_mfma_gfx942_rows16`
+/// launch per four members reads the F32 (or BF16) `input` and writes each
+/// F32 or BF16 output directly. It folds in the staging and the output
+/// rounding below with the same RNE rule and runs the same per-element MFMA
+/// chain as the 32-row-tile GEMM, so every byte equals the staged route's.
+///
+/// Otherwise, and for any member that entry declines (alignment / K % 8): one
+/// F32 -> BF16 staging of the activation in the shared 2-byte activation
+/// scratch (no per-call allocation; none when `input` is BF16), then one
 /// `gemm_bf16_mfma_gfx942` per member. The launch extent is the real `rows`;
 /// the kernel pads its batch tile internally, so nothing is padded or copied
 /// here. A BF16 output lands as F32 in `rotation` (`rows * m` elements; BF16
@@ -1271,21 +1279,50 @@ fn project_g942_mfma(
             gpu.maybe_capture_activation(projections[j].0.buf, input, rows, k);
         }
     }
-    let staged = if input.dtype == DType::BF16 {
-        view(input, 0, n)
-    } else {
-        let mut staged = hip(gpu.qwen4_f16_x_scratch(n))?;
-        staged.dtype = DType::BF16;
-        hip(gpu.convert_f32_to_bf16(input, &staged, n))?;
-        staged
-    };
-    // The registered `KernelKey::GemmBf16Mfma` entry (arch-gated to gfx942 by
-    // the registry; refuses a non-BF16 activation), not a direct launch.
-    let ctx = DispatchCtx::new(gpu);
+    let mut outputs: SmallVec<[GpuTensor; 4]> = SmallVec::new();
     for &j in group {
         let (w, out) = projections[j];
         let elements = checked_mul(rows, w.m, "gfx942 trunk output")?;
         require_tensor(out, elements, out.dtype, "gfx942 trunk output")?;
+        outputs.push(view(out, 0, elements));
+    }
+    // Few rows: the whole group, four members per launch, on the fused entry.
+    let x = view(input, 0, n);
+    let mut fused: SmallVec<[bool; 4]> = SmallVec::from_elem(false, group.len());
+    for (chunk, members) in group
+        .chunks(rdna_compute::gemm::GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS)
+        .enumerate()
+    {
+        let base = chunk * rdna_compute::gemm::GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS;
+        let launch: SmallVec<[_; 4]> = members
+            .iter()
+            .enumerate()
+            .map(|(i, &j)| (&projections[j].0.buf.buf, &outputs[base + i], projections[j].0.m))
+            .collect();
+        if hip(gpu.gemm_bf16_mfma_gfx942_rows16(&x, &launch, k, rows))? {
+            fused[base..base + members.len()].fill(true);
+        }
+    }
+    let mut staged: Option<GpuTensor> = None;
+    // The registered `KernelKey::GemmBf16Mfma` entry (arch-gated to gfx942 by
+    // the registry; refuses a non-BF16 activation), not a direct launch.
+    let ctx = DispatchCtx::new(gpu);
+    for (i, &j) in group.iter().enumerate() {
+        if fused[i] {
+            continue;
+        }
+        let (w, out) = projections[j];
+        let elements = outputs[i].numel();
+        let staged = match &staged {
+            Some(staged) => staged,
+            None if input.dtype == DType::BF16 => staged.insert(view(input, 0, n)),
+            None => {
+                let mut scratch = hip(gpu.qwen4_f16_x_scratch(n))?;
+                scratch.dtype = DType::BF16;
+                hip(gpu.convert_f32_to_bf16(input, &scratch, n))?;
+                staged.insert(scratch)
+            }
+        };
         if out.dtype == DType::BF16 {
             let landing = rotation
                 .filter(|r| r.dtype == DType::F32 && r.numel() >= elements)
@@ -1296,10 +1333,10 @@ fn project_g942_mfma(
                     quant: "BF16",
                 })?;
             let landing = view(landing, 0, elements);
-            g942_gemm_bf16_mfma(gpu, &ctx, w, &staged, &landing, rows)?;
+            g942_gemm_bf16_mfma(gpu, &ctx, w, staged, &landing, rows)?;
             hip(gpu.convert_f32_to_bf16(&landing, out, elements))?;
         } else {
-            g942_gemm_bf16_mfma(gpu, &ctx, w, &staged, out, rows)?;
+            g942_gemm_bf16_mfma(gpu, &ctx, w, staged, out, rows)?;
         }
     }
     Ok(())

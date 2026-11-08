@@ -14,6 +14,25 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 use std::sync::{LazyLock, OnceLock};
 
+/// LDS row pitch (BF16 elements) of `gemm_bf16_mfma_gfx942_rows16`: a 256-K
+/// chunk plus a 4-element pad (`R16_LD` in `kernels/src/gemm_bf16_mfma.gfx942.hip`).
+const GEMM_BF16_MFMA_ROWS16_LDS_PITCH: usize = 256 + 4;
+
+/// Most weights one `gemm_bf16_mfma_gfx942_rows16` launch takes (its four
+/// `A` / `D` / `M` argument slots).
+pub const GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS: usize = 4;
+
+/// Whether a BF16 MFMA GEMM launch takes the few-row entry
+/// `gemm_bf16_mfma_gfx942_rows16`: 1..=16 batch rows, `K % 8 == 0` (every
+/// row starts on a 16-byte boundary) and 16-byte aligned weight and activation
+/// bases (the entry's 16-byte loads).
+fn gemm_bf16_mfma_rows16_admits(a: *const c_void, x: *const c_void, k: usize, batch: usize) -> bool {
+    (1..=16).contains(&batch)
+        && k % 8 == 0
+        && (a as usize) % 16 == 0
+        && (x as usize) % 16 == 0
+}
+
 /// Most activation rows one `gemm_q8_0_batched` kernel launch takes: the
 /// kernel keeps one accumulator per row. `gemm_q8_0_batched` launches once per
 /// [`q8_0_batched_chunks`] chunk above this.
@@ -34772,9 +34791,14 @@ impl Gpu {
     /// - `b`: row-major BF16 activations `[batch, K]`
     /// - `d`: row-major FP32 output `[batch, M]` (overwritten)
     ///
-    /// Launch geometry (fixed by the HIP source): block `[256,1,1]`,
-    /// grid `[(M+31)/32, (batch+31)/32, 1]`, static LDS B-tile
-    /// (`32 × 128 × 2 B`). Fail-closed on non-gfx942 and undersized buffers.
+    /// Two entries of one module, the same bytes: `batch <= 16` (with `K % 8
+    /// == 0` and 16-byte aligned `a` / `b`) runs the few-row entry
+    /// `gemm_bf16_mfma_gfx942_rows16` ([`Self::gemm_bf16_mfma_gfx942_rows16`]),
+    /// every other launch the 32×32-tile entry
+    /// ([`Self::gemm_bf16_mfma_gfx942_tiled`]). Both run each output element as
+    /// the identical ascending-K `v_mfma_f32_16x16x16bf16_1k` chain, so the
+    /// route choice never changes a byte. Fail-closed on non-gfx942 and
+    /// undersized buffers.
     pub fn gemm_bf16_mfma_gfx942(
         &mut self,
         a: &DeviceBuffer,
@@ -34784,6 +34808,110 @@ impl Gpu {
         k: usize,
         batch: usize,
     ) -> HipResult<()> {
+        let bytes = self.gemm_bf16_mfma_gfx942_check(a, b, 2, d, 4, m, k, batch)?;
+        if gemm_bf16_mfma_rows16_admits(a.as_ptr(), b.as_ptr(), k, batch) {
+            let member = [(a.as_ptr(), d.as_ptr(), m, false)];
+            return self.launch_gemm_bf16_mfma_rows16(b.as_ptr(), false, &member, k, batch, bytes);
+        }
+        self.launch_gemm_bf16_mfma_tiled(a, b, d, m, k, batch, bytes)
+    }
+
+    /// [`Self::gemm_bf16_mfma_gfx942`] forced onto the 32×32-tile entry at
+    /// every batch: the reference the few-row entry is bit-compared against.
+    pub fn gemm_bf16_mfma_gfx942_tiled(
+        &mut self,
+        a: &DeviceBuffer,
+        b: &DeviceBuffer,
+        d: &DeviceBuffer,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> HipResult<()> {
+        let bytes = self.gemm_bf16_mfma_gfx942_check(a, b, 2, d, 4, m, k, batch)?;
+        self.launch_gemm_bf16_mfma_tiled(a, b, d, m, k, batch, bytes)
+    }
+
+    /// The few-row entry for a projection group with the route's activation
+    /// staging and output rounding folded in: up to
+    /// [`GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS`] BF16 weights `[m_j, K]` that read
+    /// the same `x` (F32 or BF16 `[batch, K]`) run as ONE launch, member j
+    /// writing its `y_j` (F32 or BF16 `[batch, m_j]`). An F32 `x` is rounded
+    /// to BF16 in-kernel and a BF16 `y_j` is rounded from the F32 accumulator,
+    /// both by `convert_f32_to_bf16`'s RNE rule, so each member's bytes equal
+    /// `convert_f32_to_bf16` → [`Self::gemm_bf16_mfma_gfx942`] (→
+    /// `convert_f32_to_bf16` for a BF16 `y_j`). Returns `Ok(false)` without
+    /// launching when the entry does not apply (no member or more than four,
+    /// `batch` outside 1..=16, `K % 8 != 0`, an operand not 16-byte aligned,
+    /// a dtype outside F32 / BF16, or an output overlapping `x`); the caller
+    /// then stages and takes
+    /// [`Self::gemm_bf16_mfma_gfx942`] per member.
+    pub fn gemm_bf16_mfma_gfx942_rows16(
+        &mut self,
+        x: &GpuTensor,
+        members: &[(&DeviceBuffer, &GpuTensor, usize)],
+        k: usize,
+        batch: usize,
+    ) -> HipResult<bool> {
+        let (x_f32, x_size) = match x.dtype {
+            DType::F32 => (true, 4),
+            DType::BF16 => (false, 2),
+            _ => return Ok(false),
+        };
+        if members.is_empty() || members.len() > GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS {
+            return Ok(false);
+        }
+        let x_start = x.buf.as_ptr() as usize;
+        let x_end = x_start + batch * k * x_size;
+        let mut launch = [(std::ptr::null_mut(), std::ptr::null_mut(), 0usize, false);
+            GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS];
+        for (slot, &(a, y, m)) in launch.iter_mut().zip(members) {
+            // Every workgroup reads x for the whole launch: an output that
+            // overlaps it keeps the staged route (which reads a staged copy).
+            let y_start = y.buf.as_ptr() as usize;
+            if y_start < x_end && x_start < y_start + batch * m * y.dtype.size() {
+                return Ok(false);
+            }
+            let (d_bf16, d_size) = match y.dtype {
+                DType::F32 => (false, 4),
+                DType::BF16 => (true, 2),
+                _ => return Ok(false),
+            };
+            if !gemm_bf16_mfma_rows16_admits(a.as_ptr(), x.buf.as_ptr(), k, batch) {
+                return Ok(false);
+            }
+            self.gemm_bf16_mfma_gfx942_check(a, &x.buf, x_size, &y.buf, d_size, m, k, batch)?;
+            *slot = (a.as_ptr(), y.buf.as_ptr(), m, d_bf16);
+        }
+        let bytes = members
+            .iter()
+            .map(|&(_, y, m)| m * k * 2 + batch * m * y.dtype.size())
+            .sum::<usize>()
+            + batch * k * x_size;
+        self.launch_gemm_bf16_mfma_rows16(
+            x.buf.as_ptr(),
+            x_f32,
+            &launch[..members.len()],
+            k,
+            batch,
+            bytes,
+        )?;
+        Ok(true)
+    }
+
+    /// Arch, extent and buffer-size checks shared by the BF16 MFMA entries;
+    /// returns the bytes the launch touches (for the profile timer).
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_bf16_mfma_gfx942_check(
+        &mut self,
+        a: &DeviceBuffer,
+        b: &DeviceBuffer,
+        b_elem: usize,
+        d: &DeviceBuffer,
+        d_elem: usize,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> HipResult<usize> {
         self.bind_thread()?;
         if !self.arch_caps.is_gfx942() {
             return Err(hip_bridge::HipError::new(
@@ -34807,13 +34935,13 @@ impl Gpu {
             })?;
         let b_bytes = batch
             .checked_mul(k)
-            .and_then(|e| e.checked_mul(2))
+            .and_then(|e| e.checked_mul(b_elem))
             .ok_or_else(|| {
                 hip_bridge::HipError::new(0, "gemm_bf16_mfma_gfx942: B size overflow")
             })?;
         let d_bytes = batch
             .checked_mul(m)
-            .and_then(|e| e.checked_mul(4))
+            .and_then(|e| e.checked_mul(d_elem))
             .ok_or_else(|| {
                 hip_bridge::HipError::new(0, "gemm_bf16_mfma_gfx942: D size overflow")
             })?;
@@ -34844,7 +34972,22 @@ impl Gpu {
                 ),
             ));
         }
+        Ok(a_bytes + b_bytes + d_bytes)
+    }
 
+    /// The 32×32-tile entry: block `[256,1,1]`, grid
+    /// `[(M+31)/32, (batch+31)/32, 1]`, static LDS B-tile (`32 × 128 × 2 B`).
+    #[allow(clippy::too_many_arguments)]
+    fn launch_gemm_bf16_mfma_tiled(
+        &mut self,
+        a: &DeviceBuffer,
+        b: &DeviceBuffer,
+        d: &DeviceBuffer,
+        m: usize,
+        k: usize,
+        batch: usize,
+        bytes: usize,
+    ) -> HipResult<()> {
         const KERNEL: &str = "gemm_bf16_mfma_gfx942";
         self.ensure_kernel(KERNEL, kernels::GEMM_BF16_MFMA_GFX942_SRC, KERNEL)?;
 
@@ -34864,7 +35007,6 @@ impl Gpu {
         ];
         let grid_x = ((m + 31) / 32) as u32;
         let grid_y = ((batch + 31) / 32) as u32;
-        let bytes = a_bytes + b_bytes + d_bytes;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
         let result = self.launch_maybe_blob(
             KERNEL,
@@ -34880,6 +35022,84 @@ impl Gpu {
                 blob.push_i32(m_i32);
                 blob.push_i32(k_i32);
                 blob.push_i32(batch_i32);
+                blob
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// The few-row entries `gemm_bf16_mfma_gfx942_rows16` / `_rows16_x2`
+    /// (same module; `_x2` for an F32 `x` of more than 8 rows): block
+    /// `[576,1,1]`, grid `[sum_j ceil(m_j/16), 1, 1]`, dynamic LDS
+    /// `2 × (16 + batch) × 260 × 2 B` (two chunk buffers of 16 A rows plus
+    /// `batch` X rows, 256 K each with a 4-element pitch pad). `members` are
+    /// `(a, d, m, d_bf16)`, 1..=4 of them, already checked.
+    fn launch_gemm_bf16_mfma_rows16(
+        &mut self,
+        x_ptr: *mut c_void,
+        x_f32: bool,
+        members: &[(*mut c_void, *mut c_void, usize, bool)],
+        k: usize,
+        batch: usize,
+        bytes: usize,
+    ) -> HipResult<()> {
+        const MODULE: &str = "gemm_bf16_mfma_gfx942";
+        let kernel = if x_f32 && batch > 8 {
+            "gemm_bf16_mfma_gfx942_rows16_x2"
+        } else {
+            "gemm_bf16_mfma_gfx942_rows16"
+        };
+        self.ensure_kernel(MODULE, kernels::GEMM_BF16_MFMA_GFX942_SRC, kernel)?;
+
+        let mut a_ptr = [std::ptr::null_mut::<c_void>(); GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS];
+        let mut d_ptr = [std::ptr::null_mut::<c_void>(); GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS];
+        let mut m_i32 = [0i32; GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS];
+        let mut d_bf16_mask = 0i32;
+        let mut tiles = 0usize;
+        for (j, &(a, d, m, d_bf16)) in members.iter().enumerate() {
+            a_ptr[j] = a;
+            d_ptr[j] = d;
+            m_i32[j] = m as i32;
+            d_bf16_mask |= i32::from(d_bf16) << j;
+            tiles += m.div_ceil(16);
+        }
+        let k_i32 = k as i32;
+        let batch_i32 = batch as i32;
+        let x_f32_i32 = i32::from(x_f32);
+        let mut params: Vec<*mut c_void> = vec![&x_ptr as *const _ as *mut c_void];
+        params.extend(a_ptr.iter().map(|p| p as *const _ as *mut c_void));
+        params.extend(d_ptr.iter().map(|p| p as *const _ as *mut c_void));
+        params.extend(m_i32.iter().map(|v| v as *const _ as *mut c_void));
+        params.extend([
+            &k_i32 as *const _ as *mut c_void,
+            &batch_i32 as *const _ as *mut c_void,
+            &x_f32_i32 as *const _ as *mut c_void,
+            &d_bf16_mask as *const _ as *mut c_void,
+        ]);
+        let lds = (2 * (16 + batch) * GEMM_BF16_MFMA_ROWS16_LDS_PITCH * 2) as u32;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
+        let result = self.launch_maybe_blob(
+            kernel,
+            [tiles as u32, 1, 1],
+            [576, 1, 1],
+            lds,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(x_ptr);
+                for p in a_ptr.iter().chain(d_ptr.iter()) {
+                    blob.push_ptr(*p);
+                }
+                for v in m_i32 {
+                    blob.push_i32(v);
+                }
+                blob.push_i32(k_i32);
+                blob.push_i32(batch_i32);
+                blob.push_i32(x_f32_i32);
+                blob.push_i32(d_bf16_mask);
                 blob
             },
         );
