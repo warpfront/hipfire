@@ -225,6 +225,222 @@ pub const FINDINGS: &[Allow] = &[
         needle: "`v_dual_mov_b32 v0, 0x7404 :: v_dual_mov_b32 v1, s3` (after label `.LBB7`): needs Ds wait 0 (War { reg: \"v0\" })",
         why: "UNPROVEN, not a claimed race: an original LLVM M7OPEN finding (the committed lane_leviathan_verify image is the same instruction stream as the hipcc image; no modified code is claimed to race). The ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one (here the dual mov of v0) on a CFG path from the entry through the not-taken branches pc 30, 42, 67, 72 and 80 that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Nothing here is discharged",
     },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m32n16_gfx1201",
+        needle: "`v_and_b32_e32 v8, 0x3f00, v86` (after label `.LBB5`): needs Ds wait 1 (War { reg: \"v[8:9]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the committed gemm_mq6sym_i8 hipcc image is unchanged compiler output; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_m32n16_gfx1201",
+        needle: "`v_and_b32_e32 v8, 0x3f00, v86` (after label `.LBB5`): needs Ds wait 1 (War { reg: \"v[8:9]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the committed gemm_mq6sym_i8 hipcc image is unchanged compiler output; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m32n32_gfx1201",
+        needle: "`v_lshrrev_b32_e32 v26, 4, v44` (after label `.LBB5`): needs Ds wait 1 (War { reg: \"v[26:27]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the committed gemm_mq6sym_i8 hipcc image is unchanged compiler output; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_m32n32_gfx1201",
+        needle: "`v_lshrrev_b32_e32 v26, 4, v44` (after label `.LBB5`): needs Ds wait 1 (War { reg: \"v[26:27]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the committed gemm_mq6sym_i8 hipcc image is unchanged compiler output; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n16_gfx1201",
+        needle: "`v_and_or_b32 v10, v28, 63, v15` (after label `.LBB5`): needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the committed gemm_mq6sym_i8 hipcc image is unchanged compiler output; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_m64n16_gfx1201",
+        needle: "`v_and_or_b32 v10, v28, 63, v15` (after label `.LBB5`): needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the committed gemm_mq6sym_i8 hipcc image is unchanged compiler output; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n32_gfx1201",
+        needle: "`v_lshlrev_b32_e32 v20, 12, v30` (after label `.LBB5`): needs Ds wait 0 (War { reg: \"v[20:21]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the committed gemm_mq6sym_i8 hipcc image is unchanged compiler output; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_m64n32_gfx1201",
+        needle: "`v_lshlrev_b32_e32 v20, 12, v30` (after label `.LBB5`): needs Ds wait 0 (War { reg: \"v[20:21]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the committed gemm_mq6sym_i8 hipcc image is unchanged compiler output; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n48_gfx1201",
+        needle: "`v_alignbit_b32 v30, v61, v60, 24` (after label `.LBB5`): needs Ds wait 1 (War { reg: \"v[30:31]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the committed gemm_mq6sym_i8 hipcc image is unchanged compiler output; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_m64n48_gfx1201",
+        needle: "`v_alignbit_b32 v30, v61, v60, 24` (after label `.LBB5`): needs Ds wait 1 (War { reg: \"v[30:31]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the committed gemm_mq6sym_i8 hipcc image is unchanged compiler output; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n16y_gfx1201",
+        needle: "`v_and_or_b32 v10, v28, 63, v15` (after label `.LBB5`): needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the committed gemm_mq6sym_i8 hipcc image is unchanged compiler output; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_m64n16y_gfx1201",
+        needle: "`v_and_or_b32 v10, v28, 63, v15` (after label `.LBB5`): needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the committed gemm_mq6sym_i8 hipcc image is unchanged compiler output; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n16_x4_gfx1201",
+        needle: "`v_and_or_b32 v10, v28, 63, v15` (after label `.LBB14`): needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the committed gemm_mq6sym_i8 hipcc image is unchanged compiler output; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m32n32_x4_gfx1201",
+        needle: "`v_lshrrev_b32_e32 v26, 4, v44` (after label `.LBB14`): needs Ds wait 1 (War { reg: \"v[26:27]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the committed gemm_mq6sym_i8 hipcc image is unchanged compiler output; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n48_x4_gfx1201",
+        needle: "`v_alignbit_b32 v30, v61, v60, 24` (after label `.LBB14`): needs Ds wait 1 (War { reg: \"v[30:31]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the committed gemm_mq6sym_i8 hipcc image is unchanged compiler output; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n16y_x4_gfx1201",
+        needle: "`v_and_or_b32 v10, v28, 63, v15` (after label `.LBB14`): needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the committed gemm_mq6sym_i8 hipcc image is unchanged compiler output; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_gfx1201",
+        needle: "`v_lshrrev_b32_e32 v3, 2, v0` (after label `.LBB5`): needs Ds wait 0 (War { reg: \"v3\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the committed gemm_mq6sym_i8 hipcc image is unchanged compiler output; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_gfx1201",
+        needle: "`v_lshrrev_b32_e32 v3, 2, v0` (after label `.LBB5`): needs Ds wait 0 (War { reg: \"v3\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the committed gemm_mq6sym_i8 hipcc image is unchanged compiler output; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m32n16_gfx1201",
+        needle: "`v_and_b32_e32 v8, 0x3f00, v86` (after label `.LBB5`): needs Ds wait 1 (War { reg: \"v[8:9]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the sealed twin is the same ELF as the hipcc image; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_m32n16_gfx1201",
+        needle: "`v_and_b32_e32 v8, 0x3f00, v86` (after label `.LBB5`): needs Ds wait 1 (War { reg: \"v[8:9]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the sealed twin is the same ELF as the hipcc image; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m32n32_gfx1201",
+        needle: "`v_lshrrev_b32_e32 v26, 4, v44` (after label `.LBB5`): needs Ds wait 1 (War { reg: \"v[26:27]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the sealed twin is the same ELF as the hipcc image; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_m32n32_gfx1201",
+        needle: "`v_lshrrev_b32_e32 v26, 4, v44` (after label `.LBB5`): needs Ds wait 1 (War { reg: \"v[26:27]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the sealed twin is the same ELF as the hipcc image; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n16_gfx1201",
+        needle: "`v_and_or_b32 v10, v28, 63, v15` (after label `.LBB5`): needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the sealed twin is the same ELF as the hipcc image; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_m64n16_gfx1201",
+        needle: "`v_and_or_b32 v10, v28, 63, v15` (after label `.LBB5`): needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the sealed twin is the same ELF as the hipcc image; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n32_gfx1201",
+        needle: "`v_lshlrev_b32_e32 v20, 12, v30` (after label `.LBB5`): needs Ds wait 0 (War { reg: \"v[20:21]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the sealed twin is the same ELF as the hipcc image; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_m64n32_gfx1201",
+        needle: "`v_lshlrev_b32_e32 v20, 12, v30` (after label `.LBB5`): needs Ds wait 0 (War { reg: \"v[20:21]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the sealed twin is the same ELF as the hipcc image; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n48_gfx1201",
+        needle: "`v_alignbit_b32 v30, v61, v60, 24` (after label `.LBB5`): needs Ds wait 1 (War { reg: \"v[30:31]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the sealed twin is the same ELF as the hipcc image; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_m64n48_gfx1201",
+        needle: "`v_alignbit_b32 v30, v61, v60, 24` (after label `.LBB5`): needs Ds wait 1 (War { reg: \"v[30:31]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the sealed twin is the same ELF as the hipcc image; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n16y_gfx1201",
+        needle: "`v_and_or_b32 v10, v28, 63, v15` (after label `.LBB5`): needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the sealed twin is the same ELF as the hipcc image; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_m64n16y_gfx1201",
+        needle: "`v_and_or_b32 v10, v28, 63, v15` (after label `.LBB5`): needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the sealed twin is the same ELF as the hipcc image; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n16_x4_gfx1201",
+        needle: "`v_and_or_b32 v10, v28, 63, v15` (after label `.LBB14`): needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the sealed twin is the same ELF as the hipcc image; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m32n32_x4_gfx1201",
+        needle: "`v_lshrrev_b32_e32 v26, 4, v44` (after label `.LBB14`): needs Ds wait 1 (War { reg: \"v[26:27]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the sealed twin is the same ELF as the hipcc image; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n48_x4_gfx1201",
+        needle: "`v_alignbit_b32 v30, v61, v60, 24` (after label `.LBB14`): needs Ds wait 1 (War { reg: \"v[30:31]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the sealed twin is the same ELF as the hipcc image; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n16y_x4_gfx1201",
+        needle: "`v_and_or_b32 v10, v28, 63, v15` (after label `.LBB14`): needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the sealed twin is the same ELF as the hipcc image; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_gfx1201",
+        needle: "`v_lshrrev_b32_e32 v3, 2, v0` (after label `.LBB5`): needs Ds wait 0 (War { reg: \"v3\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the sealed twin is the same ELF as the hipcc image; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
+    Allow {
+        scope: "pins",
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_gfx1201",
+        needle: "`v_lshrrev_b32_e32 v3, 2, v0` (after label `.LBB5`): needs Ds wait 0 (War { reg: \"v3\" })",
+        why: "UNPROVEN, not a claimed race: an original LLVM DS-store-source lifetime finding (the sealed twin is the same ELF as the hipcc image; no modified code is claimed to race). The ledger's report: the ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path from the entry that has no such wait; whether the hardware has read the DS store sources by then (store-source timing) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger, and hardware source-read timing and path feasibility remain unproven. Nothing here is discharged",
+    },
 ];
 
 /// Inputs with no verification: a verifier refusal or a refusal upstream of it (lift region, pool).
@@ -602,7 +818,11 @@ pub struct PoolBody {
 /// from 33-48 to 55-70, templates 27 and 28 are unchanged. X1 then added the committed
 /// `argmax_pair_merge_pm_gfx1201.co` and `.hxaco` (one template each, sorted before every
 /// hosted entry below), so every id below is the earlier one plus 2 (27-28 -> 29-30, 55-62 ->
-/// 57-64, 65-70 -> 67-72). The next run on the rebased tree
+/// 57-64, 65-70 -> 67-72). F4 then inserted 36 new gemm_mq6sym_i8 hosted bodies (18
+/// original symbols, each once from the `.co` hipcc image and once from the `.hxaco` twin;
+/// tids 54-89, category Candidate, UNPROVEN original LLVM DS-store-source lifetime findings)
+/// before the ggml shim bodies, so the ggml ids at or above 57 are shifted by +36 (57-64 ->
+/// 93-100, 67-72 -> 103-108; the gated-delta ids 29-30 are unchanged). The next run on the rebased tree
 /// may enumerate the templates differently; a changed id then fails as an unlisted body
 /// finding plus a stale entry here and is fixed by editing the `tid` only (body pc, insn and
 /// need are the same). Witnesses: `local://ledger-join-finding.md`. No entry is a proven
@@ -627,9 +847,333 @@ pub const POOL_BODY: &[PoolBody] = &[
         insn: "`v_add_co_u32 v22, vcc_lo, v22, s38`",
         need: "needs Store wait 0 (War { reg: \"v[22:23]\" })",
     },
-    // pins row 4
+    // F4 hosted copy of the gemm_mq6sym_i8 hipcc_gfx1201.co pins finding
+    PoolBody {
+        tid: 54,
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m32n16_gfx1201",
+        body_pc: 357,
+        category: Category::Candidate,
+        insn: "`v_and_b32_e32 v8, 0x3f00, v86`",
+        need: "needs Ds wait 1 (War { reg: \"v[8:9]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 hipcc_gfx1201.co pins finding
+    PoolBody {
+        tid: 55,
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_m32n16_gfx1201",
+        body_pc: 358,
+        category: Category::Candidate,
+        insn: "`v_and_b32_e32 v8, 0x3f00, v86`",
+        need: "needs Ds wait 1 (War { reg: \"v[8:9]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 hipcc_gfx1201.co pins finding
+    PoolBody {
+        tid: 56,
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m32n32_gfx1201",
+        body_pc: 403,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v26, 4, v44`",
+        need: "needs Ds wait 1 (War { reg: \"v[26:27]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 hipcc_gfx1201.co pins finding
     PoolBody {
         tid: 57,
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_m32n32_gfx1201",
+        body_pc: 402,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v26, 4, v44`",
+        need: "needs Ds wait 1 (War { reg: \"v[26:27]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 hipcc_gfx1201.co pins finding
+    PoolBody {
+        tid: 58,
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n16_gfx1201",
+        body_pc: 346,
+        category: Category::Candidate,
+        insn: "`v_and_or_b32 v10, v28, 63, v15`",
+        need: "needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 hipcc_gfx1201.co pins finding
+    PoolBody {
+        tid: 59,
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_m64n16_gfx1201",
+        body_pc: 346,
+        category: Category::Candidate,
+        insn: "`v_and_or_b32 v10, v28, 63, v15`",
+        need: "needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 hipcc_gfx1201.co pins finding
+    PoolBody {
+        tid: 60,
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n32_gfx1201",
+        body_pc: 381,
+        category: Category::Candidate,
+        insn: "`v_lshlrev_b32_e32 v20, 12, v30`",
+        need: "needs Ds wait 0 (War { reg: \"v[20:21]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 hipcc_gfx1201.co pins finding
+    PoolBody {
+        tid: 61,
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_m64n32_gfx1201",
+        body_pc: 383,
+        category: Category::Candidate,
+        insn: "`v_lshlrev_b32_e32 v20, 12, v30`",
+        need: "needs Ds wait 0 (War { reg: \"v[20:21]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 hipcc_gfx1201.co pins finding
+    PoolBody {
+        tid: 62,
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n48_gfx1201",
+        body_pc: 433,
+        category: Category::Candidate,
+        insn: "`v_alignbit_b32 v30, v61, v60, 24`",
+        need: "needs Ds wait 1 (War { reg: \"v[30:31]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 hipcc_gfx1201.co pins finding
+    PoolBody {
+        tid: 63,
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_m64n48_gfx1201",
+        body_pc: 435,
+        category: Category::Candidate,
+        insn: "`v_alignbit_b32 v30, v61, v60, 24`",
+        need: "needs Ds wait 1 (War { reg: \"v[30:31]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 hipcc_gfx1201.co pins finding
+    PoolBody {
+        tid: 64,
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n16y_gfx1201",
+        body_pc: 358,
+        category: Category::Candidate,
+        insn: "`v_and_or_b32 v10, v28, 63, v15`",
+        need: "needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 hipcc_gfx1201.co pins finding
+    PoolBody {
+        tid: 65,
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_m64n16y_gfx1201",
+        body_pc: 358,
+        category: Category::Candidate,
+        insn: "`v_and_or_b32 v10, v28, 63, v15`",
+        need: "needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 hipcc_gfx1201.co pins finding
+    PoolBody {
+        tid: 66,
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n16_x4_gfx1201",
+        body_pc: 402,
+        category: Category::Candidate,
+        insn: "`v_and_or_b32 v10, v28, 63, v15`",
+        need: "needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 hipcc_gfx1201.co pins finding
+    PoolBody {
+        tid: 67,
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m32n32_x4_gfx1201",
+        body_pc: 459,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v26, 4, v44`",
+        need: "needs Ds wait 1 (War { reg: \"v[26:27]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 hipcc_gfx1201.co pins finding
+    PoolBody {
+        tid: 68,
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n48_x4_gfx1201",
+        body_pc: 480,
+        category: Category::Candidate,
+        insn: "`v_alignbit_b32 v30, v61, v60, 24`",
+        need: "needs Ds wait 1 (War { reg: \"v[30:31]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 hipcc_gfx1201.co pins finding
+    PoolBody {
+        tid: 69,
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n16y_x4_gfx1201",
+        body_pc: 416,
+        category: Category::Candidate,
+        insn: "`v_and_or_b32 v10, v28, 63, v15`",
+        need: "needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 hipcc_gfx1201.co pins finding
+    PoolBody {
+        tid: 70,
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_gfx1201",
+        body_pc: 163,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v3, 2, v0`",
+        need: "needs Ds wait 0 (War { reg: \"v3\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 hipcc_gfx1201.co pins finding
+    PoolBody {
+        tid: 71,
+        target: "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_gfx1201",
+        body_pc: 162,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v3, 2, v0`",
+        need: "needs Ds wait 0 (War { reg: \"v3\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 pm_gfx1201.hxaco pins finding
+    PoolBody {
+        tid: 72,
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m32n16_gfx1201",
+        body_pc: 357,
+        category: Category::Candidate,
+        insn: "`v_and_b32_e32 v8, 0x3f00, v86`",
+        need: "needs Ds wait 1 (War { reg: \"v[8:9]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 pm_gfx1201.hxaco pins finding
+    PoolBody {
+        tid: 73,
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_m32n16_gfx1201",
+        body_pc: 358,
+        category: Category::Candidate,
+        insn: "`v_and_b32_e32 v8, 0x3f00, v86`",
+        need: "needs Ds wait 1 (War { reg: \"v[8:9]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 pm_gfx1201.hxaco pins finding
+    PoolBody {
+        tid: 74,
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m32n32_gfx1201",
+        body_pc: 403,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v26, 4, v44`",
+        need: "needs Ds wait 1 (War { reg: \"v[26:27]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 pm_gfx1201.hxaco pins finding
+    PoolBody {
+        tid: 75,
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_m32n32_gfx1201",
+        body_pc: 402,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v26, 4, v44`",
+        need: "needs Ds wait 1 (War { reg: \"v[26:27]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 pm_gfx1201.hxaco pins finding
+    PoolBody {
+        tid: 76,
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n16_gfx1201",
+        body_pc: 346,
+        category: Category::Candidate,
+        insn: "`v_and_or_b32 v10, v28, 63, v15`",
+        need: "needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 pm_gfx1201.hxaco pins finding
+    PoolBody {
+        tid: 77,
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_m64n16_gfx1201",
+        body_pc: 346,
+        category: Category::Candidate,
+        insn: "`v_and_or_b32 v10, v28, 63, v15`",
+        need: "needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 pm_gfx1201.hxaco pins finding
+    PoolBody {
+        tid: 78,
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n32_gfx1201",
+        body_pc: 381,
+        category: Category::Candidate,
+        insn: "`v_lshlrev_b32_e32 v20, 12, v30`",
+        need: "needs Ds wait 0 (War { reg: \"v[20:21]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 pm_gfx1201.hxaco pins finding
+    PoolBody {
+        tid: 79,
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_m64n32_gfx1201",
+        body_pc: 383,
+        category: Category::Candidate,
+        insn: "`v_lshlrev_b32_e32 v20, 12, v30`",
+        need: "needs Ds wait 0 (War { reg: \"v[20:21]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 pm_gfx1201.hxaco pins finding
+    PoolBody {
+        tid: 80,
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n48_gfx1201",
+        body_pc: 433,
+        category: Category::Candidate,
+        insn: "`v_alignbit_b32 v30, v61, v60, 24`",
+        need: "needs Ds wait 1 (War { reg: \"v[30:31]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 pm_gfx1201.hxaco pins finding
+    PoolBody {
+        tid: 81,
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_m64n48_gfx1201",
+        body_pc: 435,
+        category: Category::Candidate,
+        insn: "`v_alignbit_b32 v30, v61, v60, 24`",
+        need: "needs Ds wait 1 (War { reg: \"v[30:31]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 pm_gfx1201.hxaco pins finding
+    PoolBody {
+        tid: 82,
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n16y_gfx1201",
+        body_pc: 358,
+        category: Category::Candidate,
+        insn: "`v_and_or_b32 v10, v28, 63, v15`",
+        need: "needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 pm_gfx1201.hxaco pins finding
+    PoolBody {
+        tid: 83,
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_m64n16y_gfx1201",
+        body_pc: 358,
+        category: Category::Candidate,
+        insn: "`v_and_or_b32 v10, v28, 63, v15`",
+        need: "needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 pm_gfx1201.hxaco pins finding
+    PoolBody {
+        tid: 84,
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n16_x4_gfx1201",
+        body_pc: 402,
+        category: Category::Candidate,
+        insn: "`v_and_or_b32 v10, v28, 63, v15`",
+        need: "needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 pm_gfx1201.hxaco pins finding
+    PoolBody {
+        tid: 85,
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m32n32_x4_gfx1201",
+        body_pc: 459,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v26, 4, v44`",
+        need: "needs Ds wait 1 (War { reg: \"v[26:27]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 pm_gfx1201.hxaco pins finding
+    PoolBody {
+        tid: 86,
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n48_x4_gfx1201",
+        body_pc: 480,
+        category: Category::Candidate,
+        insn: "`v_alignbit_b32 v30, v61, v60, 24`",
+        need: "needs Ds wait 1 (War { reg: \"v[30:31]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 pm_gfx1201.hxaco pins finding
+    PoolBody {
+        tid: 87,
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n16y_x4_gfx1201",
+        body_pc: 416,
+        category: Category::Candidate,
+        insn: "`v_and_or_b32 v10, v28, 63, v15`",
+        need: "needs Ds wait 1 (War { reg: \"v[10:11]\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 pm_gfx1201.hxaco pins finding
+    PoolBody {
+        tid: 88,
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_gfx1201",
+        body_pc: 163,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v3, 2, v0`",
+        need: "needs Ds wait 0 (War { reg: \"v3\" })",
+    },
+    // F4 hosted copy of the gemm_mq6sym_i8 pm_gfx1201.hxaco pins finding
+    PoolBody {
+        tid: 89,
+        target: "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_gfx1201",
+        body_pc: 162,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v3, 2, v0`",
+        need: "needs Ds wait 0 (War { reg: \"v3\" })",
+    },
+    // pins row 4
+    PoolBody {
+        tid: 93,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q4_k_f16_gfx1201",
         body_pc: 143,
         category: Category::ModelLimit,
@@ -638,7 +1182,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 6; artifact://97452 pm_pool_34 pc 271
     PoolBody {
-        tid: 58,
+        tid: 94,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q5_k_f16_gfx1201",
         body_pc: 143,
         category: Category::ModelLimit,
@@ -647,7 +1191,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 8, W4; artifact://97452 pm_pool_35 pc 323
     PoolBody {
-        tid: 59,
+        tid: 95,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q6_k_f16_gfx1201",
         body_pc: 195,
         category: Category::Candidate,
@@ -656,7 +1200,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 3, W3
     PoolBody {
-        tid: 60,
+        tid: 96,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_iq4_xs_f32_gfx1201",
         body_pc: 252,
         category: Category::Candidate,
@@ -665,7 +1209,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 5
     PoolBody {
-        tid: 61,
+        tid: 97,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q4_k_f32_gfx1201",
         body_pc: 152,
         category: Category::ModelLimit,
@@ -674,7 +1218,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 7; artifact://97452 pm_pool_38 pc 280
     PoolBody {
-        tid: 62,
+        tid: 98,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q5_k_f32_gfx1201",
         body_pc: 152,
         category: Category::ModelLimit,
@@ -683,7 +1227,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 9; artifact://97452 pm_pool_39 pc 289
     PoolBody {
-        tid: 63,
+        tid: 99,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q6_k_f32_gfx1201",
         body_pc: 161,
         category: Category::ModelLimit,
@@ -692,7 +1236,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 10, W5; artifact://97452 pm_pool_40 pc 295
     PoolBody {
-        tid: 64,
+        tid: 100,
         target: "ggml_convert_shim_gfx1201.co#ggml_dequant_q8_0_f32_gfx1201",
         body_pc: 167,
         category: Category::Candidate,
@@ -701,7 +1245,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 14
     PoolBody {
-        tid: 67,
+        tid: 103,
         target: "ggml_convert_shim_gfx1201.co#ggml_get_row_q4_k_f32_gfx1201",
         body_pc: 45,
         category: Category::ModelLimit,
@@ -710,7 +1254,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 11
     PoolBody {
-        tid: 68,
+        tid: 104,
         target: "ggml_convert_shim_gfx1201.co#ggml_get_row1_q4_k_f32_gfx1201",
         body_pc: 38,
         category: Category::ModelLimit,
@@ -719,7 +1263,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 15; artifact://97452 pm_pool_45 pc 173
     PoolBody {
-        tid: 69,
+        tid: 105,
         target: "ggml_convert_shim_gfx1201.co#ggml_get_row_q5_k_f32_gfx1201",
         body_pc: 45,
         category: Category::ModelLimit,
@@ -728,7 +1272,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 12; artifact://97452 pm_pool_46 pc 166
     PoolBody {
-        tid: 70,
+        tid: 106,
         target: "ggml_convert_shim_gfx1201.co#ggml_get_row1_q5_k_f32_gfx1201",
         body_pc: 38,
         category: Category::ModelLimit,
@@ -737,7 +1281,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 16; artifact://97452 pm_pool_47 pc 194
     PoolBody {
-        tid: 71,
+        tid: 107,
         target: "ggml_convert_shim_gfx1201.co#ggml_get_row_q6_k_f32_gfx1201",
         body_pc: 66,
         category: Category::ModelLimit,
@@ -746,7 +1290,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // pins row 13; artifact://97452 pm_pool_48 pc 146
     PoolBody {
-        tid: 72,
+        tid: 108,
         target: "ggml_convert_shim_gfx1201.co#ggml_get_row1_q6_k_f32_gfx1201",
         body_pc: 18,
         category: Category::ModelLimit,

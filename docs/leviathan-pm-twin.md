@@ -128,3 +128,50 @@ explicitly; that opt-in is shared-ISA reasoning only, with numerics taken from
 gfx1201 and no gfx1200 hardware evidence. Helper calls (`s_getpc_b64`,
 `s_swappc_b64`, `s_setpc_b64`) execute in the emulator on gfx1201; the M7
 all-path obligations remain OPEN.
+
+## F4 `gemm_mq6sym_i8_set_*_x4_gfx1201` (same Route A, proof only)
+
+`scripts/pm-gemm-mq6sym-i8-twin.py` seals the four multi-part F32 narrow entries
+`gemm_mq6sym_i8_set_{m64n16,m32n32,m64n48,m64n16y}_x4_gfx1201` from one hipcc object built from the
+runtime source text `GEMM_MQ6SYM_I8_GFX1201_SRC` (the `HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE`
+define, `block_i8_128_quant.hip`, then `gemm_mq6sym_i8.gfx1201.hip`) with the same core flags.
+Route A keeps the whole device ELF, so the image also contains the module's other entries;
+only the four x4 symbols are sealed with `--abi-ref` against the anchor (96-byte explicit
+kernarg, no hidden args). Dispatch is unchanged: the registry HIP source stays the runtime path.
+
+| File (`kernels/`) | Content |
+|---|---|
+| `gemm_mq6sym_i8_hipcc_gfx1201.co` | hipcc anchor |
+| `gemm_mq6sym_i8_pm_gfx1201.hxaco` / `.hxaco.sha256` | sealed twin |
+| `gemm_mq6sym_i8_pm_gfx1201.twin.json` | source, prelude and combined-source sha256, flags, one seal report per entry |
+
+Test: `crates/peacemaker-isa/tests/hip_twin_gemm_mq6sym_i8.rs` (CPU only; stale source or prelude
+hash fails it; rerun the script after editing either file).
+
+Hardware receipt **j8542**, gfx1201 card B: the `qwen4_mq6_x4_sym oracle` directly loaded the
+committed PM bundle and compared it with hipcc x4 and per-member launches: **88 cells,
+42,654,976 words, zero mismatches or tail violations**, all four tiles covered, negative controls
+passed. Ten raw-scale edge cells include signed zero, infinities, NaN payloads, subnormal and
+maximum-finite scales, in addition to finite random inputs, part permutations and missing slots.
+The fabric marked the run unconfounded. This hardware equality does not discharge the OPEN
+strict-ledger obligations below.
+
+Twin-build lane trace **j8543** (EP2, eight lanes, MTP k3, 16 tokens): flag on launched 120
+`m32n32_x4` and 96 `m64n16_x4` kernels; flag off launched none. All 32 verify dumps
+(301,000,215 bytes) and lane/reference/window ID records were equal across arms. Both independent
+lane-vs-singleton self-checks exited 1 at the same K8/prompt-5 case; this is not a passing
+lane-vs-singleton claim. The trace wrapper exited 0 and the fabric marked it unconfounded.
+The identical K8 failure is the pre-existing all-rows lane-isolation defect (also observed at
+K4/K8 on base during MtpIsoShep's release triage), not an F4 regression.
+
+### F4 proof boundary
+
+The `hip_twin` seal reports 0 blocking hazards for the four sealed x4 entries.
+Separately, the strict CFG ledger reports 36 UNPROVEN target findings
+(18 original LLVM symbols x 2 bundle copies: the `.co` hipcc image and the `.hxaco` twin), all DS
+store source VGPR writes without a prior DS-counter wait on a CFG path; the pool bodies hosting
+them add 36 `Candidate` body pins. Each is allowlisted exactly (instruction, label, need) with no
+suppression and no category change. They are original LLVM output, not changes introduced by the
+twin, and none is claimed to be a race. The checked full-ELF byte identity of anchor and twin does
+not discharge the ledger's strict WAR path, and hardware source-read timing and path feasibility
+remain unproven. No stronger analysis proof is claimed.

@@ -27,7 +27,7 @@
 //! needs the loader's symmetric verdict ([`Gpu::set_qwen4_trunk_a8_verified`]).
 //!
 //! Multi-part form ([`Gpu::gemm_mq6sym_i8_prequant_x4`], `HIPFIRE_QWEN4_TRUNK_A8_X4`, developer,
-//! default off): up to four F32 members of one K and one `xq` (GDN qkv|z|a|b, QSA q|k|v|idx) in ONE
+//! default on): up to four F32 members of one K and one `xq` (GDN qkv|z|a|b, QSA q|k|v|idx) in ONE
 //! `gemm_mq6sym_i8_set_{m64n16,m32n32,m64n48,m64n16y}_x4_gfx1201` launch, one tile picked from the
 //! largest member; every output word is the single-matrix entry's, bit for bit.
 
@@ -517,7 +517,7 @@ impl Gpu {
         x4_tile(ms.iter().copied().max()?, n).and_then(x4_entry)
     }
 
-    /// `HIPFIRE_QWEN4_TRUNK_A8_X4` (developer, default off): the F32 members of one K of the wide
+    /// `HIPFIRE_QWEN4_TRUNK_A8_X4` (developer, default on): the F32 members of one K of the wide
     /// A8 trunk route launch as one multi-part [`Gpu::gemm_mq6sym_i8_prequant_x4`].
     pub fn qwen4_trunk_a8_x4_enabled(&self) -> bool {
         self.flags.qwen4_trunk_a8_x4 && self.arch == "gfx1201"

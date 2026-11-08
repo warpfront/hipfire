@@ -98,7 +98,7 @@ pub struct FeatureFlags {
     /// Qwen4 gfx1201 symmetric-A8 trunk route, wide verify (`HIPFIRE_QWEN4_TRUNK_A8_X4`, 9..=64
     /// rows): the F32 members of one K (GDN qkv|z|a|b, QSA q|k|v|idx) run as ONE multi-part
     /// `gemm_mq6sym_i8_set_*_x4` launch instead of one launch each. Bytes identical to the
-    /// per-member launches. Opt-in, default off (new kernel entries; needs the PM twin).
+    /// per-member launches. Default on (the PM Route-A twin is sealed); `HIPFIRE_QWEN4_TRUNK_A8_X4=0` is the kill switch.
     pub qwen4_trunk_a8_x4: bool,
     /// Qwen4 HC read/write fusion level (`HIPFIRE_QWEN4_HC_FUSE`: 0 off, 1
     /// read side, 2 + attention epilogue, 3 + shared-down epilogue). Default
@@ -1173,7 +1173,7 @@ impl FeatureFlags {
             qwen4_gdn_i8_fuse: parse_bool("HIPFIRE_QWEN4_GDN_I8_FUSE").unwrap_or(is_gfx1201),
             qwen4_gdn_chain_fuse: parse_bool("HIPFIRE_QWEN4_GDN_CHAIN_FUSE").unwrap_or(is_gfx1201),
             qwen4_gdn_qkv_bf16: parse_bool("HIPFIRE_QWEN4_GDN_QKV_BF16").unwrap_or(false),
-            qwen4_trunk_a8_x4: parse_bool("HIPFIRE_QWEN4_TRUNK_A8_X4").unwrap_or(false),
+            qwen4_trunk_a8_x4: parse_bool("HIPFIRE_QWEN4_TRUNK_A8_X4").unwrap_or(true),
             qwen4_hc_fuse: value("HIPFIRE_QWEN4_HC_FUSE")
                 .ok()
                 .and_then(|v| v.trim().parse::<u8>().ok())
