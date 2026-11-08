@@ -1072,13 +1072,15 @@ pub struct PoolBody {
 /// need are the same). Witnesses: `local://ledger-join-finding.md`. No entry is a proven
 /// race, and there is no dispatcher entry.
 ///
-/// Templates 219-250 (after every id above) are the 32 `moe_shared_down_combine` bodies
-/// (16 hipcc originals 219-234, 16 PM twins 235-250), observed on the F6 land-check
-/// `ledger-pins.log` run on the tree rebased onto beta with F3/S4. They are the pool-hosted
+/// Templates 259-290 (after every id above) are the 32 `moe_shared_down_combine` bodies
+/// (16 hipcc originals 259-274, 16 PM twins 275-290), observed on the F6+F7 restack
+/// (`fusion/logs/restack-f67/`) on top of F4, whose 32 new lane_rows (gemv_bf16/gemv_mq6)
+/// hosted pool templates now sort before them (their ids were 219-250 on the F6-only tree,
+/// +40 here). They are the pool-hosted
 /// copies of the 32 UNPROVEN DS-store source-register WAR `pins` rows (original LLVM
 /// obligation, OPEN, not a claimed race, not discharged by text identity or hardware
-/// outputs). The b320 multi pool hosts the same bodies; its tid-250 body finding (the last
-/// template) is covered by the tid 250 entry (same tid, body pc, instruction and need). A
+/// outputs). The b320 multi pool hosts the same bodies; its tid-290 body finding (the last
+/// template) is covered by the tid 290 entry (same tid, body pc, instruction and need). A
 /// changed id after a later twin lands is fixed by editing the `tid` only.
 pub const POOL_BODY: &[PoolBody] = &[
     // pins row 2, W2
@@ -1552,7 +1554,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // moe_shared_down_combine hipcc originals (tid 219-234)
     PoolBody {
-        tid: 219,
+        tid: 259,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r1",
         body_pc: 259,
         category: Category::Candidate,
@@ -1560,7 +1562,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v20\" })",
     },
     PoolBody {
-        tid: 220,
+        tid: 260,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r1_zinit",
         body_pc: 254,
         category: Category::Candidate,
@@ -1568,7 +1570,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v19\" })",
     },
     PoolBody {
-        tid: 221,
+        tid: 261,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r2",
         body_pc: 1304,
         category: Category::Candidate,
@@ -1576,7 +1578,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 222,
+        tid: 262,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r2_zinit",
         body_pc: 1275,
         category: Category::Candidate,
@@ -1584,7 +1586,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 223,
+        tid: 263,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r3",
         body_pc: 1402,
         category: Category::Candidate,
@@ -1592,7 +1594,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 224,
+        tid: 264,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r3_zinit",
         body_pc: 1373,
         category: Category::Candidate,
@@ -1600,7 +1602,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 225,
+        tid: 265,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r4",
         body_pc: 1509,
         category: Category::Candidate,
@@ -1608,7 +1610,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 226,
+        tid: 266,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r4_zinit",
         body_pc: 1480,
         category: Category::Candidate,
@@ -1616,7 +1618,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 227,
+        tid: 267,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r5",
         body_pc: 1618,
         category: Category::Candidate,
@@ -1624,7 +1626,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 228,
+        tid: 268,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r5_zinit",
         body_pc: 1589,
         category: Category::Candidate,
@@ -1632,7 +1634,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 229,
+        tid: 269,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r6",
         body_pc: 1727,
         category: Category::Candidate,
@@ -1640,7 +1642,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 230,
+        tid: 270,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r6_zinit",
         body_pc: 1698,
         category: Category::Candidate,
@@ -1648,7 +1650,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 231,
+        tid: 271,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r7",
         body_pc: 1824,
         category: Category::Candidate,
@@ -1656,7 +1658,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 232,
+        tid: 272,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r7_zinit",
         body_pc: 1795,
         category: Category::Candidate,
@@ -1664,7 +1666,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 233,
+        tid: 273,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r8",
         body_pc: 1928,
         category: Category::Candidate,
@@ -1672,7 +1674,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 234,
+        tid: 274,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r8_zinit",
         body_pc: 1899,
         category: Category::Candidate,
@@ -1681,7 +1683,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // moe_shared_down_combine PM twins (tid 235-250)
     PoolBody {
-        tid: 235,
+        tid: 275,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r1",
         body_pc: 259,
         category: Category::Candidate,
@@ -1689,7 +1691,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v20\" })",
     },
     PoolBody {
-        tid: 236,
+        tid: 276,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r1_zinit",
         body_pc: 254,
         category: Category::Candidate,
@@ -1697,7 +1699,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v19\" })",
     },
     PoolBody {
-        tid: 237,
+        tid: 277,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r2",
         body_pc: 1304,
         category: Category::Candidate,
@@ -1705,7 +1707,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 238,
+        tid: 278,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r2_zinit",
         body_pc: 1275,
         category: Category::Candidate,
@@ -1713,7 +1715,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 239,
+        tid: 279,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r3",
         body_pc: 1402,
         category: Category::Candidate,
@@ -1721,7 +1723,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 240,
+        tid: 280,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r3_zinit",
         body_pc: 1373,
         category: Category::Candidate,
@@ -1729,7 +1731,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 241,
+        tid: 281,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r4",
         body_pc: 1509,
         category: Category::Candidate,
@@ -1737,7 +1739,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 242,
+        tid: 282,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r4_zinit",
         body_pc: 1480,
         category: Category::Candidate,
@@ -1745,7 +1747,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 243,
+        tid: 283,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r5",
         body_pc: 1618,
         category: Category::Candidate,
@@ -1753,7 +1755,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 244,
+        tid: 284,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r5_zinit",
         body_pc: 1589,
         category: Category::Candidate,
@@ -1761,7 +1763,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 245,
+        tid: 285,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r6",
         body_pc: 1727,
         category: Category::Candidate,
@@ -1769,7 +1771,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 246,
+        tid: 286,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r6_zinit",
         body_pc: 1698,
         category: Category::Candidate,
@@ -1777,7 +1779,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 247,
+        tid: 287,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r7",
         body_pc: 1824,
         category: Category::Candidate,
@@ -1785,7 +1787,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 248,
+        tid: 288,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r7_zinit",
         body_pc: 1795,
         category: Category::Candidate,
@@ -1793,7 +1795,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 249,
+        tid: 289,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r8",
         body_pc: 1928,
         category: Category::Candidate,
@@ -1801,7 +1803,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 250,
+        tid: 290,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r8_zinit",
         body_pc: 1899,
         category: Category::Candidate,
