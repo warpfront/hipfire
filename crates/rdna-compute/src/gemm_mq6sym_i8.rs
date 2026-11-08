@@ -256,8 +256,11 @@ fn mq6sym_i8_select(m: usize, k: usize, n: usize) -> Select {
 
 /// Largest token count of a multi-part (x4) launch: the narrow tiles serve 9..=48, the token-split
 /// `m64n16y_x4` (grid.y = ceil(N/16)) 49..=64. Wider launches (>= 65 rows, prefill) keep one
-/// 128x128 launch per member.
-pub const MQ6SYM_X4_MAX_ROWS: usize = 64;
+/// 128x128 launch per member. The bound is the wide-verify window's top,
+/// [`crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS`] (`hipfire_config::QWEN4_VERIFY_MAX_ROWS`): the
+/// x4 entries exist to serve the verify window (the tile rule above 48 rows is the token-split
+/// tile sized for it), so the window's own limit is the single source, not a tuned threshold.
+pub const MQ6SYM_X4_MAX_ROWS: usize = crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
 /// Most matrices of one multi-part launch (the `W0..W3` kernargs).
 pub const MQ6SYM_X4_MAX_PARTS: usize = 4;
 /// Explicit kernarg bytes of the x4 entries: `W0..W3 @0, Y0..Y3 @32, Xq @64, M0..M3 @72, K @88, N @92`.
@@ -538,7 +541,10 @@ impl Gpu {
             return Err(HipError::new(0, "gemm_mq6sym_i8_x4: eager-only"));
         }
         if self.arch != "gfx1201" {
-            return Err(HipError::new(0, "gemm_mq6sym_i8_x4: exact gfx1201 required"));
+            return Err(HipError::new(
+                0,
+                "gemm_mq6sym_i8_x4: exact gfx1201 required",
+            ));
         }
         if parts.is_empty()
             || parts.len() > MQ6SYM_X4_MAX_PARTS
@@ -926,8 +932,14 @@ mod tests {
         assert_eq!(x4_tile(2048, 12), None);
         assert_eq!(x4_tile(20000, 24), None);
         let gdn = [10240usize, 6144, 48, 48];
-        assert_eq!(x4_geometry(Tile::M64N48, &gdn, 48), ([160 + 96 + 1 + 1, 1, 1], 128));
-        assert_eq!(x4_geometry(Tile::M32N32, &gdn, 24), ([320 + 192 + 2 + 2, 1, 1], 64));
+        assert_eq!(
+            x4_geometry(Tile::M64N48, &gdn, 48),
+            ([160 + 96 + 1 + 1, 1, 1], 128)
+        );
+        assert_eq!(
+            x4_geometry(Tile::M32N32, &gdn, 24),
+            ([320 + 192 + 2 + 2, 1, 1], 64)
+        );
         assert_eq!(x4_geometry(Tile::M64N16Y, &gdn, 64), ([258, 4, 1], 128));
     }
 
@@ -959,7 +971,11 @@ mod tests {
                         let part = if i < 8 { i % 4 } else { 0 };
                         let live = i >= 8 || part < ms.len();
                         OperandBinding {
-                            address: if live { 0x1000_0000 * (i as u64 + 1) } else { 0 },
+                            address: if live {
+                                0x1000_0000 * (i as u64 + 1)
+                            } else {
+                                0
+                            },
                             bytes: if live { Some(FAKE_BYTES) } else { None },
                             format: o.format,
                         }

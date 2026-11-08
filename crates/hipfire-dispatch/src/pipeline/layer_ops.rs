@@ -278,7 +278,11 @@ fn a8_launch_f32_chunk(
         let (w, _) = projections[j];
         a8_first_launch_receipt(gpu, w.m, w.k, rows, false);
     }
-    if chunk.len() >= 2 && gpu.gemm_mq6sym_i8_x4_kernel_name(&ms[..chunk.len()], rows).is_some() {
+    if chunk.len() >= 2
+        && gpu
+            .gemm_mq6sym_i8_x4_kernel_name(&ms[..chunk.len()], rows)
+            .is_some()
+    {
         let parts: [(&GpuTensor, &GpuTensor, usize); 4] = std::array::from_fn(|t| {
             let (w, out) = projections[chunk[t.min(chunk.len() - 1)]];
             (w.buf, out, w.m)

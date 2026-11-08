@@ -440,12 +440,36 @@ const P_X4_K: Expr = Expr::Param("K");
 const I32_MAX_X4: u64 = i32::MAX as u64;
 
 const PARAMS_X4: &[ParamV1] = &[
-    ParamV1 { name: "M0", ty: ScalarTy::I32, doc: "weight rows of part 0 (> 0)" },
-    ParamV1 { name: "M1", ty: ScalarTy::I32, doc: "weight rows of part 1 (0 = part absent)" },
-    ParamV1 { name: "M2", ty: ScalarTy::I32, doc: "weight rows of part 2 (0 = part absent)" },
-    ParamV1 { name: "M3", ty: ScalarTy::I32, doc: "weight rows of part 3 (0 = part absent)" },
-    ParamV1 { name: "K", ty: ScalarTy::I32, doc: "reduction length (shared)" },
-    ParamV1 { name: "N", ty: ScalarTy::I32, doc: "tokens (Y rows, shared)" },
+    ParamV1 {
+        name: "M0",
+        ty: ScalarTy::I32,
+        doc: "weight rows of part 0 (> 0)",
+    },
+    ParamV1 {
+        name: "M1",
+        ty: ScalarTy::I32,
+        doc: "weight rows of part 1 (0 = part absent)",
+    },
+    ParamV1 {
+        name: "M2",
+        ty: ScalarTy::I32,
+        doc: "weight rows of part 2 (0 = part absent)",
+    },
+    ParamV1 {
+        name: "M3",
+        ty: ScalarTy::I32,
+        doc: "weight rows of part 3 (0 = part absent)",
+    },
+    ParamV1 {
+        name: "K",
+        ty: ScalarTy::I32,
+        doc: "reduction length (shared)",
+    },
+    ParamV1 {
+        name: "N",
+        ty: ScalarTy::I32,
+        doc: "tokens (Y rows, shared)",
+    },
 ];
 
 macro_rules! x4_weight {
@@ -489,7 +513,11 @@ const OPERANDS_X4_F32: &[OperandV1] = &[
         format: FORMAT_BLOCK_I8_128_KB_N,
         access: Access::ReadOnly,
         align: 4,
-        extent: Some(Expr::Mul(&[P_N, Expr::DivExact(&P_X4_K, 128), Expr::Const(136)])),
+        extent: Some(Expr::Mul(&[
+            P_N,
+            Expr::DivExact(&P_X4_K, 128),
+            Expr::Const(136),
+        ])),
         nullable: false,
         note: "alignment 4: records start with a float; the launcher checks only non-null",
     },
@@ -511,7 +539,10 @@ macro_rules! x4_i32 {
             name: $name,
             offset: $off,
             width: 4,
-            kind: FieldKind::Scalar { ty: ScalarTy::I32, value: $p },
+            kind: FieldKind::Scalar {
+                ty: ScalarTy::I32,
+                value: $p,
+            },
         }
     };
 }
@@ -537,19 +568,46 @@ const FIELDS_X4: &[FieldV1] = &[
 ];
 
 const DOMAIN_X4: &[DomainRuleV1] = &[
-    DomainRuleV1 { rule: Rule::Positive(P_X4_K), why: "gemm_mq6sym_i8_prequant_x4: k > 0" },
+    DomainRuleV1 {
+        rule: Rule::Positive(P_X4_K),
+        why: "gemm_mq6sym_i8_prequant_x4: k > 0",
+    },
     DomainRuleV1 {
         rule: Rule::MultipleOf(P_X4_K, 256),
         why: "gemm_mq6sym_i8_prequant_x4: MQ6 groups span 256 K",
     },
-    DomainRuleV1 { rule: Rule::Positive(P_M0), why: "gemm_mq6sym_i8_prequant_x4: part 0 present" },
-    DomainRuleV1 { rule: Rule::Positive(P_N), why: "gemm_mq6sym_i8_prequant_x4: n > 0" },
-    DomainRuleV1 { rule: Rule::AtMost(P_M0, I32_MAX_X4), why: "m passed as i32" },
-    DomainRuleV1 { rule: Rule::AtMost(P_M1, I32_MAX_X4), why: "m passed as i32" },
-    DomainRuleV1 { rule: Rule::AtMost(P_M2, I32_MAX_X4), why: "m passed as i32" },
-    DomainRuleV1 { rule: Rule::AtMost(P_M3, I32_MAX_X4), why: "m passed as i32" },
-    DomainRuleV1 { rule: Rule::AtMost(P_X4_K, I32_MAX_X4), why: "k passed as i32" },
-    DomainRuleV1 { rule: Rule::AtMost(P_N, I32_MAX_X4), why: "n passed as i32" },
+    DomainRuleV1 {
+        rule: Rule::Positive(P_M0),
+        why: "gemm_mq6sym_i8_prequant_x4: part 0 present",
+    },
+    DomainRuleV1 {
+        rule: Rule::Positive(P_N),
+        why: "gemm_mq6sym_i8_prequant_x4: n > 0",
+    },
+    DomainRuleV1 {
+        rule: Rule::AtMost(P_M0, I32_MAX_X4),
+        why: "m passed as i32",
+    },
+    DomainRuleV1 {
+        rule: Rule::AtMost(P_M1, I32_MAX_X4),
+        why: "m passed as i32",
+    },
+    DomainRuleV1 {
+        rule: Rule::AtMost(P_M2, I32_MAX_X4),
+        why: "m passed as i32",
+    },
+    DomainRuleV1 {
+        rule: Rule::AtMost(P_M3, I32_MAX_X4),
+        why: "m passed as i32",
+    },
+    DomainRuleV1 {
+        rule: Rule::AtMost(P_X4_K, I32_MAX_X4),
+        why: "k passed as i32",
+    },
+    DomainRuleV1 {
+        rule: Rule::AtMost(P_N, I32_MAX_X4),
+        why: "n passed as i32",
+    },
 ];
 
 /// x4 grid, `[sum_i ceil(M_i/64), 1, 1]`.

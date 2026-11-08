@@ -95,8 +95,7 @@ fn upload_words(gpu: &mut Gpu, d: &[u32]) -> Res<GpuTensor> {
 fn download_words(gpu: &Gpu, t: &GpuTensor, words: usize) -> Res<Vec<u32>> {
     let mut b = vec![0u8; words * 4];
     gpu.hip.memcpy_dtoh(&mut b, &t.buf)?;
-    Ok(b
-        .chunks_exact(4)
+    Ok(b.chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
 }
@@ -147,7 +146,10 @@ fn run_x4(
 ) -> Res<X4Out> {
     let mut ys: Vec<GpuTensor> = Vec::new();
     for (i, &m) in ms.iter().enumerate() {
-        ys.push(upload_words(gpu, &vec![SENTINELS[i % 4]; m * n + TAIL_WORDS])?);
+        ys.push(upload_words(
+            gpu,
+            &vec![SENTINELS[i % 4]; m * n + TAIL_WORDS],
+        )?);
     }
     let lm: Vec<usize> = order.iter().map(|&i| ms[i]).collect();
     let symbol = gpu
@@ -182,7 +184,9 @@ fn compare(t: &mut Totals, label: &str, out: &X4Out, refs: &[Vec<u32>], fails: &
         t.tail_words += out.tails[i].len() as u64;
         t.tail_violations += tv as u64;
         if mm != 0 || tv != 0 {
-            fails.push(format!("{label} member {i}: {mm} mismatches, {tv} tail violations"));
+            fails.push(format!(
+                "{label} member {i}: {mm} mismatches, {tv} tail violations"
+            ));
         }
     }
 }
@@ -200,7 +204,11 @@ fn oracle() -> Res<()> {
     for (gi, (gname, ms4)) in GROUPS.iter().enumerate() {
         let mut ws: Vec<GpuTensor> = Vec::new();
         for (i, &m) in ms4.iter().enumerate() {
-            ws.push(upload_weights(&mut gpu, m, 0x1000 * (gi as u64 + 1) + i as u64)?);
+            ws.push(upload_weights(
+                &mut gpu,
+                m,
+                0x1000 * (gi as u64 + 1) + i as u64,
+            )?);
         }
         for &n in &ns {
             let x = upload_f32(&mut gpu, &activations(0x77 + n as u64 + gi as u64, n, K))?;
@@ -246,7 +254,9 @@ fn oracle() -> Res<()> {
                     bad[mid] ^= 1 << 7;
                     let mm = count_mismatch(&out.words[0], &bad);
                     neg = Some(mm >= 1);
-                    println!("negative control ({label} member 0, 1 flipped bit): {mm} mismatch(es)");
+                    println!(
+                        "negative control ({label} member 0, 1 flipped bit): {mm} mismatch(es)"
+                    );
                 }
             }
         }
