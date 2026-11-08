@@ -90,7 +90,7 @@ mod tests {
         }
         assert_eq!(
             ids.len(),
-            60 + super::generic_gemm::ABIS.len()
+            61 + super::generic_gemm::ABIS.len()
                 + super::generic_seq::ABIS.len()
                 + super::generic_elem::ABIS.len()
                 + super::generic_mmq::ABIS.len()

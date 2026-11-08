@@ -25,6 +25,11 @@
 //! Env (developer): `HIPFIRE_QWEN4_TRUNK_A8` (`developer.qwen4_trunk_a8`, typed boolean): unset
 //! requests the route on exact gfx1201, `0`/`false` is the kill switch. The route additionally
 //! needs the loader's symmetric verdict ([`Gpu::set_qwen4_trunk_a8_verified`]).
+//!
+//! Multi-part form ([`Gpu::gemm_mq6sym_i8_prequant_x4`], `HIPFIRE_QWEN4_TRUNK_A8_X4`, developer,
+//! default off): up to four F32 members of one K and one `xq` (GDN qkv|z|a|b, QSA q|k|v|idx) in ONE
+//! `gemm_mq6sym_i8_set_{m64n16,m32n32,m64n48,m64n16y}_x4_gfx1201` launch, one tile picked from the
+//! largest member; every output word is the single-matrix entry's, bit for bit.
 
 use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::kernel_abi;
@@ -249,6 +254,53 @@ fn mq6sym_i8_select(m: usize, k: usize, n: usize) -> Select {
     }
 }
 
+/// Largest token count of a multi-part (x4) launch: the narrow tiles serve 9..=48, the token-split
+/// `m64n16y_x4` (grid.y = ceil(N/16)) 49..=64. Wider launches (>= 65 rows, prefill) keep one
+/// 128x128 launch per member.
+pub const MQ6SYM_X4_MAX_ROWS: usize = 64;
+/// Most matrices of one multi-part launch (the `W0..W3` kernargs).
+pub const MQ6SYM_X4_MAX_PARTS: usize = 4;
+/// Explicit kernarg bytes of the x4 entries: `W0..W3 @0, Y0..Y3 @32, Xq @64, M0..M3 @72, K @88, N @92`.
+const X4_EXPLICIT_BYTES: usize = 96;
+
+/// Multi-part (F32) entry of `tile`, for the four tiles the wide-verify rule picks on the trunk
+/// groups; `None` for every other tile (those launch per member).
+fn x4_entry(tile: Tile) -> Option<&'static str> {
+    match tile {
+        Tile::M64N16 => Some("gemm_mq6sym_i8_set_m64n16_x4_gfx1201"),
+        Tile::M32N32 => Some("gemm_mq6sym_i8_set_m32n32_x4_gfx1201"),
+        Tile::M64N48 => Some("gemm_mq6sym_i8_set_m64n48_x4_gfx1201"),
+        Tile::M64N16Y => Some("gemm_mq6sym_i8_set_m64n16y_x4_gfx1201"),
+        _ => None,
+    }
+}
+
+/// The one tile of a multi-part launch of `n` tokens whose largest part has `max_m` rows: the
+/// single-matrix rule of that part ([`narrow_tile`]) for `9..=48`, the token-split tile for
+/// `49..=64`; `None` when no x4 entry exists for it (the caller launches per member).
+fn x4_tile(max_m: usize, n: usize) -> Option<Tile> {
+    if !(QWEN4_TRUNK_A8_MIN_ROWS..=MQ6SYM_X4_MAX_ROWS).contains(&n) {
+        return None;
+    }
+    let tile = if n > 48 {
+        Tile::M64N16Y
+    } else {
+        narrow_tile(max_m, n)
+    };
+    x4_entry(tile).map(|_| tile)
+}
+
+/// Launch geometry `(grid, block)` of the x4 entry of `tile` over parts of `ms` rows and `n` tokens.
+fn x4_geometry(tile: Tile, ms: &[usize], n: usize) -> ([u32; 3], u32) {
+    let rows = if tile == Tile::M32N32 { 32 } else { 64 };
+    let blocks = ms.iter().map(|m| m.div_ceil(rows)).sum::<usize>() as u32;
+    match tile {
+        Tile::M32N32 => ([blocks, 1, 1], 64),
+        Tile::M64N16Y => ([blocks, n.div_ceil(16) as u32, 1], 128),
+        _ => ([blocks, 1, 1], 128),
+    }
+}
+
 impl Gpu {
     /// Whether the trunk A8 route is requested on this device: exact gfx1201 and
     /// `HIPFIRE_QWEN4_TRUNK_A8` not explicitly false (unset requests it; `0` is the kill switch).
@@ -448,6 +500,170 @@ impl Gpu {
         }
         // `y` was overwritten: caches keyed on its pointer are stale.
         self.invalidate_x_caches_for(y.buf.as_ptr());
+        result
+    }
+
+    /// Name of the kernel [`Gpu::gemm_mq6sym_i8_prequant_x4`] launches for parts of `ms` rows and
+    /// `n` tokens, `None` when the multi-part route does not take the shape (more than
+    /// [`MQ6SYM_X4_MAX_PARTS`] parts, `n` outside 9..=[`MQ6SYM_X4_MAX_ROWS`], or a tile without an
+    /// x4 entry): the caller then launches [`Gpu::gemm_mq6sym_i8_prequant`] per member.
+    pub fn gemm_mq6sym_i8_x4_kernel_name(&self, ms: &[usize], n: usize) -> Option<&'static str> {
+        if ms.is_empty() || ms.len() > MQ6SYM_X4_MAX_PARTS {
+            return None;
+        }
+        x4_tile(ms.iter().copied().max()?, n).and_then(x4_entry)
+    }
+
+    /// `HIPFIRE_QWEN4_TRUNK_A8_X4` (developer, default off): the F32 members of one K of the wide
+    /// A8 trunk route launch as one multi-part [`Gpu::gemm_mq6sym_i8_prequant_x4`].
+    pub fn qwen4_trunk_a8_x4_enabled(&self) -> bool {
+        self.flags.qwen4_trunk_a8_x4 && self.arch == "gfx1201"
+    }
+
+    /// Overwrite each part's `y` (`[n x m]`, F32) with `W . X` for up to four verified-symmetric
+    /// qt47 matrices `(weights, y, m)` of one `k` against the same A8 blocks `xq`
+    /// ([`Gpu::mq6_i8_prepare_x`], `n` tokens), in ONE launch. Every output word is bytewise the
+    /// word [`Gpu::gemm_mq6sym_i8_prequant`] writes for that member (one tile per launch, picked
+    /// from the largest part; all tiles share the per-row arithmetic). Eager-only; errors where
+    /// [`Gpu::gemm_mq6sym_i8_x4_kernel_name`] is `None`.
+    pub fn gemm_mq6sym_i8_prequant_x4(
+        &mut self,
+        parts: &[(&GpuTensor, &GpuTensor, usize)],
+        xq: *mut c_void,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.replay.is_recording() || self.graphs.capture_mode {
+            return Err(HipError::new(0, "gemm_mq6sym_i8_x4: eager-only"));
+        }
+        if self.arch != "gfx1201" {
+            return Err(HipError::new(0, "gemm_mq6sym_i8_x4: exact gfx1201 required"));
+        }
+        if parts.is_empty()
+            || parts.len() > MQ6SYM_X4_MAX_PARTS
+            || n == 0
+            || k == 0
+            || k % 256 != 0
+            || xq.is_null()
+            || parts.iter().any(|p| p.2 == 0)
+        {
+            return Err(HipError::new(
+                0,
+                "gemm_mq6sym_i8_x4: need 1..=4 parts with M>0, N>0, K>0, K%256==0 and prepared blocks",
+            ));
+        }
+        let mut ms = [0usize; MQ6SYM_X4_MAX_PARTS];
+        let mut weight_bytes = 0usize;
+        let mut out_bytes = 0usize;
+        for (i, (w, y, m)) in parts.iter().enumerate() {
+            if y.dtype != DType::F32 {
+                return Err(HipError::new(0, "gemm_mq6sym_i8_x4: every y must be F32"));
+            }
+            let wb = m
+                .checked_mul(k / 256)
+                .and_then(|v| v.checked_mul(MQ6_GROUP_BYTES))
+                .ok_or_else(|| HipError::new(0, "gemm_mq6sym_i8_x4: weight bytes overflow"))?;
+            let ob = n
+                .checked_mul(*m)
+                .and_then(|v| v.checked_mul(4))
+                .ok_or_else(|| HipError::new(0, "gemm_mq6sym_i8_x4: n*m overflow"))?;
+            if w.buf.size() < wb || y.buf.size() < ob {
+                return Err(HipError::new(
+                    0,
+                    "gemm_mq6sym_i8_x4: undersized weight or output tensor",
+                ));
+            }
+            ms[i] = *m;
+            weight_bytes += wb;
+            out_bytes += ob;
+        }
+        // Parts run concurrently inside one grid: a written extent (`n * m_i` words) that overlaps
+        // another part's written extent or any part's weights would race.
+        let span = |t: &GpuTensor, bytes: usize| {
+            let lo = t.buf.as_ptr() as usize;
+            (lo, lo + bytes)
+        };
+        for (i, (_, yi, mi)) in parts.iter().enumerate() {
+            let (lo, hi) = span(yi, n * mi * 4);
+            let hits = |(a, b): (usize, usize)| a < hi && lo < b;
+            for (j, (wj, yj, mj)) in parts.iter().enumerate() {
+                if (j != i && hits(span(yj, n * mj * 4)))
+                    || hits(span(wj, mj * (k / 256) * MQ6_GROUP_BYTES))
+                {
+                    return Err(HipError::new(
+                        0,
+                        "gemm_mq6sym_i8_x4: an output overlaps another part's output or a weight",
+                    ));
+                }
+            }
+        }
+        let max_m = ms.iter().copied().max().unwrap_or(0);
+        let tile = x4_tile(max_m, n).ok_or_else(|| {
+            HipError::new(0, "gemm_mq6sym_i8_x4: no multi-part entry for this shape")
+        })?;
+        let kernel = x4_entry(tile)
+            .ok_or_else(|| HipError::new(0, "gemm_mq6sym_i8_x4: tile without x4 entry"))?;
+        let (grid, block_x) = x4_geometry(tile, &ms[..parts.len()], n);
+        let arch = kernel_abi::parse_arch(&self.arch)?;
+        let abi = kernel_abi::contract(&self.arch, kernel)?;
+        // ABI operand order: W0..W3, Y0..Y3, Xq; an absent part is a null binding.
+        let absent = |format| kernel_abi::binding_raw(std::ptr::null(), None, format);
+        let w_at = |i: usize| match parts.get(i) {
+            Some((w, _, _)) => kernel_abi::binding(w, FORMAT_MQ6G256V2_WEIGHTS),
+            None => absent(FORMAT_MQ6G256V2_WEIGHTS),
+        };
+        let y_at = |i: usize| match parts.get(i) {
+            Some((_, y, _)) => kernel_abi::binding(y, FORMAT_F32_N_M),
+            None => absent(FORMAT_F32_N_M),
+        };
+        let operands = [
+            w_at(0),
+            w_at(1),
+            w_at(2),
+            w_at(3),
+            y_at(0),
+            y_at(1),
+            y_at(2),
+            y_at(3),
+            kernel_abi::binding_raw(xq, self.int8_mmq_xq_bytes(xq), FORMAT_BLOCK_I8_128_KB_N),
+        ];
+        let block = [block_x, 1, 1];
+        let mut v = kernel_abi::validate(
+            abi,
+            &InvocationV1 {
+                arch,
+                symbol: kernel,
+                params: &[
+                    ms[0] as u64,
+                    ms[1] as u64,
+                    ms[2] as u64,
+                    ms[3] as u64,
+                    k as u64,
+                    n as u64,
+                ],
+                operands: &operands,
+                grid,
+                block,
+                dynamic_lds: 0,
+            },
+        )?;
+        debug_assert_eq!(v.explicit().len(), X4_EXPLICIT_BYTES);
+        self.ensure_kernel(GEMM_MODULE, kernels::GEMM_MQ6SYM_I8_GFX1201_SRC, kernel)?;
+        let mut ptrs = [std::ptr::null_mut::<c_void>(); MAX_FIELDS];
+        let nptrs = kernel_abi::kernel_params(&mut v, &mut ptrs)?;
+        let bytes = weight_bytes + n * (k / 128) * BLOCK_I8_128_BYTES + out_bytes;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
+        let result = self.launch_maybe_blob(kernel, grid, block, 0, &mut ptrs[..nptrs], || {
+            kernel_abi::blob(v.explicit())
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        // Every `y` was overwritten: caches keyed on their pointers are stale.
+        for (_, y, _) in parts {
+            self.invalidate_x_caches_for(y.buf.as_ptr());
+        }
         result
     }
 }
@@ -682,7 +898,89 @@ mod tests {
             .filter(|a| a.id.starts_with("mq6sym_i8."))
             .map(|a| a.exports.len())
             .sum();
-        assert_eq!(exported, ALL_TILES.len() * 2);
+        assert_eq!(exported, ALL_TILES.len() * 2 + X4_TILES.len());
+    }
+
+    const X4_TILES: [Tile; 4] = [Tile::M64N16, Tile::M32N32, Tile::M64N48, Tile::M64N16Y];
+
+    /// The multi-part rule on the two Flash-Next trunk groups (GDN 10240|6144|48|48, QSA
+    /// 12288|512|512|640): one tile from the largest part, the single-matrix rule of that part for
+    /// 9..=48 and the token-split tile for 49..=64, nothing outside 9..=64.
+    #[test]
+    fn x4_tile_rule_and_geometry() {
+        for max_m in [10240usize, 12288] {
+            for n in 9..=64usize {
+                let want = match n {
+                    9..=16 => Tile::M64N16,
+                    17..=32 => Tile::M32N32,
+                    33..=48 => Tile::M64N48,
+                    _ => Tile::M64N16Y,
+                };
+                assert_eq!(x4_tile(max_m, n), Some(want), "m={max_m} n={n}");
+            }
+        }
+        for n in [0usize, 1, 8, 65, 128, 4096] {
+            assert_eq!(x4_tile(10240, n), None, "n={n}");
+        }
+        // A tile without an x4 entry is refused, not substituted.
+        assert_eq!(x4_tile(2048, 12), None);
+        assert_eq!(x4_tile(20000, 24), None);
+        let gdn = [10240usize, 6144, 48, 48];
+        assert_eq!(x4_geometry(Tile::M64N48, &gdn, 48), ([160 + 96 + 1 + 1, 1, 1], 128));
+        assert_eq!(x4_geometry(Tile::M32N32, &gdn, 24), ([320 + 192 + 2 + 2, 1, 1], 64));
+        assert_eq!(x4_geometry(Tile::M64N16Y, &gdn, 64), ([258, 4, 1], 128));
+    }
+
+    /// The x4 kernarg image is the 96 explicit bytes `W0..W3 Y0..Y3 Xq M0..M3 K N`, and every x4
+    /// export's block, LDS and grid are what the launcher passes (absent parts null, M_i = 0).
+    #[test]
+    fn x4_contract_matches_launcher_geometry() {
+        let k = 2560usize;
+        for tile in X4_TILES {
+            let entry = x4_entry(tile).unwrap();
+            let abi = kernel_abi::contract("gfx1201", entry).unwrap();
+            assert_eq!(abi.explicit_bytes as usize, X4_EXPLICIT_BYTES, "{entry}");
+            for (ms, n) in [
+                (vec![10240usize, 6144, 48, 48], 48usize),
+                (vec![12288, 512, 512, 640], 24),
+                (vec![10240, 6144], 64),
+                (vec![10240], 9),
+            ] {
+                let (grid, block) = x4_geometry(tile, &ms, n);
+                let mut m4 = [0u64; 4];
+                for (i, m) in ms.iter().enumerate() {
+                    m4[i] = *m as u64;
+                }
+                let operands: Vec<OperandBinding> = abi
+                    .operands
+                    .iter()
+                    .enumerate()
+                    .map(|(i, o)| {
+                        let part = if i < 8 { i % 4 } else { 0 };
+                        let live = i >= 8 || part < ms.len();
+                        OperandBinding {
+                            address: if live { 0x1000_0000 * (i as u64 + 1) } else { 0 },
+                            bytes: if live { Some(FAKE_BYTES) } else { None },
+                            format: o.format,
+                        }
+                    })
+                    .collect();
+                let v = kernel_abi::validate(
+                    abi,
+                    &InvocationV1 {
+                        arch: kernel_abi::parse_arch("gfx1201").unwrap(),
+                        symbol: entry,
+                        params: &[m4[0], m4[1], m4[2], m4[3], k as u64, n as u64],
+                        operands: &operands,
+                        grid,
+                        block: [block, 1, 1],
+                        dynamic_lds: 0,
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{entry} {ms:?} n={n}: {e}"));
+                assert_eq!(v.explicit().len(), X4_EXPLICIT_BYTES, "{entry}");
+            }
+        }
     }
 
     #[test]

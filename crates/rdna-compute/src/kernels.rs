@@ -5962,7 +5962,8 @@ pub const GEMV_MQ6SYM_I8_GFX1201_SRC: &str = concat!(
 );
 /// gfx1201 symmetric-MQ6 x A8 signed-iu8 WMMA GEMM: narrow verify tiles
 /// (`gemm_mq6sym_i8_set{,_bf16}_m{32,64}n{16,32,48}{,y}_gfx1201`) and the 128x128 prefill tile
-/// (`gemm_mq6sym_i8_set{,_bf16}_gfx1201`, dynamic LDS 36864); same prelude as the GEMV.
+/// (`gemm_mq6sym_i8_set{,_bf16}_gfx1201`, dynamic LDS 36864), plus the multi-part F32 narrow entries
+/// (`gemm_mq6sym_i8_set_{m64n16,m32n32,m64n48,m64n16y}_x4_gfx1201`); same prelude as the GEMV.
 pub const GEMM_MQ6SYM_I8_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),

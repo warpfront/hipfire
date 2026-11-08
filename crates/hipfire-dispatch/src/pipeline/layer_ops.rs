@@ -259,6 +259,39 @@ fn mq6_a8_route(gpu: &Gpu, weight: &WeightRef<'_>, rows: usize) -> bool {
     weight.dtype == DType::MQ6G256V2 && gpu.qwen4_trunk_a8_applies(weight.m, weight.k, rows)
 }
 
+/// Launch the F32 members `chunk` (indices into `projections`, one K, all admitted by the A8
+/// route) of one prepared activation `xq`: one multi-part launch when the x4 route takes the shape
+/// (two or more members, 9..=64 rows, a tile with an x4 entry), else one launch per member.
+fn a8_launch_f32_chunk(
+    gpu: &mut Gpu,
+    xq: *mut std::ffi::c_void,
+    projections: &[(&WeightRef<'_>, &GpuTensor)],
+    chunk: &[usize],
+    rows: usize,
+) -> Result<(), DispatchError> {
+    let Some(&first) = chunk.first() else {
+        return Ok(());
+    };
+    let k = projections[first].0.k;
+    let ms: [usize; 4] = std::array::from_fn(|t| chunk.get(t).map_or(0, |&j| projections[j].0.m));
+    for &j in chunk {
+        let (w, _) = projections[j];
+        a8_first_launch_receipt(gpu, w.m, w.k, rows, false);
+    }
+    if chunk.len() >= 2 && gpu.gemm_mq6sym_i8_x4_kernel_name(&ms[..chunk.len()], rows).is_some() {
+        let parts: [(&GpuTensor, &GpuTensor, usize); 4] = std::array::from_fn(|t| {
+            let (w, out) = projections[chunk[t.min(chunk.len() - 1)]];
+            (w.buf, out, w.m)
+        });
+        return hip(gpu.gemm_mq6sym_i8_prequant_x4(&parts[..chunk.len()], xq, k, rows));
+    }
+    for &j in chunk {
+        let (w, out) = projections[j];
+        hip(gpu.gemm_mq6sym_i8_prequant(w.buf, xq, out, w.m, w.k, rows))?;
+    }
+    Ok(())
+}
+
 /// One-time-per-process receipt of the A8 trunk route per row class (1,
 /// 2..=8, 9..=64): proof in served-job logs that the route actually ran.
 fn a8_first_launch_receipt(gpu: &Gpu, m: usize, k: usize, rows: usize, bf16: bool) {
@@ -368,13 +401,31 @@ fn project_weights_inner(
                 continue;
             }
             let xq = hip(gpu.mq6_i8_prepare_x(input, weight.k, rows))?;
+            // `HIPFIRE_QWEN4_TRUNK_A8_X4`: the F32 members of this K gather into chunks of up to
+            // four and launch as one multi-part GEMM (`gemm_mq6sym_i8_prequant_x4`); BF16 members
+            // (the chunked GDN qkv) and shapes without an x4 entry launch per member as before.
+            let x4 = gpu.qwen4_trunk_a8_x4_enabled();
+            let mut chunk = [0usize; 4];
+            let mut chunked = 0usize;
             for j in i..projections.len() {
                 let (w, out) = projections[j];
                 if !done[j] && w.k == weight.k && take(gpu, w, out) {
-                    a8_first_launch_receipt(gpu, w.m, w.k, rows, out.dtype == DType::BF16);
-                    hip(gpu.gemm_mq6sym_i8_prequant(w.buf, xq, out, w.m, w.k, rows))?;
                     done[j] = true;
+                    if x4 && out.dtype == DType::F32 {
+                        chunk[chunked] = j;
+                        chunked += 1;
+                        if chunked == chunk.len() {
+                            a8_launch_f32_chunk(gpu, xq, projections, &chunk[..chunked], rows)?;
+                            chunked = 0;
+                        }
+                    } else {
+                        a8_first_launch_receipt(gpu, w.m, w.k, rows, out.dtype == DType::BF16);
+                        hip(gpu.gemm_mq6sym_i8_prequant(w.buf, xq, out, w.m, w.k, rows))?;
+                    }
                 }
+            }
+            if chunked > 0 {
+                a8_launch_f32_chunk(gpu, xq, projections, &chunk[..chunked], rows)?;
             }
         }
         // The exact-INT8 route (gfx1201 / gfx1151) goes next: one FWHT + A8

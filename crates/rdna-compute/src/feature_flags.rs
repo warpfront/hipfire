@@ -95,6 +95,11 @@ pub struct FeatureFlags {
     /// shape (M = 10240, K = 2048, 16384 rows: 5.53 vs 4.96 ms), which outweighs the 0.39 ms the
     /// producer gains.
     pub qwen4_gdn_qkv_bf16: bool,
+    /// Qwen4 gfx1201 symmetric-A8 trunk route, wide verify (`HIPFIRE_QWEN4_TRUNK_A8_X4`, 9..=64
+    /// rows): the F32 members of one K (GDN qkv|z|a|b, QSA q|k|v|idx) run as ONE multi-part
+    /// `gemm_mq6sym_i8_set_*_x4` launch instead of one launch each. Bytes identical to the
+    /// per-member launches. Opt-in, default off (new kernel entries; needs the PM twin).
+    pub qwen4_trunk_a8_x4: bool,
     /// Qwen4 HC read/write fusion level (`HIPFIRE_QWEN4_HC_FUSE`: 0 off, 1
     /// read side, 2 + attention epilogue, 3 + shared-down epilogue). Default
     /// 3 on gfx1151, 1 on gfx1201, 0 elsewhere; see [`Self::qwen4_hc_fuse_level`].
@@ -1168,6 +1173,7 @@ impl FeatureFlags {
             qwen4_gdn_i8_fuse: parse_bool("HIPFIRE_QWEN4_GDN_I8_FUSE").unwrap_or(is_gfx1201),
             qwen4_gdn_chain_fuse: parse_bool("HIPFIRE_QWEN4_GDN_CHAIN_FUSE").unwrap_or(is_gfx1201),
             qwen4_gdn_qkv_bf16: parse_bool("HIPFIRE_QWEN4_GDN_QKV_BF16").unwrap_or(false),
+            qwen4_trunk_a8_x4: parse_bool("HIPFIRE_QWEN4_TRUNK_A8_X4").unwrap_or(false),
             qwen4_hc_fuse: value("HIPFIRE_QWEN4_HC_FUSE")
                 .ok()
                 .and_then(|v| v.trim().parse::<u8>().ok())
@@ -2246,6 +2252,7 @@ impl FeatureFlags {
             qwen4_gdn_i8_fuse: false,
             qwen4_gdn_chain_fuse: false,
             qwen4_gdn_qkv_bf16: false,
+            qwen4_trunk_a8_x4: false,
             qwen4_hc_fuse: 0,
             qwen4_hc_up_tile: false,
             qwen4_hc_up_v2: false,
