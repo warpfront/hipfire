@@ -41,7 +41,7 @@
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Scratch, StateQuant};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::KvCache;
+use hipfire_runtime::llama::{KvCache, VMode};
 use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -123,6 +123,7 @@ fn build_kv(
             head_dim,
             MAX_SEQ,
             MAX_SEQ,
+            VMode::Q8,
         )
         .expect("fwht3 KV"),
         "asym3" => KvCache::new_gpu_asym3_capped_filtered(

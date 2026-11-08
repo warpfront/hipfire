@@ -8645,27 +8645,24 @@ impl Carrier for Qwen35Carrier {
                         }
                     }
                     (KvBackend::Legacy, hipfire_runtime::kv_mode::KvPair::Split(_, vm)) => {
-                        let mut kv = match <hipfire_runtime::llama::KvCache as hipfire_runtime::llama::KvCacheExt>::from_mode_with_backend(
+                        // V allocates at its logical stride up front (no Q8
+                        // transient that must fit contiguously before a shrink).
+                        match hipfire_runtime::llama::KvCache::new_gpu_fwht_filtered_with_v(
+                            ctx.gpu,
                             mode,
-                            KvBackend::Legacy,
-                            hipfire_runtime::llama::KvTarget::Single(ctx.gpu),
-                            &dims,
+                            &is_kv_layer,
+                            config.n_kv_heads,
+                            config.head_dim,
+                            ctx.max_seq,
+                            ctx.max_seq,
+                            vm,
                         ) {
                             Ok(k) => k,
                             Err(e) => {
                                 weights.free_gpu(ctx.gpu);
                                 return Err(format!("KvCache: {e}"));
                             }
-                        };
-                        if let Err(e) = kv.set_v_mode_realloc(ctx.gpu, vm) {
-                            let mut note = format!("set_v_mode_realloc: {e}");
-                            if let Err(fe) = kv.free_gpu(ctx.gpu) {
-                                note = format!("{note}; cleanup also failed: {fe}");
-                            }
-                            weights.free_gpu(ctx.gpu);
-                            return Err(note);
                         }
-                        kv
                     }
                 };
 

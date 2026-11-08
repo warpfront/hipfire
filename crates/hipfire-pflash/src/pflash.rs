@@ -20,7 +20,7 @@ use hip_bridge::HipResult;
 use hipfire_dispatch::families::kv_tier::KTier;
 use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::llama::KvCacheExt;
-use hipfire_runtime::llama::{self, ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
+use hipfire_runtime::llama::{self, ForwardScratch, KvCache, LlamaConfig, LlamaWeights, VMode};
 use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::{DType, Gpu};
 use std::path::Path;
@@ -554,6 +554,7 @@ pub fn load_drafter(
                     q35_cfg.n_kv_heads,
                     q35_cfg.head_dim,
                     max_kv_seq,
+                    VMode::Q8,
                 )?,
                 DrafterKvMode::Fwht3 => KvCache::new_gpu_fwht3_filtered(
                     gpu,
@@ -561,6 +562,7 @@ pub fn load_drafter(
                     q35_cfg.n_kv_heads,
                     q35_cfg.head_dim,
                     max_kv_seq,
+                    VMode::Q8,
                 )?,
                 DrafterKvMode::Fwht2 => KvCache::new_gpu_fwht2_filtered(
                     gpu,
@@ -568,6 +570,7 @@ pub fn load_drafter(
                     q35_cfg.n_kv_heads,
                     q35_cfg.head_dim,
                     max_kv_seq,
+                    VMode::Q8,
                 )?,
             };
             let compat = tokenizers_compatible(target_tokenizer, &drafter_tokenizer);
@@ -610,6 +613,7 @@ pub fn load_drafter(
             config.n_kv_heads,
             config.head_dim,
             max_kv_seq,
+            VMode::Q8,
         )?,
         DrafterKvMode::Fwht3 => KvCache::new_gpu_fwht3_filtered(
             gpu,
@@ -617,6 +621,7 @@ pub fn load_drafter(
             config.n_kv_heads,
             config.head_dim,
             max_kv_seq,
+            VMode::Q8,
         )?,
         DrafterKvMode::Fwht2 => KvCache::new_gpu_fwht2_filtered(
             gpu,
@@ -624,6 +629,7 @@ pub fn load_drafter(
             config.n_kv_heads,
             config.head_dim,
             max_kv_seq,
+            VMode::Q8,
         )?,
     };
     let compat = tokenizers_compatible(target_tokenizer, &drafter_tokenizer);

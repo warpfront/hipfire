@@ -779,6 +779,14 @@ fn main() {
             .iter()
             .map(|t| *t == qwen35::LayerType::FullAttention)
             .collect();
+        // V allocates at its logical stride up front (no Q8 transient).
+        let v_mode = match args.kv_v.as_str() {
+            "q8" => VMode::Q8,
+            "lloyd2" => VMode::Lloyd2,
+            "lloyd3" => VMode::Lloyd3,
+            "lloyd4" => VMode::Lloyd4,
+            other => panic!("unknown --kv-v: {other}"),
+        };
         let mut kv_cache = match args.kv_mode.as_str() {
             "q8" => KvCache::new_gpu_q8(
                 &mut gpu,
@@ -900,6 +908,7 @@ fn main() {
                 config.n_kv_heads,
                 config.head_dim,
                 kv_max,
+                v_mode,
             )
             .unwrap(),
             "fwht3" => KvCache::new_gpu_fwht3_filtered(
@@ -908,6 +917,7 @@ fn main() {
                 config.n_kv_heads,
                 config.head_dim,
                 kv_max,
+                v_mode,
             )
             .unwrap(),
             "fwht2" => KvCache::new_gpu_fwht2_filtered(
@@ -916,6 +926,7 @@ fn main() {
                 config.n_kv_heads,
                 config.head_dim,
                 kv_max,
+                v_mode,
             )
             .unwrap(),
             "f32" | "f16" => KvCache::new_gpu(
@@ -928,16 +939,6 @@ fn main() {
             .unwrap(),
             other => panic!("unknown --kv-mode: {other}"),
         };
-        let v_mode = match args.kv_v.as_str() {
-            "q8" => VMode::Q8,
-            "lloyd2" => VMode::Lloyd2,
-            "lloyd3" => VMode::Lloyd3,
-            "lloyd4" => VMode::Lloyd4,
-            other => panic!("unknown --kv-v: {other}"),
-        };
-        if v_mode != VMode::Q8 {
-            kv_cache.set_v_mode_realloc(&mut gpu, v_mode).unwrap();
-        }
         let scratch = Qwen35Scratch::new(&mut gpu, &config, 64).unwrap();
         let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
 
