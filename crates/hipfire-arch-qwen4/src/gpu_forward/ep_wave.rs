@@ -9,8 +9,10 @@
 //! layer (peer tables over P2P, host-mapped arenas), no gather, no tile exchange, so its cost is
 //! dominated by streaming the whole layer's expert weights, paid once PER TILE. The wave reads
 //! those weights once for all lanes' rows: ONE sealed MoE call per layer over the concatenated
-//! rows, on the same full-table runtime (`moe_full[layer]`) the singleton chunk binds, while
-//! every other stage runs per lane on the lane's own rows and state.
+//! rows, on the same full-table runtime (`moe_full[layer]`) the singleton chunk binds. The
+//! row-local dense stages (embed, PLE rows, HC read / write, the GDN and QSA in / out
+//! projections) run once over all lanes' rows too (`HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT`, default
+//! on; `0` runs them per lane); the stateful cores always run per lane on the lane's own state.
 //!
 //! # Why the bytes are the lanes' own
 //!
@@ -141,12 +143,61 @@ pub(crate) fn exact_wave_min_lane_rows() -> usize {
 /// larger tile takes the owner-routed tile route alone and keeps its serial tile).
 pub const EXACT_WAVE_MAX_LANE_ROWS: usize = QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP;
 
-/// The wave's stage shares: every stage per lane (each lane's launches are its singleton tile's
-/// by construction), the MoE once over all rows.
+/// Kill switch of the wave's JOINT dense stages (default ON): the row-local dense stages of the
+/// wave (embed, PLE rows, HC read / write, the GDN and QSA in / out projections) run once over
+/// every lane's rows beside the once-over-all-rows MoE; exact `0` restores the incumbent policy
+/// (every stage per lane, MoE once). Byte-identical on the burst oracle (G0a, 8 x 149 rows).
+pub const QWEN4_EP_WAVE_JOINT_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT";
+
+/// [`QWEN4_EP_WAVE_JOINT_ENV`] parsed: on unless exact `0`.
+pub(crate) fn ep_wave_joint_enabled_from(value: Option<&str>) -> bool {
+    value.map(str::trim) != Some("0")
+}
+
+static EP_WAVE_JOINT_KNOB: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    ep_wave_joint_enabled_from(
+        hipfire_config::developer_var(QWEN4_EP_WAVE_JOINT_ENV)
+            .ok()
+            .as_deref(),
+    )
+});
+
+/// Whether the wave's dense stages run jointly in this process (every rank thread agrees).
+pub(crate) fn ep_wave_joint_enabled() -> bool {
+    *EP_WAVE_JOINT_KNOB
+}
+
+/// The wave's stage shares: `joint` (the default) runs every row-local stage once over all lanes'
+/// rows (embed, PLE rows, HC read / write, GDN and QSA in / out projections, the MoE); the
+/// stateful stages stay per lane. Not `joint` is the incumbent: every stage per lane (each
+/// lane's launches are its singleton tile's by construction), the MoE once over all rows.
+pub(crate) fn ep_wave_policy_for(joint: bool) -> LaneStagePolicy {
+    let once = if joint {
+        &[
+            StageName::Embed,
+            StageName::PleRows,
+            StageName::HcRead,
+            StageName::HcWrite,
+            StageName::GdnInProj,
+            StageName::GdnOutProj,
+            StageName::QsaInProj,
+            StageName::QsaOutProj,
+            StageName::Moe,
+        ][..]
+    } else {
+        &[StageName::Moe][..]
+    };
+    once.iter()
+        .fold(LaneStagePolicy::all_per_lane(), |policy, stage| {
+            policy
+                .with(*stage, StageShare::OnceAllRows)
+                .expect("a joint stage does not read request state")
+        })
+}
+
+/// The wave's stage shares in this process ([`QWEN4_EP_WAVE_JOINT_ENV`]).
 pub(crate) fn ep_wave_policy() -> LaneStagePolicy {
-    LaneStagePolicy::all_per_lane()
-        .with(StageName::Moe, StageShare::OnceAllRows)
-        .expect("the MoE is not a stateful stage")
+    ep_wave_policy_for(ep_wave_joint_enabled())
 }
 
 /// The route a wave reproduces: the one every lane's own singleton tile takes.
@@ -1051,18 +1102,68 @@ mod tests {
     }
 
     #[test]
-    fn the_wave_policy_is_per_lane_with_the_moe_once() {
-        let policy = ep_wave_policy();
+    fn the_wave_policy_is_joint_by_default_and_per_lane_with_the_moe_once_when_killed() {
+        let joint = [
+            StageName::Embed,
+            StageName::PleRows,
+            StageName::HcRead,
+            StageName::HcWrite,
+            StageName::GdnInProj,
+            StageName::GdnOutProj,
+            StageName::QsaInProj,
+            StageName::QsaOutProj,
+            StageName::Moe,
+        ];
         for stage in StageName::ALL {
+            // Incumbent (`=0`): only the MoE once.
             let want = if stage == StageName::Moe {
                 StageShare::OnceAllRows
             } else {
                 StageShare::PerLane
             };
-            assert_eq!(policy.share(stage), want, "{}", stage.key());
+            assert_eq!(
+                ep_wave_policy_for(false).share(stage),
+                want,
+                "{}",
+                stage.key()
+            );
+            // Joint (default): the dense row-local stages and the MoE once; the stateful cores,
+            // PLE conv and the tail stages stay per lane.
+            let want = if joint.contains(&stage) {
+                StageShare::OnceAllRows
+            } else {
+                StageShare::PerLane
+            };
+            assert_eq!(
+                ep_wave_policy_for(true).share(stage),
+                want,
+                "{}",
+                stage.key()
+            );
         }
-        assert_eq!(policy.validate(), Ok(()));
+        assert_eq!(ep_wave_policy_for(true).validate(), Ok(()));
+        assert_eq!(ep_wave_policy_for(false).validate(), Ok(()));
         assert_eq!(ep_wave_expected_moe_calls(48), 48);
+    }
+
+    #[test]
+    fn the_joint_wave_has_its_own_kill_switch() {
+        for on in [
+            None,
+            Some(""),
+            Some("1"),
+            Some(" 1 "),
+            Some("true"),
+            Some("2"),
+        ] {
+            assert!(ep_wave_joint_enabled_from(on), "{on:?}");
+        }
+        assert!(!ep_wave_joint_enabled_from(Some("0")));
+        assert!(!ep_wave_joint_enabled_from(Some(" 0\n")));
+        assert_eq!(
+            QWEN4_EP_WAVE_JOINT_ENV,
+            "HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT"
+        );
     }
 
     /// Pins that bind each wave route to its singleton's emission: the FullTable wave binds no

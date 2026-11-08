@@ -81,8 +81,10 @@
 //! per layer over every lane's rows on the singleton's own FULL-TABLE route (the
 //! sub-512-row kernels, selected by capping the routing rows of the call at 511, with
 //! real launch extents), so the layer's expert weights are read once instead of once
-//! per lane tile; every other stage runs per lane on the lane's own rows and state
-//! (its launches are the lane tile's by construction). The caller's policy is replaced
+//! per lane tile; the row-local dense stages (embed, PLE rows, HC, the mixer in / out
+//! projections) run once over all rows too (`HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT`, default
+//! on; `0` runs them per lane, each launch the lane tile's by construction) and the
+//! stateful cores run per lane on the lane's own rows and state. The caller's policy is replaced
 //! by the EP wave policy ([`crate::gpu_forward::ep_wave::ep_wave_policy`]). A lane's
 //! committed state and head are byte-equal to its serial tile because every kernel of
 //! the wave's MoE call (router, shared expert, grouped expert GEMMs, combine) computes
@@ -2338,8 +2340,9 @@ fn forward_wave_with(
 
 /// The exact EP prefill wave ([`crate::gpu_forward::ep_wave`] has the design): the lane
 /// step over prefill lanes with the MoE ONCE per layer over every lane's rows on the
-/// singleton's FULL-TABLE route (sub-512 routing kernels), and every other stage per lane
-/// (the caller's `policy` is replaced by [`ep_wave_policy`]). Admission is decided from host
+/// singleton's FULL-TABLE route (sub-512 routing kernels), the dense row-local stages once over
+/// all rows too unless `HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT=0` (every other stage per lane;
+/// the caller's `policy` is replaced by [`ep_wave_policy`]). Admission is decided from host
 /// facts before any launch, on every rank identically; a refusal is an `ep wave refused:`
 /// error and nothing ran.
 fn forward_wave_ep(
@@ -6131,16 +6134,19 @@ mod tests {
         assert_eq!(production.len(), config.num_hidden_layers * 8 + 1);
     }
 
-    /// The EP prefill wave's program: every stage per lane (each mixer stays the
-    /// singleton's whole op on the lane's own rows) except the MoE, which is the
-    /// only op placed once over all rows, one per layer.
+    /// The EP prefill wave's program, both arms. Incumbent (`HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT=0`):
+    /// every stage per lane (each mixer stays the singleton's whole op on the lane's own rows)
+    /// except the MoE, the only op placed once over all rows, one per layer. Joint (default): the
+    /// mixers split into in-proj / core / out-proj phases (the cores stay per lane), the HC
+    /// stages and projections are placed once over all rows, and still exactly one MoE per layer.
     #[test]
     fn ep_wave_program_places_only_the_moe_once() {
-        use crate::gpu_forward::ep_wave::ep_wave_policy;
+        use crate::gpu_forward::ep_wave::ep_wave_policy_for;
         let config = crate::config::compact_test_config();
         let ple_layer = ple_layer_of(&config);
         let single = Qwen4BandScope::single(&config);
-        let policy = ep_wave_policy();
+        // Incumbent arm.
+        let policy = ep_wave_policy_for(false);
         let program = lane_program(
             band_kinds(&config, single.band.clone()),
             &policy,
@@ -6164,6 +6170,47 @@ mod tests {
         assert_eq!(once, config.num_hidden_layers);
         // Six ops per layer (the mixers stay whole) plus the PLE conv.
         assert_eq!(program.len(), config.num_hidden_layers * 6 + 1);
+
+        // Joint arm.
+        let policy = ep_wave_policy_for(true);
+        let program = lane_program(
+            band_kinds(&config, single.band.clone()),
+            &policy,
+            Some(ple_layer),
+        );
+        let (mut moe, mut hc, mut cores, mut projections) = (0usize, 0usize, 0usize, 0usize);
+        for (op, stage) in &program {
+            let share = policy.share(*stage);
+            match op {
+                LaneOp::Moe { .. } => {
+                    assert_eq!(share, StageShare::OnceAllRows);
+                    moe += 1;
+                }
+                LaneOp::HcRead { .. } | LaneOp::HcWrite { .. } => {
+                    assert_eq!(share, StageShare::OnceAllRows, "{op:?}");
+                    hc += 1;
+                }
+                LaneOp::Gdn { phase, .. } | LaneOp::Qsa { phase, .. } => match phase {
+                    MixerPhase::Whole => panic!("a joint mixer splits: {op:?}"),
+                    MixerPhase::Core => {
+                        assert!(share.per_lane(), "{op:?} runs per lane");
+                        cores += 1;
+                    }
+                    MixerPhase::InProj | MixerPhase::OutProj => {
+                        assert_eq!(share, StageShare::OnceAllRows, "{op:?}");
+                        projections += 1;
+                    }
+                },
+                _ => assert!(share.per_lane(), "{op:?} runs per lane"),
+            }
+        }
+        let layers = config.num_hidden_layers;
+        assert_eq!(moe, layers, "one MoE exchange per layer");
+        assert_eq!(hc, layers * 4);
+        assert_eq!(cores, layers);
+        assert_eq!(projections, layers * 2);
+        // Eight ops per layer (the mixer is three) plus the PLE conv.
+        assert_eq!(program.len(), layers * 8 + 1);
     }
 
     fn band_scopes(config: &crate::config::Qwen4Config, counts: &[usize]) -> Vec<Qwen4BandScope> {
@@ -6599,23 +6646,31 @@ mod tests {
         );
     }
 
-    /// The exact EP prefill wave keeps every HC stage PER LANE (each lane's HC read / write are
-    /// its singleton tile's launches at the lane's own rows and stream kind; under the trunk
-    /// shard each write is its own all-reduce at the lane's row count): the all-rows HC
-    /// placement of an AR / verify step never reaches it, by the step kind AND by the policy.
+    /// The exact EP prefill wave never takes the AR step's all-rows HC placement. Incumbent arm
+    /// (`HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT=0`): every HC stage is PER LANE (each lane's HC read /
+    /// write are its singleton tile's launches at the lane's own rows and stream kind; under the
+    /// trunk shard each write is its own all-reduce at the lane's row count), refused by the step
+    /// kind AND by the policy. Joint arm (default): the HC stages are one segment over every
+    /// lane's rows by the wave's own policy, and that segment is not the AR step's placement:
+    /// `hc_all_rows_applies` stays refused for the wave's step kind.
     #[test]
     fn the_exact_wave_never_takes_the_all_rows_hc_placement() {
-        use crate::gpu_forward::ep_wave::ep_wave_policy;
-        let wave = ep_wave_policy();
-        assert_eq!(wave.share(StageName::HcRead), StageShare::PerLane);
-        assert_eq!(wave.share(StageName::HcWrite), StageShare::PerLane);
-        // Whatever the step kind, flag and row shapes, the wave policy is never admitted ...
-        for ar_step in [false, true] {
-            for groups in [&[8usize, 8][..], &[8, 8, 8, 8], &[5, 5]] {
-                assert!(!hc_all_rows_applies(
-                    true, ar_step, true, false, groups, &wave
-                ));
+        use crate::gpu_forward::ep_wave::ep_wave_policy_for;
+        let incumbent = ep_wave_policy_for(false);
+        assert_eq!(incumbent.share(StageName::HcRead), StageShare::PerLane);
+        assert_eq!(incumbent.share(StageName::HcWrite), StageShare::PerLane);
+        let joint = ep_wave_policy_for(true);
+        assert_eq!(joint.share(StageName::HcRead), StageShare::OnceAllRows);
+        assert_eq!(joint.share(StageName::HcWrite), StageShare::OnceAllRows);
+        for groups in [&[8usize, 8][..], &[8, 8, 8, 8], &[5, 5]] {
+            // The wave is a prefill step, never an AR step, whichever policy it runs.
+            for wave in [&incumbent, &joint] {
+                assert!(!hc_all_rows_applies(true, false, true, false, groups, wave));
             }
+            // Incumbent: refused by the policy even for an AR step's shape.
+            assert!(!hc_all_rows_applies(
+                true, true, true, false, groups, &incumbent
+            ));
         }
     }
 
