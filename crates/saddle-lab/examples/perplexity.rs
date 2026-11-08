@@ -17,7 +17,7 @@
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::KvCache;
+use hipfire_runtime::llama::{KvCache, VMode};
 use std::path::Path;
 use std::time::Instant;
 
@@ -122,6 +122,7 @@ fn main() {
                 config.n_kv_heads,
                 config.head_dim,
                 kv_max,
+                VMode::Q8,
             )
             .unwrap()
         }
@@ -137,6 +138,7 @@ fn main() {
                 config.n_kv_heads,
                 config.head_dim,
                 kv_max,
+                VMode::Q8,
             )
             .unwrap()
         }
@@ -152,6 +154,7 @@ fn main() {
                 config.n_kv_heads,
                 config.head_dim,
                 kv_max,
+                VMode::Q8,
             )
             .unwrap()
         }

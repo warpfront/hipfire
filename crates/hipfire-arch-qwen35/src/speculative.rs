@@ -34,7 +34,7 @@ use hipfire_dispatch::pipeline::batched::{verify_dense_math, DenseBatchMath};
 use hipfire_runtime::checkpoint_pool::{prefix_fingerprint, prefix_fingerprint_chain};
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{self, KvCache};
+use hipfire_runtime::llama::{self, KvCache, VMode};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tokenizer::{Tokenizer, TokenizerError};
 use hipfire_runtime::tp_shard::ShardConfig;
@@ -1069,6 +1069,7 @@ impl ModelSlot {
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
+                VMode::Q8,
             )?,
             KvMode::Fwht3 => KvCache::new_gpu_fwht3_filtered(
                 gpu,
@@ -1076,6 +1077,7 @@ impl ModelSlot {
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
+                VMode::Q8,
             )?,
             KvMode::Fwht2 => KvCache::new_gpu_fwht2_filtered(
                 gpu,
@@ -1083,6 +1085,7 @@ impl ModelSlot {
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
+                VMode::Q8,
             )?,
             KvMode::Fp8 | KvMode::Bf16 => {
                 return Err(hip_bridge::HipError::new(

@@ -105,7 +105,7 @@ use hipfire_arch_qwen35::qwen35::{
 };
 use hipfire_runtime::ep::ensure_rank_streams;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{KvCache, KvCacheExt};
+use hipfire_runtime::llama::{KvCache, KvCacheExt, VMode};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
@@ -358,6 +358,7 @@ fn load_single(path: &str) -> Option<Single> {
         config.head_dim,
         KV_MAX,
         KV_MAX,
+        VMode::Q8,
     )
     .expect("single fwht3 kv");
     let dn =
@@ -756,6 +757,7 @@ fn qwen35_tp2_vs_single_oracle() {
                 configs[rank].head_dim,
                 KV_MAX,
                 KV_MAX,
+                VMode::Q8,
             )
             .unwrap_or_else(|e| panic!("tp kv rank {rank}: {e:?}")),
         );
@@ -1526,6 +1528,7 @@ fn load_ep_mesh(test: &str, path: &str, tp: usize) -> Option<EpMesh> {
                 config.n_kv_heads,
                 config.head_dim,
                 KV_MAX,
+                VMode::Q8,
             )
             .unwrap_or_else(|e| panic!("ep kv rank {r}: {e:?}")),
         );

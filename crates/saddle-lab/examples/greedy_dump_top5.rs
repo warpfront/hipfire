@@ -24,7 +24,7 @@ fn main() {
 fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::llama::{self, KvCache};
+    use hipfire_runtime::llama::{self, KvCache, VMode};
     use std::io::Write;
     use std::path::Path;
 
@@ -138,6 +138,7 @@ fn main() {
                 config.n_kv_heads,
                 config.head_dim,
                 kv_seq,
+                VMode::Q8,
             )
             .unwrap()
         }
@@ -149,6 +150,7 @@ fn main() {
                 config.n_kv_heads,
                 config.head_dim,
                 kv_seq,
+                VMode::Q8,
             )
             .unwrap()
         }
