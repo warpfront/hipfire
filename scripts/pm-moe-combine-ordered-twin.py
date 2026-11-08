@@ -121,7 +121,7 @@ def find_readelf(rocm):
     return Path(found) if found else None
 
 
-def code_object_metadata(readelf, anchor):
+def code_object_metadata(readelf, anchor, tmp):
     """`.max_flat_workgroup_size` per sealed symbol from the anchor's amdhsa note metadata."""
     if readelf is None:
         die("llvm-readelf not found (needed to record max_flat_workgroup_size)")
@@ -130,10 +130,9 @@ def code_object_metadata(readelf, anchor):
     at = blob.find(b"\x7fELF")
     if at < 0:
         die(f"{anchor.name}: no device ELF in the anchor")
-    with tempfile.TemporaryDirectory(prefix="notes-") as d:
-        elf = Path(d) / "device.elf"
-        elf.write_bytes(blob[at:])
-        text = run([str(readelf), "--notes", str(elf)])
+    elf = Path(tmp) / f"{anchor.stem}.elf"
+    elf.write_bytes(blob[at:])
+    text = run([str(readelf), "--notes", str(elf)])
     lines = text.splitlines()
     out = {}
     for sym in SYMBOLS:
@@ -192,13 +191,13 @@ def build_arch(args, root, hipcc, env, arch, tmp, readelf):
         },
         "anchor": {"file": co.name, "bytes": co.stat().st_size, "sha256": sha256_file(co)},
         "hxaco": {"file": hxaco.name, "bytes": hxaco.stat().st_size, "sha256": sha256_file(hxaco)},
-        "code_object_metadata": code_object_metadata(readelf, co),
+        "code_object_metadata": code_object_metadata(readelf, co, tmp),
         "seal": {
             "tool": "peacemaker-isa example hip_twin (Route A: lift, emit::checked, bundle)",
             "reports": reports,
         },
     }
-    # Supplemental receipts (m7 OPEN diagnostic, gpu_oracle) are explicit claims about one exact
+    # Supplemental receipts (ledger/M7 OPEN diagnostics, gpu_oracle) concern one exact
     # hxaco: carried over only when the existing manifest is for the same hxaco and the receipt's
     # own input hash matches, otherwise omitted so a CPU audit fails closed.
     new_sha = doc["hxaco"]["sha256"]
@@ -208,7 +207,7 @@ def build_arch(args, root, hipcc, env, arch, tmp, readelf):
         except ValueError:
             old = {}
         if old.get("hxaco", {}).get("sha256") == new_sha:
-            for key in ("m7", "gpu_oracle"):
+            for key in ("m7", "ledger_cfg", "gpu_oracle"):
                 rec = old.get(key)
                 if isinstance(rec, dict) and rec.get("input_hxaco_sha256") == new_sha:
                     doc[key] = rec

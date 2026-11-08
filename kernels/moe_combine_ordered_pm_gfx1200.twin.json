@@ -35,6 +35,21 @@
     "file": "moe_combine_ordered_pm_gfx1200.hxaco",
     "sha256": "b5d9d86e6caadefad23e7a3e27509dbf674a2181dacc6c331131440bc9b7cf8d"
   },
+  "ledger_cfg": {
+    "body_label": ".LBB28",
+    "diagnostic_log": "release-0.4.5/fusion/runs/twin-f7/twin-ledger.log",
+    "error_class": "path-sensitive state explosion",
+    "hosted_pools": "Not hosted: this ledger pool scan covers gfx1201 only.",
+    "input_hxaco_sha256": "b5d9d86e6caadefad23e7a3e27509dbf674a2181dacc6c331131440bc9b7cf8d",
+    "pins": "Both entries refuse at this exact label; the original LLVM bytes are retained byte-for-byte. This is neither a claimed race nor successful full strict certification.",
+    "state_cap": 512,
+    "status": "OPEN: verifier state cap, not proven",
+    "strict_wait_proof": false,
+    "symbols": [
+      "moe_down_combine_grouped_top10_bf16in_ordered",
+      "moe_down_combine_grouped_top10_bf16in_ordered_zinit"
+    ]
+  },
   "module": "moe_combine_ordered_pm_gfx1200",
   "seal": {
     "reports": [

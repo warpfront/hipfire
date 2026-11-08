@@ -977,6 +977,54 @@ pub const UNSUPPORTED: &[Allow] = &[
         needle: "not convertible: uses a private (scratch) segment",
         why: "UNSUPPORTED INPUT: lift_region refuses the kernel (it uses a private (scratch) segment), so no pool region exists and no pool body was verified; not a verifier finding",
     },
+    Allow {
+        scope: "pins",
+        target: "moe_combine_ordered_hipcc_gfx1200.co#moe_down_combine_grouped_top10_bf16in_ordered",
+        needle: "wait verification: more than 512 distinct in-flight memory states reach label `.LBB28` (path-sensitive state explosion)",
+        why: "UNSUPPORTED INPUT: OPEN: verifier state cap, not proven; the verifier's path-sensitive wait analysis exceeds its 512 in-flight-memory-state cap at `.LBB28` (LLVM-compiled anchor), so the strict wait proof is NOT established for this image; the original LLVM bytes are retained byte-for-byte via Route-A; this is not a claimed race and not a successful full certification",
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_combine_ordered_hipcc_gfx1200.co#moe_down_combine_grouped_top10_bf16in_ordered_zinit",
+        needle: "wait verification: more than 512 distinct in-flight memory states reach label `.LBB28` (path-sensitive state explosion)",
+        why: "UNSUPPORTED INPUT: OPEN: verifier state cap, not proven; the verifier's path-sensitive wait analysis exceeds its 512 in-flight-memory-state cap at `.LBB28` (LLVM-compiled anchor), so the strict wait proof is NOT established for this image; the original LLVM bytes are retained byte-for-byte via Route-A; this is not a claimed race and not a successful full certification",
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_combine_ordered_hipcc_gfx1201.co#moe_down_combine_grouped_top10_bf16in_ordered",
+        needle: "wait verification: more than 512 distinct in-flight memory states reach label `.LBB28` (path-sensitive state explosion)",
+        why: "UNSUPPORTED INPUT: OPEN: verifier state cap, not proven; the verifier's path-sensitive wait analysis exceeds its 512 in-flight-memory-state cap at `.LBB28` (LLVM-compiled anchor), so the strict wait proof is NOT established for this image; the original LLVM bytes are retained byte-for-byte via Route-A; this is not a claimed race and not a successful full certification",
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_combine_ordered_hipcc_gfx1201.co#moe_down_combine_grouped_top10_bf16in_ordered_zinit",
+        needle: "wait verification: more than 512 distinct in-flight memory states reach label `.LBB28` (path-sensitive state explosion)",
+        why: "UNSUPPORTED INPUT: OPEN: verifier state cap, not proven; the verifier's path-sensitive wait analysis exceeds its 512 in-flight-memory-state cap at `.LBB28` (LLVM-compiled anchor), so the strict wait proof is NOT established for this image; the original LLVM bytes are retained byte-for-byte via Route-A; this is not a claimed race and not a successful full certification",
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_combine_ordered_pm_gfx1200.hxaco#moe_down_combine_grouped_top10_bf16in_ordered",
+        needle: "wait verification: more than 512 distinct in-flight memory states reach label `.LBB28` (path-sensitive state explosion)",
+        why: "UNSUPPORTED INPUT: OPEN: verifier state cap, not proven; the verifier's path-sensitive wait analysis exceeds its 512 in-flight-memory-state cap at `.LBB28` (Route-A twin), so the strict wait proof is NOT established for this image; the original LLVM bytes are retained byte-for-byte via Route-A; this is not a claimed race and not a successful full certification",
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_combine_ordered_pm_gfx1200.hxaco#moe_down_combine_grouped_top10_bf16in_ordered_zinit",
+        needle: "wait verification: more than 512 distinct in-flight memory states reach label `.LBB28` (path-sensitive state explosion)",
+        why: "UNSUPPORTED INPUT: OPEN: verifier state cap, not proven; the verifier's path-sensitive wait analysis exceeds its 512 in-flight-memory-state cap at `.LBB28` (Route-A twin), so the strict wait proof is NOT established for this image; the original LLVM bytes are retained byte-for-byte via Route-A; this is not a claimed race and not a successful full certification",
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_combine_ordered_pm_gfx1201.hxaco#moe_down_combine_grouped_top10_bf16in_ordered",
+        needle: "wait verification: more than 512 distinct in-flight memory states reach label `.LBB28` (path-sensitive state explosion)",
+        why: "UNSUPPORTED INPUT: OPEN: verifier state cap, not proven; the verifier's path-sensitive wait analysis exceeds its 512 in-flight-memory-state cap at `.LBB28` (Route-A twin), so the strict wait proof is NOT established for this image; the original LLVM bytes are retained byte-for-byte via Route-A; this is not a claimed race and not a successful full certification",
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_combine_ordered_pm_gfx1201.hxaco#moe_down_combine_grouped_top10_bf16in_ordered_zinit",
+        needle: "wait verification: more than 512 distinct in-flight memory states reach label `.LBB28` (path-sensitive state explosion)",
+        why: "UNSUPPORTED INPUT: OPEN: verifier state cap, not proven; the verifier's path-sensitive wait analysis exceeds its 512 in-flight-memory-state cap at `.LBB28` (Route-A twin), so the strict wait proof is NOT established for this image; the original LLVM bytes are retained byte-for-byte via Route-A; this is not a claimed race and not a successful full certification",
+    },
 ];
 
 /// How the ledger's report on a hosted body is classified; the same two classes as the
@@ -1759,5 +1807,72 @@ pub const POOL_BODY: &[PoolBody] = &[
         category: Category::Candidate,
         insn: "`v_add_f32_e32 v5, v49, v52`",
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+];
+
+/// A hosted-body verifier STATE-CAP refusal inside a pool: `ledger_cfg` stops with
+/// `wait verification: more than 512 distinct in-flight memory states reach label
+/// `.Lt<TID>b_<n>`` (path-sensitive state explosion). OPEN: verifier state cap, not proven.
+/// This is neither a verified body nor a hazard finding, and full strict wait certification
+/// is NOT claimed for these bodies; they are the pool-hosted copies of the standalone
+/// `UNSUPPORTED` `.LBB28` rows of the same template target.
+///
+/// Exact, no wildcard: the pool (`pool_target`, so a finding moving to another pool, single
+/// or multi, is a changed outcome), the hosted template (`template_target`, `file#symbol`;
+/// the current template id is mapped from it at run time, never hardcoded), the canonical
+/// body label (`.LBB<n>`, the standalone spelling of the pool's `.Lt<TID>b_<n>`) and the
+/// whole error text with that template's current id. The named label must lie inside that
+/// template's emitted body span (never the dispatcher, entry or exit).
+pub struct PoolStateCap {
+    pub pool_target: &'static str,
+    pub template_target: &'static str,
+    pub body_label: &'static str,
+    pub error: &'static str,
+    pub why: &'static str,
+}
+
+const CAP_WHY: &str = "OPEN: verifier state cap, not proven: the 512 in-flight-memory-state cap is reached at `.LBB28` of the hosted body, so the strict wait proof is NOT established for it; not a claimed race and not a successful full certification";
+
+/// `{tid}` and `{n}` are replaced by the mapped template id and the label's index (28).
+pub const STATE_CAP_ERROR: &str = "wait verification: more than 512 distinct in-flight memory states reach label `.Lt{tid}b_{n}` (path-sensitive state explosion); wait the counters before the branches that reach it";
+
+/// The five hosted state-cap refusals observed in `ld::pool` strict verification at blockDim
+/// 64: four single-template pools and the multi pool, whose reported template is the last
+/// hosted one.
+pub const POOL_STATE_CAP: &[PoolStateCap] = &[
+    PoolStateCap {
+        pool_target: "pool:b64:moe_combine_ordered_hipcc_gfx1201.co#moe_down_combine_grouped_top10_bf16in_ordered",
+        template_target: "moe_combine_ordered_hipcc_gfx1201.co#moe_down_combine_grouped_top10_bf16in_ordered",
+        body_label: ".LBB28",
+        error: STATE_CAP_ERROR,
+        why: CAP_WHY,
+    },
+    PoolStateCap {
+        pool_target: "pool:b64:moe_combine_ordered_hipcc_gfx1201.co#moe_down_combine_grouped_top10_bf16in_ordered_zinit",
+        template_target: "moe_combine_ordered_hipcc_gfx1201.co#moe_down_combine_grouped_top10_bf16in_ordered_zinit",
+        body_label: ".LBB28",
+        error: STATE_CAP_ERROR,
+        why: CAP_WHY,
+    },
+    PoolStateCap {
+        pool_target: "pool:b64:moe_combine_ordered_pm_gfx1201.hxaco#moe_down_combine_grouped_top10_bf16in_ordered",
+        template_target: "moe_combine_ordered_pm_gfx1201.hxaco#moe_down_combine_grouped_top10_bf16in_ordered",
+        body_label: ".LBB28",
+        error: STATE_CAP_ERROR,
+        why: CAP_WHY,
+    },
+    PoolStateCap {
+        pool_target: "pool:b64:moe_combine_ordered_pm_gfx1201.hxaco#moe_down_combine_grouped_top10_bf16in_ordered_zinit",
+        template_target: "moe_combine_ordered_pm_gfx1201.hxaco#moe_down_combine_grouped_top10_bf16in_ordered_zinit",
+        body_label: ".LBB28",
+        error: STATE_CAP_ERROR,
+        why: CAP_WHY,
+    },
+    PoolStateCap {
+        pool_target: "pool:b64:multi",
+        template_target: "moe_combine_ordered_pm_gfx1201.hxaco#moe_down_combine_grouped_top10_bf16in_ordered_zinit",
+        body_label: ".LBB28",
+        error: STATE_CAP_ERROR,
+        why: CAP_WHY,
     },
 ];

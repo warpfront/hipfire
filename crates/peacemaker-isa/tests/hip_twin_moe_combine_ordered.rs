@@ -385,3 +385,17 @@ fn malformed_artifacts_wrong_arch_and_missing_symbols_are_rejected() {
     assert!("gfx9999".parse::<Arch>().is_err());
     assert!("".parse::<Arch>().is_err());
 }
+
+#[test]
+fn strict_ledger_refusals_are_open_and_image_bound() {
+    for twin in &TWINS {
+        let m = manifest(twin);
+        let ledger = &m["ledger_cfg"];
+        assert_eq!(ledger["input_hxaco_sha256"], hex(twin.hxaco));
+        assert_eq!(ledger["status"], "OPEN: verifier state cap, not proven");
+        assert_eq!(ledger["strict_wait_proof"], false);
+        assert_eq!(ledger["state_cap"], 512);
+        assert_eq!(ledger["body_label"], ".LBB28");
+        assert_eq!(ledger["symbols"], serde_json::json!(SYMBOLS));
+    }
+}
