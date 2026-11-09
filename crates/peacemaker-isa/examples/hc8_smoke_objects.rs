@@ -17,7 +17,11 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 fn main() -> Result<(), String> {
-    let out = PathBuf::from(std::env::args().nth(1).ok_or("usage: hc8_smoke_objects OUTDIR")?);
+    let out = PathBuf::from(
+        std::env::args()
+            .nth(1)
+            .ok_or("usage: hc8_smoke_objects OUTDIR")?,
+    );
     for nt in 1..=3u32 {
         for kind in ["down", "up"] {
             let name = format!("{kind}_n{nt}");

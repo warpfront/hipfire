@@ -409,8 +409,8 @@ fn read_manifest(spec: &str) -> Result<ManifestRun> {
             skipped.push(json!({"id": id, "reason": "dedup", "dedup_of": first}));
             continue;
         }
-        let axes: Value = serde_json::from_str(get(c_axes))
-            .map_err(|e| format!("{path}: {id}: axes: {e}"))?;
+        let axes: Value =
+            serde_json::from_str(get(c_axes)).map_err(|e| format!("{path}: {id}: axes: {e}"))?;
         let obj = dir.join("objects").join(format!("{id}.co"));
         let bytes = std::fs::read(&obj).map_err(|e| format!("{}: {e}", obj.display()))?;
         let got = sha256_hex(&bytes);
@@ -607,7 +607,9 @@ fn gen_data(rng: &mut Rng, v: &Variant, sh: Shape, mode: &Mode) -> HostData {
             }
         }
     }
-    let mut x: Vec<u32> = (0..rows * sh.k).map(|_| bf16_exact(rng.f32() * 3.0)).collect();
+    let mut x: Vec<u32> = (0..rows * sh.k)
+        .map(|_| bf16_exact(rng.f32() * 3.0))
+        .collect();
     if mode.x_edge {
         for r in 0..rows {
             let pool: &[u16] = match r % 4 {
@@ -781,7 +783,10 @@ fn s5_variant(
             modes.push(ModeDev {
                 mode: mi,
                 q: upload(gpu, &h.q)?,
-                s: upload(gpu, &words(&h.s.iter().map(|f| f.to_bits()).collect::<Vec<_>>()))?,
+                s: upload(
+                    gpu,
+                    &words(&h.s.iter().map(|f| f.to_bits()).collect::<Vec<_>>()),
+                )?,
                 x: upload(gpu, &words(&h.x))?,
                 nrm: if v.kind == Kind::Up {
                     Some(upload(gpu, &words(&h.nrm))?)
@@ -816,9 +821,9 @@ fn s5_variant(
                     }
                 } else if MODES[d.mode].name == "rand" && si == 0 && rows == max_rows {
                     let out = &a[GUARD..GUARD + rows * s.sh.out_dim(v.kind) * 4];
-                    let finite = out.chunks(4).all(|w| {
-                        f32::from_le_bytes(w.try_into().unwrap()).is_finite()
-                    });
+                    let finite = out
+                        .chunks(4)
+                        .all(|w| f32::from_le_bytes(w.try_into().unwrap()).is_finite());
                     if out.iter().all(|&q| q == GUARD_BYTE) || !finite {
                         return Err(format!(
                             "{}: shipped rand-mode output at served shape is empty or non-finite",
@@ -830,11 +835,7 @@ fn s5_variant(
                     shape: si,
                     mode: d.mode,
                     rows,
-                    label: format!(
-                        "{} {} rows {rows}",
-                        s.sh.label(v.kind),
-                        MODES[d.mode].name
-                    ),
+                    label: format!("{} {} rows {rows}", s.sh.label(v.kind), MODES[d.mode].name),
                     bytes: a,
                 });
             }
@@ -897,7 +898,10 @@ fn s5_variant(
                     e["by_mode"] = Value::Object(by_mode);
                     e["first_diffs"] = json!(firsts);
                     if mism != 0 {
-                        println!("  {} {}: {mism} mismatching bytes in {failed} cases", v.name, cand.id);
+                        println!(
+                            "  {} {}: {mism} mismatching bytes in {failed} cases",
+                            v.name, cand.id
+                        );
                     }
                     objects_json.push(e);
                 }
@@ -1017,7 +1021,10 @@ fn s6_variant(
     for _ in 0..copies {
         qs.push(upload(gpu, &rand_q(&mut rng, sh.w_rows * sh.k))?);
         let s = rand_s(&mut rng, sh.w_rows);
-        ss.push(upload(gpu, &words(&s.iter().map(|f| f.to_bits()).collect::<Vec<_>>()))?);
+        ss.push(upload(
+            gpu,
+            &words(&s.iter().map(|f| f.to_bits()).collect::<Vec<_>>()),
+        )?);
     }
     let h = gen_data(&mut rng, v, sh, &MODES[0]);
     let x = upload(gpu, &words(&h.x))?;
@@ -1101,9 +1108,12 @@ fn s6_variant(
             for &oi in &timed {
                 let l = objs[oi].1.as_ref().map_err(|e| e.clone())?;
                 obj_arms.push(graph_samples(
-                    gpu, o.reps, o.warm, calls, copies, |g, i| {
-                        launch(g, &l.func, v, sh, &ptrs(i, y_c.ptr()), rows, act)
-                    },
+                    gpu,
+                    o.reps,
+                    o.warm,
+                    calls,
+                    copies,
+                    |g, i| launch(g, &l.func, v, sh, &ptrs(i, y_c.ptr()), rows, act),
                 )?);
                 ref_arms.push(ref_arm(gpu)?);
             }
@@ -1287,8 +1297,10 @@ fn main() {
         if s5 {
             let mut vs = Vec::new();
             for (v, base) in wanted.iter().zip(&baselines) {
-                let runs: Vec<&ManifestRun> =
-                    manifests.iter().filter(|m| m.variant.name == v.name).collect();
+                let runs: Vec<&ManifestRun> = manifests
+                    .iter()
+                    .filter(|m| m.variant.name == v.name)
+                    .collect();
                 let (j, bad) = s5_variant(&mut gpu, v, base, &runs, seed)?;
                 bad_total += bad;
                 vs.push(j);
@@ -1304,8 +1316,10 @@ fn main() {
             };
             let mut vs = Vec::new();
             for (v, base) in wanted.iter().zip(&baselines) {
-                let runs: Vec<&ManifestRun> =
-                    manifests.iter().filter(|m| m.variant.name == v.name).collect();
+                let runs: Vec<&ManifestRun> = manifests
+                    .iter()
+                    .filter(|m| m.variant.name == v.name)
+                    .collect();
                 let (j, bad) = s6_variant(&mut gpu, v, base, &runs, &o)?;
                 bad_total += bad;
                 vs.push(j);
@@ -1319,12 +1333,9 @@ fn main() {
         let pci = gpu.hip.device_pci_bus_id(gpu.device_id).ok();
         let sysfs = |leaf: &str| {
             pci.as_ref().and_then(|p| {
-                std::fs::read_to_string(format!(
-                    "/sys/bus/pci/devices/{}/{leaf}",
-                    p.to_lowercase()
-                ))
-                .ok()
-                .map(|s| s.trim().to_string())
+                std::fs::read_to_string(format!("/sys/bus/pci/devices/{}/{leaf}", p.to_lowercase()))
+                    .ok()
+                    .map(|s| s.trim().to_string())
             })
         };
         let envv = |k: &str| std::env::var(k).ok();
