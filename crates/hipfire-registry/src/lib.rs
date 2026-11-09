@@ -2521,14 +2521,17 @@ mod tests {
         // Through the entry lookup, with the gate on.
         let resolved = ep_expert_hotset_in(&symtrunk_base_entry(), EP_EXPERT_HOTSET_PINS, true)
             .expect("the symtrunk base resolves its ranking");
-        assert_eq!(resolved.sidecar.sha256.as_deref(), Some(units.ranking_sha256));
+        assert_eq!(
+            resolved.sidecar.sha256.as_deref(),
+            Some(units.ranking_sha256)
+        );
         // Both upload together at the release.
         assert!(!resolved.published);
         assert!(!units.published);
         assert!(UNPUBLISHED_PIN_FILES.contains(&ranking.file));
         // The split base's ranking stays published and is not the hot units' ranking.
-        let split = ep_expert_hotset_in(&stock_split_base_entry(), EP_EXPERT_HOTSET_PINS, true)
-            .unwrap();
+        let split =
+            ep_expert_hotset_in(&stock_split_base_entry(), EP_EXPERT_HOTSET_PINS, true).unwrap();
         assert!(split.published);
         assert_ne!(split.sidecar.sha256.as_deref(), Some(units.ranking_sha256));
         // The local calibration copy, when at hand, is the pinned bytes.
