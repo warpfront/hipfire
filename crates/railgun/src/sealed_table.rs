@@ -1018,6 +1018,18 @@ impl SealedTableWitness {
     }
 }
 
+pub mod generation;
+pub use generation::{
+    acquire_window, acquire_window_owned, finish_window, poll_window, return_to_kv, BlockReclaimed,
+    BlockRegistry, BlockUse, Evicting, Expert, FenceBackend, FenceFailure, FenceState,
+    FencedWindow, FillComplete, FillTicket, Filling, FillsNotDone, Free, GenerationClosure,
+    GenerationId, GenerationRetired, Kv, LentBlock, OwnedSlot, OwnedTableGeneration,
+    PeerReaderFence, PendingFills, PendingOrQuarantined, PendingRestore, PendingWindow,
+    QuarantinedWindow, Quiesced, ResidencyError, Resident, ScratchLoan, SlotBank, SlotCell,
+    SlotOrTable, SlotPhaseView, SlotRead, SlotReads, SlotSpan, Staging, TableBacking,
+    WindowReadLease,
+};
+
 #[cfg(test)]
 pub(crate) mod tests;
 

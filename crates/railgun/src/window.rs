@@ -39,6 +39,7 @@ use crate::index_bind::{
 };
 use crate::kernel::{Arg, Expr, ExprError, ImageOverrides, KernelProgram, PatchKind, WordRole};
 use crate::plan::Pm4Plan;
+use crate::sealed_table::generation::{FencedWindow, WindowReadLease};
 use crate::sealed_table::{
     SealedTableError, SealedTableRegistry, SealedTableWitness, TableBindInputs, TableContent,
     TableLease,
@@ -1087,6 +1088,11 @@ pub struct BoundWindow {
     /// The consumed-at-submit sealed-table witness of a plan with
     /// sealed-table nodes, with the registry it was bound against.
     tables: Option<(SealedTableWitness, SealedTableRegistry)>,
+    /// Generation read leases attached by
+    /// [`PreparedWindow::attach_generation_lease`]; moved into the
+    /// [`Submission`] by submit. Dropped unsubmitted = released unused
+    /// (nothing was enqueued through them).
+    leases: AttachedLeases,
     /// A certified exact route for **this** window: the manifest admitted the
     /// plan with this bind's witnesses ([`PreparedWindow::certify_exact`]).
     exact: bool,
@@ -1120,6 +1126,34 @@ pub struct WindowVerifyReceipt {
     pub same_as_hip_graph: bool,
     pub tape_populated: bool,
     pub generation: u64,
+}
+
+/// The generation read leases attached to a [`BoundWindow`]. Unlike a
+/// submitted lease, one dropped before submit was never enqueued: released
+/// unused (no quarantine).
+#[derive(Default)]
+struct AttachedLeases(Vec<WindowReadLease<'static>>);
+
+impl AttachedLeases {
+    fn take(&mut self) -> Vec<WindowReadLease<'static>> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for AttachedLeases {
+    fn drop(&mut self) {
+        for lease in self.0.drain(..) {
+            lease.discard_unused();
+        }
+    }
+}
+
+impl std::fmt::Debug for AttachedLeases {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachedLeases")
+            .field("count", &self.0.len())
+            .finish()
+    }
 }
 
 /// `CompleteWindow` (§2): queue quiescence is proven; the host delta may now
@@ -1160,6 +1194,9 @@ pub struct Submission {
     host_delta: WindowHostDelta,
     sealed: Option<SealedPositions>,
     tables: Option<TableLease>,
+    /// Generation read leases of this window: fenced on a proven completion,
+    /// quarantined on an unknown one, quarantined if the submission is dropped.
+    leases: Vec<WindowReadLease<'static>>,
     /// `Some` for a persistent window: its completion runs the watchdog.
     watchdog: Option<ResolvedWatchdog>,
 }
@@ -1173,7 +1210,43 @@ impl Submission {
     /// (retired, outputs invalid); a [`FailureKind::TornDown`] one always
     /// quarantines the window (its queue is gone) and carries the
     /// quiescence the teardown proved.
-    pub fn complete(mut self) -> Result<CompleteWindow, CompletionFailure> {
+    pub fn complete(self) -> Result<CompleteWindow, CompletionFailure> {
+        // The fenced windows are dropped here, so no `FencedWindow` escapes
+        // (no trust in the queue's quiescence report is extended): a dropped
+        // owned-form window keeps its generation's slot references leaked
+        // (never an early release).
+        self.complete_inner().map(|(complete, _fenced)| complete)
+    }
+
+    /// [`Self::complete`] that also returns the generation read leases as
+    /// [`FencedWindow`]s (a proven completion is what fences them). A failure
+    /// with [`Quiescence::Proven`] fences them too, but only the failure is
+    /// returned (they are dropped: the generations stay leaked, never
+    /// released early); with [`Quiescence::Unknown`] they are quarantined.
+    /// `Quiescence::Proven` and [`CompleteWindow`] are ordinary values: no
+    /// generation API accepts either as a permit.
+    ///
+    /// This is the third trust root of the generation API (after the
+    /// `unsafe` traits `FenceBackend` and `PeerReaderFence`): the returned
+    /// [`FencedWindow`]s are minted from the safe [`WindowQueue`]'s report.
+    ///
+    /// # Safety
+    ///
+    /// The window's [`WindowQueue`] must honour the quiescence contract: its
+    /// `wait` (or the watchdog's) returns `Ok(())`, or a failure with
+    /// [`Quiescence::Proven`], only once **every** dispatch it enqueued for
+    /// this submission has finished executing on the device (no kernel of the
+    /// window can still read the leased generations' tables or slots). A
+    /// queue that reports completion early lets the caller retire and reclaim
+    /// slots a running kernel still reads.
+    pub unsafe fn complete_fenced(
+        self,
+    ) -> Result<(CompleteWindow, Vec<FencedWindow>), CompletionFailure> {
+        self.complete_inner()
+    }
+
+    fn complete_inner(mut self) -> Result<(CompleteWindow, Vec<FencedWindow>), CompletionFailure> {
+        let leases = std::mem::take(&mut self.leases);
         let mut shared = lock(&self.shared);
         let waited = match &self.watchdog {
             Some(w) => run_watchdog(&mut *shared.queue, w),
@@ -1188,16 +1261,23 @@ impl Submission {
                 if let Some(l) = self.tables.take() {
                     l.release(Quiescence::Proven);
                 }
-                Ok(CompleteWindow {
-                    generation: self.generation,
-                    execution: self.execution,
-                    receipt: WindowVerifyReceipt {
-                        same_as_hip_graph: self.receipt_hip,
-                        tape_populated: self.receipt_tape,
+                let fenced: Vec<FencedWindow> = leases
+                    .into_iter()
+                    .map(WindowReadLease::into_fenced)
+                    .collect();
+                Ok((
+                    CompleteWindow {
                         generation: self.generation,
+                        execution: self.execution,
+                        receipt: WindowVerifyReceipt {
+                            same_as_hip_graph: self.receipt_hip,
+                            tape_populated: self.receipt_tape,
+                            generation: self.generation,
+                        },
+                        host_delta: self.host_delta,
                     },
-                    host_delta: self.host_delta,
-                })
+                    fenced,
+                ))
             }
             Err(f) => {
                 shared.phase = match (f.kind, f.quiescence) {
@@ -1210,6 +1290,16 @@ impl Submission {
                 }
                 if let Some(l) = self.tables.take() {
                     l.release(f.quiescence);
+                }
+                match f.quiescence {
+                    Quiescence::Proven => drop(
+                        leases
+                            .into_iter()
+                            .map(WindowReadLease::into_fenced)
+                            .collect::<Vec<_>>(),
+                    ),
+                    // Dropped unfinished leases quarantine their generations.
+                    Quiescence::Unknown => drop(leases),
                 }
                 Err(CompletionFailure {
                     generation: self.generation,
@@ -1647,6 +1737,7 @@ impl PreparedWindow {
             host_delta,
             indexed: None,
             tables: None,
+            leases: AttachedLeases::default(),
             exact: false,
         })
     }
@@ -1740,6 +1831,33 @@ impl PreparedWindow {
         Ok(())
     }
 
+    /// Attach a read lease on a published table generation to this bound
+    /// window ([`crate::sealed_table::generation::acquire_window_owned`]).
+    /// The lease travels with the [`Submission`]: a proven completion fences
+    /// it ([`Submission::complete_fenced`]), an unknown one quarantines the
+    /// generation, dropping the submission quarantines it. A stale `bound` is
+    /// refused and the lease is released unused (an owned generation is then
+    /// kept alive and leaked, never released early). This adds no witness and
+    /// widens no certification: it is not consulted by `submit`'s checks.
+    pub fn attach_generation_lease(
+        &self,
+        bound: &mut BoundWindow,
+        lease: WindowReadLease<'static>,
+    ) -> Result<(), Refusal> {
+        {
+            let shared = lock(&self.shared);
+            if bound.prepared != self.id
+                || bound.epoch != shared.epoch
+                || shared.phase != Phase::Bound
+            {
+                lease.discard_unused();
+                return Err(Refusal::StaleBound);
+            }
+        }
+        bound.leases.0.push(lease);
+        Ok(())
+    }
+
     /// Record that the window manifest admitted this plan **together with
     /// this bind's witnesses** (a plan with conditional nodes is not
     /// certified exact by its plan alone). The owner calls it after
@@ -1799,7 +1917,7 @@ impl PreparedWindow {
         self.submit_with(bound, true)
     }
 
-    fn submit_with(&mut self, bound: BoundWindow, nowait: bool) -> Result<Submission, Refusal> {
+    fn submit_with(&mut self, mut bound: BoundWindow, nowait: bool) -> Result<Submission, Refusal> {
         let mut shared = lock(&self.shared);
         if bound.prepared != self.id || bound.epoch != shared.epoch {
             return Err(Refusal::StaleBound);
@@ -1893,6 +2011,10 @@ impl PreparedWindow {
                 grid: *grid,
             })
             .collect();
+        // Every refusal above returned before the queue was touched: the
+        // attached leases were released unused with `bound`. From here the
+        // queue may run the window, so they travel with its completion.
+        let leases = bound.leases.take();
         // A persistent window never uses the queue's blocking `submit`: that
         // would wait under the queue's own global timeout, outside the
         // watchdog. Its completion lease is `Submission::complete`.
@@ -1914,6 +2036,7 @@ impl PreparedWindow {
                     host_delta: bound.host_delta,
                     sealed,
                     tables: lease,
+                    leases,
                     watchdog: self.watchdog,
                 })
             }
@@ -1927,6 +2050,19 @@ impl PreparedWindow {
                 }
                 if let Some(l) = lease {
                     l.release(f.quiescence);
+                }
+                // Fenced on a Proven report, but dropped here: no
+                // `FencedWindow` escapes this path (the generations stay
+                // leaked, never released early).
+                match f.quiescence {
+                    Quiescence::Proven => drop(
+                        leases
+                            .into_iter()
+                            .map(WindowReadLease::into_fenced)
+                            .collect::<Vec<_>>(),
+                    ),
+                    // Dropped unfinished leases quarantine their generations.
+                    Quiescence::Unknown => drop(leases),
                 }
                 Err(Refusal::SubmitFailed {
                     message: f.message,
@@ -2671,6 +2807,206 @@ mod tests {
         assert_eq!(log_b.lock().unwrap().submits, 0);
     }
 
+    // ------------------------------------------- generation lease hookup
+
+    mod lease {
+        use super::*;
+        use crate::sealed_table::generation::{
+            acquire_window_owned, BlockRegistry, Expert, FenceBackend, FenceFailure, FenceState,
+            GenerationId, OwnedTableGeneration, SlotBank, SlotSpan,
+        };
+
+        struct Ready(u64);
+        // SAFETY: nothing is ever enqueued on this CPU stream, so every fence is complete.
+        unsafe impl FenceBackend for Ready {
+            fn incarnation(&self) -> u64 {
+                1
+            }
+            fn record(&mut self) -> Result<u64, FenceFailure> {
+                self.0 += 1;
+                Ok(self.0)
+            }
+            fn poll(&mut self, _: u64) -> FenceState {
+                FenceState::Complete
+            }
+            fn wait(&mut self, _: u64) -> FenceState {
+                FenceState::Complete
+            }
+        }
+
+        /// A bank with one resident slot named by one sealed generation, and
+        /// a probe of the generation's quarantine flag that outlives it.
+        fn generation() -> (SlotBank, OwnedTableGeneration, impl Fn() -> bool) {
+            let mut dev = Ready(0);
+            let reg = BlockRegistry::new(0);
+            let block = reg.adopt::<Expert>(0x10_0000, 256, 1).unwrap();
+            let (mut bank, mut free) = SlotBank::new(
+                block,
+                vec![vec![SlotSpan {
+                    offset: 0,
+                    bytes: 256,
+                }]],
+                false,
+            )
+            .map_err(|(_, e)| e)
+            .unwrap();
+            let backing = bank
+                .register_table_backing(vec![Binding {
+                    base: 0x20_0000,
+                    bytes: 64,
+                }])
+                .unwrap();
+            let mut staging = bank.staging();
+            let (s, t) = bank
+                .start_fill(free.pop().unwrap(), 1)
+                .map_err(|(_, e)| e)
+                .unwrap();
+            let p = bank
+                .issue_fills(vec![t], &mut dev, &mut |_| Ok(()))
+                .unwrap();
+            let mut done = bank.complete_fills(p, &mut dev, true).ok().unwrap();
+            let s = bank
+                .finish_fill(s, done.pop().unwrap())
+                .map_err(|(_, _, e)| e)
+                .unwrap();
+            bank.publish(&mut staging, &s).unwrap();
+            let g = bank
+                .seal(&staging, backing, GenerationId { epoch: 0, sub: 0 })
+                .map_err(|(_, e)| e)
+                .unwrap();
+            std::mem::forget(s);
+            let probe = g.quarantine_probe();
+            (bank, g, probe)
+        }
+
+        fn owned(
+            g: OwnedTableGeneration,
+        ) -> crate::sealed_table::generation::WindowReadLease<'static> {
+            acquire_window_owned(g).map_err(|(_, e)| e).unwrap()
+        }
+
+        #[test]
+        fn proven_completion_fences_the_leases_and_complete_fenced_returns_them() {
+            let (mut bank, g, _) = generation();
+            let id = g.id();
+            let (mut w, log) = prepared();
+            let mut bound = w.bind(&shape(300, 1), &bindings(), &inputs()).unwrap();
+            w.attach_generation_lease(&mut bound, owned(g)).unwrap();
+            let sub = w.submit(bound).unwrap();
+            // SAFETY: the test queue reports completion only after its
+            // (synchronous, host-side) dispatches ran.
+            let (done, fenced) = unsafe { sub.complete_fenced() }.unwrap();
+            assert_eq!(done.generation, 1);
+            assert_eq!(log.lock().unwrap().waits, 1);
+            assert_eq!(fenced.len(), 1);
+            assert_eq!(fenced[0].generation(), id);
+            let g = fenced
+                .into_iter()
+                .next()
+                .unwrap()
+                .into_generation()
+                .unwrap();
+            // the Proven completion is NOT a retire permit: the owner still retires through the bank
+            assert_eq!(bank.refs(0), 1);
+            bank.retire(g, None).map_err(|(_, e)| e).unwrap();
+            assert_eq!(bank.refs(0), 0);
+        }
+
+        #[test]
+        fn plain_complete_keeps_the_generation_alive_and_never_releases_it() {
+            let (bank, g, quarantined) = generation();
+            let (mut w, _log) = prepared();
+            let mut bound = w.bind(&shape(300, 1), &bindings(), &inputs()).unwrap();
+            w.attach_generation_lease(&mut bound, owned(g)).unwrap();
+            w.submit(bound).unwrap().complete().unwrap();
+            // the fenced window was dropped: the references leak (capacity), never release early
+            assert_eq!(bank.refs(0), 1);
+            assert_eq!(bank.live_generations(), 1);
+            assert!(!quarantined());
+        }
+
+        #[test]
+        fn unknown_completion_quarantines_the_generation() {
+            let (_bank, g, quarantined) = generation();
+            let (mut w, log) = prepared();
+            let mut bound = w.bind(&shape(300, 1), &bindings(), &inputs()).unwrap();
+            w.attach_generation_lease(&mut bound, owned(g)).unwrap();
+            log.lock().unwrap().wait_failure = Some(Quiescence::Unknown);
+            let sub = w.submit(bound).unwrap();
+            // SAFETY: the test queue runs nothing on a device.
+            let f = unsafe { sub.complete_fenced() }.unwrap_err();
+            assert_eq!(f.quiescence, Quiescence::Unknown);
+            assert!(quarantined());
+        }
+
+        #[test]
+        fn proven_failure_fences_without_quarantine() {
+            let (_bank, g, quarantined) = generation();
+            let (mut w, log) = prepared();
+            let mut bound = w.bind(&shape(300, 1), &bindings(), &inputs()).unwrap();
+            w.attach_generation_lease(&mut bound, owned(g)).unwrap();
+            log.lock().unwrap().wait_failure = Some(Quiescence::Proven);
+            let sub = w.submit(bound).unwrap();
+            // SAFETY: the test queue runs nothing on a device.
+            let f = unsafe { sub.complete_fenced() }.unwrap_err();
+            assert_eq!(f.quiescence, Quiescence::Proven);
+            assert!(!quarantined());
+        }
+
+        #[test]
+        fn dropping_the_submission_quarantines_the_generation() {
+            let (_bank, g, quarantined) = generation();
+            let (mut w, _log) = prepared();
+            let mut bound = w.bind(&shape(300, 1), &bindings(), &inputs()).unwrap();
+            w.attach_generation_lease(&mut bound, owned(g)).unwrap();
+            let sub = w.submit(bound).unwrap();
+            assert!(!quarantined());
+            drop(sub);
+            assert!(quarantined());
+        }
+
+        #[test]
+        fn submit_failures_follow_the_existing_quiescence_semantics() {
+            for (q, expect) in [(Quiescence::Proven, false), (Quiescence::Unknown, true)] {
+                let (_bank, g, quarantined) = generation();
+                let (mut w, log) = prepared();
+                let mut bound = w.bind(&shape(300, 1), &bindings(), &inputs()).unwrap();
+                w.attach_generation_lease(&mut bound, owned(g)).unwrap();
+                log.lock().unwrap().submit_failure = Some(q);
+                let e = w.submit(bound).err().unwrap();
+                assert!(matches!(e, Refusal::SubmitFailed { quiescence, .. } if quiescence == q));
+                assert_eq!(quarantined(), expect, "{q:?}");
+            }
+        }
+
+        #[test]
+        fn leases_that_never_reached_the_queue_are_released_unused() {
+            let (_bank, g, quarantined) = generation();
+            let (mut w, log) = prepared();
+            // refused before the queue: a superseded bound window
+            let mut first = w.bind(&shape(300, 6), &bindings(), &inputs()).unwrap();
+            w.attach_generation_lease(&mut first, owned(g)).unwrap();
+            let mut second = w.bind(&shape(300, 7), &bindings(), &inputs()).unwrap();
+            assert_eq!(w.submit(first).err(), Some(Refusal::StaleBound));
+            assert!(!quarantined());
+            // attaching to a stale bound window is refused, the lease released unused
+            let (_bank2, g2, quarantined2) = generation();
+            let _third = w.bind(&shape(300, 8), &bindings(), &inputs()).unwrap();
+            assert_eq!(
+                w.attach_generation_lease(&mut second, owned(g2)),
+                Err(Refusal::StaleBound)
+            );
+            assert!(!quarantined2());
+            // a bound window dropped unsubmitted
+            let (_bank3, g3, quarantined3) = generation();
+            let mut fresh = w.bind(&shape(300, 9), &bindings(), &inputs()).unwrap();
+            w.attach_generation_lease(&mut fresh, owned(g3)).unwrap();
+            drop(fresh);
+            assert!(!quarantined3());
+            assert_eq!(log.lock().unwrap().submits, 0);
+        }
+    }
+
     #[test]
     fn patching_an_in_flight_window_is_refused() {
         let (mut w, log) = prepared();
@@ -2802,6 +3138,7 @@ mod tests {
             host_delta: bound.host_delta,
             indexed: None,
             tables: None,
+            leases: AttachedLeases::default(),
             exact: false,
         };
         let (second_nowait, second_blocking) = (forge(2), forge(3));
