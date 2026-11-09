@@ -50,6 +50,8 @@ pub use expert_keep::{ExpertKeep, EXPERT_KEEP_METADATA_KEY, EXPERT_KEEP_SCHEMA};
 pub mod expert_arena;
 /// Per-expert VRAM/host unit planner of an EP rank (D1: static hot set).
 pub mod expert_ep_units;
+/// `<model>.ep.hot-units` sidecar of the Flash-Next EP2 hot-unit loan (calibrated host-read counts).
+pub mod expert_hot_units;
 /// Lever1 expert hotset sidecar parser and `HIPFIRE_QWEN4_EXPERT_HOTSET` policy.
 pub mod expert_hotset;
 pub mod expert_residency;

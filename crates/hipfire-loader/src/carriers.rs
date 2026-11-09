@@ -3575,6 +3575,10 @@ pub fn qwen4_ep_vram_layers(
             // rank's budget before the ranking walk, exactly where the forward
             // builds the stage (one shared predicate).
             let stage_on = hipfire_arch_qwen4::expert_ep_units::ep_unit_stage_on(&gpu.arch);
+            // The hot-unit loan (`HIPFIRE_EP_HOT_UNITS`, `HIPFIRE_EP_HOT_LOAN_MIB`): resolved once
+            // here and applied inside `qwen4_ep_unit_plan` after the staged walk. `None` (no
+            // sidecar next to the model, or a kill switch) is today's placement exactly.
+            let hot_loan = qwen4_ep_hot_loan(src, ranks, &gpu.arch)?;
             // `HIPFIRE_EP_UNIT_RESERVE=1` with a decoupled reserve plan: the units are
             // budgeted against the decoupled census and whole-resident donor layers
             // replace the plan's suffix donors.
@@ -3630,6 +3634,7 @@ pub fn qwen4_ep_vram_layers(
                                 host: &attempt.host,
                                 planar: attempt.planar,
                                 stage_borrow,
+                                loan: hot_loan.as_ref(),
                                 shadow_bytes: &shadow_bytes,
                                 reserve_no_shadows: attempt.decoupled_reserve_no_shadows,
                             })
@@ -3714,6 +3719,7 @@ pub fn qwen4_ep_vram_layers(
                         stage_on,
                         &[],
                         false,
+                        hot_loan.as_ref(),
                     )?
                 }
             };
@@ -4091,6 +4097,7 @@ fn qwen4_ep_unit_plan(
     stage_on: bool,
     forced_layers: &[usize],
     stage_borrow: bool,
+    loan: Option<&Qwen4EpHotLoan>,
 ) -> Result<hipfire_arch_qwen4::expert_ep_units::EpUnitStagedPlan, String> {
     use hipfire_arch_qwen4::expert_ep_units as units;
     let flag = units::EP_EXPERT_HOTSET_ENV;
@@ -4137,25 +4144,209 @@ fn qwen4_ep_unit_plan(
         units::ep_unit_rank_budgets(free_per_rank, non_expert, reserve_total),
         budget_delta_mib,
     );
-    if stage_borrow {
+    let mut staged = if stage_borrow {
         // `forced_layers` are the scratch donors; the planner forces the two lent stage layers.
-        return units::place_routed_experts_units_borrowed_staged(
+        units::place_routed_experts_units_borrowed_staged(
             &geometry,
             ranking,
             &budgets,
             forced_layers,
             stage_on,
         )
-        .map_err(|error| format!("qwen4: {flag}: {error}"));
+        .map_err(|error| format!("qwen4: {flag}: {error}"))?
+    } else {
+        units::place_routed_experts_units_forced_staged(
+            &geometry,
+            ranking,
+            &budgets,
+            forced_layers,
+            stage_on,
+        )
+        .map_err(|error| format!("qwen4: {flag}: {error}"))?
+    };
+    if let Some(loan) = loan {
+        qwen4_ep_apply_hot_loan(&mut staged, base, loan, sidecar.sha256(), reserve_total)?;
     }
-    units::place_routed_experts_units_forced_staged(
-        &geometry,
-        ranking,
-        &budgets,
-        forced_layers,
-        stage_on,
+    Ok(staged)
+}
+
+/// The hot-unit loan of a Flash-Next EP2 load: `<model>.ep.hot-units` lends the reserve census up
+/// to `loan_bytes` per rank to the hottest calibrated host-demand units
+/// ([`hipfire_arch_qwen4::expert_ep_units::ep_unit_apply_hot_loan`]).
+#[derive(Clone, Debug)]
+struct Qwen4EpHotLoan {
+    /// The sidecar.
+    path: std::path::PathBuf,
+    /// `HIPFIRE_EP_HOT_UNITS` named the path: a sidecar that does not apply is a load error.
+    /// Otherwise (discovered) it is skipped with one log line.
+    explicit: bool,
+    /// Bytes per rank to lend (the requested size, clamped to the measured cap).
+    loan_bytes: u64,
+    /// The measured safe per-rank loan
+    /// ([`hipfire_arch_qwen4::expert_residency::QWEN4_EP2_HOT_LOAN_GFX1201_BYTES`]).
+    cap_bytes: u64,
+}
+
+/// Resolve the hot-unit loan of this load: `Ok(None)` is no loan, with today's placement exactly
+/// (and, bar one `is_file` probe, no work). `HIPFIRE_EP_HOT_UNITS` (unset discovers
+/// `<model>.ep.hot-units`, absent is silent; `0` off; an absolute path is explicit) and
+/// `HIPFIRE_EP_HOT_LOAN_MIB` (unset the measured cap; `0` off; positive MiB clamped to the cap;
+/// non-integer is an error) are read once, here. A present or explicit sidecar on a load that
+/// does not admit the loan (not exact gfx1201, not two ranks, `HIPFIRE_EP_RESERVE_CENSUS=0`, no
+/// D2 tail) logs one `declined` line. The sidecar itself is validated where the plan is
+/// ([`qwen4_ep_apply_hot_loan`]): the geometry, the base and the ranking are known only there.
+fn qwen4_ep_hot_loan(
+    src: &ModelSource,
+    ranks: usize,
+    gpu_arch: &str,
+) -> Result<Option<Qwen4EpHotLoan>, String> {
+    use hipfire_arch_qwen4::expert_ep_units as units;
+    use hipfire_config::memory::{EpHotLoanMib, EpHotUnits};
+    let (path, explicit) =
+        match hipfire_config::memory::ep_hot_units().map_err(|error| format!("qwen4: {error}"))? {
+            EpHotUnits::Off => return Ok(None),
+            EpHotUnits::Explicit(path) => (path, true),
+            EpHotUnits::Discover => match src {
+                ModelSource::Hfq(hfq) => {
+                    let path = hipfire_config::memory::ep_hot_units_sidecar_path(hfq.path());
+                    if !path.is_file() {
+                        return Ok(None);
+                    }
+                    (path, false)
+                }
+                ModelSource::Dir(_) => return Ok(None),
+            },
+        };
+    let requested =
+        hipfire_config::memory::ep_hot_loan_mib().map_err(|error| format!("qwen4: {error}"))?;
+    if requested == EpHotLoanMib::Off {
+        return Ok(None);
+    }
+    let tail_on = hipfire_arch_qwen4::expert_unit_tail::resolve_ep_unit_tail(
+        hipfire_config::developer_var(hipfire_arch_qwen4::expert_unit_tail::EP_UNIT_TAIL_ENV)
+            .ok()
+            .as_deref(),
     )
-    .map_err(|error| format!("qwen4: {flag}: {error}"))
+    .map_err(|error| format!("qwen4: {error}"))?
+    .is_some();
+    let declined = if gpu_arch != units::EP_UNITS_DISCOVERY_ARCH {
+        Some(format!(
+            "gpu is {gpu_arch}; the loan was measured on {} only",
+            units::EP_UNITS_DISCOVERY_ARCH
+        ))
+    } else if ranks != units::EP_UNITS_DISCOVERY_RANKS {
+        Some(format!(
+            "topology.ep is {ranks}; the loan is built for ep = {}",
+            units::EP_UNITS_DISCOVERY_RANKS
+        ))
+    } else if !hipfire_config::memory::ep_reserve_census() {
+        Some("HIPFIRE_EP_RESERVE_CENSUS=0: the loan is funded from the reserve census".to_string())
+    } else if !tail_on {
+        Some(format!(
+            "the D2 tail is off ({}): the loan is sized against it",
+            hipfire_arch_qwen4::expert_unit_tail::EP_UNIT_TAIL_ENV
+        ))
+    } else {
+        None
+    };
+    if let Some(why) = declined {
+        eprintln!(
+            "qwen4 EP hot-unit loan: {} present, declined ({why})",
+            path.display()
+        );
+        return Ok(None);
+    }
+    let cap_bytes = hipfire_arch_qwen4::expert_residency::QWEN4_EP2_HOT_LOAN_GFX1201_BYTES;
+    let loan_bytes = match requested {
+        EpHotLoanMib::Mib(mib) if mib.saturating_mul(1 << 20) < cap_bytes => mib << 20,
+        EpHotLoanMib::Mib(mib) => {
+            if mib.saturating_mul(1 << 20) > cap_bytes {
+                eprintln!(
+                    "qwen4 EP hot-unit loan: {}={mib} clamped to the measured safe loan ({} MiB)",
+                    hipfire_config::memory::EP_HOT_LOAN_MIB_ENV,
+                    cap_bytes >> 20
+                );
+            }
+            cap_bytes
+        }
+        EpHotLoanMib::Measured | EpHotLoanMib::Off => cap_bytes,
+    };
+    Ok(Some(Qwen4EpHotLoan {
+        path,
+        explicit,
+        loan_bytes,
+        cap_bytes,
+    }))
+}
+
+/// Load `loan`'s sidecar against this plan (geometry, base artifact, walked ranking) and keep its
+/// hottest owned host-demand units resident on top of `staged`
+/// ([`hipfire_arch_qwen4::expert_ep_units::ep_unit_apply_hot_loan`]), funded from the reserve
+/// census (`reserve_total` bytes held back per rank). A discovered sidecar that does not bind is
+/// skipped with one line; an explicit one is a load error. A loan above what the census reserves
+/// is refused with one line and the plan stays as the ordinary walk left it.
+fn qwen4_ep_apply_hot_loan(
+    staged: &mut hipfire_arch_qwen4::expert_ep_units::EpUnitStagedPlan,
+    base: &hipfire_arch_qwen4::expert_hotset::HotsetBase,
+    loan: &Qwen4EpHotLoan,
+    ranking_sha256: &str,
+    reserve_total: u64,
+) -> Result<(), String> {
+    use hipfire_arch_qwen4::expert_ep_units as units;
+    use hipfire_arch_qwen4::expert_hot_units as hot;
+    let geometry = *staged.plan.geometry();
+    let binding = hot::HotUnitsBinding {
+        geometry: &geometry,
+        base,
+        ranking_sha256,
+    };
+    let sidecar = match hot::HotUnitsSidecar::load(&loan.path, &binding) {
+        Ok(sidecar) => sidecar,
+        Err(why) if loan.explicit => {
+            return Err(format!(
+                "qwen4: {}={}: {why}",
+                hipfire_config::memory::EP_HOT_UNITS_ENV,
+                loan.path.display()
+            ))
+        }
+        Err(why) => {
+            eprintln!(
+                "qwen4 EP hot-unit loan: {} present, not applied ({why})",
+                loan.path.display()
+            );
+            return Ok(());
+        }
+    };
+    let mut loaned = staged.plan.clone();
+    let added = units::ep_unit_apply_hot_loan(&mut loaned, sidecar.counts(), loan.loan_bytes);
+    let over = added
+        .iter()
+        .enumerate()
+        .find_map(|(rank, &(_, bytes))| (bytes > reserve_total).then_some((rank, bytes)));
+    if let Some((rank, bytes)) = over {
+        eprintln!(
+            "qwen4 EP hot-unit loan: {} not applied (rank {rank} would lend {} MiB, the reserve census holds {} MiB)",
+            loan.path.display(),
+            bytes >> 20,
+            reserve_total >> 20
+        );
+        return Ok(());
+    }
+    for (rank, &(count, bytes)) in added.iter().enumerate() {
+        eprintln!(
+            "qwen4 EP hot-unit loan: rank {rank} +{count} units +{} MiB lent from the reserve census \
+             (reserve {} MiB -> {} MiB; cap {} MiB; {}; {}=0 or {}=0 turns it off)",
+            bytes >> 20,
+            reserve_total >> 20,
+            (reserve_total - bytes) >> 20,
+            loan.cap_bytes >> 20,
+            loan.path.display(),
+            hipfire_config::memory::EP_HOT_LOAN_MIB_ENV,
+            hipfire_config::memory::EP_HOT_UNITS_ENV
+        );
+    }
+    staged.plan = loaned;
+    Ok(())
 }
 
 /// What [`qwen4_ep_units_donor_plan`] reads.
@@ -4180,6 +4371,9 @@ struct Qwen4EpUnitsDonorInputs<'a> {
     /// ([`hipfire_arch_qwen4::expert_ep_units::EP_UNIT_STAGE_BORROW_LAYERS`]) instead of two
     /// dedicated buffers; the scratch donors never include them.
     stage_borrow: bool,
+    /// The resolved hot-unit loan ([`qwen4_ep_hot_loan`]), applied to the plan the load keeps
+    /// (never to the unforced plan that ranks the donor layers). `None`: no loan.
+    loan: Option<&'a Qwen4EpHotLoan>,
     /// The weight-shadow members (`decode_share_shadows::plan_shadow_region(..).spans()` order,
     /// bytes each) the donor segments host beside the scratch roots
     /// ([`qwen4_ep_shadow_member_bytes`]). Empty: no shadow applies on this arch/config and the
@@ -4230,7 +4424,9 @@ fn qwen4_ep_units_donor_plan(
         .ok_or("the decoupled reserve plus the lane store overflows")?;
     let geometry = ep::EpRankGeometry::flash_next_layout(input.config, input.ranks, input.planar)
         .ok_or("the rank geometry overflows")?;
-    let plan_with = |forced: &[usize], borrow: bool| {
+    // The hot-unit loan applies only to the plan the load keeps; the unforced plan above ranks
+    // the donor layers by the ordinary placement.
+    let plan_with = |forced: &[usize], borrow: bool, loan: Option<&Qwen4EpHotLoan>| {
         qwen4_ep_unit_plan(
             input.path,
             input.base,
@@ -4243,11 +4439,12 @@ fn qwen4_ep_units_donor_plan(
             input.stage_on,
             forced,
             borrow,
+            loan,
         )
     };
     // The unforced plan (dedicated stage) ranks the layers; the donor count is the shortest
     // prefix of that preference order whose whole layers pack the reserve's remaining roots.
-    let unforced = plan_with(&[], false)?;
+    let unforced = plan_with(&[], false, None)?;
     let lent = if input.stage_borrow {
         hipfire_arch_qwen4::expert_ep_units::EP_UNIT_STAGE_BORROW_LAYERS.to_vec()
     } else {
@@ -4281,7 +4478,7 @@ fn qwen4_ep_units_donor_plan(
     )
     .map_err(|refusal| format!("qwen4: {refusal}"))?;
     let forced: Vec<usize> = candidates[..probe.donor_layers.len()].to_vec();
-    let staged = plan_with(&forced, input.stage_borrow)?;
+    let staged = plan_with(&forced, input.stage_borrow, input.loan)?;
     for rank in 0..input.ranks {
         let resident = staged.plan.whole_resident_layers(rank);
         if let Some(layer) = forced.iter().find(|layer| !resident.contains(layer)) {
@@ -18261,6 +18458,7 @@ mod ep_unit_plan_tests {
             true,
             &[],
             false,
+            None,
         )
         .unwrap_err();
         assert!(

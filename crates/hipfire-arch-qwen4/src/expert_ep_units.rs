@@ -692,6 +692,72 @@ pub fn ep_unit_apply_budget_delta(budgets: Vec<u64>, delta_mib: i64) -> Vec<u64>
         .collect()
 }
 
+/// The hot-unit loan: after the ordinary placement (`plan` as the staged walk left it) keep the
+/// hottest calibrated host-demand units resident too, up to `loan_bytes` per rank
+/// (`<model>.ep.hot-units`, [`crate::expert_hot_units`]; `counts[id]` for global id
+/// `layer * experts_per_layer + expert`). Per rank independently the candidates are the units it
+/// owns, not resident yet, with `counts[id] > 0`, ordered by count descending then id ascending.
+/// The walk charges [`EpUnitGeometry::unit_bytes`] per unit, plus `2 *`
+/// [`VRAM_ARENA_TAIL_PAD_BYTES`] when the rank holds no resident owned unit of that layer at that
+/// moment (the new VRAM arena's two block pads), adds the unit when the running total stays
+/// within `loan_bytes`, and otherwise skips it and goes on (a cheaper unit of a layer already
+/// touched may still fit). The core never shrinks; the rank's recorded budget grows by exactly the
+/// bytes added so the per-rank fit check admits them. Deterministic.
+///
+/// Returns per-rank `(added units, added bytes)` (bytes include pad charges). A zero loan or
+/// counts that do not cover every unit (empty included) leave `plan` untouched.
+pub fn ep_unit_apply_hot_loan(
+    plan: &mut EpUnitPlan,
+    counts: &[u64],
+    loan_bytes: u64,
+) -> Vec<(usize, u64)> {
+    let g = plan.geometry;
+    let mut out = vec![(0usize, 0u64); g.ranks];
+    if loan_bytes == 0 || counts.len() != g.total_ids() {
+        return out;
+    }
+    let experts = g.experts_per_layer;
+    for (rank, added) in out.iter_mut().enumerate() {
+        let mut touched: Vec<bool> = (0..g.layers)
+            .map(|layer| plan.layer_resident(rank, layer).iter().any(|&kept| kept))
+            .collect();
+        let mut candidates: Vec<usize> = (0..g.layers)
+            .flat_map(|layer| {
+                (rank..experts)
+                    .step_by(g.ranks)
+                    .map(move |expert| layer * experts + expert)
+            })
+            .filter(|&id| {
+                counts[id] > 0 && !plan.resident[plan.index(rank, id / experts, id % experts)]
+            })
+            .collect();
+        candidates.sort_unstable_by(|&a, &b| counts[b].cmp(&counts[a]).then(a.cmp(&b)));
+        for id in candidates {
+            let (layer, expert) = (id / experts, id % experts);
+            let charge = g.unit_bytes()
+                + if touched[layer] {
+                    0
+                } else {
+                    2 * VRAM_ARENA_TAIL_PAD_BYTES
+                };
+            if added.1 + charge > loan_bytes {
+                continue;
+            }
+            let index = plan.index(rank, layer, expert);
+            plan.resident[index] = true;
+            touched[layer] = true;
+            added.0 += 1;
+            added.1 += charge;
+        }
+    }
+    if let Some(budgets) = plan.rank_budget_bytes.as_mut() {
+        for (budget, &(_, bytes)) in budgets.iter_mut().zip(&out) {
+            *budget += bytes;
+        }
+    }
+    out
+}
+
 /// Suffix of a mixed layer's VRAM arena entry (`...layers.{L}.mlp.experts.unit_vram_arena`).
 pub const UNIT_VRAM_ARENA_SUFFIX: &str = ".mlp.experts.unit_vram_arena";
 /// Suffix of a mixed layer's pinned-host arena entry (`...layers.{L}.mlp.experts.unit_host_arena`).
@@ -2191,6 +2257,207 @@ mod tests {
             "{line}"
         );
         assert_eq!(plan.receipt_lines().len(), 2);
+    }
+
+    // The hot-unit loan: 3 layers x 4 experts x 2 ranks. Rank 0 owns experts 0 and 2 (ids
+    // 0,2,4,6,8,10), rank 1 owns experts 1 and 3 (ids 1,3,5,7,9,11). The ordinary plan keeps id 0
+    // on rank 0 and id 1 on rank 1 (the identity ranking at one unit plus one arena's pads each).
+    fn loan_geometry() -> EpUnitGeometry {
+        EpUnitGeometry {
+            layers: 3,
+            experts_per_layer: 4,
+            ranks: 2,
+            gate_up_bytes: GATE_UP,
+            down_bytes: DOWN,
+        }
+    }
+
+    fn loan_plan() -> EpUnitPlan {
+        let g = loan_geometry();
+        let ranking: Vec<u32> = (0..g.total_ids() as u32).collect();
+        let one = g.unit_bytes() + 2 * VRAM_ARENA_TAIL_PAD_BYTES;
+        let plan = place_routed_experts_units(
+            &g,
+            &EpUnitSource::Ranking {
+                ranking: EpRanking {
+                    rank: &ranking,
+                    counts: None,
+                    sha256: None,
+                },
+                rank_budget_bytes: vec![one, one],
+            },
+        )
+        .unwrap();
+        assert!(plan.is_resident(0, 0, 0) && plan.is_resident(1, 0, 1));
+        assert_eq!((plan.resident_units(0), plan.resident_units(1)), (1, 1));
+        plan
+    }
+
+    fn resident_ids(plan: &EpUnitPlan, rank: usize) -> Vec<usize> {
+        let g = plan.geometry();
+        (0..g.total_ids())
+            .filter(|&id| {
+                plan.is_resident(rank, id / g.experts_per_layer, id % g.experts_per_layer)
+            })
+            .collect()
+    }
+
+    fn unit() -> u64 {
+        loan_geometry().unit_bytes()
+    }
+
+    fn pad() -> u64 {
+        2 * VRAM_ARENA_TAIL_PAD_BYTES
+    }
+
+    /// Rank 0 counts: id 2 (layer 0, touched) 5, ids 4 and 6 (layer 1) 9, id 8 (layer 2) 1,
+    /// id 10 0; rank 1 counts are zero.
+    fn rank0_counts() -> Vec<u64> {
+        vec![0, 0, 5, 0, 9, 0, 9, 0, 1, 0, 0, 0]
+    }
+
+    #[test]
+    fn hot_loan_orders_by_count_then_id_and_skips_what_does_not_fit() {
+        let mut plan = loan_plan();
+        // Room for two units and one new arena's pads: ids 4 then 6 (the tie keeps the lower id
+        // first, and 6 rides the pads 4 paid); id 2 (count 5) and id 8 (count 1) no longer fit.
+        let added = ep_unit_apply_hot_loan(&mut plan, &rank0_counts(), 2 * unit() + pad());
+        assert_eq!(added, vec![(2, 2 * unit() + pad()), (0, 0)]);
+        assert_eq!(resident_ids(&plan, 0), vec![0, 4, 6]);
+        assert_eq!(resident_ids(&plan, 1), vec![1]);
+    }
+
+    #[test]
+    fn hot_loan_cap_is_respected_exactly() {
+        let counts = rank0_counts();
+        let exact = 2 * unit() + pad();
+        let mut plan = loan_plan();
+        let added = ep_unit_apply_hot_loan(&mut plan, &counts, exact);
+        assert_eq!(added[0], (2, exact));
+        // One byte less: id 4 alone costs a unit and the pads, every other unit then overflows.
+        let mut plan = loan_plan();
+        let added = ep_unit_apply_hot_loan(&mut plan, &counts, exact - 1);
+        assert_eq!(added[0], (1, unit() + pad()));
+        assert_eq!(resident_ids(&plan, 0), vec![0, 4]);
+        // Never above the loan, whatever it is.
+        for loan in [
+            0,
+            1,
+            unit() - 1,
+            unit(),
+            unit() + pad() - 1,
+            unit() + pad(),
+            10 * unit(),
+        ] {
+            let mut plan = loan_plan();
+            let added = ep_unit_apply_hot_loan(&mut plan, &counts, loan);
+            assert!(
+                added.iter().all(|&(_, bytes)| bytes <= loan),
+                "loan {loan}: {added:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hot_loan_walk_continues_past_a_unit_that_does_not_fit() {
+        // A loan of one bare unit: id 4 (untouched layer, needs the pads) is skipped, id 2 (layer
+        // 0 is touched, no pads) is the hottest remaining unit that fits.
+        let mut plan = loan_plan();
+        let added = ep_unit_apply_hot_loan(&mut plan, &rank0_counts(), unit());
+        assert_eq!(added[0], (1, unit()));
+        assert_eq!(resident_ids(&plan, 0), vec![0, 2]);
+    }
+
+    #[test]
+    fn hot_loan_charges_the_arena_pads_only_to_an_untouched_layer() {
+        let mut plan = loan_plan();
+        let counts = vec![0, 0, 3, 0, 2, 0, 1, 0, 0, 0, 0, 0];
+        let added = ep_unit_apply_hot_loan(&mut plan, &counts, 100 * unit());
+        // id 2: layer 0 already holds id 0 (a unit); id 4: first of layer 1 (unit + pads);
+        // id 6: second of layer 1 (a unit).
+        assert_eq!(added[0], (3, 3 * unit() + pad()));
+        assert_eq!(resident_ids(&plan, 0), vec![0, 2, 4, 6]);
+    }
+
+    #[test]
+    fn hot_loan_only_adds_units_the_rank_owns() {
+        let mut plan = loan_plan();
+        // Every unit is hot: each rank still only gains units of its own parity.
+        let counts = vec![7u64; 12];
+        let added = ep_unit_apply_hot_loan(&mut plan, &counts, 100 * unit());
+        assert_eq!(added[0].0, 5);
+        assert_eq!(added[1].0, 5);
+        assert_eq!(resident_ids(&plan, 0), vec![0, 2, 4, 6, 8, 10]);
+        assert_eq!(resident_ids(&plan, 1), vec![1, 3, 5, 7, 9, 11]);
+        for rank in 0..2 {
+            for id in resident_ids(&plan, rank) {
+                assert!(plan.owns(rank, id % 4), "rank {rank} id {id}");
+            }
+        }
+        // Rank 1's hot units alone never move rank 0.
+        let mut plan = loan_plan();
+        let mut counts = vec![0u64; 12];
+        counts[3] = 4;
+        counts[5] = 4;
+        let added = ep_unit_apply_hot_loan(&mut plan, &counts, 100 * unit());
+        assert_eq!(added[0], (0, 0));
+        assert_eq!(resident_ids(&plan, 0), vec![0]);
+        assert_eq!(resident_ids(&plan, 1), vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn hot_loan_skips_units_that_are_already_resident() {
+        let mut plan = loan_plan();
+        let mut counts = vec![0u64; 12];
+        counts[0] = 100; // resident on rank 0 already: hottest, never charged
+        counts[1] = 100; // resident on rank 1 already
+        counts[2] = 1;
+        let added = ep_unit_apply_hot_loan(&mut plan, &counts, 100 * unit());
+        assert_eq!(added, vec![(1, unit()), (0, 0)]);
+        assert_eq!(resident_ids(&plan, 0), vec![0, 2]);
+    }
+
+    #[test]
+    fn hot_loan_grows_each_rank_budget_by_the_bytes_added() {
+        let mut plan = loan_plan();
+        let before = plan.rank_budget_bytes.clone().unwrap();
+        let counts = vec![7u64; 12];
+        let added = ep_unit_apply_hot_loan(&mut plan, &counts, 3 * unit() + pad());
+        let after = plan.rank_budget_bytes.clone().unwrap();
+        for rank in 0..2 {
+            assert_eq!(after[rank], before[rank] + added[rank].1, "rank {rank}");
+        }
+        assert!(added.iter().all(|&(units, bytes)| units > 0 && bytes > 0));
+    }
+
+    #[test]
+    fn a_zero_loan_or_uncovered_counts_leave_the_plan_byte_identical() {
+        let plan = loan_plan();
+        let counts = vec![7u64; 12];
+        let zeros = vec![0u64; 12];
+        for (given, loan) in [
+            (counts.as_slice(), 0u64),
+            (&counts[..0], 100 * unit()),
+            (&counts[..11], 100 * unit()),
+            (zeros.as_slice(), 100 * unit()),
+        ] {
+            let mut copy = plan.clone();
+            let added = ep_unit_apply_hot_loan(&mut copy, given, loan);
+            assert_eq!(added, vec![(0, 0), (0, 0)]);
+            assert_eq!(copy, plan);
+        }
+    }
+
+    #[test]
+    fn hot_loan_is_deterministic() {
+        let counts: Vec<u64> = (0..12u64).map(|id| (id * 7) % 4).collect();
+        let mut a = loan_plan();
+        let mut b = loan_plan();
+        assert_eq!(
+            ep_unit_apply_hot_loan(&mut a, &counts, 4 * unit() + pad()),
+            ep_unit_apply_hot_loan(&mut b, &counts, 4 * unit() + pad())
+        );
+        assert_eq!(a, b);
     }
 }
 

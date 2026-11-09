@@ -78,6 +78,21 @@ pub const QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES: u64 = 1408 << 20;
 /// Only EP2 was measured; three or more ranks keep the historical floor.
 pub const QWEN4_EP2_RUNTIME_OVERHEAD_GFX1201_BYTES: u64 = 1088 << 20;
 
+/// The hot-unit loan cap per rank of a Flash-Next EP2 load on two exact gfx1201 R9700s: the
+/// bytes of the reserve census ([`QWEN4_EP2_RUNTIME_OVERHEAD_GFX1201_BYTES`] and the other
+/// reserve terms) that `<model>.ep.hot-units` may lend to additional VRAM-resident hot units
+/// (`HIPFIRE_EP_HOT_UNITS`, `HIPFIRE_EP_HOT_LOAN_MIB`; `expert_ep_units::ep_unit_apply_hot_loan`).
+/// It is the measured safe per-rank loan on 2xR9700 EP2 (symtrunk + hc8, `serve --spec mtp
+/// --max-seq 16384`, 8 lanes, calibrated `.ep.hot-units`), swept at 512 / 768 / 1,024 / 1,536 MiB
+/// against two 16.2k-token prefills, an 8-prompt burst and W8 (8 concurrent ~16.3k-token prompts),
+/// requiring every request answered and the warm post-long-prefill lane-page headroom
+/// (`free - earmark` at the first W8 admission) to stay at or above the census margins (512 MiB
+/// placement + 256 MiB page margin). Incumbent warm headroom was about 1.6 GiB per rank, so the
+/// loan spends it MiB for MiB: 768 MiB kept about 0.9 GiB; 1,024 MiB fell under the margins; at
+/// 1,536 MiB W8 was refused (`overload`). Receipt: `release-0.4.5/dynres/statichot/STRESS.md`.
+/// An operator value (`HIPFIRE_EP_HOT_LOAN_MIB`) above it is clamped to it.
+pub const QWEN4_EP2_HOT_LOAN_GFX1201_BYTES: u64 = 768 << 20;
+
 /// The measured HIP runtime overhead the census charges: only where it was
 /// measured, an exact gfx1201 discrete (not unified-memory) single-device
 /// load. `None` elsewhere, where the historical floor still applies. An

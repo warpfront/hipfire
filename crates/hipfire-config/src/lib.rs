@@ -7623,6 +7623,51 @@ mod tests {
     }
 
     #[test]
+    fn ep_hot_units_policy_and_sidecar_path() {
+        use memory::{parse_ep_hot_units as parse, EpHotUnits};
+        assert_eq!(parse(None), Ok(EpHotUnits::Discover));
+        assert_eq!(parse(Some("0")), Ok(EpHotUnits::Off));
+        assert_eq!(parse(Some(" 0 ")), Ok(EpHotUnits::Off));
+        assert_eq!(parse(Some("")), Ok(EpHotUnits::Off));
+        assert_eq!(
+            parse(Some(" /m/q.mq4.ep.hot-units ")),
+            Ok(EpHotUnits::Explicit("/m/q.mq4.ep.hot-units".into()))
+        );
+        for bad in ["1", "on", "q.ep.hot-units", "./q.ep.hot-units"] {
+            let error = parse(Some(bad)).unwrap_err();
+            assert!(error.contains("HIPFIRE_EP_HOT_UNITS"), "{bad}: {error}");
+        }
+        assert_eq!(memory::ep_hot_units(), Ok(EpHotUnits::Discover));
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_EP_HOT_UNITS").as_deref(),
+            Some("developer.ep_hot_units")
+        );
+        assert_eq!(
+            memory::ep_hot_units_sidecar_path(Path::new("/m/q.mq4")),
+            PathBuf::from("/m/q.mq4.ep.hot-units")
+        );
+    }
+
+    #[test]
+    fn ep_hot_loan_mib_is_measured_unless_zero_or_a_positive_integer() {
+        use memory::{parse_ep_hot_loan_mib as parse, EpHotLoanMib};
+        assert_eq!(parse(None), Ok(EpHotLoanMib::Measured));
+        assert_eq!(parse(Some("0")), Ok(EpHotLoanMib::Off));
+        assert_eq!(parse(Some("")), Ok(EpHotLoanMib::Off));
+        assert_eq!(parse(Some(" 768 ")), Ok(EpHotLoanMib::Mib(768)));
+        assert_eq!(parse(Some("4096")), Ok(EpHotLoanMib::Mib(4096)));
+        for bad in ["-1", "1.5", "1GiB", "on", "0x10"] {
+            let error = parse(Some(bad)).unwrap_err();
+            assert!(error.contains("HIPFIRE_EP_HOT_LOAN_MIB"), "{bad}: {error}");
+        }
+        assert_eq!(memory::ep_hot_loan_mib(), Ok(EpHotLoanMib::Measured));
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_EP_HOT_LOAN_MIB").as_deref(),
+            Some("developer.ep_hot_loan_mib")
+        );
+    }
+
+    #[test]
     fn qwen4_sp_is_a_typed_bool_developer_key_unset_follows_the_arch_default() {
         const KEY: &str = "developer.qwen4_sp";
         const ENV: &str = "HIPFIRE_QWEN4_SP";
@@ -10869,6 +10914,17 @@ pub mod memory {
         PathBuf::from(path)
     }
 
+    /// Suffix of the Flash-Next EP2 hot-unit loan sidecar (calibrated host-read counts of the
+    /// static placement; JSON, `hipfire.qwen4.ep_hot_units`).
+    pub const EP_HOT_UNITS_SIDECAR_SUFFIX: &str = ".ep.hot-units";
+
+    /// Path of the hot-unit loan sidecar of `model`: `<model file name>.ep.hot-units`.
+    pub fn ep_hot_units_sidecar_path(model: &Path) -> PathBuf {
+        let mut path = model.as_os_str().to_owned();
+        path.push(EP_HOT_UNITS_SIDECAR_SUFFIX);
+        PathBuf::from(path)
+    }
+
     /// THE gate of the shipped EP expert hot set (D1). `false`: nothing changes unless
     /// `HIPFIRE_QWEN4_EP_EXPERT_HOTSET=<path>` names a sidecar (the loader never discovers one,
     /// `hipfire pull` does not fetch the sidecar). `true` (shipped): an EP2 gfx1201 Flash-Next load
@@ -11413,6 +11469,80 @@ pub mod memory {
     /// Pure truth table behind [`ep_reserve_census`]: only a trimmed `0` is off.
     pub fn parse_ep_reserve_census(raw: Option<&str>) -> bool {
         raw.map(str::trim) != Some("0")
+    }
+
+    /// Environment variable of the hot-unit loan's sidecar: [`ep_hot_units`].
+    pub const EP_HOT_UNITS_ENV: &str = "HIPFIRE_EP_HOT_UNITS";
+    /// Environment variable of the hot-unit loan's size: [`ep_hot_loan_mib`].
+    pub const EP_HOT_LOAN_MIB_ENV: &str = "HIPFIRE_EP_HOT_LOAN_MIB";
+
+    /// Which `.ep.hot-units` sidecar a Flash-Next EP2 load lends from
+    /// (`HIPFIRE_EP_HOT_UNITS`, [`ep_hot_units`]).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum EpHotUnits {
+        /// Unset: discover the sibling `<model>.ep.hot-units`; absent is no loan, silently.
+        Discover,
+        /// `0` (or blank): no loan. The kill switch.
+        Off,
+        /// An absolute path to the sidecar; it must apply (a refusal is a load error).
+        Explicit(PathBuf),
+    }
+
+    /// Developer variable `HIPFIRE_EP_HOT_UNITS` of the Flash-Next EP2 hot-unit loan: unset
+    /// discovers `<model>.ep.hot-units` next to the model, `0` turns the loan off, an absolute path
+    /// names the sidecar. Anything else is a policy error (never silently ignored). Read once per
+    /// load.
+    pub fn ep_hot_units() -> Result<EpHotUnits, String> {
+        parse_ep_hot_units(process_value(EP_HOT_UNITS_ENV).as_deref())
+    }
+
+    /// Pure parse behind [`ep_hot_units`].
+    pub fn parse_ep_hot_units(raw: Option<&str>) -> Result<EpHotUnits, String> {
+        match raw.map(str::trim) {
+            None => Ok(EpHotUnits::Discover),
+            Some("") | Some("0") => Ok(EpHotUnits::Off),
+            Some(path) if Path::new(path).is_absolute() => {
+                Ok(EpHotUnits::Explicit(PathBuf::from(path)))
+            }
+            Some(other) => Err(format!(
+                "{EP_HOT_UNITS_ENV}={other:?} is neither 0 nor an absolute path to a \
+                 .ep.hot-units sidecar"
+            )),
+        }
+    }
+
+    /// The size of the hot-unit loan per rank (`HIPFIRE_EP_HOT_LOAN_MIB`, [`ep_hot_loan_mib`]).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum EpHotLoanMib {
+        /// Unset: the measured safe loan (`QWEN4_EP2_HOT_LOAN_GFX1201_BYTES`).
+        Measured,
+        /// `0` (or blank): no loan. The kill switch.
+        Off,
+        /// This many MiB, clamped by the loader to the measured safe loan.
+        Mib(u64),
+    }
+
+    /// Developer variable `HIPFIRE_EP_HOT_LOAN_MIB` of the Flash-Next EP2 hot-unit loan: unset is
+    /// the measured safe loan, `0` turns the loan off, a positive integer is that many MiB per
+    /// rank (the loader clamps it to the measured safe loan). A non-integer is a policy error.
+    /// Read once per load.
+    pub fn ep_hot_loan_mib() -> Result<EpHotLoanMib, String> {
+        parse_ep_hot_loan_mib(process_value(EP_HOT_LOAN_MIB_ENV).as_deref())
+    }
+
+    /// Pure parse behind [`ep_hot_loan_mib`].
+    pub fn parse_ep_hot_loan_mib(raw: Option<&str>) -> Result<EpHotLoanMib, String> {
+        match raw.map(str::trim) {
+            None => Ok(EpHotLoanMib::Measured),
+            Some("") => Ok(EpHotLoanMib::Off),
+            Some(value) => match value.parse::<u64>() {
+                Ok(0) => Ok(EpHotLoanMib::Off),
+                Ok(mib) => Ok(EpHotLoanMib::Mib(mib)),
+                Err(_) => Err(format!(
+                    "{EP_HOT_LOAN_MIB_ENV}={value:?} is not a non-negative integer (MiB per rank)"
+                )),
+            },
+        }
     }
 
     /// Developer `HIPFIRE_LOAD_WEIGHT_DIGEST=<path>`: when set and not blank,
