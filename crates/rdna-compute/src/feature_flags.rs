@@ -177,6 +177,12 @@ pub struct FeatureFlags {
     /// (`HIPFIRE_QWEN4_MOE_SCATTER_SCAN`), default on for gfx1201 (`=0` keeps the serial
     /// thread-0 walk); gfx1151 always scans, every other arch always walks.
     pub qwen4_moe_scatter_scan: bool,
+    /// Wave-3 C8 MoE glue folds (`HIPFIRE_QWEN4_MOE_GLUE_FOLD`, developer, default off): a
+    /// bitmask of the sub-folds ([`MOE_GLUE_FOLD_MASK`], [`MOE_GLUE_FOLD_ROUTER`],
+    /// [`MOE_GLUE_FOLD_ROTATE`]); `1` selects all, a letter list (`a`, `ab`, `c`, ...) selects
+    /// the named ones, `0` / unset none. Exact gfx1201 only (see
+    /// [`FeatureFlags::qwen4_moe_glue_fold_enabled`]).
+    pub qwen4_moe_glue_fold: u8,
     /// Multi-lane fn-lanes GDN decode core (`HIPFIRE_QWEN4_GDN_LANES`), default
     /// on for gfx1151 and gfx1201 (`=0` kills it), off elsewhere.
     pub qwen4_gdn_lanes: bool,
@@ -1055,6 +1061,43 @@ pub struct FeatureFlags {
     pub qwen4_hc_mix_fill80_gfx1100: bool,
 }
 
+/// `HIPFIRE_QWEN4_MOE_GLUE_FOLD` sub-fold X8a: the owner tile mask (`ep_tile_mask_pm`) is
+/// written by the scatter launch.
+pub const MOE_GLUE_FOLD_MASK: u8 = 0b001;
+/// Sub-fold X8b: the 9..=64-row router and the scatter (and mask) are one launch.
+pub const MOE_GLUE_FOLD_ROUTER: u8 = 0b010;
+/// Sub-fold X8c: the down producer (`qwen4_moe_rotate128_i8`) runs in the gate/up epilogue.
+pub const MOE_GLUE_FOLD_ROTATE: u8 = 0b100;
+
+/// Parse `HIPFIRE_QWEN4_MOE_GLUE_FOLD`: unset, `0` / `false` / `off` and anything unrecognised
+/// select no fold, `1` / `true` / `on` all of them, otherwise a list of the letters `a`
+/// ([`MOE_GLUE_FOLD_MASK`]), `b` ([`MOE_GLUE_FOLD_ROUTER`]) and `c` ([`MOE_GLUE_FOLD_ROTATE`])
+/// (case-insensitive, `,` / `+` / space separators ignored); any other character voids the whole
+/// value (no fold).
+pub fn parse_moe_glue_fold(raw: Option<&str>) -> u8 {
+    let Some(raw) = raw.map(str::trim) else {
+        return 0;
+    };
+    match raw {
+        "1" | "true" | "TRUE" | "on" | "ON" => {
+            return MOE_GLUE_FOLD_MASK | MOE_GLUE_FOLD_ROUTER | MOE_GLUE_FOLD_ROTATE
+        }
+        "" | "0" | "false" | "FALSE" | "off" | "OFF" => return 0,
+        _ => {}
+    }
+    let mut mask = 0u8;
+    for ch in raw.chars() {
+        match ch.to_ascii_lowercase() {
+            'a' => mask |= MOE_GLUE_FOLD_MASK,
+            'b' => mask |= MOE_GLUE_FOLD_ROUTER,
+            'c' => mask |= MOE_GLUE_FOLD_ROTATE,
+            ',' | '+' | ' ' => {}
+            _ => return 0,
+        }
+    }
+    mask
+}
+
 /// Built-in default of `experimental.graph.ar` for an architecture on a host
 /// platform. On, except Windows exact gfx1100 (#655): there AR-forward graph
 /// capture/replay silently produces wrong output (token soup on an RX 7900 XTX
@@ -1264,6 +1307,9 @@ impl FeatureFlags {
                 .unwrap_or(exact_unit_default),
             qwen4_moe_scatter_scan: parse_bool("HIPFIRE_QWEN4_MOE_SCATTER_SCAN")
                 .unwrap_or(is_gfx1201),
+            qwen4_moe_glue_fold: parse_moe_glue_fold(
+                value("HIPFIRE_QWEN4_MOE_GLUE_FOLD").ok().as_deref(),
+            ),
             qwen4_gdn_lanes: parse_bool("HIPFIRE_QWEN4_GDN_LANES").unwrap_or(matches!(arch, "gfx1151" | "gfx1201")),
             qwen4_qsa_lanes: parse_bool("HIPFIRE_QWEN4_QSA_LANES").unwrap_or(arch == "gfx1201"),
             qwen4_gdn_lanes_rows: parse_bool("HIPFIRE_QWEN4_GDN_LANES_ROWS").unwrap_or(true),
@@ -2116,6 +2162,13 @@ impl FeatureFlags {
         !self.qwen4_moe_scatter_scan && self.arch == "gfx1201"
     }
 
+    /// Whether the wave-3 MoE glue fold `bit` ([`MOE_GLUE_FOLD_MASK`], [`MOE_GLUE_FOLD_ROUTER`],
+    /// [`MOE_GLUE_FOLD_ROTATE`]) is selected by `HIPFIRE_QWEN4_MOE_GLUE_FOLD`: exact gfx1201 only,
+    /// default off.
+    pub fn qwen4_moe_glue_fold_enabled(&self, bit: u8) -> bool {
+        self.qwen4_moe_glue_fold & bit != 0 && self.arch == "gfx1201"
+    }
+
     pub fn qwen4_decode_zba_x3_enabled(&self) -> bool {
         self.qwen4_decode_zba_x3 && self.arch == "gfx1151"
     }
@@ -2383,6 +2436,7 @@ impl FeatureFlags {
             qwen4_hc_row_fold: false,
             qwen4_router_fast: false,
             qwen4_moe_scatter_scan: false,
+            qwen4_moe_glue_fold: 0,
             qwen4_gdn_lanes: false,
             qwen4_qsa_lanes: false,
             qwen4_gdn_lanes_rows: false,
@@ -3863,6 +3917,45 @@ mod tests {
                 arch == "gfx1201",
                 "{arch}"
             );
+        }
+    }
+
+    /// The wave-3 glue fold is opt-in: off unless a fold is named, `1` names all, letters name
+    /// subsets, and only exact gfx1201 reports any as enabled.
+    #[test]
+    fn qwen4_moe_glue_fold_is_opt_in_exact_gfx1201() {
+        assert_eq!(parse_moe_glue_fold(None), 0);
+        assert_eq!(parse_moe_glue_fold(Some("0")), 0);
+        assert_eq!(parse_moe_glue_fold(Some("")), 0);
+        assert_eq!(parse_moe_glue_fold(Some("2")), 0);
+        assert_eq!(parse_moe_glue_fold(Some("1")), 0b111);
+        assert_eq!(parse_moe_glue_fold(Some("a")), MOE_GLUE_FOLD_MASK);
+        assert_eq!(
+            parse_moe_glue_fold(Some("a,b")),
+            MOE_GLUE_FOLD_MASK | MOE_GLUE_FOLD_ROUTER
+        );
+        assert_eq!(parse_moe_glue_fold(Some("C")), MOE_GLUE_FOLD_ROTATE);
+        assert_eq!(parse_moe_glue_fold(Some("abx")), 0);
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+            let exact = arch == "gfx1201";
+            let with = |v: &'static str| {
+                FeatureFlags::from_lookup(arch, move |n| match n {
+                    "HIPFIRE_QWEN4_MOE_GLUE_FOLD" => Ok(v.into()),
+                    _ => Err(()),
+                })
+            };
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            for bit in [MOE_GLUE_FOLD_MASK, MOE_GLUE_FOLD_ROUTER, MOE_GLUE_FOLD_ROTATE] {
+                assert!(!unset.qwen4_moe_glue_fold_enabled(bit), "{arch}");
+                assert!(!with("0").qwen4_moe_glue_fold_enabled(bit), "{arch}");
+                assert_eq!(with("1").qwen4_moe_glue_fold_enabled(bit), exact, "{arch}");
+            }
+            assert_eq!(
+                with("a").qwen4_moe_glue_fold_enabled(MOE_GLUE_FOLD_MASK),
+                exact,
+                "{arch}"
+            );
+            assert!(!with("a").qwen4_moe_glue_fold_enabled(MOE_GLUE_FOLD_ROUTER), "{arch}");
         }
     }
 

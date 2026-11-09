@@ -66,11 +66,16 @@ pub const EP_A8_GEMM_MODULE: &str = "qwen4_moe_ep_a8_gfx12";
 /// Module and entry of the down A8 producer.
 pub const EP_A8_ROTATE128_MODULE: &str = "qwen4_moe_rotate128_i8_gfx12";
 pub const EP_A8_ROTATE128_SYMBOL: &str = "qwen4_moe_rotate128_i8";
+/// Module and entries of the gate/up GEMM with the rotate128 down producer folded into its epilogue
+/// (`HIPFIRE_QWEN4_MOE_GLUE_FOLD` sub-fold `c`, [`Gpu::gemm_qwen4_moe_gate_up_silu_a8_rot_sym`]).
+pub const EP_A8_ROT_MODULE: &str = "qwen4_moe_ep_a8_rot_gfx12";
 
 /// `block_i8_128` bytes (`float d; int s; signed char qs[128]`).
 const BLOCK_I8_128_BYTES: usize = 136;
 /// Gate/up rows per CTA: 4 waves x 16 gate rows (the up rows ride along).
 const ROWS_PER_CTA: usize = 64;
+/// Gate columns per CTA of the rotate-fold entries: one whole 128-wide rotate group (8 waves x 16 rows).
+const ROT_COLS_PER_CTA: usize = 128;
 
 /// Developer override of the tile-run width (`1` or `2`; unset or anything else: [`ep_a8_select_nt`]).
 pub const QWEN4_MOE_EP_A8_NT_ENV: &str = "HIPFIRE_QWEN4_MOE_EP_A8_NT";
@@ -146,6 +151,15 @@ pub fn ep_a8_down_symbol(planar: bool, nt: usize) -> Option<&'static str> {
     })
 }
 
+/// Symbol of the gate/up entry with the rotate128 epilogue (planar experts only: the served route).
+pub fn ep_a8_gate_up_rot_symbol(nt: usize) -> Option<&'static str> {
+    Some(match nt {
+        1 => "qwen4_moe_ep_a8_gate_up_rot_planar_nt1",
+        2 => "qwen4_moe_ep_a8_gate_up_rot_planar_nt2",
+        _ => return None,
+    })
+}
+
 /// Tile-run width of a launch of `grouped_rows` grouped rows: one 16-slot tile per CTA below two tiles'
 /// worth of work, two tiles per CTA (the weight stream is read once per pair) from there.
 pub fn ep_a8_select_nt(_down: bool, grouped_rows: usize) -> usize {
@@ -172,6 +186,21 @@ pub fn ep_a8_gate_up_shape_ok(m: usize, k: usize, grouped_rows: usize, x_row_div
         && grouped_rows != 0
         && grouped_rows % 16 == 0
         && x_row_div != 0
+}
+
+/// Pure launch-shape admission of the gate/up GEMM with the rotate128 epilogue: [`ep_a8_gate_up_shape_ok`]
+/// plus `m / 2` a whole number of 128-wide rotate groups; the fused down producer needs `down_k == m / 2`.
+pub fn ep_a8_gate_up_rot_shape_ok(
+    m: usize,
+    k: usize,
+    down_k: usize,
+    grouped_rows: usize,
+    x_row_div: usize,
+) -> bool {
+    ep_a8_gate_up_shape_ok(m, k, grouped_rows, x_row_div)
+        && m % 2 == 0
+        && (m / 2) % ROT_COLS_PER_CTA == 0
+        && down_k == m / 2
 }
 
 /// Pure launch-shape admission of the down GEMM: `m % 64 == 0`, `k % 128 == 0` (one K128 epoch per
@@ -243,7 +272,11 @@ fn err(what: &str) -> HipError {
 }
 
 fn first_launch_receipt(stage: usize, line: impl FnOnce() -> String) {
-    static SEEN: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+    static SEEN: [AtomicBool; 3] = [
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+    ];
     if !SEEN[stage].swap(true, Ordering::Relaxed) {
         eprintln!("[INFO] qwen4 moe EP A8: first launch {}", line());
     }
@@ -342,6 +375,20 @@ impl Gpu {
         };
         for (k, n) in ep_a8_reserve_shapes(max_rows, k_top, hidden, intermediate) {
             self.reserve_int8_mmq(k, n)?;
+        }
+        // X8c: the rotate-fold gate/up launch (`HIPFIRE_QWEN4_MOE_GLUE_FOLD` sub-fold `c`, wide-verify rows
+        // only) writes its down sidecar to a dedicated buffer: reserve it for the largest wide-verify
+        // chain now, so no decode step grows it.
+        if gu_a8_enabled(&self.arch, *GU_A8)
+            && intermediate % 128 == 0
+            && self
+                .flags
+                .qwen4_moe_glue_fold_enabled(crate::feature_flags::MOE_GLUE_FOLD_ROTATE)
+        {
+            self.reserve_int8_mmq_down(
+                intermediate,
+                crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS.saturating_mul(k_top),
+            )?;
         }
         Ok(())
     }
@@ -530,6 +577,198 @@ impl Gpu {
             xp,
             y,
             [m, k, x_row_div, grouped_rows, x_src_rows],
+        )
+    }
+
+    /// Whether the wide-verify chain's gate/up launch folds the down producer into its epilogue
+    /// ([`Gpu::gemm_qwen4_moe_gate_up_silu_a8_rot_sym`] + [`Gpu::gemm_qwen4_moe_down_a8_rot_sym`]):
+    /// `HIPFIRE_QWEN4_MOE_GLUE_FOLD` selects sub-fold `c` (exact gfx1201), planar experts, an eager launch (no
+    /// graph capture, no replay record: the dedicated down sidecar may grow lazily like the shared one), and the
+    /// gate/up and down shapes both admitted. `m` / `k`: gate/up GEMM (`2 * mi`, `hidden`); `down_m` / `down_k`:
+    /// the down GEMM. Evaluated by the gate/up and the down stage with the same arguments, so they always agree.
+    pub fn qwen4_moe_gu_rot_fold_applies(
+        &self,
+        m: usize,
+        k: usize,
+        down_m: usize,
+        down_k: usize,
+        grouped_rows: usize,
+        x_row_div: usize,
+    ) -> bool {
+        self.flags
+            .qwen4_moe_glue_fold_enabled(crate::feature_flags::MOE_GLUE_FOLD_ROTATE)
+            && self.mq4_experts_planar
+            && !self.graphs.capture_mode
+            && !self.replay.is_recording()
+            && ep_a8_gate_up_rot_shape_ok(m, k, down_k, grouped_rows, x_row_div)
+            && ep_a8_down_shape_ok(down_m, down_k, grouped_rows, 1)
+    }
+
+    /// [`Gpu::gemm_qwen4_moe_gate_up_silu_a8_sym`] with the down producer ([`Gpu::qwen4_moe_rotate128_i8`])
+    /// folded into the epilogue: ONE launch (`qwen4_moe_ep_a8_gate_up_rot_planar_nt{1,2}`) that writes the
+    /// flat-slot down sidecar `[m / 2 / 128, x_src_rows * x_row_div]` of the live slots of the tiles it runs to
+    /// the dedicated down scratch and leaves it pending for [`Gpu::gemm_qwen4_moe_down_a8_rot_sym`]. The BF16
+    /// grouped SwiGLU rows are NOT written. Planar experts only; `x_row_div` = top-k.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qwen4_moe_gate_up_silu_a8_rot_sym(
+        &mut self,
+        ptrs: &GpuTensor,
+        tiles: &GpuTensor,
+        sorted: &GpuTensor,
+        xq: &Int8MmqPrepared,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        const WHAT: &str = "gemm_qwen4_moe_gate_up_silu_a8_rot_sym";
+        self.qwen4_moe_ep_a8_require(WHAT)?;
+        if !self.mq4_experts_planar {
+            return Err(err(&format!("{WHAT}: planar experts only")));
+        }
+        if !ep_a8_gate_up_rot_shape_ok(m, k, m / 2, grouped_rows, x_row_div) {
+            return Err(err(&format!(
+                "{WHAT}: need m % 256 == 0, k % 256 == 0, grouped_rows % 16 == 0"
+            )));
+        }
+        let total_slots = x_src_rows
+            .checked_mul(x_row_div)
+            .ok_or_else(|| err(&format!("{WHAT}: slot count overflows")))?;
+        if grouped_rows.max(total_slots).max(m).max(k) > (i32::MAX as usize) / 2 {
+            return Err(err(&format!("{WHAT}: extent exceeds 32-bit slot indices")));
+        }
+        self.bind_thread()?;
+        crate::moe::require_span(sorted, &[grouped_rows, 4], WHAT)?;
+        crate::moe::require_span(tiles, &[grouped_rows / 16, 4], WHAT)?;
+        let (generation, live) = self.scratch.int8_mmq_live();
+        let xp = xq.checked_ptr(generation, live, k, x_src_rows)?;
+        self.ensure_mq_signs_128()?;
+        let nt = (*EP_A8_NT).unwrap_or_else(|| ep_a8_select_nt(false, grouped_rows));
+        let func = ep_a8_gate_up_rot_symbol(nt)
+            .ok_or_else(|| err(&format!("{WHAT}: unbuilt tile-run width")))?;
+        self.ensure_kernel(EP_A8_ROT_MODULE, kernels::QWEN4_MOE_EP_A8_ROT_SRC, func)?;
+        // The previous call's pending handle is dead from here on (its sidecar is overwritten).
+        self.scratch.int8_mmq_down_pending = None;
+        let reservation = self.reserve_int8_mmq_down(m / 2, total_slots)?;
+        let ep = ptrs.buf.as_ptr();
+        let tp = tiles.buf.as_ptr();
+        let sp = sorted.buf.as_ptr();
+        let dp = reservation.ptr();
+        let s1 = self.scratch.mq_signs1_128.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2_128.as_ref().unwrap().buf.as_ptr();
+        let (mv, kv, dv, mt, xs, lv) = (
+            m as i32,
+            k as i32,
+            x_row_div as i32,
+            grouped_rows as i32,
+            x_src_rows as i32,
+            total_slots as i32,
+        );
+        let nev = moe_expert_table_len(ptrs);
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &dv as *const _ as *mut c_void,
+            &mt as *const _ as *mut c_void,
+            &xs as *const _ as *mut c_void,
+            &nev as *const _ as *mut c_void,
+            &lv as *const _ as *mut c_void,
+        ];
+        let grid = [
+            (m / 2 / ROT_COLS_PER_CTA) as u32,
+            (grouped_rows / 16) as u32,
+            1,
+        ];
+        first_launch_receipt(2, || {
+            format!(
+                "stage=gate_up+rotate128 entry={func} m={m} k={k} grouped_rows={grouped_rows} x_src_rows={x_src_rows}"
+            )
+        });
+        crate::moe_entry_log::moe_entry_receipt("gate_up", func, x_src_rows);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemm",
+            func,
+            grouped_rows * (k / 2 + m)
+                + grouped_rows * k / 128 * BLOCK_I8_128_BYTES
+                + (m / 2 / 128) * total_slots * BLOCK_I8_128_BYTES,
+        );
+        let result = self.launch_maybe_blob(func, grid, [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(ep);
+            b.push_ptr(tp);
+            b.push_ptr(sp);
+            b.push_ptr(xp);
+            b.push_ptr(dp);
+            b.push_ptr(s1);
+            b.push_ptr(s2);
+            b.push_i32(mv);
+            b.push_i32(kv);
+            b.push_i32(dv);
+            b.push_i32(mt);
+            b.push_i32(xs);
+            b.push_i32(nev);
+            b.push_i32(lv);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        self.scratch.int8_mmq_down_pending = Some(Int8MmqPrepared::from_reservation(reservation));
+        Ok(())
+    }
+
+    /// [`Gpu::gemm_qwen4_moe_down_a8_sym`] over the sidecar the preceding
+    /// [`Gpu::gemm_qwen4_moe_gate_up_silu_a8_rot_sym`] launch left pending (taken here: one down per fused
+    /// gate/up). Errors, launching nothing, when no handle is pending or it is stale (the dedicated down scratch
+    /// was reserved again since) or of another shape: never reads an unproduced sidecar.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qwen4_moe_down_a8_rot_sym(
+        &mut self,
+        ptrs: &GpuTensor,
+        tiles: &GpuTensor,
+        sorted: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        grouped_rows: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        let Some(pending) = self.scratch.int8_mmq_down_pending.take() else {
+            return Err(err(
+                "gemm_qwen4_moe_down_a8_rot_sym: no fused gate/up sidecar is pending (the gate/up stage did \
+                 not run the rotate fold, or its sidecar was already consumed)",
+            ));
+        };
+        if !ep_a8_down_shape_ok(m, k, grouped_rows, 1) {
+            return Err(err(
+                "gemm_qwen4_moe_down_a8_rot_sym: need m % 64 == 0, k % 128 == 0, grouped_rows % 16 == 0",
+            ));
+        }
+        crate::moe::require_span(
+            y,
+            &[grouped_rows, m, 2],
+            "gemm_qwen4_moe_down_a8_rot_sym BF16 grouped rows",
+        )?;
+        let (generation, live) = self.scratch.int8_mmq_down_live();
+        let xp = pending.checked_ptr(generation, live, k, x_src_rows)?;
+        self.qwen4_moe_ep_a8_gemm(
+            true,
+            ptrs,
+            tiles,
+            sorted,
+            xp,
+            y,
+            [m, k, 1, grouped_rows, x_src_rows],
         )
     }
 

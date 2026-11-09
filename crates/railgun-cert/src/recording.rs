@@ -1505,6 +1505,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "qwen4-moe-glue-fold-eager",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Flash-Next exact-gfx1201 wide-verify MoE glue folds (HIPFIRE_QWEN4_MOE_GLUE_FOLD, default off) taken only with `!is_recording() && !capture_mode`: Gpu::moe_glue_fold_mask_admitted (the scatter launch also writes the owner tile mask, moe_scatter_fused_top10_pmask) and Gpu::moe_glue_fold_route_admitted (9..=64-row router + scatter + mask in one launch, moe_route_scatter_top10_wide_f32 with a persistent per-Gpu arrival counter), both rdna-compute moe.rs",
+        effect: KernelSelection,
+        switches: "eager: moe_router_softmax_top10_f32_fast + moe_scatter_fused_top10 + ep_tile_mask_pm_gfx1201 replaced by moe_scatter_fused_top10_pmask (a) or moe_route_scatter_top10_wide_f32 (b); recorded/captured: the unfused launches",
+        kernels: &[],
+        verdict: ByteExact,
+        evidence: "GPU oracle examples/qwen4_moe_glue_fold (fusion3/runs/x8): every output word of topk_idx, topk_w, expert_token_counts, expert_offsets, expert_tile_ids, tile_ids_owned and the router fault word equal to the unfused chain, sorted_slot_index / inverse_perm equal as permutations (the shipped scatter's atomic bucket fill is a race in the unfused chain itself); eager exact-gfx1201 arms only, the recorded body keeps the unfused launches. No railgun default program is a qwen4 program, so nothing reaches one",
+        reaches: &[],
+    },
+    Decision {
         id: "qwen4-flash-next-gfx1151-eager-fusions",
         predicates: &[IsRecording, CaptureMode],
         condition: "Flash-Next exact-gfx1151 prefill fusions taken only with `!is_recording() && !capture_mode`: hc_down_fused_selected / Gpu::qwen4_hc_down_fused_applies (HIPFIRE_QWEN4_HC_DOWN_FUSED, gemm.rs: m 320, k 10240, route rows >= HC_DOWN_FUSED_GFX1151_MIN_ROWS), hc_up_v2_selected / hyper_read_up_wmma_launch (HIPFIRE_QWEN4_HC_UP_V2, tensor_ops.rs: retiled HC read admitted, low_rank 320, hidden % 16 == 0, rows >= HC_UP_V2_MIN_ROWS), Gpu::qwen4_moe_front_fuse_applies (HIPFIRE_QWEN4_MOE_FRONT_FUSE, gemm.rs: exact gfx1201 or exact gfx1151, symmetric IU4 descriptor present; on gfx1151 the producer also feeds the fused shared gate/up PeaceMaker launch's router + selector groups)",
@@ -3986,6 +3997,24 @@ pub const SITES: &[Site] = &[
         function: "moe_route_scatter_top10_admitted",
         occurrences: 2,
         decisions: &["qwen4-flash-next-gfx1201-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/moe.rs",
+        function: "moe_glue_fold_mask_admitted",
+        occurrences: 2,
+        decisions: &["qwen4-moe-glue-fold-eager"],
+    },
+    Site {
+        file: "rdna-compute/src/moe.rs",
+        function: "moe_glue_fold_route_admitted",
+        occurrences: 2,
+        decisions: &["qwen4-moe-glue-fold-eager"],
+    },
+    Site {
+        file: "rdna-compute/src/qwen4_moe_ep_a8.rs",
+        function: "qwen4_moe_gu_rot_fold_applies",
+        occurrences: 2,
+        decisions: &["qwen4-moe-glue-fold-eager"],
     },
     Site {
         file: "rdna-compute/src/tensor_ops.rs",

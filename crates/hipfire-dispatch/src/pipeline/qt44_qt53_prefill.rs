@@ -2061,6 +2061,56 @@ pub(crate) fn scatter(
     ))
 }
 
+/// The owner mask a scatter-side glue-fold launch (`HIPFIRE_QWEN4_MOE_GLUE_FOLD`, X8a / X8b) writes
+/// together with the scatter tables: the wide-verify int8 chain's owner mask ([`ep_a8_owner_mask`]) of
+/// a call that takes that chain ([`ep_a8_wide`]); `None` for every other call.
+pub(crate) fn glue_fold_owner_mask<'p>(
+    gpu: &Gpu,
+    p: &'p MoePrefillParams<'_>,
+) -> Result<Option<MoeDecodeOwnerMask<'p>>, DispatchError> {
+    if !ep_a8_wide(gpu, p, true) {
+        return Ok(None);
+    }
+    ep_a8_owner_mask(gpu, p)
+}
+
+/// [`scatter`], with the owner tile mask of the wide-verify int8 chain written by the same launch when
+/// `HIPFIRE_QWEN4_MOE_GLUE_FOLD` selects X8a and the call takes the plain grouped scatter
+/// ([`scatter_fusable`]) on that chain. Returns whether the masked copy of the tile ids
+/// (`tile_ids_owned`) has been written: the gate/up stage then does not launch `ep_tile_mask`.
+pub(crate) fn scatter_masked(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    grouped_rows: usize,
+) -> Result<bool, DispatchError> {
+    if gpu.moe_glue_fold_mask_admitted() && scatter_fusable(gpu, p) {
+        require_geometry(p)?;
+        if let Some(mask) = glue_fold_owner_mask(gpu, p)? {
+            hip(gpu.moe_scatter_fused_top10_pmask(
+                p.topk_indices,
+                p.expert_token_counts,
+                p.expert_offsets,
+                p.sorted_slot_index,
+                p.expert_tile_ids,
+                p.inverse_perm,
+                p.batch_size * p.k_top,
+                p.n_exp,
+                grouped_rows,
+                crate::families::moe::MOE_GROUPED_BLOCK_M,
+                rdna_compute::moe::TileMaskFold {
+                    tile_ids_owned: mask.tile_ids_owned,
+                    owner_table: mask.owner_table,
+                    tiles: grouped_tiles(grouped_rows),
+                    rank: mask.rank,
+                },
+            ))?;
+            return Ok(true);
+        }
+    }
+    scatter(gpu, p, grouped_rows)?;
+    Ok(false)
+}
+
 /// Whether the grouped gate/up takes the F16 WMMA arm and hands the unscatter
 /// BF16 rows: the recipe rounds gate/up to BF16 before SiLU anyway.  The
 /// BF16-output entries exist in the gfx11 source only.
@@ -2286,19 +2336,23 @@ pub(crate) fn gate_up(
     use_path2: bool,
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
-    gate_up_front(gpu, p, use_path2, grouped_rows, None)
+    gate_up_front(gpu, p, use_path2, grouped_rows, None, false)
 }
 
 /// [`gate_up`] consuming the IU4 sidecar the fused front already produced
 /// ([`input_basis_front`]) instead of running `mq_rotate_x_i4`. A sidecar that is no longer
 /// the live scratch (generation, shape or pointer mismatch) is never read: the producer
 /// runs again, as the unfused chain would.
+/// `tile_mask_written`: the scatter-side launch of this call already wrote the owner-masked tile ids
+/// of the wide-verify int8 chain (`HIPFIRE_QWEN4_MOE_GLUE_FOLD`, [`scatter_masked`]); the chain's own
+/// `ep_tile_mask` launch is skipped.
 pub(crate) fn gate_up_front(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
     use_path2: bool,
     grouped_rows: usize,
     front: Option<MoeFront>,
+    tile_mask_written: bool,
 ) -> Result<(), DispatchError> {
     if is_fp8(p) {
         return fp8_gate_up(gpu, p, grouped_rows);
@@ -2365,19 +2419,46 @@ pub(crate) fn gate_up_front(
         gpu.qwen4_moe_gu_a8_receipt(p.batch_size, grouped_rows, mask.is_some());
         let tile_ids = match mask {
             Some(mask) => {
-                hip(gpu.ep_tile_mask(
-                    p.expert_tile_ids,
-                    mask.tile_ids_owned,
-                    mask.owner_table,
-                    grouped_tiles(grouped_rows),
-                    mask.n_experts,
-                    mask.rank,
-                ))?;
+                // `HIPFIRE_QWEN4_MOE_GLUE_FOLD` a / b: the scatter-side launch already wrote the
+                // masked copy of the tile ids of this call.
+                if !tile_mask_written {
+                    hip(gpu.ep_tile_mask(
+                        p.expert_tile_ids,
+                        mask.tile_ids_owned,
+                        mask.owner_table,
+                        grouped_tiles(grouped_rows),
+                        mask.n_experts,
+                        mask.rank,
+                    ))?;
+                }
                 mask.tile_ids_owned
             }
             None => gemm_tile_ids(p),
         };
         let xq = hip(gpu.qwen4_moe_rotate256_i8(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
+        if gpu.qwen4_moe_gu_rot_fold_applies(
+            2 * p.mi,
+            p.gate_up_k,
+            p.down_m,
+            p.down_k,
+            grouped_rows,
+            p.k_top,
+        ) {
+            // HIPFIRE_QWEN4_MOE_GLUE_FOLD=c: the down producer (`qwen4_moe_rotate128_i8`) runs in this
+            // GEMM's epilogue; the sidecar waits in the dedicated down scratch for the down stage's
+            // `gemm_qwen4_moe_down_a8_rot_sym` (same predicate, same arguments). No BF16 grouped rows.
+            return hip(gpu.gemm_qwen4_moe_gate_up_silu_a8_rot_sym(
+                gate_up_ptrs,
+                tile_ids,
+                p.sorted_slot_index,
+                &xq,
+                2 * p.mi,
+                p.gate_up_k,
+                p.k_top,
+                grouped_rows,
+                p.batch_size,
+            ));
+        }
         return hip(gpu.gemm_qwen4_moe_gate_up_silu_a8_sym(
             gate_up_ptrs,
             tile_ids,
@@ -2837,6 +2918,27 @@ fn down_stage(
         // down reads only the records of the tiles it runs, never a masked tile's.
         let tile_ids =
             ep_a8_owner_mask(gpu, p)?.map_or(gemm_tile_ids(p), |mask| mask.tile_ids_owned);
+        if gpu.qwen4_moe_gu_rot_fold_applies(
+            2 * p.mi,
+            p.gate_up_k,
+            p.down_m,
+            p.down_k,
+            grouped_rows,
+            p.k_top,
+        ) {
+            // The gate/up stage already produced the flat-slot A8 sidecar (HIPFIRE_QWEN4_MOE_GLUE_FOLD=c).
+            hip(gpu.gemm_qwen4_moe_down_a8_rot_sym(
+                down_ptrs,
+                tile_ids,
+                p.sorted_slot_index,
+                p.y_down_grouped,
+                p.down_m,
+                p.down_k,
+                grouped_rows,
+                total_slots,
+            ))?;
+            return release_stage(gpu, p);
+        }
         let xq = hip(gpu.qwen4_moe_rotate128_i8(
             p.y_gate_up_grouped,
             p.sorted_slot_index,

@@ -4593,6 +4593,16 @@ pub const MOE_ROUTE_SCATTER_TOP10_F32_SRC: &str = concat!(
     include_str!("../../../kernels/src/qwen4_moe_scatter_fused_k8.hip"),
     include_str!("../../../kernels/src/moe_route_scatter_top10_f32.gfx1201.hip")
 );
+/// Wave-3 C8 MoE glue folds (`HIPFIRE_QWEN4_MOE_GLUE_FOLD`, exact gfx1201): the scatter + owner tile
+/// mask launch (`moe_scatter_fused_top10_pmask`, X8a) and the 9..=64-row router + scatter (+ mask)
+/// launch (`moe_route_scatter_top10_wide_f32`, X8b). Same concatenation as
+/// [`MOE_ROUTE_SCATTER_TOP10_F32_SRC`] with the wide entries as the last unit; the scatter body and
+/// the router token body are the shipped text, the tile mask is the law of `ep_tile_mask_pm_gfx1201`.
+pub const MOE_ROUTE_SCATTER_WIDE_SRC: &str = concat!(
+    include_str!("../../../kernels/src/moe_router_softmax_top10_f32_fast.hip"),
+    include_str!("../../../kernels/src/qwen4_moe_scatter_fused_k8.hip"),
+    include_str!("../../../kernels/src/moe_route_scatter_wide.gfx1201.hip")
+);
 /// Opt-in Qwen4 symmetric IU4 MoE route (fn-moe-sym, gfx1151 and gfx1201),
 /// separately named modules; no incumbent module is extended.
 /// gfx1151 hipcc twin of the builder GEMMs (the `HIPFIRE_QWEN4_MOE_SYM_PM=0`
@@ -12854,4 +12864,14 @@ pub const QWEN4_MOE_ROTATE128_I8_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/qwen4_moe_rotate128_i8.hip")
+);
+/// Gate/up A8 GEMM of the same chain with the down producer folded into its epilogue
+/// (`qwen4_moe_ep_a8_gate_up_rot_planar_nt{1,2}`, `HIPFIRE_QWEN4_MOE_GLUE_FOLD` sub-fold `c`): the legacy
+/// A8 GEMM source and the A8 quantizer in front (unchanged), so the two legacy sources above keep their
+/// recorded identity. A module of its own.
+pub const QWEN4_MOE_EP_A8_ROT_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/qwen4_moe_ep_a8.gfx12.hip"),
+    include_str!("../../../kernels/src/qwen4_moe_ep_a8_rot.gfx12.hip")
 );

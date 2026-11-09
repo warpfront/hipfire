@@ -1753,6 +1753,10 @@ pub struct Gpu {
     /// (HIPFIRE_QWEN4_HC_PAIR_DECODE), allocated and zeroed on first use; the kernel's last
     /// block of a row resets its counter, so it stays zero between launches.
     pub(crate) hc_pair_sync: Option<GpuTensor>,
+    /// Arrival counter of `moe_route_scatter_top10_wide_f32` (HIPFIRE_QWEN4_MOE_GLUE_FOLD b),
+    /// allocated and zeroed on first use; the launch's last workgroup resets it, so it stays zero
+    /// between launches. Eager launches only.
+    pub(crate) moe_route_sync: Option<GpuTensor>,
     /// The routed-expert weights this device reads through the Qwen4 MQ4 MoE
     /// launchers are in the drop-zero planar layout (`DType::MQ4G256V2P` /
     /// `MQ4G128V2P`, DESIGN F1) instead of the shipped qt44/qt53 layout. Set
@@ -3210,6 +3214,7 @@ impl Gpu {
                 true,
             ),
             hc_pair_sync: None,
+            moe_route_sync: None,
             mq4_experts_planar: false,
             moe32_gu: match hipfire_config::developer_var("HIPFIRE_QWEN4_MOE32_GU").as_deref() {
                 Ok("0") => 0,
@@ -3313,6 +3318,10 @@ impl Gpu {
                 int8_mmq_x_scratch: None,
                 int8_mmq_x_scratch_bytes: 0,
                 int8_mmq_generation: 0,
+                int8_mmq_down_x_scratch: None,
+                int8_mmq_down_x_scratch_bytes: 0,
+                int8_mmq_down_generation: 0,
+                int8_mmq_down_pending: None,
                 qwen4_moe_group_scratch: None,
                 qwen4_moe_group_scratch_bytes: 0,
                 qwen4_moe_down_i4_scratch: None,
@@ -5994,6 +6003,26 @@ impl Gpu {
             }
         }
         self.scratch.reserve_int8_mmq(&self.hip, k, n)
+    }
+
+    /// [`Self::reserve_int8_mmq`] for the dedicated flat-slot down sidecar of the gate/up GEMM with the
+    /// rotate128 epilogue (`k % 128 == 0`): same graph-invalidation discipline on growth.
+    pub fn reserve_int8_mmq_down(
+        &mut self,
+        k: usize,
+        n: usize,
+    ) -> HipResult<crate::scratch::Int8MmqReservation> {
+        if k != 0 && n != 0 && k % 128 == 0 {
+            let needed = crate::scratch::int8_mmq_x_needed(k, n);
+            if crate::scratch::scratch_will_grow(
+                self.scratch.int8_mmq_down_x_scratch_bytes,
+                self.scratch.int8_mmq_down_x_scratch.is_some(),
+                needed,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
+        }
+        self.scratch.reserve_int8_mmq_down(&self.hip, k, n)
     }
 
     pub fn int8_mmq_prepared_ptr(

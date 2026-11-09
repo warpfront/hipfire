@@ -388,6 +388,11 @@ pub(super) struct MoeStepState<'a> {
     /// The route stage ran the fused router + scatter launch; the next `Scatter` stage launches
     /// nothing (and clears this).
     route_scatter_done: Cell<bool>,
+    /// `HIPFIRE_QWEN4_MOE_GLUE_FOLD`: the scatter-side launch of this call (the scatter stage's
+    /// `moe_scatter_fused_top10_pmask` or the route stage's wide router + scatter launch) wrote the
+    /// wide-verify chain's owner-masked tile ids; the gate/up stage takes this (and clears it) and
+    /// does not launch `ep_tile_mask`.
+    tile_mask_written: Cell<bool>,
 }
 
 /// A call abandoned between `Combine` (which queued the CP wait) and `JoinSplit`
@@ -474,6 +479,7 @@ impl<'a> MoeStepState<'a> {
             norm_fold_active: Cell::new(false),
             route_scatter_allowed: Cell::new(false),
             route_scatter_done: Cell::new(false),
+            tile_mask_written: Cell::new(false),
         }
     }
 
@@ -1384,16 +1390,27 @@ impl<'a> SealedMoeOp<'a> {
                     && selection
                         .route
                         .is_some_and(MoeRouteCapability::is_sealed_grouped)
-                    && gpu.moe_route_scatter_top10_admitted(
+                    && (gpu.moe_route_scatter_top10_admitted(
                         params.batch_size,
                         params.n_exp,
                         params.k_top,
-                    )
+                    ) || gpu.moe_glue_fold_route_admitted(
+                        params.batch_size,
+                        params.n_exp,
+                        params.k_top,
+                    ))
                     && super::qt44_qt53_prefill::scatter_fusable(gpu, params))
-                .then(|| super::sealed_moe::RouteScatterFuse {
-                    grouped_rows: selection.path2_m_total,
-                    launched: &self.state.route_scatter_done,
-                });
+                .then(|| {
+                    Ok::<_, DispatchError>(super::sealed_moe::RouteScatterFuse {
+                        grouped_rows: selection.path2_m_total,
+                        launched: &self.state.route_scatter_done,
+                        // The wide router + scatter launch (`HIPFIRE_QWEN4_MOE_GLUE_FOLD` b) also
+                        // writes the wide-verify chain's owner-masked tile ids.
+                        owner_mask: super::qt44_qt53_prefill::glue_fold_owner_mask(gpu, params)?,
+                        mask_written: &self.state.tile_mask_written,
+                    })
+                })
+                .transpose()?;
                 let receipt = super::sealed_moe::produce_prefill_route(
                     self.state.call,
                     gpu,
@@ -1681,7 +1698,13 @@ impl<'a> SealedMoeOp<'a> {
             if self.state.route_scatter_done.replace(false) {
                 return Ok(());
             }
-            return super::qt44_qt53_prefill::scatter(gpu, params, selection.path2_m_total);
+            let mask_written = super::qt44_qt53_prefill::scatter_masked(
+                gpu,
+                params,
+                selection.path2_m_total,
+            )?;
+            self.state.tile_mask_written.set(mask_written);
+            return Ok(());
         }
         super::prefill_scatter_stage(gpu, params, selection.path2_m_total)
     }
@@ -1722,6 +1745,7 @@ impl<'a> SealedMoeOp<'a> {
                 selection.uses_grouped_rows(),
                 selection.path2_m_total,
                 front,
+                self.state.tile_mask_written.replace(false),
             );
         }
         if let ExpertIu4Decision::Admitted(plan) =

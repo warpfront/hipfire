@@ -2458,6 +2458,10 @@ fn validate_route_receipt_pair(
 pub(super) struct RouteScatterFuse<'a> {
     pub(super) grouped_rows: usize,
     pub(super) launched: &'a std::cell::Cell<bool>,
+    /// The owner mask of the wide-verify int8 chain of this call (`HIPFIRE_QWEN4_MOE_GLUE_FOLD`):
+    /// the 9..=64-row wide launch writes its masked tile-id copy too and sets `mask_written`.
+    pub(super) owner_mask: Option<crate::families::moe::MoeDecodeOwnerMask<'a>>,
+    pub(super) mask_written: &'a std::cell::Cell<bool>,
 }
 
 /// Run the family-specific prefill router and mint its invocation-bound
@@ -2546,7 +2550,44 @@ pub(super) fn produce_prefill_route<'a>(
                     super::router_observer::RouterScoresAfterRoute::Logits,
                     params.recipe.bf16_round_trip(),
                 );
+                // `HIPFIRE_QWEN4_MOE_GLUE_FOLD` b: 9..=64 rows run the wide router + scatter (+ owner
+                // mask) launch, 1..=8 rows the one-workgroup `moe_route_scatter_top10_f32`.
+                let wide = fuse_scatter.is_some()
+                    && gpu.moe_glue_fold_route_admitted(
+                        params.batch_size,
+                        params.n_exp,
+                        params.k_top,
+                    );
                 let fused = match fuse_scatter.as_ref() {
+                    Some(fuse) if wide => gpu
+                        .moe_route_scatter_top10_wide_f32(
+                            scores,
+                            params.topk_indices,
+                            params.topk_weights,
+                            params.batch_size,
+                            normalize,
+                            params.recipe.bf16_round_trip(),
+                            router_layer,
+                            row_base,
+                            params.expert_token_counts,
+                            params.expert_offsets,
+                            params.sorted_slot_index,
+                            params.expert_tile_ids,
+                            params.inverse_perm,
+                            params.n_exp,
+                            params.k_top,
+                            fuse.grouped_rows,
+                            crate::families::moe::MOE_GROUPED_BLOCK_M,
+                            fuse.owner_mask.as_ref().map(|mask| {
+                                rdna_compute::moe::TileMaskFold {
+                                    tile_ids_owned: mask.tile_ids_owned,
+                                    owner_table: mask.owner_table,
+                                    tiles: fuse.grouped_rows.div_ceil(rdna_compute::moe::EP_TILE_ROWS),
+                                    rank: mask.rank,
+                                }
+                            }),
+                        )
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?,
                     Some(fuse) => gpu
                         .moe_route_scatter_top10_f32(
                             scores,
@@ -2573,6 +2614,9 @@ pub(super) fn produce_prefill_route<'a>(
                 if fused {
                     if let Some(fuse) = fuse_scatter.as_ref() {
                         fuse.launched.set(true);
+                        if wide && fuse.owner_mask.is_some() {
+                            fuse.mask_written.set(true);
+                        }
                     }
                 } else {
                     gpu.moe_router_softmax_top10_f32(
