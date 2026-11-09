@@ -66,7 +66,10 @@
 //! decides, every rank replays the ordered messages) whose advance feeds the
 //! same emission path (`forwarded_tokens` from the window's seed). The two
 //! halves fail independently: an error in one errors only its own lanes and
-//! the other half's committed tokens are still emitted. Route mix by step
+//! the other half's committed tokens are still emitted. The executor half's
+//! prefill ticks (first tokens) are emitted between the halves, before the
+//! mesh window (`HIPFIRE_LANE_FIRST_TOKEN_BEFORE_MESH`; `emit_tick` is the one
+//! per-tick emission both positions use). Route mix by step
 //! concurrency is logged once per drive (`[fn-lane-mesh-mix]`). An AR EP store
 //! (kill switch `HIPFIRE_EP_MTP_LANES=0`) keeps the executor
 //! path unchanged.
@@ -408,6 +411,32 @@ static LANE_EARLY_FIRST_TOKEN: std::sync::LazyLock<bool> = std::sync::LazyLock::
 
 fn early_first_token_enabled() -> bool {
     *LANE_EARLY_FIRST_TOKEN
+}
+
+/// `HIPFIRE_LANE_FIRST_TOKEN_BEFORE_MESH`: unset / anything but exact `0` streams the executor
+/// half's prefill ticks (the early first tokens, abort / stop / EOS / length finishes and the
+/// `prefill_progress` events of the lanes whose prompt chunk this step ran) right after the
+/// executor commits and BEFORE the step's EP mesh decode window runs; `0` (kill switch)
+/// emits them after that window, with the rest of the tick. Meaningful only with
+/// `HIPFIRE_LANE_EARLY_FIRST_TOKEN` on, and only on a step that carries a mesh window.
+pub const LANE_FIRST_TOKEN_BEFORE_MESH_ENV: &str = "HIPFIRE_LANE_FIRST_TOKEN_BEFORE_MESH";
+
+/// `early`: the resolved `HIPFIRE_LANE_EARLY_FIRST_TOKEN` (off: nothing to move, today's order).
+fn first_token_before_mesh_from(early: bool, value: Option<&str>) -> bool {
+    early && value.map(str::trim) != Some("0")
+}
+
+static LANE_FIRST_TOKEN_BEFORE_MESH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    first_token_before_mesh_from(
+        early_first_token_enabled(),
+        hipfire_config::developer_var(LANE_FIRST_TOKEN_BEFORE_MESH_ENV)
+            .ok()
+            .as_deref(),
+    )
+});
+
+fn first_token_before_mesh_enabled() -> bool {
+    *LANE_FIRST_TOKEN_BEFORE_MESH
 }
 
 /// `HIPFIRE_LANE_ADMIT_COALESCE_MS`: the quiet gap (ms) a lane-admission tick waits for one
@@ -967,7 +996,9 @@ struct PlannedStep {
 /// line per lane step. `host` is the wall time from the previous step's end
 /// to this plan (terminal decisions, inbox, admission); `plan` holds the
 /// batched draft (one D2H per draft step); `fwd` is provision + forward
-/// (synchronized by the pick download); then `commit` and `emit`. Rows by
+/// (synchronized by the pick download); then `commit` (the executor's commit and the
+/// mesh decode window) and `emit`, which also holds the prefill ticks emitted before the
+/// mesh window (`HIPFIRE_LANE_FIRST_TOKEN_BEFORE_MESH`). Rows by
 /// kind, decoding/active lanes, the queue and the committed tokens follow.
 struct StepTrace {
     origin: Instant,
@@ -987,7 +1018,10 @@ impl StepTrace {
             })
     }
 
-    /// `marks`: plan start, forward start, commit start, commit end.
+    /// `marks`: plan start, forward start, commit start, commit end. `early_emit`: the
+    /// emit time spent inside the commit window (prefill ticks before the mesh window),
+    /// reported under `emit` and not `commit`.
+    #[allow(clippy::too_many_arguments)]
     fn line(
         &mut self,
         marks: [Instant; 4],
@@ -997,9 +1031,11 @@ impl StepTrace {
         accepted: usize,
         active: usize,
         queued: usize,
+        early_emit: Duration,
     ) {
         let now = Instant::now();
         let ms = |a: Instant, b: Instant| b.saturating_duration_since(a).as_secs_f64() * 1000.0;
+        let early_ms = early_emit.as_secs_f64() * 1000.0;
         let (mut pf, mut pf_rows, mut ar, mut ver, mut ver_rows) = (0, 0, 0, 0, 0);
         for r in &plan.requests {
             match r.kind {
@@ -1018,7 +1054,7 @@ impl StepTrace {
         eprintln!("[fn-lane-step] n={} t={:.1} host={:.2} plan={:.2} fwd={:.2} commit={:.2} emit={:.2} active={active} queued={queued} \
             pf={pf} pf_rows={pf_rows} ar={ar} ver={ver} ver_rows={ver_rows} mesh_lanes={} mesh_native={} mesh_copy={} mesh_ar={} tokens={tokens} accepted={accepted}",
             self.step, ms(self.origin, marks[0]), ms(self.last, marks[0]), ms(marks[0], marks[1]), ms(marks[1], marks[2]),
-            ms(marks[2], marks[3]), ms(marks[3], now), mesh.lanes, mesh.native_windows, mesh.copy_windows, mesh.ar_windows);
+            (ms(marks[2], marks[3]) - early_ms).max(0.0), ms(marks[3], now) + early_ms, mesh.lanes, mesh.native_windows, mesh.copy_windows, mesh.ar_windows);
         hip_bridge::site_ledger::mark_step(self.step, mesh.lanes, pf_rows, tokens);
         self.step += 1;
         self.last = now;
@@ -1447,6 +1483,186 @@ fn finish_lane(
     writeln!(stdout, "{ready}")
         .and_then(|()| stdout.flush())
         .map_err(|e| e.to_string())
+}
+
+/// Whether `advance` is the executor's tick of a lane whose prompt chunk this step ran: not a
+/// decode advance and not an EP mesh window (which carries its seed).
+fn is_prefill_tick(
+    plan: &BatchStepPlan,
+    advance: &RequestAdvance,
+    decode_seed: Option<u32>,
+) -> bool {
+    decode_seed.is_none()
+        && plan
+            .requests
+            .iter()
+            .find(|r| r.epoch == advance.epoch)
+            .is_some_and(|r| r.kind == RequestStepKind::Prefill)
+}
+
+/// Emit one lane's committed tick: a prefill tick streams `prefill_progress`, stamps the
+/// prefill timers and (early first token) the lane's first committed token; any other tick
+/// streams its forwarded window (`forwarded_tokens`). `decode_seed` is the mesh window's
+/// pending seed, `None` for the executor's own ticks. Terminal finishes and per-lane errors
+/// are handled here; `Err` is a driver-level failure.
+#[allow(clippy::too_many_arguments)]
+fn emit_tick(
+    sched: &mut ContinuousBatchScheduler,
+    m: &mut LoadedModel,
+    gpu: &mut Gpu,
+    controls: &mut [Option<LaneCtl>],
+    stdout: &mut Stdout,
+    plan: &BatchStepPlan,
+    eos: u32,
+    advance: RequestAdvance,
+    decode_seed: Option<u32>,
+) -> Result<(), String> {
+    let idx = controls
+        .iter()
+        .position(|c| c.as_ref().is_some_and(|c| c.epoch == advance.epoch))
+        .ok_or("qwen4 advance has no request owner")?;
+    let request = plan.requests.iter().find(|r| r.epoch == advance.epoch);
+    let is_prefill = is_prefill_tick(plan, &advance, decode_seed);
+    let plan_seed = match (decode_seed, request) {
+        (Some(seed), _) => seed,
+        (None, Some(r)) => plan.batch.tokens[r.rows.begin],
+        (None, None) => return Err("qwen4 advance not in plan".into()),
+    };
+    if is_prefill {
+        // `prefill_progress` for the lane's prompt chunk (the
+        // last chunk is silent: `done < total` only).
+        if let BatchLane::Running(lane) | BatchLane::Seeding(lane) = &sched.lanes[idx] {
+            let progress = Owner::of(m, gpu).ok().and_then(|owner| {
+                let cell = owner.bundle.lanes()?.lane(&advance.epoch)?;
+                Some((cell.host.prefilled, cell.host.prompt.len()))
+            });
+            if let Some((done, total)) = progress {
+                crate::common::emit_prefill_progress(
+                    stdout,
+                    &lane.key.id,
+                    Some(lane.key.attempt_id),
+                    done,
+                    total,
+                );
+            }
+        }
+        if !advance.committed_ids.is_empty() {
+            let ctl = controls[idx].as_mut().ok_or("lane control missing")?;
+            ctl.prefill_ms = ctl.start.elapsed().as_secs_f64() * 1000.0;
+            ctl.decode_start = Some(Instant::now());
+            if let BatchLane::Running(lane) = &mut sched.lanes[idx] {
+                lane.prefill_done_at = ctl.decode_start;
+            }
+        }
+        let length_finish = advance.finish.as_deref() == Some("length");
+        // The prompt-completing pick streams in THIS step (it is the lane's
+        // committed first token; its next decode advance then skips it as the
+        // plan seed), not one decode step later with that step's window.
+        // `HIPFIRE_LANE_EARLY_FIRST_TOKEN=0` restores the deferred emission.
+        let early = early_first_token_enabled()
+            && !advance.committed_ids.is_empty()
+            && matches!(sched.lanes[idx], BatchLane::Running(_))
+            && controls[idx]
+                .as_ref()
+                .is_some_and(|c| !c.skip_first_forward);
+        if early {
+            if let BatchLane::Running(lane) = &sched.lanes[idx] {
+                if batch_check_abort(&lane.key.id, lane.key.attempt_id, lane.ticket.admission) {
+                    return cancel_lane(sched, m, controls, idx, stdout);
+                }
+            }
+            let BatchLane::Running(lane) = &mut sched.lanes[idx] else {
+                return Err("prefilled lane is not running".into());
+            };
+            let _scope = BatchAttemptScope::enter_for_generation(
+                &lane.key.id,
+                lane.key.attempt_id,
+                lane.ticket.admission,
+            );
+            let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer disappeared")?;
+            let ctl = controls[idx].as_mut().ok_or("lane control missing")?;
+            ctl.skip_first_forward = true;
+            let emitted = emit_forwarded(
+                stdout,
+                tokenizer,
+                lane,
+                ctl,
+                advance.committed_ids[0],
+                eos,
+                length_finish,
+            );
+            return match emitted {
+                Ok(Some(length)) => match finish_lane(sched, m, controls, idx, stdout, length) {
+                    Ok(()) => Ok(()),
+                    Err(error) => lane_error(sched, m, controls, idx, stdout, &error, "validation"),
+                },
+                Ok(None) => Ok(()),
+                Err(error) => lane_error(sched, m, controls, idx, stdout, &error, "validation"),
+            };
+        }
+        if length_finish {
+            finish_lane(sched, m, controls, idx, stdout, true)?;
+        }
+        return Ok(());
+    }
+    // All step participants committed before any bytes are published.
+    if let BatchLane::Running(lane) = &sched.lanes[idx] {
+        if batch_check_abort(&lane.key.id, lane.key.attempt_id, lane.ticket.admission) {
+            return cancel_lane(sched, m, controls, idx, stdout);
+        }
+    }
+    // Forwarded tokens: the plan seed, then every committed id but
+    // the last (the next pending seed). One entry for an AR row. A
+    // promoted lane's first plan seed was streamed by the singleton.
+    let skip_seed = controls[idx]
+        .as_mut()
+        .is_some_and(|c| std::mem::take(&mut c.skip_first_forward));
+    let forwarded = forwarded_tokens(plan_seed, &advance.committed_ids, skip_seed);
+    let length_finish = advance.finish.as_deref() == Some("length");
+    let _scope = match &sched.lanes[idx] {
+        BatchLane::Running(lane) => BatchAttemptScope::enter_for_generation(
+            &lane.key.id,
+            lane.key.attempt_id,
+            lane.ticket.admission,
+        ),
+        _ => return Err("advanced lane is not running".into()),
+    };
+    if forwarded.is_empty() && length_finish {
+        // The already-streamed promoted seed was the only forwarded token.
+        return match finish_lane(sched, m, controls, idx, stdout, true) {
+            Ok(()) => Ok(()),
+            Err(error) => lane_error(sched, m, controls, idx, stdout, &error, "validation"),
+        };
+    }
+    for (i, &token) in forwarded.iter().enumerate() {
+        let BatchLane::Running(lane) = &mut sched.lanes[idx] else {
+            return Err("advanced lane is not running".into());
+        };
+        let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer disappeared")?;
+        let emitted = emit_forwarded(
+            stdout,
+            tokenizer,
+            lane,
+            controls[idx].as_mut().ok_or("lane control missing")?,
+            token,
+            eos,
+            length_finish && i + 1 == forwarded.len(),
+        );
+        match emitted {
+            Ok(Some(length)) => {
+                if let Err(error) = finish_lane(sched, m, controls, idx, stdout, length) {
+                    lane_error(sched, m, controls, idx, stdout, &error, "validation")?;
+                }
+                break;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                lane_error(sched, m, controls, idx, stdout, &error, "validation")?;
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Serve concurrently admitted Qwen4 requests (greedy, or sampled with
@@ -1998,6 +2214,34 @@ pub fn drive_qwen4_lane_batch(
                     }
                 }
             }
+            // First tokens before the mesh window: on a step that carries one, the executor
+            // half's prefill ticks (a lane's committed first token with its abort / stop / EOS /
+            // length finish, `prefill_progress`) go out now rather than after the mesh decode
+            // window (14-21 ms) that would hold them. The mesh window carries only lanes that
+            // were Decoding when the step was planned, never a lane this step prefilled, so a
+            // lane finished here is not in it. Every other tick keeps its place below.
+            let mut early_emit = Duration::ZERO;
+            if first_token_before_mesh_enabled() && !mesh_requests.is_empty() {
+                let t_early = Instant::now();
+                let (prefill, rest): (Vec<_>, Vec<_>) = ticks
+                    .into_iter()
+                    .partition(|(advance, seed)| is_prefill_tick(&plan, advance, *seed));
+                ticks = rest;
+                for (advance, seed) in prefill {
+                    emit_tick(
+                        sched,
+                        m,
+                        gpu,
+                        &mut controls,
+                        stdout,
+                        &plan,
+                        eos,
+                        advance,
+                        seed,
+                    )?;
+                }
+                early_emit = t_early.elapsed();
+            }
             let mut mesh_facts = MeshStepFacts::default();
             if !mesh_requests.is_empty() {
                 let stepped = {
@@ -2048,190 +2292,17 @@ pub fn drive_qwen4_lane_batch(
                     })
             });
             for (advance, decode_seed) in ticks {
-                let idx = controls
-                    .iter()
-                    .position(|c| c.as_ref().is_some_and(|c| c.epoch == advance.epoch))
-                    .ok_or("qwen4 advance has no request owner")?;
-                let request = plan.requests.iter().find(|r| r.epoch == advance.epoch);
-                let is_prefill = decode_seed.is_none()
-                    && request.is_some_and(|r| r.kind == RequestStepKind::Prefill);
-                let plan_seed = match (decode_seed, request) {
-                    (Some(seed), _) => seed,
-                    (None, Some(r)) => plan.batch.tokens[r.rows.begin],
-                    (None, None) => return Err("qwen4 advance not in plan".into()),
-                };
-                if is_prefill {
-                    // `prefill_progress` for the lane's prompt chunk (the
-                    // last chunk is silent: `done < total` only).
-                    if let BatchLane::Running(lane) | BatchLane::Seeding(lane) = &sched.lanes[idx] {
-                        let progress = Owner::of(m, gpu).ok().and_then(|owner| {
-                            let cell = owner.bundle.lanes()?.lane(&advance.epoch)?;
-                            Some((cell.host.prefilled, cell.host.prompt.len()))
-                        });
-                        if let Some((done, total)) = progress {
-                            crate::common::emit_prefill_progress(
-                                stdout,
-                                &lane.key.id,
-                                Some(lane.key.attempt_id),
-                                done,
-                                total,
-                            );
-                        }
-                    }
-                    if !advance.committed_ids.is_empty() {
-                        let ctl = controls[idx].as_mut().ok_or("lane control missing")?;
-                        ctl.prefill_ms = ctl.start.elapsed().as_secs_f64() * 1000.0;
-                        ctl.decode_start = Some(Instant::now());
-                        if let BatchLane::Running(lane) = &mut sched.lanes[idx] {
-                            lane.prefill_done_at = ctl.decode_start;
-                        }
-                    }
-                    let length_finish = advance.finish.as_deref() == Some("length");
-                    // The prompt-completing pick streams in THIS step (it is the lane's
-                    // committed first token; its next decode advance then skips it as the
-                    // plan seed), not one decode step later with that step's window.
-                    // `HIPFIRE_LANE_EARLY_FIRST_TOKEN=0` restores the deferred emission.
-                    let early = early_first_token_enabled()
-                        && !advance.committed_ids.is_empty()
-                        && matches!(sched.lanes[idx], BatchLane::Running(_))
-                        && controls[idx]
-                            .as_ref()
-                            .is_some_and(|c| !c.skip_first_forward);
-                    if early {
-                        if let BatchLane::Running(lane) = &sched.lanes[idx] {
-                            if batch_check_abort(
-                                &lane.key.id,
-                                lane.key.attempt_id,
-                                lane.ticket.admission,
-                            ) {
-                                cancel_lane(sched, m, &mut controls, idx, stdout)?;
-                                continue;
-                            }
-                        }
-                        let BatchLane::Running(lane) = &mut sched.lanes[idx] else {
-                            return Err("prefilled lane is not running".into());
-                        };
-                        let _scope = BatchAttemptScope::enter_for_generation(
-                            &lane.key.id,
-                            lane.key.attempt_id,
-                            lane.ticket.admission,
-                        );
-                        let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer disappeared")?;
-                        let ctl = controls[idx].as_mut().ok_or("lane control missing")?;
-                        ctl.skip_first_forward = true;
-                        let emitted = emit_forwarded(
-                            stdout,
-                            tokenizer,
-                            lane,
-                            ctl,
-                            advance.committed_ids[0],
-                            eos,
-                            length_finish,
-                        );
-                        match emitted {
-                            Ok(Some(length)) => {
-                                if let Err(error) =
-                                    finish_lane(sched, m, &mut controls, idx, stdout, length)
-                                {
-                                    lane_error(
-                                        sched,
-                                        m,
-                                        &mut controls,
-                                        idx,
-                                        stdout,
-                                        &error,
-                                        "validation",
-                                    )?;
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                lane_error(
-                                    sched,
-                                    m,
-                                    &mut controls,
-                                    idx,
-                                    stdout,
-                                    &error,
-                                    "validation",
-                                )?;
-                            }
-                        }
-                        continue;
-                    }
-                    if length_finish {
-                        finish_lane(sched, m, &mut controls, idx, stdout, true)?;
-                    }
-                    continue;
-                }
-                // All step participants committed before any bytes are published.
-                if let BatchLane::Running(lane) = &sched.lanes[idx] {
-                    if batch_check_abort(&lane.key.id, lane.key.attempt_id, lane.ticket.admission) {
-                        cancel_lane(sched, m, &mut controls, idx, stdout)?;
-                        continue;
-                    }
-                }
-                // Forwarded tokens: the plan seed, then every committed id but
-                // the last (the next pending seed). One entry for an AR row. A
-                // promoted lane's first plan seed was streamed by the singleton.
-                let skip_seed = controls[idx]
-                    .as_mut()
-                    .is_some_and(|c| std::mem::take(&mut c.skip_first_forward));
-                let forwarded = forwarded_tokens(plan_seed, &advance.committed_ids, skip_seed);
-                let length_finish = advance.finish.as_deref() == Some("length");
-                let _scope = match &sched.lanes[idx] {
-                    BatchLane::Running(lane) => BatchAttemptScope::enter_for_generation(
-                        &lane.key.id,
-                        lane.key.attempt_id,
-                        lane.ticket.admission,
-                    ),
-                    _ => return Err("advanced lane is not running".into()),
-                };
-                if forwarded.is_empty() && length_finish {
-                    // The already-streamed promoted seed was the only forwarded token.
-                    if let Err(error) = finish_lane(sched, m, &mut controls, idx, stdout, true) {
-                        lane_error(sched, m, &mut controls, idx, stdout, &error, "validation")?;
-                    }
-                    continue;
-                }
-                for (i, &token) in forwarded.iter().enumerate() {
-                    let BatchLane::Running(lane) = &mut sched.lanes[idx] else {
-                        return Err("advanced lane is not running".into());
-                    };
-                    let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer disappeared")?;
-                    let emitted = emit_forwarded(
-                        stdout,
-                        tokenizer,
-                        lane,
-                        controls[idx].as_mut().ok_or("lane control missing")?,
-                        token,
-                        eos,
-                        length_finish && i + 1 == forwarded.len(),
-                    );
-                    match emitted {
-                        Ok(Some(length)) => {
-                            if let Err(error) =
-                                finish_lane(sched, m, &mut controls, idx, stdout, length)
-                            {
-                                lane_error(
-                                    sched,
-                                    m,
-                                    &mut controls,
-                                    idx,
-                                    stdout,
-                                    &error,
-                                    "validation",
-                                )?;
-                            }
-                            break;
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            lane_error(sched, m, &mut controls, idx, stdout, &error, "validation")?;
-                            break;
-                        }
-                    }
-                }
+                emit_tick(
+                    sched,
+                    m,
+                    gpu,
+                    &mut controls,
+                    stdout,
+                    &plan,
+                    eos,
+                    advance,
+                    decode_seed,
+                )?;
             }
             if let (Some(trace), Some((tokens, accepted))) = (trace.as_mut(), decoded) {
                 let active = controls
@@ -2247,6 +2318,7 @@ pub fn drive_qwen4_lane_batch(
                     accepted,
                     active,
                     sched.inbox.len(),
+                    early_emit,
                 );
             }
         }
@@ -2665,6 +2737,114 @@ mod tests {
         for off in [Some("0"), Some(" 0\n")] {
             assert!(!early_first_token_from(off), "{off:?}");
         }
+    }
+
+    #[test]
+    fn first_token_before_mesh_is_on_unless_exact_zero_and_needs_the_early_first_token() {
+        use super::first_token_before_mesh_from;
+        for on in [None, Some(""), Some("1"), Some("on"), Some(" 1 ")] {
+            assert!(first_token_before_mesh_from(true, on), "{on:?}");
+        }
+        for off in [Some("0"), Some(" 0\n")] {
+            assert!(!first_token_before_mesh_from(true, off), "{off:?}");
+        }
+        // With the early first token off there is no first token to move: today's order.
+        for any in [None, Some("1"), Some("0")] {
+            assert!(!first_token_before_mesh_from(false, any), "{any:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_executors_prefill_rows_are_prefill_ticks() {
+        use super::is_prefill_tick;
+        use hipfire_runtime::slot_batch::{
+            BatchStepPlan, RequestAdvance, RequestRows, RequestStepKind, RowRange,
+        };
+        let epoch = |tag| RequestEpoch {
+            request_tag: tag,
+            owner_generation: 1,
+        };
+        let rows = |tag, begin, kind| RequestRows {
+            epoch: epoch(tag),
+            rows: RowRange { begin, len: 1 },
+            kind,
+        };
+        let advance = |tag| RequestAdvance {
+            epoch: epoch(tag),
+            committed_ids: vec![5],
+            committed_position: 1,
+            accepted_drafts: 0,
+            verified_rows: 0,
+            finish: None,
+        };
+        let plan = BatchStepPlan {
+            requests: vec![
+                rows(1, 0, RequestStepKind::Prefill),
+                rows(2, 1, RequestStepKind::Ar),
+                rows(3, 2, RequestStepKind::Verify { draft_len: 1 }),
+            ],
+            ..Default::default()
+        };
+        assert!(is_prefill_tick(&plan, &advance(1), None));
+        assert!(!is_prefill_tick(&plan, &advance(2), None));
+        assert!(!is_prefill_tick(&plan, &advance(3), None));
+        // A mesh window carries its seed and is never in the executor's plan.
+        assert!(!is_prefill_tick(&plan, &advance(1), Some(9)));
+        assert!(!is_prefill_tick(&plan, &advance(4), None));
+    }
+
+    /// The order is the point: the executor's prefill ticks leave between the executor's
+    /// commit and the mesh decode window, behind the kill switch and only on a step that
+    /// carries a mesh window; every other tick keeps the single emission loop after it. The
+    /// mesh window's requests derive from lanes that were already Decoding at plan time,
+    /// so a lane a step prefilled (and may finish by its first token) is never in it.
+    #[test]
+    fn prefill_ticks_are_emitted_before_the_mesh_decode_step() {
+        let src = include_str!("fn_batch.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("test module")];
+        let drive = prod.find("pub fn drive_qwen4_lane_batch").expect("drive");
+        let body = &prod[drive..];
+        let commit = body
+            .find("executor.commit_step(&plan, out)")
+            .expect("executor commit");
+        let early = body
+            .find("if first_token_before_mesh_enabled() && !mesh_requests.is_empty()")
+            .expect("before-mesh emission");
+        let mesh = body.find("ep_mesh_decode_step").expect("mesh half");
+        let rest = body
+            .find("for (advance, decode_seed) in ticks")
+            .expect("remaining emission");
+        assert!(
+            commit < early && early < mesh && mesh < rest,
+            "commit, prefill ticks, mesh window, then every other tick"
+        );
+        let block = &body[early..mesh];
+        assert!(block.contains("is_prefill_tick(&plan, advance, *seed)"));
+        assert!(block.contains("emit_tick("));
+        // Both positions share one per-tick emission; the loop body is not duplicated.
+        assert_eq!(prod.matches("fn emit_tick(").count(), 1);
+        assert_eq!(body.matches("emit_tick(").count(), 2);
+        assert_eq!(
+            prod.matches("emit_forwarded(").count(),
+            3,
+            "decl + 2 in emit_tick"
+        );
+        // The emit time spent ahead of the mesh window is reported under `emit`.
+        assert!(body.contains("early_emit = t_early.elapsed();"));
+        assert!(body[body.find("trace.line(").expect("trace")..].contains("early_emit,"));
+        // plan_step: mesh requests come from `chosen`, which come from Decoding lanes;
+        // prefill rows come from Prefilling lanes only.
+        let plan_fn = prod.find("fn plan_step(").expect("plan_step");
+        let plan_src = &prod[plan_fn..drive];
+        let decoding = plan_src.find("let decoding: Vec<_>").expect("decoding set");
+        assert!(plan_src[decoding..].contains("l.host.status == LaneStatus::Decoding"));
+        assert!(plan_src.contains("let chosen: Vec<_> = (0..count.min(row_budget))"));
+        assert!(plan_src.contains("decoding[(*cursor + j) % count]"));
+        let mesh_build = plan_src
+            .find("mesh_requests = controls")
+            .expect("mesh requests");
+        assert!(plan_src[mesh_build..].contains("chosen.contains(&c.slot)"));
+        assert!(plan_src.contains("LaneStatus::Prefilling => rows.push(("));
     }
 
     #[test]
