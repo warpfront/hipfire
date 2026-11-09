@@ -24,6 +24,11 @@ rayon.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 railgun = { path = "../railgun", features = ["npu"] }
 
+# The D2 tail's slot/generation API (`railgun::sealed_table::generation`) is GPU-free and has no
+# platform code: off Linux the crate builds it without the HIP-interop `npu` feature.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+railgun = { path = "../railgun" }
+
 [dev-dependencies]
 half.workspace = true
 memmap2.workspace = true

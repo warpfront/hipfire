@@ -27,7 +27,7 @@
 //!   count (rank-independent) whether this window ends a group; if not it returns at once (no
 //!   sync, no D2H) and the next window keeps appending to the log. At a group end:
 //!   one D2H of the log, the window's distinct units against the slots live at
-//!   its START, then [`crate::expert_unit_tail::TailPolicy::retire`], the touched
+//!   its START, then [`crate::expert_unit_tail::TailPolicy::retire_windows`], the touched
 //!   tables' upload on the compute stream, and only then the new fills on the
 //!   copy stream (it waits for the upload, so no copy can overwrite a slot a
 //!   table still names). Completed fills are published at the next retirement.
@@ -47,6 +47,38 @@
 //!   tables with its own table uploads (compute stream, before its own fills) and only then
 //!   records the ACK the owners release quarantined slots on. Teardown frees the pools with the
 //!   mesh, like the static cores peer tables name.
+//!
+//! # Generations, leases and fences (the slot bank)
+//!
+//! The pool is the slot bank's block ([`crate::expert_unit_tail::TailPolicy`] owns the bank):
+//! the tail publishes ONE immutable table generation per retirement (epoch = the retirement
+//! index, the warm start is epoch 0, a borrow resume re-seals `sub + 1`) through the tables'
+//! backing, and holds a window lease on it from its publication until the next retirement's
+//! fence. Retirement `j`:
+//!
+//! 1. fences the window of generation `j - 1` (`finish_window` on a [`RankCompute`] whose `wait`
+//!    is the `stream_synchronize(active)` the protocol always did), then the D2H of the log;
+//! 2. polls the pending fill batches on the copy stream ([`RankCopy`] over the batch events:
+//!    `event_query`, `event_synchronize` under fill overlap, events recycled) into completion
+//!    tokens;
+//! 3. retires generation `j - 1` (PEER mode: the one `released_through` call of the
+//!    retirement), which hands back the table backing: the tables' write capability, held
+//!    only until step 5;
+//! 4. steps the policy with the retirement token (publish completions, evict, reclaim, start
+//!    fills);
+//! 5. writes the table images and uploads the changed ranges (the host images are the backing's
+//!    host side), posts / takes / applies the peer deltas;
+//! 6. seals generation `j` over the tables, leases it, records the PEER ack;
+//! 7. records the tables-ready event, makes the copy stream wait for it and issues the fills
+//!    (now, or deferred to the next forward under fill overlap): two `memcpy_htod_async` per
+//!    ticket, restricted to the ticket's write spans, then ONE event on the copy stream.
+//!
+//! The backends are borrowed, `!Send` capability structs minted on the rank thread for one call
+//! ([`RankCompute`], [`RankCopy`], [`RankDevice`]). A failed or unfinished fence quarantines
+//! what it guarded; a borrow epoch lends the whole pool as scratch (a scratch loan, refused
+//! while any generation is live) and its close re-copies every occupied slot from the canonical
+//! host bytes; release frees the pool only after the bank closed, and leaks it (logged) when it
+//! could not.
 //!
 //! Any device error freezes the tail at its last uploaded table and logs once;
 //! it never fails a decode (every table state is valid: canonical, or a live
@@ -69,17 +101,27 @@
 //! one thing that does fail decodes: [`UnitTailRank::pins_fault`] makes the owner assignment
 //! refuse on every rank, because running a call over diverged planes is not exact.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use hip_bridge::{Event, PinnedHostBuffer, Stream, HIP_EVENT_DISABLE_TIMING};
+use hip_bridge::{Event, HipRuntime, PinnedHostBuffer, Stream, HIP_EVENT_DISABLE_TIMING};
+use railgun::sealed_table::generation::{
+    acquire_window_owned, finish_window, BlockRegistry, Expert, FenceBackend, FenceFailure,
+    FenceState, FillComplete, FillTicket, FillsNotDone, GenerationId, OwnedTableGeneration,
+    PeerReaderFence, PendingFills, PendingOrQuarantined, PendingRestore, ScratchLoan, SlotSpan,
+    TableBacking, WindowReadLease,
+};
+use railgun::window::Quiescence;
+use railgun::Binding;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::expert_ep_units::EpUnitPlan;
 use crate::expert_unit_tail::{
-    EpUnitTailConfig, FillOp, PeerBoard, PeerDelta, PeerTake, PinDelta, PinPlanes, PinProtocol,
-    Retire, RetireCadence, SlotPhase, TailPolicy, UnitKey, WindowUse, QUARANTINE_WINDOWS,
+    occupant_unit, EpUnitTailConfig, FillOp, PeerBoard, PeerDelta, PeerTake, PinDelta, PinPlanes,
+    PinProtocol, Retire, RetireCadence, TailPolicy, UnitKey, WindowUse, QUARANTINE_WINDOWS,
 };
 
 /// Ids one window's log holds (`calls x slots`); a window past this stops
@@ -262,8 +304,10 @@ impl std::ops::DerefMut for TableImage {
 }
 
 impl TableImage {
-    /// Point `expert` at `value`; noted dirty only when the entry changed.
-    fn write_entry(&mut self, expert: usize, value: u64) {
+    /// Point `expert` at `value`; noted dirty only when the entry changed. The table backing is
+    /// the write capability: the images are the backing's host side, written only while no
+    /// generation is sealed over the tables.
+    fn write_entry(&mut self, _backing: &TableBacking, expert: usize, value: u64) {
         let at = expert * ENTRY_BYTES;
         let bytes = value.to_le_bytes();
         if self[at..at + ENTRY_BYTES] != bytes {
@@ -274,9 +318,11 @@ impl TableImage {
 
     /// Enqueue the upload of the entries rewritten since the last one (nothing when clean) to
     /// `table` on `stream`; returns the bytes enqueued. The image may not be rewritten until the
-    /// stream drained (the window protocol's `stream_synchronize` at the next retirement).
+    /// stream drained (the window protocol's fence of the generation published through it, at
+    /// the next retirement). The table backing is the write capability.
     fn upload_dirty(
         &mut self,
+        _backing: &TableBacking,
         gpu: &Gpu,
         table: &GpuTensor,
         stream: Option<&Stream>,
@@ -397,8 +443,15 @@ fn apply_peer_delta(
 }
 
 impl FullTable {
-    /// [`apply_peer_delta`] on this table's image.
-    fn apply_peer(&mut self, rank: usize, ranks: usize, owner: usize, delta: &PeerDelta) -> bool {
+    /// [`apply_peer_delta`] on this table's image. The table backing is the write capability.
+    fn apply_peer(
+        &mut self,
+        _backing: &TableBacking,
+        rank: usize,
+        ranks: usize,
+        owner: usize,
+        delta: &PeerDelta,
+    ) -> bool {
         let changed = apply_peer_delta(
             rank,
             ranks,
@@ -443,21 +496,278 @@ struct TailLayer {
 
 impl TailLayer {
     /// Point `expert` at `(gate_up, down)` in the decode table and, when its canonical entries
-    /// are shared, in the full table.
-    fn set(&mut self, expert: usize, gate_up: u64, down: u64) {
-        self.image_gate_up.write_entry(expert, gate_up);
-        self.image_down.write_entry(expert, down);
+    /// are shared, in the full table. The table backing is the write capability.
+    fn set(&mut self, backing: &TableBacking, expert: usize, gate_up: u64, down: u64) {
+        self.image_gate_up.write_entry(backing, expert, gate_up);
+        self.image_down.write_entry(backing, expert, down);
         if let Some(full) = self.full.as_mut().filter(|full| full.shared[expert]) {
-            full.image_gate_up.write_entry(expert, gate_up);
-            full.image_down.write_entry(expert, down);
+            full.image_gate_up.write_entry(backing, expert, gate_up);
+            full.image_down.write_entry(backing, expert, down);
         }
     }
 }
 
-struct Batch {
-    event: Event,
-    /// `(slot, generation)` per fill of the batch.
-    fills: Vec<(usize, u64)>,
+/// A failed fence whose stream state cannot be proven: everything the fence guarded stays
+/// quarantined.
+fn unknown_failure(error: impl std::fmt::Display) -> FenceFailure {
+    FenceFailure {
+        message: error.to_string(),
+        quiescence: Quiescence::Unknown,
+    }
+}
+
+/// A process-unique backend incarnation: a fence recorded on one backend value is never accepted
+/// by another.
+fn next_incarnation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The copy stream's completion events: one per batch of fills (and per restore), recycled once
+/// the batch completed. Owned by [`Inner`]; every fence method goes through a [`RankCopy`].
+struct EventPool {
+    /// One copy stream per tail, never recreated: the incarnation is fixed.
+    incarnation: u64,
+    idle: Vec<Event>,
+    /// Recorded and not yet recycled, by fence id (ascending = record order).
+    live: BTreeMap<u64, Event>,
+    next: u64,
+}
+
+impl EventPool {
+    fn new() -> Self {
+        Self {
+            incarnation: next_incarnation(),
+            idle: Vec::new(),
+            live: BTreeMap::new(),
+            next: 1,
+        }
+    }
+
+    /// Every event the pool holds (teardown destroys them).
+    fn drain(&mut self) -> Vec<Event> {
+        let mut all = std::mem::take(&mut self.idle);
+        all.extend(std::mem::take(&mut self.live).into_values());
+        all
+    }
+}
+
+/// The rank's copy-stream fence capability (DESIGN `RankCopy`): a BORROWED view of the HIP
+/// runtime, the copy stream and the event pool, minted on the rank thread for one call and
+/// `!Send` / `!Sync` (the handles are not `Sync`; no other thread may fence the stream).
+struct RankCopy<'a> {
+    hip: &'a HipRuntime,
+    stream: &'a Stream,
+    pool: &'a mut EventPool,
+    _rank_thread: PhantomData<*const ()>,
+}
+
+impl<'a> RankCopy<'a> {
+    fn new(hip: &'a HipRuntime, stream: &'a Stream, pool: &'a mut EventPool) -> Self {
+        Self {
+            hip,
+            stream,
+            pool,
+            _rank_thread: PhantomData,
+        }
+    }
+
+    /// Host-wait the NEWEST recorded fence's event (`hipEventSynchronize`) without completing
+    /// anything: fill overlap's wait before the batches are polled (the poll then finds every
+    /// batch complete, in stream order).
+    fn wait_newest(&mut self) -> Result<(), String> {
+        match self.pool.live.values().next_back() {
+            Some(event) => self.hip.event_synchronize(event).map_err(io),
+            None => Ok(()),
+        }
+    }
+
+    /// Host-wait every recorded fence's event in record order without completing anything: a
+    /// borrow open's drain of the pending batches.
+    fn wait_all(&mut self) -> Result<(), String> {
+        for event in self.pool.live.values() {
+            self.hip.event_synchronize(event).map_err(io)?;
+        }
+        Ok(())
+    }
+}
+
+// SAFETY: a fence is one `hipEvent` recorded on the copy stream AFTER every copy the owner
+// enqueued there before `record()` returned (the bank records after the last enqueue callback).
+// `poll` returns `Complete` only when `hipEventQuery` reports the event recorded and complete,
+// and `wait` only when `hipEventSynchronize` returned success: in stream order that means every
+// earlier operation of the stream finished. A query / synchronize error is `Failed` with
+// `Unknown` quiescence (never `Proven`). The incarnation is the pool's, fixed for the one copy
+// stream a tail creates and destroys.
+unsafe impl FenceBackend for RankCopy<'_> {
+    fn incarnation(&self) -> u64 {
+        self.pool.incarnation
+    }
+
+    fn record(&mut self) -> Result<u64, FenceFailure> {
+        let event = match self.pool.idle.pop() {
+            Some(event) => event,
+            None => self
+                .hip
+                .event_create_with_flags(HIP_EVENT_DISABLE_TIMING)
+                .map_err(unknown_failure)?,
+        };
+        if let Err(error) = self.hip.event_record(&event, Some(self.stream)) {
+            self.pool.idle.push(event);
+            return Err(unknown_failure(error));
+        }
+        let id = self.pool.next;
+        self.pool.next += 1;
+        self.pool.live.insert(id, event);
+        Ok(id)
+    }
+
+    fn poll(&mut self, fence: u64) -> FenceState {
+        match self.pool.live.get(&fence) {
+            None => FenceState::Failed(unknown_failure(format!("fence {fence} is not recorded"))),
+            Some(event) => match self.hip.event_query(event) {
+                Ok(true) => FenceState::Complete,
+                Ok(false) => FenceState::Pending,
+                Err(error) => FenceState::Failed(unknown_failure(error)),
+            },
+        }
+    }
+
+    fn wait(&mut self, fence: u64) -> FenceState {
+        match self.pool.live.get(&fence) {
+            None => FenceState::Failed(unknown_failure(format!("fence {fence} is not recorded"))),
+            Some(event) => match self.hip.event_synchronize(event) {
+                Ok(()) => FenceState::Complete,
+                Err(error) => FenceState::Failed(unknown_failure(error)),
+            },
+        }
+    }
+
+    fn recycle(&mut self, fence: u64) {
+        if let Some(event) = self.pool.live.remove(&fence) {
+            self.pool.idle.push(event);
+        }
+    }
+}
+
+/// The rank's compute-stream fence capability (DESIGN `RankCompute`): the window protocol's
+/// last-read fence. Borrowed, minted on the rank thread for one call, `!Send` / `!Sync`. Its
+/// `record` only marks (the window's last consumer is already enqueued on the active stream)
+/// and its `wait` is the `stream_synchronize(active)` the protocol has always done.
+struct RankCompute<'a> {
+    hip: &'a HipRuntime,
+    stream: Option<&'a Stream>,
+    incarnation: u64,
+    recorded: u64,
+    _rank_thread: PhantomData<*const ()>,
+}
+
+impl<'a> RankCompute<'a> {
+    fn new(hip: &'a HipRuntime, stream: Option<&'a Stream>) -> Self {
+        Self {
+            hip,
+            stream,
+            incarnation: next_incarnation(),
+            recorded: 0,
+            _rank_thread: PhantomData,
+        }
+    }
+}
+
+// SAFETY: `record` only numbers a mark: the owner enqueued every consumer of the window on this
+// stream before calling it. `wait(f)` returns `Complete` only after `hipStreamSynchronize` of
+// the rank's active stream (`hipDeviceSynchronize` when there is none: the work then runs on the
+// null stream) returned success, which finishes everything enqueued before the call, so
+// everything enqueued before `record()` returned `f`. `poll` has no non-blocking probe and
+// never reports `Complete`. A synchronize error is `Failed` with `Unknown` quiescence. The
+// incarnation is unique per value, so a fence is never accepted by another backend.
+unsafe impl FenceBackend for RankCompute<'_> {
+    fn incarnation(&self) -> u64 {
+        self.incarnation
+    }
+
+    fn record(&mut self) -> Result<u64, FenceFailure> {
+        self.recorded += 1;
+        Ok(self.recorded)
+    }
+
+    fn poll(&mut self, _fence: u64) -> FenceState {
+        FenceState::Pending
+    }
+
+    fn wait(&mut self, fence: u64) -> FenceState {
+        if fence == 0 || fence > self.recorded {
+            return FenceState::Failed(unknown_failure(format!(
+                "fence {fence} was not recorded by this backend"
+            )));
+        }
+        let synced = match self.stream {
+            Some(stream) => self.hip.stream_synchronize(stream),
+            None => self.hip.device_synchronize(),
+        };
+        match synced {
+            Ok(()) => FenceState::Complete,
+            Err(error) => FenceState::Failed(unknown_failure(error)),
+        }
+    }
+}
+
+/// The rank's device-scope fence capability: the bank's quiescence (`hipDeviceSynchronize`),
+/// also the window fence of a borrow open. Borrowed, rank thread, `!Send` / `!Sync`.
+struct RankDevice<'a> {
+    hip: &'a HipRuntime,
+    incarnation: u64,
+    recorded: u64,
+    _rank_thread: PhantomData<*const ()>,
+}
+
+impl<'a> RankDevice<'a> {
+    fn new(hip: &'a HipRuntime) -> Self {
+        Self {
+            hip,
+            incarnation: next_incarnation(),
+            recorded: 0,
+            _rank_thread: PhantomData,
+        }
+    }
+}
+
+// SAFETY: as [`RankCompute`], with `hipDeviceSynchronize`, which finishes everything enqueued on
+// every stream of the device before the call returned.
+unsafe impl FenceBackend for RankDevice<'_> {
+    fn incarnation(&self) -> u64 {
+        self.incarnation
+    }
+
+    fn record(&mut self) -> Result<u64, FenceFailure> {
+        self.recorded += 1;
+        Ok(self.recorded)
+    }
+
+    fn poll(&mut self, _fence: u64) -> FenceState {
+        FenceState::Pending
+    }
+
+    fn wait(&mut self, fence: u64) -> FenceState {
+        if fence == 0 || fence > self.recorded {
+            return FenceState::Failed(unknown_failure(format!(
+                "fence {fence} was not recorded by this backend"
+            )));
+        }
+        match self.hip.device_synchronize() {
+            Ok(()) => FenceState::Complete,
+            Err(error) => FenceState::Failed(unknown_failure(error)),
+        }
+    }
+}
+
+/// A borrow epoch's hold on the pool: the bank's scratch loan (the borrower's write capability
+/// over the whole block) and, once issued, the restore the loan ends with.
+struct LentPool {
+    loan: ScratchLoan,
+    restore: Option<PendingRestore>,
+    /// Occupied slots the issued restore re-copies.
+    slots: u64,
 }
 
 /// The pins lever on one rank: its protocol over the pinned host images of the planes (the
@@ -498,8 +808,10 @@ struct Inner {
     pool_down: Option<GpuTensor>,
     copy_stream: Option<Stream>,
     tables_ready: Option<Event>,
-    batches: VecDeque<Batch>,
-    idle_events: Vec<Event>,
+    /// The fills' completion fences: one pending batch per retirement that issued fills.
+    batches: VecDeque<PendingFills>,
+    /// The copy stream's fence events.
+    events: EventPool,
     log: Option<GpuTensor>,
     log_host: Vec<u8>,
     log_used: usize,
@@ -531,7 +843,7 @@ struct Inner {
     /// here (the copy stream already waits for its table upload) until the next forward's first
     /// row-gather call issues them.
     fill_overlap: bool,
-    deferred: Vec<FillOp>,
+    deferred: Vec<FillTicket>,
     uploads: u64,
     /// H2D calls and bytes of the retirements' table uploads (changed entry ranges only).
     upload_calls: u64,
@@ -550,10 +862,20 @@ struct Inner {
     /// logging, retirement, fill, publication, peer post/take or pin delta). Separate from
     /// `frozen`: a frozen tail can be suspended and resumed.
     suspended: bool,
-    /// The unit each slot last held a fill of (set at the seed and at every retirement's fills).
-    /// The policy forgets the unit of a `Quarantined` slot, whose bytes a peer's full table may
-    /// still name, so a borrow restore reads it here.
-    slot_units: Vec<Option<UnitKey>>,
+    /// The tables' write capability: held from a retirement of the published generation until
+    /// the next generation is sealed over the tables (and across a borrow epoch). No table image
+    /// is written and no table uploaded without it.
+    backing: Option<TableBacking>,
+    /// The published generation under its window lease, from its sealing (retirement `j`, or the
+    /// warm start / a borrow resume) until the next retirement's window fence.
+    lease: Option<WindowReadLease<'static>>,
+    /// A generation whose window fenced but whose retirement did not finish (an error between):
+    /// kept, never dropped into a lease.
+    fenced: Option<OwnedTableGeneration>,
+    /// The id of the newest generation sealed (a borrow resume seals `sub + 1`).
+    last_gen: GenerationId,
+    /// The borrow epoch's hold on the pool, from `borrow_suspend`'s loan until `borrow_restore`.
+    lent: Option<LentPool>,
     /// Developer skew census (`HIPFIRE_EP_SKEW_LOG=<dir>`, off by default): every retirement writes
     /// the routed ids of the group's calls with how this rank serves each one. `None` when unset.
     skew: Option<SkewLog>,
@@ -892,12 +1214,62 @@ impl UnitTailRank {
             return Err("no unit of this rank is left for the tail".into());
         }
 
-        let mut policy = TailPolicy::new(config, freeze, priority);
-        if peer.is_some() {
-            policy.enable_peer_quarantine();
-        }
-        let seeds = policy.seed(&order);
-        let slots = policy.slots();
+        // The slot pool: ONE device allocation (one memset): the gate/up block at offset 0, the
+        // down block at its 256-aligned offset; `pool_gate_up` / `pool_down` are non-owning views
+        // of the two blocks. The allocation is the slot bank's block: every slot's two write
+        // extents are block-relative spans of it.
+        let slots = config.tail_units;
+        let layout = pool_layout(slots, gub, dnb, crate::expert_arena::ARENA_TAIL_PAD_BYTES);
+        let pool = gpu.zeros(&[layout.total], DType::Raw).map_err(|e| {
+            format!(
+                "tail install on rank {rank}: the tail pool ({slots} slots, {} bytes): {e}",
+                layout.total
+            )
+        })?;
+        let (pool_view_gate_up, pool_view_down) = (
+            pool_view(&pool, 0, layout.gate_up_len),
+            pool_view(&pool, layout.down_offset, layout.down_len),
+        );
+        let block = match BlockRegistry::new(rank as u32).adopt::<Expert>(
+            pool.buf.as_ptr() as u64,
+            layout.total as u64,
+            1,
+        ) {
+            Ok(block) => block,
+            Err(error) => {
+                let _ = gpu.free_tensor(pool);
+                return Err(format!(
+                    "tail install on rank {rank}: the pool block: {error}"
+                ));
+            }
+        };
+        let policy = TailPolicy::new(
+            config,
+            freeze,
+            priority,
+            peer.is_some(),
+            block,
+            pool_spans(slots, gub, dnb, &layout),
+        );
+        let mut policy = match policy {
+            Ok(policy) => policy,
+            Err((_block, error)) => {
+                let _ = gpu.free_tensor(pool);
+                return Err(format!(
+                    "tail install on rank {rank}: the slot bank: {error}"
+                ));
+            }
+        };
+        let seeds = match policy.seed(&order) {
+            Ok(seeds) => seeds,
+            Err(error) => {
+                let _ = gpu.free_tensor(pool);
+                return Err(format!(
+                    "tail install on rank {rank}: the warm start: {error}"
+                ));
+            }
+        };
+        let seed_keys: Vec<(usize, UnitKey)> = seeds.iter().map(|op| (op.slot, op.unit)).collect();
 
         // Device state. Any failure frees what was made.
         let mut state = Inner {
@@ -910,14 +1282,14 @@ impl UnitTailRank {
             kinds,
             gate_up_bytes: gub,
             down_bytes: dnb,
-            pool: None,
-            pool_bytes: 0,
-            pool_gate_up: None,
-            pool_down: None,
+            pool: Some(pool),
+            pool_bytes: layout.total,
+            pool_gate_up: Some(pool_view_gate_up),
+            pool_down: Some(pool_view_down),
             copy_stream: None,
             tables_ready: None,
             batches: VecDeque::new(),
-            idle_events: Vec::new(),
+            events: EventPool::new(),
             log: None,
             log_host: vec![0u8; LOG_IDS * 4],
             log_used: 0,
@@ -948,10 +1320,14 @@ impl UnitTailRank {
             pins: pin_state,
             released: false,
             suspended: false,
-            slot_units: vec![None; slots],
+            backing: None,
+            lease: None,
+            fenced: None,
+            last_gen: GenerationId { epoch: 0, sub: 0 },
+            lent: None,
             skew: SkewLog::open(rank),
         };
-        let built = state.build_device(gpu, slots, &seeds);
+        let built = state.build_device(gpu, seeds);
         if let Err(error) = built {
             state.release(gpu);
             return Err(format!("tail install on rank {rank}: {error}"));
@@ -959,7 +1335,7 @@ impl UnitTailRank {
         if let Some(board) = state.peer.clone() {
             // The warm units are live from the start: post them as retirement 0 (the peers apply
             // them at their first retirement).
-            match state.seed_deltas(&seeds) {
+            match state.seed_deltas(&seed_keys) {
                 Ok(deltas) => board.post(rank, 0, deltas),
                 Err(error) => {
                     state.release(gpu);
@@ -970,12 +1346,9 @@ impl UnitTailRank {
         if let Some(pins) = state.pins.as_mut() {
             // The same warm units, as the pin deltas of retirement 0: every rank applies them at
             // its retirement 2 (the lag), so the planes agree whenever each rank's install ran.
-            let deltas: Vec<PinDelta> = seeds
+            let deltas: Vec<PinDelta> = seed_keys
                 .iter()
-                .map(|op| PinDelta {
-                    unit: op.unit,
-                    on: true,
-                })
+                .map(|&(_, unit)| PinDelta { unit, on: true })
                 .collect();
             if let Err(error) = pins.proto.post_warm(deltas) {
                 state.release(gpu);
@@ -997,7 +1370,7 @@ impl UnitTailRank {
              {} warm units published, F={} fills/window{}{}{}; retires every {} routed ids or {} windows",
             ((slots * (gub + dnb)) >> 20),
             state.layers.len(),
-            seeds.len(),
+            seed_keys.len(),
             config.fill_per_step,
             if config.boundary_every > 1 {
                 format!(", boundary every {} windows", config.boundary_every)
@@ -1132,7 +1505,7 @@ impl UnitTailRank {
     /// or filled-unpublished) from its unit's canonical pinned host bytes into the pool,
     /// host-wait. Returns bytes copied.
     pub(crate) fn borrow_restore(&self, gpu: &mut Gpu) -> Result<u64, String> {
-        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.borrow_restore(gpu)
     }
 
@@ -1199,26 +1572,44 @@ impl Inner {
         (gate_up as u64, down as u64)
     }
 
-    fn build_device(
-        &mut self,
-        gpu: &mut Gpu,
-        slots: usize,
-        seeds: &[FillOp],
-    ) -> Result<(), String> {
-        let pad = crate::expert_arena::ARENA_TAIL_PAD_BYTES;
-        // ONE allocation (one memset): the gate/up block at offset 0, the down block at its
-        // 256-aligned offset; `pool_gate_up` / `pool_down` are non-owning views of the two blocks.
-        let layout = pool_layout(slots, self.gate_up_bytes, self.down_bytes, pad);
-        let pool = gpu
-            .zeros(&[layout.total], DType::Raw)
-            .map_err(|e| format!("the tail pool ({slots} slots, {} bytes): {e}", layout.total))?;
-        self.pool_gate_up = Some(pool_view(&pool, 0, layout.gate_up_len));
-        self.pool_down = Some(pool_view(&pool, layout.down_offset, layout.down_len));
-        self.pool_bytes = layout.total;
-        self.pool = Some(pool);
-        for op in seeds {
-            self.slot_units[op.slot] = Some(op.unit);
+    /// The device allocations every generation of this tail is published through: the decode
+    /// tables and, with the prefill lever, the full tables, `experts` u64 entries each.
+    fn table_extents(&self) -> Vec<Binding> {
+        let bytes = (self.experts * ENTRY_BYTES) as u64;
+        let mut out = Vec::new();
+        for layer in &self.layers {
+            let mut tables = vec![&layer.table_gate_up, &layer.table_down];
+            if let Some(full) = layer.full.as_ref() {
+                tables.push(&full.table_gate_up);
+                tables.push(&full.table_down);
+            }
+            out.extend(tables.into_iter().map(|table| Binding {
+                base: table.buf.as_ptr() as u64,
+                bytes,
+            }));
         }
+        out
+    }
+
+    /// Device state of the install: the usage log, the copy stream and its events, the warm
+    /// start (`seeds` copied through the bank's fill API, then published as generation
+    /// `{ epoch 0, sub 0 }` over the warm tables) and the first window lease. The pool (the
+    /// slot bank's block) already exists.
+    fn build_device(&mut self, gpu: &mut Gpu, seeds: Vec<FillOp>) -> Result<(), String> {
+        let seed_keys: Vec<(usize, UnitKey)> = seeds.iter().map(|op| (op.slot, op.unit)).collect();
+        let tickets: Vec<FillTicket> = seeds.into_iter().map(|op| op.ticket).collect();
+        // A device failure before the seed copies are issued must not strand their tickets
+        // (an unissued ticket refuses the bank's close, which would leak the pool at release):
+        // abandon them, so a failed install frees the pool as before.
+        if let Err(error) = self.build_device_streams(gpu) {
+            self.policy.abandon_fills(tickets);
+            return Err(error);
+        }
+        self.seed_device(gpu, seed_keys, tickets)
+    }
+
+    /// The usage log, the drain of its memset, the copy stream and the tables-ready event.
+    fn build_device_streams(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.log = Some(
             gpu.zeros(&[LOG_IDS * 4], DType::Raw)
                 .map_err(|e| format!("the usage log: {e}"))?,
@@ -1239,52 +1630,81 @@ impl Inner {
                 .event_create_with_flags(HIP_EVENT_DISABLE_TIMING)
                 .map_err(io)?,
         );
-        // Warm start: copy every seed, wait, then publish them all.
-        self.issue_copies(gpu, seeds)?;
-        let stream = self.copy_stream.as_ref().expect("stream");
-        gpu.hip.stream_synchronize(stream).map_err(io)?;
+        Ok(())
+    }
+
+    /// Warm start: copy every seed (one copy fence), wait, then publish them all.
+    fn seed_device(
+        &mut self,
+        gpu: &mut Gpu,
+        seed_keys: Vec<(usize, UnitKey)>,
+        tickets: Vec<FillTicket>,
+    ) -> Result<(), String> {
+        let pending = {
+            let (Some(stream), Some(pool)) = (self.copy_stream.as_ref(), self.pool.as_ref()) else {
+                self.policy.abandon_fills(tickets);
+                return Err("no copy stream or pool".into());
+            };
+            let mut copy = RankCopy::new(&gpu.hip, stream, &mut self.events);
+            let (layers, layer_of) = (&self.layers, &self.layer_of);
+            let bytes = (self.gate_up_bytes, self.down_bytes);
+            let hip = &gpu.hip;
+            let issued = self.policy.issue_fills(tickets, &mut copy, &mut |ticket| {
+                copy_unit_to_spans(
+                    hip,
+                    stream,
+                    pool,
+                    layers,
+                    layer_of,
+                    bytes,
+                    occupant_unit(ticket.occupant()),
+                    ticket.write_spans(),
+                )
+            });
+            match issued {
+                Ok(pending) => pending,
+                Err((tickets, failure)) => {
+                    self.policy.abandon_fills(tickets);
+                    return Err(failure.message);
+                }
+            }
+        };
+        let done = {
+            let stream = self.copy_stream.as_ref().ok_or("no copy stream")?;
+            let mut copy = RankCopy::new(&gpu.hip, stream, &mut self.events);
+            match self.policy.complete_fills(pending, &mut copy, true) {
+                Ok(done) => done,
+                Err(FillsNotDone::Pending(_)) => {
+                    return Err(
+                        "the warm-start fence is still pending after a blocking wait".into(),
+                    )
+                }
+                Err(FillsNotDone::Failed { failure, .. }) => return Err(failure.message),
+            }
+        };
+        // The tables the generations are published through: this backing is the write capability
+        // of every table image and upload below, until the warm generation is sealed over it.
+        let extents = self.table_extents();
+        let backing = self
+            .policy
+            .register_table_backing(extents)
+            .map_err(|error| format!("the tail's table backing: {error}"))?;
         let mut touched: HashSet<usize> = HashSet::new();
-        for op in seeds {
-            let (layer, expert) = (op.unit.0 as usize, op.unit.1 as usize);
-            let (gate_up, down) = self.slot_addresses(op.slot);
+        for &(slot, unit) in &seed_keys {
+            let (layer, expert) = (unit.0 as usize, unit.1 as usize);
+            let (gate_up, down) = self.slot_addresses(slot);
             let index = self.layer_of[layer].expect("seed layers are managed");
-            self.layers[index].set(expert, gate_up, down);
+            self.layers[index].set(&backing, expert, gate_up, down);
             touched.insert(index);
         }
         // Load time: no kernel reads the tables yet, so a synchronous upload is exact.
         for &index in &touched {
             let layer = &self.layers[index];
-            gpu.hip
-                .memcpy_htod(
-                    &layer
-                        .table_gate_up
-                        .buf
-                        .byte_view(0, layer.image_gate_up.len()),
-                    &layer.image_gate_up,
-                )
-                .map_err(io)?;
-            gpu.hip
-                .memcpy_htod(
-                    &layer.table_down.buf.byte_view(0, layer.image_down.len()),
-                    &layer.image_down,
-                )
-                .map_err(io)?;
+            upload_image(&backing, gpu, &layer.table_gate_up, &layer.image_gate_up)?;
+            upload_image(&backing, gpu, &layer.table_down, &layer.image_down)?;
             if let Some(full) = layer.full.as_ref() {
-                gpu.hip
-                    .memcpy_htod(
-                        &full
-                            .table_gate_up
-                            .buf
-                            .byte_view(0, full.image_gate_up.len()),
-                        &full.image_gate_up,
-                    )
-                    .map_err(io)?;
-                gpu.hip
-                    .memcpy_htod(
-                        &full.table_down.buf.byte_view(0, full.image_down.len()),
-                        &full.image_down,
-                    )
-                    .map_err(io)?;
+                upload_image(&backing, gpu, &full.table_gate_up, &full.image_gate_up)?;
+                upload_image(&backing, gpu, &full.table_down, &full.image_down)?;
             }
         }
         // The whole images are on the device: nothing is dirty for the first retirement.
@@ -1297,91 +1717,67 @@ impl Inner {
                 full.image_down.dirty.take();
             }
         }
-        Ok(())
-    }
-
-    /// Start the copies of `fills` (canonical host bytes -> pool slot) on the copy
-    /// stream, in order.
-    fn issue_copies(&self, gpu: &Gpu, fills: &[FillOp]) -> Result<(), String> {
-        let stream = self.copy_stream.as_ref().ok_or("no copy stream")?;
-        let (pool_gate_up, pool_down) = (
-            &self.pool_gate_up.as_ref().ok_or("no pool")?.buf,
-            &self.pool_down.as_ref().ok_or("no pool")?.buf,
+        let generation = self
+            .policy
+            .finish_seed(done, backing)
+            .map_err(|(_backing, error)| format!("the warm generation: {error}"))?;
+        self.last_gen = GenerationId { epoch: 0, sub: 0 };
+        self.lease = Some(
+            acquire_window_owned(generation)
+                .map_err(|(_generation, error)| format!("the warm generation's lease: {error}"))?,
         );
-        for op in fills {
-            let (layer, expert) = (op.unit.0 as usize, op.unit.1 as usize);
-            let index = self.layer_of[layer].ok_or("a fill names an unmanaged layer")?;
-            let canon = &self.layers[index];
-            let (src_gate_up, src_down) = (canon.canon_gate_up[expert], canon.canon_down[expert]);
-            if src_gate_up == 0 || src_down == 0 {
-                return Err(format!("unit ({layer},{expert}) has no canonical source"));
-            }
-            // SAFETY: a managed unit the static core does not hold lives in its layer's
-            // pinned host arena (the canonical entries D1 uploaded name it); that
-            // allocation outlives the forward and nothing writes it after load, so the
-            // two ranges are valid, immutable host bytes for the copy.
-            let (gate_up, down) = unsafe {
-                (
-                    std::slice::from_raw_parts(
-                        src_gate_up as usize as *const u8,
-                        self.gate_up_bytes,
-                    ),
-                    std::slice::from_raw_parts(src_down as usize as *const u8, self.down_bytes),
-                )
-            };
-            gpu.hip
-                .memcpy_htod_async(
-                    &pool_gate_up.byte_view(op.slot * self.gate_up_bytes, self.gate_up_bytes),
-                    gate_up,
-                    stream,
-                )
-                .map_err(io)?;
-            gpu.hip
-                .memcpy_htod_async(
-                    &pool_down.byte_view(op.slot * self.down_bytes, self.down_bytes),
-                    down,
-                    stream,
-                )
-                .map_err(io)?;
-        }
         Ok(())
     }
 
-    /// Enqueue `fills` on the copy stream (which already waits for their retirement's table
-    /// upload) and record their batch event, which the next retirement polls (or waits for,
-    /// under fill overlap).
-    fn issue_batch(&mut self, gpu: &Gpu, fills: &[FillOp]) -> Result<(), String> {
-        self.issue_copies(gpu, fills)?;
-        let event = match self.idle_events.pop() {
-            Some(event) => event,
-            None => gpu
-                .hip
-                .event_create_with_flags(HIP_EVENT_DISABLE_TIMING)
-                .map_err(io)?,
+    /// Enqueue `tickets`' copies on the copy stream (which already waits for their retirement's
+    /// table upload) and record their batch fence, which the next retirement polls (or waits
+    /// for, under fill overlap). The copy callback writes only each ticket's write spans.
+    fn issue_batch(&mut self, gpu: &Gpu, tickets: Vec<FillTicket>) -> Result<(), String> {
+        let (Some(stream), Some(pool)) = (self.copy_stream.as_ref(), self.pool.as_ref()) else {
+            self.policy.abandon_fills(tickets);
+            return Err("no copy stream or pool".into());
         };
-        let stream = self.copy_stream.as_ref().ok_or("no copy stream")?;
-        if let Err(error) = gpu.hip.event_record(&event, Some(stream)) {
-            self.idle_events.push(event);
-            return Err(io(error));
-        }
-        self.batches.push_back(Batch {
-            event,
-            fills: fills.iter().map(|f| (f.slot, f.generation)).collect(),
+        let mut copy = RankCopy::new(&gpu.hip, stream, &mut self.events);
+        let (layers, layer_of) = (&self.layers, &self.layer_of);
+        let bytes = (self.gate_up_bytes, self.down_bytes);
+        let hip = &gpu.hip;
+        let pending = self.policy.issue_fills(tickets, &mut copy, &mut |ticket| {
+            copy_unit_to_spans(
+                hip,
+                stream,
+                pool,
+                layers,
+                layer_of,
+                bytes,
+                occupant_unit(ticket.occupant()),
+                ticket.write_spans(),
+            )
         });
+        match pending {
+            Ok(pending) => self.batches.push_back(pending),
+            Err((tickets, failure)) => {
+                // Refused or failed: the tickets come back; they will never be issued.
+                self.policy.abandon_fills(tickets);
+                return Err(failure.message);
+            }
+        }
         Ok(())
     }
 
     /// Fill overlap: issue the last retirement's deferred fills (nothing when none wait). A
-    /// frozen or released tail drops them: their slots stay `Filling`, which nothing reads.
+    /// frozen or released tail drops them: their slots stay `Filling`, which nothing reads, and
+    /// the bank is told ([`TailPolicy::abandon_fills`]) so a scratch loan and the close accept
+    /// those slots.
     fn issue_deferred(&mut self, gpu: &Gpu) -> Result<(), String> {
         if self.deferred.is_empty() {
             return Ok(());
         }
-        let fills = std::mem::take(&mut self.deferred);
+        let tickets = std::mem::take(&mut self.deferred);
         if self.frozen.is_some() || self.released {
+            self.policy.abandon_fills(tickets);
             return Ok(());
         }
-        self.issue_batch(gpu, &fills)
+        self.issue_batch(gpu, tickets)
     }
 
     fn note_call(&mut self, gpu: &mut Gpu, layer_idx: u16, slots: usize, topk: &GpuTensor) {
@@ -1610,21 +2006,29 @@ impl Inner {
         }
     }
 
-    /// One retirement of the tail: the log's D2H, the policy step, the table uploads, the peer
-    /// protocol and the fills. Returns the pin deltas of the retirement (its publications `on`,
-    /// its evictions `off`; empty without the pins lever and when nothing was retired): only a
-    /// retirement that completed all its table uploads returns them, so a pin never claims a
-    /// publication the tables did not take.
+    /// One retirement of the tail: the window fence of the published generation, the log's D2H,
+    /// the retirement of that generation (the tables' backing is writable again), the policy
+    /// step, the table writes and uploads (through the backing), the sealing of the next
+    /// generation and its window lease, the peer protocol and the fills. Returns the pin deltas
+    /// of the retirement (its publications `on`, its evictions `off`; empty without the pins
+    /// lever and when nothing was retired): only a retirement that completed all its table
+    /// uploads returns them, so a pin never claims a publication the tables did not take.
+    ///
+    /// The generation protocol (module docs): retirement `j` retires generation `j - 1` (the one
+    /// the windows since retirement `j - 1` read) and seals generation `j`; every error before
+    /// the seal leaves the tail frozen with the generation or the backing still held, never with
+    /// a table named by an unfenced reader.
     fn retire_group(&mut self, gpu: &mut Gpu, windows: u32) -> Result<Vec<PinDelta>, String> {
         if self.calls.is_empty() {
             return Ok(Vec::new());
         }
         let t0 = Instant::now();
-        // The window's forward ended with a D2H; make the stream idle for certain
-        // before reading the log and rewriting tables.
-        if let Some(stream) = gpu.active_stream.as_ref() {
-            gpu.hip.stream_synchronize(stream).map_err(io)?;
-        }
+        // The window's forward ended with a D2H; fence the window of the published generation
+        // (`finish_window`: the compute backend's wait is the stream synchronize the protocol
+        // has always done), so the stream is idle for certain before reading the log and
+        // rewriting tables.
+        let lease = self.lease.take().ok_or("no published table generation")?;
+        self.fenced = Some(fence_window(gpu, lease, false)?);
         let used = self.log_used;
         {
             let log = self.log.as_ref().ok_or("no log")?;
@@ -1685,55 +2089,159 @@ impl Inner {
         // did not hide.
         if self.fill_overlap {
             self.issue_deferred(gpu)?;
-            if let Some(last) = self.batches.back() {
+            if !self.batches.is_empty() {
                 let t_wait = Instant::now();
-                gpu.hip.event_synchronize(&last.event).map_err(io)?;
+                let stream = self.copy_stream.as_ref().ok_or("no copy stream")?;
+                RankCopy::new(&gpu.hip, stream, &mut self.events).wait_newest()?;
                 self.fill_wait_ns += t_wait.elapsed().as_nanos() as u64;
             }
         }
         // Completed fills (issued in order on one stream: stop at the first pending).
-        let mut completed: Vec<(usize, u64)> = Vec::new();
-        while let Some(batch) = self.batches.front() {
-            if !gpu.hip.event_query(&batch.event).map_err(io)? {
-                break;
-            }
-            let batch = self.batches.pop_front().expect("front exists");
-            completed.extend(batch.fills);
-            self.idle_events.push(batch.event);
-        }
+        let completed = self.poll_batches(gpu)?;
 
-        let retire = match self.peer.clone() {
-            Some(board) => {
-                let owner = self.rank;
-                self.policy.retire_peer_windows(
-                    (core_distinct, core_reads),
-                    &window,
-                    &completed,
-                    windows,
-                    |m| board.released_through(owner, m),
-                )
-            }
+        // Retire the generation the finished windows read: its window fenced above; in PEER mode
+        // this is the retirement's one `released_through` call. The table backing comes back.
+        let generation = self.fenced.take().ok_or("no fenced table generation")?;
+        let (rank, at) = (self.rank, self.policy.next_retirement());
+        let board = self.peer.clone();
+        let peers = board
+            .as_deref()
+            .map(|board| (board as &dyn PeerReaderFence, rank, at));
+        let (backing, retired) =
+            self.policy
+                .retire_generation(generation, peers)
+                .map_err(|(generation, error)| {
+                    // Fenced, but the bank refused: keep it (never dropped into a lease).
+                    self.fenced = Some(generation);
+                    format!("retiring the published generation: {error}")
+                })?;
+        let mut retire = match board {
+            Some(_) => self.policy.retire_peer_windows(
+                (core_distinct, core_reads),
+                &window,
+                completed,
+                windows,
+                &retired,
+            ),
             None => self.policy.retire_windows(
                 (core_distinct, core_reads),
                 &window,
-                &completed,
+                completed,
                 windows,
+                &retired,
             ),
         };
+        if let (refused @ 1.., why) = self.policy.refusals() {
+            let why = format!(
+                "the slot bank refused {refused} transition(s): {}",
+                why.unwrap_or("?")
+            );
+            self.backing = Some(backing);
+            self.abandon_retire_fills(&mut retire);
+            return Err(why);
+        }
         // This retirement's index (the retirement counters of all ranks are one clock: the
         // ranks retire the same groups of windows).
         let j = self.policy.stats().retirements;
-        for fill in &retire.fills {
-            self.slot_units[fill.slot] = Some(fill.unit);
-        }
         let t_retire = Instant::now();
 
-        // Tables first (publish -> slot, evict -> canonical), then the copies.
+        // Tables first (publish -> slot, evict -> canonical), written through the backing, then
+        // the new generation is sealed over them and leased to the windows that follow, then the
+        // copies.
+        let peer_take = match self.write_retirement(gpu, &backing, &retire, j) {
+            Ok(take) => take,
+            Err(error) => {
+                self.backing = Some(backing);
+                self.abandon_retire_fills(&mut retire);
+                return Err(error);
+            }
+        };
+        let id = GenerationId { epoch: j, sub: 0 };
+        let generation = match self.policy.seal(backing, id) {
+            Ok(generation) => generation,
+            Err((backing, error)) => {
+                self.backing = Some(backing);
+                self.abandon_retire_fills(&mut retire);
+                return Err(format!("sealing generation {j}: {error}"));
+            }
+        };
+        match acquire_window_owned(generation) {
+            Ok(lease) => self.lease = Some(lease),
+            Err((_generation, error)) => {
+                self.abandon_retire_fills(&mut retire);
+                return Err(format!("leasing generation {j}: {error}"));
+            }
+        }
+        self.last_gen = id;
+        // The ACK: every peer delta this retirement applied is now enqueued on the compute
+        // stream ahead of every kernel of the next window. A failed upload returned above and
+        // records nothing, so the owners keep the slots this rank may still name quarantined.
+        if let (Some(board), Some(take)) = (self.peer.as_ref(), peer_take.as_ref()) {
+            board.ack(self.rank, j, take);
+        }
+        let t_upload = Instant::now();
+        let fills = std::mem::take(&mut retire.fills);
+        if !fills.is_empty() {
+            let tickets: Vec<FillTicket> = fills.into_iter().map(|op| op.ticket).collect();
+            let gated = (|| -> Result<(), String> {
+                let compute = gpu.active_stream.as_ref();
+                let ready = self.tables_ready.as_ref().ok_or("no tables event")?;
+                gpu.hip.event_record(ready, compute).map_err(io)?;
+                let stream = self.copy_stream.as_ref().ok_or("no copy stream")?;
+                gpu.hip.stream_wait_event(stream, ready).map_err(io)
+            })();
+            if let Err(error) = gated {
+                // The copies were never enqueued: their tickets will never be issued.
+                self.policy.abandon_fills(tickets);
+                return Err(error);
+            }
+            if self.fill_overlap {
+                // Issued by the next forward's first row-gather call (`issue_deferred`).
+                self.deferred = tickets;
+            } else {
+                self.issue_batch(gpu, tickets)?;
+            }
+        }
+        let t_end = Instant::now();
+        self.log_ns += (t_log - t0).as_nanos() as u64;
+        self.retire_ns += (t_retire - t_log).as_nanos() as u64;
+        self.upload_ns += (t_upload - t_retire).as_nanos() as u64;
+        self.fill_ns += (t_end - t_upload).as_nanos() as u64;
+        if self.log_enabled && self.policy.stats().retirements % LOG_EVERY == 0 {
+            self.print_line("window");
+        }
+        Ok(if self.pins.is_some() {
+            pin_deltas(&retire)
+        } else {
+            Vec::new()
+        })
+    }
+
+    /// A retirement that fails before its fills are issued or deferred: the tickets will never
+    /// be issued, so the bank is told ([`TailPolicy::abandon_fills`]); dropping them would leave
+    /// unissued `Filling` slots that refuse every later scratch loan and the close.
+    fn abandon_retire_fills(&mut self, retire: &mut Retire) {
+        let fills = std::mem::take(&mut retire.fills);
+        self.policy
+            .abandon_fills(fills.into_iter().map(|op| op.ticket).collect());
+    }
+
+    /// Retirement `j`'s table writes: the publications and evictions into the host images, the
+    /// peer post / take / apply into the full-table images, and the upload of every changed
+    /// entry range on the compute stream. `backing` is the write capability (no generation is
+    /// sealed over the tables while it is held). Returns the peer take the ACK covers.
+    fn write_retirement(
+        &mut self,
+        gpu: &Gpu,
+        backing: &TableBacking,
+        retire: &Retire,
+        j: u64,
+    ) -> Result<Option<PeerTake>, String> {
         let mut touched: HashSet<usize> = HashSet::new();
         for &(unit, slot) in &retire.publish {
             let (gate_up, down) = self.slot_addresses(slot);
             let index = self.layer_of[unit.0 as usize].ok_or("published an unmanaged layer")?;
-            self.layers[index].set(unit.1 as usize, gate_up, down);
+            self.layers[index].set(backing, unit.1 as usize, gate_up, down);
             touched.insert(index);
         }
         for &unit in &retire.unpublish {
@@ -1743,7 +2251,7 @@ impl Inner {
                 layer.canon_gate_up[unit.1 as usize],
                 layer.canon_down[unit.1 as usize],
             );
-            layer.set(unit.1 as usize, gate_up, down);
+            layer.set(backing, unit.1 as usize, gate_up, down);
             touched.insert(index);
         }
         // PEER mode: post this retirement's publications, then take and apply what the peers
@@ -1751,7 +2259,7 @@ impl Inner {
         let mut peer_touched: HashSet<usize> = HashSet::new();
         let mut peer_take: Option<PeerTake> = None;
         if let Some(board) = self.peer.clone() {
-            board.post(self.rank, j, self.publish_deltas(&retire)?);
+            board.post(self.rank, j, self.publish_deltas(retire)?);
             let take = board.take(self.rank);
             if take.newest().is_some_and(|k| k > j) {
                 return Err(format!(
@@ -1761,7 +2269,7 @@ impl Inner {
                     self.rank
                 ));
             }
-            peer_touched = self.apply_peer(&take);
+            peer_touched = self.apply_peer(backing, &take);
             peer_take = Some(take);
         }
         let mut order: Vec<usize> = touched.union(&peer_touched).copied().collect();
@@ -1772,7 +2280,7 @@ impl Inner {
             let layer = &mut self.layers[index];
             let mut layer_calls = 0u64;
             let mut upload = |image: &mut TableImage, table: &GpuTensor| -> Result<(), String> {
-                let sent = image.upload_dirty(gpu, table, compute)?;
+                let sent = image.upload_dirty(backing, gpu, table, compute)?;
                 if sent > 0 {
                     layer_calls += 1;
                     bytes += sent as u64;
@@ -1792,38 +2300,26 @@ impl Inner {
         }
         self.upload_calls += calls;
         self.upload_bytes += bytes;
-        // The ACK: every peer delta this retirement applied is now enqueued on the compute
-        // stream ahead of every kernel of the next window. A failed upload returned above and
-        // records nothing, so the owners keep the slots this rank may still name quarantined.
-        if let (Some(board), Some(take)) = (self.peer.as_ref(), peer_take.as_ref()) {
-            board.ack(self.rank, j, take);
-        }
-        let t_upload = Instant::now();
-        if !retire.fills.is_empty() {
-            let ready = self.tables_ready.as_ref().ok_or("no tables event")?;
-            gpu.hip.event_record(ready, compute).map_err(io)?;
+        Ok(peer_take)
+    }
+
+    /// Poll the pending fill batches in issue order (one `event_query` each; stop at the first
+    /// pending): the completion tokens of the fills whose copy finished.
+    fn poll_batches(&mut self, gpu: &Gpu) -> Result<Vec<FillComplete>, String> {
+        let mut completed = Vec::new();
+        while let Some(batch) = self.batches.pop_front() {
             let stream = self.copy_stream.as_ref().ok_or("no copy stream")?;
-            gpu.hip.stream_wait_event(stream, ready).map_err(io)?;
-            if self.fill_overlap {
-                // Issued by the next forward's first row-gather call (`issue_deferred`).
-                self.deferred = retire.fills.clone();
-            } else {
-                self.issue_batch(gpu, &retire.fills)?;
+            let mut copy = RankCopy::new(&gpu.hip, stream, &mut self.events);
+            match self.policy.complete_fills(batch, &mut copy, false) {
+                Ok(done) => completed.extend(done),
+                Err(FillsNotDone::Pending(batch)) => {
+                    self.batches.push_front(batch);
+                    break;
+                }
+                Err(FillsNotDone::Failed { failure, .. }) => return Err(failure.message),
             }
         }
-        let t_end = Instant::now();
-        self.log_ns += (t_log - t0).as_nanos() as u64;
-        self.retire_ns += (t_retire - t_log).as_nanos() as u64;
-        self.upload_ns += (t_upload - t_retire).as_nanos() as u64;
-        self.fill_ns += (t_end - t_upload).as_nanos() as u64;
-        if self.log_enabled && self.policy.stats().retirements % LOG_EVERY == 0 {
-            self.print_line("window");
-        }
-        Ok(if self.pins.is_some() {
-            pin_deltas(&retire)
-        } else {
-            Vec::new()
-        })
+        Ok(completed)
     }
 
     /// The deltas of this retirement's publications (a published fill names its slot, an evicted
@@ -1857,15 +2353,15 @@ impl Inner {
     }
 
     /// The deltas that publish the warm start's `seeds`.
-    fn seed_deltas(&self, seeds: &[FillOp]) -> Result<Vec<PeerDelta>, String> {
+    fn seed_deltas(&self, seeds: &[(usize, UnitKey)]) -> Result<Vec<PeerDelta>, String> {
         self.publish_deltas(&Retire {
-            publish: seeds.iter().map(|op| (op.unit, op.slot)).collect(),
+            publish: seeds.iter().map(|&(slot, unit)| (unit, slot)).collect(),
             ..Retire::default()
         })
     }
 
     /// Apply the peers' deltas to this rank's full-table images; the layers whose image changed.
-    fn apply_peer(&mut self, take: &PeerTake) -> HashSet<usize> {
+    fn apply_peer(&mut self, backing: &TableBacking, take: &PeerTake) -> HashSet<usize> {
         let (rank, ranks) = (self.rank, self.ranks);
         let mut touched = HashSet::new();
         for (owner, delta) in &take.deltas {
@@ -1874,7 +2370,7 @@ impl Inner {
                 self.layers[index]
                     .full
                     .as_mut()
-                    .map(|full| (index, full.apply_peer(rank, ranks, *owner, delta)))
+                    .map(|full| (index, full.apply_peer(backing, rank, ranks, *owner, delta)))
             });
             match changed {
                 Some((index, true)) => {
@@ -1979,7 +2475,7 @@ impl Inner {
             s.stale_completions,
             self.policy.count(crate::expert_unit_tail::SlotPhase::Live),
             self.policy.slots(),
-            self.batches.iter().map(|b| b.fills.len()).sum::<usize>(),
+            self.batches.iter().map(|b| b.fills().len()).sum::<usize>(),
             self.host_only_reads,
             self.overflowed,
             self.log_ns as f64 / w / 1e3,
@@ -2015,7 +2511,10 @@ impl Inner {
             return;
         }
         self.released = true;
-        self.deferred.clear();
+        // Fills that never ran: their slots stay `Filling`, which nothing reads; the bank is told
+        // (`abandon_fills`) so it can close.
+        let dropped = std::mem::take(&mut self.deferred);
+        self.policy.abandon_fills(dropped);
         if let Some(board) = self.peer.as_ref() {
             board.detach(self.rank);
         }
@@ -2023,29 +2522,78 @@ impl Inner {
             // The mesh is going down: the other ranks' pin steps stop quietly.
             pins.proto.close();
         }
-        // The table images are pinned: no table upload may still read them when the pool drops.
-        if let Some(stream) = gpu.active_stream.as_ref() {
-            let _ = gpu.hip.stream_synchronize(stream);
+        // The table images are pinned: no table upload (and no reader of the published
+        // generation) may still run when the pool drops. The last-read fence of the leased
+        // generation is the compute stream synchronize this always did; the generation then
+        // retires. Without a lease (suspended, or a failed retirement) the stream is drained.
+        if let Err(error) = self.fence_and_retire(gpu, false) {
+            eprintln!(
+                "qwen4 EP rank {}: D2 tail release: the published generation did not retire: {error}",
+                self.rank
+            );
+        }
+        // A borrow epoch still open (a poisoned close): put the pool's bytes back first, so the
+        // bank can be closed.
+        if let Some(lent) = self.lent.take() {
+            let _ = device_idle(gpu);
+            if let Err((_lent, why)) = self.restore_lent(gpu, lent) {
+                eprintln!(
+                    "qwen4 EP rank {}: D2 tail release: the lent pool was not restored: {why}",
+                    self.rank
+                );
+            }
         }
         // Nothing reads a slot or the log after this: drain the copy stream first.
         if let Some(stream) = self.copy_stream.take() {
             let _ = gpu.hip.stream_synchronize(&stream);
             let _ = gpu.hip.stream_destroy(stream);
         }
-        for batch in self.batches.drain(..) {
-            let _ = gpu.hip.event_destroy(batch.event);
-        }
-        for event in self.idle_events.drain(..) {
+        self.batches.clear();
+        for event in self.events.drain() {
             let _ = gpu.hip.event_destroy(event);
         }
         if let Some(event) = self.tables_ready.take() {
             let _ = gpu.hip.event_destroy(event);
         }
+        // The pool is freed only once the bank closes: every cell handed back, no live
+        // generation, the device quiescent. Anything else leaks it (never an early free).
+        let closed = self.close_pool(gpu);
         // The two block views alias the pool's allocation: dropping them frees nothing.
         self.pool_gate_up = None;
         self.pool_down = None;
-        for tensor in [self.pool.take(), self.log.take()].into_iter().flatten() {
-            let _ = gpu.free_tensor(tensor);
+        let pool = self.pool.take();
+        if closed {
+            if let Some(pool) = pool {
+                let _ = gpu.free_tensor(pool);
+            }
+        }
+        if let Some(log) = self.log.take() {
+            let _ = gpu.free_tensor(log);
+        }
+    }
+
+    /// Close the slot bank (device-scope quiescence, then every cell back) and release the pool
+    /// block. `false` (logged) leaves the pool allocated: the bank refused, so a reader or a
+    /// generation may still name it.
+    fn close_pool(&mut self, gpu: &Gpu) -> bool {
+        let rank = self.rank;
+        let leak = |why: String| {
+            eprintln!(
+                "qwen4 EP rank {rank}: D2 tail release: the slot pool is NOT freed (it is leaked, never freed early): {why}"
+            );
+            false
+        };
+        let mut device = RankDevice::new(&gpu.hip);
+        let quiesced = match self.policy.quiesce(&mut device) {
+            Ok(quiesced) => quiesced,
+            Err(failure) => return leak(failure.message),
+        };
+        match self.policy.close(quiesced) {
+            Ok((block, reclaimed)) => match block.free(reclaimed) {
+                Ok(_extent) => true,
+                Err((_block, _reclaimed, error)) => leak(error.to_string()),
+            },
+            Err(error) => leak(error.to_string()),
         }
     }
 }
@@ -2080,6 +2628,30 @@ fn pool_layout(slots: usize, gate_up_bytes: usize, down_bytes: usize, pad: usize
     }
 }
 
+/// The write extents of every slot of a pool laid out as `layout`: block-relative spans,
+/// `[gate_up, down]` per slot (the two copies a fill makes).
+fn pool_spans(
+    slots: usize,
+    gate_up_bytes: usize,
+    down_bytes: usize,
+    layout: &PoolLayout,
+) -> Vec<Vec<SlotSpan>> {
+    (0..slots)
+        .map(|slot| {
+            vec![
+                SlotSpan {
+                    offset: (slot * gate_up_bytes) as u64,
+                    bytes: gate_up_bytes as u64,
+                },
+                SlotSpan {
+                    offset: (layout.down_offset + slot * down_bytes) as u64,
+                    bytes: down_bytes as u64,
+                },
+            ]
+        })
+        .collect()
+}
+
 /// A non-owning raw tensor over bytes `[offset, offset + len)` of the pool allocation `pool`.
 /// Like every `byte_view` it must not outlive `pool` nor be freed.
 fn pool_view(pool: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
@@ -2097,20 +2669,6 @@ fn canonical_image(entries: &[u64]) -> Vec<u8> {
         .iter()
         .flat_map(|entry| entry.to_le_bytes())
         .collect()
-}
-
-/// Whether a slot holds the bytes of a completed fill that a table names now or may name after
-/// the next retirement: `Live` (published), `Quarantined` (evicted, but a peer's full table may
-/// still name it until the peer acknowledged) and `Filling` whose copy completed
-/// (`fill_completed`, a pending batch entry of the slot's current generation: published at the
-/// next retirement). A `Filling` slot whose fill was never issued (a frozen tail dropped it) and
-/// a `Free` slot hold nothing worth restoring.
-fn slot_is_occupied(phase: SlotPhase, fill_completed: bool) -> bool {
-    match phase {
-        SlotPhase::Live | SlotPhase::Quarantined => true,
-        SlotPhase::Filling => fill_completed,
-        SlotPhase::Free => false,
-    }
 }
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -2138,17 +2696,150 @@ fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
     )
 }
 
-/// Synchronous upload of `bytes` to the start of `table`.
-fn upload_image(gpu: &Gpu, table: &GpuTensor, bytes: &[u8]) -> Result<(), String> {
+/// Synchronous upload of `bytes` to the start of the pointer table `table`; the table backing is
+/// the write capability (it exists only while no generation is sealed through the tables).
+fn upload_image(
+    _backing: &TableBacking,
+    gpu: &Gpu,
+    table: &GpuTensor,
+    bytes: &[u8],
+) -> Result<(), String> {
+    upload_plane(gpu, table, bytes)
+}
+
+/// Synchronous upload of `bytes` to the start of `table`: a pin plane (not part of any table
+/// generation).
+fn upload_plane(gpu: &Gpu, table: &GpuTensor, bytes: &[u8]) -> Result<(), String> {
     gpu.hip
         .memcpy_htod(&table.buf.byte_view(0, bytes.len()), bytes)
         .map_err(io)
+}
+
+/// Fence the window the leased generation was read in and hand the generation back: the window's
+/// last consumer was enqueued before this call, so the fence is recorded now and waited at once
+/// (`finish_window`). The compute backend's wait is the stream synchronize the window protocol
+/// has always done; `device_scope` waits the whole device instead (a borrow open's drain). A
+/// fence that fails or does not complete quarantines the generation (it can never retire).
+fn fence_window(
+    gpu: &Gpu,
+    lease: WindowReadLease<'static>,
+    device_scope: bool,
+) -> Result<OwnedTableGeneration, String> {
+    let mut compute = RankCompute::new(&gpu.hip, gpu.active_stream.as_ref());
+    let mut device = RankDevice::new(&gpu.hip);
+    let backend: &mut dyn FenceBackend = if device_scope {
+        &mut device
+    } else {
+        &mut compute
+    };
+    let pending = lease.enqueued(backend).map_err(|(lease, failure)| {
+        drop(lease);
+        failure.message
+    })?;
+    let fenced = finish_window(pending, backend).map_err(|outcome| match outcome {
+        PendingOrQuarantined::Pending(_) => {
+            "the window fence is still pending after a blocking wait".to_string()
+        }
+        PendingOrQuarantined::Quarantined(window) => {
+            format!("the window is quarantined: {}", window.failure().message)
+        }
+    })?;
+    fenced
+        .into_generation()
+        .ok_or_else(|| "the fenced window does not own its generation".to_string())
+}
+
+/// Enqueue the copy of `unit`'s canonical host bytes into the two write extents `spans`
+/// (`[gate_up, down]`, absolute device addresses inside `pool`) on `stream`: two
+/// `memcpy_htod_async`, exactly the calls a fill has always made, and nothing outside `spans`.
+#[allow(clippy::too_many_arguments)]
+fn copy_unit_to_spans(
+    hip: &HipRuntime,
+    stream: &Stream,
+    pool: &GpuTensor,
+    layers: &[TailLayer],
+    layer_of: &[Option<usize>],
+    (gate_up_bytes, down_bytes): (usize, usize),
+    unit: UnitKey,
+    spans: &[Binding],
+) -> Result<(), String> {
+    let (layer, expert) = (unit.0 as usize, unit.1 as usize);
+    let index = layer_of
+        .get(layer)
+        .copied()
+        .flatten()
+        .ok_or("a fill names an unmanaged layer")?;
+    let canon = &layers[index];
+    let (src_gate_up, src_down) = (canon.canon_gate_up[expert], canon.canon_down[expert]);
+    if src_gate_up == 0 || src_down == 0 {
+        return Err(format!("unit ({layer},{expert}) has no canonical source"));
+    }
+    let [gate_up_span, down_span] = spans else {
+        return Err(format!(
+            "a slot has {} write spans, expected 2",
+            spans.len()
+        ));
+    };
+    if gate_up_span.bytes != gate_up_bytes as u64 || down_span.bytes != down_bytes as u64 {
+        return Err(format!(
+            "slot spans of {} / {} bytes, the unit is {gate_up_bytes} / {down_bytes}",
+            gate_up_span.bytes, down_span.bytes
+        ));
+    }
+    let pool_base = pool.buf.as_ptr() as u64;
+    let offset = |span: &Binding| -> Result<usize, String> {
+        span.base
+            .checked_sub(pool_base)
+            .map(|offset| offset as usize)
+            .ok_or_else(|| {
+                format!(
+                    "slot span {:#x} lies below the pool {pool_base:#x}",
+                    span.base
+                )
+            })
+    };
+    // SAFETY: a managed unit the static core does not hold lives in its layer's pinned host
+    // arena (the canonical entries D1 uploaded name it); that allocation outlives the forward
+    // and nothing writes it after load, so the two ranges are valid, immutable host bytes for
+    // the copy.
+    let (gate_up, down) = unsafe {
+        (
+            std::slice::from_raw_parts(src_gate_up as usize as *const u8, gate_up_bytes),
+            std::slice::from_raw_parts(src_down as usize as *const u8, down_bytes),
+        )
+    };
+    hip.memcpy_htod_async(
+        &pool.buf.byte_view(offset(gate_up_span)?, gate_up_bytes),
+        gate_up,
+        stream,
+    )
+    .map_err(io)?;
+    hip.memcpy_htod_async(
+        &pool.buf.byte_view(offset(down_span)?, down_bytes),
+        down,
+        stream,
+    )
+    .map_err(io)?;
+    Ok(())
 }
 
 /// Everything the device finished: the synchronous null-stream copies of a borrow open / close
 /// and the compute and copy streams, in one wait.
 fn device_idle(gpu: &Gpu) -> Result<(), String> {
     gpu.hip.device_synchronize().map_err(io)
+}
+
+/// The occupied slots of `policy`'s bank as `(slot, unit, fill generation)`, ascending by slot:
+/// `Resident`, `Evicting` and issued-`Filling` slots, each with the unit the bank recorded as its
+/// occupant (so an evicted slot, whose bytes a peer's full table may still name, keeps its unit
+/// although the policy forgets it). A `Filling` slot counts once its copy was issued; an
+/// abandoned fill never does.
+fn occupied_units(policy: &TailPolicy) -> Vec<(usize, UnitKey, u64)> {
+    policy
+        .occupied()
+        .into_iter()
+        .map(|(slot, occupant, generation)| (slot as usize, occupant_unit(occupant), generation))
+        .collect()
 }
 
 impl Inner {
@@ -2173,35 +2864,16 @@ impl Inner {
         true
     }
 
-    /// The occupied slots ([`slot_is_occupied`]) as the fills that would reproduce them, ascending
-    /// by slot: the unit each holds (the policy's, or the last fill's for a `Quarantined` slot)
-    /// and its current generation. Empty once released. A `Filling` slot counts when a pending
-    /// batch holds its current generation, so the answer is exact only after a suspend has waited
-    /// every batch.
-    fn occupied(&self) -> Vec<FillOp> {
+    /// The occupied slots as `(slot, unit, fill generation)`, ascending by slot: the bank's view
+    /// (`Resident`, `Evicting` and issued-`Filling` slots) with the unit each holds, the bank's
+    /// occupant (so an evicted slot, whose bytes a peer's full table may still name, keeps its
+    /// unit). Empty once released. A `Filling` slot counts once its copy was issued, so the
+    /// answer is exact after a suspend has waited every batch.
+    fn occupied(&self) -> Vec<(usize, UnitKey, u64)> {
         if self.released {
             return Vec::new();
         }
-        let pending: HashSet<(usize, u64)> = self
-            .batches
-            .iter()
-            .flat_map(|batch| batch.fills.iter().copied())
-            .collect();
-        (0..self.policy.slots())
-            .filter_map(|slot| {
-                let generation = self.policy.slot_generation(slot);
-                let completed = pending.contains(&(slot, generation));
-                if !slot_is_occupied(self.policy.slot_phase(slot), completed) {
-                    return None;
-                }
-                let unit = self.policy.slot_unit(slot).or(self.slot_units[slot])?;
-                Some(FillOp {
-                    slot,
-                    unit,
-                    generation,
-                })
-            })
-            .collect()
+        occupied_units(&self.policy)
     }
 
     /// The canonical pinned host bytes of `unit`'s `[gate_up, down]`.
@@ -2213,8 +2885,9 @@ impl Inner {
         if src_gate_up == 0 || src_down == 0 {
             return Err(format!("unit ({layer},{expert}) has no canonical source"));
         }
-        // SAFETY: as in `issue_copies`: a managed unit the static core does not hold lives in its
-        // layer's pinned host arena, which outlives the forward and is never written after load.
+        // SAFETY: as in `copy_unit_to_spans`: a managed unit the static core does not hold lives
+        // in its layer's pinned host arena, which outlives the forward and is never written
+        // after load.
         Ok(unsafe {
             (
                 std::slice::from_raw_parts(src_gate_up as usize as *const u8, self.gate_up_bytes),
@@ -2233,6 +2906,47 @@ impl Inner {
         Ok(())
     }
 
+    /// Fence the window the published generation was read in, retire the generation and keep its
+    /// table backing (writable again). The fence is `finish_window` on the compute backend (the
+    /// stream synchronize of the window protocol), or with `device_scope` on the device backend
+    /// (`device_synchronize`: the drain a borrow open does). A generation a failed retirement
+    /// already fenced (`fenced`) retires directly; without any generation (a failed retirement
+    /// already retired it) the stream (device) is drained and the backing it left is kept.
+    fn fence_and_retire(&mut self, gpu: &Gpu, device_scope: bool) -> Result<(), String> {
+        let generation = if let Some(generation) = self.fenced.take() {
+            if device_scope {
+                device_idle(gpu)?;
+            }
+            generation
+        } else if let Some(lease) = self.lease.take() {
+            fence_window(gpu, lease, device_scope)?
+        } else {
+            if device_scope {
+                device_idle(gpu)?;
+            } else if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.hip.stream_synchronize(stream).map_err(io)?;
+            }
+            return if self.backing.is_some() {
+                Ok(())
+            } else {
+                Err(
+                    "the tail's published table generation is gone (its window never fenced)"
+                        .into(),
+                )
+            };
+        };
+        match self.policy.retire_generation(generation, None) {
+            Ok((backing, _retired)) => {
+                self.backing = Some(backing);
+                Ok(())
+            }
+            Err((generation, error)) => {
+                self.fenced = Some(generation);
+                Err(error.to_string())
+            }
+        }
+    }
+
     /// See [`UnitTailRank::borrow_suspend`]. The tail is marked suspended before the first device
     /// call so a failure leaves it in a state the close sequence can leave. Invariant afterwards:
     /// every table the tail owns holds canonical entries (decode tables: `canon_*`; full tables:
@@ -2243,6 +2957,12 @@ impl Inner {
     /// the retirement cadence is left alone: ranks suspend at the same call, so it stays
     /// rank-identical and the retirement clock resumes where it stopped. Pending fill batches are
     /// kept (all complete), so the next retirement polls them and publishes them as ever.
+    ///
+    /// Ownership: the published generation's window fences on the device backend and the
+    /// generation retires (the table backing comes back), the open's quiescence is the bank's
+    /// `quiesce` (the final device drain), and the whole pool is lent as scratch
+    /// ([`TailPolicy::lend_scratch`]): refused while any generation is live, a slot is
+    /// quarantined or a fill ticket was never issued.
     fn borrow_suspend(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         if self.released {
             return Err("the tail is released".into());
@@ -2255,29 +2975,41 @@ impl Inner {
         self.log_used = 0;
         self.window_routed = 0;
         self.window_seen = false;
-        // No table upload of the window protocol is still reading a pinned image.
-        device_idle(gpu)?;
+        // No table upload of the window protocol is still reading a pinned image, and no reader
+        // of the published generation can still run (the device-scope window fence).
+        self.fence_and_retire(gpu, true)?;
         // A frozen tail drops its deferred fills (its slots stay `Filling`, which nothing reads).
         self.issue_deferred(gpu)?;
         let stream = self.copy_stream.as_ref().ok_or("no copy stream")?;
         gpu.hip.stream_synchronize(stream).map_err(io)?;
-        for batch in &self.batches {
-            gpu.hip.event_synchronize(&batch.event).map_err(io)?;
-        }
+        RankCopy::new(&gpu.hip, stream, &mut self.events).wait_all()?;
+        let backing = self.backing.as_ref().ok_or("no table backing")?;
         for layer in &self.layers {
             upload_image(
+                backing,
                 gpu,
                 &layer.table_gate_up,
                 &canonical_image(&layer.canon_gate_up),
             )?;
-            upload_image(gpu, &layer.table_down, &canonical_image(&layer.canon_down))?;
+            upload_image(
+                backing,
+                gpu,
+                &layer.table_down,
+                &canonical_image(&layer.canon_down),
+            )?;
             if let Some(full) = layer.full.as_ref() {
                 upload_image(
+                    backing,
                     gpu,
                     &full.table_gate_up,
                     &canonical_image(&full.base_gate_up),
                 )?;
-                upload_image(gpu, &full.table_down, &canonical_image(&full.base_down))?;
+                upload_image(
+                    backing,
+                    gpu,
+                    &full.table_down,
+                    &canonical_image(&full.base_down),
+                )?;
             }
         }
         // The pins lever: the pin planes follow the tail's publications, so the epoch runs on
@@ -2291,23 +3023,108 @@ impl Inner {
                     .planes()
                     .statics(label)
                     .ok_or_else(|| format!("pin plane of layer {label}: no static plane"))?;
-                upload_image(gpu, device, statics)?;
+                upload_plane(gpu, device, statics)?;
             }
         }
-        // The copies above are null-stream: nothing may run ahead of them on any stream.
-        device_idle(gpu)
+        // The copies above are null-stream: nothing may run ahead of them on any stream. The
+        // bank's quiescence is that final device drain.
+        let mut device = RankDevice::new(&gpu.hip);
+        let quiesced = self
+            .policy
+            .quiesce(&mut device)
+            .map_err(|failure| failure.message)?;
+        let loan = self
+            .policy
+            .lend_scratch(quiesced)
+            .map_err(|error| error.to_string())?;
+        self.lent = Some(LentPool {
+            loan,
+            restore: None,
+            slots: 0,
+        });
+        Ok(())
     }
 
     /// See [`UnitTailRank::borrow_restore`].
-    fn borrow_restore(&self, gpu: &Gpu) -> Result<u64, String> {
+    fn borrow_restore(&mut self, gpu: &Gpu) -> Result<u64, String> {
         self.require_suspended()?;
         // Whatever used the pool (the compute stream) is done before its bytes are overwritten.
         device_idle(gpu)?;
-        let fills = self.occupied();
-        self.issue_copies(gpu, &fills)?;
-        let stream = self.copy_stream.as_ref().ok_or("no copy stream")?;
-        gpu.hip.stream_synchronize(stream).map_err(io)?;
-        Ok(fills.len() as u64 * (self.gate_up_bytes + self.down_bytes) as u64)
+        let Some(lent) = self.lent.take() else {
+            // The pool was never lent (the open failed before the loan): nothing wrote it.
+            return Ok(0);
+        };
+        match self.restore_lent(gpu, lent) {
+            Ok(bytes) => Ok(bytes),
+            Err((lent, why)) => {
+                self.lent = Some(lent);
+                Err(why)
+            }
+        }
+    }
+
+    /// Re-copy every occupied slot from its unit's canonical host bytes ([`SlotBank::issue_restore`]:
+    /// ascending slot, two copies per slot, ONE fence on the copy stream), wait the fence and end
+    /// the loan. On error the loan and the issued restore are returned (a retry only waits).
+    fn restore_lent(&mut self, gpu: &Gpu, lent: LentPool) -> Result<u64, (LentPool, String)> {
+        let (stream, pool) = match (self.copy_stream.as_ref(), self.pool.as_ref()) {
+            (Some(stream), Some(pool)) => (stream, pool),
+            _ => return Err((lent, "no copy stream or pool".into())),
+        };
+        let mut copy = RankCopy::new(&gpu.hip, stream, &mut self.events);
+        let LentPool {
+            loan,
+            mut restore,
+            mut slots,
+        } = lent;
+        if restore.is_none() {
+            let (layers, layer_of) = (&self.layers, &self.layer_of);
+            let bytes = (self.gate_up_bytes, self.down_bytes);
+            let mut copied = 0u64;
+            let issued =
+                self.policy
+                    .issue_restore(&loan, &mut copy, &mut |_slot, occupant, spans| {
+                        copied += 1;
+                        copy_unit_to_spans(
+                            &gpu.hip,
+                            stream,
+                            pool,
+                            layers,
+                            layer_of,
+                            bytes,
+                            occupant_unit(occupant),
+                            spans,
+                        )
+                    });
+            match issued {
+                Ok(pending) => {
+                    restore = Some(pending);
+                    slots = copied;
+                }
+                Err(failure) => {
+                    return Err((
+                        LentPool {
+                            loan,
+                            restore: None,
+                            slots: 0,
+                        },
+                        failure.message,
+                    ))
+                }
+            }
+        }
+        let pending = restore.take().expect("a restore was issued");
+        match self.policy.end_scratch(loan, pending, &mut copy) {
+            Ok(()) => Ok(slots * (self.gate_up_bytes + self.down_bytes) as u64),
+            Err((loan, pending, error)) => Err((
+                LentPool {
+                    loan,
+                    restore: Some(pending),
+                    slots,
+                },
+                error.to_string(),
+            )),
+        }
     }
 
     /// See [`UnitTailRank::borrow_verify`]. The digest is FNV-1a 64 over, per occupied slot
@@ -2320,17 +3137,17 @@ impl Inner {
         );
         let mut device = vec![0u8; self.gate_up_bytes.max(self.down_bytes)];
         let mut digest = FNV_OFFSET;
-        for op in self.occupied() {
-            let (layer, expert) = (op.unit.0 as usize, op.unit.1 as usize);
-            let (host_gate_up, host_down) = self.canonical_bytes(op.unit)?;
+        for (slot, unit, _generation) in self.occupied() {
+            let (layer, expert) = (unit.0 as usize, unit.1 as usize);
+            let (host_gate_up, host_down) = self.canonical_bytes(unit)?;
             for (what, pool, at, host) in [
                 (
                     "gate/up",
                     pool_gate_up,
-                    op.slot * self.gate_up_bytes,
+                    slot * self.gate_up_bytes,
                     host_gate_up,
                 ),
-                ("down", pool_down, op.slot * self.down_bytes, host_down),
+                ("down", pool_down, slot * self.down_bytes, host_down),
             ] {
                 let device = &mut device[..host.len()];
                 gpu.hip
@@ -2338,15 +3155,14 @@ impl Inner {
                     .map_err(io)?;
                 if let Some(byte) = first_difference(device, host) {
                     return Err(format!(
-                        "the tail pool slot {} (unit layer {layer} expert {expert}) {what} block \
+                        "the tail pool slot {slot} (unit layer {layer} expert {expert}) {what} block \
                          differs from its canonical host bytes at byte {byte}: device {:#04x}, host {:#04x}",
-                        op.slot,
                         device.get(byte).copied().unwrap_or(0),
                         host.get(byte).copied().unwrap_or(0)
                     ));
                 }
             }
-            for word in [op.slot as u64, layer as u64, expert as u64] {
+            for word in [slot as u64, layer as u64, expert as u64] {
                 digest = fnv1a64(digest, &word.to_le_bytes());
             }
             digest = fnv1a64(digest, host_gate_up);
@@ -2358,17 +3174,51 @@ impl Inner {
     /// See [`UnitTailRank::borrow_resume`]. Every table gets its whole live host image (a table a
     /// slot publication changed and one that did not alike: the device holds canonical entries
     /// after the open), so no dirty range remains. Fills still in flight at the open were drained
-    /// and keep their batch entries: the next retirement publishes them.
+    /// and keep their batch entries: the next retirement publishes them. The staged membership is
+    /// sealed again through the backing the open's retirement returned, as generation
+    /// `{ epoch, sub + 1 }` of the last sealed one, and its window lease runs until the next
+    /// retirement's fence. Refused while the scratch loan is outstanding (restore first).
     fn borrow_resume(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.require_suspended()?;
+        if self.lent.is_some() {
+            return Err("the tail's pool is still lent: restore it before resuming".into());
+        }
+        let backing = self.backing.take().ok_or(
+            "the tail's table backing is not held (its generation never retired): it cannot resume",
+        )?;
+        if let Err(error) = self.resume_upload(gpu, &backing) {
+            self.backing = Some(backing);
+            return Err(error);
+        }
+        let id = GenerationId {
+            epoch: self.last_gen.epoch,
+            sub: self.last_gen.sub + 1,
+        };
+        let generation = match self.policy.seal(backing, id) {
+            Ok(generation) => generation,
+            Err((backing, error)) => {
+                self.backing = Some(backing);
+                return Err(error.to_string());
+            }
+        };
+        let lease = acquire_window_owned(generation).map_err(|(_g, error)| error.to_string())?;
+        self.last_gen = id;
+        self.lease = Some(lease);
+        self.suspended = false;
+        Ok(())
+    }
+
+    /// The live host images (and pin planes) to the device, then the device drain: the upload half
+    /// of [`Self::borrow_resume`].
+    fn resume_upload(&mut self, gpu: &mut Gpu, backing: &TableBacking) -> Result<(), String> {
         for layer in &mut self.layers {
-            upload_image(gpu, &layer.table_gate_up, &layer.image_gate_up)?;
-            upload_image(gpu, &layer.table_down, &layer.image_down)?;
+            upload_image(backing, gpu, &layer.table_gate_up, &layer.image_gate_up)?;
+            upload_image(backing, gpu, &layer.table_down, &layer.image_down)?;
             layer.image_gate_up.dirty.take();
             layer.image_down.dirty.take();
             if let Some(full) = layer.full.as_mut() {
-                upload_image(gpu, &full.table_gate_up, &full.image_gate_up)?;
-                upload_image(gpu, &full.table_down, &full.image_down)?;
+                upload_image(backing, gpu, &full.table_gate_up, &full.image_gate_up)?;
+                upload_image(backing, gpu, &full.table_down, &full.image_down)?;
                 full.image_gate_up.dirty.take();
                 full.image_down.dirty.take();
             }
@@ -2378,12 +3228,10 @@ impl Inner {
         if let Some(pins) = self.pins.as_mut() {
             let _ = pins.proto.planes_mut().take_dirty();
             for (index, device) in pins.device.iter().enumerate() {
-                upload_image(gpu, device, pins.proto.planes().bytes(index))?;
+                upload_plane(gpu, device, pins.proto.planes().bytes(index))?;
             }
         }
-        device_idle(gpu)?;
-        self.suspended = false;
-        Ok(())
+        device_idle(gpu)
     }
 }
 
@@ -2391,10 +3239,11 @@ impl Inner {
 mod tests {
     use super::{
         apply_peer_delta, canonical_image, changed_entry_range, entry_span, first_difference,
-        fnv1a64, full_shared, image_entry, live_slot_units, peer_shared, pin_deltas, pool_layout,
-        slot_is_occupied, tail_layer_selected, DirtyRange, Inner, LiveSlot, ENTRY_BYTES,
-        FNV_OFFSET, LOG_IDS, POOL_BLOCK_ALIGN,
+        fnv1a64, full_shared, image_entry, live_slot_units, occupied_units, peer_shared,
+        pin_deltas, pool_layout, tail_layer_selected, DirtyRange, EventPool, GenerationId, Inner,
+        LiveSlot, ENTRY_BYTES, FNV_OFFSET, LOG_IDS, POOL_BLOCK_ALIGN,
     };
+    use crate::expert_unit_tail::rig::{rig_pool, Rig};
     use crate::expert_unit_tail::{
         EpUnitTailConfig, PeerBoard, PeerDelta, PinDelta, Retire, RetireCadence, SlotPhase,
         TailPolicy, UnitKey, WindowUse,
@@ -2675,7 +3524,7 @@ mod tests {
     }
 
     struct SimRank {
-        policy: TailPolicy,
+        policy: Rig,
         /// This rank's full-table images, one per layer.
         layers: Vec<SimLayer>,
         /// In-flight fills: `(slot, generation, retirements left)`.
@@ -2723,14 +3572,11 @@ mod tests {
                     fill_per_step: f,
                     boundary_every: b,
                 };
-                let mut policy = TailPolicy::new(config, false, priority);
-                if quarantine {
-                    policy.enable_peer_quarantine();
-                }
+                let mut policy = Rig::with_peer(config, false, priority, quarantine);
                 let seeds = policy.seed(&owned);
                 let mut held = vec![None; t];
-                for op in &seeds {
-                    held[op.slot] = Some(op.unit);
+                for &(slot, unit, _generation) in &seeds {
+                    held[slot] = Some(unit);
                 }
                 // The warm start posts as retirement 0, like `UnitTailRank::install`.
                 board.post(
@@ -2738,10 +3584,10 @@ mod tests {
                     0,
                     seeds
                         .iter()
-                        .map(|op| PeerDelta {
-                            unit: op.unit,
-                            slot: Some(sim_slot_addr(r, op.slot)),
-                            canon: sim_canon(op.unit),
+                        .map(|&(slot, unit, _generation)| PeerDelta {
+                            unit,
+                            slot: Some(sim_slot_addr(r, slot)),
+                            canon: sim_canon(unit),
                         })
                         .collect(),
                 );
@@ -2865,24 +3711,24 @@ mod tests {
             // The fills this retirement starts: a slot that was quarantined must have been
             // acknowledged by EVERY peer at a retirement strictly before this one.
             for op in &retire.fills {
-                if let Some(k) = ranks[r].quarantined_at.remove(&op.slot) {
+                let (op_slot, op_unit, op_generation) = *op;
+                if let Some(k) = ranks[r].quarantined_at.remove(&op_slot) {
                     for q in (0..SIM_RANKS).filter(|&q| q != r) {
                         match ranks[q].applied_at.get(&(r, k)) {
                             Some(&applied) if j > applied => {}
                             other => {
                                 return Err(format!(
-                                    "owner {r}: slot {} evicted at {k} refilled at {j}, peer {q} \
-                                     applied the unpublication at {other:?}",
-                                    op.slot
+                                    "owner {r}: slot {op_slot} evicted at {k} refilled at {j}, peer {q} \
+                                     applied the unpublication at {other:?}"
                                 ))
                             }
                         }
                     }
                     totals.quarantined_refills += 1;
                 }
-                pool[r][op.slot] = Some(op.unit);
+                pool[r][op_slot] = Some(op_unit);
                 let latency = (rand(rng) % 4) as u32;
-                ranks[r].flight.push((op.slot, op.generation, latency));
+                ranks[r].flight.push((op_slot, op_generation, latency));
             }
             // Take every peer delta posted so far, apply it to the full-table images, "upload",
             // acknowledge.
@@ -3220,19 +4066,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn only_a_slot_with_a_completed_fill_is_occupied() {
-        assert!(slot_is_occupied(SlotPhase::Live, false));
-        assert!(slot_is_occupied(SlotPhase::Quarantined, false));
-        assert!(slot_is_occupied(SlotPhase::Filling, true));
-        assert!(!slot_is_occupied(SlotPhase::Filling, false));
-        assert!(!slot_is_occupied(SlotPhase::Free, false));
-        assert!(!slot_is_occupied(SlotPhase::Free, true));
-    }
-
     /// An `Inner` with no layer and no device state: enough for the policy-side borrow rules.
     fn bare(policy: TailPolicy, suspended: bool) -> Inner {
-        let slots = policy.slots();
         Inner {
             rank: 0,
             ranks: 1,
@@ -3250,7 +4085,7 @@ mod tests {
             copy_stream: None,
             tables_ready: None,
             batches: Default::default(),
-            idle_events: Vec::new(),
+            events: EventPool::new(),
             log: None,
             log_host: Vec::new(),
             log_used: 0,
@@ -3281,27 +4116,52 @@ mod tests {
             pins: None,
             released: false,
             suspended,
-            slot_units: vec![None; slots],
+            backing: None,
+            lease: None,
+            fenced: None,
+            last_gen: GenerationId { epoch: 0, sub: 0 },
+            lent: None,
             skew: None,
         }
     }
 
-    fn occupied_slots(inner: &Inner) -> Vec<(usize, UnitKey)> {
-        inner
-            .occupied()
-            .iter()
-            .map(|op| (op.slot, op.unit))
+    /// A one-slot policy over the rig's pool block (no device).
+    fn bare_policy() -> TailPolicy {
+        let (block, spans) = rig_pool(1);
+        TailPolicy::new(
+            EpUnitTailConfig {
+                tail_units: 1,
+                fill_per_step: 1,
+                boundary_every: 1,
+            },
+            false,
+            HashMap::new(),
+            false,
+            block,
+            spans,
+        )
+        .map_err(|(_, error)| error)
+        .expect("a one-slot policy")
+    }
+
+    fn occupied_of(rig: &Rig) -> Vec<(usize, UnitKey)> {
+        occupied_units(&rig.policy)
+            .into_iter()
+            .map(|(slot, unit, _generation)| (slot, unit))
             .collect()
     }
 
+    /// The borrow restore's occupancy is the bank's: published and evicted-but-quarantined slots
+    /// (the bank remembers the unit of an evicted slot, which the policy forgets), and a
+    /// `Filling` slot only once its copy was issued; an abandoned fill (a frozen or released
+    /// tail's dropped ticket) stays unoccupied. Replaces the old `slot_is_occupied` phase table.
     #[test]
-    fn occupied_slots_are_the_live_and_quarantined_ones_plus_filling_only_when_unpublished_but_complete(
-    ) {
+    fn occupied_slots_are_the_resident_and_evicting_ones_plus_filling_only_once_issued() {
         let mut priority = HashMap::new();
         for expert in 0..16u16 {
             priority.insert((0u16, expert), expert as u32);
         }
-        let mut policy = TailPolicy::new(
+        let mut rig = Rig::with_peer(
             EpUnitTailConfig {
                 tail_units: 3,
                 fill_per_step: 4,
@@ -3309,39 +4169,58 @@ mod tests {
             },
             false,
             priority,
+            true,
         );
-        policy.enable_peer_quarantine();
-        let seeds = policy.seed(&[(0, 1), (0, 2)]);
-        let mut inner = bare(policy, true);
-        for op in &seeds {
-            inner.slot_units[op.slot] = Some(op.unit);
-        }
+        rig.seed(&[(0, 1), (0, 2)]);
         // Two live seeds, the third slot free.
-        assert_eq!(occupied_slots(&inner), vec![(0, (0, 1)), (1, (0, 2))]);
+        assert_eq!(occupied_of(&rig), vec![(0, (0, 1)), (1, (0, 2))]);
 
-        // A miss fills the free slot: Filling, and no batch holds it (a dropped / unissued fill).
-        let retire = inner.policy.retire_peer((0, 0), &[use_(0, 9)], &[], |_| 0);
+        // A miss fills the free slot: Filling with its ticket not issued yet (fill overlap's
+        // deferred state): not occupied.
+        rig.defer_issue(true);
+        let retire = rig.retire_peer((0, 0), &[use_(0, 9)], &[], |_| 0);
         assert_eq!(retire.fills.len(), 1);
-        for fill in &retire.fills {
-            inner.slot_units[fill.slot] = Some(fill.unit);
-        }
-        assert_eq!(occupied_slots(&inner), vec![(0, (0, 1)), (1, (0, 2))]);
+        assert_eq!(occupied_of(&rig), vec![(0, (0, 1)), (1, (0, 2))]);
 
         // A later miss with the pool full: the least recently used live slot is evicted into
-        // quarantine (the policy forgets its unit; the rank remembers the last fill's).
-        let retire = inner.policy.retire_peer((0, 0), &[use_(0, 12)], &[], |_| 0);
+        // quarantine (the policy forgets its unit; the bank keeps the occupant).
+        let retire = rig.retire_peer((0, 0), &[use_(0, 12)], &[], |_| 0);
         assert_eq!(retire.unpublish.len(), 1);
         let evicted = retire.unpublish[0];
         let quarantined = (0..3)
-            .find(|&slot| inner.policy.slot_phase(slot) == SlotPhase::Quarantined)
+            .find(|&slot| rig.slot_phase(slot) == SlotPhase::Quarantined)
             .expect("one quarantined slot");
-        assert_eq!(inner.policy.slot_unit(quarantined), None);
-        assert_eq!(inner.slot_units[quarantined], Some(evicted));
-        let occupied = occupied_slots(&inner);
+        assert_eq!(rig.slot_unit(quarantined), None);
+        let occupied = occupied_of(&rig);
         assert!(occupied.contains(&(quarantined, evicted)), "{occupied:?}");
         assert_eq!(occupied.len(), 2, "{occupied:?}");
 
+        // Issued: the filling slot is occupied too (its copy may have run).
+        rig.issue_unissued();
+        let occupied = occupied_of(&rig);
+        assert_eq!(occupied.len(), 3, "{occupied:?}");
+        assert!(occupied.contains(&(2, (0, 9))), "{occupied:?}");
+
+        // An abandoned ticket never becomes occupied.
+        let mut frozen = Rig::new(
+            EpUnitTailConfig {
+                tail_units: 2,
+                fill_per_step: 4,
+                boundary_every: 1,
+            },
+            false,
+            HashMap::new(),
+        );
+        frozen.seed(&[(0, 1)]);
+        frozen.defer_issue(true);
+        assert_eq!(frozen.retire((0, 0), &[use_(0, 9)], &[]).fills.len(), 1);
+        frozen.abandon_unissued();
+        assert_eq!(occupied_of(&frozen), vec![(0, (0, 1))]);
+        assert_eq!(frozen.slot_phase(1), SlotPhase::Filling);
+
         // Released: nothing to restore.
+        let mut inner = bare(bare_policy(), true);
+        assert!(inner.occupied().is_empty());
         inner.released = true;
         assert!(inner.occupied().is_empty());
     }
@@ -3355,16 +4234,7 @@ mod tests {
 
     #[test]
     fn a_suspended_tail_skips_the_window_end_and_drops_the_window_log() {
-        let policy = TailPolicy::new(
-            EpUnitTailConfig {
-                tail_units: 1,
-                fill_per_step: 1,
-                boundary_every: 1,
-            },
-            false,
-            HashMap::new(),
-        );
-        let mut inner = bare(policy, true);
+        let mut inner = bare(bare_policy(), true);
         inner.calls.push((3, 8, 0));
         inner.log_used = 32;
         assert!(inner.skip_suspended_window());
