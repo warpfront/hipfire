@@ -569,10 +569,22 @@ mod gfx942_bundle_tests {
     fn cdna_bundle_accepts_features_but_not_arch_prefixes() {
         let hxaco = native::bundle(b"\x7fELF", Arch::Gfx942, HOST_TRIPLE);
         let (mut bundle, payloads) = Bundle::read(&hxaco).unwrap();
-        bundle.entries[1].triple.push_str(":xnack-:sramecc+");
+        // `Bundle::write` preserves the recorded layout (payload offsets and padding gaps), so
+        // a retitled entry must move the header/padding boundary by the header's size change.
+        let retitle = |bundle: &mut Bundle, triple: &str| {
+            let delta = triple.len() as i64 - bundle.entries[1].triple.len() as i64;
+            bundle.entries[1].triple = triple.into();
+            let pad = &mut bundle.gaps[0];
+            let end = pad.offset + pad.fill.len();
+            pad.offset = (pad.offset as i64 + delta) as u64;
+            pad.fill = peacemaker_ir::envelope::Fill::Zero(end - pad.offset);
+        };
+        assert_eq!(bundle.gaps[0].offset, 140, "padding gap follows the header");
+        let features = format!("{}:xnack-:sramecc+", bundle.entries[1].triple);
+        retitle(&mut bundle, &features);
         let features = bundle.write(&payloads).unwrap();
         assert_eq!(device_elf(&features, Arch::Gfx942).unwrap(), b"\x7fELF");
-        bundle.entries[1].triple = "hipv4-amdgcn-amd-amdhsa--gfx9420".into();
+        retitle(&mut bundle, "hipv4-amdgcn-amd-amdhsa--gfx9420");
         let wrong_arch = bundle.write(&payloads).unwrap();
         assert!(device_elf(&wrong_arch, Arch::Gfx942).is_err());
     }
