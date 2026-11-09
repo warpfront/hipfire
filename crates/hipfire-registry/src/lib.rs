@@ -2388,7 +2388,10 @@ mod tests {
                 hipfire_config::memory::EP_HOT_UNITS_SIDECAR_SUFFIX
             )
         );
-        assert_eq!(pin.file, "qwen3.8-flash-next-base.mq4-xts-symtrunk.ep.hot-units");
+        assert_eq!(
+            pin.file,
+            "qwen3.8-flash-next-base.mq4-xts-symtrunk.ep.hot-units"
+        );
         assert_eq!(pin.base_sha256, HC8_SIDECAR_PINS[0].base_sha256);
         assert_eq!(pin.base_size, HC8_SIDECAR_PINS[0].base_size);
         assert_eq!(pin.repo, FLASH_NEXT_XTS_REPO);

@@ -21268,7 +21268,9 @@ effort = "high"
         fs::create_dir_all(&paths.models).unwrap();
         let base = paths.models.join("base.mq4-xts-symtrunk");
         let destination = hipfire_config::memory::ep_hot_units_sidecar_path(&base);
-        assert!(destination.to_string_lossy().ends_with("base.mq4-xts-symtrunk.ep.hot-units"));
+        assert!(destination
+            .to_string_lossy()
+            .ends_with("base.mq4-xts-symtrunk.ep.hot-units"));
         let content = br#"{"kind":"hipfire.qwen4.ep_hot_units"}"#;
         let units = hipfire_registry::HotUnitsSidecar {
             repo: "hipfire-models/qwen3.8-flash-next",
