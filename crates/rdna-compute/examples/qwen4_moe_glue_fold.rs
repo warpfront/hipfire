@@ -73,8 +73,7 @@ fn upload_u32(gpu: &mut Gpu, data: &[u32]) -> Res<GpuTensor> {
 fn download_u32(gpu: &Gpu, t: &GpuTensor, n: usize) -> Res<Vec<u32>> {
     let mut b = vec![0u8; n * 4];
     gpu.hip.memcpy_dtoh(&mut b, &t.buf)?;
-    Ok(b
-        .chunks_exact(4)
+    Ok(b.chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
 }
@@ -89,23 +88,12 @@ impl Outputs {
     fn new(gpu: &mut Gpu, rows: usize) -> Res<Self> {
         let slots = rows * K;
         let m = m_total_bound(slots);
-        let lens = [
-            slots,
-            slots,
-            E,
-            E + 1,
-            m,
-            m / BLOCK_M,
-            slots,
-            m / BLOCK_M,
-        ];
+        let lens = [slots, slots, E, E + 1, m, m / BLOCK_M, slots, m / BLOCK_M];
         let mut v = Vec::new();
         for &n in &lens {
             v.push(upload_u32(gpu, &vec![CANARY; n + PAD])?);
         }
-        let t: [GpuTensor; 8] = v
-            .try_into()
-            .map_err(|_| "eight output tensors")?;
+        let t: [GpuTensor; 8] = v.try_into().map_err(|_| "eight output tensors")?;
         Ok(Self {
             t,
             lens,
@@ -268,8 +256,16 @@ fn run_reference(
         logits, &out.t[0], &out.t[1], rows, recipe.0, recipe.1, layer, row_base,
     )?;
     gpu.moe_scatter_fused_top10(
-        &out.t[0], &out.t[2], &out.t[3], &out.t[4], &out.t[5], &out.t[6], slots, E,
-        out.grouped_rows, BLOCK_M,
+        &out.t[0],
+        &out.t[2],
+        &out.t[3],
+        &out.t[4],
+        &out.t[5],
+        &out.t[6],
+        slots,
+        E,
+        out.grouped_rows,
+        BLOCK_M,
     )?;
     gpu.ep_tile_mask(
         &out.t[5],
@@ -382,7 +378,13 @@ fn oracle() -> Res<()> {
     {
         let o = Outputs::new(&mut gpu, 64)?;
         let logits = upload_u32(&mut gpu, &vec![0u32; 80 * E])?;
-        for (rows, e, k) in [(0usize, E, K), (8, E, K), (65, E, K), (16, 256, K), (16, E, 8)] {
+        for (rows, e, k) in [
+            (0usize, E, K),
+            (8, E, K),
+            (65, E, K),
+            (16, 256, K),
+            (16, E, 8),
+        ] {
             let launched = gpu.moe_route_scatter_top10_wide_f32(
                 &logits,
                 &o.t[0],
@@ -416,8 +418,13 @@ fn oracle() -> Res<()> {
         assert!(gpu.moe_glue_fold_route_admitted(16, E, K));
         assert!(!gpu.moe_glue_fold_mask_admitted());
         enable_folds(&mut gpu);
-        assert!(gpu.moe_glue_fold_route_admitted(9, E, K) && gpu.moe_glue_fold_route_admitted(64, E, K));
-        assert!(!gpu.moe_glue_fold_route_admitted(8, E, K) && !gpu.moe_glue_fold_route_admitted(65, E, K));
+        assert!(
+            gpu.moe_glue_fold_route_admitted(9, E, K) && gpu.moe_glue_fold_route_admitted(64, E, K)
+        );
+        assert!(
+            !gpu.moe_glue_fold_route_admitted(8, E, K)
+                && !gpu.moe_glue_fold_route_admitted(65, E, K)
+        );
     }
 
     let mut tally = [Tally::default(), Tally::default()];
@@ -464,12 +471,16 @@ fn oracle() -> Res<()> {
                     // Reference chain (twice: the within-bucket order is an atomic race).
                     let want = Outputs::new(&mut gpu, rows)?;
                     gpu.clear_router_fault();
-                    run_reference(&mut gpu, &logits_t, &want, rows, recipe, layer, row_base, &tab_t[ti], tab)?;
+                    run_reference(
+                        &mut gpu, &logits_t, &want, rows, recipe, layer, row_base, &tab_t[ti], tab,
+                    )?;
                     gpu.hip.device_synchronize()?;
                     let want_fault = gpu.take_router_fault();
                     let want_d = want.dump(&gpu)?;
                     let want2 = Outputs::new(&mut gpu, rows)?;
-                    run_reference(&mut gpu, &logits_t, &want2, rows, recipe, layer, row_base, &tab_t[ti], tab)?;
+                    run_reference(
+                        &mut gpu, &logits_t, &want2, rows, recipe, layer, row_base, &tab_t[ti], tab,
+                    )?;
                     gpu.hip.device_synchronize()?;
                     let _ = gpu.take_router_fault();
                     let want2_d = want2.dump(&gpu)?;
@@ -479,7 +490,10 @@ fn oracle() -> Res<()> {
                         let got = Outputs::new(&mut gpu, rows)?;
                         gpu.clear_router_fault();
                         if arm == 0 {
-                            run_a(&mut gpu, &logits_t, &got, rows, recipe, layer, row_base, &tab_t[ti], tab)?;
+                            run_a(
+                                &mut gpu, &logits_t, &got, rows, recipe, layer, row_base,
+                                &tab_t[ti], tab,
+                            )?;
                         } else {
                             let launched = run_b(
                                 &mut gpu,
@@ -531,7 +545,9 @@ fn oracle() -> Res<()> {
                                 t.bad += 1;
                             }
                             if got_fault.is_some() != !nonfinite_rows.is_empty() {
-                                eprintln!("MISMATCH arm {name} rows {rows} seed {seed}: fault presence");
+                                eprintln!(
+                                    "MISMATCH arm {name} rows {rows} seed {seed}: fault presence"
+                                );
                                 t.bad += 1;
                             }
                         } else {
@@ -613,7 +629,9 @@ fn oracle() -> Res<()> {
                     if ti == 0 && ri == 0 && seed == 0 {
                         let got = Outputs::new(&mut gpu, rows)?;
                         gpu.clear_router_fault();
-                        let launched = run_b(&mut gpu, &logits_t, &got, rows, recipe, layer, row_base, None)?;
+                        let launched = run_b(
+                            &mut gpu, &logits_t, &got, rows, recipe, layer, row_base, None,
+                        )?;
                         assert!(launched);
                         gpu.hip.device_synchronize()?;
                         let _ = gpu.take_router_fault();
@@ -649,12 +667,31 @@ fn oracle() -> Res<()> {
         let logits_t = upload_u32(&mut gpu, &bits)?;
         let tab = &tabs[0];
         let want = Outputs::new(&mut gpu, rows)?;
-        run_reference(&mut gpu, &logits_t, &want, rows, (true, true), 5, 0, &tab_t[0], tab)?;
+        run_reference(
+            &mut gpu,
+            &logits_t,
+            &want,
+            rows,
+            (true, true),
+            5,
+            0,
+            &tab_t[0],
+            tab,
+        )?;
         gpu.hip.device_synchronize()?;
         let want_d = want.dump(&gpu)?;
         for _ in 0..repeats {
             let got = Outputs::new(&mut gpu, rows)?;
-            let launched = run_b(&mut gpu, &logits_t, &got, rows, (true, true), 5, 0, Some((&tab_t[0], tab.rank)))?;
+            let launched = run_b(
+                &mut gpu,
+                &logits_t,
+                &got,
+                rows,
+                (true, true),
+                5,
+                0,
+                Some((&tab_t[0], tab.rank)),
+            )?;
             assert!(launched);
             gpu.hip.device_synchronize()?;
             let got_d = got.dump(&gpu)?;
@@ -664,7 +701,10 @@ fn oracle() -> Res<()> {
     }
     eprintln!("arm B repeat stress: {stress_launches} launches, mismatches {stress_bad}");
     let mut failed = false;
-    for (arm, name) in [(0usize, "A (router, scatter+mask)"), (1, "B (router+scatter+mask)")] {
+    for (arm, name) in [
+        (0usize, "A (router, scatter+mask)"),
+        (1, "B (router+scatter+mask)"),
+    ] {
         let t = &tally[arm];
         eprintln!(
             "arm {name}: {} cases (rows 9..=64 x {seeds} seeds x 4 recipes x 5 owner tables, {} with non-finite rows), {} words compared, mismatches {}; chain != chain rerun (sorted/inverse bucket order) in {} cases",
@@ -734,10 +774,39 @@ fn bench() -> Res<()> {
                 let run = |gpu: &mut Gpu, g: usize, arm: usize| -> Res<()> {
                     let out = &outs[g];
                     match arm {
-                        0 => run_reference(gpu, &logits_set[g], out, rows, (true, true), 3, 0, &table, &tabs[0]),
-                        1 => run_a(gpu, &logits_set[g], out, rows, (true, true), 3, 0, &table, &tabs[0]),
-                        _ => run_b(gpu, &logits_set[g], out, rows, (true, true), 3, 0, Some((&table, 0)))
-                            .map(|_| ()),
+                        0 => run_reference(
+                            gpu,
+                            &logits_set[g],
+                            out,
+                            rows,
+                            (true, true),
+                            3,
+                            0,
+                            &table,
+                            &tabs[0],
+                        ),
+                        1 => run_a(
+                            gpu,
+                            &logits_set[g],
+                            out,
+                            rows,
+                            (true, true),
+                            3,
+                            0,
+                            &table,
+                            &tabs[0],
+                        ),
+                        _ => run_b(
+                            gpu,
+                            &logits_set[g],
+                            out,
+                            rows,
+                            (true, true),
+                            3,
+                            0,
+                            Some((&table, 0)),
+                        )
+                        .map(|_| ()),
                     }
                 };
                 // single sequence

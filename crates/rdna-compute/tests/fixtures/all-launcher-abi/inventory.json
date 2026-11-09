@@ -381,6 +381,8 @@
     "crates/railgun-cert/src/recording.rs::recording_dependent_decisions": "railgun certification report over recorded kernel names; reporting only",
     "crates/railgun-cert/src/recording.rs::inventory_json": "railgun certification report over recorded kernel names; reporting only",
     "crates/railgun-cert/src/recording.rs::inventory_markdown": "railgun certification report over recorded kernel names; reporting only",
+    "crates/railgun-cert/src/recording.rs::decision": "railgun certification lookup of a decision record by id; reporting only, launches nothing",
+    "crates/railgun-cert/src/recording.rs::refused_default_programs": "railgun certification report of programs refused as a default by NotEquivalent decisions; reporting only, launches nothing",
     "crates/rdna-compute/src/slab_moe.rs::plan_src_shared": "returns the shared union-plan HIP source (QWEN4_SLAB_UNION_PLAN_SRC) through the SlabArchKernels.plan_src function pointer; the planner launcher compiles it with ensure_kernel and launches qwen4_slab_union_plan, which is a checked site",
     "crates/rdna-compute/src/slab_moe.rs::slab_arch_kernels": "per-arch slab table lookup returning &'static SlabArchKernels (module, image and symbol names, plan source); names only, the launchers mq_i4_moe_gemv_slab, qwen4_moe_rotate128_i4_slab and the planner are checked sites",
     "crates/rdna-compute/src/slab_moe.rs::slab_cold_k1_metadata": "cold K1 table lookup by (arch, cold codec) returning &'static SlabCold (module, image and symbol names); names only, mq_i4_moe_gemv_slab launches through it and is a checked site",

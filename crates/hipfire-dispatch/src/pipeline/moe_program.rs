@@ -1698,11 +1698,8 @@ impl<'a> SealedMoeOp<'a> {
             if self.state.route_scatter_done.replace(false) {
                 return Ok(());
             }
-            let mask_written = super::qt44_qt53_prefill::scatter_masked(
-                gpu,
-                params,
-                selection.path2_m_total,
-            )?;
+            let mask_written =
+                super::qt44_qt53_prefill::scatter_masked(gpu, params, selection.path2_m_total)?;
             self.state.tile_mask_written.set(mask_written);
             return Ok(());
         }

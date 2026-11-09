@@ -35,6 +35,15 @@ const LWMMA_MULTI_DS_WHY: &str = "UNPROVEN, not a claimed race: an original LLVM
 const LWMMA_MULTI_ST_WHY: &str = "UNPROVEN, not a claimed race: an original LLVM compiler obligation, OPEN (the committed qwen4_lane_wmma_multi hipcc image is unchanged compiler output; the sealed PM twin is the same ELF; no modified code is claimed to race). The ledger keeps a pending VMEM store's source registers (data and address VGPRs) locked until its store-counter wait and reports the first write of one on a CFG path that has no such wait; whether the hardware has read the store sources by then (address captured at issue, vm_vsrc) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity does not discharge this strict WAR path in the ledger. Nothing here is discharged";
 const LWMMA_MULTI_KM_WHY: &str = "MODEL LIMITATION, not a claimed race: the IR models the VOP3 scalar-destination SGPR (here a `v_cmp_*_e64` result) as a pair although a wave32 instruction writes one SGPR, so the reported WAW with the pending SMEM load of s[2:3] exists only through the pair's second register (the committed qwen4_lane_wmma_multi hipcc image is unchanged compiler output; the sealed PM twin is the same ELF)";
 
+/// Shared reasons of the X8 twin rows (`moe_route_scatter_wide_{hipcc,pm}_gfx1201` and
+/// `qwen4_moe_ep_a8_rot_{hipcc,pm}_gfx1201`: whole-ELF seals, hipcc image and twin byte-identical, every
+/// row identical in both images).
+const X8_DS_WHY: &str = "UNPROVEN, not a claimed race: an original LLVM compiler obligation, OPEN (the committed moe_route_scatter_wide hipcc image is unchanged compiler output; the sealed PM twin is the same ELF; no modified code is claimed to race). The ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path that has no such wait; whether that path is feasible and whether the hardware has read the DS store sources by then (store-source timing) is not established here. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger; nothing here is discharged";
+const X8_ST_WHY: &str = "UNPROVEN, not a claimed race: an original LLVM compiler obligation, OPEN (the committed moe_route_scatter_wide hipcc image is unchanged compiler output; the sealed PM twin is the same ELF; no modified code is claimed to race). The ledger keeps a pending VMEM store's source registers (data and address VGPRs) locked until its store-counter wait and reports the first write of one on a CFG path that has no such wait; whether the hardware has read the store sources by then (address captured at issue, vm_vsrc) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity does not discharge this strict WAR path in the ledger; nothing here is discharged";
+const X8_LOAD_WAR_WHY: &str = "UNPROVEN, not a claimed race: an original LLVM compiler obligation, OPEN (the committed qwen4_moe_ep_a8_rot hipcc image is unchanged compiler output; the sealed PM twin is the same ELF; no modified code is claimed to race). The ledger keeps the registers of a pending VMEM load locked until its load-counter wait and reports the first write of one (here a wide load whose address pair overlaps its own destination) on a CFG path that has no such wait; whether that path is feasible and whether the hardware has read the load address by then is not established here. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger; nothing here is discharged";
+const X8_LOAD_USE_WHY: &str = "MODEL LIMITATION, not a claimed race: a d16 load (or the `.l` half read of a register a d16 load fills) whose destination VGPR is also listed as a use (the other half is preserved), so the ledger reads the pending load into the same register as a RAW on its old value; it cannot tell a d16 lo/hi pair from an overwrite, and whether the hardware returns the pair in order is not established by this verifier (the committed qwen4_moe_ep_a8_rot hipcc image is unchanged compiler output; the sealed PM twin is the same ELF)";
+const X8_KM_WHY: &str = "MODEL LIMITATION, not a claimed race: the IR models the VOP3 scalar-destination SGPR (here a `v_cmp_*_e64` result) as a pair although a wave32 instruction writes one SGPR, so the reported WAW with the pending SMEM load of s[2:3] exists only through the pair's second register (the committed qwen4_moe_ep_a8_rot hipcc image is unchanged compiler output; the sealed PM twin is the same ELF)";
+
 /// Reports of a missing wait on a CFG path, reviewed. None is a claimed race.
 pub const FINDINGS: &[Allow] = &[
     Allow {
@@ -1477,6 +1486,174 @@ pub const FINDINGS: &[Allow] = &[
         needle: "`v_add_nc_u32_e32 v3, 0xc00, v3` (after label `.LBB6`): needs Ds wait 0 (War { reg: \"v3\" })",
         why: LWMMA_MULTI_DS_WHY,
     },
+    Allow {
+        scope: "pins",
+        target: "moe_route_scatter_wide_hipcc_gfx1201.co#moe_router_softmax_top10_f32_fast",
+        needle: "`v_mov_b32_e32 v2, v1` (after label `.LBB6`): needs Store wait 0 (War { reg: \"v[2:5]\" })",
+        why: X8_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_route_scatter_wide_hipcc_gfx1201.co#moe_scatter_fused_k8",
+        needle: "`v_add_nc_u32_e32 v1, s4, v1` (after label `.LBB2`): needs Ds wait 0 (War { reg: \"v1\" })",
+        why: X8_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_route_scatter_wide_hipcc_gfx1201.co#moe_scatter_fused_top10_pmask",
+        needle: "`v_add_nc_u32_e32 v1, s4, v1` (after label `.LBB2`): needs Ds wait 0 (War { reg: \"v1\" })",
+        why: X8_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_route_scatter_wide_hipcc_gfx1201.co#moe_route_scatter_top10_wide_f32",
+        needle: "`v_mov_b32_e32 v3, v2` (after label `.LBB5`): needs Store wait 0 (War { reg: \"v[3:6]\" })",
+        why: X8_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_route_scatter_wide_pm_gfx1201.hxaco#moe_router_softmax_top10_f32_fast",
+        needle: "`v_mov_b32_e32 v2, v1` (after label `.LBB6`): needs Store wait 0 (War { reg: \"v[2:5]\" })",
+        why: X8_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_route_scatter_wide_pm_gfx1201.hxaco#moe_scatter_fused_k8",
+        needle: "`v_add_nc_u32_e32 v1, s4, v1` (after label `.LBB2`): needs Ds wait 0 (War { reg: \"v1\" })",
+        why: X8_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_route_scatter_wide_pm_gfx1201.hxaco#moe_scatter_fused_top10_pmask",
+        needle: "`v_add_nc_u32_e32 v1, s4, v1` (after label `.LBB2`): needs Ds wait 0 (War { reg: \"v1\" })",
+        why: X8_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "moe_route_scatter_wide_pm_gfx1201.hxaco#moe_route_scatter_top10_wide_f32",
+        needle: "`v_mov_b32_e32 v3, v2` (after label `.LBB5`): needs Store wait 0 (War { reg: \"v[3:6]\" })",
+        why: X8_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_nt1",
+        needle: "`flat_load_b128 v[0:3], v[6:7], off offset:8` (after label `.LBB4`): needs Load wait 0 (War { reg: \"v[0:1]\" })",
+        why: X8_LOAD_WAR_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_nt2",
+        needle: "`flat_load_d16_hi_b16 v32, v[72:73], off` (after label `.LBB14`): needs Load wait 0 (Use { reg: \"v32\" })",
+        why: X8_LOAD_USE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_planar_nt1",
+        needle: "`flat_load_d16_b16 v32, v[6:7], off` (after label `.LBB4`): needs Load wait 0 (Use { reg: \"v32\" })",
+        why: X8_LOAD_USE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_planar_nt2",
+        needle: "`flat_load_d16_b16 v32, v[72:73], off` (after label `.LBB14`): needs Load wait 0 (Use { reg: \"v32\" })",
+        why: X8_LOAD_USE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_down_nt1",
+        needle: "`flat_load_b128 v[12:15], v[12:13], off offset:20` (after label `.LBB4`): needs Load wait 0 (War { reg: \"v[12:13]\" })",
+        why: X8_LOAD_WAR_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_down_nt2",
+        needle: "`v_cvt_f32_f16_e32 v63, v24.l` (after label `.LBB20`): needs Load wait 0 (Use { reg: \"v24\" })",
+        why: X8_LOAD_USE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_down_planar_nt1",
+        needle: "`flat_load_b128 v[8:11], v[1:2], off` (after label `.LBB4`): needs Load wait 0 (War { reg: \"v[8:9]\" })",
+        why: X8_LOAD_WAR_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_down_planar_nt2",
+        needle: "`v_cvt_f32_f16_e32 v65, v24.l` (after label `.LBB20`): needs Load wait 0 (Use { reg: \"v24\" })",
+        why: X8_LOAD_USE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_rot_planar_nt1",
+        needle: "`flat_load_d16_b16 v33, v[7:8], off` (after label `.LBB4`): needs Load wait 0 (Use { reg: \"v33\" })",
+        why: X8_LOAD_USE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_rot_planar_nt2",
+        needle: "`v_cmp_le_u32_e64 s1, s5, v2` (after label `.LBB12`): needs Km wait 0 (Waw { reg: \"s[2:3]\" })",
+        why: X8_KM_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_nt1",
+        needle: "`flat_load_b128 v[0:3], v[6:7], off offset:8` (after label `.LBB4`): needs Load wait 0 (War { reg: \"v[0:1]\" })",
+        why: X8_LOAD_WAR_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_nt2",
+        needle: "`flat_load_d16_hi_b16 v32, v[72:73], off` (after label `.LBB14`): needs Load wait 0 (Use { reg: \"v32\" })",
+        why: X8_LOAD_USE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_planar_nt1",
+        needle: "`flat_load_d16_b16 v32, v[6:7], off` (after label `.LBB4`): needs Load wait 0 (Use { reg: \"v32\" })",
+        why: X8_LOAD_USE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_planar_nt2",
+        needle: "`flat_load_d16_b16 v32, v[72:73], off` (after label `.LBB14`): needs Load wait 0 (Use { reg: \"v32\" })",
+        why: X8_LOAD_USE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_down_nt1",
+        needle: "`flat_load_b128 v[12:15], v[12:13], off offset:20` (after label `.LBB4`): needs Load wait 0 (War { reg: \"v[12:13]\" })",
+        why: X8_LOAD_WAR_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_down_nt2",
+        needle: "`v_cvt_f32_f16_e32 v63, v24.l` (after label `.LBB20`): needs Load wait 0 (Use { reg: \"v24\" })",
+        why: X8_LOAD_USE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_down_planar_nt1",
+        needle: "`flat_load_b128 v[8:11], v[1:2], off` (after label `.LBB4`): needs Load wait 0 (War { reg: \"v[8:9]\" })",
+        why: X8_LOAD_WAR_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_down_planar_nt2",
+        needle: "`v_cvt_f32_f16_e32 v65, v24.l` (after label `.LBB20`): needs Load wait 0 (Use { reg: \"v24\" })",
+        why: X8_LOAD_USE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_rot_planar_nt1",
+        needle: "`flat_load_d16_b16 v33, v[7:8], off` (after label `.LBB4`): needs Load wait 0 (Use { reg: \"v33\" })",
+        why: X8_LOAD_USE_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_rot_planar_nt2",
+        needle: "`v_cmp_le_u32_e64 s1, s5, v2` (after label `.LBB12`): needs Km wait 0 (Waw { reg: \"s[2:3]\" })",
+        why: X8_KM_WHY,
+    },
 ];
 
 /// Inputs with no verification: a verifier refusal or a refusal upstream of it (lift region, pool).
@@ -1865,6 +2042,18 @@ pub const UNSUPPORTED: &[Allow] = &[
         needle: "wait verification: more than 512 distinct in-flight memory states reach label `.LBB28` (path-sensitive state explosion)",
         why: "UNSUPPORTED INPUT: OPEN: verifier state cap, not proven; the verifier's path-sensitive wait analysis exceeds its 512 in-flight-memory-state cap at `.LBB28` (Route-A twin), so the strict wait proof is NOT established for this image; the original LLVM bytes are retained byte-for-byte via Route-A; this is not a claimed race and not a successful full certification",
     },
+    Allow {
+        scope: "pools",
+        target: "region:moe_route_scatter_wide_hipcc_gfx1201.co#moe_route_scatter_top10_wide_f32",
+        needle: "not convertible: barrier participation: the paths from the per-wave branch of block 60 (EXEC Full; Vccnz on a per-wave VCC) to its post-dominator (the exit) pass different numbers of barriers",
+        why: "lift_region refuses the kernel (the last-arriving-workgroup scatter is behind a per-wave branch whose paths pass different numbers of barriers, so a multi-wave dispatcher region would mis-pair them), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:moe_route_scatter_wide_pm_gfx1201.hxaco#moe_route_scatter_top10_wide_f32",
+        needle: "not convertible: barrier participation: the paths from the per-wave branch of block 60 (EXEC Full; Vccnz on a per-wave VCC) to its post-dominator (the exit) pass different numbers of barriers",
+        why: "lift_region refuses the kernel (the last-arriving-workgroup scatter is behind a per-wave branch whose paths pass different numbers of barriers, so a multi-wave dispatcher region would mis-pair them), so no pool region exists; not a verifier finding",
+    },
 ];
 
 /// How the ledger's report on a hosted body is classified; the same two classes as the
@@ -1912,15 +2101,16 @@ pub struct PoolBody {
 /// need are the same). Witnesses: `local://ledger-join-finding.md`. No entry is a proven
 /// race, and there is no dispatcher entry.
 ///
-/// Templates 259-290 (after every id above) are the 32 `moe_shared_down_combine` bodies
-/// (16 hipcc originals 259-274, 16 PM twins 275-290), observed on the F6+F7 restack
+/// Templates 265-296 (after every id above up to the X8 route-scatter bodies 259-264) are the 32
+/// `moe_shared_down_combine` bodies (16 hipcc originals 265-280, 16 PM twins 281-296; they were 259-290
+/// before the X8 `moe_route_scatter_wide` images added the six templates 259-264, `+6`), observed on the F6+F7 restack
 /// (`fusion/logs/restack-f67/`) on top of F4, whose 32 new lane_rows (gemv_bf16/gemv_mq6)
 /// hosted pool templates now sort before them (their ids were 219-250 on the F6-only tree,
 /// +40 here). They are the pool-hosted
 /// copies of the 32 UNPROVEN DS-store source-register WAR `pins` rows (original LLVM
 /// obligation, OPEN, not a claimed race, not discharged by text identity or hardware
-/// outputs). The b320 multi pool hosts the same bodies; its tid-290 body finding (the last
-/// template) is covered by the tid 290 entry (same tid, body pc, instruction and need). A
+/// outputs). The b320 multi pool hosts the same bodies; its tid-296 body finding (the last
+/// template) is covered by the tid 296 entry (same tid, body pc, instruction and need). A
 /// changed id after a later twin lands is fixed by editing the `tid` only.
 ///
 /// The `topk8_rows_mq6g256v2_{hipcc,pm}_gfx1201` images (two entries each, `topk8_partial_f32_rows`
@@ -1929,12 +2119,12 @@ pub struct PoolBody {
 /// after the previous last template and no existing id is renumbered by them. Any `POOL_BODY` /
 /// `POOL_STATE_CAP` row for them is pinned from the observed scan, never guessed.
 ///
-/// Templates 359-498 are the 134 hosted `qwen4_lane_wmma_multi` bodies with a finding (the
-/// whole `qwen4_lane_wmma.gfx1201.hip` ELF: 70 hosted kernels per image, 359-428 from
-/// the hipcc `.co`, 429-498 from the sealed `.hxaco` twin; 3 per image report nothing). They
+/// Templates 365-504 are the 134 hosted `qwen4_lane_wmma_multi` bodies with a finding (the
+/// whole `qwen4_lane_wmma.gfx1201.hip` ELF: 70 hosted kernels per image, 365-434 from
+/// the hipcc `.co`, 435-504 from the sealed `.hxaco` twin; 3 per image report nothing). They
 /// are the pool-hosted copies of the 134 `pins` rows of the same targets (original LLVM
-/// obligations, OPEN, not claimed races); the b256 multi pool's tid-498 body finding is
-/// covered by the tid 498 entry. No template id above 290 carried an entry before, so none
+/// obligations, OPEN, not claimed races); the b256 multi pool's tid-504 body finding is
+/// covered by the tid 504 entry. No template id above 290 carried an entry before, so none
 /// was renumbered; a later image sorting before `qwen4_lane_wmma_multi_*` shifts these ids,
 /// fixed by editing the `tid` only.
 pub const POOL_BODY: &[PoolBody] = &[
@@ -2407,9 +2597,9 @@ pub const POOL_BODY: &[PoolBody] = &[
         insn: "`v_sub_co_u32 v2, s3, v0, v1`",
         need: "needs Km wait 0 (Waw { reg: \"s[4:6]\" })",
     },
-    // moe_shared_down_combine hipcc originals (tid 219-234)
+    // moe_shared_down_combine hipcc originals (tid 265-280)
     PoolBody {
-        tid: 259,
+        tid: 265,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r1",
         body_pc: 259,
         category: Category::Candidate,
@@ -2417,7 +2607,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v20\" })",
     },
     PoolBody {
-        tid: 260,
+        tid: 266,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r1_zinit",
         body_pc: 254,
         category: Category::Candidate,
@@ -2425,7 +2615,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v19\" })",
     },
     PoolBody {
-        tid: 261,
+        tid: 267,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r2",
         body_pc: 1304,
         category: Category::Candidate,
@@ -2433,7 +2623,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 262,
+        tid: 268,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r2_zinit",
         body_pc: 1275,
         category: Category::Candidate,
@@ -2441,7 +2631,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 263,
+        tid: 269,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r3",
         body_pc: 1402,
         category: Category::Candidate,
@@ -2449,7 +2639,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 264,
+        tid: 270,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r3_zinit",
         body_pc: 1373,
         category: Category::Candidate,
@@ -2457,7 +2647,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 265,
+        tid: 271,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r4",
         body_pc: 1509,
         category: Category::Candidate,
@@ -2465,7 +2655,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 266,
+        tid: 272,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r4_zinit",
         body_pc: 1480,
         category: Category::Candidate,
@@ -2473,7 +2663,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 267,
+        tid: 273,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r5",
         body_pc: 1618,
         category: Category::Candidate,
@@ -2481,7 +2671,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 268,
+        tid: 274,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r5_zinit",
         body_pc: 1589,
         category: Category::Candidate,
@@ -2489,7 +2679,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 269,
+        tid: 275,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r6",
         body_pc: 1727,
         category: Category::Candidate,
@@ -2497,7 +2687,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 270,
+        tid: 276,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r6_zinit",
         body_pc: 1698,
         category: Category::Candidate,
@@ -2505,7 +2695,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 271,
+        tid: 277,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r7",
         body_pc: 1824,
         category: Category::Candidate,
@@ -2513,7 +2703,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 272,
+        tid: 278,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r7_zinit",
         body_pc: 1795,
         category: Category::Candidate,
@@ -2521,7 +2711,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 273,
+        tid: 279,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r8",
         body_pc: 1928,
         category: Category::Candidate,
@@ -2529,16 +2719,16 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 274,
+        tid: 280,
         target: "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r8_zinit",
         body_pc: 1899,
         category: Category::Candidate,
         insn: "`v_add_f32_e32 v5, v49, v52`",
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
-    // moe_shared_down_combine PM twins (tid 235-250)
+    // moe_shared_down_combine PM twins (tid 281-296)
     PoolBody {
-        tid: 275,
+        tid: 281,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r1",
         body_pc: 259,
         category: Category::Candidate,
@@ -2546,7 +2736,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v20\" })",
     },
     PoolBody {
-        tid: 276,
+        tid: 282,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r1_zinit",
         body_pc: 254,
         category: Category::Candidate,
@@ -2554,7 +2744,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v19\" })",
     },
     PoolBody {
-        tid: 277,
+        tid: 283,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r2",
         body_pc: 1304,
         category: Category::Candidate,
@@ -2562,7 +2752,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 278,
+        tid: 284,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r2_zinit",
         body_pc: 1275,
         category: Category::Candidate,
@@ -2570,7 +2760,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 279,
+        tid: 285,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r3",
         body_pc: 1402,
         category: Category::Candidate,
@@ -2578,7 +2768,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 280,
+        tid: 286,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r3_zinit",
         body_pc: 1373,
         category: Category::Candidate,
@@ -2586,7 +2776,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 281,
+        tid: 287,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r4",
         body_pc: 1509,
         category: Category::Candidate,
@@ -2594,7 +2784,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 282,
+        tid: 288,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r4_zinit",
         body_pc: 1480,
         category: Category::Candidate,
@@ -2602,7 +2792,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 283,
+        tid: 289,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r5",
         body_pc: 1618,
         category: Category::Candidate,
@@ -2610,7 +2800,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 284,
+        tid: 290,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r5_zinit",
         body_pc: 1589,
         category: Category::Candidate,
@@ -2618,7 +2808,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 285,
+        tid: 291,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r6",
         body_pc: 1727,
         category: Category::Candidate,
@@ -2626,7 +2816,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 286,
+        tid: 292,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r6_zinit",
         body_pc: 1698,
         category: Category::Candidate,
@@ -2634,7 +2824,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 287,
+        tid: 293,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r7",
         body_pc: 1824,
         category: Category::Candidate,
@@ -2642,7 +2832,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 288,
+        tid: 294,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r7_zinit",
         body_pc: 1795,
         category: Category::Candidate,
@@ -2650,7 +2840,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 289,
+        tid: 295,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r8",
         body_pc: 1928,
         category: Category::Candidate,
@@ -2658,16 +2848,16 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
     PoolBody {
-        tid: 290,
+        tid: 296,
         target: "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r8_zinit",
         body_pc: 1899,
         category: Category::Candidate,
         insn: "`v_add_f32_e32 v5, v49, v52`",
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
     },
-    // topk8_rows_mq6g256v2 hipcc originals (tid 391-392) and PM twins (tid 395-396); b256 pools
+    // topk8_rows_mq6g256v2 hipcc originals (tid 557-558) and PM twins (tid 561-562); b256 pools
     PoolBody {
-        tid: 391,
+        tid: 557,
         target: "topk8_rows_mq6g256v2_hipcc_gfx1201.co#topk8_partial_f32_rows",
         body_pc: 274,
         category: Category::Candidate,
@@ -2675,7 +2865,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Store wait 1 (War { reg: \"v1\" })",
     },
     PoolBody {
-        tid: 392,
+        tid: 558,
         target: "topk8_rows_mq6g256v2_hipcc_gfx1201.co#topk8_rescore_mq6g256v2_k2560_rows",
         body_pc: 75,
         category: Category::ModelLimit,
@@ -2683,7 +2873,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Km wait 0 (Waw { reg: \"s4\" })",
     },
     PoolBody {
-        tid: 395,
+        tid: 561,
         target: "topk8_rows_mq6g256v2_pm_gfx1201.hxaco#topk8_partial_f32_rows",
         body_pc: 274,
         category: Category::Candidate,
@@ -2691,7 +2881,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Store wait 1 (War { reg: \"v1\" })",
     },
     PoolBody {
-        tid: 396,
+        tid: 562,
         target: "topk8_rows_mq6g256v2_pm_gfx1201.hxaco#topk8_rescore_mq6g256v2_k2560_rows",
         body_pc: 75,
         category: Category::ModelLimit,
@@ -2700,7 +2890,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 359,
+        tid: 365,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m1_n1",
         body_pc: 440,
         category: Category::Candidate,
@@ -2709,7 +2899,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 360,
+        tid: 366,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m1_n2",
         body_pc: 530,
         category: Category::Candidate,
@@ -2718,7 +2908,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 361,
+        tid: 367,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m2_n1",
         body_pc: 677,
         category: Category::Candidate,
@@ -2727,7 +2917,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 362,
+        tid: 368,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m2_n2",
         body_pc: 667,
         category: Category::Candidate,
@@ -2736,7 +2926,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 363,
+        tid: 369,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m3_n1",
         body_pc: 818,
         category: Category::Candidate,
@@ -2745,7 +2935,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 364,
+        tid: 370,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m3_n2",
         body_pc: 970,
         category: Category::Candidate,
@@ -2754,7 +2944,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 365,
+        tid: 371,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m4_n1",
         body_pc: 996,
         category: Category::Candidate,
@@ -2763,7 +2953,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 366,
+        tid: 372,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m4_n2",
         body_pc: 1217,
         category: Category::Candidate,
@@ -2772,7 +2962,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 367,
+        tid: 373,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m1_n1",
         body_pc: 683,
         category: Category::Candidate,
@@ -2781,7 +2971,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 368,
+        tid: 374,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m1_n2",
         body_pc: 871,
         category: Category::Candidate,
@@ -2790,7 +2980,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 369,
+        tid: 375,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m2_n1",
         body_pc: 1353,
         category: Category::Candidate,
@@ -2799,7 +2989,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 370,
+        tid: 376,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m2_n2",
         body_pc: 1387,
         category: Category::Candidate,
@@ -2808,7 +2998,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 371,
+        tid: 377,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m3_n1",
         body_pc: 1835,
         category: Category::Candidate,
@@ -2817,7 +3007,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 372,
+        tid: 378,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m3_n2",
         body_pc: 1835,
         category: Category::Candidate,
@@ -2826,7 +3016,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 373,
+        tid: 379,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m4_n1",
         body_pc: 2269,
         category: Category::Candidate,
@@ -2835,7 +3025,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 374,
+        tid: 380,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m4_n2",
         body_pc: 2412,
         category: Category::Candidate,
@@ -2844,7 +3034,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 375,
+        tid: 381,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m1_n1",
         body_pc: 1108,
         category: Category::Candidate,
@@ -2853,7 +3043,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 376,
+        tid: 382,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m1_n2",
         body_pc: 1187,
         category: Category::Candidate,
@@ -2862,7 +3052,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 377,
+        tid: 383,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m2_n1",
         body_pc: 1967,
         category: Category::Candidate,
@@ -2871,7 +3061,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 378,
+        tid: 384,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m2_n2",
         body_pc: 2020,
         category: Category::Candidate,
@@ -2880,7 +3070,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 379,
+        tid: 385,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m3_n1",
         body_pc: 2805,
         category: Category::Candidate,
@@ -2889,7 +3079,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 380,
+        tid: 386,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m3_n2",
         body_pc: 2801,
         category: Category::Candidate,
@@ -2898,7 +3088,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 381,
+        tid: 387,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m4_n1",
         body_pc: 3687,
         category: Category::Candidate,
@@ -2907,7 +3097,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 382,
+        tid: 388,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m4_n2",
         body_pc: 3661,
         category: Category::Candidate,
@@ -2916,7 +3106,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 383,
+        tid: 389,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m1_n1",
         body_pc: 647,
         category: Category::Candidate,
@@ -2925,7 +3115,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 384,
+        tid: 390,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m1_n2",
         body_pc: 972,
         category: Category::Candidate,
@@ -2934,7 +3124,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 385,
+        tid: 391,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m2_n1",
         body_pc: 948,
         category: Category::Candidate,
@@ -2943,7 +3133,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 386,
+        tid: 392,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m2_n2",
         body_pc: 1190,
         category: Category::Candidate,
@@ -2952,7 +3142,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 387,
+        tid: 393,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m3_n1",
         body_pc: 1118,
         category: Category::Candidate,
@@ -2961,7 +3151,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 388,
+        tid: 394,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m3_n2",
         body_pc: 1521,
         category: Category::Candidate,
@@ -2970,7 +3160,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 389,
+        tid: 395,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m4_n1",
         body_pc: 1343,
         category: Category::ModelLimit,
@@ -2979,7 +3169,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 390,
+        tid: 396,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m4_n2",
         body_pc: 1833,
         category: Category::Candidate,
@@ -2988,7 +3178,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 391,
+        tid: 397,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m1_n1",
         body_pc: 1030,
         category: Category::Candidate,
@@ -2997,7 +3187,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 392,
+        tid: 398,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m1_n2",
         body_pc: 1307,
         category: Category::Candidate,
@@ -3006,7 +3196,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 393,
+        tid: 399,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m2_n1",
         body_pc: 1734,
         category: Category::Candidate,
@@ -3015,7 +3205,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 394,
+        tid: 400,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m2_n2",
         body_pc: 1876,
         category: Category::Candidate,
@@ -3024,7 +3214,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 395,
+        tid: 401,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m3_n1",
         body_pc: 2124,
         category: Category::Candidate,
@@ -3033,7 +3223,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 396,
+        tid: 402,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m3_n2",
         body_pc: 2427,
         category: Category::Candidate,
@@ -3042,7 +3232,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 397,
+        tid: 403,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m4_n1",
         body_pc: 2552,
         category: Category::ModelLimit,
@@ -3051,7 +3241,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 398,
+        tid: 404,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m4_n2",
         body_pc: 3023,
         category: Category::Candidate,
@@ -3060,7 +3250,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 399,
+        tid: 405,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m1_n1",
         body_pc: 1341,
         category: Category::Candidate,
@@ -3069,7 +3259,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 400,
+        tid: 406,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m1_n2",
         body_pc: 1624,
         category: Category::Candidate,
@@ -3078,7 +3268,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 401,
+        tid: 407,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m2_n1",
         body_pc: 2421,
         category: Category::Candidate,
@@ -3087,7 +3277,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 402,
+        tid: 408,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m2_n2",
         body_pc: 2453,
         category: Category::Candidate,
@@ -3096,7 +3286,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 403,
+        tid: 409,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m3_n1",
         body_pc: 3070,
         category: Category::Candidate,
@@ -3105,7 +3295,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 404,
+        tid: 410,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m3_n2",
         body_pc: 3380,
         category: Category::Candidate,
@@ -3114,7 +3304,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 405,
+        tid: 411,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m4_n1",
         body_pc: 4005,
         category: Category::Candidate,
@@ -3123,7 +3313,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 406,
+        tid: 412,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m4_n2",
         body_pc: 4305,
         category: Category::Candidate,
@@ -3132,7 +3322,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 407,
+        tid: 413,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m1_n1_multi",
         body_pc: 818,
         category: Category::Candidate,
@@ -3141,7 +3331,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 408,
+        tid: 414,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m2_n1_multi",
         body_pc: 1494,
         category: Category::Candidate,
@@ -3150,7 +3340,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 409,
+        tid: 415,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m3_n1_multi",
         body_pc: 1993,
         category: Category::Candidate,
@@ -3159,7 +3349,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 410,
+        tid: 416,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m4_n1_multi",
         body_pc: 2423,
         category: Category::Candidate,
@@ -3168,7 +3358,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 411,
+        tid: 417,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t1_g1",
         body_pc: 293,
         category: Category::Candidate,
@@ -3177,7 +3367,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 412,
+        tid: 418,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t1_g2",
         body_pc: 293,
         category: Category::Candidate,
@@ -3186,7 +3376,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 413,
+        tid: 419,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t1_g4",
         body_pc: 295,
         category: Category::Candidate,
@@ -3195,7 +3385,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 414,
+        tid: 420,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t2_g1",
         body_pc: 378,
         category: Category::Candidate,
@@ -3204,7 +3394,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 415,
+        tid: 421,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t2_g2",
         body_pc: 378,
         category: Category::Candidate,
@@ -3213,7 +3403,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 416,
+        tid: 422,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t2_g4",
         body_pc: 380,
         category: Category::Candidate,
@@ -3222,7 +3412,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 417,
+        tid: 423,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t3_g1",
         body_pc: 469,
         category: Category::Candidate,
@@ -3231,7 +3421,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 418,
+        tid: 424,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t3_g2",
         body_pc: 469,
         category: Category::Candidate,
@@ -3240,7 +3430,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 419,
+        tid: 425,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t3_g4",
         body_pc: 480,
         category: Category::Candidate,
@@ -3249,7 +3439,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 421,
+        tid: 427,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t1_g2",
         body_pc: 583,
         category: Category::Candidate,
@@ -3258,7 +3448,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 422,
+        tid: 428,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t1_g4",
         body_pc: 590,
         category: Category::Candidate,
@@ -3267,7 +3457,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 424,
+        tid: 430,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t2_g2",
         body_pc: 663,
         category: Category::Candidate,
@@ -3276,7 +3466,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 425,
+        tid: 431,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t2_g4",
         body_pc: 670,
         category: Category::Candidate,
@@ -3285,7 +3475,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 427,
+        tid: 433,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t3_g2",
         body_pc: 751,
         category: Category::Candidate,
@@ -3294,7 +3484,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 428,
+        tid: 434,
         target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t3_g4",
         body_pc: 758,
         category: Category::Candidate,
@@ -3303,7 +3493,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 429,
+        tid: 435,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m1_n1",
         body_pc: 440,
         category: Category::Candidate,
@@ -3312,7 +3502,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 430,
+        tid: 436,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m1_n2",
         body_pc: 530,
         category: Category::Candidate,
@@ -3321,7 +3511,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 431,
+        tid: 437,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m2_n1",
         body_pc: 677,
         category: Category::Candidate,
@@ -3330,7 +3520,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 432,
+        tid: 438,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m2_n2",
         body_pc: 667,
         category: Category::Candidate,
@@ -3339,7 +3529,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 433,
+        tid: 439,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m3_n1",
         body_pc: 818,
         category: Category::Candidate,
@@ -3348,7 +3538,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 434,
+        tid: 440,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m3_n2",
         body_pc: 970,
         category: Category::Candidate,
@@ -3357,7 +3547,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 435,
+        tid: 441,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m4_n1",
         body_pc: 996,
         category: Category::Candidate,
@@ -3366,7 +3556,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 436,
+        tid: 442,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m4_n2",
         body_pc: 1217,
         category: Category::Candidate,
@@ -3375,7 +3565,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 437,
+        tid: 443,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m1_n1",
         body_pc: 683,
         category: Category::Candidate,
@@ -3384,7 +3574,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 438,
+        tid: 444,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m1_n2",
         body_pc: 871,
         category: Category::Candidate,
@@ -3393,7 +3583,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 439,
+        tid: 445,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m2_n1",
         body_pc: 1353,
         category: Category::Candidate,
@@ -3402,7 +3592,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 440,
+        tid: 446,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m2_n2",
         body_pc: 1387,
         category: Category::Candidate,
@@ -3411,7 +3601,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 441,
+        tid: 447,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m3_n1",
         body_pc: 1835,
         category: Category::Candidate,
@@ -3420,7 +3610,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 442,
+        tid: 448,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m3_n2",
         body_pc: 1835,
         category: Category::Candidate,
@@ -3429,7 +3619,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 443,
+        tid: 449,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m4_n1",
         body_pc: 2269,
         category: Category::Candidate,
@@ -3438,7 +3628,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 444,
+        tid: 450,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m4_n2",
         body_pc: 2412,
         category: Category::Candidate,
@@ -3447,7 +3637,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 445,
+        tid: 451,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m1_n1",
         body_pc: 1108,
         category: Category::Candidate,
@@ -3456,7 +3646,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 446,
+        tid: 452,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m1_n2",
         body_pc: 1187,
         category: Category::Candidate,
@@ -3465,7 +3655,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 447,
+        tid: 453,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m2_n1",
         body_pc: 1967,
         category: Category::Candidate,
@@ -3474,7 +3664,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 448,
+        tid: 454,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m2_n2",
         body_pc: 2020,
         category: Category::Candidate,
@@ -3483,7 +3673,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 449,
+        tid: 455,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m3_n1",
         body_pc: 2805,
         category: Category::Candidate,
@@ -3492,7 +3682,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 450,
+        tid: 456,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m3_n2",
         body_pc: 2801,
         category: Category::Candidate,
@@ -3501,7 +3691,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 451,
+        tid: 457,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m4_n1",
         body_pc: 3687,
         category: Category::Candidate,
@@ -3510,7 +3700,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 452,
+        tid: 458,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m4_n2",
         body_pc: 3661,
         category: Category::Candidate,
@@ -3519,7 +3709,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 453,
+        tid: 459,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m1_n1",
         body_pc: 647,
         category: Category::Candidate,
@@ -3528,7 +3718,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 454,
+        tid: 460,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m1_n2",
         body_pc: 972,
         category: Category::Candidate,
@@ -3537,7 +3727,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 455,
+        tid: 461,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m2_n1",
         body_pc: 948,
         category: Category::Candidate,
@@ -3546,7 +3736,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 456,
+        tid: 462,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m2_n2",
         body_pc: 1190,
         category: Category::Candidate,
@@ -3555,7 +3745,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 457,
+        tid: 463,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m3_n1",
         body_pc: 1118,
         category: Category::Candidate,
@@ -3564,7 +3754,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 458,
+        tid: 464,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m3_n2",
         body_pc: 1521,
         category: Category::Candidate,
@@ -3573,7 +3763,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 459,
+        tid: 465,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m4_n1",
         body_pc: 1343,
         category: Category::ModelLimit,
@@ -3582,7 +3772,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 460,
+        tid: 466,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m4_n2",
         body_pc: 1833,
         category: Category::Candidate,
@@ -3591,7 +3781,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 461,
+        tid: 467,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m1_n1",
         body_pc: 1030,
         category: Category::Candidate,
@@ -3600,7 +3790,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 462,
+        tid: 468,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m1_n2",
         body_pc: 1307,
         category: Category::Candidate,
@@ -3609,7 +3799,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 463,
+        tid: 469,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m2_n1",
         body_pc: 1734,
         category: Category::Candidate,
@@ -3618,7 +3808,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 464,
+        tid: 470,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m2_n2",
         body_pc: 1876,
         category: Category::Candidate,
@@ -3627,7 +3817,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 465,
+        tid: 471,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m3_n1",
         body_pc: 2124,
         category: Category::Candidate,
@@ -3636,7 +3826,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 466,
+        tid: 472,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m3_n2",
         body_pc: 2427,
         category: Category::Candidate,
@@ -3645,7 +3835,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 467,
+        tid: 473,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m4_n1",
         body_pc: 2552,
         category: Category::ModelLimit,
@@ -3654,7 +3844,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 468,
+        tid: 474,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m4_n2",
         body_pc: 3023,
         category: Category::Candidate,
@@ -3663,7 +3853,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 469,
+        tid: 475,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m1_n1",
         body_pc: 1341,
         category: Category::Candidate,
@@ -3672,7 +3862,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 470,
+        tid: 476,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m1_n2",
         body_pc: 1624,
         category: Category::Candidate,
@@ -3681,7 +3871,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 471,
+        tid: 477,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m2_n1",
         body_pc: 2421,
         category: Category::Candidate,
@@ -3690,7 +3880,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 472,
+        tid: 478,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m2_n2",
         body_pc: 2453,
         category: Category::Candidate,
@@ -3699,7 +3889,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 473,
+        tid: 479,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m3_n1",
         body_pc: 3070,
         category: Category::Candidate,
@@ -3708,7 +3898,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 474,
+        tid: 480,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m3_n2",
         body_pc: 3380,
         category: Category::Candidate,
@@ -3717,7 +3907,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 475,
+        tid: 481,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m4_n1",
         body_pc: 4005,
         category: Category::Candidate,
@@ -3726,7 +3916,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 476,
+        tid: 482,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m4_n2",
         body_pc: 4305,
         category: Category::Candidate,
@@ -3735,7 +3925,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 477,
+        tid: 483,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m1_n1_multi",
         body_pc: 818,
         category: Category::Candidate,
@@ -3744,7 +3934,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 478,
+        tid: 484,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m2_n1_multi",
         body_pc: 1494,
         category: Category::Candidate,
@@ -3753,7 +3943,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 479,
+        tid: 485,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m3_n1_multi",
         body_pc: 1993,
         category: Category::Candidate,
@@ -3762,7 +3952,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 480,
+        tid: 486,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m4_n1_multi",
         body_pc: 2423,
         category: Category::Candidate,
@@ -3771,7 +3961,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 481,
+        tid: 487,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t1_g1",
         body_pc: 293,
         category: Category::Candidate,
@@ -3780,7 +3970,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 482,
+        tid: 488,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t1_g2",
         body_pc: 293,
         category: Category::Candidate,
@@ -3789,7 +3979,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 483,
+        tid: 489,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t1_g4",
         body_pc: 295,
         category: Category::Candidate,
@@ -3798,7 +3988,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 484,
+        tid: 490,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t2_g1",
         body_pc: 378,
         category: Category::Candidate,
@@ -3807,7 +3997,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 485,
+        tid: 491,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t2_g2",
         body_pc: 378,
         category: Category::Candidate,
@@ -3816,7 +4006,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 486,
+        tid: 492,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t2_g4",
         body_pc: 380,
         category: Category::Candidate,
@@ -3825,7 +4015,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 487,
+        tid: 493,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t3_g1",
         body_pc: 469,
         category: Category::Candidate,
@@ -3834,7 +4024,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 488,
+        tid: 494,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t3_g2",
         body_pc: 469,
         category: Category::Candidate,
@@ -3843,7 +4033,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 489,
+        tid: 495,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t3_g4",
         body_pc: 480,
         category: Category::Candidate,
@@ -3852,7 +4042,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 491,
+        tid: 497,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t1_g2",
         body_pc: 583,
         category: Category::Candidate,
@@ -3861,7 +4051,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 492,
+        tid: 498,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t1_g4",
         body_pc: 590,
         category: Category::Candidate,
@@ -3870,7 +4060,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 494,
+        tid: 500,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t2_g2",
         body_pc: 663,
         category: Category::Candidate,
@@ -3879,7 +4069,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 495,
+        tid: 501,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t2_g4",
         body_pc: 670,
         category: Category::Candidate,
@@ -3888,7 +4078,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 497,
+        tid: 503,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t3_g2",
         body_pc: 751,
         category: Category::Candidate,
@@ -3897,12 +4087,221 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
     PoolBody {
-        tid: 498,
+        tid: 504,
         target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t3_g4",
         body_pc: 758,
         category: Category::Candidate,
         insn: "`v_add_nc_u32_e32 v3, 0xc00, v3`",
         need: "needs Ds wait 0 (War { reg: \"v3\" })",
+    },
+    // X8 twins: moe_route_scatter_wide and qwen4_moe_ep_a8_rot (pins rows above; tids 259-264, 513-532)
+    PoolBody {
+        tid: 259,
+        target: "moe_route_scatter_wide_hipcc_gfx1201.co#moe_router_softmax_top10_f32_fast",
+        body_pc: 255,
+        category: Category::Candidate,
+        insn: "`v_mov_b32_e32 v2, v1`",
+        need: "needs Store wait 0 (War { reg: \"v[2:5]\" })",
+    },
+    PoolBody {
+        tid: 260,
+        target: "moe_route_scatter_wide_hipcc_gfx1201.co#moe_scatter_fused_k8",
+        body_pc: 19,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, s4, v1`",
+        need: "needs Ds wait 0 (War { reg: \"v1\" })",
+    },
+    PoolBody {
+        tid: 261,
+        target: "moe_route_scatter_wide_hipcc_gfx1201.co#moe_scatter_fused_top10_pmask",
+        body_pc: 19,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, s4, v1`",
+        need: "needs Ds wait 0 (War { reg: \"v1\" })",
+    },
+    PoolBody {
+        tid: 262,
+        target: "moe_route_scatter_wide_pm_gfx1201.hxaco#moe_router_softmax_top10_f32_fast",
+        body_pc: 255,
+        category: Category::Candidate,
+        insn: "`v_mov_b32_e32 v2, v1`",
+        need: "needs Store wait 0 (War { reg: \"v[2:5]\" })",
+    },
+    PoolBody {
+        tid: 263,
+        target: "moe_route_scatter_wide_pm_gfx1201.hxaco#moe_scatter_fused_k8",
+        body_pc: 19,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, s4, v1`",
+        need: "needs Ds wait 0 (War { reg: \"v1\" })",
+    },
+    PoolBody {
+        tid: 264,
+        target: "moe_route_scatter_wide_pm_gfx1201.hxaco#moe_scatter_fused_top10_pmask",
+        body_pc: 19,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, s4, v1`",
+        need: "needs Ds wait 0 (War { reg: \"v1\" })",
+    },
+    PoolBody {
+        tid: 513,
+        target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_nt1",
+        body_pc: 126,
+        category: Category::Candidate,
+        insn: "`flat_load_b128 v[0:3], v[6:7], off offset:8`",
+        need: "needs Load wait 0 (War { reg: \"v[0:1]\" })",
+    },
+    PoolBody {
+        tid: 514,
+        target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_nt2",
+        body_pc: 234,
+        category: Category::ModelLimit,
+        insn: "`flat_load_d16_hi_b16 v32, v[72:73], off`",
+        need: "needs Load wait 0 (Use { reg: \"v32\" })",
+    },
+    PoolBody {
+        tid: 515,
+        target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_planar_nt1",
+        body_pc: 130,
+        category: Category::ModelLimit,
+        insn: "`flat_load_d16_b16 v32, v[6:7], off`",
+        need: "needs Load wait 0 (Use { reg: \"v32\" })",
+    },
+    PoolBody {
+        tid: 516,
+        target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_planar_nt2",
+        body_pc: 242,
+        category: Category::ModelLimit,
+        insn: "`flat_load_d16_b16 v32, v[72:73], off`",
+        need: "needs Load wait 0 (Use { reg: \"v32\" })",
+    },
+    PoolBody {
+        tid: 517,
+        target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_down_nt1",
+        body_pc: 115,
+        category: Category::Candidate,
+        insn: "`flat_load_b128 v[12:15], v[12:13], off offset:20`",
+        need: "needs Load wait 0 (War { reg: \"v[12:13]\" })",
+    },
+    PoolBody {
+        tid: 518,
+        target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_down_nt2",
+        body_pc: 282,
+        category: Category::ModelLimit,
+        insn: "`v_cvt_f32_f16_e32 v63, v24.l`",
+        need: "needs Load wait 0 (Use { reg: \"v24\" })",
+    },
+    PoolBody {
+        tid: 519,
+        target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_down_planar_nt1",
+        body_pc: 116,
+        category: Category::Candidate,
+        insn: "`flat_load_b128 v[8:11], v[1:2], off`",
+        need: "needs Load wait 0 (War { reg: \"v[8:9]\" })",
+    },
+    PoolBody {
+        tid: 520,
+        target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_down_planar_nt2",
+        body_pc: 284,
+        category: Category::ModelLimit,
+        insn: "`v_cvt_f32_f16_e32 v65, v24.l`",
+        need: "needs Load wait 0 (Use { reg: \"v24\" })",
+    },
+    PoolBody {
+        tid: 521,
+        target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_rot_planar_nt1",
+        body_pc: 127,
+        category: Category::ModelLimit,
+        insn: "`flat_load_d16_b16 v33, v[7:8], off`",
+        need: "needs Load wait 0 (Use { reg: \"v33\" })",
+    },
+    PoolBody {
+        tid: 522,
+        target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_rot_planar_nt2",
+        body_pc: 180,
+        category: Category::ModelLimit,
+        insn: "`v_cmp_le_u32_e64 s1, s5, v2`",
+        need: "needs Km wait 0 (Waw { reg: \"s[2:3]\" })",
+    },
+    PoolBody {
+        tid: 523,
+        target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_nt1",
+        body_pc: 126,
+        category: Category::Candidate,
+        insn: "`flat_load_b128 v[0:3], v[6:7], off offset:8`",
+        need: "needs Load wait 0 (War { reg: \"v[0:1]\" })",
+    },
+    PoolBody {
+        tid: 524,
+        target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_nt2",
+        body_pc: 234,
+        category: Category::ModelLimit,
+        insn: "`flat_load_d16_hi_b16 v32, v[72:73], off`",
+        need: "needs Load wait 0 (Use { reg: \"v32\" })",
+    },
+    PoolBody {
+        tid: 525,
+        target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_planar_nt1",
+        body_pc: 130,
+        category: Category::ModelLimit,
+        insn: "`flat_load_d16_b16 v32, v[6:7], off`",
+        need: "needs Load wait 0 (Use { reg: \"v32\" })",
+    },
+    PoolBody {
+        tid: 526,
+        target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_planar_nt2",
+        body_pc: 242,
+        category: Category::ModelLimit,
+        insn: "`flat_load_d16_b16 v32, v[72:73], off`",
+        need: "needs Load wait 0 (Use { reg: \"v32\" })",
+    },
+    PoolBody {
+        tid: 527,
+        target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_down_nt1",
+        body_pc: 115,
+        category: Category::Candidate,
+        insn: "`flat_load_b128 v[12:15], v[12:13], off offset:20`",
+        need: "needs Load wait 0 (War { reg: \"v[12:13]\" })",
+    },
+    PoolBody {
+        tid: 528,
+        target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_down_nt2",
+        body_pc: 282,
+        category: Category::ModelLimit,
+        insn: "`v_cvt_f32_f16_e32 v63, v24.l`",
+        need: "needs Load wait 0 (Use { reg: \"v24\" })",
+    },
+    PoolBody {
+        tid: 529,
+        target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_down_planar_nt1",
+        body_pc: 116,
+        category: Category::Candidate,
+        insn: "`flat_load_b128 v[8:11], v[1:2], off`",
+        need: "needs Load wait 0 (War { reg: \"v[8:9]\" })",
+    },
+    PoolBody {
+        tid: 530,
+        target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_down_planar_nt2",
+        body_pc: 284,
+        category: Category::ModelLimit,
+        insn: "`v_cvt_f32_f16_e32 v65, v24.l`",
+        need: "needs Load wait 0 (Use { reg: \"v24\" })",
+    },
+    PoolBody {
+        tid: 531,
+        target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_rot_planar_nt1",
+        body_pc: 127,
+        category: Category::ModelLimit,
+        insn: "`flat_load_d16_b16 v33, v[7:8], off`",
+        need: "needs Load wait 0 (Use { reg: \"v33\" })",
+    },
+    PoolBody {
+        tid: 532,
+        target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_rot_planar_nt2",
+        body_pc: 180,
+        category: Category::ModelLimit,
+        insn: "`v_cmp_le_u32_e64 s1, s5, v2`",
+        need: "needs Km wait 0 (Waw { reg: \"s[2:3]\" })",
     },
 ];
 

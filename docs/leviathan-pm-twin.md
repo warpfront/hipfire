@@ -257,6 +257,36 @@ to be a race. Checked full-ELF byte identity of anchor and twin does not dischar
 strict WAR paths, and hardware source-read timing and path feasibility remain unproven. No stronger
 analysis proof is claimed, and no railgun certificate is claimed for these entries.
 
+## X8 wide MoE glue and rot planar gate/up (Route A, proof only)
+
+Two gfx1201 families of `scripts/pm-leviathan-twin.py` seal the X8 entries of `HIPFIRE_QWEN4_MOE_GLUE_FOLD`
+(`--family moe-route-scatter-wide`, `--family qwen4-moe-ep-a8-rot`, both `--arch gfx1201`). Each compiles the exact
+concatenated runtime module source (the manifest's `module_source` records the define, every part's path, bytes
+and sha256, and the combined sha256: `MOE_ROUTE_SCATTER_WIDE_SRC`, `QWEN4_MOE_EP_A8_ROT_SRC`) with the core hipcc
+flags and seals the whole device ELF; the extracted device ELF (every byte of the amdgcn bundle entry) is byte-identical to the hipcc anchor's (`lift_identity`: `emit::checked ok; emitted
+bytes == input ELF`). The `.co`/`.hxaco` files are clang offload bundles (4,096-byte header + device ELF; the two containers have the same size but different sha256 because the bundle header bytes are normalized differently by the seal, so identity is claimed for the extracted device ELF only, not for the container); the
+per-symbol `elf_sha256` below is the extracted device ELF, shared by both symbols of a module. No math evidence.
+Dispatch stays the registry HIP source.
+
+| Module (`kernels/` prefix) | Symbols | Container sha256 (`.co` anchor / `.hxaco`) | Device ELF sha256 |
+|---|---|---|---|
+| `moe_route_scatter_wide_{hipcc,pm}_gfx1201` | `moe_scatter_fused_top10_pmask`, `moe_route_scatter_top10_wide_f32` | `ae68aaa75dea39da94758853e32ac283c7e6113476d57a22976813e6008f396a` / `897d2559b4a962d7b35f579d72bc22d243f21cce17b91b27e2f526f18536fbf1` (57,664 bytes each) | `66b336f9ebdcc4095726d8ed28808a7a083eccdb2aeb5fe43ba91fb8482624e1` |
+| `qwen4_moe_ep_a8_rot_{hipcc,pm}_gfx1201` | `qwen4_moe_ep_a8_gate_up_rot_planar_nt1`, `_nt2` | `4598d9b7be48fccb37c277054d1df32d926fcfe074a1dc3258b5a362e7e9a4d1` / `144541988d77744179fef6633f5f9c22ebb698ded2e843b3b21134d880468a07` (147,328 bytes each) | `9ef317ec5ea53e4f62cd06ea80c577aa42081768554218ec6361136eaa446413` |
+
+Per-entry `.text` sha256, VGPRs, LDS (manifest `seal.reports`; 0 blocking hazards, 0 scratch):
+
+| Symbol | `.text` sha256 | VGPRs | LDS |
+|---|---|---:|---:|
+| `moe_scatter_fused_top10_pmask` | `728141e7f45843ee165a80360998a0dbfb25679e5bfc90eeb7c7dce0577ed944` | 24 | 128 |
+| `moe_route_scatter_top10_wide_f32` | `6e3a9766c1cc5ceea036fc246939c79d2761783a10d195336d8c2d898028eb0d` | 80 | 16,516 |
+| `qwen4_moe_ep_a8_gate_up_rot_planar_nt1` | `0934542138798802da0d0618397b4c65bd451092e46dc0eb7f6ca388aeda3a8d` | 168 | 4,352 |
+| `qwen4_moe_ep_a8_gate_up_rot_planar_nt2` | `4552cdd2a3ff3317e1fd107baac790b504aba55930d9ecc330ef51241c8e575f` | 248 | 8,704 |
+
+The rot module also defines the eight legacy A8 entries; lifting the whole ELF needed `v_cmp_eq_u16_e32`
+(VOPC `0x3a`, true16) in the gfx12 decode table (used by `qwen4_moe_ep_a8_down_nt2`/`down_planar`). Test:
+`crates/peacemaker-isa/tests/hip_twin_x8.rs` (CPU only; a stale source part hash fails it). Ledger and railgun
+rows for these entries are OPEN; no stronger proof is claimed.
+
 ## gfx942 rows16: typed CDNA Route A
 
 The same anchor/seal/provenance pattern is used for

@@ -177,10 +177,10 @@ pub struct FeatureFlags {
     /// (`HIPFIRE_QWEN4_MOE_SCATTER_SCAN`), default on for gfx1201 (`=0` keeps the serial
     /// thread-0 walk); gfx1151 always scans, every other arch always walks.
     pub qwen4_moe_scatter_scan: bool,
-    /// Wave-3 C8 MoE glue folds (`HIPFIRE_QWEN4_MOE_GLUE_FOLD`, developer, default off): a
+    /// Wave-3 C8 MoE glue folds (`HIPFIRE_QWEN4_MOE_GLUE_FOLD`, developer, default on, all folds): a
     /// bitmask of the sub-folds ([`MOE_GLUE_FOLD_MASK`], [`MOE_GLUE_FOLD_ROUTER`],
-    /// [`MOE_GLUE_FOLD_ROTATE`]); `1` selects all, a letter list (`a`, `ab`, `c`, ...) selects
-    /// the named ones, `0` / unset none. Exact gfx1201 only (see
+    /// [`MOE_GLUE_FOLD_ROTATE`]); unset / `1` selects all, a letter list (`a`, `ab`, `c`, ...)
+    /// selects the named ones, `0` none. Exact gfx1201 only (see
     /// [`FeatureFlags::qwen4_moe_glue_fold_enabled`]).
     pub qwen4_moe_glue_fold: u8,
     /// Multi-lane fn-lanes GDN decode core (`HIPFIRE_QWEN4_GDN_LANES`), default
@@ -1069,14 +1069,14 @@ pub const MOE_GLUE_FOLD_ROUTER: u8 = 0b010;
 /// Sub-fold X8c: the down producer (`qwen4_moe_rotate128_i8`) runs in the gate/up epilogue.
 pub const MOE_GLUE_FOLD_ROTATE: u8 = 0b100;
 
-/// Parse `HIPFIRE_QWEN4_MOE_GLUE_FOLD`: unset, `0` / `false` / `off` and anything unrecognised
-/// select no fold, `1` / `true` / `on` all of them, otherwise a list of the letters `a`
+/// Parse `HIPFIRE_QWEN4_MOE_GLUE_FOLD`: unset and `1` / `true` / `on` select all folds, `0` /
+/// `false` / `off` / empty and anything unrecognised select no fold, otherwise a list of the letters `a`
 /// ([`MOE_GLUE_FOLD_MASK`]), `b` ([`MOE_GLUE_FOLD_ROUTER`]) and `c` ([`MOE_GLUE_FOLD_ROTATE`])
 /// (case-insensitive, `,` / `+` / space separators ignored); any other character voids the whole
 /// value (no fold).
 pub fn parse_moe_glue_fold(raw: Option<&str>) -> u8 {
     let Some(raw) = raw.map(str::trim) else {
-        return 0;
+        return MOE_GLUE_FOLD_MASK | MOE_GLUE_FOLD_ROUTER | MOE_GLUE_FOLD_ROTATE;
     };
     match raw {
         "1" | "true" | "TRUE" | "on" | "ON" => {
@@ -3920,11 +3920,11 @@ mod tests {
         }
     }
 
-    /// The wave-3 glue fold is opt-in: off unless a fold is named, `1` names all, letters name
-    /// subsets, and only exact gfx1201 reports any as enabled.
+    /// The wave-3 glue fold is default on (all of a/b/c): unset and `1` name all, letters name
+    /// subsets, `0` / empty / unrecognised kill it, and only exact gfx1201 reports any as enabled.
     #[test]
-    fn qwen4_moe_glue_fold_is_opt_in_exact_gfx1201() {
-        assert_eq!(parse_moe_glue_fold(None), 0);
+    fn qwen4_moe_glue_fold_defaults_on_exact_gfx1201() {
+        assert_eq!(parse_moe_glue_fold(None), 0b111);
         assert_eq!(parse_moe_glue_fold(Some("0")), 0);
         assert_eq!(parse_moe_glue_fold(Some("")), 0);
         assert_eq!(parse_moe_glue_fold(Some("2")), 0);
@@ -3945,8 +3945,12 @@ mod tests {
                 })
             };
             let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
-            for bit in [MOE_GLUE_FOLD_MASK, MOE_GLUE_FOLD_ROUTER, MOE_GLUE_FOLD_ROTATE] {
-                assert!(!unset.qwen4_moe_glue_fold_enabled(bit), "{arch}");
+            for bit in [
+                MOE_GLUE_FOLD_MASK,
+                MOE_GLUE_FOLD_ROUTER,
+                MOE_GLUE_FOLD_ROTATE,
+            ] {
+                assert_eq!(unset.qwen4_moe_glue_fold_enabled(bit), exact, "{arch}");
                 assert!(!with("0").qwen4_moe_glue_fold_enabled(bit), "{arch}");
                 assert_eq!(with("1").qwen4_moe_glue_fold_enabled(bit), exact, "{arch}");
             }
@@ -3955,7 +3959,10 @@ mod tests {
                 exact,
                 "{arch}"
             );
-            assert!(!with("a").qwen4_moe_glue_fold_enabled(MOE_GLUE_FOLD_ROUTER), "{arch}");
+            assert!(
+                !with("a").qwen4_moe_glue_fold_enabled(MOE_GLUE_FOLD_ROUTER),
+                "{arch}"
+            );
         }
     }
 

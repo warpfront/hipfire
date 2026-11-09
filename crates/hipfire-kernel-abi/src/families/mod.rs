@@ -20,6 +20,7 @@ pub mod iu4_gdn;
 pub mod mq6_i8;
 pub mod mq6sym_i8;
 pub mod qwen4_lane_wmma;
+pub mod qwen4_moe_glue_fold;
 pub mod qwen4_moe_sym;
 pub mod qwen4_topk8_rows;
 
@@ -33,6 +34,7 @@ pub fn all() -> impl Iterator<Item = &'static KernelAbiV1> {
         .iter()
         .chain(mq6sym_i8::ABIS.iter())
         .chain(qwen4_moe_sym::ABIS.iter())
+        .chain(qwen4_moe_glue_fold::ABIS.iter())
         .chain(ggml_mmvq::ABIS.iter())
         .chain(ggml_mmvq_fused::ABIS.iter())
         .chain(ggml_convert::ABIS.iter())
@@ -94,7 +96,7 @@ mod tests {
         }
         assert_eq!(
             ids.len(),
-            64 + super::generic_gemm::ABIS.len()
+            67 + super::generic_gemm::ABIS.len()
                 + super::generic_seq::ABIS.len()
                 + super::generic_elem::ABIS.len()
                 + super::generic_mmq::ABIS.len()

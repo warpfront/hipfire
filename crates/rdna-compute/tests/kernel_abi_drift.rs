@@ -408,11 +408,15 @@ const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
     ("gfx1201", "moe_grouped_qt44_iu4_sym_gfx1201_nt2r1"),
     ("gfx1201", "moe_grouped_qt44_iu4_sym_gfx1201_nt2r2"),
     ("gfx1201", "moe_grouped_qt44_iu4_sym_gfx1201_nt4r1"),
+    ("gfx1201", "moe_route_scatter_top10_wide_f32"),
     ("gfx1201", "moe_scatter_fused_k8"),
+    ("gfx1201", "moe_scatter_fused_top10_pmask"),
     ("gfx1201", "mq8_rotate_quantize_x_batched"),
     ("gfx1201", "mq_rotate_x"),
     ("gfx1201", "quantize_int8_mmq_ds128"),
     ("gfx1201", "quantize_x_q8_blk32"),
+    ("gfx1201", "qwen4_moe_ep_a8_gate_up_rot_planar_nt1"),
+    ("gfx1201", "qwen4_moe_ep_a8_gate_up_rot_planar_nt2"),
     ("gfx1201", "raon_rda_conv_prepare_w128_f32"),
     ("gfx1201", "raon_rda_prepare_f32"),
     ("gfx1201", "rotate_x_mq_awq"),
@@ -1440,6 +1444,16 @@ fn runtime_source(module: &str, source: &str) -> Result<String, String> {
             "{}{}{body}",
             read("kernels/src/topk8_select.hip")?,
             read("kernels/src/qwen4_gemv_mq6g256v2.hip")?
+        ),
+        "moe_route_scatter_wide" => format!(
+            "{}{}{body}",
+            read("kernels/src/moe_router_softmax_top10_f32_fast.hip")?,
+            read("kernels/src/qwen4_moe_scatter_fused_k8.hip")?
+        ),
+        "qwen4_moe_ep_a8_rot_gfx12" => format!(
+            "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n{}{}{body}",
+            read("kernels/src/block_i8_128_quant.hip")?,
+            read("kernels/src/qwen4_moe_ep_a8.gfx12.hip")?
         ),
         _ => body,
     })

@@ -193,6 +193,7 @@ s_mul_f32	sop2	0x44	SDST:32,SSRC0:32,SSRC1:32,literal@last	SDST	SSRC0,SSRC1	-	-	
 s_mul_hi_u32	sop2	0x2d	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	-	-	s_mul_hi_u32 s100, s99, s100	96E46463	-
 v_cmp_eq_u32_e32	vopc	0x4a	SRC0:32,VSRC1:32,literal@last	-	SRC0,VSRC1	-	-	v_cmp_eq_u32_e32 vcc_lo, 0x7f800000, v5	7C940AFF 7F800000	-
 v_cmp_eq_u16_e64	vop3	0x3a	VDST:64,SRC0:16,SRC1:16	VDST	SRC0,SRC1	-	-	v_cmp_eq_u16_e64 s1, 1, v64.l	D43A0001 02028081	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_cmp_eq_u16_e32	vopc	0x3a	SRC0:16,VSRC1:16	-	SRC0,VSRC1	-	-	v_cmp_eq_u16_e32 vcc_lo, 1, v48.l	7C746081	-
 v_cmp_le_u32_e64	vop3	0x4b	VDST:64,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_cmp_le_u32_e64 s74, s72, v188	D44B004A 02037848	src2_unused:ignored:0x1ff:0x00/0x80/0x101
 v_cmp_ngt_f32_e64	vop3	0x1b	VDST:64,SRC0:32,SRC1:32,literal@last	VDST	SRC0,SRC1	-	-	v_cmp_ngt_f32_e64 s81, 0xc2b17218, v0	D41B0051 020200FF C2B17218	src2_unused:ignored:0x1ff:0x00/0x80/0x101
 v_cmp_nlt_f32_e64	vop3	0x1e	VDST:64,SRC0:32,SRC1:32,literal@last	VDST	SRC0,SRC1	-	-	v_cmp_nlt_f32_e64 s80, 0x42ce8ed0, v0	D41E0050 020200FF 42CE8ED0	src2_unused:ignored:0x1ff:0x00/0x80/0x101

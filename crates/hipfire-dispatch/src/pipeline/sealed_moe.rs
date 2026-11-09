@@ -2578,14 +2578,16 @@ pub(super) fn produce_prefill_route<'a>(
                             params.k_top,
                             fuse.grouped_rows,
                             crate::families::moe::MOE_GROUPED_BLOCK_M,
-                            fuse.owner_mask.as_ref().map(|mask| {
-                                rdna_compute::moe::TileMaskFold {
+                            fuse.owner_mask
+                                .as_ref()
+                                .map(|mask| rdna_compute::moe::TileMaskFold {
                                     tile_ids_owned: mask.tile_ids_owned,
                                     owner_table: mask.owner_table,
-                                    tiles: fuse.grouped_rows.div_ceil(rdna_compute::moe::EP_TILE_ROWS),
+                                    tiles: fuse
+                                        .grouped_rows
+                                        .div_ceil(rdna_compute::moe::EP_TILE_ROWS),
                                     rank: mask.rank,
-                                }
-                            }),
+                                }),
                         )
                         .map_err(|e| DispatchError::Hip(e.to_string()))?,
                     Some(fuse) => gpu

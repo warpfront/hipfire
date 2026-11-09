@@ -1507,12 +1507,17 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-moe-glue-fold-eager",
         predicates: &[IsRecording, CaptureMode],
-        condition: "Flash-Next exact-gfx1201 wide-verify MoE glue folds (HIPFIRE_QWEN4_MOE_GLUE_FOLD, default off) taken only with `!is_recording() && !capture_mode`: Gpu::moe_glue_fold_mask_admitted (the scatter launch also writes the owner tile mask, moe_scatter_fused_top10_pmask) and Gpu::moe_glue_fold_route_admitted (9..=64-row router + scatter + mask in one launch, moe_route_scatter_top10_wide_f32 with a persistent per-Gpu arrival counter), both rdna-compute moe.rs",
+        condition: "Flash-Next exact-gfx1201 wide-verify MoE glue folds (HIPFIRE_QWEN4_MOE_GLUE_FOLD, default on for all folds, `0` kills) taken only with `!is_recording() && !capture_mode`: Gpu::qwen4_moe_gu_rot_fold_applies (fold c: the down producer folded into the planar A8 gate/up epilogue, qwen4_moe_ep_a8_gate_up_rot_planar_nt{1,2}, qwen4_moe_ep_a8.rs), Gpu::moe_glue_fold_mask_admitted (the scatter launch also writes the owner tile mask, moe_scatter_fused_top10_pmask) and Gpu::moe_glue_fold_route_admitted (9..=64-row router + scatter + mask in one launch, moe_route_scatter_top10_wide_f32 with a persistent per-Gpu arrival counter), both rdna-compute moe.rs",
         effect: KernelSelection,
-        switches: "eager: moe_router_softmax_top10_f32_fast + moe_scatter_fused_top10 + ep_tile_mask_pm_gfx1201 replaced by moe_scatter_fused_top10_pmask (a) or moe_route_scatter_top10_wide_f32 (b); recorded/captured: the unfused launches",
-        kernels: &[],
+        switches: "eager: moe_router_softmax_top10_f32_fast + moe_scatter_fused_top10 + ep_tile_mask_pm_gfx1201 replaced by moe_scatter_fused_top10_pmask (a) or moe_route_scatter_top10_wide_f32 (b); qwen4_moe_rotate128_i8 after qwen4_moe_ep_a8_gate_up_planar_nt{1,2} replaced by qwen4_moe_ep_a8_gate_up_rot_planar_nt{1,2} (c); recorded/captured: the unfused launches",
+        kernels: &[
+            "moe_scatter_fused_top10_pmask",
+            "moe_route_scatter_top10_wide_f32",
+            "qwen4_moe_ep_a8_gate_up_rot_planar_nt1",
+            "qwen4_moe_ep_a8_gate_up_rot_planar_nt2",
+        ],
         verdict: ByteExact,
-        evidence: "GPU oracle examples/qwen4_moe_glue_fold (fusion3/runs/x8): every output word of topk_idx, topk_w, expert_token_counts, expert_offsets, expert_tile_ids, tile_ids_owned and the router fault word equal to the unfused chain, sorted_slot_index / inverse_perm equal as permutations (the shipped scatter's atomic bucket fill is a race in the unfused chain itself); eager exact-gfx1201 arms only, the recorded body keeps the unfused launches. No railgun default program is a qwen4 program, so nothing reaches one",
+        evidence: "GPU oracle examples/qwen4_moe_glue_fold (fusion3/runs/x8): every output word of topk_idx, topk_w, expert_token_counts, expert_offsets, expert_tile_ids, tile_ids_owned and the router fault word equal to the unfused chain, sorted_slot_index / inverse_perm equal as permutations (the shipped scatter's atomic bucket fill is a race in the unfused chain itself); eager exact-gfx1201 arms only, the recorded body keeps the unfused launches. The four entries have hipcc kernarg contracts in hipfire-kernel-abi (families/qwen4_moe_glue_fold.rs) and Route-A PeaceMaker twins (kernels/moe_route_scatter_wide_pm_gfx1201.hxaco, kernels/qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco) that are whole-ELF byte-identical to the hipcc objects (peacemaker-isa tests/hip_twin_x8.rs); dispatch stays HIP, so the twins add no recorded-body difference. No railgun default program is a qwen4 program, so nothing reaches one",
         reaches: &[],
     },
     Decision {

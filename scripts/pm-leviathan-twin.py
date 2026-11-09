@@ -17,7 +17,7 @@ Explicit invocation only: no test, build script or runtime path runs this. It
 
 Tests (`crates/peacemaker-isa/tests/hip_twin_leviathan.rs`) only consume the committed files.
 
-    scripts/pm-leviathan-twin.py [--family leviathan|moe-shared-down-combine|lwmma-multi]
+    scripts/pm-leviathan-twin.py [--family leviathan|moe-shared-down-combine|lwmma-multi|moe-route-scatter-wide|qwen4-moe-ep-a8-rot]
         [--arch gfx1200|gfx1201|all] [--rocm-path DIR]
         [--build-wrapper 'WRAPPER ARGS'] [--seal-bin PATH] [--out-dir DIR]
 
@@ -30,6 +30,12 @@ manifest `moe_shared_down_combine_pm_gfx1201.twin.json`, `seal.reports` in symbo
 `lwmma_gemm_bf16_t2_m{1,2,3,4}_n1_multi` symbols into one `kernels/qwen4_lane_wmma_multi_pm_gfx1201.hxaco`
 (anchor `qwen4_lane_wmma_multi_hipcc_gfx1201.co`, manifest `qwen4_lane_wmma_multi_pm_gfx1201.twin.json`,
 `seal.reports` in symbol order); the whole device ELF (plain lane-WMMA entries included) is byte-identical; no math evidence.
+
+`--family moe-route-scatter-wide` and `--family qwen4-moe-ep-a8-rot` (gfx1201 only) compile the exact concatenated
+runtime module source (`MOE_ROUTE_SCATTER_WIDE_SRC`, `QWEN4_MOE_EP_A8_ROT_SRC`; parts and hashes recorded in the manifest's
+`module_source`) once and seal the two wide MoE glue entries (`moe_scatter_fused_top10_pmask`,
+`moe_route_scatter_top10_wide_f32`) / the two rot planar entries (`qwen4_moe_ep_a8_gate_up_rot_planar_nt{1,2}`) into
+`moe_route_scatter_wide_pm_gfx1201.hxaco` / `qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco`; whole-ELF byte identity; no math evidence.
 """
 import argparse
 import hashlib
@@ -76,6 +82,29 @@ FAMILIES = {
         "prefix": "qwen4_lane_wmma_multi",
         "arches": ("gfx1201",),
         "math": False,
+    },
+    "moe-route-scatter-wide": {
+        "source": "kernels/src/moe_route_scatter_wide.gfx1201.hip",
+        "symbols": ("moe_scatter_fused_top10_pmask", "moe_route_scatter_top10_wide_f32"),
+        "prefix": "moe_route_scatter_wide",
+        "arches": ("gfx1201",),
+        "math": False,
+        # Mirror of rdna-compute `kernels::MOE_ROUTE_SCATTER_WIDE_SRC` (concat! order).
+        "parts": ("kernels/src/moe_router_softmax_top10_f32_fast.hip",
+                  "kernels/src/qwen4_moe_scatter_fused_k8.hip",
+                  "kernels/src/moe_route_scatter_wide.gfx1201.hip"),
+    },
+    "qwen4-moe-ep-a8-rot": {
+        "source": "kernels/src/qwen4_moe_ep_a8_rot.gfx12.hip",
+        "symbols": ("qwen4_moe_ep_a8_gate_up_rot_planar_nt1", "qwen4_moe_ep_a8_gate_up_rot_planar_nt2"),
+        "prefix": "qwen4_moe_ep_a8_rot",
+        "arches": ("gfx1201",),
+        "math": False,
+        # Mirror of rdna-compute `kernels::QWEN4_MOE_EP_A8_ROT_SRC` (concat! order).
+        "define": "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+        "parts": ("kernels/src/block_i8_128_quant.hip",
+                  "kernels/src/qwen4_moe_ep_a8.gfx12.hip",
+                  "kernels/src/qwen4_moe_ep_a8_rot.gfx12.hip"),
     },
 }
 
@@ -215,7 +244,8 @@ def build_arch(args, root, hipcc, env, arch, tmp):
     tmp_co = Path(tmp) / f"anchor_{arch}.co"
     parts = fam.get("parts")
     if parts:
-        combined = b"".join((root / r).read_bytes() for r in parts)
+        # The runtime module source is a concatenation; compile exactly those bytes.
+        combined = fam.get("define", "").encode() + b"".join((root / r).read_bytes() for r in parts)
         build_src = Path(tmp) / f"{prefix}_{arch}.hip"
         build_src.write_bytes(combined)
         run([str(hipcc), *flags, "-o", str(tmp_co), str(build_src)], cwd=root, env=env)
@@ -247,8 +277,9 @@ def build_arch(args, root, hipcc, env, arch, tmp):
         "hxaco": {"file": hxaco.name, "bytes": hxaco.stat().st_size, "sha256": sha256_file(hxaco)},
     }
     if parts:
-        doc["compiler"]["invocation"] = "hipcc <flags> -o <anchor.co> <parts concatenated>"
+        doc["compiler"]["invocation"] = "hipcc <flags> -o <anchor.co> <define + parts concatenated>"
         doc["module_source"] = {
+            "define": fam.get("define", "").rstrip("\n"),
             "combined_bytes": len(combined),
             "combined_sha256": hashlib.sha256(combined).hexdigest(),
             "parts": [{"path": r, "bytes": (root / r).stat().st_size, "sha256": sha256_file(root / r)}

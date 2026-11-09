@@ -153,6 +153,7 @@ v_bfe_u32	alu
 v_bfi_b32	alu
 v_cmp_class_f32_e64	alu
 v_cmp_eq_u16_e64	alu
+v_cmp_eq_u16_e32	alu
 v_cmp_eq_u32_e32	alu
 v_cmp_eq_u32_e64	alu
 v_cmp_ge_f32_e64	alu

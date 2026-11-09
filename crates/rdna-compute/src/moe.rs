@@ -2996,11 +2996,14 @@ impl Gpu {
             ))
         };
         let word = std::mem::size_of::<i32>();
-        if mask.tiles == 0 || i32::try_from(mask.tiles).is_err() || i32::try_from(mask.rank).is_err()
+        if mask.tiles == 0
+            || i32::try_from(mask.tiles).is_err()
+            || i32::try_from(mask.rank).is_err()
         {
             return refuse("need 0 < tiles and tiles, rank within i32");
         }
-        if tile_ids.buf.size() < mask.tiles * word || mask.tile_ids_owned.buf.size() < mask.tiles * word
+        if tile_ids.buf.size() < mask.tiles * word
+            || mask.tile_ids_owned.buf.size() < mask.tiles * word
         {
             return refuse("tile id buffers hold fewer than `tiles` words");
         }
@@ -3036,7 +3039,11 @@ impl Gpu {
         self.bind_thread()?;
         Self::glue_fold_mask_check(&mask, expert_tile_ids, num_experts)?;
         let func = "moe_scatter_fused_top10_pmask";
-        self.ensure_kernel("moe_route_scatter_wide", kernels::MOE_ROUTE_SCATTER_WIDE_SRC, func)?;
+        self.ensure_kernel(
+            "moe_route_scatter_wide",
+            kernels::MOE_ROUTE_SCATTER_WIDE_SRC,
+            func,
+        )?;
         let ip = topk_indices.buf.as_ptr();
         let cp = expert_token_counts.buf.as_ptr();
         let op = expert_offsets.buf.as_ptr();
@@ -3136,7 +3143,11 @@ impl Gpu {
             Self::glue_fold_mask_check(mask, expert_tile_ids, n_experts)?;
         }
         let func = "moe_route_scatter_top10_wide_f32";
-        self.ensure_kernel("moe_route_scatter_wide", kernels::MOE_ROUTE_SCATTER_WIDE_SRC, func)?;
+        self.ensure_kernel(
+            "moe_route_scatter_wide",
+            kernels::MOE_ROUTE_SCATTER_WIDE_SRC,
+            func,
+        )?;
         let lp = logits.buf.as_ptr();
         let ip = topk_idx.buf.as_ptr();
         let wp = topk_w.buf.as_ptr();
