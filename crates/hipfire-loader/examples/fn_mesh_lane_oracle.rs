@@ -129,6 +129,7 @@ use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::ep_mesh_lanes::{EpMeshLanes, MeshLaneAdmission, MeshStepError};
 use hipfire_arch_qwen4::gpu_forward_lanes::{LaneStagePolicy, StageName};
 use hipfire_arch_qwen4::lane::{LabRoutes, LaneSpecConfig};
+use hipfire_arch_qwen4::lane::pages::ElasticLabRank;
 use hipfire_arch_qwen4::mesh_lane_protocol::{
     AcceptRule, GreedyRule, LanePlan, LaneRequest, SamplerOutput, SamplingMode, WindowBudgets,
 };
@@ -285,6 +286,11 @@ struct Args {
     /// `--copy` (`--spec mtp` only): stage the lanes with the copy lane armed
     /// (default-copy budget: widened rings/rows, head-lag storage).
     copy: bool,
+    /// `--elastic MIB` (EP lab): lend a bank of that many MiB on every rank after the lanes are
+    /// staged and settle it before the measured runs.
+    elastic: Option<u64>,
+    /// `--elastic-cycle` (needs `--elastic`): reclaim, re-lend and settle between the runs.
+    elastic_cycle: bool,
 }
 
 /// `--burst I,J,K`: prompt-file indices of one concurrent run, in lane (admission) order.
@@ -556,6 +562,8 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
     let mut tokens_sweep = None;
     let mut reserve_lanes = None;
     let mut copy = false;
+    let mut elastic: Option<u64> = None;
+    let mut elastic_cycle = false;
     let mut spec = SpecMode::Ar;
     let mut k = None;
     let mut routes = None;
@@ -594,6 +602,8 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
             }
             "--spec" => spec = SpecMode::parse(&value("--spec")?)?,
             "--copy" => copy = true,
+            "--elastic" => elastic = Some(value("--elastic")?.parse::<u64>().map_err(e)?),
+            "--elastic-cycle" => elastic_cycle = true,
             "--k" => k = Some(value("--k")?.parse::<usize>().map_err(e)?),
             "--routes" => routes = Some(RoutesArg::parse(&value("--routes")?)?),
             "--soak-seconds" => {
@@ -664,6 +674,18 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
     if copy && spec != SpecMode::Mtp {
         return Err("--copy needs --spec mtp".into());
     }
+    if elastic == Some(0) {
+        return Err("--elastic must be at least 1 MiB".into());
+    }
+    if elastic.is_some_and(|mib| mib > u64::MAX >> 20) {
+        return Err("--elastic does not fit a byte count".into());
+    }
+    if elastic_cycle && elastic.is_none() {
+        return Err("--elastic-cycle needs --elastic".into());
+    }
+    if elastic.is_some() && pp > 1 {
+        return Err("--elastic is an EP lab flag".into());
+    }
     if soak_seconds == Some(0) {
         return Err("--soak-seconds must be at least 1".into());
     }
@@ -708,6 +730,8 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
         soak_seed,
         fault_point,
         copy,
+        elastic,
+        elastic_cycle,
     })
 }
 
@@ -715,7 +739,7 @@ const HELP: &str = "fn_mesh_lane_oracle --model M.mq4 --prompt-file P [--prompt-
 --max-seq N --tokens T --ks 1,2,4,8 --out DIR [--pp 1] [--row-budget R] [--skip-model-hash] [--logits] [--logits-dump DIR] \
 [--burst I,J,...] [--policies SPEC[;SPEC...]] [--tokens-sweep N] [--reserve-lanes N] \
 [--spec ar|mtp] [--k K] [--routes floor|cycle|batched] [--soak-seconds S [--soak-seed N]] \
-[--fault-point before-draft|head-round|target-edge|repair|before-publish]\n\
+[--fault-point before-draft|head-round|target-edge|repair|before-publish] [--elastic MIB [--elastic-cycle]]\n\
 EP comes from topology.ep / the S1 env var as in fn_ep_oracle; --pp N>1 runs the PP lanes arm. \
 --policies sweeps lane stage share policies (production | per-lane | per-lane:<stage>=once,... | g0) \
 over one reference; --tokens-sweep N sets tokens per lane for every policy after the first. \
@@ -726,6 +750,10 @@ only; default off = plain load_model, N=1 is the same plan). \
 --spec mtp (--k 1..=7, default 3; --routes default cycle) selects the native-MTP lane arm; --soak-seconds and \
 --fault-point need it and are exclusive. Its execution is not yet implemented by S3/S5: the invocation is \
 validated and recorded in DIR/manifest.json (expanded command, prompt fixture hashes, binary sha), then refused. \
+--elastic MIB (EP lab, HIPFIRE_EP_ELASTIC_MIB) lends a bank of that many MiB on every rank after the lanes are staged and settles it \
+(every fill and publication run) before the measured runs, printing each rank's units and bytes lent and settled; --elastic-cycle \
+also reclaims and re-lends + settles between the --ks / --burst runs. A prefill tile of 512 or more rows reclaims the bank (the \
+reserve's backstop), so the measured decode runs on short prompts see it published. \
 Needs at least max(ks) prompt files. \
 DIR/manifest.json is written for every run. \
 Exit 0 all equal, 1 mismatch, 2 refusal/error. DIR must not exist.";
@@ -1334,6 +1362,15 @@ trait LaneBackend {
     /// Set `policy` on every lane store of the load (idempotent; refused
     /// without changes when the stores cannot take it).
     fn set_policy(&mut self, policy: LaneStagePolicy) -> R<()>;
+    /// Lab `--elastic`: lend a bank of at most `bytes` on every EP rank and settle it (every fill
+    /// and publication run). Only the single-bundle / EP backend can.
+    fn elastic_lend(&mut self, _bytes: u64) -> R<Vec<ElasticLabRank>> {
+        Err("--elastic needs the single-bundle / EP lane backend".to_string())
+    }
+    /// Lab `--elastic-cycle`: reclaim every rank's bank; per rank whether one was freed.
+    fn elastic_reclaim(&mut self) -> R<Vec<bool>> {
+        Err("--elastic-cycle needs the single-bundle / EP lane backend".to_string())
+    }
 }
 
 /// Single/EP lanes: the bundle's lane API on the primary GPU (under EP the
@@ -1377,6 +1414,16 @@ impl LaneBackend for LocalLanes<'_> {
 
     fn set_policy(&mut self, policy: LaneStagePolicy) -> R<()> {
         self.bundle.set_lane_stage_policy(None, policy).map_err(e)
+    }
+
+    fn elastic_lend(&mut self, bytes: u64) -> R<Vec<ElasticLabRank>> {
+        self.gpu.bind_thread().map_err(e)?;
+        self.bundle.elastic_lab_lend(self.gpu, bytes)
+    }
+
+    fn elastic_reclaim(&mut self) -> R<Vec<bool>> {
+        self.gpu.bind_thread().map_err(e)?;
+        self.bundle.elastic_lab_reclaim(self.gpu)
     }
 
     fn lane_capacity(&self) -> R<usize> {
@@ -2155,7 +2202,16 @@ fn run_policy(
     match backend.set_policy(policy) {
         Err(x) => status = PolicyStatus::Error(format!("set lane stage policy: {x}")),
         Ok(()) => {
-            for set in run_sets(args) {
+            for (set_index, set) in run_sets(args).into_iter().enumerate() {
+                if let (Some(mib), true, true) = (args.elastic, args.elastic_cycle, set_index > 0) {
+                    let when = format!("before run {set_index}");
+                    let cycled = elastic_reclaim_report(&when, backend.elastic_reclaim())
+                        .and_then(|()| elastic_lend_report(&when, backend.elastic_lend(mib << 20)));
+                    if let Err(x) = cycled {
+                        status = PolicyStatus::Error(x);
+                        break;
+                    }
+                }
                 let label = set.label();
                 let k = set.members.len();
                 eprintln!(
@@ -2381,6 +2437,10 @@ fn drive_all(
     ids_lines: &mut Vec<Value>,
 ) -> R<Vec<PolicyOutcome>> {
     backend.stage(max_lanes_requested, row_budget)?;
+    // Lab `--elastic`: the bank is fully published before the first measured run.
+    if let Some(mib) = args.elastic {
+        elastic_lend_report("initial", backend.elastic_lend(mib << 20))?;
+    }
     drive_policies(backend, args, prompts, references, row_budget, ids_lines)
 }
 
@@ -2882,6 +2942,36 @@ fn drive_mtp_inner(
     ))
 }
 
+/// Lab `--elastic`: print every rank's lend and settle (units and bytes), failing when a rank
+/// published no unit: a bank that is not fully published would make the run an unlent run.
+fn elastic_lend_report(when: &str, lent: R<Vec<ElasticLabRank>>) -> R<()> {
+    let ranks = lent.map_err(|x| format!("elastic lend ({when}): {x}"))?;
+    for rank in &ranks {
+        eprintln!(
+            "[{TOOL}] elastic {when}: rank {} lent {} units / {} MiB, settled {} units, bank {} MiB",
+            rank.rank,
+            rank.lent_units,
+            rank.lent_bytes >> 20,
+            rank.settled_units,
+            rank.settled_bytes >> 20
+        );
+    }
+    match ranks.iter().find(|rank| rank.settled_units == 0) {
+        Some(rank) => Err(format!(
+            "elastic {when}: rank {} published no unit (nothing lent, or the tail is suspended or frozen)",
+            rank.rank
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Lab `--elastic-cycle`: print which ranks freed a bank.
+fn elastic_reclaim_report(when: &str, freed: R<Vec<bool>>) -> R<()> {
+    let freed = freed.map_err(|x| format!("elastic reclaim ({when}): {x}"))?;
+    eprintln!("[{TOOL}] elastic {when}: reclaimed per rank {freed:?}");
+    Ok(())
+}
+
 /// The native-MTP EP arm: stage MTP lanes, then every K of `args.ks` as
 /// concurrent lanes, ids compared with the serialized singleton AR reference.
 /// One outcome (policy label `mtp:k=..,routes=..`).
@@ -2943,12 +3033,23 @@ fn drive_mtp_ep(
         after >> 20
     );
     let mut mesh = EpMeshLanes::new(gpu, bundle, 1, routes == RoutesArg::Floor)?;
+    // Lab `--elastic`: the bank is fully published before the first measured run.
+    if let Some(mib) = args.elastic {
+        elastic_lend_report("initial", bundle.elastic_lab_lend(gpu, mib << 20))?;
+    }
     let mut next_tag = 0u64;
     let mut runs = Vec::new();
     let mut per_k = Vec::new();
     let mut failures = Vec::new();
     let mut status = PolicyStatus::Pass;
-    for set in run_sets(args) {
+    for (set_index, set) in run_sets(args).into_iter().enumerate() {
+        if let (Some(mib), true, true) = (args.elastic, args.elastic_cycle, set_index > 0) {
+            elastic_reclaim_report(&format!("before run {set_index}"), bundle.elastic_lab_reclaim(gpu))?;
+            elastic_lend_report(
+                &format!("before run {set_index}"),
+                bundle.elastic_lab_lend(gpu, mib << 20),
+            )?;
+        }
         let label_set = set.label();
         let k = set.members.len();
         eprintln!(
@@ -3226,6 +3327,13 @@ fn expanded_argv(args: &Args, cwd: &Path) -> Vec<String> {
     if let Some(dir) = &args.verify_logits_dump {
         argv.push("--verify-logits-dump".to_string());
         argv.push(absolute_path(&dir.display().to_string(), cwd));
+    }
+    if let Some(mib) = args.elastic {
+        argv.push("--elastic".to_string());
+        argv.push(mib.to_string());
+    }
+    if args.elastic_cycle {
+        argv.push("--elastic-cycle".to_string());
     }
     argv
 }
@@ -5215,6 +5323,8 @@ mod spec_schema_tests {
             " --policies g0",
             " --policies per-lane;per-lane:moe=once;production",
             " --spec mtp",
+            " --elastic 1280",
+            " --spec mtp --k 5 --elastic 512 --elastic-cycle",
             " --spec mtp --k 7 --routes batched",
             " --spec mtp --k 7 --routes cycle --soak-seconds 1800 --soak-seed 42",
             " --spec mtp --k 1 --routes floor --fault-point head-round",
@@ -5232,6 +5342,32 @@ mod spec_schema_tests {
             let reparsed = parse_args_from(expanded.iter().cloned()).unwrap();
             assert_eq!(reparsed, args, "{extra}");
         }
+    }
+
+    /// `--elastic MIB` is a positive MiB count on a non-PP load and `--elastic-cycle` needs it.
+    #[test]
+    fn the_elastic_lab_flags_parse_and_validate() {
+        let line = format!("{BASE} --ks 1 --elastic 1280 --elastic-cycle{}", files(1));
+        let args = parse_args_from(argv(&line)).unwrap();
+        assert_eq!((args.elastic, args.elastic_cycle), (Some(1280), true));
+        let line = format!("{BASE} --ks 1{}", files(1));
+        let args = parse_args_from(argv(&line)).unwrap();
+        assert_eq!((args.elastic, args.elastic_cycle), (None, false));
+        for (flags, want) in [
+            ("--elastic 0", "--elastic must be at least 1 MiB"),
+            ("--elastic-cycle", "--elastic-cycle needs --elastic"),
+            ("--elastic 64 --pp 2", "--elastic is an EP lab flag"),
+        ] {
+            let line = format!("{BASE} --ks 1 {flags}{}", files(1));
+            assert_eq!(parse_args_from(argv(&line)).unwrap_err(), want, "{flags}");
+        }
+        let line = format!("{BASE} --ks 1 --elastic lots{}", files(1));
+        assert!(parse_args_from(argv(&line)).is_err());
+        let line = format!("{BASE} --ks 1{} --elastic", files(1));
+        assert_eq!(
+            parse_args_from(argv(&line)).unwrap_err(),
+            "--elastic needs a value"
+        );
     }
 
     #[test]

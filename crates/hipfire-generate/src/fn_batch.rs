@@ -83,7 +83,8 @@ use crate::common::{emit_committed_event, fit_max_tokens_if};
 use hipfire_arch_qwen4::bundle::{Qwen4Bundle, Qwen4PpLaneExecutor};
 use hipfire_arch_qwen4::ep_mesh_serve::{MeshDecodeRequest, MeshStepFacts};
 use hipfire_arch_qwen4::lane::pages::{
-    page_budget_enabled, reservation_rows, PageDecision, PageVerdict, LANE_PAGE_BUDGET_REFUSED,
+    long_prefill_route_rows, page_budget_enabled, reservation_rows, PageDecision, PageVerdict,
+    LANE_PAGE_BUDGET_REFUSED,
 };
 use hipfire_arch_qwen4::lane::{LaneSampling, LaneSpecStats, LaneStatus};
 use hipfire_arch_qwen4::lane_exec::{
@@ -261,6 +262,18 @@ impl<'a> Owner<'a> {
             return Ok(PageDecision::UNBUDGETED);
         }
         self.bundle.lane_page_decision(&mut *self.gpu, rows)
+    }
+
+    /// The elastic reserve is on for this owner (an EP load with the D2 tail and a positive cap;
+    /// never on a pipeline-parallel mesh).
+    fn elastic_active(&self) -> bool {
+        self.gpus.is_none() && self.bundle.elastic_active()
+    }
+
+    /// Reclaim the elastic bank on every rank; whether any rank freed one. `false` without the
+    /// reserve.
+    fn elastic_reclaim(&mut self, why: &str) -> bool {
+        self.elastic_active() && self.bundle.elastic_reclaim_all(&mut *self.gpu, why)
     }
 
     /// Reserve `rows` context rows for the just-admitted lane of `epoch` (host-only; a pipeline
@@ -900,6 +913,23 @@ impl PageGate {
     }
 }
 
+/// The page budget's decision for the queue front reserving `rows` rows. `None`: the budget could
+/// not be measured, which the gate answers by admitting `id` without it (logged here).
+fn gate_page_decision(
+    m: &mut LoadedModel,
+    gpu: &mut Gpu,
+    rows: usize,
+    id: &str,
+) -> Result<Option<PageDecision>, String> {
+    match Owner::of(m, gpu)?.page_decision(rows) {
+        Ok(decision) => Ok(Some(decision)),
+        Err(error) => {
+            eprintln!("  qwen4 lane page budget: {error}; admitting {id} without the budget");
+            Ok(None)
+        }
+    }
+}
+
 /// The lane page budget at the queue front (see `hipfire_arch_qwen4::lane::pages`): before the
 /// front request takes a lane, reserve-check its worst-case context growth against every rank's
 /// free device pages. `Proceed` with nothing when the kill switch is set
@@ -975,16 +1005,28 @@ fn page_budget_gate(
         Owner::of(m, gpu)?.bundle.lane_page_draft_rows(),
         m.max_seq,
     );
-    let decision = match Owner::of(m, gpu)?.page_decision(rows) {
-        Ok(decision) => decision,
-        Err(error) => {
-            eprintln!(
-                "  qwen4 lane page budget: {error}; admitting {} without the budget",
-                key.id
-            );
-            return Ok(PageGate::proceed(Some(rendered), None, None));
+    // The elastic reserve (PLAN-cp15 L2): a first prefill tile of >= 512 route rows builds the F16
+    // weight shadows out of the memory the bank holds, so every rank gives the bank back before
+    // the budget is read (the page numbers then see the freed bytes).
+    {
+        let mut owner = Owner::of(m, gpu)?;
+        if owner.elastic_active()
+            && long_prefill_route_rows(owner.bundle.lane_prefill_tile_len(prompt, 0))
+        {
+            owner.elastic_reclaim("admit");
         }
+    }
+    let Some(mut decision) = gate_page_decision(m, gpu, rows, &key.id)? else {
+        return Ok(PageGate::proceed(Some(rendered), None, None));
     };
+    // A request the budget cannot admit while a bank is lent decides again once it is back.
+    if !matches!(decision.verdict, PageVerdict::Fit) && Owner::of(m, gpu)?.elastic_reclaim("pages")
+    {
+        let Some(again) = gate_page_decision(m, gpu, rows, &key.id)? else {
+            return Ok(PageGate::proceed(Some(rendered), None, None));
+        };
+        decision = again;
+    }
     let slot = decision.slot;
     match gate_decision(decision.verdict, sched.active_count()) {
         GateDecision::Admit => {
@@ -1026,6 +1068,64 @@ fn page_budget_gate(
             ))
         }
     }
+}
+
+/// The serve loop's idle count for the elastic reserve (`Qwen4Bundle::elastic_tick`): step
+/// boundaries since the last prefill tile of >= 512 route rows or elastic reclaim.
+#[derive(Default)]
+struct ElasticIdle {
+    steps: usize,
+    /// The root bundle's reclaim count when `steps` last restarted.
+    reclaims: u64,
+}
+
+/// Step-boundary housekeeping of the elastic reserve; a no-op without it. `step` is
+/// `Some(long_prefill)` after a step (`long_prefill`: it held a tile of >= 512 route rows) and
+/// `None` on an idle iteration (the loop's 2 ms idle sleep), which counts like a step so an idle
+/// server gives back the caches and re-lends without waiting for traffic. The idle count restarts
+/// after a long prefill or any reclaim (a gate, backstop or borrow reclaim all move the bundle's reclaim count); the
+/// tick runs only while no request is queued and no lane prefills. Never fails the loop: a failed
+/// tick is logged by the bundle and the next one asks again.
+fn elastic_boundary(
+    sched: &ContinuousBatchScheduler,
+    m: &mut LoadedModel,
+    gpu: &mut Gpu,
+    controls: &[Option<LaneCtl>],
+    idle: &mut ElasticIdle,
+    step: Option<bool>,
+) {
+    match Owner::of(m, gpu) {
+        Ok(owner) if owner.elastic_active() => {}
+        _ => return,
+    }
+    let prefilling = m
+        .qwen4()
+        .and_then(|bundle| bundle.lanes())
+        .is_some_and(|store| {
+            controls
+                .iter()
+                .flatten()
+                .filter(|ctl| ctl.epoch.is_admitted())
+                .any(|ctl| {
+                    store
+                        .lane(&ctl.epoch)
+                        .is_some_and(|lane| lane.host.status == LaneStatus::Prefilling)
+                })
+        });
+    let Ok(mut owner) = Owner::of(m, gpu) else {
+        return;
+    };
+    let reclaims = owner.bundle.elastic_reclaim_epoch();
+    if reclaims != idle.reclaims || step == Some(true) {
+        idle.steps = 0;
+    } else {
+        idle.steps = idle.steps.saturating_add(1);
+    }
+    idle.reclaims = reclaims;
+    if prefilling || !sched.inbox.is_empty() {
+        return;
+    }
+    owner.bundle.elastic_tick(&mut *owner.gpu, idle.steps);
 }
 
 /// A failed `draft_step`: its error and every lane it named.
@@ -1769,6 +1869,9 @@ pub fn drive_qwen4_lane_batch(
     let mut cursor = 0;
     let mut trace = StepTrace::new();
     let mut mix = MeshMix::default();
+    // Step boundaries since the last >= 512-row prefill or elastic reclaim (the elastic reserve's
+    // idle count).
+    let mut elastic_idle = ElasticIdle::default();
     // The request the page budget is holding at the queue front, if any.
     let mut page_wait: Option<PageWait> = None;
     // Requests a failed step put back in line (see `lane_step_failed`).
@@ -2222,6 +2325,7 @@ pub fn drive_qwen4_lane_batch(
                 }
             };
             if plan.requests.is_empty() && mesh_requests.is_empty() {
+                elastic_boundary(sched, m, gpu, &controls, &mut elastic_idle, None);
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
             }
@@ -2377,6 +2481,11 @@ pub fn drive_qwen4_lane_batch(
                     early_emit,
                 );
             }
+            // The elastic reserve's step boundary (idle count, cache give-back, re-lend).
+            let long_prefill = plan.requests.iter().any(|r| {
+                r.kind == RequestStepKind::Prefill && long_prefill_route_rows(r.rows.len)
+            });
+            elastic_boundary(sched, m, gpu, &controls, &mut elastic_idle, Some(long_prefill));
         }
     })();
     mix.report();
@@ -2603,6 +2712,41 @@ mod tests {
             switch < first_read,
             "the kill switch is the first thing the gate checks"
         );
+    }
+
+    /// The elastic reserve gives its bank back before the page numbers are read: the `admit`
+    /// reclaim precedes the first page decision, and a non-Fit verdict reclaims and decides again;
+    /// the loop ticks the reserve only after the step's commit.
+    #[test]
+    fn the_elastic_reclaim_precedes_the_page_decision() {
+        let src = include_str!("fn_batch.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("test module")];
+        let gate_fn = prod.find("fn page_budget_gate(").expect("gate fn");
+        let gate_src = &prod[gate_fn..];
+        let admit = gate_src
+            .find("elastic_reclaim(\"admit\")")
+            .expect("admit reclaim");
+        let first = gate_src
+            .find("gate_page_decision(")
+            .expect("first page decision");
+        let pages = gate_src
+            .find("elastic_reclaim(\"pages\")")
+            .expect("retry reclaim");
+        assert!(
+            admit < first && first < pages,
+            "reclaim, decide, reclaim again on a non-Fit verdict"
+        );
+        assert!(
+            gate_src[pages..].contains("gate_page_decision("),
+            "a retry decision follows the retry reclaim"
+        );
+        let drive = prod.find("pub fn drive_qwen4_lane_batch").expect("drive");
+        let body = &prod[drive..];
+        let commit = body.find("executor.commit_step(&plan, out)").expect("commit");
+        let tick = body
+            .find("elastic_boundary(sched, m, gpu, &controls, &mut elastic_idle, Some(")
+            .expect("tick");
+        assert!(commit < tick, "the elastic tick follows the step's commit");
     }
 
     use super::{attach_mtp_lane_stats, forwarded_tokens, LaneCtl, LaneSpecStats};

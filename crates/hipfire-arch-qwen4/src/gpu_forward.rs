@@ -16184,6 +16184,10 @@ impl Qwen4GpuForward {
         if let Some(gather) = self.ep.as_ref().and_then(|ep| ep.gather.as_deref()) {
             gather.decode_step_end(gpu);
         }
+        // The elastic reserve's backstop for every singleton / promoted / non-lane prefill tile:
+        // a forward whose GEMM route rows reach the F16 shadow floor reclaims the bank before it
+        // builds the long-prefill caches (a no-op without the reserve or while nothing is lent).
+        bundle.elastic_prefill_backstop(gpu, tokens.len());
         if self.ep_reserve.is_some() {
             return self.ep_reserve_forward_chunk(
                 bundle,

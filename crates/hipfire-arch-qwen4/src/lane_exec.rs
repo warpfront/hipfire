@@ -818,14 +818,14 @@ impl Qwen4LaneExecutor<'_> {
     }
 
     fn provision_step_local(&mut self, gpu: &mut Gpu, plan: &BatchStepPlan) -> Result<(), String> {
-        let ends = {
+        let (ends, reclaim) = {
             let bundle: &Qwen4Bundle = &*self.bundle;
             let store = bundle
                 .lanes
                 .as_ref()
                 .ok_or_else(|| "Qwen4 lanes are not staged".to_string())?;
             store.phase.check_idle()?;
-            validate_plan(
+            let ends = validate_plan(
                 plan,
                 PlanLimits {
                     max_lanes: store.max_lanes(),
@@ -833,8 +833,17 @@ impl Qwen4LaneExecutor<'_> {
                 },
                 |epoch| store.lane(epoch).map(view_of),
                 |host| bundle.lane_prefill_tile_len(&host.prompt, host.prefilled),
-            )?
+            )?;
+            let reclaim = bundle.elastic_active()
+                && elastic_step_needs_reclaim(bundle, gpu, store, plan, &ends);
+            (ends, reclaim)
         };
+        // The elastic reserve's rank-local backstop: a step that builds the long-prefill caches or
+        // maps lane pages past the charge needs the bank's memory back first. Ranks run the same
+        // plan, so they reclaim in lockstep; a failure is logged and the bank stays in place.
+        if reclaim {
+            self.bundle.elastic_reclaim_logged(gpu, "prefill");
+        }
         let mut store = self
             .bundle
             .lanes
@@ -1040,6 +1049,28 @@ impl Qwen4LaneExecutor<'_> {
 pub(crate) fn pick_at(host: &[u8], row: usize) -> u32 {
     let b = &host[row * 4..row * 4 + 4];
     u32::from_ne_bytes([b[0], b[1], b[2], b[3]])
+}
+
+/// Whether the step takes memory the elastic bank holds: a prefill tile whose GEMM route rows
+/// reach the F16 shadow floor (it builds the long-prefill caches; `Gpu::route_rows` honours the EP
+/// wave cap, so a sub-512-row lane wave never qualifies), or a lane mapping new context pages past
+/// the load-time charge. Plain host reads.
+fn elastic_step_needs_reclaim(
+    bundle: &Qwen4Bundle,
+    gpu: &Gpu,
+    store: &Qwen4LaneStore,
+    plan: &BatchStepPlan,
+    ends: &[usize],
+) -> bool {
+    let charge = bundle.lane_charge_rows(gpu);
+    plan.requests.iter().zip(ends).any(|(r, &end)| {
+        (r.kind == RequestStepKind::Prefill
+            && crate::lane::pages::long_prefill_route_rows(gpu.route_rows(r.rows.len)))
+            || (end > charge
+                && store
+                    .lane(&r.epoch)
+                    .is_some_and(|lane| end > lane.state.mapped_context_tokens()))
+    })
 }
 
 /// Prefix of every `provision_step` error that is a mapping (VMM commit) refusal: the lane

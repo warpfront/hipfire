@@ -179,9 +179,23 @@ pub struct EpUnitPlan {
     /// The ranking the plan walked (global ids `layer * experts_per_layer + expert`, hottest
     /// first); `None` for a whole-layers plan. The D2 tail seeds and orders itself by it.
     ranking_order: Option<Vec<u32>>,
+    /// The hot-units sidecar's host-read forward counts (global ids `layer * experts_per_layer +
+    /// expert`) when the hot-unit loan bound them ([`Self::set_hot_counts`]); `None` otherwise.
+    /// Only the elastic reserve reads them (its candidate order).
+    hot_counts: Option<std::sync::Arc<[u64]>>,
 }
 
 impl EpUnitPlan {
+    /// The hot-units sidecar counts the loan bound, `None` when no sidecar was applied.
+    pub fn hot_counts(&self) -> Option<&std::sync::Arc<[u64]>> {
+        self.hot_counts.as_ref()
+    }
+
+    /// Record the counts of the sidecar the hot-unit loan bound (global unit ids).
+    pub fn set_hot_counts(&mut self, counts: std::sync::Arc<[u64]>) {
+        self.hot_counts = Some(counts);
+    }
+
     /// The walked ranking, hottest first (`None` without one).
     pub fn ranking_order(&self) -> Option<&[u32]> {
         self.ranking_order.as_deref()
@@ -453,6 +467,7 @@ pub fn place_routed_experts_units(
                 rank_budget_bytes: None,
                 stage_borrow: None,
                 ranking_order: None,
+                hot_counts: None,
             })
         }
         EpUnitSource::Ranking {
@@ -637,6 +652,7 @@ fn place_ranking(
         rank_budget_bytes: Some(rank_budget_bytes.to_vec()),
         stage_borrow: None,
         ranking_order: Some(ranking.rank.to_vec()),
+        hot_counts: None,
     })
 }
 

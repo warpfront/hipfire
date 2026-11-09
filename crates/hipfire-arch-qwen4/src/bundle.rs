@@ -261,6 +261,9 @@ pub struct Qwen4Bundle {
     /// qualification: the routing slice still gates on the per-call lab-wide scope
     /// and the caller's live thread-local capacity.
     pub(crate) cpu_d1_storage_rows: usize,
+    /// The elastic reserve of this EP rank (`install_elastic`): its D2 tail, the per-rank cap and
+    /// the log switch. `None` until attach and on a load without the tail.
+    pub(crate) elastic: Option<crate::lane::pages::ElasticRank>,
 }
 
 /// `HIPFIRE_QWEN4_PENALTY_PREPASS=0` keeps a penalized request's repeat /
@@ -976,6 +979,7 @@ impl Qwen4Bundle {
             ep: None,
             pp: None,
             pp_band: None,
+            elastic: None,
             ep_seal: None,
             trunk_overlay: None,
             hc8_sidecar: None,

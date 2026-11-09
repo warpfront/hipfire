@@ -2337,6 +2337,9 @@ impl Qwen4Bundle {
                     )
                 });
             bundle.execution = Some(forward);
+            // The elastic reserve (PLAN-cp15 L2) keeps a handle on the tail the hook just
+            // installed (`None` without it) and resolves `HIPFIRE_EP_ELASTIC_MIB` once per load.
+            let result = result.and_then(|()| bundle.install_elastic(hook.tail.get().cloned()));
             // `attach_ep` just set this rank's down-A8 trunk verdict on the full tables and, with a
             // head MoE layer, left the head verdict pending; the head was attached before the mesh
             // (`attach_mtp` settled nothing then), so take it now, before any decode.
@@ -3728,6 +3731,177 @@ impl Qwen4Bundle {
             &|bundle, peer_gpu, _| Ok(bundle.lane_page_numbers_local(&*peer_gpu, rows)),
         )?;
         outcomes.into_iter().collect()
+    }
+
+    /// Reclaim the elastic bank (PLAN-cp15 L2) on every rank: each calls
+    /// `UnitTailRank::elastic_reclaim` on its own thread (not compared: banks and timings
+    /// legitimately differ per rank). Returns whether any rank freed a bank. A rank's error is
+    /// logged and leaves that rank's bank in place (the caller then just sees less free memory).
+    /// A no-op returning `false` unless the reserve is on ([`Self::elastic_active`]); cheap when
+    /// nothing is lent.
+    pub fn elastic_reclaim_all(&mut self, gpu: &mut Gpu, why: &str) -> bool {
+        if !self.elastic_active() {
+            return false;
+        }
+        let outcomes = self.ep_run_ranks(
+            false,
+            |bundle| Ok(bundle.elastic_reclaim_local(&mut *gpu, why)),
+            &|bundle, peer_gpu, _| Ok(bundle.elastic_reclaim_local(peer_gpu, why)),
+        );
+        match outcomes {
+            Ok(ranks) => {
+                let mut freed = false;
+                for outcome in ranks {
+                    match outcome {
+                        Ok(rank_freed) => freed |= rank_freed,
+                        Err(error) => eprintln!("  qwen4 EP elastic: {error}"),
+                    }
+                }
+                freed
+            }
+            Err(error) => {
+                eprintln!("  qwen4 EP elastic: reclaim ({why}): {error}");
+                false
+            }
+        }
+    }
+
+    /// The elastic reserve's step-boundary tick: `idle_steps` counts the step boundaries since the
+    /// last >= 512-row prefill or elastic reclaim, and the caller ticks only while no request is
+    /// queued and no lane prefills. Below [`crate::lane::pages::ELASTIC_IDLE_STEPS`] nothing
+    /// happens (no device query). Then the root decides once over every rank's numbers
+    /// ([`crate::lane::pages::elastic_action`]) and all ranks act together: release the
+    /// long-prefill caches when any rank holds them, else lend the minimum lendable bank. While a
+    /// bank is lent and the caches are gone the tick is two host reads; an unchanged "nothing to
+    /// do" answer is asked again only after another idle window.
+    pub fn elastic_tick(&mut self, gpu: &mut Gpu, idle_steps: usize) {
+        let Some(cap) = self
+            .elastic
+            .as_ref()
+            .map(|elastic| elastic.cap)
+            .filter(|&cap| cap > 0)
+        else {
+            return;
+        };
+        let window = crate::lane::pages::ELASTIC_IDLE_STEPS;
+        if idle_steps < window {
+            if let Some(elastic) = self.elastic.as_mut() {
+                elastic.probed_at = None;
+            }
+            return;
+        }
+        let lent = self
+            .ep_unit_tail()
+            .is_some_and(|tail| tail.elastic_bytes() > 0);
+        let resident = gpu.long_prefill_caches_resident();
+        if lent && !resident {
+            return;
+        }
+        let probed_at = self.elastic.as_ref().and_then(|elastic| elastic.probed_at);
+        if probed_at.is_some_and(|at| idle_steps >= at && idle_steps - at < window) {
+            return;
+        }
+        if let Some(elastic) = self.elastic.as_mut() {
+            elastic.probed_at = Some(idle_steps);
+        }
+        let numbers = self
+            .ep_run_ranks(
+                false,
+                |bundle| Ok(bundle.elastic_numbers_local(&*gpu)),
+                &|bundle, peer_gpu, _| Ok(bundle.elastic_numbers_local(&*peer_gpu)),
+            )
+            .and_then(|ranks| ranks.into_iter().collect::<Result<Vec<_>, String>>());
+        let ranks = match numbers {
+            Ok(ranks) => ranks,
+            Err(error) => {
+                eprintln!("  qwen4 EP elastic: tick: {error}");
+                return;
+            }
+        };
+        match crate::lane::pages::elastic_action(cap, idle_steps, &ranks) {
+            crate::lane::pages::ElasticAction::Nothing => {}
+            crate::lane::pages::ElasticAction::ReleaseCaches => self.elastic_release_all(gpu),
+            crate::lane::pages::ElasticAction::Lend(bytes) => self.elastic_lend_all(gpu, bytes),
+        }
+    }
+
+    /// Lab (`fn_mesh_lane_oracle --elastic`): every rank lends a bank of at most `bytes` and
+    /// settles it (all fills and publications run), in rank order. Ignores the cap and the idle
+    /// rule, so it needs only the D2 tail; any rank's error fails the call (banks already lent stay
+    /// published and are freed by [`Self::elastic_lab_reclaim`] or the teardown).
+    pub fn elastic_lab_lend(
+        &mut self,
+        gpu: &mut Gpu,
+        bytes: u64,
+    ) -> Result<Vec<crate::lane::pages::ElasticLabRank>, String> {
+        self.ep_run_ranks(
+            false,
+            |bundle| Ok(bundle.elastic_lab_lend_local(&mut *gpu, bytes)),
+            &|bundle, peer_gpu, _| Ok(bundle.elastic_lab_lend_local(peer_gpu, bytes)),
+        )?
+        .into_iter()
+        .collect()
+    }
+
+    /// Lab: every rank reclaims its bank (the cap is ignored); per rank, whether one was freed.
+    pub fn elastic_lab_reclaim(&mut self, gpu: &mut Gpu) -> Result<Vec<bool>, String> {
+        self.ep_run_ranks(
+            false,
+            |bundle| Ok(bundle.elastic_lab_reclaim_local(&mut *gpu)),
+            &|bundle, peer_gpu, _| Ok(bundle.elastic_lab_reclaim_local(peer_gpu)),
+        )?
+        .into_iter()
+        .collect()
+    }
+
+    /// Every rank frees its long-prefill caches. After a clean release the probe window restarts
+    /// so the next tick can lend into the freed memory.
+    fn elastic_release_all(&mut self, gpu: &mut Gpu) {
+        let outcomes = self.ep_run_ranks(
+            false,
+            |bundle| Ok(bundle.elastic_release_caches_local(&mut *gpu)),
+            &|bundle, peer_gpu, _| Ok(bundle.elastic_release_caches_local(peer_gpu)),
+        );
+        let mut clean = true;
+        match outcomes {
+            Ok(ranks) => {
+                for outcome in ranks {
+                    if let Err(error) = outcome {
+                        eprintln!("  qwen4 EP elastic: {error}");
+                        clean = false;
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("  qwen4 EP elastic: release caches: {error}");
+                clean = false;
+            }
+        }
+        if clean {
+            if let Some(elastic) = self.elastic.as_mut() {
+                elastic.probed_at = None;
+            }
+        }
+    }
+
+    /// Every rank lends a bank of at most `bytes` (each rounds to whole units). A rank's error is
+    /// logged; the other ranks' banks stay lent (a bank is rank-local and reclaimed rank-locally).
+    fn elastic_lend_all(&mut self, gpu: &mut Gpu, bytes: u64) {
+        let outcomes = self.ep_run_ranks(
+            false,
+            |bundle| Ok(bundle.elastic_lend_local(&mut *gpu, bytes)),
+            &|bundle, peer_gpu, _| Ok(bundle.elastic_lend_local(peer_gpu, bytes)),
+        );
+        match outcomes {
+            Ok(ranks) => {
+                for outcome in ranks {
+                    if let Err(error) = outcome {
+                        eprintln!("  qwen4 EP elastic: {error}");
+                    }
+                }
+            }
+            Err(error) => eprintln!("  qwen4 EP elastic: lend: {error}"),
+        }
     }
 
     /// `reserve_lane_pages` on every rank's store (host only): every rank

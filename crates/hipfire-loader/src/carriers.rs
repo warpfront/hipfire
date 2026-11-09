@@ -4345,6 +4345,7 @@ fn qwen4_ep_apply_hot_loan(
             hipfire_config::memory::EP_HOT_UNITS_ENV
         );
     }
+    loaned.set_hot_counts(std::sync::Arc::from(sidecar.counts()));
     staged.plan = loaned;
     Ok(())
 }

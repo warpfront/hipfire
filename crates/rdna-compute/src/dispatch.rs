@@ -9869,6 +9869,88 @@ impl Gpu {
         self.drain_dflash_gdn_replay_scratch();
     }
 
+    /// Whether any lazily built weight shadow is resident: an F16 shadow cache entry
+    /// (owning or an S1 arena view), an allocated S1 arena root (or one quarantined by a
+    /// failed release), or a shared-expert INT8 shadow. A decode-share borrow's shadows
+    /// live in the caller's region and never count. Pure host read.
+    pub fn long_prefill_caches_resident(&self) -> bool {
+        // bind_thread: skip — pure host metadata read.
+        !self.fp16_shadow_cache.is_empty()
+            || !self.shared_i8_shadows.is_empty()
+            || self.f16_shadow_arena.live_roots() > 0
+            || self.f16_shadow_arena.quarantined_roots() > 0
+    }
+
+    /// Give back the weight shadows a >= 512-row prefill builds lazily: the F16 shadow
+    /// cache (owning entries to the pool, S1 arena views dropped and their roots
+    /// released) and the shared-expert INT8 shadows, then drain the pool. Every reader
+    /// resolves its shadow through its `ensure_*` path on each call (no shadow pointer is
+    /// kept across calls, and the replay recorder and graph capture never reach a shadow
+    /// route), so the next >= 512-row GEMM re-creates the shadow with the same conversion
+    /// kernel, into the same planned span (S1 arena) or a fresh pooled buffer:
+    /// byte-identical. The S1 arena plan and its source bindings are kept (only the roots
+    /// are released). Weights, the QSA gather workspace, the MQ screen cache, scratch
+    /// slots and kernel modules are untouched.
+    ///
+    /// Refuses (`Err`, nothing freed) while a decode-share `shadow_borrow` is installed
+    /// (its shadows live in a region this `Gpu` does not own), while the replay recorder
+    /// or graph capture is active, or when a borrowed cache entry has no arena behind it.
+    /// The device is synchronized first so no queued kernel can still read a freed shadow.
+    /// Returns the device bytes released: S1 arena roots plus every pooled byte drained
+    /// (the freed owning shadows included).
+    pub fn release_long_prefill_caches(&mut self) -> HipResult<u64> {
+        let err = |msg: &str| HipError::new(0, &format!("release_long_prefill_caches: {msg}"));
+        if self.shadow_borrow.is_some() {
+            return Err(err(
+                "a decode-share shadow borrow is installed (its shadows are not owned here)",
+            ));
+        }
+        if self.replay.is_recording() || self.graphs.capture_mode {
+            return Err(err("replay recording or graph capture is active"));
+        }
+        if !self.f16_shadow_arena.is_active()
+            && self.fp16_shadow_cache.values().any(|t| t.buf.is_borrowed())
+        {
+            return Err(err("a borrowed F16 shadow view has no arena behind it"));
+        }
+        self.bind_thread()?;
+        self.hip.device_synchronize()?;
+
+        let arena_bytes: usize = self
+            .f16_shadow_arena
+            .root_capacities(DeviceBuffer::size)
+            .into_iter()
+            .flatten()
+            .sum();
+        let binding = self
+            .f16_shadow_arena
+            .plan()
+            .cloned()
+            .map(|plan| (plan, self.f16_shadow_arena.source_ptrs().to_vec()));
+
+        // Views are non-owning (dropped); owning shadows go to the pool.
+        let cached: Vec<GpuTensor> = self.fp16_shadow_cache.drain().map(|(_, t)| t).collect();
+        for t in cached.into_iter().filter(|t| !t.buf.is_borrowed()) {
+            if let Err(e) = self.free_tensor(t) {
+                eprintln!("[rdna-compute] release_long_prefill_caches: {e}");
+            }
+        }
+        // The cache holds no view now; release the roots, then restore the plan binding
+        // so the next shadow build exact-allocates its root again.
+        self.clear_f16_shadow_arena()
+            .map_err(|e| err(&e.to_string()))?;
+        if let Some((plan, source_ptrs)) = binding {
+            self.f16_shadow_arena
+                .bind(plan, &source_ptrs)
+                .map_err(|e| err(&format!("re-binding the F16 shadow arena: {e}")))?;
+        }
+        self.drain_shared_i8_shadows();
+
+        let pooled = self.pool.pooled_bytes();
+        self.drain_pool();
+        Ok((arena_bytes + pooled) as u64)
+    }
+
     /// Invalidate the pointer-keyed F16 conversion cache. Must be called
     /// between layers in batched prefill when the same activation buffer
     /// (e.g. `pb_tmp`) is reused with different contents each layer —

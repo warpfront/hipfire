@@ -468,6 +468,133 @@ pub fn page_decision(enabled: bool, ranks: &[RankNumbers], margin: u64) -> PageD
     }
 }
 
+/// Rows from which a prefill forward builds the lazily created F16 weight shadows (the
+/// route-row floor of every ≥512-gated GEMM, `rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS`).
+/// `route_rows` is the forward's `Gpu::route_rows(rows)`, so a wave running under the EP route
+/// cap (511) never qualifies.
+pub fn long_prefill_route_rows(route_rows: usize) -> bool {
+    route_rows >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+}
+
+/// Step boundaries without a ≥512-row prefill or an elastic reclaim before the elastic reserve
+/// gives the long-prefill caches back or lends its bank.
+pub const ELASTIC_IDLE_STEPS: usize = 64;
+/// The smallest bank worth lending (a smaller lendable figure lends nothing).
+pub const ELASTIC_MIN_LEND_BYTES: u64 = 256 << 20;
+/// Page margin ([`page_margin_bytes`]'s default), placement margin and emergency headroom the
+/// lendable figure leaves free.
+const ELASTIC_PAGE_MARGIN_BYTES: u64 = 256 << 20;
+const ELASTIC_PLACEMENT_MARGIN_BYTES: u64 = 512 << 20;
+const ELASTIC_EMERGENCY_BYTES: u64 = 128 << 20;
+
+/// One rank's elastic reserve numbers ([`Qwen4Bundle::elastic_numbers_local`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ElasticNumbers {
+    /// Free device bytes now (`hipMemGetInfo`; an already lent bank is out of it).
+    pub free: u64,
+    /// The page earmark WITHOUT the cold reserve (the cold reserve is the revocable part).
+    pub earmark_noncold: u64,
+    /// Growth the live lanes' reservations still need.
+    pub outstanding: u64,
+    /// Device bytes of the elastic bank this rank holds (0 = none).
+    pub lent: u64,
+    /// The lazily built ≥512-row weight shadows are resident.
+    pub caches_resident: bool,
+}
+
+impl ElasticNumbers {
+    /// What this rank can lend: `free - earmark_noncold - outstanding` less the page margin, the
+    /// placement margin and the emergency headroom (saturating).
+    pub(crate) fn lendable(&self) -> u64 {
+        self.free
+            .saturating_sub(self.earmark_noncold)
+            .saturating_sub(self.outstanding)
+            .saturating_sub(ELASTIC_PAGE_MARGIN_BYTES)
+            .saturating_sub(ELASTIC_PLACEMENT_MARGIN_BYTES)
+            .saturating_sub(ELASTIC_EMERGENCY_BYTES)
+    }
+}
+
+/// What the root decides over every rank's [`ElasticNumbers`] at an idle step boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ElasticAction {
+    Nothing,
+    /// Every rank frees its long-prefill caches.
+    ReleaseCaches,
+    /// Every rank lends a bank of at most this many bytes.
+    Lend(u64),
+}
+
+/// The elastic reserve's decision: nothing before [`ELASTIC_IDLE_STEPS`] idle steps (or with the
+/// reserve off, `cap == 0`); then release the caches when any rank holds them; else, with nothing
+/// lent anywhere, lend the minimum over the ranks of `min(cap, lendable)` when it reaches
+/// [`ELASTIC_MIN_LEND_BYTES`].
+pub(crate) fn elastic_action(cap: u64, idle_steps: usize, ranks: &[ElasticNumbers]) -> ElasticAction {
+    if cap == 0 || ranks.is_empty() || idle_steps < ELASTIC_IDLE_STEPS {
+        return ElasticAction::Nothing;
+    }
+    if ranks.iter().any(|rank| rank.caches_resident) {
+        return ElasticAction::ReleaseCaches;
+    }
+    if ranks.iter().any(|rank| rank.lent > 0) {
+        return ElasticAction::Nothing;
+    }
+    let bytes = ranks
+        .iter()
+        .map(|rank| rank.lendable().min(cap))
+        .min()
+        .unwrap_or(0);
+    if bytes >= ELASTIC_MIN_LEND_BYTES {
+        ElasticAction::Lend(bytes)
+    } else {
+        ElasticAction::Nothing
+    }
+}
+
+/// Whether a rank counts as warm: the long-prefill memory is already out of `free`. With the
+/// elastic reserve on that is exactly "the long-prefill caches are resident" (a release makes the
+/// rank cold again, so the cold reserve is held for the next long prompt); otherwise today's
+/// sticky rule: some lane has run past the charge, ever.
+pub(crate) fn lane_warm(
+    elastic: bool,
+    caches_resident: bool,
+    seen_before: bool,
+    slot_past_charge: bool,
+) -> bool {
+    if elastic {
+        caches_resident
+    } else {
+        seen_before || slot_past_charge
+    }
+}
+
+/// One rank's outcome of the lab lend (`Qwen4Bundle::elastic_lab_lend`): what the lend started and
+/// what `settle` found published once every fill and publication ran.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ElasticLabRank {
+    pub rank: usize,
+    /// Units / bytes the lend started filling (0 when it lent nothing).
+    pub lent_units: usize,
+    pub lent_bytes: u64,
+    /// Units published after the settle, and the bank's device bytes.
+    pub settled_units: usize,
+    pub settled_bytes: u64,
+}
+
+/// One rank's elastic reserve under an EP load that has a D2 tail: the tail that owns the bank,
+/// the per-rank cap and the log switch (all read once at attach).
+pub(crate) struct ElasticRank {
+    pub tail: std::sync::Arc<crate::expert_unit_tail_rank::UnitTailRank>,
+    /// Cap in bytes per rank (0 = the reserve is off: every op is a no-op).
+    pub cap: u64,
+    pub log: bool,
+    /// Reclaims on this rank that freed a bank (the serve loop's idle counter resets on a change).
+    pub reclaims: std::sync::atomic::AtomicU64,
+    /// Root only: the idle-step count of the last tick that probed the ranks, so an unchanged
+    /// "nothing to do" answer is asked again only after another [`ELASTIC_IDLE_STEPS`] steps.
+    pub probed_at: Option<usize>,
+}
+
 /// The store-level facts the byte arithmetic reads (all host values).
 #[derive(Clone, Copy)]
 pub(crate) struct PageGeometry<'a> {
@@ -478,9 +605,10 @@ pub(crate) struct PageGeometry<'a> {
     pub granularity: usize,
     /// Rows the load-time lane reservation charges per lane.
     pub charge_rows: usize,
-    /// A lane has prefilled past the charged rows on this rank since the load:
-    /// the lazily grown non-lane memory of a long prefill is already out of
-    /// the free figure.
+    /// The lazily grown non-lane memory of a long prefill is already out of the free figure
+    /// ([`lane_warm`]): without the elastic reserve, a lane has prefilled past the charged rows on
+    /// this rank since the load (sticky); with it, the long-prefill caches are resident (a release
+    /// makes the rank cold again).
     pub warm: bool,
     /// Free bytes the first long prefill is expected to take beyond the lanes'
     /// own pages while the rank is not `warm`.
@@ -902,6 +1030,12 @@ impl Qwen4Bundle {
         gpu: &Gpu,
         rows: usize,
     ) -> Result<RankNumbers, String> {
+        self.lane_page_numbers_cold(gpu, rows).map(|(numbers, _)| numbers)
+    }
+
+    /// [`Self::lane_page_numbers_local`] and the cold reserve its earmark holds (0 once the rank
+    /// is warm).
+    fn lane_page_numbers_cold(&self, gpu: &Gpu, rows: usize) -> Result<(RankNumbers, u64), String> {
         let store = self
             .lanes
             .as_ref()
@@ -917,18 +1051,28 @@ impl Qwen4Bundle {
         let granularity = gpu.vmm_recommended_granularity().unwrap_or(1);
         let charge_rows = self.lane_charge_rows(gpu);
         let slots = store.page_slots(gpu)?;
-        // A lane that mapped past the charged rows has run a long prompt tile (a step
-        // provisions and forwards in one tick, so what a gate sees mapped has run): the
-        // lazily grown non-lane memory of a long prefill (pooled tile scratch, GEMM input
-        // buffers, kernel modules) is then out of `free`. The flag is sticky: it never
-        // clears, whatever the slots later hold.
-        let warm = store
+        // Without the elastic reserve: a lane that mapped past the charged rows has run a long
+        // prompt tile (a step provisions and forwards in one tick, so what a gate sees mapped has
+        // run): the lazily grown non-lane memory of a long prefill (pooled tile scratch, GEMM
+        // input buffers, kernel modules) is then out of `free`. The flag is sticky: it never
+        // clears, whatever the slots later hold. With the elastic reserve the long-prefill caches
+        // can be given back, so the rank is warm exactly while they are resident, and the sticky
+        // flag is left alone.
+        let elastic = self.elastic_active();
+        let seen_before = store
             .long_prefill_seen
-            .load(std::sync::atomic::Ordering::Relaxed)
-            || slots.iter().any(|slot| slot.mapped_tokens > charge_rows);
-        store
-            .long_prefill_seen
-            .store(warm, std::sync::atomic::Ordering::Relaxed);
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let warm = lane_warm(
+            elastic,
+            elastic && gpu.long_prefill_caches_resident(),
+            seen_before,
+            slots.iter().any(|slot| slot.mapped_tokens > charge_rows),
+        );
+        if !elastic {
+            store
+                .long_prefill_seen
+                .store(warm, std::sync::atomic::Ordering::Relaxed);
+        }
         let geometry = PageGeometry {
             config: &self.config,
             format: store.format,
@@ -966,7 +1110,209 @@ impl Qwen4Bundle {
         if page_trace() {
             trace_rank(&geometry, &slots, &numbers, gpu.pool_parked_bytes() as u64);
         }
-        Ok(numbers)
+        let cold_held = if geometry.warm || geometry.backend != Qwen4KvBackend::Vmm {
+            0
+        } else {
+            geometry.cold_reserve
+        };
+        Ok((numbers, cold_held))
+    }
+
+    /// This rank's D2 expert tail (installed by the EP row-gather hook at attach), the owner of the
+    /// elastic bank. `None` without an EP load or without the tail.
+    pub(crate) fn ep_unit_tail(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::expert_unit_tail_rank::UnitTailRank>> {
+        self.elastic.as_ref().map(|elastic| &elastic.tail)
+    }
+
+    /// Resolve the elastic reserve of this rank once at EP attach: the cap
+    /// (`HIPFIRE_EP_ELASTIC_MIB`, a bad value is a load error) and the rank's D2 tail. Without a
+    /// tail there is nothing to lend through and the reserve stays inert.
+    pub(crate) fn install_elastic(
+        &mut self,
+        tail: Option<std::sync::Arc<crate::expert_unit_tail_rank::UnitTailRank>>,
+    ) -> Result<(), String> {
+        let cap = hipfire_config::memory::ep_elastic_cap_bytes()
+            .map_err(|error| format!("qwen4: {error}"))?;
+        self.elastic = tail.map(|tail| ElasticRank {
+            tail,
+            cap,
+            log: hipfire_config::memory::ep_elastic_log(),
+            reclaims: std::sync::atomic::AtomicU64::new(0),
+            probed_at: None,
+        });
+        Ok(())
+    }
+
+    /// The elastic reserve is on for this bundle: an EP rank with a D2 tail and a positive cap
+    /// (`HIPFIRE_EP_ELASTIC_MIB` not `0`). Every elastic op is a no-op while this is false.
+    pub fn elastic_active(&self) -> bool {
+        self.elastic.as_ref().is_some_and(|elastic| elastic.cap > 0)
+    }
+
+    /// Reclaims of this rank's bank so far; the serve loop restarts its idle count when it moves.
+    pub fn elastic_reclaim_epoch(&self) -> u64 {
+        self.elastic.as_ref().map_or(0, |elastic| {
+            elastic.reclaims.load(std::sync::atomic::Ordering::Relaxed)
+        })
+    }
+
+    fn elastic_rank(&self) -> usize {
+        self.weights
+            .ep_placement()
+            .map_or(0, |placement| placement.rank)
+    }
+
+    /// This rank's [`ElasticNumbers`]: one `device_mem_info`, the page earmark without the cold
+    /// reserve and the live lanes' outstanding growth.
+    pub(crate) fn elastic_numbers_local(&self, gpu: &Gpu) -> Result<ElasticNumbers, String> {
+        let elastic = self
+            .elastic
+            .as_ref()
+            .ok_or_else(|| "the elastic reserve is not installed".to_string())?;
+        let (numbers, cold_held) = self.lane_page_numbers_cold(gpu, 0)?;
+        Ok(ElasticNumbers {
+            free: numbers.pages.free,
+            earmark_noncold: numbers.pages.earmark.saturating_sub(cold_held),
+            outstanding: numbers.pages.outstanding,
+            lent: elastic.tail.elastic_bytes(),
+            caches_resident: gpu.long_prefill_caches_resident(),
+        })
+    }
+
+    /// Unpublish and free this rank's bank (rank-local mechanics; see
+    /// `UnitTailRank::elastic_reclaim`). `Ok(true)` when a bank was freed, `Ok(false)` when none
+    /// was lent (cheap: no device work). `Err`: the bank is still published and valid.
+    pub(crate) fn elastic_reclaim_local(&self, gpu: &mut Gpu, why: &str) -> Result<bool, String> {
+        let Some(elastic) = self.elastic.as_ref().filter(|elastic| elastic.cap > 0) else {
+            return Ok(false);
+        };
+        if elastic.tail.elastic_bytes() == 0 {
+            return Ok(false);
+        }
+        let rank = self.elastic_rank();
+        match elastic.tail.elastic_reclaim(gpu, why) {
+            Ok(Some(report)) => {
+                elastic
+                    .reclaims
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if elastic.log {
+                    eprintln!(
+                        "qwen4 EP rank {rank}: [elastic] reclaim ({why}): {} units {:.0} MiB in {:.2} ms (wait {:.2}, tables {:.2}, free {:.2})",
+                        report.units,
+                        report.bytes as f64 / f64::from(1u32 << 20),
+                        report.total_ms,
+                        report.wait_ms,
+                        report.tables_ms,
+                        report.free_ms
+                    );
+                }
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
+            Err(error) => Err(format!("rank {rank}: elastic reclaim ({why}): {error}")),
+        }
+    }
+
+    /// [`Self::elastic_reclaim_local`] for the backstops that cannot act on a failure: it is
+    /// logged and the bank stays in place (the caller then just sees less free memory).
+    pub(crate) fn elastic_reclaim_logged(&self, gpu: &mut Gpu, why: &str) {
+        if let Err(error) = self.elastic_reclaim_local(gpu, why) {
+            eprintln!("  qwen4 EP elastic: {error}");
+        }
+    }
+
+    /// Backstop before a forward of `rows` rows on this rank: a prefill whose GEMM route rows reach
+    /// the F16 shadow floor ([`long_prefill_route_rows`] over `Gpu::route_rows`, so a wave under
+    /// the EP route cap never qualifies) reclaims the bank first.
+    pub(crate) fn elastic_prefill_backstop(&self, gpu: &mut Gpu, rows: usize) {
+        if self.elastic_active() && long_prefill_route_rows(gpu.route_rows(rows)) {
+            self.elastic_reclaim_logged(gpu, "prefill");
+        }
+    }
+
+    /// Lend a bank of at most `bytes` (rank-local; see `UnitTailRank::elastic_lend`). `Ok(None)`:
+    /// nothing lent (refused or no candidate).
+    pub(crate) fn elastic_lend_local(
+        &self,
+        gpu: &mut Gpu,
+        bytes: u64,
+    ) -> Result<Option<(usize, u64)>, String> {
+        let Some(elastic) = self.elastic.as_ref().filter(|elastic| elastic.cap > 0) else {
+            return Ok(None);
+        };
+        let rank = self.elastic_rank();
+        match elastic.tail.elastic_lend(gpu, bytes) {
+            Ok(Some(report)) => {
+                if elastic.log {
+                    eprintln!(
+                        "qwen4 EP rank {rank}: [elastic] lend: {} units {:.0} MiB in {:.2} ms",
+                        report.units,
+                        report.bytes as f64 / f64::from(1u32 << 20),
+                        report.ms
+                    );
+                }
+                Ok(Some((report.units, report.bytes)))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => Err(format!("rank {rank}: elastic lend: {error}")),
+        }
+    }
+
+    /// Free this rank's long-prefill caches ([`Gpu::release_long_prefill_caches`]); returns the
+    /// device bytes released.
+    pub(crate) fn elastic_release_caches_local(&self, gpu: &mut Gpu) -> Result<u64, String> {
+        let rank = self.elastic_rank();
+        let freed = gpu
+            .release_long_prefill_caches()
+            .map_err(|error| format!("rank {rank}: release long-prefill caches: {error}"))?;
+        if self.elastic.as_ref().is_some_and(|elastic| elastic.log) {
+            eprintln!(
+                "qwen4 EP rank {rank}: [elastic] release caches: {:.0} MiB",
+                freed as f64 / f64::from(1u32 << 20)
+            );
+        }
+        Ok(freed)
+    }
+
+    /// Lab (`fn_mesh_lane_oracle --elastic`): lend a bank of at most `bytes` on this rank, then
+    /// drive its fills and publication to completion (`UnitTailRank::elastic_settle`), so the
+    /// bank is fully published before the measured runs. Ignores the cap and the idle rule; needs
+    /// only the D2 tail.
+    pub(crate) fn elastic_lab_lend_local(
+        &self,
+        gpu: &mut Gpu,
+        bytes: u64,
+    ) -> Result<ElasticLabRank, String> {
+        let rank = self.elastic_rank();
+        let tail = self
+            .ep_unit_tail()
+            .ok_or_else(|| format!("rank {rank}: no D2 tail to lend through"))?;
+        let lent = tail
+            .elastic_lend(gpu, bytes)
+            .map_err(|error| format!("rank {rank}: elastic lend: {error}"))?;
+        let settled_units = tail
+            .elastic_settle(gpu)
+            .map_err(|error| format!("rank {rank}: elastic settle: {error}"))?;
+        Ok(ElasticLabRank {
+            rank,
+            lent_units: lent.as_ref().map_or(0, |report| report.units),
+            lent_bytes: lent.as_ref().map_or(0, |report| report.bytes),
+            settled_units,
+            settled_bytes: tail.elastic_bytes(),
+        })
+    }
+
+    /// Lab: reclaim this rank's bank whatever the cap; whether one was freed.
+    pub(crate) fn elastic_lab_reclaim_local(&self, gpu: &mut Gpu) -> Result<bool, String> {
+        let rank = self.elastic_rank();
+        let tail = self
+            .ep_unit_tail()
+            .ok_or_else(|| format!("rank {rank}: no D2 tail"))?;
+        tail.elastic_reclaim(gpu, "lab")
+            .map(|report| report.is_some())
+            .map_err(|error| format!("rank {rank}: elastic reclaim: {error}"))
     }
 
     /// The page budget's decision for a request reserving `rows` rows: this
@@ -1534,6 +1880,113 @@ mod tests {
             page_decision(true, &[small], 256 * MIB).verdict,
             PageVerdict::Fit
         );
+    }
+
+    /// Without the elastic reserve the warm flag is today's sticky rule (the caches never matter);
+    /// with it the flag is exactly "the long-prefill caches are resident", so a release makes the
+    /// rank cold again and the cold reserve is held for the next long prompt.
+    #[test]
+    fn the_warm_flag_follows_the_caches_only_with_the_elastic_reserve() {
+        // Reserve off: sticky or a slot past the charge, whatever the caches hold.
+        for resident in [false, true] {
+            assert!(!lane_warm(false, resident, false, false));
+            assert!(lane_warm(false, resident, true, false));
+            assert!(lane_warm(false, resident, false, true));
+        }
+        // Reserve on: the caches alone, whatever the sticky history says.
+        for (seen, past) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert!(lane_warm(true, true, seen, past));
+            assert!(!lane_warm(true, false, seen, past));
+        }
+        // After a release (history says warm, caches gone) the earmark holds the cold reserve
+        // again; the next long tile rebuilds the caches and the rank is warm.
+        let config = compact_test_config();
+        let mut g = geometry(&config, Some(mtp(None)));
+        g.cold_reserve = 1280 * MIB;
+        let slots = vec![SlotPages::default(); 8];
+        g.warm = lane_warm(true, false, true, true);
+        let released = numbers_of(&g, &slots, 0, 4096 * MIB, 1000);
+        g.warm = lane_warm(true, true, true, true);
+        let resident = numbers_of(&g, &slots, 0, 4096 * MIB, 1000);
+        assert_eq!(
+            released.pages.earmark - resident.pages.earmark,
+            1280 * MIB,
+            "the released rank holds exactly the cold reserve more"
+        );
+    }
+
+    #[test]
+    fn lendable_is_free_less_the_earmark_the_growth_and_the_margins() {
+        let cp = ElasticNumbers {
+            free: 2600 * MIB,
+            earmark_noncold: 36 * MIB,
+            outstanding: 0,
+            ..ElasticNumbers::default()
+        };
+        // 256 page + 512 placement + 128 emergency = 896 MiB of margins.
+        assert_eq!(cp.lendable(), (2600 - 36 - 896) * MIB);
+        let grown = ElasticNumbers {
+            outstanding: 900 * MIB,
+            ..cp
+        };
+        assert_eq!(grown.lendable(), (2600 - 36 - 900 - 896) * MIB);
+        // Saturating: a card with less than the margins free lends nothing.
+        let tight = ElasticNumbers {
+            free: 500 * MIB,
+            ..cp
+        };
+        assert_eq!(tight.lendable(), 0);
+    }
+
+    #[test]
+    fn the_elastic_action_waits_releases_then_lends_the_smallest_cap_bounded_bank() {
+        let rank = |free_mib: u64| ElasticNumbers {
+            free: free_mib * MIB,
+            earmark_noncold: 36 * MIB,
+            ..ElasticNumbers::default()
+        };
+        let cap = 1280 * MIB;
+        let idle = ELASTIC_IDLE_STEPS;
+        let both = [rank(2600), rank(2600)];
+        // Not idle long enough, or the reserve off: nothing, whatever the numbers say.
+        assert_eq!(elastic_action(cap, idle - 1, &both), ElasticAction::Nothing);
+        assert_eq!(elastic_action(0, idle, &both), ElasticAction::Nothing);
+        assert_eq!(elastic_action(cap, idle, &[]), ElasticAction::Nothing);
+        // Idle with plenty of room: the cap.
+        assert_eq!(elastic_action(cap, idle, &both), ElasticAction::Lend(cap));
+        // The tighter rank bounds every rank's bank.
+        let uneven = [rank(2600), rank(1500)];
+        assert_eq!(
+            elastic_action(cap, idle, &uneven),
+            ElasticAction::Lend((1500 - 36 - 896) * MIB)
+        );
+        // Under the minimum bank on any rank nothing is lent.
+        let thin = [rank(2600), rank(1000)];
+        assert_eq!(elastic_action(cap, idle, &thin), ElasticAction::Nothing);
+        // Resident caches on any rank are released first, lent or not.
+        let mut holding = both;
+        holding[1].caches_resident = true;
+        assert_eq!(
+            elastic_action(cap, idle, &holding),
+            ElasticAction::ReleaseCaches
+        );
+        holding[0].lent = 1280 * MIB;
+        assert_eq!(
+            elastic_action(cap, idle, &holding),
+            ElasticAction::ReleaseCaches
+        );
+        // A bank already lent on any rank is not lent again.
+        let mut lent = both;
+        lent[0].lent = 1280 * MIB;
+        assert_eq!(elastic_action(cap, idle, &lent), ElasticAction::Nothing);
+    }
+
+    #[test]
+    fn only_route_rows_at_the_f16_floor_are_a_long_prefill() {
+        assert!(!long_prefill_route_rows(1));
+        assert!(!long_prefill_route_rows(511));
+        assert!(long_prefill_route_rows(512));
+        assert!(long_prefill_route_rows(4096));
     }
 
     #[test]

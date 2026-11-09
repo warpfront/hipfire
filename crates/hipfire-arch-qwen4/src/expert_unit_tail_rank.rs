@@ -100,9 +100,26 @@
 //! post, a digest that differs, a failed plane upload: ranks whose planes may differ) is the
 //! one thing that does fail decodes: [`UnitTailRank::pins_fault`] makes the owner assignment
 //! refuse on every rank, because running a call over diverged planes is not exact.
+//!
+//! # Elastic bank (PLAN-cp15 L2)
+//!
+//! While no long prefill needs the VRAM, [`UnitTailRank::elastic_lend`] allocates ONE more pool
+//! (an elastic bank: its own railgun [`SlotBank`] over its own block, never visible to the peer)
+//! and copies the next-hottest owned host units into it in chunks of at most 64 MiB, one chunk per
+//! `step_end` once the previous chunk's copy-stream fence completed (polled, never waited). The
+//! bank's units are [`Kind::Elastic`]: the D2 policy treats them like core units, and they are
+//! published through the SAME tables as D2's slots: completed chunks are published inside a D2
+//! retirement, written through that retirement's table backing and uploaded with its changed
+//! ranges, then the elastic generation is retired and sealed again over every published member.
+//! A unit's canonical pointer stays its pinned host copy, so the tables are valid in every state.
+//! [`UnitTailRank::elastic_reclaim`] rewrites the tables to canonical at once (the borrow-resume
+//! pattern: fence, retire, write, upload, sync, seal `sub + 1`), then retires the elastic
+//! generation, closes the bank and frees the pool; any failure before the canonical upload is
+//! proven keeps the pool allocated and its entries valid.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -111,8 +128,8 @@ use hip_bridge::{Event, HipRuntime, PinnedHostBuffer, Stream, HIP_EVENT_DISABLE_
 use railgun::sealed_table::generation::{
     acquire_window_owned, finish_window, BlockRegistry, Expert, FenceBackend, FenceFailure,
     FenceState, FillComplete, FillTicket, FillsNotDone, GenerationId, OwnedTableGeneration,
-    PeerReaderFence, PendingFills, PendingOrQuarantined, PendingRestore, ScratchLoan, SlotSpan,
-    TableBacking, WindowReadLease,
+    PeerReaderFence, PendingFills, PendingOrQuarantined, PendingRestore, ScratchLoan, SlotBank,
+    SlotCell, SlotSpan, Staging, TableBacking, WindowReadLease,
 };
 use railgun::window::Quiescence;
 use railgun::Binding;
@@ -120,8 +137,9 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::expert_ep_units::EpUnitPlan;
 use crate::expert_unit_tail::{
-    occupant_unit, EpUnitTailConfig, FillOp, PeerBoard, PeerDelta, PeerTake, PinDelta, PinPlanes,
-    PinProtocol, Retire, RetireCadence, TailPolicy, UnitKey, WindowUse, QUARANTINE_WINDOWS,
+    occupant_unit, unit_occupant, EpUnitTailConfig, FillOp, PeerBoard, PeerDelta, PeerTake,
+    PinDelta, PinPlanes, PinProtocol, Retire, RetireCadence, TailPolicy, UnitKey, WindowUse,
+    QUARANTINE_WINDOWS,
 };
 
 /// Ids one window's log holds (`calls x slots`); a window past this stops
@@ -470,7 +488,7 @@ impl FullTable {
 }
 
 /// How one `(layer, expert)` read is served, for this rank.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     /// Not held by this rank (or outside the planned layers).
     Foreign,
@@ -480,6 +498,10 @@ enum Kind {
     Tail,
     /// Host-read unit of a layer the tail does not manage (a wholly host layer).
     HostOnly,
+    /// A unit an elastic bank holds, from its lend until its reclaim: the D2 policy treats it like
+    /// `Core` (never a candidate, never filled by D2, not a host read), its table entries are
+    /// the elastic bank's.
+    Elastic,
 }
 
 struct TailLayer {
@@ -879,13 +901,19 @@ struct Inner {
     /// Developer skew census (`HIPFIRE_EP_SKEW_LOG=<dir>`, off by default): every retirement writes
     /// the routed ids of the group's calls with how this rank serves each one. `None` when unset.
     skew: Option<SkewLog>,
+    /// The units an elastic bank may take, hottest first ([`elastic_order`]); filtered at each lend.
+    elastic_order: Vec<UnitKey>,
+    /// The elastic bank while one is lent.
+    elastic: Option<ElasticBank>,
 }
 
 /// `HIPFIRE_EP_SKEW_LOG=<dir>` (developer diagnostic, off by default): at every D2 retirement each
 /// rank appends one text line per logged trunk MoE call of the group to `<dir>/skew-rank<r>.log`:
 /// `rank retirement call host_monotonic_ns layer slots` then one token per slot, `<expert><class>`
 /// with class `F` (another rank's expert), `C` (static VRAM core), `L` (tail unit served from a
-/// live VRAM slot), `T` (tail unit read from pinned host) or `H` (host-only unit). It reads only
+/// live VRAM slot), `T` (tail unit read from pinned host, or an elastic unit whose slot is not
+/// published yet), `E` (elastic unit served from its published elastic slot) or `H` (host-only
+/// unit). It reads only
 /// what the retirement already downloaded (no added sync, no device work) and never changes an
 /// output; the host timestamp is taken when the call's copy is enqueued.
 pub(crate) const EP_SKEW_LOG_ENV: &str = "HIPFIRE_EP_SKEW_LOG";
@@ -1214,6 +1242,12 @@ impl UnitTailRank {
         if order.is_empty() {
             return Err("no unit of this rank is left for the tail".into());
         }
+        let elastic_units = elastic_order(
+            experts,
+            &kinds,
+            &order,
+            plan.hot_counts().map(|counts| &counts[..]),
+        );
 
         // The slot pool: ONE device allocation (one memset): the gate/up block at offset 0, the
         // down block at its 256-aligned offset; `pool_gate_up` / `pool_down` are non-owning views
@@ -1328,6 +1362,8 @@ impl UnitTailRank {
             last_gen: GenerationId { epoch: 0, sub: 0 },
             lent: None,
             skew: SkewLog::open(rank),
+            elastic_order: elastic_units,
+            elastic: None,
         };
         let built = state.build_device(gpu, seeds);
         if let Err(error) = built {
@@ -1433,6 +1469,9 @@ impl UnitTailRank {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if inner.skip_suspended_window() {
             return;
+        }
+        if inner.elastic.is_some() && !inner.released && inner.frozen.is_none() {
+            inner.elastic_advance(gpu);
         }
         if inner.pins.is_some() && !inner.released {
             // The pins lever: the retirement clock runs on a frozen tail too.
@@ -1972,7 +2011,7 @@ impl Inner {
                         Kind::Foreign => 'F',
                         Kind::Core => 'C',
                         Kind::HostOnly => 'H',
-                        Kind::Tail => {
+                        kind @ (Kind::Tail | Kind::Elastic) => {
                             let live = self.layer_of[layer].is_some_and(|index| {
                                 let tail = &self.layers[index];
                                 let at = expert * 8;
@@ -1983,10 +2022,10 @@ impl Inner {
                                 );
                                 entry != tail.canon_gate_up[expert]
                             });
-                            if live {
-                                'L'
-                            } else {
-                                'T'
+                            match (live, kind) {
+                                (true, Kind::Elastic) => 'E',
+                                (true, _) => 'L',
+                                (false, _) => 'T',
                             }
                         }
                     },
@@ -2070,7 +2109,7 @@ impl Inner {
             let (layer, expert) = (at / self.experts, at % self.experts);
             match self.kinds[at] {
                 Kind::Foreign => {}
-                Kind::Core => {
+                Kind::Core | Kind::Elastic => {
                     core_reads += reads as u64;
                     core_distinct += 1;
                 }
@@ -2100,6 +2139,9 @@ impl Inner {
         }
         // Completed fills (issued in order on one stream: stop at the first pending).
         let completed = self.poll_batches(gpu)?;
+        // Elastic chunks that completed publish with this retirement; their generation's window
+        // is fenced by the same drain.
+        self.elastic_prepare_publish(gpu);
 
         // Retire the generation the finished windows read: its window fenced above; in PEER mode
         // this is the retirement's one `released_through` call. The table backing comes back.
@@ -2175,6 +2217,9 @@ impl Inner {
             }
         }
         self.last_gen = id;
+        // The elastic generation of the previous window retires and a new one is sealed over
+        // every published member (nothing when no chunk was published).
+        self.elastic_reseal();
         // The ACK: every peer delta this retirement applied is now enqueued on the compute
         // stream ahead of every kernel of the next window. A failed upload returned above and
         // records nothing, so the owners keep the slots this rank may still name quarantined.
@@ -2256,6 +2301,8 @@ impl Inner {
             layer.set(backing, unit.1 as usize, gate_up, down);
             touched.insert(index);
         }
+        // Elastic chunks completed since the last retirement go up with this retirement's uploads.
+        self.elastic_publish(backing, &mut touched);
         // PEER mode: post this retirement's publications, then take and apply what the peers
         // posted so far to the full tables' peer-owned entries.
         let mut peer_touched: HashSet<usize> = HashSet::new();
@@ -2276,32 +2323,7 @@ impl Inner {
         }
         let mut order: Vec<usize> = touched.union(&peer_touched).copied().collect();
         order.sort_unstable();
-        let compute = gpu.active_stream.as_ref();
-        let (mut calls, mut bytes) = (0u64, 0u64);
-        for &index in &order {
-            let layer = &mut self.layers[index];
-            let mut layer_calls = 0u64;
-            let mut upload = |image: &mut TableImage, table: &GpuTensor| -> Result<(), String> {
-                let sent = image.upload_dirty(backing, gpu, table, compute)?;
-                if sent > 0 {
-                    layer_calls += 1;
-                    bytes += sent as u64;
-                }
-                Ok(())
-            };
-            upload(&mut layer.image_gate_up, &layer.table_gate_up)?;
-            upload(&mut layer.image_down, &layer.table_down)?;
-            if let Some(full) = layer.full.as_mut() {
-                upload(&mut full.image_gate_up, &full.table_gate_up)?;
-                upload(&mut full.image_down, &full.table_down)?;
-            }
-            if layer_calls > 0 {
-                calls += layer_calls;
-                self.uploads += 1;
-            }
-        }
-        self.upload_calls += calls;
-        self.upload_bytes += bytes;
+        self.upload_layers(gpu, backing, &order)?;
         Ok(peer_take)
     }
 
@@ -2511,6 +2533,17 @@ impl Inner {
     fn release(&mut self, gpu: &mut Gpu) {
         if self.released {
             return;
+        }
+        // The elastic bank goes first: its entries leave the tables and its pool is freed before
+        // the D2 generation retires for good.
+        if self.elastic.is_some() {
+            if let Err(error) = self.elastic_reclaim(gpu, "release", true) {
+                eprintln!(
+                    "qwen4 EP rank {}: D2 tail release: the elastic pool is NOT freed (it is leaked, never freed early): {error}",
+                    self.rank
+                );
+                self.elastic = None;
+            }
         }
         self.released = true;
         // Fills that never ran: their slots stay `Filling`, which nothing reads; the bank is told
@@ -2972,6 +3005,12 @@ impl Inner {
         if self.suspended {
             return Err("the tail is already suspended".into());
         }
+        // The rank-local backstop: the elastic bank is reclaimed before the pool is lent.
+        if self.elastic.is_some() {
+            self.elastic_reclaim(gpu, "borrow", true).map_err(|error| {
+                format!("the elastic bank could not be reclaimed before the borrow epoch: {error}")
+            })?;
+        }
         self.suspended = true;
         self.calls.clear();
         self.log_used = 0;
@@ -3237,6 +3276,1083 @@ impl Inner {
     }
 }
 
+// ------------------------------------------------------------------------ elastic bank
+
+/// Payload bytes one elastic fill chunk copies at most: one chunk is in flight at a time, so a
+/// reclaim waits for at most one.
+const ELASTIC_CHUNK_BYTES: usize = 64 << 20;
+/// The smallest pool an elastic lend allocates.
+const ELASTIC_MIN_BYTES: usize = 256 << 20;
+/// Alignment of every elastic slot extent.
+const ELASTIC_STRIDE_ALIGN: usize = 256;
+/// Bytes behind each payload inside the slot's own declared extent (the kernels' over-read).
+const ELASTIC_GUARD_BYTES: usize = 256;
+
+/// What an elastic lend allocated: bank slots (units), pool bytes and the host time of the call.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ElasticReport {
+    pub units: usize,
+    pub bytes: u64,
+    pub ms: f64,
+}
+
+/// What an elastic reclaim freed: the bank's slots (units), the pool bytes, and the host time of
+/// each phase (the in-flight chunk wait, the table rewrite through the canonical upload sync, the
+/// generation retire + close + free) and of the whole call.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ReclaimReport {
+    pub units: usize,
+    pub bytes: u64,
+    pub wait_ms: f64,
+    pub tables_ms: f64,
+    pub free_ms: f64,
+    pub total_ms: f64,
+}
+
+fn elapsed_ms(from: Instant, to: Instant) -> f64 {
+    (to - from).as_secs_f64() * 1e3
+}
+
+/// The elastic pool's layout: `[gate/up: slots * gate_up_stride | down: slots * down_stride]`.
+/// Each stride is the payload rounded up to [`ELASTIC_STRIDE_ALIGN`] plus [`ELASTIC_GUARD_BYTES`],
+/// and the slot's declared extent is its whole stride, so a kernel's over-read behind the payload
+/// (the W3 down kernel reads 2 B past it) stays inside the slot's own extent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ElasticLayout {
+    slots: usize,
+    gate_up_stride: usize,
+    down_stride: usize,
+    /// Offset of the down block: `slots * gate_up_stride`, 256-aligned.
+    down_offset: usize,
+    /// Bytes of the whole allocation.
+    total: usize,
+}
+
+fn elastic_stride(payload: usize) -> usize {
+    payload.next_multiple_of(ELASTIC_STRIDE_ALIGN) + ELASTIC_GUARD_BYTES
+}
+
+fn elastic_layout(slots: usize, gate_up_bytes: usize, down_bytes: usize) -> ElasticLayout {
+    let (gate_up_stride, down_stride) = (
+        elastic_stride(gate_up_bytes),
+        elastic_stride(down_bytes),
+    );
+    let down_offset = slots * gate_up_stride;
+    ElasticLayout {
+        slots,
+        gate_up_stride,
+        down_stride,
+        down_offset,
+        total: down_offset + slots * down_stride,
+    }
+}
+
+/// The declared extents of every slot of `layout`: block-relative `[gate_up, down]` spans, each
+/// the slot's whole stride.
+fn elastic_spans(layout: &ElasticLayout) -> Vec<Vec<SlotSpan>> {
+    (0..layout.slots)
+        .map(|slot| {
+            vec![
+                SlotSpan {
+                    offset: (slot * layout.gate_up_stride) as u64,
+                    bytes: layout.gate_up_stride as u64,
+                },
+                SlotSpan {
+                    offset: (layout.down_offset + slot * layout.down_stride) as u64,
+                    bytes: layout.down_stride as u64,
+                },
+            ]
+        })
+        .collect()
+}
+
+/// The `[gate_up, down]` device addresses of `slot` in a pool at `base`.
+fn elastic_slot_addresses(base: u64, layout: &ElasticLayout, slot: usize) -> (u64, u64) {
+    (
+        base + (slot * layout.gate_up_stride) as u64,
+        base + (layout.down_offset + slot * layout.down_stride) as u64,
+    )
+}
+
+/// Whole units a lend of at most `bytes` pool bytes holds, capped at the `candidates` available.
+fn elastic_slot_count(bytes: u64, gate_up_bytes: usize, down_bytes: usize, candidates: usize) -> usize {
+    let per_slot = (elastic_stride(gate_up_bytes) + elastic_stride(down_bytes)) as u64;
+    candidates.min((bytes / per_slot) as usize)
+}
+
+/// The slot ranges one chunk each fills: consecutive, covering `0..slots` once, each chunk's
+/// payload (`unit_payload` bytes per slot) at most `chunk_bytes` (at least one slot).
+fn elastic_chunks(slots: usize, unit_payload: usize, chunk_bytes: usize) -> Vec<Range<usize>> {
+    let per_chunk = (chunk_bytes / unit_payload.max(1)).max(1);
+    (0..slots)
+        .step_by(per_chunk)
+        .map(|start| start..(start + per_chunk).min(slots))
+        .collect()
+}
+
+/// The units an elastic bank may take, in lend order: the rank's `Kind::Tail` units by sidecar
+/// count descending then global id (`layer * experts + expert`) ascending, counts above zero only;
+/// without counts the D2 `ranking` order (its tail units).
+fn elastic_order(
+    experts: usize,
+    kinds: &[Kind],
+    ranking: &[UnitKey],
+    counts: Option<&[u64]>,
+) -> Vec<UnitKey> {
+    let is_tail = |unit: &UnitKey| {
+        kinds.get(unit.0 as usize * experts + unit.1 as usize) == Some(&Kind::Tail)
+    };
+    match counts {
+        None => ranking.iter().copied().filter(is_tail).collect(),
+        Some(counts) => {
+            let mut hot: Vec<(u64, usize)> = kinds
+                .iter()
+                .enumerate()
+                .filter(|&(_, &kind)| kind == Kind::Tail)
+                .filter_map(|(id, _)| {
+                    counts.get(id).copied().filter(|&count| count > 0).map(|count| (count, id))
+                })
+                .collect();
+            hot.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            hot.into_iter()
+                .map(|(_, id)| ((id / experts) as u16, (id % experts) as u16))
+                .collect()
+        }
+    }
+}
+
+/// `order` filtered for one lend: units still `Kind::Tail` that no D2 slot holds or fills.
+fn elastic_candidates(
+    order: &[UnitKey],
+    kinds: &[Kind],
+    experts: usize,
+    d2: &HashSet<UnitKey>,
+) -> Vec<UnitKey> {
+    order
+        .iter()
+        .copied()
+        .filter(|unit| {
+            kinds.get(unit.0 as usize * experts + unit.1 as usize) == Some(&Kind::Tail)
+                && !d2.contains(unit)
+        })
+        .collect()
+}
+
+/// Where the elastic bank's table generation is.
+enum ElasticGen {
+    /// Sealed over the published members and leased to the windows.
+    Leased(WindowReadLease<'static>),
+    /// The window fenced; not retired yet.
+    Fenced(OwnedTableGeneration),
+    /// Retired (or never sealed): the bank's table backing, nothing sealed.
+    Idle(TableBacking),
+    /// A transition failed in the middle: no generation can be retired (the pool is kept).
+    Gone,
+}
+
+/// One elastic bank: the pool, its slot bank and the bookkeeping of its fills and publications.
+struct ElasticBank {
+    /// The owning allocation of the pool.
+    pool: GpuTensor,
+    layout: ElasticLayout,
+    /// `None` only while [`teardown_elastic`] closes it.
+    bank: Option<SlotBank>,
+    /// The membership of the next elastic generation: the published slots.
+    staging: Staging,
+    /// `None` only while a transition holds the cell.
+    cells: Vec<Option<SlotCell>>,
+    /// The unit of every slot.
+    units: Vec<UnitKey>,
+    /// The slot's table entries name it (and it is staged).
+    published: Vec<bool>,
+    chunks: Vec<Range<usize>>,
+    next_chunk: usize,
+    /// The chunk in flight on the copy stream.
+    pending: Option<PendingFills>,
+    /// Completed fills not yet published (published inside the next D2 retirement).
+    ready: Vec<FillComplete>,
+    generation: ElasticGen,
+    next_epoch: u64,
+    /// A fill or fence failed: nothing more is issued or published; the pool stays until reclaim.
+    fault: Option<String>,
+    reclaim_logged: bool,
+}
+
+impl ElasticBank {
+    /// Adopt `pool` as a slot-bank block (own registry, `peer = false`) with one slot per unit,
+    /// every slot `Free`, and register the tables' backing. The pool comes back with the error.
+    fn open(
+        rank: usize,
+        pool: GpuTensor,
+        layout: ElasticLayout,
+        units: Vec<UnitKey>,
+        chunks: Vec<Range<usize>>,
+        extents: Vec<Binding>,
+    ) -> Result<Self, (GpuTensor, String)> {
+        let block = match BlockRegistry::new(rank as u32).adopt::<Expert>(
+            pool.buf.as_ptr() as u64,
+            layout.total as u64,
+            1,
+        ) {
+            Ok(block) => block,
+            Err(error) => return Err((pool, format!("the pool block: {error}"))),
+        };
+        let (mut bank, free) = match SlotBank::new(block, elastic_spans(&layout), false) {
+            Ok(made) => made,
+            Err((_block, error)) => return Err((pool, format!("the slot bank: {error}"))),
+        };
+        let backing = match bank.register_table_backing(extents) {
+            Ok(backing) => backing,
+            Err(error) => return Err((pool, format!("the table backing: {error}"))),
+        };
+        Ok(Self {
+            pool,
+            layout,
+            staging: bank.staging(),
+            bank: Some(bank),
+            cells: free.into_iter().map(|free| Some(SlotCell::Free(free))).collect(),
+            published: vec![false; units.len()],
+            units,
+            chunks,
+            next_chunk: 0,
+            pending: None,
+            ready: Vec::new(),
+            generation: ElasticGen::Idle(backing),
+            next_epoch: 0,
+            fault: None,
+            reclaim_logged: false,
+        })
+    }
+
+    fn slot_addresses(&self, slot: usize) -> (u64, u64) {
+        elastic_slot_addresses(self.pool.buf.as_ptr() as u64, &self.layout, slot)
+    }
+
+    /// `(unit, slot)` of every published slot, ascending by slot.
+    fn published_units(&self) -> Vec<(UnitKey, usize)> {
+        (0..self.units.len())
+            .filter(|&slot| self.published[slot])
+            .map(|slot| (self.units[slot], slot))
+            .collect()
+    }
+
+    /// `Filling` -> `Resident` by the completion token, then staged for the next generation.
+    fn finish_publish(&mut self, done: FillComplete) -> Result<UnitKey, String> {
+        let slot = done.slot() as usize;
+        let Some(unit) = self.units.get(slot).copied() else {
+            return Err(format!("a completion names slot {slot} outside the elastic bank"));
+        };
+        let bank = self.bank.as_mut().expect("the elastic slot bank is open");
+        match self.cells[slot].take() {
+            Some(SlotCell::Filling(filling)) => match bank.finish_fill(filling, done) {
+                Ok(resident) => {
+                    let staged = bank.publish(&mut self.staging, &resident);
+                    self.cells[slot] = Some(SlotCell::Resident(resident));
+                    staged.map_err(|error| format!("publish of elastic slot {slot}: {error}"))?;
+                    self.published[slot] = true;
+                    Ok(unit)
+                }
+                Err((filling, _done, error)) => {
+                    self.cells[slot] = Some(SlotCell::Filling(filling));
+                    Err(format!("finish of elastic slot {slot}: {error}"))
+                }
+            },
+            other => {
+                self.cells[slot] = other;
+                Err(format!("elastic slot {slot} is not filling"))
+            }
+        }
+    }
+
+    /// Seal the staged membership through `backing` and lease the generation to the windows.
+    fn seal_leased(&mut self, backing: TableBacking) -> Result<(), String> {
+        let id = GenerationId {
+            epoch: self.next_epoch,
+            sub: 0,
+        };
+        let bank = self.bank.as_mut().expect("the elastic slot bank is open");
+        match bank.seal(&self.staging, backing, id) {
+            Ok(generation) => {
+                self.next_epoch += 1;
+                match acquire_window_owned(generation) {
+                    Ok(lease) => {
+                        self.generation = ElasticGen::Leased(lease);
+                        Ok(())
+                    }
+                    Err((generation, error)) => {
+                        self.generation = ElasticGen::Fenced(generation);
+                        Err(format!("leasing the elastic generation: {error}"))
+                    }
+                }
+            }
+            Err((backing, error)) => {
+                self.generation = ElasticGen::Idle(backing);
+                Err(format!("sealing the elastic generation: {error}"))
+            }
+        }
+    }
+}
+
+impl TailLayer {
+    /// Note `expert`'s entries dirty in every image that mirrors them, whatever the images hold:
+    /// an interrupted upload took the range, so the next one resends it.
+    fn note_dirty(&mut self, expert: usize) {
+        self.image_gate_up.dirty.note(expert);
+        self.image_down.dirty.note(expert);
+        if let Some(full) = self.full.as_mut().filter(|full| full.shared[expert]) {
+            full.image_gate_up.dirty.note(expert);
+            full.image_down.dirty.note(expert);
+        }
+    }
+}
+
+/// Retire the elastic generation, hand every cell back, quiesce the device, close the bank and
+/// free the pool. On error the bank is returned as far as it got (a retry resumes); an early free
+/// never happens. The caller proved the tables name no elastic slot and the device is idle.
+fn teardown_elastic(gpu: &mut Gpu, mut el: ElasticBank) -> Result<(), (ElasticBank, String)> {
+    match std::mem::replace(&mut el.generation, ElasticGen::Gone) {
+        ElasticGen::Leased(lease) => match fence_window(gpu, lease, false) {
+            Ok(generation) => el.generation = ElasticGen::Fenced(generation),
+            Err(error) => return Err((el, format!("fencing the elastic generation: {error}"))),
+        },
+        other => el.generation = other,
+    }
+    let token = match std::mem::replace(&mut el.generation, ElasticGen::Gone) {
+        ElasticGen::Fenced(generation) => {
+            let retired = el.bank.as_mut().expect("open").retire(generation, None);
+            match retired {
+                Ok((backing, token)) => {
+                    el.generation = ElasticGen::Idle(backing);
+                    Some(token)
+                }
+                Err((generation, error)) => {
+                    el.generation = ElasticGen::Fenced(generation);
+                    return Err((el, format!("retiring the elastic generation: {error}")));
+                }
+            }
+        }
+        other => {
+            el.generation = other;
+            None
+        }
+    };
+    // Every resident slot leaves the membership and, once the generations naming it retired, goes
+    // back to `Free`; the close accepts any phase.
+    for slot in 0..el.cells.len() {
+        let cell = match el.cells[slot].take() {
+            Some(SlotCell::Resident(resident)) => {
+                let bank = el.bank.as_mut().expect("open");
+                match bank.unpublish(&mut el.staging, resident) {
+                    Ok(evicting) => SlotCell::Evicting(evicting),
+                    Err((resident, error)) => {
+                        el.cells[slot] = Some(SlotCell::Resident(resident));
+                        return Err((el, format!("unpublish of elastic slot {slot}: {error}")));
+                    }
+                }
+            }
+            Some(other) => other,
+            None => return Err((el, format!("elastic slot {slot} is in transit"))),
+        };
+        let cell = match (cell, token.as_ref()) {
+            (SlotCell::Evicting(evicting), Some(done)) => {
+                match el.bank.as_mut().expect("open").reclaim(evicting, done) {
+                    Ok(free) => SlotCell::Free(free),
+                    Err((evicting, error)) => {
+                        el.cells[slot] = Some(SlotCell::Evicting(evicting));
+                        return Err((el, format!("reclaim of elastic slot {slot}: {error}")));
+                    }
+                }
+            }
+            (cell, _) => cell,
+        };
+        el.cells[slot] = Some(cell);
+    }
+    let quiesced = {
+        let mut device = RankDevice::new(&gpu.hip);
+        match el.bank.as_mut().expect("open").quiesce(&mut device) {
+            Ok(quiesced) => quiesced,
+            Err(failure) => return Err((el, failure.message)),
+        }
+    };
+    let Some(cells) = el.cells.iter_mut().map(Option::take).collect::<Option<Vec<_>>>() else {
+        return Err((el, "an elastic slot cell is in transit".into()));
+    };
+    let bank = el.bank.take().expect("open");
+    let (block, reclaimed) = match bank.close(cells, quiesced) {
+        Ok(done) => done,
+        Err((bank, cells, error)) => {
+            el.bank = Some(bank);
+            el.cells = cells.into_iter().map(Some).collect();
+            return Err((el, format!("closing the elastic bank: {error}")));
+        }
+    };
+    match block.free(reclaimed) {
+        Ok(_extent) => {
+            if let Err(error) = gpu.release_tensor_immediate(el.pool) {
+                eprintln!("qwen4 EP elastic pool hipFree failed (the pool is leaked): {error}");
+            }
+        }
+        Err((_block, _reclaimed, error)) => {
+            eprintln!(
+                "qwen4 EP elastic pool NOT freed (it is leaked, never freed early): {error}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The elastic API of a rank's tail (the controller drives these at step boundaries).
+impl UnitTailRank {
+    /// Elastic bytes this rank's pool holds on the device (0 = none). Cheap; never syncs.
+    pub(crate) fn elastic_bytes(&self) -> u64 {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.elastic.as_ref().map_or(0, |el| el.layout.total as u64)
+    }
+
+    /// Allocate and start filling an elastic bank of at most `bytes` pool bytes (whole units, at
+    /// least 256 MiB, else `Ok(None)`). Refused (`Ok(None)`) while suspended, frozen or released,
+    /// when a bank is already lent, or when no unit is left to take. The pool is zeroed, adopted as
+    /// its own slot-bank block and the first chunk (at most 64 MiB of payload) is enqueued on the
+    /// copy stream; the rest follow from [`Self::step_end`], one chunk per window.
+    pub(crate) fn elastic_lend(
+        &self,
+        gpu: &mut Gpu,
+        bytes: u64,
+    ) -> Result<Option<ElasticReport>, String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.elastic_lend(gpu, bytes)
+    }
+
+    /// Unpublish, fence and free the bank (`Ok(None)` when none is lent): the tables are rewritten
+    /// to canonical at once, then the generation retires, the bank closes and the pool is freed.
+    /// `Err` = nothing was freed (the bank is still lent, its entries valid).
+    pub(crate) fn elastic_reclaim(
+        &self,
+        gpu: &mut Gpu,
+        why: &str,
+    ) -> Result<Option<ReclaimReport>, String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.elastic_reclaim(gpu, why, false)
+    }
+
+    /// Lab / oracle use: issue every remaining chunk, wait the copy stream and publish at once
+    /// (the reclaim's fence / retire / write / upload / seal pattern), so a bank can be measured
+    /// fully published. Returns the published units (0 when nothing is lent, or suspended, frozen
+    /// or released).
+    #[allow(dead_code)]
+    pub(crate) fn elastic_settle(&self, gpu: &mut Gpu) -> Result<usize, String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.elastic_settle(gpu)
+    }
+}
+
+impl Inner {
+    /// One `[elastic]` stderr line under `HIPFIRE_EP_ELASTIC_LOG`.
+    fn elastic_log(&self, line: impl FnOnce() -> String) {
+        if hipfire_config::memory::ep_elastic_log() {
+            eprintln!("[elastic] rank={} {}", self.rank, line());
+        }
+    }
+
+    /// See [`UnitTailRank::elastic_lend`].
+    fn elastic_lend(&mut self, gpu: &mut Gpu, bytes: u64) -> Result<Option<ElasticReport>, String> {
+        if self.released || self.suspended || self.frozen.is_some() || self.elastic.is_some() {
+            return Ok(None);
+        }
+        let t0 = Instant::now();
+        let (gub, dnb) = (self.gate_up_bytes, self.down_bytes);
+        let d2: HashSet<UnitKey> = (0..self.policy.slots())
+            .filter_map(|slot| self.policy.slot_unit(slot))
+            .collect();
+        let candidates = elastic_candidates(&self.elastic_order, &self.kinds, self.experts, &d2);
+        let slots = elastic_slot_count(bytes, gub, dnb, candidates.len());
+        let layout = elastic_layout(slots, gub, dnb);
+        if slots == 0 || layout.total < ELASTIC_MIN_BYTES {
+            return Ok(None);
+        }
+        let units = candidates[..slots].to_vec();
+        let chunks = elastic_chunks(slots, gub + dnb, ELASTIC_CHUNK_BYTES);
+        let rank = self.rank;
+        let pool = gpu.zeros(&[layout.total], DType::Raw).map_err(|error| {
+            format!(
+                "elastic lend on rank {rank}: the pool ({slots} slots, {} bytes): {error}",
+                layout.total
+            )
+        })?;
+        let el = match ElasticBank::open(
+            rank,
+            pool,
+            layout,
+            units.clone(),
+            chunks,
+            self.table_extents(),
+        ) {
+            Ok(el) => el,
+            Err((pool, why)) => {
+                let _ = gpu.release_tensor_immediate(pool);
+                return Err(format!("elastic lend on rank {rank}: {why}"));
+            }
+        };
+        let experts = self.experts;
+        for &(layer, expert) in &units {
+            self.kinds[layer as usize * experts + expert as usize] = Kind::Elastic;
+        }
+        self.elastic = Some(el);
+        // The pool's memset runs on the compute stream: the copy stream waits for it.
+        let first = self
+            .elastic_gate_copy_stream(gpu)
+            .and_then(|()| self.elastic_issue_next(gpu));
+        if let Err(error) = first {
+            // Nothing is published yet: give the bank back at once.
+            if let Err(again) = self.elastic_reclaim(gpu, "lend-failed", true) {
+                eprintln!("qwen4 EP rank {rank}: elastic lend: the failed bank was not reclaimed: {again}");
+            }
+            return Err(format!("elastic lend on rank {rank}: the first fill chunk: {error}"));
+        }
+        let ms = elapsed_ms(t0, Instant::now());
+        Ok(Some(ElasticReport {
+            units: slots,
+            bytes: layout.total as u64,
+            ms,
+        }))
+    }
+
+    /// Make the copy stream wait for everything enqueued on the compute stream so far (the pool's
+    /// memset), through the tables-ready event.
+    fn elastic_gate_copy_stream(&mut self, gpu: &Gpu) -> Result<(), String> {
+        let compute = gpu.active_stream.as_ref();
+        let ready = self.tables_ready.as_ref().ok_or("no tables event")?;
+        gpu.hip.event_record(ready, compute).map_err(io)?;
+        let stream = self.copy_stream.as_ref().ok_or("no copy stream")?;
+        gpu.hip.stream_wait_event(stream, ready).map_err(io)
+    }
+
+    /// Start the next chunk's fills and enqueue their copies on the copy stream (one fence for the
+    /// chunk). Nothing when a chunk is in flight, the bank faulted or every chunk was issued; a
+    /// slot of a later chunk stays `Free`. A failure faults the bank (no further chunks).
+    fn elastic_issue_next(&mut self, gpu: &Gpu) -> Result<(), String> {
+        let (gub, dnb) = (self.gate_up_bytes, self.down_bytes);
+        let (Some(stream), Some(el)) = (self.copy_stream.as_ref(), self.elastic.as_mut()) else {
+            return Err("no copy stream or elastic bank".into());
+        };
+        if el.pending.is_some() || el.fault.is_some() || el.next_chunk >= el.chunks.len() {
+            return Ok(());
+        }
+        let chunk = el.chunks[el.next_chunk].clone();
+        let ElasticBank {
+            pool,
+            bank,
+            cells,
+            units,
+            pending,
+            next_chunk,
+            fault,
+            ..
+        } = el;
+        let bank = bank.as_mut().expect("the elastic slot bank is open");
+        let mut tickets = Vec::with_capacity(chunk.len());
+        for slot in chunk {
+            let started = match cells[slot].take() {
+                Some(SlotCell::Free(free)) => {
+                    match bank.start_fill(free, unit_occupant(units[slot])) {
+                        Ok((filling, ticket)) => {
+                            cells[slot] = Some(SlotCell::Filling(filling));
+                            tickets.push(ticket);
+                            Ok(())
+                        }
+                        Err((free, error)) => {
+                            cells[slot] = Some(SlotCell::Free(free));
+                            Err(format!("start_fill of elastic slot {slot}: {error}"))
+                        }
+                    }
+                }
+                other => {
+                    cells[slot] = other;
+                    Err(format!("elastic slot {slot} is not free"))
+                }
+            };
+            if let Err(error) = started {
+                bank.abandon_fills(tickets);
+                *fault = Some(error.clone());
+                return Err(error);
+            }
+        }
+        let mut copy = RankCopy::new(&gpu.hip, stream, &mut self.events);
+        let (layers, layer_of, hip) = (&self.layers, &self.layer_of, &gpu.hip);
+        let pool = &*pool;
+        let issued = bank.issue_fills(tickets, &mut copy, &mut |ticket| {
+            let [gate_up, down] = ticket.write_spans() else {
+                return Err(format!(
+                    "an elastic slot has {} write spans, expected 2",
+                    ticket.write_spans().len()
+                ));
+            };
+            // The declared extent is the whole stride; the copy writes the payload only.
+            let payload = [
+                Binding {
+                    base: gate_up.base,
+                    bytes: gub as u64,
+                },
+                Binding {
+                    base: down.base,
+                    bytes: dnb as u64,
+                },
+            ];
+            copy_unit_to_spans(
+                hip,
+                stream,
+                pool,
+                layers,
+                layer_of,
+                (gub, dnb),
+                occupant_unit(ticket.occupant()),
+                &payload,
+            )
+        });
+        match issued {
+            Ok(batch) => {
+                *pending = Some(batch);
+                *next_chunk += 1;
+                Ok(())
+            }
+            Err((tickets, failure)) => {
+                bank.abandon_fills(tickets);
+                *fault = Some(failure.message.clone());
+                Err(failure.message)
+            }
+        }
+    }
+
+    /// Every window: poll the chunk in flight (never wait); once its fence completed, its fills
+    /// are ready to publish at the next retirement and the next chunk is issued.
+    fn elastic_advance(&mut self, gpu: &Gpu) {
+        let rank = self.rank;
+        let result = (|| -> Result<(), String> {
+            let (Some(stream), Some(el)) = (self.copy_stream.as_ref(), self.elastic.as_mut())
+            else {
+                return Ok(());
+            };
+            if let Some(batch) = el.pending.take() {
+                let mut copy = RankCopy::new(&gpu.hip, stream, &mut self.events);
+                let polled = el
+                    .bank
+                    .as_mut()
+                    .expect("the elastic slot bank is open")
+                    .complete_fills(batch, &mut copy, false);
+                match polled {
+                    Ok(done) => el.ready.extend(done),
+                    Err(FillsNotDone::Pending(batch)) => {
+                        el.pending = Some(batch);
+                        return Ok(());
+                    }
+                    Err(FillsNotDone::Failed { failure, .. }) => {
+                        el.fault = Some(failure.message.clone());
+                        return Err(failure.message);
+                    }
+                }
+            }
+            self.elastic_issue_next(gpu)
+        })();
+        if let Err(error) = result {
+            eprintln!(
+                "qwen4 EP rank {rank}: elastic fill stopped: {error}; the chunks published so far stay valid until the bank is reclaimed"
+            );
+        }
+    }
+
+    /// Host-wait the chunk in flight (reclaim / settle): its completions become ready tokens. An
+    /// error leaves the bank allocated (the copies may still run).
+    fn elastic_wait_pending(&mut self, gpu: &Gpu) -> Result<(), String> {
+        let (Some(stream), Some(el)) = (self.copy_stream.as_ref(), self.elastic.as_mut()) else {
+            return Ok(());
+        };
+        let Some(batch) = el.pending.take() else {
+            return Ok(());
+        };
+        let mut copy = RankCopy::new(&gpu.hip, stream, &mut self.events);
+        let waited = el
+            .bank
+            .as_mut()
+            .expect("the elastic slot bank is open")
+            .complete_fills(batch, &mut copy, true);
+        match waited {
+            Ok(done) => {
+                el.ready.extend(done);
+                Ok(())
+            }
+            Err(FillsNotDone::Pending(batch)) => {
+                el.pending = Some(batch);
+                Err("the elastic chunk is still pending after a blocking wait".into())
+            }
+            Err(FillsNotDone::Failed { failure, .. }) => {
+                el.fault = Some(failure.message.clone());
+                Err(failure.message)
+            }
+        }
+    }
+
+    /// Fence the window of the leased elastic generation (the compute stream's synchronize) and
+    /// keep it fenced, ready to retire. Nothing when it is not leased. A failed fence quarantines
+    /// the generation (the pool then stays allocated for good) and faults the bank.
+    fn elastic_fence_lease(&mut self, gpu: &Gpu) -> Result<(), String> {
+        let Some(el) = self.elastic.as_mut() else {
+            return Ok(());
+        };
+        match std::mem::replace(&mut el.generation, ElasticGen::Gone) {
+            ElasticGen::Leased(lease) => match fence_window(gpu, lease, false) {
+                Ok(generation) => {
+                    el.generation = ElasticGen::Fenced(generation);
+                    Ok(())
+                }
+                Err(error) => {
+                    el.fault = Some(error.clone());
+                    Err(format!("fencing the elastic generation: {error}"))
+                }
+            },
+            other => {
+                el.generation = other;
+                Ok(())
+            }
+        }
+    }
+
+    /// Inside a retirement, after the window fence: when completed chunks wait for publication,
+    /// fence the elastic generation too (the retirement's drain already idled the stream). A
+    /// failure drops the waiting completions (the bank is faulted, never published past it).
+    fn elastic_prepare_publish(&mut self, gpu: &Gpu) {
+        if !self.elastic.as_ref().is_some_and(|el| !el.ready.is_empty()) {
+            return;
+        }
+        if let Err(error) = self.elastic_fence_lease(gpu) {
+            eprintln!(
+                "qwen4 EP rank {}: elastic publish skipped: {error}",
+                self.rank
+            );
+            if let Some(el) = self.elastic.as_mut() {
+                el.ready.clear();
+            }
+        }
+    }
+
+    /// Inside a retirement (`backing` is the tables' write capability): finish the completed
+    /// fills, stage them and point their table entries at their slots. Layers written go into
+    /// `touched` (the retirement uploads them). Returns the units published now.
+    fn elastic_publish(&mut self, backing: &TableBacking, touched: &mut HashSet<usize>) -> usize {
+        let rank = self.rank;
+        let Some(el) = self.elastic.as_mut() else {
+            return 0;
+        };
+        if el.ready.is_empty() {
+            return 0;
+        }
+        let ready = std::mem::take(&mut el.ready);
+        let mut published = 0usize;
+        for done in ready {
+            let slot = done.slot() as usize;
+            let index = el
+                .units
+                .get(slot)
+                .and_then(|unit| self.layer_of.get(unit.0 as usize).copied().flatten());
+            let Some(index) = index else {
+                eprintln!("qwen4 EP rank {rank}: elastic slot {slot} names no managed layer; not published");
+                continue;
+            };
+            match el.finish_publish(done) {
+                Ok(unit) => {
+                    let (gate_up, down) = el.slot_addresses(slot);
+                    self.layers[index].set(backing, unit.1 as usize, gate_up, down);
+                    touched.insert(index);
+                    published += 1;
+                }
+                Err(error) => {
+                    el.fault.get_or_insert_with(|| error.clone());
+                    eprintln!("qwen4 EP rank {rank}: elastic publish: {error}");
+                }
+            }
+        }
+        if published > 0 {
+            let total = el.published.iter().filter(|&&p| p).count();
+            let slots = el.units.len();
+            self.elastic_log(|| format!("publish +{published} published={total}/{slots}"));
+        }
+        published
+    }
+
+    /// After the D2 generation was sealed over the tables just written: retire the elastic
+    /// generation of the previous window (fenced by this retirement's drain) and seal a new one
+    /// over every published member, leased to the windows that follow. Never fails the
+    /// retirement: a refusal is logged and the bank keeps its (valid) entries.
+    fn elastic_reseal(&mut self) {
+        let rank = self.rank;
+        let Some(el) = self.elastic.as_mut() else {
+            return;
+        };
+        let backing = match std::mem::replace(&mut el.generation, ElasticGen::Gone) {
+            ElasticGen::Fenced(generation) => {
+                match el.bank.as_mut().expect("the elastic slot bank is open").retire(generation, None) {
+                    Ok((backing, _retired)) => backing,
+                    Err((generation, error)) => {
+                        el.generation = ElasticGen::Fenced(generation);
+                        eprintln!("qwen4 EP rank {rank}: elastic generation did not retire: {error}");
+                        return;
+                    }
+                }
+            }
+            ElasticGen::Idle(backing) => backing,
+            other => {
+                // Leased (nothing was published since) or lost: nothing to do.
+                el.generation = other;
+                return;
+            }
+        };
+        if el.staging.is_empty() {
+            el.generation = ElasticGen::Idle(backing);
+            return;
+        }
+        if let Err(error) = el.seal_leased(backing) {
+            eprintln!("qwen4 EP rank {rank}: elastic generation: {error}");
+        }
+    }
+
+    /// Put every published elastic unit's table entries back to its slot and note them dirty: the
+    /// state a failed table rewrite restores, so the next upload resends them.
+    fn elastic_reassert(&mut self, backing: &TableBacking) {
+        let Some(el) = self.elastic.as_ref() else {
+            return;
+        };
+        for (unit, slot) in el.published_units() {
+            let (gate_up, down) = el.slot_addresses(slot);
+            if let Some(index) = self.layer_of[unit.0 as usize] {
+                let layer = &mut self.layers[index];
+                layer.set(backing, unit.1 as usize, gate_up, down);
+                layer.note_dirty(unit.1 as usize);
+            }
+        }
+    }
+
+    /// Upload the changed entry ranges of the table images of layers `order` on the compute
+    /// stream; `backing` is the write capability.
+    fn upload_layers(
+        &mut self,
+        gpu: &Gpu,
+        backing: &TableBacking,
+        order: &[usize],
+    ) -> Result<(), String> {
+        let compute = gpu.active_stream.as_ref();
+        let (mut calls, mut bytes) = (0u64, 0u64);
+        for &index in order {
+            let layer = &mut self.layers[index];
+            let mut layer_calls = 0u64;
+            let mut upload = |image: &mut TableImage, table: &GpuTensor| -> Result<(), String> {
+                let sent = image.upload_dirty(backing, gpu, table, compute)?;
+                if sent > 0 {
+                    layer_calls += 1;
+                    bytes += sent as u64;
+                }
+                Ok(())
+            };
+            upload(&mut layer.image_gate_up, &layer.table_gate_up)?;
+            upload(&mut layer.image_down, &layer.table_down)?;
+            if let Some(full) = layer.full.as_mut() {
+                upload(&mut full.image_gate_up, &full.table_gate_up)?;
+                upload(&mut full.image_down, &full.table_down)?;
+            }
+            if layer_calls > 0 {
+                calls += layer_calls;
+                self.uploads += 1;
+            }
+        }
+        self.upload_calls += calls;
+        self.upload_bytes += bytes;
+        Ok(())
+    }
+
+    /// Rewrite the tables NOW, between windows (the stream otherwise idle): the borrow resume's
+    /// pattern. The elastic and the D2 generations' windows are fenced and the D2 generation
+    /// retires (its backing comes back), `edit` writes the table images through the backing and
+    /// names the layers touched, their changed ranges upload on the compute stream and the stream
+    /// syncs, and the D2 generation is sealed again as `{ epoch, sub + 1 }` and leased. The D2
+    /// generation is sealed again after a failed edit or upload too (every entry then names a
+    /// canonical pointer or a complete slot; the published elastic entries are re-asserted and
+    /// marked dirty), and the error is returned.
+    fn rewrite_tables_now(
+        &mut self,
+        gpu: &mut Gpu,
+        edit: impl FnOnce(&mut Self, &TableBacking) -> Result<HashSet<usize>, String>,
+    ) -> Result<(), String> {
+        if self.released || self.suspended {
+            return Err("the tail is released or suspended".into());
+        }
+        self.elastic_fence_lease(gpu)?;
+        self.fence_and_retire(gpu, false)?;
+        let backing = self
+            .backing
+            .take()
+            .ok_or("the tail's table backing is not held")?;
+        let edited = edit(self, &backing).and_then(|touched| {
+            let mut order: Vec<usize> = touched.into_iter().collect();
+            order.sort_unstable();
+            self.upload_layers(gpu, &backing, &order)?;
+            match gpu.active_stream.as_ref() {
+                Some(stream) => gpu.hip.stream_synchronize(stream).map_err(io),
+                None => gpu.hip.device_synchronize().map_err(io),
+            }
+        });
+        if edited.is_err() {
+            self.elastic_reassert(&backing);
+        }
+        let id = GenerationId {
+            epoch: self.last_gen.epoch,
+            sub: self.last_gen.sub + 1,
+        };
+        let generation = match self.policy.seal(backing, id) {
+            Ok(generation) => generation,
+            Err((backing, error)) => {
+                self.backing = Some(backing);
+                return Err(format!("sealing generation {id:?}: {error}"));
+            }
+        };
+        match acquire_window_owned(generation) {
+            Ok(lease) => {
+                self.lease = Some(lease);
+                self.last_gen = id;
+            }
+            Err((generation, error)) => {
+                self.fenced = Some(generation);
+                return Err(format!("leasing generation {id:?}: {error}"));
+            }
+        }
+        edited
+    }
+
+    /// See [`UnitTailRank::elastic_reclaim`]; `log` prints the `[elastic] reclaim` line (the
+    /// controller prints its own for the public call).
+    fn elastic_reclaim(
+        &mut self,
+        gpu: &mut Gpu,
+        why: &str,
+        log: bool,
+    ) -> Result<Option<ReclaimReport>, String> {
+        if self.elastic.is_none() {
+            return Ok(None);
+        }
+        let result = self.elastic_reclaim_inner(gpu);
+        match &result {
+            Ok(Some(report)) if log => self.elastic_log(|| {
+                format!(
+                    "reclaim why={why} units={} bytes={} wait_ms={:.2} tables_ms={:.2} free_ms={:.2} total_ms={:.2}",
+                    report.units, report.bytes, report.wait_ms, report.tables_ms, report.free_ms,
+                    report.total_ms
+                )
+            }),
+            Err(error) => {
+                let rank = self.rank;
+                if let Some(el) = self.elastic.as_mut().filter(|el| !el.reclaim_logged) {
+                    el.reclaim_logged = true;
+                    eprintln!(
+                        "qwen4 EP rank {rank}: elastic reclaim ({why}) failed; the bank stays allocated with valid entries: {error}"
+                    );
+                }
+            }
+            Ok(_) => {}
+        }
+        result
+    }
+
+    fn elastic_reclaim_inner(&mut self, gpu: &mut Gpu) -> Result<Option<ReclaimReport>, String> {
+        let t0 = Instant::now();
+        // The chunk in flight finishes before anything is torn down.
+        self.elastic_wait_pending(gpu)?;
+        let t_wait = Instant::now();
+        let published = self
+            .elastic
+            .as_ref()
+            .map(ElasticBank::published_units)
+            .unwrap_or_default();
+        if !published.is_empty() {
+            self.rewrite_tables_now(gpu, |this, backing| {
+                let mut touched = HashSet::new();
+                for &(unit, _slot) in &published {
+                    let (layer, expert) = (unit.0 as usize, unit.1 as usize);
+                    let index = this.layer_of[layer].ok_or("an elastic unit names an unmanaged layer")?;
+                    let tail = &mut this.layers[index];
+                    let (gate_up, down) = (tail.canon_gate_up[expert], tail.canon_down[expert]);
+                    tail.set(backing, expert, gate_up, down);
+                    touched.insert(index);
+                }
+                Ok(touched)
+            })?;
+            // The canonical upload is synced: no table names an elastic slot any more.
+            if let Some(el) = self.elastic.as_mut() {
+                el.published.fill(false);
+            }
+        }
+        let t_tables = Instant::now();
+        let Some(el) = self.elastic.take() else {
+            return Ok(None);
+        };
+        let (units, bytes) = (el.layout.slots, el.layout.total as u64);
+        let unit_keys = el.units.clone();
+        if let Err((el, error)) = teardown_elastic(gpu, el) {
+            self.elastic = Some(el);
+            return Err(error);
+        }
+        for (layer, expert) in unit_keys {
+            let at = layer as usize * self.experts + expert as usize;
+            if self.kinds[at] == Kind::Elastic {
+                self.kinds[at] = Kind::Tail;
+            }
+        }
+        let t_end = Instant::now();
+        Ok(Some(ReclaimReport {
+            units,
+            bytes,
+            wait_ms: elapsed_ms(t0, t_wait),
+            tables_ms: elapsed_ms(t_wait, t_tables),
+            free_ms: elapsed_ms(t_tables, t_end),
+            total_ms: elapsed_ms(t0, t_end),
+        }))
+    }
+
+    /// See [`UnitTailRank::elastic_settle`].
+    fn elastic_settle(&mut self, gpu: &mut Gpu) -> Result<usize, String> {
+        if self.released || self.suspended || self.frozen.is_some() || self.elastic.is_none() {
+            return Ok(0);
+        }
+        // Every chunk, one at a time: the copy stream drains before the next is issued.
+        loop {
+            self.elastic_wait_pending(gpu)?;
+            let Some(el) = self.elastic.as_ref() else {
+                return Ok(0);
+            };
+            if let Some(fault) = el.fault.as_ref() {
+                return Err(fault.clone());
+            }
+            if el.next_chunk >= el.chunks.len() {
+                break;
+            }
+            self.elastic_issue_next(gpu)?;
+        }
+        let waiting = self.elastic.as_ref().map_or(0, |el| el.ready.len());
+        if waiting > 0 {
+            let rewritten = self.rewrite_tables_now(gpu, |this, backing| {
+                let mut touched = HashSet::new();
+                this.elastic_publish(backing, &mut touched);
+                Ok(touched)
+            });
+            self.elastic_reseal();
+            rewritten?;
+        }
+        let published = self
+            .elastic
+            .as_ref()
+            .map_or(0, |el| el.published.iter().filter(|&&p| p).count());
+        let slots = self.elastic.as_ref().map_or(0, |el| el.units.len());
+        self.elastic_log(|| format!("settle published={published}/{slots}"));
+        Ok(published)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3250,6 +4366,11 @@ mod tests {
         EpUnitTailConfig, PeerBoard, PeerDelta, PinDelta, Retire, RetireCadence, SlotPhase,
         TailPolicy, UnitKey, WindowUse,
     };
+    use super::{
+        elastic_candidates, elastic_chunks, elastic_layout, elastic_order, elastic_slot_addresses,
+        elastic_slot_count, elastic_spans, Kind, ELASTIC_CHUNK_BYTES,
+    };
+    use std::collections::HashSet;
     use std::collections::HashMap;
 
     fn image(entries: &[u64]) -> Vec<u8> {
@@ -4124,6 +5245,8 @@ mod tests {
             last_gen: GenerationId { epoch: 0, sub: 0 },
             lent: None,
             skew: None,
+            elastic_order: Vec::new(),
+            elastic: None,
         }
     }
 
@@ -4269,5 +5392,182 @@ mod tests {
         assert_eq!(first_difference(b"abcd", b"abxd"), Some(2));
         assert_eq!(first_difference(b"abcd", b"abc"), Some(3));
         assert_eq!(first_difference(b"", b"a"), Some(0));
+    }
+
+    /// `len` kinds, `Foreign` except the listed ids.
+    fn kinds_of(spec: &[(usize, Kind)], len: usize) -> Vec<Kind> {
+        let mut kinds = vec![Kind::Foreign; len];
+        for &(id, kind) in spec {
+            kinds[id] = kind;
+        }
+        kinds
+    }
+
+    #[test]
+    fn elastic_order_is_counts_descending_then_id_and_skips_non_tail_units() {
+        // 2 layers x 4 experts (ids 0..8): id 3 is core, id 4 foreign, id 7 host-only.
+        let kinds = kinds_of(
+            &[
+                (0, Kind::Tail),
+                (1, Kind::Tail),
+                (2, Kind::Tail),
+                (3, Kind::Core),
+                (5, Kind::Tail),
+                (6, Kind::Tail),
+                (7, Kind::HostOnly),
+            ],
+            8,
+        );
+        let counts = [5u64, 9, 0, 100, 100, 9, 3, 100];
+        // Count descending (the 100s belong to non-tail units), ties by ascending id (ids 1 and
+        // 5 both count 9), a zero count never.
+        let order = elastic_order(4, &kinds, &[], Some(&counts));
+        assert_eq!(order, [(0, 1), (1, 1), (0, 0), (1, 2)]);
+        // Units a D2 slot holds or fills are skipped at the lend.
+        let d2: HashSet<UnitKey> = HashSet::from([(1, 1)]);
+        assert_eq!(
+            elastic_candidates(&order, &kinds, 4, &d2),
+            [(0, 1), (0, 0), (1, 2)]
+        );
+        // A unit an elastic bank already holds is no candidate.
+        let mut lent = kinds.clone();
+        lent[1] = Kind::Elastic;
+        assert_eq!(
+            elastic_candidates(&order, &lent, 4, &HashSet::new()),
+            [(1, 1), (0, 0), (1, 2)]
+        );
+        // Counts shorter than the unit space: the missing ids have no count.
+        assert_eq!(
+            elastic_order(4, &kinds, &[], Some(&counts[..2])),
+            [(0, 1), (0, 0)]
+        );
+    }
+
+    #[test]
+    fn elastic_order_without_counts_is_the_d2_ranking_of_tail_units() {
+        let kinds = kinds_of(
+            &[
+                (0, Kind::Tail),
+                (1, Kind::Tail),
+                (2, Kind::Tail),
+                (3, Kind::Core),
+                (5, Kind::Tail),
+                (6, Kind::Tail),
+            ],
+            8,
+        );
+        // The ranking names a core unit (0, 3) and a foreign one (1, 0): neither is a candidate.
+        let ranking: Vec<UnitKey> = vec![(1, 2), (0, 3), (0, 0), (1, 0), (1, 1), (0, 2)];
+        let order = elastic_order(4, &kinds, &ranking, None);
+        assert_eq!(order, [(1, 2), (0, 0), (1, 1), (0, 2)]);
+        let d2: HashSet<UnitKey> = HashSet::from([(0, 0)]);
+        assert_eq!(
+            elastic_candidates(&order, &kinds, 4, &d2),
+            [(1, 2), (1, 1), (0, 2)]
+        );
+    }
+
+    #[test]
+    fn elastic_layout_declares_whole_strides_that_cover_the_w3_down_overread() {
+        // The shipped W3 down tensor [2560 x 640] is 640_000 B and the kernel reads 2 B past it;
+        // an odd gate/up size exercises the rounding.
+        let (gub, dnb, slots) = (1_280_001usize, 640_000usize, 7usize);
+        let layout = elastic_layout(slots, gub, dnb);
+        assert_eq!(layout.gate_up_stride % 256, 0);
+        assert_eq!(layout.down_stride % 256, 0);
+        assert_eq!(layout.down_offset % 256, 0);
+        assert!(layout.gate_up_stride >= gub + 256 && layout.down_stride >= dnb + 256);
+        assert_eq!(layout.down_offset, slots * layout.gate_up_stride);
+        assert_eq!(layout.total, layout.down_offset + slots * layout.down_stride);
+        let reach = crate::expert_arena::w3_max_read_end(2560, 640);
+        assert!(reach > dnb, "the down kernel over-reads its payload");
+        let spans = elastic_spans(&layout);
+        assert_eq!(spans.len(), slots);
+        let mut all: Vec<(u64, u64)> = Vec::new();
+        for (slot, slot_spans) in spans.iter().enumerate() {
+            assert_eq!(slot_spans.len(), 2);
+            let (gate_up, down) = (slot_spans[0], slot_spans[1]);
+            assert!(gate_up.bytes as usize >= gub + 256);
+            // The over-read of a down tensor at the slot's start ends inside its own extent.
+            assert!(down.bytes as usize >= reach, "slot {slot}: {} < {reach}", down.bytes);
+            for span in slot_spans {
+                assert_eq!(span.offset % 256, 0);
+                all.push((span.offset, span.bytes));
+            }
+            let (gate_up_at, down_at) = elastic_slot_addresses(0x1000, &layout, slot);
+            assert_eq!(gate_up_at - 0x1000, gate_up.offset);
+            assert_eq!(down_at - 0x1000, down.offset);
+        }
+        // Disjoint, inside the pool, and exactly tiling it.
+        all.sort_unstable();
+        assert_eq!(all[0].0, 0);
+        for pair in all.windows(2) {
+            assert_eq!(pair[0].0 + pair[0].1, pair[1].0);
+        }
+        let last = all[all.len() - 1];
+        assert_eq!((last.0 + last.1) as usize, layout.total);
+    }
+
+    #[test]
+    fn elastic_chunks_cover_every_slot_once_within_the_chunk_budget() {
+        let payload = 1_920_001usize;
+        for slots in [0usize, 1, 33, 34, 35, 700] {
+            let chunks = elastic_chunks(slots, payload, ELASTIC_CHUNK_BYTES);
+            let mut next = 0;
+            for chunk in &chunks {
+                assert_eq!(chunk.start, next);
+                assert!(!chunk.is_empty());
+                assert!(chunk.len() * payload <= ELASTIC_CHUNK_BYTES);
+                next = chunk.end;
+            }
+            assert_eq!(next, slots);
+        }
+        // 64 MiB holds 34 such units.
+        let lens: Vec<usize> = elastic_chunks(100, payload, ELASTIC_CHUNK_BYTES)
+            .iter()
+            .map(|chunk| chunk.len())
+            .collect();
+        assert_eq!(lens, [34, 34, 32]);
+        // A unit larger than the budget still goes one per chunk.
+        assert_eq!(
+            elastic_chunks(3, ELASTIC_CHUNK_BYTES + 1, ELASTIC_CHUNK_BYTES).len(),
+            3
+        );
+        // Whole units of the pool bytes, never more than the candidates.
+        let per_slot = {
+            let layout = elastic_layout(1, 1_280_001, 640_000);
+            layout.total as u64
+        };
+        assert_eq!(elastic_slot_count(10 * per_slot + 5, 1_280_001, 640_000, 100), 10);
+        assert_eq!(elastic_slot_count(10 * per_slot, 1_280_001, 640_000, 3), 3);
+        assert_eq!(elastic_slot_count(per_slot - 1, 1_280_001, 640_000, 3), 0);
+    }
+
+    #[test]
+    fn an_elastic_unit_is_never_a_live_slot_unit() {
+        let canon_gu = [100u64, 200, 300];
+        let canon_dn = [10u64, 20, 30];
+        // Expert 0 is served by a D2 slot, expert 1 by a published elastic slot, expert 2 is
+        // canonical.
+        let kinds = [Kind::Tail, Kind::Elastic, Kind::Tail];
+        let mut img_gu = canon_gu;
+        let mut img_dn = canon_dn;
+        img_gu[0] = 7000;
+        img_dn[0] = 8000;
+        img_gu[1] = 9000;
+        img_dn[1] = 9100;
+        let live = live_slot_units(
+            |expert| kinds[expert] == Kind::Tail,
+            (&canon_gu, &canon_dn),
+            (&image(&img_gu), &image(&img_dn)),
+        );
+        assert_eq!(
+            live,
+            [LiveSlot {
+                expert: 0,
+                canon: [100, 10],
+                slot: [7000, 8000],
+            }]
+        );
     }
 }

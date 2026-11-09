@@ -7668,6 +7668,32 @@ mod tests {
     }
 
     #[test]
+    fn ep_elastic_cap_is_default_unless_zero_or_a_positive_integer() {
+        use memory::parse_ep_elastic_cap_bytes as parse;
+        assert_eq!(parse(None), Ok(1280 << 20));
+        assert_eq!(parse(Some("0")), Ok(0));
+        assert_eq!(parse(Some("")), Ok(0));
+        assert_eq!(parse(Some(" 512 ")), Ok(512 << 20));
+        for bad in ["-1", "1.5", "lots", "0x10", "99999999999999999999"] {
+            let error = parse(Some(bad)).unwrap_err();
+            assert!(error.contains("HIPFIRE_EP_ELASTIC_MIB"), "{bad}: {error}");
+        }
+        assert!(parse(Some("18446744073709551615"))
+            .unwrap_err()
+            .contains("overflows"));
+        assert_eq!(memory::ep_elastic_cap_bytes(), Ok(1280 << 20));
+        assert!(!memory::ep_elastic_log());
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_EP_ELASTIC_MIB").as_deref(),
+            Some("developer.ep_elastic_mib")
+        );
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_EP_ELASTIC_LOG").as_deref(),
+            Some("developer.ep_elastic_log")
+        );
+    }
+
+    #[test]
     fn qwen4_sp_is_a_typed_bool_developer_key_unset_follows_the_arch_default() {
         const KEY: &str = "developer.qwen4_sp";
         const ENV: &str = "HIPFIRE_QWEN4_SP";
@@ -11543,6 +11569,44 @@ pub mod memory {
                 )),
             },
         }
+    }
+
+    /// Environment variable of the elastic reserve's cap: [`ep_elastic_cap_bytes`].
+    pub const EP_ELASTIC_MIB_ENV: &str = "HIPFIRE_EP_ELASTIC_MIB";
+    /// Environment variable of the elastic reserve's stderr log: [`ep_elastic_log`].
+    pub const EP_ELASTIC_LOG_ENV: &str = "HIPFIRE_EP_ELASTIC_LOG";
+    /// Default cap of the elastic reserve per rank: 1,280 MiB.
+    pub const EP_ELASTIC_DEFAULT_MIB: u64 = 1280;
+
+    /// Developer variable `HIPFIRE_EP_ELASTIC_MIB` of the Flash-Next EP2 elastic reserve (the
+    /// extra resident routed experts lent from idle VRAM): unset is the default cap of
+    /// [`EP_ELASTIC_DEFAULT_MIB`] MiB per rank, `0` (or blank) turns the reserve off, a positive
+    /// integer is the cap in MiB per rank. Returns the cap in bytes, `0` = off. A non-integer is a
+    /// policy error. Read once per load.
+    pub fn ep_elastic_cap_bytes() -> Result<u64, String> {
+        parse_ep_elastic_cap_bytes(process_value(EP_ELASTIC_MIB_ENV).as_deref())
+    }
+
+    /// Pure parse behind [`ep_elastic_cap_bytes`].
+    pub fn parse_ep_elastic_cap_bytes(raw: Option<&str>) -> Result<u64, String> {
+        match raw.map(str::trim) {
+            None => Ok(EP_ELASTIC_DEFAULT_MIB << 20),
+            Some("") => Ok(0),
+            Some(value) => match value.parse::<u64>() {
+                Ok(mib) => mib.checked_mul(1 << 20).ok_or_else(|| {
+                    format!("{EP_ELASTIC_MIB_ENV}={value:?} overflows a byte count")
+                }),
+                Err(_) => Err(format!(
+                    "{EP_ELASTIC_MIB_ENV}={value:?} is not a non-negative integer (MiB per rank)"
+                )),
+            },
+        }
+    }
+
+    /// Developer bool `HIPFIRE_EP_ELASTIC_LOG` (default off): one stderr line per elastic lend,
+    /// publish, reclaim and cache release.
+    pub fn ep_elastic_log() -> bool {
+        super::developer_bool(EP_ELASTIC_LOG_ENV, false)
     }
 
     /// Developer `HIPFIRE_LOAD_WEIGHT_DIGEST=<path>`: when set and not blank,

@@ -2234,7 +2234,9 @@ pub struct Qwen4LaneStore {
     /// the lane is released.
     page_reserved: Vec<usize>,
     /// A prompt tile past the first chunk has run on this store's device
-    /// ([`pages`]): sticky, never cleared.
+    /// ([`pages`]): sticky, never cleared. Only the rule without the elastic reserve reads
+    /// it; with the reserve a rank is warm exactly while the long-prefill caches are resident
+    /// ([`pages::lane_warm`]).
     pub(crate) long_prefill_seen: std::sync::atomic::AtomicBool,
 }
 
