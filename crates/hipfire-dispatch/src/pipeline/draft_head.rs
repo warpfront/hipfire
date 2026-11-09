@@ -14,7 +14,7 @@ use super::layer_ops::{execute_argmax, hip, project_weight};
 use crate::families::gemv::WeightRef;
 use crate::types::DispatchError;
 use hip_bridge::DeviceBuffer;
-use rdna_compute::gemv::TOPK8_GROUPS;
+use rdna_compute::gemv::{TOPK8_GROUPS, TOPK8_ROWS_MAX};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use smallvec::SmallVec;
 use std::ffi::c_void;
@@ -284,6 +284,17 @@ fn ranking(
     }
 }
 
+/// Bytes of the re-score partial scratch: one slot, and for an MQ6G256V2 head
+/// [`TOPK8_ROWS_MAX`] slots, the row-batched re-score's (`HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS`;
+/// slot 0 is the one-row launch's scratch).
+fn partial_bytes(head_dtype: DType) -> usize {
+    if head_dtype == DType::MQ6G256V2 {
+        TOPK8_ROWS_MAX * Gpu::TOPK8_PARTIAL_BYTES
+    } else {
+        Gpu::TOPK8_PARTIAL_BYTES
+    }
+}
+
 /// Maximal runs `(start, len)` of `members` (ascending row ids) that are consecutive row ids:
 /// each run's rows are adjacent in the hidden rows and, as batch slots `start..start + len`,
 /// adjacent in the rotation rows, so one batched rotation launch covers it.
@@ -367,7 +378,7 @@ impl DraftHead {
             scratch.push(values);
         }
         if rescore {
-            resident.push(Gpu::TOPK8_PARTIAL_BYTES);
+            resident.push(partial_bytes(head_dtype));
         }
         resident.push(layout.vocab.checked_mul(std::mem::size_of::<f32>())?);
         resident.push(Gpu::TOPK8_OUT_BYTES);
@@ -398,7 +409,7 @@ impl DraftHead {
                 owned.push(gpu.requant_g256_rows(head, vocab, layout.hidden, format, ranges)?);
             }
             if rescore {
-                owned.push(gpu.zeros(&[Gpu::TOPK8_PARTIAL_BYTES], DType::Raw)?);
+                owned.push(gpu.zeros(&[partial_bytes(head.dtype)], DType::Raw)?);
             }
             owned.push(gpu.zeros(&[layout.vocab], DType::F32)?);
             owned.push(gpu.zeros(&[Gpu::TOPK8_OUT_BYTES], DType::Raw)?);
@@ -644,6 +655,58 @@ impl DraftHead {
                     let x = rotation_rows.sub_offset(0, count * hidden);
                     let y = logits_rows.sub_offset(0, count * ranked);
                     hip(gpu.gemv_mq2g256v2_xbatch(copy, &x, &y, ranked, hidden, count))?;
+                    let rows_batched = gpu.flags.qwen4_draft_topk8_rows_enabled()
+                        && head.dtype == DType::MQ6G256V2
+                        && self.partial.as_ref().is_some_and(|partial| {
+                            partial.byte_size() >= TOPK8_ROWS_MAX * Gpu::TOPK8_PARTIAL_BYTES
+                        });
+                    if rows_batched {
+                        // `HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS`: one partial + re-score launch pair
+                        // per run of consecutive rows (at most `TOPK8_ROWS_MAX`), each row its
+                        // own partial slot and output slot, bytes of the one-row pair.
+                        let partial = self.partial.as_ref().expect("re-score partial");
+                        for (start, len) in consecutive_runs(&members) {
+                            let mut at = 0;
+                            while at < len {
+                                let take = (len - at).min(TOPK8_ROWS_MAX);
+                                let first = start + at;
+                                let out = top1_out.sub_offset(members[first] * slot, take * slot);
+                                if take == 1 {
+                                    let logits_row = logits_rows.sub_offset(first * ranked, ranked);
+                                    let rotated = rotation_rows.sub_offset(first * hidden, hidden);
+                                    hip(gpu.topk8_rescore_k2560(
+                                        &logits_row,
+                                        ranked,
+                                        order,
+                                        head,
+                                        &rotated,
+                                        partial,
+                                        &out,
+                                    ))?;
+                                } else {
+                                    let logits_run =
+                                        logits_rows.sub_offset(first * ranked, take * ranked);
+                                    let rotated_run =
+                                        rotation_rows.sub_offset(first * hidden, take * hidden);
+                                    hip(gpu.topk8_rescore_k2560_rows(
+                                        &logits_run,
+                                        ranked,
+                                        take,
+                                        ranked,
+                                        order,
+                                        head,
+                                        &rotated_run,
+                                        hidden,
+                                        partial,
+                                        &out,
+                                        slot,
+                                    ))?;
+                                }
+                                at += take;
+                            }
+                        }
+                        continue;
+                    }
                     for (slot_in_batch, &row) in members.iter().enumerate() {
                         let logits_row = logits_rows.sub_offset(slot_in_batch * ranked, ranked);
                         let out = top1_out.sub_offset(row * slot, slot);

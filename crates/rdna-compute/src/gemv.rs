@@ -18,6 +18,10 @@ pub const LANE_WMMA_MIN_ROWS: usize = 16;
 /// Groups (partial blocks) of the draft-head top-8 reduction: `topk8_partial_f32` always
 /// runs 128 blocks of `ceil(n / 128)` layout rows, whichever launches produce them.
 pub const TOPK8_GROUPS: usize = 128;
+/// Most rows one [`Gpu::topk8_rescore_k2560_rows`] launch pair covers.
+pub const TOPK8_ROWS_MAX: usize = 8;
+/// Module of the row-batched draft-head re-score kernels.
+const TOPK8_ROWS_MODULE: &str = "topk8_rows_mq6g256v2";
 
 // The hybrid-buffer MoE gate/up kernel stays compiled but is never selected:
 // see `crate::gemm::miscompiled_optin_decision`.
@@ -22458,6 +22462,162 @@ impl Gpu {
             },
         )?;
         self.topk8_rescore_only(partial, head, x, out)
+    }
+
+    /// The first launch of [`Gpu::topk8_rescore_k2560_rows`] alone: `topk8_partial_f32_rows` over
+    /// `rows` logits rows (`logits_rows[r * v_stride ..][..n]`), row `r`'s pv / pi into slot `r`
+    /// of `partial_rows` ([`Gpu::TOPK8_PARTIAL_BYTES`] each), byte for byte the slot
+    /// `topk8_partial_f32` leaves for that row. No re-score runs (a row with fewer than 8 non-NaN
+    /// logits leaves sentinel token ids no re-score may consume).
+    pub fn topk8_partial_rows(
+        &mut self,
+        logits_rows: &GpuTensor,
+        v_stride: usize,
+        rows: usize,
+        n: usize,
+        order: (usize, usize, usize),
+        partial_rows: &GpuTensor,
+    ) -> HipResult<()> {
+        let chunk = n.div_ceil(TOPK8_GROUPS);
+        let last = rows.saturating_sub(1);
+        if rows == 0
+            || rows > TOPK8_ROWS_MAX
+            || chunk > 2048
+            || v_stride > i32::MAX as usize
+            || logits_rows.numel() < last * v_stride + n
+            || partial_rows.buf.size() < rows * Self::TOPK8_PARTIAL_BYTES
+        {
+            return Err(hip_bridge::HipError::new(1, "topk8_partial_rows shape"));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            TOPK8_ROWS_MODULE,
+            kernels::TOPK8_ROWS_MQ6G256V2_SRC,
+            "topk8_partial_f32_rows",
+        )?;
+        let v_ptr = logits_rows.buf.as_ptr();
+        let part_ptr = partial_rows.buf.as_ptr();
+        let n_val = n as i32;
+        let chunk_val = chunk as i32;
+        let (front, special, tail) = (order.0 as i32, order.1 as i32, order.2 as i32);
+        let v_stride_val = v_stride as i32;
+        let mut params = [
+            &v_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &chunk_val as *const _ as *mut c_void,
+            &part_ptr as *const _ as *mut c_void,
+            &front as *const _ as *mut c_void,
+            &special as *const _ as *mut c_void,
+            &tail as *const _ as *mut c_void,
+            &v_stride_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "topk8_partial_f32_rows",
+            [TOPK8_GROUPS as u32, rows as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(v_ptr);
+                b.push_i32(n_val);
+                b.push_i32(chunk_val);
+                b.push_ptr(part_ptr);
+                b.push_i32(front);
+                b.push_i32(special);
+                b.push_i32(tail);
+                b.push_i32(v_stride_val);
+                b
+            },
+        )
+    }
+
+    /// [`Gpu::topk8_rescore_k2560`] for `rows` rows in two launches (`HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS`):
+    /// `topk8_partial_f32_rows` (grid `(128, rows)`) then `topk8_rescore_mq6g256v2_k2560_rows` (grid
+    /// `rows`), each row bytewise the one-row pair's on that row. Row `r` ranks
+    /// `logits_rows[r * v_stride ..][..n]` (same `n`, `order` for every row) through its own
+    /// [`Gpu::TOPK8_PARTIAL_BYTES`] slot `r` of `partial_rows`, re-scores against `head` (MQ6G256V2 only)
+    /// with `x_rows[r * x_stride ..][..2560]` and writes the [`Gpu::TOPK8_OUT_BYTES`] slot at byte
+    /// `r * out_stride` of `out`. Strides: `v_stride`, `x_stride` in f32 elements, `out_stride` in bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn topk8_rescore_k2560_rows(
+        &mut self,
+        logits_rows: &GpuTensor,
+        v_stride: usize,
+        rows: usize,
+        n: usize,
+        order: (usize, usize, usize),
+        head: &GpuTensor,
+        x_rows: &GpuTensor,
+        x_stride: usize,
+        partial_rows: &GpuTensor,
+        out: &GpuTensor,
+        out_stride: usize,
+    ) -> HipResult<()> {
+        if head.dtype != DType::MQ6G256V2 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "topk8_rescore_k2560_rows head dtype",
+            ));
+        }
+        let chunk = n.div_ceil(TOPK8_GROUPS);
+        let last = rows.saturating_sub(1);
+        if rows == 0
+            || rows > TOPK8_ROWS_MAX
+            || chunk > 2048
+            || v_stride > i32::MAX as usize
+            || x_stride > i32::MAX as usize
+            || out_stride % 4 != 0
+            || out_stride < Self::TOPK8_OUT_BYTES
+            || out_stride / 4 > i32::MAX as usize
+            || logits_rows.numel() < last * v_stride + n
+            || x_rows.numel() < last * x_stride + 2560
+            || partial_rows.buf.size() < rows * Self::TOPK8_PARTIAL_BYTES
+            || out.buf.size() < last * out_stride + Self::TOPK8_OUT_BYTES
+        {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "topk8_rescore_k2560_rows shape",
+            ));
+        }
+        self.topk8_partial_rows(logits_rows, v_stride, rows, n, order, partial_rows)?;
+        self.bind_thread()?;
+        self.ensure_kernel(
+            TOPK8_ROWS_MODULE,
+            kernels::TOPK8_ROWS_MQ6G256V2_SRC,
+            "topk8_rescore_mq6g256v2_k2560_rows",
+        )?;
+        let part_ptr = partial_rows.buf.as_ptr();
+        let a_ptr = head.buf.as_ptr();
+        let x_ptr = x_rows.buf.as_ptr();
+        let o_ptr = out.buf.as_ptr();
+        let x_stride_val = x_stride as i32;
+        let out_stride_val = (out_stride / 4) as i32;
+        let mut params = [
+            &part_ptr as *const _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &o_ptr as *const _ as *mut c_void,
+            &x_stride_val as *const _ as *mut c_void,
+            &out_stride_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "topk8_rescore_mq6g256v2_k2560_rows",
+            [rows as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(part_ptr);
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(o_ptr);
+                b.push_i32(x_stride_val);
+                b.push_i32(out_stride_val);
+                b
+            },
+        )
     }
 
     /// (module, source, entry) of the exact re-score kernel for `head`'s dtype.

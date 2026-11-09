@@ -8222,6 +8222,15 @@ pub const TOPK8_RESCORE_MQ6G256V2_SRC: &str = concat!(
     include_str!("../../../kernels/src/topk8_select.hip"),
     include_str!("../../../kernels/src/qwen4_gemv_mq6g256v2.hip")
 );
+/// Module `topk8_rows_mq6g256v2` (`HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS`, exact gfx1201): the row-batched
+/// MQ6G256V2 draft-head re-score (`Gpu::topk8_rescore_k2560_rows`), `topk8_partial_f32_rows` and
+/// `topk8_rescore_mq6g256v2_k2560_rows`, whose per-row bodies are the one-row entries'. The
+/// incumbent sources come first and unchanged, so their modules keep their recorded identity.
+pub const TOPK8_ROWS_MQ6G256V2_SRC: &str = concat!(
+    include_str!("../../../kernels/src/topk8_select.hip"),
+    include_str!("../../../kernels/src/qwen4_gemv_mq6g256v2.hip"),
+    include_str!("../../../kernels/src/topk8_rows.gfx1201.hip")
+);
 pub const REQUANT_G256_SRC: &str = include_str!("../../../kernels/src/requant_g256.hip");
 
 /// Batched Q8_0 GEMM. Same per-row math as gemv_q8_0 but holds MAX_BATCH

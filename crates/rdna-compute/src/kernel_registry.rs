@@ -3038,6 +3038,16 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
         add!("zero_f32", kernels::ZERO_F32_SRC, ["zero_f32"]);
     }
+    if arch == "gfx1201" {
+        add!(
+            "topk8_rows_mq6g256v2",
+            kernels::TOPK8_ROWS_MQ6G256V2_SRC,
+            [
+                "topk8_partial_f32_rows",
+                "topk8_rescore_mq6g256v2_k2560_rows"
+            ]
+        );
+    }
     if matches!(arch, "gfx1201" | "gfx1100") {
         add!(
             "gemv_bf16_xf32",

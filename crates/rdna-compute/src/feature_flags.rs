@@ -139,6 +139,11 @@ pub struct FeatureFlags {
     /// the draft ranking's per-row rotations run as one launch each (existing entries, bytes
     /// identical). Default on for exact gfx1201, `0` is the kill switch.
     pub qwen4_draft_glue_fold: bool,
+    /// MTP draft ranking row batch (`HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS`): the MQ6G256V2 head's per-row
+    /// top-8 partial + exact re-score pairs of one batched ranking class run as one pair per run
+    /// of consecutive rows (`topk8_rescore_k2560_rows`), bytes identical. Default on for exact
+    /// gfx1201, `0` is the kill switch.
+    pub qwen4_draft_topk8_rows: bool,
     /// EP partial tile mask implicit zeros (`HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO`),
     /// default on for exact gfx1201, `0` is the kill switch: the foreign experts'
     /// grouped down rows are marked `-1` in the combine order instead of being
@@ -1228,6 +1233,7 @@ impl FeatureFlags {
             qwen4_moe_combine_inline_order: parse_bool("HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER")
                 .unwrap_or(is_gfx1201),
             qwen4_draft_glue_fold: parse_bool("HIPFIRE_QWEN4_DRAFT_GLUE_FOLD").unwrap_or(is_gfx1201),
+            qwen4_draft_topk8_rows: parse_bool("HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS").unwrap_or(is_gfx1201),
             qwen4_ep_pmask_implicit_zero: parse_bool("HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO")
                 .unwrap_or(is_gfx1201),
             qwen4_ep_pmask_implicit_zero_poison: parse_bool(
@@ -1941,6 +1947,12 @@ impl FeatureFlags {
         self.qwen4_draft_glue_fold && self.arch == "gfx1201"
     }
 
+    /// MTP draft ranking row batch (`HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS`): exact gfx1201 only,
+    /// default on, `0` is the kill switch.
+    pub fn qwen4_draft_topk8_rows_enabled(&self) -> bool {
+        self.qwen4_draft_topk8_rows && self.arch == "gfx1201"
+    }
+
     /// EP partial tile mask implicit zeros (`HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO`):
     /// exact gfx1201 only.
     pub fn qwen4_ep_pmask_implicit_zero_enabled(&self) -> bool {
@@ -2334,6 +2346,7 @@ impl FeatureFlags {
             qwen4_ffn_clear_absorb_rows: false,
             qwen4_moe_combine_inline_order: false,
             qwen4_draft_glue_fold: false,
+            qwen4_draft_topk8_rows: false,
             qwen4_ep_pmask_implicit_zero: false,
             qwen4_ep_pmask_implicit_zero_poison: false,
             qwen4_hc_row_fold: false,
@@ -3502,6 +3515,29 @@ mod tests {
             assert!(!off.qwen4_draft_glue_fold_enabled(), "{arch}");
             let on = FeatureFlags::from_lookup(arch, with("1"));
             assert_eq!(on.qwen4_draft_glue_fold_enabled(), exact, "{arch}");
+        }
+    }
+
+    /// The draft ranking row batch is default on (`=0` kills) and reaches exact gfx1201 only.
+    #[test]
+    fn qwen4_draft_topk8_rows_is_default_on_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |key: &str| -> std::result::Result<String, ()> {
+                if key == "HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_draft_topk8_rows_enabled(), exact, "{arch}");
+            let off = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!off.qwen4_draft_topk8_rows_enabled(), "{arch}");
+            let on = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(on.qwen4_draft_topk8_rows_enabled(), exact, "{arch}");
         }
     }
 
