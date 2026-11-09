@@ -805,7 +805,9 @@ fn interleave_bench(
     let mut shapes_json = Vec::new();
     for &(m, k) in shapes {
         if m == 0 || k == 0 || k % 256 != 0 {
-            return Err(format!("shape {m},{k}: K must be a positive multiple of 256"));
+            return Err(format!(
+                "shape {m},{k}: K must be a positive multiple of 256"
+            ));
         }
         let (formula, copies) = copies_for(m, k);
         let copy_bytes = m * (k / 256) * 72;
@@ -832,17 +834,24 @@ fn interleave_bench(
         let mut cells = Vec::new();
         for &b in b_list {
             let written = b * m * 4;
-            gpu.hip.memset(&y_ref.buf, 0x7f, y_ref.numel() * 4).map_err(err)?;
+            gpu.hip
+                .memset(&y_ref.buf, 0x7f, y_ref.numel() * 4)
+                .map_err(err)?;
             launch_chunked_by(gpu, base, &ws[0], xp, yrp, m, k, b, base_cap)?;
             gpu.hip.device_synchronize().map_err(err)?;
             let ref_bytes = gpu.download_raw_bytes(&y_ref).map_err(err)?;
             let ref_guard_bad = ref_bytes[..guard].iter().filter(|&&q| q != 0x7f).count()
-                + ref_bytes[guard + written..].iter().filter(|&&q| q != 0x7f).count();
+                + ref_bytes[guard + written..]
+                    .iter()
+                    .filter(|&&q| q != 0x7f)
+                    .count();
             bad += ref_guard_bad;
             let mut mism = Vec::new();
             let mut timed = Vec::new();
             for (oi, obj) in objects.iter().enumerate() {
-                gpu.hip.memset(&y_c.buf, 0x7f, y_c.numel() * 4).map_err(err)?;
+                gpu.hip
+                    .memset(&y_c.buf, 0x7f, y_c.numel() * 4)
+                    .map_err(err)?;
                 launch_obj(gpu, obj, &ws[0], xp, ycp, m, k, b)?;
                 gpu.hip.device_synchronize().map_err(err)?;
                 let got = gpu.download_raw_bytes(&y_c).map_err(err)?;
@@ -906,10 +915,15 @@ fn interleave_bench(
                     e["replays_us"] = json!(obj_arms[j]);
                     println!(
                         "  B={b} {}: {med:.2} us (p10 {p10:.2} p90 {p90:.2}) ref {:.2}/{:.2}",
-                        obj.label, ref_meds[j], ref_meds[j + 1]
+                        obj.label,
+                        ref_meds[j],
+                        ref_meds[j + 1]
                     );
                 } else {
-                    println!("  B={b} {}: NOT TIMED, {} mismatching bytes", obj.label, mism[oi]);
+                    println!(
+                        "  B={b} {}: NOT TIMED, {} mismatching bytes",
+                        obj.label, mism[oi]
+                    );
                 }
                 objs_json.push(e);
             }
@@ -983,7 +997,8 @@ fn main() {
     let seed = seed_flag.unwrap_or(0x9E3779B97F4A7C15);
     let baseline_cap_flag = flag("--baseline-cap").map(|v| parse_u64(&v) as usize);
     let baseline_cap = baseline_cap_flag.unwrap_or(4);
-    let baseline_rows: usize = flag("--baseline-rows").map_or(4, |v| v.parse().expect("--baseline-rows N"));
+    let baseline_rows: usize =
+        flag("--baseline-rows").map_or(4, |v| v.parse().expect("--baseline-rows N"));
     let shape_args: Vec<(usize, usize)> = args
         .iter()
         .enumerate()
@@ -991,11 +1006,16 @@ fn main() {
         .map(|(i, _)| {
             let v = args.get(i + 1).expect("--shape M,K");
             let (m, k) = v.split_once(',').expect("--shape M,K");
-            (m.parse().expect("--shape M,K"), k.parse().expect("--shape M,K"))
+            (
+                m.parse().expect("--shape M,K"),
+                k.parse().expect("--shape M,K"),
+            )
         })
         .collect();
     let b_list_arg: Option<Vec<usize>> = flag("--b-list").map(|v| {
-        v.split(',').map(|b| b.parse().expect("--b-list 1,2,4,8")).collect()
+        v.split(',')
+            .map(|b| b.parse().expect("--b-list 1,2,4,8"))
+            .collect()
     });
     let new_flags = manifest_path.is_some()
         || interleave
@@ -1099,7 +1119,12 @@ fn main() {
             gpu.free_tensor(y).map_err(err)?;
         }
         let pm_module = gpu.arch == "gfx1201";
-        if pm_module && !no_oracle && sweep_dir.is_none() && manifest_path.is_none() && pm_cases.is_empty() {
+        if pm_module
+            && !no_oracle
+            && sweep_dir.is_none()
+            && manifest_path.is_none()
+            && pm_cases.is_empty()
+        {
             return Err("gfx1201: the PeaceMaker module covered no case".into());
         }
         if let Some(manifest) = captures.as_deref() {
@@ -1303,7 +1328,14 @@ fn main() {
         let mut interleave_json = serde_json::Value::Null;
         if let (true, Some(base)) = (interleave, base.as_ref()) {
             let (t, bad) = interleave_bench(
-                &mut gpu, &objects, base, baseline_cap, &shapes, &b_list, bench_reps, seed,
+                &mut gpu,
+                &objects,
+                base,
+                baseline_cap,
+                &shapes,
+                &b_list,
+                bench_reps,
+                seed,
             )?;
             bad_total += bad;
             interleave_json = t;
@@ -1320,9 +1352,12 @@ fn main() {
             let pci = gpu.hip.device_pci_bus_id(gpu.device_id).ok();
             let sysfs = |leaf: &str| {
                 pci.as_ref().and_then(|p| {
-                    std::fs::read_to_string(format!("/sys/bus/pci/devices/{}/{leaf}", p.to_lowercase()))
-                        .ok()
-                        .map(|s| s.trim().to_string())
+                    std::fs::read_to_string(format!(
+                        "/sys/bus/pci/devices/{}/{leaf}",
+                        p.to_lowercase()
+                    ))
+                    .ok()
+                    .map(|s| s.trim().to_string())
                 })
             };
             result["inputs"] = json!({

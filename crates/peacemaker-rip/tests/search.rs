@@ -28,7 +28,10 @@ fn pt(items: &[(&str, &str)]) -> Vec<(String, String)> {
 fn differing_lines(a: &str, b: &str) -> Vec<usize> {
     let (a, b): (Vec<&str>, Vec<&str>) = (a.split('\n').collect(), b.split('\n').collect());
     assert_eq!(a.len(), b.len(), "line count changed");
-    (0..a.len()).filter(|&i| a[i] != b[i]).map(|i| i + 1).collect()
+    (0..a.len())
+        .filter(|&i| a[i] != b[i])
+        .map(|i| i + 1)
+        .collect()
 }
 
 #[test]
@@ -94,10 +97,16 @@ fn splice_changes_only_the_literals() {
     // Partial point: unnamed axes keep their declared literal.
     let one = with_axes(SRC, "t.rip", &pt(&[("ROWS", "1")])).unwrap();
     assert_eq!(differing_lines(SRC, &one), vec![7]);
-    assert_eq!(one, SRC.replace("const ROWS: u8 = 4;", "const ROWS: u8 = 1;"));
+    assert_eq!(
+        one,
+        SRC.replace("const ROWS: u8 = 4;", "const ROWS: u8 = 1;")
+    );
     // The reference point splices to the same bytes (the literals are canonical here).
     let axes = search_axes(SRC, "t.rip").unwrap();
-    assert_eq!(with_axes(SRC, "t.rip", &reference_point(&axes)).unwrap(), SRC);
+    assert_eq!(
+        with_axes(SRC, "t.rip", &reference_point(&axes)).unwrap(),
+        SRC
+    );
     // The result is itself a valid declaration whose reference is the spliced point.
     let re = search_axes(&out, "t.rip").unwrap();
     assert_eq!(
@@ -113,10 +122,7 @@ fn splice_accepts_suffixed_hex_and_negative_literals() {
     assert_eq!(axes[0].reference, "16");
     assert_eq!(axes[1].reference, "-1");
     let out = with_axes(src, "t.rip", &pt(&[("A", "3"), ("B", "2")])).unwrap();
-    assert_eq!(
-        out,
-        src.replace("0x10u16", "3").replace("= -1;", "= 2;")
-    );
+    assert_eq!(out, src.replace("0x10u16", "3").replace("= -1;", "= 2;"));
 }
 
 #[test]
@@ -124,11 +130,26 @@ fn points_enumerate_last_axis_fastest() {
     let axes = search_axes(SRC, "t.rip").unwrap();
     let all = points(&axes);
     assert_eq!(all.len(), 12);
-    assert_eq!(all[0], pt(&[("ROWS", "1"), ("SPLIT", "false"), ("TAG", "a")]));
-    assert_eq!(all[1], pt(&[("ROWS", "1"), ("SPLIT", "false"), ("TAG", "b\"q")]));
-    assert_eq!(all[2], pt(&[("ROWS", "1"), ("SPLIT", "true"), ("TAG", "a")]));
-    assert_eq!(all[4], pt(&[("ROWS", "2"), ("SPLIT", "false"), ("TAG", "a")]));
-    assert_eq!(all[11], pt(&[("ROWS", "4"), ("SPLIT", "true"), ("TAG", "b\"q")]));
+    assert_eq!(
+        all[0],
+        pt(&[("ROWS", "1"), ("SPLIT", "false"), ("TAG", "a")])
+    );
+    assert_eq!(
+        all[1],
+        pt(&[("ROWS", "1"), ("SPLIT", "false"), ("TAG", "b\"q")])
+    );
+    assert_eq!(
+        all[2],
+        pt(&[("ROWS", "1"), ("SPLIT", "true"), ("TAG", "a")])
+    );
+    assert_eq!(
+        all[4],
+        pt(&[("ROWS", "2"), ("SPLIT", "false"), ("TAG", "a")])
+    );
+    assert_eq!(
+        all[11],
+        pt(&[("ROWS", "4"), ("SPLIT", "true"), ("TAG", "b\"q")])
+    );
     // Every point is distinct and the reference point is among them.
     for (i, p) in all.iter().enumerate() {
         assert!(!all[..i].contains(p));
@@ -209,7 +230,10 @@ fn refuses_malformed_declarations() {
     );
     // Trailing junk after the literal.
     refused(
-        &SRC.replace("const ROWS: u8 = 4; // keep", "const ROWS: u8 = 4; const X: u8 = 1;"),
+        &SRC.replace(
+            "const ROWS: u8 = 4; // keep",
+            "const ROWS: u8 = 4; const X: u8 = 1;",
+        ),
         "must be one line",
     );
 }

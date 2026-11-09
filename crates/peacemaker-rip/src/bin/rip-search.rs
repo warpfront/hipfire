@@ -211,7 +211,11 @@ fn plan(o: &Opts) -> u8 {
     }
     println!("file: {}", space.name);
     println!("arch: {}", o.arch.name());
-    println!("variants ({}): {}", space.variants.len(), space.variants.join(", "));
+    println!(
+        "variants ({}): {}",
+        space.variants.len(),
+        space.variants.join(", ")
+    );
     println!("axes ({}):", space.axes.len());
     for a in &space.axes {
         println!(
@@ -446,7 +450,11 @@ fn evaluate(ctx: &Ctx, index: usize, variant: &str, point: &[(String, String)]) 
         Err(e) => return rec.fail("S3", "uncertified", e),
     };
     let Some(cert) = certs.first() else {
-        return rec.fail("S3", "uncertified", "certification returned no certificate".into());
+        return rec.fail(
+            "S3",
+            "uncertified",
+            "certification returned no certificate".into(),
+        );
     };
     rec.m7_sha256 = Some(sha256_hex(cert.m7.to_string().as_bytes()));
     // S4
@@ -500,8 +508,14 @@ fn evaluate(ctx: &Ctx, index: usize, variant: &str, point: &[(String, String)]) 
 fn mem_available_fraction() -> Option<f64> {
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
     let field = |key: &str| -> Option<f64> {
-        text.lines()
-            .find_map(|l| l.strip_prefix(key)?.trim().strip_suffix("kB")?.trim().parse().ok())
+        text.lines().find_map(|l| {
+            l.strip_prefix(key)?
+                .trim()
+                .strip_suffix("kB")?
+                .trim()
+                .parse()
+                .ok()
+        })
     };
     Some(field("MemAvailable:")? / field("MemTotal:")?)
 }
@@ -635,33 +649,31 @@ fn run(o: &Opts) -> Result<(), Failure> {
     std::thread::scope(|scope| -> Result<(), String> {
         let mut handles = Vec::new();
         for n in 0..jobs {
-            let worker = || {
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= enumerated {
-                        break;
+            let worker = || loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= enumerated {
+                    break;
+                }
+                let rec = match reference_recs.get(&i) {
+                    Some(r) => r.clone(),
+                    None => {
+                        wait_for_memory(o.mem_floor);
+                        let variant = &space.variants[i / npoints];
+                        let point = &pts[i % npoints];
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            evaluate(&ctx, i, variant, point)
+                        }))
+                        .unwrap_or_else(|_| {
+                            let mut r = Rec::new(i, variant, point);
+                            r.id = candidate_id(ctx.arch, variant, &format!("panic {i}"));
+                            r.fail("S0", "internal-error", "the evaluator panicked".into())
+                        })
                     }
-                    let rec = match reference_recs.get(&i) {
-                        Some(r) => r.clone(),
-                        None => {
-                            wait_for_memory(o.mem_floor);
-                            let variant = &space.variants[i / npoints];
-                            let point = &pts[i % npoints];
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                evaluate(&ctx, i, variant, point)
-                            }))
-                            .unwrap_or_else(|_| {
-                                let mut r = Rec::new(i, variant, point);
-                                r.id = candidate_id(ctx.arch, variant, &format!("panic {i}"));
-                                r.fail("S0", "internal-error", "the evaluator panicked".into())
-                            })
-                        }
-                    };
-                    results.lock().unwrap().push(rec);
-                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if d % 25 == 0 || d == enumerated {
-                        eprintln!("[rip-search] {d}/{enumerated}");
-                    }
+                };
+                results.lock().unwrap().push(rec);
+                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if d % 25 == 0 || d == enumerated {
+                    eprintln!("[rip-search] {d}/{enumerated}");
                 }
             };
             let h = std::thread::Builder::new()
@@ -672,7 +684,8 @@ fn run(o: &Opts) -> Result<(), Failure> {
             handles.push(h);
         }
         for h in handles {
-            h.join().map_err(|_| "a worker thread panicked".to_string())?;
+            h.join()
+                .map_err(|_| "a worker thread panicked".to_string())?;
         }
         Ok(())
     })?;
@@ -714,7 +727,10 @@ fn run(o: &Opts) -> Result<(), Failure> {
         if let (Some(elf), true) = (&r.elf, r.dedup_of.is_none()) {
             unique += 1;
             write_file(&out.join("objects").join(format!("{}.co", r.id)), elf)?;
-            write_file(&out.join("sources").join(format!("{}.rip", r.id)), &r.source)?;
+            write_file(
+                &out.join("sources").join(format!("{}.rip", r.id)),
+                &r.source,
+            )?;
             let (v, s, n) = r
                 .resources
                 .as_ref()

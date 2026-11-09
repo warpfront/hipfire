@@ -33,7 +33,12 @@ fn with_point(p: &Params) -> String {
 }
 
 fn rip(p: &Params) -> Result<peacemaker_isa::Emitted, String> {
-    peacemaker_rip::compile_named(&with_point(p), "gemv_mq2_xbatch.rip", Arch::Gfx1201, "xbatch")
+    peacemaker_rip::compile_named(
+        &with_point(p),
+        "gemv_mq2_xbatch.rip",
+        Arch::Gfx1201,
+        "xbatch",
+    )
 }
 
 fn first_difference(a: &str, b: &str) -> String {
@@ -42,7 +47,11 @@ fn first_difference(a: &str, b: &str) -> String {
             return format!("line {}: rust `{x}` vs rip `{y}`", i + 1);
         }
     }
-    format!("lengths {} vs {} lines", a.lines().count(), b.lines().count())
+    format!(
+        "lengths {} vs {} lines",
+        a.lines().count(),
+        b.lines().count()
+    )
 }
 
 /// The device ELF payload of an uncompressed offload bundle (second entry).
@@ -71,7 +80,13 @@ fn every_tuple_matches_the_rust_generator() {
             for unroll in [1u8, 2, 4] {
                 for split in [false, true] {
                     for ilp in [false, true] {
-                        let p = Params { rows, cap, unroll, split, ilp };
+                        let p = Params {
+                            rows,
+                            cap,
+                            unroll,
+                            split,
+                            ilp,
+                        };
                         let tag = p.tag();
                         match (emit_text(&p), rip(&p)) {
                             (Ok(rust), Ok(rip)) => {
@@ -83,8 +98,12 @@ fn every_tuple_matches_the_rust_generator() {
                                 agree_ok += 1;
                             }
                             (Err(_), Err(_)) => agree_err += 1,
-                            (Ok(_), Err(e)) => panic!("{tag}: the generator emits, the script refuses: {e}"),
-                            (Err(e), Ok(_)) => panic!("{tag}: the generator refuses ({e}), the script emits"),
+                            (Ok(_), Err(e)) => {
+                                panic!("{tag}: the generator emits, the script refuses: {e}")
+                            }
+                            (Err(e), Ok(_)) => {
+                                panic!("{tag}: the generator refuses ({e}), the script emits")
+                            }
                         }
                     }
                 }
@@ -99,12 +118,19 @@ fn every_tuple_matches_the_rust_generator() {
 /// The declared point is the shipped tuple: the script's text assembles to the committed `.hxaco`'s ELF.
 #[test]
 fn declared_point_is_the_shipped_artifact() {
-    let emitted = peacemaker_rip::compile_named(RIP, "gemv_mq2_xbatch.rip", Arch::Gfx1201, "xbatch")
-        .unwrap_or_else(|e| panic!("{e}"));
+    let emitted =
+        peacemaker_rip::compile_named(RIP, "gemv_mq2_xbatch.rip", Arch::Gfx1201, "xbatch")
+            .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(emitted.s_text, emit_text(&SHIPPED).unwrap());
     let elf = peacemaker_isa::native::assemble(&emitted.s_text, Arch::Gfx1201).unwrap();
-    assert!(elf == emit_elf(&SHIPPED).unwrap(), "script ELF differs from emit_elf(SHIPPED)");
-    assert!(elf == bundle_elf(SHIPPED_HXACO), "script ELF differs from the committed .hxaco");
+    assert!(
+        elf == emit_elf(&SHIPPED).unwrap(),
+        "script ELF differs from emit_elf(SHIPPED)"
+    );
+    assert!(
+        elf == bundle_elf(SHIPPED_HXACO),
+        "script ELF differs from the committed .hxaco"
+    );
     assert_eq!(
         format!("{:x}", Sha256::digest(&elf)),
         "0e9b63c7e3ac07c9f73e3c9e1ad86451c81c24a2ec58e24741a38d876b221bd4"
@@ -142,19 +168,27 @@ fn new_schedule_axes_compile_and_reference_values_are_unchanged() {
         ("PRIO", "u8", "0", &["0", "1", "2"]),
         ("XFIRST", "bool", "false", &["false", "true"]),
     ];
-    let reference = peacemaker_rip::compile_named(RIP, "gemv_mq2_xbatch.rip", Arch::Gfx1201, "xbatch")
-        .unwrap_or_else(|e| panic!("{e}"))
-        .s_text;
+    let reference =
+        peacemaker_rip::compile_named(RIP, "gemv_mq2_xbatch.rip", Arch::Gfx1201, "xbatch")
+            .unwrap_or_else(|e| panic!("{e}"))
+            .s_text;
     for (name, ty, old, values) in axes {
         let line = format!("const {name}: {ty} = {old};");
         assert_eq!(RIP.lines().filter(|l| *l == line).count(), 1, "{line}");
         let list: Vec<String> = values.iter().map(|v| format!("\"{v}\"")).collect();
-        assert!(RIP.contains(&format!("(\"{name}\", \"schedule\", &[{}])", list.join(", "))), "{name}");
+        assert!(
+            RIP.contains(&format!(
+                "(\"{name}\", \"schedule\", &[{}])",
+                list.join(", ")
+            )),
+            "{name}"
+        );
         for value in values {
             let src = RIP.replace(&line, &format!("const {name}: {ty} = {value};"));
-            let text = peacemaker_rip::compile_named(&src, "gemv_mq2_xbatch.rip", Arch::Gfx1201, "xbatch")
-                .unwrap_or_else(|e| panic!("{name}={value}: {e}"))
-                .s_text;
+            let text =
+                peacemaker_rip::compile_named(&src, "gemv_mq2_xbatch.rip", Arch::Gfx1201, "xbatch")
+                    .unwrap_or_else(|e| panic!("{name}={value}: {e}"))
+                    .s_text;
             assert_eq!(text == reference, *value == old, "{name}={value}");
         }
     }
@@ -163,10 +197,28 @@ fn new_schedule_axes_compile_and_reference_values_are_unchanged() {
         for unroll in [1u8, 2, 4] {
             for split in [false, true] {
                 for ilp in [false, true] {
-                    let p = Params { rows, cap: 8, unroll, split, ilp };
-                    let src = with_point(&p).replace("const PREFETCH: u8 = 0;", "const PREFETCH: u8 = 1;");
-                    let got = peacemaker_rip::compile_named(&src, "gemv_mq2_xbatch.rip", Arch::Gfx1201, "xbatch");
-                    assert_eq!(emit_text(&p).is_ok(), got.is_ok(), "{}: {:?}", p.tag(), got.err());
+                    let p = Params {
+                        rows,
+                        cap: 8,
+                        unroll,
+                        split,
+                        ilp,
+                    };
+                    let src = with_point(&p)
+                        .replace("const PREFETCH: u8 = 0;", "const PREFETCH: u8 = 1;");
+                    let got = peacemaker_rip::compile_named(
+                        &src,
+                        "gemv_mq2_xbatch.rip",
+                        Arch::Gfx1201,
+                        "xbatch",
+                    );
+                    assert_eq!(
+                        emit_text(&p).is_ok(),
+                        got.is_ok(),
+                        "{}: {:?}",
+                        p.tag(),
+                        got.err()
+                    );
                 }
             }
         }

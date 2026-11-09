@@ -1431,15 +1431,22 @@ pub fn method<'a>(
         Nat::Builder(_) | Nat::Isa => match name {
             "label" | "wait_all" => {
                 if !matches!(n, Nat::Builder(_)) {
-                    return Err(format!("`wg.isa().{name}` is not available: use the Workgroup's own `{name}`").into());
+                    return Err(format!(
+                        "`wg.isa().{name}` is not available: use the Workgroup's own `{name}`"
+                    )
+                    .into());
                 }
                 if name == "label" {
                     need(1)?;
                     let label = str_of(it, &a[0], "label")?;
-                    Some(done(with_b(it, &Value::Nat(n.clone()), cx, |b| b.label(&label))?))
+                    Some(done(with_b(it, &Value::Nat(n.clone()), cx, |b| {
+                        b.label(&label)
+                    })?))
                 } else {
                     need(0)?;
-                    Some(done(with_b(it, &Value::Nat(n.clone()), cx, |b| b.wait_all())?))
+                    Some(done(with_b(it, &Value::Nat(n.clone()), cx, |b| {
+                        b.wait_all()
+                    })?))
                 }
             }
             "release_store_sources" | "lds_relayout" | "barrier_wait" => {

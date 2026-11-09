@@ -100,7 +100,9 @@ fn canon(ty: &str, text: &str) -> Result<String, String> {
     match ty {
         "bool" => match text {
             "true" | "false" => Ok(text.to_string()),
-            _ => Err(format!("`{text}` is not a valid bool value (true or false)")),
+            _ => Err(format!(
+                "`{text}` is not a valid bool value (true or false)"
+            )),
         },
         "&str" => Ok(text.to_string()),
         "u8" => int!(u8),
@@ -148,7 +150,10 @@ fn literal_value(ty: &str, lit: &str) -> Result<String, String> {
             let n = syn::parse_str::<syn::LitInt>(body)
                 .map_err(|e| format!("`{lit}` is not an integer literal: {e}"))?;
             if !n.suffix().is_empty() && n.suffix() != ty {
-                return Err(format!("`{lit}` has suffix `{}` but the const is {ty}", n.suffix()));
+                return Err(format!(
+                    "`{lit}` has suffix `{}` but the const is {ty}",
+                    n.suffix()
+                ));
             }
             let mag = n
                 .base10_parse::<u128>()
@@ -196,7 +201,11 @@ fn scan_line(line: &str, name: &str) -> Result<(String, usize, usize), String> {
     p += 1;
     let eq = line[p..].find('=').map(|i| p + i).ok_or_else(shape)?;
     let ty: String = line[p..eq].split_whitespace().collect();
-    let ty = if ty == "&'staticstr" { "&str".to_string() } else { ty };
+    let ty = if ty == "&'staticstr" {
+        "&str".to_string()
+    } else {
+        ty
+    };
     if ty != "bool" && ty != "&str" && !INT_TYPES.contains(&ty.as_str()) {
         return Err(format!(
             "axis const `{name}` has unsupported type `{ty}` (an integer type, bool or &str)"
@@ -283,13 +292,17 @@ fn scan(source: &str, name: &str) -> Result<Vec<Scanned>, String> {
     for elem in &list.elems {
         let bad = |msg: &str| at(name, elem.span(), msg);
         let Expr::Tuple(t) = peel(elem) else {
-            return Err(bad("each `SEARCH_AXES` entry must be a (name, class, values) tuple"));
+            return Err(bad(
+                "each `SEARCH_AXES` entry must be a (name, class, values) tuple",
+            ));
         };
         if t.elems.len() != 3 {
-            return Err(bad("each `SEARCH_AXES` entry must be a (name, class, values) tuple"));
+            return Err(bad(
+                "each `SEARCH_AXES` entry must be a (name, class, values) tuple",
+            ));
         }
-        let axis_name = str_lit(&t.elems[0])
-            .ok_or_else(|| bad("the axis name must be a string literal"))?;
+        let axis_name =
+            str_lit(&t.elems[0]).ok_or_else(|| bad("the axis name must be a string literal"))?;
         let class = str_lit(&t.elems[1])
             .ok_or_else(|| bad("the exactness class must be a string literal"))?;
         let Expr::Array(vals) = peel(&t.elems[2]) else {
@@ -299,7 +312,8 @@ fn scan(source: &str, name: &str) -> Result<Vec<Scanned>, String> {
             .elems
             .iter()
             .map(|v| {
-                str_lit(v).ok_or_else(|| at(name, v.span(), "an axis value must be a string literal"))
+                str_lit(v)
+                    .ok_or_else(|| at(name, v.span(), "an axis value must be a string literal"))
             })
             .collect::<Result<_, _>>()?;
         if raw.is_empty() {
@@ -327,9 +341,14 @@ fn scan(source: &str, name: &str) -> Result<Vec<Scanned>, String> {
         let line = c.const_token.span.start().line;
         let loc = c.const_token.span;
         if line == 0 || line > line_starts.len() {
-            return Err(at(name, loc, format!("axis const `{axis_name}`: position outside the source")));
+            return Err(at(
+                name,
+                loc,
+                format!("axis const `{axis_name}`: position outside the source"),
+            ));
         }
-        let text = &source[line_starts[line - 1]..line_starts.get(line).map_or(source.len(), |e| e - 1)];
+        let text =
+            &source[line_starts[line - 1]..line_starts.get(line).map_or(source.len(), |e| e - 1)];
         let (ty, ls, le) = scan_line(text, &axis_name).map_err(|m| at(name, loc, m))?;
         let reference = literal_value(&ty, &text[ls..le]).map_err(|m| at(name, loc, m))?;
         let mut values: Vec<String> = Vec::new();
