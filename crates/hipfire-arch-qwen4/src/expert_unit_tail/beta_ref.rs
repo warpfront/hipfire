@@ -3,14 +3,16 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! FROZEN reference copy of beta's `TailPolicy` (commit 20c7b6de0e, `expert_unit_tail.rs`
-//! lines 446-496 and 554-987, verbatim apart from this header and the imports; the types live in
+//! lines 446-496 and 554-987, verbatim apart from this header, the imports and the marked
+//! `--- slice 5` blocks: the peer RESERVE rule in `retire_inner`; the types live in
 //! this module, so they do not collide with the migrated ones of the parent). The
 //! differential tests (`differential`) hold the migrated policy to it: identical
 //! publish / unpublish / fills `(slot, unit, generation)` per retirement and identical
-//! [`TailStats`](super::TailStats). Never edit the policy code below; change the parent instead.
+//! [`TailStats`](super::TailStats). Never edit the policy code below except through a marked
+//! block that mirrors a deliberate policy change of the parent.
 #![allow(dead_code)]
 
-use super::{EpUnitTailConfig, TailStats, WindowUse, FILL_GROUP_CAP};
+use super::{EpUnitTailConfig, TailStats, WindowUse, FILL_GROUP_CAP, RESERVE_RETIREMENTS};
 use std::collections::HashMap;
 
 /// A unit: `(trunk layer, expert)`.
@@ -399,7 +401,55 @@ impl TailPolicy {
         } else {
             0
         };
+        // --- slice 5 RESERVE gate and target (see the block in the loop)
+        let reserve = self.peer && !boundary && candidates.len() >= budget;
+        let reserve_target = RESERVE_RETIREMENTS * budget;
+        // --- end slice 5
         for cand in candidates.into_iter().take(budget) {
+            // --- slice 5 RESERVE (the one deliberate change to beta's policy; parent module
+            // docs): peer per-window mode under saturated demand fills a free slot if one exists
+            // and, while free + quarantined slots are below the target, quarantines one victim.
+            if reserve {
+                let slot = free.pop();
+                let mut evicted = false;
+                if free.len() + quarantined < reserve_target {
+                    if let Some(v) = live.next() {
+                        let victim = self.slots[v].unit.expect("live slot has a unit");
+                        self.index.remove(&victim);
+                        out.unpublish.push(victim);
+                        self.stats.evictions += 1;
+                        let s = &mut self.slots[v];
+                        s.phase = SlotPhase::Quarantined;
+                        s.unit = None;
+                        s.evicted_at = now;
+                        self.stats.quarantined += 1;
+                        quarantined += 1;
+                        evicted = true;
+                    }
+                }
+                let Some(slot) = slot else {
+                    if !evicted {
+                        self.stats.skipped_full += 1;
+                    }
+                    continue;
+                };
+                let rank = self.rank_of(cand);
+                let s = &mut self.slots[slot];
+                s.generation += 1;
+                s.phase = SlotPhase::Filling;
+                s.unit = Some(cand);
+                s.last_used = now;
+                s.rank = rank;
+                self.index.insert(cand, slot);
+                self.stats.fills_issued += 1;
+                out.fills.push(FillOp {
+                    slot,
+                    unit: cand,
+                    generation: s.generation,
+                });
+                continue;
+            }
+            // --- end slice 5
             let (slot, evicted) = if let Some(slot) = free.pop() {
                 (slot, None)
             } else {

@@ -108,7 +108,7 @@ use railgun::Binding;
 use super::rig::{rig_pool, Rig, RIG_BLOCK, RIG_DOWN, RIG_GATE_UP, RIG_TABLE};
 use super::{
     occupant_unit, EpUnitTailConfig, PeerBoard, PeerDelta, PeerTake, Retire, SlotPhase, TailPolicy,
-    UnitKey, WindowUse, QUARANTINE_WINDOWS,
+    UnitKey, WindowUse, RESERVE_RETIREMENTS,
 };
 
 const RANKS: usize = 2;
@@ -1984,21 +1984,21 @@ fn race_withheld_peer_ack_bounds_the_quarantine() {
         second.retired();
         assert!(out.fills.is_empty(), "{out:?}");
     }
+    // The bound of a peer per-window policy: the reserve target, `RESERVE_RETIREMENTS x` the one
+    // candidate each retirement considers.
+    const BOUND: usize = RESERVE_RETIREMENTS * F;
     let policy = &m.ranks[0].policy;
-    assert_eq!(policy.count(SlotPhase::Quarantined), QUARANTINE_WINDOWS * F);
-    assert_eq!(policy.count(SlotPhase::Live), T - QUARANTINE_WINDOWS * F);
+    assert_eq!(policy.count(SlotPhase::Quarantined), BOUND);
+    assert_eq!(policy.count(SlotPhase::Live), T - BOUND);
     assert_eq!(policy.count(SlotPhase::Free), 0);
     let stats = policy.stats();
-    assert_eq!(stats.quarantined, (QUARANTINE_WINDOWS * F) as u64);
-    assert_eq!(stats.evictions, (QUARANTINE_WINDOWS * F) as u64);
+    assert_eq!(stats.quarantined, BOUND as u64);
+    assert_eq!(stats.evictions, BOUND as u64);
     assert_eq!(stats.fills_issued, 0);
-    assert_eq!(
-        stats.skipped_full,
-        (WINDOWS - QUARANTINE_WINDOWS * F) as u64
-    );
-    // The quarantined slots (2, 3, 4) kept their bytes.
+    assert_eq!(stats.skipped_full, (WINDOWS - BOUND) as u64);
+    // The quarantined slots (2, 3) kept their bytes.
     let bytes = m.bytes(0);
-    for slot in 2..=4usize {
+    for slot in 2..2 + BOUND {
         assert_eq!(bytes[slot], Some((0, slot as u16 + 1)));
     }
     m.assert_clean();

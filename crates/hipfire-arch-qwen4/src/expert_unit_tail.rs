@@ -83,13 +83,26 @@
 //!   j)`. A rank therefore names a peer slot only after the owner posted the publication (host
 //!   order) and after its own apply.
 //! * QUARANTINE. A slot the owner evicts at retirement `k` goes back to canonical in the owner's
-//!   tables at once but its BYTES stay: it is `Quarantined` (neither free nor a victim; the
-//!   candidate that triggered the eviction waits for a released slot). It becomes free at an owner
-//!   retirement `m` only when, for EVERY peer `r`, some ack of `r` has `applied >= k` and `m >=
-//!   j + 1` for the `j` it was recorded at ([`PeerBoard::released_through`]). At most
-//!   [`QUARANTINE_WINDOWS`]` x ` (this retirement's fill budget, `F` per window of its group) slots
-//!   are quarantined at once, so a peer that never acknowledges
-//!   (frozen, released) cannot drain the pool; candidates that find no victim are `skipped`.
+//!   tables at once but its BYTES stay: it is `Quarantined` (neither free nor a victim). It
+//!   becomes free at an owner retirement `m` only when, for EVERY peer `r`, some ack of `r` has
+//!   `applied >= k` and `m >= j + 1` for the `j` it was recorded at
+//!   ([`PeerBoard::released_through`]). At most [`QUARANTINE_WINDOWS`]` x ` (this retirement's
+//!   fill budget, `F` per window of its group) slots are quarantined at once, so a peer that never
+//!   acknowledges (frozen, released) cannot drain the pool; candidates that find no slot are
+//!   `skipped`.
+//! * RESERVE (per-window mode, saturated demand). An evicted slot is unusable for the one or two
+//!   retirements its acknowledgement takes, so a candidate that has to evict waits for it, and
+//!   under sustained misses eviction and refill alternate (about `F / 2` fills per window). When
+//!   a retirement has at least as many candidates as its fill budget, every candidate it
+//!   considers fills a `Free` slot if one exists AND evicts one victim into quarantine while the
+//!   reserve (`Free` + `Quarantined` slots) is below [`RESERVE_RETIREMENTS`]` x ` the budget:
+//!   the evictions of one retirement become the free slots of a later one, and `F` fills per
+//!   window are sustained. Below saturation the candidate-waits rule stays (a candidate that has
+//!   to evict is admitted only if it misses again, which keeps one-off misses out when demand is
+//!   light, where an extra fill's copy costs more than the host reads it saves), and the
+//!   reserve drains into fills. Each candidate still causes at most one eviction, and the
+//!   reserve bound is below the quarantine bound. Boundary mode keeps the candidate-waits rule
+//!   (its evictions need a challenger's heat).
 //!
 //! Cadence. With the retirement cadence ([`RetireCadence`]) a retirement ends a GROUP of windows
 //! and "window `j + 1`" below means the first window after the group retired at `j`; the
@@ -715,6 +728,11 @@ const HEAT_HYSTERESIS: f32 = 1.10;
 /// most about `2 x F` slots in quarantine; the third window is jitter headroom, and the bound
 /// keeps a silent peer from draining the pool.
 pub const QUARANTINE_WINDOWS: usize = 3;
+/// PEER per-window mode under saturated demand: the reserve (free + quarantined slots) is kept up
+/// to this many times the fill budget, the one or two retirements an eviction's acknowledgement
+/// takes (a larger reserve only holds slots idle: in an offline replay of served EP2 code traces,
+/// 3x was about 10 MiB/step of host reads worse at code C8 than 2x).
+pub const RESERVE_RETIREMENTS: usize = 2;
 
 /// Why a completion token did not publish its fill.
 enum CompletionError {
@@ -1351,11 +1369,36 @@ impl TailPolicy {
         } else {
             0
         };
+        let quarantine_cap = QUARANTINE_WINDOWS * total_budget;
+        // PEER per-window mode under SATURATED demand (at least `budget` candidates) keeps the
+        // reserve (module docs, RESERVE): every candidate fills a free slot if one exists and,
+        // while free + quarantined slots are below `RESERVE_RETIREMENTS x budget`, evicts one
+        // victim into quarantine for a later retirement's fills. Below saturation the candidate
+        // that has to evict waits (it is admitted if it misses again), as without the reserve.
+        let reserve = self.peer && !boundary && candidates.len() >= budget;
+        let reserve_target = RESERVE_RETIREMENTS * budget;
         for cand in candidates.into_iter().take(budget) {
+            if reserve {
+                let slot = free.pop();
+                let mut evicted = false;
+                if free.len() + quarantined < reserve_target {
+                    if let Some(victim) = live.next() {
+                        evicted = self.quarantine(victim, now, &mut out);
+                        quarantined += usize::from(evicted);
+                    }
+                }
+                match slot {
+                    Some(slot) => self.admit(slot, cand, now, &mut out),
+                    // The candidate waits for a later retirement's free slot.
+                    None if evicted => {}
+                    None => self.stats.skipped_full += 1,
+                }
+                continue;
+            }
             let (slot, evicted) = if let Some(slot) = free.pop() {
                 (slot, None)
             } else {
-                if self.peer && quarantined >= QUARANTINE_WINDOWS * total_budget {
+                if self.peer && quarantined >= quarantine_cap {
                     self.stats.skipped_full += 1;
                     continue;
                 }
@@ -1374,20 +1417,14 @@ impl TailPolicy {
                 }
                 (slot, Some(victim))
             };
-            if let Some(victim) = evicted {
-                if let Err(why) = self.evict(slot) {
-                    self.refuse(why);
-                    continue;
-                }
-                self.index.remove(&victim);
-                out.unpublish.push(victim);
-                self.stats.evictions += 1;
+            if evicted.is_some() {
                 if self.peer {
                     // Quarantine: the peers' full tables may still name the slot, so it takes no
                     // fill until they acknowledged the unpublication; the candidate waits.
-                    self.slots[slot].evicted_at = now;
-                    self.stats.quarantined += 1;
-                    quarantined += 1;
+                    quarantined += usize::from(self.quarantine(slot, now, &mut out));
+                    continue;
+                }
+                if !self.unpublish_victim(slot, &mut out) {
                     continue;
                 }
                 // No peer reads the slot: the retired generation was its last name.
@@ -1395,30 +1432,59 @@ impl TailPolicy {
                     continue;
                 }
             }
-            let rank = self.rank_of(cand);
-            let ticket = match self.begin_fill(slot, cand) {
-                Ok(ticket) => ticket,
-                Err(why) => {
-                    self.refuse(why);
-                    continue;
-                }
-            };
-            let s = &mut self.slots[slot];
-            s.last_used = now;
-            s.rank = rank;
-            self.index.insert(cand, slot);
-            self.stats.fills_issued += 1;
-            out.fills.push(FillOp {
-                slot,
-                unit: cand,
-                generation: ticket.fill_generation(),
-                ticket,
-            });
+            self.admit(slot, cand, now, &mut out);
         }
         if boundary {
             self.decay_heat();
         }
         out
+    }
+
+    /// Unpublish the Live `slot`'s unit (`out.unpublish`); `false` = refused (the policy froze).
+    fn unpublish_victim(&mut self, slot: usize, out: &mut Retire) -> bool {
+        let victim = self.unit_of(slot).expect("live slot has a unit");
+        if let Err(why) = self.evict(slot) {
+            self.refuse(why);
+            return false;
+        }
+        self.index.remove(&victim);
+        out.unpublish.push(victim);
+        self.stats.evictions += 1;
+        true
+    }
+
+    /// PEER mode: unpublish the Live `slot`'s unit and quarantine the slot until every peer
+    /// acknowledged the unpublication; `false` = refused (the policy froze).
+    fn quarantine(&mut self, slot: usize, now: u64, out: &mut Retire) -> bool {
+        if !self.unpublish_victim(slot, out) {
+            return false;
+        }
+        self.slots[slot].evicted_at = now;
+        self.stats.quarantined += 1;
+        true
+    }
+
+    /// Start `cand`'s fill into the Free `slot` (`out.fills`).
+    fn admit(&mut self, slot: usize, cand: UnitKey, now: u64, out: &mut Retire) {
+        let rank = self.rank_of(cand);
+        let ticket = match self.begin_fill(slot, cand) {
+            Ok(ticket) => ticket,
+            Err(why) => {
+                self.refuse(why);
+                return;
+            }
+        };
+        let s = &mut self.slots[slot];
+        s.last_used = now;
+        s.rank = rank;
+        self.index.insert(cand, slot);
+        self.stats.fills_issued += 1;
+        out.fills.push(FillOp {
+            slot,
+            unit: cand,
+            generation: ticket.fill_generation(),
+            ticket,
+        });
     }
 
     /// Candidate misses, best first: per-window mode by reads then ranking;
@@ -2355,14 +2421,62 @@ mod tests {
         }
     }
 
-    /// The quarantine path only differs from flag off when a slot is evicted: a trace that never
-    /// needs a victim (every miss finds a free slot) decides identically in both modes.
+    /// The quarantine path only differs from flag off when a slot is evicted: a trace whose free
+    /// slots never drop below the reserve ([`QUARANTINE_WINDOWS`]` x ` the fill budget, so no
+    /// miss needs a victim and no reserve eviction happens) decides identically in both modes.
     #[test]
     fn peer_mode_decides_like_flag_off_while_no_victim_is_needed() {
         for seed in [0x1234_5678_9abc_def1u64, 0x9e37_79b9_7f4a_7c15] {
-            let off = trace_digest(200, 3, 1, false, false, seed, 300);
-            let on = trace_digest(200, 3, 1, false, true, seed, 300);
+            // 300 windows x 3 fills leave more than 3 x 3 of the 1000 slots free throughout.
+            let off = trace_digest(1000, 3, 1, false, false, seed, 300);
+            let on = trace_digest(1000, 3, 1, false, true, seed, 300);
             assert_eq!(off, on);
+        }
+    }
+
+    /// RESERVE: under saturated misses (more candidates than the budget) the peer per-window
+    /// policy keeps issuing `F` fills per retirement once the reserve is built, with the peers
+    /// acknowledging one or two retirements late (without the reserve, eviction and refill
+    /// alternate: about `F / 2`). Each candidate evicts at most one victim, the reserve (free +
+    /// quarantined) never exceeds `RESERVE_RETIREMENTS x` the budget, and when the misses drop
+    /// below saturation the reserve drains into fills (the candidate-waits rule again).
+    #[test]
+    fn peer_reserve_sustains_f_fills_per_window_under_acknowledgement_lag() {
+        for lag in [1u64, 2] {
+            let (t, f) = (64usize, 4usize);
+            let mut p = policy_peer(t, f, 1);
+            p.seed(&(0..t as u16).map(|e| (0u16, e)).collect::<Vec<_>>());
+            let mut completed: Vec<(usize, u64)> = Vec::new();
+            let mut steady = Vec::new();
+            let reserve = |p: &Rig| p.count(SlotPhase::Free) + p.count(SlotPhase::Quarantined);
+            for w in 0..60u16 {
+                // Every window misses 2F fresh units.
+                let uses: Vec<WindowUse> = (0..2 * f as u16)
+                    .map(|i| use1(1, w * 2 * f as u16 + i, 1))
+                    .collect();
+                let before = *p.stats();
+                let r = p.retire_peer((0, 0), &uses, &completed, |m| m.saturating_sub(lag));
+                let s = *p.stats();
+                assert!(s.evictions - before.evictions <= f as u64, "one eviction per candidate");
+                assert!(r.fills.len() <= f);
+                let held = reserve(&p);
+                assert!(held <= RESERVE_RETIREMENTS * f, "lag {lag} w {w}: reserve {held}");
+                completed = r.fills.iter().map(|&(slot, _, g)| (slot, g)).collect();
+                if w >= 10 {
+                    steady.push(r.fills.len());
+                }
+            }
+            assert!(
+                steady.iter().all(|&n| n == f),
+                "lag {lag}: fills per retirement {steady:?}"
+            );
+            // The misses drop to one per window: the reserve drains to the new target.
+            for w in 0..20u16 {
+                let uses = [use1(2, w, 1)];
+                let r = p.retire_peer((0, 0), &uses, &completed, |m| m.saturating_sub(lag));
+                completed = r.fills.iter().map(|&(slot, _, g)| (slot, g)).collect();
+            }
+            assert!(reserve(&p) <= RESERVE_RETIREMENTS, "lag {lag}: reserve {}", reserve(&p));
         }
     }
 
@@ -2414,12 +2528,15 @@ mod tests {
         assert_eq!(p.count(SlotPhase::Free), 1);
     }
 
-    /// A peer that never acknowledges (frozen, released) must not drain the pool: at most
-    /// `QUARANTINE_WINDOWS` windows of fills are ever quarantined; the rest of the tail keeps
-    /// serving and the candidates that find no victim are counted as skipped.
+    /// A peer that never acknowledges (frozen, released) must not drain the pool: at most the
+    /// reserve target (`RESERVE_RETIREMENTS x` the candidates a retirement considers, never more
+    /// than `QUARANTINE_WINDOWS` windows of fills) is ever quarantined; the rest of the tail keeps
+    /// serving and the candidates that find no slot are counted as skipped.
     #[test]
     fn a_silent_peer_quarantines_a_bounded_part_of_the_pool() {
         let (t, f) = (24usize, 2usize);
+        // Four misses per window, two considered (the budget): the target is 2 x 2.
+        let bound = RESERVE_RETIREMENTS * f;
         let mut p = policy_peer(t, f, 1);
         p.seed(&(0..t as u16).map(|e| (0u16, e)).collect::<Vec<_>>());
         for w in 0..80u16 {
@@ -2427,12 +2544,12 @@ mod tests {
             let uses: Vec<WindowUse> = (0..4).map(|i| use1(1, (w * 4 + i) % 64, 1)).collect();
             let r = p.retire_peer((0, 0), &uses, &[], |_| 0);
             assert!(r.fills.is_empty(), "nothing is ever released");
-            assert!(p.count(SlotPhase::Quarantined) <= QUARANTINE_WINDOWS * f);
+            assert!(p.count(SlotPhase::Quarantined) <= bound);
         }
-        assert_eq!(p.count(SlotPhase::Quarantined), QUARANTINE_WINDOWS * f);
-        assert_eq!(p.count(SlotPhase::Live), t - QUARANTINE_WINDOWS * f);
+        assert_eq!(p.count(SlotPhase::Quarantined), bound);
+        assert_eq!(p.count(SlotPhase::Live), t - bound);
         assert!(p.stats().skipped_full > 0);
-        assert_eq!(p.stats().quarantined as usize, QUARANTINE_WINDOWS * f);
+        assert_eq!(p.stats().quarantined as usize, bound);
     }
 
     fn delta(layer: u16, expert: u16, slot: Option<[u64; 2]>) -> PeerDelta {
