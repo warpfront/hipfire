@@ -16755,12 +16755,18 @@ impl Qwen4GpuForward {
         // of them. Decided on `n` and load-time facts only, so both ranks always agree; any
         // reject runs today's all-reduce route for the whole chunk. Silent per chunk: the
         // ordinary rejects (flag off, not a wide prefill chunk) log nothing, the first chunk
-        // that takes SP and the first structural reject log one line each.
+        // that takes SP and the first structural reject log one line each. Row bands
+        // (`trunk_route::sp_rows_in_band`): at least `SP_MIN_ROWS`, or the sub-512 band
+        // (`HIPFIRE_QWEN4_EP_SP_SUB512`, default on, `0` kills) of `SP_SUB512_MIN_ROWS`..=511 rows
+        // when the HC read of the whole chunk and of both halves is the row-count-invariant
+        // prefill lane WMMA entry.
         let sp_rows = crate::trunk_route::sp_rows(n).filter(|_| {
             ep.is_some()
                 && trunk_chunk_partial
                 && self.prefill_scope
-                && n >= crate::trunk_route::SP_MIN_ROWS
+                && crate::trunk_route::sp_chunk_rows_in_band(n)
+                && (n >= crate::trunk_route::SP_MIN_ROWS
+                    || (gpu.prefill_lwmma_hc_applies(n / 2) && gpu.prefill_lwmma_hc_applies(n)))
                 && route_n == n
         });
         let sp_views: Option<SpViews> = match (sp_rows, crate::trunk_route::sp_route()) {
@@ -16794,8 +16800,9 @@ impl Qwen4GpuForward {
                             std::sync::atomic::AtomicBool::new(false);
                         if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                             eprintln!(
-                                "  qwen4 EP sequence-parallel prefill (HIPFIRE_QWEN4_EP_SEQ_PARALLEL, =0 restores the all-reduce route): chunks of >= {} rows split their rows across the two ranks (reduce-scatter HC write, row all-gather)",
-                                crate::trunk_route::SP_MIN_ROWS
+                                "  qwen4 EP sequence-parallel prefill (HIPFIRE_QWEN4_EP_SEQ_PARALLEL, =0 restores the all-reduce route): chunks of >= {} rows, and of {}..=511 rows on the prefill lane WMMA HC read (HIPFIRE_QWEN4_EP_SP_SUB512, =0 keeps those on the all-reduce route), split their rows across the two ranks (reduce-scatter HC write, row all-gather)",
+                                crate::trunk_route::SP_MIN_ROWS,
+                                crate::trunk_route::SP_SUB512_MIN_ROWS
                             );
                         }
                         let views = SpViews::new(&self.scratch, route, rows, dims, bf16_state);

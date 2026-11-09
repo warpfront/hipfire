@@ -578,7 +578,8 @@ pub fn sp_ag_rows_per_launch(row_elems: usize, bank_stride: usize) -> usize {
 /// launches later its push reuses bank `tag & 1` while the peer still polls it (overwritten
 /// granules or a bank timeout). Chunking only changes which launch carries a row, never the
 /// per-row fold. A range empty as a whole (or shorter than `k`) cannot be non-empty in every
-/// launch; the SP route never plans one (`SP_MIN_ROWS`).
+/// launch; the SP route never plans one (its row bands keep both halves above 64 rows:
+/// `SP_SUB512_MIN_ROWS` / `SP_MIN_ROWS`).
 pub fn sp_slices(
     own_rows: usize,
     peer_rows: usize,
