@@ -786,7 +786,7 @@ Variants: `rotate`, `norm`, `sigmoid_rotate`, `norm_out` (c8), `rows`, `gp` (rot
 
 The x-batched MQ2G256V2 GEMV (`gemv_mq2g256v2_xbatch_pm`, gfx1201; the MTP draft-head ranking GEMV; Rust generator `peacemaker_isa::kernels::gemv_mq2_xbatch_pm_gfx1201`) is written whole in [`gemv_mq2_xbatch.rip`](../../peacemaker-isa/src/kernels/gemv_mq2_xbatch.rip): no coarse natives, every instruction is a script statement over `b.push(Instruction::new(text, defs, uses))`, `b.vopd(VopdOp { op, dst, src0, src1 }, ..)`, `b.ds_crosslane`, `b.control` (branches), `b.loop_`, `b.label` and `b.wait_all` (§7). The register map (`Lay`), the ring/register `check`, the plan, the cap-gated section layout (the one-section-hop gate layout above capacity 4), the quad/tail loops, the weight decode, the VOPD row pairs, the fold, the shuffle tree and the store are script functions.
 
-The generator's grid is five consts, each one line `const NAME: TY = LITERAL;` (so a search can rewrite the literal in place). Four of them are declared in `SEARCH_AXES` with exactness class `schedule` (the arithmetic DAG of every output is the same for every point):
+The generator's grid is five consts, each one line `const NAME: TY = LITERAL;` (so a search can rewrite the literal in place). Four of them, and four script-only axes (below the first four rows), are declared in `SEARCH_AXES` with exactness class `schedule` (the arithmetic DAG of every output is the same for every point):
 
 | const | values | meaning |
 |---|---|---|
@@ -794,6 +794,12 @@ The generator's grid is five consts, each one line `const NAME: TY = LITERAL;` (
 | `UNROLL: u8` | 1, 2, 4 | quads per main-loop trip |
 | `SPLIT: bool` | false, true | activation loads as 4xb64 instead of 2xb128 |
 | `ILP: bool` | false, true | two weight sets, two groups' fmac chains interleaved term by term |
+| `PREFETCH: u8` | 0, 1 | 1 refills each quad's header/payload weight registers with the next quad's loads once its activations are in flight (peeled first quad, no per-trip `wait_all`; the last quad's refill re-reads the current quad so nothing past A is read); no extra VGPRs |
+| `DELAY_ALU: bool` | false, true | `b.enable_delay_alu()` (`s_delay_alu` issue hints) |
+| `PRIO: u8` | 0, 1, 2 | nonzero: `s_setprio PRIO` over each section's dot-product phase, `s_setprio 0` before the reduction |
+| `XFIRST: bool` | false, true | first activation loads issue before the first group's weight loads |
+
+The last four rows exist only in the script (no Rust-generator twin); their declared values (0, false, 0, false) emit the generator's text byte for byte, and each keeps every output's arithmetic DAG (only load/issue order, hints and the refill placement change).
 
 `CAP: u8` (1, 2, 4, 8; `B > CAP` clamps, `B <= 0` stores nothing) is not a search axis: a `CAP < 8` object equals the `CAP = 8` one only for `B <= CAP`.
 

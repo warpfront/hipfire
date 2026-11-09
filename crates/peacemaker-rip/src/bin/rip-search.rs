@@ -533,6 +533,15 @@ fn axes_text(axes: &[(String, String)]) -> String {
         .join(",")
 }
 
+/// The manifest's `axes` column: one compact JSON object (string values), as the bench reads it.
+fn axes_json(axes: &[(String, String)]) -> String {
+    let mut m = serde_json::Map::new();
+    for (a, v) in axes {
+        m.insert(a.clone(), Value::String(v.clone()));
+    }
+    Value::Object(m).to_string()
+}
+
 enum Failure {
     /// Usage or gate failure: exit 2.
     Gate(String),
@@ -713,7 +722,7 @@ fn run(o: &Opts) -> Result<(), Failure> {
             manifest.push_str(&format!(
                 "{}\t{}\t{}\t{v}\t{s}\t{n}\n",
                 r.id,
-                axes_text(&r.axes),
+                axes_json(&r.axes),
                 r.elf_sha256.as_deref().unwrap_or("")
             ));
         }

@@ -130,3 +130,45 @@ fn axis_consts_are_single_lines_at_the_shipped_point() {
     assert!(RIP.contains("(\"SPLIT\", \"schedule\", &[\"false\", \"true\"])"));
     assert!(RIP.contains("(\"ILP\", \"schedule\", &[\"false\", \"true\"])"));
 }
+
+/// The four script-only schedule axes (PREFETCH, DELAY_ALU, PRIO, XFIRST): single-line consts at their
+/// reference values, listed in `SEARCH_AXES`, every listed value compiles (at the declared grid point and
+/// PREFETCH across ROWS/UNROLL/SPLIT/ILP) and a non-reference value changes the text.
+#[test]
+fn new_schedule_axes_compile_and_reference_values_are_unchanged() {
+    let axes: [(&str, &str, &str, &[&str]); 4] = [
+        ("PREFETCH", "u8", "0", &["0", "1"]),
+        ("DELAY_ALU", "bool", "false", &["false", "true"]),
+        ("PRIO", "u8", "0", &["0", "1", "2"]),
+        ("XFIRST", "bool", "false", &["false", "true"]),
+    ];
+    let reference = peacemaker_rip::compile_named(RIP, "gemv_mq2_xbatch.rip", Arch::Gfx1201, "xbatch")
+        .unwrap_or_else(|e| panic!("{e}"))
+        .s_text;
+    for (name, ty, old, values) in axes {
+        let line = format!("const {name}: {ty} = {old};");
+        assert_eq!(RIP.lines().filter(|l| *l == line).count(), 1, "{line}");
+        let list: Vec<String> = values.iter().map(|v| format!("\"{v}\"")).collect();
+        assert!(RIP.contains(&format!("(\"{name}\", \"schedule\", &[{}])", list.join(", "))), "{name}");
+        for value in values {
+            let src = RIP.replace(&line, &format!("const {name}: {ty} = {value};"));
+            let text = peacemaker_rip::compile_named(&src, "gemv_mq2_xbatch.rip", Arch::Gfx1201, "xbatch")
+                .unwrap_or_else(|e| panic!("{name}={value}: {e}"))
+                .s_text;
+            assert_eq!(text == reference, *value == old, "{name}={value}");
+        }
+    }
+    // PREFETCH across the generator grid: it only refuses what the grid already refuses.
+    for rows in [1u8, 2, 4] {
+        for unroll in [1u8, 2, 4] {
+            for split in [false, true] {
+                for ilp in [false, true] {
+                    let p = Params { rows, cap: 8, unroll, split, ilp };
+                    let src = with_point(&p).replace("const PREFETCH: u8 = 0;", "const PREFETCH: u8 = 1;");
+                    let got = peacemaker_rip::compile_named(&src, "gemv_mq2_xbatch.rip", Arch::Gfx1201, "xbatch");
+                    assert_eq!(emit_text(&p).is_ok(), got.is_ok(), "{}: {:?}", p.tag(), got.err());
+                }
+            }
+        }
+    }
+}

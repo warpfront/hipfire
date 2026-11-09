@@ -20,6 +20,28 @@
 //   SPLIT   activation loads as 4xb64 instead of 2xb128
 //   ILP     the quad_ILP schedule (two weight sets, two groups' fmac chains interleaved term by term)
 //
+// Four further `schedule` axes exist only in the script (the Rust generator has no twin for them; at their
+// declared values the emitted text is byte-identical to the generator's). Each keeps the DAG of every
+// output: the same instructions' math, operands, order of accumulation and rounding; only the order and
+// placement of instructions and issue hints change.
+//
+//   PREFETCH  {0,1}: 1 refills each quad's header/payload registers (`hdr`/`pk`) with the NEXT quad's loads
+//             once the quad's last activation load has issued and the group is dequantized (the dequant is
+//             the only reader of those registers), instead of draining every counter (`wait_all`) at the
+//             end of the quad trip. The loads are the same loads at the same addresses (quad + 1's), so
+//             every `fma` sees the identical bits; no VGPRs are added (the refill is in place: every plan
+//             that fits today fits). The first quad's loads are peeled in front of the loops (only when
+//             there is a quad). On the last quad the refill re-reads the current quad (base + 0 instead of
+//             + 0x120), so nothing past A's last group is ever read; the tail groups issue their own loads
+//             as today. `S_T1` counts the quads left; SGPRs 44..47 hold the refill bases (declared only
+//             when PREFETCH = 1).
+//   DELAY_ALU `b.enable_delay_alu()` right after `Builder::new`: `s_delay_alu` issue hints only.
+//   PRIO      {0,1,2}: nonzero emits `s_setprio PRIO` at the start of every section's dot-product phase and
+//             `s_setprio 0` before the reduction: a wave arbitration hint, no data flow.
+//   XFIRST    the activation loads of the first ring items issue before the first group's weight loads
+//             instead of after (load issue order only; it applies to the loads `body` itself issues, so
+//             under PREFETCH = 1 only to the tail groups).
+//
 // CAP, the x-batch capacity {1,2,4,8} (code paths for B = 1..=CAP; B > CAP clamps, B <= 0 stores nothing),
 // is NOT a schedule axis: a CAP < 8 object equals the CAP = 8 one only on B <= CAP, so it is not in
 // `SEARCH_AXES` (a domain-restricted axis needs a declared domain, phase 3).
@@ -41,12 +63,20 @@ const SEARCH_AXES: &[(&str, &str, &[&str])] = &[
     ("UNROLL", "schedule", &["1", "2", "4"]),
     ("SPLIT", "schedule", &["false", "true"]),
     ("ILP", "schedule", &["false", "true"]),
+    ("PREFETCH", "schedule", &["0", "1"]),
+    ("DELAY_ALU", "schedule", &["false", "true"]),
+    ("PRIO", "schedule", &["0", "1", "2"]),
+    ("XFIRST", "schedule", &["false", "true"]),
 ];
 const ROWS: u8 = 4;
 const CAP: u8 = 8;
 const UNROLL: u8 = 1;
 const SPLIT: bool = false;
 const ILP: bool = false;
+const PREFETCH: u8 = 0;
+const DELAY_ALU: bool = false;
+const PRIO: u8 = 0;
+const XFIRST: bool = false;
 
 const SYMBOL: &str = "gemv_mq2g256v2_xbatch_pm";
 const GROUP_BYTES: u32 = 72;
@@ -78,6 +108,8 @@ const S_T0: u8 = 40;
 const S_T1: u8 = 41;
 const S_ROW0X4: u8 = 42;
 const S_MAIN: u8 = 43;
+// First of the four per-row refill bases (`PREFETCH = 1`): `s_row(r)` + 0x120, or + 0 on the last quad.
+const S_NEXT_BASE: u8 = 44;
 
 fn s_row(r: u8) -> u8 {
     16 + r
@@ -93,12 +125,30 @@ struct Params {
     unroll: u8,
     split: bool,
     ilp: bool,
+    prefetch: u8,
+    delay_alu: bool,
+    prio: u8,
+    xfirst: bool,
 }
 
 fn tag(p: &Params) -> String {
     let load = if p.split { "split" } else { "native" };
     let sched = if p.ilp { "quadilp" } else { "anchor" };
-    format!("r{}_b{}_u{}_{}_{}", p.rows, p.cap, p.unroll, load, sched)
+    let mut t = format!("r{}_b{}_u{}_{}_{}", p.rows, p.cap, p.unroll, load, sched);
+    // The new axes name the variant only off their declared values (the declared point keeps its tag).
+    if p.prefetch != 0 {
+        t = format!("{}_pf{}", t, p.prefetch);
+    }
+    if p.delay_alu {
+        t = format!("{}_dly", t);
+    }
+    if p.prio != 0 {
+        t = format!("{}_prio{}", t, p.prio);
+    }
+    if p.xfirst {
+        t = format!("{}_xf", t);
+    }
+    t
 }
 
 fn validate(p: &Params) -> Result<(), String> {
@@ -111,16 +161,35 @@ fn validate(p: &Params) -> Result<(), String> {
     if p.unroll != 1 && p.unroll != 2 && p.unroll != 4 {
         return Err(format!("unroll {} not in {{1,2,4}}", p.unroll));
     }
+    if p.prefetch != 0 && p.prefetch != 1 {
+        return Err(format!("prefetch {} not in {{0,1}}", p.prefetch));
+    }
+    if p.prio > 2 {
+        return Err(format!("prio {} not in {{0,1,2}}", p.prio));
+    }
     Ok(())
 }
 
 fn emit(spec: Spec) -> Result<Emitted, String> {
-    let p = Params { rows: ROWS, cap: CAP, unroll: UNROLL, split: SPLIT, ilp: ILP };
+    let p = Params {
+        rows: ROWS,
+        cap: CAP,
+        unroll: UNROLL,
+        split: SPLIT,
+        ilp: ILP,
+        prefetch: PREFETCH,
+        delay_alu: DELAY_ALU,
+        prio: PRIO,
+        xfirst: XFIRST,
+    };
     validate(&p)?;
     let lay = Lay::new(&p);
     check(&p, &lay)?;
     let regs = plan_ranges(&p, &lay)?;
     let mut b = Builder::new(kernel_spec(&p, spec.arch), regs);
+    if p.delay_alu {
+        b.enable_delay_alu();
+    }
     emit_body(&mut b, &p, &lay, ".Lpx")?;
     branch(&mut b, "s_endpgm")?;
     b.finish()
@@ -328,6 +397,9 @@ fn plan_ranges(p: &Params, lay: &Lay) -> Result<RegPlan, String> {
     for (name, base, width) in sranges {
         regs.add_range(name, "s", base, width, Live::Whole)?;
     }
+    if p.prefetch == 1 {
+        regs.add_range("next_row_offsets", "s", S_NEXT_BASE, 4, Live::Whole)?;
+    }
     let r = lay.r;
     let mut vranges = vec![
         ("lane", 0u16, 1u16),
@@ -478,8 +550,25 @@ fn advance(b: &mut Builder, p: &Params, nb: u8) -> Result<(), String> {
 }
 
 fn quad_body(b: &mut Builder, p: &Params, lay: &Lay, nb: u8) -> Result<(), String> {
-    body(b, p, lay, nb, &[0u8, 1u8, 2u8, 3u8])?;
+    body(b, p, lay, nb, &[0u8, 1u8, 2u8, 3u8], p.prefetch == 1)?;
     advance(b, p, nb)
+}
+
+// `PREFETCH = 1`, once per quad before its first load: `S_T1` counts the quads left (this one included); the
+// refill bases are the rows' next-quad bases while one remains and the current quad's bases on the last one
+// (an in-bounds re-read the tail never uses), so no refill load is ever past A's last group.
+fn prefetch_bases(b: &mut Builder, p: &Params) -> Result<(), String> {
+    salu(b, &format!("s_cmp_gt_u32 s{}, 1", S_T1), &[], &[S_T1])?;
+    salu(b, &format!("s_cselect_b32 s{}, 0x120, 0", S_T0), &[S_T0], &[])?;
+    for r in 0..p.rows {
+        salu(
+            b,
+            &format!("s_add_co_i32 s{}, s{}, s{}", S_NEXT_BASE + r, s_row(r), S_T0),
+            &[S_NEXT_BASE + r],
+            &[s_row(r), S_T0],
+        )?;
+    }
+    salu(b, &format!("s_add_co_i32 s{}, s{}, -1", S_T1, S_T1), &[S_T1], &[S_T1])
 }
 
 // The complete kernel body for `nb` columns.
@@ -493,8 +582,21 @@ fn section(b: &mut Builder, p: &Params, lay: &Lay, nb: u8, pre: &str) -> Result<
             }
         }
     }
+    if p.prio != 0 {
+        salu(b, &format!("s_setprio {}", p.prio), &[], &[])?;
+    }
     salu(b, "s_lshr_b32 s36, s14, 2", &[S_QUADS], &[S_GROUPS])?;
     salu(b, "s_and_b32 s37, s14, 3", &[S_TAIL], &[S_GROUPS])?;
+    if p.prefetch == 1 {
+        // Peel quad 0's weight loads in front of the loops (the loops refill for the next quad), only when a
+        // quad exists: a short row (fewer than four groups) must not read four groups.
+        salu(b, &format!("s_mov_b32 s{}, s{}", S_T1, S_QUADS), &[S_T1], &[S_QUADS])?;
+        salu(b, &format!("s_cmp_eq_u32 s{}, 0", S_QUADS), &[], &[S_QUADS])?;
+        branch(b, &format!("s_cbranch_scc1 {}_b{}_tail", pre, nb))?;
+        for j in 0..4u8 {
+            weight_loads(b, lay, p.rows, j, s_row(0))?;
+        }
+    }
     if p.unroll > 1 {
         // main loop: quads / unroll trips of `unroll` quads, then the quads % unroll remainder.
         let shift = p.unroll.trailing_zeros();
@@ -513,23 +615,37 @@ fn section(b: &mut Builder, p: &Params, lay: &Lay, nb: u8, pre: &str) -> Result<
         })?;
         b.label(&format!("{}_b{}_rem", pre, nb))?;
     }
-    salu(b, "s_cmp_eq_u32 s36, 0", &[], &[S_QUADS])?;
-    branch(b, &format!("s_cbranch_scc1 {}_b{}_tail", pre, nb))?;
+    // PREFETCH = 1: whoever leaves the quad loops with quads done (the loops' last refill is in flight into
+    // `hdr`/`pk`) drains at `_drain`; the ledger follows the fall-through only, so a branch to `_tail` or
+    // `_fold` must never carry a pending refill. Quad 0 exists on every path that reaches the loops, so with
+    // UNROLL = 1 no remainder check is needed.
+    let leave = if p.prefetch == 1 { format!("{}_b{}_drain", pre, nb) } else { format!("{}_b{}_tail", pre, nb) };
+    if p.prefetch == 0 || p.unroll > 1 {
+        salu(b, "s_cmp_eq_u32 s36, 0", &[], &[S_QUADS])?;
+        branch(b, &format!("s_cbranch_scc1 {}", leave))?;
+    }
     b.loop_(&format!("{}_b{}_quad", pre, nb), |b| {
         quad_body(b, p, lay, nb)?;
         salu(b, "s_add_co_i32 s36, s36, -1", &[S_QUADS], &[S_QUADS])?;
         salu(b, "s_cmp_lg_u32 s36, 0", &[], &[S_QUADS])?;
         branch(b, &format!("s_cbranch_scc1 {}_b{}_quad", pre, nb))
     })?;
+    if p.prefetch == 1 {
+        b.label(&leave)?;
+        b.wait_all()?;
+    }
     b.label(&format!("{}_b{}_tail", pre, nb))?;
     // Tail group t (at the post-quad bases) accumulates into stream t.
     for t in 0..3u8 {
         salu(b, &format!("s_cmp_gt_u32 s37, {}", t), &[], &[S_TAIL])?;
         branch(b, &format!("s_cbranch_scc0 {}_b{}_fold", pre, nb))?;
-        body(b, p, lay, nb, &[t])?;
+        body(b, p, lay, nb, &[t], false)?;
     }
     b.label(&format!("{}_b{}_fold", pre, nb))?;
     fold(b, lay, nb)?;
+    if p.prio != 0 {
+        salu(b, "s_setprio 0", &[], &[])?;
+    }
     reduce(b, p, lay, nb)?;
     store(b, p, lay, nb, pre)
 }
@@ -545,8 +661,11 @@ struct GroupStep {
 // Groups `js` (slot = stream = immediate index) of the rows against every column. Weights of the first
 // group and its activations issue first, then the remaining weights; activations of later items stream
 // through the ring as earlier items retire. `quad_ILP` decodes consecutive group pairs into two weight
-// sets and interleaves their fmac chains term by term.
-fn body(b: &mut Builder, p: &Params, lay: &Lay, nb: u8, js: &[u8]) -> Result<(), String> {
+// sets and interleaves their fmac chains term by term. `XFIRST` issues the first activations ahead of the
+// first group's weights. `pf` (PREFETCH = 1, quads only): the weights were loaded by the previous quad's
+// refill (or the peel), so none issue here and the trip does not drain; the refill for the next quad
+// issues once every activation is in flight (`refill`), the end of this quad's loads.
+fn body(b: &mut Builder, p: &Params, lay: &Lay, nb: u8, js: &[u8], pf: bool) -> Result<(), String> {
     let mut packets = Vec::new();
     if p.ilp {
         let mut i = 0usize;
@@ -596,21 +715,36 @@ fn body(b: &mut Builder, p: &Params, lay: &Lay, nb: u8, js: &[u8]) -> Result<(),
     }
     let total = items.len() as u16;
     let slots = lay.slots(nb);
-    weight_loads(b, lay, p.rows, js[0])?;
+    if pf {
+        prefetch_bases(b, p)?;
+    } else if !p.xfirst {
+        weight_loads(b, lay, p.rows, js[0], s_row(0))?;
+    }
     let mut issued = 0u16;
     let first_loads = if slots < (nb as u16) { slots } else { nb as u16 };
     while issued < first_loads {
         x_load(b, p, lay, nb, &items, issued)?;
         issued += 1;
     }
-    for k in 1..js.len() {
-        weight_loads(b, lay, p.rows, js[k])?;
+    if !pf {
+        if p.xfirst {
+            weight_loads(b, lay, p.rows, js[0], s_row(0))?;
+        }
+        for k in 1..js.len() {
+            weight_loads(b, lay, p.rows, js[k], s_row(0))?;
+        }
     }
+    let mut at = 0usize;
+    let mut dequantized = 0usize;
     for entry in &plan {
         let groups = &entry.0;
         let steps = &entry.1;
         for g in groups {
             dequant(b, lay, p.rows, g.0, g.1)?;
+            dequantized += 1;
+        }
+        if pf {
+            at = refill(b, lay, p.rows, js, at, dequantized, issued, total)?;
         }
         for step in steps {
             let first = step[0].cols[0].1;
@@ -618,6 +752,9 @@ fn body(b: &mut Builder, p: &Params, lay: &Lay, nb: u8, js: &[u8]) -> Result<(),
             while issued < reach {
                 x_load(b, p, lay, nb, &items, issued)?;
                 issued += 1;
+            }
+            if pf {
+                at = refill(b, lay, p.rows, js, at, dequantized, issued, total)?;
             }
             for term in 0..8usize {
                 for g in step {
@@ -629,21 +766,42 @@ fn body(b: &mut Builder, p: &Params, lay: &Lay, nb: u8, js: &[u8]) -> Result<(),
             }
         }
     }
+    if pf {
+        if at != js.len() {
+            return Err(format!("prefetch refilled {} of {} groups", at, js.len()));
+        }
+        return Ok(());
+    }
     b.wait_all()
 }
 
+// The next quad's weight loads of the groups already dequantized (their `hdr`/`pk` registers are dead), once
+// every activation load of this quad has issued, in group order (the order of the peel, so the loop's
+// back-edge ledger equals its entry ledger). Returns the number of groups refilled so far.
+fn refill(b: &mut Builder, lay: &Lay, rows: u8, js: &[u8], at: usize, dequantized: usize, issued: u16, total: u16) -> Result<usize, String> {
+    let mut n = at;
+    if issued < total {
+        return Ok(n);
+    }
+    while n < dequantized {
+        weight_loads(b, lay, rows, js[n], S_NEXT_BASE)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
 // Lane-selected half headers and payload dwords of group slot `j`, all rows.
-fn weight_loads(b: &mut Builder, lay: &Lay, rows: u8, j: u8) -> Result<(), String> {
+fn weight_loads(b: &mut Builder, lay: &Lay, rows: u8, j: u8, sbase: u8) -> Result<(), String> {
     let off: u32 = (j as u32) * GROUP_BYTES;
     for r in 0..rows {
         let h = lay.hdr(j, r);
         let suffix = if off == 0 { String::new() } else { format!(" offset:{}", off) };
         vmem(
             b,
-            &format!("buffer_load_b32 v{}, v1, s[20:23], s{} offen{}", h, s_row(r), suffix),
+            &format!("buffer_load_b32 v{}, v1, s[20:23], s{} offen{}", h, sbase + r, suffix),
             &[h],
             &[HDR_OFF],
-            &[20u8, 21u8, 22u8, 23u8, s_row(r)],
+            &[20u8, 21u8, 22u8, 23u8, sbase + r],
             false,
         )?;
     }
@@ -651,10 +809,10 @@ fn weight_loads(b: &mut Builder, lay: &Lay, rows: u8, j: u8) -> Result<(), Strin
         let pk = lay.pk(j, r);
         vmem(
             b,
-            &format!("buffer_load_b32 v{}, v2, s[20:23], s{} offen offset:{}", pk, s_row(r), off + 8),
+            &format!("buffer_load_b32 v{}, v2, s[20:23], s{} offen offset:{}", pk, sbase + r, off + 8),
             &[pk],
             &[PK_OFF],
-            &[20u8, 21u8, 22u8, 23u8, s_row(r)],
+            &[20u8, 21u8, 22u8, 23u8, sbase + r],
             false,
         )?;
     }
