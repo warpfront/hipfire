@@ -183,6 +183,20 @@ impl Qwen4Bundle {
         result
     }
 
+    /// Pay the fault check an unchecked async prepare owes (`HIPFIRE_QWEN4_LANE_PREPARE_ASYNC`) on
+    /// every rank, before the non-mesh work that would sync under another label or drop the
+    /// fault (`at` names it): admission, a prefill tile, the elastic reserve's frees and loans
+    /// ([`EpMeshLanes::settle_prepare`]). A no-op when the lanes are not armed or nothing is owed.
+    /// On a fault the mesh is quarantined and the error names the prepare.
+    pub(crate) fn ep_mesh_settle_prepare(&mut self, gpu: &mut Gpu, at: &str) -> Result<(), String> {
+        let Some(mut mesh) = self.mesh_lanes.take() else {
+            return Ok(());
+        };
+        let result = mesh.settle_prepare(self, gpu, at);
+        self.mesh_lanes = Some(mesh);
+        result
+    }
+
     /// The lane's counters as the done event reports them: the rank-0 store's
     /// window statistics with the mesh root's retirement.
     pub fn lane_spec_stats_for(&self, epoch: &RequestEpoch) -> Option<LaneSpecStats> {

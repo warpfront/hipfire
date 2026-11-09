@@ -144,6 +144,15 @@ pub struct FeatureFlags {
     /// of consecutive rows (`topk8_rescore_k2560_rows`), bytes identical. Default on for exact
     /// gfx1201, `0` is the kill switch.
     pub qwen4_draft_topk8_rows: bool,
+    /// Async window prepare on the EP mesh lanes (`HIPFIRE_QWEN4_LANE_PREPARE_ASYNC`, default on
+    /// for exact gfx1201, `0` is the kill switch that restores the prepare barrier):
+    /// `RankLane::prepare_commit` enqueues the prepare phase (GDN rollback, trunk restore copies,
+    /// head history commit-fill, pending-hidden copy) and returns without its end-of-phase
+    /// `device_synchronize` + wait-error read, so the host turn runs while the phase's device tail
+    /// finishes. A device fault of the phase is found one host turn late, at the next device wait
+    /// of the rank (or at a settle before work that would carry it under another label), and is
+    /// reported as `prepare (deferred)`. Same kernels in the same stream order, bytes identical.
+    pub qwen4_lane_prepare_async: bool,
     /// EP partial tile mask implicit zeros (`HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO`),
     /// default on for exact gfx1201, `0` is the kill switch: the foreign experts'
     /// grouped down rows are marked `-1` in the combine order instead of being
@@ -1234,6 +1243,8 @@ impl FeatureFlags {
                 .unwrap_or(is_gfx1201),
             qwen4_draft_glue_fold: parse_bool("HIPFIRE_QWEN4_DRAFT_GLUE_FOLD").unwrap_or(is_gfx1201),
             qwen4_draft_topk8_rows: parse_bool("HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS").unwrap_or(is_gfx1201),
+            qwen4_lane_prepare_async: parse_bool("HIPFIRE_QWEN4_LANE_PREPARE_ASYNC")
+                .unwrap_or(is_gfx1201),
             qwen4_ep_pmask_implicit_zero: parse_bool("HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO")
                 .unwrap_or(is_gfx1201),
             qwen4_ep_pmask_implicit_zero_poison: parse_bool(
@@ -1953,6 +1964,12 @@ impl FeatureFlags {
         self.qwen4_draft_topk8_rows && self.arch == "gfx1201"
     }
 
+    /// Async window prepare of the EP mesh lanes (`HIPFIRE_QWEN4_LANE_PREPARE_ASYNC`): exact
+    /// gfx1201 only, default on, `0` is the kill switch.
+    pub fn qwen4_lane_prepare_async_enabled(&self) -> bool {
+        self.qwen4_lane_prepare_async && self.arch == "gfx1201"
+    }
+
     /// EP partial tile mask implicit zeros (`HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO`):
     /// exact gfx1201 only.
     pub fn qwen4_ep_pmask_implicit_zero_enabled(&self) -> bool {
@@ -2347,6 +2364,7 @@ impl FeatureFlags {
             qwen4_moe_combine_inline_order: false,
             qwen4_draft_glue_fold: false,
             qwen4_draft_topk8_rows: false,
+            qwen4_lane_prepare_async: false,
             qwen4_ep_pmask_implicit_zero: false,
             qwen4_ep_pmask_implicit_zero_poison: false,
             qwen4_hc_row_fold: false,
@@ -3538,6 +3556,29 @@ mod tests {
             assert!(!off.qwen4_draft_topk8_rows_enabled(), "{arch}");
             let on = FeatureFlags::from_lookup(arch, with("1"));
             assert_eq!(on.qwen4_draft_topk8_rows_enabled(), exact, "{arch}");
+        }
+    }
+
+    /// The async lane prepare is default on (`=0` kills) and reaches exact gfx1201 only.
+    #[test]
+    fn qwen4_lane_prepare_async_is_default_on_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |key: &str| -> std::result::Result<String, ()> {
+                if key == "HIPFIRE_QWEN4_LANE_PREPARE_ASYNC" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_lane_prepare_async_enabled(), exact, "{arch}");
+            let off = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!off.qwen4_lane_prepare_async_enabled(), "{arch}");
+            let on = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(on.qwen4_lane_prepare_async_enabled(), exact, "{arch}");
         }
     }
 

@@ -155,6 +155,49 @@ impl Rendezvous {
 struct GatherSim {
     inner: ScriptedExecutor,
     rv: Arc<Rendezvous>,
+    /// `HIPFIRE_QWEN4_LANE_PREPARE_ASYNC` as `RankLane::prepare_commit` runs it: the prepare
+    /// returns without its device wait and owes the fault check ([`PrepareCheck`]); the draft
+    /// round's and the verify's readbacks pay it ([`GatherSim::readback`]).
+    async_prepare: bool,
+    check: PrepareCheck,
+    /// The prepare (0-based, in the order this rank runs them) whose device work faults: read at
+    /// the prepare's own wait with the flag off, at the next device wait with it on.
+    prepare_fault_at: Option<usize>,
+    prepares: usize,
+    /// A device fault recorded in the wait-error words and not yet read.
+    fault_recorded: bool,
+}
+
+impl GatherSim {
+    /// A rank with the incumbent prepare barrier and no scripted device fault.
+    fn new(inner: ScriptedExecutor, rv: Arc<Rendezvous>) -> Self {
+        Self {
+            inner,
+            rv,
+            async_prepare: false,
+            check: PrepareCheck::default(),
+            prepare_fault_at: None,
+            prepares: 0,
+            fault_recorded: false,
+        }
+    }
+
+    /// One device wait of the rank (a draft round's or the verify's readback) and the wait-error
+    /// read: a recorded fault is read once and is the wait's error, labelled as the real
+    /// readbacks label it; a clean wait pays the owed check.
+    fn readback(&mut self, draft: bool) -> Result<(), RankError> {
+        if std::mem::take(&mut self.fault_recorded) {
+            let e = "scripted device-wait timeout";
+            let text = if draft {
+                self.check.draft_wait_failure(e)
+            } else {
+                self.check.verify_wait_failure(e)
+            };
+            return Err(rank_err(self.ownership().rank, text));
+        }
+        self.check.paid();
+        Ok(())
+    }
 }
 
 impl LaneMeshExecutor for GatherSim {
@@ -179,6 +222,10 @@ impl LaneMeshExecutor for GatherSim {
         for _ in 0..result.head_gathers {
             self.rv.cross(rank)?;
         }
+        // A rank that executed no op of the round reads nothing back (an X2 peer).
+        if result.ops_executed > 0 {
+            self.readback(true)?;
+        }
         Ok(result)
     }
     fn run_verify(&mut self, plan: &VerifyPlan) -> Result<RankVerifyResult, RankError> {
@@ -187,15 +234,30 @@ impl LaneMeshExecutor for GatherSim {
         for _ in 0..plan.ledger.target_exchanges {
             self.rv.cross(rank)?;
         }
+        self.readback(false)?;
         Ok(result)
     }
     fn prepare_commit(&mut self, d: &CommitDecision) -> Result<PreparedReceipt, RankError> {
-        self.inner.prepare_commit(d)
+        let receipt = self.inner.prepare_commit(d)?;
+        let faults = self.prepare_fault_at == Some(self.prepares);
+        self.prepares += 1;
+        if self.async_prepare {
+            self.check.owe();
+            self.fault_recorded |= faults;
+        } else if faults {
+            // The incumbent's end-of-phase wait reads the fault: the prepare itself fails.
+            return Err(rank_err(
+                self.ownership().rank,
+                "prepare: scripted device-wait timeout",
+            ));
+        }
+        Ok(receipt)
     }
     fn publish_commit(&mut self, d: &CommitDecision) {
         self.inner.publish_commit(d)
     }
     fn abort_step(&mut self, k: &MeshStepKey, p: StepPhase, r: &str) {
+        self.check.waive();
         self.inner.abort_step(k, p, r)
     }
     fn evidence(&mut self, k: &MeshStepKey) -> Option<RankCostEvidence> {
@@ -236,6 +298,8 @@ struct RankSetup {
     skew_us: f32,
     rogue: bool,
     capacity_error: Option<String>,
+    async_prepare: bool,
+    prepare_fault_at: Option<usize>,
 }
 
 impl Default for RankSetup {
@@ -246,6 +310,8 @@ impl Default for RankSetup {
             skew_us: 0.0,
             rogue: false,
             capacity_error: None,
+            async_prepare: false,
+            prepare_fault_at: None,
         }
     }
 }
@@ -270,10 +336,9 @@ impl ThreadedFanout {
                     inner.skew_us = setup.skew_us;
                     inner.rogue_sampler_output = setup.rogue;
                     inner.capacity_error = setup.capacity_error;
-                    let mut sim = GatherSim {
-                        inner,
-                        rv: rv_thread.clone(),
-                    };
+                    let mut sim = GatherSim::new(inner, rv_thread.clone());
+                    sim.async_prepare = setup.async_prepare;
+                    sim.prepare_fault_at = setup.prepare_fault_at;
                     while let Ok(Some(job)) = job_rx.recv() {
                         let (reply, failed) = job(&mut sim);
                         if failed {
@@ -658,9 +723,11 @@ fn mesh_lane_ep_serial_dispatch_of_a_collective_phase_cannot_rendezvous() {
         .windows
         .extend([script(1, 0, &[10], &[10, 4])]);
     let mut ranks: Vec<GatherSim> = (0..2)
-        .map(|r| GatherSim {
-            inner: ScriptedExecutor::new(RankOwnership::ep(r), script_rc.clone()),
-            rv: rv.clone(),
+        .map(|r| {
+            GatherSim::new(
+                ScriptedExecutor::new(RankOwnership::ep(r), script_rc.clone()),
+                rv.clone(),
+            )
         })
         .collect();
     let mut root = root(false);
@@ -1845,4 +1912,359 @@ fn s4_round_asks_the_batched_head_whether_any_op_reads_a_distribution() {
     })
     .is_some());
     assert_eq!(seen, [false, true]);
+}
+
+// ---- the async window prepare's deferred fault check (HIPFIRE_QWEN4_LANE_PREPARE_ASYNC) ---------
+//
+// `RankLane` needs a `Gpu`, so these test the pieces it is built from: the owed-check state machine
+// every one of its paths goes through ([`PrepareCheck`]), the labels of the readbacks that pay it,
+// the preflight's fatal turn, the begin fan-out's mesh failure, the settle's quarantine, and a
+// whole step sequence over scripted ranks that apply the same state machine to a scripted device
+// fault ([`GatherSim`]).
+
+/// Owed from the prepare until a clean wait, a settle or an abort; nothing is owed without an
+/// async prepare.
+#[test]
+fn the_prepare_check_is_owed_from_the_prepare_until_a_clean_wait_or_an_abort() {
+    let mut check = PrepareCheck::default();
+    assert!(!check.is_owed(), "nothing is owed before an async prepare");
+    check.owe();
+    assert!(check.is_owed());
+    check.paid();
+    assert!(!check.is_owed(), "a clean device wait pays it");
+    check.owe();
+    check.waive();
+    assert!(
+        !check.is_owed(),
+        "an abort waives it: the mesh is quarantined"
+    );
+}
+
+/// A settle waits only when the check is owed and only once, clears it before the wait (a fault
+/// is reported once), and names the prepare.
+#[test]
+fn settle_waits_only_when_owed_names_the_prepare_and_reports_a_fault_once() {
+    let mut waits = 0u32;
+    let mut check = PrepareCheck::default();
+    assert_eq!(
+        check.settle(|| {
+            waits += 1;
+            Ok(())
+        }),
+        Ok(())
+    );
+    assert_eq!(waits, 0, "nothing owed: no wait");
+
+    check.owe();
+    assert_eq!(
+        check.settle(|| {
+            waits += 1;
+            Ok(())
+        }),
+        Ok(())
+    );
+    assert_eq!(waits, 1);
+    assert!(!check.is_owed(), "a clean settle pays it");
+
+    check.owe();
+    let error = check
+        .settle(|| {
+            waits += 1;
+            Err("synchronize: boom".to_string())
+        })
+        .expect_err("the wait's fault is the prepare's");
+    assert_eq!(error, "prepare (deferred): synchronize: boom");
+    assert!(!check.is_owed(), "reported once");
+    assert_eq!(
+        check.settle(|| {
+            waits += 1;
+            Err("never asked".to_string())
+        }),
+        Ok(())
+    );
+    assert_eq!(waits, 2);
+}
+
+/// With no prepare owing its fault check (`HIPFIRE_QWEN4_LANE_PREPARE_ASYNC=0`, or the check
+/// already paid) a failed readback reads exactly as it always did.
+#[test]
+fn readback_failures_keep_their_text_when_no_prepare_check_is_owed() {
+    let check = PrepareCheck::default();
+    assert_eq!(check.draft_wait_failure("boom"), "draft download: boom");
+    assert_eq!(check.verify_wait_failure("boom"), "boom");
+}
+
+/// The first failed readback after an unchecked prepare is attributed to it
+/// (`prepare (deferred)`), keeps the device's own text and names the readback that carried it.
+#[test]
+fn the_first_readback_failure_after_an_unchecked_prepare_names_the_prepare() {
+    let mut check = PrepareCheck::default();
+    check.owe();
+    let draft = check.draft_wait_failure("boom");
+    let verify = check.verify_wait_failure("boom");
+    for (text, at) in [
+        (&draft, "the draft download"),
+        (&verify, "the verify readback"),
+    ] {
+        assert!(text.starts_with(DEFERRED_PREPARE), "{text}");
+        assert!(text.contains("boom"), "{text}");
+        assert!(text.contains(at), "{text}");
+    }
+}
+
+/// A deferred prepare fault found by the preflight's settle is fatal to the mesh; a capacity
+/// refusal (the growth's own error) and every other rejection stay soft.
+#[test]
+fn a_deferred_fault_in_the_preflight_is_fatal_and_a_capacity_refusal_is_not() {
+    let deferred: R<()> = Err(format!("{DEFERRED_PREPARE}: synchronize: boom"));
+    assert_eq!(
+        deferred_preflight_fatal(&deferred),
+        Some("prepare (deferred): synchronize: boom".to_string())
+    );
+    let refusal: R<()> = Err(format!(
+        "{}16301 positions for epoch: hipMemCreate out of memory",
+        crate::lane_exec::PROVISION_MAP_REFUSED
+    ));
+    assert_eq!(deferred_preflight_fatal(&refusal), None);
+    let other: R<()> = Err("lane is Poisoned, not Decoding".to_string());
+    assert_eq!(deferred_preflight_fatal(&other), None);
+    assert_eq!(deferred_preflight_fatal(&Ok(())), None);
+}
+
+fn ready(rank: usize) -> RankReady {
+    RankReady {
+        key: MeshStepKey {
+            topology_generation: 3,
+            step_seq: 0,
+            lanes: Vec::new(),
+            policy_digest: 0,
+        },
+        rank,
+        start_digest: 0,
+        status: ReadyStatus::Ready {
+            tickets: Vec::new(),
+        },
+    }
+}
+
+/// The begin fan-out: every rank's answer in rank order, unless a rank found a deferred prepare
+/// fault (its `fatal`), which is a mesh failure of that rank (the step aborts, the mesh is
+/// quarantined) and not a rejection.
+#[test]
+fn a_rank_fatal_at_begin_is_a_mesh_failure_of_that_rank_not_a_rejection() {
+    let all = vec![(ready(0), None), (ready(1), None)];
+    let readies = begin_outcome(all).expect("no rank is fatal");
+    assert_eq!(readies, vec![ready(0), ready(1)]);
+
+    let reason = format!("{DEFERRED_PREPARE}: synchronize: boom");
+    let all = vec![(ready(0), None), (ready(1), Some(reason.clone()))];
+    let error = begin_outcome(all).expect_err("rank 1 is fatal");
+    assert_eq!(error, rank_err(1, reason));
+}
+
+/// A settle that finds no fault leaves the mesh usable; one that does quarantines the root and
+/// every rank, names the prepare, the rank and what it was found before, and every later step
+/// fails with the record.
+#[test]
+fn a_settle_fault_quarantines_the_mesh_and_every_later_step_fails_with_the_record() {
+    let mut root = root(false);
+    let mut fan = fanout_with(
+        vec![script(1, 0, &[10], &[10, 4]), script(1, 1, &[20], &[20, 5])],
+        |_, setup| setup.async_prepare = true,
+    );
+    admit(&mut root, &mut fan, 1, 10, 9, None, Some(1));
+    let budgets = budgets(LabRoutes::Batched, 1);
+    let first = drive_step(
+        &mut root,
+        &mut fan,
+        None,
+        &[req(1, 16)],
+        &budgets,
+        &mut GreedyRule,
+    )
+    .expect("a clean async step");
+    let key = first.key.clone();
+
+    assert_eq!(
+        quarantine_unchecked(
+            &mut root,
+            &mut fan,
+            &key,
+            "admission",
+            Ok(vec![Ok(()), Ok(())])
+        ),
+        Ok(())
+    );
+    assert!(
+        root.quarantined().is_none(),
+        "a clean settle changes nothing"
+    );
+
+    let faulty = Ok(vec![
+        Ok(()),
+        Err(format!("{DEFERRED_PREPARE}: synchronize: boom")),
+    ]);
+    let error = quarantine_unchecked(&mut root, &mut fan, &key, "admission", faulty)
+        .expect_err("rank 1 holds a deferred fault");
+    for part in [
+        "prepare (deferred)",
+        "rank 1",
+        "found before admission",
+        "mesh quarantined",
+    ] {
+        assert!(error.contains(part), "{error}");
+    }
+    let record = root.quarantined().expect("the root is quarantined");
+    assert!(record.reason.contains(DEFERRED_PREPARE), "{record}");
+
+    let later = drive_step(
+        &mut root,
+        &mut fan,
+        None,
+        &[req(1, 16)],
+        &budgets,
+        &mut GreedyRule,
+    )
+    .expect_err("a quarantined mesh runs no step");
+    assert!(matches!(later, ProtocolError::Aborted(_)), "{later}");
+    let sims = fan.finish();
+    for sim in &sims {
+        assert!(!sim.aborts.is_empty(), "every rank follows the quarantine");
+        assert_eq!(sim.published, vec![key.step_seq]);
+    }
+}
+
+/// Two steps of lane 1 on two scripted ranks; step 0's prepare faults on `fault_rank`.
+fn deferred_fault_run(
+    async_prepare: bool,
+    fault_rank: usize,
+    remaining: usize,
+) -> (MeshRoot, ThreadedFanout, LaneRequest) {
+    let mut root = root(false);
+    // The serve driver closes lanes itself (`EpMeshLanes::set_driver_terminates`).
+    root.set_driver_terminates(true);
+    let (drafts, picks): (&[u32], &[u32]) = if remaining > 1 {
+        (&[10], &[10, 4])
+    } else {
+        (&[], &[10])
+    };
+    let mut fan = fanout_with(
+        vec![script(1, 0, drafts, picks), script(1, 1, drafts, picks)],
+        move |rank, setup| {
+            setup.async_prepare = async_prepare;
+            if rank == fault_rank {
+                setup.prepare_fault_at = Some(0);
+            }
+        },
+    );
+    admit(&mut root, &mut fan, 1, 10, 9, None, Some(1));
+    (root, fan, req(1, remaining))
+}
+
+/// The transaction semantics of the async prepare over a whole step sequence. A device fault in
+/// step 0's prepare is not seen at the prepare: step 0 publishes (its tokens come from the verify)
+/// and step 1's first device wait on the faulting rank, here the draft round's readback, reports
+/// it as `prepare (deferred)`; step 1 aborts, nothing of it is published and the mesh is
+/// quarantined.
+#[test]
+fn a_deferred_prepare_fault_is_reported_at_the_next_draft_wait_and_quarantines_the_mesh() {
+    // Rank 0 faults: the first failing rank in rank order is the record's, and a peer woken from a
+    // gather crossing by the abort reports "row gather aborted" too.
+    let (mut root, mut fan, lane) = deferred_fault_run(true, 0, 16);
+    let budgets = budgets(LabRoutes::Batched, 1);
+    let lanes = [lane];
+    let first = drive_step(&mut root, &mut fan, None, &lanes, &budgets, &mut GreedyRule)
+        .expect("the prepare's fault is not seen at the prepare");
+    assert_eq!(
+        first.output.lanes[0].emitted,
+        vec![10, 4],
+        "step 0's tokens are out"
+    );
+    assert_eq!(root.counters().steps_published, 1);
+
+    let error = drive_step(&mut root, &mut fan, None, &lanes, &budgets, &mut GreedyRule)
+        .expect_err("step 1's first device wait reports it");
+    let ProtocolError::Aborted(record) = &error else {
+        panic!("not an abort: {error}");
+    };
+    for part in [
+        "rank 0",
+        DEFERRED_PREPARE,
+        "scripted device-wait timeout",
+        "the draft download",
+    ] {
+        assert!(record.reason.contains(part), "{record}");
+    }
+    assert!(root.quarantined().is_some(), "the mesh is quarantined");
+    assert_eq!(
+        root.counters().steps_published,
+        1,
+        "step 1 publishes nothing"
+    );
+    assert_eq!(root.generated(epoch(1)).unwrap(), &[10, 4]);
+    let sims = fan.finish();
+    for sim in &sims {
+        assert!(!sim.aborts.is_empty(), "every rank aborts");
+        assert_eq!(
+            sim.published,
+            vec![first.key.step_seq],
+            "only step 0 published"
+        );
+    }
+}
+
+/// The same fault with no draft round in step 1 (one token left: no drafts): the verify readback
+/// is the first device wait and reports it.
+#[test]
+fn a_deferred_prepare_fault_is_reported_at_the_verify_when_no_draft_round_runs() {
+    let (mut root, mut fan, lane) = deferred_fault_run(true, 0, 1);
+    let budgets = budgets(LabRoutes::Batched, 1);
+    let lanes = [lane];
+    drive_step(&mut root, &mut fan, None, &lanes, &budgets, &mut GreedyRule)
+        .expect("the prepare's fault is not seen at the prepare");
+    let error = drive_step(&mut root, &mut fan, None, &lanes, &budgets, &mut GreedyRule)
+        .expect_err("the verify readback reports it");
+    let ProtocolError::Aborted(record) = &error else {
+        panic!("not an abort: {error}");
+    };
+    for part in ["rank 0", DEFERRED_PREPARE, "the verify readback"] {
+        assert!(record.reason.contains(part), "{record}");
+    }
+    assert!(root.quarantined().is_some());
+    assert_eq!(root.counters().steps_published, 1);
+    let sims = fan.finish();
+    assert!(sims.iter().all(|s| !s.aborts.is_empty()));
+}
+
+/// The kill switch: with the barrier back (`HIPFIRE_QWEN4_LANE_PREPARE_ASYNC=0`) the same fault
+/// fails the prepare itself, before anything of step 0 is published, and nothing is deferred.
+#[test]
+fn with_the_prepare_barrier_the_same_fault_aborts_before_publish() {
+    let (mut root, mut fan, lane) = deferred_fault_run(false, 1, 16);
+    let error = drive_step(
+        &mut root,
+        &mut fan,
+        None,
+        &[lane],
+        &budgets(LabRoutes::Batched, 1),
+        &mut GreedyRule,
+    )
+    .expect_err("the prepare's own wait reports it");
+    let ProtocolError::Aborted(record) = &error else {
+        panic!("not an abort: {error}");
+    };
+    assert!(
+        record
+            .reason
+            .contains("prepare: scripted device-wait timeout"),
+        "{record}"
+    );
+    assert!(!record.reason.contains(DEFERRED_PREPARE), "{record}");
+    assert_eq!(root.counters().steps_published, 0);
+    assert!(
+        root.generated(epoch(1)).unwrap().is_empty(),
+        "no IDs leaked"
+    );
+    let sims = fan.finish();
+    assert!(sims.iter().all(|s| s.published.is_empty()));
 }

@@ -2654,6 +2654,11 @@ impl Qwen4Bundle {
 
     /// Stop and free the mesh (before the bundle itself is freed).
     pub(crate) fn ep_close(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        // An unchecked async prepare is paid before the mesh goes (the close below drains every
+        // rank itself, but its error would not name the prepare).
+        if let Err(error) = self.ep_mesh_settle_prepare(gpu, "close") {
+            eprintln!("  qwen4 EP: close: {error}");
+        }
         self.mesh_lanes = None;
         match self.ep.take() {
             Some(mesh) => mesh.close(gpu).map_err(ep_err),
@@ -3502,6 +3507,8 @@ impl Qwen4Bundle {
         prompt: Vec<u32>,
         preferred: Option<usize>,
     ) -> Result<usize, BundleError> {
+        self.ep_mesh_settle_prepare(gpu, "admission")
+            .map_err(BundleError::Forward)?;
         self.ep_lane_soft(
             "admit_lane",
             |bundle| {
@@ -3686,6 +3693,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         plan: &BatchStepPlan,
     ) -> Result<(), String> {
+        self.ep_mesh_settle_prepare(gpu, "provision_step")?;
         let outcomes = self
             .ep_run_ranks(
                 false,
@@ -3741,6 +3749,10 @@ impl Qwen4Bundle {
     /// nothing is lent.
     pub fn elastic_reclaim_all(&mut self, gpu: &mut Gpu, why: &str) -> bool {
         if !self.elastic_active() {
+            return false;
+        }
+        if let Err(error) = self.ep_mesh_settle_prepare(gpu, "elastic reclaim") {
+            eprintln!("  qwen4 EP elastic: reclaim ({why}): {error}");
             return false;
         }
         let outcomes = self.ep_run_ranks(
@@ -3857,6 +3869,10 @@ impl Qwen4Bundle {
     /// Every rank frees its long-prefill caches. After a clean release the probe window restarts
     /// so the next tick can lend into the freed memory.
     fn elastic_release_all(&mut self, gpu: &mut Gpu) {
+        if let Err(error) = self.ep_mesh_settle_prepare(gpu, "elastic cache release") {
+            eprintln!("  qwen4 EP elastic: release caches: {error}");
+            return;
+        }
         let outcomes = self.ep_run_ranks(
             false,
             |bundle| Ok(bundle.elastic_release_caches_local(&mut *gpu)),
@@ -3887,6 +3903,10 @@ impl Qwen4Bundle {
     /// Every rank lends a bank of at most `bytes` (each rounds to whole units). A rank's error is
     /// logged; the other ranks' banks stay lent (a bank is rank-local and reclaimed rank-locally).
     fn elastic_lend_all(&mut self, gpu: &mut Gpu, bytes: u64) {
+        if let Err(error) = self.ep_mesh_settle_prepare(gpu, "elastic lend") {
+            eprintln!("  qwen4 EP elastic: lend: {error}");
+            return;
+        }
         let outcomes = self.ep_run_ranks(
             false,
             |bundle| Ok(bundle.elastic_lend_local(&mut *gpu, bytes)),
@@ -3927,6 +3947,10 @@ impl Qwen4Bundle {
         epoch: &RequestEpoch,
         remaining_new_tokens: usize,
     ) {
+        if let Err(error) = self.ep_mesh_settle_prepare(gpu, "map_ahead_decode") {
+            eprintln!("  qwen4 EP: lane map_ahead_decode: {error}");
+            return;
+        }
         let mapped = self.ep_lane_soft(
             "lane map_ahead_decode",
             |bundle| {
@@ -3997,6 +4021,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         plan: &BatchStepPlan,
     ) -> Result<StepOutput, String> {
+        self.ep_mesh_settle_prepare(gpu, "forward_step")?;
         // A prefill tile in the interval makes the next mesh step's wall an
         // unusable decode price.
         if plan

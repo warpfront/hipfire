@@ -145,6 +145,141 @@ fn rank_err(rank: usize, reason: impl Into<String>) -> RankError {
     }
 }
 
+/// Prefix of every error that reports a fault of an unchecked async prepare
+/// (`HIPFIRE_QWEN4_LANE_PREPARE_ASYNC`) at a later device wait.
+const DEFERRED_PREPARE: &str = "prepare (deferred)";
+
+/// The text of a failed device wait that is the first one after an unchecked prepare: the device
+/// cannot say whether the prepare's kernels or this phase's own faulted, so the text names both.
+fn deferred_wait_failure(e: impl std::fmt::Display, at: &str) -> String {
+    format!(
+        "{DEFERRED_PREPARE}: {e} (the first device wait after an unchecked prepare, {at}: the \
+         fault is that prepare's or this phase's own)"
+    )
+}
+
+/// The fault check an async window prepare owes on one rank
+/// (`HIPFIRE_QWEN4_LANE_PREPARE_ASYNC`).
+///
+/// The incumbent `prepare_commit` ends with a device wait and the wait-error read, so a device
+/// fault of the phase is that call's error and aborts the step before it publishes. Without the
+/// wait the check is OWED: [`Self::owe`] at the prepare, [`Self::paid`] by the first device wait
+/// that completes without a fault (a draft round's or the verify's readback),
+/// [`Self::settle`] where a wait is forced before something that would carry the fault under
+/// another label or drop it, [`Self::waive`] by an abort. While it is owed, the first failed wait
+/// names the prepare.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PrepareCheck {
+    owed: bool,
+}
+
+impl PrepareCheck {
+    fn is_owed(self) -> bool {
+        self.owed
+    }
+
+    /// The prepare was enqueued without its end-of-phase wait.
+    fn owe(&mut self) {
+        self.owed = true;
+    }
+
+    /// A device wait completed and the wait-error words were clean: everything enqueued before
+    /// it, the prepare included, ran without a fault.
+    fn paid(&mut self) {
+        self.owed = false;
+    }
+
+    /// The step aborted: the mesh is quarantined and nothing is attributed to the prepare.
+    fn waive(&mut self) {
+        self.owed = false;
+    }
+
+    /// Run `wait` (the device wait and the wait-error read) when the check is owed, and only
+    /// then. The check is cleared first: a fault `wait` reports is reported once, as the
+    /// prepare's (`prepare (deferred): ..`).
+    fn settle(&mut self, wait: impl FnOnce() -> R<()>) -> R<()> {
+        if !self.owed {
+            return Ok(());
+        }
+        self.owed = false;
+        wait().map_err(|e| format!("{DEFERRED_PREPARE}: {e}"))
+    }
+
+    /// The error of a failed readback of a draft round: `draft download: {e}`, or, while the
+    /// check is owed, attributed to the prepare.
+    fn draft_wait_failure(self, e: impl std::fmt::Display) -> String {
+        if self.owed {
+            deferred_wait_failure(e, "the draft download")
+        } else {
+            format!("draft download: {e}")
+        }
+    }
+
+    /// The error of a failed verify readback: `{e}`, or, while the check is owed, attributed to
+    /// the prepare.
+    fn verify_wait_failure(self, e: impl std::fmt::Display) -> String {
+        if self.owed {
+            deferred_wait_failure(e, "the verify readback")
+        } else {
+            e.to_string()
+        }
+    }
+}
+
+/// Whether a preflight failure is a deferred prepare fault ([`PrepareCheck::settle`] ran before an
+/// arena growth): that one is fatal to the mesh, not a capacity condition of the step.
+fn deferred_preflight_fatal(capacity: &R<()>) -> Option<String> {
+    match capacity {
+        Err(reason) if reason.starts_with(DEFERRED_PREPARE) => Some(reason.clone()),
+        _ => None,
+    }
+}
+
+/// The ranks' answers to `begin_window` with each rank's `fatal` (taken right after the call):
+/// a rank that found a deferred prepare fault turns the begin into a mesh failure (the step
+/// aborts and the mesh is quarantined), anything else is every rank's [`RankReady`] in rank order.
+fn begin_outcome(all: Vec<(RankReady, Option<String>)>) -> Result<Vec<RankReady>, RankError> {
+    if let Some((rank, reason)) = all
+        .iter()
+        .enumerate()
+        .find_map(|(rank, (_, fatal))| fatal.clone().map(|reason| (rank, reason)))
+    {
+        return Err(rank_err(rank, reason));
+    }
+    Ok(all.into_iter().map(|(ready, _)| ready).collect())
+}
+
+/// Quarantine the mesh after a settle ([`EpMeshLanes::settle_prepare`]) found a deferred prepare
+/// fault: every failing rank is named in the root's abort record, every rank follows
+/// (`MeshFanout::abort`) and the error names the prepare and `at`. `Ok` when every rank was clean.
+fn quarantine_unchecked<F: MeshFanout>(
+    root: &mut MeshRoot,
+    fan: &mut F,
+    key: &MeshStepKey,
+    at: &str,
+    outcomes: Result<Vec<R<()>>, RankError>,
+) -> Result<(), String> {
+    let failures: Vec<String> = match outcomes {
+        Ok(all) => all
+            .into_iter()
+            .enumerate()
+            .filter_map(|(rank, outcome)| outcome.err().map(|e| format!("rank {rank}: {e}")))
+            .collect(),
+        Err(e) => vec![format!("rank {}: {}", e.rank, e.reason)],
+    };
+    if failures.is_empty() {
+        return Ok(());
+    }
+    let reason = format!("{} (found before {at})", failures.join("; "));
+    let phase = root.phase();
+    if let Ok(record) = root.abort_step(None, phase, &reason) {
+        fan.abort(key, record.phase, &record.reason);
+    }
+    Err(format!(
+        "EP mesh lane step aborted (mesh quarantined, reload to recover): {reason}"
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Rank-side window state
 // ---------------------------------------------------------------------------
@@ -238,6 +373,30 @@ fn answers_op(plan: &LanePlan, sampler: bool) -> bool {
     plan.head_rank.is_some() || sampler
 }
 
+/// Whether beginning `start` may grow a lane's trunk or head context arena (the one host sync of
+/// a window's begin): some lane's mapped coverage is below the rows its window reaches. An
+/// over-estimate (a head-free view maps no head arena) only costs a settle; legacy arenas are
+/// mapped whole, so they never read as short.
+fn window_needs_growth(bundle: &Qwen4Bundle, start: &WindowStart) -> bool {
+    let Some(store) = bundle.lanes.as_ref() else {
+        return false;
+    };
+    start.lanes.iter().any(|plan| {
+        let Some(lane) = store.lane(&plan.key.request_epoch) else {
+            return false;
+        };
+        let rows = plan
+            .max_rows()
+            .max(crate::mesh_rank_copy::mapped_rows(plan));
+        let end = lane.state.position.saturating_add(rows);
+        lane.state.mapped_context_tokens() < end
+            || lane
+                .spec
+                .as_ref()
+                .is_some_and(|spec| spec.head.mapped_tokens() < end)
+    })
+}
+
 /// The sharded-MoE pass (S4, `HIPFIRE_QWEN4_DRAFT_SHARDED_MOE`) of a draft
 /// round, decided from the root's whole round and the plan alone so every rank
 /// decides alike (`rank` only names this rank's share): the switch and the S4
@@ -303,7 +462,13 @@ struct ExecStep {
     lanes: Vec<LaneWin>,
     draft_us: f64,
     verify_us: f64,
+    /// Host time of the prepare phase. With `HIPFIRE_QWEN4_LANE_PREPARE_ASYNC` this is the ENQUEUE
+    /// time (the phase's device tail is not waited, [`Self::prepare_synced`] is false). Stats only:
+    /// no policy reads it (the chooser, floor and pricing read `wall_us`).
     prepare_us: f64,
+    /// Whether `prepare_us` ends at the device's completion of the phase (the incumbent
+    /// `device_synchronize` at the end of `prepare_commit`); false under the async prepare.
+    prepare_synced: bool,
     draft_tally: GatherTally,
     verify_tally: GatherTally,
     head_calls: usize,
@@ -332,8 +497,13 @@ pub struct RankExec {
     stepped: bool,
     stats: RankLaneStats,
     /// A failure after the all-prepared boundary (publish is infallible by
-    /// construction; this records the impossible case).
+    /// construction; this records the impossible case), or a fault of an unchecked prepare found
+    /// at the next window's preflight ([`RankLane::begin_window`]).
     fatal: Option<String>,
+    /// The fault check an async prepare owes on this rank (`HIPFIRE_QWEN4_LANE_PREPARE_ASYNC`):
+    /// owed from the prepare until the first device wait that completes cleanly, a settle or an
+    /// abort ([`PrepareCheck`]).
+    prepare: PrepareCheck,
     abort_reason: Option<String>,
     /// Validity flag of the row source the last verify handed out.
     rows_valid: Option<Arc<AtomicBool>>,
@@ -355,6 +525,7 @@ impl RankExec {
                 ..RankLaneStats::default()
             },
             fatal: None,
+            prepare: PrepareCheck::default(),
             abort_reason: None,
             rows_valid: None,
             vocab: None,
@@ -572,6 +743,24 @@ impl RankLane<'_> {
         self.exec.session.ownership()
     }
 
+    /// Pay the fault check an async prepare owes ([`RankExec::prepare`]): wait for the device and
+    /// read the wait-error words, exactly the pair the incumbent `prepare_commit` ends with. A
+    /// no-op when nothing is owed. Reached only from the points that would otherwise issue their
+    /// own host sync under a different label, or drop the fault (arena growth in the preflight,
+    /// [`EpMeshLanes::settle_prepare`]); the draft round and the verify pay it with their own
+    /// readback instead.
+    fn settle_prepare(&mut self) -> R<()> {
+        let Self { exec, gpu, .. } = self;
+        exec.prepare.settle(|| {
+            // Between steps the thread's current HIP device is whatever the last call left: bind it.
+            gpu.bind_thread().map_err(|e| e.to_string())?;
+            gpu.hip
+                .device_synchronize()
+                .map_err(|e| format!("synchronize: {e}"))?;
+            gpu.take_device_wait_error().map_err(|e| e.to_string())
+        })
+    }
+
     /// The host-and-mapping checks of a plan and the device half of every
     /// lane's `begin_window` ([`begin_lane_window`]: the pending window, the
     /// head's position, arenas and the head ticket where the plan wants it).
@@ -589,6 +778,14 @@ impl RankLane<'_> {
                 "rank {} all-rows MoE rule {rule:?} differs from the root's {:?}",
                 self.exec.rank, start.stage.all_rows
             ));
+        }
+        // The only host sync inside a window's begin is a VMM arena growth (its zero-fill waits the
+        // stream). With an unchecked prepare that wait would hand the prepare's fault back as a
+        // capacity refusal (a soft rejection that leaves the mesh usable and drops the fault
+        // record): settle first, so the fault is reported as the prepare's and fatally
+        // ([`Self::begin_window`]).
+        if self.exec.prepare.is_owed() && window_needs_growth(&*self.bundle, start) {
+            self.settle_prepare()?;
         }
         let own = self.own();
         let Self { bundle, gpu, .. } = self;
@@ -727,6 +924,9 @@ impl RankLane<'_> {
                 .mtp_set_draft_shard(Some(shard))
                 .map_err(|e| e.to_string())?;
         }
+        // An unchecked async prepare is paid by this round's first readback (the one wait of the
+        // round that follows every launch of the prepare on the stream).
+        let mut check = exec.prepare;
         let result = with_store(bundle, |store, bundle| {
             // Round 0: owed-row catch-ups, then the head tickets that follow one.
             let mut catch_rows = 0usize;
@@ -923,9 +1123,12 @@ impl RankLane<'_> {
                         &mut spec_store.draft_top1_host[from..to],
                         &chunk_top1.buf,
                     )
-                    .map_err(|e| format!("draft download: {e}"))?;
+                    .map_err(|e| check.draft_wait_failure(e))?;
                     gpu.take_device_wait_error()
-                        .map_err(|e| format!("draft download: {e}"))?;
+                        .map_err(|e| check.draft_wait_failure(e))?;
+                    // The device completed everything enqueued so far, the prepare included, and
+                    // no fault was recorded: its check is paid.
+                    check.paid();
                     for (slot, op) in round
                         .ops
                         .iter()
@@ -1028,6 +1231,7 @@ impl RankLane<'_> {
             }
             ran.map(|reads| (catch_rows, reads))
         });
+        exec.prepare = check;
         if shard_round {
             // Removed on every path out of the round (an error aborts the mesh anyway).
             let removed = bundle.mtp_set_draft_shard(None).map_err(|e| e.to_string());
@@ -1059,10 +1263,13 @@ impl RankLane<'_> {
         } else {
             None
         };
-        let Self { bundle, gpu, .. } = self;
+        // An unchecked async prepare is paid by this verify's readback when no draft round paid
+        // it first (an AR / copy step, or a rank that owns no op of the round).
+        let check = self.exec.prepare;
+        let Self { exec, bundle, gpu } = self;
         let vocab = bundle.lane_vocab();
         let epochs: Vec<RequestEpoch> = plan.lanes.iter().map(|l| l.key.request_epoch).collect();
-        with_store(bundle, |store, bundle| {
+        let out = with_store(bundle, |store, bundle| {
             let StepParts {
                 mut lanes,
                 logits,
@@ -1147,8 +1354,9 @@ impl RankLane<'_> {
                 &mut top1_host[..n_dec * std::mem::size_of::<i32>()],
                 &top1_src.buf,
             )
-            .map_err(|e| e.to_string())?;
-            gpu.take_device_wait_error().map_err(|e| e.to_string())?;
+            .map_err(|e| check.verify_wait_failure(e))?;
+            gpu.take_device_wait_error()
+                .map_err(|e| check.verify_wait_failure(e))?;
             // The window's forward is retired on this rank: the D2 expert tail (when installed)
             // judges it and rewrites its decode tables before the next window launches.
             if let Some(gather) = bundle
@@ -1177,7 +1385,12 @@ impl RankLane<'_> {
                 logits: logits.sub_offset(0, n_dec * vocab),
                 device,
             })
-        })
+        });
+        if out.is_ok() {
+            // The readback completed everything enqueued before it, the prepare included.
+            exec.prepare.paid();
+        }
+        out
     }
 
     /// Repair every lane to the decision ([`prepare_rank_lane`]: a window's
@@ -1377,6 +1590,11 @@ impl LaneMeshExecutor for RankLane<'_> {
             Ok(())
         };
         let failed_preflight = capacity.is_err();
+        // A fault of an unchecked prepare found at the preflight is not a capacity condition: it
+        // is fatal ([`EpFanout::begin`] turns it into the step's abort and the mesh's quarantine).
+        if let Some(reason) = deferred_preflight_fatal(&capacity) {
+            self.exec.fatal = Some(reason);
+        }
         let ready = self.exec.session.begin(start, capacity);
         if !matches!(ready.status, ReadyStatus::Ready { .. }) {
             // Windows opened for lanes before the failing one (or before the
@@ -1403,6 +1621,7 @@ impl LaneMeshExecutor for RankLane<'_> {
             draft_us: 0.0,
             verify_us: 0.0,
             prepare_us: 0.0,
+            prepare_synced: true,
             draft_tally: GatherTally::default(),
             verify_tally: GatherTally::default(),
             head_calls: 0,
@@ -1721,19 +1940,31 @@ impl LaneMeshExecutor for RankLane<'_> {
                 }
             }
         }
-        // Every fallible device operation completes (and is attributed) here.
-        self.gpu
-            .hip
-            .device_synchronize()
-            .map_err(|e| rank_err(rank, format!("prepare synchronize: {e}")))?;
-        self.gpu
-            .take_device_wait_error()
-            .map_err(|e| rank_err(rank, format!("prepare: {e}")))?;
+        let async_prepare = self.gpu.flags.qwen4_lane_prepare_async_enabled();
+        if async_prepare {
+            // `HIPFIRE_QWEN4_LANE_PREPARE_ASYNC` (PLAN-cp16 L5 (b)): the phase's launches are
+            // queued on this rank's stream, in the order the next window's launches follow, so
+            // the host does not wait for their completion here. The fault check this wait carries
+            // is owed: paid by the first readback of the next draft round or verify, or settled
+            // before anything that syncs under another label or drops the fault
+            // ([`RankLane::settle_prepare`], [`EpMeshLanes::settle_prepare`]).
+            self.exec.prepare.owe();
+        } else {
+            // Every fallible device operation completes (and is attributed) here.
+            self.gpu
+                .hip
+                .device_synchronize()
+                .map_err(|e| rank_err(rank, format!("prepare synchronize: {e}")))?;
+            self.gpu
+                .take_device_wait_error()
+                .map_err(|e| rank_err(rank, format!("prepare: {e}")))?;
+        }
         self.exec.stats.pick_mismatches += mismatches;
         let Some(step) = self.exec.step.as_mut() else {
             return Err(rank_err(rank, "prepare without a begun window"));
         };
         step.prepare_us = t0.elapsed().as_secs_f64() * 1e6;
+        step.prepare_synced = !async_prepare;
         step.totals = Some((
             decision.lanes.iter().map(|l| l.source.offered).sum(),
             decision.lanes.iter().map(|l| l.source.accepted).sum(),
@@ -1806,7 +2037,7 @@ impl LaneMeshExecutor for RankLane<'_> {
             PhaseTiming {
                 phase: TimedPhase::Prepare,
                 us: step.prepare_us as f32,
-                synchronized: true,
+                synchronized: step.prepare_synced,
             },
         ];
         if step.head_calls > 0 {
@@ -1832,6 +2063,7 @@ impl LaneMeshExecutor for RankLane<'_> {
 
     fn abort_step(&mut self, _key: &MeshStepKey, _phase: StepPhase, reason: &str) {
         self.exec.drop_rows();
+        self.exec.prepare.waive();
         if self.exec.abort_reason.is_none() {
             self.exec.abort_reason = Some(reason.to_string());
         }
@@ -2151,7 +2383,10 @@ impl MeshFanout for EpFanout<'_> {
     }
 
     fn begin(&mut self, start: &WindowStart) -> Result<Vec<RankReady>, RankError> {
-        self.soft(&|lane| lane.begin_window(start))
+        let all = self.soft(&|lane| (lane.begin_window(start), lane.exec.take_fatal()))?;
+        // A fault of an unchecked prepare found while beginning (`RankLane::begin_window`) is a
+        // mesh failure, not a rank's refusal: the step aborts and the mesh is quarantined.
+        begin_outcome(all)
     }
 
     fn reject(&mut self, key: &MeshStepKey) {
@@ -2271,6 +2506,10 @@ pub struct EpMeshLanes {
     /// Whether the root's draft-split setting has been decided from every
     /// rank's head ([`Self::decide_draft_split`]); done once, at the first step.
     draft_split_decided: bool,
+    /// The key of the last published step when its prepare ran without its end-of-phase device wait
+    /// (`HIPFIRE_QWEN4_LANE_PREPARE_ASYNC`) and no later step has paid the fault check yet
+    /// ([`Self::settle_prepare`]). `None` whenever the flag is off.
+    unchecked: Option<MeshStepKey>,
 }
 
 /// What [`EpMeshLanes::step`] reports besides the output.
@@ -2408,6 +2647,7 @@ impl EpMeshLanes {
             steps: 0,
             sampler: Some(LaneSampler::new(bundle.lane_vocab())),
             draft_split_decided: false,
+            unchecked: None,
         })
     }
 
@@ -2510,6 +2750,30 @@ impl EpMeshLanes {
         )
     }
 
+    /// Pay the fault check an async prepare owes, on every rank, before work that would sync under
+    /// another label or drop the fault: admission, a prefill tile, the elastic reserve's frees and
+    /// loans. A no-op unless the last published step's prepare is unchecked. The wait and the
+    /// wait-error read are the pair the incumbent `prepare_commit` ends with. A fault here is a
+    /// fault of an already published step's device state: the root and every rank are aborted
+    /// (mesh quarantined, reload to recover, exactly as a failed prepare quarantines it) and the
+    /// error names the prepare, `at` and the rank.
+    pub(crate) fn settle_prepare(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+        at: &str,
+    ) -> Result<(), String> {
+        let Some(key) = self.unchecked.take() else {
+            return Ok(());
+        };
+        if self.root.quarantined().is_some() {
+            return Ok(());
+        }
+        let (mut fan, root) = self.fan(bundle, gpu);
+        let outcomes = fan.soft(&|lane| lane.settle_prepare());
+        quarantine_unchecked(root, &mut fan, &key, at, outcomes)
+    }
+
     /// Admit a lane whose prompt is done to the root and mirror it on every
     /// rank (identity only: no RNG, no policy).
     pub fn admit_lane(
@@ -2603,6 +2867,9 @@ impl EpMeshLanes {
         let driven = drive_step(root, &mut fan, prior.as_ref(), requests, budgets, rule)?;
         self.steps += 1;
         self.pending = Some((driven.key.clone(), driven.receipts));
+        // Every rank paid the previous step's check at its verify; this step's own prepare may
+        // owe one ([`RankExec::prepare`]; the flag is rank-uniform: same arch, same env).
+        self.unchecked = self.rank0.prepare.is_owed().then(|| driven.key.clone());
         Ok(MeshStepReport {
             output: driven.output,
             key: driven.key,
