@@ -685,6 +685,10 @@ fn direct_cases(
         gpu.free_tensor(x).map_err(err)?;
         gpu.free_tensor(y_ref).map_err(err)?;
         gpu.free_tensor(y).map_err(err)?;
+        // `upload_raw` takes a fresh `hipMalloc` (never the pool) and `free_tensor` parks the
+        // buffer in the pool, so without a drain every object leaked this case's ~72 MB
+        // weights (hipMalloc OOM after ~222 objects in one process, j8589).
+        gpu.drain_pool();
     }
     Ok((cases, bad_total))
 }
@@ -752,6 +756,7 @@ fn bench_table(
     for t in [x, y, y2] {
         gpu.free_tensor(t).map_err(err)?;
     }
+    gpu.drain_pool();
     Ok((
         json!({
             "m": m, "k": k, "reps": reps, "calls_per_replay": BENCH_CALLS,
