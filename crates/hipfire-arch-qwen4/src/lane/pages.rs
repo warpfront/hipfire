@@ -1199,13 +1199,14 @@ impl Qwen4Bundle {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if elastic.log {
                     eprintln!(
-                        "qwen4 EP rank {rank}: [elastic] reclaim ({why}): {} units {:.0} MiB in {:.2} ms (wait {:.2}, tables {:.2}, free {:.2})",
+                        "qwen4 EP rank {rank}: [elastic] reclaim ({why}): {} units {:.0} MiB in {:.2} ms (wait {:.2}, tables {:.2}, free {:.2}, settle {:.2})",
                         report.units,
                         report.bytes as f64 / f64::from(1u32 << 20),
                         report.total_ms,
                         report.wait_ms,
                         report.tables_ms,
-                        report.free_ms
+                        report.free_ms,
+                        report.settle_ms
                     );
                 }
                 Ok(true)

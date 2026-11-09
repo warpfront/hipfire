@@ -3298,7 +3298,8 @@ pub(crate) struct ElasticReport {
 
 /// What an elastic reclaim freed: the bank's slots (units), the pool bytes, and the host time of
 /// each phase (the in-flight chunk wait, the table rewrite through the canonical upload sync, the
-/// generation retire + close + free) and of the whole call.
+/// generation retire + close + free, the wait for `hipMemGetInfo` to show the freed bytes) and of
+/// the whole call.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ReclaimReport {
     pub units: usize,
@@ -3306,8 +3307,17 @@ pub(crate) struct ReclaimReport {
     pub wait_ms: f64,
     pub tables_ms: f64,
     pub free_ms: f64,
+    pub settle_ms: f64,
     pub total_ms: f64,
 }
+
+/// How long a reclaim waits for the freed pool to show up in `hipMemGetInfo`: the kernel driver
+/// releases a freed buffer object asynchronously, so a budget read straight after `hipFree` can
+/// still see the bank as used (stress j8650: a 16k prompt refused as `never` right after a 1.9 ms
+/// reclaim, admitted on the retry).
+const ELASTIC_SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
+/// Freed bytes `hipMemGetInfo` may still miss when the settle wait stops (driver granule slack).
+const ELASTIC_SETTLE_SLACK_BYTES: u64 = 64 << 20;
 
 fn elapsed_ms(from: Instant, to: Instant) -> f64 {
     (to - from).as_secs_f64() * 1e3
@@ -4240,9 +4250,9 @@ impl Inner {
         match &result {
             Ok(Some(report)) if log => self.elastic_log(|| {
                 format!(
-                    "reclaim why={why} units={} bytes={} wait_ms={:.2} tables_ms={:.2} free_ms={:.2} total_ms={:.2}",
+                    "reclaim why={why} units={} bytes={} wait_ms={:.2} tables_ms={:.2} free_ms={:.2} settle_ms={:.2} total_ms={:.2}",
                     report.units, report.bytes, report.wait_ms, report.tables_ms, report.free_ms,
-                    report.total_ms
+                    report.settle_ms, report.total_ms
                 )
             }),
             Err(error) => {
@@ -4292,6 +4302,7 @@ impl Inner {
             return Ok(None);
         };
         let (units, bytes) = (el.layout.slots, el.layout.total as u64);
+        let free_before = gpu.device_mem_info().map(|(free, _)| free as u64).ok();
         let unit_keys = el.units.clone();
         if let Err((el, error)) = teardown_elastic(gpu, el) {
             self.elastic = Some(el);
@@ -4303,13 +4314,27 @@ impl Inner {
                 self.kinds[at] = Kind::Tail;
             }
         }
+        let t_free = Instant::now();
+        // The caller reads the page budget next: wait (bounded) until the freed bytes are visible.
+        if let Some(before) = free_before {
+            let want = before + bytes.saturating_sub(ELASTIC_SETTLE_SLACK_BYTES);
+            while t_free.elapsed() < ELASTIC_SETTLE_DEADLINE {
+                match gpu.device_mem_info() {
+                    Ok((free, _)) if (free as u64) < want => {
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                    }
+                    _ => break,
+                }
+            }
+        }
         let t_end = Instant::now();
         Ok(Some(ReclaimReport {
             units,
             bytes,
             wait_ms: elapsed_ms(t0, t_wait),
             tables_ms: elapsed_ms(t_wait, t_tables),
-            free_ms: elapsed_ms(t_tables, t_end),
+            free_ms: elapsed_ms(t_tables, t_free),
+            settle_ms: elapsed_ms(t_free, t_end),
             total_ms: elapsed_ms(t0, t_end),
         }))
     }
