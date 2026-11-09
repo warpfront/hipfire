@@ -748,6 +748,24 @@ fn plan_items_with_ep(
                 ep.sidecar.size_bytes,
             ));
         }
+        // The EP2 hot-unit loan sidecar rides with the EP ranking; an unpublished pin is not
+        // downloaded, so it is not part of the plan.
+        if let Some(units) = hipfire_registry::hot_units_sidecar_in(
+            identity,
+            hipfire_registry::HOT_UNITS_SIDECAR_PINS,
+        )
+        .filter(|units| units.published)
+        {
+            let local = format!(
+                "{model_file}{}",
+                hipfire_config::memory::EP_HOT_UNITS_SIDECAR_SUFFIX
+            );
+            items.push(item(
+                "EP hot-unit loan".to_owned(),
+                &local,
+                units.sidecar.size_bytes,
+            ));
+        }
     }
     for (name, sidecar) in &entry.heads {
         items.push(item(
@@ -1910,6 +1928,22 @@ mod tests {
         let registry = stock_registry();
         let items = hc8_plan_labels(&registry, "qwen3.8:flash", "gfx1201");
         assert!(items.iter().all(|item| item.label != "hc8"));
+    }
+
+    #[test]
+    fn the_unpublished_hot_units_pin_is_not_in_any_pull_plan() {
+        assert!(!hipfire_registry::HOT_UNITS_SIDECAR_PINS[0].published);
+        let registry = symtrunk_registry();
+        for arch in ["gfx1201", "", "gfx1100"] {
+            let items = hc8_plan_labels(&registry, "symtrunk:test", arch);
+            assert!(
+                items.iter().all(|item| item.label != "EP hot-unit loan"),
+                "{arch:?}"
+            );
+        }
+        let stock = stock_registry();
+        let items = hc8_plan_labels(&stock, "qwen3.8:flash", "gfx1201");
+        assert!(items.iter().all(|item| item.label != "EP hot-unit loan"));
     }
 
     const GF_MONO: &str = "qwen3.8-flash-next.mq4-xts";

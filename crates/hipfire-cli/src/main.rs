@@ -2181,6 +2181,42 @@ fn pull_with_all_pins(
         }
     }
     if choice.expert_hotset {
+        if let Some(units) = hipfire_registry::hot_units_sidecar_in(
+            identity,
+            hipfire_registry::HOT_UNITS_SIDECAR_PINS,
+        ) {
+            let destination = hipfire_config::memory::ep_hot_units_sidecar_path(&model_path);
+            let cache = VerifiedCache::in_home(&paths.root);
+            if units.published {
+                fetch_registry_sidecar(
+                    &cache,
+                    "EP hot-unit loan",
+                    units.repo,
+                    &units.sidecar,
+                    &destination,
+                    args.force,
+                );
+            } else {
+                // Pinned ahead of the Hugging Face upload: never request it, never touch a
+                // local copy; report what the loader will see.
+                match local_hot_units_state(&cache, &units, &destination) {
+                    LocalHotUnits::Pinned => eprintln!(
+                        "  EP hot-unit loan sidecar already present (matches the pin): {}",
+                        units.sidecar.file
+                    ),
+                    LocalHotUnits::Different => eprintln!(
+                        "  EP hot-unit loan sidecar present but not the pinned calibration (left untouched; the loader accepts it only if it binds this base and ranking): {}",
+                        units.sidecar.file
+                    ),
+                    LocalHotUnits::Absent => eprintln!(
+                        "  EP hot-unit loan sidecar not published yet; the loan stays off: {}",
+                        units.sidecar.file
+                    ),
+                }
+            }
+        }
+    }
+    if choice.expert_hotset {
         if let Some(hotset) = hipfire_registry::expert_hotset_in(identity, hotset_pins) {
             fetch_registry_sidecar(
                 &VerifiedCache::in_home(&paths.root),
@@ -2231,6 +2267,37 @@ fn pull_with_all_pins(
         )?;
     }
     Ok(Some(model_path))
+}
+
+/// What sits at the hot-unit loan sidecar path of an unpublished pin.
+#[derive(Debug, PartialEq, Eq)]
+enum LocalHotUnits {
+    /// No file there: the loan stays off.
+    Absent,
+    /// A file whose size and sha256 equal the pin.
+    Pinned,
+    /// A file that is not the pinned bytes (a local recalibration or a stale copy).
+    Different,
+}
+
+fn local_hot_units_state(
+    cache: &VerifiedCache,
+    units: &hipfire_registry::HotUnitsSidecar,
+    destination: &Path,
+) -> LocalHotUnits {
+    if !destination.is_file() {
+        return LocalHotUnits::Absent;
+    }
+    if existing_artifact_valid(
+        cache,
+        destination,
+        units.sidecar.sha256.as_deref(),
+        units.sidecar.size_bytes,
+    ) {
+        LocalHotUnits::Pinned
+    } else {
+        LocalHotUnits::Different
+    }
 }
 
 /// Fetch one optional sidecar to its local destination: an existing valid file is
@@ -2756,6 +2823,11 @@ fn rm_with_sidecar_pins(
     let hc8 = hipfire_config::memory::hc8_sidecar_path(&path);
     if hc8.is_file() {
         targets.insert(hc8);
+    }
+    // The EP2 hot-unit loan sidecar (`<resolved file>.ep.hot-units`) too.
+    let hot_units = hipfire_config::memory::ep_hot_units_sidecar_path(&path);
+    if hot_units.is_file() {
+        targets.insert(hot_units);
     }
     if let Some((file, _)) = kept_mtp.as_ref() {
         // The stem sweep matched the shared head beside the trunk; keep it.
@@ -21187,6 +21259,49 @@ effort = "high"
             Some(size)
         ));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn local_hot_units_state_verifies_size_and_sha_against_the_pin() {
+        use sha2::{Digest, Sha256};
+        let paths = test_paths("hot-units-state");
+        fs::create_dir_all(&paths.models).unwrap();
+        let base = paths.models.join("base.mq4-xts-symtrunk");
+        let destination = hipfire_config::memory::ep_hot_units_sidecar_path(&base);
+        assert!(destination.to_string_lossy().ends_with("base.mq4-xts-symtrunk.ep.hot-units"));
+        let content = br#"{"kind":"hipfire.qwen4.ep_hot_units"}"#;
+        let units = hipfire_registry::HotUnitsSidecar {
+            repo: "hipfire-models/qwen3.8-flash-next",
+            sidecar: Sidecar {
+                file: "base.mq4-xts-symtrunk.ep.hot-units".into(),
+                sha256: Some(format!("{:x}", Sha256::digest(content))),
+                size_bytes: Some(content.len() as u64),
+            },
+            ranking_sha256: hipfire_registry::HOT_UNITS_SIDECAR_PINS[0].ranking_sha256,
+            published: false,
+        };
+        let cache = VerifiedCache::disabled();
+        assert_eq!(
+            local_hot_units_state(&cache, &units, &destination),
+            LocalHotUnits::Absent
+        );
+        fs::write(&destination, content).unwrap();
+        assert_eq!(
+            local_hot_units_state(&cache, &units, &destination),
+            LocalHotUnits::Pinned
+        );
+        // Same size, other bytes: not the pinned calibration.
+        fs::write(&destination, br#"{"kind":"hipfire.qwen4.ep_hot_unitX"}"#).unwrap();
+        assert_eq!(
+            local_hot_units_state(&cache, &units, &destination),
+            LocalHotUnits::Different
+        );
+        fs::write(&destination, b"{}").unwrap();
+        assert_eq!(
+            local_hot_units_state(&cache, &units, &destination),
+            LocalHotUnits::Different
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
     }
 
     #[test]
