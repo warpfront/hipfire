@@ -1143,6 +1143,9 @@ fn read_up_module_abi_resources_and_native_roundtrip() {
         );
         let vg = field(t, ".vgpr_count:");
         assert!(vg.len() == 1 && vg[0] <= 256, "{sym}: vgpr_count {vg:?}");
+        if nt == 1 {
+            assert_eq!(vg, [145], "{sym}: early-epilogue winner VGPR pin");
+        }
         let ms = mnemonics(t);
         for m in &ms {
             assert!(

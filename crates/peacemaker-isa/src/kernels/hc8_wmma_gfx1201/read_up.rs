@@ -4,9 +4,11 @@
 
 //! Fused HC8 read-up: `hc8_read_up_e4m3_n{1..4}`, in module `hc8_wmma_pm_gfx1201`.
 //!
-//! It is `hc8_gemm_e4m3_mw4_kw1_n{NT}_set` (same decoder, K loop, register plan) with
-//! the projected `[rows, 4*hidden]` activations never leaving the chip: the epilogue
-//! is the product `hyper_read_projected_f32` (branches = 4), bit for bit, rows 1..=64.
+//! It has the arithmetic of `hc8_gemm_e4m3_mw4_kw1_n{NT}_set`, with the projected
+//! `[rows, 4*hidden]` activations never leaving the chip: the epilogue is the product
+//! `hyper_read_projected_f32` (branches = 4), bit for bit, rows 1..=64. NT 1 uses
+//! unroll 4, weights-first batch loads and early epilogue loads; NT 2..4 retain the
+//! original schedule and register plan.
 //!
 //! # ABI (56 B)
 //! `q@0 s@8 low@16 normalized@24 mixed@32` (u64), `hidden@40 low_rank@44 rows@48`
@@ -33,8 +35,9 @@
 //! wave `w` folds and stores the accumulator indices `j` with `j % 4 == w`.
 
 use super::{
-    branch, exec_all, exec_mask, k_loops, plan, prologue, vload128, zero_regs, Fmt, Geo, Lay, ACC,
-    KARG, LANE, LB, LR, SM, SO, SP, TMP, TMP2, VT, VT2, WAVE, WG, YA, YP,
+    add_split, batch_ordered, branch, exec_all, exec_mask, k_loops, plan, prologue, vload128,
+    zero_regs, Fmt, Geo, Lay, LoadOrder, Schedule, ACC, KARG, LANE, LB, LR, REM, SM, SO, SP, TMP,
+    TMP2, VT, VT2, WAVE, WG, YA, YP,
 };
 use crate::insn::{Instruction, MemoryClass};
 use crate::kernels::common::{add64, lit, op, s, smem, sop, v};
@@ -330,19 +333,85 @@ fn store_out(b: &mut Builder, c: u32, r: u32, val: u8) -> R {
     b.release_store_sources()
 }
 
-fn epilogue(b: &mut Builder, g: &Geo, l: &Lay, slot: usize, end: &str) -> R {
-    let nt = g.nt;
-    let nr = 8 * nt;
-    let sv = l.xb;
-    let nrm = sv + 8;
-    let t0 = nrm + nr as u8;
-    let t: [u8; 6] = std::array::from_fn(|i| t0 + i as u8);
-    let val = t0 + 6;
-    let p = t0 + 7;
-    let noff = p + 4;
+fn schedule(nt: u32) -> Schedule {
+    if nt == 1 {
+        Schedule {
+            unroll: 4,
+            load_order: LoadOrder::WeightsFirst,
+            early_epilogue_loads: true,
+        }
+    } else {
+        Schedule::reference(nt)
+    }
+}
 
-    smem(b, OP, 2, KARG, 32)?;
-    // Normalized pointer: normalized + (wave*hidden + wg*16)*4.
+/// Epilogue register map. `pre` (EPIPRE): the scales, normalized values and address offsets
+/// live in a dedicated block above the loop registers (8-aligned), the six temporaries,
+/// result and fold partials start at the raw x block; otherwise everything reuses the raw
+/// x block (the shipped map).
+struct EpiRegs {
+    sv: u8,
+    nrm: u8,
+    t0: u8,
+    val: u8,
+    p: u8,
+    noff: u8,
+    pre: u8,
+    pre_len: u8,
+    /// VGPR total of the kernel.
+    top: u32,
+}
+
+fn epi_regs(g: &Geo, l: &Lay, pre: bool) -> Result<EpiRegs, String> {
+    let nr = 8 * g.nt;
+    if !pre {
+        let sv = l.xb;
+        let nrm = sv + 8;
+        let t0 = nrm + nr as u8;
+        let p = t0 + 7;
+        return Ok(EpiRegs {
+            sv,
+            nrm,
+            t0,
+            val: t0 + 6,
+            p,
+            noff: p + 4,
+            pre: 0,
+            pre_len: 0,
+            top: l.top,
+        });
+    }
+    let t0 = l.xb;
+    let p = t0 + 7;
+    let scratch = u32::from(p) + 4;
+    let top = l.top.max(scratch);
+    let base = top.div_ceil(8) * 8;
+    let pre_len = 8 + nr + g.nt;
+    let total = base + pre_len;
+    if total > 256 {
+        return Err(format!(
+            "{}: the epilogue needs {total} VGPRs (> 256)",
+            read_up_symbol(g.nt)
+        ));
+    }
+    let sv = base as u8;
+    Ok(EpiRegs {
+        sv,
+        nrm: sv + 8,
+        t0,
+        val: t0 + 6,
+        p,
+        noff: sv + 8 + nr as u8,
+        pre: sv,
+        pre_len: pre_len as u8,
+        top: total,
+    })
+}
+
+/// Normalized pointer `normalized + (wave*hidden + wg*16)*4` and the byte offsets of column
+/// tile c, `r*16*hidden + h*32 + c*256*hidden`, in `noff..noff+nt`.
+fn up_address(b: &mut Builder, g: &Geo, noff: u8, a: Arch) -> R {
+    let nt = g.nt;
     sop(
         b,
         format!("s_mul_i32 s{TMP}, s{SM}, s{WAVE}"),
@@ -351,7 +420,6 @@ fn epilogue(b: &mut Builder, g: &Geo, l: &Lay, slot: usize, end: &str) -> R {
     )?;
     sop(b, format!("s_lshl_b32 s{TMP}, s{TMP}, 2"), &[TMP], &[TMP])?;
     sop(b, format!("s_lshl_b32 s{TMP2}, s{WG}, 6"), &[TMP2], &[WG])?;
-    let a = b.spec.arch;
     sop(
         b,
         format!(
@@ -362,7 +430,6 @@ fn epilogue(b: &mut Builder, g: &Geo, l: &Lay, slot: usize, end: &str) -> R {
         &[TMP, TMP2],
     )?;
     add64(b, NP, YP, TMP)?;
-    // Normalized byte offsets of column tile c: r*16*hidden + h*32 + c*256*hidden.
     sop(b, format!("s_lshl_b32 s{TMP}, s{SM}, 4"), &[TMP], &[SM])?;
     op(
         b,
@@ -408,15 +475,74 @@ fn epilogue(b: &mut Builder, g: &Geo, l: &Lay, slot: usize, end: &str) -> R {
             &[v(noff), s(TMP2)],
         )?;
     }
-    // Scales of this lane's eight rows, then the normalized values of live columns.
-    vload128(b, sv, SO, SP, 0)?;
-    vload128(b, sv + 4, SO, SP, 16)?;
-    for c in 0..nt {
+    Ok(())
+}
+
+/// Scales of this lane's eight rows, then the normalized values of live columns.
+fn up_loads(b: &mut Builder, g: &Geo, e: &EpiRegs) -> R {
+    vload128(b, e.sv, SO, SP, 0)?;
+    vload128(b, e.sv + 4, SO, SP, 16)?;
+    for c in 0..g.nt {
         exec_mask(b, c)?;
-        vload128(b, nrm + 8 * c as u8, noff + c as u8, NP, 0)?;
-        vload128(b, nrm + 8 * c as u8 + 4, noff + c as u8, NP, 16)?;
+        vload128(b, e.nrm + 8 * c as u8, e.noff + c as u8, NP, 0)?;
+        vload128(b, e.nrm + 8 * c as u8 + 4, e.noff + c as u8, NP, 16)?;
     }
-    exec_all(b)?;
+    exec_all(b)
+}
+
+/// The up_n1 K loop: `UNROLL=4` batches (then 2, 1) with `LOADORDER=1` (every weight b128,
+/// then every tile's x loads). EPIPRE: the Builder admits a loop only when its back-edge
+/// ledger equals its entry ledger, and the hoisted epilogue loads are pending at the first
+/// loop's entry, so each loop re-issues them (same loads, same registers) after every
+/// iteration that is followed by another one and leaves before the re-issue after the last.
+fn k_loops_pre(b: &mut Builder, g: &Geo, l: &Lay, tag: &str, e: &EpiRegs) -> R {
+    let mut u = l.u;
+    while u >= 1 {
+        let skip = format!(".Lhc8_{tag}_skip{u}");
+        let head = format!(".Lhc8_{tag}_loop{u}");
+        let done = format!(".Lhc8_{tag}_done{u}");
+        sop(b, format!("s_cmp_lt_u32 s{REM}, {u}"), &[], &[REM])?;
+        branch(b, &format!("s_cbranch_scc1 {skip}"))?;
+        b.loop_(&head, |b| {
+            batch_ordered(b, g, l, u, schedule(g.nt).load_order)?;
+            sop(
+                b,
+                format!("s_sub_co_i32 s{REM}, s{REM}, {u}"),
+                &[REM],
+                &[REM],
+            )?;
+            sop(b, format!("s_cmp_ge_u32 s{REM}, {u}"), &[], &[REM])?;
+            branch(b, &format!("s_cbranch_scc0 {done}"))?;
+            up_loads(b, g, e)?;
+            branch(b, &format!("s_branch {head}"))
+        })?;
+        b.label(&done)?;
+        b.label(&skip)?;
+        u /= 2;
+    }
+    Ok(())
+}
+
+fn epilogue(
+    b: &mut Builder,
+    g: &Geo,
+    _l: &Lay,
+    e: &EpiRegs,
+    pre: bool,
+    slot: usize,
+    end: &str,
+) -> R {
+    let nt = g.nt;
+    let nr = 8 * nt;
+    let (sv, nrm, val, p, noff) = (e.sv, e.nrm, e.val, e.p, e.noff);
+    let t: [u8; 6] = std::array::from_fn(|i| e.t0 + i as u8);
+
+    smem(b, OP, 2, KARG, 32)?;
+    if !pre {
+        let a = b.spec.arch;
+        up_address(b, g, noff, a)?;
+        up_loads(b, g, e)?;
+    }
     // LDS store base: ((wave*NR)*32 + lane)*4; fold read base: lane*4.
     op(
         b,
@@ -528,7 +654,11 @@ pub fn emit_read_up(nt: u32) -> Result<Emitted, String> {
     }
     let g = geo(nt);
     g.validate()?;
-    let l = Lay::new(&g)?;
+    // up_n1 winner (ripsearch 72886ef3aa4d7fb8): UNROLL=4 LOADORDER=1 EPIPRE=true DELAY_ALU=true.
+    let schedule = schedule(nt);
+    let pre = schedule.early_epilogue_loads;
+    let l = Lay::with_unroll(&g, schedule.unroll)?;
+    let e = epi_regs(&g, &l, pre)?;
     let symbol = read_up_symbol(nt);
     let kernargs = KernargLayout::new(READ_UP_KERNARG_BYTES)
         .pointer_access("q", 0, Access::ReadOnly)
@@ -553,7 +683,12 @@ pub fn emit_read_up(nt: u32) -> Result<Emitted, String> {
         wave32: true,
         cu_mode: false,
     };
-    let mut regs = plan(&g, &l)?;
+    let mut lp = l;
+    lp.top = e.top;
+    let mut regs = plan(&g, &lp)?;
+    if pre {
+        add_split(&mut regs, "epi_pre", Kind::V, e.pre, e.pre_len)?;
+    }
     regs.add_range("norm_base", Kind::S, NP, 2, Live::Whole)?;
     regs.add_range("out_ptr", Kind::S, OP, 2, Live::Whole)?;
     let mut b = Builder::new(spec, regs);
@@ -562,10 +697,19 @@ pub fn emit_read_up(nt: u32) -> Result<Emitted, String> {
     let tag = read_up_symbol(nt);
     let end = format!(".Lhc8_{tag}_end");
     prologue(&mut b, &g, &end, true)?;
+    if pre {
+        let arch = b.spec.arch;
+        up_address(&mut b, &g, e.noff, arch)?;
+        up_loads(&mut b, &g, &e)?;
+    }
     zero_regs(&mut b, ACC, g.nr())?;
     zero_regs(&mut b, l.xb, 16 * l.u * g.nt)?;
-    k_loops(&mut b, &g, &l, &tag)?;
-    epilogue(&mut b, &g, &l, slot, &end)?;
+    if pre {
+        k_loops_pre(&mut b, &g, &l, &tag, &e)?;
+    } else {
+        k_loops(&mut b, &g, &l, &tag)?;
+    }
+    epilogue(&mut b, &g, &l, &e, pre, slot, &end)?;
     b.wait_all()?;
     b.label(&end)?;
     branch(&mut b, "s_endpgm")?;

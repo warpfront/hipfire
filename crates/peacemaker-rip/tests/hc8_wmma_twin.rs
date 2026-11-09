@@ -3,11 +3,13 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! The committed `.rip` twin of the HC8 compressed-weight GEMM family (`kernels/hc8_wmma.rip` vs
-//! `kernels/hc8_wmma_gfx1201.rs` + `hc8_wmma_gfx1201/read_up.rs`): at the declared axis values every one of the
-//! six served variants re-emits the generator's per-kernel assembly text byte for byte, and its assembled
-//! kernel (machine code and kernel descriptor) equals the same symbol inside the committed
-//! `kernels/hc8_wmma_pm_gfx1201.hxaco` (86 exports, compared through the ELF symbol table). The four schedule
-//! axes compile or refuse as tabulated below, and every non-declared value changes the text.
+//! `kernels/hc8_wmma_gfx1201.rs` + `hc8_wmma_gfx1201/read_up.rs`): at each variant's served axis point (the
+//! RESULT-P2 winners for down_n2, down_n3 and up_n1; the declared point for the other three) every one of
+//! the six served variants re-emits the generator's per-kernel assembly text byte for byte, and its
+//! assembled kernel (machine code and kernel descriptor) equals the same symbol inside the committed
+//! `kernels/hc8_wmma_pm_gfx1201.hxaco` (86 exports, compared through the ELF symbol table). The script's
+//! consts stay at the original reference point (the search baseline); the four schedule axes compile or
+//! refuse as tabulated below, and every non-declared value changes the text.
 
 use peacemaker_isa::kernels::hc8_wmma_gfx1201::{emit_geos, emit_read_up, Fmt, Geo};
 use peacemaker_isa::{Arch, Emitted};
@@ -25,7 +27,7 @@ const VARIANTS: [(&str, &str, bool, u32); 6] = [
     ("up_n3", "hc8_read_up_e4m3_n3", true, 3),
 ];
 
-/// The generator's own `Geo::unroll()` per column-tile count.
+/// The original search-reference unroll per column-tile count.
 fn default_unroll(nt: u32) -> u8 {
     match nt {
         1 => 8,
@@ -52,13 +54,51 @@ fn with_axes(unroll: &str, loadorder: &str, epipre: &str, delay: &str) -> String
 
 /// One axis changed from the declared point.
 fn with_axis(name: &str, value: &str) -> String {
-    let mut a = ["0", "0", "false", "true"];
+    let mut a = REFERENCE_AXES;
     let at = ["UNROLL", "LOADORDER", "EPIPRE", "DELAY_ALU"]
         .iter()
         .position(|n| *n == name)
         .unwrap();
     a[at] = value;
     with_axes(a[0], a[1], a[2], a[3])
+}
+
+/// The declared (reference) point of the four axes: the script's own consts.
+const REFERENCE_AXES: [&str; 4] = ["0", "0", "false", "true"];
+
+/// `(UNROLL, LOADORDER, EPIPRE, DELAY_ALU)` the generator serves for `variant`: the RESULT-P2 winners for
+/// down_n2, down_n3 and up_n1, the declared point for the rest.
+fn served_axes(variant: &str) -> [&'static str; 4] {
+    match variant {
+        "down_n2" => ["2", "2", "false", "true"],
+        "down_n3" => ["1", "2", "false", "true"],
+        "up_n1" => ["4", "1", "true", "true"],
+        _ => REFERENCE_AXES,
+    }
+}
+
+/// The script with `variant`'s served axes applied.
+fn served_src(variant: &str) -> String {
+    let a = served_axes(variant);
+    with_axes(a[0], a[1], a[2], a[3])
+}
+
+/// RESULT-P2 sha256 of each winner's standalone assembled ELF.
+fn winner_elf_sha256(variant: &str) -> Option<&'static str> {
+    match variant {
+        "down_n2" => Some("e9bf1e88fa21e0ac9d2d352166ba6d9bbf8c078bcbbf231c83a792d1101ece7d"),
+        "down_n3" => Some("a7c0fdec39605c3faaff31803366b8d211d70b358228476e86d4e9113c68bc83"),
+        "up_n1" => Some("88bb2131a5b98856d88ddae3bc5b60625f5f520bc442d19e31737303e0090019"),
+        _ => None,
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn rip(src: &str, variant: &str) -> Result<Emitted, String> {
@@ -153,12 +193,12 @@ fn kernel_parts<'a>(elf: &'a [u8], symbol: &str) -> (&'a [u8], &'a [u8], u64, u6
     (code, kd, code_addr, kd_addr)
 }
 
-/// Every variant at the declared point is the generator's text, byte for byte.
+/// Every variant at its served axis point (`served_axes`) is the generator's text, byte for byte.
 #[test]
-fn declared_point_is_the_generators_text() {
+fn served_point_is_the_generators_text() {
     for (variant, symbol, up, nt) in VARIANTS {
         let rust = generator(up, nt);
-        let got = rip(RIP, variant).unwrap_or_else(|e| panic!("{variant}: {e}"));
+        let got = rip(&served_src(variant), variant).unwrap_or_else(|e| panic!("{variant}: {e}"));
         assert!(
             rust.s_text == got.s_text,
             "{variant}: {}",
@@ -168,17 +208,34 @@ fn declared_point_is_the_generators_text() {
     }
 }
 
-/// The declared point assembles to the committed `.hxaco`'s kernel: the machine code bytes of the symbol and
-/// its 64-byte descriptor equal those of the same symbol in the 86-export module ELF. The descriptor's
+/// The script's declared point (all four consts at their reference values) is the original generator's
+/// reference schedule: it still equals the served text for the unchanged variants and differs from it
+/// for exactly the three winners, so the search baseline stays the pre-winner reference.
+#[test]
+fn declared_point_is_the_reference_not_the_winner() {
+    for (variant, _, up, nt) in VARIANTS {
+        let rust = generator(up, nt);
+        let got = rip(RIP, variant).unwrap_or_else(|e| panic!("{variant}: {e}"));
+        let winner = served_axes(variant) != REFERENCE_AXES;
+        assert_eq!(got.s_text != rust.s_text, winner, "{variant}");
+    }
+}
+
+/// The served point assembles to the committed `.hxaco`'s kernel: the machine code bytes of the symbol and
+/// its 64-byte descriptor equal those of the same symbol in the 86-export module ELF. The three RESULT-P2
+/// winners' standalone ELFs also have the exact sha256 the search certified. The descriptor's
 /// `kernel_code_entry_byte_offset` (bytes 16..24) is the one field that depends on where the kernel sits in
 /// `.text`; it is compared as "points at the symbol's code" in each ELF instead of as a number.
 #[test]
-fn declared_point_is_the_shipped_artifact() {
+fn served_point_is_the_shipped_artifact() {
     let module = bundle_elf(SHIPPED_HXACO);
     for (variant, symbol, ..) in VARIANTS {
-        let got = rip(RIP, variant).unwrap_or_else(|e| panic!("{variant}: {e}"));
+        let got = rip(&served_src(variant), variant).unwrap_or_else(|e| panic!("{variant}: {e}"));
         let elf = peacemaker_isa::native::assemble(&got.s_text, Arch::Gfx1201)
             .unwrap_or_else(|e| panic!("{variant}: {e}"));
+        if let Some(want) = winner_elf_sha256(variant) {
+            assert_eq!(sha256_hex(&elf), want, "{variant}: winner ELF sha256");
+        }
         let (code, kd, code_addr, kd_addr) = kernel_parts(&elf, symbol);
         let (m_code, m_kd, m_code_addr, m_kd_addr) = kernel_parts(module, symbol);
         assert_eq!(kd.len(), 64, "{symbol}.kd");
@@ -257,8 +314,8 @@ fn unroll_refused(nt: u32, unroll: u32) -> bool {
 const UNROLLS: [&str; 9] = ["0", "1", "2", "3", "4", "5", "6", "8", "10"];
 
 /// UNROLL: refused exactly when the layout does not fit, otherwise it compiles; it changes the text exactly
-/// when it differs from the generator's default for the variant, and the generator's default value spelled
-/// out is the declared text.
+/// when it differs from the original reference's unroll for the variant, and that value spelled
+/// out explicitly is the declared text.
 #[test]
 fn unroll_compiles_or_refuses_as_tabulated() {
     for (variant, _, up, nt) in VARIANTS {

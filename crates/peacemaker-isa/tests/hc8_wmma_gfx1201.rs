@@ -1165,6 +1165,14 @@ fn module_record_abi_resources_and_native_roundtrip() {
             (vg[0], sg.first().copied().unwrap_or(0), lds[0]),
         );
     }
+    for (symbol, expected) in [
+        ("hc8_gemm_e4m3_mw1_kw16_n2_act", 128),
+        ("hc8_gemm_e4m3_mw1_kw16_n3_act", 116),
+        ("hc8_gemm_e4m3_mw1_kw16_n2_set", 200),
+        ("hc8_gemm_e4m3_mw1_kw16_n3_set", 168),
+    ] {
+        assert_eq!(vgprs[symbol].0, expected, "{symbol}: schedule VGPR pin");
+    }
     for (sym, (v, s, l)) in &vgprs {
         log(format!("[resources] {sym} vgprs={v} sgprs={s} lds={l}"));
     }

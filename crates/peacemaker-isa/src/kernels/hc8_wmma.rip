@@ -14,10 +14,11 @@
 //   up_n2      hc8_read_up_e4m3_n2               emit_read_up(2)
 //   up_n3      hc8_read_up_e4m3_n3               emit_read_up(3)
 //
-// At the declared axis values every variant re-emits the generator's per-kernel assembly text byte for byte
-// (`Emitted.s_text`), and its assembled kernel (code and 64-byte descriptor) equals the same symbol inside the
-// committed `.hxaco`; `tests/hc8_wmma_twin.rs` pins both. The int8 weight format, `set` epilogue, other
-// geometries, NT 4 and the dequant entries of the module are not served and not transliterated.
+// The declared axis values retain the original search reference. Production now uses
+// (UNROLL, LOADORDER, EPIPRE) = (2,2,false) for down_n2, (1,2,false) for down_n3,
+// and (4,1,true) for up_n1; the other three retain the reference point.
+// `tests/hc8_wmma_twin.rs` pins each served point against the Rust generator and committed
+// `.hxaco`. The int8 format, set epilogue, other geometries, NT 4 and dequant entries are not transliterated.
 //
 // ABI. down: 48-byte kernarg `q@0 s@8 x@16 y@24` (u64), `M@32 K@36 rows@40` (u32), `act_scale@44` (f32); block
 // 32*MW*KW = 512, grid M/16 (`M % 16 == 0`, `K % 512 == 0`, `M*K < 2^32`). up: 56-byte kernarg
@@ -37,7 +38,7 @@
 // rounding) is the same for every tuple; only the order and placement of instructions, the register assignment
 // and issue hints change.
 //
-//   UNROLL     K32 tiles per main K-loop batch {0,1,2,3,4,5,6,8,10}; 0 is the generator's own `Geo::unroll()`
+//   UNROLL     K32 tiles per main K-loop batch {0,1,2,3,4,5,6,8,10}; 0 is the original search reference
 //              (8 / 4 / 2 for NT 1 / 2 / 3). The remainder batches halve (`u, u/2, ..., 1`, integer division)
 //              exactly like `Geo::batches()`. Every batch computes the same tiles in the same ascending order,
 //              so each accumulator sees the same WMMA chain; only the loop trip grouping and the number of
@@ -208,7 +209,7 @@ impl Geo {
     }
 }
 
-// The generator's own `Geo::unroll()`.
+// The original search reference's unroll (not the selected production winners).
 fn default_unroll(nt: u32) -> u32 {
     if nt == 1 {
         return 8;

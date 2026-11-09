@@ -10,6 +10,31 @@ use peacemaker_isa::hip_twin::{seal, verify_hxaco};
 
 const CO: &[u8] = include_bytes!("fixtures/hip_twin_saxpy_gfx1100.co");
 
+/// The shipped HC8 module preserves the three hardware-judged instruction streams
+/// through lift/re-encode and the existing hip_twin hazard/ABI checks.
+#[test]
+fn hc8_schedule_winners_reverify() {
+    let image: &[u8] = include_bytes!("../../../kernels/hc8_wmma_pm_gfx1201.hxaco");
+    let symbols = [
+        "hc8_gemm_e4m3_mw1_kw16_n2_act",
+        "hc8_gemm_e4m3_mw1_kw16_n3_act",
+        "hc8_read_up_e4m3_n1",
+    ];
+    let expected = [
+        "ba3a3f6e6014e5b0b0e88881ce0c4ba0381bbbf6931019955c347223c7f1e431",
+        "31c4f2c61d26c53e99635308bd508f5a52e6a5c17a6347eb902f4bd8ec2756ed",
+        "2fce1fdd4c84577fc8e78908ab1ebfd70b2244ad2bf02d9fec04e5512df92837",
+    ];
+    let sealed = peacemaker_isa::hip_twin::verify_hxaco_many(image, Arch::Gfx1201, &symbols)
+        .expect("HC8 winner lift identity, hazards and descriptors");
+    for (kernel, hash) in sealed.iter().zip(expected) {
+        assert_eq!(kernel.text_sha256, hash);
+        assert_eq!(kernel.hxaco, image);
+        assert_eq!(kernel.scratch, 0);
+        assert_eq!(kernel.report["hazards"]["blocking"], 0);
+    }
+}
+
 #[test]
 fn seals_and_verifies() {
     let s = seal(CO, Arch::Gfx1100, "twin_saxpy", None).expect("seal");
