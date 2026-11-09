@@ -258,6 +258,15 @@ pub struct FeatureFlags {
     /// outputs are not bitwise the SIMT route's (f32 summation order). Default on for exact
     /// gfx1201 (`=0` kills it).
     pub qwen4_lane_wmma: bool,
+    /// Dense BF16 multirow GEMMs of the sub-512-row prefill forward above 64 rows on the lane
+    /// WMMA kernels (`HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE`), split-K pinned to
+    /// `LANE_WMMA_PREFILL_SPLIT_ROWS` (row-count invariant per row). Default on for exact
+    /// gfx1201 (`=0` kills it); also gated by the lane WMMA flag.
+    pub qwen4_prefill_lwmma_dense: bool,
+    /// The HC read down / up projections of the sub-512-row prefill forward above 64 rows on the
+    /// lane WMMA kernels (`HIPFIRE_QWEN4_PREFILL_LWMMA_HC`, pinned split-K). Default on for exact
+    /// gfx1201 (`=0` kills it); also gated by the lane WMMA flag.
+    pub qwen4_prefill_lwmma_hc: bool,
     /// One `gemv_bf16_xf32_x4_rows_exact` launch for the MTP fc_hidden branch rows of all lanes
     /// (`HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH`). Default on for exact gfx1201 (`=0` kills it).
     pub qwen4_mtp_fc_one_launch: bool,
@@ -1255,6 +1264,9 @@ impl FeatureFlags {
             qwen4_bf16_allrows: parse_bool("HIPFIRE_QWEN4_BF16_ALLROWS").unwrap_or(true),
             qwen4_hc_k4_allrows: parse_bool("HIPFIRE_QWEN4_HC_K4_ALLROWS").unwrap_or(true),
             qwen4_lane_wmma: parse_bool("HIPFIRE_QWEN4_LANE_WMMA").unwrap_or(true),
+            qwen4_prefill_lwmma_dense: parse_bool("HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE")
+                .unwrap_or(true),
+            qwen4_prefill_lwmma_hc: parse_bool("HIPFIRE_QWEN4_PREFILL_LWMMA_HC").unwrap_or(true),
             qwen4_mtp_fc_one_launch: parse_bool("HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH").unwrap_or(true),
             qwen4_lane_ple_project: parse_bool("HIPFIRE_QWEN4_LANE_PLE_PROJECT").unwrap_or(true),
             qwen4_hc8: parse_bool("HIPFIRE_QWEN4_HC8").unwrap_or(true),
@@ -2103,6 +2115,20 @@ impl FeatureFlags {
         self.qwen4_lane_wmma && self.arch == "gfx1201"
     }
 
+    /// Dense BF16 prefill GEMMs above `WIDE_VERIFY_MAX_ROWS` (below the F16 WMMA threshold) on
+    /// the lane WMMA kernels (`HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE`, default on, `=0` kills it).
+    /// Needs the lane WMMA gate ([`Self::qwen4_lane_wmma_enabled`]: exact gfx1201, not killed).
+    pub fn qwen4_prefill_lwmma_dense_enabled(&self) -> bool {
+        self.qwen4_prefill_lwmma_dense && self.qwen4_lane_wmma_enabled()
+    }
+
+    /// HC read down/up projections above `WIDE_VERIFY_MAX_ROWS` (below the F16 WMMA threshold)
+    /// on the lane WMMA kernels (`HIPFIRE_QWEN4_PREFILL_LWMMA_HC`, default on, `=0` kills it).
+    /// Same gate as [`Self::qwen4_prefill_lwmma_dense_enabled`].
+    pub fn qwen4_prefill_lwmma_hc_enabled(&self) -> bool {
+        self.qwen4_prefill_lwmma_hc && self.qwen4_lane_wmma_enabled()
+    }
+
     /// One-launch MTP fc_hidden projection over all `lanes * hc` branch rows
     /// (`HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH`, default on, `=0` kills it). Exact gfx1201 only. Bitwise
     /// the eight-row-chunk launches' outputs.
@@ -2333,6 +2359,8 @@ impl FeatureFlags {
             qwen4_bf16_allrows: false,
             qwen4_hc_k4_allrows: false,
             qwen4_lane_wmma: false,
+            qwen4_prefill_lwmma_dense: false,
+            qwen4_prefill_lwmma_hc: false,
             qwen4_mtp_fc_one_launch: false,
             qwen4_lane_ple_project: false,
             qwen4_hc8: false,
@@ -3902,6 +3930,68 @@ mod tests {
             assert_eq!(on.qwen4_lane_wmma_enabled(), arch == "gfx1201", "{arch}: 1");
         }
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_lane_wmma_enabled());
+    }
+
+    /// The prefill lane WMMA knobs are default on (`=0` kills each) and reach exact gfx1201
+    /// only; `HIPFIRE_QWEN4_LANE_WMMA=0` kills both too.
+    #[test]
+    fn qwen4_prefill_lwmma_flags_default_on_exact_gfx1201() {
+        let with = |name: &'static str, value: &'static str| {
+            move |n: &str| -> std::result::Result<String, ()> {
+                if n == name {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                unset.qwen4_prefill_lwmma_dense_enabled(),
+                exact,
+                "{arch}: dense unset"
+            );
+            assert_eq!(
+                unset.qwen4_prefill_lwmma_hc_enabled(),
+                exact,
+                "{arch}: hc unset"
+            );
+            let dense_off =
+                FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE", "0"));
+            assert!(
+                !dense_off.qwen4_prefill_lwmma_dense_enabled(),
+                "{arch}: dense 0"
+            );
+            assert_eq!(
+                dense_off.qwen4_prefill_lwmma_hc_enabled(),
+                exact,
+                "{arch}: hc kept"
+            );
+            let hc_off =
+                FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_PREFILL_LWMMA_HC", "0"));
+            assert!(!hc_off.qwen4_prefill_lwmma_hc_enabled(), "{arch}: hc 0");
+            assert_eq!(
+                hc_off.qwen4_prefill_lwmma_dense_enabled(),
+                exact,
+                "{arch}: dense kept"
+            );
+            let lane_off = FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_LANE_WMMA", "0"));
+            assert!(
+                !lane_off.qwen4_prefill_lwmma_dense_enabled(),
+                "{arch}: lane 0 dense"
+            );
+            assert!(
+                !lane_off.qwen4_prefill_lwmma_hc_enabled(),
+                "{arch}: lane 0 hc"
+            );
+        }
+        let t = FeatureFlags::for_test("gfx1201");
+        assert!(!t.qwen4_prefill_lwmma_dense_enabled());
+        assert!(!t.qwen4_prefill_lwmma_hc_enabled());
     }
 
     /// The MTP one-launch fc_hidden and lane PLE project flags are default on (`=0` kills) and

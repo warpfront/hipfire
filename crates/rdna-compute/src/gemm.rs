@@ -32284,6 +32284,25 @@ impl Gpu {
                 )
                 .map(|_| ());
         }
+        // `HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE` (default on, exact gfx1201, > 64 rows below the F16
+        // WMMA route): the same kernel with two BF16 activation terms (hi + lo) and a split-K
+        // pinned to a fixed row count, so each row is bitwise its singleton's whatever the call size.
+        if self.prefill_lwmma_dense_applies(batch_size)
+            && k.is_multiple_of(128)
+            && x.dtype == DType::F32
+            && y.dtype == DType::F32
+        {
+            return self.lane_wmma_gemm_prefill(
+                &crate::lane_wmma::LaneWmmaWeight::Bf16(weight),
+                x,
+                y,
+                m,
+                k,
+                batch_size,
+                2,
+                None,
+            );
+        }
         // `HIPFIRE_QWEN4_BF16_ALLROWS` (exact gfx1201): 9..=64 rows in one launch that loads
         // each weight once per output tile; every output word is bitwise the arms below'.
         if self.bf16_allrows_applies(batch_size) {

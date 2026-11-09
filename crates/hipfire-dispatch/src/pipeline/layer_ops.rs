@@ -2050,18 +2050,44 @@ fn execute_hyper_read_inner(
             split_projections(gpu, op.rows, &[(down, &low)], launch)?;
         }
         activated = true;
+    } else if gpu.arch_caps.has_gfx11_plus_simt()
+        && gpu.prefill_lwmma_hc_applies(op.rows)
+        && op.input_mix_down.dtype == DType::BF16
+        && op.input_mix_down.awq_scale.is_none()
+        && op.input_mix_down.k % 128 == 0
+    {
+        // HIPFIRE_QWEN4_PREFILL_LWMMA_HC (default on): lane WMMA down + hc_act epilogue above 64 rows
+        // below the F16 WMMA route. One BF16 term is exact: `normalized` is `hyper_norm`'s
+        // BF16-rounded output and the weight is BF16.
+        if !normalized_ready {
+            hip(hyper_norm(gpu, &norm))?;
+        }
+        hip(gpu.lane_wmma_gemm_prefill(
+            &rdna_compute::lane_wmma::LaneWmmaWeight::Bf16(op.input_mix_down.buf),
+            &normalized,
+            &low,
+            op.input_mix_down.m,
+            op.input_mix_down.k,
+            op.rows,
+            1,
+            Some(1.0 / op.branches as f32),
+        ))?;
+        activated = true;
     } else {
         if !normalized_ready {
             hip(hyper_norm(gpu, &norm))?;
         }
-        project_weight(
+        let held = std::mem::replace(&mut gpu.prefill_lwmma_dense_hold, true);
+        let projected = project_weight(
             gpu,
             &op.input_mix_down,
             &normalized,
             &low,
             op.rows,
             Some(op.rotation),
-        )?;
+        );
+        gpu.prefill_lwmma_dense_hold = held;
+        projected?;
     }
     // `activated` implies the gfx11+ route: the down GEMV already applied it.
     if gpu.arch_caps.has_gfx11_plus_simt() {
@@ -2155,9 +2181,38 @@ fn execute_hyper_read_inner(
             )
             .map(|_| ()));
         }
+        // HIPFIRE_QWEN4_PREFILL_LWMMA_HC (default on): the same lane WMMA up read above 64 rows below
+        // the F16 WMMA route, split-K-free (the read-up kernel is row-count invariant there).
+        if gpu.arch_caps.has_gfx11_plus_simt()
+            && gpu.prefill_lwmma_hc_applies(op.rows)
+            && !read.normalized_bf16
+            && read.low.dtype == DType::F32
+            && read.normalized.dtype == DType::F32
+            && read.mixed.dtype == DType::F32
+            && op.input_mix_up.dtype == DType::BF16
+            && op.input_mix_up.awq_scale.is_none()
+            && op.low_rank % 32 == 0
+            && op.hidden % 16 == 0
+        {
+            return hip(rdna_compute::lane_wmma::lane_wmma_read_up(
+                gpu,
+                &rdna_compute::lane_wmma::LaneWmmaWeight::Bf16(op.input_mix_up.buf),
+                read.low,
+                read.normalized,
+                read.mixed,
+                op.rows,
+                op.hidden,
+                op.low_rank,
+                1,
+            )
+            .map(|_| ()));
+        }
         return hip(hyper_read_up_fused(gpu, &read));
     }
-    project_weight(gpu, &op.input_mix_up, &low, &up, op.rows, Some(op.rotation))?;
+    let held = std::mem::replace(&mut gpu.prefill_lwmma_dense_hold, true);
+    let projected = project_weight(gpu, &op.input_mix_up, &low, &up, op.rows, Some(op.rotation));
+    gpu.prefill_lwmma_dense_hold = held;
+    projected?;
     if let Some(rotated) = rotate_into.filter(|r| {
         op.branches == 4 && op.hidden.is_multiple_of(256) && r.numel() >= op.rows * op.hidden
     }) {

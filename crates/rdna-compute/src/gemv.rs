@@ -22103,6 +22103,29 @@ impl Gpu {
             && (LANE_WMMA_MIN_ROWS..=WIDE_VERIFY_MAX_ROWS).contains(&rows)
     }
 
+    /// Whether a dense BF16 prefill GEMM of `rows` rows takes the lane WMMA kernel above
+    /// [`WIDE_VERIFY_MAX_ROWS`] (`HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE`, default on) while the route is
+    /// below the F16 WMMA prefill threshold ([`crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS`]). Not
+    /// bitwise the SIMT route; deterministic; each row is bitwise the same across call sizes
+    /// (pinned split-K). Refused in the lane row-exact scope and under the HC hold
+    /// ([`Gpu::prefill_lwmma_dense_hold`]).
+    pub fn prefill_lwmma_dense_applies(&self, rows: usize) -> bool {
+        self.flags.qwen4_prefill_lwmma_dense_enabled()
+            && !self.lane_row_exact_scope
+            && !self.prefill_lwmma_dense_hold
+            && rows > WIDE_VERIFY_MAX_ROWS
+            && self.route_rows(rows) < crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+    }
+
+    /// Same as [`Gpu::prefill_lwmma_dense_applies`] for the HC read projections
+    /// (`HIPFIRE_QWEN4_PREFILL_LWMMA_HC`, default on), without the HC hold.
+    pub fn prefill_lwmma_hc_applies(&self, rows: usize) -> bool {
+        self.flags.qwen4_prefill_lwmma_hc_enabled()
+            && !self.lane_row_exact_scope
+            && rows > WIDE_VERIFY_MAX_ROWS
+            && self.route_rows(rows) < crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+    }
+
     /// Whether the HC k4 projection of `rows` activation rows takes the one-launch all-rows arm
     /// (`HIPFIRE_QWEN4_HC_K4_ALLROWS`, exact gfx1201): the flag, `k % 32 == 0`, `k >=
     /// [`HcK4AllRowsTile::MIN_K`]` and 9..=
