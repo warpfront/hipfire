@@ -906,6 +906,7 @@ fn install_unit_tail(
         hipfire_config::developer_bool(tail::EP_UNIT_TAIL_FREEZE_ENV, false),
         log,
         tail::tail_lever(tail::EP_UNIT_TAIL_FILL_OVERLAP_ENV),
+        tail::tail_lever(tail::EP_UNIT_TAIL_PEER_RESERVE_ENV),
         layers,
         peer,
         pin_board,

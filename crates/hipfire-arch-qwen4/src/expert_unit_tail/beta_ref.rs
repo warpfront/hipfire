@@ -74,6 +74,9 @@ pub struct TailPolicy {
     frozen: bool,
     /// PEER mode: evictions quarantine the slot instead of refilling it in the same retirement.
     peer: bool,
+    // --- slice 5 RESERVE lever (`disable_slice5_reserve`: the policy below is beta's exactly)
+    reserve: bool,
+    // --- end slice 5
     slots: Vec<Slot>,
     /// Unit -> slot for slots that are `Filling` or `Live`.
     index: HashMap<UnitKey, usize>,
@@ -104,6 +107,9 @@ impl TailPolicy {
             config,
             frozen,
             peer: false,
+            // --- slice 5
+            reserve: true,
+            // --- end slice 5
             slots: vec![
                 Slot {
                     unit: None,
@@ -165,6 +171,12 @@ impl TailPolicy {
         let s = &self.slots[slot];
         (s.phase == SlotPhase::Quarantined).then_some(s.evicted_at)
     }
+
+    // --- slice 5: drop every marked RESERVE block's effect (beta's decisions exactly).
+    pub fn disable_slice5_reserve(&mut self) {
+        self.reserve = false;
+    }
+    // --- end slice 5
 
     /// PEER mode: from now on an eviction quarantines the slot until
     /// [`Self::retire_peer`]'s `released_through` covers it. Must precede the first retirement.
@@ -402,7 +414,7 @@ impl TailPolicy {
             0
         };
         // --- slice 5 RESERVE gate and target (see the block in the loop)
-        let reserve = self.peer && !boundary && candidates.len() >= budget;
+        let reserve = self.reserve && self.peer && !boundary && candidates.len() >= budget;
         let reserve_target = RESERVE_RETIREMENTS * budget;
         // --- end slice 5
         for cand in candidates.into_iter().take(budget) {

@@ -218,6 +218,12 @@ pub const EP_UNIT_TAIL_LOG_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_LOG";
 /// them before it polls (the policy sees the same completions). `=0` issues them at the
 /// retirement and polls them.
 pub const EP_UNIT_TAIL_FILL_OVERLAP_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_FILL_OVERLAP";
+/// Default on (`=0` is the kill switch): with peer quarantine ([`EP_UNIT_TAIL_PEER_ENV`]) in
+/// per-window mode, a retirement whose candidates saturate its fill budget keeps a reserve of
+/// free + quarantined slots ([`RESERVE_RETIREMENTS`]` x ` the budget, a constant) so `F` fills per
+/// window are sustained instead of alternating with the evictions (module docs, RESERVE). `=0`
+/// restores the candidate-waits rule for every retirement, decision for decision.
+pub const EP_UNIT_TAIL_PEER_RESERVE_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_PEER_RESERVE";
 /// `G` (whole units, default [`EP_UNIT_TAIL_STAGE_GAP_DEFAULT`]): with the prefill lever, the
 /// slot-aware unit stage merges two H2D copy runs across a slot-live gap shorter than `G` units
 /// (the gap units are copied too and simply not referenced: their stage-table entries still name
@@ -686,6 +692,9 @@ pub struct TailPolicy {
     frozen: bool,
     /// PEER mode: evictions quarantine the slot instead of refilling it in the same retirement.
     peer: bool,
+    /// PEER per-window mode keeps the RESERVE under saturated demand (module docs);
+    /// [`EP_UNIT_TAIL_PEER_RESERVE_ENV`]`=0` turns it off ([`Self::set_peer_reserve`]).
+    peer_reserve: bool,
     /// `None` only after [`Self::close`] succeeded.
     bank: Option<SlotBank>,
     /// The membership of the NEXT generation: the `Resident` slots.
@@ -773,6 +782,7 @@ impl TailPolicy {
             config,
             frozen,
             peer,
+            peer_reserve: true,
             bank: Some(bank),
             staging,
             slots: cells
@@ -792,6 +802,13 @@ impl TailPolicy {
             refusals: 0,
             first_refusal: None,
         })
+    }
+
+    /// The RESERVE lever ([`EP_UNIT_TAIL_PEER_RESERVE_ENV`]): `false` keeps the candidate-waits
+    /// rule in every retirement (the pre-reserve decisions). Default `true`; only PEER per-window
+    /// mode ever keeps a reserve.
+    pub fn set_peer_reserve(&mut self, on: bool) {
+        self.peer_reserve = on;
     }
 
     pub fn config(&self) -> &EpUnitTailConfig {
@@ -1375,7 +1392,7 @@ impl TailPolicy {
         // while free + quarantined slots are below `RESERVE_RETIREMENTS x budget`, evicts one
         // victim into quarantine for a later retirement's fills. Below saturation the candidate
         // that has to evict waits (it is admitted if it misses again), as without the reserve.
-        let reserve = self.peer && !boundary && candidates.len() >= budget;
+        let reserve = self.peer && self.peer_reserve && !boundary && candidates.len() >= budget;
         let reserve_target = RESERVE_RETIREMENTS * budget;
         for cand in candidates.into_iter().take(budget) {
             if reserve {
@@ -2457,10 +2474,16 @@ mod tests {
                 let before = *p.stats();
                 let r = p.retire_peer((0, 0), &uses, &completed, |m| m.saturating_sub(lag));
                 let s = *p.stats();
-                assert!(s.evictions - before.evictions <= f as u64, "one eviction per candidate");
+                assert!(
+                    s.evictions - before.evictions <= f as u64,
+                    "one eviction per candidate"
+                );
                 assert!(r.fills.len() <= f);
                 let held = reserve(&p);
-                assert!(held <= RESERVE_RETIREMENTS * f, "lag {lag} w {w}: reserve {held}");
+                assert!(
+                    held <= RESERVE_RETIREMENTS * f,
+                    "lag {lag} w {w}: reserve {held}"
+                );
                 completed = r.fills.iter().map(|&(slot, _, g)| (slot, g)).collect();
                 if w >= 10 {
                     steady.push(r.fills.len());
@@ -2476,7 +2499,11 @@ mod tests {
                 let r = p.retire_peer((0, 0), &uses, &completed, |m| m.saturating_sub(lag));
                 completed = r.fills.iter().map(|&(slot, _, g)| (slot, g)).collect();
             }
-            assert!(reserve(&p) <= RESERVE_RETIREMENTS, "lag {lag}: reserve {}", reserve(&p));
+            assert!(
+                reserve(&p) <= RESERVE_RETIREMENTS,
+                "lag {lag}: reserve {}",
+                reserve(&p)
+            );
         }
     }
 

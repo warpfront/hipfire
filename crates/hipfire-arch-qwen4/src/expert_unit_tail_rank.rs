@@ -981,6 +981,7 @@ impl UnitTailRank {
         freeze: bool,
         log_enabled: bool,
         fill_overlap: bool,
+        peer_reserve: bool,
         layers: Vec<TailLayerInit>,
         peer: Option<Arc<PeerBoard>>,
         pin_board: Option<Arc<PeerBoard>>,
@@ -1260,6 +1261,7 @@ impl UnitTailRank {
                 ));
             }
         };
+        policy.set_peer_reserve(peer_reserve);
         let seeds = match policy.seed(&order) {
             Ok(seeds) => seeds,
             Err(error) => {
