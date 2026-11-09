@@ -47,7 +47,10 @@ fn end() -> Inst {
     ops::sp(SoppOp::Endpgm, 0)
 }
 fn wait(vm: u8, lgkm: u8) -> Inst {
-    ops::sp(SoppOp::Waitcnt, waitcnt_imm(A, vm, 7, lgkm).expect("valid wait"))
+    ops::sp(
+        SoppOp::Waitcnt,
+        waitcnt_imm(A, vm, 7, lgkm).expect("valid wait"),
+    )
 }
 fn nop(imm: u16) -> Inst {
     ops::sp(SoppOp::Nop, imm)
@@ -84,7 +87,7 @@ fn ok(insts: &[Inst]) -> Value {
 }
 fn fails(insts: &[Inst], needle: &str) {
     match certify(insts) {
-        Ok(v) => panic!("expected failure containing `{needle}`, certified: {v}"),
+        Ok(cert) => panic!("expected failure containing `{needle}`, certified: {cert}"),
         Err(e) => assert!(e.contains(needle), "`{needle}` not in: {e}"),
     }
 }
@@ -150,7 +153,10 @@ fn missing_vmem_wait_fails_and_the_wait_fixes_it() {
     fails(&[load(1), use_of(1), end()], "Vm wait");
     ok(&[load(1), wait(0, 15), use_of(1), end()]);
     // WAW: a pending load's destination needs its wait before it is overwritten.
-    fails(&[load(1), ops::v1(Vop1Op::MovB32, v(1), v(0)), end()], "Vm wait");
+    fails(
+        &[load(1), ops::v1(Vop1Op::MovB32, v(1), v(0)), end()],
+        "Vm wait",
+    );
     ok(&[
         load(1),
         wait(0, 15),
@@ -175,10 +181,16 @@ fn store_sources_are_not_counter_held_on_gfx942_but_counters_and_barriers_still_
     ]);
     // Still enforced: the store occupies its counter slot (a later load's wait position),
     // and a pending DS store blocks the barrier even though its data was overwritten.
-    fails(&[ds_write(1), overwrite(1), barrier(), end()], "Lgkm wait 0 (Barrier)");
+    fails(
+        &[ds_write(1), overwrite(1), barrier(), end()],
+        "Lgkm wait 0 (Barrier)",
+    );
     ok(&[ds_write(1), overwrite(1), wait(63, 0), barrier(), end()]);
     ok(&[store(5), load(1), wait(1, 15), end()]);
-    fails(&[store(5), load(1), wait(1, 15), use_of(1), end()], "Vm wait");
+    fails(
+        &[store(5), load(1), wait(1, 15), use_of(1), end()],
+        "Vm wait",
+    );
     // The ISA's wait-state rule for wide VMEM store data stays enforced by the hazard pass.
     let wide = || ops::global_store(FlatOp::StoreDwordx4, v(2), v(4), None, 0);
     fails(&[wide(), overwrite(5), end()], "> 64 bits of data");
@@ -188,8 +200,19 @@ fn store_sources_are_not_counter_held_on_gfx942_but_counters_and_barriers_still_
 #[test]
 fn nonzero_vmcnt_retires_by_position_in_one_in_order_stream() {
     // Loads and stores share VM_CNT in issue order: after `vmcnt(1)` only the youngest remains.
-    ok(&[load(1), load(10), wait(1, 15), use_of(1), wait(0, 15), use_of(10), end()]);
-    fails(&[load(1), load(10), wait(1, 15), use_of(10), end()], "Vm wait");
+    ok(&[
+        load(1),
+        load(10),
+        wait(1, 15),
+        use_of(1),
+        wait(0, 15),
+        use_of(10),
+        end(),
+    ]);
+    fails(
+        &[load(1), load(10), wait(1, 15), use_of(10), end()],
+        "Vm wait",
+    );
     ok(&[load(1), store(5), wait(1, 15), use_of(1), end()]);
     // A wait with the no-wait maximum retires nothing.
     fails(&[load(1), wait(63, 15), use_of(1), end()], "Vm wait");
@@ -200,7 +223,10 @@ fn missing_lgkm_wait_for_ds_fails_and_nonzero_lgkmcnt_retires_by_position() {
     fails(&[ds_read(1), use_of(1), end()], "Lgkm wait");
     ok(&[ds_read(1), wait(63, 0), use_of(1), end()]);
     ok(&[ds_read(1), ds_read(10), wait(63, 1), use_of(1), end()]);
-    fails(&[ds_read(1), ds_read(10), wait(63, 1), use_of(10), end()], "Lgkm wait");
+    fails(
+        &[ds_read(1), ds_read(10), wait(63, 1), use_of(10), end()],
+        "Lgkm wait",
+    );
 }
 
 #[test]
@@ -226,7 +252,10 @@ fn a_wait_on_only_one_branch_path_is_rejected() {
     // 0: load  1: s_cbranch_scc1 -> 3  2: s_waitcnt vmcnt(0)  3: use  4: end
     // The branch skips the wait (offset 1 dword over the one-dword wait).
     let skip = ops::sp(SoppOp::CbranchScc1, 1);
-    fails(&[load(1), skip.clone(), wait(0, 15), use_of(1), end()], "Vm wait");
+    fails(
+        &[load(1), skip.clone(), wait(0, 15), use_of(1), end()],
+        "Vm wait",
+    );
     // The wait before the branch covers both paths.
     ok(&[load(1), wait(0, 15), skip, use_of(1), end()]);
 }
@@ -259,13 +288,16 @@ fn control_flow_and_effects_the_checkers_cannot_follow_fail_closed() {
     // Fall-through off the end.
     fails(&[wait(0, 15)], "fall off the end");
     // Indirect branch.
-    fails(
-        &[ops::s1(Sop1Op::SetpcB64, s(0), s(2)), end()],
-        "indirect",
-    );
+    fails(&[ops::s1(Sop1Op::SetpcB64, s(0), s(2)), end()], "indirect");
     // Traps and messages are outside the ledger's model.
-    fails(&[ops::sp(SoppOp::Trap, 1), end()], "outside the wait ledger's model");
-    fails(&[ops::sp(SoppOp::Sendmsg, 1), end()], "outside the wait ledger's model");
+    fails(
+        &[ops::sp(SoppOp::Trap, 1), end()],
+        "outside the wait ledger's model",
+    );
+    fails(
+        &[ops::sp(SoppOp::Sendmsg, 1), end()],
+        "outside the wait ledger's model",
+    );
     // FLAT-segment accesses count on two counters and may reach LDS.
     let mut flat = load(1);
     if let Inst::Flat(f) = &mut flat {
@@ -274,7 +306,11 @@ fn control_flow_and_effects_the_checkers_cannot_follow_fail_closed() {
     fails(&[flat, wait(0, 0), end()], "segment access");
     // Memory data in an AccVGPR cannot be tracked by the ledger.
     fails(
-        &[ops::global_store(FlatOp::StoreDword, v(2), Src::Agpr(0), None, 0), wait(0, 15), end()],
+        &[
+            ops::global_store(FlatOp::StoreDword, v(2), Src::Agpr(0), None, 0),
+            wait(0, 15),
+            end(),
+        ],
         "plain SGPR/VGPR",
     );
 }
@@ -285,7 +321,9 @@ fn offsets_must_be_the_encoders() {
     bad[1].dword_offset = 5;
     let e = certify_stream("k", &bad).unwrap_err();
     assert!(e.contains("instruction 1 is at dword 5"), "{e}");
-    assert!(certify_stream("k", &[]).unwrap_err().contains("no instructions"));
+    assert!(certify_stream("k", &[])
+        .unwrap_err()
+        .contains("no instructions"));
 }
 
 #[test]

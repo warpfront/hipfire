@@ -22,6 +22,129 @@
       "Thread model: posix"
     ]
   },
+  "gpu_oracle": {
+    "all_case_inputs_sha256": "886a1054be63584c59e6c294241c3e5cffadad703f21a1760838770b14121a20",
+    "case_count": 8280,
+    "cases_by_kernel": {
+      "gemm_bf16_mfma_gfx942_rows16": 3680,
+      "gemm_bf16_mfma_gfx942_rows16_x2": 4600
+    },
+    "controls": {
+      "control_shape": {
+        "d": "f32",
+        "k": 256,
+        "m": 48,
+        "rows": 2,
+        "x": "f32"
+      },
+      "pm_equals_hipcc_on_control_input": true,
+      "pm_on_perturbed_input_differs_from_hipcc": true,
+      "single_flipped_host_byte_detected": true
+    },
+    "device": {
+      "arch": "gfx942",
+      "index": 0,
+      "pci_bus_id": "0000:83:00.0"
+    },
+    "failed_cases": 0,
+    "failures": [],
+    "full_matrix": true,
+    "full_receipt_location": "mi300x:/scratch/quant/fn-fp8/twin-g942/gpu-oracle-full.json (per-case array retained there)",
+    "full_receipt_sha256": "6b086c8d7826cdee20b185270ef31092aa9f18849be7ffcf910841e6c0403776",
+    "hipcc_device_elf_bytes": 52104,
+    "hipcc_device_elf_sha256": "5509737bfa4914f6f18648c792684d18b488e672ef198fea8d5b0e147a517672",
+    "hipcc_image_sha256": "1e2c623a29db8b21bc1e9bab7d4230257e3c4186a646143585ade03df829b8be",
+    "host_ram": {
+      "mem_available_at_start_bytes": 245766746112,
+      "mem_total_bytes": 253347037184,
+      "min_free_fraction": 0.25
+    },
+    "input_hxaco_sha256": "dfddba54609b725d8ab7e2f1a3c78191cf45bc4356583999ef1e4b53beb9c728",
+    "method": "hipModuleLoadData of the hipcc device ELF and of the gfx942 device ELF of the twin hxaco; identical device inputs; hipModuleLaunchKernel via hip-bridge with the production kernarg image; raw byte compare of every output, two poison patterns per arm; every output also compared with the shipped tiled kernel gemm_bf16_mfma_gfx942 of the hipcc image (F32 X staged with convert_f32_to_bf16's rule, BF16 members rounded with the same rule)",
+    "pm_device_elf_bytes": 52104,
+    "pm_device_elf_sha256": "5509737bfa4914f6f18648c792684d18b488e672ef198fea8d5b0e147a517672",
+    "results": {
+      "all_checks_pass": true,
+      "raw_outputs_hipcc_equals_tiled": true,
+      "raw_outputs_pm_equals_hipcc": true,
+      "raw_outputs_pm_equals_tiled": true
+    },
+    "rows": [
+      1,
+      7,
+      8,
+      9,
+      16
+    ],
+    "seconds": 20.881832324,
+    "seed": 8215434355743739409,
+    "shapes": [
+      "gdn_qkv",
+      "gdn_z",
+      "gdn_a",
+      "gdn_b",
+      "out_proj",
+      "qsa_q",
+      "qsa_k",
+      "qsa_v",
+      "qsa_idx",
+      "hc_down",
+      "hc_up",
+      "hc_inject",
+      "sh_gate",
+      "sh_up",
+      "sh_down",
+      "router",
+      "sh_egate",
+      "lm_head",
+      "ple_key",
+      "ple_val",
+      "grp_gdn_in",
+      "grp_qsa_in",
+      "grp_sh_gu",
+      "grp_moe_in",
+      "packed_gdn_in",
+      "packed_sh_gu",
+      "tailk_8",
+      "tailk_16",
+      "tailk_128",
+      "tailk_136",
+      "tailk_248",
+      "tailk_256",
+      "tailk_264",
+      "tailk_384",
+      "tailk_392",
+      "tailk_520",
+      "tailk_2568",
+      "tailk_4104",
+      "tailk_16384",
+      "tailm_1",
+      "tailm_7",
+      "tailm_15",
+      "tailm_17",
+      "tailm_31",
+      "tailm_33",
+      "tailm_4097",
+      "tailg_2",
+      "tailg_3",
+      "tailg_4"
+    ],
+    "status": "PASS",
+    "target": "gfx942",
+    "tiled_comparison": {
+      "bf16_output_rule": "same rule applied to the tiled F32 output words",
+      "cases_hipcc_ne_tiled": 0,
+      "cases_pm_ne_tiled": 0,
+      "f32_x_staging_rule": "RNE; NaN -> sign | 0x7fc0 (sign from the F32 bits), convert_f32_to_bf16.hip",
+      "image_device_elf_sha256": "5509737bfa4914f6f18648c792684d18b488e672ef198fea8d5b0e147a517672",
+      "kernel": "gemm_bf16_mfma_gfx942"
+    },
+    "tool": "peacemaker-isa example gemm_bf16_rows16_oracle",
+    "x_types": [
+      "f32",
+      "bf16"
+    ]
+  },
   "hxaco": {
     "bytes": 56200,
     "file": "gemm_bf16_mfma_gfx942_rows16_pm_gfx942.hxaco",

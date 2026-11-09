@@ -70,6 +70,7 @@ use peacemaker_ir::envelope::Bundle;
 use peacemaker_lift::bundle::BundleCodec;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::ffi::c_void;
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -134,7 +135,9 @@ fn device_image<'a>(bytes: &'a [u8], label: &str) -> Result<&'a [u8], String> {
         bytes
     };
     if elf.len() < 64 || &elf[..4] != b"\x7fELF" || elf[4] != 2 || elf[5] != 1 {
-        return Err(format!("{label}: device image is not a 64-bit little-endian ELF"));
+        return Err(format!(
+            "{label}: device image is not a 64-bit little-endian ELF"
+        ));
     }
     let machine = u16::from_le_bytes([elf[18], elf[19]]);
     let flags = u32::from_le_bytes([elf[48], elf[49], elf[50], elf[51]]);
@@ -165,24 +168,8 @@ struct Image {
     file_sha: String,
     elf_sha: String,
     elf_bytes: usize,
-    _module: Module,
-    r16: Function,
-    x2: Function,
-    tiled: Option<Function>,
-}
-
-impl Image {
-    fn func(&self, s: Sym) -> &Function {
-        match s {
-            Sym::R16 => &self.r16,
-            Sym::X2 => &self.x2,
-        }
-    }
-    fn tiled_fn(&self) -> Result<&Function, String> {
-        self.tiled
-            .as_ref()
-            .ok_or_else(|| format!("image has no `{SYM_TILED}` (the tiled comparator)"))
-    }
+    module: Module,
+    has_tiled: bool,
 }
 
 struct Card {
@@ -234,23 +221,19 @@ impl Card {
             .rt
             .module_load_data(elf)
             .map_err(|e| format!("{label}: hipModuleLoadData: {e}"))?;
-        let r16 = self
-            .rt
+        self.rt
             .module_get_function(&module, SYM_R16)
             .map_err(|e| format!("{label}: hipModuleGetFunction({SYM_R16}): {e}"))?;
-        let x2 = self
-            .rt
+        self.rt
             .module_get_function(&module, SYM_X2)
             .map_err(|e| format!("{label}: hipModuleGetFunction({SYM_X2}): {e}"))?;
-        let tiled = self.rt.module_get_function(&module, SYM_TILED).ok();
+        let has_tiled = self.rt.module_get_function(&module, SYM_TILED).is_ok();
         Ok(Image {
             file_sha,
             elf_sha: sha_hex(elf),
             elf_bytes: elf.len(),
-            _module: module,
-            r16,
-            x2,
-            tiled,
+            module,
+            has_tiled,
         })
     }
 }
@@ -262,7 +245,8 @@ fn ptr(d: &DeviceBuffer) -> u64 {
 // ───────────────────────────── host RAM guard ─────────────────────────────
 
 fn meminfo() -> Result<(u64, u64), String> {
-    let text = std::fs::read_to_string("/proc/meminfo").map_err(|e| format!("/proc/meminfo: {e}"))?;
+    let text =
+        std::fs::read_to_string("/proc/meminfo").map_err(|e| format!("/proc/meminfo: {e}"))?;
     let field = |name: &str| -> Result<u64, String> {
         text.lines()
             .find_map(|l| l.strip_prefix(name))
@@ -341,7 +325,11 @@ fn f32_bits(p: Profile, r: u64, scale: f32) -> u32 {
             _ => base,
         },
         Profile::NanSparse | Profile::NanDense => {
-            let c = if p == Profile::NanDense { class & 0xff } else { class };
+            let c = if p == Profile::NanDense {
+                class & 0xff
+            } else {
+                class
+            };
             match c {
                 0 => 0x7f80_0000,
                 1 => 0xff80_0000,
@@ -503,11 +491,26 @@ fn shapes() -> Vec<Shape> {
         v.push(Shape::new(name, &[m], k, false));
     }
     // r16bench.cpp projection groups (shared X and K).
-    v.push(Shape::new("grp_gdn_in", &[10240, 6144, 48, 48], 2560, false));
-    v.push(Shape::new("grp_qsa_in", &[640, 12288, 512, 512], 2560, false));
+    v.push(Shape::new(
+        "grp_gdn_in",
+        &[10240, 6144, 48, 48],
+        2560,
+        false,
+    ));
+    v.push(Shape::new(
+        "grp_qsa_in",
+        &[640, 12288, 512, 512],
+        2560,
+        false,
+    ));
     v.push(Shape::new("grp_sh_gu", &[640, 640], 2560, false));
     v.push(Shape::new("grp_moe_in", &[512, 640, 640, 1], 2560, false));
-    v.push(Shape::new("packed_gdn_in", &[10240, 6144, 48, 48], 2560, true));
+    v.push(Shape::new(
+        "packed_gdn_in",
+        &[10240, 6144, 48, 48],
+        2560,
+        true,
+    ));
     v.push(Shape::new("packed_sh_gu", &[640, 640], 2560, true));
     // Tail K: K % 128 / K % 256 != 0 and the one-chunk / odd-half-chunk walks.
     for (name, m, k) in [
@@ -621,13 +624,19 @@ fn launch(
     }
     let tiles: usize = g.ms.iter().map(|&v| v.div_ceil(16)).sum();
     let mut blob = KernargBlob::new();
-    blob.push_u64(x);
-    for p in a.iter().chain(d.iter()) {
-        blob.push_u64(*p);
-    }
-    for v in m {
-        blob.push_i32(v);
-    }
+    blob.push_ptr(x as usize as *const c_void);
+    blob.push_ptr(a[0] as usize as *const c_void);
+    blob.push_ptr(a[1] as usize as *const c_void);
+    blob.push_ptr(a[2] as usize as *const c_void);
+    blob.push_ptr(a[3] as usize as *const c_void);
+    blob.push_ptr(d[0] as usize as *const c_void);
+    blob.push_ptr(d[1] as usize as *const c_void);
+    blob.push_ptr(d[2] as usize as *const c_void);
+    blob.push_ptr(d[3] as usize as *const c_void);
+    blob.push_i32(m[0]);
+    blob.push_i32(m[1]);
+    blob.push_i32(m[2]);
+    blob.push_i32(m[3]);
     blob.push_i32(g.k as i32);
     blob.push_i32(g.rows as i32);
     blob.push_i32(i32::from(g.xf32));
@@ -636,8 +645,14 @@ fn launch(
     // SAFETY: `blob` is the kernel's full explicit kernarg image; every pointer in it is a live allocation of this
     // harness (or null for an unused member, never dereferenced) sized for this launch.
     unsafe {
-        card.rt
-            .launch_kernel_blob(f, [tiles as u32, 1, 1], [BLOCK, 1, 1], lds, None, blob.as_mut_slice())
+        card.rt.launch_kernel_blob(
+            f,
+            [tiles as u32, 1, 1],
+            [BLOCK, 1, 1],
+            lds,
+            None,
+            blob.as_mut_slice(),
+        )
     }
     .map_err(|e| format!("launch: {e}"))
 }
@@ -692,9 +707,9 @@ fn launch_tiled(
     rows: usize,
 ) -> Result<(), String> {
     let mut blob = KernargBlob::new();
-    blob.push_u64(a);
-    blob.push_u64(b);
-    blob.push_u64(d);
+    blob.push_ptr(a as usize as *const c_void);
+    blob.push_ptr(b as usize as *const c_void);
+    blob.push_ptr(d as usize as *const c_void);
     blob.push_i32(m as i32);
     blob.push_i32(k as i32);
     blob.push_i32(rows as i32);
@@ -752,7 +767,15 @@ fn run_case(
             for j in 0..n {
                 d[j] = ptr(&dbufs[arm][p][j]);
             }
-            launch(card, img.func(sym), g, x_ptr, a_ptr, &d)?;
+            let name = match sym {
+                Sym::R16 => SYM_R16,
+                Sym::X2 => SYM_X2,
+            };
+            let f = card
+                .rt
+                .module_get_function(&img.module, name)
+                .map_err(|e| format!("hipModuleGetFunction({name}): {e}"))?;
+            launch(card, &f, g, x_ptr, a_ptr, &d)?;
         }
     }
     card.sync()?;
@@ -821,7 +844,11 @@ fn run_case(
             let d = first_diff(out, &exp[..valid]);
             if let Some(at) = d {
                 report(
-                    if arm == 0 { "hipcc_ne_tiled" } else { "pm_ne_tiled" },
+                    if arm == 0 {
+                        "hipcc_ne_tiled"
+                    } else {
+                        "pm_ne_tiled"
+                    },
                     at,
                     out,
                     &exp[..valid],
@@ -850,7 +877,10 @@ fn run_case(
             for p in 0..2 {
                 let h = &host[arm * 2 + p];
                 if let Some(i) = h[valid..used].iter().position(|&x| x != POISON[p]) {
-                    let at = (valid + i, h[valid..used].iter().filter(|&&x| x != POISON[p]).count());
+                    let at = (
+                        valid + i,
+                        h[valid..used].iter().filter(|&&x| x != POISON[p]).count(),
+                    );
                     report(
                         if arm == 0 {
                             "hipcc_guard_written"
@@ -891,7 +921,13 @@ fn run_shape(
     let n = sh.ms.len();
     let k = sh.k;
     let mmax = *sh.ms.iter().max().expect("non-empty");
-    let tiled_fn = env.refi.tiled_fn()?;
+    if !env.refi.has_tiled {
+        return Err(format!("image has no `{SYM_TILED}` (the tiled comparator)"));
+    }
+    let tiled_fn = &card
+        .rt
+        .module_get_function(&env.refi.module, SYM_TILED)
+        .map_err(|e| format!("hipModuleGetFunction({SYM_TILED}): {e}"))?;
     host_ram_check((CHUNK * 4 + 10 * (16 * mmax * 4 + GUARD)) as u64 + (256 << 20))?;
 
     // Weights: one buffer per member, or one slab at 16-byte (non-256-byte) offsets.
@@ -913,7 +949,16 @@ fn run_shape(
             let byte = slab_base + offs[j] * 2;
             a_ptr[j] = ptr(&buf) + byte as u64;
             a_sha.push(upload_stream(
-                card, &buf, byte, prof, env.seed, STREAM_A + j as u64, 0.04, Elem::Bf16, m * k, scratch,
+                card,
+                &buf,
+                byte,
+                prof,
+                env.seed,
+                STREAM_A + j as u64,
+                0.04,
+                Elem::Bf16,
+                m * k,
+                scratch,
             )?);
         }
         a_bufs.push(buf);
@@ -922,7 +967,16 @@ fn run_shape(
             let buf = card.alloc(m * k * 2)?;
             a_ptr[j] = ptr(&buf);
             a_sha.push(upload_stream(
-                card, &buf, 0, prof, env.seed, STREAM_A + j as u64, 0.04, Elem::Bf16, m * k, scratch,
+                card,
+                &buf,
+                0,
+                prof,
+                env.seed,
+                STREAM_A + j as u64,
+                0.04,
+                Elem::Bf16,
+                m * k,
+                scratch,
             )?);
             a_bufs.push(buf);
         }
@@ -975,7 +1029,16 @@ fn run_shape(
             )?;
             let stage_sha = if xf32 {
                 upload_stream(
-                    card, &xbf, 0, prof, env.seed, STREAM_X, 1.0, Elem::Bf16Stage, rows * k, scratch,
+                    card,
+                    &xbf,
+                    0,
+                    prof,
+                    env.seed,
+                    STREAM_X,
+                    1.0,
+                    Elem::Bf16Stage,
+                    rows * k,
+                    scratch,
                 )?
             } else {
                 String::new()
@@ -986,7 +1049,16 @@ fn run_shape(
                 let bytes = rows * sh.ms[j] * 4;
                 for p in 0..2 {
                     card.memset(&tbufs[p][j], POISON[p], bytes)?;
-                    launch_tiled(card, tiled_fn, a_ptr[j], b_ptr, ptr(&tbufs[p][j]), sh.ms[j], k, rows)?;
+                    launch_tiled(
+                        card,
+                        tiled_fn,
+                        a_ptr[j],
+                        b_ptr,
+                        ptr(&tbufs[p][j]),
+                        sh.ms[j],
+                        k,
+                        rows,
+                    )?;
                 }
             }
             card.sync()?;
@@ -1113,9 +1185,31 @@ fn controls(env: &Env, scratch: &mut Vec<u8>) -> Result<Value, String> {
         mask: 0,
     };
     let abuf = card.alloc(m * k * 2)?;
-    upload_stream(card, &abuf, 0, Profile::Random, env.seed, STREAM_A, 0.04, Elem::Bf16, m * k, scratch)?;
+    upload_stream(
+        card,
+        &abuf,
+        0,
+        Profile::Random,
+        env.seed,
+        STREAM_A,
+        0.04,
+        Elem::Bf16,
+        m * k,
+        scratch,
+    )?;
     let x1 = card.alloc(rows * k * 4)?;
-    upload_stream(card, &x1, 0, Profile::Random, env.seed, STREAM_X, 1.0, Elem::F32, rows * k, scratch)?;
+    upload_stream(
+        card,
+        &x1,
+        0,
+        Profile::Random,
+        env.seed,
+        STREAM_X,
+        1.0,
+        Elem::F32,
+        rows * k,
+        scratch,
+    )?;
     // X2 = X1 with the exponent MSB of element 0 flipped (the weights are random and non-zero).
     let mut bytes = vec![0u8; rows * k * 4];
     card.read(&x1, &mut bytes)?;
@@ -1129,7 +1223,11 @@ fn controls(env: &Env, scratch: &mut Vec<u8>) -> Result<Value, String> {
     let a = [ptr(&abuf), 0, 0, 0];
     let run = |img: &Image, x: &DeviceBuffer, d: &DeviceBuffer| -> Result<Vec<u8>, String> {
         card.memset(d, 0xA5, out)?;
-        launch(card, img.func(Sym::R16), &g, ptr(x), &a, &[ptr(d), 0, 0, 0])?;
+        let f = card
+            .rt
+            .module_get_function(&img.module, SYM_R16)
+            .map_err(|e| format!("hipModuleGetFunction({SYM_R16}): {e}"))?;
+        launch(card, &f, &g, ptr(x), &a, &[ptr(d), 0, 0, 0])?;
         card.sync()?;
         let mut v = vec![0u8; out];
         card.read(d, &mut v)?;
@@ -1148,7 +1246,10 @@ fn controls(env: &Env, scratch: &mut Vec<u8>) -> Result<Value, String> {
         card.free(b)?;
     }
     if !same {
-        return Err("control: pm differs from hipcc on the control input (see the matrix for details)".into());
+        return Err(
+            "control: pm differs from hipcc on the control input (see the matrix for details)"
+                .into(),
+        );
     }
     if !sees_perturbation || !sees_flip {
         return Err(format!(
@@ -1191,9 +1292,8 @@ fn run() -> Result<bool, String> {
     let seed: u64 = opt("--seed").map_or(Ok(0x7203_1604_f1a5_4e11), |v| {
         v.parse().map_err(|_| "bad --seed".to_string())
     })?;
-    let device: i32 = opt("--device").map_or(Ok(0), |v| {
-        v.parse().map_err(|_| "bad --device".to_string())
-    })?;
+    let device: i32 =
+        opt("--device").map_or(Ok(0), |v| v.parse().map_err(|_| "bad --device".to_string()))?;
     let only = opt("--only");
     let skip_big = flag("--skip-big");
     let t0 = Instant::now();
@@ -1303,7 +1403,10 @@ fn run() -> Result<bool, String> {
         "seconds": t0.elapsed().as_secs_f64(),
         "failures": rep.failures,
     });
-    println!("{}", serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())?
+    );
     if let Some(out) = opt("--out") {
         let mut full_doc = summary;
         full_doc["cases"] = Value::Array(std::mem::take(&mut rep.cases));

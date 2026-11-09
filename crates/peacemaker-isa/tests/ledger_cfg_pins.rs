@@ -30,6 +30,7 @@ use peacemaker_isa::insn::{Instruction, Program};
 use peacemaker_isa::kernels::lifted_dispatch_gfx1201 as ld;
 use peacemaker_isa::ledger_cfg::{self, Stats};
 use peacemaker_isa::{Arch, Emitted};
+use peacemaker_lift::bundle::BundleCodec;
 use peacemaker_lift::rewrite::region::{HipccObject, LiftedRegion, RegionError, RegionInputs};
 use peacemaker_lift::{lift_object, Options};
 use std::collections::BTreeMap;
@@ -216,14 +217,20 @@ fn gfx942_elf(bytes: &[u8]) -> Result<&[u8], String> {
         return Ok(bytes);
     }
     let (bundle, payloads) = Bundle::read(bytes).map_err(|e| format!("bundle: {e}"))?;
-    let triple = format!("{}gfx942", peacemaker_lift::bundle::HIP_DEVICE_TRIPLE_PREFIX);
+    let triple = format!(
+        "{}gfx942",
+        peacemaker_lift::bundle::HIP_DEVICE_TRIPLE_PREFIX
+    );
     let mut hits = bundle.entries.iter().enumerate().filter(|(_, e)| {
         e.triple == triple
             || e.triple
                 .strip_prefix(&triple)
                 .is_some_and(|s| s.starts_with(':'))
     });
-    let idx = hits.next().map(|(i, _)| i).ok_or("bundle has no gfx942 device entry")?;
+    let idx = hits
+        .next()
+        .map(|(i, _)| i)
+        .ok_or("bundle has no gfx942 device entry")?;
     if hits.next().is_some() {
         return Err("bundle has multiple gfx942 device entries".into());
     }
@@ -262,8 +269,10 @@ fn every_committed_image_verifies_or_is_an_explicit_allowlist_entry() {
                 Ok(names) => {
                     let mut got = names.clone();
                     got.sort();
-                    let mut want: Vec<String> =
-                        CDNA_EXPECTED_KERNELS.iter().map(|s| s.to_string()).collect();
+                    let mut want: Vec<String> = CDNA_EXPECTED_KERNELS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
                     want.sort();
                     assert_eq!(got, want, "{}: kernel symbol set", image.file);
                     // One verified outcome per certified kernel.
