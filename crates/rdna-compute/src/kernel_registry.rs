@@ -3043,6 +3043,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "topk8_rows_mq6g256v2",
             kernels::TOPK8_ROWS_MQ6G256V2_SRC,
             [
+                "gemv_mq6g256v2",
+                "gemv_mq6g256v2_x4",
                 "topk8_partial_f32_rows",
                 "topk8_rescore_mq6g256v2_k2560_rows"
             ]
@@ -12059,6 +12061,21 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // `HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS` (default on, exact gfx1201): the row-batched MQ6G256V2
+        // draft-head re-score.
+        const TOPK8_ROWS_ADDED_MODULES: [&str; 1] = ["topk8_rows_mq6g256v2"];
+        for module in TOPK8_ROWS_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing draft top-8 rows module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         // `HIPFIRE_EP_TRUNK_BALANCED_OWNERS=1` (opt-in, exact gfx1201, EP trunk shard): the
         // partitioned top-10 combine of the fixed `e % ranks` reduction partition.
         const TRUNK_REDUCTION_PARTITION_ADDED_MODULES: [&str; 1] =
@@ -12118,7 +12135,8 @@ mod tests {
                 + COMBINE_INLINE_ORDER_ADDED_MODULES.len()
                 + LANE_LEVIATHAN_ADDED_MODULES.len()
                 + ARGMAX_PAIR_MERGE_ADDED_MODULES.len()
-                + TRUNK_REDUCTION_PARTITION_ADDED_MODULES.len(),
+                + TRUNK_REDUCTION_PARTITION_ADDED_MODULES.len()
+                + TOPK8_ROWS_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
