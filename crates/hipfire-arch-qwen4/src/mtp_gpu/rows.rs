@@ -617,6 +617,9 @@ impl Qwen4MtpGpu {
             .checked_mul(hidden)
             .ok_or_else(|| invalid("MTP wide dimension overflow"))?;
         let wide_bytes = wide * std::mem::size_of::<f32>();
+        // `HIPFIRE_QWEN4_DRAFT_GLUE_FOLD`: the round's launch glue (broadcast adds, staging
+        // copies) runs as one launch each; the bytes are the per-lane launches'.
+        let glue_fold = gpu.flags.qwen4_draft_glue_fold_enabled();
 
         // Stage 1 (per lane, host): the position guards and the backbone
         // hidden staging, exactly `head_prologue`'s; then the draft history
@@ -648,10 +651,22 @@ impl Qwen4MtpGpu {
         }
         require_hc_up(&rs.hc_up, n, wide, config.hc_lowrank)?;
         let view = rs.view(n, config)?;
-        for (row, lane) in lanes.iter().enumerate() {
-            let source = lane.backbone_hidden.unwrap_or(&lane.state.wide_hidden);
-            let target = rs.backbone_hidden.sub_offset(row * wide, wide);
-            gpu.copy_d2d(source, &target, wide_bytes)?;
+        {
+            let targets: SmallVec<[GpuTensor; MTP_DRAFT_LANES_MAX]> = (0..n)
+                .map(|row| rs.backbone_hidden.sub_offset(row * wide, wide))
+                .collect();
+            let pairs: SmallVec<[(&GpuTensor, &GpuTensor, usize); MTP_DRAFT_LANES_MAX]> = lanes
+                .iter()
+                .zip(&targets)
+                .map(|(lane, target)| {
+                    (
+                        lane.backbone_hidden.unwrap_or(&lane.state.wide_hidden),
+                        target,
+                        wide_bytes,
+                    )
+                })
+                .collect();
+            copy_tensors(gpu, &pairs)?;
         }
         let mut token_bytes = [0u8; MTP_DRAFT_LANES_MAX * std::mem::size_of::<i32>()];
         for (row, lane) in lanes.iter_mut().enumerate() {
@@ -829,6 +844,7 @@ impl Qwen4MtpGpu {
                 &tensors,
                 &views,
                 n,
+                glue_fold,
                 &view.backbone_hidden,
                 &attn.read,
             )?;
@@ -913,9 +929,18 @@ impl Qwen4MtpGpu {
                 .then_some((&rs.draft_logits, &rs.draft_rotation));
             draft.draft_rows_enqueue(gpu, head, &rs.hc_mixed, &mut requests, top1_out, batch)?;
         }
+        {
+            let sources: SmallVec<[GpuTensor; MTP_DRAFT_LANES_MAX]> = (0..n)
+                .map(|row| rs.wide.sub_offset(row * wide, wide))
+                .collect();
+            let pairs: SmallVec<[(&GpuTensor, &GpuTensor, usize); MTP_DRAFT_LANES_MAX]> = lanes
+                .iter()
+                .zip(&sources)
+                .map(|(lane, source)| (source, &lane.state.wide_hidden, wide_bytes))
+                .collect();
+            copy_tensors(gpu, &pairs)?;
+        }
         for (row, lane) in lanes.iter_mut().enumerate() {
-            let source = rs.wide.sub_offset(row * wide, wide);
-            gpu.copy_d2d(&source, &lane.state.wide_hidden, wide_bytes)?;
             lane.state.commit_step(lengths[row]);
         }
         Ok(())

@@ -6861,38 +6861,58 @@ pub fn execute_lane_attention(
     ))
 }
 
-/// `output[r] = rows_input[r] + row` for every one of `rows` rows of `width`.
+/// `output[l * rows + r] = rows_input[l * rows + r] + row[l]` for every one of `rows` branch rows
+/// of `width` of each of `lanes` lane rows (`row` holds `lanes` rows of `width`; `lanes == 1` is
+/// one lane's `rows` branch rows plus its single `row`).
 pub struct BroadcastAddOp<'a> {
     pub rows_input: &'a GpuTensor,
     pub row: &'a GpuTensor,
     pub output: &'a GpuTensor,
     pub rows: usize,
     pub width: usize,
+    pub lanes: usize,
 }
 
 impl BroadcastAddOp<'_> {
     pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
-        if self.rows == 0 || self.width == 0 {
+        if self.rows == 0 || self.width == 0 || self.lanes == 0 {
             return Err(DispatchError::Hip(
                 "broadcast add has empty geometry".into(),
             ));
         }
-        let elements = checked_mul(self.rows, self.width, "broadcast add rows")?;
+        let lane_elements = checked_mul(self.rows, self.width, "broadcast add rows")?;
+        let elements = checked_mul(lane_elements, self.lanes, "broadcast add lanes")?;
+        let row_elements = checked_mul(self.width, self.lanes, "broadcast add row lanes")?;
         require_tensor(self.rows_input, elements, DType::F32, "broadcast add input")?;
         require_tensor(self.output, elements, DType::F32, "broadcast add output")?;
-        require_tensor(self.row, self.width, DType::F32, "broadcast add row")
+        require_tensor(self.row, row_elements, DType::F32, "broadcast add row")
     }
 }
 
+/// One `broadcast_add_rows_f32` launch (`HIPFIRE_QWEN4_DRAFT_GLUE_FOLD`: the launch is one IEEE add per
+/// element, the same operand pairs as the per-branch `add_f32` launches, so the bytes are
+/// identical) or one `add_f32` per branch row.
 pub fn execute_broadcast_add(gpu: &mut Gpu, op: &BroadcastAddOp<'_>) -> Result<(), DispatchError> {
-    let row = view(op.row, 0, op.width);
-    for r in 0..op.rows {
-        let offset = r * op.width;
-        hip(gpu.add_f32(
-            &view(op.rows_input, offset, op.width),
-            &row,
-            &view(op.output, offset, op.width),
-        ))?;
+    if gpu.flags.qwen4_draft_glue_fold_enabled() {
+        return hip(gpu.broadcast_add_rows_f32(
+            op.rows_input,
+            op.row,
+            op.output,
+            op.rows,
+            op.width,
+            op.lanes,
+        ));
+    }
+    for l in 0..op.lanes {
+        let row = view(op.row, l * op.width, op.width);
+        for r in 0..op.rows {
+            let offset = (l * op.rows + r) * op.width;
+            hip(gpu.add_f32(
+                &view(op.rows_input, offset, op.width),
+                &row,
+                &view(op.output, offset, op.width),
+            ))?;
+        }
     }
     Ok(())
 }

@@ -42,9 +42,10 @@ use hipfire_runtime::kv_backend::{
 use hipfire_runtime::session_cache::{RowStream, StateLayout};
 use hipfire_runtime::spec::SpecGrammar;
 use rdna_compute::tensor_ops::{
-    hc_activation_fused_f32, hyper_norm, hyper_read_projected, indexed_attention_append_prologue,
-    indexed_attention_pool_rope_incremental, HcActivationFused, HyperNorm, HyperReadProjected,
-    IndexedAttentionAppendPrologue, IndexedAttentionPoolRope, QsaKvFormat, QsaPositionBinding,
+    copy_regions, hc_activation_fused_f32, hyper_norm, hyper_read_projected,
+    indexed_attention_append_prologue, indexed_attention_pool_rope_incremental, CopyRegion,
+    HcActivationFused, HyperNorm, HyperReadProjected, IndexedAttentionAppendPrologue,
+    IndexedAttentionPoolRope, QsaKvFormat, QsaPositionBinding,
 };
 use rdna_compute::{DType, Gpu, GpuTensor, MemsetBatch};
 use smallvec::SmallVec;
@@ -280,6 +281,34 @@ fn upload_token_ids(
             ring.upload(gpu, dst, bytes.len())?;
         }
         _ => gpu.upload_stream_ordered(dst, bytes)?,
+    }
+    Ok(())
+}
+
+/// D2D copies `(source, destination, bytes)` between distinct, non-overlapping tensors. With
+/// `HIPFIRE_QWEN4_DRAFT_GLUE_FOLD` the copies are ONE `copy_regions_u32` launch (a pure word
+/// copy per region; a region that is not 4-byte aligned takes the plain copy), else one
+/// `copy_d2d` launch each. The bytes written are the same either way.
+fn copy_tensors(
+    gpu: &mut Gpu,
+    pairs: &[(&GpuTensor, &GpuTensor, usize)],
+) -> Result<(), MtpGpuError> {
+    if pairs.len() > 1 && gpu.flags.qwen4_draft_glue_fold_enabled() {
+        let regions: SmallVec<[CopyRegion<'_>; MTP_DRAFT_LANES_MAX]> = pairs
+            .iter()
+            .map(|&(source, destination, bytes)| CopyRegion {
+                dst: &destination.buf,
+                dst_offset: 0,
+                src: &source.buf,
+                src_offset: 0,
+                bytes,
+            })
+            .collect();
+        copy_regions(gpu, &regions)?;
+    } else {
+        for &(source, destination, bytes) in pairs {
+            gpu.copy_d2d(source, destination, bytes)?;
+        }
     }
     Ok(())
 }
@@ -1961,20 +1990,25 @@ impl MtpGpuState {
         validate_mtp_mark(&mark, self)?;
         let arena_generation = self.snapshot_arena.generation;
         let result = (|| -> Result<(), MtpGpuError> {
-            gpu.copy_d2d(
-                &self.selected_indices,
-                &self.snapshot_arena.selected_indices,
-                self.selected_indices.byte_size(),
-            )?;
-            gpu.copy_d2d(
-                &self.selected_len_out,
-                &self.snapshot_arena.selected_len_out,
-                self.selected_len_out.byte_size(),
-            )?;
-            gpu.copy_d2d(
-                &self.wide_hidden,
-                &self.snapshot_arena.wide_hidden,
-                self.wide_hidden.byte_size(),
+            copy_tensors(
+                gpu,
+                &[
+                    (
+                        &self.selected_indices,
+                        &self.snapshot_arena.selected_indices,
+                        self.selected_indices.byte_size(),
+                    ),
+                    (
+                        &self.selected_len_out,
+                        &self.snapshot_arena.selected_len_out,
+                        self.selected_len_out.byte_size(),
+                    ),
+                    (
+                        &self.wide_hidden,
+                        &self.snapshot_arena.wide_hidden,
+                        self.wide_hidden.byte_size(),
+                    ),
+                ],
             )?;
             self.snapshot_arena.mark = mark;
             self.snapshot_arena.active = true;
@@ -2005,20 +2039,25 @@ impl MtpGpuState {
         }
         let mark = self.snapshot_arena.mark;
         let result = (|| -> Result<(), MtpGpuError> {
-            gpu.copy_d2d(
-                &self.snapshot_arena.selected_indices,
-                &self.selected_indices,
-                self.selected_indices.byte_size(),
-            )?;
-            gpu.copy_d2d(
-                &self.snapshot_arena.selected_len_out,
-                &self.selected_len_out,
-                self.selected_len_out.byte_size(),
-            )?;
-            gpu.copy_d2d(
-                &self.snapshot_arena.wide_hidden,
-                &self.wide_hidden,
-                self.wide_hidden.byte_size(),
+            copy_tensors(
+                gpu,
+                &[
+                    (
+                        &self.snapshot_arena.selected_indices,
+                        &self.selected_indices,
+                        self.selected_indices.byte_size(),
+                    ),
+                    (
+                        &self.snapshot_arena.selected_len_out,
+                        &self.selected_len_out,
+                        self.selected_len_out.byte_size(),
+                    ),
+                    (
+                        &self.snapshot_arena.wide_hidden,
+                        &self.wide_hidden,
+                        self.wide_hidden.byte_size(),
+                    ),
+                ],
             )?;
             self.full_len = mark.full_len;
             self.raw_len = mark.raw_len;
@@ -2602,6 +2641,7 @@ fn push_head_rows_front<'a>(
     t: &HeadRowTensors<'a>,
     views: &'a HeadRowViews,
     rows: usize,
+    fold_broadcast: bool,
     backbone_hidden: &'a GpuTensor,
     attn_read: &Qwen4HyperReadWeights<'a>,
 ) -> Result<(), MtpGpuError> {
@@ -2656,6 +2696,7 @@ fn push_head_rows_front<'a>(
             output: t.wide,
             rows: config.hc_count,
             width: hidden,
+            lanes: 1,
         }));
     } else {
         for (input, output, count) in &views.fc_hidden {
@@ -2669,14 +2710,28 @@ fn push_head_rows_front<'a>(
                 residual: None,
             }));
         }
-        for (rows_input, row, output) in &views.broadcast {
+        if fold_broadcast {
+            // One launch over every lane's rows (`rows_input` / `output` hold `rows * hc_count`
+            // branch rows, `row` one embedding row per lane): the per-lane ops below, bytewise.
             steps.push(Step::BroadcastAdd(BroadcastAddOp {
-                rows_input,
-                row,
-                output,
+                rows_input: t.projected_hidden,
+                row: t.projected_embedding,
+                output: t.wide,
                 rows: config.hc_count,
                 width: hidden,
+                lanes: rows,
             }));
+        } else {
+            for (rows_input, row, output) in &views.broadcast {
+                steps.push(Step::BroadcastAdd(BroadcastAddOp {
+                    rows_input,
+                    row,
+                    output,
+                    rows: config.hc_count,
+                    width: hidden,
+                    lanes: 1,
+                }));
+            }
         }
     }
     steps.push(Step::HyperRead(hc_read(attn_read, t, config, rows)));
@@ -3740,7 +3795,10 @@ impl Qwen4MtpGpu {
                     "MTP backbone hidden must be F32 with {wide} elements"
                 )));
             }
-        } else {
+        } else if !gpu.flags.qwen4_draft_glue_fold_enabled() {
+            // `HIPFIRE_QWEN4_DRAFT_GLUE_FOLD` reads the head's own carried hidden in place
+            // ([`Self::head_block`]): the stage-1 norm is its only reader and the step's
+            // `wide_hidden` write (`finish_head_step`) is stream-ordered after it.
             gpu.copy_d2d(
                 &self.state.wide_hidden,
                 &self.scratch.backbone_hidden,
@@ -3799,7 +3857,12 @@ impl Qwen4MtpGpu {
         let lengths = {
             let scratch = &self.scratch;
             let state = &self.state;
-            let backbone_hidden = backbone_hidden.unwrap_or(&scratch.backbone_hidden);
+            let backbone_hidden =
+                backbone_hidden.unwrap_or(if gpu.flags.qwen4_draft_glue_fold_enabled() {
+                    &state.wide_hidden
+                } else {
+                    &scratch.backbone_hidden
+                });
             let hidden = config.hidden_size;
             let ctx = DispatchCtx::new(gpu);
             let attn = hyper_desc(weights, &mtp.attn_hyper)?;
@@ -3937,6 +4000,7 @@ impl Qwen4MtpGpu {
                 &row_tensors,
                 &views,
                 MTP_HC_ROWS,
+                gpu.flags.qwen4_draft_glue_fold_enabled(),
                 backbone_hidden,
                 &attn.read,
             )?;

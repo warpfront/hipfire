@@ -284,6 +284,23 @@ fn ranking(
     }
 }
 
+/// Maximal runs `(start, len)` of `members` (ascending row ids) that are consecutive row ids:
+/// each run's rows are adjacent in the hidden rows and, as batch slots `start..start + len`,
+/// adjacent in the rotation rows, so one batched rotation launch covers it.
+fn consecutive_runs(members: &[usize]) -> SmallVec<[(usize, usize); 8]> {
+    let mut runs = SmallVec::new();
+    let mut start = 0;
+    while start < members.len() {
+        let mut len = 1;
+        while start + len < members.len() && members[start + len] == members[start] + len {
+            len += 1;
+        }
+        runs.push((start, len));
+        start += len;
+    }
+    runs
+}
+
 /// What [`DraftHead::new`] builds for a `head_dtype` head: the ranking-copy
 /// format, whether the copy's top 8 are re-scored, and the layout front.
 fn plan(
@@ -603,10 +620,26 @@ impl DraftHead {
                     let (ranked, order) =
                         ranking(self.front, self.special, self.vocab, holds[members[0]]);
                     let copy = self.copy.as_ref().expect("MQ2 ranking copy");
-                    for (slot_in_batch, &row) in members.iter().enumerate() {
-                        let hidden_row = hidden_rows.sub_offset(row * hidden, hidden);
-                        let rotated = rotation_rows.sub_offset(slot_in_batch * hidden, hidden);
-                        hip(gpu.rotate_x_mq(&hidden_row, &rotated, hidden))?;
+                    if gpu.flags.qwen4_draft_glue_fold_enabled() {
+                        // `HIPFIRE_QWEN4_DRAFT_GLUE_FOLD`: one rotation launch per run of
+                        // consecutive hidden rows (a block is one 256-element group of one row,
+                        // so a row's bytes do not depend on the launch it rides).
+                        for (start, len) in consecutive_runs(&members) {
+                            let rows_in =
+                                hidden_rows.sub_offset(members[start] * hidden, len * hidden);
+                            let rows_out = rotation_rows.sub_offset(start * hidden, len * hidden);
+                            if len == 1 {
+                                hip(gpu.rotate_x_mq(&rows_in, &rows_out, hidden))?;
+                            } else {
+                                hip(gpu.rotate_x_mq_batched(&rows_in, &rows_out, hidden, len))?;
+                            }
+                        }
+                    } else {
+                        for (slot_in_batch, &row) in members.iter().enumerate() {
+                            let hidden_row = hidden_rows.sub_offset(row * hidden, hidden);
+                            let rotated = rotation_rows.sub_offset(slot_in_batch * hidden, hidden);
+                            hip(gpu.rotate_x_mq(&hidden_row, &rotated, hidden))?;
+                        }
                     }
                     let x = rotation_rows.sub_offset(0, count * hidden);
                     let y = logits_rows.sub_offset(0, count * ranked);
@@ -1044,5 +1077,31 @@ mod tests {
         assert_eq!(shard_range(100_276, 1), (50_176, 50_100));
         assert_eq!(shard_range(248_320, 0), (0, 124_160));
         assert_eq!(shard_range(248_320, 1), (124_160, 124_160));
+    }
+
+    /// The batched rotation covers each maximal run of consecutive hidden rows with one launch;
+    /// the runs tile the members in order and never join a gap.
+    #[test]
+    fn consecutive_runs_tile_the_members_and_split_at_gaps() {
+        assert!(consecutive_runs(&[]).is_empty());
+        assert_eq!(consecutive_runs(&[3]).as_slice(), &[(0, 1)]);
+        assert_eq!(consecutive_runs(&[0, 1, 2, 3]).as_slice(), &[(0, 4)]);
+        assert_eq!(consecutive_runs(&[0, 2, 3]).as_slice(), &[(0, 1), (1, 2)]);
+        assert_eq!(
+            consecutive_runs(&[1, 3, 4, 7]).as_slice(),
+            &[(0, 1), (1, 2), (3, 1)]
+        );
+        for members in [vec![0usize, 1, 5, 6, 7], vec![2, 3], vec![0, 4, 5, 6, 7]] {
+            let runs = consecutive_runs(&members);
+            let mut at = 0;
+            for &(start, len) in &runs {
+                assert_eq!(start, at, "{members:?}");
+                for i in 0..len {
+                    assert_eq!(members[start + i], members[start] + i, "{members:?}");
+                }
+                at += len;
+            }
+            assert_eq!(at, members.len(), "{members:?}");
+        }
     }
 }
