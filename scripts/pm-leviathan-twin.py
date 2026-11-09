@@ -17,7 +17,7 @@ Explicit invocation only: no test, build script or runtime path runs this. It
 
 Tests (`crates/peacemaker-isa/tests/hip_twin_leviathan.rs`) only consume the committed files.
 
-    scripts/pm-leviathan-twin.py [--family leviathan|moe-shared-down-combine]
+    scripts/pm-leviathan-twin.py [--family leviathan|moe-shared-down-combine|lwmma-multi]
         [--arch gfx1200|gfx1201|all] [--rocm-path DIR]
         [--build-wrapper 'WRAPPER ARGS'] [--seal-bin PATH] [--out-dir DIR]
 
@@ -25,6 +25,11 @@ Tests (`crates/peacemaker-isa/tests/hip_twin_leviathan.rs`) only consume the com
 once and seals its eight `moe_shared_down_combine_rows_r{1..8}_zinit` symbols into one
 `kernels/moe_shared_down_combine_pm_gfx1201.hxaco` (anchor `moe_shared_down_combine_hipcc_gfx1201.co`,
 manifest `moe_shared_down_combine_pm_gfx1201.twin.json`, `seal.reports` in symbol order); no math evidence.
+
+`--family lwmma-multi` (gfx1201 only) compiles `kernels/src/qwen4_lane_wmma.gfx1201.hip` once and seals its four
+`lwmma_gemm_bf16_t2_m{1,2,3,4}_n1_multi` symbols into one `kernels/qwen4_lane_wmma_multi_pm_gfx1201.hxaco`
+(anchor `qwen4_lane_wmma_multi_hipcc_gfx1201.co`, manifest `qwen4_lane_wmma_multi_pm_gfx1201.twin.json`,
+`seal.reports` in symbol order); the whole device ELF (plain lane-WMMA entries included) is byte-identical; no math evidence.
 """
 import argparse
 import hashlib
@@ -64,6 +69,13 @@ FAMILIES = {
         "parts": ("kernels/src/topk8_select.hip",
                   "kernels/src/qwen4_gemv_mq6g256v2.hip",
                   "kernels/src/topk8_rows.gfx1201.hip"),
+    },
+    "lwmma-multi": {
+        "source": "kernels/src/qwen4_lane_wmma.gfx1201.hip",
+        "symbols": tuple(f"lwmma_gemm_bf16_t2_m{m}_n1_multi" for m in range(1, 5)),
+        "prefix": "qwen4_lane_wmma_multi",
+        "arches": ("gfx1201",),
+        "math": False,
     },
 }
 

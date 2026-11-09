@@ -119,8 +119,7 @@ fn upload_f32(gpu: &mut Gpu, d: &[f32]) -> Res<GpuTensor> {
 fn download_words(gpu: &Gpu, t: &GpuTensor, words: usize) -> Res<Vec<u32>> {
     let mut b = vec![0u8; words * 4];
     gpu.hip.memcpy_dtoh(&mut b, &t.buf)?;
-    Ok(b
-        .chunks_exact(4)
+    Ok(b.chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
 }
@@ -258,18 +257,20 @@ fn run_multi(
     for _ in 0..2 {
         let mut ys = Vec::new();
         for &m in &c.ms {
-            ys.push(upload_words(gpu, &dirty_with_tail(c.rows * m, DIRTY_MULTI))?);
+            ys.push(upload_words(
+                gpu,
+                &dirty_with_tail(c.rows * m, DIRTY_MULTI),
+            )?);
         }
-        let parts: Vec<LaneWmmaMultiPart<'_>> = c
-            .ms
-            .iter()
-            .enumerate()
-            .map(|(p, &m)| LaneWmmaMultiPart {
-                w: &inp.w[p],
-                y: &ys[p],
-                m,
-            })
-            .collect();
+        let parts: Vec<LaneWmmaMultiPart<'_>> =
+            c.ms.iter()
+                .enumerate()
+                .map(|(p, &m)| LaneWmmaMultiPart {
+                    w: &inp.w[p],
+                    y: &ys[p],
+                    m,
+                })
+                .collect();
         let l = lane_wmma_gemm_multi(gpu, &parts, &inp.x, c.k, c.rows, mscratch)?;
         kernel = l.kernel;
         grid = l.grid;
@@ -320,7 +321,10 @@ fn compare(
 
 /// Words one `compare` covers for the cell (outputs with tails, then `x`).
 fn first_words(c: &Cell, x_words: &[u32]) -> u64 {
-    c.ms.iter().map(|&m| (c.rows * m + TAIL_WORDS) as u64).sum::<u64>() + x_words.len() as u64
+    c.ms.iter()
+        .map(|&m| (c.rows * m + TAIL_WORDS) as u64)
+        .sum::<u64>()
+        + x_words.len() as u64
 }
 
 fn oracle() -> Res<()> {
@@ -364,7 +368,10 @@ fn oracle() -> Res<()> {
             let reference = run_reference(&mut gpu, &single, &c, &inp)?;
             let mut ys = Vec::new();
             for &m in &c.ms {
-                ys.push(upload_words(&mut gpu, &dirty_with_tail(c.rows * m, DIRTY_MULTI))?);
+                ys.push(upload_words(
+                    &mut gpu,
+                    &dirty_with_tail(c.rows * m, DIRTY_MULTI),
+                )?);
             }
             let slot = |i: usize| {
                 let j = i.min(c.ms.len() - 1);
@@ -419,7 +426,8 @@ fn oracle() -> Res<()> {
                 }
                 let inp = make_inputs(&mut gpu, &c, None)?;
                 let reference = run_reference(&mut gpu, &single, &c, &inp)?;
-                let (first, second, kernel, grid) = run_multi(&mut gpu, &multi, &c, &inp, &mut tot)?;
+                let (first, second, kernel, grid) =
+                    run_multi(&mut gpu, &multi, &c, &inp, &mut tot)?;
                 let before = tot.mismatches;
                 compare(&reference, &first, &c, &inp.x_words, &mut tot, true);
                 // The repeat over the dirtied partial scratch is word-compared too.
@@ -431,7 +439,10 @@ fn oracle() -> Res<()> {
                 *grids.entry(format!("{kernel} grid {grid:?}")).or_default() += 1;
                 if tot.mismatches != before {
                     failures += 1;
-                    println!("MISMATCH {label} rows {rows} edge {x_edge}: {}", tot.mismatches - before);
+                    println!(
+                        "MISMATCH {label} rows {rows} edge {x_edge}: {}",
+                        tot.mismatches - before
+                    );
                 }
             }
         }
@@ -451,21 +462,40 @@ fn oracle() -> Res<()> {
         let reference = run_reference(&mut gpu, &single, &c, &inp)?;
         let mut scratch_tot = Totals::default();
         let (first, _, _, _) = run_multi(&mut gpu, &multi, &c, &inp, &mut scratch_tot)?;
-        let clean = compare(&reference, &first, &c, &inp.x_words, &mut Totals::default(), false);
+        let clean = compare(
+            &reference,
+            &first,
+            &c,
+            &inp.x_words,
+            &mut Totals::default(),
+            false,
+        );
         // (a) one flipped output bit of the last part.
         let mut flipped = Arm {
             outs: first.outs.clone(),
             x: first.x.clone(),
         };
         flipped.outs[3][17] ^= 1;
-        let a = compare(&reference, &flipped, &c, &inp.x_words, &mut Totals::default(), false);
+        let a = compare(
+            &reference,
+            &flipped,
+            &c,
+            &inp.x_words,
+            &mut Totals::default(),
+            false,
+        );
         // (b) the multi launch over a weight with one perturbed BF16 element in part 2.
         let inp_p = make_inputs(&mut gpu, &c, Some(2))?;
         let (pert, _, _, _) = run_multi(&mut gpu, &multi, &c, &inp_p, &mut scratch_tot)?;
-        let b = compare(&reference, &pert, &c, &inp.x_words, &mut Totals::default(), false);
-        println!(
-            "controls: clean {clean} | flipped-bit {a} | perturbed-weight {b}"
+        let b = compare(
+            &reference,
+            &pert,
+            &c,
+            &inp.x_words,
+            &mut Totals::default(),
+            false,
         );
+        println!("controls: clean {clean} | flipped-bit {a} | perturbed-weight {b}");
         controls_ok = clean == 0 && a > 0 && b > 0;
     }
 
@@ -475,13 +505,22 @@ fn oracle() -> Res<()> {
     }
     println!(
         "direct: cells {} (x-edge cells {}) | words compared {} | mismatches {} | tail words {} | tail violations {} | counter words left dirty {}",
-        tot.cells, tot.edge_cells, tot.words, tot.mismatches, tot.tail_words, tot.tail_violations, tot.counter_dirty
+        tot.cells,
+        tot.edge_cells,
+        tot.words,
+        tot.mismatches,
+        tot.tail_words,
+        tot.tail_violations,
+        tot.counter_dirty
     );
     println!(
         "route (Gpu::gemv_bf16_xf32_x4_rows): cells {} | words compared {} | mismatches {} | tail violations {}",
         route_tot.cells, route_tot.words, route_tot.mismatches, route_tot.tail_violations
     );
-    println!("negative controls detected: {}", if controls_ok { "PASS" } else { "FAIL" });
+    println!(
+        "negative controls detected: {}",
+        if controls_ok { "PASS" } else { "FAIL" }
+    );
     let pass = failures == 0
         && tot.mismatches == 0
         && tot.tail_violations == 0
@@ -548,7 +587,16 @@ fn bench() -> Res<()> {
                 let b = &sets[(it + 3) % SETS];
                 gpu.hip.event_record(&e0, gpu.active_stream.as_ref())?;
                 for (p, &m) in ms.iter().enumerate() {
-                    gpu.lane_wmma_gemm_fixed(&LaneWmmaWeight::Bf16(&a[p]), &x, &ys[p], m, K, rows, 2, None)?;
+                    gpu.lane_wmma_gemm_fixed(
+                        &LaneWmmaWeight::Bf16(&a[p]),
+                        &x,
+                        &ys[p],
+                        m,
+                        K,
+                        rows,
+                        2,
+                        None,
+                    )?;
                 }
                 gpu.hip.event_record(&e1, gpu.active_stream.as_ref())?;
                 gpu.hip.event_synchronize(&e1)?;
@@ -573,7 +621,10 @@ fn bench() -> Res<()> {
                 }
             }
             let (ml, mm) = (pct(&mut t_loop, 0.5), pct(&mut t_multi, 0.5));
-            println!("{label} {rname} {rows} | {ml:.2} | {mm:.2} | {:.2}", ml - mm);
+            println!(
+                "{label} {rname} {rows} | {ml:.2} | {mm:.2} | {:.2}",
+                ml - mm
+            );
             let trip = |v: &mut Vec<f64>| {
                 format!("[{:.2},{:.2},{:.2}]", pct(v, 0.1), pct(v, 0.5), pct(v, 0.9))
             };

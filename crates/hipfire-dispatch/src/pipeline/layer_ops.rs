@@ -680,7 +680,9 @@ fn project_weights_inner(
                     }
                 })
                 .collect();
-            hip(gpu.lane_wmma_gemm_multi_fixed(&parts, input, weight.k, rows).map(|_| ()))?;
+            hip(gpu
+                .lane_wmma_gemm_multi_fixed(&parts, input, weight.k, rows)
+                .map(|_| ()))?;
             for j in group {
                 done[j] = true;
             }

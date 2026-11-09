@@ -460,7 +460,8 @@ pub const LANE_WMMA_MULTI_PARTS: usize = 4;
 pub const LANE_WMMA_MULTI_SCRATCH_PARTIAL_FLOATS: usize =
     LANE_WMMA_MULTI_PARTS * LANE_WMMA_SCRATCH_PARTIAL_FLOATS;
 /// Counter capacity of the multi-part scratch (one slot per flat column tile and token block).
-pub const LANE_WMMA_MULTI_SCRATCH_COUNTERS: usize = LANE_WMMA_MULTI_PARTS * LANE_WMMA_SCRATCH_COUNTERS;
+pub const LANE_WMMA_MULTI_SCRATCH_COUNTERS: usize =
+    LANE_WMMA_MULTI_PARTS * LANE_WMMA_SCRATCH_COUNTERS;
 
 /// One part of a [`lane_wmma_gemm_multi`] launch: `y[rows, m] = x . w[m, k]^T`.
 #[derive(Clone, Copy)]
@@ -535,8 +536,11 @@ pub fn lane_wmma_gemm_multi(
     scratch: &LaneWmmaScratch,
 ) -> HipResult<LaneWmmaLaunch> {
     let ms: Vec<usize> = parts.iter().map(|p| p.m).collect();
-    let plan = lane_wmma_multi_plan(&ms, k, rows)
-        .ok_or_else(|| err(format!("multi-part launch does not fit: ms {ms:?} k {k} rows {rows}")))?;
+    let plan = lane_wmma_multi_plan(&ms, k, rows).ok_or_else(|| {
+        err(format!(
+            "multi-part launch does not fit: ms {ms:?} k {k} rows {rows}"
+        ))
+    })?;
     need_f32(x, rows * k, "x")?;
     for p in parts {
         need_bytes(p.w, p.m * k * 2, "bf16 weight")?;
@@ -573,7 +577,11 @@ pub fn lane_wmma_gemm_multi(
     args.push_ptr(scratch.partial.buf.as_ptr());
     args.push_ptr(scratch.counters.buf.as_ptr());
     for i in 0..LANE_WMMA_MULTI_PARTS {
-        args.push_i32(if i < parts.len() { i32_of(parts[i].m, "m")? } else { 0 });
+        args.push_i32(if i < parts.len() {
+            i32_of(parts[i].m, "m")?
+        } else {
+            0
+        });
     }
     for s in plan.split_k {
         args.push_i32(i32_of(s, "split_k")?);

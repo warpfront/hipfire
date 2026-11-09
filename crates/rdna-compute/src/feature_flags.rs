@@ -284,8 +284,9 @@ pub struct FeatureFlags {
     /// One multi-part lane-WMMA launch (`HIPFIRE_QWEN4_LWMMA_MULTI_PART`) for the dense BF16
     /// projections of one activation at 16..=64 rows (router | selector | shared gate | shared up
     /// of the wide MoE block): up to four parts share one `lwmma_gemm_bf16_t2_m<MT>_n1_multi`
-    /// launch, each part's bytes identical to its own lane-WMMA launch. Opt-in, default off (new
-    /// kernel entries; needs the PM twin).
+    /// launch, each part's bytes identical to its own lane-WMMA launch. Default on for exact
+    /// gfx1201 with the lane-WMMA route (`=0` kills it). The PM Route-A twins of the four `_multi`
+    /// entries are proof-only (dispatch stays HIP).
     pub qwen4_lwmma_multi_part: bool,
     /// One `gemv_bf16_xf32_x4_rows_exact` launch for the MTP fc_hidden branch rows of all lanes
     /// (`HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH`). Default on for exact gfx1201 (`=0` kills it).
@@ -1290,7 +1291,7 @@ impl FeatureFlags {
             qwen4_prefill_lwmma_dense: parse_bool("HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE")
                 .unwrap_or(true),
             qwen4_prefill_lwmma_hc: parse_bool("HIPFIRE_QWEN4_PREFILL_LWMMA_HC").unwrap_or(true),
-            qwen4_lwmma_multi_part: parse_bool("HIPFIRE_QWEN4_LWMMA_MULTI_PART").unwrap_or(false),
+            qwen4_lwmma_multi_part: parse_bool("HIPFIRE_QWEN4_LWMMA_MULTI_PART").unwrap_or(true),
             qwen4_mtp_fc_one_launch: parse_bool("HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH").unwrap_or(true),
             qwen4_lane_ple_project: parse_bool("HIPFIRE_QWEN4_LANE_PLE_PROJECT").unwrap_or(true),
             qwen4_hc8: parse_bool("HIPFIRE_QWEN4_HC8").unwrap_or(true),
@@ -2165,7 +2166,7 @@ impl FeatureFlags {
         self.qwen4_prefill_lwmma_hc && self.qwen4_lane_wmma_enabled()
     }
 
-    /// Multi-part lane-WMMA launches (`HIPFIRE_QWEN4_LWMMA_MULTI_PART`, default off): needs the
+    /// Multi-part lane-WMMA launches (`HIPFIRE_QWEN4_LWMMA_MULTI_PART`, default on, `=0` kills): needs the
     /// lane-WMMA route itself ([`Self::qwen4_lane_wmma_enabled`]), exact gfx1201.
     pub fn qwen4_lwmma_multi_part_enabled(&self) -> bool {
         self.qwen4_lwmma_multi_part && self.qwen4_lane_wmma_enabled()

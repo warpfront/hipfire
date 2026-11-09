@@ -56,8 +56,7 @@ fn upload_words(gpu: &mut Gpu, d: &[u32]) -> R<GpuTensor> {
 fn download(gpu: &Gpu, t: &GpuTensor, words: usize) -> R<Vec<u32>> {
     let mut b = vec![0u8; words * 4];
     gpu.hip.memcpy_dtoh(&mut b, &t.buf)?;
-    Ok(b
-        .chunks_exact(4)
+    Ok(b.chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
 }
@@ -128,7 +127,11 @@ fn main() -> R<()> {
                     None,
                 )?;
             }
-            let refs: Vec<WeightRef<'_>> = ms.iter().enumerate().map(|(p, &m)| wref(&ws[p], m)).collect();
+            let refs: Vec<WeightRef<'_>> = ms
+                .iter()
+                .enumerate()
+                .map(|(p, &m)| wref(&ws[p], m))
+                .collect();
             let projections: Vec<(&WeightRef<'_>, &GpuTensor)> =
                 refs.iter().zip(ys_new.iter()).collect();
             project_weights(&mut gpu, &x, rows, None, &projections)?;

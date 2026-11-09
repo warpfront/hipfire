@@ -1,0 +1,1123 @@
+{
+  "anchor": {
+    "bytes": 1371600,
+    "file": "qwen4_lane_wmma_multi_hipcc_gfx1201.co",
+    "sha256": "4a4d20cc17d64366173e21fddaab1b093589bc8371f814a9b59036b7c0945d0f"
+  },
+  "arch": "gfx1201",
+  "compiler": {
+    "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6"
+    ],
+    "invocation": "hipcc <flags> -o <anchor.co> kernels/src/qwen4_lane_wmma.gfx1201.hip",
+    "version": [
+      "HIP version: 7.16.26385-0000000",
+      "AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)",
+      "Target: x86_64-unknown-linux-gnu",
+      "Thread model: posix"
+    ]
+  },
+  "hxaco": {
+    "bytes": 1371600,
+    "file": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco",
+    "sha256": "eb900a45d084886ab86c1a96b66efd309956644808d3ce5ac0a547d495c87679"
+  },
+  "module": "qwen4_lane_wmma_multi_pm_gfx1201",
+  "seal": {
+    "reports": [
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 48,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 56,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 64,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 72,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 80,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 88,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 92,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 96,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 100,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 104,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 108,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 112,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 116,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 120,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 124,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 128,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_x"
+            },
+            {
+              "name": "",
+              "offset": 132,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_y"
+            },
+            {
+              "name": "",
+              "offset": 136,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_z"
+            },
+            {
+              "name": "",
+              "offset": 140,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_x"
+            },
+            {
+              "name": "",
+              "offset": 142,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_y"
+            },
+            {
+              "name": "",
+              "offset": 144,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_z"
+            },
+            {
+              "name": "",
+              "offset": 146,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_x"
+            },
+            {
+              "name": "",
+              "offset": 148,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_y"
+            },
+            {
+              "name": "",
+              "offset": 150,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_z"
+            },
+            {
+              "name": "",
+              "offset": 168,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_x"
+            },
+            {
+              "name": "",
+              "offset": 176,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_y"
+            },
+            {
+              "name": "",
+              "offset": 184,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_z"
+            },
+            {
+              "name": "",
+              "offset": 192,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_grid_dims"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 384
+        },
+        "arch": "gfx1201",
+        "elf_bytes": 1367504,
+        "elf_sha256": "c3f9b5264627e746df6d6ed05ac41d44fe39dc38a00308b41a1338a8ccb47452",
+        "hazards": {
+          "advisory": 0,
+          "blocking": 0,
+          "checked": true,
+          "findings": 0,
+          "pm_ir_obligations": 0
+        },
+        "hxaco_bytes": 1371600,
+        "hxaco_sha256": "eb900a45d084886ab86c1a96b66efd309956644808d3ce5ac0a547d495c87679",
+        "kernel": "lwmma_gemm_bf16_t2_m1_n1_multi",
+        "lds": 4100,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "rsrc2": 900,
+        "scratch": 0,
+        "sgprs": 46,
+        "text_bytes": 6784,
+        "text_sha256": "1a1f81c4a3dc27022667c38348cc99d8695f3cfd457c730696b143817987bbeb",
+        "user_sgprs": 2,
+        "vgprs": 104,
+        "wavefront_size": 32
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 48,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 56,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 64,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 72,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 80,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 88,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 92,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 96,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 100,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 104,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 108,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 112,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 116,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 120,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 124,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 128,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_x"
+            },
+            {
+              "name": "",
+              "offset": 132,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_y"
+            },
+            {
+              "name": "",
+              "offset": 136,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_z"
+            },
+            {
+              "name": "",
+              "offset": 140,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_x"
+            },
+            {
+              "name": "",
+              "offset": 142,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_y"
+            },
+            {
+              "name": "",
+              "offset": 144,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_z"
+            },
+            {
+              "name": "",
+              "offset": 146,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_x"
+            },
+            {
+              "name": "",
+              "offset": 148,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_y"
+            },
+            {
+              "name": "",
+              "offset": 150,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_z"
+            },
+            {
+              "name": "",
+              "offset": 168,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_x"
+            },
+            {
+              "name": "",
+              "offset": 176,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_y"
+            },
+            {
+              "name": "",
+              "offset": 184,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_z"
+            },
+            {
+              "name": "",
+              "offset": 192,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_grid_dims"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 384
+        },
+        "arch": "gfx1201",
+        "elf_bytes": 1367504,
+        "elf_sha256": "c3f9b5264627e746df6d6ed05ac41d44fe39dc38a00308b41a1338a8ccb47452",
+        "hazards": {
+          "advisory": 0,
+          "blocking": 0,
+          "checked": true,
+          "findings": 0,
+          "pm_ir_obligations": 0
+        },
+        "hxaco_bytes": 1371600,
+        "hxaco_sha256": "eb900a45d084886ab86c1a96b66efd309956644808d3ce5ac0a547d495c87679",
+        "kernel": "lwmma_gemm_bf16_t2_m2_n1_multi",
+        "lds": 8196,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "rsrc2": 900,
+        "scratch": 0,
+        "sgprs": 46,
+        "text_bytes": 11892,
+        "text_sha256": "3c1b98d0caa588d3f76b7db25c895a40b8ed7c29eca762356976df495a7ef579",
+        "user_sgprs": 2,
+        "vgprs": 104,
+        "wavefront_size": 32
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 48,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 56,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 64,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 72,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 80,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 88,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 92,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 96,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 100,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 104,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 108,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 112,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 116,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 120,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 124,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 128,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_x"
+            },
+            {
+              "name": "",
+              "offset": 132,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_y"
+            },
+            {
+              "name": "",
+              "offset": 136,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_z"
+            },
+            {
+              "name": "",
+              "offset": 140,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_x"
+            },
+            {
+              "name": "",
+              "offset": 142,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_y"
+            },
+            {
+              "name": "",
+              "offset": 144,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_z"
+            },
+            {
+              "name": "",
+              "offset": 146,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_x"
+            },
+            {
+              "name": "",
+              "offset": 148,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_y"
+            },
+            {
+              "name": "",
+              "offset": 150,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_z"
+            },
+            {
+              "name": "",
+              "offset": 168,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_x"
+            },
+            {
+              "name": "",
+              "offset": 176,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_y"
+            },
+            {
+              "name": "",
+              "offset": 184,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_z"
+            },
+            {
+              "name": "",
+              "offset": 192,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_grid_dims"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 384
+        },
+        "arch": "gfx1201",
+        "elf_bytes": 1367504,
+        "elf_sha256": "c3f9b5264627e746df6d6ed05ac41d44fe39dc38a00308b41a1338a8ccb47452",
+        "hazards": {
+          "advisory": 0,
+          "blocking": 0,
+          "checked": true,
+          "findings": 0,
+          "pm_ir_obligations": 0
+        },
+        "hxaco_bytes": 1371600,
+        "hxaco_sha256": "eb900a45d084886ab86c1a96b66efd309956644808d3ce5ac0a547d495c87679",
+        "kernel": "lwmma_gemm_bf16_t2_m3_n1_multi",
+        "lds": 12292,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "rsrc2": 900,
+        "scratch": 0,
+        "sgprs": 46,
+        "text_bytes": 16504,
+        "text_sha256": "2bb99d87e61142682adcdc49a271d314ccdd33b021fe8d19b69ca92abae35f80",
+        "user_sgprs": 2,
+        "vgprs": 144,
+        "wavefront_size": 32
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 48,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 56,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 64,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 72,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 80,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 88,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 92,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 96,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 100,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 104,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 108,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 112,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 116,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 120,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 124,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 128,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_x"
+            },
+            {
+              "name": "",
+              "offset": 132,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_y"
+            },
+            {
+              "name": "",
+              "offset": 136,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_z"
+            },
+            {
+              "name": "",
+              "offset": 140,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_x"
+            },
+            {
+              "name": "",
+              "offset": 142,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_y"
+            },
+            {
+              "name": "",
+              "offset": 144,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_z"
+            },
+            {
+              "name": "",
+              "offset": 146,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_x"
+            },
+            {
+              "name": "",
+              "offset": 148,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_y"
+            },
+            {
+              "name": "",
+              "offset": 150,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_z"
+            },
+            {
+              "name": "",
+              "offset": 168,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_x"
+            },
+            {
+              "name": "",
+              "offset": 176,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_y"
+            },
+            {
+              "name": "",
+              "offset": 184,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_z"
+            },
+            {
+              "name": "",
+              "offset": 192,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_grid_dims"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 384
+        },
+        "arch": "gfx1201",
+        "elf_bytes": 1367504,
+        "elf_sha256": "c3f9b5264627e746df6d6ed05ac41d44fe39dc38a00308b41a1338a8ccb47452",
+        "hazards": {
+          "advisory": 0,
+          "blocking": 0,
+          "checked": true,
+          "findings": 0,
+          "pm_ir_obligations": 0
+        },
+        "hxaco_bytes": 1371600,
+        "hxaco_sha256": "eb900a45d084886ab86c1a96b66efd309956644808d3ce5ac0a547d495c87679",
+        "kernel": "lwmma_gemm_bf16_t2_m4_n1_multi",
+        "lds": 16388,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "rsrc2": 900,
+        "scratch": 0,
+        "sgprs": 46,
+        "text_bytes": 20824,
+        "text_sha256": "b70fbd6fef1cea6969b554735c9a77699d12bdf379100bbcb539901c9733a34a",
+        "user_sgprs": 2,
+        "vgprs": 200,
+        "wavefront_size": 32
+      }
+    ],
+    "tool": "peacemaker-isa example hip_twin (Route A: lift, emit::checked, bundle)"
+  },
+  "source": {
+    "bytes": 23056,
+    "path": "kernels/src/qwen4_lane_wmma.gfx1201.hip",
+    "sha256": "d059713f780edcf9122d16d0c6722ef63ec5abc4531975ca545c8e4ecd43e2dd"
+  },
+  "symbols": [
+    "lwmma_gemm_bf16_t2_m1_n1_multi",
+    "lwmma_gemm_bf16_t2_m2_n1_multi",
+    "lwmma_gemm_bf16_t2_m3_n1_multi",
+    "lwmma_gemm_bf16_t2_m4_n1_multi"
+  ]
+}

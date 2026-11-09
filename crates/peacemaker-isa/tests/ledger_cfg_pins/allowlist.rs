@@ -28,6 +28,13 @@ const TOPK8_ROWS_KM_WHY: &str = "MODEL LIMITATION, not a claimed race: the IR mo
 /// twins; same instruction and need in both images).
 const MOE_SHARED_DOWN_COMBINE_WHY: &str = "UNPROVEN, not a claimed race: an original LLVM compiler obligation, OPEN (the committed moe_shared_down_combine hipcc image is unchanged compiler output; the PM twin carries the same instruction at the same pc; no modified code is claimed to race). The ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path of not-taken/taken branches from the entry that has no such wait (pending DS source lock reuse without a wait); whether that path is feasible and whether the hardware has read the DS store sources by then (store-source timing) is not established here. Text identity and hardware outputs (source twin, direct GPU run) do not discharge the ledger; nothing here is discharged";
 
+/// Shared reasons of the 134 `qwen4_lane_wmma_multi` rows below (67 kernels of the whole
+/// `qwen4_lane_wmma.gfx1201.hip` ELF, once from the hipcc anchor `.co`, once from the sealed PM
+/// twin `.hxaco`; same instruction and need in both images). Original LLVM obligations, OPEN.
+const LWMMA_MULTI_DS_WHY: &str = "UNPROVEN, not a claimed race: an original LLVM compiler obligation, OPEN (the committed qwen4_lane_wmma_multi hipcc image is unchanged compiler output; the sealed PM twin is the same ELF; no modified code is claimed to race). The ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path of not-taken/taken branches from the entry that has no such wait (pending DS source lock reuse without a wait); whether that path is feasible and whether the hardware has read the DS store sources by then (store-source timing) is not established here. Checked full-ELF byte identity between the hipcc anchor and the sealed twin, and the oracle outputs of the HIP kernels, do not discharge this strict WAR path in the ledger. Nothing here is discharged";
+const LWMMA_MULTI_ST_WHY: &str = "UNPROVEN, not a claimed race: an original LLVM compiler obligation, OPEN (the committed qwen4_lane_wmma_multi hipcc image is unchanged compiler output; the sealed PM twin is the same ELF; no modified code is claimed to race). The ledger keeps a pending VMEM store's source registers (data and address VGPRs) locked until its store-counter wait and reports the first write of one on a CFG path that has no such wait; whether the hardware has read the store sources by then (address captured at issue, vm_vsrc) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity does not discharge this strict WAR path in the ledger. Nothing here is discharged";
+const LWMMA_MULTI_KM_WHY: &str = "MODEL LIMITATION, not a claimed race: the IR models the VOP3 scalar-destination SGPR (here a `v_cmp_*_e64` result) as a pair although a wave32 instruction writes one SGPR, so the reported WAW with the pending SMEM load of s[2:3] exists only through the pair's second register (the committed qwen4_lane_wmma_multi hipcc image is unchanged compiler output; the sealed PM twin is the same ELF)";
+
 /// Reports of a missing wait on a CFG path, reviewed. None is a claimed race.
 pub const FINDINGS: &[Allow] = &[
     Allow {
@@ -666,6 +673,810 @@ pub const FINDINGS: &[Allow] = &[
         needle: "`v_cmp_eq_u32_e64 s3, 0, v2` (after label `.LBB12`): needs Km wait 0 (Waw { reg: \"s4\" })",
         why: TOPK8_ROWS_KM_WHY,
     },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m1_n1",
+        needle: "`v_lshlrev_b32_e32 v5, 2, v15` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m1_n2",
+        needle: "`v_lshrrev_b32_e32 v3, 4, v11` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[3:4]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m2_n1",
+        needle: "`v_bfe_u32 v5, v12, 5, 3` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m2_n2",
+        needle: "`v_add_nc_u32_e32 v9, 0x400, v36` (after label `.LBB8`): needs Ds wait 1 (War { reg: \"v9\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m3_n1",
+        needle: "`v_add_nc_u32_e32 v17, 0x400, v25` (after label `.LBB8`): needs Ds wait 0 (War { reg: \"v17\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m3_n2",
+        needle: "`v_add_nc_u32_e32 v25, 0x400, v52` (after label `.LBB8`): needs Ds wait 1 (War { reg: \"v25\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m4_n1",
+        needle: "`v_add_nc_u32_e32 v25, 0x400, v33` (after label `.LBB8`): needs Ds wait 1 (War { reg: \"v25\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m4_n2",
+        needle: "`v_add_nc_u32_e32 v33, 0x400, v68` (after label `.LBB8`): needs Ds wait 2 (War { reg: \"v33\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m1_n1",
+        needle: "`v_lshlrev_b32_e32 v5, 2, v15` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m1_n2",
+        needle: "`v_lshrrev_b32_e32 v3, 4, v11` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[3:4]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m2_n1",
+        needle: "`v_bfe_u32 v5, v12, 5, 3` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m2_n2",
+        needle: "`v_add_nc_u32_e32 v9, 0x400, v33` (after label `.LBB8`): needs Ds wait 1 (War { reg: \"v9\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m3_n1",
+        needle: "`v_add_nc_u32_e32 v17, 0x400, v25` (after label `.LBB8`): needs Ds wait 0 (War { reg: \"v17\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m3_n2",
+        needle: "`v_add_nc_u32_e32 v25, 0x400, v49` (after label `.LBB8`): needs Ds wait 1 (War { reg: \"v25\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m4_n1",
+        needle: "`v_add_nc_u32_e32 v25, 0x400, v33` (after label `.LBB8`): needs Ds wait 1 (War { reg: \"v25\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m4_n2",
+        needle: "`v_add_nc_u32_e32 v33, 0x400, v65` (after label `.LBB8`): needs Ds wait 2 (War { reg: \"v33\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m1_n1",
+        needle: "`v_lshlrev_b32_e32 v5, 2, v12` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m1_n2",
+        needle: "`v_lshrrev_b32_e32 v3, 4, v11` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[3:4]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m2_n1",
+        needle: "`v_bfe_u32 v5, v12, 5, 3` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m2_n2",
+        needle: "`v_add_nc_u32_e32 v9, 0x400, v33` (after label `.LBB8`): needs Ds wait 1 (War { reg: \"v9\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m3_n1",
+        needle: "`v_add_nc_u32_e32 v17, 0x400, v25` (after label `.LBB8`): needs Ds wait 0 (War { reg: \"v17\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m3_n2",
+        needle: "`v_add_nc_u32_e32 v25, 0x400, v49` (after label `.LBB8`): needs Ds wait 1 (War { reg: \"v25\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m4_n1",
+        needle: "`v_add_nc_u32_e32 v25, 0x400, v33` (after label `.LBB8`): needs Ds wait 1 (War { reg: \"v25\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m4_n2",
+        needle: "`v_add_nc_u32_e32 v33, 0x400, v65` (after label `.LBB8`): needs Ds wait 2 (War { reg: \"v33\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m1_n1",
+        needle: "`v_lshlrev_b32_e32 v6, 2, v15` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[6:7]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m1_n2",
+        needle: "`v_lshrrev_b32_e32 v3, 4, v11` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[3:4]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m2_n1",
+        needle: "`v_bfe_u32 v5, v13, 5, 3` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m2_n2",
+        needle: "`v_add_nc_u32_e32 v20, 0xc00, v20` (after label `.LBB8`): needs Ds wait 0 (War { reg: \"v20\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m3_n1",
+        needle: "`v_add_nc_u32_e32 v10, 0x800, v10` (after label `.LBB7`): needs Ds wait 0 (War { reg: \"v10\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m3_n2",
+        needle: "`v_add_nc_u32_e32 v5, 0x1000, v4` (after label `.LBB8`): needs Ds wait 5 (War { reg: \"v5\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m4_n1",
+        needle: "`v_cmp_gt_i32_e64 s1, s16, v9` (after label `.LBB8`): needs Km wait 0 (Waw { reg: \"s[2:3]\" })",
+        why: LWMMA_MULTI_KM_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m4_n2",
+        needle: "`v_add_nc_u32_e32 v2, 0x1400, v1` (after label `.LBB8`): needs Ds wait 8 (War { reg: \"v2\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m1_n1",
+        needle: "`v_lshlrev_b32_e32 v5, 2, v13` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m1_n2",
+        needle: "`v_lshrrev_b32_e32 v3, 4, v11` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[3:4]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m2_n1",
+        needle: "`v_bfe_u32 v5, v12, 5, 3` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m2_n2",
+        needle: "`v_add_nc_u32_e32 v1, 0xc00, v1` (after label `.LBB8`): needs Ds wait 0 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m3_n1",
+        needle: "`v_add_nc_u32_e32 v1, 0x800, v1` (after label `.LBB7`): needs Ds wait 0 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m3_n2",
+        needle: "`v_add_nc_u32_e32 v2, 0x1000, v1` (after label `.LBB8`): needs Ds wait 5 (War { reg: \"v2\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m4_n1",
+        needle: "`v_cmp_gt_i32_e64 s1, s16, v69` (after label `.LBB8`): needs Km wait 0 (Waw { reg: \"s[2:3]\" })",
+        why: LWMMA_MULTI_KM_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m4_n2",
+        needle: "`v_add_nc_u32_e32 v2, 0x1400, v1` (after label `.LBB8`): needs Ds wait 8 (War { reg: \"v2\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m1_n1",
+        needle: "`v_lshlrev_b32_e32 v5, 2, v12` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m1_n2",
+        needle: "`v_lshrrev_b32_e32 v3, 4, v11` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[3:4]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m2_n1",
+        needle: "`v_bfe_u32 v5, v12, 5, 3` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m2_n2",
+        needle: "`v_add_nc_u32_e32 v1, 0xc00, v1` (after label `.LBB8`): needs Ds wait 0 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m3_n1",
+        needle: "`v_add_nc_u32_e32 v1, 0x800, v1` (after label `.LBB7`): needs Ds wait 0 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m3_n2",
+        needle: "`v_add_nc_u32_e32 v2, 0x1000, v1` (after label `.LBB8`): needs Ds wait 5 (War { reg: \"v2\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m4_n1",
+        needle: "`v_add_nc_u32_e32 v1, 0xc00, v1` (after label `.LBB8`): needs Ds wait 0 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m4_n2",
+        needle: "`v_add_nc_u32_e32 v2, 0x1400, v1` (after label `.LBB8`): needs Ds wait 8 (War { reg: \"v2\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m1_n1_multi",
+        needle: "`v_add_nc_u32_e32 v5, 0x80, v4` (after label `.LBB27`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m2_n1_multi",
+        needle: "`v_add_nc_u32_e32 v5, 0x80, v4` (after label `.LBB28`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m3_n1_multi",
+        needle: "`v_add_nc_u32_e32 v17, 0x400, v25` (after label `.LBB26`): needs Ds wait 0 (War { reg: \"v17\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m4_n1_multi",
+        needle: "`v_add_nc_u32_e32 v25, 0x400, v33` (after label `.LBB26`): needs Ds wait 0 (War { reg: \"v25\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t1_g1",
+        needle: "`v_add_nc_u32_e32 v1, 0x400, v36` (after label `.LBB10`): needs Ds wait 1 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t1_g2",
+        needle: "`v_add_nc_u32_e32 v1, 0x400, v35` (after label `.LBB6`): needs Ds wait 1 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t1_g4",
+        needle: "`v_add_nc_u32_e32 v1, 0x400, v37` (after label `.LBB6`): needs Ds wait 1 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t2_g1",
+        needle: "`v_add_nc_u32_e32 v1, 0x400, v36` (after label `.LBB10`): needs Ds wait 1 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t2_g2",
+        needle: "`v_add_nc_u32_e32 v1, 0x400, v35` (after label `.LBB6`): needs Ds wait 1 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t2_g4",
+        needle: "`v_add_nc_u32_e32 v1, 0x400, v37` (after label `.LBB6`): needs Ds wait 1 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t3_g1",
+        needle: "`v_add_nc_u32_e32 v1, 0x400, v35` (after label `.LBB10`): needs Ds wait 1 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t3_g2",
+        needle: "`v_add_nc_u32_e32 v1, 0x400, v35` (after label `.LBB6`): needs Ds wait 1 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t3_g4",
+        needle: "`v_add_nc_u32_e32 v1, 0x400, v35` (after label `.LBB6`): needs Ds wait 1 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t1_g2",
+        needle: "`v_add_nc_u32_e32 v3, 0xc00, v3` (after label `.LBB6`): needs Ds wait 0 (War { reg: \"v3\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t1_g4",
+        needle: "`v_add_nc_u32_e32 v3, 0xc00, v3` (after label `.LBB6`): needs Ds wait 0 (War { reg: \"v3\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t2_g2",
+        needle: "`v_add_nc_u32_e32 v3, 0xc00, v3` (after label `.LBB6`): needs Ds wait 0 (War { reg: \"v3\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t2_g4",
+        needle: "`v_add_nc_u32_e32 v3, 0xc00, v3` (after label `.LBB6`): needs Ds wait 0 (War { reg: \"v3\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t3_g2",
+        needle: "`v_add_nc_u32_e32 v3, 0xc00, v3` (after label `.LBB6`): needs Ds wait 0 (War { reg: \"v3\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t3_g4",
+        needle: "`v_add_nc_u32_e32 v3, 0xc00, v3` (after label `.LBB6`): needs Ds wait 0 (War { reg: \"v3\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m1_n1",
+        needle: "`v_lshlrev_b32_e32 v5, 2, v15` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m1_n2",
+        needle: "`v_lshrrev_b32_e32 v3, 4, v11` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[3:4]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m2_n1",
+        needle: "`v_bfe_u32 v5, v12, 5, 3` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m2_n2",
+        needle: "`v_add_nc_u32_e32 v9, 0x400, v36` (after label `.LBB8`): needs Ds wait 1 (War { reg: \"v9\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m3_n1",
+        needle: "`v_add_nc_u32_e32 v17, 0x400, v25` (after label `.LBB8`): needs Ds wait 0 (War { reg: \"v17\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m3_n2",
+        needle: "`v_add_nc_u32_e32 v25, 0x400, v52` (after label `.LBB8`): needs Ds wait 1 (War { reg: \"v25\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m4_n1",
+        needle: "`v_add_nc_u32_e32 v25, 0x400, v33` (after label `.LBB8`): needs Ds wait 1 (War { reg: \"v25\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m4_n2",
+        needle: "`v_add_nc_u32_e32 v33, 0x400, v68` (after label `.LBB8`): needs Ds wait 2 (War { reg: \"v33\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m1_n1",
+        needle: "`v_lshlrev_b32_e32 v5, 2, v15` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m1_n2",
+        needle: "`v_lshrrev_b32_e32 v3, 4, v11` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[3:4]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m2_n1",
+        needle: "`v_bfe_u32 v5, v12, 5, 3` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m2_n2",
+        needle: "`v_add_nc_u32_e32 v9, 0x400, v33` (after label `.LBB8`): needs Ds wait 1 (War { reg: \"v9\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m3_n1",
+        needle: "`v_add_nc_u32_e32 v17, 0x400, v25` (after label `.LBB8`): needs Ds wait 0 (War { reg: \"v17\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m3_n2",
+        needle: "`v_add_nc_u32_e32 v25, 0x400, v49` (after label `.LBB8`): needs Ds wait 1 (War { reg: \"v25\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m4_n1",
+        needle: "`v_add_nc_u32_e32 v25, 0x400, v33` (after label `.LBB8`): needs Ds wait 1 (War { reg: \"v25\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m4_n2",
+        needle: "`v_add_nc_u32_e32 v33, 0x400, v65` (after label `.LBB8`): needs Ds wait 2 (War { reg: \"v33\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m1_n1",
+        needle: "`v_lshlrev_b32_e32 v5, 2, v12` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m1_n2",
+        needle: "`v_lshrrev_b32_e32 v3, 4, v11` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[3:4]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m2_n1",
+        needle: "`v_bfe_u32 v5, v12, 5, 3` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m2_n2",
+        needle: "`v_add_nc_u32_e32 v9, 0x400, v33` (after label `.LBB8`): needs Ds wait 1 (War { reg: \"v9\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m3_n1",
+        needle: "`v_add_nc_u32_e32 v17, 0x400, v25` (after label `.LBB8`): needs Ds wait 0 (War { reg: \"v17\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m3_n2",
+        needle: "`v_add_nc_u32_e32 v25, 0x400, v49` (after label `.LBB8`): needs Ds wait 1 (War { reg: \"v25\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m4_n1",
+        needle: "`v_add_nc_u32_e32 v25, 0x400, v33` (after label `.LBB8`): needs Ds wait 1 (War { reg: \"v25\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m4_n2",
+        needle: "`v_add_nc_u32_e32 v33, 0x400, v65` (after label `.LBB8`): needs Ds wait 2 (War { reg: \"v33\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m1_n1",
+        needle: "`v_lshlrev_b32_e32 v6, 2, v15` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[6:7]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m1_n2",
+        needle: "`v_lshrrev_b32_e32 v3, 4, v11` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[3:4]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m2_n1",
+        needle: "`v_bfe_u32 v5, v13, 5, 3` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m2_n2",
+        needle: "`v_add_nc_u32_e32 v20, 0xc00, v20` (after label `.LBB8`): needs Ds wait 0 (War { reg: \"v20\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m3_n1",
+        needle: "`v_add_nc_u32_e32 v10, 0x800, v10` (after label `.LBB7`): needs Ds wait 0 (War { reg: \"v10\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m3_n2",
+        needle: "`v_add_nc_u32_e32 v5, 0x1000, v4` (after label `.LBB8`): needs Ds wait 5 (War { reg: \"v5\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m4_n1",
+        needle: "`v_cmp_gt_i32_e64 s1, s16, v9` (after label `.LBB8`): needs Km wait 0 (Waw { reg: \"s[2:3]\" })",
+        why: LWMMA_MULTI_KM_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m4_n2",
+        needle: "`v_add_nc_u32_e32 v2, 0x1400, v1` (after label `.LBB8`): needs Ds wait 8 (War { reg: \"v2\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m1_n1",
+        needle: "`v_lshlrev_b32_e32 v5, 2, v13` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m1_n2",
+        needle: "`v_lshrrev_b32_e32 v3, 4, v11` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[3:4]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m2_n1",
+        needle: "`v_bfe_u32 v5, v12, 5, 3` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m2_n2",
+        needle: "`v_add_nc_u32_e32 v1, 0xc00, v1` (after label `.LBB8`): needs Ds wait 0 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m3_n1",
+        needle: "`v_add_nc_u32_e32 v1, 0x800, v1` (after label `.LBB7`): needs Ds wait 0 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m3_n2",
+        needle: "`v_add_nc_u32_e32 v2, 0x1000, v1` (after label `.LBB8`): needs Ds wait 5 (War { reg: \"v2\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m4_n1",
+        needle: "`v_cmp_gt_i32_e64 s1, s16, v69` (after label `.LBB8`): needs Km wait 0 (Waw { reg: \"s[2:3]\" })",
+        why: LWMMA_MULTI_KM_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m4_n2",
+        needle: "`v_add_nc_u32_e32 v2, 0x1400, v1` (after label `.LBB8`): needs Ds wait 8 (War { reg: \"v2\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m1_n1",
+        needle: "`v_lshlrev_b32_e32 v5, 2, v12` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m1_n2",
+        needle: "`v_lshrrev_b32_e32 v3, 4, v11` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[3:4]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m2_n1",
+        needle: "`v_bfe_u32 v5, v12, 5, 3` (after label `.LBB13`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m2_n2",
+        needle: "`v_add_nc_u32_e32 v1, 0xc00, v1` (after label `.LBB8`): needs Ds wait 0 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m3_n1",
+        needle: "`v_add_nc_u32_e32 v1, 0x800, v1` (after label `.LBB7`): needs Ds wait 0 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m3_n2",
+        needle: "`v_add_nc_u32_e32 v2, 0x1000, v1` (after label `.LBB8`): needs Ds wait 5 (War { reg: \"v2\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m4_n1",
+        needle: "`v_add_nc_u32_e32 v1, 0xc00, v1` (after label `.LBB8`): needs Ds wait 0 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m4_n2",
+        needle: "`v_add_nc_u32_e32 v2, 0x1400, v1` (after label `.LBB8`): needs Ds wait 8 (War { reg: \"v2\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m1_n1_multi",
+        needle: "`v_add_nc_u32_e32 v5, 0x80, v4` (after label `.LBB27`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m2_n1_multi",
+        needle: "`v_add_nc_u32_e32 v5, 0x80, v4` (after label `.LBB28`): needs Store wait 0 (War { reg: \"v[5:6]\" })",
+        why: LWMMA_MULTI_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m3_n1_multi",
+        needle: "`v_add_nc_u32_e32 v17, 0x400, v25` (after label `.LBB26`): needs Ds wait 0 (War { reg: \"v17\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m4_n1_multi",
+        needle: "`v_add_nc_u32_e32 v25, 0x400, v33` (after label `.LBB26`): needs Ds wait 0 (War { reg: \"v25\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t1_g1",
+        needle: "`v_add_nc_u32_e32 v1, 0x400, v36` (after label `.LBB10`): needs Ds wait 1 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t1_g2",
+        needle: "`v_add_nc_u32_e32 v1, 0x400, v35` (after label `.LBB6`): needs Ds wait 1 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t1_g4",
+        needle: "`v_add_nc_u32_e32 v1, 0x400, v37` (after label `.LBB6`): needs Ds wait 1 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t2_g1",
+        needle: "`v_add_nc_u32_e32 v1, 0x400, v36` (after label `.LBB10`): needs Ds wait 1 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t2_g2",
+        needle: "`v_add_nc_u32_e32 v1, 0x400, v35` (after label `.LBB6`): needs Ds wait 1 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t2_g4",
+        needle: "`v_add_nc_u32_e32 v1, 0x400, v37` (after label `.LBB6`): needs Ds wait 1 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t3_g1",
+        needle: "`v_add_nc_u32_e32 v1, 0x400, v35` (after label `.LBB10`): needs Ds wait 1 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t3_g2",
+        needle: "`v_add_nc_u32_e32 v1, 0x400, v35` (after label `.LBB6`): needs Ds wait 1 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t3_g4",
+        needle: "`v_add_nc_u32_e32 v1, 0x400, v35` (after label `.LBB6`): needs Ds wait 1 (War { reg: \"v1\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t1_g2",
+        needle: "`v_add_nc_u32_e32 v3, 0xc00, v3` (after label `.LBB6`): needs Ds wait 0 (War { reg: \"v3\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t1_g4",
+        needle: "`v_add_nc_u32_e32 v3, 0xc00, v3` (after label `.LBB6`): needs Ds wait 0 (War { reg: \"v3\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t2_g2",
+        needle: "`v_add_nc_u32_e32 v3, 0xc00, v3` (after label `.LBB6`): needs Ds wait 0 (War { reg: \"v3\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t2_g4",
+        needle: "`v_add_nc_u32_e32 v3, 0xc00, v3` (after label `.LBB6`): needs Ds wait 0 (War { reg: \"v3\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t3_g2",
+        needle: "`v_add_nc_u32_e32 v3, 0xc00, v3` (after label `.LBB6`): needs Ds wait 0 (War { reg: \"v3\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t3_g4",
+        needle: "`v_add_nc_u32_e32 v3, 0xc00, v3` (after label `.LBB6`): needs Ds wait 0 (War { reg: \"v3\" })",
+        why: LWMMA_MULTI_DS_WHY,
+    },
 ];
 
 /// Inputs with no verification: a verifier refusal or a refusal upstream of it (lift region, pool).
@@ -1117,6 +1928,15 @@ pub struct PoolBody {
 /// image (`topk8_partial_blocks_pm_gfx1201.*` was the last file), so their templates take the ids
 /// after the previous last template and no existing id is renumbered by them. Any `POOL_BODY` /
 /// `POOL_STATE_CAP` row for them is pinned from the observed scan, never guessed.
+///
+/// Templates 359-498 are the 134 hosted `qwen4_lane_wmma_multi` bodies with a finding (the
+/// whole `qwen4_lane_wmma.gfx1201.hip` ELF: 70 hosted kernels per image, 359-428 from
+/// the hipcc `.co`, 429-498 from the sealed `.hxaco` twin; 3 per image report nothing). They
+/// are the pool-hosted copies of the 134 `pins` rows of the same targets (original LLVM
+/// obligations, OPEN, not claimed races); the b256 multi pool's tid-498 body finding is
+/// covered by the tid 498 entry. No template id above 290 carried an entry before, so none
+/// was renumbered; a later image sorting before `qwen4_lane_wmma_multi_*` shifts these ids,
+/// fixed by editing the `tid` only.
 pub const POOL_BODY: &[PoolBody] = &[
     // pins row 2, W2
     PoolBody {
@@ -1877,6 +2697,1212 @@ pub const POOL_BODY: &[PoolBody] = &[
         category: Category::ModelLimit,
         insn: "`v_cmp_eq_u32_e64 s3, 0, v2`",
         need: "needs Km wait 0 (Waw { reg: \"s4\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 359,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m1_n1",
+        body_pc: 440,
+        category: Category::Candidate,
+        insn: "`v_lshlrev_b32_e32 v5, 2, v15`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 360,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m1_n2",
+        body_pc: 530,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v3, 4, v11`",
+        need: "needs Store wait 0 (War { reg: \"v[3:4]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 361,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m2_n1",
+        body_pc: 677,
+        category: Category::Candidate,
+        insn: "`v_bfe_u32 v5, v12, 5, 3`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 362,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m2_n2",
+        body_pc: 667,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v9, 0x400, v36`",
+        need: "needs Ds wait 1 (War { reg: \"v9\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 363,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m3_n1",
+        body_pc: 818,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v17, 0x400, v25`",
+        need: "needs Ds wait 0 (War { reg: \"v17\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 364,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m3_n2",
+        body_pc: 970,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v25, 0x400, v52`",
+        need: "needs Ds wait 1 (War { reg: \"v25\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 365,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m4_n1",
+        body_pc: 996,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v25, 0x400, v33`",
+        need: "needs Ds wait 1 (War { reg: \"v25\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 366,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m4_n2",
+        body_pc: 1217,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v33, 0x400, v68`",
+        need: "needs Ds wait 2 (War { reg: \"v33\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 367,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m1_n1",
+        body_pc: 683,
+        category: Category::Candidate,
+        insn: "`v_lshlrev_b32_e32 v5, 2, v15`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 368,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m1_n2",
+        body_pc: 871,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v3, 4, v11`",
+        need: "needs Store wait 0 (War { reg: \"v[3:4]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 369,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m2_n1",
+        body_pc: 1353,
+        category: Category::Candidate,
+        insn: "`v_bfe_u32 v5, v12, 5, 3`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 370,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m2_n2",
+        body_pc: 1387,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v9, 0x400, v33`",
+        need: "needs Ds wait 1 (War { reg: \"v9\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 371,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m3_n1",
+        body_pc: 1835,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v17, 0x400, v25`",
+        need: "needs Ds wait 0 (War { reg: \"v17\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 372,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m3_n2",
+        body_pc: 1835,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v25, 0x400, v49`",
+        need: "needs Ds wait 1 (War { reg: \"v25\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 373,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m4_n1",
+        body_pc: 2269,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v25, 0x400, v33`",
+        need: "needs Ds wait 1 (War { reg: \"v25\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 374,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m4_n2",
+        body_pc: 2412,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v33, 0x400, v65`",
+        need: "needs Ds wait 2 (War { reg: \"v33\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 375,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m1_n1",
+        body_pc: 1108,
+        category: Category::Candidate,
+        insn: "`v_lshlrev_b32_e32 v5, 2, v12`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 376,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m1_n2",
+        body_pc: 1187,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v3, 4, v11`",
+        need: "needs Store wait 0 (War { reg: \"v[3:4]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 377,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m2_n1",
+        body_pc: 1967,
+        category: Category::Candidate,
+        insn: "`v_bfe_u32 v5, v12, 5, 3`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 378,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m2_n2",
+        body_pc: 2020,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v9, 0x400, v33`",
+        need: "needs Ds wait 1 (War { reg: \"v9\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 379,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m3_n1",
+        body_pc: 2805,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v17, 0x400, v25`",
+        need: "needs Ds wait 0 (War { reg: \"v17\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 380,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m3_n2",
+        body_pc: 2801,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v25, 0x400, v49`",
+        need: "needs Ds wait 1 (War { reg: \"v25\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 381,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m4_n1",
+        body_pc: 3687,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v25, 0x400, v33`",
+        need: "needs Ds wait 1 (War { reg: \"v25\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 382,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m4_n2",
+        body_pc: 3661,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v33, 0x400, v65`",
+        need: "needs Ds wait 2 (War { reg: \"v33\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 383,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m1_n1",
+        body_pc: 647,
+        category: Category::Candidate,
+        insn: "`v_lshlrev_b32_e32 v6, 2, v15`",
+        need: "needs Store wait 0 (War { reg: \"v[6:7]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 384,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m1_n2",
+        body_pc: 972,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v3, 4, v11`",
+        need: "needs Store wait 0 (War { reg: \"v[3:4]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 385,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m2_n1",
+        body_pc: 948,
+        category: Category::Candidate,
+        insn: "`v_bfe_u32 v5, v13, 5, 3`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 386,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m2_n2",
+        body_pc: 1190,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v20, 0xc00, v20`",
+        need: "needs Ds wait 0 (War { reg: \"v20\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 387,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m3_n1",
+        body_pc: 1118,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v10, 0x800, v10`",
+        need: "needs Ds wait 0 (War { reg: \"v10\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 388,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m3_n2",
+        body_pc: 1521,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v5, 0x1000, v4`",
+        need: "needs Ds wait 5 (War { reg: \"v5\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 389,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m4_n1",
+        body_pc: 1343,
+        category: Category::ModelLimit,
+        insn: "`v_cmp_gt_i32_e64 s1, s16, v9`",
+        need: "needs Km wait 0 (Waw { reg: \"s[2:3]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 390,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m4_n2",
+        body_pc: 1833,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v2, 0x1400, v1`",
+        need: "needs Ds wait 8 (War { reg: \"v2\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 391,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m1_n1",
+        body_pc: 1030,
+        category: Category::Candidate,
+        insn: "`v_lshlrev_b32_e32 v5, 2, v13`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 392,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m1_n2",
+        body_pc: 1307,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v3, 4, v11`",
+        need: "needs Store wait 0 (War { reg: \"v[3:4]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 393,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m2_n1",
+        body_pc: 1734,
+        category: Category::Candidate,
+        insn: "`v_bfe_u32 v5, v12, 5, 3`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 394,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m2_n2",
+        body_pc: 1876,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0xc00, v1`",
+        need: "needs Ds wait 0 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 395,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m3_n1",
+        body_pc: 2124,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x800, v1`",
+        need: "needs Ds wait 0 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 396,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m3_n2",
+        body_pc: 2427,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v2, 0x1000, v1`",
+        need: "needs Ds wait 5 (War { reg: \"v2\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 397,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m4_n1",
+        body_pc: 2552,
+        category: Category::ModelLimit,
+        insn: "`v_cmp_gt_i32_e64 s1, s16, v69`",
+        need: "needs Km wait 0 (Waw { reg: \"s[2:3]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 398,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m4_n2",
+        body_pc: 3023,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v2, 0x1400, v1`",
+        need: "needs Ds wait 8 (War { reg: \"v2\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 399,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m1_n1",
+        body_pc: 1341,
+        category: Category::Candidate,
+        insn: "`v_lshlrev_b32_e32 v5, 2, v12`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 400,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m1_n2",
+        body_pc: 1624,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v3, 4, v11`",
+        need: "needs Store wait 0 (War { reg: \"v[3:4]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 401,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m2_n1",
+        body_pc: 2421,
+        category: Category::Candidate,
+        insn: "`v_bfe_u32 v5, v12, 5, 3`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 402,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m2_n2",
+        body_pc: 2453,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0xc00, v1`",
+        need: "needs Ds wait 0 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 403,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m3_n1",
+        body_pc: 3070,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x800, v1`",
+        need: "needs Ds wait 0 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 404,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m3_n2",
+        body_pc: 3380,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v2, 0x1000, v1`",
+        need: "needs Ds wait 5 (War { reg: \"v2\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 405,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m4_n1",
+        body_pc: 4005,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0xc00, v1`",
+        need: "needs Ds wait 0 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 406,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m4_n2",
+        body_pc: 4305,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v2, 0x1400, v1`",
+        need: "needs Ds wait 8 (War { reg: \"v2\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 407,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m1_n1_multi",
+        body_pc: 818,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v5, 0x80, v4`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 408,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m2_n1_multi",
+        body_pc: 1494,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v5, 0x80, v4`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 409,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m3_n1_multi",
+        body_pc: 1993,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v17, 0x400, v25`",
+        need: "needs Ds wait 0 (War { reg: \"v17\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 410,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m4_n1_multi",
+        body_pc: 2423,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v25, 0x400, v33`",
+        need: "needs Ds wait 0 (War { reg: \"v25\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 411,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t1_g1",
+        body_pc: 293,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x400, v36`",
+        need: "needs Ds wait 1 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 412,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t1_g2",
+        body_pc: 293,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x400, v35`",
+        need: "needs Ds wait 1 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 413,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t1_g4",
+        body_pc: 295,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x400, v37`",
+        need: "needs Ds wait 1 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 414,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t2_g1",
+        body_pc: 378,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x400, v36`",
+        need: "needs Ds wait 1 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 415,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t2_g2",
+        body_pc: 378,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x400, v35`",
+        need: "needs Ds wait 1 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 416,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t2_g4",
+        body_pc: 380,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x400, v37`",
+        need: "needs Ds wait 1 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 417,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t3_g1",
+        body_pc: 469,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x400, v35`",
+        need: "needs Ds wait 1 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 418,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t3_g2",
+        body_pc: 469,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x400, v35`",
+        need: "needs Ds wait 1 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 419,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t3_g4",
+        body_pc: 480,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x400, v35`",
+        need: "needs Ds wait 1 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 421,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t1_g2",
+        body_pc: 583,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+        need: "needs Ds wait 0 (War { reg: \"v3\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 422,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t1_g4",
+        body_pc: 590,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+        need: "needs Ds wait 0 (War { reg: \"v3\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 424,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t2_g2",
+        body_pc: 663,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+        need: "needs Ds wait 0 (War { reg: \"v3\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 425,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t2_g4",
+        body_pc: 670,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+        need: "needs Ds wait 0 (War { reg: \"v3\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 427,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t3_g2",
+        body_pc: 751,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+        need: "needs Ds wait 0 (War { reg: \"v3\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 428,
+        target: "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t3_g4",
+        body_pc: 758,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+        need: "needs Ds wait 0 (War { reg: \"v3\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 429,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m1_n1",
+        body_pc: 440,
+        category: Category::Candidate,
+        insn: "`v_lshlrev_b32_e32 v5, 2, v15`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 430,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m1_n2",
+        body_pc: 530,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v3, 4, v11`",
+        need: "needs Store wait 0 (War { reg: \"v[3:4]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 431,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m2_n1",
+        body_pc: 677,
+        category: Category::Candidate,
+        insn: "`v_bfe_u32 v5, v12, 5, 3`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 432,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m2_n2",
+        body_pc: 667,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v9, 0x400, v36`",
+        need: "needs Ds wait 1 (War { reg: \"v9\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 433,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m3_n1",
+        body_pc: 818,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v17, 0x400, v25`",
+        need: "needs Ds wait 0 (War { reg: \"v17\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 434,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m3_n2",
+        body_pc: 970,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v25, 0x400, v52`",
+        need: "needs Ds wait 1 (War { reg: \"v25\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 435,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m4_n1",
+        body_pc: 996,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v25, 0x400, v33`",
+        need: "needs Ds wait 1 (War { reg: \"v25\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 436,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m4_n2",
+        body_pc: 1217,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v33, 0x400, v68`",
+        need: "needs Ds wait 2 (War { reg: \"v33\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 437,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m1_n1",
+        body_pc: 683,
+        category: Category::Candidate,
+        insn: "`v_lshlrev_b32_e32 v5, 2, v15`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 438,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m1_n2",
+        body_pc: 871,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v3, 4, v11`",
+        need: "needs Store wait 0 (War { reg: \"v[3:4]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 439,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m2_n1",
+        body_pc: 1353,
+        category: Category::Candidate,
+        insn: "`v_bfe_u32 v5, v12, 5, 3`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 440,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m2_n2",
+        body_pc: 1387,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v9, 0x400, v33`",
+        need: "needs Ds wait 1 (War { reg: \"v9\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 441,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m3_n1",
+        body_pc: 1835,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v17, 0x400, v25`",
+        need: "needs Ds wait 0 (War { reg: \"v17\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 442,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m3_n2",
+        body_pc: 1835,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v25, 0x400, v49`",
+        need: "needs Ds wait 1 (War { reg: \"v25\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 443,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m4_n1",
+        body_pc: 2269,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v25, 0x400, v33`",
+        need: "needs Ds wait 1 (War { reg: \"v25\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 444,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m4_n2",
+        body_pc: 2412,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v33, 0x400, v65`",
+        need: "needs Ds wait 2 (War { reg: \"v33\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 445,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m1_n1",
+        body_pc: 1108,
+        category: Category::Candidate,
+        insn: "`v_lshlrev_b32_e32 v5, 2, v12`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 446,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m1_n2",
+        body_pc: 1187,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v3, 4, v11`",
+        need: "needs Store wait 0 (War { reg: \"v[3:4]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 447,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m2_n1",
+        body_pc: 1967,
+        category: Category::Candidate,
+        insn: "`v_bfe_u32 v5, v12, 5, 3`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 448,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m2_n2",
+        body_pc: 2020,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v9, 0x400, v33`",
+        need: "needs Ds wait 1 (War { reg: \"v9\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 449,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m3_n1",
+        body_pc: 2805,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v17, 0x400, v25`",
+        need: "needs Ds wait 0 (War { reg: \"v17\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 450,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m3_n2",
+        body_pc: 2801,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v25, 0x400, v49`",
+        need: "needs Ds wait 1 (War { reg: \"v25\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 451,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m4_n1",
+        body_pc: 3687,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v25, 0x400, v33`",
+        need: "needs Ds wait 1 (War { reg: \"v25\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 452,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m4_n2",
+        body_pc: 3661,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v33, 0x400, v65`",
+        need: "needs Ds wait 2 (War { reg: \"v33\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 453,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m1_n1",
+        body_pc: 647,
+        category: Category::Candidate,
+        insn: "`v_lshlrev_b32_e32 v6, 2, v15`",
+        need: "needs Store wait 0 (War { reg: \"v[6:7]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 454,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m1_n2",
+        body_pc: 972,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v3, 4, v11`",
+        need: "needs Store wait 0 (War { reg: \"v[3:4]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 455,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m2_n1",
+        body_pc: 948,
+        category: Category::Candidate,
+        insn: "`v_bfe_u32 v5, v13, 5, 3`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 456,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m2_n2",
+        body_pc: 1190,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v20, 0xc00, v20`",
+        need: "needs Ds wait 0 (War { reg: \"v20\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 457,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m3_n1",
+        body_pc: 1118,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v10, 0x800, v10`",
+        need: "needs Ds wait 0 (War { reg: \"v10\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 458,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m3_n2",
+        body_pc: 1521,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v5, 0x1000, v4`",
+        need: "needs Ds wait 5 (War { reg: \"v5\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 459,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m4_n1",
+        body_pc: 1343,
+        category: Category::ModelLimit,
+        insn: "`v_cmp_gt_i32_e64 s1, s16, v9`",
+        need: "needs Km wait 0 (Waw { reg: \"s[2:3]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 460,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m4_n2",
+        body_pc: 1833,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v2, 0x1400, v1`",
+        need: "needs Ds wait 8 (War { reg: \"v2\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 461,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m1_n1",
+        body_pc: 1030,
+        category: Category::Candidate,
+        insn: "`v_lshlrev_b32_e32 v5, 2, v13`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 462,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m1_n2",
+        body_pc: 1307,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v3, 4, v11`",
+        need: "needs Store wait 0 (War { reg: \"v[3:4]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 463,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m2_n1",
+        body_pc: 1734,
+        category: Category::Candidate,
+        insn: "`v_bfe_u32 v5, v12, 5, 3`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 464,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m2_n2",
+        body_pc: 1876,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0xc00, v1`",
+        need: "needs Ds wait 0 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 465,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m3_n1",
+        body_pc: 2124,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x800, v1`",
+        need: "needs Ds wait 0 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 466,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m3_n2",
+        body_pc: 2427,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v2, 0x1000, v1`",
+        need: "needs Ds wait 5 (War { reg: \"v2\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 467,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m4_n1",
+        body_pc: 2552,
+        category: Category::ModelLimit,
+        insn: "`v_cmp_gt_i32_e64 s1, s16, v69`",
+        need: "needs Km wait 0 (Waw { reg: \"s[2:3]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 468,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m4_n2",
+        body_pc: 3023,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v2, 0x1400, v1`",
+        need: "needs Ds wait 8 (War { reg: \"v2\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 469,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m1_n1",
+        body_pc: 1341,
+        category: Category::Candidate,
+        insn: "`v_lshlrev_b32_e32 v5, 2, v12`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 470,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m1_n2",
+        body_pc: 1624,
+        category: Category::Candidate,
+        insn: "`v_lshrrev_b32_e32 v3, 4, v11`",
+        need: "needs Store wait 0 (War { reg: \"v[3:4]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 471,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m2_n1",
+        body_pc: 2421,
+        category: Category::Candidate,
+        insn: "`v_bfe_u32 v5, v12, 5, 3`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 472,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m2_n2",
+        body_pc: 2453,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0xc00, v1`",
+        need: "needs Ds wait 0 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 473,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m3_n1",
+        body_pc: 3070,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x800, v1`",
+        need: "needs Ds wait 0 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 474,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m3_n2",
+        body_pc: 3380,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v2, 0x1000, v1`",
+        need: "needs Ds wait 5 (War { reg: \"v2\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 475,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m4_n1",
+        body_pc: 4005,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0xc00, v1`",
+        need: "needs Ds wait 0 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 476,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m4_n2",
+        body_pc: 4305,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v2, 0x1400, v1`",
+        need: "needs Ds wait 8 (War { reg: \"v2\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 477,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m1_n1_multi",
+        body_pc: 818,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v5, 0x80, v4`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 478,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m2_n1_multi",
+        body_pc: 1494,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v5, 0x80, v4`",
+        need: "needs Store wait 0 (War { reg: \"v[5:6]\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 479,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m3_n1_multi",
+        body_pc: 1993,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v17, 0x400, v25`",
+        need: "needs Ds wait 0 (War { reg: \"v17\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 480,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m4_n1_multi",
+        body_pc: 2423,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v25, 0x400, v33`",
+        need: "needs Ds wait 0 (War { reg: \"v25\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 481,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t1_g1",
+        body_pc: 293,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x400, v36`",
+        need: "needs Ds wait 1 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 482,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t1_g2",
+        body_pc: 293,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x400, v35`",
+        need: "needs Ds wait 1 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 483,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t1_g4",
+        body_pc: 295,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x400, v37`",
+        need: "needs Ds wait 1 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 484,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t2_g1",
+        body_pc: 378,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x400, v36`",
+        need: "needs Ds wait 1 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 485,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t2_g2",
+        body_pc: 378,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x400, v35`",
+        need: "needs Ds wait 1 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 486,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t2_g4",
+        body_pc: 380,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x400, v37`",
+        need: "needs Ds wait 1 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 487,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t3_g1",
+        body_pc: 469,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x400, v35`",
+        need: "needs Ds wait 1 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 488,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t3_g2",
+        body_pc: 469,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x400, v35`",
+        need: "needs Ds wait 1 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 489,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t3_g4",
+        body_pc: 480,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v1, 0x400, v35`",
+        need: "needs Ds wait 1 (War { reg: \"v1\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 491,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t1_g2",
+        body_pc: 583,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+        need: "needs Ds wait 0 (War { reg: \"v3\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 492,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t1_g4",
+        body_pc: 590,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+        need: "needs Ds wait 0 (War { reg: \"v3\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 494,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t2_g2",
+        body_pc: 663,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+        need: "needs Ds wait 0 (War { reg: \"v3\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 495,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t2_g4",
+        body_pc: 670,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+        need: "needs Ds wait 0 (War { reg: \"v3\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 497,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t3_g2",
+        body_pc: 751,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+        need: "needs Ds wait 0 (War { reg: \"v3\" })",
+    },
+    // S1 hosted copy of the qwen4_lane_wmma_multi pins finding
+    PoolBody {
+        tid: 498,
+        target: "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t3_g4",
+        body_pc: 758,
+        category: Category::Candidate,
+        insn: "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+        need: "needs Ds wait 0 (War { reg: \"v3\" })",
     },
 ];
 

@@ -210,6 +210,53 @@ twin, and none is claimed to be a race. The checked full-ELF byte identity of an
 not discharge the ledger's strict WAR path, and hardware source-read timing and path feasibility
 remain unproven. No stronger analysis proof is claimed.
 
+## `lwmma_gemm_bf16_t2_m{1,2,3,4}_n1_multi` (same Route A, proof only)
+
+The four multi-part lane-WMMA entries of `kernels/src/qwen4_lane_wmma.gfx1201.hip`
+(`HIPFIRE_QWEN4_LWMMA_MULTI_PART`) are sealed by `scripts/pm-leviathan-twin.py --family lwmma-multi
+--arch gfx1201` into one bundle. The seal covers the whole device ELF (all 67 kernels, the plain
+lane-WMMA entries included), which is byte-identical to the hipcc anchor; there is no math
+evidence from this script. Dispatch stays the registry HIP source.
+
+| File (`kernels/`) | sha256 | Content |
+|---|---|---|
+| `qwen4_lane_wmma_multi_hipcc_gfx1201.co` | `4a4d20cc17d64366173e21fddaab1b093589bc8371f814a9b59036b7c0945d0f` | hipcc anchor (1,371,600 bytes) |
+| `qwen4_lane_wmma_multi_pm_gfx1201.hxaco` / `.hxaco.sha256` | `eb900a45d084886ab86c1a96b66efd309956644808d3ce5ac0a547d495c87679` | sealed twin (1,371,600 bytes) |
+| `qwen4_lane_wmma_multi_pm_gfx1201.twin.json` | | source sha256 `d059713f780edcf9122d16d0c6722ef63ec5abc4531975ca545c8e4ecd43e2dd`, flags, one seal report per symbol |
+
+Device ELF (1,367,504 bytes) sha256 `c3f9b5264627e746df6d6ed05ac41d44fe39dc38a00308b41a1338a8ccb47452`,
+recorded by every seal report. Per-entry `.text` sha256 (manifest `seal.reports`):
+
+| Symbol | `.text` bytes | `.text` sha256 | VGPRs | LDS |
+|---|---:|---|---:|---:|
+| `lwmma_gemm_bf16_t2_m1_n1_multi` | 6,784 | `1a1f81c4a3dc27022667c38348cc99d8695f3cfd457c730696b143817987bbeb` | 104 | 4,100 |
+| `lwmma_gemm_bf16_t2_m2_n1_multi` | 11,892 | `3c1b98d0caa588d3f76b7db25c895a40b8ed7c29eca762356976df495a7ef579` | 104 | 8,196 |
+| `lwmma_gemm_bf16_t2_m3_n1_multi` | 16,504 | `2bb99d87e61142682adcdc49a271d314ccdd33b021fe8d19b69ca92abae35f80` | 144 | 12,292 |
+| `lwmma_gemm_bf16_t2_m4_n1_multi` | 20,824 | `b70fbd6fef1cea6969b554735c9a77699d12bdf379100bbcb539901c9733a34a` | 200 | 16,388 |
+
+Test: `crates/peacemaker-isa/tests/hip_twin_lwmma_multi.rs` (CPU only; a stale source hash fails it).
+
+### Proof boundary (ledger / railgun rows: OPEN)
+
+The `hip_twin` seal reports 0 blocking hazards, 0 advisory findings and 0 scratch for the four sealed
+entries. Separately, the strict CFG ledger reports 134 UNPROVEN target findings across the whole ELF
+(67 kernels x 2 bundle copies: the `.co` hipcc image and the `.hxaco` twin; `ledger_cfg_pins`
+`allowlist.rs`, targets `qwen4_lane_wmma_multi_{hipcc,pm}_gfx1201.*#<symbol>`), each allowlisted
+exactly (instruction, label, need) with no suppression:
+
+| Class | Findings | Status |
+|---|---:|---|
+| DS store source VGPR written without a prior DS-counter wait on a CFG path (`LWMMA_MULTI_DS_WHY`) | 90 | OPEN / UNPROVEN |
+| VMEM store source VGPR written without a prior store-counter wait on a CFG path (`LWMMA_MULTI_ST_WHY`) | 40 | OPEN / UNPROVEN |
+| `Km` WAW on `s[2:3]` from a wave32 `v_cmp_*_e64` (`LWMMA_MULTI_KM_WHY`; `lwmma_gemm_w8_t{1,2}_m4_n1`, both copies) | 4 | MODEL LIMITATION |
+
+The four `_multi` entries themselves carry 8 of the 134 rows (m1, m2: `Store` WAR; m3, m4: `Ds` WAR; each in
+both copies). The pool bodies hosting these findings add 134 `Candidate` body pins (templates 359-498).
+All are original LLVM output, not changes introduced by the twin, and none is claimed
+to be a race. Checked full-ELF byte identity of anchor and twin does not discharge the ledger's
+strict WAR paths, and hardware source-read timing and path feasibility remain unproven. No stronger
+analysis proof is claimed, and no railgun certificate is claimed for these entries.
+
 ## gfx942 rows16: typed CDNA Route A
 
 The same anchor/seal/provenance pattern is used for
