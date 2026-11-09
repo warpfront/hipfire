@@ -182,6 +182,10 @@ name = "qwen4_topk8_rows"
 required-features = ["lab"]
 
 [[example]]
+name = "qwen4_lwmma_multi_part"
+required-features = ["lab"]
+
+[[example]]
 name = "mtp_dense_det_pm"
 required-features = ["lab"]
 

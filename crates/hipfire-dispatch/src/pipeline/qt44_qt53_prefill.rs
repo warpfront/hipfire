@@ -688,7 +688,11 @@ pub(crate) fn router_projection(
     }
     require_geometry(p)?;
     // Projected by the shared gate/up stage's launch instead.
-    if router_with_shared(gpu, p) || router_with_selector(gpu, p) || router_shares_f16(gpu, p) {
+    if router_with_shared(gpu, p)
+        || router_with_shared_multi(gpu, p)
+        || router_with_selector(gpu, p)
+        || router_shares_f16(gpu, p)
+    {
         return Ok(());
     }
     batch_projection(
@@ -753,6 +757,38 @@ fn router_with_selector(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
                 .all(|w| w.dtype == DType::BF16)
                 && weights.selector.dtype == DType::BF16
                 && weights.selector.k == p.prelude.router.k
+        })
+}
+
+/// Whether the unscoped wide route (`route_rows` past `Gpu::few_row_limit`, 16..=64 rows) projects
+/// the router together with the all-BF16 shared selector/gate/up in the shared gate/up stage's
+/// `project_weights` call (`HIPFIRE_QWEN4_LWMMA_MULTI_PART`): the four members are lane-WMMA
+/// projections of the same `x_norm_batch` (none takes the F16 WMMA route, no EP wave split), which
+/// `project_weights` runs as ONE multi-part launch, each output the router stage's / the
+/// member's own launch's bytes. Like [`router_with_shared`], the stage runs right after the router
+/// stage with no writer of `x_norm_batch` or reader of the logits in between.
+fn router_with_shared_multi(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
+    let router = &p.prelude.router;
+    gpu.flags.qwen4_lwmma_multi_part_enabled()
+        && !is_fp8(p)
+        && gpu.route_rows(p.batch_size) > gpu.few_row_limit()
+        && p.x_norm_batch.dtype == DType::F32
+        && p.prelude.router_logits.dtype == DType::F32
+        && gpu.wave_lane_groups(p.batch_size).is_none()
+        && p.prelude.shared.as_ref().is_some_and(|shared| {
+            let w = &shared.weights;
+            router_shared_bf16_basis(router, [&w.selector, &w.gate, &w.up])
+                && [shared.scalar, shared.gate_out, shared.up_out]
+                    .iter()
+                    .all(|t| t.dtype == DType::F32)
+                && [router, &w.selector, &w.gate, &w.up]
+                    .iter()
+                    .all(|m| !gpu.qwen4_f16_wmma_applies(m.buf, m.k, p.batch_size))
+                && gpu.lane_wmma_multi_part_applies(
+                    &[router.m, w.selector.m, w.gate.m, w.up.m],
+                    router.k,
+                    p.batch_size,
+                )
         })
 }
 
@@ -904,7 +940,7 @@ pub(crate) fn shared_gate_up_front(
         .as_ref()
         .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))?;
     let weights = &shared.weights;
-    if router_with_shared(gpu, p) {
+    if router_with_shared(gpu, p) || router_with_shared_multi(gpu, p) {
         // All read the natural F32 activation; admitted rows share the exact x4 launch.
         super::layer_ops::project_weights(
             gpu,

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 use crate::dispatch::{DType, Gpu, GpuTensor, FP8_GEMV_MIN_M};
 use crate::kernels;
-use crate::lane_wmma::LaneWmmaWeight;
+use crate::lane_wmma::{LaneWmmaMultiPart, LaneWmmaWeight};
 use crate::prefill_invariant::{few_row_groups, FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS};
 use hip_bridge::HipResult;
 use std::ffi::c_void;
@@ -24720,6 +24720,23 @@ impl Gpu {
                     .all(|&(_, y, m)| m == 0 || (y.dtype == DType::F32 && k.is_multiple_of(128)))
             {
                 // Terms 2: general f32 activations, no `hc_act`. Parts with m == 0 are padding.
+                // `HIPFIRE_QWEN4_LWMMA_MULTI_PART`: two or more live parts are ONE launch, each
+                // part's bytes the per-part launch's.
+                let mut live = [LaneWmmaMultiPart {
+                    w: parts[0].0,
+                    y: parts[0].1,
+                    m: 0,
+                }; 4];
+                let mut n = 0usize;
+                for &(w, y, m) in parts.iter().filter(|p| p.2 > 0) {
+                    live[n] = LaneWmmaMultiPart { w, y, m };
+                    n += 1;
+                }
+                let ms: [usize; 4] = std::array::from_fn(|i| live[i].m);
+                if n >= 2 && self.lane_wmma_multi_part_applies(&ms[..n], k, rows) {
+                    self.lane_wmma_gemm_multi_fixed(&live[..n], x, k, rows)?;
+                    return Ok(());
+                }
                 for &(w, y, m) in parts.iter().filter(|p| p.2 > 0) {
                     self.lane_wmma_gemm_fixed(&LaneWmmaWeight::Bf16(w), x, y, m, k, rows, 2, None)?;
                 }

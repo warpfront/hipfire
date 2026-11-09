@@ -452,6 +452,186 @@ impl Gpu {
     }
 }
 
+/// Most parts one [`lane_wmma_gemm_multi`] launch carries.
+pub const LANE_WMMA_MULTI_PARTS: usize = 4;
+/// Split-K partial capacity of the [`Gpu`]-owned multi-part scratch: every part may need the
+/// single-launch scratch's worth ([`LANE_WMMA_SCRATCH_PARTIAL_FLOATS`]), and the parts of one
+/// launch need disjoint slices.
+pub const LANE_WMMA_MULTI_SCRATCH_PARTIAL_FLOATS: usize =
+    LANE_WMMA_MULTI_PARTS * LANE_WMMA_SCRATCH_PARTIAL_FLOATS;
+/// Counter capacity of the multi-part scratch (one slot per flat column tile and token block).
+pub const LANE_WMMA_MULTI_SCRATCH_COUNTERS: usize = LANE_WMMA_MULTI_PARTS * LANE_WMMA_SCRATCH_COUNTERS;
+
+/// One part of a [`lane_wmma_gemm_multi`] launch: `y[rows, m] = x . w[m, k]^T`.
+#[derive(Clone, Copy)]
+pub struct LaneWmmaMultiPart<'a> {
+    pub w: &'a GpuTensor,
+    pub y: &'a GpuTensor,
+    pub m: usize,
+}
+
+/// The launch geometry of a multi-part launch: each part's own auto split-K (exactly what a
+/// launch of that part alone picks), the summed column tiles and the scratch they need.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LaneWmmaMultiPlan {
+    /// Per part; unused slots are 1.
+    pub split_k: [usize; LANE_WMMA_MULTI_PARTS],
+    /// Sum of the parts' column tiles of 16 (grid x).
+    pub tiles: usize,
+    /// Largest part split-K (grid y).
+    pub grid_y: usize,
+    /// Token blocks of 64 (grid z).
+    pub grid_z: usize,
+    /// Partial floats the parts with `split_k > 1` take, back to back.
+    pub partial_floats: usize,
+}
+
+/// [`LaneWmmaMultiPlan`] for parts of `ms` output columns over `k` and `rows`, or `None` when the
+/// parts do not form a multi launch: 2..=[`LANE_WMMA_MULTI_PARTS`] non-empty parts, `k` a multiple
+/// of 128, at least one row, and the partials / counters inside the multi scratch. Pure.
+pub fn lane_wmma_multi_plan(ms: &[usize], k: usize, rows: usize) -> Option<LaneWmmaMultiPlan> {
+    if !(2..=LANE_WMMA_MULTI_PARTS).contains(&ms.len())
+        || ms.contains(&0)
+        || k == 0
+        || !k.is_multiple_of(128)
+        || rows == 0
+    {
+        return None;
+    }
+    let mut split_k = [1usize; LANE_WMMA_MULTI_PARTS];
+    let (mut tiles, mut grid_y, mut partial_floats) = (0usize, 1usize, 0usize);
+    for (p, &m) in ms.iter().enumerate() {
+        let s = lane_wmma_auto_split_k(m, k, rows, 1);
+        split_k[p] = s;
+        tiles += m.div_ceil(16);
+        grid_y = grid_y.max(s);
+        if s > 1 {
+            partial_floats += s * rows * m;
+        }
+    }
+    let grid_z = rows.div_ceil(64);
+    (partial_floats <= LANE_WMMA_MULTI_SCRATCH_PARTIAL_FLOATS
+        && tiles * grid_z <= LANE_WMMA_MULTI_SCRATCH_COUNTERS)
+        .then_some(LaneWmmaMultiPlan {
+            split_k,
+            tiles,
+            grid_y,
+            grid_z,
+            partial_floats,
+        })
+}
+
+/// Several A1 projections of the SAME `x [rows, k]` (BF16 weights, two activation terms, one
+/// n-tile, each part's own auto split-K) in ONE launch (`lwmma_gemm_bf16_t2_m<MT>_n1_multi`).
+/// Every output word is bitwise what [`lane_wmma_gemm`] of that part alone writes: the blocks run
+/// the same body with the part's own split-K and fold. `scratch` is the multi-part scratch
+/// ([`LANE_WMMA_MULTI_SCRATCH_PARTIAL_FLOATS`] / [`LANE_WMMA_MULTI_SCRATCH_COUNTERS`]).
+pub fn lane_wmma_gemm_multi(
+    gpu: &mut Gpu,
+    parts: &[LaneWmmaMultiPart<'_>],
+    x: &GpuTensor,
+    k: usize,
+    rows: usize,
+    scratch: &LaneWmmaScratch,
+) -> HipResult<LaneWmmaLaunch> {
+    let ms: Vec<usize> = parts.iter().map(|p| p.m).collect();
+    let plan = lane_wmma_multi_plan(&ms, k, rows)
+        .ok_or_else(|| err(format!("multi-part launch does not fit: ms {ms:?} k {k} rows {rows}")))?;
+    need_f32(x, rows * k, "x")?;
+    for p in parts {
+        need_bytes(p.w, p.m * k * 2, "bf16 weight")?;
+        need_f32(p.y, rows * p.m, "y")?;
+    }
+    need_f32(
+        &scratch.partial,
+        LANE_WMMA_MULTI_SCRATCH_PARTIAL_FLOATS,
+        "multi scratch.partial",
+    )?;
+    need_bytes(
+        &scratch.counters,
+        LANE_WMMA_MULTI_SCRATCH_COUNTERS * 4,
+        "multi scratch.counters",
+    )?;
+    let mt = rows.div_ceil(16).min(4);
+    let grid = [
+        u32_of(plan.tiles, "grid x")?,
+        u32_of(plan.grid_y, "grid y")?,
+        u32_of(plan.grid_z, "grid z")?,
+    ];
+    let block = [128u32, 1, 1];
+    let kernel = format!("lwmma_gemm_bf16_t2_m{mt}_n1_multi");
+    gpu.ensure_kernel_public(LANE_WMMA_MODULE, LANE_WMMA_SRC, &kernel)?;
+    let slot = |i: usize| parts[i.min(parts.len() - 1)];
+    let mut args = KernargBlob::new();
+    for i in 0..LANE_WMMA_MULTI_PARTS {
+        args.push_ptr(slot(i).w.buf.as_ptr() as *const _);
+    }
+    for i in 0..LANE_WMMA_MULTI_PARTS {
+        args.push_ptr(slot(i).y.buf.as_ptr());
+    }
+    args.push_ptr(x.buf.as_ptr());
+    args.push_ptr(scratch.partial.buf.as_ptr());
+    args.push_ptr(scratch.counters.buf.as_ptr());
+    for i in 0..LANE_WMMA_MULTI_PARTS {
+        args.push_i32(if i < parts.len() { i32_of(parts[i].m, "m")? } else { 0 });
+    }
+    for s in plan.split_k {
+        args.push_i32(i32_of(s, "split_k")?);
+    }
+    args.push_i32(i32_of(k, "k")?);
+    args.push_i32(i32_of(rows, "rows")?);
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        &kernel,
+        grid,
+        block,
+        0,
+        args.as_mut_slice(),
+        ReplayLaunchBindings::NONE,
+    )?;
+    Ok(LaneWmmaLaunch {
+        kernel,
+        grid,
+        block,
+    })
+}
+
+impl Gpu {
+    /// Whether `parts` of `ms` output columns over `k` and `rows` run as ONE
+    /// [`Gpu::lane_wmma_gemm_multi_fixed`] launch: `HIPFIRE_QWEN4_LWMMA_MULTI_PART` on top of
+    /// [`Gpu::lane_wmma_applies`] and a [`lane_wmma_multi_plan`]. Pure.
+    pub fn lane_wmma_multi_part_applies(&self, ms: &[usize], k: usize, rows: usize) -> bool {
+        self.flags.qwen4_lwmma_multi_part_enabled()
+            && self.lane_wmma_applies(rows)
+            && lane_wmma_multi_plan(ms, k, rows).is_some()
+    }
+
+    /// [`lane_wmma_gemm_multi`] with the `Gpu`-owned multi-part scratch: allocated lazily on first
+    /// use at the fixed [`LANE_WMMA_MULTI_SCRATCH_PARTIAL_FLOATS`] /
+    /// [`LANE_WMMA_MULTI_SCRATCH_COUNTERS`] size, zeroed once, never grown (a recorded launch's
+    /// pointers never go stale). Each part's output is bitwise the per-part
+    /// [`Gpu::lane_wmma_gemm_fixed`] (two terms) of that part alone.
+    pub fn lane_wmma_gemm_multi_fixed(
+        &mut self,
+        parts: &[LaneWmmaMultiPart<'_>],
+        x: &GpuTensor,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<LaneWmmaLaunch> {
+        let scratch = match self.scratch.lane_wmma_multi_scratch.take() {
+            Some(s) => s,
+            None => LaneWmmaScratch::new(
+                self,
+                LANE_WMMA_MULTI_SCRATCH_PARTIAL_FLOATS,
+                LANE_WMMA_MULTI_SCRATCH_COUNTERS,
+            )?,
+        };
+        let out = lane_wmma_gemm_multi(self, parts, x, k, rows, &scratch);
+        self.scratch.lane_wmma_multi_scratch = Some(scratch);
+        out
+    }
+}
+
 /// How a BF16 multirow call over `total` rows of an EP prefill wave is split into per-lane calls
 /// (`None`: one call over all rows, the ordinary route). `table` is [`Gpu::qwen4_wave_lane_rows`],
 /// the wave's lanes' rows in order. A lane's own singleton takes the 16..=64-row lane WMMA arm
@@ -634,5 +814,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The multi plan keeps each part's own single-launch split-K, fits the Flash-Next front at
+    /// every wide row count, and refuses what is not a multi launch.
+    #[test]
+    fn multi_plan_is_the_per_part_split_k() {
+        for rows in 9..=64usize {
+            for ms in [[512usize, 1, 384, 384], [512, 1, 256, 256]] {
+                let plan = lane_wmma_multi_plan(&ms, 2560, rows).expect("front fits");
+                for (p, &m) in ms.iter().enumerate() {
+                    assert_eq!(plan.split_k[p], lane_wmma_auto_split_k(m, 2560, rows, 1));
+                }
+                assert_eq!(plan.tiles, ms.iter().map(|m| m.div_ceil(16)).sum::<usize>());
+                assert_eq!(plan.grid_y, *plan.split_k.iter().max().unwrap());
+                assert_eq!(plan.grid_z, 1);
+            }
+        }
+        // One part, five parts, an empty part, K not a multiple of 128, no rows: not a multi launch.
+        assert!(lane_wmma_multi_plan(&[384], 2560, 32).is_none());
+        assert!(lane_wmma_multi_plan(&[1, 2, 3, 4, 5], 2560, 32).is_none());
+        assert!(lane_wmma_multi_plan(&[384, 0], 2560, 32).is_none());
+        assert!(lane_wmma_multi_plan(&[384, 384], 2500, 32).is_none());
+        assert!(lane_wmma_multi_plan(&[384, 384], 2560, 0).is_none());
     }
 }

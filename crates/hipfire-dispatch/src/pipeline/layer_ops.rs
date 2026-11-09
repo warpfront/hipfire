@@ -639,6 +639,53 @@ fn project_weights_inner(
             }
         }
     }
+    // `HIPFIRE_QWEN4_LWMMA_MULTI_PART` (exact gfx1201, 16..=64 rows past the few-row window): BF16
+    // members of one K that each decline the F16 WMMA route take, one by one, the lane-WMMA arm of
+    // `gemm_bf16_xf32_multirow` (`project_rotated`); two to four of them run as ONE multi-part
+    // launch instead, each member's bytes that launch's. Not inside an EP prefill wave split
+    // (`Gpu::wave_lane_groups`: the one-call-per-lane arm owns those).
+    if !wide_exact
+        && input.dtype == DType::F32
+        && gpu.flags.qwen4_lwmma_multi_part_enabled()
+        && gpu.wave_lane_groups(rows).is_none()
+    {
+        for i in 0..projections.len() {
+            let (weight, _) = projections[i];
+            if done[i] || weight.dtype != DType::BF16 {
+                continue;
+            }
+            let group: SmallVec<[usize; 4]> = (i..projections.len())
+                .filter(|&j| {
+                    let (w, out) = projections[j];
+                    !done[j]
+                        && w.dtype == DType::BF16
+                        && w.k == weight.k
+                        && out.dtype == DType::F32
+                        && !gpu.qwen4_f16_wmma_applies(w.buf, w.k, rows)
+                })
+                .take(4)
+                .collect();
+            let ms: SmallVec<[usize; 4]> = group.iter().map(|&j| projections[j].0.m).collect();
+            if group.len() < 2 || !gpu.lane_wmma_multi_part_applies(&ms, weight.k, rows) {
+                continue;
+            }
+            let parts: SmallVec<[rdna_compute::lane_wmma::LaneWmmaMultiPart<'_>; 4]> = group
+                .iter()
+                .map(|&j| {
+                    let (w, out) = projections[j];
+                    rdna_compute::lane_wmma::LaneWmmaMultiPart {
+                        w: w.buf,
+                        y: out,
+                        m: w.m,
+                    }
+                })
+                .collect();
+            hip(gpu.lane_wmma_gemm_multi_fixed(&parts, input, weight.k, rows).map(|_| ()))?;
+            for j in group {
+                done[j] = true;
+            }
+        }
+    }
     for i in 0..projections.len() {
         if done[i] {
             continue;

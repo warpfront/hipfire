@@ -3280,6 +3280,7 @@ impl Gpu {
                 fp16_x_scratch: None,
                 fp16_x_scratch_bytes: 0,
                 lane_wmma_scratch: None,
+                lane_wmma_multi_scratch: None,
                 hc8_bf16: [None, None],
                 qsa_select_scores: None,
                 qsa_select_scores_bytes: 0,

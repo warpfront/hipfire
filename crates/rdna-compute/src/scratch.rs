@@ -380,6 +380,10 @@ pub struct ScratchState {
     /// Fixed-size split-K scratch of the lane WMMA route (`crate::lane_wmma`): allocated lazily on
     /// first use, zeroed once, never grown or replaced.
     pub lane_wmma_scratch: Option<crate::lane_wmma::LaneWmmaScratch>,
+    /// Multi-part split-K scratch of the lane WMMA route (`HIPFIRE_QWEN4_LWMMA_MULTI_PART`):
+    /// disjoint partial slices for up to four parts of one launch; lazily allocated, zeroed once,
+    /// never grown.
+    pub lane_wmma_multi_scratch: Option<crate::lane_wmma::LaneWmmaScratch>,
     /// Reused exact-BF16 expansions of the HC8 sidecar weights (`crate::hc8_weight`): slot 0 the HC
     /// down, slot 1 the HC up. Allocated lazily on first prefill-class use, never regrown.
     pub hc8_bf16: [Option<GpuTensor>; 2],
