@@ -1114,6 +1114,10 @@ name = "mq2_xbatch_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "hc8_rip_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "lane_rows_pm_oracle"
 required-features = ["lab"]
 
