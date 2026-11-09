@@ -7670,7 +7670,7 @@ mod tests {
     #[test]
     fn ep_elastic_cap_is_default_unless_zero_or_a_positive_integer() {
         use memory::parse_ep_elastic_cap_bytes as parse;
-        assert_eq!(parse(None), Ok(1280 << 20));
+        assert_eq!(parse(None), Ok(2048 << 20));
         assert_eq!(parse(Some("0")), Ok(0));
         assert_eq!(parse(Some("")), Ok(0));
         assert_eq!(parse(Some(" 512 ")), Ok(512 << 20));
@@ -7681,7 +7681,7 @@ mod tests {
         assert!(parse(Some("18446744073709551615"))
             .unwrap_err()
             .contains("overflows"));
-        assert_eq!(memory::ep_elastic_cap_bytes(), Ok(1280 << 20));
+        assert_eq!(memory::ep_elastic_cap_bytes(), Ok(2048 << 20));
         assert!(!memory::ep_elastic_log());
         assert_eq!(
             developer_key_for_env("HIPFIRE_EP_ELASTIC_MIB").as_deref(),
@@ -11575,8 +11575,8 @@ pub mod memory {
     pub const EP_ELASTIC_MIB_ENV: &str = "HIPFIRE_EP_ELASTIC_MIB";
     /// Environment variable of the elastic reserve's stderr log: [`ep_elastic_log`].
     pub const EP_ELASTIC_LOG_ENV: &str = "HIPFIRE_EP_ELASTIC_LOG";
-    /// Default cap of the elastic reserve per rank: 1,280 MiB.
-    pub const EP_ELASTIC_DEFAULT_MIB: u64 = 1280;
+    /// Default cap of the elastic reserve per rank: 2,048 MiB (the lend is lendable-bound: about 1,620 MiB on the cp15 fixture).
+    pub const EP_ELASTIC_DEFAULT_MIB: u64 = 2048;
 
     /// Developer variable `HIPFIRE_EP_ELASTIC_MIB` of the Flash-Next EP2 elastic reserve (the
     /// extra resident routed experts lent from idle VRAM): unset is the default cap of
