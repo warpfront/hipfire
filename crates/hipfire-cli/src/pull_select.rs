@@ -737,7 +737,9 @@ fn plan_items_with_ep(
         }
     }
     if choice.expert_hotset {
-        if let Some(ep) = hipfire_registry::ep_expert_hotset_in(identity, ep_pins, ep_gate) {
+        if let Some(ep) = hipfire_registry::ep_expert_hotset_in(identity, ep_pins, ep_gate)
+            .filter(|ep| ep.published)
+        {
             let local = format!(
                 "{model_file}{}",
                 hipfire_config::memory::EP_EXPERT_HOTSET_SIDECAR_SUFFIX
@@ -1943,6 +1945,31 @@ mod tests {
         }
         let stock = stock_registry();
         let items = hc8_plan_labels(&stock, "qwen3.8:flash", "gfx1201");
+        assert!(items.iter().all(|item| item.label != "EP hot-unit loan"));
+    }
+
+    #[test]
+    fn the_unpublished_symtrunk_ranking_is_not_in_a_gate_on_pull_plan() {
+        let registry = symtrunk_registry();
+        let host = host_with_arch("gfx1201");
+        let (tag, entry) = registry.model("symtrunk:test").unwrap();
+        let ctx = PullContext {
+            registry: &registry,
+            host: &host,
+            overlay_pins: hipfire_registry::TRUNK_OVERLAY_PINS,
+            hotset_pins: hipfire_registry::EXPERT_HOTSET_PINS,
+            grandfather_pins: hipfire_registry::GRANDFATHERED_MONOLITHICS,
+            present: &absent,
+        };
+        let choice = PullChoice::defaults(tag, entry, &PullFlags::default());
+        let items = plan_items_with_ep(
+            &ctx,
+            &choice,
+            false,
+            hipfire_registry::EP_EXPERT_HOTSET_PINS,
+            true,
+        );
+        assert!(items.iter().all(|item| item.label != "EP expert hot set"));
         assert!(items.iter().all(|item| item.label != "EP hot-unit loan"));
     }
 

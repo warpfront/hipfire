@@ -562,22 +562,42 @@ pub const EXPERT_HOTSET_PINS: &[ExpertHotsetPin] = &[
 
 /// EP2 expert-ranking sidecars, distinct from [`EXPERT_HOTSET_PINS`]: the name
 /// is the canonical base file plus
-/// `hipfire_config::memory::EP_EXPERT_HOTSET_SIDECAR_SUFFIX`. Only the split
-/// base is pinned; the ranking is bound to its tensor index.
-pub const EP_EXPERT_HOTSET_PINS: &[ExpertHotsetPin] = &[ExpertHotsetPin {
-    base_sha256: FLASH_NEXT_XTS_SPLIT_BASE_SHA256,
-    base_size: FLASH_NEXT_XTS_SPLIT_BASE_SIZE,
-    repo: FLASH_NEXT_XTS_REPO,
-    file: "qwen3.8-flash-next-base.mq4-xts.ep.expert-hotset",
-    sha256: "77540499adecb1cbca1186051d24aaa329b986dddd52f6d950c887088e61d7b6",
-    size_bytes: 312_036,
-}];
+/// `hipfire_config::memory::EP_EXPERT_HOTSET_SIDECAR_SUFFIX`. The split base and the
+/// symmetric-trunk base are pinned; each ranking is bound to its base's tensor index.
+pub const EP_EXPERT_HOTSET_PINS: &[ExpertHotsetPin] = &[
+    ExpertHotsetPin {
+        base_sha256: FLASH_NEXT_XTS_SPLIT_BASE_SHA256,
+        base_size: FLASH_NEXT_XTS_SPLIT_BASE_SIZE,
+        repo: FLASH_NEXT_XTS_REPO,
+        file: "qwen3.8-flash-next-base.mq4-xts.ep.expert-hotset",
+        sha256: "77540499adecb1cbca1186051d24aaa329b986dddd52f6d950c887088e61d7b6",
+        size_bytes: 312_036,
+    },
+    // The symmetric-trunk base (the ranking `HOT_UNITS_SIDECAR_PINS` is calibrated under).
+    // Pinned ahead of the Hugging Face upload; see [`UNPUBLISHED_PIN_FILES`].
+    ExpertHotsetPin {
+        base_sha256: "27dfff6692eba3385655959d134771fcff154c6279ab0a6c43cb8c7d81a7fa31",
+        base_size: 70_888_270_360,
+        repo: FLASH_NEXT_XTS_REPO,
+        file: "qwen3.8-flash-next-base.mq4-xts-symtrunk.ep.expert-hotset",
+        sha256: "c27a8ebff3d560e6c73d9b1e8b52fb27878a13735301660159109e857b0fb53c",
+        size_bytes: 312_036,
+    },
+];
+
+/// Pinned sidecar files that are not on Hugging Face yet (both upload at the release).
+/// `hipfire pull` never requests them and never touches a local copy; a local copy beside the
+/// model is still size- and sha256-checked against its pin and reported.
+pub const UNPUBLISHED_PIN_FILES: &[&str] =
+    &["qwen3.8-flash-next-base.mq4-xts-symtrunk.ep.expert-hotset"];
 
 /// A resolved expert hotset: the repo that hosts it and its sidecar identity.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExpertHotset {
     pub repo: &'static str,
     pub sidecar: Sidecar,
+    /// Whether the file is on the repo (`false` for [`UNPUBLISHED_PIN_FILES`]).
+    pub published: bool,
 }
 
 /// The pin in `pins` whose base identity equals the entry's `sha256` and
@@ -595,6 +615,7 @@ pub fn expert_hotset_in(entry: &ModelEntry, pins: &[ExpertHotsetPin]) -> Option<
                 sha256: Some(pin.sha256.to_owned()),
                 size_bytes: Some(pin.size_bytes),
             },
+            published: !UNPUBLISHED_PIN_FILES.contains(&pin.file),
         })
 }
 
@@ -2479,6 +2500,46 @@ mod tests {
         assert!(registry_sidecar_files(&registry).contains(HOT_UNITS_SIDECAR_PINS[0].file));
     }
 
+    #[test]
+    fn hot_units_ranking_binding_resolves_to_a_pinned_hotset_of_the_same_base() {
+        let units = HOT_UNITS_SIDECAR_PINS[0];
+        let ranking = EP_EXPERT_HOTSET_PINS
+            .iter()
+            .find(|pin| pin.sha256 == units.ranking_sha256)
+            .expect("the ranking the hot units were calibrated under is pinned");
+        assert_eq!(ranking.base_sha256, units.base_sha256);
+        assert_eq!(ranking.base_size, units.base_size);
+        assert_eq!(ranking.repo, units.repo);
+        assert_eq!(ranking.size_bytes, 312_036);
+        assert_eq!(
+            ranking.file,
+            format!(
+                "{SYMTRUNK_BASE_FILE}{}",
+                hipfire_config::memory::EP_EXPERT_HOTSET_SIDECAR_SUFFIX
+            )
+        );
+        // Through the entry lookup, with the gate on.
+        let resolved = ep_expert_hotset_in(&symtrunk_base_entry(), EP_EXPERT_HOTSET_PINS, true)
+            .expect("the symtrunk base resolves its ranking");
+        assert_eq!(resolved.sidecar.sha256.as_deref(), Some(units.ranking_sha256));
+        // Both upload together at the release.
+        assert!(!resolved.published);
+        assert!(!units.published);
+        assert!(UNPUBLISHED_PIN_FILES.contains(&ranking.file));
+        // The split base's ranking stays published and is not the hot units' ranking.
+        let split = ep_expert_hotset_in(&stock_split_base_entry(), EP_EXPERT_HOTSET_PINS, true)
+            .unwrap();
+        assert!(split.published);
+        assert_ne!(split.sidecar.sha256.as_deref(), Some(units.ranking_sha256));
+        // The local calibration copy, when at hand, is the pinned bytes.
+        let path = std::path::Path::new(
+            "/home/kaden/qcal/release-0.4.5/symtrunk/model/qwen3.8-flash-next-base.mq4-xts-symtrunk.ep.expert-hotset",
+        );
+        if let Ok(bytes) = std::fs::read(path) {
+            assert_eq!(bytes.len() as u64, ranking.size_bytes);
+        }
+    }
+
     const EXPERT_HOTSET_FILE: &str = "qwen3.8-flash-next.mq4-xts.expert-hotset";
 
     #[test]
@@ -2635,7 +2696,7 @@ mod tests {
 
     #[test]
     fn ep_expert_hotset_pin_has_exact_metadata_and_is_gated() {
-        assert_eq!(EP_EXPERT_HOTSET_PINS.len(), 1);
+        assert_eq!(EP_EXPERT_HOTSET_PINS.len(), 2);
         let pin = &EP_EXPERT_HOTSET_PINS[0];
         let split_hotset = &EXPERT_HOTSET_PINS[1];
         assert_eq!(

@@ -2197,22 +2197,13 @@ fn pull_with_all_pins(
                     args.force,
                 );
             } else {
-                // Pinned ahead of the Hugging Face upload: never request it, never touch a
-                // local copy; report what the loader will see.
-                match local_hot_units_state(&cache, &units, &destination) {
-                    LocalHotUnits::Pinned => eprintln!(
-                        "  EP hot-unit loan sidecar already present (matches the pin): {}",
-                        units.sidecar.file
-                    ),
-                    LocalHotUnits::Different => eprintln!(
-                        "  EP hot-unit loan sidecar present but not the pinned calibration (left untouched; the loader accepts it only if it binds this base and ranking): {}",
-                        units.sidecar.file
-                    ),
-                    LocalHotUnits::Absent => eprintln!(
-                        "  EP hot-unit loan sidecar not published yet; the loan stays off: {}",
-                        units.sidecar.file
-                    ),
-                }
+                report_unpublished_sidecar(
+                    &cache,
+                    "EP hot-unit loan",
+                    &units.sidecar,
+                    &destination,
+                    "the loan stays off",
+                );
             }
         }
     }
@@ -2232,14 +2223,26 @@ fn pull_with_all_pins(
             ep_hotset_pins,
             hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON,
         ) {
-            fetch_registry_sidecar(
-                &VerifiedCache::in_home(&paths.root),
-                "EP expert hot set",
-                ep.repo,
-                &ep.sidecar,
-                &hipfire_config::memory::ep_expert_hotset_sidecar_path(&model_path),
-                args.force,
-            );
+            let destination = hipfire_config::memory::ep_expert_hotset_sidecar_path(&model_path);
+            let cache = VerifiedCache::in_home(&paths.root);
+            if ep.published {
+                fetch_registry_sidecar(
+                    &cache,
+                    "EP expert hot set",
+                    ep.repo,
+                    &ep.sidecar,
+                    &destination,
+                    args.force,
+                );
+            } else {
+                report_unpublished_sidecar(
+                    &cache,
+                    "EP expert hot set",
+                    &ep.sidecar,
+                    &destination,
+                    "placement falls back to whole-layer",
+                );
+            }
         }
     }
     for (name, sidecar) in &entry.heads {
@@ -2269,10 +2272,10 @@ fn pull_with_all_pins(
     Ok(Some(model_path))
 }
 
-/// What sits at the hot-unit loan sidecar path of an unpublished pin.
+/// What sits at the path of a pinned sidecar that is not published yet.
 #[derive(Debug, PartialEq, Eq)]
-enum LocalHotUnits {
-    /// No file there: the loan stays off.
+enum LocalUnpublished {
+    /// No file there.
     Absent,
     /// A file whose size and sha256 equal the pin.
     Pinned,
@@ -2280,23 +2283,48 @@ enum LocalHotUnits {
     Different,
 }
 
-fn local_hot_units_state(
+fn local_unpublished_state(
     cache: &VerifiedCache,
-    units: &hipfire_registry::HotUnitsSidecar,
+    sidecar: &Sidecar,
     destination: &Path,
-) -> LocalHotUnits {
+) -> LocalUnpublished {
     if !destination.is_file() {
-        return LocalHotUnits::Absent;
+        return LocalUnpublished::Absent;
     }
     if existing_artifact_valid(
         cache,
         destination,
-        units.sidecar.sha256.as_deref(),
-        units.sidecar.size_bytes,
+        sidecar.sha256.as_deref(),
+        sidecar.size_bytes,
     ) {
-        LocalHotUnits::Pinned
+        LocalUnpublished::Pinned
     } else {
-        LocalHotUnits::Different
+        LocalUnpublished::Different
+    }
+}
+
+/// A pin that is not on Hugging Face yet is never requested and a local copy is never touched;
+/// report what the loader will see. `without` says what happens with no file.
+fn report_unpublished_sidecar(
+    cache: &VerifiedCache,
+    label: &str,
+    sidecar: &Sidecar,
+    destination: &Path,
+    without: &str,
+) {
+    match local_unpublished_state(cache, sidecar, destination) {
+        LocalUnpublished::Pinned => eprintln!(
+            "  {label} sidecar already present (matches the pin): {}",
+            sidecar.file
+        ),
+        LocalUnpublished::Different => eprintln!(
+            "  {label} sidecar present but not the pinned file (left untouched; the loader accepts it only if it binds this base): {}",
+            sidecar.file
+        ),
+        LocalUnpublished::Absent => eprintln!(
+            "  {label} sidecar not published yet; {without}: {}",
+            sidecar.file
+        ),
     }
 }
 
@@ -21262,7 +21290,7 @@ effort = "high"
     }
 
     #[test]
-    fn local_hot_units_state_verifies_size_and_sha_against_the_pin() {
+    fn local_unpublished_state_verifies_size_and_sha_against_the_pin() {
         use sha2::{Digest, Sha256};
         let paths = test_paths("hot-units-state");
         fs::create_dir_all(&paths.models).unwrap();
@@ -21284,24 +21312,24 @@ effort = "high"
         };
         let cache = VerifiedCache::disabled();
         assert_eq!(
-            local_hot_units_state(&cache, &units, &destination),
-            LocalHotUnits::Absent
+            local_unpublished_state(&cache, &units.sidecar, &destination),
+            LocalUnpublished::Absent
         );
         fs::write(&destination, content).unwrap();
         assert_eq!(
-            local_hot_units_state(&cache, &units, &destination),
-            LocalHotUnits::Pinned
+            local_unpublished_state(&cache, &units.sidecar, &destination),
+            LocalUnpublished::Pinned
         );
         // Same size, other bytes: not the pinned calibration.
         fs::write(&destination, br#"{"kind":"hipfire.qwen4.ep_hot_unitX"}"#).unwrap();
         assert_eq!(
-            local_hot_units_state(&cache, &units, &destination),
-            LocalHotUnits::Different
+            local_unpublished_state(&cache, &units.sidecar, &destination),
+            LocalUnpublished::Different
         );
         fs::write(&destination, b"{}").unwrap();
         assert_eq!(
-            local_hot_units_state(&cache, &units, &destination),
-            LocalHotUnits::Different
+            local_unpublished_state(&cache, &units.sidecar, &destination),
+            LocalUnpublished::Different
         );
         fs::remove_dir_all(&paths.root).unwrap();
     }
