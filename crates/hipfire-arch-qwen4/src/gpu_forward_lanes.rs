@@ -108,8 +108,8 @@ use crate::bundle::Qwen4Bundle;
 use crate::config::LayerType;
 use crate::gpu_forward::ep_wave::{
     ep_wave_expected_moe_calls, ep_wave_joint_enabled, ep_wave_joint_for_lanes, ep_wave_layer_moe,
-    ep_wave_partial_mask, ep_wave_policy_for, ep_wave_refusal,
-    ep_wave_route, ep_wave_scope_rows, ep_wave_tile_exchange, EpWaveRoute,
+    ep_wave_partial_mask, ep_wave_policy_for, ep_wave_refusal, ep_wave_route, ep_wave_scope_rows,
+    ep_wave_tile_exchange, EpWaveRoute,
 };
 use crate::gpu_forward::{
     bind_ep_lane_gather, ep_lane, ep_lane_buffer, ep_lane_check_invocations, ep_lane_moe_rows,
