@@ -271,8 +271,17 @@ pub(crate) enum EpWaveRoute {
     Tile,
     /// The trunk shard's PARTIAL chunk route (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`): the compact table
     /// (non-owned experts the zero dummy, static `e % ranks` owners), no exchange, no gather; the
-    /// rank's FFN is its partial, reduced by the all-reduce of each lane's FFN HC write.
+    /// rank's FFN is its partial, reduced by the all-reduce of each lane's FFN HC write. The
+    /// lanes' own partial chunks are not admitted by the owner-routed tile route (floor 512:
+    /// `HIPFIRE_EP_PREFILL_TILE_MIN_ROWS=512`, `HIPFIRE_QWEN4_MOE_EP_A8=0`, or the mask off), so
+    /// no tile mask is bound.
     Partial,
+    /// [`Self::Partial`] with the shard's partial tile mask (`HIPFIRE_QWEN4_EP_TRUNK_SHARD_PMASK`):
+    /// every lane's own partial chunk is admitted by the owner-routed tile route
+    /// (`ep_tile_active`: the lowered floor on the A8 chain) and masks the non-owned tiles, so
+    /// the wave's one MoE call binds the same mask-only exchange (owned experts only, no peer
+    /// traffic).
+    PartialMask,
 }
 
 /// Host facts of one wave, identical on every rank. All of them are decided from replicated
@@ -398,7 +407,7 @@ pub(crate) fn ep_wave_refusal(facts: &EpWaveFacts) -> Option<String> {
             }
             None
         }
-        Ok(EpWaveRoute::Partial) => {
+        Ok(EpWaveRoute::Partial | EpWaveRoute::PartialMask) => {
             if !facts.shard_wave_enabled {
                 return refuse(format!(
                     "the trunk-shard partial-route wave is switched off ({QWEN4_EP_WAVE_SHARD_ENV}=0)"
@@ -453,14 +462,24 @@ pub(crate) fn ep_wave_refusal(facts: &EpWaveFacts) -> Option<String> {
 /// The route a wave takes, decided from its lanes' own routes: every lane's singleton tile on
 /// the FULL-TABLE route -> [`EpWaveRoute::FullTable`], every lane's on the owner-routed TILE
 /// route -> [`EpWaveRoute::Tile`]; lanes of both kinds (a floor between their rows) have no
-/// single route to reproduce.
+/// single route to reproduce. Under the trunk shard: [`EpWaveRoute::PartialMask`] when every
+/// lane's own partial chunk takes the partial tile mask, else [`EpWaveRoute::Partial`] (a mix is
+/// refused by [`ep_wave_refusal`]).
 pub(crate) fn ep_wave_route(facts: &EpWaveFacts) -> Result<EpWaveRoute, String> {
     // Under the trunk shard every chunk of 9+ rows is the PARTIAL chunk route
     // (`ep_trunk_partial_chunk`): it takes precedence over the tile route, whose exchange the
-    // shard refuses (it would complete the routed FFN on both ranks), so the lanes' own tile
-    // flags are not their route.
+    // shard refuses (it would complete the routed FFN on both ranks). The lanes' own tile flags
+    // then decide only the partial tile mask: `forward_chunk_scoped` masks a partial chunk
+    // exactly when the mask is on and `ep_tile_active` admits it.
     if facts.ffn_partial {
-        return Ok(EpWaveRoute::Partial);
+        let masked = facts.partial_mask
+            && !facts.lane_tile.is_empty()
+            && facts.lane_tile.iter().all(|tile| *tile);
+        return Ok(if masked {
+            EpWaveRoute::PartialMask
+        } else {
+            EpWaveRoute::Partial
+        });
     }
     let tiles = facts.lane_tile.iter().filter(|tile| **tile).count();
     if tiles == 0 {
@@ -480,9 +499,9 @@ pub(crate) fn ep_wave_route(facts: &EpWaveFacts) -> Result<EpWaveRoute, String> 
 /// The runtime a wave's MoE invocation of `layer` binds: exactly the singleton chunk's
 /// selection for a sub-512-row tile of the wave's route (`select_layer_moe` with `full_chunk`):
 /// [`EpWaveRoute::FullTable`] the layer's EP full runtime of the bank in use (never the balanced
-/// live or the decode table), [`EpWaveRoute::Tile`] and [`EpWaveRoute::Partial`] the compact
-/// (owned-experts, non-owned = zero dummy) runtime the owner-routed tile exchange / the trunk
-/// shard's partial chunk reads.
+/// live or the decode table), [`EpWaveRoute::Tile`], [`EpWaveRoute::Partial`] and
+/// [`EpWaveRoute::PartialMask`] the compact (owned-experts, non-owned = zero dummy) runtime the
+/// owner-routed tile exchange / the trunk shard's partial chunk reads.
 pub(crate) fn ep_wave_layer_moe<'a>(
     route: EpWaveRoute,
     ep: Option<&'a Qwen4ForwardEp>,
@@ -523,8 +542,8 @@ pub(crate) fn ep_wave_partial_mask_on(ep: Option<&Qwen4ForwardEp>) -> bool {
         && ep.is_some_and(|ep| ep.tile.as_ref().is_some_and(|route| route.hook.is_some()))
 }
 
-/// The mask-only exchange of the Partial wave's MoE call (see [`super::PartialMaskArc`]) and the
-/// owned-tile id buffer it masks with, when [`ep_wave_partial_mask_on`].
+/// The mask-only exchange of the [`EpWaveRoute::PartialMask`] wave's MoE call (see
+/// [`super::PartialMaskArc`]) and the owned-tile id buffer it masks with.
 pub(crate) fn ep_wave_partial_mask(
     ep: Option<&Qwen4ForwardEp>,
 ) -> Option<hipfire_dispatch::families::moe::MoeTileExchangeParams<'_>> {
@@ -721,7 +740,9 @@ impl Qwen4GpuForward {
             std::mem::replace(&mut gpu.qwen4_wave_lane_rows, ep_wave_lane_table(lane_rows));
         let bank_route = match route {
             EpWaveRoute::FullTable => EpBankRoute::FullTable,
-            EpWaveRoute::Tile | EpWaveRoute::Partial => EpBankRoute::TileExchange,
+            EpWaveRoute::Tile | EpWaveRoute::Partial | EpWaveRoute::PartialMask => {
+                EpBankRoute::TileExchange
+            }
         };
         let result = (|| {
             if self.ep_reserve.is_some() {
@@ -753,10 +774,7 @@ impl Qwen4GpuForward {
     pub(crate) fn ep_wave_note(&mut self, rows: usize) {
         let route = match self.wave_route {
             Some(EpWaveRoute::Tile) => ep_reserve_forward::LaneTileRoute::Tile,
-            // The lane program binds the mask exactly on this predicate (`gpu_forward_lanes`).
-            Some(EpWaveRoute::Partial) if ep_wave_partial_mask_on(self.ep.as_ref()) => {
-                ep_reserve_forward::LaneTileRoute::PartialMask
-            }
+            Some(EpWaveRoute::PartialMask) => ep_reserve_forward::LaneTileRoute::PartialMask,
             Some(EpWaveRoute::Partial) => ep_reserve_forward::LaneTileRoute::Partial,
             Some(EpWaveRoute::FullTable) | None => ep_reserve_forward::LaneTileRoute::FullTable,
         };
@@ -1123,6 +1141,21 @@ mod tests {
         // The carrier tile hook may flag the lanes as tile lanes: the route is still Partial.
         f.lane_tile = vec![true; 8];
         assert_eq!(ep_wave_route(&f), Ok(EpWaveRoute::Partial));
+        // The partial tile mask follows the lanes' own partial chunks: every lane admitted by the
+        // tile route (floor 9, A8) -> the PartialMask wave; with the floor at 512
+        // (`HIPFIRE_EP_PREFILL_TILE_MIN_ROWS=512`, `HIPFIRE_QWEN4_MOE_EP_A8=0`) no lane is, and the
+        // wave binds no mask (the lanes' F32 grouped chain has none: binding it was a dispatch
+        // error); a mix is refused.
+        f.partial_mask = true;
+        assert_eq!(ep_wave_route(&f), Ok(EpWaveRoute::PartialMask));
+        assert_eq!(ep_wave_refusal(&f), None);
+        f.lane_tile = vec![false; 8];
+        assert_eq!(ep_wave_route(&f), Ok(EpWaveRoute::Partial));
+        assert_eq!(ep_wave_refusal(&f), None);
+        f.lane_tile[4] = true;
+        assert!(refused(&f).contains("tile mask"), "{}", refused(&f));
+        f.lane_tile = vec![true; 8];
+        f.partial_mask = false;
         // F32 grouped chain (D1 load: floor 512): the compact-mode capacity binds.
         assert_eq!(ep_wave_refusal(&f), None);
         f.capacity_rows = 512;
@@ -1340,9 +1373,9 @@ mod tests {
         // Tile / Partial: the tile bank route (the partial chunk's wide route is the same class,
         // `ep_wide_bank_route(false, true)`), and for Tile alone the exchange of the installed
         // transport.
-        assert!(
-            body.contains("EpWaveRoute::Tile | EpWaveRoute::Partial => EpBankRoute::TileExchange")
-        );
+        assert!(body.contains(
+            "EpWaveRoute::Tile | EpWaveRoute::Partial | EpWaveRoute::PartialMask => {\n                EpBankRoute::TileExchange"
+        ));
         assert!(body.contains("exchange: route.hook.as_deref()?"));
         assert!(body.contains("tile_ids_owned: &route.tile_ids_owned"));
         // The lane program binds the transport's exchange on the Tile route and, on the Partial
@@ -1356,9 +1389,9 @@ mod tests {
         assert_eq!(arm.matches("moe.tile_exchange =").count(), 2, "{arm}");
         assert!(arm.contains("if route == EpWaveRoute::Tile {"), "{arm}");
         assert!(
-            arm.contains("route == EpWaveRoute::Partial")
-                && arm.contains("ep_wave_partial_mask_on(fwd.ep.as_ref())")
-                && arm.contains("ep_wave_partial_mask(fwd.ep.as_ref())"),
+            arm.contains("if route == EpWaveRoute::PartialMask {")
+                && arm.contains("ep_wave_partial_mask(fwd.ep.as_ref())")
+                && !arm.contains("ep_wave_partial_mask_on"),
             "{arm}"
         );
         // Both routes run under the routing-row cap, set and restored once.

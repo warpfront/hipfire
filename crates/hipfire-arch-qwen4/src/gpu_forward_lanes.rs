@@ -108,7 +108,7 @@ use crate::bundle::Qwen4Bundle;
 use crate::config::LayerType;
 use crate::gpu_forward::ep_wave::{
     ep_wave_expected_moe_calls, ep_wave_joint_enabled, ep_wave_joint_for_lanes, ep_wave_layer_moe,
-    ep_wave_partial_mask, ep_wave_partial_mask_on, ep_wave_policy_for, ep_wave_refusal,
+    ep_wave_partial_mask, ep_wave_policy_for, ep_wave_refusal,
     ep_wave_route, ep_wave_scope_rows, ep_wave_tile_exchange, EpWaveRoute,
 };
 use crate::gpu_forward::{
@@ -3828,12 +3828,17 @@ fn forward_lanes_scoped(
                                         })?,
                                     );
                                 }
-                                // The Partial wave masks the non-owned tiles like the lanes' own
-                                // partial chunks do (the trunk shard's partial tile mask).
-                                if route == EpWaveRoute::Partial
-                                    && ep_wave_partial_mask_on(fwd.ep.as_ref())
-                                {
-                                    moe.tile_exchange = ep_wave_partial_mask(fwd.ep.as_ref());
+                                // The PartialMask wave masks the non-owned tiles exactly as the
+                                // lanes' own partial chunks do (the trunk shard's partial tile
+                                // mask); the Partial wave's lanes take no mask, nor does it.
+                                if route == EpWaveRoute::PartialMask {
+                                    moe.tile_exchange = Some(
+                                        ep_wave_partial_mask(fwd.ep.as_ref()).ok_or_else(|| {
+                                            invalid(
+                                                "a partial-mask EP wave needs the installed tile route's mask",
+                                            )
+                                        })?,
+                                    );
                                 }
                                 wave_moe_calls += 1;
                             } else if let Some(runtime) =
