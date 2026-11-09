@@ -16892,7 +16892,11 @@ impl Qwen4GpuForward {
         if ep_lane_tile {
             self.lane_tile_note = Some(ep_reserve_forward::LaneTileNote {
                 rows: n,
-                tile_exchange: tile_active,
+                route: ep_reserve_forward::LaneTileRoute::of(
+                    tile_active,
+                    trunk_chunk_partial,
+                    partial_mask_route.is_some(),
+                ),
                 staged: expert_stage.is_some(),
                 stage_min_rows: self
                     .expert_stage

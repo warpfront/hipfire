@@ -751,9 +751,18 @@ impl Qwen4GpuForward {
     /// Record the route a wave took as the lane tile note of its total rows (the
     /// `HIPFIRE_CB_PHASES` per-tile line reads it; it never feeds a decision).
     pub(crate) fn ep_wave_note(&mut self, rows: usize) {
+        let route = match self.wave_route {
+            Some(EpWaveRoute::Tile) => ep_reserve_forward::LaneTileRoute::Tile,
+            // The lane program binds the mask exactly on this predicate (`gpu_forward_lanes`).
+            Some(EpWaveRoute::Partial) if ep_wave_partial_mask_on(self.ep.as_ref()) => {
+                ep_reserve_forward::LaneTileRoute::PartialMask
+            }
+            Some(EpWaveRoute::Partial) => ep_reserve_forward::LaneTileRoute::Partial,
+            Some(EpWaveRoute::FullTable) | None => ep_reserve_forward::LaneTileRoute::FullTable,
+        };
         self.lane_tile_note = Some(ep_reserve_forward::LaneTileNote {
             rows,
-            tile_exchange: self.wave_route == Some(EpWaveRoute::Tile),
+            route,
             staged: false,
             stage_min_rows: None,
         });
