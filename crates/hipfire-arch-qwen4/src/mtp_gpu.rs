@@ -46,7 +46,7 @@ use rdna_compute::tensor_ops::{
     indexed_attention_pool_rope_incremental, HcActivationFused, HyperNorm, HyperReadProjected,
     IndexedAttentionAppendPrologue, IndexedAttentionPoolRope, QsaKvFormat, QsaPositionBinding,
 };
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor, MemsetBatch};
 use smallvec::SmallVec;
 use std::fmt;
 
@@ -1858,14 +1858,34 @@ impl MtpGpuState {
     }
 
     pub(crate) fn reset(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
-        self.reset_inner(gpu, true)
+        self.reset_synced(gpu, true)
+    }
+
+    /// [`Self::reset`] that only enqueues its zero-fills into `batch`: the caller owns
+    /// the one wait ([`Gpu::memset_batch_sync`], also after a failed reset) and keeps
+    /// the state alive until then.
+    pub(crate) fn reset_into(
+        &mut self,
+        gpu: &mut Gpu,
+        batch: &mut MemsetBatch,
+    ) -> Result<(), MtpGpuError> {
+        self.reset_inner(gpu, true, batch)
+    }
+
+    /// One reset with its own wait: every fill enqueued, then a single stream wait (paid
+    /// even when the reset fails part-way).
+    fn reset_synced(&mut self, gpu: &mut Gpu, clear_rows: bool) -> Result<(), MtpGpuError> {
+        let mut batch = MemsetBatch::default();
+        let reset = self.reset_inner(gpu, clear_rows, &mut batch);
+        let synced = gpu.memset_batch_sync(&mut batch).map_err(MtpGpuError::from);
+        reset.and(synced)
     }
 
     /// Cold reset of a side request: as [`Self::reset`] except the
     /// append-only row streams (full K/V, raw index keys, pooled keys) keep
     /// their bytes.
     pub(crate) fn reset_for_side(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
-        self.reset_inner(gpu, false)
+        self.reset_synced(gpu, false)
     }
 
     /// Per-stream row ends of a side request writing tokens `[0, through)`,
@@ -1875,7 +1895,12 @@ impl MtpGpuState {
         vec![through, through, through, through.div_ceil(self.compress)]
     }
 
-    fn reset_inner(&mut self, gpu: &mut Gpu, clear_rows: bool) -> Result<(), MtpGpuError> {
+    fn reset_inner(
+        &mut self,
+        gpu: &mut Gpu,
+        clear_rows: bool,
+        batch: &mut MemsetBatch,
+    ) -> Result<(), MtpGpuError> {
         self.snapshot_arena.invalidate();
         for (index, tensor) in [
             &self.full_keys,
@@ -1896,7 +1921,7 @@ impl MtpGpuState {
             }
             // An unmapped VMM arena has an empty accessible prefix.
             if tensor.buf.size() > 0 {
-                gpu.memset_stream_ordered(&tensor.buf, 0, tensor.buf.size())?;
+                gpu.memset_batched(batch, &tensor.buf, 0, tensor.buf.size())?;
             }
         }
         self.position = 0;

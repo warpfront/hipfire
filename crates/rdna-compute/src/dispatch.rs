@@ -447,6 +447,14 @@ pub struct GpuTensor {
     pub dtype: DType,
 }
 
+/// Zero-fills enqueued on the steady copy stream that still await their one wait
+/// (see [`Gpu::memset_batched`]). Plain bookkeeping: it borrows no buffer, so a reset can
+/// keep mutating its owner between enqueues.
+#[derive(Debug, Default)]
+pub struct MemsetBatch {
+    pending: bool,
+}
+
 /// Host-visible QSA depth associated with a checked kernel launch.
 #[derive(Clone, Copy, Debug)]
 pub struct QsaExtentDepth {
@@ -9240,6 +9248,52 @@ impl Gpu {
                 self.hip.stream_synchronize(stream)
             }
             None => self.hip.memset(buf, value, size),
+        }
+    }
+
+    /// [`Self::memset_stream_ordered`] without the per-call wait: with a steady copy stream
+    /// and `flags.lane_reset_batch` the fill is only enqueued and recorded in `batch`, and
+    /// [`Self::memset_batch_sync`] waits for the whole run once. With no steady stream or with
+    /// the kill switch (`HIPFIRE_LANE_RESET_BATCH=0`) it is exactly the blocking
+    /// [`Self::memset_stream_ordered`]. The caller keeps `buf` alive until the batch is
+    /// synced. A failed enqueue waits for the fills already in flight before returning, so
+    /// no write outlives the error.
+    #[track_caller]
+    pub fn memset_batched(
+        &self,
+        batch: &mut MemsetBatch,
+        buf: &hip_bridge::DeviceBuffer,
+        value: i32,
+        size: usize,
+    ) -> HipResult<()> {
+        if !self.flags.lane_reset_batch {
+            return self.memset_stream_ordered(buf, value, size);
+        }
+        self.bind_thread()?;
+        match self.steady_copy_stream() {
+            Some(stream) => {
+                if let Err(error) = self.hip.memset_async(buf, value, size, stream) {
+                    let _ = self.memset_batch_sync(batch);
+                    return Err(error);
+                }
+                batch.pending = true;
+                Ok(())
+            }
+            None => self.hip.memset(buf, value, size),
+        }
+    }
+
+    /// One wait on the steady copy stream for every fill [`Self::memset_batched`] enqueued
+    /// into `batch` (nothing when none is pending); `batch` is empty afterwards.
+    #[track_caller]
+    pub fn memset_batch_sync(&self, batch: &mut MemsetBatch) -> HipResult<()> {
+        if !std::mem::take(&mut batch.pending) {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        match self.steady_copy_stream() {
+            Some(stream) => self.hip.stream_synchronize(stream),
+            None => Ok(()),
         }
     }
 

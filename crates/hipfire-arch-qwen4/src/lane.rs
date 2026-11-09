@@ -78,7 +78,7 @@ use hipfire_dispatch::pipeline::DraftHeadRequestState;
 use hipfire_runtime::ngram_mod::NgramModConfig;
 use hipfire_runtime::slot_batch::RequestEpoch;
 use rdna_compute::expert_capabilities::{self, ExpertQt, Route};
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor, MemsetBatch};
 use std::ops::{Deref, DerefMut};
 use std::time::Instant;
 
@@ -1222,13 +1222,21 @@ impl LaneSpec {
     /// Back to a request's start: empty head, zero pending hidden, no
     /// window, no owed rows, fresh counters (the window router lives at the
     /// root).
-    fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+    ///
+    /// The zero-fills (head arenas, pending hidden) are enqueued into `batch`; the
+    /// caller owns the one wait ([`Gpu::memset_batch_sync`], also after an error).
+    fn reset_into(&mut self, gpu: &mut Gpu, batch: &mut MemsetBatch) -> Result<(), String> {
         self.head
-            .reset(gpu)
+            .reset_into(gpu, batch)
             .map_err(|e| format!("lane head reset: {e}"))?;
         self.draft = DraftHeadRequestState::default();
-        gpu.memset_stream_ordered(&self.pending_hidden.buf, 0, self.pending_hidden.buf.size())
-            .map_err(|e| format!("lane pending hidden reset: {e}"))?;
+        gpu.memset_batched(
+            batch,
+            &self.pending_hidden.buf,
+            0,
+            self.pending_hidden.buf.size(),
+        )
+        .map_err(|e| format!("lane pending hidden reset: {e}"))?;
         self.window = None;
         if let Some(lag) = self.lag.as_mut() {
             lag.clear();
@@ -1305,6 +1313,31 @@ fn new_payload(
         }
     };
     Ok((state, spec))
+}
+
+/// Back an existing lane cell to a request's start: trunk state, then (when the store
+/// stages spec) the MTP head and pending hidden, every zero-fill enqueued into `batch`
+/// (the caller owns the one wait, also after an error).
+fn reset_cell_into(
+    gpu: &mut Gpu,
+    cell: &mut Qwen4LaneState,
+    store_has_spec: bool,
+    slot: usize,
+    batch: &mut MemsetBatch,
+) -> Result<(), String> {
+    cell.state
+        .reset_into(gpu, batch)
+        .map_err(|e| format!("admit: reset lane {slot}: {e}"))?;
+    cell.state.row_capture_armed = false;
+    match (store_has_spec, cell.spec.as_mut()) {
+        (true, Some(spec)) => spec
+            .reset_into(gpu, batch)
+            .map_err(|e| format!("admit: reset lane {slot}: {e}")),
+        (false, None) => Ok(()),
+        _ => Err(format!(
+            "admit: lane {slot} spec state does not match the store"
+        )),
+    }
 }
 
 /// One admitted request's whole device state.
@@ -2672,21 +2705,16 @@ impl Qwen4LaneStore {
                 };
                 match existing {
                     Some(cell) => {
-                        cell.state
-                            .reset(gpu)
-                            .map_err(|e| format!("admit: reset lane {slot}: {e}"))?;
-                        cell.state.row_capture_armed = false;
-                        match (spec_cfg, cell.spec.as_mut()) {
-                            (Some(_), Some(spec)) => spec
-                                .reset(gpu)
-                                .map_err(|e| format!("admit: reset lane {slot}: {e}"))?,
-                            (None, None) => {}
-                            _ => {
-                                return Err(format!(
-                                    "admit: lane {slot} spec state does not match the store"
-                                ));
-                            }
-                        }
+                        // Trunk state, MTP head and pending hidden zero under ONE
+                        // stream wait (paid also when a reset fails part-way).
+                        let mut batch = MemsetBatch::default();
+                        let reset =
+                            reset_cell_into(gpu, cell, spec_cfg.is_some(), slot, &mut batch);
+                        let synced = gpu
+                            .memset_batch_sync(&mut batch)
+                            .map_err(|e| format!("admit: reset lane {slot}: {e}"));
+                        reset?;
+                        synced?;
                         Ok(None)
                     }
                     None => new_payload(gpu, bundle, slot, ring_rows, spec_cfg).map(Some),
