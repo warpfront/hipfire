@@ -240,7 +240,10 @@ fn validate_image(image: &KernelImage) -> Result<(), String> {
         return fail(format!(".symbol {} is not {name}.kd", meta.symbol));
     }
     if meta.name != *name {
-        return fail(format!(".name {} differs from the kernel symbol", meta.name));
+        return fail(format!(
+            ".name {} differs from the kernel symbol",
+            meta.name
+        ));
     }
     if meta.private_segment_fixed_size != kd.private_segment_fixed_size {
         return fail(format!(

@@ -341,17 +341,25 @@ fn gemm_bf16_mfma_trunk(gpu: &mut Gpu) -> Result<String, String> {
                 ] {
                     let got = run_rows16_fused(gpu, &w, xin, m, k, n, dt)?;
                     if &got != want {
-                        let diff = got.chunks(dt.size()).zip(want.chunks(dt.size()))
-                            .filter(|(a, b)| a != b).count();
+                        let diff = got
+                            .chunks(dt.size())
+                            .zip(want.chunks(dt.size()))
+                            .filter(|(a, b)| a != b)
+                            .count();
                         fused_bad.push(format!("rows={n} {xname} {oname}: {diff} elements differ"));
                     }
                 }
             }
         }
         results.push(if few_bad.is_empty() {
-            Ok(format!("{label} few-row entry == tile entry bitwise at rows {FEW_ROWS:?}"))
+            Ok(format!(
+                "{label} few-row entry == tile entry bitwise at rows {FEW_ROWS:?}"
+            ))
         } else {
-            Err(format!("{label} few-row entry != tile entry: {}", few_bad.join("; ")))
+            Err(format!(
+                "{label} few-row entry != tile entry: {}",
+                few_bad.join("; ")
+            ))
         });
         results.push(if fused_bad.is_empty() {
             Ok(format!(
@@ -419,8 +427,15 @@ fn gemm_bf16_mfma_rows16_group(gpu: &mut Gpu) -> Result<String, String> {
             ys.push(gpu.alloc_tensor(&[n * m], dt).map_err(e)?);
         }
         let x = x32.sub_offset(0, n * k);
-        let members: Vec<_> = ws.iter().zip(&ys).zip(&ms).map(|((w, y), &m)| (&w.buf, y, m)).collect();
-        let ran = gpu.gemm_bf16_mfma_gfx942_rows16(&x, &members, k, n).map_err(e)?;
+        let members: Vec<_> = ws
+            .iter()
+            .zip(&ys)
+            .zip(&ms)
+            .map(|((w, y), &m)| (&w.buf, y, m))
+            .collect();
+        let ran = gpu
+            .gemm_bf16_mfma_gfx942_rows16(&x, &members, k, n)
+            .map_err(e)?;
         if !ran {
             return Err(format!("group launch declined at rows={n}"));
         }
@@ -431,17 +446,27 @@ fn gemm_bf16_mfma_rows16_group(gpu: &mut Gpu) -> Result<String, String> {
             let want: Vec<u8> = if dts[j] == DType::F32 {
                 want.iter().flat_map(|v| v.to_le_bytes()).collect()
             } else {
-                want.iter().flat_map(|&v| f32_to_bf16_bits(v).to_le_bytes()).collect()
+                want.iter()
+                    .flat_map(|&v| f32_to_bf16_bits(v).to_le_bytes())
+                    .collect()
             };
             let got = down_bytes(gpu, y)?;
             if got != want {
-                let diff = got.chunks(dts[j].size()).zip(want.chunks(dts[j].size()))
-                    .filter(|(a, b)| a != b).count();
-                bad.push(format!("member {j} [{m}x{k} {:?}]: {diff} elements differ", dts[j]));
+                let diff = got
+                    .chunks(dts[j].size())
+                    .zip(want.chunks(dts[j].size()))
+                    .filter(|(a, b)| a != b)
+                    .count();
+                bad.push(format!(
+                    "member {j} [{m}x{k} {:?}]: {diff} elements differ",
+                    dts[j]
+                ));
             }
         }
         results.push(if bad.is_empty() {
-            Ok(format!("gdn_in group rows={n}: 4 members == staged tile GEMM bitwise"))
+            Ok(format!(
+                "gdn_in group rows={n}: 4 members == staged tile GEMM bitwise"
+            ))
         } else {
             Err(format!("gdn_in group rows={n}: {}", bad.join("; ")))
         });

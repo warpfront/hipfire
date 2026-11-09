@@ -527,12 +527,18 @@ impl World {
                 .map
                 .get(name.as_str())
                 .filter(|b| b.len() == 1)
-                .ok_or_else(|| format!("iterated array `{name}` must have exactly one declaration"))?;
+                .ok_or_else(|| {
+                    format!("iterated array `{name}` must have exactly one declaration")
+                })?;
             let init = &bindings[0].init;
             if init.len() != 1 || !init[0].is_g('[') {
-                return Err(format!("iterated array `{name}` is not an array literal or `[x; N]`"));
+                return Err(format!(
+                    "iterated array `{name}` is not an array literal or `[x; N]`"
+                ));
             }
-            let count = self.array_elems_in(init[0].group().unwrap(), ctx.file)?.len();
+            let count = self
+                .array_elems_in(init[0].group().unwrap(), ctx.file)?
+                .len();
             for idx in 0..count {
                 out.push(Some(vec![
                     Tt::Id(name.clone(), 0),

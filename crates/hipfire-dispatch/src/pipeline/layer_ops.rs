@@ -1297,7 +1297,13 @@ fn project_g942_mfma(
         let launch: SmallVec<[_; 4]> = members
             .iter()
             .enumerate()
-            .map(|(i, &j)| (&projections[j].0.buf.buf, &outputs[base + i], projections[j].0.m))
+            .map(|(i, &j)| {
+                (
+                    &projections[j].0.buf.buf,
+                    &outputs[base + i],
+                    projections[j].0.m,
+                )
+            })
             .collect();
         if hip(gpu.gemm_bf16_mfma_gfx942_rows16(&x, &launch, k, rows))? {
             fused[base..base + members.len()].fill(true);

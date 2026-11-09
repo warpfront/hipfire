@@ -26,11 +26,13 @@ pub const GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS: usize = 4;
 /// `gemm_bf16_mfma_gfx942_rows16`: 1..=16 batch rows, `K % 8 == 0` (every
 /// row starts on a 16-byte boundary) and 16-byte aligned weight and activation
 /// bases (the entry's 16-byte loads).
-fn gemm_bf16_mfma_rows16_admits(a: *const c_void, x: *const c_void, k: usize, batch: usize) -> bool {
-    (1..=16).contains(&batch)
-        && k % 8 == 0
-        && (a as usize) % 16 == 0
-        && (x as usize) % 16 == 0
+fn gemm_bf16_mfma_rows16_admits(
+    a: *const c_void,
+    x: *const c_void,
+    k: usize,
+    batch: usize,
+) -> bool {
+    (1..=16).contains(&batch) && k % 8 == 0 && (a as usize) % 16 == 0 && (x as usize) % 16 == 0
 }
 
 /// Most activation rows one `gemm_q8_0_batched` kernel launch takes: the

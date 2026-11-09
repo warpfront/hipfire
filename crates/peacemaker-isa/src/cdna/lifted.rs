@@ -89,7 +89,11 @@ pub fn certify_stream(name: &str, instructions: &[Typed]) -> Result<Value, Strin
                 .cloned()
                 .collect::<Vec<_>>()
                 .join(" | "),
-            if violations.len() > SHOWN { " | ..." } else { "" }
+            if violations.len() > SHOWN {
+                " | ..."
+            } else {
+                ""
+            }
         ));
     }
 
@@ -291,8 +295,9 @@ fn ledger_program(name: &str, insts: &[Inst], cfg: &Cfg) -> Result<(Program, Cou
 }
 
 fn convert(inst: &Inst, branch: Option<usize>, counts: &mut Counts) -> Result<Instruction, String> {
-    let control =
-        |text: String| -> Result<Instruction, String> { Ok(Instruction::new(text, vec![], vec![])) };
+    let control = |text: String| -> Result<Instruction, String> {
+        Ok(Instruction::new(text, vec![], vec![]))
+    };
     if let Inst::Sopp(p) = inst {
         if let Some(target) = branch {
             counts.branches += 1;
@@ -309,7 +314,9 @@ fn convert(inst: &Inst, branch: Option<usize>, counts: &mut Counts) -> Result<In
                 if lgkm != 0 && lgkm < caps.lgkmcnt_max {
                     counts.lgkm_partial += 1;
                 }
-                control(format!("s_waitcnt vmcnt({vm}) expcnt({exp}) lgkmcnt({lgkm})"))
+                control(format!(
+                    "s_waitcnt vmcnt({vm}) expcnt({exp}) lgkmcnt({lgkm})"
+                ))
             }
             SoppOp::Barrier => {
                 counts.barriers += 1;
@@ -355,7 +362,12 @@ fn convert(inst: &Inst, branch: Option<usize>, counts: &mut Counts) -> Result<In
     if let Some(bad) = footprint.uses.iter().find(|u| {
         !matches!(
             u.file,
-            RegFile::Sgpr | RegFile::Vgpr | RegFile::Exec | RegFile::M0 | RegFile::Scc | RegFile::Vcc
+            RegFile::Sgpr
+                | RegFile::Vgpr
+                | RegFile::Exec
+                | RegFile::M0
+                | RegFile::Scc
+                | RegFile::Vcc
         )
     }) {
         return Err(format!(

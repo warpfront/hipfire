@@ -159,19 +159,28 @@ fn device_elf(input: &[u8], arch: Arch) -> Result<&[u8], String> {
     }
     let (bundle, payloads) = Bundle::read(input).map_err(|e| format!("bundle: {e}"))?;
     let idx = if arch == Arch::Gfx942 {
-        let triple = format!("{}gfx942", peacemaker_lift::bundle::HIP_DEVICE_TRIPLE_PREFIX);
+        let triple = format!(
+            "{}gfx942",
+            peacemaker_lift::bundle::HIP_DEVICE_TRIPLE_PREFIX
+        );
         let mut matches = bundle.entries.iter().enumerate().filter(|(_, entry)| {
             entry.triple == triple
-                || entry.triple.strip_prefix(&triple).is_some_and(|suffix| suffix.starts_with(':'))
+                || entry
+                    .triple
+                    .strip_prefix(&triple)
+                    .is_some_and(|suffix| suffix.starts_with(':'))
         });
-        let idx = matches.next().map(|(idx, _)| idx)
+        let idx = matches
+            .next()
+            .map(|(idx, _)| idx)
             .ok_or("bundle has no gfx942 device entry")?;
         if matches.next().is_some() {
             return Err("bundle has multiple gfx942 device entries".into());
         }
         idx
     } else {
-        bundle.device_entry(ir_arch(arch)?)
+        bundle
+            .device_entry(ir_arch(arch)?)
             .map_err(|e| format!("bundle has no {} device entry: {e}", arch.name()))?
     };
     Ok(payloads[idx])
@@ -391,23 +400,26 @@ pub fn seal(
 
 /// Route A for the typed CDNA model. The existing ELF envelope codec rebuilds
 /// descriptors and metadata as well as every kernel's re-encoded instructions.
-fn seal_cdna(
-    input: &[u8],
-    symbol: &str,
-    abi_ref: Option<(&[u8], &str)>,
-) -> Result<Sealed, String> {
+fn seal_cdna(input: &[u8], symbol: &str, abi_ref: Option<(&[u8], &str)>) -> Result<Sealed, String> {
     let arch = Arch::Gfx942;
     let elf = device_elf(input, arch)?;
-    let lifted = peacemaker_lift::cdna::lift_object(elf)
-        .map_err(|e| format!("CDNA lift: {e}"))?;
-    let emitted = peacemaker_lift::cdna::checked(&lifted)
-        .map_err(|e| format!("CDNA emit::checked: {e}"))?;
+    let lifted = peacemaker_lift::cdna::lift_object(elf).map_err(|e| format!("CDNA lift: {e}"))?;
+    let emitted =
+        peacemaker_lift::cdna::checked(&lifted).map_err(|e| format!("CDNA emit::checked: {e}"))?;
     if emitted != elf {
-        let at = emitted.iter().zip(elf).position(|(a, b)| a != b)
+        let at = emitted
+            .iter()
+            .zip(elf)
+            .position(|(a, b)| a != b)
             .unwrap_or(emitted.len().min(elf.len()));
-        return Err(format!("CDNA re-emitted ELF differs from input at byte offset {at:#x}"));
+        return Err(format!(
+            "CDNA re-emitted ELF differs from input at byte offset {at:#x}"
+        ));
     }
-    let kernel = lifted.kernels.iter().find(|k| k.image.name == symbol)
+    let kernel = lifted
+        .kernels
+        .iter()
+        .find(|k| k.image.name == symbol)
         .ok_or_else(|| format!("kernel `{symbol}` not found in CDNA object"))?;
     let desc = &kernel.image.descriptor;
     let meta = &kernel.image.metadata.parsed;
@@ -419,10 +431,15 @@ fn seal_cdna(
         let inc_elf = device_elf(inc_bytes, arch)?;
         let inc = peacemaker_lift::cdna::lift_object(inc_elf)
             .map_err(|e| format!("CDNA lift abi-ref: {e}"))?;
-        let inc_k = inc.kernels.iter().find(|k| k.image.name == inc_sym)
+        let inc_k = inc
+            .kernels
+            .iter()
+            .find(|k| k.image.name == inc_sym)
             .ok_or_else(|| format!("abi-ref kernel `{inc_sym}` not found"))?;
         if let Some(diff) = abi_diff(meta, &inc_k.image.metadata.parsed) {
-            return Err(format!("kernarg ABI mismatch vs incumbent `{inc_sym}`: {diff}"));
+            return Err(format!(
+                "kernarg ABI mismatch vs incumbent `{inc_sym}`: {diff}"
+            ));
         }
         abi["compared_to_incumbent"] = json!(true);
         abi["incumbent_symbol"] = json!(inc_sym);
@@ -430,7 +447,9 @@ fn seal_cdna(
     }
     let mut words = Vec::with_capacity(kernel.image.code.len() / 4);
     for instruction in &kernel.instructions {
-        instruction.inst.encode(peacemaker_cdna::Arch::Gfx942, &mut words)?;
+        instruction
+            .inst
+            .encode(peacemaker_cdna::Arch::Gfx942, &mut words)?;
     }
     let text: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
     if text != kernel.image.code {

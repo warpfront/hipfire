@@ -133,7 +133,8 @@ fn expand_obj(s: &str, defs: &BTreeMap<String, Def>, depth: u32) -> Result<Strin
                 // kernels would vanish from the declared-ABI index. Any other
                 // function-like macro is left as written (it cannot declare an entry).
                 Some(Def::Func { params, body }) if body.contains("__global__") => {
-                    let (expanded, after) = expand_kernel_macro(&w, params, body, &c, j, defs, depth)?;
+                    let (expanded, after) =
+                        expand_kernel_macro(&w, params, body, &c, j, defs, depth)?;
                     out.push_str(&expanded);
                     next = after;
                 }
@@ -158,9 +159,9 @@ fn expand_obj(s: &str, defs: &BTreeMap<String, Def>, depth: u32) -> Result<Strin
 
 /// Parses the `(PARAMS) BODY` text after the name of a function-like `#define`.
 fn parse_func_macro(after_name: &str) -> Result<Def, String> {
-    let close = after_name.find(')').ok_or_else(|| {
-        format!("unterminated function-like macro parameter list {after_name:?}")
-    })?;
+    let close = after_name
+        .find(')')
+        .ok_or_else(|| format!("unterminated function-like macro parameter list {after_name:?}"))?;
     let params: Vec<String> = after_name[1..close]
         .split(',')
         .map(|p| p.trim().to_string())

@@ -27,7 +27,12 @@ fn anchor() -> Vec<u8> {
         .filter(|(_, e)| e.triple == exact || e.triple.starts_with(&format!("{exact}:")))
         .map(|(i, _)| i)
         .collect();
-    assert_eq!(hits.len(), 1, "exactly one gfx942 device entry: {:?}", bundle.entries);
+    assert_eq!(
+        hits.len(),
+        1,
+        "exactly one gfx942 device entry: {:?}",
+        bundle.entries
+    );
     payloads[hits[0]].to_vec()
 }
 
@@ -126,7 +131,10 @@ fn indirect_jump_is_rejected() {
         },
     );
     let err = checked(&lifted).unwrap_err();
-    assert!(err.contains("s_setpc_b64") || err.contains("indirect"), "{err}");
+    assert!(
+        err.contains("s_setpc_b64") || err.contains("indirect"),
+        "{err}"
+    );
 }
 
 #[test]

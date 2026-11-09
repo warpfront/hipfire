@@ -3609,12 +3609,21 @@ fn gemm_bf16_mfma_launchers_check_against_the_hip_source_declarations() {
         assert_eq!(d.args.len(), 17, "{n}");
         assert_eq!(d.end, 104, "{n}");
         assert_eq!(d.args.iter().filter(|a| a.kind == 'p').count(), 9, "{n}");
-        assert!(d.args[..9].iter().all(|a| a.kind == 'p' && a.size == 8), "{n}");
-        assert!(d.args[9..].iter().all(|a| a.kind == 'i' && a.size == 4), "{n}");
+        assert!(
+            d.args[..9].iter().all(|a| a.kind == 'p' && a.size == 8),
+            "{n}"
+        );
+        assert!(
+            d.args[9..].iter().all(|a| a.kind == 'i' && a.size == 4),
+            "{n}"
+        );
         assert_eq!(d.args[9].offset, 72, "{n}");
     }
     assert!(
-        hip::same_layout(&decls[GEMM_BF16_MFMA_ROWS16], &decls[GEMM_BF16_MFMA_ROWS16_X2]),
+        hip::same_layout(
+            &decls[GEMM_BF16_MFMA_ROWS16],
+            &decls[GEMM_BF16_MFMA_ROWS16_X2]
+        ),
         "rows16 and rows16_x2 share one ABI"
     );
     assert_eq!(decls[GEMM_BF16_MFMA_TILED].args.len(), 6);
@@ -3712,7 +3721,9 @@ fn non_production_pm_twins_match_the_hip_declarations() {
         let all_hip: Vec<String> = hip.keys().cloned().collect();
         let want: BTreeSet<String> = all_hip.iter().cloned().collect();
         if got != want {
-            problems.push(format!("{image}: exports {got:?}, the HIP source declares {want:?}"));
+            problems.push(format!(
+                "{image}: exports {got:?}, the HIP source declares {want:?}"
+            ));
         }
         for s in &symbols {
             if !want.contains(s) {
@@ -3773,7 +3784,10 @@ fn negative_pm_twin_parity_rejects_layout_name_extent_and_export_drift() {
     assert!(!run(resized).is_empty(), "a resized argument must fail");
     let mut scalar = twin_kernel(&hip["k"], &names);
     scalar.decl.args[0].kind = 'v';
-    assert!(!run(scalar).is_empty(), "a pointer declared by value must fail");
+    assert!(
+        !run(scalar).is_empty(),
+        "a pointer declared by value must fail"
+    );
     let mut shifted = twin_kernel(&hip["k"], &names);
     shifted.decl.args[2].offset += 4;
     assert!(!run(shifted).is_empty(), "a shifted argument must fail");
@@ -3789,7 +3803,10 @@ fn negative_pm_twin_parity_rejects_layout_name_extent_and_export_drift() {
     assert!(!run(short).is_empty(), "a short kernarg segment must fail");
     let mut hidden = twin_kernel(&hip["k"], &names);
     hidden.hidden_start = Some(8);
-    assert!(!run(hidden).is_empty(), "a hidden argument inside the explicit bytes must fail");
+    assert!(
+        !run(hidden).is_empty(),
+        "a hidden argument inside the explicit bytes must fail"
+    );
     assert!(
         !twin_problems("twin", &BTreeMap::new(), &hip, &symbols).is_empty(),
         "a missing export must fail"
@@ -3896,7 +3913,10 @@ fn repeat_arrays_and_chain_loops_are_traced_per_element_and_fail_closed() {
     for bad in [
         // Element class of a repeat array is the class of its initialiser.
         source.replace("[0i32; MAX]", "[0u64; MAX]"),
-        source.replace("let mut dims = [0i32; MAX];", "let mut dims = [0.0f32; MAX];"),
+        source.replace(
+            "let mut dims = [0i32; MAX];",
+            "let mut dims = [0.0f32; MAX];",
+        ),
         // Unsuffixed or unknown initialisers have no provable ABI class.
         source.replace("[0i32; MAX]", "[0; MAX]"),
         source.replace("[0i32; MAX]", "[make_default(); MAX]"),
@@ -3907,15 +3927,24 @@ fn repeat_arrays_and_chain_loops_are_traced_per_element_and_fail_closed() {
         // Iterator adapters could reorder or drop elements.
         source.replace("ptrs.iter().chain", "ptrs.iter().rev().chain"),
         source.replace("more.iter())", "more.iter().skip(1))"),
-        source.replace("for p in ptrs.iter().chain(more.iter())", "for p in ptrs.iter().zip(more.iter())"),
+        source.replace(
+            "for p in ptrs.iter().chain(more.iter())",
+            "for p in ptrs.iter().zip(more.iter())",
+        ),
         // The pushed class must match the params entry's element class.
         source.replace("b.push_ptr(*p);", "b.push_i32(*p);"),
-        source.replace("for n in dims { b.push_i32(n); }", "for n in dims { b.push_u64(n); }"),
+        source.replace(
+            "for n in dims { b.push_i32(n); }",
+            "for n in dims { b.push_u64(n); }",
+        ),
         // The params mapping must read the array the blob pushes.
         source.replace("params.extend(more.iter()", "params.extend(ptrs.iter()"),
         source.replace("params.extend(dims.iter()", "params.extend(ptrs.iter()"),
         // A literal array is still never accepted as mutable; shadowing is refused.
-        source.replace("let mut dims = [0i32; MAX];", "let mut dims = [1i32, 2i32];"),
+        source.replace(
+            "let mut dims = [0i32; MAX];",
+            "let mut dims = [1i32, 2i32];",
+        ),
         source.replace(
             "        self.launch_maybe_blob",
             "        let dims = [9i32, 11i32];\n        self.launch_maybe_blob",

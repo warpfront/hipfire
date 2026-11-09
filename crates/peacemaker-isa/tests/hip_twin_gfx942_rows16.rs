@@ -91,10 +91,16 @@ fn manifest_records_source_and_artifact_hashes() {
         "gemm_bf16_mfma.gfx942.hip changed since the twin was generated; rerun scripts/pm-gfx942-rows16-twin.py"
     );
     assert_eq!(n(&m, &["source", "bytes"]), SOURCE.len() as u64);
-    assert_eq!(s(&m, &["anchor", "file"]), "gemm_bf16_mfma_gfx942_rows16_hipcc_gfx942.co");
+    assert_eq!(
+        s(&m, &["anchor", "file"]),
+        "gemm_bf16_mfma_gfx942_rows16_hipcc_gfx942.co"
+    );
     assert_eq!(s(&m, &["anchor", "sha256"]), hex(ANCHOR));
     assert_eq!(n(&m, &["anchor", "bytes"]), ANCHOR.len() as u64);
-    assert_eq!(s(&m, &["hxaco", "file"]), "gemm_bf16_mfma_gfx942_rows16_pm_gfx942.hxaco");
+    assert_eq!(
+        s(&m, &["hxaco", "file"]),
+        "gemm_bf16_mfma_gfx942_rows16_pm_gfx942.hxaco"
+    );
     assert_eq!(s(&m, &["hxaco", "sha256"]), hex(HXACO));
     assert_eq!(n(&m, &["hxaco", "bytes"]), HXACO.len() as u64);
     assert_eq!(SHA_FILE.trim(), hex(HXACO), ".sha256 file");
@@ -141,7 +147,8 @@ fn manifest_flags_are_the_portable_core_recipe() {
 #[test]
 fn anchor_and_sealed_twin_are_the_same_elf_and_text() {
     let m = manifest();
-    let from_anchor = seal_many(ANCHOR, arch(), &specs()).unwrap_or_else(|e| panic!("seal_many: {e}"));
+    let from_anchor =
+        seal_many(ANCHOR, arch(), &specs()).unwrap_or_else(|e| panic!("seal_many: {e}"));
     let from_twin = verify_hxaco_many(HXACO, arch(), &SYMBOLS)
         .unwrap_or_else(|e| panic!("verify_hxaco_many: {e}"));
     assert_eq!(from_anchor.len(), SYMBOLS.len());
@@ -169,8 +176,7 @@ fn anchor_and_sealed_twin_are_the_same_elf_and_text() {
         assert_eq!(r["scratch"], t.scratch, "{symbol}");
         assert_eq!(r["wavefront_size"], 64, "{symbol}");
         assert_eq!(
-            r["lift_identity"],
-            "emit::checked ok; emitted bytes == input ELF",
+            r["lift_identity"], "emit::checked ok; emitted bytes == input ELF",
             "{symbol}"
         );
     }
@@ -186,10 +192,16 @@ fn gfx942_checked_evidence_is_recorded_and_reproduced() {
     let fresh = verify_hxaco_many(HXACO, arch(), &SYMBOLS).expect("verify");
     for (i, symbol) in SYMBOLS.iter().enumerate() {
         let r = &reports[i];
-        assert_eq!(r["hazards"]["checked"], true, "{symbol}: hazards not checked");
+        assert_eq!(
+            r["hazards"]["checked"], true,
+            "{symbol}: hazards not checked"
+        );
         assert_eq!(r["hazards"]["blocking"], 0, "{symbol}");
         assert_eq!(fresh[i].report["hazards"], r["hazards"], "{symbol}");
-        assert_eq!(fresh[i].report["lift_identity"], r["lift_identity"], "{symbol}");
+        assert_eq!(
+            fresh[i].report["lift_identity"], r["lift_identity"],
+            "{symbol}"
+        );
         assert_eq!(fresh[i].report["abi"], r["abi"], "{symbol}");
     }
 }
@@ -208,13 +220,21 @@ fn gpu_oracle_receipt_is_full_and_bound_to_these_images() {
     assert_eq!(receipt["results"]["raw_outputs_hipcc_equals_tiled"], true);
     assert_eq!(receipt["results"]["raw_outputs_pm_equals_tiled"], true);
     assert_eq!(receipt["results"]["all_checks_pass"], true);
-    assert_eq!(receipt["tiled_comparison"]["kernel"], "gemm_bf16_mfma_gfx942");
+    assert_eq!(
+        receipt["tiled_comparison"]["kernel"],
+        "gemm_bf16_mfma_gfx942"
+    );
     assert_eq!(receipt["tiled_comparison"]["cases_hipcc_ne_tiled"], 0);
     assert_eq!(receipt["tiled_comparison"]["cases_pm_ne_tiled"], 0);
     assert!(receipt["case_count"].as_u64().expect("case_count") > 0);
     assert_eq!(receipt["rows"], serde_json::json!([1, 7, 8, 9, 16]));
     for symbol in SYMBOLS {
-        assert!(receipt["cases_by_kernel"][symbol].as_u64().expect("kernel cases") > 0);
+        assert!(
+            receipt["cases_by_kernel"][symbol]
+                .as_u64()
+                .expect("kernel cases")
+                > 0
+        );
     }
     let seal = &m["seal"]["reports"][0];
     assert_eq!(receipt["pm_device_elf_sha256"], seal["elf_sha256"]);
