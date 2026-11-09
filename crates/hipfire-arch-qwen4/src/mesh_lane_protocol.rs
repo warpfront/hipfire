@@ -61,8 +61,8 @@ use crate::mesh_lane_copy::{
     head_outcome, CopyLane, CopyPool, CopyProposal, CopyShadow, HeadWindow,
 };
 use crate::mtp_lanes::{
-    lane_cost_trace_enabled, step_trace_line, LaneCostModel, LaneCostProfile, LaneSpecPolicy,
-    RouteTraceCtx,
+    lane_cost_trace_enabled, step_trace_line, LaneCostModel, LaneCostProfile, LaneDepthCost,
+    LaneSpecPolicy, RouteTraceCtx,
 };
 use crate::mtp_spec::{target_commit_accept_len, HeadLag, NGRAM_DEPTHS};
 use crate::sampled_lane::{DraftRead, LaneRng, RowHandle};
@@ -1883,6 +1883,7 @@ struct StepState {
     start: WindowStart,
     phase: StepPhase,
     staged_cost: LaneCostModel,
+    staged_depth_cost: LaneDepthCost,
     staged: Vec<StagedLane>,
     obs_applied: bool,
     obs_dropped: bool,
@@ -1920,6 +1921,13 @@ pub struct MeshRoot {
     next_lane_generation: u64,
     step_seq: u64,
     cost: LaneCostModel,
+    /// The store-pooled measured depth cost ([`LaneDepthCost`]) the gfx1201
+    /// profile prices EP lane draft depths with; observed on every priced
+    /// step beside `cost`.
+    depth_cost: LaneDepthCost,
+    /// Whether lane routes are priced by `depth_cost`
+    /// ([`LaneCostProfile::measured_depth`], read once at [`Self::bind_cost_arch`]).
+    measured_depth: bool,
     /// The lane cost profile of the loaded arch ([`Self::bind_cost_arch`]);
     /// every lane admitted afterwards carries it.
     profile: LaneCostProfile,
@@ -1974,6 +1982,8 @@ impl MeshRoot {
             next_lane_generation: 1,
             step_seq: 0,
             cost: LaneCostModel::new(),
+            depth_cost: LaneDepthCost::new(),
+            measured_depth: false,
             profile: LaneCostProfile::LEGACY,
             profile_bound: false,
             pending_obs: None,
@@ -2003,8 +2013,10 @@ impl MeshRoot {
         }
         self.profile_bound = true;
         self.profile = LaneCostProfile::for_arch(arch);
+        self.measured_depth = self.profile.measured_depth();
         if self.step_seq == 0 && self.lanes.is_empty() {
             self.cost = LaneCostModel::with_prior(self.profile.prior_us());
+            self.depth_cost = LaneDepthCost::new();
         }
     }
 
@@ -2088,6 +2100,12 @@ impl MeshRoot {
     ) -> Option<(u64, (f64, f64, f64, f64))> {
         let cost = self.lanes.get(&epoch)?.policy.as_ref()?.own_cost()?;
         Some((cost.observed(), cost.fit()))
+    }
+
+    /// The measured depth cost's `(F, a, r, q)` fit, for tests.
+    #[cfg(test)]
+    pub(crate) fn depth_cost_fit(&self) -> (f64, f64, f64, f64) {
+        self.depth_cost.fit()
     }
 
     /// Replace a lane's policy (tests: a promoted, floor-retired lane).
@@ -2506,6 +2524,7 @@ impl MeshRoot {
 
         // Stage: evidence first, then routes (all on clones).
         let mut staged_cost = self.cost.clone();
+        let mut staged_depth_cost = self.depth_cost.clone();
         let mut staged_warm = self.copy_warm;
         let mut staged: HashMap<RequestEpoch, StagedLane> = HashMap::new();
         for r in requests {
@@ -2532,11 +2551,26 @@ impl MeshRoot {
             match prior_evidence {
                 Some(m) => {
                     applied = true;
-                    apply_evidence(&mut staged_cost, &mut staged, &mut staged_warm, p, m);
+                    apply_evidence(
+                        &mut staged_cost,
+                        &mut staged_depth_cost,
+                        &mut staged,
+                        &mut staged_warm,
+                        p,
+                        m,
+                    );
                 }
                 None => dropped = true,
             }
         }
+
+        // The window price of every depth at this step's lane count, once per
+        // step (the lane loop reads it for each lane): only under the gfx1201
+        // profile with the measured-depth switch on.
+        let depth_costs = self
+            .measured_depth
+            .then(|| staged_depth_cost.window_costs(requests.len()));
+        let depth_costs = depth_costs.as_ref().map(|c| c.as_slice());
 
         let mut plans: Vec<LanePlan> = Vec::with_capacity(requests.len());
         let mut total_rows = 0usize;
@@ -2617,7 +2651,7 @@ impl MeshRoot {
             } else if let Some(policy) = sl.policy.as_mut() {
                 let budget = max_drafts.min(policy.max_k());
                 plan.budget = budget;
-                let route = policy.route(max_drafts, budgets.lab);
+                let route = policy.route(max_drafts, budgets.lab, depth_costs);
                 if lane_cost_trace_enabled() {
                     policy.trace_route(
                         &RouteTraceCtx {
@@ -2628,6 +2662,8 @@ impl MeshRoot {
                             lanes: requests.len(),
                         },
                         &self.cost,
+                        &staged_depth_cost,
+                        depth_costs,
                         max_drafts,
                         budgets.lab,
                         route,
@@ -2781,6 +2817,7 @@ impl MeshRoot {
             start: start.clone(),
             phase: StepPhase::Planned,
             staged_cost,
+            staged_depth_cost,
             staged: staged_vec,
             obs_applied: applied,
             obs_dropped: dropped,
@@ -3885,6 +3922,7 @@ impl MeshRoot {
         let decision = s.decision.expect("prepared");
         let mut out = Vec::with_capacity(decision.lanes.len());
         self.cost = s.staged_cost;
+        self.depth_cost = s.staged_depth_cost;
         self.copy_warm = s.staged_copy_warm;
         if s.obs_applied {
             self.counters.observations_applied += 1;
@@ -4111,6 +4149,8 @@ impl MeshRoot {
         if m.priced {
             self.cost
                 .observe(p.decode_lanes, p.spill, p.verified, m.wall_us as f32);
+            self.depth_cost
+                .observe(p.decode_lanes, p.verified, m.wall_us as f32);
         }
         if lane_cost_trace_enabled() {
             eprintln!(
@@ -4331,6 +4371,7 @@ pub enum CancelOutcome {
 /// retired.
 fn apply_evidence(
     cost: &mut LaneCostModel,
+    depth_cost: &mut LaneDepthCost,
     staged: &mut HashMap<RequestEpoch, StagedLane>,
     warm: &mut u64,
     p: &PendingObservation,
@@ -4338,6 +4379,7 @@ fn apply_evidence(
 ) {
     if m.priced {
         cost.observe(p.decode_lanes, p.spill, p.verified, m.wall_us as f32);
+        depth_cost.observe(p.decode_lanes, p.verified, m.wall_us as f32);
     }
     if lane_cost_trace_enabled() {
         eprintln!(
@@ -7081,6 +7123,80 @@ mod tests {
             Some((0, (prior[0], prior[1], prior[2], prior[3]))),
             "the idle lane's fit is untouched"
         );
+    }
+
+    #[test]
+    fn mesh_lane_protocol_gfx1201_floor_off_lanes_price_their_depth_by_the_measured_cost() {
+        // a1 = a2 = ... = 0.5: the gfx1151 table prices every depth above its
+        // AR row (an AR window); the measured R9700 cost drafts.
+        let agreement = [(4.0f32, 8.0f32); 5];
+        let route_of = |measured: bool, profile: &str| -> LaneRoute {
+            let mut m = Mesh::new(MeshKind::Ep, false);
+            m.root.bind_cost_arch(profile);
+            m.root.measured_depth = measured;
+            let e = m.admit(1, 10, 7, None, Some(5));
+            m.root.test_set_policy(
+                e,
+                LaneSpecPolicy::promoted_with_profile(
+                    5,
+                    &agreement,
+                    false,
+                    false,
+                    &LaneCostProfile::for_arch(profile),
+                ),
+            );
+            let start = m
+                .s_plan(None, &[req(1, 99)], &budgets(LabRoutes::Floor, 5))
+                .unwrap();
+            start.lanes[0].route
+        };
+        assert_eq!(route_of(false, "gfx1201"), LaneRoute::ArSynced);
+        assert!(matches!(
+            route_of(true, "gfx1201"),
+            LaneRoute::Batched { .. }
+        ));
+        // The legacy profile never prices by the measured cost.
+        let legacy = Mesh::new(MeshKind::Ep, false);
+        assert!(!legacy.root.measured_depth);
+        let mut bound = Mesh::new(MeshKind::Ep, false);
+        bound.root.bind_cost_arch("gfx1151");
+        assert!(!bound.root.measured_depth);
+    }
+
+    #[test]
+    fn mesh_lane_protocol_depth_cost_trains_with_the_committed_step_only() {
+        let b = budgets(LabRoutes::Floor, 3);
+        let prior = crate::mtp_lanes::LaneDepthCost::new().fit();
+        let mut m = Mesh::new(MeshKind::Ep, true);
+        m.root.bind_cost_arch("gfx1201");
+        m.admit(1, 10, 7, None, Some(3));
+        for s in 0..8 {
+            script_matching(&m, 1, s, 8);
+        }
+        let reqs = [req(1, 999)];
+        let (_, out) = m.step_p(None, &reqs, &b);
+        let evidence = m.merged(&out);
+        assert_eq!(m.root.depth_cost_fit(), prior, "pending, not yet settled");
+        // The next plan stages the evidence: nothing is trained until the
+        // step commits.
+        m.s_plan(Some(&evidence), &reqs, &b).unwrap();
+        assert_eq!(m.root.depth_cost_fit(), prior, "staged only");
+        m.s_ready().unwrap();
+        m.s_draft().unwrap();
+        m.s_verify().unwrap();
+        m.s_decide(&mut GreedyRule).unwrap();
+        m.s_prepare().unwrap();
+        m.s_publish();
+        assert_ne!(m.root.depth_cost_fit(), prior, "committed with the step");
+        // The settle path trains it too.
+        let mut settled = Mesh::new(MeshKind::Ep, true);
+        settled.root.bind_cost_arch("gfx1201");
+        settled.admit(1, 10, 7, None, Some(3));
+        for s in 0..8 {
+            script_matching(&settled, 1, s, 8);
+        }
+        priced_steps(&mut settled, &[1], 1, &b);
+        assert_ne!(settled.root.depth_cost_fit(), prior);
     }
 
     #[test]

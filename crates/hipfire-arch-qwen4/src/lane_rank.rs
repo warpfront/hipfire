@@ -1315,7 +1315,7 @@ mod tests {
                     .policies
                     .entry(tag)
                     .or_insert_with(|| LaneSpecPolicy::with_floor(K, true));
-                let route = policy.route(budget, self.lab);
+                let route = policy.route(budget, self.lab, None);
                 let s = &script.windows[&(tag, seq[&tag])];
                 let drafts: Vec<u32> = match route {
                     LaneRoute::Batched { k_max } => s.drafts[..k_max].to_vec(),
