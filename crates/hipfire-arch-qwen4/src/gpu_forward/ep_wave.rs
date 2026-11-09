@@ -374,6 +374,9 @@ pub(crate) fn ep_wave_refusal(facts: &EpWaveFacts) -> Option<String> {
     match ep_wave_route(facts) {
         Err(why) => refuse(why),
         Ok(EpWaveRoute::FullTable) => {
+            if let Some(why) = f32_chain_small_lane(facts) {
+                return refuse(why);
+            }
             if total > facts.capacity_rows {
                 return refuse(format!(
                     "{total} rows exceed the {} rows the selected scratch holds for the F32 grouped chain",
@@ -444,6 +447,11 @@ pub(crate) fn ep_wave_refusal(facts: &EpWaveFacts) -> Option<String> {
                     ));
                 }
             }
+            if sym == 0 {
+                if let Some(why) = f32_chain_small_lane(facts) {
+                    return refuse(why);
+                }
+            }
             let capacity = if sym != 0 {
                 facts.tile_capacity_rows
             } else {
@@ -457,6 +465,25 @@ pub(crate) fn ep_wave_refusal(facts: &EpWaveFacts) -> Option<String> {
             None
         }
     }
+}
+
+/// The small-lane wave (`HIPFIRE_EP_LANE_PREFILL_WAVE_SMALL_LANES`: lanes of 9..=64 rows) is
+/// exact only on the symmetric A8 chain (the Tile wave, a Partial wave whose lanes run the
+/// symmetric chain). On the F32 grouped chain (the FullTable wave, a Partial wave whose lanes are
+/// below the owner-routed floor: floor 512 or `HIPFIRE_QWEN4_MOE_EP_A8=0`) a lane of at most
+/// `WIDE_VERIFY_MAX_ROWS` rows runs the 9..=64-row MoE families in its own chunk (the routed-down
+/// A8 grouped window, the g32 gate/up), which the wave's one call over every lane's rows does not
+/// (j8439 u60x8 0/8; j8706 floor 512 u60x8 0/8, logits differ at row 0), so such lanes keep
+/// their serial tile ([`EXACT_WAVE_MIN_LANE_ROWS`]).
+fn f32_chain_small_lane(facts: &EpWaveFacts) -> Option<String> {
+    let lane = facts
+        .lane_rows
+        .iter()
+        .position(|&rows| rows < EXACT_WAVE_MIN_LANE_ROWS)?;
+    Some(format!(
+        "lane {lane} ({} rows) is below {EXACT_WAVE_MIN_LANE_ROWS} rows on the F32 grouped chain: its own chunk runs the 9..=64-row MoE families, only the A8 chain's small-lane wave is exact",
+        facts.lane_rows[lane]
+    ))
 }
 
 /// The route a wave takes, decided from its lanes' own routes: every lane's singleton tile on
@@ -864,12 +891,18 @@ mod tests {
         assert_eq!(exact_wave_lane_floor_from(Some("9"), false), 9);
         assert_eq!(exact_wave_lane_floor_from(Some(" 24 "), false), 24);
         assert_eq!(exact_wave_lane_floor_from(Some("511"), false), 511);
-        // The process default (knob unset in the test environment) is the const.
+        // The process default (knob unset in the test environment) is the const. The knob
+        // lowers the floor of the A8 tile chain's wave; the F32 grouped chain (FullTable) keeps
+        // its 65-row lanes whatever it says.
         let mut f = facts(&[9, 24]);
+        f.lane_tile = vec![true; 2];
         f.min_lane_rows = 9;
         assert_eq!(ep_wave_refusal(&f), None);
         f.min_lane_rows = EXACT_WAVE_MIN_LANE_ROWS;
         assert!(refused(&f).contains("lane 0"));
+        f.min_lane_rows = 9;
+        f.lane_tile = vec![false; 2];
+        assert!(refused(&f).contains("lane 0 (9 rows) is below 65 rows on the F32 grouped chain"));
     }
 
     #[test]
@@ -1154,6 +1187,21 @@ mod tests {
         assert_eq!(ep_wave_refusal(&f), None);
         f.lane_tile[4] = true;
         assert!(refused(&f).contains("tile mask"), "{}", refused(&f));
+        // Small lanes (60 rows, `HIPFIRE_EP_LANE_PREFILL_WAVE_SMALL_LANES`) join the masked wave on
+        // the symmetric A8 chain only; the unmasked Partial wave on the F32 grouped chain refuses
+        // them (j8706: floor 512, u60x8 0/8 lane == singleton).
+        let mut s = facts(&[60; 8]);
+        s.ffn_partial = true;
+        s.min_lane_rows = 9;
+        s.partial_mask = true;
+        s.lane_tile = vec![true; 8];
+        s.lane_sym = vec![true; 8];
+        assert_eq!(ep_wave_route(&s), Ok(EpWaveRoute::PartialMask));
+        assert_eq!(ep_wave_refusal(&s), None);
+        s.lane_tile = vec![false; 8];
+        s.lane_sym = vec![false; 8];
+        assert_eq!(ep_wave_route(&s), Ok(EpWaveRoute::Partial));
+        assert!(refused(&s).contains("F32 grouped chain"), "{}", refused(&s));
         f.lane_tile = vec![true; 8];
         f.partial_mask = false;
         // F32 grouped chain (D1 load: floor 512): the compact-mode capacity binds.
