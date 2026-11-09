@@ -128,8 +128,8 @@
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::ep_mesh_lanes::{EpMeshLanes, MeshLaneAdmission, MeshStepError};
 use hipfire_arch_qwen4::gpu_forward_lanes::{LaneStagePolicy, StageName};
-use hipfire_arch_qwen4::lane::{LabRoutes, LaneSpecConfig};
 use hipfire_arch_qwen4::lane::pages::ElasticLabRank;
+use hipfire_arch_qwen4::lane::{LabRoutes, LaneSpecConfig};
 use hipfire_arch_qwen4::mesh_lane_protocol::{
     AcceptRule, GreedyRule, LanePlan, LaneRequest, SamplerOutput, SamplingMode, WindowBudgets,
 };
@@ -3044,7 +3044,10 @@ fn drive_mtp_ep(
     let mut status = PolicyStatus::Pass;
     for (set_index, set) in run_sets(args).into_iter().enumerate() {
         if let (Some(mib), true, true) = (args.elastic, args.elastic_cycle, set_index > 0) {
-            elastic_reclaim_report(&format!("before run {set_index}"), bundle.elastic_lab_reclaim(gpu))?;
+            elastic_reclaim_report(
+                &format!("before run {set_index}"),
+                bundle.elastic_lab_reclaim(gpu),
+            )?;
             elastic_lend_report(
                 &format!("before run {set_index}"),
                 bundle.elastic_lab_lend(gpu, mib << 20),

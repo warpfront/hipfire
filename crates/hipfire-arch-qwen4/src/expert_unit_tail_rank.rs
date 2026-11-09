@@ -3343,10 +3343,7 @@ fn elastic_stride(payload: usize) -> usize {
 }
 
 fn elastic_layout(slots: usize, gate_up_bytes: usize, down_bytes: usize) -> ElasticLayout {
-    let (gate_up_stride, down_stride) = (
-        elastic_stride(gate_up_bytes),
-        elastic_stride(down_bytes),
-    );
+    let (gate_up_stride, down_stride) = (elastic_stride(gate_up_bytes), elastic_stride(down_bytes));
     let down_offset = slots * gate_up_stride;
     ElasticLayout {
         slots,
@@ -3385,7 +3382,12 @@ fn elastic_slot_addresses(base: u64, layout: &ElasticLayout, slot: usize) -> (u6
 }
 
 /// Whole units a lend of at most `bytes` pool bytes holds, capped at the `candidates` available.
-fn elastic_slot_count(bytes: u64, gate_up_bytes: usize, down_bytes: usize, candidates: usize) -> usize {
+fn elastic_slot_count(
+    bytes: u64,
+    gate_up_bytes: usize,
+    down_bytes: usize,
+    candidates: usize,
+) -> usize {
     let per_slot = (elastic_stride(gate_up_bytes) + elastic_stride(down_bytes)) as u64;
     candidates.min((bytes / per_slot) as usize)
 }
@@ -3420,7 +3422,11 @@ fn elastic_order(
                 .enumerate()
                 .filter(|&(_, &kind)| kind == Kind::Tail)
                 .filter_map(|(id, _)| {
-                    counts.get(id).copied().filter(|&count| count > 0).map(|count| (count, id))
+                    counts
+                        .get(id)
+                        .copied()
+                        .filter(|&count| count > 0)
+                        .map(|count| (count, id))
                 })
                 .collect();
             hot.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -3520,7 +3526,10 @@ impl ElasticBank {
             layout,
             staging: bank.staging(),
             bank: Some(bank),
-            cells: free.into_iter().map(|free| Some(SlotCell::Free(free))).collect(),
+            cells: free
+                .into_iter()
+                .map(|free| Some(SlotCell::Free(free)))
+                .collect(),
             published: vec![false; units.len()],
             units,
             chunks,
@@ -3550,7 +3559,9 @@ impl ElasticBank {
     fn finish_publish(&mut self, done: FillComplete) -> Result<UnitKey, String> {
         let slot = done.slot() as usize;
         let Some(unit) = self.units.get(slot).copied() else {
-            return Err(format!("a completion names slot {slot} outside the elastic bank"));
+            return Err(format!(
+                "a completion names slot {slot} outside the elastic bank"
+            ));
         };
         let bank = self.bank.as_mut().expect("the elastic slot bank is open");
         match self.cells[slot].take() {
@@ -3684,7 +3695,12 @@ fn teardown_elastic(gpu: &mut Gpu, mut el: ElasticBank) -> Result<(), (ElasticBa
             Err(failure) => return Err((el, failure.message)),
         }
     };
-    let Some(cells) = el.cells.iter_mut().map(Option::take).collect::<Option<Vec<_>>>() else {
+    let Some(cells) = el
+        .cells
+        .iter_mut()
+        .map(Option::take)
+        .collect::<Option<Vec<_>>>()
+    else {
         return Err((el, "an elastic slot cell is in transit".into()));
     };
     let bank = el.bank.take().expect("open");
@@ -3703,9 +3719,7 @@ fn teardown_elastic(gpu: &mut Gpu, mut el: ElasticBank) -> Result<(), (ElasticBa
             }
         }
         Err((_block, _reclaimed, error)) => {
-            eprintln!(
-                "qwen4 EP elastic pool NOT freed (it is leaked, never freed early): {error}"
-            );
+            eprintln!("qwen4 EP elastic pool NOT freed (it is leaked, never freed early): {error}");
         }
     }
     Ok(())
@@ -3716,7 +3730,10 @@ impl UnitTailRank {
     /// Elastic bytes this rank's pool holds on the device (0 = none). Cheap; never syncs.
     pub(crate) fn elastic_bytes(&self) -> u64 {
         let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        inner.elastic.as_ref().map_or(0, |el| el.layout.total as u64)
+        inner
+            .elastic
+            .as_ref()
+            .map_or(0, |el| el.layout.total as u64)
     }
 
     /// Allocate and start filling an elastic bank of at most `bytes` pool bytes (whole units, at
@@ -3817,7 +3834,9 @@ impl Inner {
             if let Err(again) = self.elastic_reclaim(gpu, "lend-failed", true) {
                 eprintln!("qwen4 EP rank {rank}: elastic lend: the failed bank was not reclaimed: {again}");
             }
-            return Err(format!("elastic lend on rank {rank}: the first fill chunk: {error}"));
+            return Err(format!(
+                "elastic lend on rank {rank}: the first fill chunk: {error}"
+            ));
         }
         let ms = elapsed_ms(t0, Instant::now());
         Ok(Some(ElasticReport {
@@ -4099,11 +4118,18 @@ impl Inner {
         };
         let backing = match std::mem::replace(&mut el.generation, ElasticGen::Gone) {
             ElasticGen::Fenced(generation) => {
-                match el.bank.as_mut().expect("the elastic slot bank is open").retire(generation, None) {
+                match el
+                    .bank
+                    .as_mut()
+                    .expect("the elastic slot bank is open")
+                    .retire(generation, None)
+                {
                     Ok((backing, _retired)) => backing,
                     Err((generation, error)) => {
                         el.generation = ElasticGen::Fenced(generation);
-                        eprintln!("qwen4 EP rank {rank}: elastic generation did not retire: {error}");
+                        eprintln!(
+                            "qwen4 EP rank {rank}: elastic generation did not retire: {error}"
+                        );
                         return;
                     }
                 }
@@ -4284,7 +4310,8 @@ impl Inner {
                 let mut touched = HashSet::new();
                 for &(unit, _slot) in &published {
                     let (layer, expert) = (unit.0 as usize, unit.1 as usize);
-                    let index = this.layer_of[layer].ok_or("an elastic unit names an unmanaged layer")?;
+                    let index =
+                        this.layer_of[layer].ok_or("an elastic unit names an unmanaged layer")?;
                     let tail = &mut this.layers[index];
                     let (gate_up, down) = (tail.canon_gate_up[expert], tail.canon_down[expert]);
                     tail.set(backing, expert, gate_up, down);
@@ -4386,17 +4413,17 @@ mod tests {
         pin_deltas, pool_layout, tail_layer_selected, DirtyRange, EventPool, GenerationId, Inner,
         LiveSlot, ENTRY_BYTES, FNV_OFFSET, LOG_IDS, POOL_BLOCK_ALIGN,
     };
+    use super::{
+        elastic_candidates, elastic_chunks, elastic_layout, elastic_order, elastic_slot_addresses,
+        elastic_slot_count, elastic_spans, Kind, ELASTIC_CHUNK_BYTES,
+    };
     use crate::expert_unit_tail::rig::{rig_pool, Rig};
     use crate::expert_unit_tail::{
         EpUnitTailConfig, PeerBoard, PeerDelta, PinDelta, Retire, RetireCadence, SlotPhase,
         TailPolicy, UnitKey, WindowUse,
     };
-    use super::{
-        elastic_candidates, elastic_chunks, elastic_layout, elastic_order, elastic_slot_addresses,
-        elastic_slot_count, elastic_spans, Kind, ELASTIC_CHUNK_BYTES,
-    };
-    use std::collections::HashSet;
     use std::collections::HashMap;
+    use std::collections::HashSet;
 
     fn image(entries: &[u64]) -> Vec<u8> {
         entries.iter().flat_map(|e| e.to_le_bytes()).collect()
@@ -5503,7 +5530,10 @@ mod tests {
         assert_eq!(layout.down_offset % 256, 0);
         assert!(layout.gate_up_stride >= gub + 256 && layout.down_stride >= dnb + 256);
         assert_eq!(layout.down_offset, slots * layout.gate_up_stride);
-        assert_eq!(layout.total, layout.down_offset + slots * layout.down_stride);
+        assert_eq!(
+            layout.total,
+            layout.down_offset + slots * layout.down_stride
+        );
         let reach = crate::expert_arena::w3_max_read_end(2560, 640);
         assert!(reach > dnb, "the down kernel over-reads its payload");
         let spans = elastic_spans(&layout);
@@ -5514,7 +5544,11 @@ mod tests {
             let (gate_up, down) = (slot_spans[0], slot_spans[1]);
             assert!(gate_up.bytes as usize >= gub + 256);
             // The over-read of a down tensor at the slot's start ends inside its own extent.
-            assert!(down.bytes as usize >= reach, "slot {slot}: {} < {reach}", down.bytes);
+            assert!(
+                down.bytes as usize >= reach,
+                "slot {slot}: {} < {reach}",
+                down.bytes
+            );
             for span in slot_spans {
                 assert_eq!(span.offset % 256, 0);
                 all.push((span.offset, span.bytes));
@@ -5563,7 +5597,10 @@ mod tests {
             let layout = elastic_layout(1, 1_280_001, 640_000);
             layout.total as u64
         };
-        assert_eq!(elastic_slot_count(10 * per_slot + 5, 1_280_001, 640_000, 100), 10);
+        assert_eq!(
+            elastic_slot_count(10 * per_slot + 5, 1_280_001, 640_000, 100),
+            10
+        );
         assert_eq!(elastic_slot_count(10 * per_slot, 1_280_001, 640_000, 3), 3);
         assert_eq!(elastic_slot_count(per_slot - 1, 1_280_001, 640_000, 3), 0);
     }

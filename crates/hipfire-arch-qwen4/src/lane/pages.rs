@@ -529,7 +529,11 @@ pub(crate) enum ElasticAction {
 /// reserve off, `cap == 0`); then release the caches when any rank holds them; else, with nothing
 /// lent anywhere, lend the minimum over the ranks of `min(cap, lendable)` when it reaches
 /// [`ELASTIC_MIN_LEND_BYTES`].
-pub(crate) fn elastic_action(cap: u64, idle_steps: usize, ranks: &[ElasticNumbers]) -> ElasticAction {
+pub(crate) fn elastic_action(
+    cap: u64,
+    idle_steps: usize,
+    ranks: &[ElasticNumbers],
+) -> ElasticAction {
     if cap == 0 || ranks.is_empty() || idle_steps < ELASTIC_IDLE_STEPS {
         return ElasticAction::Nothing;
     }
@@ -1030,7 +1034,8 @@ impl Qwen4Bundle {
         gpu: &Gpu,
         rows: usize,
     ) -> Result<RankNumbers, String> {
-        self.lane_page_numbers_cold(gpu, rows).map(|(numbers, _)| numbers)
+        self.lane_page_numbers_cold(gpu, rows)
+            .map(|(numbers, _)| numbers)
     }
 
     /// [`Self::lane_page_numbers_local`] and the cold reserve its earmark holds (0 once the rank

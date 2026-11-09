@@ -2482,10 +2482,18 @@ pub fn drive_qwen4_lane_batch(
                 );
             }
             // The elastic reserve's step boundary (idle count, cache give-back, re-lend).
-            let long_prefill = plan.requests.iter().any(|r| {
-                r.kind == RequestStepKind::Prefill && long_prefill_route_rows(r.rows.len)
-            });
-            elastic_boundary(sched, m, gpu, &controls, &mut elastic_idle, Some(long_prefill));
+            let long_prefill = plan
+                .requests
+                .iter()
+                .any(|r| r.kind == RequestStepKind::Prefill && long_prefill_route_rows(r.rows.len));
+            elastic_boundary(
+                sched,
+                m,
+                gpu,
+                &controls,
+                &mut elastic_idle,
+                Some(long_prefill),
+            );
         }
     })();
     mix.report();
@@ -2742,10 +2750,10 @@ mod tests {
         );
         let drive = prod.find("pub fn drive_qwen4_lane_batch").expect("drive");
         let body = &prod[drive..];
-        let commit = body.find("executor.commit_step(&plan, out)").expect("commit");
-        let tick = body
-            .find("elastic_boundary(sched, m, gpu, &controls, &mut elastic_idle, Some(")
-            .expect("tick");
+        let commit = body
+            .find("executor.commit_step(&plan, out)")
+            .expect("commit");
+        let tick = body.find("Some(long_prefill),").expect("tick");
         assert!(commit < tick, "the elastic tick follows the step's commit");
     }
 
