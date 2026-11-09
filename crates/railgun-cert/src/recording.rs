@@ -3141,6 +3141,13 @@ pub const SITES: &[Site] = &[
         occurrences: 2,
         decisions: &["eager-only-refusals"],
     },
+    // Elastic reserve reclaim refuses before freeing any shadow under recording/capture (dispatch.rs:9908).
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "release_long_prefill_caches",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
     // Loader-independent E8P MoE decode launcher refuses before submission under recording/capture (e8p_moe_decode.rs:670).
     Site {
         file: "rdna-compute/src/e8p_moe_decode.rs",
