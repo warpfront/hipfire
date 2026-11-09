@@ -204,7 +204,8 @@ fn linked_object(arch: Arch, variant: &str, s_text: &str) -> Result<Vec<u8>, Str
             let _ = std::fs::remove_file(elf);
         }
     };
-    std::fs::write(&s_path, s_text).map_err(|e| format!("{}: {e}", s_path.display()))?;
+    std::fs::write(&s_path, crate::objdump_spelling(s_text))
+        .map_err(|e| format!("{}: {e}", s_path.display()))?;
     let elf = match build(&Toolchain::default(), &s_path, &hsaco_path, arch.name()) {
         Ok(out) => out.elf,
         Err(e) => {

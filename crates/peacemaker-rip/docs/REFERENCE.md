@@ -804,3 +804,18 @@ The last four rows exist only in the script (no Rust-generator twin); their decl
 `CAP: u8` (1, 2, 4, 8; `B > CAP` clamps, `B <= 0` stores nothing) is not a search axis: a `CAP < 8` object equals the `CAP = 8` one only for `B <= CAP`.
 
 The declared values are the shipped tuple `r4_b8_u1_native_anchor` (`const ROWS: u8 = 4; const CAP: u8 = 8; const UNROLL: u8 = 1; const SPLIT: bool = false; const ILP: bool = false;`); the variant is `xbatch` and the `KernelSpec` variant is the tuple tag. A tuple whose ring/register plan does not fit is refused by the script's `check` with the same verdict as the Rust generator (`r4_b8` with `ILP` has one ring slot but needs four). `tests/gemv_mq2_xbatch_twin.rs` requires, for all 144 tuples of the grid, that the script refuses exactly when `emit_text` does and otherwise emits the same `s_text` byte for byte, and that the declared point assembles to the ELF inside the committed `kernels/gemv_mq2_xbatch_pm_gfx1201.hxaco`.
+
+## 20. The HC8 compressed-weight GEMM family on the raw `Builder`: `hc8_wmma`
+
+The six served E4M3 entries of the module `kernels/hc8_wmma_pm_gfx1201.hxaco` (gfx1201) are written whole in [`hc8_wmma.rip`](../../peacemaker-isa/src/kernels/hc8_wmma.rip): variants `down_n1..3` (`hc8_gemm_e4m3_mw1_kw16_n{1,2,3}_act`, the `act` GEMM of Rust `Geo { E4M3, mw 1, kw 16, nt, act }`) and `up_n1..3` (`hc8_read_up_e4m3_n{1,2,3}`, the fused read-up, Rust `emit_read_up`). Every instruction is a script statement (`op`, `sop`, `b.push`, `b.control`, `b.loop_`, `b.label`, `b.ds_store`/`b.ds_load`, `b.barrier_with_scope`). `SEARCH_AXES` declares four `schedule` axes; the declared values emit the generator's per-kernel `s_text` byte for byte:
+
+| const | declared | values | meaning |
+|---|---|---|---|
+| `UNROLL: u8` | 0 | 0, 1, 2, 3, 4, 5, 6, 8, 10 | tiles per main K-loop batch; 0 is the generator's default (8 / 4 / 2 for NT 1 / 2 / 3); remainder batches halve; refused when the VGPR layout does not fit (NT 2: above 5, NT 3: above 3) |
+| `LOADORDER: u8` | 0 | 0, 1, 2 | load issue order in a batch: per tile weight then x / all weights then all x / all x then all weights |
+| `EPIPRE: bool` | false | false, true | the epilogue's global loads (scales; for the read-up also the normalized values) issued in front of the K loops into dedicated VGPRs; each loop re-issues them after every iteration that is followed by another one (the Builder admits a loop only when its back-edge ledger equals its entry ledger) and branches out before the re-issue after the last |
+| `DELAY_ALU: bool` | true | true, false | `b.enable_delay_alu()` |
+
+`tests/hc8_wmma_twin.rs` pins the six texts against the generator, the machine code and 64-byte descriptor of every symbol against the same symbol of the committed `.hxaco` (through the ELF symbol table; the descriptor's `kernel_code_entry_byte_offset` is compared as "points at the symbol's code"), the axis consts, and the compile/refuse table of the axes.
+
+The generator spells `v_perm_b32` selectors as `0x07060302` and writes `offset:0`; `llvm-objdump` prints `0x7060302` and omits a zero offset, so the toolchain's parse-back would reject the text as authored. `peacemaker_rip::certify` (and the `features` linked build) therefore assemble the text through `peacemaker_rip::objdump_spelling`, which rewrites exactly those two spellings on instruction lines; the assembled ELF is the same (pinned by the twin test).
