@@ -19,6 +19,7 @@ pub const LANE_WMMA_MIN_ROWS: usize = 16;
 /// runs 128 blocks of `ceil(n / 128)` layout rows, whichever launches produce them.
 pub const TOPK8_GROUPS: usize = 128;
 /// Most rows one [`Gpu::topk8_rescore_k2560_rows`] launch pair covers.
+// selector-receipt: receipts/selectors/qwen4_topk8_rows_max.json
 pub const TOPK8_ROWS_MAX: usize = 8;
 /// Module of the row-batched draft-head re-score kernels.
 const TOPK8_ROWS_MODULE: &str = "topk8_rows_mq6g256v2";

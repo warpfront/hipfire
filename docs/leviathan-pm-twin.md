@@ -6,6 +6,40 @@ are `mode` kernarg branches of one symbol, so sealing the symbol seals all of th
 ABI is unchanged: seven explicit args `region, lanes_off, rows_off, ptab, mode, cand_local,
 cand_peer` at offsets 0, 8, 12, 16, 24, 32, 40. Dispatch is not changed by these artifacts.
 
+## Row-batched draft top-8 (gfx1201)
+
+`topk8_rows_mq6g256v2_pm_gfx1201.hxaco` seals both
+`topk8_partial_f32_rows` and `topk8_rescore_mq6g256v2_k2560_rows` in one module.
+The anchor is `topk8_rows_mq6g256v2_hipcc_gfx1201.co`; the manifest records the
+exact concatenation of `topk8_select.hip`, `qwen4_gemv_mq6g256v2.hip` and
+`topk8_rows.gfx1201.hip`, with no `HIPFIRE_TOPK8_RESCORE` define. Both explicit
+kernarg layouts are 40 bytes; row strides are in floats (partial input and
+re-score input) or ints (re-score output), and each partial slot is 8192 bytes.
+`hip_twin_topk8_rows` checks source provenance, full device-ELF identity, both
+entry ABIs and wrong-arch/wrong-symbol rejection using committed files only.
+The HIP and PM wrapper hashes can differ: the complete device ELF is identical.
+
+The committed module's complete gfx1201 device ELF is 25,480 bytes, SHA256
+`037150d701462a89cafdb0173eddbb86f8d0dff7df4d0b5f27da135abfc04d72`
+in both the HIP anchor and PM twin. Wrapper SHA256s are
+`22c1e30c1cd2e2c6c7f677ebaae32dff94caa8885ba609ed663b862ddad35eeb`
+(HIP) and `c0da81e80943325ff3ded561fcdb94137eebd46136dfcc73a090b592a4a0135a`
+(PM); the HIP host triple has a trailing `-`, unlike PM's empty host entry.
+This is an envelope spelling difference, not an ELF or kernel-byte mismatch.
+
+Regenerate explicitly:
+
+```sh
+scripts/pm-leviathan-twin.py --family topk8-rows --arch gfx1201 \
+  --build-wrapper /home/kaden/qcal/locks/build-slot.sh
+```
+
+The wrapper is a local build-serialization policy, not an artifact dependency;
+substitute your cargo wrapper or omit it on another machine. No local toolchain
+is needed to consume the committed twins. Dispatch stays on HIP and the existing
+exact-gfx1201 default remains on. `HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS=0` kills row
+batching and restores the per-row launch pairs.
+
 ## What Route A proves
 
 The twin is not a rewrite. `hip_twin` (`crates/peacemaker-isa/src/hip_twin.rs`) lifts the hipcc

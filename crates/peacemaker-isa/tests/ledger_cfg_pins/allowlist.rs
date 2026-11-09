@@ -19,6 +19,11 @@ pub struct Allow {
     pub why: &'static str,
 }
 
+/// Shared reasons of the `topk8_rows_mq6g256v2_{hipcc,pm}_gfx1201` rows (one ELF per image, the
+/// hipcc anchor and the PM twin carry the same instruction at the same pc in both images).
+const TOPK8_ROWS_ST_WHY: &str = "UNPROVEN, not a claimed race: an original LLVM compiler obligation, OPEN (the committed topk8_rows_mq6g256v2 hipcc image is unchanged compiler output; the PM twin carries the same instruction at the same pc; no modified code is claimed to race). The ledger keeps a pending VMEM store's source registers locked until its store-counter wait and reports the first write of one on a CFG path of not-taken/taken branches that has no such wait; whether that path is feasible and whether the hardware has read the store sources by then is not established here and the path was not checked for feasibility. Text identity and hardware outputs do not discharge this strict WAR path in the ledger; nothing here is discharged";
+const TOPK8_ROWS_KM_WHY: &str = "MODEL LIMITATION, not a claimed race: the IR models the VOP3 scalar-destination SGPR (here a `v_cmp_*_e64` result) as a pair although a wave32 instruction writes one SGPR, so the reported WAW with the pending Km-counter write of s4 exists only through the pair's second register (the committed topk8_rows_mq6g256v2 hipcc image is unchanged compiler output; the PM twin carries the same instruction at the same pc)";
+
 /// Shared reason of the 32 `moe_shared_down_combine` rows below (16 hipcc originals, 16 PM
 /// twins; same instruction and need in both images).
 const MOE_SHARED_DOWN_COMBINE_WHY: &str = "UNPROVEN, not a claimed race: an original LLVM compiler obligation, OPEN (the committed moe_shared_down_combine hipcc image is unchanged compiler output; the PM twin carries the same instruction at the same pc; no modified code is claimed to race). The ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path of not-taken/taken branches from the entry that has no such wait (pending DS source lock reuse without a wait); whether that path is feasible and whether the hardware has read the DS store sources by then (store-source timing) is not established here. Text identity and hardware outputs (source twin, direct GPU run) do not discharge the ledger; nothing here is discharged";
@@ -637,6 +642,30 @@ pub const FINDINGS: &[Allow] = &[
         needle: "`v_add_f32_e32 v5, v49, v52` (after label `.LBB22`): needs Ds wait 0 (War { reg: \"v5\" })",
         why: MOE_SHARED_DOWN_COMBINE_WHY,
     },
+    Allow {
+        scope: "pins",
+        target: "topk8_rows_mq6g256v2_hipcc_gfx1201.co#topk8_partial_f32_rows",
+        needle: "`v_cndmask_b32_e64 v1, 0x7fffffff, v6, s2` (after label `.LBB19`): needs Store wait 1 (War { reg: \"v1\" })",
+        why: TOPK8_ROWS_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "topk8_rows_mq6g256v2_hipcc_gfx1201.co#topk8_rescore_mq6g256v2_k2560_rows",
+        needle: "`v_cmp_eq_u32_e64 s3, 0, v2` (after label `.LBB12`): needs Km wait 0 (Waw { reg: \"s4\" })",
+        why: TOPK8_ROWS_KM_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "topk8_rows_mq6g256v2_pm_gfx1201.hxaco#topk8_partial_f32_rows",
+        needle: "`v_cndmask_b32_e64 v1, 0x7fffffff, v6, s2` (after label `.LBB19`): needs Store wait 1 (War { reg: \"v1\" })",
+        why: TOPK8_ROWS_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "topk8_rows_mq6g256v2_pm_gfx1201.hxaco#topk8_rescore_mq6g256v2_k2560_rows",
+        needle: "`v_cmp_eq_u32_e64 s3, 0, v2` (after label `.LBB12`): needs Km wait 0 (Waw { reg: \"s4\" })",
+        why: TOPK8_ROWS_KM_WHY,
+    },
 ];
 
 /// Inputs with no verification: a verifier refusal or a refusal upstream of it (lift region, pool).
@@ -1082,6 +1111,12 @@ pub struct PoolBody {
 /// outputs). The b320 multi pool hosts the same bodies; its tid-290 body finding (the last
 /// template) is covered by the tid 290 entry (same tid, body pc, instruction and need). A
 /// changed id after a later twin lands is fixed by editing the `tid` only.
+///
+/// The `topk8_rows_mq6g256v2_{hipcc,pm}_gfx1201` images (two entries each, `topk8_partial_f32_rows`
+/// and `topk8_rescore_mq6g256v2_k2560_rows`, one ELF per image) sort after every other committed
+/// image (`topk8_partial_blocks_pm_gfx1201.*` was the last file), so their templates take the ids
+/// after the previous last template and no existing id is renumbered by them. Any `POOL_BODY` /
+/// `POOL_STATE_CAP` row for them is pinned from the observed scan, never guessed.
 pub const POOL_BODY: &[PoolBody] = &[
     // pins row 2, W2
     PoolBody {
@@ -1809,6 +1844,39 @@ pub const POOL_BODY: &[PoolBody] = &[
         category: Category::Candidate,
         insn: "`v_add_f32_e32 v5, v49, v52`",
         need: "needs Ds wait 0 (War { reg: \"v5\" })",
+    },
+    // topk8_rows_mq6g256v2 hipcc originals (tid 391-392) and PM twins (tid 395-396); b256 pools
+    PoolBody {
+        tid: 391,
+        target: "topk8_rows_mq6g256v2_hipcc_gfx1201.co#topk8_partial_f32_rows",
+        body_pc: 274,
+        category: Category::Candidate,
+        insn: "`v_cndmask_b32_e64 v1, 0x7fffffff, v6, s2`",
+        need: "needs Store wait 1 (War { reg: \"v1\" })",
+    },
+    PoolBody {
+        tid: 392,
+        target: "topk8_rows_mq6g256v2_hipcc_gfx1201.co#topk8_rescore_mq6g256v2_k2560_rows",
+        body_pc: 75,
+        category: Category::ModelLimit,
+        insn: "`v_cmp_eq_u32_e64 s3, 0, v2`",
+        need: "needs Km wait 0 (Waw { reg: \"s4\" })",
+    },
+    PoolBody {
+        tid: 395,
+        target: "topk8_rows_mq6g256v2_pm_gfx1201.hxaco#topk8_partial_f32_rows",
+        body_pc: 274,
+        category: Category::Candidate,
+        insn: "`v_cndmask_b32_e64 v1, 0x7fffffff, v6, s2`",
+        need: "needs Store wait 1 (War { reg: \"v1\" })",
+    },
+    PoolBody {
+        tid: 396,
+        target: "topk8_rows_mq6g256v2_pm_gfx1201.hxaco#topk8_rescore_mq6g256v2_k2560_rows",
+        body_pc: 75,
+        category: Category::ModelLimit,
+        insn: "`v_cmp_eq_u32_e64 s3, 0, v2`",
+        need: "needs Km wait 0 (Waw { reg: \"s4\" })",
     },
 ];
 

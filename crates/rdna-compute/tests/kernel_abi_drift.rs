@@ -419,6 +419,8 @@ const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
     ("gfx1201", "stream_mix_postmix_bf16"),
     ("gfx1201", "stream_mix_route_aggregate_n4_k10_bf16"),
     ("gfx1201", "stream_mix_route_helmert"),
+    ("gfx1201", "topk8_partial_f32_rows"),
+    ("gfx1201", "topk8_rescore_mq6g256v2_k2560_rows"),
     ("gfx1201", "gemm_mq6sym_i8_set_bf16_gfx1201"),
     ("gfx1201", "gemm_mq6sym_i8_set_bf16_m32n16_gfx1201"),
     ("gfx1201", "gemm_mq6sym_i8_set_bf16_m32n32_gfx1201"),
@@ -1429,6 +1431,11 @@ fn runtime_source(module: &str, source: &str) -> Result<String, String> {
             read("kernels/src/block_i8_128_emit.hip")?,
             read("kernels/src/mq_fwht256.h")?,
             read("kernels/src/ffn_grouped_activation_pad.hip")?
+        ),
+        "topk8_rows_mq6g256v2" => format!(
+            "{}{}{body}",
+            read("kernels/src/topk8_select.hip")?,
+            read("kernels/src/qwen4_gemv_mq6g256v2.hip")?
         ),
         _ => body,
     })

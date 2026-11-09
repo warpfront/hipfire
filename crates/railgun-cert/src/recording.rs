@@ -1691,6 +1691,12 @@ pub const DECISIONS: &[Decision] = &[
         evidence: "the overwrite kernels store `acc + 0.0f` once per output, bit-identical to legacy memset(+0.0f) then `Y += acc`, signed zero included (dflash_draft_fusion.rs, gemm_mq4g256v2_overwrite_gfx12_dflash documentation). rdna-compute examples/draft_overwrite_gfx12_oracle compares both arms as u32 bit patterns (5 (m, k) shapes x batch 2..63, NaN-prefilled overwrite output, N = 64 inside and outside the rows64 scope; 40/40 per CHANGELOG, with serve C8 greedy md5 equal). The separate generic verify-tile admission above 16 rows is inventoried under gfx12-mq4v2-verify-tile-route; this verdict covers eliminating the pre-zero, not certifying that independent tile-selection decision. G0 observation closes the overwrite predicate, so the G0 eager arm already takes the legacy tail; the pre-railgun default process (direct, unobserved dense draft) takes the overwrite twin, so arm3 differs",
         reaches: &[reach(Program::DflashGfx1201, "DFlash2 B=16 draft MQ4G256V2 lm_head and draft GEMMs on exact gfx1201, admitted 2..=16-row chunks, k % 256 == 0", "arm3")],
     },
+    // Row-batched draft top-8 is not a recording-sensitive decision: draft_head.rs uses the
+    // same exact-gfx1201 / MQ6G256V2 / scratch / HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS admission in
+    // every mode (default on; 0 kills). Its two ledger contracts are qwen4_topk8_rows;
+    // hip_twin_topk8_rows pins both explicit 40-byte ABIs and full device-ELF identity of
+    // the proof-only portable PM twin. Dispatch remains HIP. No recording-predicate site
+    // or fictitious SITES row is added for this mode-invariant admission.
     Decision {
         id: "dflash-cb-lane-draft-batching",
         predicates: &[IsRecording, CaptureMode, G0Observing],

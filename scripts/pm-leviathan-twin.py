@@ -55,6 +55,16 @@ FAMILIES = {
         "arches": ("gfx1201",),
         "math": False,
     },
+    "topk8-rows": {
+        "source": "kernels/src/topk8_rows.gfx1201.hip",
+        "symbols": ("topk8_partial_f32_rows", "topk8_rescore_mq6g256v2_k2560_rows"),
+        "prefix": "topk8_rows_mq6g256v2",
+        "arches": ("gfx1201",),
+        "math": False,
+        "parts": ("kernels/src/topk8_select.hip",
+                  "kernels/src/qwen4_gemv_mq6g256v2.hip",
+                  "kernels/src/topk8_rows.gfx1201.hip"),
+    },
 }
 
 
@@ -191,7 +201,14 @@ def build_arch(args, root, hipcc, env, arch, tmp):
     evidence = math_evidence(hipcc, env, root, arch, tmp, Path(env["ROCM_PATH"])) if fam["math"] else None
 
     tmp_co = Path(tmp) / f"anchor_{arch}.co"
-    run([str(hipcc), *flags, "-o", str(tmp_co), source_rel], cwd=root, env=env)
+    parts = fam.get("parts")
+    if parts:
+        combined = b"".join((root / r).read_bytes() for r in parts)
+        build_src = Path(tmp) / f"{prefix}_{arch}.hip"
+        build_src.write_bytes(combined)
+        run([str(hipcc), *flags, "-o", str(tmp_co), str(build_src)], cwd=root, env=env)
+    else:
+        run([str(hipcc), *flags, "-o", str(tmp_co), source_rel], cwd=root, env=env)
     shutil.copyfile(tmp_co, co)
 
     report_path = Path(tmp) / f"report_{arch}.json"
@@ -217,6 +234,14 @@ def build_arch(args, root, hipcc, env, arch, tmp):
         "anchor": {"file": co.name, "bytes": co.stat().st_size, "sha256": sha256_file(co)},
         "hxaco": {"file": hxaco.name, "bytes": hxaco.stat().st_size, "sha256": sha256_file(hxaco)},
     }
+    if parts:
+        doc["compiler"]["invocation"] = "hipcc <flags> -o <anchor.co> <parts concatenated>"
+        doc["module_source"] = {
+            "combined_bytes": len(combined),
+            "combined_sha256": hashlib.sha256(combined).hexdigest(),
+            "parts": [{"path": r, "bytes": (root / r).stat().st_size, "sha256": sha256_file(root / r)}
+                      for r in parts],
+        }
     tool = "peacemaker-isa example hip_twin (Route A: lift, emit::checked, bundle)"
     if len(symbols) == 1:
         doc["symbol"] = symbols[0]
