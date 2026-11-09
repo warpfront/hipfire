@@ -2068,6 +2068,17 @@ mod tests {
         assert!(validate_raw_codec_payload(c, &vec![0; 64 * 8 * 72], 64, 1024, "q").is_ok());
     }
 
+    #[test]
+    fn raw_codec_refuses_ragged_k_floor_stride_payloads() {
+        // HIPF-209: every floor-stride format, not only qt 7, refuses a ragged K
+        // (1000 is no whole number of 32-, 64-, 128- or 256-element groups).
+        for qt in [0u8, 3, 4, 6, 8, 10, 12] {
+            let c = raw_codec(qt).expect("raw codec row");
+            let r = validate_raw_codec_payload(c, &[], 4, 1000, "w");
+            assert!(r.is_err(), "qt={qt} {:?} accepted a ragged K", c.dtype);
+        }
+    }
+
     // ── Low-bit layout-validation contract (GPU-free) ─────────────────────────
     // TQ2G128: 34 B per 128, BQ1G128: 18 B per 128, K%128==0, exact byte length
     // m*(k/128)*block_bytes with checked arithmetic. Centralized in
