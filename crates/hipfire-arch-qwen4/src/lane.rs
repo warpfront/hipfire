@@ -1152,6 +1152,29 @@ pub enum LabRoutes {
     Batched,
 }
 
+impl LabRoutes {
+    /// `HIPFIRE_QWEN4_LANE_LAB_ROUTES` (developer; default `floor`): the
+    /// window router a lane store starts with. `batched` drafts every window
+    /// at its whole budget (`HIPFIRE_EP_MTP_LANE_K` caps it), `cycle` walks the
+    /// lab cycle; an unknown value keeps the floor and says so on stderr.
+    pub(crate) fn from_env() -> Self {
+        match hipfire_config::developer_var("HIPFIRE_QWEN4_LANE_LAB_ROUTES")
+            .as_deref()
+            .map(str::trim)
+        {
+            Ok("batched") => Self::Batched,
+            Ok("cycle") => Self::Cycle,
+            Ok("floor") | Ok("") | Err(_) => Self::Floor,
+            Ok(other) => {
+                eprintln!(
+                    "HIPFIRE_QWEN4_LANE_LAB_ROUTES={other:?} is not floor|batched|cycle: the lane floor routes"
+                );
+                Self::Floor
+            }
+        }
+    }
+}
+
 /// One MTP lane's device state next to its trunk state.
 pub struct LaneSpec {
     /// The lane's MTP head state (QSA arenas, selection, wide hidden).
@@ -2146,7 +2169,7 @@ impl SpecStore {
             draft_top1,
             draft_top1_host: vec![0; top1_bytes],
             append_scratch,
-            routes: LabRoutes::Floor,
+            routes: LabRoutes::from_env(),
             skip_rollback: false,
         })
     }
