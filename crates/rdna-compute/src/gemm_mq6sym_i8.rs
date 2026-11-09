@@ -287,17 +287,29 @@ fn x4_entry(tile: Tile) -> Option<&'static str> {
     }
 }
 
+/// Largest-member rows of the EP2 trunk-shard GDN group (qkv 5120 | z 3072 | a 24 | b 24) for
+/// which the multi-part rule takes `m32n32_x4` at 17..=32 tokens, where [`narrow_tile`] picks
+/// `m64n32` (no x4 entry: four single launches). R9700 cold-weight bench, fabric j8784
+/// (release-0.4.5/storystep/mq6bench): the group's four singles 61.3–64.5 µs vs `m32n32_x4`
+/// 40.6–41.2 µs at n 17..32, byte-identical. From 6144 rows [`narrow_tile`] already picks
+/// `m32n32`; other `m64n32` shapes are unmeasured and keep the per-member launches.
+const X4_SHARD_M32N32_M: std::ops::Range<usize> = 5120..6144;
+
 /// The one tile of a multi-part launch of `n` tokens whose largest part has `max_m` rows: the
-/// single-matrix rule of that part ([`narrow_tile`]) for `9..=48`, the token-split tile for
+/// single-matrix rule of that part ([`narrow_tile`]) for `9..=48` (with `shard`, the trunk-shard
+/// GDN group's `m64n32` becomes `m32n32`, [`X4_SHARD_M32N32_M`]), the token-split tile for
 /// `49..=64`; `None` when no x4 entry exists for it (the caller launches per member).
-fn x4_tile(max_m: usize, n: usize) -> Option<Tile> {
+fn x4_tile(max_m: usize, n: usize, shard: bool) -> Option<Tile> {
     if !(QWEN4_TRUNK_A8_MIN_ROWS..=MQ6SYM_X4_MAX_ROWS).contains(&n) {
         return None;
     }
     let tile = if n > 48 {
         Tile::M64N16Y
     } else {
-        narrow_tile(max_m, n)
+        match narrow_tile(max_m, n) {
+            Tile::M64N32 if shard && X4_SHARD_M32N32_M.contains(&max_m) => Tile::M32N32,
+            tile => tile,
+        }
     };
     x4_entry(tile).map(|_| tile)
 }
@@ -525,7 +537,12 @@ impl Gpu {
         if ms.is_empty() || ms.len() > MQ6SYM_X4_MAX_PARTS {
             return None;
         }
-        x4_tile(ms.iter().copied().max()?, n).and_then(x4_entry)
+        x4_tile(
+            ms.iter().copied().max()?,
+            n,
+            self.flags.qwen4_trunk_a8_x4_shard,
+        )
+        .and_then(x4_entry)
     }
 
     /// `HIPFIRE_QWEN4_TRUNK_A8_X4` (developer, default on): the F32 members of one K of the wide
@@ -626,7 +643,7 @@ impl Gpu {
             }
         }
         let max_m = ms.iter().copied().max().unwrap_or(0);
-        let tile = x4_tile(max_m, n).ok_or_else(|| {
+        let tile = x4_tile(max_m, n, self.flags.qwen4_trunk_a8_x4_shard).ok_or_else(|| {
             HipError::new(0, "gemm_mq6sym_i8_x4: no multi-part entry for this shape")
         })?;
         let kernel = x4_entry(tile)
@@ -931,11 +948,13 @@ mod tests {
     const X4_TILES: [Tile; 4] = [Tile::M64N16, Tile::M32N32, Tile::M64N48, Tile::M64N16Y];
 
     /// The multi-part rule on the two Flash-Next trunk groups (GDN 10240|6144|48|48, QSA
-    /// 12288|512|512|640): one tile from the largest part, the single-matrix rule of that part for
-    /// 9..=48 and the token-split tile for 49..=64, nothing outside 9..=64.
+    /// 12288|512|512|640) and the EP2 trunk-shard ones (GDN 5120|3072|24|24, QSA 6144|512|512|640):
+    /// one tile from the largest part, the single-matrix rule of that part for 9..=48 (the shard
+    /// GDN group's `m64n32` at 17..=32 becomes `m32n32` with the shard switch) and the
+    /// token-split tile for 49..=64, nothing outside 9..=64.
     #[test]
     fn x4_tile_rule_and_geometry() {
-        for max_m in [10240usize, 12288] {
+        for max_m in [10240usize, 12288, 6144] {
             for n in 9..=64usize {
                 let want = match n {
                     9..=16 => Tile::M64N16,
@@ -943,15 +962,34 @@ mod tests {
                     33..=48 => Tile::M64N48,
                     _ => Tile::M64N16Y,
                 };
-                assert_eq!(x4_tile(max_m, n), Some(want), "m={max_m} n={n}");
+                for shard in [false, true] {
+                    assert_eq!(x4_tile(max_m, n, shard), Some(want), "m={max_m} n={n}");
+                }
             }
         }
-        for n in [0usize, 1, 8, 65, 128, 4096] {
-            assert_eq!(x4_tile(10240, n), None, "n={n}");
+        for n in 9..=64usize {
+            let (want_on, want_off) = match n {
+                9..=16 => (Some(Tile::M64N16), Some(Tile::M64N16)),
+                17..=32 => (Some(Tile::M32N32), None),
+                33..=48 => (Some(Tile::M64N48), Some(Tile::M64N48)),
+                _ => (Some(Tile::M64N16Y), Some(Tile::M64N16Y)),
+            };
+            assert_eq!(x4_tile(5120, n, true), want_on, "shard gdn n={n}");
+            assert_eq!(x4_tile(5120, n, false), want_off, "shard off n={n}");
         }
-        // A tile without an x4 entry is refused, not substituted.
-        assert_eq!(x4_tile(2048, 12), None);
-        assert_eq!(x4_tile(20000, 24), None);
+        for n in [0usize, 1, 8, 65, 128, 4096] {
+            assert_eq!(x4_tile(10240, n, true), None, "n={n}");
+            assert_eq!(x4_tile(5120, n, true), None, "n={n}");
+        }
+        // Outside the measured shard band a tile without an x4 entry is refused, not substituted.
+        assert_eq!(x4_tile(2048, 12, true), None);
+        assert_eq!(x4_tile(20000, 24, true), None);
+        assert_eq!(x4_tile(5119, 24, true), None);
+        let shard_gdn = [5120usize, 24, 24, 3072];
+        assert_eq!(
+            x4_geometry(Tile::M32N32, &shard_gdn, 24),
+            ([160 + 1 + 1 + 96, 1, 1], 64)
+        );
         let gdn = [10240usize, 6144, 48, 48];
         assert_eq!(
             x4_geometry(Tile::M64N48, &gdn, 48),

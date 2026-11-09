@@ -100,6 +100,13 @@ pub struct FeatureFlags {
     /// `gemm_mq6sym_i8_set_*_x4` launch instead of one launch each. Bytes identical to the
     /// per-member launches. Default on (the PM Route-A twin is sealed); `HIPFIRE_QWEN4_TRUNK_A8_X4=0` is the kill switch.
     pub qwen4_trunk_a8_x4: bool,
+    /// Qwen4 gfx1201 A8 trunk multi-part tile at the EP2 trunk-shard GDN group
+    /// (`HIPFIRE_QWEN4_TRUNK_A8_X4_SHARD`, default on): at 17..=32 rows a group whose largest
+    /// member has 5120..=6143 rows (qkv 5120 | z 3072 | a | b) launches `m32n32_x4` instead of
+    /// the single-matrix rule's `m64n32`, which has no x4 entry (four launches). Bytes identical
+    /// (every tile shares the per-row arithmetic); `HIPFIRE_QWEN4_TRUNK_A8_X4_SHARD=0` restores the
+    /// per-member launches.
+    pub qwen4_trunk_a8_x4_shard: bool,
     /// Qwen4 HC read/write fusion level (`HIPFIRE_QWEN4_HC_FUSE`: 0 off, 1
     /// read side, 2 + attention epilogue, 3 + shared-down epilogue). Default
     /// 3 on gfx1151, 1 on gfx1201, 0 elsewhere; see [`Self::qwen4_hc_fuse_level`].
@@ -1270,6 +1277,7 @@ impl FeatureFlags {
             qwen4_gdn_chain_fuse: parse_bool("HIPFIRE_QWEN4_GDN_CHAIN_FUSE").unwrap_or(is_gfx1201),
             qwen4_gdn_qkv_bf16: parse_bool("HIPFIRE_QWEN4_GDN_QKV_BF16").unwrap_or(false),
             qwen4_trunk_a8_x4: parse_bool("HIPFIRE_QWEN4_TRUNK_A8_X4").unwrap_or(true),
+            qwen4_trunk_a8_x4_shard: parse_bool("HIPFIRE_QWEN4_TRUNK_A8_X4_SHARD").unwrap_or(true),
             qwen4_hc_fuse: value("HIPFIRE_QWEN4_HC_FUSE")
                 .ok()
                 .and_then(|v| v.trim().parse::<u8>().ok())
@@ -2421,6 +2429,7 @@ impl FeatureFlags {
             qwen4_gdn_chain_fuse: false,
             qwen4_gdn_qkv_bf16: false,
             qwen4_trunk_a8_x4: false,
+            qwen4_trunk_a8_x4_shard: false,
             qwen4_hc_fuse: 0,
             qwen4_hc_up_tile: false,
             qwen4_hc_up_v2: false,
