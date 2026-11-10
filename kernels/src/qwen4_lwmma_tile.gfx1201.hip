@@ -90,13 +90,21 @@ static __device__ __forceinline__ float lwmma_hc_act(float value, float scale) {
 // Y[rows, M] = epi(X . W^T).  Grid [ceil(M / BN), ceil(rows / BM)], block 32 * WM * WN.
 // K % (128 * split_k) == 0.  Wave (wm, wn) owns sub-tile rows [wm * MT * 16, +MT * 16), columns
 // [wn * NTN * 16, +NTN * 16) of the block tile.
-template <int NT, int BM, int BN, int WM, int WN>
+//
+// QG == 1: one wave group walks the whole K range ascending; the four quarter chains of a split-K
+// chunk run back to back in each wave.  QG == 4 (latency-bound small grids): the block carries
+// four wave groups, group q owns quarter q of every split-K chunk (its own LDS pipeline, the
+// block-wide barrier works because every group takes the same number of steps), and at the end of
+// each chunk groups 1..3 hand their chain to group 0 through LDS, which folds (c0 + c1) + (c2 + c3)
+// and accumulates the chunks in ascending order.  Same arithmetic, 4x shorter serial K walk.
+template <int NT, int BM, int BN, int WM, int WN, int QG>
 static __device__ __forceinline__ void lwmma_tile_body(
     const unsigned short* __restrict__ W,
     const float* __restrict__ X,
     float* __restrict__ Y,
     int M, int K, int rows, int split_k, float scale, int hc_act) {
-    constexpr int NTHR = 32 * WM * WN;
+    static_assert(QG == 1 || QG == 4, "quarter groups");
+    constexpr int NTHR = 32 * WM * WN;     // threads per wave group
     constexpr int MT = BM / WM / 16;
     constexpr int NTN = BN / WN / 16;
     static_assert(MT * WM * 16 == BM && NTN * WN * 16 == BN, "tile / wave split");
@@ -107,9 +115,13 @@ static __device__ __forceinline__ void lwmma_tile_body(
     constexpr int WCH = BN * 4;            // 8-element W chunks per K step
     constexpr int XPT = (XCH + NTHR - 1) / NTHR;
     constexpr int WPT = (WCH + NTHR - 1) / NTHR;
-    __shared__ __attribute__((aligned(16))) unsigned short lds[2 * BUF];
+    constexpr int RED = QG > 1 ? 3 * WM * WN * MT * NTN * 8 * 32 : 1;  // floats: chains of groups 1..3
+    __shared__ __attribute__((aligned(16))) unsigned short lds[QG * 2 * BUF];
+    __shared__ float red[RED];
 
-    const int tid = threadIdx.x;
+    const int gtid = threadIdx.x;
+    const int grp = QG > 1 ? gtid / NTHR : 0;
+    const int tid = QG > 1 ? gtid % NTHR : gtid;
     const int wave = tid >> 5, lane = tid & 31, l16 = lane & 15, kh = lane >> 4;
     const int wm = wave / WN, wn = wave % WN;
     const int n0 = blockIdx.x * BN;
@@ -131,6 +143,7 @@ static __device__ __forceinline__ void lwmma_tile_body(
         wg[u] = W + (size_t)row * K + 8 * (idx & 3);
     }
 
+    unsigned short* const glds = lds + grp * 2 * BUF;
     float4 xv[XPT][2];
     uint4 wv[WPT];
     auto gload = [&](int s) {
@@ -149,7 +162,7 @@ static __device__ __forceinline__ void lwmma_tile_body(
         }
     };
     auto sstore = [&](int buf) {
-        unsigned short* base = lds + buf * BUF;
+        unsigned short* base = glds + buf * BUF;
 #pragma unroll
         for (int u = 0; u < XPT; u++) {
             const int idx = tid + u * NTHR;
@@ -169,29 +182,37 @@ static __device__ __forceinline__ void lwmma_tile_body(
         }
     };
 
-    lwmma_f8_t acc[MT][NTN], s01[MT][NTN], c2[MT][NTN], vv[MT][NTN];
+    constexpr int SM = QG == 1 ? MT : 1, SN = QG == 1 ? NTN : 1;
+    lwmma_f8_t acc[MT][NTN], vv[MT][NTN], s01[SM][SN], c2[SM][SN];
 #pragma unroll
     for (int mt = 0; mt < MT; mt++)
 #pragma unroll
         for (int nt = 0; nt < NTN; nt++) {
             acc[mt][nt] = lwmma_f8_t{0, 0, 0, 0, 0, 0, 0, 0};
-            s01[mt][nt] = acc[mt][nt];
-            c2[mt][nt] = acc[mt][nt];
             vv[mt][nt] = acc[mt][nt];
         }
+#pragma unroll
+    for (int mt = 0; mt < SM; mt++)
+#pragma unroll
+        for (int nt = 0; nt < SN; nt++) {
+            s01[mt][nt] = lwmma_f8_t{0, 0, 0, 0, 0, 0, 0, 0};
+            c2[mt][nt] = s01[mt][nt];
+        }
 
-    const int S = K / 32;                   // K steps
     const int nq = (K / split_k / 4) / 32;  // K steps per quarter chain
+    const int LS = QG == 1 ? K / 32 : split_k * nq;  // this group's K steps
+    // Global K step of this group's local step j.
+    auto gstep = [&](int j) { return QG == 1 ? j : ((j / nq) * 4 + grp) * nq + (j % nq); };
 
-    gload(0);
+    gload(gstep(0));
     sstore(0);
     __syncthreads();
 
     // One K step: the redundant tail prefetch (clamped to the last step) keeps the loop branch-free.
-    auto step = [&](int s) {
-        const int cur = s & 1;
-        gload(min(s + 1, S - 1));
-        const unsigned short* base = lds + cur * BUF;
+    auto step = [&](int j) {
+        const int cur = j & 1;
+        gload(gstep(min(j + 1, LS - 1)));
+        const unsigned short* base = glds + cur * BUF;
 #pragma unroll
         for (int sub = 0; sub < 2; sub++) {
             lwmma_bf16x8_t bf[NTN];
@@ -216,30 +237,72 @@ static __device__ __forceinline__ void lwmma_tile_body(
         __syncthreads();
     };
 
-    // Chain g = kz * 4 + quarter; the K walk is ascending, so chain g owns steps [g * nq, (g + 1) * nq).
-    int s = 0;
-    for (int g = 0; g < 4 * split_k; g++) {
-        for (int b = 0; b < nq; b++, s++) step(s);
-        const int q = g & 3;
+    if constexpr (QG == 1) {
+        // Chain g = kz * 4 + quarter; the K walk is ascending, so chain g owns steps [g * nq, (g + 1) * nq).
+        int s = 0;
+        for (int g = 0; g < 4 * split_k; g++) {
+            for (int b = 0; b < nq; b++, s++) step(s);
+            const int q = g & 3;
 #pragma unroll
-        for (int mt = 0; mt < MT; mt++)
+            for (int mt = 0; mt < MT; mt++)
 #pragma unroll
-            for (int nt = 0; nt < NTN; nt++) {
-                if (q == 0) {
-                    s01[mt][nt] = acc[mt][nt];
-                } else if (q == 1) {
-                    s01[mt][nt] = s01[mt][nt] + acc[mt][nt];
-                } else if (q == 2) {
-                    c2[mt][nt] = acc[mt][nt];
-                } else {
-                    const lwmma_f8_t p = s01[mt][nt] + (c2[mt][nt] + acc[mt][nt]);
-                    if (split_k == 1) vv[mt][nt] = p;
-                    else vv[mt][nt] = vv[mt][nt] + p;
+                for (int nt = 0; nt < NTN; nt++) {
+                    if (q == 0) {
+                        s01[mt][nt] = acc[mt][nt];
+                    } else if (q == 1) {
+                        s01[mt][nt] = s01[mt][nt] + acc[mt][nt];
+                    } else if (q == 2) {
+                        c2[mt][nt] = acc[mt][nt];
+                    } else {
+                        const lwmma_f8_t p = s01[mt][nt] + (c2[mt][nt] + acc[mt][nt]);
+                        if (split_k == 1) vv[mt][nt] = p;
+                        else vv[mt][nt] = vv[mt][nt] + p;
+                    }
+                    acc[mt][nt] = lwmma_f8_t{0, 0, 0, 0, 0, 0, 0, 0};
                 }
-                acc[mt][nt] = lwmma_f8_t{0, 0, 0, 0, 0, 0, 0, 0};
+        }
+    } else {
+        int j = 0;
+        for (int kz = 0; kz < split_k; kz++) {
+            for (int b = 0; b < nq; b++, j++) step(j);
+            // Groups 1..3 publish their chain (red is free: group 0 read the previous chunk's
+            // values before the barrier of the first step of this chunk), group 0 folds.
+            if (grp > 0) {
+                float* r = red + ((grp - 1) * WM * WN + wave) * (MT * NTN * 8 * 32);
+#pragma unroll
+                for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+                    for (int nt = 0; nt < NTN; nt++)
+#pragma unroll
+                        for (int i = 0; i < 8; i++) r[(((mt * NTN + nt) * 8 + i) << 5) + lane] = acc[mt][nt][i];
             }
+            __syncthreads();
+            if (grp == 0) {
+#pragma unroll
+                for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+                    for (int nt = 0; nt < NTN; nt++) {
+                        lwmma_f8_t c1, cc2, c3;
+#pragma unroll
+                        for (int i = 0; i < 8; i++) {
+                            const int e = (((mt * NTN + nt) * 8 + i) << 5) + lane;
+                            c1[i] = red[(0 * WM * WN + wave) * (MT * NTN * 8 * 32) + e];
+                            cc2[i] = red[(1 * WM * WN + wave) * (MT * NTN * 8 * 32) + e];
+                            c3[i] = red[(2 * WM * WN + wave) * (MT * NTN * 8 * 32) + e];
+                        }
+                        const lwmma_f8_t p = (acc[mt][nt] + c1) + (cc2 + c3);
+                        if (split_k == 1) vv[mt][nt] = p;
+                        else vv[mt][nt] = vv[mt][nt] + p;
+                    }
+            }
+#pragma unroll
+            for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+                for (int nt = 0; nt < NTN; nt++) acc[mt][nt] = lwmma_f8_t{0, 0, 0, 0, 0, 0, 0, 0};
+        }
     }
 
+    if (grp != 0) return;
 #pragma unroll
     for (int mt = 0; mt < MT; mt++)
 #pragma unroll
@@ -256,13 +319,17 @@ static __device__ __forceinline__ void lwmma_tile_body(
         }
 }
 
-#define LWMMA_TILE_ENTRY(NT, BM, BN, WM, WN)                                                          \
-    extern "C" __global__ __launch_bounds__(32 * WM * WN) void                                        \
-        lwmma_tile_bf16_t##NT##_b##BM##x##BN##w##WM##x##WN(                                           \
-            const unsigned short* __restrict__ W, const float* __restrict__ X, float* __restrict__ Y, \
-            int M, int K, int rows, int split_k, float scale, int hc_act) {                          \
-        lwmma_tile_body<NT, BM, BN, WM, WN>(W, X, Y, M, K, rows, split_k, scale, hc_act);             \
+#define LWMMA_TILE_ENTRY_NAMED(NAME, NT, BM, BN, WM, WN, QG)                                          \
+    extern "C" __global__ __launch_bounds__(32 * WM * WN * QG) void NAME(                             \
+        const unsigned short* __restrict__ W, const float* __restrict__ X, float* __restrict__ Y,   \
+        int M, int K, int rows, int split_k, float scale, int hc_act) {                              \
+        lwmma_tile_body<NT, BM, BN, WM, WN, QG>(W, X, Y, M, K, rows, split_k, scale, hc_act);         \
     }
+
+#define LWMMA_TILE_ENTRY(NT, BM, BN, WM, WN) \
+    LWMMA_TILE_ENTRY_NAMED(lwmma_tile_bf16_t##NT##_b##BM##x##BN##w##WM##x##WN, NT, BM, BN, WM, WN, 1)
+#define LWMMA_TILE_ENTRY_G4(NT, BM, BN, WM, WN) \
+    LWMMA_TILE_ENTRY_NAMED(lwmma_tile_bf16_t##NT##_b##BM##x##BN##w##WM##x##WN##g4, NT, BM, BN, WM, WN, 4)
 
 #define LWMMA_TILE_ENTRIES(NT)           \
     LWMMA_TILE_ENTRY(NT, 64, 64, 4, 2)   \
@@ -277,7 +344,11 @@ static __device__ __forceinline__ void lwmma_tile_body(
     LWMMA_TILE_ENTRY(NT, 64, 64, 4, 1)   \
     LWMMA_TILE_ENTRY(NT, 32, 64, 2, 1)   \
     LWMMA_TILE_ENTRY(NT, 128, 64, 8, 1)  \
-    LWMMA_TILE_ENTRY(NT, 64, 256, 4, 4)
+    LWMMA_TILE_ENTRY(NT, 64, 256, 4, 4)  \
+    LWMMA_TILE_ENTRY_G4(NT, 16, 32, 1, 1)
 
 LWMMA_TILE_ENTRIES(1)
 LWMMA_TILE_ENTRIES(2)
+// Wider quarter-group tiles fit the 64 KB LDS only with one activation term.
+LWMMA_TILE_ENTRY_G4(1, 16, 64, 1, 2)
+LWMMA_TILE_ENTRY_G4(1, 32, 32, 2, 1)

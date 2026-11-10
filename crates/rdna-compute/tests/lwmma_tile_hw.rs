@@ -162,8 +162,8 @@ fn lwmma_tile_oracle_hw() {
             let want = download_f32(&gpu, &y_ref, rows * m);
 
             let mut cfgs: Vec<(String, Option<LaneWmmaTile>)> = vec![("pick".into(), None)];
-            for t in LANE_WMMA_TILES {
-                cfgs.push((format!("b{}x{}w{}x{}", t.bm, t.bn, t.wm, t.wn), Some(*t)));
+            for t in LANE_WMMA_TILES.iter().filter(|t| t.instantiated(terms)) {
+                cfgs.push((t.name(), Some(*t)));
             }
             let mut line = format!("[tile-oracle] m={m} k={k} t={terms} rows={rows} split_k={split_k}");
             for (name, t) in &cfgs {
@@ -245,24 +245,24 @@ fn lwmma_tile_bench_hw() {
                     .expect("incumbent");
             });
             println!("[tile-bench] m={m} k={k} t={terms} rows={rows} arm=incumbent us={us:.1}");
-            for t in LANE_WMMA_TILES {
+            for t in LANE_WMMA_TILES.iter().filter(|t| t.instantiated(terms)) {
                 let us = time_us(&mut gpu, |g| {
                     lane_wmma_tile_gemm_cfg(g, &w, &x_t, &y_t, m, k, rows, terms, act, split_k, *t)
                         .expect("tile");
                 });
                 println!(
-                    "[tile-bench] m={m} k={k} t={terms} rows={rows} arm=tile-b{}x{}w{}x{} us={us:.1}",
-                    t.bm, t.bn, t.wm, t.wn
+                    "[tile-bench] m={m} k={k} t={terms} rows={rows} arm=tile-{} us={us:.1}",
+                    t.name()
                 );
             }
-            let pick = lane_wmma_tile_pick(m, k, rows);
+            let pick = lane_wmma_tile_pick(m, k, rows, terms);
             let us = time_us(&mut gpu, |g| {
                 g.lane_wmma_tile_gemm_prefill(&wref, &x_t, &y_t, m, k, rows, terms, act)
                     .expect("tile prefill");
             });
             println!(
-                "[tile-bench] m={m} k={k} t={terms} rows={rows} arm=tile-pick(b{}x{}w{}x{}) us={us:.1}",
-                pick.bm, pick.bn, pick.wm, pick.wn
+                "[tile-bench] m={m} k={k} t={terms} rows={rows} arm=tile-pick({}) us={us:.1}",
+                pick.name()
             );
         }
     }

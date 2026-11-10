@@ -28,34 +28,50 @@ pub const LANE_WMMA_TILE_SRC: &str =
 
 const LANE_WMMA_TILE_MODULE: &str = "qwen4_lwmma_tile";
 
-/// One compiled tile configuration: the block owns `bm x bn` outputs, `wm x wn` waves.
+/// One compiled tile configuration: the block owns `bm x bn` outputs, `wm x wn` waves per wave
+/// group; `qg` wave groups per block (1: one group walks all of K; 4: group q owns quarter q of
+/// every split-K chunk, for latency-bound small grids).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LaneWmmaTile {
     pub bm: usize,
     pub bn: usize,
     pub wm: usize,
     pub wn: usize,
+    pub qg: usize,
 }
 
 impl LaneWmmaTile {
     /// Threads per block.
     pub fn threads(&self) -> usize {
-        32 * self.wm * self.wn
+        32 * self.wm * self.wn * self.qg
+    }
+
+    /// `b<BM>x<BN>w<WM>x<WN>` plus `g4` for the quarter-group variants.
+    pub fn name(&self) -> String {
+        let g = if self.qg == 4 { "g4" } else { "" };
+        format!("b{}x{}w{}x{}{g}", self.bm, self.bn, self.wm, self.wn)
+    }
+
+    /// Whether the kernel file instantiates this tile for `terms` activation terms (the wider
+    /// quarter-group tiles only fit the 64 KB LDS with one term).
+    pub fn instantiated(&self, terms: usize) -> bool {
+        LANE_WMMA_TILES.contains(self) && (self.qg == 1 || terms == 1 || (self.bm, self.bn) == (16, 32))
     }
 
     fn entry(&self, terms: usize) -> String {
-        format!(
-            "lwmma_tile_bf16_t{terms}_b{}x{}w{}x{}",
-            self.bm, self.bn, self.wm, self.wn
-        )
+        format!("lwmma_tile_bf16_t{terms}_{}", self.name())
     }
 }
 
 const fn tile(bm: usize, bn: usize, wm: usize, wn: usize) -> LaneWmmaTile {
-    LaneWmmaTile { bm, bn, wm, wn }
+    LaneWmmaTile { bm, bn, wm, wn, qg: 1 }
 }
 
-/// Every tile configuration the kernel file instantiates (both term counts).
+const fn tile_g4(bm: usize, bn: usize, wm: usize, wn: usize) -> LaneWmmaTile {
+    LaneWmmaTile { bm, bn, wm, wn, qg: 4 }
+}
+
+/// Every tile configuration the kernel file instantiates (see [`LaneWmmaTile::instantiated`]).
 pub const LANE_WMMA_TILES: &[LaneWmmaTile] = &[
     tile(64, 64, 4, 2),
     tile(64, 128, 2, 4),
@@ -70,6 +86,9 @@ pub const LANE_WMMA_TILES: &[LaneWmmaTile] = &[
     tile(32, 64, 2, 1),
     tile(128, 64, 8, 1),
     tile(64, 256, 4, 4),
+    tile_g4(16, 32, 1, 1),
+    tile_g4(16, 64, 1, 2),
+    tile_g4(32, 32, 2, 1),
 ];
 
 /// Row buckets of the pick table: up to 300 rows, up to 800 rows, above.
@@ -81,22 +100,28 @@ fn rows_bucket(rows: usize) -> usize {
     }
 }
 
-/// Tuned picks per served `(m, k)` and row bucket (T3 bench on card C, 2026-11-09: the fastest
-/// configuration of the sweep at 149 / 596 / 1192 rows).
-const TILE_PICKS: &[((usize, usize), [LaneWmmaTile; 3])] = &[
-    ((320, 10240), [tile(32, 64, 2, 2), tile(32, 64, 2, 2), tile(64, 64, 4, 1)]),
-    ((512, 2560), [tile(32, 64, 2, 2), tile(32, 64, 2, 2), tile(64, 64, 4, 2)]),
-    ((640, 2560), [tile(32, 64, 2, 2), tile(32, 128, 2, 2), tile(64, 128, 4, 2)]),
-    ((2560, 640), [tile(64, 128, 4, 2), tile(64, 128, 2, 4), tile(64, 128, 2, 4)]),
-    ((2560, 2560), [tile(64, 128, 2, 4), tile(32, 128, 2, 2), tile(64, 128, 4, 2)]),
-    ((10240, 2560), [tile(64, 128, 4, 2), tile(64, 128, 4, 2), tile(64, 128, 4, 2)]),
+/// Tuned picks per served `(m, k)` (and `terms`, 0 = any) and row bucket (T3 bench on card C,
+/// 2026-11-10: the fastest configuration of the sweep at 149 / 596 / 1192 rows). The quarter-group
+/// tiles win only the 149-row bucket of the 320 x 10240 shapes, where the serial K walk of the
+/// plain tiles is latency bound.
+const TILE_PICKS: &[(usize, usize, usize, [LaneWmmaTile; 3])] = &[
+    (320, 10240, 1, [tile_g4(32, 32, 2, 1), tile(32, 64, 2, 2), tile(64, 64, 4, 1)]),
+    (320, 10240, 2, [tile_g4(16, 32, 1, 1), tile(32, 64, 2, 2), tile(64, 64, 4, 1)]),
+    (512, 2560, 0, [tile(32, 64, 2, 2), tile(32, 64, 2, 2), tile(64, 64, 4, 2)]),
+    (640, 2560, 0, [tile(32, 64, 2, 2), tile(32, 128, 2, 2), tile(64, 128, 4, 2)]),
+    (2560, 640, 0, [tile(64, 128, 4, 2), tile(64, 128, 2, 4), tile(64, 128, 2, 4)]),
+    (2560, 2560, 0, [tile(64, 128, 2, 4), tile(32, 128, 2, 2), tile(64, 128, 4, 2)]),
+    (10240, 2560, 0, [tile(64, 128, 4, 2), tile(64, 128, 4, 2), tile(64, 128, 4, 2)]),
 ];
 
-/// The tile configuration [`lane_wmma_tile_gemm`] runs for `(m, k, rows)`: the tuned table for the
-/// served shapes, else a shape-generic rule (every configuration is bitwise the same).
-pub fn lane_wmma_tile_pick(m: usize, k: usize, rows: usize) -> LaneWmmaTile {
+/// The tile configuration [`lane_wmma_tile_gemm`] runs for `(m, k, rows, terms)`: the tuned table
+/// for the served shapes, else a shape-generic rule (every configuration is bitwise the same).
+pub fn lane_wmma_tile_pick(m: usize, k: usize, rows: usize, terms: usize) -> LaneWmmaTile {
     let bucket = rows_bucket(rows);
-    if let Some((_, t)) = TILE_PICKS.iter().find(|(key, _)| *key == (m, k)) {
+    if let Some((_, _, _, t)) = TILE_PICKS
+        .iter()
+        .find(|(pm, pk, pt, _)| (*pm, *pk) == (m, k) && (*pt == 0 || *pt == terms))
+    {
         return t[bucket];
     }
     match (bucket, m % 128 == 0, m % 64 == 0) {
@@ -133,8 +158,10 @@ pub fn lane_wmma_tile_gemm_cfg(
             "tile: k {k} must be a non-zero multiple of 128 * split_k {split_k}"
         )));
     }
-    if !LANE_WMMA_TILES.contains(&t) {
-        return Err(err(format!("tile: configuration {t:?} is not instantiated")));
+    if !t.instantiated(terms) {
+        return Err(err(format!(
+            "tile: configuration {t:?} is not instantiated for terms {terms}"
+        )));
     }
     need_bytes(w, m * k * 2, "tile bf16 weight")?;
     need_f32(x, rows * k, "tile x")?;
@@ -194,7 +221,7 @@ pub fn lane_wmma_tile_gemm(
     hc_act: Option<f32>,
     split_k: usize,
 ) -> HipResult<LaneWmmaLaunch> {
-    let t = lane_wmma_tile_pick(m, k, rows);
+    let t = lane_wmma_tile_pick(m, k, rows, terms);
     lane_wmma_tile_gemm_cfg(gpu, w, x, y, m, k, rows, terms, hc_act, split_k, t)
 }
 
@@ -229,15 +256,19 @@ mod tests {
 
     #[test]
     fn every_pick_is_an_instantiated_tile() {
-        for ((m, k), picks) in TILE_PICKS {
+        for (m, k, _, picks) in TILE_PICKS {
             for t in picks {
-                assert!(LANE_WMMA_TILES.contains(t), "{m}x{k}: {t:?} not instantiated");
+                assert!(t.instantiated(1), "{m}x{k}: {t:?} not instantiated");
             }
         }
         for m in [320, 512, 640, 2560, 10240, 96, 1000] {
-            for rows in [1, 65, 149, 300, 301, 596, 800, 801, 1192, 2048] {
-                let t = lane_wmma_tile_pick(m, 2560, rows);
-                assert!(LANE_WMMA_TILES.contains(&t), "m {m} rows {rows}: {t:?}");
+            for k in [640, 2560, 10240] {
+                for rows in [1, 65, 149, 300, 301, 596, 800, 801, 1192, 2048] {
+                    for terms in [1, 2] {
+                        let t = lane_wmma_tile_pick(m, k, rows, terms);
+                        assert!(t.instantiated(terms), "m {m} k {k} rows {rows} t {terms}: {t:?}");
+                    }
+                }
             }
         }
     }
