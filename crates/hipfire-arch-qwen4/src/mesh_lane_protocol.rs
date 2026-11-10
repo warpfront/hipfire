@@ -9193,6 +9193,67 @@ mod tests {
         }
     }
 
+    /// The widest step the root plans (two lanes of full copy windows) fits
+    /// the step rows the store allocates for its lane count
+    /// ([`crate::mesh_rank_copy::copy_budget`]); a store of fewer lanes than
+    /// the native step covers once sized its buffers for the native step alone
+    /// and the ranks refused the takeover ("verify rows exceed the store's
+    /// step rows").
+    #[test]
+    fn mesh_lane_protocol_widest_copy_step_fits_the_stores_step_rows() {
+        let context = crate::kv_backend::Qwen4ContextCommit::legacy(64);
+        let copy = crate::lane::LaneCopyConfig {
+            ngram: copy_cfg(),
+            head_lag_rows: 4,
+            wide_lanes: 2,
+        };
+        // (store lanes, native K): 2 lanes at the serve's K=5; 2..=5 lanes at K=2.
+        for (lanes, k) in [(2usize, 5usize), (2, 2), (3, 2), (4, 2), (5, 2), (8, 5)] {
+            let budget =
+                crate::mesh_rank_copy::copy_budget(lanes, k, &copy, 8, context, 1).unwrap();
+            let mut b = cycle_budgets();
+            b.max_lanes = lanes;
+            b.max_rows = budget.step_rows();
+            let mut m = Mesh::new_with(MeshKind::Ep, false, Some(copy_cfg()));
+            m.root.copy_max_lanes = copy.wide_lanes;
+            let tags = [1u64, 2];
+            let epochs: Vec<RequestEpoch> = tags
+                .iter()
+                .map(|&t| {
+                    let e = admit_cycle(&mut m, t, None);
+                    script_cycle(&m, t, 0, 20);
+                    e
+                })
+                .collect();
+            let reqs: Vec<LaneRequest> = tags.iter().map(|&t| req(t, 99)).collect();
+            // Steps of two copy lanes until a step plans the full window of
+            // both (the take-length chooser lengthens a copy window as the
+            // lane's acceptance accrues): every step stays inside the store.
+            let mut widest = 0usize;
+            for seq in 0..6u64 {
+                if seq > 0 {
+                    for (&t, &e) in tags.iter().zip(&epochs) {
+                        let (_, seed) = m.root.lane_position(e).unwrap();
+                        script_cycle(&m, t, seq, seed);
+                    }
+                }
+                let (start, _) = m.step(&reqs, &b);
+                let rows: usize = start.lanes.iter().map(LanePlan::max_rows).sum();
+                assert!(
+                    rows <= budget.step_rows(),
+                    "lanes={lanes} k={k} step {seq}: {rows} planned rows exceed the store's {} step rows",
+                    budget.step_rows()
+                );
+                widest = widest.max(rows);
+            }
+            assert!(
+                widest > lanes.min(2) * (k + 1) || lanes * (k + 1) >= 16,
+                "lanes={lanes} k={k}: the widest planned step ({widest} rows) never needed more \
+                 than the native step the store once held"
+            );
+        }
+    }
+
     /// Root CPU cost per phase of one scripted window (microseconds, median of
     /// 400 steps): the receipt of what the lane driver adds on the host between
     /// GPU phases. `cargo test --release -p hipfire-arch-qwen4 --lib

@@ -89,8 +89,11 @@ pub struct LaneSpecBudget {
     /// across lanes); `0` for greedy-only and the host-draw naive sampler.
     pub sampling_scratch: u64,
     /// Decode rows per lane the step buffers hold (`verify_rows_per_lane`
-    /// unless [`Self::with_step_rows_per_lane`] narrows it).
+    /// unless [`Self::with_copy_steps`] narrows it).
     step_rows_per_lane: usize,
+    /// Rows the widest copy step carries (`0`: no copy steps, the per-lane
+    /// rows alone size the step; see [`Self::with_copy_steps`]).
+    copy_step_rows: usize,
 }
 
 impl LaneSpecBudget {
@@ -151,6 +154,7 @@ impl LaneSpecBudget {
             owner_mask,
             sampling_scratch: 0,
             step_rows_per_lane: verify_rows_per_lane,
+            copy_step_rows: 0,
         })
     }
 
@@ -211,19 +215,27 @@ impl LaneSpecBudget {
         self
     }
 
-    /// With the step buffers sized for `rows` decode rows per lane (at least 1
-    /// and at most `verify_rows_per_lane`): a store whose widest windows come
-    /// from a few lanes in small steps (the copy lane) keeps the native
-    /// `native_k + 1`-row step buffers.
-    pub fn with_step_rows_per_lane(mut self, rows: usize) -> Self {
-        self.step_rows_per_lane = rows.clamp(1, self.verify_rows_per_lane);
+    /// With the step buffers of a store that runs copy windows only in steps
+    /// of at most `copy_lanes` lanes (every other window is native, at most
+    /// `native_k + 1` rows): the buffers hold the larger of the native step
+    /// (`lanes * (native_k + 1)`) and the widest copy step (`min(copy_lanes,
+    /// lanes)` lanes of `verify_rows_per_lane` rows). A copy step must fit
+    /// whatever the lane count: at fewer lanes than the native rows cover
+    /// (`lanes * (native_k + 1) < copy_lanes * verify_rows_per_lane`) the
+    /// widest copy step sets the size, so a small store still takes its copy
+    /// windows. At the default eight lanes the native step is the larger
+    /// and the buffers are unchanged.
+    pub fn with_copy_steps(mut self, copy_lanes: usize) -> Self {
+        self.step_rows_per_lane = (self.native_k + 1).min(self.verify_rows_per_lane);
+        self.copy_step_rows = copy_lanes.min(self.lanes) * self.verify_rows_per_lane;
         self
     }
 
-    /// Decode rows the step buffers hold: `lanes * step_rows_per_lane`
-    /// (`verify_rows_per_lane` unless narrowed).
+    /// Decode rows the step buffers hold: `lanes * step_rows_per_lane`, and at
+    /// least the widest copy step ([`Self::with_copy_steps`]);
+    /// `lanes * verify_rows_per_lane` without it.
     pub fn step_rows(&self) -> usize {
-        self.lanes * self.step_rows_per_lane
+        (self.lanes * self.step_rows_per_lane).max(self.copy_step_rows)
     }
 
     /// Whether rank/band `rank` owns the MTP head and the sampler.

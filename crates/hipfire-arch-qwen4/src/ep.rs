@@ -4708,10 +4708,18 @@ mod tests {
         );
         assert!(wide > narrow, "the copy ring is wider ({wide} vs {narrow})");
         let all_wide = bytes(usize::MAX, None);
+        // The step buffers hold the larger of the native step (`lanes * (k + 1)`
+        // rows) and the widest copy step (`wide_lanes` lanes of 8 rows): each
+        // decode row costs its logits (+ top-1) and its wide hidden.
+        let row_bytes =
+            (config.vocab_size * 4 + 4 + config.hc_count * config.hidden_size * 4) as u64;
+        let step_rows = |w: usize| (lanes * (k + 1)).max(w.min(lanes) * 8) as u64;
         for w in 0..=lanes {
             assert_eq!(
                 bytes(w, None),
-                all_wide - (lanes - w) as u64 * (wide - narrow),
+                all_wide
+                    - (lanes - w) as u64 * (wide - narrow)
+                    - (step_rows(usize::MAX) - step_rows(w)) * row_bytes,
                 "wide_lanes={w}"
             );
         }
@@ -4746,8 +4754,12 @@ mod tests {
         );
         // A mixed store: only the MTP slots carry a ring, wide on the first two.
         let mixed_all = bytes(usize::MAX, Some(3));
-        assert_eq!(bytes(2, Some(3)), mixed_all - (wide - narrow));
-        assert_eq!(bytes(5, Some(3)), mixed_all);
+        let step_less = |w: usize| (step_rows(usize::MAX) - step_rows(w)) * row_bytes;
+        assert_eq!(
+            bytes(2, Some(3)),
+            mixed_all - (wide - narrow) - step_less(2)
+        );
+        assert_eq!(bytes(5, Some(3)), mixed_all - step_less(5));
     }
 
     /// The AR lane store a rank stages carries no snapshot mirror: the one
