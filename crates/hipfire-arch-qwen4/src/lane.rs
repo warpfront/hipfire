@@ -144,6 +144,7 @@ fn classify_owned_experts(weights: &Qwen4Weights, config: &Qwen4Config) -> LaneE
     let arenas = match &weights.manifest.identity.recipe {
         Qwen4TierRecipe::FlashNextSlab { arenas, .. } => Some(arenas.as_ref()),
         Qwen4TierRecipe::FlashNextPacked { .. } => None,
+        Qwen4TierRecipe::StockFp8 => return classify_stock_fp8_experts(weights, band),
         _ => return LaneExpertRoute::Unclassified,
     };
     let (mut host_mapped, mut refused, mut e8p_experts, mut mq3_experts) =
@@ -172,6 +173,41 @@ fn classify_owned_experts(weights: &Qwen4Weights, config: &Qwen4Config) -> LaneE
         LaneExpertRoute::ResidentMq3Slab
     } else {
         LaneExpertRoute::Unclassified
+    }
+}
+
+/// Stock-FP8 band: every owned layer a MoE layer whose gate_up / down
+/// aggregates are resident (device, not host-mapped) qt=55 `FP8E4M3B128`
+/// tables with no expert arena is [`LaneExpertRoute::ResidentFp8`]; any
+/// host-mapped aggregate is [`LaneExpertRoute::HostMapped`]; anything else
+/// is `Unclassified`.
+fn classify_stock_fp8_experts(
+    weights: &Qwen4Weights,
+    band: std::ops::Range<usize>,
+) -> LaneExpertRoute {
+    let mut host_mapped = false;
+    for absolute in band {
+        let Some(moe) = weights.layer(absolute).and_then(|layer| layer.ffn.moe()) else {
+            return LaneExpertRoute::Unclassified;
+        };
+        if moe.expert_arena.is_some() {
+            return LaneExpertRoute::Unclassified;
+        }
+        let (Ok(gate_up), Ok(down)) = (
+            weights.resident(&moe.experts_gate_up),
+            weights.resident(&moe.experts_down),
+        ) else {
+            return LaneExpertRoute::Unclassified;
+        };
+        if gate_up.dtype != DType::FP8E4M3B128 || down.dtype != DType::FP8E4M3B128 {
+            return LaneExpertRoute::Unclassified;
+        }
+        host_mapped |= gate_up.buf.is_host_mapped() || down.buf.is_host_mapped();
+    }
+    if host_mapped {
+        LaneExpertRoute::HostMapped
+    } else {
+        LaneExpertRoute::ResidentFp8
     }
 }
 

@@ -857,7 +857,7 @@ retains the ordinary automatic legacy fallback; gfx1100 TP/Givens fallback,
 gfx1201 selection and defaults are unchanged.
 
 Qwen4 (Flash-Next, arch 16) owns its own QSA context layout. Automatic
-selects **vmm** exactly on gfx1151 or gfx1201 with a certified platform (not Windows,
+selects **vmm** exactly on gfx1151, gfx1201 or gfx942 with a certified platform (not Windows,
 not WSL without its unsafe override) and a HIP VMM runtime; elsewhere it
 selects legacy and logs the reason. Explicit `legacy` is always honoured, and
 explicit `vmm` is refused only where that capability check fails. Under VMM,

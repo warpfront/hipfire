@@ -391,6 +391,25 @@ pub const GFX1201_HC8_ROWS_RECEIPT: &str =
 pub const GFX1201_PLE_PROJECT_RECEIPT: &str =
     "g0 reread/runs/oracle1 j8313 2026-11-06 gfx1201 bf16 ple key/value lanes2-8 rows4-48";
 
+/// G0 oracle receipt behind the gfx942 single-device stock-FP8 row-twin proofs
+/// (`fn_lane_oracle --g0 --controls`, one MI300X, `qwen3.8-flash-next.stock-fp8.hfq`
+/// sha256 `650e7f43…`, contexts 512/2048, 64 steps): the combined production
+/// policy (every row-local stage once over all rows) at k=1/2/4/8 gave every
+/// lane's logits rows, ids and state checkpoints byte-identical to the
+/// singleton, and the negative controls were detected. The per-stage probes did
+/// NOT all agree: sharing HC read, HC write, the GDN in or out projection, or
+/// the MoE alone (the rest per lane) diverged, so this receipt proves the
+/// combined policy only ([`COMBINED_ONLY_RECEIPTS`]). The trunk / head
+/// projections are BF16 on the few-row MFMA entry (`gemm_bf16_mfma_gfx942_rows16`),
+/// the routed experts the FP8 grouped MFMA route ([`LaneExpertRoute::ResidentFp8`]).
+pub const GFX942_STOCK_FP8_RECEIPT: &str =
+    "g0 mi300x/headline/oracle/g0 2026-11-10 gfx942 stock-fp8 single, combined policy only";
+
+/// Receipts that evidence their rows' stages only together (the G0 oracle
+/// passed the combined policy, not every single-stage probe):
+/// [`resolve_with_proofs`] admits all of a receipt's stages or none.
+const COMBINED_ONLY_RECEIPTS: &[&str] = &[GFX942_STOCK_FP8_RECEIPT];
+
 /// Device topology a lane step runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LaneTopology {
@@ -408,6 +427,12 @@ pub enum LaneExpertRoute {
     /// expert), the mq3-xts Flash-Next family.
     ResidentMq3Slab,
     ResidentPacked,
+    /// Stock-FP8 routed experts (`Qwen4TierRecipe::StockFp8`): every owned
+    /// MoE layer's gate_up / down aggregates resident qt=55 `FP8E4M3B128`
+    /// tables (no arena, no host mapping), run by the gfx942 FP8 grouped
+    /// MFMA route (`gemm_fp8b128_moe_grouped_bf16mfma`, fixed ascending K,
+    /// 1..16-row tiles, the same kernels at every row count).
+    ResidentFp8,
     HostMapped,
     CpuDeferred,
     Split,
@@ -494,14 +519,16 @@ const LANE_ALL_TOPOLOGIES: &[LaneTopology] =
     &[LaneTopology::Single, LaneTopology::Pp, LaneTopology::Ep];
 const LANE_PP_ONLY: &[LaneTopology] = &[LaneTopology::Pp];
 const LANE_EP_ONLY: &[LaneTopology] = &[LaneTopology::Ep];
+const LANE_SINGLE_ONLY: &[LaneTopology] = &[LaneTopology::Single];
 
 /// Row-twin proofs, one row per shared stage per arch and topology domain
 /// (gfx1201 carries a PP-only domain and a disjoint EP-only domain whose MoE
-/// row is the packed static-or-balanced expert class). A stage is
-/// shared only when every instance a lane owns matches a row of its arch,
-/// stage and topology; any other (arch, topology, route) keeps that stage per
-/// lane until its own G0 run (other cards bind other kernels, e.g. no Q8_0
-/// decode copies on gfx1201).
+/// row is the packed static-or-balanced expert class; gfx942 a single-device
+/// domain whose rows are the stock-FP8 BF16 trunk and FP8 expert class). A
+/// stage is shared only when every instance a lane owns matches a row of its
+/// arch, stage and topology; any other (arch, topology, route) keeps that
+/// stage per lane until its own G0 run (other cards bind other kernels, e.g.
+/// no Q8_0 decode copies on gfx1201).
 ///
 /// The gfx1151 rows are `Any` over every topology on purpose, for
 /// compatibility: the proof predates route classification and was applied to
@@ -847,6 +874,101 @@ pub static LANE_ROW_TWIN_PROOFS: &[RowTwinProof] = &[
         LANE_EP_ONLY,
         GFX1201_PLE_PROJECT_RECEIPT,
     ),
+    proof(
+        "gfx942",
+        StageName::Embed,
+        StageRoute::Embed(DType::BF16),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::PleRows,
+        StageRoute::PleRows(DType::BF16),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::HcRead,
+        StageRoute::HyperRead([DType::BF16; 3]),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::HcWrite,
+        StageRoute::HyperWrite(DType::BF16),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::GdnInProj,
+        StageRoute::GdnIn([DType::BF16; 4]),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::GdnOutProj,
+        StageRoute::Projection(DType::BF16),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::QsaInProj,
+        StageRoute::QsaIn([DType::BF16; 4]),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::QsaOutProj,
+        StageRoute::Projection(DType::BF16),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::Moe,
+        StageRoute::Moe {
+            experts: LaneExpertRoute::ResidentFp8,
+            dense: [DType::BF16; 5],
+            decode_admitted: false,
+        },
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::FinalHyper,
+        StageRoute::HyperRead([DType::BF16; 3]),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::Head,
+        StageRoute::Projection(DType::BF16),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::Argmax,
+        StageRoute::Argmax(DType::F32),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::PleProject,
+        StageRoute::PleProject([DType::BF16; 2]),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
 ];
 
 /// A resolved lane policy: the policy, the receipts of the proofs behind
@@ -865,7 +987,9 @@ pub struct LanePolicyResolution {
 /// non-`Unclassified` route). A stage that owns no instance is admitted
 /// vacuously once such a row exists (a band without that stage must not
 /// demote the rest), and cites no receipt. Stateful stages are always per
-/// lane.
+/// lane. A [`COMBINED_ONLY_RECEIPTS`] receipt admits its stages only
+/// together: when any stage it has a row for (on this arch and topology)
+/// stays per lane, every stage admitted under it goes back per lane.
 fn resolve_with_proofs(
     arch: &str,
     topology: LaneTopology,
@@ -873,8 +997,8 @@ fn resolve_with_proofs(
     proofs: &[RowTwinProof],
 ) -> LanePolicyResolution {
     let mut policy = LaneStagePolicy::all_per_lane();
-    let mut receipts: Vec<&'static str> = Vec::new();
     let mut per_lane: Vec<(StageName, String)> = Vec::new();
+    let mut admitted: Vec<(StageName, Vec<&'static str>)> = Vec::new();
     for (stage, share) in STAGE_SHARE {
         if stage.stateful() {
             per_lane.push((stage, "stateful".to_string()));
@@ -931,11 +1055,47 @@ fn resolve_with_proofs(
             Some(reason) => per_lane.push((stage, reason)),
             None => {
                 policy.shares[stage.index()] = share;
-                for receipt in stage_receipts {
-                    if !receipts.contains(&receipt) {
-                        receipts.push(receipt);
-                    }
-                }
+                admitted.push((stage, stage_receipts));
+            }
+        }
+    }
+    for &combined in COMBINED_ONLY_RECEIPTS {
+        let covers = |stage: StageName| {
+            proofs.iter().any(|row| {
+                row.receipt == combined
+                    && row.arch == arch
+                    && row.stage == stage
+                    && row.domain.contains(&topology)
+            })
+        };
+        let Some(missing) = StageName::ALL
+            .into_iter()
+            .find(|&stage| covers(stage) && policy.share(stage) != StageShare::OnceAllRows)
+        else {
+            continue;
+        };
+        for (stage, stage_receipts) in &admitted {
+            if stage_receipts.contains(&combined) || (stage_receipts.is_empty() && covers(*stage)) {
+                policy.shares[stage.index()] = StageShare::PerLane;
+                per_lane.push((
+                    *stage,
+                    format!(
+                        "arch {arch:?} topology {topology:?} stage {}: receipt {combined:?} proves only the combined policy and stage {} stays per lane",
+                        stage.key(),
+                        missing.key()
+                    ),
+                ));
+            }
+        }
+    }
+    let mut receipts: Vec<&'static str> = Vec::new();
+    for (stage, stage_receipts) in &admitted {
+        if policy.share(*stage) != StageShare::OnceAllRows {
+            continue;
+        }
+        for receipt in stage_receipts {
+            if !receipts.contains(receipt) {
+                receipts.push(receipt);
             }
         }
     }
@@ -4717,6 +4877,34 @@ mod tests {
         routes
     }
 
+    /// The route instances a single-device gfx942 stock-FP8 lane store
+    /// registers, written out from the artifact (BF16 embed, PLE rows and
+    /// projections, hyper-connection, GDN in/out, QSA in/out, router /
+    /// shared experts and head; resident qt=55 routed experts; F32 argmax),
+    /// NOT read from the proof table.
+    fn g942_stock_fp8_routes() -> LaneStageRoutes {
+        let bf16 = DType::BF16;
+        let mut routes = LaneStageRoutes::default();
+        routes[StageName::Embed.index()] = vec![StageRoute::Embed(bf16)];
+        routes[StageName::PleRows.index()] = vec![StageRoute::PleRows(bf16)];
+        routes[StageName::PleProject.index()] = vec![StageRoute::PleProject([bf16; 2])];
+        routes[StageName::HcRead.index()] = vec![StageRoute::HyperRead([bf16; 3])];
+        routes[StageName::HcWrite.index()] = vec![StageRoute::HyperWrite(bf16)];
+        routes[StageName::GdnInProj.index()] = vec![StageRoute::GdnIn([bf16; 4])];
+        routes[StageName::GdnOutProj.index()] = vec![StageRoute::Projection(bf16)];
+        routes[StageName::QsaInProj.index()] = vec![StageRoute::QsaIn([bf16; 4])];
+        routes[StageName::QsaOutProj.index()] = vec![StageRoute::Projection(bf16)];
+        routes[StageName::Moe.index()] = vec![StageRoute::Moe {
+            experts: LaneExpertRoute::ResidentFp8,
+            dense: [bf16; 5],
+            decode_admitted: false,
+        }];
+        routes[StageName::FinalHyper.index()] = vec![StageRoute::HyperRead([bf16; 3])];
+        routes[StageName::Head.index()] = vec![StageRoute::Projection(bf16)];
+        routes[StageName::Argmax.index()] = vec![StageRoute::Argmax(DType::F32)];
+        routes
+    }
+
     /// Stages the resolution places per lane for a reason other than state.
     fn fallback_stages(resolution: &LanePolicyResolution) -> Vec<StageName> {
         resolution
@@ -4766,14 +4954,15 @@ mod tests {
         // and one EP row per shared stage, plus the second PP MoE row (the
         // mq3 slab class), the two EP Q8F16 QSA overlay rows (qsa_in x4,
         // qsa_out) and the three EP Q8F16 trunk rows (gdn_in x4, gdn_out,
-        // head), and the two EP HC8 rows (hc_read, final_hyper).
+        // head), and the two EP HC8 rows (hc_read, final_hyper). gfx942: one
+        // single-device row per shared stage (the stock-FP8 receipt).
         // `ple_project` (the lane-wide PLE key / value projection) has no gfx1151 row: its flag is
         // exact-gfx1201-only, so gfx1151 carries one row per shared stage but that one.
         assert_eq!(
             LANE_ROW_TWIN_PROOFS.len(),
-            (shared.len() - 1) + 2 * shared.len() + 1 + 2 + 3 + 2
+            (shared.len() - 1) + 2 * shared.len() + 1 + 2 + 3 + 2 + shared.len()
         );
-        for arch in ["gfx1151", "gfx1201"] {
+        for arch in ["gfx1151", "gfx1201", "gfx942"] {
             for stage in StageName::ALL {
                 for topology in ALL_TOPOLOGIES {
                     let rows: Vec<_> = LANE_ROW_TWIN_PROOFS
@@ -4788,6 +4977,7 @@ mod tests {
                         ("gfx1151", _) => shared.contains(&stage) && stage != StageName::PleProject,
                         ("gfx1201", LaneTopology::Pp) => shared.contains(&stage),
                         ("gfx1201", LaneTopology::Ep) => shared.contains(&stage),
+                        ("gfx942", LaneTopology::Single) => shared.contains(&stage),
                         _ => false,
                     };
                     // The PP MoE stage carries the mq2 and the mq3 slab rows;
@@ -4822,6 +5012,21 @@ mod tests {
                                 assert_eq!(proof.route, StageRoute::Any);
                                 assert_eq!(proof.domain, ALL_TOPOLOGIES);
                                 assert_eq!(proof.receipt, GFX1151_LANE_RECEIPT);
+                            }
+                            ("gfx942", _) => {
+                                assert_ne!(proof.route, StageRoute::Any);
+                                assert_ne!(proof.route, StageRoute::Unclassified);
+                                assert_eq!(proof.domain, [LaneTopology::Single]);
+                                assert_eq!(proof.receipt, GFX942_STOCK_FP8_RECEIPT);
+                                assert_eq!(
+                                    proof.route
+                                        == StageRoute::Moe {
+                                            experts: LaneExpertRoute::ResidentFp8,
+                                            dense: [DType::BF16; 5],
+                                            decode_admitted: false,
+                                        },
+                                    stage == StageName::Moe
+                                );
                             }
                             (_, LaneTopology::Pp) => {
                                 assert_ne!(proof.route, StageRoute::Any);
@@ -5831,8 +6036,88 @@ mod tests {
     }
 
     #[test]
+    fn gfx942_single_stock_fp8_shares_every_row_local_stage() {
+        let resolution = LaneStagePolicy::for_bound_routes(
+            "gfx942",
+            LaneTopology::Single,
+            &g942_stock_fp8_routes(),
+        );
+        assert_eq!(resolution.policy, LaneStagePolicy::production());
+        assert_eq!(resolution.receipts, [GFX942_STOCK_FP8_RECEIPT]);
+        assert_stateful_reasons(&resolution);
+        assert!(fallback_stages(&resolution).is_empty());
+    }
+
+    #[test]
+    fn gfx942_proofs_bind_only_single_device_and_the_fp8_expert_class() {
+        // PP / EP topologies have no gfx942 row: every stage per lane.
+        for topology in [LaneTopology::Pp, LaneTopology::Ep] {
+            let resolution =
+                LaneStagePolicy::for_bound_routes("gfx942", topology, &g942_stock_fp8_routes());
+            assert_eq!(
+                resolution.policy,
+                LaneStagePolicy::all_per_lane(),
+                "{topology:?}"
+            );
+            assert!(resolution.receipts.is_empty());
+        }
+        // Any other expert class (or a decode-admitted K1 route) demotes MoE, and
+        // with it every stage of the combined-only receipt.
+        for moe in [
+            moe_route(LaneExpertRoute::Unclassified, false),
+            moe_route(LaneExpertRoute::HostMapped, false),
+            moe_route(LaneExpertRoute::ResidentPacked, true),
+            moe_route(LaneExpertRoute::ResidentFp8, true),
+        ] {
+            let mut routes = g942_stock_fp8_routes();
+            routes[StageName::Moe.index()] = vec![moe];
+            let resolution =
+                LaneStagePolicy::for_bound_routes("gfx942", LaneTopology::Single, &routes);
+            assert_eq!(
+                resolution.policy,
+                LaneStagePolicy::all_per_lane(),
+                "{moe:?}"
+            );
+            assert!(resolution.receipts.is_empty(), "{moe:?}");
+            assert_eq!(fallback_stages(&resolution)[0], StageName::Moe, "{moe:?}");
+            assert!(reason_of(&resolution, StageName::Head).contains("combined policy"));
+        }
+        // An MQ trunk on gfx942 is not the proven route: nothing is shared.
+        let resolution =
+            LaneStagePolicy::for_bound_routes("gfx942", LaneTopology::Single, &pp2_mq2_routes());
+        assert_eq!(resolution.policy, LaneStagePolicy::all_per_lane());
+        assert!(resolution.receipts.is_empty());
+    }
+
+    #[test]
+    fn combined_only_receipts_admit_all_or_nothing() {
+        // Any one gfx942 stage left unmatched demotes the rest, including a
+        // vacuously admitted stage (no instance of it owned).
+        for missing in shared_stages() {
+            let mut routes = g942_stock_fp8_routes();
+            routes[missing.index()] = vec![StageRoute::Unclassified];
+            let resolution =
+                LaneStagePolicy::for_bound_routes("gfx942", LaneTopology::Single, &routes);
+            assert_eq!(
+                resolution.policy,
+                LaneStagePolicy::all_per_lane(),
+                "{missing:?}"
+            );
+            assert!(resolution.receipts.is_empty());
+            assert_stateful_reasons(&resolution);
+        }
+        let mut routes = g942_stock_fp8_routes();
+        routes[StageName::PleProject.index()].clear();
+        let resolution = LaneStagePolicy::for_bound_routes("gfx942", LaneTopology::Single, &routes);
+        assert_eq!(resolution.policy, LaneStagePolicy::production());
+        routes[StageName::Head.index()] = vec![StageRoute::Projection(DType::Q8_0)];
+        let resolution = LaneStagePolicy::for_bound_routes("gfx942", LaneTopology::Single, &routes);
+        assert_eq!(resolution.policy, LaneStagePolicy::all_per_lane());
+    }
+
+    #[test]
     fn unknown_arch_runs_every_stage_per_lane() {
-        for arch in ["gfx1100", "gfx942", ""] {
+        for arch in ["gfx1100", "gfx90a", ""] {
             for topology in ALL_TOPOLOGIES {
                 for routes in [
                     pp2_mq2_routes(),
