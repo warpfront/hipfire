@@ -112,6 +112,29 @@ fn g942_fold_note(once: &std::sync::Once, what: &'static str) {
     once.call_once(|| eprintln!("[g942-fold-moe] {what} active (HIPFIRE_QWEN4_G942_FOLD_MOE)"));
 }
 
+/// Bind `func` of the fold module: the hipcc source (the anchor object), or, only when
+/// `HIPFIRE_QWEN4_G942_FOLD_MOE_IMAGE=/absolute/device.elf` names one, that explicitly supplied
+/// code object (the Route-A twin proof: same module, same entry names, loaded through
+/// `ensure_embedded_kernel`). Unset: the source, unchanged.
+fn g942_fold_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
+    match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_FOLD_MOE_IMAGE") {
+        Ok(path) if !path.is_empty() => {
+            let bytes = std::fs::read(&path).map_err(|error| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("HIPFIRE_QWEN4_G942_FOLD_MOE_IMAGE {path}: {error}"),
+                )
+            })?;
+            gpu.ensure_embedded_kernel(
+                QWEN4_G942_GLUE_MOE_MODULE,
+                std::sync::Arc::<[u8]>::from(bytes),
+                func,
+            )
+        }
+        _ => gpu.ensure_kernel(QWEN4_G942_GLUE_MOE_MODULE, QWEN4_G942_GLUE_MOE_SRC, func),
+    }
+}
+
 /// A mutable GPU borrow proven to target exact gfx942.
 ///
 /// The constructor is intentionally available only through Gpu::try_gfx942.
@@ -1979,11 +2002,7 @@ impl Gfx942Device<'_> {
             "qwen4_g942_moe_group_scatter_desc tile_desc",
         )?;
         self.gpu.bind_thread()?;
-        self.gpu.ensure_kernel(
-            QWEN4_G942_GLUE_MOE_MODULE,
-            QWEN4_G942_GLUE_MOE_SRC,
-            QWEN4_G942_MOE_GROUP_SCATTER_DESC,
-        )?;
+        g942_fold_ensure(&mut *self.gpu, QWEN4_G942_MOE_GROUP_SCATTER_DESC)?;
         static NOTE: std::sync::Once = std::sync::Once::new();
         g942_fold_note(&NOTE, "fold 1 (ranks + prefix + scatter + tile descriptors)");
         let tp = topk.buf.as_ptr();
@@ -2134,11 +2153,7 @@ impl Gfx942Device<'_> {
             ));
         }
         self.gpu.bind_thread()?;
-        self.gpu.ensure_kernel(
-            QWEN4_G942_GLUE_MOE_MODULE,
-            QWEN4_G942_GLUE_MOE_SRC,
-            QWEN4_G942_MOE_UNSCATTER_ACT,
-        )?;
+        g942_fold_ensure(&mut *self.gpu, QWEN4_G942_MOE_UNSCATTER_ACT)?;
         static NOTE: std::sync::Once = std::sync::Once::new();
         g942_fold_note(&NOTE, "fold 2 (unscatter-silu + shared activation)");
         let (miv, nv, sv) = (mi as i32, n_sorted as i32, slots as i32);
@@ -2289,11 +2304,7 @@ impl Gfx942Device<'_> {
             return refuse(format!("{WHAT}: the target must not alias another operand"));
         }
         self.gpu.bind_thread()?;
-        self.gpu.ensure_kernel(
-            QWEN4_G942_GLUE_MOE_MODULE,
-            QWEN4_G942_GLUE_MOE_SRC,
-            QWEN4_G942_MOE_COMBINE_SHARED_ADD,
-        )?;
+        g942_fold_ensure(&mut *self.gpu, QWEN4_G942_MOE_COMBINE_SHARED_ADD)?;
         static NOTE: std::sync::Once = std::sync::Once::new();
         g942_fold_note(&NOTE, "fold 3 (combine + shared add)");
         let (hv, gr, tv, nx) = (
