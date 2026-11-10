@@ -11,7 +11,7 @@
 
 use std::ffi::c_void;
 
-use hip_bridge::{HipResult, KernargBlob};
+use hip_bridge::{DeviceBuffer, HipResult, KernargBlob};
 
 use crate::{DType, Gpu, GpuTensor};
 
@@ -111,6 +111,138 @@ impl Gpu {
         self.arch_caps
             .is_gfx942()
             .then_some(Gfx942Device { gpu: self })
+    }
+}
+
+const QWEN4_G942_GLUE_ELEM_SRC: &str =
+    include_str!("../../../../kernels/src/qwen4_g942_glue_elem.hip");
+const QWEN4_G942_GLUE_ELEM_MODULE: &str = "qwen4_g942_glue_elem";
+const QWEN4_G942_HC_DOWN_ACT_KERNEL: &str = "qwen4_g942_gemm_bf16_rows16_hc_act";
+const QWEN4_G942_HC_DOWN_ACT_X2_KERNEL: &str = "qwen4_g942_gemm_bf16_rows16_hc_act_x2";
+/// LDS row pitch (BF16 elements) of the few-row GEMM bodies: a 256-K chunk plus a
+/// 4-element pad (`R16_LD` in `qwen4_g942_glue_elem.hip`).
+const QWEN4_G942_ROWS16_LDS_PITCH: usize = 256 + 4;
+
+impl Gfx942Device<'_> {
+    /// The HC read's down projection and its activation as ONE launch (C1 fold,
+    /// kill switch `HIPFIRE_QWEN4_G942_FOLD_ELEM`):
+    /// `out[b, m] = hc_act(Σ_k a[m, k] · x[b, k])`, `hc_act(v) = bf16(silu(bf16(bf16(v) · scale)))`
+    /// in the unfused chain's expressions (see `kernels/src/qwen4_g942_glue_elem.hip`).
+    ///
+    /// Bitwise `gemm_bf16_mfma_gfx942_rows16` (F32 `out`) followed by
+    /// `bf16_roundtrip_f32`, `scale_f32`, `bf16_roundtrip_f32`, `silu_f32`,
+    /// `bf16_roundtrip_f32` over `out`: the GEMM body is a single-member copy of the
+    /// rows16 entry and only its output store differs. `a` is the BF16 weight
+    /// `[m, k]`, `x` the F32 (rounded to BF16 in-kernel) or BF16 `[batch, k]`
+    /// activation, `out` F32 `[batch, m]`.
+    ///
+    /// Returns `Ok(false)` without launching when the entry does not apply (`batch`
+    /// outside 1..=16, `k % 8 != 0`, `a` or `x` not 16-byte aligned, a dtype outside
+    /// F32 / BF16 for `x` or not F32 for `out`, or `out` overlapping `x`); the caller
+    /// keeps the unfused launches. Block `[576,1,1]`, grid `[ceil(m/16),1,1]`, dynamic
+    /// LDS `2 × (16 + batch) × 260 × 2 B`; the `_x2` entry takes an F32 `x` of more
+    /// than 8 rows.
+    pub fn qwen4_hc_down_act_rows16(
+        &mut self,
+        a: &DeviceBuffer,
+        x: &GpuTensor,
+        out: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+        scale: f32,
+    ) -> HipResult<bool> {
+        const WHAT: &str = "qwen4_hc_down_act_rows16";
+        let (x_f32, x_size) = match x.dtype {
+            DType::F32 => (true, 4usize),
+            DType::BF16 => (false, 2usize),
+            _ => return Ok(false),
+        };
+        if out.dtype != DType::F32
+            || m == 0
+            || !(1..=16).contains(&batch)
+            || k == 0
+            || k % 8 != 0
+            || m > i32::MAX as usize
+            || k > i32::MAX as usize
+            || (a.as_ptr() as usize) % 16 != 0
+            || (x.buf.as_ptr() as usize) % 16 != 0
+        {
+            return Ok(false);
+        }
+        let refuse = |msg: String| Err(hip_bridge::HipError::new(0, &msg));
+        let (Some(a_bytes), Some(x_bytes), Some(out_bytes)) = (
+            m.checked_mul(k).and_then(|e| e.checked_mul(2)),
+            batch.checked_mul(k).and_then(|e| e.checked_mul(x_size)),
+            batch.checked_mul(m).and_then(|e| e.checked_mul(4)),
+        ) else {
+            return refuse(format!("{WHAT}: extent overflow (m={m} k={k} batch={batch})"));
+        };
+        if a.size() < a_bytes || x.buf.size() < x_bytes || out.buf.size() < out_bytes {
+            return refuse(format!(
+                "{WHAT}: buffer too small (a {}/{a_bytes}, x {}/{x_bytes}, out {}/{out_bytes})",
+                a.size(),
+                x.buf.size(),
+                out.buf.size()
+            ));
+        }
+        // Every workgroup reads x for the whole launch: an output that overlaps it
+        // keeps the unfused route (which writes `out` after its own read of x).
+        let (x_start, out_start) = (x.buf.as_ptr() as usize, out.buf.as_ptr() as usize);
+        if out_start < x_start + x_bytes && x_start < out_start + out_bytes {
+            return Ok(false);
+        }
+        let kernel = if x_f32 && batch > 8 {
+            QWEN4_G942_HC_DOWN_ACT_X2_KERNEL
+        } else {
+            QWEN4_G942_HC_DOWN_ACT_KERNEL
+        };
+        self.gpu.bind_thread()?;
+        self.gpu
+            .ensure_kernel(QWEN4_G942_GLUE_ELEM_MODULE, QWEN4_G942_GLUE_ELEM_SRC, kernel)?;
+        let (x_ptr, a_ptr, d_ptr) = (x.buf.as_ptr(), a.as_ptr(), out.buf.as_ptr());
+        let (m_i32, k_i32, batch_i32, x_f32_i32) =
+            (m as i32, k as i32, batch as i32, i32::from(x_f32));
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &d_ptr as *const _ as *mut c_void,
+            &m_i32 as *const _ as *mut c_void,
+            &k_i32 as *const _ as *mut c_void,
+            &batch_i32 as *const _ as *mut c_void,
+            &x_f32_i32 as *const _ as *mut c_void,
+            &scale as *const _ as *mut c_void,
+        ];
+        let lds = (2 * (16 + batch) * QWEN4_G942_ROWS16_LDS_PITCH * 2) as u32;
+        let timer = crate::profile::begin_timer(
+            &self.gpu.hip,
+            "gemm",
+            kernel,
+            a_bytes + x_bytes + out_bytes,
+        );
+        let result = self.gpu.launch_maybe_blob(
+            kernel,
+            [m.div_ceil(16) as u32, 1, 1],
+            [576, 1, 1],
+            lds,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(a_ptr);
+                blob.push_ptr(d_ptr);
+                blob.push_i32(m_i32);
+                blob.push_i32(k_i32);
+                blob.push_i32(batch_i32);
+                blob.push_i32(x_f32_i32);
+                blob.push_f32(scale);
+                blob
+            },
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.gpu.hip);
+        }
+        result.map(|()| true)
     }
 }
 

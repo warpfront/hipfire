@@ -1258,6 +1258,18 @@ fn project_rotated(
     hip(result)
 }
 
+/// `HIPFIRE_QWEN4_G942_FOLD_ELEM` (read once; default off until the Route-A twin of
+/// `kernels/src/qwen4_g942_glue_elem.hip` is sealed, `=1` on, `=0` off): the gfx942 C1
+/// elementwise folds. Today: the HC read's few-row down GEMM carries its activation
+/// chain (`bf16_roundtrip_f32`, `scale_f32`, `bf16_roundtrip_f32`, `silu_f32`,
+/// `bf16_roundtrip_f32`) as its output epilogue, six launches to one, bitwise.
+fn g942_fold_elem() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_bool("HIPFIRE_QWEN4_G942_FOLD_ELEM", false)
+    });
+    *ON
+}
+
 /// `HIPFIRE_G942_TRUNK_GEMV=1` (read once): on gfx942, one-row BF16 trunk
 /// projections keep the legacy GEMV arm instead of the MFMA GEMM.
 fn g942_trunk_gemv() -> bool {
@@ -1980,6 +1992,8 @@ fn execute_hyper_read_inner(
     let wmma_read = f16 && op.low_rank % 16 == 0 && op.low_rank <= 504 && op.hidden % 16 == 0;
     let mut normalized_f16 = None;
     let mut activated = false;
+    // gfx942 C1 fold: the down GEMM already applied the activation chain to `low`.
+    let mut g942_act_folded = false;
     // The WMMA read takes `low` as packed BF16, staged in `up` (which that
     // route does not otherwise use).
     let low_bf16 = wmma_read.then(|| {
@@ -2172,17 +2186,48 @@ fn execute_hyper_read_inner(
         if !normalized_ready {
             hip(hyper_norm(gpu, &norm))?;
         }
-        let held = std::mem::replace(&mut gpu.prefill_lwmma_dense_hold, true);
-        let projected = project_weight(
-            gpu,
-            &op.input_mix_down,
-            &normalized,
-            &low,
-            op.rows,
-            Some(op.rotation),
-        );
-        gpu.prefill_lwmma_dense_hold = held;
-        projected?;
+        // gfx942 C1 fold (`HIPFIRE_QWEN4_G942_FOLD_ELEM`): the few-row down GEMM with the
+        // activation chain below as its epilogue, one launch for the six; bitwise their output.
+        if g942_fold_elem()
+            && gpu.arch_caps.is_gfx942()
+            && op.input_mix_down.dtype == DType::BF16
+            && normalized.dtype == DType::F32
+            && low.dtype == DType::F32
+            && op.input_mix_down.m == op.low_rank
+            && !(g942_trunk_gemv() && op.rows == 1)
+            && !super::projection_split::is_split(gpu, &op.input_mix_down, op.rows)
+        {
+            gpu.maybe_capture_activation(
+                op.input_mix_down.buf,
+                &normalized,
+                op.rows,
+                op.input_mix_down.k,
+            );
+            if let Some(device) = gpu.try_gfx942() {
+                g942_act_folded = hip(device.qwen4_hc_down_act_rows16(
+                    &op.input_mix_down.buf.buf,
+                    &normalized,
+                    &low,
+                    op.input_mix_down.m,
+                    op.input_mix_down.k,
+                    op.rows,
+                    1.0 / op.branches as f32,
+                ))?;
+            }
+        }
+        if !g942_act_folded {
+            let held = std::mem::replace(&mut gpu.prefill_lwmma_dense_hold, true);
+            let projected = project_weight(
+                gpu,
+                &op.input_mix_down,
+                &normalized,
+                &low,
+                op.rows,
+                Some(op.rotation),
+            );
+            gpu.prefill_lwmma_dense_hold = held;
+            projected?;
+        }
     }
     // `activated` implies the gfx11+ route: the down GEMV already applied it.
     if gpu.arch_caps.has_gfx11_plus_simt() {
@@ -2196,7 +2241,7 @@ fn execute_hyper_read_inner(
                 },
             ))?;
         }
-    } else {
+    } else if !g942_act_folded {
         // The three source BF16 boundaries, each one launch over all rows of
         // `low`: the round trip is elementwise, so this is bitwise the
         // per-row launches it replaces. Its BF16 copy is staged in `up`,
