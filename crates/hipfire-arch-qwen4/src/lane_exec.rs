@@ -135,7 +135,7 @@ use std::time::Instant;
 /// `HIPFIRE_CB_PHASES=1` (developer diagnostic, read once; the serve step line of the same name
 /// lives in `hipfire-generate`): one `[fn-lane-tile]` stderr line per lane prefill tile, with the
 /// tile's synchronized wall and the route it took (`run_prefill_tiles`).
-static LANE_TILE_PHASES: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+pub(crate) static LANE_TILE_PHASES: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_var("HIPFIRE_CB_PHASES").is_ok_and(|v| v.trim() == "1")
 });
 

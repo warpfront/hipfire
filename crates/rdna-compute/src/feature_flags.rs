@@ -305,6 +305,10 @@ pub struct FeatureFlags {
     /// launches. Read through [`Self::qwen4_prefill_lwmma_floor_knob`]; scoped to waves only by
     /// `Gpu::qwen4_prefill_lwmma_floor` (singleton chunks, decode and verify never see it).
     pub qwen4_prefill_lwmma_wave_floor: bool,
+    /// `HIPFIRE_QWEN4_WAVE_HEAD_ONE` (default on, `=0` kills; exact gfx1201): the final rows of an
+    /// EP prefill wave of >= 2 lanes take ONE all-rows LM head + argmax under the wide few-row
+    /// scope instead of one one-row GEMV per lane (byte-equal to the singleton, lane oracle).
+    pub qwen4_wave_head_one: bool,
     /// One multi-part lane-WMMA launch (`HIPFIRE_QWEN4_LWMMA_MULTI_PART`) for the dense BF16
     /// projections of one activation at 16..=64 rows (router | selector | shared gate | shared up
     /// of the wide MoE block): up to four parts share one `lwmma_gemm_bf16_t2_m<MT>_n1_multi`
@@ -1358,6 +1362,7 @@ impl FeatureFlags {
             qwen4_prefill_lwmma_hc: parse_bool("HIPFIRE_QWEN4_PREFILL_LWMMA_HC").unwrap_or(true),
             qwen4_prefill_lwmma_wave_floor: parse_bool("HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR")
                 .unwrap_or(true),
+            qwen4_wave_head_one: parse_bool("HIPFIRE_QWEN4_WAVE_HEAD_ONE").unwrap_or(true),
             qwen4_lwmma_multi_part: parse_bool("HIPFIRE_QWEN4_LWMMA_MULTI_PART").unwrap_or(true),
             qwen4_mtp_fc_one_launch: parse_bool("HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH").unwrap_or(true),
             qwen4_lane_ple_project: parse_bool("HIPFIRE_QWEN4_LANE_PLE_PROJECT").unwrap_or(true),
@@ -2137,6 +2142,12 @@ impl FeatureFlags {
         self.qwen4_lane_allrows_exact && self.arch == "gfx1201"
     }
 
+    /// One all-rows LM head for the final rows of an EP prefill wave
+    /// (`HIPFIRE_QWEN4_WAVE_HEAD_ONE`, default on, `=0` kills). Exact gfx1201 only.
+    pub fn qwen4_wave_head_one_enabled(&self) -> bool {
+        self.qwen4_wave_head_one && self.arch == "gfx1201"
+    }
+
     /// The sampled lane rows' D2H lands in pinned host memory
     /// (`HIPFIRE_QWEN4_LANE_PINNED_LOGITS`). Exact gfx1201 only, default on (`=0` restores the
     /// pageable `Vec` path).
@@ -2498,6 +2509,7 @@ impl FeatureFlags {
             qwen4_prefill_lwmma_dense: false,
             qwen4_prefill_lwmma_hc: false,
             qwen4_prefill_lwmma_wave_floor: false,
+            qwen4_wave_head_one: false,
             qwen4_lwmma_multi_part: false,
             qwen4_mtp_fc_one_launch: false,
             qwen4_lane_ple_project: false,
@@ -2972,6 +2984,21 @@ mod tests {
             });
             assert_eq!(flags.fn_gdn_dense_scan, expected);
         }
+    }
+
+    #[test]
+    fn wave_head_one_defaults_on_exact_gfx1201_and_zero_kills() {
+        let on = |arch: &str, raw: Option<&'static str>| {
+            FeatureFlags::from_lookup(arch, |name| match raw {
+                Some(v) if name == "HIPFIRE_QWEN4_WAVE_HEAD_ONE" => Ok(v.into()),
+                _ => Err(()),
+            })
+            .qwen4_wave_head_one_enabled()
+        };
+        assert!(on("gfx1201", None));
+        assert!(on("gfx1201", Some("1")));
+        assert!(!on("gfx1201", Some("0")));
+        assert!(!on("gfx1100", None));
     }
 
     #[test]

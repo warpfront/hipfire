@@ -4495,7 +4495,70 @@ fn forward_lanes_scoped(
         }
         // Prefill wave head: per lane, the singleton's own LM-head / argmax
         // forms on the lane's rows (Final: `requested_rows == 1`).
+        // `HIPFIRE_QWEN4_WAVE_HEAD_ONE` (default on, `=0` kills; exact gfx1201): a Final wave of >= 2 lanes gathers
+        // every lane's final row into the first rows of `scratch.hc_mixed` (ascending, so no
+        // source row is overwritten before it is read) and runs ONE all-rows LM head and ONE
+        // argmax over them under the wide few-row scope, instead of one one-row GEMV per lane.
+        let wave_head_one = match out {
+            StepOutputs::Wave(wave)
+                if matches!(wave.head, WaveHead::Final)
+                    && lane_segs.len() >= 2
+                    && gpu.flags.qwen4_wave_head_one_enabled() =>
+            {
+                Some(wave)
+            }
+            _ => None,
+        };
+        if let Some(wave) = wave_head_one {
+            let lanes_n = lane_segs.len();
+            let hidden_n = config.hidden_size;
+            if *crate::lane_exec::LANE_TILE_PHASES {
+                eprintln!("[fn-lane-wave-head] one all-rows LM head launch for {lanes_n} lanes");
+            }
+            for (lane, seg) in lane_segs.iter().enumerate() {
+                let v = &views[lane];
+                let source = view(&v.hc_mixed, (seg.rows - 1) * hidden_n, hidden_n);
+                let destination = view(&scratch.hc_mixed, lane * hidden_n, hidden_n);
+                if seg.begin + seg.rows - 1 != lane {
+                    gpu.copy_d2d(&source, &destination, destination.byte_size())?;
+                }
+            }
+            let (_, lm_head) = head_ref()?;
+            let hidden = view(&scratch.hc_mixed, 0, lanes_n * hidden_n);
+            let rotation = view(&scratch.rotation, 0, lanes_n * hidden_n);
+            let logits = view(wave.logits, 0, lanes_n * vocab);
+            gpu.set_wide_verify_rows(lanes_n);
+            let head = execute_lm_head(
+                gpu,
+                &lm_head,
+                &hidden,
+                &logits,
+                lanes_n,
+                lanes_n,
+                Some(&rotation),
+            );
+            gpu.set_wide_verify_rows(prior_wide);
+            head.map_err(|error| {
+                Qwen4GpuForwardError::Dispatch(format!(
+                    "execute wave one-launch LM head: {error:?}"
+                ))
+            })?;
+            if let Some(top1) = wave.top1 {
+                argmax_f32(
+                    gpu,
+                    &ArgmaxF32 {
+                        logits: &logits,
+                        indices: &view(top1, 0, lanes_n * std::mem::size_of::<i32>()),
+                        rows: lanes_n,
+                        vocab,
+                    },
+                )?;
+            }
+        }
         for (lane, (head_logits, head_top1, requested)) in wave_head.iter().enumerate() {
+            if wave_head_one.is_some() {
+                break;
+            }
             let (seg, v) = (&lane_segs[lane], &views[lane]);
             let (_, lm_head) = head_ref()?;
             let hidden = view(&v.hc_mixed, 0, seg.rows * config.hidden_size);
