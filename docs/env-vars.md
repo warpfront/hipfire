@@ -807,9 +807,20 @@ separate output directory per executor). Under `HIPFIRE_SAMPLED_MTP_TOPOLOGY=ep2
 (`HIPFIRE_TOPOLOGY_EP=2`, two visible cards) each arm process runs the EP2 lane
 executor over a `HIPFIRE_SAMPLED_MTP_SHARD=START..END` trial shard: `lane_ar` is
 sampled AR lanes (the reference), `lane_batched` / `lane_adaptive` are
-native-MTP mesh lanes with root Leviathan acceptance (the `ep2` cohort has no
-`lane_copy` arm, so no ep2 verdict covers the EP copy lane, which is on by
-default in steps of at most two lanes since `047ed76122`). The fixed-count
+native-MTP mesh lanes with root Leviathan acceptance. `lane_copy` (`ep2`,
+`HIPFIRE_SAMPLED_MTP_LANES=1` or `2` only: the EP copy lane is on by default in
+steps of at most two lanes since `047ed76122`) stages the copy lane the serve
+stages by default (on the serve's eight-lane store) and runs the same mesh step.
+Its own `ep2` cohort is `lane_ar` + `lane_copy` on `HIPFIRE_SAMPLED_MTP_PROMPT=copy`
+(a rewrite request whose assistant turn already holds the start of the passage:
+verbatim repetition, so the copy matcher proposes on the first window), and its
+coverage fails unless the lane counters show copy windows (takeovers, each
+verified against the point-mass draft distribution). The neutral sampler
+(1.0 / 0.95) leaves that fixture's four ids nearly deterministic (the chi-square
+has one degree of freedom): run the cohort at a flat sampler too
+(`HIPFIRE_SAMPLED_MTP_TEMP=2.0`, `HIPFIRE_SAMPLED_MTP_TOP_P=1.0`;
+`scripts/job_sampled_lane_shards.sh` takes `SAMPLED_TEMP` / `SAMPLED_TOP_P`), where
+rejections and native windows occur. The fixed-count
 native-MTP arms pin `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8` so that `N` lanes run
 native windows at every `N`; they are native-window coverage arms, not the shipped
 switching policy. `lane_cross` (`ep2`, `HIPFIRE_SAMPLED_MTP_LANES=8` only; the
