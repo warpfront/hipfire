@@ -99,6 +99,13 @@ const SHAPES: &[(usize, usize, usize, Option<f32>)] = &[
     (2560, 2560, 2, None),
     (10240, 2560, 2, None),
     (320, 10240, 2, None),
+    // The trunk-sharded shared expert (rank 0 keeps 384 of the 640 rows / columns, rank 1 256) and
+    // the shared selector (one row): the per-lane GEMM sites of the served wave.
+    (384, 2560, 2, None),
+    (256, 2560, 2, None),
+    (2560, 384, 2, None),
+    (2560, 256, 2, None),
+    (1, 2560, 2, None),
 ];
 const ROWS: &[usize] = &[
     65, 77, 96, 149, 256, 384, 511, 596, 1043, 1191, 1192, 1536, 2048,

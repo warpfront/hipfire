@@ -182,6 +182,50 @@ const TILE_PICKS: &[(usize, usize, usize, &[(usize, Option<LaneWmmaTile>)])] = &
         ],
     ),
     (10240, 2560, 2, &[(usize::MAX, Some(tile(64, 128, 4, 2)))]),
+    // The trunk-sharded shared expert (rank 0 keeps 384 of the 640 rows / columns, rank 1 256) and
+    // the shared selector (one row): the per-lane GEMM sites of the served wave. Bench on card E,
+    // 2026-11-10 (fabric, 65..1192 rows): every pick is within 7 % of the best tile at every bench
+    // row, `None` where the shipped kernel is as fast or faster.
+    (
+        384,
+        2560,
+        2,
+        &[
+            (170, Some(tile_g4(16, 32, 1, 1))),
+            (1096, Some(tile(32, 64, 2, 2))),
+            (usize::MAX, Some(tile(64, 128, 4, 2))),
+        ],
+    ),
+    (
+        256,
+        2560,
+        2,
+        &[
+            (138, Some(tile_g4(16, 32, 1, 1))),
+            (170, None),
+            (278, Some(tile_g4(16, 32, 1, 1))),
+            (usize::MAX, Some(tile(32, 64, 2, 2))),
+        ],
+    ),
+    (
+        2560,
+        384,
+        2,
+        &[
+            (138, Some(tile(32, 64, 2, 2))),
+            (usize::MAX, Some(tile(64, 128, 4, 2))),
+        ],
+    ),
+    (
+        2560,
+        256,
+        2,
+        &[
+            (170, Some(tile(32, 64, 2, 2))),
+            (usize::MAX, Some(tile(64, 128, 4, 2))),
+        ],
+    ),
+    (1, 2560, 2, &[(278, None), (usize::MAX, Some(tile_g4(16, 32, 1, 1)))]),
 ];
 
 /// The tile configuration [`lane_wmma_tile_gemm`] runs for `(m, k, rows, terms)`: the tuned table
@@ -369,8 +413,8 @@ mod tests {
                 );
             }
         }
-        for m in [320, 512, 640, 2560, 10240, 96, 1000] {
-            for k in [640, 2560, 10240] {
+        for m in [1, 256, 320, 384, 512, 640, 2560, 10240, 96, 1000] {
+            for k in [256, 384, 640, 2560, 10240] {
                 for rows in [1, 65, 149, 300, 301, 596, 800, 801, 1192, 2048] {
                     for terms in [1, 2] {
                         if let Some(t) = lane_wmma_tile_pick(m, k, rows, terms) {
@@ -387,5 +431,15 @@ mod tests {
         assert!(lane_wmma_tile_pick(512, 2560, 300, 1).is_none());
         assert!(lane_wmma_tile_pick(320, 10240, 149, 1).is_none());
         assert!(lane_wmma_tile_pick(320, 10240, 596, 1).is_some());
+        // The trunk-sharded shared expert and the selector: tiled in the wave, the shipped kernel
+        // where it is as fast.
+        assert_eq!(lane_wmma_tile_pick(384, 2560, 1050, 2), Some(tile(32, 64, 2, 2)));
+        assert_eq!(lane_wmma_tile_pick(384, 2560, 1192, 2), Some(tile(64, 128, 4, 2)));
+        assert_eq!(lane_wmma_tile_pick(256, 2560, 1050, 2), Some(tile(32, 64, 2, 2)));
+        assert_eq!(lane_wmma_tile_pick(256, 2560, 149, 2), None);
+        assert_eq!(lane_wmma_tile_pick(2560, 384, 1050, 2), Some(tile(64, 128, 4, 2)));
+        assert_eq!(lane_wmma_tile_pick(2560, 256, 149, 2), Some(tile(32, 64, 2, 2)));
+        assert_eq!(lane_wmma_tile_pick(1, 2560, 1050, 2), Some(tile_g4(16, 32, 1, 1)));
+        assert_eq!(lane_wmma_tile_pick(1, 2560, 256, 2), None);
     }
 }
