@@ -1353,6 +1353,90 @@ impl Gfx942Device<'_> {
     }
 }
 
+/// Most batch rows one `gemm_bf16_mfma_gfx942_rows16` launch takes; a chain
+/// launches it once per this many rows.
+const ROWS16_CHAIN_STEP: usize = 16;
+
+/// The most batch rows at which ⌈rows/16⌉ chained few-row launches of a BF16
+/// `[m, k]` weight beat one 32-row-tile launch on MI300X (P-K table,
+/// `mi300x/beat/P/P-K.md` (a), every Flash-Next trunk shape at 17 / 31 / 57 /
+/// 145 / 456 / 912 rows). The tile entry has a ~120-130 µs floor on small `m`
+/// and a chain launch costs ~6-20 µs, so the crossover is per shape:
+/// - `k < 512` (hc_up 10240x320): chain/tile 0.88 at 57, 1.22 at 145.
+/// - `k < 1024` (sh_down 2560x640): 0.78 at 145, 1.27 at 456.
+/// - `m >= 2048` (qkv, z, out_proj, qsa_q, PLE, at k >= 1024): ≤ 0.56 up to
+///   912 rows; the prefill chunk bound (1,536 rows) is the cap.
+/// - `m < 64` (gdn_a/b, sh_egate, hc_inject): crossover ~210-310 rows.
+/// - other `m` (router, qsa_k/v/idx, shared gate/up, hc_down): 0.51-0.54 at
+///   145, crossover ~300 rows (hc_down, k = 10240: ~600).
+pub fn rows16_chain_max_rows(m: usize, k: usize) -> usize {
+    if k < 512 {
+        48
+    } else if k < 1024 {
+        256
+    } else if m >= 2048 {
+        usize::MAX
+    } else if m < 64 {
+        192
+    } else if k > 4096 {
+        512
+    } else {
+        256
+    }
+}
+
+impl Gpu {
+    /// [`Gpu::gemm_bf16_mfma_gfx942_rows16`] for any `batch`: up to 16 rows
+    /// it is that one launch; past 16 rows (with `chain` set and every
+    /// member's `batch <= `[`rows16_chain_max_rows`]) it launches the same
+    /// entry once per 16-row slice of `x` and of each `y_j`, last slice
+    /// partial. Each output element is the one ascending-K MFMA chain of its
+    /// own activation row in every entry of the module, so the bytes equal
+    /// the 32-row-tile route's (P-K: 114/114 shape × rows cells, 0 differing
+    /// words). Returns `Ok(false)` without launching when the first slice
+    /// declines or a member's shape keeps the tile entry; a later slice's
+    /// refusal (an output overlapping that slice of `x`) also returns
+    /// `Ok(false)` and the caller's tile route rewrites every row.
+    pub fn gemm_bf16_mfma_gfx942_rows16_chain(
+        &mut self,
+        x: &GpuTensor,
+        members: &[(&hip_bridge::DeviceBuffer, &GpuTensor, usize)],
+        k: usize,
+        batch: usize,
+        chain: bool,
+    ) -> HipResult<bool> {
+        const MAX: usize = crate::gemm::GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS;
+        if batch <= ROWS16_CHAIN_STEP {
+            return self.gemm_bf16_mfma_gfx942_rows16(x, members, k, batch);
+        }
+        if !chain
+            || members.is_empty()
+            || members.len() > MAX
+            || members
+                .iter()
+                .any(|&(_, _, m)| batch > rows16_chain_max_rows(m, k))
+        {
+            return Ok(false);
+        }
+        let mut ys: [Option<GpuTensor>; MAX] = Default::default();
+        for row in (0..batch).step_by(ROWS16_CHAIN_STEP) {
+            let rows = (batch - row).min(ROWS16_CHAIN_STEP);
+            let xs = x.sub_offset(row * k, rows * k);
+            for (slot, &(_, y, m)) in ys.iter_mut().zip(members) {
+                *slot = Some(y.sub_offset(row * m, rows * m));
+            }
+            let mut slice = [(members[0].0, x, 0usize); MAX];
+            for (j, &(a, _, m)) in members.iter().enumerate() {
+                slice[j] = (a, ys[j].as_ref().expect("slice view"), m);
+            }
+            if !self.gemm_bf16_mfma_gfx942_rows16(&xs, &slice[..members.len()], k, rows)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::arch_caps::ArchCaps;
@@ -1420,5 +1504,33 @@ mod tests {
         assert!(!src.contains("fp8moe_") && !src.contains("FP8MOE_"));
         assert!(!src.contains("HIPFIRE_COMPILER_FLAGS"));
         assert!(src.contains("#error"));
+    }
+
+    #[test]
+    fn rows16_chain_thresholds_follow_the_p_k_table() {
+        use super::rows16_chain_max_rows as t;
+        // (m, k, rows where chain/tile < 1 was measured, rows where it lost)
+        for (m, k, win, lose) in [
+            (10240, 320, 31, 145),
+            (2560, 640, 145, 456),
+            (48, 2560, 145, 456),
+            (1, 2560, 145, 456),
+            (4, 10240, 145, 456),
+            (512, 2560, 145, 456),
+            (640, 2560, 145, 456),
+            (320, 10240, 456, 912),
+        ] {
+            assert!(win <= t(m, k), "{m}x{k} must chain at {win}");
+            assert!(lose > t(m, k), "{m}x{k} must keep the tile at {lose}");
+        }
+        for (m, k) in [
+            (10240, 2560),
+            (6144, 2560),
+            (2560, 6144),
+            (12288, 2560),
+            (2560, 2560),
+        ] {
+            assert!(t(m, k) >= 1536, "{m}x{k} chains through the prefill chunk");
+        }
     }
 }

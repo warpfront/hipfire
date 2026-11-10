@@ -50,6 +50,11 @@ pub const CASES: &[Q4Case] = &[
         run: gemm_bf16_mfma_rows16_group,
     },
     Q4Case {
+        name: "qwen4_gemm_bf16_mfma_gfx942_rows16_chain",
+        timeout_s: 900,
+        run: gemm_bf16_mfma_rows16_chain,
+    },
+    Q4Case {
         name: "qwen4_gemv_bf16_xf32_1row",
         timeout_s: 120,
         run: gemv_bf16_xf32_1row,
@@ -475,6 +480,122 @@ fn gemm_bf16_mfma_rows16_group(gpu: &mut Gpu) -> Result<String, String> {
     ws.push(x32);
     ws.push(xbf);
     free_all(gpu, ws)?;
+    all(results)
+}
+
+// ── Chained few-row entry past 16 rows (P1a) ────────────────────────────────
+/// Row counts the chain is bit-compared against the tile entry at.
+const CHAIN_ROWS: [usize; 6] = [17, 31, 57, 145, 456, 912];
+
+// `Gpu::gemm_bf16_mfma_gfx942_rows16_chain` at 17 / 31 / 57 / 145 / 456 / 912
+// rows: every trunk shape alone (F32 x, F32 and BF16 out) and the GDN
+// in-projection group (F32 x, mixed out). Where the shape's threshold admits
+// the chain every member's bytes must equal its staged tile-entry GEMM (BF16:
+// + RNE rounding); where it does not, the call must decline without writing
+// (the output keeps its sentinel).
+fn gemm_bf16_mfma_rows16_chain(gpu: &mut Gpu) -> Result<String, String> {
+    if !gpu.arch_caps.is_gfx942() {
+        return Ok("skipped: gemm_bf16_mfma_gfx942 requires gfx942".to_string());
+    }
+    let max_rows = *CHAIN_ROWS.iter().max().unwrap();
+    let mut rng = Rng::new(0x7121_0003);
+    let mut groups: Vec<(String, usize, Vec<usize>, Vec<DType>)> = MFMA_SHAPES
+        .iter()
+        .flat_map(|s| {
+            [DType::F32, DType::BF16]
+                .into_iter()
+                .map(move |dt| (format!("{} {dt:?}", s.name), s.k, vec![s.m], vec![dt]))
+        })
+        .collect();
+    groups.push((
+        "gdn_in group".to_string(),
+        HIDDEN,
+        vec![10240, 6144, GDN_VALUE_HEADS, GDN_VALUE_HEADS],
+        vec![DType::F32, DType::BF16, DType::F32, DType::BF16],
+    ));
+    let mut results = Vec::new();
+    for (name, k, ms, dts) in &groups {
+        let k = *k;
+        let mut ws = Vec::new();
+        for &m in ms {
+            let host = rng.vec_bf16_exact(m * k, -W_RANGE, W_RANGE);
+            ws.push(up_bf16(gpu, &host)?);
+        }
+        let x_host = rng.vec(max_rows * k, -1.0, 1.0);
+        let x32 = up_f32(gpu, &x_host)?;
+        let xbf = stage_bf16(gpu, &x_host)?;
+        for n in CHAIN_ROWS {
+            let admitted = ms
+                .iter()
+                .all(|&m| n <= rdna_compute::cdna::gfx942::rows16_chain_max_rows(m, k));
+            let mut ys = Vec::new();
+            for (&m, &dt) in ms.iter().zip(dts) {
+                let mut y = gpu
+                    .upload_raw(&vec![0xA5u8; n * m * dt.size()], &[n * m])
+                    .map_err(e)?;
+                y.dtype = dt;
+                ys.push(y);
+            }
+            let members: Vec<_> = ws
+                .iter()
+                .zip(&ys)
+                .zip(ms)
+                .map(|((w, y), &m)| (&w.buf, y, m))
+                .collect();
+            let ran = gpu
+                .gemm_bf16_mfma_gfx942_rows16_chain(&x32.sub_offset(0, n * k), &members, k, n, true)
+                .map_err(e)?;
+            sync(gpu)?;
+            if ran != admitted {
+                results.push(Err(format!(
+                    "{name} rows={n}: chain ran={ran}, threshold admits={admitted}"
+                )));
+                free_all(gpu, ys)?;
+                continue;
+            }
+            let mut bad = Vec::new();
+            for (j, ((w, y), &m)) in ws.iter().zip(&ys).zip(ms).enumerate() {
+                let got = down_bytes(gpu, y)?;
+                let want: Vec<u8> = if !admitted {
+                    vec![0xA5; n * m * dts[j].size()]
+                } else {
+                    let t = run_mfma_tiled(gpu, w, &xbf.sub_offset(0, n * k), m, k, n)?;
+                    if dts[j] == DType::F32 {
+                        t.iter().flat_map(|v| v.to_le_bytes()).collect()
+                    } else {
+                        t.iter()
+                            .flat_map(|&v| f32_to_bf16_bits(v).to_le_bytes())
+                            .collect()
+                    }
+                };
+                if got != want {
+                    let diff = got
+                        .chunks(dts[j].size())
+                        .zip(want.chunks(dts[j].size()))
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    bad.push(format!(
+                        "member {j} [{m}x{k} {:?}]: {diff} elements differ",
+                        dts[j]
+                    ));
+                }
+            }
+            let what = if admitted {
+                "chain == staged tile GEMM bitwise"
+            } else {
+                "declined, untouched"
+            };
+            results.push(if bad.is_empty() {
+                Ok(format!("{name} rows={n}: {what}"))
+            } else {
+                Err(format!("{name} rows={n}: {}", bad.join("; ")))
+            });
+            free_all(gpu, ys)?;
+        }
+        ws.push(x32);
+        ws.push(xbf);
+        free_all(gpu, ws)?;
+    }
     all(results)
 }
 

@@ -1870,6 +1870,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_G3_BUILD_ID` | crates/hipfire-arch-qwen35/examples/shared_weight_state_oracle.rs | harness |
 | `HIPFIRE_G5_CAPTURE` | crates/rdna-compute/tests/ffn_grouped_i8_producer_oracle.rs | harness |
 | `HIPFIRE_G5_ONLY_CAPTURE` | crates/rdna-compute/tests/ffn_grouped_i8_producer_oracle.rs | harness |
+| `HIPFIRE_G942_ROWS16_CHAIN` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |
 | `HIPFIRE_G942_TRUNK_GEMV` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |
 | `HIPFIRE_GATED_DELTA_VECTOR_CHUNKED` | crates/hipfire-arch-raon/examples/rda_layer_node.rs, crates/hipfire-arch-raon/src/rda.rs | developer |
 | `HIPFIRE_GATED_DELTA_VECTOR_PM` | crates/rdna-compute/src/gated_delta_vector_pm.rs, crates/rdna-compute/src/kernel_registry.rs | developer |

@@ -1267,6 +1267,18 @@ fn g942_trunk_gemv() -> bool {
     *OPT_OUT
 }
 
+/// `HIPFIRE_G942_ROWS16_CHAIN` (read once, default on; `=0` kills): on gfx942,
+/// a BF16 projection of more than 16 rows takes ⌈rows/16⌉ chained few-row
+/// launches instead of the 32-row-tile entry while the shape's
+/// `rdna_compute::cdna::gfx942::rows16_chain_max_rows` admits it. Same bytes
+/// either way (row-invariant MFMA chain).
+fn g942_rows16_chain() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_bool("HIPFIRE_G942_ROWS16_CHAIN", true)
+    });
+    *ON
+}
+
 /// Whether a BF16-weight projection takes the gfx942 MFMA GEMM
 /// (`KernelKey::GemmBf16Mfma`) at `rows` batch rows.
 ///
@@ -1337,8 +1349,21 @@ fn project_g942_mfma(
         require_tensor(out, elements, out.dtype, "gfx942 trunk output")?;
         outputs.push(view(out, 0, elements));
     }
-    // Few rows: the whole group, four members per launch, on the fused entry.
-    let x = view(input, 0, n);
+    // Few rows (and, past 16, the per-shape rows16 chain): the whole group,
+    // four members per launch, on the fused entry. A chain stages an F32
+    // activation to BF16 once (the bytes the in-kernel staging produces):
+    // otherwise every 16-row launch re-reads its F32 rows per workgroup.
+    let chain = g942_rows16_chain();
+    let mut staged: Option<GpuTensor> = None;
+    if chain && rows > 16 && input.dtype == DType::F32 {
+        let mut scratch = hip(gpu.qwen4_f16_x_scratch(n))?;
+        scratch.dtype = DType::BF16;
+        hip(gpu.convert_f32_to_bf16(input, &scratch, n))?;
+        staged = Some(scratch);
+    }
+    let x = staged
+        .as_ref()
+        .map_or_else(|| view(input, 0, n), |s| view(s, 0, n));
     let mut fused: SmallVec<[bool; 4]> = SmallVec::from_elem(false, group.len());
     for (chunk, members) in group
         .chunks(rdna_compute::gemm::GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS)
@@ -1356,11 +1381,10 @@ fn project_g942_mfma(
                 )
             })
             .collect();
-        if hip(gpu.gemm_bf16_mfma_gfx942_rows16(&x, &launch, k, rows))? {
+        if hip(gpu.gemm_bf16_mfma_gfx942_rows16_chain(&x, &launch, k, rows, chain))? {
             fused[base..base + members.len()].fill(true);
         }
     }
-    let mut staged: Option<GpuTensor> = None;
     // The registered `KernelKey::GemmBf16Mfma` entry (arch-gated to gfx942 by
     // the registry; refuses a non-BF16 activation), not a direct launch.
     let ctx = DispatchCtx::new(gpu);
