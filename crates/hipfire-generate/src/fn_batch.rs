@@ -2729,7 +2729,9 @@ mod tests {
         let commit = body
             .find("executor.commit_step(&plan, out)")
             .expect("commit");
-        let tick = body.find("Some(long_prefill),").expect("tick");
+        let tick = body
+            .find("elastic_boundary(sched, m, gpu, &controls, Some(long_prefill))")
+            .expect("tick");
         assert!(commit < tick, "the elastic tick follows the step's commit");
     }
 
