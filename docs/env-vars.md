@@ -808,7 +808,8 @@ separate output directory per executor). Under `HIPFIRE_SAMPLED_MTP_TOPOLOGY=ep2
 executor over a `HIPFIRE_SAMPLED_MTP_SHARD=START..END` trial shard: `lane_ar` is
 sampled AR lanes (the reference), `lane_batched` / `lane_adaptive` are
 native-MTP mesh lanes with root Leviathan acceptance (the `ep2` cohort has no
-`lane_copy`: the copy lane is off by default on EP serve). The fixed-count
+`lane_copy` arm, so no ep2 verdict covers the EP copy lane, which is on by
+default in steps of at most two lanes since `047ed76122`). The fixed-count
 native-MTP arms pin `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8` so that `N` lanes run
 native windows at every `N`; they are native-window coverage arms, not the shipped
 switching policy. `lane_cross` (`ep2`, `HIPFIRE_SAMPLED_MTP_LANES=8` only; the
