@@ -90,6 +90,7 @@ pub mod lane_proj;
 pub mod lane_rows_pm;
 pub mod lane_wmma;
 pub mod lane_wmma_lab;
+pub mod lane_wmma_tile;
 pub mod latent_attention;
 pub mod latent_attention_absorb;
 pub mod latent_attention_decode;
