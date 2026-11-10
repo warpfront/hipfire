@@ -21,7 +21,7 @@ use rdna_compute::lane_wmma::{
     LANE_WMMA_PREFILL_SPLIT_ROWS,
 };
 use rdna_compute::lane_wmma_tile::{
-    lane_wmma_tile_gemm, lane_wmma_tile_gemm_cfg, lane_wmma_tile_pick, LaneWmmaTile, LANE_WMMA_TILES,
+    lane_wmma_tile_gemm, lane_wmma_tile_gemm_cfg, lane_wmma_tile_pick, lane_wmma_tile_set, LaneWmmaTile,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -162,7 +162,7 @@ fn lwmma_tile_oracle_hw() {
             let want = download_f32(&gpu, &y_ref, rows * m);
 
             let mut cfgs: Vec<(String, Option<LaneWmmaTile>)> = vec![("pick".into(), None)];
-            for t in LANE_WMMA_TILES.iter().filter(|t| t.instantiated(terms)) {
+            for t in lane_wmma_tile_set(terms) {
                 cfgs.push((t.name(), Some(*t)));
             }
             let mut line = format!("[tile-oracle] m={m} k={k} t={terms} rows={rows} split_k={split_k}");
@@ -245,7 +245,7 @@ fn lwmma_tile_bench_hw() {
                     .expect("incumbent");
             });
             println!("[tile-bench] m={m} k={k} t={terms} rows={rows} arm=incumbent us={us:.1}");
-            for t in LANE_WMMA_TILES.iter().filter(|t| t.instantiated(terms)) {
+            for t in lane_wmma_tile_set(terms) {
                 let us = time_us(&mut gpu, |g| {
                     lane_wmma_tile_gemm_cfg(g, &w, &x_t, &y_t, m, k, rows, terms, act, split_k, *t)
                         .expect("tile");
@@ -255,7 +255,7 @@ fn lwmma_tile_bench_hw() {
                     t.name()
                 );
             }
-            let pick = lane_wmma_tile_pick(m, k, rows, terms);
+            let pick = lane_wmma_tile_pick(m, k, rows, terms).expect("served shape has a pick");
             let us = time_us(&mut gpu, |g| {
                 g.lane_wmma_tile_gemm_prefill(&wref, &x_t, &y_t, m, k, rows, terms, act)
                     .expect("tile prefill");

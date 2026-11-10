@@ -331,24 +331,23 @@ static __device__ __forceinline__ void lwmma_tile_body(
 #define LWMMA_TILE_ENTRY_G4(NT, BM, BN, WM, WN) \
     LWMMA_TILE_ENTRY_NAMED(lwmma_tile_bf16_t##NT##_b##BM##x##BN##w##WM##x##WN##g4, NT, BM, BN, WM, WN, 4)
 
-#define LWMMA_TILE_ENTRIES(NT)           \
-    LWMMA_TILE_ENTRY(NT, 64, 64, 4, 2)   \
-    LWMMA_TILE_ENTRY(NT, 64, 128, 2, 4)  \
-    LWMMA_TILE_ENTRY(NT, 128, 64, 4, 2)  \
-    LWMMA_TILE_ENTRY(NT, 128, 128, 4, 4) \
-    LWMMA_TILE_ENTRY(NT, 32, 64, 2, 2)   \
-    LWMMA_TILE_ENTRY(NT, 32, 128, 2, 4)  \
-    LWMMA_TILE_ENTRY(NT, 64, 64, 2, 2)   \
-    LWMMA_TILE_ENTRY(NT, 64, 128, 4, 2)  \
-    LWMMA_TILE_ENTRY(NT, 32, 128, 2, 2)  \
-    LWMMA_TILE_ENTRY(NT, 64, 64, 4, 1)   \
-    LWMMA_TILE_ENTRY(NT, 32, 64, 2, 1)   \
-    LWMMA_TILE_ENTRY(NT, 128, 64, 8, 1)  \
-    LWMMA_TILE_ENTRY(NT, 64, 256, 4, 4)  \
-    LWMMA_TILE_ENTRY_G4(NT, 16, 32, 1, 1)
+// Exactly the configurations `lane_wmma_tile_pick` can select (crates/rdna-compute/src/lane_wmma_tile.rs
+// TILE_PICKS); the module exports nothing else.  One activation term (the HC down, exact BF16
+// operands): the 320 x 10240 shape only.
+#define LWMMA_TILE_ENTRIES_T1                  \
+    LWMMA_TILE_ENTRY_G4(1, 32, 32, 2, 1)       \
+    LWMMA_TILE_ENTRY(1, 32, 64, 2, 2)          \
+    LWMMA_TILE_ENTRY(1, 64, 64, 4, 1)
 
-LWMMA_TILE_ENTRIES(1)
-LWMMA_TILE_ENTRIES(2)
-// Wider quarter-group tiles fit the 64 KB LDS only with one activation term.
-LWMMA_TILE_ENTRY_G4(1, 16, 64, 1, 2)
-LWMMA_TILE_ENTRY_G4(1, 32, 32, 2, 1)
+// Two activation terms (dense BF16 projections).
+#define LWMMA_TILE_ENTRIES_T2                  \
+    LWMMA_TILE_ENTRY_G4(2, 16, 32, 1, 1)       \
+    LWMMA_TILE_ENTRY(2, 32, 64, 2, 2)          \
+    LWMMA_TILE_ENTRY(2, 64, 64, 4, 1)          \
+    LWMMA_TILE_ENTRY(2, 64, 64, 4, 2)          \
+    LWMMA_TILE_ENTRY(2, 32, 128, 2, 2)         \
+    LWMMA_TILE_ENTRY(2, 64, 128, 4, 2)         \
+    LWMMA_TILE_ENTRY(2, 64, 128, 2, 4)
+
+LWMMA_TILE_ENTRIES_T1
+LWMMA_TILE_ENTRIES_T2

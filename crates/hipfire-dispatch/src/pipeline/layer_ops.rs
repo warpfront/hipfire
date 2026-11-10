@@ -2110,11 +2110,12 @@ fn execute_hyper_read_inner(
     {
         // HIPFIRE_QWEN4_PREFILL_LWMMA_HC (default on): lane WMMA down + hc_act epilogue above 64 rows
         // below the F16 WMMA route. One BF16 term is exact: `normalized` is `hyper_norm`'s
-        // BF16-rounded output and the weight is BF16.
+        // BF16-rounded output and the weight is BF16. HIPFIRE_QWEN4_PREFILL_LWMMA_TILE (default on)
+        // runs the tuned shape on the staged-tile kernel, every output word the same.
         if !normalized_ready {
             hip(hyper_norm(gpu, &norm))?;
         }
-        hip(gpu.lane_wmma_gemm_prefill(
+        hip(gpu.lane_wmma_prefill_gemm(
             &rdna_compute::lane_wmma::LaneWmmaWeight::Bf16(op.input_mix_down.buf),
             &normalized,
             &low,

@@ -32287,12 +32287,14 @@ impl Gpu {
         // `HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE` (default on, exact gfx1201, > 64 rows below the F16
         // WMMA route): the same kernel with two BF16 activation terms (hi + lo) and a split-K
         // pinned to a fixed row count, so each row is bitwise its singleton's whatever the call size.
+        // `HIPFIRE_QWEN4_PREFILL_LWMMA_TILE` (default on) runs the tuned shapes on the staged-tile
+        // kernel (`lwmma_tile_bf16_*`), every output word the same as the shipped kernel's.
         if self.prefill_lwmma_dense_applies(batch_size)
             && k.is_multiple_of(128)
             && x.dtype == DType::F32
             && y.dtype == DType::F32
         {
-            return self.lane_wmma_gemm_prefill(
+            return self.lane_wmma_prefill_gemm(
                 &crate::lane_wmma::LaneWmmaWeight::Bf16(weight),
                 x,
                 y,
