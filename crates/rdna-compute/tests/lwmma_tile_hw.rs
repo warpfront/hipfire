@@ -21,7 +21,8 @@ use rdna_compute::lane_wmma::{
     LANE_WMMA_PREFILL_SPLIT_ROWS,
 };
 use rdna_compute::lane_wmma_tile::{
-    lane_wmma_tile_gemm, lane_wmma_tile_gemm_cfg, lane_wmma_tile_pick, lane_wmma_tile_set, LaneWmmaTile,
+    lane_wmma_tile_gemm, lane_wmma_tile_gemm_cfg, lane_wmma_tile_pick, lane_wmma_tile_set,
+    LaneWmmaTile,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -135,8 +136,16 @@ fn lwmma_tile_oracle_hw() {
         let (split_k, _) = lane_wmma_prefill_plan(m, k, MAX_ROWS, LANE_WMMA_PREFILL_SPLIT_ROWS);
         let scratch = LaneWmmaScratch::new(
             &mut gpu,
-            if split_k > 1 { split_k * MAX_ROWS * m } else { 1 },
-            if split_k > 1 { m.div_ceil(16) * MAX_ROWS.div_ceil(64) } else { 1 },
+            if split_k > 1 {
+                split_k * MAX_ROWS * m
+            } else {
+                1
+            },
+            if split_k > 1 {
+                m.div_ceil(16) * MAX_ROWS.div_ceil(64)
+            } else {
+                1
+            },
         )
         .expect("scratch");
         let mut rng = Lcg(0x71E0_1000 ^ ((m as u64) << 20) ^ k as u64);
@@ -165,14 +174,15 @@ fn lwmma_tile_oracle_hw() {
             for t in lane_wmma_tile_set(terms) {
                 cfgs.push((t.name(), Some(*t)));
             }
-            let mut line = format!("[tile-oracle] m={m} k={k} t={terms} rows={rows} split_k={split_k}");
+            let mut line =
+                format!("[tile-oracle] m={m} k={k} t={terms} rows={rows} split_k={split_k}");
             for (name, t) in &cfgs {
                 // Poison y so an unwritten word cannot match by accident.
                 let y_t = upload_f32(&mut gpu, &vec![f32::from_bits(0x7fc0_dead); rows * m]);
                 match t {
-                    None => {
-                        lane_wmma_tile_gemm(&mut gpu, &w, &x_t, &y_t, m, k, rows, terms, act, split_k)
-                    }
+                    None => lane_wmma_tile_gemm(
+                        &mut gpu, &w, &x_t, &y_t, m, k, rows, terms, act, split_k,
+                    ),
                     Some(t) => lane_wmma_tile_gemm_cfg(
                         &mut gpu, &w, &x_t, &y_t, m, k, rows, terms, act, split_k, *t,
                     ),
@@ -193,7 +203,10 @@ fn lwmma_tile_oracle_hw() {
         }
     }
     eprintln!("[tile-oracle] total differing words {total_diff} over {checks} checks");
-    assert_eq!(total_diff, 0, "tile kernel is not byte-identical to lane_wmma_gemm");
+    assert_eq!(
+        total_diff, 0,
+        "tile kernel is not byte-identical to lane_wmma_gemm"
+    );
 }
 
 fn median(v: &mut [f64]) -> f64 {

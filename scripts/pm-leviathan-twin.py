@@ -17,7 +17,7 @@ Explicit invocation only: no test, build script or runtime path runs this. It
 
 Tests (`crates/peacemaker-isa/tests/hip_twin_leviathan.rs`) only consume the committed files.
 
-    scripts/pm-leviathan-twin.py [--family leviathan|moe-shared-down-combine|lwmma-multi|moe-route-scatter-wide|qwen4-moe-ep-a8-rot]
+    scripts/pm-leviathan-twin.py [--family leviathan|moe-shared-down-combine|lwmma-multi|lwmma-tile|moe-route-scatter-wide|qwen4-moe-ep-a8-rot]
         [--arch gfx1200|gfx1201|all] [--rocm-path DIR]
         [--build-wrapper 'WRAPPER ARGS'] [--seal-bin PATH] [--out-dir DIR]
 
@@ -30,6 +30,11 @@ manifest `moe_shared_down_combine_pm_gfx1201.twin.json`, `seal.reports` in symbo
 `lwmma_gemm_bf16_t2_m{1,2,3,4}_n1_multi` symbols into one `kernels/qwen4_lane_wmma_multi_pm_gfx1201.hxaco`
 (anchor `qwen4_lane_wmma_multi_hipcc_gfx1201.co`, manifest `qwen4_lane_wmma_multi_pm_gfx1201.twin.json`,
 `seal.reports` in symbol order); the whole device ELF (plain lane-WMMA entries included) is byte-identical; no math evidence.
+
+`--family lwmma-tile` (gfx1201 only) compiles `kernels/src/qwen4_lwmma_tile.gfx1201.hip` once and
+seals the 10 selected P3 tile entries into `kernels/qwen4_lwmma_tile_pm_gfx1201.hxaco`
+(anchor `qwen4_lwmma_tile_hipcc_gfx1201.co`, manifest `qwen4_lwmma_tile_pm_gfx1201.twin.json`);
+the full device ELF is byte-identical. Proof only; dispatch remains HIP.
 
 `--family moe-route-scatter-wide` and `--family qwen4-moe-ep-a8-rot` (gfx1201 only) compile the exact concatenated
 runtime module source (`MOE_ROUTE_SCATTER_WIDE_SRC`, `QWEN4_MOE_EP_A8_ROT_SRC`; parts and hashes recorded in the manifest's
@@ -75,6 +80,24 @@ FAMILIES = {
         "parts": ("kernels/src/topk8_select.hip",
                   "kernels/src/qwen4_gemv_mq6g256v2.hip",
                   "kernels/src/topk8_rows.gfx1201.hip"),
+    },
+    "lwmma-tile": {
+        "source": "kernels/src/qwen4_lwmma_tile.gfx1201.hip",
+        "symbols": (
+            "lwmma_tile_bf16_t1_b32x32w2x1g4",
+            "lwmma_tile_bf16_t1_b32x64w2x2",
+            "lwmma_tile_bf16_t1_b64x64w4x1",
+            "lwmma_tile_bf16_t2_b16x32w1x1g4",
+            "lwmma_tile_bf16_t2_b32x64w2x2",
+            "lwmma_tile_bf16_t2_b64x64w4x1",
+            "lwmma_tile_bf16_t2_b64x64w4x2",
+            "lwmma_tile_bf16_t2_b32x128w2x2",
+            "lwmma_tile_bf16_t2_b64x128w4x2",
+            "lwmma_tile_bf16_t2_b64x128w2x4",
+        ),
+        "prefix": "qwen4_lwmma_tile",
+        "arches": ("gfx1201",),
+        "math": False,
     },
     "lwmma-multi": {
         "source": "kernels/src/qwen4_lane_wmma.gfx1201.hip",

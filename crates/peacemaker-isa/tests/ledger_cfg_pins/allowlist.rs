@@ -47,6 +47,12 @@ const X8_LOAD_WAR_WHY: &str = "UNPROVEN, not a claimed race: an original LLVM co
 const X8_LOAD_USE_WHY: &str = "MODEL LIMITATION, not a claimed race: a d16 load (or the `.l` half read of a register a d16 load fills) whose destination VGPR is also listed as a use (the other half is preserved), so the ledger reads the pending load into the same register as a RAW on its old value; it cannot tell a d16 lo/hi pair from an overwrite, and whether the hardware returns the pair in order is not established by this verifier (the committed qwen4_moe_ep_a8_rot hipcc image is unchanged compiler output; the sealed PM twin is the same ELF)";
 const X8_KM_WHY: &str = "MODEL LIMITATION, not a claimed race: the IR models the VOP3 scalar-destination SGPR (here a `v_cmp_*_e64` result) as a pair although a wave32 instruction writes one SGPR, so the reported WAW with the pending SMEM load of s[2:3] exists only through the pair's second register (the committed qwen4_moe_ep_a8_rot hipcc image is unchanged compiler output; the sealed PM twin is the same ELF)";
 
+/// Shared reasons of the 20 `qwen4_lwmma_tile` rows below (10 selected kernels of the whole
+/// `qwen4_lwmma_tile.gfx1201.hip` ELF, once from the hipcc anchor `.co`, once from the sealed PM twin
+/// `.hxaco`; same instruction and need in both images). Original LLVM obligations, OPEN.
+const LWMMA_TILE_ST_WHY: &str = "UNPROVEN, not a claimed race: an original LLVM compiler obligation, OPEN (the committed qwen4_lwmma_tile hipcc image is unchanged compiler output; the sealed PM twin is the same ELF; no modified code is claimed to race). The ledger keeps a pending VMEM store's source registers (data and address VGPRs) locked until its store-counter wait and reports the first write of one on a CFG path that has no such wait; whether that path is feasible and whether the hardware has read the store sources by then (address captured at issue, vm_vsrc) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity does not discharge this strict WAR path in the ledger. Nothing here is discharged";
+const LWMMA_TILE_KM_WHY: &str = "MODEL LIMITATION, not a claimed race: the IR models the VOP3 scalar-destination SGPR (here a `v_cmp_*_e64` result) as a pair although a wave32 instruction writes one SGPR, so the reported WAW with the pending SMEM load of s[2:3] exists only through the pair's second register (the committed qwen4_lwmma_tile hipcc image is unchanged compiler output; the sealed PM twin is the same ELF)";
+
 /// Reports of a missing wait on a CFG path, reviewed. None is a claimed race.
 pub const FINDINGS: &[Allow] = &[
     Allow {
@@ -1657,6 +1663,126 @@ pub const FINDINGS: &[Allow] = &[
         needle: "`v_cmp_le_u32_e64 s1, s5, v2` (after label `.LBB12`): needs Km wait 0 (Waw { reg: \"s[2:3]\" })",
         why: X8_KM_WHY,
     },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t1_b32x32w2x1g4",
+        needle: "`v_or_b32_e32 v4, 1, v3` (after label `.LBB25`): needs Store wait 0 (War { reg: \"v[4:5]\" })",
+        why: LWMMA_TILE_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t1_b32x64w2x2",
+        needle: "`v_or_b32_e32 v4, 1, v3` (after label `.LBB48`): needs Store wait 0 (War { reg: \"v[4:5]\" })",
+        why: LWMMA_TILE_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t1_b64x64w4x1",
+        needle: "`v_or_b32_e32 v4, 1, v3` (after label `.LBB72`): needs Store wait 0 (War { reg: \"v[4:5]\" })",
+        why: LWMMA_TILE_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b16x32w1x1g4",
+        needle: "`v_cmp_ne_u32_e64 s1, 0, v45` (after label `.LBB1`): needs Km wait 0 (Waw { reg: \"s[2:3]\" })",
+        why: LWMMA_TILE_KM_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b32x64w2x2",
+        needle: "`v_or_b32_e32 v4, 1, v3` (after label `.LBB48`): needs Store wait 0 (War { reg: \"v[4:5]\" })",
+        why: LWMMA_TILE_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b64x64w4x1",
+        needle: "`v_or_b32_e32 v4, 1, v3` (after label `.LBB72`): needs Store wait 0 (War { reg: \"v[4:5]\" })",
+        why: LWMMA_TILE_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b64x64w4x2",
+        needle: "`v_or_b32_e32 v4, 1, v3` (after label `.LBB48`): needs Store wait 0 (War { reg: \"v[4:5]\" })",
+        why: LWMMA_TILE_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b32x128w2x2",
+        needle: "`v_or_b32_e32 v4, 1, v3` (after label `.LBB72`): needs Store wait 0 (War { reg: \"v[4:5]\" })",
+        why: LWMMA_TILE_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b64x128w4x2",
+        needle: "`v_or_b32_e32 v4, 1, v3` (after label `.LBB72`): needs Store wait 0 (War { reg: \"v[4:5]\" })",
+        why: LWMMA_TILE_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b64x128w2x4",
+        needle: "`v_or_b32_e32 v4, 1, v3` (after label `.LBB63`): needs Store wait 0 (War { reg: \"v[4:5]\" })",
+        why: LWMMA_TILE_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t1_b32x32w2x1g4",
+        needle: "`v_or_b32_e32 v4, 1, v3` (after label `.LBB25`): needs Store wait 0 (War { reg: \"v[4:5]\" })",
+        why: LWMMA_TILE_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t1_b32x64w2x2",
+        needle: "`v_or_b32_e32 v4, 1, v3` (after label `.LBB48`): needs Store wait 0 (War { reg: \"v[4:5]\" })",
+        why: LWMMA_TILE_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t1_b64x64w4x1",
+        needle: "`v_or_b32_e32 v4, 1, v3` (after label `.LBB72`): needs Store wait 0 (War { reg: \"v[4:5]\" })",
+        why: LWMMA_TILE_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b16x32w1x1g4",
+        needle: "`v_cmp_ne_u32_e64 s1, 0, v45` (after label `.LBB1`): needs Km wait 0 (Waw { reg: \"s[2:3]\" })",
+        why: LWMMA_TILE_KM_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b32x64w2x2",
+        needle: "`v_or_b32_e32 v4, 1, v3` (after label `.LBB48`): needs Store wait 0 (War { reg: \"v[4:5]\" })",
+        why: LWMMA_TILE_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b64x64w4x1",
+        needle: "`v_or_b32_e32 v4, 1, v3` (after label `.LBB72`): needs Store wait 0 (War { reg: \"v[4:5]\" })",
+        why: LWMMA_TILE_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b64x64w4x2",
+        needle: "`v_or_b32_e32 v4, 1, v3` (after label `.LBB48`): needs Store wait 0 (War { reg: \"v[4:5]\" })",
+        why: LWMMA_TILE_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b32x128w2x2",
+        needle: "`v_or_b32_e32 v4, 1, v3` (after label `.LBB72`): needs Store wait 0 (War { reg: \"v[4:5]\" })",
+        why: LWMMA_TILE_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b64x128w4x2",
+        needle: "`v_or_b32_e32 v4, 1, v3` (after label `.LBB72`): needs Store wait 0 (War { reg: \"v[4:5]\" })",
+        why: LWMMA_TILE_ST_WHY,
+    },
+    Allow {
+        scope: "pins",
+        target: "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b64x128w2x4",
+        needle: "`v_or_b32_e32 v4, 1, v3` (after label `.LBB63`): needs Store wait 0 (War { reg: \"v[4:5]\" })",
+        why: LWMMA_TILE_ST_WHY,
+    },
 ];
 
 /// Inputs with no verification: a verifier refusal or a refusal upstream of it (lift region, pool).
@@ -2130,6 +2256,13 @@ pub struct PoolBody {
 /// covered by the tid 504 entry. No template id above 290 carried an entry before, so none
 /// was renumbered; a later image sorting before `qwen4_lane_wmma_multi_*` shifts these ids,
 /// fixed by editing the `tid` only.
+///
+/// Templates 505-524 are the 20 hosted `qwen4_lwmma_tile` bodies (10 selected kernels of the whole
+/// `qwen4_lwmma_tile.gfx1201.hip` ELF per image: 505-514 from the hipcc `.co`, 515-524 from the
+/// sealed `.hxaco` twin, every one with a finding). They are the pool-hosted copies of the 20 `pins`
+/// rows of the same targets (original LLVM obligations, OPEN, not claimed races). The images sort
+/// after `qwen4_lane_wmma_multi_*` and before `qwen4_moe_ep_a8_rot_*`, so every id of the later
+/// images (the 20 a8_rot bodies 513-532 and the four topk8_rows bodies 557-562) shifted by +20.
 pub const POOL_BODY: &[PoolBody] = &[
     // pins row 2, W2
     PoolBody {
@@ -2860,7 +2993,7 @@ pub const POOL_BODY: &[PoolBody] = &[
     },
     // topk8_rows_mq6g256v2 hipcc originals (tid 557-558) and PM twins (tid 561-562); b256 pools
     PoolBody {
-        tid: 557,
+        tid: 577,
         target: "topk8_rows_mq6g256v2_hipcc_gfx1201.co#topk8_partial_f32_rows",
         body_pc: 274,
         category: Category::Candidate,
@@ -2868,7 +3001,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Store wait 1 (War { reg: \"v1\" })",
     },
     PoolBody {
-        tid: 558,
+        tid: 578,
         target: "topk8_rows_mq6g256v2_hipcc_gfx1201.co#topk8_rescore_mq6g256v2_k2560_rows",
         body_pc: 75,
         category: Category::ModelLimit,
@@ -2876,7 +3009,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Km wait 0 (Waw { reg: \"s4\" })",
     },
     PoolBody {
-        tid: 561,
+        tid: 581,
         target: "topk8_rows_mq6g256v2_pm_gfx1201.hxaco#topk8_partial_f32_rows",
         body_pc: 274,
         category: Category::Candidate,
@@ -2884,7 +3017,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Store wait 1 (War { reg: \"v1\" })",
     },
     PoolBody {
-        tid: 562,
+        tid: 582,
         target: "topk8_rows_mq6g256v2_pm_gfx1201.hxaco#topk8_rescore_mq6g256v2_k2560_rows",
         body_pc: 75,
         category: Category::ModelLimit,
@@ -4147,7 +4280,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Ds wait 0 (War { reg: \"v1\" })",
     },
     PoolBody {
-        tid: 513,
+        tid: 533,
         target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_nt1",
         body_pc: 126,
         category: Category::Candidate,
@@ -4155,7 +4288,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Load wait 0 (War { reg: \"v[0:1]\" })",
     },
     PoolBody {
-        tid: 514,
+        tid: 534,
         target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_nt2",
         body_pc: 234,
         category: Category::ModelLimit,
@@ -4163,7 +4296,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Load wait 0 (Use { reg: \"v32\" })",
     },
     PoolBody {
-        tid: 515,
+        tid: 535,
         target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_planar_nt1",
         body_pc: 130,
         category: Category::ModelLimit,
@@ -4171,7 +4304,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Load wait 0 (Use { reg: \"v32\" })",
     },
     PoolBody {
-        tid: 516,
+        tid: 536,
         target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_planar_nt2",
         body_pc: 242,
         category: Category::ModelLimit,
@@ -4179,7 +4312,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Load wait 0 (Use { reg: \"v32\" })",
     },
     PoolBody {
-        tid: 517,
+        tid: 537,
         target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_down_nt1",
         body_pc: 115,
         category: Category::Candidate,
@@ -4187,7 +4320,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Load wait 0 (War { reg: \"v[12:13]\" })",
     },
     PoolBody {
-        tid: 518,
+        tid: 538,
         target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_down_nt2",
         body_pc: 282,
         category: Category::ModelLimit,
@@ -4195,7 +4328,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Load wait 0 (Use { reg: \"v24\" })",
     },
     PoolBody {
-        tid: 519,
+        tid: 539,
         target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_down_planar_nt1",
         body_pc: 116,
         category: Category::Candidate,
@@ -4203,7 +4336,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Load wait 0 (War { reg: \"v[8:9]\" })",
     },
     PoolBody {
-        tid: 520,
+        tid: 540,
         target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_down_planar_nt2",
         body_pc: 284,
         category: Category::ModelLimit,
@@ -4211,7 +4344,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Load wait 0 (Use { reg: \"v24\" })",
     },
     PoolBody {
-        tid: 521,
+        tid: 541,
         target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_rot_planar_nt1",
         body_pc: 168,
         category: Category::ModelLimit,
@@ -4219,7 +4352,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Load wait 0 (Use { reg: \"v36\" })",
     },
     PoolBody {
-        tid: 522,
+        tid: 542,
         target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_rot_planar_nt2",
         body_pc: 180,
         category: Category::ModelLimit,
@@ -4227,7 +4360,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Km wait 0 (Waw { reg: \"s[2:3]\" })",
     },
     PoolBody {
-        tid: 523,
+        tid: 543,
         target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_nt1",
         body_pc: 126,
         category: Category::Candidate,
@@ -4235,7 +4368,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Load wait 0 (War { reg: \"v[0:1]\" })",
     },
     PoolBody {
-        tid: 524,
+        tid: 544,
         target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_nt2",
         body_pc: 234,
         category: Category::ModelLimit,
@@ -4243,7 +4376,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Load wait 0 (Use { reg: \"v32\" })",
     },
     PoolBody {
-        tid: 525,
+        tid: 545,
         target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_planar_nt1",
         body_pc: 130,
         category: Category::ModelLimit,
@@ -4251,7 +4384,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Load wait 0 (Use { reg: \"v32\" })",
     },
     PoolBody {
-        tid: 526,
+        tid: 546,
         target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_planar_nt2",
         body_pc: 242,
         category: Category::ModelLimit,
@@ -4259,7 +4392,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Load wait 0 (Use { reg: \"v32\" })",
     },
     PoolBody {
-        tid: 527,
+        tid: 547,
         target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_down_nt1",
         body_pc: 115,
         category: Category::Candidate,
@@ -4267,7 +4400,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Load wait 0 (War { reg: \"v[12:13]\" })",
     },
     PoolBody {
-        tid: 528,
+        tid: 548,
         target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_down_nt2",
         body_pc: 282,
         category: Category::ModelLimit,
@@ -4275,7 +4408,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Load wait 0 (Use { reg: \"v24\" })",
     },
     PoolBody {
-        tid: 529,
+        tid: 549,
         target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_down_planar_nt1",
         body_pc: 116,
         category: Category::Candidate,
@@ -4283,7 +4416,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Load wait 0 (War { reg: \"v[8:9]\" })",
     },
     PoolBody {
-        tid: 530,
+        tid: 550,
         target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_down_planar_nt2",
         body_pc: 284,
         category: Category::ModelLimit,
@@ -4291,7 +4424,7 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Load wait 0 (Use { reg: \"v24\" })",
     },
     PoolBody {
-        tid: 531,
+        tid: 551,
         target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_rot_planar_nt1",
         body_pc: 168,
         category: Category::ModelLimit,
@@ -4299,12 +4432,192 @@ pub const POOL_BODY: &[PoolBody] = &[
         need: "needs Load wait 0 (Use { reg: \"v36\" })",
     },
     PoolBody {
-        tid: 532,
+        tid: 552,
         target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_rot_planar_nt2",
         body_pc: 180,
         category: Category::ModelLimit,
         insn: "`v_cmp_le_u32_e64 s1, s5, v2`",
         need: "needs Km wait 0 (Waw { reg: \"s[2:3]\" })",
+    },
+    // P3 hosted copy of the qwen4_lwmma_tile pins finding
+    PoolBody {
+        tid: 505,
+        target: "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t1_b32x32w2x1g4",
+        body_pc: 742,
+        category: Category::Candidate,
+        insn: "`v_or_b32_e32 v4, 1, v3`",
+        need: "needs Store wait 0 (War { reg: \"v[4:5]\" })",
+    },
+    // P3 hosted copy of the qwen4_lwmma_tile pins finding
+    PoolBody {
+        tid: 506,
+        target: "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t1_b32x64w2x2",
+        body_pc: 712,
+        category: Category::Candidate,
+        insn: "`v_or_b32_e32 v4, 1, v3`",
+        need: "needs Store wait 0 (War { reg: \"v[4:5]\" })",
+    },
+    // P3 hosted copy of the qwen4_lwmma_tile pins finding
+    PoolBody {
+        tid: 507,
+        target: "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t1_b64x64w4x1",
+        body_pc: 1034,
+        category: Category::Candidate,
+        insn: "`v_or_b32_e32 v4, 1, v3`",
+        need: "needs Store wait 0 (War { reg: \"v[4:5]\" })",
+    },
+    // P3 hosted copy of the qwen4_lwmma_tile pins finding
+    PoolBody {
+        tid: 508,
+        target: "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b16x32w1x1g4",
+        body_pc: 320,
+        category: Category::ModelLimit,
+        insn: "`v_cmp_ne_u32_e64 s1, 0, v45`",
+        need: "needs Km wait 0 (Waw { reg: \"s[2:3]\" })",
+    },
+    // P3 hosted copy of the qwen4_lwmma_tile pins finding
+    PoolBody {
+        tid: 509,
+        target: "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b32x64w2x2",
+        body_pc: 799,
+        category: Category::Candidate,
+        insn: "`v_or_b32_e32 v4, 1, v3`",
+        need: "needs Store wait 0 (War { reg: \"v[4:5]\" })",
+    },
+    // P3 hosted copy of the qwen4_lwmma_tile pins finding
+    PoolBody {
+        tid: 510,
+        target: "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b64x64w4x1",
+        body_pc: 1202,
+        category: Category::Candidate,
+        insn: "`v_or_b32_e32 v4, 1, v3`",
+        need: "needs Store wait 0 (War { reg: \"v[4:5]\" })",
+    },
+    // P3 hosted copy of the qwen4_lwmma_tile pins finding
+    PoolBody {
+        tid: 511,
+        target: "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b64x64w4x2",
+        body_pc: 768,
+        category: Category::Candidate,
+        insn: "`v_or_b32_e32 v4, 1, v3`",
+        need: "needs Store wait 0 (War { reg: \"v[4:5]\" })",
+    },
+    // P3 hosted copy of the qwen4_lwmma_tile pins finding
+    PoolBody {
+        tid: 512,
+        target: "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b32x128w2x2",
+        body_pc: 1101,
+        category: Category::Candidate,
+        insn: "`v_or_b32_e32 v4, 1, v3`",
+        need: "needs Store wait 0 (War { reg: \"v[4:5]\" })",
+    },
+    // P3 hosted copy of the qwen4_lwmma_tile pins finding
+    PoolBody {
+        tid: 513,
+        target: "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b64x128w4x2",
+        body_pc: 1062,
+        category: Category::Candidate,
+        insn: "`v_or_b32_e32 v4, 1, v3`",
+        need: "needs Store wait 0 (War { reg: \"v[4:5]\" })",
+    },
+    // P3 hosted copy of the qwen4_lwmma_tile pins finding
+    PoolBody {
+        tid: 514,
+        target: "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b64x128w2x4",
+        body_pc: 1000,
+        category: Category::Candidate,
+        insn: "`v_or_b32_e32 v4, 1, v3`",
+        need: "needs Store wait 0 (War { reg: \"v[4:5]\" })",
+    },
+    // P3 hosted copy of the qwen4_lwmma_tile pins finding
+    PoolBody {
+        tid: 515,
+        target: "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t1_b32x32w2x1g4",
+        body_pc: 742,
+        category: Category::Candidate,
+        insn: "`v_or_b32_e32 v4, 1, v3`",
+        need: "needs Store wait 0 (War { reg: \"v[4:5]\" })",
+    },
+    // P3 hosted copy of the qwen4_lwmma_tile pins finding
+    PoolBody {
+        tid: 516,
+        target: "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t1_b32x64w2x2",
+        body_pc: 712,
+        category: Category::Candidate,
+        insn: "`v_or_b32_e32 v4, 1, v3`",
+        need: "needs Store wait 0 (War { reg: \"v[4:5]\" })",
+    },
+    // P3 hosted copy of the qwen4_lwmma_tile pins finding
+    PoolBody {
+        tid: 517,
+        target: "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t1_b64x64w4x1",
+        body_pc: 1034,
+        category: Category::Candidate,
+        insn: "`v_or_b32_e32 v4, 1, v3`",
+        need: "needs Store wait 0 (War { reg: \"v[4:5]\" })",
+    },
+    // P3 hosted copy of the qwen4_lwmma_tile pins finding
+    PoolBody {
+        tid: 518,
+        target: "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b16x32w1x1g4",
+        body_pc: 320,
+        category: Category::ModelLimit,
+        insn: "`v_cmp_ne_u32_e64 s1, 0, v45`",
+        need: "needs Km wait 0 (Waw { reg: \"s[2:3]\" })",
+    },
+    // P3 hosted copy of the qwen4_lwmma_tile pins finding
+    PoolBody {
+        tid: 519,
+        target: "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b32x64w2x2",
+        body_pc: 799,
+        category: Category::Candidate,
+        insn: "`v_or_b32_e32 v4, 1, v3`",
+        need: "needs Store wait 0 (War { reg: \"v[4:5]\" })",
+    },
+    // P3 hosted copy of the qwen4_lwmma_tile pins finding
+    PoolBody {
+        tid: 520,
+        target: "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b64x64w4x1",
+        body_pc: 1202,
+        category: Category::Candidate,
+        insn: "`v_or_b32_e32 v4, 1, v3`",
+        need: "needs Store wait 0 (War { reg: \"v[4:5]\" })",
+    },
+    // P3 hosted copy of the qwen4_lwmma_tile pins finding
+    PoolBody {
+        tid: 521,
+        target: "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b64x64w4x2",
+        body_pc: 768,
+        category: Category::Candidate,
+        insn: "`v_or_b32_e32 v4, 1, v3`",
+        need: "needs Store wait 0 (War { reg: \"v[4:5]\" })",
+    },
+    // P3 hosted copy of the qwen4_lwmma_tile pins finding
+    PoolBody {
+        tid: 522,
+        target: "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b32x128w2x2",
+        body_pc: 1101,
+        category: Category::Candidate,
+        insn: "`v_or_b32_e32 v4, 1, v3`",
+        need: "needs Store wait 0 (War { reg: \"v[4:5]\" })",
+    },
+    // P3 hosted copy of the qwen4_lwmma_tile pins finding
+    PoolBody {
+        tid: 523,
+        target: "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b64x128w4x2",
+        body_pc: 1062,
+        category: Category::Candidate,
+        insn: "`v_or_b32_e32 v4, 1, v3`",
+        need: "needs Store wait 0 (War { reg: \"v[4:5]\" })",
+    },
+    // P3 hosted copy of the qwen4_lwmma_tile pins finding
+    PoolBody {
+        tid: 524,
+        target: "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b64x128w2x4",
+        body_pc: 1000,
+        category: Category::Candidate,
+        insn: "`v_or_b32_e32 v4, 1, v3`",
+        need: "needs Store wait 0 (War { reg: \"v[4:5]\" })",
     },
 ];
 

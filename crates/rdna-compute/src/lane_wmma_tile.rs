@@ -14,11 +14,11 @@
 //!
 //! Kernels: `kernels/src/qwen4_lwmma_tile.gfx1201.hip`. This module reads no environment variable.
 
+use crate::dispatch::ReplayLaunchBindings;
 use crate::lane_wmma::{
     err, i32_of, lane_wmma_prefill_plan, need_bytes, need_f32, u32_of, LaneWmmaLaunch,
     LaneWmmaWeight, LANE_WMMA_PREFILL_SPLIT_ROWS,
 };
-use crate::dispatch::ReplayLaunchBindings;
 use crate::{Gpu, GpuTensor};
 use hip_bridge::{HipResult, KernargBlob};
 
@@ -63,16 +63,32 @@ impl LaneWmmaTile {
 }
 
 const fn tile(bm: usize, bn: usize, wm: usize, wn: usize) -> LaneWmmaTile {
-    LaneWmmaTile { bm, bn, wm, wn, qg: 1 }
+    LaneWmmaTile {
+        bm,
+        bn,
+        wm,
+        wn,
+        qg: 1,
+    }
 }
 
 const fn tile_g4(bm: usize, bn: usize, wm: usize, wn: usize) -> LaneWmmaTile {
-    LaneWmmaTile { bm, bn, wm, wn, qg: 4 }
+    LaneWmmaTile {
+        bm,
+        bn,
+        wm,
+        wn,
+        qg: 4,
+    }
 }
 
 /// The tiles the kernel file exports for one activation term (the HC down): exactly the ones
 /// [`lane_wmma_tile_pick`] can select, nothing else is built.
-const TILES_T1: &[LaneWmmaTile] = &[tile_g4(32, 32, 2, 1), tile(32, 64, 2, 2), tile(64, 64, 4, 1)];
+const TILES_T1: &[LaneWmmaTile] = &[
+    tile_g4(32, 32, 2, 1),
+    tile(32, 64, 2, 2),
+    tile(64, 64, 4, 1),
+];
 
 /// The tiles the kernel file exports for two activation terms (dense BF16 projections).
 const TILES_T2: &[LaneWmmaTile] = &[
@@ -108,13 +124,68 @@ fn rows_bucket(rows: usize) -> usize {
 /// the 149-row bucket of the 320 x 10240 shapes, where the serial K walk of the plain tiles is
 /// latency bound.
 const TILE_PICKS: &[(usize, usize, usize, [LaneWmmaTile; 3])] = &[
-    (320, 10240, 1, [tile_g4(32, 32, 2, 1), tile(32, 64, 2, 2), tile(64, 64, 4, 1)]),
-    (320, 10240, 2, [tile_g4(16, 32, 1, 1), tile(32, 64, 2, 2), tile(64, 64, 4, 1)]),
-    (512, 2560, 2, [tile(32, 64, 2, 2), tile(32, 64, 2, 2), tile(64, 64, 4, 2)]),
-    (640, 2560, 2, [tile(32, 64, 2, 2), tile(32, 128, 2, 2), tile(64, 128, 4, 2)]),
-    (2560, 640, 2, [tile(64, 128, 4, 2), tile(64, 128, 2, 4), tile(64, 128, 2, 4)]),
-    (2560, 2560, 2, [tile(64, 128, 2, 4), tile(32, 128, 2, 2), tile(64, 128, 4, 2)]),
-    (10240, 2560, 2, [tile(64, 128, 4, 2), tile(64, 128, 4, 2), tile(64, 128, 4, 2)]),
+    (
+        320,
+        10240,
+        1,
+        [
+            tile_g4(32, 32, 2, 1),
+            tile(32, 64, 2, 2),
+            tile(64, 64, 4, 1),
+        ],
+    ),
+    (
+        320,
+        10240,
+        2,
+        [
+            tile_g4(16, 32, 1, 1),
+            tile(32, 64, 2, 2),
+            tile(64, 64, 4, 1),
+        ],
+    ),
+    (
+        512,
+        2560,
+        2,
+        [tile(32, 64, 2, 2), tile(32, 64, 2, 2), tile(64, 64, 4, 2)],
+    ),
+    (
+        640,
+        2560,
+        2,
+        [tile(32, 64, 2, 2), tile(32, 128, 2, 2), tile(64, 128, 4, 2)],
+    ),
+    (
+        2560,
+        640,
+        2,
+        [
+            tile(64, 128, 4, 2),
+            tile(64, 128, 2, 4),
+            tile(64, 128, 2, 4),
+        ],
+    ),
+    (
+        2560,
+        2560,
+        2,
+        [
+            tile(64, 128, 2, 4),
+            tile(32, 128, 2, 2),
+            tile(64, 128, 4, 2),
+        ],
+    ),
+    (
+        10240,
+        2560,
+        2,
+        [
+            tile(64, 128, 4, 2),
+            tile(64, 128, 4, 2),
+            tile(64, 128, 4, 2),
+        ],
+    ),
 ];
 
 /// The tile configuration [`lane_wmma_tile_gemm`] runs for `(m, k, rows, terms)`: the tuned table
@@ -217,9 +288,8 @@ pub fn lane_wmma_tile_gemm(
     hc_act: Option<f32>,
     split_k: usize,
 ) -> HipResult<LaneWmmaLaunch> {
-    let t = lane_wmma_tile_pick(m, k, rows, terms).ok_or_else(|| {
-        err(format!("tile: no tuned tile for m {m} k {k} terms {terms}"))
-    })?;
+    let t = lane_wmma_tile_pick(m, k, rows, terms)
+        .ok_or_else(|| err(format!("tile: no tuned tile for m {m} k {k} terms {terms}")))?;
     lane_wmma_tile_gemm_cfg(gpu, w, x, y, m, k, rows, terms, hc_act, split_k, t)
 }
 
@@ -284,7 +354,10 @@ mod tests {
         let mut selected: Vec<(usize, LaneWmmaTile)> = Vec::new();
         for (m, k, terms, picks) in TILE_PICKS {
             for t in picks {
-                assert!(t.instantiated(*terms), "{m}x{k} t{terms}: {t:?} not exported");
+                assert!(
+                    t.instantiated(*terms),
+                    "{m}x{k} t{terms}: {t:?} not exported"
+                );
                 if !selected.contains(&(*terms, *t)) {
                     selected.push((*terms, *t));
                 }
@@ -292,7 +365,10 @@ mod tests {
         }
         for terms in [1, 2] {
             for t in lane_wmma_tile_set(terms) {
-                assert!(selected.contains(&(terms, *t)), "t{terms}: {t:?} exported but never picked");
+                assert!(
+                    selected.contains(&(terms, *t)),
+                    "t{terms}: {t:?} exported but never picked"
+                );
             }
         }
         for m in [320, 512, 640, 2560, 10240, 96, 1000] {
@@ -300,7 +376,10 @@ mod tests {
                 for rows in [1, 65, 149, 300, 301, 596, 800, 801, 1192, 2048] {
                     for terms in [1, 2] {
                         if let Some(t) = lane_wmma_tile_pick(m, k, rows, terms) {
-                            assert!(t.instantiated(terms), "m {m} k {k} rows {rows} t {terms}: {t:?}");
+                            assert!(
+                                t.instantiated(terms),
+                                "m {m} k {k} rows {rows} t {terms}: {t:?}"
+                            );
                         }
                     }
                 }

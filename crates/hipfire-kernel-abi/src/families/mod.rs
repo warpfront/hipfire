@@ -20,6 +20,7 @@ pub mod iu4_gdn;
 pub mod mq6_i8;
 pub mod mq6sym_i8;
 pub mod qwen4_lane_wmma;
+pub mod qwen4_lwmma_tile;
 pub mod qwen4_moe_glue_fold;
 pub mod qwen4_moe_sym;
 pub mod qwen4_topk8_rows;
@@ -48,6 +49,7 @@ pub fn all() -> impl Iterator<Item = &'static KernelAbiV1> {
         .chain(iu4_gdn::ABIS.iter())
         .chain(qwen4_topk8_rows::ABIS.iter())
         .chain(qwen4_lane_wmma::ABIS.iter())
+        .chain(qwen4_lwmma_tile::ABIS.iter())
         .copied()
 }
 

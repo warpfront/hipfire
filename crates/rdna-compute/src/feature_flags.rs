@@ -4303,18 +4303,42 @@ mod tests {
         ] {
             let exact = arch == "gfx1201";
             let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
-            assert_eq!(unset.qwen4_prefill_lwmma_tile_enabled(), exact, "{arch}: unset");
-            let off = FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_PREFILL_LWMMA_TILE", "0"));
+            assert_eq!(
+                unset.qwen4_prefill_lwmma_tile_enabled(),
+                exact,
+                "{arch}: unset"
+            );
+            let off =
+                FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_PREFILL_LWMMA_TILE", "0"));
             assert!(!off.qwen4_prefill_lwmma_tile_enabled(), "{arch}: tile 0");
-            assert_eq!(off.qwen4_prefill_lwmma_dense_enabled(), exact, "{arch}: dense kept");
-            assert_eq!(off.qwen4_prefill_lwmma_hc_enabled(), exact, "{arch}: hc kept");
+            assert_eq!(
+                off.qwen4_prefill_lwmma_dense_enabled(),
+                exact,
+                "{arch}: dense kept"
+            );
+            assert_eq!(
+                off.qwen4_prefill_lwmma_hc_enabled(),
+                exact,
+                "{arch}: hc kept"
+            );
             let on = FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_PREFILL_LWMMA_TILE", "1"));
-            assert_eq!(on.qwen4_prefill_lwmma_tile_enabled(), exact, "{arch}: tile 1");
+            assert_eq!(
+                on.qwen4_prefill_lwmma_tile_enabled(),
+                exact,
+                "{arch}: tile 1"
+            );
             let dense_off =
                 FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE", "0"));
-            assert_eq!(dense_off.qwen4_prefill_lwmma_tile_enabled(), exact, "{arch}: dense 0");
+            assert_eq!(
+                dense_off.qwen4_prefill_lwmma_tile_enabled(),
+                exact,
+                "{arch}: dense 0"
+            );
             let lane_off = FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_LANE_WMMA", "0"));
-            assert!(!lane_off.qwen4_prefill_lwmma_tile_enabled(), "{arch}: lane 0");
+            assert!(
+                !lane_off.qwen4_prefill_lwmma_tile_enabled(),
+                "{arch}: lane 0"
+            );
         }
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_prefill_lwmma_tile_enabled());
     }

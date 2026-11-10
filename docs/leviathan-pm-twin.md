@@ -320,3 +320,44 @@ outputs with the shipped tiled MFMA kernel over rows, groups, dtypes,
 tails, random/edge/NaN/Inf inputs and poisoned output guards.
 Its full hardware receipt is bound to the image hashes in `twin.json`.
 No broader CDNA IR/rewrite, helper or emulator qualification is claimed.
+
+## P3 BF16 prefill tiles (Route A, proof only)
+
+`scripts/pm-leviathan-twin.py --family lwmma-tile --arch gfx1201` compiles
+`kernels/src/qwen4_lwmma_tile.gfx1201.hip` with the portable core flags and seals
+all 10 selectable entries. The committed artifacts are
+`qwen4_lwmma_tile_hipcc_gfx1201.co`, `qwen4_lwmma_tile_pm_gfx1201.hxaco`,
+its `.hxaco.sha256`, and `.twin.json`, under `kernels/`.
+The manifest pins source, compiler provenance, container hashes and each
+entry's device-ELF and text hashes. Identity means every byte of the extracted
+device ELF, not necessarily the enclosing offload-bundle header.
+
+The selected one-term tiles are `b32x32w2x1g4`, `b32x64w2x2`, `b64x64w4x1`.
+The two-term tiles are `b16x32w1x1g4`, `b32x64w2x2`, `b64x64w4x1`,
+`b64x64w4x2`, `b32x128w2x2`, `b64x128w4x2`, `b64x128w2x4`.
+Their nine explicit arguments are `W, X, Y, M, K, rows, split_k, scale, hc_act`
+(48 bytes). The ABI family is `qwen4_lwmma_tile.hipcc.gfx12.bf16_tile`.
+`hip_twin_lwmma_tile` checks committed inputs only: source staleness, portable
+recipe, per-entry resealing, complete ELF identity, ABI and rejection of a
+different architecture or absent symbol.
+
+Dispatch stays on HIP. Ledger and railgun proof status remains OPEN: a
+Route-A byte-identity seal does not discharge strict CFG wait findings,
+state-space refusals, path feasibility or hardware store-source timing.
+Exact exceptions belong to `ledger_cfg_pins/allowlist.rs`; dispatcher
+verification remains fatal and no railgun certificate is claimed.
+
+The shared extracted device-ELF sha256 is
+`cabbcdc60def8995550c0cddbe70ae85e0aa0f5ccea6c2ba2efdded73b089dd0`.
+The 232,168-byte anchor container sha256 is
+`aac57cde433f4e8d9fb2be78d65d1a35b4119e3aff5bfbbf543eea9b8c37c747`;
+the same-size sealed container sha256 is
+`6160b53cb59c46e8a90ac068cdaf75d2c3bb2daddef085e02cbbfc37923ca309`.
+Every selected entry's seal records zero scratch and zero blocking/advisory hazards.
+
+The exact ledger rows cover 20 standalone findings and 20 hosted-body
+findings (10 entries in each image): 18 Store-source WAR findings are
+OPEN / UNPROVEN; the two `t2_b16x32w1x1g4` Km WAW findings are a wave32
+scalar-destination-pair MODEL LIMITATION. The new templates are 505–524;
+later pre-existing positional template ids move by 20 without changing
+their findings. No tile STATE-CAP refusal was observed in the scan.
