@@ -2224,8 +2224,12 @@ impl Qwen4LaneStore {
             None => {
                 let facts = gather_stage_facts(bundle);
                 let routes = derive_stage_routes(&gpu.arch, &facts);
-                let resolution =
-                    LaneStagePolicy::for_bound_routes(&gpu.arch, facts.topology, &routes);
+                let resolution = LaneStagePolicy::for_bound_routes_spec(
+                    &gpu.arch,
+                    facts.topology,
+                    &routes,
+                    spec.is_some(),
+                );
                 let evidence = resolution.receipts.join(",");
                 eprintln!(
                     "{}",
