@@ -60,10 +60,10 @@ __device__ __forceinline__ void ep8r_body(const ep8_wrow (&wrow)[2], const ep8_b
     ep8_xop x0[NT], x1[NT];
 #define EP8R_LOAD(h, A, X)                                                                              \
     do {                                                                                                \
-        _Pragma("unroll") for (int f = 0; f < NF; ++f) ep8_load_a<false, true>(A[f], wrow[f], (h), hi); \
         _Pragma("unroll") for (int i = 0; i < NT; ++i) {                                                \
             if (FULL || i < ntv) ep8_load_x(X[i], xrow[i], live[i], (h), x_src_rows, hi);               \
         }                                                                                               \
+        _Pragma("unroll") for (int f = 0; f < NF; ++f) ep8_load_a<false, true>(A[f], wrow[f], (h), hi); \
     } while (0)
     EP8R_LOAD(0, a0, x0);
     for (int h = 0; h < epochs; h += 2) {

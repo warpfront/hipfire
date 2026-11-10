@@ -38,6 +38,9 @@ const LWMMA_MULTI_KM_WHY: &str = "MODEL LIMITATION, not a claimed race: the IR m
 /// Shared reasons of the X8 twin rows (`moe_route_scatter_wide_{hipcc,pm}_gfx1201` and
 /// `qwen4_moe_ep_a8_rot_{hipcc,pm}_gfx1201`: whole-ELF seals, hipcc image and twin byte-identical, every
 /// row identical in both images).
+/// ST1 rot activation-first re-seal: "unchanged compiler output" means the current hipcc
+/// anchor is sealed without instruction rewriting, not that it equals the pre-ST1 image.
+/// Full device ELF sha256: fa83561ed67bb97b17d873d3f3b939a66b58b32f275f067883edb00f6d3c28d2.
 const X8_DS_WHY: &str = "UNPROVEN, not a claimed race: an original LLVM compiler obligation, OPEN (the committed moe_route_scatter_wide hipcc image is unchanged compiler output; the sealed PM twin is the same ELF; no modified code is claimed to race). The ledger keeps a pending DS store's source VGPRs locked until its DS-counter wait and reports the first write of one on a CFG path that has no such wait; whether that path is feasible and whether the hardware has read the DS store sources by then (store-source timing) is not established here. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger; nothing here is discharged";
 const X8_ST_WHY: &str = "UNPROVEN, not a claimed race: an original LLVM compiler obligation, OPEN (the committed moe_route_scatter_wide hipcc image is unchanged compiler output; the sealed PM twin is the same ELF; no modified code is claimed to race). The ledger keeps a pending VMEM store's source registers (data and address VGPRs) locked until its store-counter wait and reports the first write of one on a CFG path that has no such wait; whether the hardware has read the store sources by then (address captured at issue, vm_vsrc) is not established here and the path was not checked for feasibility. Checked full-ELF byte identity does not discharge this strict WAR path in the ledger; nothing here is discharged";
 const X8_LOAD_WAR_WHY: &str = "UNPROVEN, not a claimed race: an original LLVM compiler obligation, OPEN (the committed qwen4_moe_ep_a8_rot hipcc image is unchanged compiler output; the sealed PM twin is the same ELF; no modified code is claimed to race). The ledger keeps the registers of a pending VMEM load locked until its load-counter wait and reports the first write of one (here a wide load whose address pair overlaps its own destination) on a CFG path that has no such wait; whether that path is feasible and whether the hardware has read the load address by then is not established here. Checked full-ELF byte identity between the hipcc anchor and the sealed twin does not discharge this strict WAR path in the ledger; nothing here is discharged";
@@ -1585,7 +1588,7 @@ pub const FINDINGS: &[Allow] = &[
     Allow {
         scope: "pins",
         target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_rot_planar_nt1",
-        needle: "`flat_load_d16_b16 v33, v[7:8], off` (after label `.LBB4`): needs Load wait 0 (Use { reg: \"v33\" })",
+        needle: "`flat_load_d16_hi_b16 v36, v[21:22], off` (after label `.LBB7`): needs Load wait 0 (Use { reg: \"v36\" })",
         why: X8_LOAD_USE_WHY,
     },
     Allow {
@@ -1645,7 +1648,7 @@ pub const FINDINGS: &[Allow] = &[
     Allow {
         scope: "pins",
         target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_rot_planar_nt1",
-        needle: "`flat_load_d16_b16 v33, v[7:8], off` (after label `.LBB4`): needs Load wait 0 (Use { reg: \"v33\" })",
+        needle: "`flat_load_d16_hi_b16 v36, v[21:22], off` (after label `.LBB7`): needs Load wait 0 (Use { reg: \"v36\" })",
         why: X8_LOAD_USE_WHY,
     },
     Allow {
@@ -4210,10 +4213,10 @@ pub const POOL_BODY: &[PoolBody] = &[
     PoolBody {
         tid: 521,
         target: "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_rot_planar_nt1",
-        body_pc: 127,
+        body_pc: 168,
         category: Category::ModelLimit,
-        insn: "`flat_load_d16_b16 v33, v[7:8], off`",
-        need: "needs Load wait 0 (Use { reg: \"v33\" })",
+        insn: "`flat_load_d16_hi_b16 v36, v[21:22], off`",
+        need: "needs Load wait 0 (Use { reg: \"v36\" })",
     },
     PoolBody {
         tid: 522,
@@ -4290,10 +4293,10 @@ pub const POOL_BODY: &[PoolBody] = &[
     PoolBody {
         tid: 531,
         target: "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_rot_planar_nt1",
-        body_pc: 127,
+        body_pc: 168,
         category: Category::ModelLimit,
-        insn: "`flat_load_d16_b16 v33, v[7:8], off`",
-        need: "needs Load wait 0 (Use { reg: \"v33\" })",
+        insn: "`flat_load_d16_hi_b16 v36, v[21:22], off`",
+        need: "needs Load wait 0 (Use { reg: \"v36\" })",
     },
     PoolBody {
         tid: 532,

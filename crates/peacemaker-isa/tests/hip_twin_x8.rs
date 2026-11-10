@@ -127,6 +127,15 @@ fn manifests_record_sources_and_artifact_hashes() {
         let id = t.module;
         assert_eq!(m["arch"], "gfx1201", "{id}");
         assert_eq!(m["module"], id);
+        if t.family == "qwen4-moe-ep-a8-rot" {
+            // ST1 activation-first schedule: pin the whole device ELF, not its bundle header.
+            for report in m["seal"]["reports"].as_array().expect("seal reports") {
+                assert_eq!(
+                    report["elf_sha256"],
+                    "fa83561ed67bb97b17d873d3f3b939a66b58b32f275f067883edb00f6d3c28d2"
+                );
+            }
+        }
         let (last_path, last) = t.parts[t.parts.len() - 1];
         assert_eq!(m["source"]["path"], last_path, "{id}");
         assert_eq!(m["source"]["sha256"], hex(last), "{id}");

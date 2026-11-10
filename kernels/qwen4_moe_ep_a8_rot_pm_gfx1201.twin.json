@@ -2,7 +2,7 @@
   "anchor": {
     "bytes": 147328,
     "file": "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co",
-    "sha256": "4598d9b7be48fccb37c277054d1df32d926fcfe074a1dc3258b5a362e7e9a4d1"
+    "sha256": "d2682b9183f134b45c171d0d11dfcb857f6b593730e58c36143dc2462a670a1d"
   },
   "arch": "gfx1201",
   "compiler": {
@@ -25,12 +25,12 @@
   "hxaco": {
     "bytes": 147328,
     "file": "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco",
-    "sha256": "144541988d77744179fef6633f5f9c22ebb698ded2e843b3b21134d880468a07"
+    "sha256": "64690989fb57520200cc3f85e6f8042141aa3ef811d27fe97943b470d6daf3cf"
   },
   "module": "qwen4_moe_ep_a8_rot_pm_gfx1201",
   "module_source": {
     "combined_bytes": 29695,
-    "combined_sha256": "a1fff60ebe9533586b62e9355f30757f89c3fd1fe7fd677cfa41cb7115938924",
+    "combined_sha256": "515e3728347231b68c00eb3fc7894401a527193d8b4d6d1b3a91577395b078dd",
     "define": "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1",
     "parts": [
       {
@@ -46,7 +46,7 @@
       {
         "bytes": 10463,
         "path": "kernels/src/qwen4_moe_ep_a8_rot.gfx12.hip",
-        "sha256": "1b011ce4b882a5f2737cf7081cba4146f022d7b1b9c99f3c7da4a04bf7e26f2a"
+        "sha256": "7868cf8651e40349da1b27efa5a57e16206e16c54866345a0937ff6780e63c30"
       }
     ]
   },
@@ -159,7 +159,7 @@
         },
         "arch": "gfx1201",
         "elf_bytes": 143232,
-        "elf_sha256": "9ef317ec5ea53e4f62cd06ea80c577aa42081768554218ec6361136eaa446413",
+        "elf_sha256": "fa83561ed67bb97b17d873d3f3b939a66b58b32f275f067883edb00f6d3c28d2",
         "hazards": {
           "advisory": 0,
           "blocking": 0,
@@ -168,15 +168,15 @@
           "pm_ir_obligations": 0
         },
         "hxaco_bytes": 147328,
-        "hxaco_sha256": "144541988d77744179fef6633f5f9c22ebb698ded2e843b3b21134d880468a07",
+        "hxaco_sha256": "64690989fb57520200cc3f85e6f8042141aa3ef811d27fe97943b470d6daf3cf",
         "kernel": "qwen4_moe_ep_a8_gate_up_rot_planar_nt1",
         "lds": 4352,
         "lift_identity": "emit::checked ok; emitted bytes == input ELF",
         "rsrc2": 388,
         "scratch": 0,
         "sgprs": 30,
-        "text_bytes": 10832,
-        "text_sha256": "0934542138798802da0d0618397b4c65bd451092e46dc0eb7f6ca388aeda3a8d",
+        "text_bytes": 10844,
+        "text_sha256": "98bc68b6037a2c15de5fa99b7662ed2aa2e8e9a1ca0601449e85ac76438cf183",
         "user_sgprs": 2,
         "vgprs": 168,
         "wavefront_size": 32
@@ -288,7 +288,7 @@
         },
         "arch": "gfx1201",
         "elf_bytes": 143232,
-        "elf_sha256": "9ef317ec5ea53e4f62cd06ea80c577aa42081768554218ec6361136eaa446413",
+        "elf_sha256": "fa83561ed67bb97b17d873d3f3b939a66b58b32f275f067883edb00f6d3c28d2",
         "hazards": {
           "advisory": 0,
           "blocking": 0,
@@ -297,15 +297,15 @@
           "pm_ir_obligations": 0
         },
         "hxaco_bytes": 147328,
-        "hxaco_sha256": "144541988d77744179fef6633f5f9c22ebb698ded2e843b3b21134d880468a07",
+        "hxaco_sha256": "64690989fb57520200cc3f85e6f8042141aa3ef811d27fe97943b470d6daf3cf",
         "kernel": "qwen4_moe_ep_a8_gate_up_rot_planar_nt2",
         "lds": 8704,
         "lift_identity": "emit::checked ok; emitted bytes == input ELF",
         "rsrc2": 388,
         "scratch": 0,
         "sgprs": 36,
-        "text_bytes": 24724,
-        "text_sha256": "4552cdd2a3ff3317e1fd107baac790b504aba55930d9ecc330ef51241c8e575f",
+        "text_bytes": 24824,
+        "text_sha256": "50d597e93acbcf24162bc01689464949c2f98a4b57c03ac1aac36fdbcd72a0cc",
         "user_sgprs": 2,
         "vgprs": 248,
         "wavefront_size": 32
@@ -316,7 +316,7 @@
   "source": {
     "bytes": 10463,
     "path": "kernels/src/qwen4_moe_ep_a8_rot.gfx12.hip",
-    "sha256": "1b011ce4b882a5f2737cf7081cba4146f022d7b1b9c99f3c7da4a04bf7e26f2a"
+    "sha256": "7868cf8651e40349da1b27efa5a57e16206e16c54866345a0937ff6780e63c30"
   },
   "symbols": [
     "qwen4_moe_ep_a8_gate_up_rot_planar_nt1",
