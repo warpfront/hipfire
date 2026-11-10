@@ -975,6 +975,9 @@ request run alone on the singleton route. **Default off, experimental.**
   projection once over all rows, bound to the BF16 trunk and the resident FP8
   expert class) but not every single-stage probe, so gfx942 shares all of
   those stages or none; the GDN and QSA cores run one launch per lane there.
+  Measured on one MI300X (`hipfire bench --backend batch`, 16 prompts x 128
+  tokens, 4 fresh loads): C8 151 tok/s aggregate (TTFT 1.88 s, 208 tok/s
+  steady decode) against C1 60 tok/s, every stream's text identical to C1.
   Other cards run every stage per lane until their own G0 run.
 - **Under `topology.pp` / `topology.ep` (2..=8 cards):** the same exact
   **AR** fn-lanes route is staged across the cards, with these differences from
