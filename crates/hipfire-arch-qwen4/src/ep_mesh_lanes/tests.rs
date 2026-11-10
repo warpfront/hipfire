@@ -583,6 +583,7 @@ fn mesh_lane_ep_multi_group_all_rows_step_plans_one_exchange_per_layer() {
         trunk_ar_write: trunk,
         band_moe_calls: 48,
         policy: crate::gpu_forward_lanes::LaneStagePolicy::production(),
+        hetero_rows: 0,
     };
     for trunk in [false, true] {
         let layers = planned_gather_layers(48, trunk, 15);

@@ -1354,6 +1354,43 @@ fn hc_all_rows_applies(
         && policy.share(StageName::HcWrite) == StageShare::OnceAllRows
 }
 
+/// Whether a single-card hetero lane step (`hetero_rows`: its decode slot width, 0 off the
+/// hetero tier split) runs its routed MoE as ONE call per layer over every row, the other
+/// stages keeping their groups: an eager AR / verify step of several groups of at most
+/// [`LANE_MAX_ROWS`] rows whose `n` rows (more than one group's) fit the slot, the MoE shared
+/// (`HIPFIRE_QWEN4_LANE_ALLROWS_MOE` on) and no wide-class lane or CPU splice. The call takes
+/// the expert device's decode exchange for `n` rows (the per-slot route on both devices) inside
+/// the wide few-row scope of `n` rows ([`HcAllRowsScope`]).
+///
+/// Opt-in through `HIPFIRE_HETERO_DECODE_ROWS` (> 8; the default 8 never admits it). On the
+/// hetero serve (3 MTP K=7 lanes, slot 32) it is NOT yet byte-identical to the singleton (2 of 3
+/// prompts diverged) and saves no time: the MoE's cost follows its rows (about 8 ms per verify
+/// row), not its calls.
+#[allow(clippy::too_many_arguments)]
+fn hetero_moe_all_rows_applies(
+    moe_flag: bool,
+    hetero_rows: usize,
+    ar_step: bool,
+    eager: bool,
+    cpu_splice: bool,
+    group_rows: &[usize],
+    any_wide_lane: bool,
+    policy: &LaneStagePolicy,
+) -> bool {
+    let n: usize = group_rows.iter().sum();
+    moe_flag
+        && ar_step
+        && eager
+        && !cpu_splice
+        && !any_wide_lane
+        && group_rows.len() > 1
+        && group_rows
+            .iter()
+            .all(|&rows| (1..=LANE_MAX_ROWS).contains(&rows))
+        && (LANE_MAX_ROWS + 1..=hetero_rows.min(HC_ALL_ROWS_MAX)).contains(&n)
+        && policy.share(StageName::Moe) == StageShare::OnceAllRows
+}
+
 /// Whether an AR / verify lane step also runs every non-MoE row-local stage once over all
 /// rows (`HIPFIRE_QWEN4_LANE_ALLROWS`), on top of the all-rows HC segment
 /// ([`hc_all_rows_applies`], which it refines: it is only asked for a step that segment
@@ -1515,6 +1552,10 @@ pub struct LaneAllRowsRule {
     pub band_moe_calls: usize,
     /// The stage shares (HC read / write, MoE) the rule reads.
     pub policy: LaneStagePolicy,
+    /// The hetero tier split's decode slot width ([`crate::hetero::hetero_decode_rows`]) on a
+    /// single-card hetero lane step, else 0: a multi-group step whose rows all fit it runs its
+    /// routed MoE as one exchange per layer ([`hetero_moe_all_rows_applies`]).
+    pub hetero_rows: usize,
 }
 
 /// What [`LaneAllRowsRule::decide`] decided for one step.
@@ -1550,6 +1591,7 @@ impl LaneAllRowsRule {
             trunk_ar_write: false,
             band_moe_calls: 0,
             policy: LaneStagePolicy::production(),
+            hetero_rows: 0,
         }
     }
 
@@ -1590,6 +1632,7 @@ impl LaneAllRowsRule {
                 || crate::trunk_route::ffn_writer().is_some(),
             band_moe_calls,
             policy: *policy,
+            hetero_rows: 0,
         }
     }
 
@@ -1656,7 +1699,18 @@ impl LaneAllRowsRule {
         } else {
             None
         };
-        let moe_all = self.moe_flag && moe_refusal.is_none();
+        let hetero_moe = hetero_moe_all_rows_applies(
+            self.moe_flag,
+            self.hetero_rows,
+            ar_step,
+            self.eager,
+            self.cpu_splice,
+            group_rows,
+            any_wide_lane,
+            &self.policy,
+        );
+        let moe_all = (self.moe_flag && moe_refusal.is_none()) || hetero_moe;
+        let moe_refusal = if hetero_moe { None } else { moe_refusal };
         AllRowsDecision {
             hc_all,
             all_stages,
@@ -1682,12 +1736,15 @@ impl LaneAllRowsRule {
 /// layer over every row on the MoE all-rows segment (the one after the HC one).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AllRowsPlan {
+    /// The HC reads (and the writes `hc_writes` names) run all-rows; off, a hetero
+    /// MoE-only all-rows step keeps every HC stage on its groups.
+    hc: bool,
     /// Whether the attention (`[0]`) / MLP (`[1]`) HC write runs all-rows; a write a TP2
     /// all-reduce carries stays per group (unless `moe`, which takes them all-rows too).
     hc_writes: [bool; 2],
     /// Every other non-MoE once-over-all-rows operation runs all-rows too.
     stages: bool,
-    /// The routed MoE is one call over every row (needs `stages`).
+    /// The routed MoE is one call over every row (with `stages`, or alone on a hetero step).
     moe: bool,
 }
 
@@ -1715,14 +1772,15 @@ fn run_pieces(
 ) -> Vec<(std::ops::Range<usize>, Placement)> {
     let place = |op: LaneOp, stage: StageName| match (op, all_rows) {
         (_, None) => Placement::Groups,
-        (LaneOp::HcRead { .. }, Some(_)) => Placement::AllRows,
-        (LaneOp::HcWrite { mlp, .. }, Some(plan)) if plan.hc_writes[usize::from(mlp)] => {
+        (LaneOp::HcRead { .. }, Some(plan)) if plan.hc => Placement::AllRows,
+        (LaneOp::HcRead { .. }, Some(_)) => Placement::Groups,
+        (LaneOp::HcWrite { mlp, .. }, Some(plan))
+            if plan.hc && plan.hc_writes[usize::from(mlp)] =>
+        {
             Placement::AllRows
         }
         (LaneOp::HcWrite { .. }, Some(_)) => Placement::Groups,
-        (_, Some(plan)) if plan.moe && plan.stages && stage == StageName::Moe => {
-            Placement::AllRowsMoe
-        }
+        (_, Some(plan)) if plan.moe && stage == StageName::Moe => Placement::AllRowsMoe,
         (_, Some(plan)) if plan.stages && stage != StageName::Moe => Placement::AllRows,
         _ => Placement::Groups,
     };
@@ -1777,6 +1835,8 @@ struct HcAllRowsScope {
     prior: usize,
     exact: bool,
     moe: bool,
+    /// A hetero MoE-only all-rows step: the MoE call runs in the scope without `exact`.
+    hetero_moe: bool,
 }
 
 impl MoeStepHooks for HcAllRowsScope {
@@ -1796,7 +1856,7 @@ impl MoeStepHooks for HcAllRowsScope {
             Step::HyperWrite(op) => op.rows == self.rows,
             Step::GatedDeltaNet(op) => self.exact && op.rows == self.rows,
             Step::IndexedAttention(op) => self.exact && op.rows == self.rows,
-            Step::Moe(_) => self.exact && self.moe,
+            Step::Moe(_) => self.moe && (self.exact || self.hetero_moe),
             _ => false,
         };
         gpu.set_wide_verify_rows(if all_rows { self.rows } else { self.prior });
@@ -2954,13 +3014,17 @@ fn forward_lanes_scoped(
     // rows under that scope), so the projections take the row-exact singleton-derived 8-row
     // tiles in one launch instead of the unscoped wide routes. The scope is ours: a scope
     // already in force no longer refuses the all-rows stages.
-    let rule = LaneAllRowsRule::from_parts(
+    let mut rule = LaneAllRowsRule::from_parts(
         gpu,
         ep_gather_cap,
         cpu_splice,
         band_scope.band.len(),
         policy,
     );
+    // The hetero tier split's decode slot width bounds a single-card step's one-call MoE.
+    if !ep_lane_step && fwd.hetero_tiered_experts() {
+        rule.hetero_rows = crate::hetero::hetero_decode_rows();
+    }
     let decision = rule.decide(
         matches!(out, StepOutputs::Ar(_)),
         &group_rows,
@@ -2982,7 +3046,9 @@ fn forward_lanes_scoped(
         moe_all,
         ..
     } = decision;
-    let hc_seg: Option<usize> = hc_all.then_some(all_segs.len());
+    // The all-rows segment: the HC one, or the anchor a hetero MoE-only step's MoE segment
+    // follows (no op is placed on it then).
+    let hc_seg: Option<usize> = (hc_all || moe_all).then_some(all_segs.len());
     // The MoE all-rows segment follows the HC one ([`run_items`]).
     let moe_seg: Option<usize> = hc_seg.filter(|_| moe_all).map(|hc| hc + 1);
     // The segments a stage of share `share` runs over: its groups / lanes, or the all-rows
@@ -3006,6 +3072,7 @@ fn forward_lanes_scoped(
         (
             seg,
             AllRowsPlan {
+                hc: hc_all,
                 hc_writes,
                 stages: all_stages,
                 moe: moe_all,
@@ -3065,7 +3132,7 @@ fn forward_lanes_scoped(
         vec![widest; all_segs.len()]
     };
     // The all-rows segment binds the descriptions (and decode copies) of the groups.
-    if hc_all {
+    if hc_seg.is_some() {
         all_segs.push(Segment {
             begin: 0,
             rows: n,
@@ -4090,6 +4157,7 @@ fn forward_lanes_scoped(
                     prior: prior_wide,
                     exact: exact_scope,
                     moe: moe_all,
+                    hetero_moe: moe_all && !hc_all,
                 };
                 let result = if hetero || timed {
                     let mut hooks = HeteroLaneMoe {
@@ -6740,8 +6808,100 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn hetero_moe_all_rows_needs_several_groups_within_the_slot() {
+        let shared = LaneStagePolicy::production();
+        let per_lane_moe = shared.with(StageName::Moe, StageShare::PerLane).unwrap();
+        let applies = |rows: &[usize], slot: usize| {
+            hetero_moe_all_rows_applies(true, slot, true, true, false, rows, false, &shared)
+        };
+        assert!(!applies(&[8], 32), "one group never needs it");
+        assert!(!applies(&[4, 4], 32), "8 rows fit one group");
+        assert!(applies(&[7, 6, 6], 32));
+        assert!(applies(&[8, 8, 8, 8], 32));
+        assert!(!applies(&[8, 8, 8, 8, 1], 32), "past the slot");
+        assert!(!applies(&[7, 6, 6], 0), "off the hetero split");
+        assert!(!applies(&[7, 6, 6], 8), "the default slot");
+        assert!(!applies(&[9, 6], 32), "a group above LANE_MAX_ROWS");
+        for (moe_flag, ar, eager, splice, wide, policy) in [
+            (false, true, true, false, false, &shared),
+            (true, false, true, false, false, &shared),
+            (true, true, false, false, false, &shared),
+            (true, true, true, true, false, &shared),
+            (true, true, true, false, true, &shared),
+            (true, true, true, false, false, &per_lane_moe),
+        ] {
+            assert!(!hetero_moe_all_rows_applies(
+                moe_flag,
+                32,
+                ar,
+                eager,
+                splice,
+                &[7, 6, 6],
+                wide,
+                policy
+            ));
+        }
+    }
+
+    #[test]
+    fn decide_takes_the_hetero_moe_only_with_a_slot() {
+        let mut rule = LaneAllRowsRule::never();
+        rule.moe_flag = true;
+        rule.eager = true;
+        let off = rule.decide(true, &[7, 6, 6], false);
+        assert!(!off.moe_all && !off.hc_all && !off.all_stages);
+        rule.hetero_rows = 32;
+        let on = rule.decide(true, &[7, 6, 6], false);
+        assert!(on.moe_all && on.moe_refusal.is_none());
+        assert!(!on.hc_all && !on.all_stages && !on.exact_scope);
+    }
+
+    #[test]
+    fn moe_only_plan_keeps_every_hc_op_on_its_groups() {
+        let plan = Some(AllRowsPlan {
+            hc: false,
+            hc_writes: [true, true],
+            stages: false,
+            moe: true,
+        });
+        let run = [
+            (
+                LaneOp::HcWrite {
+                    layer: 0,
+                    mlp: false,
+                },
+                StageName::HcWrite,
+            ),
+            (
+                LaneOp::HcRead {
+                    layer: 0,
+                    mlp: true,
+                },
+                StageName::HcRead,
+            ),
+            (LaneOp::Moe { layer: 0 }, StageName::Moe),
+            (
+                LaneOp::HcWrite {
+                    layer: 0,
+                    mlp: true,
+                },
+                StageName::HcWrite,
+            ),
+        ];
+        assert_eq!(
+            run_pieces(&run, plan),
+            vec![
+                (0..2, Placement::Groups),
+                (2..3, Placement::AllRowsMoe),
+                (3..4, Placement::Groups)
+            ]
+        );
+    }
+
     fn plan(hc_writes: [bool; 2], stages: bool) -> Option<AllRowsPlan> {
         Some(AllRowsPlan {
+            hc: true,
             hc_writes,
             stages,
             moe: false,
@@ -6751,6 +6911,7 @@ mod tests {
     /// The `HIPFIRE_QWEN4_LANE_ALLROWS_MOE` plan: every stage all-rows, every HC write too.
     fn plan_moe() -> Option<AllRowsPlan> {
         Some(AllRowsPlan {
+            hc: true,
             hc_writes: [true, true],
             stages: true,
             moe: true,
@@ -7175,6 +7336,7 @@ mod tests {
             trunk_ar_write: false,
             band_moe_calls: 48,
             policy: LaneStagePolicy::production(),
+            hetero_rows: 0,
         }
     }
 

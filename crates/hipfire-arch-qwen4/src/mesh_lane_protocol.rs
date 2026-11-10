@@ -5255,6 +5255,7 @@ mod tests {
             trunk_ar_write,
             band_moe_calls: 48,
             policy: crate::gpu_forward_lanes::LaneStagePolicy::production(),
+            hetero_rows: 0,
         }
     }
 

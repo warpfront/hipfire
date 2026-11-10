@@ -94,8 +94,27 @@ use hipfire_dispatch::hetero_responder::{
 
 /// Rows of the decode exchange: single-token decode and MTP verify windows up
 /// to this width take the decode slot (one round trip per layer, no staging);
-/// wider calls take the prefill exchange.
+/// wider calls take the prefill exchange. The default of [`hetero_decode_rows`].
 pub const HETERO_DECODE_ROWS: usize = 8;
+
+/// Widest decode slot [`hetero_decode_rows`] admits: the wide verify cap.
+pub const HETERO_DECODE_ROWS_MAX: usize = rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
+
+/// The load's decode slot width: `HIPFIRE_HETERO_DECODE_ROWS`
+/// (`HETERO_DECODE_ROWS..=HETERO_DECODE_ROWS_MAX`) or [`HETERO_DECODE_ROWS`].
+/// A wider slot lets one lane step's routed MoE over every row of several
+/// lanes' verify windows take a single exchange per layer; the mailbox and the
+/// responder's per-row-count graphs grow with it. Read once.
+pub fn hetero_decode_rows() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_HETERO_DECODE_ROWS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|r| (HETERO_DECODE_ROWS..=HETERO_DECODE_ROWS_MAX).contains(r))
+            .unwrap_or(HETERO_DECODE_ROWS)
+    })
+}
 
 /// The prefill chunk under the split: the mailbox's prefill slot and the expert
 /// device's scratch are sized for it, and the load's prefill chunk is clamped
@@ -218,7 +237,7 @@ pub(crate) fn attach_device_layer(
         // attaches: `attach_head_layer`).
         let geom = MailboxGeometry {
             layers: layers + HEAD_SLOTS,
-            max_rows: HETERO_DECODE_ROWS,
+            max_rows: hetero_decode_rows(),
             top_k,
             dim,
         };
@@ -297,7 +316,7 @@ pub(crate) fn attach_device_layer(
         .map_err(hip)?;
     gpu.memcpy_htod_auto(&bitmap.buf, placement).map_err(hip)?;
     let masked_ids = gpu
-        .alloc_tensor(&[HETERO_DECODE_ROWS * top_k], rdna_compute::DType::F32)
+        .alloc_tensor(&[hetero_decode_rows() * top_k], rdna_compute::DType::F32)
         .map_err(hip)?;
     let slot = slot_ptrs(ctx, layer);
     let b = ctx.mailbox as u64;
@@ -367,7 +386,7 @@ pub(crate) fn attach_device_layer(
             masked_ids,
             n_experts: placement.len() as i32,
             max_polls: AWAIT_MAX_POLLS,
-            max_rows: HETERO_DECODE_ROWS,
+            max_rows: hetero_decode_rows(),
             advance: false,
         },
         prefill,
@@ -451,7 +470,7 @@ pub(crate) fn attach_head_layer(
         .map_err(hip)?;
     gpu.memcpy_htod_auto(&bitmap.buf, placement).map_err(hip)?;
     let masked_ids = gpu
-        .alloc_tensor(&[HETERO_DECODE_ROWS * top_k], rdna_compute::DType::F32)
+        .alloc_tensor(&[hetero_decode_rows() * top_k], rdna_compute::DType::F32)
         .map_err(hip)?;
     eprintln!(
         "  qwen4 hetero experts: MTP head on the device split (slot {index}, {} cold experts)",
@@ -466,7 +485,7 @@ pub(crate) fn attach_head_layer(
         masked_ids,
         n_experts: placement.len() as i32,
         max_polls: AWAIT_MAX_POLLS,
-        max_rows: HETERO_DECODE_ROWS,
+        max_rows: hetero_decode_rows(),
         advance: true,
     })
 }
