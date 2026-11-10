@@ -138,6 +138,10 @@ pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151: usize =
 /// after the row-exactness oracle proves the arch at that many rows.
 pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201: usize =
     hipfire_config::QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201;
+/// gfx942 row-exact verify rows (owned by `hipfire-config`): the M-K-measured
+/// default-route chunk == single-row decode width the drafter serves.
+pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX942: usize =
+    hipfire_config::QWEN4_ROW_EXACT_VERIFY_ROWS_GFX942;
 
 /// Parse `HIPFIRE_QWEN4_WIDE_VERIFY_ROWS`: an unsigned integer clamped to
 /// [`FEW_ROW_ROUTE_ROWS`]..=[`WIDE_VERIFY_MAX_ROWS`]; unset or unparsable is
@@ -172,6 +176,11 @@ pub fn set_qwen4_wide_verify_rows_override(rows: Option<usize>) {
 /// Precedence of the verify-rows sources: runtime override (`0` = unset),
 /// then the env override, then the table.
 fn resolve_verify_rows(arch: &str, runtime: usize, env: Option<usize>, table: usize) -> usize {
+    if arch == "gfx942" {
+        // The table is authoritative here: neither lab override (RDNA
+        // wide-verify oracles) widens gfx942.
+        return table.clamp(FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS);
+    }
     if !matches!(arch, "gfx1151" | "gfx1201" | "gfx1100") {
         return FEW_ROW_ROUTE_ROWS;
     }
@@ -746,10 +755,15 @@ mod wide_verify_tests {
         for rows in [
             QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151,
             QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201,
+            QWEN4_ROW_EXACT_VERIFY_ROWS_GFX942,
         ] {
             assert!((FEW_ROW_ROUTE_ROWS..=WIDE_VERIFY_MAX_ROWS).contains(&rows));
         }
-        for arch in ["gfx1150", "gfx942", "gfx1151-x", "gfx1100-x", ""] {
+        assert_eq!(
+            qwen4_row_exact_verify_rows("gfx942"),
+            QWEN4_ROW_EXACT_VERIFY_ROWS_GFX942
+        );
+        for arch in ["gfx1150", "gfx1151-x", "gfx1100-x", ""] {
             assert_eq!(qwen4_row_exact_verify_rows(arch), FEW_ROW_ROUTE_ROWS);
         }
     }

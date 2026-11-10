@@ -107,6 +107,18 @@ required-features = ["lab"]
 name = "qwen4_rows"
 required-features = ["lab"]
 
+# gfx942 native-MTP window cost per draft depth (fills `MTP_WINDOW_COST_MS_GFX942`).
+[[example]]
+name = "qwen4_mtp_g942_cost"
+required-features = ["lab"]
+
+# G3 head-logit oracle: stock-FP8 `<model>.mtp` sidecar head logits at N positions + the exact head inputs
+# (`beat/M/g3`). `reference-parity` supplies `wide_verify_oracle::dev_head_chain` (a head step on an explicit
+# backbone hidden); `lab` supplies `Qwen4MtpDrafter::lab_pending_hidden_bytes`.
+[[example]]
+name = "qwen4_mtp_head_dump"
+required-features = ["lab", "reference-parity"]
+
 [[example]]
 name = "qwen4_wide_grouped_moe_oracle"
 required-features = ["lab"]

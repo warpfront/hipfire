@@ -14,6 +14,15 @@
 //! workspace. Product code and sampled coverage, identity and law assertions
 //! are unchanged.
 //!
+//! A model with a `<model>.mtp` sidecar (the stock-FP8 artifact, whose native
+//! head lives there) loads through the oracle recipe
+//! (`common/stock_mtp_load.rs`: the sidecar bound at admission, `attach_mtp`),
+//! because the product loader refuses native MTP on that recipe until its
+//! verify is proven. On gfx942 (no GDN row capture, no cost table yet) run the
+//! MTP arms under `HIPFIRE_QWEN4_MTP_G942_DEPTH=<1..7>` (a forced fixed depth;
+//! `interleaved` still takes the interleaved route) with
+//! `HIPFIRE_G942_TRUNK_GEMV` unset.
+//!
 //! The serve battery's prose prompt (thinking off, rendered as `hipfire
 //! serve` renders one user message) is decoded from a cold state
 //! `HIPFIRE_SAMPLED_MTP_TRIALS` times (default 2000) per arm, each trial with
@@ -461,6 +470,8 @@ use std::process::{Command, Stdio};
 
 #[path = "common/hw_identity.rs"]
 mod hw_identity;
+#[path = "common/stock_mtp_load.rs"]
+mod stock_mtp_load;
 use hw_identity::Counters;
 #[path = "common/lane_ep.rs"]
 mod lane_ep;
@@ -1068,15 +1079,57 @@ struct Loaded {
     tokenizer: Tokenizer,
     template: String,
     state: String,
+    /// The native MTP head is already attached (the product loader does it).
+    mtp_attached: bool,
 }
 
 fn load(model: &Path) -> Result<Loaded, String> {
     load_with_max_seq(model, MAX_SEQ)
 }
 
+/// A stock-FP8 `model` with its `<model>.mtp` head sidecar, loaded through the
+/// oracle recipe ([`stock_mtp_load`]): forward resources and the native MTP
+/// head attached, sized for `max_seq`.
+fn load_stock_mtp(model: &Path, max_seq: usize) -> Result<Loaded, String> {
+    let (tokenizer, template) = {
+        let hfq = HfqFile::open(model).map_err(|e| e.to_string())?;
+        (
+            Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| e.to_string())?,
+            hfq.chat_template().ok_or("artifact has no chat template")?,
+        )
+    };
+    hipfire_loader::prepare_host_memory_for(model);
+    let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+    let (state_request, want_gdn) = hw_identity::gdn_test_state_quant()?;
+    let bundle =
+        stock_mtp_load::load_stock_mtp_bundle(&mut gpu, model, max_seq, state_request)?;
+    let state_format = bundle.state_format();
+    if state_format.gdn != want_gdn {
+        return Err(format!(
+            "{}={state_request} resolved to GDN state {:?}, expected {want_gdn:?}",
+            hw_identity::GDN_TEST_STATE_QUANT_ENV,
+            state_format.gdn
+        ));
+    }
+    Ok(Loaded {
+        gpu,
+        bundle,
+        tokenizer,
+        template,
+        state: format!(
+            "state_quant={state_request} gdn_format={} {state_format:?}",
+            state_format.gdn.name()
+        ),
+        mtp_attached: true,
+    })
+}
+
 /// [`load`] with the context (`max_seq`) the forward, the native-MTP reserve
 /// and the assembled bundle are sized for.
 fn load_with_max_seq(model: &Path, max_seq: usize) -> Result<Loaded, String> {
+    if stock_mtp_load::has_stock_mtp_sidecar(model) {
+        return load_stock_mtp(model, max_seq);
+    }
     let mut hfq = HfqFile::open(model).map_err(|e| e.to_string())?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| e.to_string())?;
     let template = hfq.chat_template().ok_or("artifact has no chat template")?;
@@ -1296,6 +1349,7 @@ fn load_with_max_seq(model: &Path, max_seq: usize) -> Result<Loaded, String> {
         bundle,
         tokenizer,
         template,
+        mtp_attached: false,
         state: format!(
             "state_quant={state_request} gdn_format={} {state_format:?}",
             state_format.gdn.name()
@@ -1534,10 +1588,12 @@ fn new_drafter_with_max_seq(
     copy_lane: bool,
     max_seq: usize,
 ) -> Result<Qwen4MtpDrafter, String> {
-    loaded
-        .bundle
-        .attach_mtp(&mut loaded.gpu, max_seq)
-        .map_err(|e| e.to_string())?;
+    if !loaded.mtp_attached {
+        loaded
+            .bundle
+            .attach_mtp(&mut loaded.gpu, max_seq)
+            .map_err(|e| e.to_string())?;
+    }
     let drafter = Qwen4MtpDrafter::new(MTP_K, max_seq, None)
         .with_ngram(ngram)
         .with_copy_lane(copy_lane);
