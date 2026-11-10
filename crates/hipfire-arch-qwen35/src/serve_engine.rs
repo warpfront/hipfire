@@ -1216,7 +1216,7 @@ impl Rig {
                 )
             );
         }
-        let mtp_head: Option<crate::mtp_head::Qwen35MtpHead> = if mtp_armed {
+        let mut mtp_head: Option<crate::mtp_head::Qwen35MtpHead> = if mtp_armed {
             let trunk_path = &cfg.model_path;
             let mut head_opt: Option<crate::mtp_head::Qwen35MtpHead> = None;
             match crate::mtp_head::load_mtp_head_bundled(trunk_path, &mut gpu, cfg.cap_tokens) {
@@ -1292,12 +1292,41 @@ impl Rig {
             );
         }
 
+        // ── YaRN + speculative decode refusal (v1 boundary) ──────────────
+        // YaRN rescales low-frequency RoPE bands at ALL positions, so the
+        // draft's position arithmetic diverges from the target's. Refuse
+        // DFlash and MTP when YaRN is active.
+        let yarn_active = !matches!(config.rope_scaling, rdna_compute::rope::RopeScaling::None);
+        if yarn_active {
+            if let Some(h) = mtp_head.take() {
+                h.free_gpu(&mut gpu);
+            }
+            eprintln!("  YaRN RoPE scaling active: speculative decode (DFlash/MTP) is not supported in v1; serving AR only");
+        }
+        // YaRN rescales low-frequency RoPE bands at ALL positions, so the
+        // draft's position arithmetic diverges from the target's. Refuse
+        // DFlash and MTP when YaRN is active.
+        let yarn_active = !matches!(config.rope_scaling, rdna_compute::rope::RopeScaling::None);
+        if yarn_active {
+            eprintln!("  YaRN RoPE scaling active: speculative decode (DFlash/MTP) is not supported in v1; serving AR only");
+        }
         // ── DFlash2 draft loading ─────────────────────────────────────────
         // Shared draft state (weights + extract-layer hidden staging). The
         // slot path runs the DFlash2 selector chain only — legacy DFlash
         // drafts are refused inside `load_dflash_shared`. `dflash_required`
         // (dflash_mode=on) fails the load; auto warns and serves AR.
         let dflash = match &cfg.dflash_draft {
+            Some(path) if yarn_active => {
+                if cfg.dflash_required {
+                    return Err(
+                        "YaRN RoPE scaling is active: DFlash is not supported in v1; \
+                         use dflash_mode=off or remove attention.yarn_factor"
+                            .to_string(),
+                    );
+                }
+                eprintln!("  DFlash draft {} refused: YaRN active (v1 boundary)", path.display());
+                None
+            }
             Some(path) => match crate::dflash_slot::load_dflash_shared(
                 &mut gpu,
                 &path.to_string_lossy(),
