@@ -1617,7 +1617,9 @@ fn require_hyper_mixer(
 }
 
 /// The decode / verify HC8 route: both mixers are HC8 weights of a launchable shape and the
-/// routed row count is within the kernel's `1..=hc8::MAX_ROWS`.
+/// routed row count is within the kernel's `1..=hc8::MAX_ROWS`. A PREFILL call at or above the
+/// lowered prefill lane WMMA floor ([`Gpu::prefill_small_lane_rows`]) takes the expanded BF16 read
+/// and the prefill entries instead, exactly like the same rows inside a wider call.
 fn hc8_decode_applies(gpu: &Gpu, op: &HyperReadOp<'_>) -> bool {
     let wide = op.branches * op.hidden;
     let (down, up) = (&op.input_mix_down, &op.input_mix_up);
@@ -1625,6 +1627,7 @@ fn hc8_decode_applies(gpu: &Gpu, op: &HyperReadOp<'_>) -> bool {
         && is_hc8(up)
         && op.rows <= rdna_compute::hc8::MAX_ROWS
         && gpu.route_rows(op.rows) <= rdna_compute::hc8::MAX_ROWS
+        && !gpu.prefill_small_lane_rows(op.rows)
         && (down.m, down.k) == (op.low_rank, wide)
         && (up.m, up.k) == (wide, op.low_rank)
         && rdna_compute::hc8_weight::hc8_decode_shape_supported(down.m, down.k)

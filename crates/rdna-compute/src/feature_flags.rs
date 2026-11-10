@@ -17,6 +17,10 @@ pub enum Mb4Mode {
     Pack4,
 }
 
+/// Fewest rows of an EP prefill wave lane that take the prefill lane WMMA entries and the joint
+/// dense stages (`HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR`).
+pub const QWEN4_PREFILL_LWMMA_WAVE_FLOOR_ROWS: usize = 49;
+
 #[derive(Debug, Clone)]
 pub struct FeatureFlags {
     // ── Arch identity ──────────────────────────────────────────────
@@ -294,6 +298,13 @@ pub struct FeatureFlags {
     /// lane WMMA kernels (`HIPFIRE_QWEN4_PREFILL_LWMMA_HC`, pinned split-K). Default on for exact
     /// gfx1201 (`=0` kills it); also gated by the lane WMMA flag.
     pub qwen4_prefill_lwmma_hc: bool,
+    /// `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR` (default on, `=0` kills): lanes of
+    /// `QWEN4_PREFILL_LWMMA_WAVE_FLOOR_ROWS`..=64 rows INSIDE an EP prefill wave take the prefill
+    /// lane WMMA entries ([`Self::qwen4_prefill_lwmma_dense`] / [`Self::qwen4_prefill_lwmma_hc`])
+    /// and the joint dense stages instead of the 16..=64-row decode-shaped arms and per-lane
+    /// launches. Read through [`Self::qwen4_prefill_lwmma_floor_knob`]; scoped to waves only by
+    /// `Gpu::qwen4_prefill_lwmma_floor` (singleton chunks, decode and verify never see it).
+    pub qwen4_prefill_lwmma_wave_floor: bool,
     /// One multi-part lane-WMMA launch (`HIPFIRE_QWEN4_LWMMA_MULTI_PART`) for the dense BF16
     /// projections of one activation at 16..=64 rows (router | selector | shared gate | shared up
     /// of the wide MoE block): up to four parts share one `lwmma_gemm_bf16_t2_m<MT>_n1_multi`
@@ -1345,6 +1356,8 @@ impl FeatureFlags {
             qwen4_prefill_lwmma_dense: parse_bool("HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE")
                 .unwrap_or(true),
             qwen4_prefill_lwmma_hc: parse_bool("HIPFIRE_QWEN4_PREFILL_LWMMA_HC").unwrap_or(true),
+            qwen4_prefill_lwmma_wave_floor: parse_bool("HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR")
+                .unwrap_or(true),
             qwen4_lwmma_multi_part: parse_bool("HIPFIRE_QWEN4_LWMMA_MULTI_PART").unwrap_or(true),
             qwen4_mtp_fc_one_launch: parse_bool("HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH").unwrap_or(true),
             qwen4_lane_ple_project: parse_bool("HIPFIRE_QWEN4_LANE_PLE_PROJECT").unwrap_or(true),
@@ -2227,6 +2240,22 @@ impl FeatureFlags {
         self.qwen4_prefill_lwmma_hc && self.qwen4_lane_wmma_enabled()
     }
 
+    /// `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR` as the lane WMMA prefill floor of an EP prefill
+    /// WAVE: [`QWEN4_PREFILL_LWMMA_WAVE_FLOOR_ROWS`] when the flag and both prefill lane WMMA
+    /// entries are enabled (the floor routes the call to both the dense and the HC entry), else
+    /// `WIDE_VERIFY_MAX_ROWS + 1` (no row below 65 is ever moved off its decode-shaped arm).
+    /// Singleton chunks never read it.
+    pub fn qwen4_prefill_lwmma_floor_knob(&self) -> usize {
+        if self.qwen4_prefill_lwmma_wave_floor
+            && self.qwen4_prefill_lwmma_dense_enabled()
+            && self.qwen4_prefill_lwmma_hc_enabled()
+        {
+            QWEN4_PREFILL_LWMMA_WAVE_FLOOR_ROWS
+        } else {
+            crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS + 1
+        }
+    }
+
     /// Multi-part lane-WMMA launches (`HIPFIRE_QWEN4_LWMMA_MULTI_PART`, default on, `=0` kills): needs the
     /// lane-WMMA route itself ([`Self::qwen4_lane_wmma_enabled`]), exact gfx1201.
     pub fn qwen4_lwmma_multi_part_enabled(&self) -> bool {
@@ -2468,6 +2497,7 @@ impl FeatureFlags {
             qwen4_lane_wmma: false,
             qwen4_prefill_lwmma_dense: false,
             qwen4_prefill_lwmma_hc: false,
+            qwen4_prefill_lwmma_wave_floor: false,
             qwen4_lwmma_multi_part: false,
             qwen4_mtp_fc_one_launch: false,
             qwen4_lane_ple_project: false,
@@ -2942,6 +2972,25 @@ mod tests {
             });
             assert_eq!(flags.fn_gdn_dense_scan, expected);
         }
+    }
+
+    #[test]
+    fn prefill_lwmma_wave_floor_defaults_on_and_zero_kills() {
+        let off = crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS + 1;
+        let knob = |wave: Option<&str>, dense: Option<&str>| {
+            FeatureFlags::from_lookup("gfx1201", |name| match (name, wave, dense) {
+                ("HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR", Some(v), _) => Ok(v.into()),
+                ("HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE", _, Some(v)) => Ok(v.into()),
+                _ => Err(()),
+            })
+            .qwen4_prefill_lwmma_floor_knob()
+        };
+        assert_eq!(knob(None, None), QWEN4_PREFILL_LWMMA_WAVE_FLOOR_ROWS);
+        assert_eq!(knob(Some("1"), None), QWEN4_PREFILL_LWMMA_WAVE_FLOOR_ROWS);
+        assert_eq!(knob(Some("0"), None), off);
+        assert_eq!(knob(None, Some("0")), off);
+        let other = FeatureFlags::from_lookup("gfx1100", |_| Err(()));
+        assert_eq!(other.qwen4_prefill_lwmma_floor_knob(), off);
     }
 
     #[test]

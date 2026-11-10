@@ -179,15 +179,20 @@ pub(crate) fn exact_wave_lane_floor_from(value: Option<&str>, small_lanes: bool)
 }
 
 /// Whether a wave of `lane_rows` runs its row-local dense stages jointly
-/// ([`ep_wave_joint_enabled`]): only when EVERY lane is wider than the few-row window
-/// (`WIDE_VERIFY_MAX_ROWS`, 64). The joint HC / GDN / QSA launches select their kernels on the
-/// real rows of the call (lane WMMA at 16..=64 rows, the HC8 decode route, the 9..=48-row MQ6
-/// tile), so a small lane's singleton bytes are only reproduced by its own per-lane launches.
-pub(crate) fn ep_wave_joint_for_lanes(joint_enabled: bool, lane_rows: &[usize]) -> bool {
-    joint_enabled
-        && lane_rows
-            .iter()
-            .all(|&rows| rows > rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS)
+/// ([`ep_wave_joint_enabled`]): only when EVERY lane has at least `floor` rows, where `floor` is
+/// `WIDE_VERIFY_MAX_ROWS + 1` (65, every lane wider than the few-row window) unless the LAB
+/// prefill lane WMMA floor (`HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR`,
+/// `FeatureFlags::qwen4_prefill_lwmma_floor_knob`) lowered it. The joint HC / GDN / QSA launches
+/// select their kernels on the real rows of the call (lane WMMA at 16..=64 rows, the HC8 decode
+/// route, the 9..=48-row MQ6 tile), so a lane below `floor` reproduces its singleton bytes only
+/// with its own per-lane launches; a lane at or above a lowered floor takes the same prefill
+/// entries at the same pinned split-K in its own tile and in the joint call.
+pub(crate) fn ep_wave_joint_for_lanes(
+    joint_enabled: bool,
+    lane_rows: &[usize],
+    floor: usize,
+) -> bool {
+    joint_enabled && lane_rows.iter().all(|&rows| rows >= floor)
 }
 
 /// Most rows of a lane the exact wave takes: every lane stays below the 512-row floors (a
@@ -247,13 +252,11 @@ pub(crate) fn ep_wave_policy_for(joint: bool) -> LaneStagePolicy {
 }
 
 /// The lane-row table a wave hands `Gpu::qwen4_wave_lane_rows`: the lanes' rows when any lane
-/// is within the few-row window (64 rows), else empty (every projection of such a wave is the
+/// has fewer than `floor` rows (65 by default: within the few-row window, 64 rows; lower with the
+/// LAB prefill lane WMMA floor), else empty (every projection of such a wave is the
 /// singleton's whatever the call's total).
-pub(crate) fn ep_wave_lane_table(lane_rows: &[usize]) -> Vec<usize> {
-    if lane_rows
-        .iter()
-        .any(|&rows| rows <= rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS)
-    {
+pub(crate) fn ep_wave_lane_table(lane_rows: &[usize], floor: usize) -> Vec<usize> {
+    if lane_rows.iter().any(|&rows| rows < floor) {
         lane_rows.to_vec()
     } else {
         Vec::new()
@@ -763,8 +766,10 @@ impl Qwen4GpuForward {
         // [`QWEN4_EP_WAVE_SMALL_LANES_ENV`]): set only when a small lane is in the wave, cleared on
         // every return path below (the forward runs in the closure, no `?` between here and the
         // restore after it).
-        let prior_lane_rows =
-            std::mem::replace(&mut gpu.qwen4_wave_lane_rows, ep_wave_lane_table(lane_rows));
+        let prior_lane_rows = std::mem::replace(
+            &mut gpu.qwen4_wave_lane_rows,
+            ep_wave_lane_table(lane_rows, gpu.qwen4_prefill_lwmma_floor),
+        );
         let bank_route = match route {
             EpWaveRoute::FullTable => EpBankRoute::FullTable,
             EpWaveRoute::Tile | EpWaveRoute::Partial | EpWaveRoute::PartialMask => {
@@ -976,19 +981,36 @@ mod tests {
 
     #[test]
     fn joint_dense_stages_need_every_lane_wider_than_the_few_row_window() {
-        assert!(ep_wave_joint_for_lanes(true, &[65, 149, 511]));
-        assert!(!ep_wave_joint_for_lanes(true, &[60, 149]));
-        assert!(!ep_wave_joint_for_lanes(true, &[64, 64]));
-        assert!(!ep_wave_joint_for_lanes(false, &[149, 149]));
-        assert!(ep_wave_joint_for_lanes(true, &[]));
+        let floor = rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS + 1;
+        assert!(ep_wave_joint_for_lanes(true, &[65, 149, 511], floor));
+        assert!(!ep_wave_joint_for_lanes(true, &[60, 149], floor));
+        assert!(!ep_wave_joint_for_lanes(true, &[64, 64], floor));
+        assert!(!ep_wave_joint_for_lanes(false, &[149, 149], floor));
+        assert!(ep_wave_joint_for_lanes(true, &[], floor));
+    }
+
+    /// `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR` (49): lanes of 49..=64 rows join the joint stages;
+    /// a lane below the floor still keeps every row-local stage per lane.
+    #[test]
+    fn a_lowered_prefill_floor_admits_49_to_64_row_lanes_to_the_joint_stages() {
+        assert!(ep_wave_joint_for_lanes(true, &[60; 8], 49));
+        assert!(ep_wave_joint_for_lanes(true, &[49, 64, 149], 49));
+        assert!(!ep_wave_joint_for_lanes(true, &[48, 60], 49));
+        assert!(!ep_wave_joint_for_lanes(false, &[60; 8], 49));
+        assert!(ep_wave_lane_table(&[60; 8], 49).is_empty());
+        assert_eq!(ep_wave_lane_table(&[40, 60, 149], 49), vec![40, 60, 149]);
     }
 
     #[test]
     fn the_lane_table_is_handed_over_only_with_a_lane_of_at_most_64_rows() {
-        assert_eq!(ep_wave_lane_table(&[60; 8]), vec![60; 8]);
-        assert_eq!(ep_wave_lane_table(&[149, 64, 149]), vec![149, 64, 149]);
-        assert!(ep_wave_lane_table(&[65, 149]).is_empty());
-        assert!(ep_wave_lane_table(&[]).is_empty());
+        let floor = rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS + 1;
+        assert_eq!(ep_wave_lane_table(&[60; 8], floor), vec![60; 8]);
+        assert_eq!(
+            ep_wave_lane_table(&[149, 64, 149], floor),
+            vec![149, 64, 149]
+        );
+        assert!(ep_wave_lane_table(&[65, 149], floor).is_empty());
+        assert!(ep_wave_lane_table(&[], floor).is_empty());
     }
 
     #[test]

@@ -2077,6 +2077,13 @@ pub struct Gpu {
     /// forward's tile scopes; the route also never takes a call of at most `few_row_limit`
     /// rows, see [`Gpu::qwen4_moe_sym_iu4_applies`]).
     pub qwen4_moe_sym_iu4_floor: usize,
+    /// `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR` in scope: the fewest rows of a call that takes the
+    /// prefill lane WMMA entries ([`Gpu::prefill_lwmma_dense_applies`] /
+    /// [`Gpu::prefill_lwmma_hc_applies`]) instead of the 16..=64-row decode-shaped arms
+    /// ([`Gpu::lane_wmma_applies`], the HC8 decode route). `WIDE_VERIFY_MAX_ROWS + 1` (65: no
+    /// call at or below 64 rows moves) unless a Qwen4 PREFILL forward's tile scopes lowered it;
+    /// decode, verify, lane AR steps and the MTP head never do (they have no prefill scope).
+    pub qwen4_prefill_lwmma_floor: usize,
 }
 
 /// Developer kill switch for the pinned landing buffer of [`Gpu::dtoh_stream_ordered`]
@@ -3430,6 +3437,7 @@ impl Gpu {
             qwen4_route_rows_cap: 0,
             qwen4_wave_lane_rows: Vec::new(),
             qwen4_moe_sym_iu4_floor: crate::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
+            qwen4_prefill_lwmma_floor: crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS + 1,
         })
         .and_then(|mut gpu| {
             if gpu.flags.force_blob_path {

@@ -9667,6 +9667,7 @@ pub(crate) struct TileScopes {
     ragged: bool,
     ep_a8: bool,
     sym_floor: usize,
+    lwmma_floor: usize,
 }
 
 /// How a prefill chunk's staged PLE rows reach the device.
@@ -16130,6 +16131,25 @@ impl Qwen4GpuForward {
             });
         }
         let sym_floor = std::mem::replace(&mut gpu.qwen4_moe_sym_iu4_floor, sym_floor_now);
+        // `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR`: lowered only inside an EP prefill WAVE
+        // (`ep_wave_run` sets `wave_route` before entering these scopes). Singleton prefill
+        // chunks (`forward_chunk_scoped`), non-EP lane steps, decode, verify and the MTP head
+        // always run at `WIDE_VERIFY_MAX_ROWS + 1`, where `Gpu::prefill_small_lane_rows` is never
+        // true: their arms are unchanged by construction.
+        let lwmma_floor_now = if self.prefill_scope && self.wave_route.is_some() {
+            gpu.flags.qwen4_prefill_lwmma_floor_knob()
+        } else {
+            rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS + 1
+        };
+        if lwmma_floor_now <= rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "  qwen4 prefill lane WMMA wave floor: {lwmma_floor_now} rows (HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR; EP prefill waves only, singletons, decode and verify are unchanged)"
+                );
+            });
+        }
+        let lwmma_floor = std::mem::replace(&mut gpu.qwen4_prefill_lwmma_floor, lwmma_floor_now);
         (
             TileScopes {
                 scope,
@@ -16138,6 +16158,7 @@ impl Qwen4GpuForward {
                 ragged,
                 ep_a8,
                 sym_floor,
+                lwmma_floor,
             },
             append,
         )
@@ -16151,6 +16172,7 @@ impl Qwen4GpuForward {
         gpu.qwen4_trunk_iu4_prefill_scope = saved.ragged;
         gpu.qwen4_ep_a8_scope = saved.ep_a8;
         gpu.qwen4_moe_sym_iu4_floor = saved.sym_floor;
+        gpu.qwen4_prefill_lwmma_floor = saved.lwmma_floor;
     }
 
     /// Bank and runtime selection, the only place decode-share state changes.

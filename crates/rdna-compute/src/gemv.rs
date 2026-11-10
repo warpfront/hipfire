@@ -22098,18 +22098,31 @@ impl Gpu {
         )
     }
 
+    /// Whether a PREFILL call of `rows` rows sits at or above the lane WMMA prefill floor
+    /// ([`Gpu::qwen4_prefill_lwmma_floor`], `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR`) but within the
+    /// 16..=64-row decode-shaped window: such calls step off the decode-shaped lane WMMA / HC8
+    /// arms onto the row-count-invariant prefill entries. Pure. The floor is
+    /// `WIDE_VERIFY_MAX_ROWS + 1` (so this is never true) outside a Qwen4 prefill forward's tile
+    /// scopes: decode, verify, lane AR steps and MTP drafting never see a lowered floor.
+    pub fn prefill_small_lane_rows(&self, rows: usize) -> bool {
+        (self.qwen4_prefill_lwmma_floor..=WIDE_VERIFY_MAX_ROWS).contains(&rows)
+    }
+
     /// Whether a lane WMMA projection of `rows` activation rows is taken: the
     /// `HIPFIRE_QWEN4_LANE_WMMA` flag (exact gfx1201) and [`LANE_WMMA_MIN_ROWS`]..=[`WIDE_VERIFY_MAX_ROWS`] rows. Pure; outputs are NOT bitwise the SIMT
     /// route's (f32 summation order differs), but are deterministic. Refused inside the lane row-exact
-    /// scope ([`Gpu::lane_row_exact_scope`]).
+    /// scope ([`Gpu::lane_row_exact_scope`]) and for a prefill call at or above the lowered prefill
+    /// floor ([`Gpu::prefill_small_lane_rows`]), which takes the prefill entries instead.
     pub fn lane_wmma_applies(&self, rows: usize) -> bool {
         self.flags.qwen4_lane_wmma_enabled()
             && !self.lane_row_exact_scope
             && (LANE_WMMA_MIN_ROWS..=WIDE_VERIFY_MAX_ROWS).contains(&rows)
+            && !self.prefill_small_lane_rows(rows)
     }
 
     /// Whether a dense BF16 prefill GEMM of `rows` rows takes the lane WMMA kernel above
-    /// [`WIDE_VERIFY_MAX_ROWS`] (`HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE`, default on) while the route is
+    /// [`WIDE_VERIFY_MAX_ROWS`] (or from the lowered prefill floor,
+    /// [`Gpu::qwen4_prefill_lwmma_floor`]; `HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE`, default on) while the route is
     /// below the F16 WMMA prefill threshold ([`crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS`]). Not
     /// bitwise the SIMT route; deterministic; each row is bitwise the same across call sizes
     /// (pinned split-K). Refused in the lane row-exact scope and under the HC hold
@@ -22118,7 +22131,7 @@ impl Gpu {
         self.flags.qwen4_prefill_lwmma_dense_enabled()
             && !self.lane_row_exact_scope
             && !self.prefill_lwmma_dense_hold
-            && rows > WIDE_VERIFY_MAX_ROWS
+            && (rows > WIDE_VERIFY_MAX_ROWS || self.prefill_small_lane_rows(rows))
             && self.route_rows(rows) < crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
     }
 
@@ -22127,7 +22140,7 @@ impl Gpu {
     pub fn prefill_lwmma_hc_applies(&self, rows: usize) -> bool {
         self.flags.qwen4_prefill_lwmma_hc_enabled()
             && !self.lane_row_exact_scope
-            && rows > WIDE_VERIFY_MAX_ROWS
+            && (rows > WIDE_VERIFY_MAX_ROWS || self.prefill_small_lane_rows(rows))
             && self.route_rows(rows) < crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
     }
 

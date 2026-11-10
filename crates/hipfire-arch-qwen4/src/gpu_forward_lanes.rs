@@ -2526,9 +2526,16 @@ fn forward_wave_ep(
     out: &StepOutputs<'_>,
 ) -> Result<(), Qwen4GpuForwardError> {
     let lane_rows: Vec<usize> = lanes.iter().map(|lane| lane.tokens.len()).collect();
-    // Joint dense stages only when every lane is wider than the few-row window (small lanes run
-    // their row-local stages per lane: `ep_wave_joint_for_lanes`).
-    let policy = ep_wave_policy_for(ep_wave_joint_for_lanes(ep_wave_joint_enabled(), &lane_rows));
+    // Joint dense stages only when every lane has at least the prefill lane WMMA floor of rows
+    // (65 = every lane wider than the few-row window, or the LAB
+    // `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR`); lanes below it run their row-local stages per lane
+    // (`ep_wave_joint_for_lanes`). A wave is a prefill forward by construction.
+    let floor = gpu.flags.qwen4_prefill_lwmma_floor_knob();
+    let policy = ep_wave_policy_for(ep_wave_joint_for_lanes(
+        ep_wave_joint_enabled(),
+        &lane_rows,
+        floor,
+    ));
     let total: usize = lane_rows.iter().sum();
     let facts = fwd.ep_wave_facts(gpu, &bundle.config, &lane_rows);
     if let Some(why) = ep_wave_refusal(&facts) {

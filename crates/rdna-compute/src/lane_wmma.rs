@@ -645,26 +645,35 @@ impl Gpu {
 /// the wave's lanes' rows in order. A lane's own singleton takes the 16..=64-row lane WMMA arm
 /// (`wmma(rows)`, keyed on the call's REAL rows and not bitwise the SIMT arm), so every such lane
 /// is its own call; a lane of at most 15 rows is its own call too (it keeps its singleton's
-/// few-row arms), while consecutive lanes wider than the few-row window (64 rows) stay one call
-/// (the SIMT multirow arm is row-count invariant there, and so is the prefill lane WMMA arm
-/// ([`Gpu::lane_wmma_gemm_prefill`], split-K pinned), and one wide call is the wave's gain).
-/// Split only when the table is the call's (`sum == total`) and some lane takes the lane WMMA arm.
+/// few-row arms), while consecutive lanes of `wide_from` rows or more stay one call
+/// (`wide_from` = `WIDE_VERIFY_MAX_ROWS + 1` by default: the SIMT multirow arm is row-count
+/// invariant there, and so is the prefill lane WMMA arm ([`Gpu::lane_wmma_gemm_prefill`], split-K
+/// pinned), and one wide call is the wave's gain; the lowered prefill floor
+/// [`Gpu::qwen4_prefill_lwmma_floor`] moves the 49..=64-row lanes into those wide runs, where
+/// their singleton takes the same prefill arm at the same pinned split-K).
+/// Split only when the table is the call's (`sum == total`) and some lane takes the lane WMMA arm,
+/// or a lane below `wide_from` shares the wave with a lane within `wide_from..=64` (which is
+/// not WMMA-keyed any more, but whose neighbour keeps its own arm).
 pub fn wave_lane_groups(
     table: &[usize],
     total: usize,
+    wide_from: usize,
     wmma: impl Fn(usize) -> bool,
 ) -> Option<Vec<usize>> {
+    let wide = crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
+    let floor_lane = |rows: usize| (wide_from..=wide).contains(&rows);
     if table.is_empty()
         || table.iter().sum::<usize>() != total
-        || !table.iter().any(|&rows| wmma(rows))
+        || !(table.iter().any(|&rows| wmma(rows))
+            || (table.iter().any(|&rows| rows < wide_from)
+                && table.iter().any(|&rows| floor_lane(rows))))
     {
         return None;
     }
-    let wide = crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
     let mut groups = Vec::with_capacity(table.len());
     let mut run = 0usize;
     for &rows in table {
-        if rows > wide {
+        if rows >= wide_from {
             run += rows;
         } else {
             if run > 0 {
@@ -681,11 +690,15 @@ pub fn wave_lane_groups(
 }
 
 impl Gpu {
-    /// [`wave_lane_groups`] for a call of `rows` rows under this device's lane WMMA admission.
+    /// [`wave_lane_groups`] for a call of `rows` rows under this device's lane WMMA admission and
+    /// prefill floor ([`Gpu::qwen4_prefill_lwmma_floor`]).
     pub fn wave_lane_groups(&self, rows: usize) -> Option<Vec<usize>> {
-        wave_lane_groups(&self.qwen4_wave_lane_rows, rows, |r| {
-            self.lane_wmma_applies(r)
-        })
+        wave_lane_groups(
+            &self.qwen4_wave_lane_rows,
+            rows,
+            self.qwen4_prefill_lwmma_floor,
+            |r| self.lane_wmma_applies(r),
+        )
     }
 }
 
@@ -699,29 +712,61 @@ mod tests {
 
     #[test]
     fn wave_lane_groups_split_only_when_a_lane_takes_the_lane_wmma_arm() {
+        let w = 65;
         // The story C8 burst: eight 60-row lanes, each its own call.
-        assert_eq!(wave_lane_groups(&[60; 8], 480, wmma), Some(vec![60; 8]));
+        assert_eq!(wave_lane_groups(&[60; 8], 480, w, wmma), Some(vec![60; 8]));
         // Small lanes split, consecutive wide lanes stay one call.
         assert_eq!(
-            wave_lane_groups(&[60, 60, 149, 149, 256, 511], 1185, wmma),
+            wave_lane_groups(&[60, 60, 149, 149, 256, 511], 1185, w, wmma),
             Some(vec![60, 60, 149 + 149 + 256 + 511])
         );
         // A small lane between wide lanes cuts the wide run.
         assert_eq!(
-            wave_lane_groups(&[149, 60, 149, 149], 507, wmma),
+            wave_lane_groups(&[149, 60, 149, 149], 507, w, wmma),
             Some(vec![149, 60, 298])
         );
         // Lanes of 9..=15 rows keep their few-row arms: their own calls, but only with a WMMA lane.
-        assert_eq!(wave_lane_groups(&[12, 12], 24, wmma), None);
-        assert_eq!(wave_lane_groups(&[12, 40], 52, wmma), Some(vec![12, 40]));
+        assert_eq!(wave_lane_groups(&[12, 12], 24, w, wmma), None);
+        assert_eq!(wave_lane_groups(&[12, 40], 52, w, wmma), Some(vec![12, 40]));
         // No small lane, no table, or a table that is not this call's rows: one call.
-        assert_eq!(wave_lane_groups(&[149, 256], 405, wmma), None);
-        assert_eq!(wave_lane_groups(&[], 0, wmma), None);
-        assert_eq!(wave_lane_groups(&[60, 60], 480, wmma), None);
+        assert_eq!(wave_lane_groups(&[149, 256], 405, w, wmma), None);
+        assert_eq!(wave_lane_groups(&[], 0, w, wmma), None);
+        assert_eq!(wave_lane_groups(&[60, 60], 480, w, wmma), None);
         // The groups always cover the call exactly.
         for table in [vec![60; 8], vec![9, 16, 64, 65, 200], vec![65, 64, 65]] {
             let total: usize = table.iter().sum();
-            if let Some(groups) = wave_lane_groups(&table, total, wmma) {
+            if let Some(groups) = wave_lane_groups(&table, total, w, wmma) {
+                assert_eq!(groups.iter().sum::<usize>(), total);
+            }
+        }
+    }
+
+    /// The lowered prefill floor (49): lanes of 49..=64 rows leave the WMMA-keyed per-lane split
+    /// (`wmma` is then false for them) and join the wide runs.
+    #[test]
+    fn wave_lane_groups_with_a_lowered_prefill_floor_run_floor_lanes_jointly() {
+        let w = 49;
+        let wmma_below = |rows: usize| wmma(rows) && rows < w;
+        // The story C8 burst joins into one call.
+        assert_eq!(wave_lane_groups(&[60; 8], 480, w, wmma_below), None);
+        assert_eq!(wave_lane_groups(&[49, 64, 149], 262, w, wmma_below), None);
+        // A lane below the floor still runs its own arm; the floor lanes join the wide run.
+        assert_eq!(
+            wave_lane_groups(&[40, 60, 60, 149], 309, w, wmma_below),
+            Some(vec![40, 60 + 60 + 149])
+        );
+        assert_eq!(
+            wave_lane_groups(&[60, 40, 60, 149], 309, w, wmma_below),
+            Some(vec![60, 40, 60 + 149])
+        );
+        // A sub-16 lane next to a floor lane keeps its own call although nothing is WMMA-keyed.
+        assert_eq!(
+            wave_lane_groups(&[12, 60], 72, w, wmma_below),
+            Some(vec![12, 60])
+        );
+        for table in [vec![60; 8], vec![9, 16, 48, 49, 64, 65, 200]] {
+            let total: usize = table.iter().sum();
+            if let Some(groups) = wave_lane_groups(&table, total, w, wmma_below) {
                 assert_eq!(groups.iter().sum::<usize>(), total);
             }
         }
