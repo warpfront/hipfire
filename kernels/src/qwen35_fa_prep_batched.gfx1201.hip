@@ -56,7 +56,8 @@ static __device__ __forceinline__ void qwen35_fa_prep_row_gfx1201(
     int pos_offset,
     int n_q_heads,
     int n_kv_heads,
-    int batch_size)
+    int batch_size,
+    RopeYarn yarn)
 {
     // Every rounding point is explicit (the reference sums RN(v*v) leaves and
     // the RoPE fmas are written out): no implicit contraction here.
@@ -118,8 +119,8 @@ static __device__ __forceinline__ void qwen35_fa_prep_row_gfx1201(
         const int pos = positions[b] + pos_offset;
         const float freq = 1.0f / powf(freq_base, (float)(2 * lane) / (float)NROT);
         const float angle = (float)pos * freq;
-        const float cos_a = cosf(angle);
-        const float sin_a = sinf(angle);
+        const float cos_a, sin_a;
+        rope_yarn_sincos(angle, lane, yarn, &sin_a, &cos_a);
         const float x0 = o[0];
         const float x1 = o[1];
         o[0] = fmaf(x0, cos_a, -(x1 * sin_a));
@@ -168,11 +169,12 @@ __global__ void qwen35_fa_prep_batched_gfx1201(
     int pos_offset,
     int n_q_heads,
     int n_kv_heads,
-    int batch_size)
+    int batch_size,
+    RopeYarn yarn)
 {
     qwen35_fa_prep_row_gfx1201<false>(
         q_interleaved, q, nullptr, nullptr, gate, k, q_weight, k_weight,
-        positions, eps, freq_base, pos_offset, n_q_heads, n_kv_heads, batch_size);
+        positions, eps, freq_base, pos_offset, n_q_heads, n_kv_heads, batch_size, yarn);
 }
 
 extern "C" __launch_bounds__(256)
@@ -190,11 +192,12 @@ __global__ void qwen35_fa_prep_fp8q_batched_gfx1201(
     int pos_offset,
     int n_q_heads,
     int n_kv_heads,
-    int batch_size)
+    int batch_size,
+    RopeYarn yarn)
 {
     qwen35_fa_prep_row_gfx1201<true>(
         q_interleaved, nullptr, q_codes, q_scale, gate, k, q_weight, k_weight,
-        positions, eps, freq_base, pos_offset, n_q_heads, n_kv_heads, batch_size);
+        positions, eps, freq_base, pos_offset, n_q_heads, n_kv_heads, batch_size, yarn);
 }
 
 extern "C" __launch_bounds__(256)
@@ -211,9 +214,10 @@ __global__ void qwen35_fa_prep_fp8q_nogate_batched_gfx1201(
     int pos_offset,
     int n_q_heads,
     int n_kv_heads,
-    int batch_size)
+    int batch_size,
+    RopeYarn yarn)
 {
     qwen35_fa_prep_row_gfx1201<true, false>(
         q_interleaved, nullptr, q_codes, q_scale, nullptr, k, q_weight, k_weight,
-        positions, eps, freq_base, pos_offset, n_q_heads, n_kv_heads, batch_size);
+        positions, eps, freq_base, pos_offset, n_q_heads, n_kv_heads, batch_size, yarn);
 }

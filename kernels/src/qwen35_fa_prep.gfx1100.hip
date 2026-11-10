@@ -25,7 +25,8 @@ __global__ void HIPFIRE_QWEN35_FA_PREP_KERNEL(
     const float* __restrict__ k_weight,
     const int* __restrict__ pos_buf,
     float eps,
-    float freq_base)
+    float freq_base,
+    RopeYarn yarn)
 {
     constexpr int NQ = 16;
     constexpr int HD = 256;
@@ -74,8 +75,8 @@ __global__ void HIPFIRE_QWEN35_FA_PREP_KERNEL(
         const int pos = *pos_buf;
         const float freq = 1.0f / powf(freq_base, (float)(2 * tid) / (float)NROT);
         const float angle = (float)pos * freq;
-        const float cos_a = cosf(angle);
-        const float sin_a = sinf(angle);
+        const float cos_a, sin_a;
+        rope_yarn_sincos(angle, tid, yarn, &sin_a, &cos_a);
         const float x0 = sdata[tid];
         const float x1 = sdata[tid + HALF];
 #if defined(__gfx1100__) || defined(__gfx1151__) || defined(QWEN_FA_PREP_EXACT_ROPE)

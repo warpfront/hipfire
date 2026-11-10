@@ -1,0 +1,33 @@
+{
+ "model_path": "C:/Users/Jan/.hipfire/models/qwen3.8-27b.mq4l",
+ "expect_n_ctx": 262144,
+ "budget": 250000,
+ "needle_at": 240000,
+ "kv": {
+  "kv_mode": null,
+  "kv_k": "fwht4",
+  "kv_v": "lloyd4"
+ },
+ "trials": [
+  {
+   "name": "control",
+   "needle_token_pos_est": 124987,
+   "passed": false,
+   "error": "('Connection aborted.', ConnectionResetError(10054, 'An existing connection was forcibly closed by the remote host', None, 10054, None))"
+  },
+  {
+   "name": "target",
+   "needle_token_pos_est": 239997,
+   "passed": false,
+   "error": "HTTPConnectionPool(host='127.0.0.1', port=18082): Max retries exceeded with url: /v1/chat/completions (Caused by NewConnectionError(\"HTTPConnection(host='127.0.0.1', port=18082): Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it\"))"
+  }
+ ],
+ "resident_n_ctx": 262144,
+ "resident_bound": "legacy-fit",
+ "calibration": {
+  "template_question_tokens": 26,
+  "per_sentence_tokens": 13.63
+ },
+ "vram_peak_mib": 24469,
+ "serve_max_seq_line": "max_seq: 262144 (bound=legacy-fit; model_ctx=unknown, card_cap=unknown, kv=auto)"
+}

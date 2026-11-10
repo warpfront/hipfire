@@ -1152,6 +1152,7 @@ pub(super) fn decode(
                             )?;
                         }
                     } else {
+                        let yarn = crate::qwen35::config::rope_yarn(config);
                         for rs in &row_scratch {
                             gpu.qwen35_fa_prep_gfx1100(
                                 &rs.fa_q_full,
@@ -1165,6 +1166,7 @@ pub(super) fn decode(
                                 config.rope_theta,
                                 config.n_heads,
                                 config.n_kv_heads,
+                                &yarn,
                             )?;
                         }
                     }

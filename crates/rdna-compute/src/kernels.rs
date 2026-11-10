@@ -9463,22 +9463,28 @@ pub const TOPK_LOGSUMEXP_BATCHED_SRC: &str =
 /// Dims >= n_rot pass through unchanged.
 /// Grid: [n_rot/2]. Block: [1]. Each thread handles one rotation pair.
 #[cfg(feature = "deltanet")]
-pub const ROPE_PARTIAL_INTERLEAVED_SRC: &str =
-    include_str!("../../../kernels/src/rope_partial_interleaved.hip");
+pub const ROPE_PARTIAL_INTERLEAVED_SRC: &str = concat!(
+    include_str!("../../../kernels/src/rope_yarn.h"),
+    include_str!("../../../kernels/src/rope_partial_interleaved.hip")
+);
 
 /// Half-split-pair partial RoPE, matching HF `rotate_half` convention used by
 /// Qwen2 / Qwen3 / Qwen3.5 `apply_rotary_pos_emb`. Wired in via env-gate
 /// `HIPFIRE_ROPE_HALFSPLIT=1` from `rope_partial_interleaved_f32`. See
 /// docs/plans/qwen35-mq4-quality-gap.md §"RoPE convention probe".
 #[cfg(feature = "deltanet")]
-pub const ROPE_PARTIAL_HALFSPLIT_SRC: &str =
-    include_str!("../../../kernels/src/rope_partial_halfsplit.hip");
+pub const ROPE_PARTIAL_HALFSPLIT_SRC: &str = concat!(
+    include_str!("../../../kernels/src/rope_yarn.h"),
+    include_str!("../../../kernels/src/rope_partial_halfsplit.hip")
+);
 
 /// gfx1201 decode twin of `rope_partial_halfsplit_f32` (`HIPFIRE_G12_DEC_NORM`):
 /// one workgroup per head instead of one wave looping over all heads.
 #[cfg(feature = "deltanet")]
-pub const ROPE_PARTIAL_HALFSPLIT_HEADGRID_SRC: &str =
-    include_str!("../../../kernels/src/rope_partial_halfsplit_headgrid.hip");
+pub const ROPE_PARTIAL_HALFSPLIT_HEADGRID_SRC: &str = concat!(
+    include_str!("../../../kernels/src/rope_yarn.h"),
+    include_str!("../../../kernels/src/rope_partial_halfsplit_headgrid.hip")
+);
 
 /// Gemma 4 full-attention partial RoPE (HF `rotate_half` pairing). head_dim=512
 /// but only the first `n_rot_pairs` pairs (i, i+head_dim/2) rotate; the rest are
@@ -9499,8 +9505,10 @@ pub const ROPE_PARTIAL_HALVED_BATCHED_SRC: &str =
 /// no contraction, gives ulp-level diffs that flip greedy tokens (seen on
 /// 16Q/4K). The note lives here because the `.hip` bytes feed frozen module
 /// manifests.
-pub const QWEN35_FA_PREP_GFX1100_SRC: &str =
-    include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip");
+pub const QWEN35_FA_PREP_GFX1100_SRC: &str = concat!(
+    include_str!("../../../kernels/src/rope_yarn.h"),
+    include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
+);
 /// Qwen3.6-27B 24Q/4K body shared by the gfx1100 and exact-gfx1201 twins. The
 /// RoPE pair is written with explicit fmaf in the contraction both archs'
 /// unfused decode RoPE (`rope_partial_halfsplit_f32` on gfx1100,
@@ -9525,6 +9533,7 @@ pub fn qwen36_27b_fa_prep_gfx1100_src() -> &'static str {
 }
 #[cfg(feature = "deltanet")]
 pub const QWEN35_FA_PREP_GFX1151_SRC: &str = concat!(
+    include_str!("../../../kernels/src/rope_yarn.h"),
     "#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1151\n",
     include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
 );
@@ -9534,6 +9543,7 @@ pub const QWEN35_FA_PREP_GFX1151_SRC: &str = concat!(
 /// module/entry symbol keeps HSACO caches from aliasing the gfx1100/gfx1151
 /// builds.
 pub const QWEN35_FA_PREP_GFX1201_SRC: &str = concat!(
+    include_str!("../../../kernels/src/rope_yarn.h"),
     "#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1201\n",
     include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
 );
@@ -9548,8 +9558,10 @@ pub fn qwen36_27b_fa_prep_gfx1201_src() -> &'static str {
 /// see the kernel header). Replaces one `kv_cache_write_q8_0_pair` launch per
 /// full-attention layer; cache bytes are bit-identical to the pair writer.
 #[cfg(feature = "deltanet")]
-pub const QWEN35_FA_KVWRITE_GFX1100_SRC: &str =
-    include_str!("../../../kernels/src/qwen35_fa_kvwrite.gfx1100.hip");
+pub const QWEN35_FA_KVWRITE_GFX1100_SRC: &str = concat!(
+    include_str!("../../../kernels/src/rope_yarn.h"),
+    include_str!("../../../kernels/src/qwen35_fa_kvwrite.gfx1100.hip")
+);
 
 /// 2-D spatial RoPE with precomputed per-patch cos/sin tables. Used by
 /// the dots.ocr (Qwen2-VL family) `DotsVisionTransformer` for vision
@@ -9744,16 +9756,20 @@ pub const QWEN4_BF16_ROUND_TRIP_SRC: &str =
 /// Batched partial-interleaved RoPE — per-row positions read from a
 /// positions[] array. Used by the batched prefill FA path.
 #[cfg(feature = "deltanet")]
-pub const ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/rope_partial_interleaved_batched.hip");
+pub const ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC: &str = concat!(
+    include_str!("../../../kernels/src/rope_yarn.h"),
+    include_str!("../../../kernels/src/rope_partial_interleaved_batched.hip")
+);
 
 /// Batched half-split partial RoPE — twin of the interleaved batched kernel
 /// with HF `rotate_half` convention. Default for Qwen3.5 since 2026-05-12.
 /// See docs/plans/qwen35-mq4-quality-gap.md §"RoPE convention probe / halfsplit
 /// fix" for the rationale.
 #[cfg(feature = "deltanet")]
-pub const ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/rope_partial_halfsplit_batched.hip");
+pub const ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC: &str = concat!(
+    include_str!("../../../kernels/src/rope_yarn.h"),
+    include_str!("../../../kernels/src/rope_partial_halfsplit_batched.hip")
+);
 
 /// 3D mrope, half-split convention. Twin of ROPE_PARTIAL_HALFSPLIT_SRC,
 /// differing only in which position each frequency index reads: band mapping

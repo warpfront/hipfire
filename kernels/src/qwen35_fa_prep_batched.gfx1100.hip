@@ -43,7 +43,8 @@ __global__ void QWEN35_FA_PREP_BATCHED_KERNEL(
     int pos_offset, // added to positions[b] for the RoPE angle only
     int n_q_heads, // Q-head split point (16 or 24); K heads fill the grid rest
     int n_kv_heads, // K-head count (2 or 4); guards the grid x extent
-    int batch_size)
+    int batch_size,
+    RopeYarn yarn)
 {
     constexpr int HD = 256;
     constexpr int NROT = 64;
@@ -98,8 +99,8 @@ __global__ void QWEN35_FA_PREP_BATCHED_KERNEL(
         const int pos = positions[b] + pos_offset;
         const float freq = 1.0f / powf(freq_base, (float)(2 * tid) / (float)NROT);
         const float angle = (float)pos * freq;
-        const float cos_a = cosf(angle);
-        const float sin_a = sinf(angle);
+        const float cos_a, sin_a;
+        rope_yarn_sincos(angle, tid, yarn, &sin_a, &cos_a);
         const float x0 = sdata[tid];
         const float x1 = sdata[tid + HALF];
         out[tid] = fmaf(x0, cos_a, -(x1 * sin_a));

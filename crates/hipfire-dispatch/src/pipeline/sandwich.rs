@@ -732,6 +732,7 @@ impl Rope {
                 {
                     gpu.rope_partial_interleaved_f32(
                         q, k, pos_buf, n_heads, n_kv_heads, head_dim, rot_dim, theta,
+                        &rdna_compute::rope::RopeYarn::OFF,
                     )
                 }
                 #[cfg(not(feature = "deltanet"))]

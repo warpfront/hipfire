@@ -27,7 +27,8 @@ extern "C" __global__ void rope_partial_halfsplit_f32(
     int n_heads_k,
     int head_dim,
     int n_rot,
-    float freq_base
+    float freq_base,
+    RopeYarn yarn
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int half = n_rot / 2;
@@ -38,8 +39,8 @@ extern "C" __global__ void rope_partial_halfsplit_f32(
     // restricted to the partial-rotary region (n_rot = head_dim * partial_rotary_factor).
     float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)n_rot);
     float angle = (float)pos * freq;
-    float cos_a = cosf(angle);
-    float sin_a = sinf(angle);
+    float cos_a, sin_a;
+    rope_yarn_sincos(angle, i, yarn, &sin_a, &cos_a);
 
     for (int h = 0; h < n_heads_q; h++) {
         int base = h * head_dim;
