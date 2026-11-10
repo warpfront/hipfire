@@ -3339,7 +3339,7 @@ impl GatedDeltaNetOp<'_> {
     /// phase wrote the capture in place). The projection-only phases cannot
     /// honor one (their op carries the capture's `inputs` as `projection`,
     /// never as a `row_capture`).
-    fn check_phase(&self) -> Result<(), DispatchError> {
+    pub(super) fn check_phase(&self) -> Result<(), DispatchError> {
         if matches!(self.phase, MixerPhase::InProj | MixerPhase::OutProj)
             && self.row_capture.is_some()
         {
@@ -3527,7 +3527,7 @@ impl GatedDeltaNetOp<'_> {
 /// gate parameters and gate compute each row as the per-row kernels do, so a
 /// decode row is bitwise the per-row route's, and the step runs as one
 /// launch over all value heads instead of the sequential kernel.
-fn gdn_persistent_batch(gpu: &Gpu, op: &GatedDeltaNetOp<'_>, rows: usize) -> bool {
+pub(super) fn gdn_persistent_batch(gpu: &Gpu, op: &GatedDeltaNetOp<'_>, rows: usize) -> bool {
     gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
         && (gpu.route_rows(rows) > 1 || gpu.arch_caps.is_gfx942())
         && op.key_dim == 128
@@ -4038,6 +4038,14 @@ pub fn execute_gated_delta_net_core_lanes(
     ops: &[&GatedDeltaNetOp<'_>],
     before_launch: impl FnOnce(&mut Gpu) -> Result<(), DispatchError>,
 ) -> Result<bool, DispatchError> {
+    // Exact gfx942 (`HIPFIRE_QWEN4_GDN_LANES`, default off): the one-row F32 lanes'
+    // recurrence as one launch over every lane (`pipeline/gdn.rs`); a group it declines
+    // falls through to the gfx11+ multi-lane kernels below, which refuse it too.
+    let before_launch =
+        match super::gdn::execute_core_lanes_f32_gfx942(gpu, ops, before_launch)? {
+            super::gdn::Gfx942GdnLanes::Done => return Ok(true),
+            super::gdn::Gfx942GdnLanes::Declined(before_launch) => before_launch,
+        };
     let Some(first) = ops.first() else {
         return Ok(false);
     };
