@@ -510,12 +510,14 @@ mod tests {
             assert!(sp_rows_in_band(n, true), "{n}");
             let [a, b] = sp_even_split(n);
             for half in [a.1, b.1] {
-                assert!(half > WIDE_VERIFY_MAX_ROWS && half > FEW_ROW_ROUTE_ROWS, "{n}: {half}");
+                assert!(half > WIDE_VERIFY_MAX_ROWS, "{n}: {half}");
+                assert!(half > FEW_ROW_ROUTE_ROWS, "{n}: {half}");
                 assert!(half >= 16, "{n}: row fold floor");
             }
             for rows in [a.1, b.1, n] {
                 assert!(rows < QWEN4_F16_WMMA_MIN_TOKENS, "{n}");
-                assert!(rows < HC_DOWN_FUSED_MIN_ROWS && rows < HC_DOWN_FUSED_GFX1151_MIN_ROWS);
+                assert!(rows < HC_DOWN_FUSED_MIN_ROWS, "{n}");
+                assert!(rows < HC_DOWN_FUSED_GFX1151_MIN_ROWS, "{n}");
             }
         }
         let below = SP_SUB512_MIN_ROWS - 1;
