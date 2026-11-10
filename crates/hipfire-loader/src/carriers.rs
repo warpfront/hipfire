@@ -11244,6 +11244,16 @@ fn load_qwen35_pp(
     let pp = ctx.pp;
     let config = hipfire_arch_qwen35::qwen35::config_from_hfq(&hfq_file)
         .map_err(|e| format!("failed to read Qwen3.5 config: {e}"))?;
+    // Native positions, or the YaRN-extended `factor x original` context.
+    let positions = hipfire_arch_qwen35::qwen35::config::context_limit(&config);
+    if ctx.max_seq > positions {
+        return Err(format!(
+            "qwen35: max_seq {} exceeds the model's trained context of {positions} tokens \
+             (max_position_embeddings, or YaRN factor x original; see attention.yarn_factor). \
+             Lower memory.max_seq to at most {positions}",
+            ctx.max_seq
+        ));
+    }
     // Band counts were normalized once at admission (`BandPlacement`, sum and
     // length validated against this config's layer count); explicit counts
     // skip the uniform free-VRAM delta gate exactly as the old

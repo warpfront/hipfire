@@ -145,6 +145,7 @@ impl Qwen35MtpHeadConfig {
             head_dim: self.head_dim,
             rope_theta: self.rope_theta,
             rope_scaling: rdna_compute::rope::RopeScaling::None,
+            max_position_embeddings: 262144,
             partial_rotary_factor: self.n_rot as f32 / self.head_dim as f32,
             is_vl_text: false,
             mrope_interleaved: false,

@@ -108,6 +108,8 @@ pub struct Qwen35Config {
     /// Long-context RoPE scaling, resolved by the engine
     /// ([`hipfire_runtime::rope::rope_scaling`]).
     pub rope_scaling: rdna_compute::rope::RopeScaling,
+    /// The checkpoint's native `max_position_embeddings`.
+    pub max_position_embeddings: usize,
     pub partial_rotary_factor: f32, // 0.25 — only 64/256 dims get RoPE
     /// True when a composite Qwen3.5-VL checkpoint is being used as a
     /// text-only model through its nested `text_config`.
@@ -889,6 +891,10 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
 
     let rope_scaling = hipfire_runtime::rope::rope_scaling(tc)
         .map_err(|e| format!("qwen35: rope_scaling: {e}"))?;
+    let max_position_embeddings = tc
+        .get("max_position_embeddings")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(262144) as usize;
 
     let mut config = Qwen35Config {
         dim,
@@ -901,6 +907,7 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
         head_dim,
         rope_theta,
         rope_scaling,
+        max_position_embeddings,
         partial_rotary_factor,
         is_vl_text,
         mrope_interleaved,
@@ -992,8 +999,8 @@ pub fn config_from_safetensors(source: &dyn ModelSource) -> Result<Qwen35Config,
 
 /// Positions the RoPE covers: `max_position_embeddings`, or the YaRN
 /// `factor x original` context.
-pub fn context_limit(config: &Qwen35Config, max_position_embeddings: usize) -> usize {
-    config.rope_scaling.context_limit(max_position_embeddings)
+pub fn context_limit(config: &Qwen35Config) -> usize {
+    config.rope_scaling.context_limit(config.max_position_embeddings)
 }
 
 /// The full-attention rotary embedding.
