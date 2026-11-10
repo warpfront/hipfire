@@ -103,7 +103,8 @@ const SHAPES: &[(usize, usize, usize, Option<f32>)] = &[
 const ROWS: &[usize] = &[
     65, 77, 96, 149, 256, 384, 511, 596, 1043, 1191, 1192, 1536, 2048,
 ];
-const BENCH_ROWS: &[usize] = &[149, 596, 1192];
+/// The served counts plus both sides of the launcher's row-bucket edges (300 | 301, 800 | 801).
+const BENCH_ROWS: &[usize] = &[149, 256, 300, 301, 384, 511, 596, 800, 801, 1000, 1192];
 const MAX_ROWS: usize = 2048;
 
 fn shape_w(gpu: &mut Gpu, m: usize, k: usize) -> GpuTensor {
