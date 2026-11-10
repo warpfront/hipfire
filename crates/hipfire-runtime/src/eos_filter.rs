@@ -217,8 +217,9 @@ impl EosFilter {
     }
 
     /// Like [`Self::observe`], but a configured stop marker does not end
-    /// the turn. The marker is dropped, `stopped` stays clear, and later
-    /// chunks are still emitted.
+    /// the turn. The marker bytes are emitted as text, `stopped` stays
+    /// clear, and later chunks are still emitted. `min_tokens` suspension
+    /// still drops the marker.
     pub fn observe_suppressing_stops(&mut self, raw_bytes: &[u8]) -> FilterAction {
         self.observe_with(raw_bytes, false)
     }
@@ -258,8 +259,9 @@ impl EosFilter {
     /// disambiguation). Open-think content is still discarded. Incomplete
     /// UTF-8 tails are emitted as-is at EOS (no further bytes will arrive).
     ///
-    /// `honor_stops`: when false, a complete stop marker is discarded and
-    /// scanning continues. The filter does not latch `stopped`.
+    /// `honor_stops`: when false, a complete stop marker is kept as visible
+    /// text and scanning continues. The filter does not latch `stopped`.
+    /// `stops_suspended` still discards the marker (`min_tokens`).
     fn pump(&mut self, at_eos: bool, honor_stops: bool) -> Option<FilterAction> {
         const OPEN: &[u8] = b"<think>";
         const CLOSE: &[u8] = b"</think>";
@@ -366,10 +368,16 @@ impl EosFilter {
                     }
                     self.state.cursor = cursor + ev.at + ev.len;
                     match ev.kind {
-                        EventKind::Stop if self.stops_suspended || !honor_stops => {
-                            // `min_tokens`, or a caller holding the turn open:
-                            // drop the marker and keep scanning. `stopped`
-                            // stays clear.
+                        EventKind::Stop if self.stops_suspended => {
+                            // `min_tokens` not reached: the marker is not a
+                            // stop yet. Drop it and keep scanning.
+                            continue;
+                        }
+                        EventKind::Stop if !honor_stops => {
+                            // The caller is holding the turn open. The marker
+                            // is argument text, so it stays in the stream.
+                            let marker = self.state.raw[cursor + ev.at..self.state.cursor].to_vec();
+                            self.push_visible(&marker);
                             continue;
                         }
                         EventKind::Stop => {
@@ -871,12 +879,12 @@ mod tests {
     }
 
     #[test]
-    fn suppressing_stops_drops_the_marker_and_keeps_the_stream_open() {
+    fn suppressing_stops_keeps_the_marker_and_the_stream_open() {
         let mut f = EosFilter::new(cfg_qwen_ar(false));
         assert_eq!(f.observe(b"hi"), FilterAction::Emit(b"hi".to_vec()));
         assert_eq!(
             f.observe_suppressing_stops(b"<|im_end|>"),
-            FilterAction::Hold
+            FilterAction::Emit(b"<|im_end|>".to_vec())
         );
         assert_eq!(
             f.observe_suppressing_stops(b"more"),
@@ -890,7 +898,7 @@ mod tests {
         let mut f = EosFilter::new(cfg_qwen_ar(false));
         assert_eq!(
             f.observe_suppressing_stops(b"foo<|im_end|>bar"),
-            FilterAction::Emit(b"foobar".to_vec())
+            FilterAction::Emit(b"foo<|im_end|>bar".to_vec())
         );
     }
 
@@ -903,7 +911,7 @@ mod tests {
         );
         assert_eq!(
             f.observe_suppressing_stops(b"end|>bar"),
-            FilterAction::Emit(b"bar".to_vec())
+            FilterAction::Emit(b"<|im_end|>bar".to_vec())
         );
     }
 
