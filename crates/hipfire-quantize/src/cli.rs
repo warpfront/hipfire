@@ -62,10 +62,21 @@ pub(crate) struct QuantizeArgs {
     /// it selects its own route, so `--qwen4-flash-next` is not given.
     /// `--qwen4-component-mode compact-fixture` is the only other flag read;
     /// legacy recipe flags, `--format` and the other routes are refused.
-    #[arg(long, value_name = "RECIPE", value_parser = ["stock-fp8"],
+    /// `stock-fp8-mtp-sidecar` builds the `<model>.mtp` MTP head sidecar of
+    /// such an artifact from the same checkpoint: `--input <dir> --base
+    /// <model.hfq> [--base-sha256 HEX] [--output PATH]`; it reads no other flag.
+    #[arg(long, value_name = "RECIPE", value_parser = ["stock-fp8", "stock-fp8-mtp-sidecar"],
           conflicts_with_all = ["qwen4_flash_next", "flux_pipe", "mq4v2_final_codes",
                                 "mq3v2_final_codes", "mq2v2_final_codes", "reap_overlay"])]
     pub recipe: Option<String>,
+    /// `--recipe stock-fp8-mtp-sidecar` only: the stock-FP8 AR artifact the
+    /// sidecar extends.
+    #[arg(long, value_name = "MODEL_HFQ")]
+    pub base: Option<String>,
+    /// `--recipe stock-fp8-mtp-sidecar` only: refuse a base whose whole-file
+    /// SHA-256 is not this value (64 hex digits).
+    #[arg(long = "base-sha256", value_name = "HEX")]
+    pub base_sha256: Option<String>,
     /// Developer-only (build feature `qwen4-dev-profiles`): produce a COMPLETE
     /// tiny local Qwen4 checkpoint from a local safetensors directory whose
     /// config.json carries a `hipfire_profile` developer marker.
@@ -79,8 +90,9 @@ pub(crate) struct QuantizeArgs {
           value_parser = ["source-exact", "packed"])]
     pub qwen4_dev_tiny: Option<String>,
 
-    /// Destination HFQ file.
-    #[arg(long, value_name = "PATH")]
+    /// Destination HFQ file.  With `--recipe stock-fp8-mtp-sidecar` it
+    /// defaults to `<base file name>.mtp` beside the base.
+    #[arg(long, value_name = "PATH", required_unless_present = "base", default_value = "")]
     pub output: String,
 
     /// Quantization recipe or wire format.
@@ -427,6 +439,8 @@ pub(crate) enum Route {
     Qwen4,
     /// `--recipe stock-fp8` stock FP8 passthrough converter.
     Qwen4StockFp8,
+    /// `--recipe stock-fp8-mtp-sidecar` MTP head sidecar of a stock FP8 artifact.
+    Qwen4StockMtpSidecar,
     /// `--qwen4-dev-tiny` complete developer tiny checkpoint (feature-gated).
     #[cfg(feature = "qwen4-dev-profiles")]
     Qwen4DevTiny,
@@ -453,6 +467,7 @@ const EVERY: &[Route] = &[
     Flux,
     Qwen4,
     Qwen4StockFp8,
+    Qwen4StockMtpSidecar,
     FinalCodes,
     EarlySpecial,
     Gguf,
@@ -466,6 +481,7 @@ const EVERY: &[Route] = &[
     Flux,
     Qwen4,
     Qwen4StockFp8,
+    Qwen4StockMtpSidecar,
     Qwen4DevTiny,
     FinalCodes,
     EarlySpecial,
@@ -485,6 +501,7 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
         &[
             Qwen4,
             Qwen4StockFp8,
+            Qwen4StockMtpSidecar,
             FinalCodes,
             EarlySpecial,
             Gguf,
@@ -500,6 +517,7 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
         &[
             Qwen4,
             Qwen4StockFp8,
+            Qwen4StockMtpSidecar,
             Qwen4DevTiny,
             FinalCodes,
             EarlySpecial,
@@ -514,7 +532,9 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     ("threads", EVERY),
     ("qwen4_flash_next", &[Qwen4]),
     ("qwen4_component_mode", &[Qwen4, Qwen4StockFp8]),
-    ("recipe", &[Qwen4StockFp8]),
+    ("recipe", &[Qwen4StockFp8, Qwen4StockMtpSidecar]),
+    ("base", &[Qwen4StockMtpSidecar]),
+    ("base_sha256", &[Qwen4StockMtpSidecar]),
     #[cfg(feature = "qwen4-dev-profiles")]
     ("qwen4_dev_tiny", &[Qwen4DevTiny]),
     ("format", &[EarlySpecial, Gguf, Raon, Main]),
@@ -579,6 +599,7 @@ fn route_label(route: Route) -> &'static str {
         Flux => "--flux-pipe",
         Qwen4 => "--qwen4-flash-next",
         Qwen4StockFp8 => "--recipe stock-fp8",
+        Qwen4StockMtpSidecar => "--recipe stock-fp8-mtp-sidecar",
         #[cfg(feature = "qwen4-dev-profiles")]
         Qwen4DevTiny => "--qwen4-dev-tiny",
         FinalCodes => "--mq*v2-final-codes",
@@ -864,6 +885,64 @@ mod route_tests {
                 "i",
                 "--output",
                 "o"
+            ])
+            .is_err());
+    }
+
+    #[test]
+    fn stock_fp8_mtp_sidecar_route_reads_only_input_base_sha_and_output() {
+        let base = [
+            "--recipe",
+            "stock-fp8-mtp-sidecar",
+            "--input",
+            "i",
+            "--base",
+            "b.hfq",
+        ];
+        // --output is optional on this route (defaults beside the base).
+        reject_unreachable(&matches(&base), Qwen4StockMtpSidecar).unwrap();
+        let mut full = base.to_vec();
+        full.extend(["--base-sha256", "ab", "--output", "o"]);
+        reject_unreachable(&matches(&full), Qwen4StockMtpSidecar).unwrap();
+        for (flag, value) in [
+            ("--qwen4-component-mode", Some("compact-fixture")),
+            ("--format", Some("mq4")),
+            ("--imatrix", Some("x")),
+            ("--awq", None),
+        ] {
+            let mut argv = base.to_vec();
+            argv.push(flag);
+            argv.extend(value);
+            let err = reject_unreachable(&matches(&argv), Qwen4StockMtpSidecar).unwrap_err();
+            assert!(
+                err.starts_with(&format!("{flag} has no effect")),
+                "{flag}: {err}"
+            );
+        }
+        // --base and --base-sha256 belong to this route alone.
+        let argv = ["--recipe", "stock-fp8", "--input", "i", "--output", "o", "--base", "b"];
+        let err = reject_unreachable(&matches(&argv), Qwen4StockFp8).unwrap_err();
+        assert!(err.starts_with("--base has no effect"), "{err}");
+        let argv = [
+            "--recipe",
+            "stock-fp8",
+            "--input",
+            "i",
+            "--output",
+            "o",
+            "--base-sha256",
+            "ab",
+        ];
+        let err = reject_unreachable(&matches(&argv), Qwen4StockFp8).unwrap_err();
+        assert!(err.starts_with("--base-sha256 has no effect"), "{err}");
+        // Without --base, --output stays required.
+        assert!(QuantizeArgs::command()
+            .try_get_matches_from([
+                "hipfire-quantize",
+                "--recipe",
+                "stock-fp8-mtp-sidecar",
+                "--input",
+                "i"
             ])
             .is_err());
     }

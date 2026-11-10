@@ -595,8 +595,11 @@ pub enum AdmissionError {
     Fp8ExpertsUnsupported {
         gpu_arch: Option<String>,
     },
-    /// Native MTP requested for the AR-only stock-FP8 artifact.
+    /// Native MTP requested for the stock-FP8 artifact admitted without its head sidecar.
     ArOnlyArtifact,
+    /// Native MTP requested with the stock-FP8 head sidecar attached on gfx942, before the
+    /// exact-verify gate (M3a) removes this arm.
+    Fp8MtpVerifyPending,
     /// The stock-FP8 artifact is admitted fully resident on one device only
     /// (P1): no expert parallelism.
     Fp8SingleDeviceOnly(EffectiveMesh),
@@ -655,8 +658,14 @@ impl fmt::Display for AdmissionError {
             ),
             Self::ArOnlyArtifact => write!(
                 f,
-                "qwen4 admission: the stock-FP8 artifact is AR-only (it carries no MTP head); \
-                 native MTP (--spec mtp) cannot be admitted"
+                "qwen4 admission: the stock-FP8 artifact was admitted without its MTP head \
+                 sidecar (<model>.mtp); native MTP (--spec mtp) cannot be admitted"
+            ),
+            Self::Fp8MtpVerifyPending => write!(
+                f,
+                "qwen4 admission: native MTP on gfx942 has no proven exact verify rollback yet \
+                 (GDN row capture needs gfx11+ SIMT); the stock-FP8 MTP head loads for oracles \
+                 only; set speculation.mtp = off"
             ),
             Self::Fp8SingleDeviceOnly(mesh) => write!(
                 f,
@@ -692,7 +701,7 @@ impl Qwen4Admission {
     ) -> Result<Self, AdmissionError> {
         config.validate().map_err(AdmissionError::InvalidConfig)?;
         let stock_fp8 = request.artifact.quant_geometry.is_stock_fp8();
-        if stock_fp8 && !config.profile.is_ar_only() {
+        if stock_fp8 && !config.profile.is_stock_fp8() {
             return Err(AdmissionError::Fp8ProfileMismatch(
                 config.profile.id().to_string(),
             ));
@@ -729,6 +738,7 @@ impl Qwen4Admission {
                 request.effective_mesh,
                 request.native_mtp,
                 false,
+                config.profile == crate::config::Qwen4Profile::FlashNextStockMtp,
             )?;
         }
         request
@@ -781,6 +791,7 @@ fn check_fp8_device(
     mesh: EffectiveMesh,
     native_mtp: bool,
     host_mapped_experts: bool,
+    head_attached: bool,
 ) -> Result<(), AdmissionError> {
     if !capabilities.supports(Qwen4Capability::Fp8Experts) {
         return Err(AdmissionError::Fp8ExpertsUnsupported {
@@ -788,7 +799,11 @@ fn check_fp8_device(
         });
     }
     if native_mtp {
-        return Err(AdmissionError::ArOnlyArtifact);
+        return Err(if head_attached {
+            AdmissionError::Fp8MtpVerifyPending
+        } else {
+            AdmissionError::ArOnlyArtifact
+        });
     }
     if !mesh.is_single() {
         return Err(AdmissionError::Fp8SingleDeviceOnly(mesh));
@@ -811,6 +826,7 @@ pub fn admit_recipe_on_device(
     mesh: EffectiveMesh,
     native_mtp: bool,
     host_mapped_experts: bool,
+    head_attached: bool,
 ) -> Result<Qwen4Capabilities, AdmissionError> {
     let capabilities = if native_mtp {
         Qwen4Capabilities::text_mtp()
@@ -825,6 +841,7 @@ pub fn admit_recipe_on_device(
             mesh,
             native_mtp,
             host_mapped_experts,
+            head_attached,
         )?;
     }
     Ok(capabilities)
@@ -1948,31 +1965,60 @@ mod tests {
     fn recipe_device_admission_gates_stock_fp8() {
         let single = EffectiveMesh::single();
         let stock = Qwen4TierRecipe::StockFp8;
-        let caps = admit_recipe_on_device(&stock, "gfx942", single, false, false).unwrap();
+        let caps = admit_recipe_on_device(&stock, "gfx942", single, false, false, false).unwrap();
         assert!(caps.fp8_experts && caps.supports(Qwen4Capability::Fp8Experts));
         for arch in ["gfx1201", "gfx1151"] {
-            assert!(matches!(
-                admit_recipe_on_device(&stock, arch, single, false, false),
-                Err(AdmissionError::Fp8ExpertsUnsupported { .. })
-            ));
+            for head in [false, true] {
+                assert!(matches!(
+                    admit_recipe_on_device(&stock, arch, single, false, false, head),
+                    Err(AdmissionError::Fp8ExpertsUnsupported { .. })
+                ));
+                // Other archs refuse on the device before the MTP question (U6).
+                assert!(matches!(
+                    admit_recipe_on_device(&stock, arch, single, true, false, head),
+                    Err(AdmissionError::Fp8ExpertsUnsupported { .. })
+                ));
+            }
         }
+        // gfx942 without the head sidecar: R0.
+        let r0 = admit_recipe_on_device(&stock, "gfx942", single, true, false, false);
+        assert_eq!(r0, Err(AdmissionError::ArOnlyArtifact));
         assert_eq!(
-            admit_recipe_on_device(&stock, "gfx942", single, true, false),
-            Err(AdmissionError::ArOnlyArtifact)
+            r0.unwrap_err().to_string(),
+            "qwen4 admission: the stock-FP8 artifact was admitted without its MTP head sidecar \
+             (<model>.mtp); native MTP (--spec mtp) cannot be admitted"
         );
+        // gfx942 with the head attached: R4 until the exact-verify gate lands.
+        let r4 = admit_recipe_on_device(&stock, "gfx942", single, true, false, true);
+        assert_eq!(r4, Err(AdmissionError::Fp8MtpVerifyPending));
         assert_eq!(
-            admit_recipe_on_device(&stock, "gfx942", single, false, true),
+            r4.unwrap_err().to_string(),
+            "qwen4 admission: native MTP on gfx942 has no proven exact verify rollback yet \
+             (GDN row capture needs gfx11+ SIMT); the stock-FP8 MTP head loads for oracles \
+             only; set speculation.mtp = off"
+        );
+        // Head attached without native MTP requested is device-admitted.
+        assert!(admit_recipe_on_device(&stock, "gfx942", single, false, false, true).is_ok());
+        assert_eq!(
+            admit_recipe_on_device(&stock, "gfx942", single, false, true, false),
             Err(AdmissionError::Fp8HostMappedExperts)
         );
         assert!(matches!(
-            admit_recipe_on_device(&stock, "gfx942", EffectiveMesh::new(1, 1, 4), false, false),
+            admit_recipe_on_device(
+                &stock,
+                "gfx942",
+                EffectiveMesh::new(1, 1, 4),
+                false,
+                false,
+                false
+            ),
             Err(AdmissionError::Fp8SingleDeviceOnly(_))
         ));
         let packed = Qwen4TierRecipe::FlashNextPacked {
             trunk_tier: rdna_compute::DType::Q8_0,
             mtp_source: false,
         };
-        let caps = admit_recipe_on_device(&packed, "gfx1201", single, true, true).unwrap();
+        let caps = admit_recipe_on_device(&packed, "gfx1201", single, true, true, false).unwrap();
         assert!(!caps.fp8_experts && caps.native_mtp);
     }
 

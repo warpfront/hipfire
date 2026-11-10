@@ -999,6 +999,8 @@ pub(crate) fn route_for(args: &QuantizeArgs) -> crate::cli::Route {
         Route::Flux
     } else if args.qwen4_flash_next {
         Route::Qwen4
+    } else if args.recipe.as_deref() == Some("stock-fp8-mtp-sidecar") {
+        Route::Qwen4StockMtpSidecar
     } else if args.recipe.is_some() {
         Route::Qwen4StockFp8
     } else if args.raon_shared_ffn.is_some() || args.raon_shared_ffn_verify.is_some() {
@@ -1098,6 +1100,50 @@ pub(crate) fn run() {
             }
             Err(error) => {
                 eprintln!("error: qwen4 streaming pack: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // ── Stock FP8 MTP head sidecar (`--recipe stock-fp8-mtp-sidecar`) ───
+    // Production-only dedicated producer; `reject_unreachable` has already
+    // refused every flag it does not read.
+    if args.recipe.as_deref() == Some("stock-fp8-mtp-sidecar") {
+        let input = args
+            .input
+            .as_deref()
+            .expect("--input is required with --recipe stock-fp8-mtp-sidecar");
+        let Some(base) = args.base.as_deref() else {
+            eprintln!("error: --recipe stock-fp8-mtp-sidecar requires --base <model.hfq>");
+            std::process::exit(2);
+        };
+        let output = (!args.output.is_empty()).then(|| Path::new(&args.output));
+        match crate::qwen4::run_stock_fp8_mtp_sidecar_cli(
+            Path::new(input),
+            Path::new(base),
+            output,
+            args.base_sha256.as_deref(),
+        ) {
+            Ok(summary) => {
+                eprintln!(
+                    "stock-fp8-mtp-sidecar: wrote {} ({} entries: {} experts; \
+                     mtp fp8 tensors scanned={}; payload={} bytes; sidecar={} bytes sha256={}; \
+                     base sha256={}; receipt={}; {:.1}s)",
+                    summary.output.display(),
+                    summary.entries,
+                    summary.expert_entries,
+                    summary.mtp_fp8_scanned,
+                    summary.payload_bytes,
+                    summary.sidecar_bytes,
+                    summary.sidecar_sha256,
+                    summary.base_sha256,
+                    summary.receipt_path.display(),
+                    summary.elapsed_seconds
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("error: stock-fp8-mtp-sidecar: {error}");
                 std::process::exit(2);
             }
         }

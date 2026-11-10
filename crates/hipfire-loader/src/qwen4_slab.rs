@@ -245,6 +245,26 @@ pub(crate) fn qwen4_fulfillment_payload<'a>(
     Ok(SourcePayload::Borrowed { info, bytes })
 }
 
+/// [`qwen4_fulfillment_payload`] over the stock-FP8 two-file source: with a head sidecar
+/// attached the rule is total, `mtp.*` is served `Borrowed` from the sidecar (never a
+/// range: a second backing file would fail the direct reader's identity check) and
+/// everything else from the base. Without a sidecar every name is the base's, exactly
+/// as before (a packed artifact holds its own `mtp.*` records).
+pub(crate) fn qwen4_routed_payload<'a>(
+    base: &'a HfqModelSource,
+    mtp: Option<&'a HfqModelSource>,
+    recipe: &Qwen4TierRecipe,
+    entry: &WeightEntry,
+    use_range: bool,
+) -> Result<SourcePayload<'a>, String> {
+    match mtp {
+        Some(sidecar) if entry.name.starts_with("mtp.") => {
+            qwen4_fulfillment_payload(sidecar, recipe, entry, false)
+        }
+        _ => qwen4_fulfillment_payload(base, recipe, entry, use_range),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,6 +484,94 @@ mod tests {
             .expect_err("a packed recipe has no arenas");
         assert_eq!(error, format!("missing resident tensor '{}'", host.name));
         cleanup(&path);
+    }
+
+    /// U8: with a head sidecar attached `mtp.*` is served `Borrowed` from the sidecar
+    /// (even when the caller asks for ranges), everything else from the base, and every
+    /// record resolves through the two-file view.
+    #[test]
+    fn payload_routes_mtp_names_to_the_sidecar_and_the_rest_to_the_base() {
+        use hipfire_arch_qwen4::stock_mtp_sidecar::Qwen4StockSources;
+        let dir = std::env::temp_dir()
+            .join(format!("hipfire-qwen4-mtp-route-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base_path = dir.join("base.hfq");
+        let mtp_path = dir.join("base.hfq.mtp");
+        let mem = |name: &str, data: Vec<u8>| HfqMemTensor {
+            name: name.into(),
+            quant_type: 1,
+            shape: vec![data.len() as u32],
+            group_size: 0,
+            data,
+        };
+        write_hfqm_package_mem(
+            &base_path,
+            16,
+            "{}",
+            &[mem("model.embed_tokens.weight", vec![1; 16])],
+        )
+        .unwrap();
+        write_hfqm_package_mem(
+            &mtp_path,
+            16,
+            "{}",
+            &[
+                mem("mtp.fc_embedding.weight", vec![2; 16]),
+                mem("mtp.layers.0.mlp.experts.down_proj", vec![3; 32]),
+            ],
+        )
+        .unwrap();
+        let base_hfq = HfqFile::open_at_offset(&base_path, 0).unwrap();
+        let mtp_hfq = HfqFile::open_at_offset(&mtp_path, 0).unwrap();
+        let names = [
+            "model.embed_tokens.weight",
+            "mtp.fc_embedding.weight",
+            "mtp.layers.0.mlp.experts.down_proj",
+        ];
+        let sources = Qwen4StockSources {
+            base: &base_hfq,
+            mtp: Some(&mtp_hfq),
+        };
+        for name in names {
+            assert!(sources.find_tensor_info(name).is_some(), "{name} resolves");
+        }
+        assert_eq!(
+            sources
+                .find_tensor_info("mtp.layers.0.mlp.experts.down_proj")
+                .map(|info| info.data_size),
+            Some(32)
+        );
+        let base = HfqModelSource::from_hfq(base_hfq);
+        let mut sidecar = HfqModelSource::from_hfq(mtp_hfq);
+        sidecar.set_prefer_ranges(false);
+        let recipe = Qwen4TierRecipe::StockFp8;
+        for (name, fill, len) in [
+            ("model.embed_tokens.weight", 1u8, 16usize),
+            ("mtp.fc_embedding.weight", 2, 16),
+            ("mtp.layers.0.mlp.experts.down_proj", 3, 32),
+        ] {
+            let entry = ordinary_entry(name, None);
+            match qwen4_routed_payload(&base, Some(&sidecar), &recipe, &entry, false) {
+                Ok(SourcePayload::Borrowed { bytes, .. }) => {
+                    assert_eq!(bytes, vec![fill; len].as_slice(), "{name}")
+                }
+                other => panic!("{name} must borrow, got {:?}", other.map(|_| ())),
+            }
+        }
+        // The sidecar is never asked for a range, whatever the caller wants.
+        let mtp_entry = ordinary_entry("mtp.fc_embedding.weight", None);
+        assert!(matches!(
+            qwen4_routed_payload(&base, Some(&sidecar), &recipe, &mtp_entry, true),
+            Ok(SourcePayload::Borrowed { .. })
+        ));
+        // Without a sidecar `mtp.*` is the base's (and missing there).
+        assert_eq!(
+            qwen4_routed_payload(&base, None, &recipe, &mtp_entry, false).map(|_| ()),
+            Err("missing resident tensor 'mtp.fc_embedding.weight'".to_string())
+        );
+        let _ = std::fs::remove_file(&base_path);
+        let _ = std::fs::remove_file(&mtp_path);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     /// A tiny 8-expert source holding layer 3's two aggregate stacks, and the

@@ -38,6 +38,7 @@ pub(crate) use dev_tiny::{run_dev_tiny_cli, Qwen4DevTinyEncoding};
 
 mod stock_fp8;
 pub(crate) use stock_fp8::run_stock_fp8_cli;
+pub(crate) use stock_fp8::run_stock_fp8_mtp_sidecar_cli;
 
 /// SoA row geometry: `16 + ((n_blocks + 15) >> 4) << 4 + n_blocks * 16`, with
 /// `n_blocks = k / 32`.  Returned as `(row_stride, extent)`; the padded scale

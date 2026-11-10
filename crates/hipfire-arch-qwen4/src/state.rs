@@ -334,7 +334,7 @@ fn validate_gdn_session_tag(
 }
 
 fn validate_gdn_profile(config: &Qwen4Config, format: GdnStateFormat) -> Result<(), StateError> {
-    if config.profile.is_ar_only() && format.has_residual() {
+    if config.profile.is_stock_fp8() && format.has_residual() {
         return Err(StateError::Config(
             "qwen4: stock-FP8 pins F32 GDN state; q8_ef is refused".into(),
         ));
@@ -863,7 +863,7 @@ fn resolve_qsa_format_for_arch(
 /// `q8` is refused.
 pub fn resolve_gdn_format(request: &str, config: &Qwen4Config) -> Result<GdnStateFormat, String> {
     let request = request.trim().to_ascii_lowercase();
-    if config.profile.is_ar_only() {
+    if config.profile.is_stock_fp8() {
         return match request.as_str() {
             "" | "auto" | "fp32" | "f32" => Ok(GdnStateFormat::F32),
             "q8" | "int8" | "q8_ef" => Err(format!(
@@ -915,7 +915,7 @@ fn resolve_gdn_format_for_arch(
     let auto = matches!(request.trim().to_ascii_lowercase().as_str(), "" | "auto");
     if auto
         && arch == "gfx1151"
-        && !config.profile.is_ar_only()
+        && !config.profile.is_stock_fp8()
         && GdnStateFormat::Q8.supports(config.linear_key_head_dim, config.linear_value_head_dim)
     {
         return Ok(GdnStateFormat::F32);
@@ -5167,6 +5167,36 @@ mod tests {
         let error = validate_gdn_profile(&stock, GdnStateFormat::Q8Ef).unwrap_err();
         assert!(error.to_string().contains("stock-FP8") && error.to_string().contains("q8_ef"));
         assert!(validate_gdn_profile(&stock, GdnStateFormat::F32).is_ok());
+    }
+
+    /// U3: the headed stock-FP8 profile keeps the F32 GDN pin and the q8 refusals.
+    #[test]
+    fn stock_mtp_profile_pins_f32_gdn_state_too() {
+        let stock = crate::config::compact_test_config()
+            .into_stock_mtp()
+            .unwrap();
+        for request in ["", "auto", " AUTO ", "fp32", "f32"] {
+            assert_eq!(
+                resolve_gdn_format(request, &stock).unwrap(),
+                GdnStateFormat::F32,
+                "{request:?}"
+            );
+        }
+        for request in ["q8", "Q8", "int8"] {
+            let error = resolve_gdn_format(request, &stock).unwrap_err();
+            assert!(
+                error.contains("stock-FP8") && error.contains("F32"),
+                "{error}"
+            );
+        }
+        assert!(resolve_gdn_format("bf16", &stock).is_err());
+        for arch in ["gfx1151", "gfx942", "gfx1201"] {
+            assert_eq!(
+                resolve_gdn_format_for_arch("auto", &stock, arch, false),
+                Ok(GdnStateFormat::F32),
+                "{arch}"
+            );
+        }
     }
 
     /// The AR-only (stock-FP8) profile pins the F32 GDN recurrent state:
