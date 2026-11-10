@@ -2203,7 +2203,7 @@ fn execute_hyper_read_inner(
                 op.rows,
                 op.input_mix_down.k,
             );
-            if let Some(device) = gpu.try_gfx942() {
+            if let Some(mut device) = gpu.try_gfx942() {
                 g942_act_folded = hip(device.qwen4_hc_down_act_rows16(
                     &op.input_mix_down.buf.buf,
                     &normalized,
