@@ -225,7 +225,12 @@ const TILE_PICKS: &[(usize, usize, usize, &[(usize, Option<LaneWmmaTile>)])] = &
             (usize::MAX, Some(tile(64, 128, 4, 2))),
         ],
     ),
-    (1, 2560, 2, &[(278, None), (usize::MAX, Some(tile_g4(16, 32, 1, 1)))]),
+    (
+        1,
+        2560,
+        2,
+        &[(278, None), (usize::MAX, Some(tile_g4(16, 32, 1, 1)))],
+    ),
 ];
 
 /// The tile configuration [`lane_wmma_tile_gemm`] runs for `(m, k, rows, terms)`: the tuned table
@@ -330,8 +335,11 @@ pub fn lane_wmma_tile_gemm(
     hc_act: Option<f32>,
     split_k: usize,
 ) -> HipResult<LaneWmmaLaunch> {
-    let t = lane_wmma_tile_pick(m, k, rows, terms)
-        .ok_or_else(|| err(format!("tile: no tuned tile for m {m} k {k} rows {rows} terms {terms}")))?;
+    let t = lane_wmma_tile_pick(m, k, rows, terms).ok_or_else(|| {
+        err(format!(
+            "tile: no tuned tile for m {m} k {k} rows {rows} terms {terms}"
+        ))
+    })?;
     lane_wmma_tile_gemm_cfg(gpu, w, x, y, m, k, rows, terms, hc_act, split_k, t)
 }
 
@@ -433,13 +441,31 @@ mod tests {
         assert!(lane_wmma_tile_pick(320, 10240, 596, 1).is_some());
         // The trunk-sharded shared expert and the selector: tiled in the wave, the shipped kernel
         // where it is as fast.
-        assert_eq!(lane_wmma_tile_pick(384, 2560, 1050, 2), Some(tile(32, 64, 2, 2)));
-        assert_eq!(lane_wmma_tile_pick(384, 2560, 1192, 2), Some(tile(64, 128, 4, 2)));
-        assert_eq!(lane_wmma_tile_pick(256, 2560, 1050, 2), Some(tile(32, 64, 2, 2)));
+        assert_eq!(
+            lane_wmma_tile_pick(384, 2560, 1050, 2),
+            Some(tile(32, 64, 2, 2))
+        );
+        assert_eq!(
+            lane_wmma_tile_pick(384, 2560, 1192, 2),
+            Some(tile(64, 128, 4, 2))
+        );
+        assert_eq!(
+            lane_wmma_tile_pick(256, 2560, 1050, 2),
+            Some(tile(32, 64, 2, 2))
+        );
         assert_eq!(lane_wmma_tile_pick(256, 2560, 149, 2), None);
-        assert_eq!(lane_wmma_tile_pick(2560, 384, 1050, 2), Some(tile(64, 128, 4, 2)));
-        assert_eq!(lane_wmma_tile_pick(2560, 256, 149, 2), Some(tile(32, 64, 2, 2)));
-        assert_eq!(lane_wmma_tile_pick(1, 2560, 1050, 2), Some(tile_g4(16, 32, 1, 1)));
+        assert_eq!(
+            lane_wmma_tile_pick(2560, 384, 1050, 2),
+            Some(tile(64, 128, 4, 2))
+        );
+        assert_eq!(
+            lane_wmma_tile_pick(2560, 256, 149, 2),
+            Some(tile(32, 64, 2, 2))
+        );
+        assert_eq!(
+            lane_wmma_tile_pick(1, 2560, 1050, 2),
+            Some(tile_g4(16, 32, 1, 1))
+        );
         assert_eq!(lane_wmma_tile_pick(1, 2560, 256, 2), None);
     }
 }
