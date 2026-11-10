@@ -117,6 +117,21 @@ pub const CASES: &[Q4Case] = &[
         timeout_s: 90,
         run: fp8_shared_activation_case,
     },
+    Q4Case {
+        name: "qwen4_g942_fold_moe_scatter_desc",
+        timeout_s: 240,
+        run: g942_fold_scatter_desc_case,
+    },
+    Q4Case {
+        name: "qwen4_g942_fold_moe_unscatter_act",
+        timeout_s: 240,
+        run: g942_fold_unscatter_act_case,
+    },
+    Q4Case {
+        name: "qwen4_g942_fold_moe_combine_shared_add",
+        timeout_s: 240,
+        run: g942_fold_combine_shared_add_case,
+    },
 ];
 
 /// `MOE_GROUPED_BLOCK_M` (`hipfire-dispatch/src/families/moe.rs:31`).
@@ -1761,6 +1776,277 @@ fn fp8_shared_activation_case(gpu: &mut Gpu) -> Result<String, String> {
             &got_sel,
             &want_sel,
         ));
+    }
+    all(results)
+}
+
+// ── C1 gfx942 stock-FP8 MoE glue folds (`HIPFIRE_QWEN4_G942_FOLD_MOE`) ───────────────────────
+//
+// Each fold is compared on the device against the unfused launch sequence it replaces, byte for
+// byte (NaN-sentinel / -2 sentinel filled outputs, so an unwritten word fails too):
+//   qwen4_g942_moe_group_scatter_desc  vs  Gpu::moe_scatter_stable_top10 + fp8b128_moe_tile_desc_pad16
+//   qwen4_g942_moe_unscatter_act       vs  fp8b128_moe_unscatter_silu + fp8b128_moe_shared_activation
+//   qwen4_g942_moe_combine_shared_add  vs  moe_down_combine_grouped_top10 + bf16_scaled_add_batched
+
+/// Token counts spanning the decode, verify, lane and chunk-boundary classes (rows * 10 slots: the
+/// scatter fold holds up to 1024 slots; 26 and 102 straddle the 256-slot chunk edges).
+const G942_FOLD_ROWS: [usize; 12] = [1, 2, 3, 7, 8, 16, 25, 26, 33, 64, 101, 102];
+
+fn g942_unrouted(rng: &mut Rng, topk: &mut [i32]) {
+    for entry in topk.iter_mut() {
+        match rng.below(12) {
+            0 => *entry = -1,
+            1 => *entry = E as i32 + 3,
+            _ => {}
+        }
+    }
+}
+
+fn check_g942_scatter_desc(gpu: &mut Gpu, label: &str, topk: &[i32]) -> Result<String, String> {
+    let slots = topk.len();
+    let grouped_rows = grouped_rows_bound(slots);
+    let n_tiles = grouped_rows / BLOCK_M;
+    let t_topk = ints(gpu, topk)?;
+    let mut sets = Vec::new();
+    for _ in 0..2 {
+        sets.push([
+            int_sentinel(gpu, E)?,
+            int_sentinel(gpu, E + 1)?,
+            int_sentinel(gpu, grouped_rows)?,
+            int_sentinel(gpu, n_tiles)?,
+            int_sentinel(gpu, slots)?,
+            int_sentinel(gpu, n_tiles * 4)?,
+        ]);
+    }
+    let fused = sets.pop().ok_or("missing fused set")?;
+    let unfused = sets.pop().ok_or("missing unfused set")?;
+    gpu.moe_scatter_stable_top10(
+        &t_topk,
+        &unfused[0],
+        &unfused[1],
+        &unfused[2],
+        &unfused[3],
+        &unfused[4],
+        slots,
+        E,
+        grouped_rows,
+    )
+    .map_err(e)?;
+    {
+        let mut dev = gpu.try_gfx942().ok_or("not gfx942")?;
+        dev.fp8b128_moe_tile_desc_pad16(&unfused[3], &unfused[5], n_tiles)
+            .map_err(e)?;
+        dev.g942_fold_moe_group_scatter_desc(
+            &t_topk, &fused[0], &fused[1], &fused[2], &fused[3], &fused[4], &fused[5], slots, E,
+            grouped_rows,
+        )
+        .map_err(e)?;
+    }
+    sync(gpu)?;
+    let names = ["counts", "offsets", "sorted", "tile_ids", "inverse_perm", "tile_desc"];
+    let mut results = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let want = down_i32(gpu, &unfused[i])?;
+        let got = down_i32(gpu, &fused[i])?;
+        results.push(exact_ints(&format!("{label} {name}"), &got, &want));
+    }
+    let mut free = vec![t_topk];
+    free.extend(unfused);
+    free.extend(fused);
+    free_all(gpu, free)?;
+    all(results)
+}
+
+fn g942_fold_scatter_desc_case(gpu: &mut Gpu) -> Result<String, String> {
+    if gpu.try_gfx942().is_none() {
+        return Ok("skipped: not gfx942".to_string());
+    }
+    let mut rng = Rng::new(0x4D0E_0021);
+    let mut results = Vec::new();
+    for &rows in &G942_FOLD_ROWS {
+        for (spread, name) in [
+            (Spread::Uniform, "uniform"),
+            (Spread::Skewed, "skewed"),
+            (Spread::Few, "few-experts"),
+            (Spread::Identical, "identical"),
+        ] {
+            let mut topk = make_topk(&mut rng, rows, spread);
+            results.push(check_g942_scatter_desc(
+                gpu,
+                &format!("rows={rows} {name}"),
+                &topk,
+            ));
+            g942_unrouted(&mut rng, &mut topk);
+            results.push(check_g942_scatter_desc(
+                gpu,
+                &format!("rows={rows} {name} +unrouted ids"),
+                &topk,
+            ));
+        }
+    }
+    // The fold is one workgroup: more than 1024 slots (103 rows) is outside its capacity and
+    // must be refused by the admission predicate (the dispatch then keeps the unfused chain).
+    let dev = gpu.try_gfx942().ok_or("not gfx942")?;
+    let admitted_edge = dev.g942_fold_moe_scatter_admitted(1020, E, grouped_rows_bound(1020));
+    let admitted_over = dev.g942_fold_moe_scatter_admitted(1030, E, grouped_rows_bound(1030));
+    results.push(if admitted_edge && !admitted_over {
+        Ok("admission: 1020 slots yes, 1030 slots no".to_string())
+    } else {
+        Err(format!(
+            "admission: 1020 slots -> {admitted_edge}, 1030 slots -> {admitted_over}"
+        ))
+    });
+    all(results)
+}
+
+fn g942_fold_unscatter_act_case(gpu: &mut Gpu) -> Result<String, String> {
+    if gpu.try_gfx942().is_none() {
+        return Ok("skipped: not gfx942".to_string());
+    }
+    let mut rng = Rng::new(0x4D0E_0022);
+    let mut results = Vec::new();
+    for &rows in G942_FOLD_ROWS.iter().chain(&[128usize, 1536]) {
+        for &sh_mi in &[768usize, 770] {
+            let slots = rows * K;
+            let topk = make_topk(
+                &mut rng,
+                rows,
+                if rows < 16 {
+                    Spread::Uniform
+                } else {
+                    Spread::Skewed
+                },
+            );
+            let lay = scatter_ref(&topk);
+            let n_sorted = lay.offsets[E] as usize;
+            let mut sorted_v: Vec<i32> = lay.sorted[..n_sorted].to_vec();
+            for entry in sorted_v.iter_mut() {
+                if *entry >= 0 {
+                    match rng.below(10) {
+                        0 => *entry = -1,
+                        1 => *entry = (slots + 3) as i32,
+                        _ => {}
+                    }
+                }
+            }
+            let y = stress_vals(&mut rng, n_sorted * 2 * MI);
+            let gate = stress_vals(&mut rng, rows * sh_mi);
+            let up = stress_vals(&mut rng, rows * sh_mi);
+            let sel = stress_vals(&mut rng, rows);
+            let t_y = up_f32(gpu, &y)?;
+            let t_sorted = ints(gpu, &sorted_v)?;
+            let (t_g, t_u) = (up_f32(gpu, &gate)?, up_f32(gpu, &up)?);
+            let t_act_u = sentinel_f32(gpu, slots * MI)?;
+            let t_act_f = sentinel_f32(gpu, slots * MI)?;
+            let t_sact_u = sentinel_f32(gpu, rows * sh_mi)?;
+            let t_sact_f = sentinel_f32(gpu, rows * sh_mi)?;
+            let t_sel_u = up_f32(gpu, &sel)?;
+            let t_sel_f = up_f32(gpu, &sel)?;
+            {
+                let mut dev = gpu.try_gfx942().ok_or("not gfx942")?;
+                dev.fp8b128_moe_unscatter_silu(&t_y, &t_sorted, &t_act_u, MI, n_sorted, slots)
+                    .map_err(e)?;
+                dev.fp8b128_moe_shared_activation(&t_g, &t_u, &t_sact_u, &t_sel_u, rows, sh_mi)
+                    .map_err(e)?;
+                dev.g942_fold_moe_unscatter_act(
+                    &t_y, &t_sorted, &t_act_f, MI, n_sorted, slots, &t_g, &t_u, &t_sact_f,
+                    &t_sel_f, rows, sh_mi,
+                )
+                .map_err(e)?;
+            }
+            sync(gpu)?;
+            let label = format!("rows={rows} G={n_sorted} shared_mi={sh_mi}");
+            for (name, unfused, fused) in [
+                ("routed activation", &t_act_u, &t_act_f),
+                ("shared activation", &t_sact_u, &t_sact_f),
+                ("selector", &t_sel_u, &t_sel_f),
+            ] {
+                let want = down_f32(gpu, unfused)?;
+                let got = down_f32(gpu, fused)?;
+                results.push(exact_f32(&format!("{label} {name}"), &got, &want));
+            }
+            free_all(
+                gpu,
+                vec![
+                    t_y, t_sorted, t_g, t_u, t_act_u, t_act_f, t_sact_u, t_sact_f, t_sel_u,
+                    t_sel_f,
+                ],
+            )?;
+        }
+    }
+    all(results)
+}
+
+fn g942_fold_combine_shared_add_case(gpu: &mut Gpu) -> Result<String, String> {
+    if gpu.try_gfx942().is_none() {
+        return Ok("skipped: not gfx942".to_string());
+    }
+    let mut rng = Rng::new(0x4D0E_0023);
+    let mut results = Vec::new();
+    for &rows in G942_FOLD_ROWS.iter().chain(&[128usize]) {
+        let topk = make_topk(&mut rng, rows, Spread::Skewed);
+        let lay = scatter_ref(&topk);
+        let w = route_weights(&mut rng, rows);
+        let grouped = stress_vals(&mut rng, lay.m_total_max * HIDDEN);
+        let residual = stress_vals(&mut rng, rows * HIDDEN);
+        let shared = stress_vals(&mut rng, rows * HIDDEN);
+        let sel = stress_vals(&mut rng, rows);
+        let t_grouped = up_f32(gpu, &grouped)?;
+        let t_inv = ints(gpu, &lay.inverse)?;
+        let t_ids = ints(gpu, &topk)?;
+        let t_w = up_f32(gpu, &w)?;
+        let t_res_u = up_f32(gpu, &residual)?;
+        let t_res_f = up_f32(gpu, &residual)?;
+        let t_shared = up_f32(gpu, &shared)?;
+        let t_sel = up_f32(gpu, &sel)?;
+        gpu.moe_down_combine_grouped_top10(
+            &t_grouped,
+            &t_inv,
+            &t_ids,
+            &t_w,
+            &t_res_u,
+            HIDDEN,
+            lay.m_total_max,
+            rows,
+            E,
+        )
+        .map_err(e)?;
+        rdna_compute::tensor_ops::bf16_scaled_add_batched(
+            gpu,
+            &rdna_compute::tensor_ops::Bf16ScaledAddBatched {
+                residual: &t_res_u,
+                value: &t_shared,
+                scalar: &t_sel,
+                rows,
+                elements: HIDDEN,
+            },
+        )
+        .map_err(e)?;
+        {
+            let mut dev = gpu.try_gfx942().ok_or("not gfx942")?;
+            dev.g942_fold_moe_combine_shared_add(
+                &t_grouped,
+                &t_inv,
+                &t_ids,
+                &t_w,
+                &t_res_f,
+                &t_shared,
+                &t_sel,
+                HIDDEN,
+                lay.m_total_max,
+                rows,
+                E,
+            )
+            .map_err(e)?;
+        }
+        sync(gpu)?;
+        let want = down_f32(gpu, &t_res_u)?;
+        let got = down_f32(gpu, &t_res_f)?;
+        results.push(exact_f32(&format!("rows={rows} target"), &got, &want));
+        free_all(
+            gpu,
+            vec![t_grouped, t_inv, t_ids, t_w, t_res_u, t_res_f, t_shared, t_sel],
+        )?;
     }
     all(results)
 }

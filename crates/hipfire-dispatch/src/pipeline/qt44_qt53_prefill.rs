@@ -4113,6 +4113,29 @@ fn fp8_scatter(
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     let plan = fp8_validate(gpu, p, grouped_rows)?;
+    // C1 fold 1 (`HIPFIRE_QWEN4_G942_FOLD_MOE`): the whole grouping and the tile descriptors in
+    // one single-workgroup launch, for the slot counts it holds.
+    let fold = gpu.try_gfx942().is_some_and(|device| {
+        device.g942_fold_moe_enabled()
+            && device.g942_fold_moe_scatter_admitted(plan.slots, p.n_exp, plan.grouped_rows)
+    });
+    if fold {
+        return hip(gpu
+            .try_gfx942()
+            .ok_or_else(fp8_not_gfx942)?
+            .g942_fold_moe_group_scatter_desc(
+                p.topk_indices,
+                p.expert_token_counts,
+                p.expert_offsets,
+                p.sorted_slot_index,
+                p.expert_tile_ids,
+                p.inverse_perm,
+                p.gate_batch,
+                plan.slots,
+                p.n_exp,
+                plan.grouped_rows,
+            ));
+    }
     hip(gpu.moe_scatter_stable_top10(
         p.topk_indices,
         p.expert_token_counts,
@@ -4241,6 +4264,113 @@ fn fp8_combine(
         hip(gpu.bf16_round_trip_f32(&f32_view(target, 0, plan.rows * p.down_m)))?;
     }
     Ok(())
+}
+
+// ───────────── C1 gfx942 stock-FP8 MoE glue folds (`HIPFIRE_QWEN4_G942_FOLD_MOE`) ─────────────
+//
+// Seven launches of the sealed qt=55 grouped route become two plus a combine that carries the
+// shared add (each fold bitwise the unfused sequence it replaces, `qwen4_g942_glue_moe.hip`):
+// * fold 1, inside [`fp8_scatter`]: ranks + prefix + scatter + tile descriptors;
+// * fold 2, [`g942_fold_unscatter_act`]: the shared activation (deferred by the
+//   `SharedActivation` stage, which has no reader before the shared down) rides the routed
+//   unscatter-SiLU launch;
+// * fold 3, [`g942_fold_combine_preflight`] + [`g942_fold_shared_down_combine`]: the `Combine`
+//   stage defers to the `SharedDown` stage, which runs the shared down GEMM and then ONE launch
+//   that combines the ten routed rows and applies the shared scaled add.
+
+/// Whether this call's stock-FP8 route takes the C1 folds 2 and 3 on this device.
+pub(crate) fn g942_fold_applies(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> bool {
+    is_fp8(p)
+        && gpu
+            .try_gfx942()
+            .is_some_and(|device| device.g942_fold_moe_enabled())
+}
+
+/// Fold 2: `fp8_unscatter` with the shared activation (and the in-place selector sigmoid) in
+/// the same launch.  The caller deferred [`fp8_shared_activation`] to here.
+pub(crate) fn g942_fold_unscatter_act(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    grouped_rows: usize,
+) -> Result<(), DispatchError> {
+    let plan = fp8_validate(gpu, p, grouped_rows)?;
+    let shared = fp8_shared(p)?;
+    let live = p.batch_size * shared.intermediate;
+    let (gate, up, rotated) = (
+        f32_view(shared.gate_out, 0, live),
+        f32_view(shared.up_out, 0, live),
+        f32_view(shared.rotated, 0, live),
+    );
+    hip(gpu
+        .try_gfx942()
+        .ok_or_else(fp8_not_gfx942)?
+        .g942_fold_moe_unscatter_act(
+            p.y_gate_up_grouped,
+            p.sorted_slot_index,
+            p.rot_batch,
+            p.mi,
+            plan.grouped_rows,
+            plan.slots,
+            &gate,
+            &up,
+            &rotated,
+            shared.scalar,
+            p.batch_size,
+            shared.intermediate,
+        ))
+}
+
+/// Fold 3, the `Combine` stage's half: [`fp8_combine`]'s refusals and preflight with no launch.
+/// The launch happens in [`g942_fold_shared_down_combine`].
+pub(crate) fn g942_fold_combine_preflight(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    grouped_rows: usize,
+) -> Result<(), DispatchError> {
+    super::combine_leaf(super::CombineArm::Fp8Grouped, reduction_partition(p))?;
+    if !p.recipe.shared_after_combine() || p.prelude.shared.is_none() {
+        return Err(fp8_refuse(
+            "the folded combine carries the shared add: it needs a shared expert after the combine",
+        ));
+    }
+    fp8_validate(gpu, p, grouped_rows).map(drop)
+}
+
+/// Fold 3, the `SharedDown` stage's half: the unfused shared down GEMM into the F32 rows of
+/// `shared_down_out` (else `down_expanded`), then the combine of the ten routed rows with the
+/// scaled add of those rows as its epilogue, in one launch.  Bitwise [`fp8_combine`] followed by
+/// [`fp8_shared_down`]'s `bf16_scaled_add_batched`: the GEMM reads `shared.rotated` and writes
+/// rows nothing else reads, so running it before the combine changes no operand.
+pub(crate) fn g942_fold_shared_down_combine(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+) -> Result<(), DispatchError> {
+    let plan = fp8_validate(gpu, p, p.m_total_max)?;
+    let shared = fp8_shared(p)?;
+    let down = &shared.weights.down;
+    let target = p.routed_out.unwrap_or(p.x_batch);
+    let out = f32_view(
+        p.shared_down_out.unwrap_or(p.down_expanded),
+        0,
+        p.batch_size * p.down_m,
+    );
+    super::project_weight(gpu, down, shared.rotated, &out, p.batch_size, None)?;
+    hip(gpu
+        .try_gfx942()
+        .ok_or_else(fp8_not_gfx942)?
+        .g942_fold_moe_combine_shared_add(
+            p.y_down_grouped,
+            p.inverse_perm,
+            p.topk_indices,
+            p.topk_weights,
+            target,
+            &out,
+            shared.scalar,
+            p.down_m,
+            plan.grouped_rows,
+            plan.rows,
+            p.n_exp,
+        ))
 }
 
 // ───────────── S1 slow-link layer-major prefill hooks (`slowlink_prefill`) ─────────────

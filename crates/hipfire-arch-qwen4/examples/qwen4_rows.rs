@@ -197,8 +197,20 @@ fn main() -> Result<(), String> {
                     .iter()
                     .zip(&single_logits)
                     .all(|(a, b)| a.to_bits() == b.to_bits());
+                // FNV-1a over the raw logits bits of each route: lets two builds / two env
+                // settings (e.g. a fold on vs off) be compared byte for byte across processes.
+                let fnv = |v: &[f32]| {
+                    v.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, x| {
+                        x.to_bits()
+                            .to_le_bytes()
+                            .iter()
+                            .fold(h, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3))
+                    })
+                };
                 println!(
-                    "rows {rows}: chunk vs singles max|diff| {diff:.3e} argmax agree {agree}/{rows} bitwise {exact}"
+                    "rows {rows}: chunk vs singles max|diff| {diff:.3e} argmax agree {agree}/{rows} bitwise {exact} chunk_fnv {:016x} singles_fnv {:016x}",
+                    fnv(&chunk_logits),
+                    fnv(&single_logits)
                 );
             }
         }

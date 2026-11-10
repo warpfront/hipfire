@@ -94,6 +94,23 @@ const FP8B128_MOE_UNSCATTER_SILU_KERNEL: &str = "fp8b128_moe_unscatter_silu_gfx9
 const FP8B128_MOE_SHARED_ACTIVATION_SRC: &str =
     include_str!("../../../../kernels/src/fp8b128_moe_shared_activation.gfx942.hip");
 const FP8B128_MOE_SHARED_ACTIVATION_KERNEL: &str = "fp8b128_moe_shared_activation_gfx942";
+/// C1 stock-FP8 MoE glue folds (`HIPFIRE_QWEN4_G942_FOLD_MOE`): one source, three entries.
+const QWEN4_G942_GLUE_MOE_SRC: &str =
+    include_str!("../../../../kernels/src/qwen4_g942_glue_moe.hip");
+const QWEN4_G942_GLUE_MOE_MODULE: &str = "qwen4_g942_glue_moe";
+const QWEN4_G942_MOE_GROUP_SCATTER_DESC: &str = "qwen4_g942_moe_group_scatter_desc";
+const QWEN4_G942_MOE_UNSCATTER_ACT: &str = "qwen4_g942_moe_unscatter_act";
+const QWEN4_G942_MOE_COMBINE_SHARED_ADD: &str = "qwen4_g942_moe_combine_shared_add";
+/// Capacity of the single-workgroup scatter fold (`G942_FOLD_MAXL` / `G942_FOLD_MAXE` in the
+/// kernel source): flat slots (four 256-slot chunks) and experts.
+pub const G942_FOLD_MOE_MAX_SLOTS: usize = 1024;
+pub const G942_FOLD_MOE_MAX_EXPERTS: usize = 1024;
+
+/// One stderr line per process the first time a fold launches: the proof, in a served or benched
+/// run's log, that the lever ran (lessons-0.4.5 §4.7).
+fn g942_fold_note(once: &std::sync::Once, what: &'static str) {
+    once.call_once(|| eprintln!("[g942-fold-moe] {what} active (HIPFIRE_QWEN4_G942_FOLD_MOE)"));
+}
 
 /// A mutable GPU borrow proven to target exact gfx942.
 ///
@@ -1866,6 +1883,472 @@ impl Gpu {
         }
         result?;
         Ok(true)
+    }
+}
+
+impl Gfx942Device<'_> {
+    /// `HIPFIRE_QWEN4_G942_FOLD_MOE` (default off until the Route-A twin is sealed): whether the
+    /// stock-FP8 MoE glue folds are selected for this device.
+    pub fn g942_fold_moe_enabled(&self) -> bool {
+        self.gpu.flags.qwen4_g942_fold_moe_enabled()
+    }
+
+    /// Whether [`Self::g942_fold_moe_group_scatter_desc`] covers this grouping: the fold is one
+    /// workgroup, so it holds at most [`G942_FOLD_MOE_MAX_SLOTS`] flat slots and
+    /// [`G942_FOLD_MOE_MAX_EXPERTS`] experts.
+    pub fn g942_fold_moe_scatter_admitted(
+        &self,
+        total_slots: usize,
+        experts: usize,
+        grouped_rows: usize,
+    ) -> bool {
+        total_slots > 0
+            && total_slots <= G942_FOLD_MOE_MAX_SLOTS
+            && experts > 0
+            && experts <= G942_FOLD_MOE_MAX_EXPERTS
+            && grouped_rows % 16 == 0
+            && grouped_rows >= total_slots
+            && i32::try_from(grouped_rows).is_ok()
+    }
+
+    /// Stable pad16 grouping plus the FP8 tile descriptors in ONE launch: bitwise
+    /// `Gpu::moe_scatter_stable_top10` (`qwen4_moe_group_ranks`, `_prefix`, `_scatter`) followed by
+    /// [`Self::fp8b128_moe_tile_desc_pad16`] over the tile ids it wrote.
+    ///
+    /// ```text
+    /// qwen4_g942_moe_group_scatter_desc(
+    ///     topk:      i32 [slots]            routed expert per flat slot
+    ///     counts:    i32 [experts]          pad16 counts
+    ///     offsets:   i32 [experts + 1]      pad16 exclusive offsets
+    ///     sorted:    i32 [grouped_rows]     flat slot per grouped row, -1 padding
+    ///     tiles:     i32 [grouped_rows/16]  expert per tile, -1 tail
+    ///     inverse:   i32 [slots]            grouped row per flat slot, -1 unrouted
+    ///     tile_desc: [grouped_rows/16, 4] i32 `{tile_id, 16 t, 16, 0}`
+    ///     slots, experts, grouped_rows)
+    /// ```
+    ///
+    /// One workgroup of 1024 threads; the grouping scratch lives in LDS. Refused outside
+    /// [`Self::g942_fold_moe_scatter_admitted`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn g942_fold_moe_group_scatter_desc(
+        &mut self,
+        topk: &GpuTensor,
+        counts: &GpuTensor,
+        offsets: &GpuTensor,
+        sorted: &GpuTensor,
+        tiles: &GpuTensor,
+        inverse: &GpuTensor,
+        tile_desc: &GpuTensor,
+        total_slots: usize,
+        experts: usize,
+        grouped_rows: usize,
+    ) -> HipResult<()> {
+        const WHAT: &str = "qwen4_g942_moe_group_scatter_desc";
+        if !self.g942_fold_moe_scatter_admitted(total_slots, experts, grouped_rows) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{WHAT}: need 0 < slots <= {G942_FOLD_MOE_MAX_SLOTS}, 0 < experts <= \
+                     {G942_FOLD_MOE_MAX_EXPERTS}, grouped_rows >= slots and a multiple of 16 \
+                     (slots={total_slots} experts={experts} grouped_rows={grouped_rows})"
+                ),
+            ));
+        }
+        let n_tiles = grouped_rows / 16;
+        crate::moe::require_span(topk, &[total_slots, 4], "qwen4_g942_moe_group_scatter_desc topk")?;
+        crate::moe::require_span(counts, &[experts, 4], "qwen4_g942_moe_group_scatter_desc counts")?;
+        crate::moe::require_span(
+            offsets,
+            &[experts + 1, 4],
+            "qwen4_g942_moe_group_scatter_desc offsets",
+        )?;
+        crate::moe::require_span(
+            sorted,
+            &[grouped_rows, 4],
+            "qwen4_g942_moe_group_scatter_desc sorted",
+        )?;
+        crate::moe::require_span(tiles, &[n_tiles, 4], "qwen4_g942_moe_group_scatter_desc tiles")?;
+        crate::moe::require_span(
+            inverse,
+            &[total_slots, 4],
+            "qwen4_g942_moe_group_scatter_desc inverse",
+        )?;
+        crate::moe::require_span(
+            tile_desc,
+            &[n_tiles, 16],
+            "qwen4_g942_moe_group_scatter_desc tile_desc",
+        )?;
+        self.gpu.bind_thread()?;
+        self.gpu.ensure_kernel(
+            QWEN4_G942_GLUE_MOE_MODULE,
+            QWEN4_G942_GLUE_MOE_SRC,
+            QWEN4_G942_MOE_GROUP_SCATTER_DESC,
+        )?;
+        static NOTE: std::sync::Once = std::sync::Once::new();
+        g942_fold_note(&NOTE, "fold 1 (ranks + prefix + scatter + tile descriptors)");
+        let tp = topk.buf.as_ptr();
+        let cp = counts.buf.as_ptr();
+        let op = offsets.buf.as_ptr();
+        let sp = sorted.buf.as_ptr();
+        let tip = tiles.buf.as_ptr();
+        let ip = inverse.buf.as_ptr();
+        let dp = tile_desc.buf.as_ptr();
+        let (lv, ev, pv) = (total_slots as i32, experts as i32, grouped_rows as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &tp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &tip as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &lv as *const _ as *mut c_void,
+            &ev as *const _ as *mut c_void,
+            &pv as *const _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(
+            &self.gpu.hip,
+            "elementwise",
+            QWEN4_G942_MOE_GROUP_SCATTER_DESC,
+            (3 * total_slots + 2 * experts + grouped_rows + 5 * n_tiles) * 4,
+        );
+        let result = self.gpu.launch_maybe_blob(
+            QWEN4_G942_MOE_GROUP_SCATTER_DESC,
+            [1, 1, 1],
+            [1024, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(tp);
+                blob.push_ptr(cp);
+                blob.push_ptr(op);
+                blob.push_ptr(sp);
+                blob.push_ptr(tip);
+                blob.push_ptr(ip);
+                blob.push_ptr(dp);
+                blob.push_i32(lv);
+                blob.push_i32(ev);
+                blob.push_i32(pv);
+                blob
+            },
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.gpu.hip);
+        }
+        result
+    }
+
+    /// The routed SwiGLU unscatter and the shared expert's activation in ONE launch: bitwise
+    /// [`Self::fp8b128_moe_unscatter_silu`] followed by [`Self::fp8b128_moe_shared_activation`]
+    /// (the two touch disjoint buffers).
+    ///
+    /// ```text
+    /// qwen4_g942_moe_unscatter_act(
+    ///     gate_up, sorted, activation, mi, n_sorted, slots      (fp8b128_moe_unscatter_silu)
+    ///     shared_gate, shared_up, shared_act, selector, rows, shared_mi
+    ///                                                           (fp8b128_moe_shared_activation)
+    /// )
+    /// ```
+    ///
+    /// Grid `[n_sorted + ceil(ceil(rows*shared_mi/256) / ceil(mi/256)), ceil(mi/256)]`, block 256.
+    #[allow(clippy::too_many_arguments)]
+    pub fn g942_fold_moe_unscatter_act(
+        &mut self,
+        gate_up: &GpuTensor,
+        sorted: &GpuTensor,
+        activation: &GpuTensor,
+        mi: usize,
+        n_sorted: usize,
+        slots: usize,
+        shared_gate: &GpuTensor,
+        shared_up: &GpuTensor,
+        shared_act: &GpuTensor,
+        selector: &GpuTensor,
+        rows: usize,
+        shared_mi: usize,
+    ) -> HipResult<()> {
+        const WHAT: &str = "qwen4_g942_moe_unscatter_act";
+        let refuse = |msg: String| Err(hip_bridge::HipError::new(0, &msg));
+        let max_dim = i32::MAX as usize;
+        if mi > max_dim
+            || n_sorted > max_dim
+            || slots > max_dim
+            || rows > max_dim
+            || shared_mi > max_dim
+        {
+            return refuse(format!("{WHAT}: scalar dimension exceeds i32::MAX"));
+        }
+        let Some(shared_n) = rows.checked_mul(shared_mi) else {
+            return refuse(format!("{WHAT}: rows*shared_mi overflows"));
+        };
+        let grid_y = mi.div_ceil(256);
+        if grid_y == 0 || grid_y > u16::MAX as usize {
+            return refuse(format!("{WHAT}: mi={mi} needs grid.y={grid_y} (1..={})", u16::MAX));
+        }
+        let act_blocks = shared_n.div_ceil(256);
+        let grid_x = n_sorted + act_blocks.div_ceil(grid_y);
+        if grid_x > i32::MAX as usize || act_blocks > i32::MAX as usize {
+            return refuse(format!("{WHAT}: grid.x={grid_x} exceeds i32::MAX"));
+        }
+        for (name, t) in [
+            ("gate_up", gate_up),
+            ("activation", activation),
+            ("shared_gate", shared_gate),
+            ("shared_up", shared_up),
+            ("shared_act", shared_act),
+            ("selector", selector),
+        ] {
+            if t.dtype != DType::F32 {
+                return refuse(format!("{WHAT}: {name} must be F32 (got {:?})", t.dtype));
+            }
+        }
+        // `sorted` is i32 data; the sealed route carries the stable scatter's index scratch as
+        // `DType::Raw`, so accept a 4-byte dtype or Raw (the byte-span check bounds the read).
+        if !(sorted.dtype.size() == 4 || sorted.dtype == DType::Raw) {
+            return refuse(format!("{WHAT}: sorted needs a 4-byte dtype (got {:?})", sorted.dtype));
+        }
+        crate::moe::require_span(gate_up, &[n_sorted, 2, mi, 4], "qwen4_g942_moe_unscatter_act gate_up")?;
+        crate::moe::require_span(sorted, &[n_sorted, 4], "qwen4_g942_moe_unscatter_act sorted")?;
+        crate::moe::require_span(activation, &[slots, mi, 4], "qwen4_g942_moe_unscatter_act activation")?;
+        crate::moe::require_span(shared_gate, &[rows, shared_mi, 4], "qwen4_g942_moe_unscatter_act shared gate")?;
+        crate::moe::require_span(shared_up, &[rows, shared_mi, 4], "qwen4_g942_moe_unscatter_act shared up")?;
+        crate::moe::require_span(shared_act, &[rows, shared_mi, 4], "qwen4_g942_moe_unscatter_act shared activation")?;
+        crate::moe::require_span(selector, &[rows, 4], "qwen4_g942_moe_unscatter_act selector")?;
+        let (yp, sp, ap) = (gate_up.buf.as_ptr(), sorted.buf.as_ptr(), activation.buf.as_ptr());
+        let (gp, up_p, hp, lp) = (
+            shared_gate.buf.as_ptr(),
+            shared_up.buf.as_ptr(),
+            shared_act.buf.as_ptr(),
+            selector.buf.as_ptr(),
+        );
+        let all = [yp, sp, ap, gp, up_p, hp, lp];
+        if all.iter().enumerate().any(|(i, a)| all[..i].contains(a)) {
+            return refuse(format!(
+                "{WHAT}: gate_up, sorted, activation and the four shared buffers must be distinct"
+            ));
+        }
+        if mi == 0 || n_sorted == 0 || slots == 0 {
+            return refuse(format!(
+                "{WHAT}: empty routed extent (mi={mi} n_sorted={n_sorted} slots={slots})"
+            ));
+        }
+        self.gpu.bind_thread()?;
+        self.gpu.ensure_kernel(
+            QWEN4_G942_GLUE_MOE_MODULE,
+            QWEN4_G942_GLUE_MOE_SRC,
+            QWEN4_G942_MOE_UNSCATTER_ACT,
+        )?;
+        static NOTE: std::sync::Once = std::sync::Once::new();
+        g942_fold_note(&NOTE, "fold 2 (unscatter-silu + shared activation)");
+        let (miv, nv, sv) = (mi as i32, n_sorted as i32, slots as i32);
+        let (rv, smv, abv) = (rows as i32, shared_mi as i32, act_blocks as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &yp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &miv as *const _ as *mut c_void,
+            &nv as *const _ as *mut c_void,
+            &sv as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &up_p as *const _ as *mut c_void,
+            &hp as *const _ as *mut c_void,
+            &lp as *const _ as *mut c_void,
+            &rv as *const _ as *mut c_void,
+            &smv as *const _ as *mut c_void,
+            &abv as *const _ as *mut c_void,
+        ];
+        let bytes = n_sorted
+            .saturating_mul(mi)
+            .saturating_mul(12)
+            .saturating_add(shared_n.saturating_mul(12));
+        let timer = crate::profile::begin_timer(
+            &self.gpu.hip,
+            "elementwise",
+            QWEN4_G942_MOE_UNSCATTER_ACT,
+            bytes,
+        );
+        let result = self.gpu.launch_maybe_blob(
+            QWEN4_G942_MOE_UNSCATTER_ACT,
+            [grid_x as u32, grid_y as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(yp);
+                blob.push_ptr(sp);
+                blob.push_ptr(ap);
+                blob.push_i32(miv);
+                blob.push_i32(nv);
+                blob.push_i32(sv);
+                blob.push_ptr(gp);
+                blob.push_ptr(up_p);
+                blob.push_ptr(hp);
+                blob.push_ptr(lp);
+                blob.push_i32(rv);
+                blob.push_i32(smv);
+                blob.push_i32(abv);
+                blob
+            },
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.gpu.hip);
+        }
+        result
+    }
+
+    /// `Gpu::moe_down_combine_grouped_top10` with the shared expert's `bf16_scaled_add_batched`
+    /// as its epilogue, in ONE launch: bitwise the combine into `residual` followed by
+    /// `residual += sigmoid-selector * shared_out` (`bf16_scaled_add_batched_f32`).
+    ///
+    /// `shared_out` is the shared down's F32 rows `[tokens, hidden]`, `selector` the in-place
+    /// selector the shared activation left (`[tokens]`). Grid `[ceil(hidden/256), tokens]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn g942_fold_moe_combine_shared_add(
+        &mut self,
+        grouped_down: &GpuTensor,
+        inverse_perm: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        residual: &GpuTensor,
+        shared_out: &GpuTensor,
+        selector: &GpuTensor,
+        hidden: usize,
+        grouped_rows: usize,
+        tokens: usize,
+        n_experts: usize,
+    ) -> HipResult<()> {
+        const WHAT: &str = "qwen4_g942_moe_combine_shared_add";
+        let refuse = |msg: String| Err(hip_bridge::HipError::new(0, &msg));
+        if tokens == 0
+            || hidden == 0
+            || grouped_rows > i32::MAX as usize
+            || hidden > i32::MAX as usize
+            || tokens > u16::MAX as usize
+            || n_experts > i32::MAX as usize
+        {
+            return refuse(format!(
+                "{WHAT}: bad extent (hidden={hidden} grouped_rows={grouped_rows} tokens={tokens})"
+            ));
+        }
+        for (name, t) in [
+            ("grouped_down", grouped_down),
+            ("residual", residual),
+            ("shared_out", shared_out),
+            ("selector", selector),
+            ("topk_weights", topk_weights),
+        ] {
+            if t.dtype != DType::F32 {
+                return refuse(format!("{WHAT}: {name} must be F32 (got {:?})", t.dtype));
+            }
+        }
+        crate::moe::require_span(
+            grouped_down,
+            &[grouped_rows, hidden, 4],
+            "qwen4_g942_moe_combine_shared_add grouped rows",
+        )?;
+        crate::moe::require_span(
+            inverse_perm,
+            &[tokens, 10, 4],
+            "qwen4_g942_moe_combine_shared_add inverse permutation",
+        )?;
+        crate::moe::require_span(
+            topk_indices,
+            &[tokens, 10, 4],
+            "qwen4_g942_moe_combine_shared_add topk indices",
+        )?;
+        crate::moe::require_span(
+            topk_weights,
+            &[tokens, 10, 4],
+            "qwen4_g942_moe_combine_shared_add topk weights",
+        )?;
+        crate::moe::require_span(
+            residual,
+            &[tokens, hidden, 4],
+            "qwen4_g942_moe_combine_shared_add target",
+        )?;
+        crate::moe::require_span(
+            shared_out,
+            &[tokens, hidden, 4],
+            "qwen4_g942_moe_combine_shared_add shared rows",
+        )?;
+        crate::moe::require_span(selector, &[tokens, 4], "qwen4_g942_moe_combine_shared_add selector")?;
+        let (gp, ip, tp, wp, rp, hp, sp) = (
+            grouped_down.buf.as_ptr(),
+            inverse_perm.buf.as_ptr(),
+            topk_indices.buf.as_ptr(),
+            topk_weights.buf.as_ptr(),
+            residual.buf.as_ptr(),
+            shared_out.buf.as_ptr(),
+            selector.buf.as_ptr(),
+        );
+        // `residual` is read and written in place; nothing else may alias it (the kernel reads
+        // `shared_out` and `selector` per element after the combine).
+        if [gp, ip, tp, wp, hp, sp].contains(&rp) {
+            return refuse(format!("{WHAT}: the target must not alias another operand"));
+        }
+        self.gpu.bind_thread()?;
+        self.gpu.ensure_kernel(
+            QWEN4_G942_GLUE_MOE_MODULE,
+            QWEN4_G942_GLUE_MOE_SRC,
+            QWEN4_G942_MOE_COMBINE_SHARED_ADD,
+        )?;
+        static NOTE: std::sync::Once = std::sync::Once::new();
+        g942_fold_note(&NOTE, "fold 3 (combine + shared add)");
+        let (hv, gr, tv, nx) = (
+            hidden as i32,
+            grouped_rows as i32,
+            tokens as i32,
+            n_experts as i32,
+        );
+        let mut params: Vec<*mut c_void> = vec![
+            &gp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &hv as *const _ as *mut c_void,
+            &gr as *const _ as *mut c_void,
+            &tv as *const _ as *mut c_void,
+            &nx as *const _ as *mut c_void,
+            &hp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+        ];
+        let grid_x = (hidden as u32).div_ceil(256);
+        let bytes = (grouped_rows * hidden + 3 * tokens * 10 + 3 * tokens * hidden) * 4;
+        let timer = crate::profile::begin_timer(
+            &self.gpu.hip,
+            "elementwise",
+            QWEN4_G942_MOE_COMBINE_SHARED_ADD,
+            bytes,
+        );
+        let result = self.gpu.launch_maybe_blob(
+            QWEN4_G942_MOE_COMBINE_SHARED_ADD,
+            [grid_x, tokens as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(gp);
+                blob.push_ptr(ip);
+                blob.push_ptr(tp);
+                blob.push_ptr(wp);
+                blob.push_ptr(rp);
+                blob.push_i32(hv);
+                blob.push_i32(gr);
+                blob.push_i32(tv);
+                blob.push_i32(nx);
+                blob.push_ptr(hp);
+                blob.push_ptr(sp);
+                blob
+            },
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.gpu.hip);
+        }
+        result
     }
 }
 

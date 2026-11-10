@@ -417,6 +417,16 @@ pub(super) struct MoeStepState<'a> {
     /// wide-verify chain's owner-masked tile ids; the gate/up stage takes this (and clears it) and
     /// does not launch `ep_tile_mask`.
     tile_mask_written: Cell<bool>,
+    /// C1 (`HIPFIRE_QWEN4_G942_FOLD_MOE`): the call runs its whole lowered program through
+    /// [`execute`] / [`execute_after_clear`], so a fold that defers work to a later stage always
+    /// reaches that stage (direct stage entries and the S1 prepare leave this false).
+    g942_fold_allowed: Cell<bool>,
+    /// The lowering is the plain grouped tail with the shared down after the combine.
+    g942_plain_tail: Cell<bool>,
+    /// The `SharedActivation` stage deferred its launch to the `Unscatter` stage (fold 2).
+    g942_act_deferred: Cell<bool>,
+    /// The `Combine` stage deferred its launch to the `SharedDown` stage (fold 3).
+    g942_combine_deferred: Cell<bool>,
 }
 
 /// A call abandoned between `Combine` (which queued the CP wait) and `JoinSplit`
@@ -505,6 +515,10 @@ impl<'a> MoeStepState<'a> {
             route_scatter_allowed: Cell::new(false),
             route_scatter_done: Cell::new(false),
             tile_mask_written: Cell::new(false),
+            g942_fold_allowed: Cell::new(false),
+            g942_plain_tail: Cell::new(false),
+            g942_act_deferred: Cell::new(false),
+            g942_combine_deferred: Cell::new(false),
         }
     }
 
@@ -556,6 +570,12 @@ impl<'a> MoeStepState<'a> {
         if self.combine_deferred.get() {
             return Err(DispatchError::Hip(
                 "sealed moe: the combine was deferred to the shared down but its launch never ran"
+                    .into(),
+            ));
+        }
+        if self.g942_combine_deferred.get() || self.g942_act_deferred.get() {
+            return Err(DispatchError::Hip(
+                "sealed moe: a gfx942 MoE glue fold was deferred to a later stage that never ran it"
                     .into(),
             ));
         }
@@ -1654,6 +1674,15 @@ impl<'a> SealedMoeOp<'a> {
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
         {
+            // C1 fold 2 (`HIPFIRE_QWEN4_G942_FOLD_MOE`): nothing reads the shared activation
+            // before the shared down, so the plain tail launches it with the routed unscatter.
+            if self.state.g942_fold_allowed.get()
+                && self.state.g942_plain_tail.get()
+                && super::qt44_qt53_prefill::g942_fold_applies(gpu, params)
+            {
+                self.state.g942_act_deferred.set(true);
+                return Ok(());
+            }
             return super::qt44_qt53_prefill::shared_activation(
                 gpu,
                 params,
@@ -1713,6 +1742,11 @@ impl<'a> SealedMoeOp<'a> {
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
         {
+            // C1 fold 3: the combine stage deferred to this launch (shared down GEMM, then one
+            // launch that combines the routed rows and applies the shared scaled add).
+            if self.state.g942_combine_deferred.replace(false) {
+                return super::qt44_qt53_prefill::g942_fold_shared_down_combine(gpu, params);
+            }
             // `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE`: this call's combine was deferred by the
             // combine stage; the one launch does combine, shared-down rows and shared fold.
             if self.state.combine_deferred.replace(false) {
@@ -1857,6 +1891,15 @@ impl<'a> SealedMoeOp<'a> {
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
         {
+            // C1 fold 2: the shared activation the `SharedActivation` stage deferred rides this
+            // launch.
+            if self.state.g942_act_deferred.replace(false) {
+                return super::qt44_qt53_prefill::g942_fold_unscatter_act(
+                    gpu,
+                    params,
+                    selection.path2_m_total,
+                );
+            }
             return super::qt44_qt53_prefill::unscatter(gpu, params, selection.path2_m_total);
         }
         if matches!(
@@ -2065,6 +2108,24 @@ impl<'a> SealedMoeOp<'a> {
                     selection.uses_grouped_rows(),
                     selection.path2_m_total,
                 );
+            }
+            // C1 fold 3 (`HIPFIRE_QWEN4_G942_FOLD_MOE`): the stock-FP8 combine defers to the
+            // shared down stage, whose one launch combines and applies the shared scaled add.
+            // Only the plain tail with no HC write offered and no absorbed fill (the folded
+            // launch reads and writes the target in place, like the unfused combine).
+            if self.state.g942_fold_allowed.get()
+                && self.state.g942_plain_tail.get()
+                && self.state.hc_write.borrow().is_none()
+                && !self.state.initial_zero.get()
+                && super::qt44_qt53_prefill::g942_fold_applies(gpu, params)
+            {
+                super::qt44_qt53_prefill::g942_fold_combine_preflight(
+                    gpu,
+                    params,
+                    selection.path2_m_total,
+                )?;
+                self.state.g942_combine_deferred.set(true);
+                return Ok(());
             }
             // The row fold combines inside its own kernel; only the rank order
             // is owed here, and the absorbed target fill is not (the shared
@@ -2974,6 +3035,16 @@ fn lower_prefill<'a>(
             }
             return Ok(steps);
         }
+        // C1 (`HIPFIRE_QWEN4_G942_FOLD_MOE`): this lowering is the plain grouped tail (no CPU
+        // split or deferral, which returned above) with the shared down after the combine, the
+        // only shape in which `SharedActivation` may ride the unscatter launch and `Combine`
+        // may defer to `SharedDown`.
+        state.g942_plain_tail.set(
+            params.recipe.shared_after_combine()
+                && selection.uses_grouped_rows()
+                && params.ep_row_gather.is_none()
+                && params.ep_tile_exchange.is_none(),
+        );
         if selection.uses_grouped_rows() {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Scatter))?;
         }
@@ -3108,6 +3179,7 @@ pub(super) fn execute(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<(), Dis
     let state = MoeStepState::new(call);
     state.front_allowed.set(true);
     state.epilogue_fuse_allowed.set(true);
+    state.g942_fold_allowed.set(true);
     let steps = match call.protocol() {
         MoeProtocol::IndexedDecode => lower_decode(&state)?,
         MoeProtocol::GroupedPrefill => lower_prefill(&state)?,
@@ -3387,6 +3459,7 @@ pub(super) fn execute_after_clear(
     let state = MoeStepState::new(call);
     state.front_allowed.set(true);
     state.epilogue_fuse_allowed.set(true);
+    state.g942_fold_allowed.set(true);
     if let Some(write) = hc {
         let mut offered = super::qt44_qt53_prefill::HcSharedDown::offer(write);
         if let (Some(offered), Some((read, next_write))) = (offered.as_mut(), next) {
