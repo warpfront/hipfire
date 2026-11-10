@@ -208,7 +208,8 @@ pub struct FeatureFlags {
     /// shared add. Exact gfx942 only (see [`FeatureFlags::qwen4_g942_fold_moe_enabled`]).
     pub qwen4_g942_fold_moe: bool,
     /// Multi-lane fn-lanes GDN decode core (`HIPFIRE_QWEN4_GDN_LANES`), default
-    /// on for gfx1151 and gfx1201 (`=0` kills it), off elsewhere.
+    /// on for gfx1151 and gfx1201 (`=0` kills it), opt-in (`=1`) on exact gfx942
+    /// (the batched F32 recurrence `qwen4_gdn_lanes_step_f32_gfx942`), off elsewhere.
     pub qwen4_gdn_lanes: bool,
     /// Multi-lane fn-lanes QSA decode core (`HIPFIRE_QWEN4_QSA_LANES`), default
     /// on for exact gfx1201 (`=0` kills it), off elsewhere.
@@ -2123,9 +2124,10 @@ impl FeatureFlags {
     /// Wave-per-token E512/top-10 router for batched prefill
     /// (`HIPFIRE_QWEN4_ROUTER_FAST`). Exact gfx1151 / gfx1201.
     /// Multi-lane fn-lanes GDN decode core (`HIPFIRE_QWEN4_GDN_LANES`). Exact
-    /// gfx1151 and exact gfx1201 (both default on, `=0` kills it).
+    /// gfx1151 and exact gfx1201 (both default on, `=0` kills it) and exact gfx942
+    /// (default off, `=1` opts in).
     pub fn qwen4_gdn_lanes_enabled(&self) -> bool {
-        self.qwen4_gdn_lanes && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
+        self.qwen4_gdn_lanes && matches!(self.arch.as_str(), "gfx1151" | "gfx1201" | "gfx942")
     }
 
     /// Multi-lane fn-lanes GDN verify-rows core (`HIPFIRE_QWEN4_GDN_LANES_ROWS`).
@@ -6253,8 +6255,8 @@ mod tests {
     }
 
     /// `HIPFIRE_QWEN4_GDN_LANES`: exact gfx1151 and exact gfx1201 default on,
-    /// `=0` kills it everywhere, and no other arch ever enables
-    /// it, whatever the value.
+    /// exact gfx942 default off (`=1` opts in), `=0` kills it everywhere, and no
+    /// other arch ever enables it, whatever the value.
     #[test]
     fn gdn_lanes_default_and_override_by_arch() {
         let flags = |arch: &str, value: Option<&str>| {
@@ -6267,7 +6269,7 @@ mod tests {
             ("gfx1151", true, true, false),
             ("gfx1201", true, true, false),
             ("gfx1100", false, false, false),
-            ("gfx942", false, false, false),
+            ("gfx942", false, true, false),
             ("gfx1200", false, false, false),
             ("gfx1201:xnack-", false, false, false),
         ] {

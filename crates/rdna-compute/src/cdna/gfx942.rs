@@ -134,6 +134,65 @@ fn g942_fold_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
         _ => gpu.ensure_kernel(QWEN4_G942_GLUE_MOE_MODULE, QWEN4_G942_GLUE_MOE_SRC, func),
     }
 }
+const QWEN4_GDN_LANES_F32_SRC: &str =
+    include_str!("../../../../kernels/src/qwen4_gdn_lanes_f32.gfx942.hip");
+const QWEN4_GDN_LANES_F32_KERNEL: &str = "qwen4_gdn_lanes_step_f32_gfx942";
+/// Most lanes one [`Gfx942Device::qwen4_gdn_lanes_step_f32`] launch covers (grid.y;
+/// `serve.continuous_batch_size` tops out at 256).
+pub const QWEN4_GDN_LANES_F32_MAX: usize = 256;
+/// Lane tables the cache keeps before it is dropped whole (one table per layer and
+/// lane set: 36 layers x about a hundred distinct lane sets).
+const GDN_LANES_TABLE_CACHE_MAX: usize = 4096;
+
+/// One lane of the device lane table: the five pointers of one lane's recurrence
+/// (`struct Qwen4GdnLaneDesc` in `kernels/src/qwen4_gdn_lanes_f32.gfx942.hip`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Qwen4GdnLaneDesc {
+    projection: u64,
+    gate: u64,
+    beta: u64,
+    state: u64,
+    output: u64,
+}
+const _: () = assert!(std::mem::size_of::<Qwen4GdnLaneDesc>() == 40);
+
+/// `[rows, key_heads, value_heads]` and the lane descriptors a cached table was built from.
+type GdnLanesTableKey = ([usize; 3], Vec<Qwen4GdnLaneDesc>);
+
+/// Device lane tables of [`Gfx942Device::qwen4_gdn_lanes_step_f32`], keyed by content (shape
+/// and every lane's five pointers): a table is a pure function of its key, so a hit is always
+/// current and a lane set that changes simply misses once per layer. Each entry keeps its host
+/// bytes until the table is dropped, so its stream-ordered upload never races the source.
+#[derive(Default)]
+pub(crate) struct GdnLanesTableCache {
+    tables: std::collections::HashMap<GdnLanesTableKey, (hip_bridge::DeviceBuffer, Vec<u8>)>,
+}
+
+/// One lane of a [`Gfx942Device::qwen4_gdn_lanes_step_f32`] launch: the tensors the
+/// per-lane `gated_delta_step_batched` launch of that lane names.
+pub struct Qwen4GdnLanesF32Lane<'a> {
+    /// F32 `[rows, qkv_width]` convolution output (q | k | v per row).
+    pub projection: &'a GpuTensor,
+    /// F32 `[rows, value_heads]` decay gate.
+    pub gate: &'a GpuTensor,
+    /// F32 `[rows, value_heads]` beta.
+    pub beta: &'a GpuTensor,
+    /// F32 `[value_heads, 128, 128]` recurrent state, read then updated in place.
+    pub state: &'a GpuTensor,
+    /// F32 `[rows, value_heads * 128]` recurrent output.
+    pub output: &'a GpuTensor,
+}
+
+/// Shape shared by every lane of one [`Gfx942Device::qwen4_gdn_lanes_step_f32`] launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen4GdnLanesF32Shape {
+    pub rows: usize,
+    pub key_heads: usize,
+    pub value_heads: usize,
+    pub key_dim: usize,
+    pub value_dim: usize,
+}
 
 /// A mutable GPU borrow proven to target exact gfx942.
 ///
@@ -1550,6 +1609,222 @@ impl Gfx942Device<'_> {
         }
         result
     }
+
+    /// The one-row (or few-row) F32 GDN recurrence of up to
+    /// [`QWEN4_GDN_LANES_F32_MAX`] lanes in ONE launch
+    /// (`qwen4_gdn_lanes_step_f32_gfx942`, grid `[value_heads, lanes]`, block 128).
+    ///
+    /// Lane `i` runs `gated_delta_step_pipe128_f32`'s body (the kernel
+    /// `gated_delta_step_batched` launches for an F32 state on gfx942) on lane `i`'s
+    /// own tensors, so its state and output bytes equal that lane's per-lane launch.
+    /// The lanes' pointers ride in a device lane table, built once per distinct lane set
+    /// and layer and reused until the set changes (the cache is keyed by content).
+    ///
+    /// Refused (`Err`, nothing launched) unless every tensor is F32 with exactly the
+    /// extent the singleton launch validates, the shape is the exact 128 x 128 GDN one,
+    /// no lane's written range (state, output) overlaps another lane's written range or
+    /// any lane's read range (projection, gate, beta), and, during hipGraph capture, the
+    /// table is already cached.
+    pub fn qwen4_gdn_lanes_step_f32(
+        &mut self,
+        lanes: &[Qwen4GdnLanesF32Lane<'_>],
+        shape: Qwen4GdnLanesF32Shape,
+    ) -> HipResult<()> {
+        const WHAT: &str = "qwen4_gdn_lanes_step_f32";
+        let refuse = |msg: String| Err(hip_bridge::HipError::new(0, &msg));
+        let Qwen4GdnLanesF32Shape {
+            rows,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+        } = shape;
+        if lanes.is_empty() || lanes.len() > QWEN4_GDN_LANES_F32_MAX {
+            return refuse(format!(
+                "{WHAT}: {} lanes (1..={QWEN4_GDN_LANES_F32_MAX})",
+                lanes.len()
+            ));
+        }
+        if rows == 0
+            || key_heads == 0
+            || value_heads == 0
+            || value_heads % key_heads != 0
+            || key_dim != 128
+            || value_dim != 128
+        {
+            return refuse(format!(
+                "{WHAT}: needs the exact 128x128 GDN shape (rows={rows} key_heads={key_heads} \
+                 value_heads={value_heads} key_dim={key_dim} value_dim={value_dim})"
+            ));
+        }
+        let qk = key_heads * 128;
+        let value = value_heads * 128;
+        let qkv = 2 * qk + value;
+        let (Some(proj_elems), Some(gate_elems), Some(out_elems)) = (
+            rows.checked_mul(qkv),
+            rows.checked_mul(value_heads),
+            rows.checked_mul(value),
+        ) else {
+            return refuse(format!("{WHAT}: lane extent overflows"));
+        };
+        let state_elems = value * 128;
+        // The kernel indexes rows with 32-bit ints.
+        if proj_elems.max(out_elems) > i32::MAX as usize {
+            return refuse(format!(
+                "{WHAT}: rows={rows} exceeds the kernel's 32-bit row index"
+            ));
+        }
+        let mut descs = Vec::with_capacity(lanes.len());
+        for (i, lane) in lanes.iter().enumerate() {
+            for (name, tensor, elems) in [
+                ("projection", lane.projection, proj_elems),
+                ("gate", lane.gate, gate_elems),
+                ("beta", lane.beta, gate_elems),
+                ("state", lane.state, state_elems),
+                ("output", lane.output, out_elems),
+            ] {
+                if tensor.dtype != DType::F32
+                    || tensor.numel() != elems
+                    || tensor.buf.size() < elems * 4
+                {
+                    return refuse(format!(
+                        "{WHAT}: lane {i} {name} must be F32 with {elems} elements (got {:?}, {} \
+                         elements, {} bytes)",
+                        tensor.dtype,
+                        tensor.numel(),
+                        tensor.buf.size()
+                    ));
+                }
+            }
+            descs.push(Qwen4GdnLaneDesc {
+                projection: lane.projection.buf.as_ptr() as u64,
+                gate: lane.gate.buf.as_ptr() as u64,
+                beta: lane.beta.buf.as_ptr() as u64,
+                state: lane.state.buf.as_ptr() as u64,
+                output: lane.output.buf.as_ptr() as u64,
+            });
+        }
+        let key: GdnLanesTableKey = ([rows, key_heads, value_heads], descs);
+        if !self.gpu.gdn_lanes_f32_tables.tables.contains_key(&key) {
+            // Validated once per distinct lane set: the table is a pure function of the key.
+            let descs = &key.1;
+            let mut writes: Vec<(u64, u64)> = Vec::with_capacity(2 * descs.len());
+            for d in descs {
+                writes.push((d.state, d.state + (state_elems * 4) as u64));
+                writes.push((d.output, d.output + (out_elems * 4) as u64));
+            }
+            writes.sort_unstable();
+            if writes.windows(2).any(|w| w[0].1 > w[1].0) {
+                return refuse(format!(
+                    "{WHAT}: two lanes write overlapping state or output ranges"
+                ));
+            }
+            let hits_write = |start: u64, bytes: usize| {
+                let end = start + bytes as u64;
+                // The last write starting before `end` is the only one that can reach back over
+                // `start` (the writes are disjoint and sorted).
+                let at = writes.partition_point(|w| w.0 < end);
+                at > 0 && writes[at - 1].1 > start
+            };
+            for d in descs {
+                if hits_write(d.projection, proj_elems * 4)
+                    || hits_write(d.gate, gate_elems * 4)
+                    || hits_write(d.beta, gate_elems * 4)
+                {
+                    return refuse(format!(
+                        "{WHAT}: a lane reads a range another lane (or itself) writes"
+                    ));
+                }
+            }
+            if self.gpu.graphs.capture_mode {
+                return refuse(format!("{WHAT}: lane table staging during graph capture"));
+            }
+            self.gpu.bind_thread()?;
+            if self.gpu.gdn_lanes_f32_tables.tables.len() >= GDN_LANES_TABLE_CACHE_MAX {
+                // Queued launches may still read a table: drain before freeing any.
+                self.gpu.hip.device_synchronize()?;
+                self.gpu.gdn_lanes_f32_tables.tables.clear();
+            }
+            let bytes: Vec<u8> = key
+                .1
+                .iter()
+                .flat_map(|d| {
+                    [d.projection, d.gate, d.beta, d.state, d.output]
+                        .into_iter()
+                        .flat_map(u64::to_le_bytes)
+                })
+                .collect();
+            let buf = self.gpu.hip.malloc(bytes.len().next_multiple_of(256))?;
+            // Stream-ordered before this launch; `bytes` lives in the cache entry, so the
+            // (possibly staged) copy never reads a dropped source and nothing synchronizes.
+            match self.gpu.active_stream.as_ref() {
+                Some(stream) => self.gpu.hip.memcpy_htod_async(&buf, &bytes, stream)?,
+                None => self.gpu.hip.memcpy_htod(&buf, &bytes)?,
+            }
+            self.gpu
+                .gdn_lanes_f32_tables
+                .tables
+                .insert(key.clone(), (buf, bytes));
+        }
+        let table = self.gpu.gdn_lanes_f32_tables.tables[&key].0.as_ptr();
+        self.gpu.bind_thread()?;
+        self.gpu.ensure_kernel(
+            QWEN4_GDN_LANES_F32_KERNEL,
+            QWEN4_GDN_LANES_F32_SRC,
+            QWEN4_GDN_LANES_F32_KERNEL,
+        )?;
+        let (rv, qv, khv, vhv, kdv, vdv) = (
+            rows as i32,
+            qkv as i32,
+            key_heads as i32,
+            value_heads as i32,
+            key_dim as i32,
+            value_dim as i32,
+        );
+        let scale = (key_dim as f32).sqrt().recip();
+        let mut params: Vec<*mut c_void> = vec![
+            &table as *const _ as *mut c_void,
+            &rv as *const _ as *mut c_void,
+            &qv as *const _ as *mut c_void,
+            &khv as *const _ as *mut c_void,
+            &vhv as *const _ as *mut c_void,
+            &kdv as *const _ as *mut c_void,
+            &vdv as *const _ as *mut c_void,
+            &scale as *const _ as *mut c_void,
+        ];
+        let bytes = lanes.len().saturating_mul(
+            2 * state_elems * 4 + (proj_elems + out_elems + 2 * gate_elems) * 4,
+        );
+        let timer = crate::profile::begin_timer(
+            &self.gpu.hip,
+            "deltanet",
+            QWEN4_GDN_LANES_F32_KERNEL,
+            bytes,
+        );
+        let result = self.gpu.launch_maybe_blob(
+            QWEN4_GDN_LANES_F32_KERNEL,
+            [value_heads as u32, lanes.len() as u32, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(table);
+                blob.push_i32(rv);
+                blob.push_i32(qv);
+                blob.push_i32(khv);
+                blob.push_i32(vhv);
+                blob.push_i32(kdv);
+                blob.push_i32(vdv);
+                blob.push_f32(scale);
+                blob
+            },
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.gpu.hip);
+        }
+        result
+    }
 }
 
 /// Most batch rows one `gemm_bf16_mfma_gfx942_rows16` launch takes; a chain
@@ -2607,6 +2882,56 @@ mod tests {
             (2560, 2560),
         ] {
             assert!(t(m, k) >= 1536, "{m}x{k} chains through the prefill chunk");
+        }
+    }
+
+    /// The lanes kernel's pipe128 body is `tensor_ops.hip`'s, byte for byte: every block between
+    /// the `BEGIN` / `END verbatim tensor_ops.hip` markers must occur in the production source.
+    #[test]
+    fn gdn_lanes_f32_gfx942_source_is_tensor_ops_verbatim() {
+        const BEGIN: &str = "// BEGIN verbatim tensor_ops.hip\n";
+        const END: &str = "// END verbatim tensor_ops.hip";
+        let src = super::QWEN4_GDN_LANES_F32_SRC;
+        let production = crate::tensor_ops::TENSOR_OPS_SRC;
+        let mut blocks = 0;
+        let mut rest = src;
+        while let Some(at) = rest.find(BEGIN) {
+            let body = &rest[at + BEGIN.len()..];
+            let end = body.find(END).expect("END marker after every BEGIN marker");
+            let block = body[..end].trim_end_matches('\n');
+            assert!(
+                production.contains(block),
+                "verbatim block {blocks} of qwen4_gdn_lanes_f32.gfx942.hip is no longer a \
+                 substring of tensor_ops.hip: mirror the production edit into the lanes kernel\n\
+                 block starts: {:?}",
+                &block[..block.len().min(120)]
+            );
+            blocks += 1;
+            rest = &body[end + END.len()..];
+        }
+        assert_eq!(blocks, 4, "bf16 helpers, Q8 helpers, barrier, pipe128 helpers + body");
+        // The one-row production kernel is the body this wrapper batches.
+        assert!(production.contains(
+            "gated_delta_step_pipe128_body<false>(projection, gate, beta, state, output, rows,"
+        ));
+        assert_eq!(src.matches("gated_delta_step_pipe128_body<false>(").count(), 1);
+        assert!(src.contains(&format!("void {}(", super::QWEN4_GDN_LANES_F32_KERNEL)));
+        assert_eq!(src.matches("__launch_bounds__(128)").count(), 1);
+    }
+
+    /// The lane table entry is five 8-byte pointers on both sides of the launch.
+    #[test]
+    fn gdn_lanes_f32_gfx942_lane_desc_matches_kernel_struct() {
+        assert_eq!(std::mem::size_of::<super::Qwen4GdnLaneDesc>(), 40);
+        let src = super::QWEN4_GDN_LANES_F32_SRC;
+        let at = src
+            .find("struct Qwen4GdnLaneDesc {")
+            .expect("kernel lane descriptor");
+        let body = &src[at..src[at..].find("};").unwrap() + at];
+        assert_eq!(body.matches("QWEN4_GDN_GLOBAL*").count(), 5);
+        assert_eq!(body.matches(';').count(), 5);
+        for field in ["projection", "gate", "beta", "state", "output"] {
+            assert!(body.contains(&format!("* {field};")), "field {field}");
         }
     }
 }

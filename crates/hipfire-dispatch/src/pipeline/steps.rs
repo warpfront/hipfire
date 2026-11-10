@@ -1032,19 +1032,20 @@ fn execute_window<'a>(
         // group's steps are announced here, once each in program order, after
         // every refusal check and before the grouped launch; a refused group
         // announced nothing and each step is announced by the plain path below.
-        if matches!(&steps[i], Step::GatedDeltaNet(op)
-                if crate::pipeline::layer_ops::gdn_core_lane_groupable(gpu, op))
+        // Exact gfx942 (`HIPFIRE_QWEN4_GDN_LANES`, default off) also groups one-row F32
+        // Core steps, up to `QWEN4_GDN_LANES_F32_MAX` of them (`pipeline/gdn.rs`).
+        let core_lane = |gpu: &Gpu, op: &crate::pipeline::layer_ops::GatedDeltaNetOp<'_>| {
+            crate::pipeline::layer_ops::gdn_core_lane_groupable(gpu, op)
+                || crate::pipeline::gdn::core_lane_f32_gfx942(gpu, op)
+        };
+        if matches!(&steps[i], Step::GatedDeltaNet(op) if core_lane(gpu, op))
             && !cpu_exec::cpu_exec_enabled()
         {
             let ops: Vec<_> = steps[i..end]
                 .iter()
-                .take(rdna_compute::tensor_ops::GDN_CORE_LANES_MAX)
+                .take(crate::pipeline::gdn::core_lanes_group_max(gpu))
                 .map_while(|s| match s {
-                    Step::GatedDeltaNet(op)
-                        if crate::pipeline::layer_ops::gdn_core_lane_groupable(gpu, op) =>
-                    {
-                        Some(op)
-                    }
+                    Step::GatedDeltaNet(op) if core_lane(gpu, op) => Some(op),
                     _ => None,
                 })
                 .collect();
