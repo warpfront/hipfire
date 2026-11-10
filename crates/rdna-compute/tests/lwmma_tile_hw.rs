@@ -103,8 +103,11 @@ const SHAPES: &[(usize, usize, usize, Option<f32>)] = &[
 const ROWS: &[usize] = &[
     65, 77, 96, 149, 256, 384, 511, 596, 1043, 1191, 1192, 1536, 2048,
 ];
-/// The served counts plus both sides of the launcher's row-bucket edges (300 | 301, 800 | 801).
-const BENCH_ROWS: &[usize] = &[149, 256, 300, 301, 384, 511, 596, 800, 801, 1000, 1192];
+/// A grid over the served prefill rows (SP halves of singletons and waves included) that sets the
+/// pick table's per-shape row ranges.
+const BENCH_ROWS: &[usize] = &[
+    65, 75, 96, 128, 149, 192, 224, 256, 300, 340, 384, 448, 511, 596, 700, 800, 900, 1000, 1192,
+];
 const MAX_ROWS: usize = 2048;
 
 fn shape_w(gpu: &mut Gpu, m: usize, k: usize) -> GpuTensor {
@@ -171,7 +174,11 @@ fn lwmma_tile_oracle_hw() {
             gpu.hip.device_synchronize().expect("sync");
             let want = download_f32(&gpu, &y_ref, rows * m);
 
-            let mut cfgs: Vec<(String, Option<LaneWmmaTile>)> = vec![("pick".into(), None)];
+            // The launcher's own pick (where the table picks a tile), then every exported tile.
+            let mut cfgs: Vec<(String, Option<LaneWmmaTile>)> = Vec::new();
+            if lane_wmma_tile_pick(m, k, rows, terms).is_some() {
+                cfgs.push(("pick".into(), None));
+            }
             for t in lane_wmma_tile_set(terms) {
                 cfgs.push((t.name(), Some(*t)));
             }
@@ -269,15 +276,16 @@ fn lwmma_tile_bench_hw() {
                     t.name()
                 );
             }
-            let pick = lane_wmma_tile_pick(m, k, rows, terms).expect("served shape has a pick");
-            let us = time_us(&mut gpu, |g| {
-                g.lane_wmma_tile_gemm_prefill(&wref, &x_t, &y_t, m, k, rows, terms, act)
-                    .expect("tile prefill");
-            });
-            println!(
-                "[tile-bench] m={m} k={k} t={terms} rows={rows} arm=tile-pick({}) us={us:.1}",
-                pick.name()
-            );
+            if let Some(pick) = lane_wmma_tile_pick(m, k, rows, terms) {
+                let us = time_us(&mut gpu, |g| {
+                    g.lane_wmma_tile_gemm_prefill(&wref, &x_t, &y_t, m, k, rows, terms, act)
+                        .expect("tile prefill");
+                });
+                println!(
+                    "[tile-bench] m={m} k={k} t={terms} rows={rows} arm=tile-pick({}) us={us:.1}",
+                    pick.name()
+                );
+            }
         }
     }
 }

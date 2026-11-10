@@ -110,93 +110,91 @@ pub fn lane_wmma_tile_set(terms: usize) -> &'static [LaneWmmaTile] {
     }
 }
 
-/// Row buckets of the pick table: up to 300 rows, up to 800 rows, above.
-fn rows_bucket(rows: usize) -> usize {
-    match rows {
-        0..=300 => 0,
-        301..=800 => 1,
-        _ => 2,
-    }
-}
-
-/// Tuned picks per served `(m, k, terms)` and row bucket (T3 bench on card C, 2026-11-10: the
-/// fastest configuration of the sweep at 149 / 596 / 1192 rows). The quarter-group tiles win only
-/// the 149-row bucket of the 320 x 10240 shapes, where the serial K walk of the plain tiles is
-/// latency bound.
-const TILE_PICKS: &[(usize, usize, usize, [LaneWmmaTile; 3])] = &[
+/// Tuned picks per served `(m, k, terms)`: ascending `(max_rows, pick)` ranges, the last one open.
+/// `None` keeps the shipped lwmma kernel (bitwise the same) where every tile is slower. Fine-grid
+/// bench on card C, 2026-11-10 (fabric j8842, 65..1192 rows, min of two passes): the HC down
+/// (320 x 10240, one term) loses to the shipped kernel up to about 360 rows (its serial K walk is
+/// latency bound at few rows); every other shape wins at every row count (0.29x..0.87x).
+const TILE_PICKS: &[(usize, usize, usize, &[(usize, Option<LaneWmmaTile>)])] = &[
     (
         320,
         10240,
         1,
-        [
-            tile_g4(32, 32, 2, 1),
-            tile(32, 64, 2, 2),
-            tile(64, 64, 4, 1),
+        &[
+            (360, None),
+            (420, Some(tile_g4(32, 32, 2, 1))),
+            (1100, Some(tile(32, 64, 2, 2))),
+            (usize::MAX, Some(tile(64, 64, 4, 1))),
         ],
     ),
     (
         320,
         10240,
         2,
-        [
-            tile_g4(16, 32, 1, 1),
-            tile(32, 64, 2, 2),
-            tile(64, 64, 4, 1),
+        &[
+            (200, Some(tile_g4(16, 32, 1, 1))),
+            (1100, Some(tile(32, 64, 2, 2))),
+            (usize::MAX, Some(tile(64, 64, 4, 1))),
         ],
     ),
     (
         512,
         2560,
         2,
-        [tile(32, 64, 2, 2), tile(32, 64, 2, 2), tile(64, 64, 4, 2)],
+        &[
+            (140, Some(tile_g4(16, 32, 1, 1))),
+            (420, Some(tile(32, 64, 2, 2))),
+            (530, Some(tile(64, 64, 4, 2))),
+            (750, Some(tile(32, 64, 2, 2))),
+            (usize::MAX, Some(tile(64, 128, 4, 2))),
+        ],
     ),
     (
         640,
         2560,
         2,
-        [tile(32, 64, 2, 2), tile(32, 128, 2, 2), tile(64, 128, 4, 2)],
+        &[
+            (110, Some(tile_g4(16, 32, 1, 1))),
+            (280, Some(tile(32, 64, 2, 2))),
+            (470, Some(tile(32, 128, 2, 2))),
+            (650, Some(tile(32, 64, 2, 2))),
+            (usize::MAX, Some(tile(64, 128, 2, 4))),
+        ],
     ),
     (
         2560,
         640,
         2,
-        [
-            tile(64, 128, 4, 2),
-            tile(64, 128, 2, 4),
-            tile(64, 128, 2, 4),
+        &[
+            (90, Some(tile(32, 64, 2, 2))),
+            (140, Some(tile(32, 128, 2, 2))),
+            (usize::MAX, Some(tile(64, 128, 2, 4))),
         ],
     ),
     (
         2560,
         2560,
         2,
-        [
-            tile(64, 128, 2, 4),
-            tile(32, 128, 2, 2),
-            tile(64, 128, 4, 2),
+        &[
+            (110, Some(tile(32, 128, 2, 2))),
+            (140, Some(tile(32, 64, 2, 2))),
+            (usize::MAX, Some(tile(64, 128, 2, 4))),
         ],
     ),
-    (
-        10240,
-        2560,
-        2,
-        [
-            tile(64, 128, 4, 2),
-            tile(64, 128, 4, 2),
-            tile(64, 128, 4, 2),
-        ],
-    ),
+    (10240, 2560, 2, &[(usize::MAX, Some(tile(64, 128, 4, 2)))]),
 ];
 
 /// The tile configuration [`lane_wmma_tile_gemm`] runs for `(m, k, rows, terms)`: the tuned table
-/// for the served shapes, `None` for any other shape (the caller stays on the shipped lwmma
-/// kernel, which is bitwise the same).
+/// for the served shapes, `None` for any other shape or a row range where the shipped lwmma kernel
+/// is faster (the caller stays on it; it is bitwise the same).
 pub fn lane_wmma_tile_pick(m: usize, k: usize, rows: usize, terms: usize) -> Option<LaneWmmaTile> {
-    let bucket = rows_bucket(rows);
-    TILE_PICKS
+    let (_, _, _, ranges) = TILE_PICKS
         .iter()
-        .find(|(pm, pk, pt, _)| (*pm, *pk, *pt) == (m, k, terms))
-        .map(|(_, _, _, t)| t[bucket])
+        .find(|(pm, pk, pt, _)| (*pm, *pk, *pt) == (m, k, terms))?;
+    ranges
+        .iter()
+        .find(|(max_rows, _)| rows <= *max_rows)
+        .and_then(|(_, t)| *t)
 }
 
 /// [`lane_wmma_tile_gemm`] on an explicit tile configuration (the bench sweeps these).
@@ -289,7 +287,7 @@ pub fn lane_wmma_tile_gemm(
     split_k: usize,
 ) -> HipResult<LaneWmmaLaunch> {
     let t = lane_wmma_tile_pick(m, k, rows, terms)
-        .ok_or_else(|| err(format!("tile: no tuned tile for m {m} k {k} terms {terms}")))?;
+        .ok_or_else(|| err(format!("tile: no tuned tile for m {m} k {k} rows {rows} terms {terms}")))?;
     lane_wmma_tile_gemm_cfg(gpu, w, x, y, m, k, rows, terms, hc_act, split_k, t)
 }
 
@@ -352,8 +350,8 @@ mod tests {
     #[test]
     fn exports_are_exactly_the_selectable_tiles() {
         let mut selected: Vec<(usize, LaneWmmaTile)> = Vec::new();
-        for (m, k, terms, picks) in TILE_PICKS {
-            for t in picks {
+        for (m, k, terms, ranges) in TILE_PICKS {
+            for t in ranges.iter().filter_map(|(_, t)| t.as_ref()) {
                 assert!(
                     t.instantiated(*terms),
                     "{m}x{k} t{terms}: {t:?} not exported"
@@ -387,5 +385,7 @@ mod tests {
         }
         assert!(lane_wmma_tile_pick(96, 2560, 300, 2).is_none());
         assert!(lane_wmma_tile_pick(512, 2560, 300, 1).is_none());
+        assert!(lane_wmma_tile_pick(320, 10240, 149, 1).is_none());
+        assert!(lane_wmma_tile_pick(320, 10240, 596, 1).is_some());
     }
 }
