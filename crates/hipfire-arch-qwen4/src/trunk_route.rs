@@ -77,6 +77,32 @@ pub(crate) fn sp_chunk_rows_in_band(n: usize) -> bool {
     sp_rows_in_band(n, *SP_SUB512_ON)
 }
 
+/// Switch of sequence-parallel HC for EP prefill WAVES (`forward_lanes_scoped`) of at least
+/// [`SP_SUB512_MIN_ROWS`] rows, on top of [`SP_SUB512_ENV`]: unset / `1` / `on` / `true` is on,
+/// `0` / `off` / `false` is the kill switch, any other value is off.
+pub(crate) const SP_SUB512_WAVE_ENV: &str = "HIPFIRE_QWEN4_EP_SP_SUB512_WAVE";
+
+static SP_SUB512_WAVE_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    sp_switch(
+        hipfire_config::developer_var(SP_SUB512_WAVE_ENV)
+            .ok()
+            .as_deref(),
+    )
+});
+
+/// Whether an `n`-row EP prefill wave runs its joint HC sequence-parallel: the sub-512 switch
+/// (`sub512`, [`SP_SUB512_ENV`]) and the wave switch (`wave`, [`SP_SUB512_WAVE_ENV`]) are both on
+/// and `n >= `[`SP_SUB512_MIN_ROWS`]. The wave's routing-row cap of 511 keeps every launch and
+/// both halves on sub-512 routes (waves are capped at 2048 rows).
+pub(crate) fn sp_wave_rows_in_band_from(n: usize, sub512: bool, wave: bool) -> bool {
+    sub512 && wave && n >= SP_SUB512_MIN_ROWS
+}
+
+/// [`sp_wave_rows_in_band_from`] with this process's switches.
+pub(crate) fn sp_wave_rows_in_band(n: usize) -> bool {
+    sp_wave_rows_in_band_from(n, *SP_SUB512_ON, *SP_SUB512_WAVE_ON)
+}
+
 /// Switch of the sequence-parallel QSA indexer inside a sequence-parallel chunk (each rank selects
 /// its own work-balanced rows and the block ids are all-gathered): unset (or `1` / `on` / `true`)
 /// = ON wherever the sequence-parallel prefill route runs ([`SP_ENV`]); `0` / `off` / `false` is
@@ -543,6 +569,22 @@ mod tests {
             assert_eq!(sp_rows_in_band(n, false), off, "{n} off");
         }
         assert_ne!(SP_SUB512_ENV, SP_ENV);
+    }
+
+    #[test]
+    fn sp_wave_band_needs_both_switches_and_the_floor() {
+        for n in [129usize, 130, 596, 1192, 2048] {
+            for sub512 in [false, true] {
+                for wave in [false, true] {
+                    assert_eq!(
+                        sp_wave_rows_in_band_from(n, sub512, wave),
+                        sub512 && wave && n >= 130,
+                        "{n} {sub512} {wave}"
+                    );
+                }
+            }
+        }
+        assert_ne!(SP_SUB512_WAVE_ENV, SP_SUB512_ENV);
     }
 
     #[test]

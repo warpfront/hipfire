@@ -118,7 +118,7 @@ use crate::gpu_forward::{
 use crate::gpu_forward::{
     decode_copy, dense_ref, hyper_read_desc, invalid, layer_desc, matrix_view, ple_desc,
     program_dims, qwen4_ple_rows_f16, router_columns, view, Qwen4GpuForward, Qwen4GpuForwardError,
-    Qwen4GpuForwardScratch, ScratchField, DECODE_Q8_PER_LAYER, EPSILON,
+    Qwen4GpuForwardScratch, ScratchField, SpViews, DECODE_Q8_PER_LAYER, EPSILON,
 };
 use crate::mesh_lane_protocol::pack_classed_row_groups;
 use crate::ple_stage::ple_async_upload;
@@ -134,7 +134,7 @@ use hipfire_dispatch::pipeline::{
     execute_embedding, execute_validated_steps, execute_validated_steps_with_moe_hooks,
     validate_steps, ClearOp, EmbeddingOp, GatedDeltaNetOp, GroupedDepthwiseOp, HyperReadOp,
     HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, MixerPhase,
-    MoeStepHooks, ProjectLadder, ProjectOp, Step,
+    MoeStepHooks, ProjectLadder, ProjectOp, RowGatherOp, Step,
 };
 use hipfire_runtime::external_rows::RowFetch;
 use rdna_compute::prefill_invariant::QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP;
@@ -3015,6 +3015,31 @@ fn forward_lanes_scoped(
         gpu.replay.set_forward_eligible(false);
     }
 
+    // `HIPFIRE_QWEN4_EP_SP_SUB512_WAVE`: a trunk-shard prefill wave of at
+    // least the sub-512 SP floor runs its joint HC reads / writes sequence-parallel, like a wide
+    // singleton chunk (`forward_chunk_scoped`'s `SpViews`): each rank reads / writes its half of the
+    // wave's rows (reduce-scatter write), a row all-gather rejoins `hc_mixed` after every read and
+    // the streams before the PLE conv and the final hyper read. The HC read of the wave and of both
+    // halves is the pinned-split-K prefill lane WMMA entry (the routing-row cap keeps all three
+    // below 512 routing rows), so a row's bytes do not depend on which half carries it.
+    let wave_sp: Option<crate::trunk_route::SpRows> = if ep_wave
+        && matches!(
+            wave_route,
+            Some(EpWaveRoute::Partial | EpWaveRoute::PartialMask)
+        )
+        && group_segs.len() == 1
+        && !bf16_state
+        && policy.share(StageName::HcRead) == StageShare::OnceAllRows
+        && policy.share(StageName::HcWrite) == StageShare::OnceAllRows
+        && crate::trunk_route::sp_wave_rows_in_band(n)
+        && gpu.prefill_lwmma_hc_applies(n / 2)
+        && gpu.prefill_lwmma_hc_applies(n)
+        && !(gpu.replay.is_recording() || gpu.graphs.capture_mode)
+    {
+        crate::trunk_route::sp_rows(n)
+    } else {
+        None
+    };
     // A step that runs its all-rows segment row-exact also refuses the 9..=64-row arms that are
     // not bitwise the <=8-row route (lane WMMA, trunk A8, MoE int8 gate/up / down) for its whole execution:
     // every launch of more than 8 rows here is an all-rows-segment launch. Restored on every exit
@@ -3044,6 +3069,23 @@ fn forward_lanes_scoped(
             .iter()
             .map(|view| view.layer_scratch(scratch))
             .collect();
+        // The own-row HC views of a sequence-parallel wave ([`wave_sp`]): the group segment's
+        // tensors (row 0 of every scratch field) cut at this rank's first row.
+        let sp_views: Option<SpViews> = wave_sp.and_then(|rows| {
+            crate::trunk_route::sp_route()
+                .map(|route| SpViews::new(scratch, route, rows, dims, bf16_state))
+        });
+        if sp_views.is_some() {
+            static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "  qwen4 EP sequence-parallel prefill wave (HIPFIRE_QWEN4_EP_SP_SUB512_WAVE): the wave's joint HC reads / writes split its rows across the two ranks (reduce-scatter HC write, row all-gather)"
+                );
+            }
+        }
+        // The streams hold only this rank's rows current (an own-row HC write ran since the
+        // last stream gather): the PLE conv and the final hyper read gather them first.
+        let mut sp_streams_partial = false;
         // Under EP: the row gather, the two trunk gather buffers and, per
         // segment, the scratch description whose expanded-row scratch is each
         // buffer (validated before any launch). A prefill wave runs no gather:
@@ -3462,10 +3504,29 @@ fn forward_lanes_scoped(
                                 &descs[layer - band_first].attn_hyper.read
                             };
                             let copy = layer * DECODE_Q8_PER_LAYER + if mlp { 2 } else { 0 };
+                            let sp = sp_views.as_ref().filter(|_| i == lane_segs.len());
+                            let (streams, normalized, low, up, mixed, hc_rows) = match sp {
+                                Some(sp) => (
+                                    &sp.streams,
+                                    &sp.normalized,
+                                    &sp.low,
+                                    &sp.up,
+                                    &sp.hc_mixed,
+                                    sp.rows.own.1,
+                                ),
+                                None => (
+                                    &v.streams,
+                                    &v.hc_normalized,
+                                    &v.hc_low,
+                                    &v.hc_up,
+                                    &v.hc_mixed,
+                                    r,
+                                ),
+                            };
                             steps.push(Step::HyperRead(HyperReadOp {
                                 rotation: &scratch.rotation,
                                 state_bf16: bf16_state,
-                                input: &v.streams,
+                                input: streams,
                                 norm_weight: read.norm,
                                 input_mix_down: decode_copy(
                                     &fwd.decode_q8,
@@ -3481,15 +3542,25 @@ fn forward_lanes_scoped(
                                     row_limit,
                                     read.input_mix_up,
                                 ),
-                                normalized: &v.hc_normalized,
-                                low: &v.hc_low,
-                                up: &v.hc_up,
-                                mixed: &v.hc_mixed,
-                                rows: r,
+                                normalized,
+                                low,
+                                up,
+                                mixed,
+                                rows: hc_rows,
                                 branches: dims.hc_count,
                                 hidden: config.hidden_size,
                                 low_rank: dims.hc_lowrank,
                             }));
+                            // Sequence-parallel wave: the mixer and the MoE read every row.
+                            if let Some(sp) = sp {
+                                steps.push(Step::RowGather(RowGatherOp {
+                                    tensor: &scratch.hc_mixed,
+                                    f32_bf16: true,
+                                    row_elems: config.hidden_size,
+                                    rows: n,
+                                    exec: sp.exec,
+                                }));
+                            }
                         }
                         LaneOp::HcWrite { layer, mlp } => {
                             let write = if mlp {
@@ -3497,6 +3568,32 @@ fn forward_lanes_scoped(
                             } else {
                                 &descs[layer - band_first].attn_hyper.write
                             };
+                            let sp = sp_views.as_ref().filter(|_| i == lane_segs.len());
+                            let (streams, normalized, mixed, gates, hc_rows) = match sp {
+                                Some(sp) => (
+                                    &sp.streams,
+                                    &sp.normalized,
+                                    if mlp {
+                                        &sp.ffn_output
+                                    } else {
+                                        &sp.attention_output
+                                    },
+                                    &sp.gates,
+                                    sp.rows.own.1,
+                                ),
+                                None => (
+                                    &v.streams,
+                                    &v.hc_normalized,
+                                    if mlp {
+                                        &v.ffn_output
+                                    } else {
+                                        &v.attention_output
+                                    },
+                                    &v.hc_gates,
+                                    r,
+                                ),
+                            };
+                            sp_streams_partial |= sp.is_some();
                             steps.push(Step::HyperWrite(HyperWriteOp {
                                 ar: if mlp {
                                     crate::trunk_route::ffn_writer()
@@ -3505,18 +3602,14 @@ fn forward_lanes_scoped(
                                 },
                                 rotation: &scratch.rotation,
                                 state_bf16: bf16_state,
-                                input: &v.streams,
+                                input: streams,
                                 norm_weight: write.norm,
                                 block_inject: write.block_inject,
-                                normalized: &v.hc_normalized,
-                                mixed: if mlp {
-                                    &v.ffn_output
-                                } else {
-                                    &v.attention_output
-                                },
-                                gates: &v.hc_gates,
-                                output: &v.streams,
-                                rows: r,
+                                normalized,
+                                mixed,
+                                gates,
+                                output: streams,
+                                rows: hc_rows,
                                 branches: dims.hc_count,
                                 hidden: config.hidden_size,
                             }));
@@ -3550,6 +3643,18 @@ fn forward_lanes_scoped(
                             let ple_w = ple_w
                                 .as_ref()
                                 .ok_or_else(|| invalid("PLE weights missing"))?;
+                            // Sequence-parallel wave: the PLE conv reads and writes every row of
+                            // the streams (and leaves them current on both ranks).
+                            if let Some(sp) = sp_views.as_ref().filter(|_| sp_streams_partial) {
+                                steps.push(Step::RowGather(RowGatherOp {
+                                    tensor: &scratch.streams,
+                                    f32_bf16: !bf16_state,
+                                    row_elems: dims.wide(),
+                                    rows: n,
+                                    exec: sp.exec,
+                                }));
+                                sp_streams_partial = false;
+                            }
                             if ple_split.is_none() {
                                 ple_split = Some(steps.len());
                             }
@@ -3897,6 +4002,16 @@ fn forward_lanes_scoped(
             }
             start = end;
         }
+        // Sequence-parallel wave: the final hyper read and the wide-hidden capture read every row.
+        if let Some(sp) = sp_views.as_ref().filter(|_| sp_streams_partial) {
+            steps.push(Step::RowGather(RowGatherOp {
+                tensor: &scratch.streams,
+                f32_bf16: !bf16_state,
+                row_elems: dims.wide(),
+                rows: n,
+                exec: sp.exec,
+            }));
+        }
         if ep_lane.is_some() {
             ep_lane_check_invocations(ep_invocations)?;
         }
@@ -4052,6 +4167,18 @@ fn forward_lanes_scoped(
                 ));
             }
         };
+        // Arm the sequence-parallel split for the wave's steps (own-row HC writes take the
+        // reduce-scatter, `RowGather`s use its ranges); disarmed on every exit of this closure.
+        struct SpArm;
+        impl Drop for SpArm {
+            fn drop(&mut self) {
+                crate::trunk_route::sp_end();
+            }
+        }
+        let _sp_arm = sp_views.as_ref().map(|sp| {
+            crate::trunk_route::sp_begin(sp.rows);
+            SpArm
+        });
         execute(gpu, &steps[..split])?;
 
         // PLE rows: wait for the fetch, stage, upload, convert.
