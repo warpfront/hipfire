@@ -525,6 +525,69 @@ fn builtin_terminator_inside_open_tool_call_does_not_end_the_turn() {
 }
 
 #[test]
+fn bare_tool_call_opener_still_stops_on_a_terminator() {
+    let (_, _, fin, stopped, _, _) =
+        drive_ar_semantic_path(&["<tool_call>", "<|im_end|>"], false, false);
+    assert!(stopped);
+    let err = fin.expect_err("bare opener fails closed");
+    assert_eq!(err.detail(), "unclosed <tool_call> span at end of output");
+}
+
+#[test]
+fn spelled_terminator_inside_a_parameter_stays_in_the_argument() {
+    for marker in ["<|im_end|>", "<|endoftext|>"] {
+        let (out, visible, fin, stopped, _, _) = drive_ar_semantic_path(
+            &[
+                "<tool_call><function=write_file><parameter=content>\nEND = \"",
+                marker,
+                "\"\n</parameter></function></tool_call>",
+            ],
+            false,
+            false,
+        );
+        assert!(!stopped, "{marker}");
+        let fin = fin.expect(marker);
+        assert_eq!(fin.finish_reason, "tool_calls", "{marker}");
+        assert_eq!(fin.wire_tool_calls.len(), 1, "{marker}");
+        let content = fin.wire_tool_calls[0].arguments["content"]
+            .as_str()
+            .expect("content string");
+        assert!(
+            content.contains(marker),
+            "{marker} missing from {content:?}"
+        );
+        assert!(!visible.contains(marker), "{marker}");
+        for ev in parse_jsonl(&out) {
+            let kind = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if kind == "token" || kind == "reasoning" {
+                let text = ev.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                assert!(!text.contains(marker), "{marker} leaked into {kind}");
+            }
+        }
+    }
+}
+
+#[test]
+fn spelled_terminator_split_across_chunks_stays_in_the_argument() {
+    let (_, _, fin, stopped, _, _) = drive_ar_semantic_path(
+        &[
+            "<tool_call><function=write_file><parameter=content>\nEND = \"<|",
+            "im_end",
+            "|>\"\n</parameter></function></tool_call>",
+        ],
+        false,
+        false,
+    );
+    assert!(!stopped);
+    let fin = fin.expect("split marker");
+    assert_eq!(fin.finish_reason, "tool_calls");
+    assert_eq!(
+        fin.wire_tool_calls[0].arguments["content"].as_str(),
+        Some("END = \"<|im_end|>\"")
+    );
+}
+
+#[test]
 fn terminator_inside_open_tool_call_stays_fail_closed_without_a_closer() {
     let (_, _, fin, stopped, _, _) = drive_ar_semantic_path(
         &[

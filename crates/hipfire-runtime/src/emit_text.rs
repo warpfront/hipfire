@@ -468,6 +468,14 @@ impl ToolOutputRouter {
         }
     }
 
+    /// True once an open span has a complete `<function=NAME>` header.
+    ///
+    /// Built-in turn terminators are masked only then. A bare `<tool_call>`
+    /// still ends the turn, so the model is not forced to invent a call.
+    pub fn masks_builtin_terminators(&self) -> bool {
+        self.in_tool_call() && qwen_function_header_complete(&self.buf)
+    }
+
     /// Feed one decoded text chunk. May emit zero or more ordered events.
     ///
     /// Returns [`Err`] once malformed/truncated protocol is detected; the error
@@ -885,12 +893,60 @@ fn parse_one_tool_call_body(body_raw: &str) -> Option<crate::prompt_frame::ToolC
     })
 }
 
+const CHATML_LEAKAGE: &[&str] = &["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|im_sep|>"];
+
+/// Drop ChatML special-token spellings that leaked around a tool body.
+///
+/// Text inside a `<parameter=KEY>...</parameter>` value is the argument, so a
+/// marker the model wrote there stays. The same spelling between tags is
+/// still removed.
 fn strip_chatml_leakage(body_raw: &str) -> String {
-    body_raw
-        .replace("<|im_start|>", "")
-        .replace("<|im_end|>", "")
-        .replace("<|endoftext|>", "")
-        .replace("<|im_sep|>", "")
+    let mut out = String::with_capacity(body_raw.len());
+    let mut rest = body_raw;
+    while !rest.is_empty() {
+        if let Some(after_key) = rest.strip_prefix("<parameter=") {
+            if let Some(key_end) = after_key.find('>') {
+                let value_and_after = &after_key[key_end + 1..];
+                if let Some(close_at) = value_and_after.find("</parameter>") {
+                    let keep_end =
+                        "<parameter=".len() + key_end + 1 + close_at + "</parameter>".len();
+                    out.push_str(&rest[..keep_end]);
+                    rest = &rest[keep_end..];
+                    continue;
+                }
+            }
+        }
+        if let Some(marker) = CHATML_LEAKAGE
+            .iter()
+            .find(|marker| rest.starts_with(*marker))
+        {
+            rest = &rest[marker.len()..];
+            continue;
+        }
+        let ch = rest.chars().next().expect("rest is non-empty");
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    out
+}
+
+/// A `<function=NAME>` header has been fully written into this open span.
+fn qwen_function_header_complete(body: &str) -> bool {
+    let Some(function_body) = body.trim_start().strip_prefix("<function=") else {
+        return false;
+    };
+    let Some(name_end) = function_body.find('>') else {
+        return false;
+    };
+    valid_tool_ident(function_body[..name_end].trim())
+}
+
+fn valid_tool_ident(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().enumerate().all(|(i, c)| {
+            c == '_' || c.is_ascii_alphanumeric() || (i > 0 && matches!(c, '.' | '-'))
+        })
+        && !name.as_bytes()[0].is_ascii_digit()
 }
 
 /// Extract Hermes/ChatML `<tool_call>{json}</tool_call>` and Qwen-native XML
@@ -1298,12 +1354,7 @@ fn extract_qwen_xml_tool_call_inner(
     let function_body = body.strip_prefix("<function=")?;
     let name_end = function_body.find('>')?;
     let name = function_body[..name_end].trim();
-    if name.is_empty()
-        || !name.chars().enumerate().all(|(i, c)| {
-            c == '_' || c.is_ascii_alphanumeric() || (i > 0 && matches!(c, '.' | '-'))
-        })
-        || name.as_bytes()[0].is_ascii_digit()
-    {
+    if !valid_tool_ident(name) {
         return None;
     }
 
@@ -1326,12 +1377,7 @@ fn extract_qwen_xml_tool_call_inner(
         rest = &rest[open + "<parameter=".len()..];
         let key_end = rest.find('>')?;
         let key = rest[..key_end].trim();
-        if key.is_empty()
-            || !key.chars().enumerate().all(|(i, c)| {
-                c == '_' || c.is_ascii_alphanumeric() || (i > 0 && matches!(c, '.' | '-'))
-            })
-            || key.as_bytes()[0].is_ascii_digit()
-        {
+        if !valid_tool_ident(key) {
             return None;
         }
         rest = &rest[key_end + 1..];
@@ -2041,6 +2087,30 @@ mod tests {
             .expect("disabled text");
         assert!(!router.in_tool_call());
         assert!(router.finish().expect("disabled finish").is_empty());
+    }
+
+    #[test]
+    fn terminator_mask_waits_for_a_function_header() {
+        let mut router = ToolOutputRouter::new();
+        router.push("<tool_call>").expect("opener");
+        assert!(router.in_tool_call());
+        assert!(!router.masks_builtin_terminators());
+        router.push("<function=re").expect("partial name");
+        assert!(!router.masks_builtin_terminators());
+        router.push("ad>").expect("header");
+        assert!(router.masks_builtin_terminators());
+    }
+
+    #[test]
+    fn parameter_value_keeps_a_spelled_terminator() {
+        let (vis, calls, term) = feed(&["<tool_call><function=write_file><parameter=content>\nEND = \"<|im_end|>\"\n</parameter></function></tool_call>"]);
+        assert_eq!(term, Terminal::Ok);
+        assert!(vis.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments["content"].as_str(),
+            Some("END = \"<|im_end|>\"")
+        );
     }
 
     #[test]

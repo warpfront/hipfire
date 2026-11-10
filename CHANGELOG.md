@@ -1,7 +1,7 @@
 # Changelog
 
 ## Unreleased
-- **Fixed: an open `<tool_call>` on the Qwen AR path stays open through EOS, `<|im_end|>`, and `<|endoftext|>`.** While the tool router is inside the span, those terminator ids are masked before sampling, and the same bytes are not a turn boundary in the EOS filter. A user stop sequence and the token budget still end the turn. Ending inside the span still fails closed, and running out of tokens still finishes with `length`.
+- **Fixed: the single-GPU Qwen AR decode loop masks EOS, `<|im_end|>`, and `<|endoftext|>` only after an open tool call has a `<function=NAME>` header, so those ids no longer cut that call off.** A bare `<tool_call>` still ends the turn and fails closed. When the Qwen AR text path classifies the output, a marker spelled inside a parameter value stays in the argument. A user stop sequence and the token budget still end the turn. An unclosed span still fails closed, and running out of tokens still finishes with `length`.
 
 ## v0.4.5 — 2026-11-11 (re-cut)
 
