@@ -555,6 +555,22 @@ pub(crate) fn elastic_action(
     }
 }
 
+/// The idle step count after one more step boundary: restarted by a prefill tile of >= 512 route
+/// rows (`long_prefill`) or by a reclaim since the last boundary (`reclaims != seen_reclaims`),
+/// else one more.
+pub(crate) fn elastic_idle_next(
+    steps: usize,
+    seen_reclaims: u64,
+    reclaims: u64,
+    long_prefill: bool,
+) -> usize {
+    if reclaims != seen_reclaims || long_prefill {
+        0
+    } else {
+        steps.saturating_add(1)
+    }
+}
+
 /// Whether a rank counts as warm: the long-prefill memory is already out of `free`. With the
 /// elastic reserve on that is exactly "the long-prefill caches are resident" (a release makes the
 /// rank cold again, so the cold reserve is held for the next long prompt); otherwise today's
@@ -592,8 +608,16 @@ pub(crate) struct ElasticRank {
     /// Cap in bytes per rank (0 = the reserve is off: every op is a no-op).
     pub cap: u64,
     pub log: bool,
-    /// Reclaims on this rank that freed a bank (the serve loop's idle counter resets on a change).
+    /// Reclaims on this rank that freed a bank (the idle step count restarts when it moves).
     pub reclaims: std::sync::atomic::AtomicU64,
+    /// Root only: step boundaries since the last >= 512-row prefill or reclaim
+    /// ([`Qwen4Bundle::elastic_idle_boundary`]). It lives here, not in the serve loop: the batch
+    /// loop returns whenever no lane is active and nothing is queued, so a loop-local count
+    /// restarts with every request and a workload of short replies never reached
+    /// [`ELASTIC_IDLE_STEPS`].
+    pub idle_steps: usize,
+    /// Root only: the reclaim count [`Self::idle_steps`] last saw.
+    pub idle_reclaims: u64,
     /// Root only: the idle-step count of the last tick that probed the ranks, so an unchanged
     /// "nothing to do" answer is asked again only after another [`ELASTIC_IDLE_STEPS`] steps.
     pub probed_at: Option<usize>,
@@ -1145,6 +1169,8 @@ impl Qwen4Bundle {
             cap,
             log: hipfire_config::memory::ep_elastic_log(),
             reclaims: std::sync::atomic::AtomicU64::new(0),
+            idle_steps: 0,
+            idle_reclaims: 0,
             probed_at: None,
         });
         Ok(())
@@ -1156,11 +1182,22 @@ impl Qwen4Bundle {
         self.elastic.as_ref().is_some_and(|elastic| elastic.cap > 0)
     }
 
-    /// Reclaims of this rank's bank so far; the serve loop restarts its idle count when it moves.
-    pub fn elastic_reclaim_epoch(&self) -> u64 {
-        self.elastic.as_ref().map_or(0, |elastic| {
-            elastic.reclaims.load(std::sync::atomic::Ordering::Relaxed)
-        })
+    /// One step boundary of the serve loop: the count of boundaries since the last prefill tile of
+    /// >= 512 route rows (`long_prefill`) or elastic reclaim, which restarts it. The count spans
+    /// the loop's busy periods (a request's end does not restart it). 0 without the reserve.
+    pub fn elastic_idle_boundary(&mut self, long_prefill: bool) -> usize {
+        let Some(elastic) = self.elastic.as_mut() else {
+            return 0;
+        };
+        let reclaims = elastic.reclaims.load(std::sync::atomic::Ordering::Relaxed);
+        elastic.idle_steps = elastic_idle_next(
+            elastic.idle_steps,
+            elastic.idle_reclaims,
+            reclaims,
+            long_prefill,
+        );
+        elastic.idle_reclaims = reclaims;
+        elastic.idle_steps
     }
 
     fn elastic_rank(&self) -> usize {
@@ -1261,7 +1298,15 @@ impl Qwen4Bundle {
                 }
                 Ok(Some((report.units, report.bytes)))
             }
-            Ok(None) => Ok(None),
+            Ok(None) => {
+                if elastic.log {
+                    eprintln!(
+                        "qwen4 EP rank {rank}: [elastic] lend: nothing lent (asked {:.0} MiB; refused or too few candidates)",
+                        bytes as f64 / f64::from(1u32 << 20)
+                    );
+                }
+                Ok(None)
+            }
             Err(error) => Err(format!("rank {rank}: elastic lend: {error}")),
         }
     }
@@ -1985,6 +2030,25 @@ mod tests {
         let mut lent = both;
         lent[0].lent = 1280 * MIB;
         assert_eq!(elastic_action(cap, idle, &lent), ElasticAction::Nothing);
+    }
+
+    #[test]
+    fn the_idle_count_spans_requests_and_restarts_on_a_long_prefill_or_a_reclaim() {
+        // 64 step boundaries accumulate whatever busy period they fall in: a workload of short
+        // replies (about 30 steps each, the loop returns between them) still reaches the window.
+        let mut steps = 0;
+        for _ in 0..ELASTIC_IDLE_STEPS {
+            steps = elastic_idle_next(steps, 0, 0, false);
+        }
+        assert_eq!(steps, ELASTIC_IDLE_STEPS);
+        // A prefill tile of >= 512 route rows restarts it.
+        assert_eq!(elastic_idle_next(steps, 0, 0, true), 0);
+        // So does any reclaim (the bundle's reclaim count moved), long prefill or not.
+        assert_eq!(elastic_idle_next(steps, 3, 4, false), 0);
+        assert_eq!(elastic_idle_next(steps, 3, 4, true), 0);
+        // The next boundary after a restart counts again.
+        assert_eq!(elastic_idle_next(0, 4, 4, false), 1);
+        assert_eq!(elastic_idle_next(usize::MAX, 4, 4, false), usize::MAX);
     }
 
     #[test]

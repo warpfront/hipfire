@@ -3851,6 +3851,30 @@ impl Qwen4Bundle {
                 return;
             }
         };
+        if self.elastic.as_ref().is_some_and(|elastic| elastic.log) {
+            let mib = |bytes: u64| bytes as f64 / f64::from(1u32 << 20);
+            let terms = ranks
+                .iter()
+                .enumerate()
+                .map(|(rank, n)| {
+                    format!(
+                        "rank {rank}: free {:.0} earmark_noncold {:.0} outstanding {:.0} lent {:.0} caches {} lendable {:.0}",
+                        mib(n.free),
+                        mib(n.earmark_noncold),
+                        mib(n.outstanding),
+                        mib(n.lent),
+                        n.caches_resident,
+                        mib(n.lendable()),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            eprintln!(
+                "qwen4 EP [elastic] tick idle_steps={idle_steps} cap {:.0} MiB min {:.0} MiB: {terms} (MiB)",
+                mib(cap),
+                mib(crate::lane::pages::ELASTIC_MIN_LEND_BYTES),
+            );
+        }
         match crate::lane::pages::elastic_action(cap, idle_steps, &ranks) {
             crate::lane::pages::ElasticAction::Nothing => {}
             crate::lane::pages::ElasticAction::ReleaseCaches => self.elastic_release_all(gpu),

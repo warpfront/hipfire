@@ -1070,28 +1070,20 @@ fn page_budget_gate(
     }
 }
 
-/// The serve loop's idle count for the elastic reserve (`Qwen4Bundle::elastic_tick`): step
-/// boundaries since the last prefill tile of >= 512 route rows or elastic reclaim.
-#[derive(Default)]
-struct ElasticIdle {
-    steps: usize,
-    /// The root bundle's reclaim count when `steps` last restarted.
-    reclaims: u64,
-}
-
 /// Step-boundary housekeeping of the elastic reserve; a no-op without it. `step` is
 /// `Some(long_prefill)` after a step (`long_prefill`: it held a tile of >= 512 route rows) and
-/// `None` on an idle iteration (the loop's 2 ms idle sleep), which counts like a step so an idle
-/// server gives back the caches and re-lends without waiting for traffic. The idle count restarts
-/// after a long prefill or any reclaim (a gate, backstop or borrow reclaim all move the bundle's reclaim count); the
-/// tick runs only while no request is queued and no lane prefills. Never fails the loop: a failed
-/// tick is logged by the bundle and the next one asks again.
+/// `None` on an idle iteration (the loop's 2 ms idle sleep with lanes active but nothing planned),
+/// which counts like a step. The idle count lives in the bundle (`Qwen4Bundle::elastic_idle_boundary`)
+/// because this loop returns when no lane is active and nothing is queued: it spans busy periods
+/// and restarts after a long prefill or any reclaim (a gate, backstop or borrow reclaim all move
+/// the bundle's reclaim count); the tick runs only while no request is queued and no lane
+/// prefills. Never fails the loop: a failed tick is logged by the bundle and the next one asks
+/// again.
 fn elastic_boundary(
     sched: &ContinuousBatchScheduler,
     m: &mut LoadedModel,
     gpu: &mut Gpu,
     controls: &[Option<LaneCtl>],
-    idle: &mut ElasticIdle,
     step: Option<bool>,
 ) {
     match Owner::of(m, gpu) {
@@ -1115,17 +1107,11 @@ fn elastic_boundary(
     let Ok(mut owner) = Owner::of(m, gpu) else {
         return;
     };
-    let reclaims = owner.bundle.elastic_reclaim_epoch();
-    if reclaims != idle.reclaims || step == Some(true) {
-        idle.steps = 0;
-    } else {
-        idle.steps = idle.steps.saturating_add(1);
-    }
-    idle.reclaims = reclaims;
+    let idle_steps = owner.bundle.elastic_idle_boundary(step == Some(true));
     if prefilling || !sched.inbox.is_empty() {
         return;
     }
-    owner.bundle.elastic_tick(&mut *owner.gpu, idle.steps);
+    owner.bundle.elastic_tick(&mut *owner.gpu, idle_steps);
 }
 
 /// A failed `draft_step`: its error and every lane it named.
@@ -1869,9 +1855,6 @@ pub fn drive_qwen4_lane_batch(
     let mut cursor = 0;
     let mut trace = StepTrace::new();
     let mut mix = MeshMix::default();
-    // Step boundaries since the last >= 512-row prefill or elastic reclaim (the elastic reserve's
-    // idle count).
-    let mut elastic_idle = ElasticIdle::default();
     // The request the page budget is holding at the queue front, if any.
     let mut page_wait: Option<PageWait> = None;
     // Requests a failed step put back in line (see `lane_step_failed`).
@@ -2325,7 +2308,7 @@ pub fn drive_qwen4_lane_batch(
                 }
             };
             if plan.requests.is_empty() && mesh_requests.is_empty() {
-                elastic_boundary(sched, m, gpu, &controls, &mut elastic_idle, None);
+                elastic_boundary(sched, m, gpu, &controls, None);
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
             }
@@ -2486,14 +2469,7 @@ pub fn drive_qwen4_lane_batch(
                 .requests
                 .iter()
                 .any(|r| r.kind == RequestStepKind::Prefill && long_prefill_route_rows(r.rows.len));
-            elastic_boundary(
-                sched,
-                m,
-                gpu,
-                &controls,
-                &mut elastic_idle,
-                Some(long_prefill),
-            );
+            elastic_boundary(sched, m, gpu, &controls, Some(long_prefill));
         }
     })();
     mix.report();
