@@ -1381,7 +1381,7 @@ fn all_rows_stages_apply(
 /// lane step with its shape -- rows, groups, where the HC / non-MoE stages and the routed MoE
 /// run, MoE calls per layer and the launches emitted per stage -- so a timing job can prove it
 /// measured the intended step. Read once.
-fn lane_step_trace_enabled() -> bool {
+pub(crate) fn lane_step_trace_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         hipfire_config::developer_bool("HIPFIRE_QWEN4_LANE_STEP_TRACE", false)
     });
@@ -1567,8 +1567,10 @@ impl LaneAllRowsRule {
             // (GFX1201_HC8_ROWS_RECEIPT). Elsewhere it is not a row twin: on the single-card
             // hetero serve, 3 MTP lanes (24 rows) with hc_read and hc_write shared diverged from
             // the singleton, and were byte-identical with the segment off. Such a step keeps
-            // the HC stages once per <= LANE_MAX_ROWS group.
-            hc_flag: gpu.flags.qwen4_lane_hc_allrows_enabled() && gather_cap.is_some(),
+            // the HC stages once per <= LANE_MAX_ROWS group, unless the lab exact scope
+            // (`HIPFIRE_QWEN4_LANE_ALLROWS_EXACT`) runs the all-rows steps on the row-exact tiles.
+            hc_flag: gpu.flags.qwen4_lane_hc_allrows_enabled()
+                && (gather_cap.is_some() || gpu.flags.qwen4_lane_allrows_exact_enabled()),
             stages_flag: gpu.flags.qwen4_lane_allrows_enabled(),
             exact_flag: gpu.flags.qwen4_lane_allrows_exact_enabled(),
             moe_flag: gpu.flags.qwen4_lane_allrows_moe_enabled(),
@@ -1808,12 +1810,71 @@ impl MoeStepHooks for HcAllRowsScope {
 /// the step's other hooks (the all-rows HC scope) when it has them.
 struct HeteroLaneMoe<'h> {
     inner: Option<&'h mut dyn MoeStepHooks>,
+    /// A hetero split is active: every MoE call advances its exchange.
+    hetero: bool,
+    /// `HIPFIRE_QWEN4_LANE_STEP_TRACE`: per-step-kind wall clock.
+    clock: Option<&'h mut StageClock>,
+}
+
+/// Wall time per step kind of one lane forward (`HIPFIRE_QWEN4_LANE_STEP_TRACE`):
+/// a device sync before every announced step closes the previous step's span.
+/// The syncs serialise the forward, so the totals are a diagnostic breakdown,
+/// not a production timing.
+#[derive(Default)]
+struct StageClock {
+    open: Option<(std::time::Instant, String)>,
+    totals: Vec<(String, f64, usize)>,
+}
+
+impl StageClock {
+    /// Close the open span and, with `label`, open the next one.
+    fn mark(
+        &mut self,
+        gpu: &mut Gpu,
+        label: Option<String>,
+    ) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))?;
+        let now = std::time::Instant::now();
+        if let Some((start, open)) = self.open.take() {
+            let ms = (now - start).as_secs_f64() * 1e3;
+            match self.totals.iter_mut().find(|(l, ..)| *l == open) {
+                Some(total) => {
+                    total.1 += ms;
+                    total.2 += 1;
+                }
+                None => self.totals.push((open, ms, 1)),
+            }
+        }
+        self.open = label.map(|l| (now, l));
+        Ok(())
+    }
+
+    fn step_label(step: &Step<'_>) -> String {
+        match step {
+            Step::GatedDeltaNet(op) => format!("GatedDeltaNet:{:?}", op.phase),
+            Step::IndexedAttention(op) => format!("IndexedAttention:{:?}", op.phase),
+            other => other.variant_name().to_string(),
+        }
+    }
+
+    fn line(&self) -> String {
+        self.totals
+            .iter()
+            .map(|(label, ms, calls)| format!("{label}={ms:.2}/{calls}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 }
 
 impl MoeStepHooks for HeteroLaneMoe<'_> {
     fn before_moe(&mut self, gpu: &mut Gpu) -> Result<(), hipfire_dispatch::types::DispatchError> {
         if let Some(inner) = self.inner.as_mut() {
             inner.before_moe(gpu)?;
+        }
+        if !self.hetero {
+            return Ok(());
         }
         crate::hetero::advance_call(gpu).map_err(hipfire_dispatch::types::DispatchError::Hip)
     }
@@ -1828,6 +1889,9 @@ impl MoeStepHooks for HeteroLaneMoe<'_> {
         gpu: &mut Gpu,
         step: &Step<'_>,
     ) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        if let Some(clock) = self.clock.as_mut() {
+            clock.mark(gpu, Some(StageClock::step_label(step)))?;
+        }
         match self.inner.as_mut() {
             Some(inner) => inner.before_step(gpu, step),
             None => Ok(()),
@@ -4018,6 +4082,8 @@ fn forward_lanes_scoped(
             if hetero {
                 crate::hetero::begin_token(gpu).map_err(Qwen4GpuForwardError::Dispatch)?;
             }
+            let mut clock = lane_step_trace_enabled().then(StageClock::default);
+            let timed = clock.is_some();
             let result = if hc_seg.is_some() {
                 let mut scope = HcAllRowsScope {
                     rows: n,
@@ -4025,9 +4091,11 @@ fn forward_lanes_scoped(
                     exact: exact_scope,
                     moe: moe_all,
                 };
-                let result = if hetero {
+                let result = if hetero || timed {
                     let mut hooks = HeteroLaneMoe {
                         inner: Some(&mut scope),
+                        hetero,
+                        clock: clock.as_mut(),
                     };
                     execute_validated_steps_with_moe_hooks(gpu, &ctx, steps, &mut hooks)
                 } else {
@@ -4035,12 +4103,27 @@ fn forward_lanes_scoped(
                 };
                 gpu.set_wide_verify_rows(prior_wide);
                 result
-            } else if hetero {
-                let mut hooks = HeteroLaneMoe { inner: None };
+            } else if hetero || timed {
+                let mut hooks = HeteroLaneMoe {
+                    inner: None,
+                    hetero,
+                    clock: clock.as_mut(),
+                };
                 execute_validated_steps_with_moe_hooks(gpu, &ctx, steps, &mut hooks)
             } else {
                 execute_validated_steps(gpu, &ctx, steps)
             };
+            if let Some(clock) = clock.as_mut() {
+                clock.mark(gpu, None).map_err(|error| {
+                    Qwen4GpuForwardError::Dispatch(format!("lane stage trace: {error:?}"))
+                })?;
+                eprintln!(
+                    "[lane-stage-trace] lanes={} rows={n} steps={} {}",
+                    lanes.len(),
+                    steps.len(),
+                    clock.line()
+                );
+            }
             result.map_err(|error| {
                 Qwen4GpuForwardError::Dispatch(format!("execute lane program: {error:?}"))
             })
