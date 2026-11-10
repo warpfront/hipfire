@@ -163,6 +163,7 @@ struct Args {
     g0: bool,
     controls: bool,
     bench: usize,
+    bench_rounds: usize,
     spec_mtp: bool,
     k: usize,
     routes: RoutesArg,
@@ -215,6 +216,7 @@ fn parse_args_from(raw: &[String]) -> R<Args> {
         g0: false,
         controls: false,
         bench: 0,
+        bench_rounds: 0,
         spec_mtp: false,
         k: 3,
         routes: RoutesArg::Cycle,
@@ -239,6 +241,9 @@ fn parse_args_from(raw: &[String]) -> R<Args> {
             "--max-seq" => a.max_seq = value(&mut i, "--max-seq")?.parse().map_err(e)?,
             "--policy" => a.policy = value(&mut i, "--policy")?,
             "--bench" => a.bench = value(&mut i, "--bench")?.parse().map_err(e)?,
+            "--bench-rounds" => {
+                a.bench_rounds = value(&mut i, "--bench-rounds")?.parse().map_err(e)?
+            }
             "--spec" => {
                 a.spec_mtp = match value(&mut i, "--spec")?.as_str() {
                     "ar" => false,
@@ -1571,13 +1576,14 @@ fn median(v: &mut [f64]) -> f64 {
 }
 
 impl App {
-    /// Wall time per lane step at `k` lanes (production policy), median over `n`.
-    fn bench_lanes(&mut self, k: usize, n: usize) -> R<f64> {
+    /// Wall time per lane step at `k` lanes under `policy` (`--policy`,
+    /// production by default), median over `n`.
+    fn bench_lanes(&mut self, k: usize, n: usize, policy: LaneStagePolicy) -> R<f64> {
         self.w
             .bundle
             .lanes_mut()
             .ok_or("lane store is not staged")?
-            .set_stage_policy(LaneStagePolicy::production());
+            .set_stage_policy(policy);
         let mut lanes: Vec<Lane> = Vec::new();
         let result = (|| -> R<f64> {
             for req in 0..k {
@@ -3931,7 +3937,7 @@ fn real_main() -> R<bool> {
             "bench singleton: {singleton_ms:.3} ms/step (median of {n}, request 0)"
         ));
         for &k in &args.ks {
-            let step_ms = app.bench_lanes(k, n)?;
+            let step_ms = app.bench_lanes(k, n, primary)?;
             let tok_s = k as f64 * 1000.0 / step_ms;
             let speedup = tok_s / (1000.0 / singleton_ms);
             app.log.say(format!(
@@ -3940,6 +3946,46 @@ fn real_main() -> R<bool> {
             bench_json.push(json!({
                 "k": k, "step_ms": step_ms, "tok_s": tok_s, "singleton_ms": singleton_ms, "speedup": speedup
             }));
+        }
+        // `--bench-rounds R`: R interleaved rounds of (singleton, then per
+        // k: every stage per lane, then `--policy`), so host load drifts hit
+        // both arms alike; the medians over rounds are reported.
+        if args.bench_rounds > 0 {
+            let per_lane = LaneStagePolicy::all_per_lane();
+            let mut singleton = Vec::new();
+            let mut arms: Vec<[Vec<f64>; 2]> = vec![Default::default(); args.ks.len()];
+            for round in 0..args.bench_rounds {
+                singleton.push(app.bench_singleton(n)?);
+                for (i, &k) in args.ks.iter().enumerate() {
+                    for (arm, policy) in [per_lane, primary].into_iter().enumerate() {
+                        let ms = app.bench_lanes(k, n, policy)?;
+                        app.log.say(format!(
+                            "bench round {round} k={k} {}: step_ms={ms:.3}",
+                            if arm == 0 { "per-lane" } else { "policy" }
+                        ));
+                        arms[i][arm].push(ms);
+                    }
+                }
+            }
+            let singleton_ms = median(&mut singleton);
+            app.log.say(format!(
+                "bench interleaved singleton: {singleton_ms:.3} ms/step (median of {} rounds)",
+                args.bench_rounds
+            ));
+            for (i, &k) in args.ks.iter().enumerate() {
+                let [lane, policy] = &mut arms[i];
+                let (lane_ms, policy_ms) = (median(lane), median(policy));
+                app.log.say(format!(
+                    "bench interleaved k={k}: per-lane step_ms={lane_ms:.3} ({:.2} tok/s), policy step_ms={policy_ms:.3} ({:.2} tok/s), policy/per-lane speedup={:.3}x",
+                    k as f64 * 1000.0 / lane_ms,
+                    k as f64 * 1000.0 / policy_ms,
+                    lane_ms / policy_ms
+                ));
+                bench_json.push(json!({
+                    "k": k, "interleaved_rounds": args.bench_rounds, "singleton_ms": singleton_ms,
+                    "per_lane_step_ms": lane_ms, "policy_step_ms": policy_ms,
+                }));
+            }
         }
     }
 

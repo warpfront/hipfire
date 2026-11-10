@@ -104,8 +104,9 @@ use crate::gpu_forward::{
 };
 use crate::gpu_forward::{
     decode_copy, dense_ref, hyper_read_desc, invalid, layer_desc, matrix_view, ple_desc,
-    program_dims, qwen4_ple_rows_f16, router_columns, view, Qwen4GpuForward, Qwen4GpuForwardError,
-    Qwen4GpuForwardScratch, ScratchField, DECODE_Q8_PER_LAYER, EPSILON,
+    program_dims, qwen4_ple_rows_f16, router_columns, view, Qwen4ForwardScratchMode,
+    Qwen4GpuForward, Qwen4GpuForwardError, Qwen4GpuForwardScratch, ScratchField,
+    DECODE_Q8_PER_LAYER, EPSILON,
 };
 use crate::mesh_lane_protocol::pack_classed_row_groups;
 use crate::ple_stage::ple_async_upload;
@@ -358,6 +359,26 @@ pub const GFX1201_Q8_TRUNK_ROWS_RECEIPT: &str =
 pub const GFX1201_HC8_ROWS_RECEIPT: &str =
     "g0 hc8/proof/oracle1 j8251 2026-11-06 gfx1201 hc8 e4m3 hc read rows1-64";
 
+/// G0 oracle receipt behind the gfx1201 single-card (one R9700) Flash-Next
+/// mq4-xts row-twin proofs (`fn_lane_oracle --g0`, compact `FnSymGfx1201`
+/// scratch with the lane-carry buffers ([`LaneCarry`]), 18 resident expert
+/// layers, D2 off): every shareable non-MoE stage alone and the combined
+/// policy of every shareable stage were byte-identical to the per-lane
+/// singleton at K=2 and K=8, 8 prompts x 16 steps; the combined policy also
+/// at K=1..4, 4 prompts x 4 steps, with D2 on. The artifact's non-MoE
+/// tensors are Q8_0 embed, MQ6G256V2 head, GDN in/out and QSA in/out, and
+/// BF16 PLE rows and hyper-connection. No MoE row: that sweep's expert class
+/// is not the hetero split's.
+pub const GFX1201_SINGLE_MQ4XTS_RECEIPT: &str =
+    "g0 hetero-lanes/g0_carry 2026-11-09 gfx1201 single flash-next mq4-xts k2,8 + combined k1-4";
+
+/// Receipts evidenced on AR lanes only: their rows never apply to a store
+/// whose lanes run MTP verify windows. On the hetero serve (3 lanes, MTP K=7)
+/// the single-card rows diverged from the singleton (2 of 3 prompts, 200
+/// greedy tokens) while every stage per lane and the same rows on AR lanes
+/// were byte-identical.
+pub const LANE_AR_ONLY_RECEIPTS: &[&str] = &[GFX1201_SINGLE_MQ4XTS_RECEIPT];
+
 /// Device topology a lane step runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LaneTopology {
@@ -459,10 +480,12 @@ const LANE_ALL_TOPOLOGIES: &[LaneTopology] =
     &[LaneTopology::Single, LaneTopology::Pp, LaneTopology::Ep];
 const LANE_PP_ONLY: &[LaneTopology] = &[LaneTopology::Pp];
 const LANE_EP_ONLY: &[LaneTopology] = &[LaneTopology::Ep];
+const LANE_SINGLE_ONLY: &[LaneTopology] = &[LaneTopology::Single];
 
 /// Row-twin proofs, one row per shared stage per arch and topology domain
-/// (gfx1201 carries a PP-only domain and a disjoint EP-only domain whose MoE
-/// row is the packed static-or-balanced expert class). A stage is
+/// (gfx1201 carries a PP-only domain, a disjoint EP-only domain whose MoE
+/// row is the packed static-or-balanced expert class, and a single-card
+/// domain without a MoE row). A stage is
 /// shared only when every instance a lane owns matches a row of its arch,
 /// stage and topology; any other (arch, topology, route) keeps that stage per
 /// lane until its own G0 run (other cards bind other kernels, e.g. no Q8_0
@@ -798,6 +821,83 @@ pub static LANE_ROW_TWIN_PROOFS: &[RowTwinProof] = &[
         LANE_EP_ONLY,
         GFX1201_EP2_MQ4_RECEIPT,
     ),
+    proof(
+        "gfx1201",
+        StageName::Embed,
+        StageRoute::Embed(DType::Q8_0),
+        LANE_SINGLE_ONLY,
+        GFX1201_SINGLE_MQ4XTS_RECEIPT,
+    ),
+    proof(
+        "gfx1201",
+        StageName::PleRows,
+        StageRoute::PleRows(DType::BF16),
+        LANE_SINGLE_ONLY,
+        GFX1201_SINGLE_MQ4XTS_RECEIPT,
+    ),
+    proof(
+        "gfx1201",
+        StageName::HcRead,
+        StageRoute::HyperRead([DType::BF16; 3]),
+        LANE_SINGLE_ONLY,
+        GFX1201_SINGLE_MQ4XTS_RECEIPT,
+    ),
+    proof(
+        "gfx1201",
+        StageName::HcWrite,
+        StageRoute::HyperWrite(DType::BF16),
+        LANE_SINGLE_ONLY,
+        GFX1201_SINGLE_MQ4XTS_RECEIPT,
+    ),
+    proof(
+        "gfx1201",
+        StageName::GdnInProj,
+        StageRoute::GdnIn([DType::MQ6G256V2; 4]),
+        LANE_SINGLE_ONLY,
+        GFX1201_SINGLE_MQ4XTS_RECEIPT,
+    ),
+    proof(
+        "gfx1201",
+        StageName::GdnOutProj,
+        StageRoute::Projection(DType::MQ6G256V2),
+        LANE_SINGLE_ONLY,
+        GFX1201_SINGLE_MQ4XTS_RECEIPT,
+    ),
+    proof(
+        "gfx1201",
+        StageName::QsaInProj,
+        StageRoute::QsaIn([DType::MQ6G256V2; 4]),
+        LANE_SINGLE_ONLY,
+        GFX1201_SINGLE_MQ4XTS_RECEIPT,
+    ),
+    proof(
+        "gfx1201",
+        StageName::QsaOutProj,
+        StageRoute::Projection(DType::MQ6G256V2),
+        LANE_SINGLE_ONLY,
+        GFX1201_SINGLE_MQ4XTS_RECEIPT,
+    ),
+    proof(
+        "gfx1201",
+        StageName::FinalHyper,
+        StageRoute::HyperRead([DType::BF16; 3]),
+        LANE_SINGLE_ONLY,
+        GFX1201_SINGLE_MQ4XTS_RECEIPT,
+    ),
+    proof(
+        "gfx1201",
+        StageName::Head,
+        StageRoute::Projection(DType::MQ6G256V2),
+        LANE_SINGLE_ONLY,
+        GFX1201_SINGLE_MQ4XTS_RECEIPT,
+    ),
+    proof(
+        "gfx1201",
+        StageName::Argmax,
+        StageRoute::Argmax(DType::F32),
+        LANE_SINGLE_ONLY,
+        GFX1201_SINGLE_MQ4XTS_RECEIPT,
+    ),
 ];
 
 /// A resolved lane policy: the policy, the receipts of the proofs behind
@@ -912,6 +1012,26 @@ impl LaneStagePolicy {
         routes: &LaneStageRoutes,
     ) -> LanePolicyResolution {
         resolve_with_proofs(arch, topology, routes, LANE_ROW_TWIN_PROOFS)
+    }
+
+    /// [`Self::for_bound_routes`] for a store whose lanes run MTP verify
+    /// windows (`mtp`): proofs evidenced on AR lanes only
+    /// ([`LANE_AR_ONLY_RECEIPTS`]) do not apply there.
+    pub fn for_bound_routes_spec(
+        arch: &str,
+        topology: LaneTopology,
+        routes: &LaneStageRoutes,
+        mtp: bool,
+    ) -> LanePolicyResolution {
+        if !mtp {
+            return Self::for_bound_routes(arch, topology, routes);
+        }
+        let proofs: Vec<RowTwinProof> = LANE_ROW_TWIN_PROOFS
+            .iter()
+            .filter(|proof| !LANE_AR_ONLY_RECEIPTS.contains(&proof.receipt))
+            .copied()
+            .collect();
+        resolve_with_proofs(arch, topology, routes, &proofs)
     }
 
     /// The G0-evidenced share table: every row-local stage shared. It is not
@@ -1749,6 +1869,143 @@ struct SegViews {
     top1: GpuTensor,
 }
 
+/// Mixer phase outputs a lane step carries across operations of other
+/// scratch groups: the input projections' outputs Core reads (GDN qkv / a / b /
+/// z, QSA index / qgate / k / v) and Core's output the output projection
+/// reads.
+const LANE_CARRY_FIELDS: [ScratchField; 10] = [
+    ScratchField::Projection,
+    ScratchField::GdnA,
+    ScratchField::GdnB,
+    ScratchField::GdnZ,
+    ScratchField::GdnOutput,
+    ScratchField::QsaIndex,
+    ScratchField::QsaQgate,
+    ScratchField::QsaK,
+    ScratchField::QsaV,
+    ScratchField::QsaOutput,
+];
+
+/// Rows a lane step's carry buffers cover at most (`WIDE_VERIFY_MAX_ROWS`); a
+/// wider step (a prefill wave) keeps its mixers whole instead.
+const LANE_CARRY_MAX_ROWS: usize = 64;
+
+/// Logical row width of a [`LANE_CARRY_FIELDS`] member, as [`SegViews::new`]
+/// views it.
+fn lane_carry_width(dims: Qwen4ProgramDims, field: ScratchField) -> usize {
+    use ScratchField as F;
+    match field {
+        F::Projection => dims.gdn_qkv(),
+        F::GdnA | F::GdnB => dims.linear_num_value_heads,
+        F::GdnZ | F::GdnOutput => dims.gdn_value(),
+        F::QsaIndex => dims.index_width(),
+        F::QsaQgate => 2 * dims.q_width(),
+        F::QsaK | F::QsaV => dims.kv_width(),
+        F::QsaOutput => dims.q_width(),
+        _ => unreachable!("{field:?} is not a lane carry field"),
+    }
+}
+
+/// Dedicated storage for the mixer phase outputs of a lane step under the
+/// compact scratch plan ([`Qwen4ForwardScratchMode::FnSymGfx1201`]).
+///
+/// The compact plan overlays the step-local fields of the GDN, QSA, HC, PLE,
+/// MoE and embedding steps in one arena, valid while those groups never run at
+/// once. A singleton runs each mixer as one whole op, so its phase outputs
+/// never outlive an op of another group. A lane step that splits a mixer
+/// ([`MixerPhase`]) does: per-lane runs are segment-major, so lane 1's rows of
+/// a shared input projection must survive lane 0's core, output projection,
+/// HC and MoE ops, which write overlapping arena rows. These fields therefore
+/// live here for such a step, outside the arena, at their logical row width.
+#[derive(Default)]
+pub(crate) struct LaneCarry {
+    rows: usize,
+    tensors: Vec<GpuTensor>,
+}
+
+impl LaneCarry {
+    /// Cover `rows` rows; `false` (nothing allocated) past
+    /// [`LANE_CARRY_MAX_ROWS`].
+    fn ensure(
+        &mut self,
+        gpu: &mut Gpu,
+        dims: Qwen4ProgramDims,
+        rows: usize,
+    ) -> Result<bool, Qwen4GpuForwardError> {
+        if rows > LANE_CARRY_MAX_ROWS {
+            return Ok(false);
+        }
+        if self.rows >= rows {
+            return Ok(true);
+        }
+        if let Some(error) = std::mem::take(self).free_gpu(gpu) {
+            return Err(error.into());
+        }
+        let capacity = rows.next_multiple_of(8).min(LANE_CARRY_MAX_ROWS);
+        let mut tensors = Vec::with_capacity(LANE_CARRY_FIELDS.len());
+        for field in LANE_CARRY_FIELDS {
+            match gpu.alloc_tensor(&[capacity * lane_carry_width(dims, field)], DType::F32) {
+                Ok(tensor) => tensors.push(tensor),
+                Err(error) => {
+                    for tensor in tensors {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+        *self = Self {
+            rows: capacity,
+            tensors,
+        };
+        Ok(true)
+    }
+
+    /// `seg`'s rows of `field` (a [`LANE_CARRY_FIELDS`] member).
+    fn rows(&self, field: ScratchField, seg: Segment, width: usize) -> GpuTensor {
+        let index = LANE_CARRY_FIELDS
+            .iter()
+            .position(|&f| f == field)
+            .expect("lane carry field");
+        view(&self.tensors[index], seg.begin * width, seg.rows * width)
+    }
+
+    pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+        let mut first = None;
+        for tensor in self.tensors {
+            if let Err(error) = gpu.free_tensor(tensor) {
+                first.get_or_insert(error);
+            }
+        }
+        first
+    }
+}
+
+/// Whether `policy` splits a mixer into phases (either of its projections
+/// shared), see [`lane_program`].
+fn splits_mixers(policy: &LaneStagePolicy) -> bool {
+    MIXER_PROJECTIONS
+        .iter()
+        .any(|&stage| !policy.share(stage).per_lane())
+}
+
+const MIXER_PROJECTIONS: [StageName; 4] = [
+    StageName::GdnInProj,
+    StageName::GdnOutProj,
+    StageName::QsaInProj,
+    StageName::QsaOutProj,
+];
+
+/// `policy` with every mixer projection per lane: each mixer stays the whole
+/// op.
+fn whole_mixers(policy: &LaneStagePolicy) -> Result<LaneStagePolicy, Qwen4GpuForwardError> {
+    let mut whole = *policy;
+    for stage in MIXER_PROJECTIONS {
+        whole = whole.with(stage, StageShare::PerLane).map_err(invalid)?;
+    }
+    Ok(whole)
+}
+
 /// Segment views of the scratch.  Every row-banded field comes from
 /// [`Qwen4GpuForwardScratch::segment_view`]: a dedicated field is addressed at
 /// its logical row width, a field of an alias set (compact scratch) at the row
@@ -1829,6 +2086,7 @@ impl SegViews {
         ple_embed_dim: usize,
         bf16_streams: bool,
         ple_normed_field: ScratchField,
+        carry: Option<&LaneCarry>,
     ) -> Result<Self, Qwen4GpuForwardError> {
         let b = seg.begin;
         let wide = dims.wide();
@@ -1849,6 +2107,12 @@ impl SegViews {
         };
         use ScratchField as F;
         let rows = |field: F, width: usize| seg_rows(scratch, field, seg, width);
+        // A step that splits its mixers under the compact plan keeps their
+        // phase outputs out of the arena ([`LaneCarry`]).
+        let carried = |field: F| match carry {
+            Some(carry) => Ok(carry.rows(field, seg, lane_carry_width(dims, field))),
+            None => rows(field, lane_carry_width(dims, field)),
+        };
         Ok(Self {
             streams: if bf16_streams {
                 bf16_stream_rows(scratch, seg, wide)?
@@ -1860,20 +2124,20 @@ impl SegViews {
             hc_up: rows(F::HcUp, wide)?,
             hc_mixed: rows(F::HcMixed, hidden)?,
             hc_gates: rows(F::HcGates, dims.hc_count)?,
-            projection: rows(F::Projection, dims.gdn_qkv())?,
+            projection: carried(F::Projection)?,
             projection2: rows(F::Projection2, dims.gdn_qkv())?,
-            gdn_a: rows(F::GdnA, value_heads)?,
-            gdn_b: rows(F::GdnB, value_heads)?,
+            gdn_a: carried(F::GdnA)?,
+            gdn_b: carried(F::GdnB)?,
             gdn_gate: rows(F::GdnGate, value_heads)?,
             gdn_beta: rows(F::GdnBeta, value_heads)?,
             gdn_recurrent_output: rows(F::GdnRecurrentOutput, dims.gdn_value())?,
-            gdn_z: rows(F::GdnZ, dims.gdn_value())?,
-            gdn_output: rows(F::GdnOutput, dims.gdn_value())?,
-            qsa_index: rows(F::QsaIndex, dims.index_width())?,
-            qsa_qgate: rows(F::QsaQgate, 2 * dims.q_width())?,
-            qsa_k: rows(F::QsaK, dims.kv_width())?,
-            qsa_v: rows(F::QsaV, dims.kv_width())?,
-            qsa_output: rows(F::QsaOutput, dims.q_width())?,
+            gdn_z: carried(F::GdnZ)?,
+            gdn_output: carried(F::GdnOutput)?,
+            qsa_index: carried(F::QsaIndex)?,
+            qsa_qgate: carried(F::QsaQgate)?,
+            qsa_k: carried(F::QsaK)?,
+            qsa_v: carried(F::QsaV)?,
+            qsa_output: carried(F::QsaOutput)?,
             attention_output: rows(F::AttentionOutput, hidden)?,
             ffn_output: rows(F::FfnOutput, hidden)?,
             router_logits: matrix_view(&scratch.router_logits, seg.rows, router_columns(dims))?,
@@ -2352,6 +2616,19 @@ fn forward_lanes_scoped(
     let rows: Vec<usize> = lanes.iter().map(|lane| lane.tokens.len()).collect();
     let n: usize = rows.iter().sum();
     let prefill = out.prefill();
+    // Under the compact scratch plan a step that splits a mixer keeps the
+    // phase outputs in dedicated buffers ([`LaneCarry`]); a step too wide for
+    // them keeps its mixers whole (the singleton's op, which never splits).
+    let compact = fwd.scratch.mode == Qwen4ForwardScratchMode::FnSymGfx1201;
+    let split = compact && splits_mixers(policy);
+    let use_carry = split && fwd.lane_carry.ensure(gpu, dims, n)?;
+    let whole;
+    let policy = if split && !use_carry {
+        whole = whole_mixers(policy)?;
+        &whole
+    } else {
+        policy
+    };
     for (lane, rows) in lanes.iter().zip(&rows) {
         if prefill != matches!(lane.kind, LaneRowKind::Prefill) {
             return Err(invalid(
@@ -2808,6 +3085,7 @@ fn forward_lanes_scoped(
 
     let attempt = (|| -> Result<Vec<QsaCommit>, Qwen4GpuForwardError> {
         let scratch = &fwd.scratch;
+        let carry = use_carry.then_some(&fwd.lane_carry);
         let mut views = Vec::with_capacity(all_segs.len());
         for seg in &all_segs {
             views.push(SegViews::new(
@@ -2823,6 +3101,7 @@ fn forward_lanes_scoped(
                 // Every segment of the step addresses the one field its
                 // total row count selects.
                 scratch.ple_normed_field(n),
+                carry,
             )?);
         }
         let seg_scratch: Vec<Qwen4LayerScratch<'_>> = views
@@ -3142,6 +3421,7 @@ fn forward_lanes_scoped(
                     ple_head_count * ple_row_width,
                     bf16_state && !(band_scope.input && band_scope.output),
                     scratch.ple_normed_field(n),
+                    carry,
                 )
             })
             .collect::<Result<_, _>>()?;
@@ -4353,8 +4633,12 @@ mod tests {
         // and one EP row per shared stage, plus the second PP MoE row (the
         // mq3 slab class), the two EP Q8F16 QSA overlay rows (qsa_in x4,
         // qsa_out) and the three EP Q8F16 trunk rows (gdn_in x4, gdn_out,
-        // head), and the two EP HC8 rows (hc_read, final_hyper).
-        assert_eq!(LANE_ROW_TWIN_PROOFS.len(), 3 * shared.len() + 1 + 2 + 3 + 2);
+        // head), and the two EP HC8 rows (hc_read, final_hyper); plus one
+        // single-card row per shared stage but the MoE.
+        assert_eq!(
+            LANE_ROW_TWIN_PROOFS.len(),
+            3 * shared.len() + 1 + 2 + 3 + 2 + (shared.len() - 1)
+        );
         for arch in ["gfx1151", "gfx1201"] {
             for stage in StageName::ALL {
                 for topology in ALL_TOPOLOGIES {
@@ -4370,6 +4654,9 @@ mod tests {
                         ("gfx1151", _) => shared.contains(&stage),
                         ("gfx1201", LaneTopology::Pp) => shared.contains(&stage),
                         ("gfx1201", LaneTopology::Ep) => shared.contains(&stage),
+                        ("gfx1201", LaneTopology::Single) => {
+                            shared.contains(&stage) && stage != StageName::Moe
+                        }
                         _ => false,
                     };
                     // The PP MoE stage carries the mq2 and the mq3 slab rows;
@@ -4422,6 +4709,13 @@ mod tests {
                                 } else {
                                     assert_eq!(proof.receipt, GFX1201_PP2_MQ2_RECEIPT);
                                 }
+                            }
+                            (_, LaneTopology::Single) => {
+                                assert_ne!(proof.route, StageRoute::Any);
+                                assert_ne!(proof.route, StageRoute::Unclassified);
+                                assert!(!matches!(proof.route, StageRoute::Moe { .. }));
+                                assert_eq!(proof.domain, [LaneTopology::Single]);
+                                assert_eq!(proof.receipt, GFX1201_SINGLE_MQ4XTS_RECEIPT);
                             }
                             _ => {
                                 assert_ne!(proof.route, StageRoute::Any);
@@ -4605,26 +4899,105 @@ mod tests {
         assert_eq!(other_arch.policy, LaneStagePolicy::all_per_lane());
     }
 
+    /// The route instances the single-card (one R9700) Flash-Next mq4-xts
+    /// lane store registered (oracle placement, D2 on; read from its
+    /// `HIPFIRE_TEMP_LANE_ROUTES` trace, NOT from the proof table).
+    fn single_mq4xts_routes() -> LaneStageRoutes {
+        let mq6 = DType::MQ6G256V2;
+        let bf16 = DType::BF16;
+        let mut routes = LaneStageRoutes::default();
+        routes[StageName::Embed.index()] = vec![StageRoute::Embed(DType::Q8_0)];
+        routes[StageName::PleRows.index()] = vec![StageRoute::PleRows(bf16)];
+        routes[StageName::HcRead.index()] = vec![StageRoute::HyperRead([bf16; 3])];
+        routes[StageName::HcWrite.index()] = vec![StageRoute::HyperWrite(bf16)];
+        routes[StageName::GdnInProj.index()] = vec![StageRoute::GdnIn([mq6; 4])];
+        routes[StageName::GdnOutProj.index()] = vec![StageRoute::Projection(mq6)];
+        routes[StageName::QsaInProj.index()] = vec![StageRoute::QsaIn([mq6; 4])];
+        routes[StageName::QsaOutProj.index()] = vec![StageRoute::Projection(mq6)];
+        routes[StageName::Moe.index()] = vec![StageRoute::Moe {
+            experts: LaneExpertRoute::Split,
+            dense: [bf16; 5],
+            decode_admitted: true,
+        }];
+        routes[StageName::FinalHyper.index()] = vec![StageRoute::HyperRead([bf16; 3])];
+        routes[StageName::Head.index()] = vec![StageRoute::Projection(mq6)];
+        routes[StageName::Argmax.index()] = vec![StageRoute::Argmax(DType::F32)];
+        routes
+    }
+
     #[test]
-    fn gfx1201_single_runs_every_stage_per_lane_with_a_named_reason() {
-        for routes in [
-            pp2_mq2_routes(),
-            ep2_mq4_routes(vec![StageRoute::Unclassified]),
-            LaneStageRoutes::default(),
-        ] {
-            let resolution =
-                LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Single, &routes);
-            assert_eq!(resolution.policy, LaneStagePolicy::all_per_lane());
-            assert!(resolution.receipts.is_empty());
-            assert_stateful_reasons(&resolution);
-            assert_eq!(fallback_stages(&resolution), shared_stages());
-            for stage in shared_stages() {
-                let reason = reason_of(&resolution, stage);
-                assert!(reason.contains("gfx1201"), "{reason}");
-                assert!(reason.contains("Single"), "{reason}");
-                assert!(reason.contains(stage.key()), "{reason}");
-            }
+    fn ar_only_single_rows_never_apply_to_mtp_lanes() {
+        let routes = single_mq4xts_routes();
+        let ar =
+            LaneStagePolicy::for_bound_routes_spec("gfx1201", LaneTopology::Single, &routes, false);
+        assert_eq!(ar.policy, production_without(&[StageName::Moe]));
+        assert_eq!(ar.receipts, [GFX1201_SINGLE_MQ4XTS_RECEIPT]);
+        let mtp =
+            LaneStagePolicy::for_bound_routes_spec("gfx1201", LaneTopology::Single, &routes, true);
+        assert_eq!(mtp.policy, LaneStagePolicy::all_per_lane());
+        assert!(mtp.receipts.is_empty());
+        assert_eq!(fallback_stages(&mtp), shared_stages());
+        // Receipts not marked AR-only keep their rows under MTP.
+        let pp = pp2_mq2_routes();
+        assert_eq!(
+            LaneStagePolicy::for_bound_routes_spec("gfx1201", LaneTopology::Pp, &pp, true).policy,
+            LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Pp, &pp).policy
+        );
+        assert!(LANE_ROW_TWIN_PROOFS
+            .iter()
+            .filter(|row| LANE_AR_ONLY_RECEIPTS.contains(&row.receipt))
+            .all(|row| row.domain == [LaneTopology::Single]));
+    }
+
+    #[test]
+    fn gfx1201_single_shares_the_flash_next_trunk_and_keeps_moe_per_lane() {
+        let routes = single_mq4xts_routes();
+        let resolution =
+            LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Single, &routes);
+        assert_eq!(resolution.policy, production_without(&[StageName::Moe]));
+        assert_eq!(resolution.receipts, [GFX1201_SINGLE_MQ4XTS_RECEIPT]);
+        assert_stateful_reasons(&resolution);
+        assert_eq!(fallback_stages(&resolution), [StageName::Moe]);
+        let reason = reason_of(&resolution, StageName::Moe);
+        assert!(
+            reason.contains("gfx1201") && reason.contains("Single"),
+            "{reason}"
+        );
+
+        // One member of another dtype demotes only its own stage.
+        let mut mixed = routes.clone();
+        mixed[StageName::GdnInProj.index()].push(StageRoute::GdnIn([
+            DType::MQ6G256V2,
+            DType::MQ4G256V2,
+            DType::MQ4G256V2,
+            DType::MQ4G256V2,
+        ]));
+        let mixed = LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Single, &mixed);
+        assert_eq!(
+            fallback_stages(&mixed),
+            [StageName::GdnInProj, StageName::Moe]
+        );
+        assert!(reason_of(&mixed, StageName::GdnInProj).contains("has no row-twin proof"));
+
+        // A stage the band never executes (no instance) is shared vacuously
+        // and cites no receipt; the MoE still has no Single row.
+        let empty = LaneStagePolicy::for_bound_routes(
+            "gfx1201",
+            LaneTopology::Single,
+            &LaneStageRoutes::default(),
+        );
+        assert_eq!(empty.policy, production_without(&[StageName::Moe]));
+        assert!(empty.receipts.is_empty());
+        // An unclassified instance never matches a single-card row.
+        let mut unclassified = LaneStageRoutes::default();
+        for stage in shared_stages() {
+            unclassified[stage.index()] = vec![StageRoute::Unclassified];
         }
+        let unclassified =
+            LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Single, &unclassified);
+        assert_eq!(unclassified.policy, LaneStagePolicy::all_per_lane());
+        assert!(unclassified.receipts.is_empty());
+        assert_eq!(fallback_stages(&unclassified), shared_stages());
     }
 
     /// The route instances an EP2 mq4-xts lane store registers, written out
@@ -5027,10 +5400,15 @@ mod tests {
         assert_eq!(pp_resolution.policy, LaneStagePolicy::production());
         assert_eq!(pp_resolution.receipts, [GFX1201_PP2_MQ2_RECEIPT]);
 
-        // Neither domain leaks to Single.
-        let single = LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Single, &ep);
-        assert_eq!(single.policy, LaneStagePolicy::all_per_lane());
-        assert!(single.receipts.is_empty());
+        // Neither domain's receipt nor MoE class leaks to Single: there the
+        // same trunk routes share on the single-card rows' own receipt and the
+        // MoE (no Single row) stays per lane.
+        for routes in [&ep, &pp] {
+            let single = LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Single, routes);
+            assert_eq!(fallback_stages(&single), [StageName::Moe]);
+            assert_eq!(single.policy, production_without(&[StageName::Moe]));
+            assert_eq!(single.receipts, [GFX1201_SINGLE_MQ4XTS_RECEIPT]);
+        }
     }
 
     #[test]
@@ -5804,6 +6182,62 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn whole_mixers_keeps_every_mixer_one_op_and_other_shares() {
+        let config = crate::config::compact_test_config();
+        let ple_layer = ple_layer_of(&config);
+        let single = Qwen4BandScope::single(&config);
+        for spec in [
+            "per-lane:gdn_in=once",
+            "per-lane:gdn_out=once,qsa_in=once",
+            "per-lane:qsa_out=once,moe=once,hc_read=once",
+        ] {
+            let split = LaneStagePolicy::parse(spec).unwrap();
+            assert!(splits_mixers(&split), "{spec}");
+            let whole = whole_mixers(&split).unwrap();
+            assert!(!splits_mixers(&whole), "{spec}");
+            for stage in StageName::ALL {
+                if !MIXER_PROJECTIONS.contains(&stage) {
+                    assert_eq!(whole.share(stage), split.share(stage), "{spec} {stage:?}");
+                }
+            }
+            let program = lane_program(
+                band_kinds(&config, single.band.clone()),
+                &whole,
+                Some(ple_layer),
+            );
+            assert!(program.iter().all(|(op, _)| !matches!(
+                op,
+                LaneOp::Gdn { phase, .. } | LaneOp::Qsa { phase, .. } if *phase != MixerPhase::Whole
+            )));
+        }
+        assert!(!splits_mixers(
+            &LaneStagePolicy::parse("per-lane:moe=once").unwrap()
+        ));
+    }
+
+    #[test]
+    fn lane_carry_widths_are_the_segment_view_widths() {
+        let dims = program_dims(&crate::config::compact_test_config());
+        use ScratchField as F;
+        for (field, width) in [
+            (F::Projection, dims.gdn_qkv()),
+            (F::GdnA, dims.linear_num_value_heads),
+            (F::GdnB, dims.linear_num_value_heads),
+            (F::GdnZ, dims.gdn_value()),
+            (F::GdnOutput, dims.gdn_value()),
+            (F::QsaIndex, dims.index_width()),
+            (F::QsaQgate, 2 * dims.q_width()),
+            (F::QsaK, dims.kv_width()),
+            (F::QsaV, dims.kv_width()),
+            (F::QsaOutput, dims.q_width()),
+        ] {
+            assert!(LANE_CARRY_FIELDS.contains(&field));
+            assert_eq!(lane_carry_width(dims, field), width, "{field:?}");
+            assert!(width > 0, "{field:?}");
+        }
     }
 
     #[test]
