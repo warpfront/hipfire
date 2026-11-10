@@ -1189,6 +1189,20 @@ fn forward_with_proto(
         }
     }
 
+    // `HIPFIRE_QWEN4_LANE_STEP_TRACE`: one `[lane-phase-trace]` line per step with
+    // the draft (step start to here), verify and prepare phases, each closed by a
+    // device sync. Off, no sync is added.
+    let phase_trace = crate::gpu_forward_lanes::lane_step_trace_enabled();
+    let mut phase_marks: Vec<Instant> = Vec::new();
+    let mut mark = |gpu: &mut Gpu| -> Result<(), String> {
+        if phase_trace {
+            gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
+            phase_marks.push(Instant::now());
+        }
+        Ok(())
+    };
+    mark(gpu)?;
+
     // The decode rows: verify, decide, prepare (the protocol's phases).
     if decode_lanes > 0 {
         let LaneProto {
@@ -1206,12 +1220,14 @@ fn forward_with_proto(
             flight,
         };
         let verified = exec.run_verify(&verify).map_err(|e| e.reason)?;
+        mark(&mut *exec.gpu)?;
         root.collect_verify(&[verified])
             .map_err(|e| e.to_string())?;
         let decision = root
             .decide_commit(&mut GreedyRule)
             .map_err(|e| e.to_string())?;
         let receipt = exec.prepare_commit(&decision).map_err(|e| e.reason)?;
+        mark(&mut *exec.gpu)?;
         root.collect_prepared(&[receipt])
             .map_err(|e| e.to_string())?;
         let fl = exec
@@ -1232,6 +1248,16 @@ fn forward_with_proto(
     // Prefill tiles.
     run_prefill_tiles(bundle, gpu, store, plan, &mut picks)?;
     let prefill_ran = n_prefill > 0;
+    if phase_trace && decode_lanes > 0 && phase_marks.len() == 3 {
+        let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1e3;
+        eprintln!(
+            "[lane-phase-trace] lanes={decode_lanes} rows={} prefill={n_prefill} draft_ms={:.2} verify_ms={:.2} prepare_ms={:.2}",
+            plan.total_rows(),
+            ms(started, phase_marks[0]),
+            ms(phase_marks[0], phase_marks[1]),
+            ms(phase_marks[1], phase_marks[2]),
+        );
+    }
 
     // The step's wall clock feeds the cost model only on a pure-decode step
     // (draft start to the synchronized end): it is the controller interval
