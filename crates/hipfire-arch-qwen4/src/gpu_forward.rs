@@ -11834,6 +11834,24 @@ impl Qwen4GpuForward {
             .map(|layer| layer.label)
             .collect()
     }
+
+    /// Whether this forward's routed experts are exactly the hetero tier
+    /// split (`topology.hetero_experts`): at least one trunk layer carries a
+    /// device-side split, every layer with cold experts sends them through
+    /// one, and no layer runs D2 or the routed CPU splice.
+    pub(crate) fn hetero_tiered_experts(&self) -> bool {
+        let mut hetero = false;
+        for layer in self.moe.iter().flatten() {
+            if layer.cpu_split.is_some()
+                || layer.cpu_deferred_experts
+                || (layer.cpu_cold_owners.is_some() && layer.hetero.is_none())
+            {
+                return false;
+            }
+            hetero |= layer.hetero.is_some();
+        }
+        hetero
+    }
     /// The D2 owner kind of every armed split layer, in layer order.
     pub(crate) fn split_owner_kinds(&self) -> Vec<(usize, &'static str)> {
         self.moe

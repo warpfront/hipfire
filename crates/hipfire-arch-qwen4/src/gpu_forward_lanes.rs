@@ -367,17 +367,23 @@ pub const GFX1201_HC8_ROWS_RECEIPT: &str =
 /// singleton at K=2 and K=8, 8 prompts x 16 steps; the combined policy also
 /// at K=1..4, 4 prompts x 4 steps, with D2 on. The artifact's non-MoE
 /// tensors are Q8_0 embed, MQ6G256V2 head, GDN in/out and QSA in/out, and
-/// BF16 PLE rows and hyper-connection. No MoE row: that sweep's expert class
-/// is not the hetero split's.
+/// BF16 PLE rows and hyper-connection. On the hetero serve (3 lanes, 3 x 200
+/// greedy tokens vs sequential) the rows were byte-identical on AR lanes and,
+/// with the all-rows HC segment held to EP steps ([`LaneAllRowsRule`]), on
+/// MTP K=7 lanes. No MoE row: that sweep's expert class is not the hetero
+/// split's.
 pub const GFX1201_SINGLE_MQ4XTS_RECEIPT: &str =
     "g0 hetero-lanes/g0_carry 2026-11-09 gfx1201 single flash-next mq4-xts k2,8 + combined k1-4";
 
-/// Receipts evidenced on AR lanes only: their rows never apply to a store
-/// whose lanes run MTP verify windows. On the hetero serve (3 lanes, MTP K=7)
-/// the single-card rows diverged from the singleton (2 of 3 prompts, 200
-/// greedy tokens) while every stage per lane and the same rows on AR lanes
-/// were byte-identical.
-pub const LANE_AR_ONLY_RECEIPTS: &[&str] = &[GFX1201_SINGLE_MQ4XTS_RECEIPT];
+/// Serve receipt behind the gfx1201 single-card hetero-tier MoE row-twin
+/// proof ([`LaneExpertRoute::HeteroTiered`]: hot set on the R9700, cold
+/// experts on the gfx1151 responder): on the hetero serve (3 lanes) with
+/// every shareable stage once, MoE included, 3 prompts x 400 greedy tokens
+/// were byte-identical to the same requests served one at a time, on MTP K=7
+/// lanes and on AR lanes (`.hetero-lanes/serve_probe_arm.sh moe_mtp` /
+/// `moe_ar`).
+pub const GFX1201_SINGLE_HETERO_MOE_RECEIPT: &str =
+    "serve hetero-lanes/moe_mtp+moe_ar 2026-11-10 gfx1201+gfx1151 hetero mq4-xts 3 lanes 3x400 greedy";
 
 /// Device topology a lane step runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -413,6 +419,12 @@ pub enum LaneExpertRoute {
     /// and folds under the fixed `e % ranks` reduction partition, so a row's
     /// partial does not depend on the other rows of its call.
     EpPackedStaticOrBalanced,
+    /// The hetero tier split (`topology.hetero_experts`): an expert hot set
+    /// in VRAM, every cold expert served by the expert device's responder
+    /// through the layer's device-side split; no D2 or CPU-splice layer. Set
+    /// only from the bound forward
+    /// ([`crate::gpu_forward::Qwen4GpuForward::hetero_tiered_experts`]).
+    HeteroTiered,
     Unclassified,
 }
 
@@ -485,7 +497,7 @@ const LANE_SINGLE_ONLY: &[LaneTopology] = &[LaneTopology::Single];
 /// Row-twin proofs, one row per shared stage per arch and topology domain
 /// (gfx1201 carries a PP-only domain, a disjoint EP-only domain whose MoE
 /// row is the packed static-or-balanced expert class, and a single-card
-/// domain without a MoE row). A stage is
+/// domain whose MoE row is the hetero tier class). A stage is
 /// shared only when every instance a lane owns matches a row of its arch,
 /// stage and topology; any other (arch, topology, route) keeps that stage per
 /// lane until its own G0 run (other cards bind other kernels, e.g. no Q8_0
@@ -898,6 +910,17 @@ pub static LANE_ROW_TWIN_PROOFS: &[RowTwinProof] = &[
         LANE_SINGLE_ONLY,
         GFX1201_SINGLE_MQ4XTS_RECEIPT,
     ),
+    proof(
+        "gfx1201",
+        StageName::Moe,
+        StageRoute::Moe {
+            experts: LaneExpertRoute::HeteroTiered,
+            dense: [DType::BF16; 5],
+            decode_admitted: false,
+        },
+        LANE_SINGLE_ONLY,
+        GFX1201_SINGLE_HETERO_MOE_RECEIPT,
+    ),
 ];
 
 /// A resolved lane policy: the policy, the receipts of the proofs behind
@@ -1012,26 +1035,6 @@ impl LaneStagePolicy {
         routes: &LaneStageRoutes,
     ) -> LanePolicyResolution {
         resolve_with_proofs(arch, topology, routes, LANE_ROW_TWIN_PROOFS)
-    }
-
-    /// [`Self::for_bound_routes`] for a store whose lanes run MTP verify
-    /// windows (`mtp`): proofs evidenced on AR lanes only
-    /// ([`LANE_AR_ONLY_RECEIPTS`]) do not apply there.
-    pub fn for_bound_routes_spec(
-        arch: &str,
-        topology: LaneTopology,
-        routes: &LaneStageRoutes,
-        mtp: bool,
-    ) -> LanePolicyResolution {
-        if !mtp {
-            return Self::for_bound_routes(arch, topology, routes);
-        }
-        let proofs: Vec<RowTwinProof> = LANE_ROW_TWIN_PROOFS
-            .iter()
-            .filter(|proof| !LANE_AR_ONLY_RECEIPTS.contains(&proof.receipt))
-            .copied()
-            .collect();
-        resolve_with_proofs(arch, topology, routes, &proofs)
     }
 
     /// The G0-evidenced share table: every row-local stage shared. It is not
@@ -1560,7 +1563,12 @@ impl LaneAllRowsRule {
         policy: &LaneStagePolicy,
     ) -> Self {
         Self {
-            hc_flag: gpu.flags.qwen4_lane_hc_allrows_enabled(),
+            // The all-rows HC segment's 9..=64-row routes are evidenced on EP lane steps only
+            // (GFX1201_HC8_ROWS_RECEIPT). Elsewhere it is not a row twin: on the single-card
+            // hetero serve, 3 MTP lanes (24 rows) with hc_read and hc_write shared diverged from
+            // the singleton, and were byte-identical with the segment off. Such a step keeps
+            // the HC stages once per <= LANE_MAX_ROWS group.
+            hc_flag: gpu.flags.qwen4_lane_hc_allrows_enabled() && gather_cap.is_some(),
             stages_flag: gpu.flags.qwen4_lane_allrows_enabled(),
             exact_flag: gpu.flags.qwen4_lane_allrows_exact_enabled(),
             moe_flag: gpu.flags.qwen4_lane_allrows_moe_enabled(),
@@ -4634,11 +4642,8 @@ mod tests {
         // mq3 slab class), the two EP Q8F16 QSA overlay rows (qsa_in x4,
         // qsa_out) and the three EP Q8F16 trunk rows (gdn_in x4, gdn_out,
         // head), and the two EP HC8 rows (hc_read, final_hyper); plus one
-        // single-card row per shared stage but the MoE.
-        assert_eq!(
-            LANE_ROW_TWIN_PROOFS.len(),
-            3 * shared.len() + 1 + 2 + 3 + 2 + (shared.len() - 1)
-        );
+        // single-card row per shared stage (its MoE row the hetero tier class).
+        assert_eq!(LANE_ROW_TWIN_PROOFS.len(), 4 * shared.len() + 1 + 2 + 3 + 2);
         for arch in ["gfx1151", "gfx1201"] {
             for stage in StageName::ALL {
                 for topology in ALL_TOPOLOGIES {
@@ -4654,9 +4659,7 @@ mod tests {
                         ("gfx1151", _) => shared.contains(&stage),
                         ("gfx1201", LaneTopology::Pp) => shared.contains(&stage),
                         ("gfx1201", LaneTopology::Ep) => shared.contains(&stage),
-                        ("gfx1201", LaneTopology::Single) => {
-                            shared.contains(&stage) && stage != StageName::Moe
-                        }
+                        ("gfx1201", LaneTopology::Single) => shared.contains(&stage),
                         _ => false,
                     };
                     // The PP MoE stage carries the mq2 and the mq3 slab rows;
@@ -4713,9 +4716,20 @@ mod tests {
                             (_, LaneTopology::Single) => {
                                 assert_ne!(proof.route, StageRoute::Any);
                                 assert_ne!(proof.route, StageRoute::Unclassified);
-                                assert!(!matches!(proof.route, StageRoute::Moe { .. }));
                                 assert_eq!(proof.domain, [LaneTopology::Single]);
-                                assert_eq!(proof.receipt, GFX1201_SINGLE_MQ4XTS_RECEIPT);
+                                if stage == StageName::Moe {
+                                    assert_eq!(
+                                        proof.route,
+                                        StageRoute::Moe {
+                                            experts: LaneExpertRoute::HeteroTiered,
+                                            dense: [DType::BF16; 5],
+                                            decode_admitted: false,
+                                        }
+                                    );
+                                    assert_eq!(proof.receipt, GFX1201_SINGLE_HETERO_MOE_RECEIPT);
+                                } else {
+                                    assert_eq!(proof.receipt, GFX1201_SINGLE_MQ4XTS_RECEIPT);
+                                }
                             }
                             _ => {
                                 assert_ne!(proof.route, StageRoute::Any);
@@ -4926,27 +4940,41 @@ mod tests {
     }
 
     #[test]
-    fn ar_only_single_rows_never_apply_to_mtp_lanes() {
-        let routes = single_mq4xts_routes();
-        let ar =
-            LaneStagePolicy::for_bound_routes_spec("gfx1201", LaneTopology::Single, &routes, false);
-        assert_eq!(ar.policy, production_without(&[StageName::Moe]));
-        assert_eq!(ar.receipts, [GFX1201_SINGLE_MQ4XTS_RECEIPT]);
-        let mtp =
-            LaneStagePolicy::for_bound_routes_spec("gfx1201", LaneTopology::Single, &routes, true);
-        assert_eq!(mtp.policy, LaneStagePolicy::all_per_lane());
-        assert!(mtp.receipts.is_empty());
-        assert_eq!(fallback_stages(&mtp), shared_stages());
-        // Receipts not marked AR-only keep their rows under MTP.
-        let pp = pp2_mq2_routes();
+    fn gfx1201_single_hetero_tier_shares_every_stage() {
+        // The routes the hetero serve registers: the single-card trunk plus the
+        // hetero tier MoE class.
+        let mut routes = single_mq4xts_routes();
+        routes[StageName::Moe.index()] = vec![StageRoute::Moe {
+            experts: LaneExpertRoute::HeteroTiered,
+            dense: [DType::BF16; 5],
+            decode_admitted: false,
+        }];
+        let resolution =
+            LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Single, &routes);
+        assert_eq!(resolution.policy, LaneStagePolicy::production());
         assert_eq!(
-            LaneStagePolicy::for_bound_routes_spec("gfx1201", LaneTopology::Pp, &pp, true).policy,
-            LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Pp, &pp).policy
+            resolution.receipts,
+            [
+                GFX1201_SINGLE_MQ4XTS_RECEIPT,
+                GFX1201_SINGLE_HETERO_MOE_RECEIPT
+            ]
         );
-        assert!(LANE_ROW_TWIN_PROOFS
-            .iter()
-            .filter(|row| LANE_AR_ONLY_RECEIPTS.contains(&row.receipt))
-            .all(|row| row.domain == [LaneTopology::Single]));
+        assert!(fallback_stages(&resolution).is_empty());
+        // The class is single-card only, and needs its exact dense dtypes.
+        for topology in [LaneTopology::Pp, LaneTopology::Ep] {
+            let other = LaneStagePolicy::for_bound_routes("gfx1201", topology, &routes);
+            assert!(
+                fallback_stages(&other).contains(&StageName::Moe),
+                "{topology:?}"
+            );
+        }
+        routes[StageName::Moe.index()] = vec![StageRoute::Moe {
+            experts: LaneExpertRoute::HeteroTiered,
+            dense: [DType::BF16; 5],
+            decode_admitted: true,
+        }];
+        let admitted = LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Single, &routes);
+        assert_eq!(fallback_stages(&admitted), [StageName::Moe]);
     }
 
     #[test]
@@ -4980,13 +5008,13 @@ mod tests {
         assert!(reason_of(&mixed, StageName::GdnInProj).contains("has no row-twin proof"));
 
         // A stage the band never executes (no instance) is shared vacuously
-        // and cites no receipt; the MoE still has no Single row.
+        // and cites no receipt.
         let empty = LaneStagePolicy::for_bound_routes(
             "gfx1201",
             LaneTopology::Single,
             &LaneStageRoutes::default(),
         );
-        assert_eq!(empty.policy, production_without(&[StageName::Moe]));
+        assert_eq!(empty.policy, LaneStagePolicy::production());
         assert!(empty.receipts.is_empty());
         // An unclassified instance never matches a single-card row.
         let mut unclassified = LaneStageRoutes::default();
