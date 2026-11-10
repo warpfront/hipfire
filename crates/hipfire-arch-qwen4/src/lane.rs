@@ -115,6 +115,12 @@ fn lane_expert_route(bundle: &Qwen4Bundle) -> LaneExpertRoute {
         LaneExpertRoute::Split
     } else if bundle.has_cpu_deferred_experts() {
         LaneExpertRoute::CpuDeferred
+    } else if bundle
+        .execution
+        .as_ref()
+        .is_some_and(|forward| forward.hetero_tiered_experts())
+    {
+        LaneExpertRoute::HeteroTiered
     } else if bundle.weights.expert_tiers().is_some() {
         LaneExpertRoute::Unclassified
     } else if bundle.weights.ep_placement().is_some() {
@@ -2224,12 +2230,8 @@ impl Qwen4LaneStore {
             None => {
                 let facts = gather_stage_facts(bundle);
                 let routes = derive_stage_routes(&gpu.arch, &facts);
-                let resolution = LaneStagePolicy::for_bound_routes_spec(
-                    &gpu.arch,
-                    facts.topology,
-                    &routes,
-                    spec.is_some(),
-                );
+                let resolution =
+                    LaneStagePolicy::for_bound_routes(&gpu.arch, facts.topology, &routes);
                 let evidence = resolution.receipts.join(",");
                 eprintln!(
                     "{}",
@@ -4263,6 +4265,7 @@ mod tests {
             LaneExpertRoute::HostMapped,
             LaneExpertRoute::CpuDeferred,
             LaneExpertRoute::Split,
+            LaneExpertRoute::HeteroTiered,
             LaneExpertRoute::Unclassified,
         ] {
             assert_eq!(
@@ -4287,6 +4290,22 @@ mod tests {
                     dense: [DType::BF16; 5],
                     decode_admitted: true,
                 }],
+                "{topology:?}"
+            );
+        }
+        // The hetero tier class keeps its own label off EP.
+        for topology in [LaneTopology::Single, LaneTopology::Pp] {
+            let mut facts = stage_facts();
+            facts.topology = topology;
+            facts.experts = LaneExpertRoute::HeteroTiered;
+            assert!(
+                matches!(
+                    moe_stage(&facts)[..],
+                    [StageRoute::Moe {
+                        experts: LaneExpertRoute::HeteroTiered,
+                        ..
+                    }]
+                ),
                 "{topology:?}"
             );
         }
