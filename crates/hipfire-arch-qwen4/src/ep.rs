@@ -906,6 +906,12 @@ fn install_unit_tail(
         hipfire_config::developer_bool(tail::EP_UNIT_TAIL_FREEZE_ENV, false),
         log,
         tail::tail_lever(tail::EP_UNIT_TAIL_FILL_OVERLAP_ENV),
+        // Direct usage log: routed ids are written into the log by the route, not copied there.
+        // The chunk dump and the routing trace read the top-k scratch after the layer, so either
+        // one keeps the per-layer copy.
+        tail::tail_lever(tail::EP_TAIL_LOG_DIRECT_ENV)
+            && crate::chunk_dump::config().is_none()
+            && !forward.route_trace_active(),
         tail::tail_lever(tail::EP_UNIT_TAIL_PEER_RESERVE_ENV),
         layers,
         peer,
@@ -1127,6 +1133,21 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
         if let Some(tail) = self.tail.get() {
             tail.note_call(gpu, layer_idx, slots, topk);
         }
+    }
+
+    /// Pre-route reservation of the tail's usage-log destination
+    /// ([`UnitTailRank::reserve_topk`](crate::expert_unit_tail_rank::UnitTailRank::reserve_topk)):
+    /// the route writes this layer's ids into the log, so the gather's `note_call` copies nothing.
+    fn reserve_topk(
+        &self,
+        gpu: &mut Gpu,
+        layer_idx: u16,
+        slots: usize,
+        scratch: &GpuTensor,
+    ) -> Option<GpuTensor> {
+        self.tail
+            .get()?
+            .reserve_topk(gpu, layer_idx, slots, scratch)
     }
 
     fn last_gather_buffer(&self) -> Option<usize> {

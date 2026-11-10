@@ -2471,6 +2471,7 @@ pub(super) fn produce_prefill_route<'a>(
     call: &SealedMoeCall<'a>,
     gpu: &mut Gpu,
     scores: &GpuTensor,
+    topk_indices: &GpuTensor,
     normalize: bool,
     fuse_scatter: Option<RouteScatterFuse<'_>>,
 ) -> Result<MoeRouteReceipt<'a>, DispatchError> {
@@ -2533,7 +2534,7 @@ pub(super) fn produce_prefill_route<'a>(
                 );
                 gpu.moe_router_softmax_top10_masked_f32(
                     scores,
-                    params.topk_indices,
+                    topk_indices,
                     params.topk_weights,
                     params.batch_size,
                     normalize,
@@ -2562,7 +2563,7 @@ pub(super) fn produce_prefill_route<'a>(
                     Some(fuse) if wide => gpu
                         .moe_route_scatter_top10_wide_f32(
                             scores,
-                            params.topk_indices,
+                            topk_indices,
                             params.topk_weights,
                             params.batch_size,
                             normalize,
@@ -2593,7 +2594,7 @@ pub(super) fn produce_prefill_route<'a>(
                     Some(fuse) => gpu
                         .moe_route_scatter_top10_f32(
                             scores,
-                            params.topk_indices,
+                            topk_indices,
                             params.topk_weights,
                             params.batch_size,
                             normalize,
@@ -2623,7 +2624,7 @@ pub(super) fn produce_prefill_route<'a>(
                 } else {
                     gpu.moe_router_softmax_top10_f32(
                         scores,
-                        params.topk_indices,
+                        topk_indices,
                         params.topk_weights,
                         params.batch_size,
                         normalize,
@@ -2655,7 +2656,7 @@ pub(super) fn produce_prefill_route<'a>(
                         .map_err(|e| DispatchError::Hip(e.to_string()))?;
                     gpu.moe_topk_renorm_top10_batched(
                         scores,
-                        params.topk_indices,
+                        topk_indices,
                         params.topk_weights,
                         params.n_exp,
                         normalize,
@@ -2690,7 +2691,7 @@ pub(super) fn produce_prefill_route<'a>(
                     ) {
                         gpu.moe_router_softmax_topk_k8_multirow_prefill(
                             scores,
-                            params.topk_indices,
+                            topk_indices,
                             params.topk_weights,
                             params.n_exp,
                             normalize,
@@ -2699,7 +2700,7 @@ pub(super) fn produce_prefill_route<'a>(
                     } else {
                         gpu.moe_router_softmax_topk_k8_prefill(
                             scores,
-                            params.topk_indices,
+                            topk_indices,
                             params.topk_weights,
                             params.n_exp,
                             normalize,
@@ -2718,7 +2719,7 @@ pub(super) fn produce_prefill_route<'a>(
                         .map_err(|e| DispatchError::Hip(e.to_string()))?;
                     gpu.moe_topk_renorm_k8_batched(
                         scores,
-                        params.topk_indices,
+                        topk_indices,
                         params.topk_weights,
                         params.n_exp,
                         normalize,
@@ -2746,7 +2747,7 @@ pub(super) fn produce_prefill_route<'a>(
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
                 gpu.moe_topk_renorm_k8_batched(
                     scores,
-                    params.topk_indices,
+                    topk_indices,
                     params.topk_weights,
                     params.n_exp,
                     normalize,

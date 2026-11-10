@@ -218,6 +218,13 @@ pub const EP_UNIT_TAIL_LOG_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_LOG";
 /// them before it polls (the policy sees the same completions). `=0` issues them at the
 /// retirement and polls them.
 pub const EP_UNIT_TAIL_FILL_OVERLAP_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_FILL_OVERLAP";
+/// Default on (`=0` is the kill switch): under the D2 tail a few-row grouped prefill (verify)
+/// call's routed ids are written by the route kernels straight into the tail's usage log, the
+/// tail's whole per-call logging decision taken before the route launches, instead of the route
+/// writing the top-k scratch and the row gather copying it into the log (one device copy per MoE
+/// layer per step). The logged bytes, offsets and every routing result are identical. `=0`
+/// restores the per-layer copy.
+pub const EP_TAIL_LOG_DIRECT_ENV: &str = "HIPFIRE_EP_TAIL_LOG_DIRECT";
 /// Default on (`=0` is the kill switch): with peer quarantine ([`EP_UNIT_TAIL_PEER_ENV`]) in
 /// per-window mode, a retirement whose candidates saturate its fill budget keeps a reserve of
 /// free + quarantined slots ([`RESERVE_RETIREMENTS`]` x ` the budget, a constant) so `F` fills per

@@ -2668,6 +2668,14 @@ pub const SITES: &[Site] = &[
         occurrences: 4,
         decisions: &["eager-only-refusals"],
     },
+    // The D2 tail usage-log direct route never reserves a top-k destination under recording/capture
+    // (the row gather refuses those): the call routes into its own scratch and the gather copies.
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "reserve_topk",
+        occurrences: 4,
+        decisions: &["eager-only-refusals"],
+    },
     Site {
         file: "hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs",
         function: "tile_exchange_eager_only",

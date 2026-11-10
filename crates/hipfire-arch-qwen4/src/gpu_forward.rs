@@ -13791,6 +13791,12 @@ impl Qwen4GpuForward {
         })
     }
 
+    /// Whether the routing trace (`HIPFIRE_QWEN4_ROUTE_TRACE`) is on: it copies each layer's
+    /// top-k scratch right after the layer, so the scratch must hold the layer's ids.
+    pub(crate) fn route_trace_active(&self) -> bool {
+        self.route_trace.is_some()
+    }
+
     /// The rank's decode MoE layers the D2 tail may manage (`HIPFIRE_EP_UNIT_TAIL`): per layer
     /// the label, non-owning aliases of the two decode pointer tables and the host entries they
     /// were uploaded from. Only layers running the static `e % ranks` owners over a unit plan

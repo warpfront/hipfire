@@ -317,12 +317,36 @@ fn input_basis_producer_fused_admitted(
         && gate_k == router_k
 }
 
+/// The prefill operands of a call as its stages read them: the sealed record itself, or, when the
+/// route stage reserved a usage-log destination for the call's routed ids
+/// ([`MoeRowGather::reserve_topk`]), a copy whose `topk_indices` is that view. Every stage of
+/// the call reads its ids through this, so the route writes and all readers see one buffer.
+pub(super) enum PrefillParamsView<'s> {
+    Sealed(&'s MoePrefillParams<'s>),
+    Routed(MoePrefillParams<'s>),
+}
+
+impl<'s> std::ops::Deref for PrefillParamsView<'s> {
+    type Target = MoePrefillParams<'s>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Sealed(params) => params,
+            Self::Routed(params) => params,
+        }
+    }
+}
+
 /// Invocation-local mutable state. It borrows the sealed call but never gets
 /// stored by that call, so borrowed Steps cannot form a self-referential owner.
 pub(super) struct MoeStepState<'a> {
     call: &'a SealedMoeCall<'a>,
     host_route: OnceCell<HostRoute>,
     route_stamp: Cell<Option<RouteStamp>>,
+    /// The routed-id view the call's hook reserved before its route launch
+    /// ([`MoeRowGather::reserve_topk`]); set once by the route stage, read through
+    /// [`Self::prefill_parts`]. Empty: the call routes into its own `topk_indices`.
+    topk_log: OnceCell<GpuTensor>,
     /// The IU4 activation token the router stage quantized for the shared
     /// group: written only by the router stage, taken (consumed, never
     /// re-quantized) by the shared gate/up stage of the same invocation.
@@ -459,6 +483,7 @@ impl<'a> MoeStepState<'a> {
             call,
             host_route: OnceCell::new(),
             route_stamp: Cell::new(route_stamp),
+            topk_log: OnceCell::new(),
             shared_iu4: RefCell::new(None),
             shared_down_iu4: RefCell::new(None),
             shared_gate,
@@ -554,7 +579,7 @@ impl<'a> MoeStepState<'a> {
 
     fn prefill_parts(
         &self,
-    ) -> Result<(&MoePrefillParams<'_>, &MoePrefillSelection), DispatchError> {
+    ) -> Result<(PrefillParamsView<'_>, &MoePrefillSelection), DispatchError> {
         let params = self.call.prefill_params().ok_or_else(|| {
             DispatchError::Hip("sealed moe: operation requires prefill operands".into())
         })?;
@@ -566,7 +591,45 @@ impl<'a> MoeStepState<'a> {
                 ));
             }
         };
-        Ok((params, selection))
+        let view = match self.topk_log.get() {
+            Some(log) => PrefillParamsView::Routed(params.with_topk_indices(log)),
+            None => PrefillParamsView::Sealed(params),
+        };
+        Ok((view, selection))
+    }
+
+    /// Ask the call's row-gather hook for a routed-id destination before the route launches
+    /// ([`MoeRowGather::reserve_topk`]). Only a replicated-route call that reaches its row gather
+    /// asks, and never while a graph capture or replay record is armed (the gather refuses
+    /// those); a hook that names no view leaves the call routing into its own scratch.
+    fn reserve_topk(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let (params, _) = self.prefill_parts()?;
+        let Some(gather) = params.ep_row_gather else {
+            return Ok(());
+        };
+        if !matches!(
+            params.prelude.route,
+            super::sealed_moe::PrefillRouteMode::Replicated
+        ) || gpu.graphs.capture_mode
+            || gpu.graphs.verify.capturing.is_some()
+            || gpu.graphs.replay.capturing.is_some()
+            || gpu.replay.is_recording()
+        {
+            return Ok(());
+        }
+        let slots = params.batch_size.checked_mul(params.k_top).ok_or_else(|| {
+            DispatchError::Hip("sealed moe: top-k reservation extent overflows".into())
+        })?;
+        if let Some(view) =
+            gather.reserve_topk(gpu, params.ep_layer_idx, slots, params.topk_indices)
+        {
+            self.topk_log.set(view).map_err(|_| {
+                DispatchError::Hip(
+                    "sealed moe: top-k destination reserved twice in one invocation".into(),
+                )
+            })?;
+        }
+        Ok(())
     }
 
     /// Whether the combine of this call can take over `clear`'s zero fill, and which launch
@@ -596,6 +659,7 @@ impl<'a> MoeStepState<'a> {
         let Ok((params, selection)) = self.prefill_parts() else {
             return ClearAbsorb::No;
         };
+        let params = &*params;
         let target = params.routed_out.unwrap_or(params.x_batch);
         let owns_target = selection
             .route
@@ -744,6 +808,7 @@ impl<'a> MoeStepState<'a> {
                 .flatten();
         }
         if let Ok((params, selection)) = self.prefill_parts() {
+            let params = &*params;
             return selection
                 .cpu_split
                 .then(|| prefill_split_executor(params).ok())
@@ -889,6 +954,7 @@ impl<'a> SealedMoeOp<'a> {
             }
             MoeProtocol::GroupedPrefill => {
                 let (params, selection) = self.state.prefill_parts()?;
+                let params = &*params;
                 if let MoeNormalization::RmsNorm {
                     weight,
                     plain_out,
@@ -995,6 +1061,7 @@ impl<'a> SealedMoeOp<'a> {
             return super::decode_input_basis_stage(gpu, params, selection.resolution);
         }
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         if self.state.norm_basis_folded.get() {
             // The normalize stage produced the F32 basis and the token (L4 fold).
             return Ok(());
@@ -1207,6 +1274,7 @@ impl<'a> SealedMoeOp<'a> {
             }
             MoeProtocol::GroupedPrefill => {
                 let (params, selection) = self.state.prefill_parts()?;
+                let params = &*params;
                 if selection
                     .route
                     .is_some_and(MoeRouteCapability::is_sealed_grouped)
@@ -1381,7 +1449,9 @@ impl<'a> SealedMoeOp<'a> {
                         "sealed moe: route producer ran twice in one invocation".into(),
                     ));
                 }
+                self.state.reserve_topk(gpu)?;
                 let (params, selection) = self.state.prefill_parts()?;
+                let params = &*params;
                 let scores = params.prelude.router_scores;
                 // The fused router + scatter launch: only when the lowering put `Scatter` right
                 // after this stage and the scatter stage would launch the plain grouped scatter.
@@ -1415,6 +1485,7 @@ impl<'a> SealedMoeOp<'a> {
                     self.state.call,
                     gpu,
                     scores,
+                    params.topk_indices,
                     params.prelude.norm_topk_prob,
                     fuse,
                 )?;
@@ -1534,6 +1605,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         if selection
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
@@ -1577,6 +1649,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         if selection
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
@@ -1635,6 +1708,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         if selection
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
@@ -1678,6 +1752,7 @@ impl<'a> SealedMoeOp<'a> {
 
     pub(super) fn scatter(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         self.state.require_route_ready()?;
         let view = self.state.masked_prefill(params, selection)?;
         let params = view.as_ref().unwrap_or(params);
@@ -1725,6 +1800,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         let view = self.state.masked_prefill(params, selection)?;
         let params = view.as_ref().unwrap_or(params);
         if selection
@@ -1769,6 +1845,7 @@ impl<'a> SealedMoeOp<'a> {
 
     pub(super) fn unscatter(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         let view = self.state.masked_prefill(params, selection)?;
         let params = view.as_ref().unwrap_or(params);
         if !selection.uses_grouped_rows() {
@@ -1810,6 +1887,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         let view = self.state.masked_prefill(params, selection)?;
         let params = view.as_ref().unwrap_or(params);
         if selection
@@ -1902,6 +1980,7 @@ impl<'a> SealedMoeOp<'a> {
             return Ok(());
         }
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         let view = self.state.masked_prefill(params, selection)?;
         let params = view.as_ref().unwrap_or(params);
         if selection
@@ -1968,6 +2047,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         if selection.cpu_split {
             return self.split_combine_prefill(gpu, params, selection);
         }
@@ -2080,6 +2160,7 @@ impl<'a> SealedMoeOp<'a> {
             }
             MoeProtocol::GroupedPrefill => {
                 let (params, _) = self.state.prefill_parts()?;
+                let params = &*params;
                 let gpu_ref: &Gpu = &*gpu;
                 // `dim` is the model hidden size, which is exactly the routed down
                 // projection's row count: `MoePrefillParams` has no `hidden` field
@@ -2148,6 +2229,7 @@ impl<'a> SealedMoeOp<'a> {
             }
             MoeProtocol::GroupedPrefill => {
                 let (params, selection) = self.state.prefill_parts()?;
+                let params = &*params;
                 if !selection.cpu_split {
                     return Err(split_error(
                         "PrepareSplit lowered without the split selection",
@@ -2200,6 +2282,7 @@ impl<'a> SealedMoeOp<'a> {
             }
             MoeProtocol::GroupedPrefill => {
                 let (params, selection) = self.state.prefill_parts()?;
+                let params = &*params;
                 if !selection.cpu_split {
                     return Err(split_error("JoinSplit lowered without the split selection"));
                 }
@@ -2413,6 +2496,7 @@ impl<'a> SealedMoeOp<'a> {
             }
             MoeProtocol::GroupedPrefill => {
                 let (params, _) = self.state.prefill_parts()?;
+                let params = &*params;
                 (
                     params.ep_row_gather.ok_or_else(missing)?,
                     params.ep_layer_idx,
@@ -2467,6 +2551,7 @@ impl<'a> SealedMoeOp<'a> {
             }
             MoeProtocol::GroupedPrefill => {
                 let (params, selection) = self.state.prefill_parts()?;
+                let params = &*params;
                 let gather = params.ep_row_gather.ok_or_else(missing)?;
                 if !selection
                     .route
@@ -2531,6 +2616,7 @@ impl<'a> SealedMoeOp<'a> {
 
     pub(super) fn tile_mask(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         let tx = params.ep_tile_exchange.ok_or_else(|| {
             DispatchError::Hip("sealed moe: tile mask lowered without a tile exchange".into())
         })?;
@@ -2540,6 +2626,7 @@ impl<'a> SealedMoeOp<'a> {
 
     pub(super) fn tile_exchange(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         let tx = params.ep_tile_exchange.ok_or_else(|| {
             DispatchError::Hip("sealed moe: tile exchange lowered without a tile exchange".into())
         })?;
@@ -2741,6 +2828,7 @@ fn lower_prefill<'a>(
     state: &'a MoeStepState<'a>,
 ) -> Result<SmallVec<[Step<'a>; INLINE_STEP_CAPACITY]>, DispatchError> {
     let (params, selection) = state.prefill_parts()?;
+    let params = &*params;
     if selection.cpu_split {
         // Checked before any other lowering decision: the mode must never
         // fall into the generic or deferred arms by accident.
@@ -3055,6 +3143,7 @@ pub(super) fn execute_prepare(
         return execute_prepare_decode(gpu, call, &state);
     }
     let (params, selection) = state.prefill_parts()?;
+    let params = &*params;
     if !selection
         .route
         .is_some_and(MoeRouteCapability::is_sealed_grouped)
@@ -3158,6 +3247,7 @@ pub(super) fn split_phase_probe(call: &SealedMoeCall<'_>) -> Result<(), String> 
         }
     }
     if let Ok((params, selection)) = state.prefill_parts() {
+        let params = &*params;
         if state.masked_prefill(params, selection).is_ok() {
             return Err("prefill tail took the masked view before PrepareSplit".into());
         }
@@ -3234,6 +3324,7 @@ pub(super) fn split_phase_probe(call: &SealedMoeCall<'_>) -> Result<(), String> 
         }
     }
     if let Ok((params, selection)) = state.prefill_parts() {
+        let params = &*params;
         if params.prelude.shared.is_none() {
             return Err("prefill fixture does not carry a shared expert".into());
         }
@@ -3300,6 +3391,7 @@ pub(super) fn execute_after_clear(
         let mut offered = super::qt44_qt53_prefill::HcSharedDown::offer(write);
         if let (Some(offered), Some((read, next_write))) = (offered.as_mut(), next) {
             if let Ok((params, selection)) = state.prefill_parts() {
+                let params = &*params;
                 if selection
                     .route
                     .is_some_and(MoeRouteCapability::is_sealed_grouped)

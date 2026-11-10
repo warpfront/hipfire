@@ -21,7 +21,14 @@
 //! # Window protocol (rank thread; the only cross-rank state is the PEER board)
 //!
 //! * [`UnitTailRank::note_call`] (the row-gather hook, once per MoE layer
-//!   call): a stream-ordered D2D of the call's routed ids into the log.
+//!   call): records the call's routed ids in the log. With `HIPFIRE_EP_TAIL_LOG_DIRECT` (default
+//!   on) a few-row grouped prefill call is reserved BEFORE its route launches
+//!   ([`UnitTailRank::reserve_topk`]: the whole window-count / deferred-fill / skip / overflow
+//!   decision is taken there, once) and its route kernels write the ids straight into the log
+//!   slice, so the gather only records `(layer, slots, offset)`: no device copy. Any call that
+//!   was not reserved (switch `=0`, a one-row decode, a borrow epoch, a chunk forward) takes its
+//!   decision at the gather and copies the ids there (a stream-ordered D2D); the log bytes and
+//!   the recorded offsets are the same either way.
 //! * [`UnitTailRank::step_end`] (after the window's forward and its D2H sync): the retirement
 //!   cadence ([`crate::expert_unit_tail::RetireCadence`]) decides from the window's routed-id
 //!   count (rank-independent) whether this window ends a group; if not it returns at once (no
@@ -806,6 +813,25 @@ struct RankPins {
     reported: bool,
 }
 
+/// The tail's verdict on one row-gather call ([`Inner::admit_call`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogAdmit {
+    /// The call logs nothing (suspended / frozen / released tail, non-trunk layer, no slots, a
+    /// short top-k buffer, no log, or an overflowing log: the overflow is counted).
+    Skip,
+    /// The call's `slots * 4` bytes of ids land at byte offset `at` of the usage log.
+    Log { at: usize },
+}
+
+/// A call whose verdict was taken before its route launched ([`Inner::reserve_topk`]) and is
+/// recorded when its gather runs ([`Inner::note_call`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Reserved {
+    layer: u16,
+    slots: usize,
+    admit: LogAdmit,
+}
+
 struct Inner {
     rank: usize,
     ranks: usize,
@@ -837,6 +863,12 @@ struct Inner {
     log: Option<GpuTensor>,
     log_host: Vec<u8>,
     log_used: usize,
+    /// `HIPFIRE_EP_TAIL_LOG_DIRECT` (default on): a row-gather call's routed ids are routed
+    /// straight into the usage log ([`Inner::reserve_topk`]) instead of copied there after the
+    /// route.
+    log_direct: bool,
+    /// The call the route stage reserved a log destination for and whose gather has not run yet.
+    reserved: Option<Reserved>,
     calls: Vec<(u16, u32, u32)>,
     /// Which windows retire ([`RetireCadence`]); fed only by `window_routed`, never by anything
     /// this rank logged.
@@ -1009,6 +1041,7 @@ impl UnitTailRank {
         freeze: bool,
         log_enabled: bool,
         fill_overlap: bool,
+        log_direct: bool,
         peer_reserve: bool,
         layers: Vec<TailLayerInit>,
         peer: Option<Arc<PeerBoard>>,
@@ -1346,6 +1379,8 @@ impl UnitTailRank {
             fill_ns: 0,
             fill_wait_ns: 0,
             fill_overlap,
+            log_direct,
+            reserved: None,
             deferred: Vec::new(),
             uploads: 0,
             upload_calls: 0,
@@ -1458,15 +1493,35 @@ impl UnitTailRank {
         })
     }
 
-    /// Row-gather hook: log this call's routed ids (stream-ordered D2D).
+    /// Row-gather hook: log this call's routed ids. A call the route stage reserved
+    /// ([`Self::reserve_topk`]) was routed into the log already and only records; any other call
+    /// is copied there (stream-ordered D2D).
     pub(crate) fn note_call(&self, gpu: &mut Gpu, layer_idx: u16, slots: usize, topk: &GpuTensor) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.note_call(gpu, layer_idx, slots, topk);
     }
 
+    /// Pre-route hook of a few-row grouped prefill call that will reach its row gather: take the
+    /// call's whole logging decision now (window count, deferred fills, every skip) and, when the
+    /// call logs, name the usage-log view the route kernels write instead of `scratch` (the
+    /// call's own top-k buffer). `None`: the call routes into `scratch` and its gather decides
+    /// (or has decided) exactly as without this hook.
+    pub(crate) fn reserve_topk(
+        &self,
+        gpu: &mut Gpu,
+        layer_idx: u16,
+        slots: usize,
+        scratch: &GpuTensor,
+    ) -> Option<GpuTensor> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.reserve_topk(gpu, layer_idx, slots, scratch)
+    }
+
     /// End of a decode window (after its forward's D2H sync): retire it.
     pub(crate) fn step_end(&self, gpu: &mut Gpu) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        // A window end drops a reservation whose gather never ran (a failed forward).
+        inner.reserved = None;
         if inner.skip_suspended_window() {
             return;
         }
@@ -1821,11 +1876,16 @@ impl Inner {
         self.issue_batch(gpu, tickets)
     }
 
-    fn note_call(&mut self, gpu: &mut Gpu, layer_idx: u16, slots: usize, topk: &GpuTensor) {
-        if self.suspended {
-            // A borrow epoch: no window counting, no deferred issue, no usage-log copy.
-            return;
-        }
+    /// The tail's decision for one row-gather call: window counting, the deferred-fill issue point
+    /// (`issue`) and every skip rule, made once per call (at the route for a reserved call, at the
+    /// gather otherwise). `topk_bytes` is the byte size of the call's own top-k buffer.
+    fn admit_call(
+        &mut self,
+        layer_idx: u16,
+        slots: usize,
+        topk_bytes: usize,
+        issue: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> LogAdmit {
         let layer = layer_idx as usize;
         // The cadence's input: every rank enters this call with the same `slots` (the extent of
         // the cross-rank row exchange), so this count is counted before any rank-local early
@@ -1836,33 +1896,97 @@ impl Inner {
         }
         // Fill overlap: the first row-gather call after a retirement starts its fills, so they
         // run under this forward (enqueued after the copy stream's wait for the table upload).
-        if let Err(error) = self.issue_deferred(gpu) {
+        if let Err(error) = issue(self) {
             self.freeze(&format!("deferred fills: {error}"));
         }
         if self.frozen.is_some()
             || self.released
             || layer >= self.trunk_layers
             || slots == 0
-            || topk.buf.size() < slots * 4
+            || topk_bytes < slots * 4
         {
+            return LogAdmit::Skip;
+        }
+        if self.log.is_none() {
+            return LogAdmit::Skip;
+        }
+        if self.log_used + slots * 4 > LOG_IDS * 4 {
+            self.overflowed += 1;
+            return LogAdmit::Skip;
+        }
+        LogAdmit::Log { at: self.log_used }
+    }
+
+    /// `HIPFIRE_EP_TAIL_LOG_DIRECT`: decide the call's logging before its route launches
+    /// ([`Self::admit_call`]) and, for a call that logs, return the `slots * 4`-byte log view at
+    /// its offset for the route to write. The decision is parked until the call's gather
+    /// ([`Self::note_with`]) records it, so it is never taken twice. A borrow epoch, or the
+    /// switch off, takes no decision here: the gather decides, exactly as before.
+    fn reserve_with(
+        &mut self,
+        layer_idx: u16,
+        slots: usize,
+        scratch_bytes: usize,
+        issue: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Option<GpuTensor> {
+        if !self.log_direct || self.suspended {
+            return None;
+        }
+        let admit = self.admit_call(layer_idx, slots, scratch_bytes, issue);
+        self.reserved = Some(Reserved {
+            layer: layer_idx,
+            slots,
+            admit,
+        });
+        let LogAdmit::Log { at } = admit else {
+            return None;
+        };
+        let log = self.log.as_ref()?;
+        Some(GpuTensor {
+            buf: log.buf.byte_view(at, slots * 4),
+            shape: vec![slots * 4],
+            dtype: DType::Raw,
+        })
+    }
+
+    /// The row-gather hook: record the call's routed ids in the log. The verdict is the one the
+    /// call's route reservation took, or is taken now. When the ids already sit at the call's log
+    /// offset (the route wrote them there) nothing moves; otherwise `copy(dst)` copies them from
+    /// the call's top-k buffer into the log view `dst`.
+    fn note_with(
+        &mut self,
+        layer_idx: u16,
+        slots: usize,
+        topk: &GpuTensor,
+        issue: impl FnOnce(&mut Self) -> Result<(), String>,
+        copy: impl FnOnce(&hip_bridge::DeviceBuffer) -> Result<(), String>,
+    ) {
+        if self.suspended {
+            // A borrow epoch: no window counting, no deferred issue, no usage-log copy.
+            return;
+        }
+        let admit = match self.reserved.take() {
+            Some(reserved) if reserved.layer == layer_idx && reserved.slots == slots => {
+                reserved.admit
+            }
+            _ => self.admit_call(layer_idx, slots, topk.buf.size(), issue),
+        };
+        let LogAdmit::Log { at } = admit else {
+            return;
+        };
+        // A reserved call whose tail froze or retired in between logs nothing, as a call that
+        // met a frozen tail at its gather.
+        if self.frozen.is_some() || self.released || at != self.log_used {
             return;
         }
         let Some(log) = self.log.as_ref() else {
             return;
         };
-        if self.log_used + slots * 4 > LOG_IDS * 4 {
-            self.overflowed += 1;
-            return;
-        }
-        let at = self.log_used;
         let dst = log.buf.byte_view(at, slots * 4);
-        let result = match gpu.active_stream.as_ref() {
-            Some(stream) => gpu
-                .hip
-                .memcpy_dtod_async_at(&dst, 0, &topk.buf, 0, slots * 4, stream),
-            None => gpu
-                .hip
-                .memcpy_dtod_async_default_at(&dst, 0, &topk.buf, 0, slots * 4),
+        let result = if dst.as_ptr() == topk.buf.as_ptr() {
+            Ok(())
+        } else {
+            copy(&dst)
         };
         match result {
             Ok(()) => {
@@ -1874,6 +1998,42 @@ impl Inner {
             }
             Err(error) => self.freeze(&format!("usage log copy: {error}")),
         }
+    }
+
+    /// [`Self::reserve_with`] on the rank's device.
+    fn reserve_topk(
+        &mut self,
+        gpu: &Gpu,
+        layer_idx: u16,
+        slots: usize,
+        scratch: &GpuTensor,
+    ) -> Option<GpuTensor> {
+        self.reserve_with(layer_idx, slots, scratch.buf.size(), |tail| {
+            tail.issue_deferred(gpu)
+        })
+    }
+
+    /// [`Self::note_with`] on the rank's device: a call not routed into the log is copied there,
+    /// stream-ordered D2D.
+    fn note_call(&mut self, gpu: &Gpu, layer_idx: u16, slots: usize, topk: &GpuTensor) {
+        self.note_with(
+            layer_idx,
+            slots,
+            topk,
+            |tail| tail.issue_deferred(gpu),
+            |dst| {
+                match gpu.active_stream.as_ref() {
+                    Some(stream) => {
+                        gpu.hip
+                            .memcpy_dtod_async_at(dst, 0, &topk.buf, 0, slots * 4, stream)
+                    }
+                    None => gpu
+                        .hip
+                        .memcpy_dtod_async_default_at(dst, 0, &topk.buf, 0, slots * 4),
+                }
+                .map_err(|error| error.to_string())
+            },
+        );
     }
 
     /// Forget the accumulated group (the tail froze or was released).
@@ -1923,6 +2083,7 @@ impl Inner {
             Ok(()) if self.frozen.is_some() => {
                 self.calls.clear();
                 self.log_used = 0;
+                self.reserved = None;
             }
             Ok(()) => match self.retire_group(gpu, windows) {
                 Ok(posted) => deltas = posted,
@@ -2078,6 +2239,7 @@ impl Inner {
         }
         let calls = std::mem::take(&mut self.calls);
         self.log_used = 0;
+        self.reserved = None;
         self.write_skew_log(&calls);
         let t_log = Instant::now();
 
@@ -2422,6 +2584,7 @@ impl Inner {
         }
         self.calls.clear();
         self.log_used = 0;
+        self.reserved = None;
         // The pins lever's retirement clock IS the cadence's: a freeze must never reset the
         // accumulated group (the other ranks keep theirs), nor drop this window's routed count.
         if self.pins.is_none() {
@@ -2896,6 +3059,7 @@ impl Inner {
         }
         self.calls.clear();
         self.log_used = 0;
+        self.reserved = None;
         true
     }
 
@@ -3014,6 +3178,7 @@ impl Inner {
         self.suspended = true;
         self.calls.clear();
         self.log_used = 0;
+        self.reserved = None;
         self.window_routed = 0;
         self.window_seen = false;
         // No table upload of the window protocol is still reading a pinned image, and no reader
@@ -5281,6 +5446,8 @@ mod tests {
             fill_ns: 0,
             fill_wait_ns: 0,
             fill_overlap: false,
+            log_direct: false,
+            reserved: None,
             deferred: Vec::new(),
             uploads: 0,
             upload_calls: 0,
@@ -5406,6 +5573,325 @@ mod tests {
         WindowUse {
             unit: (layer, expert),
             reads: 1,
+        }
+    }
+
+    /// `HIPFIRE_EP_TAIL_LOG_DIRECT`: a call reserved before its route launches takes the very
+    /// verdict (window count, deferred-fill issue point, skip / overflow rule) the gather takes
+    /// for an unreserved call, records the same `(layer, slots, offset)` and moves no bytes.
+    mod direct_log {
+        use super::{bare, bare_policy};
+        use crate::expert_unit_tail_rank::{Inner, LogAdmit, LOG_IDS};
+        use rdna_compute::{DType, GpuTensor};
+        use std::cell::Cell;
+
+        const LOG_BASE: usize = 0x1000_0000;
+        const SCRATCH_BASE: usize = 0x4000_0000;
+
+        /// A device-less tensor over a fake address range: only pointer arithmetic touches it.
+        fn fake(base: usize, bytes: usize) -> GpuTensor {
+            GpuTensor {
+                // SAFETY: never dereferenced, no device call is made with it.
+                buf: unsafe {
+                    hip_bridge::DeviceBuffer::from_raw(base as *mut std::ffi::c_void, bytes)
+                },
+                shape: vec![bytes],
+                dtype: DType::Raw,
+            }
+        }
+
+        fn tail(direct: bool) -> Inner {
+            let mut inner = bare(bare_policy(), false);
+            inner.log = Some(fake(LOG_BASE, LOG_IDS * 4));
+            inner.log_direct = direct;
+            inner
+        }
+
+        #[derive(Clone, Copy)]
+        struct Call {
+            layer: u16,
+            slots: usize,
+            scratch_bytes: usize,
+        }
+
+        fn call(layer: u16, slots: usize) -> Call {
+            Call {
+                layer,
+                slots,
+                scratch_bytes: slots * 4,
+            }
+        }
+
+        /// What one call did on the device side.
+        #[derive(Default, Debug, PartialEq, Eq)]
+        struct Effects {
+            /// Usage-log copies the gather made.
+            copies: usize,
+            /// Deferred-fill issue points reached.
+            issues: usize,
+            /// Calls that were handed a log view by the reservation.
+            views: usize,
+        }
+
+        /// One call through the pre-route reservation and the gather. `routed_into_view`: the
+        /// route wrote into the reserved view (the real wiring), else into the scratch.
+        fn drive(inner: &mut Inner, c: Call, routed_into_view: bool, effects: &mut Effects) {
+            let scratch = fake(SCRATCH_BASE, c.scratch_bytes);
+            let issues = Cell::new(0usize);
+            let view = inner.reserve_with(c.layer, c.slots, c.scratch_bytes, |_| {
+                issues.set(issues.get() + 1);
+                Ok(())
+            });
+            if let Some(view) = view.as_ref() {
+                effects.views += 1;
+                // The view is the call's slice of the log at its offset.
+                assert_eq!(view.buf.size(), c.slots * 4);
+                assert_eq!(view.buf.as_ptr() as usize, LOG_BASE + inner.log_used);
+            }
+            let topk = match (&view, routed_into_view) {
+                (Some(view), true) => view,
+                _ => &scratch,
+            };
+            let mut copies = 0usize;
+            inner.note_with(
+                c.layer,
+                c.slots,
+                topk,
+                |_| {
+                    issues.set(issues.get() + 1);
+                    Ok(())
+                },
+                |dst| {
+                    copies += 1;
+                    assert_eq!(dst.size(), c.slots * 4);
+                    Ok(())
+                },
+            );
+            effects.copies += copies;
+            effects.issues += issues.get();
+            assert!(
+                inner.reserved.is_none(),
+                "the gather consumes the reservation"
+            );
+        }
+
+        type State = (Vec<(u16, u32, u32)>, usize, u64, u64, bool, bool);
+
+        fn state(inner: &Inner) -> State {
+            (
+                inner.calls.clone(),
+                inner.log_used,
+                inner.overflowed,
+                inner.window_routed,
+                inner.window_seen,
+                inner.frozen.is_some(),
+            )
+        }
+
+        /// Run `calls` through the per-layer copy (`=0`), the direct log, and the direct log whose
+        /// route ignored the view; every state is the same, only the copies differ. Returns the
+        /// recorded calls.
+        fn parity(setup: fn(&mut Inner), calls: &[Call]) -> State {
+            let (mut old, mut direct, mut ignored) = (tail(false), tail(true), tail(true));
+            for inner in [&mut old, &mut direct, &mut ignored] {
+                setup(inner);
+            }
+            let (mut e_old, mut e_direct, mut e_ignored) =
+                (Effects::default(), Effects::default(), Effects::default());
+            for &c in calls {
+                drive(&mut old, c, true, &mut e_old);
+                drive(&mut direct, c, true, &mut e_direct);
+                drive(&mut ignored, c, false, &mut e_ignored);
+            }
+            let recorded = state(&old);
+            assert_eq!(state(&direct), recorded, "direct log state");
+            assert_eq!(
+                state(&ignored),
+                recorded,
+                "view ignored by the route: state"
+            );
+            let logged = recorded.0.len();
+            // Off: no reservation, one copy per logged call, the issue point at the gather.
+            assert_eq!(e_old.views, 0);
+            assert_eq!(e_old.copies, logged);
+            // On: no copy for a call routed into its view; a route that ignored the view still
+            // gets its ids copied (the same bytes land in the log).
+            assert_eq!(e_direct.copies, 0);
+            assert_eq!(e_direct.views, logged);
+            assert_eq!(e_ignored.copies, logged);
+            // The deferred-fill issue point is reached once per call either way.
+            assert_eq!(e_direct.issues, e_old.issues);
+            assert_eq!(e_ignored.issues, e_old.issues);
+            recorded
+        }
+
+        #[test]
+        fn trunk_calls_record_the_same_offsets_and_move_no_bytes() {
+            let calls = [
+                call(0, 40),
+                call(1, 40),
+                call(2, 10),
+                call(3, 640),
+                call(0, 20),
+            ];
+            let (recorded, used, overflowed, routed, seen, frozen) = parity(|_| {}, &calls);
+            assert_eq!(
+                recorded,
+                [
+                    (0, 40, 0),
+                    (1, 40, 160),
+                    (2, 10, 320),
+                    (3, 640, 360),
+                    (0, 20, 2920)
+                ]
+            );
+            assert_eq!(used, (40 + 40 + 10 + 640 + 20) * 4);
+            assert_eq!((overflowed, routed, seen, frozen), (0, 750, true, false));
+        }
+
+        #[test]
+        fn non_trunk_layers_and_empty_calls_log_nothing() {
+            // The head layers (>= trunk_layers = 4) count no routed slot and log nothing.
+            let (recorded, used, _, routed, seen, _) = parity(|_| {}, &[call(4, 40), call(7, 40)]);
+            assert!(recorded.is_empty() && used == 0 && routed == 0 && !seen);
+            // No slots: not counted, not logged.
+            let (recorded, used, _, routed, seen, _) = parity(|_| {}, &[call(0, 0)]);
+            assert!(recorded.is_empty() && used == 0 && routed == 0 && !seen);
+        }
+
+        #[test]
+        fn a_short_scratch_still_counts_but_logs_nothing() {
+            let short = Call {
+                layer: 0,
+                slots: 40,
+                scratch_bytes: 100,
+            };
+            let (recorded, _, _, routed, seen, _) = parity(|_| {}, &[short, call(1, 40)]);
+            assert_eq!(recorded, [(1, 40, 0)]);
+            assert_eq!((routed, seen), (80, true));
+        }
+
+        #[test]
+        fn a_frozen_or_released_tail_counts_the_window_but_logs_nothing() {
+            let (recorded, used, _, routed, seen, frozen) = parity(
+                |inner| inner.frozen = Some("boom".to_string()),
+                &[call(0, 40), call(1, 40)],
+            );
+            assert!(recorded.is_empty() && used == 0 && frozen);
+            assert_eq!((routed, seen), (80, true));
+            let (recorded, used, _, routed, _, _) =
+                parity(|inner| inner.released = true, &[call(0, 40), call(1, 40)]);
+            assert!(recorded.is_empty() && used == 0 && routed == 80);
+        }
+
+        #[test]
+        fn a_log_without_room_counts_the_overflow_and_keeps_logging_what_fits() {
+            let (recorded, used, overflowed, routed, _, _) = parity(
+                |inner| inner.log_used = LOG_IDS * 4 - 200,
+                &[call(0, 40), call(1, 40), call(2, 10), call(3, 10)],
+            );
+            // 160 B fit, the next 160 B overflow (counted), 40 B fit and fill the log, the last
+            // 40 B overflow (counted).
+            let base = (LOG_IDS * 4 - 200) as u32;
+            assert_eq!(recorded, [(0, 40, base), (2, 10, base + 160)]);
+            assert_eq!(used, LOG_IDS * 4);
+            assert_eq!((overflowed, routed), (2, 100));
+        }
+
+        #[test]
+        fn a_tail_without_a_log_logs_nothing() {
+            let (recorded, used, _, routed, _, _) =
+                parity(|inner| inner.log = None, &[call(0, 40)]);
+            assert!(recorded.is_empty() && used == 0 && routed == 40);
+        }
+
+        #[test]
+        fn a_suspended_tail_takes_no_decision_in_either_mode() {
+            let mut inner = tail(true);
+            inner.suspended = true;
+            let mut effects = Effects::default();
+            drive(&mut inner, call(0, 40), true, &mut effects);
+            assert_eq!(effects, Effects::default());
+            assert!(inner.calls.is_empty() && inner.log_used == 0);
+            assert_eq!((inner.window_routed, inner.window_seen), (0, false));
+        }
+
+        #[test]
+        fn the_reservation_is_the_one_decision_of_its_call() {
+            let mut inner = tail(true);
+            let issues = Cell::new(0usize);
+            let view = inner
+                .reserve_with(1, 40, 160, |_| {
+                    issues.set(issues.get() + 1);
+                    Ok(())
+                })
+                .expect("a trunk call with room logs");
+            assert_eq!(view.buf.as_ptr() as usize, LOG_BASE);
+            assert_eq!(
+                inner.reserved.map(|reserved| reserved.admit),
+                Some(LogAdmit::Log { at: 0 })
+            );
+            // The reservation counted the call once and moved no log offset.
+            assert_eq!((inner.window_routed, inner.log_used), (40, 0));
+            inner.note_with(
+                1,
+                40,
+                &view,
+                |_| panic!("the gather issues no deferred fill of a reserved call"),
+                |_| panic!("a call routed into the log is not copied"),
+            );
+            assert_eq!(issues.get(), 1);
+            assert_eq!((inner.window_routed, inner.log_used), (40, 160));
+            assert_eq!(inner.calls, [(1, 40, 0)]);
+        }
+
+        #[test]
+        fn a_reserved_call_that_met_a_freeze_logs_nothing() {
+            let mut inner = tail(true);
+            let view = inner
+                .reserve_with(0, 40, 160, |_| Ok(()))
+                .expect("a trunk call with room logs");
+            inner.freeze("a device error between the route and the gather");
+            inner.note_with(
+                0,
+                40,
+                &view,
+                |_| Ok(()),
+                |_| panic!("a frozen tail copies nothing"),
+            );
+            assert!(inner.calls.is_empty() && inner.log_used == 0);
+        }
+
+        #[test]
+        fn a_gather_that_does_not_match_the_reservation_takes_its_own_decision() {
+            let mut inner = tail(true);
+            let _ = inner.reserve_with(1, 40, 160, |_| Ok(()));
+            let scratch = fake(SCRATCH_BASE, 80);
+            let mut copies = 0;
+            inner.note_with(
+                2,
+                20,
+                &scratch,
+                |_| Ok(()),
+                |_| {
+                    copies += 1;
+                    Ok(())
+                },
+            );
+            // The unrelated call was decided and copied as an unreserved one.
+            assert_eq!((copies, inner.calls.clone()), (1, vec![(2, 20, 0)]));
+            assert!(inner.reserved.is_none());
+        }
+
+        #[test]
+        fn a_window_end_drops_a_reservation_that_never_gathered() {
+            let mut inner = tail(true);
+            inner.suspended = false;
+            let _ = inner.reserve_with(0, 40, 160, |_| Ok(()));
+            assert!(inner.reserved.is_some());
+            inner.suspended = true;
+            assert!(inner.skip_suspended_window());
+            assert!(inner.reserved.is_none());
         }
     }
 

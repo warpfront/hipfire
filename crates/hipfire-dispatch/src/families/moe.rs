@@ -1614,6 +1614,26 @@ pub trait MoeRowGather {
         Err("owner assignment not supported".into())
     }
 
+    /// Pre-route reservation of a few-row grouped prefill call's routed-id destination: the
+    /// hook that logs the call's ids ([`Self::gather_rows`] sees them) may name a device view of
+    /// `slots * 4` bytes that the route producer then writes DIRECTLY instead of `scratch`, so
+    /// the usage log needs no later device copy. Called once per call, before the router
+    /// launches, only for a replicated-route prefill call that will reach its row gather
+    /// (never under a graph capture or replay record); `scratch` is the call's own top-k
+    /// buffer. `Some(view)`: the route kernels write `view` and every later reader of the call's
+    /// ids (owner assignment, scatter, gate/up, down, combine, [`Self::gather_rows`]) reads it,
+    /// the bytes exactly those the scratch would have held; the view stays valid until the
+    /// window's retirement. `None` (default): the call routes into `scratch`.
+    fn reserve_topk(
+        &self,
+        _gpu: &mut rdna_compute::Gpu,
+        _layer_idx: u16,
+        _slots: usize,
+        _scratch: &GpuTensor,
+    ) -> Option<GpuTensor> {
+        None
+    }
+
     /// A rank-local MoE call that replaces this hook's row gather (an X2 owned
     /// MTP draft lane computes every slot itself and crosses nothing) reports
     /// itself here at the point the gather would run, so per-call bookkeeping
