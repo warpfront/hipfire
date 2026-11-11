@@ -9985,6 +9985,18 @@ pub const GATED_DELTA_NET_Q8_FAST_SRC: &str = concat!(
     include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
 );
 
+/// FP32-continuation stream twin of [`GATED_DELTA_NET_Q8_FAST_SRC`]
+/// (`gated_delta_net_q8_fast_stream`): the same recurrence, DPP reduction and
+/// prefetch, plus explicit entry (Q8 / Q8+EF / FP32 `h0`) and exit (quantize /
+/// FP32 `ht`) modes and a caller-keyed stochastic-rounding frame. Used by the
+/// sequential algorithm of `gdn_stream_append_sequential`; every other launch
+/// keeps the unmodified fast kernel and its ABI.
+pub const GATED_DELTA_NET_Q8_FAST_STREAM_SRC: &str = concat!(
+    "#define HIPFIRE_GDN_DPP_REDUCE 1\n#define HIPFIRE_GDN_PREFETCH 1\n",
+    "#define HIPFIRE_GDN_STREAM 1\n#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_fast_stream\n",
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
+);
+
 /// fused chunked gated-delta-net prefill scan, WMMA-resident state (hipfire design; structure informed by public FLA/AITER chunk decomposition).
 pub const GDN_CHUNK_PREP_SRC: &str =
     include_str!("../../../kernels/src/gdn_chunk_scan_prep.gfx1201.hip");

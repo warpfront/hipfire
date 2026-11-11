@@ -341,6 +341,7 @@ module	gated_delta_net_q8_compact3_b2_rows	config-opt-in	Non-default configurati
 module	gated_delta_net_q8_fast_independent_masked	config-opt-in	Non-default configuration: serve.continuous_batch_size; rdna-compute/src/norm.rs:3977-4021
 module	gated_delta_net_q8_fast_lanes_varrows	config-opt-in	Non-default configuration: serve.vmm_batch; dflash_cb.rs:1003
 module	gated_delta_net_q8_fast_lanes_varrows_from	config-opt-in	Non-default configuration: serve.vmm_batch; dflash_cb.rs:1003
+module	gated_delta_net_q8_fast_stream	no-caller	Sequential-algorithm stream executor has no shipping caller until the architecture owners wire gdn_stream_append_sequential; rdna-compute/src/norm.rs:7516
 module	gated_delta_net_q8_independent_masked	developer-opt-in	Non-default developer override: HIPFIRE_DN_REQUANT_PER_TOKEN; rdna-compute/src/norm.rs:58-74
 module	gated_norm_mq_rotate_awq_gfx1100	non-core-family	Non-core family route: LFM2; rdna-compute/src/gemv.rs:5301-5306
 module	gated_norm_mq_rotate_awq_gfx1151	non-core-family	Non-core family route: LFM2; rdna-compute/src/gemv.rs:5287-5293

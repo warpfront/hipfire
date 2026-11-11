@@ -63,12 +63,23 @@ struct __attribute__((aligned(16))) GsLds{
 };
 static_assert(sizeof(unsigned short)*GS_D*GS_KTP<=sizeof(unsigned short)*GS_BV*GS_KP,"transposed K fits the z tile");
 
+// State entry/exit modes: the same kernargs and semantics as
+// `gdn_chunk_scan` (gdn_chunk_scan.gfx1201.hip), whose header documents them.
+#define GS_ENTRY_Q8 0
+#define GS_ENTRY_Q8EF 1
+#define GS_ENTRY_F32 2
+#define GS_EXIT_SEAL 0
+#define GS_EXIT_F32 1
+#define GS_EXIT_SEAM 2
+#define GS_EXIT_NONE 3
+#define GS_EXIT_EF 4
 extern "C" __launch_bounds__(GS_NT,1)
 __global__ void gdn_chunk_scan_gfx1151(
  const unsigned short* __restrict__ q,const unsigned short* __restrict__ k,const unsigned short* __restrict__ v,
  const unsigned short* __restrict__ A,const float* __restrict__ G,const float* __restrict__ beta,
- signed char* __restrict__ sq,float* __restrict__ sc,_Float16* __restrict__ ef,float* __restrict__ out,int row0,int T){
- if(T<=0||T>512)return;
+ signed char* __restrict__ sq,float* __restrict__ sc,_Float16* __restrict__ ef,float* __restrict__ out,int row0,int T,
+ const float* h0,float* ht,int entry_mode,int exit_mode){
+ if(T<0||T>512)return;
  const int head=(int)blockIdx.y;
  const int tid=(int)threadIdx.x,lane=tid&31,lo=lane&15,hi=lane>>4;
  const int wave=__builtin_amdgcn_readfirstlane(tid>>5);
@@ -85,7 +96,8 @@ __global__ void gdn_chunk_scan_gfx1151(
 #pragma unroll
   for(int e=0;e<8;++e){const int key=(kt0+ki)*16+gs_acc_row(lane,e);
    const unsigned long long off=((unsigned long long)head*GS_D+vv)*GS_D+key;
-   St[t][e]=(float)sq[off]*sc[head*GS_D+vv]+(float)ef[off];
+   if(entry_mode==GS_ENTRY_F32)St[t][e]=h0[off];
+   else{const float res=entry_mode==GS_ENTRY_Q8EF?(float)ef[off]:0.0f;St[t][e]=(float)sq[off]*sc[head*GS_D+vv]+res;}
   }}
  auto stage_state=[&](){
 #pragma unroll
@@ -213,6 +225,14 @@ __global__ void gdn_chunk_scan_gfx1151(
   GS_BAR();
  }
 
+ if((exit_mode&3)==GS_EXIT_NONE)return;
+ if((exit_mode&3)==GS_EXIT_F32){
+#pragma unroll
+  for(int ki=0;ki<2;++ki)for(int vi=0;vi<2;++vi){int t=ki*2+vi,vv=vbase+(vt0+vi)*16+lo;
+#pragma unroll
+   for(int e=0;e<8;++e)ht[((unsigned long long)head*GS_D+vv)*GS_D+(kt0+ki)*16+gs_acc_row(lane,e)]=St[t][e];}
+  return;
+ }
  // The old EF was folded into St before the scan so it participates in every
  // output and decay.  The dead state staging tile holds the full-row reductions.
  float vmax[2]={0,0};
@@ -224,6 +244,7 @@ __global__ void gdn_chunk_scan_gfx1151(
    for(int e=0;e<8;++e)vmax[vi]=fmaxf(vmax[vi],fabsf(St[t][e]));}
   vmax[vi]=fmaxf(vmax[vi],__shfl_xor(vmax[vi],16));if(hi==0)reinterpret_cast<float*>(&sm.state[0][0])[(swave>>1)*GS_BV+vv-vbase]=vmax[vi];}
  GS_BAR();
+ const bool gs_wef=(exit_mode&GS_EXIT_EF)!=0,gs_seam=(exit_mode&3)==GS_EXIT_SEAM;
 #pragma unroll
  for(int vi=0;vi<2;++vi){int vv=vbase+(vt0+vi)*16+lo;float mx=0;
 #pragma unroll
@@ -231,5 +252,8 @@ __global__ void gdn_chunk_scan_gfx1151(
 #pragma unroll
   for(int ki=0;ki<2;++ki){int t=ki*2+vi;
 #pragma unroll
-   for(int e=0;e<8;++e){const unsigned long long off=((unsigned long long)head*GS_D+vv)*GS_D+(kt0+ki)*16+gs_acc_row(lane,e);float qf=fminf(fmaxf(rintf(St[t][e]*inv),-128.0f),127.0f);sq[off]=(signed char)qf;ef[off]=(_Float16)(St[t][e]-qf*scale);}}}
+   for(int e=0;e<8;++e){const unsigned long long off=((unsigned long long)head*GS_D+vv)*GS_D+(kt0+ki)*16+gs_acc_row(lane,e);float qf=fminf(fmaxf(rintf(St[t][e]*inv),-128.0f),127.0f);sq[off]=(signed char)qf;
+    const float qs=qf*scale;
+    if(gs_wef)ef[off]=(_Float16)(St[t][e]-qs);
+    if(gs_seam)ht[off]=qs+(float)(_Float16)(St[t][e]-qs);}}}
 }
