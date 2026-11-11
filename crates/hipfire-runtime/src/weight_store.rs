@@ -1273,7 +1273,10 @@ fn expected_float_bytes(shape: &[usize], dtype: DType) -> Option<usize> {
 /// expert dimensions; every dimension before K contributes to the row count.
 /// In particular, MQ4G128V2 is `rows * ceil(K/128) * 68`, not a flat
 /// `ceil(rows*K/128)` calculation.
-fn expected_payload_bytes(shape: &[usize], dtype: DType) -> Result<Option<usize>, String> {
+pub(crate) fn expected_payload_bytes(
+    shape: &[usize],
+    dtype: DType,
+) -> Result<Option<usize>, String> {
     if matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
         return Ok(expected_float_bytes(shape, dtype));
     }

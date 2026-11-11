@@ -132,9 +132,13 @@ pub fn load_embedding(
 ) -> HipResult<(GpuTensor, EmbeddingFormat)> {
     match embed_classify(quant_type)? {
         EmbedPlan::Raw(fmt) => {
-            if fmt == EmbeddingFormat::HFQ4G128 {
-                validate_hfq4g128_extent(data.len(), vocab, dim, "token_embd")?;
-            }
+            validate_row_extent(
+                embedding_format_dtype(fmt),
+                data.len(),
+                vocab,
+                dim,
+                "token_embd",
+            )?;
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok((buf, fmt))
         }
@@ -748,11 +752,31 @@ pub fn hfq_weight_dtype(quant_type: u8) -> Option<DType> {
     raw_codec(quant_type).map(|codec| codec.dtype)
 }
 
-/// HFQ4-G128 per-row extent for loaders that upload qt7 without
-/// [`decode_raw_codec`]: a pre-`b4846285e` file packs groups across rows and
-/// decodes to NaN. Same rule as the weight_store manifest paths.
-pub fn validate_hfq4g128_extent(len: usize, m: usize, k: usize, name: &str) -> HipResult<()> {
-    crate::weight_store::validate_payload_extent(&[m, k], DType::HFQ4G128, len).map_err(|reason| {
+/// Per-row extent check for row-packed raw formats; other dtypes pass. Every
+/// raw upload (with or without [`decode_raw_codec`]) calls this: older
+/// quantizers packed ragged-K matrices across rows, which the per-row kernels
+/// decode to garbage or NaN. Same rule as the weight_store manifest paths.
+pub fn validate_row_extent(
+    dtype: DType,
+    len: usize,
+    m: usize,
+    k: usize,
+    name: &str,
+) -> HipResult<()> {
+    if !matches!(
+        dtype,
+        DType::HFQ4G128
+            | DType::HFQ6G256
+            | DType::HFQ4G256
+            | DType::HFQ2G128
+            | DType::HFQ3G128
+            | DType::Q4F16G64
+            | DType::Q4K
+            | DType::Q8_0
+    ) {
+        return Ok(());
+    }
+    crate::weight_store::validate_payload_extent(&[m, k], dtype, len).map_err(|reason| {
         hip_bridge::HipError::new(0, &format!("tensor {name}: {reason}{BLOB_FIX}"))
     })
 }
@@ -780,24 +804,7 @@ fn validate_raw_codec_payload(
             ),
         ));
     }
-    if matches!(
-        codec.dtype,
-        DType::HFQ4G128
-            | DType::HFQ6G256
-            | DType::HFQ4G256
-            | DType::HFQ2G128
-            | DType::HFQ3G128
-            | DType::Q4F16G64
-            | DType::Q4K
-            | DType::Q8_0
-    ) {
-        // Same per-row extent the weight_store manifest paths enforce: older
-        // quantizers packed ragged-K matrices across rows, which the per-row
-        // kernels decode to garbage or NaN.
-        crate::weight_store::validate_payload_extent(&[m, k], codec.dtype, data.len()).map_err(
-            |reason| hip_bridge::HipError::new(0, &format!("tensor {name}: {reason}{BLOB_FIX}")),
-        )?;
-    }
+    validate_row_extent(codec.dtype, data.len(), m, k, name)?;
     if codec.dtype == DType::MQ4G256V2 {
         let gpr = k / 256;
         let expected = m * gpr * 136;
@@ -1679,6 +1686,44 @@ impl<'a> WeightBackend for ParoBackend<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every row-packed raw dtype refuses a cross-row (pre-per-row) payload
+    /// for ragged K and accepts the per-row one; the set is shared by
+    /// `decode_raw_codec` and the non-codec loaders.
+    #[test]
+    fn validate_row_extent_refuses_cross_row_ragged_k() {
+        for (dtype, group) in [
+            (DType::HFQ4G128, 128),
+            (DType::HFQ6G256, 256),
+            (DType::HFQ4G256, 256),
+            (DType::HFQ2G128, 128),
+            (DType::HFQ3G128, 128),
+            (DType::Q4F16G64, 64),
+            (DType::Q4K, 256),
+            (DType::Q8_0, 32),
+        ] {
+            let (m, k) = (2, group + group / 2);
+            // Per-row padding: 2 groups per row, 4 total; cross-row packing: 3.
+            // Dtypes that need K % group == 0 refuse ragged K at any length.
+            let Ok(Some(per_row)) = crate::weight_store::expected_payload_bytes(&[m, k], dtype)
+            else {
+                assert!(
+                    validate_row_extent(dtype, 1 << 20, m, k, "t").is_err(),
+                    "{dtype:?}"
+                );
+                continue;
+            };
+            let cross_row = per_row / 4 * 3;
+            assert!(
+                validate_row_extent(dtype, per_row, m, k, "t").is_ok(),
+                "{dtype:?}"
+            );
+            assert!(
+                validate_row_extent(dtype, cross_row, m, k, "t").is_err(),
+                "{dtype:?}"
+            );
+        }
+    }
 
     /// `fwht256_inplace` must be bit-identical to the per-arm inlined FWHT it
     /// replaced (the version that shipped in 6 dequant arms). Pin it: run a

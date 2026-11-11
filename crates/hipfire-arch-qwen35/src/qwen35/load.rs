@@ -251,6 +251,16 @@ fn load_weight_tensor_raw_with(
     k: usize,
     target: MemoryTarget,
 ) -> HipResult<WeightTensor> {
+    let row_packed = match quant_type {
+        6 => Some(DType::HFQ4G256),
+        7 => Some(DType::HFQ4G128),
+        8 => Some(DType::HFQ6G256),
+        12 => Some(DType::HFQ3G128),
+        _ => None,
+    };
+    if let Some(dtype) = row_packed {
+        hipfire_runtime::weight_backend::validate_row_extent(dtype, data.len(), m, k, "raw")?;
+    }
     match quant_type {
         6 => {
             let buf = upload_codes(gpu, target, data, &[data.len()])?;
@@ -268,12 +278,6 @@ fn load_weight_tensor_raw_with(
             })
         }
         7 => {
-            hipfire_runtime::weight_backend::validate_hfq4g128_extent(
-                data.len(),
-                m,
-                k,
-                "HFQ4G128",
-            )?;
             let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
