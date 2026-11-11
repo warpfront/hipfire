@@ -230,7 +230,10 @@ fn main() {
         sub_chunks: MAX_SUB_CHUNKS,
     };
     let po = pgeom.offsets(geom.total_bytes());
-    let mb = pinned(&r, po.error + pgeom.bytes(), true);
+    // The load-wide poison word on its own line after the prefill slot, as the
+    // production context lays it out.
+    let poison_off = (po.error + pgeom.bytes()).next_multiple_of(64);
+    let mb = pinned(&r, poison_off + 64, true);
     let layer = ColdLayer {
         gate_up: gate_up.clone(),
         down: down.clone(),
@@ -277,6 +280,7 @@ fn main() {
         ordinal: 1,
         geom,
         mailbox_base: mb as u64,
+        poison: mb as u64 + poison_off as u64,
         n_experts: N_EXP,
         mi: MI,
         prefill: vec![PrefillServe {
@@ -300,6 +304,7 @@ fn main() {
             ids: b + o.ids as u64,
             weights: b + o.weights as u64,
             cold_out: b + o.cold_out as u64,
+            poison: b + poison_off as u64,
         }
     };
     let counter = upload_bytes(&mut r, &0u32.to_ne_bytes());
@@ -819,6 +824,7 @@ fn main() {
                     ids: 0,
                     weights: 0,
                     cold_out: 0,
+                    poison: b + poison_off as u64,
                 };
                 r.hetero_await_cold(&counter, l, LAYERS as u32, &slot, 50_000_000)
                     .unwrap();

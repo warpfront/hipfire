@@ -13,8 +13,11 @@
 //   * the gfx12 WMMA operand layout: a lane holds 8 K elements (lanes 0..15
 //     elements 0..7, lanes 16..31 elements 8..15) and accumulator element i
 //     of lane (l16, half) is matrix row i + 8 * half.
-// Not bit-exact against indexed_attention_attention_fp8_batched_hg4 (opt-in
-// until a KLD reference exists).
+// Not bit-exact against the hg4 references
+// (indexed_attention_attention_{fp8,q8}_batched_hg4). The q8 route is the
+// gfx1201 default (HIPFIRE_QWEN4_QSA_Q8_GATHER_GFX1201=0 keeps hg4): KLD 0.104
+// against q8 hg4 (2 x 2048 ctx, top-256), the same divergence as the gfx1151
+// default, which already is the gathered route.
 
 typedef _Float16 __attribute__((ext_vector_type(8))) qg_h8_t;
 typedef _Float16 __attribute__((ext_vector_type(4))) qg_h4_t;

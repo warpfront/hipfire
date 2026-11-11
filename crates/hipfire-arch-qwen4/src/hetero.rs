@@ -6,14 +6,12 @@
 //!
 //! With `topology.hetero_experts = "gfx1151"` and `hardware.devices =
 //! "gfx1201,gfx1151"`, the gfx1201 primary runs the trunk and the hot routed
-//! experts. Every D2 split executor then computes its cold slots on one shared
-//! gfx1151 iGPU arm ([`hipfire_dispatch::igpu_split::IgpuColdArm`], HIP logical
-//! device 1) instead of host CPU cores. The arm is process-wide: a daemon holds
-//! one model.
+//! experts; the cold experts are computed on the gfx1151 (HIP logical device
+//! 1) by a responder that answers each layer through a pinned mailbox (the
+//! device-side split below). Its state is load-owned: [`release`] tears it
+//! down at unload, and a reload starts a fresh one.
 
 use std::sync::{Arc, Mutex};
-
-use hipfire_dispatch::igpu_split::{ColdArmDims, IgpuColdArm};
 
 /// HIP logical device of the expert iGPU (`hardware.devices = "gfx1201,gfx1151"`).
 const EXPERT_DEVICE: i32 = 1;
@@ -30,57 +28,63 @@ pub(crate) fn check_primary(primary_arch: &str) -> Result<(), String> {
 }
 
 /// `topology.hetero_experts` for this process: `Some(arch)` when the split is
-/// requested and its combination rules hold.
+/// requested, its combination rules hold and the process's cards are the
+/// pair it runs on (a gfx1201 primary, then the expert arch). A key set on
+/// any other device set is an error, not a load that silently changes its
+/// dispatch and prefill settings and never engages the split.
 pub(crate) fn requested() -> Result<Option<String>, String> {
     use hipfire_config::topology;
     let value = hipfire_config::process_value(topology::HETERO_EXPERTS_ENV);
-    topology::resolve_hetero_experts(
+    let Some(arch) = topology::resolve_hetero_experts(
         value.as_deref(),
         hipfire_runtime::config::get().allow_mixed_arch,
         topology::qwen4_ep()?,
         topology::pp()?,
+        // tp is a load parameter, not process configuration; Qwen4's mesh
+        // admission refuses any tp > 1 for every load
+        // (`EffectiveMesh::is_qwen4_admitted`), the split's included.
         1,
-    )
+    )?
+    else {
+        return Ok(None);
+    };
+    // `None`: the cards cannot be told before the runtime loads (no KFD
+    // topology); the attach's `check_primary` still holds the primary.
+    if let Some(devices) = hipfire_config::devices::startup_devices() {
+        check_devices(&devices.iter().map(|d| d.arch.as_str()).collect::<Vec<_>>(), &arch)?;
+    }
+    Ok(Some(arch))
+}
+
+/// The split's card pair: HIP logical device 0 the gfx1201 primary, device
+/// [`EXPERT_DEVICE`] the expert arch.
+fn check_devices(archs: &[&str], expert: &str) -> Result<(), String> {
+    match archs {
+        ["gfx1201", second, ..] if *second == expert => Ok(()),
+        _ => Err(format!(
+            "topology.hetero_experts = {expert:?} needs hardware.devices = \"gfx1201,{expert}\" (the gfx1201 first); this process has {archs:?}"
+        )),
+    }
 }
 
 /// Whether this process requests the split (a valid `topology.hetero_experts`).
-/// Needs the process and runtime configuration installed.
+/// Needs the process and runtime configuration installed. An invalid key is
+/// reported here once and reads as not requested; the load itself refuses it
+/// (`Qwen4GpuForward::new_inner_with_reserve`).
 pub fn split_requested() -> bool {
-    matches!(requested(), Ok(Some(_)))
+    match requested() {
+        Ok(found) => found.is_some(),
+        Err(error) => {
+            static REPORTED: std::sync::Once = std::sync::Once::new();
+            REPORTED.call_once(|| eprintln!("  qwen4 hetero experts: {error}"));
+            false
+        }
+    }
 }
 
-static ARM: Mutex<Option<Arc<IgpuColdArm>>> = Mutex::new(None);
-
-/// The shared iGPU arm when the split is requested, opened on first use; `None`
-/// when it is not. `dims.max_rows` is raised to the D2 storage cap so every
-/// executor of the load (wider verify reservations included) fits one arm.
-pub(crate) fn arm_for(
-    primary_arch: &str,
-    dims: ColdArmDims,
-) -> Result<Option<Arc<IgpuColdArm>>, String> {
-    if requested()?.is_none() {
-        return Ok(None);
-    }
-    check_primary(primary_arch)?;
-    let mut slot = ARM
-        .lock()
-        .map_err(|_| "topology.hetero_experts: arm lock poisoned".to_owned())?;
-    if let Some(arm) = slot.as_ref() {
-        return Ok(Some(Arc::clone(arm)));
-    }
-    let dims = ColdArmDims {
-        max_rows: hipfire_dispatch::cpu_split::CPU_SPLIT_STORAGE_MAX_ROWS,
-        ..dims
-    };
-    let arm = Arc::new(
-        IgpuColdArm::new(EXPERT_DEVICE, dims)
-            .map_err(|e| format!("topology.hetero_experts: {e:?}"))?,
-    );
-    eprintln!(
-        "  qwen4 hetero experts: igpu arm on gfx1151 (HIP device {EXPERT_DEVICE}), cold D2 slots run there"
-    );
-    *slot = Some(Arc::clone(&arm));
-    Ok(Some(arm))
+/// Whether a layer attached this load's device split.
+pub(crate) fn attached() -> bool {
+    lock_device().is_ok_and(|guard| guard.is_some())
 }
 
 // ---- Device-side split (design v3) ---------------------------------------
@@ -182,6 +186,9 @@ const AWAIT_MAX_POLLS: u32 = 1_000_000;
 /// then the responder.
 struct DeviceContext {
     mailbox: usize,
+    /// Address of the load-wide poison word (in the mailbox allocation):
+    /// nonzero once a wait timed out or the responder stopped.
+    poison: usize,
     geom: MailboxGeometry,
     counter: rdna_compute::GpuTensor,
     n_experts: usize,
@@ -254,7 +261,9 @@ pub(crate) fn attach_device_layer(
             end = o.error + pgeom.bytes();
             poffs.push(o);
         }
-        let total = end;
+        // The load-wide poison word, on its own cache line after the slots.
+        let poison_off = end.next_multiple_of(64);
+        let total = poison_off + 64;
         let flags = hip_bridge::HIP_HOST_MALLOC_MAPPED | hip_bridge::HIP_HOST_MALLOC_COHERENT;
         let mailbox = gpu.hip.host_malloc(total, flags).map_err(hip)?.cast::<u8>();
         // SAFETY: fresh pinned allocation of `total` bytes: zero = never written.
@@ -275,6 +284,7 @@ pub(crate) fn attach_device_layer(
         let prefill = HeteroPrefillShared::new(
             gpu,
             mailbox as u64,
+            mailbox as u64 + poison_off as u64,
             &poffs,
             pgeom,
             placement.len(),
@@ -284,6 +294,7 @@ pub(crate) fn attach_device_layer(
         .map_err(|e| format!("topology.hetero_experts: {e:?}"))?;
         *guard = Some(DeviceContext {
             mailbox: mailbox as usize,
+            poison: mailbox as usize + poison_off,
             geom,
             counter,
             n_experts: placement.len(),
@@ -301,6 +312,14 @@ pub(crate) fn attach_device_layer(
         );
     }
     let ctx = guard.as_mut().expect("initialized above");
+    // A context whose responder runs, or that already holds this layer,
+    // belongs to an earlier load that was never released ([`release`]): its
+    // responder's graphs bake that load's cold expert addresses.
+    if ctx.responder.is_some() || ctx.pending.get(layer).is_some_and(Option::is_some) {
+        return Err(format!(
+            "topology.hetero_experts: layer {layer} attached while an earlier load's device split is still live (not released)"
+        ));
+    }
     if ctx.pending.len() != layers || layer >= layers || ctx.n_experts != placement.len() {
         return Err(format!(
             "topology.hetero_experts: layer {layer} of {layers} does not match the load's geometry"
@@ -338,6 +357,7 @@ pub(crate) fn attach_device_layer(
             ordinal: EXPERT_DEVICE,
             geom: ctx.geom,
             mailbox_base: b,
+            poison: ctx.poison as u64,
             n_experts: ctx.n_experts,
             mi: ctx.mi,
             prefill: ctx
@@ -408,6 +428,7 @@ fn slot_ptrs(ctx: &DeviceContext, index: usize) -> rdna_compute::HeteroSlotPtrs 
         ids: b + o.ids as u64,
         weights: b + o.weights as u64,
         cold_out: b + o.cold_out as u64,
+        poison: ctx.poison as u64,
     }
 }
 
@@ -506,6 +527,29 @@ pub(crate) fn begin_token(gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
                 .into(),
         );
     };
+    poisoned(ctx, responder)?;
+    gpu.hetero_token_advance(&ctx.counter)
+        .map_err(|e| format!("topology.hetero_experts: {e}"))
+}
+
+/// After a forward's host readback (its work is complete): fail the forward
+/// whose cold rows a timed-out wait skipped, so a token computed without its
+/// cold experts (an EOS or a request's last token included) never reaches the
+/// client. No-op without a device split.
+pub(crate) fn check_forward() -> Result<(), String> {
+    let guard = lock_device()?;
+    match guard.as_ref() {
+        Some(ctx) => match ctx.responder.as_ref() {
+            Some(responder) => poisoned(ctx, responder),
+            None => Ok(()),
+        },
+        None => Ok(()),
+    }
+}
+
+/// `Err` when the split is poisoned: the responder stopped, a layer's or a
+/// prefill chunk's wait timed out, or the poison word is set.
+fn poisoned(ctx: &DeviceContext, responder: &HeteroResponder) -> Result<(), String> {
     if let Some(f) = responder.failure() {
         return Err(format!("topology.hetero_experts: responder stopped: {f}"));
     }
@@ -526,8 +570,15 @@ pub(crate) fn begin_token(gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
             "topology.hetero_experts: a prefill chunk timed out waiting for the expert device (seq {e}); the split is poisoned"
         ));
     }
-    gpu.hetero_token_advance(&ctx.counter)
-        .map_err(|e| format!("topology.hetero_experts: {e}"))
+    // SAFETY: an aligned word in the live pinned mailbox.
+    let p = unsafe { &*(ctx.poison as *const std::sync::atomic::AtomicU32) }
+        .load(std::sync::atomic::Ordering::Acquire);
+    if p != 0 {
+        return Err(format!(
+            "topology.hetero_experts: the split is poisoned (word {p:#x}): a wait timed out or the responder stopped"
+        ));
+    }
+    Ok(())
 }
 
 /// Before each MoE call of an fn-lanes step: advance the device token counter
@@ -545,6 +596,67 @@ pub(crate) fn advance_call(gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
         .map_err(|e| format!("topology.hetero_experts: {e}"))
 }
 
+/// Tear down the load's split at unload (or after a load that failed once
+/// it attached a layer): drain the primary, stop and join the responder
+/// (its captured graphs read the load's cold expert pages), free the token
+/// counters, the prefill exchange, the layer-major arena and the pinned
+/// mailbox. Every layer's split must already be gone:
+/// a prefill exchange still shared is leaked with a warning, never freed
+/// under a live reference. No-op without a split. The next load starts a
+/// fresh context.
+pub(crate) fn release(gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+    let hip = |e: hip_bridge::HipError| format!("topology.hetero_experts: release: {e}");
+    let ctx = lock_device()?.take();
+    let arena = ARENA
+        .lock()
+        .map_err(|_| "topology.hetero_experts: arena lock poisoned".to_owned())?
+        .take();
+    if ctx.is_none() && arena.is_none() {
+        return Ok(());
+    }
+    let mut first: Option<String> = gpu.hip.device_synchronize().err().map(hip);
+    if let Some((_, streams, ffn)) = arena {
+        for t in std::iter::once(streams).chain(ffn) {
+            if let Err(e) = gpu.free_tensor(t) {
+                first.get_or_insert(hip(e));
+            }
+        }
+    }
+    if let Some(ctx) = ctx {
+        let DeviceContext {
+            mailbox,
+            counter,
+            responder,
+            head_counter,
+            prefill,
+            ..
+        } = ctx;
+        // The responder polls the mailbox and reads the cold pages: it stops
+        // before either goes.
+        drop(responder);
+        match Arc::try_unwrap(prefill) {
+            Ok(prefill) => {
+                if let Err(e) = prefill.free_gpu(gpu) {
+                    first.get_or_insert(format!("topology.hetero_experts: release: {e:?}"));
+                }
+            }
+            Err(_) => eprintln!(
+                "  qwen4 hetero experts: WARNING prefill exchange still shared at release; leaked"
+            ),
+        }
+        for t in std::iter::once(counter).chain(head_counter) {
+            if let Err(e) = gpu.free_tensor(t) {
+                first.get_or_insert(hip(e));
+            }
+        }
+        if let Err(e) = gpu.hip.host_free(mailbox as *mut std::ffi::c_void) {
+            first.get_or_insert(hip(e));
+        }
+        eprintln!("  qwen4 hetero experts: device split released");
+    }
+    first.map_or(Ok(()), Err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,6 +666,21 @@ mod tests {
         assert!(!all_attached::<u8>(&[]));
         assert!(!all_attached(&[Some(1), None]));
         assert!(all_attached(&[Some(1), Some(2)]));
+    }
+
+    #[test]
+    fn hetero_needs_the_gfx1201_then_expert_card_pair() {
+        assert!(check_devices(&["gfx1201", "gfx1151"], "gfx1151").is_ok());
+        for archs in [
+            &["gfx1151"][..],
+            &["gfx1201"],
+            &["gfx1151", "gfx1201"],
+            &["gfx1201", "gfx1100"],
+            &[],
+        ] {
+            let e = check_devices(archs, "gfx1151").unwrap_err();
+            assert!(e.contains("gfx1201,gfx1151"), "{e}");
+        }
     }
 
     #[test]
@@ -587,7 +714,7 @@ static ARENA: Mutex<
 > = Mutex::new(None);
 
 fn view_of(t: &rdna_compute::GpuTensor) -> rdna_compute::GpuTensor {
-    // SAFETY: a non-owning view of an arena tensor that lives for the process.
+    // SAFETY: a non-owning view of an arena tensor that lives until [`release`].
     rdna_compute::GpuTensor {
         buf: unsafe { hip_bridge::DeviceBuffer::from_raw(t.buf.as_ptr(), t.buf.size()) },
         shape: t.shape.clone(),
@@ -597,7 +724,7 @@ fn view_of(t: &rdna_compute::GpuTensor) -> rdna_compute::GpuTensor {
 
 /// `Some` when this load runs the hetero split with its prefill exchange and
 /// `HIPFIRE_HETERO_LAYER_MAJOR` is not `0`. The arena is allocated on first use
-/// (once per process: a daemon holds one model).
+/// and freed with the load's split ([`release`]).
 pub(crate) fn layer_major(
     gpu: &mut rdna_compute::Gpu,
     tile_rows: usize,

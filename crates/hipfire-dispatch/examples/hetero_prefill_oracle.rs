@@ -493,7 +493,8 @@ fn main() {
         };
         let got = run_cold_prefill(&mut gpu, &layer, &scratch, rows, io4);
         gpu.hip.device_synchronize().unwrap();
-        let expect_ok = symmetric && rows >= 512;
+        let expect_ok =
+            symmetric && rows >= hipfire_dispatch::hetero_prefill::COLD_PREFILL_SYM_IU4_FLOOR;
         match (got, expect_ok) {
             (Ok(()), true) => {
                 let g = partial();

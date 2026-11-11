@@ -58,6 +58,9 @@ pub struct ResponderConfig {
     pub ordinal: i32,
     pub geom: MailboxGeometry,
     pub mailbox_base: u64,
+    /// Address of the load-wide poison word: the responder sets it whenever
+    /// it stops on its own (a failure), so the primary's waits give up at once.
+    pub poison: u64,
     pub n_experts: usize,
     pub mi: usize,
     /// The prefill slot and the cold-prefill geometry, when prefill is served.
@@ -644,6 +647,26 @@ fn build(cfg: &ResponderConfig, layers: &[ColdLayer]) -> Result<Graphs, String> 
     Ok(graphs)
 }
 
+/// Sets the poison word when the responder thread ends on its own (a
+/// recorded failure, an early return, a panic): the primary's waits then give
+/// up at once instead of each polling out its bound. A requested stop
+/// (`stop`) leaves the word alone. `poison == 0`: no word.
+struct PoisonOnExit<'a> {
+    poison: u64,
+    stop: &'a AtomicBool,
+}
+
+impl Drop for PoisonOnExit<'_> {
+    fn drop(&mut self) {
+        if self.poison != 0 && !self.stop.load(Ordering::Acquire) {
+            // SAFETY: an aligned word in the live pinned mailbox, which the
+            // caller keeps alive for the responder's lifetime.
+            unsafe { &*(self.poison as usize as *const AtomicU32) }
+                .store(u32::MAX, Ordering::Release);
+        }
+    }
+}
+
 impl HeteroResponder {
     /// Record the per-layer graphs on gfx1151 device `cfg.ordinal` and start
     /// answering. Returns once the graphs exist, or the setup error.
@@ -670,6 +693,10 @@ impl HeteroResponder {
                         let _ = ready_tx.send(Err(e));
                         return;
                     }
+                };
+                let _poison_on_exit = PoisonOnExit {
+                    poison: cfg.poison,
+                    stop: &stop2,
                 };
                 let n = cfg.geom.layers;
                 let mut last: Vec<u32> = (0..n)

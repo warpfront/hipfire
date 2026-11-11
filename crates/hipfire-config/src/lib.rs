@@ -2400,7 +2400,7 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         true,
         Some("HIPFIRE_TOPOLOGY_HETERO_EXPERTS"),
-        "Qwen4 (Flash-Next) heterogeneous expert split: the gfx arch of the device that holds and computes cold routed experts (v1: \"gfx1151\" only), beside a gfx1201 primary that runs the trunk and hot experts. Admitted at load only when measured faster than the expert device alone. Requires hardware.allow_mixed_arch; cannot combine with topology.ep, topology.pp or tp > 1. Opt-in; null = off."
+        "Qwen4 (Flash-Next) heterogeneous expert split: the gfx arch of the device that holds and computes cold routed experts (v1: \"gfx1151\" only), beside a gfx1201 primary that runs the trunk and hot experts. Needs hardware.devices = \"gfx1201,gfx1151\" (the gfx1201 first) and hardware.allow_mixed_arch; cannot combine with topology.ep or topology.pp (Qwen4 admits no tp > 1). A key on any other device set refuses the load. Opt-in; null = off."
     ),
     process_field!(
         "hardware.uniform_vram_tolerance_gb",

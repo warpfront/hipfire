@@ -1882,7 +1882,10 @@ pub(crate) fn download_lane_rows(
         .flags
         .qwen4_lane_pinned_logits_enabled()
         .then_some(&gpu.hip);
-    copy_lane_rows(gpu, logits, begin, scratch.landing(pinned, n))
+    copy_lane_rows(gpu, logits, begin, scratch.landing(pinned, n))?;
+    // The rows are on the host, so the step's layers are done: a hetero wait
+    // that timed out in it skipped cold rows, and no lane may sample them.
+    crate::hetero::check_forward()
 }
 
 /// One draw of a sampled lane: the AR singleton's `sample_cpu` (neutral

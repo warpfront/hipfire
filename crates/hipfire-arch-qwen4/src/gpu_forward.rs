@@ -6015,6 +6015,15 @@ impl Qwen4MoeLayerRuntime {
                     payload.gate_up.len(),
                     payload.down.len(),
                 );
+                // The responder's decode graphs run the MQ4 cold kernels only
+                // (as the MTP head attach checks): any other slab format would
+                // be read as MQ4 bytes.
+                if (this.0, this.1) != (DType::MQ4G256V2, DType::MQ4G128V2) {
+                    return Err(Qwen4GpuForwardError::Dispatch(format!(
+                        "layer {} hetero: cold expert {e} is {:?}/{:?}, the responder serves MQ4G256V2/MQ4G128V2",
+                        self.label, this.0, this.1
+                    )));
+                }
                 if *spans.get_or_insert(this) != this {
                     return Err(Qwen4GpuForwardError::Dispatch(format!(
                         "layer {} hetero: cold experts differ in format or size ({spans:?} vs {this:?})",
@@ -6691,22 +6700,6 @@ impl Qwen4MoeLayerRuntime {
                 );
             }
         }
-        let dims = hipfire_dispatch::igpu_split::ColdArmDims {
-            dim: config.hidden_size,
-            mi: config.moe_intermediate_size,
-            top_k: config.num_experts_per_tok,
-            n_experts: placement.len(),
-            max_rows: rows,
-        };
-        match crate::hetero::arm_for(&gpu.arch, dims) {
-            Ok(Some(arm)) => {
-                if let Err(error) = executor.set_igpu_arm(arm) {
-                    return Err(release(executor, format!("{error:?}")));
-                }
-            }
-            Ok(None) => {}
-            Err(error) => return Err(release(executor, error)),
-        }
         Ok(executor)
     }
 
@@ -6866,6 +6859,22 @@ impl Qwen4MoeLayerRuntime {
     }
 
     pub(crate) fn free_gpu(mut self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+        // Hetero split: the layer's own buffers. The forward drained the
+        // device first, and the load's context goes after every layer
+        // (`hetero::release`).
+        let mut hetero_error = None;
+        if let Some(split) = self.hetero.take() {
+            hetero_error = split.free_gpu(gpu).err();
+        }
+        if let Some(prefill) = self.hetero_prefill.take() {
+            hetero_error = hetero_error.or(prefill.free_gpu(gpu).err());
+        }
+        if let Some(error) = hetero_error {
+            return Some(hip_bridge::HipError::new(
+                999,
+                &format!("hetero split teardown failed: {error:?}"),
+            ));
+        }
         // D2 split executor first: it drains its queued uploads/masks before
         // freeing. If that drain cannot be proven, nothing of this layer is
         // released: the executor retains its own owners and the runtime
@@ -12615,6 +12624,45 @@ impl Qwen4GpuForward {
         ep_reserve_plan: Option<Arc<crate::ep_reserve::EpReservePlan>>,
         tail_borrow_plan: Option<ep_tail_borrow::EpTailBorrowPlan>,
     ) -> Result<Self, Qwen4GpuForwardError> {
+        // An invalid `topology.hetero_experts` (bad combination, wrong cards)
+        // refuses the load instead of reading as unset.
+        let hetero = crate::hetero::requested().map_err(Qwen4GpuForwardError::Dispatch)?;
+        let built = Self::build_with_reserve(
+            gpu,
+            bundle,
+            max_chunk,
+            mode,
+            #[cfg(target_os = "linux")]
+            npu_prepared,
+            ep_reserve_plan,
+            tail_borrow_plan,
+        );
+        // A failed build may have attached hetero layers (its layers are
+        // dropped by now): release the context so a retry or the next load
+        // starts fresh instead of finding a stale one.
+        if built.is_err() {
+            if let Err(error) = crate::hetero::release(gpu) {
+                eprintln!("  qwen4 hetero experts: release after a failed build: {error}");
+            }
+        } else if hetero.is_some() && !crate::hetero::attached() {
+            eprintln!(
+                "  qwen4 hetero experts: WARNING topology.hetero_experts is set but no layer attached the split (no cold expert tier in this placement): the load runs without it, under its process settings (worker-thread dispatch, prefill chunk <= {})",
+                crate::hetero::hetero_prefill_rows()
+            );
+        }
+        built
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_with_reserve(
+        gpu: &mut Gpu,
+        bundle: &Qwen4Bundle,
+        max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+        #[cfg(target_os = "linux")] npu_prepared: Option<Option<npu_forward::PreparedTrunk>>,
+        ep_reserve_plan: Option<Arc<crate::ep_reserve::EpReservePlan>>,
+        tail_borrow_plan: Option<ep_tail_borrow::EpTailBorrowPlan>,
+    ) -> Result<Self, Qwen4GpuForwardError> {
         Self::admit_profile(&bundle.config)?;
         let scope = bundle.weights.band_scope().clone();
         let single_scope = scope == Qwen4BandScope::single(&bundle.config);
@@ -15271,6 +15319,11 @@ impl Qwen4GpuForward {
                 first.get_or_insert(error);
             }
         }
+        // Last: every layer's hetero split is gone, so the load's context
+        // (responder, mailbox, counters, prefill exchange, arena) can go.
+        if let Err(error) = crate::hetero::release(gpu) {
+            first.get_or_insert(hip_bridge::HipError::new(999, &error));
+        }
         first.map_or(Ok(()), Err)
     }
 
@@ -17716,6 +17769,10 @@ impl Qwen4GpuForward {
                         .ok_or_else(|| invalid("Qwen4 token readback missing"))?;
                     let token = readback.read_token(&gpu.hip, &token_ids.buf)?;
                     gpu.take_device_wait_error()?;
+                    // The id depends on every layer, so they are done: a hetero
+                    // wait that timed out skipped cold rows, and this token,
+                    // even a request's last, must not reach the client.
+                    crate::hetero::check_forward().map_err(Qwen4GpuForwardError::Dispatch)?;
                     if token as usize >= vocab {
                         return Err(invalid(
                             "Qwen4 token id is outside the embedding vocabulary",
