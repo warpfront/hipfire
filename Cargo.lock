@@ -1269,7 +1269,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hip-bridge"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hipfire-config",
  "libloading",
@@ -1278,7 +1278,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-cohere2moe"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1291,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-deepseek4"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1309,7 +1309,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-diffusion"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "fancy-regex 0.14.0",
  "half",
@@ -1329,7 +1329,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-dots-ocr"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-qwen2",
@@ -1342,7 +1342,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-embeddinggemma2"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "half",
  "hip-bridge",
@@ -1355,7 +1355,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-gemma4"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1367,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-lfm2-vl"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-runtime",
@@ -1394,7 +1394,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-llama"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
@@ -1406,7 +1406,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-maple"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1419,7 +1419,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-minimax"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1433,7 +1433,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-muse-glimmer"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1445,7 +1445,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen2"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1458,7 +1458,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen35"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-qwen35-vl",
@@ -1477,7 +1477,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen35-embed"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "half",
  "hip-bridge",
@@ -1490,7 +1490,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen35-vl"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1505,7 +1505,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen4"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "half",
  "hip-bridge",
@@ -1545,7 +1545,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-toy"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hipfire-runtime",
  "rdna-compute",
@@ -1553,7 +1553,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-atlas"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "regex",
  "serde",
@@ -1563,7 +1563,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-cli"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1596,7 +1596,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-client"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hipfire-config",
  "libc",
@@ -1607,7 +1607,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-config"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -1619,7 +1619,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-cpu"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "half",
  "libc",
@@ -1629,7 +1629,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-daemon"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "base64 0.22.1",
  "hip-bridge",
@@ -1652,7 +1652,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-detect"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "md5 0.8.1",
  "regex",
@@ -1662,7 +1662,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-dispatch"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1674,7 +1674,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-dispatch-tests"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hipfire-dispatch",
  "hipfire-runtime",
@@ -1683,7 +1683,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-ds4-parent"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1697,7 +1697,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-engine"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1710,7 +1710,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-generate"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "base64 0.22.1",
  "hip-bridge",
@@ -1746,7 +1746,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-kernel-abi"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -1756,7 +1756,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-loader"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-cohere2moe",
@@ -1789,7 +1789,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-pflash"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-qwen35",
@@ -1801,7 +1801,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-quantize"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "byteorder",
  "clap",
@@ -1828,7 +1828,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-reap"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hipfire-config",
  "hipfire-runtime",
@@ -1838,7 +1838,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-registry"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hipfire-config",
  "serde",
@@ -1850,7 +1850,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-runtime"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "byteorder",
  "half",
@@ -1903,7 +1903,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-tui"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1919,7 +1919,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-xdna"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "libc",
  "parking_lot",
@@ -1927,7 +1927,7 @@ dependencies = [
 
 [[package]]
 name = "hsa-bridge"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -2503,7 +2503,7 @@ dependencies = [
 
 [[package]]
 name = "npu-tools"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "peacemaker-npu",
@@ -2686,18 +2686,18 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "peacemaker-author"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "trybuild",
 ]
 
 [[package]]
 name = "peacemaker-cdna"
-version = "0.4.5"
+version = "0.4.6"
 
 [[package]]
 name = "peacemaker-ir"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "insta",
  "peacemaker-lift",
@@ -2725,7 +2725,7 @@ dependencies = [
 
 [[package]]
 name = "peacemaker-lift"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "insta",
  "object",
@@ -2741,11 +2741,11 @@ dependencies = [
 
 [[package]]
 name = "peacemaker-npu"
-version = "0.4.5"
+version = "0.4.6"
 
 [[package]]
 name = "peacemaker-rip"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "peacemaker-author",
@@ -2880,7 +2880,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pm-census"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hipfire-atlas",
  "hipfire-kernel-abi",
@@ -3028,7 +3028,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "radiowave"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -3038,7 +3038,7 @@ dependencies = [
 
 [[package]]
 name = "railgun"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -3056,7 +3056,7 @@ dependencies = [
 
 [[package]]
 name = "railgun-cert"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "object",
  "peacemaker-ir",
@@ -3073,7 +3073,7 @@ dependencies = [
 
 [[package]]
 name = "railgun-corpus"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -3083,7 +3083,7 @@ dependencies = [
 
 [[package]]
 name = "railgun-jitcorpus"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hipfire-config",
  "railgun-cert",
@@ -3289,7 +3289,7 @@ dependencies = [
 
 [[package]]
 name = "rdna-compute"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "half",
  "hip-bridge",
@@ -3321,7 +3321,7 @@ checksum = "03251193000f4bd3b042892be858ee50e8b3719f2b08e5833ac4353724632430"
 
 [[package]]
 name = "redline"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "libc",
  "libloading",
@@ -3329,7 +3329,7 @@ dependencies = [
 
 [[package]]
 name = "redline-dispatch"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hipfire-config",
  "libloading",
@@ -3341,7 +3341,7 @@ dependencies = [
 
 [[package]]
 name = "redline-rocr"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hipfire-config",
  "libloading",
@@ -3489,7 +3489,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "saddle-core"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "rdna-compute",
@@ -3498,7 +3498,7 @@ dependencies = [
 
 [[package]]
 name = "saddle-lab"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "byteorder",
  "hip-bridge",
@@ -3520,7 +3520,7 @@ dependencies = [
 
 [[package]]
 name = "saddle-quant"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "clap",
  "memmap2",
