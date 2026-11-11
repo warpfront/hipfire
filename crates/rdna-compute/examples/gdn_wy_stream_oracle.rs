@@ -330,6 +330,59 @@ fn main() {
     for format in [GdnStateFormat::F32, GdnStateFormat::Q8, GdnStateFormat::Q8Ef] {
         let initial = initial_state(&mut rng, format);
         let rig = Rig::new(&mut gpu, format, n, &inp, &mut rng);
+        if let Some(spec) = arg(&args, "--perturb") {
+            // --perturb START,ROW,L0,L1: zero fields of rows >= L0 and run L1 rows.
+            let v: Vec<usize> = spec.split(',').map(|v| v.parse().unwrap()).collect();
+            let (st, row, l0, l1) = (v[0], v[1], v[2], v[3]);
+            let base = run(&mut gpu, &rig, st, &[l0], &initial, false);
+            let pick = |r: &Result| r.out[row * VALUE * 4..(row + 1) * VALUE * 4].to_vec();
+            let b0 = pick(&base);
+            let cmp = |gpu: &mut Gpu, tag: &str| {
+                let r = run(gpu, &rig, st, &[l1], &initial, false);
+                let rb = pick(&r);
+                let d: Vec<usize> = (0..VALUE).filter(|e| rb[e * 4..e * 4 + 4] != b0[e * 4..e * 4 + 4]).collect();
+                println!("PERTURB {tag} diff_elems={d:?}");
+            };
+            cmp(&mut gpu, "none");
+            let zero_proj = |lo: usize, hi: usize| {
+                let mut p = inp.proj.clone();
+                for r in l0..n {
+                    for c in lo..hi {
+                        let o = (r * QKV + c) * 2;
+                        p[o] = 0;
+                        p[o + 1] = 0;
+                    }
+                }
+                p
+            };
+            let zero_f32 = |src: &Vec<u8>, w: usize| {
+                let mut p = src.clone();
+                for x in p.iter_mut().skip(l0 * w * 4) {
+                    *x = 0;
+                }
+                p
+            };
+            let qk = KH * HD;
+            for (tag, p) in [
+                ("q", zero_proj(0, qk)),
+                ("k", zero_proj(qk, 2 * qk)),
+                ("v", zero_proj(2 * qk, QKV)),
+                ("all", zero_proj(0, QKV)),
+            ] {
+                up(&gpu, &rig.proj, &p);
+                cmp(&mut gpu, &format!("zero_{tag}"));
+                up(&gpu, &rig.proj, &inp.proj);
+            }
+            up(&gpu, &rig.beta, &zero_f32(&inp.beta, VH));
+            cmp(&mut gpu, "zero_beta");
+            up(&gpu, &rig.beta, &inp.beta);
+            up(&gpu, &rig.gate, &zero_f32(&inp.gate, VH));
+            cmp(&mut gpu, "zero_gate");
+            up(&gpu, &rig.gate, &inp.gate);
+            up(&gpu, &rig.z, &zero_f32(&inp.z, VALUE));
+            cmp(&mut gpu, "zero_z");
+            std::process::exit(0);
+        }
         if let Some(spec) = arg(&args, "--sweep") {
             // --sweep START,ROW,L0,L1 (F32): row ROW of a single call of L rows, L0..=L1.
             let v: Vec<usize> = spec.split(',').map(|v| v.parse().unwrap()).collect();
