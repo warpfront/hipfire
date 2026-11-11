@@ -158,6 +158,8 @@ pub struct Scope {
 pub struct RegPlan {
     pub vgpr_budget: u16,
     pub sgpr_budget: u16,
+    /// AccVGPR budget (CDNA only; 0 on RDNA, where no AGPR exists).
+    pub agpr_budget: u16,
     pub ranges: Vec<Range>,
     pub scratch: Option<(u8, u8)>,
 }
@@ -169,9 +171,18 @@ impl RegPlan {
         Ok(Self {
             vgpr_budget,
             sgpr_budget,
+            agpr_budget: 0,
             ranges: Vec::new(),
             scratch: None,
         })
+    }
+    /// Allow AccVGPR ranges up to `budget` (CDNA's unified VGPR/AGPR file; at most 256).
+    pub fn with_agpr_budget(mut self, budget: u16) -> Result<Self, String> {
+        if budget > 256 {
+            return Err("register budget exceeds architectural limit".into());
+        }
+        self.agpr_budget = budget;
+        Ok(self)
     }
     pub fn scratch_pool(&mut self, base: u8, len: u8) -> Result<(), String> {
         if u16::from(base) + u16::from(len) > self.vgpr_budget {
@@ -189,21 +200,21 @@ impl RegPlan {
         live: Live,
     ) -> Result<(), String> {
         let name = name.into();
-        if kind == Kind::A {
+        if kind == Kind::A && self.agpr_budget == 0 {
             return Err(format!(
-                "{name}: AGPR allocation is not supported by RegPlan"
+                "{name}: AGPR allocation needs a CDNA plan (RegPlan::with_agpr_budget)"
             ));
         }
-        if !matches!(len, 1 | 2 | 4 | 8) {
-            return Err("register width must be 1, 2, 4 or 8".into());
+        if !matches!(len, 1 | 2 | 4 | 8) && !(kind == Kind::A && len == 16) {
+            return Err("register width must be 1, 2, 4 or 8 (16 for AGPRs)".into());
         }
         if kind == Kind::S && len > 1 && base % len != 0 {
             return Err(format!("misaligned SGPR {base}:{len}"));
         }
-        let budget = if kind == Kind::V {
-            self.vgpr_budget
-        } else {
-            self.sgpr_budget
+        let budget = match kind {
+            Kind::V => self.vgpr_budget,
+            Kind::A => self.agpr_budget,
+            Kind::S => self.sgpr_budget,
         };
         if u16::from(base) + u16::from(len) > budget {
             return Err(format!("{name} exceeds register budget"));
@@ -280,6 +291,14 @@ impl RegPlan {
         self.ranges
             .iter()
             .filter(|r| r.kind == Kind::V)
+            .map(|r| u16::from(r.base) + u16::from(r.len))
+            .max()
+            .unwrap_or(0)
+    }
+    pub fn next_free_agpr(&self) -> u16 {
+        self.ranges
+            .iter()
+            .filter(|r| r.kind == Kind::A)
             .map(|r| u16::from(r.base) + u16::from(r.len))
             .max()
             .unwrap_or(0)

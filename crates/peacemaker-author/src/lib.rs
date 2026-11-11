@@ -42,7 +42,7 @@ pub use scope::{
     Arrived, Carried, End, Forward, LoopExit, Scc, Uniform, Wave, WgUniform, Workgroup,
 };
 pub use target::{
-    BarrierModel, Full, Gfx1100, Gfx1151, Gfx11Waits, Gfx1201, Gfx12Waits, LdsCounter, MmaIu4,
-    Split, SplitBarrier, Target, WaitModel,
+    BarrierModel, CdnaWaits, Full, Gfx1100, Gfx1151, Gfx11Waits, Gfx1201, Gfx12Waits, Gfx942,
+    LdsCounter, MmaIu4, Split, SplitBarrier, Target, WaitModel,
 };
 pub use wait::{Drained, Event, LdsWrite, Pending, Pendings};

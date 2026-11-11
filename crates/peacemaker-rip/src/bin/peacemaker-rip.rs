@@ -13,7 +13,7 @@
 //!
 //! - `check` compiles every (arch, variant) of FILE and reports located, coded
 //!   diagnostics (errors and warnings) plus one summary line per target.
-//!   `--arch` is a comma list of `gfx1100`, `gfx1151`, `gfx1201`, or `all`
+//!   `--arch` is a comma list of `gfx942`, `gfx1100`, `gfx1151`, `gfx1201`, or `all`
 //!   (default `gfx1151,gfx1201`). `--variant` is a comma list (default: the
 //!   variants declared by the script's `enum Kind`). `--json` prints one JSON
 //!   document on stdout instead of the human text. Exit 0 when there are no
@@ -30,7 +30,7 @@
 //!   one target and writes the behavior-capture case (behavior, not
 //!   correctness) even when expectations fail. Exit 0 iff every target passes,
 //!   1 on failures, 2 on a usage error.
-//! - `build` writes the assembly. `ARCH` is `gfx1151`, `gfx1201`, `gfx1100` or
+//! - `build` writes the assembly. `ARCH` is `gfx942`, `gfx1151`, `gfx1201`, `gfx1100` or
 //!   `both` (gfx1151 and gfx1201; `OUTPUT` then gets the arch before its
 //!   extension: `out.gfx1151.s`). `--certify` assembles and links the emitted
 //!   code object into `$RIP_CERT_DIR` (default: a temporary directory), then
@@ -61,7 +61,7 @@ const USAGE: &str = "usage:
   peacemaker-rip help
 
 check:   compile every (arch, variant) and report diagnostics; exit 0 ok (warnings allowed), 1 errors, 2 usage.
-         --arch LIST|all   comma list of gfx1100,gfx1151,gfx1201 (default: the script's `const ARCHES`, else gfx1151,gfx1201; all = declared ARCHES, else all three)
+         --arch LIST|all   comma list of gfx942,gfx1100,gfx1151,gfx1201 (default: the script's `const ARCHES`, else gfx1151,gfx1201; all = declared ARCHES, else all four)
          --variant LIST    comma list (default: the script's `const VARIANTS`, else its `enum Kind`)
          --json            one JSON document on stdout
 features: report offline resource, schedule and emulator facts; target selection is the same as check.
@@ -72,7 +72,7 @@ run:    execute every (arch, variant) on the CPU emulator and check buffers; exi
          --variant LIST    comma list (default: the script's `const VARIANTS`, else its `enum Kind`)
          --json            one target prints the flat schema-1 report; several print {schema:1,ok,results:[reports]}
          --dump OUT        write the behavior-capture case; exactly one target required, written even when expectations fail
-build:   write assembly; ARCH is gfx1151, gfx1201, gfx1100 or both. --certify assembles, links and certifies.
+build:   write assembly; ARCH is gfx942, gfx1151, gfx1201, gfx1100 or both. --certify assembles, links and certifies.
          The legacy form `peacemaker-rip [--certify] [--module] SOURCE ARCH ...` is `build`.
 fmt:     format in place with rustfmt; --check lists files that would change and exits 1.
 explain: print the long-form explanation of a diagnostic code; --list lists all codes.";
@@ -586,6 +586,13 @@ fn build_one(
                     vec![d]
                 })?;
             for c in certs {
+                if arch == Arch::Gfx942 {
+                    eprintln!(
+                        "certified {} (gfx942): CDNA lift {}, hazards {}, CFG wait ledger verified",
+                        c.symbol, c.m7["lift"], c.m7["checks"]["hazard"]["violations"]
+                    );
+                    continue;
+                }
                 eprintln!(
                     "certified {} ({}): lift {}, obligations {}",
                     c.symbol,

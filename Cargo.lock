@@ -2749,6 +2749,7 @@ version = "0.4.5"
 dependencies = [
  "hip-bridge",
  "peacemaker-author",
+ "peacemaker-cdna",
  "peacemaker-ir",
  "peacemaker-isa",
  "peacemaker-lift",

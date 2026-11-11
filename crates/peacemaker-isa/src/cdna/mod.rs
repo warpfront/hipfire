@@ -26,6 +26,7 @@ pub(crate) mod control;
 pub mod emit;
 pub mod hazard;
 pub mod lifted;
+pub mod lower;
 pub mod ops;
 
 pub use peacemaker_cdna as model;

@@ -546,7 +546,7 @@ impl Vop3Op {
 
     /// `OP_SEL` as llvm lists it: two-source ops with a destination select
     /// print `[src0, src1, dst]` (bits 0, 1, 3), the others bits 0..=3.
-    fn op_sel_bits(self) -> &'static [u8] {
+    pub fn op_sel_bits(self) -> &'static [u8] {
         match self {
             Self::Only(
                 Vop3OnlyOp::CvtPkFp8F32 | Vop3OnlyOp::CvtPkBf8F32 | Vop3OnlyOp::PackB32F16,

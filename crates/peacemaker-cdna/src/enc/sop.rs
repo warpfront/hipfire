@@ -632,7 +632,7 @@ impl fmt::Display for Sop1 {
 
 /// llvm's symbolic `HW_REG_*` names on gfx942 (CDNA3 ISA §5.8 Table 19 p.29;
 /// spellings as llvm prints them, checked exhaustively by the tests).
-fn hwreg_name(id: u16) -> Option<&'static str> {
+pub fn hwreg_name(id: u16) -> Option<&'static str> {
     Some(match id {
         1 => "HW_REG_MODE",
         2 => "HW_REG_STATUS",

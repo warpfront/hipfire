@@ -227,6 +227,9 @@ pub struct Builder {
     /// Obligations their back edges carried (joined into the head by the fixpoint).
     sync_back: std::collections::BTreeMap<String, sync::SyncState>,
     pub regions: Vec<plan::RegionProof>,
+    /// gfx942: the explicit wait requests, keyed by the source program index they precede
+    /// (replayed onto the checked CDNA builder by `finish`; every other source wait is re-derived).
+    wave64_waits: Vec<(usize, cdna::lower::Wait)>,
 }
 /// Loop bodies emitted before the back-edge state must have converged.
 const MAX_LOOP_RUNS: u8 = 8;
@@ -300,6 +303,7 @@ impl Builder {
             loop_heads: vec![],
             sync_back: Default::default(),
             regions: vec![],
+            wave64_waits: vec![],
         }
     }
     /// The program so far (read-only).
@@ -315,6 +319,10 @@ impl Builder {
     /// Emit `s_delay_alu` issue hints before dependent VALU instructions (see
     /// `hazard::DelayAlu`). Opt-in, so existing kernels keep their bytes.
     pub fn enable_delay_alu(&mut self) {
+        assert!(
+            !self.spec.arch.wave64(),
+            "s_delay_alu is RDNA3+ only; gfx942 hazards come from the CDNA hazard pass"
+        );
         self.delay_alu = Some(DelayAlu::default())
     }
     /// gfx12: buffer each run of plain VALU instructions and list-schedule it
@@ -578,6 +586,16 @@ impl Builder {
         Ok(())
     }
     pub fn wait(&mut self, c: Counter, n: u8) -> Result<(), String> {
+        if self.spec.arch.wave64() {
+            if !matches!(c, Counter::Vm | Counter::Lgkm | Counter::Exp) {
+                return Err(format!("{c:?} is not a CDNA wait counter"));
+            }
+            self.flush_valu()?;
+            self.wave64_waits.push((
+                self.program.instructions.len(),
+                cdna::lower::Wait::Counters(vec![(c, n)]),
+            ));
+        }
         self.emit_wait(c, n, Reason::Barrier)
     }
     fn emit_required(&mut self, mut required: Vec<(Counter, u8, Reason)>) -> Result<(), String> {
@@ -628,6 +646,10 @@ impl Builder {
         Ok(())
     }
     pub fn wait_all(&mut self) -> Result<(), String> {
+        if self.spec.arch.wave64() {
+            self.wave64_waits
+                .push((self.program.instructions.len(), cdna::lower::Wait::All));
+        }
         let required = self.ledger.clone().drain();
         self.emit_required(required)
     }
@@ -637,6 +659,12 @@ impl Builder {
     /// still in flight); a task-body region's entry uses this to start from the kernel-start
     /// counter state on every path.
     pub fn drain_all_counters(&mut self) -> Result<(), String> {
+        if self.spec.arch.wave64() {
+            self.wave64_waits.push((
+                self.program.instructions.len(),
+                cdna::lower::Wait::Counters(vec![(Counter::Vm, 0), (Counter::Lgkm, 0)]),
+            ));
+        }
         let counters: &[Counter] = if self.spec.arch.gfx12() {
             &[Counter::Load, Counter::Store, Counter::Ds, Counter::Km]
         } else if self.spec.arch == Arch::Gfx942 {
@@ -689,6 +717,17 @@ impl Builder {
     /// `ds_load`/`ds_store`. The builder inserts its waits and hazard guards.
     pub fn push(&mut self, insn: Instruction) -> Result<(), String> {
         insn.check_raw()?;
+        if self.spec.arch.wave64()
+            && !matches!(
+                cdna::lower::classify(&insn.text, self.spec.arch.cdna().unwrap())?,
+                cdna::lower::Source::Inst(_)
+            )
+        {
+            return Err(format!(
+                "{:?}: waits, barriers, labels and branches use the builder methods on gfx942",
+                insn.text
+            ));
+        }
         let m = insn.mnemonic();
         if matches!(
             m,
@@ -795,6 +834,21 @@ impl Builder {
                 subs,
             });
         }
+        if self.spec.arch.wave64() == self.spec.wave32 {
+            return Err(if self.spec.arch.wave64() {
+                "gfx942 is wave64: KernelSpec.wave32 must be false".into()
+            } else {
+                "builder requires wave32".into()
+            });
+        }
+        let mut insn = insn;
+        if let Some(arch) = self.spec.arch.cdna() {
+            // The typed instruction is the authority on registers and memory class: the caller's
+            // claimed defs/uses are replaced by the footprint of what will be encoded.
+            if let cdna::lower::Source::Inst(typed) = cdna::lower::classify(&insn.text, arch)? {
+                insn = cdna::lower::shadow(&typed);
+            }
+        }
         insn.validate(self.spec.arch)?;
         if self
             .program
@@ -877,7 +931,7 @@ impl Builder {
                 })
             }
         }
-        if !self.spec.arch.gfx12() {
+        if !self.spec.arch.gfx12() && !self.spec.arch.wave64() {
             for text in self
                 .gfx11_hazard
                 .step(pipe, mnemonic, &insn.uses, &insn.defs)
@@ -1022,7 +1076,12 @@ impl Builder {
         insn: Instruction,
         step: impl FnOnce(&mut Lds) -> Result<(), String>,
     ) -> Result<(), String> {
-        if insn.memory != Some(MemoryClass::DsStore) || !insn.mnemonic().starts_with("ds_store") {
+        let prefix = if self.spec.arch == Arch::Gfx942 {
+            "ds_write"
+        } else {
+            "ds_store"
+        };
+        if insn.memory != Some(MemoryClass::DsStore) || !insn.mnemonic().starts_with(prefix) {
             return Err("ds_store requires an LDS store instruction".into());
         }
         let old = self.lds.clone();
@@ -1053,7 +1112,12 @@ impl Builder {
         insn: Instruction,
         step: impl FnOnce(&mut Lds) -> Result<(), String>,
     ) -> Result<(), String> {
-        if insn.memory != Some(MemoryClass::DsLoad) || !insn.mnemonic().starts_with("ds_load") {
+        let prefix = if self.spec.arch == Arch::Gfx942 {
+            "ds_read"
+        } else {
+            "ds_load"
+        };
+        if insn.memory != Some(MemoryClass::DsLoad) || !insn.mnemonic().starts_with(prefix) {
             return Err("ds_load requires an LDS load instruction".into());
         }
         let old = self.lds.clone();
@@ -1142,6 +1206,9 @@ impl Builder {
         body: impl FnOnce(&mut Builder) -> Result<(), String>,
     ) -> Result<(), String> {
         self.flush_valu()?;
+        if self.spec.arch.wave64() {
+            return Err("s_clause is RDNA-only".into());
+        }
         let mut draft = self.clone();
         let start = draft.program.instructions.len();
         body(&mut draft)?;
@@ -1229,6 +1296,9 @@ impl Builder {
         transitions: &[Transition],
         scope: MemoryScope,
     ) -> Result<(), String> {
+        if scope == MemoryScope::Workgroup && self.spec.arch.wave64() {
+            return Err("workgroup-scope barrier invalidate (buffer_gl0_inv) is RDNA-only".into());
+        }
         if self.spec.arch.gfx12() {
             self.signal(transitions)?;
             self.arrive()?
@@ -1361,6 +1431,151 @@ impl Builder {
         ledger_cfg::verify(&self.program, &ledger_cfg::region_spans(&self.regions))
     }
     /// Finish only after every declared lifetime has both endpoints and all live aliases are disjoint.
+    /// gfx942 `finish`: the source program (already proved for ownership, lifetimes, LDS slots
+    /// and release/acquire obligations) is lowered onto the checked CDNA builder, which owns the
+    /// counter waits, hazard wait states, encoding and emission; the proof carries ITS waits and
+    /// hazards (indexing `Emitted::program`, rebuilt from the final instruction list).
+    fn finish_cdna(self) -> Result<Emitted, String> {
+        if !self.regions.is_empty() || self.open_region.is_some() {
+            return Err("task-body regions have no gfx942 lowering".into());
+        }
+        if self.spec.wave32 {
+            return Err("gfx942 is wave64: KernelSpec.wave32 must be false".into());
+        }
+        self.spec.kernargs.validate()?;
+        let kernargs: Vec<_> = self
+            .spec
+            .kernargs
+            .args
+            .iter()
+            .map(|a| {
+                (
+                    a.name.clone(),
+                    a.offset,
+                    a.size,
+                    a.value_kind.clone(),
+                    a.actual_access.clone(),
+                )
+            })
+            .collect();
+        let abi = cdna::lower::Abi {
+            name: &self.spec.symbol,
+            workgroup_size: u32::from(self.spec.workgroup_size),
+            user_sgpr_count: self.spec.user_sgpr_count,
+            workgroup_id_y: self.spec.system_sgpr_workgroup_id_y,
+            workgroup_id_z: self.workgroup_id_z,
+            group_segment_fixed_size: self.spec.group_segment_fixed_size,
+            kernargs: &kernargs,
+            kernarg_size: self.spec.kernargs.size,
+            plan_sgprs: self.regs.next_free_sgpr(),
+            plan_vgprs: self.regs.next_free_vgpr(),
+            plan_agprs: self.regs.next_free_agpr(),
+        };
+        let kernel = cdna::lower::lower(
+            self.spec.arch,
+            &abi,
+            &self.program.instructions,
+            &self.wave64_waits,
+        )?;
+        let sgprs = kernel.resources.next_free_sgpr;
+        let vgprs = kernel.resources.next_free_vgpr;
+        if vgprs > self.regs.vgpr_budget || sgprs > self.regs.sgpr_budget {
+            return Err("register plan exceeds budget".into());
+        }
+        if kernel.resources.agprs > self.regs.agpr_budget {
+            return Err("register plan exceeds AGPR budget".into());
+        }
+        let (program, index) = cdna::lower::final_program(&kernel)?;
+        let remap = |pc: usize| {
+            index
+                .get(pc)
+                .copied()
+                .ok_or_else(|| format!("proof index {pc} is outside the lowered kernel"))
+        };
+        let mut waits = kernel.waits.clone();
+        for w in &mut waits {
+            w.pc_index = remap(w.pc_index)?;
+        }
+        let mut hazards = kernel.hazards.clone();
+        for h in &mut hazards {
+            h.pc_index = remap(h.pc_index)?;
+        }
+        let barrier_pcs: Vec<usize> = program
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.mnemonic() == "s_barrier")
+            .map(|(pc, _)| pc)
+            .collect();
+        if barrier_pcs.len() != self.barriers.len() {
+            return Err("lowered barrier count differs from the source's".into());
+        }
+        let mut barriers = self.barriers;
+        for (b, pc) in barriers.iter_mut().zip(barrier_pcs) {
+            b.pc_index = pc;
+        }
+        let text = cdna::emit::assembly(&[&kernel], cdna::emit::CodeObjectVersion::V6)?;
+        let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
+        let mut shape = IsaShape {
+            instructions: program.len(),
+            next_free_vgpr: vgprs,
+            next_free_sgpr: sgprs,
+            waits: waits.len() + hazards.len(),
+            barriers: barriers.len(),
+            ..Default::default()
+        };
+        for i in &program {
+            let name = i.mnemonic();
+            if name.starts_with("v_mfma_") {
+                shape.wmma += 1
+            } else if name.starts_with('v') {
+                shape.valu_slots += 1
+            }
+            if name.starts_with("ds_") {
+                shape.ds += 1
+            }
+            if name.starts_with("buffer_") || name.starts_with("global_") {
+                shape.vmem += 1
+            }
+        }
+        let proof = BuilderProof {
+            kernel_id: self.spec.kernel_id,
+            variant: self.spec.variant,
+            arch: self.spec.arch,
+            builder_crate_version: env!("CARGO_PKG_VERSION").into(),
+            builder_git_sha: option_env!("HIPFIRE_BUILDER_GIT_SHA")
+                .unwrap_or("unknown")
+                .into(),
+            reg_plan: self.regs.ranges,
+            next_free_vgpr: vgprs,
+            next_free_sgpr: sgprs,
+            system_sgpr_workgroup_id_z: self.workgroup_id_z,
+            waits,
+            hazards,
+            clauses: self.clauses,
+            vopd_pairs: 0,
+            lds_slots: self.lds.all_slots(),
+            barriers,
+            loop_fixpoints: self.loop_fixpoints,
+            forbidden_mnemonics_checked: vec![
+                "s_waitcnt (cdna builder only)".into(),
+                "scratch_*".into(),
+            ],
+            s_text_sha256: hash,
+            syncs: self.syncs,
+            regions: self.regions,
+        };
+        Ok(Emitted {
+            s_text: text,
+            proof,
+            shape,
+            program: Program {
+                arch: self.spec.arch,
+                instructions: program,
+            },
+            vgpr_record: self.vgpr_rec,
+            vgpr_stats: None,
+        })
+    }
     pub fn finish(mut self) -> Result<Emitted, String> {
         self.flush_valu()?;
         if self.pending_barrier.is_some() {
@@ -1405,6 +1620,9 @@ impl Builder {
             );
         }
         self.regs.verify_lifetimes(&self.labels)?;
+        if self.spec.arch.wave64() {
+            return self.finish_cdna();
+        }
         let next_free_sgpr =
             emit::sgpr_high_water(&self.spec, &self.regs, &self.program, self.workgroup_id_z);
         if self.regs.next_free_vgpr() > self.regs.vgpr_budget

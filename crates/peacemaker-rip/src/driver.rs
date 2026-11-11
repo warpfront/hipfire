@@ -11,7 +11,7 @@ use peacemaker_author::runtime::{
     Arrived, Breaks, Cond, Driver, Exit, Forward, Lend, Phase, Place, RegionId, RingId, Transition,
     WgCond,
 };
-use peacemaker_author::{Gfx1100, Gfx1151, Gfx1201, Target, Workgroup};
+use peacemaker_author::{Gfx1100, Gfx1151, Gfx1201, Gfx942, Target, Workgroup};
 use peacemaker_isa::insn::Instruction;
 use peacemaker_isa::{Arch, Builder};
 
@@ -166,7 +166,7 @@ macro_rules! no_split {
         }
     )*};
 }
-no_split!(Gfx1100, Gfx1151);
+no_split!(Gfx942, Gfx1100, Gfx1151);
 impl SplitOps for Gfx1201 {
     fn sig(d: &mut Driver<'_, Self, Builder>, ts: &[Transition]) -> Res<Arrived> {
         d.signal(ts)
@@ -428,6 +428,6 @@ pub fn drive<'a>(
         Arch::Gfx1201 => drive_t::<Gfx1201>(bld, body),
         Arch::Gfx1100 => drive_t::<Gfx1100>(bld, body),
         Arch::Gfx1200 => Err("the .rip front end has no gfx1200 builder target (only sealed hip_twin objects target gfx1200)".into()),
-        Arch::Gfx942 => Err("the .rip front end lowers onto the RDNA builder; gfx942 kernels use peacemaker_isa::cdna".into()),
+        Arch::Gfx942 => drive_t::<Gfx942>(bld, body),
     }
 }

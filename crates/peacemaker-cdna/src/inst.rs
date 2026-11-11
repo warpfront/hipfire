@@ -389,6 +389,25 @@ impl Inst {
             None
         }
     }
+    /// Lossless assembler spelling. Unlike LLVM's display spelling, this
+    /// preserves the VOP3 NOP form and every DS swizzle offset bit.
+    pub fn assembly(&self) -> impl fmt::Display + '_ {
+        Assembly(self)
+    }
+}
+
+struct Assembly<'a>(&'a Inst);
+
+impl fmt::Display for Assembly<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Inst::Vop3(i) if i.op == crate::enc::vop3::Vop3Op::V1(crate::enc::vop::Vop1Op::Nop) => {
+                f.write_str("v_nop_e64")
+            }
+            Inst::Ds(i) => i.fmt_assembly(f),
+            inst => fmt::Display::fmt(inst, f),
+        }
+    }
 }
 
 impl fmt::Display for Inst {

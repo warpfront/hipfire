@@ -253,7 +253,11 @@ fn descriptor_int(text: &str, key: &str) -> Option<u32> {
 
 /// Wave size declared by the emitted kernel, never inferred from its architecture.
 pub(crate) fn wave_size_of(e: &Emitted) -> Option<u32> {
-    match descriptor_int(&e.s_text, ".amdhsa_wavefront_size32 ")? {
+    let wave32 = descriptor_int(&e.s_text, ".amdhsa_wavefront_size32 ");
+    if wave32.is_none() {
+        return descriptor_int(&e.s_text, ".wavefront_size: ");
+    }
+    match wave32? {
         0 => Some(64),
         1 => Some(32),
         _ => None,
@@ -366,7 +370,7 @@ pub fn check(source: &str, name: &str, arch: Arch, variant: &str) -> Checked {
 pub const DEFAULT_ARCHES: [Arch; 2] = [Arch::Gfx1151, Arch::Gfx1201];
 
 /// Every arch a `--arch` list or `--arch all` may name.
-pub const ALL_ARCHES: [Arch; 3] = [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201];
+pub const ALL_ARCHES: [Arch; 4] = [Arch::Gfx942, Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201];
 
 /// Parse one arch name of a `--arch` list or a script's `const ARCHES`.
 pub fn parse_arch(name: &str) -> Result<Arch, String> {
@@ -506,7 +510,7 @@ mod certify {
     #[derive(Debug)]
     pub struct Certificate {
         pub symbol: String,
-        /// `pm_check::m7` report: lift identity and (empty) obligations.
+        /// Target-specific object report: RDNA M7, or CDNA typed lift/hazard/wait checks.
         pub m7: serde_json::Value,
     }
 
@@ -523,6 +527,36 @@ mod certify {
         module_name: &str,
         dir: &Path,
     ) -> Result<Vec<Certificate>, String> {
+        if arch == Arch::Gfx942 {
+            let elf = peacemaker_isa::native::assemble(text, arch)?;
+            let lifted = peacemaker_lift::cdna::lift_object(&elf)?;
+            if lifted.kernels.len() != emitted.len() {
+                return Err("CDNA certification: emitted/object kernel count differs".into());
+            }
+            let mut out = Vec::with_capacity(emitted.len());
+            for e in emitted {
+                let symbol = symbol_of(e)?;
+                let kernel = lifted
+                    .kernels
+                    .iter()
+                    .find(|k| k.image.name == symbol)
+                    .ok_or_else(|| format!("CDNA certification: missing symbol {symbol}"))?;
+                let checks = peacemaker_isa::cdna::lifted::certify(kernel)?;
+                out.push(Certificate {
+                    symbol,
+                    m7: serde_json::json!({
+                        "checker": "peacemaker_isa::cdna::lifted::certify",
+                        "lift": "byte-exact", "checks": checks
+                    }),
+                });
+            }
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            std::fs::write(dir.join(format!("{module_name}.s")), text)
+                .map_err(|e| e.to_string())?;
+            std::fs::write(dir.join(format!("{module_name}.hsaco")), elf)
+                .map_err(|e| e.to_string())?;
+            return Ok(out);
+        }
         for e in emitted {
             ledger_replay::replay_waits(&e.s_text, arch)
                 .map_err(|err| format!("{}: wait replay: {err}", e.proof.variant))?;
