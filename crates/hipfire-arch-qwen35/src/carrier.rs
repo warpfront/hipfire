@@ -569,7 +569,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
                 / stride;
             Ok((free, minimum, stride, card_cap, draft_reserve))
         })();
-        let (free, minimum, stride, card_cap, draft_reserve) = match capacity {
+        let (free, minimum, stride, mut card_cap, draft_reserve) = match capacity {
             Ok(v) => v,
             Err(e) => {
                 weights.free_gpu(ctx.gpu);
@@ -585,15 +585,14 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
             // the VMM parts (vision and draft reserves included); admission
             // deliberately did not refuse on the pre-teardown figure, so
             // this post-weight cap is the effective bound.
-            let card_cap = if ctx.kv_backend == KvBackend::Legacy {
-                legacy_card_cap(free, minimum, reserve, draft_reserve, stride)
-            } else {
-                card_cap
-            };
+            let legacy = ctx.kv_backend == KvBackend::Legacy;
+            if legacy {
+                card_cap = legacy_card_cap(free, minimum, reserve, draft_reserve, stride);
+            }
             if card_cap < 512 {
                 weights.free_gpu(ctx.gpu);
                 return Err(release_after_failed_load(
-                    if ctx.kv_backend == KvBackend::Legacy {
+                    if legacy {
                         "Qwen legacy load refused: measured post-weight VRAM cannot hold minimum PBS and KV"
                     } else {
                         "Qwen VMM load refused: measured post-weight VRAM cannot hold minimum PBS and KV"
