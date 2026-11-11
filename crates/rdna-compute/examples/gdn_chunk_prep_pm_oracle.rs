@@ -1029,7 +1029,7 @@ fn norm_halving(out: &[[f32; 4]; 32]) -> f32 {
 }
 /// Wave-local C64 gate prefix of the incumbent: lane `l` owns rows `2l`, `2l + 1`
 /// (zero past `rows`), Hillis-Steele `__shfl_up` over the pair sums, then
-/// `before = pair - g0 - g1`. Returns the written rows `0..rows`.
+/// `before` = the previous lane's inclusive value (0 on lane 0). Returns the written rows `0..rows`.
 fn gate_scan_model(g: &[f32; CHUNK], rows: usize) -> Vec<f32> {
     let (mut g0, mut g1, mut pair) = ([0f32; 32], [0f32; 32], [0f32; 32]);
     for l in 0..32 {
@@ -1048,7 +1048,7 @@ fn gate_scan_model(g: &[f32; CHUNK], rows: usize) -> Vec<f32> {
     }
     let mut out = vec![0f32; rows];
     for l in 0..32 {
-        let before = pair[l] - g0[l] - g1[l];
+        let before = if l == 0 { 0.0 } else { pair[l - 1] };
         if 2 * l < rows {
             out[2 * l] = before + g0[l];
         }
