@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! gfx1100 prologue (B4-B): native workgroup ids (`s2`/`s3`), tile and expert
+//! gfx11 prologue (B4-B): native workgroup ids (`s2`/`s3`; gfx1100 `s14`/`s15`, see `Gen::wg_in`), tile and expert
 //! gating, exact-extent buffer descriptors, lane offsets, slot gather, and the
 //! K-loop constants. Nothing is loaded from the weights here.
 //!
@@ -44,14 +44,26 @@ pub(super) fn emit<T: Gfx11>(wg: &mut Wg<'_, T>, g: &Gen, end: &End) -> Result<(
     let gate_up = kind == Kind::GateUp;
     let neg = g.spec.negative;
     let b = wg.isa();
-    smem(b, ARGS0, 8, KARG, 0)?;
+    let args0 = g.args0();
+    smem(b, args0, 8, KARG, 0)?;
     smem(b, ARGS1, 2, KARG, 0x20)?;
     smem(b, M, 2, KARG, 0x28)?;
     smem(b, ARGS2, 2, KARG, 0x30)?;
     smem(b, ARGS3, 1, KARG, 0x38)?;
-    // gfx11 native workgroup ids.
-    sop(b, format!("s_mov_b32 s{WGX}, s2"), &[WGX], &[2])?;
-    sop(b, format!("s_mov_b32 s{WGY}, s3"), &[WGY], &[3])?;
+    // gfx11 native workgroup ids (after the declared user SGPRs: s2/s3, gfx1100 s14/s15).
+    let (wg_in_x, wg_in_y) = (g.wg_in(), g.wg_in() + 1);
+    sop(
+        b,
+        format!("s_mov_b32 s{WGX}, s{wg_in_x}"),
+        &[WGX],
+        &[wg_in_x],
+    )?;
+    sop(
+        b,
+        format!("s_mov_b32 s{WGY}, s{wg_in_y}"),
+        &[WGY],
+        &[wg_in_y],
+    )?;
     // v1 = wave, v2 = lane, v3 = lr, v4 = hi.
     op(b, "v_lshrrev_b32_e32 v1, 5, v0", &[v(1)], &[v(TID)])?;
     op(b, "v_and_b32_e32 v2, 31, v0", &[v(2)], &[v(TID)])?;
@@ -82,7 +94,7 @@ pub(super) fn emit<T: Gfx11>(wg: &mut Wg<'_, T>, g: &Gen, end: &End) -> Result<(
     wg.exit_if(outside, end)?;
     let b = wg.isa();
     sop(b, format!("s_lshl_b32 s{T0}, s{WGY}, 2"), &[T0], &[WGY])?;
-    add64(b, T64, ARGS0 + 2, T0)?;
+    add64(b, T64, args0 + 2, T0)?;
     smem(b, EID, 1, T64, 0)?;
     // Fail closed: an expert id outside [0, n_experts) (the -1 sentinel, or a corrupt / non-finite-router id) exits
     // before any `expert_weight_ptrs[id]` load or table prefetch. One unsigned compare covers both bounds (negative ids are huge).
@@ -98,7 +110,7 @@ pub(super) fn emit<T: Gfx11>(wg: &mut Wg<'_, T>, g: &Gen, end: &End) -> Result<(
     } else {
         sop(b, format!("s_lshl_b32 s{T0}, s{EID}, 3"), &[T0], &[EID])?;
     }
-    add64(b, T64, ARGS0, T0)?;
+    add64(b, T64, args0, T0)?;
     smem(b, WPTR, 2, T64, 0)?;
     // Row geometry.
     match codec {
@@ -183,7 +195,7 @@ pub(super) fn emit<T: Gfx11>(wg: &mut Wg<'_, T>, g: &Gen, end: &End) -> Result<(
     )?;
     // Sorted slots of this tile.
     sop(b, format!("s_lshl_b32 s{T0}, s{WGY}, 6"), &[T0], &[WGY])?;
-    add64(b, SRD_S, ARGS0 + 4, T0)?;
+    add64(b, SRD_S, args0 + 4, T0)?;
     sop(
         b,
         format!("s_mov_b32 s{}, 64", SRD_S + 2),
@@ -207,15 +219,15 @@ pub(super) fn emit<T: Gfx11>(wg: &mut Wg<'_, T>, g: &Gen, end: &End) -> Result<(
     )?;
     sop(
         b,
-        format!("s_mov_b32 s{SRD_X}, s{}", ARGS0 + 6),
+        format!("s_mov_b32 s{SRD_X}, s{}", args0 + 6),
         &[SRD_X],
-        &[ARGS0 + 6],
+        &[args0 + 6],
     )?;
     sop(
         b,
-        format!("s_mov_b32 s{}, s{}", SRD_X + 1, ARGS0 + 7),
+        format!("s_mov_b32 s{}, s{}", SRD_X + 1, args0 + 7),
         &[SRD_X + 1],
-        &[ARGS0 + 7],
+        &[args0 + 7],
     )?;
     sop(
         b,

@@ -17,6 +17,18 @@ use crate::{DType, Gpu, GpuTensor};
 pub(crate) mod npu_arena;
 pub use npu_arena::*;
 
+// Multi-lane QSA decode core (fn-lanes, exact gfx1201): a child module so it
+// shares the singleton launchers' private validators and route predicates.
+#[path = "qsa_core_lanes.rs"]
+mod qsa_core_lanes;
+pub use qsa_core_lanes::{
+    qsa_core_lanes, qsa_core_lanes_min, qsa_lanes_fuse_enabled, QsaCoreLane, QsaCoreLanesPlan,
+    QsaOutRotate, QSA_CORE_LANES_MAX, QSA_CORE_LANE_ROWS, QSA_LANES_ATTENTION_SYMBOL,
+    QSA_LANES_FUSED_ATTENTION_SYMBOL, QSA_LANES_FUSED_CORE_SYMBOL, QSA_LANES_FUSE_MODULE,
+    QSA_LANES_MODULE, QSA_LANES_POOL_SYMBOL, QSA_LANES_PROLOGUE_SYMBOL, QSA_LANES_SELECT_SYMBOL,
+};
+pub(crate) use qsa_core_lanes::{QSA_LANES_FUSE_SRC, QSA_LANES_SRC};
+
 pub(crate) const TENSOR_OPS_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_fwht256.h"),
     include_str!("../../../kernels/src/rope_yarn.h"),
@@ -26,6 +38,14 @@ pub(crate) const HYPER_READ_UP_WMMA_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_wmma.gfx1151.hip");
 pub(crate) const HYPER_READ_UP_FUSED_TWIN_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_fused_twin.gfx1151.hip");
+pub(crate) const HYPER_READ_UP_FUSED_TWIN_T1_SRC: &str =
+    include_str!("../../../kernels/src/hyper_read_up_fused_twin_t1.gfx1201.hip");
+pub(crate) const HYPER_READ_UP_FUSED_ROT_T1_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq_fwht256.h"),
+    include_str!("../../../kernels/src/hyper_read_up_fused_rot_t1.gfx1201.hip")
+);
+pub(crate) const MOE_SHARED_DOWN_COMBINE_SRC: &str =
+    include_str!("../../../kernels/src/moe_shared_down_combine.gfx1201.hip");
 pub(crate) const HYPER_READ_UP_WMMA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_wmma.gfx1201.hip");
 pub(crate) const HYPER_READ_UP_WMMA_GFX1151_V2_SRC: &str =
@@ -500,6 +520,11 @@ const GDN_PAIR_COUNTERS: usize = 256;
 /// Bytes of the head-pair arrival counters [`ensure_gdn_pair_counters`] allocates.
 pub const GDN_PAIR_COUNTERS_BYTES: usize = GDN_PAIR_COUNTERS * 4;
 
+/// u32 counters of the fused lanes GDN Core ([`GdnCoreLanesPlan::launch_rotated`]):
+/// per lane `value_heads / 2` head-pair counters, then `key_heads` key-head
+/// counters. Only `HIPFIRE_QWEN4_GDN_LANES_FUSE` sizes the allocation this large.
+const GDN_LANE_FUSE_COUNTERS: usize = 1024;
+
 /// Allocate and zero the fused GDN step's head-pair arrival counters if they
 /// do not exist yet. Each launch leaves them zero, so the zeroing memset runs
 /// once. A retained-body boundary calls this before opening its capture
@@ -507,8 +532,13 @@ pub const GDN_PAIR_COUNTERS_BYTES: usize = GDN_PAIR_COUNTERS * 4;
 /// makes the capture effect-incomplete.
 pub fn ensure_gdn_pair_counters(gpu: &mut Gpu) -> HipResult<()> {
     if gpu.scratch.gdn_pair_counters.is_none() {
-        let counters = gpu.hip.malloc(GDN_PAIR_COUNTERS_BYTES)?;
-        gpu.hip.memset(&counters, 0, GDN_PAIR_COUNTERS_BYTES)?;
+        let bytes = if gpu.flags.qwen4_gdn_lanes_fuse_enabled() {
+            GDN_LANE_FUSE_COUNTERS * 4
+        } else {
+            GDN_PAIR_COUNTERS_BYTES
+        };
+        let counters = gpu.hip.malloc(bytes)?;
+        gpu.memset_stream_ordered(&counters, 0, bytes)?;
         gpu.scratch.gdn_pair_counters = Some(counters);
     }
     Ok(())
@@ -950,8 +980,9 @@ pub(crate) fn gdn_batched_kernargs(a: &GdnBatchedKernargs) -> KernargBlob {
     args
 }
 
-pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) -> HipResult<()> {
-    let format = p.format;
+/// Every shape, dtype and state-slot check of a batched GDN recurrence launch
+/// ([`gated_delta_step_batched`]), before any kernel work.
+fn validate_gated_delta_step_batched(p: &GatedDeltaStepBatched<'_>) -> HipResult<()> {
     for tensor in [p.projection, p.gate, p.beta, p.output] {
         ensure_f32(tensor)?;
     }
@@ -965,7 +996,7 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
     validate_gdn_state(
-        format,
+        p.format,
         p.state,
         p.residual,
         p.row_states,
@@ -992,6 +1023,12 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
+    Ok(())
+}
+
+pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) -> HipResult<()> {
+    let format = p.format;
+    validate_gated_delta_step_batched(p)?;
     let rows = checked_i32(p.rows, "GDN batched rows")?;
     let qkv_width = checked_i32(p.qkv_width, "GDN batched qkv width")?;
     let key_heads = checked_i32(p.key_heads, "GDN batched key heads")?;
@@ -1187,12 +1224,40 @@ pub fn gated_delta_q8_inline_route(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> 
     gpu.flags.qwen4_gdn_q8_inline_enabled() && gated_delta_q8_inline_geometry(gpu, p)
 }
 
+/// Shape part of [`gated_delta_conv_qknorm_geometry`]: the kernel hard-codes 16 key heads of
+/// 128 (its first 16 channel blocks are the 32 q|k heads, remapped to one head per wave), so the
+/// TP2 trunk shard's rank-local 8 key / 24 value heads (5120 channels) never take it and fall
+/// back to the plain convolution + separate Q/K-norm launches; q|k|v channel order,
+/// `channels % 256 == 0`, K=4 with a 3-row ring, and a BF16 convolution output.
+#[allow(clippy::too_many_arguments)]
+fn conv_qknorm_shape_admits(
+    key_heads: usize,
+    key_dim: usize,
+    qkv_width: usize,
+    step_rows: usize,
+    conv_channels: usize,
+    conv_rows: usize,
+    history_rows: usize,
+    kernel_size: usize,
+    output_bf16: bool,
+) -> bool {
+    key_heads == 16
+        && key_dim == 128
+        && qkv_width == conv_channels
+        && conv_rows == step_rows
+        && conv_channels >= 4096
+        && conv_channels % 256 == 0
+        && history_rows == 3
+        && kernel_size == 4
+        && output_bf16
+}
+
 /// Whether H5's convolution that also writes the normalized Q/K
 /// (`gated_delta_conv_qknorm_bf16_f32_batched_k4`) can run this chunk, flag
 /// aside: exact gfx1151 wave32 on the chunked route (so never a recorder, a
 /// graph capture or the persistent gfx1201/gfx1100-persistent route), 16 key
 /// heads of 128 in q|k|v channel order, `channels % 256 == 0`, K=4 with a
-/// 3-row ring, and a BF16 convolution output.
+/// 3-row ring, and a BF16 convolution output ([`conv_qknorm_shape_admits`]).
 pub fn gated_delta_conv_qknorm_geometry(
     gpu: &Gpu,
     step: &GatedDeltaStepBatched<'_>,
@@ -1201,15 +1266,17 @@ pub fn gated_delta_conv_qknorm_geometry(
     gpu.arch_caps.is_gfx1151()
         && gpu.arch_caps.has_wmma_w32()
         && gated_delta_chunk_route(gpu, step)
-        && step.key_heads == 16
-        && step.key_dim == 128
-        && step.qkv_width == conv.channels
-        && conv.rows == step.rows
-        && conv.channels >= 4096
-        && conv.channels % 256 == 0
-        && conv.history_rows == 3
-        && conv.kernel_size == 4
-        && conv.output.dtype == DType::BF16
+        && conv_qknorm_shape_admits(
+            step.key_heads,
+            step.key_dim,
+            step.qkv_width,
+            step.rows,
+            conv.channels,
+            conv.rows,
+            conv.history_rows,
+            conv.kernel_size,
+            conv.output.dtype == DType::BF16,
+        )
 }
 
 /// [`gated_delta_conv_qknorm_geometry`] under
@@ -1456,11 +1523,8 @@ fn gated_delta_step_gate_wmma_arms(
             "gated_delta_qk_norm_bf16_batched",
         )?;
     }
-    gpu.ensure_kernel_public(
-        gdn_chunk_module_name(format, arms.q8_inline, false),
-        gdn_chunk_source(format, arms.q8_inline, false),
-        gdn_chunk_kernel_name(format, arms.q8_inline, false),
-    )?;
+    // The PM twin (`gated_delta_chunk_pm`) or the hipcc kernel; same kernargs, grid and block.
+    let chunk_kernel = gpu.gdn_chunk_ensure(format, arms.q8_inline, false)?;
     // With `qk_prenormed` the convolution already stored the normalized Q/K
     // in this same scratch (`gated_delta_conv_params_qknorm_batched`).
     if !arms.qk_prenormed {
@@ -1534,7 +1598,7 @@ fn gated_delta_step_gate_wmma_arms(
     });
     args.pad_to(16);
     gpu.launch_blob_recorded(
-        gdn_chunk_kernel_name(format, arms.q8_inline, false),
+        chunk_kernel,
         [checked_u32(p.value_heads, "GDN chunk head grid")?, 1, 1],
         [256, 1, 1],
         0,
@@ -2316,6 +2380,130 @@ pub fn hyper_write_norm(
     )
 }
 
+/// `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE` (developer, default off): on exact gfx1201 the Qwen4 MoE
+/// epilogue chain `moe_down_combine_top10_batched` -> shared-down `gemv_bf16_xf32_x4_rows_r<R>`
+/// -> `bf16_scaled_add_batched_f32` (3 launches, 1..=8 rows) runs as the one launch
+/// `moe_shared_down_combine_rows_r<R>` ([`moe_shared_down_combine`]): the combine and the shared
+/// fold ride the shared-down GEMV's epilogue. Read once.
+static QWEN4_MOE_EPILOGUE_FUSE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE", true)
+});
+
+/// Operands of [`moe_shared_down_combine`].
+pub struct MoeSharedDownCombine<'a> {
+    /// The shared down's BF16 weight `[m, k]`.
+    pub weight: &'a GpuTensor,
+    /// The shared hidden `[rows, k]` (F32).
+    pub x: &'a GpuTensor,
+    /// The combine target `[rows, m]` (F32): the accumulator seed in (unless
+    /// [`Self::initial_zero`]), the final block output out (bitwise what the three launches leave
+    /// there).
+    pub target: &'a GpuTensor,
+    /// The `_zinit` entry (`HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS`): the accumulator starts from +0.0
+    /// and `target` is never read, only fully overwritten (every `[rows, m]` element is stored), so
+    /// the caller skips the `zero_f32` fill: bitwise that fill + the plain entry.
+    pub initial_zero: bool,
+    /// Unweighted expanded routed rows `[rows * 10 * m]` (`moe_down_combine_top10_batched`'s).
+    pub expert_outputs: &'a GpuTensor,
+    pub topk_indices: &'a GpuTensor,
+    pub topk_weights: &'a GpuTensor,
+    /// Shared selector `[rows]` (already activated).
+    pub scalar: &'a GpuTensor,
+    pub m: usize,
+    pub k: usize,
+    pub rows: usize,
+    pub n_experts: usize,
+}
+
+impl MoeSharedDownCombine<'_> {
+    /// Whether [`moe_shared_down_combine`] can run these operands on `gpu`: the flag, exact
+    /// gfx1201, no replay recording / graph capture, 1..=8 rows (the rows-GEMV route; wider
+    /// passes take the WMMA GEMMs), `m % 8 == 0`, at most 2^20 experts (the kernel's sort key) and
+    /// the operand extents the kernel reads.
+    /// Pure: launches nothing. The caller owns every other condition of the unfused chain it
+    /// replaces (the route the shared down GEMV would have taken, the combine's arm).
+    pub fn applies(&self, gpu: &Gpu) -> bool {
+        let f32_at_least = |t: &GpuTensor, n: usize| t.dtype == DType::F32 && t.numel() >= n;
+        let (m, k, rows) = (self.m, self.k, self.rows);
+        *QWEN4_MOE_EPILOGUE_FUSE
+            && gpu.arch_caps.is_gfx1201()
+            && !gpu.replay.is_recording()
+            && !gpu.graphs.capture_mode
+            && (1..=crate::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&rows)
+            && m > 0
+            && m % 8 == 0
+            && k > 0
+            && self.n_experts > 0
+            && self.n_experts <= 1 << 20
+            && self.weight.dtype == DType::BF16
+            && self.weight.numel() >= m * k
+            && f32_at_least(self.x, rows * k)
+            && f32_at_least(self.target, rows * m)
+            && f32_at_least(self.expert_outputs, rows * 10 * m)
+            && self.topk_indices.buf.size() >= rows * 10 * 4
+            && f32_at_least(self.topk_weights, rows * 10)
+            && f32_at_least(self.scalar, rows)
+    }
+}
+
+/// `moe_shared_down_combine_rows_r<rows>`: bitwise `moe_down_combine_top10_batched` into
+/// `target` + the shared-down rows GEMV (`gemv_bf16_xf32_x4_rows_r<rows>`, whose F32 rows are
+/// not stored) + `bf16_scaled_add_batched_f32` (selector `scalar`), in one launch of `m / 8`
+/// blocks of ten waves (eight GEMV waves, two combine waves). Callers MUST check [`MoeSharedDownCombine::applies`] first (it is the
+/// only admission); an operand set it rejects is an error with nothing launched.
+pub fn moe_shared_down_combine(gpu: &mut Gpu, p: &MoeSharedDownCombine<'_>) -> HipResult<()> {
+    if !p.applies(gpu) {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let kernel = match (p.rows, p.initial_zero) {
+        (1, false) => "moe_shared_down_combine_rows_r1",
+        (2, false) => "moe_shared_down_combine_rows_r2",
+        (3, false) => "moe_shared_down_combine_rows_r3",
+        (4, false) => "moe_shared_down_combine_rows_r4",
+        (5, false) => "moe_shared_down_combine_rows_r5",
+        (6, false) => "moe_shared_down_combine_rows_r6",
+        (7, false) => "moe_shared_down_combine_rows_r7",
+        (_, false) => "moe_shared_down_combine_rows_r8",
+        (1, true) => "moe_shared_down_combine_rows_r1_zinit",
+        (2, true) => "moe_shared_down_combine_rows_r2_zinit",
+        (3, true) => "moe_shared_down_combine_rows_r3_zinit",
+        (4, true) => "moe_shared_down_combine_rows_r4_zinit",
+        (5, true) => "moe_shared_down_combine_rows_r5_zinit",
+        (6, true) => "moe_shared_down_combine_rows_r6_zinit",
+        (7, true) => "moe_shared_down_combine_rows_r7_zinit",
+        (_, true) => "moe_shared_down_combine_rows_r8_zinit",
+    };
+    gpu.ensure_kernel_public(
+        "moe_shared_down_combine",
+        MOE_SHARED_DOWN_COMBINE_SRC,
+        kernel,
+    )?;
+    let mut args = KernargBlob::new();
+    for ptr in [
+        p.weight.buf.as_ptr(),
+        p.x.buf.as_ptr(),
+        p.target.buf.as_ptr(),
+        p.expert_outputs.buf.as_ptr(),
+        p.topk_indices.buf.as_ptr(),
+        p.topk_weights.buf.as_ptr(),
+        p.scalar.buf.as_ptr(),
+    ] {
+        args.push_ptr(ptr);
+    }
+    args.push_i32(checked_i32(p.m, "MoE shared down rows")?);
+    args.push_i32(checked_i32(p.k, "MoE shared down K")?);
+    args.push_i32(checked_i32(p.n_experts, "MoE epilogue expert count")?);
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        kernel,
+        [(p.m / 8) as u32, 1, 1],
+        [320, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
 pub struct HyperNorm<'a> {
     pub input: &'a GpuTensor,
     pub norm_weight: &'a GpuTensor,
@@ -2521,6 +2709,111 @@ pub fn hyper_norm_gate_outputs(gpu: &mut Gpu, p: &HyperNormGateOutputs<'_>) -> H
     )
 }
 
+/// Decode HC read norm + the paired write's k4 gate GEMV in one launch
+/// (`hyper_norm_gate_k4_outputs_f32`, `HIPFIRE_QWEN4_HC_PAIR_DECODE`): `normalized` is
+/// bitwise [`hyper_norm`]'s and `gates` bitwise the write's `gemv_bf16_xf32_k4` /
+/// `gemv_bf16_xf32_k4_rows_r<R>` / `_otile_r<R>` launch over that `normalized` (no
+/// `hc_act`), for 1..=64 rows (`WIDE_VERIFY_MAX_ROWS`). Four branches, hidden 2560.
+pub struct HyperNormGateK4Outputs<'a> {
+    pub input: &'a GpuTensor,
+    pub norm_weight: &'a GpuTensor,
+    /// The paired write's BF16 `[branches, branches * hidden]` gate weight.
+    pub gate_weight: &'a GpuTensor,
+    /// F32 `rows * branches * hidden` elements (the read's `normalized`).
+    pub normalized: &'a GpuTensor,
+    /// F32 `rows * branches` gate logits.
+    pub gates: &'a GpuTensor,
+    pub rows: usize,
+    pub branches: usize,
+    pub hidden: usize,
+    /// `input` holds BF16 bits (see [`Gpu::qwen4_bf16_streams`]).
+    pub state_bf16: bool,
+}
+
+/// Rows the fused launch supports: the wide verify cap (and so the persistent sync buffer's size).
+const HC_PAIR_MAX_ROWS: usize = crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
+/// Byte offset of the quarter scratch: `HC_PAIR_MAX_ROWS` u32 counters padded to a 64-B multiple.
+const HC_PAIR_SCRATCH_OFFSET: usize = (HC_PAIR_MAX_ROWS * 4).div_ceil(64) * 64;
+/// Bytes of the per-Gpu row-completion buffer of [`hyper_norm_gate_k4_outputs`]: the counters
+/// (padded to 64 B) and the `[HC_PAIR_MAX_ROWS rows][4 gates][4 quarters]` F32 quarter scratch.
+const HC_PAIR_SYNC_BYTES: usize = HC_PAIR_SCRATCH_OFFSET + HC_PAIR_MAX_ROWS * 16 * 4;
+
+impl HyperNormGateK4Outputs<'_> {
+    /// Geometry the kernel supports: four branches, hidden 2560, 1..=64 rows.
+    pub fn supports(branches: usize, hidden: usize, rows: usize) -> bool {
+        branches == 4 && hidden == 2560 && (1..=HC_PAIR_MAX_ROWS).contains(&rows)
+    }
+}
+
+pub fn hyper_norm_gate_k4_outputs(gpu: &mut Gpu, p: &HyperNormGateK4Outputs<'_>) -> HipResult<()> {
+    ensure_f32(p.normalized)?;
+    ensure_f32(p.gates)?;
+    if !HyperNormGateK4Outputs::supports(p.branches, p.hidden, p.rows) {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let wide = checked_product(p.branches, p.hidden, "HC norm-gate-k4 width")?;
+    ensure_f32(p.input)?;
+    let input_ok = p.input.numel() >= p.rows * wide;
+    if p.norm_weight.dtype != DType::BF16
+        || p.gate_weight.dtype != DType::BF16
+        || !gpu.arch_caps.has_gfx11_plus_simt()
+        || !input_ok
+        || p.norm_weight.numel() != wide
+        || p.gate_weight.numel() < p.branches * wide
+        || p.normalized.numel() < p.rows * wide
+        || p.gates.numel() < p.rows * p.branches
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    // The row-completion counters live in one persistent per-Gpu buffer that no recorded or
+    // captured launch may share with an eager one.
+    if gpu.replay.is_recording() || gpu.graphs.capture_mode {
+        return Err(HipError::new(
+            0,
+            "hyper_norm_gate_k4_outputs: not available while recording or capturing",
+        ));
+    }
+    let hidden = checked_i32(p.hidden, "HC norm-gate-k4 hidden width")?;
+    let row_grid = checked_u32(p.rows, "HC norm-gate-k4 row grid")?;
+    gpu.ensure_kernel_public(
+        "tensor_ops",
+        TENSOR_OPS_SRC,
+        "hyper_norm_gate_k4_outputs_f32",
+    )?;
+    // `[64 u32 counters | 64 rows x 4 gates x 4 quarters f32]`, zeroed once.
+    if gpu.hc_pair_sync.is_none() {
+        gpu.bind_thread()?;
+        let sync = gpu.alloc_tensor(&[HC_PAIR_SYNC_BYTES / 4], DType::F32)?;
+        gpu.memset_stream_ordered(&sync.buf, 0, sync.buf.size())?;
+        gpu.hc_pair_sync = Some(sync);
+    }
+    let counters = gpu.hc_pair_sync.as_ref().unwrap().buf.as_ptr();
+    // SAFETY: the buffer is HC_PAIR_SYNC_BYTES long; the quarter scratch starts at
+    // HC_PAIR_SCRATCH_OFFSET.
+    let scratch =
+        unsafe { (counters as *mut u8).add(HC_PAIR_SCRATCH_OFFSET) } as *mut std::ffi::c_void;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.input.buf.as_ptr());
+    args.push_ptr(p.norm_weight.buf.as_ptr());
+    args.push_ptr(p.gate_weight.buf.as_ptr());
+    args.push_ptr(p.normalized.buf.as_ptr());
+    args.push_ptr(p.gates.buf.as_ptr());
+    args.push_ptr(scratch);
+    args.push_ptr(counters);
+    args.push_i32(hidden);
+    args.push_i32(i32::from(p.state_bf16));
+    args.pad_to(16);
+    // Grid `[branches, rows]`, hyper_norm_f32's geometry: block (b, row) is one branch of one row.
+    gpu.launch_blob_recorded(
+        "hyper_norm_gate_k4_outputs_f32",
+        [4, row_grid, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
 /// gfx1151 HC read tail: the BF16 `[4 * hidden, low_rank]` up projection of
 /// `low` fused with `hyper_read_projected` (four branches), bitwise
 /// identical to the multi-row BF16 GEMM followed by that kernel; the
@@ -2555,11 +2848,105 @@ fn qwen4_hc_up_twin_applies(enabled: bool, exact_gfx1151: bool, rows: usize) -> 
     enabled && exact_gfx1151 && rows >= QWEN4_HC_UP_TWIN_MIN_ROWS
 }
 
-/// Same arguments, grid, block, dynamic LDS and kernarg blob for either entry:
-/// on exact gfx1151 with at least 16 rows (and `HIPFIRE_QWEN4_HC_UP_TWIN`
-/// not `0`) the launch is the bitwise twin `hyper_read_up_fused_f32_sx`
-/// (module `hyper_read_up_fused_twin`); otherwise it is `hyper_read_up_fused_f32`.
+/// Largest row count (inclusive) that takes the `hyper_read_up_fused` twin on exact gfx1201:
+/// decode, verify (K <= 7 drafts) and fn-lane steps (at most `LANE_MAX_ROWS` = 8 rows per
+/// forward). The 8-row decode HC read-up leaves 6 of 8 waves idle in the incumbent; the twin
+/// is bitwise the incumbent, gated by `tests/hyper_read_up_twin_hw.rs` (raw f32 bits).
+// selector-receipt: receipts/selectors/qwen4_hc_up_twin_gfx1201_max_rows.json
+const QWEN4_HC_UP_TWIN_GFX1201_MAX_ROWS: usize = 8;
+
+/// The gfx1201 admission of the sx twin (`HIPFIRE_QWEN4_HC_UP_TWIN` kill switch applies).
+fn qwen4_hc_up_twin_gfx1201_applies(enabled: bool, exact_gfx1201: bool, rows: usize) -> bool {
+    enabled && exact_gfx1201 && rows <= QWEN4_HC_UP_TWIN_GFX1201_MAX_ROWS
+}
+
+/// `HIPFIRE_QWEN4_HC_UP_T1` (developer, default on; `0` falls back from the one-token-per-wave
+/// entry to the `_sx` twin on the gfx1201 rows it admits). Read once.
+static QWEN4_HC_UP_T1: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_UP_T1", true));
+
+/// `HIPFIRE_QWEN4_HC_UP_T1_K320` (developer, default off): on the gfx1201 rows that take the t1
+/// entry, `low_rank == 320` launches `hyper_read_up_fused_f32_sx_t1_k320` instead (same module,
+/// grid, block, LDS and arguments; bitwise the t1 output). Read once.
+static QWEN4_HC_UP_T1_K320: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_UP_T1_K320", true)
+});
+
+/// Entry of the HC read tail `hyper_read_up_fused` (same arguments, block and dynamic LDS).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HyperReadUpFusedEntry {
+    /// `hyper_read_up_fused_f32` (module `tensor_ops`): grid `[hidden/8, ceil(rows/128)]`.
+    Incumbent,
+    /// `hyper_read_up_fused_f32_sx` (module `hyper_read_up_fused_twin`): same grid, scalar X.
+    Twin,
+    /// `hyper_read_up_fused_f32_sx_t1` (module `hyper_read_up_fused_twin_t1`): one token per
+    /// wave, grid `[hidden/8, ceil(rows/8)]`.
+    TwinT1,
+    /// `hyper_read_up_fused_f32_sx_t1_k320` (module `hyper_read_up_fused_twin_t1`): the t1 entry
+    /// with `low_rank == 320` compiled in; only valid for `low_rank == 320`.
+    TwinT1K320,
+}
+
+/// The entry [`hyper_read_up_fused`] launches. `twin_enabled` = `HIPFIRE_QWEN4_HC_UP_TWIN`,
+/// `t1_enabled` = `HIPFIRE_QWEN4_HC_UP_T1`. gfx1201 (exact, rows <= 8) takes `TwinT1`, or
+/// `Twin` with the T1 switch off; gfx1151 (exact, rows >= 16) takes `Twin`.
+fn hyper_read_up_fused_route(
+    twin_enabled: bool,
+    t1_enabled: bool,
+    exact_gfx1151: bool,
+    exact_gfx1201: bool,
+    rows: usize,
+) -> HyperReadUpFusedEntry {
+    if qwen4_hc_up_twin_gfx1201_applies(twin_enabled, exact_gfx1201, rows) {
+        if t1_enabled {
+            HyperReadUpFusedEntry::TwinT1
+        } else {
+            HyperReadUpFusedEntry::Twin
+        }
+    } else if qwen4_hc_up_twin_applies(twin_enabled, exact_gfx1151, rows) {
+        HyperReadUpFusedEntry::Twin
+    } else {
+        HyperReadUpFusedEntry::Incumbent
+    }
+}
+
+/// Same arguments, block and dynamic LDS for every entry: on exact gfx1151 with at least 16
+/// rows the launch is the bitwise twin `hyper_read_up_fused_f32_sx`; on exact gfx1201 with at
+/// most 8 rows it is the one-token-per-wave `hyper_read_up_fused_f32_sx_t1`
+/// (`HIPFIRE_QWEN4_HC_UP_T1=0`: the sx twin); `HIPFIRE_QWEN4_HC_UP_TWIN=0` forces the
+/// incumbent `hyper_read_up_fused_f32` everywhere.
 pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<()> {
+    let mut entry = hyper_read_up_fused_route(
+        *QWEN4_HC_UP_TWIN,
+        *QWEN4_HC_UP_T1,
+        gpu.arch_caps.is_gfx1151(),
+        gpu.arch_caps.is_gfx1201(),
+        p.rows,
+    );
+    // `HIPFIRE_QWEN4_LANE_HC_ALLROWS`: the lane step's all-rows HC read tail (9..=64 rows) is the
+    // t1 entry, whose grid `[hidden / 8, ceil(rows / 8)]` runs each eight-token tile with the
+    // very device body the <= 8-row group launches run (one token per wave, no state shared
+    // across `blockIdx.y`), in one launch, instead of the incumbent's 128-token row grid.
+    if entry == HyperReadUpFusedEntry::Incumbent
+        && *QWEN4_HC_UP_TWIN
+        && *QWEN4_HC_UP_T1
+        && gpu.lane_hc_allrows_applies(p.rows)
+    {
+        entry = HyperReadUpFusedEntry::TwinT1;
+    }
+    if entry == HyperReadUpFusedEntry::TwinT1 && *QWEN4_HC_UP_T1_K320 && p.low_rank == 320 {
+        entry = HyperReadUpFusedEntry::TwinT1K320;
+    }
+    hyper_read_up_fused_entry(gpu, p, entry)
+}
+
+/// [`hyper_read_up_fused`] with the entry chosen by the caller: the byte-identity gates run
+/// every entry on one device through this.
+pub fn hyper_read_up_fused_entry(
+    gpu: &mut Gpu,
+    p: &HyperReadUpFused<'_>,
+    entry: HyperReadUpFusedEntry,
+) -> HipResult<()> {
     ensure_f32(p.low)?;
     ensure_f32(p.normalized)?;
     ensure_f32(p.mixed)?;
@@ -2581,18 +2968,35 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
     let low_rank = checked_i32(p.low_rank, "HC read low rank")?;
     let rows = checked_i32(p.rows, "HC read rows")?;
     let column_grid = checked_u32(p.hidden / 8, "HC read column grid")?;
-    let row_grid = checked_u32(p.rows.div_ceil(128), "HC read row grid")?;
+    if entry == HyperReadUpFusedEntry::TwinT1K320 && p.low_rank != 320 {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let tokens_per_row_group = match entry {
+        HyperReadUpFusedEntry::TwinT1 | HyperReadUpFusedEntry::TwinT1K320 => 8,
+        HyperReadUpFusedEntry::Incumbent | HyperReadUpFusedEntry::Twin => 128,
+    };
+    let row_grid = checked_u32(p.rows.div_ceil(tokens_per_row_group), "HC read row grid")?;
     let lds_bytes = checked_u32(32 * (p.low_rank / 2 + 1) * 4, "HC read LDS")?;
-    let (module, source, kernel) =
-        if qwen4_hc_up_twin_applies(*QWEN4_HC_UP_TWIN, gpu.arch_caps.is_gfx1151(), p.rows) {
-            (
-                "hyper_read_up_fused_twin",
-                HYPER_READ_UP_FUSED_TWIN_SRC,
-                "hyper_read_up_fused_f32_sx",
-            )
-        } else {
+    let (module, source, kernel) = match entry {
+        HyperReadUpFusedEntry::Twin => (
+            "hyper_read_up_fused_twin",
+            HYPER_READ_UP_FUSED_TWIN_SRC,
+            "hyper_read_up_fused_f32_sx",
+        ),
+        HyperReadUpFusedEntry::TwinT1 => (
+            "hyper_read_up_fused_twin_t1",
+            HYPER_READ_UP_FUSED_TWIN_T1_SRC,
+            "hyper_read_up_fused_f32_sx_t1",
+        ),
+        HyperReadUpFusedEntry::TwinT1K320 => (
+            "hyper_read_up_fused_twin_t1",
+            HYPER_READ_UP_FUSED_TWIN_T1_SRC,
+            "hyper_read_up_fused_f32_sx_t1_k320",
+        ),
+        HyperReadUpFusedEntry::Incumbent => {
             ("tensor_ops", TENSOR_OPS_SRC, "hyper_read_up_fused_f32")
-        };
+        }
+    };
     gpu.ensure_kernel_public(module, source, kernel)?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.up_weight.buf.as_ptr());
@@ -2613,6 +3017,102 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
+/// `HIPFIRE_QWEN4_HC_UP_ROT` (developer, default off): the gfx1201 `low_rank == 320` HC read tail
+/// of at most eight rows also writes the next mixer's `mq_rotate_x` of `mixed`
+/// ([`hyper_read_up_fused_rotate`]). Read once.
+static QWEN4_HC_UP_ROT: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_UP_ROT", true));
+
+/// [`hyper_read_up_fused`] on exact gfx1201 (`HIPFIRE_QWEN4_HC_UP_ROT`, `low_rank == 320`,
+/// `hidden % 256 == 0`, 2..=8 rows, F32 `rotated`, not recording or capturing) in the one launch
+/// `hyper_read_up_fused_f32_sx_t1_k320_rot`: `mixed` is bitwise the t1 entry's and `rotated`
+/// bitwise `mq_rotate_x(mixed)`; the next matching `rotate_x_mq_batched(mixed, rotated, hidden,
+/// rows)` is then a no-op ([`ScratchState::prerotated`]). Returns whether it launched; `false`
+/// launched nothing (the caller runs [`hyper_read_up_fused`] and its own rotate).
+pub fn hyper_read_up_fused_rotate(
+    gpu: &mut Gpu,
+    p: &HyperReadUpFused<'_>,
+    rotated: &GpuTensor,
+) -> HipResult<bool> {
+    let route = hyper_read_up_fused_route(
+        *QWEN4_HC_UP_TWIN,
+        *QWEN4_HC_UP_T1,
+        gpu.arch_caps.is_gfx1151(),
+        gpu.arch_caps.is_gfx1201(),
+        p.rows,
+    );
+    if !*QWEN4_HC_UP_ROT
+        || route != HyperReadUpFusedEntry::TwinT1
+        || p.low_rank != 320
+        || p.hidden % 256 != 0
+        || !(2..=8).contains(&p.rows)
+        || rotated.dtype != DType::F32
+        || rotated.numel() < p.rows * p.hidden
+        || gpu.replay.is_recording()
+        || gpu.graphs.capture_mode
+    {
+        return Ok(false);
+    }
+    ensure_f32(p.low)?;
+    ensure_f32(p.normalized)?;
+    ensure_f32(p.mixed)?;
+    let wide = checked_product(4, p.hidden, "HC read width")?;
+    if p.up_weight.dtype != DType::BF16
+        || p.up_weight.numel() < wide * p.low_rank
+        || p.low.numel() < p.rows * p.low_rank
+        || p.normalized.numel() < p.rows * wide
+        || p.mixed.numel() < p.rows * p.hidden
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    // Arrival counters: the fused GDN step's (zero between launches, every user resets what it
+    // touched), 256 u32 >= rows * hidden / 256.
+    ensure_gdn_pair_counters(gpu)?;
+    gpu.ensure_mq_signs()?;
+    let hidden = checked_i32(p.hidden, "HC read hidden width")?;
+    let low_rank = checked_i32(p.low_rank, "HC read low rank")?;
+    let rows = checked_i32(p.rows, "HC read rows")?;
+    let column_grid = checked_u32(p.hidden / 8, "HC read column grid")?;
+    let lds_bytes = checked_u32(32 * (p.low_rank / 2 + 1) * 4, "HC read LDS")?;
+    let kernel = "hyper_read_up_fused_f32_sx_t1_k320_rot";
+    gpu.ensure_kernel_public(
+        "hyper_read_up_fused_rot_t1",
+        HYPER_READ_UP_FUSED_ROT_T1_SRC,
+        kernel,
+    )?;
+    let s1 = gpu.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+    let s2 = gpu.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+    let counters = gpu.scratch.gdn_pair_counters.as_ref().unwrap().as_ptr();
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.up_weight.buf.as_ptr());
+    args.push_ptr(p.low.buf.as_ptr());
+    args.push_ptr(p.normalized.buf.as_ptr());
+    args.push_ptr(p.mixed.buf.as_ptr());
+    args.push_i32(hidden);
+    args.push_i32(low_rank);
+    args.push_i32(rows);
+    args.push_i32(i32::from(p.normalized_bf16));
+    args.push_ptr(rotated.buf.as_ptr());
+    args.push_ptr(s1);
+    args.push_ptr(s2);
+    args.push_ptr(counters);
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        kernel,
+        [column_grid, (p.rows.div_ceil(8)) as u32, 1],
+        [256, 1, 1],
+        lds_bytes,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )?;
+    gpu.scratch.prerotated = Some((
+        p.mixed.buf.as_ptr() as usize,
+        rotated.buf.as_ptr() as usize,
+        p.hidden * p.rows,
+    ));
+    Ok(true)
+}
+
 /// [`hyper_read_up_fused`] on gfx11 BF16 WMMA, or on gfx1201's gfx12 BF16
 /// WMMA when [`Gpu::qwen4_f16_wmma_gfx1201`] admits it; `low` is packed BF16
 /// ([`HcActivationFused::bf16_out`]) and `normalized` is
@@ -3024,6 +3524,11 @@ pub struct GdnCoreLanesPlan<'a, 'l> {
     step: [i32; 4],
 }
 
+/// Whether no two entries of `keys` are equal.
+fn pairwise_distinct(keys: &[usize]) -> bool {
+    (1..keys.len()).all(|i| !keys[..i].contains(&keys[i]))
+}
+
 /// Admission of the per-lane [`gated_delta_conv_params`] + unrotated
 /// [`gated_delta_step_gated`] calls of 2..=[`GDN_CORE_LANES_MAX`] lanes as two
 /// launches (see [`GdnCoreLanesPlan::launch`]). Lanes share the weights and
@@ -3047,6 +3552,9 @@ pub fn gated_delta_core_lanes<'a, 'l>(
         || lanes.len() > GDN_CORE_LANES_MAX
         || gpu.replay.is_recording()
         || !gpu.flags.qwen4_gdn_lanes_enabled()
+        // The singleton's fused step + gated norm (the body the lane kernel
+        // inlines) is the gfx11+ SIMT 128x128 route.
+        || !gpu.arch_caps.has_gfx11_plus_simt()
     {
         return Ok(None);
     }
@@ -3080,6 +3588,26 @@ pub fn gated_delta_core_lanes<'a, 'l>(
             && g.norm.buf.as_ptr() == g0.norm.buf.as_ptr();
         let lane_shape = ([channels, history_rows, kernel_size], step_args);
         if !fits || *shape.get_or_insert(lane_shape) != lane_shape {
+            return Ok(None);
+        }
+    }
+    // Lanes run concurrently: two lanes naming one state, ring or output
+    // buffer would race, so every written buffer must be pairwise distinct.
+    type LaneKey = fn(&GdnCoreLane<'_>) -> usize;
+    let written: [LaneKey; 6] = [
+        |l| l.step.state.buf.as_ptr() as usize,
+        |l| l.conv.history.buf.as_ptr() as usize,
+        |l| l.conv.output.buf.as_ptr() as usize,
+        |l| l.params.gate.buf.as_ptr() as usize,
+        |l| l.params.beta.buf.as_ptr() as usize,
+        |l| l.gate.output.buf.as_ptr() as usize,
+    ];
+    for key in written {
+        let mut keys = [0usize; GDN_CORE_LANES_MAX];
+        for (slot, lane) in keys.iter_mut().zip(lanes) {
+            *slot = key(lane);
+        }
+        if !pairwise_distinct(&keys[..lanes.len()]) {
             return Ok(None);
         }
     }
@@ -3216,6 +3744,652 @@ impl GdnCoreLanesPlan<'_, '_> {
             crate::dispatch::ReplayLaunchBindings::NONE,
         )?;
         Ok(())
+    }
+
+    /// [`Self::launch`] under `HIPFIRE_QWEN4_GDN_LANES_FUSE`: ONE launch
+    /// (`gated_delta_step_gate_norm128_q8_lanes_fuse`) runs the convolution + gate
+    /// parameters as the step block's prologue, and, with `rotation`, the output
+    /// projection's `mq_rotate_x` of every lane's gated output as its epilogue.
+    /// Every output, the conv ring and the Q8 slots are byte-identical to
+    /// [`Self::launch`]'s (plus, with `rotation`, `rotate_x_mq_batched` of the
+    /// lanes' gated outputs as one `lanes.len()`-row batch).
+    ///
+    /// `rotation` is the output projection's rotation scratch; lane `l`'s
+    /// rotated row is written at element `l * value_heads * value_dim`. It is used
+    /// only when the lanes' gated outputs are consecutive rows of one buffer
+    /// (lane `l` at `l * value_heads * value_dim` elements from lane 0's), and
+    /// then `ScratchState::prerotated` names that batch so the next matching
+    /// `rotate_x_mq_batched` skips. Returns whether the rotation was written.
+    ///
+    /// Flag off, or any shape / buffer the fused kernel does not take (ring
+    /// width other than K = 4, extra conv channels, counters too small): the two
+    /// incumbent launches run and nothing is rotated.
+    pub fn launch_rotated(self, gpu: &mut Gpu, rotation: Option<&GpuTensor>) -> HipResult<bool> {
+        let n = self.lanes.len();
+        let [channels, history_rows, kernel_size] = self.conv;
+        let [key_heads, value_heads, key_dim, value_dim] = self.step;
+        let (qk, value) = (
+            key_heads as usize * key_dim as usize,
+            value_heads as usize * value_dim as usize,
+        );
+        let pairs = value_heads as usize / 2;
+        let counters_needed = n * (pairs + key_heads as usize);
+        let fits = gpu.flags.qwen4_gdn_lanes_fuse_enabled()
+            && history_rows == 3
+            && kernel_size == 4
+            && key_dim == 128
+            && value_dim == 128
+            && channels as usize == 2 * qk + value
+            && value_heads % key_heads == 0
+            && counters_needed <= GDN_LANE_FUSE_COUNTERS;
+        if !fits {
+            self.launch(gpu)?;
+            return Ok(false);
+        }
+        ensure_gdn_pair_counters(gpu)?;
+        let (pair_counters, counters_bytes) = {
+            let counters = gpu.scratch.gdn_pair_counters.as_ref().unwrap();
+            (counters.as_ptr(), counters.size())
+        };
+        if counters_bytes < counters_needed * 4 {
+            self.launch(gpu)?;
+            return Ok(false);
+        }
+        // SAFETY: inside the allocation (`counters_needed` checked above).
+        let key_counters =
+            unsafe { (pair_counters as *mut u32).add(n * pairs) } as *mut std::ffi::c_void;
+        let lanes = self.lanes;
+        let first = &lanes[0];
+        let (s0, c0, p0, g0) = (&first.step, &first.conv, &first.params, &first.gate);
+        let out0 = g0.output.buf.as_ptr() as usize;
+        let consecutive = lanes
+            .iter()
+            .enumerate()
+            .all(|(l, lane)| lane.gate.output.buf.as_ptr() as usize == out0 + l * value * 4);
+        let rotation = rotation.filter(|r| {
+            value_heads % 2 == 0 && r.dtype == DType::F32 && r.numel() >= n * value && consecutive
+        });
+        gpu.ensure_mq_signs()?;
+        let signs1 = gpu.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let signs2 = gpu.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        gpu.ensure_kernel_public(
+            "gdn_lanes",
+            GDN_LANES_SRC,
+            "gated_delta_step_gate_norm128_q8_lanes_fuse",
+        )?;
+        let pad = |args: &mut KernargBlob, filled: usize, ptr: bool| {
+            for _ in filled..GDN_CORE_LANES_MAX {
+                if ptr {
+                    args.push_ptr(std::ptr::null());
+                } else {
+                    args.push_u32(0);
+                }
+            }
+        };
+        let mut args = KernargBlob::new();
+        for ptr in [
+            c0.kernel.buf.as_ptr(),
+            p0.a_log.buf.as_ptr(),
+            p0.dt_bias.buf.as_ptr(),
+            g0.norm.buf.as_ptr(),
+            signs1,
+            signs2,
+            pair_counters,
+            key_counters,
+        ] {
+            args.push_ptr(ptr);
+        }
+        for v in [channels, key_heads, value_heads, key_dim, value_dim] {
+            args.push_i32(v);
+        }
+        args.push_f32((s0.key_dim as f32).sqrt().recip());
+        args.push_i32(checked_i32(qk, "GDN lane q width")?);
+        // GdnFuseLanes: eleven pointer arrays, then the cursors and the Q8 frames.
+        let fields: [fn(&GdnCoreLane<'_>) -> *mut std::ffi::c_void; 10] = [
+            |l| l.conv.input.buf.as_ptr(),
+            |l| l.conv.output.buf.as_ptr(),
+            |l| l.conv.history.buf.as_ptr(),
+            |l| l.params.a.buf.as_ptr(),
+            |l| l.params.b.buf.as_ptr(),
+            |l| l.params.gate.buf.as_ptr(),
+            |l| l.params.beta.buf.as_ptr(),
+            |l| l.step.state.buf.as_ptr(),
+            |l| l.gate.z.buf.as_ptr(),
+            |l| l.gate.output.buf.as_ptr(),
+        ];
+        for field in fields {
+            for lane in lanes {
+                args.push_ptr(field(lane));
+            }
+            pad(&mut args, n, true);
+        }
+        for l in 0..n {
+            args.push_ptr(rotation.map_or(std::ptr::null_mut(), |r| {
+                (r.buf.as_ptr() as usize + l * value * 4) as *mut std::ffi::c_void
+            }));
+        }
+        pad(&mut args, n, true);
+        for lane in lanes {
+            args.push_i32(checked_i32(lane.conv.cursor, "GDN lane cursor")?);
+        }
+        pad(&mut args, n, false);
+        for lane in lanes {
+            args.push_u32(checked_u32(lane.step.position, "GDN lane Q8 frame")?);
+        }
+        pad(&mut args, n, false);
+        args.pad_to(16);
+        gpu.launch_blob_recorded(
+            "gated_delta_step_gate_norm128_q8_lanes_fuse",
+            [value_heads as u32, 1, n as u32],
+            [128, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )?;
+        if let Some(r) = rotation {
+            gpu.scratch.prerotated = Some((out0, r.buf.as_ptr() as usize, n * value));
+        }
+        Ok(rotation.is_some())
+    }
+}
+
+/// Most rows one lane of [`gated_delta_core_lanes_rows`] may carry (the
+/// capture ring's verify window).
+pub const GDN_CORE_LANE_ROWS: usize = 8;
+
+/// One verify lane's GDN Core under the armed capture ring: the arguments of
+/// its per-lane chain `copy_d2d(projection -> conv.input)`,
+/// [`gated_delta_conv_params_batched`], [`gated_delta_step_batched`] (with
+/// `row_states`) and [`gated_delta_gate_batched`], exactly as
+/// `execute_gated_delta_net_hc_impl` builds them.
+pub struct GdnCoreRowsLane<'a> {
+    /// The qkv projection rows `[rows, qkv]` the per-lane route copies into
+    /// `conv.input` (the capture's `inputs`); the lanes kernel does that copy.
+    /// When the in-projection wrote the capture in place
+    /// (`HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`) this IS `conv.input` and the kernel's copy
+    /// stores each element onto itself (the same bits), as the per-lane route skips it.
+    pub projection: &'a GpuTensor,
+    pub conv: GatedDeltaConvBatched<'a>,
+    pub params: GatedDeltaParamsBatched<'a>,
+    pub step: GatedDeltaStepBatched<'a>,
+    pub gate: GatedDeltaGateBatched<'a>,
+}
+
+/// A validated, admitted set of 2..=[`GDN_CORE_LANES_MAX`] verify lanes, ready
+/// for [`GdnCoreRowsPlan::launch`]; produced only by
+/// [`gated_delta_core_lanes_rows`].
+pub struct GdnCoreRowsPlan<'a, 'l> {
+    lanes: &'a [GdnCoreRowsLane<'l>],
+    heads: usize,
+}
+
+/// The strict F32 convolution checks of [`gated_delta_conv_batched`] (the lanes
+/// kernel runs the F32 in / F32 out k4 route only).
+fn validate_gated_delta_conv_rows(p: &GatedDeltaConvBatched<'_>) -> HipResult<()> {
+    for tensor in [p.input, p.output, p.history, p.next_history] {
+        ensure_f32(tensor)?;
+    }
+    if p.kernel.dtype != DType::BF16
+        || p.rows == 0
+        || p.channels == 0
+        || p.history_rows != 3
+        || p.kernel_size != 4
+        || p.start_cursor >= p.history_rows
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let input_elements = checked_product(p.rows, p.channels, "GDN lane rows convolution input")?;
+    let history_elements = checked_product(
+        p.channels,
+        p.history_rows,
+        "GDN lane rows convolution history",
+    )?;
+    let kernel_elements = checked_product(p.channels, p.kernel_size, "GDN lane rows kernel")?;
+    if p.input.numel() != input_elements
+        || p.output.numel() != input_elements
+        || p.history.numel() != history_elements
+        || p.next_history.numel() != history_elements
+        || p.kernel.numel() != kernel_elements
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    Ok(())
+}
+
+/// `[start, end)` device ranges a lane's chain writes and reads (see
+/// [`gdn_rows_ranges_disjoint`]).
+fn gdn_rows_lane_ranges(lane: &GdnCoreRowsLane<'_>) -> ([(usize, usize); 8], [(usize, usize); 5]) {
+    let (c, p, s, g) = (&lane.conv, &lane.params, &lane.step, &lane.gate);
+    let at = |t: &GpuTensor, bytes: usize| {
+        let start = t.buf.as_ptr() as usize;
+        (start, start.saturating_add(bytes))
+    };
+    let rows = s.rows;
+    let value = s.value_heads * s.value_dim;
+    let slot = GdnStateFormat::Q8.state_bytes(s.value_heads, s.key_dim, s.value_dim);
+    let ring_slot = {
+        let ring = s.row_states.map_or(0, |r| r.buf.as_ptr() as usize);
+        let start = ring.saturating_add((rows - 1).saturating_mul(slot));
+        (start, start.saturating_add(slot))
+    };
+    (
+        [
+            at(c.history, c.history_rows * c.channels * 4),
+            at(c.output, rows * c.channels * 4),
+            at(p.gate, rows * p.heads * 4),
+            at(p.beta, rows * p.heads * 4),
+            at(c.input, rows * c.channels * 4),
+            ring_slot,
+            at(s.output, rows * value * 4),
+            at(g.output, rows * value * 4),
+        ],
+        [
+            at(lane.projection, rows * c.channels * 4),
+            at(p.a, rows * p.heads * 4),
+            at(p.b, rows * p.heads * 4),
+            at(g.z, rows * value * 4),
+            at(s.state, slot),
+        ],
+    )
+}
+
+/// Whether every written range of every lane is disjoint from every other
+/// written range and from every other lane's read ranges: lanes run
+/// concurrently, so any overlap (a duplicated state, ring, history or output,
+/// or a lane reading what another lane writes) would make the grouped result
+/// differ from the sequential per-lane one.
+fn gdn_rows_ranges_disjoint(lanes: &[GdnCoreRowsLane<'_>]) -> bool {
+    let all: Vec<_> = lanes.iter().map(gdn_rows_lane_ranges).collect();
+    gdn_rows_ranges_clear(&all)
+}
+
+/// [`gdn_rows_ranges_disjoint`] on the `(written, read)` ranges of each lane.
+fn gdn_rows_ranges_clear(all: &[([(usize, usize); 8], [(usize, usize); 5])]) -> bool {
+    for (i, (writes, _)) in all.iter().enumerate() {
+        for (w, &write) in writes.iter().enumerate() {
+            if write.0 >= write.1 {
+                return false;
+            }
+            for &other in &writes[w + 1..] {
+                if ranges_overlap(write, other) {
+                    return false;
+                }
+            }
+            for (j, (other_writes, other_reads)) in all.iter().enumerate() {
+                if j == i {
+                    continue;
+                }
+                if other_writes.iter().any(|&o| ranges_overlap(write, o))
+                    || other_reads.iter().any(|&o| ranges_overlap(write, o))
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    // Lanes never share a live Q8 state (read only, but a duplicated pointer
+    // marks a lane table gone wrong): the live-state reads (index 4) are
+    // pairwise disjoint as well.
+    for (i, (_, reads)) in all.iter().enumerate() {
+        if all[i + 1..]
+            .iter()
+            .any(|(_, other)| ranges_overlap(reads[4], other[4]))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Kernargs of `gated_delta_gate_bf16_f32_rows_lanes`: `norm`, `value_heads`,
+/// then the by-value `GdnGateRowsLanes` table: three pointer arrays
+/// (`recurrent`, `z`, `output`) and the rows.
+fn rows_gate_kernargs(
+    norm: *mut std::ffi::c_void,
+    value_heads: i32,
+    tables: &[[*mut std::ffi::c_void; GDN_CORE_LANES_MAX]],
+    rows: &[u32; GDN_CORE_LANES_MAX],
+) -> KernargBlob {
+    debug_assert_eq!(tables.len(), 3);
+    let mut args = KernargBlob::new();
+    args.push_ptr(norm);
+    args.push_i32(value_heads);
+    for table in tables {
+        for &ptr in table {
+            args.push_ptr(ptr);
+        }
+    }
+    for &v in rows {
+        args.push_u32(v);
+    }
+    args.pad_to(16);
+    args
+}
+
+/// Per-lane pointer tables of `fields`, padded with null to
+/// [`GDN_CORE_LANES_MAX`] entries.
+fn rows_ptr_tables(
+    lanes: &[GdnCoreRowsLane<'_>],
+    fields: &[fn(&GdnCoreRowsLane<'_>) -> *mut std::ffi::c_void],
+) -> Vec<[*mut std::ffi::c_void; GDN_CORE_LANES_MAX]> {
+    fields
+        .iter()
+        .map(|field| {
+            let mut table = [std::ptr::null_mut(); GDN_CORE_LANES_MAX];
+            for (slot, lane) in table.iter_mut().zip(lanes) {
+                *slot = field(lane);
+            }
+            table
+        })
+        .collect()
+}
+
+/// Kernargs of `gated_delta_conv_params_bf16_f32_rows_lanes` (`gdn_lanes.hip`):
+/// `kernel, a_log, dt_bias`, `channels, heads, max_rows`, then the by-value
+/// `GdnConvRowsLanes` table: eight pointer arrays (`input, inputs, output,
+/// history, a, b, gate, beta`), the rows and the conv cursors.
+fn rows_conv_kernargs(
+    shared: [*mut std::ffi::c_void; 3],
+    dims: [i32; 3],
+    tables: &[[*mut std::ffi::c_void; GDN_CORE_LANES_MAX]],
+    rows: &[u32; GDN_CORE_LANES_MAX],
+    cursors: &[u32; GDN_CORE_LANES_MAX],
+) -> KernargBlob {
+    debug_assert_eq!(tables.len(), 8);
+    let mut args = KernargBlob::new();
+    for ptr in shared {
+        args.push_ptr(ptr);
+    }
+    for v in dims {
+        args.push_i32(v);
+    }
+    for table in tables {
+        for &ptr in table {
+            args.push_ptr(ptr);
+        }
+    }
+    for &v in rows.iter().chain(cursors) {
+        args.push_u32(v);
+    }
+    args.pad_to(16);
+    args
+}
+
+/// Kernargs of `gated_delta_step_halves_state128_persistent256_capture_q8_lanes`:
+/// `qkv_width, key_heads, value_heads, key_dim, value_dim, query_scale`, then
+/// the by-value `GdnStepRowsLanes` table: six pointer arrays (`projection, gate,
+/// beta, state, output, ring`), the rows and the Q8 frames.
+fn rows_step_kernargs(
+    dims: [i32; 5],
+    query_scale: f32,
+    tables: &[[*mut std::ffi::c_void; GDN_CORE_LANES_MAX]],
+    rows: &[u32; GDN_CORE_LANES_MAX],
+    frames: &[u32; GDN_CORE_LANES_MAX],
+) -> KernargBlob {
+    debug_assert_eq!(tables.len(), 6);
+    let mut args = KernargBlob::new();
+    for v in dims {
+        args.push_i32(v);
+    }
+    args.push_f32(query_scale);
+    for table in tables {
+        for &ptr in table {
+            args.push_ptr(ptr);
+        }
+    }
+    for &v in rows.iter().chain(frames) {
+        args.push_u32(v);
+    }
+    args.pad_to(16);
+    args
+}
+
+/// Admission of the per-lane verify chains of 2..=[`GDN_CORE_LANES_MAX`] lanes
+/// with 2..=[`GDN_CORE_LANE_ROWS`] rows each as three launches (see
+/// [`GdnCoreRowsPlan::launch`]), under `HIPFIRE_QWEN4_GDN_LANES_ROWS`
+/// ([`crate::feature_flags::FeatureFlags::qwen4_gdn_lanes_rows_enabled`]: exact
+/// gfx1201, opt-in, killed by `HIPFIRE_QWEN4_GDN_LANES=0`). Lanes hold Q8 slots on the exact-gfx1201
+/// 128x128 route with their capture ring armed (`step.row_states`: the
+/// token-exact capture recurrence; the unarmed route requantizes once and is
+/// not this kernel; every lane has 2..=[`GDN_CORE_LANE_ROWS`] rows, so a set
+/// that holds a one-row lane is never admitted: one-row AR lanes take
+/// [`gated_delta_core_lanes`]) and share the weights and shapes. Every
+/// refusal happens
+/// here, before anything launches: `Ok(None)` means run the lanes one by one;
+/// a malformed lane is an `Err`, as in the singleton launchers. Never while a
+/// replay tape records (per-lane cursors and frames are not declared).
+pub fn gated_delta_core_lanes_rows<'a, 'l>(
+    gpu: &Gpu,
+    lanes: &'a [GdnCoreRowsLane<'l>],
+    heads: usize,
+) -> HipResult<Option<GdnCoreRowsPlan<'a, 'l>>> {
+    let Some(first) = lanes.first() else {
+        return Ok(None);
+    };
+    if lanes.len() < 2
+        || lanes.len() > GDN_CORE_LANES_MAX
+        || gpu.replay.is_recording()
+        || !gpu.flags.qwen4_gdn_lanes_rows_enabled()
+        || !gpu.arch_caps.has_gfx11_plus_simt()
+    {
+        return Ok(None);
+    }
+    let (c0, p0, s0, g0) = (&first.conv, &first.params, &first.step, &first.gate);
+    for lane in lanes {
+        let (c, p, s, g) = (&lane.conv, &lane.params, &lane.step, &lane.gate);
+        validate_gated_delta_conv_rows(c)?;
+        validate_gated_delta_params_batched(p)?;
+        validate_gated_delta_step_batched(s)?;
+        validate_gated_delta_gate_batched(g)?;
+        ensure_f32(lane.projection)?;
+        // The position seeds a u32 Q8 frame (checked like the singleton).
+        checked_u32(s.position + s.rows - 1, "GDN lane Q8 frame")?;
+        let fits = s.format == GdnStateFormat::Q8
+            && s.residual.is_none()
+            && s.row_states.is_some()
+            && (2..=GDN_CORE_LANE_ROWS).contains(&s.rows)
+            && c.rows == s.rows
+            && p.rows == s.rows
+            && g.rows == s.rows
+            && p.heads == heads
+            && s.value_heads == heads
+            && g.value_heads == heads
+            && c.channels == s.qkv_width
+            && lane.projection.numel() == c.input.numel()
+            && c.next_history.buf.as_ptr() == c.history.buf.as_ptr()
+            && s.projection.buf.as_ptr() == c.output.buf.as_ptr()
+            && s.gate.buf.as_ptr() == p.gate.buf.as_ptr()
+            && s.beta.buf.as_ptr() == p.beta.buf.as_ptr()
+            && g.recurrent_output.buf.as_ptr() == s.output.buf.as_ptr()
+            && (
+                s.key_heads,
+                s.value_heads,
+                s.key_dim,
+                s.value_dim,
+                s.qkv_width,
+            ) == (
+                s0.key_heads,
+                s0.value_heads,
+                s0.key_dim,
+                s0.value_dim,
+                s0.qkv_width,
+            )
+            && c.kernel.buf.as_ptr() == c0.kernel.buf.as_ptr()
+            && p.a_log.buf.as_ptr() == p0.a_log.buf.as_ptr()
+            && p.dt_bias.buf.as_ptr() == p0.dt_bias.buf.as_ptr()
+            && g.norm.buf.as_ptr() == g0.norm.buf.as_ptr();
+        if !fits {
+            return Ok(None);
+        }
+    }
+    if !gdn_rows_ranges_disjoint(lanes) {
+        return Ok(None);
+    }
+    Ok(Some(GdnCoreRowsPlan { lanes, heads }))
+}
+
+impl GdnCoreRowsPlan<'_, '_> {
+    /// The admitted lanes as three launches (convolution + gate parameters +
+    /// the fused capture copy, the capture recurrence, the gated norm over all
+    /// rows): each lane's blocks run the per-lane chain's device bodies on its
+    /// own rows, Q8 frame and ring, so every output, capture and state byte
+    /// equals the per-lane calls'.
+    pub fn launch(self, gpu: &mut Gpu) -> HipResult<()> {
+        let Self { lanes, heads } = self;
+        let first = &lanes[0];
+        let (c0, p0, s0, g0) = (&first.conv, &first.params, &first.step, &first.gate);
+        let n = lanes.len();
+
+        let max_rows = lanes.iter().map(|l| l.step.rows).max().unwrap_or(0);
+        let conv_blocks = blocks(c0.channels)? as usize;
+        let conv_tiles = checked_product(
+            conv_blocks,
+            max_rows.div_ceil(16),
+            "GDN lane rows convolution tile grid",
+        )?;
+        let param_blocks = (max_rows * heads).div_ceil(256);
+        gpu.ensure_kernel_public(
+            "gdn_lanes",
+            GDN_LANES_SRC,
+            "gated_delta_conv_params_bf16_f32_rows_lanes",
+        )?;
+        let mut rows_table = [0u32; GDN_CORE_LANES_MAX];
+        let mut cursor_table = [0u32; GDN_CORE_LANES_MAX];
+        for (i, lane) in lanes.iter().enumerate() {
+            rows_table[i] = lane.conv.rows as u32;
+            cursor_table[i] = lane.conv.start_cursor as u32;
+        }
+        let mut args = rows_conv_kernargs(
+            [
+                c0.kernel.buf.as_ptr(),
+                p0.a_log.buf.as_ptr(),
+                p0.dt_bias.buf.as_ptr(),
+            ],
+            [
+                checked_i32(c0.channels, "GDN lane rows channels")?,
+                checked_i32(heads, "GDN lane rows heads")?,
+                checked_i32(max_rows, "GDN lane rows max rows")?,
+            ],
+            &rows_ptr_tables(
+                lanes,
+                &[
+                    |l| l.projection.buf.as_ptr(),
+                    |l| l.conv.input.buf.as_ptr(),
+                    |l| l.conv.output.buf.as_ptr(),
+                    |l| l.conv.history.buf.as_ptr(),
+                    |l| l.params.a.buf.as_ptr(),
+                    |l| l.params.b.buf.as_ptr(),
+                    |l| l.params.gate.buf.as_ptr(),
+                    |l| l.params.beta.buf.as_ptr(),
+                ],
+            ),
+            &rows_table,
+            &cursor_table,
+        );
+        gpu.launch_blob_recorded(
+            "gated_delta_conv_params_bf16_f32_rows_lanes",
+            [
+                checked_u32(conv_tiles + param_blocks, "GDN lane rows convolution grid")?,
+                n as u32,
+                1,
+            ],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )?;
+
+        gpu.ensure_kernel_public(
+            "gdn_lanes",
+            GDN_LANES_SRC,
+            "gated_delta_step_halves_state128_persistent256_capture_q8_lanes",
+        )?;
+        let mut rows_table = [0u32; GDN_CORE_LANES_MAX];
+        let mut frame_table = [0u32; GDN_CORE_LANES_MAX];
+        for (i, lane) in lanes.iter().enumerate() {
+            rows_table[i] = lane.step.rows as u32;
+            // Admission checked `position + rows - 1` against u32.
+            frame_table[i] = (lane.step.position + lane.step.rows - 1) as u32;
+        }
+        let mut args = rows_step_kernargs(
+            [
+                checked_i32(s0.qkv_width, "GDN lane rows qkv width")?,
+                checked_i32(s0.key_heads, "GDN lane rows key heads")?,
+                checked_i32(s0.value_heads, "GDN lane rows value heads")?,
+                checked_i32(s0.key_dim, "GDN lane rows key width")?,
+                checked_i32(s0.value_dim, "GDN lane rows value width")?,
+            ],
+            (s0.key_dim as f32).sqrt().recip(),
+            &rows_ptr_tables(
+                lanes,
+                &[
+                    |l| l.step.projection.buf.as_ptr(),
+                    |l| l.step.gate.buf.as_ptr(),
+                    |l| l.step.beta.buf.as_ptr(),
+                    |l| l.step.state.buf.as_ptr(),
+                    |l| l.step.output.buf.as_ptr(),
+                    |l| {
+                        l.step
+                            .row_states
+                            .expect("admitted lane has a capture ring")
+                            .buf
+                            .as_ptr()
+                    },
+                ],
+            ),
+            &rows_table,
+            &frame_table,
+        );
+        gpu.launch_blob_recorded(
+            "gated_delta_step_halves_state128_persistent256_capture_q8_lanes",
+            [
+                checked_u32(s0.value_heads, "GDN lane rows value-head grid")?,
+                1,
+                n as u32,
+            ],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )?;
+
+        // The gated norm is row independent: the same head body per lane's
+        // rows; the lanes' scratch need not be adjacent (AR lanes of the same
+        // step sit between verify lanes in the packed rows).
+        gpu.ensure_kernel_public(
+            "gdn_lanes",
+            GDN_LANES_SRC,
+            "gated_delta_gate_bf16_f32_rows_lanes",
+        )?;
+        let mut gate_rows = [0u32; GDN_CORE_LANES_MAX];
+        for (slot, lane) in gate_rows.iter_mut().zip(lanes) {
+            *slot = lane.gate.rows as u32;
+        }
+        let mut args = rows_gate_kernargs(
+            g0.norm.buf.as_ptr(),
+            checked_i32(g0.value_heads, "GDN lane rows gate heads")?,
+            &rows_ptr_tables(
+                lanes,
+                &[
+                    |l| l.gate.recurrent_output.buf.as_ptr(),
+                    |l| l.gate.z.buf.as_ptr(),
+                    |l| l.gate.output.buf.as_ptr(),
+                ],
+            ),
+            &gate_rows,
+        );
+        gpu.launch_blob_recorded(
+            "gated_delta_gate_bf16_f32_rows_lanes",
+            [
+                checked_u32(max_rows * g0.value_heads, "GDN lane rows gate grid")?,
+                n as u32,
+                1,
+            ],
+            [32, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )
     }
 }
 
@@ -6463,6 +7637,24 @@ fn indexed_attention_select_rows8_core(
         (group, s.scores, s.cand, s.ctl)
     } else {
         let group = score_group.min(p.rows);
+        if gpu.flags.qwen4_qsa_scores_reserve_enabled() && p.shape_blocks > stride {
+            // The block count grows by one every compress-ratio tokens: an exact-size
+            // request regrows the shared scratch (device sync + free + malloc, and the
+            // captured-state invalidation) every few decode steps (served EP2 MTP:
+            // ~0.6 per rank per step). Reserve the call's shape bound once; the scores
+            // below keep their exact view.
+            let bound = p.shape_blocks;
+            let bound_group = (QSA_SELECT_SCORE_SCRATCH_BYTES / (bound * 4) / 16 * 16)
+                .max(16)
+                .min(p.rows);
+            if let Some(elems) = bound_group
+                .checked_mul(bound)
+                .and_then(|n| n.checked_mul(2))
+                .filter(|&elems| elems > group * stride * 2)
+            {
+                gpu.qwen4_f16_x_scratch(elems)?;
+            }
+        }
         let scores = gpu.qwen4_f16_x_scratch(group * stride * 2)?.buf.as_ptr();
         (group, scores, std::ptr::null_mut(), std::ptr::null_mut())
     };
@@ -6663,8 +7855,9 @@ fn indexed_attention_select_rows8_core(
 /// [`Gpu::qsa_select_scores`] slot, from [`QSA_BF16_SPLIT_MIN_BLOCKS`] pooled
 /// blocks. Selected indices and the mirror are byte-identical to the fused
 /// `indexed_attention_select_bf16_batched` incumbent. Default on, and only on
-/// exact gfx1201 ([`qsa_bf16_split_arch`]; the other architectures keep the
-/// incumbent whatever the switch says); `0` is the kill switch and always
+/// exact gfx1201 and exact gfx1100 ([`qsa_bf16_split_arch`]; gfx1100 has the
+/// kill switch `HIPFIRE_QWEN4_QSA_SPLIT_GFX1100=0`; the other architectures
+/// keep the incumbent whatever the switch says); `0` is the kill switch and always
 /// keeps the incumbent, as does `HIPFIRE_QWEN4_QSA_FILTER_SELECT=0` (the
 /// select-from-scores arm never beats the filter on gfx1201). Read once.
 static QWEN4_QSA_BF16_SPLIT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -6678,7 +7871,14 @@ static QWEN4_QSA_BF16_SPLIT: std::sync::LazyLock<bool> = std::sync::LazyLock::ne
 /// 1024 blocks at 1 and 8 rows and from 2048 blocks at 16 rows (1 / 8 / 16 rows
 /// at 2048 blocks: fused 64.6 / 64.3 / 67.6 us, filter 40.1 / 43.6 / 65.8 us;
 /// at 65536 blocks fused 552 / 546 / 545 us, filter 313 / 263 / 211 us), and
-/// from 1024 blocks at 64 and 256 rows.
+/// from 1024 blocks at 64 and 256 rows. Re-measured on gfx1100 (7900 XTX,
+/// `qsa_bf16_split_crossover_table`, one launch per call, us per call fused vs
+/// filter for 1 / 8 / 16 rows): at 1024 blocks 48.2 / 57.1 / 57.9 vs 38.3 /
+/// 40.9 / 55.7; at 2048 blocks 61.8 / 61.8 / 64.6 vs 42.1 / 44.5 / 59.3; at
+/// 8192 blocks 106.6 / 106.2 / 106.5 vs 50.6 / 53.5 / 69.7; at 32768 blocks
+/// 326.0 / 330.1 / 345.3 vs 77.5 / 83.8 / 126.2; at 65536 blocks 616.3 / 644.3
+/// / 657.8 vs 112.8 / 119.9 / 199.4, so the 2048 crossover holds on gfx1100
+/// for up to 16 rows.
 const QSA_BF16_SPLIT_MIN_BLOCKS: usize = 2048;
 /// Rows above which a call counts as prefill for the crossover.
 const QSA_BF16_SPLIT_MANY_ROWS: usize = 256;
@@ -6686,6 +7886,7 @@ const QSA_BF16_SPLIT_MANY_ROWS: usize = 256;
 /// is 0.5% (1024 rows) to 7% (2048 rows) behind the fused selector at 2048
 /// blocks and 2.5% to 14% behind at 4096, ahead from 8192 blocks (1024 / 2048
 /// rows at 8192 blocks: fused 1838 / 3452 us, filter 1670 / 3309 us).
+/// Measured on gfx1201 and reused unchanged on gfx1100.
 const QSA_BF16_SPLIT_MIN_BLOCKS_MANY_ROWS: usize = 8192;
 /// Rows per score / select group: with the 64 MiB score budget this bounds the
 /// scratch at a constant ([`reserve_qsa_bf16_split_scratch`] reserves it), so
@@ -6698,12 +7899,40 @@ struct QsaBf16SplitRoute {
     bounded: bool,
 }
 
-/// Exact gfx1201 only: the crossovers were measured there; gfx1151 keeps its
-/// PM routes and every other arch keeps the fused selector.
+/// `HIPFIRE_QWEN4_QSA_SPLIT_GFX1100` (on unless `0`) is the kill switch for
+/// exact gfx1100 (7900 XTX) on the BF16 split route: unset/1 admits it under
+/// exactly the gfx1201 conditions and crossovers (measured on gfx1100, see
+/// [`QSA_BF16_SPLIT_MIN_BLOCKS`]); `0` restores the fused selector there.
+/// Byte identity on gfx1100 is proven by the route tests (knob on/off) and the
+/// exhaustive score gate (255 / 257 / 2048 / 8192 / 32768 / 65536 blocks,
+/// 27,648 launches bit-exact over 4.3e9 cells). Read once.
+static QWEN4_QSA_SPLIT_GFX1100: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SPLIT_GFX1100", true)
+});
+
+/// Pure admission predicate behind [`qsa_bf16_split_arch`].
+fn qsa_bf16_split_arch_admits(
+    is_gfx1201: bool,
+    is_gfx1100: bool,
+    gfx1100_knob: bool,
+    parallel_qsa_gdn: bool,
+    forced_serial: bool,
+) -> bool {
+    (is_gfx1201 || (is_gfx1100 && gfx1100_knob)) && parallel_qsa_gdn && !forced_serial
+}
+
+/// Exact gfx1201, or exact gfx1100 unless
+/// `HIPFIRE_QWEN4_QSA_SPLIT_GFX1100=0`; gfx1151 keeps its PM routes and every
+/// other arch keeps the fused selector. The route, the scratch reserve and the
+/// expert-residency census all call this one fn, so they agree in a process.
 fn qsa_bf16_split_arch(gpu: &Gpu) -> bool {
-    gpu.arch_caps.is_gfx1201()
-        && gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
-        && !select_forced_serial()
+    qsa_bf16_split_arch_admits(
+        gpu.arch_caps.is_gfx1201(),
+        gpu.arch_caps.is_gfx1100(),
+        *QWEN4_QSA_SPLIT_GFX1100,
+        gpu.arch_caps.has_qwen4_parallel_qsa_gdn(),
+        select_forced_serial(),
+    )
 }
 
 /// Geometry the BF16 score kernels cover: four heads, `index_dim % 4 == 0`
@@ -8470,7 +9699,7 @@ fn qsa_copy_region_extent_post(
     );
 }
 
-fn launch_copy_regions(gpu: &mut Gpu, table: &[(u64, u64, u32)]) -> HipResult<()> {
+pub(crate) fn launch_copy_regions(gpu: &mut Gpu, table: &[(u64, u64, u32)]) -> HipResult<()> {
     const NAME: &str = "copy_regions_u32";
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, NAME)?;
     let mut args = KernargBlob::new();
@@ -8874,6 +10103,55 @@ const QSA_ATTENTION_HG12_MIN_ROWS: usize = 16;
 /// (4 rows, 232 context: 55 -> 27 us per layer).
 const QSA_ATTENTION_HG4_MIN_ROWS: usize = 2;
 
+/// Whether the grouped prefill attention runs its low-LDS twin
+/// (`indexed_attention_attention_q8_batched_hg4_lite`): q8 K/V on exact gfx1100
+/// with `HIPFIRE_QWEN4_QSA_HG4_Q8_LITE` not `0`. The kernel symbol and the
+/// dynamic-LDS size both follow from this one decision.
+fn qsa_attention_hg4_lite(flags: &crate::feature_flags::FeatureFlags, format: QsaKvFormat) -> bool {
+    format == QsaKvFormat::Q8 && flags.qwen4_qsa_hg4_q8_lite_enabled()
+}
+
+/// Which GQA-group-specialised batch attention routes a (`n_heads`, `n_kv_heads`) shape
+/// admits (query heads per KV head = `group`; head_dim / format / arch / row terms are the
+/// callers'): the grouped hg12 kernel needs exactly 12 heads per KV head, the grouped hg4
+/// and the dense WMMA route whole four-head sub-groups, the gathered WMMA route up to 16.
+/// Any other group (a trunk shard's 12 q heads over 2 KV heads = group 6) takes the
+/// per-head kernels, or the gathered route, which carries the group at run time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QsaGroupAdmits {
+    hg12: bool,
+    hg4: bool,
+    dense: bool,
+    gathered: bool,
+}
+
+fn qsa_group_admits(n_heads: usize, n_kv_heads: usize) -> QsaGroupAdmits {
+    let group = n_heads / n_kv_heads;
+    QsaGroupAdmits {
+        hg12: n_heads == n_kv_heads * QSA_ATTENTION_HG12_HEADS,
+        hg4: group % QSA_ATTENTION_HG4_HEADS == 0,
+        dense: group % 4 == 0,
+        gathered: group <= 16,
+    }
+}
+
+/// Dynamic LDS bytes of the grouped kernel for `shape_selected` selected rows.
+/// Shipped kernels: weights[sel][4] + tokens[sel] + partial maxes[4][256] +
+/// maxes[4]. The lite twin recomputes the validated token and reduces the
+/// maxes with wave shuffles: weights[sel][4] + 8 waves x 4 partial maxes
+/// (reused for the four denominators) = `selected * 16 + 128`.
+fn qsa_attention_hg4_lds_bytes_for(shape_selected: usize, lite: bool) -> Option<usize> {
+    let (per_row, fixed) = if lite {
+        (4 * QSA_ATTENTION_HG4_HEADS, 4 * 8 * QSA_ATTENTION_HG4_HEADS)
+    } else {
+        (
+            4 * QSA_ATTENTION_HG4_HEADS + 4,
+            4 * (QSA_ATTENTION_HG4_HEADS * 256 + QSA_ATTENTION_HG4_HEADS),
+        )
+    };
+    shape_selected.checked_mul(per_row)?.checked_add(fixed)
+}
+
 /// Dynamic LDS for the grouped kernel, or `None` when the shape is not the one
 /// it is specialised for (gfx11+ ISA, head_dim 256, four heads per KV group,
 /// prefill-sized row counts).
@@ -8882,18 +10160,17 @@ fn qsa_attention_hg4_lds_bytes(
     p: &IndexedAttentionAttentionBatch<'_>,
     shape_selected: usize,
 ) -> Option<u32> {
-    let group = p.n_heads / p.n_kv_heads;
     if !gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
         || p.head_dim != 256
-        || group % QSA_ATTENTION_HG4_HEADS != 0
+        || !qsa_group_admits(p.n_heads, p.n_kv_heads).hg4
         || gpu.route_rows(p.rows) < QSA_ATTENTION_HG4_MIN_ROWS
     {
         return None;
     }
-    // weights[sel][4] + tokens[sel] + partial maxes[4][256] + maxes[4].
-    let bytes = shape_selected
-        .checked_mul(4 * QSA_ATTENTION_HG4_HEADS + 4)?
-        .checked_add(4 * (QSA_ATTENTION_HG4_HEADS * 256 + QSA_ATTENTION_HG4_HEADS))?;
+    let bytes = qsa_attention_hg4_lds_bytes_for(
+        shape_selected,
+        qsa_attention_hg4_lite(&gpu.flags, p.format),
+    )?;
     (bytes <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES).then_some(bytes as u32)
 }
 
@@ -9140,7 +10417,7 @@ fn indexed_attention_attention_batch_launch(
         && p.format == QsaKvFormat::F32
         && gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
         && p.head_dim == 256
-        && p.n_heads == p.n_kv_heads * QSA_ATTENTION_HG12_HEADS
+        && qsa_group_admits(p.n_heads, p.n_kv_heads).hg12
         && gpu.route_rows(p.rows) >= QSA_ATTENTION_HG12_MIN_ROWS
         && shape_selected <= QSA_ATTENTION_HG12_MAX_SELECTED;
     let hg4_bytes = (allow_fast && !decode && !hg12)
@@ -9158,12 +10435,16 @@ fn indexed_attention_attention_batch_launch(
         )
     } else if let Some(bytes) = hg4_bytes {
         (
-            p.format.kernel([
-                "indexed_attention_attention_f32_batched_hg4",
-                "indexed_attention_attention_fp8_batched_hg4",
-                "indexed_attention_attention_q8_batched_hg4",
-                "indexed_attention_attention_fp8_fnuz_batched_hg4",
-            ]),
+            if qsa_attention_hg4_lite(&gpu.flags, p.format) {
+                "indexed_attention_attention_q8_batched_hg4_lite"
+            } else {
+                p.format.kernel([
+                    "indexed_attention_attention_f32_batched_hg4",
+                    "indexed_attention_attention_fp8_batched_hg4",
+                    "indexed_attention_attention_q8_batched_hg4",
+                    "indexed_attention_attention_fp8_fnuz_batched_hg4",
+                ])
+            },
             [
                 checked_u32(
                     p.n_heads / QSA_ATTENTION_HG4_HEADS,
@@ -10282,7 +11563,7 @@ fn qsa_dense_wmma_applies(
         && !gpu.graphs.capture_mode
         && p.head_dim == 256
         && p.format == QsaKvFormat::F32
-        && (p.n_heads / p.n_kv_heads) % 4 == 0
+        && qsa_group_admits(p.n_heads, p.n_kv_heads).dense
         && end_position / p.compress <= p.budget_blocks
         && end_position <= p.capacity
 }
@@ -10560,7 +11841,7 @@ fn qsa_gathered_wmma_applies(gpu: &Gpu, p: &IndexedAttentionAttentionBatch<'_>) 
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
         && p.head_dim == 256
-        && p.n_heads / p.n_kv_heads <= 16
+        && qsa_group_admits(p.n_heads, p.n_kv_heads).gathered
         && p.capacity.div_ceil(128) * 128 * 4 + QSA_GATHERED_STATIC_LDS_BYTES
             <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
 }
@@ -11226,9 +12507,103 @@ pub fn argmax_f32(gpu: &mut Gpu, p: &ArgmaxF32<'_>) -> HipResult<()> {
     )
 }
 
+/// Merge of two vocabulary-shard argmaxes into the full-row [`argmax_f32`] answer
+/// (`argmax_f32_pair_merge`): shard 0 is this rank's packed `[rows][w0]` logits
+/// (global ids `[0, w0)`), shard 1 the peer's packed `[rows][w1]` logits (global ids
+/// `[w0, w0 + w1)`), read through its device address (UVA peer pointer).
+pub struct ArgmaxPairMerge<'a> {
+    /// `[rows][w0]` f32 (a larger buffer is fine: the first `rows * w0` floats).
+    pub local_logits: &'a GpuTensor,
+    /// Raw, `rows` i32 local ids: [`argmax_f32`] over the packed shard (`vocab = w0`).
+    pub local_top1: &'a GpuTensor,
+    /// Device address of the peer's `[rows][w1]` f32 logits.
+    pub peer_logits: u64,
+    /// Device address of the peer's `rows` i32 local ids.
+    pub peer_top1: u64,
+    /// Raw, `rows` i32 global ids; may alias `local_top1`.
+    pub out_top1: &'a GpuTensor,
+    pub rows: usize,
+    pub w0: usize,
+    pub w1: usize,
+}
+
+impl Gpu {
+    /// Per row: the first index of the largest finite value over shard 0 ++ shard 1
+    /// (shard 0 wins ties, `+0 == -0` included), `0` when neither shard has a finite
+    /// value. One thread per row; the peer pointers must be mapped on this device.
+    pub fn argmax_f32_pair_merge(&mut self, p: &ArgmaxPairMerge<'_>) -> HipResult<()> {
+        ensure_f32(p.local_logits)?;
+        if p.rows == 0
+            || p.w0 == 0
+            || p.w1 == 0
+            || p.peer_logits == 0
+            || p.peer_top1 == 0
+            || p.local_top1.dtype != DType::Raw
+            || p.out_top1.dtype != DType::Raw
+        {
+            return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+        }
+        let local_elements = checked_product(p.rows, p.w0, "argmax pair-merge local extent")?;
+        checked_product(p.rows, p.w1, "argmax pair-merge peer extent")?;
+        checked_i32(
+            p.w0.checked_add(p.w1)
+                .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?,
+            "argmax pair-merge global vocabulary",
+        )?;
+        let top1_bytes = p
+            .rows
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
+        let rows = checked_i32(p.rows, "argmax pair-merge row count")?;
+        let w0 = checked_i32(p.w0, "argmax pair-merge local width")?;
+        let w1 = checked_i32(p.w1, "argmax pair-merge peer width")?;
+        let grid = checked_u32(p.rows.div_ceil(256), "argmax pair-merge row grid")?;
+        if p.local_logits.numel() < local_elements
+            || p.local_top1.numel() < top1_bytes
+            || p.out_top1.numel() < top1_bytes
+        {
+            return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+        }
+        self.ensure_kernel(
+            "argmax_pair_merge",
+            crate::kernels::ARGMAX_PAIR_MERGE_SRC,
+            "argmax_f32_pair_merge",
+        )?;
+        let mut args = KernargBlob::new();
+        args.push_ptr(p.local_logits.buf.as_ptr());
+        args.push_ptr(p.local_top1.buf.as_ptr());
+        args.push_ptr(p.peer_logits as *mut std::ffi::c_void);
+        args.push_ptr(p.peer_top1 as *mut std::ffi::c_void);
+        args.push_ptr(p.out_top1.buf.as_ptr());
+        args.push_i32(rows);
+        args.push_i32(w0);
+        args.push_i32(w1);
+        args.pad_to(16);
+        self.launch_blob_recorded(
+            "argmax_f32_pair_merge",
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )
+    }
+}
+
 /// [`argmax_f32`] of one logits row, read back: `llama::argmax(logits)`
 /// without downloading the row. Uses a lazily allocated 4-byte scratch.
 pub fn argmax_f32_host(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {
+    argmax_f32_host_impl(gpu, logits, false)
+}
+
+/// [`argmax_f32_host`] for a decode loop that replays a graph on
+/// `Gpu::active_stream`: the 4-byte result is read back ordered on that stream
+/// ([`Gpu::download_f32_stream_ordered`]) instead of a blocking null-stream copy.
+pub fn argmax_f32_host_stream_ordered(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {
+    argmax_f32_host_impl(gpu, logits, true)
+}
+
+fn argmax_f32_host_impl(gpu: &mut Gpu, logits: &GpuTensor, ordered: bool) -> HipResult<u32> {
     if gpu.scratch.argmax_host.is_none() {
         gpu.scratch.argmax_host = Some(gpu.alloc_tensor(&[1], DType::F32)?);
     }
@@ -11245,12 +12620,91 @@ pub fn argmax_f32_host(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {
             vocab: logits.numel(),
         },
     )?;
-    Ok(gpu.download_f32(&result)?[0].to_bits())
+    let row = if ordered {
+        gpu.download_f32_stream_ordered(&result)?
+    } else {
+        gpu.download_f32(&result)?
+    };
+    Ok(row[0].to_bits())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qsa_bf16_split_arch_predicate_is_gfx1201_or_gfx1100_unless_killed() {
+        let f = qsa_bf16_split_arch_admits;
+        // gfx1201: admitted whatever the gfx1100 knob says.
+        assert!(f(true, false, false, true, false));
+        assert!(f(true, false, true, true, false));
+        // gfx1100: admitted with the knob (default), not with the kill switch.
+        assert!(f(false, true, true, true, false));
+        assert!(!f(false, true, false, true, false));
+        // other arch: never.
+        assert!(!f(false, false, true, true, false));
+        assert!(!f(false, false, false, true, false));
+        // conjunction terms still gate both archs.
+        for (a, b) in [(true, false), (false, true)] {
+            assert!(!f(a, b, true, false, false));
+            assert!(!f(a, b, true, true, true));
+        }
+    }
+
+    /// The grouped attention's dynamic LDS: 20 bytes per selected row for the
+    /// shipped kernels (weights[4] + token) plus a 4112-byte maxes/partial-max
+    /// tail; the q8 lite twin keeps no token array and reduces maxes with wave
+    /// shuffles: 16 bytes per selected row plus 128 bytes. The measured
+    /// prefill shape (2051 selected rows) is 45132 / 32944 bytes.
+    #[test]
+    fn qsa_attention_hg4_lds_formula_drops_the_token_array_for_the_lite_twin() {
+        assert_eq!(qsa_attention_hg4_lds_bytes_for(2051, false), Some(45132));
+        assert_eq!(qsa_attention_hg4_lds_bytes_for(2051, true), Some(32944));
+        assert_eq!(qsa_attention_hg4_lds_bytes_for(0, false), Some(4112));
+        assert_eq!(qsa_attention_hg4_lds_bytes_for(0, true), Some(128));
+        assert_eq!(qsa_attention_hg4_lds_bytes_for(usize::MAX, true), None);
+        // Three lite workgroups fit a 128 KiB WGP at the measured shape; two
+        // shipped ones do, a third does not. Four lite ones do not (the
+        // weights alone are 32816 bytes at 2051 rows).
+        assert!(3 * 32944 <= 128 * 1024 && 4 * 32944 > 128 * 1024 && 3 * 45132 > 128 * 1024);
+        // The largest selected capacity under the 64 KiB dynamic limit.
+        let limit = QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES;
+        assert!(qsa_attention_hg4_lds_bytes_for(3071, false).unwrap() <= limit);
+        assert!(qsa_attention_hg4_lds_bytes_for(3072, false).unwrap() > limit);
+        assert!(qsa_attention_hg4_lds_bytes_for(4088, true).unwrap() <= limit);
+        assert!(qsa_attention_hg4_lds_bytes_for(4089, true).unwrap() > limit);
+    }
+
+    /// The lite twin serves q8 K/V on exact gfx1100 unless
+    /// `HIPFIRE_QWEN4_QSA_HG4_Q8_LITE=0`; every other format and architecture
+    /// keeps the shipped kernel (and its LDS size).
+    #[test]
+    fn qsa_attention_hg4_lite_is_q8_exact_gfx1100_with_a_kill_switch() {
+        let flags = |arch: &str, switch: bool| {
+            let mut flags = crate::feature_flags::FeatureFlags::for_test(arch);
+            flags.qwen4_qsa_hg4_q8_lite = switch;
+            flags
+        };
+        for format in [
+            QsaKvFormat::F32,
+            QsaKvFormat::Fp8,
+            QsaKvFormat::Q8,
+            QsaKvFormat::Fp8Fnuz,
+        ] {
+            for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1201", "gfx942"] {
+                let expect = format == QsaKvFormat::Q8 && arch == "gfx1100";
+                assert_eq!(
+                    qsa_attention_hg4_lite(&flags(arch, true), format),
+                    expect,
+                    "{arch} {format:?}"
+                );
+                assert!(
+                    !qsa_attention_hg4_lite(&flags(arch, false), format),
+                    "{arch} {format:?}: kill switch"
+                );
+            }
+        }
+    }
 
     /// The decode attention policy over the flags and architecture alone:
     /// F32 K/V keeps split-K (exact gfx1151), q8 K/V at 24 query heads over 2
@@ -11388,6 +12842,211 @@ mod tests {
             ),
             per_head
         );
+    }
+
+    /// Trunk shard (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`): a rank runs 12 q heads over the SAME 2
+    /// KV heads (GQA group 6). Every group-specialised route must refuse that shape (it
+    /// falls back to the per-head kernels, or the gathered WMMA route that reads the group
+    /// at run time) while the production 24 / 2 shape (group 12) keeps its routes.
+    #[test]
+    fn qsa_group_routes_at_the_trunk_shard_shape_fall_back_and_production_is_unchanged() {
+        let production = qsa_group_admits(24, 2);
+        assert_eq!(
+            production,
+            QsaGroupAdmits {
+                hg12: true,
+                hg4: true,
+                dense: true,
+                gathered: true
+            }
+        );
+        let shard = qsa_group_admits(12, 2);
+        assert_eq!(
+            shard,
+            QsaGroupAdmits {
+                hg12: false,
+                hg4: false,
+                dense: false,
+                gathered: true
+            }
+        );
+        // The decode policy: never split-K layout 2 / split-KV q8 at group 6, on any
+        // architecture, format or launch mode.
+        assert!(!qsa_decode_splitk_layout_fits(
+            256,
+            12,
+            2,
+            QSA_DECODE_SPLITK_SCORING_LAYOUT
+        ));
+        assert!(qsa_decode_splitk_layout_fits(
+            256,
+            24,
+            2,
+            QSA_DECODE_SPLITK_SCORING_LAYOUT
+        ));
+        for layout in [0, 1] {
+            assert!(qsa_decode_splitk_layout_fits(256, 12, 2, layout));
+        }
+        assert!(!qsa_decode_splitkv_q8_geometry_fits(
+            QsaKvFormat::Q8,
+            256,
+            12,
+            2
+        ));
+        assert!(qsa_decode_splitkv_q8_geometry_fits(
+            QsaKvFormat::Q8,
+            256,
+            24,
+            2
+        ));
+        for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1201"] {
+            for format in [QsaKvFormat::F32, QsaKvFormat::Q8, QsaKvFormat::Fp8] {
+                for eager in [true, false] {
+                    let mut flags = crate::feature_flags::FeatureFlags::for_test(arch);
+                    flags.qwen4_qsa_decode_splitk = true;
+                    let flags = std::sync::Arc::new(flags);
+                    let caps = crate::arch_caps::ArchCaps::new(arch, flags.clone());
+                    for selected in [1usize, 2051, 8192] {
+                        assert_eq!(
+                            qsa_decode_attention_policy_with(
+                                &flags, &caps, format, 256, 12, 2, selected, eager
+                            ),
+                            QsaDecodeAttentionPolicy::PerHead,
+                            "{arch} {format:?} eager={eager} selected={selected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The H5 convolution + Q/K-norm kernel hard-codes 16 key heads of 128: its 16 / 48 shape
+    /// (10240 channels) is admitted as before, the TP2 trunk shard's rank-local 8 / 24 shape
+    /// (5120 channels, still >= 4096 and a multiple of 256) is refused so it runs the plain
+    /// convolution + separate Q/K-norm launches.
+    #[test]
+    fn conv_qknorm_shape_pins_sixteen_key_heads_and_the_shard_shape_declines() {
+        // (key heads, key dim, step qkv width, step rows, conv channels, conv rows, history rows,
+        //  kernel size, BF16 output)
+        assert!(conv_qknorm_shape_admits(
+            16, 128, 10240, 4096, 10240, 4096, 3, 4, true
+        ));
+        assert!(!conv_qknorm_shape_admits(
+            8, 128, 5120, 4096, 5120, 4096, 3, 4, true
+        ));
+        for (channels, key_heads) in [(8192usize, 16usize), (10240, 8), (10240, 32), (4096, 16)] {
+            let admitted = key_heads == 16;
+            assert_eq!(
+                conv_qknorm_shape_admits(key_heads, 128, channels, 64, channels, 64, 3, 4, true),
+                admitted,
+                "{key_heads} key heads, {channels} channels"
+            );
+        }
+        // Every other precondition still gates the 16-head shape.
+        for (qkv, rows_conv, history, kernel, bf16) in [
+            (10112usize, 4096usize, 3usize, 4usize, true),
+            (10240, 4095, 3, 4, true),
+            (10240, 4096, 2, 4, true),
+            (10240, 4096, 3, 5, true),
+            (10240, 4096, 3, 4, false),
+        ] {
+            assert!(
+                !conv_qknorm_shape_admits(
+                    16, 128, qkv, 4096, 10240, rows_conv, history, kernel, bf16
+                ),
+                "{qkv} {rows_conv} {history} {kernel} {bf16}"
+            );
+        }
+    }
+
+    /// The GDN recurrent state follows the value-head count: the rank-local 24-head slot of every
+    /// format (F32, Q8, Q8Ef plus its live F16 residual) is exactly half the 48-head one, and the
+    /// strict state descriptor check accepts the 24-head tensors and refuses them as 48-head.
+    #[test]
+    fn gdn_state_slots_halve_for_the_shard_and_the_descriptor_check_follows_the_head_count() {
+        for (format, bytes48, residual48) in [
+            (GdnStateFormat::F32, 48 * 128 * 128 * 4, 0),
+            (GdnStateFormat::Q8, 48 * 128 * (128 + 4), 0),
+            (
+                GdnStateFormat::Q8Ef,
+                48 * 128 * (128 + 4),
+                48 * 128 * 128 * 2,
+            ),
+        ] {
+            assert_eq!(format.state_bytes(48, 128, 128), bytes48, "{format:?}");
+            assert_eq!(format.state_bytes(24, 128, 128) * 2, bytes48, "{format:?}");
+            assert_eq!(
+                format.residual_bytes(48, 128, 128),
+                residual48,
+                "{format:?}"
+            );
+            assert_eq!(
+                format.residual_bytes(24, 128, 128) * 2,
+                residual48,
+                "{format:?}"
+            );
+        }
+        assert_eq!(GdnStateFormat::Q8.state_bytes(48, 128, 128), 811_008);
+        assert_eq!(GdnStateFormat::Q8.state_bytes(24, 128, 128), 405_504);
+        let tensor = |storage: &mut Vec<u8>, numel: usize, dtype: DType| GpuTensor {
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(storage.as_mut_ptr().cast(), storage.len())
+            },
+            shape: vec![numel],
+            dtype,
+        };
+        let slot_bytes = GdnStateFormat::Q8.state_bytes(24, 128, 128);
+        let ring_bytes = 8 * slot_bytes;
+        let mut slot = vec![0u8; slot_bytes];
+        let mut residual = vec![0u8; GdnStateFormat::Q8Ef.residual_bytes(24, 128, 128)];
+        let mut ring = vec![0u8; ring_bytes];
+        let state = tensor(&mut slot, slot_bytes, DType::Raw);
+        let ef = tensor(&mut residual, 24 * 128 * 128, DType::F16);
+        let row_states = tensor(&mut ring, ring_bytes, DType::Raw);
+        // 24 value heads: Q8 and Q8Ef (with and without the verify ring) are admitted ...
+        assert!(
+            validate_gdn_state(GdnStateFormat::Q8, &state, None, None, 1, 24, 128, 128).is_ok()
+        );
+        assert!(validate_gdn_state(
+            GdnStateFormat::Q8Ef,
+            &state,
+            Some(&ef),
+            Some(&row_states),
+            8,
+            24,
+            128,
+            128
+        )
+        .is_ok());
+        // ... a ring too short for the rows asked, or a 48-head claim over 24-head tensors, is not.
+        assert!(validate_gdn_state(
+            GdnStateFormat::Q8,
+            &state,
+            None,
+            Some(&row_states),
+            9,
+            24,
+            128,
+            128
+        )
+        .is_err());
+        assert!(
+            validate_gdn_state(GdnStateFormat::Q8, &state, None, None, 1, 48, 128, 128).is_err()
+        );
+        assert!(validate_gdn_state(
+            GdnStateFormat::Q8Ef,
+            &state,
+            Some(&ef),
+            None,
+            1,
+            48,
+            128,
+            128
+        )
+        .is_err());
+        // The fused step + gated norm's optional head-pair rotation counts value_heads / 2 pairs
+        // against the 256 arrival counters: 12 for the shard, 24 for Flash-Next.
+        assert!(24 / 2 <= GDN_PAIR_COUNTERS && 48 / 2 <= GDN_PAIR_COUNTERS);
     }
 
     #[test]
@@ -20613,6 +22272,69 @@ mod hc_up_twin_route_tests {
             );
         }
     }
+
+    #[test]
+    fn qwen4_hc_up_twin_gfx1201_route_table() {
+        // (enabled, exact_gfx1201, rows, expected)
+        let cases: [(bool, bool, usize, bool); 9] = [
+            (false, true, 1, false),
+            (false, true, 8, false),
+            (true, false, 1, false),
+            (true, true, 1, true),
+            (true, true, 7, true),
+            (true, true, 8, true),
+            (true, true, 9, false),
+            (true, true, 16, false),
+            (true, true, 529, false),
+        ];
+        for (enabled, exact, rows, want) in cases {
+            assert_eq!(
+                qwen4_hc_up_twin_gfx1201_applies(enabled, exact, rows),
+                want,
+                "enabled={enabled} exact_gfx1201={exact} rows={rows}"
+            );
+        }
+    }
+
+    #[test]
+    fn hyper_read_up_fused_route_table() {
+        use HyperReadUpFusedEntry::{Incumbent, Twin, TwinT1};
+        // (twin_enabled, t1_enabled, exact_gfx1151, exact_gfx1201, rows, expected)
+        let cases: [(bool, bool, bool, bool, usize, HyperReadUpFusedEntry); 20] = [
+            // gfx1201: T1 by default for rows <= 8.
+            (true, true, false, true, 1, TwinT1),
+            (true, true, false, true, 5, TwinT1),
+            (true, true, false, true, 8, TwinT1),
+            (true, true, false, true, 9, Incumbent),
+            (true, true, false, true, 16, Incumbent),
+            (true, true, false, true, 529, Incumbent),
+            // T1 switch off: the sx twin.
+            (true, false, false, true, 1, Twin),
+            (true, false, false, true, 8, Twin),
+            (true, false, false, true, 9, Incumbent),
+            // HIPFIRE_QWEN4_HC_UP_TWIN=0 forces the incumbent.
+            (false, true, false, true, 1, Incumbent),
+            (false, true, false, true, 8, Incumbent),
+            (false, false, false, true, 8, Incumbent),
+            // gfx1151: unchanged (sx twin at >= 16 rows, T1 never).
+            (true, true, true, false, 15, Incumbent),
+            (true, true, true, false, 16, Twin),
+            (true, true, true, false, 145, Twin),
+            (true, false, true, false, 145, Twin),
+            (false, true, true, false, 145, Incumbent),
+            (true, true, true, false, 1, Incumbent),
+            // Other architectures: incumbent.
+            (true, true, false, false, 1, Incumbent),
+            (true, true, false, false, 145, Incumbent),
+        ];
+        for (twin, t1, gfx1151, gfx1201, rows, want) in cases {
+            assert_eq!(
+                hyper_read_up_fused_route(twin, t1, gfx1151, gfx1201, rows),
+                want,
+                "twin={twin} t1={t1} gfx1151={gfx1151} gfx1201={gfx1201} rows={rows}"
+            );
+        }
+    }
 }
 
 /// CPU-only tests of the Q8Ef live-layout ABI: format metadata, strict state
@@ -21408,5 +23130,360 @@ mod gdn_q8ef_tests {
         for (count, grid) in [(1usize, 1u32), (256, 1), (257, 2), (48 * 128 * 128, 3072)] {
             assert_eq!(blocks(count).unwrap(), grid, "count {count}");
         }
+    }
+}
+
+#[cfg(test)]
+mod gdn_core_lanes_tests {
+    use super::*;
+
+    #[test]
+    fn lane_buffers_must_be_pairwise_distinct() {
+        assert!(pairwise_distinct(&[]));
+        assert!(pairwise_distinct(&[0x10]));
+        assert!(pairwise_distinct(&[0x10, 0x20, 0x30, 0x40]));
+        assert!(!pairwise_distinct(&[0x10, 0x10]));
+        assert!(!pairwise_distinct(&[0x10, 0x20, 0x30, 0x20]));
+        assert!(!pairwise_distinct(&[
+            0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x10
+        ]));
+    }
+
+    /// A lane whose every argument is the one tensor `t`: enough for the
+    /// refusals that precede any shape or pointer validation.
+    fn lane(t: &GpuTensor) -> GdnCoreLane<'_> {
+        GdnCoreLane {
+            conv: GatedDeltaConv {
+                input: t,
+                kernel: t,
+                history: t,
+                output: t,
+                next_history: t,
+                channels: 1,
+                history_rows: 3,
+                kernel_size: 4,
+                cursor: 0,
+                row_index: 0,
+            },
+            params: GatedDeltaParams {
+                a: t,
+                b: t,
+                a_log: t,
+                dt_bias: t,
+                gate: t,
+                beta: t,
+            },
+            step: GatedDeltaStep {
+                q: t,
+                k: t,
+                v: t,
+                gate: t,
+                beta: t,
+                state: t,
+                format: GdnStateFormat::Q8,
+                residual: None,
+                output: t,
+                key_heads: 16,
+                value_heads: 48,
+                key_dim: 128,
+                value_dim: 128,
+                position: 0,
+            },
+            gate: GatedDeltaGate {
+                recurrent_output: t,
+                z: t,
+                norm: t,
+                output: t,
+                value_heads: 48,
+                value_dim: 128,
+            },
+        }
+    }
+
+    /// The count and flag refusals return `Ok(None)` (run the lanes one by one)
+    /// before anything is validated or launched. Needs a GPU for the tensor
+    /// handles only; skipped without one.
+    #[test]
+    fn admission_refuses_bad_counts_and_a_killed_flag() {
+        let Some(mut gpu) = crate::gpu_test::init().ok() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let t = gpu.zeros(&[16], DType::F32).expect("tensor");
+        let lanes: Vec<GdnCoreLane<'_>> = (0..GDN_CORE_LANES_MAX + 1).map(|_| lane(&t)).collect();
+        std::sync::Arc::make_mut(&mut gpu.flags).qwen4_gdn_lanes = true;
+        assert!(gated_delta_core_lanes(&gpu, &[], 48).unwrap().is_none());
+        assert!(gated_delta_core_lanes(&gpu, &lanes[..1], 48)
+            .unwrap()
+            .is_none());
+        assert!(gated_delta_core_lanes(&gpu, &lanes, 48).unwrap().is_none());
+        std::sync::Arc::make_mut(&mut gpu.flags).qwen4_gdn_lanes = false;
+        assert!(gated_delta_core_lanes(&gpu, &lanes[..2], 48)
+            .unwrap()
+            .is_none());
+        drop(lanes);
+        gpu.free_tensor(t).expect("free");
+    }
+
+    /// Writes `[w0..w1)`-style ranges of one lane: eight written, five read.
+    fn lane_ranges(base: usize) -> ([(usize, usize); 8], [(usize, usize); 5]) {
+        let range = |i: usize| (base + i * 0x100, base + i * 0x100 + 0x80);
+        (
+            [
+                range(0),
+                range(1),
+                range(2),
+                range(3),
+                range(4),
+                range(5),
+                range(6),
+                range(7),
+            ],
+            [range(8), range(9), range(10), range(11), range(12)],
+        )
+    }
+
+    #[test]
+    fn rows_lane_ranges_must_be_disjoint_across_writes_and_other_lanes_reads() {
+        let (a, b) = (lane_ranges(0x10_0000), lane_ranges(0x20_0000));
+        assert!(gdn_rows_ranges_clear(&[a, b]));
+        // A duplicated written range (state, ring, history, output).
+        let mut dup = b;
+        dup.0[5] = a.0[5];
+        assert!(!gdn_rows_ranges_clear(&[a, dup]));
+        // A partial overlap of two written ranges.
+        let mut partial = b;
+        partial.0[1] = (a.0[1].0 + 0x40, a.0[1].1 + 0x40);
+        assert!(!gdn_rows_ranges_clear(&[a, partial]));
+        // A lane writing what another lane reads, either way round.
+        let mut reads_a = b;
+        reads_a.1[2] = a.0[3];
+        assert!(!gdn_rows_ranges_clear(&[a, reads_a]));
+        assert!(!gdn_rows_ranges_clear(&[reads_a, a]));
+        // Two lanes reading the same range is fine (shared inputs).
+        let mut shared = b;
+        shared.1[0] = a.1[0];
+        assert!(gdn_rows_ranges_clear(&[a, shared]));
+        // Two lanes naming one live Q8 state (read only, but a duplicated
+        // state pointer is refused: it marks a lane table gone wrong).
+        let mut dup_state = b;
+        dup_state.1[4] = a.1[4];
+        assert!(!gdn_rows_ranges_clear(&[a, dup_state]));
+        // Overlaps inside one lane's own writes, and empty ranges, are refused.
+        let mut self_overlap = a;
+        self_overlap.0[1] = self_overlap.0[0];
+        assert!(!gdn_rows_ranges_clear(&[self_overlap, b]));
+        let mut empty = b;
+        empty.0[2] = (0x30_0000, 0x30_0000);
+        assert!(!gdn_rows_ranges_clear(&[a, empty]));
+    }
+
+    #[test]
+    fn rows_gate_kernargs_follow_the_device_struct_layout() {
+        let p = |i: usize| (0x2_0000 + i * 0x10) as *mut std::ffi::c_void;
+        let tables: Vec<[*mut std::ffi::c_void; GDN_CORE_LANES_MAX]> = (0..3)
+            .map(|f| {
+                let mut t = [std::ptr::null_mut(); GDN_CORE_LANES_MAX];
+                for (l, slot) in t.iter_mut().enumerate().take(4) {
+                    *slot = p(f * 16 + l);
+                }
+                t
+            })
+            .collect();
+        let rows = [2u32, 8, 3, 5, 0, 0, 0, 0];
+        let mut blob = rows_gate_kernargs(p(900), 48, &tables, &rows);
+        assert_eq!(word(&mut blob, 0), p(900) as u64);
+        assert_eq!(half(&mut blob, 8), 48);
+        // The table starts at the next 8-byte boundary (offset 16).
+        for f in 0..3usize {
+            for l in 0..GDN_CORE_LANES_MAX {
+                let at = 16 + (f * GDN_CORE_LANES_MAX + l) * 8;
+                let want = if l < 4 { p(f * 16 + l) as u64 } else { 0 };
+                assert_eq!(word(&mut blob, at), want, "field {f} lane {l}");
+            }
+        }
+        let ints = 16 + 3 * GDN_CORE_LANES_MAX * 8;
+        for (l, want) in rows.iter().enumerate() {
+            assert_eq!(half(&mut blob, ints + 4 * l), *want);
+        }
+        assert_eq!(
+            blob.len(),
+            (ints + 4 * GDN_CORE_LANES_MAX).next_multiple_of(16)
+        );
+    }
+
+    fn word(blob: &mut KernargBlob, at: usize) -> u64 {
+        let s = blob.as_mut_slice();
+        u64::from_ne_bytes(s[at..at + 8].try_into().unwrap())
+    }
+
+    fn half(blob: &mut KernargBlob, at: usize) -> u32 {
+        let s = blob.as_mut_slice();
+        u32::from_ne_bytes(s[at..at + 4].try_into().unwrap())
+    }
+
+    /// The kernarg blobs match the HIP structs `GdnConvRowsLanes` /
+    /// `GdnStepRowsLanes` (`gdn_lanes.hip`): shared scalars, the by-value table
+    /// at 8-byte alignment, pointer arrays in field order, then the int arrays.
+    #[test]
+    fn rows_kernarg_blobs_follow_the_device_struct_layout() {
+        let p = |i: usize| (0x1_0000 + i * 0x10) as *mut std::ffi::c_void;
+        let tables: Vec<[*mut std::ffi::c_void; GDN_CORE_LANES_MAX]> = (0..8)
+            .map(|f| {
+                let mut t = [std::ptr::null_mut(); GDN_CORE_LANES_MAX];
+                for (l, slot) in t.iter_mut().enumerate().take(3) {
+                    *slot = p(f * 16 + l);
+                }
+                t
+            })
+            .collect();
+        let rows = [2u32, 5, 8, 0, 0, 0, 0, 0];
+        let aux = [1u32, 2, 0, 0, 0, 0, 0, 0];
+
+        let mut conv = rows_conv_kernargs(
+            [p(900), p(901), p(902)],
+            [10240, 48, 8],
+            &tables,
+            &rows,
+            &aux,
+        );
+        assert_eq!(word(&mut conv, 0), p(900) as u64);
+        assert_eq!(word(&mut conv, 16), p(902) as u64);
+        assert_eq!(half(&mut conv, 24), 10240);
+        assert_eq!(half(&mut conv, 28), 48);
+        assert_eq!(half(&mut conv, 32), 8);
+        // The table starts at the next 8-byte boundary (offset 40).
+        for f in 0..8usize {
+            for l in 0..GDN_CORE_LANES_MAX {
+                let at = 40 + (f * GDN_CORE_LANES_MAX + l) * 8;
+                let want = if l < 3 { p(f * 16 + l) as u64 } else { 0 };
+                assert_eq!(word(&mut conv, at), want, "field {f} lane {l}");
+            }
+        }
+        let ints = 40 + 8 * GDN_CORE_LANES_MAX * 8;
+        assert_eq!(half(&mut conv, ints + 4), 5);
+        assert_eq!(half(&mut conv, ints + 8), 8);
+        assert_eq!(half(&mut conv, ints + 4 * GDN_CORE_LANES_MAX + 4), 2);
+        assert_eq!(conv.len() % 16, 0);
+        assert_eq!(
+            conv.len(),
+            (ints + 2 * 4 * GDN_CORE_LANES_MAX).next_multiple_of(16)
+        );
+
+        let mut step =
+            rows_step_kernargs([10240, 16, 48, 128, 128], 0.0883, &tables[..6], &rows, &aux);
+        assert_eq!(half(&mut step, 0), 10240);
+        assert_eq!(half(&mut step, 16), 128);
+        assert_eq!(f32::from_bits(half(&mut step, 20)), 0.0883);
+        for f in 0..6usize {
+            for l in 0..GDN_CORE_LANES_MAX {
+                let at = 24 + (f * GDN_CORE_LANES_MAX + l) * 8;
+                let want = if l < 3 { p(f * 16 + l) as u64 } else { 0 };
+                assert_eq!(word(&mut step, at), want, "field {f} lane {l}");
+            }
+        }
+        let ints = 24 + 6 * GDN_CORE_LANES_MAX * 8;
+        assert_eq!(half(&mut step, ints), 2);
+        assert_eq!(half(&mut step, ints + 4 * GDN_CORE_LANES_MAX + 4), 2);
+        assert_eq!(
+            step.len(),
+            (ints + 2 * 4 * GDN_CORE_LANES_MAX).next_multiple_of(16)
+        );
+    }
+
+    /// The count and flag refusals of the verify route return `Ok(None)` before
+    /// anything is validated. Needs a GPU for the tensor handles only; skipped
+    /// without one.
+    #[test]
+    fn rows_admission_refuses_bad_counts_and_a_killed_flag() {
+        let Some(mut gpu) = crate::gpu_test::init().ok() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let t = gpu.zeros(&[16], DType::F32).expect("tensor");
+        fn one(t: &GpuTensor) -> GdnCoreRowsLane<'_> {
+            GdnCoreRowsLane {
+                projection: t,
+                conv: GatedDeltaConvBatched {
+                    input: t,
+                    kernel: t,
+                    history: t,
+                    output: t,
+                    next_history: t,
+                    rows: 2,
+                    channels: 1,
+                    history_rows: 3,
+                    kernel_size: 4,
+                    start_cursor: 0,
+                },
+                params: GatedDeltaParamsBatched {
+                    a: t,
+                    b: t,
+                    a_log: t,
+                    dt_bias: t,
+                    gate: t,
+                    beta: t,
+                    rows: 2,
+                    heads: 48,
+                },
+                step: GatedDeltaStepBatched {
+                    projection: t,
+                    gate: t,
+                    beta: t,
+                    state: t,
+                    format: GdnStateFormat::Q8,
+                    residual: None,
+                    output: t,
+                    row_states: Some(t),
+                    rows: 2,
+                    qkv_width: 1,
+                    key_heads: 16,
+                    value_heads: 48,
+                    key_dim: 128,
+                    value_dim: 128,
+                    position: 0,
+                },
+                gate: GatedDeltaGateBatched {
+                    recurrent_output: t,
+                    z: t,
+                    norm: t,
+                    output: t,
+                    rows: 2,
+                    value_heads: 48,
+                    value_dim: 128,
+                },
+            }
+        }
+        let lanes: Vec<GdnCoreRowsLane<'_>> =
+            (0..GDN_CORE_LANES_MAX + 1).map(|_| one(&t)).collect();
+        {
+            let flags = std::sync::Arc::make_mut(&mut gpu.flags);
+            flags.qwen4_gdn_lanes = true;
+            flags.qwen4_gdn_lanes_rows = true;
+        }
+        assert!(gated_delta_core_lanes_rows(&gpu, &[], 48)
+            .unwrap()
+            .is_none());
+        assert!(gated_delta_core_lanes_rows(&gpu, &lanes[..1], 48)
+            .unwrap()
+            .is_none());
+        assert!(gated_delta_core_lanes_rows(&gpu, &lanes, 48)
+            .unwrap()
+            .is_none());
+        // The rows flag is its own switch: lanes on, rows off refuses.
+        std::sync::Arc::make_mut(&mut gpu.flags).qwen4_gdn_lanes_rows = false;
+        assert!(gated_delta_core_lanes_rows(&gpu, &lanes[..2], 48)
+            .unwrap()
+            .is_none());
+        {
+            let flags = std::sync::Arc::make_mut(&mut gpu.flags);
+            flags.qwen4_gdn_lanes_rows = true;
+            flags.qwen4_gdn_lanes = false;
+        }
+        assert!(gated_delta_core_lanes_rows(&gpu, &lanes[..2], 48)
+            .unwrap()
+            .is_none());
+        drop(lanes);
+        gpu.free_tensor(t).expect("free");
     }
 }

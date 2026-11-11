@@ -199,6 +199,77 @@ pub struct CensusV1 {
     pub by_contract: BTreeMap<String, Bucket>,
     pub top: Vec<TopKernel>,
     pub notes: Vec<String>,
+    /// How this census was measured. Absent (every rocprofv3 census) =
+    /// time-weighted from a rocprofv3 kernel trace. Present for dispatch-ledger
+    /// cells (`pm-census ledger`), where it states the weighting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement: Option<MeasurementV1>,
+}
+
+/// What a ledger census weights its shares by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Weighting {
+    /// Shares are of GPU time (nanoseconds).
+    Time,
+    /// Shares are of executed dispatches. NOT a time share.
+    Count,
+}
+
+/// Which instrument produced a ledger census.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasurementMode {
+    /// Retained-PM4 dispatch ledger, default tape: exact dispatch counts x
+    /// replays; per-kernel time is unknown.
+    LedgerDispatchCount,
+    /// Retained-PM4 dispatch ledger on the per-dispatch-timestamp tape
+    /// (`HIPFIRE_REDLINE_LEDGER_TIMING=1`): per-dispatch GPU spans from a
+    /// perturbed run.
+    LedgerPm4Timestamps,
+}
+
+/// The mode/weighting/perturbation triple a matrix cell repeats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeasurementLabel {
+    pub mode: MeasurementMode,
+    pub weighting: Weighting,
+    /// The measured run executed a different tape than the product run.
+    pub perturbing: bool,
+}
+
+/// Measurement record of a ledger census.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MeasurementV1 {
+    pub mode: MeasurementMode,
+    pub weighting: Weighting,
+    pub perturbing: bool,
+    /// What the census covers and what it cannot see.
+    pub scope: String,
+    /// Retained programs with at least one counted replay.
+    pub programs: u64,
+    /// Counted replays summed over programs.
+    pub replays: u64,
+    /// Dispatches executed = sum over programs of replays x dispatches.
+    pub dispatches_executed: u64,
+    /// Whole-program GPU span over the counted replays (ns), from the
+    /// tape's bracketing timestamps. Time-weighted but whole-program only:
+    /// it carries no per-kernel information.
+    pub program_gpu_span_ns: u64,
+    /// Share of executed dispatches per origin (`pm`/`hipcc`/`unknown`).
+    /// A count share in every mode; compare `by_origin[*].exclusive_ns`
+    /// for time (non-zero only when `weighting` is `time`).
+    pub dispatch_share_by_origin: BTreeMap<String, f64>,
+}
+
+impl MeasurementV1 {
+    pub fn label(&self) -> MeasurementLabel {
+        MeasurementLabel {
+            mode: self.mode,
+            weighting: self.weighting,
+            perturbing: self.perturbing,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -220,6 +291,13 @@ pub struct MatrixCell {
     pub pm_share_of_kernel_busy: Option<f64>,
     /// PM exclusive time / ROI wall time. `None` unless `Measured`.
     pub pm_share_of_wall: Option<f64>,
+    /// PM dispatches / all executed dispatches. Only for count-weighted
+    /// ledger cells (where the two time shares above are `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pm_share_of_dispatches: Option<f64>,
+    /// How the cell was measured; absent = a rocprofv3 kernel trace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement: Option<MeasurementLabel>,
     /// Reasons that qualify the shares (e.g. an unknown-origin share above
     /// 5 % makes them lower bounds). Empty for a clean measurement.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -327,7 +405,7 @@ fn phase_str(p: &PhaseV1) -> &'static str {
     }
 }
 
-fn parse_phase(s: &str) -> Result<PhaseV1, String> {
+pub(crate) fn parse_phase(s: &str) -> Result<PhaseV1, String> {
     match s {
         "prefill" => Ok(PhaseV1::Prefill),
         "ar" => Ok(PhaseV1::Ar),
@@ -348,7 +426,7 @@ fn in_grid(k: &CellKey) -> bool {
     MATRIX_MODELS.contains(&k.model.as_str()) && MATRIX_ARCHES.contains(&k.arch.as_str())
 }
 
-fn origin_key(o: &Origin) -> &'static str {
+pub(crate) fn origin_key(o: &Origin) -> &'static str {
     match o {
         Origin::Pm => "pm",
         Origin::Hipcc => "hipcc",
@@ -356,7 +434,7 @@ fn origin_key(o: &Origin) -> &'static str {
     }
 }
 
-fn origin_from_key(k: &str) -> Origin {
+pub(crate) fn origin_from_key(k: &str) -> Origin {
     match k {
         "pm" => Origin::Pm,
         "hipcc" => Origin::Hipcc,
@@ -376,14 +454,14 @@ fn dispatch_class(d: &Dispatch) -> &'static str {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Export symbol (any arch) -> `<contract id>@v<version>` over every
 /// `hipfire-kernel-abi` contract. A symbol exported by several contracts maps
 /// to all of them joined by `|` (never silently to one).
-fn contract_index() -> HashMap<&'static str, String> {
+pub(crate) fn contract_index() -> HashMap<&'static str, String> {
     let mut by_symbol: HashMap<&'static str, Vec<String>> = HashMap::new();
     for abi in hipfire_kernel_abi::families::all() {
         let id = format!("{}@v{}", abi.id, abi.version);
@@ -820,6 +898,7 @@ pub fn census(
         by_contract: buckets(by_contract),
         top: top_rows,
         notes,
+        measurement: None,
     })
 }
 
@@ -877,6 +956,8 @@ fn matrix_cell(
             status: CellStatus::Refused { reason },
             pm_share_of_kernel_busy: None,
             pm_share_of_wall: None,
+            pm_share_of_dispatches: None,
+            measurement: None,
             notes: Vec::new(),
         }
     }
@@ -895,28 +976,68 @@ fn matrix_cell(
             },
             pm_share_of_kernel_busy: None,
             pm_share_of_wall: None,
+            pm_share_of_dispatches: None,
+            measurement: None,
             notes: Vec::new(),
         },
         [(path, sha, c)] => {
             let mut notes = Vec::new();
             let busy = c.kernel_busy_ns;
-            let (share_busy, share_wall) = if busy == 0 || c.roi.wall_ns == 0 {
-                notes.push("census has no kernel busy time; shares not computed".to_string());
-                (None, None)
-            } else {
-                let pm = c.by_origin.get("pm").map_or(0, |b| b.exclusive_ns) as f64;
-                let unknown = c.by_origin.get("unknown").map_or(0, |b| b.exclusive_ns) as f64;
-                let unknown_share = unknown / busy as f64;
-                if unknown_share > UNKNOWN_SHARE_LIMIT {
-                    notes.push(format!(
+            let count_weighted = c
+                .measurement
+                .as_ref()
+                .is_some_and(|m| m.weighting == Weighting::Count);
+            let mut share_dispatches = None;
+            let (share_busy, share_wall) =
+                if count_weighted {
+                    let total: u64 = c.by_origin.values().map(|b| b.calls).sum();
+                    if total == 0 {
+                        notes.push("census has no dispatches; shares not computed".to_string());
+                    } else {
+                        let calls = |origin: &str| c.by_origin.get(origin).map_or(0, |b| b.calls);
+                        share_dispatches = Some(calls("pm") as f64 / total as f64);
+                        let unknown_share = calls("unknown") as f64 / total as f64;
+                        if unknown_share > UNKNOWN_SHARE_LIMIT {
+                            notes.push(format!(
+                            "unknown share {:.1}% of dispatches exceeds {:.0}%: the share counts \
+                             only the joined dispatches (lower bound)",
+                            100.0 * unknown_share,
+                            100.0 * UNKNOWN_SHARE_LIMIT
+                        ));
+                        }
+                    }
+                    notes.push(
+                    "count-weighted ledger cell: pm_share_of_dispatches is a share of executed \
+                     dispatches, NOT of GPU time; pm_share_of_kernel_busy and pm_share_of_wall \
+                     are deliberately not computed"
+                        .to_string(),
+                );
+                    (None, None)
+                } else if busy == 0 || c.roi.wall_ns == 0 {
+                    notes.push("census has no kernel busy time; shares not computed".to_string());
+                    (None, None)
+                } else {
+                    let pm = c.by_origin.get("pm").map_or(0, |b| b.exclusive_ns) as f64;
+                    let unknown = c.by_origin.get("unknown").map_or(0, |b| b.exclusive_ns) as f64;
+                    let unknown_share = unknown / busy as f64;
+                    if unknown_share > UNKNOWN_SHARE_LIMIT {
+                        notes.push(format!(
                         "unknown share {:.1}% of kernel_busy exceeds {:.0}%: shares count only \
                          the joined kernels (lower bound)",
                         100.0 * unknown_share,
                         100.0 * UNKNOWN_SHARE_LIMIT
                     ));
-                }
-                (Some(pm / busy as f64), Some(pm / c.roi.wall_ns as f64))
-            };
+                    }
+                    if let Some(m) = &c.measurement {
+                        notes.push(format!(
+                        "{:?} cell{}: shares are of the summed retained-program GPU span, not of \
+                         end-to-end request time",
+                        m.mode,
+                        if m.perturbing { " (perturbing run)" } else { "" }
+                    ));
+                    }
+                    (Some(pm / busy as f64), Some(pm / c.roi.wall_ns as f64))
+                };
             MatrixCell {
                 key,
                 status: CellStatus::Measured {
@@ -925,6 +1046,8 @@ fn matrix_cell(
                 },
                 pm_share_of_kernel_busy: share_busy,
                 pm_share_of_wall: share_wall,
+                pm_share_of_dispatches: share_dispatches,
+                measurement: c.measurement.as_ref().map(MeasurementV1::label),
                 notes,
             }
         }
@@ -1676,6 +1799,7 @@ mod tests {
             by_contract: BTreeMap::new(),
             top: Vec::new(),
             notes: Vec::new(),
+            measurement: None,
         }
     }
 

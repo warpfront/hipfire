@@ -499,7 +499,7 @@ fn global_visibility_is_explicit_not_implied_by_lds_barrier() {
         wave32: true,
         cu_mode: false,
     };
-    let mut builder = Builder::new(spec, RegPlan::new(8, 8).unwrap());
+    let mut builder = Builder::new(spec, RegPlan::new(8, 16).unwrap());
     builder.barrier(&[]).unwrap();
     assert_eq!(
         builder
@@ -644,7 +644,7 @@ fn hip_hidden_kernarg_metadata_assembles() {
         wave32: true,
         cu_mode: false,
     };
-    let mut builder = Builder::new(spec, RegPlan::new(8, 8).unwrap());
+    let mut builder = Builder::new(spec, RegPlan::new(8, 16).unwrap());
     builder
         .control(Instruction::new("s_endpgm", vec![], vec![]))
         .unwrap();
@@ -696,7 +696,7 @@ fn gfx11_descriptor_extras_assemble() {
             wave32: true,
             cu_mode: false,
         };
-        let mut builder = Builder::new(spec, RegPlan::new(8, 8).unwrap());
+        let mut builder = Builder::new(spec, RegPlan::new(8, 16).unwrap());
         builder
             .control(Instruction::new("s_endpgm", vec![], vec![]))
             .unwrap();

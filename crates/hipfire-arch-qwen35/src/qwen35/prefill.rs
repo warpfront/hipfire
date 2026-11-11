@@ -327,6 +327,90 @@ fn dense_layers_have_projection_dtype(weights: &Qwen35Weights, dtype: DType) -> 
         })
 }
 
+/// No allocation: callers supply one fixed projection set per layer.
+/// DeltaNet may retain its unrotated output projection as Q8_0 (HFQ qt3);
+/// every other projection, including FullAttn output, must be symmetric qt49.
+fn symmetric_mq3v2_projection_sets(
+    marker: bool,
+    mut layers: impl Iterator<Item = Option<([DType; 8], bool)>>,
+) -> bool {
+    let admissible = |(dtypes, delta_net): ([DType; 8], bool)| {
+        dtypes.iter().enumerate().all(|(i, &dtype)| {
+            dtype == DType::MQ3G256V2 || (delta_net && i == 4 && dtype == DType::Q8_0)
+        })
+    };
+    marker
+        && layers
+            .next()
+            .is_some_and(|projections| projections.is_some_and(admissible))
+        && layers.all(|projections| projections.is_some_and(admissible))
+}
+
+fn dense_layers_are_uniform_symmetric_mq3v2(weights: &Qwen35Weights) -> bool {
+    symmetric_mq3v2_projection_sets(
+        weights.mq3v2_symmetric,
+        weights.layers.iter().map(|layer| match layer {
+            LayerWeights::DeltaNet(layer) => Some((
+                [
+                    layer.wqkv.gpu_dtype,
+                    layer.wz.gpu_dtype,
+                    layer.w_alpha.gpu_dtype,
+                    layer.w_beta.gpu_dtype,
+                    layer.wo.gpu_dtype,
+                    layer.w_gate.gpu_dtype,
+                    layer.w_up.gpu_dtype,
+                    layer.w_down.gpu_dtype,
+                ],
+                true,
+            )),
+            LayerWeights::FullAttn(layer) => Some((
+                [
+                    layer.wq.gpu_dtype,
+                    layer.wk.gpu_dtype,
+                    layer.wv.gpu_dtype,
+                    layer.wo.gpu_dtype,
+                    layer.w_gate.gpu_dtype,
+                    layer.w_up.gpu_dtype,
+                    layer.w_down.gpu_dtype,
+                    layer.w_down.gpu_dtype,
+                ],
+                false,
+            )),
+            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => None,
+        }),
+    )
+}
+
+/// Symmetric qt49 dense model with an enabled A4 or A8 projection route: the
+/// widened (8192-row) chunk, its A4/A8 projection scratch sizing and the GDN
+/// chunk scan all key on this one predicate.
+fn mq3_wide_route(gpu: &Gpu, weights: &Qwen35Weights) -> bool {
+    dense_layers_are_uniform_symmetric_mq3v2(weights)
+        && (gpu.flags.mq3v25_a8_enabled(gpu.mq3v2_symmetric)
+            || gpu.flags.mq3v25_a4_enabled(gpu.mq3v2_symmetric))
+}
+
+/// Activation-projection sizing family of the widened route for projection
+/// scratch reservation: `Off` keeps the incumbent MQ4 sizing (FP8 on gfx1201,
+/// IU4 elsewhere); a symmetric qt49 route sizes against its A4 (72 B per K128
+/// block) or A8 (136 B per K128 block) prelude. A8 wins over A4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mq3WideProjection {
+    Off,
+    A4,
+    A8,
+}
+
+fn mq3_wide_projection(gpu: &Gpu, weights: &Qwen35Weights) -> Mq3WideProjection {
+    if !mq3_wide_route(gpu, weights) {
+        Mq3WideProjection::Off
+    } else if gpu.flags.mq3v25_a8_enabled(gpu.mq3v2_symmetric) {
+        Mq3WideProjection::A8
+    } else {
+        Mq3WideProjection::A4
+    }
+}
+
 fn native_mq4_widened_requested() -> bool {
     hipfire_config::developer_var("HIPFIRE_GFX1100_MQ4_WIDE_PREFILL")
         .ok()
@@ -421,6 +505,27 @@ fn legacy_prefill_max_batch(
 /// PBS) call whose admitted ceiling exceeds the 512-row commit seam.
 fn widened_route(wide_candidate: bool, limit: usize) -> bool {
     wide_candidate && limit > WIDENED_COMMIT_ROWS
+}
+
+/// Window during which a widened-PBS rung that really failed to allocate is
+/// not retried.
+const WIDENED_ALLOC_FAIL_MEMO: std::time::Duration = std::time::Duration::from_secs(60);
+
+static WIDENED_ALLOC_FAILED: std::sync::Mutex<Option<(usize, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// Rows to try first: `rows`, narrowed below a rung that failed within the memo window.
+fn widened_alloc_clamp(rows: usize) -> usize {
+    match *WIDENED_ALLOC_FAILED.lock().unwrap() {
+        Some((failed, at)) if at.elapsed() < WIDENED_ALLOC_FAIL_MEMO && rows >= failed => {
+            (failed / 2).max(WIDENED_COMMIT_ROWS)
+        }
+        _ => rows,
+    }
+}
+
+fn widened_alloc_failed(rows: usize) {
+    *WIDENED_ALLOC_FAILED.lock().unwrap() = Some((rows, std::time::Instant::now()));
 }
 
 /// Rows of the owned widened PBS for an `n`-token call under `limit`.
@@ -552,13 +657,16 @@ fn ordinary_prefill_static_ceiling(
         return None;
     }
     let native_mq4 = native_mq4_widened_route(gpu, weights);
-    if !dense_layers_are_all_mq4v2(weights) && !native_mq4 {
+    let mq3 = mq3_wide_route(gpu, weights);
+    if !dense_layers_are_all_mq4v2(weights) && !native_mq4 && !mq3 {
         return None;
     }
-    // gfx1201 keeps all four FP8 projection routes. gfx11 substitutes the
-    // existing IU4 K16 projection route; its full-attention layers remain on
-    // Q8 FA2 because the packet kernel and FP8 KV format are gfx1201-only.
-    let projection_route_admitted = if native_mq4 {
+    // gfx1201 keeps all four FP8 projection routes for qt44; symmetric qt49
+    // uses A4/A8 on gfx1201 (its flag predicate is the admission) and the
+    // gfx1100 A4 flag already implies the IU4 prefill gate. gfx11 substitutes
+    // the existing IU4 K16 projection route; its full-attention layers remain
+    // on Q8 FA2 because the packet kernel and FP8 KV format are gfx1201-only.
+    let projection_route_admitted = if native_mq4 || mq3 {
         true
     } else if gpu.arch == "gfx1201" {
         gpu.flags.gfx12_mq4v2_fp8_gateup
@@ -1398,8 +1506,23 @@ fn ordinary_wrapper_pbs_prepare(
     }
     if plan.alloc_virtual {
         if let WrapperOwner::Virtual { rows, tape } = plan.owner {
-            let owner = PrefillBatchScratch::new_opt(gpu, config, rows, tape)?;
-            *scratch.reuse_virtual_pbs.borrow_mut() = Some(owner);
+            // The admission planned this owner from device capacity; the
+            // allocation is the real check. Only a real failure keeps the
+            // incumbent implicit cache and ceiling.
+            match PrefillBatchScratch::new_opt(gpu, config, rows, tape) {
+                Ok(owner) => *scratch.reuse_virtual_pbs.borrow_mut() = Some(owner),
+                Err(e) => {
+                    eprintln!(
+                        "prefill_chunk: allocating the {rows}-row virtual prefill owner failed ({e:?}); keeping the implicit cache and its ceiling"
+                    );
+                    return Ok(WrapperPbsPlan {
+                        owner: WrapperOwner::Physical,
+                        max_batch_override: None,
+                        free_virtual: false,
+                        alloc_virtual: false,
+                    });
+                }
+            }
         }
     }
     Ok(plan)
@@ -1701,7 +1824,7 @@ struct ResidentMoeMemoryFacts {
 
 fn resident_moe_memory_facts(gpu: &Gpu) -> ResidentMoeMemoryFacts {
     ResidentMoeMemoryFacts {
-        free_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
+        free_bytes: gpu.planned_capacity().ok().map(|cap| cap.bytes),
         live: live_projection_scratch(gpu),
         live_q16_bytes: gpu.scratch.fa2_q16_scratch_bytes,
     }
@@ -2099,6 +2222,15 @@ fn iu4_row_bytes_wide(config: &Qwen35Config) -> Option<usize> {
         .checked_div(128)?
         .checked_mul(72)
 }
+/// K128-major A8 prelude bytes/row at the `Kmax = hidden_dim` envelope: one
+/// 136-byte `block_i8_128` per K/128 block.
+fn iu8_row_bytes_wide(config: &Qwen35Config) -> Option<usize> {
+    config
+        .hidden_dim
+        .checked_add(127)?
+        .checked_div(128)?
+        .checked_mul(136)
+}
 /// Per-token physical K+V stride for the selected cache encoding. Only
 /// full-attention layers own KV; DeltaNet layers carry no token rows.
 pub fn vmm_kv_token_bytes(
@@ -2139,7 +2271,8 @@ pub fn vmm_kv_token_bytes(
 /// Larger PBS buffers are allocated lazily and admitted per request from free
 /// VRAM *after mapped KV*, not subtracted from the lifetime context bound.
 pub fn minimum_prefill_reservation_bytes(config: &Qwen35Config, arch: &str) -> Option<usize> {
-    let base = dense_prefill_reservation_bytes(config, WIDENED_COMMIT_ROWS, arch)?;
+    let base =
+        dense_prefill_reservation_bytes(config, WIDENED_COMMIT_ROWS, arch, Mq3WideProjection::Off)?;
     // The loader has not classified all projection tensors yet. Under the
     // explicit experimental MQ4 opt-ins, conservatively reserve their prelude
     // too; the default V2/other-format reservation remains unchanged.
@@ -2191,11 +2324,13 @@ fn dense_prefill_reservation_bytes(
     config: &Qwen35Config,
     rows: usize,
     arch: &str,
+    mq3: Mq3WideProjection,
 ) -> Option<usize> {
-    let projection = if arch == "gfx1201" {
-        fp8_row_bytes_wide(config)?
-    } else {
-        iu4_row_bytes_wide(config)?
+    let projection = match mq3 {
+        Mq3WideProjection::A8 => iu8_row_bytes_wide(config)?,
+        Mq3WideProjection::A4 => iu4_row_bytes_wide(config)?,
+        Mq3WideProjection::Off if arch == "gfx1201" => fp8_row_bytes_wide(config)?,
+        Mq3WideProjection::Off => iu4_row_bytes_wide(config)?,
     };
     let q16 = WIDENED_COMMIT_ROWS
         .checked_mul(config.n_heads)?
@@ -2211,11 +2346,18 @@ fn dense_prefill_reservation_bytes(
 /// reclaims the cache just before mapping if that growth needs its memory.
 /// Reserving *all* unmapped KV here made mixed-size prefills repeatedly free
 /// and reallocate the same multi-gigabyte PBS despite no KV growth.
-fn can_retain_widened_pbs(gpu: &Gpu, kv: &llama::KvCache, config: &Qwen35Config) -> bool {
+fn can_retain_widened_pbs(
+    gpu: &Gpu,
+    kv: &llama::KvCache,
+    config: &Qwen35Config,
+    mq3: Mq3WideProjection,
+) -> bool {
     if !kv.uses_vmm_backend() {
         return true;
     }
-    let Some(minimum) = minimum_prefill_reservation_bytes(config, &gpu.arch) else {
+    let Some(minimum) =
+        dense_prefill_reservation_bytes(config, WIDENED_COMMIT_ROWS, &gpu.arch, mq3)
+    else {
         return false;
     };
     let grow_only = widened_pbs_grow_only(gpu);
@@ -2230,8 +2372,8 @@ fn can_retain_widened_pbs(gpu: &Gpu, kv: &llama::KvCache, config: &Qwen35Config)
             }
         }
     }
-    gpu.device_mem_info()
-        .is_ok_and(|(free, _)| free >= unmapped.saturating_add(minimum).saturating_add(128 << 20))
+    gpu.planned_capacity()
+        .is_ok_and(|cap| cap.bytes >= unmapped.saturating_add(minimum).saturating_add(128 << 20))
 }
 
 /// gfx1100 stays off the grow-only route on purpose: there, later pp8192
@@ -2272,7 +2414,7 @@ pub(crate) fn release_widened_pbs_for_kv_growth(
                 .and_then(|minimum| growth.checked_add(minimum))
         })
         .and_then(|needed| needed.checked_add(128 << 20))
-        .is_some_and(|needed| gpu.device_mem_info().is_ok_and(|(free, _)| free >= needed));
+        .is_some_and(|needed| gpu.planned_capacity().is_ok_and(|cap| cap.bytes >= needed));
     if !keep {
         if let Some(old) = scratch.widened_prefill_batch.borrow_mut().take() {
             old.free_gpu(gpu)?;
@@ -2288,6 +2430,7 @@ pub(crate) fn release_widened_pbs_for_kv_growth(
 /// owner needs no allocation, and a smaller owner is freed before replacement.
 /// The query follows model+KV mapping and request-state allocation.
 /// Falls back to 512 when no enlarged rung fits.
+/// Logs the planned-capacity chunk decision whenever it changes.
 #[allow(clippy::too_many_arguments)]
 fn memory_admitted_rung(
     gpu: &Gpu,
@@ -2296,25 +2439,66 @@ fn memory_admitted_rung(
     perf_rows: usize,
     lean: bool,
     native_mq4: bool,
+    mq3: Mq3WideProjection,
+    cached: Option<&PrefillBatchScratch>,
+    free_deduction: usize,
+) -> HipResult<usize> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static LAST_LOGGED: AtomicUsize = AtomicUsize::new(usize::MAX);
+    let rung = memory_admitted_rung_planned(
+        gpu,
+        config,
+        kv_cache,
+        perf_rows,
+        lean,
+        native_mq4,
+        mq3,
+        cached,
+        free_deduction,
+    )?;
+    if perf_rows > WIDENED_COMMIT_ROWS && LAST_LOGGED.swap(rung, Ordering::Relaxed) != rung {
+        if let Ok(cap) = gpu.planned_capacity() {
+            eprintln!(
+                "qwen35: admission decision: prefill chunk rows {rung} (perf ceiling {perf_rows}) from {cap}"
+            );
+        }
+    }
+    Ok(rung)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn memory_admitted_rung_planned(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    kv_cache: &llama::KvCache,
+    perf_rows: usize,
+    lean: bool,
+    native_mq4: bool,
+    mq3: Mq3WideProjection,
     cached: Option<&PrefillBatchScratch>,
     free_deduction: usize,
 ) -> HipResult<usize> {
     if perf_rows <= WIDENED_COMMIT_ROWS {
         return Ok(WIDENED_COMMIT_ROWS.min(perf_rows));
     }
-    let fp8_projection = gpu.arch == "gfx1201";
+    let a8_projection = mq3 == Mq3WideProjection::A8;
+    let fp8_projection = gpu.arch == "gfx1201" && mq3 == Mq3WideProjection::Off;
     if (if lean {
         lean_dense_prefill_allocation_bytes(config, perf_rows)
     } else {
         dense_prefill_allocation_bytes(config, perf_rows)
     })
     .is_none()
+        || (a8_projection && iu8_row_bytes_wide(config).is_none())
         || (fp8_projection && fp8_row_bytes_wide(config).is_none())
-        || (!fp8_projection && iu4_row_bytes_wide(config).is_none())
+        || (!a8_projection && !fp8_projection && iu4_row_bytes_wide(config).is_none())
     {
         return Ok(WIDENED_COMMIT_ROWS);
     }
-    let free_bytes = gpu.device_mem_info()?.0.saturating_sub(free_deduction);
+    // Planned capacity (total - own - reserve), not instantaneous free: a
+    // transient foreign allocation must not flip the chunk route.
+    let capacity = gpu.planned_capacity()?;
+    let free_bytes = capacity.bytes.saturating_sub(free_deduction);
     let q_dim = config.n_heads.checked_mul(config.head_dim).unwrap_or(0);
     // Only a selectable gfx11 whole-chunk FA2 route needs more than the
     // incumbent 512-row Q16 scratch. Charge each candidate rung separately.
@@ -2332,9 +2516,18 @@ fn memory_admitted_rung(
     let live_fp8_sums = gpu.scratch.mq4v2_fp8_half_sums_scratch_bytes;
     let live_fp8_scales = gpu.scratch.mq4v2_fp8_row_scales_scratch_bytes;
     let live_iu4 = gpu.scratch.int4_mmq_x_scratch_bytes;
+    let live_iu8 = gpu.scratch.int8_mmq_x_scratch_bytes;
     let fp8_groups = config.hidden_dim / 256;
     let iu4_bytes_per_row = iu4_row_bytes_wide(config).unwrap_or(usize::MAX);
+    let iu8_bytes_per_row = iu8_row_bytes_wide(config).unwrap_or(usize::MAX);
     for &rung in WIDENED_RUNGS.iter().rev() {
+        // Symmetric qt49 A4/A8 on gfx1201 admit 8192/4096 before the 512 fallback.
+        if mq3 != Mq3WideProjection::Off
+            && gpu.arch == "gfx1201"
+            && !matches!(rung, 8192 | 4096 | 512)
+        {
+            continue;
+        }
         if rung > perf_rows {
             continue;
         }
@@ -2347,7 +2540,11 @@ fn memory_admitted_rung(
             dense_prefill_allocation_bytes(config, rung)
         }
         .unwrap_or(usize::MAX);
-        let projection_deficit = if native_mq4 {
+        let projection_deficit = if a8_projection {
+            rung.checked_mul(iu8_bytes_per_row)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(live_iu8)
+        } else if native_mq4 {
             native_mq4_projection_deficit(
                 config,
                 rung,
@@ -2403,6 +2600,21 @@ fn memory_admitted_rung(
     }
     Ok(WIDENED_COMMIT_ROWS)
 }
+/// Physical KV bytes this request will still map to reach `end_tokens` rows
+/// (clamped to the cache's physical capacity). Zero on non-VMM KV, when the
+/// mapping already covers the request, or if the query errors. Feed to
+/// [`ordinary_prefill_chunk_limit_deducting`] so the once-per-prompt chunk
+/// ceiling is sized against memory the same request is about to map.
+pub fn request_kv_growth_deduction(
+    gpu: &Gpu,
+    kv_cache: &llama::KvCache,
+    end_tokens: usize,
+) -> usize {
+    kv_cache
+        .planned_mapped_growth_bytes(gpu, end_tokens.min(kv_cache.physical_cap))
+        .unwrap_or(0)
+}
+
 ///
 /// Effective admitted ordinary chunk ceiling for this request: static
 /// eligibility, highest performance-admitted rung, explicit requested
@@ -2495,6 +2707,19 @@ fn ordinary_prefill_chunk_limit_with_cache(
     )
 }
 
+/// Logs the resident-MoE chunk decision and its planned-capacity input when it changes.
+fn log_resident_moe_decision(gpu: &Gpu, rows: usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static LAST: AtomicUsize = AtomicUsize::new(usize::MAX);
+    if LAST.swap(rows, Ordering::Relaxed) != rows {
+        if let Ok(cap) = gpu.planned_capacity() {
+            eprintln!(
+                "qwen35: admission decision: resident-MoE prefill chunk rows {rows} from {cap}"
+            );
+        }
+    }
+}
+
 /// [`ordinary_prefill_chunk_limit_with_cache`] over already gathered resident
 /// MoE static facts (the inner entry gathers them once for the whole call).
 #[allow(clippy::too_many_arguments)]
@@ -2514,7 +2739,7 @@ fn ordinary_prefill_chunk_limit_with_facts(
 ) -> HipResult<usize> {
     let legacy = prefill_max_batch_for_model(gpu, weights);
     let Some(perf) = ordinary_prefill_static_ceiling(gpu, weights, config, dn_state) else {
-        return Ok(resident_moe_chunk_limit_from_facts(
+        let rows = resident_moe_chunk_limit_from_facts(
             moe,
             pbs.map(|p| p.max_batch),
             config,
@@ -2524,7 +2749,9 @@ fn ordinary_prefill_chunk_limit_with_facts(
             reuse_rows,
             free_deduction,
             legacy,
-        ));
+        );
+        log_resident_moe_decision(gpu, rows);
+        return Ok(rows);
     };
     if perf <= WIDENED_COMMIT_ROWS {
         return Ok(perf.min(legacy));
@@ -2537,6 +2764,7 @@ fn ordinary_prefill_chunk_limit_with_facts(
         perf,
         lean,
         native_mq4_widened_route(gpu, weights),
+        mq3_wide_projection(gpu, weights),
         cached,
         free_deduction,
     )?;
@@ -2603,9 +2831,65 @@ pub fn ordinary_serve_prefill_chunk_len(remaining: usize, ceiling: usize) -> Opt
 /// log. Emitted on the first chunked (multi-token) prefill of the process and
 /// again whenever the admitted ceiling changes, so a later memory-admission
 /// fallback is visible in the log.
-fn emit_prefill_chunk_receipt(requested: usize, admitted: usize, commit_stride: Option<usize>) {
+fn emit_prefill_chunk_receipt(
+    requested: usize,
+    admitted: usize,
+    commit_stride: Option<usize>,
+    downgrade: Option<&str>,
+) {
     static LAST_ADMITTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    emit_prefill_chunk_receipt_guarded(&LAST_ADMITTED, requested, admitted, commit_stride);
+    if emit_prefill_chunk_receipt_guarded(&LAST_ADMITTED, requested, admitted, commit_stride) {
+        if let Some(reason) = downgrade {
+            // An explicit knob that cannot be honored is a WARNING; a default
+            // ceiling narrowed by a smaller caller scratch is a plain note.
+            let level = if explicit_prefill_max_batch().is_some() {
+                "WARNING"
+            } else {
+                "note"
+            };
+            eprintln!("prefill_chunk: {level} {reason}");
+        }
+    }
+}
+
+/// The receipt of the chunk the ordinary loop really executes, plus a named
+/// reason when that is below the planned ceiling. `chunk_batch` is the value
+/// the loop chunks with ([`prefill_effective_chunk_batch`]); the planned
+/// ceiling can exceed it when the PBS staging owner (e.g. the exact-gfx1201
+/// implicit `HIPFIRE_PREFILL_REUSE_PBS=1` cache, capped at 512 rows) or the
+/// hidden ring is smaller, so an explicit `HIPFIRE_PREFILL_MAX_BATCH` it cannot
+/// honor is reported as downgraded rather than silently ignored.
+fn executed_chunk_receipt(
+    planned: PrefillChunkReceipt,
+    chunk_batch: usize,
+    n: usize,
+    pbs_max_batch: usize,
+    ring_cap: Option<usize>,
+) -> (PrefillChunkReceipt, Option<String>) {
+    // A call shorter than the ceiling executes `n`-row chunks by construction;
+    // that is the planned ceiling being honored, not a downgrade.
+    if chunk_batch >= planned.admitted.min(n) {
+        return (planned, None);
+    }
+    let executed = PrefillChunkReceipt {
+        admitted: chunk_batch,
+        ..planned
+    };
+    let cause = if pbs_max_batch < planned.admitted {
+        format!("the prefill batch scratch (PBS) holds only {pbs_max_batch} rows")
+    } else {
+        format!(
+            "the hidden-state ring stages only {} rows",
+            ring_cap.unwrap_or(chunk_batch)
+        )
+    };
+    (
+        executed,
+        Some(format!(
+            "requested {} rows (admitted ceiling {}) cannot be honored: {cause}; executing {chunk_batch}-row chunks",
+            planned.requested, planned.admitted
+        )),
+    )
 }
 
 /// [`emit_prefill_chunk_receipt`] with the changed-admission guard injected,
@@ -3599,11 +3883,6 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         },
     )?;
     let limit = plan.limit;
-    emit_prefill_chunk_receipt(
-        plan.receipt.requested,
-        plan.receipt.admitted,
-        plan.receipt.commit_stride,
-    );
     // Allocate the batch scratch once per call (or reuse a caller-owned one).
     // When `pbs_in` is Some, we neither allocate nor free — the caller retains
     // ownership across DFlash cycles to avoid ~25 per-cycle tensor alloc/free
@@ -3646,11 +3925,35 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                     if let Some(old) = cached.take() {
                         let _ = old.free_gpu(gpu);
                     }
-                    *cached = Some(if lean {
-                        PrefillBatchScratch::new_opt_lean(gpu, config, owned_rows)?
-                    } else {
-                        PrefillBatchScratch::new_opt(gpu, config, owned_rows, false)?
-                    });
+                    // Admission plans from device capacity; the allocation is
+                    // the real check. Step down a rung only when it really
+                    // fails (a foreign allocation that leaves room never
+                    // narrows the route); the receipt below reports the rows
+                    // actually allocated.
+                    // A rung that really failed is not retried for a short
+                    // window (no alloc/free thrash per request while memory is
+                    // genuinely short); the next window re-tries the planned rung.
+                    let mut rows = widened_alloc_clamp(owned_rows);
+                    let built = loop {
+                        let attempt = if lean {
+                            PrefillBatchScratch::new_opt_lean(gpu, config, rows)
+                        } else {
+                            PrefillBatchScratch::new_opt(gpu, config, rows, false)
+                        };
+                        match attempt {
+                            Ok(p) => break p,
+                            Err(e) if rows > WIDENED_COMMIT_ROWS => {
+                                let next = (rows / 2).max(WIDENED_COMMIT_ROWS);
+                                eprintln!(
+                                    "prefill_chunk: allocating the {rows}-row prefill scratch failed ({e:?}); retrying with {next} rows"
+                                );
+                                widened_alloc_failed(rows);
+                                rows = next;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    };
+                    *cached = Some(built);
                 }
                 own_pbs = cached.take();
                 widened_from_cache = true;
@@ -3673,16 +3976,23 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         // A ring seed chunks exactly as AR does; chunks wider than staging
         // land straight in the ring, so the ring (not its staging) bounds
         // them. Every other ring caller stays capped at staging.
-        let chunk_batch = prefill_effective_chunk_batch(
-            limit,
-            pbs.max_batch,
-            hidden_rb.as_ref().map(|rb| {
-                if ring_seed {
-                    rb.max_positions.max(rb.max_batch)
-                } else {
-                    rb.max_batch
-                }
-            }),
+        let ring_cap = hidden_rb.as_ref().map(|rb| {
+            if ring_seed {
+                rb.max_positions.max(rb.max_batch)
+            } else {
+                rb.max_batch
+            }
+        });
+        let chunk_batch = prefill_effective_chunk_batch(limit, pbs.max_batch, ring_cap);
+        // The receipt names the chunk the loop below actually executes
+        // (`chunk_batch`), never the planned ceiling or the request.
+        let (executed, downgrade) =
+            executed_chunk_receipt(plan.receipt, chunk_batch, n, pbs.max_batch, ring_cap);
+        emit_prefill_chunk_receipt(
+            executed.requested,
+            executed.admitted,
+            executed.commit_stride,
+            downgrade.as_deref(),
         );
         // F2 pair envelope, loop-invariant half: ordinary sequential prefill
         // with FA layers batch-admissible, no tree/tape/max_layer machinery,
@@ -3914,7 +4224,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         // Return the retained PBS to the cache (also on error: it is pure
         // scratch, and the next use overwrites before reading).
         if let Some(owned) = own_pbs {
-            if can_retain_widened_pbs(gpu, kv_cache, config) {
+            if can_retain_widened_pbs(gpu, kv_cache, config, mq3_wide_projection(gpu, weights)) {
                 *scratch.widened_prefill_batch.borrow_mut() = Some(owned);
             } else {
                 let _ = owned.free_gpu(gpu);
@@ -3961,6 +4271,10 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
         // them in the same change -- see the all-together rule in
         // docs/plans/mq-lloyd-batched-prefill-followup.md.
         | DType::TQ2G128 | DType::BQ1G128
+        // GGUF-native block formats: unrotated unfused plain-GEMM prefill
+        // (`run_plain_gemm_key` dequantises each weight); lockstep with the
+        // `is_lowbit` / `qkv_all_ggml` widenings in hipfire-dispatch.
+        | DType::GgmlQ4K | DType::GgmlQ5K | DType::GgmlQ6K | DType::GgmlQ8_0 | DType::GgmlIQ4XS
         // Phase 1.5 (PARO): wqkv/wz/wo are ParoQ4G128, w_alpha/w_beta are F32
         // on shisa-Qwen3.6-A3B-PARO. Dispatch in the DeltaNetMoe LA matcher
         // routes these through gemm_hfq4g128 (with per-weight Givens
@@ -5427,7 +5741,7 @@ pub(crate) fn batch_chunk_embed_tokens(
         && !pre_embedded
         && matches!(
             weights.embd_format,
-            EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0
+            EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 | EmbeddingFormat::Ggml(_)
         )
     {
         if !pre_uploaded {
@@ -5469,6 +5783,14 @@ pub(crate) fn batch_chunk_embed_tokens(
                         len,
                         dim,
                     ),
+                    EmbeddingFormat::Ggml(dtype) => gpu.ggml_embedding_lookup_batched(
+                        dtype,
+                        &weights.token_embd,
+                        &output,
+                        &token_ids,
+                        len,
+                        dim,
+                    ),
                     _ => unreachable!(),
                 }
             })?;
@@ -5482,6 +5804,14 @@ pub(crate) fn batch_chunk_embed_tokens(
                     dim,
                 )?,
                 EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
+                    &weights.token_embd,
+                    &pbs.x_batch,
+                    &pbs.tokens,
+                    n,
+                    dim,
+                )?,
+                EmbeddingFormat::Ggml(dtype) => gpu.ggml_embedding_lookup_batched(
+                    dtype,
                     &weights.token_embd,
                     &pbs.x_batch,
                     &pbs.tokens,
@@ -5506,6 +5836,9 @@ pub(crate) fn batch_chunk_embed_tokens(
                 }
                 EmbeddingFormat::F32 => {
                     gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?
+                }
+                EmbeddingFormat::Ggml(dtype) => {
+                    gpu.ggml_embedding_lookup(dtype, &weights.token_embd, &s.x, tok, dim)?
                 }
                 _ => panic!("unsupported embedding format"),
             }
@@ -7094,6 +7427,8 @@ pub(crate) fn forward_batch_chunk_impl(
             "forward_batch_chunk: fp8 verify scope needs dense batched DeltaNet/FullAttention layers",
         ));
     }
+    let mq3_scan = mq3_wide_route(gpu, weights);
+    let mq4_scan = dense_layers_are_all_mq4v2(weights);
     let gdn_chunk_scan_common_admitted = gpu.flags.gfx12_gdn_chunk_scan
         // The GDN chunk-scan arm has no `SingletonWmma` producer.
         && !gpu.fp8_verify_scope
@@ -7104,13 +7439,16 @@ pub(crate) fn forward_batch_chunk_impl(
         && config.linear_key_head_dim == 128
         && config.linear_value_head_dim == 128
         && config.conv_kernel_dim == 4
-        && dense_layers_are_all_mq4v2(weights)
+        // Each dtype must have its own admitted qkvza producer; the A4/A8
+        // flags cannot enable a qt44 scan when the MQ4 projection route is off.
         // gfx1201 admits both MQ4V2 projection routes: iu4-direct (default) or
         // FP8-WMMA qkvza (HIPFIRE_IU4_PREFILL=0 arm). Every qkvza dispatch arm
         // writes the same f32 dn_qkv/dn_z/dn_beta/dn_alpha scratch the scan
         // consumes, so the scan is route-agnostic. gfx11 keeps the iu4 gate.
-        && (gpu.flags.iu4_prefill_enabled()
-            || (gpu.arch == "gfx1201" && gpu.flags.gfx12_mq4v2_fp8_qkvza))
+        && (mq3_scan
+            || (mq4_scan
+                && (gpu.flags.iu4_prefill_enabled()
+                    || (gpu.arch == "gfx1201" && gpu.flags.gfx12_mq4v2_fp8_qkvza))))
         // The scan never reads KV, so the clause only names qualified tiers:
         // native FP8 (gfx1201-only), Q8 on gfx11, and the fwht4/fwht3 4/3-bit
         // K tiers (`quant_asym4`/`quant_asym3`, any V) on every scan arch.
@@ -7200,13 +7538,21 @@ pub(crate) fn forward_batch_chunk_impl(
     let tap = tap_fn.get();
 
     for layer_idx in layer_start..layer_end {
+        // Developer capture (`HIPFIRE_MOE_ROUTE_DUMP` / `HIPFIRE_MOE_ACT_CAPTURE`): names this
+        // layer and the chunk's first position for the sealed-MoE hooks; a no-op when both are unset.
+        hipfire_dispatch::pipeline::moe_capture::set_site(layer_idx, start_pos);
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
+                let qkvza_dtype = if mq3_scan {
+                    DType::MQ3G256V2
+                } else {
+                    DType::MQ4G256V2
+                };
                 let gdn_chunk_scan_admitted = gdn_chunk_scan_common_admitted
-                    && layer.wqkv.gpu_dtype == DType::MQ4G256V2
-                    && layer.wz.gpu_dtype == DType::MQ4G256V2
-                    && layer.w_beta.gpu_dtype == DType::MQ4G256V2
-                    && layer.w_alpha.gpu_dtype == DType::MQ4G256V2
+                    && layer.wqkv.gpu_dtype == qkvza_dtype
+                    && layer.wz.gpu_dtype == qkvza_dtype
+                    && layer.w_beta.gpu_dtype == qkvza_dtype
+                    && layer.w_alpha.gpu_dtype == qkvza_dtype
                     && delta_layer_idx < dn_state.s_ef_residual.len();
                 batch_chunk_delta_net_attn(
                     gpu,
@@ -7445,6 +7791,51 @@ pub(crate) fn forward_batch_chunk_impl(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_override_receipt_is_the_physical_chunk() {
+        // gfx1201 + HIPFIRE_PREFILL_MAX_BATCH=8192 + HIPFIRE_PREFILL_REUSE_PBS=1: the implicit
+        // cache is 512 rows, so the loop executes 512-row chunks. The receipt used to say 8192.
+        let (pbs_rows, _) = implicit_reuse_pbs_plan("gfx1201", Some(8192), true);
+        assert_eq!(pbs_rows, 512);
+        for n in [4096usize, 16384, 513, 100] {
+            let planned = PrefillChunkReceipt {
+                requested: 8192,
+                admitted: 8192,
+                commit_stride: None,
+            };
+            let chunk_batch = prefill_effective_chunk_batch(8192, pbs_rows, None);
+            let (receipt, reason) = executed_chunk_receipt(planned, chunk_batch, n, pbs_rows, None);
+            // Physical: replay the production chunk loop.
+            let mut max_chunk = 0usize;
+            let mut at = 0usize;
+            while at < n {
+                let c = next_ordinary_chunk_len(false, false, n - at, chunk_batch).unwrap();
+                max_chunk = max_chunk.max(c);
+                at += c;
+            }
+            if n > 512 {
+                assert!(
+                    max_chunk <= receipt.admitted,
+                    "n={n}: physical {max_chunk} exceeds logged"
+                );
+                if n >= 4096 {
+                    assert_eq!(receipt.admitted, max_chunk, "n={n}: logged != physical");
+                }
+                assert_eq!(receipt.admitted, 512);
+                let r = reason.expect("downgrade must be named");
+                assert!(
+                    r.contains("8192") && r.contains("512") && r.contains("scratch"),
+                    "{r}"
+                );
+                assert!(format!("{receipt}").contains("admitted=512"));
+            } else {
+                // Short call: n-row chunk, the planned ceiling is not downgraded.
+                assert!(reason.is_none());
+                assert!(max_chunk <= receipt.admitted);
+            }
+        }
+    }
+
     use super::super::forward::unsupported_mq3_experts_uniform_from_dtypes;
     use super::super::weights::DeltaNetStatePlan;
     use super::*;
@@ -7457,6 +7848,67 @@ mod tests {
         routed_codebook_grouped_supported, routed_uniform_mqv2_grouped_supported, MoePrefillDtypes,
     };
     use rdna_compute::DType;
+
+    #[test]
+    fn ordinary_prefill_mq3v25_projection_admission_requires_marker_and_safe_q8_wo() {
+        let la = [DType::MQ3G256V2; 8];
+        let fa = [DType::MQ3G256V2; 8]; // FA's seven weights, down repeated
+        let layer = |dtypes, delta_net| Some((dtypes, delta_net));
+        assert!(symmetric_mq3v2_projection_sets(
+            true,
+            [layer(la, true), layer(fa, false)].into_iter()
+        ));
+        let mut pro_la = la;
+        pro_la[4] = DType::Q8_0; // qt3 DeltaNet linear_attn.out_proj
+        assert!(symmetric_mq3v2_projection_sets(
+            true,
+            [layer(pro_la, true), layer(fa, false)].into_iter()
+        ));
+        assert!(!symmetric_mq3v2_projection_sets(
+            false,
+            [layer(pro_la, true)].into_iter()
+        ));
+        let mut wrong_la = la;
+        wrong_la[5] = DType::Q8_0;
+        assert!(!symmetric_mq3v2_projection_sets(
+            true,
+            [layer(wrong_la, true)].into_iter()
+        ));
+        let mut wrong_fa = fa;
+        wrong_fa[3] = DType::Q8_0;
+        assert!(!symmetric_mq3v2_projection_sets(
+            true,
+            [layer(wrong_fa, false)].into_iter()
+        ));
+        assert!(!symmetric_mq3v2_projection_sets(true, std::iter::empty()));
+        assert!(!symmetric_mq3v2_projection_sets(
+            true,
+            [layer(la, true), None].into_iter()
+        ));
+    }
+
+    /// A8 sizes 136-byte `block_i8_128` rows, A4 sizes 72-byte `block_i4_128`
+    /// rows, and only the unrouted gfx1201 reservation keeps the FP8 sizing.
+    #[test]
+    fn mq3_wide_projection_reservation_uses_a4_a8_block_sizes() {
+        let config = widened_test_config();
+        assert_eq!(config.hidden_dim, 17_408);
+        assert_eq!(iu4_row_bytes_wide(&config), Some(136 * 72));
+        assert_eq!(iu8_row_bytes_wide(&config), Some(136 * 136));
+        let rows = 8192;
+        let at = |arch, mq3| dense_prefill_reservation_bytes(&config, rows, arch, mq3).unwrap();
+        let base = at("gfx1100", Mq3WideProjection::Off);
+        assert_eq!(at("gfx1100", Mq3WideProjection::A4), base);
+        assert_eq!(at("gfx1201", Mq3WideProjection::A4), base);
+        assert_eq!(
+            at("gfx1201", Mq3WideProjection::A8) - base,
+            rows * (136 * 136 - 136 * 72)
+        );
+        assert_eq!(
+            at("gfx1201", Mq3WideProjection::Off) - base,
+            rows * (fp8_row_bytes_wide(&config).unwrap() - 136 * 72)
+        );
+    }
 
     /// Head geometry of the generalized chunk scan: 16 key heads, value heads a
     /// multiple of 16 up to 48, 128-wide heads, 4-tap conv.
@@ -10291,6 +10743,14 @@ mod tests {
         assert_eq!(WIDENED_VRAM_HEADROOM_BYTES, 1 << 30);
         assert!(resident_moe_rung_fits(&fit(need, 0, 0)));
         assert!(!resident_moe_rung_fits(&fit(need - 1, 0, 0)));
+        // A transient foreign allocation (free -> need-1) used to flip the route;
+        // planned capacity is independent of the instantaneous free figure.
+        let total = need + (30usize << 30);
+        let planned = |free_now: usize| {
+            rdna_compute::PlannedCapacity::new(free_now, total, 4usize << 30, true).bytes
+        };
+        assert_eq!(planned(total), planned(need - 1));
+        assert!(resident_moe_rung_fits(&fit(planned(need - 1), 0, 0)));
         // Pending allocations are deducted from free bytes (saturating).
         assert!(resident_moe_rung_fits(&fit(need + 4096, 4096, 0)));
         assert!(!resident_moe_rung_fits(&fit(need + 4096, 4097, 0)));

@@ -455,7 +455,22 @@ fn qsa_bf16_score_kernels_match_fused_scores_bit_for_bit() {
     }
     let mut cells_checked = 0usize;
     let mut cases = 0usize;
+    // `QSA_SCORES_BLOCKS=255,257,...` restricts the block counts (to split this exhaustive gate across bounded card
+    // jobs); unset = every block count. Each block count prints its own elapsed time.
+    let block_filter: Option<Vec<usize>> = std::env::var("QSA_SCORES_BLOCKS").ok().map(|s| {
+        s.split(',')
+            .map(|b| {
+                b.trim()
+                    .parse()
+                    .expect("QSA_SCORES_BLOCKS: comma-separated block counts")
+            })
+            .collect()
+    });
     for blocks in [255usize, 257, 2048, 8192, 32768, 65536] {
+        if block_filter.as_ref().is_some_and(|f| !f.contains(&blocks)) {
+            continue;
+        }
+        let block_t0 = std::time::Instant::now();
         for kind in [Keys::Dense, Keys::Ties, Keys::Wide] {
             let pooled = upload_bf16(&mut gpu, &keys_bf16(kind, blocks, blocks));
             for rows in 1..=WIDE_VERIFY_MAX_ROWS {
@@ -603,6 +618,10 @@ fn qsa_bf16_score_kernels_match_fused_scores_bit_for_bit() {
             );
             gpu.free_tensor(pooled).expect("free pooled");
         }
+        println!(
+            "blocks={blocks}: done in {:.1} s ({cases} launches so far)",
+            block_t0.elapsed().as_secs_f64()
+        );
     }
     println!("{cases} score launches bit-exact over {cells_checked} cells");
 }
@@ -1942,12 +1961,16 @@ fn split_switch() -> bool {
 
 #[test]
 fn qsa_bf16_split_production_route_matches_fused() {
-    let split_on = split_switch();
     let mut gpu = gpu_for_gate();
+    // gfx1100 is admitted unless the kill switch HIPFIRE_QWEN4_QSA_SPLIT_GFX1100=0
+    // is set in the process env (the knob is read once by the library).
+    let gfx1100_knob = std::env::var("HIPFIRE_QWEN4_QSA_SPLIT_GFX1100").as_deref() != Ok("0");
+    let arch_admitted = gpu.arch_caps.is_gfx1201() || (gpu.arch_caps.is_gfx1100() && gfx1100_knob);
     assert!(
-        gpu.arch_caps.is_gfx1201(),
-        "this production split-route gate requires exact gfx1201"
+        gpu.arch_caps.is_gfx1201() || gpu.arch_caps.is_gfx1100(),
+        "this production split-route gate requires gfx1201 or gfx1100"
     );
+    let split_on = split_switch() && arch_admitted;
     let fx = Fixture::new(&mut gpu, PRODUCTION);
     let reserved =
         reserve_qsa_bf16_split_scratch(&mut gpu, DType::BF16).expect("reserve split scratch");

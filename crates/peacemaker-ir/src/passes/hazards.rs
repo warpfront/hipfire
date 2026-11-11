@@ -30,6 +30,31 @@
 //! Depctr field positions are pinned by `llvm-mc -mcpu=gfx1201`: `sa_sdst`
 //! is bit 0, `va_vcc` is bit 1, `va_sdst` is bits [11:9] of the `s_wait_alu`
 //! simm16.
+//!
+//! gfx1201 wave64 (`AMDGPUWaitSGPRHazards.cpp`, gate
+//! `hasVALUReadSGPRHazard() = HasGFX12Insts && !HasGFX1250Insts`; the pass has
+//! no other wave-size dependence than `DsNopCount`, 4 vs 8, which only
+//! matters for `ds_nop` hazard culls that the hipcc incumbents never carry):
+//! * lane masks are SGPR *pairs*: explicit mask slots of `v_cmp*`,
+//!   `v_cndmask`, `v_*_co_*`, `v_*_co_ci_*`, `v_div_scale` are two SGPRs
+//!   wide (`codec::gfx12::operand_register`); `s_*_b64` mask operands are
+//!   genuine 64-bit SGPR pairs; EXEC is never tracked (`sgprNumber`), VCC is
+//!   tracked as the one pair `vcc_lo/vcc_hi` (s106/s107 → pair 53) with its
+//!   own SALU/VALU source (`VCCHazard`, waited by `sa_sdst` / `va_vcc`).
+//! * implicit VCC accesses (`HasImplicitVCC`: `v_cndmask_*_e32`,
+//!   `v_*_co_ci_*_e32`, `v_cmp_*_e32`, `v_div_fmas`, `s_cbranch_vcc*`) and
+//!   explicit `vcc`/`vcc_lo`/`vcc_hi` operands are replayed; a VALU write
+//!   reread by a SALU needs nothing (the SALU read clears it), a SALU write
+//!   reread by anything needs `sa_sdst(0)`, a VALU write reread by a VALU
+//!   needs `va_sdst(0)` (`va_vcc(0)` for VCC).
+//! * `SIInstrInfo::isVMEM && !isFLAT || isSMRD` clear the state; FLAT
+//!   encodings (`global_*`, `scratch_*`, `flat_*`) are `isFLAT` and do NOT
+//!   clear it, and `s_sendmsg_rtn_*` is SALU, not SMRD. `s_setpc_b64` /
+//!   `s_swappc_b64` (`IsSetPC`) must flush every pending write.
+//! * wave32 keeps the historic builder-parity model (VCC untracked, every
+//!   VMEM/FLAT/SMEM clears) so wave32 results are unchanged.
+//! Deliberate over-approximation shared with the wave32 port: a wide SGPR
+//! tuple marks every pair it spans tracked, LLVM marks only the base pair.
 
 use crate::cfg::{Body, InstId};
 use crate::effects::{Control, MemClass};
@@ -41,7 +66,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum HazardError {
-    #[error("hazard tables cover gfx1100/gfx1151/gfx1201 wave32 only (got {0:?} {1:?})")]
+    #[error(
+        "hazard tables cover gfx1100/gfx1151 (gfx11 rules) and gfx1201 (SGPR model, wave32 and wave64) only (got {0:?} {1:?})"
+    )]
     Unsupported(Arch, Wave),
     #[error("SGPR hazard replay needs a built CFG")]
     MissingCfg,
@@ -81,6 +108,51 @@ fn pipe_by_name(inst: &Inst, arch: Arch) -> Pipeline {
         _ => Pipeline::Ds,
     }
 }
+
+/// `AMDGPUWaitSGPRHazards::runOnMachineBasicBlock` instruction classes:
+/// `isVMEM && !isFLAT` and `isSMRD` clear the state, FLAT-encoded accesses
+/// (`global_*`, `scratch_*`, `flat_*`) are ignored, `s_sendmsg_rtn_*` is SOP1.
+fn llvm_pipe(inst: &Inst, arch: Arch) -> Pipeline {
+    let name = inst.op.name(arch).unwrap_or("");
+    // Every SMEM-encoded instruction is `isSMRD` in LLVM, including the effect-less hints (`s_prefetch_data`): it
+    // clears the pending state instead of consuming an SGPR (it is not a SALU/VALU in the pass's classification).
+    if inst.form == crate::inst::Form::Smem && !name.starts_with("s_sendmsg_rtn") {
+        return Pipeline::Smem;
+    }
+    match &inst.effects.mem {
+        Some(mem) => match mem.class {
+            MemClass::SmemLoad if name.starts_with("s_sendmsg_rtn") => Pipeline::Salu,
+            MemClass::SmemLoad | MemClass::SmemStore => Pipeline::Smem,
+            MemClass::FlatLoad | MemClass::FlatStore | MemClass::FlatAtomic { .. } => Pipeline::Ds,
+            MemClass::VmemLoad | MemClass::VmemStore | MemClass::VmemAtomic { .. }
+                if name.starts_with("global_") || name.starts_with("scratch_") =>
+            {
+                Pipeline::Ds
+            }
+            MemClass::VmemLoad | MemClass::VmemStore | MemClass::VmemAtomic { .. } => {
+                Pipeline::Vmem
+            }
+            _ => pipe_by_name(inst, arch),
+        },
+        None => pipe_by_name(inst, arch),
+    }
+}
+
+/// VCC reads/writes the way `AMDGPUWaitSGPRHazards` sees them: explicit VCC
+/// operands plus the instruction descriptor's implicit VCC. The ISA table's
+/// implicit column omits the VOP2/VOPC `_e32` VCC slot, so name it here.
+fn vcc_access(inst: &Inst, name: &str) -> (bool, bool) {
+    use crate::effects::ImplicitSet;
+    let e32 = name.ends_with("_e32");
+    let used = inst.effects.implicit.reads & ImplicitSet::VCC != 0
+        || e32 && (name.starts_with("v_cndmask_") || name.contains("_co_ci_"));
+    let defined = inst.effects.implicit.writes & ImplicitSet::VCC != 0
+        || e32 && (name.starts_with("v_cmp_") || name.contains("_co_ci_"));
+    (used, defined)
+}
+
+/// `vcc_lo`/`vcc_hi` are s106/s107: pair 53 in `AMDGPUWaitSGPRHazards::Tracked`.
+const VCC_PAIR: usize = 53;
 
 /// Port of `peacemaker-isa` `Gfx12Sgpr`: tracks SGPR pairs read by VALU and
 /// written by SALU/VALU, demanding `depctr_*_sdst(0)` / `depctr_va_vcc(0)`
@@ -139,6 +211,26 @@ impl Gfx12Sgpr {
         self.vcc_valu = false;
     }
 
+    /// `IsSetPC` (`s_setpc_b64`, `s_swappc_b64`, calls, returns): every pending
+    /// write must be flushed because the target will not see the hazard chain.
+    pub fn flush(&mut self) -> Vec<&'static str> {
+        let mut waits = Vec::new();
+        if self.salu.iter().any(|b| *b) || self.vcc_salu {
+            waits.push("depctr_sa_sdst(0)");
+        }
+        if self.valu.iter().any(|b| *b) {
+            waits.push("depctr_va_sdst(0)");
+        }
+        if self.vcc_valu {
+            waits.push("depctr_va_vcc(0)");
+        }
+        self.salu.fill(false);
+        self.valu.fill(false);
+        self.vcc_salu = false;
+        self.vcc_valu = false;
+        waits
+    }
+
     pub fn step(
         &mut self,
         pipe: Pipeline,
@@ -173,7 +265,7 @@ impl Gfx12Sgpr {
                 }
             }
         }
-        if vcc_use {
+        if vcc_use && self.tracked[VCC_PAIR] {
             sa |= self.vcc_salu;
             if pipe == Pipeline::Valu {
                 vcc |= self.vcc_valu;
@@ -205,6 +297,9 @@ impl Gfx12Sgpr {
                 }
             }
         }
+        if vcc_use && pipe == Pipeline::Valu {
+            self.tracked[VCC_PAIR] = true;
+        }
         for reg in defs {
             if reg.kind == Kind::S {
                 for n in reg.base as usize..reg.base as usize + reg.len as usize {
@@ -218,7 +313,7 @@ impl Gfx12Sgpr {
                 }
             }
         }
-        if vcc_def {
+        if vcc_def && self.tracked[VCC_PAIR] {
             self.vcc_salu = pipe == Pipeline::Salu;
             self.vcc_valu = pipe == Pipeline::Valu;
         }
@@ -332,15 +427,40 @@ pub struct HazardAnalysis {
     pub obligations: Vec<Obligation>,
 }
 
+/// Which SGPR-hazard replay a gfx1201 analysis runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SgprModel {
+    /// The builder-parity boundary the wave32 pipeline has always used: VCC is
+    /// not producer-tracked and every VMEM/FLAT/SMEM access clears the state.
+    BuilderParity,
+    /// `AMDGPUWaitSGPRHazards.cpp` as LLVM runs it: VCC tracked as a pair, FLAT
+    /// (`global_*`/`scratch_*`/`flat_*`) does not clear, `IsSetPC` flushes.
+    LlvmExact,
+}
+
 /// Whole-program hazard replay for the supported ISA tables. RDNA3 gfx11
-/// admits wave32 and wave64; gfx1201's validated SGPR model is wave32 only.
+/// admits wave32 and wave64; gfx1201 replays the `AMDGPUWaitSGPRHazards` SGPR
+/// model in both wave sizes (lane masks are SGPR pairs in wave64, see the
+/// module docs). wave32 uses [`SgprModel::BuilderParity`] (unchanged), wave64
+/// uses [`SgprModel::LlvmExact`].
 pub fn analyze(body: &Body, arch: Arch, wave: Wave) -> Result<HazardAnalysis, HazardError> {
-    if arch == Arch::Gfx1201 && wave != Wave::Wave32 {
-        return Err(HazardError::Unsupported(arch, wave));
-    }
+    let model = match wave {
+        Wave::Wave32 => SgprModel::BuilderParity,
+        Wave::Wave64 => SgprModel::LlvmExact,
+    };
+    analyze_with(body, arch, wave, model)
+}
+
+/// [`analyze`] with an explicit gfx1201 SGPR model (ignored on gfx11).
+pub fn analyze_with(
+    body: &Body,
+    arch: Arch,
+    wave: Wave,
+    model: SgprModel,
+) -> Result<HazardAnalysis, HazardError> {
     let mut analysis = HazardAnalysis::default();
     match arch {
-        Arch::Gfx1201 => run_sgpr(body, arch, wave, &mut analysis)?,
+        Arch::Gfx1200 | Arch::Gfx1201 => run_sgpr_model(body, arch, wave, model, &mut analysis)?,
         Arch::Gfx1100 | Arch::Gfx1151 => run_gfx11(body, arch, &mut analysis),
         _ => return Err(HazardError::Unsupported(arch, wave)),
     }
@@ -473,6 +593,7 @@ fn sgpr_block(
     body: &Body,
     arch: Arch,
     wave: Wave,
+    model: SgprModel,
     block: &crate::cfg::Block,
     machine: &mut Gfx12Sgpr,
     mut analysis: Option<&mut HazardAnalysis>,
@@ -493,53 +614,27 @@ fn sgpr_block(
             }
             continue;
         }
-        // Encoding rows use 64-bit slots for lane masks in both wave sizes.
-        // Use the kernel's metadata-selected wave width, unlike genuine
-        // 64-bit scalar data operands, which remain two registers.
-        let mask_len = match wave {
-            Wave::Wave32 => 1,
-            Wave::Wave64 => 2,
-        };
+        // Encoding rows use 64-bit slots for lane masks in both wave sizes;
+        // `wave_effects` narrows them to the kernel's wave width and leaves
+        // genuine 64-bit scalar data operands as two registers.
         let name = inst.op.name(arch).unwrap_or("");
-        let mut uses = smallvec::SmallVec::<[RegRef; 4]>::new();
-        let mut defs = smallvec::SmallVec::<[RegRef; 2]>::new();
-        let mask_input =
-            name.starts_with("v_cndmask_") || (name.starts_with("v_") && name.contains("_co_ci_"));
-        let mask_output = name.starts_with("v_cmp")
-            || name.starts_with("v_div_scale_")
-            || (name.starts_with("v_") && name.contains("_co_"));
-        let use_refs = if mask_input {
-            let mask = inst.operands.last().and_then(|operand| match operand {
-                Operand::Reg(reg) => Some(*reg),
-                _ => None,
-            });
-            uses.extend(inst.effects.uses.iter().map(|reg| {
-                let mut reg = *reg;
-                if Some(reg) == mask && reg.kind == Kind::S {
-                    reg.len = mask_len;
-                }
-                reg
-            }));
-            uses.as_slice()
-        } else {
-            inst.effects.uses.as_slice()
-        };
-        let def_refs = if mask_output {
-            defs.extend(inst.effects.defs.iter().map(|reg| {
-                let mut reg = *reg;
-                if reg.kind == Kind::S {
-                    reg.len = mask_len;
-                }
-                reg
-            }));
-            defs.as_slice()
-        } else {
-            inst.effects.defs.as_slice()
-        };
-        // Same explicit capability boundary as the builder: VCC is not
-        // producer-tracked here.
+        let effects = crate::effects::wave_effects(arch, wave, inst);
+        let use_refs = effects.uses.as_slice();
+        let def_refs = effects.defs.as_slice();
+        // LlvmExact replays the LLVM pass exactly (VCC tracked, FLAT does not
+        // clear, IsSetPC flushes). BuilderParity keeps the historic boundary:
+        // VCC is not producer-tracked and every memory access clears.
+        let exact = model == SgprModel::LlvmExact;
         let prior = machine.clone();
-        for demand in machine.step(pipe_of(inst, arch), use_refs, def_refs, false, false) {
+        let demands = if exact && matches!(name, "s_setpc_b64" | "s_swappc_b64") {
+            machine.flush()
+        } else if exact {
+            let (vcc_use, vcc_def) = vcc_access(inst, name);
+            machine.step(llvm_pipe(inst, arch), use_refs, def_refs, vcc_use, vcc_def)
+        } else {
+            machine.step(pipe_of(inst, arch), use_refs, def_refs, false, false)
+        };
+        for demand in demands {
             // A missing guard is not an imaginary wait. Keep unresolved
             // writes pending so later consumers also see the real state.
             match demand {
@@ -573,10 +668,26 @@ fn sgpr_block(
     }
 }
 
+/// Default-model replay (wave32 builder parity, wave64 exact); unit tests.
+#[cfg(test)]
 fn run_sgpr(
     body: &Body,
     arch: Arch,
     wave: Wave,
+    analysis: &mut HazardAnalysis,
+) -> Result<(), HazardError> {
+    let model = match wave {
+        Wave::Wave32 => SgprModel::BuilderParity,
+        Wave::Wave64 => SgprModel::LlvmExact,
+    };
+    run_sgpr_model(body, arch, wave, model, analysis)
+}
+
+fn run_sgpr_model(
+    body: &Body,
+    arch: Arch,
+    wave: Wave,
+    model: SgprModel,
     analysis: &mut HazardAnalysis,
 ) -> Result<(), HazardError> {
     if body.layout.is_empty() {
@@ -602,7 +713,7 @@ fn run_sgpr(
                 }
             }
             let next = at.clone().map(|mut s| {
-                sgpr_block(body, arch, wave, block, &mut s, None);
+                sgpr_block(body, arch, wave, model, block, &mut s, None);
                 s
             });
             changed |= next != outputs[index];
@@ -619,7 +730,7 @@ fn run_sgpr(
     }
     for (block, input) in body.blocks.iter().zip(inputs) {
         if let Some(mut state) = input {
-            sgpr_block(body, arch, wave, block, &mut state, Some(analysis));
+            sgpr_block(body, arch, wave, model, block, &mut state, Some(analysis));
         }
     }
     Ok(())
@@ -647,7 +758,7 @@ fn wmma_block(
                     .iter()
                     .take(2)
                     .any(|src| old.overlaps(*src))
-                    || (arch == Arch::Gfx1201
+                    || (arch.is_gfx12()
                         && name.starts_with("v_swmmac_")
                         && inst
                             .effects
@@ -928,6 +1039,225 @@ mod tests {
             found.missing.iter().any(|m| m.inst == body.layout[3]),
             "{found:?}"
         );
+    }
+
+    // gfx1201 wave64 encodings (llvm-mc -mcpu=gfx1201 -mattr=+wavefrontsize64).
+    const CNDMASK_VCC: &[u32] = &[0x0204_0903]; // v_cndmask_b32_e32 v2, v3, v4, vcc
+    const CMP_VCC: &[u32] = &[0x7c82_0300]; // v_cmp_lt_i32_e32 vcc, v0, v1
+    const CBR_VCCZ_1: &[u32] = &[0xbfa3_0001]; // s_cbranch_vccz +1
+    const SAVEEXEC_VCC: &[u32] = &[0xbe82_216a]; // s_and_saveexec_b64 s[2:3], vcc
+    const CNDMASK_S23_A: &[u32] = &[0xd501_0000, 0x000a_0501]; // v_cndmask_b32_e64 v0, v1, v2, s[2:3]
+    const CMP64_S23: &[u32] = &[0xd441_0002, 0x0202_0300]; // v_cmp_lt_i32_e64 s[2:3], v0, v1
+    const CNDMASK_S23_B: &[u32] = &[0xd501_0003, 0x000a_0501]; // v_cndmask_b32_e64 v3, v1, v2, s[2:3]
+    const MOV_V0_S3: &[u32] = &[0x7e00_0203]; // v_mov_b32_e32 v0, s3
+    const MOV_V1_S3: &[u32] = &[0x7e02_0203]; // v_mov_b32_e32 v1, s3
+    const MOV_S23_0: &[u32] = &[0xbe82_0180]; // s_mov_b64 s[2:3], 0
+    const AND_VCC_EXEC_S45: &[u32] = &[0x8bea_047e]; // s_and_b64 vcc, exec, s[4:5]
+    const WAIT_VA_SDST0: &[u32] = &[0xbf88_f19f]; // s_wait_alu depctr_va_sdst(0)
+    const WAIT_SA_SDST0: &[u32] = &[0xbf88_ff9e]; // s_wait_alu depctr_sa_sdst(0)
+    const WAIT_VA_VCC0: &[u32] = &[0xbf88_ff9d]; // s_wait_alu depctr_va_vcc(0)
+    const GLOBAL_LOAD: &[u32] = &[0xee05_007c, 0, 2]; // global_load_b32 v0, v[2:3], off
+    const BUFFER_LOAD: &[u32] = &[0xc405_000c, 0x4080_1000, 1]; // buffer_load_b32 v0, v1, s[8:11], s12 offen
+    const S_LOAD: &[u32] = &[0xf400_0000, 0xf800_0000]; // s_load_b32 s0, s[0:1], 0x0
+    const S_PREFETCH: &[u32] = &[0xf404_c00b, 0xf800_0000]; // s_prefetch_data s[22:23], 0x0, null, 0
+    const SETPC_S45: &[u32] = &[0xbe80_4804]; // s_setpc_b64 s[4:5]
+    const ENDPGM: &[u32] = &[0xbfb0_0000]; // s_endpgm
+
+    fn decode_body(arch: Arch, seq: &[&[u32]]) -> Body {
+        let mut body = Body::default();
+        for words in seq.iter().chain(std::iter::once(&ENDPGM)) {
+            let (inst, used) = crate::codec::gfx12::decode_for(arch, words).expect("decode");
+            assert_eq!(used, words.len(), "{words:x?}");
+            body.layout.push(body.insts.insert(inst));
+        }
+        match crate::passes::cfg::build_blocks(&mut body, arch) {
+            Ok(_) => {}
+            // A bare `s_setpc_b64 s[4:5]` has no resolvable target (the CFG builder refuses it); these tests exercise
+            // the hazard model, not control flow, so lay the stream out as the single block it textually is.
+            Err(crate::passes::cfg::CfgError::UnresolvedIndirectJump { .. }) => {
+                body.blocks = vec![crate::cfg::Block {
+                    id: crate::cfg::BlockId(0),
+                    range: (0, body.layout.len()),
+                    term: crate::cfg::Terminator::EndPgm,
+                    preds: Default::default(),
+                    succs: Default::default(),
+                }];
+            }
+            Err(error) => panic!("cfg: {error:?}"),
+        }
+        body
+    }
+
+    /// `(body, missing waits as (layout index, wait))` of one gfx1201 stream.
+    fn gfx1201_missing(wave: Wave, seq: &[&[u32]]) -> Vec<(usize, String)> {
+        let body = decode_body(Arch::Gfx1201, seq);
+        let found = analyze(&body, Arch::Gfx1201, wave).expect("gfx1201 analysis");
+        found
+            .missing
+            .iter()
+            .map(|m| {
+                let at = body.layout.iter().position(|id| *id == m.inst).unwrap();
+                (at, m.wait.clone())
+            })
+            .collect()
+    }
+
+    /// AMDGPUWaitSGPRHazards, wave64: VCC is the tracked pair vcc_lo/vcc_hi
+    /// and EXEC is never tracked, so a VALU-written VCC read by the SALU
+    /// branch / saveexec needs nothing (the SALU read retires it).
+    #[test]
+    fn gfx1201_wave64_accepts_vcc_branch_and_saveexec() {
+        let seq: &[&[u32]] = &[CNDMASK_VCC, CMP_VCC, CBR_VCCZ_1, SAVEEXEC_VCC, CNDMASK_VCC];
+        // The last v_cndmask rereads the VALU-written VCC after the SALU read
+        // retired it: nothing pending, so the stream is accepted.
+        assert_eq!(gfx1201_missing(Wave::Wave64, seq), vec![]);
+        // Same stream without the SALU consumer: VALU VCC write, VALU reread.
+        assert_eq!(
+            gfx1201_missing(Wave::Wave64, &[CNDMASK_VCC, CMP_VCC, CNDMASK_VCC]),
+            vec![(2, "depctr_va_vcc(0)".to_string())]
+        );
+    }
+
+    #[test]
+    fn gfx1201_wave64_vcc_waits_are_verified() {
+        // SALU write of VCC reread by a VALU needs sa_sdst(0).
+        let hazard: &[&[u32]] = &[CNDMASK_VCC, AND_VCC_EXEC_S45, CNDMASK_VCC];
+        assert_eq!(
+            gfx1201_missing(Wave::Wave64, hazard),
+            vec![(2, "depctr_sa_sdst(0)".to_string())]
+        );
+        assert_eq!(
+            gfx1201_missing(
+                Wave::Wave64,
+                &[CNDMASK_VCC, AND_VCC_EXEC_S45, WAIT_SA_SDST0, CNDMASK_VCC]
+            ),
+            vec![]
+        );
+        // va_vcc(0) retires a VALU VCC write; sa_sdst(0) does not.
+        let valu: &[&[u32]] = &[CNDMASK_VCC, CMP_VCC, WAIT_SA_SDST0, CNDMASK_VCC];
+        assert_eq!(
+            gfx1201_missing(Wave::Wave64, valu),
+            vec![(3, "depctr_va_vcc(0)".to_string())]
+        );
+        assert_eq!(
+            gfx1201_missing(
+                Wave::Wave64,
+                &[CNDMASK_VCC, CMP_VCC, WAIT_VA_VCC0, CNDMASK_VCC]
+            ),
+            vec![]
+        );
+        // VCC that no VALU ever read is not tracked (LLVM `Tracked`).
+        assert_eq!(
+            gfx1201_missing(Wave::Wave64, &[AND_VCC_EXEC_S45, CNDMASK_VCC]),
+            vec![]
+        );
+    }
+
+    /// The synthetic wave64 violation: a VALU-written lane-mask pair read by
+    /// a VALU without `s_wait_alu depctr_va_sdst(0)`.
+    #[test]
+    fn gfx1201_wave64_missing_va_sdst_is_caught() {
+        let hazard: &[&[u32]] = &[CNDMASK_S23_A, CMP64_S23, CNDMASK_S23_B];
+        assert_eq!(
+            gfx1201_missing(Wave::Wave64, hazard),
+            vec![(2, "depctr_va_sdst(0)".to_string())]
+        );
+        assert_eq!(
+            gfx1201_missing(
+                Wave::Wave64,
+                &[CNDMASK_S23_A, CMP64_S23, WAIT_VA_SDST0, CNDMASK_S23_B]
+            ),
+            vec![]
+        );
+        // sa_sdst(0) is not the guard for a VALU write.
+        assert_eq!(
+            gfx1201_missing(
+                Wave::Wave64,
+                &[CNDMASK_S23_A, CMP64_S23, WAIT_SA_SDST0, CNDMASK_S23_B]
+            ),
+            vec![(3, "depctr_va_sdst(0)".to_string())]
+        );
+    }
+
+    /// Mask pairs are two SGPRs wide in wave64 only: the VALU read of the high
+    /// half s3 hits the pair written by the 64-bit `v_cmp`, but in wave32 the
+    /// mask is s2 alone.
+    #[test]
+    fn gfx1201_mask_pair_high_half_is_wave64_only() {
+        let seq: &[&[u32]] = &[MOV_V0_S3, CMP64_S23, MOV_V1_S3];
+        assert_eq!(
+            gfx1201_missing(Wave::Wave64, seq),
+            vec![(2, "depctr_va_sdst(0)".to_string())]
+        );
+        assert_eq!(gfx1201_missing(Wave::Wave32, seq), vec![]);
+    }
+
+    /// s_and_saveexec_b64 writes a genuine SGPR pair (both halves) and EXEC
+    /// itself is never a tracked register.
+    #[test]
+    fn gfx1201_wave64_saveexec_defines_the_whole_pair() {
+        let mov_v1_s2: &[u32] = &[0x7e02_0202]; // v_mov_b32_e32 v1, s2
+        assert_eq!(
+            gfx1201_missing(Wave::Wave64, &[MOV_V0_S3, SAVEEXEC_VCC, mov_v1_s2]),
+            vec![(2, "depctr_sa_sdst(0)".to_string())]
+        );
+    }
+
+    /// `isVMEM && !isFLAT` and `isSMRD` retire pending writes, FLAT
+    /// (`global_*`) does not; `s_setpc_b64` flushes everything.
+    #[test]
+    fn gfx1201_wave64_memory_clears_and_setpc_flushes() {
+        let tail = |mem: &'static [u32]| -> Vec<(usize, String)> {
+            gfx1201_missing(Wave::Wave64, &[MOV_V0_S3, MOV_S23_0, mem, MOV_V1_S3])
+        };
+        assert_eq!(
+            tail(GLOBAL_LOAD),
+            vec![(3, "depctr_sa_sdst(0)".to_string())]
+        );
+        assert_eq!(tail(BUFFER_LOAD), vec![]);
+        assert_eq!(tail(S_LOAD), vec![]);
+        // SMEM hints are `isSMRD` too: a prefetch consumes no pending SGPR write and clears the state.
+        assert_eq!(tail(S_PREFETCH), vec![]);
+        // wave32 keeps the historic model where every VMEM/FLAT access clears.
+        assert_eq!(
+            gfx1201_missing(
+                Wave::Wave32,
+                &[MOV_V0_S3, MOV_S23_0, GLOBAL_LOAD, MOV_V1_S3]
+            ),
+            vec![]
+        );
+        assert_eq!(
+            gfx1201_missing(Wave::Wave64, &[MOV_V0_S3, MOV_S23_0, SETPC_S45]),
+            vec![(2, "depctr_sa_sdst(0)".to_string())]
+        );
+        assert_eq!(
+            gfx1201_missing(
+                Wave::Wave64,
+                &[MOV_V0_S3, MOV_S23_0, WAIT_SA_SDST0, SETPC_S45]
+            ),
+            vec![]
+        );
+    }
+
+    /// `analyze_with` picks the model explicitly: LLVM-exact in wave32 sees the
+    /// FLAT write that builder parity retires, and wave64 builder parity
+    /// retires it again.
+    #[test]
+    fn gfx1201_model_is_selectable_per_wave() {
+        let body = decode_body(
+            Arch::Gfx1201,
+            &[MOV_V0_S3, MOV_S23_0, GLOBAL_LOAD, MOV_V1_S3],
+        );
+        let missing = |wave, model| {
+            analyze_with(&body, Arch::Gfx1201, wave, model)
+                .unwrap()
+                .missing
+                .len()
+        };
+        assert_eq!(missing(Wave::Wave32, SgprModel::BuilderParity), 0);
+        assert_eq!(missing(Wave::Wave32, SgprModel::LlvmExact), 1);
+        assert_eq!(missing(Wave::Wave64, SgprModel::BuilderParity), 0);
+        assert_eq!(missing(Wave::Wave64, SgprModel::LlvmExact), 1);
     }
 
     /// Gfx12Sgpr tracks the builder's exact demand sequence.

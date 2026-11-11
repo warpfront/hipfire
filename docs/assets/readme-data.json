@@ -1,126 +1,5 @@
 {
-  "_comment": "Inputs for scripts/readme_charts.py. gains: hipfire.dev 0.4.1 release-matrix cells vs the same Halo release-matrix lane rerun on v0.4.2, plus the v0.4.2 16K NPU receipt. Matrix sources per column below. Regenerate with: python3 scripts/readme_charts.py",
-  "gains": {
-    "title": "hipfire 0.4.1 → 0.4.2 on Strix Halo",
-    "subtitle": "Qwen3.8-Flash (qwen3.8:flash-next), qwen3.8-flash-next.mq4-xts, gfx1151, release defaults, medians of 3 fresh processes",
-    "alt": "hipfire 0.4.1 vs 0.4.2 on Strix Halo, Qwen3.8-Flash: prefill, decode and 16K NPU prefill",
-    "legend": {
-      "before": "0.4.1 (hipfire.dev, 2026-10-07)",
-      "after": "0.4.2 (same lane rerun, 2026-10-14)"
-    },
-    "panels": [
-      {
-        "panel": "Prefill",
-        "unit": "tok/s",
-        "higher_is_better": true,
-        "caption": "0.4.1: hipfire.dev/benchmarks/0.4.1, 2026-10-07 · 0.4.2: same release-matrix cells rerun on v0.4.2 (6ea3f5076), 2026-10-14",
-        "rows": [
-          {
-            "label": "synthetic pp8192, cold prefill",
-            "before": {
-              "median": 2072.9,
-              "min": 2072.7,
-              "max": 2076.9
-            },
-            "after": {
-              "median": 2156.1,
-              "min": 2155.4,
-              "max": 2157.8
-            }
-          },
-          {
-            "label": "32K prompt file, cold prefill",
-            "before": {
-              "median": 1776.5,
-              "min": 1776.3,
-              "max": 1780.3
-            },
-            "after": {
-              "median": 2305.9,
-              "min": 2298.4,
-              "max": 2318.0
-            }
-          }
-        ]
-      },
-      {
-        "panel": "Decode",
-        "unit": "tok/s",
-        "higher_is_better": true,
-        "caption": "0.4.1: hipfire.dev/benchmarks/0.4.1, 2026-10-07 · 0.4.2: same release-matrix cells rerun on v0.4.2 (6ea3f5076), 2026-10-14",
-        "rows": [
-          {
-            "label": "greedy AR",
-            "before": {
-              "median": 33.78,
-              "min": 33.77,
-              "max": 33.88
-            },
-            "after": {
-              "median": 34.15,
-              "min": 34.14,
-              "max": 34.21
-            }
-          },
-          {
-            "label": "greedy native MTP",
-            "before": {
-              "median": 58.67,
-              "min": 58.54,
-              "max": 58.76
-            },
-            "after": {
-              "median": 60.2,
-              "min": 60.14,
-              "max": 60.36
-            }
-          },
-          {
-            "label": "sampled MTP, presence 1.5",
-            "before": {
-              "median": 56.98,
-              "min": 45.55,
-              "max": 57.21
-            },
-            "after": {
-              "median": 60.9,
-              "min": 60.13,
-              "max": 61.91
-            }
-          }
-        ]
-      },
-      {
-        "panel": "16K prefill with the NPU trunk",
-        "unit": "tok/s",
-        "higher_is_better": true,
-        "caption": "v0.4.2 shipped tip 6ea3f5076, Strix Halo + XDNA2, client TTFT, 3 fresh processes × 3 requests, 2026-10-14",
-        "rows": [
-          {
-            "label": "16,355-token prompt (TTFT 6,854 ms)",
-            "before": null,
-            "new": true,
-            "after": {
-              "median": 2386.2,
-              "min": 2346.4,
-              "max": 2392.1
-            }
-          }
-        ]
-      }
-    ],
-    "footnotes": [
-      "Same artifact, host and protocol on both sides; the 0.4.1 cells are copied from hipfire.dev/benchmarks/0.4.1.",
-      "Sampled MTP (seed 123): in 0.4.2 three of eight prompts give different token streams across fresh processes (known issue: wall-time route",
-      "chooser); greedy AR and MTP are bit-identical across processes. 0.4.2 runs its new defaults (trunk overlay, q4 PLE, NPU trunk auto;",
-      "the NPU engages only on the 32K cell). Sources: hipfire.dev/benchmarks/0.4.2, docs/assets/readme-data.json."
-    ],
-    "sources": {
-      "v041": "https://hipfire.dev/benchmarks/0.4.1 (Cold prefill and decode table), measured 2026-10-07",
-      "v042": "Release-matrix rerun on v0.4.2 code (build 6ea3f5076, daemon md5 e4ccd5c9393642134c307ebf2787d430), Strix Halo gfx1151, 2026-10-14 07:30-08:09Z, 3 fresh processes, warm discarded; receipts /home/kaden/qcal/release-0.4.2/rel-matrix-042/runs/<cell>/r1..r3 (REPORT-table.md). NPU trunk engaged only on the 32K cell. Table: rel-matrix-042/REPORT-table.md; details SUMMARY.md.",
-      "npu16k": "RELEASE-NOTES-0.4.2 NPU section; hipx ~/pm-wave/npuprefill-check/runs/ship-20261014T064851Z T2b-r1..3 (9 client TTFTs 6,837.0-6,970.3 ms; median 6,854.1)"
-    }
-  },
+  "_comment": "Inputs for scripts/readme_charts.py (GPU support matrix). Sources per column below. Regenerate with: python3 scripts/readme_charts.py",
   "matrix": {
     "_comment": "Levels: tuned = arch-specific kernels or default-on route; generic = runs on the portable/typed-dispatch path; none = not available. Capability, not admission or certification (docs/ARCHITECTURE.md).",
     "features": [
@@ -175,7 +54,7 @@
           "tuned",
           "tuned",
           "tuned",
-          "generic",
+          "tuned",
           "none",
           "tuned"
         ]
@@ -206,10 +85,10 @@
       }
     ],
     "sources": {
-      "Decode": "docs/ARCHITECTURE.md kernel-select layer (hipfire-dispatch / rdna-compute family tables pick WMMA -> specialized -> baseline); README GPU table",
+      "Decode": "docs/ARCHITECTURE.md kernel-select layer (hipfire-dispatch / rdna-compute family tables pick WMMA -> specialized -> baseline); README GPU table; CHANGELOG 0.4.4 #478: MQ6/HFQ6 GEMV rows admitted on RDNA1/RDNA2 (generic wave32 kernels, resolve-tested on CPU)",
       "Prefill WMMA": "docs/ARCHITECTURE.md (WMMA family tables); docs/BENCHMARKS.md supporting notes (gfx12 WMMA paths; gfx906 uses dp4a MMQ, CDNA is MFMA not WMMA)",
-      "DFlash": "docs/speculation-support-inventory.md (DFlash is per model arch, GPU-generic); tuned: CHANGELOG 0.4.2 gfx1100 shared rotations, gfx1151 XLDS verify GEMMs, gfx1201 continuous-batching / device accept",
-      "MTP": "docs/speculation-support-inventory.md (MTP per model arch); tuned: CHANGELOG 0.4.2 gfx1151 MTP cap 4 + DET prompt fill, gfx1201 batched MTP fill",
+      "DFlash": "docs/speculation-support-inventory.md (DFlash is per model arch, GPU-generic); tuned: CHANGELOG 0.4.2 gfx1100 shared rotations, gfx1151 XLDS verify GEMMs, gfx1201 continuous-batching / device accept; CHANGELOG 0.4.4 gfx1201 native-fp8 split-KV verifier (#921, #922)",
+      "MTP": "docs/speculation-support-inventory.md (MTP per model arch); tuned: CHANGELOG 0.4.2 gfx1151 MTP cap 4 + DET prompt fill, gfx1201 batched MTP fill; CHANGELOG 0.4.4 exact gfx1100 int8-activation verify GEMV (#987), WMMA split-K verify attention (#989), 65,536-token draft vocabulary (#998), all default on",
       "NPU prefill": "CHANGELOG 0.4.2 Flash-Next NPU trunk route: exact gfx1151 with XDNA2 only",
       "Redline": "README / docs/ARCHITECTURE.md Redline roles: RDNA1-RDNA4 dispatch; mq4r_redline_default on exact gfx1100/gfx1151/gfx1201"
     }

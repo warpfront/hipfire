@@ -1,0 +1,34 @@
+{
+  "gemm_mq6g256v2_residual_pm_gfx1100_w4": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 9,
+    "clauses": 0,
+    "delays": 178,
+    "instructions": 4485,
+    "lds_accesses": 592,
+    "lds_max_known_end": null,
+    "lds_unknown_addresses": 520,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 84,
+    "table": "gfx1100",
+    "vgpr_high_water": 256,
+    "wait_facts": 476
+  },
+  "gemm_mq6g256v2_residual_pm_gfx1100_w8": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 9,
+    "clauses": 0,
+    "delays": 170,
+    "instructions": 4353,
+    "lds_accesses": 556,
+    "lds_max_known_end": null,
+    "lds_unknown_addresses": 520,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 84,
+    "table": "gfx1100",
+    "vgpr_high_water": 236,
+    "wait_facts": 440
+  }
+}

@@ -34,7 +34,7 @@
 //!     symbol moves with its section. Program headers keep their first/last section and the
 //!     head/tail distance to them.
 //! 11. The descriptor's entry offset is `entry - kd`; `INST_PREF_SIZE` (rsrc3 11:4) becomes
-//!     `min(ceil(size / 128), 255)` when the input descriptor followed that rule (hipcc and
+//!     `min(ceil(size / 128), 255; 63 on gfx11, whose prefetch field is 6 bits)` when the input descriptor followed that rule (hipcc and
 //!     the builder both do); a resized kernel whose input did not follow it is refused.
 //!
 //! Every rule is first applied to the input's own sizes and must reproduce the input
@@ -60,8 +60,16 @@ const CACHE_LINE: u64 = 128;
 const CODE_END_EXTRA: u64 = 3 * CACHE_LINE;
 const INST_PREF_SHIFT: u32 = 4;
 const INST_PREF_MAX: u32 = 0xff;
+/// gfx11 rsrc3 prefetch is 6 bits [9:4] (bits [11:10] must be zero; AMDGPUUsage
+/// compute_pgm_rsrc3-gfx10-gfx11), so hipcc caps it at 63.
+const INST_PREF_MAX_GFX11: u32 = 0x3f;
 const GNU_HASH_SHIFT2: u32 = 26;
+const EF_AMDGPU_MACH_GFX1200: u32 = 0x48;
 const EF_AMDGPU_MACH_GFX1201: u32 = 0x4e;
+/// gfx1100 / gfx1151 (hipcc and the builder link them with the same ld.lld rules; the
+/// input-reproduction check below is the proof, not the machine number).
+const EF_AMDGPU_MACH_GFX1100: u32 = 0x41;
+const EF_AMDGPU_MACH_GFX1151: u32 = 0x4a;
 /// `e_ident[EI_ABIVERSION]` of code object v6.
 const ABI_VERSION_V6: u8 = 4;
 const SHN_LORESERVE: u16 = 0xff00;
@@ -89,13 +97,13 @@ fn align_skew(x: u64, a: u64, skew: u64) -> u64 {
     }
 }
 
-/// `INST_PREF_SIZE` for a kernel of `size` bytes.
-pub(crate) fn inst_pref_size(size: u64) -> u32 {
-    size.div_ceil(CACHE_LINE).min(u64::from(INST_PREF_MAX)) as u32
+/// `INST_PREF_SIZE` for a kernel of `size` bytes, saturating at the field's `max`.
+pub(crate) fn inst_pref_size(size: u64, max: u32) -> u32 {
+    size.div_ceil(CACHE_LINE).min(u64::from(max)) as u32
 }
 
-fn inst_pref_field(rsrc3: Rsrc3) -> u32 {
-    (rsrc3.0 >> INST_PREF_SHIFT) & INST_PREF_MAX
+fn inst_pref_field(rsrc3: Rsrc3, max: u32) -> u32 {
+    (rsrc3.0 >> INST_PREF_SHIFT) & max
 }
 
 /// The re-laid-out module: an envelope whose fixed-layout write is the module, and each
@@ -770,10 +778,16 @@ pub(crate) fn relayout(
     metadata: &[&HsaKernelMetadata],
 ) -> Result<Layout, ElfError> {
     if env.header.abi_version != ABI_VERSION_V6
-        || env.header.e_flags & 0xff != EF_AMDGPU_MACH_GFX1201
+        || !matches!(
+            env.header.e_flags & 0xff,
+            EF_AMDGPU_MACH_GFX1200
+                | EF_AMDGPU_MACH_GFX1201
+                | EF_AMDGPU_MACH_GFX1100
+                | EF_AMDGPU_MACH_GFX1151
+        )
     {
         return Err(fail(
-            "re-layout is modelled for code object v6 gfx1201 only",
+            "re-layout is modelled for code object v6 gfx1100, gfx1151, gfx1200 and gfx1201 only",
         ));
     }
     if env.gaps.iter().any(|g| !matches!(g.fill, Fill::Zero(_))) {
@@ -1150,13 +1164,22 @@ pub(crate) fn relayout(
         let mut d = part.descriptor.clone();
         let old_size = env.kernels[k].size;
         if code_sizes[k] != old_size {
-            if inst_pref_field(d.compute_pgm_rsrc3) != inst_pref_size(old_size) {
-                return Err(fail(format!("kernel {} changed size but its INST_PREF_SIZE {} does not follow min(ceil(size/128), 255) = {}",
-                    slot.name, inst_pref_field(d.compute_pgm_rsrc3), inst_pref_size(old_size))));
+            let pref_max = if matches!(
+                env.header.e_flags & 0xff,
+                EF_AMDGPU_MACH_GFX1200 | EF_AMDGPU_MACH_GFX1201
+            ) {
+                INST_PREF_MAX
+            } else {
+                INST_PREF_MAX_GFX11
+            };
+            if inst_pref_field(d.compute_pgm_rsrc3, pref_max) != inst_pref_size(old_size, pref_max)
+            {
+                return Err(fail(format!("kernel {} changed size but its INST_PREF_SIZE {} does not follow min(ceil(size/128), {pref_max}) = {}",
+                    slot.name, inst_pref_field(d.compute_pgm_rsrc3, pref_max), inst_pref_size(old_size, pref_max))));
             }
             d.compute_pgm_rsrc3 = Rsrc3(
-                d.compute_pgm_rsrc3.0 & !(INST_PREF_MAX << INST_PREF_SHIFT)
-                    | inst_pref_size(code_sizes[k]) << INST_PREF_SHIFT,
+                d.compute_pgm_rsrc3.0 & !(pref_max << INST_PREF_SHIFT)
+                    | inst_pref_size(code_sizes[k], pref_max) << INST_PREF_SHIFT,
             );
         }
         d.kernel_code_entry_byte_offset = i64::try_from(new_entry[k]).expect("VA fits")

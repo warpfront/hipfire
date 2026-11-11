@@ -6,30 +6,30 @@
 .p2align 8
 .type qwen4_slab_union_plan_t8_pm_gfx1100,@function
 qwen4_slab_union_plan_t8_pm_gfx1100:
-	s_load_b256 s[8:15], s[0:1], null
+	s_load_b256 s[32:39], s[0:1], null
 	s_load_b32 s16, s[0:1], 0x20
-	s_mov_b32 s17, s2
+	s_mov_b32 s17, s15
 	s_waitcnt lgkmcnt(0)
-	s_cmp_lt_i32 s14, 1
+	s_cmp_lt_i32 s38, 1
 	s_cbranch_scc1 .Lunion_end
-	s_cmp_gt_i32 s14, 64
+	s_cmp_gt_i32 s38, 64
 	s_cbranch_scc1 .Lunion_end
-	s_cmp_lt_i32 s15, -1
+	s_cmp_lt_i32 s39, -1
 	s_cbranch_scc1 .Lunion_end
-	s_cmp_gt_i32 s15, 1
+	s_cmp_gt_i32 s39, 1
 	s_cbranch_scc1 .Lunion_end
 	s_cmp_lt_i32 s16, 0
 	s_cbranch_scc1 .Lunion_end
 	s_lshl_b32 s20, s17, 3
 	s_cmp_ge_u32 s17, 8
 	s_cbranch_scc1 .Lunion_end
-	s_cmp_ge_u32 s20, s14
+	s_cmp_ge_u32 s20, s38
 	s_cbranch_scc1 .Lunion_end
 	s_mul_i32 s18, s17, 0x50
-	s_mul_i32 s19, s14, 10
+	s_mul_i32 s19, s38, 10
 	s_mul_i32 s20, s17, 0x788
-	s_add_u32 s12, s12, s20
-	s_addc_u32 s13, s13, 0
+	s_add_u32 s36, s36, s20
+	s_addc_u32 s37, s37, 0
 	v_add_nc_u32_e32 v3, s18, v0
 	v_mov_b32_e32 v1, -1
 	v_mov_b32_e32 v2, -1
@@ -38,20 +38,20 @@ qwen4_slab_union_plan_t8_pm_gfx1100:
 	s_and_b32 s22, s22, s24
 	s_and_saveexec_b32 s26, s22
 	v_lshlrev_b32_e32 v4, 2, v3
-	global_load_b32 v1, v4, s[8:9]
+	global_load_b32 v1, v4, s[32:33]
 	s_mov_b32 exec_lo, s26
 	s_waitcnt vmcnt(0)
 	v_cmp_gt_u32_e64 s22, s16, v1
 	s_and_saveexec_b32 s26, s22
-	s_cmp_ge_i32 s15, 0
+	s_cmp_ge_i32 s39, 0
 	s_cbranch_scc1 .Lunion_uniform
-	global_load_u8 v5, v1, s[10:11]
+	global_load_u8 v5, v1, s[34:35]
 	s_waitcnt vmcnt(0)
 	v_cmp_eq_u32_e64 s24, 1, v5
 	v_cndmask_b32_e64 v2, 1, 0, s24
 	s_branch .Lunion_bucket_done
 	.Lunion_uniform:
-	v_mov_b32_e32 v2, s15
+	v_mov_b32_e32 v2, s39
 	.Lunion_bucket_done:
 	s_mov_b32 exec_lo, s26
 	v_cmp_gt_u32_e64 s22, 0x50, v0
@@ -136,15 +136,15 @@ qwen4_slab_union_plan_t8_pm_gfx1100:
 	s_and_saveexec_b32 s26, s22
 	v_add_nc_u32_e32 v20, v15, v6
 	v_lshlrev_b32_e32 v4, 2, v20
-	global_store_b32 v4, v3, s[12:13] offset:1288
+	global_store_b32 v4, v3, s[36:37] offset:1288
 	v_cmp_eq_u32_e64 s24, 1, v9
 	s_and_saveexec_b32 s20, s24
 	s_waitcnt_vscnt null, 0x0
 	v_lshlrev_b32_e32 v4, 2, v14
-	global_store_b32 v4, v1, s[12:13] offset:0
+	global_store_b32 v4, v1, s[36:37] offset:0
 	s_waitcnt_vscnt null, 0x0
 	v_lshlrev_b32_e32 v4, 2, v14
-	global_store_b32 v4, v15, s[12:13] offset:640
+	global_store_b32 v4, v15, s[36:37] offset:640
 	s_mov_b32 exec_lo, s20
 	s_mov_b32 exec_lo, s26
 	v_cmp_ge_u32_e64 s22, v0, v16
@@ -154,10 +154,10 @@ qwen4_slab_union_plan_t8_pm_gfx1100:
 	s_and_saveexec_b32 s26, s22
 	s_waitcnt_vscnt null, 0x0
 	v_lshlrev_b32_e32 v4, 2, v0
-	global_store_b32 v4, v5, s[12:13] offset:0
+	global_store_b32 v4, v5, s[36:37] offset:0
 	s_waitcnt_vscnt null, 0x0
 	v_lshlrev_b32_e32 v4, 2, v0
-	global_store_b32 v4, v18, s[12:13] offset:640
+	global_store_b32 v4, v18, s[36:37] offset:640
 	s_mov_b32 exec_lo, s26
 	v_cmp_ge_u32_e64 s22, v0, v18
 	v_cmp_gt_u32_e64 s24, 0x50, v0
@@ -165,28 +165,28 @@ qwen4_slab_union_plan_t8_pm_gfx1100:
 	s_and_saveexec_b32 s26, s22
 	s_waitcnt_vscnt null, 0x0
 	v_lshlrev_b32_e32 v4, 2, v0
-	global_store_b32 v4, v5, s[12:13] offset:1288
+	global_store_b32 v4, v5, s[36:37] offset:1288
 	s_mov_b32 exec_lo, s26
 	v_cmp_eq_u32_e64 s22, 0, v0
 	s_and_saveexec_b32 s26, s22
 	s_waitcnt_vscnt null, 0x0
 	v_lshlrev_b32_e32 v4, 2, v0
-	global_store_b32 v4, v18, s[12:13] offset:960
+	global_store_b32 v4, v18, s[36:37] offset:960
 	s_mov_b32 exec_lo, s26
 	v_cmp_eq_u32_e64 s22, 1, v2
 	s_and_saveexec_b32 s26, s22
 	v_add_nc_u32_e32 v20, v15, v6
 	s_waitcnt_vscnt null, 0x0
 	v_lshlrev_b32_e32 v4, 2, v20
-	global_store_b32 v4, v3, s[12:13] offset:1608
+	global_store_b32 v4, v3, s[36:37] offset:1608
 	v_cmp_eq_u32_e64 s24, 1, v9
 	s_and_saveexec_b32 s20, s24
 	s_waitcnt_vscnt null, 0x0
 	v_lshlrev_b32_e32 v4, 2, v14
-	global_store_b32 v4, v1, s[12:13] offset:320
+	global_store_b32 v4, v1, s[36:37] offset:320
 	s_waitcnt_vscnt null, 0x0
 	v_lshlrev_b32_e32 v4, 2, v14
-	global_store_b32 v4, v15, s[12:13] offset:964
+	global_store_b32 v4, v15, s[36:37] offset:964
 	s_mov_b32 exec_lo, s20
 	s_mov_b32 exec_lo, s26
 	v_cmp_ge_u32_e64 s22, v0, v17
@@ -196,10 +196,10 @@ qwen4_slab_union_plan_t8_pm_gfx1100:
 	s_and_saveexec_b32 s26, s22
 	s_waitcnt_vscnt null, 0x0
 	v_lshlrev_b32_e32 v4, 2, v0
-	global_store_b32 v4, v5, s[12:13] offset:320
+	global_store_b32 v4, v5, s[36:37] offset:320
 	s_waitcnt_vscnt null, 0x0
 	v_lshlrev_b32_e32 v4, 2, v0
-	global_store_b32 v4, v19, s[12:13] offset:964
+	global_store_b32 v4, v19, s[36:37] offset:964
 	s_mov_b32 exec_lo, s26
 	v_cmp_ge_u32_e64 s22, v0, v19
 	v_cmp_gt_u32_e64 s24, 0x50, v0
@@ -207,13 +207,13 @@ qwen4_slab_union_plan_t8_pm_gfx1100:
 	s_and_saveexec_b32 s26, s22
 	s_waitcnt_vscnt null, 0x0
 	v_lshlrev_b32_e32 v4, 2, v0
-	global_store_b32 v4, v5, s[12:13] offset:1608
+	global_store_b32 v4, v5, s[36:37] offset:1608
 	s_mov_b32 exec_lo, s26
 	v_cmp_eq_u32_e64 s22, 0, v0
 	s_and_saveexec_b32 s26, s22
 	s_waitcnt_vscnt null, 0x0
 	v_lshlrev_b32_e32 v4, 2, v0
-	global_store_b32 v4, v19, s[12:13] offset:1284
+	global_store_b32 v4, v19, s[36:37] offset:1284
 	s_mov_b32 exec_lo, s26
 	s_waitcnt_vscnt null, 0x0
 	.Lunion_end:
@@ -226,7 +226,7 @@ qwen4_slab_union_plan_t8_pm_gfx1100:
 	.amdhsa_group_segment_fixed_size 1280
 	.amdhsa_private_segment_fixed_size 0
 	.amdhsa_kernarg_size 40
-	.amdhsa_user_sgpr_count 2
+	.amdhsa_user_sgpr_count 15
 	.amdhsa_user_sgpr_dispatch_ptr 0
 	.amdhsa_user_sgpr_queue_ptr 0
 	.amdhsa_user_sgpr_kernarg_segment_ptr 1
@@ -241,7 +241,7 @@ qwen4_slab_union_plan_t8_pm_gfx1100:
 	.amdhsa_system_sgpr_workgroup_info 0
 	.amdhsa_system_vgpr_workitem_id 0
 	.amdhsa_next_free_vgpr 24
-	.amdhsa_next_free_sgpr 27
+	.amdhsa_next_free_sgpr 40
 	.amdhsa_reserve_vcc 0
 	.amdhsa_float_round_mode_32 0
 	.amdhsa_float_round_mode_16_64 0
@@ -307,7 +307,7 @@ amdhsa.kernels:
     .max_flat_workgroup_size: 128
     .name: qwen4_slab_union_plan_t8_pm_gfx1100
     .private_segment_fixed_size: 0
-    .sgpr_count: 27
+    .sgpr_count: 40
     .sgpr_spill_count: 0
     .symbol: qwen4_slab_union_plan_t8_pm_gfx1100.kd
     .uniform_work_group_size: 1

@@ -183,7 +183,8 @@ pub(crate) struct FfnLayerView<'a> {
     pub kind: &'static str,
 }
 
-/// Refuse the typed-only weight formats every generic batched route rejects.
+/// Refuse the typed-only weight formats (and the not-yet-runnable ggml block
+/// formats) every generic batched route rejects.
 pub fn reject_typed_only_format(dtype: DType) -> HipResult<()> {
     if dtype == DType::MQ4G128V2 {
         Err(HipError::new(
@@ -197,6 +198,10 @@ pub fn reject_typed_only_format(dtype: DType) -> HipResult<()> {
                 "this model uses the {name} weight format (MQ-I4 / E8P-I4, qt=131..=136), an expert-slab format only Qwen4 (Flash-Next) models can run, and it has no generic GPU kernel; re-quantize it to a different format"
             ),
         ))
+    } else if let Some(refusal) = dtype.ggml_refusal() {
+        // GGUF block formats (`DType::Ggml*`): parsed and planned, but no ggml
+        // kernel is wired, so no route may run or reinterpret them.
+        Err(HipError::new(0, &refusal))
     } else {
         Ok(())
     }
@@ -343,6 +348,25 @@ fn try_a8_hin_prepared(
     let reservation = gpu.reserve_int8_mmq(k, n)?;
     gpu.fused_silu_hin_rotate_mq_i8_batched(h, awq, reservation, k, n)
         .map(Some)
+}
+
+/// Symmetric qt49 (MQ3G256V2) weight that enters the gfx1201 A4 producer/consumer
+/// pair: validated provenance, the A4 flag, exact gfx1201, and no active
+/// higher-priority A8 route. Every producer admitted here has a prepared
+/// MQ3V25 consumer at its call site (no producer runs without its consumer).
+pub(crate) fn mq3v25_a4_weight(gpu: &Gpu, dtype: DType) -> bool {
+    dtype == DType::MQ3G256V2
+        && gpu.arch == "gfx1201"
+        && !gpu.flags.mq3v25_a8_enabled(gpu.mq3v2_symmetric)
+        && gpu.flags.mq3v25_a4_enabled(gpu.mq3v2_symmetric)
+}
+
+/// The shared-input producer of a projection group anchored at `anchor` may run
+/// for a qt49 A4 route only when every sibling projection has the same dtype
+/// (the one prepared consumer reads all of them); any other anchor is
+/// unaffected. Keeps the rule "no producer runs without its consumer".
+pub(crate) fn mq3v25_a4_consumers_agree(gpu: &Gpu, anchor: DType, siblings: &[DType]) -> bool {
+    !mq3v25_a4_weight(gpu, anchor) || siblings.iter().all(|&dtype| dtype == anchor)
 }
 
 /// C2: when MQ4V2 + IU4 producer sidecar is live, emit block_i4_128 from
@@ -618,10 +642,12 @@ fn try_packed_mq4_ffn_gate_up(
 /// ([`try_iu4_silu_prepared`] with an AWQ scale: uniform MQ4G256V2, `Residual`
 /// epilogue, no S4 f16 route, portable gfx11 sidecar live; or on exact
 /// gfx1201 [`try_gfx12_silu_quant_fused_prepared`]'s AWQ twin) and gate/up are
-/// MQ4G256V2 of equal shape. Decided once per FFN, before gate/up; the gate/up
-/// hook then reports whether it actually emitted h
-/// (`Gpu::gemm_gate_up_silu_mq4g256v2_iu4_prepared` adds the per-arch tile
-/// rule and `HIPFIRE_F1LITE`).
+/// MQ4G256V2 of equal shape (or, when [`mq3v25_a4_weight`] admits, equal-dtype
+/// symmetric qt49 gate/up/down feeding the same AWQ h producer). Decided once
+/// per FFN, before gate/up; the gate/up hook then reports whether it actually
+/// emitted h (`Gpu::gemm_gate_up_silu_mq4g256v2_iu4_prepared` /
+/// `gemm_gate_up_silu_mq3v25_iu4_prepared` add the per-arch tile rule and
+/// `HIPFIRE_F1LITE`).
 #[allow(clippy::too_many_arguments)]
 fn f1lite_ffn_eligible(
     gpu: &Gpu,
@@ -633,12 +659,12 @@ fn f1lite_ffn_eligible(
     hidden_dim: usize,
     n: usize,
 ) -> bool {
-    w_gate.dtype == DType::MQ4G256V2
-        && w_up.dtype == DType::MQ4G256V2
+    (w_gate.dtype == DType::MQ4G256V2 || mq3v25_a4_weight(gpu, w_gate.dtype))
+        && w_up.dtype == w_gate.dtype
         && w_gate.m == hidden_dim
         && w_up.m == hidden_dim
         && w_gate.k == w_up.k
-        && w_down.dtype == DType::MQ4G256V2
+        && w_down.dtype == w_gate.dtype
         && w_down.awq_scale.is_some()
         && w_down.k == hidden_dim
         && matches!(epilogue, BatchEpilogue::Residual)
@@ -688,7 +714,9 @@ fn try_gfx12_silu_quant_fused_prepared(
     n: usize,
     emit_f32: bool,
 ) -> HipResult<Option<rdna_compute::Int4MmqPrepared>> {
-    if w_down.dtype != DType::MQ4G256V2 || !gpu.iu4_silu_quant_fused_active(n, k) {
+    if !(w_down.dtype == DType::MQ4G256V2 || mq3v25_a4_weight(gpu, w_down.dtype))
+        || !gpu.iu4_silu_quant_fused_active(n, k)
+    {
         return Ok(None);
     }
     let res = gpu.reserve_int4_mmq(k, n)?;
@@ -696,7 +724,12 @@ fn try_gfx12_silu_quant_fused_prepared(
         gate,
         up,
         w_down.awq_scale,
-        if emit_f32 { Some(x_rot) } else { None },
+        // The MQ3 consumer's small-tail and fallback readers need the f32 plane.
+        if emit_f32 || w_down.dtype == DType::MQ3G256V2 {
+            Some(x_rot)
+        } else {
+            None
+        },
         res,
         k,
         n,
@@ -721,7 +754,9 @@ pub(crate) fn try_gfx12_rmsnorm_quant_fused_prepared(
     n: usize,
     emit_f32: bool,
 ) -> HipResult<Option<rdna_compute::Int4MmqPrepared>> {
-    if next_linear.dtype != DType::MQ4G256V2 || !gpu.iu4_producer_quant_fused_active(n, k) {
+    if !(next_linear.dtype == DType::MQ4G256V2 || mq3v25_a4_weight(gpu, next_linear.dtype))
+        || !gpu.iu4_producer_quant_fused_active(n, k)
+    {
         return Ok(None);
     }
     let res = gpu.reserve_int4_mmq(k, n)?;
@@ -729,7 +764,12 @@ pub(crate) fn try_gfx12_rmsnorm_quant_fused_prepared(
         x,
         norm_weight,
         next_linear.awq_scale,
-        if emit_f32 { Some(x_rot) } else { None },
+        // The MQ3 consumer's small-tail and fallback readers need the f32 plane.
+        if emit_f32 || next_linear.dtype == DType::MQ3G256V2 {
+            Some(x_rot)
+        } else {
+            None
+        },
         res,
         k,
         eps,
@@ -1099,7 +1139,10 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
     let is_mq3 = matches!(w.dtype, DType::MQ3G256);
     let is_fp4 = matches!(w.dtype, DType::HFP4G32 | DType::MFP4G32);
     let is_q8 = matches!(w.dtype, DType::Q8_0);
-    let is_lowbit = matches!(w.dtype, DType::TQ2G128 | DType::BQ1G128);
+    // GGUF-native (`DType::Ggml*`) weights take the same unfused plain-GEMM
+    // strategy: `run_plain_gemm_key` dequantises the weight and runs the
+    // engine's F16 / F32 GEMM on it.
+    let is_lowbit = matches!(w.dtype, DType::TQ2G128 | DType::BQ1G128) || w.dtype.is_ggml();
     match epilogue {
         BatchEpilogue::Residual => {
             if is_6bit {
@@ -1374,6 +1417,8 @@ pub fn plain_gemm_key_for(dt: DType) -> crate::types::KernelKey {
     match dt {
         DType::TQ2G128 => K::GemmTQ2G128Prefill,
         DType::BQ1G128 => K::GemmBQ1G128Prefill,
+        // Float weights kept F32 (the GDN beta/alpha matrices of a GGUF file).
+        DType::F32 => K::GemmF32RegisterTiled,
         _ => K::GemmQ8_0BatchedChunked,
     }
 }
@@ -1431,6 +1476,12 @@ pub fn run_plain_gemm_key(
     k: usize,
     n: usize,
 ) -> HipResult<()> {
+    // GGUF-native weight: dequantise into the persistent prefill scratch (F16,
+    // or BF16-rounded F32 for the codec-only tier) and run the engine's GEMM
+    // on it; `HIPFIRE_GGUF_A8_EMU=1` first rounds the activations through q8_1.
+    if w_dtype.is_ggml() {
+        return gpu.ggml_prefill_gemm(w_dtype, w_buf, m, k, x, y, n);
+    }
     use crate::families::gemm::GemmParams;
     let ctx = DispatchCtx::new(gpu);
     let w = WeightRef {
@@ -1883,7 +1934,8 @@ fn swiglu_ffn_gate_up_batched(
     // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
-    let ffn_is_lowbit = matches!(layer.w_gate.dtype, DType::TQ2G128 | DType::BQ1G128);
+    let ffn_is_lowbit = matches!(layer.w_gate.dtype, DType::TQ2G128 | DType::BQ1G128)
+        || layer.w_gate.dtype.is_ggml();
     // qt=52 re-arm anchor: gate+up both Lloyd → FP8-LUT launcher.
     let ffn_is_mq4v2_lloyd = all_mq4v2_lloyd(&[layer.w_gate.dtype, layer.w_up.dtype]);
     let a8_prep = if layer.w_gate.dtype == DType::MQ4G256V2 && layer.w_up.dtype == DType::MQ4G256V2
@@ -1915,7 +1967,9 @@ fn swiglu_ffn_gate_up_batched(
             n,
             false,
         )?;
-        if iu4_prep.is_none() {
+        if iu4_prep.is_none()
+            && mq3v25_a4_consumers_agree(gpu, layer.w_gate.dtype, &[layer.w_up.dtype])
+        {
             // gfx1201 slices-2: fused rmsnorm+quant producer (bit-identical).
             iu4_prep = try_gfx12_rmsnorm_quant_fused_prepared(
                 gpu,
@@ -2020,7 +2074,42 @@ fn swiglu_ffn_gate_up_batched(
             n,
         )?;
         return Ok(FfnGateOutput::A8H);
-    } else if let Some(prep) = &iu4_prep {
+    } else if let Some(prep) = iu4_prep.as_ref().filter(|_| {
+        mq3v25_a4_weight(gpu, layer.w_gate.dtype) && layer.w_up.dtype == layer.w_gate.dtype
+    }) {
+        // Symmetric qt49 A4 (gfx1201): F1-lite single launch emits h when
+        // admitted (the down hook then runs the AWQ h producer exactly as
+        // for MQ4); else the SET pair. No MQ4-only epilogue (A4 down
+        // sidecar) applies to qt49.
+        if f1lite
+            && gpu.gemm_gate_up_silu_mq3v25_iu4_prepared(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                prep,
+                &pbs.gate_ffn_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                n,
+            )?
+        {
+            return Ok(FfnGateOutput::Iu4H);
+        }
+        gpu.gemm_gate_up_mq3v25_iu4_prepared(
+            &layer.w_gate.buf,
+            &layer.w_up.buf,
+            prep,
+            &pbs.gate_ffn_batch,
+            &pbs.up_batch,
+            layer.w_gate.m,
+            layer.w_up.m,
+            layer.w_gate.k,
+            n,
+        )?;
+    } else if let Some(prep) = iu4_prep
+        .as_ref()
+        .filter(|_| !mq3v25_a4_weight(gpu, layer.w_gate.dtype))
+    {
         // F1-lite: one GEMM v2 launch emits h; else the SET pair below.
         // A4 fusion (gfx1151 V2B only, default on; `HIPFIRE_V2B_A4_EPI=0` opts out): the epilogue
         // also writes the w_down sidecar, so no h and no hin producer.
@@ -2492,7 +2581,17 @@ fn swiglu_ffn_down_batched(
         gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
     }
     // Batched w_down + residual/partial.
-    if let Some(prep) = &iu4_prep {
+    if let (Some(prep), true) = (&iu4_prep, mq3v25_a4_weight(gpu, layer.w_down.dtype)) {
+        gpu.gemm_mq3v25_residual_iu4_prepared(
+            &layer.w_down.buf,
+            prep,
+            &pbs.x_batch,
+            layer.w_down.m,
+            layer.w_down.k,
+            n,
+            true,
+        )?;
+    } else if let Some(prep) = &iu4_prep {
         gpu.gemm_mq4g256v2_residual_wmma_iu4_prepared(
             &layer.w_down.buf,
             prep,

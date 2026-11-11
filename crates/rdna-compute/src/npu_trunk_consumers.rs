@@ -437,13 +437,8 @@ fn chunk_arena(
     }
     // The kernel, module and source follow the state format and the inline/bracket arm; the
     // plain Q8 inline module is its own registry entry over its own arena source.
-    let chunk_kernel = gdn_chunk_kernel_name(format, arms.q8_inline, true);
-    let chunk_module = gdn_chunk_module_name(format, arms.q8_inline, true);
-    gpu.ensure_kernel_public(
-        chunk_module,
-        gdn_chunk_source(format, arms.q8_inline, true),
-        chunk_kernel,
-    )?;
+    // The PM twin (`gated_delta_chunk_pm`) or the hipcc kernel; same kernargs, grid and block.
+    let chunk_kernel = gpu.gdn_chunk_ensure(format, arms.q8_inline, true)?;
     // With `qk_prenormed` the convolution already stored the normalized Q/K
     // in this same scratch (`gated_delta_conv_params_qknorm_batched`).
     if !arms.qk_prenormed {

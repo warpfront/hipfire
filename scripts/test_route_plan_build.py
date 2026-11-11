@@ -253,5 +253,79 @@ class FlashNextBuilder(unittest.TestCase):
             self.assertIn('env={"HIPFIRE_PLE_FORMAT": "q4", "HIPFIRE_ROUTE_PLAN": "0"}', receipt[0])
 
 
+class Gfx1100FlashNext(unittest.TestCase):
+    """The bounded XTX walk's shape: q8 QSA/GDN on the legacy KV backend, a walked max_seq of 262144, an AR walk and
+    an MTP walk of the same layout; the plan stays open and its HIP rows become the gfx1100 trace rows."""
+
+    STATE = "  qwen4 state: QSA q8 (Q8_0 blocks of 32) K/V (legacy context storage), GDN q8 recurrent"
+
+    def test_partial_walk_is_refused_unless_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            model = root / "fn.hfq"
+            write_hfqm(model, 16, TRUNK)
+            walk = make_walk(root, "ar", "ar", model, [self.STATE, *audit("gfx1100", [("add", "add_f32")], [])], max_seq=262144)
+            (walk / "result.json").write_text(json.dumps({"rc": None, "ok": False, "partial": True, "reason": "walk timeout",
+                                                          "errors": 0, "results": []}))
+            with self.assertRaises(SystemExit):
+                run_build(root / "p.tsv", "--model", str(model), "--walk", f"ar={walk}")
+            text = run_build(root / "p.tsv", "--model", str(model), "--walk", f"ar={walk}", "--accept-partial")
+            self.assertIn("ar\thip\tadd\tadd_f32\t" + HIP_SHA, text.splitlines())
+            (walk / "result.json").write_text(json.dumps({"rc": None, "ok": False, "partial": True, "reason": "x",
+                                                          "errors": 1, "results": []}))
+            with self.assertRaises(SystemExit):
+                run_build(root / "p.tsv", "--model", str(model), "--walk", f"ar={walk}", "--accept-partial")
+
+    def test_walks_at_two_context_ceilings_need_union_max_seq_and_take_the_largest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            model = root / "fn.hfq"
+            write_hfqm(model, 16, TRUNK)
+            low = make_walk(root, "low", "ar", model, [self.STATE, *audit("gfx1100", [("add", "add_f32"), ("s1", "k_s1")], [])],
+                            max_seq=32768)
+            high = make_walk(root, "high", "ar", model, [self.STATE, *audit("gfx1100", [("add", "add_f32")], [])], max_seq=262144)
+            with self.assertRaises(SystemExit):
+                run_build(root / "p.tsv", "--model", str(model), "--walk", f"ar={low}", "--walk", f"ar={high}")
+            text = run_build(root / "p.tsv", "--model", str(model), "--walk", f"ar={low}", "--walk", f"ar={high}",
+                             "--union-max-seq")
+            lines = text.splitlines()
+            self.assertIn("#! max_seq 262144", lines)
+            self.assertIn("# max_seq union of walks at [32768, 262144]", lines)
+            self.assertIn("ar\thip\ts1\tk_s1\t" + HIP_SHA, lines, "the lower walk's kernels join the closure")
+
+    def test_plan_axes_open_seal_and_trace_rows(self):
+        spec = importlib.util.spec_from_file_location("route_plan_trace_rows",
+                                                      pathlib.Path(__file__).with_name("route_plan_trace_rows.py"))
+        trace = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(trace)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            model = root / "fn.hfq"
+            write_hfqm(model, 16, TRUNK)
+            ar = make_walk(root, "ar", "ar", model,
+                           [self.STATE, *audit("gfx1100", [("add", "add_f32"), ("tensor_ops", "a")], [("pm_img", "pm_w4")])],
+                           max_seq=262144)
+            mtp = make_walk(root, "mtp", "native_mtp", model,
+                            [self.STATE, *audit("gfx1100", [("add", "add_f32"), ("tensor_ops", "b")], [])],
+                            max_seq=262144)
+            text = run_build(root / "qwen3.8-flash-next.gfx1100.tsv", "--model", str(model), "--walk", f"ar={ar}",
+                             "--walk", f"native_mtp={mtp}")
+            plan = text.splitlines()
+            for line in ("#! arch gfx1100", "#! max_seq 262144", "#! axis qsa q8", "#! axis kv_backend legacy",
+                         "#! axis gdn q8", "#! axis qsa_f16_arena off", "#! axis qsa_pooled_bf16 off"):
+                self.assertIn(line, plan)
+            self.assertFalse([l for l in plan if l.startswith("#! sealed")], "a bounded walk never seals")
+            # native_mtp includes every ar row; the MTP-only symbol joins its module's row.
+            self.assertIn(f"ar\thip\ttensor_ops\ta\t{HIP_SHA}", plan)
+            self.assertIn(f"native_mtp\thip\ttensor_ops\ta,b\t{HIP_SHA}", plan)
+            self.assertIn(f"native_mtp\tembedded\tpm_img\tpm_w4\t{IMG_SHA}", plan)
+            arch, rows = trace.trace_rows(text)
+            self.assertEqual(arch, "gfx1100")
+            self.assertEqual(rows, [("add", ["add_f32"]), ("tensor_ops", ["a", "b"])])
+            rendered = trace.render("qwen3.8-flash-next.gfx1100.tsv", text).splitlines()
+            self.assertEqual(rendered[-2:], ["gfx1100\tadd\tadd_f32", "gfx1100\ttensor_ops\ta,b"])
+            self.assertTrue(all(l.startswith("#") or l.count("\t") == 2 for l in rendered))
+
+
 if __name__ == "__main__":
     unittest.main()

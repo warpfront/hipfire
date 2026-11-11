@@ -615,7 +615,7 @@ impl Fp8 {
             },
         )
         .map_err(|e| format!("lift: {e:?}"))?;
-        let emu = Emulator::new(&lifted.program, &obj.launch_symbol)?;
+        let emu = Emulator::new(&lifted.program, &obj.launch_symbol)?.hw_model();
         let (n, k) = (TILE_TOKENS, 256usize);
         let dims: Vec<usize> = if self.silu() {
             vec![TILE_ROWS / 2; 2]

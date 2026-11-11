@@ -2851,6 +2851,19 @@ mod render_tests {
     }
 
     #[test]
+    fn chat_input_title_shows_prefill_progress_while_sending() {
+        let (mut app, _home) = crate::test_support::hermetic_app();
+        app.tab = Tab::Chat;
+        app.chat.sending = true;
+        app.chat.status = "prefilling 512/2048 (25%) · ETA 6s".into();
+        let (text, _) = draw_at(&mut app, 100, 24);
+        assert!(
+            text.contains("prefilling 512/2048 (25%) · ETA 6s"),
+            "prefill readout in the chat view: {text}"
+        );
+    }
+
+    #[test]
     fn chat_abort_marks_stopped_in_transcript_only() {
         let (mut app, _home) = crate::test_support::hermetic_app();
         app.tab = Tab::Chat;

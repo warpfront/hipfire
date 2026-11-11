@@ -3,7 +3,7 @@
   "arch": "gfx1100",
   "builder_crate_version": "0.4.1",
   "builder_git_sha": "unknown",
-  "s_text_sha256": "3046dc804aafb38cd340d18037bb259357d830e09a297671259bedf87f82b2ab",
+  "s_text_sha256": "c45928d611fccecd2ad5f3d1358b1037aa82346bab71d8dcc96e87e2e1e0dc89",
   "kernels": [
     {
       "kernel_id": "qwen4_lane_rows_mq6",
@@ -22,7 +22,7 @@
         {
           "name": "workgroup_id",
           "kind": "s",
-          "base": 2,
+          "base": 14,
           "len": 1,
           "live": "Whole"
         },
@@ -36,7 +36,7 @@
         {
           "name": "workgroup_id_y",
           "kind": "s",
-          "base": 3,
+          "base": 15,
           "len": 1,
           "live": "Whole"
         },
@@ -5600,7 +5600,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "721b63a56e745c7e9dda52f411c9fde5ab4b9271b6e827f45a835f68108ad4b7"
+      "s_text_sha256": "9be963bda2ca1cbb49ecd4853e986961cc174982e0753064d9bf8f31a927068a"
     },
     {
       "kernel_id": "qwen4_lane_rows_mq6",
@@ -5619,7 +5619,7 @@
         {
           "name": "workgroup_id",
           "kind": "s",
-          "base": 2,
+          "base": 14,
           "len": 1,
           "live": "Whole"
         },
@@ -5633,7 +5633,7 @@
         {
           "name": "workgroup_id_y",
           "kind": "s",
-          "base": 3,
+          "base": 15,
           "len": 1,
           "live": "Whole"
         },
@@ -5647,7 +5647,7 @@
         {
           "name": "weight_pointers",
           "kind": "s",
-          "base": 8,
+          "base": 64,
           "len": 8,
           "live": "Whole"
         },
@@ -5982,7 +5982,7 @@
         }
       ],
       "next_free_vgpr": 72,
-      "next_free_sgpr": 60,
+      "next_free_sgpr": 72,
       "waits": [
         {
           "pc_index": 18,
@@ -11225,7 +11225,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "c2475bea23b0432acbe598665e5967ae221b09fc62383bcd986201ccd5620de5"
+      "s_text_sha256": "2a2302f94864bb660b8a8614390b8378dc811136a69eaaf58fbf84a06819f7eb"
     },
     {
       "kernel_id": "qwen4_lane_rows_q8_gfx1100",
@@ -11244,7 +11244,7 @@
         {
           "name": "wg_x0",
           "kind": "s",
-          "base": 2,
+          "base": 14,
           "len": 1,
           "live": "Whole"
         },
@@ -11272,7 +11272,7 @@
         {
           "name": "wg_y0",
           "kind": "s",
-          "base": 3,
+          "base": 15,
           "len": 1,
           "live": "Whole"
         },
@@ -11286,14 +11286,14 @@
         {
           "name": "hc_act0",
           "kind": "s",
-          "base": 14,
+          "base": 50,
           "len": 1,
           "live": "Whole"
         },
         {
           "name": "scalar0",
           "kind": "s",
-          "base": 15,
+          "base": 49,
           "len": 1,
           "live": "Whole"
         },
@@ -11551,7 +11551,7 @@
         }
       ],
       "next_free_vgpr": 48,
-      "next_free_sgpr": 49,
+      "next_free_sgpr": 51,
       "waits": [
         {
           "pc_index": 28,
@@ -20000,7 +20000,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "872d2ecd5658011902efe81db058455de1b51b105390944ce0a7512211fde4b5"
+      "s_text_sha256": "e1988f26e815d2f74b1a88ab4a08fb2811061863b01530a33006a2d059c5f2ab"
     },
     {
       "kernel_id": "qwen4_lane_rows_q8_gfx1100",
@@ -20019,7 +20019,7 @@
         {
           "name": "wg_x0",
           "kind": "s",
-          "base": 2,
+          "base": 14,
           "len": 1,
           "live": "Whole"
         },
@@ -20047,7 +20047,7 @@
         {
           "name": "wg_y0",
           "kind": "s",
-          "base": 3,
+          "base": 15,
           "len": 1,
           "live": "Whole"
         },
@@ -20061,7 +20061,7 @@
         {
           "name": "scalar0",
           "kind": "s",
-          "base": 15,
+          "base": 49,
           "len": 1,
           "live": "Whole"
         },
@@ -20340,7 +20340,7 @@
         }
       ],
       "next_free_vgpr": 72,
-      "next_free_sgpr": 49,
+      "next_free_sgpr": 50,
       "waits": [
         {
           "pc_index": 27,
@@ -26429,7 +26429,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "bc4081d09de07d0878f4d5dd2f6beaddeed6f248b03fbfdca6e42b982f5fe952"
+      "s_text_sha256": "0a8ddb1ec094322980ccbb14c6bc9b41d4451c2aef1cf011bfeb45b01d063320"
     },
     {
       "kernel_id": "qwen4_lane_rows_q8_gfx1100",
@@ -26448,7 +26448,7 @@
         {
           "name": "wg_x0",
           "kind": "s",
-          "base": 2,
+          "base": 14,
           "len": 1,
           "live": "Whole"
         },
@@ -26476,7 +26476,7 @@
         {
           "name": "wg_y0",
           "kind": "s",
-          "base": 3,
+          "base": 15,
           "len": 1,
           "live": "Whole"
         },
@@ -26490,7 +26490,7 @@
         {
           "name": "scalar0",
           "kind": "s",
-          "base": 15,
+          "base": 49,
           "len": 1,
           "live": "Whole"
         },
@@ -26748,7 +26748,7 @@
         }
       ],
       "next_free_vgpr": 48,
-      "next_free_sgpr": 49,
+      "next_free_sgpr": 50,
       "waits": [
         {
           "pc_index": 27,
@@ -33237,7 +33237,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "eb0f7a7411934369c1b8163a8de6a48d8b7c1beca2b186c28bd0c5823298d6b9"
+      "s_text_sha256": "fa3642dd63fad3e0ea9a53e113cbe1d71865e636d0f36fc9d6e6dafad72fe773"
     },
     {
       "kernel_id": "qwen4_lane_rows_q8_gfx1100",
@@ -33256,7 +33256,7 @@
         {
           "name": "wg_x0",
           "kind": "s",
-          "base": 2,
+          "base": 14,
           "len": 1,
           "live": "Whole"
         },
@@ -33284,7 +33284,7 @@
         {
           "name": "wg_y0",
           "kind": "s",
-          "base": 3,
+          "base": 15,
           "len": 1,
           "live": "Whole"
         },
@@ -33298,7 +33298,7 @@
         {
           "name": "scalar0",
           "kind": "s",
-          "base": 15,
+          "base": 49,
           "len": 1,
           "live": "Whole"
         },
@@ -33591,7 +33591,7 @@
         }
       ],
       "next_free_vgpr": 48,
-      "next_free_sgpr": 49,
+      "next_free_sgpr": 50,
       "waits": [
         {
           "pc_index": 28,
@@ -40080,7 +40080,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "3050cda8bafe80b9b2a444cdaffd7d7b2fc5a7c8fa45ced86f213e3e4cc17ccf"
+      "s_text_sha256": "40128330f9fcc86935503919fa8165a3946194b4622985b932f36fe8decdc027"
     },
     {
       "kernel_id": "qwen4_lane_rows_q8_gfx1100",
@@ -40099,7 +40099,7 @@
         {
           "name": "wg_x0",
           "kind": "s",
-          "base": 2,
+          "base": 14,
           "len": 1,
           "live": "Whole"
         },
@@ -40127,7 +40127,7 @@
         {
           "name": "wg_y0",
           "kind": "s",
-          "base": 3,
+          "base": 15,
           "len": 1,
           "live": "Whole"
         },
@@ -40141,7 +40141,7 @@
         {
           "name": "scalar0",
           "kind": "s",
-          "base": 15,
+          "base": 49,
           "len": 1,
           "live": "Whole"
         },
@@ -40420,7 +40420,7 @@
         }
       ],
       "next_free_vgpr": 72,
-      "next_free_sgpr": 49,
+      "next_free_sgpr": 50,
       "waits": [
         {
           "pc_index": 27,
@@ -46509,7 +46509,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "c459dcabf13693727ae55c3900b8fc50f614080de92faae6cdf6e3da314b8b67"
+      "s_text_sha256": "02638d1b0fb775e015cbeb90f78b8d8cc8583cd4c7909bb19ea6aebb0eb26793"
     }
   ]
 }

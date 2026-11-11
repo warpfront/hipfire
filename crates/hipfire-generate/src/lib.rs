@@ -51,6 +51,10 @@ pub mod qwen;
 /// MiniMax-M2, Cohere2-MoE, Gemma4, Muse Glimmer, Qwen2, LLaMA.
 pub mod dense;
 
+/// Raon-1-mini (arch 19): prompt render, sampling defaults and the
+/// `generate_ar_with_forward` wiring for `GenerationRoute::RaonAr`.
+pub mod raon;
+
 /// Image generation: the `img_generate` wire body (FLUX.1/FLUX.2),
 /// including reference-image decode and the GPU/CPU denoise split.
 pub mod img;

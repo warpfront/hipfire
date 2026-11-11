@@ -9,6 +9,7 @@
 //! committed model position: only a successful all-device drain acknowledges an
 //! epoch. A failed drain permanently quarantines the mesh's leases.
 
+use super::tp_exchange::{tp_exchange_format, TpExchange16};
 use super::transport::{self, EdgeDescriptor, EdgeId, EdgeLease, EdgeSpec};
 use super::Gpus;
 use crate::device_mesh::{DeviceMesh, DimKind, MeshEpoch};
@@ -1333,6 +1334,7 @@ impl Backend for HipBackend<'_> {
                 tp.max_bytes,
                 &partials,
                 &targets,
+                metas[0].descriptor.rows,
                 count,
                 metas[0].partial_slot,
             ),
@@ -1380,6 +1382,7 @@ fn peer_reduce(
     max_bytes: usize,
     partials: &[&DeviceBuffer],
     targets: &[&DeviceBuffer],
+    rows: usize,
     count: usize,
     partial_slot: Option<usize>,
 ) -> Result<()> {
@@ -1393,9 +1396,31 @@ fn peer_reduce(
         && gpus.devices[0].device_id != gpus.devices[1].device_id
     {
         return gpus
-            .all_reduce_sum_f32_peer_add_routed(partials, targets, count, partial_slot)
+            .all_reduce_sum_f32_peer_add_routed(partials, targets, rows, count, partial_slot)
             .map_err(hip_error);
     }
+    // TP3/TP4 decode inside a whole-token graph capture: one bf16 peer-push
+    // kernel per rank replaces the pack, copies, fold and events below, whose
+    // cross-device events cannot be captured. Same rounded, rank-ordered sum.
+    if gpus.devices.len() >= 3
+        && targets.len() == gpus.devices.len()
+        && gpus.devices.iter().all(|gpu| gpu.graphs.capture_mode)
+        && gpus.tp_exchange16_executor(rows, count) == Some(TpExchange16::Bf16)
+        && gpus.tp_peer_pushn_active()
+        && gpus.tp_peer_push_serves(count)
+    {
+        return gpus
+            .tp_peer_push_reduce_captured(partials, targets, count)
+            .map_err(hip_error);
+    }
+    // `HIPFIRE_TP_EXCHANGE` bf16|f16 (or `auto` per rows/TP): the ranks exchange 16-bit partials
+    // (`AllReduceAdd` only; the no-target `AllReduce` keeps f32). The same
+    // rounded, rank-ordered sum the hand route's `peer_add_routed` adds.
+    let fmt = if targets.len() == gpus.devices.len() {
+        gpus.tp_exchange16_executor(rows, count)
+    } else {
+        None
+    };
     let Gpus {
         devices,
         rank_barrier_events: produced,
@@ -1409,19 +1434,35 @@ fn peer_reduce(
         return Err("TP peer scratch or events are not provisioned".into());
     }
     let bytes = count * 4;
-    // 1. Each rank's partial is complete at this point of its stream.
-    for (gpu, event) in devices.iter().zip(produced.iter()) {
+    let bytes16 = count * 2;
+    let rooted = n > 2 && bytes > ROOTED_REDUCE_MIN_BYTES;
+    // 1. Each rank's partial is complete at this point of its stream. A
+    // 16-bit exchange first packs it into the rank's own slot `r` of its
+    // stage, which is what the other ranks pull (the rooted fold reads the
+    // root's own f32 partial directly, so the root does not pack).
+    for (r, (gpu, event)) in devices.iter_mut().zip(produced.iter()).enumerate() {
         gpu.bind_thread().map_err(hip_error)?;
+        if let Some(fmt) = fmt.filter(|_| !(rooted && r == 0)) {
+            let own = scratch[r].stage.buf.as_ptr() as usize + r * max_bytes;
+            gpu.tp_pack16(
+                fmt,
+                partials[r].as_ptr() as *const std::ffi::c_void,
+                own as *mut std::ffi::c_void,
+                count,
+            )
+            .map_err(hip_error)?;
+        }
         gpu.hip
             .event_record(event, Some(rank_stream(gpu)?))
             .map_err(hip_error)?;
     }
-    if n > 2 && bytes > ROOTED_REDUCE_MIN_BYTES {
+    if rooted {
         return peer_reduce_rooted(
-            devices, scratch, produced, read, max_bytes, partials, targets, count,
+            devices, scratch, produced, read, max_bytes, partials, targets, count, fmt,
         );
     }
     // 2. After every producer: pull partial q into slot q, fold into slot 0.
+    // The 16-bit fold sums every rank's packed slot straight into the target.
     for (r, (gpu, rank)) in devices.iter_mut().zip(scratch).enumerate() {
         gpu.bind_thread().map_err(hip_error)?;
         for (_, event) in produced.iter().enumerate().filter(|&(q, _)| q != r) {
@@ -1429,13 +1470,35 @@ fn peer_reduce(
                 .stream_wait_event(rank_stream(gpu)?, event)
                 .map_err(hip_error)?;
         }
-        let sum = rank.stage.sub_offset(0, count);
-        for (q, partial) in partials.iter().enumerate() {
-            let slot = rank.stage.buf.as_ptr() as usize + q * max_bytes;
-            transport::copy_bytes(gpu, &rank.owners, partial.as_ptr() as usize, slot, bytes)?;
-            if q > 0 {
-                let addend = rank.stage.sub_offset(q * (max_bytes / 4), count);
-                gpu.add_inplace_f32(&sum, &addend).map_err(hip_error)?;
+        if let Some(fmt) = fmt {
+            let base = rank.stage.buf.as_ptr() as usize;
+            let mut sources = [std::ptr::null::<std::ffi::c_void>(); 4];
+            for (q, source) in sources.iter_mut().take(n).enumerate() {
+                let slot = base + q * max_bytes;
+                if q != r {
+                    let packed = scratch[q].stage.buf.as_ptr() as usize + q * max_bytes;
+                    transport::copy_bytes(gpu, &rank.owners, packed, slot, bytes16)?;
+                }
+                *source = slot as *const std::ffi::c_void;
+            }
+            gpu.tp_fold16(
+                fmt,
+                std::ptr::null_mut(),
+                targets[r].as_ptr(),
+                std::ptr::null(),
+                &sources[..n],
+                count,
+            )
+            .map_err(hip_error)?;
+        } else {
+            let sum = rank.stage.sub_offset(0, count);
+            for (q, partial) in partials.iter().enumerate() {
+                let slot = rank.stage.buf.as_ptr() as usize + q * max_bytes;
+                transport::copy_bytes(gpu, &rank.owners, partial.as_ptr() as usize, slot, bytes)?;
+                if q > 0 {
+                    let addend = rank.stage.sub_offset(q * (max_bytes / 4), count);
+                    gpu.add_inplace_f32(&sum, &addend).map_err(hip_error)?;
+                }
             }
         }
         gpu.hip
@@ -1449,6 +1512,10 @@ fn peer_reduce(
             gpu.hip
                 .stream_wait_event(rank_stream(gpu)?, event)
                 .map_err(hip_error)?;
+        }
+        if fmt.is_some() {
+            // The fold above already added the sum to the target.
+            continue;
         }
         let sum = rank.stage.sub_offset(0, count);
         match targets.get(r) {
@@ -1492,6 +1559,11 @@ const ROOTED_REDUCE_MIN_BYTES: usize = 256 * 1024;
 /// rank `r` right after it pulled rank 0's slot 0; rank 0 waits those before
 /// returning, so the next collective cannot overwrite slot 0 under a reader.
 /// Nothing waits on the host and nothing is allocated.
+///
+/// With a 16-bit exchange (`fmt`) the non-root ranks have already packed their
+/// partial into their own stage slot `r`; rank 0 pulls those `2 * count`-byte
+/// copies into its slots `1..N` and folds `r(p0) + r(p1) + …` (`p0` rounded in
+/// register) into the f32 slot 0. The broadcast of the f32 sum is unchanged.
 #[allow(clippy::too_many_arguments)]
 fn peer_reduce_rooted(
     devices: &mut [Gpu],
@@ -1502,6 +1574,7 @@ fn peer_reduce_rooted(
     partials: &[&DeviceBuffer],
     targets: &[&DeviceBuffer],
     count: usize,
+    fmt: Option<TpExchange16>,
 ) -> Result<()> {
     let bytes = count * 4;
     // 2. Rank 0, after every producer: pull p1.., fold into slot 0.
@@ -1513,17 +1586,37 @@ fn peer_reduce_rooted(
                 .stream_wait_event(rank_stream(gpu)?, event)
                 .map_err(hip_error)?;
         }
-        for (q, partial) in partials.iter().enumerate().skip(1) {
-            let slot = rank.stage.buf.as_ptr() as usize + q * max_bytes;
-            transport::copy_bytes(gpu, &rank.owners, partial.as_ptr() as usize, slot, bytes)?;
-        }
-        let sum = rank.stage.sub_offset(0, count);
-        let first = rank.stage.sub_offset(max_bytes / 4, count);
-        gpu.add_f32(&f32_view(partials[0], count), &first, &sum)
+        if let Some(fmt) = fmt {
+            let base = rank.stage.buf.as_ptr() as usize;
+            let mut sources = [std::ptr::null::<std::ffi::c_void>(); 4];
+            for q in 1..partials.len() {
+                let slot = base + q * max_bytes;
+                let packed = scratch[q].stage.buf.as_ptr() as usize + q * max_bytes;
+                transport::copy_bytes(gpu, &rank.owners, packed, slot, count * 2)?;
+                sources[q - 1] = slot as *const std::ffi::c_void;
+            }
+            gpu.tp_fold16(
+                fmt,
+                base as *mut std::ffi::c_void,
+                std::ptr::null_mut(),
+                partials[0].as_ptr() as *const std::ffi::c_void,
+                &sources[..partials.len() - 1],
+                count,
+            )
             .map_err(hip_error)?;
-        for q in 2..partials.len() {
-            let addend = rank.stage.sub_offset(q * (max_bytes / 4), count);
-            gpu.add_inplace_f32(&sum, &addend).map_err(hip_error)?;
+        } else {
+            for (q, partial) in partials.iter().enumerate().skip(1) {
+                let slot = rank.stage.buf.as_ptr() as usize + q * max_bytes;
+                transport::copy_bytes(gpu, &rank.owners, partial.as_ptr() as usize, slot, bytes)?;
+            }
+            let sum = rank.stage.sub_offset(0, count);
+            let first = rank.stage.sub_offset(max_bytes / 4, count);
+            gpu.add_f32(&f32_view(partials[0], count), &first, &sum)
+                .map_err(hip_error)?;
+            for q in 2..partials.len() {
+                let addend = rank.stage.sub_offset(q * (max_bytes / 4), count);
+                gpu.add_inplace_f32(&sum, &addend).map_err(hip_error)?;
+            }
         }
         gpu.hip
             .event_record(&read[0], Some(rank_stream(gpu)?))
@@ -2623,6 +2716,10 @@ fn alloc_tp_scratch(
             // The TP2 direct-peer add (`peer_reduce`) launches this kernel.
             gpu.add_peer_residual_f32(&a, &b, b.buf.as_ptr() as *const std::ffi::c_void, 4)
                 .map_err(hip_error)?;
+        }
+        if let Some(fmt) = tp_exchange_format() {
+            // The 16-bit exchange packs and folds with these kernels.
+            gpu.ensure_tp_exchange16_kernels(fmt).map_err(hip_error)?;
         }
         gpu.hip.device_synchronize().map_err(hip_error)?;
     }

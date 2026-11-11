@@ -171,6 +171,23 @@ static ROWS: &[EvidenceRow] = &[
         source: Some("CHANGELOG.md:1887"),
         ..NONE
     },
+    // Flash-Next experts, gfx1100 (7900 XTX): symmetric IU4 requested by default.
+    EvidenceRow {
+        line_id: FLASH_NEXT_EXPERTS,
+        arch: Some("gfx1100"),
+        kld_from: Some(0.0905),
+        kld_to: Some(0.0612),
+        kld_metric: Some("BF16-ref WT2 KLD"),
+        speed_from: Some(955.5),
+        speed_to: Some(943.9),
+        speed_metric: Some("XTX pp8192 tok/s"),
+        typing: Some("unchanged (route is prefill chunks ≥ 512 rows)"),
+        caveat: Some("both arms had expert placement pinned at 8 VRAM layers"),
+        source: Some(
+            "CHANGELOG.md:27 (Flash-Next on gfx1100 (7900 XTX): the symmetric-IU4 MoE prefill route is requested by default)",
+        ),
+        ..NONE
+    },
     // Flash-Next experts, gfx1151.
     EvidenceRow {
         line_id: FLASH_NEXT_EXPERTS,

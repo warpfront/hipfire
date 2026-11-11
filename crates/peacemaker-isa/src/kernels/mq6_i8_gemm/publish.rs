@@ -77,6 +77,11 @@ pub(crate) fn ds_load(text: String, dst: RegRef, addr: u8) -> Instruction {
 /// Raw activation chunks of K32 half `sb` of slab `slab` of the block whose descriptor is
 /// `srd`: one b64 per staging round into `a_pf[r]`.
 pub(crate) fn fetch_a(b: &mut Builder, g: &Gen, slab: u32, sb: u32, srd: u8) -> Result<(), String> {
+    // A clause takes no waits inside: settle the destinations' hazards first (at depth 3 the
+    // half-0 stores still read the registers; depth 2 has drained them, nothing is emitted).
+    let dsts: Vec<RegRef> = g.a_pf.iter().map(|&r| vr(r, 2)).collect();
+    b.settle_defs(&dsts)
+        .map_err(|e| format!("fetch_a(slab {slab}, sb {sb}): {e}"))?;
     let round_rows = g.spec.tile.round_rows();
     let mut load = |b: &mut Builder| {
         for r in 0..g.a_pf.len() as u32 {
@@ -104,6 +109,10 @@ pub(crate) fn fetch_a(b: &mut Builder, g: &Gen, slab: u32, sb: u32, srd: u8) -> 
 /// Raw weight dwords (both rounds) at group-relative byte offset `base`
 /// (`8 + 96 h + 48 slab`, plus the group stride when fetching across a group boundary).
 pub(crate) fn fetch_w(b: &mut Builder, g: &Gen, base: u32) -> Result<(), String> {
+    // A clause takes no waits inside: settle the destinations' hazards first.
+    let dsts: Vec<RegRef> = g.w_pf.iter().map(|&r| vr(r, 3)).collect();
+    b.settle_defs(&dsts)
+        .map_err(|e| format!("fetch_w({base}): {e}"))?;
     b.clause(|b| {
         for r in 0..g.w_pf.len() {
             let soff = if r == 0 { g.goff } else { g.goff1 };
@@ -255,14 +264,15 @@ pub(crate) fn decode_round<S: Sink>(b: &mut S, g: &Gen, r: usize) -> Result<(), 
 /// The two LDS stores of the decoded operands of weight round `r` into slot `slot`: `e0` (data
 /// in `o`) at `+0`, `e1` (data in `p`) at `+512`.
 pub(crate) fn store_w_insns(g: &Gen, slot: usize, r: usize) -> Result<[Instruction; 2], String> {
-    if slot > 1 || r >= g.w_pf.len() {
+    if slot >= g.depth() || r >= g.w_pf.len() {
         return Err(format!(
-            "store_w: slot {slot} / round {r} out of range (2 / {})",
+            "store_w: slot {slot} / round {r} out of range ({} / {})",
+            g.depth(),
             g.w_pf.len()
         ));
     }
     let tile = g.spec.tile;
-    let base = tile.layout().w[slot] + tile.round_lds_stride() * r as u32;
+    let base = tile.layout().w_slot(slot)? + tile.round_lds_stride() * r as u32;
     let (o, p) = (g.scratch + 4, g.scratch + 2);
     Ok([
         ds_store(
@@ -289,13 +299,13 @@ pub(crate) fn store_w_insns(g: &Gen, slot: usize, r: usize) -> Result<[Instructi
 }
 
 /// The two decoded operands of round `r` to LDS slot `slot`.
-pub(crate) fn store_w_round<C: State>(
+pub(crate) fn store_w_round<C: State, const D: usize>(
     w: &mut Wv,
     g: &Gen,
-    sw: Staged<PayW, C>,
+    sw: Staged<PayW, C, D>,
     slot: usize,
     r: usize,
-) -> Result<Staged<PayW, C>, String> {
+) -> Result<Staged<PayW, C, D>, String> {
     let [e0, e1] = store_w_insns(g, slot, r)?;
     let sw = w.ds_store(sw, e0)?;
     w.ds_store(sw, e1)
@@ -303,12 +313,13 @@ pub(crate) fn store_w_round<C: State>(
 
 /// The two LDS stores of the raw activation chunks of K32 half `sb` into slot `slot`.
 pub(crate) fn store_a_insns(g: &Gen, slot: usize, sb: u32) -> Result<Vec<Instruction>, String> {
-    if slot > 1 || sb > 1 {
+    if slot >= g.depth() || sb > 1 {
         return Err(format!(
             "store_a: slot {slot} / half {sb} out of range (0..2)"
         ));
     }
     let tile = g.spec.tile;
+    let a_base = tile.layout().a_slot(slot)?;
     let one = |r: u32| {
         let ar = g.a_pf[r as usize];
         ds_store(
@@ -317,7 +328,7 @@ pub(crate) fn store_a_insns(g: &Gen, slot: usize, sb: u32) -> Result<Vec<Instruc
                 g.st_alds,
                 ar,
                 ar + 1,
-                ds_offset(tile.layout().a[slot] + tile.round_lds_stride() * r + 1024 * sb)
+                ds_offset(a_base + tile.round_lds_stride() * r + 1024 * sb)
             ),
             vec![v(g.st_alds), vr(ar, 2)],
         )
@@ -326,13 +337,13 @@ pub(crate) fn store_a_insns(g: &Gen, slot: usize, sb: u32) -> Result<Vec<Instruc
 }
 
 /// The raw activation chunks of K32 half `sb` to LDS slot `slot`.
-pub(crate) fn store_a_half<C: State>(
+pub(crate) fn store_a_half<C: State, const D: usize>(
     w: &mut Wv,
     g: &Gen,
-    mut sa: Staged<PayA, C>,
+    mut sa: Staged<PayA, C, D>,
     slot: usize,
     sb: u32,
-) -> Result<Staged<PayA, C>, String> {
+) -> Result<Staged<PayA, C, D>, String> {
     for insn in store_a_insns(g, slot, sb)? {
         sa = w.ds_store(sa, insn)?;
     }

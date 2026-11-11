@@ -1,5 +1,5 @@
 {
-  "amdgpu_metadata": "---\namdhsa.kernels:\n  - .args:\n      - .actual_access: read_only\n        .address_space: global\n        .name: topk\n        .offset: 0\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: read_only\n        .address_space: global\n        .name: codec\n        .offset: 8\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: write_only\n        .address_space: global\n        .name: out\n        .offset: 16\n        .size: 8\n        .value_kind: global_buffer\n      - \n        .name: rows\n        .offset: 24\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: uniform_bucket\n        .offset: 28\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: n_experts\n        .offset: 32\n        .size: 4\n        .value_kind: by_value\n    .group_segment_fixed_size: 1280\n    .kernarg_segment_align: 8\n    .kernarg_segment_size: 40\n    .max_flat_workgroup_size: 128\n    .name: qwen4_slab_union_plan_t8_pm_gfx1100\n    .private_segment_fixed_size: 0\n    .sgpr_count: 27\n    .sgpr_spill_count: 0\n    .symbol: qwen4_slab_union_plan_t8_pm_gfx1100.kd\n    .uniform_work_group_size: 1\n    .uses_dynamic_stack: false\n    .vgpr_count: 24\n    .vgpr_spill_count: 0\n    .wavefront_size: 32\n    .workgroup_processor_mode: 1\namdhsa.target: amdgcn-amd-amdhsa--gfx1100\namdhsa.version: [1, 2]\n...\n.end_amdgpu_metadata\n.text\n\t.p2alignl 7, 3214868480\n\t.fill 96, 4, 3214868480\n",
+  "amdgpu_metadata": "---\namdhsa.kernels:\n  - .args:\n      - .actual_access: read_only\n        .address_space: global\n        .name: topk\n        .offset: 0\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: read_only\n        .address_space: global\n        .name: codec\n        .offset: 8\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: write_only\n        .address_space: global\n        .name: out\n        .offset: 16\n        .size: 8\n        .value_kind: global_buffer\n      - \n        .name: rows\n        .offset: 24\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: uniform_bucket\n        .offset: 28\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: n_experts\n        .offset: 32\n        .size: 4\n        .value_kind: by_value\n    .group_segment_fixed_size: 1280\n    .kernarg_segment_align: 8\n    .kernarg_segment_size: 40\n    .max_flat_workgroup_size: 128\n    .name: qwen4_slab_union_plan_t8_pm_gfx1100\n    .private_segment_fixed_size: 0\n    .sgpr_count: 40\n    .sgpr_spill_count: 0\n    .symbol: qwen4_slab_union_plan_t8_pm_gfx1100.kd\n    .uniform_work_group_size: 1\n    .uses_dynamic_stack: false\n    .vgpr_count: 24\n    .vgpr_spill_count: 0\n    .wavefront_size: 32\n    .workgroup_processor_mode: 1\namdhsa.target: amdgcn-amd-amdhsa--gfx1100\namdhsa.version: [1, 2]\n...\n.end_amdgpu_metadata\n.text\n\t.p2alignl 7, 3214868480\n\t.fill 96, 4, 3214868480\n",
   "arch": "gfx1100",
   "builder_proof": {
     "arch": "gfx1100",
@@ -64,7 +64,7 @@
         "iterations": 2
       }
     ],
-    "next_free_sgpr": 27,
+    "next_free_sgpr": 40,
     "next_free_vgpr": 24,
     "reg_plan": [
       {
@@ -75,14 +75,14 @@
         "name": "kernarg"
       },
       {
-        "base": 2,
+        "base": 15,
         "kind": "s",
         "len": 1,
         "live": "Whole",
         "name": "workgroup_x"
       },
       {
-        "base": 8,
+        "base": 32,
         "kind": "s",
         "len": 8,
         "live": "Whole",
@@ -173,7 +173,7 @@
         "name": "slot_state"
       }
     ],
-    "s_text_sha256": "b33941d82a05d11ae154f01ae9156a10f6e7ce423cbe55c55f554e740273dd74",
+    "s_text_sha256": "bb5cf128ffd7569b790fd7cf1c2adc7f514b3464ba9c016ec0d37fe51be725f9",
     "variant": "t8",
     "vopd_pairs": 0,
     "waits": [
@@ -383,7 +383,7 @@
     "barriers": 2,
     "ds": 8,
     "instructions": 212,
-    "next_free_sgpr": 27,
+    "next_free_sgpr": 40,
     "next_free_vgpr": 24,
     "valu_slots": 86,
     "vmem": 16,
@@ -419,7 +419,7 @@
   "require_wave32": true,
   "require_zero_private": true,
   "require_zero_spills": true,
-  "sgpr_max": 27,
+  "sgpr_max": 40,
   "symbol": "qwen4_slab_union_plan_t8_pm_gfx1100",
   "vgpr_max": 24
 }

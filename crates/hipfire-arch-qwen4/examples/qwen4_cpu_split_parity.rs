@@ -27,7 +27,7 @@
 //! `memory.offload_exec` always wins over the force, so any explicit value is refused here),
 //! and every armed layer must be a whole-layer host owner: split owner kind `whole-layer`,
 //! identity `cpu-whole-split-v1/<bitmap of the host-placed layers>`, placement all-cold.
-//! `HIPFIRE_QWEN4_D2_RETURN=mapped|copy` (default `copy`) selects the cold-result
+//! `HIPFIRE_QWEN4_D2_RETURN=mapped|copy` (default `copy`; `mapped` on exact gfx1100) selects the cold-result
 //! transport at load: `mapped` makes every all-cold layer's canonical combine read
 //! the CPU-written mapped allocation instead of H2D-copied slots (a mixed-placement
 //! layer keeps `copy`). Every layer reports its return mode, `output_copy_calls`,
@@ -35,7 +35,7 @@
 //! publishes once with zero cold-slot copies. The same-input gates run unchanged on
 //! the tensor the combine actually read (the mapped view in mapped mode).
 //! `HIPFIRE_QWEN4_D2_READY=sync|event` (default `sync`) selects the input-readiness
-//! mechanism of `prepare` and `HIPFIRE_QWEN4_D2_JOIN=host|cpwait` (default `host`) the
+//! mechanism of `prepare` and `HIPFIRE_QWEN4_D2_JOIN=host|cpwait` (default `host`; `cpwait` on exact gfx1100, so a gfx1100 lab run needs `HIPFIRE_QWEN4_D2_JOIN=host`) the
 //! join. Readiness is the configured `HIPFIRE_QWEN4_D2_READY` mode under either join:
 //! the CP-wait join reports the same `sync`/`event` readiness as the host join. The
 //! effective per-layer modes, the cumulative `ready_polls` (event queries),
@@ -149,8 +149,13 @@ const USAGE: &str = "usage: HIPFIRE_OFFLOAD_EXEC=cpu qwen4_cpu_split_parity MODE
     HIPFIRE_QWEN4_D2_DEFAULT=1 [HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N optional diagnostic override; unset/auto = product placement] (HIPFIRE_OFFLOAD_EXEC unset) \
     qwen4_cpu_split_parity MODEL.mq4 TEXT.txt --untiered [same options, no --hot-budget-mib/--hotset]";
 
-/// Rows the split serves at most (`CPU_SPLIT_MAX_ROWS`).
-const MAX_SPLIT_ROWS: usize = 4;
+/// Rows the split serves at most: `CPU_SPLIT_MAX_ROWS` (4), or the wider
+/// `HIPFIRE_QWEN4_D2_WINDOW_ROWS` window (`5..=8`; set it for a `--rows 5..8`
+/// run, the executor is then built for that many rows).
+fn max_split_rows() -> usize {
+    hipfire_config::memory::qwen4_d2_window_rows()
+        .max(hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS)
+}
 
 // ── arguments ────────────────────────────────────────────────────────
 
@@ -264,17 +269,19 @@ fn parse_args() -> R<Args> {
             return Err("--hot-budget-mib must be > 0".into());
         }
     }
-    if rows == 0 || rows > MAX_SPLIT_ROWS {
+    if rows == 0 || rows > max_split_rows() {
         return Err(format!(
-            "--rows {rows}: the split serves 1..={MAX_SPLIT_ROWS} rows"
+            "--rows {rows}: the split serves 1..={} rows (5..8 need HIPFIRE_QWEN4_D2_WINDOW_ROWS)",
+            max_split_rows()
         ));
     }
     if greedy && rows != 1 {
         return Err("--greedy feeds one argmax token per step: it needs --rows 1".into());
     }
-    if prompt_rows <= MAX_SPLIT_ROWS {
+    if prompt_rows <= max_split_rows() {
         return Err(format!(
-            "--prompt-rows {prompt_rows}: the prefill must be wider than {MAX_SPLIT_ROWS} rows so only decode/verify steps take the split"
+            "--prompt-rows {prompt_rows}: the prefill must be wider than {} rows so only decode/verify steps take the split",
+            max_split_rows()
         ));
     }
     if steps == 0 {
@@ -534,6 +541,13 @@ fn load(args: &Args, max_seq: usize) -> R<Model> {
     let trunk_overlay =
         hipfire_arch_qwen4::resolve_trunk_overlay(&hfq, path, &gpu.arch, &receipt.config)
             .map_err(|x| format!("qwen4 trunk overlay: {x}"))?;
+    let hc8_sidecar = hipfire_arch_qwen4::resolve_hc8_sidecar(
+        &hfq,
+        path,
+        gpu.flags.qwen4_hc8_enabled(),
+        &receipt.config,
+    )
+    .map_err(|x| format!("qwen4 hc8 sidecar: {x}"))?;
     let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
         &gpu,
         &hfq,
@@ -746,6 +760,7 @@ fn load(args: &Args, max_seq: usize) -> R<Model> {
                         slab_recipe,
                         false,
                     ),
+                    0,
                 )?;
                 match resolved {
                     Some(n) => {
@@ -837,6 +852,11 @@ fn load(args: &Args, max_seq: usize) -> R<Model> {
         bundle
             .attach_trunk_overlay(overlay)
             .map_err(|x| format!("qwen4 trunk overlay: {x}"))?;
+    }
+    if let Some(sidecar) = hc8_sidecar {
+        bundle
+            .attach_hc8_sidecar(sidecar)
+            .map_err(|x| format!("qwen4 hc8 sidecar: {x}"))?;
     }
     bundle
         .attach_forward(&mut gpu, max_seq, scratch_mode)
@@ -1014,7 +1034,7 @@ fn analyze(rec: &SplitParityRecord, shadow: &HfqShadow, agg: &mut LayerAgg) -> R
     let n_experts = rec.placement.len();
     let slots = rows * top_k;
     if rows == 0
-        || rows > MAX_SPLIT_ROWS
+        || rows > max_split_rows()
         || rec.x_rot.len() != rows * dim
         || rec.ids.len() != slots
         || rec.weights.len() != slots
@@ -1683,8 +1703,8 @@ fn real_main() -> R<bool> {
     );
     println!(
         "qwen4_cpu_split_parity: HIPFIRE_QWEN4_D2_RETURN requested {} (a mixed-placement layer keeps copy; per-layer return mode and counters are reported below)",
-        hipfire_config::memory::qwen4_d2_return()
-            .map_or_else(|refusal| format!("INVALID ({refusal})"), |mode| mode.as_str().to_string()),
+        hipfire_config::memory::qwen4_d2_transport(&m.gpu.arch)
+            .map_or_else(|refusal| format!("INVALID ({refusal})"), |t| t.ret.as_str().to_string()),
     );
     // The lab parity modes drain the stream before the CPU arithmetic and
     // serialize the combine, which a CP-wait join cannot do: refuse instead of
@@ -1704,12 +1724,12 @@ fn real_main() -> R<bool> {
         hipfire_config::memory::qwen4_d2_ready()
             .map_or_else(|refusal| format!("INVALID ({refusal})"), |mode| mode.as_str().to_string()),
         ready_modes.len(),
-        hipfire_config::memory::qwen4_d2_join()
-            .map_or_else(|refusal| format!("INVALID ({refusal})"), |mode| mode.as_str().to_string()),
+        hipfire_config::memory::qwen4_d2_transport(&m.gpu.arch)
+            .map_or_else(|refusal| format!("INVALID ({refusal})"), |t| t.join.as_str().to_string()),
     );
     if cpwait_layers > 0 {
         return Err(format!(
-            "HIPFIRE_QWEN4_D2_JOIN=cpwait is active on {cpwait_layers} layers; the lab parity runs drain the stream before the join and cannot run under it (run with HIPFIRE_QWEN4_D2_JOIN=host)"
+            "HIPFIRE_QWEN4_D2_JOIN=cpwait is active on {cpwait_layers} layers; the lab parity runs drain the stream before the join and cannot run under it (run with HIPFIRE_QWEN4_D2_JOIN=host; exact gfx1100 defaults an unset join to cpwait)"
         ));
     }
 
@@ -2092,9 +2112,9 @@ fn real_main() -> R<bool> {
             "placement_digest": m.placement_digest,
             "placement_source": m.placement_source,
             "d2_force": hipfire_config::memory::qwen4_d2_default(),
-            "d2_return_requested": hipfire_config::memory::qwen4_d2_return().ok().map(|mode| mode.as_str()),
+            "d2_return_requested": hipfire_config::memory::qwen4_d2_transport(&m.gpu.arch).ok().map(|t| t.ret.as_str()),
             "d2_ready_requested": hipfire_config::memory::qwen4_d2_ready().ok().map(|mode| mode.as_str()),
-            "d2_join_requested": hipfire_config::memory::qwen4_d2_join().ok().map(|mode| mode.as_str()),
+            "d2_join_requested": hipfire_config::memory::qwen4_d2_transport(&m.gpu.arch).ok().map(|t| t.join.as_str()),
             "d2_ready_modes": ready_modes.iter().map(|(l, k)| json!([l, k])).collect::<Vec<_>>(),
             "d2_join_modes": join_modes.iter().map(|(l, k)| json!([l, k])).collect::<Vec<_>>(),
             "d2_readiness_counters": counters.iter().map(|(l, c)| json!({

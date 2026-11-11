@@ -11,7 +11,8 @@
 //! launch domain, the row-locality, the register plan (72 VGPRs, wave32) and the numerical
 //! order (rotation, IEEE divide DAG, mse trees, strict winner selection, unit block) are the
 //! same instruction for instruction. Differences, all arch-only:
-//!  * the workgroup id x is the first system SGPR `s2` (after the two user SGPRs), not `ttmp9`;
+//!  * the workgroup id x is the first system SGPR, `s15` (after the 15 declared user SGPRs: the
+//!    kernarg pointer padded to the gfx1100 `user + system >= 16` rule), not `ttmp9`;
 //!  * `s_sub_co_u32` -> `s_sub_u32`; `v_max_num_f32` -> `v_max_f32`; `v_maxmin_num_f32` ->
 //!    `v_maxmin_f32` (finite domain: identical results);
 //!  * adds, `s_load` offsets and waits dispatch through `kernels::common` / the builder
@@ -94,14 +95,23 @@ pub fn module_specs(arch: Arch) -> Vec<Spec> {
 }
 
 // ----------------------------------------------------------------------- SGPRs
-// s0:1 kernarg pointer; s2 workgroup id x (gfx11: the first system SGPR after the two user SGPRs).
+// s0:1 kernarg pointer. gfx1100 `FeatureUserSGPRInit16Bug` (LLVM): a wave32 kernel enables at least
+// 16 user + system SGPRs, so the kernarg pointer s[0:1] is padded with dead user SGPRs up to
+// `user + system (workgroup id x) = 16`, i.e. 15 declared user SGPRs, and the workgroup id x is the
+// first system SGPR AFTER the padding: s15.
+/// Real user SGPRs (the kernarg pointer) and enabled system SGPRs (workgroup id x).
+const USER_SGPRS: u8 = 2;
+const SYSTEM_SGPRS: u8 = 1;
+/// `.amdhsa_user_sgpr_count` of the gfx1100 descriptor (`Arch::declared_user_sgprs`).
+const DECLARED_USER_SGPRS: u8 = Arch::Gfx1100.declared_user_sgprs(USER_SGPRS, SYSTEM_SGPRS);
 const KARG: u8 = 0;
-const WGIN: u8 = 2;
-/// Kernargs: `s_load_b256` s[8:15] = h, sorted, xq, signs1; `s_load_b128` s[16:19] = signs2, P, L.
-const ARG_H: u8 = 8;
-const ARG_SORTED: u8 = 10;
-const ARG_XQ: u8 = 12;
-const ARG_S1: u8 = 14;
+const WGIN: u8 = DECLARED_USER_SGPRS;
+/// Kernargs: `s_load_b256` s[48:55] = h, sorted, xq, signs1 (s14/s15 hold the padding and the
+/// workgroup id); `s_load_b128` s[16:19] = signs2, P, L.
+const ARG_H: u8 = 48;
+const ARG_SORTED: u8 = 50;
+const ARG_XQ: u8 = 52;
+const ARG_S1: u8 = 54;
 const ARG_S2: u8 = 16;
 const ARG_P: u8 = 18;
 const ARG_L: u8 = 19;
@@ -228,7 +238,7 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
         arch: spec.arch,
         symbol: spec.symbol(),
         kernargs,
-        user_sgpr_count: 2,
+        user_sgpr_count: USER_SGPRS,
         system_sgpr_workgroup_id_y: false,
         workgroup_size: WORKGROUP_SIZE as u16,
         group_segment_fixed_size: 0,
@@ -255,21 +265,29 @@ pub fn emit_module(arch: Arch) -> Result<(Vec<Emitted>, String, iu4_gemm::Module
 }
 
 /// `dst = base + x * imm` over a 64-bit SGPR pair (`x` an unsigned SGPR, `imm` a literal);
-/// clobbers `T0`, `T1`.
+/// clobbers `T0`, `T1`. `x` may be `T0` (the xq record index is built there): the high word is
+/// computed FIRST, from the intact `x`, because the low-word product overwrites `T0`. (The original
+/// order read the clobbered `T0` for `s_mul_hi_u32`, adding `floor(low * imm / 2^32) << 32` to the
+/// pointer: zero while `x * imm < 2^32 / imm`, i.e. record index `x < 828,505` at imm 72, and a
+/// wild 4 GiB-shifted store above it; with L = 168,960 slots, group 4 and a slot >= 152,665 hit it.)
 fn mad64(b: &mut Builder, dst: u8, base: u8, x: u8, imm: u32) -> R {
     let a = b.spec.arch;
+    assert!(
+        x != T1,
+        "mad64: x must not be T1 (written before the low-word product)"
+    );
     // SOP2 literals other than inline constants are not encodable here: the multiplier goes through an SGPR.
     sop(b, format!("s_mov_b32 s{KIMM}, {}", lit(imm)), &[KIMM], &[])?;
     sop(
         b,
-        format!("s_mul_i32 s{T0}, s{x}, s{KIMM}"),
-        &[T0],
+        format!("s_mul_hi_u32 s{T1}, s{x}, s{KIMM}"),
+        &[T1],
         &[x, KIMM],
     )?;
     sop(
         b,
-        format!("s_mul_hi_u32 s{T1}, s{x}, s{KIMM}"),
-        &[T1],
+        format!("s_mul_i32 s{T0}, s{x}, s{KIMM}"),
+        &[T0],
         &[x, KIMM],
     )?;
     sop(

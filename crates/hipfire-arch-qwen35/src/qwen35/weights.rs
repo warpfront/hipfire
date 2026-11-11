@@ -2444,6 +2444,10 @@ pub struct Qwen35Weights {
     pub output_norm: GpuTensor,
     pub output: WeightTensor,
     pub layers: Vec<LayerWeights>,
+    /// Provenance of the validated qt49 zero=-4d header contract. The GPU
+    /// carries the same marker; wide admission must check both provenance
+    /// and uniform dense projection dtypes.
+    pub mq3v2_symmetric: bool,
     /// True when any MoE FFN projection in the loaded model is MQ6. gfx1151's
     /// grouped-i8 MQ4 shortcut is model-level unsafe for these promoted A3B
     /// checkpoints, even in layers whose local routed experts remain MQ4.
@@ -3103,6 +3107,9 @@ impl Qwen35Weights {
             output_norm: placeholder_tensor(&seal.output_norm),
             output: placeholder_weight(&seal.output),
             layers,
+            // The seal/shared-weights recipe carries no qt49 provenance, so a
+            // hydrated model fails closed: no symmetric MQ3V25 A4/A8 route.
+            mq3v2_symmetric: false,
             moe_has_mq6: false,
             pager: None,
             lm_head_aliases_embd: seal.lm_head_aliases_embd,
@@ -4289,6 +4296,7 @@ mod dense_shared_tests {
             output_norm,
             output,
             layers: vec![LayerWeights::DeltaNet(delta), LayerWeights::FullAttn(full)],
+            mq3v2_symmetric: false,
             moe_has_mq6: false,
             pager: None,
             lm_head_aliases_embd: tied,

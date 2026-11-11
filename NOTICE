@@ -140,6 +140,37 @@ the derived files carry the SPDX identifier noted below.
   gfx1151`); coop27 embeds the incumbent code object directly from
   kernels/gemm_mq4g256v2_residual_iu4_pm_v2b_gfx1151.hxaco.
 
+== Third-party components: ggml (MIT) ==
+
+Quantised block formats and HIP kernels under third_party/ggml and
+kernels/src/ggml_*.hip.
+
+- third_party/ggml/ is a verbatim, unedited snapshot of a subset of the ggml
+  sources shipped in https://github.com/ggml-org/llama.cpp (the `ggml/`
+  directory plus the repository-root LICENSE), pinned at commit
+  2e0d86bebc210947680e8f0d67daa79f3260c106 (2026-10-28). The pin, the
+  upstream path of every file and its SHA-256 are recorded in
+  third_party/ggml/PIN; any local change lives as a patch file under
+  third_party/ggml-patches/, never inside the snapshot.
+  Copyright (c) 2023-2026 The ggml authors. Licensed MIT; the copyright
+  notice and permission notice are retained in third_party/ggml/LICENSE
+  (verbatim) and in every imported file. The imported files keep their
+  upstream terms (MIT) and are NOT relabelled Apache-2.0; they are excluded
+  from scripts/governance/apply_spdx_headers.py (any `third_party/` path).
+
+- kernels/src/ggml_*.hip are hipfire shim files (SPDX `Apache-2.0`) derived
+  from ggml: they #include the pinned upstream headers and loop or call
+  upstream's device functions (`vec_dot_*_q8_1` of the mmvq shims,
+  `dequantize_*` of ggml_convert_shim.hip, whose gather and dequantise kernel
+  bodies are transcriptions of upstream's convert.cu / getrows.cu kernels), and
+  carry a "Derived from ggml (MIT)" line. Each compiled shim object
+  (kernels/ggml_*_shim_gfx1201.co) contains code compiled from both.
+
+hipfire imports ggml's quantised-weight formats and kernels (MIT) as a
+library for GGUF-native serving; it is not a wrapper around llama.cpp: the
+executor, attention/GDN/MoE/KV/speculation, dispatch and the PeaceMaker
+toolchain are hipfire's.
+
 == Attribution requirements (when distributing under Apache 2.0) ==
 
 Any redistribution of Apache-2.0-licensed portions of this Software

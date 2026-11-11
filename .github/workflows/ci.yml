@@ -47,64 +47,146 @@ env:
   # red the build on legacy code. Add it after a warning-cleanup pass.
 
 jobs:
-  build:
-    name: build (workspace, no GPU)
+  # `build` and `test` below are the required status checks (see the header).
+  # The work runs in the matrix jobs `build-shards` / `test-shards` so a run
+  # takes the longest shard, not the sum of all of them; `build` and `test`
+  # keep the original check names and only report whether every shard passed.
+  # Test shards compile and run under the `ci` profile (Cargo.toml): optimised
+  # where the exhaustive CPU oracles/emulators live, debug assertions and
+  # overflow checks on everywhere. rust-cache is keyed per shard (the default
+  # key does not include matrix values, so shards would otherwise collide).
+  build-shards:
+    name: build shard (${{ matrix.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release
+            # The release profile is what ships: every library and binary (not
+            # the test/example targets, which `all-targets` covers), then the
+            # daemon alone (its feature set differs from the workspace-unified
+            # one) and the dark NPU stack.
+            run: |
+              cargo build --release --locked --workspace --lib --bins
+              cargo build --release --locked -p hipfire-daemon
+              cargo build --release --locked -p railgun --features npu && cargo build --release --locked -p npu-tools --features lab
+          - name: all-targets
+            # Every target of every crate (lib, bins, examples, tests, benches),
+            # including the GPU-only ones CI does not run, must keep compiling.
+            # `check`, not `build`: linking every example and test binary
+            # unoptimised writes ~15-19 GB, more than a hosted runner has to
+            # spare. Everything that ships is built and linked by `release`
+            # above and everything CI runs is built and linked by the test
+            # shards; only the never-run examples/benches/GPU tests are
+            # type-checked rather than linked.
+            run: cargo check --locked --workspace --all-targets
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build workspace (lib + bins + examples + tests)
-        run: cargo build --release --workspace --all-targets --locked
-      - name: Build daemon (real shipped binary, all architectures in)
-        run: cargo build --release --locked -p hipfire-daemon
-      - name: Build the dark NPU stack (railgun `npu`, npu-tools `lab`) so it cannot rot
-        run: cargo build --release --locked -p railgun --features npu && cargo build --release --locked -p npu-tools --features lab
+        with:
+          key: build-${{ matrix.name }}
+      - name: Build (${{ matrix.name }})
+        run: ${{ matrix.run }}
 
-  test:
-    name: unit + integration tests (no GPU)
+  build:
+    name: build (workspace, no GPU)
+    needs: build-shards
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every build shard passed
+        run: |
+          echo "build-shards: ${{ needs.build-shards.result }}"
+          test "${{ needs.build-shards.result }}" = success
+
+  test-shards:
+    name: test shard (${{ matrix.name }})
     runs-on: ubuntu-latest
     env:
       # Belt and braces on a GPU-less runner: no test may see a device.
       ROCR_VISIBLE_DEVICES: "-1"
       HIP_VISIBLE_DEVICES: "-1"
       HIPFIRE_TEST_REQUIRE_ROCM: "0"
+      # GPU-free integration/bin tests: `--lib` skips crates/*/tests/*.rs and
+      # bin-only unit tests. These crates' integration tests are GPU-free (GPU
+      # ones are #[ignore]). The `int-*` shards split them by the first letter
+      # of the test target name with cargo `--test` globs; the globs partition
+      # every name (the last one is a negation), so a new test target lands in
+      # a shard without touching this file. Keep the package list identical in
+      # every shard: cargo unifies features over the selected packages, so a
+      # different list would build the same tests with different features.
+      INTEG_PKGS: >-
+        -p hipfire-engine -p hipfire-generate -p peacemaker-isa -p peacemaker-lift
+        -p redline-dispatch -p hipfire-arch-qwen35-vl -p hipfire-detect
+        -p hipfire-daemon -p saddle-quant -p hipfire-tui
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: lib-peacemaker-isa
+            # peacemaker-isa's unit tests, with the `toolchain` feature that
+            # rdna-compute turns on in the workspace-wide build (181 tests; the
+            # `int-*` shards build it without, 107). Run alone, because they
+            # are the longest lib binary.
+            run: cargo test --profile ci --locked --lib -p peacemaker-isa -p rdna-compute
+          - name: lib-rest
+            # --lib only: unit tests inside library targets are GPU-free
+            # (detector logic, sampler, framing, quant math). Integration
+            # tests / examples that dispatch kernels need the self-hosted
+            # GPU runner and are intentionally excluded here. peacemaker-isa is
+            # the only package excluded; rdna-compute stays selected so the
+            # feature set of every other crate is the workspace-wide one.
+            run: cargo test --profile ci --locked --lib --workspace --exclude peacemaker-isa
+          - name: serve
+            # hipfire-cli is bin-only, so `--lib --workspace` skips it. Its tests
+            # drive the OpenAI HTTP gateway against the scripted fake daemon
+            # (crates/hipfire-cli/src/serve/fake_daemon.py, stdlib python3) and
+            # need no GPU. hipfire-client is a lib crate and runs above.
+            run: |
+              cargo test --profile ci --locked -p hipfire-cli
+              cargo test --profile ci --locked -p npu-tools --bin npu-trunk-transport
+              cargo test --profile ci --locked -p hipfire-generate --features serve-fault-inject --test serve_fault_inject_tests
+          - name: rdna-compute-abi
+            # dflash_accept_emu compares the builder device-accept kernel with
+            # the rdna-compute host twin on the CPU interpreter;
+            # all_launcher_abi is the MoE launcher ABI gate.
+            run: |
+              cargo test --profile ci --locked -p rdna-compute --test dflash_accept_emu
+              cargo test --profile ci --locked -p rdna-compute --test all_launcher_abi
+          - name: int-e
+            run: cargo test --profile ci --locked $INTEG_PKGS --test '[e]*'
+          - name: int-l
+            run: cargo test --profile ci --locked $INTEG_PKGS --test '[l]*'
+          - name: int-m
+            run: cargo test --profile ci --locked $INTEG_PKGS --test '[m]*'
+          - name: int-q
+            run: cargo test --profile ci --locked $INTEG_PKGS --test '[q]*'
+          - name: int-rest
+            # Everything else, plus the unit tests of the lib and bin targets.
+            run: cargo test --profile ci --locked $INTEG_PKGS --lib --bins --test '[!elmq]*'
     steps:
       - name: Private hipfire lock dir
         run: echo "HIPFIRE_LOCK_DIR=$RUNNER_TEMP/hipfire-locks" >> "$GITHUB_ENV" && mkdir -p "$RUNNER_TEMP/hipfire-locks"
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run workspace lib unit tests
-        # --lib only: unit tests inside library targets are GPU-free
-        # (detector logic, sampler, framing, quant math). Integration
-        # tests / examples that dispatch kernels need the self-hosted
-        # GPU runner and are intentionally excluded here.
-        run: cargo test --lib --workspace --locked
-      - name: Run serve gateway tests (bin crate)
-        # hipfire-cli is bin-only, so `--lib --workspace` skips it. Its tests
-        # drive the OpenAI HTTP gateway against the scripted fake daemon
-        # (crates/hipfire-cli/src/serve/fake_daemon.py, stdlib python3) and
-        # need no GPU. hipfire-client is a lib crate and runs above.
-        run: cargo test --locked -p hipfire-cli
-      - name: Run GPU-free integration and bin tests
-        # `--lib` skips crates/*/tests/*.rs and bin-only unit tests. These
-        # crates' integration tests are GPU-free (GPU ones are #[ignore]).
-        run: >-
-          cargo test --locked --tests
-          -p hipfire-engine -p hipfire-generate -p peacemaker-isa -p peacemaker-lift
-          -p redline-dispatch -p hipfire-arch-qwen35-vl -p hipfire-detect
-          -p hipfire-daemon -p saddle-quant -p hipfire-tui
-      - name: Run builder-kernel CPU emulation test (no GPU)
-        # Moved from peacemaker-isa: compares the builder device-accept kernel
-        # with the rdna-compute host twin on the CPU interpreter.
-        run: cargo test --locked -p rdna-compute --test dflash_accept_emu
-      - name: Run MoE launcher ABI test (no GPU)
-        run: cargo test --locked -p rdna-compute --test all_launcher_abi
-      - name: Run NPU transport CPU tests
-        run: cargo test --locked -p npu-tools --bin npu-trunk-transport
-      - name: Run serve fault-injection tests
-        run: cargo test --locked -p hipfire-generate --features serve-fault-inject --test serve_fault_inject_tests
+        with:
+          key: test-${{ matrix.name }}
+      - name: Test (${{ matrix.name }})
+        run: ${{ matrix.run }}
+
+  test:
+    name: unit + integration tests (no GPU)
+    needs: test-shards
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every test shard passed
+        run: |
+          echo "test-shards: ${{ needs.test-shards.result }}"
+          test "${{ needs.test-shards.result }}" = success
 
   windows:
     name: Windows MSVC (no GPU)
@@ -272,10 +354,18 @@ jobs:
         run: bash scripts/leanup-ratchets.sh
       - name: Crate maps match the tree
         run: python3 scripts/check-crate-maps.py --check
+      - name: QSA image pooling positions and negative controls (host C++)
+        run: python3 scripts/test_qsa_mrope_position.py
       - name: Scratch growers invalidate captured graphs first
         run: python3 scripts/check-scratch-growth.py
       - name: Released CHANGELOG sections match their tags
         run: python3 scripts/check-changelog.py
+      - name: Row-predicate selector constants carry a covering receipt
+        run: python3 scripts/check-selector-receipts.py
+      - name: MTP parity fixture bytes are pinned and the acceptance ratchet self-tests
+        run: |
+          python3 scripts/check-mtp-parity-ratchet.py --self-test
+          python3 scripts/check-mtp-parity-ratchet.py fixture
       - name: No committed expectation was loosened
         # PR-only: on a push there is no proposed base to compare against.
         if: github.event_name == 'pull_request'

@@ -16,6 +16,42 @@ use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
 
+/// First gfx1201 row count at which the qt49 A4 consumer (128x128 MMQ tile,
+/// width-independent cost) beats the fp16 WMMA tiles. Up to 16 rows the WMMA
+/// kernel runs a single 16-row batch tile and is 1.3-1.7x faster than A4 on
+/// every 27B projection shape (measured on R9700, n=2..16); from 24 rows its
+/// second batch tile makes A4 faster or equal. Speculative verify (MTP, a few rows;
+/// DFlash block 16) therefore stays on the WMMA incumbent.
+const MQ3V25_A4_GFX1201_MIN_ROWS: usize = 17;
+
+/// Symmetric-MQ3V2 (qt49) A4 fast path. Multirow only: singleton decode
+/// (`batch_size == 1`) keeps the incumbent GEMV regardless of the flag, and
+/// gfx1201 keeps narrow batches (speculative verify widths) on the WMMA route.
+pub(crate) fn mq3v25_route(
+    flags: &rdna_compute::FeatureFlags,
+    symmetric: bool,
+    batch_size: usize,
+    m: usize,
+) -> bool {
+    batch_size > 1
+        && flags.mq3v25_a4_enabled(symmetric)
+        && match flags.arch.as_str() {
+            "gfx1100" => m % 128 == 0 && batch_size >= 128,
+            "gfx1201" => batch_size >= MQ3V25_A4_GFX1201_MIN_ROWS,
+            _ => false,
+        }
+}
+
+/// Symmetric-MQ3V2 (qt49) A8 fast path (explicit opt-in, exact gfx1201).
+/// Multirow only: singleton decode keeps the incumbent GEMV.
+pub(crate) fn mq3v25_a8_route(
+    flags: &rdna_compute::FeatureFlags,
+    symmetric: bool,
+    batch_size: usize,
+) -> bool {
+    batch_size > 1 && flags.mq3v25_a8_enabled(symmetric)
+}
+
 /// Exact wire format and epilogue for the opt-in packed dispatcher entries.
 fn packed_gemm_contract(key: KernelKey) -> Option<(DType, bool)> {
     use KernelKey::*;
@@ -659,7 +695,15 @@ impl GemmFamily {
             K::GemmMq4G256V2 => hip!(gpu.gemm_mq4g256v2(w.buf, x, y, m, k, batch_size)),
             K::GemmMq5G256V2 => hip!(gpu.gemm_mq5g256v2(w.buf, x, y, m, k, batch_size)),
             K::GemmMq6G256V2 => hip!(gpu.gemm_mq6g256v2(w.buf, x, y, m, k, batch_size)),
-            K::GemmMq3G256V2 => hip!(gpu.gemm_mq3g256v2(w.buf, x, y, m, k, batch_size)),
+            K::GemmMq3G256V2 => {
+                if mq3v25_a8_route(&gpu.flags, gpu.mq3v2_symmetric, batch_size) {
+                    hip!(gpu.gemm_mq3v25_residual_iu8(w.buf, x, y, m, k, batch_size, false))
+                } else if mq3v25_route(&gpu.flags, gpu.mq3v2_symmetric, batch_size, m) {
+                    hip!(gpu.gemm_mq3v25_residual_iu4(w.buf, x, y, m, k, batch_size, false))
+                } else {
+                    hip!(gpu.gemm_mq3g256v2(w.buf, x, y, m, k, batch_size))
+                }
+            }
             K::GemmMq2G256V2 => hip!(gpu.gemm_mq2g256v2(w.buf, x, y, m, k, batch_size)),
             K::GemmMq4G256V2Residual => {
                 hip!(gpu.gemm_hfq4g256_residual_mq4v2(w.buf, x, y, m, k, batch_size))
@@ -674,7 +718,13 @@ impl GemmFamily {
                 hip!(gpu.gemm_mq6g256v2_residual_wmma(w.buf, x, y, m, k, batch_size))
             }
             K::GemmMq3G256V2Residual => {
-                hip!(gpu.gemm_mq3g256v2_residual_wmma(w.buf, x, y, m, k, batch_size))
+                if mq3v25_a8_route(&gpu.flags, gpu.mq3v2_symmetric, batch_size) {
+                    hip!(gpu.gemm_mq3v25_residual_iu8(w.buf, x, y, m, k, batch_size, true))
+                } else if mq3v25_route(&gpu.flags, gpu.mq3v2_symmetric, batch_size, m) {
+                    hip!(gpu.gemm_mq3v25_residual_iu4(w.buf, x, y, m, k, batch_size, true))
+                } else {
+                    hip!(gpu.gemm_mq3g256v2_residual_wmma(w.buf, x, y, m, k, batch_size))
+                }
             }
             K::GemmMq2G256V2Residual => {
                 hip!(gpu.gemm_mq2g256v2_residual_wmma(w.buf, x, y, m, k, batch_size))
@@ -692,7 +742,13 @@ impl GemmFamily {
                 hip!(gpu.gemm_mq6g256v2_batched_lmhead(w.buf, x, y, m, k, batch_size))
             }
             K::GemmMq3G256V2BatchedLmhead => {
-                hip!(gpu.gemm_mq3g256v2_batched_lmhead(w.buf, x, y, m, k, batch_size))
+                if mq3v25_a8_route(&gpu.flags, gpu.mq3v2_symmetric, batch_size) {
+                    hip!(gpu.gemm_mq3v25_residual_iu8(w.buf, x, y, m, k, batch_size, false))
+                } else if mq3v25_route(&gpu.flags, gpu.mq3v2_symmetric, batch_size, m) {
+                    hip!(gpu.gemm_mq3v25_residual_iu4(w.buf, x, y, m, k, batch_size, false))
+                } else {
+                    hip!(gpu.gemm_mq3g256v2_batched_lmhead(w.buf, x, y, m, k, batch_size))
+                }
             }
             K::GemmMq2G256V2BatchedLmhead => {
                 hip!(gpu.gemm_mq2g256v2_batched_lmhead(w.buf, x, y, m, k, batch_size))

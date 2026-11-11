@@ -153,12 +153,14 @@ any AMD GPU for matching wire formats and operands; gfx1151-specific kernel
 optimizations do not gate ordinary-HIP serving.
 
 The grouped symmetric IU4 MoE prefill route (`HIPFIRE_QWEN4_MOE_SYM_IU4`) is
-**on by default** on gfx1151 and gfx1201 for layers whose routed-expert
+**on by default** on gfx1100, gfx1151 and gfx1201 for layers whose routed-expert
 headers verify symmetric at load (a symmetric requant such as GPTQ3); shipped
 asymmetric artifacts fail that check and stay on the F16 WMMA route.
 `HIPFIRE_QWEN4_MOE_SYM_IU4=0` opts out and keeps the F16 route, which has the
 lower KLD but the slower prefill; the measured trade for each architecture is
-recorded with the knob in [`env-vars.md`](env-vars.md).
+recorded with the knob in [`env-vars.md`](env-vars.md). On gfx1100 the regular
+prefill and the S1 slow-link window route (`aggregate-sym-iu4`) read the same
+request (`Gpu::qwen4_moe_sym_iu4_requested`), so one flag moves both.
 
 On gfx1151, Flash-Next prefill tiles of 48 to 511 rows (agent-turn appends,
 tool results, short prompt tails) run on the >= 512-row kernel family by

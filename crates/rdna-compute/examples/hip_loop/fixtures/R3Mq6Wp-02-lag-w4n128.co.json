@@ -1,0 +1,70 @@
+{
+  "arch": "gfx1100",
+  "header": {
+    "block": "128",
+    "lds_dynamic": "0",
+    "tile_m": "64",
+    "tile_n": "128"
+  },
+  "hipcc_argv": [
+    "/opt/rocm/core/bin/hipcc",
+    "--genco",
+    "--offload-arch=gfx1100",
+    "-O3",
+    "--no-offload-compress",
+    "-fuse-cuid=none",
+    "-mcode-object-version=6",
+    "--rocm-path=/opt/rocm/core",
+    "--hip-path=/opt/rocm/core",
+    "-I/opt/rocm/core/include",
+    "-o",
+    "/home/kaden/qcal/release-0.4.3/pm-krsi-1100/scratch/filter/r3/R3Mq6Wp-02-lag-w4n128/qkv/candidate/gemm_mqv2_wmma_gfx1100_mw_lds.hsaco",
+    "/home/kaden/qcal/release-0.4.3/pm-krsi-1100/scratch/filter/r3/R3Mq6Wp-02-lag-w4n128/qkv/candidate/gemm_mqv2_wmma_gfx1100_mw_lds.hip"
+  ],
+  "kernels": {
+    "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds": {
+      "code_sha256": "40f2ea2a31fbac24989b805f4513febd5ac8327b403507850a3f93e3865146f2",
+      "explicit_args": [
+        {
+          "class": "pointer",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "class": "pointer",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "class": "pointer",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "class": "value",
+          "offset": 24,
+          "size": 4
+        },
+        {
+          "class": "value",
+          "offset": 28,
+          "size": 4
+        },
+        {
+          "class": "value",
+          "offset": 32,
+          "size": 4
+        }
+      ],
+      "kernarg_bytes": 36
+    }
+  },
+  "module": "gemm_mqv2_wmma_gfx1100_mw_lds",
+  "node": "mq6_res",
+  "object_sha256": "fbd236e8e3c6947d270019286f6a55419a6d3aee235efafa85fee867852ab1b5",
+  "schema": 1,
+  "source_sha256": "76d69064e59c6f61df936132d5b9cf1e825236992834ef14d8db5015a95ce135",
+  "symbol": "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds",
+  "tool": "hip_loop",
+  "toolchain_id": "HIP version: 7.16.26385-0000000"
+}

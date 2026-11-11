@@ -34,6 +34,7 @@ members = [
     "crates/hipfire-arch-toy",
     "crates/hipfire-arch-qwen2",
     "crates/hipfire-arch-lfm2moe",
+    "crates/hipfire-arch-raon",
     "crates/hipfire-arch-lfm2-vl",
     "crates/hipfire-arch-minimax",
     "crates/hipfire-arch-cohere2moe",
@@ -67,7 +68,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.4"
+version = "0.4.5"
 edition = "2021"
 # Outbound license for the work as a whole. Individual files whose authors
 # have not elected Apache-2.0 keep an MIT SPDX header; see LICENSE and NOTICE.
@@ -112,4 +113,58 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.peacemaker-lift]
+opt-level = 3
+
+# CI test/build profile (`cargo test --profile ci`, see .github/workflows/ci.yml).
+#
+# The GPU-free CI job runs exhaustive CPU oracle/emulator tests (the rowtile
+# and MoE-splice oracles, the sampler-distribution and PSD-projection checks,
+# the launcher-ABI source scan) that took hours at opt-level 0 on a 4-core
+# runner. Optimize exactly the crates those tests live in, plus every external
+# dependency (cached by rust-cache, so it costs nothing per run); everything
+# else stays at opt-level 0 to keep the compile cheap. Debug assertions and
+# overflow checks stay ON: they are part of what the tests check. Debuginfo is
+# off (panic locations and symbol names are unaffected).
+[profile.ci]
+inherits = "dev"
+opt-level = 0
+debug = false
+debug-assertions = true
+overflow-checks = true
+incremental = false
+
+[profile.ci.package."*"]
+opt-level = 3
+
+[profile.ci.package.peacemaker-isa]
+opt-level = 3
+
+[profile.ci.package.peacemaker-ir]
+opt-level = 3
+
+[profile.ci.package.peacemaker-cdna]
+opt-level = 3
+
+[profile.ci.package.peacemaker-author]
+opt-level = 3
+
+[profile.ci.package.peacemaker-lift]
+opt-level = 3
+
+[profile.ci.package.peacemaker-npu]
+opt-level = 3
+
+[profile.ci.package.hipfire-cpu]
+opt-level = 3
+
+[profile.ci.package.hipfire-dispatch]
+opt-level = 3
+
+[profile.ci.package.hipfire-quantize]
+opt-level = 3
+
+[profile.ci.package.hipfire-runtime]
+opt-level = 3
+
+[profile.ci.package.rdna-compute]
 opt-level = 3

@@ -10,7 +10,7 @@
     "lds_unknown_addresses": 52,
     "lift": "byte-exact",
     "obligations": {},
-    "sgpr_high_water": 88,
+    "sgpr_high_water": 96,
     "table": "gfx1100",
     "vgpr_high_water": 88,
     "wait_facts": 49
@@ -26,7 +26,7 @@
     "lds_unknown_addresses": 0,
     "lift": "byte-exact",
     "obligations": {},
-    "sgpr_high_water": 88,
+    "sgpr_high_water": 96,
     "table": "gfx1100",
     "vgpr_high_water": 88,
     "wait_facts": 50
@@ -42,7 +42,7 @@
     "lds_unknown_addresses": 52,
     "lift": "byte-exact",
     "obligations": {},
-    "sgpr_high_water": 88,
+    "sgpr_high_water": 96,
     "table": "gfx1100",
     "vgpr_high_water": 112,
     "wait_facts": 61
@@ -58,7 +58,7 @@
     "lds_unknown_addresses": 0,
     "lift": "byte-exact",
     "obligations": {},
-    "sgpr_high_water": 88,
+    "sgpr_high_water": 96,
     "table": "gfx1100",
     "vgpr_high_water": 112,
     "wait_facts": 62

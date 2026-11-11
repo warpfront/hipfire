@@ -555,6 +555,7 @@ pub fn generate_deepseek4_spec(
             // The DSpark speculator keeps no one-row windows to retain.
             stop_sequences: false,
             logprobs: false,
+            penalty_generated_only: false,
         });
     }
 
@@ -596,6 +597,7 @@ pub fn generate_deepseek4_spec(
             tools: tools.map(|t| t.to_vec()),
             enable_grammar: tools.is_some(),
             stop: Vec::new(),
+            min_tokens: 0,
             max_think: 0,
             assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
             think_mode,
@@ -2922,6 +2924,7 @@ fn generate_gemma4_spec(
             tools: None,
             enable_grammar: false,
             stop: Vec::new(),
+            min_tokens: 0,
             max_think: max_think_tokens,
             assistant_prefix: AssistantPrefix::Plain,
             think_mode: if enable_thinking {
@@ -7058,6 +7061,7 @@ pub fn generate_minimax(
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     let mut text_stream = TokenTextStream::new();
+    let mut hit_eos = false;
     loop {
         // Decode-side abort check: a mid-decode client cancel stops the loop
         // immediately instead of running the full `max_tokens` of wasted work.
@@ -7072,6 +7076,7 @@ pub fn generate_minimax(
         // Sample next token from the most recent logits.
         let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
         if next_tok == eos_tok {
+            hit_eos = true;
             break;
         }
 
@@ -7139,6 +7144,7 @@ pub fn generate_minimax(
         "tok_s": (tok_s * 100.0).round() / 100.0,
         "prefill_ms": prefill_ms,
         "total_ms": total_ms,
+        "finish_reason": if hit_eos { "stop" } else { "length" },
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
@@ -8145,6 +8151,7 @@ pub fn generate_qwen2(
         }
     };
     let mut text_stream = TokenTextStream::new();
+    let mut hit_eos = false;
 
     loop {
         // Decode-side abort check: a mid-decode client cancel stops the loop
@@ -8158,6 +8165,7 @@ pub fn generate_qwen2(
             break;
         }
         if eos_set.contains(&next_tok) {
+            hit_eos = true;
             break;
         }
         // Emit the text this token completed: one emoji or CJK character is
@@ -8198,6 +8206,7 @@ pub fn generate_qwen2(
         "tok_s": (tok_s * 100.0).round() / 100.0,
         "prefill_ms": prefill_ms,
         "total_ms": total_ms,
+        "finish_reason": if hit_eos { "stop" } else { "length" },
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {

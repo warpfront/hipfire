@@ -12,7 +12,7 @@
 //! variant rounds each h to bf16 RNE before storing.
 use super::{
     region::{self, Binding, Region},
-    Epi, Gen, Wg, END, EPI,
+    Epi, Gen, IdleHalf, QkvStore, Wg, END, EPI,
 };
 use crate::kernels::{
     bf16::Bf16,
@@ -88,7 +88,20 @@ pub(crate) fn emit(wg: &mut Wg, g: &Gen, end: &End) -> Result<(), String> {
     op(b, "s_setprio 0", &[], &[])?;
     let a = g.args;
     let rbase = if g.spec.epi.is_silu() { g.hs } else { g.rs };
-    store(b, g, g.spec.epi, a.y, a.m, rbase, None)
+    if g.spec.tune.idle == IdleHalf::Off {
+        return store(b, g, g.spec.epi, a.y, a.m, rbase, None);
+    }
+    // The token-half-1 waves of a tile whose tokens all precede it (`N - bs <= 64`)
+    // compute nothing and store nothing (every column block is masked off): they
+    // leave without the store path. It holds no barrier, so skipping it is local.
+    let live = wg.scmp(Instruction::new(
+        format!("s_cmp_lg_u32 s{}, 0", g.idle),
+        vec![],
+        vec![s(g.idle)],
+    ))?;
+    wg.skip_if(live, &format!("{EPI}_live"), (), |w, ()| {
+        store(w.isa(), g, g.spec.epi, a.y, a.m, rbase, None)
+    })
 }
 
 /// Fused projection, non-GDN tiles: Z tiles store like SET into Yz (stride
@@ -104,7 +117,14 @@ fn fused_stores(wg: &mut Wg, g: &Gen, end: &End) -> Result<(), String> {
         vec![],
         vec![s(seg)],
     ))?;
-    wg.exit_unless(qkv, super::GDN, end, |wg| {
+    // `QkvStore::Gdn`: QKV tiles continue at the GDN preparation. `QkvStore::Set`: they continue at
+    // `.Liu4_epilogue_qkv` below, store every row like SET and fall into the kernel exit.
+    let qkv_target = if g.spec.tune.qkv == QkvStore::Set {
+        format!("{EPI}_qkv")
+    } else {
+        super::GDN.to_string()
+    };
+    wg.exit_unless(qkv, &qkv_target, end, |wg| {
         let (ba, stored) = (format!("{EPI}_ba"), format!("{EPI}_stored"));
         wg.forward(|w, f| {
             let beta_alpha = w.scmp(Instruction::new(
@@ -119,7 +139,19 @@ fn fused_stores(wg: &mut Wg, g: &Gen, end: &End) -> Result<(), String> {
             f.goto(w, &stored)?;
             f.place(w, &ba)?;
             let b = w.isa();
-            sop(b, format!("s_bitcmp1_b32 s{}, 2", g.wave), &[], &[g.wave])?;
+            // Row pair (`wt_pair`) bit 1 picks the alpha rows: wave bit 2, or bit 1 once
+            // `IdleHalf::SkipHi` remapped `wt_pair = wave & 3`.
+            let alpha_bit = if g.spec.tune.idle == IdleHalf::SkipHi {
+                1
+            } else {
+                2
+            };
+            sop(
+                b,
+                format!("s_bitcmp1_b32 s{}, {alpha_bit}", g.wave),
+                &[],
+                &[g.wave],
+            )?;
             op(
                 b,
                 format!(
@@ -147,7 +179,27 @@ fn fused_stores(wg: &mut Wg, g: &Gen, end: &End) -> Result<(), String> {
             f.place(w, &stored)
         })?;
         op(wg.isa(), "s_mov_b32 exec_lo, -1", &[], &[])
-    })
+    })?;
+    if g.spec.tune.qkv == QkvStore::Set {
+        // QKV tile: `X` (kernarg offset 104) is the plain QKV output, row stride M0 (s20).
+        let (m0, yq) = (20u8, g.step2);
+        let b = wg.isa();
+        mem(
+            b,
+            format!(
+                "s_load_b64 s[{yq}:{}], s[{}:{}], 0x68",
+                yq + 1,
+                g.karg,
+                g.karg + 1
+            ),
+            &[sr(yq, 2)],
+            &[sr(g.karg, 2)],
+            MemoryClass::SmemLoad,
+        )?;
+        store(b, g, Epi::Set, yq, m0, g.rs, None)?;
+        b.wait_all()?;
+    }
+    Ok(())
 }
 
 /// `rg` row groups x `quads` quads per lane; SET/ADD: 2 x 2, gate/up: 1 x 2.
@@ -251,7 +303,11 @@ fn store(
         let x = g.tmp;
         sop(
             b,
-            format!("s_lshr_b32 s{x}, s{}, 1", g.wave),
+            if g.spec.tune.idle == IdleHalf::SkipHi {
+                format!("s_and_b32 s{x}, s{}, 3", g.wave)
+            } else {
+                format!("s_lshr_b32 s{x}, s{}, 1", g.wave)
+            },
             &[x],
             &[g.wave],
         )?;

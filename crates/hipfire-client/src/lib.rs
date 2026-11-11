@@ -341,8 +341,38 @@ pub enum OpenAiSseEvent {
     },
     /// Separate `choices: []` usage chunk (never rides the finish choice).
     Usage { usage: Value },
+    /// Prefill progress from the `: prefill <done>/<total>` SSE comment frame
+    /// (sent only before the first token; never a delta).
+    PrefillProgress { done: u64, total: u64 },
     /// Literal `data: [DONE]` terminator.
     Done,
+}
+
+/// Whole-percent prefill completion (`done * 100 / total`, floored, capped at
+/// 100; 0 when `total` is 0).
+pub fn prefill_percent(done: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    (u128::from(done.min(total)) * 100 / u128::from(total)) as u64
+}
+
+/// Seconds until prefill finishes at the rate observed so far (`done` tokens
+/// in `elapsed` since the request was sent). `None` until a rate exists.
+pub fn prefill_eta_secs(done: u64, total: u64, elapsed: Duration) -> Option<f64> {
+    let secs = elapsed.as_secs_f64();
+    if done == 0 || secs <= 0.0 {
+        return None;
+    }
+    let remaining = total.saturating_sub(done) as f64;
+    Some(remaining * secs / done as f64)
+}
+
+/// Parse the exact `: prefill <done>/<total>` SSE comment line.
+fn parse_prefill_comment(line: &str) -> Option<(u64, u64)> {
+    let rest = line.strip_prefix(": prefill ")?;
+    let (done, total) = rest.split_once('/')?;
+    Some((done.parse().ok()?, total.parse().ok()?))
 }
 
 /// Deterministic SSE reader/parser seam over an already-open byte stream.
@@ -368,7 +398,10 @@ pub fn read_openai_sse(
             continue;
         }
         let Some(payload) = trimmed.strip_prefix("data:").map(str::trim) else {
-            // Ignore SSE comments / event: / id: / retry: lines.
+            if let Some((done, total)) = parse_prefill_comment(trimmed) {
+                on_event(OpenAiSseEvent::PrefillProgress { done, total })?;
+            }
+            // Ignore other SSE comments / event: / id: / retry: lines.
             continue;
         };
         if payload.is_empty() {
@@ -519,14 +552,88 @@ pub fn stream_openai_chat(
 }
 
 fn http_agent(timeout: Duration) -> ureq::Agent {
-    ureq::Agent::config_builder()
+    use ureq::unversioned::{
+        resolver::DefaultResolver,
+        transport::{Connector, DefaultConnector},
+    };
+    let config = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .timeout_recv_body(Some(Duration::from_secs(120)))
         .http_status_as_error(false)
         // Never forward the bearer to another origin.
         .max_redirects(0)
-        .build()
-        .into()
+        .build();
+    ureq::Agent::with_parts(
+        config,
+        DefaultConnector::new().chain(eintr::RetryInterrupted),
+        DefaultResolver::default(),
+    )
+}
+
+/// `read(2)` interrupted by a signal (EINTR) transfers no bytes and is safe to
+/// reissue, but std's `TcpStream::read` (used by ureq) surfaces it as an error.
+/// Any signal delivered to the process during a blocking response read would
+/// otherwise fail an in-flight request. Retrying only the interrupted syscall
+/// is not a client-side request retry: nothing is resent.
+mod eintr {
+    use ureq::unversioned::transport::{
+        Buffers, ConnectionDetails, Connector, NextTimeout, Transport,
+    };
+    use ureq::Error;
+
+    #[derive(Debug)]
+    pub(super) struct RetryInterrupted;
+
+    impl Connector<Box<dyn Transport>> for RetryInterrupted {
+        type Out = Box<dyn Transport>;
+
+        fn connect(
+            &self,
+            _: &ConnectionDetails,
+            chained: Option<Box<dyn Transport>>,
+        ) -> Result<Option<Self::Out>, Error> {
+            Ok(chained.map(|inner| Box::new(RetryTransport(inner)) as Box<dyn Transport>))
+        }
+    }
+
+    fn interrupted(error: &Error) -> bool {
+        matches!(error, Error::Io(e) if e.kind() == std::io::ErrorKind::Interrupted)
+    }
+
+    #[derive(Debug)]
+    struct RetryTransport(Box<dyn Transport>);
+
+    impl Transport for RetryTransport {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            self.0.buffers()
+        }
+
+        fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), Error> {
+            loop {
+                match self.0.transmit_output(amount, timeout) {
+                    Err(e) if interrupted(&e) => continue,
+                    other => return other,
+                }
+            }
+        }
+
+        fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, Error> {
+            loop {
+                match self.0.await_input(timeout) {
+                    Err(e) if interrupted(&e) => continue,
+                    other => return other,
+                }
+            }
+        }
+
+        fn is_open(&mut self) -> bool {
+            self.0.is_open()
+        }
+
+        fn is_tls(&self) -> bool {
+            self.0.is_tls()
+        }
+    }
 }
 
 fn http_error_message(status: u16, text: &str) -> String {
@@ -681,6 +788,7 @@ impl Engine {
                     ty,
                     "gen_start"
                         | "token"
+                        | "prefill_progress"
                         | "reasoning"
                         | "tool_calls"
                         | "committed"
@@ -1750,6 +1858,7 @@ fn reject_stale_lifecycle_event(
         "gen_start"
             | "token"
             | "reasoning"
+            | "prefill_progress"
             | "tool_calls"
             | "committed"
             | "commit_ready"
@@ -1910,6 +2019,47 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec!["r", "c", "f", "d"]);
+    }
+
+    #[test]
+    fn sse_prefill_comment_parsed_other_comments_ignored() {
+        let raw = format!(
+            ": keepalive\n\n: prefill 512/2048\n\n: prefill 1024/2048\n\n: prefill nope\n\n: prefill 1/\n\n{}{}",
+            sse_line(r#"{"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}"#),
+            sse_line(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#),
+        ) + "data: [DONE]\n\n";
+        let events = collect_sse(&raw).unwrap();
+        assert_eq!(
+            events[..2],
+            [
+                OpenAiSseEvent::PrefillProgress {
+                    done: 512,
+                    total: 2048
+                },
+                OpenAiSseEvent::PrefillProgress {
+                    done: 1024,
+                    total: 2048
+                },
+            ]
+        );
+        assert!(matches!(events[2], OpenAiSseEvent::Content { .. }));
+        assert_eq!(events.len(), 5);
+    }
+
+    #[test]
+    fn prefill_percent_and_eta_helpers() {
+        assert_eq!(prefill_percent(512, 2048), 25);
+        assert_eq!(prefill_percent(2047, 2048), 99);
+        assert_eq!(prefill_percent(5, 0), 0);
+        assert_eq!(prefill_percent(9, 4), 100);
+        let secs = prefill_eta_secs(512, 2048, Duration::from_secs(2)).unwrap();
+        assert!((secs - 6.0).abs() < 1e-9, "{secs}");
+        assert_eq!(prefill_eta_secs(0, 2048, Duration::from_secs(2)), None);
+        assert_eq!(prefill_eta_secs(1, 2, Duration::ZERO), None);
+        assert_eq!(
+            prefill_eta_secs(2048, 2048, Duration::from_secs(2)),
+            Some(0.0)
+        );
     }
 
     #[test]
@@ -2393,6 +2543,7 @@ mod tests {
             "gen_start",
             "token",
             "reasoning",
+            "prefill_progress",
             "tool_calls",
             "committed",
             "commit_ready",
@@ -2564,6 +2715,7 @@ mod tests {
             "gen_start",
             "token",
             "reasoning",
+            "prefill_progress",
             "tool_calls",
             "committed",
             "commit_ready",
@@ -2898,6 +3050,61 @@ done
             !logged.contains(r#""type":"abort""#),
             "successful commit must not send abort: {logged}"
         );
+        engine.unload().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_routes_prefill_progress_to_callback_non_terminal() {
+        let root = env::temp_dir().join(format!(
+            "hipfire-client-prefill-progress-{}-{}",
+            std::process::id(),
+            "a"
+        ));
+        let daemon = write_fake_daemon(
+            &root,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"generate"'*)
+      echo '{"type":"gen_start","id":"req-pp","attempt_id":3}'
+      echo '{"type":"prefill_progress","id":"req-pp","attempt_id":3,"done":512,"total":2048}'
+      echo '{"type":"prefill_progress","id":"req-pp","attempt_id":3,"done":1024,"total":2048}'
+      echo '{"type":"prefill_progress","id":"other","attempt_id":3,"done":1,"total":2}'
+      echo '{"type":"commit_ready","id":"req-pp","attempt_id":3,"finish_reason":"stop"}'
+      ;;
+    *'"commit"'*)
+      echo '{"type":"done","id":"req-pp","attempt_id":3,"finish_reason":"stop"}'
+      ;;
+    *'"unload"'*) echo '{"type":"unloaded"}'; exit 0 ;;
+  esac
+done
+"#,
+        );
+        let mut engine = spawn_fake_engine(&daemon);
+        let mut progress = Vec::new();
+        engine
+            .generate(
+                &serde_json::json!({
+                    "type": "generate",
+                    "id": "req-pp",
+                    "attempt_id": 3,
+                    "prompt": "hi",
+                }),
+                |ev| {
+                    if ev.get("type").and_then(Value::as_str) == Some("prefill_progress") {
+                        progress.push((
+                            ev.get("done").and_then(Value::as_u64).unwrap(),
+                            ev.get("total").and_then(Value::as_u64).unwrap(),
+                        ));
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        // The peer-id progress line is quarantined, never delivered here.
+        assert_eq!(progress, vec![(512, 2048), (1024, 2048)]);
         engine.unload().unwrap();
         let _ = fs::remove_dir_all(root);
     }
@@ -4706,6 +4913,62 @@ done
             "{err}"
         );
         server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    extern "C" fn noop_signal_handler(_: libc::c_int) {}
+
+    /// Signals delivered (without SA_RESTART) while the client blocks reading
+    /// the response must not surface EINTR as an HTTP error.
+    #[cfg(unix)]
+    #[test]
+    fn http_requests_survive_signals_during_blocking_read() {
+        // SAFETY: installs a no-op handler for SIGUSR2 without SA_RESTART so
+        // blocking syscalls on the signalled thread return EINTR.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = noop_signal_handler as extern "C" fn(libc::c_int) as usize;
+            action.sa_flags = 0;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let seen = read_request(&mut stream);
+            // Hold the response so the client sits in a blocking read.
+            thread::sleep(Duration::from_millis(400));
+            stream
+                .write_all(json_response("200 OK", r#"{"ok":true}"#).as_bytes())
+                .unwrap();
+            seen
+        });
+
+        // SAFETY: pthread_self has no preconditions.
+        let target = unsafe { libc::pthread_self() } as usize;
+        let done = Arc::new(AtomicBool::new(false));
+        let signaller = {
+            let done = Arc::clone(&done);
+            thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    // SAFETY: the target thread outlives this loop (joined below).
+                    unsafe { libc::pthread_kill(target as libc::pthread_t, libc::SIGUSR2) };
+                    thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+
+        let endpoint = ServiceEndpoint::local("127.0.0.1", port, None).unwrap();
+        let result = http_get_json(&endpoint, "/health", Duration::from_secs(10));
+        done.store(true, Ordering::SeqCst);
+        signaller.join().unwrap();
+        server.join().unwrap();
+        assert_eq!(result.unwrap()["ok"], true);
     }
 
     #[test]

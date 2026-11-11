@@ -242,6 +242,13 @@ pub fn spec_step_dflash_mtp(
             llama::EmbeddingFormat::F32 => {
                 gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
             }
+            llama::EmbeddingFormat::Ggml(_) => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
+                )
+                .into())
+            }
             _ => panic!("dflash_mtp: unsupported target embedding format"),
         }
     }
@@ -828,6 +835,13 @@ pub fn spec_step_dflash_mtp_tree(
             }
             llama::EmbeddingFormat::F32 => {
                 gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
+            }
+            llama::EmbeddingFormat::Ggml(_) => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
+                )
+                .into())
             }
             _ => panic!("dflash_mtp_tree: unsupported target embedding format"),
         }

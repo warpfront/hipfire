@@ -6,7 +6,7 @@
 //! `mq6::*` natives and the checked driver's rings) re-emits the production kernel's bytes for every
 //! valid `Spec` on gfx1201, and the coarse natives return the Rust functions' values.
 
-use peacemaker_isa::kernels::mq6_i8_gemm::{self as mq6, Epi, Raster, Spec, Tile};
+use peacemaker_isa::kernels::mq6_i8_gemm::{self as mq6, Epi, Raster, RingDepth, Spec, Tile, Tune};
 use peacemaker_isa::Arch;
 
 const TWIN: &str = include_str!("../../peacemaker-isa/src/kernels/mq6_i8_gemm.rip");
@@ -21,6 +21,7 @@ fn every_spec() -> Vec<Spec> {
                     raster,
                     tile,
                     arch: Arch::Gfx1201,
+                    tune: Default::default(),
                 });
             }
         }
@@ -70,6 +71,58 @@ fn mq6_i8_gemm_twin_matches_the_rust_emit() {
     assert_eq!(
         valid, 12,
         "the number of valid specs changed: update VARIANTS"
+    );
+}
+
+/// The twin with `const RING = 3`: the depth-3 composition (`block3`, `group3`, `head3`, `arm3`,
+/// `kloop3` over `Ring::new(a, b, c)`, `starting_at`, `advance` and `wg.wg_if_else`).
+fn twin_ring3() -> String {
+    let text = TWIN.replace("const RING: u32 = 2;", "const RING: u32 = 3;");
+    assert_ne!(text, TWIN, "the twin declares `const RING: u32 = 2;`");
+    text
+}
+
+/// With `const RING = 3` the script emits, byte for byte and proof for proof, the generator's
+/// depth-3 kernel (`Tune { ring: Three }`) for every variant that fits, and refuses the others with
+/// `Spec::validate`'s numbers (the 256-wide tiles do not fit: LDS and VGPRs).
+#[test]
+fn the_ring3_twin_matches_the_generators_depth_3() {
+    let src = twin_ring3();
+    let mut fits = 0;
+    for spec in every_spec() {
+        let name = spec.variant_name();
+        let spec3 = spec.with_tune(Tune {
+            ring: RingDepth::Three,
+        });
+        let rip = peacemaker_rip::compile_named(&src, "mq6_i8_gemm.rip", spec.arch, &name);
+        match spec3.validate() {
+            Ok(()) => {
+                fits += 1;
+                let rust = mq6::emit(spec3).unwrap_or_else(|e| panic!("{name}: {e}"));
+                let rip = rip.unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert!(
+                    rust.s_text == rip.s_text,
+                    "{name} ring 3: {}",
+                    first_difference(&rust.s_text, &rip.s_text)
+                );
+                assert_eq!(
+                    serde_json::to_value(&rust.proof).unwrap(),
+                    serde_json::to_value(&rip.proof).unwrap(),
+                    "{name} ring 3: proof"
+                );
+                // It is the depth-3 program, not the depth-2 one.
+                let d2 = mq6::emit(spec).unwrap();
+                assert_ne!(rip.s_text, d2.s_text, "{name}");
+            }
+            Err(e) => {
+                let got = rip.err().unwrap_or_else(|| panic!("{name} ring 3 built"));
+                assert!(got.contains(&e), "{name}: {got} vs {e}");
+            }
+        }
+    }
+    assert_eq!(
+        fits, 4,
+        "128x128x8 x {{set, set_bf16}} x {{banded, linear}}"
     );
 }
 
@@ -124,6 +177,7 @@ fn mq6_emit_native_returns_the_rust_emitted() {
         raster: Raster::Linear,
         tile: Tile::T256x128,
         arch: Arch::Gfx1201,
+        tune: Default::default(),
     })
     .unwrap();
     let got = peacemaker_rip::compile(COARSE, Arch::Gfx1201, "default").unwrap();
@@ -133,6 +187,46 @@ fn mq6_emit_native_returns_the_rust_emitted() {
         .err()
         .unwrap();
     assert!(e.contains("mq6_i8_gemm targets gfx1201 only"), "{e}");
+}
+
+/// `Mq6Spec` takes one optional field, `ring` (the A/W ring depth, 2 | 3): absent means 2.
+#[test]
+fn mq6_spec_ring_field_selects_the_depth() {
+    let src = |fields: &str| {
+        format!(
+            r#"
+fn emit(spec: Spec) -> Result<Emitted, String> {{
+    Mq6Gemm::emit(Mq6Spec {{ epi: Mq6Epi::Set, raster: Raster::Linear, tile: Mq6Tile::T128x128, arch: spec.arch{fields} }})
+}}
+"#
+        )
+    };
+    let base = Spec::emulation(Epi::Set);
+    let d3 = base.with_tune(Tune {
+        ring: RingDepth::Three,
+    });
+    let got = |fields: &str| peacemaker_rip::compile(&src(fields), Arch::Gfx1201, "default");
+    assert_eq!(got("").unwrap().s_text, mq6::emit(base).unwrap().s_text);
+    assert_eq!(
+        got(", ring: 2").unwrap().s_text,
+        mq6::emit(base).unwrap().s_text
+    );
+    assert_eq!(
+        got(", ring: 3").unwrap().s_text,
+        mq6::emit(d3).unwrap().s_text
+    );
+    let e = got(", ring: 4").err().unwrap();
+    assert!(e.contains("unknown ring depth 4"), "{e}");
+    // A tile that does not fit is refused by the generator's validate, with the numbers.
+    let wide = src(", ring: 3").replace("T128x128", "T128x256");
+    let e = peacemaker_rip::compile(&wide, Arch::Gfx1201, "default")
+        .err()
+        .unwrap();
+    assert!(
+        e.contains("ring depth 3 does not fit the 128x256x16 tile"),
+        "{e}"
+    );
+    assert!(e.contains("79872 B"), "{e}");
 }
 
 const COARSE_FIELDS: &str = r#"
@@ -213,8 +307,8 @@ fn a_variation_without_the_k_loop_priority_builds_and_differs() {
 #[test]
 fn moving_the_decode_between_other_wmmas_reorders_without_losing_work() {
     let src = edit(
-        "phase(wg, g, &mut st, 0, true, 8, 3)?;",
-        "phase(wg, g, &mut st, 0, true, 12, 3)?;",
+        "phase(wg, g, &mut st, 0, true, 8, 3,",
+        "phase(wg, g, &mut st, 0, true, 12, 3,",
     );
     let base = build(TWIN, SET).unwrap();
     let varied = build(&src, SET).unwrap();
@@ -243,16 +337,21 @@ fn reordering_the_row_group_1_fragments_changes_the_packet_sequence() {
     assert_eq!(count(&base.s_text), count(&varied.s_text));
 }
 
-/// Split-barrier position (B1): the next block's token/row-header fetch moves after the signal, so
-/// it overlaps the rendezvous together with the slab-0 fetch.
+/// The next block's token word / row header fetch is a queued work unit (issued behind the half-1
+/// refetch, after WMMA 7). Split-barrier position (B1): it moves after the signal instead, so it
+/// overlaps the rendezvous together with the slab-0 fetch.
+const META_QUEUED: &str = "    if fetch_next {\n        // Early producer: the next block's token word / row header issue right behind the half-1\n        // refetch (after WMMA 7), so they are long landed when phase B's Meta consumes them.\n        st.work.push(Work::FetchMeta(h, if h == 0 { 4 } else { group }));\n    }\n";
+const META_AFTER_SIGNAL: &str = "    if fetch_next {\n        mq6::fetch_meta(wg, g, h, if h == 0 { 4 } else { group })?;\n    }\n";
+
 #[test]
 fn signalling_b1_before_the_meta_fetch_builds_and_differs() {
-    let meta = "    if fetch_next {\n        // Next block's token word and packed row header (header word of the next half; across a\n        // group boundary the group stride, since `goff` has not advanced).\n        mq6::fetch_meta(wg, g, h, if h == 0 { 4 } else { group })?;\n    }\n";
     let signal = "    let b1 = wg.signal((rotate(st.a, da), rotate(st.w, dw)))?;\n";
-    assert!(TWIN.contains(meta) && TWIN.contains(signal));
-    let moved = TWIN
-        .replacen(meta, "", 1)
-        .replacen(signal, &format!("{signal}{meta}"), 1);
+    assert!(TWIN.contains(META_QUEUED) && TWIN.contains(signal));
+    let moved = TWIN.replacen(META_QUEUED, "", 1).replacen(
+        signal,
+        &format!("{signal}{META_AFTER_SIGNAL}"),
+        1,
+    );
     let base = build(TWIN, SET).unwrap();
     let varied = build(&moved, SET).unwrap();
     assert_ne!(base.s_text, varied.s_text);
@@ -261,18 +360,19 @@ fn signalling_b1_before_the_meta_fetch_builds_and_differs() {
     assert_eq!(instructions(&base.s_text), instructions(&varied.s_text));
 }
 
-/// The wait before a raw staging refill is the script's, and the builder checks it: dropping it
-/// leaves the refill's clause with a wait it needs (the staging registers are still sources of
-/// the previous half's LDS stores), and the build is refused.
+/// The wait before a raw staging refill is the script's (`st.drain`), and without it the builder
+/// still guards the refill: the staging registers are still sources of the previous half's LDS
+/// stores, so `fetch_a` settles that hazard itself (the minimal `s_wait_dscnt`, outside the clause)
+/// instead of the script's ledger-wide wait. A different program that builds.
 #[test]
-fn dropping_the_wait_before_a_staging_refill_is_refused() {
+fn dropping_the_wait_before_a_staging_refill_leaves_the_hazard_to_the_builder() {
     let src = edit(
-        "                // The raw staging registers are still sources of the previous half's stores.\n                mq6::wait_all(wg)?;\n",
+        "                // The raw staging registers are still sources of the previous half's stores.\n                if st.drain {\n                    mq6::wait_all(wg)?;\n                }\n",
         "",
     );
-    let e = build(&src, SET).expect_err("the refill needs its wait");
-    assert!(e.contains("fetch_a(slab 1, sb 1)"), "{e}");
-    assert!(e.contains("without waits"), "{e}");
+    let base = build(TWIN, SET).unwrap();
+    let varied = build(&src, SET).unwrap();
+    assert_ne!(base.s_text, varied.s_text);
 }
 
 /// A second wait right after the refill (the wait moved later as well as kept) is a different
@@ -280,8 +380,8 @@ fn dropping_the_wait_before_a_staging_refill_is_refused() {
 #[test]
 fn a_wait_after_the_refill_changes_the_program() {
     let src = edit(
-        "                mq6::wait_all(wg)?;\n                mq6::fetch_a(wg, g, slab, sb, srd)?;\n",
-        "                mq6::wait_all(wg)?;\n                mq6::fetch_a(wg, g, slab, sb, srd)?;\n                mq6::wait_all(wg)?;\n",
+        "                mq6::fetch_a(wg, g, slab, sb, srd)?;\n",
+        "                mq6::fetch_a(wg, g, slab, sb, srd)?;\n                mq6::wait_all(wg)?;\n",
     );
     let base = build(TWIN, SET).unwrap();
     let varied = build(&src, SET).unwrap();
@@ -337,8 +437,8 @@ fn a_block_native_refuses_out_of_range_indices() {
             "mma: step",
         ),
         (
-            "mq6::decode_insns(g, 0)?);\n    st.work.push(Work::FetchA(1, 1",
-            "mq6::decode_insns(g, 2)?);\n    st.work.push(Work::FetchA(1, 1",
+            "queue_decode(&mut st, mq6::decode_insns(g, 0)?);\n    st.work.push(Work::StoreW(0));",
+            "queue_decode(&mut st, mq6::decode_insns(g, 2)?);\n    st.work.push(Work::StoreW(0));",
             "decode_round: round 2 out of range",
         ),
         (
@@ -487,21 +587,20 @@ fn moved_decode_split_barrier_and_fold_order_keep_the_output_bit_identical() {
         want.iter().any(|&b| b != 0xa5),
         "the baseline wrote no output"
     );
-    let meta = "    if fetch_next {\n        // Next block's token word and packed row header (header word of the next half; across a\n        // group boundary the group stride, since `goff` has not advanced).\n        mq6::fetch_meta(wg, g, h, if h == 0 { 4 } else { group })?;\n    }\n";
     let signal = "    let b1 = wg.signal((rotate(st.a, da), rotate(st.w, dw)))?;\n";
     let variations = [
         (
             "decode starts after the 12th WMMA",
-            edit("phase(wg, g, &mut st, 0, true, 8, 3)?;", "phase(wg, g, &mut st, 0, true, 12, 3)?;"),
+            edit("phase(wg, g, &mut st, 0, true, 8, 3,", "phase(wg, g, &mut st, 0, true, 12, 3,"),
         ),
         (
             "two work units per WMMA",
-            edit("phase(wg, g, &mut st, 1, false, 6, 3)?;", "phase(wg, g, &mut st, 1, false, 6, 2)?;"),
+            edit("phase(wg, g, &mut st, 1, false, 6, 3,", "phase(wg, g, &mut st, 1, false, 6, 2,"),
         ),
         (
             "B1 signalled before the meta fetch",
-            TWIN.replacen(meta, "", 1)
-                .replacen(signal, &format!("{signal}{meta}"), 1),
+            TWIN.replacen(META_QUEUED, "", 1)
+                .replacen(signal, &format!("{signal}{META_AFTER_SIGNAL}"), 1),
         ),
         (
             "row group 1 folded in reverse order",
@@ -546,8 +645,8 @@ fn decoding_before_the_seed_is_consumed_builds_but_changes_the_output() {
         interpreter::run(&e, &peacemaker_rip::symbol_of(&e).unwrap())
     };
     let early = edit(
-        "phase(wg, g, &mut st, 0, true, 8, 3)?;",
-        "phase(wg, g, &mut st, 0, true, 4, 3)?;",
+        "phase(wg, g, &mut st, 0, true, 8, 3,",
+        "phase(wg, g, &mut st, 0, true, 4, 3,",
     );
     assert!(
         run(&early) != run(TWIN),
@@ -561,7 +660,7 @@ fn decoding_before_the_seed_is_consumed_builds_but_changes_the_output() {
 fn signalling_b2_one_fragment_later_keeps_the_output() {
     let linear = "128x128x8-set-linear";
     let frag = "    frag(wg, g, 2, 0, fold_sc, fold_zp)?;\n";
-    let start = TWIN.find("    let arrived = if fetch_next {").unwrap();
+    let start = TWIN.find("    let arrived = if b2 {").unwrap();
     let end = start + TWIN[start..].find("    };\n").unwrap() + "    };\n".len();
     let block = &TWIN[start..end];
     let tail = &TWIN[end..];
@@ -659,7 +758,7 @@ fn moves_keep_the_output_on_the_wide_tiles() {
         let want = run(TWIN);
         assert!(want.iter().any(|&b| b != 0xa5), "{variant}: no output");
         for src in [
-            edit("phase(wg, g, &mut st, 0, true, 8, 3)?;", "phase(wg, g, &mut st, 0, true, 12, 3)?;"),
+            edit("phase(wg, g, &mut st, 0, true, 8, 3,", "phase(wg, g, &mut st, 0, true, 12, 3,"),
             edit(
                 "    for nb in 0..4usize {\n        frag(wg, g, nb, 1, cacc, scratch)?;\n    }\n",
                 "    for nb in [3usize, 2, 1, 0] {\n        frag(wg, g, nb, 1, cacc, scratch)?;\n    }\n",

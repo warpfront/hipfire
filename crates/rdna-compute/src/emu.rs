@@ -368,6 +368,23 @@ impl Gpu {
         }
     }
 
+    /// [`Gpu::planned_capacity`] of `device_id`: the budget owner's own device
+    /// uses its ledger-aware figure; another device holds none of this
+    /// runtime's allocations before its rank loads (the own-bytes ledger is one
+    /// counter for the runtime, not per device), so it plans against total
+    /// minus the fixed reserve. UMA parts keep the free figure.
+    pub fn planned_capacity_for(&self, device_id: i32) -> HipResult<crate::PlannedCapacity> {
+        if device_id == self.device_id {
+            return self.planned_capacity();
+        }
+        let (free, total) = self.device_mem_info_for(device_id)?;
+        let stable = self
+            .hip
+            .get_device_attribute(HIP_DEVICE_ATTRIBUTE_INTEGRATED, device_id)
+            .map_or(false, |value| value == 0);
+        Ok(crate::PlannedCapacity::new(free, total, 0, stable))
+    }
+
     /// Refuse a multi-device path (EP/TP/PP/heterogeneous) under emulation;
     /// `Ok` when emulation is off. `what` names the refused path.
     pub fn emu_refuse_multi_device(&self, what: &str) -> HipResult<()> {

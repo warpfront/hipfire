@@ -1,0 +1,44 @@
+# ggml snapshot pin (hipfire S1). Verbatim copies; NO edits inside this tree.
+# Local changes, if ever unavoidable, live in third_party/ggml-patches/ as patch files.
+upstream_repo=https://github.com/ggml-org/llama.cpp
+upstream_branch=master
+upstream_commit=2e0d86bebc210947680e8f0d67daa79f3260c106
+upstream_commit_date=2026-10-28T19:04:18-07:00
+license=MIT (Copyright (c) 2023-2026 The ggml authors), file LICENSE in this directory, verbatim from the repository root
+layout=upstream path "ggml/<p>" is stored here as "<p>" (include/, src/); LICENSE is the repository-root LICENSE
+format=sha256  local-path  upstream-path
+94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d  LICENSE  LICENSE
+d114067f9099c4a0e2bbc0625c676d4894d9cf0ea27168ee072c7de0e71bb51d  include/ggml-alloc.h  ggml/include/ggml-alloc.h
+0e5e8e1f16d11ebbf501e38bc6705d79eee819b5f0b17476533f2100ed9674e2  include/ggml-backend.h  ggml/include/ggml-backend.h
+9cbfcea49f6da4d07f41dc22fa8dbf870825faaa2a68e34e65fe30ea6c41e042  include/ggml-cuda.h  ggml/include/ggml-cuda.h
+2b4dd92fa992cb4ef484917a6c62fef5097698744160ccc09214fd0c459c92c7  include/ggml.h  ggml/include/ggml.h
+e56714aab702e5ce62ee587a409643c08f7e93e8fbb77f48ef7cc85075f96fa4  include/gguf.h  ggml/include/gguf.h
+0061131b615c5721fc88a78feeb22c1f8c450f1c2646a317d80796a653bf595c  src/ggml-common.h  ggml/src/ggml-common.h
+43564db0238aebb7ed68501e346c194866b5dac218d1d37b26baff9f458c00d3  src/ggml-impl.h  ggml/src/ggml-impl.h
+71e86c21026e619afac86c58c464a0c983947969a921fbe503a8826ef15d2010  src/ggml-cuda/common.cuh  ggml/src/ggml-cuda/common.cuh
+eca96057a2888f38c7596e716d1af0aac903376bebfb1f1b1503ab576dd5ac70  src/ggml-cuda/mma.cuh  ggml/src/ggml-cuda/mma.cuh
+6de9336a6c2f65c0ad83cbe9303dcd03e8cbb6185d15346133a31421000f6408  src/ggml-cuda/mmq-config-ampere.cuh  ggml/src/ggml-cuda/mmq-config-ampere.cuh
+8bec1e65a3a2a58fab1f406225f6ba2f1a4c38a19793dfa255baff69bc044d70  src/ggml-cuda/mmq-config-blackwell.cuh  ggml/src/ggml-cuda/mmq-config-blackwell.cuh
+314eeb8453834723d5224012f692f70673f86ecc42d2b6d6f2005a0fad124dbc  src/ggml-cuda/mmq-config-cdna.cuh  ggml/src/ggml-cuda/mmq-config-cdna.cuh
+f669a723fc19d1e650de33a2852a10472a5773b0c8a3cd5b96662bc4fe6ebfe3  src/ggml-cuda/mmq-config-gcn.cuh  ggml/src/ggml-cuda/mmq-config-gcn.cuh
+67a93b6d26d3e16e77fd285dd77e7cca7848fb0b0d68897c2ff1e8cc47102263  src/ggml-cuda/mmq-config-pascal-dp4a.cuh  ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh
+48bae44f1f0e667fa02fb898859eb18c03961bdbadf53c1e22d98801ed70affe  src/ggml-cuda/mmq-config-pascal-older.cuh  ggml/src/ggml-cuda/mmq-config-pascal-older.cuh
+758be2a33b89018841f432c15cd63009ad212d71eae888a04b4535cb64941aa7  src/ggml-cuda/mmq-config-rdna2.cuh  ggml/src/ggml-cuda/mmq-config-rdna2.cuh
+0b6298eb94c563d3f81f345331fe8bfc2ec79c11ea2162d88dfcfaf403c9d53b  src/ggml-cuda/mmq-config-rdna3-5.cuh  ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh
+a1ac4f4fa799f2fb200ead23f3403bb0f729d41109b8967c6d76216768aae0cf  src/ggml-cuda/mmq-config-rdna3.cuh  ggml/src/ggml-cuda/mmq-config-rdna3.cuh
+e40c9c5fe85607db07ae351dd6ca13c92caaa238e2a62d5134877d9fbcb5c645  src/ggml-cuda/mmq-config-rdna4.cuh  ggml/src/ggml-cuda/mmq-config-rdna4.cuh
+a8cf42139940831a2bbbb2e76a38442eb2a6c0cc69b93922280d0a3dae66b786  src/ggml-cuda/mmq.cuh  ggml/src/ggml-cuda/mmq.cuh
+c17216917108e4f4e39bd6d747f3b7c0166a8935e8f4d57c8a4ae6b5b3a4c105  src/ggml-cuda/mmq-load-tiles.cuh  ggml/src/ggml-cuda/mmq-load-tiles.cuh
+c038cf45ca87552e8c7c81f71f8c908c7d07460a55a571522abd562640c692b3  src/ggml-cuda/mmq-vec-dot.cuh  ggml/src/ggml-cuda/mmq-vec-dot.cuh
+63dda3d1b8ca90959d596e8d623f60cfed7ed45c0996be995c3bc6a20611dfa3  src/ggml-cuda/mmvq.cu  ggml/src/ggml-cuda/mmvq.cu
+b37f8359f519ba90ddecd9cb3ca5f8c2ae05685bfae6813d435d75763c2bb006  src/ggml-cuda/mmvq.cuh  ggml/src/ggml-cuda/mmvq.cuh
+ff7a578d98937554775931f696e25d171eec9d763c445115fc6ef0b119601a0a  src/ggml-cuda/quantize.cu  ggml/src/ggml-cuda/quantize.cu
+112e190a096e1fa68d4c72ca2a450cb202586e3f2919c884f3e3316a8d5c57cd  src/ggml-cuda/quantize.cuh  ggml/src/ggml-cuda/quantize.cuh
+a8c7e041000ba4e90b37842a3d21003a6d4f83808a118bcb96f86c183ba84e52  src/ggml-cuda/unary.cuh  ggml/src/ggml-cuda/unary.cuh
+5e6882fe30b86f2f1ba294542ec88866c962e8f90500d4e035882eff3942f975  src/ggml-cuda/vecdotq.cuh  ggml/src/ggml-cuda/vecdotq.cuh
+9f8a9e935aaa9aa8eac5d07def11b67b757dff02fe8d81ce4908540c5779df7e  src/ggml-cuda/vendors/hip.h  ggml/src/ggml-cuda/vendors/hip.h
+4984ec7d0a7d0a054dc7d1189d0ef01482c3ac2346eb31d945d53357b62b78fc  src/ggml-cuda/convert.cu  ggml/src/ggml-cuda/convert.cu
+c22bcfa617140b6dfd7fb5eb11fc5ae4c25244a435aceb8e7c4c26f4bd578fd0  src/ggml-cuda/convert.cuh  ggml/src/ggml-cuda/convert.cuh
+135b3f11b7e7e49d96b18cc653a0440e79e05591397a3d12f94ce61b58432469  src/ggml-cuda/dequantize.cuh  ggml/src/ggml-cuda/dequantize.cuh
+3691d71610908bd1bbe38729ee143649a99da349ab3077a5cedd155137767adb  src/ggml-cuda/getrows.cu  ggml/src/ggml-cuda/getrows.cu
+5c365e5111fe5a44ded0c0344568dbc8489c94aa87583746c8e15666fe910601  src/ggml-cuda/getrows.cuh  ggml/src/ggml-cuda/getrows.cuh

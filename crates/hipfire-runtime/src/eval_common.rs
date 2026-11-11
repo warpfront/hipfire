@@ -398,6 +398,163 @@ pub fn write_hfkseq(
     out.flush()
 }
 
+/// Mean of one chunk's per-token KLDs, exactly as [`seq_stats`] and the
+/// evaluator's inline per-chunk statistics compute it (sequential `f64` sum in
+/// scoring order, divided by the count). Anything that recomputes a kldseq
+/// `mean_kld` from HFKTOK values MUST use this order to reproduce it bit for bit.
+pub fn chunk_mean_kld(chunk_klds: &[f64]) -> f64 {
+    chunk_klds.iter().copied().sum::<f64>() / chunk_klds.len() as f64
+}
+
+/// HFKTOK v1 per-token output: `HFKTOK\0\0`, version 1, `n_chunk`,
+/// `scored_per_chunk`, reserved 0 (all little-endian u32), then `n_chunk *
+/// scored_per_chunk` little-endian f64 per-token KLDs in scoring order (chunk
+/// major). `klds.len()` MUST equal `n_chunk * scored_per_chunk`.
+pub fn write_hfktok(
+    out: &mut impl std::io::Write,
+    n_chunk: usize,
+    scored_per_chunk: usize,
+    klds: &[f64],
+) -> std::io::Result<()> {
+    if n_chunk.checked_mul(scored_per_chunk) != Some(klds.len()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "hfktok: {} values != n_chunk {n_chunk} * scored_per_chunk {scored_per_chunk}",
+                klds.len()
+            ),
+        ));
+    }
+    let as_u32 = |v: usize, what: &str| {
+        u32::try_from(v).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("hfktok: {what} {v} overflows u32"),
+            )
+        })
+    };
+    out.write_all(b"HFKTOK\0\0")?;
+    out.write_all(&1u32.to_le_bytes())?;
+    out.write_all(&as_u32(n_chunk, "n_chunk")?.to_le_bytes())?;
+    out.write_all(&as_u32(scored_per_chunk, "scored_per_chunk")?.to_le_bytes())?;
+    out.write_all(&0u32.to_le_bytes())?;
+    for k in klds {
+        out.write_all(&k.to_le_bytes())?;
+    }
+    out.flush()
+}
+
+/// Collects the per-token KLDs of every completed chunk (the exact `f64`s
+/// whose [`chunk_mean_kld`] the kldseq records) for [`write_hfktok`]. A chunk
+/// whose scored-token count differs from `scored_per_chunk` is an error: the
+/// HFKTOK shape is fixed.
+pub struct TokenKldRecorder {
+    scored_per_chunk: usize,
+    n_chunk: usize,
+    klds: Vec<f64>,
+}
+
+impl TokenKldRecorder {
+    pub fn new(scored_per_chunk: usize, effective_n_chunk: usize) -> Self {
+        Self {
+            scored_per_chunk,
+            n_chunk: 0,
+            klds: Vec::with_capacity(scored_per_chunk * effective_n_chunk),
+        }
+    }
+
+    pub fn push_chunk(&mut self, chunk_klds: &[f64]) -> Result<(), String> {
+        if chunk_klds.len() != self.scored_per_chunk {
+            return Err(format!(
+                "per-token output: chunk {} scored {} tokens, expected {}",
+                self.n_chunk,
+                chunk_klds.len(),
+                self.scored_per_chunk
+            ));
+        }
+        self.klds.extend_from_slice(chunk_klds);
+        self.n_chunk += 1;
+        Ok(())
+    }
+
+    pub fn write(&self, out: &mut impl std::io::Write) -> std::io::Result<()> {
+        write_hfktok(out, self.n_chunk, self.scored_per_chunk, &self.klds)
+    }
+}
+
+#[cfg(test)]
+mod hfktok_tests {
+    use super::{chunk_mean_kld, seq_stats, write_hfkseq, write_hfktok, TokenKldRecorder};
+
+    /// Reader for the HFKTOK v1 layout (the consumer lives in `pm-census`).
+    fn read_hfktok(b: &[u8]) -> (usize, usize, Vec<f64>) {
+        assert_eq!(&b[..8], b"HFKTOK\0\0");
+        let u = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        assert_eq!(u(8), 1, "version");
+        assert_eq!(u(20), 0, "reserved");
+        let (n, s) = (u(12) as usize, u(16) as usize);
+        assert_eq!(b.len(), 24 + n * s * 8);
+        let vals = b[24..]
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        (n, s, vals)
+    }
+
+    fn synth(c: usize, scored: usize) -> Vec<f64> {
+        (0..scored)
+            .map(|j| {
+                let x = ((c * 7919 + j * 104729) % 10007) as f64;
+                (x * 1e-4 + 1e-6).powi(2) * (1.0 + (j % 5) as f64 * 0.3)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hfktok_round_trips_and_reproduces_the_kldseq_chunk_means_bit_for_bit() {
+        let (n, scored) = (5usize, 1023usize);
+        let mut rec = TokenKldRecorder::new(scored, n);
+        let (mut means, mut p99s, mut nlls) = (vec![], vec![], vec![]);
+        let mut all = vec![];
+        for c in 0..n {
+            let chunk = synth(c, scored);
+            let (m, p, nll) = seq_stats(&chunk, 1.5 * (c + 1) as f64, scored);
+            means.push(m);
+            p99s.push(p);
+            nlls.push(nll);
+            rec.push_chunk(&chunk).unwrap();
+            all.extend_from_slice(&chunk);
+        }
+        let mut bytes = vec![];
+        rec.write(&mut bytes).unwrap();
+        assert_eq!(&bytes[..8], b"HFKTOK\0\0");
+        let (rn, rs, vals) = read_hfktok(&bytes);
+        assert_eq!((rn, rs), (n, scored));
+        assert_eq!(vals.len(), all.len());
+        for (a, b) in vals.iter().zip(&all) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+        let mut seq = vec![];
+        write_hfkseq(&mut seq, n, &means, &p99s, &nlls).unwrap();
+        for c in 0..n {
+            let re = chunk_mean_kld(&vals[c * scored..(c + 1) * scored]);
+            let off = 20 + c * 24;
+            let rec_mean = f64::from_le_bytes(seq[off..off + 8].try_into().unwrap());
+            assert_eq!(re.to_bits(), rec_mean.to_bits(), "chunk {c}");
+            assert_eq!(re.to_bits(), means[c].to_bits());
+        }
+    }
+
+    #[test]
+    fn hfktok_refuses_wrong_shapes() {
+        let mut rec = TokenKldRecorder::new(4, 2);
+        assert!(rec.push_chunk(&[0.0; 3]).is_err());
+        rec.push_chunk(&[0.0; 4]).unwrap();
+        assert!(write_hfktok(&mut Vec::new(), 2, 4, &[0.0; 4]).is_err());
+        assert!(write_hfktok(&mut Vec::new(), 1, 4, &[0.0; 4]).is_ok());
+    }
+}
+
 #[cfg(test)]
 mod legacy_scoring_tests {
     use super::{kld_from_block, seq_stats, write_hfkseq};

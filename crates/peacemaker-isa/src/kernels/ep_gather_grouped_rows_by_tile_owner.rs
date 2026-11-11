@@ -61,6 +61,7 @@
 //! immediates; gfx1201 keeps the immediates.
 use super::common::{add64, add64_imm, bload, bstore_b128, op, s, smem, sop, srd_tail, v};
 use crate::{
+    arch::WgIdSource,
     insn::Instruction,
     plan::Access,
     reg::{Kind, Live},
@@ -70,8 +71,23 @@ use peacemaker_author::{End, Gfx1100, Gfx1201, Scc, Target, WgUniform, Workgroup
 
 type R = Result<(), String>;
 
-/// gfx11 system SGPR right after the two user SGPRs: workgroup id x (gfx12 reads `ttmp9`).
-const WGX_IN: u8 = 2;
+/// Real user SGPRs (the kernarg pointer) and enabled system SGPRs (workgroup id x).
+const USER_SGPRS: u8 = 2;
+const SYSTEM_SGPRS: u8 = 1;
+/// gfx11 system SGPR right after the DECLARED user SGPRs: workgroup id x (gfx12 reads `ttmp9`). gfx1100 pads the
+/// descriptor to user + system >= 16 (`Arch::declared_user_sgprs`, LLVM FeatureUserSGPRInit16Bug), so the id is `s15` there.
+fn wg_x_in(arch: Arch) -> Result<u8, String> {
+    match arch
+        .workgroup_ids(arch.declared_user_sgprs(USER_SGPRS, SYSTEM_SGPRS))?
+        .x
+    {
+        WgIdSource::Sgpr(n) => Ok(n),
+        other => Err(format!(
+            "ep_gather_grouped_rows_by_tile_owner: no workgroup id SGPR on {}: {other:?}",
+            arch.name()
+        )),
+    }
+}
 
 /// Threads per workgroup.
 pub const BLOCK: u32 = 256;
@@ -123,13 +139,31 @@ pub fn module(variant: Variant, arch: Arch) -> String {
 const KARG: u8 = 0;
 // EP2: kernarg words 0..8 -> s8..s15 (tile_ids 8:9, table 10:11, peer 12:13, dst 14:15), words 8..12 -> s16..s19.
 // N8: kernarg words 0..4 -> s8..s11 (tile_ids 8:9, table 10:11), dst (@80) -> s12:13, words @88..104 -> s16..s19.
-// N8 loads the per-tile source base from kernarg[16 + 8 * owner] into SRC; KSLOT is that kernarg address.
-const TIDS: u8 = 8;
-const TABLE: u8 = 10;
-const PEER: u8 = 12;
-const DST_EP2: u8 = 14;
-const DST_N8: u8 = 12;
-const KSLOT: u8 = 14;
+// N8 loads the per-tile source base from kernarg[16 + 8 * owner] into SRC; `kslot` is that kernarg address (s14:15).
+// gfx1100: s[2:16) are the padded user SGPRs and the workgroup id (s15), so the s[8:16) block moves to `S_END` (see `args`).
+struct Args {
+    tids: u8,
+    table: u8,
+    peer: u8,
+    dst_ep2: u8,
+    dst_n8: u8,
+    kslot: u8,
+}
+fn args(arch: Arch) -> Args {
+    let base = if arch.min_user_system_sgprs() > 0 {
+        S_END
+    } else {
+        8
+    };
+    Args {
+        tids: base,
+        table: base + 2,
+        peer: base + 4,
+        dst_ep2: base + 6,
+        dst_n8: base + 4,
+        kslot: base + 6,
+    }
+}
 const NEXP: u8 = 16;
 const RANK: u8 = 17;
 const TU4: u8 = 18;
@@ -188,10 +222,17 @@ fn kernargs(variant: Variant) -> KernargLayout {
 fn plan(arch: Arch) -> Result<RegPlan, String> {
     let mut p = RegPlan::new(u16::from(V_END), 104)?;
     p.s::<2>("kernarg_ptr", KARG, Live::Whole)?;
+    // gfx1100: s[2:16) are the (padded) user SGPRs and the workgroup id, the named blocks start at s16 and the
+    // relocated kernarg block follows `S_END`.
+    let (first, end) = if arch.min_user_system_sgprs() > 0 {
+        (16u8, S_END + 8)
+    } else {
+        (8u8, S_END)
+    };
     if !arch.gfx12() {
-        p.s::<1>("wg_x_in", WGX_IN, Live::Whole)?;
+        p.s::<1>("wg_x_in", wg_x_in(arch)?, Live::Whole)?;
     }
-    for base in (8u8..S_END).step_by(8) {
+    for base in (first..end).step_by(8) {
         p.add_range(&format!("s_blk{base}"), Kind::S, base, 8, Live::Whole)?;
     }
     for base in (0u8..V_END).step_by(8) {
@@ -276,19 +317,20 @@ fn prologue<T: Target>(
     variant: Variant,
     arch: Arch,
 ) -> R {
+    let a = args(arch);
     let dst = match variant {
-        Variant::Ep2 => DST_EP2,
-        Variant::N8 => DST_N8,
+        Variant::Ep2 => a.dst_ep2,
+        Variant::N8 => a.dst_n8,
     };
     let b = wg.isa();
     match variant {
         Variant::Ep2 => {
-            smem(b, TIDS, 8, KARG, 0x00)?;
+            smem(b, a.tids, 8, KARG, 0x00)?;
             smem(b, NEXP, 4, KARG, 0x20)?;
         }
         Variant::N8 => {
-            smem(b, TIDS, 4, KARG, 0x00)?;
-            smem(b, DST_N8, 2, KARG, 0x50)?;
+            smem(b, a.tids, 4, KARG, 0x00)?;
+            smem(b, a.dst_n8, 2, KARG, 0x50)?;
             smem(b, NEXP, 4, KARG, 0x58)?;
         }
     }
@@ -296,7 +338,8 @@ fn prologue<T: Target>(
     if arch.gfx12() {
         sop(b, format!("s_mov_b32 s{WGX}, ttmp9"), &[WGX], &[])?;
     } else {
-        sop(b, format!("s_mov_b32 s{WGX}, s{WGX_IN}"), &[WGX], &[WGX_IN])?;
+        let wg_in = wg_x_in(arch)?;
+        sop(b, format!("s_mov_b32 s{WGX}, s{wg_in}"), &[WGX], &[wg_in])?;
     }
     let outside = cmp_wg(
         wg,
@@ -307,7 +350,7 @@ fn prologue<T: Target>(
     // id = tile_ids[tile]; the unsigned compare also rejects the -1 sentinel.
     let b = wg.isa();
     sop(b, format!("s_lshl_b32 s{T0}, s{WGX}, 2"), &[T0], &[WGX])?;
-    add64(b, T64, TIDS, T0)?;
+    add64(b, T64, a.tids, T0)?;
     smem(b, ID, 1, T64, 0)?;
     let dead = cmp_wg(
         wg,
@@ -318,7 +361,7 @@ fn prologue<T: Target>(
     // owner = owner_table[id].
     let b = wg.isa();
     sop(b, format!("s_lshl_b32 s{T0}, s{ID}, 2"), &[T0], &[ID])?;
-    add64(b, T64, TABLE, T0)?;
+    add64(b, T64, a.table, T0)?;
     smem(b, OWN, 1, T64, 0)?;
     let mine = cmp_wg(
         wg,
@@ -340,14 +383,14 @@ fn prologue<T: Target>(
     // Tile byte offset = tile * tile_u4 * 16 (fits 32 bits by contract); trips; the
     // source / destination raw descriptors (base = pointer + tile offset, num_records =
     // the tile's bytes). N8: the source base is kernarg[16 + 8 * owner] (one SMEM load at a
-    // scalar-computed kernarg address); EP2: the one peer base is already in PEER.
+    // scalar-computed kernarg address); EP2: the one peer base is already in `a.peer`.
     let b = wg.isa();
     let src = match variant {
-        Variant::Ep2 => PEER,
+        Variant::Ep2 => a.peer,
         Variant::N8 => {
             sop(b, format!("s_lshl_b32 s{T0}, s{OWN}, 3"), &[T0], &[OWN])?;
-            add64(b, KSLOT, KARG, T0)?;
-            smem(b, SRC, 2, KSLOT, 16)?;
+            add64(b, a.kslot, KARG, T0)?;
+            smem(b, SRC, 2, a.kslot, 16)?;
             SRC
         }
     };

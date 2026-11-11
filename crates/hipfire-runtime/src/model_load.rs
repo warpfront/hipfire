@@ -160,6 +160,13 @@ pub trait WeightSource {
     fn mq4v2_symmetric(&self) -> bool {
         false
     }
+    /// Artifact-level MQ3V2 (qt49) symmetric grid. Default false for non-HFQ
+    /// sources. HFQ implementations forward `mq3v2.symmetric` only after the
+    /// qt49 zero contract has been validated (marker=1 with bad zeros or zero
+    /// qt49 tensors is a load error at open; absent marker stays false).
+    fn mq3v2_symmetric(&self) -> bool {
+        false
+    }
     /// Pre-load hook. HFQ drops the mmap when n==1; PaRo rejects n>1; llama no-op.
     fn prepare(&mut self, n_devices: usize) -> HipResult<()>;
     fn read_embed(&mut self, gpu: &mut Gpu) -> HipResult<(GpuTensor, EmbeddingFormat)>;
@@ -476,8 +483,10 @@ fn load_weights_inner<S: WeightSource>(
         ));
     }
     let mq4v2_symmetric = source.mq4v2_symmetric();
+    let mq3v2_symmetric = source.mq3v2_symmetric();
     for device in devices.iter_mut() {
         device.mq4v2_symmetric = mq4v2_symmetric;
+        device.mq3v2_symmetric = mq3v2_symmetric;
     }
     layout
         .validate(n_devices, source.n_layers())

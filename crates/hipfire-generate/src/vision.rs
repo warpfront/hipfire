@@ -1333,7 +1333,14 @@ pub fn generate_vl(
         let chunk_max = if m.kv_adaptive.is_some() {
             qwen35::PREFILL_MAX_BATCH
         } else {
-            match qwen35::ordinary_prefill_chunk_limit(gpu, weights, config, dn, kv, None) {
+            let deduction = qwen35::prefill::request_kv_growth_deduction(
+                gpu,
+                kv,
+                m.seq_pos + prompt_tokens.len(),
+            );
+            match qwen35::prefill::ordinary_prefill_chunk_limit_deducting(
+                gpu, weights, config, dn, kv, deduction,
+            ) {
                 Ok(limit) => limit,
                 Err(e) => {
                     eprintln!("[daemon/vl] chunk-limit query failed ({e}); keeping legacy ceiling");
@@ -1402,6 +1409,13 @@ pub fn generate_vl(
                 break;
             }
             start = end;
+            crate::common::emit_prefill_progress(
+                stdout,
+                id,
+                Some(active_attempt_id()),
+                end,
+                prompt_tokens.len(),
+            );
         }
         // Drop the scope before decode (and before any terminal below).
         let released = guard.release(gpu);

@@ -1746,9 +1746,40 @@ pub enum WideKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WideSpec {
     pub kind: WideKind,
+    pub arch: Arch,
 }
 
 impl WideSpec {
+    /// Workgroup id x SGPR: right after the DECLARED user SGPRs (s2; gfx1100 pads them so that
+    /// user + system >= 16, LLVM `FeatureUserSGPRInit16Bug`, which moves the ids to s14/s15).
+    pub const fn s_wg(&self) -> u8 {
+        self.arch
+            .declared_user_sgprs(WIDE_USER_SGPRS, WIDE_SYSTEM_SGPRS)
+    }
+    /// System workgroup id y, the SGPR after [`WideSpec::s_wg`].
+    pub const fn s_wg_y(&self) -> u8 {
+        self.s_wg() + 1
+    }
+    /// True when the padded ids sit on the gfx1151 `WS_HC`/`WS_WAVE` numbers (s14/s15).
+    const fn ids_moved(&self) -> bool {
+        self.s_wg() != WIDE_USER_SGPRS
+    }
+    /// This wave's index (s15 on gfx1151, a free SGPR above `WS_ROWOFF` on gfx1100).
+    pub const fn s_wave(&self) -> u8 {
+        if self.ids_moved() {
+            WS_WAVE_PADDED
+        } else {
+            WS_WAVE
+        }
+    }
+    /// HC activation flag (s14 on gfx1151, a free SGPR above `WS_ROWOFF` on gfx1100).
+    pub const fn s_hc(&self) -> u8 {
+        if self.ids_moved() {
+            WS_HC_PADDED
+        } else {
+            WS_HC
+        }
+    }
     /// Physical tile rows.
     pub const fn cap(&self) -> u8 {
         8
@@ -1847,6 +1878,11 @@ const WS_R: u8 = 12;
 const WS_SCALE: u8 = 13;
 const WS_HC: u8 = 14;
 const WS_WAVE: u8 = 15;
+/// gfx1100 relocations of `WS_WAVE`/`WS_HC`: s14/s15 are the padded workgroup ids there.
+const WS_WAVE_PADDED: u8 = 49;
+const WS_HC_PADDED: u8 = 50;
+const WIDE_USER_SGPRS: u8 = 2;
+const WIDE_SYSTEM_SGPRS: u8 = 2;
 /// First matrix-local output column of the workgroup.
 const WS_MBASE: u8 = 16;
 /// This wave's output column, and whether it exists (`COL < M`).
@@ -1935,22 +1971,27 @@ fn wide_plan(w: WideSpec) -> Result<RegPlan, String> {
     let mut p = RegPlan::new(w.vgpr_budget(), WIDE_SGPRS)?;
     for (name, base, len) in [
         ("kernarg_ptr", S_KARG, 2),
-        ("wg_x", S_WG, 1),
+        ("wg_x", w.s_wg(), 1),
         ("a_x_ptrs", WS_A, 4),
         ("y_ptr", WS_Y, 2),
         ("m_k", WS_M, 2),
     ] {
         declare(&mut p, name, Kind::S, base, len)?;
     }
-    declare(&mut p, "wg_y", Kind::S, 3, 1)?;
+    declare(&mut p, "wg_y", Kind::S, w.s_wg_y(), 1)?;
     if w.hc() {
         declare(&mut p, "r_scale", Kind::S, WS_R, 2)?;
-        declare(&mut p, "hc_act", Kind::S, WS_HC, 1)?;
+        declare(&mut p, "hc_act", Kind::S, w.s_hc(), 1)?;
     } else {
         declare(&mut p, "r", Kind::S, WS_R, 1)?;
     }
+    if w.ids_moved() {
+        declare(&mut p, "scalar", Kind::S, w.s_wave(), 1)?;
+    }
     for n in WS_WAVE..=WS_IT {
-        declare(&mut p, "scalar", Kind::S, n, 1)?;
+        if !w.ids_moved() || n > w.s_wg_y() {
+            declare(&mut p, "scalar", Kind::S, n, 1)?;
+        }
     }
     if w.x2() {
         for (name, base, len) in [
@@ -2024,10 +2065,10 @@ fn wide_kspec(w: WideSpec) -> KernelSpec {
     KernelSpec {
         kernel_id: "qwen4_lane_rows_q8".into(),
         variant: format!("rowtiles_{}_t8", w.tag()),
-        arch: Arch::Gfx1151,
+        arch: w.arch,
         symbol: rowtile_symbol(w.kind).into(),
         kernargs,
-        user_sgpr_count: 2,
+        user_sgpr_count: WIDE_USER_SGPRS,
         system_sgpr_workgroup_id_y: true,
         workgroup_size: w.workgroup_size(),
         group_segment_fixed_size: w.lds_bytes(),
@@ -2072,7 +2113,13 @@ pub(super) fn emit_rowtiles_for(target: RowtileTarget) -> Result<Emitted, String
         RowtileRecipe::PlainX2 => WideKind::K2560X2,
         RowtileRecipe::Small => WideKind::Wide,
     };
-    wide_impl_target(WideSpec { kind }, Some(target))
+    wide_impl_target(
+        WideSpec {
+            kind,
+            arch: target.arch,
+        },
+        Some(target),
+    )
 }
 
 fn wide_impl(w: WideSpec) -> Result<Emitted, String> {
@@ -2082,10 +2129,17 @@ fn wide_impl(w: WideSpec) -> Result<Emitted, String> {
 fn wide_impl_target(w: WideSpec, target: Option<RowtileTarget>) -> Result<Emitted, String> {
     let mut spec = wide_kspec(w);
     if let Some(target) = target {
+        debug_assert_eq!(w.arch, target.arch);
         spec.kernel_id = "qwen4_lane_rows_q8_gfx1100".into();
         spec.variant = format!("rowtiles_{}", target.symbol);
         spec.arch = target.arch;
         spec.symbol = target.symbol.into();
+    }
+    let ids = spec.workgroup_ids(false)?;
+    if ids.x != crate::arch::WgIdSource::Sgpr(w.s_wg())
+        || ids.y != crate::arch::WgIdSource::Sgpr(w.s_wg_y())
+    {
+        return Err(format!("qwen4 rowtile workgroup ids moved: {ids:?}"));
     }
     let mut b = Builder::new(spec, wide_plan(w)?);
     b.enable_delay_alu();
@@ -2137,6 +2191,7 @@ fn wide_impl_target(w: WideSpec, target: Option<RowtileTarget>) -> Result<Emitte
 /// barrier); the x2 matrix selection; the wave's column, weight and X
 /// offsets, the tile counts and the LDS addresses.
 fn wide_prologue(b: &mut Builder, w: WideSpec, domain: Option<RowtileDomain>, end: &str) -> R {
+    let (wg_x, wg_y, wave, hc_act) = (w.s_wg(), w.s_wg_y(), w.s_wave(), w.s_hc());
     match w.kind {
         WideKind::K2560X2 => {
             smem(b, WS_RA, 4, S_KARG, 0)?;
@@ -2150,7 +2205,7 @@ fn wide_prologue(b: &mut Builder, w: WideSpec, domain: Option<RowtileDomain>, en
             smem(b, WS_Y, 2, S_KARG, 0x10)?;
             smem(b, WS_M, 2, S_KARG, 0x18)?;
             smem(b, WS_R, 2, S_KARG, 0x20)?;
-            smem(b, WS_HC, 1, S_KARG, 0x28)?;
+            smem(b, hc_act, 1, S_KARG, 0x28)?;
         }
         _ => {
             smem(b, WS_A, 4, S_KARG, 0)?;
@@ -2175,8 +2230,8 @@ fn wide_prologue(b: &mut Builder, w: WideSpec, domain: Option<RowtileDomain>, en
     )?;
     op(
         b,
-        format!("v_readfirstlane_b32 s{WS_WAVE}, v{WV_VT}"),
-        &[s(WS_WAVE)],
+        format!("v_readfirstlane_b32 s{wave}, v{WV_VT}"),
+        &[s(wave)],
         &[v(WV_VT)],
     )?;
     bpermute_addresses(b, WV_ADDR, V_LANE)?;
@@ -2211,9 +2266,9 @@ fn wide_prologue(b: &mut Builder, w: WideSpec, domain: Option<RowtileDomain>, en
         )?;
         sop(
             b,
-            format!("s_cmp_ge_u32 s{S_WG}, s{WS_T1}"),
+            format!("s_cmp_ge_u32 s{wg_x}, s{WS_T1}"),
             &[],
-            &[S_WG, WS_T1],
+            &[wg_x, WS_T1],
         )?;
         op(
             b,
@@ -2253,9 +2308,9 @@ fn wide_prologue(b: &mut Builder, w: WideSpec, domain: Option<RowtileDomain>, en
         )?;
         sop(
             b,
-            format!("s_sub_i32 s{WS_T0}, s{S_WG}, s{WS_T1}"),
+            format!("s_sub_i32 s{WS_T0}, s{wg_x}, s{WS_T1}"),
             &[WS_T0],
-            &[S_WG, WS_T1],
+            &[wg_x, WS_T1],
         )?;
         op(
             b,
@@ -2281,7 +2336,7 @@ fn wide_prologue(b: &mut Builder, w: WideSpec, domain: Option<RowtileDomain>, en
         )?;
         WS_T0
     } else {
-        S_WG
+        wg_x
     };
     // Uniform refusals precede all loads/stores/barriers: total R in 1..=64 for
     // the row-tile ABI.
@@ -2374,16 +2429,26 @@ fn wide_prologue(b: &mut Builder, w: WideSpec, domain: Option<RowtileDomain>, en
         &[WS_MBASE, WS_M],
     )?;
     op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
-    // s3 is the system workgroup-id-y SGPR. Rebase the selected matrix's
+    // `wg_y` is the system workgroup-id-y SGPR (s3; s15 on gfx1100). Rebase the selected matrix's
     // pointers once, retaining K/M as the full-window row strides.
-    sop(b, "s_lshl_b32 s3, s3, 3", &[3], &[3])?;
-    sop(b, format!("s_cmp_ge_u32 s3, s{WS_R}"), &[], &[3, WS_R])?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{wg_y}, s{wg_y}, 3"),
+        &[wg_y],
+        &[wg_y],
+    )?;
+    sop(
+        b,
+        format!("s_cmp_ge_u32 s{wg_y}, s{WS_R}"),
+        &[],
+        &[wg_y, WS_R],
+    )?;
     op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
     sop(
         b,
-        format!("s_sub_u32 s{WS_R}, s{WS_R}, s3"),
+        format!("s_sub_u32 s{WS_R}, s{WS_R}, s{wg_y}"),
         &[WS_R],
-        &[WS_R, 3],
+        &[WS_R, wg_y],
     )?;
     sop(
         b,
@@ -2394,9 +2459,9 @@ fn wide_prologue(b: &mut Builder, w: WideSpec, domain: Option<RowtileDomain>, en
     for (base, stride) in [(WS_X, WS_K), (WS_Y, WS_M)] {
         sop(
             b,
-            format!("s_mul_i32 s{WS_T0}, s3, s{stride}"),
+            format!("s_mul_i32 s{WS_T0}, s{wg_y}, s{stride}"),
             &[WS_T0],
-            &[3, stride],
+            &[wg_y, stride],
         )?;
         sop(
             b,
@@ -2421,22 +2486,22 @@ fn wide_prologue(b: &mut Builder, w: WideSpec, domain: Option<RowtileDomain>, en
     if w.hc() {
         sop(
             b,
-            format!("s_lshr_b32 s{WS_PROW}, s{WS_WAVE}, 3"),
+            format!("s_lshr_b32 s{WS_PROW}, s{wave}, 3"),
             &[WS_PROW],
-            &[WS_WAVE],
+            &[wave],
         )?;
         sop(
             b,
-            format!("s_and_b32 s{WS_PART}, s{WS_WAVE}, 7"),
+            format!("s_and_b32 s{WS_PART}, s{wave}, 7"),
             &[WS_PART],
-            &[WS_WAVE],
+            &[wave],
         )?;
     } else {
         sop(
             b,
-            format!("s_mov_b32 s{WS_PROW}, s{WS_WAVE}"),
+            format!("s_mov_b32 s{WS_PROW}, s{wave}"),
             &[WS_PROW],
-            &[WS_WAVE],
+            &[wave],
         )?;
     }
     sop(
@@ -2569,9 +2634,9 @@ fn wide_prologue(b: &mut Builder, w: WideSpec, domain: Option<RowtileDomain>, en
     )?;
     sop(
         b,
-        format!("s_lshl_b32 s{WS_T1}, s{WS_WAVE}, 10"),
+        format!("s_lshl_b32 s{WS_T1}, s{wave}, 10"),
         &[WS_T1],
-        &[WS_WAVE],
+        &[wave],
     )?;
     vop(
         b,
@@ -3194,7 +3259,8 @@ fn wide_hc_epilogue(b: &mut Builder, w: WideSpec, lbl: &str, end: &str) -> R {
     }
     let x = p(0);
     let store = format!("{lbl}_store");
-    sop(b, format!("s_cmp_eq_u32 s{WS_HC}, 0"), &[], &[WS_HC])?;
+    let hc_act = w.s_hc();
+    sop(b, format!("s_cmp_eq_u32 s{hc_act}, 0"), &[], &[hc_act])?;
     op(b, format!("s_cbranch_scc1 {store}"), &[], &[])?;
     let e = |n: u8| WV_Q + n;
     bf16_round(b, x, [e(0), e(1), e(2), e(3)])?;
@@ -3245,7 +3311,13 @@ pub fn build_rowtiles_gfx1151() -> Result<Vec<Emitted>, String> {
         WideKind::Wide,
     ]
     .into_iter()
-    .map(|kind| wide_impl(WideSpec { kind }).map_err(|e| format!("{}: {e}", rowtile_symbol(kind))))
+    .map(|kind| {
+        wide_impl(WideSpec {
+            kind,
+            arch: Arch::Gfx1151,
+        })
+        .map_err(|e| format!("{}: {e}", rowtile_symbol(kind)))
+    })
     .collect()
 }
 
@@ -3330,7 +3402,10 @@ mod tests {
             );
             assert!(!e.s_text.contains("xbatch_wide_r16"));
             assert!(!e.s_text.contains("xbatch_wide_r32"));
-            let w = WideSpec { kind };
+            let w = WideSpec {
+                kind,
+                arch: Arch::Gfx1151,
+            };
             assert_eq!(
                 e.shape.next_free_vgpr,
                 w.vgpr_high_water() as u16,
@@ -3362,25 +3437,42 @@ mod tests {
         // HC: the X tile retired, then the partial layout.
         assert_eq!(emitted[0].proof.lds_slots.len(), 2);
         assert_eq!(emitted[1].proof.lds_slots.len(), 1);
-        assert_eq!(WideSpec { kind: WideKind::K8 }.kernarg_bytes(), 44);
         assert_eq!(
             WideSpec {
-                kind: WideKind::K320
+                kind: WideKind::K8,
+                arch: Arch::Gfx1151
+            }
+            .kernarg_bytes(),
+            44
+        );
+        assert_eq!(
+            WideSpec {
+                kind: WideKind::K320,
+                arch: Arch::Gfx1151,
             }
             .kernarg_bytes(),
             36
         );
         assert_eq!(
             WideSpec {
-                kind: WideKind::K2560X2
+                kind: WideKind::K2560X2,
+                arch: Arch::Gfx1151,
             }
             .kernarg_bytes(),
             56
         );
-        assert_eq!(WideSpec { kind: WideKind::K8 }.workgroup_size(), 512);
         assert_eq!(
             WideSpec {
-                kind: WideKind::Wide
+                kind: WideKind::K8,
+                arch: Arch::Gfx1151
+            }
+            .workgroup_size(),
+            512
+        );
+        assert_eq!(
+            WideSpec {
+                kind: WideKind::Wide,
+                arch: Arch::Gfx1151,
             }
             .workgroup_size(),
             256
@@ -3434,7 +3526,10 @@ mod tests {
         let emitted = build_rowtiles_gfx1151().expect("q8 rowtiles");
         let (acc0, x0, dq0) = (WV_ACC, WV_XS, WV_DQ);
         for (e, kind) in emitted.iter().zip(kinds) {
-            let w = WideSpec { kind };
+            let w = WideSpec {
+                kind,
+                arch: Arch::Gfx1151,
+            };
             let t = &e.s_text;
             if w.four() {
                 // Generic quad: fmac(acc, dq, x); K = 640: fmac(acc, x, dq).
@@ -3546,7 +3641,10 @@ mod tests {
         ];
         assert_eq!(emitted.len(), kinds.len());
         for (e, kind) in emitted.iter().zip(kinds) {
-            let w = WideSpec { kind };
+            let w = WideSpec {
+                kind,
+                arch: Arch::Gfx1151,
+            };
             let spec = wide_kspec(w);
             assert_eq!(spec.arch, Arch::Gfx1151);
             assert_eq!(spec.symbol, rowtile_symbol(kind));
@@ -3637,7 +3735,10 @@ mod tests {
         ) -> [Vec<u32>; 2] {
             let rows = x.len() / k;
             assert_eq!(x.len(), rows * k);
-            let w = WideSpec { kind };
+            let w = WideSpec {
+                kind,
+                arch: Arch::Gfx1151,
+            };
             let mut args = Vec::new();
             let ptrs = if w.x2() {
                 vec![A[0], A[1], X, Y[0] + 16, Y[1] + 16]
@@ -3793,7 +3894,11 @@ mod tests {
                     vec![[3, 0], [9, 0]],
                 ),
             ] {
-                let e = wide_impl(WideSpec { kind }).unwrap();
+                let e = wide_impl(WideSpec {
+                    kind,
+                    arch: Arch::Gfx1151,
+                })
+                .unwrap();
                 let elf = crate::native::assemble(&e.s_text, Arch::Gfx1151).unwrap();
                 let lifted = peacemaker_lift::lift_object(
                     &elf,
@@ -3879,7 +3984,10 @@ mod tests {
                 WideKind::K2560X2,
                 WideKind::Wide,
             ] {
-                let w = WideSpec { kind };
+                let w = WideSpec {
+                    kind,
+                    arch: Arch::Gfx1151,
+                };
                 let e = wide_impl(w).unwrap();
                 let elf = crate::native::assemble(&e.s_text, Arch::Gfx1151).unwrap();
                 let lifted = peacemaker_lift::lift_object(

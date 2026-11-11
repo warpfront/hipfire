@@ -69,14 +69,7 @@ pub(crate) fn run_vision_cli(input: &Path, output: &Path) -> Result<Qwen4Summary
         .collect();
     hipfire_arch_qwen4::vision::validate_tensor_infos(&tensor_infos, &geometry)
         .map_err(Qwen4Error::Invalid)?;
-    let provenance = match &source {
-        SourceSet::Remote { source, paths } => json!({
-            "repository": format!("{}/{}", source.spec.owner, source.spec.repo),
-            "revision": source.spec.revision,
-            "shards": paths,
-        }),
-        SourceSet::Local { .. } => json!({"input": input.to_string_lossy()}),
-    };
+    let provenance = vision_source_provenance(&source);
     let metadata_json = serde_json::to_string(&json!({
         "config": config,
         "preprocessor_config": processor,
@@ -136,6 +129,32 @@ pub(crate) fn run_vision_cli(input: &Path, output: &Path) -> Result<Qwen4Summary
         predicted_output_bytes,
         scratch_high_water_bytes,
     })
+}
+
+/// Distributed artifacts retain source identity without recording local
+/// filesystem layout. Local checkpoints do not establish an upstream revision.
+fn vision_source_provenance(source: &SourceSet) -> Value {
+    match source {
+        SourceSet::Remote { source, paths } => json!({
+            "kind": "hugging_face",
+            "input": format!("hf://{}/{}@{}", source.spec.owner, source.spec.repo, source.spec.revision),
+            "repository": format!("{}/{}", source.spec.owner, source.spec.repo),
+            "revision": source.spec.revision,
+            "shards": paths,
+        }),
+        SourceSet::Local { paths, .. } => {
+            let mut shards: Vec<String> = paths
+                .iter()
+                .map(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "<unnamed>".to_string())
+                })
+                .collect();
+            shards.sort();
+            json!({"kind": "local_safetensors", "shards": shards})
+        }
+    }
 }
 
 fn vision_source_paths(input: &Path) -> Result<SourceSet, Qwen4Error> {
@@ -254,6 +273,65 @@ fn stream_vision_tensor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_provenance_is_directory_independent_and_keeps_sorted_shards() {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let local = |directory: &Path| SourceSet::Local {
+            // Metadata admission does not read payloads; the real exporter
+            // verifies its source identity independently before publication.
+            paths: vec![
+                directory.join("vision-b.safetensors"),
+                directory.join("vision-a.safetensors"),
+            ],
+            identities: Vec::new(),
+        };
+        let first = vision_source_provenance(&local(left.path()));
+        let second = vision_source_provenance(&local(right.path()));
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            json!({
+                "kind": "local_safetensors",
+                "shards": ["vision-a.safetensors", "vision-b.safetensors"],
+            })
+        );
+        let serialized = serde_json::to_string(&first).unwrap();
+        assert!(!serialized.contains(left.path().to_string_lossy().as_ref()));
+        assert!(!serialized.contains(right.path().to_string_lossy().as_ref()));
+        assert!(first.get("input").is_none());
+        assert!(first.get("revision").is_none());
+        assert!(first.get("repository").is_none());
+    }
+
+    #[test]
+    fn remote_provenance_keeps_canonical_pinned_hf_uri_and_shards() {
+        let pinned = "hf://Qwen/Qwen3.8-Flash-Next@de4b8e4d43b917e7706784d8bb445c9af86a3540";
+        let source = SourceSet::Remote {
+            // Construct without credential lookup or requests: this is a
+            // pure metadata test, not a model download.
+            source: Arc::new(RemoteSource {
+                spec: parse_remote_spec(pinned).unwrap().unwrap(),
+                base_url: "https://example.invalid".to_string(),
+                agent: ureq::Agent::config_builder().build().into(),
+                authorization: None,
+                identity: Mutex::new(RemoteIdentityState::default()),
+            }),
+            paths: vec!["model-00003-of-00048.safetensors".to_string()],
+        };
+        let value = vision_source_provenance(&source);
+        assert_eq!(value["input"], pinned);
+        assert_eq!(value["kind"], "hugging_face");
+        assert_eq!(value["repository"], "Qwen/Qwen3.8-Flash-Next");
+        assert_eq!(
+            value["revision"],
+            "de4b8e4d43b917e7706784d8bb445c9af86a3540"
+        );
+        assert_eq!(value["shards"], json!(["model-00003-of-00048.safetensors"]));
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(!serialized.contains("example.invalid"));
+    }
 
     #[test]
     fn remote_selection_reads_only_visual_shards_and_retains_merger() {

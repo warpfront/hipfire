@@ -442,6 +442,10 @@ fn embed_lookup_to_scratch(
         // kept defensively in case it lands later — verify call convention then.
         EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, out, token, dim),
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, out, token, dim),
+        EmbeddingFormat::Ggml(_) => Err(hip_bridge::HipError::new(
+            0,
+            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
+        )),
     }
 }
 

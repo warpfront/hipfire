@@ -7,9 +7,15 @@
                       [--require-identical GLOB ...] [--json OUT] [--work DIR]
 
 Each ref is built with scripts/build-kernel-pack.sh --commit REF: `git archive`
-of the exact commit, fresh HOME, no HIPFIRE_* overrides, byte-reproducible
-objects. Per arch, every packaged module (`<name>.hsaco` / `.hash` /
-`.index.json`) is classified identical / changed / removed / added by sha256.
+of the exact commit, fresh HOME, no HIPFIRE_* overrides. Per arch, every
+packaged module (`<name>.hsaco` / `.hash` / `.index.json`) is classified
+identical / changed / removed / added by sha256. A fifth class,
+`nondeterministic`, is a module whose `.index.json` is identical but for
+`object_sha256` (same source, compile key, flags, scheduler profile and
+toolchain) and whose `.hash` matches, yet whose object bytes differ: the
+compiler turned identical inputs into different code (hipcc's post-RA
+scheduler on `qsa_bf16_scores`, gfx1201), so nothing in the commits caused it.
+It is listed by name and never fails --require-identical.
 The pack's manifest.json is not compared (it names the commit).
 
 Exit 0: done, and no module matching --require-identical changed or vanished.
@@ -33,6 +39,9 @@ ROOT = Path(__file__).resolve().parent.parent
 PACK = ROOT / "scripts" / "build-kernel-pack.sh"
 EXTS = (".hsaco", ".hash", ".index.json")
 DEFAULT_ARCHS = ("gfx1100", "gfx1151", "gfx1201")
+# Not a file: sha256 of the module's index.json without `object_sha256`, i.e. every
+# input of the compile. Equal inputs with different object bytes is toolchain noise.
+INPUTS = ".inputs"
 
 
 def module_digests(files: dict[str, str]) -> dict[str, dict[str, str]]:
@@ -48,12 +57,24 @@ def module_digests(files: dict[str, str]) -> dict[str, dict[str, str]]:
     return dict(mods)
 
 
-def classify(base: dict, new: dict) -> dict[str, list[str]]:
-    """Module digests of two builds -> {identical, changed, removed, added}.
+def index_inputs(index_json: bytes) -> str:
+    """sha256 of an index.json's compile inputs: every field but `object_sha256`."""
+    index = json.loads(index_json)
+    index.pop("object_sha256", None)
+    return hashlib.sha256(json.dumps(index, sort_keys=True).encode()).hexdigest()
 
-    `changed` entries name the differing parts: `foo (.hash,.hsaco)`.
+
+def classify(base: dict, new: dict) -> dict[str, list[str]]:
+    """Module digests of two builds -> {identical, changed, nondeterministic, removed, added}.
+
+    `changed` and `nondeterministic` entries name the differing parts:
+    `foo (.hash,.hsaco)`. A module is `nondeterministic` when its compile inputs
+    (`INPUTS`) are present and equal in both builds and only the object (and
+    the `object_sha256` it records) differs; anything else that differs is `changed`.
     """
-    out: dict[str, list[str]] = {"identical": [], "changed": [], "removed": [], "added": []}
+    out: dict[str, list[str]] = {
+        "identical": [], "changed": [], "nondeterministic": [], "removed": [], "added": [],
+    }
     for m in sorted(set(base) | set(new)):
         if m not in new:
             out["removed"].append(m)
@@ -62,8 +83,17 @@ def classify(base: dict, new: dict) -> dict[str, list[str]]:
         elif base[m] == new[m]:
             out["identical"].append(m)
         else:
-            parts = sorted(e for e in set(base[m]) | set(new[m]) if base[m].get(e) != new[m].get(e))
-            out["changed"].append(f"{m} ({','.join(parts)})")
+            parts = sorted(
+                e for e in set(base[m]) | set(new[m])
+                if e != INPUTS and base[m].get(e) != new[m].get(e)
+            )
+            noise = (
+                INPUTS in base[m]
+                and base[m].get(INPUTS) == new[m].get(INPUTS)
+                and ".hsaco" in parts
+                and set(parts) <= {".hsaco", ".index.json"}
+            )
+            out["nondeterministic" if noise else "changed"].append(f"{m} ({','.join(parts)})")
     return out
 
 
@@ -98,13 +128,18 @@ def build(commit: str, archs: list[str], out: Path, target: Path) -> dict[str, d
     )
     digests = {}
     for arch in archs:
-        files = {}
+        files, inputs = {}, {}
         with tarfile.open(out / f"hipfire-kernels-{tag}-{arch}.tar.gz") as tar:
             for member in tar.getmembers():
                 if member.isfile() and member.name.startswith(f"{arch}/"):
                     data = tar.extractfile(member).read()
-                    files[member.name[len(arch) + 1:]] = hashlib.sha256(data).hexdigest()
+                    name = member.name[len(arch) + 1:]
+                    files[name] = hashlib.sha256(data).hexdigest()
+                    if name.endswith(".index.json"):
+                        inputs[name[: -len(".index.json")]] = index_inputs(data)
         digests[arch] = module_digests(files)
+        for module, sha in inputs.items():
+            digests[arch][module][INPUTS] = sha
     return digests
 
 
@@ -153,6 +188,11 @@ def main() -> int:
         for kind in ("changed", "removed", "added"):
             for entry in result[kind]:
                 print(f"   {kind}: {entry}")
+        for entry in result["nondeterministic"]:
+            print(f"   toolchain-nondeterministic (identical compile inputs, different bytes): {entry}")
+            module = entry.split(" ", 1)[0]
+            if any(fnmatch.fnmatchcase(module, g) for g in args.require_identical):
+                print(f"kernel_idproof: {arch} required-identical module {module} is toolchain-nondeterministic only", file=sys.stderr)
         bad += [f"{arch} {v}" for v in violations(result, args.require_identical)]
     report["require_identical_violations"] = bad
     if args.json:

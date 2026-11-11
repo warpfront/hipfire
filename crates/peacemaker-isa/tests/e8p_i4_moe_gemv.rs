@@ -103,6 +103,85 @@ fn insns(t: &str) -> Vec<&str> {
         })
         .collect()
 }
+
+/// First workgroup-id SGPR of a gfx11 arm: the DECLARED user SGPRs (`Arch::declared_user_sgprs`; gfx1100's
+/// `FeatureUserSGPRInit16Bug` pads user + system to 16: x / y are `s14` / `s15`, with z (the `_t8` entries)
+/// `s13` / `s14` / `s15`; gfx1151 has no padding: `s2` / `s3` / `s4`).
+fn wg_x(arch: Arch, z: bool) -> u32 {
+    u32::from(arch.declared_user_sgprs(2, if z { 3 } else { 2 }))
+}
+
+/// SGPRs the plan declares on `arch`.
+fn sgprs(arch: Arch) -> u32 {
+    u32::from(if arch == Arch::Gfx1100 {
+        e8p_i4_moe_gemv::SGPRS_GFX1100
+    } else {
+        e8p_i4_moe_gemv::SGPRS
+    })
+}
+
+/// The gfx1151 source of an entry as the gfx1100 arm spells it: the only gfx1100-specific SGPR deltas are the
+/// workgroup ids (`s2` / `s3` / `s4` -> the declared-user placement of [`wg_x`]; `s4` is only an id in the `_t8` entries,
+/// in the narrow entries it is the unchanged `n_experts` register), the kernarg pointer block `s[8:15]` -> `s[88:95]`,
+/// and the descriptor / metadata SGPR counts.
+fn gfx1151_sgprs_as_gfx1100(text: &str, z: bool) -> String {
+    let x = wg_x(Arch::Gfx1100, z);
+    let map = |n: u32| match n {
+        2 => x,
+        3 => x + 1,
+        4 if z => x + 2,
+        8..=15 => n + 80,
+        _ => n,
+    };
+    let rename = |line: &str| {
+        let b = line.as_bytes();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < b.len() {
+            let sgpr_start = b[i] == b's'
+                && (i == 0
+                    || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'.'));
+            if sgpr_start && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
+                let end = (i + 1..b.len())
+                    .find(|&j| !b[j].is_ascii_digit())
+                    .unwrap_or(b.len());
+                out += &format!("s{}", map(line[i + 1..end].parse().unwrap()));
+                i = end;
+            } else if sgpr_start && i + 1 < b.len() && b[i + 1] == b'[' {
+                let close = line[i..].find(']').unwrap() + i;
+                let (lo, hi) = line[i + 2..close].split_once(':').unwrap();
+                let (lo, hi): (u32, u32) = (lo.parse().unwrap(), hi.parse().unwrap());
+                assert_eq!(map(hi) - map(lo), hi - lo, "range {line}");
+                out += &format!("s[{}:{}]", map(lo), map(hi));
+                i = close + 1;
+            } else {
+                out.push(b[i] as char);
+                i += 1;
+            }
+        }
+        out
+    };
+    let (user, ceiling) = (
+        u32::from(Arch::Gfx1100.declared_user_sgprs(2, if z { 3 } else { 2 })),
+        sgprs(Arch::Gfx1100),
+    );
+    text.lines()
+        .map(|l| {
+            let l = if l.starts_with('\t') && !l.starts_with("\t.") {
+                rename(l)
+            } else if l == "\t.amdhsa_user_sgpr_count 2" {
+                format!("\t.amdhsa_user_sgpr_count {user}")
+            } else if l == format!("\t.amdhsa_next_free_sgpr {}", sgprs(Arch::Gfx1151)) {
+                format!("\t.amdhsa_next_free_sgpr {ceiling}")
+            } else if l == format!("    .sgpr_count: {}", sgprs(Arch::Gfx1151)) {
+                format!("    .sgpr_count: {ceiling}")
+            } else {
+                l.to_owned()
+            };
+            format!("{l}\n")
+        })
+        .collect()
+}
 fn gate(spec: Spec) -> bool {
     spec.kind == Kind::GateUp
 }
@@ -173,7 +252,7 @@ fn emission_is_deterministic_and_refuses_other_arches() {
 }
 
 /// The gfx11 arms: the two `_pm_<arch>` symbols, the 96-byte ABI, wave32 and the 1,536-byte table stage, the
-/// system-SGPR workgroup ids (`s2` / `s3`, no `ttmp`), gfx11 `s_barrier` (no gfx12 split barrier or wait
+/// system-SGPR workgroup ids (`s2` / `s3`, gfx1100: `s14` / `s15` after the 16-SGPR padding; no `ttmp`), gfx11 `s_barrier` (no gfx12 split barrier or wait
 /// counters), the `.l` convert shared with gfx1201, and a successful native assembly of the module.
 #[test]
 fn gfx1100_arm_emits_the_suffixed_symbols_with_gfx11_ids_and_barrier() {
@@ -232,13 +311,26 @@ fn gfx11_arm(arch: Arch) {
         );
         let lines: Vec<&str> = insns(&e.s_text);
         assert!(!e.s_text.contains("ttmp"), "{symbol}: ttmp register");
+        let x = wg_x(arch, false);
         let (row, uidx) = (
-            lines.iter().position(|l| *l == "s_mov_b32 s30, s2"),
-            lines.iter().position(|l| *l == "s_mov_b32 s31, s3"),
+            lines
+                .iter()
+                .position(|l| *l == format!("s_mov_b32 s30, s{x}")),
+            lines
+                .iter()
+                .position(|l| *l == format!("s_mov_b32 s31, s{}", x + 1)),
         );
         assert!(
             row.is_some() && uidx.is_some(),
-            "{symbol}: s2/s3 workgroup id prologue"
+            "{symbol}: s{x}/s{} workgroup id prologue",
+            x + 1
+        );
+        assert!(
+            e.s_text.contains(&format!(
+                ".amdhsa_user_sgpr_count {}\n",
+                arch.declared_user_sgprs(2, 2)
+            )),
+            "{symbol}: declared user SGPR count"
         );
         assert!(
             !lines.contains(&"s_and_b32 s31, ttmp7, 0xffff"),
@@ -297,7 +389,9 @@ const TRANS_USE_WAIT: &str = "s_waitcnt_depctr depctr_va_vdst(0)";
 /// (one per entry, the `v_rcp_iflag_f32` -> dependent-VALU guard of the `x_row_div` division), is byte-identical
 /// to the gfx1100 text; the shape contracts agree except for the symbol name and that wait's count; the register
 /// plan agrees (so the `n_experts@88` load into `s4` and its guard are the same instructions); and neither text
-/// leaks the other arch's token.
+/// leaks the other arch's token. gfx1100's `FeatureUserSGPRInit16Bug` padding is the one further delta: its
+/// workgroup ids and kernarg pointer block are renamed (`gfx1151_sgprs_as_gfx1100`: ids `s2` / `s3` -> `s14` / `s15`,
+/// `s[8:15]` -> `s[88:95]`, the declared user count and the SGPR ceiling), and nothing else differs.
 #[test]
 fn gfx1151_arm_is_the_gfx1100_arm_modulo_the_arch_forced_deltas() {
     fn strip(text: &str) -> String {
@@ -324,7 +418,7 @@ fn gfx1151_arm_is_the_gfx1100_arm_modulo_the_arch_forced_deltas() {
         "one trans-use wait per gfx1100 entry"
     );
     assert_eq!(
-        strip(&t1151).replace("gfx1151", "gfx1100"),
+        gfx1151_sgprs_as_gfx1100(&strip(&t1151), false).replace("gfx1151", "gfx1100"),
         strip(&t1100),
         "module source"
     );
@@ -336,17 +430,18 @@ fn gfx1151_arm_is_the_gfx1100_arm_modulo_the_arch_forced_deltas() {
     assert_eq!(p1100.kernels.len(), p1151.kernels.len());
     for (a, b) in e1100.iter().zip(&e1151) {
         assert_eq!(
-            strip(&b.s_text).replace("gfx1151", "gfx1100"),
+            gfx1151_sgprs_as_gfx1100(&strip(&b.s_text), false).replace("gfx1151", "gfx1100"),
             strip(&a.s_text),
             "{}: entry source",
             b.proof.variant
         );
         assert_eq!(
             (a.shape.next_free_vgpr, a.shape.next_free_sgpr),
-            (b.shape.next_free_vgpr, b.shape.next_free_sgpr),
+            (b.shape.next_free_vgpr, sgprs(Arch::Gfx1100) as u16),
             "{}: register plan",
             b.proof.variant
         );
+        assert_eq!(b.shape.next_free_sgpr as u32, sgprs(Arch::Gfx1151));
         assert_eq!(
             a.proof.barriers.len(),
             b.proof.barriers.len(),
@@ -380,6 +475,9 @@ fn gfx1151_arm_is_the_gfx1100_arm_modulo_the_arch_forced_deltas() {
             .as_object_mut()
             .unwrap()
             .remove("s_waitcnt_depctr");
+        assert_eq!(ca["sgpr_max"], sgprs(Arch::Gfx1100));
+        assert_eq!(cb["sgpr_max"], sgprs(Arch::Gfx1151));
+        ca["sgpr_max"] = cb["sgpr_max"].clone();
         assert_eq!(
             cb.to_string().replace("gfx1151", "gfx1100"),
             ca.to_string(),
@@ -618,7 +716,8 @@ fn touches_sgpr(line: &str, n: u32) -> bool {
 /// The `n_experts` guard on every architecture: the word is loaded once into the spare `s4` (no other instruction
 /// defines or reads it but the compare), the unsigned compare `s_cmp_ge_u32 s34, s4` of the expert id plus the
 /// existing exit branch sit after the offsets guard and before `expert_id * 8`, the expert-table `s_load_b64` and the
-/// LDS stage / barrier, and the SGPR ceiling is the unchanged 88 (the plan's physical assignment is untouched).
+/// LDS stage / barrier, and the SGPR ceiling is the unchanged 88 on gfx1151 / gfx1201 (gfx1100 relocates the kernarg
+/// pointer block past the padded workgroup-id SGPRs: 96; `s4` stays the spare, no id lives there).
 #[test]
 fn n_experts_guard_precedes_the_table_index_and_the_stage_on_both_arches() {
     for arch in [Arch::Gfx1201, Arch::Gfx1100, Arch::Gfx1151] {
@@ -628,8 +727,8 @@ fn n_experts_guard_precedes_the_table_index_and_the_stage_on_both_arches() {
             let lines = insns(&e.s_text);
             let exit = format!(".Le8pi4moe_{}_exit", spec.tag());
             assert_eq!(
-                (e.shape.next_free_sgpr, e8p_i4_moe_gemv::SGPRS),
-                (88, 88),
+                (u32::from(e.shape.next_free_sgpr), sgprs(arch)),
+                (sgprs(arch), sgprs(arch)),
                 "{symbol}: sgpr ceiling"
             );
             let touching: Vec<usize> = lines
@@ -2698,6 +2797,39 @@ mod rowtiles {
         }
     }
 
+    /// The gfx1151 `_t8` entries are the gfx1100 ones modulo the arch-forced deltas and the gfx1100 SGPR placement
+    /// (`FeatureUserSGPRInit16Bug`: ids `s2` / `s3` / `s4` -> `s13` / `s14` / `s15`, kernarg pointer block
+    /// `s[8:15]` -> `s[88:95]`, the declared user count 13 and the SGPR ceiling).
+    #[test]
+    fn gfx1151_rowtiles_are_the_gfx1100_rowtiles_modulo_the_sgpr_placement() {
+        fn strip(text: &str) -> String {
+            text.lines()
+                .filter(|l| l.trim() != TRANS_USE_WAIT)
+                .map(|l| format!("{l}\n"))
+                .collect()
+        }
+        for spec in e8p_i4_moe_gemv::module_specs(Arch::Gfx1100) {
+            let a = e8p_i4_moe_gemv::emit_rowtiles(spec).unwrap();
+            let b = e8p_i4_moe_gemv::emit_rowtiles(Spec {
+                arch: Arch::Gfx1151,
+                kind: spec.kind,
+            })
+            .unwrap();
+            assert_eq!(
+                gfx1151_sgprs_as_gfx1100(&strip(&b.s_text), true).replace("gfx1151", "gfx1100"),
+                strip(&a.s_text),
+                "{spec:?}: _t8 source"
+            );
+            assert_eq!(
+                (
+                    u32::from(a.shape.next_free_sgpr),
+                    u32::from(b.shape.next_free_sgpr)
+                ),
+                (sgprs(Arch::Gfx1100), sgprs(Arch::Gfx1151))
+            );
+        }
+    }
+
     #[test]
     fn emission_abi_resources_isa_and_barrier_order_are_arch_specific() {
         for arch in ARCHES {
@@ -2787,7 +2919,7 @@ mod rowtiles {
                     count(t, "global_load_u16"),
                     2 * spec.group_instances() as usize
                 );
-                assert_eq!(e.shape.next_free_sgpr, 88);
+                assert_eq!(u32::from(e.shape.next_free_sgpr), sgprs(arch));
                 assert_eq!(e.shape.next_free_vgpr, if gate(spec) { 112 } else { 88 });
                 assert!(lines[..publish]
                     .iter()
@@ -2807,9 +2939,15 @@ mod rowtiles {
                     );
                     assert_eq!(count(t, "s_barrier"), 0);
                 } else {
-                    assert!(t.contains("s_mov_b32 s7, s4"));
-                    assert!(t.contains("s_lshl_b32 s30, s2, 3"));
-                    assert!(t.contains("s_mov_b32 s31, s3"));
+                    // Enabled workgroup ids x / y / z follow the declared user SGPRs (gfx1100: padded to 13).
+                    let x = wg_x(arch, true);
+                    assert!(t.contains(&format!("s_mov_b32 s7, s{}", x + 2)));
+                    assert!(t.contains(&format!("s_lshl_b32 s30, s{x}, 3")));
+                    assert!(t.contains(&format!("s_mov_b32 s31, s{}", x + 1)));
+                    assert!(t.contains(&format!(
+                        ".amdhsa_user_sgpr_count {}\n",
+                        arch.declared_user_sgprs(2, 3)
+                    )));
                     assert!(!t.contains("ttmp"));
                     assert_eq!(count(t, "s_barrier"), 1);
                     for banned in [

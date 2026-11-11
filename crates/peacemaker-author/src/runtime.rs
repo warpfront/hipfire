@@ -47,9 +47,10 @@
 //! retire = `barrier(&[Retire])`.
 
 use crate::backend::{Auth, Backend, EventId, SlotTransition};
-use crate::lds::{Lendable, Ring, RingParts, Slots};
+use crate::lds::{check_private_layout, Lendable, Ring, RingParts, Slots, Writing};
 use crate::scope::{End, Scc, WgUniform, Workgroup};
 use crate::target::{SplitBarrier, Target, WaitModel};
+use crate::wait::{LdsWrite, Pending};
 use std::any::TypeId;
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
@@ -71,6 +72,13 @@ pub struct RegionId {
 /// A dynamic two-buffer ring id (from `ring`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RingId {
+    owner: u64,
+    idx: usize,
+}
+/// A dynamic wave-private LDS region id (from `lds_private`). Valid for the
+/// `Driver` that issued it only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PrivateId {
     owner: u64,
     idx: usize,
 }
@@ -116,9 +124,31 @@ impl std::fmt::Debug for Phase {
     }
 }
 
+/// Ownership of a wave-private region, as each wave holds its own slice: no
+/// other wave ever reads or writes it, so every step is wave-local and none
+/// passes a barrier.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PrivatePhase {
+    /// The wave's slice holds nothing live; the wave may start writing.
+    RtFree,
+    /// The wave has stores into its slice; it may not read yet.
+    RtWriting,
+    /// Readable by the owning wave only; not writable until retired.
+    RtOwned,
+}
+impl std::fmt::Debug for PrivatePhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PrivatePhase::RtFree => "Free",
+            PrivatePhase::RtWriting => "Writing",
+            PrivatePhase::RtOwned => "Owned",
+        })
+    }
+}
+
 /// One barrier-carried transition (the typed core's `ready`, `retire`,
-/// `rotate`, `prime`, `retire_cur`). A barrier lowers all retires, then all
-/// readies, each in slice order.
+/// `rotate`, `prime`, `advance`, `retire_cur`). A barrier lowers all
+/// retires, then all readies, each in slice order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transition {
     /// `Writing -> Published`; needs a `wait` covering the youngest store.
@@ -126,21 +156,25 @@ pub enum Transition {
     /// `Published -> Free`.
     Retire(RegionId),
     /// Ring `(cur Published, next Writing)`: retire `cur` (if it holds a
-    /// published tile), publish the drained `next`, swap the roles.
+    /// published tile), publish the drained `next`, move `cur` on.
     Rotate(RingId),
-    /// Ring `(cur Free, next Writing)`: publish the drained `next` and swap
-    /// the roles (nothing to retire).
+    /// Ring `(cur Free, next Writing)`: publish the drained `next` and move
+    /// `cur` on (nothing to retire).
     Prime(RingId),
     /// Ring `cur` `Published -> Free`.
     RetireCur(RingId),
+    /// Ring `(cur Published, next Free)` with a published buffer after
+    /// `cur`: retire `cur` (if live) and move `cur` on, storing nothing.
+    Advance(RingId),
 }
 impl Transition {
     fn place(self) -> Place {
         match self {
             Transition::Ready(r) | Transition::Retire(r) => Place::Region(r),
-            Transition::Rotate(g) | Transition::Prime(g) | Transition::RetireCur(g) => {
-                Place::Ring(g)
-            }
+            Transition::Rotate(g)
+            | Transition::Prime(g)
+            | Transition::RetireCur(g)
+            | Transition::Advance(g) => Place::Ring(g),
         }
     }
 }
@@ -245,20 +279,43 @@ struct Region {
     hold: Hold,
 }
 #[derive(Clone, Debug)]
+struct PrivateRegion {
+    name: String,
+    slot: usize,
+    phase: PrivatePhase,
+    hold: Hold,
+    /// The wave's youngest stores into its slice (as `Region::stores`): what
+    /// `private_drain` asks the backend about.
+    stores: Stores,
+}
+#[derive(Clone, Debug)]
 struct RingBuf {
     name: String,
-    bufs: [Vec<usize>; 2],
+    bufs: Vec<Vec<usize>>,
     /// `Some` for a ring a typed body gave (`Lend::give`): the `TypeId` of its
     /// tag. Only such a ring can be taken back.
     tag: Option<TypeId>,
     cur: usize,
-    /// `cur` holds data a barrier published (false only before the first
-    /// rotation of a steady ring).
-    cur_live: bool,
+    /// Per buffer: it holds data a barrier published and not yet retired
+    /// (the current buffer is vacant before a ring has filled).
+    live: Vec<bool>,
+    /// A barrier published a buffer of this ring.
+    published: bool,
     cur_phase: Phase,
     next: Phase,
     stores: Stores,
     hold: Hold,
+}
+impl RingBuf {
+    fn depth(&self) -> usize {
+        self.bufs.len()
+    }
+    fn next_ix(&self) -> usize {
+        (self.cur + self.depth() - 1) % self.depth()
+    }
+    fn cur_live(&self) -> bool {
+        self.live[self.cur]
+    }
 }
 
 /// Everything a fork or a loop back edge must reproduce.
@@ -266,6 +323,7 @@ struct RingBuf {
 struct St {
     regions: Vec<Region>,
     rings: Vec<RingBuf>,
+    privates: Vec<PrivateRegion>,
     /// The split barrier in flight: its signal serial and transitions.
     in_flight: Option<(u64, Vec<Transition>)>,
     /// Code falls through to the current point (false after `s_branch`).
@@ -298,8 +356,27 @@ fn desc(phase: Phase, undrained: bool, hold: Hold) -> String {
 /// Why two states differ in ownership, or `None` when they agree (event
 /// ids and ring physical indices are build-time values, not shape).
 fn shape_diff(a: &St, b: &St) -> Option<String> {
-    if a.regions.len() != b.regions.len() || a.rings.len() != b.rings.len() {
-        return Some("one path declares LDS regions or rings the other lacks".into());
+    if a.regions.len() != b.regions.len()
+        || a.rings.len() != b.rings.len()
+        || a.privates.len() != b.privates.len()
+    {
+        return Some(
+            "one path declares LDS regions, rings or wave-private regions the other lacks".into(),
+        );
+    }
+    for (x, y) in a.privates.iter().zip(&b.privates) {
+        if (x.phase, x.hold) != (y.phase, y.hold) {
+            let d = |r: &PrivateRegion| match r.hold {
+                Hold::Live => format!("{:?}", r.phase),
+                _ => "consumed".to_string(),
+            };
+            return Some(format!(
+                "wave-private {} is {} on one path and {} on the other",
+                x.name,
+                d(x),
+                d(y)
+            ));
+        }
     }
     if a.in_flight.is_some() != b.in_flight.is_some() {
         return Some("a split barrier is in flight on one path only".into());
@@ -340,6 +417,20 @@ fn shape_diff(a: &St, b: &St) -> Option<String> {
     None
 }
 
+/// Why two states' rings differ in build-time values (`cur` index, live
+/// buffers), or `None` when they agree; `shape_diff` ignores both.
+fn ring_values_diff(a: &St, b: &St) -> Option<String> {
+    for (x, y) in a.rings.iter().zip(&b.rings) {
+        if x.cur != y.cur || x.live != y.live {
+            return Some(format!(
+                "ring {} has cur {} and live buffers {:?} on one path, cur {} and live buffers {:?} on the other",
+                x.name, x.cur, x.live, y.cur, y.live
+            ));
+        }
+    }
+    None
+}
+
 /// Join `other` into `into` (paths of equal shape meeting at one point).
 fn merge(into: &mut St, other: &St) -> Result<(), String> {
     if let Some(d) = shape_diff(into, other) {
@@ -349,6 +440,9 @@ fn merge(into: &mut St, other: &St) -> Result<(), String> {
         x.stores.join(&y.stores);
     }
     for (x, y) in into.rings.iter_mut().zip(&other.rings) {
+        x.stores.join(&y.stores);
+    }
+    for (x, y) in into.privates.iter_mut().zip(&other.privates) {
         x.stores.join(&y.stores);
     }
     into.wave_exit |= other.wave_exit;
@@ -487,6 +581,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         let st = St {
             regions: Vec::new(),
             rings: Vec::new(),
+            privates: Vec::new(),
             in_flight: None,
             reachable: true,
             wave_exit: false,
@@ -582,13 +677,17 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         let r = &self.st.rings[self.ring_ix(g)?];
         Ok((r.cur_phase, r.next))
     }
-    /// Physical index (0 or 1, declaration order) of the ring's current buffer.
+    /// Number of buffers of the ring.
+    pub fn ring_depth(&self, g: RingId) -> Result<usize, String> {
+        Ok(self.st.rings[self.ring_ix(g)?].depth())
+    }
+    /// Physical index (`0..depth`, declaration order) of the ring's current buffer.
     pub fn cur_index(&self, g: RingId) -> Result<usize, String> {
         Ok(self.st.rings[self.ring_ix(g)?].cur)
     }
-    /// Physical index of the ring's next buffer.
+    /// Physical index of the ring's next buffer: `(cur + depth - 1) % depth`.
     pub fn next_index(&self, g: RingId) -> Result<usize, String> {
-        Ok(1 - self.st.rings[self.ring_ix(g)?].cur)
+        Ok(self.st.rings[self.ring_ix(g)?].next_ix())
     }
 
     // ---- scope guards -------------------------------------------------
@@ -675,6 +774,147 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
             idx: self.st.regions.len() - 1,
         })
     }
+    /// Declare one wave-private LDS region: wave `w` owns bytes `[base + w *
+    /// stride, base + (w + 1) * stride)`, for `waves` waves (`base` and
+    /// `stride` multiples of 16, the whole window inside the LDS and clear of
+    /// every other slot). Its ownership is per wave and never crosses a
+    /// barrier: `private_store`, `private_publish`, `private_load` and
+    /// `private_retire` are wave-scope operations (legal under wave-uniform
+    /// control), and no `Transition`, shared `ds_store`/`ds_load` or handoff
+    /// can name it, so no other wave can be given access to it. Which bytes
+    /// each access touches is the instruction's address; the object-level
+    /// certification (`pm_check::lds_wave_private`) proves every wave's
+    /// addresses stay in its own slice.
+    pub fn lds_private(
+        &mut self,
+        name: &str,
+        base: u32,
+        stride: u32,
+        waves: u32,
+    ) -> Result<PrivateId, String> {
+        self.wg("lds_private")?;
+        check_private_layout(name, base, stride, waves, T::LDS_BYTES, T::NAME)?;
+        let slot = self
+            .b
+            .lds_slot_private(&self.auth, name, base, stride, waves)?;
+        self.st.privates.push(PrivateRegion {
+            name: name.into(),
+            slot,
+            phase: PrivatePhase::RtFree,
+            hold: Hold::Live,
+            stores: Stores::default(),
+        });
+        Ok(PrivateId {
+            owner: self.owner,
+            idx: self.st.privates.len() - 1,
+        })
+    }
+    fn private_ix(&self, id: PrivateId) -> Result<usize, String> {
+        if id.owner != self.owner {
+            return Err("wave-private region id from another Driver".into());
+        }
+        let r = self
+            .st
+            .privates
+            .get(id.idx)
+            .ok_or("unknown wave-private LDS region")?;
+        match r.hold {
+            Hold::Live => Ok(id.idx),
+            _ => Err(format!("{} was consumed by a relayout", r.name)),
+        }
+    }
+    /// Phase of a wave-private region (each wave's own).
+    pub fn private_phase(&self, p: PrivateId) -> Result<PrivatePhase, String> {
+        Ok(self.st.privates[self.private_ix(p)?].phase)
+    }
+    /// One DS store into the issuing wave's slice: `Free | Writing ->
+    /// Writing`. Wave scope: legal under `skip_if`/`exec_if`/`if_else`/
+    /// `loop_until`.
+    pub fn private_store(&mut self, p: PrivateId, insn: B::Insn) -> Result<(), String> {
+        let i = self.private_ix(p)?;
+        let r = &self.st.privates[i];
+        if r.phase == PrivatePhase::RtOwned {
+            return Err(format!(
+                "cannot store into wave-private {}: it is Owned (published to its wave) until private_retire",
+                r.name
+            ));
+        }
+        let slot = r.slot;
+        let e = self.b.ds_store_private(&self.auth, slot, insn)?;
+        self.st.privates[i].phase = PrivatePhase::RtWriting;
+        self.st.privates[i].stores.store(e);
+        Ok(())
+    }
+    /// Wait for the wave's own stores into its slice (a `Free`-phase region
+    /// has none to wait for). Publishing and retiring never need it; a
+    /// workgroup barrier does, for any DS store still in flight (`s_barrier`
+    /// waits for no memory counter), exactly as for a shared region.
+    pub fn private_drain(&mut self, p: PrivateId) -> Result<(), String> {
+        let i = self.private_ix(p)?;
+        let r = &self.st.privates[i];
+        if !r.stores.undrained() {
+            return Err(format!(
+                "drain of wave-private {}: no store of this wave is in flight",
+                r.name
+            ));
+        }
+        if r.stores.events.iter().any(|&e| self.b.lds_store_pending(e)) {
+            self.b
+                .drain_lds_stores(&self.auth, <T::Waits as WaitModel>::LDS)?;
+        }
+        self.st.privates[i].stores.clear();
+        Ok(())
+    }
+    /// `Writing -> Owned`: make the wave's stores readable by that wave. It
+    /// emits nothing and waits for nothing: one wave's DS instructions
+    /// execute in issue order (RDNA3 ISA 12.5, RDNA4 ISA 12.5 and 5.7.1.4), so
+    /// a load issued after the store reads what it stored, with no `s_barrier`
+    /// (which other waves would have to reach) and no `lgkmcnt`/`dscnt` wait.
+    pub fn private_publish(&mut self, p: PrivateId) -> Result<(), String> {
+        let i = self.private_ix(p)?;
+        let r = &self.st.privates[i];
+        if r.phase != PrivatePhase::RtWriting {
+            return Err(format!(
+                "cannot publish wave-private {} to its wave: it is {:?}, publishing needs a store first",
+                r.name, r.phase
+            ));
+        }
+        let slot = r.slot;
+        self.b.lds_private_publish(&self.auth, slot)?;
+        self.st.privates[i].phase = PrivatePhase::RtOwned;
+        Ok(())
+    }
+    /// One DS load from the issuing wave's slice, which must be `Owned`.
+    pub fn private_load(&mut self, p: PrivateId, insn: B::Insn) -> Result<(), String> {
+        let i = self.private_ix(p)?;
+        let r = &self.st.privates[i];
+        if r.phase != PrivatePhase::RtOwned {
+            return Err(format!(
+                "wave-private {} is not published to its wave: it is {:?}",
+                r.name, r.phase
+            ));
+        }
+        self.b.ds_load_private(&self.auth, r.slot, insn)
+    }
+    /// `Owned -> Free`: the wave is done reading its slice and may rewrite
+    /// it. It emits nothing: the wave's loads are issued ahead of its own later
+    /// stores in the same in-order LDS stream, and no other wave reads the
+    /// slice (a shared region's `Retire` waits out other waves' reads, which a
+    /// private slice has none of).
+    pub fn private_retire(&mut self, p: PrivateId) -> Result<(), String> {
+        let i = self.private_ix(p)?;
+        let r = &self.st.privates[i];
+        if r.phase != PrivatePhase::RtOwned {
+            return Err(format!(
+                "cannot retire wave-private {}: it is {:?}, only an Owned slice retires",
+                r.name, r.phase
+            ));
+        }
+        let slot = r.slot;
+        self.b.lds_private_retire(&self.auth, slot)?;
+        self.st.privates[i].phase = PrivatePhase::RtFree;
+        Ok(())
+    }
     /// End the slot layout so a later phase can carve its own. Every region
     /// and ring must be `Free`; all ids are invalid afterwards.
     pub fn relayout(&mut self) -> Result<(), String> {
@@ -696,9 +936,21 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
                 ));
             }
         }
+        for r in self.st.privates.iter().filter(|r| r.hold != Hold::Gone) {
+            if r.phase != PrivatePhase::RtFree {
+                return Err(format!(
+                    "wave-private {} is {:?} at relayout: its wave must retire it first",
+                    r.name, r.phase
+                ));
+            }
+        }
         self.b.lds_relayout(&self.auth)?;
         self.st.regions.iter_mut().for_each(|r| r.hold = Hold::Gone);
         self.st.rings.iter_mut().for_each(|g| g.hold = Hold::Gone);
+        self.st
+            .privates
+            .iter_mut()
+            .for_each(|r| r.hold = Hold::Gone);
         Ok(())
     }
     /// Re-carve `Free` regions into one region (a store or load then covers
@@ -795,11 +1047,35 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         first: RegionId,
         second: RegionId,
     ) -> Result<RingId, String> {
-        if first == second {
-            return Err("a ring needs two distinct regions".into());
+        self.ring_n(name, &[first, second])
+    }
+    /// A `D`-buffer ring (`2 <= D <= 4`) over `D` distinct `Free` regions;
+    /// the first store goes to `regions[0]` (the initial current buffer is
+    /// `1 % D`).
+    pub fn ring_n(&mut self, name: &str, regions: &[RegionId]) -> Result<RingId, String> {
+        let depth = regions.len();
+        if !(2..=crate::lds::MAX_RING_DEPTH).contains(&depth) {
+            return Err(format!(
+                "ring {name}: a ring has 2 to {} buffers, not {depth}",
+                crate::lds::MAX_RING_DEPTH
+            ));
         }
-        let (i, j) = (self.region_ix(first)?, self.region_ix(second)?);
-        for k in [i, j] {
+        if regions
+            .iter()
+            .enumerate()
+            .any(|(n, r)| regions[..n].contains(r))
+        {
+            return Err(if depth == 2 {
+                "a ring needs two distinct regions".into()
+            } else {
+                format!("a ring needs {depth} distinct regions")
+            });
+        }
+        let ixs = regions
+            .iter()
+            .map(|&r| self.region_ix(r))
+            .collect::<Result<Vec<_>, _>>()?;
+        for &k in &ixs {
             let r = &self.st.regions[k];
             if r.phase != Phase::RtFree {
                 return Err(format!(
@@ -808,18 +1084,20 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
                 ));
             }
         }
-        let bufs = [
-            self.st.regions[i].slots.clone(),
-            self.st.regions[j].slots.clone(),
-        ];
-        self.st.regions[i].hold = Hold::Gone;
-        self.st.regions[j].hold = Hold::Gone;
+        let bufs: Vec<Vec<usize>> = ixs
+            .iter()
+            .map(|&k| self.st.regions[k].slots.clone())
+            .collect();
+        for &k in &ixs {
+            self.st.regions[k].hold = Hold::Gone;
+        }
         self.st.rings.push(RingBuf {
             name: name.into(),
             bufs,
             tag: None,
-            cur: 1,
-            cur_live: false,
+            cur: 1 % depth,
+            live: vec![false; depth],
+            published: false,
             cur_phase: Phase::RtFree,
             next: Phase::RtFree,
             stores: Stores::default(),
@@ -830,13 +1108,41 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
             idx: self.st.rings.len() - 1,
         })
     }
+    /// Choose which buffer takes the first store: `cur` is set so that
+    /// `next_index() == k`. Refused once the ring has published anything
+    /// or holds a store.
+    pub fn ring_start_at(&mut self, g: RingId, k: usize) -> Result<(), String> {
+        let i = self.ring_ix(g)?;
+        let r = &mut self.st.rings[i];
+        let depth = r.depth();
+        if k >= depth {
+            return Err(format!(
+                "ring {}: start buffer {k} is outside a depth-{depth} ring",
+                r.name
+            ));
+        }
+        if r.published
+            || r.live.iter().any(|&l| l)
+            || r.cur_phase != Phase::RtFree
+            || r.next != Phase::RtFree
+            || r.stores.pending
+            || !r.stores.events.is_empty()
+        {
+            return Err(format!(
+                "ring {}: a depth-{depth} ring can only choose its first buffer before anything is published or stored",
+                r.name
+            ));
+        }
+        r.cur = (k + 1) % depth;
+        Ok(())
+    }
     /// Enter steady-state role typing before a loop whose head barrier
     /// rotates: the vacant current buffer is not retired by the first
     /// `Rotate`, and a read of it is refused.
     pub fn ring_steady(&mut self, g: RingId) -> Result<(), String> {
         let i = self.ring_ix(g)?;
         let r = &mut self.st.rings[i];
-        if r.cur_phase != Phase::RtFree || r.cur_live {
+        if r.cur_phase != Phase::RtFree || r.cur_live() {
             return Err(format!(
                 "ring {}: only a ring whose current buffer is Free and vacant can become steady",
                 r.name
@@ -857,7 +1163,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     fn slots_of(st: &St, l: Loc) -> &[usize] {
         match l {
             Loc::Region(i) => &st.regions[i].slots,
-            Loc::Ring(i) => &st.rings[i].bufs[1 - st.rings[i].cur],
+            Loc::Ring(i) => &st.rings[i].bufs[st.rings[i].next_ix()],
         }
     }
     fn note_store(&mut self, l: Loc, e: EventId) {
@@ -945,7 +1251,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
                 r.name, r.cur_phase
             ));
         }
-        if !r.cur_live {
+        if !r.cur_live() {
             return Err("read of a ring buffer no barrier has published".into());
         }
         self.b.ds_load(&self.auth, &r.bufs[r.cur], insn)
@@ -1032,11 +1338,11 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
                         return Err(format!("rotate of ring {}: cur is {:?}, next is {:?}; it needs cur Published and next Writing", r.name, r.cur_phase, r.next));
                     }
                     Self::covered(&r.name, &r.stores)?;
-                    if r.cur_live {
+                    if r.cur_live() {
                         retire.extend(r.bufs[r.cur].iter().map(|&id| SlotTransition::Retire(id)));
                     }
                     ready.extend(
-                        r.bufs[1 - r.cur]
+                        r.bufs[r.next_ix()]
                             .iter()
                             .map(|&id| SlotTransition::Ready(id)),
                     );
@@ -1048,7 +1354,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
                     }
                     Self::covered(&r.name, &r.stores)?;
                     ready.extend(
-                        r.bufs[1 - r.cur]
+                        r.bufs[r.next_ix()]
                             .iter()
                             .map(|&id| SlotTransition::Ready(id)),
                     );
@@ -1058,7 +1364,23 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
                     if r.cur_phase != Phase::RtPublished {
                         return Err(format!("retire_cur of ring {}: cur is {:?}, only a Published buffer can be retired", r.name, r.cur_phase));
                     }
-                    if r.cur_live {
+                    if r.cur_live() {
+                        retire.extend(r.bufs[r.cur].iter().map(|&id| SlotTransition::Retire(id)));
+                    }
+                }
+                Transition::Advance(g) => {
+                    let r = &self.st.rings[self.ring_ix(g)?];
+                    if r.cur_phase != Phase::RtPublished || r.next != Phase::RtFree {
+                        return Err(format!("advance of ring {}: cur is {:?}, next is {:?}; it needs cur Published and next Free", r.name, r.cur_phase, r.next));
+                    }
+                    if !r.live[(r.cur + 1) % r.depth()] {
+                        return Err(format!(
+                            "advance of ring {}: depth {} has no published buffer after the current one",
+                            r.name,
+                            r.depth()
+                        ));
+                    }
+                    if r.cur_live() {
                         retire.extend(r.bufs[r.cur].iter().map(|&id| SlotTransition::Retire(id)));
                     }
                 }
@@ -1087,8 +1409,11 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
                 }
                 Transition::Rotate(g) | Transition::Prime(g) => {
                     let r = &mut self.st.rings[g.idx];
-                    r.cur = 1 - r.cur;
-                    r.cur_live = true;
+                    let next = r.next_ix();
+                    r.live[r.cur] = false;
+                    r.live[next] = true;
+                    r.published = true;
+                    r.cur = (r.cur + 1) % r.depth();
                     r.cur_phase = Phase::RtPublished;
                     r.next = Phase::RtFree;
                     r.stores.clear();
@@ -1096,7 +1421,12 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
                 Transition::RetireCur(g) => {
                     let r = &mut self.st.rings[g.idx];
                     r.cur_phase = Phase::RtFree;
-                    r.cur_live = false;
+                    r.live[r.cur] = false;
+                }
+                Transition::Advance(g) => {
+                    let r = &mut self.st.rings[g.idx];
+                    r.live[r.cur] = false;
+                    r.cur = (r.cur + 1) % r.depth();
                 }
             }
         }
@@ -1238,6 +1568,48 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     ) -> Result<(), String> {
         self.wg("wg_skip_if")?;
         self.skip(cond.owner, cond.at, target, false, false, body)
+    }
+    /// Two-way workgroup-uniform branch whose arms may hold barriers and
+    /// change LDS ownership (the runtime twin of `Workgroup::wg_if_else`).
+    /// When `cond` holds, jump to `else_label` and run `els` from the state
+    /// of the branch point; otherwise run `then`, which ends with `s_branch
+    /// join`. `join` is placed after the arms, where the backend joins their
+    /// states. The arms must end equal: the same LDS ownership shape, ring
+    /// `cur` index and live buffers, else `Err`.
+    pub fn wg_if_else(
+        &mut self,
+        cond: WgCond,
+        else_label: &str,
+        join: &str,
+        then: impl FnOnce(&mut Self) -> Result<(), String>,
+        els: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.wg("wg_if_else")?;
+        self.fresh(cond.owner, cond.at)?;
+        self.b.branch_scc1(&self.auth, else_label)?;
+        let at = self.b.fork();
+        let saved = self.st.clone();
+        then(self)?;
+        self.b.branch(&self.auth, join)?;
+        self.st.reachable = false;
+        let then_end = (self.b.fork(), self.st.clone());
+        self.b.resume(&self.auth, at)?;
+        self.restore(saved);
+        self.b.label(&self.auth, else_label)?;
+        els(self)?;
+        if let Some(d) =
+            shape_diff(&then_end.1, &self.st).or_else(|| ring_values_diff(&then_end.1, &self.st))
+        {
+            return Err(format!(
+                "the arms end in different LDS states at {join}: {d}"
+            ));
+        }
+        self.b
+            .join(&self.auth, then_end.0)
+            .map_err(|e| format!("the arms cannot join at {join}: {e}"))?;
+        merge(&mut self.st, &then_end.1)
+            .map_err(|e| format!("the arms cannot join at {join}: {e}"))?;
+        self.b.label(&self.auth, join)
     }
     /// Run `body` with EXEC = all lanes if `cond`, else none, then restore
     /// EXEC. The body is wave scope.
@@ -1607,13 +1979,31 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
 /// kernel exits and conditions of the script side. It cannot mint a ring, a
 /// region or an `Auth`; it only moves what the typed core built.
 ///
-/// A ring crosses only in a state with no `Pending` token (`Free` or
-/// `Published` buffers, [`Lendable`]) and only under its own tag, which is
+/// A ring crosses with `Free` or `Published` buffers ([`Lendable`], `take` /
+/// `give_back`) or with a `Writing` next buffer and its `Pending` token
+/// (`take_writing` / `give_writing`), and only under its own tag, which is
 /// what makes a ring of the wrong payload kind a refusal instead of a
-/// misread LDS plane.
+/// misread LDS plane. [`Lend::view`] reads a ring's phases without taking it.
 pub struct Lend<'a> {
     st: &'a mut St,
     owner: u64,
+}
+
+/// A ring as the driver holds it ([`Lend::view`]).
+#[derive(Clone, Debug)]
+pub struct RingView {
+    pub name: String,
+    pub cur: Phase,
+    pub next: Phase,
+    /// Number of buffers (the `D` of the typed `Ring<_, _, _, D>`).
+    pub depth: usize,
+    /// Physical index (`0..depth`) of the current and of the next buffer.
+    pub cur_index: usize,
+    pub next_index: usize,
+    /// The current buffer holds data a barrier published.
+    pub cur_live: bool,
+    /// The next buffer's `Pending` token has not been waited.
+    pub pending: bool,
 }
 
 impl Lend<'_> {
@@ -1641,21 +2031,64 @@ impl Lend<'_> {
             )),
         }
     }
+    /// The typed body's depth `D` must be the ring's depth.
+    fn depth_check(r: &RingBuf, want: usize) -> Result<(), String> {
+        if r.depth() != want {
+            return Err(format!(
+                "ring {} has depth {}; the typed body takes it as depth {want}",
+                r.name,
+                r.depth()
+            ));
+        }
+        Ok(())
+    }
+    fn parts_of(r: &RingBuf, last: Option<EventId>) -> Result<RingParts, String> {
+        Ok(RingParts {
+            bufs: r
+                .bufs
+                .iter()
+                .map(|b| Slots::from_ids(b))
+                .collect::<Result<Vec<_>, _>>()?,
+            cur: r.cur,
+            live: r.live.clone(),
+            published: r.published,
+            last,
+        })
+    }
+    /// A ring given back is the one that was taken: same depth, same buffers.
+    fn same_ring(r: &RingBuf, p: &RingParts) -> Result<(), String> {
+        if r.depth() != p.bufs.len() {
+            return Err(format!(
+                "ring {}: the ring given back has depth {}, the one taken had depth {}",
+                r.name,
+                p.bufs.len(),
+                r.depth()
+            ));
+        }
+        if r.bufs.iter().zip(&p.bufs).any(|(a, b)| a != b.ids()) {
+            return Err(format!(
+                "ring {}: the ring given back is not the one that was taken",
+                r.name
+            ));
+        }
+        Ok(())
+    }
     /// Register a typed ring with the driver: a new live ring of its phases
     /// (`C` current, `N` next), tagged `Tag`. Only `Free` and `Published`
     /// states can be given.
-    pub fn give<Tag: 'static, C: Lendable, N: Lendable>(
+    pub fn give<Tag: 'static, C: Lendable, N: Lendable, const D: usize>(
         &mut self,
-        ring: Ring<Tag, C, N>,
+        ring: Ring<Tag, C, N, D>,
         name: &str,
     ) -> RingId {
         let p = ring.into_parts();
         self.st.rings.push(RingBuf {
             name: name.into(),
-            bufs: [p.bufs[0].ids().to_vec(), p.bufs[1].ids().to_vec()],
+            bufs: p.bufs.iter().map(|b| b.ids().to_vec()).collect(),
             tag: Some(TypeId::of::<Tag>()),
             cur: p.cur,
-            cur_live: p.cur_live,
+            live: p.live,
+            published: p.published,
             cur_phase: C::PHASE,
             next: N::PHASE,
             stores: Stores {
@@ -1669,16 +2102,16 @@ impl Lend<'_> {
             idx: self.st.rings.len() - 1,
         }
     }
-    /// Move a ring out of the driver as the typed `Ring<Tag, C, N>`. It must
-    /// be live (not in a split barrier, not already lent, not consumed), carry
-    /// no `Pending` token or outstanding store, be tagged `Tag` and be in
-    /// phases `C`/`N`. Its internals (`cur`, `cur_live`, buffers) travel
-    /// unchanged. The driver marks it lent until [`give_back`](Self::give_back)
-    /// or [`consumed`](Self::consumed).
-    pub fn take<Tag: 'static, C: Lendable, N: Lendable>(
+    /// Move a ring out of the driver as the typed `Ring<Tag, C, N, D>`. It
+    /// must be live (not in a split barrier, not already lent, not consumed),
+    /// carry no `Pending` token or outstanding store, be tagged `Tag`, have
+    /// depth `D` and be in phases `C`/`N`. Its internals (`cur`, live
+    /// buffers, buffers) travel unchanged. The driver marks it lent until
+    /// [`give_back`](Self::give_back) or [`consumed`](Self::consumed).
+    pub fn take<Tag: 'static, C: Lendable, N: Lendable, const D: usize>(
         &mut self,
         id: RingId,
-    ) -> Result<Ring<Tag, C, N>, String> {
+    ) -> Result<Ring<Tag, C, N, D>, String> {
         let i = self.ring_slot(id)?;
         let r = &self.st.rings[i];
         match r.hold {
@@ -1693,6 +2126,7 @@ impl Lend<'_> {
             Hold::Gone => return Err(format!("ring {} was re-laid out or consumed", r.name)),
         }
         Self::tag_check::<Tag>(r)?;
+        Self::depth_check(r, D)?;
         if r.stores.undrained() || !r.stores.events.is_empty() {
             return Err(format!(
                 "ring {} has a Pending store: only a drained ring can be lent",
@@ -1709,24 +2143,19 @@ impl Lend<'_> {
                 N::PHASE
             ));
         }
-        let parts = RingParts {
-            bufs: [Slots::from_ids(&r.bufs[0])?, Slots::from_ids(&r.bufs[1])?],
-            cur: r.cur,
-            cur_live: r.cur_live,
-            last: None,
-        };
+        let ring = Ring::from_parts(Self::parts_of(r, None)?)?;
         self.st.rings[i].hold = Hold::Lent;
-        Ok(Ring::from_parts(parts))
+        Ok(ring)
     }
     /// Return a taken ring to its driver slot, in the phases `C`/`N` the body
     /// left it in (a body may retire or publish it). It must be the ring
-    /// taken under `id`: same tag, same buffers. From here on it is an
-    /// ordinary driver ring, so a script loop around the body checks it
+    /// taken under `id`: same tag, same depth, same buffers. From here on it
+    /// is an ordinary driver ring, so a script loop around the body checks it
     /// like any other.
-    pub fn give_back<Tag: 'static, C: Lendable, N: Lendable>(
+    pub fn give_back<Tag: 'static, C: Lendable, N: Lendable, const D: usize>(
         &mut self,
         id: RingId,
-        ring: Ring<Tag, C, N>,
+        ring: Ring<Tag, C, N, D>,
     ) -> Result<(), String> {
         let i = self.ring_slot(id)?;
         let r = &self.st.rings[i];
@@ -1735,21 +2164,125 @@ impl Lend<'_> {
         }
         Self::tag_check::<Tag>(r)?;
         let p = ring.into_parts();
-        if r.bufs[0] != p.bufs[0].ids() || r.bufs[1] != p.bufs[1].ids() {
-            return Err(format!(
-                "ring {}: the ring given back is not the one that was taken",
-                r.name
-            ));
-        }
+        Self::same_ring(r, &p)?;
         let r = &mut self.st.rings[i];
         r.cur = p.cur;
-        r.cur_live = p.cur_live;
+        r.live = p.live;
+        r.published = p.published;
         r.cur_phase = C::PHASE;
         r.next = N::PHASE;
         r.stores = Stores {
             events: p.last.into_iter().collect(),
             pending: false,
         };
+        r.hold = Hold::Live;
+        Ok(())
+    }
+    /// What the driver currently holds for ring `id`, tag-checked as `Tag`
+    /// and live (not lent, not in a split barrier, not consumed), without
+    /// taking it: the phases and physical indices a typed body picks its
+    /// typed states by. A ring is lent in `Free`/`Published` buffers by
+    /// [`take`](Self::take) and with a `Writing` next buffer by
+    /// [`take_writing`](Self::take_writing).
+    pub fn view<Tag: 'static>(&self, id: RingId) -> Result<RingView, String> {
+        let i = self.ring_slot(id)?;
+        let r = &self.st.rings[i];
+        Self::live_check(r)?;
+        Self::tag_check::<Tag>(r)?;
+        Ok(RingView {
+            name: r.name.clone(),
+            cur: r.cur_phase,
+            next: r.next,
+            depth: r.depth(),
+            cur_index: r.cur,
+            next_index: r.next_ix(),
+            cur_live: r.cur_live(),
+            pending: r.stores.undrained(),
+        })
+    }
+    fn live_check(r: &RingBuf) -> Result<(), String> {
+        match r.hold {
+            Hold::Live => Ok(()),
+            Hold::Lent => Err(format!("ring {} is already lent", r.name)),
+            Hold::Barrier => Err(format!(
+                "ring {} is held by a split barrier in flight until wait_arrived",
+                r.name
+            )),
+            Hold::Gone => Err(format!("ring {} was re-laid out or consumed", r.name)),
+        }
+    }
+    /// [`take`](Self::take) for a ring whose next buffer is `Writing`: the
+    /// typed `Ring<Tag, C, Writing>` with its `Pending` token (the youngest
+    /// store the driver knows of; stores from several incoming paths
+    /// cannot be lent). The driver's own record of the buffer is left as it
+    /// was, so a typed body that only reads the current buffer hands the
+    /// ring back with its token still pending, or already waited, as it was
+    /// ([`give_writing`](Self::give_writing)).
+    pub fn take_writing<Tag: 'static, W: WaitModel, C: Lendable, const D: usize>(
+        &mut self,
+        id: RingId,
+    ) -> Result<(Ring<Tag, C, Writing, D>, Pending<W, LdsWrite<Tag>>), String> {
+        let i = self.ring_slot(id)?;
+        let r = &self.st.rings[i];
+        Self::live_check(r)?;
+        Self::tag_check::<Tag>(r)?;
+        Self::depth_check(r, D)?;
+        if r.cur_phase != C::PHASE || r.next != Phase::RtWriting {
+            return Err(format!(
+                "ring {} is [cur {:?}, next {:?}]; the typed body takes it as [cur {:?}, next Writing]",
+                r.name,
+                r.cur_phase,
+                r.next,
+                C::PHASE
+            ));
+        }
+        if r.stores.events.len() > 1 {
+            return Err(format!(
+                "ring {} has stores from several paths: it cannot be lent as one Pending token",
+                r.name
+            ));
+        }
+        let last = r.stores.events.first().copied();
+        let ring = Ring::from_parts(Self::parts_of(r, last)?)?;
+        self.st.rings[i].hold = Hold::Lent;
+        Ok((ring, Pending::new(last)))
+    }
+    /// Return a ring in the `Writing` state ([`take_writing`](Self::take_writing),
+    /// or a [`take`](Self::take)n `Free` ring a body wrote into). A new store
+    /// makes its token pending; a ring whose youngest store is the one it was
+    /// taken with keeps the driver's record (pending, or already waited).
+    pub fn give_writing<Tag: 'static, W: WaitModel, C: Lendable, const D: usize>(
+        &mut self,
+        id: RingId,
+        (ring, pending): (Ring<Tag, C, Writing, D>, Pending<W, LdsWrite<Tag>>),
+    ) -> Result<(), String> {
+        let i = self.ring_slot(id)?;
+        let r = &self.st.rings[i];
+        if r.hold != Hold::Lent {
+            return Err(format!("ring {} is not lent: nothing to give back", r.name));
+        }
+        Self::tag_check::<Tag>(r)?;
+        let p = ring.into_parts();
+        Self::same_ring(r, &p)?;
+        if pending.last != p.last {
+            return Err(format!(
+                "ring {}: the Pending token does not cover the ring's youngest store",
+                r.name
+            ));
+        }
+        let r = &mut self.st.rings[i];
+        r.cur = p.cur;
+        r.live = p.live;
+        r.published = p.published;
+        r.cur_phase = C::PHASE;
+        let unchanged = r.next == Phase::RtWriting && r.stores.events.first().copied() == p.last;
+        r.next = Phase::RtWriting;
+        if !unchanged {
+            r.stores = Stores {
+                events: p.last.into_iter().collect(),
+                pending: true,
+            };
+        }
         r.hold = Hold::Live;
         Ok(())
     }

@@ -81,7 +81,29 @@ fn main() {
     // mirrors daemon.rs:1500-1504 and eval_hipfire's load path. HFQ files
     // take the canonical HFQ path below.
     let t_load = Instant::now();
-    let (config, weights, model_bytes) = if model_path_buf.is_dir() {
+    let (config, weights, model_bytes) = if model_path_buf.extension().is_some_and(|e| e == "gguf")
+    {
+        // GGUF-native (`HIPFIRE_GGUF_NATIVE=1`): ggml block bytes served as-is.
+        let m = hipfire_loader::gguf_native::GgufNativeModel::open(model_path_buf).unwrap_or_else(
+            |e| {
+                eprintln!("{e}");
+                std::process::exit(1)
+            },
+        );
+        let config = m.hparams.config.clone();
+        eprintln!(
+            "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
+            config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
+        );
+        let bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
+        eprintln!(
+            "Model size: {:.3} GiB ({} bytes, GGUF)",
+            bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            bytes
+        );
+        let weights = m.load_qwen35_weights(&mut gpu).expect("load GGUF weights");
+        (config, weights, bytes)
+    } else if model_path_buf.is_dir() {
         use hipfire_runtime::safetensors_source::SafetensorsSource;
         let source = SafetensorsSource::open(model_path_buf).expect("safetensors open");
         let config = qwen35::config_from_safetensors(&source).expect("config_from_safetensors");

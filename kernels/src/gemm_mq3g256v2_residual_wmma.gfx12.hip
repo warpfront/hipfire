@@ -13,14 +13,59 @@
 typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
 typedef float    __attribute__((ext_vector_type(8))) float8_t;
 
-__launch_bounds__(32, 2)
+// ---- qt49 (MQ3G256V2) split-K group decode ---------------------------------
+// One 104 B group = fp16 {sc0,zp0,sc1,zp1} + 96 B of 3-bit codes. Rows are
+// 104 B apart, so every group is 8-byte aligned: a lane loads the whole group
+// as 13 u64 instead of 48 single-byte loads. Chunk kt (16 K per wave-wide
+// WMMA step) owns 6 bytes = two 24-bit halves, one per k_grp lane half.
+#define MQ3_KS 8  // waves per block; each wave owns every KS-th group of K
+typedef _Float16 __attribute__((ext_vector_type(2))) half2_t;
+
+__device__ __forceinline__ half2_t mq3_codes2(unsigned int c24, int shift, half2_t sc2, half2_t zp2) {
+    unsigned int p = ((c24 >> shift) & 7u) | (((c24 >> (shift + 3)) & 7u) << 16) | 0x64006400u;
+    half2_t v = __builtin_bit_cast(half2_t, p) - (half2_t){(_Float16)1024.0f, (_Float16)1024.0f};
+    return __builtin_elementwise_fma(sc2, v, zp2);
+}
+
+// Dequantize chunk kt (24 bits of this lane's k_grp) into a WMMA A fragment.
+__device__ __forceinline__ half8_t mq3_chunk(unsigned int c24, half2_t sc2, half2_t zp2) {
+    half2_t p0 = mq3_codes2(c24, 0, sc2, zp2);
+    half2_t p1 = mq3_codes2(c24, 6, sc2, zp2);
+    half2_t p2 = mq3_codes2(c24, 12, sc2, zp2);
+    half2_t p3 = mq3_codes2(c24, 18, sc2, zp2);
+    half8_t r;
+    r[0] = p0[0]; r[1] = p0[1]; r[2] = p1[0]; r[3] = p1[1];
+    r[4] = p2[0]; r[5] = p2[1]; r[6] = p3[0]; r[7] = p3[1];
+    return r;
+}
+
+// 24-bit code word of chunk kt for k_grp, from the 12 data u64 (d[0..11]).
+#define MQ3_C24(d, kt, k_grp) ({                                              \
+    const int _s = (kt) * 48, _wi = _s >> 6, _sh = _s & 63;                   \
+    unsigned long long _b = (d)[_wi] >> _sh;                                  \
+    if (_sh > 16) _b |= (d)[_wi + 1] << (64 - _sh);                           \
+    (unsigned int)(_b >> ((k_grp) * 24)) & 0xFFFFFFu; })
+
+// Group header -> per-half scale/zero pairs (first 8 K-chunks use half 0).
+#define MQ3_HDR(w0, sc0, zp0, sc1, zp1) do {                                  \
+    unsigned int _hA = (unsigned int)(w0), _hB = (unsigned int)((w0) >> 32);  \
+    sc0 = (_Float16)__half2float(__ushort_as_half((unsigned short)(_hA & 0xFFFFu))); \
+    zp0 = (_Float16)__half2float(__ushort_as_half((unsigned short)(_hA >> 16)));     \
+    sc1 = (_Float16)__half2float(__ushort_as_half((unsigned short)(_hB & 0xFFFFu))); \
+    zp1 = (_Float16)__half2float(__ushort_as_half((unsigned short)(_hB >> 16)));     \
+} while (0)
+
+__launch_bounds__(32 * MQ3_KS)
 extern "C" __global__ void gemm_mq3g256v2_residual_wmma_gfx12(
     const char* __restrict__ A,
     const _Float16* __restrict__ X,
     float* __restrict__ Y,
     int M, int K, int batch_size
 ) {
-    const int tid = threadIdx.x;
+    // Launch: block = 32 * MQ3_KS threads. Wave w accumulates groups w, w+KS, ...
+    // of every row; wave 0 sums the partials and applies `Y += `.
+    const int tid = threadIdx.x & 31;
+    const int wv = threadIdx.x >> 5;
     const int row_start = blockIdx.x * 16;
     const int batch_start = blockIdx.y * 16;
 
@@ -38,60 +83,39 @@ extern "C" __global__ void gemm_mq3g256v2_residual_wmma_gfx12(
 
     float8_t acc = {0, 0, 0, 0, 0, 0, 0, 0};
 
-    #define UNPACK_CHUNK_DQ(b0, b1, b2)                          \
-        do {                                                      \
-            unsigned int _a0 = (b0), _a1 = (b1), _a2 = (b2);     \
-            a_reg[0] = sc_h * (_Float16)(float)(_a0 & 7u) + zp_h; \
-            a_reg[1] = sc_h * (_Float16)(float)((_a0 >> 3) & 7u) + zp_h; \
-            a_reg[2] = sc_h * (_Float16)(float)(((_a0 >> 6) | (_a1 << 2)) & 7u) + zp_h; \
-            a_reg[3] = sc_h * (_Float16)(float)((_a1 >> 1) & 7u) + zp_h; \
-            a_reg[4] = sc_h * (_Float16)(float)((_a1 >> 4) & 7u) + zp_h; \
-            a_reg[5] = sc_h * (_Float16)(float)(((_a1 >> 7) | (_a2 << 1)) & 7u) + zp_h; \
-            a_reg[6] = sc_h * (_Float16)(float)((_a2 >> 2) & 7u) + zp_h; \
-            a_reg[7] = sc_h * (_Float16)(float)((_a2 >> 5) & 7u) + zp_h; \
-        } while (0)
-
-    for (int g = 0; g < groups_per_row; g++) {
-        const char* gp = row_base + g * 104;
-        const unsigned int hA = *(const unsigned int*)(gp);
-        const unsigned int hB = *(const unsigned int*)(gp + 4);
-        _Float16 sc0 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hA & 0xFFFFu)));
-        _Float16 zp0 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hA >> 16)));
-        _Float16 sc1 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hB & 0xFFFFu)));
-        _Float16 zp1 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hB >> 16)));
+    for (int g = wv; g < groups_per_row; g += MQ3_KS) {
+        const unsigned long long* gp = (const unsigned long long*)(row_base + (long long)g * 104);
+        unsigned long long w[13];
+        #pragma unroll
+        for (int i = 0; i < 13; i++) w[i] = gp[i];
+        _Float16 sc0, zp0, sc1, zp1;
+        MQ3_HDR(w[0], sc0, zp0, sc1, zp1);
+        const half2_t scv0 = {sc0, sc0}, zpv0 = {zp0, zp0};
+        const half2_t scv1 = {sc1, sc1}, zpv1 = {zp1, zp1};
+        const unsigned long long* d = w + 1;
         const _Float16* xg = x_base + g * 256;
-        const unsigned char* dp = (const unsigned char*)(gp + 8);
 
-        for (int kt = 0; kt < 16; kt += 4) {
-            _Float16 sc_h = (kt < 8) ? sc0 : sc1;
-            _Float16 zp_h = (kt < 8) ? zp0 : zp1;
-            const unsigned char* dpa = dp + (kt + 0) * 6 + k_grp * 3;
-            const unsigned char* dpb = dp + (kt + 1) * 6 + k_grp * 3;
-            const unsigned char* dpc = dp + (kt + 2) * 6 + k_grp * 3;
-            const unsigned char* dpd = dp + (kt + 3) * 6 + k_grp * 3;
-
-            half8_t b_a = *(const half8_t*)(xg + (kt + 0) * 16 + k_grp * 8);
-            half8_t b_b = *(const half8_t*)(xg + (kt + 1) * 16 + k_grp * 8);
-            half8_t b_c = *(const half8_t*)(xg + (kt + 2) * 16 + k_grp * 8);
-            half8_t b_d = *(const half8_t*)(xg + (kt + 3) * 16 + k_grp * 8);
-
-            unsigned int a0 = dpa[0], a1 = dpa[1], a2 = dpa[2];
-            unsigned int b0 = dpb[0], b1 = dpb[1], b2 = dpb[2];
-            unsigned int c0 = dpc[0], c1 = dpc[1], c2 = dpc[2];
-            unsigned int d0 = dpd[0], d1 = dpd[1], d2 = dpd[2];
-
-            half8_t a_reg;
-            UNPACK_CHUNK_DQ(a0, a1, a2);
-            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b_a, acc);
-            UNPACK_CHUNK_DQ(b0, b1, b2);
-            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b_b, acc);
-            UNPACK_CHUNK_DQ(c0, c1, c2);
-            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b_c, acc);
-            UNPACK_CHUNK_DQ(d0, d1, d2);
-            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b_d, acc);
+        #pragma unroll
+        for (int kt = 0; kt < 16; kt++) {
+            half8_t b = *(const half8_t*)(xg + kt * 16 + k_grp * 8);
+            half8_t a_reg = (kt < 8) ? mq3_chunk(MQ3_C24(d, kt, k_grp), scv0, zpv0)
+                                     : mq3_chunk(MQ3_C24(d, kt, k_grp), scv1, zpv1);
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b, acc);
         }
     }
-    #undef UNPACK_CHUNK_DQ
+
+    __shared__ float red[MQ3_KS - 1][32][8];
+    if (wv > 0) {
+        #pragma unroll
+        for (int j = 0; j < 8; j++) red[wv - 1][tid][j] = acc[j];
+    }
+    __syncthreads();
+    if (wv != 0) return;
+    #pragma unroll
+    for (int w2 = 0; w2 < MQ3_KS - 1; w2++) {
+        #pragma unroll
+        for (int j = 0; j < 8; j++) acc[j] += red[w2][tid][j];
+    }
 
     // gfx12 wave32 WMMA C-mapping: contiguous rows per lane-group.
     const int out_col = batch_start + m_lane;

@@ -966,6 +966,24 @@ impl ExpertExecutionContract {
                 )
             })
     }
+
+    /// Whether this contract authorizes the owner-routed EP route (the
+    /// Flash-Next exchange): EP parallelism and a nonempty schedule of EP
+    /// owner row gathers only. Every rank runs the whole MoE call against its
+    /// own view of the experts; the gather (or the tile exchange) copies
+    /// non-owned rows from their owner, so no reduction is involved.
+    pub fn is_owner_routed_ep(&self) -> bool {
+        self.parallelism == ContractParallelism::ExpertParallel
+            && !self.collective_rows.is_empty()
+            && self.collective_rows.iter().all(|row| {
+                matches!(
+                    row.hint,
+                    ContractCollectiveHint::OwnerRowGather {
+                        kind: ContractAxis::Ep
+                    }
+                )
+            })
+    }
 }
 
 /// Immutable, fully validated expert table. It owns CPU metadata only.
@@ -1384,7 +1402,7 @@ fn tier_identity_suffix(tier: &ExpertTierIdentity) -> String {
 /// Codec byte of an expert's down dtype: `0` = MQ4, `1` = W3, `3` = E8P-I4,
 /// `255` = unknown.
 fn expert_codec_byte(down: DType) -> u8 {
-    match down {
+    match down.shipped_layout() {
         DType::MQ4G128V2 => 0,
         DType::MQ3I4G128R128 => 1,
         DType::E8PI4G128R128 => 3,
@@ -2265,15 +2283,7 @@ impl<'a> SealedMoeCall<'a> {
         }
         match &self.params {
             SealedParams::Decode(params) => match params.ep_mode {
-                MoeEpMode::None => {
-                    if self.experts.rank_count() != 1 || self.experts.local_rank() != 0 {
-                        return Err(invalid(format!(
-                            "sealed MoE execution requires Single rank (rank={}/{}); refusing before launch",
-                            self.experts.local_rank(),
-                            self.experts.rank_count()
-                        )));
-                    }
-                }
+                MoeEpMode::None => require_single_or_owner_routed(&self.experts)?,
                 MoeEpMode::RootRoutedPartial => {
                     if self.experts.rank_count() == 0
                         || self.experts.local_rank() >= self.experts.rank_count()
@@ -2305,6 +2315,15 @@ impl<'a> SealedMoeCall<'a> {
             SealedParams::Prefill(params) => {
                 if self.experts.rank_count() == 1 && self.experts.local_rank() == 0 {
                     // Single grouped prefill: unchanged.
+                } else if self
+                    .experts
+                    .execution_contract()
+                    .is_some_and(ExpertExecutionContract::is_owner_routed_ep)
+                {
+                    // Owner-routed EP chunk: the same grouped call on every
+                    // rank; non-owned rows come from the exchange (or from
+                    // the immutable peer view).
+                    require_single_or_owner_routed(&self.experts)?;
                 } else if self.experts.execution_contract().is_some() && params.routed_out.is_some()
                 {
                     // Compact EP prefill: the routed contribution targets the
@@ -2432,6 +2451,19 @@ fn validate_route_receipt_pair(
     Ok(())
 }
 
+/// The route stage's offer to run the grouped scatter inside the router launch
+/// (`HIPFIRE_QWEN4_MOE_ROUTE_SCATTER`): the caller has already checked that the scatter stage
+/// would launch the plain grouped scatter right after this route. `launched` is set when the
+/// fused launch ran; the scatter stage then launches nothing.
+pub(super) struct RouteScatterFuse<'a> {
+    pub(super) grouped_rows: usize,
+    pub(super) launched: &'a std::cell::Cell<bool>,
+    /// The owner mask of the wide-verify int8 chain of this call (`HIPFIRE_QWEN4_MOE_GLUE_FOLD`):
+    /// the 9..=64-row wide launch writes its masked tile-id copy too and sets `mask_written`.
+    pub(super) owner_mask: Option<crate::families::moe::MoeDecodeOwnerMask<'a>>,
+    pub(super) mask_written: &'a std::cell::Cell<bool>,
+}
+
 /// Run the family-specific prefill router and mint its invocation-bound
 /// receipt.  Qwen's softmax producer and Cohere's sigmoid producer both use
 /// this boundary; model callers must not launch those operations themselves.
@@ -2439,7 +2471,9 @@ pub(super) fn produce_prefill_route<'a>(
     call: &SealedMoeCall<'a>,
     gpu: &mut Gpu,
     scores: &GpuTensor,
+    topk_indices: &GpuTensor,
     normalize: bool,
+    fuse_scatter: Option<RouteScatterFuse<'_>>,
 ) -> Result<MoeRouteReceipt<'a>, DispatchError> {
     if !matches!(
         call.router,
@@ -2500,7 +2534,7 @@ pub(super) fn produce_prefill_route<'a>(
                 );
                 gpu.moe_router_softmax_top10_masked_f32(
                     scores,
-                    params.topk_indices,
+                    topk_indices,
                     params.topk_weights,
                     params.batch_size,
                     normalize,
@@ -2517,17 +2551,89 @@ pub(super) fn produce_prefill_route<'a>(
                     super::router_observer::RouterScoresAfterRoute::Logits,
                     params.recipe.bf16_round_trip(),
                 );
-                gpu.moe_router_softmax_top10_f32(
-                    scores,
-                    params.topk_indices,
-                    params.topk_weights,
-                    params.batch_size,
-                    normalize,
-                    params.recipe.bf16_round_trip(),
-                    router_layer,
-                    row_base,
-                )
-                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                // `HIPFIRE_QWEN4_MOE_GLUE_FOLD` b: 9..=64 rows run the wide router + scatter (+ owner
+                // mask) launch, 1..=8 rows the one-workgroup `moe_route_scatter_top10_f32`.
+                let wide = fuse_scatter.is_some()
+                    && gpu.moe_glue_fold_route_admitted(
+                        params.batch_size,
+                        params.n_exp,
+                        params.k_top,
+                    );
+                let fused = match fuse_scatter.as_ref() {
+                    Some(fuse) if wide => gpu
+                        .moe_route_scatter_top10_wide_f32(
+                            scores,
+                            topk_indices,
+                            params.topk_weights,
+                            params.batch_size,
+                            normalize,
+                            params.recipe.bf16_round_trip(),
+                            router_layer,
+                            row_base,
+                            params.expert_token_counts,
+                            params.expert_offsets,
+                            params.sorted_slot_index,
+                            params.expert_tile_ids,
+                            params.inverse_perm,
+                            params.n_exp,
+                            params.k_top,
+                            fuse.grouped_rows,
+                            crate::families::moe::MOE_GROUPED_BLOCK_M,
+                            fuse.owner_mask
+                                .as_ref()
+                                .map(|mask| rdna_compute::moe::TileMaskFold {
+                                    tile_ids_owned: mask.tile_ids_owned,
+                                    owner_table: mask.owner_table,
+                                    tiles: fuse
+                                        .grouped_rows
+                                        .div_ceil(rdna_compute::moe::EP_TILE_ROWS),
+                                    rank: mask.rank,
+                                }),
+                        )
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?,
+                    Some(fuse) => gpu
+                        .moe_route_scatter_top10_f32(
+                            scores,
+                            topk_indices,
+                            params.topk_weights,
+                            params.batch_size,
+                            normalize,
+                            params.recipe.bf16_round_trip(),
+                            router_layer,
+                            row_base,
+                            params.expert_token_counts,
+                            params.expert_offsets,
+                            params.sorted_slot_index,
+                            params.expert_tile_ids,
+                            params.inverse_perm,
+                            params.n_exp,
+                            params.k_top,
+                            fuse.grouped_rows,
+                            crate::families::moe::MOE_GROUPED_BLOCK_M,
+                        )
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?,
+                    None => false,
+                };
+                if fused {
+                    if let Some(fuse) = fuse_scatter.as_ref() {
+                        fuse.launched.set(true);
+                        if wide && fuse.owner_mask.is_some() {
+                            fuse.mask_written.set(true);
+                        }
+                    }
+                } else {
+                    gpu.moe_router_softmax_top10_f32(
+                        scores,
+                        topk_indices,
+                        params.topk_weights,
+                        params.batch_size,
+                        normalize,
+                        params.recipe.bf16_round_trip(),
+                        router_layer,
+                        row_base,
+                    )
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                }
             } else {
                 let result = if params.k_top == 10 {
                     #[cfg(feature = "moe-oracle")]
@@ -2550,7 +2656,7 @@ pub(super) fn produce_prefill_route<'a>(
                         .map_err(|e| DispatchError::Hip(e.to_string()))?;
                     gpu.moe_topk_renorm_top10_batched(
                         scores,
-                        params.topk_indices,
+                        topk_indices,
                         params.topk_weights,
                         params.n_exp,
                         normalize,
@@ -2585,7 +2691,7 @@ pub(super) fn produce_prefill_route<'a>(
                     ) {
                         gpu.moe_router_softmax_topk_k8_multirow_prefill(
                             scores,
-                            params.topk_indices,
+                            topk_indices,
                             params.topk_weights,
                             params.n_exp,
                             normalize,
@@ -2594,7 +2700,7 @@ pub(super) fn produce_prefill_route<'a>(
                     } else {
                         gpu.moe_router_softmax_topk_k8_prefill(
                             scores,
-                            params.topk_indices,
+                            topk_indices,
                             params.topk_weights,
                             params.n_exp,
                             normalize,
@@ -2613,7 +2719,7 @@ pub(super) fn produce_prefill_route<'a>(
                         .map_err(|e| DispatchError::Hip(e.to_string()))?;
                     gpu.moe_topk_renorm_k8_batched(
                         scores,
-                        params.topk_indices,
+                        topk_indices,
                         params.topk_weights,
                         params.n_exp,
                         normalize,
@@ -2641,7 +2747,7 @@ pub(super) fn produce_prefill_route<'a>(
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
                 gpu.moe_topk_renorm_k8_batched(
                     scores,
-                    params.topk_indices,
+                    topk_indices,
                     params.topk_weights,
                     params.n_exp,
                     normalize,
@@ -3027,9 +3133,18 @@ fn prepare_decode<'a>(
         }
     }
     match params.ep_mode {
-        // Single (classic or deferred-combine experiment): exactly one rank,
-        // rank 0, no contract needed.
-        MoeEpMode::None => require_single_binding(experts)?,
+        // Single (classic or deferred-combine experiment), or an owner-routed
+        // EP rank whose row gather completes the non-owned rows.
+        MoeEpMode::None => {
+            require_single_or_owner_routed(experts)?;
+            // A rank's compact view names the zero dummy for every expert it
+            // does not own; only the row gather supplies those rows.
+            if experts.rank_count() > 1 && params.ep_row_gather.is_none() {
+                return Err(invalid(
+                    "owner-routed EP decode requires the EP row gather; refusing before launch",
+                ));
+            }
+        }
         // Root-routed EP: plan-bound compact owners under the root-routed
         // execution contract, decode-eligible on this GPU.
         MoeEpMode::RootRoutedPartial => {
@@ -3201,7 +3316,19 @@ fn prepare_prefill<'a>(
     router: MoeRouterInput,
 ) -> Result<(MoePrefillParams<'a>, MoeRouterInput), DispatchError> {
     require_context_device(ctx, experts)?;
-    require_single_binding(experts)?;
+    require_single_or_owner_routed(experts)?;
+    if let Some(tile) = params.ep_tile_exchange {
+        let (rank, _, n_experts) = tile.exchange.owners();
+        if rank != experts.local_rank() || n_experts != experts.n_experts() {
+            return Err(invalid(format!(
+                "EP tile exchange of rank {rank} over {n_experts} experts does not match the \
+                 binding (rank {}/{} over {} experts); refusing before launch",
+                experts.local_rank(),
+                experts.rank_count(),
+                experts.n_experts()
+            )));
+        }
+    }
     let expected = match params.recipe {
         crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. } => match params.prelude.route {
             PrefillRouteMode::AdoptRoot { .. } => MoeRouterInput::PrecomputedSoftmaxTopK,
@@ -3349,12 +3476,42 @@ fn require_context_device(
     Ok(())
 }
 
-fn require_single_binding(experts: &BoundMoeExperts<'_>) -> Result<(), DispatchError> {
-    if experts.rank_count() != 1 || experts.local_rank() != 0 {
+/// Admit a Single binding (rank 0 of 1) or an owner-routed EP rank: a binding
+/// adapted from a sealed plan whose contract is the owner-routed EP route,
+/// whose rank lies inside the plan's mesh and owns at least one expert.
+fn require_single_or_owner_routed(experts: &BoundMoeExperts<'_>) -> Result<(), DispatchError> {
+    if experts.rank_count() == 1 && experts.local_rank() == 0 {
+        return Ok(());
+    }
+    let Some(contract) = experts.execution_contract() else {
         return Err(invalid(format!(
-            "sealed MoE only admits Single rank (rank={}/{}); refusing before launch",
+            "sealed MoE rank {}/{} has no plan-bound execution contract; refusing before launch",
             experts.local_rank(),
             experts.rank_count()
+        )));
+    };
+    if !contract.is_owner_routed_ep() {
+        return Err(invalid(format!(
+            "sealed MoE rank {}/{} contract '{}' is not the owner-routed EP route; refusing before launch",
+            experts.local_rank(),
+            experts.rank_count(),
+            contract.execution()
+        )));
+    }
+    if experts.local_rank() >= experts.rank_count()
+        || contract.physical_devices().len() != experts.rank_count()
+    {
+        return Err(invalid(format!(
+            "owner-routed EP rank {}/{} is outside the sealed {}-rank mesh; refusing before launch",
+            experts.local_rank(),
+            experts.rank_count(),
+            contract.physical_devices().len()
+        )));
+    }
+    if experts.local_expert_ids().is_empty() {
+        return Err(invalid(format!(
+            "owner-routed EP rank {} owns no expert; refusing before launch",
+            experts.local_rank()
         )));
     }
     Ok(())
@@ -4124,7 +4281,7 @@ fn validate_expert_shape_and_dtype(
         let resources = expert.resources();
         let expected_gate_up = per_gate_up.map_or(representative_gate_up, |values| values[index]);
         let gate_up_dtype = if let Some(gate_up) = resources.gate_up() {
-            if gate_up.dtype() != expected_gate_up {
+            if gate_up.dtype().shipped_layout() != expected_gate_up.shipped_layout() {
                 return Err(invalid(format!(
                     "expert {index} gate/up source '{}' dtype differs from the declared source metadata",
                     gate_up.source_name()
@@ -4159,7 +4316,7 @@ fn validate_expert_shape_and_dtype(
                 )));
             }
             for (role, source) in [("gate", gate), ("up", up)] {
-                if source.dtype() != expected_gate_up {
+                if source.dtype().shipped_layout() != expected_gate_up.shipped_layout() {
                     return Err(invalid(format!(
                         "expert {index} separate {role} source '{}' dtype differs from the declared source metadata",
                         source.source_name()
@@ -4181,7 +4338,7 @@ fn validate_expert_shape_and_dtype(
             }
             gate.dtype()
         };
-        if gate_up_dtype != expected_gate_up {
+        if gate_up_dtype.shipped_layout() != expected_gate_up.shipped_layout() {
             return Err(invalid(format!(
                 "expert {index} gate/up dtype differs from the declared source metadata"
             )));
@@ -4194,7 +4351,7 @@ fn validate_expert_shape_and_dtype(
 
         let down = resources.down();
         let expected_down = per_down.map_or(representative_down, |values| values[index]);
-        if down.dtype() != expected_down {
+        if down.dtype().shipped_layout() != expected_down.shipped_layout() {
             return Err(invalid(format!(
                 "expert {index} down dtype differs from the declared source metadata"
             )));
@@ -4590,7 +4747,12 @@ fn expected_live_weight_geometry(
     if gate_up {
         if let Some(resource) = resources.gate_up() {
             let (rows, cols) = resource_dims(resource, index, role)?;
-            Ok((rows, cols, resource.dtype(), resource.encoded_bytes()))
+            Ok((
+                rows,
+                cols,
+                resource.dtype().shipped_layout(),
+                resource.encoded_bytes(),
+            ))
         } else {
             let gate = resources.gate().ok_or_else(|| {
                 invalid(format!("expert {index} separate resources have no gate"))
@@ -4614,12 +4776,17 @@ fn expected_live_weight_geometry(
                 .ok_or_else(|| {
                     invalid(format!("expert {index} separate gate/up bytes overflow"))
                 })?;
-            Ok((rows, gate_cols, gate.dtype(), bytes))
+            Ok((rows, gate_cols, gate.dtype().shipped_layout(), bytes))
         }
     } else {
         let resource = resources.down();
         let (rows, cols) = resource_dims(resource, index, role)?;
-        Ok((rows, cols, resource.dtype(), resource.encoded_bytes()))
+        Ok((
+            rows,
+            cols,
+            resource.dtype().shipped_layout(),
+            resource.encoded_bytes(),
+        ))
     }
 }
 
@@ -6978,6 +7145,58 @@ mod tests {
         .unwrap()
     }
 
+    /// An owner-routed rank (the Flash-Next EP route) runs the None-mode
+    /// sealed call; a rank without that contract, outside the sealed mesh or
+    /// owning no expert is refused before launch.
+    #[test]
+    fn owner_routed_ep_binding_admits_only_owning_ranks_of_its_contract() {
+        let dtype = DType::MQ4G256;
+        let admit = |n: usize, ranks: usize, rank: usize, devices: usize, hint| {
+            let table = ep_table(n, ranks, dtype);
+            let contract = ExpertExecutionContract::new(
+                "qwen4",
+                Some(0),
+                "fp",
+                7,
+                (0..devices as i32).collect(),
+                ContractParallelism::ExpertParallel,
+                ContractAssignment::Stride,
+                table.experts().iter().map(|r| r.owner_rank()).collect(),
+                table.experts().iter().map(|r| r.local_slot()).collect(),
+                "owner-routed",
+                vec![ContractCollectiveRow {
+                    name: "moe".into(),
+                    layer: 0,
+                    hint,
+                }],
+            )
+            .unwrap();
+            let table = table.with_execution_contract(contract).unwrap();
+            let mut cache = table.prepare_binding(rank, ranks, 0).unwrap();
+            let fixture = live_fixture(&table, 0x50_0000);
+            bind_fixture(&table, &mut cache, &fixture);
+            require_single_or_owner_routed(&BoundMoeExperts::from_cache(&table, &cache).unwrap())
+                .map_err(|error| format!("{error:?}"))
+        };
+        let gather = ContractCollectiveHint::OwnerRowGather {
+            kind: ContractAxis::Ep,
+        };
+        for rank in 0..4 {
+            admit(8, 4, rank, 4, gather).unwrap();
+        }
+        let reduce = ContractCollectiveHint::AllReduce {
+            kind: ContractAxis::Ep,
+        };
+        let error = admit(8, 2, 1, 2, reduce).unwrap_err();
+        assert!(error.contains("not the owner-routed EP route"), "{error}");
+        let error = admit(8, 2, 1, 3, gather).unwrap_err();
+        assert!(error.contains("outside the sealed"), "{error}");
+        // Three experts over four ranks: rank 3 owns nothing.
+        admit(3, 4, 2, 4, gather).unwrap();
+        let error = admit(3, 4, 3, 4, gather).unwrap_err();
+        assert!(error.contains("owns no expert"), "{error}");
+    }
+
     /// `RoutedExpertWeights` mirroring one rank's compact live binding: owned
     /// globals resolve to the fixture's local tensor identities, non-owned
     /// globals to the shared zero dummies — the same pointers the compact
@@ -7855,6 +8074,91 @@ mod tests {
         assert!(params.expert_iu4.is_none());
     }
 
+    /// The shared expert is validated against its OWN declared width. A trunk shard rank holds
+    /// it as a K-slice (half of the fixture's 4 here; 384 / 256 of 640 in the model): the
+    /// weights, the declared width and both scratch views must agree, and a declared width left
+    /// at the routed expert's (the two coincide at 640 on one card) is refused, decode and
+    /// prefill alike. The equal-width cases are the pre-shard behaviour.
+    #[test]
+    fn shared_validation_pins_the_declared_width_to_the_sliced_weights() {
+        use crate::families::moe::{MoeSharedDecode, MoeSharedPrefill, MoeSharedWeights};
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xE8_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+
+        let s = prefill_scratch(0xE9_0000);
+        let base = ep_prefill_params(
+            &s,
+            &fixture.routed,
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+        );
+        let prefill = |declared: usize, weights_m: usize| {
+            let params = MoePrefillParams {
+                prelude: crate::families::moe::MoePrefillPrelude {
+                    shared: Some(MoeSharedPrefill {
+                        weights: MoeSharedWeights {
+                            selector: shaped_weight(&s.y_down_grouped, DType::MQ4G256, 1, 4),
+                            gate: shaped_weight(&s.gate_batch, DType::MQ4G256, weights_m, 4),
+                            up: shaped_weight(&s.up_batch, DType::MQ4G256, weights_m, 4),
+                            down: shaped_weight(&s.down_expanded, DType::MQ4G256, 4, weights_m),
+                        },
+                        intermediate: declared,
+                        scalar: &s.shared_scalar,
+                        gate_out: &s.shared_gate,
+                        up_out: &s.shared_up,
+                        rotated: &s.shared_rotated,
+                    }),
+                    ..base.prelude
+                },
+                ..base
+            };
+            validate_shared_prefill(&params, 4).is_ok()
+        };
+        assert!(prefill(4, 4), "the one-card width");
+        assert!(prefill(2, 2), "a K-slice declared as sliced");
+        assert!(!prefill(4, 2), "a slice declared at the routed width");
+        assert!(!prefill(2, 4), "whole weights declared as a slice");
+
+        let d = decode_scratch(0xEA_8000);
+        let base = ep_decode_params(
+            &d,
+            &fixture.routed,
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            0,
+            8,
+            4,
+            crate::families::moe::MoeEpMode::None,
+            None,
+            false,
+        );
+        let decode = |declared: usize, weights_m: usize| {
+            let params = MoeParams {
+                shared: Some(MoeSharedDecode {
+                    weights: MoeSharedWeights {
+                        selector: shaped_weight(&d.backing, DType::MQ4G256, 1, 4),
+                        gate: shaped_weight(&d.backing, DType::MQ4G256, weights_m, 4),
+                        up: shaped_weight(&d.backing, DType::MQ4G256, weights_m, 4),
+                        down: shaped_weight(&d.backing, DType::MQ4G256, 4, weights_m),
+                    },
+                    intermediate: declared,
+                    scalar: &d.scalar_buf,
+                    gate_out: &d.gate_buf,
+                    up_out: &d.up_buf,
+                }),
+                ..base
+            };
+            validate_shared_decode(&params, 4).is_ok()
+        };
+        assert!(decode(4, 4), "the one-card width");
+        assert!(decode(2, 2), "a K-slice declared as sliced");
+        assert!(!decode(4, 2), "a slice declared at the routed width");
+        assert!(!decode(2, 4), "whole weights declared as a slice");
+    }
+
     fn ep_prefill_table() -> (ExpertTable, ExpertBindingCache, CompactFixture) {
         let dtype = DType::MQ4G256;
         let table = ep_table(4, 2, dtype);
@@ -8132,6 +8436,7 @@ mod tests {
             cpu_deferred_experts: false,
             cpu_split: false,
             cpwait: false,
+            norm_fold: false,
         })
     }
 
@@ -8755,6 +9060,36 @@ mod tests {
         }
     }
 
+    /// `HIPFIRE_QWEN4_D2_WINDOW_ROWS=N`: the executor is built for N rows
+    /// (capacity N). The seal's qualification and the lowering's structural
+    /// width check must agree for every window against that capacity: a window
+    /// the seal qualifies (`cpu_wide_window_qualified_with`) must lower, and
+    /// lowering must read the allocated capacity (`0` = no executor still
+    /// refuses everything above the legacy 4). Regression: lowering once
+    /// checked against "no executor" and refused every 5..8-row window on the
+    /// first MTP verify step of a card run (wiring only, not numeric proof).
+    #[test]
+    fn d2_window_n_lowers_exactly_the_windows_the_seal_qualifies() {
+        use crate::families::moe::{cpu_wide_window_qualified_with, CpuWideVerifyScope};
+        let default = CpuWideVerifyScope::default_scope();
+        for window in 4..=8usize {
+            for rows in 1..=12usize {
+                let qualified =
+                    cpu_wide_window_qualified_with(true, rows, rows, default, window, window);
+                let lowers = moe_program::cpu_split_prefill_conflict_width(rows, window).is_none();
+                assert_eq!(qualified, lowers, "window={window} rows={rows}");
+                assert_eq!(qualified, rows <= window, "window={window} rows={rows}");
+            }
+            // No executor (capacity 0): only the legacy 4 rows lower.
+            for rows in 1..=8usize {
+                assert_eq!(
+                    moe_program::cpu_split_prefill_conflict_width(rows, 0).is_none(),
+                    rows <= 4
+                );
+            }
+        }
+    }
+
     #[test]
     fn split_cap_matches_the_narrow_verify_window_and_wide_prefill_is_ordinary() {
         assert_eq!(crate::cpu_split::CPU_SPLIT_MAX_ROWS, 4);
@@ -9213,6 +9548,145 @@ mod tests {
         assert!(format!("{error:?}").contains("row gather"), "{error:?}");
     }
 
+    /// A balanced-trunk gather: device-assigned ownership plus a fixed reduction partition
+    /// `(rank, ranks)` on exactly one layer (the hook decides per call and layer).
+    struct PartitionGather {
+        layer: u16,
+        rank: usize,
+        ranks: usize,
+    }
+
+    impl MoeRowGather for PartitionGather {
+        fn gather_rows(
+            &self,
+            _gpu: &mut Gpu,
+            _layer_idx: u16,
+            _slots: usize,
+            _down_expanded: &GpuTensor,
+            _topk_indices: &GpuTensor,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn assigns_owners(&self, layer_idx: u16) -> bool {
+            layer_idx == self.layer
+        }
+
+        fn reduction_partition(&self, layer_idx: u16) -> Option<(usize, usize)> {
+            (layer_idx == self.layer).then_some((self.rank, self.ranks))
+        }
+    }
+
+    /// The partition only picks the combine leaf: the lowered stage list of a partitioned
+    /// balanced call is the balanced call's, on both protocols, symmetric declaration included.
+    #[test]
+    fn a_reduction_partition_never_changes_the_lowered_stages() {
+        let grouped = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        let symmetric = Some(MoeRouteCapability::Qt44Qt53GroupedSymmetric);
+        // Layer 0 is the layer both fixtures run.
+        let partitioned = PartitionGather {
+            layer: 0,
+            rank: 1,
+            ranks: 2,
+        };
+        let balanced = decode_stages(Some(&OwnerGather), grouped).unwrap();
+        assert_eq!(
+            decode_stages(Some(&partitioned), grouped).unwrap(),
+            balanced
+        );
+        let balanced = prefill_stages(Some(&OwnerGather), grouped, false).unwrap();
+        assert_eq!(
+            prefill_stages(Some(&partitioned), grouped, false).unwrap(),
+            balanced
+        );
+        assert_eq!(
+            prefill_stages(Some(&partitioned), symmetric, false).unwrap(),
+            balanced
+        );
+        // Off the grouped route a gather (partitioned or not) still refuses at lowering.
+        let error = decode_stages(Some(&partitioned), None).unwrap_err();
+        assert!(format!("{error:?}").contains("row gather"), "{error:?}");
+        let error = prefill_stages(Some(&partitioned), None, false).unwrap_err();
+        assert!(format!("{error:?}").contains("row gather"), "{error:?}");
+    }
+
+    /// The combine consults the hook with the SAME layer index the row gather receives: the
+    /// decode protocol's `layer_idx`, the prefill protocol's `ep_layer_idx`. A layer the hook
+    /// does not partition (MTP head, static layer) and a call without a hook read `None`.
+    #[test]
+    fn the_combine_reads_the_partition_of_the_gather_layer_index() {
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xE8_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        static HOOK: PartitionGather = PartitionGather {
+            layer: 7,
+            rank: 1,
+            ranks: 2,
+        };
+        let decode = decode_scratch(0xE9_0000);
+        let decode_params = |layer_idx: u16, gather: Option<&'static dyn MoeRowGather>| MoeParams {
+            ep_row_gather: gather,
+            ..ep_decode_params(
+                &decode,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                layer_idx,
+                8,
+                4,
+                MoeEpMode::None,
+                None,
+                false,
+            )
+        };
+        let hook_ref: &'static dyn MoeRowGather = &HOOK;
+        assert_eq!(
+            super::super::decode_reduction_partition(&decode_params(7, Some(hook_ref))),
+            Some((1, 2))
+        );
+        assert_eq!(
+            super::super::decode_reduction_partition(&decode_params(6, Some(hook_ref))),
+            None
+        );
+        assert_eq!(
+            super::super::decode_reduction_partition(&decode_params(7, None)),
+            None
+        );
+
+        let prefill = prefill_scratch(0xEC_0000);
+        let prefill_params =
+            |ep_layer_idx: u16, gather: Option<&'static dyn MoeRowGather>| MoePrefillParams {
+                ep_row_gather: gather,
+                ep_layer_idx,
+                ..ep_prefill_params(
+                    &prefill,
+                    &fixture.routed,
+                    &fixture.gate_up_ptrs,
+                    &fixture.down_ptrs,
+                    None,
+                )
+            };
+        assert_eq!(
+            super::super::qt44_qt53_prefill::reduction_partition(&prefill_params(
+                7,
+                Some(hook_ref)
+            )),
+            Some((1, 2))
+        );
+        assert_eq!(
+            super::super::qt44_qt53_prefill::reduction_partition(&prefill_params(
+                6,
+                Some(hook_ref)
+            )),
+            None
+        );
+        assert_eq!(
+            super::super::qt44_qt53_prefill::reduction_partition(&prefill_params(7, None)),
+            None
+        );
+    }
+
     /// A tile exchange that never runs (lowering tests only).
     struct NoopTileExchange;
 
@@ -9225,7 +9699,7 @@ mod tests {
             unreachable!("lowering does not run stages")
         }
 
-        fn host_barrier(&self) -> Result<(), String> {
+        fn host_barrier(&self, _what: u8, _epoch: u32) -> Result<(), String> {
             unreachable!("lowering does not run stages")
         }
 
@@ -9368,6 +9842,62 @@ mod tests {
                 format!("{error:?}").contains("tile exchange"),
                 "{route:?}: {error:?}"
             );
+        }
+    }
+
+    /// The trunk shard's partial mask: a mask-only exchange lowers the `TileMask` right after
+    /// the scatter and NO `TileExchange` (the all-reduce completes the FFN), on both routes.
+    struct MaskOnlyTileExchange;
+
+    impl crate::families::moe::MoeTileExchange for MaskOnlyTileExchange {
+        fn owners(&self) -> (usize, &GpuTensor, usize) {
+            unreachable!("lowering does not run stages")
+        }
+
+        fn mask_only(&self) -> bool {
+            true
+        }
+
+        fn before_down(&self, _gpu: &mut Gpu) -> Result<(), String> {
+            unreachable!("a mask-only exchange never waits on a peer")
+        }
+
+        fn host_barrier(&self, _what: u8, _epoch: u32) -> Result<(), String> {
+            unreachable!("lowering does not run stages")
+        }
+
+        fn exchange(
+            &self,
+            _gpu: &mut Gpu,
+            _layer_idx: u16,
+            _tile_ids: &GpuTensor,
+            _y_down_grouped: &GpuTensor,
+            _tiles: usize,
+        ) -> Result<(), String> {
+            unreachable!("a mask-only exchange never pulls")
+        }
+    }
+
+    #[test]
+    fn mask_only_exchange_lowers_the_mask_and_no_exchange() {
+        for route in [
+            MoeRouteCapability::Qt44Qt53Grouped,
+            MoeRouteCapability::Qt44Qt53GroupedSymmetric,
+        ] {
+            let route = Some(route);
+            let without = tile_prefill_stages(None, None, route, false).unwrap();
+            let masked =
+                tile_prefill_stages(Some(&MaskOnlyTileExchange), None, route, false).unwrap();
+            assert!(!masked.contains(&MoeStage::TileExchange), "{masked:?}");
+            let scatter = masked
+                .iter()
+                .position(|s| *s == MoeStage::Scatter)
+                .expect("scatter");
+            assert_eq!(masked[scatter + 1], MoeStage::TileMask, "{masked:?}");
+            assert_eq!(masked[scatter + 2], MoeStage::GateUp, "{masked:?}");
+            let mut stripped = masked.clone();
+            stripped.retain(|s| *s != MoeStage::TileMask);
+            assert_eq!(stripped, without, "only the mask stage differs");
         }
     }
 }

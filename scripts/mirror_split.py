@@ -120,6 +120,7 @@ PEACEMAKER_KERNELS = [
     "qwen4_moe_iu4_sym_w3_pm_gfx1201",
     "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1_control",
     "gemm_mq4g256v2_residual_iu4_pm_gfx1100",
+    "gemm_mq6g256v2_residual_pm_gfx1100",
     "gemm_mq4g256v2_residual_iu4_pm_v2b_gfx1151",
     "gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151",
     "mq4_verify_pm_gfx1201",
@@ -134,6 +135,7 @@ PEACEMAKER_KERNELS = [
     "qsa_select_bf16_pm_gfx1151",
     "qwen4_lane_rows_pm_gfx1151",
     "qwen4_ep_owner_assign_pm_gfx1201",
+    "qwen4_ep_owner_assign_pinned_pm_gfx1201",
     "ep_tile_mask_pm_gfx1100",
     "ep_tile_mask_pm_gfx1201",
     "ep_gather_grouped_rows_by_tile_owner_pm_gfx1100",
@@ -150,6 +152,16 @@ PEACEMAKER_KERNELS = [
     "spec_sampling_rows_parallel_pm_gfx1201",
     "qwen4_moe_iu4_sym_w3_pm_gfx1151",
     "qwen4_moe_iu4_sym_w3_nt4_pm_gfx1151",
+    "gemv_mq2_xbatch_pm_gfx1201",
+    "qwen4_moe_gu_few_pm_gfx1201",
+    "qwen4_moe_gu_c8_pm_gfx1201",
+    "qwen4_moe_down_c8_pm_gfx1201",
+    "npu_trunk_pack_pm_gfx1151",
+    "gated_delta_chunk_pm_gfx1151",
+    "gated_delta_chunk_arena_pm_gfx1151",
+    "gated_delta_chunk_q8_pm_gfx1151",
+    "gated_delta_chunk_q8_arena_pm_gfx1151",
+    "gated_delta_chunk_pm_gfx1100",
 ]
 
 MIRRORS: dict[str, dict] = {

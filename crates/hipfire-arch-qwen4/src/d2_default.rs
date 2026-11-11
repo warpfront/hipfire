@@ -40,7 +40,7 @@
 //! 6. `developer.qwen4_d2_default = true` (`HIPFIRE_QWEN4_D2_DEFAULT=1`): on,
 //!    skipping only the cost comparison (lab and receipt runs).
 //! 7. The decode-cost comparison below. A failed or invalid measurement, or
-//!    one whose *pessimistic* comparison does not clear the margin, is off.
+//!    one whose robust comparison does not clear the margin, is off.
 //!
 //! # Decode-cost comparison
 //!
@@ -53,19 +53,36 @@
 //! D2 is selected only when  D2 <= 85% of PCIe  (at least 15% faster).
 //! ```
 //!
-//! The comparison is **pessimistic about D2 and optimistic about PCIe**, so a
-//! disturbed host cannot flip it toward D2 and noise cannot hide a clear win:
-//! `D2` is the **slowest** of the [`PROBE_SAMPLES`] CPU arm samples plus the
-//! handoff, `PCIe` is the **fastest** link sample's rate plus the **minimum**
-//! launch-floor sample. D2 is chosen whenever that worst-case D2 still
-//! clears 85% of that best-case PCIe, **however large the sample spread**
-//! (an arm disturbed 3× on a 7900 XTX is still a clear win: 0.3 ms × 3 +
-//! 0.806 ms against 26 MB at 7 GB/s). Otherwise the load stays on PCIe: a
-//! tight run that loses, a wide run whose worst case does not clear, an
-//! inconclusive noisy run all end on PCIe. The medians and the max/min
-//! spread of each engine are logged for information only; there is no spread
-//! threshold. A zero or non-positive sample, byte count or floor is no
-//! measurement and fails closed to PCIe.
+//! The comparison reads a **robust statistic of the CPU arm** and is
+//! **optimistic about PCIe**: `D2` is the **median** of the CPU arm samples
+//! (the upper median: `sorted[len / 2]`, so an even or half-slow set is never
+//! read as fast) plus the handoff, `PCIe` is the **fastest** link sample's rate
+//! plus the **minimum** launch-floor sample. A single preempted batch cannot
+//! decide the load: the probe that read the slowest of five samples refused D2
+//! on a 7,316 µs outlier among ~410 µs samples (worst-case D2 8,122 µs against
+//! PCIe 3,691 µs, a ~5 tok/s load), where the median D2 was 1,216 µs. The
+//! fix is a statistic, not a looser margin:
+//!
+//! * The CPU arm is sampled in a pass of [`PROBE_SAMPLES`] batches. When the
+//!   pass is **dispersed** (its slowest sample is more than
+//!   [`CPU_OUTLIER_PERCENT`] = 200% of its median) it is re-probed **once** and
+//!   the two passes are pooled (10 samples, the upper median is the 6th
+//!   smallest, so six of ten must be fast to read fast). A pass that is not
+//!   dispersed is never re-probed and the re-probe never repeats.
+//! * The **margin is unchanged**: D2 is chosen only when `D2 <= 85%` of the
+//!   best-case PCIe, so a genuinely slow CPU (every sample slow, or a
+//!   majority of them) still ends on PCIe. Only a minority of slow samples
+//!   (fewer than three of five, fewer than five of ten once pooled) is
+//!   ignored.
+//! * The link keeps the optimistic fastest sample: a disturbed link sample can
+//!   only be slow, and an implausibly fast one keeps PCIe (a lost D2 win, never
+//!   a wrong D2).
+//!
+//! The load log reports the statistic used (`median CPU arm of N samples`),
+//! whether the first pass was re-probed, the slowest sample, the single-slowest
+//! D2 it would have been, and the spreads (max/min and max/median) of each
+//! engine. There is no spread threshold. A zero or non-positive sample, byte
+//! count or floor is no measurement and fails closed to PCIe.
 //!
 //! * **`real_cpu_arm`** is the production arm itself:
 //!   `hipfire_dispatch::cpu_exec::moe_cpu_host_slot_outputs` (gate/up GEMV,
@@ -117,9 +134,10 @@
 //! * **PLE prewarm**: the probe does not wait for or pause the PLE sidecar
 //!   page-cache prewarm (`ple_prewarm`; request-serving guards are acquired
 //!   after load, not around this probe). A prewarm running during the probe
-//!   can only slow the CPU arm
-//!   and add noise, which the pessimistic rule turns into PCIe (a lost D2 win
-//!   on a contended load, never a wrong D2).
+//!   slows and adds noise to the CPU arm: a minority of slow samples is
+//!   absorbed by the median (and the dispersed-pass re-probe), a sustained
+//!   slowdown resolves to PCIe (a lost D2 win on a contended load, never a
+//!   wrong D2).
 //!
 //! No arch or card-name predicate exists anywhere in the comparison: a link
 //! the GPU reads at 4–7 GB/s (a 7900 XTX) loses to a 0.4–0.6 ms CPU arm plus
@@ -152,9 +170,15 @@ use crate::config::Qwen4Config;
 use crate::gpu_forward::{ColdLayerRefs, ColdLayerSource};
 use crate::weights::Qwen4Weights;
 
-/// Timed samples of each engine (and the launch-floor median). Odd, so the
-/// median is a sample.
+/// Timed samples of each engine per probe pass. Odd, so the median is a
+/// sample.
 pub const PROBE_SAMPLES: usize = 5;
+
+/// A CPU arm pass is *dispersed* (its slowest sample is an outlier of the
+/// kind that decided a wrong PCIe load: 7,316 µs against a 410 µs median) when
+/// `slowest > median * CPU_OUTLIER_PERCENT / 100`, strictly. A dispersed
+/// first pass is re-probed once and the two passes are pooled.
+pub const CPU_OUTLIER_PERCENT: u64 = 200;
 
 /// Untimed warm batches of cold experts run before the timed ones.
 pub const PROBE_WARM_BATCHES: usize = 1;
@@ -194,7 +218,10 @@ pub const JOIN_RESIDUAL_NS: u64 = 7_400;
 pub const CURRENT_COPY_TRANSPORT_HANDOFF_NS: u64 =
     READINESS_WAIT_NS + POST_CPU_RETURN_NS + RESULT_COPY_NS + RESUME_GAP_NS + JOIN_RESIDUAL_NS;
 
-/// Min / median / max of one set of [`PROBE_SAMPLES`] nanosecond samples.
+/// Min / median / max of one set of nanosecond samples. The median is the
+/// *upper* median (`sorted[len / 2]`: the middle sample of an odd count, the
+/// slower of the two middle samples of an even count), so a half-slow set is
+/// never read as fast.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SampleStats {
     pub min_ns: u64,
@@ -203,23 +230,36 @@ pub struct SampleStats {
 }
 
 impl SampleStats {
-    /// `None` when any sample is zero: an unusable timing is no timing.
-    pub fn of(samples: &[u64; PROBE_SAMPLES]) -> Option<Self> {
-        if samples.contains(&0) {
+    /// `None` when there is no sample or any sample is zero: an unusable
+    /// timing is no timing.
+    pub fn of(samples: &[u64]) -> Option<Self> {
+        if samples.is_empty() || samples.contains(&0) {
             return None;
         }
-        let mut sorted = *samples;
+        let mut sorted = samples.to_vec();
         sorted.sort_unstable();
         Some(Self {
             min_ns: sorted[0],
-            median_ns: sorted[PROBE_SAMPLES / 2],
-            max_ns: sorted[PROBE_SAMPLES - 1],
+            median_ns: sorted[sorted.len() / 2],
+            max_ns: sorted[sorted.len() - 1],
         })
     }
 
     /// `max / min`, for the log.
     pub fn spread(self) -> f64 {
         self.max_ns as f64 / self.min_ns as f64
+    }
+
+    /// `max / median`: how far the slowest sample sits above the statistic
+    /// the decision reads, for the log.
+    pub fn tail(self) -> f64 {
+        self.max_ns as f64 / self.median_ns as f64
+    }
+
+    /// The slowest sample is an outlier: strictly more than
+    /// [`CPU_OUTLIER_PERCENT`] of the median.
+    pub fn dispersed(self) -> bool {
+        u128::from(self.max_ns) * 100 > u128::from(self.median_ns) * u128::from(CPU_OUTLIER_PERCENT)
     }
 }
 
@@ -257,17 +297,29 @@ impl Unusable {
     }
 }
 
+/// The CPU arm samples of one re-probe pass (see [`DecodeMeasurement::cpu_retry`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CpuRetry {
+    /// Wall ns of each timed batch, as [`DecodeMeasurement::cpu_ns`].
+    pub cpu_ns: [u64; PROBE_SAMPLES],
+    /// GPU read bytes of each timed batch, as [`DecodeMeasurement::batch_bytes`].
+    pub batch_bytes: [u64; PROBE_SAMPLES],
+}
+
 /// The raw live samples of one decode-cost probe.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DecodeMeasurement {
     /// Wall ns of the production CPU arm per timed batch of `top_k` distinct
-    /// cold experts.
+    /// cold experts (first pass).
     pub cpu_ns: [u64; PROBE_SAMPLES],
     /// GPU read bytes (not CPU span lengths) of each timed batch, the `B` of
     /// that sample: what PCIe is priced on, and what that sample's CPU time
     /// is normalized against. Equal across samples for one codec; they differ
     /// when the host layers mix codecs, so every sample carries its own count.
     pub batch_bytes: [u64; PROBE_SAMPLES],
+    /// A second CPU arm pass, taken once when the first was dispersed
+    /// ([`SampleStats::dispersed`]); the decision pools both passes.
+    pub cpu_retry: Option<CpuRetry>,
     /// Wall ns of each zero-copy read of [`Self::link_sample_bytes`].
     pub link_ns: [u64; PROBE_SAMPLES],
     /// Wall ns of each launch + synchronize of a one-element read.
@@ -284,17 +336,26 @@ pub struct DecodeCosts {
     /// The decision's PCIe: best case, `B / fastest link sample rate + the
     /// minimum launch-floor sample`.
     pub pcie_ns: u64,
-    /// The decision's D2: worst case, `slowest CPU arm sample +
+    /// The decision's D2: `median CPU arm sample (pooled over every pass) +
     /// CURRENT_COPY_TRANSPORT_HANDOFF_NS`.
     pub d2_ns: u64,
-    /// The same two costs from the medians (information only).
+    /// Information only: the PCIe cost from the medians, and the D2 cost of the
+    /// single slowest CPU arm sample (what the decision used before it read
+    /// the median).
     pub pcie_median_ns: u64,
-    pub d2_median_ns: u64,
-    /// Median and slowest CPU arm ns, normalized to [`Self::layer_bytes`].
+    pub d2_worst_ns: u64,
+    /// Median (the decision's statistic) and slowest CPU arm ns, normalized to
+    /// [`Self::layer_bytes`].
     pub cpu_arm_ns: u64,
     pub cpu_slowest_ns: u64,
-    /// `max / min` of the CPU samples (information only).
+    /// `max / min` and `max / median` of the pooled CPU samples (information
+    /// only).
     pub cpu_spread: f64,
+    pub cpu_tail: f64,
+    /// CPU samples the median is over, and whether a dispersed first pass
+    /// was re-probed.
+    pub cpu_samples: usize,
+    pub cpu_reprobed: bool,
     /// Median and fastest link sample ns.
     pub link_sample_ns: u64,
     pub link_fastest_ns: u64,
@@ -312,8 +373,9 @@ pub struct DecodeCosts {
 }
 
 impl DecodeCosts {
-    /// The worst-case D2 clears the best-case PCIe by at least 15%:
-    /// `d2 <= 85% of pcie`, exact integer compare (equality selects D2).
+    /// The robust D2 (median CPU arm sample + handoff) clears the best-case
+    /// PCIe by at least 15%: `d2 <= 85% of pcie`, exact integer compare
+    /// (equality selects D2).
     pub fn favors_d2(self) -> bool {
         u128::from(self.d2_ns) * 100 <= u128::from(self.pcie_ns) * u128::from(D2_MAX_PCIE_PERCENT)
     }
@@ -345,22 +407,30 @@ impl DecodeCosts {
                 mb(self.layer_bytes_range.1)
             )
         };
+        let reprobe = if self.cpu_reprobed {
+            "; first pass was dispersed, re-probed once and pooled"
+        } else {
+            ""
+        };
         format!(
-            "live samples (real CPU arm, zero-copy link; no stored rate): worst-case D2 {:.0} us \
-             vs best-case PCIe {:.0} us per full-cold decode layer ({:.2}x; D2 needs <= \
-             {D2_MAX_PCIE_PERCENT}%) [medians: D2 {:.0} us vs PCIe {:.0} us]: CPU arm slowest \
-             {:.0} us / median {:.0} us [spread x{:.2}, {:.1} GB/s median over {bytes} of \
-             experts] + {:.0} us copy-transport handoff; link fastest {:.1} GB/s / median \
-             {:.1} GB/s [spread x{:.2}] + launch floor {:.0} us min / {:.0} us median; \
+            "live samples (real CPU arm, zero-copy link; no stored rate): D2 {:.0} us (median \
+             CPU arm of {} samples{reprobe}) vs best-case PCIe {:.0} us per full-cold decode \
+             layer ({:.2}x; D2 needs <= {D2_MAX_PCIE_PERCENT}%) [single slowest sample would \
+             give D2 {:.0} us; median PCIe {:.0} us]: CPU arm median {:.0} us / slowest \
+             {:.0} us [spread x{:.2} max/min, x{:.2} max/median, {:.1} GB/s median over \
+             {bytes} of experts] + {:.0} us copy-transport handoff; link fastest {:.1} GB/s / \
+             median {:.1} GB/s [spread x{:.2}] + launch floor {:.0} us min / {:.0} us median; \
              real-arm probe {:.1} ms",
             us(self.d2_ns),
+            self.cpu_samples,
             us(self.pcie_ns),
             self.d2_ns as f64 / self.pcie_ns as f64,
-            us(self.d2_median_ns),
+            us(self.d2_worst_ns),
             us(self.pcie_median_ns),
-            us(self.cpu_slowest_ns),
             us(self.cpu_arm_ns),
+            us(self.cpu_slowest_ns),
             self.cpu_spread,
+            self.cpu_tail,
             self.cpu_gbps(),
             us(CURRENT_COPY_TRANSPORT_HANDOFF_NS),
             self.link_fastest_gbps(),
@@ -373,36 +443,69 @@ impl DecodeCosts {
     }
 }
 
+/// The CPU samples of `passes` (`(wall ns, GPU bytes)` per timed batch)
+/// pooled and scaled to the median batch size: sample `i` is
+/// `ns[i] * median_bytes / bytes[i]`, so batches of different byte counts
+/// (mixed codecs) compare as time per byte, and the identity when every batch
+/// read the same bytes. `None` for no sample or a zero byte count.
+fn normalized_cpu_ns(passes: &[(&[u64], &[u64])]) -> Option<(Vec<u64>, u64)> {
+    let mut bytes: Vec<u64> = passes
+        .iter()
+        .flat_map(|(_, bytes)| bytes.iter().copied())
+        .collect();
+    if bytes.is_empty() || bytes.contains(&0) {
+        return None;
+    }
+    let pooled_bytes = bytes.clone();
+    bytes.sort_unstable();
+    let median = bytes[bytes.len() / 2];
+    let ns = passes.iter().flat_map(|(ns, _)| ns.iter().copied());
+    let mut scaled = Vec::with_capacity(pooled_bytes.len());
+    for (ns, bytes) in ns.zip(pooled_bytes) {
+        let value = u128::from(ns) * u128::from(median) / u128::from(bytes);
+        scaled.push(u64::try_from(value).ok()?);
+    }
+    Some((scaled, median))
+}
+
+/// Whether one CPU arm pass is dispersed ([`SampleStats::dispersed`]) after
+/// normalization: the measurement should be re-probed once. A pass that cannot
+/// be normalized is not dispersed (it is an invalid sample, which the decision
+/// reports).
+pub fn cpu_pass_dispersed(
+    cpu_ns: &[u64; PROBE_SAMPLES],
+    batch_bytes: &[u64; PROBE_SAMPLES],
+) -> bool {
+    normalized_cpu_ns(&[(cpu_ns, batch_bytes)])
+        .and_then(|(scaled, _)| SampleStats::of(&scaled))
+        .is_some_and(SampleStats::dispersed)
+}
+
 impl DecodeMeasurement {
-    /// The CPU samples scaled to the median batch size: sample `i` is
-    /// `cpu_ns[i] * median_bytes / batch_bytes[i]`, so batches of different
-    /// byte counts (mixed codecs) compare as time per byte, and the identity
-    /// when every batch read the same bytes. `None` for a zero byte count.
-    fn normalized_cpu_ns(&self) -> Option<([u64; PROBE_SAMPLES], u64)> {
-        if self.batch_bytes.contains(&0) {
-            return None;
+    /// The pooled, normalized CPU samples of every pass and the median batch
+    /// bytes.
+    fn pooled_cpu(&self) -> Option<(Vec<u64>, u64)> {
+        match &self.cpu_retry {
+            None => normalized_cpu_ns(&[(&self.cpu_ns, &self.batch_bytes)]),
+            Some(retry) => normalized_cpu_ns(&[
+                (&self.cpu_ns, &self.batch_bytes),
+                (&retry.cpu_ns, &retry.batch_bytes),
+            ]),
         }
-        let mut sorted = self.batch_bytes;
-        sorted.sort_unstable();
-        let median = sorted[PROBE_SAMPLES / 2];
-        let mut scaled = [0u64; PROBE_SAMPLES];
-        for ((out, &ns), &bytes) in scaled.iter_mut().zip(&self.cpu_ns).zip(&self.batch_bytes) {
-            let value = u128::from(ns) * u128::from(median) / u128::from(bytes);
-            *out = u64::try_from(value).ok()?;
-        }
-        Some((scaled, median))
     }
 
     /// The predicted costs, or why the samples cannot decide: any zero is
-    /// [`Unusable::InvalidSample`]. The decision costs are the pessimistic D2
-    /// (slowest CPU arm sample + handoff) and the optimistic PCIe (fastest
-    /// link sample + minimum floor); the medians and spreads ride along for
-    /// the log. There is no spread threshold. Pure.
+    /// [`Unusable::InvalidSample`]. The decision costs are the **robust** D2
+    /// (the median CPU arm sample over every pass + handoff: one outlier
+    /// sample cannot move it, a uniformly slow arm moves all of it) and the
+    /// optimistic PCIe (fastest link sample + minimum floor), both held to the
+    /// 85% margin; the slowest sample, spreads and the other medians ride
+    /// along for the log. There is no spread threshold. Pure.
     pub fn costs(&self) -> Result<DecodeCosts, Unusable> {
         if self.link_sample_bytes == 0 {
             return Err(Unusable::InvalidSample);
         }
-        let (scaled, layer_bytes) = self.normalized_cpu_ns().ok_or(Unusable::InvalidSample)?;
+        let (scaled, layer_bytes) = self.pooled_cpu().ok_or(Unusable::InvalidSample)?;
         let cpu = SampleStats::of(&scaled).ok_or(Unusable::InvalidSample)?;
         let link = SampleStats::of(&self.link_ns).ok_or(Unusable::InvalidSample)?;
         let floor = SampleStats::of(&self.launch_floor_ns).ok_or(Unusable::InvalidSample)?;
@@ -413,14 +516,21 @@ impl DecodeMeasurement {
         };
         let d2 = |arm_ns: u64| arm_ns.checked_add(CURRENT_COPY_TRANSPORT_HANDOFF_NS);
         let invalid = Unusable::InvalidSample;
+        let mut all_bytes = self.batch_bytes.to_vec();
+        if let Some(retry) = &self.cpu_retry {
+            all_bytes.extend_from_slice(&retry.batch_bytes);
+        }
         Ok(DecodeCosts {
             pcie_ns: pcie(link.min_ns, floor.min_ns).ok_or(invalid)?,
-            d2_ns: d2(cpu.max_ns).ok_or(invalid)?,
+            d2_ns: d2(cpu.median_ns).ok_or(invalid)?,
             pcie_median_ns: pcie(link.median_ns, floor.median_ns).ok_or(invalid)?,
-            d2_median_ns: d2(cpu.median_ns).ok_or(invalid)?,
+            d2_worst_ns: d2(cpu.max_ns).ok_or(invalid)?,
             cpu_arm_ns: cpu.median_ns,
             cpu_slowest_ns: cpu.max_ns,
             cpu_spread: cpu.spread(),
+            cpu_tail: cpu.tail(),
+            cpu_samples: scaled.len(),
+            cpu_reprobed: self.cpu_retry.is_some(),
             link_sample_ns: link.median_ns,
             link_fastest_ns: link.min_ns,
             link_spread: link.spread(),
@@ -428,12 +538,327 @@ impl DecodeMeasurement {
             launch_floor_min_ns: floor.min_ns,
             layer_bytes,
             layer_bytes_range: (
-                *self.batch_bytes.iter().min().unwrap_or(&layer_bytes),
-                *self.batch_bytes.iter().max().unwrap_or(&layer_bytes),
+                *all_bytes.iter().min().unwrap_or(&layer_bytes),
+                *all_bytes.iter().max().unwrap_or(&layer_bytes),
             ),
             link_sample_bytes: self.link_sample_bytes,
             probe_wall_ns: self.probe_wall_ns,
         })
+    }
+}
+
+/// Minimum predicted per-layer gain (percent of the layer's D2 time with no
+/// share) for `auto` to give any cold expert to the GPU arm; below it the layer
+/// stays all-CPU (`0`, today's D2). The model is a prediction of a discrete,
+/// latency-bound arm, so a small predicted win is inside its error.
+pub const SHARE_MIN_GAIN_PERCENT: u64 = 10;
+
+/// The shares `auto` considers (parts per million): 5% steps up to 95%. `0` is
+/// the baseline, and `1.0` is excluded: an all-PCIe layer is the D2 selector's
+/// verdict (plain PCIe), not a share.
+pub fn share_grid_ppm() -> impl Iterator<Item = u32> {
+    (1..=19).map(|step| step * 50_000)
+}
+
+/// Per-expert probability that a decode row of `top_k` routed experts contains
+/// the expert, from the sidecar's routing counts of one layer: `top_k * count /
+/// total`, capped at 1. A layer with no counts routes uniformly.
+pub fn routing_probabilities(counts: &[u64], top_k: usize) -> Vec<f64> {
+    let total: u128 = counts.iter().map(|&c| u128::from(c)).sum();
+    if counts.is_empty() {
+        return Vec::new();
+    }
+    counts
+        .iter()
+        .map(|&c| {
+            let q = if total == 0 {
+                top_k as f64 / counts.len() as f64
+            } else {
+                top_k as f64 * c as f64 / total as f64
+            };
+            q.clamp(0.0, 1.0)
+        })
+        .collect()
+}
+
+/// The distribution of how many of independent events with probabilities `q`
+/// occur, as `max + 1` probabilities for counts `0..=max`; the mass of more
+/// than `max` events is lumped into `max` (a row routes `top_k` distinct
+/// experts, so `max = top_k`). Poisson-binomial dynamic programme. Pure.
+pub fn count_distribution(q: impl IntoIterator<Item = f64>, max: usize) -> Vec<f64> {
+    let mut dist = vec![0.0; max + 1];
+    dist[0] = 1.0;
+    for q in q {
+        let q = q.clamp(0.0, 1.0);
+        if q == 0.0 {
+            continue;
+        }
+        for n in (0..=max).rev() {
+            let mut next = dist[n] * (1.0 - q);
+            if n > 0 {
+                next += dist[n - 1] * q;
+            }
+            if n == max {
+                // Mass that would step past `max` stays lumped at `max`.
+                next += dist[max] * q;
+            }
+            dist[n] = next;
+        }
+    }
+    dist
+}
+
+/// A layer's predicted D2 time with and without a PCIe share.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayerSharePlan {
+    /// The share the layer takes, parts per million; `0` when no grid share
+    /// clears [`SHARE_MIN_GAIN_PERCENT`] (or the mode is not `auto`).
+    pub ppm: u32,
+    /// Predicted layer time with no share, ns.
+    pub base_ns: f64,
+    /// Predicted layer time at the best grid share, ns (equals `base_ns` when
+    /// the best share is no share).
+    pub best_ns: f64,
+    /// The best grid share before the gain threshold, ppm.
+    pub best_ppm: u32,
+}
+
+impl LayerSharePlan {
+    pub const OFF: Self = Self {
+        ppm: 0,
+        base_ns: 0.0,
+        best_ns: 0.0,
+        best_ppm: 0,
+    };
+
+    /// Predicted gain of the best grid share, percent of the no-share time.
+    pub fn best_gain_percent(&self) -> f64 {
+        if self.base_ns > 0.0 {
+            100.0 * (self.base_ns - self.best_ns) / self.base_ns
+        } else {
+            0.0
+        }
+    }
+}
+
+/// What `auto` prices a layer's two arms from. The measured quantities are the
+/// D2 selector's real CPU arm and zero-copy link samples plus a device copy
+/// sample and a single-expert zero-copy read latency probe.
+///
+/// A decode call routes a random set of experts. The CPU arm computes the
+/// `i` CPU-owned cold experts of the call (`i * cpu_ns_per_expert`); the GPU
+/// arm reads the device-resident experts (`H`, priced at `vram_ns_per_byte`)
+/// and, when the call routes any PCIe-owned expert (`j >= 1`), waits for the
+/// zero-copy read, `max(link_latency_ns, j * expert_bytes * link_ns_per_byte)`:
+/// the GPU tail is latency-bound, so one expert costs a whole read, not a
+/// byte-share of it. The two arms overlap, and the serial D2 handoff is paid
+/// every call:
+///
+/// ```text
+/// T(call) = handoff + max(i * c, H + [j >= 1] * max(l1, j * b * L))
+/// T(p)    = E[T(call)] over the layer's routed-expert distribution
+/// ```
+///
+/// where `i` and `j` are independent Poisson-binomial counts of the CPU- and
+/// PCIe-owned experts routed (probabilities from the sidecar counts,
+/// [`routing_probabilities`]), `c` is the CPU time per expert, `b` the GPU
+/// bytes per expert and `L` the link ns per byte. While both arms are busy each
+/// is slowed by `contention` (a unified-memory host sharing DRAM). `auto`
+/// evaluates `T` at no share and on [`share_grid_ppm`] and takes the minimum,
+/// but only when it beats the no-share time by [`SHARE_MIN_GAIN_PERCENT`];
+/// otherwise the layer stays all-CPU. This is an expectation of the per-call
+/// maximum, not the maximum of the expected arm times: a linear byte-balance
+/// mispredicts a discrete arm (one 2.6 MB expert over a 7 GB/s link costs
+/// ~0.4 ms of tail whatever the share).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShareModel {
+    /// Median real CPU arm per cold expert, ns ([`DecodeCosts::cpu_arm_ns`] /
+    /// `top_k`).
+    pub cpu_ns_per_expert: f64,
+    /// Median live zero-copy link read, ns per byte.
+    pub link_ns_per_byte: f64,
+    /// One cold expert read by the GPU over the zero-copy link, ns
+    /// ([`link_latency_ns`]).
+    pub link_latency_ns: f64,
+    /// Device-memory copy kernel, ns per byte read ([`device_copy_ns_per_byte`]):
+    /// a copy also writes every byte, so the hot arm is priced at no less than
+    /// its read time. The shared expert is not priced.
+    pub vram_ns_per_byte: f64,
+    /// GPU read bytes of one expert.
+    pub expert_bytes: f64,
+    /// Routed experts per row.
+    pub top_k: usize,
+    /// Serial D2 handoff per call, ns.
+    pub handoff_ns: f64,
+    /// `>= 1`: how much slower both arms run while overlapped (lab,
+    /// `HIPFIRE_QWEN4_D2_PCIE_CONTENTION`). `1.0` is no contention.
+    pub contention: f64,
+}
+
+impl ShareModel {
+    pub fn from_costs(
+        costs: &DecodeCosts,
+        vram_ns_per_byte: f64,
+        link_latency_ns: f64,
+        top_k: usize,
+    ) -> Self {
+        Self {
+            cpu_ns_per_expert: costs.cpu_arm_ns as f64 / top_k as f64,
+            link_ns_per_byte: costs.link_sample_ns as f64 / costs.link_sample_bytes as f64,
+            link_latency_ns,
+            vram_ns_per_byte,
+            expert_bytes: costs.layer_bytes as f64 / top_k as f64,
+            top_k,
+            handoff_ns: CURRENT_COPY_TRANSPORT_HANDOFF_NS as f64,
+            contention: 1.0,
+        }
+    }
+
+    /// The same model with both arms slowed by `contention` while overlapped
+    /// (`>= 1`; anything lower or non-finite is no contention).
+    pub fn with_contention(mut self, contention: f64) -> Self {
+        self.contention = if contention.is_finite() && contention >= 1.0 {
+            contention
+        } else {
+            1.0
+        };
+        self
+    }
+
+    /// Predicted per-call D2 time of a layer, ns: `cold[e]` host-mapped,
+    /// `pcie[e]` GPU-read cold experts (a subset of `cold`), `q[e]` the
+    /// per-row routing probabilities. Pure.
+    pub fn expected_layer_ns(&self, cold: &[bool], pcie: &[bool], q: &[f64]) -> f64 {
+        let owned = |e: usize| pcie.get(e).copied().unwrap_or(false);
+        let k = self.top_k;
+        let cpu = count_distribution(
+            (0..cold.len())
+                .filter(|&e| cold[e] && !owned(e))
+                .map(|e| q[e]),
+            k,
+        );
+        let gpu = count_distribution(
+            (0..cold.len())
+                .filter(|&e| cold[e] && owned(e))
+                .map(|e| q[e]),
+            k,
+        );
+        let hot: f64 = (0..cold.len()).filter(|&e| !cold[e]).map(|e| q[e]).sum();
+        let hot_ns = hot * self.expert_bytes * self.vram_ns_per_byte;
+        let mut total = 0.0;
+        for (i, &pi) in cpu.iter().enumerate() {
+            for (j, &pj) in gpu.iter().enumerate() {
+                let overlapped = if i > 0 && j > 0 { self.contention } else { 1.0 };
+                let cpu_ns = i as f64 * self.cpu_ns_per_expert * overlapped;
+                let pcie_ns = if j > 0 {
+                    self.link_latency_ns
+                        .max(j as f64 * self.expert_bytes * self.link_ns_per_byte)
+                        * overlapped
+                } else {
+                    0.0
+                };
+                total += pi * pj * (self.handoff_ns + cpu_ns.max(hot_ns + pcie_ns));
+            }
+        }
+        total
+    }
+
+    /// Plan one layer: `cold` host-mapped experts, `counts` the layer's routing
+    /// counts, `partition(ppm)` the PCIe-owned experts a share of `ppm` gives
+    /// ([`crate::gpu_forward`]'s deterministic partition).
+    pub fn plan_layer(
+        &self,
+        cold: &[bool],
+        counts: &[u64],
+        partition: &dyn Fn(u32) -> Vec<bool>,
+    ) -> LayerSharePlan {
+        let q = routing_probabilities(counts, self.top_k);
+        if q.len() != cold.len() || !cold.iter().any(|&c| c) {
+            return LayerSharePlan::OFF;
+        }
+        let base_ns = self.expected_layer_ns(cold, &[], &q);
+        let (mut best_ns, mut best_ppm) = (base_ns, 0);
+        for ppm in share_grid_ppm() {
+            let ns = self.expected_layer_ns(cold, &partition(ppm), &q);
+            if ns < best_ns {
+                (best_ns, best_ppm) = (ns, ppm);
+            }
+        }
+        let plan = LayerSharePlan {
+            ppm: 0,
+            base_ns,
+            best_ns,
+            best_ppm,
+        };
+        let enough =
+            best_ppm > 0 && (base_ns - best_ns) * 100.0 >= base_ns * SHARE_MIN_GAIN_PERCENT as f64;
+        LayerSharePlan {
+            ppm: if enough { best_ppm } else { 0 },
+            ..plan
+        }
+    }
+
+    /// Median CPU arm and link rates in GB/s (one byte per ns is 1 GB/s), for
+    /// the log.
+    pub fn rates_gbps(&self) -> (f64, f64) {
+        (
+            self.expert_bytes / self.cpu_ns_per_expert,
+            1.0 / self.link_ns_per_byte,
+        )
+    }
+}
+
+/// The resolved PCIe share of one load (`HIPFIRE_QWEN4_D2_PCIE_SHARE`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PcieShare {
+    /// Every cold expert of an armed tier layer is CPU-owned (today's D2).
+    Off,
+    /// The same share, in parts per million, on every layer.
+    Fixed(u32),
+    /// Priced per layer ([`ShareModel::plan_layer`]).
+    Auto(ShareModel),
+}
+
+impl PcieShare {
+    /// The share plan of one layer.
+    pub fn plan_layer(
+        self,
+        cold: &[bool],
+        counts: &[u64],
+        partition: &dyn Fn(u32) -> Vec<bool>,
+    ) -> LayerSharePlan {
+        match self {
+            Self::Off => LayerSharePlan::OFF,
+            Self::Fixed(ppm) => LayerSharePlan {
+                ppm: ppm.min(hipfire_config::memory::D2_PCIE_SHARE_PPM_ONE),
+                ..LayerSharePlan::OFF
+            },
+            Self::Auto(model) => model.plan_layer(cold, counts, partition),
+        }
+    }
+
+    /// Load-log text of the mode and, for `auto`, the measured inputs and the
+    /// gain threshold.
+    pub fn describe(self) -> String {
+        match self {
+            Self::Off => "off".to_owned(),
+            Self::Fixed(ppm) => format!("fixed {:.4}", f64::from(ppm) / 1e6),
+            Self::Auto(model) => {
+                let (cpu, link) = model.rates_gbps();
+                let contention = if model.contention > 1.0 {
+                    format!(", contention x{:.2}", model.contention)
+                } else {
+                    String::new()
+                };
+                format!(
+                    "auto (measured CPU arm {cpu:.1} GB/s, zero-copy link {link:.2} GB/s, one-expert \
+                     zero-copy read {:.0} us, device copy {:.0} GB/s read; a layer takes the best \
+                     grid share only when the predicted layer gain is >= {SHARE_MIN_GAIN_PERCENT}%{contention})",
+                    model.link_latency_ns / 1e3,
+                    1.0 / model.vram_ns_per_byte
+                )
+            }
+        }
     }
 }
 
@@ -841,12 +1266,39 @@ fn resolve_sources(
     Ok((sources, codecs))
 }
 
+/// One CPU arm pass's `(wall ns, GPU bytes)` per timed batch.
+type CpuPass = ([u64; PROBE_SAMPLES], [u64; PROBE_SAMPLES]);
+
+/// The CPU arm samples of one probe: a first pass, and exactly one more pass
+/// when the first was dispersed ([`cpu_pass_dispersed`], one slow outlier
+/// such as a preempted batch), so a disturbed host is measured twice and the
+/// decision pools both. A first pass that is not dispersed never re-probes;
+/// the re-probe never repeats. A failed pass fails closed.
+fn sample_cpu_with_reprobe(
+    mut pass: impl FnMut() -> Result<CpuPass, Unusable>,
+) -> Result<(CpuPass, Option<CpuRetry>), Unusable> {
+    let first = pass()?;
+    if !cpu_pass_dispersed(&first.0, &first.1) {
+        return Ok((first, None));
+    }
+    let (cpu_ns, batch_bytes) = pass()?;
+    Ok((
+        first,
+        Some(CpuRetry {
+            cpu_ns,
+            batch_bytes,
+        }),
+    ))
+}
+
 /// The live decode-cost probe of this model on this device: the real CPU arm
-/// over the host layers' actual cold experts, then live link samples. Fails
-/// closed on any setup problem. `started` is when source resolution began, so
-/// the logged probe wall covers every setup cost. The probe does not pause
-/// the PLE prewarm (see the module docs): contention shows up as slower or
-/// wider samples, which the pessimistic comparison resolves toward PCIe.
+/// over the host layers' actual cold experts (re-probed once when the first
+/// pass is dispersed), then live link samples. Fails closed on any setup
+/// problem. `started` is when source resolution began, so the logged probe
+/// wall covers every setup cost. The probe does not pause the PLE prewarm
+/// (see the module docs): contention shows up as slower or wider samples; the
+/// median CPU statistic ignores a minority of them, a majority of slow
+/// samples resolves toward PCIe.
 fn measure_decode(
     gpu: &mut Gpu,
     config: &Qwen4Config,
@@ -866,13 +1318,21 @@ fn measure_decode(
         need,
     )
     .map_err(|have| Unusable::ColdExperts { have, need })?;
-    let (cpu_ns, batch_bytes) = sample_cpu_arm(
-        config.hidden_size,
-        config.moe_intermediate_size,
-        top_k,
-        config.num_experts,
-        &picked,
-    )?;
+    let ((cpu_ns, batch_bytes), cpu_retry) = sample_cpu_with_reprobe(|| {
+        sample_cpu_arm(
+            config.hidden_size,
+            config.moe_intermediate_size,
+            top_k,
+            config.num_experts,
+            &picked,
+        )
+    })?;
+    if cpu_retry.is_some() {
+        eprintln!(
+            "  qwen4 D2 default: first CPU arm pass was dispersed (slowest > {CPU_OUTLIER_PERCENT}% \
+             of its median); re-probed once"
+        );
+    }
     drop(picked);
     let (link_ns, launch_floor_ns) =
         crate::host_link::zero_copy_read_samples::<PROBE_SAMPLES>(gpu, LINK_SAMPLE_BYTES).map_err(
@@ -887,6 +1347,7 @@ fn measure_decode(
     Ok(DecodeMeasurement {
         cpu_ns,
         batch_bytes,
+        cpu_retry,
         link_ns,
         launch_floor_ns,
         link_sample_bytes: LINK_SAMPLE_BYTES as u64,
@@ -956,6 +1417,177 @@ pub(crate) fn resolve(
     verdict.selects_d2()
 }
 
+/// Median ns per byte read of a device-to-device copy kernel (`bytes` long),
+/// net of the one-element launch floor: the hot arm's price in [`ShareModel`].
+fn device_copy_ns_per_byte(gpu: &mut Gpu, bytes: usize) -> Result<f64, String> {
+    let elems = bytes / 4;
+    if elems == 0 {
+        return Err("empty device copy sample request".to_string());
+    }
+    let src = gpu
+        .alloc_tensor(&[elems], DType::F32)
+        .map_err(|error| format!("device source: {error}"))?;
+    let dst = match gpu.alloc_tensor(&[elems], DType::F32) {
+        Ok(dst) => dst,
+        Err(error) => {
+            let _ = gpu.free_tensor(src);
+            return Err(format!("device destination: {error}"));
+        }
+    };
+    let timed = (|| -> Result<(u64, u64), String> {
+        let launch = |gpu: &mut Gpu, n: usize| -> Result<u64, String> {
+            let start = Instant::now();
+            gpu.copy_f32_buffer(&dst, &src, n)
+                .map_err(|error| format!("device copy: {error}"))?;
+            gpu.hip
+                .device_synchronize()
+                .map_err(|error| format!("synchronize: {error}"))?;
+            Ok(start.elapsed().as_nanos() as u64)
+        };
+        launch(gpu, elems)?;
+        let mut reads = [0u64; PROBE_SAMPLES];
+        for sample in &mut reads {
+            *sample = launch(gpu, elems)?;
+        }
+        launch(gpu, 1)?;
+        let mut floors = [0u64; PROBE_SAMPLES];
+        for sample in &mut floors {
+            *sample = launch(gpu, 1)?;
+        }
+        Ok((
+            SampleStats::of(&reads)
+                .ok_or("no device copy sample")?
+                .median_ns,
+            SampleStats::of(&floors)
+                .ok_or("no launch floor sample")?
+                .min_ns,
+        ))
+    })();
+    let _ = gpu.hip.device_synchronize();
+    let _ = gpu.free_tensor(dst);
+    let _ = gpu.free_tensor(src);
+    let (read_ns, floor_ns) = timed?;
+    let net = read_ns.saturating_sub(floor_ns).max(1);
+    Ok(net as f64 / (elems * 4) as f64)
+}
+
+/// Median ns of one GPU kernel reading `bytes` of host-mapped memory over the
+/// zero-copy link, net of the one-element launch floor: the cost of one cold
+/// expert in a GPU tail, the `l1` of [`ShareModel`]. Every timed sample reads
+/// its own freshly mapped buffer (after one untimed warm-up on another), so no
+/// sample is served from the GPU's caches; the copy kernel runs wide, so a
+/// narrower real GEMV can only be slower than this.
+fn link_latency_ns(gpu: &mut Gpu, bytes: usize) -> Result<f64, String> {
+    let elems = bytes / 4;
+    if elems == 0 {
+        return Err("empty link latency sample request".to_string());
+    }
+    let mut sources = Vec::with_capacity(PROBE_SAMPLES + 1);
+    let mut dst = None;
+    let timed = (|| -> Result<(u64, u64), String> {
+        for _ in 0..=PROBE_SAMPLES {
+            sources.push(
+                gpu.upload_raw_host(&vec![0u8; bytes], &[bytes])
+                    .map_err(|error| format!("host-mapped buffer: {error}"))?,
+            );
+        }
+        let dst = dst.insert(
+            gpu.alloc_tensor(&[elems], DType::F32)
+                .map_err(|error| format!("device buffer: {error}"))?,
+        );
+        let launch = |gpu: &mut Gpu, src: usize, n: usize| -> Result<u64, String> {
+            let start = Instant::now();
+            gpu.copy_f32_buffer(dst, &sources[src], n)
+                .map_err(|error| format!("zero-copy read: {error}"))?;
+            gpu.hip
+                .device_synchronize()
+                .map_err(|error| format!("synchronize: {error}"))?;
+            Ok(start.elapsed().as_nanos() as u64)
+        };
+        launch(gpu, 0, elems)?;
+        let mut reads = [0u64; PROBE_SAMPLES];
+        for (i, sample) in reads.iter_mut().enumerate() {
+            *sample = launch(gpu, i + 1, elems)?;
+        }
+        launch(gpu, 0, 1)?;
+        let mut floors = [0u64; PROBE_SAMPLES];
+        for sample in &mut floors {
+            *sample = launch(gpu, 0, 1)?;
+        }
+        Ok((
+            SampleStats::of(&reads)
+                .ok_or("no link latency sample")?
+                .median_ns,
+            SampleStats::of(&floors)
+                .ok_or("no launch floor sample")?
+                .min_ns,
+        ))
+    })();
+    let _ = gpu.hip.device_synchronize();
+    if let Some(dst) = dst {
+        let _ = gpu.free_tensor(dst);
+    }
+    for source in sources {
+        let _ = gpu.free_tensor(source);
+    }
+    let (read_ns, floor_ns) = timed?;
+    Ok(read_ns.saturating_sub(floor_ns).max(1) as f64)
+}
+
+/// Resolve `HIPFIRE_QWEN4_D2_PCIE_SHARE` for one load. Call after [`resolve`]
+/// and before any layer runtime is built; `d2_armed` is whether the load asks
+/// for the D2 split at all (the measured default or an explicit
+/// `memory.offload_exec=cpu`): a load that does not ignores the knob and runs
+/// no probe. `Fixed` needs no measurement. `auto` takes the CPU-arm and link
+/// samples of the D2 selector (the process-cached measurement when the
+/// selector already ran it, else the same live probe), a device copy sample
+/// and a single-expert zero-copy read latency sample, and any failure (an
+/// unusable sample, a failed probe) logs its reason and keeps `Off`, never a
+/// guessed split. An invalid knob value refuses the load.
+pub(crate) fn resolve_pcie_share(
+    gpu: &mut Gpu,
+    weights: &Qwen4Weights,
+    config: &Qwen4Config,
+    single_scope: bool,
+    d2_armed: bool,
+) -> Result<PcieShare, String> {
+    use hipfire_config::memory::D2PcieShare;
+    let knob = hipfire_config::memory::qwen4_d2_pcie_share()?;
+    let contention = hipfire_config::memory::qwen4_d2_pcie_contention()?;
+    if knob == D2PcieShare::Off || !d2_armed {
+        return Ok(PcieShare::Off);
+    }
+    let D2PcieShare::Fixed(ppm) = knob else {
+        let layers = host_split_layers(weights, config, single_scope);
+        let costs = measured_decode(gpu, weights, config, &layers)
+            .and_then(|measurement| measurement.costs());
+        let top_k = config.num_experts_per_tok;
+        let expert_bytes = match &costs {
+            Ok(costs) => (costs.layer_bytes / top_k as u64) as usize,
+            Err(_) => 0,
+        };
+        let probes = costs.is_ok().then(|| {
+            device_copy_ns_per_byte(gpu, LINK_SAMPLE_BYTES)
+                .and_then(|vram| link_latency_ns(gpu, expert_bytes).map(|l1| (vram, l1)))
+        });
+        return Ok(match (costs, probes) {
+            (Ok(costs), Some(Ok((vram, l1)))) => PcieShare::Auto(
+                ShareModel::from_costs(&costs, vram, l1, top_k).with_contention(contention),
+            ),
+            (Err(why), _) => {
+                eprintln!("  qwen4 D2 pcie share: auto kept off: {}", why.describe());
+                PcieShare::Off
+            }
+            (_, Some(Err(why))) => {
+                eprintln!("  qwen4 D2 pcie share: auto kept off: probe failed: {why}");
+                PcieShare::Off
+            }
+            (_, None) => PcieShare::Off,
+        });
+    };
+    Ok(PcieShare::Fixed(ppm))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,6 +1620,7 @@ mod tests {
         DecodeMeasurement {
             cpu_ns,
             batch_bytes: [flash_next_layer_bytes(); PROBE_SAMPLES],
+            cpu_retry: None,
             link_ns,
             launch_floor_ns: [FLOOR_NS; PROBE_SAMPLES],
             link_sample_bytes: LINK_SAMPLE_BYTES as u64,
@@ -1189,14 +1822,17 @@ mod tests {
     }
 
     /// `D2 <= 85% of PCIe` is exact at the boundary, on the decision costs:
-    /// the slowest arm sample against the fastest link and minimum floor.
-    /// Equality selects D2 and one nanosecond more does not.
+    /// the **median** arm sample (the slowest and fastest arm samples do not
+    /// move it) against the fastest link and minimum floor. Equality selects
+    /// D2 and one nanosecond more does not; the result is a pure function of
+    /// the samples.
     #[test]
-    fn exact_fifteen_percent_boundary_uses_the_slowest_arm_and_the_fastest_link() {
+    fn exact_fifteen_percent_boundary_uses_the_median_arm_and_the_fastest_link() {
         // layer bytes == link sample bytes: pcie = fastest link + minimum floor.
-        let at = |slowest_arm_ns: u64| DecodeMeasurement {
-            cpu_ns: [slowest_arm_ns, 10_000, 10_000, 10_000, 10_000],
+        let at = |median_arm_ns: u64| DecodeMeasurement {
+            cpu_ns: [10_000, median_arm_ns, median_arm_ns, 20_000_000, 20_000_000],
             batch_bytes: [LINK_SAMPLE_BYTES as u64; PROBE_SAMPLES],
+            cpu_retry: None,
             // Slower link samples and a larger median floor must not matter.
             link_ns: [1_400_000, 990_000, 1_100_000, 1_200_000, 1_300_000],
             launch_floor_ns: [30_000, 10_000, 20_000, 25_000, 40_000],
@@ -1211,8 +1847,19 @@ mod tests {
             .unwrap();
         assert_eq!((edge.pcie_ns, edge.d2_ns), (pcie, d2_at_limit));
         assert!(edge.favors_d2(), "exactly 15% faster selects D2");
-        // The medians ride along and are strictly worse for PCIe here.
-        assert!(edge.pcie_median_ns > edge.pcie_ns && edge.d2_median_ns < edge.d2_ns);
+        // The slowest samples ride along for the log only; the median PCIe is
+        // strictly worse than the decision's best-case PCIe.
+        assert!(edge.pcie_median_ns > edge.pcie_ns);
+        assert_eq!(
+            edge.d2_worst_ns,
+            20_000_000 + CURRENT_COPY_TRANSPORT_HANDOFF_NS
+        );
+        assert_eq!(
+            edge,
+            at(d2_at_limit - CURRENT_COPY_TRANSPORT_HANDOFF_NS)
+                .costs()
+                .unwrap()
+        );
         let over = at(d2_at_limit - CURRENT_COPY_TRANSPORT_HANDOFF_NS + 1)
             .costs()
             .unwrap();
@@ -1226,9 +1873,9 @@ mod tests {
 
     /// A disturbed arm on a 7900 XTX (CPU arm 0.39 ms, link 7.1 GB/s: PCIe
     /// 3.7 ms, 85% of it 3.14 ms): a single slow outlier, a sustained 3x or
-    /// 5x disturbance and wide scatter all keep the worst case, slowest arm +
-    /// 806.1 µs, under the margin, so D2 stays selected however wide the
-    /// spread is (the old hard 1.2x spread reject flipped these to PCIe).
+    /// 5x disturbance and wide scatter all keep the median arm + 806.1 µs
+    /// under the margin, so D2 stays selected however wide the spread is (the
+    /// old hard 1.2x spread reject flipped these to PCIe).
     #[test]
     fn xtx_disturbed_high_arm_samples_still_select_d2() {
         let arm = arm_ns(66.9);
@@ -1258,13 +1905,14 @@ mod tests {
         assert!(arms(noisy));
     }
 
-    /// Past the margin, or when the noise makes the comparison ambiguous, the
-    /// load stays on PCIe: a sustained 7x arm disturbance (worst case 3.5 ms
-    /// against 3.14 ms), one 3x arm sample with one link sample twice as fast
-    /// as the rest (best-case PCIe 1.9 ms), and a link whose fastest sample
-    /// hides a slow median all end on PCIe.
+    /// Past the margin the load stays on PCIe: a sustained 7x arm disturbance
+    /// (median D2 3.5 ms against 3.14 ms), a sustained 3x arm with one link
+    /// sample twice as fast as the rest (best-case PCIe 1.9 ms), and an
+    /// implausibly fast link sample (0.3x of the rest: best-case PCIe 1.1 ms)
+    /// under a one-outlier arm all end on PCIe. One 3x arm outlier with a link
+    /// sample twice as fast now selects D2: the median ignores the outlier.
     #[test]
-    fn ambiguous_or_past_the_margin_noise_stays_on_pcie() {
+    fn past_the_margin_noise_stays_on_pcie() {
         let arm = arm_ns(66.9);
         let link = link_ns(7.1);
         let heavy = sampled(
@@ -1273,21 +1921,20 @@ mod tests {
         );
         assert!(!heavy.costs().unwrap().favors_d2());
         assert!(!arms(heavy));
-        let ambiguous = sampled(
+        let outlier_fast_link = sampled(
             scaled([arm; PROBE_SAMPLES], [1.0, 1.0, 1.0, 1.0, 3.0]),
             scaled([link; PROBE_SAMPLES], [0.5, 1.0, 1.0, 1.0, 1.0]),
         );
-        let costs = ambiguous.costs().unwrap();
-        assert!(!costs.favors_d2(), "{costs:?}");
-        // The medians alone would have chosen D2: only the pessimistic worst
-        // case against the optimistic best case is ambiguous.
-        assert!(
-            u128::from(costs.d2_median_ns) * 100
-                <= u128::from(costs.pcie_median_ns) * u128::from(D2_MAX_PCIE_PERCENT)
+        let costs = outlier_fast_link.costs().unwrap();
+        assert!(costs.favors_d2(), "{costs:?}");
+        assert!(arms(outlier_fast_link));
+        let implausible_link = sampled(
+            scaled([arm; PROBE_SAMPLES], [1.0, 1.0, 1.0, 1.0, 3.0]),
+            scaled([link; PROBE_SAMPLES], [0.3, 1.0, 1.0, 1.0, 1.0]),
         );
-        assert!(!arms(ambiguous));
-        // Disturbance in both engines: a 3x arm and a link twice as fast in
-        // one sample.
+        assert!(!arms(implausible_link));
+        // Disturbance in both engines: a sustained 3x arm and a link twice as
+        // fast in one sample.
         let both = sampled(
             scaled([arm; PROBE_SAMPLES], [3.0; PROBE_SAMPLES]),
             scaled([link; PROBE_SAMPLES], [0.5, 1.0, 1.0, 1.0, 1.0]),
@@ -1295,11 +1942,179 @@ mod tests {
         assert!(!arms(both));
     }
 
+    /// The defect: hipx `xb-splitkv0-2` refused D2 because one CPU sample was
+    /// 7,316 µs among ~410 µs ones (worst-case D2 8,122 µs vs PCIe 3,691 µs,
+    /// so the load decoded at ~5 tok/s).
+    fn reported_outlier() -> DecodeMeasurement {
+        DecodeMeasurement {
+            cpu_ns: [410_000, 7_316_000, 405_000, 415_000, 412_000],
+            ..from_rates(66.9, 7.1)
+        }
+    }
+
+    #[test]
+    fn one_huge_cpu_outlier_among_steady_samples_still_selects_d2() {
+        let measurement = reported_outlier();
+        let costs = measurement.costs().unwrap();
+        assert_eq!(costs.cpu_arm_ns, 412_000);
+        assert_eq!(costs.cpu_slowest_ns, 7_316_000);
+        assert_eq!(costs.d2_ns, 412_000 + CURRENT_COPY_TRANSPORT_HANDOFF_NS);
+        assert!(costs.favors_d2(), "{costs:?}");
+        // The slowest-sample rule this replaces refused it.
+        assert!(
+            u128::from(costs.d2_worst_ns) * 100
+                > u128::from(costs.pcie_ns) * u128::from(D2_MAX_PCIE_PERCENT)
+        );
+        let (verdict, probed) = run(None, None, false, 43, false, Ok(measurement));
+        assert!(probed && verdict.selects_d2(), "{verdict:?}");
+        let line = verdict.describe().unwrap();
+        for needle in ["median CPU arm of 5 samples", "x17.", "max/median"] {
+            assert!(line.contains(needle), "{needle:?} missing from {line}");
+        }
+    }
+
+    /// A uniformly slow CPU is a slow CPU, not an outlier: refused, with or
+    /// without a re-probe, and a re-probe that is also slow cannot rescue a
+    /// dispersed first pass.
+    #[test]
+    fn uniformly_slow_cpu_is_still_refused() {
+        let slow = 7_316_000;
+        let uniform = DecodeMeasurement {
+            cpu_ns: [slow; PROBE_SAMPLES],
+            ..from_rates(66.9, 7.1)
+        };
+        assert!(!uniform.costs().unwrap().favors_d2());
+        assert!(!arms(uniform));
+        assert!(!cpu_pass_dispersed(&uniform.cpu_ns, &uniform.batch_bytes));
+        // Most of the first pass slow and a slow re-probe.
+        let slow_both = DecodeMeasurement {
+            cpu_ns: [410_000, 7_316_000, 7_000_000, 7_100_000, 7_200_000],
+            cpu_retry: Some(CpuRetry {
+                cpu_ns: [slow; PROBE_SAMPLES],
+                batch_bytes: uniform.batch_bytes,
+            }),
+            ..from_rates(66.9, 7.1)
+        };
+        assert!(!arms(slow_both));
+        // A merely-slow CPU past the margin (median D2 3.5 ms vs 3.14 ms).
+        assert!(!arms(sampled(
+            scaled([arm_ns(66.9); PROBE_SAMPLES], [7.0, 7.0, 7.0, 1.0, 1.0]),
+            [link_ns(7.1); PROBE_SAMPLES],
+        )));
+    }
+
+    /// `dispersed` is strict at exactly `CPU_OUTLIER_PERCENT` of the median.
+    #[test]
+    fn dispersion_threshold_is_strict_and_deterministic() {
+        let bytes = [flash_next_layer_bytes(); PROBE_SAMPLES];
+        let pass = |max: u64| [100_000, 100_000, 100_000, 100_000, max];
+        assert!(!cpu_pass_dispersed(&pass(100_000), &bytes));
+        assert!(
+            !cpu_pass_dispersed(&pass(200_000), &bytes),
+            "exactly 200% is not an outlier"
+        );
+        assert!(cpu_pass_dispersed(&pass(200_001), &bytes));
+        assert!(cpu_pass_dispersed(&reported_outlier().cpu_ns, &bytes));
+        // An unusable pass is not "dispersed" (the decision reports it).
+        assert!(!cpu_pass_dispersed(&[0, 1, 2, 3, 4], &bytes));
+        assert!(!cpu_pass_dispersed(&pass(9_000_000), &[0; PROBE_SAMPLES]));
+        // Normalization is per byte: a big batch that is proportionally
+        // slower is steady.
+        let mixed_bytes = [1_000, 2_000, 1_000, 1_000, 1_000];
+        assert!(!cpu_pass_dispersed(
+            &[100, 200, 100, 100, 100],
+            &mixed_bytes
+        ));
+    }
+
+    /// The re-probe runs exactly once, only for a dispersed first pass, and a
+    /// failing pass fails closed.
+    #[test]
+    fn dispersed_first_pass_reprobes_exactly_once() {
+        let bytes = [flash_next_layer_bytes(); PROBE_SAMPLES];
+        let steady = ([100_000u64; PROBE_SAMPLES], bytes);
+        let spiky = ([100_000, 100_000, 100_000, 100_000, 900_000], bytes);
+        let calls = Cell::new(0);
+        let (first, retry) = sample_cpu_with_reprobe(|| {
+            calls.set(calls.get() + 1);
+            Ok(steady)
+        })
+        .unwrap();
+        assert_eq!((calls.get(), first, retry), (1, steady, None));
+        calls.set(0);
+        let (first, retry) = sample_cpu_with_reprobe(|| {
+            calls.set(calls.get() + 1);
+            // The re-probe is itself dispersed: still no third pass.
+            Ok(spiky)
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(first, spiky);
+        assert_eq!(
+            retry,
+            Some(CpuRetry {
+                cpu_ns: spiky.0,
+                batch_bytes: bytes
+            })
+        );
+        calls.set(0);
+        let failed = sample_cpu_with_reprobe(|| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Ok(spiky)
+            } else {
+                Err(Unusable::Arm)
+            }
+        });
+        assert_eq!((calls.get(), failed), (2, Err(Unusable::Arm)));
+    }
+
+    /// A re-probe pools with the first pass (10 samples, upper median = 6th
+    /// smallest): four slow samples of ten are ignored, five are not.
+    #[test]
+    fn pooled_reprobe_ignores_a_minority_and_not_a_majority() {
+        let fast = 410_000;
+        let slow = 7_316_000;
+        let pooled = |first: [u64; PROBE_SAMPLES], retry: [u64; PROBE_SAMPLES]| DecodeMeasurement {
+            cpu_ns: first,
+            cpu_retry: Some(CpuRetry {
+                cpu_ns: retry,
+                batch_bytes: [flash_next_layer_bytes(); PROBE_SAMPLES],
+            }),
+            ..from_rates(66.9, 7.1)
+        };
+        // 1 + 3 slow of ten: D2.
+        let four = pooled(
+            [fast, fast, slow, fast, fast],
+            [slow, fast, slow, fast, slow],
+        );
+        let costs = four.costs().unwrap();
+        assert_eq!((costs.cpu_samples, costs.cpu_reprobed), (10, true));
+        assert_eq!(costs.cpu_arm_ns, fast);
+        assert!(costs.favors_d2() && arms(four));
+        assert!(costs.detail().contains("median CPU arm of 10 samples"));
+        assert!(costs.detail().contains("re-probed once and pooled"));
+        // 5 slow of ten: the upper median is slow, refused.
+        let five = pooled(
+            [fast, fast, slow, fast, slow],
+            [slow, fast, slow, fast, slow],
+        );
+        assert_eq!(five.costs().unwrap().cpu_arm_ns, slow);
+        assert!(!arms(five));
+        // A clean re-probe after a dispersed first pass: D2 even with two
+        // outliers in the first pass.
+        assert!(arms(pooled(
+            [fast, slow, slow, fast, fast],
+            [fast; PROBE_SAMPLES]
+        )));
+    }
+
     /// An R9700 (j1406: healthy CPU 119.6 / link 54.8 GB/s, disturbed CPU
     /// 47.7 / link 55.4) stays on PCIe whether healthy, contended, scattered
-    /// or with one outlier of either sign: the slowest arm only makes D2
-    /// worse and a fast arm sample cannot flip it: even a sustained arm half
-    /// the healthy time plus the 806.1 µs reserve exceeds 85% of best-case PCIe.
+    /// or with one outlier of either sign: an outlier of either sign cannot
+    /// move the median and a fast arm sample cannot flip it: even a sustained
+    /// arm half the healthy time plus the 806.1 µs reserve exceeds 85% of
+    /// best-case PCIe.
     #[test]
     fn r9700_healthy_contended_and_outliers_stay_on_pcie() {
         let cases = [
@@ -1450,11 +2265,12 @@ mod tests {
         .unwrap();
         for needle in [
             "ON (",
-            "worst-case D2",
+            "median CPU arm of 5 samples",
             "best-case PCIe",
-            "medians: D2",
-            "CPU arm slowest",
-            "spread x3.00",
+            "single slowest sample would give D2",
+            "median PCIe",
+            "slowest",
+            "spread x3.00 max/min, x3.00 max/median",
             "link fastest",
             "launch floor",
             "copy-transport handoff",
@@ -1463,6 +2279,7 @@ mod tests {
         ] {
             assert!(line.contains(needle), "{needle:?} missing from {line}");
         }
+        assert!(!line.contains("re-probed"), "{line}");
     }
 
     /// The calibration record's stored rates can never enable D2: `--show`
@@ -1711,6 +2528,7 @@ mod tests {
         let measurement = DecodeMeasurement {
             cpu_ns: samples,
             batch_bytes,
+            cpu_retry: None,
             link_ns: [link_ns(7.1); PROBE_SAMPLES],
             launch_floor_ns: [FLOOR_NS; PROBE_SAMPLES],
             link_sample_bytes: LINK_SAMPLE_BYTES as u64,
@@ -1798,6 +2616,7 @@ mod tests {
         let measure = |bytes: [u64; PROBE_SAMPLES]| DecodeMeasurement {
             cpu_ns: samples,
             batch_bytes: bytes,
+            cpu_retry: None,
             link_ns: [1_000_000; PROBE_SAMPLES],
             launch_floor_ns: [FLOOR_NS; PROBE_SAMPLES],
             link_sample_bytes: LINK_SAMPLE_BYTES as u64,
@@ -1816,5 +2635,193 @@ mod tests {
         // identical CPU time and 3x the GPU bytes, the per-GPU-byte CPU cost
         // is the median CPU sample scaled by 1x (uniform batches).
         assert_eq!(gpu_costs.cpu_arm_ns, cpu_costs.cpu_arm_ns);
+    }
+
+    /// A Flash-Next-like layer: 512 experts, the first `hot` device-resident, routing
+    /// counts decaying geometrically by expert id (so the hot set holds the mass).
+    fn layer(hot: usize) -> (Vec<bool>, Vec<u64>) {
+        let cold = (0..512).map(|e| e >= hot).collect();
+        let counts = (0..512)
+            .map(|e| (1_000_000.0 * 0.992f64.powi(e as i32)) as u64 + 50)
+            .collect();
+        (cold, counts)
+    }
+
+    /// Interleaving test partition: cold expert of rank `r` goes to the GPU arm when
+    /// `floor((r+1)*ppm) > floor(r*ppm)` (the shipped rule is
+    /// `cpu_splice::pcie_partition`; the model only needs a spread partition).
+    fn spread(cold: &[bool]) -> impl Fn(u32) -> Vec<bool> + '_ {
+        move |ppm| {
+            let mut rank = 0u64;
+            cold.iter()
+                .map(|&c| {
+                    if !c {
+                        return false;
+                    }
+                    let (a, b) = (
+                        rank * u64::from(ppm) / 1_000_000,
+                        (rank + 1) * u64::from(ppm) / 1_000_000,
+                    );
+                    rank += 1;
+                    b > a
+                })
+                .collect()
+        }
+    }
+
+    /// A model from a CPU arm and link rate in GB/s (the selector's own samples), a
+    /// one-expert zero-copy read latency in us and a 700 GB/s device.
+    fn model(cpu_gbps: f64, link_gbps: f64, l1_us: f64) -> ShareModel {
+        let costs = from_rates(cpu_gbps, link_gbps).costs().unwrap();
+        ShareModel::from_costs(&costs, 1.0 / 700.0, l1_us * 1e3, 10)
+    }
+
+    #[test]
+    fn routing_probabilities_sum_to_top_k_and_cap_at_one() {
+        let q = routing_probabilities(&[10, 10, 10, 10], 2);
+        assert_eq!(q, vec![0.5; 4]);
+        let q = routing_probabilities(&[1000, 1, 1], 10);
+        assert_eq!(q[0], 1.0, "a dominant expert is capped at 1");
+        assert!(q.iter().all(|&p| (0.0..=1.0).contains(&p)));
+        // No counts: uniform over the experts.
+        assert_eq!(routing_probabilities(&[0, 0, 0, 0, 0], 10), vec![1.0; 5]);
+        assert!(routing_probabilities(&[], 10).is_empty());
+    }
+
+    #[test]
+    fn count_distribution_is_a_poisson_binomial_with_a_lumped_tail() {
+        let d = count_distribution([0.5, 0.5], 4);
+        assert_eq!(d, vec![0.25, 0.5, 0.25, 0.0, 0.0]);
+        let d = count_distribution([0.3, 0.9, 0.0, 1.0, 0.2], 10);
+        assert!((d.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        let mean: f64 = d.iter().enumerate().map(|(n, p)| n as f64 * p).sum();
+        assert!((mean - 2.4).abs() < 1e-12, "{mean}");
+        // More events than `max` lump into `max`.
+        let d = count_distribution([1.0; 5], 3);
+        assert_eq!(d, vec![0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(count_distribution([], 2), vec![1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn no_pcie_expert_prices_the_arms_as_a_per_call_maximum_plus_the_handoff() {
+        let m = model(70.0, 7.0, 400.0);
+        // One cold expert that is always routed, nothing else: handoff + one CPU expert.
+        let t = m.expected_layer_ns(&[true], &[], &[1.0]);
+        assert!(
+            (t - (m.handoff_ns + m.cpu_ns_per_expert)).abs() < 1e-6,
+            "{t}"
+        );
+        // The same expert read over PCIe: handoff + max(latency, bytes / link); no CPU work.
+        let t = m.expected_layer_ns(&[true], &[true], &[1.0]);
+        let read = m.link_latency_ns.max(m.expert_bytes * m.link_ns_per_byte);
+        assert!((t - (m.handoff_ns + read)).abs() < 1e-6, "{t}");
+        // A never-routed cold expert costs only the handoff.
+        assert!((m.expected_layer_ns(&[true], &[true], &[0.0]) - m.handoff_ns).abs() < 1e-9);
+        // Contention can only slow an overlapped call.
+        let slow = m.with_contention(2.0);
+        let (cold, pcie) = ([true, true], [false, true]);
+        assert!(
+            slow.expected_layer_ns(&cold, &pcie, &[1.0, 1.0])
+                > m.expected_layer_ns(&cold, &pcie, &[1.0, 1.0])
+        );
+        assert_eq!(
+            slow.expected_layer_ns(&cold, &[], &[1.0, 1.0]),
+            m.expected_layer_ns(&cold, &[], &[1.0, 1.0])
+        );
+    }
+
+    #[test]
+    fn xtx_class_link_resolves_every_layer_to_off() {
+        // The measured XTX arm (68.7 GB/s CPU, 7.1 GB/s zero-copy link, hundreds of us per
+        // expert read) over layers with 0..30% of the mass cold: a PCIe read costs several
+        // CPU experts, so no share clears the gain threshold.
+        let m = model(68.7, 7.1, 450.0);
+        for hot in [60, 120, 200, 300, 400] {
+            let (cold, counts) = layer(hot);
+            let plan = m.plan_layer(&cold, &counts, &spread(&cold));
+            assert_eq!(plan.ppm, 0, "hot {hot}: {plan:?}");
+            assert!(
+                plan.best_gain_percent() < SHARE_MIN_GAIN_PERCENT as f64,
+                "hot {hot}: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_slow_cpu_arm_on_a_fast_link_takes_a_share_and_the_threshold_gates_it() {
+        // CPU arm 5 GB/s against a 55 GB/s link and a 40 us read: the GPU arm is far cheaper.
+        let fast_link = model(5.0, 55.0, 40.0);
+        let (cold, counts) = layer(120);
+        let plan = fast_link.plan_layer(&cold, &counts, &spread(&cold));
+        assert!(plan.ppm > 0, "{plan:?}");
+        assert!(
+            plan.best_gain_percent() >= SHARE_MIN_GAIN_PERCENT as f64,
+            "{plan:?}"
+        );
+        assert_eq!(plan.ppm, plan.best_ppm);
+        assert!(plan.best_ns < plan.base_ns);
+        // A faster CPU arm shrinks the gain (and with it the best share) monotonically.
+        let mut last_gain = f64::MAX;
+        for cpu in [5.0, 10.0, 20.0, 40.0, 80.0, 160.0] {
+            let plan = model(cpu, 55.0, 40.0).plan_layer(&cold, &counts, &spread(&cold));
+            assert!(
+                plan.best_gain_percent() <= last_gain + 1e-9,
+                "cpu {cpu}: {plan:?}"
+            );
+            last_gain = plan.best_gain_percent();
+        }
+        // The R9700 class (CPU 75 GB/s, link 55 GB/s, short reads): whatever the model says is
+        // a valid share and never below the threshold when taken.
+        let plan = model(75.0, 55.0, 60.0).plan_layer(&cold, &counts, &spread(&cold));
+        assert!(
+            plan.ppm == 0 || plan.best_gain_percent() >= SHARE_MIN_GAIN_PERCENT as f64,
+            "{plan:?}"
+        );
+        // A layer with nothing cold, or without routing counts of its size, is left alone.
+        assert_eq!(
+            fast_link.plan_layer(&[false; 4], &[1; 4], &spread(&[false; 4])),
+            LayerSharePlan::OFF
+        );
+        assert_eq!(
+            fast_link.plan_layer(&cold, &counts[..10], &spread(&cold)),
+            LayerSharePlan::OFF
+        );
+    }
+
+    #[test]
+    fn pcie_share_mode_resolves_each_layer() {
+        let m = model(5.0, 55.0, 40.0);
+        let (cold, counts) = layer(120);
+        let part = spread(&cold);
+        assert_eq!(
+            PcieShare::Off.plan_layer(&cold, &counts, &part),
+            LayerSharePlan::OFF
+        );
+        assert_eq!(
+            PcieShare::Fixed(250_000)
+                .plan_layer(&cold, &counts, &part)
+                .ppm,
+            250_000
+        );
+        assert_eq!(
+            PcieShare::Fixed(5_000_000)
+                .plan_layer(&cold, &counts, &part)
+                .ppm,
+            1_000_000
+        );
+        assert_eq!(
+            PcieShare::Auto(m).plan_layer(&cold, &counts, &part),
+            m.plan_layer(&cold, &counts, &part)
+        );
+        assert_eq!(PcieShare::Off.describe(), "off");
+        assert_eq!(PcieShare::Fixed(250_000).describe(), "fixed 0.2500");
+        let auto = PcieShare::Auto(m.with_contention(2.0)).describe();
+        assert!(
+            auto.starts_with("auto (measured CPU arm 5.0 GB/s"),
+            "{auto}"
+        );
+        assert!(auto.contains("one-expert zero-copy read 40 us"), "{auto}");
+        assert!(auto.contains(">= 10%"), "{auto}");
+        assert!(auto.ends_with(", contention x2.00)"), "{auto}");
     }
 }

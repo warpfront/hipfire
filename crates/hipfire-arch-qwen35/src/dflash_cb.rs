@@ -38,8 +38,8 @@
 //!   each sampled lane retains its private singleton-b Product dispatch.
 //! * [`dflash_cb_verify`] — whole lanes packed into trunk chunks of at most
 //!   the effective cap (`<= 63` rows; up to 128 with
-//!   `HIPFIRE_CB_VERIFY_CHUNK128` on an admitted dense MQ4G256V2 gfx1201
-//!   target) (`forward_prefill_batch_multi`, ChainVerify fusion, each lane's
+//!   `HIPFIRE_CB_VERIFY_CHUNK128` (default on for gfx1201; `=0` restores 63) on
+//!   an admitted dense MQ4G256V2 gfx1201 target) (`forward_prefill_batch_multi`, ChainVerify fusion, each lane's
 //!   own hidden ring and tape at offset 0). Greedy lanes share a packed head;
 //!   sampled lanes retain actual selector q and private FastTargetRows until
 //!   their shared singleton accept/commit consumer runs.

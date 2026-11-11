@@ -6,29 +6,39 @@
 //!
 //! Numerical scopes are deliberately separate: ordinary and raw HC execute the PM
 //! object against an independent transcription of PLAN §13's gfx1100 singleton
-//! DAG. PM R=1 is an additional scheduling oracle, never the actual-object oracle.
+//! DAG. PM R=1 is an additional scheduling oracle.
 //! Activated HC has no CPU byte claim: gfx1100 exp/rcp semantics are unqualified
-//! in peacemaker-ir, unlike gfx1151/gfx1201. The activated test requires the exact
-//! interpreter refusal at every R, not a host exp2 approximation or an error skip.
+//! in peacemaker-ir, unlike gfx1151/gfx1201. The activated tests require the exact
+//! interpreter refusal at every R (PM and actual singleton alike), not a host exp2
+//! approximation or an error skip.
 //! The six basic emitted opcodes (s_sub_u32/s_sub_co_u32, s_cmp_le_i32, s_bfe_u32,
 //! v_cmp_gt_u32_e32, v_mul_f32_e64, v_cndmask_b32_e32) own decode rows, ALU
 //! dispatch arms and semantics.tbl interpreter rows, so Emulator::new builds
-//! both PM programs. The construction test pins that supported state; every R
-//! then still owes mandatory hardware G1 for actual-singleton bytes.
+//! both PM programs. The construction test pins that supported state.
 //!
 //! Actual singleton evidence uses runtime fixture files, not machine-local
 //! include_bytes!: QWEN4_BF16_GFX1100_FIXTURE_DIR must contain bf16-scalar.co and
 //! bf16-hc.co with the pins below (default: tests/fixtures/gfx1100_singletons/bf16).
 //! Missing files, wrong hashes and lift errors are fatal evidence refusals. The
-//! current actual objects contain unmodeled VOPD integer instructions, including
-//! v_dual_mov_b32; the actual-object test records that precise missing CPU claim.
-//! Neither a refusal assertion nor a PM/DAG comparison is singleton-byte proof.
+//! hipcc objects' VOPD integer instructions (v_dual_mov_b32, ...) now have
+//! interpreter semantics, so both pinned objects construct on the unmodified
+//! gfx1100 interpreter and are executed: for every R=1..64 the actual scalar
+//! singleton (one matrix x one activation row per launch, the C1 oracle of
+//! PLAN §13) and the raw (act=0) HC singleton must produce bytes identical to
+//! the PM tile and therefore to the independent DAG, with identical write
+//! extents, intact guards and unmutated inputs. Only integer/bit operations
+//! and IEEE f32 add/mul/fma under the descriptor's FP modes are claimed.
 //!
-//! Mandatory gfx1100 hardware G1: actual loaded singleton versus every R=1..64,
-//! ordinary scalar/vector tails and x4 masks, raw/activated HC, all quarter tails,
-//! realistic and extreme scales, signed-zero, denormal, infinity and NaN domains.
-//! Record compiler/descriptor/object identity and poison/input immutability. CPU
-//! tests do not qualify exceptional inputs, intrinsic keys, hazards or throughput.
+//! Still refused, never claimed: activated HC (act != 0) at every R. The actual
+//! singleton reaches v_exp_f32 and the interpreter refuses gfx1100 exp bytes; a
+//! host exp2/divide, gfx1100_as_gfx1151 numerics or an error skip would not be a
+//! gfx1100 claim.
+//!
+//! Mandatory gfx1100 hardware G1 (not covered by these CPU tests): actual loaded
+//! singleton versus every R=1..64 for activated HC, realistic and extreme scales,
+//! signed-zero, denormal, infinity and NaN domains. Record compiler/descriptor/
+//! object identity and poison/input immutability. CPU tests do not qualify
+//! exceptional inputs, intrinsic keys, hazards or throughput.
 
 use peacemaker_ir::emu::{Emulator, Launch, Memory};
 use peacemaker_ir::inst::Frontend;
@@ -285,7 +295,8 @@ fn fixed_eight_row_dag_and_no_scalar_float_hc_retagging() {
                 "{forbidden}"
             );
         }
-        assert!(lines.contains(&"s_lshl_b32 s41, s3, 3"));
+        // gfx1100 FeatureUserSGPRInit16Bug: 14 declared user SGPRs, so Y is s15.
+        assert!(lines.contains(&"s_lshl_b32 s41, s15, 3"));
         assert!(lines.contains(&"s_cmp_gt_u32 s31, 64"));
         assert!(lines.contains(&"s_sub_u32 s45, s31, s41"));
         assert!(lines.contains(&"s_min_u32 s40, s45, 8"));
@@ -476,7 +487,14 @@ fn check_output(
     }
 }
 
-fn ordinary_case(emu: &Emulator<'_>, rows: usize, k: usize, ms: [usize; 4], salt: u32) -> Memory {
+fn ordinary_case(
+    emu: &Emulator<'_>,
+    rows: usize,
+    k: usize,
+    ms: [usize; 4],
+    salt: u32,
+    actual: Option<&Emulator<'_>>,
+) -> Memory {
     let mut mem = Memory::default();
     let mut args = vec![0u8; 96];
     let x: Vec<_> = (0..rows * k).map(|i| sample(i, salt)).collect();
@@ -549,35 +567,39 @@ fn ordinary_case(emu: &Emulator<'_>, rows: usize, k: usize, ms: [usize; 4], salt
             &tag,
         );
     }
+    if let Some(actual) = actual {
+        compare_actual_ordinary(actual, &mem, rows, k, ms, &tag);
+    }
     mem
+}
+
+fn ordinary_scalar_sweep(emu: &Emulator<'_>, actual: Option<&Emulator<'_>>) {
+    for rows in 1..=64 {
+        for k in [
+            1, 2, 3, 4, 5, 6, 7, 9, 17, 31, 33, 63, 65, 127, 129, 255, 257, 511, 513,
+        ] {
+            ordinary_case(emu, rows, k, [1, 0, 0, 0], 0x53a9, actual);
+        }
+        // All 32 legal K256 lane masks, both before and after a complete group.
+        for tail in 1..=32 {
+            for full in [0, 256] {
+                ordinary_case(emu, rows, full + 8 * tail, [0, 1, 0, 0], 0x7bd3, actual);
+            }
+        }
+        for k in [768, 1024, 1032] {
+            ordinary_case(emu, rows, k, [0, 0, 1, 0], 0xb517, actual);
+        }
+    }
 }
 
 #[test]
 fn ordinary_every_r_scalar_k_all_residues_and_divisible8_lane_tails() {
     let p = program(false);
     let emu = Emulator::new(&p, ORDINARY).unwrap();
-    for rows in 1..=64 {
-        for k in [
-            1, 2, 3, 4, 5, 6, 7, 9, 17, 31, 33, 63, 65, 127, 129, 255, 257, 511, 513,
-        ] {
-            ordinary_case(&emu, rows, k, [1, 0, 0, 0], 0x53a9);
-        }
-        // All 32 legal K256 lane masks, both before and after a complete group.
-        for tail in 1..=32 {
-            for full in [0, 256] {
-                ordinary_case(&emu, rows, full + 8 * tail, [0, 1, 0, 0], 0x7bd3);
-            }
-        }
-        for k in [768, 1024, 1032] {
-            ordinary_case(&emu, rows, k, [0, 0, 1, 0], 0xb517);
-        }
-    }
+    ordinary_scalar_sweep(&emu, None);
 }
 
-#[test]
-fn ordinary_every_r_x4_differing_heights_and_all_sixteen_empty_live_masks() {
-    let p = program(false);
-    let emu = Emulator::new(&p, ORDINARY).unwrap();
+fn ordinary_x4_sweep(emu: &Emulator<'_>, actual: Option<&Emulator<'_>>) {
     for rows in 1..=64 {
         for mask in 0..16 {
             let ms = std::array::from_fn(|i| {
@@ -588,11 +610,18 @@ fn ordinary_every_r_x4_differing_heights_and_all_sixteen_empty_live_masks() {
                 }
             });
             for k in [33, 264] {
-                ordinary_case(&emu, rows, k, ms, 0x1d35 + mask);
+                ordinary_case(emu, rows, k, ms, 0x1d35 + mask, actual);
             }
         }
-        ordinary_case(&emu, rows, 520, [2, 8, 3, 1], 0x2a79);
+        ordinary_case(emu, rows, 520, [2, 8, 3, 1], 0x2a79, actual);
     }
+}
+
+#[test]
+fn ordinary_every_r_x4_differing_heights_and_all_sixteen_empty_live_masks() {
+    let p = program(false);
+    let emu = Emulator::new(&p, ORDINARY).unwrap();
+    ordinary_x4_sweep(&emu, None);
 }
 
 fn hc_memory(
@@ -666,6 +695,7 @@ fn raw_hc_case(
     m: usize,
     salt: u32,
     scale: f32,
+    actual: Option<&Emulator<'_>>,
 ) -> Memory {
     let (mut mem, expected) = hc_memory(rows, k, m, salt, 0, scale, false);
     let before: Vec<_> = mem.regions.iter().map(|r| r.bytes.clone()).collect();
@@ -678,22 +708,22 @@ fn raw_hc_case(
     }
     check_readonly(&mem, &before);
     check_output(&mem, "y", &before[2], rows, m, &expected, &tag);
+    if let Some(actual) = actual {
+        compare_actual_hc(actual, &mem, rows, k, m, &tag);
+    }
     mem
 }
 
-#[test]
-fn hc_raw_every_r_all_quarter_lane_tails_and_ragged_m() {
-    let p = program(true);
-    let emu = Emulator::new(&p, HC).unwrap();
+fn raw_hc_sweep(emu: &Emulator<'_>, actual: Option<&Emulator<'_>>) {
     for rows in 1..=64 {
         // K/4=8..256 and 264..512: all quarter lane masks and loop transitions.
         for lanes in 1..=32 {
             for full in [0, 1024] {
-                raw_hc_case(&emu, rows, full + 32 * lanes, 1, 0x419d, 0.125);
+                raw_hc_case(emu, rows, full + 32 * lanes, 1, 0x419d, 0.125, actual);
             }
         }
         for m in [1, 2, 3, 7, 8, 9] {
-            raw_hc_case(&emu, rows, 1056, m, 0xa783, -3.25);
+            raw_hc_case(emu, rows, 1056, m, 0xa783, -3.25, actual);
         }
         // act=0 bypasses ALL BF16 rounding, scale and intrinsic arithmetic.
         for scale in [
@@ -705,9 +735,16 @@ fn hc_raw_every_r_all_quarter_lane_tails_and_ragged_m() {
             f32::NEG_INFINITY,
             f32::from_bits(0x7fc1_2345),
         ] {
-            raw_hc_case(&emu, rows, 32, 1, 0x617b, scale);
+            raw_hc_case(emu, rows, 32, 1, 0x617b, scale, actual);
         }
     }
+}
+
+#[test]
+fn hc_raw_every_r_all_quarter_lane_tails_and_ragged_m() {
+    let p = program(true);
+    let emu = Emulator::new(&p, HC).unwrap();
+    raw_hc_sweep(&emu, None);
 }
 
 /// Both PM twins construct: the six basic interpreter rows
@@ -715,9 +752,7 @@ fn hc_raw_every_r_all_quarter_lane_tails_and_ragged_m() {
 /// `v_cmp_gt_u32_e32`, `v_cndmask_b32_e32`, `v_mul_f32_e64`) exist and the
 /// matching dispatch arms execute them. The activated HC twin still has no
 /// CPU byte claim: gfx1100 exp/rcp semantics are unqualified, and the
-/// activated test below requires that exact interpreter refusal at every R.
-/// Actual-singleton VOPD bytes remain hardware-owned (see the
-/// pinned-object test); refusal assertions are not singleton-byte proof.
+/// activated tests below require that exact interpreter refusal at every R.
 #[test]
 fn pm_emulator_construction_reports_exact_missing_semantics() {
     for (hc, symbol) in [(false, ORDINARY), (true, HC)] {
@@ -876,71 +911,300 @@ fn every_r_grid_has_unique_outputs_and_row_local_quarter_partial_owners() {
     }
 }
 
-#[test]
-fn pinned_actual_singleton_objects_report_exact_missing_cpu_semantics() {
+/// Pinned, descriptor-checked, lifted hipcc singleton `FIXTURES[idx]`. Missing
+/// files, wrong hashes, a changed descriptor or a lift error are fatal evidence
+/// refusals; PM/DAG or another arch is never substituted.
+fn actual_object(idx: usize) -> Program {
     let dir = std::env::var_os("QWEN4_BF16_GFX1100_FIXTURE_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/gfx1100_singletons/bf16")
         });
-    for (name, symbol, sha, cache, source_sha) in FIXTURES {
-        let path = dir.join(name);
-        let bytes = std::fs::read(&path).unwrap_or_else(|err| panic!(
-            "ACTUAL-OBJECT CPU EVIDENCE REFUSED: {}: {err}; supply QWEN4_BF16_GFX1100_FIXTURE_DIR with pinned extracted objects; never substitute PM/DAG or another arch", path.display(),
-        ));
-        assert_eq!(
-            format!("{:x}", Sha256::digest(&bytes)),
-            sha,
-            "{}: singleton pin",
-            path.display()
-        );
-        // File offsets of the frozen AMDHSA KD RSRC1 words, provided by the
-        // object inspection in PLAN §13. Pins above make these offsets stable.
-        let (offset, expected) = if name == "bf16-scalar.co" {
-            (0x6b0, 0xe0af_0003u32)
-        } else {
-            (0x90f0, 0xe0af_000du32)
-        };
-        let rsrc1 = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        assert_eq!(rsrc1, expected, "{symbol}: pinned descriptor");
-        assert_eq!((rsrc1 >> 12) & 15, 0, "round32 and round16_64 RN");
-        assert_eq!((rsrc1 >> 16) & 15, 15, "all denormals preserved");
-        assert_eq!((rsrc1 >> 21) & 1, 1, "DX10 clamp");
-        assert_eq!((rsrc1 >> 23) & 1, 1, "IEEE");
-        assert_eq!((rsrc1 >> 26) & 1, 0, "FP16 overflow");
-        assert_eq!((rsrc1 >> 29) & 1, 1, "WGP");
-        let p = peacemaker_lift::lift_object(&bytes, peacemaker_lift::Options { frontend: Frontend::Hipcc })
-            .unwrap_or_else(|err| panic!("ACTUAL-OBJECT CPU EVIDENCE REFUSED: {name} lift: {err}; missing claim requires hardware G1")).program;
-        assert_eq!(p.target.arch, IR_ARCH);
+    let (name, symbol, sha, cache, source_sha) = FIXTURES[idx];
+    let path = dir.join(name);
+    let bytes = std::fs::read(&path).unwrap_or_else(|err| panic!(
+        "ACTUAL-OBJECT CPU EVIDENCE REFUSED: {}: {err}; supply QWEN4_BF16_GFX1100_FIXTURE_DIR with pinned extracted objects; never substitute PM/DAG or another arch", path.display(),
+    ));
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&bytes)),
+        sha,
+        "{}: singleton pin",
+        path.display()
+    );
+    // File offsets of the frozen AMDHSA KD RSRC1 words, provided by the
+    // object inspection in PLAN §13. Pins above make these offsets stable.
+    let (offset, expected) = if name == "bf16-scalar.co" {
+        (0x6b0, 0xe0af_0003u32)
+    } else {
+        (0x90f0, 0xe0af_000du32)
+    };
+    let rsrc1 = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+    assert_eq!(rsrc1, expected, "{symbol}: pinned descriptor");
+    assert_eq!((rsrc1 >> 12) & 15, 0, "round32 and round16_64 RN");
+    assert_eq!((rsrc1 >> 16) & 15, 15, "all denormals preserved");
+    assert_eq!((rsrc1 >> 21) & 1, 1, "DX10 clamp");
+    assert_eq!((rsrc1 >> 23) & 1, 1, "IEEE");
+    assert_eq!((rsrc1 >> 26) & 1, 0, "FP16 overflow");
+    assert_eq!((rsrc1 >> 29) & 1, 1, "WGP");
+    let p = peacemaker_lift::lift_object(&bytes, peacemaker_lift::Options { frontend: Frontend::Hipcc })
+        .unwrap_or_else(|err| panic!("ACTUAL-OBJECT CPU EVIDENCE REFUSED: {name} lift: {err}; missing claim requires hardware G1")).program;
+    assert_eq!(p.target.arch, IR_ARCH);
+    eprintln!("ACTUAL-OBJECT CPU EVIDENCE: {symbol} object={name} sha256={sha} cache={cache} source_sha256={source_sha}");
+    p
+}
+
+/// The pinned singletons are fully executable: every decoded opcode has an
+/// interpreter semantics row and `Emulator::new` accepts them on the plain
+/// gfx1100 interpreter (no gfx1151 numerics substitution).
+#[test]
+fn pinned_actual_singleton_objects_construct_with_complete_semantics() {
+    for (idx, (_, symbol, ..)) in FIXTURES.into_iter().enumerate() {
+        let p = actual_object(idx);
         let kernel = p
             .kernels
             .iter()
             .find(|k| k.symbol.0 == symbol)
             .expect("pinned singleton export");
         let mut absent = BTreeSet::new();
-        let mut first = None;
         for id in &kernel.body.layout {
             let inst = kernel.body.insts.get(*id).unwrap();
             let row =
                 peacemaker_ir::isa::lookup(IR_ARCH, inst.op, inst.form).expect("decoded opcode");
             if peacemaker_ir::emu::semantic_class(row.name).is_none() {
                 absent.insert(row.name.to_string());
-                if first.is_none() {
-                    first = Some(row.name.to_string());
-                }
             }
         }
-        // The blocker set shrinks as the interpreter gains rows (the VOPD `v_dual_*` rows are modeled now);
-        // the singleton stays CPU-unclaimed exactly while any row is absent and `Emulator::new` refuses it.
-        assert!(!absent.is_empty(), "missing actual-object blocker changed: require complete singleton-byte comparisons rather than treating this gap test as proof: {absent:?}");
-        let err = match Emulator::new(&p, symbol) {
-            Ok(_) => panic!("actual singleton became executable: replace refusal with mandatory all-R byte comparisons"),
-            Err(err) => err,
-        };
-        assert_eq!(err, format!("no semantics for {}", first.unwrap()));
-        eprintln!("ABSENT ACTUAL-OBJECT CPU BYTE CLAIM: {symbol} object={name} sha256={sha} cache={cache} source_sha256={source_sha} missing={absent:?}; first={err}; every R=1..64 ordinary/raw/activated HC requires actual-singleton hardware G1, not PM C1 or DAG fallback");
+        assert!(
+            absent.is_empty(),
+            "{symbol}: actual singleton has interpreter-unmodeled rows: {absent:?}"
+        );
+        Emulator::new(&p, symbol)
+            .unwrap_or_else(|err| panic!("{symbol}: actual singleton construction failed: {err}"));
     }
+}
+
+/// hipcc kernarg segment for the explicit ABI plus zeroed hidden arguments.
+const ACTUAL_KERNARG: usize = 256;
+
+/// Copy `tiled`'s inputs into a fresh memory: poison every `y*`, replace the PM
+/// kernarg by a zeroed hipcc one. Returns the pristine bytes of every region.
+fn actual_memory(tiled: &Memory) -> (Memory, Vec<Vec<u8>>) {
+    let mut single = Memory::default();
+    for region in &tiled.regions {
+        if region.name == "kernarg" {
+            continue;
+        }
+        let bytes = if region.name.starts_with('y') {
+            poison(region.bytes.len() / 4)
+        } else {
+            region.bytes.clone()
+        };
+        single.map(region.name.clone(), region.base, bytes).unwrap();
+    }
+    single
+        .map("kernarg".into(), KARG, vec![0u8; ACTUAL_KERNARG])
+        .unwrap();
+    let before = single.regions.iter().map(|r| r.bytes.clone()).collect();
+    (single, before)
+}
+
+/// The kernel neither wrote nor mutated anything outside the `y*` outputs.
+fn assert_actual_inputs_intact(single: &Memory, before: &[Vec<u8>], tag: &str) {
+    for (region, original) in single.regions.iter().zip(before) {
+        if region.name == "kernarg" {
+            assert_eq!(region.written.count(), 0, "{tag}: kernarg written");
+        } else if !region.name.starts_with('y') {
+            assert_eq!(&region.bytes, original, "{tag}: {} mutated", region.name);
+            assert_eq!(region.written.count(), 0, "{tag}: {} written", region.name);
+        }
+    }
+}
+
+/// The actual singleton's memory is bytewise the PM tile's (itself equal to the
+/// independent DAG inside `ordinary_case`/`raw_hc_case`): identical outputs,
+/// identical write extents, guards intact, inputs unmutated and unwritten, and
+/// the kernarg never written by the kernel.
+fn assert_actual_matches(tiled: &Memory, single: &Memory, before: &[Vec<u8>], tag: &str) {
+    assert_eq!(tiled.regions.len(), single.regions.len(), "{tag}: regions");
+    assert_actual_inputs_intact(single, before, tag);
+    for region in single.regions.iter().filter(|r| r.name.starts_with('y')) {
+        let tile = tiled
+            .regions
+            .iter()
+            .find(|r| r.name == region.name)
+            .unwrap();
+        assert_eq!(
+            tile.bytes, region.bytes,
+            "actual singleton != PM/DAG: {tag}: {}",
+            region.name
+        );
+        assert_eq!(
+            tile.written.count(),
+            region.written.count(),
+            "{tag}: {} write extents",
+            region.name
+        );
+        for byte in 0..tile.bytes.len() {
+            assert_eq!(
+                tile.written.contains(byte),
+                region.written.contains(byte),
+                "{tag}: {} byte={byte}",
+                region.name
+            );
+        }
+    }
+}
+
+/// Actual hipcc `gemv_bf16_xf32`: one (matrix, activation row) per launch with
+/// that row's x pointer and y pointer, grid [M] plus the one-past-the-end
+/// workgroup whose `row >= M` exit must neither load nor store.
+fn compare_actual_ordinary(
+    actual: &Emulator<'_>,
+    tiled: &Memory,
+    rows: usize,
+    k: usize,
+    ms: [usize; 4],
+    tag: &str,
+) {
+    let (mut single, before) = actual_memory(tiled);
+    let ka = single
+        .regions
+        .iter()
+        .position(|r| r.name == "kernarg")
+        .unwrap();
+    for row in 0..rows {
+        for (i, &m) in ms.iter().enumerate() {
+            if m == 0 {
+                continue;
+            }
+            let args = &mut single.regions[ka].bytes;
+            put64(args, 0, wbase(i));
+            put64(args, 8, X + (4 * row * k) as u64);
+            put64(args, 16, ybase(i) + (GUARD + 4 * row * m) as u64);
+            put32(args, 24, m as u32);
+            put32(args, 28, k as u32);
+            for gx in 0..=m as u32 {
+                actual
+                    .run_workgroup(&launch(false, gx, 0), &mut single)
+                    .unwrap_or_else(|err| {
+                        panic!("actual singleton {tag} row={row} matrix={i} wg={gx}: {err}")
+                    });
+            }
+        }
+    }
+    assert_actual_matches(tiled, &single, &before, tag);
+}
+
+/// Actual-singleton HC memory: `tiled`'s inputs plus a hipcc kernarg whose
+/// explicit args W,x,y,M,K,scale,hc_act are the PM kernarg's first 40 bytes.
+fn actual_hc_memory(tiled: &Memory) -> (Memory, Vec<Vec<u8>>, usize) {
+    let (mut single, before) = actual_memory(tiled);
+    let ka = single
+        .regions
+        .iter()
+        .position(|r| r.name == "kernarg")
+        .unwrap();
+    let pm_args = &tiled
+        .regions
+        .iter()
+        .find(|r| r.name == "kernarg")
+        .unwrap()
+        .bytes;
+    single.regions[ka].bytes[..40].copy_from_slice(&pm_args[..40]);
+    (single, before, ka)
+}
+
+/// Actual hipcc `gemv_bf16_xf32_k4` (act=0): one activation row per launch,
+/// grid [M] plus the one-past-the-end workgroup, block 128.
+fn compare_actual_hc(
+    actual: &Emulator<'_>,
+    tiled: &Memory,
+    rows: usize,
+    k: usize,
+    m: usize,
+    tag: &str,
+) {
+    let (mut single, before, ka) = actual_hc_memory(tiled);
+    for row in 0..rows {
+        let args = &mut single.regions[ka].bytes;
+        put64(args, 8, X + (4 * row * k) as u64);
+        put64(args, 16, ybase(0) + (GUARD + 4 * row * m) as u64);
+        for gx in 0..=m as u32 {
+            actual
+                .run_workgroup(&launch(true, gx, 0), &mut single)
+                .unwrap_or_else(|err| panic!("actual singleton {tag} row={row} wg={gx}: {err}"));
+        }
+    }
+    assert_actual_matches(tiled, &single, &before, tag);
+}
+
+#[test]
+fn actual_singleton_ordinary_scalar_every_r_equals_pm_and_dag_bytes() {
+    let pm = program(false);
+    let pm_emu = Emulator::new(&pm, ORDINARY).unwrap();
+    let obj = actual_object(0);
+    let actual = Emulator::new(&obj, FIXTURES[0].1).unwrap();
+    ordinary_scalar_sweep(&pm_emu, Some(&actual));
+}
+
+#[test]
+fn actual_singleton_ordinary_x4_every_r_equals_pm_and_dag_bytes() {
+    let pm = program(false);
+    let pm_emu = Emulator::new(&pm, ORDINARY).unwrap();
+    let obj = actual_object(0);
+    let actual = Emulator::new(&obj, FIXTURES[0].1).unwrap();
+    ordinary_x4_sweep(&pm_emu, Some(&actual));
+}
+
+#[test]
+fn actual_singleton_raw_hc_every_r_equals_pm_and_dag_bytes() {
+    let pm = program(true);
+    let pm_emu = Emulator::new(&pm, HC).unwrap();
+    let obj = actual_object(1);
+    let actual = Emulator::new(&obj, FIXTURES[1].1).unwrap();
+    raw_hc_sweep(&pm_emu, Some(&actual));
+}
+
+/// Activated HC stays an explicit refusal on the actual object too: the hipcc
+/// singleton reaches the gfx1100 transcendental and the interpreter refuses it
+/// before any store, at every R. No byte identity is claimed for act != 0.
+#[test]
+fn actual_singleton_hc_activated_every_r_precisely_refuses_unqualified_gfx1100_exp_bytes() {
+    let obj = actual_object(1);
+    let actual = Emulator::new(&obj, FIXTURES[1].1).unwrap();
+    for rows in 1..=64 {
+        for act in [1, u32::MAX] {
+            // Same domain as the PM refusal test: n=-4 reaches exp, not the
+            // independently unqualified negative-to-zero case.
+            let (tiled, _) = hc_memory(rows, 32, 1, 0, act, 0.125, true);
+            let (mut single, before, ka) = actual_hc_memory(&tiled);
+            for row in 0..rows {
+                let args = &mut single.regions[ka].bytes;
+                put64(args, 8, X + (4 * row * 32) as u64);
+                put64(args, 16, ybase(0) + (GUARD + 4 * row) as u64);
+                let err = actual
+                    .run_workgroup(&launch(true, 0, 0), &mut single)
+                    .expect_err("gfx1100 activation became executable on the actual singleton: require actual intrinsic-key and singleton byte oracle, not this gap assertion");
+                assert!(
+                    err.contains(" v_exp_f32_e32: unqualified numerical architecture Gfx1100"),
+                    "R={rows} act={act} row={row}: unexpected refusal: {err}"
+                );
+                if rows == 1 && act == 1 {
+                    eprintln!("actual singleton activated refusal: {err}");
+                }
+            }
+            let tag = format!("activated refusal R={rows} act={act}");
+            assert_actual_inputs_intact(&single, &before, &tag);
+            let y = single.regions.iter().find(|r| r.name == "y").unwrap();
+            assert_eq!(
+                y.bytes, before[2],
+                "{tag}: refusal must precede any output store"
+            );
+            assert_eq!(y.written.count(), 0, "{tag}: y written");
+        }
+    }
+    eprintln!("ABSENT CPU CLAIM: activated actual-singleton HC bytes at every R=1..64; gfx1100 v_exp_f32/v_rcp_f32 observations are unqualified. Mandatory actual-singleton hardware G1; no host exp2/divide fallback.");
 }
 
 /// Separate R=1 launches use each full-window row's actual pointer. Neither
@@ -1025,10 +1289,10 @@ fn ordinary_and_raw_hc_every_r_also_equal_independent_pm_c1_launches() {
     for rows in 1..=64 {
         for k in [33, 264] {
             let ms = [1, 2, 3, 9];
-            let tiled = ordinary_case(&ordinary_emu, rows, k, ms, 0x91b7);
+            let tiled = ordinary_case(&ordinary_emu, rows, k, ms, 0x91b7, None);
             compare_pm_c1(&ordinary_emu, false, &tiled, rows, k, ms);
         }
-        let tiled = raw_hc_case(&hc_emu, rows, 1056, 3, 0xb41d, 0.125);
+        let tiled = raw_hc_case(&hc_emu, rows, 1056, 3, 0xb41d, 0.125, None);
         compare_pm_c1(&hc_emu, true, &tiled, rows, 1056, [3, 0, 0, 0]);
     }
 }

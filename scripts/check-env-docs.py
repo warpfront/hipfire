@@ -37,6 +37,9 @@ BOOTSTRAP_ENV = {
     # hipfire-runtime ple_q4.rs #[cfg(test)]; never read by runtime code.
     "HIPFIRE_PROBE_MODEL",
     "HIPFIRE_PROBE_ROWS",
+    # Test-only HF tokenizer.json path of the #[ignore]d Raon tokenizer parity
+    # check in hipfire-runtime tokenizer.rs #[cfg(test)]; never read by runtime code.
+    "HIPFIRE_RAON_TOKENIZER",
     # Test-only fixture path of the #[ignore]d packed-host-expert parity check in
     # hipfire-arch-qwen35 qwen35/load.rs #[cfg(test)]; never read by runtime code.
     "HIPFIRE_MOE_PARITY_FIXTURE",

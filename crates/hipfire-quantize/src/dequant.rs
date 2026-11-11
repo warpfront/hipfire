@@ -101,6 +101,18 @@ pub(crate) fn tensor_to_f32_with_optional_fp8_scale(
             .unwrap_or_else(|| panic!("FP8 scale tensor missing: {sname}"));
         if smeta.dtype == "F8_E8M0" {
             return dequantize_e4m3_ue8m0_to_f32(raw_data, &meta.shape, sbytes, &smeta.shape);
+        } else if smeta.dtype == "U8"
+            && meta.dtype == "F8_E4M3"
+            && smeta.shape.len() == 2
+            && meta.shape.len() == 2
+            && smeta.shape[0] == meta.shape[0]
+            && smeta.shape[1] * 32 == meta.shape[1]
+        {
+            // MXFP8 (`quantization_config.weight_block_size == [1,32]`): the
+            // `.weight_scale_inv` U8 tensor is RAW E8M0 exponent bytes, not an
+            // F32 multiplier. Shape-implied [1,32] block; strict validation.
+            return dequantize_mxfp8_e8m0_strict(raw_data, &meta.shape, sbytes, &smeta.shape, 32)
+                .unwrap_or_else(|e| panic!("MXFP8 dequant of {name}: {e}"));
         } else if smeta.dtype == "F32" {
             // MiniMax-M2: e4m3 + F32 block-[128,128] weight_scale_inv (multiply).
             return dequantize_e4m3_f32scale_to_f32(raw_data, &meta.shape, sbytes, &smeta.shape);
@@ -275,6 +287,76 @@ pub(crate) fn dequantize_e4m3_ue8m0_to_f32(
         }
     }
     out
+}
+
+/// Strict E4M3 byte → f32. The single NaN code (`S.1111.111`) is an error:
+/// unlike [`e4m3_to_f32`] it never decays to 0.
+pub(crate) fn e4m3_to_f32_strict(byte: u8) -> Result<f32, String> {
+    if (byte & 0x7f) == 0x7f {
+        return Err(format!("E4M3 NaN code 0x{byte:02x}"));
+    }
+    Ok(e4m3_to_f32(byte))
+}
+
+/// Exact `2^(byte-127)` for an E8M0 exponent byte (`byte == 0` is the f32
+/// subnormal `2^-127`). `0xFF` is the E8M0 NaN code and is refused.
+pub(crate) fn e8m0_to_scale_strict(byte: u8) -> Result<f32, String> {
+    match byte {
+        255 => Err("E8M0 exponent byte 255 (NaN code)".to_string()),
+        0 => Ok(f32::from_bits(0x0040_0000)),
+        b => Ok(f32::from_bits((b as u32) << 23)),
+    }
+}
+
+/// Dequantize an MXFP8 `[N,K]` E4M3 weight with raw E8M0 exponent bytes
+/// `[N,K/block_k]` (OCP MX; checkpoint `quantization_config.weight_block_size`
+/// `[1, block_k]`): `value = float32(E4M3) * 2^(u8 - 127)`.
+///
+/// The scale tensor is raw exponent bytes (`U8` or `F8_E8M0` storage), never
+/// an F32 multiplier and never a block-128 grid. Every code is validated:
+/// E4M3 NaN, E8M0 255 and any non-finite product are errors (no NaN→0).
+pub(crate) fn dequantize_mxfp8_e8m0_strict(
+    weight_bytes: &[u8],
+    weight_shape: &[usize],
+    scale_bytes: &[u8],
+    scale_shape: &[usize],
+    block_k: usize,
+) -> Result<Vec<f32>, String> {
+    if weight_shape.len() != 2 || scale_shape.len() != 2 || block_k == 0 {
+        return Err(format!(
+            "MXFP8 needs 2-D weight/scale, got {weight_shape:?} / {scale_shape:?}"
+        ));
+    }
+    let (rows, cols) = (weight_shape[0], weight_shape[1]);
+    if cols % block_k != 0 || scale_shape != [rows, cols / block_k] {
+        return Err(format!(
+            "MXFP8 scale shape {scale_shape:?} is not [{rows}, {}] for weight {weight_shape:?} \
+             with block [1,{block_k}]",
+            cols / block_k.max(1)
+        ));
+    }
+    if weight_bytes.len() != rows * cols || scale_bytes.len() != scale_shape[0] * scale_shape[1] {
+        return Err("MXFP8 byte count does not match shape".to_string());
+    }
+    let sc = cols / block_k;
+    let mut out = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for j in 0..sc {
+            let scale = e8m0_to_scale_strict(scale_bytes[r * sc + j])
+                .map_err(|e| format!("scale[{r},{j}]: {e}"))?;
+            for c in j * block_k..(j + 1) * block_k {
+                let v = e4m3_to_f32_strict(weight_bytes[r * cols + c])
+                    .map_err(|e| format!("weight[{r},{c}]: {e}"))? as f64
+                    * scale as f64;
+                let v32 = v as f32;
+                if !v32.is_finite() {
+                    return Err(format!("weight[{r},{c}]: non-finite dequantized value"));
+                }
+                out[r * cols + c] = v32;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Dequantize FP8 E4M3 weights paired with an F32 block-[128,128]

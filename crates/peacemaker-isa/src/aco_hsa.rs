@@ -1245,7 +1245,7 @@ pub fn adapt_to_hsa(
             covered.insert(n, i);
         }
     }
-    let live = Liveness::analyze(&kernel.body);
+    let live = Liveness::analyze(&kernel.body, arch, kernel.wave);
     let first = *kernel
         .body
         .layout

@@ -182,7 +182,7 @@ Proof obligations that exist in source (not run here): `fn_route_plan.rs::every_
 
 `qwen36_27b_route` (crates/rdna-compute/src/kernel_registry.rs:5303) returns a route only if: gpu arch `gfx1201`, model_arch 5, heads/kv/head_dim 24/4/256, 64 layers, 464 projection tensors all MQ4G256V2, lm_head MQ4G256V2 [248320,5120], embed Q8_0 [248320,5120], and three anchor shapes (mlp gate L0 [17408,5120], in_proj_qkv L0 [10240,5120], q_proj L3 [12288,5120]). It then requires KV fp8/fp8, state q8, max_seq 2..=262144, prefill chunk 512..=8192, spec Ar or NativeMtp (native MTP needs the MQ4G256 sidecar head tensors, otherwise refuse), builtin feature flags except `pm_decode`, no host-mapped experts. The loader additionally refuses pp>1, CASK sidecar, adaptive KV, any DFlash draft, n-gram drafter, `-dspark` sibling, vision tower, and `HIPFIRE_ROUTE_PLAN=0` (crates/hipfire-loader/src/lib.rs:2973).
 
-Frozen manifest (`jit-a3/27b-xts-gfx1201.a3.json`, hipcc recipe with `pm_decode=false`): AR 71 entries / 117 symbols; native MTP 95 entries / 141 symbols (24 MTP-only modules). Default `pm_decode=true` replaces accepted HIP entries with embedded twins (test `pm_decode_twins_replace_their_hip_route_entries`). Tests (not run here): `jit_a3_route_plan.rs::qwen36_27b_gfx1201_plans_are_exact_frozen_manifests`, `::every_observed_route_symbol_is_planned_with_its_observed_identity`, `::explicit_drafter_and_unclosed_routes_refuse`.
+Frozen manifest (`jit-a3/27b-xts-gfx1201.a3.json`, hipcc recipe with `pm_decode=false`): AR 72 entries / 120 symbols; native MTP 101 entries / 149 symbols (29 MTP-only modules). Default `pm_decode=true` replaces accepted HIP entries with embedded twins (test `pm_decode_twins_replace_their_hip_route_entries`). Tests (not run here): `jit_a3_route_plan.rs::qwen36_27b_gfx1201_plans_are_exact_frozen_manifests`, `::every_observed_route_symbol_is_planned_with_its_observed_identity`, `::explicit_drafter_and_unclosed_routes_refuse`.
 
 Exact-identity proof exists for one artifact only, `qwen3.8-27b.mq4-xts` (SX in section 3). The other 22 arch-5 dense files are static-selector candidates (SC): the closure code path would apply only if their unread headers satisfy the fingerprint and policy conditions above, so none of them counts as a closed route. `docs/jit-g0-inventory.md` and `A3-closure-audit.md` record that the G0 point observations are lower bounds, not an oracle for all-row/tail/max-context/graph shapes.
 
@@ -213,7 +213,7 @@ Existing trace fixtures (`assert_trace_packaged`, crates/rdna-compute/src/kernel
 | kernel-trace-qwen35.tsv | gfx1100 | 111 | 124 | ornith-1.5-35b-a3b.mq4 (MoE), qwen3.8-27b.mq4-xts (dense, load + AR) |
 | kernel-trace-qwen35.tsv | gfx1151 | 99 | 111 | same |
 | kernel-trace-qwen35.tsv | gfx1201 | 115 | 120 | same, plus 27B DFlash cold additions |
-| kernel-trace-qwen4-flash-next.tsv | gfx1100 | 0 | 0 | none (no gfx1100 Flash-Next trace exists) |
+| kernel-trace-qwen4-flash-next.tsv | gfx1100 | 55 | 129 | XTX route walk of the canonical mq4-xts header (`route_plan_walk.py --profile xtx-fn-bounded`, AR + native MTP), not a cold-cache trace |
 | kernel-trace-qwen4-flash-next.tsv | gfx1151 | 55 | 132 | flash-next-gptq3.mq4, then-shipped flash-next.mq4, cold-cache pack runs |
 | kernel-trace-qwen4-flash-next.tsv | gfx1201 | 52 | 113 | gptq3 (host-mapped experts), flash-next.mq4, cold pack runs |
 

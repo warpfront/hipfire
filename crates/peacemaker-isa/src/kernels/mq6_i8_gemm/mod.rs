@@ -64,7 +64,7 @@ use peacemaker_author::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-pub use spec::{Epi, Raster, Spec, Tile};
+pub use spec::{Epi, Raster, RingDepth, Spec, Tile, Tune};
 
 pub const ENTRY: &str = "entry";
 pub const K_BEGIN: &str = ".Lmq6i8_k_begin";
@@ -145,6 +145,10 @@ pub struct Gen {
     /// triple per weight round (`Tile::a_rounds` / `w_rounds` of them).
     pub(crate) a_pf: Vec<u8>,
     pub(crate) w_pf: Vec<u8>,
+    /// The depth-3 ring's second raw prefetch set (same shapes as `a_pf` / `w_pf`, empty at
+    /// depth 2); [`Gen::pf_set`] swaps it in.
+    pub(crate) a_pf_b: Vec<u8>,
+    pub(crate) w_pf_b: Vec<u8>,
     pub(crate) ds_nx: u8,
     pub(crate) sz_nx: u8,
     pub(crate) fr_a: u8,
@@ -196,6 +200,29 @@ impl Gen {
     pub fn spec(&self) -> Spec {
         self.spec
     }
+    /// The A/W ring depth this generator was built for (`2` or `3`).
+    pub fn depth(&self) -> usize {
+        match self.spec.tune.ring {
+            RingDepth::Two => 2,
+            RingDepth::Three => 3,
+        }
+    }
+    /// This generator with raw prefetch set `set` in the `a_pf` / `w_pf` slots every fetch, decode
+    /// and store block reads (`0`: the base set; `1`: the depth-3 ring's second set). Everything
+    /// else of the register map is shared.
+    pub fn pf_set(&self, set: usize) -> Result<Gen, String> {
+        match set {
+            0 => Ok(self.clone()),
+            1 if self.depth() == 3 => {
+                let mut g = self.clone();
+                std::mem::swap(&mut g.a_pf, &mut g.a_pf_b);
+                std::mem::swap(&mut g.w_pf, &mut g.w_pf_b);
+                Ok(g)
+            }
+            1 => Err("prefetch set 1 exists at ring depth 3 only".into()),
+            _ => Err(format!("prefetch set {set} out of range (0, 1)")),
+        }
+    }
     /// The kernel header (symbol, kernargs, workgroup size) of this spec.
     pub fn kernel_spec(&self) -> KernelSpec {
         let spec = self.spec;
@@ -208,7 +235,7 @@ impl Gen {
             user_sgpr_count: 2,
             system_sgpr_workgroup_id_y: true,
             workgroup_size: self.spec.tile.threads() as u16,
-            group_segment_fixed_size: 0,
+            group_segment_fixed_size: spec.static_lds(),
             wave32: true,
             cu_mode: false,
         }
@@ -231,6 +258,10 @@ impl Gen {
             "a_pf1" => return self.a_pf.get(1).copied(),
             "w_pf0" => self.w_pf[0],
             "w_pf1" => return self.w_pf.get(1).copied(),
+            "a_pf_b0" => return self.a_pf_b.first().copied(),
+            "a_pf_b1" => return self.a_pf_b.get(1).copied(),
+            "w_pf_b0" => return self.w_pf_b.first().copied(),
+            "w_pf_b1" => return self.w_pf_b.get(1).copied(),
             "ds_nx" => self.ds_nx,
             "sz_nx" => self.sz_nx,
             "fr_a" => self.fr_a,
@@ -288,6 +319,9 @@ impl Gen {
             "DS1" => (l.ds[1], l.ds_bytes),
             "SZ0" => (l.sz[0], l.sz_bytes),
             "SZ1" => (l.sz[1], l.sz_bytes),
+            // The third A/W slab buffers exist at depth 3 only.
+            "A2" if self.depth() == 3 => (l.a_slot(2).ok()?, l.a_bytes),
+            "W2" if self.depth() == 3 => (l.w_slot(2).ok()?, l.w_bytes),
             _ => return None,
         })
     }
@@ -312,6 +346,23 @@ impl Gen {
             msn: 161,
             a_pf: [164, 166][..spec.tile.a_rounds() as usize].to_vec(),
             w_pf: [168, 171][..spec.tile.w_rounds() as usize].to_vec(),
+            // The depth-3 ring's second raw prefetch set, past the depth-2 map (192 VGPRs): the
+            // activation pairs, then the weight triples.
+            a_pf_b: if spec.tune.ring == RingDepth::Three {
+                (0..spec.tile.a_rounds() as u8)
+                    .map(|r| 192 + 2 * r)
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            w_pf_b: if spec.tune.ring == RingDepth::Three {
+                let base = 192 + 2 * spec.tile.a_rounds() as u8;
+                (0..spec.tile.w_rounds() as u8)
+                    .map(|r| base + 3 * r)
+                    .collect()
+            } else {
+                Vec::new()
+            },
             ds_nx: 160,
             sz_nx: 162,
             fr_a: 163,
@@ -353,7 +404,7 @@ impl Gen {
 
     /// The register plan of this assignment (a script may add ranges before building).
     pub fn plan(&self) -> Result<RegPlan, String> {
-        let mut p = RegPlan::new(spec::VGPR_CEILING, 104)?;
+        let mut p = RegPlan::new(self.spec.vgpr_budget(), 104)?;
         let pro = || Live::Between(ENTRY.into(), K_BEGIN.into());
         let kl = || Live::Between(K_BEGIN.into(), EPI.into());
         let kernel = || Live::Between(ENTRY.into(), EPI.into());
@@ -377,6 +428,15 @@ impl Gen {
         for &r in &self.w_pf {
             for i in 0..3u8 {
                 p.v::<1>("w_pf", r + i, kernel())?;
+            }
+        }
+        // The depth-3 ring's second raw prefetch set.
+        for &r in &self.a_pf_b {
+            p.v::<2>("a_pf_b", r, kernel())?;
+        }
+        for &r in &self.w_pf_b {
+            for i in 0..3u8 {
+                p.v::<1>("w_pf_b", r + i, kernel())?;
             }
         }
         for (name, r) in [
@@ -481,6 +541,47 @@ impl Gen {
             Ring::new(s0, s1),
         ))
     }
+
+    /// The depth-3 rings: A and W over three slab buffers each (`A0 W0 A1 W1 A2 W2`), DS/SZ over
+    /// their two planes; every buffer `Free`.
+    #[allow(clippy::type_complexity)]
+    fn declare_lds3(
+        &self,
+        wg: &mut Wg,
+    ) -> Result<
+        (
+            Ring<PayA, Free, Free, 3>,
+            Ring<PayW, Free, Free, 3>,
+            Ring<MetaD, Free, Free>,
+            Ring<MetaS, Free, Free>,
+        ),
+        String,
+    > {
+        let l = self.spec.tile.layout();
+        let slab = |wg: &mut Wg, s: usize, an: &str, wn: &str| {
+            Ok::<_, String>((
+                wg.lds(an, l.a_slot(s)?, l.a_bytes)?,
+                wg.lds(wn, l.w_slot(s)?, l.w_bytes)?,
+            ))
+        };
+        let (a0, w0) = slab(wg, 0, "A0", "W0")?;
+        let (a1, w1) = slab(wg, 1, "A1", "W1")?;
+        let (a2, w2) = slab(wg, 2, "A2", "W2")?;
+        let (d0, d1) = (
+            wg.lds("DS0", l.ds[0], l.ds_bytes)?,
+            wg.lds("DS1", l.ds[1], l.ds_bytes)?,
+        );
+        let (s0, s1) = (
+            wg.lds("SZ0", l.sz[0], l.sz_bytes)?,
+            wg.lds("SZ1", l.sz[1], l.sz_bytes)?,
+        );
+        Ok((
+            Ring::new_n([a0, a1, a2])?,
+            Ring::new_n([w0, w1, w2])?,
+            Ring::new(d0, d1),
+            Ring::new(s0, s1),
+        ))
+    }
 }
 
 pub enum PayA {}
@@ -489,20 +590,38 @@ pub enum MetaD {}
 pub enum MetaS {}
 pub(crate) type Wg<'b> = Workgroup<'b, Gfx1201, Builder>;
 pub(crate) type Wv<'b> = Wave<'b, Gfx1201, Builder>;
-pub(crate) type Lds = (
-    Ring<PayA, Published, Free>,
-    Ring<PayW, Published, Free>,
+/// The four rings of the K-loop: the A/W payload rings `D` deep (`2`, or `3` for [`RingDepth::Three`]),
+/// the DS/SZ metadata planes always two deep.
+pub(crate) type Lds<const D: usize = 2> = (
+    Ring<PayA, Published, Free, D>,
+    Ring<PayW, Published, Free, D>,
     Ring<MetaD, Published, Free>,
     Ring<MetaS, Published, Free>,
 );
-pub(crate) type Staged<R, C> = (Ring<R, C, Writing>, Pending<Gfx12Waits, LdsWrite<R>>);
+pub(crate) type Staged<R, C, const D: usize = 2> =
+    (Ring<R, C, Writing, D>, Pending<Gfx12Waits, LdsWrite<R>>);
 
 /// Emit one kernel symbol. The result is a complete single-kernel `.s`.
 pub fn emit(spec: Spec) -> Result<Emitted, String> {
     spec.validate()?;
     let g = Gen::new(spec)?;
     let mut b = Builder::new(g.kernel_spec(), g.plan()?);
+    if spec.stacked() {
+        b.enable_delay_alu();
+    }
     let mut wg = Wg::new(&mut b)?;
+    if spec.tune.ring == RingDepth::Three {
+        // Validate refused `SetNr`: no epilogue reads the rings.
+        let lds = g.declare_lds3(&mut wg)?;
+        let end = wg.exit(END)?;
+        if spec.raster == Raster::Banded {
+            op(wg.isa(), "s_setprio 1", &[], &[])?;
+        }
+        kloop::ring3::emit(&mut wg, &g, &end, lds)?;
+        epilogue::emit(&mut wg, &g, &end)?;
+        wg.end(end)?;
+        return b.finish();
+    }
     let lds = g.declare_lds(&mut wg)?;
     let end = wg.exit(END)?;
     if spec.raster == Raster::Banded {
@@ -591,6 +710,7 @@ pub fn emit_module(arch: crate::Arch) -> Result<(Vec<Emitted>, String, ModulePro
                 raster: Raster::Banded,
                 tile,
                 arch,
+                tune: Tune::default(),
             })
         })
         .collect::<Result<Vec<_>, _>>()?;

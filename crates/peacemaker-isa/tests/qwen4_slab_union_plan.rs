@@ -138,9 +138,12 @@ fn metadata(arch: Arch, emitted: &Emitted) {
         assert!(text.contains(required), "{arch:?}: missing {required}");
     }
     assert_eq!(emitted.shape.next_free_vgpr, 24, "{arch:?}");
-    assert_eq!(emitted.shape.next_free_sgpr, 27, "{arch:?}");
+    // gfx1100: the 8-aligned kernarg block s[32:39] clears the workgroup id s15
+    // (`FeatureUserSGPRInit16Bug`), so next_free_sgpr is 40.
+    let next_free_sgpr = if arch == Arch::Gfx1100 { 40 } else { 27 };
+    assert_eq!(emitted.shape.next_free_sgpr, next_free_sgpr, "{arch:?}");
     assert_eq!(emitted.proof.next_free_vgpr, 24);
-    assert_eq!(emitted.proof.next_free_sgpr, 27);
+    assert_eq!(emitted.proof.next_free_sgpr, next_free_sgpr);
     assert_eq!(emitted.shape.barriers, 2);
     assert_eq!(emitted.proof.barriers.len(), 2);
     let mnemonics: Vec<_> = text

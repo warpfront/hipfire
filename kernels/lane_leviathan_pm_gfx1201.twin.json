@@ -1,0 +1,374 @@
+{
+  "anchor": {
+    "bytes": 59680,
+    "file": "lane_leviathan_hipcc_gfx1201.co",
+    "sha256": "9af62ae877958ea3b6440cb391f242eaad2492e291fb43d012438efd0b5ab157"
+  },
+  "arch": "gfx1201",
+  "compiler": {
+    "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6"
+    ],
+    "invocation": "hipcc <flags> -o <anchor.co> kernels/src/lane_leviathan.hip",
+    "version": [
+      "HIP version: 7.16.26385-0000000",
+      "AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)",
+      "Target: x86_64-unknown-linux-gnu",
+      "Thread model: posix"
+    ]
+  },
+  "gpu_oracle": {
+    "card": "E",
+    "case_count": 360,
+    "confounded": false,
+    "exit_code": 0,
+    "input_hxaco_sha256": "b44350ac1fd595d275468005f5eff200bc298eac3c9f192367ebc78a401fc4cc",
+    "job_id": "j8420",
+    "matrix": [
+      {
+        "lanes": 72,
+        "lanes_per_launch": 6,
+        "launches": 12,
+        "v": 248320
+      },
+      {
+        "lanes": 144,
+        "lanes_per_launch": 6,
+        "launches": 24,
+        "v": 5000
+      },
+      {
+        "lanes": 144,
+        "lanes_per_launch": 6,
+        "launches": 24,
+        "v": 4098
+      }
+    ],
+    "method": "ignored committed-object tests; objects loaded directly from include_bytes, no JIT",
+    "modes": [
+      0,
+      1,
+      2
+    ],
+    "not_run": "gfx1200 hardware",
+    "results": {
+      "image_modes_1_and_2_equal_mode0": true,
+      "ptables_pm_equals_hipcc": true,
+      "raw_outputs_pm_equals_hipcc": true,
+      "shard_candidates": 2,
+      "shard_candidates_pm_equals_hipcc": true
+    },
+    "status": "PASS",
+    "target": "gfx1201",
+    "tests": {
+      "passed": 2,
+      "total": 2
+    }
+  },
+  "hxaco": {
+    "bytes": 59680,
+    "file": "lane_leviathan_pm_gfx1201.hxaco",
+    "sha256": "b44350ac1fd595d275468005f5eff200bc298eac3c9f192367ebc78a401fc4cc"
+  },
+  "m7": {
+    "command": "cargo test --release -p peacemaker-isa --features toolchain --test hip_twin_leviathan -- --ignored m7_reports_open_findings --nocapture",
+    "command_expected": "fails visibly (M7 OPEN)",
+    "definedness_sites": [
+      {
+        "offset": "0x6790",
+        "registers": [
+          "v7",
+          "v8"
+        ]
+      },
+      {
+        "offset": "0x6b8c",
+        "registers": [
+          "s24"
+        ]
+      },
+      {
+        "offset": "0x6bac",
+        "registers": [
+          "s24"
+        ]
+      },
+      {
+        "offset": "0x6bc4",
+        "registers": [
+          "s22"
+        ]
+      }
+    ],
+    "input_hxaco_sha256": "b44350ac1fd595d275468005f5eff200bc298eac3c9f192367ebc78a401fc4cc",
+    "kernel": "lane_leviathan_verify",
+    "scope": "metadata kernel only; not helper CFG certification and not a full M7 pass",
+    "scratch_bytes_per_item": 272,
+    "status": "OPEN",
+    "summary": {
+      "ambiguous_delays": 51,
+      "barrier_pairs": 67,
+      "clauses": 7,
+      "delays": 587,
+      "instructions": 6502,
+      "lds_accesses": 333,
+      "lds_max_known_end": null,
+      "lds_unknown_addresses": 333,
+      "lift": "byte-exact",
+      "obligations": {
+        "Definedness/definedness-entry": 4,
+        "SrcReadTiming(DsStore)/wait-war-ds-store": 160,
+        "SrcReadTiming(VmemStore)/wait-war-vmem-store": 13,
+        "Unknown/scratch-in-use": 1
+      },
+      "sgpr_high_water": 50,
+      "table": "gfx1201",
+      "vgpr_high_water": 44,
+      "wait_facts": 325
+    }
+  },
+  "math_evidence": {
+    "functions": {
+      "expf": {
+        "callees": [
+          "llvm.exp.f32"
+        ],
+        "extract": [
+          "define internal noundef float @_ZL4expff(float noundef %0) #5 {",
+          "  %2 = alloca float, align 4, addrspace(5)",
+          "  %3 = addrspacecast ptr addrspace(5) %2 to ptr",
+          "  store float %0, ptr %3, align 4, !tbaa !34",
+          "  %4 = load float, ptr %3, align 4, !tbaa !34",
+          "  %5 = call contract float @llvm.exp.f32(float %4)",
+          "  ret float %5",
+          "}"
+        ],
+        "found": true,
+        "wrapper": "_ZL4expff"
+      },
+      "powf": {
+        "callees": [
+          "__ocml_pow_f32"
+        ],
+        "extract": [
+          "define internal noundef float @_ZL4powfff(float noundef %0, float noundef %1) #5 {",
+          "  %3 = alloca float, align 4, addrspace(5)",
+          "  %4 = alloca float, align 4, addrspace(5)",
+          "  %5 = addrspacecast ptr addrspace(5) %3 to ptr",
+          "  %6 = addrspacecast ptr addrspace(5) %4 to ptr",
+          "  store float %0, ptr %5, align 4, !tbaa !34",
+          "  store float %1, ptr %6, align 4, !tbaa !34",
+          "  %7 = load float, ptr %5, align 4, !tbaa !34",
+          "  %8 = load float, ptr %6, align 4, !tbaa !34",
+          "  %9 = call contract float @__ocml_pow_f32(float noundef %7, float noundef %8) #24",
+          "  ret float %9",
+          "}"
+        ],
+        "found": true,
+        "wrapper": "_ZL4powfff"
+      }
+    },
+    "ir_sha256": "85ef9a6a659664dd032e516e8659d4d247d7f4f046f314b7793e72a9f4846767",
+    "method": "core_hipcc_flags + -save-temps=obj; llvm-dis of the pre-link *.tmp.bc",
+    "note_scope": "callees are read per wrapper body; an OCML function reached by a wrapper may itself call further intrinsics (e.g. __ocml_exp_f32 -> llvm.exp.f32), which this record does not follow",
+    "status": "recorded"
+  },
+  "module": "lane_leviathan_pm_gfx1201",
+  "seal": {
+    "report": {
+      "abi": {
+        "args": [
+          {
+            "name": "",
+            "offset": 0,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 8,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 12,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 16,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 24,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 32,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 40,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 48,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "hidden_block_count_x"
+          },
+          {
+            "name": "",
+            "offset": 52,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "hidden_block_count_y"
+          },
+          {
+            "name": "",
+            "offset": 56,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "hidden_block_count_z"
+          },
+          {
+            "name": "",
+            "offset": 60,
+            "pointer": false,
+            "size": 2,
+            "value_kind": "hidden_group_size_x"
+          },
+          {
+            "name": "",
+            "offset": 62,
+            "pointer": false,
+            "size": 2,
+            "value_kind": "hidden_group_size_y"
+          },
+          {
+            "name": "",
+            "offset": 64,
+            "pointer": false,
+            "size": 2,
+            "value_kind": "hidden_group_size_z"
+          },
+          {
+            "name": "",
+            "offset": 66,
+            "pointer": false,
+            "size": 2,
+            "value_kind": "hidden_remainder_x"
+          },
+          {
+            "name": "",
+            "offset": 68,
+            "pointer": false,
+            "size": 2,
+            "value_kind": "hidden_remainder_y"
+          },
+          {
+            "name": "",
+            "offset": 70,
+            "pointer": false,
+            "size": 2,
+            "value_kind": "hidden_remainder_z"
+          },
+          {
+            "name": "",
+            "offset": 88,
+            "pointer": false,
+            "size": 8,
+            "value_kind": "hidden_global_offset_x"
+          },
+          {
+            "name": "",
+            "offset": 96,
+            "pointer": false,
+            "size": 8,
+            "value_kind": "hidden_global_offset_y"
+          },
+          {
+            "name": "",
+            "offset": 104,
+            "pointer": false,
+            "size": 8,
+            "value_kind": "hidden_global_offset_z"
+          },
+          {
+            "name": "",
+            "offset": 112,
+            "pointer": false,
+            "size": 2,
+            "value_kind": "hidden_grid_dims"
+          }
+        ],
+        "compared_to_incumbent": false,
+        "kernarg_segment_size": 304
+      },
+      "arch": "gfx1201",
+      "elf_bytes": 55584,
+      "elf_sha256": "e04f7e111ef78d78d73169593934ae7ed07e4dccd643bbba6c59ffa5a546e821",
+      "hazards": {
+        "advisory": 0,
+        "blocking": 0,
+        "checked": true,
+        "findings": 0,
+        "pm_ir_obligations": 0
+      },
+      "helper_coverage": "typed instruction re-encode (decode_for+encode_for byte-exact over each out-of-line helper's full extent); no helper CFG/emulator proof",
+      "helpers": [
+        {
+          "bytes": 18868,
+          "coverage": "typed instruction re-encode",
+          "entry_va": 6912,
+          "instructions": 3603,
+          "section_index": 8,
+          "stream_sha256": "515a16fb2f97350ea618aadddbfdad5331a972f7673a980bf9fa06c0e0cf8bc8",
+          "symbol": "_ZL8llv_tailR9LlvSharedPjPfPKjiiiffifi"
+        }
+      ],
+      "hxaco_bytes": 59680,
+      "hxaco_sha256": "b44350ac1fd595d275468005f5eff200bc298eac3c9f192367ebc78a401fc4cc",
+      "kernel": "lane_leviathan_verify",
+      "lds": 29712,
+      "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+      "rsrc2": 133,
+      "scratch": 272,
+      "sgprs": 52,
+      "text_bytes": 31608,
+      "text_sha256": "cab8408a72cb6c698297379268fbd73f055072b6550885460fcc43e9f3cc1624",
+      "user_sgprs": 2,
+      "vgprs": 48,
+      "wavefront_size": 32
+    },
+    "tool": "peacemaker-isa example hip_twin (Route A: lift, emit::checked, bundle)"
+  },
+  "source": {
+    "bytes": 29778,
+    "path": "kernels/src/lane_leviathan.hip",
+    "sha256": "32fb58726965f6cd94d2cc27b5230ff063977eb7d312026bf348c9e32c934fdf"
+  },
+  "symbol": "lane_leviathan_verify"
+}

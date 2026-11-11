@@ -66,7 +66,7 @@ use crate::insn::{Instruction, MemoryClass};
 use crate::kernels::common::lit;
 use crate::plan::Access;
 use crate::reg::{Kind, Live, RegRef};
-use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan};
+use crate::{arch::WgIdSource, Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan};
 
 type R = Result<(), String>;
 
@@ -102,14 +102,55 @@ fn kernargs() -> KernargLayout {
 
 // ---- SGPRs ----------------------------------------------------------------
 // s0:1 kernarg pointer. gfx12 workgroup ids: ttmp9 (x) / ttmp7 low/high
-// (y/z). gfx11: system SGPRs s[WGX] (x), s[WGX+1] (y), s[WGX+2] (z).
+// (y/z). gfx11: system SGPRs s[wg_x_in] (x), +1 (y), +2 (z), after the DECLARED user SGPRs.
 const KARG: u8 = 0;
-const WGX: u8 = 2;
-// Kernarg words -> s8..s20.
-const PPTR: u8 = 8; // expert_ptrs
-const IPTR: u8 = 10; // topk_indices
-const XPTR: u8 = 12; // hidden_batch
-const YPTR: u8 = 14; // expert_outputs
+/// Real user SGPRs (the kernarg pointer) and enabled system SGPRs (workgroup ids X, Y, Z).
+const USER_SGPRS: u8 = 2;
+const SYSTEM_SGPRS: u8 = 3;
+/// gfx11 workgroup id x: after the DECLARED user SGPRs. gfx1100 pads the descriptor to user + system >= 16
+/// (`Arch::declared_user_sgprs`, LLVM FeatureUserSGPRInit16Bug), so the ids are s13, s14, s15 there.
+fn wg_x_in(arch: Arch) -> Result<u8, String> {
+    match arch
+        .workgroup_ids(arch.declared_user_sgprs(USER_SGPRS, SYSTEM_SGPRS))?
+        .x
+    {
+        WgIdSource::Sgpr(n) => Ok(n),
+        other => Err(format!(
+            "legacy_mq4 down t8: no workgroup id SGPR on {}: {other:?}",
+            arch.name()
+        )),
+    }
+}
+// Kernarg words -> s8..s20 (the pointer block s[8:15]; on gfx1100 s13..s15 are the workgroup ids, so the
+// block moves to `KARG_BLOCK_GFX1100`).
+struct Karg {
+    pptr: u8, // expert_ptrs
+    iptr: u8, // topk_indices
+    xptr: u8, // hidden_batch
+    yptr: u8, // expert_outputs
+}
+const KARG_BLOCK_GFX1100: u8 = 48;
+fn karg(arch: Arch) -> Karg {
+    let base = if arch.min_user_system_sgprs() > 0 {
+        KARG_BLOCK_GFX1100
+    } else {
+        8
+    };
+    Karg {
+        pptr: base,
+        iptr: base + 2,
+        xptr: base + 4,
+        yptr: base + 6,
+    }
+}
+/// SGPR budget of the plan: `S_END`, or past the relocated pointer block on gfx1100.
+fn s_end(arch: Arch) -> u8 {
+    if arch.min_user_system_sgprs() > 0 {
+        KARG_BLOCK_GFX1100 + 8
+    } else {
+        S_END
+    }
+}
 const SM: u8 = 16; // M (actual output dim, 2560)
 const SK: u8 = 17; // K
 const SN: u8 = 18; // N (batch/token rows: the logical total R, 1..=64)
@@ -149,14 +190,17 @@ const KIDX: u8 = 25; // lane-local group element index (ragged guard)
 const V_END: u8 = 26;
 
 fn plan(arch: Arch) -> Result<RegPlan, String> {
-    let mut p = RegPlan::new(u16::from(V_END), u16::from(S_END))?;
+    // gfx1100: s[2:16) are the (padded) user SGPRs and the workgroup ids (s13..s15); the kernarg pointer block
+    // is relocated by `karg`.
+    let mut p = RegPlan::new(u16::from(V_END), u16::from(s_end(arch)))?;
     p.s::<2>("kernarg_ptr", KARG, Live::Whole)?;
     if !arch.gfx12() {
-        p.s::<1>("workgroup_id_x", WGX, Live::Whole)?;
-        p.s::<1>("workgroup_id_y", WGX + 1, Live::Whole)?;
-        p.s::<1>("workgroup_id_z", WGX + 2, Live::Whole)?;
+        let wgx = wg_x_in(arch)?;
+        p.s::<1>("workgroup_id_x", wgx, Live::Whole)?;
+        p.s::<1>("workgroup_id_y", wgx + 1, Live::Whole)?;
+        p.s::<1>("workgroup_id_z", wgx + 2, Live::Whole)?;
     }
-    p.add_range("kernarg_ptr0", Kind::S, PPTR, 8, Live::Whole)?;
+    p.add_range("kernarg_ptr0", Kind::S, karg(arch).pptr, 8, Live::Whole)?;
     p.add_range("kernarg_rest", Kind::S, SM, 4, Live::Whole)?;
     p.add_range("kernarg_kt", Kind::S, SKT, 1, Live::Whole)?;
     p.add_range("derived_row", Kind::S, ROW, 1, Live::Whole)?;
@@ -309,7 +353,7 @@ pub fn emit_module(arch: Arch) -> Result<(Vec<Emitted>, String), String> {
 fn kernel(b: &mut Builder, arch: Arch) -> R {
     let end = ".Ldown_t8_end";
     // Kernarg words (original 52-byte segment: 32B pointers + 20B scalars).
-    smem(b, PPTR, 8, KARG, 0x00)?;
+    smem(b, karg(arch).pptr, 8, KARG, 0x00)?;
     smem(b, SM, 4, KARG, 0x20)?;
     smem(b, SKT, 1, KARG, 0x30)?;
     b.wait_all()?;
@@ -319,18 +363,19 @@ fn kernel(b: &mut Builder, arch: Arch) -> R {
         sop(b, format!("s_and_b32 s{RANK}, ttmp7, 0xffff"), &[RANK], &[])?;
         sop(b, format!("s_lshr_b32 s{TILE}, ttmp7, 16"), &[TILE], &[])?;
     } else {
-        sop(b, format!("s_mov_b32 s{ROW}, s{WGX}"), &[ROW], &[WGX])?;
+        let wgx = wg_x_in(arch)?;
+        sop(b, format!("s_mov_b32 s{ROW}, s{wgx}"), &[ROW], &[wgx])?;
         sop(
             b,
-            format!("s_mov_b32 s{RANK}, s{}", WGX + 1),
+            format!("s_mov_b32 s{RANK}, s{}", wgx + 1),
             &[RANK],
-            &[WGX + 1],
+            &[wgx + 1],
         )?;
         sop(
             b,
-            format!("s_mov_b32 s{TILE}, s{}", WGX + 2),
+            format!("s_mov_b32 s{TILE}, s{}", wgx + 2),
             &[TILE],
-            &[WGX + 2],
+            &[wgx + 2],
         )?;
     }
     // Domain guards before any data-memory access (uniform exit).
@@ -454,7 +499,7 @@ fn kernel(b: &mut Builder, arch: Arch) -> R {
             &[FLAT],
             &[],
         )?;
-        gload(b, "global_load_b32", EID, VA, IPTR, "")?;
+        gload(b, "global_load_b32", EID, VA, karg(arch).iptr, "")?;
         b.wait_all()?;
         b.push(Instruction::new(
             format!("v_readfirstlane_b32 s{TMP}, v{EID}"),
@@ -613,11 +658,12 @@ fn kernel(b: &mut Builder, arch: Arch) -> R {
             &[VA],
             &[],
         )?;
+        let yptr = karg(arch).yptr;
         b.push(
             Instruction::new(
-                format!("global_store_b32 v{VA}, v{acc}, s[{YPTR}:{}]", YPTR + 1),
+                format!("global_store_b32 v{VA}, v{acc}, s[{yptr}:{}]", yptr + 1),
                 vec![],
-                vec![vreg(VA, 1), vreg(acc, 1), sreg(YPTR, 2)],
+                vec![vreg(VA, 1), vreg(acc, 1), sreg(yptr, 2)],
             )
             .memory(MemoryClass::VmemStore),
         )?;
@@ -797,7 +843,7 @@ fn group_body(b: &mut Builder, arch: Arch, ragged: bool) -> R {
                 &[SK],
             )?;
             raw(b, "s_and_b32 exec_lo, exec_lo, vcc_lo")?;
-            gload(b, "global_load_b32", x, VA, XPTR, "")?;
+            gload(b, "global_load_b32", x, VA, karg(b.spec.arch).xptr, "")?;
             b.wait_all()?;
             raw(b, "s_mov_b32 exec_lo, -1")?;
             valu(
@@ -818,7 +864,7 @@ fn group_body(b: &mut Builder, arch: Arch, ragged: bool) -> R {
             }
         }
     } else {
-        gload_b128(b, X0, VA, XPTR)?;
+        gload_b128(b, X0, VA, karg(b.spec.arch).xptr)?;
     }
     // Actual indexed AR contracts the first product into the second:
     // d = x1*w1; d = fma(x0, w0, d); then fma terms 2 and 3.
@@ -852,6 +898,7 @@ fn group_body(b: &mut Builder, arch: Arch, ragged: bool) -> R {
 /// expert id, so the table load is uniform and the two pointer words are read
 /// back with `v_readfirstlane_b32`.
 fn broadcast_expert(b: &mut Builder, eid: u8) -> R {
+    let pptr = karg(b.spec.arch).pptr;
     valu(
         b,
         &format!("v_lshlrev_b32_e32 v{VA}, 3, v{eid}"),
@@ -862,12 +909,12 @@ fn broadcast_expert(b: &mut Builder, eid: u8) -> R {
     b.push(
         Instruction::new(
             format!(
-                "global_load_b64 v[{VB}:{}], v{VA}, s[{PPTR}:{}]",
+                "global_load_b64 v[{VB}:{}], v{VA}, s[{pptr}:{}]",
                 VB + 1,
-                PPTR + 1
+                pptr + 1
             ),
             vec![vreg(VB, 2)],
-            vec![vreg(VA, 1), sreg(PPTR, 2)],
+            vec![vreg(VA, 1), sreg(pptr, 2)],
         )
         .memory(MemoryClass::VmemLoad),
     )?;

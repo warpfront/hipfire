@@ -25,7 +25,7 @@ Case families (all gating): rand10k (10,000 rows, all slots valid, mixed distrib
 zeros, ties, huge / tiny / subnormal bf16, mixed scales, outliers), zeros (+0 / -0 rows, zero groups inside live
 rows), shapes P = 1, 2, 7, 8, 15, 16, 17 (sparse slots, first / last slot, all-pad), chunk boundaries P = 4095, 4096,
 4097, 8191, 8192, 8193 (valid / pad rows at the 4096 multiples), random sign tables, and `solo_*` single-row launches
-whose bytes must equal the same row's bytes inside the 10k batch (batch independence).
+whose bytes must equal the same row's bytes inside the 10k batch (batch independence).  `bigl_*` are 256 rows over L = 1M and 1024 rows over L = 13M flat slots (record indices past 2^32/72^2 and 2^32/72).
 
 Run it under the card scheduler, e.g. (from the worktree root):
   /home/kaden/qcal/locks/fabric-sched/fabric-run.sh --class correct --card A --mem-gb 2 --priority P1 \
@@ -285,6 +285,10 @@ def build_cases(seed, total_rows):
     for i in range(64):  # solo launches of rows of the 10k batch
         r = (i * 157 + 3) % total_rows
         add(f"solo_{i}", "solo", big.h[r:r + 1].copy(), np.array([0], np.int32), 1)
+    # Large flat-slot counts: record index g*L + slot reaches past 2^32/72^2 (~828K; the 64-bit address product once
+    # read a clobbered low word) and, at L = 13M, past 2^32/72 (~59.6M; the 32-bit low product itself wraps).
+    for p, l in ((256, 1_000_000), (1024, 13_000_000)):
+        add(f"bigl_p{p}_l{l}", "bigl", mixed_rows(rng, p, p), slots(rng, p, l, 0.1, force_valid=(0, p - 1)), l)
     return cases
 
 

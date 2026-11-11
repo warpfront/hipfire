@@ -229,6 +229,10 @@ new PRs merge). Hand-edits inside the auto block will be overwritten.
 - **beanssec** ([@beanssec](https://github.com/beanssec)) - co-author on PR #35 (vision color misidentification fix) and PR #48 (`triattn_validate` r̄ contamination surfacing).
 - **Dominik** (`git@domko.sbs`) - co-author on PR #9 (OpenAI-compatible serve, streaming lock lifecycle, SSE headers).
 
+### Raon-1-mini-preview (arch 19)
+
+- **u/Queasy_Asparagus69** (Hugging Face: datayoda) - the original community port of KRAFTON Raon-1-mini-preview to hipfire, and the bug reports that shaped the shipped route: the stock serve stream refusing generations (`stream must begin with gen_start`), thinking never closing (answers landing in reasoning), the broken `enable_thinking: false` frame, and needle-probe prompt-echo at greedy.
+
 ## License
 
 hipfire is licensed under Apache-2.0 as of v0.3.0; individual files

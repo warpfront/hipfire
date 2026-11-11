@@ -1009,5 +1009,27 @@ class SerialDriver(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(d, "launch")))
 
 
+class GlobalNames(unittest.TestCase):
+    def test_every_function_resolves_its_global_names(self):
+        """`prepare` once referenced `label`/`selected`/`bounds`/`harness` that no assignment defined (NameError on the first real
+        run, invisible to every other test): each implicit global of every function must exist in the module or builtins."""
+        import builtins
+        import symtable
+        with open(qc.__file__) as fh:
+            src = fh.read()
+        problems = []
+
+        def walk(table):
+            for sym in table.get_symbols():
+                if table.get_type() == "function" and sym.is_global() and sym.is_referenced() and not sym.is_assigned():
+                    if not hasattr(qc, sym.get_name()) and not hasattr(builtins, sym.get_name()):
+                        problems.append("%s: %s" % (table.get_name(), sym.get_name()))
+            for child in table.get_children():
+                walk(child)
+
+        walk(symtable.symtable(src, qc.__file__, "exec"))
+        self.assertEqual(problems, [])
+
+
 if __name__ == "__main__":
     unittest.main()

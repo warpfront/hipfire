@@ -106,6 +106,7 @@ Source: `peacemaker-author/src/runtime.rs` (`scmp`, `skip_if`, `skip_unless`, `w
 
 - Use `wg.if_else(cond, else_label, join, |w| .., |w| ..)` for a two-arm branch (`out = a + b` versus `out = a - b`) instead of two one-armed skips; neither arm may hold a barrier or change LDS ownership.
 - Replace the `flag` compare with `scmp_wg_uniform` and `wg.wg_skip_if(..)` when the body must contain a barrier (several waves); the claim that every wave agrees is then yours.
+- Use `wg.wg_if_else(wgcond, else_label, join, |w| .., |w| ..)` for a workgroup-uniform two-arm branch whose arms hold barriers or change LDS ownership; the arms must end in the same ownership state (and the same ring `cur` index and live buffers), and the call places the join label.
 - Use `exec_if(cond, |w| ..)` to predicate a body per whole wave while still issuing every instruction.
 - Swap `skip_if`/`skip_unless` by inverting the compare (`s_cmp_lg_u32` for `skip_if`, `s_cmp_eq_u32` for `skip_unless`); the emitted branch flips between `s_cbranch_scc1` and `s_cbranch_scc0`.
 - Load `flag` and `n` separately (`smem(b, 16, 1, 0, 24)?; smem(b, 17, 1, 0, 28)?;`) when the loads must be ordered differently; both stay inside the `args` owner.

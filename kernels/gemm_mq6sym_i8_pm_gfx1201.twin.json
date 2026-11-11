@@ -1,0 +1,614 @@
+{
+  "anchor": {
+    "bytes": 232616,
+    "file": "gemm_mq6sym_i8_hipcc_gfx1201.co",
+    "sha256": "53d43945aec86ac13ad93cc847430a296dc52330f736f1450810f9c4f8fcb5b8"
+  },
+  "arch": "gfx1201",
+  "compiler": {
+    "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6"
+    ],
+    "invocation": "hipcc <flags> -o <anchor.co> <define + prelude + source>",
+    "version": [
+      "HIP version: 7.16.26385-0000000",
+      "AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)",
+      "Target: x86_64-unknown-linux-gnu",
+      "Thread model: posix"
+    ]
+  },
+  "hxaco": {
+    "bytes": 232616,
+    "file": "gemm_mq6sym_i8_pm_gfx1201.hxaco",
+    "sha256": "82835b828ef80880f9d97bdea036251569f0111e206383c611d1836d73d8f709"
+  },
+  "module": "gemm_mq6sym_i8_pm_gfx1201",
+  "prelude": {
+    "bytes": 4724,
+    "combined_bytes": 48260,
+    "combined_sha256": "52dc0f6f78813f937dd29b739e8473965109c524e3184b3dd5d13cbe92b95d9d",
+    "define": "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1",
+    "path": "kernels/src/block_i8_128_quant.hip",
+    "runtime_const": "rdna-compute kernels::GEMM_MQ6SYM_I8_GFX1201_SRC",
+    "sha256": "6b5f8a19152c02e590bc13c691f70b3127288db0cf580d4b9425ed1f2b190875"
+  },
+  "seal": {
+    "reports": [
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 48,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 56,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 64,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 72,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 76,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 80,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 84,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 88,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 92,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": true,
+          "incumbent_sha256": "c5fd9408bda8d34bdb9409214d5ba4f7e1310bda01e2d744a1f31fc1474c68f1",
+          "incumbent_symbol": "gemm_mq6sym_i8_set_m64n16_x4_gfx1201",
+          "kernarg_segment_size": 96
+        },
+        "arch": "gfx1201",
+        "elf_bytes": 228520,
+        "elf_sha256": "c5fd9408bda8d34bdb9409214d5ba4f7e1310bda01e2d744a1f31fc1474c68f1",
+        "hazards": {
+          "advisory": 0,
+          "blocking": 0,
+          "checked": true,
+          "findings": 0,
+          "pm_ir_obligations": 0
+        },
+        "hxaco_bytes": 232616,
+        "hxaco_sha256": "82835b828ef80880f9d97bdea036251569f0111e206383c611d1836d73d8f709",
+        "kernel": "gemm_mq6sym_i8_set_m64n16_x4_gfx1201",
+        "lds": 6144,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "rsrc2": 132,
+        "scratch": 0,
+        "sgprs": 30,
+        "text_bytes": 7956,
+        "text_sha256": "634b0260821c411ccdd2f26b3bac655a8554d661970356d8356f87f2fdf9ccf0",
+        "user_sgprs": 2,
+        "vgprs": 136,
+        "wavefront_size": 32
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 48,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 56,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 64,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 72,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 76,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 80,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 84,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 88,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 92,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": true,
+          "incumbent_sha256": "c5fd9408bda8d34bdb9409214d5ba4f7e1310bda01e2d744a1f31fc1474c68f1",
+          "incumbent_symbol": "gemm_mq6sym_i8_set_m32n32_x4_gfx1201",
+          "kernarg_segment_size": 96
+        },
+        "arch": "gfx1201",
+        "elf_bytes": 228520,
+        "elf_sha256": "c5fd9408bda8d34bdb9409214d5ba4f7e1310bda01e2d744a1f31fc1474c68f1",
+        "hazards": {
+          "advisory": 0,
+          "blocking": 0,
+          "checked": true,
+          "findings": 0,
+          "pm_ir_obligations": 0
+        },
+        "hxaco_bytes": 232616,
+        "hxaco_sha256": "82835b828ef80880f9d97bdea036251569f0111e206383c611d1836d73d8f709",
+        "kernel": "gemm_mq6sym_i8_set_m32n32_x4_gfx1201",
+        "lds": 9216,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "rsrc2": 132,
+        "scratch": 0,
+        "sgprs": 30,
+        "text_bytes": 10460,
+        "text_sha256": "cee873ea5158de5759c46753c8951a4f81cbd39814a400084e583b0912674bc2",
+        "user_sgprs": 2,
+        "vgprs": 208,
+        "wavefront_size": 32
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 48,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 56,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 64,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 72,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 76,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 80,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 84,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 88,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 92,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": true,
+          "incumbent_sha256": "c5fd9408bda8d34bdb9409214d5ba4f7e1310bda01e2d744a1f31fc1474c68f1",
+          "incumbent_symbol": "gemm_mq6sym_i8_set_m64n48_x4_gfx1201",
+          "kernarg_segment_size": 96
+        },
+        "arch": "gfx1201",
+        "elf_bytes": 228520,
+        "elf_sha256": "c5fd9408bda8d34bdb9409214d5ba4f7e1310bda01e2d744a1f31fc1474c68f1",
+        "hazards": {
+          "advisory": 0,
+          "blocking": 0,
+          "checked": true,
+          "findings": 0,
+          "pm_ir_obligations": 0
+        },
+        "hxaco_bytes": 232616,
+        "hxaco_sha256": "82835b828ef80880f9d97bdea036251569f0111e206383c611d1836d73d8f709",
+        "kernel": "gemm_mq6sym_i8_set_m64n48_x4_gfx1201",
+        "lds": 14336,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "rsrc2": 132,
+        "scratch": 0,
+        "sgprs": 30,
+        "text_bytes": 12184,
+        "text_sha256": "da1fab3c25f63df9e5932b9f4c647414b787b217244a4e5a5cc07c96caa9e7ba",
+        "user_sgprs": 2,
+        "vgprs": 256,
+        "wavefront_size": 32
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 48,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 56,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 64,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 72,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 76,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 80,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 84,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 88,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 92,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": true,
+          "incumbent_sha256": "c5fd9408bda8d34bdb9409214d5ba4f7e1310bda01e2d744a1f31fc1474c68f1",
+          "incumbent_symbol": "gemm_mq6sym_i8_set_m64n16y_x4_gfx1201",
+          "kernarg_segment_size": 96
+        },
+        "arch": "gfx1201",
+        "elf_bytes": 228520,
+        "elf_sha256": "c5fd9408bda8d34bdb9409214d5ba4f7e1310bda01e2d744a1f31fc1474c68f1",
+        "hazards": {
+          "advisory": 0,
+          "blocking": 0,
+          "checked": true,
+          "findings": 0,
+          "pm_ir_obligations": 0
+        },
+        "hxaco_bytes": 232616,
+        "hxaco_sha256": "82835b828ef80880f9d97bdea036251569f0111e206383c611d1836d73d8f709",
+        "kernel": "gemm_mq6sym_i8_set_m64n16y_x4_gfx1201",
+        "lds": 6144,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "rsrc2": 388,
+        "scratch": 0,
+        "sgprs": 32,
+        "text_bytes": 8036,
+        "text_sha256": "539207794779fdee9aadb15c0146fe33f2fa47c1ba45246bce7270adaa275fb7",
+        "user_sgprs": 2,
+        "vgprs": 136,
+        "wavefront_size": 32
+      }
+    ],
+    "tool": "peacemaker-isa example hip_twin (Route A: lift, emit::checked, bundle)"
+  },
+  "source": {
+    "bytes": 43485,
+    "path": "kernels/src/gemm_mq6sym_i8.gfx1201.hip",
+    "sha256": "1a691bd663adbe90b09bb7e4f155df379b71962352a210a1a83d89d2d6d6d601"
+  },
+  "strict_cfg_ledger": {
+    "evidence": "crates/peacemaker-isa/tests/ledger_cfg_pins/allowlist.rs",
+    "proven": false,
+    "scope": "DS-store-source WAR findings are UNPROVEN original-LLVM obligations; byte identity and zero blocking hip_twin hazards do not discharge them",
+    "status": "OPEN"
+  },
+  "symbols": [
+    "gemm_mq6sym_i8_set_m64n16_x4_gfx1201",
+    "gemm_mq6sym_i8_set_m32n32_x4_gfx1201",
+    "gemm_mq6sym_i8_set_m64n48_x4_gfx1201",
+    "gemm_mq6sym_i8_set_m64n16y_x4_gfx1201"
+  ]
+}

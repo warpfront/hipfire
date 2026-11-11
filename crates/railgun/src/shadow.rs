@@ -612,6 +612,7 @@ pub fn diff(
                     Lowering::HipDirect { reason }
                     | Lowering::Graph { reason }
                     | Lowering::Conditional { reason } => reason.clone(),
+                    Lowering::LabPending { pending } => format!("lab-pending: {pending}"),
                     Lowering::Pm4 => "no IB group".to_owned(),
                 };
                 c.add(

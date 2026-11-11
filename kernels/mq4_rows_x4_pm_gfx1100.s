@@ -6,11 +6,11 @@
 .p2align 8
 .type gemv_mq4g256v2_rows_x4_t8_pm_gfx1100,@function
 gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
-	s_load_b256 s[8:15], s[0:1], null
+	s_load_b256 s[80:87], s[0:1], null
 	s_load_b256 s[16:23], s[0:1], 0x20
 	s_load_b128 s[24:27], s[0:1], 0x40
 	s_load_b128 s[28:31], s[0:1], 0x50
-	s_mov_b32 s40, s2
+	s_mov_b32 s40, s14
 	s_waitcnt lgkmcnt(0)
 	s_mov_b32 s57, s31
 	s_cmp_eq_u32 s57, 0
@@ -30,7 +30,7 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_cbranch_scc1 .Lmq4rxt8_end
 	s_cmp_lt_i32 s29, 0
 	s_cbranch_scc1 .Lmq4rxt8_end
-	s_mov_b32 s56, s3
+	s_mov_b32 s56, s15
 	s_cmp_ge_u32 s56, 8
 	s_cbranch_scc1 .Lmq4rxt8_end
 	s_lshl_b32 s56, s56, 3
@@ -53,17 +53,17 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_cmp_ge_u32 s40, s39
 	s_cbranch_scc1 .Lmq4rxt8_end
 	s_cmp_lt_u32 s40, s38
-	s_cselect_b64 s[4:5], s[12:13], s[14:15]
+	s_cselect_b64 s[4:5], s[84:85], s[86:87]
 	s_cselect_b64 s[32:33], s[22:23], s[24:25]
 	s_cselect_b32 s34, s28, s29
 	s_cselect_b32 s35, s37, s38
 	s_cmp_lt_u32 s40, s37
-	s_cselect_b64 s[4:5], s[10:11], s[4:5]
+	s_cselect_b64 s[4:5], s[82:83], s[4:5]
 	s_cselect_b64 s[32:33], s[20:21], s[32:33]
 	s_cselect_b32 s34, s27, s34
 	s_cselect_b32 s35, s36, s35
 	s_cmp_lt_u32 s40, s36
-	s_cselect_b64 s[4:5], s[8:9], s[4:5]
+	s_cselect_b64 s[4:5], s[80:81], s[4:5]
 	s_cselect_b64 s[32:33], s[18:19], s[32:33]
 	s_cselect_b32 s34, s26, s34
 	s_cselect_b32 s35, 0, s35
@@ -13031,7 +13031,7 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	.amdhsa_group_segment_fixed_size 0
 	.amdhsa_private_segment_fixed_size 0
 	.amdhsa_kernarg_size 96
-	.amdhsa_user_sgpr_count 2
+	.amdhsa_user_sgpr_count 14
 	.amdhsa_user_sgpr_dispatch_ptr 0
 	.amdhsa_user_sgpr_queue_ptr 0
 	.amdhsa_user_sgpr_kernarg_segment_ptr 1
@@ -13046,7 +13046,7 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	.amdhsa_system_sgpr_workgroup_info 0
 	.amdhsa_system_vgpr_workitem_id 0
 	.amdhsa_next_free_vgpr 121
-	.amdhsa_next_free_sgpr 80
+	.amdhsa_next_free_sgpr 88
 	.amdhsa_reserve_vcc 1
 	.amdhsa_float_round_mode_32 0
 	.amdhsa_float_round_mode_16_64 0
@@ -13163,7 +13163,7 @@ amdhsa.kernels:
     .max_flat_workgroup_size: 32
     .name: gemv_mq4g256v2_rows_x4_t8_pm_gfx1100
     .private_segment_fixed_size: 0
-    .sgpr_count: 82
+    .sgpr_count: 90
     .sgpr_spill_count: 0
     .symbol: gemv_mq4g256v2_rows_x4_t8_pm_gfx1100.kd
     .uniform_work_group_size: 1

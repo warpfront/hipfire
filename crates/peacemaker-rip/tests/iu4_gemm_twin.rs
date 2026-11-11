@@ -37,6 +37,7 @@ fn every_spec() -> Vec<Spec> {
                                 act,
                                 arch: Arch::Gfx1201,
                                 mma,
+                                tune: Default::default(),
                             });
                         }
                     }
@@ -167,6 +168,7 @@ fn iu4_gemm_emit_native_returns_the_rust_emitted() {
         act: ALayout::Slab,
         arch: Arch::Gfx1201,
         mma: Mma::Dense,
+        tune: Default::default(),
     })
     .unwrap();
     let got = peacemaker_rip::compile(COARSE, Arch::Gfx1201, "default").unwrap();

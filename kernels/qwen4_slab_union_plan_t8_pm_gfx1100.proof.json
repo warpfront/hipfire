@@ -3,7 +3,7 @@
   "arch": "gfx1100",
   "builder_crate_version": "0.4.1",
   "builder_git_sha": "unknown",
-  "s_text_sha256": "b33941d82a05d11ae154f01ae9156a10f6e7ce423cbe55c55f554e740273dd74",
+  "s_text_sha256": "bb5cf128ffd7569b790fd7cf1c2adc7f514b3464ba9c016ec0d37fe51be725f9",
   "kernels": [
     {
       "kernel_id": "qwen4_slab_union_plan",
@@ -22,14 +22,14 @@
         {
           "name": "workgroup_x",
           "kind": "s",
-          "base": 2,
+          "base": 15,
           "len": 1,
           "live": "Whole"
         },
         {
           "name": "args_0",
           "kind": "s",
-          "base": 8,
+          "base": 32,
           "len": 8,
           "live": "Whole"
         },
@@ -119,7 +119,7 @@
         }
       ],
       "next_free_vgpr": 24,
-      "next_free_sgpr": 27,
+      "next_free_sgpr": 40,
       "waits": [
         {
           "pc_index": 3,
@@ -380,7 +380,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "b33941d82a05d11ae154f01ae9156a10f6e7ce423cbe55c55f554e740273dd74"
+      "s_text_sha256": "bb5cf128ffd7569b790fd7cf1c2adc7f514b3464ba9c016ec0d37fe51be725f9"
     }
   ]
 }

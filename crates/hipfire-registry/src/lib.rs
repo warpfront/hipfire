@@ -23,9 +23,10 @@ use std::{
 use thiserror::Error;
 pub mod local_files;
 pub use local_files::{
-    is_expert_hotset_name, is_listable_model_file, is_model_file, is_ple_sidecar_name,
-    is_standalone_model, is_trunk_overlay_name, names_registry_model, probe_hfq_arch_id,
-    registry_sidecar_files, MODEL_SUFFIXES, PLE_AUX_SUFFIXES, SERVE_TRUNK_ARCH_IDS,
+    is_expert_hotset_name, is_hc8_sidecar_name, is_hot_units_sidecar_name, is_listable_model_file,
+    is_model_file, is_ple_sidecar_name, is_standalone_model, is_trunk_overlay_name,
+    names_registry_model, probe_hfq_arch_id, registry_sidecar_files, MODEL_SUFFIXES,
+    PLE_AUX_SUFFIXES, SERVE_TRUNK_ARCH_IDS,
 };
 pub mod xdna;
 pub use xdna::{XdnaManifest, XdnaProfile, XdnaSidecarDescriptor};
@@ -306,6 +307,214 @@ pub fn trunk_overlay_in(entry: &ModelEntry, pins: &[TrunkOverlayPin]) -> Option<
         })
 }
 
+/// Content identity of one HC8 sidecar and of the exact base artifact it is
+/// bound to.
+///
+/// The HC8 sidecar (`<base file>.hc8`) is an HFQM container of the base's
+/// hyper-connection mixer weights requantized to per-row-scaled E4M3
+/// (`hipfire_runtime::hc8_sidecar`); the Qwen4 loader applies it by default on
+/// exact gfx1201 (`HIPFIRE_QWEN4_HC8=0` is the kill switch) and binds it to the
+/// base's file length and index sha256. Like [`TrunkOverlayPin`], the pin lives
+/// in the client rather than in a registry field, keyed by the base identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hc8SidecarPin {
+    /// SHA-256 of the base artifact (the registry entry's `sha256`).
+    pub base_sha256: &'static str,
+    /// Size in bytes of the base artifact (the registry entry's `size_bytes`).
+    pub base_size: u64,
+    /// Hugging Face repo that hosts the sidecar file.
+    pub repo: &'static str,
+    /// Sidecar file name: the base file name plus
+    /// `hipfire_config::memory::HC8_SIDECAR_SUFFIX`.
+    pub file: &'static str,
+    /// SHA-256 of the sidecar file.
+    pub sha256: &'static str,
+    /// Size in bytes of the sidecar file.
+    pub size_bytes: u64,
+}
+
+/// HC8 sidecars known to this client, keyed by exact base artifact identity.
+pub const HC8_SIDECAR_PINS: &[Hc8SidecarPin] = &[
+    // The Flash-Next MQ4 XTS symmetric-trunk base.
+    Hc8SidecarPin {
+        base_sha256: "27dfff6692eba3385655959d134771fcff154c6279ab0a6c43cb8c7d81a7fa31",
+        base_size: 70_888_270_360,
+        repo: FLASH_NEXT_XTS_REPO,
+        file: "qwen3.8-flash-next-base.mq4-xts-symtrunk.hc8",
+        sha256: "2adf32e564f09efbe185c7ebf57483dc58103f21341569e716173098f0e2ee67",
+        size_bytes: 659_649_536,
+    },
+];
+
+/// A resolved HC8 sidecar: the repo that hosts it and its sidecar identity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Hc8Sidecar {
+    pub repo: &'static str,
+    pub sidecar: Sidecar,
+}
+
+/// The pin in `pins` whose base identity equals the entry's `sha256` and
+/// `size_bytes`, as a [`Hc8Sidecar`]. An entry without a pinned digest and
+/// size never matches.
+pub fn hc8_sidecar_in(entry: &ModelEntry, pins: &[Hc8SidecarPin]) -> Option<Hc8Sidecar> {
+    let sha256 = entry.sha256.as_deref()?;
+    let size_bytes = entry.size_bytes?;
+    pins.iter()
+        .find(|pin| pin.base_size == size_bytes && pin.base_sha256.eq_ignore_ascii_case(sha256))
+        .map(|pin| Hc8Sidecar {
+            repo: pin.repo,
+            sidecar: Sidecar {
+                file: pin.file.to_owned(),
+                sha256: Some(pin.sha256.to_owned()),
+                size_bytes: Some(pin.size_bytes),
+            },
+        })
+}
+
+/// Content identity of one EP2 hot-unit loan sidecar (`<base file>.ep.hot-units`) and of the
+/// exact base artifact and EP expert-ranking sidecar it was calibrated under.
+///
+/// The file is closed JSON (`hipfire.qwen4.ep_hot_units`); the Qwen4 EP2 loader binds it to the
+/// base (`model_sha256`, `base_size`, `base_index_sha256`) and to the sha256 of the
+/// `.ep.expert-hotset` it ran under (`base_ranking_sha256`), and declines the loan on any
+/// mismatch. Like [`Hc8SidecarPin`], the pin lives in the client, keyed by the base identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HotUnitsSidecarPin {
+    /// SHA-256 of the base artifact (the registry entry's `sha256`).
+    pub base_sha256: &'static str,
+    /// Size in bytes of the base artifact (the registry entry's `size_bytes`).
+    pub base_size: u64,
+    /// SHA-256 of the `.ep.expert-hotset` sidecar the calibration ran under (the file's
+    /// `base_ranking_sha256`).
+    pub ranking_sha256: &'static str,
+    /// Hugging Face repo that will host the sidecar file.
+    pub repo: &'static str,
+    /// Sidecar file name: the base file name plus
+    /// `hipfire_config::memory::EP_HOT_UNITS_SIDECAR_SUFFIX`.
+    pub file: &'static str,
+    /// SHA-256 of the sidecar file.
+    pub sha256: &'static str,
+    /// Size in bytes of the sidecar file.
+    pub size_bytes: u64,
+    /// Whether the file is on the Hugging Face repo. While `false`, `hipfire pull` never
+    /// requests it (no 404, no warning); a local copy beside the model is still verified and
+    /// honoured by the loader.
+    pub published: bool,
+}
+
+/// Hot-unit loan sidecars known to this client, keyed by exact base artifact identity.
+pub const HOT_UNITS_SIDECAR_PINS: &[HotUnitsSidecarPin] = &[
+    // The Flash-Next MQ4 XTS symmetric-trunk base; hosted on the Hugging Face repo.
+    HotUnitsSidecarPin {
+        base_sha256: "27dfff6692eba3385655959d134771fcff154c6279ab0a6c43cb8c7d81a7fa31",
+        base_size: 70_888_270_360,
+        ranking_sha256: "c27a8ebff3d560e6c73d9b1e8b52fb27878a13735301660159109e857b0fb53c",
+        repo: FLASH_NEXT_XTS_REPO,
+        file: "qwen3.8-flash-next-base.mq4-xts-symtrunk.ep.hot-units",
+        sha256: "a50317cf2014f88d306d88366131212757d875c4c6e65572d659d361ec17db13",
+        size_bytes: 67_526,
+        published: true,
+    },
+];
+
+/// A resolved hot-unit loan sidecar: the repo that hosts it, its sidecar identity and whether it
+/// is published.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HotUnitsSidecar {
+    pub repo: &'static str,
+    pub sidecar: Sidecar,
+    /// The ranking sidecar sha256 the calibration is bound to.
+    pub ranking_sha256: &'static str,
+    pub published: bool,
+}
+
+/// The pin in `pins` whose base identity equals the entry's `sha256` and `size_bytes`, as a
+/// [`HotUnitsSidecar`]. An entry without a pinned digest and size never matches.
+pub fn hot_units_sidecar_in(
+    entry: &ModelEntry,
+    pins: &[HotUnitsSidecarPin],
+) -> Option<HotUnitsSidecar> {
+    let sha256 = entry.sha256.as_deref()?;
+    let size_bytes = entry.size_bytes?;
+    pins.iter()
+        .find(|pin| pin.base_size == size_bytes && pin.base_sha256.eq_ignore_ascii_case(sha256))
+        .map(|pin| HotUnitsSidecar {
+            repo: pin.repo,
+            sidecar: Sidecar {
+                file: pin.file.to_owned(),
+                sha256: Some(pin.sha256.to_owned()),
+                size_bytes: Some(pin.size_bytes),
+            },
+            ranking_sha256: pin.ranking_sha256,
+            published: pin.published,
+        })
+}
+
+/// A replacement artifact this client pulls in place of a published one.
+///
+/// The published registry entry (repo, `file`, `sha256`, `size_bytes`) stays
+/// untouched so older clients keep pulling the artifact they can run, and so
+/// their strict `deny_unknown_fields` v1 parser keeps accepting the registry
+/// (the same reason as [`TrunkOverlayPin`]). This client applies the pin at
+/// parse time ([`RegistryV1::apply_artifact_upgrades`]): the entry takes the
+/// replacement's `sha256` / `size_bytes`, keeps its tag and local file name,
+/// and [`artifact_remote_file`] fetches the replacement from a versioned path
+/// in the same repo, so the published file is never overwritten.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArtifactUpgradePin {
+    /// Registry tag the pin applies to.
+    pub tag: &'static str,
+    /// SHA-256 of the published artifact being replaced (the entry's `sha256`).
+    pub base_sha256: &'static str,
+    /// Size in bytes of the published artifact (the entry's `size_bytes`).
+    pub base_size: u64,
+    /// Path of the replacement inside the entry's repo.
+    pub remote_file: &'static str,
+    /// SHA-256 of the replacement.
+    pub sha256: &'static str,
+    /// Size in bytes of the replacement.
+    pub size_bytes: u64,
+}
+
+/// Artifact replacements known to this client.
+pub const ARTIFACT_UPGRADE_PINS: &[ArtifactUpgradePin] = &[
+    // Raon-1-mini-preview: the attention-class projections MQ8G256 (FWHT256
+    // int8, one scale per 256) in place of Q8F16; routed experts, shared /
+    // dense FFN and lm_head byte-identical to the published file. Needs the
+    // MQ8G256 Raon route, which builds before it lack, hence a client pin.
+    ArtifactUpgradePin {
+        tag: "raon-1-mini-preview",
+        base_sha256: "e136b14c2ab7f31a8951c3ffb74439ca4299e9c835fe77fa1ed533f5dfe86688",
+        base_size: 17_865_468_284,
+        remote_file: "v2/raon-1-mini-preview.mq4-xts",
+        sha256: "fa6d150bcb2af4600aad29aa96bb8fdaf894f0bf1f6bd706af17bc65c8f8690e",
+        size_bytes: 17_772_056_444,
+    },
+];
+
+/// The repo path to fetch `file` of `entry` from: an applied
+/// [`ArtifactUpgradePin`]'s `remote_file` when `file` is the entry's own
+/// artifact and the entry carries that pin's replacement identity, else `file`.
+pub fn artifact_remote_file<'a>(entry: &ModelEntry, file: &'a str) -> &'a str {
+    artifact_remote_file_in(entry, file, ARTIFACT_UPGRADE_PINS)
+}
+
+fn artifact_remote_file_in<'a>(
+    entry: &ModelEntry,
+    file: &'a str,
+    pins: &'static [ArtifactUpgradePin],
+) -> &'a str {
+    if file != entry.file {
+        return file;
+    }
+    let (Some(sha256), Some(size_bytes)) = (entry.sha256.as_deref(), entry.size_bytes) else {
+        return file;
+    };
+    pins.iter()
+        .find(|pin| pin.size_bytes == size_bytes && pin.sha256.eq_ignore_ascii_case(sha256))
+        .map_or(file, |pin| pin.remote_file)
+}
+
 /// Content identity of one expert-hotset sidecar and of the exact base
 /// artifact it is bound to.
 ///
@@ -350,11 +559,43 @@ pub const EXPERT_HOTSET_PINS: &[ExpertHotsetPin] = &[
     },
 ];
 
+/// EP2 expert-ranking sidecars, distinct from [`EXPERT_HOTSET_PINS`]: the name
+/// is the canonical base file plus
+/// `hipfire_config::memory::EP_EXPERT_HOTSET_SIDECAR_SUFFIX`. The split base and the
+/// symmetric-trunk base are pinned; each ranking is bound to its base's tensor index.
+pub const EP_EXPERT_HOTSET_PINS: &[ExpertHotsetPin] = &[
+    ExpertHotsetPin {
+        base_sha256: FLASH_NEXT_XTS_SPLIT_BASE_SHA256,
+        base_size: FLASH_NEXT_XTS_SPLIT_BASE_SIZE,
+        repo: FLASH_NEXT_XTS_REPO,
+        file: "qwen3.8-flash-next-base.mq4-xts.ep.expert-hotset",
+        sha256: "77540499adecb1cbca1186051d24aaa329b986dddd52f6d950c887088e61d7b6",
+        size_bytes: 312_036,
+    },
+    // The symmetric-trunk base (the ranking `HOT_UNITS_SIDECAR_PINS` is calibrated under).
+    // Published to the Hugging Face repo with the hot-units sidecar.
+    ExpertHotsetPin {
+        base_sha256: "27dfff6692eba3385655959d134771fcff154c6279ab0a6c43cb8c7d81a7fa31",
+        base_size: 70_888_270_360,
+        repo: FLASH_NEXT_XTS_REPO,
+        file: "qwen3.8-flash-next-base.mq4-xts-symtrunk.ep.expert-hotset",
+        sha256: "c27a8ebff3d560e6c73d9b1e8b52fb27878a13735301660159109e857b0fb53c",
+        size_bytes: 312_036,
+    },
+];
+
+/// Pinned sidecar files that are not on Hugging Face yet. `hipfire pull` never requests them
+/// and never touches a local copy; a local copy beside the model is still size- and sha256-checked
+/// against its pin and reported. Empty: every pinned sidecar is published.
+pub const UNPUBLISHED_PIN_FILES: &[&str] = &[];
+
 /// A resolved expert hotset: the repo that hosts it and its sidecar identity.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExpertHotset {
     pub repo: &'static str,
     pub sidecar: Sidecar,
+    /// Whether the file is on the repo (`false` for [`UNPUBLISHED_PIN_FILES`]).
+    pub published: bool,
 }
 
 /// The pin in `pins` whose base identity equals the entry's `sha256` and
@@ -372,7 +613,20 @@ pub fn expert_hotset_in(entry: &ModelEntry, pins: &[ExpertHotsetPin]) -> Option<
                 sha256: Some(pin.sha256.to_owned()),
                 size_bytes: Some(pin.size_bytes),
             },
+            published: !UNPUBLISHED_PIN_FILES.contains(&pin.file),
         })
+}
+
+/// [`expert_hotset_in`] over the EP2 ranking pins, `None` while `gate` is off.
+pub fn ep_expert_hotset_in(
+    entry: &ModelEntry,
+    pins: &[ExpertHotsetPin],
+    gate: bool,
+) -> Option<ExpertHotset> {
+    if !gate {
+        return None;
+    }
+    expert_hotset_in(entry, pins)
 }
 
 /// A monolithic artifact a published split base was cut from, pinned in the
@@ -470,7 +724,7 @@ pub struct RetiredModel {
 impl RetiredModel {
     /// The registry card the retired entry carried, so a verified local copy
     /// loads with the same identity, sampling defaults and sidecar pins (the
-    /// sha256/size keyed [`TRUNK_OVERLAY_PINS`] and [`EXPERT_HOTSET_PINS`]) it
+    /// sha256/size keyed [`TRUNK_OVERLAY_PINS`], [`HC8_SIDECAR_PINS`] and [`EXPERT_HOTSET_PINS`]) it
     /// had while published. It declares no sidecar slots.
     pub fn entry(&self) -> ModelEntry {
         ModelEntry {
@@ -783,10 +1037,32 @@ impl ModelEntry {
         trunk_overlay_in(self, TRUNK_OVERLAY_PINS)
     }
 
+    /// The Flash-Next HC8 sidecar of this entry's base artifact, from the
+    /// compiled-in [`HC8_SIDECAR_PINS`]; `None` for every other entry.
+    pub fn hc8_sidecar(&self) -> Option<Hc8Sidecar> {
+        hc8_sidecar_in(self, HC8_SIDECAR_PINS)
+    }
+
+    /// The Flash-Next hot-unit loan sidecar of this entry's base artifact, from the
+    /// compiled-in [`HOT_UNITS_SIDECAR_PINS`]; `None` for every other entry.
+    pub fn hot_units_sidecar(&self) -> Option<HotUnitsSidecar> {
+        hot_units_sidecar_in(self, HOT_UNITS_SIDECAR_PINS)
+    }
+
     /// The Flash-Next expert-hotset sidecar of this entry's base artifact, from
     /// the compiled-in [`EXPERT_HOTSET_PINS`]; `None` for every other entry.
     pub fn expert_hotset(&self) -> Option<ExpertHotset> {
         expert_hotset_in(self, EXPERT_HOTSET_PINS)
+    }
+
+    /// The EP2 expert-ranking sidecar of this entry's base artifact; `None`
+    /// while `hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON` is off.
+    pub fn ep_expert_hotset(&self) -> Option<ExpertHotset> {
+        ep_expert_hotset_in(
+            self,
+            EP_EXPERT_HOTSET_PINS,
+            hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON,
+        )
     }
 
     /// True when this entry is a split base that publishes PLE row sidecars.
@@ -856,6 +1132,10 @@ impl ModelEntry {
     }
 }
 
+/// Registry tags (besides the Qwen3.8-27B tiers) whose declared `dflash`
+/// sidecar lowers `speculation.dflash = "auto"`.
+const RAON_DFLASH_AUTO_TAG: &str = "raon-1-mini-preview";
+
 /// Tag-aware registry config layer. Starts from [`ModelEntry::config_layer`]
 /// then applies automatic load policy by canonical tag. This is the single
 /// canonical place for tag policy so validation and CLI stay in sync.
@@ -873,6 +1153,11 @@ impl ModelEntry {
 /// stays in effect. The schema/BuiltIn default stays `off` for every other
 /// model; `arch_id=16`, draft/dflash sidecars, and tiers with no `dflash`
 /// declaration get no speculation policy.
+///
+/// `raon-1-mini-preview` (arch 19) that declares its DFlash2 `dflash` sidecar
+/// lowers the same `auto`: the Raon carrier builds the DFlash2 speculator when
+/// the pulled draft is wired and runs plain AR (Raon has no MTP) when it is not;
+/// `speculation.dflash = off` opts out.
 ///
 /// Explicit global/model/one-shot user config (including `dflash=off`) remains
 /// higher precedence than this registry layer.
@@ -893,6 +1178,14 @@ pub fn config_layer_for_tag(
     }
     let is_qwen38_27b_tier = tag == "qwen3.8:27b" || tag.starts_with("qwen3.8:27b-");
     if is_qwen_tag_policy && is_qwen38_27b_tier && entry.dflash.is_some() {
+        layer
+            .set("speculation.dflash", ConfigValue::String("auto".into()))
+            .map_err(|error| error.to_string())?;
+    }
+    // Raon-1-mini-preview: the explicit allow-list entry for the arch-19 target
+    // that declares its DFlash2 sidecar (`raon-1-mini-preview:draft` and any
+    // other draft/dflash tag never match).
+    if tag == RAON_DFLASH_AUTO_TAG && !is_sidecar && entry.dflash.is_some() {
         layer
             .set("speculation.dflash", ConfigValue::String("auto".into()))
             .map_err(|error| error.to_string())?;
@@ -1006,6 +1299,7 @@ impl RegistryV1 {
             })?;
         registry.validate(&source_name)?;
         registry.normalize_flash_next_xts();
+        registry.apply_artifact_upgrades(ARTIFACT_UPGRADE_PINS);
         registry.strip_retired(RETIRED_MODELS);
         // An alias is non-authoritative convenience data. Match v1 behavior by
         // dropping dangling redirects instead of rejecting an otherwise valid
@@ -1024,6 +1318,29 @@ impl RegistryV1 {
     pub fn strip_retired(&mut self, pins: &[RetiredModel]) {
         self.models
             .retain(|tag, _| !pins.iter().any(|pin| pin.tag == tag));
+    }
+
+    /// Point every entry whose artifact identity (`sha256`, `size_bytes`)
+    /// equals a pin's base identity at the pin's replacement: the entry's
+    /// `sha256` and `size_bytes` become the replacement's, and
+    /// [`artifact_remote_file`] fetches it from the pin's repo path. The local
+    /// file name (`file`) and the tag are unchanged, so an installed copy of
+    /// the old artifact fails verification and is refreshed by the next pull.
+    pub fn apply_artifact_upgrades(&mut self, pins: &[ArtifactUpgradePin]) {
+        for (tag, entry) in self.models.iter_mut() {
+            let (Some(sha256), Some(size_bytes)) = (entry.sha256.as_deref(), entry.size_bytes)
+            else {
+                continue;
+            };
+            if let Some(pin) = pins.iter().find(|pin| {
+                pin.tag == tag
+                    && pin.base_size == size_bytes
+                    && pin.base_sha256.eq_ignore_ascii_case(sha256)
+            }) {
+                entry.sha256 = Some(pin.sha256.to_owned());
+                entry.size_bytes = Some(pin.size_bytes);
+            }
+        }
     }
 
     fn normalize_flash_next_xts(&mut self) {
@@ -1764,7 +2081,16 @@ mod tests {
             // The recipe is named MQ4 XTS; the old marketing name stays out of descs
             // (a desc may still cite the legacy FILE names in lower case).
             assert!(!entry.desc.contains("GPTQ3"), "{tag}");
-            assert_eq!(&parsed.models[tag], entry, "{tag}: nothing to normalize");
+            // An artifact upgrade pin is the one intended parse-time rewrite (identity only).
+            let mut expected = entry.clone();
+            if let Some(pin) = ARTIFACT_UPGRADE_PINS.iter().find(|pin| pin.tag == tag) {
+                expected.sha256 = Some(pin.sha256.to_owned());
+                expected.size_bytes = Some(pin.size_bytes);
+            }
+            assert_eq!(
+                &parsed.models[tag], &expected,
+                "{tag}: nothing else to normalize"
+            );
             assert!(
                 entry.ple.keys().all(|key| is_ple_format_token(key)),
                 "{tag}"
@@ -1778,6 +2104,7 @@ mod tests {
         }
         // The MQ3 and MQ2 bases are split-only on the same shared pair.
         let split_tags = [
+            "qwen3.8:flash-next-mq4-xts-symtrunk",
             "qwen3.8:flash-next-mq3-xts",
             "qwen3.8:flash-next-mq2-xts",
             "qwen3.8:flash-next-mq2-xts-4500",
@@ -1977,6 +2304,244 @@ mod tests {
         assert!(other.trunk_overlay().is_none());
     }
 
+    const SYMTRUNK_BASE_FILE: &str = "qwen3.8-flash-next-base.mq4-xts-symtrunk";
+
+    /// The published symmetric-trunk base the HC8 pin binds to.
+    fn symtrunk_base_entry() -> ModelEntry {
+        let pin = &HC8_SIDECAR_PINS[0];
+        ModelEntry {
+            file: SYMTRUNK_BASE_FILE.into(),
+            sha256: Some(pin.base_sha256.into()),
+            size_bytes: Some(pin.base_size),
+            ..stock_split_base_entry()
+        }
+    }
+
+    #[test]
+    fn hc8_sidecar_pin_names_the_base_file_plus_the_suffix() {
+        assert_eq!(HC8_SIDECAR_PINS.len(), 1);
+        let pin = &HC8_SIDECAR_PINS[0];
+        assert_eq!(
+            pin.file,
+            format!(
+                "{SYMTRUNK_BASE_FILE}{}",
+                hipfire_config::memory::HC8_SIDECAR_SUFFIX
+            )
+        );
+        assert_eq!(
+            pin.base_sha256,
+            "27dfff6692eba3385655959d134771fcff154c6279ab0a6c43cb8c7d81a7fa31"
+        );
+        assert_eq!(pin.base_size, FLASH_NEXT_XTS_SPLIT_BASE_SIZE);
+        assert_eq!(pin.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(
+            pin.sha256,
+            "2adf32e564f09efbe185c7ebf57483dc58103f21341569e716173098f0e2ee67"
+        );
+        assert_eq!(pin.size_bytes, 659_649_536);
+        for digest in [pin.base_sha256, pin.sha256] {
+            assert_eq!(digest.len(), 64);
+            assert!(digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        }
+        assert!(!pin.file.contains('/') && !pin.file.contains('\\'));
+    }
+
+    #[test]
+    fn hc8_sidecar_lookup_matches_the_symtrunk_base_identity_only() {
+        let entry = symtrunk_base_entry();
+        let hc8 = entry.hc8_sidecar().unwrap();
+        let pin = &HC8_SIDECAR_PINS[0];
+        assert_eq!(hc8.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(
+            hc8.sidecar,
+            Sidecar {
+                file: pin.file.into(),
+                sha256: Some(pin.sha256.into()),
+                size_bytes: Some(pin.size_bytes),
+            }
+        );
+        // Upper-case digests of the same base still match.
+        let mut upper = entry.clone();
+        upper.sha256 = upper.sha256.map(|sha| sha.to_ascii_uppercase());
+        assert!(upper.hc8_sidecar().is_some());
+        // The stock split base (a different artifact of the same size) has no pin.
+        assert!(stock_split_base_entry().hc8_sidecar().is_none());
+        assert_eq!(
+            stock_split_base_entry().size_bytes,
+            Some(HC8_SIDECAR_PINS[0].base_size)
+        );
+        // A different size or sha, or no pinned identity, never matches.
+        let mut other = entry.clone();
+        other.size_bytes = Some(pin.base_size - 1);
+        assert!(other.hc8_sidecar().is_none());
+        let mut other = entry.clone();
+        other.sha256 = Some(digest('a'));
+        assert!(other.hc8_sidecar().is_none());
+        let mut other = entry.clone();
+        other.sha256 = None;
+        assert!(other.hc8_sidecar().is_none());
+        let mut other = entry;
+        other.size_bytes = None;
+        assert!(other.hc8_sidecar().is_none());
+    }
+
+    #[test]
+    fn hc8_pin_does_not_bind_either_overlay_or_hotset_base() {
+        for pin in TRUNK_OVERLAY_PINS {
+            assert_ne!(pin.base_sha256, HC8_SIDECAR_PINS[0].base_sha256);
+        }
+        assert!(symtrunk_base_entry().trunk_overlay().is_none());
+        assert!(symtrunk_base_entry().expert_hotset().is_none());
+        assert!(hc8_sidecar_in(&symtrunk_base_entry(), &[]).is_none());
+    }
+
+    #[test]
+    fn hot_units_pin_names_the_base_file_plus_the_suffix_and_binds_its_calibration() {
+        assert_eq!(HOT_UNITS_SIDECAR_PINS.len(), 1);
+        let pin = &HOT_UNITS_SIDECAR_PINS[0];
+        assert_eq!(
+            pin.file,
+            format!(
+                "{SYMTRUNK_BASE_FILE}{}",
+                hipfire_config::memory::EP_HOT_UNITS_SIDECAR_SUFFIX
+            )
+        );
+        assert_eq!(
+            pin.file,
+            "qwen3.8-flash-next-base.mq4-xts-symtrunk.ep.hot-units"
+        );
+        assert_eq!(pin.base_sha256, HC8_SIDECAR_PINS[0].base_sha256);
+        assert_eq!(pin.base_size, HC8_SIDECAR_PINS[0].base_size);
+        assert_eq!(pin.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(
+            pin.ranking_sha256,
+            "c27a8ebff3d560e6c73d9b1e8b52fb27878a13735301660159109e857b0fb53c"
+        );
+        assert_eq!(
+            pin.sha256,
+            "a50317cf2014f88d306d88366131212757d875c4c6e65572d659d361ec17db13"
+        );
+        assert_eq!(pin.size_bytes, 67_526);
+        assert!(pin.published, "uploaded to the Hugging Face repo");
+        for digest in [pin.base_sha256, pin.ranking_sha256, pin.sha256] {
+            assert_eq!(digest.len(), 64);
+            assert!(digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        }
+        assert!(!pin.file.contains('/') && !pin.file.contains('\\'));
+    }
+
+    #[test]
+    fn hot_units_lookup_matches_the_symtrunk_base_identity_only() {
+        let entry = symtrunk_base_entry();
+        let units = entry.hot_units_sidecar().unwrap();
+        let pin = &HOT_UNITS_SIDECAR_PINS[0];
+        assert_eq!(units.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(
+            units.sidecar,
+            Sidecar {
+                file: pin.file.into(),
+                sha256: Some(pin.sha256.into()),
+                size_bytes: Some(pin.size_bytes),
+            }
+        );
+        assert_eq!(units.ranking_sha256, pin.ranking_sha256);
+        assert!(units.published);
+        let mut upper = entry.clone();
+        upper.sha256 = upper.sha256.map(|sha| sha.to_ascii_uppercase());
+        assert!(upper.hot_units_sidecar().is_some());
+        // The stock split base (same size, different artifact) has no pin.
+        assert!(stock_split_base_entry().hot_units_sidecar().is_none());
+        let mut other = entry.clone();
+        other.size_bytes = Some(pin.base_size - 1);
+        assert!(other.hot_units_sidecar().is_none());
+        let mut other = entry.clone();
+        other.sha256 = Some(digest('a'));
+        assert!(other.hot_units_sidecar().is_none());
+        let mut other = entry.clone();
+        other.sha256 = None;
+        assert!(other.hot_units_sidecar().is_none());
+        let mut other = entry;
+        other.size_bytes = None;
+        assert!(other.hot_units_sidecar().is_none());
+        assert!(hot_units_sidecar_in(&symtrunk_base_entry(), &[]).is_none());
+    }
+
+    #[test]
+    fn hot_units_pin_matches_the_calibration_file_it_was_cut_from() {
+        // The sidecar's own header binds the pinned base and ranking; the pin must say the same
+        // when the calibration file is at hand (it is not in the repo, so skip when absent).
+        let path = std::path::Path::new(
+            "/home/kaden/qcal/release-0.4.5/dynres/statichot/sidecar/qwen3.8-flash-next-base.mq4-xts-symtrunk.ep.hot-units",
+        );
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let pin = &HOT_UNITS_SIDECAR_PINS[0];
+        assert_eq!(bytes.len() as u64, pin.size_bytes);
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["model_sha256"], pin.base_sha256);
+        assert_eq!(value["base_size"], pin.base_size);
+        assert_eq!(value["base_ranking_sha256"], pin.ranking_sha256);
+    }
+
+    #[test]
+    fn hot_units_pin_binds_only_the_symtrunk_base() {
+        for pin in TRUNK_OVERLAY_PINS {
+            assert_ne!(pin.base_sha256, HOT_UNITS_SIDECAR_PINS[0].base_sha256);
+        }
+        assert!(symtrunk_base_entry().hc8_sidecar().is_some());
+        assert!(symtrunk_base_entry().expert_hotset().is_none());
+        let registry = RegistryV1::parse(BUNDLED_REGISTRY, "bundled").unwrap();
+        assert!(registry_sidecar_files(&registry).contains(HOT_UNITS_SIDECAR_PINS[0].file));
+    }
+
+    #[test]
+    fn hot_units_ranking_binding_resolves_to_a_pinned_hotset_of_the_same_base() {
+        let units = HOT_UNITS_SIDECAR_PINS[0];
+        let ranking = EP_EXPERT_HOTSET_PINS
+            .iter()
+            .find(|pin| pin.sha256 == units.ranking_sha256)
+            .expect("the ranking the hot units were calibrated under is pinned");
+        assert_eq!(ranking.base_sha256, units.base_sha256);
+        assert_eq!(ranking.base_size, units.base_size);
+        assert_eq!(ranking.repo, units.repo);
+        assert_eq!(ranking.size_bytes, 312_036);
+        assert_eq!(
+            ranking.file,
+            format!(
+                "{SYMTRUNK_BASE_FILE}{}",
+                hipfire_config::memory::EP_EXPERT_HOTSET_SIDECAR_SUFFIX
+            )
+        );
+        // Through the entry lookup, with the gate on.
+        let resolved = ep_expert_hotset_in(&symtrunk_base_entry(), EP_EXPERT_HOTSET_PINS, true)
+            .expect("the symtrunk base resolves its ranking");
+        assert_eq!(
+            resolved.sidecar.sha256.as_deref(),
+            Some(units.ranking_sha256)
+        );
+        // Both are on the repo.
+        assert!(resolved.published);
+        assert!(units.published);
+        assert!(!UNPUBLISHED_PIN_FILES.contains(&ranking.file));
+        // The split base's ranking stays published and is not the hot units' ranking.
+        let split =
+            ep_expert_hotset_in(&stock_split_base_entry(), EP_EXPERT_HOTSET_PINS, true).unwrap();
+        assert!(split.published);
+        assert_ne!(split.sidecar.sha256.as_deref(), Some(units.ranking_sha256));
+        // The local calibration copy, when at hand, is the pinned bytes.
+        let path = std::path::Path::new(
+            "/home/kaden/qcal/release-0.4.5/symtrunk/model/qwen3.8-flash-next-base.mq4-xts-symtrunk.ep.expert-hotset",
+        );
+        if let Ok(bytes) = std::fs::read(path) {
+            assert_eq!(bytes.len() as u64, ranking.size_bytes);
+        }
+    }
+
     const EXPERT_HOTSET_FILE: &str = "qwen3.8-flash-next.mq4-xts.expert-hotset";
 
     #[test]
@@ -2129,6 +2694,68 @@ mod tests {
         let mut other = split;
         other.sha256 = None;
         assert!(other.expert_hotset().is_none());
+    }
+
+    #[test]
+    fn ep_expert_hotset_pin_has_exact_metadata_and_is_gated() {
+        assert_eq!(EP_EXPERT_HOTSET_PINS.len(), 2);
+        let pin = &EP_EXPERT_HOTSET_PINS[0];
+        let split_hotset = &EXPERT_HOTSET_PINS[1];
+        assert_eq!(
+            pin.file,
+            format!(
+                "{FLASH_NEXT_XTS_SPLIT_BASE_FILE}{}",
+                hipfire_config::memory::EP_EXPERT_HOTSET_SIDECAR_SUFFIX
+            )
+        );
+        assert_eq!(pin.file, "qwen3.8-flash-next-base.mq4-xts.ep.expert-hotset");
+        assert_ne!(pin.file, split_hotset.file);
+        assert_eq!(pin.base_sha256, split_hotset.base_sha256);
+        assert_eq!(pin.base_size, split_hotset.base_size);
+        assert_eq!(pin.base_sha256, FLASH_NEXT_XTS_SPLIT_BASE_SHA256);
+        assert_eq!(pin.base_size, FLASH_NEXT_XTS_SPLIT_BASE_SIZE);
+        assert_eq!(pin.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(
+            pin.sha256,
+            "77540499adecb1cbca1186051d24aaa329b986dddd52f6d950c887088e61d7b6"
+        );
+        assert_eq!(pin.size_bytes, 312_036);
+
+        let split = stock_split_base_entry();
+        assert!(ep_expert_hotset_in(&split, EP_EXPERT_HOTSET_PINS, false).is_none());
+        let ep = ep_expert_hotset_in(&split, EP_EXPERT_HOTSET_PINS, true).unwrap();
+        assert_eq!(ep.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(
+            ep.sidecar,
+            Sidecar {
+                file: pin.file.into(),
+                sha256: Some(pin.sha256.into()),
+                size_bytes: Some(312_036),
+            }
+        );
+        // The method follows the compiled-in gate.
+        assert_eq!(
+            split.ep_expert_hotset().is_some(),
+            hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON
+        );
+
+        let monolithic = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        assert!(ep_expert_hotset_in(&monolithic, EP_EXPERT_HOTSET_PINS, true).is_none());
+        let mut other = split.clone();
+        other.size_bytes = Some(FLASH_NEXT_XTS_SPLIT_BASE_SIZE - 1);
+        assert!(ep_expert_hotset_in(&other, EP_EXPERT_HOTSET_PINS, true).is_none());
+        let mut other = split.clone();
+        other.sha256 = Some(digest('c'));
+        assert!(ep_expert_hotset_in(&other, EP_EXPERT_HOTSET_PINS, true).is_none());
+        let mut unpinned = split;
+        unpinned.sha256 = None;
+        assert!(ep_expert_hotset_in(&unpinned, EP_EXPERT_HOTSET_PINS, true).is_none());
+    }
+
+    #[test]
+    fn registry_sidecar_files_contains_the_ep_expert_hotset_file() {
+        let registry = RegistryV1::parse(BUNDLED_REGISTRY, "bundled").unwrap();
+        assert!(registry_sidecar_files(&registry).contains(EP_EXPERT_HOTSET_PINS[0].file));
     }
 
     #[test]
@@ -3664,6 +4291,117 @@ mod tests {
         );
     }
     #[test]
+    fn bundled_raon_takes_the_mq8_upgrade_pin_and_keeps_its_published_entry() {
+        // The checked-in (published) entry is unchanged: old clients pull the
+        // Q8F16-attention file they can run.
+        let raw: serde_json::Value = serde_json::from_str(BUNDLED_REGISTRY).unwrap();
+        let published = &raw["models"]["raon-1-mini-preview"];
+        assert_eq!(published["file"], "raon-1-mini-preview.mq4-xts");
+        assert_eq!(
+            published["sha256"],
+            "e136b14c2ab7f31a8951c3ffb74439ca4299e9c835fe77fa1ed533f5dfe86688"
+        );
+        assert_eq!(published["size_bytes"], 17_865_468_284u64);
+        // This client: same tag and local file name, the replacement identity,
+        // fetched from the versioned repo path; sidecars and drafts unchanged.
+        let registry = bundled().unwrap();
+        let (_, entry) = registry.model("raon-1-mini-preview").unwrap();
+        assert_eq!(entry.file, "raon-1-mini-preview.mq4-xts");
+        assert_eq!(
+            entry.sha256.as_deref(),
+            Some("fa6d150bcb2af4600aad29aa96bb8fdaf894f0bf1f6bd706af17bc65c8f8690e")
+        );
+        assert_eq!(entry.size_bytes, Some(17_772_056_444));
+        assert_eq!(
+            artifact_remote_file(entry, &entry.file),
+            "v2/raon-1-mini-preview.mq4-xts"
+        );
+        let sidecar = entry.dflash.as_ref().unwrap();
+        assert_eq!(artifact_remote_file(entry, &sidecar.file), sidecar.file);
+        let (_, draft) = registry.model("raon-1-mini-preview:draft").unwrap();
+        assert_eq!(artifact_remote_file(draft, &draft.file), draft.file);
+        // Re-parsing an already-upgraded registry (e.g. the fetch cache) is a no-op.
+        let again = RegistryV1::parse(&serde_json::to_string(&registry).unwrap(), "x").unwrap();
+        assert_eq!(again.models["raon-1-mini-preview"], *entry);
+    }
+
+    #[test]
+    fn artifact_upgrade_pins_match_tag_and_exact_base_identity_only() {
+        let pin = ARTIFACT_UPGRADE_PINS[0];
+        let entry = |tag_sha: &str, size: u64| ModelEntry {
+            repo: "hipfire-models/raon-1-mini-preview".into(),
+            file: "raon-1-mini-preview.mq4-xts".into(),
+            sha256: Some(tag_sha.into()),
+            size_bytes: Some(size),
+            ..ModelEntry::default()
+        };
+        let mut registry = bundled().unwrap();
+        registry.models.clear();
+        registry
+            .models
+            .insert(pin.tag.into(), entry(pin.base_sha256, pin.base_size));
+        registry
+            .models
+            .insert("other".into(), entry(pin.base_sha256, pin.base_size));
+        registry
+            .models
+            .insert("raon-wrong-size".into(), entry(pin.base_sha256, 1));
+        registry.apply_artifact_upgrades(ARTIFACT_UPGRADE_PINS);
+        assert_eq!(registry.models[pin.tag].sha256.as_deref(), Some(pin.sha256));
+        assert_eq!(
+            registry.models["other"].sha256.as_deref(),
+            Some(pin.base_sha256)
+        );
+        let unchanged = &registry.models["other"];
+        assert_eq!(
+            artifact_remote_file(unchanged, &unchanged.file),
+            unchanged.file
+        );
+        let mut fresh = bundled().unwrap();
+        fresh.models.clear();
+        let mut wrong = entry(pin.base_sha256, pin.base_size);
+        wrong.size_bytes = Some(pin.base_size + 1);
+        fresh.models.insert(pin.tag.into(), wrong);
+        fresh.apply_artifact_upgrades(ARTIFACT_UPGRADE_PINS);
+        assert_eq!(
+            fresh.models[pin.tag].sha256.as_deref(),
+            Some(pin.base_sha256)
+        );
+    }
+
+    #[test]
+    fn bundled_raon_dflash2_sidecar_is_declared_and_lowers_auto_on_the_target_only() {
+        let registry = bundled().unwrap();
+        let (tag, target) = registry.model("raon-1-mini-preview").unwrap();
+        let sidecar = target.dflash.as_ref().expect("raon declares its draft");
+        assert_eq!(sidecar.file, "raon-1-mini-preview-dflash2.mq4");
+        assert_eq!(sidecar.size_bytes, Some(748_250_112));
+        assert_eq!(
+            sidecar.sha256.as_deref(),
+            Some("f46b4257773afdfaf25370df47d558429e950b8825561a8f1c3ad5a0010758ee")
+        );
+        let (draft_tag, draft) = registry.model("raon-1-mini-preview:draft").unwrap();
+        assert_eq!(draft.file, sidecar.file);
+        assert_eq!(draft.repo, target.repo);
+        assert_eq!(draft.arch_id, Some(20));
+        assert_eq!(draft.sha256, sidecar.sha256);
+        assert_eq!(draft.size_bytes, sidecar.size_bytes);
+        let auto = ConfigValue::String("auto".into());
+        let layer = config_layer_for_tag(tag, target).unwrap();
+        assert_eq!(layer.get("speculation.dflash"), Some(&auto));
+        let mut bare = target.clone();
+        bare.dflash = None;
+        assert!(config_layer_for_tag(tag, &bare)
+            .unwrap()
+            .get("speculation.dflash")
+            .is_none());
+        assert!(config_layer_for_tag(draft_tag, draft)
+            .unwrap()
+            .get("speculation.dflash")
+            .is_none());
+    }
+
+    #[test]
     fn bundled_dflash_sidecars_name_pullable_files() {
         // Every `dflash.file` must name a file that some registry entry's
         // `file` also names, so `hipfire pull <target>` fetching the sidecar
@@ -4227,16 +4965,18 @@ mod tests {
     fn bundled_dflash_auto_matches_only_declared_qwen38_27b_tiers() {
         // Source-grounded against checked-in registry/v1.json: DFlash-paired
         // Qwen3.8-27B trunk tiers lower `auto`; mq5/mq6 tiers (no dflash
-        // declaration), Flash-Next, drafts, and other families do not.
+        // declaration), Flash-Next, drafts, and other families do not; the
+        // explicit `raon-1-mini-preview` allow-list entry lowers it too.
         let registry = bundled().unwrap();
         let mut auto_tiers = 0;
         for (tag, entry) in &registry.models {
             let layer = config_layer_for_tag(tag, entry).unwrap();
-            let expected = (tag == "qwen3.8:27b" || tag.starts_with("qwen3.8:27b-"))
+            let expected = ((tag == "qwen3.8:27b" || tag.starts_with("qwen3.8:27b-"))
                 && !tag.contains("draft")
                 && !tag.contains("dflash")
                 && entry.arch_id != Some(16)
-                && entry.dflash.is_some();
+                && entry.dflash.is_some())
+                || (tag == "raon-1-mini-preview" && entry.dflash.is_some());
             assert_eq!(
                 layer.get("speculation.dflash") == Some(&ConfigValue::String("auto".into())),
                 expected,

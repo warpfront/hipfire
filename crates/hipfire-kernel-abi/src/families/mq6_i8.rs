@@ -84,9 +84,9 @@ pub const NUMERIC_GFX11_SET_BF16_RNE: NumericContractId =
 
 // ---- shared pieces -----------------------------------------------------------
 
-const P_M: Expr = Expr::Param("M");
+pub(crate) const P_M: Expr = Expr::Param("M");
 const P_K: Expr = Expr::Param("K");
-const P_N: Expr = Expr::Param("N");
+pub(crate) const P_N: Expr = Expr::Param("N");
 const P_HSR: Expr = Expr::Param("head_stride_rows");
 const ONE: Expr = Expr::Const(1);
 
@@ -105,7 +105,7 @@ const ROPE_BYTES: Expr = Expr::Mul(&[P_N, Expr::Const(64), Expr::Const(4)]);
 /// (`rdna-compute/src/gemm.rs:1454`).
 const I32_MAX: u64 = i32::MAX as u64;
 
-const PARAMS_MKN: &[ParamV1] = &[
+pub(crate) const PARAMS_MKN: &[ParamV1] = &[
     ParamV1 {
         name: "M",
         ty: ScalarTy::I32,
@@ -222,8 +222,8 @@ const OP_ROPE: OperandV1 = OperandV1 {
 const OPERANDS_PM_F32: &[OperandV1] = &[OP_A, OP_XQ, OP_Y_F32_PM];
 const OPERANDS_PM_BF16: &[OperandV1] = &[OP_A, OP_XQ, OP_Y_BF16_PM];
 const OPERANDS_PM_NR: &[OperandV1] = &[OP_A, OP_XQ, OP_Y_F32_PM, OP_NORM, OP_ROPE];
-const OPERANDS_HIPCC_F32: &[OperandV1] = &[OP_A, OP_XQ, OP_Y_F32_HIPCC];
-const OPERANDS_HIPCC_BF16: &[OperandV1] = &[OP_A, OP_XQ, OP_Y_BF16_HIPCC];
+pub(crate) const OPERANDS_HIPCC_F32: &[OperandV1] = &[OP_A, OP_XQ, OP_Y_F32_HIPCC];
+pub(crate) const OPERANDS_HIPCC_BF16: &[OperandV1] = &[OP_A, OP_XQ, OP_Y_BF16_HIPCC];
 
 const F_A: FieldV1 = FieldV1 {
     name: "A",
@@ -309,10 +309,10 @@ const F_ROPE: FieldV1 = FieldV1 {
 
 const FIELDS_PM_SET: &[FieldV1] = &[F_A, F_XQ, F_Y, F_M, F_K, F_N, F_UNUSED];
 const FIELDS_PM_NR: &[FieldV1] = &[F_A, F_XQ, F_Y, F_M, F_K, F_N, F_HEAD_MASK, F_NORM, F_ROPE];
-const FIELDS_HIPCC: &[FieldV1] = &[F_A, F_XQ, F_Y, F_M, F_K, F_N];
+pub(crate) const FIELDS_HIPCC: &[FieldV1] = &[F_A, F_XQ, F_Y, F_M, F_K, F_N];
 
 /// Hidden block of every entry, exactly the object metadata's offsets/widths.
-const HIDDEN: &[HiddenV1] = &[
+pub(crate) const HIDDEN: &[HiddenV1] = &[
     HiddenV1 {
         offset: 40,
         width: 4,
@@ -534,7 +534,7 @@ const DOMAIN_PM_NR: &[DomainRuleV1] = &[
 /// hipcc route (`gemm_mq6_i8.rs:363`): `m, n, k > 0`, `k % 256 == 0`; the
 /// kernargs are `i32` (`:429-431`), so dims are bounded by the I32 param type.
 /// The hipcc path has no 2^31-byte extent rule and none is imposed here.
-const DOMAIN_HIPCC: &[DomainRuleV1] = &[
+pub(crate) const DOMAIN_HIPCC: &[DomainRuleV1] = &[
     DomainRuleV1 {
         rule: Rule::Positive(P_K),
         why: "gemm_mq6_i8.rs:363 k > 0",
@@ -573,7 +573,7 @@ const PM_OBJECT: ObjectRefV1 = ObjectRefV1::Embedded {
     artifact: "kernels/gemm_mq6g256v2_mmq_i8_pm_gfx1201.hxaco",
     // `sha256sum` of the committed object. (The doc comment of
     // `kernels::GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201` quotes an older digest.)
-    sha256: "1c2dcba4b9433e71acba6ba27fabe96c21cedf1a1497e5abed79b0804952e5da",
+    sha256: "c1458584a1b8ab53e613c982c9a3e87c530c80e83e76223ed4f677d594bad300",
 };
 
 /// 128 x 128 grid: `[ceil(M/128), ceil(N/128), 1]` (`gemm_mq6_i8.rs:451-454`

@@ -241,6 +241,8 @@ pub(crate) fn encode(
             "{symbol}: .amdhsa_user_sgpr_count is below the {implied} enabled user SGPRs"
         ));
     }
+    let rsrc2 = u32::from_le_bytes(kd[52..56].try_into().unwrap());
+    arch.check_user_system_sgprs(symbol, rsrc2)?;
     Ok(kd)
 }
 

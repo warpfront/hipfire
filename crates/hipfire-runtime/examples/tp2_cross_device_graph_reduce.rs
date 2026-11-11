@@ -5,9 +5,14 @@
 
 //! Exact replay screen for the TP2 graph-resident fused barrier and
 //! rank-ordered residual reduction on an exact homogeneous gfx1100 or gfx1201
-//! pair (`prepare_tp_graph_signals` refuses any other topology).
+//! pair (`prepare_tp_graph_signals` refuses any other topology). It reduces
+//! through `all_reduce_sum_f32_peer_add_routed`, so `HIPFIRE_TP_EXCHANGE`
+//! (`f32`, `bf16`, `f16`) picks the captured kernel; the expected residual is
+//! replayed on the host with the matching round-to-nearest-even 16-bit round
+//! trip of every partial.
 
 use hip_bridge::{Graph, GraphExec};
+use hipfire_runtime::multi_gpu::tp_exchange::{tp_exchange_mode, TpExchange16};
 use hipfire_runtime::multi_gpu::Gpus;
 use rdna_compute::{DType, GpuTensor};
 
@@ -20,6 +25,29 @@ struct CapturedRank {
     graph: Graph,
     exec: GraphExec,
     _blobs: Vec<Vec<u8>>,
+}
+
+/// The value a rank adds for partial `v` under the exchange format.
+fn exchanged(fmt: Option<TpExchange16>, v: f32) -> f32 {
+    match fmt {
+        None => v,
+        Some(TpExchange16::Bf16) => half::bf16::from_f32(v).to_f32(),
+        Some(TpExchange16::F16) => half::f16::from_f32(v).to_f32(),
+    }
+}
+
+/// Host replay of one captured replay on `rank`: every barrier first adds the
+/// rank's increment to its partial (f32), then every rank adds the rank-ordered
+/// sum of the exchanged partials to its residual.
+fn expected_residual(fmt: Option<TpExchange16>, replay: usize, rank: usize) -> f32 {
+    let mut partial = [(replay * 2 + 1) as f32, (replay * 2 + 2) as f32];
+    let mut residual = (100 + rank) as f32;
+    for _ in 0..BARRIERS {
+        partial[0] += 1.0;
+        partial[1] += 2.0;
+        residual += exchanged(fmt, partial[0]) + exchanged(fmt, partial[1]);
+    }
+    residual
 }
 
 fn upload(gpu: &rdna_compute::Gpu, tensor: &GpuTensor, value: f32) {
@@ -42,6 +70,8 @@ fn main() {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(100);
     assert!(replays > 1);
+    // The capture reduces one row over two ranks.
+    let fmt = tp_exchange_mode().resolve(1, 2);
 
     let mut gpus = Gpus::init_uniform(2, 2).expect("init TP2 GPUs");
     let arch = gpus.devices[0].arch.clone();
@@ -105,11 +135,12 @@ fn main() {
                 .add_f32(&partials[rank], &increments[rank], &partials[rank])
                 .expect("capture partial producer");
         }
-        gpus.all_reduce_sum_f32_peer_direct_add_alternating(
+        gpus.all_reduce_sum_f32_peer_add_routed(
             &partial_refs,
             &residual_refs,
+            1,
             ELEMS,
-            barrier & 1,
+            Some(barrier & 1),
         )
         .expect("capture fused TP2 reduction");
     }
@@ -167,10 +198,7 @@ fn main() {
             let host = gpu
                 .download_f32(&residuals[rank])
                 .expect("download reduced residual");
-            let b = BARRIERS as f32;
-            let initial_pair = (replay * 2 + 1) as f32 + (replay * 2 + 2) as f32;
-            let producer_triangle = 3.0 * b * (b + 1.0) * 0.5;
-            let expected = (100 + rank) as f32 + b * initial_pair + producer_triangle;
+            let expected = expected_residual(fmt, replay, rank);
             assert!(
                 host.iter().all(|&value| value == expected),
                 "replay {replay} rank {rank}: expected {expected}, head {:?}",
@@ -188,5 +216,11 @@ fn main() {
             .expect("destroy graph exec");
         gpu.hip.graph_destroy(capture.graph).expect("destroy graph");
     }
-    println!("PASS {arch} TP2 graph fused reduce: {replays} exact replays");
+    println!(
+        "PASS {arch} TP2 graph fused reduce ({}): {replays} exact replays",
+        fmt.map_or("f32", |f| match f {
+            TpExchange16::Bf16 => "bf16",
+            TpExchange16::F16 => "f16",
+        })
+    );
 }

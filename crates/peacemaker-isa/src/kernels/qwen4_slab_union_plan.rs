@@ -26,11 +26,35 @@ use crate::{
 };
 
 type R = Result<(), String>;
-const TOP: u8 = 8;
-const CODEC: u8 = 10;
-const OUT: u8 = 12;
-const ROWS: u8 = 14;
-const UNIFORM: u8 = 15;
+const USER_SGPRS: u8 = 2;
+/// The workgroup id X is the only system SGPR.
+const SYSTEM_SGPRS: u8 = 1;
+/// Kernarg block s[base:base+7]: topk, codec, out pointers, rows, uniform bucket.
+#[derive(Clone, Copy)]
+struct Args {
+    top: u8,
+    codec: u8,
+    out: u8,
+    rows: u8,
+    uniform: u8,
+}
+/// gfx1100 `FeatureUserSGPRInit16Bug` (user + system >= 16) declares 15 user SGPRs, so the workgroup
+/// id is s15 and the (8-aligned) kernarg block moves from s[8:15] to the unused s[32:39]; every other
+/// arch keeps s[8:15].
+const fn args(arch: Arch) -> Args {
+    let base = if matches!(arch, Arch::Gfx1100) { 32 } else { 8 };
+    Args {
+        top: base,
+        codec: base + 2,
+        out: base + 4,
+        rows: base + 6,
+        uniform: base + 7,
+    }
+}
+/// First SGPR of the workgroup id X (`s2`, gfx1100 `s15`; gfx12 reads ttmp9).
+const fn workgroup_x(arch: Arch) -> u8 {
+    arch.declared_user_sgprs(USER_SGPRS, SYSTEM_SGPRS)
+}
 const EXPERTS: u8 = 16;
 const TILE: u8 = 17;
 const BASE: u8 = 18;
@@ -77,6 +101,14 @@ pub fn emit(arch: Arch) -> Result<Emitted, String> {
             arch.name()
         ));
     }
+    let Args {
+        top,
+        codec,
+        out,
+        rows,
+        uniform,
+    } = args(arch);
+    let wg_x = workgroup_x(arch);
     let spec = KernelSpec {
         kernel_id: "qwen4_slab_union_plan".into(),
         variant: "t8".into(),
@@ -89,17 +121,17 @@ pub fn emit(arch: Arch) -> Result<Emitted, String> {
             .hidden("rows", 24, 4, "by_value")
             .hidden("uniform_bucket", 28, 4, "by_value")
             .hidden("n_experts", 32, 4, "by_value"),
-        user_sgpr_count: 2,
+        user_sgpr_count: USER_SGPRS,
         system_sgpr_workgroup_id_y: false,
         workgroup_size: 128,
         group_segment_fixed_size: 1280,
         wave32: true,
         cu_mode: false,
     };
-    let mut p = RegPlan::new(32, 32)?;
+    let mut p = RegPlan::new(32, if arch == Arch::Gfx1100 { 40 } else { 32 })?;
     p.s::<2>("kernarg", 0, Live::Whole)?;
-    p.s::<1>("workgroup_x", 2, Live::Whole)?;
-    p.s::<8>("args_0", TOP, Live::Whole)?;
+    p.s::<1>("workgroup_x", wg_x, Live::Whole)?;
+    p.s::<8>("args_0", top, Live::Whole)?;
     p.s::<1>("n_experts", EXPERTS, Live::Whole)?;
     for (name, r) in [
         ("tile", TILE),
@@ -121,20 +153,25 @@ pub fn emit(arch: Arch) -> Result<Emitted, String> {
     let buckets = b.lds_slot("buckets", 320, 320)?;
     let heads = b.lds_slot("heads", 640, 320)?;
     let totals = b.lds_slot("totals", 960, 320)?;
-    smem(&mut b, TOP, 8, 0, 0)?;
+    smem(&mut b, top, 8, 0, 0)?;
     smem(&mut b, EXPERTS, 1, 0, 32)?;
     if arch.gfx12() {
         sop(&mut b, format!("s_mov_b32 s{TILE}, ttmp9"), &[TILE], &[])?;
     } else {
-        sop(&mut b, format!("s_mov_b32 s{TILE}, s2"), &[TILE], &[2])?;
+        sop(
+            &mut b,
+            format!("s_mov_b32 s{TILE}, s{wg_x}"),
+            &[TILE],
+            &[wg_x],
+        )?;
     }
     b.wait_all()?;
     // All exits here are workgroup-uniform and precede every barrier.
     for (cmp, uses) in [
-        (format!("s_cmp_lt_i32 s{ROWS}, 1"), vec![ROWS]),
-        (format!("s_cmp_gt_i32 s{ROWS}, 64"), vec![ROWS]),
-        (format!("s_cmp_lt_i32 s{UNIFORM}, -1"), vec![UNIFORM]),
-        (format!("s_cmp_gt_i32 s{UNIFORM}, 1"), vec![UNIFORM]),
+        (format!("s_cmp_lt_i32 s{rows}, 1"), vec![rows]),
+        (format!("s_cmp_gt_i32 s{rows}, 64"), vec![rows]),
+        (format!("s_cmp_lt_i32 s{uniform}, -1"), vec![uniform]),
+        (format!("s_cmp_gt_i32 s{uniform}, 1"), vec![uniform]),
         (format!("s_cmp_lt_i32 s{EXPERTS}, 0"), vec![EXPERTS]),
     ] {
         sop(&mut b, cmp, &[], &uses)?;
@@ -151,9 +188,9 @@ pub fn emit(arch: Arch) -> Result<Emitted, String> {
     op(&mut b, "s_cbranch_scc1 .Lunion_end", &[], &[])?;
     sop(
         &mut b,
-        format!("s_cmp_ge_u32 s{TEMP}, s{ROWS}"),
+        format!("s_cmp_ge_u32 s{TEMP}, s{rows}"),
         &[],
-        &[TEMP, ROWS],
+        &[TEMP, rows],
     )?;
     op(&mut b, "s_cbranch_scc1 .Lunion_end", &[], &[])?;
     sop(
@@ -164,9 +201,9 @@ pub fn emit(arch: Arch) -> Result<Emitted, String> {
     )?;
     sop(
         &mut b,
-        format!("s_mul_i32 s{LIMIT}, s{ROWS}, 10"),
+        format!("s_mul_i32 s{LIMIT}, s{rows}, 10"),
         &[LIMIT],
-        &[ROWS],
+        &[rows],
     )?;
     sop(
         &mut b,
@@ -174,7 +211,7 @@ pub fn emit(arch: Arch) -> Result<Emitted, String> {
         &[TEMP],
         &[TILE],
     )?;
-    add64(&mut b, OUT, OUT, TEMP)?;
+    add64(&mut b, out, out, TEMP)?;
     vi(
         &mut b,
         ABS,
@@ -207,7 +244,7 @@ pub fn emit(arch: Arch) -> Result<Emitted, String> {
             format!("v_lshlrev_b32_e32 v{ADDR}, 2, v{ABS}"),
             &[v(ABS)],
         )?;
-        load(b, ID, ADDR, TOP, false)
+        load(b, ID, ADDR, top, false)
     })?;
     b.wait_all()?;
     // Unsigned ID comparison rejects negative IDs as well as >=n_experts.
@@ -220,15 +257,15 @@ pub fn emit(arch: Arch) -> Result<Emitted, String> {
         &[s(EXPERTS), v(ID)],
     )?;
     masked(&mut b, |b| {
-        sop(b, format!("s_cmp_ge_i32 s{UNIFORM}, 0"), &[], &[UNIFORM])?;
+        sop(b, format!("s_cmp_ge_i32 s{uniform}, 0"), &[], &[uniform])?;
         op(b, "s_cbranch_scc1 .Lunion_uniform", &[], &[])?;
-        load(b, DATA, ID, CODEC, true)?;
+        load(b, DATA, ID, codec, true)?;
         b.wait_all()?;
         cmp(b, MASK2, "eq_u32", "1", &format!("v{DATA}"), &[v(DATA)])?;
         choose(b, BUCKET, "1", "0", MASK2, &[])?;
         op(b, "s_branch .Lunion_bucket_done", &[], &[])?;
         b.label(".Lunion_uniform")?;
-        mov(b, BUCKET, &format!("s{UNIFORM}"), &[s(UNIFORM)])?;
+        mov(b, BUCKET, &format!("s{uniform}"), &[s(uniform)])?;
         b.label(".Lunion_bucket_done")
     })?;
     // Exactly the first80 threads initialize LDS, including inactive tail slots.
@@ -533,6 +570,7 @@ fn load(b: &mut Builder, dst: u8, addr: u8, base: u8, byte: bool) -> R {
     )
 }
 fn output(b: &mut Builder, index: u8, base: u32, data: u8) -> R {
+    let out = args(b.spec.arch).out;
     vi(
         b,
         ADDR,
@@ -542,12 +580,12 @@ fn output(b: &mut Builder, index: u8, base: u32, data: u8) -> R {
     mem(
         b,
         format!(
-            "global_store_b32 v{ADDR}, v{data}, s[{OUT}:{}] offset:{}",
-            OUT + 1,
+            "global_store_b32 v{ADDR}, v{data}, s[{out}:{}] offset:{}",
+            out + 1,
             base * 4
         ),
         &[],
-        &[v(ADDR), v(data), sr(OUT, 2)],
+        &[v(ADDR), v(data), sr(out, 2)],
         MemoryClass::VmemStore,
     )
 }

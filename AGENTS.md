@@ -1,7 +1,14 @@
 # AGENTS.md — project notice + testing playbook
 
-Redline = retained PM4/AQL capture-and-replay of an eager decode step (default only for .mq4r, gfx1201 no-drafter loads, and the gfx1201 A3B `.mq4rs` plain-AR load).
+Redline = retained PM4/AQL capture-and-replay of an eager decode step. It is the default only where `retained_redline_default` (`crates/hipfire-runtime/src/config.rs`) admits it, always single-device (EP=PP=TP=1): `.mq4r` files on gfx1100/gfx1151/gfx1201, and, without a drafter, gfx1201 Qwen3.5 dense and Qwen4 (Flash-Next with MTP off), gfx1100 Qwen3.5 dense `.mq3-xt`, the gfx1201 A3B `.mq4rs` and the gfx1151 DeepSeek V4 `.mq2r`; Gemma 4, Muse Glimmer and Qwen3.5-family CPU-executed offload are excluded.
 railgun = certified typed dispatch programs (railgun, railgun-cert, railgun-corpus, railgun-jitcorpus), including railgun::npu (the Strix Halo NPU trunk runtime), D8 and G7. Do not conflate them.
+
+**Engineering lessons (authoritative):** [`docs/methodology/lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md)
+holds the measurement, gate and lever-selection rules learned in the 0.4.5
+cycle (decompose before choosing levers, ceiling-first kill experiments,
+served-not-isolated wins, nonce/reducer/host-load/first-arm hygiene,
+per-arch cost tables, residency first, bitwise gates, gate gaps). Where this
+file or [`CLAUDE.md`](CLAUDE.md) disagrees with it, the lessons file wins.
 
 This file serves two purposes, in order:
 
@@ -153,7 +160,9 @@ prompt-shape adaptation paths.
 **Companion docs:** [`CLAUDE.md`](CLAUDE.md) holds project-wide rules
 (non-negotiable hard rules). [`docs/VALIDATION.md`](docs/VALIDATION.md) is
 the authority on which validation route a given change owes.
-This file holds the *testing playbook* — how to verify the engine
+[`docs/methodology/lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md) is the
+authority on measurement hygiene and gate discipline (it supersedes older
+rules here). This file holds the *testing playbook*: how to verify the engine
 works, what to measure, what counts as pass/fail.
 
 **Default behavior to be aware of:**
@@ -243,14 +252,26 @@ works, what to measure, what counts as pass/fail.
    TypeScript/JavaScript runtime surface. `scripts/install.{sh,ps1}`, Nix, and
    the container build install the native `hipfire` binary. Python remains
    appropriate for developer-only orchestration and analysis scripts.
-7. **Run `scripts/pre-commit-ci.sh [origin/<base>]` before every commit.**
+7. **Run `scripts/pre-commit-ci.sh [origin/<base>]` on the final commit.**
    It runs the GPU-free CI checks that finish quickly: ratchets, crate
    maps, scratch growth, changelog, ratchet-diff, cargo-deny
-   bans/licenses/sources, rustfmt on changed files, clippy, env docs and
+   bans/licenses/sources, rustfmt, clippy, env docs and
    lifecycle. It skips the tests and the release build. Pass the branch
    your PR targets (for example `origin/beta`) so ratchet-diff compares
-   against it. Fix every failure before you commit. Install cargo-deny first
-   with `cargo install --locked cargo-deny`; missing tools fail the check.
+   against it. Run it again after every rebase, squash or conflict
+   resolution: a pass on an earlier commit does not cover the one that lands
+   (clippy's deny-by-default lints failed a land gate this way, `566f26b40a`).
+   Also run `cargo test -p railgun-cert` for every Rust change: its
+   recording-inventory test scans every crate, so a change outside railgun can
+   turn it red (`8aab98f1e0`). Fix every failure before you commit. Install
+   cargo-deny first with `cargo install --locked cargo-deny`; missing tools
+   fail the check.
+8. **Measurement hygiene is not optional.** Every timing claim follows
+   [`docs/methodology/lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md) § 4:
+   distinct prompts or nonces in C>1 greedy comparisons, a checked reducer,
+   host load checked by hand, a throwaway arm first, at least 4 interleaved
+   fresh loads per arm, bootstrap CIs. An isolated kernel win is not a served
+   win (§ 3).
 
 ---
 
@@ -429,14 +450,20 @@ hipfire bench <model> --runs 5 --warmups 3 --max-tokens 128 --json
 Pin `--backend` and `--workload` explicitly for any A/B. The default is `both`,
 which measures two things at once and is not a comparison.
 
-**Do not use `--concurrency` for a perf comparison.** It sweeps concurrent
-stream counts and leaves the single-stream path; it answers a different
-question.
+**Do not use `--concurrency` for a single-stream comparison.** It is the
+closed-loop serving sweep (K lanes, unique request tags, an overlap check per
+K>1 cell) and answers the concurrent-serving question, not the single-stream
+one. A C>1 claim is measured on the served path under the rules of
+[`docs/methodology/lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md) § 4
+(distinct prompts per stream, EOS-on and fixed-length cells reported
+separately, at least 4 interleaved fresh loads per arm, bootstrap CIs).
 
 Still true regardless of tool: run in a fresh process, and record the model md5
-and both binary md5s with any number you report. Within-session A/B is noisy on
-gfx1100 (±10–15 % from DPM/thermal state). `HIPFIRE_VERIFY_GRAPH=0` gives ~0.1 %
-spread versus 1.5–3 % with graph capture on.
+and both binary md5s with any number you report. There is no universal noise
+band: characterize it on the fixture with an A/A pair before calling a delta
+real. The older figures (gfx1100 within-session ±10–15 % from DPM/thermal
+state; `HIPFIRE_VERIFY_GRAPH=0` ~0.1 % spread versus 1.5–3 % with graph capture
+on) are historical observations on that card, not bands to reuse.
 
 ### 3.2 — Prompt-shape A/B
 
@@ -455,7 +482,8 @@ hipfire bench <model> --spec off    --runs 5 --backend noslots --json
 hipfire bench <model> --spec dflash --runs 5 --backend noslots --json
 ```
 
-Report the 5-run median with GPU model, ROCm version, model md5 and binary md5.
+Report the median with the run count and a bootstrap CI of the difference, plus
+GPU model, ROCm version, model md5 and binary md5.
 Older pre-q8 DFlash numbers are not authoritative for current perf triage.
 
 ### 3.4 — DFlash-by-genre matrix (full sweep)
@@ -573,19 +601,30 @@ For dataclass benches:
 
 ### Don't claim a perf win without
 
-- ≥3 fresh-process runs
-- Prompt md5 recorded
-- Binary md5 recorded
+- At least 4 fresh-process loads per arm, interleaved (ABBA or Latin square),
+  with a throwaway arm first; 6–12 per arm when the effect is under about
+  1 ms/step
+- A bootstrap 95% CI of the difference; a bar claim quotes the pooled median,
+  the ratio's CI and how many loads cleared the bar
+- Prompt md5 recorded; distinct prompts or nonces in any C>1 greedy arm
+- Binary md5 recorded; the number measured on the build that lands
+- A log line proving the lever was active in the measured run
 - Claim-scoped `serve_harness` / VALIDATION route pass (retired coherence-gate scripts are **not** acceptance)
+- For a kernel change, a served A/B, not only an isolated bench (unless it is
+  bitwise and below served resolution; see
+  [`lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md) § 3)
 
 - Eyeball check on decoded output (especially when τ is unusually high)
 
 ### Don't claim a perf regression without
 
-- ≥3 fresh-process runs (same prompt, same env)
+- The same load count, interleaving and CI as a win (same prompt, same env),
+  and a host-load check of the runs that show it
 - Bisect to a specific commit (use `scripts/probe_commits.sh COMMIT_BEFORE COMMIT_AFTER`)
 - Confirmation that the regression appears across genres (not just one
   prompt that happens to hit a different distribution)
+- A reducer check: lead, warm-up and fixed-length bursts are not pooled into
+  the cell (a τ "regression" was exactly that, lessons § 4.2)
 
 ### Pinned Hugging Face bench fixture
 
@@ -757,6 +796,15 @@ hot set `qwen3.8-flash-next-base.mq4-xts.expert-hotset` (sha256 `91143074…`);
 the monolith-bound overlay (`df49bc0a…`) and hot set (`7f6760e1…`) serve
 grandfathered monolithic installs.
 
+**EP2 serve fixture (2x R9700).** The 0.4.5 Flash-Next EP2 serve measurements
+(cp20) use the symmetric-trunk variant `qwen3.8-flash-next-base.mq4-xts-symtrunk`
+with its `.hc8`, `.ep.hot-units` and `.ep.expert-hotset` sidecars; fixture,
+hashes, cells and method are in
+[`docs/perf-checkpoints/2026-11-11-flash-next-ep2-cp20.md`](docs/perf-checkpoints/2026-11-11-flash-next-ep2-cp20.md).
+Use that cell plan (story/code x C1/C4/C8, fresh serves, pooled medians with
+bootstrap CIs) for any EP2 serve claim, and the rules in
+[`lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md) § 4.
+
 HF preservation policy: the monolithic HF objects (`qwen3.8-flash-next.mq4-xts`,
 `qwen3.8-flash-next-gptq3.mq4` and the two retired artifacts below) must stay
 published while 0.4.2 clients exist, because their bundles reference them.
@@ -906,11 +954,16 @@ Caveats that are part of the fixture, not trivia:
   teacher and seven primitive cases remain unchanged: a gfx1201 target is
   not a new teacher or cross-architecture greedy proof. Keep original KL
   limits (16K: 0.03948458079446915; 4K: 0.027284316982763658), not +0.010.
-  Symmetric IU4 remains requested ON by default on gfx1151/gfx1201; pending
-  qualification never justifies switching it OFF (`=0` is an isolated
+  Symmetric IU4 is requested ON by default on gfx1100, gfx1151 and gfx1201;
+  pending qualification never justifies switching it OFF (`=0` is an isolated
   control). Active execution still requires actual eligible headers,
   descriptor, row and resource admission; a request is not an active-route
-  receipt. The gfx1100 candidate remains default OFF. FP8 KV and FA2 are
+  receipt. The gfx1100 default (regular prefill and the S1 `aggregate-sym-iu4`
+  window read the same `Gpu::qwen4_moe_sym_iu4_requested`) was flipped on
+  with its numeric acceptance recorded in the CHANGELOG entry (S1 context-mean
+  KL within the limits above; WT2/code24 BF16-teacher KLD deltas +0.0293 /
+  +0.0296 vs gfx1201 +0.0306 / +0.0285, the code24 excess of 0.0011 waived by
+  Kaden 2026-10-29; pp8192/pp32768 A/B +1.2 / +1.4%). FP8 KV and FA2 are
   independent, stackable choices; A3B H16/KV2/D256 FA2 work is not an applied
   Flash-Next H24/KV2/D256 QSA FA2 port or a Flash-Next performance gain.
   **Widened byte/state/ID and performance qualification is pending.** Before
@@ -941,7 +994,10 @@ Caveats that are part of the fixture, not trivia:
   greedy requests with penalties run AR
   (`crates/hipfire-generate/src/ar.rs:1715–1734`).
   Flash-Next batch lanes refuse non-neutral repeat/presence/frequency penalties
-  (`crates/hipfire-generate/src/batch.rs:2767–2789`).** Each MTP
+  (`crates/hipfire-generate/src/batch.rs`, `qwen4_lane_request_supported`), but
+  batch sampled neutral-penalty requests under `serve.batch_sampled`: AR lanes
+  draw with the AR singleton sampler and request seed, MTP lanes verify sampled
+  windows with naive acceptance.** Each MTP
   window picks its verification route: a batched `(K+1)`-row verify at the
   draft depth `K` (up to the `mtp_k` cap; `auto` for native Qwen4 MTP =
   `min(GPU row-exact verify rows, CPU-owned-expert window) − 1` resolved after
@@ -1052,8 +1108,16 @@ Caveats that are part of the fixture, not trivia:
   serves greedy and sampled requests, thinking on or off (Qwen4 and
   Qwen3.5/3.x). The Qwen4 proposal source is switched by
   `speculation.mtp_ngram_copy` / `HIPFIRE_MTP_NGRAM_COPY` (`on`/`off`/`auto`,
-  also `1`/`0`; default `auto`, which is **off on every GPU for now**; env
-  beats TOML beats default). **Off is beta's lane exactly.** On Qwen4 a pool
+  also `1`/`0`; default `auto`, which is **on for native Qwen4 MTP (arch 16)
+  on gfx1151 and gfx1201** and off on every other GPU; `off`/`0` is the kill
+  switch; env beats TOML beats default). Default history: the lane shipped
+  with `auto` off on every GPU (`448a471ea4`); `auto` arms gfx1151 and gfx1201
+  since `c921903686` (`copy_lane_arch_admitted` in
+  `crates/hipfire-config/src/lib.rs`). Flash-Next EP mesh lanes stage the same
+  copy lane by default wherever `auto` arms it, in steps of at most
+  `HIPFIRE_QWEN4_LANE_COPY_LANES` (2) lanes (`047ed76122`; kill switch
+  `HIPFIRE_EP_MTP_LANE_COPY=0`). **Off is the 5/3/3 pool lane
+  exactly.** On Qwen4 a pool
   hit (`MtpNgramContext`, the 5/3/3 pool; request-local, cleared and reseeded
   from the full prompt every request, so earlier requests never influence
   candidates, and cleared after five low-acceptance windows) takes the window
@@ -1170,6 +1234,15 @@ Caveats that are part of the fixture, not trivia:
   `plan_us`, `retired`) per window with a proposal (retired plans included)
   and `ngram_confirm` (`position`, `match`) wherever the row-0 confirmation
   ran; with it off neither event is emitted.
+- **Concurrent MTP output depends on batch composition by default (Flash-Next
+  EP lanes, exact gfx1201).** With `HIPFIRE_QWEN4_LANE_ROW_EXACT` off (the
+  default, `20c7b6de0e`), lane verify steps of 9..=64 rows take routes whose
+  per-row arithmetic depends on the co-batched rows, so C>1 MTP output may
+  differ from the singleton's; C1 and AR stay exact. `greedy`/`seeded` opts
+  into batch-invariant output (code C8 step +82%, C4 +41% on the measured
+  fixture). Bitwise gates for lane changes therefore compare candidate against
+  incumbent under the same setting, never a lane against the singleton
+  ([`lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md) § 7).
 - **Measured, not an 80% claim:** on 2026-09-23, gfx1151, HIP 7.2, greedy,
   KV q8, `max_seq=2048`, graph off, three fresh daemon processes per mode and
   byte-identical committed prompts, median code decode was AR 19.4 versus
@@ -1235,7 +1308,7 @@ Caveats that are part of the fixture, not trivia:
 | "27B DFlash regressed 30-40% suddenly" | PR #32 (cleanup-dead-wmma-kernels) on master removed `gemm_hfq4g256_residual_wmma{,2,_k4}.hip` thinking dead. Dispatch fell back to slower variants. | Verify against canonical 199 tok/s @ max=120 with default flags. If kernel files missing in `kernels/src/`, `git checkout` from a known-good commit (see commit 9a2c667 for the full recovery context). |
 | `HIPFIRE_GRAPH=1` reports plausible tok/s but output is garbage | Dangling stack-pointer kernargs from raw `self.hip.launch_kernel(...)` calls in `forward_scratch_layers` (kv_cache_write_*, attention_flash_*, fused_qkv_hfq4g256, rmsnorm_batched, rope_partial_interleaved_f32, gated_delta_net_q8, etc.) — captured pointers dangle past `end_graph_capture` | Bench tok/s alone never proves graph correctness. Always eyeball under `HIPFIRE_GRAPH=1` and run the claim-scoped VALIDATION serve route — never retired coherence-gate scripts as acceptance. Fix: migrate every raw-launch helper used in forward_scratch_layers to `launch_maybe_blob` (model after `conv1d_silu_split_f32_n`). |
 | `memory.offload_exec` modes disagree on greedy output, or `passback` differs between two identical runs | Expected: the modes run different GEMV engines, and `passback`'s row split is scheduled per process (probe + online arm timings). Measured (2B): `cpu`×2 and `pcie`×2 byte-identical; `cpu` vs `pcie` differ; `passback`×2 differ; `HIPFIRE_OFFLOAD_PASSBACK_SHARE=0` byte-identical to `cpu` | NEVER assert a greedy/golden reference across a mode pair (`cpu` vs `pcie` is not bit-identical either), and NEVER assert `passback` output with the share on `auto` — pin `memory.offload_passback_share`, or use `0` to reach the exact `cpu` twin. See [`docs/perf-checkpoints/2026-10-02-offload-passback-model-spread-gfx1201-amendment-1.md`](docs/perf-checkpoints/2026-10-02-offload-passback-model-spread-gfx1201-amendment-1.md) § 5. |
-| Qwen3.5-class (arch 5/6) model with `speculation.mtp=auto` runs AR, resident or offloaded (bench `spec_route` null, serve `timings.tau`/`mtp` null, no `MTP head loaded` line) | Native MTP `auto` arms only a producer that declares a measured AR floor, and Qwen35 declares none, so the load logs `MTP: off by default (no measured AR floor); opt in with --spec mtp` and no head is loaded. Where a floor-declaring producer (Qwen4) does attach under `auto`, a host-mapped routed-expert spill still declines it on any arch but its admitted one (the `pcie`/`cpu` decline line logs the count, seam and `opt in with --spec mtp`). Unset/null layer/expert budgets keep all weights resident; only explicit `auto`/`-1` or manual `N` requests placement changes | Use `--spec mtp` / `speculation.mtp=on`, subject to metadata-based refusal of uniform MQ6G256 V1 (qt15) Qwen35 MoE on gfx1200/gfx1201 with FP16 WMMA enabled whenever a head would attach. `--spec off` / `speculation.mtp=off`, `auto` and an auto-declined spill remain AR; `HIPFIRE_FP16=0` permits explicit MTP. Mixed/graded MQ4+MQ6, MQ6V2, gfx1151 and dense are outside the refusal. `speculation.dflash=on` still refuses without a DFlash draft and never aliases to MTP. No root WMMA fix is claimed |
+| Qwen3.5-class (arch 5/6) model with `speculation.mtp=auto` runs AR, resident or offloaded (bench `spec_route` null, serve `timings.tau`/`mtp` null, no `MTP head loaded` line) | Native MTP `auto` arms only a producer that declares a measured AR floor, and Qwen35 declares none, so the load logs `MTP: off by default (no measured AR floor); opt in with --spec mtp` and no head is loaded. Where a floor-declaring producer (Qwen4) does attach under `auto`, a host-mapped routed-expert spill still declines it on any arch but its admitted ones (gfx1100, gfx1201) (the `pcie`/`cpu` decline line logs the count, seam and `opt in with --spec mtp`). Unset/null layer/expert budgets keep all weights resident; only explicit `auto`/`-1` or manual `N` requests placement changes | Use `--spec mtp` / `speculation.mtp=on`, subject to metadata-based refusal of uniform MQ6G256 V1 (qt15) Qwen35 MoE on gfx1200/gfx1201 with FP16 WMMA enabled whenever a head would attach. `--spec off` / `speculation.mtp=off`, `auto` and an auto-declined spill remain AR; `HIPFIRE_FP16=0` permits explicit MTP. Mixed/graded MQ4+MQ6, MQ6V2, gfx1151 and dense are outside the refusal. `speculation.dflash=on` still refuses without a DFlash draft and never aliases to MTP. No root WMMA fix is claimed |
 
 
 ---
@@ -1284,23 +1357,27 @@ reach for.
 
 ## 8 · Open questions agents can investigate
 
-If you want to actively contribute findings, these are open:
+Open performance questions are tracked against the 0.4.5 Flash-Next EP2 record
+([`lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md) and the cp20
+checkpoint); read both before proposing a lever. Still open there:
 
-1. **Phase 3 prompt-shape rules** — what other rare BPE tokens depress
-   τ? Run `encode_prompt --heat` on a wide variety of prompts and look
-   for patterns.
-2. **Path C training — DEAD**: target-aligned custom DFlash draft (`feat/mtp-dflash-training`) was a failed month-1 experiment and is out of scope. Do not pursue; no recipe is forthcoming. (Historical note: prior revisions listed this as an open investigation.)
-3. **Path D engineering**: stale-context overlap pipelining — the only
-   structural lever still on the table for 27B-3.5 code beyond +8.2%.
-4. **DDTree gfx1100 fix**: linearization-slot RoPE phase delta skew
-   (commit 39aa358). Per-genre data: `feedback_dflash_per_genre`
-   memory. If you have an idea for the structural fix, the project
-   memory has the relevant context.
+1. **EP2 TTFT** — the dominant gap at every cell (0.065-0.263 s median stream
+   TTFT on 2x R9700 vs about half that for another open engine on the same host).
+2. **Story / low-τ decode** — story cells run at τ about 2.2; per-stream decode
+   is below that engine's at C1-C8.
+3. **DDTree gfx1100 fix**: linearization-slot RoPE phase delta skew
+   (commit 39aa358).
+
+Closed, do not reopen: Path C (target-aligned custom DFlash draft training) is
+dead.
 
 ---
 
-*Last updated: 2026-09-30 (0.4.0 cycle: DFlash window default, KV docs; fixture pin: Qwen3.8-27B MQ4XTS). When this
-doc gets stale (more than 1-2 releases behind HEAD), update it as part of the release PR.*
+*Last updated: 2026-11-11 (0.4.5 release: EP2 serve fixture pointer and open
+questions refreshed; engineering lessons are authoritative in
+[`docs/methodology/lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md) and win
+over this file). When this doc gets stale (more than 1-2 releases behind HEAD),
+update it as part of the release PR.*
 
 
 # Code intelligence — CodeGraph

@@ -24,7 +24,8 @@ def _classify(new_files):
 
 def test_same_listing_is_all_identical():
     assert _classify(dict(BASE)) == {
-        "identical": ["attn", "gemv", "old"], "changed": [], "removed": [], "added": [],
+        "identical": ["attn", "gemv", "old"], "changed": [], "nondeterministic": [],
+        "removed": [], "added": [],
     }
 
 
@@ -37,6 +38,7 @@ def test_each_class_and_the_differing_parts_are_reported():
     assert _classify(new) == {
         "identical": ["attn"],
         "changed": ["gemv (.hash,.hsaco)"],
+        "nondeterministic": [],
         "removed": ["old"],
         "added": ["fresh"],
     }
@@ -57,3 +59,61 @@ def test_require_identical_flags_only_matching_changed_or_removed_modules():
     assert kid.violations(result, ["attn*"]) == []
     assert kid.violations(result, ["gemv*", "old"]) == ["changed: gemv (.hsaco)", "removed: old"]
     assert kid.violations(result, ["fresh"]) == []
+
+
+INPUTS = kid.INPUTS
+
+
+def _with_inputs(files, inputs):
+    mods = kid.module_digests(files)
+    for module, sha in inputs.items():
+        mods[module][INPUTS] = sha
+    return mods
+
+
+def test_index_inputs_ignore_only_the_object_sha():
+    a = b'{"module": "m", "object_sha256": "aa", "flags": ["-O3"], "source_sha256": "s"}'
+    b = b'{"source_sha256": "s", "flags": ["-O3"], "object_sha256": "bb", "module": "m"}'
+    assert kid.index_inputs(a) == kid.index_inputs(b)
+    assert kid.index_inputs(a) != kid.index_inputs(a.replace(b'-O3', b'-O2'))
+    assert kid.index_inputs(a) != kid.index_inputs(a.replace(b'"s"', b'"t"'))
+
+
+def test_same_inputs_different_object_is_nondeterministic_not_changed():
+    base = _with_inputs(BASE, {"gemv": "i1", "attn": "i2"})
+    new_files = dict(BASE)
+    new_files["gemv.hsaco"] = "zz"
+    new_files["gemv.index.json"] = "zz"  # only its object_sha256 differs
+    result = kid.classify(base, _with_inputs(new_files, {"gemv": "i1", "attn": "i2"}))
+    assert result["nondeterministic"] == ["gemv (.hsaco,.index.json)"]
+    assert result["changed"] == []
+    assert result["identical"] == ["attn", "old"]
+    # Not a failure, even for a module the caller requires identical.
+    assert kid.violations(result, ["gemv*"]) == []
+
+
+def test_changed_inputs_or_hash_or_missing_inputs_stay_changed():
+    new_files = dict(BASE)
+    new_files["gemv.hsaco"] = "zz"
+    new_files["gemv.index.json"] = "zz"
+    base = _with_inputs(BASE, {"gemv": "i1"})
+    # The compile's inputs differ: a real change.
+    assert kid.classify(base, _with_inputs(new_files, {"gemv": "i9"}))["changed"] == [
+        "gemv (.hsaco,.index.json)"
+    ]
+    # The key's `.hash` differs although the inputs agree: not noise.
+    hashed = dict(new_files)
+    hashed["gemv.hash"] = "zz"
+    assert kid.classify(base, _with_inputs(hashed, {"gemv": "i1"}))["changed"] == [
+        "gemv (.hash,.hsaco,.index.json)"
+    ]
+    # An old pack without inputs for the module cannot be called noise.
+    assert kid.classify(base, kid.module_digests(new_files))["changed"] == [
+        "gemv (.hsaco,.index.json)"
+    ]
+    # The index changed without the object: not noise either.
+    index_only = dict(BASE)
+    index_only["gemv.index.json"] = "zz"
+    assert kid.classify(base, _with_inputs(index_only, {"gemv": "i1"}))["changed"] == [
+        "gemv (.index.json)"
+    ]

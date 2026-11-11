@@ -39,7 +39,7 @@ fn end(builder: &mut Builder) {
 fn default_descriptor_and_proof_keep_legacy_output() {
     for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201] {
         for y in [false, true] {
-            let mut builder = probe(arch, y, 8);
+            let mut builder = probe(arch, y, 16);
             end(&mut builder);
             let legacy = emit::assembly(&builder.spec, &builder.regs, builder.program()).unwrap();
             let emitted = builder.finish().unwrap();
@@ -60,13 +60,20 @@ fn default_descriptor_and_proof_keep_legacy_output() {
 fn workgroup_z_accounts_for_architectural_input_footprint() {
     for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201] {
         for y in [false, true] {
-            let mut builder = probe(arch, y, 8);
+            let mut builder = probe(arch, y, 16);
             builder.enable_workgroup_id_z();
             builder.enable_workgroup_id_z(); // Idempotent, with no instruction insertion.
             assert!(builder.program().instructions.is_empty());
             end(&mut builder);
             let emitted = builder.finish().unwrap();
-            let high = if arch.gfx12() { 2 } else { 4 + u16::from(y) };
+            // gfx1100 pads user + system to 16 (LLVM FeatureUserSGPRInit16Bug), so the inputs end at s16.
+            let high = if arch.gfx12() {
+                2
+            } else if arch == Arch::Gfx1100 {
+                16
+            } else {
+                4 + u16::from(y)
+            };
             assert!(emitted
                 .s_text
                 .contains(".amdhsa_system_sgpr_workgroup_id_z 1\n"));
@@ -84,22 +91,26 @@ fn workgroup_z_accounts_for_architectural_input_footprint() {
 #[test]
 fn workgroup_z_only_changes_descriptor_when_inputs_are_already_planned() {
     for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201] {
-        let mut legacy = probe(arch, true, 8);
-        legacy.regs.s::<1>("last_scalar", 7, Live::Whole).unwrap();
+        let mut legacy = probe(arch, true, 16);
+        legacy.regs.s::<1>("last_scalar", 15, Live::Whole).unwrap();
         let mut opted_in = legacy.clone();
         opted_in.enable_workgroup_id_z();
         end(&mut legacy);
         end(&mut opted_in);
         let legacy = legacy.finish().unwrap();
         let opted_in = opted_in.finish().unwrap();
-        assert_eq!(
-            opted_in.s_text,
-            legacy.s_text.replace(
-                ".amdhsa_system_sgpr_workgroup_id_z 0\n",
-                ".amdhsa_system_sgpr_workgroup_id_z 1\n",
-            ),
-            "{arch:?}"
+        let mut expected = legacy.s_text.replace(
+            ".amdhsa_system_sgpr_workgroup_id_z 0\n",
+            ".amdhsa_system_sgpr_workgroup_id_z 1\n",
         );
+        if arch == Arch::Gfx1100 {
+            // The padding that makes user + system 16 shrinks by the one more system SGPR.
+            expected = expected.replace(
+                ".amdhsa_user_sgpr_count 14\n",
+                ".amdhsa_user_sgpr_count 13\n",
+            );
+        }
+        assert_eq!(opted_in.s_text, expected, "{arch:?}");
     }
 }
 

@@ -498,6 +498,11 @@ pub fn batch_chunk_full_attn_input_projection(
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
     let qkv_is_lowbit = matches!(layer.wq.dtype, DType::TQ2G128 | DType::BQ1G128);
+    // GGUF-native weights (`DType::Ggml*`): unfused plain GEMMs, one per
+    // weight at that weight's own type (mixed types per tensor are normal in
+    // a GGUF; `run_plain_gemm_key` dequantises each).
+    let qkv_all_ggml =
+        layer.wq.dtype.is_ggml() && layer.wk.dtype.is_ggml() && layer.wv.dtype.is_ggml();
     // qt=52 re-arm anchor: q/k/v all Lloyd → FP8-LUT launcher.
     let qkv_is_mq4v2_lloyd = all_mq4v2_lloyd(&[layer.wq.dtype, layer.wk.dtype, layer.wv.dtype]);
     // Fused QKV kernels require all three weights to share a
@@ -540,7 +545,9 @@ pub fn batch_chunk_full_attn_input_projection(
             n,
             false,
         )?;
-        if iu4_prep.is_none() {
+        if iu4_prep.is_none()
+            && mq3v25_a4_consumers_agree(gpu, layer.wq.dtype, &[layer.wk.dtype, layer.wv.dtype])
+        {
             // gfx1201 slices-2: fused rmsnorm+quant producer (bit-identical).
             iu4_prep = try_gfx12_rmsnorm_quant_fused_prepared(
                 gpu,
@@ -627,7 +634,31 @@ pub fn batch_chunk_full_attn_input_projection(
             layer.wv.k,
             n,
         )?;
-    } else if let Some(prep) = &iu4_prep {
+    } else if let Some(prep) = iu4_prep
+        .as_ref()
+        .filter(|_| mq3v25_a4_weight(gpu, layer.wq.dtype) && qkv_same_dtype)
+    {
+        // Symmetric qt49 A4 (gfx1201): three SETs over one producer. A
+        // mixed-dtype q/k/v falls through to the readers of the f32 plane
+        // the MQ3 producer always emits.
+        gpu.gemm_qkv_mq3v25_iu4_prepared(
+            &layer.wq.buf,
+            &layer.wk.buf,
+            &layer.wv.buf,
+            prep,
+            &pbs.fa_q_full_batch,
+            &pbs.fa_k_batch,
+            &pbs.fa_v_batch,
+            layer.wq.m,
+            layer.wk.m,
+            layer.wv.m,
+            layer.wq.k,
+            n,
+        )?;
+    } else if let Some(prep) = iu4_prep
+        .as_ref()
+        .filter(|_| !mq3v25_a4_weight(gpu, layer.wq.dtype))
+    {
         gpu.gemm_qkv_mq4g256v2_wmma_iu4_prepared(
             &layer.wq.buf,
             &layer.wk.buf,
@@ -739,7 +770,7 @@ pub fn batch_chunk_full_attn_input_projection(
             layer.wq.k,
             n,
         )?;
-    } else if (qkv_is_q8 || qkv_is_lowbit) && qkv_same_dtype {
+    } else if ((qkv_is_q8 || qkv_is_lowbit) && qkv_same_dtype) || qkv_all_ggml {
         run_plain_gemm_key(
             gpu,
             plain_gemm_key_for(layer.wq.dtype),

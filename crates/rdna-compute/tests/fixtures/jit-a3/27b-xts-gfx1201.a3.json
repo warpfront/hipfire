@@ -129,6 +129,26 @@
      ]
     },
     {
+     "module": "attention_fp8_e4m3_fa2_gqa_partial_lse_gfx1201",
+     "kind": "hip",
+     "sha256": "ee0bd54e3c1f51f3983ce06db6b10efad109f6b76eeed9140fb0bc94e2f07175",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "attention_fp8_e4m3_fa2_gqa_partial_lse_gfx1201",
+      "attention_fp8_e4m3_fa2_gqa_merge_lse_gfx1201",
+      "attention_fp8_e4m3_fa2_q_preconvert_lse_gfx1201"
+     ]
+    },
+    {
      "module": "attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201",
      "kind": "hip",
      "sha256": "0c0df82f6b5b188ae3a3bb95fa43108e1e028675dd24acd6ca1efe3eab336adf",
@@ -1298,14 +1318,18 @@
     {
      "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
      "kind": "embedded",
-     "sha256": "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
+     "sha256": "b351ce70156444a657f31165c704b02faf58c4e81acc3de2d1ff35ffa428eefa",
      "flags": null,
      "scheduler_profile": null,
      "symbols": [
       "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s",
       "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s",
       "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
-      "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s"
+      "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",
+      "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s_v64",
+      "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s_v64",
+      "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s_v64",
+      "gemm_mq4g256v2_residual_mmq_iu4_qkvzaset_b1s_v64"
      ]
     },
     {
@@ -1345,7 +1369,7 @@
      ]
     }
    ],
-   "symbol_count": 117
+   "symbol_count": 124
   },
   "native_mtp": {
    "entries": [
@@ -1527,6 +1551,26 @@
      "scheduler_profile": "default",
      "symbols": [
       "attention_flash_reduce_dsplit_gfx1201_vmm"
+     ]
+    },
+    {
+     "module": "attention_fp8_e4m3_fa2_gqa_partial_lse_gfx1201",
+     "kind": "hip",
+     "sha256": "ee0bd54e3c1f51f3983ce06db6b10efad109f6b76eeed9140fb0bc94e2f07175",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "attention_fp8_e4m3_fa2_gqa_partial_lse_gfx1201",
+      "attention_fp8_e4m3_fa2_gqa_merge_lse_gfx1201",
+      "attention_fp8_e4m3_fa2_q_preconvert_lse_gfx1201"
      ]
     },
     {
@@ -3131,14 +3175,18 @@
     {
      "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
      "kind": "embedded",
-     "sha256": "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
+     "sha256": "b351ce70156444a657f31165c704b02faf58c4e81acc3de2d1ff35ffa428eefa",
      "flags": null,
      "scheduler_profile": null,
      "symbols": [
       "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s",
       "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s",
       "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
-      "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s"
+      "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",
+      "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s_v64",
+      "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s_v64",
+      "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s_v64",
+      "gemm_mq4g256v2_residual_mmq_iu4_qkvzaset_b1s_v64"
      ]
     },
     {
@@ -3188,7 +3236,7 @@
      ]
     }
    ],
-   "symbol_count": 146,
+   "symbol_count": 153,
    "mtp_only_modules": [
     "add_inplace",
     "argmax_token_chain",
@@ -4244,7 +4292,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s",
     "kind": "embedded",
-    "sha256": "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
+    "sha256": "b351ce70156444a657f31165c704b02faf58c4e81acc3de2d1ff35ffa428eefa",
     "flags": null,
     "scheduler_profile": null
    },
@@ -4252,7 +4300,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s",
     "kind": "embedded",
-    "sha256": "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
+    "sha256": "b351ce70156444a657f31165c704b02faf58c4e81acc3de2d1ff35ffa428eefa",
     "flags": null,
     "scheduler_profile": null
    },
@@ -4260,7 +4308,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
     "kind": "embedded",
-    "sha256": "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
+    "sha256": "b351ce70156444a657f31165c704b02faf58c4e81acc3de2d1ff35ffa428eefa",
     "flags": null,
     "scheduler_profile": null
    },
@@ -4268,7 +4316,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",
     "kind": "embedded",
-    "sha256": "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
+    "sha256": "b351ce70156444a657f31165c704b02faf58c4e81acc3de2d1ff35ffa428eefa",
     "flags": null,
     "scheduler_profile": null
    }
@@ -5470,7 +5518,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s",
     "kind": "embedded",
-    "sha256": "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
+    "sha256": "b351ce70156444a657f31165c704b02faf58c4e81acc3de2d1ff35ffa428eefa",
     "flags": null,
     "scheduler_profile": null
    },
@@ -5478,7 +5526,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s",
     "kind": "embedded",
-    "sha256": "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
+    "sha256": "b351ce70156444a657f31165c704b02faf58c4e81acc3de2d1ff35ffa428eefa",
     "flags": null,
     "scheduler_profile": null
    },
@@ -5486,7 +5534,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
     "kind": "embedded",
-    "sha256": "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
+    "sha256": "b351ce70156444a657f31165c704b02faf58c4e81acc3de2d1ff35ffa428eefa",
     "flags": null,
     "scheduler_profile": null
    },
@@ -5494,7 +5542,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",
     "kind": "embedded",
-    "sha256": "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
+    "sha256": "b351ce70156444a657f31165c704b02faf58c4e81acc3de2d1ff35ffa428eefa",
     "flags": null,
     "scheduler_profile": null
    }

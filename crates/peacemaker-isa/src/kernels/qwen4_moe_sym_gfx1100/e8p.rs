@@ -63,7 +63,7 @@
 //! `d` at the next multiple of four (`s = d + 1`), A operands `a_out(t, i) = AOUT + 16 t + 2 i` (all eight
 //! K16 steps live, no WAR reuse inside an epoch), unpack pool of five registers per word at `POOL`
 //! (4 words GateUp, 2 Down). GateUp 184 VGPRs, Down 152. SGPR: eight literal staging registers at
-//! `LITS = 88`.
+//! `LITS = 88` (gfx1100: the dead padded-user SGPRs `s8..s13` and `s84,s85`, because the kernarg block takes `s88:95`; see `Gen::lit`).
 use super::*;
 use peacemaker_author::{ready, Free, LdsRegion, Published, Wave};
 use peacemaker_isa::kernels::qwen4_moe_sym::e8p as twin;
@@ -156,9 +156,20 @@ const STG_MASK: [u8; 2] = [5, 9];
 const STG_CHUNK: [u8; 4] = [1, 3, 4, 13];
 /// Eight literal staging SGPRs.
 pub(super) const LITS: u8 = 88;
+/// gfx1100 literal staging SGPRs: `FeatureUserSGPRInit16Bug` pads the user SGPRs, so `s8..s13` are dead (the kernarg
+/// block is at `s88:95`, see `Gen::args0`); two more from the unused `s83..s87` (an aligned pair). Eight in all, all below `s102`.
+const LITS_PADDED: [u8; 8] = [8, 9, 10, 11, 12, 13, 84, 85];
 const UNP_LEN: u8 = 5;
 
 impl Gen {
+    /// Literal staging SGPR `q` (0..8).
+    pub(super) fn lit(&self, q: u8) -> u8 {
+        if self.args0() == ARGS0 {
+            LITS + q
+        } else {
+            LITS_PADDED[usize::from(q)]
+        }
+    }
     /// Weight dword `i` (words `2i`, `2i+1`) of tensor `t` of the epoch.
     pub(super) fn raw(&self, t: u8, i: u8) -> u8 {
         self.a(t) + i
@@ -214,11 +225,14 @@ pub(super) fn plan_operands(
             p.v::<1>("unpack_tmp", g.unp(n, k), kernel())?;
         }
     }
-    p.s::<8>(
-        "table_literals",
-        LITS,
-        Live::Between("entry".into(), g.label("k_begin")),
-    )?;
+    let live = || Live::Between("entry".into(), g.label("k_begin"));
+    if g.args0() == ARGS0 {
+        p.s::<8>("table_literals", LITS, live())?;
+    } else {
+        p.s::<4>("table_literals", LITS_PADDED[0], live())?;
+        p.s::<2>("table_literals", LITS_PADDED[4], live())?;
+        p.s::<2>("table_literals", LITS_PADDED[6], live())?;
+    }
     Ok(())
 }
 
@@ -387,7 +401,7 @@ pub(super) fn stage<T: Gfx11>(
                 let b = w.isa();
                 for batch in 0..4u32 {
                     for q in 0..8u32 {
-                        let r = LITS + q as u8;
+                        let r = g.lit(q as u8);
                         sop(
                             b,
                             format!(
@@ -399,7 +413,7 @@ pub(super) fn stage<T: Gfx11>(
                         )?;
                     }
                     for q in 0..8u32 {
-                        let r = LITS + q as u8;
+                        let r = g.lit(q as u8);
                         op(
                             b,
                             format!("v_writelane_b32 v{vc}, s{r}, {}", 8 * batch + q),

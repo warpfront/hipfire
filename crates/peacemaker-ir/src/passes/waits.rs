@@ -102,7 +102,7 @@ fn mem_name(class: MemClass) -> &'static str {
     }
 }
 
-fn is_load(class: MemClass) -> bool {
+pub(crate) fn is_load(class: MemClass) -> bool {
     matches!(
         class,
         MemClass::VmemLoad
@@ -135,7 +135,7 @@ fn is_tracked(class: MemClass) -> bool {
 /// Load-counter in-order class from the encoding form: gfx12 BUFFER and
 /// GLOBAL loads share LOADcnt's `VMEM_ACCESS` event; flat, scratch and image
 /// stay separate (the `ledger.rs` order-class rule).
-fn family_of(inst: &Inst) -> &'static str {
+pub(crate) fn family_of(inst: &Inst) -> &'static str {
     match inst.form {
         crate::inst::Form::Vmem(crate::inst::VmemForm::Buffer | crate::inst::VmemForm::Global) => {
             "vmem_read"
@@ -200,7 +200,7 @@ fn explicit_regs(inst: &Inst, arch: Arch, wave: Wave) -> Vec<RegRef> {
 /// Physical bits touched by an explicit operand. A narrow DS store reads
 /// only its data half, never a narrow address. D16 loads independently
 /// write their selected half; the preserved half is not a hardware read.
-fn operand_mask(inst: &Inst, arch: Arch, index: usize) -> u32 {
+pub(crate) fn operand_mask(inst: &Inst, arch: Arch, index: usize) -> u32 {
     use crate::operand::Half;
     match inst.operands.get(index) {
         Some(Operand::Half(_, Half::Lo)) => return 0xffff,
@@ -252,14 +252,14 @@ fn raw_overlap(body: &Body, event: &PendingEvent, consumer: &Inst, arch: Arch, w
 }
 
 /// Raw SOPP simm16 bits of an `s_wait_alu`, if present.
-fn wait_alu_bits(inst: &Inst) -> Option<u16> {
+pub(crate) fn wait_alu_bits(inst: &Inst) -> Option<u16> {
     inst.operands.iter().find_map(|operand| match operand {
         Operand::Imm(ImmField::Sopp(n) | ImmField::Sopk(n)) => Some(*n as u16),
         _ => None,
     })
 }
 
-fn is_wait_alu(inst: &Inst, arch: Arch) -> bool {
+pub(crate) fn is_wait_alu(inst: &Inst, arch: Arch) -> bool {
     opcode_name(inst, arch) == Some("s_wait_alu")
 }
 
@@ -280,7 +280,7 @@ fn counter_at(index: usize) -> Counter {
 
 /// Unit weight per counter from the table row (`Km:2` → 2 on Km), for the
 /// instruction's return form (`@rtn` / `@nortn` rules).
-fn unit_weights(inst: &Inst, arch: Arch) -> [u8; N] {
+pub(crate) fn unit_weights(inst: &Inst, arch: Arch) -> [u8; N] {
     let mut units = [0u8; N];
     let Some(row) = crate::isa::lookup(arch, inst.op, inst.form) else {
         return units;
@@ -383,7 +383,12 @@ fn retire(state: &mut WaitState, body: &Body, counter: Counter, count: u8) -> Ve
                     && !event.satisfied.contains(counter)
                     && !matches!(
                         event.class,
-                        MemClass::DsLoad | MemClass::DsStore | MemClass::DsAtomic { .. }
+                        MemClass::DsLoad
+                            | MemClass::DsStore
+                            | MemClass::DsAtomic { .. }
+                            | MemClass::FlatLoad
+                            | MemClass::FlatStore
+                            | MemClass::FlatAtomic { .. }
                     )
             })
         {
@@ -701,7 +706,10 @@ fn walk_block(
 
 /// CFG-aware wait replay with fixpoint over the block graph.
 pub fn replay(body: &Body, arch: Arch, wave: Wave) -> Result<WaitReplay, WaitError> {
-    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
+    if !matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+    ) {
         return Err(WaitError::UnsupportedArch(arch));
     }
     for id in &body.layout {
@@ -896,7 +904,10 @@ fn fixpoint(
 
 /// Count wait instructions by opcode for T6.
 pub fn census(body: &Body, arch: Arch) -> Result<WaitCensus, WaitError> {
-    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
+    if !matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+    ) {
         return Err(WaitError::UnsupportedArch(arch));
     }
     let mut out = WaitCensus::default();
@@ -1124,6 +1135,85 @@ mod c5_tests {
         }
     }
 
+    /// RDNA3 ISA ch. 11 "Ordering": a flat access increments LGKMcnt as well as VM/VScnt, and its LGKM path is in order
+    /// with DS. So `flat_load; ds_load A; ds_load B; s_waitcnt lgkmcnt(1)` has retired A (a read of A's data is legal),
+    /// but not the flat load's data, which also needs its vmcnt (a read of it is an obligation).
+    #[test]
+    fn gfx11_flat_lgkm_is_in_order_with_ds() {
+        for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+            let dec = |words: &[u32]| crate::codec::gfx11::decode(arch, words).unwrap().0;
+            let rules = |consumer: &[u32]| {
+                replay(
+                    &body_of(vec![
+                        dec(&[0xdc50_0000, 0x017c_0006]), // flat_load_b32 v1, v[6:7]
+                        dec(&[0xd8d8_0000, 0x0200_0009]), // ds_load_b32 v2, v9
+                        dec(&[0xd8d8_0000, 0x0300_0009]), // ds_load_b32 v3, v9
+                        dec(&[0xbf89_fc17]),              // s_waitcnt lgkmcnt(1)
+                        dec(consumer),
+                    ]),
+                    arch,
+                    crate::inst::Wave::Wave64,
+                )
+                .unwrap()
+                .obligations
+                .into_iter()
+                .map(|o| o.rule_id)
+                .collect::<Vec<_>>()
+            };
+            let reads_ds_a = rules(&[0x0628_2b02]); // v_add_f32_e32 v20, v2, v21
+            assert!(
+                reads_ds_a.is_empty(),
+                "{arch:?}: ds_load A retired in order behind the flat load: {reads_ds_a:?}"
+            );
+            assert!(
+                !rules(&[0x0628_2b01]).is_empty(),
+                "{arch:?}: the flat load's data still waits on vmcnt"
+            );
+        }
+    }
+
+    /// RDNA3 ISA ch. 11 "Ordering": flat instructions decrement VMcnt in order for the threads that went to global
+    /// memory, and those are in order with scratch/global/texture/buffer. `flat_load; global_load;
+    /// s_waitcnt vmcnt(1) lgkmcnt(0)` has retired the flat load (what LLVM relies on in the MoE gemv kernels); the
+    /// younger global load is still outstanding, and an lgkmcnt-only wait does not retire the flat load.
+    #[test]
+    fn gfx11_flat_and_global_loads_share_one_in_order_vmcnt_queue() {
+        for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+            let dec = |words: &[u32]| crate::codec::gfx11::decode(arch, words).unwrap().0;
+            let rules = |wait: u32, consumer: u32| {
+                replay(
+                    &body_of(vec![
+                        dec(&[0xdc50_0000, 0x017c_0006]), // flat_load_b32 v1, v[6:7]
+                        dec(&[0xdc52_0000, 0x027c_0008]), // global_load_b32 v2, v[8:9], off
+                        dec(&[wait]),
+                        dec(&[consumer]),
+                    ]),
+                    arch,
+                    crate::inst::Wave::Wave64,
+                )
+                .unwrap()
+                .obligations
+                .into_iter()
+                .map(|o| o.rule_id)
+                .collect::<Vec<_>>()
+            };
+            let (vm1_lgkm0, lgkm0) = (0xbf89_0407, 0xbf89_fc07); // s_waitcnt vmcnt(1) lgkmcnt(0); s_waitcnt lgkmcnt(0)
+            let (reads_flat, reads_global) = (0x0628_2b01, 0x0628_2b02); // v_add_f32 v20, v1|v2, v21
+            let ok = rules(vm1_lgkm0, reads_flat);
+            assert!(
+                ok.is_empty(),
+                "{arch:?}: the older flat load retired behind vmcnt(1): {ok:?}"
+            );
+            assert!(
+                !rules(vm1_lgkm0, reads_global).is_empty(),
+                "{arch:?}: the younger global load is outstanding"
+            );
+            assert!(
+                !rules(lgkm0, reads_flat).is_empty(),
+                "{arch:?}: lgkmcnt alone does not retire a flat load's vm side"
+            );
+        }
+    }
     /// gfx11 GLOBAL atomics: the returning (GLC) form's destination is
     /// pending on vmcnt; the non-returning form locks its sources on vscnt,
     /// which `vmcnt(0)` does not retire.
@@ -1368,7 +1458,7 @@ mod c5_tests {
         use crate::inst::Wave;
         for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201] {
             let decode = |words: &[u32]| crate::codec::gfx12::decode_for(arch, words).unwrap().0;
-            let (low, high, wait) = if arch == Arch::Gfx1201 {
+            let (low, high, wait) = if arch.is_gfx12() {
                 (
                     decode(&[0xee07807c, 10, 2]),
                     decode(&[0xee08407c, 10, 4]),

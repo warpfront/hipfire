@@ -3,7 +3,7 @@
   "arch": "gfx1100",
   "builder_crate_version": "0.4.1",
   "builder_git_sha": "unknown",
-  "s_text_sha256": "dfe45db9477039cf0125423e8e6185dc261ceaf92c707e78661962ec1ad0179e",
+  "s_text_sha256": "f92d0d9b65974f4d7dfcc1eee3016c90a4d5a59c522cc849f0ffd50c81efdb54",
   "kernels": [
     {
       "kernel_id": "mq_i4_moe_gemv",
@@ -22,21 +22,21 @@
         {
           "name": "workgroup_id_x",
           "kind": "s",
-          "base": 2,
+          "base": 14,
           "len": 1,
           "live": "Whole"
         },
         {
           "name": "workgroup_id_y",
           "kind": "s",
-          "base": 3,
+          "base": 15,
           "len": 1,
           "live": "Whole"
         },
         {
           "name": "kernel_arguments_ptrs",
           "kind": "s",
-          "base": 8,
+          "base": 80,
           "len": 8,
           "live": "Whole"
         },
@@ -532,7 +532,7 @@
         }
       ],
       "next_free_vgpr": 144,
-      "next_free_sgpr": 80,
+      "next_free_sgpr": 88,
       "waits": [
         {
           "pc_index": 7,
@@ -4646,7 +4646,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "41763f4f1b643fd84bf3553f90f5d04bac459a07e196b5a28e0dae0483749fd7"
+      "s_text_sha256": "6bf8cfa90056a3a80fa9a5172440c52563dbfdffd6771413213aaf18699d0770"
     },
     {
       "kernel_id": "mq_i4_moe_gemv",
@@ -4665,21 +4665,21 @@
         {
           "name": "workgroup_id_x",
           "kind": "s",
-          "base": 2,
+          "base": 14,
           "len": 1,
           "live": "Whole"
         },
         {
           "name": "workgroup_id_y",
           "kind": "s",
-          "base": 3,
+          "base": 15,
           "len": 1,
           "live": "Whole"
         },
         {
           "name": "kernel_arguments_ptrs",
           "kind": "s",
-          "base": 8,
+          "base": 80,
           "len": 8,
           "live": "Whole"
         },
@@ -5119,7 +5119,7 @@
         }
       ],
       "next_free_vgpr": 80,
-      "next_free_sgpr": 80,
+      "next_free_sgpr": 88,
       "waits": [
         {
           "pc_index": 7,
@@ -6391,7 +6391,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "9fd51ec10673d60455a56cf93d39ed83cfa58abf0a529586b8f39de430887886"
+      "s_text_sha256": "90b434eeb75135f587ea435501c9a2f579b7ab0229d2faab0dd5db30d1c76070"
     },
     {
       "kernel_id": "mq_i4_moe_gemv",
@@ -6410,21 +6410,21 @@
         {
           "name": "workgroup_id_x",
           "kind": "s",
-          "base": 2,
+          "base": 13,
           "len": 1,
           "live": "Whole"
         },
         {
           "name": "workgroup_id_y",
           "kind": "s",
-          "base": 3,
+          "base": 14,
           "len": 1,
           "live": "Whole"
         },
         {
           "name": "kernel_arguments_ptrs",
           "kind": "s",
-          "base": 8,
+          "base": 80,
           "len": 8,
           "live": "Whole"
         },
@@ -6704,7 +6704,7 @@
         {
           "name": "workgroup_id_z",
           "kind": "s",
-          "base": 4,
+          "base": 15,
           "len": 1,
           "live": "Whole"
         },
@@ -6927,7 +6927,7 @@
         }
       ],
       "next_free_vgpr": 144,
-      "next_free_sgpr": 80,
+      "next_free_sgpr": 88,
       "system_sgpr_workgroup_id_z": true,
       "waits": [
         {
@@ -11062,7 +11062,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "16c1ec58d195ccf23434da49f81348f34667c0bbfc069d31317610585611a639"
+      "s_text_sha256": "23721bb2a6105e5adb3f6e3b20acc48b837884fabb0652332bd1eea2554629fd"
     },
     {
       "kernel_id": "mq_i4_moe_gemv",
@@ -11081,21 +11081,21 @@
         {
           "name": "workgroup_id_x",
           "kind": "s",
-          "base": 2,
+          "base": 13,
           "len": 1,
           "live": "Whole"
         },
         {
           "name": "workgroup_id_y",
           "kind": "s",
-          "base": 3,
+          "base": 14,
           "len": 1,
           "live": "Whole"
         },
         {
           "name": "kernel_arguments_ptrs",
           "kind": "s",
-          "base": 8,
+          "base": 80,
           "len": 8,
           "live": "Whole"
         },
@@ -11375,7 +11375,7 @@
         {
           "name": "workgroup_id_z",
           "kind": "s",
-          "base": 4,
+          "base": 15,
           "len": 1,
           "live": "Whole"
         },
@@ -11542,7 +11542,7 @@
         }
       ],
       "next_free_vgpr": 80,
-      "next_free_sgpr": 80,
+      "next_free_sgpr": 88,
       "system_sgpr_workgroup_id_z": true,
       "waits": [
         {
@@ -12830,7 +12830,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "397a15e68d83c6bf53f633c12048f2a274b9c35e706d617bcdafcaf4f4119ced"
+      "s_text_sha256": "f1a28fd6b4b6f7345bcac8528c10436750f00d6cf7c55e3210b7347c3cefe5c0"
     }
   ]
 }

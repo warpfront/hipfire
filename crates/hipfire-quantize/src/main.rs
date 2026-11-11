@@ -19,6 +19,7 @@ mod diagnostics;
 mod e8;
 mod e8_gptq;
 mod gguf_input;
+mod hc8;
 mod hfq;
 mod maple;
 mod model_filter;
@@ -36,6 +37,7 @@ mod quant_mq;
 mod quant_mq4v2_lloyd;
 mod quant_q4;
 mod qwen4;
+mod raon;
 mod reap_overlay;
 mod trunk_overlay;
 
@@ -47,6 +49,7 @@ fn main() {
         Some("ple-hot-rank") => std::process::exit(ple_hot_rank::run(argv.collect())),
         Some("ple-hot-pack") => std::process::exit(ple_hot_pack::run(argv.collect())),
         Some("trunk-overlay") => std::process::exit(trunk_overlay::run(argv.collect())),
+        Some("hc8") => std::process::exit(hc8::run(argv.collect())),
         _ => {}
     }
     pipeline::run();

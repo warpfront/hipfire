@@ -11,7 +11,7 @@
 //! `hipfire_runtime::trunk_overlay`; this is only the command-line wrapper.
 
 use clap::Parser;
-use hipfire_runtime::trunk_overlay::write_trunk_overlay;
+use hipfire_runtime::trunk_overlay::{write_trunk_overlay, TrunkOverlayFormat};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -32,9 +32,14 @@ pub(crate) struct TrunkOverlayArgs {
     #[arg(long, value_name = "BASE.hfq")]
     pub base: PathBuf,
 
-    /// Directory of `<tensor name>.bin` QT44 payloads.
+    /// Directory of `<tensor name>.bin` payloads of `--format` (QT44 by
+    /// default; for `qt3` the engine's Q8_0 rows, 34 bytes per 32 weights).
     #[arg(long, value_name = "DIR")]
     pub qt44_payload_dir: PathBuf,
+
+    /// Payload format of every tensor: `qt44` (default) or `qt3` (Q8F16).
+    #[arg(long, value_name = "FORMAT", default_value = "qt44", value_parser = parse_format)]
+    pub format: TrunkOverlayFormat,
 
     /// Tensor name suffix to replace (repeatable, at least one).
     #[arg(long, value_name = "SUFFIX", required = true)]
@@ -67,12 +72,21 @@ pub(crate) fn run(argv: Vec<String>) -> i32 {
     }
 }
 
+fn parse_format(text: &str) -> Result<TrunkOverlayFormat, String> {
+    match text {
+        "qt44" => Ok(TrunkOverlayFormat::Qt44),
+        "qt3" => Ok(TrunkOverlayFormat::Qt3),
+        other => Err(format!("{other:?} is not qt44 or qt3")),
+    }
+}
+
 fn run_inner(args: &TrunkOverlayArgs) -> Result<String, String> {
     let report = write_trunk_overlay(
         &args.base,
         &args.qt44_payload_dir,
         &args.suffix,
         &args.trunk_iu4_default,
+        args.format,
         &args.output,
     )?;
     serde_json::to_string_pretty(&report).map_err(|e| format!("serialize report: {e}"))
@@ -102,6 +116,32 @@ mod tests {
         .unwrap();
         assert_eq!(args.suffix, [".in_proj_z.weight", ".in_proj_a.weight"]);
         assert_eq!(args.trunk_iu4_default, "gfx1151-zab-v1");
+        assert_eq!(args.format, TrunkOverlayFormat::Qt44);
+    }
+
+    #[test]
+    fn parses_the_qt3_format_and_refuses_unknown() {
+        let base = [
+            "trunk-overlay",
+            "--base",
+            "m",
+            "--qt44-payload-dir",
+            "d",
+            "--suffix",
+            ".q_proj.weight",
+            "--trunk-iu4-default",
+            "gfx1151-zab-v1",
+            "--output",
+            "o",
+        ];
+        let args =
+            TrunkOverlayArgs::try_parse_from(base.iter().copied().chain(["--format", "qt3"]))
+                .unwrap();
+        assert_eq!(args.format, TrunkOverlayFormat::Qt3);
+        assert!(
+            TrunkOverlayArgs::try_parse_from(base.iter().copied().chain(["--format", "q8"]))
+                .is_err()
+        );
     }
 
     #[test]

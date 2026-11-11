@@ -28,7 +28,7 @@ wg.wait_arrived(b1)?;                                  // B1, second half
 
 The natives return `Instruction`s for everything that touches LDS and emit straight into `wg.isa()` for everything else. A native owns no ring, so there is nothing to lend: the driver sees every store, load, wait and barrier and checks it as it does any script.
 
-Between the WMMAs the block runs queued work units (`enum Work { Insn, StoreW, StoreA, FetchA, Meta }`). `phase(wg, g, st, slot, first, start, per)` issues four K16 steps and, after each WMMA from index `start` on, runs `per` units. The order of the `st.work.push(..)` lines, `start` and `per` are the placement.
+Between the WMMAs the block runs queued work units (`enum Work { Insn, StoreW, StoreA, FetchA, FetchMeta, Meta }`). `phase(wg, g, st, slot, first, start, per, io_at, io_n, hold_at, hold, ..)` issues four K16 steps and, after each WMMA from index `start` on, runs `per` units; `io_n` more units run after WMMA `io_at`, and the `hold` units are appended and drained after WMMA `hold_at` (`99` = never; the trailing fold arguments are likewise off). The order of the `st.work.push(..)` lines, `start`, `per`, `io_at` / `io_n` and `hold_at` are the placement.
 
 ## Move a wait
 
@@ -48,12 +48,12 @@ The ring waits are the same kind of statement. `wg.wait_all((st.a, st.w))` befor
 
 ## Move the split-barrier signal
 
-B1 is split: `wg.signal` after the stores drain, the next block's raw slab-0 fetch (VMEM) overlaps the rendezvous, `wg.wait_arrived` completes it. Production issues the next block's token word and row header (`mq6::fetch_meta`) *before* the signal. To make that fetch overlap the rendezvous too, move the block after the signal:
+B1 is split: `wg.signal` after the stores drain, the next block's raw slab-0 fetch (VMEM) overlaps the rendezvous, `wg.wait_arrived` completes it. Production issues the next block's token word and row header (`mq6::fetch_meta`) as the queued unit `Work::FetchMeta`, right behind the half-1 refetch after WMMA 7, so it is long landed by the signal. To make that fetch overlap the rendezvous instead, drop the `st.work.push(Work::FetchMeta(..))` and issue it after the signal:
 
 ```text
     let (da, dw) = wg.wait_all((st.a, st.w))?;
     let b1 = wg.signal((rotate(st.a, da), rotate(st.w, dw)))?;
-    if fetch_next {                                    // was above the wait_all
+    if fetch_next {                                    // was the queued `Work::FetchMeta`
         mq6::fetch_meta(wg, g, h, if h == 0 { 4 } else { group })?;
     }
     if fetch_next {
@@ -71,16 +71,16 @@ What the driver refuses, wherever you put the signal: a read of a ring the barri
 
 ## Decode placement relative to the MMAs
 
-The weight decode (`mq6::decode_insns(g, r)`, 31 VALU instructions per round) is spread between the WMMAs so the tensor and vector pipes overlap. In `phase(wg, g, &mut st, 0, true, 8, 3)` the first K16 step's bundle is the seeded one: the seed octet *is* the decode scratch, so decode may only start after the last seeded WMMA (index 8). From there three work units run after every WMMA. Change it:
+The weight decode (`mq6::decode_insns(g, r)`, 31 VALU instructions per round) is spread between the WMMAs so the tensor and vector pipes overlap. In `phase(wg, g, &mut st, 0, true, 8, 3, ..)` the first K16 step's bundle is the seeded one: the seed octet *is* the decode scratch, so decode may only start after the last seeded WMMA (index 8). From there three work units run after every WMMA. Change it:
 
 ```text
-    phase(wg, g, &mut st, 0, true, 12, 3)?;   // decode starts after the 12th WMMA
-    phase(wg, g, &mut st, 1, false, 6, 2)?;   // two units per WMMA in phase B
+    phase(wg, g, &mut st, 0, true, 12, 3, ..)?;   // decode starts after the 12th WMMA
+    phase(wg, g, &mut st, 1, false, 6, 2, ..)?;   // two units per WMMA in phase B
 ```
 
-Both build, keep every instruction and leave the output bit-identical (interpreter). A start below 8 is the experiment the seed forbids: the decode overwrites the `0x4B400000` octet the first WMMAs still read. `phase(.., 0, true, 4, 3)` builds, because the builder has no model of that arithmetic, and computes another result. The interpreter is what catches it (`decoding_before_the_seed_is_consumed_builds_but_changes_the_output`), so run a variation there before the card.
+Both build, keep every instruction and leave the output bit-identical (interpreter). A start below 8 is the experiment the seed forbids: the decode overwrites the `0x4B400000` octet the first WMMAs still read. `phase(.., 0, true, 4, 3, ..)` builds, because the builder has no model of that arithmetic, and computes another result. The interpreter is what catches it (`decoding_before_the_seed_is_consumed_builds_but_changes_the_output`), so run a variation there before the card.
 
-The queue order is a placement knob as well: `Work::StoreW(0)` after the first decode round is the earliest the decoded operand can be stored; `Work::FetchA(.., sb = 1, ..)` sits between the stores so the raw staging registers refill as soon as their stores have drained.
+The queue order is a placement knob as well: `Work::StoreW(0)` after the first decode round is the earliest the decoded operand can be stored; `Work::FetchA(.., sb = 1, ..)` is queued right after the first `StoreA` so the raw staging registers refill as soon as their stores have drained, and `StoreA(1)`, the last consumer of that refetch, is held to after WMMA 24 (`hold_at`) so the refetch has the whole span to land.
 
 ## VOPD fold pairing
 
@@ -115,6 +115,12 @@ pm_loop --kernel mq6_i8_gemm --shape fn:m10240k2560-n4096 --epi set --rip my_mq6
 
 - **One implementation.** `mq6_i8_gemm::emit`, its K-loop and its prologue are written over `mq6_i8_gemm::blocks`, the functions the natives call. The twin re-expresses the composition; the byte-identity test and the pinned digests keep the three equal.
 - **The seal stays.** No native owns a ring, and no `Auth` and no `Lend` reach the script. Every ring transition, wait and barrier is a driver call (`begin_write`, `ds_store`, `ds_load_cur`, `wait_all`, `signal`, `wait_arrived`, `loop_carried`), checked as in any script.
-- **What stays Rust.** Tile geometry (rows x tokens x waves: 128x128x8, 256x128x16, 128x256x16), the LDS layout, the register map and the ring depth (two buffers). They are spec axes of the generator: a change needs a rebuild. The script reads the tile only through `g.w_rounds()` (a tile with one weight round queues one decode / store).
+- **What stays Rust.** Tile geometry (rows x tokens x waves: 128x128x8, 256x128x16, 128x256x16), the LDS layout, the register map and the DS/SZ ring depth (two buffers). They are spec axes of the generator: a change needs a rebuild. The A/W ring depth is the script's own `const RING` (2 or 3, see below). The script reads the tile only through `g.w_rounds()` (a tile with one weight round queues one decode / store).
 - **gfx1201 only.** `Mq6Gen::new` refuses another target with the Rust message `mq6_i8_gemm targets gfx1201 only`.
 - **`set_nr` is generator-only.** The Flash-Next QSA q / k epilogue (`Epi::SetNr`, `256x128` tile, entry `gemm_mq6g256v2_mmq_i8_pm_set_nr_gfx1201_t256x128`) re-lays the K loop's LDS out as one region (`nr_epilogue.rs`: staged token rows, inverse RMS, RoPE partner exchange) with typed barriers, then runs the unchanged F32 store loop. Its K loop is the `256x128` `set` loop (the same blocks, byte for byte: `set_nr_keeps_the_hot_loop_and_adds_the_documented_epilogue`); the twin has no `set_nr` variant, so `pm_loop` and `--rip` time the plain epilogues and `crates/rdna-compute/tests/qsa_norm_epi_oracle.rs` checks and times `set_nr`.
+
+## Ring depth 3 (`const RING = 3`)
+
+`const RING: u32 = 2;` at the top of `mq6_i8_gemm.rip` is the A / W payload ring depth. With `3` the script composes the generator's depth-3 K-loop (`Tune { ring: Three }`, `kernels/mq6_i8_gemm/kloop3.rs`) from the same natives, byte for byte (`the_ring3_twin_matches_the_generators_depth_3`): slabs are published two ahead through `Ring::new(a0, a1, a2)`, the raw fetch runs two ahead through two prefetch register sets (`g.pf_set(0)` / `g.pf_set(1)`; the half-1 refetch of a set takes no ledger-wide wait, `fetch_a` settles the stores' hazard itself), and the K-loop runs over a three-group period: `mq6::ring3_split` computes `r = (K/256 - 1) % 3` and `q = (K/256 - 1) / 3`, `wg.wg_if_else` picks the arm that stages slabs 0 and 1 with the rings `starting_at((3 - r) % 3)` and runs `r` groups, then `q` trips of three groups (`mq6::group_end`, `mq6::trips_dec`), then the peeled group, whose last block's B1 is the store-free `advance(ring)`. `Mq6Spec { .., ring: 3 }` (optional field, default 2) builds the matching `Mq6Gen`.
+
+Depth 3 needs a third A+W slab of LDS and a second prefetch set of VGPRs, so `Spec::validate` refuses what does not fit, with the numbers: the shipped `128x128x8` tile fits (53248 B of LDS, 202 VGPRs against the 256 that two workgroups per WGP allow), the `256x128x16` and `128x256x16` tiles do not (79872 B against the 65536 B workgroup limit; 8 / 7 more VGPRs over the 192 budget at two workgroups per WGP). The depth-3 object keeps the depth-2 dynamic launch size and declares the third slab as `group_segment_fixed_size`, so fixed + dynamic covers the layout.

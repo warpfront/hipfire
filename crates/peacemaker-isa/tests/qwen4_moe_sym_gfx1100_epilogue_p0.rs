@@ -855,8 +855,9 @@ impl FxMem {
         sim.mem = std::mem::take(&mut self.mem);
         sim.s[0] = KARG_BASE as u32;
         sim.s[1] = (KARG_BASE >> 32) as u32;
-        sim.s[2] = x;
-        sim.s[3] = y;
+        // gfx1100 places the workgroup ids after the DECLARED (padded) user SGPRs: s14/s15.
+        sim.s[epilogue_fixture::WG_X_IN as usize] = x;
+        sim.s[epilogue_fixture::WG_Y_IN as usize] = y;
         for lane in 0..LANES {
             sim.v[0][lane] = num(wave * 32 + lane as u32);
         }

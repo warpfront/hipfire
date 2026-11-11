@@ -231,6 +231,21 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
             reason: "maple not a serve-hardening retry candidate yet",
         },
     };
+    // Raon-1-mini (arch 19): RaonBundle::reset zeroes RDA recurrent state, conv
+    // history and rewinds the MLA latent cursor; no graphs/drafter yet.
+    const RAON1_MINI: ResetCoreCoverage = ResetCoreCoverage {
+        arch: "raon1_mini",
+        recurrent_or_conv: true,
+        s_ef_residual: false, // n/a — FP32 RDA state, no error-feedback residual
+        kv_or_aux_caches: true,
+        graphs: false,
+        drafter: false,
+        adaptive: false,
+        host_position_and_conversation: true,
+        eligibility: RetryResetEligibility::Ineligible {
+            reason: "raon1_mini GPU fault parity pending",
+        },
+    };
     // Qwen3.5 multi-vector embedding encoder (arch 17): one-shot requests,
     // no KV cache / graphs / drafter state; the GDN scratch resets before
     // every encode, so there is no cross-request state to recover.
@@ -302,6 +317,7 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
         GEMMA4,
         MUSE_GLIMMER,
         MAPLE,
+        RAON1_MINI,
         QWEN35_EMBED,
         EMBEDDING_GEMMA2,
         FLUX,
@@ -601,6 +617,7 @@ mod tests {
                 13 => Some("gemma4"),
                 14 => Some("muse_glimmer"),
                 15 => Some("maple"),
+                19 => Some("raon1_mini"),
                 17 => Some("qwen35-embed"),
                 18 => Some("embeddinggemma2"),
                 40 => Some("flux"),

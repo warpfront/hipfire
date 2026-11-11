@@ -125,14 +125,29 @@ impl Spec {
 }
 
 // ----------------------------------------------------------------------- SGPRs
-// s0:1 kernarg pointer; s2 workgroup id (gfx11, the first system SGPR after
-// the two user SGPRs; gfx12 reads it from ttmp9).
+// s0:1 kernarg pointer; the workgroup ids (gfx11) are the system SGPRs after the declared user
+// SGPRs: s2/s3 on gfx1151, s14/s15 on gfx1100 (`FeatureUserSGPRInit16Bug`: user + system >= 16, so
+// the kernarg pointer is padded to 14 user SGPRs); gfx12 reads them from ttmp9/ttmp7.
 const KARG: u8 = 0;
-const WGIN: u8 = 2;
+const USER_SGPRS: u8 = 2;
+/// Workgroup X and Y (rowtile entry) system SGPRs.
+const SYSTEM_SGPRS: u8 = 2;
+/// First workgroup-id SGPR: the declared user SGPR count of the arch.
+const fn wgin(arch: Arch) -> u8 {
+    arch.declared_user_sgprs(USER_SGPRS, SYSTEM_SGPRS)
+}
+/// First scalar of the `A0..A3` weight-pointer block: s[8:15] on gfx1151; the gfx1100 workgroup ids
+/// occupy s14/s15, so the block moves to s[80:87].
+const fn pa(arch: Arch) -> u8 {
+    if matches!(arch, Arch::Gfx1100) {
+        80
+    } else {
+        8
+    }
+}
 /// Weight buffer resource (base of the selected matrix).
 const SRD: u8 = 4;
-/// Kernargs: s[8:15] A0..A3, s[16:23] x y0 y1 y2, s[24:27] y3 M0 M1, s[28:31] M2 M3 K B.
-const PA: u8 = 8;
+/// Kernargs: s[pa:pa+7] A0..A3 (s[8:15], gfx1100 s[80:87]), s[16:23] x y0 y1 y2, s[24:27] y3 M0 M1, s[28:31] M2 M3 K B.
 const PXY: u8 = 16;
 const Y3M: u8 = 24;
 const M2KB: u8 = 28;
@@ -211,11 +226,11 @@ fn lbl(nb: u8, name: &str, rowtiles: bool) -> String {
 }
 
 fn plan(arch: Arch, rowtiles: bool) -> Result<RegPlan, String> {
-    let mut regs = RegPlan::new(128, 80)?;
+    let mut regs = RegPlan::new(128, if arch == Arch::Gfx1100 { 88 } else { 80 })?;
     let mut s_ranges: Vec<(&str, u8, u8)> = vec![
         ("kernarg", KARG, 2),
         ("weight_resource", SRD, 4),
-        ("weight_pointers", PA, 8),
+        ("weight_pointers", pa(arch), 8),
         ("x_y_pointers", PXY, 8),
         ("y3_m01", Y3M, 4),
         ("m23_k_b", M2KB, 4),
@@ -246,9 +261,9 @@ fn plan(arch: Arch, rowtiles: bool) -> Result<RegPlan, String> {
         ("column_bases1", XCOL + 8, 8),
     ];
     if !arch.gfx12() {
-        s_ranges.push(("workgroup_id", WGIN, 1));
+        s_ranges.push(("workgroup_id", wgin(arch), 1));
         if rowtiles {
-            s_ranges.push(("workgroup_id_y", WGIN + 1, 1));
+            s_ranges.push(("workgroup_id_y", wgin(arch) + 1, 1));
         }
     }
     if rowtiles {
@@ -396,14 +411,16 @@ pub fn emit_module(
 fn prologue(b: &mut Builder, rowtiles: bool) -> R {
     let a = b.spec.arch;
     let end = end_label(rowtiles);
-    smem(b, PA, 8, KARG, 0)?;
+    let pa0 = pa(a);
+    let wg0 = wgin(a);
+    smem(b, pa0, 8, KARG, 0)?;
     smem(b, PXY, 8, KARG, 32)?;
     smem(b, Y3M, 4, KARG, 64)?;
     smem(b, M2KB, 4, KARG, 80)?;
     if a.gfx12() {
         sop(b, format!("s_mov_b32 s{SW}, ttmp9"), &[SW], &[])?;
     } else {
-        sop(b, format!("s_mov_b32 s{SW}, s{WGIN}"), &[SW], &[WGIN])?;
+        sop(b, format!("s_mov_b32 s{SW}, s{wg0}"), &[SW], &[wg0])?;
     }
     if rowtiles {
         rowtile_domain(b)?;
@@ -436,13 +453,13 @@ fn prologue(b: &mut Builder, rowtiles: bool) -> R {
         format!(
             "s_cselect_b64 s[{SRD}:{}], s[{}:{}], s[{}:{}]",
             SRD + 1,
-            PA + 4,
-            PA + 5,
-            PA + 6,
-            PA + 7
+            pa0 + 4,
+            pa0 + 5,
+            pa0 + 6,
+            pa0 + 7
         ),
         &[pair(SRD)],
-        &[pair(PA + 4), pair(PA + 6)],
+        &[pair(pa0 + 4), pair(pa0 + 6)],
     )?;
     op(
         b,
@@ -473,12 +490,12 @@ fn prologue(b: &mut Builder, rowtiles: bool) -> R {
         format!(
             "s_cselect_b64 s[{SRD}:{}], s[{}:{}], s[{SRD}:{}]",
             SRD + 1,
-            PA + 2,
-            PA + 3,
+            pa0 + 2,
+            pa0 + 3,
             SRD + 1
         ),
         &[pair(SRD)],
-        &[pair(PA + 2), pair(SRD)],
+        &[pair(pa0 + 2), pair(SRD)],
     )?;
     op(
         b,
@@ -507,13 +524,13 @@ fn prologue(b: &mut Builder, rowtiles: bool) -> R {
     op(
         b,
         format!(
-            "s_cselect_b64 s[{SRD}:{}], s[{PA}:{}], s[{SRD}:{}]",
+            "s_cselect_b64 s[{SRD}:{}], s[{pa0}:{}], s[{SRD}:{}]",
             SRD + 1,
-            PA + 1,
+            pa0 + 1,
             SRD + 1
         ),
         &[pair(SRD)],
-        &[pair(PA), pair(SRD)],
+        &[pair(pa0), pair(SRD)],
     )?;
     op(
         b,
@@ -756,9 +773,9 @@ fn rowtile_domain(b: &mut Builder) -> R {
     } else {
         sop(
             b,
-            format!("s_mov_b32 s{ROW_BASE}, s{}", WGIN + 1),
+            format!("s_mov_b32 s{ROW_BASE}, s{}", wgin(a) + 1),
             &[ROW_BASE],
-            &[WGIN + 1],
+            &[wgin(a) + 1],
         )?;
     }
     // Reject before shifting, so an excess grid cannot wrap onto a live tile.

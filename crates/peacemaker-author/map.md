@@ -8,15 +8,18 @@
 The typed core of the PM kernel language (design: `pm-kernel-lang-design.md` §4, §9, §12 M0). Kernel source is ordinary Rust run at build time; this crate puts types in front of a lowering `Backend` (`peacemaker-isa`'s `Builder` in production, `trace::Trace` for tests):
 
 - `target`: `Gfx1100`, `Gfx1151`, `Gfx1201` as types with their wait-counter and barrier models; capabilities (`MmaIu4`, `SplitBarrier`) are trait bounds with `#[diagnostic::on_unimplemented]` errors. gfx942 (and its FNUZ fp8 type) is a documented future extension, not modelled.
-- `lds`: `LdsRegion<R, Free | Writing | Published>`, two-buffer `Ring<R, Cur, Next>`, `join`/`split`, and the barrier transitions `ready`, `retire`, `rotate`, `prime`, `retire_cur`.
+- `lds`: `LdsRegion<R, Free | Writing | Published>`, the N-slot `Ring<R, Cur, Next, const D = 2>` (depth 2 to 4; `new_n`, `starting_at`, `depth`), `join`/`split`, and the barrier transitions `ready`, `retire`, `rotate`, `prime`, `retire_cur`, and the store-free `advance`.
+- `lds` also holds the wave-private region: `WaveRegion<R, Free | Writing | Owned>` (typed, `Workgroup::lds_private` / `Wave::private_store`, `private_drain`, `private_publish`, `private_load`, `private_retire`) and, in `runtime`, `Driver::lds_private` returning a `PrivateId` with the same operations and a `PrivatePhase`. Wave `w` owns slice `w` of a `stride x waves` window; its steps are wave-local, emit no barrier and no counter wait (one wave's DS instructions stay in issue order: RDNA3 ISA 12.5, RDNA4 ISA 12.5 / 5.7.1.4) and are legal under wave-uniform control. It is not an `LdsRegion`, so no barrier `Transition`, shared `ds_load`, join, ring or handoff can name it. The backend seam has `lds_slot_private`, `ds_store_private`, `ds_load_private`, `lds_private_publish` and `lds_private_retire`.
 - `wait`: `Pending` / `Drained` tokens; `ready`/`rotate` demand `Drained`.
-- `scope`: `Workgroup` (barriers, `loop_carried`, `wg_skip_if`, kernel exits `exit`/`exit_if`/`exit_unless`/`end`/`end_with`) dereferencing to `Wave` (LDS ops, waits, `skip_if`/`skip_unless`, `exec_if`, `forward` blocks of wave-uniform forward branches, raw ISA), affine `Uniform`/`WgUniform` SCC handles. `Forward::branch_if` and `branch_unless` preserve SCC1/SCC0 polarity. Every branch target (skip target, `Forward` target) joins the backend state of every path into it (`Backend::join`); branches only go forward, except a loop's back edge. `Wave::exit_unless` branches to an `End` with SCC0 and refuses later workgroup barriers. A handoff's reader receives `&End` as its third argument, so it can leave through that same exit without cloning ownership.
+- `scope`: `Workgroup` (barriers, `loop_carried`, `wg_skip_if`, `wg_if_else`, kernel exits `exit`/`exit_if`/`exit_unless`/`end`/`end_with`) dereferencing to `Wave` (LDS ops, waits, `skip_if`/`skip_unless`, `exec_if`, `forward` blocks of wave-uniform forward branches, raw ISA), affine `Uniform`/`WgUniform` SCC handles. `Forward::branch_if` and `branch_unless` preserve SCC1/SCC0 polarity. Every branch target (skip target, `Forward` target) joins the backend state of every path into it (`Backend::join`); branches only go forward, except a loop's back edge. `Wave::exit_unless` branches to an `End` with SCC0 and refuses later workgroup barriers. A handoff's reader receives `&End` as its third argument, so it can leave through that same exit without cloning ownership.
 - `backend`: the lowering seam. Every state-changing entry point takes an `Auth` that only the core mints (one session per `Workgroup::new`); a backend keeps a `Seal` and refuses other sessions' tokens and anything after the kernel exit.
 - `runtime`: the standalone RIP front end's checked `Driver`, with dynamic region/ring ids. It privately mints the same sealed `Auth`, mirrors the typed core's ownership and scope transitions, and issues the same backend calls. Wait ledgers, branch joins, loop fixed points and object-level safety analyses remain in the backend and existing Peacemaker IR passes.
 
 The Halo VerifyAttn `lgkmcnt` race and the gfx11 FA2 mailbox race are compile errors (`tests/ui`), as are a lowering call without an `Auth` and a barrier in a wave scope, a `loop_until` body or a handoff's reader continuation.
 
 ## Gotchas
+
+- A wave-private region does not exempt its stores from a workgroup barrier's drain: `s_barrier` waits for no memory counter, so a private store still in flight needs `private_drain` (a `lgkmcnt`/`dscnt` wait) before any workgroup barrier. Joins refuse paths that disagree on a private slice's state (no `Free`+`Publishing` merge: a skipping wave holds nothing there). Ownership of addresses is value-level: `peacemaker-isa`'s `pm_check::lds_wave_private` (run by `toolchain::certify` with the windows it derives from the `; pm.wave_private` markers the Builder writes into the assembly; a contract's `wave_private_windows` may be omitted or must equal them) and `Emulator::wave_private_lds` prove each wave's accesses stay in its own slice.
 
 - Zero-cost is a gate, not a goal: every request maps onto the builder call a hand kernel makes, in the same order. The ported `peacemaker-isa` kernels (`iu4_v2c`, `iu4_v2b`, `iu4_gemm`) must re-emit byte-identical `.s` and `BuilderProof`s, except where a join or loop fixed point needs a guard the linear emission missed (or drops one it inherited from a path that never reaches the point).
 - A barrier lowers its transitions as all retires, then all readies, each in tuple order (the slot lists every hand-written builder barrier passed).
@@ -47,8 +50,11 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `seal`
   - `SlotTransition`
 - [`src/lds.rs`](src/lds.rs)
+  - `Advance`
+  - `advance`
   - `AllFree`
   - `cur_index`
+  - `depth`
   - `Free`
   - `FreeParts`
   - `into_steady`
@@ -58,10 +64,16 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `LdsRegion`
   - `Lendable`
   - `Lowering`
+  - `MAX_RING_DEPTH`
   - `new`
+  - `new_n`
   - `next_index`
+  - `Owned`
   - `Prime`
   - `prime`
+  - `Private`
+  - `PrivState`
+  - `PrivWritable`
   - `Published`
   - `Ready`
   - `ready`
@@ -74,11 +86,13 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `rotate`
   - `Slots`
   - `split`
+  - `starting_at`
   - `State`
   - `Store`
   - `StoreTarget`
   - `Transition`
   - `Transitions`
+  - `WaveRegion`
   - `Writing`
 - [`src/lib.rs`](src/lib.rs)
   - `backend`
@@ -114,6 +128,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `forward`
   - `give`
   - `give_back`
+  - `give_writing`
   - `goto`
   - `handoff`
   - `if_else`
@@ -121,6 +136,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `join`
   - `label`
   - `lds`
+  - `lds_private`
   - `Lend`
   - `loop_carried`
   - `loop_until`
@@ -130,14 +146,26 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `Place`
   - `place`
   - `position`
+  - `private_drain`
+  - `private_load`
+  - `private_phase`
+  - `private_publish`
+  - `private_retire`
+  - `private_store`
+  - `PrivateId`
+  - `PrivatePhase`
   - `raw`
   - `region_phase`
   - `RegionId`
   - `relayout`
   - `ring`
+  - `ring_depth`
+  - `ring_n`
   - `ring_phases`
+  - `ring_start_at`
   - `ring_steady`
   - `RingId`
+  - `RingView`
   - `scmp`
   - `scmp_wg_uniform`
   - `signal`
@@ -145,14 +173,17 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `skip_unless`
   - `split`
   - `take`
+  - `take_writing`
   - `Transition`
   - `typed`
+  - `view`
   - `wait`
   - `wait_all`
   - `wait_arrived`
   - `wave_exit_unless`
   - `wg_cond`
   - `wg_exit_unless`
+  - `wg_if_else`
   - `wg_skip_if`
   - `WgCond`
 - [`src/scope.rs`](src/scope.rs)
@@ -182,11 +213,17 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `isa`
   - `label`
   - `lds`
+  - `lds_private`
   - `loop_carried`
   - `loop_until`
   - `LoopExit`
   - `new`
   - `place`
+  - `private_drain`
+  - `private_load`
+  - `private_publish`
+  - `private_retire`
+  - `private_store`
   - `relayout`
   - `Scc`
   - `scmp`
@@ -201,6 +238,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `wait_all`
   - `wait_arrived`
   - `Wave`
+  - `wg_if_else`
   - `wg_skip_if`
   - `WgUniform`
   - `Workgroup`

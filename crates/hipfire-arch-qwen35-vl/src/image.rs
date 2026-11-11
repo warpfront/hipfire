@@ -122,9 +122,10 @@ pub fn smart_resize(
     }
 }
 
-/// Validate the actual rounded dimensions before allocating resized pixels.
-/// Clamping each axis to `factor` can make an extreme aspect ratio exceed
-/// the requested budget even when the original image passed the header cap.
+/// Validate resize arithmetic without imposing a model-specific patch cap.
+/// WMMA vision attention can serve extreme aspect ratios whose rounded grid
+/// exceeds the naive attention LDS bound. Resource admission belongs to the
+/// caller that prices the tower scratch reserve.
 fn checked_resized_dimensions(
     height: usize,
     width: usize,
@@ -142,13 +143,32 @@ fn checked_resized_dimensions(
         || w == 0
         || h > u32::MAX as usize
         || w > u32::MAX as usize
-        || pixels > VISION_LDS_MAX_PIXELS
+        || pixels
+            .checked_mul(3 * std::mem::size_of::<f32>())
+            .is_none_or(|bytes| bytes > isize::MAX as usize)
     {
         return Err(format!(
-            "resized image dimensions ({w}x{h}) exceed the vision limit ({VISION_LDS_MAX_PIXELS} pixels); reduce the aspect ratio"
+            "resized image dimensions ({w}x{h}) exceed addressable image storage"
         ));
     }
     Ok((h, w))
+}
+
+/// Resolve the exact dimensions used by the shared Qwen image processor.
+///
+/// This validates arithmetic and honours the resolved pixel budget. It does
+/// not impose a model-specific scratch reserve: callers such as Flash-Next
+/// must admit the resulting patch grid before decoding/allocating pixels.
+pub fn resized_dimensions(
+    height: usize,
+    width: usize,
+    patch_size: usize,
+    spatial_merge_size: usize,
+) -> Result<(usize, usize), String> {
+    let factor = patch_size
+        .checked_mul(spatial_merge_size)
+        .ok_or("image patch/merge factor overflow")?;
+    checked_resized_dimensions(height, width, factor, vision_max_pixels())
 }
 
 /// Shared preprocessing logic that takes an already-loaded `DynamicImage`.
@@ -161,11 +181,7 @@ fn preprocess_dynamic_image(
 ) -> Result<(Vec<f32>, usize, usize), String> {
     let (orig_w, orig_h) = (img.width() as usize, img.height() as usize);
 
-    let factor = patch_size
-        .checked_mul(spatial_merge_size)
-        .ok_or("image patch/merge factor overflow")?;
-    let (final_h, final_w) =
-        checked_resized_dimensions(orig_h, orig_w, factor, vision_max_pixels())?;
+    let (final_h, final_w) = resized_dimensions(orig_h, orig_w, patch_size, spatial_merge_size)?;
 
     // HF's `Qwen2VLImageProcessorFast` uses PIL's BICUBIC (`resample=3`).
     // `FilterType::CatmullRom` is the `image` crate's bicubic filter; this
@@ -218,9 +234,11 @@ pub fn load_and_preprocess(
     patch_size: usize,
     spatial_merge_size: usize,
 ) -> Result<(Vec<f32>, usize, usize), String> {
-    let bytes = std::fs::read(path)
-        .map_err(|error| format!("failed to open image {}: {error}", path.display()))?;
-    load_and_preprocess_from_bytes(&bytes, patch_size, spatial_merge_size)
+    // Preserve the existing path-input contract: large local images are
+    // decoded and downscaled, while untrusted byte inputs retain their
+    // format-header bomb guard below. Flash-Next owns its stricter wrapper.
+    let img = hipfire_runtime::imagedec::decode_dynamic_path(path)?;
+    preprocess_dynamic_image(img, patch_size, spatial_merge_size)
 }
 
 /// Load an image from raw bytes (PNG or JPEG), smart-resize, normalize.
@@ -887,18 +905,17 @@ mod tests {
     }
 
     #[test]
-    fn resized_dimensions_refuse_extreme_aspect_ratio_before_allocation() {
-        for (h, w) in [(1_048_576, 1), (1, 1_048_576)] {
-            // Header accepts 1 MP, but the minimum 32-pixel short axis
-            // would turn it into 8 MP / 32,768 patches.
-            let (rh, rw) = smart_resize(h, w, 32, VISION_MIN_PIXELS, VISION_MAX_PIXELS);
-            assert_eq!(rh * rw, 8_388_608);
-            assert!(checked_resized_dimensions(h, w, 32, VISION_MAX_PIXELS)
-                .unwrap_err()
-                .contains("vision limit"));
-        }
-        let image = image::DynamicImage::new_rgb8(1, 1_048_576);
-        assert!(preprocess_dynamic_image(image, 16, 2).is_err());
+    fn resized_dimensions_preserve_existing_extreme_aspect_grids() {
+        // Fixed historical results, deliberately not recomputed via
+        // smart_resize: WMMA can serve this grid on the existing 27B route.
+        assert_eq!(
+            checked_resized_dimensions(1, 1_048_576, 32, VISION_MAX_PIXELS).unwrap(),
+            (32, 262_144)
+        );
+        assert_eq!(
+            checked_resized_dimensions(1_048_576, 1, 32, VISION_MAX_PIXELS).unwrap(),
+            (262_144, 32)
+        );
     }
 
     #[test]

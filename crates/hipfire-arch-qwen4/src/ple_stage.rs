@@ -109,20 +109,156 @@ pub(crate) fn ple_async_upload(
     enabled && !device_token && deferred && !capturing
 }
 
-/// The reusable host staging buffer of one forward and its upload fence.
-pub(crate) struct PleHostStage {
-    bytes: Vec<u8>,
-    fence: Option<Event>,
+/// The device side of one staging upload, abstracted so the ordering rule
+/// ([`PleSequencer`]) is testable without a GPU.
+pub(crate) trait StageOps {
+    /// Enqueue the stream-ordered copy of the staged bytes.
+    fn copy(&mut self, len: usize) -> HipResult<()>;
+    /// Record the completion fence on the copy's stream, right behind it.
+    fn record_fence(&mut self) -> HipResult<()>;
+    /// Host-wait until the fence completed.
+    fn wait_fence(&mut self) -> HipResult<()>;
+    /// Host-wait until the whole device drained.
+    fn wait_device(&mut self) -> HipResult<()>;
+}
+
+/// The upload state machine: the one place that decides when the staging
+/// bytes may be written again.
+#[derive(Debug)]
+pub(crate) struct PleSequencer {
     upload: PleUpload,
+    fence_created: bool,
+}
+
+impl PleSequencer {
+    pub(crate) fn new() -> Self {
+        Self {
+            upload: PleUpload::Idle,
+            fence_created: false,
+        }
+    }
+
+    /// Wait until no enqueued copy reads the bytes. On failure the state is
+    /// unchanged, so the bytes stay unwritable and the next call retries.
+    pub(crate) fn drain(&mut self, ops: &mut impl StageOps) -> HipResult<()> {
+        match self.upload.drain() {
+            PleDrain::Nothing => {}
+            PleDrain::Fence if self.fence_created => ops.wait_fence()?,
+            // A Fenced state without an event cannot arise; drain the whole
+            // device rather than trust it.
+            PleDrain::Fence | PleDrain::Device => ops.wait_device()?,
+        }
+        self.upload = PleUpload::Idle;
+        Ok(())
+    }
+
+    /// Enqueue the copy and fence it. Every `?` after the enqueue leaves the
+    /// state pending, so a failing forward cannot release the buffer early.
+    /// `fenced == false` skips the fence (the caller proves ordering itself).
+    pub(crate) fn upload(
+        &mut self,
+        ops: &mut impl StageOps,
+        len: usize,
+        fenced: bool,
+    ) -> HipResult<()> {
+        if !fenced {
+            return ops.copy(len);
+        }
+        self.fence_created = true;
+        self.upload = self.upload.enqueue();
+        ops.copy(len)?;
+        ops.record_fence()?;
+        self.upload = self.upload.fence_recorded();
+        Ok(())
+    }
+
+    pub(crate) fn pending(&self) -> bool {
+        self.upload != PleUpload::Idle
+    }
+}
+
+/// Pinned (`hipHostMalloc`) host memory owned by a [`PleHostStage`].
+struct PinnedBytes {
+    ptr: *mut u8,
+    cap: usize,
+}
+
+/// The reusable pinned host staging buffer of one forward, its upload fence,
+/// and the stream-ordered copy that reads it.
+///
+/// Every device read of the buffer is a `hipMemcpyAsync` on the forward's
+/// compute stream (`gpu.active_stream`), never the legacy NULL stream: a
+/// NULL-stream copy forces the runtime to insert dependency markers in both
+/// directions against the blocking compute stream. The buffer is pinned, so
+/// the copy is a plain stream-ordered DMA and the call never host-waits.
+///
+/// Ordering: the next host write goes through [`Self::stage_buffer`], which
+/// first drains the fence recorded on the compute stream right behind the
+/// previous copy ([`PleSequencer`]). The device-token forward alone skips the
+/// fence ([`Self::upload_unfenced`]).
+pub(crate) struct PleHostStage {
+    /// `cap` bytes, allocated pinned on first use (`bind_thread` first) and
+    /// kept until [`Self::free_gpu`].
+    bytes: Option<PinnedBytes>,
+    cap: usize,
+    fence: Option<Event>,
+    seq: PleSequencer,
     enabled: bool,
 }
 
+// SAFETY: the pinned allocation is exclusively owned by the stage (no
+// aliasing handle exists) and all device access to it is ordered by the
+// sequencer; the raw pointer is only dereferenced through `&mut self`/`&self`.
+unsafe impl Send for PleHostStage {}
+
+struct GpuStageOps<'a> {
+    gpu: &'a Gpu,
+    dst: Option<&'a DeviceBuffer>,
+    src: &'a [u8],
+    fence: Option<&'a Event>,
+}
+
+impl StageOps for GpuStageOps<'_> {
+    fn copy(&mut self, len: usize) -> HipResult<()> {
+        let dst = self.dst.expect("copy needs a destination");
+        self.gpu
+            .hip
+            .memcpy_htod_async_on(dst, &self.src[..len], self.gpu.active_stream.as_ref())
+    }
+    fn record_fence(&mut self) -> HipResult<()> {
+        let fence = self.fence.expect("fence created before the copy");
+        self.gpu
+            .hip
+            .event_record(fence, self.gpu.active_stream.as_ref())
+    }
+    fn wait_fence(&mut self) -> HipResult<()> {
+        self.gpu
+            .hip
+            .event_synchronize(self.fence.expect("fence exists when Fenced"))
+    }
+    fn wait_device(&mut self) -> HipResult<()> {
+        self.gpu.hip.device_synchronize()
+    }
+}
+
+/// The first `len` staged bytes, for a device copy to read.
+fn pinned_slice(bytes: &Option<PinnedBytes>, len: usize) -> &[u8] {
+    let pinned = bytes.as_ref().expect("pinned staging allocated");
+    assert!(len <= pinned.cap, "PLE staging write exceeds capacity");
+    // SAFETY: `ptr` is a live `cap`-byte host allocation owned by the stage;
+    // the shared borrow excludes a concurrent `&mut` host write.
+    unsafe { std::slice::from_raw_parts(pinned.ptr, len) }
+}
+
 impl PleHostStage {
-    pub(crate) fn new(bytes: Vec<u8>, enabled: bool) -> Self {
+    /// A stage whose pinned buffer holds `cap` bytes (the maximum of every
+    /// upload it will stage).
+    pub(crate) fn new(cap: usize, enabled: bool) -> Self {
         Self {
-            bytes,
+            bytes: None,
+            cap,
             fence: None,
-            upload: PleUpload::Idle,
+            seq: PleSequencer::new(),
             enabled,
         }
     }
@@ -131,55 +267,93 @@ impl PleHostStage {
         self.enabled
     }
 
-    /// Wait until no enqueued copy reads the bytes. On failure the state is
-    /// unchanged, so the bytes stay unwritable and the next call retries.
-    fn drain(&mut self, gpu: &Gpu) -> HipResult<()> {
-        match (self.upload.drain(), self.fence.as_ref()) {
-            (PleDrain::Nothing, _) => {}
-            (PleDrain::Fence, Some(fence)) => gpu.hip.event_synchronize(fence)?,
-            // A Fenced state without an event cannot arise; drain the whole
-            // device rather than trust it.
-            (PleDrain::Fence, None) | (PleDrain::Device, _) => gpu.hip.device_synchronize()?,
+    fn ensure_pinned(&mut self, gpu: &Gpu) -> HipResult<()> {
+        if self.bytes.is_none() {
+            gpu.bind_thread()?;
+            let raw = gpu.hip.host_malloc(self.cap.max(1), 0)?;
+            self.bytes = Some(PinnedBytes {
+                ptr: raw as *mut u8,
+                cap: self.cap.max(1),
+            });
         }
-        self.upload = PleUpload::Idle;
         Ok(())
+    }
+
+    fn drain(&mut self, gpu: &Gpu) -> HipResult<()> {
+        let src: &[u8] = &[];
+        let mut ops = GpuStageOps {
+            gpu,
+            dst: None,
+            src,
+            fence: self.fence.as_ref(),
+        };
+        self.seq.drain(&mut ops)
     }
 
     /// The first `len` bytes for the host copy to fill. This is the only
     /// mutable access to the buffer, and it drains any pending upload first.
     pub(crate) fn stage_buffer(&mut self, gpu: &Gpu, len: usize) -> HipResult<&mut [u8]> {
+        self.ensure_pinned(gpu)?;
         self.drain(gpu)?;
-        Ok(&mut self.bytes[..len])
+        let pinned = self.bytes.as_mut().expect("pinned staging allocated");
+        assert!(len <= pinned.cap, "PLE staging write exceeds capacity");
+        // SAFETY: live `cap`-byte pinned allocation exclusively borrowed via
+        // `&mut self`; the drain above retired every device read of it.
+        Ok(unsafe { std::slice::from_raw_parts_mut(pinned.ptr, len) })
     }
 
-    /// Blocking upload of the staged bytes (`memcpy_htod_auto`, capture aware).
+    /// Upload of the staged bytes. Under graph capture, a stream-ordered copy
+    /// on the capturing stream; otherwise a stream-ordered copy on the compute
+    /// stream, fenced, with the host waiting for that fence (the blocking
+    /// opt-out; no NULL-stream operation).
     pub(crate) fn upload_blocking(
-        &self,
+        &mut self,
         gpu: &Gpu,
         dst: &DeviceBuffer,
         len: usize,
     ) -> HipResult<()> {
-        gpu.memcpy_htod_auto(dst, &self.bytes[..len])
+        if gpu.graphs.capture_mode {
+            gpu.bind_thread()?;
+            let stream = gpu
+                .active_stream
+                .as_ref()
+                .expect("capture mode requires an active stream");
+            return gpu
+                .hip
+                .memcpy_htod_async(dst, pinned_slice(&self.bytes, len), stream);
+        }
+        self.upload_async(gpu, dst, len)?;
+        self.drain(gpu)
     }
 
-    /// The device-token forward's asynchronous upload, unchanged and not
-    /// fenced (decode hot path). Its ordering is the readback: the caller has
-    /// just synchronized on the event of an argmax enqueued behind the
-    /// previous forward's upload, so the buffer was free to write; the next
-    /// writer is the next device-token forward behind the same readback, or a
-    /// forward that began with a blocking token-id copy on that stream.
+    /// The device-token forward's asynchronous upload, not fenced (decode hot
+    /// path), stream-ordered on the compute stream.
+    ///
+    /// Ordering proof (no fence needed): the previous forward enqueued this
+    /// copy on the compute stream C *before* its argmax and the event `E`
+    /// recorded behind it (`gpu_forward.rs` token readback `event_record`);
+    /// this forward's `stage_ple` first runs `read_token`, a
+    /// `hipStreamSynchronize` of the readback stream, which waits on `E`
+    /// (`hipStreamWaitEvent`). So the previous copy completed before the host
+    /// could reach the next `stage_buffer` write.
     pub(crate) fn upload_unfenced(
-        &self,
+        &mut self,
         gpu: &Gpu,
         dst: &DeviceBuffer,
         len: usize,
     ) -> HipResult<()> {
-        gpu.hip.memcpy_htod_async_default(dst, &self.bytes[..len])
+        gpu.bind_thread()?;
+        let mut ops = GpuStageOps {
+            gpu,
+            dst: Some(dst),
+            src: pinned_slice(&self.bytes, len),
+            fence: None,
+        };
+        self.seq.upload(&mut ops, len, false)
     }
 
-    /// Enqueue the staged bytes on the legacy stream without blocking the
-    /// host and fence the copy. Every `?` after the enqueue leaves the state
-    /// pending, so a failing forward cannot release the buffer early.
+    /// Enqueue the staged bytes on the compute stream without blocking the
+    /// host and fence the copy.
     pub(crate) fn upload_async(
         &mut self,
         gpu: &Gpu,
@@ -193,21 +367,29 @@ impl PleHostStage {
                     .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?,
             );
         }
-        self.upload = self.upload.enqueue();
-        gpu.hip.memcpy_htod_async_default(dst, &self.bytes[..len])?;
-        // Same (legacy) stream as the copy, so the event completes after it.
-        let fence = self.fence.as_ref().expect("fence created above");
-        gpu.hip.event_record(fence, None)?;
-        self.upload = self.upload.fence_recorded();
-        Ok(())
+        let mut ops = GpuStageOps {
+            gpu,
+            dst: Some(dst),
+            src: pinned_slice(&self.bytes, len),
+            fence: self.fence.as_ref(),
+        };
+        self.seq.upload(&mut ops, len, true)
     }
 
-    /// Teardown: retire any pending upload, then destroy the fence.
+    /// Teardown: retire any pending upload, destroy the fence, free the
+    /// pinned buffer (kept, not freed, when the drain failed).
     pub(crate) fn free_gpu(mut self, gpu: &Gpu) -> Option<HipError> {
         let mut first = self.drain(gpu).err();
         if let Some(fence) = self.fence.take() {
             if let Err(error) = gpu.hip.event_destroy(fence) {
                 first.get_or_insert(error);
+            }
+        }
+        if !self.seq.pending() {
+            if let Some(pinned) = self.bytes.take() {
+                if let Err(error) = gpu.hip.host_free(pinned.ptr as *mut std::ffi::c_void) {
+                    first.get_or_insert(error);
+                }
             }
         }
         first
@@ -216,12 +398,9 @@ impl PleHostStage {
 
 impl Drop for PleHostStage {
     fn drop(&mut self) {
-        // A stage dropped with a copy pending (no `free_gpu`, or a failed
-        // drain) keeps its bytes alive forever instead of freeing memory the
-        // device may still read.
-        if self.upload != PleUpload::Idle {
-            std::mem::forget(std::mem::take(&mut self.bytes));
-        }
+        // The pinned buffer needs a `Gpu` to be freed (`free_gpu`); a stage
+        // dropped without it leaks the allocation rather than free memory a
+        // copy may still read.
     }
 }
 
@@ -307,5 +486,116 @@ mod tests {
             ple_async_upload_enabled(Some("true")),
             "strict table: other spelling is default"
         );
+    }
+
+    /// Fake device: a copy reads the staged bytes only when the "device"
+    /// executes it (at a fence/device wait), like a stream-ordered copy.
+    struct FakeDevice {
+        staging: Vec<u8>,
+        pending: Vec<Vec<u8>>,
+        consumed: Vec<Vec<u8>>,
+        fail_fence_record: bool,
+        waits: Vec<&'static str>,
+    }
+
+    impl FakeDevice {
+        fn execute(&mut self) {
+            // Model: the copy reads staging *now*, not at enqueue.
+            let n = self.pending.len();
+            for _ in 0..n {
+                self.pending.pop();
+                self.consumed.push(self.staging.clone());
+            }
+        }
+    }
+
+    impl StageOps for FakeDevice {
+        fn copy(&mut self, _len: usize) -> HipResult<()> {
+            self.pending.push(Vec::new());
+            Ok(())
+        }
+        fn record_fence(&mut self) -> HipResult<()> {
+            if self.fail_fence_record {
+                return Err(HipError::new(0, "fence"));
+            }
+            Ok(())
+        }
+        fn wait_fence(&mut self) -> HipResult<()> {
+            self.waits.push("fence");
+            self.execute();
+            Ok(())
+        }
+        fn wait_device(&mut self) -> HipResult<()> {
+            self.waits.push("device");
+            self.execute();
+            Ok(())
+        }
+    }
+
+    fn fake() -> FakeDevice {
+        FakeDevice {
+            staging: Vec::new(),
+            pending: Vec::new(),
+            consumed: Vec::new(),
+            fail_fence_record: false,
+            waits: Vec::new(),
+        }
+    }
+
+    /// The host write gate: drain, then write.
+    fn host_write(seq: &mut PleSequencer, dev: &mut FakeDevice, bytes: &[u8]) {
+        seq.drain(dev).unwrap();
+        dev.staging = bytes.to_vec();
+    }
+
+    #[test]
+    fn next_write_waits_for_the_copy_to_consume_the_staging() {
+        let mut dev = fake();
+        let mut seq = PleSequencer::new();
+        host_write(&mut seq, &mut dev, b"token-1");
+        seq.upload(&mut dev, 7, true).unwrap();
+        // The copy has not run yet; overwriting now would corrupt it.
+        assert_eq!(dev.pending.len(), 1);
+        host_write(&mut seq, &mut dev, b"token-2");
+        assert_eq!(dev.consumed, vec![b"token-1".to_vec()], "copy saw token-1");
+        seq.upload(&mut dev, 7, true).unwrap();
+        host_write(&mut seq, &mut dev, b"token-3");
+        assert_eq!(dev.consumed, vec![b"token-1".to_vec(), b"token-2".to_vec()]);
+        assert_eq!(dev.waits, vec!["fence", "fence"]);
+    }
+
+    #[test]
+    fn a_write_that_skips_the_gate_is_caught_by_the_fake() {
+        // Negative control: without the drain the copy reads the new bytes.
+        let mut dev = fake();
+        let mut seq = PleSequencer::new();
+        dev.staging = b"token-1".to_vec();
+        seq.upload(&mut dev, 7, true).unwrap();
+        dev.staging = b"token-2".to_vec(); // no drain
+        dev.execute();
+        assert_eq!(dev.consumed, vec![b"token-2".to_vec()]);
+    }
+
+    #[test]
+    fn failed_fence_record_forces_a_device_drain_before_the_next_write() {
+        let mut dev = fake();
+        let mut seq = PleSequencer::new();
+        host_write(&mut seq, &mut dev, b"a");
+        dev.fail_fence_record = true;
+        assert!(seq.upload(&mut dev, 1, true).is_err());
+        dev.fail_fence_record = false;
+        host_write(&mut seq, &mut dev, b"b");
+        assert_eq!(dev.waits, vec!["device"]);
+        assert_eq!(dev.consumed, vec![b"a".to_vec()]);
+    }
+
+    #[test]
+    fn unfenced_upload_leaves_no_pending_state() {
+        let mut dev = fake();
+        let mut seq = PleSequencer::new();
+        host_write(&mut seq, &mut dev, b"a");
+        seq.upload(&mut dev, 1, false).unwrap();
+        assert!(!seq.pending());
+        assert!(dev.waits.is_empty());
     }
 }

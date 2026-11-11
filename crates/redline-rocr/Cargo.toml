@@ -36,3 +36,10 @@ proptest.workspace = true
 [[example]]
 name = "pm4_ib_smoke"
 required-features = ["lab"]
+
+# Hardware proof for GFX10/GFX11 PM4 scratch dispatch (A5): AQL vs PM4
+# byte-identity incl. full occupancy. Needs the code objects from
+# examples/pm4_scratch/build.sh.
+[[example]]
+name = "pm4_scratch_probe"
+required-features = ["lab"]

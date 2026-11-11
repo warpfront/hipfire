@@ -31,6 +31,7 @@
 //! its id, the owner of `live ? id : 0`, and selects with two lane masks.
 use super::common::{bload, op, s, smem, sop, sr, srd_tail, v};
 use crate::{
+    arch::WgIdSource,
     insn::MemoryClass,
     plan::Access,
     reg::{Kind, Live, RegRef},
@@ -54,14 +55,46 @@ pub fn module(arch: Arch) -> String {
 
 // ---- SGPRs ------------------------------------------------------------------
 const KARG: u8 = 0;
-/// gfx11 system SGPR right after the two user SGPRs: workgroup id x (gfx12 reads `ttmp9`).
-const WGX_IN: u8 = 2;
-// kernarg words 0..8 -> s8..s15 (ids 8:9, owned 10:11, table 12:13, tiles 14, n_experts 15), rank s16.
-const IDS: u8 = 8;
-const OWNED: u8 = 10;
-const TABLE: u8 = 12;
-const TILES: u8 = 14;
-const NEXP: u8 = 15;
+/// Real user SGPRs (the kernarg pointer) and enabled system SGPRs (workgroup id x).
+const USER_SGPRS: u8 = 2;
+const SYSTEM_SGPRS: u8 = 1;
+/// gfx11 system SGPR right after the DECLARED user SGPRs: workgroup id x (gfx12 reads `ttmp9`). gfx1100 pads the
+/// descriptor to user + system >= 16 (`Arch::declared_user_sgprs`, LLVM FeatureUserSGPRInit16Bug), so the id is `s15` there.
+fn wg_x_in(arch: Arch) -> Result<u8, String> {
+    match arch
+        .workgroup_ids(arch.declared_user_sgprs(USER_SGPRS, SYSTEM_SGPRS))?
+        .x
+    {
+        WgIdSource::Sgpr(n) => Ok(n),
+        other => Err(format!(
+            "ep_tile_mask_pm: no workgroup id SGPR on {}: {other:?}",
+            arch.name()
+        )),
+    }
+}
+/// The kernarg block `s_load_b256` destination: s[8:15] (ids 8:9, owned 10:11, table 12:13, tiles 14, n_experts 15),
+/// except on gfx1100 where s14/s15 belong to the padded user SGPRs / the workgroup id: the block moves to `S_END`.
+struct Args {
+    ids: u8,
+    owned: u8,
+    table: u8,
+    tiles: u8,
+    nexp: u8,
+}
+fn args(arch: Arch) -> Args {
+    let base = if arch.min_user_system_sgprs() > 0 {
+        S_END
+    } else {
+        8
+    };
+    Args {
+        ids: base,
+        owned: base + 2,
+        table: base + 4,
+        tiles: base + 6,
+        nexp: base + 7,
+    }
+}
 const RANK: u8 = 16;
 const WGX: u8 = 17;
 const TLM1: u8 = 18;
@@ -103,10 +136,17 @@ fn kernargs() -> KernargLayout {
 fn plan(arch: Arch) -> Result<RegPlan, String> {
     let mut p = RegPlan::new(u16::from(V_END), 104)?;
     p.s::<2>("kernarg_ptr", KARG, Live::Whole)?;
+    // gfx1100: s[2:16) are the (padded) user SGPRs and the workgroup id, the named blocks start at s16 and the
+    // relocated kernarg block follows `S_END`.
+    let (first, end) = if arch.min_user_system_sgprs() > 0 {
+        (16u8, S_END + 8)
+    } else {
+        (8u8, S_END)
+    };
     if !arch.gfx12() {
-        p.s::<1>("wg_x_in", WGX_IN, Live::Whole)?;
+        p.s::<1>("wg_x_in", wg_x_in(arch)?, Live::Whole)?;
     }
-    for base in (8u8..S_END).step_by(8) {
+    for base in (first..end).step_by(8) {
         p.add_range(&format!("s_blk{base}"), Kind::S, base, 8, Live::Whole)?;
     }
     for base in (0u8..V_END).step_by(8) {
@@ -196,13 +236,21 @@ fn s_sub_i32(a: Arch) -> &'static str {
 fn kernel<T: Target>(wg: &mut Workgroup<'_, T, Builder>, arch: Arch) -> R {
     let end = wg.exit(".Lmask_end")?;
     let b = wg.isa();
-    smem(b, IDS, 8, KARG, 0x00)?;
+    let Args {
+        ids,
+        owned,
+        table,
+        tiles,
+        nexp,
+    } = args(arch);
+    smem(b, ids, 8, KARG, 0x00)?;
     smem(b, RANK, 1, KARG, 0x20)?;
     // Workgroup id x: gfx12 `ttmp9`, gfx11 the system SGPR after the user SGPRs.
     if arch.gfx12() {
         sop(b, format!("s_mov_b32 s{WGX}, ttmp9"), &[WGX], &[])?;
     } else {
-        sop(b, format!("s_mov_b32 s{WGX}, s{WGX_IN}"), &[WGX], &[WGX_IN])?;
+        let wg_in = wg_x_in(arch)?;
+        sop(b, format!("s_mov_b32 s{WGX}, s{wg_in}"), &[WGX], &[wg_in])?;
     }
     for mk in MASKS {
         sop(b, format!("s_mov_b32 s{}, 0", mk + 1), &[mk + 1], &[])?
@@ -210,26 +258,26 @@ fn kernel<T: Target>(wg: &mut Workgroup<'_, T, Builder>, arch: Arch) -> R {
     // Last tile (the load clamp), extents, descriptors.
     sop(
         b,
-        format!("{} s{TLM1}, s{TILES}, 1", s_sub_i32(arch)),
+        format!("{} s{TLM1}, s{tiles}, 1", s_sub_i32(arch)),
         &[TLM1],
-        &[TILES],
+        &[tiles],
     )?;
     sop(
         b,
-        format!("s_lshl_b32 s{BYTES}, s{TILES}, 2"),
+        format!("s_lshl_b32 s{BYTES}, s{tiles}, 2"),
         &[BYTES],
-        &[TILES],
+        &[tiles],
     )?;
-    srd(b, SRD_IDS, IDS, BYTES)?;
-    srd(b, SRD_OWNED, OWNED, BYTES)?;
+    srd(b, SRD_IDS, ids, BYTES)?;
+    srd(b, SRD_OWNED, owned, BYTES)?;
     // The owner table holds n_experts words.
     sop(
         b,
-        format!("s_lshl_b32 s{BYTES}, s{NEXP}, 2"),
+        format!("s_lshl_b32 s{BYTES}, s{nexp}, 2"),
         &[BYTES],
-        &[NEXP],
+        &[nexp],
     )?;
-    srd(b, SRD_TABLE, TABLE, BYTES)?;
+    srd(b, SRD_TABLE, table, BYTES)?;
     // t = 256 wg + tid; the clamped tile and its byte offset.
     op(
         b,
@@ -254,9 +302,9 @@ fn kernel<T: Target>(wg: &mut Workgroup<'_, T, Builder>, arch: Arch) -> R {
     // live = 0 <= id < n_experts (unsigned compare covers negatives).
     op(
         b,
-        format!("v_cmp_gt_u32_e64 s{LIVE}, s{NEXP}, v{VID}"),
+        format!("v_cmp_gt_u32_e64 s{LIVE}, s{nexp}, v{VID}"),
         &[m(LIVE)],
-        &[s(NEXP), v(VID)],
+        &[s(nexp), v(VID)],
     )?;
     // owner = owner_table[live ? id : 0].
     op(
@@ -294,9 +342,9 @@ fn kernel<T: Target>(wg: &mut Workgroup<'_, T, Builder>, arch: Arch) -> R {
     // Only lanes of tiles (`t < tiles`) store.
     op(
         b,
-        format!("v_cmp_gt_u32_e64 s{VALID}, s{TILES}, v{VT}"),
+        format!("v_cmp_gt_u32_e64 s{VALID}, s{tiles}, v{VT}"),
         &[m(VALID)],
-        &[s(TILES), v(VT)],
+        &[s(tiles), v(VT)],
     )?;
     op(
         b,

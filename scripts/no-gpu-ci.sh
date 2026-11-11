@@ -22,6 +22,9 @@ if [[ "${1:-}" == "--self-check" ]]; then
     exit 0
 fi
 
+echo "== QSA pooling positions (host C++, no HIP) =="
+python3 scripts/test_qsa_mrope_position.py
+
 echo "== Rust check =="
 cargo check --workspace --examples
 
@@ -49,7 +52,7 @@ PYTEST_PATHS=(
     scripts/test_registry_gen_ornith.py scripts/test_registry_gen_vision.py
     scripts/test_registry_gen_coverage.py scripts/test_registry_gen_decider.py
     scripts/test_lmx_corpus.py scripts/test_ck_runtime_bundle.py
-    scripts/test_check_changelog.py scripts/test_kernel_idproof.py
+    scripts/test_check_changelog.py scripts/test_check_conflict_markers.py scripts/test_kernel_idproof.py
     scripts/test_agentic_gate_driver.py
     scripts/test_post_land_smoke.py scripts/test_post_land_smoke_orchestrator.py
 )
@@ -73,6 +76,10 @@ python3 scripts/check-env-docs.py
 
 echo "== Lifecycle check (deprecated surfaces opt-in; env/config lifecycle status) =="
 python3 scripts/check-lifecycle.py
+
+echo "== MTP parity fixture bytes + ratchet self-test =="
+python3 scripts/check-mtp-parity-ratchet.py --self-test
+python3 scripts/check-mtp-parity-ratchet.py fixture
 
 echo "== Leaked hipfire processes =="
 # A test that execs a workspace-built hipfire/daemon must not leave it running.

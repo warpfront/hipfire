@@ -8,6 +8,16 @@ and model identity, and a measurement date on the same report — these tables
 do not carry that full identity manifest, so this page is **historical** only
 (the inventory date below is not a measurement date).
 
+**Current release numbers are not on this page.** Dated v0.4.4 measurements
+(card, fixture, method, date and build per row) are in the README's
+[Measured performance (v0.4.4)](../README.md#measured-performance-v044) table
+and the [CHANGELOG](../CHANGELOG.md) entries it cites. The tables below were
+taken on older builds, most with the since-deprecated `asym3` KV mode; they
+are not the current speed of any listed card or model. The v0.4.5 Flash-Next
+EP2 serve measurement (2x R9700, 2026-11-11) is the **measured** (not admitted)
+record [`perf-checkpoints/2026-11-11-flash-next-ep2-cp20.md`](perf-checkpoints/2026-11-11-flash-next-ep2-cp20.md);
+it has no [`admissions.yml`](admissions.yml) row and is not a product floor.
+
 | Field | Value |
 |---|---|
 | Page state | **historical** (see [`INDEX.md`](INDEX.md)) |
@@ -137,23 +147,18 @@ proves a broader win. Enable globally with `hipfire config set dflash_mode auto`
 `hipfire config qwen3.5:27b set dflash_mode on`. The numbers above were measured
 with DFlash forced on.
 
-## Historical: vs ollama (Q4_K_M GGUF) — 7900 XTX
+## Historical: 7900 XTX small-model snapshot (hipfire only)
 
 **Truth state:** historical
-Same-machine snapshot: hipfire MQ4 with asym3 KV and FlashAttention versus
-ollama Q4_K_M through llama.cpp’s ROCm backend. Matched ~140-token and
-~530-token prompts and matched 128-token generation lengths. Ollama numbers from
-its `prompt_eval_duration` / `eval_duration` reporting via `/api/generate` with
-`num_predict=128`. No per-row binary/model hash manifest on this page.
+Same-machine snapshot of hipfire MQ4 with asym3 KV and FlashAttention at
+matched ~140-token and ~530-token prompts and 128-token generation. No
+per-row binary/model hash manifest on this page.
 
-| Model | hf pp128 | oll pp128 | hf pp512 | oll pp512 | hf decode | oll decode | decode× |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Qwen 3.5 0.8B | **10,861** | 4,622 | **12,962** | 7,117 | **353** | 168 | **2.10×** |
-| Qwen 3.5 4B | **3,304** | 1,972 | **3,321** | 2,670 | **165** | 93 | **1.78×** |
-| Qwen 3.5 9B | **1,920** | 1,428 | 1,919 | **1,970** | **122** | 71 | **1.71×** |
-
-The retired comparison harness remains available in git history; the table is
-historical evidence, not a currently runnable route.
+| Model | hf pp128 | hf pp512 | hf decode |
+|---|---:|---:|---:|
+| Qwen 3.5 0.8B | **10,861** | **12,962** | **353** |
+| Qwen 3.5 4B | **3,304** | **3,321** | **165** |
+| Qwen 3.5 9B | **1,920** | 1,919 | **122** |
 
 ## Historical: other arches (decode tok/s)
 
@@ -183,9 +188,7 @@ Supporting dated notes (still fixture-bound):
   ([`perf-checkpoints/2026-05-05-gfx906-decode-investigation.md`](perf-checkpoints/2026-05-05-gfx906-decode-investigation.md)): residual
   GEMV software-pipelined ILP variant (+4.8% on 9B under that fixture) and fused
   projections pre-quantizing x to Q8_1 with `v_dot4_i32_i8` (+9.3% on 9B).
-  Combined historical row: 50.7 → 58.9 tok/s (+16.2%) on Qwen 3.5 9B. Stock
-  llama.cpp Q4_K_M on the same hardware in that note: 61.55 tok/s; skyne98/iacopPBK
-  fork: 63.48.
+  Combined historical row: 50.7 → 58.9 tok/s (+16.2%) on Qwen 3.5 9B.
 
 ## Where new numbers go
 

@@ -19,7 +19,7 @@
 //! `2..64` (the gfx12 projection GEMMs are row-count independent there —
 //! CbSpec probe — and every n-dependent route switch is at >= 64 rows).
 //!
-//! Aggregate 64..=128 rows (`HIPFIRE_CB_VERIFY_CHUNK128`, exact gfx1201 with
+//! Aggregate 64..=128 rows (`HIPFIRE_CB_VERIFY_CHUNK128`, default on for exact gfx1201 with
 //! a dense MQ4G256V2 target only, see [`multi_chunk_wide_admitted`]): the
 //! default `>= 64`-row projection route (IU4/FP8 quantized activations) is not
 //! the singleton's arithmetic, so the shared stages run with
@@ -93,8 +93,8 @@ pub struct MultiChunkRequest<'a> {
 
 /// The largest aggregate row count the multi-request body supports (the
 /// exact wide verify GEMMs cover 64..=128 rows). The route's EFFECTIVE cap is
-/// [`multi_chunk_row_cap`]: 128 only with `HIPFIRE_CB_VERIFY_CHUNK128` on exact
-/// gfx1201, otherwise [`MULTI_CHUNK_PRODUCT_MAX_ROWS`].
+/// [`multi_chunk_row_cap`]: 128 on exact gfx1201 unless `HIPFIRE_CB_VERIFY_CHUNK128=0`,
+/// otherwise [`MULTI_CHUNK_PRODUCT_MAX_ROWS`].
 pub const MULTI_CHUNK_MAX_ROWS: usize = 128;
 
 /// The largest aggregate row count on the product arithmetic: below every
@@ -108,8 +108,8 @@ pub const MULTI_CHUNK_PRODUCT_MAX_ROWS: usize = 63;
 pub const MULTI_CHUNK_MAX_LANE_ROWS: usize = 63;
 
 /// The effective aggregate row cap of this device/process:
-/// `Gpu::mq4_verify_chunk_rows` (128 on exact gfx1201 with
-/// `HIPFIRE_CB_VERIFY_CHUNK128` and WMMA batch tiles, else 63) bounded to the
+/// `Gpu::mq4_verify_chunk_rows` (128 on exact gfx1201 with WMMA batch tiles unless
+/// `HIPFIRE_CB_VERIFY_CHUNK128=0`, else 63) bounded to the
 /// supported `MULTI_CHUNK_PRODUCT_MAX_ROWS..=MULTI_CHUNK_MAX_ROWS`.
 pub fn multi_chunk_row_cap(gpu: &Gpu) -> usize {
     gpu.mq4_verify_chunk_rows()
@@ -2067,8 +2067,9 @@ mod pack_tests {
     };
     use rdna_compute::FeatureFlags;
 
-    /// gfx1201 defaults with `HIPFIRE_CB_VERIFY_CHUNK128=1` (the env default of
-    /// `HIPFIRE_WMMA_BATCH_TILES` on gfx1201 is on).
+    /// gfx1201 defaults (`HIPFIRE_CB_VERIFY_CHUNK128` and
+    /// `HIPFIRE_WMMA_BATCH_TILES` are both on by default on gfx1201; the
+    /// `for_test` constructor keeps both off, so they are set here).
     fn chunk128_flags() -> FeatureFlags {
         let mut f = FeatureFlags::for_test("gfx1201");
         f.cb_verify_chunk128 = true;

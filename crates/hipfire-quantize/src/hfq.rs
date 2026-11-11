@@ -74,6 +74,7 @@ impl QuantType {
             53 => Some(Self::MQ4G128V2),
             55 => Some(Self::FP8E4M3B128),
             56 => Some(Self::FP8E4M3PT),
+            57 => Some(Self::HC8E4M3Row),
             131 => Some(Self::MQ3I4G128R256),
             132 => Some(Self::MQ3I4G128R128),
             133 => Some(Self::MQ2I4G128R256),
@@ -253,6 +254,12 @@ pub(crate) enum QuantType {
     /// FP8 E4M3PT (qt=56): OCP e4m3fn codes with one per-tensor bf16 scale in a
     /// 16-byte header, then `rows*K` code bytes. Arch-loaded (Qwen4 PLE row store).
     FP8E4M3PT = 56,
+    /// HC8 E4M3Row (qt=57): wire constant, Qwen4 HC8 sidecar (`<model>.hc8`) only,
+    /// never produced by the quantize pipeline. `[m, k]` payload = swizzled OCP
+    /// e4m3 bytes (`m*k`) then little-endian f32 per-row power-of-two scales
+    /// (`4*m`); decode `q * s`. Layout in `docs/quant-formats/hc8-e4m3-row.md`;
+    /// built by `hipfire-quantize hc8 build`.
+    HC8E4M3Row = 57,
     /// MQ3-I4 gate/up (qt=131, DESIGN F1/F2): W3 grid ±{1,3,5,7} (3-bit planar
     /// codes) + per-128 f16 scales, R256 FWHT (seeds 42/1042). Tensor bytes are
     /// `[codes plane M*K*3/8][scales plane M*K/128 f16]`. Typed-qwen4 expert
@@ -807,6 +814,92 @@ fn write_hfq_to(
     }
 
     Ok(())
+}
+
+/// One tensor index record for [`write_hfq_streamed`]; the payload is produced
+/// by the caller's emitter in index order.
+#[derive(Debug, Clone)]
+pub(crate) struct HfqIndexEntry {
+    pub(crate) name: String,
+    pub(crate) quant_type: u8,
+    pub(crate) shape: Vec<u32>,
+    pub(crate) group_size: u32,
+    pub(crate) data_len: u64,
+}
+
+/// Write an HFQ container whose tensor payloads are streamed by `emit`
+/// (called once per entry, in index order, and required to write exactly
+/// `entries[i].data_len` bytes). Same container layout and atomic
+/// tmp + fsync + rename discipline as [`write_hfq`]; no payload is held in RAM.
+pub(crate) fn write_hfq_streamed(
+    path: &Path,
+    arch: u32,
+    metadata_json: &str,
+    entries: &[HfqIndexEntry],
+    mut emit: impl FnMut(usize, &mut File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::Seek;
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    let result = File::create(&tmp).and_then(|mut f| {
+        let metadata_bytes = metadata_json.as_bytes();
+        let metadata_offset = 32u64;
+        let index_offset = metadata_offset + metadata_bytes.len() as u64;
+        let mut index_bytes = Vec::new();
+        index_bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for e in entries {
+            let name_bytes = e.name.as_bytes();
+            index_bytes.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            index_bytes.extend_from_slice(name_bytes);
+            index_bytes.push(e.quant_type);
+            index_bytes.push(e.shape.len() as u8);
+            for &d in &e.shape {
+                index_bytes.extend_from_slice(&d.to_le_bytes());
+            }
+            index_bytes.extend_from_slice(&e.group_size.to_le_bytes());
+            index_bytes.extend_from_slice(&e.data_len.to_le_bytes());
+        }
+        let data_start_unaligned = index_offset + index_bytes.len() as u64;
+        let data_offset = (data_start_unaligned + 4095) & !4095;
+
+        f.write_all(HFQ_MAGIC)?;
+        f.write_all(&HFQ_VERSION.to_le_bytes())?;
+        f.write_all(&arch.to_le_bytes())?;
+        f.write_all(&(entries.len() as u32).to_le_bytes())?;
+        f.write_all(&metadata_offset.to_le_bytes())?;
+        f.write_all(&data_offset.to_le_bytes())?;
+        f.write_all(metadata_bytes)?;
+        f.write_all(&index_bytes)?;
+        f.write_all(&vec![0u8; (data_offset - data_start_unaligned) as usize])?;
+
+        let mut expect = data_offset;
+        for (i, e) in entries.iter().enumerate() {
+            emit(i, &mut f)?;
+            expect += e.data_len;
+            let pos = f.stream_position()?;
+            if pos != expect {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "tensor `{}`: emitter wrote {} bytes, index says {}",
+                        e.name,
+                        pos + e.data_len - expect,
+                        e.data_len
+                    ),
+                ));
+            }
+        }
+        f.flush()?;
+        f.sync_all()
+    });
+    match result.and_then(|()| std::fs::rename(&tmp, path)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]

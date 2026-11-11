@@ -723,13 +723,16 @@ impl Qwen35TpProgram {
         epoch: &ForwardEpoch,
     ) -> bool {
         epoch.route == MeshRoute::Decode
-            && ranks.len() == 2
-            && gpus.devices.len() == 2
+            && ranks.len() == gpus.devices.len()
             && ranks
                 .iter()
                 .zip(&gpus.devices)
                 .all(|(rank, gpu)| graphs_enabled(rank, gpu))
-            && gpus.tp2_whole_token_graph_ready(plan.collectives.len())
+            && match ranks.len() {
+                2 => gpus.tp2_whole_token_graph_ready(plan.collectives.len()),
+                4 => gpus.tp_push_whole_token_graph_ready(),
+                _ => false,
+            }
     }
 
     /// One decode epoch on the TP2 whole-token graph. The embeds run
@@ -760,7 +763,8 @@ impl Qwen35TpProgram {
         let barriers = plan.collectives.len();
         let mut ticket = None;
         let mut refusal = None;
-        let step = gpus.tp2_whole_token_graph_forward(barriers, |gpus| {
+        let tp = gpus.devices.len();
+        let run = |gpus: &mut Gpus| {
             let mut bindings = Qwen35TpBindings::new(self, &mut *ranks, plan);
             bindings.embedded_whole_token();
             bindings.set_tokens(tokens);
@@ -775,7 +779,12 @@ impl Qwen35TpProgram {
                     Err(failure)
                 }
             }
-        });
+        };
+        let step = if tp == 2 {
+            gpus.tp2_whole_token_graph_forward(barriers, run)
+        } else {
+            gpus.tp_push_whole_token_graph_forward(barriers, run)
+        };
         let step = match step {
             Ok(step) => step,
             Err(error) => {
@@ -817,11 +826,11 @@ impl Qwen35TpProgram {
         if ar_graph_trace_enabled() {
             match step {
                 TpGraphStep::Captured => eprintln!(
-                    "[qwen-mesh-tp-graph] whole-token tp=2 captured barriers={barriers} pos={}",
+                    "[qwen-mesh-tp-graph] whole-token tp={tp} captured barriers={barriers} pos={}",
                     epoch.start_position
                 ),
                 TpGraphStep::Replayed => eprintln!(
-                    "[qwen-mesh-tp-graph] whole-token tp=2 replay barriers={barriers} pos={}",
+                    "[qwen-mesh-tp-graph] whole-token tp={tp} replay barriers={barriers} pos={}",
                     epoch.start_position
                 ),
                 TpGraphStep::Direct => {}

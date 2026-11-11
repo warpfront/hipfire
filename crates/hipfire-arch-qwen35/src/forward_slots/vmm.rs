@@ -68,7 +68,7 @@ pub fn vmm_executor_supports(
     route: VmmRoute,
 ) -> Result<(), String> {
     if route == VmmRoute::Exact {
-        exact::supports(gpu, weights)?;
+        exact::supports(gpu, weights, config)?;
     }
     slots_embed_format_admitted(weights.embd_format).map_err(|e| format!("VMM executor: {e}"))?;
     if !lm_head_slots_admissible(weights.output.gpu_dtype) {
@@ -287,6 +287,21 @@ pub struct VmmAdmission {
     pub committed: usize,
 }
 
+/// Where the flash decode leaves each row's attention output.
+pub(super) enum VmmAttendOut<'a> {
+    /// The reduced, ungated output in `pbs.fa_attn_out_batch` (the caller
+    /// applies the output gate and the `wo` rotation).
+    Plain,
+    /// The singleton's fused epilogue (A3B): reduce + sigmoid(`gate`) output
+    /// gate + `wo` FWHT rotate, row r's rotated `wo` input written to row r of
+    /// `rot` (`[rows, n_heads * head_dim]`). `gate` rows are the per-row gates
+    /// of the FA prep (`pbs.fa_gate_batch`).
+    GatedRotate {
+        gate: &'a GpuTensor,
+        rot: &'a GpuTensor,
+    },
+}
+
 /// KV write (K and V) and causal attend over independent request owners.
 pub(super) fn vmm_kv_write_attend(
     gpu: &mut Gpu,
@@ -294,6 +309,18 @@ pub(super) fn vmm_kv_write_attend(
     layer: &VmmLayerKv,
     pbs: &PrefillBatchScratch,
     n: usize,
+) -> HipResult<()> {
+    vmm_kv_write_attend_out(gpu, config, layer, pbs, n, &VmmAttendOut::Plain)
+}
+
+/// [`vmm_kv_write_attend`] with an explicit output mode.
+pub(super) fn vmm_kv_write_attend_out(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    layer: &VmmLayerKv,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    out: &VmmAttendOut,
 ) -> HipResult<()> {
     for (side, src) in [
         (VmmKvSide::K, &pbs.fa_k_batch),
@@ -321,19 +348,39 @@ pub(super) fn vmm_kv_write_attend(
     let mut r0 = 0usize;
     while r0 < n {
         let len = group.min(n - r0);
-        gpu.attention_flash_decode_vmm(
-            layer.flash,
-            &pbs.fa_q_batch.sub_offset(r0 * q_row, len * q_row),
-            &pbs.fa_attn_out_batch.sub_offset(r0 * q_row, len * q_row),
-            &pbs.positions.sub_offset(r0, len),
-            config.n_heads,
-            config.n_kv_heads,
-            config.head_dim,
-            len,
-            layer.partials,
-            layer.descs,
-            &layer.row_slot.sub_offset(r0, len),
-        )?;
+        let q = pbs.fa_q_batch.sub_offset(r0 * q_row, len * q_row);
+        let positions = pbs.positions.sub_offset(r0, len);
+        let row_slot = layer.row_slot.sub_offset(r0, len);
+        match out {
+            VmmAttendOut::Plain => gpu.attention_flash_decode_vmm(
+                layer.flash,
+                &q,
+                &pbs.fa_attn_out_batch.sub_offset(r0 * q_row, len * q_row),
+                &positions,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                len,
+                layer.partials,
+                layer.descs,
+                &row_slot,
+            )?,
+            VmmAttendOut::GatedRotate { gate, rot } => gpu
+                .attention_flash_decode_vmm_gated_mq_rotate(
+                    layer.flash,
+                    &q,
+                    &gate.sub_offset(r0 * q_row, len * q_row),
+                    &rot.sub_offset(r0 * q_row, len * q_row),
+                    &positions,
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    len,
+                    layer.partials,
+                    layer.descs,
+                    &row_slot,
+                )?,
+        }
         r0 += len;
     }
     Ok(())
@@ -797,8 +844,7 @@ impl Qwen35VmmStore {
             )
             .map_err(|e| format!("VMM executor: {e}"))?;
         // The exact route's trunk rows are decode rows only (one per slot):
-        // its prefill is the singleton prefill on the singleton's own scratch
-        // and its attention is the singleton binding (no shared partials).
+        // its prefill is the singleton prefill on the singleton's own scratch.
         // Sizing these for prefill rows would duplicate the singleton's PBS.
         let trunk_rows = match route {
             VmmRoute::Exact => max_slots,

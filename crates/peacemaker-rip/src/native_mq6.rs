@@ -21,7 +21,9 @@ use super::{
 use crate::interp::{Cx, Interp, R};
 use crate::value::Value;
 use peacemaker_isa::insn::Instruction;
-use peacemaker_isa::kernels::mq6_i8_gemm::{self as mq6, blocks, Epi, Gen, Raster, Spec, Tile};
+use peacemaker_isa::kernels::mq6_i8_gemm::{
+    self as mq6, blocks, Epi, Gen, Raster, RingDepth, Spec, Tile, Tune,
+};
 use peacemaker_isa::Emitted;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -63,6 +65,10 @@ const FNS: &[&str] = &[
     "mq6::prologue_fetch",
     "mq6::zero_acc",
     "mq6::epilogue",
+    "mq6::group_end",
+    "mq6::trips_dec",
+    "mq6::ring3_split",
+    "mq6::ring3_cmp_insn",
 ];
 
 pub(super) fn is_fn(name: &str) -> bool {
@@ -102,6 +108,11 @@ pub(super) fn assoc_const<'a>(ty: &str, item: &str) -> Option<Value<'a>> {
             "K_LOOP_END" => mq6::K_LOOP_END,
             "EPI" => mq6::EPI,
             "END" => mq6::END,
+            // The depth-3 arm selector's labels (`kloop::ring3`).
+            "K_ARMS_END" => mq6::kloop::ring3::K_ARMS_END,
+            "ARM12" => mq6::kloop::ring3::ARM12,
+            "ARM12_END" => mq6::kloop::ring3::ARM12_END,
+            "ARM2" => mq6::kloop::ring3::ARM2,
             _ => return None,
         }));
     }
@@ -168,12 +179,21 @@ fn field<'a>(fs: &mut Fields<'a>, name: &str, k: &str) -> Res<Value<'a>> {
 fn spec_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<Spec> {
     let mut fs = fields_of(it, v, "Mq6Spec")?;
     let n = "Mq6Spec";
-    let spec = Spec {
+    let mut spec = Spec {
         epi: epi_of(it, &field(&mut fs, n, "epi")?)?,
         raster: raster_of(it, &field(&mut fs, n, "raster")?)?,
         tile: tile_of(it, &field(&mut fs, n, "tile")?)?,
         arch: arch_of(it, &field(&mut fs, n, "arch")?)?,
+        tune: Tune::default(),
     };
+    // `ring` (the A/W ring depth, 2 or 3) is the one optional field: absent means the shipped 2.
+    if let Some(i) = fs.iter().position(|(f, _)| &**f == "ring") {
+        let ring = u32_of(it, &fs.remove(i).1, "Mq6Spec ring")?;
+        spec.tune.ring = ring
+            .to_string()
+            .parse::<RingDepth>()
+            .map_err(|e| format!("`Mq6Spec` ring: {e}"))?;
+    }
     if let Some((k, _)) = fs.first() {
         return Err(format!("`{n}` has no field `{k}`"));
     }
@@ -189,6 +209,7 @@ fn spec_val<'a>(s: Spec) -> Value<'a> {
             f("raster", enum_val("Raster", &format!("{:?}", s.raster))),
             f("tile", enum_val("Mq6Tile", &format!("{:?}", s.tile))),
             f("arch", nat(Nat::Arch(s.arch))),
+            f("ring", Value::u32(s.tune.ring.name().parse().unwrap_or(2))),
         ],
     )
 }
@@ -476,6 +497,18 @@ fn call<'a>(it: &Interp<'a>, name: &str, a: &[Value<'a>], cx: &mut Cx<'_>) -> R<
                 zp,
             )))
         }
+        "mq6::group_end" => emit!(2, |b, g| blocks::group_end(b, &g)),
+        "mq6::trips_dec" => emit!(2, |b, g| blocks::trips_dec(b, &g)),
+        "mq6::ring3_split" => emit!(2, |b, g| blocks::ring3_split(b, &g)),
+        "mq6::ring3_cmp_insn" => {
+            need(3)?;
+            let (g, cmp, imm) = (
+                gen_of(it, &a[0])?,
+                str_of(it, &a[1], "ring3_cmp")?,
+                u32_of(it, &a[2], "immediate")?,
+            );
+            Ok(done_with(blocks::ring3_cmp_insn(&g, &cmp, imm), insn_val))
+        }
         n => Err(format!("native function `{n}` is not implemented").into()),
     }
 }
@@ -517,6 +550,15 @@ pub(super) fn method<'a>(
         "w_rounds" => {
             need(0)?;
             Some(Value::usize(g.spec().tile.w_rounds() as usize))
+        }
+        "depth" => {
+            need(0)?;
+            Some(Value::usize(g.depth()))
+        }
+        "pf_set" => {
+            need(1)?;
+            let set = usize_of(it, &a[0], "prefetch set")?;
+            Some(done_with(g.pf_set(set), |g| nat(Nat::Mq6Gen(Rc::new(g)))))
         }
         "slot" => {
             need(1)?;

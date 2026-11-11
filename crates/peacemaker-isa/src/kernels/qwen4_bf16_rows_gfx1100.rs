@@ -57,7 +57,10 @@ use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan};
 type R = Result<(), String>;
 const KARG: u8 = 0;
 const SRD: u8 = 4;
-const PA: u8 = 8;
+/// Kernarg pointer/scalar block s[PA:PA+7] (A0..A3, or the HC W X Y M K). gfx1100
+/// `FeatureUserSGPRInit16Bug`: user + system SGPRs >= 16 declares 14 user SGPRs, so the workgroup
+/// ids are s14/s15 and the block lives clear of them.
+const PA: u8 = 72;
 const PXY: u8 = 16;
 const Y3M: u8 = 24;
 const M2KB: u8 = 28;
@@ -275,25 +278,25 @@ pub fn emit_rowtiles(hc: bool) -> Result<Emitted, String> {
 }
 
 fn prologue(b: &mut Builder, hc: bool) -> R {
-    let ids = b.spec.arch.workgroup_ids(b.spec.user_sgpr_count)?;
+    let ids = b.spec.workgroup_ids(false)?;
     let (crate::arch::WgIdSource::Sgpr(wgx), crate::arch::WgIdSource::Sgpr(wgy)) = (ids.x, ids.y)
     else {
         return Err("gfx1100 BF16 rowtiles require SGPR workgroup IDs".into());
     };
     if hc {
-        smem(b, 8, 8, KARG, 0)?;
+        smem(b, PA, 8, KARG, 0)?;
         smem(b, 16, 4, KARG, 32)?;
         b.wait_all()?;
         for (d, x) in [
             (SCALE, 16),
             (ACT, 17),
             (SR, 18),
-            (XP, 10),
-            (XP + 1, 11),
-            (SY, 12),
-            (SY + 1, 13),
-            (SM, 14),
-            (SK, 15),
+            (XP, PA + 2),
+            (XP + 1, PA + 3),
+            (SY, PA + 4),
+            (SY + 1, PA + 5),
+            (SM, PA + 6),
+            (SK, PA + 7),
         ] {
             mov(b, d, x)?;
         }
@@ -311,8 +314,8 @@ fn prologue(b: &mut Builder, hc: bool) -> R {
             &[s(QUARTER)],
             &[v(VT)],
         )?;
-        mov(b, SRD, 8)?;
-        mov(b, SRD + 1, 9)?;
+        mov(b, SRD, PA)?;
+        mov(b, SRD + 1, PA + 1)?;
     } else {
         smem(b, PA, 8, KARG, 0)?;
         smem(b, PXY, 8, KARG, 32)?;

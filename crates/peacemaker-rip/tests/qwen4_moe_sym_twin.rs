@@ -143,11 +143,30 @@ fn changes_program(from: &str, to: &str, variant: &str) {
 fn reordering_the_nt_kloop_changes_the_program() {
     for v in ["down_gp_nt4", "gate_up_nt8"] {
         changes_program(
-            "            moent::advance(wg)?;\n            moent::load_w(wg, g, 0)?;\n",
-            "            moent::load_w(wg, g, 0)?;\n            moent::advance(wg)?;\n",
+            "            moent::advance(wg)?;\n            if g.gate_up() && g.nt() == 8 {\n                wg.barrier(())?;\n            }\n            moent::load_w(wg, g, 0)?;\n",
+            "            if g.gate_up() && g.nt() == 8 {\n                wg.barrier(())?;\n            }\n            moent::load_w(wg, g, 0)?;\n            moent::advance(wg)?;\n",
             v,
         );
     }
+}
+
+/// The gfx1201 NT8 `gate_up` epoch lock is the script's: one workgroup barrier per K128 epoch (at the
+/// top of the trip and between the descriptor step and the second epoch's weight loads). Dropping
+/// either barrier is a different program.
+#[test]
+fn the_nt8_gate_up_epoch_lock_is_script_level() {
+    let gate = "            if g.gate_up() && g.nt() == 8 {\n                wg.barrier(())?;\n            }\n";
+    assert_eq!(TWIN.matches(gate).count(), 2, "two epoch barriers");
+    changes_program(
+        &format!("{gate}            moent::load_w(wg, g, 1)?;\n"),
+        "            moent::load_w(wg, g, 1)?;\n",
+        "gate_up_nt8",
+    );
+    changes_program(
+        &format!("{gate}            moent::load_w(wg, g, 0)?;\n"),
+        "            moent::load_w(wg, g, 0)?;\n",
+        "gate_up_nt8",
+    );
 }
 
 #[test]

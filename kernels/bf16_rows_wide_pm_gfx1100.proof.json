@@ -3,7 +3,7 @@
   "arch": "gfx1100",
   "builder_crate_version": "0.4.1",
   "builder_git_sha": "unknown",
-  "s_text_sha256": "3a43a3dbb58f33c215c04f59f100b9c8235d1d470ed1a5fe47e2ac6b29809831",
+  "s_text_sha256": "9d42b3ddf2bbed61b2c5ab5a421dea1ec134feecdf6568f8947d3b9513fb1db4",
   "kernels": [
     {
       "kernel_id": "qwen4_bf16_rows_gfx1100",
@@ -1466,7 +1466,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "d8f30d3e6a4cc5339d65a77c440660a1ba1c0ccca20aaf618817d742ed843f1e"
+      "s_text_sha256": "1e8ef57e4965b491813397a9146a009d3b05652e9cfe088d1678f9fbeea04a67"
     },
     {
       "kernel_id": "qwen4_bf16_rows_gfx1100",
@@ -4212,7 +4212,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "a421759a879e079ff5924d391d93faaa6b73cf607f5a7e3731b875abbe57a490"
+      "s_text_sha256": "4a5d022c7859efd58ef4c54b1525af79d3d8d1e6c6e3249e9e7ce76ed10dc419"
     }
   ]
 }

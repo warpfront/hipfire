@@ -454,7 +454,7 @@ fn validate_command(paths: &Paths, args: EmuValidateArgs) -> Result<()> {
     if let Some(line) = effective.log_line() {
         eprintln!("{line}");
     }
-    let daemon = crate::find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
+    let daemon = crate::find_daemon(paths).ok_or_else(|| crate::daemon_not_found_error(paths))?;
     let engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, None)
         .with_context(|| format!("failed to start a daemon with emu profile `{}`", args.id))?;
     engine.ping()?;

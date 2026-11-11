@@ -3008,6 +3008,7 @@ fn load_weights_inner(
         output,
         moe_has_mq6: layers_have_mq6_moe(&layers),
         layers,
+        mq3v2_symmetric: source.mq3v2_symmetric(),
         pager: None,
         lm_head_aliases_embd,
         ep_shard: None,
@@ -3038,7 +3039,15 @@ impl WeightSource for HfqSource<'_> {
     fn mq4v2_symmetric(&self) -> bool {
         self.hfq.mq4v2_symmetric()
     }
+    fn mq3v2_symmetric(&self) -> bool {
+        self.hfq.mq3v2_symmetric()
+    }
     fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
+        if self.hfq.mq3v2_symmetric() {
+            self.hfq
+                .validate_mq3v2_symmetric_groups()
+                .map_err(|msg| hip_bridge::HipError::new(1, &msg))?;
+        }
         // Single early file-level qt53 (MQ4G128V2) admission: wrong role,
         // mixed tier, AWQ, bad K or an unsupported mode fails here, before the
         // first upload of any resident, host-mapped or per-expert path.
@@ -5091,6 +5100,7 @@ pub fn load_weights_dense_tp_rank(
             output,
             moe_has_mq6: false,
             layers,
+            mq3v2_symmetric: gpu.mq3v2_symmetric,
             pager: None,
             lm_head_aliases_embd,
             ep_shard: None,
@@ -8171,6 +8181,7 @@ fn load_weights_ep_rank_inner(
         output: output.expect("staged EP output"),
         moe_has_mq6,
         layers,
+        mq3v2_symmetric: gpu.mq3v2_symmetric,
         pager: None,
         lm_head_aliases_embd,
         ep_shard: None,

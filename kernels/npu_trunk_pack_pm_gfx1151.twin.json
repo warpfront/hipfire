@@ -1,0 +1,186 @@
+{
+  "module": "npu_trunk_pack_pm_gfx1151",
+  "arch": "gfx1151",
+  "reports": [
+    {
+      "abi": {
+        "args": [
+          {
+            "name": "",
+            "offset": 0,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 8,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 16,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 24,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 28,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 32,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 36,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          }
+        ],
+        "compared_to_incumbent": true,
+        "incumbent_sha256": "d6337e8d134d40d85187f95b8debc4d2c7a3207c7fa5038663f7579c182b79bb",
+        "incumbent_symbol": "npu_trunk_pack_a_bf16",
+        "kernarg_segment_size": 40
+      },
+      "arch": "gfx1151",
+      "elf_bytes": 24152,
+      "elf_sha256": "2fb1331547e95bb3cc9345b67b14622a429ffae1cef5edde735678038eaac180",
+      "hazards": {
+        "advisory": 15,
+        "blocking": 0,
+        "checked": true,
+        "findings": 15,
+        "pm_ir_obligations": 0
+      },
+      "hxaco_bytes": 28248,
+      "hxaco_sha256": "38e16e5410a15532986565073ed722b1cc89945eafbc52a4bbc8158c276c0162",
+      "kernel": "npu_trunk_pack_a_bf16_pm",
+      "lds": 20576,
+      "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+      "rsrc2": 132,
+      "scratch": 0,
+      "sgprs": 20,
+      "text_bytes": 6784,
+      "text_sha256": "33b905ec30f54cf0cd09b9ea24d1f6d32406aaffd942b4ec5b78128dc06aaf5d",
+      "user_sgprs": 2,
+      "vgprs": 104,
+      "wavefront_size": 32
+    },
+    {
+      "abi": {
+        "args": [
+          {
+            "name": "",
+            "offset": 0,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 8,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 16,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 24,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 28,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 32,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 36,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          }
+        ],
+        "compared_to_incumbent": true,
+        "incumbent_sha256": "d6337e8d134d40d85187f95b8debc4d2c7a3207c7fa5038663f7579c182b79bb",
+        "incumbent_symbol": "npu_trunk_pack_a_bf16_k5120",
+        "kernarg_segment_size": 40
+      },
+      "arch": "gfx1151",
+      "elf_bytes": 24152,
+      "elf_sha256": "2fb1331547e95bb3cc9345b67b14622a429ffae1cef5edde735678038eaac180",
+      "hazards": {
+        "advisory": 25,
+        "blocking": 0,
+        "checked": true,
+        "findings": 25,
+        "pm_ir_obligations": 0
+      },
+      "hxaco_bytes": 28248,
+      "hxaco_sha256": "38e16e5410a15532986565073ed722b1cc89945eafbc52a4bbc8158c276c0162",
+      "kernel": "npu_trunk_pack_a_bf16_k5120_pm",
+      "lds": 41056,
+      "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+      "rsrc2": 132,
+      "scratch": 0,
+      "sgprs": 20,
+      "text_bytes": 11784,
+      "text_sha256": "812d6c31c54276fe6525b6741a5b043099ce117588b674b2a988873996d91943",
+      "user_sgprs": 2,
+      "vgprs": 224,
+      "wavefront_size": 32
+    }
+  ],
+  "judged_text_check": [
+    {
+      "symbol": "npu_trunk_pack_a_bf16_pm",
+      "judged_candidate": "incumbent-hipcc",
+      "judged_code_sha256": "33b905ec30f54cf0cd09b9ea24d1f6d32406aaffd942b4ec5b78128dc06aaf5d",
+      "twin_text_sha256": "33b905ec30f54cf0cd09b9ea24d1f6d32406aaffd942b4ec5b78128dc06aaf5d",
+      "equal": true
+    },
+    {
+      "symbol": "npu_trunk_pack_a_bf16_k5120_pm",
+      "judged_candidate": "incumbent-hipcc",
+      "judged_code_sha256": "812d6c31c54276fe6525b6741a5b043099ce117588b674b2a988873996d91943",
+      "twin_text_sha256": "812d6c31c54276fe6525b6741a5b043099ce117588b674b2a988873996d91943",
+      "equal": true
+    }
+  ]
+}

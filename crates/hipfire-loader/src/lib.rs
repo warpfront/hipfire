@@ -10,7 +10,15 @@ pub mod bench_topology;
 mod carriers;
 pub use carriers::*;
 pub mod decide;
+/// GGUF as a native model source (CPU side): parse, name map, per-tensor
+/// admission, byte extents, bpw census. Default-off (`HIPFIRE_GGUF_NATIVE=1`).
+pub mod gguf_native;
 mod qwen4_slab;
+pub mod topology_caps;
+pub use topology_caps::{
+    pp_degree_refusal, topology_axes_refusal, EpCaps, PpBenchRoute, PpCaps, PpExecutor,
+    TopologyCaps, TpCaps,
+};
 
 /// Speculative-decode build/glue (RAII slot guard now; `DflashSpeculator` +
 /// `build_speculator` at Stages 1-2). Lives here at the top of the DAG where
@@ -20,6 +28,7 @@ pub mod spec_build;
 #[cfg(target_os = "linux")]
 pub use hipfire_arch_qwen4::npu_trunk::set_diagnostic_gpu_route;
 
+use crate::bench_topology::EpKind;
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
@@ -31,6 +40,7 @@ use hipfire_arch_qwen35::qwen35::{self};
 use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
+use hipfire_arch_raon as raon;
 use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::device_mesh::DimKind;
@@ -49,20 +59,15 @@ use std::path::Path;
 
 /// Plain-language refusal for a model family that cannot be split across GPUs
 /// in pipeline mode. `family` is the carrier name (kept as the stable prefix),
-/// `pp` is the requested degree. Names the setting that fixes it.
+/// `pp` is the requested degree. Names the setting that fixes it. Delegates to
+/// the shared builder so pp/ep/tp refusals read the same.
 pub(crate) fn pp_unsupported_message(family: &str, is_dir: bool, pp: usize) -> String {
-    if is_dir {
-        format!(
-            "{family}: a safetensors model directory cannot be split across GPUs in pipeline \
-             mode (topology.pp = {pp}). Set topology.pp = 1 to load it on one GPU, or convert it \
-             to a packed .hfq file first"
-        )
-    } else {
-        format!(
-            "{family}: this model family cannot be split across GPUs in pipeline mode \
-             (topology.pp = {pp}). Set topology.pp = 1 to load it on one GPU"
-        )
-    }
+    hipfire_runtime::loader_api::topology_refusal(
+        family,
+        hipfire_runtime::loader_api::TopologyAxis::Pipeline,
+        pp,
+        is_dir,
+    )
 }
 
 pub trait Carrier: Send + Sync {
@@ -80,28 +85,110 @@ pub trait Carrier: Send + Sync {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String>;
     /// Read-only admission refusal for a topology/shape combination this
-    /// carrier cannot serve. Runs before any allocation or collective so a
-    /// refusal leaves no side effect (device-mesh G2 admission). Default:
-    /// pipeline-parallel (pp>1) is unsupported; HFQ and Dir get distinct
-    /// messages matching each carrier's load-time refusal. Qwen3.5 overrides —
-    /// it is the only carrier with a pp>1 path (`load_qwen35_pp`).
+    /// carrier cannot serve beyond what [`Carrier::topology_caps`] already
+    /// decided. Runs before any allocation or collective so a refusal leaves
+    /// no side effect (device-mesh G2 admission). The axis verdicts (an
+    /// undeclared `topology.pp` / `topology.ep` / `--tp N`, directory sources
+    /// on an HFQ-only axis, the declared pipeline degree bound) are the
+    /// admission front door's, keyed on the declaration; the default accepts.
     fn admit_topology(
         &self,
         _arch_id: u32,
-        is_dir: bool,
-        pp: usize,
+        _is_dir: bool,
+        _pp: usize,
         _kv_backend: KvBackend,
     ) -> Result<(), String> {
-        if pp > 1 {
-            return Err(pp_unsupported_message(self.name(), is_dir, pp));
-        }
         Ok(())
+    }
+
+    /// The multi-GPU axes this carrier declares (`topology.pp`,
+    /// `topology.ep`, `--tp N`). Default: none, so every multi-card request
+    /// is refused at admission with the uniform topology sentence.
+    fn topology_caps(&self) -> TopologyCaps {
+        TopologyCaps::default()
+    }
+
+    /// Layer count the pipeline bands partition. Default: the generic source
+    /// metadata (`n_layers` of the HFQ metadata JSON / directory config).
+    fn pp_layer_count(&self, src: &ModelSource) -> Result<usize, String> {
+        admission::source_n_layers(src).ok_or_else(|| {
+            format!(
+                "{} pipeline admission: layer count unavailable",
+                self.name()
+            )
+        })
+    }
+
+    /// The mesh axis `--tp N` shards over for this source: [`DimKind::Ep`] for
+    /// a MoE model (experts sharded), [`DimKind::Tp`] for a dense one. May
+    /// refuse a degree the model cannot be sharded at. Only called for
+    /// carriers that declare `tp`.
+    fn tp_mesh_axis(&self, src: &ModelSource, tp: usize) -> Result<DimKind, String> {
+        Err(hipfire_runtime::loader_api::topology_refusal(
+            self.name(),
+            hipfire_runtime::loader_api::TopologyAxis::Tp,
+            tp,
+            src.is_dir(),
+        ))
+    }
+
+    /// Load an admitted `--tp N` source (expert/tensor parallel). Only called
+    /// for carriers that declare `tp`; the default is the uniform refusal.
+    fn load_tp(
+        &self,
+        _admission: admission::SourceAdmission,
+        args: TpLoadArgs<'_>,
+    ) -> Result<LoadedModel, String> {
+        Err(hipfire_runtime::loader_api::topology_refusal(
+            self.name(),
+            hipfire_runtime::loader_api::TopologyAxis::Tp,
+            args.tp,
+            false,
+        ))
+    }
+
+    /// `load_model_ep_with_compressor_cache`'s per-carrier route: an explicit
+    /// DeepSeek V4 compressor-cache policy. Only called for carriers that
+    /// declare `tp`; a carrier the setting does not apply to refuses it
+    /// with its own sentence.
+    fn load_tp_with_compressor_cache(
+        &self,
+        _path: &str,
+        _max_seq: usize,
+        tp: usize,
+        _compressor_cache: hipfire_config::Deepseek4CompressorCache,
+    ) -> Result<LoadedModel, String> {
+        Err(hipfire_runtime::loader_api::topology_refusal(
+            self.name(),
+            hipfire_runtime::loader_api::TopologyAxis::Tp,
+            tp,
+            false,
+        ))
+    }
+
+    /// Weight-slab packing of this carrier's load on a device of `gpu_arch`
+    /// when `HIPFIRE_WEIGHT_SLAB` is unset (`None`: the global default).
+    fn weight_slab_default(&self, _gpu_arch: &str) -> Option<hip_bridge::SlabMode> {
+        None
     }
 
     /// Read-only, per-carrier request-option refusal before GPU allocation.
     /// The default leaves other architectures' option behavior unchanged.
     fn admit_options(
         &self,
+        _draft_path: Option<&str>,
+        _options: admission::SourceAdmissionOptions,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Read-only, per-carrier request-option refusal for a `topology.pp` > 1
+    /// load, run at admission (before any previous model is torn down or a
+    /// device is touched) for every carrier that declares a pipeline route.
+    /// Default: no extra refusal.
+    fn admit_pp_options(
+        &self,
+        _pp: usize,
         _draft_path: Option<&str>,
         _options: admission::SourceAdmissionOptions,
     ) -> Result<(), String> {
@@ -149,7 +236,11 @@ pub trait Carrier: Send + Sync {
         _state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        Err(format!("{}: spec-decode target unsupported", self.name()))
+        Err(format!(
+            "{}: spec-decode target unsupported; load without speculation: --spec off \
+             (speculation.mode = \"off\")",
+            self.name()
+        ))
     }
 
     /// Construct this model's per-token spec-decode emitter from the
@@ -160,7 +251,11 @@ pub trait Carrier: Send + Sync {
         &self,
         _ctx: SpecEmitCtx<'a>,
     ) -> Result<Box<dyn SpecEmit + 'a>, String> {
-        Err(format!("{}: spec emitter unsupported", self.name()))
+        Err(format!(
+            "{}: spec emitter unsupported; load without speculation: --spec off \
+             (speculation.mode = \"off\")",
+            self.name()
+        ))
     }
 
     // ── GenDispatch (wave2) — arch-erased generation/bench hooks ──────────
@@ -364,6 +459,7 @@ pub enum BenchDecodeRoute {
     Gemma4,
     MuseGlimmer,
     Qwen4,
+    Raon,
     Unsupported,
 }
 pub fn bench_decode_route(arch_id: u32) -> BenchDecodeRoute {
@@ -374,6 +470,7 @@ pub fn bench_decode_route(arch_id: u32) -> BenchDecodeRoute {
         13 => BenchDecodeRoute::Gemma4,
         14 => BenchDecodeRoute::MuseGlimmer,
         16 => BenchDecodeRoute::Qwen4,
+        19 => BenchDecodeRoute::Raon,
         _ => BenchDecodeRoute::Unsupported,
     }
 }
@@ -395,6 +492,7 @@ pub fn arch_label(arch_id: u32) -> &'static str {
         16 => "qwen4",
         17 => "qwen3_5_embed",
         18 => "embedding_gemma2",
+        19 => "raon1_mini",
         40 => "flux_mmdit",
         45 => "flux2_mmdit",
         _ => "qwen3",
@@ -511,34 +609,52 @@ impl WireVerb {
     }
 }
 
-/// EP prompt construction route. DeepSeek4 (arch 9) uses the DSML prompt
-/// builder; all other EP arches (10 MiniMax, etc.) use Jinja.
+/// EP prompt construction route. DeepSeek4 uses the DSML prompt builder; every
+/// other EP server (MiniMax, Qwen3.5) uses Jinja.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EpPromptRoute {
     Dsml,
     Jinja,
 }
-pub fn ep_prompt_route(arch_id: u32) -> EpPromptRoute {
-    match arch_id {
-        9 => EpPromptRoute::Dsml,
-        _ => EpPromptRoute::Jinja,
-    }
-}
 
-/// EP EOS token selection route. MiniMax (10) carries its own EOS; all others
-/// (including DeepSeek4) use `deepseek4_eos_tok`.
+/// EP EOS token selection route. MiniMax carries its own EOS; Qwen3.5 (MoE EP
+/// and dense TP) its own; DeepSeek4 uses `deepseek4_eos_tok`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EpEosRoute {
     Deepseek4,
     Minimax,
     Qwen35,
 }
-pub fn ep_eos_route(arch_id: u32) -> EpEosRoute {
-    match arch_id {
-        10 => EpEosRoute::Minimax,
-        5 | 6 => EpEosRoute::Qwen35,
-        _ => EpEosRoute::Deepseek4,
+
+impl EpKind {
+    /// Prompt route of this server kind.
+    pub fn prompt_route(self) -> EpPromptRoute {
+        match self {
+            EpKind::Ds4 => EpPromptRoute::Dsml,
+            EpKind::Minimax | EpKind::Qwen35Moe | EpKind::Qwen35DenseTp => EpPromptRoute::Jinja,
+        }
     }
+
+    /// EOS route of this server kind.
+    pub fn eos_route(self) -> EpEosRoute {
+        match self {
+            EpKind::Ds4 => EpEosRoute::Deepseek4,
+            EpKind::Minimax => EpEosRoute::Minimax,
+            EpKind::Qwen35Moe | EpKind::Qwen35DenseTp => EpEosRoute::Qwen35,
+        }
+    }
+}
+
+/// Prompt route of the loaded EP server (`None`: no EP state, the Jinja
+/// default).
+pub fn ep_prompt_route(ep: Option<&EpArch>) -> EpPromptRoute {
+    ep.map_or(EpPromptRoute::Jinja, |ep| ep.kind().prompt_route())
+}
+
+/// EOS route of the loaded EP server (`None`: no EP state, the DeepSeek4
+/// default read).
+pub fn ep_eos_route(ep: Option<&EpArch>) -> EpEosRoute {
+    ep.map_or(EpEosRoute::Deepseek4, |ep| ep.kind().eos_route())
 }
 
 /// Early generation short-circuit route (Gemma4 eager, Glimmer eager).
@@ -577,6 +693,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &FluxDiffusionCarrier,
     &Qwen35EmbedCarrier,
     &EmbeddingGemma2Carrier,
+    &RaonCarrier,
 ];
 
 // ─── Constants ────────────────────────────────────────────────────────
@@ -888,6 +1005,7 @@ pub struct Deepseek4HeterogeneousBundle {
 /// (orphan rule). Field-identical to the prior loader-local struct. `eos_tok` is
 /// resolved at load time and rides along so the generate path doesn't re-tokenize.
 pub use lfm2moe::Lfm2MoeBundle;
+pub use raon::RaonBundle;
 
 /// MiniMax-M2 (arch_id=10) GPU bundle. Re-exported from the arch crate, which
 /// owns it so `impl SpecTarget for MiniMaxBundle` (the n-gram verify seam) can
@@ -1377,6 +1495,53 @@ impl LoadedModel {
             .and_then(|s| (s as &mut dyn Any).downcast_mut::<Lfm2MoeBundle>())
     }
 
+    /// Raon-1-mini bundle if this model is arch_id=19, else None.
+    pub fn raon(&self) -> Option<&RaonBundle> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<RaonBundle>())
+    }
+
+    pub fn raon_mut(&mut self) -> Option<&mut RaonBundle> {
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<RaonBundle>())
+    }
+
+    /// The Raon pipeline mesh model (`topology.pp` > 1) if this model is one.
+    pub fn raon_mesh(&self) -> Option<&hipfire_arch_raon::RaonMeshModel> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<hipfire_arch_raon::RaonMeshModel>())
+    }
+
+    /// The Raon pipeline mesh model and its generic `Gpus` as disjoint borrows
+    /// (`state` and `pp_gpus` are separate fields), for generation closures
+    /// that need both at once. `None` unless this is a Raon mesh whose
+    /// `pp_gpus` is present.
+    pub fn raon_mesh_mut(&mut self) -> Option<(&mut hipfire_arch_raon::RaonMeshModel, &mut Gpus)> {
+        let model = self
+            .state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_raon::RaonMeshModel>())?;
+        let gpus = self.pp_gpus.as_mut()?;
+        Some((model, gpus))
+    }
+
+    /// [`ArchModel::reset_session_state`] of the loaded model, through the
+    /// mesh devices when the model owns a mesh lifecycle
+    /// ([`ArchModel::owns_mesh_lifecycle`]) and its `pp_gpus` are present.
+    pub fn reset_arch_session_state(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+        let Self { state, pp_gpus, .. } = self;
+        match (state.as_deref_mut(), pp_gpus.as_mut()) {
+            (Some(model), Some(gpus)) if model.owns_mesh_lifecycle() => {
+                model.reset_session_state_mesh(gpu, gpus)
+            }
+            (Some(model), _) => model.reset_session_state(gpu),
+            (None, _) => Ok(()),
+        }
+    }
+
     /// MiniMax-M2 bundle if this model is arch_id=10, else None.
     pub fn minimax(&self) -> Option<&MiniMaxBundle> {
         self.state
@@ -1677,6 +1842,16 @@ pub enum EpArch {
 }
 
 impl EpArch {
+    /// Which expert-/tensor-sharded server this load is.
+    pub fn kind(&self) -> EpKind {
+        match self {
+            EpArch::Ds4 { .. } => EpKind::Ds4,
+            EpArch::Minimax { .. } => EpKind::Minimax,
+            EpArch::Qwen35 { .. } => EpKind::Qwen35Moe,
+            EpArch::Qwen35DenseTp { .. } | EpArch::Qwen35MeshTp { .. } => EpKind::Qwen35DenseTp,
+        }
+    }
+
     /// Whether this EP load's serve loop applies a request's repeat, presence
     /// and frequency penalties to its logits. The Qwen3.5 loops (dense TP on
     /// either route, MoE EP) do, over rank 0's logits with the single-GPU host
@@ -2114,6 +2289,142 @@ pub(crate) fn parse_state_quant(
 
 // ─── Core arch carrier load ─────────────────────────────────────────────
 
+/// What the whole Qwen load left on the card, measured by
+/// [`qwen35_post_load_fit`].
+struct Qwen35PostLoadFit {
+    /// Free VRAM after every load-time owner exists.
+    free: usize,
+    /// Per-request prefill transient: the minimum prefill reservation (incl.
+    /// the widened-PBS headroom) plus VMM page slack.
+    prefill: usize,
+    /// DeltaNet checkpoint rings a request can fill ([`Qwen35LazyCharges`]).
+    checkpoints: usize,
+    /// Native-MTP per-request owners ([`Qwen35LazyCharges`]).
+    mtp: usize,
+    /// `prefill + checkpoints + mtp`: kept free of KV mapping.
+    transient: usize,
+    /// Largest context whose remaining KV mapping plus `transient` fits `free`.
+    fit: usize,
+    /// Bytes still to map for `cap` tokens (reported as a per-token rate).
+    growth_at_cap: usize,
+}
+
+/// Owners a request creates lazily after the load, which no load-time
+/// allocation shows up for but which a filled context must still find room
+/// for (they came out of the KV room as `hipMalloc` failures at fill).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Qwen35LazyCharges {
+    /// DeltaNet checkpoint rings: one charged `snapshot_bytes` per ring.
+    checkpoints: usize,
+    /// Native MTP `MtpSpecState` (first request) + prompt-fill transient.
+    mtp: usize,
+}
+
+/// Bytes of the checkpoint rings one load can populate at once.
+///
+/// Each snapshot mirrors `dn_state` ([`DeltaNetSnapshot::bytes_for`]); only the
+/// first of a ring is charged. `take_dn_checkpoint` adds further ones (up to
+/// the cap, `HIPFIRE_CACHE_CKPT_MAX`) only from memory the admitted context
+/// does not need (`Gpu::kv_fit_floor`). Two rings can be live together: the AR
+/// prefill ring (`LoadedModel.prefill_checkpoints`, gated by
+/// `HIPFIRE_CACHE_CKPT_RESUME` != 0, cap `ckpt_max()`) and, when a DFlash or
+/// native-MTP speculator is attached, that speculator's own ring (gated by
+/// `HIPFIRE_DFLASH_CKPT_RESUME`, i.e. `mtp_cache_policy().checkpoint_resume`,
+/// cap = the same `HIPFIRE_CACHE_CKPT_MAX` knob). `ckpt_max()`,
+/// `mtp_cache_policy().checkpoint_cap` and the DFlash builder all read that
+/// one knob with default 8 and floor 1, so a single `cap` serves every ring.
+fn qwen35_checkpoint_ring_bytes(snapshot_bytes: usize, speculator_ring: bool) -> usize {
+    let policy = hipfire_config::mtp_cache_policy();
+    let ar_ring = hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_RESUME")
+        .ok()
+        .as_deref()
+        != Some("0");
+    let rings = usize::from(ar_ring) + usize::from(speculator_ring && policy.checkpoint_resume);
+    snapshot_bytes.saturating_mul(rings)
+}
+
+/// [`Qwen35LazyCharges`] for this load. `mtp` is the native-MTP head (and the
+/// requested chain depth) only when the MTP speculator is the one attached.
+fn qwen35_lazy_charges(
+    config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
+    dn_state: &hipfire_arch_qwen35::qwen35::DeltaNetState,
+    gpu: &Gpu,
+    speculator_ring: bool,
+    mtp: Option<(&hipfire_arch_qwen35::mtp_head::Qwen35MtpHead, usize)>,
+) -> Result<Qwen35LazyCharges, String> {
+    let snapshot_bytes = usize::try_from(DeltaNetSnapshot::bytes_for(dn_state))
+        .map_err(|_| "DeltaNet snapshot sizing overflow".to_string())?;
+    let checkpoints = qwen35_checkpoint_ring_bytes(snapshot_bytes, speculator_ring);
+    let mtp = match mtp {
+        None => 0,
+        Some((head, requested_k)) => {
+            use hipfire_arch_qwen35::mtp_spec::{
+                mtp_head_fills_batched, mtp_prompt_fill_requested_bytes, MtpSpecState,
+            };
+            let max_n = hipfire_arch_qwen35::mtp_speculator::mtp_drafter_max_n(requested_k);
+            let verify_capacity = hipfire_arch_qwen35::mtp_speculator::mtp_verify_capacity(max_n);
+            let state = MtpSpecState::requested_bytes(
+                &gpu.arch,
+                config,
+                snapshot_bytes,
+                &head.config,
+                head.weights.compressed_vocab_size,
+                max_n,
+                verify_capacity,
+            )?;
+            let fill = mtp_prompt_fill_requested_bytes(
+                config,
+                &head.config,
+                mtp_head_fills_batched(head),
+                hipfire_arch_qwen35::qwen35::prefill_max_batch(gpu),
+            );
+            state.saturating_add(fill)
+        }
+    };
+    Ok(Qwen35LazyCharges { checkpoints, mtp })
+}
+
+/// Measured fit of the single-card Qwen VMM cache after the full load
+/// (weights, KV owners' initial prefix, DeltaNet, scratch, drafts). The
+/// carrier's pre-KV `card_cap` is provisional: it cannot charge what is
+/// allocated afterwards. `free` honours the UMA clamp and the emulation cap.
+/// `lazy` charges the per-request owners created after the load, so
+/// `free - transient` is real KV room.
+fn qwen35_post_load_fit(
+    config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
+    kv: &llama::KvCache,
+    gpu: &Gpu,
+    cap: usize,
+    lazy: Qwen35LazyCharges,
+) -> Result<Qwen35PostLoadFit, String> {
+    let (free, _) = gpu
+        .device_mem_info()
+        .map_err(|e| format!("Qwen post-load VRAM query: {e}"))?;
+    let minimum =
+        hipfire_arch_qwen35::qwen35::prefill::minimum_prefill_reservation_bytes(config, &gpu.arch)
+            .ok_or("Qwen minimum PBS sizing overflow")?;
+    // Same page-rounding slack the carrier's `card_cap` keeps.
+    let prefill = minimum.saturating_add(128 << 20);
+    let transient = prefill
+        .saturating_add(lazy.checkpoints)
+        .saturating_add(lazy.mtp);
+    let growth = |t: usize| {
+        kv.planned_mapped_growth_bytes(gpu, t)
+            .map_err(|e| format!("Qwen KV growth plan for {t} tokens: {e}"))
+    };
+    let fit = admission::qwen35_measured_fit(free, transient, cap, growth)?;
+    let growth_at_cap = growth(cap)?;
+    Ok(Qwen35PostLoadFit {
+        free,
+        prefill,
+        checkpoints: lazy.checkpoints,
+        mtp: lazy.mtp,
+        transient,
+        fit,
+        growth_at_cap,
+    })
+}
+
 /// Hard-error free for unfinished qwen35 finish path: bundle + optional VL.
 ///
 /// `free_qwen35_bundle` returns every buffer to the GPU pool; only a drain
@@ -2364,6 +2675,10 @@ fn finish_qwen35_load(
         eprintln!(
             "  kv_adaptive engaged — suppressing generic speculator path (DSpark/DFlash/n-gram/bundled MTP-spec)"
         );
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::SpecOff,
+            "kv_adaptive suppresses speculation",
+        );
     }
 
     // ── DSpark sidecar (wins over DFlash/MTP/n-gram) ───────────────
@@ -2426,6 +2741,10 @@ fn finish_qwen35_load(
                                         ctx.gpu,
                                     ) {
                                         Ok(body) => {
+                                            hipfire_config::load_summary::note(
+                                                hipfire_config::load_summary::Facet::SpecOn,
+                                                format!("dspark (block {block})"),
+                                            );
                                             Some(hipfire_runtime::dspark_core::build_dspark_speculator(
                                             body,
                                             dspark_weights,
@@ -2442,6 +2761,10 @@ fn finish_qwen35_load(
                                             eprintln!(
                                                 "  qwen35: DSpark body build failed: {e} — AR/other"
                                             );
+                                            hipfire_config::load_summary::note(
+                                                hipfire_config::load_summary::Facet::SpecOff,
+                                                format!("DSpark body build failed: {e}"),
+                                            );
                                             None
                                         }
                                     }
@@ -2450,16 +2773,28 @@ fn finish_qwen35_load(
                                     eprintln!(
                                         "  qwen35: DSpark sidecar {p:?} has no dspark_* metadata — skipping"
                                     );
+                                    hipfire_config::load_summary::note(
+                                        hipfire_config::load_summary::Facet::SpecOff,
+                                        "DSpark sidecar failed: no dspark_* metadata",
+                                    );
                                     None
                                 }
                                 Err(e) => {
                                     eprintln!("  qwen35: WARNING DSpark sidecar load failed: {e}");
+                                    hipfire_config::load_summary::note(
+                                        hipfire_config::load_summary::Facet::SpecOff,
+                                        format!("DSpark sidecar failed: {e}"),
+                                    );
                                     None
                                 }
                             }
                         }
                         Err(e) => {
                             eprintln!("  qwen35: WARNING cannot open DSpark sidecar {p:?}: {e}");
+                            hipfire_config::load_summary::note(
+                                hipfire_config::load_summary::Facet::SpecOff,
+                                format!("DSpark sidecar failed: cannot open: {e}"),
+                            );
                             None
                         }
                     }
@@ -2516,6 +2851,17 @@ fn finish_qwen35_load(
                     s.draft_config.block_size,
                     s.block_size
                 );
+                hipfire_config::load_summary::note(
+                    hipfire_config::load_summary::Facet::SpecOn,
+                    format!(
+                        "dflash (draft {}, block {})",
+                        Path::new(dp)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| dp.to_string()),
+                        s.block_size
+                    ),
+                );
                 Some(s)
             }
             Err(e) => {
@@ -2532,6 +2878,10 @@ fn finish_qwen35_load(
                 eprintln!(
                     "  DFlash draft load failed ({}): {} — falling back to AR only",
                     dp, e
+                );
+                hipfire_config::load_summary::note(
+                    hipfire_config::load_summary::Facet::SpecOff,
+                    format!("DFlash draft load failed: {e}"),
                 );
                 None
             }
@@ -2576,6 +2926,20 @@ fn finish_qwen35_load(
     let cpu_deferred_moe = bundle.weights.has_cpu_deferred_experts();
     let (host_mapped_expert_blobs, host_mapped_expert_bytes) =
         hipfire_arch_qwen35::qwen35::host_mapped_expert_accounting(&bundle.weights.layers);
+    if host_mapped_expert_blobs > 0 {
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::Placement,
+            format!(
+                "experts: {host_mapped_expert_blobs} expert blobs ({:.1} GiB) host-mapped ({})",
+                host_mapped_expert_bytes as f64 / (1u64 << 30) as f64,
+                if cpu_deferred_moe {
+                    "offload_exec=cpu"
+                } else {
+                    "offload_exec=pcie"
+                },
+            ),
+        );
+    }
     // Same shared policy as the slots arming site: `auto` (typed `None`)
     // declines over a host-mapped spill, `on` (`Some(true)`) arms, `off`
     // (`Some(false)`) stays AR via the gate below. qwen35's admitted list is
@@ -2616,6 +2980,18 @@ fn finish_qwen35_load(
                 },
             )
         );
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::SpecOff,
+            format!(
+                "MTP off: {host_mapped_expert_blobs} expert blobs host-mapped ({:.2} GiB, {})",
+                host_mapped_expert_bytes as f64 / (1u64 << 30) as f64,
+                if cpu_deferred_moe {
+                    "offload_exec=cpu"
+                } else {
+                    "offload_exec=pcie"
+                },
+            ),
+        );
     }
     if mtp_floor_declined
         && !adaptive_blocks_generic_spec
@@ -2624,6 +3000,10 @@ fn finish_qwen35_load(
         && dspark_speculator.is_none()
     {
         eprintln!("{}", hipfire_config::mtp_no_floor_decline_line("qwen35"));
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::SpecOff,
+            "MTP off: no measured AR floor (speculation.mtp=auto)",
+        );
     }
     // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then .mtp sidecar) ──
     // Precedence: DSpark > DFlash > MTP > n-gram. Gate: only arch 5/6, no adaptive/eviction,
@@ -2670,15 +3050,30 @@ fn finish_qwen35_load(
                         ctx.gpu,
                     ));
                 }
-                if !errors.is_empty() {
+                if errors.is_empty() {
+                    hipfire_config::load_summary::note(
+                        hipfire_config::load_summary::Facet::SpecOff,
+                        "MTP off: model has no MTP head (no bundled trailer or .mtp sidecar)",
+                    );
+                } else {
                     eprintln!(
                         "  MTP head not loaded: {} — falling back to AR/n-gram",
                         errors.join("; ")
+                    );
+                    hipfire_config::load_summary::note(
+                        hipfire_config::load_summary::Facet::SpecOff,
+                        format!("MTP head not loaded: {}", errors.join("; ")),
                     );
                 }
             }
             resolved
         };
+    if matches!(arch_id, 5 | 6) && ctx.spec.mtp == Some(false) {
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::SpecOff,
+            "MTP off: speculation.mtp=off",
+        );
+    }
     if mtp.is_some() {
         if let Some(reason) = hipfire_arch_qwen35::qwen35::weights::native_mtp_refusal(
             &bundle.weights.layers,
@@ -2722,6 +3117,42 @@ fn finish_qwen35_load(
     if mtp_present && ctx.spec.mtp == Some(true) {
         eprintln!("  qwen35 MTP: armed explicitly (speculation.mtp=on / --spec mtp)");
     }
+    // Drafts that actually loaded (named in the post-load fit line).
+    let drafts_attached = {
+        let mut names = Vec::new();
+        if dflash.is_some() {
+            names.push("dflash");
+        }
+        if mtp_present {
+            names.push("mtp");
+        }
+        if dspark_speculator.is_some() {
+            names.push("dspark");
+        }
+        if names.is_empty() {
+            "none".to_string()
+        } else {
+            names.join("+")
+        }
+    };
+    // Per-request owners the speculator/AR paths create lazily, charged to the
+    // post-load fit below. `build_speculator` order: DSpark > DFlash > MTP >
+    // n-gram; the MTP head is only attached when none of the earlier arms is
+    // and eviction is off (the same guard `build_speculator` re-asserts).
+    let lazy_charges = {
+        let spec_slot_free = !adaptive_blocks_generic_spec && dspark_speculator.is_none();
+        let mtp_attaches = spec_slot_free && dflash.is_none() && eviction.is_none();
+        let speculator_ring = spec_slot_free
+            && eviction.is_none()
+            && (dflash.is_some() || (mtp_attaches && mtp.is_some()));
+        let mtp_sizing = if mtp_attaches && matches!(arch_id, 5 | 6) {
+            mtp.as_ref()
+                .map(|head| (head, crate::spec_build::mtp_requested_k(&ctx.spec)))
+        } else {
+            None
+        };
+        qwen35_lazy_charges(config, dn_state, &*ctx.gpu, speculator_ring, mtp_sizing)
+    };
     // Pick the arch-generic speculator: a loaded DFlash draft → DflashSpeculator,
     // else an MTP head → MtpSpeculator<Qwen35MtpDrafter>, else (opt-in) the
     // model-free n-gram drafter. `eviction` is borrowed (not moved) here so it is
@@ -2750,6 +3181,84 @@ fn finish_qwen35_load(
         }
     }
 
+    // ── Measured post-load fit ─────────────────────────────────────
+    // Every load-time owner (KV prefix, DeltaNet, scratch, DFlash/MTP/DSpark,
+    // eviction) exists now, so free VRAM is the true room left for mapping KV
+    // and for the per-request prefill transient. The carrier's pre-KV
+    // `card_cap` could not charge any of it. Owners already built stay as
+    // built (they are only larger than needed).
+    let mut physical_cap = physical_cap;
+    let mut fit_refusal: Option<String> = None;
+    // A later (or non-Qwen) load must never inherit a previous load's floor.
+    ctx.gpu.kv_fit_floor = None;
+    if let Some(mut seq) = ctx.sequence {
+        if bundle.kv_cache.uses_vmm_backend() {
+            let lazy = lazy_charges.clone();
+            match lazy.and_then(|lazy| {
+                qwen35_post_load_fit(config, &bundle.kv_cache, &*ctx.gpu, physical_cap, lazy)
+            }) {
+                Err(e) => fit_refusal = Some(e),
+                Ok(m) => {
+                    let requested = ctx.max_seq;
+                    let per_token = m.growth_at_cap / physical_cap.max(1);
+                    let verdict = if seq.automatic {
+                        if m.fit >= physical_cap {
+                            format!("{requested} unchanged")
+                        } else if m.fit < admission::QWEN35_MIN_AUTO_CONTEXT {
+                            fit_refusal = Some(format!(
+                                "Qwen VMM load refused: after the weights, drafts ({drafts_attached}) and scratch loaded, {} tokens fit (free {} B, per-request reserve {} B = prefill {} + DeltaNet checkpoints {} + MTP {}), below the minimum automatic context {}; free GPU memory, disable the draft (speculation.dflash off), or use a smaller quantization of this model",
+                                m.fit,
+                                m.free,
+                                m.transient,
+                                m.prefill,
+                                m.checkpoints,
+                                m.mtp,
+                                admission::QWEN35_MIN_AUTO_CONTEXT
+                            ));
+                            format!("{requested} -> refused")
+                        } else {
+                            physical_cap = m.fit;
+                            ctx.max_seq = ctx.max_seq.min(m.fit);
+                            seq.card_cap = m.fit;
+                            ctx.sequence = Some(seq);
+                            format!("{requested} -> {}", m.fit)
+                        }
+                    } else if requested.min(physical_cap) > m.fit {
+                        let message = format!(
+                            "max_seq {requested} does not fit this card: after the weights, drafts and scratch loaded, {} tokens fit (free {} B, per-request reserve {} B = prefill {} + DeltaNet checkpoints {} + MTP {}); lower memory.max_seq to at most {} or omit it for automatic sizing",
+                            m.fit, m.free, m.transient, m.prefill, m.checkpoints, m.mtp, m.fit
+                        );
+                        if hipfire_config::oom_guard_mode() == hipfire_config::OomGuardMode::Off {
+                            eprintln!("warning: {message} (memory.oom_guard off: loading anyway)");
+                            format!("{requested} kept (exceeds fit {}; oom_guard off)", m.fit)
+                        } else {
+                            fit_refusal = Some(message);
+                            format!("{requested} -> refused")
+                        }
+                    } else {
+                        format!("{requested} unchanged")
+                    };
+                    eprintln!(
+                        "max_seq fit: measured after full load: free={} transient={} (prefill {} + checkpoints {} + mtp {}) kv_mapped_growth_per_token≈{per_token} drafts={drafts_attached} ; context {verdict}",
+                        m.free, m.transient, m.prefill, m.checkpoints, m.mtp
+                    );
+                    hipfire_config::load_summary::note(
+                        hipfire_config::load_summary::Facet::ContextFit,
+                        match verdict.strip_suffix(" unchanged") {
+                            Some(_) => "measured fit unchanged".to_string(),
+                            None => format!("measured fit {verdict}"),
+                        },
+                    );
+                    // Further DeltaNet checkpoints yield to the admitted context.
+                    ctx.gpu.kv_fit_floor = Some(rdna_compute::KvFitFloor {
+                        admitted_tokens: ctx.max_seq.min(physical_cap),
+                        reserve_bytes: m.transient,
+                    });
+                }
+            }
+        }
+    }
+
     // Move adaptive controller out of the bundle before parking the rest in
     // `Box<dyn ArchModel>`. LoadedModel.kv_adaptive is the runtime home for downshift hooks.
     let mut bundle = bundle;
@@ -2774,6 +3283,14 @@ fn finish_qwen35_load(
         )
     };
     model.mtp_weights_present = mtp_present;
+    if let Some(message) = fit_refusal {
+        // The speculator, eviction and bundle are all owned by `model` now:
+        // the regular unload path frees every one of them.
+        return Err(match unload_model(model, ctx.gpu) {
+            Ok(()) => message,
+            Err(e) => format!("{message}; cleanup also failed: {e}"),
+        });
+    }
     Ok(model)
 }
 
@@ -3259,6 +3776,7 @@ fn resolve_route_plan(
         hipcc_extra_flags: &gpu.flags.hipcc_extra_flags,
         flags: &gpu.flags,
         route_axes: &axes,
+        hc8_sidecar: false,
     })
     .map_err(|e| format!("{e:?}"))?;
     Ok((plan, spec, seal))
@@ -3326,6 +3844,14 @@ fn resolve_qwen4_route_plan(
     {
         return Err("trunk overlay".into());
     }
+    // An applied `.hc8` sidecar adds its PM image to the walked plan (`RouteKernelInput::hc8_sidecar`).
+    let hc8_sidecar = hipfire_arch_qwen4::resolve_hc8_sidecar(
+        hfq,
+        Path::new(req.path),
+        gpu.flags.qwen4_hc8_enabled(),
+        &receipt.config,
+    )?
+    .is_some();
     let kv_mode = req
         .kv_mode_override
         .filter(|s| !s.is_empty())
@@ -3390,6 +3916,7 @@ fn resolve_qwen4_route_plan(
         hipcc_extra_flags: &gpu.flags.hipcc_extra_flags,
         flags: &gpu.flags,
         route_axes: &axes,
+        hc8_sidecar: hc8_sidecar,
     })
     .map_err(|e| format!("{e:?}"))?;
     Ok((plan, spec, seal))
@@ -3718,6 +4245,8 @@ pub fn load_admitted_with_gemma4_drafter(
     } = admission;
     let carrier =
         carrier.ok_or_else(|| "single/pp admission must resolve a carrier".to_string())?;
+    // The admitted-context floor is per load: a later (non-Qwen) load never inherits it.
+    gpu.kv_fit_floor = None;
     ensure_vmm_ready_for_load(gpu)?;
     warn_kho_scratch_once(gpu.is_uma());
     let rec_sampling = match &source {
@@ -3801,7 +4330,14 @@ pub fn load_admitted_with_gemma4_drafter(
         xdna: None,
         batch_request,
     };
-    let mut result = match carrier.load(source, &mut ctx) {
+    // Weight uploads of this load are packed into slabs per
+    // `HIPFIRE_WEIGHT_SLAB`, else the carrier's default (a no-op when off); the
+    // scope closes — sealing every slab — whether or not the carrier succeeds.
+    let slab_default = carrier.weight_slab_default(&ctx.gpu.arch);
+    ctx.gpu.weight_slab_scope_begin_with(slab_default);
+    let carrier_result = carrier.load(source, &mut ctx);
+    ctx.gpu.weight_slab_scope_end();
+    let mut result = match carrier_result {
         Ok(result) => result,
         Err(error) => {
             // The carrier already unwound its resources; join any compile
@@ -4335,25 +4871,31 @@ pub fn qwen35_ep_moe_topology_refusal(
     None
 }
 
-/// Message constructor shared by [`ep_admission`] and the per-entry match
-/// backstops so the refusal text cannot drift between the two.
-pub(crate) fn ep_unsupported_arch_message(arch_id: u32) -> String {
-    format!(
-        "expert parallelism (tp>1) is not supported for arch_id={arch_id}; it works for Qwen3.5 (5|6), DeepSeek V4 (9) and MiniMax (10). Set tp=1 for this model"
+/// Message constructor shared by [`ep_admission`] and the per-entry
+/// backstops so the refusal text cannot drift between them. The family is the
+/// carrier name for `arch_id` (`arch{id}` only where no carrier claims the id).
+pub(crate) fn ep_unsupported_arch_message(arch_id: u32, tp: usize) -> String {
+    let family = carrier_for(arch_id)
+        .map(|carrier| carrier.name().to_string())
+        .unwrap_or_else(|| format!("arch{arch_id}"));
+    hipfire_runtime::loader_api::topology_refusal(
+        &family,
+        hipfire_runtime::loader_api::TopologyAxis::Tp,
+        tp,
+        false,
     )
 }
 
-/// EP load admission by arch_id. Only archs with an `EpArch` variant may enter
-/// expert-parallel load (9/DeepSeek4, 10/MiniMax, 5|6/Qwen3.5); LFM2 (11),
-/// Cohere2 (12) and anything else must fail here — right after the host-side
-/// HFQ probe, before any device init — otherwise they would reach
+/// EP load admission by arch_id: the carrier that claims `arch_id` and
+/// declares `--tp N` ([`Carrier::topology_caps`]) may enter expert/tensor
+/// parallel load; anything else (LFM2, Cohere2, ...) fails here — right after
+/// the host-side HFQ probe, before any device init — otherwise it would reach
 /// `generate_ep` with no correct server. Pure so the contract is
 /// unit-testable; both `load_model_ep_*` entries call it before dispatching.
-pub fn ep_admission(arch_id: u32) -> Result<(), String> {
-    match arch_id {
-        5 | 6 | 9 | 10 => Ok(()),
-        id => Err(ep_unsupported_arch_message(id)),
-    }
+pub fn ep_admission(arch_id: u32, tp: usize) -> Result<&'static dyn Carrier, String> {
+    carrier_for(arch_id)
+        .filter(|carrier| carrier.topology_caps().tp.is_some())
+        .ok_or_else(|| ep_unsupported_arch_message(arch_id, tp))
 }
 
 /// Expert-parallel (EP) model load — shards the routed experts across `tp` ranks
@@ -4488,11 +5030,25 @@ pub fn load_model_ep_with_kv_mode(
     loaded
 }
 
-/// Dispatch an already-admitted expert-parallel source on its `arch_id` —
-/// admission's classification is not repeated. Unlike the single/pp route,
-/// the per-arch EP loaders still re-open `path` per rank, so the retained
-/// `SourceAdmission.source` is dropped here rather than consumed. Destructive
-/// (per-rank allocation + collectives) begins inside the per-arch loaders.
+/// Everything an admitted `--tp N` load needs beyond the admission record.
+/// The per-arch EP loaders re-open `path` per rank.
+pub struct TpLoadArgs<'a> {
+    pub path: &'a str,
+    pub tp: usize,
+    pub kv_mode: Option<&'a str>,
+    pub kv_k: Option<&'a str>,
+    pub kv_v: Option<&'a str>,
+    pub state_quant: Option<&'a str>,
+    pub mtp_path: Option<&'a Path>,
+    pub spec: hipfire_runtime::loader_api::SpecLoadCfg,
+}
+
+/// Dispatch an already-admitted expert-parallel source to the carrier that
+/// declares `--tp N` for it — admission's classification is not repeated.
+/// Unlike the single/pp route, the per-arch EP loaders still re-open `path`
+/// per rank, so the retained `SourceAdmission.source` is dropped by the
+/// carrier rather than consumed. Destructive (per-rank allocation +
+/// collectives) begins inside the per-arch loaders.
 pub fn load_model_ep_admitted(
     admission: crate::admission::SourceAdmission,
     path: &str,
@@ -4505,37 +5061,23 @@ pub fn load_model_ep_admitted(
     mtp_path: Option<&Path>,
     spec: hipfire_runtime::loader_api::SpecLoadCfg,
 ) -> Result<LoadedModel, String> {
-    let kv_backend = admission.kv_backend;
-    let qwen_default_q8 = admission.qwen_default_q8;
-    let max_seq = admission.max_seq;
-    match admission.arch_id {
-        9 => load_model_ep_ds4(
+    // Backstop: `admit_source` already refused every carrier that does not
+    // declare `--tp N`; the shared constructor keeps this message from
+    // drifting from `ep_admission`'s.
+    let carrier = ep_admission(admission.arch_id, tp)?;
+    carrier.load_tp(
+        admission,
+        TpLoadArgs {
             path,
-            max_seq,
-            tp,
-            resolve_deepseek4_compressor_cache_kv_mode(kv_mode)?,
-            kv_backend,
-        ),
-        10 => load_model_ep_minimax(path, max_seq, tp),
-        5 | 6 => load_model_ep_qwen35(
-            path,
-            max_seq,
             tp,
             kv_mode,
             kv_k,
             kv_v,
-            qwen_default_q8,
-            Some(kv_backend.as_str()),
             state_quant,
             mtp_path,
             spec,
-        ),
-        // Backstop: `admit_source` above already refused every other arch_id.
-        // Route through the shared constructor (not `unreachable!`) so the
-        // refusal survives a future edit that drops the early classification,
-        // and so this message never drifts from `ep_admission`'s.
-        id => Err(ep_unsupported_arch_message(id)),
-    }
+        },
+    )
 }
 
 /// Expert-parallel load with an explicit DeepSeek V4 compressor-cache storage
@@ -4548,25 +5090,10 @@ pub fn load_model_ep_with_compressor_cache(
     compressor_cache: hipfire_config::Deepseek4CompressorCache,
 ) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
-    // Admission: refuse archs with no `EpArch` before any per-arch device init.
-    ep_admission(hfq.arch_id)?;
-    match hfq.arch_id {
-        9 => load_model_ep_ds4(path, max_seq, tp, compressor_cache, KvBackend::Vmm),
-        10 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
-            load_model_ep_minimax(path, max_seq, tp)
-        }
-        10 => Err("the DeepSeek V4 compressor-cache setting (memory.kv_cache = f16) does not apply to MiniMax models; remove it for this model".to_string()),
-        5 | 6 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
-            load_model_ep_with_kv_mode(path, max_seq, tp, None, None, None)
-        }
-        5 | 6 => {
-            Err("the DeepSeek V4 compressor-cache setting (memory.kv_cache = f16) does not apply to Qwen3.5 models; remove it for this model".to_string())
-        }
-        // Backstop: `ep_admission` above already refused these; route through the
-        // shared constructor (not `unreachable!`) so the refusal survives a
-        // future edit that drops the early call.
-        id => Err(ep_unsupported_arch_message(id)),
-    }
+    // Admission: refuse carriers that do not declare `--tp N` before any
+    // per-arch device init.
+    let carrier = ep_admission(hfq.arch_id, tp)?;
+    carrier.load_tp_with_compressor_cache(path, max_seq, tp, compressor_cache)
 }
 
 fn load_model_ep_ds4(
@@ -5456,6 +5983,10 @@ fn load_model_tp_qwen35_dense(
     eprintln!(
         "[loader] dense qwen TP route=hand (hand dense-TP forward): {tp} ranks, peer_access={peer}"
     );
+    eprintln!(
+        "[loader] dense qwen TP exchange={} (HIPFIRE_TP_EXCHANGE)",
+        hipfire_runtime::multi_gpu::tp_exchange::tp_exchange_label(peer)
+    );
     let mtp_present = mtp_head.is_some();
     // Block-verify drafters cannot run on the mesh (`Qwen35DenseTpTarget`
     // refuses `verify_block`), so an `ngram=on` request must not build one
@@ -5806,6 +6337,14 @@ fn load_model_tp_qwen35_mesh(
             eprintln!(
                 "[loader] dense qwen {arch} mesh TP2 whole-token graph signal tape: {barriers} barriers"
             );
+        } else if staging
+            .gpus_mut()
+            .prepare_tp_push_whole_token_graph(config.dim * std::mem::size_of::<f32>())
+        {
+            let arch = staging.gpus_mut().devices[0].arch.clone();
+            eprintln!(
+                "[loader] dense qwen {arch} mesh TP{tp} whole-token graph peer-push mailboxes: {barriers} collectives"
+            );
         }
     }
     staging
@@ -5846,6 +6385,10 @@ fn load_model_tp_qwen35_mesh(
         "[loader] dense qwen TP route=mesh (generic mesh executor): {tp} ranks, \
          transport={transport}, prefill chunk={chunk}, {} collectives/epoch",
         plan.collectives.len()
+    );
+    eprintln!(
+        "[loader] dense qwen TP exchange={} (HIPFIRE_TP_EXCHANGE)",
+        hipfire_runtime::multi_gpu::tp_exchange::tp_exchange_label(transport == "peer")
     );
 
     let (gpus, ranks) = staging.into_parts();
@@ -5973,7 +6516,70 @@ fn unload_qwen4_pp(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<()
     gpu.ensure_vmm_cleaned().map_err(|e| e.to_string())
 }
 
+/// What unload reports when a generic mesh-owning model's teardown failed: its
+/// mesh free drains every epoch and edge before freeing anything, and a failed
+/// drain keeps all resources (devices, ranks, edges) alive and unreclaimed.
+fn mesh_owner_quarantine_report(error: &str) -> String {
+    format!("topology.pp unload failed ({error}); mesh resources quarantined until process restart")
+}
+
+/// Unload a pipeline-mesh model that owns its lifecycle over `pp_gpus`
+/// ([`ArchModel::owns_mesh_lifecycle`]; today Raon). [`ArchModel::free_gpu_mesh`]
+/// drains the mesh first and then frees every rank on its own device; a failed
+/// drain quarantines: the model leaked the ranks, and the `Gpus` and the rest of
+/// the `LoadedModel` are leaked here, never freed under possibly in-flight work.
+fn unload_mesh_owner(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+    if let Some(spec) = m.speculator.take() {
+        spec.free(gpu);
+    }
+    if let Some(ev) = m.eviction.take() {
+        ev.free_gpu(gpu);
+    }
+    for (_, snap) in std::mem::take(&mut m.prefill_checkpoints) {
+        snap.free_gpu(gpu);
+    }
+    for (_, snap) in std::mem::take(&mut m.dflash_checkpoints) {
+        snap.free_gpu(gpu);
+    }
+    let Some(mut gpus) = m.pp_gpus.take() else {
+        std::mem::forget(m);
+        return Err(mesh_owner_quarantine_report("the PP model carries no Gpus"));
+    };
+    let Some(state) = m.state.take() else {
+        std::mem::forget(gpus);
+        std::mem::forget(m);
+        return Err(mesh_owner_quarantine_report(
+            "the PP model carries no state",
+        ));
+    };
+    if let Err(error) = state.free_gpu_mesh(gpu, &mut gpus) {
+        std::mem::forget(gpus);
+        std::mem::forget(m);
+        return Err(mesh_owner_quarantine_report(&error));
+    }
+    let mut first_err: Option<String> = None;
+    for (rank, device) in gpus.devices.iter_mut().enumerate() {
+        let _ = device.bind_thread();
+        device.invalidate_weight_caches();
+        device.invalidate_graph_state();
+        device.drain_pool();
+        if let Err(error) = device.ensure_vmm_cleaned() {
+            first_err.get_or_insert(format!("unload topology.pp VMM rank {rank}: {error}"));
+        }
+    }
+    drop(gpus);
+    gpu.invalidate_weight_caches();
+    gpu.invalidate_graph_state();
+    gpu.drain_pool();
+    let daemon = gpu.ensure_vmm_cleaned().map_err(|e| e.to_string());
+    match first_err {
+        Some(error) => Err(error),
+        None => daemon,
+    }
+}
+
 pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+    gpu.kv_fit_floor = None;
     // The next load (or none) starts lazy; a sealed route never outlives its model.
     if let Err(e) = gpu.abort_route_kernel_load() {
         eprintln!("  kernels: route reset on unload: {e}");
@@ -6266,6 +6872,10 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     if qwen4_pp_mesh_owner(&m) {
         return unload_qwen4_pp(m, gpu);
     }
+    // Any other mesh-executor model owns its lifecycle through `ArchModel`.
+    if m.pp > 1 && m.state.as_ref().is_some_and(|s| s.owns_mesh_lifecycle()) {
+        return unload_mesh_owner(m, gpu);
+    }
     if m.pp > 1 {
         if let Some(b) = m.qwen35_mut() {
             if let Some(batch_state) = b.qwen35_decode_batch.take() {
@@ -6360,6 +6970,15 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     gpu.invalidate_weight_caches();
     gpu.invalidate_graph_state();
     gpu.drain_pool();
+    if let Some(pinned) = gpu.pinned_weight_slabs() {
+        // A view that outlives its model keeps its whole slab allocated.
+        eprintln!(
+            "  weight-slab: {} slab(s) ({:.1} MiB) still allocated after unload, held by {} live view(s)",
+            pinned.slabs,
+            pinned.slab_bytes as f64 / (1024.0 * 1024.0),
+            pinned.live_views
+        );
+    }
     // After ordinary frees/pool drain, retry any VMM arenas retained by a
     // failed free_tensor. Success is reported only when none remain.
     note(gpu.ensure_vmm_cleaned().map_err(|e| e.to_string()));
@@ -6407,22 +7026,29 @@ mod ep_admission_tests {
     fn ep_without_eparch_refuses_but_served_archs_admit() {
         // LFM2 (11), Cohere2 (12) and anything else with no `EpArch` variant:
         for arch in [11u32, 12, 13, 0, 99] {
-            let err = match ep_admission(arch) {
-                Ok(()) => panic!("arch {arch} + EP must refuse"),
+            let err = match ep_admission(arch, 2) {
+                Ok(_) => panic!("arch {arch} + EP must refuse"),
                 Err(e) => e,
             };
-            assert!(
-                err.contains("expert parallelism (tp>1) is not supported"),
-                "reason: {err}"
+            let family = super::carrier_for(arch)
+                .map(|carrier| carrier.name().to_string())
+                .unwrap_or_else(|| format!("arch{arch}"));
+            assert_eq!(
+                err,
+                hipfire_runtime::loader_api::topology_refusal(
+                    &family,
+                    hipfire_runtime::loader_api::TopologyAxis::Tp,
+                    2,
+                    false,
+                ),
+                "uniform Tp sentence with the carrier family name"
             );
-            assert!(
-                err.contains(&arch.to_string()),
-                "reason names the arch: {err}"
-            );
+            assert!(err.starts_with(&format!("{family}: ")), "reason: {err}");
+            assert!(err.contains("--tp 2"), "reason names the degree: {err}");
         }
         // Adjacent supported: DS4, MiniMax and Qwen3.5 keep their EP entries.
         for arch in [5u32, 6, 9, 10] {
-            assert!(ep_admission(arch).is_ok(), "arch {arch} + EP must admit");
+            assert!(ep_admission(arch, 2).is_ok(), "arch {arch} + EP must admit");
         }
     }
 
@@ -6869,6 +7495,7 @@ mod registry_tests {
             (10, false, "minimax"),
             (11, false, "lfm2moe"),
             (12, false, "cohere2moe"),
+            (19, false, "raon1_mini"),
             (40, false, "flux"),
             (40, true, "flux"),
             (45, false, "flux"),
@@ -7077,7 +7704,13 @@ mod registry_tests {
             );
             covered.push(label);
         }
-        for label in ["qwen3_5", "qwen3_5_moe", "qwen4", "muse_glimmer"] {
+        for label in [
+            "qwen3_5",
+            "qwen3_5_moe",
+            "qwen4",
+            "muse_glimmer",
+            "raon1_mini",
+        ] {
             assert!(covered.contains(&label), "{label} not covered: {covered:?}");
         }
     }
@@ -7094,8 +7727,8 @@ mod registry_tests {
         use super::{
             bench_decode_route, continuous_batch_route, ep_eos_route, ep_prompt_route,
             generation_early_route, img_route, vision_route, BenchDecodeRoute,
-            ContinuousBatchRoute, EpEosRoute, EpPromptRoute, GenerationEarlyRoute, ImgRoute,
-            VisionRoute,
+            ContinuousBatchRoute, EpEosRoute, EpKind, EpPromptRoute, GenerationEarlyRoute,
+            ImgRoute, VisionRoute,
         };
         use saddle_core::caps::{ArchCaps, DflashKind, ReasoningContract};
 
@@ -7158,6 +7791,14 @@ mod registry_tests {
         );
         assert_eq!(caps_of("cohere2moe"), text_only);
         assert_eq!(
+            caps_of("raon1_mini"),
+            ArchCaps {
+                reasoning_contract: ReasoningContract::QwenJinja,
+                semantic_contract_version: Some(2),
+                ..text_only
+            }
+        );
+        assert_eq!(
             caps_of("gemma4"),
             ArchCaps {
                 reasoning_contract: ReasoningContract::GemmaBoolean,
@@ -7198,8 +7839,8 @@ mod registry_tests {
             );
         }
 
-        // ── bench_decode_route: 9, 11, 5|6, 13, 14, 16; everything else Unsupported ──
-        for id in 0u32..=16 {
+        // ── bench_decode_route: 9, 11, 5|6, 13, 14, 16, 19; everything else Unsupported ──
+        for id in 0u32..=22 {
             let want = match id {
                 9 => BenchDecodeRoute::Deepseek4,
                 11 => BenchDecodeRoute::Lfm2Moe,
@@ -7207,6 +7848,7 @@ mod registry_tests {
                 13 => BenchDecodeRoute::Gemma4,
                 14 => BenchDecodeRoute::MuseGlimmer,
                 16 => BenchDecodeRoute::Qwen4,
+                19 => BenchDecodeRoute::Raon,
                 _ => BenchDecodeRoute::Unsupported,
             };
             assert_eq!(bench_decode_route(id), want, "bench_decode_route({id})");
@@ -7237,24 +7879,28 @@ mod registry_tests {
             assert_eq!(img_route(id), want, "img_route({id})");
         }
 
-        // ── ep_prompt_route: 9 -> Dsml, everything else Jinja ──
-        for id in 0u32..=14 {
-            let want = if id == 9 {
-                EpPromptRoute::Dsml
-            } else {
-                EpPromptRoute::Jinja
-            };
-            assert_eq!(ep_prompt_route(id), want, "ep_prompt_route({id})");
+        // ── EP prompt route: DeepSeek4 -> Dsml, every other server Jinja;
+        // no EP state keeps the Jinja default ──
+        assert_eq!(ep_prompt_route(None), EpPromptRoute::Jinja);
+        for (kind, want) in [
+            (EpKind::Ds4, EpPromptRoute::Dsml),
+            (EpKind::Minimax, EpPromptRoute::Jinja),
+            (EpKind::Qwen35Moe, EpPromptRoute::Jinja),
+            (EpKind::Qwen35DenseTp, EpPromptRoute::Jinja),
+        ] {
+            assert_eq!(kind.prompt_route(), want, "{kind:?}");
         }
 
-        // ── ep_eos_route: Qwen, MiniMax and DeepSeek carry distinct EOS ──
-        for id in 0u32..=14 {
-            let want = match id {
-                5 | 6 => EpEosRoute::Qwen35,
-                10 => EpEosRoute::Minimax,
-                _ => EpEosRoute::Deepseek4,
-            };
-            assert_eq!(ep_eos_route(id), want, "ep_eos_route({id})");
+        // ── EP EOS route: Qwen (MoE and dense TP), MiniMax and DeepSeek carry
+        // distinct EOS; no EP state keeps the DeepSeek4 default ──
+        assert_eq!(ep_eos_route(None), EpEosRoute::Deepseek4);
+        for (kind, want) in [
+            (EpKind::Ds4, EpEosRoute::Deepseek4),
+            (EpKind::Minimax, EpEosRoute::Minimax),
+            (EpKind::Qwen35Moe, EpEosRoute::Qwen35),
+            (EpKind::Qwen35DenseTp, EpEosRoute::Qwen35),
+        ] {
+            assert_eq!(kind.eos_route(), want, "{kind:?}");
         }
 
         // ── generation_early_route: 13 -> Gemma4, 14 -> MuseGlimmer; arch 22

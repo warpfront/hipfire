@@ -102,6 +102,23 @@ pub struct KernelSpec {
     /// CU mode (`workgroup_processor_mode 0`): every wave of a workgroup on one CU.
     pub cu_mode: bool,
 }
+impl KernelSpec {
+    /// Enabled system SGPRs: workgroup id X, plus Y and (when `workgroup_id_z`) Z.
+    pub fn system_sgprs(&self, workgroup_id_z: bool) -> u8 {
+        1 + u8::from(self.system_sgpr_workgroup_id_y) + u8::from(workgroup_id_z)
+    }
+    /// The `.amdhsa_user_sgpr_count` the descriptor declares: `user_sgpr_count` real user SGPRs
+    /// padded per [`Arch::declared_user_sgprs`] (gfx1100: user + system >= 16, as LLVM).
+    pub fn declared_user_sgprs(&self, workgroup_id_z: bool) -> u8 {
+        self.arch
+            .declared_user_sgprs(self.user_sgpr_count, self.system_sgprs(workgroup_id_z))
+    }
+    /// Where the hardware puts the workgroup ids of this kernel (after the DECLARED user SGPRs).
+    pub fn workgroup_ids(&self, workgroup_id_z: bool) -> Result<crate::arch::WgIds, String> {
+        self.arch
+            .workgroup_ids(self.declared_user_sgprs(workgroup_id_z))
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryScope {
     LdsOnly,
@@ -158,13 +175,88 @@ pub struct BuilderProof {
     pub loop_fixpoints: Vec<LoopFixpoint>,
     pub forbidden_mnemonics_checked: Vec<String>,
     pub s_text_sha256: String,
+    /// Declared release signals, event polls and fences (`sync::verify`); absent when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub syncs: Vec<crate::sync::SyncProof>,
+    /// Task-body regions emitted inside this program (`Builder::region`); absent when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<RegionProof>,
 }
 fn is_false(value: &bool) -> bool {
     !*value
+}
+/// Declared entry state of a task-body region ([`crate::Builder::region`]): the
+/// caller-owned registers the body reads (argument block pointer, lane id,
+/// virtual workgroup coordinate, ...), the LDS bytes it may use and the
+/// physical workgroup size it assumes.
+#[derive(Clone, Debug)]
+pub struct RegionAbi {
+    /// Labels `.L{name}_entry` / `.L{name}_exit` (local labels: not kernel symbols).
+    pub name: String,
+    /// `(meaning, register)`: read-only inputs, owned by the caller's register plan.
+    pub inputs: Vec<(String, crate::reg::RegRef)>,
+    pub lds_bytes: u32,
+    pub workgroup_size: u16,
+}
+/// The entry label of region `name`.
+pub fn region_entry_label(name: &str) -> String {
+    format!(".L{name}_entry")
+}
+/// The exit label of region `name`.
+pub fn region_exit_label(name: &str) -> String {
+    format!(".L{name}_exit")
+}
+/// Inputs needed to re-derive a lifted task body from its standalone object.
+/// Register numbers name SGPRs; `block` and `dynamic_lds` retain the lift request.
+#[derive(Clone, Debug, Serialize)]
+pub struct RegionLiftInputs {
+    pub prefix: String,
+    pub workgroup_x: u16,
+    pub workgroup_yz: u16,
+    pub block: u32,
+    pub dynamic_lds: u32,
+}
+/// What `Builder::region` proved about one emitted region.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RegionProof {
+    pub name: String,
+    /// Instruction indices of the entry and exit labels.
+    pub entry_pc: usize,
+    pub exit_pc: usize,
+    /// `(meaning, register)` of every declared input, live and unwritten across the region.
+    pub inputs: Vec<(String, String)>,
+    /// Register ranges live only inside the region (`Live::Between(entry, exit)`): free for
+    /// the caller outside it, disjoint from every caller range inside it (`verify_lifetimes`).
+    pub locals: Vec<String>,
+    pub lds_bytes: u32,
+    pub workgroup_size: u16,
+    /// The body writes EXEC (e.g. a lane-0 store `v_cmpx`): the caller restores it at the exit.
+    pub exec_clobbered: bool,
+    /// Global writes of the body not yet covered by a release at the exit: the caller
+    /// must release before publishing completion.
+    pub unreleased_writes_at_exit: bool,
+    /// Explicit dispatcher template id. Only tagged regions enter `.note.pm_regions`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<u32>,
+    /// Original lift request; absent for a native PM body such as COPY.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lift_inputs: Option<RegionLiftInputs>,
+    /// SHA-256 of the standalone source object (the lift receipt's exact bytes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_object_sha256: Option<[u8; 32]>,
+    /// Kernel symbol in that standalone source object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_symbol: Option<String>,
 }
 #[derive(Clone, Debug)]
 pub struct Emitted {
     pub s_text: String,
     pub proof: BuilderProof,
     pub shape: IsaShape,
+    /// The instruction list the proofs' `pc_index` fields index (labels included).
+    pub program: crate::insn::Program,
+    /// What `Builder::record_vgpr_stream` recorded (pass 1 of `regalloc::compact_vgprs`).
+    pub vgpr_record: Option<crate::regalloc::Recording>,
+    /// What the VGPR compaction measured (set by `regalloc::compact_vgprs`).
+    pub vgpr_stats: Option<crate::regalloc::Stats>,
 }

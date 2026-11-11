@@ -2296,6 +2296,16 @@ impl DeepseekV4 {
                         "HIPFIRE_DEEPSEEK4_LOAD_MTP=0"
                     }
                 );
+                hipfire_config::load_summary::note(
+                    hipfire_config::load_summary::Facet::SpecOff,
+                    if cfg.reap_keep.is_some() {
+                        "MTP off: REAP keep-map active"
+                    } else if !cfg.load_mtp {
+                        "MTP off: no measured AR floor (speculation.mtp=auto)"
+                    } else {
+                        "MTP off: HIPFIRE_DEEPSEEK4_LOAD_MTP=0"
+                    },
+                );
             } else {
                 eprintln!(
                     "deepseek4: MTP layer present — uploading from {}.",

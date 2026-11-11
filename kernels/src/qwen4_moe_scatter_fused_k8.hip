@@ -1,6 +1,10 @@
-// Qwen4 copy of moe_scatter_fused_k8.hip as #774 left it (block-wide scan on gfx1151). The
-// top-10 alias compiles this on every arch and the shipped k8 module on gfx1151 only;
-// moe_scatter_fused_k8.hip keeps the shipped text for every other arch.
+// Qwen4 copy of moe_scatter_fused_k8.hip as #774 left it (block-wide scan on gfx1151), with the
+// same scan on gfx1201. The top-10 alias compiles this on every arch (scan on gfx1151/gfx1201,
+// the serial walk elsewhere) and additionally exports `moe_scatter_fused_k8_serial` (the serial
+// walk on every arch: the gfx1201 `HIPFIRE_QWEN4_MOE_SCATTER_SCAN=0` kill switch and the
+// incumbent arm of `moe_scatter_scan_oracle`) when QWEN4_SCATTER_SERIAL_ENTRY is defined;
+// the shipped k8 module on gfx1151 only; moe_scatter_fused_k8.hip keeps the shipped text for
+// every other arch.
 
 #include <hip/hip_runtime.h>
 
@@ -25,7 +29,23 @@
 //
 // Single workgroup, 256 threads. LDS = num_experts * 4 bytes.
 
-extern "C" __global__ void moe_scatter_fused_k8(
+// Phase 2 variant of the default entry: the block-wide scan on gfx1151 and gfx1201, the serial
+// thread-0 walk elsewhere. Both are integer sums, so counts and offsets are bytewise equal.
+#if defined(__gfx1151__) || defined(__gfx1201__)
+#define QWEN4_SCATTER_DEFAULT_SCAN true
+#else
+#define QWEN4_SCATTER_DEFAULT_SCAN false
+#endif
+
+// ORDERED (default false, every shipped entry): the bucket fill runs on wave 0 alone, 32 slots per
+// step in ascending slot order, so the slots of one expert land in ascending slot order every
+// time. The default fill (every thread claims a position with an LDS atomicAdd) leaves the order
+// inside an expert's bucket to the arrival order of the waves (a race, not ascending in a large share of the cases and not even
+// repeatable); the tables are equal as sets either way. Only valid
+// for total_slots <= 96 (the fused router + scatter entry, <= 8 rows x top-10). Same counts,
+// offsets, tile ids and padding.
+template <bool SCAN, bool ORDERED = false>
+__device__ __forceinline__ void qwen4_moe_scatter_body(
     const int* __restrict__ topk_indices,        // [total_slots]
     int*       __restrict__ expert_token_counts, // [E]
     int*       __restrict__ expert_offsets,      // [E+1]
@@ -72,54 +92,54 @@ extern "C" __global__ void moe_scatter_fused_k8(
     __syncthreads();
 
     // ── Phase 2: pad + exclusive prefix-sum ──
-#if defined(__gfx1151__)
-    // gfx1151: a block-wide scan over contiguous per-thread expert ranges:
-    // integer sums, so the offsets equal the serial walk's exactly (512-expert
-    // Qwen4 routing). Other archs keep the serial walk below unchanged.
-    __shared__ int wave_totals[32];
-    const int per = (num_experts + bdim - 1) / bdim;
-    const int first = tid * per;
-    const int last = min(first + per, num_experts);
-    int local = 0;
-    for (int e = first; e < last; ++e) {
-        local += ((s_workspace[e] + block_m - 1) / block_m) * block_m;
-    }
-    const int lane = tid & 31;
-    const int wave = tid >> 5;
-    const int waves = (bdim + 31) >> 5;
-    int inclusive = local;
-    for (int offset = 1; offset < 32; offset <<= 1) {
-        const int up = __shfl_up(inclusive, offset, 32);
-        if (lane >= offset) inclusive += up;
-    }
-    if (lane == 31 || tid == bdim - 1) wave_totals[wave] = inclusive;
-    __syncthreads();
-    if (tid == 0) {
-        for (int w = 1; w < waves; ++w) wave_totals[w] += wave_totals[w - 1];
-        expert_offsets[num_experts] = wave_totals[waves - 1]; // M_total
-    }
-    __syncthreads();
-    int acc = inclusive - local + (wave > 0 ? wave_totals[wave - 1] : 0);
-    for (int e = first; e < last; ++e) {
-        const int padded = ((s_workspace[e] + block_m - 1) / block_m) * block_m;
-        expert_offsets[e] = acc;
-        expert_token_counts[e] = padded;
-        acc += padded;
-    }
-#else
-    // Serial in thread 0 — E ≤ 256.
-    if (tid == 0) {
-        int acc = 0;
-        for (int i = 0; i < num_experts; i++) {
-            const int raw = s_workspace[i];
-            const int padded = ((raw + block_m - 1) / block_m) * block_m;
-            expert_offsets[i] = acc;
-            expert_token_counts[i] = padded;
+    if constexpr (SCAN) {
+        // A block-wide scan over contiguous per-thread expert ranges: integer
+        // sums, so the offsets equal the serial walk's exactly (512-expert
+        // Qwen4 routing).
+        __shared__ int wave_totals[32];
+        const int per = (num_experts + bdim - 1) / bdim;
+        const int first = tid * per;
+        const int last = min(first + per, num_experts);
+        int local = 0;
+        for (int e = first; e < last; ++e) {
+            local += ((s_workspace[e] + block_m - 1) / block_m) * block_m;
+        }
+        const int lane = tid & 31;
+        const int wave = tid >> 5;
+        const int waves = (bdim + 31) >> 5;
+        int inclusive = local;
+        for (int offset = 1; offset < 32; offset <<= 1) {
+            const int up = __shfl_up(inclusive, offset, 32);
+            if (lane >= offset) inclusive += up;
+        }
+        if (lane == 31 || tid == bdim - 1) wave_totals[wave] = inclusive;
+        __syncthreads();
+        if (tid == 0) {
+            for (int w = 1; w < waves; ++w) wave_totals[w] += wave_totals[w - 1];
+            expert_offsets[num_experts] = wave_totals[waves - 1]; // M_total
+        }
+        __syncthreads();
+        int acc = inclusive - local + (wave > 0 ? wave_totals[wave - 1] : 0);
+        for (int e = first; e < last; ++e) {
+            const int padded = ((s_workspace[e] + block_m - 1) / block_m) * block_m;
+            expert_offsets[e] = acc;
+            expert_token_counts[e] = padded;
             acc += padded;
         }
-        expert_offsets[num_experts] = acc; // M_total
+    } else {
+        // Serial in thread 0 — E ≤ 256.
+        if (tid == 0) {
+            int acc = 0;
+            for (int i = 0; i < num_experts; i++) {
+                const int raw = s_workspace[i];
+                const int padded = ((raw + block_m - 1) / block_m) * block_m;
+                expert_offsets[i] = acc;
+                expert_token_counts[i] = padded;
+                acc += padded;
+            }
+            expert_offsets[num_experts] = acc; // M_total
+        }
     }
-#endif
     __syncthreads();
 
     // ── Phase 3a: reset s_workspace for bucket-fill counters ──
@@ -129,6 +149,34 @@ extern "C" __global__ void moe_scatter_fused_k8(
     __syncthreads();
 
     // ── Phase 3b: scatter ──
+    if constexpr (ORDERED) {
+        if (tid < 32) {
+            constexpr int CHUNKS = 3;  // 3 x 32 >= 80 = 8 rows x top-10
+            int e_c[CHUNKS];
+            int base_c[CHUNKS];
+#pragma unroll
+            for (int c = 0; c < CHUNKS; ++c) {
+                const int i = tid + 32 * c;
+                const int e = i < total_slots ? topk_indices[i] : -1;
+                e_c[c] = e;
+                base_c[c] = (e >= 0 && e < num_experts) ? expert_offsets[e] : 0;
+            }
+#pragma unroll
+            for (int c = 0; c < CHUNKS; ++c) {
+                const int i = tid + 32 * c;
+                if (i < total_slots) {
+                    const int e = e_c[c];
+                    if (e >= 0 && e < num_experts) {
+                        const int sorted_pos = base_c[c] + atomicAdd(&s_workspace[e], 1);
+                        sorted_slot_index[sorted_pos] = i;
+                        inverse_perm[i] = sorted_pos;
+                    } else {
+                        inverse_perm[i] = -1;
+                    }
+                }
+            }
+        }
+    } else
     for (int i = tid; i < total_slots; i += bdim) {
         const int e = topk_indices[i];
         if (e >= 0 && e < num_experts) {
@@ -154,3 +202,40 @@ extern "C" __global__ void moe_scatter_fused_k8(
         }
     }
 }
+
+extern "C" __global__ void moe_scatter_fused_k8(
+    const int* __restrict__ topk_indices,        // [total_slots]
+    int*       __restrict__ expert_token_counts, // [E]
+    int*       __restrict__ expert_offsets,      // [E+1]
+    int*       __restrict__ sorted_slot_index,   // [m_total_max] (-1 padding)
+    int*       __restrict__ expert_tile_ids,     // [m_total_max / block_m]
+    int*       __restrict__ inverse_perm,        // [total_slots]
+    int        total_slots,
+    int        num_experts,
+    int        m_total_max,                      // upper bound for -1 init
+    int        block_m
+) {
+    qwen4_moe_scatter_body<QWEN4_SCATTER_DEFAULT_SCAN>(
+        topk_indices, expert_token_counts, expert_offsets, sorted_slot_index,
+        expert_tile_ids, inverse_perm, total_slots, num_experts, m_total_max, block_m);
+}
+
+#if defined(QWEN4_SCATTER_SERIAL_ENTRY)
+// Same launch ABI, serial prefix walk on every arch (see the header).
+extern "C" __global__ void moe_scatter_fused_k8_serial(
+    const int* __restrict__ topk_indices,
+    int*       __restrict__ expert_token_counts,
+    int*       __restrict__ expert_offsets,
+    int*       __restrict__ sorted_slot_index,
+    int*       __restrict__ expert_tile_ids,
+    int*       __restrict__ inverse_perm,
+    int        total_slots,
+    int        num_experts,
+    int        m_total_max,
+    int        block_m
+) {
+    qwen4_moe_scatter_body<false>(
+        topk_indices, expert_token_counts, expert_offsets, sorted_slot_index,
+        expert_tile_ids, inverse_perm, total_slots, num_experts, m_total_max, block_m);
+}
+#endif

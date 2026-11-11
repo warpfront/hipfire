@@ -7,7 +7,7 @@ description = "Compute kernel dispatch for RDNA GPUs"
 
 [features]
 # Archived research probes; see the note by the [[example]] blocks.
-lab = []
+lab = ["railgun/lab"]
 # Explicit timing instrumentation opt-in; neither default builds nor lab alone
 # enable timing state or launch-path hooks.
 kernel-timing = ["lab", "hip-bridge/kernel-timing"]
@@ -36,6 +36,13 @@ peacemaker-isa = { path = "../peacemaker-isa", features = ["toolchain"] }
 peacemaker-ir = { path = "../peacemaker-ir" }
 peacemaker-lift = { path = "../peacemaker-lift" }
 peacemaker-rip = { path = "../peacemaker-rip" }
+railgun-cert = { path = "../railgun-cert" }
+[[example]]
+name = "bench_stream_mix_chain_gfx1201"
+required-features = ["lab"]
+[[example]]
+name = "bench_moe_grouped_qt44_iu4"
+required-features = ["lab"]
 [[example]]
 name = "npu_trunk_glue_check"
 required-features = ["lab"]
@@ -54,6 +61,26 @@ required-features = ["lab"]
 # (crate::device_wait): forced timeout, host error path, fail-fast, recovery.
 [[example]]
 name = "device_wait_deadline"
+required-features = ["lab"]
+
+[[example]]
+name = "otile_bf16_rows_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "bf16_allrows_oracle"
+required-features = ["lab"]
+
+# Hardware smoke of weight slabs (HIPFIRE_WEIGHT_SLAB): packing, readback,
+# alignment, ledger split, free/unload cycles.
+[[example]]
+name = "weight_slab_smoke"
+required-features = ["lab"]
+
+# MQ8G256 decode / verify lab (M2): identity of the row-exact multi-row GEMV vs the
+# single-row decode GEMV, and Q8_0 vs MQ8G256 node timing at the Raon attention shapes.
+[[example]]
+name = "mq8_decode_lab"
 required-features = ["lab"]
 
 # ---------------------------------------------------------------------------
@@ -83,6 +110,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "pm_aco_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "mq8_prefill_lab"
 required-features = ["lab"]
 
 [[example]]
@@ -127,7 +158,39 @@ name = "qwen4_moe_f16_lds_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "moe_scatter_scan_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "qwen4_mq6_rows"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_mq6_x4_sym"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_moe_combine_ordered"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_draft_glue"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_topk8_rows"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_lwmma_multi_part"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_moe_glue_fold"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_moe_gu_rot_fold"
 required-features = ["lab"]
 
 [[example]]
@@ -395,6 +458,18 @@ name = "bench_mq3g256gl_moe_gate_up"
 required-features = ["lab"]
 
 [[example]]
+name = "bench_mq3v25_a8"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq3v25_iu4"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq3v25_iu4_g11"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_mq4_gate_up"
 required-features = ["lab"]
 
@@ -408,6 +483,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "bench_q8_wmma_4w"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_q8_raon_shapes"
 required-features = ["lab"]
 
 [[example]]
@@ -1019,7 +1098,35 @@ name = "pm_loop"
 required-features = ["lab"]
 
 [[example]]
+name = "hip_loop"
+required-features = ["lab"]
+
+[[example]]
+name = "emu_race_gate"
+required-features = ["lab"]
+
+[[example]]
+name = "decode_audit_compile"
+required-features = ["lab"]
+
+[[example]]
+name = "lane_emu_check"
+required-features = ["lab"]
+
+[[example]]
+name = "lift_probe_compile"
+required-features = ["lab"]
+
+[[example]]
 name = "pm_xbatch_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "mq2_xbatch_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "hc8_rip_oracle"
 required-features = ["lab"]
 
 [[example]]
@@ -1047,6 +1154,10 @@ name = "mq6_rows_split_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "mq6_r8_pk_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "bf16_rows_pm_oracle"
 required-features = ["lab"]
 
@@ -1067,12 +1178,28 @@ name = "draft_lane_rows_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "head_batch_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "gdn_lanes_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "gdn_lanes_rows_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "lane_gdn_oracle"
 required-features = ["lab", "deltanet"]
 
 [[example]]
 name = "lane_fa_oracle"
 required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "qsa_lanes_oracle"
+required-features = ["lab"]
 
 [[example]]
 name = "qwen4_mq4_x4_pm_oracle"
@@ -1100,6 +1227,10 @@ name = "prefill_iu4_producer_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "zba_fold_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "shared_down_sigmoid_epi_oracle"
 required-features = ["lab"]
 
@@ -1114,6 +1245,10 @@ required-features = ["lab"]
 [[example]]
 name = "fa_pm_fp8_oracle"
 required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "fa_qres_pm_timing"
+required-features = ["lab"]
 
 [[example]]
 name = "fa_pm_qprep_oracle"
@@ -1174,4 +1309,61 @@ required-features = ["lab"]
 # DFlash railgun window GPU oracle (design A); `--features lab`.
 [[example]]
 name = "railgun_copy_fill_oracle"
+required-features = ["lab"]
+
+# railgun submits a PeaceMaker-emitted persistent kernel registered by its pinned
+# SHA-256 (one gfx1201 card); `--features lab`.
+[[example]]
+name = "railgun_pm_persistent_smoke"
+required-features = ["lab"]
+
+# Persistent-program completion cancel on one gfx1201 card (poison cell,
+# teardown escalation, device quarantine); `--features lab`.
+[[example]]
+name = "railgun_persistent_cancel_smoke"
+required-features = ["lab"]
+
+# Peer-VRAM push + flag collective vs the incumbent TP2 graph collective
+# (two gfx1201 cards); `--features lab`.
+[[example]]
+name = "tp_peer_push_probe"
+required-features = ["lab"]
+
+# TP4 bf16 peer-push collective chain on four gfx1201 cards; `--features lab`.
+[[example]]
+name = "tp_peer_pushn_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "latent_attention_absorb_bench"
+required-features = ["lab"]
+
+[[example]]
+name = "latent_attention_absorb_check"
+required-features = ["lab"]
+
+[[example]]
+name = "latent_attention_decode_check"
+required-features = ["lab"]
+
+[[example]]
+name = "latent_attention_flash_check"
+required-features = ["lab"]
+
+# W8A8 Q8_0 gfx12 node bench + accuracy (needs a gfx12 GPU).
+[[example]]
+name = "bench_q8_0_a8_gfx12"
+required-features = ["lab"]
+
+# Chunked RDA node gate/bench (needs a gfx1201 GPU).
+[[example]]
+name = "gated_delta_vector_chunk_node"
+required-features = ["deltanet"]
+
+[[example]]
+name = "argmax_regrid_pm_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "gdn_chunk_pm_oracle"
 required-features = ["lab"]

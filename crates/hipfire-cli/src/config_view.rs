@@ -14,6 +14,7 @@ use anyhow::{anyhow, bail, Result};
 use hipfire_config::effective::{
     effective, install_gpu_arch, A8Prefill, ArchCtx, Effective, Origin,
 };
+use hipfire_config::env_audit::EnvEntry;
 use hipfire_config::intent::{field_matches, intent_of, key_matches, Intent};
 use hipfire_config::tuning::{attribute, TuningState};
 use hipfire_config::{
@@ -55,6 +56,15 @@ impl Filter {
             changed: args.changed,
             search: args.search.clone().filter(|query| !query.is_empty()),
         })
+    }
+
+    /// No filtering: every row.
+    fn all() -> Self {
+        Self {
+            group: None,
+            changed: false,
+            search: None,
+        }
     }
 
     fn keeps(&self, row: &Row<'_>) -> bool {
@@ -697,4 +707,240 @@ pub(crate) fn explain_model_to(
         write_shadowed(out, value)?;
     }
     Ok(())
+}
+
+/// Where a keyless-explain row's value came from, in the user's vocabulary.
+struct ExplainSource {
+    kind: &'static str,
+    label: String,
+    env: Option<String>,
+    path: Option<std::path::PathBuf>,
+}
+
+/// Files and model of the scope a keyless explain runs in.
+struct ExplainScope<'a> {
+    config_toml: std::path::PathBuf,
+    /// `(model name, models.toml path)` in a model scope.
+    model: Option<(&'a str, std::path::PathBuf)>,
+}
+
+fn explain_source(row: &Row<'_>, scope: &ExplainScope<'_>) -> ExplainSource {
+    let simple = |kind, label: String| ExplainSource {
+        kind,
+        label,
+        env: None,
+        path: None,
+    };
+    match &row.origin {
+        Origin::Default => simple("default", "default".into()),
+        Origin::DefaultArch(arch) => simple("default-arch", format!("default · {arch}")),
+        Origin::Registry => {
+            let tag = row.item.and_then(|item| match &item.source {
+                hipfire_config::ConfigSource::RegistryModel { tag, .. }
+                | hipfire_config::ConfigSource::RegistryTarget { tag, .. } => Some(tag.as_str()),
+                _ => None,
+            });
+            simple(
+                "registry",
+                tag.map_or_else(|| "registry".into(), |tag| format!("registry {tag}")),
+            )
+        }
+        Origin::Profile(name) => ExplainSource {
+            path: Some(scope.config_toml.clone()),
+            ..simple("profile", format!("profile {name}"))
+        },
+        Origin::Preset => ExplainSource {
+            path: Some(scope.config_toml.clone()),
+            ..simple("preset", "preset".into())
+        },
+        Origin::You => ExplainSource {
+            path: Some(scope.config_toml.clone()),
+            ..simple("config", "config.toml".into())
+        },
+        Origin::ThisModel => match &scope.model {
+            Some((model, path)) => {
+                let file = path
+                    .file_name()
+                    .map_or_else(|| "models.toml".into(), |name| name.to_string_lossy());
+                ExplainSource {
+                    path: Some(path.clone()),
+                    ..simple("models", format!("{file} [{model}]"))
+                }
+            }
+            None => simple("models", "models.toml".into()),
+        },
+        Origin::Env(name) => ExplainSource {
+            env: Some(name.clone()),
+            ..simple("env", format!("env {name}"))
+        },
+        Origin::OneShot => simple("cli", "cli".into()),
+    }
+}
+
+fn write_explain_all(
+    out: &mut dyn Write,
+    header: &[String],
+    rows: &[Row<'_>],
+    scope: &ExplainScope<'_>,
+    json: bool,
+    mut head: serde_json::Map<String, serde_json::Value>,
+    env: &[EnvEntry],
+    gpu_arch: Option<&str>,
+) -> Result<()> {
+    if json {
+        let settings = rows
+            .iter()
+            .map(|row| {
+                let source = explain_source(row, scope);
+                let mut src = serde_json::Map::new();
+                src.insert("kind".into(), source.kind.into());
+                src.insert("label".into(), source.label.into());
+                if let Some(env) = source.env {
+                    src.insert("env".into(), env.into());
+                }
+                if let Some(path) = source.path {
+                    src.insert("path".into(), serde_json::json!(path));
+                }
+                serde_json::json!({
+                    "key": row.key,
+                    "value": row.item.map(|item| &item.value),
+                    "effective": row.effective.value,
+                    "source": src,
+                })
+            })
+            .collect::<Vec<_>>();
+        head.insert("gpu_arch".into(), serde_json::json!(gpu_arch));
+        head.insert("settings".into(), settings.into());
+        head.insert(
+            "env".into(),
+            env.iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "name": entry.name,
+                        "value": entry.value,
+                        "status": entry.status,
+                        "label": entry.status.label(),
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        );
+        writeln!(
+            out,
+            "{}",
+            serde_json::to_string_pretty(&serde_json::Value::Object(head))?
+        )?;
+        return Ok(());
+    }
+    for line in header {
+        writeln!(out, "{line}")?;
+    }
+    writeln!(out, "{}", gpu_line(gpu_arch))?;
+    writeln!(out)?;
+    let mut current: Option<Intent> = None;
+    for row in rows {
+        if current != Some(row.intent) {
+            if current.is_some() {
+                writeln!(out)?;
+            }
+            writeln!(out, "{}", row.intent.title())?;
+            current = Some(row.intent);
+        }
+        let source = explain_source(row, scope);
+        writeln!(
+            out,
+            "  {:<43} {:<16} {}",
+            row.key,
+            row.using_now(),
+            source.label
+        )?;
+    }
+    writeln!(out)?;
+    writeln!(out, "environment")?;
+    if env.is_empty() {
+        writeln!(out, "  no HIPFIRE_* variables set")?;
+    }
+    for entry in env {
+        let assignment = format!("{}={}", entry.name, entry.value);
+        writeln!(out, "  {assignment:<60} {}", entry.status.label())?;
+    }
+    writeln!(out)?;
+    writeln!(out, "explain one key: hipfire config explain <key>")?;
+    Ok(())
+}
+
+/// `hipfire config explain` with no key (global scope): every effective
+/// setting with its source, then the `HIPFIRE_*` environment audit.
+pub(crate) fn explain_all_global_to(
+    paths: &Paths,
+    json: bool,
+    env: &[EnvEntry],
+    out: &mut dyn Write,
+) -> Result<()> {
+    let (loaded, resolved) = crate::resolved_global(paths, true)?;
+    let view = View::new(paths, &resolved, &loaded.layer, &loaded.layer, None);
+    let rows = view.rows(&Filter::all());
+    let scope = ExplainScope {
+        config_toml: loaded.path.clone(),
+        model: None,
+    };
+    let header = vec![format!(
+        "Effective configuration (config.toml: {})",
+        loaded.path.display()
+    )];
+    let mut head = serde_json::Map::new();
+    head.insert("scope".into(), "global".into());
+    head.insert("path".into(), serde_json::json!(loaded.path));
+    write_explain_all(
+        out,
+        &header,
+        &rows,
+        &scope,
+        json,
+        head,
+        env,
+        view.gpu_arch(),
+    )
+}
+
+/// `hipfire config explain --model MODEL` with no key: as
+/// [`explain_all_global_to`], resolved in the model's scope.
+pub(crate) fn explain_all_model_to(
+    paths: &Paths,
+    registry: &RegistryV1,
+    model: &str,
+    json: bool,
+    env: &[EnvEntry],
+    out: &mut dyn Write,
+) -> Result<()> {
+    let scope_data = ModelScope::load(paths, registry, model)?;
+    let view = scope_data.view(paths);
+    let rows = view.rows(&Filter::all());
+    let global_path = paths.config.config_toml.clone();
+    let models_path = scope_data.catalog.path.clone();
+    let scope = ExplainScope {
+        config_toml: global_path.clone(),
+        model: Some((model, models_path.clone())),
+    };
+    let header = vec![
+        format!("Effective configuration for {model}"),
+        format!("config.toml: {}", global_path.display()),
+        format!("per-model catalog: {}", models_path.display()),
+    ];
+    let mut head = serde_json::Map::new();
+    head.insert("scope".into(), "model".into());
+    head.insert("model".into(), model.into());
+    head.insert("canonical_tag".into(), serde_json::json!(scope_data.tag));
+    head.insert("path".into(), serde_json::json!(global_path));
+    head.insert("models_path".into(), serde_json::json!(models_path));
+    write_explain_all(
+        out,
+        &header,
+        &rows,
+        &scope,
+        json,
+        head,
+        env,
+        view.gpu_arch(),
+    )
 }

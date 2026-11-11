@@ -5,13 +5,13 @@
 //! Prologue: kernel arguments, banded raster (hipcc `IU4_G12_RASTER`, band 8),
 //! buffer descriptors, hoisted lane offsets, block-0 staging and the first
 //! rendezvous. Workgroup ids on gfx1201 are `ttmp9` (x) and `ttmp7[15:0]` (y).
-use super::{publish, Epi, Gen, Lds, MetaD, MetaS, PayA, PayW, Tile, Wg};
+use super::{publish, Epi, Gen, IdleHalf, Lds, MetaD, MetaS, PayA, PayW, Tile, Wg};
 use crate::kernels::common::{lit, mem, op, s, sop, sr, v};
 use crate::{
     insn::{Instruction, MemoryClass},
     Builder,
 };
-use peacemaker_author::{prime, End, Free, Ring};
+use peacemaker_author::{prime, rotate, End, Free, Ring};
 
 /// SALU unsigned 32-bit division, LLVM's AMDGPU expansion: a float
 /// reciprocal refined once, then two quotient corrections. Exact for all
@@ -71,17 +71,87 @@ fn vop(b: &mut Builder, text: String, vdst: u8, vuse: &[u8], suse: &[u8]) -> Res
     op(b, text, &[v(vdst)], &uses)
 }
 
+/// The whole prologue at ring depth 2.
 pub(crate) fn emit(
     wg: &mut Wg,
     g: &Gen,
     end: &End,
-    (ra, rw, rd, rs): (
+    rings: (
         Ring<PayA, Free, Free>,
         Ring<PayW, Free, Free>,
         Ring<MetaD, Free, Free>,
         Ring<MetaS, Free, Free>,
     ),
 ) -> Result<Lds, String> {
+    setup(wg, g, end)?;
+    block0_publish(wg, g, rings)
+}
+
+/// Ring depth 3's prologue before the rings: everything of [`emit`] up to
+/// block 0's staging, then block 0's slab 0 and slab 1 and its metadata are
+/// fetched (into prefetch sets 0 and 1) and the accumulators cleared. The
+/// ring part (`ring_part3`) follows once the K-loop's slot phase is known.
+pub(crate) fn setup3(wg: &mut Wg, g: &Gen, end: &End) -> Result<(), String> {
+    setup(wg, g, end)?;
+    let b = wg.isa();
+    let a0 = g.srd_a[0];
+    b.clause(|b| {
+        for (r, &dst) in g.a_pf.iter().enumerate() {
+            let (soff, offset) = publish::a_offset(g, 0, r);
+            publish::vload(b, dst, 2, g.st_a, a0, soff, offset)?;
+        }
+        for (r, &dst) in g.w_pf.iter().enumerate() {
+            publish::vload(b, dst, 2, g.st_w[r], g.srd_w, Some(g.goff), 8)?;
+        }
+        publish::vload(b, g.ds_nx, 1, g.ds_voff, a0, None, 0)?;
+        publish::vload(b, g.sz_nx, 1, g.sz_voff, g.srd_z, Some(g.goff), 0)
+    })?;
+    // Block 0's slab 1, in flight behind slab 0 (a depth-2 kernel fetches it
+    // only after slab 0 has been published).
+    publish::fetch_slab_at(b, g, 1, 1, 0, 40)?;
+    for i in (0..64u8).step_by(2) {
+        let r = g.acc + i;
+        op(
+            b,
+            format!("v_dual_mov_b32 v{r}, 0 :: v_dual_mov_b32 v{}, 0", r + 1),
+            &[v(r), v(r + 1)],
+            &[],
+        )?;
+    }
+    Ok(())
+}
+
+/// Ring depth 3: block 0's slab 0 and metadata go into the rings' first
+/// buffers (`prime`); with its slab 1 still to publish, block 1's slab 0
+/// is fetched into the freed prefetch set 0 behind the first rendezvous; then
+/// slab 1 goes into the second buffer behind a second rendezvous (the vacant
+/// current buffer rotates), and block 1's slab 1 is fetched into set 1.
+/// Leaves slab 0 current, slab 1 ahead, blocks 1's slabs in flight.
+pub(crate) fn ring_part3(
+    wg: &mut Wg,
+    g: &Gen,
+    (ra, rw, rd, rs): (
+        Ring<PayA, Free, Free, 3>,
+        Ring<PayW, Free, Free, 3>,
+        Ring<MetaD, Free, Free>,
+        Ring<MetaS, Free, Free>,
+    ),
+) -> Result<super::Lds3, String> {
+    let ((ra, pa), (rw, pw)) = publish::publish_slab_set(wg, g, 0, ra, rw)?;
+    let ((rd, pd), (rs, ps)) = publish::publish_meta(wg, g, rd, rs)?;
+    let (da, dw, dd, ds) = wg.wait_all((pa, pw, pd, ps))?;
+    let arrived = wg.signal((prime(ra, da), prime(rw, dw), prime(rd, dd), prime(rs, ds)))?;
+    // Block 1's slab 0 (the plane-1 descriptor and weight plane, group 0).
+    publish::fetch_slab_at(wg.isa(), g, 0, 0, 1, 64 + 8)?;
+    let (ra, rw, rd, rs) = wg.wait_arrived(arrived)?;
+    let ((ra, pa), (rw, pw)) = publish::publish_slab_set(wg, g, 1, ra, rw)?;
+    let (da, dw) = wg.wait_all((pa, pw))?;
+    let (ra, rw) = wg.barrier((rotate(ra, da), rotate(rw, dw)))?;
+    publish::fetch_slab_at(wg.isa(), g, 1, 1, 1, 64 + 40)?;
+    Ok((ra, rw, rd, rs))
+}
+
+fn setup(wg: &mut Wg, g: &Gen, end: &End) -> Result<(), String> {
     let b = wg.isa();
     let a = g.args;
     let silu = g.spec.epi.is_silu();
@@ -458,18 +528,52 @@ pub(crate) fn emit(
     )?;
     // Fragment bases: A frag (tok_half*4+nb)*2+sb, W frag (wt_pair*2+rg)*2+sb.
     let (th, wp, x) = (t[0], t[1], t[2]);
+    // `IdleHalf::SkipHi`: the token half is the wave's high bit and the row pair its
+    // low two bits, so the dead (token half 1) waves are 4..7. Every consumer of the
+    // wave's token half / row pair is derived from `th` / `wp` here, from `wave & 3`
+    // in the SiLU and fused beta/alpha epilogues (`epilogue.rs`). The LDS staging
+    // roles are by `tid` and unchanged.
+    let hi = g.spec.tune.idle == IdleHalf::SkipHi;
     sop(
         b,
-        format!("s_and_b32 s{th}, s{}, 1", g.wave),
+        if hi {
+            format!("s_lshr_b32 s{th}, s{}, 2", g.wave)
+        } else {
+            format!("s_and_b32 s{th}, s{}, 1", g.wave)
+        },
         &[th],
         &[g.wave],
     )?;
     sop(
         b,
-        format!("s_lshr_b32 s{wp}, s{}, 1", g.wave),
+        if hi {
+            format!("s_and_b32 s{wp}, s{}, 3", g.wave)
+        } else {
+            format!("s_lshr_b32 s{wp}, s{}, 1", g.wave)
+        },
         &[wp],
         &[g.wave],
     )?;
+    if g.spec.tune.idle != IdleHalf::Off {
+        // idle = (token half == 1) && (N - bs <= 64): workgroup-uniform second term
+        // (`bs` is the tile's first token and `bs < N` was checked above), so a
+        // wave-uniform flag; no wave skips a barrier by it.
+        let flag = g.idle;
+        sop(
+            b,
+            format!("s_sub_co_i32 s{flag}, s{}, s{}", a.n, g.bs),
+            &[flag],
+            &[a.n, g.bs],
+        )?;
+        sop(b, format!("s_cmp_le_u32 s{flag}, 64"), &[], &[flag])?;
+        sop(b, format!("s_cselect_b32 s{flag}, 1, 0"), &[flag], &[])?;
+        sop(
+            b,
+            format!("s_and_b32 s{flag}, s{flag}, s{th}"),
+            &[flag],
+            &[flag, th],
+        )?;
+    }
     for (base, shift, dst) in [(th, 11u32, g.fr_a), (wp, 10, g.fr_w)] {
         sop(
             b,
@@ -829,9 +933,16 @@ pub(crate) fn emit(
         &[x],
     )?;
     sop(b, format!("s_lshl_b32 s{x}, s{th}, 8"), &[x], &[th])?;
+    // `s_addk_co_i32` takes a signed 16-bit immediate: a plane base past
+    // 0x7fff (the 16-wave tile at ring depth 3) goes through a literal.
+    let ds0 = g.layout.ds[0];
     sop(
         b,
-        format!("s_addk_co_i32 s{x}, {}", lit(g.layout.ds[0])),
+        if ds0 <= 0x7fff {
+            format!("s_addk_co_i32 s{x}, {}", lit(ds0))
+        } else {
+            format!("s_add_co_i32 s{x}, s{x}, {}", lit(ds0))
+        },
         &[x],
         &[x],
     )?;
@@ -850,6 +961,22 @@ pub(crate) fn emit(
         &[x],
     )?;
 
+    Ok(())
+}
+
+/// Depth 2: block 0's staging, publication and the first rendezvous.
+fn block0_publish(
+    wg: &mut Wg,
+    g: &Gen,
+    (ra, rw, rd, rs): (
+        Ring<PayA, Free, Free>,
+        Ring<PayW, Free, Free>,
+        Ring<MetaD, Free, Free>,
+        Ring<MetaS, Free, Free>,
+    ),
+) -> Result<Lds, String> {
+    let b = wg.isa();
+    let [a0, _] = g.srd_a;
     // Block 0: slab 0, d plane 0, sc plane 0.
     b.clause(|b| {
         for (r, &dst) in g.a_pf.iter().enumerate() {
@@ -890,6 +1017,6 @@ pub(crate) fn emit(
     let arrived = wg.signal((prime(ra, da), prime(rw, dw), prime(rd, dd), prime(rs, ds)))?;
     // Seed the ring: every subsequent slab-1 fetch is issued by its
     // predecessor after the slab-0 payload has been published.
-    publish::fetch_slab1(wg.isa(), g, 0)?;
+    publish::fetch_slab1_prologue(wg.isa(), g)?;
     wg.wait_arrived(arrived)
 }

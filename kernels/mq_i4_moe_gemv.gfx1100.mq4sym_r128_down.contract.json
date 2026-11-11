@@ -57,7 +57,7 @@
   "require_wave32": true,
   "require_zero_private": true,
   "require_zero_spills": true,
-  "sgpr_max": 80,
+  "sgpr_max": 88,
   "symbol": "mq_i4_moe_gemv_mq4sym_r128_down_pm_gfx1100",
   "vgpr_max": 80
 }

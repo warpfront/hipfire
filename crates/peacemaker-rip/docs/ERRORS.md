@@ -537,6 +537,20 @@ fn emit(spec: Spec) -> Result<Emitted, String> {
 }
 ```
 
+### In a fine `iu4_gemm` K-loop schedule
+
+A publish (`iu4::publish_slab` / `iu4::publish_meta`) leaves the next buffer `Writing` with a pending store. A barrier that rotates it before `iu4::wait` (or `wg.wait_all`) has drained those stores is refused, exactly as for a region: the stores may not have landed when other waves read.
+
+The whole failing script and its fix are in [cookbook 17, "What the driver refuses"](cookbook/17-iu4-kloop-natives.md#what-the-driver-refuses); `tests/docs.rs` compiles it on gfx1201 and requires `R0301`.
+
+Fix: drain first, and hand the drained tokens to the rotate:
+
+```text
+let (da, dw) = iu4::wait(wg, lds, "slab")?;
+wg.barrier((rotate(lds[0], da), rotate(lds[1], dw)))?;
+```
+
+
 ## R0302: region still published (not retired)
 
 A region becomes Published when a barrier makes it readable by every wave. Until a later barrier *retires* it, other waves may still be reading, so anything that reuses or restructures it would race with those reads. The driver refuses a store into it, and refuses to join it with other regions, split it or re-lay it out, while it is still Published.
@@ -661,6 +675,15 @@ fn emit(spec: Spec) -> Result<Emitted, String> {
     b.finish()
 }
 ```
+
+### In a fine `iu4_gemm` K-loop schedule
+
+`iu4::fragments_body` (the dense fragment loads, called by the script body `rip_fragments`), `iu4::d_loads`, `iu4::scale_loads`, `iu4::scale_tail` (and the sparse `iu4::sparse_fragments`, `iu4::sparse_scale_loads`, `iu4::sparse_scale_tail`) read a ring's *current* buffer, and `iu4::wmma` (`iu4::sparse_wmma`) consumes fragments loaded from the payload rings' current slot. Each refuses a ring whose current buffer is not `Published` (`iu4::fragments_body: ring iu4.A current buffer is Free, not published: a read needs a buffer a barrier has published (publish, wait, then rotate it)`), so a WMMA group on a slab nobody published, and a read of a slot before its barrier, are build errors.
+
+The whole failing script (the first WMMA group before the prologue published anything) and its fix are in [cookbook 17, "What the driver refuses"](cookbook/17-iu4-kloop-natives.md#what-the-driver-refuses); `tests/docs.rs` compiles it on gfx1201 and requires `R0303`.
+
+Fix: run the prologue first (it stages and publishes block 0), then `rip_fragments(wg, g, lds)?` and the WMMA groups, as `fine_block` does.
+
 
 ## R0304: workgroup op under divergent control
 
@@ -911,6 +934,18 @@ fn emit(spec: Spec) -> Result<Emitted, String> {
     b.finish()
 }
 ```
+
+### In a fine `iu4_gemm` K-loop schedule
+
+The fine K-loop natives ([cookbook 17](cookbook/17-iu4-kloop-natives.md)) lend the four LDS rings to the typed block in the state its Rust step is typed for, and two of their refusals carry no code of their own:
+
+- **A publish into a buffer that is not `Free`.** `iu4::publish_slab` / `iu4::publish_meta` write the ring's next buffer, which must be `Free`. A second publish before the first one was waited and rotated finds it `Writing` (`ring iu4.A next buffer is Writing (its stores are still pending): a publish writes a Free buffer, so wait for the slab in flight and rotate it first`).
+- **A wait with nothing in flight.** `iu4::wait(wg, lds, set)` (and `wg.wait_all`) name rings whose next buffer has no store of this wave to drain (`wait on ring iu4.A: no store of this wave is in flight (Free)`).
+
+The whole failing scripts (publish twice; wait with no publish) and their fixes are in [cookbook 17, "What the driver refuses"](cookbook/17-iu4-kloop-natives.md#what-the-driver-refuses): they are `iu4_gemm` kernels and so gfx1201-only, which the example convention of this page (every failing script also builds on gfx1151 unless it is about one architecture's spelling) does not cover; `tests/docs.rs` compiles them there and requires each to raise `R0399`.
+
+Fix: finish the first publish (`iu4::wait(wg, lds, "slab")` then `wg.barrier((rotate(lds[0], da), rotate(lds[1], dw)))`) before the next one writes, as `fine_block` does; wait only after the publish whose stores it drains.
+
 
 ## R0401: register not in the plan
 

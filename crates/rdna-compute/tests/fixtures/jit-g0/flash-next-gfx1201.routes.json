@@ -49,7 +49,7 @@
       "kind": "embedded",
       "module": "qwen4_moe_iu4_sym_pm_gfx1201",
       "path": "/home/kaden/ClaudeCode/warpfront/wt-jit/kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco",
-      "sha256": "0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e",
+      "sha256": "44177c21de25bec8502f63f318e682dc4fa1948420723c75dec14fa63cfed723",
       "symbols": [
         "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4",
         "qwen4_moe_down_iu4_sym_pm_gfx1201_nt8",
@@ -1464,7 +1464,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "47a0d58e48944ce33c5d2be507eb45008ac948a240dbdad08ebbdc02da5b2dd2",
+      "sha256": "e0c7b4dab79c6bb736a274bbef6bd904b3493ea74bb73ae77aa12189977d284f",
       "symbols": [
         "moe_scatter_fused_top10"
       ],
@@ -2772,7 +2772,7 @@
           "kind": "embedded",
           "module": "qwen4_moe_iu4_sym_pm_gfx1201",
           "path": "/home/kaden/ClaudeCode/warpfront/wt-jit/kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco",
-          "sha256": "0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e",
+          "sha256": "44177c21de25bec8502f63f318e682dc4fa1948420723c75dec14fa63cfed723",
           "symbols": [
             "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4",
             "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4"

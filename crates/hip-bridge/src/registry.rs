@@ -34,6 +34,7 @@ pub enum AllocationRole {
 pub enum AllocationKind {
     Malloc,
     Signal,
+    FineGrained,
     VmmChunk,
 }
 

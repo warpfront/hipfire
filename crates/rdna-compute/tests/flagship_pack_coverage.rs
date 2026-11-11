@@ -15,13 +15,15 @@
 //! gfx1100 and gfx1151 as well) that must be registered on every release arch.
 //! gfx1201-only modules are asserted for gfx1201 only.
 
-use rdna_compute::kernel_registry::{entries, SUPPORTED_ARCHES};
+use rdna_compute::kernel_registry::{entries, walked_route_plans, SUPPORTED_ARCHES};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 const FLAGSHIP: &str = include_str!("fixtures/flagship-pack-gfx1201.tsv");
+const FLAGSHIP_1151: &str = include_str!("fixtures/flagship-pack-gfx1151.tsv");
+const FLAGSHIP_1100: &str = include_str!("fixtures/flagship-pack-gfx1100.tsv");
 const SHARED: &str = include_str!("fixtures/flagship-pack-shared.tsv");
-/// Extra hipcc flags the runtime derives on the measured gfx1201 hosts.
+/// Extra hipcc flags the registry CLI prints for every measured release arch.
 const EXTRA_FLAGS: &str = "-DIU4_A4_CANDIDATES=2";
 const RELEASE_ARCHES: [&str; 3] = ["gfx1201", "gfx1100", "gfx1151"];
 const ROUTES: [&str; 6] = [
@@ -57,8 +59,11 @@ struct Row {
 }
 
 fn rows() -> Vec<Row> {
-    FLAGSHIP
-        .lines()
+    rows_of(FLAGSHIP)
+}
+
+fn rows_of(text: &str) -> Vec<Row> {
+    text.lines()
         .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
         .map(|l| {
             let c: Vec<&str> = l.split('\t').collect();
@@ -80,6 +85,10 @@ fn rows() -> Vec<Row> {
 
 /// `#route` header counts: route -> (hip, embedded).
 fn header_counts() -> BTreeMap<String, (usize, usize)> {
+    header_counts_of(FLAGSHIP)
+}
+
+fn header_counts_of(text: &str) -> BTreeMap<String, (usize, usize)> {
     let field = |c: &[&str], key: &str| -> usize {
         c.iter()
             .find_map(|f| f.strip_prefix(key))
@@ -87,8 +96,7 @@ fn header_counts() -> BTreeMap<String, (usize, usize)> {
             .parse()
             .unwrap()
     };
-    FLAGSHIP
-        .lines()
+    text.lines()
         .filter_map(|l| l.strip_prefix("#route "))
         .map(|l| {
             let c: Vec<&str> = l.split('\t').collect();
@@ -128,11 +136,11 @@ fn fixture_holds_complete_measured_sets_for_all_six_routes() {
         );
         let measured = match route {
             "27b-ar" => (64, 9),
-            "27b-dflash-default" => (59, 7),
-            "27b-mtp" => (92, 10),
+            "27b-dflash-default" => (60, 7),
+            "27b-mtp" => (93, 10),
             "fn-ar" => (68, 4),
             "fn-mtp" => (69, 4),
-            "a3b-ar" => (37, 10),
+            "a3b-ar" => (53, 10),
             _ => unreachable!(),
         };
         assert_eq!((hip, emb), measured, "{route}: measured set changed");
@@ -145,13 +153,15 @@ fn fixture_holds_complete_measured_sets_for_all_six_routes() {
     }
 }
 
-#[test]
-fn every_measured_flagship_hip_module_is_registered_exactly_on_gfx1201() {
-    let registry = entries("gfx1201", EXTRA_FLAGS).unwrap();
+fn assert_measured_hip_modules_registered(arch: &str, fixture: &str) {
+    let registry = entries(arch, EXTRA_FLAGS).unwrap();
     let mut failures = Vec::new();
-    for r in rows().iter().filter(|r| r.kind == "hip") {
+    for r in rows_of(fixture).iter().filter(|r| r.kind == "hip") {
         let Some(e) = registry.iter().find(|e| e.module == r.module) else {
-            failures.push(format!("{} [{}]: not registered", r.module, r.route));
+            failures.push(format!(
+                "{arch}: {} [{}]: not registered",
+                r.module, r.route
+            ));
             continue;
         };
         if !e.symbols.contains(&r.symbol.as_str()) {
@@ -190,6 +200,159 @@ fn every_measured_flagship_hip_module_is_registered_exactly_on_gfx1201() {
         "pack coverage regressions:\n{}",
         failures.join("\n")
     );
+}
+
+/// hipcc modules the A3B mq4rs AR decode loads that were added after the v0.4.4
+/// measurement. A release binary on a host without hipcc binds only packed
+/// kernels, so each must be registered for gfx1201 (the set
+/// `hipfire-kernel-pack` compiles) AND listed in the `a3b-ar` route of the
+/// fixture with its exact source SHA-256 (the registry test above then pins
+/// symbol, flags and source). A module missing from either fails here.
+const A3B_AR_POST_MEASUREMENT_HIP_MODULES: [&str; 16] = [
+    "fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201",
+    // Lane-batched FullAttention of the exact CbVmm route: the batched VMM fp8
+    // KV write, the group-8 flash tile twin, the fused reduce + gate + rotate
+    // epilogue twin and the 16Q/2K FA prep rows twin.
+    "kv_cache_write_fp8_e4m3_batched_vmm",
+    "attention_flash_fp8_e4m3_tile_gqa8_gfx1201_vmm",
+    "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201_vmm",
+    "qwen35_fa_prep_gfx1201_rows",
+    // Lane-batched lm_head of the exact CbVmm route (`head_lanes.rs`).
+    "gemv_mq4g256v2_head_lanes_gfx1201",
+    // Lane-batched multi-weight projection GEMV of the exact VMM batch route
+    // (DeltaNet QKVZA, FullAttention QKV, MoE router/selector/shared quartet).
+    "gemv_mq4g256v2_lane_proj_k2048_gfx1201",
+    // Expert-deduplicating routed gate/up and down + combine of the exact
+    // CbVmm route (`moe_decode_lanes.rs`).
+    "moe_dedup_mq4rs_gfx1201",
+    // Lane-batched twins the exact CbVmm route launches for the A3B DeltaNet
+    // mixer, the MoE block (also the fallback of the dedup kernels and the
+    // one-lane path) and the `wo` residual.
+    "conv1d_silu_split_qknorm_b256_rows",
+    "gated_delta_net_q8_compact2_b2_rows",
+    "gated_norm_mq_rotate_gfx1201_rows",
+    "gemv_mq4g128v2_moe_ninepath_d4_rows",
+    "gemv_mq4g256v2_moe_gate_up_k8_indexed_rows",
+    "gemv_mq4g256v2_residual_lanes_gfx1201",
+    "gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2_rows",
+    "moe_router_softmax_topk_k8_wave64_rows",
+];
+
+#[test]
+fn a3b_ar_post_measurement_decode_modules_ship_in_the_gfx1201_pack() {
+    let registry = entries("gfx1201", EXTRA_FLAGS).unwrap();
+    let rows = rows();
+    for module in A3B_AR_POST_MEASUREMENT_HIP_MODULES {
+        assert!(
+            registry.iter().any(|e| e.module == module),
+            "{module}: not registered for gfx1201 (a pack-only host cannot bind it)"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.route == "a3b-ar" && r.kind == "hip" && r.module == module),
+            "{module}: missing from the a3b-ar route of flagship-pack-gfx1201.tsv"
+        );
+    }
+}
+
+/// The gfx1201 Z/beta/alpha fold split the dense 27B verify batch
+/// (`gemm_zba_fold_g12_iu4_prepared`) launches after the v0.4.4 measurement:
+/// it must be registered for gfx1201 and listed in both verify routes.
+#[test]
+fn zba_fold_split_module_ships_in_the_gfx1201_pack() {
+    let module = "split_mq4v2_z_betaalpha";
+    let registry = entries("gfx1201", EXTRA_FLAGS).unwrap();
+    assert!(
+        registry
+            .iter()
+            .any(|e| e.module == module && e.symbols.contains(&"split_mq4v2_z_betaalpha_g12")),
+        "{module}: g12 split not registered for gfx1201 (a pack-only host cannot bind it)"
+    );
+    let rows = rows();
+    for route in ["27b-dflash-default", "27b-mtp"] {
+        assert!(
+            rows.iter()
+                .any(|r| r.route == route && r.kind == "hip" && r.module == module),
+            "{module}: missing from the {route} route of flagship-pack-gfx1201.tsv"
+        );
+    }
+}
+
+#[test]
+fn every_measured_flagship_hip_module_is_registered_exactly_on_gfx1201() {
+    assert_measured_hip_modules_registered("gfx1201", FLAGSHIP);
+}
+
+#[test]
+fn every_measured_flagship_hip_module_is_registered_exactly_on_gfx1151() {
+    assert_measured_hip_modules_registered("gfx1151", FLAGSHIP_1151);
+}
+
+#[test]
+fn every_measured_flagship_hip_module_is_registered_exactly_on_gfx1100() {
+    assert_measured_hip_modules_registered("gfx1100", FLAGSHIP_1100);
+}
+
+#[test]
+fn halo_and_rdna3_fixtures_pin_measured_route_counts() {
+    let cases: [(&str, &str, &[(&str, usize)]); 2] = [
+        (
+            "gfx1151",
+            FLAGSHIP_1151,
+            &[
+                ("27b-ar", 41),
+                ("27b-dflash-default", 59),
+                ("27b-mtp", 58),
+                ("a3b-ar-iu4off", 55),
+            ],
+        ),
+        (
+            "gfx1100",
+            FLAGSHIP_1100,
+            &[
+                ("27b-ar", 34),
+                ("27b-dflash-default", 55),
+                ("27b-mtp", 65),
+                ("fn-ar", 30),
+                ("fn-mtp", 36),
+                ("a3b-ar-iu4off", 53),
+            ],
+        ),
+    ];
+    for (arch, fixture, expected) in cases {
+        let rows = rows_of(fixture);
+        let counts = header_counts_of(fixture);
+        assert_eq!(counts.len(), expected.len(), "{arch}: route set");
+        for (route, hip) in expected {
+            assert_eq!(counts[*route], (*hip, 0), "{arch} {route}: header counts");
+            let mine: Vec<&Row> = rows.iter().filter(|r| r.route == *route).collect();
+            assert_eq!(mine.len(), *hip, "{arch} {route}: row count");
+            assert!(mine.iter().all(|r| r.arch == arch && r.kind == "hip"));
+            let unique: BTreeSet<&str> = mine.iter().map(|r| r.module.as_str()).collect();
+            assert_eq!(
+                unique.len(),
+                mine.len(),
+                "{arch} {route}: duplicate modules"
+            );
+        }
+    }
+}
+
+#[test]
+fn halo_select_regrid_and_topk_fixup_are_registered_on_gfx1151() {
+    let registry = entries("gfx1151", EXTRA_FLAGS).unwrap();
+    for m in ["select_regrid", "topk_values_fixup_f32"] {
+        assert!(
+            rows_of(FLAGSHIP_1151)
+                .iter()
+                .any(|r| r.module == m && r.kind == "hip"),
+            "{m} missing from the measured gfx1151 fixture"
+        );
+        assert!(
+            registry.iter().any(|e| e.module == m),
+            "{m} not registered for gfx1151"
+        );
+    }
 }
 
 #[test]
@@ -296,6 +459,100 @@ fn portable_flagship_subset_is_registered_on_every_release_arch() {
     assert!(
         failures.is_empty(),
         "portable coverage regressions:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// The exact BF16 split QSA selector is the exact-gfx1100 Flash-Next default
+/// (`HIPFIRE_QWEN4_QSA_SPLIT_GFX1100`, on unless `0`), so the gfx1100 AR and
+/// native-MTP route module sets must carry its two modules. The v0.4.4
+/// `flagship-pack-gfx1100.tsv` predates the default and is never regenerated;
+/// the required set is therefore its measured fn-ar / fn-mtp modules plus the
+/// walked gfx1100 plan's hip modules (which include the split modules) plus
+/// these two, each of which must be a registry entry (what `hipfire-kernel-pack`
+/// compiles) with the symbols the split launchers bind, the gfx1100 recipe, and
+/// the exact kernel source the gfx1201 measured rows pin. A module missing from
+/// the pack, from either walked route, or with a different source fails here.
+#[test]
+fn gfx1100_flash_next_pack_carries_the_bf16_split_qsa_modules() {
+    const SPLIT: [(&str, &[&str]); 2] = [
+        (
+            "qsa_bf16_scores",
+            &[
+                "indexed_attention_select_scores_rows16_bf16",
+                "indexed_attention_select_scores_rows8_bf16",
+            ],
+        ),
+        (
+            "qsa_filter_select",
+            &[
+                "qsa_filter_compact",
+                "qsa_filter_finish",
+                "qsa_filter_threshold",
+            ],
+        ),
+    ];
+    let pack = entries("gfx1100", EXTRA_FLAGS).unwrap();
+    let plan = walked_route_plans()
+        .unwrap()
+        .iter()
+        .find(|plan| plan.model_arch == 16 && plan.arch == "gfx1100")
+        .expect("walked gfx1100 Flash-Next plan");
+    let measured_1201 = rows();
+    let measured_1100 = rows_of(FLAGSHIP_1100);
+    let mut failures = Vec::new();
+    for (route, native_mtp, fixture_route) in
+        [("ar", false, "fn-ar"), ("native_mtp", true, "fn-mtp")]
+    {
+        let mut required: BTreeSet<&str> = measured_1100
+            .iter()
+            .filter(|r| r.route == fixture_route && r.kind == "hip")
+            .map(|r| r.module.as_str())
+            .collect();
+        let walked: BTreeSet<&str> = plan
+            .rows
+            .iter()
+            .filter(|row| row.native_mtp == native_mtp && !row.embedded)
+            .map(|row| row.module)
+            .collect();
+        required.extend(&walked);
+        required.extend(SPLIT.iter().map(|(module, _)| *module));
+        for module in &required {
+            if !pack.iter().any(|e| e.module == *module) {
+                failures.push(format!("gfx1100 {route}: {module} not in the pack"));
+            }
+        }
+        for (module, symbols) in SPLIT {
+            if !walked.contains(module) {
+                failures.push(format!("gfx1100 {route}: {module} not in the walked plan"));
+            }
+            let Some(e) = pack.iter().find(|e| e.module == module) else {
+                continue;
+            };
+            for symbol in symbols {
+                if !e.symbols.contains(symbol) {
+                    failures.push(format!("gfx1100 {route}: {module} lacks {symbol}"));
+                }
+            }
+            if !e.flags.iter().any(|f| f == "--offload-arch=gfx1100") {
+                failures.push(format!("gfx1100 {route}: {module} targets another arch"));
+            }
+            let pinned = measured_1201
+                .iter()
+                .find(|r| r.route == fixture_route && r.kind == "hip" && r.module == module)
+                .unwrap_or_else(|| panic!("{module}: no measured gfx1201 {fixture_route} row"));
+            if sha(e.source()) != pinned.sha256 {
+                failures.push(format!(
+                    "gfx1100 {route}: {module} source sha256 {} != pinned {}",
+                    sha(e.source()),
+                    pinned.sha256
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "gfx1100 Flash-Next split QSA pack regressions:\n{}",
         failures.join("\n")
     );
 }

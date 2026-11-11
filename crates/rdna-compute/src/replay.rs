@@ -22,11 +22,12 @@ use hip_bridge::HipRuntime;
 use radiowave::{CodeObjectCertification, KernelArgumentAccess, MutableReadCache};
 use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, FenceScope, Gfx10DispatchInitiatorPolicy,
-    Gfx10Pm4CommandBuffer, Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy,
-    Gfx11DispatchInterleave, Gfx12DispatchPacing, Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy,
-    GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector, HeaderPolicy, KernargBuffer,
-    KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy, Quiescence,
-    RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
+    Gfx10KernelImage, Gfx10Pm4CommandBuffer, Gfx10Scratch, Gfx10ScratchFamily, Gfx10ScratchPlan,
+    Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave,
+    Gfx12DispatchPacing, Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy, GpuBatchTiming, GpuDevice,
+    GpuMultiQueueTiming, GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel,
+    LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy, Quiescence, RecordedDispatch, Runtime,
+    SingleQueueBatchGraph, SingleQueuePm4Ib,
 };
 use redline_dispatch::{
     AllocationPolicy, BindingRevision, KernargAbi, KernargField, Recorder, ReplayBindings,
@@ -35,6 +36,7 @@ use redline_dispatch::{
 
 use crate::code_object::{CodeObjectId, RecordedArtifact};
 use crate::dispatch::VmmResourceMove;
+use crate::pm4_ledger;
 
 pub(crate) mod railgun_lower;
 pub(crate) mod railgun_shadow;
@@ -161,6 +163,111 @@ impl Pm4Architecture {
                 device_name
             ))
         }
+    }
+}
+
+/// Kill switch for retained gfx10/gfx11 PM4 scratch (private-segment) rings.
+/// Default on; `0`/`false`/`off` restores the pre-A5 behaviour where a kernel
+/// with a private segment refuses the retained route.
+const PM4_SCRATCH_ENV: &str = "HIPFIRE_PMSCRATCH_PM4_SCRATCH";
+/// Upper bound on one scratch ring's backing memory. The ring is sized for the
+/// device's full wave capacity; this only trims it for huge per-wave needs.
+const PM4_SCRATCH_RING_CAP_BYTES: u64 = 256 << 20;
+
+fn pm4_scratch_enabled() -> bool {
+    hipfire_config::developer_var(PM4_SCRATCH_ENV)
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        .unwrap_or(true)
+}
+
+/// The scratch rings one retained legacy (gfx10/gfx11) PM4 route owns: one
+/// constant `COMPUTE_TMPRING_SIZE` plan sized for the largest private segment
+/// of every retained kernel, and one backing allocation per queue lane.
+///
+/// Lane `i` of every phase runs on queue `i`, and phases are serialized by the
+/// graph, so a lane's ring is never shared by two live streams; concurrent
+/// lanes get distinct rings. Rings are plain device memory the route keeps
+/// alive for as long as its IBs exist, independent of hipfire's scratch-buffer
+/// growth (which only re-resolves resource bindings in kernargs).
+struct Pm4ScratchRings {
+    plan: Option<Gfx10ScratchPlan>,
+    pool: Option<KernargPool>,
+    rings: Vec<(KernargBuffer, Gfx10Scratch)>,
+}
+
+impl Pm4ScratchRings {
+    fn for_kernels(
+        architecture: Pm4Architecture,
+        device: &GpuDevice,
+        kernels: &[Kernel],
+    ) -> Result<Self, String> {
+        let none = Self {
+            plan: None,
+            pool: None,
+            rings: Vec::new(),
+        };
+        let family = match architecture {
+            Pm4Architecture::Gfx10 => Gfx10ScratchFamily::Gfx10,
+            Pm4Architecture::Gfx11 => Gfx10ScratchFamily::Gfx11,
+            Pm4Architecture::Gfx12 => return Ok(none),
+        };
+        if !pm4_scratch_enabled() {
+            return Ok(none);
+        }
+        // Kernels whose descriptor cannot be adapted fail at their own
+        // dispatch with the kernel's name; they do not size the ring.
+        let required = kernels
+            .iter()
+            .filter_map(|kernel| Gfx10KernelImage::from_hsa(kernel).ok())
+            .map(|image| image.scratch_bytes_per_wave())
+            .max()
+            .unwrap_or(0);
+        if required == 0 {
+            return Ok(none);
+        }
+        let topology = device
+            .scratch_topology()
+            .map_err(|error| format!("PM4 scratch topology: {error}"))?;
+        let plan = Gfx10ScratchPlan::new(family, topology, required, PM4_SCRATCH_RING_CAP_BYTES)
+            .map_err(|error| format!("PM4 scratch ring: {error}"))?;
+        let pool = KernargPool::discover_device_local(device)
+            .map_err(|error| format!("PM4 scratch pool: {error}"))?;
+        eprintln!(
+            "[redline] PM4 scratch ring arch={} need_per_wave={required} bytes_per_wave={} \
+             wave_slots={} backing_bytes_per_lane={} tmpring_size={:#010x}",
+            device.name(),
+            plan.bytes_per_wave(),
+            plan.slots(),
+            plan.backing_bytes(),
+            plan.tmpring_size(),
+        );
+        Ok(Self {
+            plan: Some(plan),
+            pool: Some(pool),
+            rings: Vec::new(),
+        })
+    }
+
+    /// The ring for queue lane `lane`, allocating it (and any lower lane's) on
+    /// first use. `None` when no retained kernel has a private segment.
+    fn ring(&mut self, lane: usize) -> Result<Option<Gfx10Scratch>, String> {
+        let (Some(plan), Some(pool)) = (self.plan, self.pool.as_ref()) else {
+            return Ok(None);
+        };
+        while self.rings.len() <= lane {
+            let backing = pool
+                .allocate_scratch_backing(plan.backing_bytes() as usize)
+                .map_err(|error| format!("PM4 scratch backing: {error}"))?;
+            let scratch = plan
+                .bind(backing.address() as usize as u64)
+                .map_err(|error| format!("PM4 scratch backing: {error}"))?;
+            self.rings.push((backing, scratch));
+        }
+        Ok(Some(self.rings[lane].1))
+    }
+
+    fn into_backings(self) -> Vec<KernargBuffer> {
+        self.rings.into_iter().map(|(backing, _)| backing).collect()
     }
 }
 
@@ -397,6 +504,36 @@ impl Pm4Commands {
             }
         }
     }
+
+    /// The architecture-matched system-scope `ACQUIRE_MEM` for a railgun
+    /// `Rung::System` boundary: `acquire_system_gfx12` (GCR 0xc3b1) on gfx12,
+    /// ROCr's gfx10+ system acquire on a legacy stream.
+    fn system_acquire(&mut self) {
+        match self {
+            Self::Gfx12(commands) => commands.acquire_system_gfx12(),
+            Self::Legacy { commands, .. } => commands.acquire_system(),
+        }
+    }
+
+    /// The PM4 architecture this stream was built for.
+    fn architecture(&self) -> Pm4Architecture {
+        match self {
+            Self::Gfx12(_) => Pm4Architecture::Gfx12,
+            Self::Legacy { architecture, .. } => *architecture,
+        }
+    }
+
+    /// The gfx11 command dwords (railgun's owned gfx1100 lowering checks them).
+    fn gfx11_dwords(&self) -> Option<&[u32]> {
+        match self {
+            Self::Legacy {
+                architecture: Pm4Architecture::Gfx11,
+                commands,
+                ..
+            } => Some(commands.dwords()),
+            _ => None,
+        }
+    }
     /// Trailing release at the tape terminal: drain shaders, then emit the
     /// architecture-matched full-system acquire so GL2 is written back for a
     /// non-shader next consumer (e.g. an SDMA H2D copy). `CS_PARTIAL_FLUSH`
@@ -457,6 +594,14 @@ impl Pm4Commands {
             Self::Gfx12(commands) => commands
                 .dispatch(kernel, geometry, dynamic_group_bytes, kernarg_address)
                 .map_err(|error| error.to_string()),
+        }
+    }
+
+    /// Pin the route's scratch ring on this stream (legacy gfx10/gfx11 only;
+    /// gfx12 has none and `None` leaves the stream untouched).
+    fn set_scratch(&mut self, scratch: Option<Gfx10Scratch>) {
+        if let (Self::Legacy { commands, .. }, Some(scratch)) = (self, scratch) {
+            *commands = std::mem::take(commands).with_scratch(scratch);
         }
     }
 
@@ -931,6 +1076,26 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             read(48),
             write(56),
+        ]);
+    }
+    if kernel == "fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201" {
+        // A0..A3 weights, x, norm weight, signs1, signs2 (read); y0..y3 and
+        // the rotated x_rot (write). A qkv (3-source) launch passes A3/y3 as
+        // aliases of A2/y2 with m3 == 0.
+        return Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            read(40),
+            read(48),
+            read(56),
+            write(64),
+            write(72),
+            write(80),
+            write(88),
+            write(96),
         ]);
     }
     if matches!(
@@ -1779,6 +1944,10 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_mixed_moe_down_k8_indexed_batched_expanded"
     ) {
         return Some(64);
+    }
+    if kernel == "fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201" {
+        // 13 ptr + m0..m3 + nw + eps = 128 explicit bytes (no hidden arguments).
+        return Some(128);
     }
     if matches!(
         kernel,
@@ -4403,6 +4572,34 @@ fn replay_sequence_hash<'a>(launches: impl IntoIterator<Item = &'a RecordedHipLa
     hash
 }
 
+/// One retained launch as a dispatch-ledger row (`HIPFIRE_REDLINE_LEDGER`).
+/// Only called with the ledger on, at prepare time.
+fn ledger_dispatch_row(launch: &RecordedHipLaunch) -> pm4_ledger::DispatchRow {
+    pm4_ledger::DispatchRow {
+        kernel: launch.kernel.clone(),
+        artifact: pm4_ledger::ArtifactRow::of(
+            launch
+                .artifact
+                .as_deref()
+                .expect("prepare resolved an owning code object for every retained launch"),
+        ),
+        grid: launch.grid,
+        block: launch.block,
+        shared_mem: launch.shared_mem,
+        grid_binding: launch.grid_binding.map(
+            |ReplayGridBinding::PositionCeilDiv {
+                 axis,
+                 addend,
+                 divisor,
+             }| pm4_ledger::GridBindingRow {
+                axis,
+                addend,
+                divisor,
+            },
+        ),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReplayObservation {
     pub count: u64,
@@ -4915,7 +5112,25 @@ impl PreparedPm4Graph {
     unsafe fn replay_and_wait_profiled_checked(
         &mut self,
     ) -> Result<GpuMultiQueueTiming, (redline_dispatch::aql::ReplayError, Quiescence)> {
-        if dispatch_profile_enabled() {
+        // SAFETY: same contract as this method's # Safety.
+        unsafe { self.replay_and_wait_profiled_spans(None) }
+    }
+
+    /// [`Self::replay_and_wait_profiled_checked`] that also hands the
+    /// per-dispatch spans of an instrumented single-queue tape to `spans_out`
+    /// (`HIPFIRE_REDLINE_LEDGER_TIMING`). `None` is exactly the historical
+    /// behaviour; a phased tape has no per-dispatch spans and leaves
+    /// `spans_out` untouched.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::replay_and_wait_profiled_checked`].
+    unsafe fn replay_and_wait_profiled_spans(
+        &mut self,
+        spans_out: Option<&mut Vec<u64>>,
+    ) -> Result<GpuMultiQueueTiming, (redline_dispatch::aql::ReplayError, Quiescence)> {
+        let diagnostic = dispatch_profile_enabled();
+        if diagnostic || spans_out.is_some() {
             if let Self::Single(graph) = self {
                 // Execute the instrumented graph once. Reuse the same timestamp
                 // vector for whole-tape timing and the one-line legacy report.
@@ -4924,8 +5139,12 @@ impl PreparedPm4Graph {
                     .map_err(|(error, q)| (error, q))?;
                 static REPORTED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
-                if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                if diagnostic && !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     report_dispatch_spans(&spans);
+                }
+                if let Some(out) = spans_out {
+                    out.clear();
+                    out.extend_from_slice(&spans);
                 }
                 return Ok(timing);
             }
@@ -5040,6 +5259,9 @@ pub struct PreparedPm4Replay {
     /// through every replay; dropped only after queue quiescence via normal
     /// PreparedPm4Replay teardown (field order: graph first).
     _dependency_fence: Option<KernargBuffer>,
+    /// Scratch-ring backing allocations (one per queue lane) the IBs address
+    /// by absolute VA; freed only after `graph` has quiesced.
+    _scratch: Vec<KernargBuffer>,
     dynamic_gdn_frames: Vec<usize>,
     dynamic_kernarg_bindings: Vec<(usize, ReplayKernargBinding)>,
     dynamic_grids: Vec<(usize, ReplayGridBinding, [u32; 3], [u32; 3])>,
@@ -5058,6 +5280,9 @@ pub struct PreparedPm4Replay {
     /// and u32 dynamic bindings). Precomputed once at prepare time.
     bound_exempt_ranges: Vec<Vec<(usize, usize)>>,
     encoded_revision: BindingRevision,
+    /// Replay counters of the dispatch ledger (`HIPFIRE_REDLINE_LEDGER`);
+    /// `None` unless the ledger is on, in which case replay does nothing extra.
+    ledger: Option<std::sync::Arc<pm4_ledger::Program>>,
 }
 
 impl PreparedPm4Replay {
@@ -5165,16 +5390,26 @@ impl PreparedPm4Replay {
         }
         crate::gap_timing::add_since(crate::gap_timing::Slot::Patch, patch_started);
         let wait_started = crate::gap_timing::now();
+        // Ledger timing mode (`HIPFIRE_REDLINE_LEDGER_TIMING`) asks the
+        // instrumented tape for its per-dispatch spans; otherwise `None` and
+        // an empty (unallocated) vector: the historical replay.
+        let mut ledger_spans = Vec::new();
+        let want_spans = self
+            .ledger
+            .as_deref()
+            .is_some_and(pm4_ledger::Program::wants_spans);
         // SAFETY: forwarded from the caller that owns the model allocations.
-        let result = unsafe { self.graph.replay_and_wait_profiled_checked() }.map_err(
-            |(error, quiescence)| RetainedReplayFailure {
-                error: error.to_string(),
-                quiescence: match quiescence {
-                    Quiescence::Proven => ReplayQuiescence::Proven,
-                    Quiescence::Unknown => ReplayQuiescence::Unknown,
-                },
+        let result = unsafe {
+            self.graph
+                .replay_and_wait_profiled_spans(want_spans.then_some(&mut ledger_spans))
+        }
+        .map_err(|(error, quiescence)| RetainedReplayFailure {
+            error: error.to_string(),
+            quiescence: match quiescence {
+                Quiescence::Proven => ReplayQuiescence::Proven,
+                Quiescence::Unknown => ReplayQuiescence::Unknown,
             },
-        );
+        });
         crate::gap_timing::add_since(crate::gap_timing::Slot::SubmitWait, wait_started);
         if let Ok(timing) = &result {
             crate::gap_timing::add_ns(
@@ -5184,6 +5419,16 @@ impl PreparedPm4Replay {
                     .saturating_sub(timing.first_start)
                     .saturating_mul(1_000_000_000)
                     / timing.frequency_hz.max(1),
+            );
+        }
+        if let (Some(ledger), Ok(timing)) = (self.ledger.as_deref(), &result) {
+            ledger.note_replay(
+                timing
+                    .last_end
+                    .saturating_sub(timing.first_start)
+                    .saturating_mul(1_000_000_000)
+                    / timing.frequency_hz.max(1),
+                &ledger_spans,
             );
         }
         result
@@ -6113,6 +6358,9 @@ impl ReplayController {
         dispatch_profile: bool,
         allow_uncalibrated: bool,
     ) -> Result<(usize, u32, u64), String> {
+        // `HIPFIRE_REDLINE_LEDGER_TIMING=1` (ledger on): prepare the per-dispatch
+        // timestamp tape. Perturbing and recorded as such; off unless requested.
+        let dispatch_profile = dispatch_profile || pm4_ledger::timing_requested();
         if !allow_uncalibrated && !self.position_bindings_calibrated {
             return Err(
                 "position bindings not calibrated; call synthesize_position_bindings or explicitly opt out via prepare_pm4_prefix_allow_uncalibrated".to_owned(),
@@ -6245,6 +6493,7 @@ impl ReplayController {
             kernargs.push(kernarg);
             geometries.push(geometry);
         }
+        let mut scratch_rings = Pm4ScratchRings::for_kernels(pm4_architecture, &device, &kernels)?;
         // GDN frames, synthesized position bindings and engine-declared
         // bindings, from the one builder the recorded-HIP oracle also uses. New
         // tapes leave the legacy `dynamic_gdn_frames` vector empty so replay has
@@ -6365,6 +6614,9 @@ impl ReplayController {
         }
         let mut dependency_fence = None;
         let mut dispatch_boundaries = Vec::new();
+        // Execution-slot -> recorded-index map for the ledger, only when the
+        // single-IB reorder permutes the tape and the ledger is on.
+        let mut ledger_exec_order: Option<Vec<usize>> = None;
         let (graph, command_dwords) = if queue_limit == 1 {
             let recorded = &self.recorded[..prefix];
             let reorder_window = pm4_single_ib_reorder_from_config(device.name());
@@ -6396,6 +6648,9 @@ impl ReplayController {
                     order
                 }
             };
+            if reorder_window.is_some() && pm4_ledger::enabled() {
+                ledger_exec_order = Some(order.clone());
+            }
             let dependency_mode = match gfx1010_dependency {
                 Gfx1010DependencyPolicy::ReleaseWait => {
                     let fence = pool
@@ -6423,6 +6678,7 @@ impl ReplayController {
                 resource_limits_policy,
                 dependency_mode,
             );
+            commands.set_scratch(scratch_rings.ring(0)?);
             let pacing = if dispatch_profile {
                 Gfx12DispatchPacing::None
             } else {
@@ -6769,7 +7025,7 @@ impl ReplayController {
                 };
                 if lane_count > 1 {
                     let mut lanes = (0..lane_count)
-                        .map(|_| {
+                        .map(|lane_index| -> Result<Pm4Commands, String> {
                             let mut commands = Pm4Commands::new(
                                 pm4_architecture,
                                 self.pm4_register_policy,
@@ -6777,10 +7033,11 @@ impl ReplayController {
                                 dispatch_interleave,
                                 resource_limits_policy,
                             );
+                            commands.set_scratch(scratch_rings.ring(lane_index)?);
                             commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
-                            commands
+                            Ok(commands)
                         })
-                        .collect::<Vec<_>>();
+                        .collect::<Result<Vec<_>, String>>()?;
                     let lane_indices = if let Some(split) = phase.lane_split {
                         if lane_count != 2 || split == 0 || split >= phase.indices.len() {
                             return Err(format!(
@@ -6861,6 +7118,7 @@ impl ReplayController {
                     dispatch_interleave,
                     resource_limits_policy,
                 );
+                commands.set_scratch(scratch_rings.ring(0)?);
                 commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
                 let mut resource_frontier = ResourceFrontier::default();
                 for (position, index) in phase.indices.iter().copied().enumerate() {
@@ -6979,6 +7237,29 @@ impl ReplayController {
             &dynamic_kernarg_bindings,
             &dynamic_gdn_frames,
         );
+        // Retain-time dispatch ledger (`HIPFIRE_REDLINE_LEDGER`): one row per
+        // retained dispatch, written here and never on the replay path.
+        let ledger = if pm4_ledger::enabled() {
+            pm4_ledger::register_program(
+                pm4_ledger::ProgramMeta {
+                    device_ordinal,
+                    arch: device.name().to_owned(),
+                    pm4_architecture: format!("{pm4_architecture:?}"),
+                    command_dwords,
+                    queue_id,
+                    queues: graph.queue_count(),
+                    phases: graph.phase_count(),
+                    sequence_hash: replay_sequence_hash(self.recorded.iter().take(prefix)),
+                    exec_order: ledger_exec_order,
+                    timing: dispatch_profile,
+                    pid: std::process::id(),
+                    prepared_unix_ms: pm4_ledger::unix_ms(),
+                },
+                self.recorded.iter().take(prefix).map(ledger_dispatch_row),
+            )
+        } else {
+            None
+        };
         self.prepared_pm4 = Some(PreparedPm4Replay {
             graph,
             _kernels: kernels,
@@ -6987,6 +7268,7 @@ impl ReplayController {
                 .rposition(|kernarg| kernarg.is_device_local() && !kernarg.is_empty()),
             kernargs,
             _dependency_fence: dependency_fence,
+            _scratch: scratch_rings.into_backings(),
             dynamic_gdn_frames,
             dynamic_kernarg_bindings,
             dynamic_grids,
@@ -6998,6 +7280,7 @@ impl ReplayController {
             bound_explicit_lens,
             bound_exempt_ranges,
             encoded_revision: self.binding_revision,
+            ledger,
         });
         self.route_identities_sealed = true;
         self.state = ReplayState::Ready;
@@ -7175,6 +7458,9 @@ impl ReplayController {
             }
         }
         // Quiescence proven: safe to release retained resources.
+        // Replays are complete: persist the ledger's cumulative counters (no-op
+        // unless `HIPFIRE_REDLINE_LEDGER` is set).
+        pm4_ledger::flush_all();
         self.prepared_pm4 = None;
         self.prepared = None;
         self.prepared_max_position = None;
@@ -8572,6 +8858,7 @@ mod tests {
         "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
         "fused_qkv_mq4g256v2",
         "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100",
+        "fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201",
         "fused_gate_up_mq4g256v2",
         "fused_gate_up_mq4g256v2_k5120_gfx1100",
         "fused_gate_up_mq4g256v2_k5120_gfx1201",

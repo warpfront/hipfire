@@ -47,6 +47,25 @@ fn ngram_mod_env_config() -> Option<NgramModConfig> {
     }
 }
 
+/// Verify-batch ceiling [`Qwen35MtpDrafter::ensure_state`] builds its
+/// `MtpSpecState` with for chain depth `max_n`: widened to the configured
+/// n-gram ceiling only when the process explicitly enables the modifier.
+pub fn mtp_verify_capacity(max_n: usize) -> usize {
+    if hipfire_config::mtp_ngram_enabled() {
+        ngram_mod_env_config()
+            .map(|cfg| max_n.max(cfg.n_max))
+            .unwrap_or(max_n)
+    } else {
+        max_n
+    }
+}
+
+/// Chain depth the drafter actually runs with for a requested depth
+/// (`Qwen35MtpDrafter::new` clamps to 1..=8).
+pub fn mtp_drafter_max_n(requested: usize) -> usize {
+    requested.clamp(1, 8)
+}
+
 /// qwen35 MTP drafter. `state` is allocated on the first `mtp_prefill` (it needs
 /// `&mut Gpu` + the concrete `ModelSlot`, neither available at load-time
 /// construction). Sampling is installed once per request via
@@ -116,7 +135,7 @@ impl Qwen35MtpDrafter {
             state: None,
             tp: None,
             tp_reset_pending: false,
-            max_n: max_n.clamp(1, 8),
+            max_n: mtp_drafter_max_n(max_n),
             ctx_capacity,
             request: SpecRequestConfig::default(),
             ar_repeat_cap: PENALTY_REPEAT_CAP,
@@ -270,13 +289,7 @@ impl Qwen35MtpDrafter {
             }
         }
         if self.state.is_none() {
-            let verify_capacity = if hipfire_config::mtp_ngram_enabled() {
-                ngram_mod_env_config()
-                    .map(|cfg| self.max_n.max(cfg.n_max))
-                    .unwrap_or(self.max_n)
-            } else {
-                self.max_n
-            };
+            let verify_capacity = mtp_verify_capacity(self.max_n);
             let mut st = MtpSpecState::new_for_slot_with_kv_mode_and_verify_capacity(
                 gpu,
                 slot,
@@ -456,11 +469,12 @@ impl MtpDrafter for Qwen35MtpDrafter {
             fill_tokens,
             start_pos,
             prompt_route,
-            |gpu, dn_state, position| {
+            |gpu, dn_state, kv, position| {
                 if checkpoint_resume {
                     take_dn_checkpoint(
                         &mut checkpoints,
                         dn_state,
+                        kv,
                         gpu,
                         position,
                         checkpoint_interval,

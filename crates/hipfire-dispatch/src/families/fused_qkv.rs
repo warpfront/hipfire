@@ -610,6 +610,12 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             gpu.maybe_capture_activation(wk, x, __cap_n, k);
             gpu.maybe_capture_activation(wv, x, __cap_n, k);
             match params.batch_size {
+                Some(n) if super::gemm::mq3v25_a8_route(&gpu.flags, gpu.mq3v2_symmetric, n) => {
+                    hip!(gpu.gemm_qkv_mq3v25_iu8(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
+                }
+                Some(n) if super::gemm::mq3v25_route(&gpu.flags, gpu.mq3v2_symmetric, n, mq) => {
+                    hip!(gpu.gemm_qkv_mq3v25_iu4(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
+                }
                 Some(n) => {
                     hip!(gpu.gemm_qkv_mq3g256v2_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
                 }
@@ -939,6 +945,16 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             gpu.maybe_capture_activation(wb, x, __cap_n, k);
             gpu.maybe_capture_activation(wa, x, __cap_n, k);
             match params.batch_size {
+                Some(n) if super::gemm::mq3v25_a8_route(&gpu.flags, gpu.mq3v2_symmetric, n) => {
+                    hip!(gpu.gemm_qkvza_mq3v25_iu8(
+                        wqkv, wz, wb, wa, x, qkv, z, beta, alpha, mqkv, mz, mb, ma, k, n
+                    ))
+                }
+                Some(n) if super::gemm::mq3v25_route(&gpu.flags, gpu.mq3v2_symmetric, n, mqkv) => {
+                    hip!(gpu.gemm_qkvza_mq3v25_iu4(
+                        wqkv, wz, wb, wa, x, qkv, z, beta, alpha, mqkv, mz, mb, ma, k, n
+                    ))
+                }
                 Some(n) => hip!(gpu.gemm_qkvza_mq3g256v2_wmma(
                     wqkv, wz, wb, wa, x, qkv, z, beta, alpha, mqkv, mz, mb, ma, k, n
                 )),
@@ -1298,6 +1314,12 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             gpu.maybe_capture_activation(wg, x, __cap_n, k);
             gpu.maybe_capture_activation(wu, x, __cap_n, k);
             match params.batch_size {
+                Some(n) if super::gemm::mq3v25_a8_route(&gpu.flags, gpu.mq3v2_symmetric, n) => {
+                    hip!(gpu.gemm_gate_up_mq3v25_iu8(wg, wu, x, g, u, mg, mu, k, n))
+                }
+                Some(n) if super::gemm::mq3v25_route(&gpu.flags, gpu.mq3v2_symmetric, n, mg) => {
+                    hip!(gpu.gemm_gate_up_mq3v25_iu4(wg, wu, x, g, u, mg, mu, k, n))
+                }
                 Some(n) => {
                     hip!(gpu.gemm_gate_up_mq3g256v2_wmma(wg, wu, x, g, u, mg, mu, k, n))
                 }

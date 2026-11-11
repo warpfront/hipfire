@@ -918,6 +918,10 @@ impl NpuForward {
                 );
             }
             eprintln!("npu-trunk: mode={mode} families={:#x} contract=bf16_direct trunk_route={trunk_route} zab_source={zab_source} pack_ms={pack_ms:.3} download_ms={download_ms:.3} resident_bytes={resident_bytes} npu_panels_bytes={npu_panels_bytes} gpu_twin_bytes={gpu_twin_bytes} bank_b_bytes={bank_b_bytes} runtime={} raw=DtoH(no-retained-host-copy)", families.bits(), if runtime.is_some() { "open" } else { "not-opened" });
+            hipfire_config::load_summary::note(
+                hipfire_config::load_summary::Facet::Prefill,
+                format!("npu trunk mode={mode} route={trunk_route}"),
+            );
             let rates = (mode == NpuTrunkMode::Auto && runtime.is_some()).then(|| {
                 coproc::RateEstimator::new(calibration.as_ref().expect("auto calibration").clone())
             });
@@ -2150,6 +2154,7 @@ impl NpuForward {
         // No tape can contain relay/host operations. Decode retains its old route.
         gpu.replay.set_forward_eligible(false);
         owner.uploaded_id_rows = 0;
+        owner.lane_uploaded_ids.1.clear();
         // Bank A adopts the first-tile PLE ticket started at admission; bank
         // B's rows are enqueued once A's fetch owns the epoch and adopted by
         // B's initialization (rows are a pure function of their ids).

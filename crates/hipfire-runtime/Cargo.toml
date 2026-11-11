@@ -165,9 +165,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 # not listed here (bench_q8, probe_wmma, dump_meta, …) build under any
 # feature combination.
 
-# Raw PM dense-row K1 GPU byte oracle (no production dispatch wiring).
+# GPU oracle + bench of `lane_draw::lane_draws` (the lane-wide sampled verify):
+# p tables vs the device-law host model, verdicts, chi-square distribution, timing.
 [[example]]
-name = "mq_i4_rows_byte_oracle"
+name = "lane_draw_bench"
 required-features = ["lab"]
 
 # K2 G1 oracle for the MQ3-I4 NT1 gate/up (raw PM module; no production dispatch).
@@ -180,14 +181,41 @@ required-features = ["lab"]
 name = "qwen4_moe_sym_e8p_g1_oracle"
 required-features = ["lab"]
 
-# Raw PM K3 (R128 / K640 A4 producer) GPU runner for the byte oracle (no production dispatch wiring).
-[[example]]
-name = "mq_i4_a4_byte_oracle"
-required-features = ["lab"]
-
 # Raw PM K1 MoE decode-GEMV G1 byte oracle + timing runner (no production dispatch wiring).
 [[example]]
 name = "mq_i4_moe_gemv_byte_oracle"
+required-features = ["lab", "rdna-compute/lab"]
+
+# F1 drop-zero planar vs shipped MQ4 expert launcher byte oracle (real layers, on card).
+[[example]]
+name = "f1_planar_byte_oracle"
+required-features = ["lab"]
+
+# C8 routed-expert kernel roofline (real expert tensors, VRAM-resident, EP2 C8 AR shape).
+[[example]]
+name = "moe_c8_roofline"
+required-features = ["lab"]
+
+# S3 wide-pass routed-expert byte oracle + A/B (production vs g32 gate/up on real expert tensors).
+[[example]]
+name = "moe_wide_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "moe_gu_few_pm_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "moe_gu_c8_pm_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "moe_down_c8_pm_oracle"
+required-features = ["lab"]
+
+# S3 per-pick routed-down byte oracle + A/B (production k640_r4 vs dni on real expert tensors).
+[[example]]
+name = "moe_down_oracle"
 required-features = ["lab"]
 
 # K-E2 E8P-on-IU4 pointer-addressed MoE decode GEMV oracle + row-time runner (raw PM module; no production dispatch wiring).
@@ -208,6 +236,11 @@ required-features = ["lab"]
 # Raw PM gfx1100 MQ-I4 MoE decode GEMV G1 runner (no production dispatch wiring).
 [[example]]
 name = "mq_i4_moe_gemv_gfx1100_g1"
+required-features = ["lab"]
+
+# Raw PM gfx1100 W3 (MQ3-I4) K1 decode-GEMV byte oracle + microbench (no production dispatch wiring).
+[[example]]
+name = "mq_i4_moe_gemv_gfx1100_w3_g1"
 required-features = ["lab"]
 
 # Raw PM gfx1100 MQ-I4 A4 producer G1 oracle (no production dispatch wiring).
@@ -279,6 +312,10 @@ required-features = []
 
 [[example]]
 name = "eval_hipfire"
+required-features = ["deltanet"]
+
+[[example]]
+name = "gguf_native_gen"
 required-features = ["deltanet"]
 
 [[example]]
@@ -856,6 +893,11 @@ required-features = ["lab"]
 name = "ep2_boundary_micro"
 required-features = ["lab"]
 
+# Dead grouped-row store skip (HIPFIRE_QWEN4_MOE_DEAD_STORES) byte oracle + A/B on real expert tensors: production o8_r16 down, zero stores vs skip.
+[[example]]
+name = "moe_dead_rows_oracle"
+required-features = ["lab"]
+
 [[example]]
 name = "moe_nan_guard_regress"
 required-features = ["lab"]
@@ -863,4 +905,37 @@ required-features = ["lab"]
 # DFlash railgun window GPU oracle (design A); `--features lab`.
 [[example]]
 name = "dflash_selector_greedy_oracle"
+required-features = ["lab"]
+
+# Two-card exactness oracle of the fused TP2 all-reduce + HC write (Flash-Next trunk shard);
+# `--features lab`.
+[[example]]
+name = "ar_hc_write_oracle"
+required-features = ["lab"]
+
+# Two-card latency/bandwidth bench of the same launch; `--features lab`.
+[[example]]
+name = "ar_hc_write_bench"
+required-features = ["lab"]
+
+# Two-card torn/stale/sentinel negative tests of the dense AR wire; `--features lab`.
+[[example]]
+name = "ar_hc_write_tear_oracle"
+required-features = ["lab"]
+
+# Two-card byte oracle (+ bench) of the SP reduce-scatter / all-gather launches against the
+# all-reduce launch; `--features lab`.
+[[example]]
+name = "sp_rs_ag_oracle"
+required-features = ["lab"]
+
+# Two-card byte oracle (+ bench) of the sequence-parallel QSA selection (own-range select, compact
+# block-id all-gather, expand) against the full-tile select; `--features lab`.
+[[example]]
+name = "qsa_sp_gather_oracle"
+required-features = ["lab"]
+
+# Load-path benches (HFQ direct reader grid); developer-only.
+[[example]]
+name = "bench_hfq_reader"
 required-features = ["lab"]

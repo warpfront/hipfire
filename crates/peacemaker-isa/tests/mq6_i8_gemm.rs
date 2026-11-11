@@ -11,7 +11,7 @@
 //! out-of-tile word is checked against a sentinel.
 use peacemaker_ir::emu::{Emulator, Launch, Memory};
 use peacemaker_ir::inst::Frontend;
-use peacemaker_isa::kernels::mq6_i8_gemm::{self, spec, Epi, Spec, Tile};
+use peacemaker_isa::kernels::mq6_i8_gemm::{self, spec, Epi, RingDepth, Spec, Tile, Tune};
 use peacemaker_isa::Arch;
 
 const KERNARG: u64 = 0x1_0000;
@@ -189,10 +189,15 @@ fn run(c: &Case, epi: Epi, seed: u64) {
 /// Run `tile`'s kernel (linear raster) on the interpreter over the whole grid, require the exact
 /// CPU reference bit for bit, and return the output bytes.
 fn run_tile(c: &Case, epi: Epi, tile: Tile, seed: u64) -> Vec<u8> {
+    run_spec(c, Spec::emulation(epi).with_tile(tile), seed)
+}
+
+/// [`run_tile`] for any emulation spec (generator knobs included).
+fn run_spec(c: &Case, spec: Spec, seed: u64) -> Vec<u8> {
+    let (epi, tile) = (spec.epi, spec.tile);
     let rng = &mut Rng(seed);
     let data = make(rng, c);
     let want = reference(c, &data, epi);
-    let spec = Spec::emulation(epi).with_tile(tile);
     let emitted = mq6_i8_gemm::emit(spec).unwrap();
     let elf = peacemaker_isa::native::assemble(&emitted.s_text, Arch::Gfx1201).unwrap();
     let program = peacemaker_lift::lift_object(
@@ -232,7 +237,7 @@ fn run_tile(c: &Case, epi: Epi, tile: Tile, seed: u64) -> Vec<u8> {
                     kernarg_ptr: KERNARG,
                     workgroup: [gx_i, gy_i, 0],
                     block: [tile.threads(), 1, 1],
-                    dynamic_lds: tile.layout().launch,
+                    dynamic_lds: spec.launch_lds(),
                 },
                 &mut mem,
             )
@@ -613,7 +618,8 @@ fn gfx1201_only() {
             epi: Epi::Set,
             raster: mq6_i8_gemm::Raster::Banded,
             tile: Tile::T128x128,
-            arch
+            arch,
+            tune: Default::default(),
         })
         .is_err());
     }
@@ -831,7 +837,7 @@ fn set_nr_validates_only_on_the_wide_row_tile() {
 }
 
 /// The norm+RoPE epilogue changes nothing in the K loop: `set_nr`'s hot-loop census equals the plain
-/// `256x128` entry's, the kernel stays inside the occupancy ceiling, and what it adds after the K
+/// `256x128` entry's (bar the plain entry's `s_delay_alu` hints and `s_wait_dscnt` placement), the kernel stays inside the occupancy ceiling, and what it adds after the K
 /// loop is the documented epilogue: four staging passes and the RoPE exchange (16 b128 stores
 /// each), the inverse-RMS store, one `v_rsq_f32` and 13 barriers (the K loop's rings retire, two per
 /// staging pass, two each for the inverse RMS and the exchange).
@@ -839,10 +845,18 @@ fn set_nr_validates_only_on_the_wide_row_tile() {
 fn set_nr_keeps_the_hot_loop_and_adds_the_documented_epilogue() {
     let plain = mq6_i8_gemm::emit(Spec::product(Epi::Set).with_tile(Tile::T256x128)).unwrap();
     let nr = mq6_i8_gemm::emit(Spec::product(Epi::SetNr).with_tile(Tile::T256x128)).unwrap();
-    assert_eq!(
-        mq6_i8_gemm::hot_loop_census(&plain.s_text),
-        mq6_i8_gemm::hot_loop_census(&nr.s_text)
-    );
+    // The plain entries run the stacked schedule (`Spec::stacked`): `s_delay_alu` issue hints and
+    // another `s_wait_dscnt` placement; `set_nr` keeps the plain schedule. Every other counted
+    // instruction of the loop is the same.
+    let census = |text: &str| {
+        let mut c = mq6_i8_gemm::hot_loop_census(text);
+        c.remove("s_delay_alu");
+        c.remove("s_wait_dscnt");
+        c
+    };
+    assert!(mq6_i8_gemm::hot_loop_census(&plain.s_text).contains_key("s_delay_alu"));
+    assert!(!mq6_i8_gemm::hot_loop_census(&nr.s_text).contains_key("s_delay_alu"));
+    assert_eq!(census(&plain.s_text), census(&nr.s_text));
     assert!(nr.shape.next_free_vgpr <= spec::VGPR_CEILING);
     assert_eq!(nr.shape.wmma, plain.shape.wmma);
     let count = |text: &str, name: &str| {
@@ -857,4 +871,162 @@ fn set_nr_keeps_the_hot_loop_and_adds_the_documented_epilogue() {
     assert_eq!(added("s_barrier_signal"), 13);
     assert_eq!(added("s_barrier_wait"), 13);
     assert_eq!(added("v_wmma_i32_16x16x16_iu8"), 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ring depth 3 (`Tune { ring: Three }`): scheduling only, the result bits are depth 2's.
+
+fn ring3(spec: Spec) -> Spec {
+    spec.with_tune(Tune {
+        ring: RingDepth::Three,
+    })
+}
+
+/// Depth 3 on the shipped tile equals the CPU reference (hence the depth-2 kernel) bit for bit at
+/// every `K` residue class of the three-group period: `n = K/256 - 1` full groups before the peeled
+/// one, `r = n % 3` leading groups (K = 256: r 0, q 0; 512: r 1; 768: r 2; 1024: r 0, q 1; 1280:
+/// r 1, q 1; 1536: r 2, q 1; 2560: r 0, q 3; 3328: r 0, q 4; 3840: r 2, q 4).
+#[test]
+fn ring3_equals_depth_2_and_the_reference_at_every_k_residue() {
+    for (k, m, n, epi) in [
+        (256usize, 132usize, 130usize, Epi::Set),
+        (512, 132, 130, Epi::SetBf16),
+        (768, 128, 128, Epi::Set),
+        (1024, 132, 130, Epi::Set),
+        (1280, 128, 128, Epi::SetBf16),
+        (1536, 128, 128, Epi::Set),
+        (2560, 128, 128, Epi::Set),
+        (3328, 64, 64, Epi::Set),
+        (3840, 64, 64, Epi::SetBf16),
+    ] {
+        let c = Case {
+            m,
+            k,
+            n,
+            fill: Fill::Random,
+        };
+        let seed = 700 + (k / 256) as u64;
+        let d3 = run_spec(&c, ring3(Spec::emulation(epi)), seed);
+        let d2 = run_spec(&c, Spec::emulation(epi), seed);
+        assert_eq!(d3, d2, "ring 3 vs ring 2 at K={k} {epi:?}");
+    }
+}
+
+#[test]
+fn ring3_pairs_every_code_position_with_its_activation_byte() {
+    for j in [0usize, 17, 64, 127] {
+        let c = Case {
+            m: 132,
+            k: 768,
+            n: 40,
+            fill: Fill::OneHot(j),
+        };
+        let d3 = run_spec(&c, ring3(Spec::emulation(Epi::Set)), 90 + j as u64);
+        let d2 = run_spec(&c, Spec::emulation(Epi::Set), 90 + j as u64);
+        assert_eq!(d3, d2, "one-hot {j}");
+    }
+}
+
+/// The feasibility numbers per tile (`spec::ring3_budget`): only the shipped tile fits. The
+/// 256-wide tiles' third A+W slab alone takes the LDS launch past the 64 KiB workgroup limit
+/// (79872 B), and their second prefetch set exceeds the 192-VGPR plan at the 2-workgroup occupancy.
+#[test]
+fn ring3_budget_numbers_per_tile() {
+    let n = spec::ring3_budget(Tile::T128x128);
+    assert_eq!(
+        (n.pf_vgprs, n.vgprs, n.vgpr_budget, n.lds, n.wg_per_wgp),
+        (10, 202, 256, 53248, 2)
+    );
+    assert!(n.lds_fits() && n.vgprs_fit());
+    for (tile, pf, vgprs) in [(Tile::T256x128, 8, 200), (Tile::T128x256, 7, 199)] {
+        let n = spec::ring3_budget(tile);
+        assert_eq!(
+            (n.pf_vgprs, n.vgprs, n.vgpr_budget, n.lds, n.wg_per_wgp),
+            (pf, vgprs, 192, 79872, 2),
+            "{tile:?}"
+        );
+        assert!(!n.lds_fits() && !n.vgprs_fit());
+    }
+    // The depth-3 layout keeps the depth-2 buffers where they are and appends the third slab.
+    for tile in Tile::ALL {
+        let l = tile.layout();
+        assert_eq!(
+            l.launch_for(RingDepth::Three),
+            l.launch + l.a_bytes + l.w_bytes
+        );
+        assert_eq!(l.a_slot(2).unwrap(), l.launch);
+        assert_eq!(l.w_slot(2).unwrap(), l.launch + l.a_bytes);
+    }
+}
+
+#[test]
+fn ring3_is_refused_where_it_does_not_fit_with_the_numbers() {
+    let r3 = |tile, epi| ring3(Spec::product(epi).with_tile(tile)).validate();
+    assert!(r3(Tile::T128x128, Epi::Set).is_ok());
+    assert!(r3(Tile::T128x128, Epi::SetBf16).is_ok());
+    let e = r3(Tile::T128x256, Epi::Set).unwrap_err();
+    for want in [
+        "128x256x16",
+        "79872 B",
+        "16384 B A",
+        "8192 B W",
+        "65536 B",
+        "55296",
+    ] {
+        assert!(e.contains(want), "{want} in {e}");
+    }
+    let e = r3(Tile::T256x128, Epi::Set).unwrap_err();
+    for want in ["256x128x16", "79872 B", "8192 B A", "16384 B W", "65536 B"] {
+        assert!(e.contains(want), "{want} in {e}");
+    }
+    let e = r3(Tile::T256x128, Epi::SetNr).unwrap_err();
+    assert!(e.contains("set_nr"), "{e}");
+    // `emit` and `Gen::new` refuse too.
+    assert!(mq6_i8_gemm::emit(ring3(Spec::product(Epi::Set).with_tile(Tile::T128x256))).is_err());
+}
+
+/// Depth 3 changes the spec's variant name by `-r3` and nothing else of its identity; depth 2
+/// names, symbols and launch bytes are unchanged.
+#[test]
+fn ring3_variant_name_and_launch() {
+    let d2 = Spec::product(Epi::Set);
+    let d3 = ring3(d2);
+    assert_eq!(d2.variant_name(), "128x128x8-set");
+    assert_eq!(d3.variant_name(), "128x128x8-set-r3");
+    assert_eq!(d3.symbol(), d2.symbol());
+    // The launch passes the depth-2 dynamic size; the third A+W slab is the object's static LDS, so
+    // fixed + dynamic covers the depth-3 layout and the depth-2 fixed size stays 0.
+    assert_eq!(d2.launch_lds(), 36864);
+    assert_eq!(d3.launch_lds(), 36864);
+    assert_eq!((d2.static_lds(), d3.static_lds()), (0, 16384));
+    assert_eq!(d3.total_lds(), 53248);
+    let k2 = mq6_i8_gemm::Gen::new(d2).unwrap().kernel_spec();
+    let k3 = mq6_i8_gemm::Gen::new(d3).unwrap().kernel_spec();
+    assert_eq!(k2.group_segment_fixed_size, 0);
+    assert_eq!(k3.group_segment_fixed_size + d3.launch_lds(), 53248);
+    assert!(
+        k3.group_segment_fixed_size + d3.launch_lds()
+            >= d3.tile.layout().launch_for(RingDepth::Three)
+    );
+}
+
+/// The depth-3 kernel keeps its register plan inside the occupancy budget `Spec::vgpr_budget`
+/// derives, its WMMA count per block and the depth-2 K-loop's instruction mix per block; the
+/// code is three arms + three body groups + the peeled group (14 blocks of 64 WMMAs).
+#[test]
+fn ring3_register_plan_and_code_shape() {
+    let d2 = mq6_i8_gemm::emit(Spec::product(Epi::Set)).unwrap();
+    let d3 = mq6_i8_gemm::emit(ring3(Spec::product(Epi::Set))).unwrap();
+    assert!(d2.shape.next_free_vgpr <= spec::VGPR_CEILING);
+    assert_eq!(d3.shape.next_free_vgpr, 202);
+    assert!(d3.shape.next_free_vgpr <= ring3(Spec::product(Epi::Set)).vgpr_budget());
+    let wmma = |e: &peacemaker_isa::Emitted| {
+        e.s_text
+            .lines()
+            .filter(|l| l.trim().starts_with("v_wmma_i32_16x16x16_iu8"))
+            .count()
+    };
+    // depth 2: 4 blocks; depth 3: 2 + 4 arm blocks, 6 body blocks, 2 peeled blocks.
+    assert_eq!(wmma(&d2), 4 * 64);
+    assert_eq!(wmma(&d3), 14 * 64);
 }

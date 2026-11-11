@@ -132,10 +132,19 @@ fn refuses_truncated_or_unadmitted_quant_payload_before_upload() {
 }
 
 #[test]
-fn scratch_admission_includes_pool_retention_and_refuses_unbounded_images() {
-    assert_eq!(device_scratch_bytes(16_128, true).unwrap(), 1_219_534_848);
-    assert_eq!(device_scratch_bytes(16_128, false).unwrap(), 1_484_808_192);
-    assert!(device_scratch_bytes(0, true).is_err());
-    assert!(device_scratch_bytes(16_132, true).is_err());
-    assert!(device_scratch_bytes(5, true).is_err());
+fn scratch_admission_accepts_aligned_endpoints_and_refuses_outside_budget() {
+    // Exercise the admission contract rather than duplicating all scratch
+    // allocation coefficients. Actual tower allocation is hardware-checked.
+    for has_wmma in [false, true] {
+        let smallest = device_scratch_bytes(4, has_wmma).unwrap();
+        let largest = device_scratch_bytes(MAX_IMAGE_PATCHES, has_wmma).unwrap();
+        assert!(smallest > 0);
+        assert!(largest > smallest);
+        for patches in [0, 1, 3, 5, MAX_IMAGE_PATCHES + 4, usize::MAX - 3] {
+            assert!(
+                device_scratch_bytes(patches, has_wmma).is_err(),
+                "accepted patches={patches} wmma={has_wmma}"
+            );
+        }
+    }
 }

@@ -37,6 +37,7 @@ hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2", optional = true }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4", optional = true }
 # Non-optional arch deps — LoadedModel struct references these types.
 hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
+hipfire-arch-raon = { path = "../hipfire-arch-raon" }
 # Public accessor types (Lfm2MoeBundle.vision_* fields are lfm2-vl types).
 hipfire-arch-lfm2-vl = { path = "../hipfire-arch-lfm2-vl" }
 hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
@@ -56,6 +57,7 @@ serde_json.workspace = true
 [dev-dependencies]
 hipfire-arch-qwen4 = { path = "../hipfire-arch-qwen4", features = ["lab"] }
 sha2.workspace = true
+tempfile = "3"
 
 # ---------------------------------------------------------------------------
 # Archived research probes.
@@ -83,7 +85,15 @@ name = "fn_ep_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "fn_ep_wide_gather_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "fn_mesh_lane_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "fn_wide_kl_oracle"
 required-features = ["lab"]
 
 [[example]]

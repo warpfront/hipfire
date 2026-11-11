@@ -621,6 +621,9 @@ pub struct HfqFile {
     pub metadata_json: String,
     pub arch_id: u32,
     mq4v2_symmetric: bool,
+    /// Artifact-level MQ3V2 symmetric grid contract (`mq3v2.symmetric` metadata).
+    /// When true, every qt49 group stores `z = f16(-4·d)` (code 4 = 0).
+    mq3v2_symmetric: bool,
     tensors: Vec<HfqTensorInfo>,
     tensor_map: HashMap<String, usize>,
     /// Reusable read buffer for pread-based tensor reads.
@@ -679,6 +682,23 @@ impl HfqFile {
     /// for anything that is not a container, or is shorter than one.
     pub fn probe_arch_id(path: &Path) -> std::io::Result<u32> {
         hipfire_registry::probe_hfq_arch_id(path)
+    }
+    /// True when the HFQ metadata carries `mq3v2.symmetric = 1` (or `true`).
+    /// Open-time validation has already enforced the qt49 zero contract when
+    /// this returns true; absent marker remains the legacy asymmetric path.
+    pub fn mq3v2_symmetric(&self) -> bool {
+        self.mq3v2_symmetric
+    }
+
+    /// Validate every effective qt49 (MQ3G256V2) group's symmetric zero contract.
+    ///
+    /// For each 104-byte group, both fp16 zero fields must equal
+    /// `f16(-4 * f16_to_f32(d))`. A half with `d == 0` must store ±0 zero and
+    /// an all-code-4 payload. Streams group-sized reads (mmap slice or pread)
+    /// so Halo-sized artifacts are not pulled into a single allocation.
+    /// When `mq3v2.symmetric` is set, at least one qt49 group is required.
+    pub fn validate_mq3v2_symmetric_groups(&self) -> Result<(), String> {
+        validate_mq3v2_symmetric_groups_impl(self)
     }
 
     /// `open` with the REAP plan injected instead of taken from process config.
@@ -1188,6 +1208,12 @@ impl HfqFile {
             .is_some_and(|marker| {
                 marker == serde_json::json!(1) || marker == serde_json::json!(true)
             });
+        let mq3v2_symmetric = serde_json::from_str::<serde_json::Value>(&metadata_json)
+            .ok()
+            .and_then(|metadata| metadata.get("mq3v2.symmetric").cloned())
+            .is_some_and(|marker| {
+                marker == serde_json::json!(1) || marker == serde_json::json!(true)
+            });
 
         // Parse tensor index (follows metadata JSON)
         let mut pos = metadata_offset.checked_add(json_end).ok_or_else(|| {
@@ -1336,6 +1362,37 @@ impl HfqFile {
                 ));
             }
         }
+        if mq3v2_symmetric {
+            // Full qt49 zero contract (every group, both halves). Marker=1 with
+            // no qt49 body is a load error — same fail-closed posture as mq4v2.
+            let mut n_groups = 0usize;
+            for tensor in tensors.iter().filter(|t| t.quant_type == MQ3V2_QUANT_TYPE) {
+                if tensor.data_size % MQ3V2_GROUP_BYTES != 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "HfqFile: qt49 tensor '{}' data_size {} is not a multiple of {}",
+                            tensor.name, tensor.data_size, MQ3V2_GROUP_BYTES
+                        ),
+                    ));
+                }
+                let groups = tensor.data_size / MQ3V2_GROUP_BYTES;
+                for group_idx in 0..groups {
+                    let base = tensor.data_offset + group_idx * MQ3V2_GROUP_BYTES;
+                    let group = &mmap[base..base + MQ3V2_GROUP_BYTES];
+                    if let Err(msg) = check_mq3v2_symmetric_group(&tensor.name, group_idx, group) {
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
+                    }
+                    n_groups += 1;
+                }
+            }
+            if n_groups == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HfqFile: symmetric MQ3V2 marker set but no qt=49 groups exist",
+                ));
+            }
+        }
         let me = Self {
             _file: Arc::new(file),
             path: path.to_path_buf(),
@@ -1346,6 +1403,7 @@ impl HfqFile {
             metadata_json,
             tensors,
             mq4v2_symmetric,
+            mq3v2_symmetric,
             tensor_map,
             pread_buf: std::cell::RefCell::new(Vec::new()),
             evict_page_cache: true,
@@ -2222,6 +2280,7 @@ fn quant_type_to_dtype(quant_type: u8) -> &'static str {
         54 => "I64",
         55 => "FP8E4M3B128",
         56 => "FP8E4M3PT",
+        57 => "HC8E4M3Row",
         131 => "MQ3I4G128R256",
         132 => "MQ3I4G128R128",
         133 => "MQ2I4G128R256",
@@ -2758,6 +2817,15 @@ impl WeightSource for LlamaHfqSource<'_> {
 
     fn n_layers(&self) -> usize {
         self.cfg.n_layers
+    }
+
+    fn mq4v2_symmetric(&self) -> bool {
+        self.hfq.mq4v2_symmetric()
+    }
+
+    fn mq3v2_symmetric(&self) -> bool {
+        // Open already fail-closed on marker=1 with bad/missing qt49 groups.
+        self.hfq.mq3v2_symmetric()
     }
 
     fn prepare(&mut self, _n_devices: usize) -> HipResult<()> {
@@ -3591,6 +3659,145 @@ mod llama_config_tests {
 /// Home for the writer previously private to `overlay_tests` so DFlash
 /// leaf-upload tests can build tiny containers (weight + AWQ sidecar)
 /// without duplicating the container layout.
+
+/// MQ3G256V2 (qt=49) group stride: fp16 (d0,z0,d1,z1) + 96 B packed 3-bit codes.
+const MQ3V2_GROUP_BYTES: usize = 104;
+const MQ3V2_QUANT_TYPE: u8 = 49;
+/// 8× code-4 packed as one little-endian 3-byte octet (matches the quantizer).
+const MQ3V2_ALL_CODE4_OCTET: [u8; 3] = [0x24, 0x49, 0x92];
+
+fn check_mq3v2_symmetric_group(
+    tensor_name: &str,
+    group_idx: usize,
+    group: &[u8],
+) -> Result<(), String> {
+    debug_assert_eq!(group.len(), MQ3V2_GROUP_BYTES);
+    for half_idx in 0..2 {
+        let hoff = half_idx * 4;
+        let d_bits = u16::from_le_bytes(group[hoff..hoff + 2].try_into().unwrap());
+        let z_bits = u16::from_le_bytes(group[hoff + 2..hoff + 4].try_into().unwrap());
+        let d = half::f16::from_bits(d_bits).to_f32();
+        if d == 0.0 {
+            // Degenerate half: zero must be ±0 and payload all code 4.
+            let z_ok = z_bits == 0 || z_bits == 0x8000;
+            if !z_ok {
+                return Err(format!(
+                    "mq3v2 symmetric: tensor '{tensor_name}' group {group_idx} half {half_idx}:                      d==0 but z=0x{z_bits:04x} (expected ±0)"
+                ));
+            }
+            let payload_off = 8 + half_idx * 16 * 3;
+            for octet in 0..16 {
+                let o = payload_off + octet * 3;
+                let got = [group[o], group[o + 1], group[o + 2]];
+                if got != MQ3V2_ALL_CODE4_OCTET {
+                    return Err(format!(
+                        "mq3v2 symmetric: tensor '{tensor_name}' group {group_idx} half {half_idx}:                          d==0 payload octet {octet} is {got:02x?} (expected all code 4 = {MQ3V2_ALL_CODE4_OCTET:02x?})"
+                    ));
+                }
+            }
+        } else {
+            let expected = half::f16::from_f32(-4.0 * d).to_bits();
+            if z_bits != expected {
+                return Err(format!(
+                    "mq3v2 symmetric: tensor '{tensor_name}' group {group_idx} half {half_idx}:                      z=0x{z_bits:04x}, expected -4*d=0x{expected:04x}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pread_exact_at(file: &File, offset: usize, dst: &mut [u8]) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
+        let mut got = 0usize;
+        while got < dst.len() {
+            let n = unsafe {
+                libc::pread(
+                    fd,
+                    dst[got..].as_mut_ptr() as *mut libc::c_void,
+                    dst.len() - got,
+                    (offset + got) as libc::off_t,
+                )
+            };
+            if n < 0 {
+                return Err(format!(
+                    "mq3v2 symmetric: pread failed at offset {}: {}",
+                    offset + got,
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if n == 0 {
+                return Err(format!(
+                    "mq3v2 symmetric: short pread at offset {} (got {got}, need {})",
+                    offset,
+                    dst.len()
+                ));
+            }
+            got += n as usize;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, offset, dst);
+        Err("mq3v2 symmetric: pread streaming requires unix".into())
+    }
+}
+
+fn validate_mq3v2_symmetric_groups_impl(hfq: &HfqFile) -> Result<(), String> {
+    use crate::model_source::ModelSource;
+    let mut n_groups = 0usize;
+    // Effective name set (base ∪ overlay); each name resolves overlay-first.
+    for name in hfq.tensor_names() {
+        let Some(info) = hfq.find_tensor_info(name) else {
+            continue;
+        };
+        if info.quant_type != MQ3V2_QUANT_TYPE {
+            continue;
+        }
+        if info.data_size % MQ3V2_GROUP_BYTES != 0 {
+            return Err(format!(
+                "mq3v2 symmetric: tensor '{name}' data_size {} is not a multiple of {}",
+                info.data_size, MQ3V2_GROUP_BYTES
+            ));
+        }
+        let groups = info.data_size / MQ3V2_GROUP_BYTES;
+        if let Some((_, data)) = hfq.tensor_data(name) {
+            for group_idx in 0..groups {
+                let lo = group_idx * MQ3V2_GROUP_BYTES;
+                check_mq3v2_symmetric_group(name, group_idx, &data[lo..lo + MQ3V2_GROUP_BYTES])?;
+                n_groups += 1;
+            }
+        } else {
+            // Mmap dropped (UMA path): stream one group at a time via pread.
+            // Overlay-owned tensors live on the overlay's file handle.
+            let owner = if let Some(ov) = &hfq.overlay {
+                if ov.find_tensor_info(name).is_some() {
+                    ov
+                } else {
+                    hfq
+                }
+            } else {
+                hfq
+            };
+            let mut buf = [0u8; MQ3V2_GROUP_BYTES];
+            for group_idx in 0..groups {
+                let off = info.data_offset + group_idx * MQ3V2_GROUP_BYTES;
+                pread_exact_at(&owner._file, off, &mut buf)?;
+                check_mq3v2_symmetric_group(name, group_idx, &buf)?;
+                n_groups += 1;
+            }
+        }
+    }
+    if hfq.mq3v2_symmetric && n_groups == 0 {
+        return Err("mq3v2 symmetric: marker mq3v2.symmetric=1 but no qt=49 groups exist".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) mod hfq_test_fixture {
     use std::io::Write;
@@ -3609,7 +3816,17 @@ pub(crate) mod hfq_test_fixture {
     ///   - tensor data, concatenated in index order (offsets are derived at
     ///     read time cumulatively from `data_offset`).
     pub(crate) fn write_min_hfq(path: &Path, arch_id: u32, tensors: &[(&str, u8, &[u32], &[u8])]) {
-        let metadata = b"{}"; // balanced JSON; brace-scan parser stops at the close brace
+        write_min_hfq_with_meta(path, arch_id, b"{}", tensors);
+    }
+
+    /// Like [`write_min_hfq`] but with an explicit metadata JSON blob (must be
+    /// brace-balanced; the open parser scans to the matching top-level `}`).
+    pub(crate) fn write_min_hfq_with_meta(
+        path: &Path,
+        arch_id: u32,
+        metadata: &[u8],
+        tensors: &[(&str, u8, &[u32], &[u8])],
+    ) {
         let header_size: u64 = 32;
         let metadata_offset = header_size;
         let index_offset = metadata_offset + metadata.len() as u64;
@@ -5096,5 +5313,187 @@ mod mq_i4_header_tests {
         // Neighbours stay unknown (130 is the compact-Hessian record id).
         assert_eq!(quant_type_to_dtype(130), "?");
         assert_eq!(quant_type_to_dtype(135), "?");
+    }
+}
+
+// ─── MQ3V2 symmetric marker + qt49 zero contract (MQ V2.5 S4) ───────────────
+
+#[cfg(test)]
+mod mq3v2_symmetric_tests {
+    use super::hfq_test_fixture::{write_min_hfq, write_min_hfq_with_meta};
+    use super::*;
+
+    /// One 104-byte MQ3G256V2 group with symmetric zeros for scale `d`.
+    fn sym_group(d: f32) -> [u8; 104] {
+        let mut g = [0u8; 104];
+        if d == 0.0 {
+            // d=0, z=-0, all code 4
+            let z = half::f16::from_f32(-0.0).to_bits().to_le_bytes();
+            g[0..2].copy_from_slice(&0u16.to_le_bytes());
+            g[2..4].copy_from_slice(&z);
+            g[4..6].copy_from_slice(&0u16.to_le_bytes());
+            g[6..8].copy_from_slice(&z);
+            for chunk in 0..32 {
+                let o = 8 + chunk * 3;
+                g[o..o + 3].copy_from_slice(&MQ3V2_ALL_CODE4_OCTET);
+            }
+        } else {
+            let d_bits = half::f16::from_f32(d).to_bits();
+            let d_f = half::f16::from_bits(d_bits).to_f32();
+            let z_bits = half::f16::from_f32(-4.0 * d_f).to_bits();
+            let db = d_bits.to_le_bytes();
+            let zb = z_bits.to_le_bytes();
+            g[0..2].copy_from_slice(&db);
+            g[2..4].copy_from_slice(&zb);
+            g[4..6].copy_from_slice(&db);
+            g[6..8].copy_from_slice(&zb);
+            // Non-degenerate payload: pack codes 0..7 repeating (any valid 3-bit).
+            for chunk in 0..32 {
+                let mut qq = [0u8; 8];
+                for j in 0..8 {
+                    qq[j] = (j as u8) & 7;
+                }
+                let b0 = (qq[0] & 7) | ((qq[1] & 7) << 3) | ((qq[2] & 3) << 6);
+                let b1 = ((qq[2] >> 2) & 1)
+                    | ((qq[3] & 7) << 1)
+                    | ((qq[4] & 7) << 4)
+                    | ((qq[5] & 1) << 7);
+                let b2 = ((qq[5] >> 1) & 3) | ((qq[6] & 7) << 2) | ((qq[7] & 7) << 5);
+                let o = 8 + chunk * 3;
+                g[o] = b0;
+                g[o + 1] = b1;
+                g[o + 2] = b2;
+            }
+        }
+        g
+    }
+
+    fn bad_zero_group(d: f32) -> [u8; 104] {
+        let mut g = sym_group(d);
+        // Corrupt half-0 zero to something other than -4*d.
+        let wrong = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        g[2..4].copy_from_slice(&wrong);
+        g
+    }
+
+    #[test]
+    fn mq3v2_symmetric_marker_absent_is_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("abs.hfq");
+        let g = sym_group(0.25);
+        write_min_hfq(&path, 9, &[("w", 49, &[1, 256], &g)]);
+        let f = HfqFile::open(&path).unwrap();
+        assert!(!f.mq3v2_symmetric());
+        // Validator is a no-op on unmarked files with respect to the marker
+        // gate; groups are still checked when present so a deliberate call on
+        // a well-formed symmetric body returns Ok.
+        assert!(f.validate_mq3v2_symmetric_groups().is_ok());
+    }
+
+    #[test]
+    fn mq3v2_symmetric_marker_present_and_groups_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sym.hfq");
+        let mut body = Vec::new();
+        body.extend_from_slice(&sym_group(0.25));
+        body.extend_from_slice(&sym_group(0.0)); // degenerate half path
+        write_min_hfq_with_meta(
+            &path,
+            9,
+            br#"{"mq3v2.symmetric":1}"#,
+            &[("proj.weight", 49, &[2, 256], &body)],
+        );
+        let f = HfqFile::open(&path).unwrap();
+        assert!(f.mq3v2_symmetric());
+        f.validate_mq3v2_symmetric_groups().unwrap();
+    }
+
+    #[test]
+    fn mq3v2_symmetric_wrong_zero_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("badz.hfq");
+        let g = bad_zero_group(0.25);
+        write_min_hfq_with_meta(
+            &path,
+            9,
+            br#"{"mq3v2.symmetric":1}"#,
+            &[("bad.weight", 49, &[1, 256], &g)],
+        );
+        let err = match HfqFile::open(&path) {
+            Ok(_) => panic!("expected open failure on wrong zero"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("bad.weight") && err.contains("group 0"),
+            "expected precise tensor/group error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn mq3v2_symmetric_marker_without_qt49_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("noqt.hfq");
+        write_min_hfq_with_meta(
+            &path,
+            9,
+            br#"{"mq3v2.symmetric":1}"#,
+            &[("norm.weight", 3, &[4], &[0u8; 8])], // f16, not qt49
+        );
+        let err = match HfqFile::open(&path) {
+            Ok(_) => panic!("expected open failure when marker set without qt49"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("no qt=49") || err.contains("no qt49"),
+            "expected no-qt49 error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn mq3v2_symmetric_validator_reports_group_index() {
+        // Marker absent so open succeeds; validator still walks qt49 bodies.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("val.hfq");
+        let mut body = Vec::new();
+        body.extend_from_slice(&sym_group(0.5));
+        body.extend_from_slice(&bad_zero_group(0.5));
+        write_min_hfq(&path, 9, &[("t.weight", 49, &[2, 256], &body)]);
+        let f = HfqFile::open(&path).unwrap();
+        assert!(!f.mq3v2_symmetric());
+        let err = f.validate_mq3v2_symmetric_groups().unwrap_err();
+        assert!(
+            err.contains("t.weight") && err.contains("group 1"),
+            "expected group 1 error, got: {err}"
+        );
+    }
+
+    #[test]
+    #[ignore = "real multi-GB HFQ artifacts; run with --ignored"]
+    fn mq3v2_symmetric_real_b1a_artifact_passes() {
+        let path = std::path::Path::new(
+            "/home/kaden/qcal/qat/v3/mi300x2/qwen3.8-27b.b1a.mq3v2-sym.base.hfq",
+        );
+        assert!(path.is_file(), "missing B1a artifact at {}", path.display());
+        let f = HfqFile::open(path).expect("B1a open");
+        assert!(f.mq3v2_symmetric(), "B1a must carry mq3v2.symmetric=1");
+        f.validate_mq3v2_symmetric_groups()
+            .expect("B1a qt49 symmetric groups must validate");
+    }
+
+    #[test]
+    #[ignore = "real multi-GB HFQ artifacts; run with --ignored"]
+    fn mq3v2_symmetric_real_asymmetric_base_marker_false() {
+        let path =
+            std::path::Path::new("/home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq3v2.base.hfq");
+        assert!(
+            path.is_file(),
+            "missing asymmetric base at {}",
+            path.display()
+        );
+        let f = HfqFile::open(path).expect("base open");
+        assert!(
+            !f.mq3v2_symmetric(),
+            "asymmetric ladder base must report marker=false"
+        );
     }
 }

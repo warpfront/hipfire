@@ -2,9 +2,12 @@
 // Copyright (c) 2026 Kaden Schutt
 
 //! `--kernel qwen4_moe_sym`: the grouped symmetric IU4 MoE GEMMs of the Qwen4
-//! prefill route on gfx1201 (`peacemaker-isa emit --kernel qwen4_moe_sym`,
+//! prefill route on gfx1201 (default), gfx1151 or gfx1100 (`--arch`;
+//! `peacemaker-isa emit --kernel qwen4_moe_sym`,
 //! `crates/peacemaker-isa/src/kernels/qwen4_moe_sym.rs`, weight codec
-//! `WeightCodec::Mq4Sym`: pointer-addressed QT44 gate/up and QT53 down).
+//! `WeightCodec::Mq4Sym`: pointer-addressed QT44 gate/up and QT53 down). The arch selects the
+//! shipped baseline object/symbol, the candidate generator, the R1 contract exports and the
+//! launch geometry; see `# Shipped baseline`.
 //!
 //! Included by the driver with `#[path = "pm_loop/moe.rs"] mod moe;`.
 //!
@@ -12,9 +15,15 @@
 //!
 //! * `--epi gate_up|down|gate_up_ntN|down_ntN|down_nt4rR|down_gp_nt4|down_gp_nt8` (default
 //!   `gate_up`): the candidate entry. Everything but `down_gp_*` is parsed by
-//!   `Spec::from_epi(epi, Gfx1201)` and emitted with `qwen4_moe_sym::emit`. **`N` is the tile
-//!   width** (16-slot tiles per weight stream: NT1/NT4/NT8 for gate/up, NT1/NT4/NT8 for down) and
-//!   `R` repeats a 64-row block per CTA (gfx1151-only, refused by `validate` on gfx1201).
+//!   `Spec::from_epi(epi, arch)` and emitted with `qwen4_moe_sym::emit` (gfx1100: the NT1
+//!   `qwen4_moe_sym_gfx11::emit`, `Spec::validate` refuses gfx1100). **`N` is the tile
+//!   width** (16-slot tiles per weight stream: NT1/NT4/NT8 for gfx1201 gate/up and down, NT1/NT4
+//!   for gfx1151, NT1 only for gfx1100) and
+//!   `R` repeats a 64-row block per CTA (gfx1151 down NT4 only: `down_nt4r2|r4`; refused by
+//!   `validate` on gfx1201). `gate_up_stream8` (gfx1151 only) is the streamed NT8 gate/up
+//!   (`emit_gate_up_stream8`, object `QWEN4_MOE_GATE_UP_STREAM8_PM_GFX1151`).
+//!   `down_gp_*` exists on gfx1201 only (a gfx1151/gfx1100 `--epi`/`--base-epi` naming it is refused,
+//!   as are gfx1100 NT>1 and gfx1151 NT8: `Spec::validate` verbatim).
 //!   `down_gp_nt4|nt8` is the grouped-position twin of the down NT4/NT8 entry
 //!   (`qwen4_moe_sym::emit_down_gp`, bundle `qwen4_moe_down_gp_pm_gfx1201`): same 64-byte ABI,
 //!   grid and output bytes; the activation plane is `[K/128][m_total]` records in grouped
@@ -36,6 +45,15 @@
 //! `emit_down_gp` (`candidate.rip.identical_to_generator`); an edited script that keeps the ABI is
 //! timed against the shipped baseline and reported as `identical_to_baseline: false`. The
 //! chains/prefetch/grouped axes of `R4Spec` stay private Rust experiments (`pm_r4_screen`).
+//!
+//! `--cand-object FILE` (`--arch gfx1100` only; `pm_loop.rs`): FILE is the candidate code object
+//! instead of the emit, e.g. `pm-krsi-1100/emit` builds a modified copy of
+//! `crates/peacemaker-isa/src/kernels/qwen4_moe_sym_gfx1100/` into `gate_up.co` / `down.co`
+//! (`tools/moe_check.sh`). It must expose the entry's symbol with the in-tree emit's ABI
+//! (kernarg layout, workgroup size, LDS, wave mode; refused otherwise, stage `cand_object`); M7,
+//! resources and `code_sha256` then run as for an emitted candidate (`candidate.cand_object`
+//! = `{path, sha256, variant, identical_to_generator}`) and the GPU path (identity vs shipped,
+//! CPU reference, timing) is unchanged.
 //!
 //! Correctness requires the candidate to be bitwise equal to the shipped baseline (every NT and
 //! `gp` entry is byte-identical to the others on the same activations) AND to pass the CPU
@@ -73,7 +91,11 @@
 //!   aliases synthetic expert `e % D`, a memory cap), `seed` (default 1),
 //!   `route` = `uniform` (default: `TOP` distinct uniform experts per token) |
 //!   `skew` (experts 0..min(5,TOP) on every token, rest uniform distinct) |
-//!   `all` (flat slot `f` -> expert `f % E`) | `one` (every slot to expert 0).
+//!   `all` (flat slot `f` -> expert `f % E`) | `one` (every slot to expert 0) |
+//!   `hist:<route_hist.json>[@L]` (replay the recorded per-token expert lists of a pinned
+//!   `route_hist.v1`, layer `L` or all layers' records in record order, cycling past the recording;
+//!   E and TOP must equal the recording's `n_experts`/`topk`, the ids bin is sha256-verified, the
+//!   record gets `route: {kind:"hist", path, id, layer}` and the shape `route_id`/`route_layer`).
 //!
 //! The kind (`gate_up` or `down`) comes from `--epi`; the GEMM dims follow
 //! `ExpertGeometry::plan` (so its admission rules apply):
@@ -85,16 +107,16 @@
 //!
 //! # Launch ABI (reproduced from production)
 //!
-//! `qwen4_moe_sym_gemm` (`crates/rdna-compute/src/gemm.rs:51568`; callers
-//! `gemm_qwen4_moe_{gate_up_silu,down}_iu4_sym` at `:51041`, `:51088`):
+//! `qwen4_moe_sym_gemm` (`crates/rdna-compute/src/gemm.rs:52361`; callers
+//! `gemm_qwen4_moe_{gate_up_silu,down}_iu4_sym` at `:51771`, `:51819`):
 //! kernarg 64 B (`Spec::kernargs`, `KERNARG_BYTES`):
 //! `expert_weight_ptrs@0, expert_tile_ids@8, sorted_slot_index@16, Xq@24,
 //! Y_grouped@32` (device pointers) then `M@40, K@44, x_row_div@48, m_total@52,
 //! x_src_rows@56, n_experts@60` (i32). `n_experts` is the pointer-table length
-//! (`moe_expert_table_len`, `gemm.rs:1428`), `m_total` the grouped rows. Grid
+//! (`moe_expert_table_len`, `gemm.rs:1539`), `m_total` the grouped rows. Grid
 //! `(M / (64 * rr), m_total / 16, 1)`, block `Spec::threads()` (64 for the NT1
 //! gate/up, else 128), **no dynamic LDS** (the NT gate/up LDS is static in the
-//! descriptor; `gemm.rs:51646` passes 0).
+//! descriptor; `gemm.rs:52476` passes 0).
 //!
 //! Grouping (`examples/qwen4_moe_sym.rs:395-428 cpu_group`, `make_case:557-560`):
 //! the flat slot `f = token * TOP + j` is stable-sorted by (expert, `f`); each
@@ -112,21 +134,35 @@
 //! byte `j/2` low first, signed), epoch-major `[K/128][x_src_rows]`, row
 //! `slot / x_row_div` (`iu4_fold.rs:30`, HIP twin `qwen4_moe_iu4_sym.gfx1151.hip:12-20`).
 //!
-//! # Shipped baseline (gfx1201, VRAM-resident experts)
+//! # Shipped baseline (VRAM-resident experts; one row per `--arch`, default gfx1201)
+//!
+//! | arch | gate/up | down | object (`rdna_compute::kernels`, `kernels.rs`) | selection source (`gemm.rs`) |
+//! |------|---------|------|------------------------------------------------|------------------------------|
+//! | gfx1201 | NT4; NT8 iff `total_slots >= 128 * E` | NT4 (gp NT4 with `down_gp_*`) | `QWEN4_MOE_IU4_SYM_PM_GFX1201` (`:4467`), `QWEN4_MOE_DOWN_GP_PM_GFX1201` (`:10783`) | `qwen4_moe_sym_nt8_selected :49334`, `..._wide_shape :49313`, tables `:49277-49296`, row `:50101-50125` |
+//! | gfx1151 | NT4; streamed NT8 (`..._nt8_stream2`) iff `[M,K,top,rows,E] = [1280,2560,10,7168..=8192,512]` | NT4 rr1 (`HIPFIRE_QWEN4_MOE_SYM_DOWN_RR` unset; `nt4r2/r4` are opt-ins) | `QWEN4_MOE_IU4_SYM_PM_GFX1151` (`:4465`), `QWEN4_MOE_GATE_UP_STREAM8_PM_GFX1151` (`:4472`) | `qwen4_moe_sym_gemm_symbols :50704`, row `:50072-50100`, `qwen4_moe_sym_gate_up_symbol :50779`, `qwen4_moe_stream8_selected :56516`, `qwen4_moe_sym_down_rr :50802`, rr entries `:50307` |
+//! | gfx1100 | NT1 | NT1 | `QWEN4_MOE_IU4_SYM_PM_GFX1100` (`:4495`) | row `:50038-50071`, NT1 early-out `:50711`, `qwen4_moe_sym_nt1_gemm :52067` |
+//!
+//! A shipped entry an arch lacks (the gp down off gfx1201, anything but NT1 on gfx1100) is
+//! refused with the entry and arch named; a gfx1201 object is never retagged. The geometry plan
+//! of gfx1100 is asked on gfx1151 (`Spec::validate` refuses gfx1100; the plan is pure
+//! arithmetic and the K2 module shares its admission). The gfx1201 detail follows.
 //!
 //! Production loads `rdna_compute::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201`
-//! (`kernels.rs:4303`, `kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco`, six exports: NT1,
-//! NT4, NT8 x gate/up, down; `MoeSymIu4Kernel` row `gemm.rs:49542-49566`) and picks the
+//! (`kernels.rs:4467`, `kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco`, six exports: NT1,
+//! NT4, NT8 x gate/up, down; `MoeSymIu4Kernel` row `gemm.rs:50101-50125`) and picks the
 //! symbol per call: **down is always NT4**; **gate/up is NT4 unless the real slots
 //! `x_src_rows * x_row_div` reach 128 per table expert (`total_slots >= 128 * E`),
-//! then NT8** (`qwen4_moe_sym_nt8_selected`, `gemm.rs:48775`; `qwen4_moe_sym_wide_shape`,
-//! `gemm.rs:48754`; flag `HIPFIRE_MOE_IU4_WIDE_TILES` unset = on at gfx1201,
-//! `prefill_route_capabilities.rs:303,327`; the tables `gemm.rs:48718-48737`). Host-mapped
+//! then NT8** (`qwen4_moe_sym_nt8_selected`, `gemm.rs:49334`; `qwen4_moe_sym_wide_shape`,
+//! `gemm.rs:49313`; flag `HIPFIRE_MOE_IU4_WIDE_TILES` unset = on at gfx1201,
+//! `prefill_route_capabilities.rs:303,327`; the tables `gemm.rs:49277-49296`). Host-mapped
 //! experts (NT8 for both GEMMs) are not modelled: weights here are VRAM-resident; use
 //! `--base-epi gate_up_nt8` / `down_nt8` for that arm. All NT entries share the 64-byte
 //! ABI, grid and output bytes (each output byte equals the NT1 entry's;
 //! `qwen4_moe_sym.rs:1544-1554`), so a candidate of any `nt` is directly comparable
 //! with the shipped symbol of a different `nt`; `baseline().source` records the nt.
+//! The gfx1151 / gfx1100 records carry their own `const`, `artifact`, `sha256`, `symbol`,
+//! `selection` and a `generator` field (the non-gfx1201 emitter), and the launch grid is
+//! `M / (64 * rr)` (`Spec::rr`) for every arch.
 //!
 //! # Correctness reference
 //!
@@ -145,8 +181,16 @@
 //!
 //! `Workload::emu` runs the candidate on the peacemaker emulator
 //! (`peacemaker_ir::emu`) at a tiny shape (`E=2,TOP=2,T=20,H=512,I=128`) against the same
-//! reference; if the emulator cannot lift/decode/execute some instruction it refuses with its
-//! own message verbatim.
+//! reference; if the emulator cannot lift/decode/execute some instruction (on any arch) it
+//! refuses with its own message verbatim.
+//!
+//! The reference is arch-independent: gfx11 (WMMA `16x16x16`, eight K16 steps per K128 epoch,
+//! C rows `2j + hi`) and gfx12 (`16x16x32`, four K32 steps, rows `8hi + j`) differ only in which
+//! accumulator row a lane holds; per epoch `C_h` is the exact int32 chain (`|C_h| <= 8192`) so
+//! the K-step grouping cannot change it, and the epoch fold `fma(RN(d_h * sc_h), C_h, sum)` is
+//! ascending from `+0` on every arch (`qwen4_moe_sym.rs` module doc; `qwen4_moe_sym_gfx11/mod.rs`
+//! `# Numerics`; the gfx1100 epilogue reuses `Epilogue::silu_dense`). Tolerances (down 0,
+//! gate/up 1 BF16 ulp) and `requires_baseline_identity` are therefore the same on every arch.
 
 use crate::common::sha256_hex;
 use crate::workload::{Arm, Knobs, Launch, Object, RefReport, Result, Workload};
@@ -161,13 +205,40 @@ use peacemaker_isa::kernels::qwen4_moe_down_gp;
 use peacemaker_isa::kernels::qwen4_moe_sym::{
     self, ExpertGeometry, Kind, Spec, WeightCodec, KERNARG_BYTES, MAX_SLOTS,
 };
+use peacemaker_isa::kernels::qwen4_moe_sym_gfx11 as gfx11;
 use peacemaker_isa::Arch;
 use rayon::prelude::*;
 use rdna_compute::Gpu;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 
-const ARCH: Arch = Arch::Gfx1201;
+/// Contract-crate twin of `arch`; every arch of this adapter has a `qwen4_moe_sym` contract.
+fn abi_arch(arch: Arch) -> Result<AbiArch> {
+    match arch {
+        Arch::Gfx1201 => Ok(AbiArch::Gfx1201),
+        Arch::Gfx1151 => Ok(AbiArch::Gfx1151),
+        Arch::Gfx1100 => Ok(AbiArch::Gfx1100),
+        other => Err(format!(
+            "qwen4_moe_sym: no kernel-abi contract for {} (gfx1100, gfx1151, gfx1201 only)",
+            other.name()
+        )),
+    }
+}
+
+/// The arch the (arch-independent) geometry plan is asked on. `ExpertGeometry::plan` validates the
+/// `Spec` ladder of the arch it is given, and `Spec::validate` refuses gfx1100 (its NT1 entries
+/// come from `qwen4_moe_sym_gfx11`, not `Spec`); the gfx1100 NT1 kernels share the gfx1151 plan's
+/// 64-row / K-multiple / 24-bit-row admission (`qwen4_moe_sym_gfx11::validate_launch`), so gfx1100
+/// plans on gfx1151. The plan only supplies `M/K/x_row_div/row_bytes`; no object is retagged.
+fn plan_arch(arch: Arch) -> Arch {
+    if arch == Arch::Gfx1100 {
+        Arch::Gfx1151
+    } else {
+        arch
+    }
+}
+
 const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
 /// Cap on device memory the synthetic problem may take.
 const DEVICE_CAP: u64 = 3 << 30;
@@ -207,6 +278,135 @@ enum Route {
     Skew,
     All,
     One,
+    Hist,
+}
+
+/// `--shape route=hist:<route_hist.json>[@L]`: the expert ids of a pinned `route_hist.v1`
+/// (`HIPFIRE_MOE_ROUTE_DUMP` records, headerless `i32` LE bin), layer `L` or every layer's
+/// records concatenated in record order. Token `t` takes recorded row `t % rows` (cycled).
+#[derive(Clone, Debug, PartialEq)]
+struct Hist {
+    path: String,
+    id: String,
+    layer: Option<u32>,
+    n_experts: usize,
+    topk: usize,
+    /// Row-major `rows x topk`.
+    ids: Vec<i32>,
+}
+
+impl Hist {
+    fn parse(spec: &str) -> Result<Hist> {
+        let (path, layer) = match spec.rsplit_once('@') {
+            Some((p, l)) => (
+                p,
+                Some(
+                    l.parse::<u32>()
+                        .map_err(|e| format!("--shape route=hist:{spec}: layer `{l}`: {e}"))?,
+                ),
+            ),
+            None => (spec, None),
+        };
+        Self::load(std::path::Path::new(path), layer)
+    }
+
+    fn load(path: &std::path::Path, layer: Option<u32>) -> Result<Hist> {
+        let err = |m: String| format!("--shape route=hist:{}: {m}", path.display());
+        let doc: Value =
+            serde_json::from_slice(&std::fs::read(path).map_err(|e| err(e.to_string()))?)
+                .map_err(|e| err(e.to_string()))?;
+        if doc["schema"] != "route_hist.v1" {
+            return Err(err(format!(
+                "schema {}: expected route_hist.v1",
+                doc["schema"]
+            )));
+        }
+        let id = crate::iu4::artefact_id(&doc).map_err(err)?;
+        let num = |v: &Value, what: &str| {
+            v.as_u64()
+                .map(|x| x as usize)
+                .ok_or_else(|| err(format!("missing or non-integer {what}")))
+        };
+        let n_experts = num(&doc["n_experts"], "n_experts")?;
+        let topk = num(&doc["topk"], "topk")?;
+        let bin_path = crate::iu4::sibling_path(
+            path,
+            doc["ids"]["path"]
+                .as_str()
+                .ok_or_else(|| err("missing ids.path".into()))?,
+        );
+        let bin =
+            std::fs::read(&bin_path).map_err(|e| err(format!("{}: {e}", bin_path.display())))?;
+        let (want, got) = (
+            doc["ids"]["sha256"].as_str().unwrap_or(""),
+            sha256_hex(&bin),
+        );
+        if want != got {
+            return Err(err(format!(
+                "ids sha256 mismatch ({}): manifest {want}, file {got}",
+                bin_path.display()
+            )));
+        }
+        let records = doc["records"]
+            .as_array()
+            .ok_or_else(|| err("missing records".into()))?;
+        let mut at = 0usize;
+        let mut ids = Vec::new();
+        for (i, r) in records.iter().enumerate() {
+            let (l, n, k) = (
+                num(&r["layer"], "record layer")?,
+                num(&r["n"], "record n")?,
+                num(&r["k"], "record k")?,
+            );
+            if k != topk {
+                return Err(err(format!("record {i}: k={k}, topk={topk}")));
+            }
+            let end = at + n * k * 4;
+            let part = bin.get(at..end).ok_or_else(|| {
+                err(format!(
+                    "record {i} runs past the ids bin ({} bytes)",
+                    bin.len()
+                ))
+            })?;
+            at = end;
+            if layer.is_some_and(|want| want as usize != l) {
+                continue;
+            }
+            for c in part.chunks_exact(4) {
+                let e = i32::from_le_bytes(c.try_into().unwrap());
+                if e < 0 || e as usize >= n_experts {
+                    return Err(err(format!(
+                        "record {i}: expert id {e} outside [0,{n_experts})"
+                    )));
+                }
+                ids.push(e);
+            }
+        }
+        if at != bin.len() {
+            return Err(err(format!(
+                "ids bin has {} bytes, records cover {at}",
+                bin.len()
+            )));
+        }
+        if ids.is_empty() {
+            return Err(err(match layer {
+                Some(l) => format!("no records for layer {l}"),
+                None => "no rows".into(),
+            }));
+        }
+        Ok(Hist {
+            path: path.display().to_string(),
+            id,
+            layer,
+            n_experts,
+            topk,
+            ids,
+        })
+    }
+
+    fn json(&self) -> Value {
+        json!({"kind": "hist", "path": self.path, "id": self.id, "layer": self.layer})
+    }
 }
 
 impl Route {
@@ -216,12 +416,14 @@ impl Route {
             Route::Skew => "skew",
             Route::All => "all",
             Route::One => "one",
+            Route::Hist => "hist",
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct Geo {
+    arch: Arch,
     preset: &'static str,
     experts: usize,
     top: usize,
@@ -230,6 +432,8 @@ struct Geo {
     inter: usize,
     distinct: usize,
     route: Route,
+    /// `route=hist:<file>`: the recorded per-token expert lists (`Route::Hist`).
+    hist: Option<Hist>,
     seed: u64,
 }
 
@@ -243,7 +447,7 @@ where
 }
 
 impl Geo {
-    fn parse(shape: &str) -> Result<Geo> {
+    fn parse(shape: &str, arch: Arch) -> Result<Geo> {
         let items: Vec<&str> = shape
             .split(',')
             .map(str::trim)
@@ -264,6 +468,7 @@ impl Geo {
             };
         }
         let mut g = Geo {
+            arch,
             preset: preset.0,
             experts: preset.1,
             top: preset.2,
@@ -272,6 +477,7 @@ impl Geo {
             inter: preset.4,
             distinct: 0,
             route: Route::Uniform,
+            hist: None,
             seed: 1,
         };
         let mut distinct = None;
@@ -288,14 +494,20 @@ impl Geo {
                 "D" => distinct = Some(num::<usize>(k, v)?),
                 "seed" => g.seed = num(k, v)?,
                 "route" => {
-                    g.route = match v.trim() {
+                    let v = v.trim();
+                    if let Some(spec) = v.strip_prefix("hist:") {
+                        g.hist = Some(Hist::parse(spec)?);
+                        g.route = Route::Hist;
+                        continue;
+                    }
+                    g.route = match v {
                         "uniform" => Route::Uniform,
                         "skew" => Route::Skew,
                         "all" => Route::All,
                         "one" => Route::One,
                         other => {
                             return Err(format!(
-                                "--shape route={other}: expected uniform|skew|all|one"
+                                "--shape route={other}: expected uniform|skew|all|one|hist:<route_hist.json>[@L]"
                             ))
                         }
                     }
@@ -359,7 +571,16 @@ impl Geo {
         if hot > self.experts {
             return Err("--shape route=skew needs E >= min(5, TOP)".into());
         }
-        self.expert_geometry()?.plan(ARCH, WeightCodec::Mq4Sym)?;
+        if let Some(h) = &self.hist {
+            if h.n_experts != self.experts || h.topk != self.top {
+                return Err(format!(
+                    "--shape route=hist:{}: recording has E={} TOP={}, the shape has E={} TOP={}",
+                    h.path, h.n_experts, h.topk, self.experts, self.top
+                ));
+            }
+        }
+        self.expert_geometry()?
+            .plan(plan_arch(self.arch), WeightCodec::Mq4Sym)?;
         Ok(())
     }
 
@@ -379,6 +600,14 @@ impl Geo {
         match self.route {
             Route::One => vec![0; l],
             Route::All => (0..l).map(|f| (f % self.experts) as u32).collect(),
+            Route::Hist => {
+                let ids = &self
+                    .hist
+                    .as_ref()
+                    .expect("Route::Hist carries its recording")
+                    .ids;
+                (0..l).map(|f| ids[f % ids.len()] as u32).collect()
+            }
             Route::Uniform | Route::Skew => {
                 let hot = self.hot();
                 let mut v = Vec::with_capacity(l);
@@ -445,13 +674,13 @@ fn pick_evenly(live: &[usize], n: usize) -> Vec<usize> {
 /// `(sc, zp)` header with `zp == -8*sc` exactly: independently varied normal
 /// scales of both signs (2^-12 .. 2^-4), plus zero groups of both zero signs.
 /// `examples/qwen4_moe_sym.rs:198-211`.
-fn sym_header(r: &mut Rng) -> (u16, u16) {
+fn sym_header(r: &mut Rng, span: u64) -> (u16, u16) {
     match r.below(64) {
         0 => (0x0000, 0x8000),
         1 => (0x8000, 0x0000),
         _ => {
             let sign = (r.below(2) as u16) << 15;
-            let exp = 3 + r.below(9) as u16;
+            let exp = 3 + r.below(span) as u16;
             let man = r.below(1024) as u16;
             let sc = sign | (exp << 10) | man;
             let zp = (sign ^ 0x8000) | ((exp + 3) << 10) | man;
@@ -463,12 +692,12 @@ fn sym_header(r: &mut Rng) -> (u16, u16) {
 /// One expert's rows: QT44 (136 B groups, `K % 256`) or QT53 (68 B groups,
 /// `K % 128`), every header symmetric, every nibble code uniform.
 /// `examples/qwen4_moe_sym.rs:223-244`.
-fn symmetric_weights_into(w: &mut [u8], group_bytes: usize, seed: u64) {
+fn symmetric_weights_into(w: &mut [u8], group_bytes: usize, seed: u64, span: u64) {
     let mut r = Rng(seed ^ 0x5eed_0000_0000_0001);
     let hdrs = group_bytes / 68;
     for g in w.chunks_exact_mut(group_bytes) {
         for h in 0..hdrs {
-            let (sc, zp) = sym_header(&mut r);
+            let (sc, zp) = sym_header(&mut r, span);
             g[4 * h..4 * h + 2].copy_from_slice(&sc.to_le_bytes());
             g[4 * h + 2..4 * h + 4].copy_from_slice(&zp.to_le_bytes());
         }
@@ -496,16 +725,16 @@ fn locate(kind: Kind, row_bytes: usize, row: usize, h: usize) -> (usize, usize) 
 }
 
 /// One activation row decoded: per-epoch scale and `epochs * 128` signed values.
-struct XRow {
-    d: Vec<f32>,
-    v: Vec<i8>,
+pub(crate) struct XRow {
+    pub(crate) d: Vec<f32>,
+    pub(crate) v: Vec<i8>,
 }
 
 /// Exact fold of `m` weight rows against each activation row: `[xs.len()][m]`
 /// f32 sums, `sum = fma(RN(sc_h * d_h), float(C_h), sum)` from `+0`, ascending
 /// epochs (`examples/qwen4_moe_sym.rs:262-328`). `C_h` is an exact integer sum,
 /// so its evaluation order is irrelevant.
-fn fold_slots(
+pub(crate) fn fold_slots(
     kind: Kind,
     m: usize,
     epochs: usize,
@@ -550,7 +779,7 @@ fn bf16_bits(v: f32) -> u16 {
 }
 
 /// BF16 round trip (`mq_i4_reference.rs:941-948`, kernel `sym_bf16_rt`).
-fn rt_f32(v: f32) -> f32 {
+pub(crate) fn rt_f32(v: f32) -> f32 {
     if !v.is_finite() {
         return v;
     }
@@ -561,7 +790,7 @@ fn rt_f32(v: f32) -> f32 {
 /// Portable-math SwiGLU `RN(IEEE(g / (1 + e^-g)) * u)` of `silu_dense`
 /// (`mq_i4_reference.rs:1046-1068` with `PortableEpilogue`): a portable reference,
 /// not a device byte oracle.
-fn portable_silu_mul(g: f32, u: f32) -> f32 {
+pub(crate) fn portable_silu_mul(g: f32, u: f32) -> f32 {
     let neg_log2e = f32::from_bits(0xbfb8_aa3b);
     let neg_log2e_lo = f32::from_bits(0xb2a5_705f);
     let ph = neg_log2e * g;
@@ -657,12 +886,17 @@ struct Problem {
     sorted: Vec<i32>,
     tiles: Vec<i32>,
     xq: OnceLock<Vec<u8>>,
+    /// Emulator gate only: narrow the synthetic weight scales (header exponent span 4 instead of 9) so no
+    /// accumulator reaches the SwiGLU divisions the emulator has not measured. Never set on a device run.
+    tame: bool,
 }
 
 impl Problem {
     fn new(geo: &Geo, kind: Kind) -> Result<Problem> {
         geo.validate()?;
-        let plan = geo.expert_geometry()?.plan(ARCH, WeightCodec::Mq4Sym)?;
+        let plan = geo
+            .expert_geometry()?
+            .plan(plan_arch(geo.arch), WeightCodec::Mq4Sym)?;
         let pg = match kind {
             Kind::GateUp => plan.gate_up,
             Kind::Down => plan.down,
@@ -703,7 +937,7 @@ impl Problem {
             Kind::GateUp => m / 2,
             Kind::Down => m,
         };
-        // The kernel indexes Y with a 32-bit byte offset (`gemm.rs:1403 pm_check_moe_down_extent`).
+        // The kernel indexes Y with a 32-bit byte offset (`gemm.rs:1514 pm_check_moe_down_extent`).
         if (pmax as u64) * (row_len as u64) * 2 > u64::from(u32::MAX) {
             return Err(format!(
                 "{} grouped rows x {row_len} x 2 B exceed the kernel's 32-bit Y byte offset",
@@ -727,6 +961,7 @@ impl Problem {
             sorted,
             tiles,
             xq: OnceLock::new(),
+            tame: false,
         };
         let need = p.device_bytes();
         if need > DEVICE_CAP {
@@ -778,7 +1013,7 @@ impl Problem {
         let seed = self.geo.seed
             ^ (idx as u64).wrapping_mul(GOLDEN)
             ^ (self.group_bytes as u64).wrapping_mul(0x1_0000_0001);
-        symmetric_weights_into(out, self.group_bytes, seed);
+        symmetric_weights_into(out, self.group_bytes, seed, if self.tame { 4 } else { 9 });
     }
 
     /// Epoch-major `[epochs][x_src_rows]` `block_i4_128` records: `d` a normal
@@ -1035,8 +1270,9 @@ impl Problem {
         ptrs: [(u64, u64); 5],
     ) -> Result<Vec<u8>> {
         let spec = entry.spec;
-        let exact = if spec.arch == ARCH && spec.codec == WeightCodec::Mq4Sym {
-            find_export(AbiArch::Gfx1201, &entry.symbol())
+        let abi_arch = abi_arch(spec.arch)?;
+        let exact = if spec.codec == WeightCodec::Mq4Sym {
+            find_export(abi_arch, &entry.symbol())
         } else {
             None
         };
@@ -1045,7 +1281,7 @@ impl Problem {
             None => {
                 let product = Entry {
                     spec: Spec {
-                        arch: ARCH,
+                        arch: spec.arch,
                         kind: spec.kind,
                         nt: 4,
                         rr: 1,
@@ -1053,14 +1289,14 @@ impl Problem {
                     },
                     gp: entry.gp,
                 };
-                find_export(AbiArch::Gfx1201, &product.symbol()).ok_or_else(|| {
+                find_export(abi_arch, &product.symbol()).ok_or_else(|| {
                     format!("no kernel-abi contract export for {}", product.symbol())
                 })?
             }
         };
         let evidence = ExportEvidence {
             source: EvidenceSource::Generator,
-            arch: Some(AbiArch::Gfx1201),
+            arch: Some(abi_arch),
             symbol: export.symbol.to_owned(),
             args: layout
                 .args
@@ -1154,7 +1390,7 @@ impl Problem {
         let v = validate_invocation(
             abi,
             &InvocationV1 {
-                arch: AbiArch::Gfx1201,
+                arch: abi_arch,
                 symbol: export.symbol,
                 params: &params,
                 operands: &binds,
@@ -1191,7 +1427,7 @@ impl Problem {
 
     fn shape_json(&self) -> Value {
         let g = &self.geo;
-        json!({
+        let mut v = json!({
             "preset": g.preset, "experts": g.experts, "top_k": g.top, "tokens": g.tokens,
             "hidden": g.hidden, "intermediate": g.inter, "distinct_experts": g.distinct,
             "route": g.route.name(), "seed": g.seed,
@@ -1201,7 +1437,12 @@ impl Problem {
             "live_slots": g.slots(), "total_slots": self.total_slots(),
             "expert_tensor_bytes": self.stride, "y_bytes_per_arm": self.y_bytes(),
             "device_bytes": self.device_bytes(),
-        })
+        });
+        if let Some(h) = &g.hist {
+            v["route_id"] = json!(h.id);
+            v["route_layer"] = json!(h.layer);
+        }
+        v
     }
 }
 
@@ -1210,7 +1451,7 @@ impl Problem {
 
 /// Production's gfx1201 resident symbol width for one call: down is always NT4;
 /// gate/up is NT8 when `total_slots >= 128 * n_experts`, else NT4
-/// (`gemm.rs:48775 qwen4_moe_sym_nt8_selected`, `:48754 qwen4_moe_sym_wide_shape`).
+/// (`gemm.rs:49334 qwen4_moe_sym_nt8_selected`, `:49313 qwen4_moe_sym_wide_shape`).
 fn shipped_nt(kind: Kind, total_slots: usize, experts: usize) -> u8 {
     let wide = kind == Kind::GateUp
         && experts != 0
@@ -1221,6 +1462,51 @@ fn shipped_nt(kind: Kind, total_slots: usize, experts: usize) -> u8 {
         8
     } else {
         4
+    }
+}
+
+/// The gfx1151 streamed NT8 gate/up (`qwen4_moe_sym::emit_gate_up_stream8`) selection: production's
+/// `qwen4_moe_stream8_selected` (`gemm.rs:56516`; caller `qwen4_moe_sym_gate_up_symbol`,
+/// `gemm.rs:50779`) takes it on a resident gfx1151 call exactly at `[M, K, top, rows, experts] =
+/// [1280, 2560, 10, 7168..=8192, 512]` (gate/up only; `rows` = token rows = `x_src_rows`).
+fn stream8_selected(p: &Problem) -> bool {
+    p.kind == Kind::GateUp
+        && p.m == 1280
+        && p.k == 2560
+        && p.x_row_div == 10
+        && p.geo.experts == 512
+        && (7168..=8192).contains(&p.x_src_rows)
+}
+
+/// What production (`HIPFIRE_*` unset, VRAM-resident experts) launches on `arch` for this call:
+/// gfx1201 `shipped_nt`; gfx1151 gate/up NT4 (stream8 at its measured shape), down NT4 with row
+/// repeat 1; gfx1100 NT1 for both. An entry the arch has no shipped object for is refused by name.
+fn shipped_entry(arch: Arch, gp: bool, p: &Problem) -> Result<Entry> {
+    let kind = p.kind;
+    let plain = |nt: u8| Entry {
+        spec: Spec {
+            arch,
+            kind,
+            nt,
+            rr: 1,
+            codec: WeightCodec::Mq4Sym,
+        },
+        gp,
+    };
+    match arch {
+        Arch::Gfx1201 => Ok(plain(shipped_nt(kind, p.total_slots(), p.geo.experts))),
+        _ if gp => Err(format!(
+            "no shipped grouped-position down entry on {}: `qwen4_moe_down_gp_pm_gfx1201` \
+             (QWEN4_MOE_DOWN_GP_PM_GFX1201) is the only gp object",
+            arch.name()
+        )),
+        Arch::Gfx1151 if stream8_selected(p) => Ok(Entry::stream8()),
+        Arch::Gfx1151 => Ok(plain(4)),
+        Arch::Gfx1100 => Ok(plain(1)),
+        other => Err(format!(
+            "no shipped qwen4_moe_sym object on {}",
+            other.name()
+        )),
     }
 }
 
@@ -1261,6 +1547,8 @@ struct Moe {
     reference: OnceLock<Vec<(usize, Vec<u16>)>>,
     /// `--rip`: source path and text of the candidate script.
     rip: Option<(String, String)>,
+    /// `--cand-object`: path and bytes of the prebuilt candidate code object (gfx1100 only).
+    cand_object: Option<(String, Vec<u8>)>,
 }
 
 fn arm_index(arm: Arm) -> usize {
@@ -1274,6 +1562,10 @@ fn arm_index(arm: Arm) -> usize {
 /// the gfx1201 MQ4 down NT4/NT8 entry (`qwen4_moe_sym::emit_down_gp`), which reads the down A4
 /// plane in grouped-position order (record `g * m_total + row`) instead of gathering
 /// `sorted[row]`-indexed flat-slot records. Same 64-byte ABI, grid and output bytes.
+///
+/// The gfx1151 streamed NT8 gate/up (`emit_gate_up_stream8`, symbol `..._gfx1151_nt8_stream2`) has
+/// no `Spec` of its own; it is the gfx1151 gate/up `nt = 8` spec, which `Spec::validate` refuses
+/// for every other purpose, so [`Entry::is_stream8`] identifies it unambiguously.
 #[derive(Clone, Copy, Debug)]
 struct Entry {
     spec: Spec,
@@ -1281,16 +1573,35 @@ struct Entry {
 }
 
 impl Entry {
-    /// `--epi` grammar: the `Spec::from_epi` names plus `down_gp_nt4|down_gp_nt8`.
-    fn parse(epi: &str) -> Result<Entry> {
+    /// `--epi` grammar: the `Spec::from_epi` names plus `down_gp_nt4|down_gp_nt8` (gfx1201) and
+    /// `gate_up_stream8` (gfx1151). gfx1100 builds only the NT1 entries; gfx1151 validates the
+    /// spec at parse time (`Spec::validate` verbatim: NT8 and row-repeat rules).
+    fn parse(epi: &str, arch: Arch) -> Result<Entry> {
+        if epi == "gate_up_stream8" {
+            if arch != Arch::Gfx1151 {
+                return Err(format!(
+                    "--epi {epi}: the streamed NT8 gate/up (`emit_gate_up_stream8`, object \
+                     QWEN4_MOE_GATE_UP_STREAM8_PM_GFX1151) is built for gfx1151 only, not {}",
+                    arch.name()
+                ));
+            }
+            return Ok(Entry::stream8());
+        }
         if let Some(tail) = epi.strip_prefix("down_gp") {
             if !tail.starts_with("_nt") {
                 return Err(format!(
                     "--epi {epi}: the grouped-position twin needs a tile width (down_gp_nt4|down_gp_nt8)"
                 ));
             }
+            if arch != Arch::Gfx1201 {
+                return Err(format!(
+                    "--epi {epi}: the grouped-position down twin (`emit_down_gp`, bundle \
+                     qwen4_moe_down_gp_pm_gfx1201) exists on gfx1201 only, not {}",
+                    arch.name()
+                ));
+            }
             return Ok(Entry {
-                spec: Spec::from_epi(&format!("down{tail}"), ARCH)?,
+                spec: Spec::from_epi(&format!("down{tail}"), arch)?,
                 gp: true,
             });
         }
@@ -1299,15 +1610,54 @@ impl Entry {
                 "--epi {epi}: only the down entry has a grouped-position twin (down_gp_nt4|down_gp_nt8)"
             ));
         }
-        Ok(Entry {
-            spec: Spec::from_epi(epi, ARCH)?,
+        let spec = Spec::from_epi(epi, arch)?;
+        match arch {
+            Arch::Gfx1201 => {}
+            Arch::Gfx1151 => spec.validate()?,
+            Arch::Gfx1100 if spec.nt != 1 || spec.rr != 1 => {
+                return Err(format!(
+                    "--epi {epi}: gfx1100 builds only the NT1 entries (gate_up, down; \
+                     `qwen4_moe_sym_gfx11`), not nt{} rr{}",
+                    spec.nt, spec.rr
+                ));
+            }
+            Arch::Gfx1100 => {}
+            other => {
+                return Err(format!(
+                    "--epi {epi}: no qwen4_moe_sym entry on {}",
+                    other.name()
+                ));
+            }
+        }
+        Ok(Entry { spec, gp: false })
+    }
+
+    /// The gfx1151 streamed NT8 gate/up entry.
+    fn stream8() -> Entry {
+        Entry {
+            spec: Spec {
+                arch: Arch::Gfx1151,
+                kind: Kind::GateUp,
+                nt: 8,
+                rr: 1,
+                codec: WeightCodec::Mq4Sym,
+            },
             gp: false,
-        })
+        }
+    }
+
+    fn is_stream8(self) -> bool {
+        !self.gp
+            && self.spec.arch == Arch::Gfx1151
+            && self.spec.kind == Kind::GateUp
+            && self.spec.nt == 8
     }
 
     fn symbol(self) -> String {
         if self.gp {
             self.spec.symbol().replacen("_sym_pm_", "_sym_gp_pm_", 1)
+        } else if self.is_stream8() {
+            format!("{}_stream2", self.spec.symbol())
         } else {
             self.spec.symbol()
         }
@@ -1316,14 +1666,28 @@ impl Entry {
     fn variant(self) -> String {
         if self.gp {
             self.spec.variant().replacen("down_nt", "down_gp_nt", 1)
+        } else if self.is_stream8() {
+            "gate_up_stream8".to_owned()
         } else {
             self.spec.variant()
         }
     }
 
+    /// The generator of this entry: `emit_down_gp`, `emit_gate_up_stream8`, the gfx11 K2 module
+    /// for the gfx1100 NT1 entries (`Spec::validate` refuses gfx1100), else `qwen4_moe_sym::emit`.
     fn emit(self) -> Result<peacemaker_isa::Emitted> {
         if self.gp {
             qwen4_moe_sym::emit_down_gp(self.spec)
+        } else if self.is_stream8() {
+            qwen4_moe_sym::emit_gate_up_stream8(self.spec.arch)
+        } else if self.spec.arch == Arch::Gfx1100 {
+            gfx11::emit(gfx11::Spec {
+                arch: self.spec.arch,
+                codec: gfx11::Codec::Mq4,
+                kind: self.spec.kind,
+                acc: false,
+                negative: gfx11::Negative::None,
+            })
         } else {
             qwen4_moe_sym::emit(self.spec)
         }
@@ -1352,6 +1716,23 @@ fn emit_object(entry: Entry, source: Value) -> Result<Object> {
         desc: json!({"knobs": spec_json(entry)}),
         source,
     })
+}
+
+/// Provenance of a non-gfx1201 entry's generator (gfx1201 records keep their original `source`
+/// text; this adds `generator` only elsewhere).
+fn with_generator(entry: Entry, mut source: Value) -> Value {
+    let generator = if entry.gp || entry.spec.arch == Arch::Gfx1201 {
+        return source;
+    } else if entry.is_stream8() {
+        "peacemaker_isa::kernels::qwen4_moe_sym::emit_gate_up_stream8 + native::assemble"
+    } else if entry.spec.arch == Arch::Gfx1100 {
+        "peacemaker_isa::kernels::qwen4_moe_sym_gfx11::emit (Codec::Mq4; Spec::validate of \
+         qwen4_moe_sym refuses gfx1100) + native::assemble"
+    } else {
+        "peacemaker_isa::kernels::qwen4_moe_sym::emit (Spec::from_epi(epi, gfx1151)) + native::assemble"
+    };
+    source["generator"] = json!(generator);
+    source
 }
 
 /// Flash-Next prefill presets: `fn:<entry>-t<tokens>` = the Flash-Next geometry
@@ -1431,18 +1812,159 @@ fn rip_object(entry: Entry, path: &str, source: &str) -> Result<Object> {
     })
 }
 
-/// Constructor for `--kernel qwen4_moe_sym` without `--rip`.
-#[cfg(test)]
-pub fn new(shape: &str, knobs: &mut Knobs) -> Result<Box<dyn Workload>> {
-    new_with_rip(shape, knobs, None)
+/// A prebuilt candidate code object for `entry` (`--cand-object`; gfx1100 NT1, built by the
+/// standalone emitter of a candidate module copy): refused unless it exposes `entry`'s symbol with
+/// the ABI (kernarg layout, workgroup size, LDS, wave mode) of the in-tree Rust emit of that
+/// entry, so the launch contract, kernarg encoding and grid of the baseline arm stay valid. M7,
+/// resources and `code_sha256` then run on it exactly as on an emitted candidate.
+fn cand_object_object(entry: Entry, path: &str, bytes: &[u8]) -> Result<Object> {
+    let symbol = entry.symbol();
+    let generator = entry.emit()?;
+    let gen_elf = peacemaker_isa::native::assemble(&generator.s_text, entry.spec.arch)?;
+    let got = crate::iu4::abi_signature(bytes, &symbol)
+        .map_err(|e| format!("--cand-object {path}: not a code object exposing {symbol}: {e}"))?;
+    // gfx1201: the reference is the shipped image's own entry (the object the baseline launches),
+    // when that image exports the symbol; otherwise (an NT the shipped image lacks) the emit's.
+    let (want, want_what) = match shipped_reference(entry) {
+        Some(image) if crate::iu4::abi_signature(image, &symbol).is_ok() => (
+            crate::iu4::abi_signature(image, &symbol)?,
+            "shipped baseline image",
+        ),
+        _ => (
+            crate::iu4::abi_signature(&gen_elf, &symbol)?,
+            "in-tree emit",
+        ),
+    };
+    if got != want {
+        return Err(format!(
+            "--cand-object {path}: ABI mismatch with the {want_what} of {} in field {}:\n  object:    {got}\n  reference: {want}",
+            entry.variant(),
+            abi_diff_field(&got, &want),
+        ));
+    }
+    let text_sha256 = kernel_text_sha256(bytes, &symbol)?;
+    Ok(Object {
+        source: json!({
+            "source": format!("--cand-object {path} (prebuilt candidate code object)"),
+            "variant": entry.variant(),
+            "sha256": sha256_hex(bytes),
+            "symbol": symbol,
+            "text_sha256": text_sha256,
+        }),
+        desc: json!({
+            "knobs": spec_json(entry),
+            "cand_object": {
+                "path": path,
+                "sha256": sha256_hex(bytes),
+                "co_sha256": sha256_hex(bytes),
+                "symbol": symbol,
+                "text_sha256": text_sha256,
+                "abi_reference": want_what,
+                "variant": entry.variant(),
+                "identical_to_generator": bytes == gen_elf.as_slice(),
+            },
+        }),
+        exports: vec![symbol.clone()],
+        launch_symbol: symbol,
+        bytes: bytes.to_vec(),
+    })
 }
 
-/// Constructor for `--kernel qwen4_moe_sym`; `rip` = `--rip FILE.rip` (every MQ4 entry).
+/// The shipped gfx1201 image holding `entry`'s symbol (None off gfx1201).
+fn shipped_reference(entry: Entry) -> Option<&'static [u8]> {
+    if entry.spec.arch != Arch::Gfx1201 {
+        return None;
+    }
+    Some(if entry.gp {
+        rdna_compute::kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201
+    } else {
+        rdna_compute::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201
+    })
+}
+
+/// sha256 of `symbol`'s re-encoded instruction stream (the `.text` of that kernel).
+fn kernel_text_sha256(bytes: &[u8], symbol: &str) -> Result<String> {
+    let program = crate::lift(bytes)?;
+    let kernel = program
+        .kernels
+        .iter()
+        .find(|k| k.symbol.0 == symbol)
+        .ok_or_else(|| format!("object has no kernel {symbol}"))?;
+    let code = peacemaker_lift::emit::bytes(kernel, program.target.arch).map_err(err)?;
+    Ok(sha256_hex(&code))
+}
+
+/// Name of the first `abi_signature` field that differs between `a` and `b`.
+fn abi_diff_field(a: &str, b: &str) -> String {
+    const KEYS: [&str; 8] = [
+        "symbol",
+        "args",
+        "kernarg_bytes",
+        "kernarg_align",
+        "lds_bytes",
+        "max_flat_workgroup_size",
+        "wavefront_size",
+        "workgroup_processor_mode",
+    ];
+    let field = |s: &str, i: usize| -> String {
+        let start = s.find(&format!("{}=", KEYS[i])).unwrap_or(s.len());
+        let end = KEYS
+            .get(i + 1)
+            .and_then(|k| s.find(&format!(" {k}=")))
+            .unwrap_or(s.len());
+        s[start..end.max(start)].to_string()
+    };
+    (0..KEYS.len())
+        .find(|&i| field(a, i) != field(b, i))
+        .map(|i| KEYS[i].to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// Constructor for `--kernel qwen4_moe_sym` without `--rip` (gfx1201).
+#[cfg(test)]
+pub fn new(shape: &str, knobs: &mut Knobs) -> Result<Box<dyn Workload>> {
+    new_with_rip(shape, knobs, None, Arch::Gfx1201)
+}
+
+/// Test constructor: `--rip` only, no `--cand-object`.
+#[cfg(test)]
 pub fn new_with_rip(
     shape: &str,
     knobs: &mut Knobs,
     rip: Option<&std::path::Path>,
+    arch: Arch,
 ) -> Result<Box<dyn Workload>> {
+    new_with_cand_object(shape, knobs, rip, arch, None)
+}
+
+/// Constructor for `--kernel qwen4_moe_sym`; `rip` = `--rip FILE.rip` (every MQ4 entry);
+/// `cand_object` = `--cand-object FILE` (a prebuilt candidate code object, gfx1100 only: read and
+/// ABI-checked against the in-tree emit of the entry by `candidate()`); `arch` =
+/// gfx1201 (default), gfx1151 or gfx1100: the shipped baseline, candidate emit, R1 contract and
+/// geometry are all that arch's (see the module doc's `# Shipped baseline`).
+pub fn new_with_cand_object(
+    shape: &str,
+    knobs: &mut Knobs,
+    rip: Option<&std::path::Path>,
+    arch: Arch,
+    cand_object: Option<&std::path::Path>,
+) -> Result<Box<dyn Workload>> {
+    let cand_object = match cand_object {
+        Some(p) => {
+            if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1201) {
+                return Err(format!(
+                    "--cand-object is supported on gfx1100 and gfx1201 only (got {})",
+                    arch.name()
+                ));
+            }
+            Some((
+                p.display().to_string(),
+                std::fs::read(p).map_err(|e| format!("--cand-object {}: {e}", p.display()))?,
+            ))
+        }
+        None => None,
+    };
+    abi_arch(arch)?;
     let rip = match rip {
         Some(p) => Some((
             p.display().to_string(),
@@ -1454,12 +1976,12 @@ pub fn new_with_rip(
     let epi = knobs.take_or("epi", preset_epi.unwrap_or("gate_up"));
     let base_epi = knobs.take("base-epi");
     let sample = Sample::parse(&knobs.take_or("ref-rows", &format!("sample:{DEFAULT_SAMPLE}")))?;
-    let geo = Geo::parse(&shape)?;
-    let cand = Entry::parse(&epi)?;
+    let geo = Geo::parse(&shape, arch)?;
+    let cand = Entry::parse(&epi, arch)?;
     let problem = Problem::new(&geo, cand.spec.kind)?;
     let base = match base_epi {
         Some(b) => {
-            let entry = Entry::parse(&b).map_err(|e| format!("--base-epi: {e}"))?;
+            let entry = Entry::parse(&b, arch).map_err(|e| format!("--base-epi: {e}"))?;
             if entry.spec.kind != cand.spec.kind {
                 return Err(format!(
                     "--base-epi {b}: kind {} differs from the candidate's {} (outputs are not comparable)",
@@ -1471,16 +1993,7 @@ pub fn new_with_rip(
         }
         // A gp candidate times against the shipped gp entry (production runs the grouped
         // plane whenever the PM rotate twin is selected), a flat one against the flat entry.
-        None => Baseline::Shipped(Entry {
-            spec: Spec {
-                arch: ARCH,
-                kind: cand.spec.kind,
-                nt: shipped_nt(cand.spec.kind, problem.total_slots(), geo.experts),
-                rr: 1,
-                codec: WeightCodec::Mq4Sym,
-            },
-            gp: cand.gp,
-        }),
+        None => Baseline::Shipped(shipped_entry(arch, cand.gp, &problem)?),
     };
     let any_gp = cand.gp || base.entry().gp;
     if any_gp && problem.device_bytes_with(true) > DEVICE_CAP {
@@ -1497,7 +2010,37 @@ pub fn new_with_rip(
         dev: None,
         reference: OnceLock::new(),
         rip,
+        cand_object,
     }))
+}
+
+/// Unmapped bytes between the exact-size buffers of an emulator-gate run (the gate demands >= 64 KiB).
+const EMU_GUARD: u64 = 0x2_0000;
+/// Shapes of the emulator gate: an aligned and a ragged token count (grouped rows pad to 16 per expert) at a tiny K
+/// (gate_up K=512 / 4 epochs, down K=128 / 1 epoch) and at the production K (H=2560, I=640: gate_up K=2560 / 20
+/// epochs, down K=640 / 5 epochs), so K-specialised paths (e.g. an epoch-count guard) are emulated too. ALL must pass.
+const EMU_GATE_SHAPES: [(&str, &str); 4] = [
+    ("tiny", "E=2,TOP=2,T=20,H=512,I=128"),
+    ("ragged", "E=2,TOP=2,T=37,H=512,I=128"),
+    ("prod", "E=2,TOP=2,T=20,H=2560,I=640"),
+    ("prod_ragged", "E=2,TOP=2,T=37,H=2560,I=640"),
+];
+/// Production-extent cases of the gate: the judge shape (Flash-Next geometry, T=16896) and T=4096 with the real
+/// kernargs and exact-size guarded buffers (hundreds of MB to ~1 GB of address space, lazily backed), emulating
+/// only sampled workgroups ([`Moe::extent_wgs`]); the sampled outputs are compared with the emulated incumbent's.
+/// Catches address-arithmetic faults that only appear at production record indices.
+const EMU_EXTENT_SHAPES: [(&str, &str); 2] = [
+    ("extent_t16896", "fn,T=16896"),
+    ("extent_t4096", "fn,T=4096"),
+];
+
+/// One emulated arm of the gate: output bytes and counters.
+struct EmuArm {
+    y: Vec<u8>,
+    y_bytes_written: u64,
+    instructions: u64,
+    workgroups: u64,
+    lds_static: Option<u64>,
 }
 
 impl Moe {
@@ -1537,11 +2080,15 @@ impl Moe {
         match self.base {
             Baseline::Emitted(_) => emit_object(
                 entry,
-                json!({
-                    "source": "emitted from --base-epi: peacemaker_isa::kernels::qwen4_moe_sym::emit \
-                               + native::assemble (peacemaker-isa.rs:202-216, :1547)",
-                }),
+                with_generator(
+                    entry,
+                    json!({
+                        "source": "emitted from --base-epi: peacemaker_isa::kernels::qwen4_moe_sym::emit \
+                                   + native::assemble (peacemaker-isa.rs:202-216, :1547)",
+                    }),
+                ),
             ),
+            Baseline::Shipped(_) if spec.arch != Arch::Gfx1201 => self.shipped_gfx11(entry),
             Baseline::Shipped(_) if entry.gp => self.shipped_gp(entry),
             Baseline::Shipped(_) => {
                 let bytes = rdna_compute::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201.to_vec();
@@ -1553,7 +2100,7 @@ impl Moe {
                         "shipped bundle QWEN4_MOE_IU4_SYM_PM_GFX1201 does not export {symbol}"
                     ));
                 }
-                let exports: Vec<String> = qwen4_moe_sym::module_specs(ARCH)
+                let exports: Vec<String> = qwen4_moe_sym::module_specs(spec.arch)
                     .into_iter()
                     .map(Spec::symbol)
                     .collect();
@@ -1566,12 +2113,12 @@ impl Moe {
                         "knobs": spec_json(entry),
                     }),
                     source: json!({
-                        "source": "crates/rdna-compute/src/gemm.rs:48775 qwen4_moe_sym_nt8_selected \
-                                   (resident width; wide shape :48754; tables :48718-48737), \
-                                   :49542-49566 gfx1201 MoeSymIu4Kernel row, \
-                                   :51568-51666 qwen4_moe_sym_gemm launcher",
+                        "source": "crates/rdna-compute/src/gemm.rs:49334 qwen4_moe_sym_nt8_selected \
+                                   (resident width; wide shape :49313; tables :49277-49296), \
+                                   :50101-50125 gfx1201 MoeSymIu4Kernel row, \
+                                   :52361-52503 qwen4_moe_sym_gemm launcher",
                         "const": "rdna_compute::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201 \
-                                  (crates/rdna-compute/src/kernels.rs:4303)",
+                                  (crates/rdna-compute/src/kernels.rs:4467)",
                         "artifact": "kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco",
                         "sha256": sha256_hex(&bytes),
                         "symbol": symbol,
@@ -1585,7 +2132,7 @@ impl Moe {
                             "n_experts": p.geo.experts,
                         },
                         "launch": "grid (M/64, m_total/16, 1), block = Spec::threads, dynamic LDS 0 \
-                                   (gemm.rs:51621,51646)",
+                                   (gemm.rs:52472,52476)",
                         "outputs_comparable": "yes: every NT entry shares the 64-byte ABI, grid and \
                                    output bytes (qwen4_moe_sym.rs:1544-1554), so the shipped nt may \
                                    differ from the candidate's",
@@ -1594,6 +2141,115 @@ impl Moe {
                 })
             }
         }
+    }
+
+    /// The shipped gfx1151 / gfx1100 baseline (`entry` from [`shipped_entry`]): that arch's own
+    /// embedded bundle (never a gfx1201 object), selected as production does at VRAM residency.
+    fn shipped_gfx11(&self, entry: Entry) -> Result<Object> {
+        use rdna_compute::kernels as k;
+        let spec = entry.spec;
+        let arch = spec.arch;
+        let symbol = entry.symbol();
+        let p = &self.problem;
+        let nt1_exports = || -> Vec<String> {
+            Kind::ALL
+                .into_iter()
+                .map(|kind| {
+                    Spec {
+                        arch,
+                        kind,
+                        nt: 1,
+                        rr: 1,
+                        codec: WeightCodec::Mq4Sym,
+                    }
+                    .symbol()
+                })
+                .collect()
+        };
+        let (bytes, konst, artifact, exports, source, rule) = match (arch, entry.is_stream8()) {
+            (Arch::Gfx1151, true) => (
+                k::QWEN4_MOE_GATE_UP_STREAM8_PM_GFX1151.to_vec(),
+                "rdna_compute::kernels::QWEN4_MOE_GATE_UP_STREAM8_PM_GFX1151 \
+                 (crates/rdna-compute/src/kernels.rs:4472)",
+                "kernels/qwen4_moe_gate_up_stream8_pm_gfx1151.hxaco",
+                vec![symbol.clone()],
+                "crates/rdna-compute/src/gemm.rs:50779 qwen4_moe_sym_gate_up_symbol (stream8 \
+                 allowlist), :56516 qwen4_moe_stream8_selected, :52458 launcher module \
+                 QWEN4_MOE_SYM_STREAM8_MODULE (:49228-49229)",
+                "gate_up: streamed NT8 iff gfx1151 && native PM (HIPFIRE_QWEN4_MOE_SYM_PM unset = on) \
+                 && resident && [M,K,top,rows,experts] = [1280,2560,10,7168..=8192,512] \
+                 (gemm.rs:56516)",
+            ),
+            (Arch::Gfx1151, false) => (
+                k::QWEN4_MOE_IU4_SYM_PM_GFX1151.to_vec(),
+                "rdna_compute::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1151 \
+                 (crates/rdna-compute/src/kernels.rs:4465)",
+                "kernels/qwen4_moe_iu4_sym_pm_gfx1151.hxaco",
+                qwen4_moe_sym::module_specs(arch)
+                    .into_iter()
+                    .map(Spec::symbol)
+                    .collect(),
+                "crates/rdna-compute/src/gemm.rs:50704 qwen4_moe_sym_gemm_symbols (resident pair; \
+                 gfx1151 MoeSymIu4Kernel row :50072-50100; tables :49277-49296; NT8 selection is \
+                 gfx1201-only, :49334-49350), :50802 qwen4_moe_sym_down_rr \
+                 (HIPFIRE_QWEN4_MOE_SYM_DOWN_RR unset = 1; rr2/rr4 entries :50307, env :50344), \
+                 :50779 qwen4_moe_sym_gate_up_symbol (stream8 allowlist :56516)",
+                "down: NT4 rr1 (HIPFIRE_QWEN4_MOE_SYM_DOWN_RR unset; nt4r2/nt4r4 are env opt-ins: \
+                 use --base-epi down_nt4r2|down_nt4r4); gate_up: NT4 (the only tile width) except \
+                 the measured stream8 shape (--epi gate_up_stream8; \
+                 [M,K,top,rows,experts] = [1280,2560,10,7168..=8192,512])",
+            ),
+            (Arch::Gfx1100, _) => (
+                k::QWEN4_MOE_IU4_SYM_PM_GFX1100.to_vec(),
+                "rdna_compute::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1100 \
+                 (crates/rdna-compute/src/kernels.rs:4495)",
+                "kernels/qwen4_moe_iu4_sym_pm_gfx1100.hxaco",
+                nt1_exports(),
+                "crates/rdna-compute/src/gemm.rs:50038-50071 gfx1100 MoeSymIu4Kernel row \
+                 (tiles_per_cta [1,1], block [64,128] = QWEN4_MOE_SYM_NT1_BLOCK :49995, no LDS), \
+                 :50711 NT1 early-out of qwen4_moe_sym_gemm_symbols, launcher \
+                 qwen4_moe_sym_nt1_gemm :52067; the descriptor's default_requested is false \
+                 (route default OFF on gfx1100 until its Flash-Next qualification)",
+                "gate_up and down: NT1 for both residencies (the only gfx1100 entries)",
+            ),
+            (other, _) => {
+                return Err(format!("no shipped qwen4_moe_sym object on {}", other.name()))
+            }
+        };
+        let mut needle = symbol.clone().into_bytes();
+        needle.push(0);
+        if !bytes.windows(needle.len()).any(|w| w == needle.as_slice()) {
+            return Err(format!(
+                "shipped {artifact} (arch {}) does not export {symbol}",
+                arch.name()
+            ));
+        }
+        Ok(Object {
+            launch_symbol: symbol.clone(),
+            exports,
+            desc: json!({"artifact": artifact, "knobs": spec_json(entry)}),
+            source: json!({
+                "source": source,
+                "const": konst,
+                "artifact": artifact,
+                "sha256": sha256_hex(&bytes),
+                "symbol": symbol,
+                "nt": spec.nt,
+                "selection": {
+                    "residency": "vram",
+                    "rule": rule,
+                    "total_slots": p.total_slots(),
+                    "n_experts": p.geo.experts,
+                },
+                "launch": "grid (M/(64*rr), m_total/16, 1), block = Spec::threads, dynamic LDS 0 \
+                           (static LDS in the object: gate/up NT4 8192 B, stream8 16384 B, else 0)",
+                "outputs_comparable": "yes: every entry shares the 64-byte ABI, grid and output \
+                           bytes (same ascending K128 fold and BF16/SwiGLU rounding as the NT1 \
+                           anchor; qwen4_moe_sym.rs module doc), so the shipped nt may differ \
+                           from the candidate's",
+            }),
+            bytes,
+        })
     }
 
     /// The shipped grouped-position down entry: `QWEN4_MOE_DOWN_GP_PM_GFX1201`, the NT4
@@ -1611,20 +2267,20 @@ impl Moe {
         let p = &self.problem;
         Ok(Object {
             launch_symbol: symbol.clone(),
-            exports: qwen4_moe_down_gp::symbols(ARCH).to_vec(),
+            exports: qwen4_moe_down_gp::symbols(entry.spec.arch).to_vec(),
             desc: json!({
                 "artifact": "kernels/qwen4_moe_down_gp_pm_gfx1201.hxaco",
                 "knobs": spec_json(entry),
             }),
             source: json!({
-                "source": "crates/rdna-compute/src/gemm.rs:51304-51318 gemm_qwen4_moe_down_iu4_sym \
-                           (grouped plane -> `..._gp` twin), :48818-48851 entries/image \
+                "source": "crates/rdna-compute/src/gemm.rs:51851-51864 gemm_qwen4_moe_down_iu4_sym \
+                           (grouped plane -> `..._gp` twin), :49236-49261 entries/image \
                            (qwen4_moe_down_gp_entry, qwen4_moe_down_gp_image, QWEN4_MOE_DOWN_GP_PM_ENTRIES), \
-                           :51867-51874 launcher; down width is NT4 resident (:48775 rule); \
-                           plane writer crates/rdna-compute/src/moe_rotate_i4_pm.rs:218-245 \
+                           :51865-51872 launcher; down width is NT4 resident (:49334 rule); \
+                           plane writer crates/rdna-compute/src/moe_rotate_i4_pm.rs:219-249 \
                            (qwen4_moe_rotate128_i4_gp_selected / qwen4_moe_rotate128_i4_gp)",
                 "const": "rdna_compute::kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201 \
-                          (crates/rdna-compute/src/kernels.rs:10511)",
+                          (crates/rdna-compute/src/kernels.rs:10783)",
                 "artifact": "kernels/qwen4_moe_down_gp_pm_gfx1201.hxaco",
                 "sha256": sha256_hex(&bytes),
                 "symbol": symbol,
@@ -1664,6 +2320,7 @@ impl Moe {
         const SLACK: usize = 4096;
 
         let geo = Geo {
+            arch: self.problem.geo.arch,
             preset: "emu",
             experts: 2,
             top: 2,
@@ -1672,6 +2329,7 @@ impl Moe {
             inter: 128,
             distinct: 2,
             route: Route::Uniform,
+            hist: None,
             seed: 7,
         };
         let p = Problem::new(&geo, self.cand.spec.kind)?;
@@ -1684,7 +2342,7 @@ impl Moe {
         )
         .map_err(|e| format!("lift: {e}"))?
         .program;
-        let emu = Emulator::new(&program, &object.launch_symbol)?;
+        let emu = Emulator::new(&program, &object.launch_symbol)?.hw_model();
 
         let mut mem = Memory::default();
         let mut table = Vec::with_capacity(geo.experts * 8);
@@ -1756,6 +2414,329 @@ impl Moe {
             "tolerance": report.tolerance,
         }))
     }
+
+    /// One arm of [`Moe::emu_gate_run`]: lift `object`, run its complete grid on the emulator at `p` with
+    /// definedness-tracked LDS and every buffer an exact-size region of its own, `EMU_GUARD` unmapped bytes apart
+    /// (no slack: any access past a buffer is an unmapped-memory error). `Err` is the verbatim refusal.
+    fn emu_gate_arm(
+        p: &Problem,
+        entry: Entry,
+        object: &Object,
+        wgs: Option<&[(u32, u32)]>,
+    ) -> Result<EmuArm> {
+        use peacemaker_ir::emu::{Emulator, Launch as EmuLaunch, Memory};
+        let program = peacemaker_lift::lift_object(
+            &object.bytes,
+            peacemaker_lift::Options {
+                frontend: peacemaker_ir::inst::Frontend::Builder,
+            },
+        )
+        .map_err(|e| format!("lift: {e}"))?
+        .program;
+        let lds_static = program
+            .kernels
+            .iter()
+            .find(|k| k.symbol.0 == object.launch_symbol)
+            .and_then(|k| match &k.abi {
+                peacemaker_ir::inst::Abi::Hsa { descriptor, .. } => {
+                    Some(u64::from(descriptor.group_segment_fixed_size))
+                }
+                _ => None,
+            });
+        let emu = Emulator::new(&program, &object.launch_symbol)?
+            .hw_model()
+            .gfx1100_as_gfx1151();
+        let geo = &p.geo;
+        let mut mem = Memory::default();
+        // Sampled (extent) runs back only the experts the sampled tiles use; every other table entry is 0 (an access
+        // through it is an unmapped-memory error). `vec![0; n]` is calloc'd, so untouched pages cost no memory.
+        let needed: Option<std::collections::BTreeSet<i32>> = wgs.map(|w| {
+            w.iter()
+                .map(|&(_, gy)| p.tiles[gy as usize])
+                .filter(|&e| e >= 0)
+                .collect()
+        });
+        let mut table = Vec::with_capacity(geo.experts * 8);
+        for e in 0..geo.experts {
+            if needed.as_ref().is_some_and(|n| !n.contains(&(e as i32))) {
+                table.extend_from_slice(&0u64.to_le_bytes());
+                continue;
+            }
+            let mut w = vec![0u8; p.stride];
+            p.fill_weights(e % geo.distinct, &mut w);
+            let base = mem.map_guarded(format!("expert{e}"), w, EMU_GUARD)?;
+            table.extend_from_slice(&base.to_le_bytes());
+        }
+        let table_len = table.len() as u64;
+        let table_base = mem.map_guarded("table".into(), table, EMU_GUARD)?;
+        let tiles = Problem::i32_bytes(&p.tiles);
+        let tiles_len = tiles.len() as u64;
+        let tiles_base = mem.map_guarded("tiles".into(), tiles, EMU_GUARD)?;
+        let sorted = Problem::i32_bytes(&p.sorted);
+        let sorted_len = sorted.len() as u64;
+        let sorted_base = mem.map_guarded("sorted".into(), sorted, EMU_GUARD)?;
+        let xq = if entry.gp {
+            p.make_xq_gp()
+        } else {
+            p.xq().to_vec()
+        };
+        let xq_len = xq.len() as u64;
+        let xq_base = mem.map_guarded("xq".into(), xq, EMU_GUARD)?;
+        let y_len = p.y_bytes();
+        let y_base = mem.map_guarded("y".into(), vec![0u8; y_len], EMU_GUARD)?;
+        let launch = p.launch_for(
+            entry,
+            [
+                (table_base, table_len),
+                (tiles_base, tiles_len),
+                (sorted_base, sorted_len),
+                (xq_base, xq_len),
+                (y_base, y_len as u64),
+            ],
+        )?;
+        let kernarg = mem.map_guarded("kernarg".into(), launch.kernarg.clone(), EMU_GUARD)?;
+        let mut instructions = 0u64;
+        let all: Vec<(u32, u32)>;
+        let run: &[(u32, u32)] = match wgs {
+            Some(w) => w,
+            None => {
+                all = (0..launch.grid[1])
+                    .flat_map(|gy| (0..launch.grid[0]).map(move |gx| (gx, gy)))
+                    .collect();
+                &all
+            }
+        };
+        for &(gx, gy) in run {
+            if gx >= launch.grid[0] || gy >= launch.grid[1] {
+                return Err(format!(
+                    "workgroup ({gx},{gy}) outside the launch grid {:?}",
+                    launch.grid
+                ));
+            }
+            instructions += emu
+                .run_workgroup_counted(
+                    &EmuLaunch {
+                        kernarg_ptr: kernarg,
+                        workgroup: [gx, gy, 0],
+                        block: launch.block,
+                        dynamic_lds: launch.lds,
+                    },
+                    &mut mem,
+                )
+                .map_err(|e| format!("workgroup ({gx},{gy}): {e}"))?;
+        }
+        let region = mem
+            .regions
+            .iter()
+            .find(|r| r.name == "y")
+            .ok_or("emulator memory lost the y region")?;
+        let y = match wgs {
+            None => region.bytes.clone(),
+            Some(w) => {
+                // The output rows of every sampled tile (16 grouped rows each), ascending. A live tile that wrote
+                // nothing is a failure (an all-zero output would otherwise compare equal to an all-zero incumbent).
+                let tile_bytes = 16 * p.row_len * 2;
+                let tiles: std::collections::BTreeSet<usize> =
+                    w.iter().map(|&(_, gy)| gy as usize).collect();
+                let mut y = Vec::with_capacity(tiles.len() * tile_bytes);
+                for t in tiles {
+                    let (lo, hi) = (t * tile_bytes, (t + 1) * tile_bytes);
+                    let live =
+                        p.tiles[t] >= 0 && p.sorted[16 * t..16 * t + 16].iter().any(|&x| x >= 0);
+                    if live && !(lo..hi).any(|i| region.written.contains(i)) {
+                        return Err(format!("sampled live tile {t} wrote no output"));
+                    }
+                    y.extend_from_slice(&region.bytes[lo..hi]);
+                }
+                y
+            }
+        };
+        Ok(EmuArm {
+            y,
+            y_bytes_written: region.written.count() as u64,
+            instructions,
+            workgroups: run.len() as u64,
+            lds_static,
+        })
+    }
+
+    /// Sampled workgroups of an extent run: grid corners, the first/last live, ragged (padding slots) and sentinel
+    /// (all-padding) tiles, the first tile of the last live expert, and eight seeded random (gx, tile) pairs.
+    fn extent_wgs(p: &Problem, grid: [u32; 3]) -> Vec<(u32, u32)> {
+        let nt = p.ntiles();
+        let slots = |t: usize| &p.sorted[16 * t..16 * t + 16];
+        let live = |t: usize| p.tiles[t] >= 0 && slots(t).iter().any(|&s| s >= 0);
+        let ragged = |t: usize| live(t) && slots(t).iter().any(|&s| s < 0);
+        let sentinel = |t: usize| p.tiles[t] < 0;
+        let first = |f: &dyn Fn(usize) -> bool| (0..nt).find(|&t| f(t));
+        let last = |f: &dyn Fn(usize) -> bool| (0..nt).rev().find(|&t| f(t));
+        let mut tiles: Vec<usize> = vec![0, nt - 1];
+        for f in [&live as &dyn Fn(usize) -> bool, &ragged, &sentinel] {
+            tiles.extend(first(f));
+            tiles.extend(last(f));
+        }
+        if let Some(l) = last(&live) {
+            let e = p.tiles[l];
+            tiles.extend((0..nt).find(|&t| p.tiles[t] == e));
+        }
+        let mut wgs: Vec<(u32, u32)> = tiles
+            .iter()
+            .flat_map(|&t| [0, grid[0] - 1].map(|gx| (gx, t as u32)))
+            .collect();
+        let mut rng = Rng(p.geo.seed ^ 0xE87E_0000_0000_0000 ^ nt as u64);
+        for _ in 0..8 {
+            let t = rng.below(nt as u64) as u32;
+            let gx = rng.below(u64::from(grid[0])) as u32;
+            wgs.push((gx, t));
+        }
+        wgs.sort_unstable();
+        wgs.dedup();
+        wgs
+    }
+
+    /// The pre-card emulator gate (`--emu`): `cand` and `base` (the incumbent) each run their complete grid on the
+    /// emulator at the tiny shapes of [`EMU_GATE_SHAPES`]. It FAILS on: an access outside a mapped buffer, an LDS
+    /// access out of bounds or a read of LDS bytes this workgroup never wrote, a barrier deadlock, the instruction
+    /// limit, any instruction the emulator or lifter cannot execute (named), an output that is not bit-identical to
+    /// the emulated incumbent, and an output that fails the CPU reference. The record is `emu_gate`.
+    fn emu_gate_run(&self, cand: &Object, base: &Object) -> Value {
+        let arch = self.problem.geo.arch;
+        let (cand_entry, base_entry) = (self.cand, self.base.entry());
+        let mut cases = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+        let (mut instructions, mut workgroups) = (0u64, 0u64);
+        let (mut cand_hash, mut base_hash) = (Sha256::new(), Sha256::new());
+        let short = |e: &str| e.split(" | ").next().unwrap_or(e).to_owned();
+        let all_cases = EMU_GATE_SHAPES
+            .iter()
+            .map(|&(n, s)| (n, s, false))
+            .chain(EMU_EXTENT_SHAPES.iter().map(|&(n, s)| (n, s, true)));
+        for (name, shape, extent) in all_cases {
+            let built = Geo::parse(&format!("{shape},seed=7"), arch)
+                .and_then(|geo| Problem::new(&geo, cand_entry.spec.kind))
+                .map(|mut p| {
+                    p.tame = true;
+                    p
+                });
+            let p = match built {
+                Ok(p) => p,
+                Err(e) => {
+                    failures.push(format!("{name}: shape {shape}: {e}"));
+                    cases.push(json!({"name": name, "status": "fail", "reason": e}));
+                    continue;
+                }
+            };
+            let mut case = json!({"name": name, "shape": p.shape_json()});
+            let wgs = extent.then(|| Self::extent_wgs(&p, p.geometry(cand_entry.spec).0));
+            if let Some(w) = &wgs {
+                case["sampled_workgroups"] = json!(w.len());
+                case["sampled"] = json!(w);
+            }
+            let c = Self::emu_gate_arm(&p, cand_entry, cand, wgs.as_deref());
+            let b = Self::emu_gate_arm(&p, base_entry, base, wgs.as_deref());
+            let mut reasons: Vec<String> = Vec::new();
+            match (&c, &b) {
+                (Ok(c), Ok(b)) => {
+                    let identical = c.y == b.y;
+                    if !identical {
+                        let first = c.y.iter().zip(&b.y).position(|(x, y)| x != y);
+                        reasons.push(format!(
+                            "output not bit-identical to the emulated incumbent ({} of {} bytes differ, first at byte {})",
+                            c.y.iter().zip(&b.y).filter(|(x, y)| x != y).count(),
+                            c.y.len(),
+                            first.map_or("n/a".to_owned(), |i| i.to_string())
+                        ));
+                    }
+                    // Extent runs have no CPU reference (it needs every row); the tiny/prod cases carry it.
+                    let reference = if extent {
+                        Vec::new()
+                    } else {
+                        p.reference(Sample::Full)
+                    };
+                    let report = |y: &[u8]| match p.compare(y, &reference, Sample::Full) {
+                        Ok(r) => (
+                            r.pass,
+                            json!({"reference": r.reference, "pass": r.pass,
+                                   "max_abs_err": r.max_abs_err, "tolerance": r.tolerance}),
+                        ),
+                        Err(e) => (false, json!({"pass": false, "error": e})),
+                    };
+                    let (cand_ok, cand_ref) = if extent {
+                        (true, json!("not computed at extent: bit-identity vs the emulated incumbent only"))
+                    } else {
+                        report(&c.y)
+                    };
+                    let (base_ok, base_ref) = if extent {
+                        (true, json!(null))
+                    } else {
+                        report(&b.y)
+                    };
+                    if !cand_ok {
+                        reasons.push(format!(
+                            "candidate output fails the CPU reference: {cand_ref}"
+                        ));
+                    }
+                    if !base_ok {
+                        reasons.push(format!(
+                            "emulated incumbent fails the CPU reference: {base_ref}"
+                        ));
+                    }
+                    cand_hash.update(&c.y);
+                    base_hash.update(&b.y);
+                    instructions += c.instructions;
+                    workgroups += c.workgroups;
+                    case["workgroups"] = json!(c.workgroups);
+                    case["identical_to_incumbent"] = json!(identical);
+                    case["reference"] = json!({"candidate": cand_ref, "incumbent": base_ref});
+                }
+                _ => {}
+            }
+            for (who, r) in [("candidate", &c), ("incumbent", &b)] {
+                match r {
+                    Ok(a) => {
+                        case[who] = json!({
+                            "instructions": a.instructions,
+                            "workgroups": a.workgroups,
+                            "out_sha256": sha256_hex(&a.y),
+                            "out_bytes": a.y.len(),
+                            "out_bytes_written": a.y_bytes_written,
+                            "lds_static_bytes": a.lds_static,
+                        })
+                    }
+                    Err(e) => reasons.push(format!("{who}: {}", short(e))),
+                }
+            }
+            if reasons.is_empty() {
+                case["status"] = json!("pass");
+            } else {
+                case["status"] = json!("fail");
+                case["reason"] = json!(reasons.join("; "));
+                failures.push(format!("{name}: {}", reasons.join("; ")));
+            }
+            cases.push(case);
+        }
+        let status = if failures.is_empty() { "pass" } else { "fail" };
+        json!({
+            "status": status,
+            "reason": if failures.is_empty() { "ok".to_owned() } else { failures.join(" | ") },
+            "shape": EMU_GATE_SHAPES
+                .iter()
+                .chain(EMU_EXTENT_SHAPES.iter())
+                .map(|(n, s)| format!("{n}:{s}"))
+                .collect::<Vec<_>>(),
+            "instructions": instructions,
+            "workgroups": workgroups,
+            "cand_out_sha256": format!("{:x}", cand_hash.finalize()),
+            "base_out_sha256": format!("{:x}", base_hash.finalize()),
+            "guard_bytes": EMU_GUARD,
+            "strict_lds": true,
+            "inputs": "synthetic, weight scale span narrowed (Problem::tame) so no accumulator reaches emulator-unmeasured SwiGLU divisions",
+            "numeric_model": "gfx1100 executed with the gfx1151 WMMA + transcendental model on both arms (no hardware-qualified gfx1100 model); arms compared emulated-vs-emulated and against the CPU reference",
+            "candidate_sha256": sha256_hex(&cand.bytes),
+            "incumbent_sha256": sha256_hex(&base.bytes),
+            "cases": cases,
+        })
+    }
 }
 
 impl Workload for Moe {
@@ -1764,13 +2745,20 @@ impl Workload for Moe {
     }
 
     fn arch(&self) -> &'static str {
-        "gfx1201"
+        self.problem.geo.arch.name()
     }
 
     fn shape_json(&self) -> Value {
         let mut v = self.problem.shape_json();
         v["ref_rows"] = json!(self.sample.label());
         v
+    }
+
+    fn record_extra(&self) -> Vec<(String, Value)> {
+        match &self.problem.geo.hist {
+            Some(h) => vec![("route".to_owned(), h.json())],
+            None => Vec::new(),
+        }
     }
 
     fn candidate_knobs(&self) -> Value {
@@ -1783,16 +2771,22 @@ impl Workload for Moe {
     }
 
     fn candidate(&self) -> Result<Object> {
+        if let Some((path, bytes)) = &self.cand_object {
+            return cand_object_object(self.cand, path, bytes);
+        }
         if let Some((path, text)) = &self.rip {
             return rip_object(self.cand, path, text);
         }
         emit_object(
             self.cand,
-            json!({
-                "source": "peacemaker_isa::kernels::qwen4_moe_sym::emit (emit_down_gp for down_gp_*) via Spec::from_epi + \
-                           native::assemble (the `peacemaker-isa emit --kernel qwen4_moe_sym --co` \
-                           path: crates/peacemaker-isa/src/bin/peacemaker-isa.rs:202-216, :1547)",
-            }),
+            with_generator(
+                self.cand,
+                json!({
+                    "source": "peacemaker_isa::kernels::qwen4_moe_sym::emit (emit_down_gp for down_gp_*) via Spec::from_epi + \
+                               native::assemble (the `peacemaker-isa emit --kernel qwen4_moe_sym --co` \
+                               path: crates/peacemaker-isa/src/bin/peacemaker-isa.rs:202-216, :1547)",
+                }),
+            ),
         )
     }
 
@@ -1906,11 +2900,87 @@ impl Workload for Moe {
             Err(reason) => Value::String(format!("refused ({reason})")),
         }
     }
+
+    fn emu_gate(&self, cand: &Object, base: &Object) -> Option<Value> {
+        Some(self.emu_gate_run(cand, base))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ARCH: Arch = Arch::Gfx1201;
+
+    /// Write a synthetic `route_hist.v1` (2 records: layer 0 rows 3, layer 1 rows 2; E=256 TOP=8).
+    fn hist_fixture(tag: &str, tamper: bool) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pm_loop_hist_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bin = Vec::new();
+        for r in 0..5i32 {
+            for j in 0..8i32 {
+                bin.extend(((r * 17 + j * 3) % 256).to_le_bytes());
+            }
+        }
+        let sha = sha256_hex(&bin);
+        if tamper {
+            bin[0] ^= 1;
+        }
+        std::fs::write(dir.join("h.ids.bin"), &bin).unwrap();
+        let doc = json!({
+            "schema": "route_hist.v1", "n_experts": 256, "topk": 8,
+            "records": [
+                {"layer": 0, "n": 3, "k": 8, "position": 0},
+                {"layer": 1, "n": 2, "k": 8, "position": 0},
+            ],
+            "ids": {"path": "h.ids.bin", "sha256": sha},
+            "id": "cd".repeat(32),
+        });
+        let p = dir.join("h.json");
+        std::fs::write(&p, serde_json::to_vec(&doc).unwrap()).unwrap();
+        p
+    }
+
+    #[test]
+    fn route_hist_replays_deterministically_and_cycles() {
+        let p = hist_fixture("det", false);
+        let shape = format!("a3b,T=7,route=hist:{}", p.display());
+        let a = Geo::parse(&shape, ARCH).unwrap();
+        let b = Geo::parse(&shape, ARCH).unwrap();
+        assert_eq!(a, b);
+        let (ra, rb) = (a.route_table(), b.route_table());
+        assert_eq!(ra, rb);
+        assert_eq!(ra.len(), 7 * 8);
+        // 5 recorded rows: token 5 replays row 0.
+        assert_eq!(ra[5 * 8..6 * 8], ra[..8]);
+        assert_eq!(ra[8], 17);
+        assert_eq!(a.route, Route::Hist);
+        let h = a.hist.as_ref().unwrap().json();
+        assert_eq!(
+            (h["kind"].as_str(), h["id"].as_str()),
+            (Some("hist"), Some("cd".repeat(32).as_str()))
+        );
+        assert!(h["layer"].is_null());
+        // `@1` selects layer 1's two rows.
+        let l1 = Geo::parse(&format!("{shape}@1"), ARCH).unwrap();
+        assert_eq!(l1.hist.as_ref().unwrap().json()["layer"], 1);
+        assert_eq!(l1.route_table()[..8], ra[3 * 8..4 * 8]);
+        assert_eq!(l1.route_table()[16..24], ra[3 * 8..4 * 8]);
+        assert!(Geo::parse(&format!("{shape}@9"), ARCH).is_err());
+    }
+
+    #[test]
+    fn route_hist_refuses_sha_and_shape_mismatch() {
+        let p = hist_fixture("sha", true);
+        let e = Geo::parse(&format!("a3b,route=hist:{}", p.display()), ARCH).unwrap_err();
+        assert!(e.contains("sha256 mismatch"), "{e}");
+        let p = hist_fixture("shape", false);
+        let e = Geo::parse(&format!("fn,route=hist:{}", p.display()), ARCH).unwrap_err();
+        assert!(
+            e.contains("E=256 TOP=8") && e.contains("E=512 TOP=10"),
+            "{e}"
+        );
+    }
 
     fn knobs(pairs: &[(&str, &str)]) -> Knobs {
         let mut k = Knobs::default();
@@ -1921,25 +2991,25 @@ mod tests {
     }
 
     fn tiny(kind: Kind) -> Problem {
-        let geo = Geo::parse("E=3,TOP=2,T=12,H=256,I=128,D=2,seed=5").unwrap();
+        let geo = Geo::parse("E=3,TOP=2,T=12,H=256,I=128,D=2,seed=5", ARCH).unwrap();
         Problem::new(&geo, kind).unwrap()
     }
 
     #[test]
     fn shape_grammar() {
-        let d = Geo::parse("").unwrap();
+        let d = Geo::parse("", ARCH).unwrap();
         assert_eq!(
             (d.preset, d.experts, d.top, d.tokens, d.hidden, d.inter, d.distinct),
             ("fn", 512, 10, 4096, 2560, 640, 512)
         );
         assert_eq!((d.route, d.seed), (Route::Uniform, 1));
-        let a = Geo::parse("a3b, T=8, route=skew,seed=9").unwrap();
+        let a = Geo::parse("a3b, T=8, route=skew,seed=9", ARCH).unwrap();
         assert_eq!(
             (a.preset, a.experts, a.top, a.tokens, a.hidden, a.inter, a.route, a.seed),
             ("a3b", 256, 8, 8, 2048, 512, Route::Skew, 9)
         );
         // Explicit keys win whatever the order.
-        let b = Geo::parse("E=64,a3b").unwrap();
+        let b = Geo::parse("E=64,a3b", ARCH).unwrap();
         assert_eq!((b.preset, b.experts, b.top), ("a3b", 64, 8));
         for bad in [
             "bogus",
@@ -1954,13 +3024,13 @@ mod tests {
             "H=300",
             "T=900000",
         ] {
-            assert!(Geo::parse(bad).is_err(), "{bad}");
+            assert!(Geo::parse(bad, ARCH).is_err(), "{bad}");
         }
     }
 
     #[test]
     fn dims_follow_the_plan() {
-        let g = Geo::parse("T=100").unwrap();
+        let g = Geo::parse("T=100", ARCH).unwrap();
         let gu = Problem::new(&g, Kind::GateUp).unwrap();
         assert_eq!(
             (
@@ -2042,7 +3112,7 @@ mod tests {
     }
 
     fn entry(epi: &str) -> Entry {
-        Entry::parse(epi).unwrap()
+        Entry::parse(epi, ARCH).unwrap()
     }
 
     #[test]
@@ -2560,7 +3630,7 @@ mod tests {
             assert!(b.source["source"]
                 .as_str()
                 .unwrap()
-                .contains("gemm.rs:48775"));
+                .contains("gemm.rs:49334"));
             assert_eq!(
                 b.source["sha256"],
                 sha256_hex(rdna_compute::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201)
@@ -2736,7 +3806,7 @@ mod tests {
             "down_gp_nt4",
             "down_gp_nt8",
         ] {
-            let e = Entry::parse(epi).unwrap();
+            let e = Entry::parse(epi, ARCH).unwrap();
             let o = rip_object(e, "twin.rip", TWIN).unwrap();
             assert_eq!(o.launch_symbol, e.symbol(), "{epi}");
             assert_eq!(o.desc["rip"]["identical_to_generator"], true, "{epi}");
@@ -2748,12 +3818,12 @@ mod tests {
     #[test]
     fn rip_reordered_kloop_keeps_the_abi_and_never_claims_identity() {
         let edited = TWIN.replace(
-            "            moent::advance(wg)?;\n            moent::load_w(wg, g, 0)?;\n",
-            "            moent::load_w(wg, g, 0)?;\n            moent::advance(wg)?;\n",
+            "            moent::advance(wg)?;\n            if g.gate_up() && g.nt() == 8 {\n                wg.barrier(())?;\n            }\n            moent::load_w(wg, g, 0)?;\n",
+            "            if g.gate_up() && g.nt() == 8 {\n                wg.barrier(())?;\n            }\n            moent::load_w(wg, g, 0)?;\n            moent::advance(wg)?;\n",
         );
         assert_ne!(edited, TWIN);
         for epi in ["down_gp_nt4", "gate_up_nt8"] {
-            let e = Entry::parse(epi).unwrap();
+            let e = Entry::parse(epi, ARCH).unwrap();
             if let Ok(o) = rip_object(e, "edited.rip", &edited) {
                 assert_eq!(o.desc["rip"]["identical_to_generator"], false, "{epi}");
             }
@@ -2764,9 +3834,9 @@ mod tests {
     fn rip_is_refused_for_an_entry_the_script_does_not_declare() {
         let edited = TWIN.replace("        \"down_gp_nt8\" => Ok((\"down\", 8, true)),\n", "");
         assert_ne!(edited, TWIN);
-        let e = Entry::parse("down_gp_nt8").unwrap();
+        let e = Entry::parse("down_gp_nt8", ARCH).unwrap();
         assert!(rip_object(e, "edited.rip", &edited).is_err());
-        let e = Entry::parse("down_gp_nt4").unwrap();
+        let e = Entry::parse("down_gp_nt4", ARCH).unwrap();
         assert!(rip_object(e, "edited.rip", &edited).is_ok());
     }
 
@@ -2783,5 +3853,387 @@ mod tests {
                 other => panic!("{other}"),
             }
         }
+    }
+
+    /// The pre-card gate on the shipped gfx1100 object (candidate = the in-tree emit, incumbent = the shipped
+    /// bundle): both run the whole grid on the emulator with guard gaps and strict LDS and agree bit-for-bit.
+    #[test]
+    fn emu_gate_passes_the_in_tree_gfx1100_entries() {
+        for epi in ["gate_up", "down"] {
+            let w = on("E=2,TOP=2,T=20,H=512,I=128", &[("epi", epi)], Arch::Gfx1100).unwrap();
+            let g = w
+                .emu_gate(&w.candidate().unwrap(), &w.baseline().unwrap())
+                .unwrap();
+            assert_eq!(g["status"], "pass", "{epi}: {g}");
+            assert!(g["instructions"].as_u64().unwrap() > 0);
+            assert_eq!(g["cand_out_sha256"], g["base_out_sha256"], "{epi}");
+            let cases = g["cases"].as_array().unwrap();
+            assert_eq!(cases.len(), EMU_GATE_SHAPES.len() + EMU_EXTENT_SHAPES.len());
+            for c in &cases[EMU_GATE_SHAPES.len()..] {
+                assert!(c["sampled_workgroups"].as_u64().unwrap() >= 8, "{c}");
+            }
+        }
+    }
+
+    fn tiny_on(kind: Kind, arch: Arch) -> Problem {
+        let geo = Geo::parse("E=3,TOP=2,T=12,H=256,I=128,D=2,seed=5", arch).unwrap();
+        Problem::new(&geo, kind).unwrap()
+    }
+
+    fn on(shape: &str, pairs: &[(&str, &str)], arch: Arch) -> Result<Box<dyn Workload>> {
+        new_with_rip(shape, &mut knobs(pairs), None, arch)
+    }
+
+    /// gfx1151 / gfx1100 baselines are that arch's own shipped objects and symbols, with the
+    /// artifact sha256 of the embedded const; the gfx1151 gate/up takes the streamed NT8 entry
+    /// exactly on production's measured shape.
+    #[test]
+    fn gfx11_shipped_baselines_are_the_per_arch_objects() {
+        use rdna_compute::kernels as k;
+        let nt4 = k::QWEN4_MOE_IU4_SYM_PM_GFX1151;
+        let cases: [(Arch, &str, &str, &str, &[u8], &str); 9] = [
+            (
+                Arch::Gfx1151,
+                "fn,T=4096",
+                "gate_up",
+                "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4",
+                nt4,
+                "kernels/qwen4_moe_iu4_sym_pm_gfx1151.hxaco",
+            ),
+            (
+                Arch::Gfx1151,
+                "fn,T=4096",
+                "down",
+                "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4",
+                nt4,
+                "kernels/qwen4_moe_iu4_sym_pm_gfx1151.hxaco",
+            ),
+            (
+                Arch::Gfx1151,
+                "fn,T=7167",
+                "gate_up",
+                "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4",
+                nt4,
+                "kernels/qwen4_moe_iu4_sym_pm_gfx1151.hxaco",
+            ),
+            (
+                Arch::Gfx1151,
+                "fn,T=7168",
+                "gate_up",
+                "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt8_stream2",
+                k::QWEN4_MOE_GATE_UP_STREAM8_PM_GFX1151,
+                "kernels/qwen4_moe_gate_up_stream8_pm_gfx1151.hxaco",
+            ),
+            (
+                Arch::Gfx1151,
+                "fn,T=8192",
+                "gate_up",
+                "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt8_stream2",
+                k::QWEN4_MOE_GATE_UP_STREAM8_PM_GFX1151,
+                "kernels/qwen4_moe_gate_up_stream8_pm_gfx1151.hxaco",
+            ),
+            (
+                Arch::Gfx1151,
+                "fn,T=8193",
+                "gate_up",
+                "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4",
+                nt4,
+                "kernels/qwen4_moe_iu4_sym_pm_gfx1151.hxaco",
+            ),
+            (
+                Arch::Gfx1151,
+                "fn,T=8192",
+                "down",
+                "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4",
+                nt4,
+                "kernels/qwen4_moe_iu4_sym_pm_gfx1151.hxaco",
+            ),
+            (
+                Arch::Gfx1100,
+                "fn,T=4096",
+                "gate_up",
+                "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1100",
+                k::QWEN4_MOE_IU4_SYM_PM_GFX1100,
+                "kernels/qwen4_moe_iu4_sym_pm_gfx1100.hxaco",
+            ),
+            (
+                Arch::Gfx1100,
+                "fn,T=4096",
+                "down",
+                "qwen4_moe_down_iu4_sym_pm_gfx1100",
+                k::QWEN4_MOE_IU4_SYM_PM_GFX1100,
+                "kernels/qwen4_moe_iu4_sym_pm_gfx1100.hxaco",
+            ),
+        ];
+        for (arch, shape, epi, symbol, image, artifact) in cases {
+            let w = on(shape, &[("epi", epi)], arch).unwrap();
+            assert_eq!(w.arch(), arch.name());
+            let b = w.baseline().unwrap();
+            assert_eq!(b.launch_symbol, symbol, "{} {shape} {epi}", arch.name());
+            assert!(b.exports.contains(&symbol.to_owned()));
+            assert_eq!(b.source["symbol"], symbol);
+            assert_eq!(b.source["artifact"], artifact);
+            assert_eq!(b.desc["artifact"], artifact);
+            assert_eq!(b.source["sha256"], sha256_hex(image));
+            assert_eq!(b.bytes, image);
+            assert!(b.source["source"].as_str().unwrap().contains("gemm.rs:"));
+            assert!(b.source["const"]
+                .as_str()
+                .unwrap()
+                .contains(&arch.name().to_uppercase()));
+            assert!(!b.source.to_string().contains("GFX1201"), "{}", b.source);
+            assert_eq!(w.candidate_knobs()["arch"], arch.name());
+            assert!(w.requires_baseline_identity());
+        }
+    }
+
+    /// Candidate emit and the R1 contract (`check_export` + `validate_invocation` inside
+    /// `Problem::kernarg`) succeed for every shipped entry of gfx1151 and gfx1100, including
+    /// the gfx1151 row repeats whose grid x is `M / (64 * rr)`.
+    #[test]
+    fn gfx11_candidates_emit_and_satisfy_the_contract() {
+        let cases: [(Arch, &[&str]); 2] = [
+            (
+                Arch::Gfx1151,
+                &[
+                    "gate_up",
+                    "gate_up_nt4",
+                    "gate_up_stream8",
+                    "down",
+                    "down_nt4",
+                    "down_nt4r2",
+                    "down_nt4r4",
+                ],
+            ),
+            (Arch::Gfx1100, &["gate_up", "down"]),
+        ];
+        for (arch, epis) in cases {
+            for &epi in epis {
+                let e = Entry::parse(epi, arch).unwrap();
+                let object = emit_object(e, json!({})).unwrap();
+                assert_eq!(object.launch_symbol, e.symbol(), "{} {epi}", arch.name());
+                crate::iu4::abi_signature(&object.bytes, &object.launch_symbol).unwrap();
+                assert!(find_export(abi_arch(arch).unwrap(), &e.symbol()).is_some());
+                let p = tiny_on(e.spec.kind, arch);
+                let l = p.launch_for(e, fake_ptrs(&p, false)).unwrap();
+                assert_eq!(
+                    l.grid[0],
+                    (p.m / (64 * usize::from(e.spec.rr))) as u32,
+                    "{} {epi}",
+                    arch.name()
+                );
+                assert_eq!(l.block[0], e.spec.threads());
+            }
+        }
+    }
+
+    /// `--cand-object` (gfx1100): the emitted object round-trips (identical to the generator, the
+    /// same launch symbol/exports as an emitted candidate); garbage, a wrong-kind object and a
+    /// non-gfx1100 arch are refused before any launch.
+    #[test]
+    fn cand_object_is_checked_against_the_in_tree_emit() {
+        let dir = std::env::temp_dir().join(format!("pm_loop_cand_object_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        };
+        let build = |epi: &str, path: &std::path::Path, arch: Arch| {
+            new_with_cand_object(
+                "fn,T=64",
+                &mut knobs(&[("epi", epi)]),
+                None,
+                arch,
+                Some(path),
+            )
+        };
+        for epi in ["gate_up", "down"] {
+            let e = Entry::parse(epi, Arch::Gfx1100).unwrap();
+            let emitted = emit_object(e, json!({})).unwrap();
+            let p = write(&format!("{epi}.co"), &emitted.bytes);
+            let c = build(epi, &p, Arch::Gfx1100).unwrap().candidate().unwrap();
+            assert_eq!(c.bytes, emitted.bytes, "{epi}");
+            assert_eq!(c.launch_symbol, emitted.launch_symbol, "{epi}");
+            assert_eq!(c.exports, emitted.exports, "{epi}");
+            assert_eq!(
+                c.desc["cand_object"]["identical_to_generator"], true,
+                "{epi}"
+            );
+            // The other kind's object does not expose this entry's symbol.
+            let other = if epi == "down" { "gate_up" } else { "down" };
+            let o = emit_object(Entry::parse(other, Arch::Gfx1100).unwrap(), json!({})).unwrap();
+            let po = write(&format!("{epi}_wrong.co"), &o.bytes);
+            let e = build(epi, &po, Arch::Gfx1100)
+                .unwrap()
+                .candidate()
+                .unwrap_err();
+            assert!(
+                e.contains("--cand-object") && e.contains(&emitted.launch_symbol),
+                "{e}"
+            );
+        }
+        let junk = write("junk.co", b"not an elf");
+        let e = build("gate_up", &junk, Arch::Gfx1100)
+            .unwrap()
+            .candidate()
+            .unwrap_err();
+        assert!(e.contains("--cand-object"), "{e}");
+        let e = build("gate_up", &dir.join("missing.co"), Arch::Gfx1100)
+            .err()
+            .unwrap();
+        assert!(
+            e.contains("--cand-object") && e.contains("missing.co"),
+            "{e}"
+        );
+        let e = build("gate_up", &junk, Arch::Gfx1151).err().unwrap();
+        assert!(e.contains("gfx1100 and gfx1201 only"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An entry an arch has no shipped object for is refused naming the entry and the arch; so
+    /// are gfx1151 NT8 (`Spec::validate` verbatim) and an arch without a contract.
+    #[test]
+    fn entries_missing_on_an_arch_are_refused_by_name() {
+        let refused = |arch: Arch, epi: &str| {
+            on("fn,T=64", &[("epi", epi)], arch)
+                .err()
+                .unwrap_or_else(|| panic!("{epi} accepted on {}", arch.name()))
+        };
+        for epi in ["down_gp_nt4", "down_gp_nt8"] {
+            for arch in [Arch::Gfx1151, Arch::Gfx1100] {
+                let e = refused(arch, epi);
+                assert!(
+                    e.contains(epi) && e.contains("gfx1201 only") && e.contains(arch.name()),
+                    "{e}"
+                );
+            }
+        }
+        for epi in ["gate_up_nt4", "down_nt4", "gate_up_nt8", "down_nt4r2"] {
+            let e = refused(Arch::Gfx1100, epi);
+            assert!(
+                e.contains(epi) && e.contains("gfx1100") && e.contains("NT1"),
+                "{e}"
+            );
+        }
+        for epi in ["gate_up_nt8", "down_nt8"] {
+            let e = refused(Arch::Gfx1151, epi);
+            assert!(e.contains("tile width 8"), "{e}");
+        }
+        for arch in [Arch::Gfx1201, Arch::Gfx1100] {
+            let e = refused(arch, "gate_up_stream8");
+            assert!(e.contains("gfx1151 only") && e.contains(arch.name()), "{e}");
+        }
+        // `--base-epi` follows the same grammar.
+        let e = on(
+            "fn,T=64",
+            &[("epi", "down"), ("base-epi", "down_gp_nt4")],
+            Arch::Gfx1151,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            e.starts_with("--base-epi:") && e.contains("gfx1201 only"),
+            "{e}"
+        );
+        // Spec::validate refuses gfx1100 NT>1 on emit; the adapter refuses earlier, by name.
+        let e = on("fn,T=64", &[], Arch::Gfx942).err().unwrap();
+        assert!(e.contains("gfx942"), "{e}");
+        // gfx1201 is unchanged: the stream8 / row-repeat spellings are not gfx1201 entries.
+        assert!(on("fn,T=64", &[("epi", "down_nt4r2")], Arch::Gfx1201)
+            .unwrap()
+            .candidate()
+            .is_err());
+    }
+
+    fn cand_object_on(epi: &str, shape: &str, tag: &str, bytes: &[u8]) -> Result<Object> {
+        let p =
+            std::env::temp_dir().join(format!("pm_loop_candobj_{}_{tag}.co", std::process::id()));
+        std::fs::write(&p, bytes).unwrap();
+        let mut k = knobs(&[("epi", epi)]);
+        let w = new_with_cand_object(shape, &mut k, None, Arch::Gfx1201, Some(&p));
+        let r = w.and_then(|w| w.candidate());
+        let _ = std::fs::remove_file(&p);
+        r
+    }
+
+    #[test]
+    fn gfx1201_cand_object_accepts_the_shipped_hxaco_for_every_flat_epi() {
+        let image = rdna_compute::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201;
+        for epi in [
+            "gate_up",
+            "gate_up_nt4",
+            "gate_up_nt8",
+            "down",
+            "down_nt4",
+            "down_nt8",
+        ] {
+            let o =
+                cand_object_on(epi, "T=64", epi, image).unwrap_or_else(|e| panic!("{epi}: {e}"));
+            let c = &o.desc["cand_object"];
+            assert_eq!(c["co_sha256"], sha256_hex(image), "{epi}");
+            assert_eq!(c["abi_reference"], "shipped baseline image", "{epi}");
+            assert_eq!(c["text_sha256"].as_str().unwrap().len(), 64, "{epi}");
+            assert_eq!(c["symbol"], o.launch_symbol, "{epi}");
+        }
+    }
+
+    #[test]
+    fn gfx1201_cand_object_accepts_the_shipped_gp_hxaco() {
+        let image = rdna_compute::kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201;
+        for epi in ["down_gp_nt4"] {
+            let o =
+                cand_object_on(epi, "T=64", epi, image).unwrap_or_else(|e| panic!("{epi}: {e}"));
+            assert_eq!(o.desc["cand_object"]["co_sha256"], sha256_hex(image));
+        }
+    }
+
+    #[test]
+    fn gfx1201_cand_object_refuses_a_missing_symbol_and_non_objects() {
+        // The gp image has no flat gate_up_nt8 export.
+        let e = cand_object_on(
+            "gate_up_nt8",
+            "T=64",
+            "missing",
+            rdna_compute::kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201,
+        )
+        .err()
+        .unwrap();
+        assert!(e.contains("not a code object exposing"), "{e}");
+        let e = cand_object_on("gate_up_nt8", "T=64", "junk", b"not an object")
+            .err()
+            .unwrap();
+        assert!(e.contains("--cand-object"), "{e}");
+    }
+
+    #[test]
+    fn abi_diff_field_names_the_differing_field() {
+        let a = "symbol=s args=[A, B] kernarg_bytes=64 kernarg_align=8 lds_bytes=0 max_flat_workgroup_size=256 wavefront_size=32 workgroup_processor_mode=false";
+        assert_eq!(abi_diff_field(a, a), "unknown");
+        assert_eq!(
+            abi_diff_field(a, &a.replace("args=[A, B]", "args=[A]")),
+            "args"
+        );
+        assert_eq!(
+            abi_diff_field(a, &a.replace("kernarg_bytes=64", "kernarg_bytes=72")),
+            "kernarg_bytes"
+        );
+        assert_eq!(
+            abi_diff_field(a, &a.replace("size=256", "size=128")),
+            "max_flat_workgroup_size"
+        );
+    }
+
+    /// The pre-lockstep shipped object (a full hxaco from before NT8 lockstep).
+    #[test]
+    fn gfx1201_cand_object_pre_lockstep_object() {
+        let p = "/home/kaden/qcal/release-0.4.3/pm-krsi/land/moe-route/obj/baseline.0eea1673a5308805.co";
+        let Ok(bytes) = std::fs::read(p) else {
+            eprintln!("pre-lockstep object absent: {p}");
+            return;
+        };
+        let o = cand_object_on("gate_up_nt8", "T=64", "prelock", &bytes)
+            .unwrap_or_else(|e| panic!("pre-lockstep gate_up_nt8: {e}"));
+        eprintln!("pre-lockstep cand_object: {}", o.desc["cand_object"]);
     }
 }

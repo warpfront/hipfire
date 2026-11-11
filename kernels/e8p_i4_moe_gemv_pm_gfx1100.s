@@ -7,24 +7,24 @@
 .type e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100,@function
 e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100:
 	v_lshlrev_b32_e32 v24, 2, v0
-	s_load_b256 s[8:15], s[0:1], null
+	s_load_b256 s[88:95], s[0:1], null
 	s_load_b256 s[16:23], s[0:1], 0x20
 	s_load_b128 s[24:27], s[0:1], 0x40
 	s_load_b64 s[28:29], s[0:1], 0x50
 	s_load_b32 s4, s[0:1], 0x58
-	s_mov_b32 s30, s2
-	s_mov_b32 s31, s3
+	s_mov_b32 s30, s14
+	s_mov_b32 s31, s15
 	s_waitcnt lgkmcnt(0)
 	s_cmp_ge_u32 s30, s22
 	s_cbranch_scc1 .Le8pi4moe_r256_gate_up_exit
 	s_cmp_ge_u32 s31, s24
 	s_cbranch_scc1 .Le8pi4moe_r256_gate_up_exit
 	s_lshl_b32 s51, s31, 2
-	s_add_u32 s36, s12, s51
-	s_addc_u32 s37, s13, 0
+	s_add_u32 s36, s92, s51
+	s_addc_u32 s37, s93, 0
 	s_load_b64 s[32:33], s[36:37], null
-	s_add_u32 s36, s10, s51
-	s_addc_u32 s37, s11, 0
+	s_add_u32 s36, s90, s51
+	s_addc_u32 s37, s91, 0
 	s_load_b32 s34, s[36:37], null
 	s_waitcnt lgkmcnt(0)
 	s_sub_i32 s35, s33, s32
@@ -38,8 +38,8 @@ e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100:
 	s_cmp_ge_u32 s34, s4
 	s_cbranch_scc1 .Le8pi4moe_r256_gate_up_exit
 	s_lshl_b32 s51, s34, 3
-	s_add_u32 s36, s8, s51
-	s_addc_u32 s37, s9, 0
+	s_add_u32 s36, s88, s51
+	s_addc_u32 s37, s89, 0
 	s_load_b64 s[38:39], s[36:37], null
 	s_lshr_b32 s48, s23, 7
 	s_lshr_b32 s49, s23, 2
@@ -110,7 +110,7 @@ e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100:
 	v_add_nc_u32_e32 v39, s32, v39
 	s_delay_alu instid0(VALU_DEP_1)
 	v_lshlrev_b32_e32 v39, 2, v39
-	global_load_b32 v32, v39, s[14:15]
+	global_load_b32 v32, v39, s[94:95]
 	v_cvt_f32_u32_e32 v37, s26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_rcp_iflag_f32_e32 v37, v37
@@ -2775,7 +2775,7 @@ e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100:
 	.amdhsa_group_segment_fixed_size 1536
 	.amdhsa_private_segment_fixed_size 0
 	.amdhsa_kernarg_size 96
-	.amdhsa_user_sgpr_count 2
+	.amdhsa_user_sgpr_count 14
 	.amdhsa_user_sgpr_dispatch_ptr 0
 	.amdhsa_user_sgpr_queue_ptr 0
 	.amdhsa_user_sgpr_kernarg_segment_ptr 1
@@ -2790,7 +2790,7 @@ e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100:
 	.amdhsa_system_sgpr_workgroup_info 0
 	.amdhsa_system_vgpr_workitem_id 0
 	.amdhsa_next_free_vgpr 112
-	.amdhsa_next_free_sgpr 88
+	.amdhsa_next_free_sgpr 96
 	.amdhsa_reserve_vcc 0
 	.amdhsa_float_round_mode_32 0
 	.amdhsa_float_round_mode_16_64 0
@@ -2820,24 +2820,24 @@ e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100:
 .type e8p_i4_moe_gemv_r128_down_pm_gfx1100,@function
 e8p_i4_moe_gemv_r128_down_pm_gfx1100:
 	v_lshlrev_b32_e32 v24, 2, v0
-	s_load_b256 s[8:15], s[0:1], null
+	s_load_b256 s[88:95], s[0:1], null
 	s_load_b256 s[16:23], s[0:1], 0x20
 	s_load_b128 s[24:27], s[0:1], 0x40
 	s_load_b64 s[28:29], s[0:1], 0x50
 	s_load_b32 s4, s[0:1], 0x58
-	s_mov_b32 s30, s2
-	s_mov_b32 s31, s3
+	s_mov_b32 s30, s14
+	s_mov_b32 s31, s15
 	s_waitcnt lgkmcnt(0)
 	s_cmp_ge_u32 s30, s22
 	s_cbranch_scc1 .Le8pi4moe_r128_down_exit
 	s_cmp_ge_u32 s31, s24
 	s_cbranch_scc1 .Le8pi4moe_r128_down_exit
 	s_lshl_b32 s51, s31, 2
-	s_add_u32 s36, s12, s51
-	s_addc_u32 s37, s13, 0
+	s_add_u32 s36, s92, s51
+	s_addc_u32 s37, s93, 0
 	s_load_b64 s[32:33], s[36:37], null
-	s_add_u32 s36, s10, s51
-	s_addc_u32 s37, s11, 0
+	s_add_u32 s36, s90, s51
+	s_addc_u32 s37, s91, 0
 	s_load_b32 s34, s[36:37], null
 	s_waitcnt lgkmcnt(0)
 	s_sub_i32 s35, s33, s32
@@ -2851,8 +2851,8 @@ e8p_i4_moe_gemv_r128_down_pm_gfx1100:
 	s_cmp_ge_u32 s34, s4
 	s_cbranch_scc1 .Le8pi4moe_r128_down_exit
 	s_lshl_b32 s51, s34, 3
-	s_add_u32 s36, s8, s51
-	s_addc_u32 s37, s9, 0
+	s_add_u32 s36, s88, s51
+	s_addc_u32 s37, s89, 0
 	s_load_b64 s[38:39], s[36:37], null
 	s_lshr_b32 s48, s23, 7
 	s_lshr_b32 s49, s23, 2
@@ -2896,7 +2896,7 @@ e8p_i4_moe_gemv_r128_down_pm_gfx1100:
 	v_add_nc_u32_e32 v39, s32, v39
 	s_delay_alu instid0(VALU_DEP_1)
 	v_lshlrev_b32_e32 v39, 2, v39
-	global_load_b32 v32, v39, s[14:15]
+	global_load_b32 v32, v39, s[94:95]
 	v_cvt_f32_u32_e32 v37, s26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_rcp_iflag_f32_e32 v37, v37
@@ -4380,7 +4380,7 @@ e8p_i4_moe_gemv_r128_down_pm_gfx1100:
 	.amdhsa_group_segment_fixed_size 1536
 	.amdhsa_private_segment_fixed_size 0
 	.amdhsa_kernarg_size 96
-	.amdhsa_user_sgpr_count 2
+	.amdhsa_user_sgpr_count 14
 	.amdhsa_user_sgpr_dispatch_ptr 0
 	.amdhsa_user_sgpr_queue_ptr 0
 	.amdhsa_user_sgpr_kernarg_segment_ptr 1
@@ -4395,7 +4395,7 @@ e8p_i4_moe_gemv_r128_down_pm_gfx1100:
 	.amdhsa_system_sgpr_workgroup_info 0
 	.amdhsa_system_vgpr_workitem_id 0
 	.amdhsa_next_free_vgpr 88
-	.amdhsa_next_free_sgpr 88
+	.amdhsa_next_free_sgpr 96
 	.amdhsa_reserve_vcc 0
 	.amdhsa_float_round_mode_32 0
 	.amdhsa_float_round_mode_16_64 0
@@ -4431,15 +4431,15 @@ e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100_t8:
 	v_lshrrev_b32_e32 v6, 5, v0
 	s_delay_alu instid0(VALU_DEP_1)
 	v_readfirstlane_b32 s5, v6
-	s_load_b256 s[8:15], s[0:1], null
+	s_load_b256 s[88:95], s[0:1], null
 	s_load_b256 s[16:23], s[0:1], 0x20
 	s_load_b128 s[24:27], s[0:1], 0x40
 	s_load_b64 s[28:29], s[0:1], 0x50
 	s_load_b32 s6, s[0:1], 0x58
-	s_lshl_b32 s30, s2, 3
+	s_lshl_b32 s30, s13, 3
 	s_add_i32 s30, s30, s5
-	s_mov_b32 s31, s3
-	s_mov_b32 s7, s4
+	s_mov_b32 s31, s14
+	s_mov_b32 s7, s15
 	s_waitcnt lgkmcnt(0)
 	s_cmp_eq_u32 s25, 0
 	s_cbranch_scc1 .Le8pi4moe_r256_gate_up_t8_exit
@@ -4454,20 +4454,20 @@ e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100_t8:
 	s_cmp_ge_u32 s51, s22
 	s_cbranch_scc1 .Le8pi4moe_r256_gate_up_t8_exit
 	s_mul_i32 s51, s7, 0x788
-	s_add_u32 s10, s10, s51
-	s_addc_u32 s11, s11, 0
-	s_add_u32 s12, s12, s51
-	s_addc_u32 s13, s13, 0
-	s_add_u32 s14, s14, s51
-	s_addc_u32 s15, s15, 0
+	s_add_u32 s90, s90, s51
+	s_addc_u32 s91, s91, 0
+	s_add_u32 s92, s92, s51
+	s_addc_u32 s93, s93, 0
+	s_add_u32 s94, s94, s51
+	s_addc_u32 s95, s95, 0
 	s_cmp_ge_u32 s31, s24
 	s_cbranch_scc1 .Le8pi4moe_r256_gate_up_t8_exit
 	s_lshl_b32 s51, s31, 2
-	s_add_u32 s36, s12, s51
-	s_addc_u32 s37, s13, 0
+	s_add_u32 s36, s92, s51
+	s_addc_u32 s37, s93, 0
 	s_load_b64 s[32:33], s[36:37], null
-	s_add_u32 s36, s10, s51
-	s_addc_u32 s37, s11, 0
+	s_add_u32 s36, s90, s51
+	s_addc_u32 s37, s91, 0
 	s_load_b32 s34, s[36:37], null
 	s_waitcnt lgkmcnt(0)
 	s_sub_i32 s35, s33, s32
@@ -4481,8 +4481,8 @@ e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100_t8:
 	s_cmp_ge_u32 s34, s6
 	s_cbranch_scc1 .Le8pi4moe_r256_gate_up_t8_exit
 	s_lshl_b32 s51, s34, 3
-	s_add_u32 s36, s8, s51
-	s_addc_u32 s37, s9, 0
+	s_add_u32 s36, s88, s51
+	s_addc_u32 s37, s89, 0
 	s_load_b64 s[38:39], s[36:37], null
 	s_lshr_b32 s48, s23, 7
 	s_lshr_b32 s49, s23, 2
@@ -4555,7 +4555,7 @@ e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100_t8:
 	v_add_nc_u32_e32 v39, s32, v39
 	s_delay_alu instid0(VALU_DEP_1)
 	v_lshlrev_b32_e32 v39, 2, v39
-	global_load_b32 v32, v39, s[14:15]
+	global_load_b32 v32, v39, s[94:95]
 	s_mul_i32 s52, s25, 10
 	s_waitcnt vmcnt(0)
 	v_readlane_b32 s51, v32, 0
@@ -7172,7 +7172,7 @@ e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100_t8:
 	.amdhsa_group_segment_fixed_size 1536
 	.amdhsa_private_segment_fixed_size 0
 	.amdhsa_kernarg_size 96
-	.amdhsa_user_sgpr_count 2
+	.amdhsa_user_sgpr_count 13
 	.amdhsa_user_sgpr_dispatch_ptr 0
 	.amdhsa_user_sgpr_queue_ptr 0
 	.amdhsa_user_sgpr_kernarg_segment_ptr 1
@@ -7187,7 +7187,7 @@ e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100_t8:
 	.amdhsa_system_sgpr_workgroup_info 0
 	.amdhsa_system_vgpr_workitem_id 0
 	.amdhsa_next_free_vgpr 112
-	.amdhsa_next_free_sgpr 88
+	.amdhsa_next_free_sgpr 96
 	.amdhsa_reserve_vcc 0
 	.amdhsa_float_round_mode_32 0
 	.amdhsa_float_round_mode_16_64 0
@@ -7223,15 +7223,15 @@ e8p_i4_moe_gemv_r128_down_pm_gfx1100_t8:
 	v_lshrrev_b32_e32 v6, 5, v0
 	s_delay_alu instid0(VALU_DEP_1)
 	v_readfirstlane_b32 s5, v6
-	s_load_b256 s[8:15], s[0:1], null
+	s_load_b256 s[88:95], s[0:1], null
 	s_load_b256 s[16:23], s[0:1], 0x20
 	s_load_b128 s[24:27], s[0:1], 0x40
 	s_load_b64 s[28:29], s[0:1], 0x50
 	s_load_b32 s6, s[0:1], 0x58
-	s_lshl_b32 s30, s2, 3
+	s_lshl_b32 s30, s13, 3
 	s_add_i32 s30, s30, s5
-	s_mov_b32 s31, s3
-	s_mov_b32 s7, s4
+	s_mov_b32 s31, s14
+	s_mov_b32 s7, s15
 	s_waitcnt lgkmcnt(0)
 	s_cmp_eq_u32 s25, 0
 	s_cbranch_scc1 .Le8pi4moe_r128_down_t8_exit
@@ -7246,20 +7246,20 @@ e8p_i4_moe_gemv_r128_down_pm_gfx1100_t8:
 	s_cmp_ge_u32 s51, s22
 	s_cbranch_scc1 .Le8pi4moe_r128_down_t8_exit
 	s_mul_i32 s51, s7, 0x788
-	s_add_u32 s10, s10, s51
-	s_addc_u32 s11, s11, 0
-	s_add_u32 s12, s12, s51
-	s_addc_u32 s13, s13, 0
-	s_add_u32 s14, s14, s51
-	s_addc_u32 s15, s15, 0
+	s_add_u32 s90, s90, s51
+	s_addc_u32 s91, s91, 0
+	s_add_u32 s92, s92, s51
+	s_addc_u32 s93, s93, 0
+	s_add_u32 s94, s94, s51
+	s_addc_u32 s95, s95, 0
 	s_cmp_ge_u32 s31, s24
 	s_cbranch_scc1 .Le8pi4moe_r128_down_t8_exit
 	s_lshl_b32 s51, s31, 2
-	s_add_u32 s36, s12, s51
-	s_addc_u32 s37, s13, 0
+	s_add_u32 s36, s92, s51
+	s_addc_u32 s37, s93, 0
 	s_load_b64 s[32:33], s[36:37], null
-	s_add_u32 s36, s10, s51
-	s_addc_u32 s37, s11, 0
+	s_add_u32 s36, s90, s51
+	s_addc_u32 s37, s91, 0
 	s_load_b32 s34, s[36:37], null
 	s_waitcnt lgkmcnt(0)
 	s_sub_i32 s35, s33, s32
@@ -7273,8 +7273,8 @@ e8p_i4_moe_gemv_r128_down_pm_gfx1100_t8:
 	s_cmp_ge_u32 s34, s6
 	s_cbranch_scc1 .Le8pi4moe_r128_down_t8_exit
 	s_lshl_b32 s51, s34, 3
-	s_add_u32 s36, s8, s51
-	s_addc_u32 s37, s9, 0
+	s_add_u32 s36, s88, s51
+	s_addc_u32 s37, s89, 0
 	s_load_b64 s[38:39], s[36:37], null
 	s_lshr_b32 s48, s23, 7
 	s_lshr_b32 s49, s23, 2
@@ -7320,7 +7320,7 @@ e8p_i4_moe_gemv_r128_down_pm_gfx1100_t8:
 	v_add_nc_u32_e32 v39, s32, v39
 	s_delay_alu instid0(VALU_DEP_1)
 	v_lshlrev_b32_e32 v39, 2, v39
-	global_load_b32 v32, v39, s[14:15]
+	global_load_b32 v32, v39, s[94:95]
 	s_mul_i32 s52, s25, 10
 	s_waitcnt vmcnt(0)
 	v_readlane_b32 s51, v32, 0
@@ -8756,7 +8756,7 @@ e8p_i4_moe_gemv_r128_down_pm_gfx1100_t8:
 	.amdhsa_group_segment_fixed_size 1536
 	.amdhsa_private_segment_fixed_size 0
 	.amdhsa_kernarg_size 96
-	.amdhsa_user_sgpr_count 2
+	.amdhsa_user_sgpr_count 13
 	.amdhsa_user_sgpr_dispatch_ptr 0
 	.amdhsa_user_sgpr_queue_ptr 0
 	.amdhsa_user_sgpr_kernarg_segment_ptr 1
@@ -8771,7 +8771,7 @@ e8p_i4_moe_gemv_r128_down_pm_gfx1100_t8:
 	.amdhsa_system_sgpr_workgroup_info 0
 	.amdhsa_system_vgpr_workitem_id 0
 	.amdhsa_next_free_vgpr 88
-	.amdhsa_next_free_sgpr 88
+	.amdhsa_next_free_sgpr 96
 	.amdhsa_reserve_vcc 0
 	.amdhsa_float_round_mode_32 0
 	.amdhsa_float_round_mode_16_64 0
@@ -8896,7 +8896,7 @@ amdhsa.kernels:
     .max_flat_workgroup_size: 32
     .name: e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100
     .private_segment_fixed_size: 0
-    .sgpr_count: 88
+    .sgpr_count: 96
     .sgpr_spill_count: 0
     .symbol: e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100.kd
     .uniform_work_group_size: 1
@@ -9004,7 +9004,7 @@ amdhsa.kernels:
     .max_flat_workgroup_size: 32
     .name: e8p_i4_moe_gemv_r128_down_pm_gfx1100
     .private_segment_fixed_size: 0
-    .sgpr_count: 88
+    .sgpr_count: 96
     .sgpr_spill_count: 0
     .symbol: e8p_i4_moe_gemv_r128_down_pm_gfx1100.kd
     .uniform_work_group_size: 1
@@ -9112,7 +9112,7 @@ amdhsa.kernels:
     .max_flat_workgroup_size: 256
     .name: e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100_t8
     .private_segment_fixed_size: 0
-    .sgpr_count: 88
+    .sgpr_count: 96
     .sgpr_spill_count: 0
     .symbol: e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100_t8.kd
     .uniform_work_group_size: 1
@@ -9220,7 +9220,7 @@ amdhsa.kernels:
     .max_flat_workgroup_size: 256
     .name: e8p_i4_moe_gemv_r128_down_pm_gfx1100_t8
     .private_segment_fixed_size: 0
-    .sgpr_count: 88
+    .sgpr_count: 96
     .sgpr_spill_count: 0
     .symbol: e8p_i4_moe_gemv_r128_down_pm_gfx1100_t8.kd
     .uniform_work_group_size: 1

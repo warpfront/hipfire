@@ -50,6 +50,21 @@
 //! x = sum of the regions' row blocks), static LDS 40960 bytes. K is a
 //! multiple of 256 (a ragged K tail is ignored, as in hipcc).
 //!
+//! gfx1100 residual twin (`Kind::Resid`, `Cfg::RESID` wr 4 / 8): an exact twin of hipcc's
+//! `gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds` (`gemm_mqv2_wmma_gfx11_mw_lds.hip`,
+//! `Y[out_col * M + out_row] += acc[j]`, F32). The A operand, the B operand and the WMMA chain are
+//! the ones above (hipcc's mw kernel decodes with the same contracted `v_fma_f16` of
+//! `sc_h * (f16)q + zp_h`, one rounding; both run the ascending-K chain from +0.0), so only the
+//! epilogue differs: after the cross-half swap, Y is loaded (two b128 per tile under the
+//! token < N, row < M mask), `v_add_f32 acc, acc, y` (hipcc: `v_add_f32_e32 v1, v1, v14`, acc is
+//! src0) and stored; no `0 + acc`. Tails: rows >= M and tokens >= N are neither loaded nor
+//! stored; `M % 8 != 0` takes a per-element path. Launch: block `32*wr`, grid
+//! `[ceil(M/(16*wr)), ceil(N/256), 1]`, static LDS 40960; the symbols are
+//! `gemm_mq6g256v2_residual_pm_<arch>_w<wr>` (`Cfg::symbol`), both in one object (`emit_resid_module`), kernargs `A X Y M K N` (36 bytes). Residual entries
+//! assemble for gfx1100 (the product) and gfx1151 (the emulator differential: the instruction
+//! streams are identical); every other arch refuses. A K < 256 call adds an all-zero
+//! accumulator to Y exactly as hipcc does; K <= 0 exits without touching Y.
+//!
 //! MQ4 (`Fmt::Mq4`, `qwen4_mq4_x4_gfx11`): the MQ4G256V2 entries are exact
 //! twins of the current hipcc MQ4 route (`gemm_mq4g256v2_residual_wmma_gfx11_bt4`,
 //! contract C reference): the same A operands (`v_cvt_f32_ubyte0`,
@@ -78,6 +93,8 @@ pub enum Kind {
     Bf16,
     Regions,
     Hcw,
+    /// gfx1100 residual: `Y += acc` in F32 (the `gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds` twin).
+    Resid,
 }
 
 /// Weight format of the A operand.
@@ -162,15 +179,28 @@ impl Cfg {
         (8, Kind::Regions),
         (8, Kind::Hcw),
     ];
+    /// Waves per workgroup of the gfx1100 residual twin entries.
+    pub const RESID: [u8; 2] = [4, 8];
     fn suffix(&self) -> &'static str {
         match self.kind {
             Kind::Plain => "",
             Kind::Bf16 => "_bf16out",
             Kind::Regions => "_regions",
             Kind::Hcw => "_hcw",
+            Kind::Resid => "_resid",
         }
     }
+    /// Exported symbol. The residual twin of hipcc's `gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds`
+    /// is `gemm_mq6g256v2_residual_pm_<arch>_w<wr>`: distinct from hipcc's so both can be
+    /// loaded in one product process.
     pub fn symbol(&self) -> String {
+        if self.kind == Kind::Resid {
+            return format!(
+                "gemm_mq6g256v2_residual_pm_{}_w{}",
+                self.arch.name(),
+                self.wr
+            );
+        }
         format!(
             "qwen4_{}_x4_pm_{}_w{}{}",
             self.fmt.tag(),
@@ -182,7 +212,27 @@ impl Cfg {
     pub fn module(fmt: Fmt, arch: Arch) -> String {
         format!("qwen4_{}_x4_pm_{}", fmt.tag(), arch.name())
     }
+    /// Module name of the residual twin object (both `wr` entries).
+    pub fn resid_module(arch: Arch) -> String {
+        format!("gemm_mq6g256v2_residual_pm_{}", arch.name())
+    }
     pub fn validate(&self) -> R {
+        if self.kind == Kind::Resid {
+            if !matches!(self.arch, Arch::Gfx1100 | Arch::Gfx1151) || self.fmt != Fmt::Mq6 {
+                return Err(format!(
+                    "{} residual (Y += acc) entry is MQ6 gfx1100 / gfx1151 only",
+                    self.fmt.builder()
+                ));
+            }
+            if !Self::RESID.contains(&self.wr) {
+                return Err(format!(
+                    "{}: no residual entry w{}",
+                    self.fmt.builder(),
+                    self.wr
+                ));
+            }
+            return Ok(());
+        }
         if self.arch != Arch::Gfx1151 {
             return Err(format!(
                 "{} builder is exact-gfx1151 only",
@@ -337,18 +387,43 @@ fn lbl(spec: &Cfg, name: &str) -> String {
         Kind::Bf16 => "b",
         Kind::Regions => "r",
         Kind::Hcw => "h",
+        Kind::Resid => "y",
     };
     format!(".L{}g11w{}{k}_{name}", spec.fmt.tag(), spec.wr)
 }
 
 // ----------------------------------------------------------------------- SGPRs
-// s0:1 kernarg pointer; s2, s3 workgroup ids (after the two user SGPRs).
+// s0:1 kernarg pointer; the workgroup ids follow the DECLARED user SGPRs: s2, s3 on gfx1151, but on
+// gfx1100 `FeatureUserSGPRInit16Bug` (LLVM) the kernarg pointer is padded with dead user SGPRs up to
+// `user + system (workgroup ids x, y) = 16`, i.e. 14 declared user SGPRs: ids s14, s15 (and the output
+// descriptor `SRD_Y`, which would overlap them, moves out of s[12:15]).
+/// Real user SGPRs (the kernarg pointer) and enabled system SGPRs (workgroup ids x, y).
+const USER_SGPRS: u8 = 2;
+const SYSTEM_SGPRS: u8 = 2;
+/// `.amdhsa_user_sgpr_count` of `arch` (`Arch::declared_user_sgprs`: user + system >= 16 on gfx1100).
+const fn declared_user_sgprs(arch: Arch) -> u8 {
+    arch.declared_user_sgprs(USER_SGPRS, SYSTEM_SGPRS)
+}
 const KARG: u8 = 0;
-const WGX_IN: u8 = 2;
-const WGY_IN: u8 = 3;
+/// Workgroup id x / y: the first two system SGPRs, after the declared user SGPRs.
+const fn wgx_in(arch: Arch) -> u8 {
+    declared_user_sgprs(arch)
+}
+const fn wgy_in(arch: Arch) -> u8 {
+    declared_user_sgprs(arch) + 1
+}
 const SRD_A: u8 = 4;
 const SRD_X: u8 = 8;
-const SRD_Y: u8 = 12;
+/// Output (Y) buffer descriptor `s[SRD_Y:SRD_Y+3]`: s[12:15] on gfx1151; on gfx1100 s[56:59] (s14 / s15
+/// are the workgroup ids; the residual entries use none of the region / HCW scalars at s[56:79]).
+const fn srd_y(arch: Arch) -> u8 {
+    if wgy_in(arch) >= SRD_Y_GFX1151 {
+        56
+    } else {
+        SRD_Y_GFX1151
+    }
+}
+const SRD_Y_GFX1151: u8 = 12;
 const PA: u8 = 16;
 const PX: u8 = 18;
 const PY: u8 = 20;
@@ -434,6 +509,8 @@ struct Ep {
     vla: u8,
     vlb: u8,
     vc: u8,
+    /// Residual epilogue: Y-load registers (`YG` tiles x 8), after the 16 tile offsets.
+    yb: u8,
 }
 fn ep(spec: &Cfg) -> Ep {
     let e = spec.ringb();
@@ -451,6 +528,7 @@ fn ep(spec: &Cfg) -> Ep {
         vla: e + 82,
         vlb: e + 83,
         vc: e + 84,
+        yb: e + 22,
     }
 }
 
@@ -538,11 +616,16 @@ fn plan(spec: &Cfg) -> Result<RegPlan, String> {
         for n in 0..16 {
             p.v::<1>("epi_offset", e.offs + n, epi())?;
         }
+        if spec.kind == Kind::Resid {
+            for n in 0..YG {
+                p.v::<8>("y_load", e.yb + 8 * n, epi())?;
+            }
+        }
     }
     p.s::<2>("kernarg_ptr", KARG, w())?;
-    p.s::<1>("wg_x_in", WGX_IN, w())?;
-    p.s::<1>("wg_y_in", WGY_IN, w())?;
-    for srd in [SRD_A, SRD_X, SRD_Y] {
+    p.s::<1>("wg_x_in", wgx_in(spec.arch), w())?;
+    p.s::<1>("wg_y_in", wgy_in(spec.arch), w())?;
+    for srd in [SRD_A, SRD_X, srd_y(spec.arch)] {
         p.s::<4>("srd", srd, w())?;
     }
     p.s::<8>("kernargs", PA, w())?;
@@ -1073,9 +1156,9 @@ fn select_region(b: &mut Builder, spec: &Cfg) -> R {
     // region's first row block.
     sop(
         b,
-        format!("s_cmp_lt_i32 s{WGX_IN}, s{SSEL}"),
+        format!("s_cmp_lt_i32 s{}, s{SSEL}", wgx_in(spec.arch)),
         &[],
-        &[WGX_IN, SSEL],
+        &[wgx_in(spec.arch), SSEL],
     )?;
     op(
         b,
@@ -1113,9 +1196,9 @@ fn select_region(b: &mut Builder, spec: &Cfg) -> R {
     )?;
     sop(
         b,
-        format!("s_cmp_lt_i32 s{WGX_IN}, s{ST0}"),
+        format!("s_cmp_lt_i32 s{}, s{ST0}", wgx_in(spec.arch)),
         &[],
-        &[WGX_IN, ST0],
+        &[wgx_in(spec.arch), ST0],
     )?;
     op(
         b,
@@ -1153,9 +1236,9 @@ fn select_region(b: &mut Builder, spec: &Cfg) -> R {
     )?;
     sop(
         b,
-        format!("s_sub_i32 s{WGX}, s{WGX_IN}, s{WGX}"),
+        format!("s_sub_i32 s{WGX}, s{}, s{WGX}", wgx_in(spec.arch)),
         &[WGX],
-        &[WGX_IN, WGX],
+        &[wgx_in(spec.arch), WGX],
     )?;
     op(
         b,
@@ -1341,9 +1424,19 @@ fn prologue(b: &mut Builder, spec: &Cfg) -> R {
         )?;
         sop(b, format!("s_cmp_lt_i32 s{ST0}, 1"), &[], &[ST0])?;
         op(b, format!("s_cbranch_scc1 {}", lbl(spec, "end")), &[], &[])?;
-        sop(b, format!("s_mov_b32 s{WGX}, s{WGX_IN}"), &[WGX], &[WGX_IN])?;
+        sop(
+            b,
+            format!("s_mov_b32 s{WGX}, s{}", wgx_in(spec.arch)),
+            &[WGX],
+            &[wgx_in(spec.arch)],
+        )?;
     }
-    sop(b, format!("s_mov_b32 s{WGY}, s{WGY_IN}"), &[WGY], &[WGY_IN])?;
+    sop(
+        b,
+        format!("s_mov_b32 s{WGY}, s{}", wgy_in(spec.arch)),
+        &[WGY],
+        &[wgy_in(spec.arch)],
+    )?;
     sop(b, format!("s_lshr_b32 s{GPR}, s{SK}, 8"), &[GPR], &[SK])?;
     sop(b, format!("s_lshr_b32 s{NCHM1}, s{SK}, 5"), &[NCHM1], &[SK])?;
     sop(
@@ -1367,7 +1460,7 @@ fn prologue(b: &mut Builder, spec: &Cfg) -> R {
         &[ST1],
         &[SN, SK2],
     )?;
-    let mut srds = vec![(SRD_A, PA), (SRD_X, PX), (SRD_Y, PY)];
+    let mut srds = vec![(SRD_A, PA), (SRD_X, PX), (srd_y(spec.arch), PY)];
     if spec.hcw() {
         srds.extend([(SRD_S, HS), (SRD_G, HG)]);
     }
@@ -1824,9 +1917,9 @@ fn plain_epilogue(b: &mut Builder, spec: &Cfg) -> R {
             &[],
             &[s(MASK0), s(MASK1)],
         )?;
-        bstore(b, 4, a, e.offs + t, SRD_Y, SZERO, 0)?;
+        bstore(b, 4, a, e.offs + t, srd_y(spec.arch), SZERO, 0)?;
         if !bf16 {
-            bstore(b, 4, a + 4, e.offs + t, SRD_Y, SZERO, 16)?;
+            bstore(b, 4, a + 4, e.offs + t, srd_y(spec.arch), SZERO, 16)?;
         }
         op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
         sop(b, format!("s_add_i32 s{SNB}, s{SNB}, -16"), &[SNB], &[SNB])?;
@@ -1871,9 +1964,25 @@ fn plain_epilogue(b: &mut Builder, spec: &Cfg) -> R {
                 &[s(MASK0), s(MASK1)],
             )?;
             if bf16 {
-                bstore(b, 0, a + n, e.offs + t, SRD_Y, SZERO, 2 * u32::from(n))?;
+                bstore(
+                    b,
+                    0,
+                    a + n,
+                    e.offs + t,
+                    srd_y(spec.arch),
+                    SZERO,
+                    2 * u32::from(n),
+                )?;
             } else {
-                bstore(b, 1, a + n, e.offs + t, SRD_Y, SZERO, 4 * u32::from(n))?;
+                bstore(
+                    b,
+                    1,
+                    a + n,
+                    e.offs + t,
+                    srd_y(spec.arch),
+                    SZERO,
+                    4 * u32::from(n),
+                )?;
             }
             op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
             sop(b, format!("s_add_i32 s{SMJ}, s{SMJ}, -1"), &[SMJ], &[SMJ])?;
@@ -2172,8 +2281,8 @@ fn hcw_epilogue(b: &mut Builder, spec: &Cfg) -> R {
                 &[],
                 &[s(MASK0), s(MASK1)],
             )?;
-            bstore(b, 4, a, e.offs + bt, SRD_Y, SZERO, 0)?;
-            bstore(b, 4, a + 4, e.offs + bt, SRD_Y, SZERO, 16)?;
+            bstore(b, 4, a, e.offs + bt, srd_y(spec.arch), SZERO, 0)?;
+            bstore(b, 4, a + 4, e.offs + bt, srd_y(spec.arch), SZERO, 16)?;
             op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
             sop(b, format!("s_add_i32 s{SNB}, s{SNB}, -16"), &[SNB], &[SNB])?;
             // hcw_pack8: word p = bf16(r[2p]) | bf16(r[2p+1]) << 16.
@@ -2220,16 +2329,175 @@ fn hcw_epilogue(b: &mut Builder, spec: &Cfg) -> R {
     Ok(())
 }
 
+/// Tiles per Y-load batch of the residual epilogue (8 VGPRs per tile).
+const YG: u8 = 8;
+
+/// Residual epilogue (`Y += acc`, F32), hipcc's `Y[(long long)out_col * M + out_row] += acc[j]`
+/// for `out_col < N`, `out_row < M`: after the cross-half swap each lane owns rows
+/// `8*lh .. 8*lh+7` of its token's tile column, so the stores are two b128 runs; the value
+/// stored is `v_add_f32 acc, acc, y` (hipcc's `v_add_f32_e32 v1, v1, v14`: acc is src0, the
+/// loaded Y src1; no `0 + acc` canonicalisation, the accumulator is added to Y as is). Y is
+/// loaded and stored under the same exec mask (token < N, row < M), so nothing outside the
+/// output is read. Ragged M (`M % 8 != 0`) loads, adds and stores element by element.
+fn resid_epilogue(b: &mut Builder, spec: &Cfg) -> R {
+    let e = ep(spec);
+    for t in 0..BT {
+        swap_tile(b, spec, &e, t)?;
+    }
+    sop(b, format!("s_lshl_b32 s{YSTEP}, s{SM}, 6"), &[YSTEP], &[SM])?;
+    sop(b, format!("s_mov_b32 s{SZERO}, 0"), &[SZERO], &[])?;
+    tile_offsets(b, e.offs, BT, VYOFF, YSTEP)?;
+    sop(b, format!("s_and_b32 s{ST0}, s{SM}, 7"), &[ST0], &[SM])?;
+    sop(b, format!("s_cmp_lg_u32 s{ST0}, 0"), &[], &[ST0])?;
+    op(
+        b,
+        format!("s_cbranch_scc1 {}", lbl(spec, "scalar")),
+        &[],
+        &[],
+    )?;
+    // M % 8 == 0: whole 8-row runs (row0 < M implies row0 + 8 <= M).
+    op(
+        b,
+        format!("v_cmp_gt_i32_e64 s{MASK1}, s{SM}, v{VROW0}"),
+        &[s(MASK1)],
+        &[s(SM), v(VROW0)],
+    )?;
+    // The token mask of tile `t` is recomputed under full exec each time: exec is
+    // restored to all ones after every tile, since a VOPC under a partial exec clears
+    // the result bits of the inactive lanes.
+    let tile_exec = |b: &mut Builder, t: u8| -> R {
+        sop(
+            b,
+            format!("s_sub_i32 s{SNB}, s{SN}, {}", lit(16 * u32::from(t))),
+            &[SNB],
+            &[SN],
+        )?;
+        op(
+            b,
+            format!("v_cmp_gt_i32_e64 s{MASK0}, s{SNB}, v{VTOK}"),
+            &[s(MASK0)],
+            &[s(SNB), v(VTOK)],
+        )?;
+        op(
+            b,
+            format!("s_and_b32 exec_lo, s{MASK0}, s{MASK1}"),
+            &[],
+            &[s(MASK0), s(MASK1)],
+        )
+    };
+    for g in 0..BT / YG {
+        for k in 0..YG {
+            let t = g * YG + k;
+            tile_exec(b, t)?;
+            bload(b, 4, e.yb + 8 * k, e.offs + t, srd_y(spec.arch), SZERO, 0)?;
+            bload(
+                b,
+                4,
+                e.yb + 8 * k + 4,
+                e.offs + t,
+                srd_y(spec.arch),
+                SZERO,
+                16,
+            )?;
+            op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
+        }
+        for k in 0..YG {
+            let t = g * YG + k;
+            let a = spec.acc() + 8 * t;
+            tile_exec(b, t)?;
+            for i in 0..8u8 {
+                op(
+                    b,
+                    format!("v_add_f32_e32 v{0}, v{0}, v{1}", a + i, e.yb + 8 * k + i),
+                    &[v(a + i)],
+                    &[v(a + i), v(e.yb + 8 * k + i)],
+                )?;
+            }
+            bstore(b, 4, a, e.offs + t, srd_y(spec.arch), SZERO, 0)?;
+            bstore(b, 4, a + 4, e.offs + t, srd_y(spec.arch), SZERO, 16)?;
+            op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
+        }
+    }
+    b.wait_all()?;
+    op(b, format!("s_branch {}", lbl(spec, "end")), &[], &[])?;
+    // Ragged M: per element, row0 + n < M.
+    b.label(&lbl(spec, "scalar"))?;
+    for t in 0..BT {
+        let a = spec.acc() + 8 * t;
+        sop(
+            b,
+            format!("s_sub_i32 s{SNB}, s{SN}, {}", lit(16 * u32::from(t))),
+            &[SNB],
+            &[SN],
+        )?;
+        op(
+            b,
+            format!("v_cmp_gt_i32_e64 s{MASK0}, s{SNB}, v{VTOK}"),
+            &[s(MASK0)],
+            &[s(SNB), v(VTOK)],
+        )?;
+        for phase in 0..2u8 {
+            sop(b, format!("s_mov_b32 s{SMJ}, s{SM}"), &[SMJ], &[SM])?;
+            for n in 0..8u8 {
+                op(
+                    b,
+                    format!("v_cmp_gt_i32_e64 s{MASK1}, s{SMJ}, v{VROW0}"),
+                    &[s(MASK1)],
+                    &[s(SMJ), v(VROW0)],
+                )?;
+                op(
+                    b,
+                    format!("s_and_b32 exec_lo, s{MASK0}, s{MASK1}"),
+                    &[],
+                    &[s(MASK0), s(MASK1)],
+                )?;
+                if phase == 0 {
+                    bload(
+                        b,
+                        1,
+                        e.yb + n,
+                        e.offs + t,
+                        srd_y(spec.arch),
+                        SZERO,
+                        4 * u32::from(n),
+                    )?;
+                } else {
+                    op(
+                        b,
+                        format!("v_add_f32_e32 v{0}, v{0}, v{1}", a + n, e.yb + n),
+                        &[v(a + n)],
+                        &[v(a + n), v(e.yb + n)],
+                    )?;
+                    bstore(
+                        b,
+                        1,
+                        a + n,
+                        e.offs + t,
+                        srd_y(spec.arch),
+                        SZERO,
+                        4 * u32::from(n),
+                    )?;
+                }
+                op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
+                sop(b, format!("s_add_i32 s{SMJ}, s{SMJ}, -1"), &[SMJ], &[SMJ])?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn epilogue(b: &mut Builder, spec: &Cfg) -> R {
     b.wait_all()?;
     b.label(&lbl(spec, "epi"))?;
     if spec.hcw() {
         hcw_epilogue(b, spec)?;
+    } else if spec.kind == Kind::Resid {
+        resid_epilogue(b, spec)?;
     } else {
         plain_epilogue(b, spec)?;
     }
     b.label(&lbl(spec, "end"))?;
-    b.control(Sop::End.encode(Arch::Gfx1151)?)
+    b.control(Sop::End.encode(spec.arch)?)
 }
 
 /// One MQ6 entry (`Cfg` with `Fmt::Mq6`).
@@ -2246,7 +2514,7 @@ pub fn emit_cfg(spec: Cfg) -> Result<Emitted, String> {
             .fold(k, |k, (n, o)| k.hidden(n, *o, 4, "by_value"))
     };
     let kernargs = match spec.kind {
-        Kind::Plain | Kind::Bf16 => by_value(
+        Kind::Plain | Kind::Bf16 | Kind::Resid => by_value(
             KernargLayout::new(36)
                 .pointer("A", 0)
                 .pointer("X", 8)
@@ -2284,7 +2552,7 @@ pub fn emit_cfg(spec: Cfg) -> Result<Emitted, String> {
         arch: spec.arch,
         symbol: spec.symbol(),
         kernargs,
-        user_sgpr_count: 2,
+        user_sgpr_count: USER_SGPRS,
         system_sgpr_workgroup_id_y: true,
         workgroup_size: spec.threads(),
         group_segment_fixed_size: GROUP_BYTES,
@@ -2305,6 +2573,25 @@ pub fn emit_cfg(spec: Cfg) -> Result<Emitted, String> {
     b.loop_(&lbl(&spec, "loop"), |b| body(b, &spec))?;
     epilogue(&mut b, &spec)?;
     b.finish()
+}
+
+/// Both residual twin entries (`Cfg::RESID`) as one code object (`Cfg::resid_module`).
+pub fn emit_resid_module(
+    arch: Arch,
+) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
+    let emitted = Cfg::RESID
+        .into_iter()
+        .map(|wr| {
+            emit_cfg(Cfg {
+                arch,
+                wr,
+                kind: Kind::Resid,
+                fmt: Fmt::Mq6,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (text, proof) = super::iu4_gemm::module(&emitted, &Cfg::resid_module(arch))?;
+    Ok((emitted, text, proof))
 }
 
 /// Every MQ6 entry as one code object (`Spec::module`).

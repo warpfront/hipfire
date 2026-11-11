@@ -523,6 +523,46 @@ static __device__ __forceinline__ float gdn_q8_halves_peak(
     return fmaxf(peak_half[0][value_index], peak_half[1][value_index]);
 }
 
+#if defined(__GFX12__) && !defined(HIPFIRE_GDN_PERSISTENT_SERIAL)
+// gfx12 gated_delta_step_persistent256_body: the few-row parameter pass staged
+// by the whole block and the per-row Q8 boundary without the int8 round trip
+// (both bit-identical). `HIPFIRE_GDN_PERSISTENT_STAGED=0` compiles the module
+// with HIPFIRE_GDN_PERSISTENT_SERIAL, restoring the previous body.
+#define GDN_PERSISTENT_STAGED 1
+
+// Rows up to which gated_delta_step_persistent256_body's parameter pass stages
+// the per-element q/k squares with the whole block (the few-row verify,
+// capture-lanes and rollback windows); wider row blocks keep one thread per row.
+#define GDN_PERSISTENT_STAGE_ROWS 8
+
+// hip_bfloat16's float -> bfloat16 conversion (RNE; Inf/NaN keep their high
+// bits, a NaN whose payload lies in the low 16 bits gets the quiet-preserving
+// bit 16) as selects instead of the header's divergent branch. Same bits.
+static __device__ __forceinline__ unsigned short gdn_bf16_bits(float value) {
+    const unsigned int u = __float_as_uint(value);
+    const unsigned int rne = u + 0x7fffu + ((u >> 16) & 1u);
+    const unsigned int special = (u & 0xffffu) != 0u ? (u | 0x10000u) : u;
+    return (unsigned short)(((~u & 0x7f800000u) != 0u ? rne : special) >> 16);
+}
+
+static __device__ __forceinline__ float gdn_bf16_value(unsigned int bits) {
+    return __uint_as_float(bits << 16);
+}
+
+// gdn_q8_round's code as the F32 value the (signed char) conversion keeps:
+// the clamped floor is already an integer in [-128, 127] (a NaN clamps to
+// -128 in both), so float -> int8 -> float is the identity on it. The same
+// expression sequence as gdn_q8_round up to the conversion.
+static __device__ __forceinline__ float gdn_q8_round_value(
+    float value, float inv, int head, int row, int column, unsigned int frame) {
+    unsigned int rng = (unsigned int)head * 1664525u + (unsigned int)row * 1013904223u
+        + (unsigned int)column * 214013u + frame * 2531011u;
+    rng = rng * 1664525u + 1013904223u;
+    const float noise = (float)(rng >> 8) * (1.0f / 16777216.0f);
+    return fminf(fmaxf(floorf(value * inv + noise), -128.0f), 127.0f);
+}
+#endif
+
 // Wave-size-independent persistent row-batched path for exact 128x128 geometry.
 // A block owns one value head and 256 threads.  tid%128 is the output channel
 // and tid/128 selects the half; each thread retains 64 state values in
@@ -594,6 +634,9 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
     __shared__ float handoff_kv[128];
     __shared__ float handoff_delta[128];
     __shared__ float handoff_out[128];
+#if defined(GDN_PERSISTENT_STAGED)
+    __shared__ __align__(16) unsigned short square_rows[GDN_PERSISTENT_STAGE_ROWS][2][128];
+#endif
 
     float state_half[64];
     if constexpr (kQ8) {
@@ -642,12 +685,58 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
     for (int block = 0; block < rows; block += 256) {
         const int block_rows = min(256, rows - block);
         gdn_lds_barrier();
+#if defined(GDN_PERSISTENT_STAGED)
+        // Few-row blocks: the whole block stages every row's BF16-rounded q/k
+        // element squares (independent per element) into LDS, so the row
+        // threads below only add them in kd order. The thread-per-row pass
+        // ran each row's 128-element load-and-round chain on one wave while
+        // the other seven waited, most of a few-row launch's fixed cost.
+        // Same values, same serial sum order.
+        const bool staged = block_rows <= GDN_PERSISTENT_STAGE_ROWS;
+        if (staged) {
+            const int kd = thread & 127;
+            const int column = (thread < 128 ? q_offset : k_offset) + kd;
+            float x[GDN_PERSISTENT_STAGE_ROWS];
+            #pragma unroll
+            for (int r = 0; r < GDN_PERSISTENT_STAGE_ROWS; ++r) {
+                x[r] = projection[(block + min(r, block_rows - 1)) * qkv_width + column];
+            }
+            #pragma unroll
+            for (int r = 0; r < GDN_PERSISTENT_STAGE_ROWS; ++r) {
+                if (r < block_rows) {
+                    const float rounded = gdn_bf16_value(gdn_bf16_bits(x[r]));
+                    square_rows[r][thread >> 7][kd] = gdn_bf16_bits(rounded * rounded);
+                }
+            }
+            gdn_lds_barrier();
+        }
+#endif
         if (thread < block_rows) {
             const int row = block + thread;
             const int row_base = row * qkv_width;
             float q_sum_f32 = 0.0f;
             float k_sum_f32 = 0.0f;
             const __hip_bfloat16 eps = bf16_round(1.0e-6f);
+#if defined(GDN_PERSISTENT_STAGED)
+            if (staged) {
+                const uint4* q_squares = reinterpret_cast<const uint4*>(square_rows[thread][0]);
+                const uint4* k_squares = reinterpret_cast<const uint4*>(square_rows[thread][1]);
+                #pragma unroll
+                for (int c = 0; c < 16; ++c) {
+                    const uint4 qw = q_squares[c];
+                    const uint4 kw = k_squares[c];
+                    #pragma unroll
+                    for (int w = 0; w < 4; ++w) {
+                        const unsigned int qp = (&qw.x)[w];
+                        const unsigned int kp = (&kw.x)[w];
+                        q_sum_f32 += gdn_bf16_value(qp & 0xffffu);
+                        k_sum_f32 += gdn_bf16_value(kp & 0xffffu);
+                        q_sum_f32 += gdn_bf16_value(qp >> 16);
+                        k_sum_f32 += gdn_bf16_value(kp >> 16);
+                    }
+                }
+            } else {
+#endif
             // float4 loads, the next pair issued before the current one is
             // consumed (a scalar load per kd waited a full memory round trip
             // each); the kd-order sums are unchanged.  More loads in flight
@@ -668,6 +757,9 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
                     k_sum_f32 += bf16_to_f32(bf16_round(k_float * k_float));
                 }
             }
+#if defined(GDN_PERSISTENT_STAGED)
+            }
+#endif
             const __hip_bfloat16 q_sum = bf16_round(q_sum_f32);
             const __hip_bfloat16 k_sum = bf16_round(k_sum_f32);
             q_inv_rows[thread] = bf16_round(
@@ -843,9 +935,16 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
                     } else {
                     #pragma unroll
                     for (int kd = 0; kd < 64; ++kd) {
+#if defined(GDN_PERSISTENT_STAGED)
+                        // The code's exact F32 value: no float -> int8 -> float trip.
+                        state_half[kd] = scale * gdn_q8_round_value(
+                            state_half[kd], inv, value_head, value_index, kd_base + kd,
+                            row_frame);
+#else
                         state_half[kd] = scale * (float)gdn_q8_round(
                             state_half[kd], inv, value_head, value_index, kd_base + kd,
                             row_frame);
+#endif
                     }
                     }
                 }
@@ -2233,6 +2332,141 @@ extern "C" __global__ __launch_bounds__(256) void hyper_norm_gate_f32(
     const float sum = hc_lane0_tree_sum((a0 + a1) + (a2 + a3));
     if (lane == 0) gates[(size_t)row * branches + wave] = sum;
 }
+
+#if defined(__GFX12__)
+// Decode HC read norm + the paired write's k4 gate GEMV in ONE launch, in hyper_norm_f32's
+// geometry (grid [4 branches, rows], block 256, hidden == 2560).  Block (b, row) runs
+// hyper_norm_rows' single-batch path verbatim for branch b (same loads, `partial += v * v` in
+// u order, 256-wide LDS tree from blockDim/2, `v * inv * (1 + w)` expression) and keeps the
+// normalized branch in LDS as BF16 bits (the F32 values are BF16-rounded: the widen is
+// lossless).  Waves 0..3 then each run one k4 quarter job: gate row g = wave, K quarter b =
+// this branch, i.e. `gemv_bf16_xf32_row` over that quarter exactly as gemv_bf16_xf32_k4 does
+// (lane l reads positions l * 8 + 256 * s, s = 0..9; four chains a0..a3 in dwordx4 order;
+// `(a0 + a1) + (a2 + a3)`; shfl_down 16..1; same text as hyper_write_norm_f32's quarters_out
+// path in qwen4_gemv_bf16_xf32.hip).  The four gate-row weight slices of the branch load into
+// registers before the norm.  Each block stores its four quarters to `scratch`
+// `[rows][4 gates][4 quarters]`; the last of the row's four blocks to arrive (device atomic
+// counter `counters[row]`, zero between launches: the last block resets it) folds
+// `(q0 + q1) + (q2 + q3)` in fixed quarter order and writes `gates[row * 4 + g]`, so the
+// result does not depend on arrival order.  No `hc_act`.
+// `input` is the HC streams (BF16 bits when `state_bf16`); `gate_weight` is the write's BF16
+// [4, 4 * hidden] block_inject.  Not for recording / graph capture (the counters are one
+// persistent buffer per Gpu); the dispatch pairing guards that.
+template <typename T>
+static __device__ __forceinline__ void hyper_norm_gate_k4_branch(
+    const T* input,
+    const __hip_bfloat16* norm_weight,
+    const unsigned short* gate_weight,
+    float* normalized,
+    float* gates,
+    float* scratch,
+    unsigned int* counters) {
+    constexpr int hidden = 2560;
+    constexpr int wide = 4 * hidden;
+    const int branch = (int)blockIdx.x;
+    const int row = (int)blockIdx.y;
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int offset = (row * 4 + branch) * hidden;
+    const int weight_offset = branch * hidden;
+    __shared__ float rms_sum[256];
+    __shared__ __align__(16) unsigned short xsb[hidden];
+    __shared__ unsigned int last_block;
+    // Gate row `wave`, quarter `branch`: weights up front (waves 0..3).
+    uint4 wv[10];
+    if (wave < 4) {
+        const unsigned short* w_row =
+            gate_weight + (size_t)wave * wide + weight_offset + lane * 8;
+#pragma unroll
+        for (int s = 0; s < 10; ++s) wv[s] = *(const uint4*)(w_row + s * 256);
+    }
+    float raw[10], weight[10];
+    float partial = 0.0f;
+#pragma unroll
+    for (int u = 0; u < 10; ++u) {
+        raw[u] = hc_stream_value(input[offset + tid + u * 256]);
+        weight[u] = bf16_to_f32(norm_weight[weight_offset + tid + u * 256]);
+    }
+#pragma unroll
+    for (int u = 0; u < 10; ++u) {
+        const float value = bf16_to_f32(bf16_round(raw[u]));
+        partial += value * value;
+    }
+    rms_sum[tid] = partial;
+    __syncthreads();
+    for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            rms_sum[tid] += rms_sum[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float inv = rsqrtf(rms_sum[0] / (float)hidden + 1.0e-6f);
+#pragma unroll
+    for (int u = 0; u < 10; ++u) {
+        const float value = bf16_to_f32(bf16_round(
+            bf16_to_f32(bf16_round(raw[u])) * inv * (1.0f + weight[u])));
+        normalized[offset + tid + u * 256] = value;
+        xsb[tid + u * 256] = (unsigned short)(__float_as_uint(value) >> 16);
+    }
+    __syncthreads();
+    if (wave < 4) {
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+#pragma unroll
+        for (int s = 0; s < 10; ++s) {
+            const uint4 xv = *(const uint4*)(xsb + lane * 8 + s * 256);
+            const float4 xa = {__uint_as_float(xv.x << 16), __uint_as_float(xv.x & 0xFFFF0000u), __uint_as_float(xv.y << 16), __uint_as_float(xv.y & 0xFFFF0000u)};
+            const float4 xb = {__uint_as_float(xv.z << 16), __uint_as_float(xv.z & 0xFFFF0000u), __uint_as_float(xv.w << 16), __uint_as_float(xv.w & 0xFFFF0000u)};
+            a0 += __uint_as_float(wv[s].x << 16) * xa.x;
+            a1 += __uint_as_float(wv[s].x & 0xFFFF0000u) * xa.y;
+            a2 += __uint_as_float(wv[s].y << 16) * xa.z;
+            a3 += __uint_as_float(wv[s].y & 0xFFFF0000u) * xa.w;
+            a0 += __uint_as_float(wv[s].z << 16) * xb.x;
+            a1 += __uint_as_float(wv[s].z & 0xFFFF0000u) * xb.y;
+            a2 += __uint_as_float(wv[s].w << 16) * xb.z;
+            a3 += __uint_as_float(wv[s].w & 0xFFFF0000u) * xb.w;
+        }
+        float sum = (a0 + a1) + (a2 + a3);
+        for (int off = 16; off > 0; off >>= 1) sum += __shfl_down(sum, off);
+        if (lane == 0) {
+            scratch[(size_t)(row * 4 + wave) * 4 + branch] = sum;
+            __threadfence();
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence();
+        last_block = atomicAdd(&counters[row], 1u) == 3u;
+    }
+    __syncthreads();
+    if (!last_block) return;
+    __threadfence();
+    if (tid < 4) {
+        const volatile float* q = scratch + (size_t)(row * 4 + tid) * 4;
+        const float q0 = q[0], q1 = q[1], q2 = q[2], q3 = q[3];
+        gates[(size_t)row * 4 + tid] = (q0 + q1) + (q2 + q3);
+    }
+    if (tid == 0) atomicExch(&counters[row], 0u);
+}
+
+extern "C" __global__ __launch_bounds__(256) void hyper_norm_gate_k4_outputs_f32(
+    const void* input,
+    const __hip_bfloat16* norm_weight,
+    const unsigned short* gate_weight,
+    float* normalized,
+    float* gates,
+    float* scratch,
+    unsigned int* counters,
+    int hidden,
+    int state_bf16) {
+    if (state_bf16)
+        hyper_norm_gate_k4_branch((const unsigned short*)input, norm_weight, gate_weight,
+                                  normalized, gates, scratch, counters);
+    else
+        hyper_norm_gate_k4_branch((const float*)input, norm_weight, gate_weight, normalized,
+                                  gates, scratch, counters);
+}
+#endif  // __GFX12__
 
 // H4 read side: hyper_norm_gate_f32's exact norm + BF16 gate projection of the
 // streams, plus the normalized row for the HC down projection, in ONE launch,
@@ -5424,6 +5658,313 @@ static __device__ __forceinline__ void qsa_attention_batched_hg4(
             : 0.0f;
     }
 }
+
+#if defined(QSA_HAS_Q8)
+// Q8 twin of qsa_attention_batched_hg4 with the same arithmetic in the same
+// order (bitwise-equal output), restructured for less LDS and fewer exposed
+// latencies (card-proven bit-identical, 0.467 mid / 0.438 late of the shipped
+// kernel's time: R2Qsa-05-hg4-pipe-kpf):
+//  - no tokens[] array in LDS: the validated token is recomputed from the
+//    selected list where it is needed (one unsigned compare against
+//    min(visible, full_capacity));
+//  - LDS = [8 waves x 4 partial maxes, later the 4 denominators][selected x 4
+//    weights]: the per-thread max array and its serial 256-step reduction are
+//    replaced by wave-shuffle maxes (fmaxf is exact and order-independent);
+//  - score loop: each thread owns one selected row (per 256-row tile) and the
+//    next pair's 17 key words, the next tile's pair 0 and the token indices
+//    two tiles ahead are requested before the current pair is decoded, with
+//    sched_barrier(0) fences so the loads are neither sunk nor the q loads
+//    hoisted into SGPR spills;
+//  - value loads use a wave-uniform buffer descriptor on the wave's Q8_0
+//    block of row 0 plus an SGPR row offset, in two 16-token ping-pong
+//    batches (the loop body is one branch-free block so every value is
+//    converted next to its load);
+//  - every channel's denominator is the same in-order sum of the head's
+//    weights, so wave 0 computes it once (one lane per head) and publishes
+//    it through LDS instead of all eight waves adding it redundantly.
+// Requires dynamic LDS of selected_len * 16 + 4 * 8 * 4 bytes.
+// Bit-identity: score = the incumbent's qsa_kv_key_dots<Q8> chain per head
+// (same code[] values, dot0/dot1 ascending d from +0, `total += dot0*scale0;
+// total += dot1*scale1` per 64-wide pair in ascending pair order), then
+// `/ sqrtf(256)`; weights are expf(scaled - max[h]); numerator/denominator
+// keep their selected-row-ascending chains from +0.
+template <bool B>
+struct qsa_bool {
+    static constexpr bool value = B;
+};
+
+// One 64-wide pair (17 words, 68 bytes) of a Q8 key row against HG query heads: the incumbent's code[] decode and
+// dot chains. `total[h]` carries across pairs exactly like qsa_kv_key_dots<Q8, HG>.
+template <int HG>
+static __device__ __forceinline__ void qsa_lite_key_pair(
+    const unsigned int* w, const float* __restrict__ q, int q_stride, int pair, float (&total)[HG]) {
+    const float scale0 = qsa_half_bits(w[0] & 0xFFFFu);
+    const float scale1 = qsa_half_bits(w[8] >> 16);
+    float code[64];
+    code[0] = qsa_q8_code(w[0], 2);
+    code[1] = qsa_q8_code(w[0], 3);
+#pragma unroll
+    for (int i = 1; i < 8; ++i) {
+#pragma unroll
+        for (int b = 0; b < 4; ++b) code[4 * i - 2 + b] = qsa_q8_code(w[i], b);
+    }
+    code[30] = qsa_q8_code(w[8], 0);
+    code[31] = qsa_q8_code(w[8], 1);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+#pragma unroll
+        for (int b = 0; b < 4; ++b) code[32 + 4 * i + b] = qsa_q8_code(w[9 + i], b);
+    }
+    const float* qbase = q;
+#pragma unroll
+    for (int h = 0; h < HG; ++h) {
+        const float* qh = qbase + h * q_stride + pair * 64;
+        float dot0 = 0.0f;
+        float dot1 = 0.0f;
+#pragma unroll
+        for (int d = 0; d < 32; ++d) dot0 += qh[d] * code[d];
+#pragma unroll
+        for (int d = 0; d < 32; ++d) dot1 += qh[32 + d] * code[32 + d];
+        total[h] += dot0 * scale0;
+        total[h] += dot1 * scale1;
+        __builtin_amdgcn_sched_barrier(0);
+    }
+}
+
+#define QSA_TOK_OK(t) ((unsigned)(t) < (unsigned)valid_limit)
+template <int F>
+static __device__ __forceinline__ void qsa_attention_batched_hg4_lite(
+    const float* q_with_gate,
+    const unsigned char* full_keys,
+    const unsigned char* full_values,
+    const int* selected_indices,
+    float* output,
+    int rows,
+    int position_start,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int budget_blocks,
+    int compress,
+    int capacity,
+    int full_capacity) {
+    static_assert(F == QSA_KV_Q8, "the lite hg4 kernel is the Q8 K/V twin");
+    constexpr int HG = QSA_HG;
+    int row = (int)blockIdx.z;
+    if (row >= rows) return;
+    int visible = position_start + row + 1;
+    int block_count = visible / compress;
+    int chosen = budget_blocks < block_count ? budget_blocks : block_count;
+    int selected_len = chosen * compress + visible - block_count * compress;
+    if (selected_len > capacity) selected_len = capacity;
+    // token >= 0 && token < full_capacity && token < visible, as one unsigned compare.
+    const int valid_limit = max(min(visible, full_capacity), 0);
+    // LDS: [kt: 8 waves x HG partial maxes, later the HG denominators][weights: selected_len x HG].
+    // Both regions are multiples of 16 bytes. No token array and no per-thread max array.
+    extern __shared__ float4 lds4[];
+    float* lds = reinterpret_cast<float*>(lds4);
+    float* kt = lds;
+    float* weights = lds + 8 * HG;
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int wave_id = __builtin_amdgcn_readfirstlane(tid >> 5);  // wave-uniform
+    const int head0 = (int)blockIdx.x * HG;
+    const int kv_head = head0 / (n_heads / n_kv_heads);
+    const size_t row_bytes = (size_t)qsa_kv_row_bytes<F>(n_kv_heads, QSA_HD);
+    const int* row_selected = selected_indices + row * capacity;
+    const int q_row = row * 2 * n_heads * QSA_HD;
+    // The query rows are block-uniform: the score loop reads them as scalar loads (SGPR FMA operands).
+    const float* __restrict__ qg = q_with_gate + q_row + head0 * QSA_HD * 2;
+    // Validated token of selected row `index` (or -1), straight from the selected list.
+    auto token_at = [&](int index) -> int {
+        if (index >= selected_len) return -1;
+        const int token = row_selected[index];
+        return QSA_TOK_OK(token) ? token : -1;
+    };
+
+    // ---- scores: each thread owns one selected row (per 256-row tile) and all HG heads ----
+    float partial_max[HG];
+#pragma unroll
+    for (int h = 0; h < HG; ++h) partial_max[h] = -3.402823466e+38f;
+    // Token indices run two tiles ahead and the next tile's first key pair is requested before this tile is
+    // decoded, so no tile waits on a dependent global load chain (index -> row -> key words).
+    int tok0 = token_at(tid);
+    int raw1 = row_selected[min(tid + 256, selected_len - 1)];  // next tile's raw index, validated one tile later
+    unsigned int wt[17];  // pair 0 of this tile's key row
+    {
+        const unsigned int* p0 = reinterpret_cast<const unsigned int*>(
+            full_keys + (size_t)(tok0 >= 0 ? tok0 : 0) * row_bytes + kv_head * (QSA_HD / 32) * 34);
+#pragma unroll
+        for (int i = 0; i < 17; ++i) wt[i] = p0[i];
+    }
+    for (int base = 0; base < selected_len; base += 256) {
+        const int index = base + tid;
+        const int token = tok0;
+        tok0 = (index + 256 < selected_len && QSA_TOK_OK(raw1)) ? raw1 : -1;  // next tile's token
+        raw1 = row_selected[min(index + 512, selected_len - 1)];            // the tile after: stays in flight
+        unsigned int wx[17];  // pair 0 of the next tile's key row (row 0 stands in for a dead lane)
+        {
+            const unsigned int* px = reinterpret_cast<const unsigned int*>(
+                full_keys + (size_t)(tok0 >= 0 ? tok0 : 0) * row_bytes + kv_head * (QSA_HD / 32) * 34);
+#pragma unroll
+            for (int i = 0; i < 17; ++i) wx[i] = px[i];
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        float score[HG];
+#pragma unroll
+        for (int h = 0; h < HG; ++h) score[h] = 0.0f;
+        if (token >= 0) {
+            const unsigned int* pairs = reinterpret_cast<const unsigned int*>(
+                full_keys + (size_t)token * row_bytes + kv_head * (QSA_HD / 32) * 34);
+            float total[HG];
+#pragma unroll
+            for (int h = 0; h < HG; ++h) total[h] = 0.0f;
+            unsigned int wc[17];
+#pragma unroll
+            for (int i = 0; i < 17; ++i) wc[i] = wt[i];
+#pragma unroll 1
+            for (int pair = 0; pair < QSA_HD / 64; ++pair) {
+                unsigned int wn[17];
+                const int next_pair = pair + 1 < QSA_HD / 64 ? pair + 1 : QSA_HD / 64 - 1;
+#pragma unroll
+                for (int i = 0; i < 17; ++i) wn[i] = pairs[next_pair * 17 + i];
+                __builtin_amdgcn_sched_barrier(0);
+                qsa_lite_key_pair<HG>(wc, qg, QSA_HD * 2, pair, total);
+                __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+                for (int i = 0; i < 17; ++i) wc[i] = wn[i];
+            }
+#pragma unroll
+            for (int h = 0; h < HG; ++h) score[h] += total[h];
+        }
+#pragma unroll
+        for (int i = 0; i < 17; ++i) wt[i] = wx[i];
+        if (index < selected_len) {
+#pragma unroll
+            for (int h = 0; h < HG; ++h) {
+                const float scaled = score[h] / sqrtf((float)QSA_HD);
+                weights[index * HG + h] = scaled;
+                if (token >= 0) partial_max[h] = fmaxf(partial_max[h], scaled);
+            }
+        }
+    }
+    // fmaxf is exact and order-independent: reduce inside each wave with shuffles, then across the 8 waves.
+#pragma unroll
+    for (int h = 0; h < HG; ++h) {
+        float m = partial_max[h];
+        for (int offset = 16; offset > 0; offset >>= 1) m = fmaxf(m, __shfl_xor(m, offset, 32));
+        if (lane == 0) kt[wave_id * HG + h] = m;
+    }
+    __syncthreads();
+    float maxes[HG];
+#pragma unroll
+    for (int h = 0; h < HG; ++h) {
+        float head_max = -3.402823466e+38f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) head_max = fmaxf(head_max, kt[w * HG + h]);
+        maxes[h] = head_max;
+    }
+    // exp phase: same thread/row mapping as the score loop (no barrier needed between them); the next row's raw
+    // index is requested before this row's exps are computed.
+    int exp_raw = row_selected[min(tid, selected_len - 1)];
+    for (int index = tid; index < selected_len; index += 256) {
+        const int exp_next = row_selected[min(index + 256, selected_len - 1)];
+        const bool ok = QSA_TOK_OK(exp_raw);
+        exp_raw = exp_next;
+        if (ok) {
+            float* wp = weights + index * HG;
+            float4 w4 = *reinterpret_cast<const float4*>(wp);
+            w4.x = expf(w4.x - maxes[0]);
+            w4.y = expf(w4.y - maxes[1]);
+            w4.z = expf(w4.z - maxes[2]);
+            w4.w = expf(w4.w - maxes[3]);
+            *reinterpret_cast<float4*>(wp) = w4;
+        }
+    }
+    __syncthreads();
+
+    // ---- PV: lane = channel; token indices are block-uniform scalar loads, value rows go through one
+    // wave-uniform buffer descriptor + SGPR row offset (invalid rows read row 0 and select 0.0) ----
+    const int channel = tid;
+    float numerator[HG];
+#pragma unroll
+    for (int h = 0; h < HG; ++h) numerator[h] = 0.0f;
+    const __amdgpu_buffer_rsrc_t qrsrc = __builtin_amdgcn_make_buffer_rsrc(
+        (void*)(full_values + (size_t)(kv_head * (QSA_HD / 32) + wave_id) * 34), 0,
+        0x7FFFFFFF, 0x31004000);
+    auto value_at = [&](int index) {
+        const int token = __builtin_amdgcn_readfirstlane(row_selected[index]);
+        const bool ok = QSA_TOK_OK(token);
+        const unsigned soff = ok ? (unsigned)token * (unsigned)row_bytes : 0u;
+        const unsigned char code = __builtin_amdgcn_raw_buffer_load_b8(qrsrc, lane + 2, soff, 0);
+        const unsigned short scale = __builtin_amdgcn_raw_buffer_load_b16(qrsrc, 0, soff, 0);
+        const float v = (float)(signed char)code * qsa_half_bits(scale);
+        return ok ? v : 0.0f;
+    };
+    // Wave 0, lane l runs head l's denominator chain (every channel's denominator is the same in-order sum).
+    float den_lane = 0.0f;
+    const int den_h = lane < HG ? lane : 0;
+    auto accumulate = [&](auto with_den, int index, float value) {
+        const float* wp = weights + index * HG;
+        float wv[HG];
+        const float4 w4 = *reinterpret_cast<const float4*>(wp);
+        wv[0] = w4.x; wv[1] = w4.y; wv[2] = w4.z; wv[3] = w4.w;
+        if constexpr (decltype(with_den)::value) den_lane += wp[den_h];
+#pragma unroll
+        for (int h = 0; h < HG; ++h) QSA_SUM_ACC(numerator[h], wv[h], value);
+    };
+    auto consume = [&](auto with_den, const float (&value)[16], int i0) {
+#pragma unroll
+        for (int u = 0; u < 16; ++u) accumulate(with_den, i0 + u, value[u]);
+    };
+    auto pv = [&](auto with_den) {
+        int i = 0;
+        // Two value batches in flight: the next batch's loads (and token-index scalar loads) are issued before
+        // the current batch is consumed. The loop body is one branch-free block (indices past the end are clamped
+        // to the last full batch: valid reads whose values are never consumed), so every value is converted next to its
+        // load and no raw byte is carried across blocks.
+        if (selected_len >= 16) {
+            const int last_batch = selected_len - 16;
+            float va[16];
+            float vb[16];
+#pragma unroll
+            for (int u = 0; u < 16; ++u) va[u] = value_at(u);
+            for (; i + 32 <= selected_len; i += 32) {
+#pragma unroll
+                for (int u = 0; u < 16; ++u) vb[u] = value_at(i + 16 + u);
+                consume(with_den, va, i);
+                const int next_batch = min(i + 32, last_batch);  // contiguous, so the index loads stay one scalar load
+#pragma unroll
+                for (int u = 0; u < 16; ++u) va[u] = value_at(next_batch + u);
+                consume(with_den, vb, i + 16);
+            }
+            if (i + 16 <= selected_len) {
+                consume(with_den, va, i);
+                i += 16;
+            }
+        }
+        for (; i < selected_len; ++i) {
+            const float value = value_at(i);
+            accumulate(with_den, i, value);
+        }
+    };
+    if (wave_id == 0) pv(qsa_bool<true>{}); else pv(qsa_bool<false>{});
+    // Every thread read the partial maxes in kt before the barrier that precedes PV: the region is free again.
+    if (tid < HG) kt[tid] = den_lane;
+    __syncthreads();
+#pragma unroll
+    for (int h = 0; h < HG; ++h) {
+        const float denominator = kt[h];
+        const int head = head0 + h;
+        const float gate = q_with_gate[q_row + head * QSA_HD * 2 + QSA_HD + channel];
+        output[row * n_heads * QSA_HD + head * QSA_HD + channel] = denominator > 0.0f
+            ? numerator[h] / denominator / (1.0f + expf(-gate))
+            : 0.0f;
+    }
+}
+#undef QSA_HD
+#undef QSA_TOK_OK
+#endif
 #undef QSA_HG
 #undef QSA_HD
 
@@ -5746,6 +6287,12 @@ QSA_ATTENTION_KERNELS(fp8_fnuz, QSA_KV_FP8_FNUZ, unsigned char)
 #endif
 #if defined(QSA_HAS_Q8)
 QSA_ATTENTION_KERNELS(q8, QSA_KV_Q8, unsigned char)
+// Same arithmetic as indexed_attention_attention_q8_batched_hg4, less LDS
+// (selected_len * 16 + 128 bytes) and pipelined key/value gathers: routed on
+// exact gfx1100 prefill only.
+QSA_ATTENTION_BATCHED(indexed_attention_attention_q8_batched_hg4_lite,
+                      qsa_attention_batched_hg4_lite, __launch_bounds__(256), QSA_KV_Q8,
+                      unsigned char)
 #endif
 #undef QSA_ATTENTION_KERNELS
 #undef QSA_NO_BOUNDS

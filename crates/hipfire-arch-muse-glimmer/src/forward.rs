@@ -202,6 +202,10 @@ pub(crate) fn embed_lookup(
             .embedding_lookup(&weights.embed_tokens, &state.x, token_id, dim)
             .map_err(|e| format!("glimmer: embed f32: {e:?}"))?,
         EmbeddingFormat::Q4K => return Err("glimmer: Q4K embedding format unsupported".to_string()),
+        EmbeddingFormat::Ggml(_) => return Err(
+            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only"
+                .to_string(),
+        ),
     }
     // Scale-less RMSNorm over the embedding.
     //
@@ -251,6 +255,10 @@ fn embed_lookup_batched(
             .embedding_lookup_q8_batched(&weights.embed_tokens, x, token_ids, b, dim)
             .map_err(|e| format!("glimmer: embed q8 batched: {e:?}"))?,
         EmbeddingFormat::F32 | EmbeddingFormat::Q4K => return Ok(false),
+        EmbeddingFormat::Ggml(_) => return Err(
+            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only"
+                .to_string(),
+        ),
     }
     gpu.rmsnorm_batched(x, &state.embed_norm_ones, x, b, dim, rms_eps)
         .map_err(|e| format!("glimmer: embed_norm batched: {e:?}"))?;
@@ -475,6 +483,10 @@ pub fn embed_raw(
         EmbeddingFormat::Q4K => {
             return Err("glimmer embed_raw: Q4K unsupported".into());
         }
+        EmbeddingFormat::Ggml(_) => return Err(
+            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only"
+                .into(),
+        ),
     }
     let host = gpu
         .download_f32(&state.x)

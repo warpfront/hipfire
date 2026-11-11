@@ -10,7 +10,7 @@
     "lds_unknown_addresses": 56,
     "lift": "byte-exact",
     "obligations": {},
-    "sgpr_high_water": 68,
+    "sgpr_high_water": 80,
     "table": "gfx1100",
     "vgpr_high_water": 72,
     "wait_facts": 99
@@ -26,7 +26,7 @@
     "lds_unknown_addresses": 40,
     "lift": "byte-exact",
     "obligations": {},
-    "sgpr_high_water": 61,
+    "sgpr_high_water": 80,
     "table": "gfx1100",
     "vgpr_high_water": 72,
     "wait_facts": 67

@@ -11,7 +11,8 @@
 //! * The gfx1151 source is the gfx1100 source with only arch-forced deltas: the arch name, and the builder's
 //!   `VALUTransUseHazard` waits (`s_waitcnt_depctr depctr_va_vdst(0)` after a transcendental), a gfx1100-only
 //!   hazard (`Gfx11Hazards::for_arch`; the installed ROCm LLVM inserts it for `-mcpu=gfx1100` and not for
-//!   `-mcpu=gfx1151`). The register plan, LDS tables, operand/fold sequence and ABI are identical.
+//!   `-mcpu=gfx1151`), and gfx1100's `FeatureUserSGPRInit16Bug` SGPR renumbering (workgroup ids s14/s15, kernarg block
+//!   s88:95, E8P table literals s8..s13/s84/s85, user-SGPR count 14). The VGPR plan, LDS tables, operand/fold sequence and ABI are identical.
 //! * The committed `kernels/qwen4_moe_iu4_sym_e8p_pm_{gfx1100,gfx1151}.hxaco` candidates and the six
 //!   `kernels/qwen4_moe_{arch}_negative/<negative>/` images are the emitter's output, byte for byte (native
 //!   assembler + HIP bundle), so any change of the shared module that moves either arch shows up here.
@@ -429,11 +430,75 @@ fn wrong_fold_epoch_gfx1151_drops_only_the_activation_sum() {
     }
 }
 
-/// The gfx1100 source with its arch name swapped and its gfx1100-only trans-use waits removed.
-fn arch_neutral(text: &str, arch: Arch) -> String {
-    text.replace(arch.name(), "ARCH")
-        .lines()
+/// gfx1100 `FeatureUserSGPRInit16Bug` renumbering, as the gfx1151 SGPR number: the descriptor declares 14 user SGPRs, so
+/// the workgroup ids are s14/s15 (gfx1151: s2/s3) and the kernarg `s_load_b256` block moves s8:15 -> s88:95; the E8P
+/// table literals (s88:95 on gfx1151) move to the freed s8..s13 and s84,s85.
+fn sgpr_1100_to_1151(n: u32, e8p: bool) -> u32 {
+    match n {
+        14 | 15 => n - 12,
+        88..=95 => n - 80,
+        8..=13 if e8p => n + 80,
+        84 | 85 if e8p => n + 10,
+        _ => n,
+    }
+}
+
+/// `text` with every scalar register number mapped by `f` (`sN` and `s[N:M]` operands; not `s_load`, `v14`, `.sgpr_count`).
+fn map_sgprs(text: &str, f: impl Fn(u32) -> u32) -> String {
+    let b = text.as_bytes();
+    let (mut out, mut i) = (String::with_capacity(text.len()), 0);
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'.';
+    while i < b.len() {
+        let starts = b[i] == b's' && (i == 0 || !word(b[i - 1]));
+        if starts && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j >= b.len() || !word(b[j]) {
+                out += &format!("s{}", f(text[i + 1..j].parse().unwrap()));
+                i = j;
+                continue;
+            }
+        } else if starts && text[i..].starts_with("s[") {
+            let close = i + text[i..].find(']').unwrap();
+            let (lo, hi) = text[i + 2..close].split_once(':').unwrap();
+            out += &format!("s[{}:{}]", f(lo.parse().unwrap()), f(hi.parse().unwrap()));
+            i = close + 1;
+            continue;
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// The source with its arch name swapped, its gfx1100-only trans-use waits removed, the gfx1100 SGPR renumbering undone
+/// (`gfx1100` only) and the SGPR-count directives (`.amdhsa_user_sgpr_count`, `.amdhsa_next_free_sgpr`, `.sgpr_count`)
+/// blanked: they are the SGPR rule's own deltas.
+fn arch_neutral(text: &str, arch: Arch, e8p: bool) -> String {
+    let text = text.replace(arch.name(), "ARCH");
+    let text = if arch == Arch::Gfx1100 {
+        map_sgprs(&text, |n| sgpr_1100_to_1151(n, e8p))
+    } else {
+        text
+    };
+    text.lines()
         .filter(|l| l.trim() != TRANS_WAIT)
+        .map(|l| {
+            let t = l.trim();
+            match [
+                ".amdhsa_user_sgpr_count",
+                ".amdhsa_next_free_sgpr",
+                ".sgpr_count:",
+            ]
+            .into_iter()
+            .find(|d| t.starts_with(d))
+            {
+                Some(d) => format!("{d} N"),
+                None => l.to_owned(),
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -458,34 +523,39 @@ fn gfx1151_source_is_the_gfx1100_source_minus_arch_forced_deltas() {
                     let a = gfx11::emit(spec(Arch::Gfx1100, codec, kind, acc, negative)).unwrap();
                     let b = gfx11::emit(s1151(codec, kind, acc, negative)).unwrap();
                     let id = format!("{codec:?} {kind:?} acc {acc} {negative:?}");
+                    if codec == Codec::Mq4 && !acc && negative == Negative::None {
+                        // The round-2 gfx1100 card winners (gate/up lockstep, down K=640 pipeline)
+                        // are exact-gfx1100 only: gfx1151 keeps the plain loop, barrier-free.
+                        assert!(a.s_text.contains("s_barrier"), "{id}");
+                        assert!(!b.s_text.contains("s_barrier"), "{id}");
+                        entries += 1;
+                        continue;
+                    }
                     let (wa, wb) = (
                         a.s_text.matches(TRANS_WAIT).count(),
                         b.s_text.matches(TRANS_WAIT).count(),
                     );
                     assert_eq!(wb, 0, "{id}: gfx1151 has no VALUTransUseHazard wait");
                     assert_eq!(
-                        arch_neutral(&a.s_text, Arch::Gfx1100),
-                        arch_neutral(&b.s_text, Arch::Gfx1151),
-                        "{id}: unexpected delta beyond the trans-use waits"
+                        arch_neutral(&a.s_text, Arch::Gfx1100, codec == Codec::E8p),
+                        arch_neutral(&b.s_text, Arch::Gfx1151, codec == Codec::E8p),
+                        "{id}: unexpected delta beyond the trans-use waits and the gfx1100 SGPR renumbering"
                     );
                     assert_eq!(
                         a.s_text.lines().count(),
                         b.s_text.lines().count() + wa,
                         "{id}"
                     );
+                    // gfx1100 declares user SGPRs padded to 14 and keeps its kernarg block at s88:95, so its
+                    // SGPR high-water mark is at least 96 (E8P: already 96 on both).
                     assert_eq!(
-                        (
-                            a.shape.next_free_vgpr,
-                            a.shape.next_free_sgpr,
-                            a.shape.wmma,
-                            a.shape.vmem
-                        ),
-                        (
-                            b.shape.next_free_vgpr,
-                            b.shape.next_free_sgpr,
-                            b.shape.wmma,
-                            b.shape.vmem
-                        ),
+                        a.shape.next_free_sgpr,
+                        b.shape.next_free_sgpr.max(96),
+                        "{id}: SGPR high-water mark"
+                    );
+                    assert_eq!(
+                        (a.shape.next_free_vgpr, a.shape.wmma, a.shape.vmem),
+                        (b.shape.next_free_vgpr, b.shape.wmma, b.shape.vmem),
                         "{id}: register plan and operation census"
                     );
                     assert_eq!(a.shape.barriers, b.shape.barriers, "{id}");

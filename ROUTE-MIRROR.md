@@ -313,7 +313,7 @@ These design IDs used in every kernel row specify both PM mapping and numerical 
 
 **Proposed T55 order:** natural prelude/router(no0rotation)→2S.1→2S.2→2S.3→G1 andG0→G→4T55→D0→D→6B. G1 adapter is once for both GEMMs and may precede G0 (independent inputs); G0/G1 both must precede G. The reused stable chain has independent T55 admission, not sym-IU4 selection. Generator arm never admits teacher/capture or numeric fallback.
 
-PM source-tree bundles are SHA-pinned `kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco`, SHA256 `0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e`, embedded at `crates/rdna-compute/src/kernels.rs:4220-4232`. The PM symbol generator emits anchor/NT4/NT8 names (`qwen4_moe_sym.rs:102-129`). A gfx942 twin needs new wave64 typed emission/contracts/binary pin; changing the architecture string or executing the gfx1201 bundle is not a port.
+PM source-tree bundles are SHA-pinned `kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco`, SHA256 `44177c21de25bec8502f63f318e682dc4fa1948420723c75dec14fa63cfed723`, embedded at `crates/rdna-compute/src/kernels.rs:4220-4232`. The PM symbol generator emits anchor/NT4/NT8 names (`qwen4_moe_sym.rs:102-129`). A gfx942 twin needs new wave64 typed emission/contracts/binary pin; changing the architecture string or executing the gfx1201 bundle is not a port.
 
 
 

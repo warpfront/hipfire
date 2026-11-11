@@ -49,7 +49,7 @@
 //! `HIPFIRE_CB_VERIFY_PM` (default on) selects PM; `=0` selects the hipcc
 //! twins. A PM bundle or symbol that fails to load is an error, never a hipcc
 //! fallback. [`Gpu::mq4_verify_chunk_rows`] is the admission capacity
-//! (`HIPFIRE_CB_VERIFY_CHUNK128`, default off). The launches use fixed-size
+//! (`HIPFIRE_CB_VERIFY_CHUNK128`, default on for gfx1201, `=0` kills). The launches use fixed-size
 //! argument arrays: no per-launch allocation beyond the existing blob path.
 
 use crate::{kernels, Gpu, GpuTensor};
@@ -463,7 +463,7 @@ impl Gpu {
     }
 
     /// Rows of one aggregated exact verify chunk this GPU admits: 128 on exact
-    /// gfx1201 when `HIPFIRE_CB_VERIFY_CHUNK128` (default off) and
+    /// gfx1201 when `HIPFIRE_CB_VERIFY_CHUNK128` (default on for gfx1201) and
     /// `HIPFIRE_WMMA_BATCH_TILES` are both on, otherwise the historical 63.
     /// Admission of a particular target (dense MQ4V2 projections and head
     /// only, singleton chain per [`Self::mq4_verify_singleton_chain`]) stays

@@ -306,18 +306,41 @@ pub(crate) fn mtp_head_reserved(spec_mtp: Option<bool>) -> bool {
     )
 }
 
+/// Device bytes the drafts this load attaches will own: the MTP head (only
+/// when `mtp_head_reserved` admits it: bundled trailer, the CLI sidecar, or the
+/// `.mtp` sibling) plus the DFlash draft when named. One resolution shared by
+/// the placement capacity and the post-weight context cap so the two cannot
+/// drift. MTP not admitted (explicit off, or `auto` without a measured AR
+/// floor) means the head will not load; a named DFlash draft is still charged
+/// because the slots route runs its DFlash2 chain independently of the MTP gate.
+fn load_draft_reserve_bytes(trunk: &std::path::Path, ctx: &LoadCtx) -> u64 {
+    let dflash_draft: Option<&std::path::Path> = ctx.draft_path.map(std::path::Path::new);
+    let mtp_head: Option<MtpHeadLocation> = if mtp_head_reserved(ctx.spec.mtp) {
+        match ctx.mtp_path.clone() {
+            // An explicit CLI path is always a standalone sidecar file.
+            Some(path) => Some(MtpHeadLocation::Sidecar(path)),
+            None => resolve_mtp_head_file(trunk),
+        }
+    } else {
+        None
+    };
+    draft_device_reserve_bytes(mtp_head.as_ref(), dflash_draft)
+}
+
 fn placement_capacity_inputs(
     hfq: &HfqFile,
     config: &Qwen35Config,
     ctx: &LoadCtx,
     plan: &Qwen35KvPlan,
 ) -> Result<PlacementCapacity, String> {
-    // Capped sizing query (UMA-safe clamp, then the HIPFIRE_EMU cap).
-    let free_vram = ctx
+    // Planned capacity (total - own - reserve; UMA/emu keep their capped free
+    // figure): a transient foreign allocation must not change placement.
+    let planned = ctx
         .gpu
-        .device_mem_info()
-        .map_err(|e| format!("Qwen pre-weight VRAM query: {e}"))?
-        .0 as u64;
+        .planned_capacity()
+        .map_err(|e| format!("Qwen pre-weight VRAM query: {e}"))?;
+    eprintln!("qwen35: admission decision: weight/KV placement capacity from {planned}");
+    let free_vram = planned.bytes as u64;
     let rows = plan.dims.physical_cap.unwrap_or(plan.dims.max_seq);
     let stride =
         crate::qwen35::prefill::vmm_kv_token_bytes(config, plan.pair, plan.adaptive.is_some())
@@ -338,23 +361,8 @@ fn placement_capacity_inputs(
     // when the load will actually attach it (`mtp_head_reserved`): under
     // `auto` this producer declares no measured AR floor, so no head loads
     // and nothing is reserved.
-    let mtp_head: Option<MtpHeadLocation>;
-    let dflash_draft: Option<&std::path::Path> = ctx.draft_path.map(std::path::Path::new);
-    if mtp_head_reserved(ctx.spec.mtp) {
-        mtp_head = match ctx.mtp_path.clone() {
-            // An explicit CLI path is always a standalone sidecar file.
-            Some(path) => Some(MtpHeadLocation::Sidecar(path)),
-            None => resolve_mtp_head_file(hfq.path()),
-        };
-    } else {
-        // MTP not admitted (explicit off, or `auto` without a measured AR
-        // floor): the head will not load. A DFlash draft is still charged when
-        // named — the slots route runs its DFlash2 chain independently of the
-        // MTP gate.
-        mtp_head = None;
-    }
     // (DSpark is a DeepSeek4 module and never attaches here.)
-    let draft_reservation = draft_device_reserve_bytes(mtp_head.as_ref(), dflash_draft);
+    let draft_reservation = load_draft_reserve_bytes(hfq.path(), ctx);
     let layer_bytes = crate::qwen35::load::qwen35_layer_bytes(hfq, config);
     let inputs = offload::CapacityInputs {
         free_vram,
@@ -511,11 +519,13 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     // expanded tensors) already own VRAM, while KV and lazy PBS do not.
     if let Some(mut sequence) = ctx.sequence {
         let reserve = sequence.reserve_bytes;
-        let capacity = (|| -> Result<(usize, usize, usize, usize), String> {
-            let (free, _) = ctx
+        let capacity = (|| -> Result<(usize, usize, usize, usize, u64), String> {
+            let planned = ctx
                 .gpu
-                .device_mem_info()
+                .planned_capacity()
                 .map_err(|e| format!("Qwen post-weight VRAM query: {e}"))?;
+            eprintln!("qwen35: admission decision: max_seq/KV budget capacity from {planned}");
+            let free = planned.bytes;
             let minimum =
                 crate::qwen35::prefill::minimum_prefill_reservation_bytes(&config, &ctx.gpu.arch)
                     .ok_or("Qwen minimum PBS sizing overflow")?;
@@ -525,14 +535,16 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
                 plan.adaptive.is_some(),
             )
             .ok_or("Qwen KV stride overflow")?;
+            let draft_reserve = load_draft_reserve_bytes(hfq.path(), ctx);
             let card_cap = free
                 .saturating_sub(minimum)
                 .saturating_sub(reserve)
                 .saturating_sub(128 << 20)
+                .saturating_sub(usize::try_from(draft_reserve).unwrap_or(usize::MAX))
                 / stride;
-            Ok((free, minimum, stride, card_cap))
+            Ok((free, minimum, stride, card_cap, draft_reserve))
         })();
-        let (free, minimum, stride, card_cap) = match capacity {
+        let (free, minimum, stride, card_cap, draft_reserve) = match capacity {
             Ok(v) => v,
             Err(e) => {
                 weights.free_gpu(ctx.gpu);
@@ -540,7 +552,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
             }
         };
         eprintln!(
-            "max_seq budget: free_after_weights={free} min_prefill={minimum} vision_reserve={reserve} page_rounding={} kv_bytes_per_token={stride}",
+            "max_seq budget: free_after_weights={free} min_prefill={minimum} vision_reserve={reserve} draft_reserve={draft_reserve} page_rounding={} kv_bytes_per_token={stride}",
             128 << 20,
         );
         if sequence.automatic {
@@ -688,17 +700,25 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
     )
     .map_err(|e| e.to_string())?;
     let mode = pair.k();
-    match pair {
-        kv_mode::KvPair::Native(_) => eprintln!(
-            "  KV cache: requested mode={mode_raw}, effective KV={}",
+    let effective = match pair {
+        kv_mode::KvPair::Native(_) => kv_mode::qwen_k_display_name(mode).to_string(),
+        kv_mode::KvPair::Split(_, v) => format!(
+            "K={} V={}",
             kv_mode::qwen_k_display_name(mode),
+            kv_mode::qwen_v_display_name(v),
         ),
+    };
+    match pair {
+        kv_mode::KvPair::Native(_) => {
+            eprintln!("  KV cache: requested mode={mode_raw}, effective KV={effective}")
+        }
         kv_mode::KvPair::Split(_, v) => eprintln!(
             "  KV cache: requested mode={mode_raw}, effective K={}, effective V={}",
             kv_mode::qwen_k_display_name(mode),
             kv_mode::qwen_v_display_name(v),
         ),
     }
+    hipfire_config::load_summary::note(hipfire_config::load_summary::Facet::Kv, effective);
 
     validate_native_kv_admission(mode, config, ctx, adaptive_req.is_some(), v_raw.is_some())?;
     validate_adaptive_cask_handoff(

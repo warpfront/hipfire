@@ -33,6 +33,12 @@ pub enum ChatEvent {
     Usage {
         completion_tokens: usize,
     },
+    /// Prefill progress (`: prefill <done>/<total>` SSE comment): prompt
+    /// tokens processed so far, before the first content/reasoning arrives.
+    PrefillProgress {
+        done: u64,
+        total: u64,
+    },
     Done,
     Error(String),
 }
@@ -71,6 +77,9 @@ fn chat_event_for(event: OpenAiSseEvent) -> Option<ChatEvent> {
             .map(|n| ChatEvent::Usage {
                 completion_tokens: n as usize,
             }),
+        OpenAiSseEvent::PrefillProgress { done, total } => {
+            Some(ChatEvent::PrefillProgress { done, total })
+        }
         OpenAiSseEvent::Role { .. }
         | OpenAiSseEvent::ToolCall { .. }
         | OpenAiSseEvent::Finish { .. }
@@ -234,5 +243,36 @@ mod tests {
             )),
             "usage chunk must produce a Usage event: {events:?}"
         );
+    }
+
+    #[test]
+    fn sse_prefill_comment_yields_prefill_progress_event() {
+        let raw = concat!(
+            ": keepalive\n\n",
+            ": prefill 512/2048\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut events = Vec::new();
+        hipfire_client::read_openai_sse(
+            std::io::Cursor::new(raw.as_bytes()),
+            |ev| {
+                if let Some(e) = chat_event_for(ev) {
+                    events.push(e);
+                }
+                Ok(())
+            },
+            || false,
+        )
+        .expect("well-formed stream");
+        assert!(matches!(
+            &events[0],
+            ChatEvent::PrefillProgress {
+                done: 512,
+                total: 2048
+            }
+        ));
+        assert!(matches!(&events[1], ChatEvent::Content(t) if t == "hi"));
     }
 }

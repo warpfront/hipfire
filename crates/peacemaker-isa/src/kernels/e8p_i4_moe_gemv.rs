@@ -15,8 +15,11 @@
 //! # gfx1100 arm
 //! The gfx1100 arm is the gfx1201 emitter with exactly the architecture-forced deltas, so the gfx1201
 //! emitted text and object are unchanged by construction (every delta is behind `arch.gfx12()`):
-//! workgroup ids are the system SGPRs `s2` (x) and `s3` (y) (`Arch::workgroup_ids(2)`, declared in the
-//! register plan, the qualified `mq_i4_moe_gemv_gfx1100` pattern) instead of `ttmp9` / `ttmp7[15:0]`
+//! workgroup ids are the system SGPRs after the DECLARED user SGPRs (`KernelSpec::workgroup_ids`, declared in the
+//! register plan, the qualified `mq_i4_moe_gemv_gfx1100` pattern; gfx1100's `FeatureUserSGPRInit16Bug` pads the
+//! user SGPRs to user + system >= 16, so x / y are `s14` / `s15` and the `_t8` entries' x / y / z are
+//! `s13` / `s14` / `s15`, and the kernarg pointer block moves from `s[8:15]` to `s[88:95]`; gfx1151 keeps `s2` / `s3`
+//! (/ `s4`) and `s[8:15]`) instead of `ttmp9` / `ttmp7[15:0]`
 //! (the y mask does not exist: the system SGPR is the whole id); the F16 scale widening keeps the
 //! qualified `v_cvt_f32_f16_e64 vD, vD.l` spelling of both architectures; the barrier is the builder's
 //! `s_barrier` and the waits are the builder-inserted gfx11 `s_waitcnt` / `s_waitcnt_depctr` /
@@ -239,18 +242,18 @@ pub fn module_specs(arch: Arch) -> Vec<Spec> {
 }
 
 // ----------------------------------------------------------------------- SGPRs
-// s0:1 kernarg pointer; gfx1201 workgroup ids are ttmp9 (x) and ttmp7[15:0] (y); gfx1100 ids are the
-// system SGPRs s2 (x) / s3 (y) after the two user SGPRs.
+// s0:1 kernarg pointer; gfx1201 workgroup ids are ttmp9 (x) and ttmp7[15:0] (y); gfx1100 / gfx1151 ids are the
+// system SGPRs after the declared user SGPRs: s2 (x) / s3 (y) (/ s4 z) on gfx1151, and on gfx1100, whose
+// `FeatureUserSGPRInit16Bug` pads the user SGPRs to user + system >= 16 (`Arch::declared_user_sgprs`),
+// s14 / s15 (x / y, no z entry) and s13 / s14 / s15 (x / y / z, the `_t8` entries).
 /// User SGPRs: the kernarg pointer pair.
 const USER_SGPRS: u8 = 2;
 const KARG: u8 = 0;
-const WGX: u8 = USER_SGPRS;
-const WGY: u8 = USER_SGPRS + 1;
-/// Kernargs (s_load_b256 @0, b256 @0x20, b128 @0x40, b64 @0x50).
+/// Kernargs (s_load_b256 @0, b256 @0x20, b128 @0x40, b64 @0x50): `Lay::wptrs()`, `+2`, `+4`, `+6`.
+/// gfx1151 keeps them at s8..15; gfx1100's workgroup ids occupy s13..15, so the block lives past the plan's
+/// other SGPRs, at s[88:95] ([`Lay::sgprs`] 96).
 const WPTRS: u8 = 8;
-const EIDS: u8 = 10;
-const OFFS: u8 = 12;
-const SLOTS: u8 = 14;
+const WPTRS_GFX1100: u8 = 88;
 const XROT: u8 = 16;
 const Y0: u8 = 18;
 const Y1: u8 = 20;
@@ -297,8 +300,11 @@ const ROWM: u8 = 78;
 const ROWIN: u8 = 79;
 /// Eight literal staging SGPRs of the LUT stage.
 const LITS: u8 = 80;
-/// SGPRs the plan declares (the honest ceiling, `sgpr_max` of the contract).
+/// SGPRs the plan declares (the honest ceiling, `sgpr_max` of the contract) on gfx1151 / gfx1201; gfx1100 declares
+/// [`SGPRS_GFX1100`] (the relocated kernarg pointer block, [`WPTRS_GFX1100`]).
 pub const SGPRS: u8 = 88;
+/// SGPRs the gfx1100 plan declares.
+pub const SGPRS_GFX1100: u8 = WPTRS_GFX1100 + 8;
 /// `n_experts@88`, the extent of the `expert_weight_ptrs` table: `s4`, the first SGPR after the system workgroup ids,
 /// which no other instruction of the entry touches (the plan's SGPR ceiling and the physical assignment of every
 /// other register are unchanged). An `expert_ids` entry at or past it is never used to index the table.
@@ -306,9 +312,8 @@ const SNEXP: u8 = 4;
 /// The uniform wave index of the eight-output-wave entry (`tid >> 5` via `v_readfirstlane_b32`): `s5`, a gfx12
 /// SGPR no other instruction of the entry names (declared in the plan only for that entry).
 const WAVE: u8 = 5;
-/// Tiled gfx11 z id occupies s4; move the expert extent to the otherwise unused s6.
+/// Tiled gfx1151 z id occupies s4; move the expert extent to the otherwise unused s6.
 const TILE_NEXP: u8 = 6;
-const WGZ: u8 = USER_SGPRS + 2;
 const TILE: u8 = 7;
 /// Fixed union descriptor capacity and byte stride, including both codec buckets.
 const TILE_SLOTS: u32 = 80;
@@ -320,6 +325,7 @@ const LANE: u8 = 0;
 /// VGPR layout of one entry, assigned sequentially so no range can overlap.
 #[derive(Clone, Copy, Debug)]
 struct Lay {
+    arch: Arch,
     /// Eight-output-wave workgroup (`Lay::lane` is then `tid & 31`, not the work-item id).
     rows8: bool,
     rowtiles: bool,
@@ -389,6 +395,7 @@ impl Lay {
         let ya = take(MAX_SLOTS as u8, 1);
         let end = n.div_ceil(8) * 8;
         Self {
+            arch: spec.arch,
             rows8,
             rowtiles: false,
             // The lane index: the work-item id in the one-wave entry; `tid & 31`, held in `x_address`
@@ -420,6 +427,43 @@ impl Lay {
             xo,
             ya,
             end,
+        }
+    }
+    /// First SGPR of the gfx11 workgroup ids: the declared user SGPRs (`Arch::declared_user_sgprs`; the `_t8` entries
+    /// also enable the z id).
+    fn wg_x(&self) -> u8 {
+        let system = if self.rowtiles { 3 } else { 2 };
+        self.arch.declared_user_sgprs(USER_SGPRS, system)
+    }
+    fn wg_y(&self) -> u8 {
+        self.wg_x() + 1
+    }
+    fn wg_z(&self) -> u8 {
+        self.wg_x() + 2
+    }
+    /// The `expert_weight_ptrs` / `expert_ids` / `expert_offsets` / `slot_ids` kernarg block (`s_load_b256`).
+    fn wptrs(&self) -> u8 {
+        if self.arch.min_user_system_sgprs() > 0 {
+            WPTRS_GFX1100
+        } else {
+            WPTRS
+        }
+    }
+    fn eids(&self) -> u8 {
+        self.wptrs() + 2
+    }
+    fn offs(&self) -> u8 {
+        self.wptrs() + 4
+    }
+    fn slots(&self) -> u8 {
+        self.wptrs() + 6
+    }
+    /// SGPRs the plan declares.
+    fn sgprs(&self) -> u8 {
+        if self.arch.min_user_system_sgprs() > 0 {
+            SGPRS_GFX1100
+        } else {
+            SGPRS
         }
     }
     fn label(&self, spec: Spec, name: &str) -> String {
@@ -455,18 +499,18 @@ fn declare(regs: &mut RegPlan, name: &str, kind: RKind, base: u8, len: u8) -> R 
     Ok(())
 }
 fn plan(l: &Lay, arch: Arch) -> Result<RegPlan, String> {
-    let mut regs = RegPlan::new(u16::from(l.end), u16::from(SGPRS))?;
+    let mut regs = RegPlan::new(u16::from(l.end), u16::from(l.sgprs()))?;
     if !arch.gfx12() {
-        for (name, base) in [("workgroup_id_x", WGX), ("workgroup_id_y", WGY)] {
+        for (name, base) in [("workgroup_id_x", l.wg_x()), ("workgroup_id_y", l.wg_y())] {
             declare(&mut regs, name, RKind::S, base, 1)?;
         }
         if l.rowtiles {
-            declare(&mut regs, "workgroup_id_z", RKind::S, WGZ, 1)?;
+            declare(&mut regs, "workgroup_id_z", RKind::S, l.wg_z(), 1)?;
         }
     }
     for (name, base, len) in [
         ("kernarg", KARG, 2),
-        ("kernel_arguments_ptrs", WPTRS, 8),
+        ("kernel_arguments_ptrs", l.wptrs(), 8),
         ("kernel_arguments_x_y_m_k", XROT, 8),
         ("kernel_arguments_u_c_div_src", SU, 4),
         ("kernel_arguments_strides", SXSTR, 2),
@@ -815,7 +859,7 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
             &[],
         )?;
     }
-    smem(b, WPTRS, 8, KARG, 0)?;
+    smem(b, l.wptrs(), 8, KARG, 0)?;
     smem(b, XROT, 8, KARG, 0x20)?;
     smem(b, SU, 4, KARG, 0x40)?;
     smem(b, SXSTR, 2, KARG, 0x50)?;
@@ -836,12 +880,17 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
         sop(b, format!("s_and_b32 s{UIDX}, ttmp7, 0xffff"), &[UIDX], &[])?;
     } else {
         // gfx11 workgroup ids are system SGPRs (after the user SGPRs), not ttmp registers.
-        let ids = a.workgroup_ids(USER_SGPRS)?;
-        if (ids.x, ids.y) != (WgIdSource::Sgpr(WGX), WgIdSource::Sgpr(WGY)) {
+        let ids = b.spec.workgroup_ids(l.rowtiles)?;
+        if (ids.x, ids.y) != (WgIdSource::Sgpr(l.wg_x()), WgIdSource::Sgpr(l.wg_y())) {
             return Err(format!("unexpected workgroup id ABI {ids:?}"));
         }
         if l.rows8 {
-            sop(b, format!("s_lshl_b32 s{ROW}, s{WGX}, 3"), &[ROW], &[WGX])?;
+            sop(
+                b,
+                format!("s_lshl_b32 s{ROW}, s{}, 3", l.wg_x()),
+                &[ROW],
+                &[l.wg_x()],
+            )?;
             sop(
                 b,
                 format!("{} s{ROW}, s{ROW}, s{WAVE}", s_add_i32(a)),
@@ -849,15 +898,30 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
                 &[ROW, WAVE],
             )?;
         } else {
-            sop(b, format!("s_mov_b32 s{ROW}, s{WGX}"), &[ROW], &[WGX])?;
+            sop(
+                b,
+                format!("s_mov_b32 s{ROW}, s{}", l.wg_x()),
+                &[ROW],
+                &[l.wg_x()],
+            )?;
         }
-        sop(b, format!("s_mov_b32 s{UIDX}, s{WGY}"), &[UIDX], &[WGY])?;
+        sop(
+            b,
+            format!("s_mov_b32 s{UIDX}, s{}", l.wg_y()),
+            &[UIDX],
+            &[l.wg_y()],
+        )?;
     }
     if l.rowtiles {
         if a.gfx12() {
             sop(b, format!("s_lshr_b32 s{TILE}, ttmp7, 16"), &[TILE], &[])?;
         } else {
-            sop(b, format!("s_mov_b32 s{TILE}, s{WGZ}"), &[TILE], &[WGZ])?;
+            sop(
+                b,
+                format!("s_mov_b32 s{TILE}, s{}", l.wg_z()),
+                &[TILE],
+                &[l.wg_z()],
+            )?;
         }
         // A dead tile/domain exits before any descriptor or table access, uniformly.
         sop(b, format!("s_cmp_eq_u32 s{SC}, 0"), &[], &[SC])?;
@@ -883,7 +947,7 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
             &[TMP],
             &[TILE],
         )?;
-        for ptr in [EIDS, OFFS, SLOTS] {
+        for ptr in [l.eids(), l.offs(), l.slots()] {
             add64(b, ptr, ptr, TMP)?;
         }
     }
@@ -895,9 +959,9 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
     // offsets[u], offsets[u+1] and the expert id; the expert's tensor pointer from the table.
     sop(b, format!("s_lshl_b32 s{TMP}, s{UIDX}, 2"), &[TMP], &[UIDX])?;
-    add64(b, TPTR, OFFS, TMP)?;
+    add64(b, TPTR, l.offs(), TMP)?;
     smem(b, OFF0, 2, TPTR, 0)?;
-    add64(b, TPTR, EIDS, TMP)?;
+    add64(b, TPTR, l.eids(), TMP)?;
     smem(b, EID, 1, TPTR, 0)?;
     sop(
         b,
@@ -936,7 +1000,7 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
     )?;
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
     sop(b, format!("s_lshl_b32 s{TMP}, s{EID}, 3"), &[TMP], &[EID])?;
-    add64(b, TPTR, WPTRS, TMP)?;
+    add64(b, TPTR, l.wptrs(), TMP)?;
     smem(b, WPTR, 2, TPTR, 0)?;
     // Group count, row bytes (K/4) and the row's word and scale pointers (scales follow the M*K/4 word bytes).
     sop(
@@ -1132,7 +1196,7 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
         &[p],
         &[],
     )?;
-    gload(b, "global_load_b32", sid, p, SLOTS, "")?;
+    gload(b, "global_load_b32", sid, p, l.slots(), "")?;
     if l.rowtiles {
         // Each wave reads the same eight slot lanes (inactive lanes duplicate the final
         // live slot). A bad absolute slot therefore exits the entire workgroup before

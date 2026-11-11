@@ -776,6 +776,19 @@ pub(crate) fn zero_acc(b: &mut Builder, g: &Gen) -> Result<(), String> {
     Ok(())
 }
 
+/// Kernel arguments, CTA raster, out-of-range exits, scalars and hoisted lane offsets: everything
+/// before block 0's staging.
+pub(crate) fn pre(wg: &mut Wg, g: &Gen, end: &End) -> Result<(), String> {
+    front(wg.isa(), g)?;
+    // Tiles past the problem exit (none for the host grid; kept for safety).
+    let outside = wg.scmp_wg_uniform(outside_insn(g, 0)?)?;
+    wg.exit_if(outside, end)?;
+    let outside = wg.scmp_wg_uniform(outside_insn(g, 1)?)?;
+    wg.exit_if(outside, end)?;
+    scalars(wg.isa(), g)?;
+    lanes(wg.isa(), g)
+}
+
 pub(crate) fn emit(
     wg: &mut Wg,
     g: &Gen,
@@ -787,14 +800,7 @@ pub(crate) fn emit(
         Ring<MetaS, Free, Free>,
     ),
 ) -> Result<Lds, String> {
-    front(wg.isa(), g)?;
-    // Tiles past the problem exit (none for the host grid; kept for safety).
-    let outside = wg.scmp_wg_uniform(outside_insn(g, 0)?)?;
-    wg.exit_if(outside, end)?;
-    let outside = wg.scmp_wg_uniform(outside_insn(g, 1)?)?;
-    wg.exit_if(outside, end)?;
-    scalars(wg.isa(), g)?;
-    lanes(wg.isa(), g)?;
+    pre(wg, g, end)?;
 
     // Block 0: slab 0 (K32 half 0 now, half 1 after half 0 is published), token plane 0, row plane 0.
     let a0r = g.srd_a[0];

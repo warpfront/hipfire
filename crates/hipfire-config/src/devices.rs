@@ -112,6 +112,18 @@ impl UncertifiedPlatform {
 pub const UNSAFE_WSL_REDLINE: &str = "HIPFIRE_UNSAFE_WSL_REDLINE";
 /// Process knob that admits VMM KV under WSL/ROCDXG; unsafe until certified.
 pub const UNSAFE_WSL_VMM_KV: &str = "HIPFIRE_UNSAFE_WSL_VMM_KV";
+/// Developer kill switch (default on) for Qwen4 (Flash-Next) VMM QSA context
+/// arenas and the VMM gather/split-KV workspace on exact gfx1100. `0` restores
+/// the legacy `hipMalloc` arenas and the legacy exact-size gather slot; unset
+/// or `1` admits VMM like gfx1151/gfx1201. Read by the Qwen4 VMM capability
+/// check and `Gpu::qsa_gather_vmm_capable`.
+pub const QWEN4_VMM_GFX1100: &str = "HIPFIRE_QWEN4_VMM_GFX1100";
+
+/// Whether Qwen4 VMM is admitted on gfx1100: [`QWEN4_VMM_GFX1100`] is not `0`
+/// in this process.
+pub fn qwen4_vmm_gfx1100_enabled() -> bool {
+    crate::developer_bool(QWEN4_VMM_GFX1100, true)
+}
 
 /// Why Redline PM4 (retained default or explicit backend) is refused on
 /// `platform`, or `None` when it may run. Native Windows has no ROCr, so no
@@ -1164,6 +1176,23 @@ mod tests {
     use crate::{resolve, ConfigLayer, ConfigSource, NamedLayer};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `HIPFIRE_QWEN4_VMM_GFX1100` is the `developer_bool` contract at default
+    /// on: only `0` disables Qwen4 VMM on gfx1100.
+    #[test]
+    fn qwen4_vmm_gfx1100_switch_is_default_on_and_zero_disables() {
+        assert_eq!(QWEN4_VMM_GFX1100, "HIPFIRE_QWEN4_VMM_GFX1100");
+        assert!(crate::parse_developer_bool(None, true));
+        assert!(crate::parse_developer_bool(Some("1"), true));
+        assert!(!crate::parse_developer_bool(Some("0"), true));
+        for other in ["", "off", "false", "2"] {
+            assert!(crate::parse_developer_bool(Some(other), true), "{other:?}");
+        }
+        // The live snapshot of a test process leaves the switch unset.
+        if std::env::var_os(QWEN4_VMM_GFX1100).is_none() {
+            assert!(qwen4_vmm_gfx1100_enabled());
+        }
+    }
 
     struct Topology(PathBuf);
 

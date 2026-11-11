@@ -51,6 +51,14 @@ const SRD_SLOT: u8 = 40;
 const TILE16: u8 = 47;
 const WAVE: u8 = 48;
 const RBASE: u8 = 49;
+/// Real user SGPRs (the kernarg pointer) and enabled system SGPRs (workgroup ids X, Y).
+const USER_SGPRS: u8 = 2;
+const SYSTEM_SGPRS: u8 = 2;
+/// gfx1100 `FeatureUserSGPRInit16Bug`: the descriptor declares user SGPRs padded to user + system = 16, so the
+/// native workgroup ids are s14 (x) and s15 (y) (`s8:11` and `s16:` are clear of them).
+const DECLARED_USER_SGPRS: u8 = Arch::Gfx1100.declared_user_sgprs(USER_SGPRS, SYSTEM_SGPRS);
+pub const WG_X_IN: u8 = DECLARED_USER_SGPRS;
+pub const WG_Y_IN: u8 = DECLARED_USER_SGPRS + 1;
 
 /// Entry symbol, e.g. `qwen4_moe_epilogue_fixture_gate_up_wrongsel_gfx1100`.
 pub fn symbol(kind: Kind, wrong_pack_selector: bool) -> String {
@@ -83,8 +91,8 @@ fn plan(kind: Kind, wrong: bool) -> Result<RegPlan, String> {
         p.v::<8>("sum_up", SUM + 8, Live::Whole)?;
     }
     p.s::<2>("kernarg_ptr", KARG, Live::Whole)?;
-    p.s::<1>("wg_x_in", 2, Live::Whole)?;
-    p.s::<1>("wg_y_in", 3, Live::Whole)?;
+    p.s::<1>("wg_x_in", WG_X_IN, Live::Whole)?;
+    p.s::<1>("wg_y_in", WG_Y_IN, Live::Whole)?;
     p.s::<1>("s_tmp0", T0, kernel())?;
     p.s::<1>("s_tmp1", T1, kernel())?;
     p.s::<4>("args_ptrs", SUMS, kernel())?;
@@ -127,7 +135,7 @@ fn builder(kind: Kind, wrong_pack_selector: bool) -> Result<Builder, String> {
             .pointer("slots", 8)
             .pointer("Y_grouped", 16)
             .hidden("M", 24, 4, "by_value"),
-        user_sgpr_count: 2,
+        user_sgpr_count: USER_SGPRS,
         system_sgpr_workgroup_id_y: true,
         workgroup_size: if kind == Kind::GateUp { 64 } else { 128 },
         group_segment_fixed_size: 0,
@@ -145,7 +153,7 @@ pub fn emit_prologue(b: &mut Builder, kind: Kind) -> Result<(), String> {
     smem(b, SUMS, 4, KARG, 0)?;
     smem(b, Y_PTR, 2, KARG, 0x10)?;
     smem(b, M, 1, KARG, 0x18)?;
-    // v1 = wave, v2 = lane, v3 = lr, v4 = hi (workgroup ids in s2/s3 on gfx11).
+    // v1 = wave, v2 = lane, v3 = lr, v4 = hi (workgroup ids in s14/s15 on gfx1100, see WG_X_IN).
     op(b, "v_lshrrev_b32_e32 v1, 5, v0", &[v(1)], &[v(0)])?;
     op(b, "v_and_b32_e32 v2, 31, v0", &[v(2)], &[v(0)])?;
     op(
@@ -156,13 +164,18 @@ pub fn emit_prologue(b: &mut Builder, kind: Kind) -> Result<(), String> {
     )?;
     op(b, "v_and_b32_e32 v3, 15, v2", &[v(3)], &[v(2)])?;
     op(b, "v_lshrrev_b32_e32 v4, 4, v2", &[v(4)], &[v(2)])?;
-    sop(b, format!("s_lshl_b32 s{TILE16}, s3, 4"), &[TILE16], &[3])?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{TILE16}, s{WG_Y_IN}, 4"),
+        &[TILE16],
+        &[WG_Y_IN],
+    )?;
     let shift = if kind == Kind::GateUp { 5 } else { 6 };
     sop(
         b,
-        format!("s_lshl_b32 s{RBASE}, s2, {shift}"),
+        format!("s_lshl_b32 s{RBASE}, s{WG_X_IN}, {shift}"),
         &[RBASE],
-        &[2],
+        &[WG_X_IN],
     )?;
     sop(b, format!("s_lshl_b32 s{T0}, s{WAVE}, 4"), &[T0], &[WAVE])?;
     sop(

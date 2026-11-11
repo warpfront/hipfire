@@ -105,9 +105,10 @@
 //! penalties), `HIPFIRE_SAMPLED_MTP_TRIALS` (>= 2000) cold trials per arm.
 //! These arms follow the product switch: `copy` is
 //! `hipfire_config::mtp_ngram_copy_enabled_for_arch` of the loaded GPU
-//! (`speculation.mtp_ngram_copy` / `HIPFIRE_MTP_NGRAM_COPY`, off by default:
-//! the native-MTP n-gram takeover; `HIPFIRE_MTP_NGRAM_COPY=on` runs them on
-//! the copy lane). The mode is recorded as `copy_lane` in every arm's config,
+//! (`speculation.mtp_ngram_copy` / `HIPFIRE_MTP_NGRAM_COPY`; `auto` is the
+//! copy lane on gfx1151 / gfx1201 and the native-MTP 5/3/3 takeover elsewhere;
+//! `HIPFIRE_MTP_NGRAM_COPY=off` runs them on the 5/3/3 pool, `on` on the copy
+//! lane). The mode is recorded as `copy_lane` in every arm's config,
 //! and the parent resolves it from each arm's receipt GPU, so ids of one mode
 //! are never reused as the other's:
 //!
@@ -253,6 +254,190 @@
 //! run `sampled_mtp_late_arm` directly per shard / per arm (`late_ar`,
 //! `late_adaptive`) to fit fabric holds, then the aggregate test reuses every
 //! config-verified shard and runs only the missing ranges.
+//!
+//! # PP2 topology arms (sampled Leviathan MTP under `topology.pp`)
+//!
+//! `HIPFIRE_SAMPLED_MTP_TOPOLOGY=pp2` runs the four short arms (`ar`,
+//! `batched`, `interleaved`, `adaptive`) of the chi-square above on a two-card
+//! pipeline mesh instead of one card, so sampled Leviathan MTP on `topology.pp`
+//! is compared with AR sampling in distribution (unset or `single` keeps the
+//! one-card arms, byte for byte unchanged). Both arms of the comparison load
+//! the SAME artifact through the product loader (`hipfire_loader::load_model`
+//! with `pp = 2`, the daemon's own mesh load, native MTP head attached on every
+//! arm so placement and reserves match): the `ar` arm is PP AR (`pp_prefill_final`
+//! / `pp_forward_token_or_argmax` logits on the output band's card, the
+//! production host sampler `sample_cpu`, per-trial `reset_cpu_sampler_rng`);
+//! the MTP arms drive `pp_mtp_reset` / `pp_mtp_prefill` / `pp_mtp_step`, the
+//! entries the daemon's spec loop calls. A 2xR9700 box cannot hold the
+//! mq3-xts / mq4-xts artifact on one card, so the PP2 `ar` arm is the
+//! reference there (AR on one mesh and AR on one card are the same target law;
+//! compare the PP2 AR arm with the one-card `ar` arm on the gptq3 artifact
+//! separately if that cross-check is wanted). Everything else is the file's
+//! own machinery: shards (`HIPFIRE_SAMPLED_MTP_SHARD`), merge
+//! (`sampled_mtp_merge_short_shards`), per-position marginals and (t1, t2)
+//! joint chi-square at `ALPHA`, evidence/coverage checks, config sidecars and
+//! the replay of the first `REPLAYS` seeds on the forced floor-off arms (the
+//! PP verify is deterministic, so a replay mismatch is a finding).
+//!
+//! The model is whatever `HIPFIRE_MTP_IDENTITY_MODEL` names (the 2xR9700
+//! mq3-xts or mq4-xts artifact, or the gptq3 mq4 one); the topology and
+//! `HIPFIRE_PP_LAYERS` (band layer counts in logical band order, summing to
+//! the trunk layer count; unset = the loader's uniform split) are `HIPFIRE_*`
+//! variables, so they are part of every arm's recorded identity and a result
+//! produced under another split or topology is a hard config mismatch, never
+//! reused. Only the four short arms take a PP2 topology (every other arm fails
+//! naming the variable). The PP2 arms run neutral penalties only (penalized
+//! sampled requests decode AR under PP and `HIPFIRE_MTP_SAMPLED_MODE=naive` is
+//! refused there); do not set `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` (the PP load
+//! refuses host-mapped experts), and leave both cards visible (no
+//! `ROCR_VISIBLE_DEVICES=0` restriction). Run from the repository root:
+//!
+//! ```sh
+//! export MODEL=/path/to/qwen3.8-flash-next.mq3-xts   # or the mq4-xts / gptq3 mq4 artifact
+//! export OUT=/tmp/pp2-sampled
+//! export HIPFIRE_MTP_IDENTITY_MODEL="$MODEL" HIPFIRE_SAMPLED_MTP_OUT="$OUT"
+//! export HIPFIRE_SAMPLED_MTP_TOPOLOGY=pp2
+//! # export HIPFIRE_PP_LAYERS=24,24      # optional band split, logical band order
+//! export HIPFIRE_SAMPLED_MTP_TRIALS=2000 HIPFIRE_SAMPLED_MTP_PROMPT=prose
+//! export HIPFIRE_MTP_SAMPLED=1 HIPFIRE_MTP_SAMPLED_MODE=leviathan
+//! unset HIPFIRE_MTP_TRACE HIPFIRE_MTP_PHASE_TIMING HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS
+//! T="cargo test --release -p hipfire-arch-qwen4 --test sampled_mtp_distribution_hw"
+//! # Per arm, per shard (disjoint START..END ranges covering 0..2000; seeds are global):
+//! export HIPFIRE_SAMPLED_MTP_SHARD=0..100
+//! export HIPFIRE_SAMPLED_MTP_ARM=ar
+//! unset HIPFIRE_MTP_INCREMENTAL HIPFIRE_MTP_AR_FLOOR
+//! $T sampled_mtp_distribution_arm -- --exact --ignored --nocapture --test-threads=1
+//! export HIPFIRE_SAMPLED_MTP_ARM=batched HIPFIRE_MTP_INCREMENTAL=0 HIPFIRE_MTP_AR_FLOOR=0
+//! $T sampled_mtp_distribution_arm -- --exact --ignored --nocapture --test-threads=1
+//! export HIPFIRE_SAMPLED_MTP_ARM=interleaved HIPFIRE_MTP_INCREMENTAL=1 HIPFIRE_MTP_AR_FLOOR=0
+//! $T sampled_mtp_distribution_arm -- --exact --ignored --nocapture --test-threads=1
+//! export HIPFIRE_SAMPLED_MTP_ARM=adaptive; unset HIPFIRE_MTP_INCREMENTAL HIPFIRE_MTP_AR_FLOOR
+//! $T sampled_mtp_distribution_arm -- --exact --ignored --nocapture --test-threads=1
+//! # ... repeat the four arms for every shard range, then (CPU only) join the shards:
+//! unset HIPFIRE_SAMPLED_MTP_ARM HIPFIRE_SAMPLED_MTP_SHARD
+//! $T sampled_mtp_merge_short_shards -- --exact --ignored --nocapture
+//! # The verdict (reuses the merged, config-verified whole-arm files):
+//! $T sampled_mtp_matches_ar_distribution_on_flash_next -- --exact --ignored --nocapture
+//! ```
+//!
+//! Expected artifacts in `$OUT`, per arm and shard `<arm>.<START>-<END>`:
+//! `.ids.json` (one `TOKENS`-id row per trial), `.ids.config.json` (config
+//! with the PP identity: `HIPFIRE_SAMPLED_MTP_TOPOLOGY`, `HIPFIRE_PP_LAYERS`,
+//! executable and model hashes), `.ids.receipt.json` (output card's GPU
+//! identity) and, for the MTP arms, `.evidence.json` and `.text.txt`; after the
+//! merge the same names without the range, and `report.txt` from the verdict
+//! test (per-arm marginal and joint chi-square lines; every p-value must exceed
+//! `ALPHA`, coverage failures are reported separately). Run unsharded
+//! (`HIPFIRE_SAMPLED_MTP_SHARD` unset) and the parent test alone spawns the
+//! four arms in fresh processes.
+//!
+//! # Lane suite (`HIPFIRE_SAMPLED_MTP_EXECUTOR=lanes`)
+//!
+//! Compares the continuous-batching lane executor with AR lanes in
+//! distribution. `HIPFIRE_SAMPLED_MTP_EXECUTOR=lanes` (default `singleton`)
+//! selects it; `HIPFIRE_SAMPLED_MTP_LANES=1..8` (any count 1 to 8; required, refused under
+//! `singleton`) is the concurrent request count of a trial;
+//! `HIPFIRE_SAMPLED_MTP_TOPOLOGY` takes `single`, `pp2` or `ep2` (`ep2` only
+//! under the lane executor; the singleton arms stay `single`/`pp2`). The
+//! declared arm set is `lane_ar` (the reference), `lane_batched`
+//! (`HIPFIRE_MTP_INCREMENTAL=0`, `HIPFIRE_MTP_AR_FLOOR=0`), `lane_adaptive`
+//! (floor on, no route knob) and `lane_copy` (copy lane, `HIPFIRE_MTP_NGRAM_COPY=on`,
+//! one-hot copy proposals); there is no `lane_interleaved`. Arms run through the
+//! same exact `sampled_mtp_distribution_arm` test and `START..END` shards, in a
+//! **separate** `HIPFIRE_SAMPLED_MTP_OUT` directory per executor: a lane shard
+//! holds `(END - START) * lanes` rows, lane-minor, and a request's seed depends
+//! on the global trial and lane, never on the slot it ran in.
+//!
+//! `sampled_mtp_merge_short_shards` under `lanes` merges the lane arm set only,
+//! and refuses (writing nothing) a shard set that is mixed or incomplete: it keys
+//! every shard on executor, topology, model artifact hash, lane count, route,
+//! sampling/cohort settings, GDN state format and trial range, requires one key
+//! per arm and one cross-arm key, ranges that tile `0..trials` exactly once, and
+//! every arm of its cohort (all four; under `ep2` the three fixed arms, plus `lane_cross` at 8 lanes: the cohort follows the lane count the shards record). `sampled_mtp_matches_ar_distribution_on_flash_next` under
+//! `lanes` never launches an arm: it judges the merged files (>= 2000 trials)
+//! pooled and per lane against `lane_ar`, plus route coverage from each arm's
+//! evidence. The host-only logic and its CPU tests are `common/lane_suite.rs`
+//! (`cargo test ... --test sampled_mtp_distribution_hw lane_suite`).
+//!
+//! # EP2 lane arms (`lane_ep.rs`)
+//!
+//! Under `HIPFIRE_SAMPLED_MTP_TOPOLOGY=ep2` the cohort is `lane_ar`,
+//! `lane_batched` and `lane_adaptive` (`lane_suite::EP2_FIXED_ARMS`), plus
+//! `lane_cross` at 8 lanes (`lane_suite::EP2_ARMS`). The copy lane is on by
+//! default on EP serve, in steps of at most `lane_suite::EP2_COPY_LANES` (2)
+//! lanes, so `lane_copy` has its own `ep2` cohort at 1 or 2 lanes
+//! (`lane_suite::EP2_COPY_ARMS`: `lane_ar` and `lane_copy`; the directory is
+//! the copy cohort when it holds `lane_copy` results). `lane_copy` stages the
+//! copy lane exactly as the serve does (`ep::ep_default_copy_config`) and runs
+//! the same mesh step; run the cohort with `HIPFIRE_SAMPLED_MTP_PROMPT=copy` (a
+//! verbatim-repetition prompt: the copied-span rewrite request with the
+//! passage's first `COPY_PRIMED` tokens already in the assistant turn, so the
+//! copy matcher proposes on the first window; `lane_copy_prompt` pre-checks
+//! that on the CPU, and every arm of the cohort runs it) and its coverage
+//! fails unless the lane counters show copy windows (takeovers, every one a
+//! point-mass `delta(candidate)` verify). At more than 2 lanes `lane_copy` is
+//! refused (no copy windows exist there). A lane arm process (cards C,B under
+//! `HIPFIRE_TOPOLOGY_EP=2`, one fresh process per arm and shard) loads the
+//! artifact once through the product loader with the serve's `serve.vmm_batch`
+//! lane reservation, stages one lane store and runs its `START..END` trials
+//! through it, recycling the lanes. `lane_ar` is target-only AR lanes (lane
+//! executor AR rows: the reference);
+//! `lane_batched` and `lane_adaptive` are native-MTP mesh lanes
+//! (`Qwen4Bundle::ep_mesh_decode_step`, Leviathan acceptance against each
+//! draft's q, every lane MTP, no copy lane). With
+//! `HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE` on (the default on gfx1201) every sampled
+//! draw of every arm (AR rows, the prompt-completing first token, native and
+//! copy verify windows) is one lane-wide device launch
+//! (`hipfire_runtime::lane_draw::lane_draws`) under the shared device sampler's
+//! law (a copy proposal is a point-mass q); `=0` restores the host sampler. The
+//! arm resolves the route from its loaded `Gpu` and records it as
+//! `lane_suite.lane_draw_route` (`device` or `host`) in its config and merge key,
+//! so ids from one route are a config error under the other, shards of two
+//! routes never merge, and the verdict prints each arm's route and refuses a
+//! cohort that mixes them. The fixed-count MTP arms pin `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8` so
+//! `N` lanes run native windows at every lane count `1..=8` (the step switch would otherwise run
+//! AR windows above `max_active + 1` lanes): they are native-window coverage arms, not the shipped
+//! switching policy. The mesh router calibrates inline, so the
+//! `ep2` adaptive coverage needs native windows and a floor-on route class
+//! (`adaptive-floor` in its recorded config), not a zero-draft first window.
+//!
+//! `lane_cross` (8 lanes, `ep2` only) is the shipped switching policy: native
+//! batched drafting as `lane_batched` (`HIPFIRE_MTP_INCREMENTAL=0`,
+//! `HIPFIRE_MTP_AR_FLOOR=0`) with `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=3` (the shipped
+//! `lane_switch::DEFAULT_MAX_ACTIVE`, pinned so the identity records it; a test
+//! keeps the two equal) and a staggered trial
+//! (`lane_suite::admit_schedule`): the first 3 requests are admitted at tick 0
+//! and the other 5 once the first group has finished its prompt prefill, so the
+//! early lanes' first decode window runs native with 3 active lanes and their
+//! later windows run AR with 8 (`lane_switch::native_mode`: AR from
+//! `max_active + 2` = 5 lanes, 4 lanes is the hold case).
+//! Request `i` is lane `i`. Its evidence adds `crossing_requests` (requests with
+//! both a native and an AR window) and the mesh step occupancy histogram
+//! (`mesh.steps_by_lanes`, occupancy 4 recorded); its coverage fails (a
+//! COVERAGE FAILURE, never a verdict) when no request crossed or the steps never
+//! had occupancy <= 3 and >= 5. It is judged against `lane_ar` exactly like
+//! `lane_batched`: pooled and per lane chi-square over tokens 1..4 and the
+//! joint, with merge key route `cross`.
+//!
+//! The native arms (`lane_batched`, `lane_adaptive`, `lane_cross`) draft at the
+//! lane depth chosen with `HIPFIRE_SAMPLED_MTP_LANE_K` (`2` = the shipped
+//! `ep_lane_spec_k` default, or `3` for the sensitivity run; anything else is
+//! refused): the arm pins `HIPFIRE_EP_MTP_LANE_K` to it, `lane_ar` pins nothing.
+//! The oracle still loads and calls the drafter with `MTP_K=3`; the EP lane store
+//! drafts at `min(3, HIPFIRE_EP_MTP_LANE_K)`. The depth is recorded in every
+//! shard's `lane_suite` block and merge key (a K=2 set never merges with a K=3
+//! set), in the identity environment, and in the evidence (`lane_k`,
+//! `max_offered`, `first_window_offered`): the coverage fails a window that
+//! offered more than K drafts and a run whose first windows never offered K.
+//! Request seeds are the lane suite's `lane_request_seed` truncated to the lane
+//! RNG's 32 bits. Each shard writes `<arm>.<START>-<END>.ids.json`
+//! (`(END - START) * lanes` lane-minor rows), `.ids.config.json`,
+//! `.ids.receipt.json`, `.evidence.json` (window counters classified per window
+//! from the lanes' own counters and cross-checked against the mesh step facts)
+//! and `.text.txt`. The model artifact's identity needs a verified-artifact
+//! cache under `HIPFIRE_HOME` (the test never hashes artifacts) and
+//! `HIPFIRE_FABRIC_ADMISSION` is excluded from the compared identity. Single-card
+//! and PP2 lane arms validate their configuration and refuse explicitly.
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::expert_residency as residency;
@@ -277,6 +462,13 @@ use std::process::{Command, Stdio};
 #[path = "common/hw_identity.rs"]
 mod hw_identity;
 use hw_identity::Counters;
+#[path = "common/lane_ep.rs"]
+mod lane_ep;
+#[path = "common/lane_run.rs"]
+mod lane_run;
+#[path = "common/lane_suite.rs"]
+mod lane_suite;
+use lane_suite::Topology;
 
 const MODEL_ENV: &str = "HIPFIRE_MTP_IDENTITY_MODEL";
 const OUT_ENV: &str = "HIPFIRE_SAMPLED_MTP_OUT";
@@ -295,9 +487,10 @@ const PROMPT_ENV: &str = "HIPFIRE_SAMPLED_MTP_PROMPT";
 const INCREMENTAL_ENV: &str = "HIPFIRE_MTP_INCREMENTAL";
 const SAMPLED_MODE_ENV: &str = "HIPFIRE_MTP_SAMPLED_MODE";
 const FLOOR_ENV: &str = "HIPFIRE_MTP_AR_FLOOR";
-const SHARD_ENV: &str = "HIPFIRE_SAMPLED_MTP_SHARD";
+const SHARD_ENV: &str = lane_suite::SHARD_ENV;
 const LATE_TOKENS_ENV: &str = "HIPFIRE_SAMPLED_MTP_LATE_TOKENS";
 const LATE_ARM_TEST: &str = "sampled_mtp_late_arm";
+const TOPOLOGY_ENV: &str = lane_suite::TOPOLOGY_ENV;
 /// Harness-control variables: they differ between a parent and each child
 /// without changing what the arm computes, so identities exclude them.
 const CONTROL_ENV: [&str; 4] = [MODEL_ENV, OUT_ENV, ARM_ENV, SHARD_ENV];
@@ -320,7 +513,7 @@ const NGRAM_MIN_TRIALS: usize = 2000;
 const NGRAM_ARM_TEST: &str = "sampled_mtp_ngram_distribution_arm";
 /// The AR reference arm of the copied-span fixture.
 const COPY_AR_ARM: &str = "copy_ar";
-const COPY_AR_SALT: u64 = 0xC0A11;
+const COPY_AR_SALT: u64 = lane_suite::SALT_COPY_AR;
 
 /// Copied-span fixture: the user asks for a rewrite that keeps the wording,
 /// and the assistant turn already holds the passage's first `COPY_PRIMED`
@@ -350,37 +543,37 @@ static NGRAM_ARMS: [NgramArm; 6] = [
         name: "ngram_batched",
         reference: "ar",
         copy: false,
-        salt: 0x4E1,
+        salt: lane_suite::SALT_NGRAM_BATCHED,
     },
     NgramArm {
         name: "ngram_interleaved",
         reference: "ar",
         copy: false,
-        salt: 0x4E2,
+        salt: lane_suite::SALT_NGRAM_INTERLEAVED,
     },
     NgramArm {
         name: "ngram_adaptive",
         reference: "ar",
         copy: false,
-        salt: 0x4E3,
+        salt: lane_suite::SALT_NGRAM_ADAPTIVE,
     },
     NgramArm {
         name: "copy_batched",
         reference: COPY_AR_ARM,
         copy: true,
-        salt: 0xC0B1,
+        salt: lane_suite::SALT_COPY_BATCHED,
     },
     NgramArm {
         name: "copy_interleaved",
         reference: COPY_AR_ARM,
         copy: true,
-        salt: 0xC0B2,
+        salt: lane_suite::SALT_COPY_INTERLEAVED,
     },
     NgramArm {
         name: "copy_adaptive",
         reference: COPY_AR_ARM,
         copy: true,
-        salt: 0xC0B3,
+        salt: lane_suite::SALT_COPY_ADAPTIVE,
     },
 ];
 
@@ -447,6 +640,10 @@ enum Fixture {
     Prose,
     Repeat,
     Window,
+    /// The copied-span rewrite request whose assistant turn is primed with the
+    /// passage's first `COPY_PRIMED` tokens (ep2 lane arms only: the priming
+    /// and its pool check are [`lane_copy_prompt`]).
+    Copy,
 }
 
 impl Fixture {
@@ -455,8 +652,9 @@ impl Fixture {
             Err(_) | Ok("prose") => Ok(Self::Prose),
             Ok("repeat") => Ok(Self::Repeat),
             Ok("window") => Ok(Self::Window),
+            Ok("copy") => Ok(Self::Copy),
             Ok(other) => Err(format!(
-                "{PROMPT_ENV}={other}: expected prose, repeat or window"
+                "{PROMPT_ENV}={other}: expected prose, repeat, window or copy"
             )),
         }
     }
@@ -466,6 +664,7 @@ impl Fixture {
             Self::Prose => "prose",
             Self::Repeat => "repeat",
             Self::Window => "window",
+            Self::Copy => "copy",
         }
     }
 
@@ -476,6 +675,7 @@ impl Fixture {
                 "Continue this pattern for as long as you can, writing only the continuation: {}",
                 "red green blue red green blue red green blue ".repeat(24)
             ),
+            Self::Copy => format!("{COPY_INSTRUCTION}{COPY_PASSAGE}"),
             // Head (its distinctive names occur only here), filler, tail: with
             // a 128-token window the head has left the window before the first
             // generated token, and the filler drains out as tokens are added.
@@ -493,6 +693,12 @@ impl Fixture {
 
     /// The window fixture must really cross the penalty window.
     fn check_prompt(self, prompt_tokens: usize, pen: &Penalties) -> Result<(), String> {
+        if self == Self::Copy {
+            return Err(format!(
+                "{PROMPT_ENV}=copy primes the assistant turn and runs only under the ep2 lane arms ({} executor lanes)",
+                lane_suite::EXECUTOR_ENV
+            ));
+        }
         if self == Self::Window && prompt_tokens <= pen.repeat_window.max(128) + TOKENS {
             return Err(format!(
                 "window fixture has only {prompt_tokens} prompt tokens; it must exceed the {} \
@@ -792,6 +998,11 @@ fn homogeneity<K: std::hash::Hash + Eq + Clone>(a: &[K], b: &[K]) -> (f64, usize
 fn sampled_mtp_matches_ar_distribution_on_flash_next() {
     let model = model_path();
     let dir = out_dir();
+    let placement = lane_suite::Placement::from_env().unwrap_or_else(|e| panic!("{e}"));
+    if placement.executor == lane_suite::Executor::Lanes {
+        lane_run::lane_verdict(&model, &dir, placement).unwrap_or_else(|e| panic!("{e}"));
+        return;
+    }
     let model_id = hw_identity::model_identity(&model, &dir).unwrap_or_else(|e| panic!("{e}"));
     let mut samples: Vec<Vec<Vec<u32>>> = Vec::new();
     let settings = DistSettings::from_env().unwrap_or_else(|e| panic!("{e}"));
@@ -1101,28 +1312,7 @@ impl Loaded {
 
     /// [`render`](Self::render) with the thinking switch given.
     fn render_with(&self, text: &str, thinking: bool) -> Result<Vec<u32>, String> {
-        let user = Message {
-            role: Role::User,
-            content: text.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            tool_plan: String::new(),
-        };
-        let rendered = JinjaChatFrame {
-            tokenizer: &self.tokenizer,
-            template: &self.template,
-            system: None,
-            user: text,
-            enable_thinking: thinking,
-            bos_token: None,
-            reasoning_strength: None,
-            reasoning_effort: None,
-        }
-        .render_messages(&[user], None, None)?;
-        Ok(self.tokenizer.encode(&rendered))
+        render_prompt(&self.tokenizer, &self.template, text, thinking)
     }
 
     /// Seeded AR from a cold state with the production host sampler: up to
@@ -1359,6 +1549,13 @@ fn new_drafter_with_max_seq(
 
 fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
     require_arm_env(arm, "leviathan")?;
+    let placement = lane_suite::Placement::from_env()?;
+    if placement.executor == lane_suite::Executor::Lanes {
+        return lane_run::run_lane_arm(arm, model, dir, placement);
+    }
+    if placement.topology == Topology::Pp2 {
+        return run_arm_pp(arm, model, dir);
+    }
     let DistSettings {
         trials,
         temp,
@@ -1377,7 +1574,18 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         (temp, top_p, top_k, min_p),
         trials,
     );
-    let ids_path = dir.join(format!("{arm}.ids.json"));
+    // `HIPFIRE_SAMPLED_MTP_SHARD=START..END` runs a slice of the global trial
+    // indices (seeds stay global) and writes `<arm>.<START>-<END>.*`; unset
+    // keeps the whole-arm `<arm>.*` files. `sampled_mtp_merge_short_shards`
+    // joins shards into the whole-arm files the parent comparison reads.
+    let (start, end) = shard_range(arm, trials)?;
+    let sharded = (start, end) != (0, trials);
+    let stem = if sharded {
+        format!("{arm}.{start}-{end}")
+    } else {
+        arm.to_string()
+    };
+    let ids_path = dir.join(format!("{stem}.ids.json"));
     if ids_path.exists() {
         check_config(&ids_path, &settings_config)?;
     }
@@ -1399,15 +1607,15 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
     );
     println!("ARM {arm} config {settings_config}");
     let started = std::time::Instant::now();
-    let mut samples: Vec<Vec<u32>> = Vec::with_capacity(trials);
+    let mut samples: Vec<Vec<u32>> = Vec::with_capacity(end - start);
     if arm == "ar" {
         let logits = loaded
             .gpu
             .zeros(&[loaded.bundle.config.vocab_size], DType::F32)
             .map_err(|e| e.to_string())?;
         let cfg = ar_sampler(temp, top_p, top_k, min_p, &pen);
-        for trial in 0..trials {
-            let seed = trial_seed(0xA11, trial) as u32;
+        for trial in start..end {
+            let seed = trial_seed(lane_suite::SALT_PROSE_AR, trial) as u32;
             samples.push(loaded.ar_ids(&logits, &prompt, &cfg, seed, TOKENS)?);
         }
         loaded.gpu.free_tensor(logits).map_err(|e| e.to_string())?;
@@ -1419,8 +1627,8 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
             let cfg = spec_request(temp, top_p, top_k, min_p, seed, &pen);
             loaded.mtp_request(&mut drafter, &prompt, cfg, TOKENS)
         };
-        for trial in 0..trials {
-            let seed = trial_seed(0x5EC, trial);
+        for trial in start..end {
+            let seed = trial_seed(lane_suite::SALT_PROSE_MTP, trial);
             let result = run(&mut loaded, seed)?;
             evidence.observe(
                 trial,
@@ -1435,28 +1643,27 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         // Only a forced floor-off route replays byte for byte; the adaptive
         // route's choices depend on wall-clock prices.
         if hw_identity::forced_floor_off(&env) {
-            for trial in 0..REPLAYS.min(trials) {
-                let replay = run(&mut loaded, trial_seed(0x5EC, trial))?;
-                if replay.ids != samples[trial] {
+            let replays = REPLAYS.min(end - start);
+            for local in 0..replays {
+                let trial = start + local;
+                let replay = run(&mut loaded, trial_seed(lane_suite::SALT_PROSE_MTP, trial))?;
+                if replay.ids != samples[local] {
                     return Err(format!(
                         "seed {} replayed {:?}, first run {:?}",
                         trial + 1,
                         replay.ids,
-                        samples[trial]
+                        samples[local]
                     ));
                 }
             }
-            println!(
-                "ARM {arm} replayed {} seeds identically",
-                REPLAYS.min(trials)
-            );
+            println!("ARM {arm} replayed {replays} seeds identically");
         } else {
             println!(
                 "ARM {arm} replay not asserted (route class {}): its routing depends on wall-clock prices",
                 hw_identity::route_class(&env)
             );
         }
-        evidence.write(dir, arm, budget, LATE_MARGINALS[0])?;
+        evidence.write(dir, &stem, budget, LATE_MARGINALS[0])?;
         Box::new(drafter).mtp_free(&mut loaded.gpu);
     }
     // Positions after an EOS read as EOS.
@@ -1464,7 +1671,7 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         ids.resize(TOKENS, eos);
     }
     println!(
-        "ARM {arm} {trials} trials in {:.1}s; first sample: {:?}",
+        "ARM {arm} trials {start}..{end} in {:.1}s; first sample: {:?}",
         started.elapsed().as_secs_f64(),
         loaded.tokenizer.decode(&samples[0])
     );
@@ -1479,6 +1686,533 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         .bundle
         .free_gpu(&mut loaded.gpu)
         .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// PP2 topology arms (`HIPFIRE_SAMPLED_MTP_TOPOLOGY=pp2`)
+// ---------------------------------------------------------------------------
+
+/// The pipeline degree of [`Topology::Pp2`] (topologies: [`lane_suite::Topology`]).
+const PP_DEGREE: usize = 2;
+
+/// `text` as one user message, thinking as given, rendered as `hipfire serve`
+/// renders it.
+fn render_prompt(
+    tokenizer: &Tokenizer,
+    template: &str,
+    text: &str,
+    thinking: bool,
+) -> Result<Vec<u32>, String> {
+    let user = Message {
+        role: Role::User,
+        content: text.to_string(),
+        reasoning_content: None,
+        name: None,
+        rendered_name: None,
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        tool_plan: String::new(),
+    };
+    let rendered = JinjaChatFrame {
+        tokenizer,
+        template,
+        system: None,
+        user: text,
+        enable_thinking: thinking,
+        bos_token: None,
+        reasoning_strength: None,
+        reasoning_effort: None,
+    }
+    .render_messages(&[user], None, None)?;
+    Ok(tokenizer.encode(&rendered))
+}
+
+/// The native MTP drafter behind the load's speculator, for the mesh entries.
+fn pp_drafter(
+    speculator: &mut dyn hipfire_runtime::spec::Speculator,
+) -> Result<&mut Qwen4MtpDrafter, String> {
+    speculator
+        .drafter_any_mut()
+        .and_then(|any| any.downcast_mut::<Qwen4MtpDrafter>())
+        .ok_or_else(|| "the load's speculator is not the native Qwen4 MTP drafter".to_string())
+}
+
+/// The mesh's output band device (logits, the MTP head and the sampled verify's
+/// reads live there) with the calling thread bound to it.
+fn pp_owner(gpus: &mut hipfire_runtime::multi_gpu::Gpus) -> Result<&mut Gpu, String> {
+    let owner = gpus
+        .mesh_output_owner()
+        .ok_or("the PP mesh has no output owner")?;
+    let gpu = gpus
+        .devices
+        .get_mut(owner)
+        .ok_or("the PP output owner is not a mesh device")?;
+    gpu.bind_thread().map_err(|e| e.to_string())?;
+    Ok(gpu)
+}
+
+/// A Flash-Next target loaded across a PP2 mesh by the product loader, with
+/// its tokenizer, chat template and native MTP drafter (loaded on every arm,
+/// used by the MTP arms only).
+struct PpLoaded {
+    model: hipfire_loader::LoadedModel,
+    speculator: Box<dyn hipfire_runtime::spec::Speculator>,
+    tokenizer: Tokenizer,
+    template: String,
+    state: String,
+    /// The daemon-side `Gpu` the load was given; it outlives the model.
+    _gpu: Gpu,
+}
+
+impl PpLoaded {
+    fn load(model: &Path) -> Result<Self, String> {
+        let path = model
+            .to_str()
+            .ok_or_else(|| format!("{} is not valid UTF-8", model.display()))?;
+        let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+        let (state_request, _) = hw_identity::gdn_test_state_quant()?;
+        let cask = hipfire_runtime::loader_api::CaskConfig::default();
+        let mut spec = hipfire_runtime::loader_api::SpecLoadCfg::default();
+        // The native head is attached on every arm so placement and reserves
+        // are identical across the arms of one comparison.
+        spec.mtp = Some(true);
+        let mut loaded = hipfire_loader::load_model(
+            path,
+            MAX_SEQ,
+            None,
+            None,
+            None,
+            Some(state_request),
+            &cask,
+            PP_DEGREE,
+            spec,
+            &mut gpu,
+        )?;
+        if loaded.pp != PP_DEGREE {
+            return Err(format!(
+                "the product load resolved pp = {} but {TOPOLOGY_ENV}=pp2 needs {PP_DEGREE}",
+                loaded.pp
+            ));
+        }
+        let tokenizer = loaded.tokenizer.take().ok_or("the load has no tokenizer")?;
+        let template = loaded
+            .chat_template
+            .take()
+            .ok_or("the artifact has no chat template")?;
+        let mut speculator = loaded
+            .speculator
+            .take()
+            .ok_or("the load attached no speculator (is the native MTP head present?)")?;
+        {
+            let drafter = pp_drafter(speculator.as_mut())?;
+            if !drafter.supports_temp_verify() {
+                return Err("HIPFIRE_MTP_SAMPLED did not enable sampled verification".into());
+            }
+            if drafter.sampled_mode_is_naive() {
+                return Err(
+                    "HIPFIRE_MTP_SAMPLED_MODE=naive is refused under topology.pp; use leviathan"
+                        .into(),
+                );
+            }
+        }
+        {
+            let (bundle, _) = loaded
+                .qwen4_mesh_mut()
+                .ok_or("the PP2 load has no Qwen4 mesh bundle")?;
+            if !bundle.pp_mesh_active() {
+                return Err("the PP2 load has no active pipeline mesh".into());
+            }
+        }
+        Ok(Self {
+            model: loaded,
+            speculator,
+            tokenizer,
+            template,
+            state: format!("state_quant={state_request} (product loader, pp={PP_DEGREE})"),
+            _gpu: gpu,
+        })
+    }
+
+    fn parts(
+        &mut self,
+    ) -> Result<(&mut Qwen4Bundle, &mut hipfire_runtime::multi_gpu::Gpus), String> {
+        self.model
+            .qwen4_mesh_mut()
+            .ok_or_else(|| "the PP2 model lost its Qwen4 mesh".to_string())
+    }
+
+    fn render(&self, text: &str) -> Result<Vec<u32>, String> {
+        render_prompt(&self.tokenizer, &self.template, text, false)
+    }
+
+    /// One vocabulary-wide F32 logits row on the output band's device.
+    fn alloc_logits(&mut self) -> Result<rdna_compute::GpuTensor, String> {
+        let (bundle, gpus) = self.parts()?;
+        let vocab = bundle.config.vocab_size;
+        pp_owner(gpus)?
+            .zeros(&[vocab], DType::F32)
+            .map_err(|e| e.to_string())
+    }
+
+    fn free_logits(&mut self, logits: rdna_compute::GpuTensor) -> Result<(), String> {
+        let (_, gpus) = self.parts()?;
+        pp_owner(gpus)?
+            .free_tensor(logits)
+            .map_err(|e| e.to_string())
+    }
+
+    fn receipt(&mut self, model: &Path) -> Result<Value, String> {
+        let (_, gpus) = self.parts()?;
+        Ok(hw_identity::receipt(pp_owner(gpus)?, model))
+    }
+
+    /// [`Loaded::ar_ids`] on the mesh: seeded AR from a cold state with the
+    /// production host sampler over the output band's logits row.
+    fn ar_ids(
+        &mut self,
+        logits: &rdna_compute::GpuTensor,
+        prompt: &[u32],
+        cfg: &SamplerConfig,
+        seed: u32,
+        tokens: usize,
+    ) -> Result<Vec<u32>, String> {
+        let (bundle, gpus) = self.parts()?;
+        let eos = bundle.config.eos_token_id;
+        hipfire_runtime::llama::reset_cpu_sampler_rng(seed);
+        // A cold prefill (`reused == 0`) resets every band.
+        bundle
+            .pp_prefill_final(gpus, prompt, 0, logits)
+            .map_err(|e| e.to_string())?;
+        let mut history = prompt.to_vec();
+        let mut ids = Vec::with_capacity(tokens);
+        loop {
+            let mut row = pp_owner(gpus)?
+                .download_f32(logits)
+                .map_err(|e| e.to_string())?;
+            let token = sample_cpu(&mut row, &history, cfg);
+            ids.push(token);
+            history.push(token);
+            if ids.len() == tokens || token == eos {
+                return Ok(ids);
+            }
+            bundle
+                .pp_forward_token_or_argmax(gpus, Some(token), logits)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    /// [`Loaded::mtp_request`] on the mesh: the drafter's mesh entries with the
+    /// model's `Gpus`, exactly as the daemon's spec loop drives them.
+    fn mtp_request(
+        &mut self,
+        prompt: &[u32],
+        cfg: SpecRequestConfig,
+        tokens: usize,
+    ) -> Result<MtpRun, String> {
+        let (bundle, gpus) = self
+            .model
+            .qwen4_mesh_mut()
+            .ok_or_else(|| "the PP2 model lost its Qwen4 mesh".to_string())?;
+        let drafter = pp_drafter(self.speculator.as_mut())?;
+        let eos = bundle.config.eos_token_id;
+        bundle.pp_reset(gpus).map_err(|e| e.to_string())?;
+        drafter.pp_mtp_reset(gpus, bundle)?;
+        drafter.configure_request(cfg);
+        let mut seed_token = drafter
+            .pp_mtp_prefill(gpus, bundle, prompt, prompt, 0, false, &|| false)?
+            .into_first_token()?;
+        let mut ids = vec![seed_token];
+        let (mut drafted, mut accepted) = (0, 0);
+        let mut windows = Vec::new();
+        while ids.len() < tokens && seed_token != eos {
+            let position = bundle.state.position;
+            let k = MTP_K.min(tokens - ids.len());
+            let before = StatsSnap::of(&drafter.request_stats());
+            let started = Counters::now();
+            let window = drafter.pp_mtp_step(gpus, bundle, position, seed_token, &ids, k, eos)?;
+            let counters = Counters::now().since(started);
+            windows.push(WindowRec {
+                index: ids.len(),
+                position_before: position,
+                position_after: bundle.state.position,
+                k_budget: k,
+                drafts: window.drafts_generated,
+                accepted: window.accepted,
+                committed: window.committed.len(),
+                before,
+                after: StatsSnap::of(&drafter.request_stats()),
+                counters,
+            });
+            drafted += window.drafts_generated;
+            accepted += window.accepted;
+            seed_token = *window.committed.last().ok_or("empty MTP window")?;
+            ids.extend_from_slice(&window.committed);
+        }
+        ids.truncate(tokens);
+        Ok(MtpRun {
+            ids,
+            drafted,
+            accepted,
+            stats: drafter.request_stats(),
+            windows,
+        })
+    }
+}
+
+/// [`run_arm`] on a PP2 mesh: the same trials, seeds, shard files, config,
+/// evidence and replay, with the PP load and the mesh decode loops. The load
+/// is not freed (the arm is a fresh process that exits right after).
+fn run_arm_pp(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
+    let DistSettings {
+        trials,
+        temp,
+        top_p,
+        top_k,
+        min_p,
+        pen,
+        fixture,
+    } = DistSettings::from_env()?;
+    if spec_request(temp, top_p, top_k, min_p, 0, &pen).penalties_active() {
+        return Err(
+            "the PP2 arms run neutral penalties only: penalized sampled MTP is refused under \
+             topology.pp (the GPU penalty prepass refuses the mesh; such requests decode AR)"
+                .into(),
+        );
+    }
+    let env = own_env(&CONTROL_ENV);
+    let settings_config = dist_config(
+        arm,
+        &own_identity(model, dir, &CONTROL_ENV)?,
+        &pen,
+        fixture,
+        (temp, top_p, top_k, min_p),
+        trials,
+    );
+    let (start, end) = shard_range(arm, trials)?;
+    let sharded = (start, end) != (0, trials);
+    let stem = if sharded {
+        format!("{arm}.{start}-{end}")
+    } else {
+        arm.to_string()
+    };
+    let ids_path = dir.join(format!("{stem}.ids.json"));
+    if ids_path.exists() {
+        check_config(&ids_path, &settings_config)?;
+    }
+    let mut loaded = PpLoaded::load(model)?;
+    let prompt = loaded.render(&fixture.text())?;
+    fixture.check_prompt(prompt.len(), &pen)?;
+    let eos = loaded.parts()?.0.config.eos_token_id;
+    println!(
+        "ARM {arm} topology=pp{PP_DEGREE} pp_layers={} prompt_tokens={} trials={trials} temp={temp} top_p={top_p} top_k={top_k:?} min_p={min_p} fixture={} state={} route_class={}",
+        std::env::var("HIPFIRE_PP_LAYERS").unwrap_or_else(|_| "default".to_string()),
+        prompt.len(),
+        fixture.name(),
+        loaded.state,
+        hw_identity::route_class(&env)
+    );
+    println!("ARM {arm} config {settings_config}");
+    let started = std::time::Instant::now();
+    let mut samples: Vec<Vec<u32>> = Vec::with_capacity(end - start);
+    if arm == "ar" {
+        let logits = loaded.alloc_logits()?;
+        let cfg = ar_sampler(temp, top_p, top_k, min_p, &pen);
+        for trial in start..end {
+            let seed = trial_seed(lane_suite::SALT_PROSE_AR, trial) as u32;
+            samples.push(loaded.ar_ids(&logits, &prompt, &cfg, seed, TOKENS)?);
+        }
+        loaded.free_logits(logits)?;
+    } else {
+        let budget = floor_probe_budget()?;
+        let mut evidence = Evidence::with_samples(EVIDENCE_SAMPLES);
+        for trial in start..end {
+            let seed = trial_seed(lane_suite::SALT_PROSE_MTP, trial);
+            let cfg = spec_request(temp, top_p, top_k, min_p, seed, &pen);
+            let result = loaded.mtp_request(&prompt, cfg, TOKENS)?;
+            evidence.observe(
+                trial,
+                seed,
+                &result,
+                &loaded.tokenizer,
+                budget,
+                LATE_MARGINALS[0],
+            );
+            samples.push(result.ids);
+        }
+        // Only a forced floor-off route replays byte for byte; the adaptive
+        // route's choices depend on wall-clock prices.
+        if hw_identity::forced_floor_off(&env) {
+            let replays = REPLAYS.min(end - start);
+            for local in 0..replays {
+                let trial = start + local;
+                let cfg = spec_request(
+                    temp,
+                    top_p,
+                    top_k,
+                    min_p,
+                    trial_seed(lane_suite::SALT_PROSE_MTP, trial),
+                    &pen,
+                );
+                let replay = loaded.mtp_request(&prompt, cfg, TOKENS)?;
+                if replay.ids != samples[local] {
+                    return Err(format!(
+                        "seed {} replayed {:?}, first run {:?}",
+                        trial + 1,
+                        replay.ids,
+                        samples[local]
+                    ));
+                }
+            }
+            println!("ARM {arm} replayed {replays} seeds identically");
+        } else {
+            println!(
+                "ARM {arm} replay not asserted (route class {}): its routing depends on wall-clock prices",
+                hw_identity::route_class(&env)
+            );
+        }
+        evidence.write(dir, &stem, budget, LATE_MARGINALS[0])?;
+    }
+    // Positions after an EOS read as EOS.
+    for ids in &mut samples {
+        ids.resize(TOKENS, eos);
+    }
+    println!(
+        "ARM {arm} trials {start}..{end} in {:.1}s; first sample: {:?}",
+        started.elapsed().as_secs_f64(),
+        loaded.tokenizer.decode(&samples[0])
+    );
+    fs::write(
+        &ids_path,
+        serde_json::to_vec(&samples).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    write_config(&ids_path, &settings_config)?;
+    let receipt = loaded.receipt(model)?;
+    write_receipt(&ids_path, &receipt)
+}
+
+/// Joins the shards of each short arm (`<arm>.<START>-<END>.*` written by
+/// `sampled_mtp_distribution_arm` under `HIPFIRE_SAMPLED_MTP_SHARD`) into the
+/// whole-arm files the parent comparison reuses: ids concatenated in trial
+/// order, the (identical) config and receipt of the first shard, evidence
+/// counters summed and per-trial rows / texts concatenated. CPU only: no GPU,
+/// no model read. Shards must cover `0..trials` exactly once and carry equal
+/// configs; the parent still checks the merged config against the current
+/// environment, so a stale or mixed shard set fails there.
+#[test]
+#[ignore = "CPU only: merges shards written by sampled_mtp_distribution_arm; needs HIPFIRE_SAMPLED_MTP_OUT"]
+fn sampled_mtp_merge_short_shards() {
+    let dir = out_dir();
+    let trials: usize = env_or(TRIALS_ENV, 2000);
+    let placement = lane_suite::Placement::from_env().unwrap_or_else(|e| panic!("{e}"));
+    if placement.executor == lane_suite::Executor::Lanes {
+        lane_run::merge_lane_suite(&dir, trials, placement).unwrap_or_else(|e| panic!("{e}"));
+        return;
+    }
+    for arm in ARMS {
+        let shards = late_shards(&dir, arm).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!shards.is_empty(), "{arm}: no shards in {}", dir.display());
+        let gaps = shard_gaps(&shards, trials).unwrap_or_else(|e| panic!("{arm}: {e}"));
+        assert!(
+            gaps.is_empty(),
+            "{arm}: shards leave {gaps:?} of 0..{trials} uncovered"
+        );
+        let ids_file = |r: (usize, usize), ext: &str| late_file(&dir, arm, r, ext);
+        let mut ids: Vec<Vec<u32>> = Vec::new();
+        let config =
+            read_json(&ids_file(shards[0], "ids.config.json")).unwrap_or_else(|e| panic!("{e}"));
+        for &r in &shards {
+            let c = read_json(&ids_file(r, "ids.config.json")).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(
+                c, config,
+                "{arm}: shard {r:?} was produced under a different config"
+            );
+            let part: Vec<Vec<u32>> =
+                serde_json::from_slice(&fs::read(ids_file(r, "ids.json")).expect("shard ids"))
+                    .expect("shard ids json");
+            assert_eq!(
+                part.len(),
+                r.1 - r.0,
+                "{arm}: shard {r:?} holds {} trials",
+                part.len()
+            );
+            ids.extend(part);
+        }
+        assert_eq!(ids.len(), trials);
+        let whole = dir.join(format!("{arm}.ids.json"));
+        fs::write(&whole, serde_json::to_vec(&ids).unwrap()).unwrap();
+        write_config(&whole, &config).unwrap_or_else(|e| panic!("{e}"));
+        let receipt =
+            read_json(&ids_file(shards[0], "ids.receipt.json")).unwrap_or_else(|e| panic!("{e}"));
+        write_receipt(&whole, &receipt).unwrap_or_else(|e| panic!("{e}"));
+        if arm != "ar" {
+            let mut merged = read_json(&dir.join(format!(
+                "{arm}.{}-{}.evidence.json",
+                shards[0].0, shards[0].1
+            )))
+            .unwrap_or_else(|e| panic!("{e}"));
+            let mut text = String::new();
+            for (i, &r) in shards.iter().enumerate() {
+                let stem = format!("{arm}.{}-{}", r.0, r.1);
+                text.push_str(
+                    &fs::read_to_string(dir.join(format!("{stem}.text.txt"))).unwrap_or_default(),
+                );
+                if i == 0 {
+                    continue;
+                }
+                let e = read_json(&dir.join(format!("{stem}.evidence.json")))
+                    .unwrap_or_else(|e| panic!("{e}"));
+                for key in [
+                    "trials",
+                    "no_window_trials",
+                    "calibration_ok_trials",
+                    "retired_trials",
+                    "full_trials",
+                    "late_full_trials",
+                    "mtp_windows",
+                    "ar_windows",
+                    "ngram_windows",
+                    "steps",
+                    "drafted",
+                    "accepted",
+                    "post_retirement_ar_steps",
+                ] {
+                    merged[key] =
+                        json!(merged[key].as_u64().unwrap_or(0) + e[key].as_u64().unwrap_or(0));
+                }
+                for key in ["retire_steps", "per_trial"] {
+                    let extra = e[key].as_array().cloned().unwrap_or_default();
+                    merged[key].as_array_mut().expect(key).extend(extra);
+                }
+                let counters = merged["counters"].as_object_mut().expect("counters");
+                for (name, total) in counters.iter_mut() {
+                    *total = json!(
+                        total.as_u64().unwrap_or(0) + e["counters"][name].as_u64().unwrap_or(0)
+                    );
+                }
+                assert_eq!(
+                    merged["probe_budget"], e["probe_budget"],
+                    "{arm}: probe budget differs"
+                );
+                if merged["first_full_trial"].is_null() {
+                    merged["first_full_trial"] = e["first_full_trial"].clone();
+                }
+            }
+            assert_eq!(
+                merged["trials"].as_u64(),
+                Some(trials as u64),
+                "{arm}: merged evidence trials"
+            );
+            write_json(&dir.join(format!("{arm}.evidence.json")), &merged)
+                .unwrap_or_else(|e| panic!("{e}"));
+            fs::write(dir.join(format!("{arm}.text.txt")), text).unwrap();
+        }
+        eprintln!(
+            "{arm}: merged {} shards into {}",
+            shards.len(),
+            whole.display()
+        );
+    }
 }
 
 const ID_ARM_TEST: &str = "sampled_mtp_identity_arm";
@@ -1657,7 +2391,7 @@ fn run_identity_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         }
         for (sampling, temp, top_p, top_k, min_p) in ID_SAMPLINGS {
             for n in 0..ID_SEEDS {
-                let seed = trial_seed(0x1D, n) as u32;
+                let seed = trial_seed(lane_suite::SALT_IDS, n) as u32;
                 let case = format!("{prompt_name} {sampling} seed#{n}");
                 let (ids, drafted, accepted) = match drafter.as_mut() {
                     None => {
@@ -1713,12 +2447,13 @@ fn run_identity_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 /// Route knob of a forced arm: a `batched` / `interleaved` name is a fixed
-/// route (`HIPFIRE_MTP_INCREMENTAL` 0 / 1, floor off); every other arm
+/// route (`HIPFIRE_MTP_INCREMENTAL` 0 / 1, floor off); the lane suite's
+/// `lane_cross` runs the batched route too; every other arm
 /// (`ar`, `adaptive`, `*_adaptive`, `late_*`) runs with no route knob.
 fn arm_route(arm: &str) -> Option<&'static str> {
     if arm.ends_with("interleaved") {
         Some("1")
-    } else if arm.ends_with("batched") {
+    } else if arm.ends_with("batched") || arm == lane_suite::CROSS_ARM {
         Some("0")
     } else {
         None
@@ -1747,6 +2482,14 @@ fn arm_overrides(arm: &str, mode: &'static str) -> Vec<(&'static str, Option<&'s
             overrides.push((FLOOR_ENV, None));
         }
     }
+    if lane_suite::is_lane_arm(arm) {
+        let lane_k = lane_suite::parse_lane_k(
+            std::env::var(lane_suite::LANE_K_ENV).ok().as_deref(),
+            lane_suite::Executor::Lanes,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        overrides.extend(lane_suite::lane_env_overrides(arm, lane_k));
+    }
     let (state_request, _) = hw_identity::gdn_test_state_quant().unwrap_or_else(|e| panic!("{e}"));
     overrides.push((hw_identity::GDN_TEST_STATE_QUANT_ENV, Some(state_request)));
     overrides
@@ -1759,6 +2502,11 @@ fn require_arm_env(arm: &str, mode: &'static str) -> Result<(), String> {
     // An unknown test mode (or q8_ef) is refused before the overrides below
     // resolve it.
     hw_identity::gdn_test_state_quant()?;
+    // Executor / topology / lane count: lane arms need the lane executor and the
+    // singleton arms refuse it; a mesh topology is read by the four short
+    // leviathan arms (pp2) or the lane arms only, so a stale setting cannot
+    // mislabel a one-card arm.
+    lane_suite::validate_arm(arm, mode, lane_suite::Placement::from_env()?, &ARMS)?;
     for (name, want) in arm_overrides(arm, mode) {
         let have = std::env::var(name).ok();
         if have.as_deref() != want {
@@ -2367,9 +3115,9 @@ const COPY_LONG_JOINTS: [(usize, usize); 4] = [(0, 1), (7, 8), (15, 16), (31, 32
 
 fn copy_long_salt(arm: &str) -> u64 {
     match arm {
-        "copy_long_ar" => 0xC091_A200,
-        "copy_long_batched" => 0xC091_BA7C,
-        "copy_long_adaptive" => 0xC091_ADA9,
+        "copy_long_ar" => lane_suite::SALT_COPY_LONG_AR,
+        "copy_long_batched" => lane_suite::SALT_COPY_LONG_BATCHED,
+        "copy_long_adaptive" => lane_suite::SALT_COPY_LONG_ADAPTIVE,
         _ => unreachable!("unknown long-copy arm {arm}"),
     }
 }
@@ -3205,6 +3953,51 @@ fn copy_fixture(loaded: &Loaded, copy_lane: bool) -> Result<Vec<u32>, String> {
     }
 }
 
+/// The ep2 copy cohort's prompt: the rendered rewrite request plus the
+/// passage's first `COPY_PRIMED` tokens, so the request-local pool of the
+/// serve's copy lane (`MtpCopyContext`, the production copy triple) proposes
+/// the passage's continuation on the first window whenever the sampled first
+/// token is the passage's next one. Fails unless the passage occurs in the
+/// request and the pool, seeded from the returned prompt, proposes the
+/// passage's continuation after the passage's token `COPY_PRIMED`.
+fn lane_copy_prompt(tokenizer: &Tokenizer, rendered: Vec<u32>) -> Result<Vec<u32>, String> {
+    // A takeover is as deep as the window's draft room (`TOKENS` less the
+    // first token): the passage must hold that many tokens past the seed.
+    let depth = TOKENS - 1;
+    let passage = tokenizer.encode(COPY_PASSAGE);
+    let pool_config = qwen4_ngram_mod_config(hipfire_config::ngram_mod_copy_triple())?;
+    if passage.len() < COPY_PRIMED + 1 + depth {
+        return Err(format!(
+            "copy passage has {} tokens, need {}",
+            passage.len(),
+            COPY_PRIMED + 1 + depth
+        ));
+    }
+    let mut prompt = rendered;
+    if !prompt
+        .windows(passage.len())
+        .any(|window| window == passage.as_slice())
+    {
+        return Err("the passage's own tokens do not occur in the rendered request".into());
+    }
+    prompt.extend_from_slice(&passage[..COPY_PRIMED]);
+    let mut pool = MtpCopyContext::new(pool_config).map_err(|e| e.to_string())?;
+    pool.begin_request(&prompt);
+    // The proposal runs on past the passage into the request's tail; only the
+    // passage's own continuation is compared.
+    let want = &passage[COPY_PRIMED + 1..];
+    match pool.propose(&passage[COPY_PRIMED..=COPY_PRIMED], pool_config.n_max) {
+        Some(candidates)
+            if candidates.len() >= depth && candidates[..depth] == want[..depth] =>
+        {
+            Ok(prompt)
+        }
+        other => Err(format!(
+            "copy fixture: the copy pool proposed {other:?} after the passage's token {COPY_PRIMED}, expected at least {depth} tokens of {want:?}"
+        )),
+    }
+}
+
 fn run_ngram_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
     let spec = NGRAM_ARMS.iter().find(|spec| spec.name == arm);
     if spec.is_none() && arm != COPY_AR_ARM {
@@ -3383,9 +4176,9 @@ fn run_ngram_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
 const LATE_AR_ARM: &str = "late_ar";
 const LATE_ADAPTIVE_ARM: &str = "late_adaptive";
 const LATE_PILOT_ARM: &str = "late_pilot";
-const LATE_AR_SALT: u64 = 0x1A7E_A200;
-const LATE_MTP_SALT: u64 = 0x1A7E_5EC0;
-const LATE_PILOT_SALT: u64 = 0x1A7E_9170;
+const LATE_AR_SALT: u64 = lane_suite::SALT_LATE_AR;
+const LATE_MTP_SALT: u64 = lane_suite::SALT_LATE_MTP;
+const LATE_PILOT_SALT: u64 = lane_suite::SALT_LATE_PILOT;
 /// Generated IDs per trial (`HIPFIRE_SAMPLED_MTP_LATE_TOKENS` may only raise it).
 const LATE_TOKENS_DEFAULT: usize = 128;
 /// Fewest independent trials per compared arm.
@@ -3448,21 +4241,7 @@ fn shard_range(arm: &str, trials: usize) -> Result<(usize, usize), String> {
     let Ok(value) = std::env::var(SHARD_ENV) else {
         return Ok((0, total));
     };
-    let (start, end) = value
-        .split_once("..")
-        .ok_or_else(|| format!("{SHARD_ENV}={value}: expected START..END"))?;
-    let parse = |text: &str| {
-        text.trim()
-            .parse::<usize>()
-            .map_err(|e| format!("{SHARD_ENV}={value}: {e}"))
-    };
-    let (start, end) = (parse(start)?, parse(end)?);
-    if start >= end || end > total {
-        return Err(format!(
-            "{SHARD_ENV}={value}: the range must be non-empty and within 0..{total}"
-        ));
-    }
-    Ok((start, end))
+    lane_suite::parse_shard(SHARD_ENV, &value, total)
 }
 
 fn late_config(
@@ -3495,7 +4274,6 @@ fn late_config(
 
 /// Sorted `(start, end)` of every `<arm>.<start>-<end>.ids.json` in `dir`.
 fn late_shards(dir: &Path, arm: &str) -> Result<Vec<(usize, usize)>, String> {
-    let prefix = format!("{arm}.");
     let mut found = Vec::new();
     for entry in fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
         let name = entry
@@ -3503,17 +4281,8 @@ fn late_shards(dir: &Path, arm: &str) -> Result<Vec<(usize, usize)>, String> {
             .file_name()
             .to_string_lossy()
             .into_owned();
-        let Some(rest) = name
-            .strip_prefix(&prefix)
-            .and_then(|rest| rest.strip_suffix(".ids.json"))
-        else {
-            continue;
-        };
-        let Some((start, end)) = rest.split_once('-') else {
-            continue;
-        };
-        if let (Ok(start), Ok(end)) = (start.parse::<usize>(), end.parse::<usize>()) {
-            found.push((start, end));
+        if let Some(range) = lane_suite::shard_of_file(arm, &name) {
+            found.push(range);
         }
     }
     found.sort_unstable();
@@ -3524,26 +4293,7 @@ fn late_shards(dir: &Path, arm: &str) -> Result<Vec<(usize, usize)>, String> {
 /// a seed twice and a shard beyond `total` is not part of this cohort: both
 /// are errors, not something to patch around.
 fn shard_gaps(shards: &[(usize, usize)], total: usize) -> Result<Vec<(usize, usize)>, String> {
-    let mut gaps = Vec::new();
-    let mut next = 0;
-    for &(start, end) in shards {
-        if start >= end || end > total {
-            return Err(format!("shard {start}-{end} lies outside 0..{total}"));
-        }
-        if start < next {
-            return Err(format!(
-                "shard {start}-{end} overlaps an earlier shard ending at {next}: a seed would be counted twice"
-            ));
-        }
-        if start > next {
-            gaps.push((next, start));
-        }
-        next = end;
-    }
-    if next < total {
-        gaps.push((next, total));
-    }
-    Ok(gaps)
+    lane_suite::shard_gaps(shards, total)
 }
 
 /// Every shard of `arm` covering exactly `0..total`, each verified against
@@ -4101,6 +4851,69 @@ mod coverage_logic {
             assert_eq!(find(arm, INCREMENTAL_ENV), Some(None), "{arm}");
         }
     }
+
+    /// `lane_cross` is a forced batched, floor-off arm that pins the previous shipped
+    /// `max_active` (3); the fixed-count native arms pin 8; the native arms
+    /// pin the cohort's lane depth and the reference pins nothing.
+    #[test]
+    fn the_crossing_lane_arm_runs_batched_floor_off_with_the_shipped_max_active() {
+        let find = |arm: &str, name: &str| {
+            arm_overrides(arm, "leviathan")
+                .into_iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value)
+        };
+        let max_active = lane_suite::MAX_ACTIVE_ENV;
+        for arm in ["lane_batched", lane_suite::CROSS_ARM] {
+            assert_eq!(find(arm, INCREMENTAL_ENV), Some(Some("0")), "{arm}");
+            assert_eq!(find(arm, FLOOR_ENV), Some(Some("0")), "{arm}");
+        }
+        assert_eq!(
+            find(lane_suite::CROSS_ARM, max_active),
+            Some(Some("3")),
+            "the pin is the previous shipped switch (the default is now 8)"
+        );
+        assert_eq!(
+            lane_suite::CROSS_MAX_ACTIVE,
+            lane_suite::CROSS_MAX_ACTIVE_N.to_string()
+        );
+        assert_eq!(find("lane_batched", max_active), Some(Some("8")));
+        assert_eq!(find("lane_adaptive", max_active), Some(Some("8")));
+        assert_eq!(find("lane_adaptive", FLOOR_ENV), Some(None));
+        assert_eq!(
+            find("lane_ar", max_active),
+            None,
+            "the reference pins nothing"
+        );
+    }
+
+    /// The native lane arms pin `HIPFIRE_EP_MTP_LANE_K` to the cohort's depth
+    /// (`HIPFIRE_SAMPLED_MTP_LANE_K`, default 2); the reference and every
+    /// singleton arm pin nothing.
+    #[test]
+    fn the_native_lane_arms_pin_the_cohort_lane_depth() {
+        let lane_k = lane_suite::parse_lane_k(
+            std::env::var(lane_suite::LANE_K_ENV).ok().as_deref(),
+            lane_suite::Executor::Lanes,
+        )
+        .unwrap();
+        let find = |arm: &str| {
+            arm_overrides(arm, "leviathan")
+                .into_iter()
+                .find(|(key, _)| *key == lane_suite::EP_LANE_K_ENV)
+                .map(|(_, value)| value)
+        };
+        for arm in ["lane_batched", "lane_adaptive", lane_suite::CROSS_ARM] {
+            assert_eq!(
+                find(arm),
+                Some(Some(lane_suite::lane_k_str(lane_k))),
+                "{arm}"
+            );
+        }
+        for arm in ["lane_ar", "ar", "batched", "interleaved", "adaptive"] {
+            assert_eq!(find(arm), None, "{arm}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4136,8 +4949,8 @@ const THINK_SEEDS_ENV: &str = "HIPFIRE_SAMPLED_MTP_THINK_SEEDS";
 /// Generated IDs per request, shared by both arms; must leave room in `MAX_SEQ`.
 const THINK_TOKENS_DEFAULT: usize = 3500;
 const THINK_SEEDS_DEFAULT: usize = 4;
-const THINK_AR_SALT: u64 = 0x7A1A_A200;
-const THINK_MTP_SALT: u64 = 0x7A1A_5EC0;
+const THINK_AR_SALT: u64 = lane_suite::SALT_THINK_AR;
+const THINK_MTP_SALT: u64 = lane_suite::SALT_THINK_MTP;
 const THINK_CLOSE: &str = "</think>";
 /// A fixed counting problem with a cheap-to-verify answer (the answer is 400)
 /// that invites a long deliberate check; sent as one user message.
@@ -4562,12 +5375,12 @@ fn q8ef_all_arms() -> impl Iterator<Item = &'static str> {
 
 fn q8ef_salt(arm: &str) -> Result<u64, String> {
     Ok(match arm {
-        "q8ef_batched" => 0xE8F1,
-        "q8ef_interleaved" => 0xE8F2,
-        "q8ef_adaptive" => 0xE8F3,
-        "q8ef_session_batched" => 0xE8F4,
-        "q8ef_prefix_batched" => 0xE8F5,
-        Q8EF_DISK_ARM => 0xE8F6,
+        "q8ef_batched" => lane_suite::SALT_Q8EF_BATCHED,
+        "q8ef_interleaved" => lane_suite::SALT_Q8EF_INTERLEAVED,
+        "q8ef_adaptive" => lane_suite::SALT_Q8EF_ADAPTIVE,
+        "q8ef_session_batched" => lane_suite::SALT_Q8EF_SESSION_BATCHED,
+        "q8ef_prefix_batched" => lane_suite::SALT_Q8EF_PREFIX_BATCHED,
+        Q8EF_DISK_ARM => lane_suite::SALT_Q8EF_DISK,
         other => return Err(format!("{other} is not a q8_ef arm")),
     })
 }

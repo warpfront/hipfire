@@ -30,8 +30,10 @@
 //!
 //! Resolution is exact along the unique reaching path: straight-line within
 //! the block, continued across single-predecessor edges. A consumer past the
-//! block end rejects (`DelayCrossesLeader`): the skip would count across
-//! control flow, which the window model cannot preserve. A producer past a
+//! block end is `Ambiguous` when only plain leader splits (fall-through block
+//! boundaries) lie between the hint and it, and rejects (`DelayCrossesLeader`)
+//! when the skip counts over a branch: that would count across control
+//! flow, which the window model cannot preserve. A producer past a
 //! join, a loop revisit, or an invalid id yields `DelayStatus::Ambiguous`,
 //! never a rejection: hints are performance-only and `NO_DEP` is always
 //! sound, so downstream edits touching the reach must rewrite the hint to
@@ -41,7 +43,7 @@
 
 use thiserror::Error;
 
-use crate::cfg::{BlockId, Body, InstId};
+use crate::cfg::{BlockId, Body, InstId, Terminator};
 use crate::effects::{Control, MemClass};
 use crate::inst::Form;
 use crate::operand::Modifiers;
@@ -233,6 +235,14 @@ fn clause_length(mods: &Modifiers) -> Option<usize> {
 /// blocks. Clause violations and delay consumers past the block end reject;
 /// backward producer over-reach across joins goes ambiguous (never rejects).
 pub fn check_windows(body: &Body) -> Result<WindowFacts, WindowError> {
+    check_windows_with(body, false)
+}
+
+/// As [`check_windows`]; with `lenient_delay` an `s_delay_alu` whose skip counts across a block boundary that is not a
+/// plain fall-through (hipcc legally emits a hint whose second consumer lies past a conditional branch or in the
+/// fall-through block of one) resolves to `Ambiguous` instead of rejecting. The hint is performance-only (NO_DEP is
+/// always sound; the interpreter ignores it), so ambiguity loses nothing; PM-authored code keeps the strict rule.
+pub fn check_windows_with(body: &Body, lenient_delay: bool) -> Result<WindowFacts, WindowError> {
     if body.blocks.is_empty() {
         return Err(WindowError::BlocksNotBuilt);
     }
@@ -300,7 +310,7 @@ pub fn check_windows(body: &Body) -> Result<WindowFacts, WindowError> {
                 let block = containing_block(body, id).expect("inst is laid out in a block");
                 facts
                     .delays
-                    .push(resolve_delay(body, id, block, pos, hint)?);
+                    .push(resolve_delay(body, id, block, pos, hint, lenient_delay)?);
             }
             _ => {}
         }
@@ -314,6 +324,7 @@ fn resolve_delay(
     block: BlockId,
     pos: usize,
     raw: crate::operand::DelayAluHint,
+    lenient: bool,
 ) -> Result<DelayFact, WindowError> {
     let ambiguous = DelayFact::ambiguous(hint, block);
     let (_, end) = body.blocks[block.0].range;
@@ -321,15 +332,47 @@ fn resolve_delay(
 
     // Consumers (forward): consumer0 is the next layout instruction,
     // consumer1 is skip_forward further. SKIP counts layout instructions, so
-    // the consumers are positional; a consumer past the block end means the
-    // skip counts across control flow, which the straight-line window model
-    // cannot preserve: reject like a clause window crossing a leader.
+    // the consumers are positional. A consumer past the block end is exact
+    // only when every block boundary the skip crosses is a plain leader split
+    // (`Terminator::FallThrough`: a branch target starts the next block, the
+    // hint's block runs into it): the next dynamic instruction after the hint
+    // is then the next layout instruction (hipcc emits such a hint right
+    // before a loop header). The window is not resolved across the split
+    // (the join has other predecessors, so its producers are `Ambiguous`).
+    // A skip that counts over a branch executes differently per path: reject
+    // like a clause window crossing a leader.
     let fwd = match skip_forward(raw.instskip) {
         Some(fwd) => fwd,
         None => return Ok(ambiguous),
     };
     if pos + 1 >= end || pos + 1 + fwd >= end {
-        return Err(WindowError::DelayCrossesLeader { index: pos });
+        let last = pos + 1 + fwd;
+        if body.layout.get(last).is_none() {
+            return if lenient {
+                Ok(ambiguous)
+            } else {
+                Err(WindowError::DelayCrossesLeader { index: pos })
+            };
+        }
+        let mut b = block.0;
+        while body.blocks[b].range.1 <= last {
+            let fall = body.blocks[b].term == Terminator::FallThrough;
+            let next = b + 1;
+            if !fall
+                || body
+                    .blocks
+                    .get(next)
+                    .is_none_or(|n| n.range.0 != body.blocks[b].range.1)
+            {
+                return if lenient {
+                    Ok(ambiguous)
+                } else {
+                    Err(WindowError::DelayCrossesLeader { index: pos })
+                };
+            }
+            b = next;
+        }
+        return Ok(ambiguous);
     }
     let consumer0 = body.layout[pos + 1];
     let consumer1 = body.layout[pos + 1 + fwd];
@@ -538,11 +581,11 @@ mod tests {
     }
 
     #[test]
-    fn delay_consumer_past_block_end_rejects() {
+    fn delay_consumer_across_a_leader_split_is_ambiguous() {
         // A branch targets the instruction right after the hint, so the hint
-        // is alone in its block and its consumer lives in the next one: the
-        // skip would count across control flow, which the window model
-        // cannot preserve.
+        // is alone in its block and runs into the next one by fall-through:
+        // the next dynamic instruction is the next layout instruction, so the
+        // hint is legal, but the window is not resolved across the split.
         // Layout: hint@0 valu@1 valu@2 branch@3(taken valu@1, off -3) endpgm@4.
         let mut back = mk("s_branch", Form::Sopp);
         back.effects.control = Control::Jump;
@@ -550,10 +593,50 @@ mod tests {
         let mut body = body_of(vec![delay_hint(0, 0, 0), valu(), valu(), back, endpgm()]);
         build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(body.blocks[0].range, (0, 1));
+        let facts = check_windows(&body).unwrap();
+        assert_eq!(facts.delays.len(), 1);
+        assert!(facts.delays[0].is_ambiguous());
+    }
+
+    #[test]
+    fn delay_skip_over_a_branch_rejects() {
+        // The second consumer (SKIP_1: two layout instructions after the hint's
+        // next) lies past a conditional branch: the skip would count over
+        // control flow, which differs per path.
+        // Layout: hint@0 valu@1 cbr@2(taken endpgm@4) valu@3 endpgm@4.
+        let mut body = body_of(vec![
+            delay_hint(1, 2, 1),
+            valu(),
+            branch_to(1),
+            valu(),
+            endpgm(),
+        ]);
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
+        assert_eq!(body.blocks[0].range, (0, 3));
         assert_eq!(
             check_windows(&body),
             Err(WindowError::DelayCrossesLeader { index: 0 })
         );
+    }
+    #[test]
+    fn hipcc_delay_skip_over_a_branch_is_accepted_as_ambiguous() {
+        // Same shape as `delay_skip_over_a_branch_rejects`: hipcc emits such hints (consumer in the fall-through
+        // block of a conditional branch); the lenient check keeps them as ambiguous, performance-only facts.
+        let mut body = body_of(vec![
+            delay_hint(1, 2, 1),
+            valu(),
+            branch_to(1),
+            valu(),
+            endpgm(),
+        ]);
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
+        assert_eq!(
+            check_windows(&body),
+            Err(WindowError::DelayCrossesLeader { index: 0 })
+        );
+        let facts = check_windows_with(&body, true).unwrap();
+        assert_eq!(facts.delays.len(), 1);
+        assert!(facts.delays[0].is_ambiguous());
     }
     #[test]
     fn smem_clause_of_mixed_widths_validates() {

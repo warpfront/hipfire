@@ -20,7 +20,8 @@
 //!
 //! Every wave is independent: operands are loaded straight into registers
 //! (the next K128 epoch prefetched while the current one is consumed), no
-//! LDS and no barrier. The tile of 16 grouped slots is `blockIdx.y`; a tile
+//! LDS and no barrier (except the gfx1201 NT8 `gate_up` entry, which holds its four waves to one
+//! workgroup barrier per K128 epoch in the K loop, and the NT4 / NT8 `gate_up` hand-off). The tile of 16 grouped slots is `blockIdx.y`; a tile
 //! past `m_total` or with an expert id outside `[0, n_experts)` (the -1 sentinel, or a
 //! corrupt id) returns before any load or store.
 //! Each lane loads its slot `s = sorted[16*tile + lane%16]`; a padding slot
@@ -44,8 +45,8 @@
 //! entry, byte for byte.
 use super::bf16::Bf16;
 use super::common::{
-    self, add64, add64_imm, bload, bstore_b128, lit, op, s, s_add_i32, smem, sop, srd_tail, v,
-    GatherTemps, SRD_WORD3,
+    self, add64, add64_imm, bload, bload_u16, bstore_b128, lit, op, s, s_add_i32, smem, sop,
+    srd_tail, v, GatherTemps, SRD_WORD3,
 };
 use super::iu4_fold::{self, MAGIC, REBIAS};
 use crate::{
@@ -145,11 +146,19 @@ impl std::str::FromStr for Kind {
 /// `Mq3I4` is the planar qt131/132 W3 grid (`d * (2c - 7)`, codes plane then
 /// f16 scale plane, see `hipfire_runtime::mq_i4`) with the same exact IU4 fold.
 /// Its numerics are frozen in `mq_i4_reference` (`iu4_gemm_f32`).
+///
+/// `Mq4SymPlanar` is the F1 drop-zero planar twin of `Mq4Sym` (`hipfire_runtime::mq4_planar`, qt137 gate/up and qt138
+/// down): the same symmetric MQ4 codes and f16 scales, laid out per `[M, K]` tensor as
+/// `[codes plane: M*K/2 bytes][scales plane: M*(K/128) LE f16]` (code row `r` at byte `r*K/2`, 64 bytes per K128
+/// epoch; the scale of row `r` and epoch `h` at `M*K/2 + 2*(r*(K/128) + h)`). Every fold, rounding and store is the
+/// shipped entry's, so a planar expert yields bytes identical to its shipped-layout twin; only the weight and scale
+/// addressing differ. Built for the gfx1201 NT4/NT8 gate/up and down entries and the grouped-position down twins.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WeightCodec {
     Mq4Sym,
     Mq3I4,
     E8pI4,
+    Mq4SymPlanar,
 }
 
 /// One entry: arch, GEMM kind, expert-run tile width `nt` (16-slot tiles
@@ -193,6 +202,25 @@ pub fn module_specs(arch: Arch) -> Vec<Spec> {
 /// [`module_specs`] for one weight codec. The MQ3-I4 module (gfx1151, gfx1201) holds the
 /// NT1 gate/up and down entries; the MQ4 module is the shipped one.
 pub fn module_specs_codec(arch: Arch, codec: WeightCodec) -> Vec<Spec> {
+    if codec == WeightCodec::Mq4SymPlanar {
+        // The shipped expert-run tiles of the exact gfx1201 route (no NT1 entry, no row repeats), both kinds.
+        return if arch == Arch::Gfx1201 {
+            [4u8, 8]
+                .into_iter()
+                .flat_map(|nt| {
+                    Kind::ALL.into_iter().map(move |kind| Spec {
+                        arch,
+                        kind,
+                        nt,
+                        rr: 1,
+                        codec,
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+    }
     if matches!(codec, WeightCodec::Mq3I4 | WeightCodec::E8pI4) {
         let admitted = match codec {
             WeightCodec::Mq3I4 => matches!(arch, Arch::Gfx1151 | Arch::Gfx1201),
@@ -265,11 +293,20 @@ impl Spec {
             codec: WeightCodec::Mq4Sym,
         })
     }
+    /// The grouped-position twin's symbol (`..._sym_gp_pm_...`; `..._sym_p_gp_pm_...` for the planar codec).
+    pub fn symbol_gp(self) -> String {
+        let (from, to) = match self.codec {
+            WeightCodec::Mq4SymPlanar => ("_sym_p_pm_", "_sym_p_gp_pm_"),
+            _ => ("_sym_pm_", "_sym_gp_pm_"),
+        };
+        self.symbol().replacen(from, to, 1)
+    }
     pub fn symbol(self) -> String {
         let infix = match self.codec {
             WeightCodec::Mq4Sym => "",
             WeightCodec::Mq3I4 => "_w3",
             WeightCodec::E8pI4 => "_e8p",
+            WeightCodec::Mq4SymPlanar => "_p",
         };
         let base = match self.kind {
             Kind::GateUp => format!(
@@ -300,6 +337,7 @@ impl Spec {
             WeightCodec::Mq4Sym => tag,
             WeightCodec::Mq3I4 => format!("{tag}_w3"),
             WeightCodec::E8pI4 => format!("{tag}_e8p"),
+            WeightCodec::Mq4SymPlanar => format!("{tag}_p"),
         }
     }
     /// The committed MQ4 module (`WeightCodec::Mq4Sym`).
@@ -311,6 +349,7 @@ impl Spec {
             WeightCodec::Mq4Sym => format!("qwen4_moe_iu4_sym_pm_{}", arch.name()),
             WeightCodec::Mq3I4 => format!("qwen4_moe_iu4_sym_w3_pm_{}", arch.name()),
             WeightCodec::E8pI4 => format!("qwen4_moe_iu4_sym_e8p_pm_{}", arch.name()),
+            WeightCodec::Mq4SymPlanar => format!("qwen4_moe_iu4_sym_p_pm_{}", arch.name()),
         }
     }
     pub fn validate(self) -> Result<(), String> {
@@ -345,6 +384,14 @@ impl Spec {
         {
             return Err(
                 "qwen4_moe_sym: the E8P-I4 codec is built for the gfx1201 NT1 entries only".into(),
+            );
+        }
+        if self.codec == WeightCodec::Mq4SymPlanar
+            && !(self.arch == Arch::Gfx1201 && matches!(self.nt, 4 | 8) && self.rr == 1)
+        {
+            return Err(
+                "qwen4_moe_sym: the planar MQ4 codec is built for the gfx1201 NT4/NT8 entries only"
+                    .into(),
             );
         }
         Ok(())
@@ -675,6 +722,7 @@ impl Gen {
             (WeightCodec::Mq3I4, true) => "_w3acc",
             (WeightCodec::E8pI4, false) => "_e8p",
             (WeightCodec::E8pI4, true) => "_e8pacc",
+            (WeightCodec::Mq4SymPlanar, _) => "_p",
         };
         format!(".Lq4s_{}{entry}_{name}", self.spec.kind.tag())
     }
@@ -1522,7 +1570,7 @@ pub fn emit_down_gp(spec: Spec) -> Result<Emitted, String> {
     spec.validate()?;
     if spec.arch != Arch::Gfx1201
         || spec.kind != Kind::Down
-        || spec.codec != WeightCodec::Mq4Sym
+        || !matches!(spec.codec, WeightCodec::Mq4Sym | WeightCodec::Mq4SymPlanar)
         || spec.rr != 1
         || !matches!(spec.nt, 4 | 8)
     {
@@ -1716,6 +1764,9 @@ pub fn emit_module_codec(
     arch: Arch,
     codec: WeightCodec,
 ) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
+    if codec == WeightCodec::Mq4SymPlanar && arch != Arch::Gfx1201 {
+        return Err("qwen4_moe_sym: the planar MQ4 module is built for gfx1201 only".into());
+    }
     let mut emitted = module_specs_codec(arch, codec)
         .into_iter()
         .map(emit)
@@ -1860,6 +1911,9 @@ mod nt {
     const LIVE0: u8 = 60; // + 2j
     const SRD_Y: u8 = 76;
     const PSEL: u8 = 80;
+    // Planar codec only: the scale-plane descriptor and the scale row bytes (above the highest tile `live` pair, SRD_Y, PSEL).
+    const SRD_SC: u8 = 84;
+    const SROWB: u8 = 88;
     const SILU_MASK: u8 = 24;
 
     #[derive(Clone, Copy)]
@@ -1887,6 +1941,23 @@ mod nt {
         }
         fn streamed(&self) -> bool {
             self.buffered < self.nt()
+        }
+        /// The gfx1201 MQ4 NT8 `gate_up` entry rendezvouses its four waves twice per K-loop trip
+        /// (one workgroup barrier per K128 epoch: at the top of the trip and between the
+        /// descriptor step and the second epoch's weight loads), keeping their activation
+        /// gathers aligned. Every other entry, and every experimental or streamed schedule,
+        /// has no barrier in its K loop.
+        fn epoch_lock(&self) -> bool {
+            self.spec.arch == Arch::Gfx1201
+                && matches!(
+                    self.spec.codec,
+                    WeightCodec::Mq4Sym | WeightCodec::Mq4SymPlanar
+                )
+                && self.spec.kind == Kind::GateUp
+                && self.spec.nt == 8
+                && self.rr() == 1
+                && !self.streamed()
+                && !self.experimental()
         }
         fn buffered_tiles(&self) -> u8 {
             self.buffered
@@ -2035,13 +2106,24 @@ mod nt {
                 self.wa(0) + 16
             }
         }
+        /// The F1 drop-zero planar codec: codes plane then scales plane (see [`WeightCodec::Mq4SymPlanar`]).
+        fn planar(&self) -> bool {
+            self.spec.codec == WeightCodec::Mq4SymPlanar
+        }
+        /// Byte offset, from the scale descriptor, of epoch parity `p`'s scale within a two-epoch trip (planar).
         fn header_off(&self, p: usize) -> u32 {
+            if self.planar() {
+                return 2 * p as u32;
+            }
             match self.spec.kind {
                 Kind::GateUp => 4 * p as u32,
                 Kind::Down => 68 * p as u32,
             }
         }
         fn nibble_off(&self, p: usize) -> u32 {
+            if self.planar() {
+                return 64 * p as u32;
+            }
             match self.spec.kind {
                 Kind::GateUp => 8 + 64 * p as u32,
                 Kind::Down => 4 + 68 * p as u32,
@@ -2184,6 +2266,10 @@ mod nt {
             p.s::<1>("x_src_rows", 22, kernel())?;
             p.s::<1>("expert", 23, kernel())?;
             p.s::<4>("srd_w", SRD_W, kernel())?;
+            if self.planar() {
+                p.s::<4>("srd_scale", SRD_SC, kernel())?;
+                p.s::<1>("scale_row_bytes", SROWB, kernel())?;
+            }
             p.s::<2>("w_ptr", WPTR, kernel())?;
             p.s::<1>("run_back", BACK, pro())?;
             p.s::<1>("run_pos", POS, pro())?;
@@ -2559,14 +2645,20 @@ mod nt {
         )?;
         // row_bytes = (K/256)*136 (QT44) or (K/128)*68 (QT53).
         let k = 19;
-        match kind {
-            Kind::GateUp => {
-                sop(b, format!("s_lshr_b32 s{ROWB}, s{k}, 8"), &[ROWB], &[k])?;
-                sop(b, format!("s_mulk_i32 s{ROWB}, 0x88"), &[ROWB], &[ROWB])?;
-            }
-            Kind::Down => {
-                sop(b, format!("s_lshr_b32 s{ROWB}, s{k}, 7"), &[ROWB], &[k])?;
-                sop(b, format!("s_mulk_i32 s{ROWB}, 0x44"), &[ROWB], &[ROWB])?;
+        if g.planar() {
+            // Planar: code row bytes K/2 (ROWB), scale row bytes (K/128)*2 = K/64 (SROWB).
+            sop(b, format!("s_lshr_b32 s{ROWB}, s{k}, 1"), &[ROWB], &[k])?;
+            sop(b, format!("s_lshr_b32 s{SROWB}, s{k}, 6"), &[SROWB], &[k])?;
+        } else {
+            match kind {
+                Kind::GateUp => {
+                    sop(b, format!("s_lshr_b32 s{ROWB}, s{k}, 8"), &[ROWB], &[k])?;
+                    sop(b, format!("s_mulk_i32 s{ROWB}, 0x88"), &[ROWB], &[ROWB])?;
+                }
+                Kind::Down => {
+                    sop(b, format!("s_lshr_b32 s{ROWB}, s{k}, 7"), &[ROWB], &[k])?;
+                    sop(b, format!("s_mulk_i32 s{ROWB}, 0x44"), &[ROWB], &[ROWB])?;
+                }
             }
         }
         set_trips(b, a)?;
@@ -2664,6 +2756,33 @@ mod nt {
         bload(b, 1, 6 + j, 5, SRD_S, 64 * u32::from(j))
     }
 
+    /// Planar scale-plane descriptor: the scale plane starts `M * (K/2)` bytes after the tensor base, and this wave's
+    /// rows `row_base..` start `row_base * (K/64)` bytes into it (`s18` = `M`).
+    fn scale_descriptor(b: &mut Builder) -> Result<(), String> {
+        let a = b.spec.arch;
+        let (rows, plane) = (SRD_SC + 2, SRD_SC + 3);
+        sop(
+            b,
+            format!("s_mul_i32 s{rows}, s{RBASE}, s{SROWB}"),
+            &[rows],
+            &[RBASE, SROWB],
+        )?;
+        sop(
+            b,
+            format!("s_mul_i32 s{plane}, s18, s{ROWB}"),
+            &[plane],
+            &[18, ROWB],
+        )?;
+        sop(
+            b,
+            format!("{} s{rows}, s{rows}, s{plane}", s_add_i32(a)),
+            &[rows],
+            &[rows, plane],
+        )?;
+        add64(b, SRD_SC, WPTR, rows)?;
+        srd_tail(b, SRD_SC, None)
+    }
+
     /// Activation and weight descriptors, lane offsets, the first epoch's weights.
     fn pro_desc(b: &mut Builder, g: &G) -> Result<(), String> {
         let a = g.arch();
@@ -2672,6 +2791,9 @@ mod nt {
         sop(b, format!("s_lshl_b32 s{XS2}, s4, 1"), &[XS2], &[4])?;
         // Weight descriptor: rows rbase.. of the expert.
         w_descriptor(b)?;
+        if g.planar() {
+            scale_descriptor(b)?;
+        }
         op(
             b,
             format!("v_mul_u32_u24_e32 v{WOFF}, s{ROWB}, v3"),
@@ -2695,9 +2817,12 @@ mod nt {
         }
         op(
             b,
-            format!("v_mul_u32_u24_e32 v{HOFF}, s{ROWB}, v14"),
+            format!(
+                "v_mul_u32_u24_e32 v{HOFF}, s{}, v14",
+                if g.planar() { SROWB } else { ROWB }
+            ),
             &[v(HOFF)],
-            &[s(ROWB), v(14)],
+            &[s(if g.planar() { SROWB } else { ROWB }), v(14)],
         )?;
         load_w(b, g, 0)?;
         Ok(())
@@ -2860,7 +2985,11 @@ mod nt {
             (4u8, 4u8)
         };
         b.clause(|b| {
-            bload(b, 1, g.wh(p), HOFF, SRD_W, g.header_off(p))?;
+            if g.planar() {
+                bload_u16(b, g.wh(p), HOFF, SRD_SC, g.header_off(p))?;
+            } else {
+                bload(b, 1, g.wh(p), HOFF, SRD_W, g.header_off(p))?;
+            }
             for i in 0..4u8 {
                 bload(
                     b,
@@ -3146,8 +3275,14 @@ mod nt {
         Ok(())
     }
 
-    fn advance(b: &mut Builder, streamed: bool) -> Result<(), String> {
-        add64_imm(b, SRD_W, 136)?;
+    fn advance(b: &mut Builder, streamed: bool, planar: bool) -> Result<(), String> {
+        if planar {
+            // One two-epoch trip: 2 * 64 code bytes, 2 * 2 scale bytes.
+            add64_imm(b, SRD_W, 128)?;
+            add64_imm(b, SRD_SC, 4)?;
+        } else {
+            add64_imm(b, SRD_W, 136)?;
+        }
         for r in SRD_X {
             // Streamed epoch 1 still reads SRD_X[1] while it computes; move
             // only epoch 0 here so epoch 1 can prefetch epoch 2 into its ring.
@@ -3181,9 +3316,15 @@ mod nt {
         wg.wg_skip_if(no_trip, &done, (), |wg, ()| {
             wg.loop_carried(&head, (), |wg, ()| {
                 if g.prefetch {
+                    if g.epoch_lock() {
+                        wg.barrier(())?;
+                    }
                     load_w(wg.isa(), g, 1)?;
                     compute(wg, g, 0, "l0", Some(SRD_X[1]))?;
-                    advance(wg.isa(), g.streamed())?;
+                    advance(wg.isa(), g.streamed(), g.planar())?;
+                    if g.epoch_lock() {
+                        wg.barrier(())?;
+                    }
                     load_w(wg.isa(), g, 0)?;
                     compute(wg, g, 1, "l1", Some(SRD_X[0]))?;
                     if g.streamed() {
@@ -3192,7 +3333,7 @@ mod nt {
                 } else {
                     compute(wg, g, 0, "l0", None)?;
                     load_epoch(wg, g, 1, "l0x")?;
-                    advance(wg.isa(), g.streamed())?;
+                    advance(wg.isa(), g.streamed(), g.planar())?;
                     compute(wg, g, 1, "l1", None)?;
                     load_epoch(wg, g, 0, "l1x")?;
                 }
@@ -3751,7 +3892,7 @@ mod nt {
             ),
             arch: spec.arch,
             symbol: if g.gpos {
-                spec.symbol().replacen("_sym_pm_", "_sym_gp_pm_", 1)
+                spec.symbol_gp()
             } else {
                 format!("{}{suffix}", spec.symbol())
             },
@@ -3977,7 +4118,7 @@ mod nt {
         }
         /// Step the weight descriptor and both activation descriptors one trip's epoch pair on.
         pub fn advance(b: &mut Builder) -> Result<(), String> {
-            super::advance(b, false)
+            super::advance(b, false, false)
         }
         /// `s_cmp_eq_u32 TRIPS, 0`: no full trip (workgroup-uniform).
         pub fn trips_zero_insn() -> Instruction {

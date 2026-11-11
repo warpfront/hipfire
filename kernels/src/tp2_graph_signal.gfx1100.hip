@@ -7,6 +7,9 @@
 #ifndef HF_DEVICE_WAIT_DEADLINE_H
 #include "device_wait_deadline.h"
 #endif
+#ifndef HF_TP_EXCHANGE16_H
+#include "tp_exchange16.h"
+#endif
 
 // clang's HIP `float4` is a wrapper type rather than a native vector, so the
 // nontemporal builtin cannot consume `float4*` directly. Match RCCL's gfx11
@@ -148,4 +151,126 @@ extern "C" __global__ void tp_graph_signal_reduce_gfx1100(
         const float si = local_is_first ? shadow : local;
         x[i] = x[i] + (fi + si);
     }
+}
+
+// 16-bit-exchange twin of tp_graph_signal_reduce_gfx1100
+// (`HIPFIRE_TP_EXCHANGE=bf16|f16`). Same barrier and coherent-payload
+// protocol; the 4*count-byte f32 partial is published as a 2*count-byte 16-bit
+// copy (tp_exchange16.h), so the peer segment holds half the bytes. Both ranks
+// add `x + (r(p0) + r(p1))` where r() is the 16-bit round trip: the local term
+// is rounded in register, the peer term is the peer's packed bytes, so the two
+// ranks sum identical operands in rank order.
+__device__ __forceinline__ void tp_store_nontemporal_u64(unsigned long long *ptr,
+                                                         unsigned long long value) {
+    typedef __attribute__((address_space(1))) unsigned long long *global_u64_ptr;
+    __builtin_nontemporal_store(value, (global_u64_ptr)ptr);
+}
+
+__device__ __forceinline__ unsigned long long tp_load_nontemporal_u64(
+    const unsigned long long *ptr) {
+    typedef __attribute__((address_space(1))) const unsigned long long *global_u64_ptr;
+    return __builtin_nontemporal_load((global_u64_ptr)ptr);
+}
+
+template <int FMT>
+__device__ __forceinline__ void tp_graph_signal_reduce16_body(
+    unsigned int *__restrict__ local_signal,
+    const unsigned int *__restrict__ peer_signal,
+    float *__restrict__ x,
+    const float *__restrict__ local_partial,
+    uint16_t *__restrict__ peer_shadow,
+    const uint16_t *__restrict__ local_shadow,
+    int local_is_first,
+    int count,
+    hf_device_wait_block *__restrict__ wait_block) {
+    if (blockIdx.x != 0) return;
+
+    const int vec = count >> 2;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+
+    const float4 *__restrict__ localv = reinterpret_cast<const float4 *>(local_partial);
+    unsigned long long *__restrict__ peerv = reinterpret_cast<unsigned long long *>(peer_shadow);
+    for (int i = tid; i < vec; i += stride) {
+        tp_store_nontemporal_u64(peerv + i, tp16_pack4<FMT>(localv[i]));
+    }
+    for (int i = (vec << 2) + tid; i < count; i += stride) {
+        __builtin_nontemporal_store(tp16_pack<FMT>(local_partial[i]), peer_shadow + i);
+    }
+    __threadfence_system();
+    __syncthreads();
+
+    __shared__ unsigned int epoch;
+    if (threadIdx.x == 0) {
+        epoch = __hip_atomic_load(
+            local_signal, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) + 1u;
+        __hip_atomic_exchange(
+            local_signal, epoch, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    __syncthreads();
+
+    if (!hf_bounded_wait(
+            [&] { return !tp_peer_behind(peer_signal, epoch); },
+            wait_block, HF_WAIT_SITE_TP_SIGNAL_REDUCE_GFX1100, epoch)) {
+        return;
+    }
+
+    float4 *__restrict__ xv = reinterpret_cast<float4 *>(x);
+    const unsigned long long *__restrict__ shadowv =
+        reinterpret_cast<const unsigned long long *>(local_shadow);
+    for (int i = tid; i < vec; i += stride) {
+        float4 xi = xv[i];
+        const float4 lp = localv[i];
+        float4 local;
+        local.x = tp16_round<FMT>(lp.x);
+        local.y = tp16_round<FMT>(lp.y);
+        local.z = tp16_round<FMT>(lp.z);
+        local.w = tp16_round<FMT>(lp.w);
+        // Physically local but peer-produced: bypass any stale private line.
+        const float4 shadow = tp16_unpack4<FMT>(tp_load_nontemporal_u64(shadowv + i));
+        const float4 fi = local_is_first ? local : shadow;
+        const float4 si = local_is_first ? shadow : local;
+        xi.x = xi.x + (fi.x + si.x);
+        xi.y = xi.y + (fi.y + si.y);
+        xi.z = xi.z + (fi.z + si.z);
+        xi.w = xi.w + (fi.w + si.w);
+        xv[i] = xi;
+    }
+    for (int i = (vec << 2) + tid; i < count; i += stride) {
+        const float local = tp16_round<FMT>(local_partial[i]);
+        const float shadow = tp16_unpack<FMT>(__builtin_nontemporal_load(local_shadow + i));
+        const float fi = local_is_first ? local : shadow;
+        const float si = local_is_first ? shadow : local;
+        x[i] = x[i] + (fi + si);
+    }
+}
+
+extern "C" __global__ void tp_graph_signal_reduce16_bf16_gfx1100(
+    unsigned int *__restrict__ local_signal,
+    const unsigned int *__restrict__ peer_signal,
+    float *__restrict__ x,
+    const float *__restrict__ local_partial,
+    uint16_t *__restrict__ peer_shadow,
+    const uint16_t *__restrict__ local_shadow,
+    int local_is_first,
+    int count,
+    hf_device_wait_block *__restrict__ wait_block) {
+    tp_graph_signal_reduce16_body<HF_TP16_BF16>(local_signal, peer_signal, x, local_partial,
+                                                peer_shadow, local_shadow, local_is_first, count,
+                                                wait_block);
+}
+
+extern "C" __global__ void tp_graph_signal_reduce16_f16_gfx1100(
+    unsigned int *__restrict__ local_signal,
+    const unsigned int *__restrict__ peer_signal,
+    float *__restrict__ x,
+    const float *__restrict__ local_partial,
+    uint16_t *__restrict__ peer_shadow,
+    const uint16_t *__restrict__ local_shadow,
+    int local_is_first,
+    int count,
+    hf_device_wait_block *__restrict__ wait_block) {
+    tp_graph_signal_reduce16_body<HF_TP16_F16>(local_signal, peer_signal, x, local_partial,
+                                               peer_shadow, local_shadow, local_is_first, count,
+                                               wait_block);
 }

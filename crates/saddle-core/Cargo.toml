@@ -25,3 +25,7 @@ lab = []
 [[example]]
 name = "cb_vmm_addressing_g1"
 required-features = ["lab"]
+
+[[example]]
+name = "cb_a3b_fa_lanes_gate"
+required-features = ["lab"]

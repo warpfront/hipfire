@@ -41,3 +41,15 @@ required-features = ["lab"]
 [[example]]
 name = "d2_mapped_return_pilot"
 required-features = ["lab"]
+
+[[example]]
+name = "hc_allrows_oracle"
+required-features = ["test-utils"]
+
+[[example]]
+name = "lwmma_multi_front_oracle"
+required-features = ["test-utils"]
+
+[[example]]
+name = "mtp_proj_batch_oracle"
+required-features = ["test-utils"]

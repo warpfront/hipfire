@@ -74,9 +74,9 @@ use serde_json::{json, Value};
 
 const ARCH: Arch = Arch::Gfx1201;
 /// Rotation width and A4 group width in columns.
-const GROUP: usize = moe_rotate_i4_pm::GROUP as usize;
+pub(crate) const GROUP: usize = moe_rotate_i4_pm::GROUP as usize;
 /// Bytes of one `block_i4_128` record.
-const REC: usize = moe_rotate_i4_pm::RECORD_BYTES as usize;
+pub(crate) const REC: usize = moe_rotate_i4_pm::RECORD_BYTES as usize;
 /// `Gpu::qwen4_moe_rotate128_i4_pm` block (`MOE_ROTATE_I4_PM_BLOCK`, `rdna-compute/src/moe_rotate_i4_pm.rs:40`).
 const BLOCK: u32 = 32;
 /// Largest valid-record count checked in full by default.
@@ -601,7 +601,7 @@ fn parse_signs(b: &[u8]) -> Result<[f32; GROUP]> {
 /// FWHT128 as the kernel: widen, `* signs1`, butterflies of strides 1..64
 /// (`lo' = lo + hi`, `hi' = lo - hi`), `(v * 0.0883883476) * signs2`
 /// (`crates/peacemaker-isa/tests/moe_rotate_i4_pm.rs:490-511`).
-fn rotate(h: &[u16; GROUP], s1: &[f32; GROUP], s2: &[f32; GROUP]) -> [f32; GROUP] {
+pub(crate) fn rotate(h: &[u16; GROUP], s1: &[f32; GROUP], s2: &[f32; GROUP]) -> [f32; GROUP] {
     let mut v = [0f32; GROUP];
     for i in 0..GROUP {
         v[i] = f32::from_bits(u32::from(h[i]) << 16) * s1[i];
@@ -628,7 +628,7 @@ fn rotate(h: &[u16; GROUP], s1: &[f32; GROUP], s2: &[f32; GROUP]) -> [f32; GROUP
 /// `fake_quantize_block_i4_128(candidates = 2)` (`hipfire-quantize/src/calibration.rs`),
 /// four values per simulated lane and the XOR 16,8,4,2,1 trees
 /// (`crates/peacemaker-isa/tests/moe_rotate_i4_pm.rs:515-576`).
-fn quantize(x: &[f32; GROUP]) -> [u8; REC] {
+pub(crate) fn quantize(x: &[f32; GROUP]) -> [u8; REC] {
     let mut lane_amax = [0f32; 32];
     for (lane, a) in lane_amax.iter_mut().enumerate() {
         let b = lane * 4;

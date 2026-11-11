@@ -265,7 +265,12 @@ pub fn undefined_reads(kernel: &Kernel) -> Vec<Undefined> {
 /// Check 11 on a rewrite. `edited` is the kernel the script produced (its instructions
 /// carry edit provenance, original ones keep their base ids); `emitted` is the same kernel
 /// lifted back from the final bytes, instruction for instruction.
-pub fn check(base: &Kernel, edited: &Kernel, emitted: &Kernel) -> Result<(), String> {
+pub fn check(
+    arch: peacemaker_ir::inst::Arch,
+    base: &Kernel,
+    edited: &Kernel,
+    emitted: &Kernel,
+) -> Result<(), String> {
     if emitted.body.layout.len() != edited.body.layout.len() {
         return Err(format!(
             "the final bytes hold {} instructions, the script produced {}",
@@ -282,7 +287,7 @@ pub fn check(base: &Kernel, edited: &Kernel, emitted: &Kernel) -> Result<(), Str
         let id = edited.body.layout[u.index];
         let inst = edited.body.insts.get(id).expect("laid out");
         let mut missing = u.locations;
-        if let Some(reg) = preserved_vgpr_destination(peacemaker_ir::inst::Arch::Gfx1201, inst) {
+        if let Some(reg) = preserved_vgpr_destination(arch, inst) {
             for d in locations(reg) {
                 missing.remove(&name(d));
             }
@@ -290,9 +295,7 @@ pub fn check(base: &Kernel, edited: &Kernel, emitted: &Kernel) -> Result<(), Str
         if missing.is_empty() {
             continue;
         }
-        let text = inst
-            .text(peacemaker_ir::inst::Arch::Gfx1201)
-            .unwrap_or_default();
+        let text = inst.text(arch).unwrap_or_default();
         if inst.prov.edit.is_some() {
             failures.push(format!(
                 "inserted `{text}` reads {missing:?} undefined on some path"
@@ -387,7 +390,7 @@ mod tests {
             3,
             "diamond: [cmp, branch] [def v200] [join]"
         );
-        let err = check(&base, &edited, &edited).unwrap_err();
+        let err = check(peacemaker_ir::inst::Arch::Gfx1201, &base, &edited, &edited).unwrap_err();
         assert!(err.contains("v200"), "{err}");
     }
 
@@ -397,13 +400,19 @@ mod tests {
     fn straight_line_insertion_passes() {
         let base = kernel(&[DEF_V200, ENDPGM], &[]);
         let edited = kernel(&[DEF_V200, READ_V200, ENDPGM], &[1]);
-        assert_eq!(check(&base, &edited, &edited), Ok(()));
+        assert_eq!(
+            check(peacemaker_ir::inst::Arch::Gfx1201, &base, &edited, &edited),
+            Ok(())
+        );
         let base = kernel(&[CMP, SKIP1, DEF_V200, READ_V200, ENDPGM], &[]);
         assert_eq!(
             undefined_reads(&base).len(),
             1,
             "the original join read is undefined on the taken path"
         );
-        assert_eq!(check(&base, &base, &base), Ok(()));
+        assert_eq!(
+            check(peacemaker_ir::inst::Arch::Gfx1201, &base, &base, &base),
+            Ok(())
+        );
     }
 }

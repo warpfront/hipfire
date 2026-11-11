@@ -1,0 +1,651 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+// The `iu4_gemm` generator with its K128 blocks written out in `.rip` from the
+// FINE K-loop natives (cookbook 17): `fine_block` (dense) and `fine_sparse_block`
+// (the 2:4-sparse SWMMAC K-loops) below spell the block as head, fragment
+// loads, MMA groups, publishes, waits, barriers, the fold, so wait placement
+// and prefetch order are script choices, each checked by the same driver and
+// typed core as the generator.
+//
+// With `WAIT = "after"` it re-emits the generator's default-tune bytes for every dense
+// and sparse variant (`tests/iu4_gemm_fine_twin.rs`); `"mid"`, `"before"` and `"window"`
+// re-emit the generator's `Tune { wait: Mid | Before | Window }` for the dense variants
+// (the sparse block has the one, default placement; `"window"` is the 128x128x8 tile only
+// and is what the shipped 27B gate/up `_b1s` export, `Tune::shipped_gate_up_slab`, runs).
+// To time a variation:
+//
+//     pm_loop --kernel iu4_gemm ... --rip crates/peacemaker-isa/src/kernels/iu4_gemm_fine.rip
+//
+// Edit the composition here and re-run: no rebuild.
+//
+// Variant grammar: the shipped variant name, `Spec::variant_name()`:
+//
+//     FOLD-TILE-CACC[-slab]-EPI[-s24x64|-s24x32]
+//
+//     FOLD  k128 | k256s | k256p              (fold granularity; only k128 builds)
+//     TILE  128x128x8 | 256x128x16            (rows x tokens x waves)
+//     CACC  cacc1 | cacc2                     (int32 accumulator sets; only cacc1 builds)
+//     slab  optional: the slab activation layout (default: token layout)
+//     EPI   set | add | addsigmoid | silu | silu-bf16 | qkvzagdn
+//     MMA   optional: s24x64 | s24x32 = the 2:4-sparse SWMMAC K-loop (set/add on the
+//           128x128x8 token-layout tile only; default: the dense WMMA K-loop)
+//
+// e.g. `k128-128x128x8-cacc1-set`, `k128-128x128x8-cacc1-slab-silu-bf16`,
+// `k128-256x128x16-cacc1-add`. A combination without a generator is refused by
+// `Iu4Gen::new` with the Rust `Spec::validate` message. `VARIANTS` lists every
+// valid one. gfx1201 only.
+//
+// Blocks work on the typed workgroup scope through `Driver::typed`: `lds` is
+// the array of the four LDS rings (A, W, DS, SZ), declared Free, Published/Free
+// at a block boundary. A block takes it and returns it.
+
+const ARCHES: &[&str] = &["gfx1201"];
+
+// Where the next slab's publish (the LDS stores into the Free next buffer) sits
+// between the WMMA groups: "after" (the default order), "mid" (between the two
+// 32-K groups) or "before" (ahead of both). The wait and the rotate that make
+// it readable stay where they are, so the stores' distance to them grows.
+// "window" (128x128x8 tile): "mid", plus `d_loads` moved ahead into phase A and
+// the first rendezvous split around sub-block 1's WMMA group.
+const WAIT: &str = "after";
+
+// The fold schedule: "paired" (the shipped order) or "chain" (the generator's
+// `Tune { fold_sched: FoldSched::Chain }`, F3-01-lead1rot-prio: only the first
+// accumulator is unbiased between the WMMAs, pair-swapped; stage 2 runs in bundle order
+// with each accumulator's fmac packets carrying the rotated stage-1 subrevs of the next;
+// wave priority 2 from the block head, 1 from the fold on). `iu4::wmma` (fold = true) and
+// `iu4::fold_scale` emit the chained packets and the priority drop from the spec; the
+// block head's `s_setprio 2` below is the script's. With `WAIT = "window"` this is the
+// shipped 27B gate/up `_b1s` export.
+const FOLD: &str = "paired";
+
+// The depth of the A/W payload rings: 2 (the shipped kernel) or 3 (the generator's
+// `Tune { ring: RingDepth::Three }`: a third LDS slab, a second prefetch set, two
+// slabs published ahead; dense K128 variants except the fused GDN projection).
+// `RING = 3` writes the whole depth-3 composition below (`author3`): the entry
+// branch on the leading group count, the arms, the three-group loop body and the
+// peeled tail group, from the same fine natives plus `iu4::fetch_ahead`,
+// `iu4::fetch_slab` and `iu4::publish_slab_set`. It re-emits the generator's
+// depth-3 bytes for every `WAIT` placement (`tests/iu4_gemm_fine_twin.rs`).
+const RING: usize = 2;
+
+const VARIANTS: &[&str] = &[
+    "k128-128x128x8-cacc1-set",
+    "k128-128x128x8-cacc1-slab-set",
+    "k128-128x128x8-cacc1-add",
+    "k128-128x128x8-cacc1-slab-add",
+    "k128-128x128x8-cacc1-addsigmoid",
+    "k128-128x128x8-cacc1-silu",
+    "k128-128x128x8-cacc1-slab-silu",
+    "k128-128x128x8-cacc1-silu-bf16",
+    "k128-128x128x8-cacc1-slab-silu-bf16",
+    "k128-128x128x8-cacc1-qkvzagdn",
+    "k128-128x128x8-cacc1-slab-qkvzagdn",
+    "k128-256x128x16-cacc1-set",
+    "k128-256x128x16-cacc1-add",
+    "k128-256x128x16-cacc1-silu",
+    "k128-128x128x8-cacc1-set-s24x64",
+    "k128-128x128x8-cacc1-set-s24x32",
+    "k128-128x128x8-cacc1-add-s24x64",
+    "k128-128x128x8-cacc1-add-s24x32",
+];
+
+fn emit(spec: Spec) -> Result<Emitted, String> {
+    let g = Iu4Gen::new(iu4_spec(&spec.variant, spec.arch)?)?;
+    let mut b = Builder::new(g.kernel_spec(), g.plan()?);
+    let mut wg = Workgroup::new(&mut b, spec.arch)?;
+    author(&mut wg, &g)?;
+    b.finish()
+}
+
+// The variant name as the `Iu4Spec` it names.
+fn iu4_spec(variant: &str, arch: Arch) -> Result<Iu4Spec, String> {
+    let mut parts: Vec<&str> = variant.split('-').collect();
+    // An optional trailing `-s24x64` / `-s24x32`: the 2:4-sparse SWMMAC K-loop.
+    let mut mma = Mma::Dense;
+    let last = parts[parts.len() - 1];
+    if last == "s24x64" {
+        mma = Mma::S24X64;
+        parts.pop();
+    } else if last == "s24x32" {
+        mma = Mma::S24X32;
+        parts.pop();
+    }
+    if parts.len() < 4 {
+        return Err(format!("variant `{variant}`: expected FOLD-TILE-CACC[-slab]-EPI[-s24x64|-s24x32]"));
+    }
+    let fold = match parts[0] {
+        "k128" => Fold::K128,
+        "k256s" => Fold::K256Shared,
+        "k256p" => Fold::K256Pow2,
+        f => return Err(format!("variant `{variant}`: unknown fold `{f}` (k128, k256s, k256p)")),
+    };
+    let tile = match parts[1] {
+        "128x128x8" => Tile::T128x128x8,
+        "256x128x16" => Tile::T256x128x16,
+        t => return Err(format!("variant `{variant}`: unknown tile `{t}` (128x128x8, 256x128x16)")),
+    };
+    let cacc = match parts[2] {
+        "cacc1" => Cacc::One,
+        "cacc2" => Cacc::Two,
+        c => return Err(format!("variant `{variant}`: unknown accumulator count `{c}` (cacc1, cacc2)")),
+    };
+    let slab = parts[3] == "slab";
+    let act = if slab { ALayout::Slab } else { ALayout::Token };
+    let first = if slab { 4 } else { 3 };
+    if first >= parts.len() {
+        return Err(format!("variant `{variant}`: missing the epilogue"));
+    }
+    let name = parts.iter().skip(first).cloned().collect::<Vec<_>>().join("-");
+    let epi = match name.as_str() {
+        "set" => Epi::Set,
+        "add" => Epi::Add,
+        "addsigmoid" => Epi::AddSigmoid,
+        "silu" => Epi::GateUpSilu,
+        "silu-bf16" => Epi::GateUpSiluBf16,
+        "qkvzagdn" => Epi::QkvzaGdn,
+        e => return Err(format!("variant `{variant}`: unknown epilogue `{e}` (set, add, addsigmoid, silu, silu-bf16, qkvzagdn)")),
+    };
+    let ring = if RING == 3 { RingDepth::Three } else { RingDepth::Two };
+    let fold_sched = if FOLD == "chain" { FoldSched::Chain } else { FoldSched::Paired };
+    Ok(Iu4Spec { fold: fold, tile: tile, cacc: cacc, epi: epi, act: act, arch: arch, mma: mma, ring: ring, fold_sched: fold_sched })
+}
+
+// The Workgroup scope lives here, not in emit(): emit() mentions `b` again at
+// finish(), which would end the scope under any later `wg` use.
+fn author<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen) -> Result<(), String> {
+    let lds = iu4::declare_lds(wg, g)?;
+    let end = wg.exit(iu4::END)?;
+    // Every symbol runs its K-loop at wave priority 1 and drops to 0 for its
+    // epilogue (the fused projection keeps its stores at 1 and drops at the QKV
+    // tiles' GDN epilogue), so co-resident K-loops win issue arbitration over a
+    // finishing tile. Scheduling only.
+    op(wg.isa(), "s_setprio 1", vec![], vec![])?;
+    if RING == 3 {
+        return author3(wg, g, end, lds);
+    }
+    let lds = iu4::prologue(wg, g, end, lds)?;
+    let lds = kloop(wg, g, lds)?;
+    iu4::epilogue(wg, g, end)?;
+    // Only the fused projection reuses the LDS after the K loop: its QKV tiles
+    // continue at the GDN label the epilogue's exit branch skips to.
+    if g.spec().epi == Epi::QkvzaGdn {
+        iu4::gdn_epilogue(wg, g, lds)?;
+    }
+    wg.end(end)
+}
+
+// The rolled K-loop. One trip is a whole 256-K group (two 128-K blocks, plane
+// parity 0 then 1), so every LDS address is an immediate and the trip ends in
+// the state it started in; `loop_carried` checks that. The last group is
+// peeled: its second block fetches and publishes nothing.
+fn kloop<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, lds: Lds) -> Result<Lds, String> {
+    wg.label(iu4::K_BEGIN)?;
+    // K == 256: no full trip; go straight to the peeled group.
+    let no_trip = iu4::trips_cmp(wg, g, "s_cmp_eq_u32")?;
+    let lds = wg.wg_skip_if(no_trip, iu4::tail_label(0), lds, |wg, lds| {
+        let lds = wg.loop_carried(iu4::K_LOOP, lds, |wg, lds| {
+            let lds = mma_block(wg, g, "m0", 0, true, iu4::label("m1"), true, lds)?;
+            // The even-block descriptor was last read by block 0's slab-1 fetch;
+            // block 1 moves it to block 2g+2 before its own next-block fetch
+            // reads it (a step inside the block, after its slab-1 fetch).
+            let lds = mma_block_stepping(wg, g, "m1", 1, true, iu4::K_LOOP_END, true, 0, lds)?;
+            // Trip end: the odd-block descriptor and the group offset move on
+            // after every read of them in this trip.
+            iu4::trip_end(wg, g)?;
+            let more = iu4::trips_cmp(wg, g, "s_cmp_lg_u32")?;
+            Ok((lds, more))
+        })?;
+        wg.label(iu4::K_LOOP_END)?;
+        Ok(lds)
+    })?;
+    // The skip target is the peeled group's first block label, which this
+    // block's `entry_label = false` leaves for the `wg_skip_if` above to place.
+    let lds = mma_block(wg, g, "t0", 0, true, iu4::label("t1"), false, lds)?;
+    mma_block(wg, g, "t1", 1, false, iu4::EPI, true, lds)
+}
+
+// The block of the spec's matrix instruction: the dense WMMA block or the
+// 2:4-sparse SWMMAC block, each spelled out below with the fine K-loop natives
+// (the sparse weights must be packed by `iu4_gemm::sparse24::pack_block`; same
+// arguments, same ring transitions).
+fn mma_block<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, h: usize, fetch_next: bool,
+        end_label: &str, entry_label: bool, lds: Lds) -> Result<Lds, String> {
+    if g.spec().mma == Mma::Dense {
+        fine_block(wg, g, tag, h, fetch_next, end_label, entry_label, None, lds)
+    } else {
+        fine_sparse_block(wg, g, tag, h, fetch_next, end_label, entry_label, None, lds)
+    }
+}
+
+fn mma_block_stepping<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, h: usize, fetch_next: bool,
+        end_label: &str, entry_label: bool, step: usize, lds: Lds) -> Result<Lds, String> {
+    if g.spec().mma == Mma::Dense {
+        fine_block(wg, g, tag, h, fetch_next, end_label, entry_label, Some(step), lds)
+    } else {
+        fine_sparse_block(wg, g, tag, h, fetch_next, end_label, entry_label, Some(step), lds)
+    }
+}
+
+// `iu4::wmma(.., sb = 1, first = false, fold = false)` spelled out with `Wmma::iu4`,
+// WMMAs `lo..hi` of the generator's bundle order: accumulate in place. `iu4::wmma`
+// refuses a ring held by a split barrier (a WMMA reads registers only), so the group
+// inside the barrier window is pushed directly. Registers are the 128x128x8 tile's:
+// accumulators v0.., sub-block-1 fragments at v148 (W) / v152 (A).
+fn raw_wmma_sb1<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, lo: usize, hi: usize) -> Result<(), String> {
+    let order = [0usize, 2, 4, 6, 1, 3, 5, 7];
+    for i in lo..hi {
+        let k = order[i];
+        let nb = k / 2;
+        let rg = k % 2;
+        let dst = (8 * k) as u8;
+        let a = (148 + 2 * rg) as u8;
+        let b = (152 + 2 * nb) as u8;
+        wg.isa().push(Wmma::iu4(g.spec().arch, vr(dst, 8), vr(a, 2), vr(b, 2), Some(vr(dst, 8))))?;
+    }
+    Ok(())
+}
+
+// One K128 block of the dense K-loop on plane `h`, written with the fine
+// natives in the order the generator's `block` uses (`WAIT = "after"`; the other
+// placements are the generator's `Tune { wait: Mid | Before | Window }`). `step`
+// advances that descriptor right after the block's head, as `block_stepping`.
+// `WAIT = "window"` (128x128x8 tile): `iu4::d_loads` right after phase A's fragments,
+// slab 0's group, the slab-1 publish, then the rendezvous split with sub-block 1's
+// WMMA group (`raw_wmma_sb1`) inside its window.
+//
+// Ring discipline, each line checked by the driver:
+//   publish_*   next buffer Free -> Writing (a Pending token)
+//   wait        Pending -> Drained (names the ring set)
+//   barrier     rotate: cur retired, the Drained next one published
+//   rip_fragments / scale_loads / wmma   read the Published current buffer
+fn fine_block<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, h: usize, fetch_next: bool,
+        end_label: &str, entry_label: bool, step: Option<usize>, lds: Lds) -> Result<Lds, String> {
+    let lds = iu4::block_begin(wg, g, tag, h, end_label, entry_label, lds)?;
+    if let Some(s) = step {
+        iu4::step_descriptor(wg, g, s)?;
+    }
+    // Wave priority 2 over the block's WMMA groups; `iu4::fold_scale` drops it to 1.
+    if FOLD == "chain" {
+        op(wg.isa(), "s_setprio 2", vec![], vec![])?;
+    }
+    // Phase A: slab 0 from slot 0; slab 1 (fetched by the preceding block) is
+    // published into slot 1.
+    let lds = rip_fragments(wg, g, lds)?;
+    let lds = if WAIT == "window" { iu4::d_loads(wg, g, lds)? } else { lds };
+    let lds = if WAIT == "after" {
+        let lds = iu4::wmma(wg, g, 0, true, false, lds)?;
+        let lds = iu4::wmma(wg, g, 1, false, false, lds)?;
+        iu4::publish_slab(wg, g, lds)?
+    } else if WAIT == "mid" {
+        let lds = iu4::wmma(wg, g, 0, true, false, lds)?;
+        let lds = iu4::publish_slab(wg, g, lds)?;
+        iu4::wmma(wg, g, 1, false, false, lds)?
+    } else if WAIT == "window" {
+        let lds = iu4::wmma(wg, g, 0, true, false, lds)?;
+        iu4::publish_slab(wg, g, lds)?
+    } else {
+        let lds = iu4::publish_slab(wg, g, lds)?;
+        let lds = iu4::wmma(wg, g, 0, true, false, lds)?;
+        iu4::wmma(wg, g, 1, false, false, lds)?
+    };
+    if fetch_next {
+        iu4::fetch_next_meta(wg, g, h)?;
+    }
+    let (da, dw) = iu4::wait(wg, lds, "slab")?;
+    if WAIT == "window" {
+        let b1 = wg.signal((rotate(lds[0], da), rotate(lds[1], dw)))?;
+        raw_wmma_sb1(wg, g, 0, 8)?;
+        wg.wait_arrived(b1)?;
+    } else {
+        wg.barrier((rotate(lds[0], da), rotate(lds[1], dw)))?;
+    }
+    // Phase B: slab 1 from slot 1, the fold, the next block into slot 0.
+    if fetch_next {
+        iu4::fetch_next(wg, g, h)?;
+    }
+    let lds = rip_fragments(wg, g, lds)?;
+    let lds = if WAIT == "window" { lds } else { iu4::d_loads(wg, g, lds)? };
+    if !fetch_next {
+        // The peeled group's last block: nothing to publish.
+        let lds = iu4::wmma(wg, g, 0, false, false, lds)?;
+        let lds = iu4::scale_loads(wg, g, tag, lds)?;
+        let lds = iu4::wmma(wg, g, 1, false, true, lds)?;
+        let lds = iu4::scale_tail(wg, g, tag, lds)?;
+        iu4::fold_scale(wg, g)?;
+        return Ok(lds);
+    }
+    let lds = if WAIT == "after" || WAIT == "window" {
+        let lds = iu4::wmma(wg, g, 0, false, false, lds)?;
+        let lds = iu4::scale_loads(wg, g, tag, lds)?;
+        let lds = iu4::wmma(wg, g, 1, false, true, lds)?;
+        let lds = iu4::scale_tail(wg, g, tag, lds)?;
+        let lds = iu4::publish_slab(wg, g, lds)?;
+        iu4::publish_meta(wg, g, lds)?
+    } else if WAIT == "mid" {
+        let lds = iu4::wmma(wg, g, 0, false, false, lds)?;
+        let lds = iu4::scale_loads(wg, g, tag, lds)?;
+        let lds = iu4::publish_slab(wg, g, lds)?;
+        let lds = iu4::publish_meta(wg, g, lds)?;
+        let lds = iu4::wmma(wg, g, 1, false, true, lds)?;
+        iu4::scale_tail(wg, g, tag, lds)?
+    } else {
+        let lds = iu4::publish_slab(wg, g, lds)?;
+        let lds = iu4::publish_meta(wg, g, lds)?;
+        let lds = iu4::wmma(wg, g, 0, false, false, lds)?;
+        let lds = iu4::scale_loads(wg, g, tag, lds)?;
+        let lds = iu4::wmma(wg, g, 1, false, true, lds)?;
+        iu4::scale_tail(wg, g, tag, lds)?
+    };
+    let (da, dw, dd, ds) = iu4::wait(wg, lds, "all")?;
+    let b2 = wg.signal((rotate(lds[0], da), rotate(lds[1], dw), rotate(lds[2], dd), rotate(lds[3], ds)))?;
+    // The signal drained slab-0 stores: the retired payload ring can hold the
+    // next K128's slab 1 while this block folds. The odd block runs before the
+    // group offset advances, so it names the next group explicitly.
+    if h == 0 {
+        iu4::fetch_slab1(wg, g, 1)?;
+    } else {
+        iu4::fetch_slab1_next_group(wg, g)?;
+    }
+    iu4::fold_scale(wg, g)?;
+    wg.wait_arrived(b2)?;
+    Ok(lds)
+}
+
+// The fragment loads of a dense block, written here: per 32-K sub-block one
+// W load (both row groups) and two A loads (column blocks 0-1, 2-3), from the
+// payload rings' current slot. The script builds the six instructions;
+// `iu4::fragments_body` lends the A and W rings in their state (Published
+// current buffer, Free or Writing next, depth 2 or 3), replays each load on
+// the ring its `PayloadRole` names through the typed core, and gives them
+// back. Only LDS loads are accepted. Edit the body here: no rebuild.
+fn rip_fragments<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, lds: Lds) -> Result<Lds, String> {
+    // DS offset fields count 512-byte strides (`stride64` of b64).
+    let slot = lds[0].cur_index();
+    let a = g.payload_base(PayloadRole::A, slot)? / 512;
+    let w = g.payload_base(PayloadRole::W, slot)? / 512;
+    let mut loads = Vec::new();
+    for sb in 0..2 {
+        let f = g.reg(&format!("f{sb}")).ok_or("no fragment register")?;
+        let fr_w = g.reg(&format!("fr_w{sb}")).ok_or("no W address register")?;
+        let fr_a = g.reg(&format!("fr_a{sb}")).ok_or("no A address register")?;
+        loads.push(NativeLoad { role: PayloadRole::W, insn: frag_load(f, fr_w, w) });
+        for half in 0..2 {
+            loads.push(NativeLoad { role: PayloadRole::A, insn: frag_load(f + 4 + 4 * half, fr_a, a + 2 * half) });
+        }
+    }
+    iu4::fragments_body(wg, g, lds, loads)
+}
+
+// `ds_load_2addr_stride64_b64` of four VGPRs at `dst` from `v{addr}`, the two
+// halves `o` and `o + 1` strides apart.
+fn frag_load(dst: u8, addr: u8, o: u32) -> Instruction {
+    let text = format!("ds_load_2addr_stride64_b64 v[{}:{}], v{}{}", dst, dst + 3, addr, ds_offsets(o, o + 1));
+    Instruction::new(text, vec![vr(dst, 4)], vec![v(addr)]).memory(MemoryClass::DsLoad)
+}
+
+// DS offset fields as objdump prints them: a zero field is omitted.
+fn ds_offsets(o0: u32, o1: u32) -> String {
+    let mut t = String::new();
+    if o0 != 0 {
+        t.push_str(&format!(" offset0:{o0}"));
+    }
+    if o1 != 0 {
+        t.push_str(&format!(" offset1:{o1}"));
+    }
+    t
+}
+
+// ---- ring depth 3 (`RING = 3`) -------------------------------------------------
+//
+// The A/W payload rings are three LDS slabs deep and publish two slabs ahead;
+// the metadata rings stay two deep. Two prefetch register sets hold the next
+// block's slabs: set 0 its slab 0, set 1 its slab 1. At block `b`'s entry slab
+// `2b` is the current buffer, slab `2b + 1` is published ahead, and the sets hold
+// block `b + 1`. With n = K/256 - 1 full groups, r = n mod 3 and q = n / 3, slab
+// `s` lives in slot (s - r) mod 3, so every LDS address is an immediate: r
+// leading groups (in an arm of the entry branch that also starts the rings at
+// slot (3 - r) mod 3), q trips of a three-group loop body, then the peeled group.
+// Everything is checked by the same driver and typed core as the generator.
+
+fn author3<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, end: Exit, lds: Lds) -> Result<(), String> {
+    // Arguments, raster, descriptors .. block 0's fetches; the rings stay Free.
+    iu4::setup(wg, g, end)?;
+    wg.label(iu4::K_BEGIN)?;
+    // q -> the trip register, r -> a scratch SGPR.
+    iu4::split_trips(wg, g)?;
+    let c0 = iu4::ring_cmp(wg, g, 0)?;
+    wg.wg_if_else(c0, iu4::label("arms_else"), iu4::label("arms_join"),
+        |wg| { arm(wg, g, 0, lds) },
+        |wg| {
+            let c1 = iu4::ring_cmp(wg, g, 1)?;
+            wg.wg_if_else(c1, iu4::label("arms_else12"), iu4::label("arms_join12"),
+                |wg| { arm(wg, g, 1, lds) },
+                |wg| { arm(wg, g, 2, lds) })
+        })?;
+    // No full trip (n is r < 3 groups): straight to the peeled group.
+    let no_trip = iu4::trips_cmp(wg, g, "s_cmp_eq_u32")?;
+    let lds = wg.wg_skip_if(no_trip, iu4::tail_label(0), lds, |wg, lds| {
+        let lds = wg.loop_carried(iu4::K_LOOP, lds, |wg, lds| {
+            let lds = group3(wg, g, "b0", iu4::label("b1m0"), false, lds)?;
+            let lds = group3(wg, g, "b1", iu4::label("b2m0"), false, lds)?;
+            let lds = group3(wg, g, "b2", iu4::K_LOOP_END, true, lds)?;
+            let more = iu4::trips_cmp(wg, g, "s_cmp_lg_u32")?;
+            Ok((lds, more))
+        })?;
+        wg.label(iu4::K_LOOP_END)?;
+        Ok(lds)
+    })?;
+    // The peeled group: the even block publishes the odd block's slabs and
+    // fetches nothing; the odd block publishes nothing and moves its rings on.
+    // The skip target is the even block's label, which `entry_label = false`
+    // leaves for the `wg_skip_if` above to place.
+    let lds = fine_block3(wg, g, "t0", 0, "t0", iu4::label("t1"), false, None, lds)?;
+    fine_block3(wg, g, "t1", 1, "t1", iu4::EPI, true, None, lds)?;
+    iu4::epilogue(wg, g, end)?;
+    wg.end(end)
+}
+
+// Arm r of the entry branch: the rings start at slot (3 - r) mod 3, the
+// prologue's ring part, r full groups. The last block's register lifetimes
+// close at a label of the arm (lifetimes are positional).
+fn arm<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, r: usize, lds: Lds) -> Result<(), String> {
+    let k = (3 - r) % 3;
+    lds[0].starting_at(k);
+    lds[1].starting_at(k);
+    let lds = ring_part3(wg, g, lds)?;
+    if r == 1 {
+        group3(wg, g, "a1g0", iu4::label("a1_end"), false, lds)?;
+        wg.label(iu4::label("a1_end"))?;
+    } else if r == 2 {
+        let lds = group3(wg, g, "a2g0", iu4::label("a2g1m0"), false, lds)?;
+        group3(wg, g, "a2g1", iu4::label("a2_end"), false, lds)?;
+        wg.label(iu4::label("a2_end"))?;
+    }
+    Ok(())
+}
+
+// The prologue's ring part: block 0's slab 0 and metadata into the rings' first
+// buffers (`prime`), block 1's slab 0 fetched behind the first rendezvous, slab 1
+// published behind a second one (the vacant current buffer rotates), block 1's
+// slab 1 fetched. Slab 0 is then current, slab 1 ahead, block 1 in flight.
+fn ring_part3<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, lds: Lds) -> Result<Lds, String> {
+    let lds = iu4::publish_slab(wg, g, lds)?;
+    let lds = iu4::publish_meta(wg, g, lds)?;
+    let (da, dw, dd, ds) = iu4::wait(wg, lds, "all")?;
+    let arrived = wg.signal((prime(lds[0], da), prime(lds[1], dw), prime(lds[2], dd), prime(lds[3], ds)))?;
+    // Block 1 (plane 1, group 0): slab 0 into set 0, whose stores are drained.
+    iu4::fetch_slab(wg, g, 0, 0, 1, 72)?;
+    wg.wait_arrived(arrived)?;
+    let lds = iu4::publish_slab_set(wg, g, 1, lds)?;
+    let (da, dw) = iu4::wait(wg, lds, "slab")?;
+    wg.barrier((rotate(lds[0], da), rotate(lds[1], dw)))?;
+    iu4::fetch_slab(wg, g, 1, 1, 1, 104)?;
+    Ok(lds)
+}
+
+// One full 256-K group: two blocks, each stepping its own plane's activation
+// descriptor at its head (block b + 2 is one group on), then the group offset
+// advances; `count` also drops the loop's trip counter (the loop body's last group).
+fn group3<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, end_label: &str, count: bool,
+        lds: Lds) -> Result<Lds, String> {
+    let m0 = format!("{tag}m0");
+    let m1 = format!("{tag}m1");
+    let lds = fine_block3(wg, g, &m0, 0, "full", iu4::label(&m1), true, Some(0), lds)?;
+    let lds = fine_block3(wg, g, &m1, 1, "full", end_label, true, Some(1), lds)?;
+    iu4::group_end(wg, g, count)?;
+    Ok(lds)
+}
+
+// One K128 block of the depth-3 K-loop on plane `h`, the generator's `block3`
+// written with the fine natives. `kind`: "full" publishes block b + 1's slabs
+// and fetches block b + 2's; "t0" (the peeled group's even block) fetches
+// nothing; "t1" (its odd block) publishes and fetches nothing. `step` advances
+// that plane's activation descriptor right after the block's head.
+//
+//   phase A   fragments(cur) ; WMMA groups ; publish set 0 (block b+1's slab 0)
+//             into the free next buffer ; fetch_next_meta ; wait ; barrier
+//             rotate(A, W) ; fetch block b+2's slab 0 into set 0
+//   phase B   fragments(cur) ; d_loads ; WMMA groups ; publish set 1 (slab 1) and
+//             the metadata ; wait ; signal rotate(A, W, DS, SZ) ; fetch block
+//             b+2's slab 1 into set 1 ; fold ; wait_arrived
+//   "t1"      nothing is published, so phase A's barrier is `advance`: the
+//             current buffer retires and the ahead buffer (published by "t0")
+//             becomes current, with no store.
+fn fine_block3<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, h: usize, kind: &str,
+        end_label: &str, entry_label: bool, step: Option<usize>, lds: Lds) -> Result<Lds, String> {
+    let lds = iu4::block_begin(wg, g, tag, h, end_label, entry_label, lds)?;
+    if let Some(s) = step {
+        iu4::step_descriptor(wg, g, s)?;
+    }
+    let lds = rip_fragments(wg, g, lds)?;
+    if kind == "t1" {
+        let lds = iu4::wmma(wg, g, 0, true, false, lds)?;
+        let lds = iu4::wmma(wg, g, 1, false, false, lds)?;
+        wg.barrier((advance(lds[0]), advance(lds[1])))?;
+    } else {
+        let lds = if WAIT == "after" {
+            let lds = iu4::wmma(wg, g, 0, true, false, lds)?;
+            let lds = iu4::wmma(wg, g, 1, false, false, lds)?;
+            iu4::publish_slab(wg, g, lds)?
+        } else if WAIT == "mid" {
+            let lds = iu4::wmma(wg, g, 0, true, false, lds)?;
+            let lds = iu4::publish_slab(wg, g, lds)?;
+            iu4::wmma(wg, g, 1, false, false, lds)?
+        } else {
+            let lds = iu4::publish_slab(wg, g, lds)?;
+            let lds = iu4::wmma(wg, g, 0, true, false, lds)?;
+            iu4::wmma(wg, g, 1, false, false, lds)?
+        };
+        iu4::fetch_next_meta(wg, g, h)?;
+        let (da, dw) = iu4::wait(wg, lds, "slab")?;
+        wg.barrier((rotate(lds[0], da), rotate(lds[1], dw)))?;
+    }
+    if kind == "full" {
+        iu4::fetch_ahead(wg, g, h, 0)?;
+    }
+    let lds = rip_fragments(wg, g, lds)?;
+    let lds = iu4::d_loads(wg, g, lds)?;
+    if kind == "t1" {
+        let lds = iu4::wmma(wg, g, 0, false, false, lds)?;
+        let lds = iu4::scale_loads(wg, g, tag, lds)?;
+        let lds = iu4::wmma(wg, g, 1, false, true, lds)?;
+        let lds = iu4::scale_tail(wg, g, tag, lds)?;
+        iu4::fold_scale(wg, g)?;
+        return Ok(lds);
+    }
+    let lds = if WAIT == "after" {
+        let lds = iu4::wmma(wg, g, 0, false, false, lds)?;
+        let lds = iu4::scale_loads(wg, g, tag, lds)?;
+        let lds = iu4::wmma(wg, g, 1, false, true, lds)?;
+        let lds = iu4::scale_tail(wg, g, tag, lds)?;
+        let lds = iu4::publish_slab_set(wg, g, 1, lds)?;
+        iu4::publish_meta(wg, g, lds)?
+    } else if WAIT == "mid" {
+        let lds = iu4::wmma(wg, g, 0, false, false, lds)?;
+        let lds = iu4::scale_loads(wg, g, tag, lds)?;
+        let lds = iu4::publish_slab_set(wg, g, 1, lds)?;
+        let lds = iu4::publish_meta(wg, g, lds)?;
+        let lds = iu4::wmma(wg, g, 1, false, true, lds)?;
+        iu4::scale_tail(wg, g, tag, lds)?
+    } else {
+        let lds = iu4::publish_slab_set(wg, g, 1, lds)?;
+        let lds = iu4::publish_meta(wg, g, lds)?;
+        let lds = iu4::wmma(wg, g, 0, false, false, lds)?;
+        let lds = iu4::scale_loads(wg, g, tag, lds)?;
+        let lds = iu4::wmma(wg, g, 1, false, true, lds)?;
+        iu4::scale_tail(wg, g, tag, lds)?
+    };
+    let (da, dw, dd, ds) = iu4::wait(wg, lds, "all")?;
+    let b2 = wg.signal((rotate(lds[0], da), rotate(lds[1], dw), rotate(lds[2], dd), rotate(lds[3], ds)))?;
+    if kind == "full" {
+        iu4::fetch_ahead(wg, g, h, 1)?;
+    }
+    iu4::fold_scale(wg, g)?;
+    wg.wait_arrived(b2)?;
+    Ok(lds)
+}
+
+// One K128 block of the 2:4-sparse K-loop on plane `h`: `fine_block`'s order
+// with the `iu4::sparse_*` steps, in the one placement the generator ships
+// (the publishes after the slab's last SWMMAC bundle). The sparse steps refuse
+// a dense spec and the dense steps refuse a sparse one.
+//   s24x64: one SWMMAC bundle per slab (`sparse_wmma` sub-block 0 only), so all
+//           four scale loads come after it, at `_s0`; no `_s1`.
+//   s24x32: two sub-block bundles per slab (dense fragment loads); scale loads
+//           (0, 16) at `_s0` between them, (64, 80) at `_s1` after the second.
+fn fine_sparse_block<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, h: usize, fetch_next: bool,
+        end_label: &str, entry_label: bool, step: Option<usize>, lds: Lds) -> Result<Lds, String> {
+    let x64 = g.spec().mma == Mma::S24X64;
+    let lds = iu4::sparse_block_begin(wg, g, tag, h, end_label, entry_label, lds)?;
+    if let Some(s) = step {
+        iu4::step_descriptor(wg, g, s)?;
+    }
+    // Phase A: slab 0 from slot 0; slab 1 (fetched by the preceding block) is
+    // published into slot 1.
+    let lds = iu4::sparse_fragments(wg, g, lds)?;
+    let lds = iu4::sparse_wmma(wg, g, 0, true, false, lds)?;
+    let lds = if x64 { lds } else { iu4::sparse_wmma(wg, g, 1, false, false, lds)? };
+    let lds = iu4::publish_slab(wg, g, lds)?;
+    if fetch_next {
+        iu4::fetch_next_meta(wg, g, h)?;
+    }
+    let (da, dw) = iu4::wait(wg, lds, "slab")?;
+    wg.barrier((rotate(lds[0], da), rotate(lds[1], dw)))?;
+    // Phase B: slab 1 from slot 1, the fold, the next block into slot 0.
+    if fetch_next {
+        iu4::fetch_next(wg, g, h)?;
+    }
+    let lds = iu4::sparse_fragments(wg, g, lds)?;
+    let lds = iu4::d_loads(wg, g, lds)?;
+    let lds = if x64 {
+        let lds = iu4::sparse_wmma(wg, g, 0, false, true, lds)?;
+        iu4::sparse_scale_loads(wg, g, tag, lds)?
+    } else {
+        let lds = iu4::sparse_wmma(wg, g, 0, false, false, lds)?;
+        let lds = iu4::sparse_scale_loads(wg, g, tag, lds)?;
+        let lds = iu4::sparse_wmma(wg, g, 1, false, true, lds)?;
+        iu4::sparse_scale_tail(wg, g, tag, lds)?
+    };
+    if !fetch_next {
+        // The peeled group's last block: nothing to publish.
+        iu4::fold_scale(wg, g)?;
+        return Ok(lds);
+    }
+    let lds = iu4::publish_slab(wg, g, lds)?;
+    let lds = iu4::publish_meta(wg, g, lds)?;
+    let (da, dw, dd, ds) = iu4::wait(wg, lds, "all")?;
+    let b2 = wg.signal((rotate(lds[0], da), rotate(lds[1], dw), rotate(lds[2], dd), rotate(lds[3], ds)))?;
+    // As dense: the retired payload ring holds the next K128's slab 1 while
+    // this block folds.
+    if h == 0 {
+        iu4::fetch_slab1(wg, g, 1)?;
+    } else {
+        iu4::fetch_slab1_next_group(wg, g)?;
+    }
+    iu4::fold_scale(wg, g)?;
+    wg.wait_arrived(b2)?;
+    Ok(lds)
+}

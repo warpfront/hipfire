@@ -303,11 +303,15 @@ fn validate_mq4v2_xt_source(
     {
         return Err("final-code import requires an MQ4V2 XT source artifact".to_string());
     }
-    if let Some(tensor) = source
-        .tensors()
-        .iter()
-        .find(|tensor| !matches!(tensor.quant_type, 1 | 3 | MQ4V2_FINAL_CODE_QTYPE))
-    {
+    if let Some(tensor) = source.tensors().iter().find(|tensor| {
+        !matches!(tensor.quant_type, 1 | 3 | MQ4V2_FINAL_CODE_QTYPE)
+                // Raon keeps A_log/dt_bias/bias/eta (and non-exact gammas) as F32
+                // (qt2) and the router as BF16 (qt16); the class map is arch 19's own.
+                && !(source.arch_id == crate::raon::RAON_ARCH_ID
+                    && (tensor.quant_type == 2
+                        || (tensor.quant_type == 16 && tensor.name.ends_with(".moe.gate.weight"))
+                        || (tensor.quant_type == 14 && crate::raon::is_mq8_attn_class(&tensor.name))))
+    }) {
         return Err(format!(
             "input is not the MQ4V2-XT type map: `{}` has qt={}",
             tensor.name, tensor.quant_type
@@ -380,7 +384,7 @@ fn same_hfq_manifest(left: &RuntimeHfqFile, right: &RuntimeHfqFile) -> bool {
             })
 }
 
-fn export_mq4v2_final_codes(
+pub(crate) fn export_mq4v2_final_codes(
     input: &Path,
     records_path: &Path,
     output: &Path,
@@ -984,7 +988,7 @@ fn is_early_special_format(format: &str) -> bool {
 }
 
 /// Which `run()` path these arguments dispatch to (same precedence as `run()`).
-fn route_for(args: &QuantizeArgs) -> crate::cli::Route {
+pub(crate) fn route_for(args: &QuantizeArgs) -> crate::cli::Route {
     use crate::cli::Route;
     #[cfg(feature = "qwen4-dev-profiles")]
     if args.qwen4_dev_tiny.is_some() {
@@ -997,6 +1001,9 @@ fn route_for(args: &QuantizeArgs) -> crate::cli::Route {
         Route::Qwen4
     } else if args.recipe.is_some() {
         Route::Qwen4StockFp8
+    } else if args.raon_shared_ffn.is_some() || args.raon_shared_ffn_verify.is_some() {
+        // clap makes both flags exclusive with every other recipe route.
+        Route::RaonSharedFfn
     } else if args.mq4v2_final_codes.is_some()
         || args.mq3v2_final_codes.is_some()
         || args.mq2v2_final_codes.is_some()
@@ -1010,6 +1017,12 @@ fn route_for(args: &QuantizeArgs) -> crate::cli::Route {
         .is_some_and(|i| is_gguf_input(Path::new(i)))
     {
         Route::Gguf
+    } else if args
+        .input
+        .as_deref()
+        .is_some_and(|i| crate::raon::is_raon_source_dir(Path::new(i)))
+    {
+        Route::Raon
     } else if args.reap_overlay.is_some() {
         Route::ReapOverlay
     } else {
@@ -1193,6 +1206,65 @@ pub(crate) fn run() {
         }
     }
 
+    // ── Raon-1-mini always-active FFN swap / verify (existing qt44 artifact in) ──
+    if route_for(&args) == crate::cli::Route::RaonSharedFfn {
+        use crate::raon::{raon_hfq_diff, swap_shared_ffn, Scope, SharedFfn};
+        let input = Path::new(args.input.as_deref().expect("--input is required"));
+        let scope = match Scope::parse(args.raon_shared_ffn_scope.as_deref().unwrap_or("all")) {
+            Ok(scope) => scope,
+            Err(error) => {
+                eprintln!("error: {error}");
+                std::process::exit(2);
+            }
+        };
+        if let Some(storage) = args.raon_shared_ffn.as_deref() {
+            let source = args
+                .raon_source
+                .as_deref()
+                .expect("--raon-source is required with --raon-shared-ffn");
+            match SharedFfn::parse(storage)
+                .and_then(|t| swap_shared_ffn(input, source, Path::new(&args.output), t, scope))
+            {
+                Ok(summary) => {
+                    eprintln!("{}", summary.report());
+                    eprintln!("raon: OK {}", args.output);
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("error: raon shared-FFN swap failed: {error}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        let storage = args
+            .raon_shared_ffn_verify
+            .as_deref()
+            .expect("route implies --raon-shared-ffn-verify");
+        match SharedFfn::parse(storage)
+            .and_then(|t| raon_hfq_diff(input, Path::new(&args.output), t, scope))
+        {
+            Ok(report) => {
+                eprint!("{}", report.table());
+                if report.ok() {
+                    eprintln!("raon: shared-FFN {storage} verify OK ({})", args.output);
+                    return;
+                }
+                for v in report.violations.iter().take(50) {
+                    eprintln!("violation: {v}");
+                }
+                eprintln!(
+                    "error: raon shared-FFN verify failed: {} violation(s)",
+                    report.violations.len()
+                );
+                std::process::exit(2);
+            }
+            Err(error) => {
+                eprintln!("error: raon shared-FFN verify failed: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     if let Some(records_path) = args.mq4v2_final_codes.as_deref() {
         let input = args
             .input
@@ -1236,6 +1308,42 @@ pub(crate) fn run() {
                     eprintln!("error: final-code import failed: {error}");
                     std::process::exit(2);
                 }
+            }
+        }
+    }
+
+    // ── Raon-1-mini (arch 19): dedicated symmetric qt44 control producer ──
+    // Selected by the source config's `model_type == raon1_mini`. Only the
+    // recipe `--format mq4 --mq4v2-symmetric --tier xt` exists for it; any
+    // other combination is refused rather than silently reinterpreted.
+    if route_for(&args) == crate::cli::Route::Raon {
+        let input = args.input.as_deref().expect("--input is required");
+        match crate::raon::run_recipe(
+            Path::new(input),
+            Path::new(&args.output),
+            &args.format,
+            args.mq4v2_symmetric,
+            args.tier.as_deref(),
+            args.raon_attn_mq8,
+        ) {
+            Ok(summary) => {
+                eprintln!(
+                    "raon: OK {}: {} tensors ({} qt44, {} unit AWQ sidecars, {} padded K1088->1280, \
+                     {} symmetric half headers verified), {} data bytes, qt census {:?}",
+                    args.output,
+                    summary.tensors,
+                    summary.qt44,
+                    summary.sidecars,
+                    summary.padded,
+                    summary.halves_verified,
+                    summary.bytes,
+                    summary.by_qt
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("error: raon conversion failed: {error}");
+                std::process::exit(2);
             }
         }
     }

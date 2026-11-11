@@ -11,6 +11,38 @@ use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult};
 
+/// 16-bit format of the dense TP partial-sum exchange (`HIPFIRE_TP_EXCHANGE`).
+/// Both round to nearest even; bf16 keeps the f32 range, f16 has three more
+/// mantissa bits but turns `|v| > 65504` into infinity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TpExchange16 {
+    Bf16,
+    F16,
+}
+
+impl TpExchange16 {
+    pub fn pack_kernel(self) -> &'static str {
+        match self {
+            Self::Bf16 => "tp_pack16_bf16",
+            Self::F16 => "tp_pack16_f16",
+        }
+    }
+
+    pub fn fold_kernel(self) -> &'static str {
+        match self {
+            Self::Bf16 => "tp_fold16_bf16",
+            Self::F16 => "tp_fold16_f16",
+        }
+    }
+
+    pub fn graph_reduce_kernel(self) -> &'static str {
+        match self {
+            Self::Bf16 => "tp_graph_signal_reduce16_bf16_gfx1100",
+            Self::F16 => "tp_graph_signal_reduce16_f16_gfx1100",
+        }
+    }
+}
+
 /// Monotonic per-launch counter feeding the Q8 GatedDeltaNet state
 /// stochastic-rounding dither. Supplies fresh, data-INDEPENDENT entropy each
 /// requant so the rounding is genuinely unbiased across the recurrence — the
@@ -627,6 +659,128 @@ impl Gpu {
                 bb
             },
         );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Resolve the 16-bit TP exchange kernels (`tp_pack16_*`, `tp_fold16_*`)
+    /// so a later launch never JIT-compiles (graph capture and sealed route
+    /// plans refuse a post-ready compile).
+    pub fn ensure_tp_exchange16_kernels(&mut self, fmt: TpExchange16) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "tp_exchange16",
+            kernels::TP_EXCHANGE16_SRC,
+            fmt.pack_kernel(),
+        )?;
+        self.ensure_kernel(
+            "tp_exchange16",
+            kernels::TP_EXCHANGE16_SRC,
+            fmt.fold_kernel(),
+        )
+    }
+
+    /// Convert `count` f32 partials at `src` to 16-bit `fmt` at `dst`
+    /// (round-to-nearest-even). Both are device pointers on this device; the
+    /// destination holds `2 * count` bytes and is what peers read.
+    pub fn tp_pack16(
+        &mut self,
+        fmt: TpExchange16,
+        src: *const c_void,
+        dst: *mut c_void,
+        count: usize,
+    ) -> HipResult<()> {
+        self.ensure_tp_exchange16_kernels(fmt)?;
+        let count_val = i32::try_from(count)
+            .map_err(|_| hip_bridge::HipError::new(0, "tp_pack16 count exceeds i32"))?;
+        let mut params: Vec<*mut c_void> = vec![
+            &src as *const _ as *mut c_void,
+            &dst as *const _ as *mut c_void,
+            &count_val as *const _ as *mut c_void,
+        ];
+        let vec = count / 4;
+        let block = 256u32;
+        let grid = ((vec as u32).div_ceil(block)).max(1);
+        // 4 B read + 2 B write per element.
+        let bytes = count * 6;
+        let name = fmt.pack_kernel();
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", name, bytes);
+        let result =
+            self.launch_maybe_blob(name, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(src);
+                bb.push_ptr(dst);
+                bb.push_i32(count_val);
+                bb
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Rank-ordered 16-bit fold: `sum = [r(first_f32)] + up(srcs[0]) + ...`
+    /// (left-associated, f32 adds), then `sum_out = sum` (when non-null) and
+    /// `x = x + sum` (when `x` is non-null). `first_f32` (null for none) is a
+    /// local f32 partial taken as term 0 through the 16-bit round trip;
+    /// `srcs` are 16-bit `fmt` buffers (up to four, any of them may be a
+    /// P2P-mapped peer buffer) holding `count` elements each. With
+    /// `first_f32` null and two sources this is `x + (r(p0) + r(p1))`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tp_fold16(
+        &mut self,
+        fmt: TpExchange16,
+        sum_out: *mut c_void,
+        x: *mut c_void,
+        first_f32: *const c_void,
+        srcs: &[*const c_void],
+        count: usize,
+    ) -> HipResult<()> {
+        if srcs.is_empty() && first_f32.is_null() || srcs.len() > 4 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "tp_fold16 takes 1..=4 sources (plus an optional f32 first term)",
+            ));
+        }
+        self.ensure_tp_exchange16_kernels(fmt)?;
+        let count_val = i32::try_from(count)
+            .map_err(|_| hip_bridge::HipError::new(0, "tp_fold16 count exceeds i32"))?;
+        let nsrc = srcs.len() as i32;
+        let mut s = [std::ptr::null::<c_void>(); 4];
+        s[..srcs.len()].copy_from_slice(srcs);
+        let mut params: Vec<*mut c_void> = vec![
+            &sum_out as *const _ as *mut c_void,
+            &x as *const _ as *mut c_void,
+            &first_f32 as *const _ as *mut c_void,
+            &s[0] as *const _ as *mut c_void,
+            &s[1] as *const _ as *mut c_void,
+            &s[2] as *const _ as *mut c_void,
+            &s[3] as *const _ as *mut c_void,
+            &nsrc as *const _ as *mut c_void,
+            &count_val as *const _ as *mut c_void,
+        ];
+        let vec = count / 4;
+        let block = 256u32;
+        let grid = ((vec as u32).div_ceil(block)).max(1);
+        let bytes = count * (2 * srcs.len() + 8);
+        let name = fmt.fold_kernel();
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", name, bytes);
+        let result =
+            self.launch_maybe_blob(name, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(sum_out);
+                bb.push_ptr(x);
+                bb.push_ptr(first_f32);
+                bb.push_ptr(s[0]);
+                bb.push_ptr(s[1]);
+                bb.push_ptr(s[2]);
+                bb.push_ptr(s[3]);
+                bb.push_i32(nsrc);
+                bb.push_i32(count_val);
+                bb
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! cargo run -p peacemaker-isa --release --features toolchain --example emit_qwen4_moe_sym_gfx1100 -- \
-//!     [--arch gfx1100|gfx1151] [--codec legacy|e8p|all] [--out-dir REPO_ROOT] [--receipt FILE] [--work-dir DIR] [--evidence-dir DIR] [--seed N] [--p1-only]
+//!     [--arch gfx1100|gfx1151] [--codec legacy|e8p|all|w3] [--out-dir REPO_ROOT] [--receipt FILE] [--work-dir DIR] [--evidence-dir DIR] [--seed N] [--p1-only]
 //! ```
 //!
 //! `--codec legacy` (default, the original behaviour): three modules `kernels/qwen4_moe_iu4_sym{,_w2,_w3}_pm_gfx1100.hxaco`;
@@ -73,10 +73,12 @@ mod app {
     /// Immutable baselines (lead): the gfx1201 objects and the shared sources. Re-pinned on land-rc5 over beta 12daf4fe9:
     /// the objects are the exact beta 12daf4fe9 blobs (n_experts@60 guard; rc3/rc4 pins were
     /// fea044d00e2989172fb440aef1af2304c70ccbf5c663508c0c0ec912afb15481 / 83822312b26a2f90fa688e39f610f1b95528e035c5118946b7060df3cc254833).
+    /// The gfx1201 pin was then moved by the gfx1201 NT8 `gate_up` epoch-lock bake (was
+    /// 0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e).
     const PINNED_OBJECTS: [(&str, &str); 2] = [
         (
             "qwen4_moe_iu4_sym_pm_gfx1201.hxaco",
-            "0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e",
+            "44177c21de25bec8502f63f318e682dc4fa1948420723c75dec14fa63cfed723",
         ),
         (
             "qwen4_moe_iu4_sym_w3_pm_gfx1201.hxaco",
@@ -84,12 +86,16 @@ mod app {
         ),
     ];
     const PINNED_SOURCES: [(&str, &str); 2] = [
+        // Re-pinned on land2 (gfx1201 NT8 gate_up lock bake, 75f0d90173): qwen4_moe_sym.rs is
+        // Re-pinned on mgmtp/sc-mq3wire after the F1 drop-zero planar codec (09a3bb2331, gfx1201-only, new WeightCodec arm): the
+        // gfx1100 MQ4 and E8P modules re-emit byte-identically (MQ4 831db6f9.., E8P 1dfc5811..), so the delta touches no gfx1100 entry.
+        // Previous pin: f75b549cfc019fb6680b1fd7200a36285342a25ad757b66bde3bf5fb23b7864c; earlier pin below.
         // Re-pinned on land-rc5: qwen4_moe_sym.rs is beta 12daf4fe9 (cdb4f9c6a9ca0c4017aa17e88d134cf3e22fe3fced04e3896f2dc7b5a04c446f)
         // plus the retained consumer24 E8P dispatch; qwen4_moe_sym_w3.rs is exactly beta 12daf4fe9. rc3/rc4 pins:
         // 02ac151d8c548badb646ada96eec4516d1c3258528dad8f1fa4984ed7043c00e, b15ef478422178342b6cba2a021555dcc837aba604e95e3ce0a2008911b3bbce.
         (
             "src/kernels/qwen4_moe_sym.rs",
-            "d5a348744d7e9425c339461317bdd0c6c56623e5fb4d3ab3eb30b9b57e1235f8",
+            "d48ca4fe9ce119ce770e56e6ac85f2f2c7a2d2aba0e9af5c8a16da7000233c79",
         ),
         (
             "src/kernels/qwen4_moe_sym_w3.rs",
@@ -99,12 +105,14 @@ mod app {
 
     type R<T> = Result<T, String>;
 
-    /// Which codec modules a run emits: the committed MQ4/W2/W3 set (default), the E8P module, or both.
+    /// Which codec modules a run emits: the committed MQ4/W2/W3 set (default), the E8P module, both,
+    /// or the W3 module alone (the gfx1100 W3 K2 of the decode+prefill MQ3 tier).
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum CodecSet {
         Legacy,
         E8p,
         All,
+        W3,
     }
 
     impl CodecSet {
@@ -113,6 +121,7 @@ mod app {
                 Self::Legacy => Codec::ALL.to_vec(),
                 Self::E8p => vec![Codec::E8p],
                 Self::All => Codec::ALL.iter().copied().chain([Codec::E8p]).collect(),
+                Self::W3 => vec![Codec::W3],
             }
         }
     }
@@ -435,6 +444,8 @@ mod app {
             ]
             .iter()
             .filter(|s| spec.codec != Codec::E8p || !E8P_ONLY_FORBIDDEN.contains(*s))
+            // The BF16 MQ4 GateUp/Down entries own workgroup barriers (lockstep / K=640 pipeline).
+            .filter(|s| !(spec.codec == Codec::Mq4 && !spec.acc && **s == "s_barrier*"))
             .map(|s| (*s).to_owned())
             .collect(),
             vgpr_max: Some(u32::from(e.shape.next_free_vgpr).div_ceil(8) * 8),
@@ -444,6 +455,7 @@ mod app {
             require_zero_private: true,
             launch_dynamic_lds_bytes: Some(0),
             group_segment_fixed_bytes: spec.codec.lds_bytes(),
+            wave_private_windows: vec![],
         }
     }
 
@@ -554,6 +566,7 @@ mod app {
         dis: &str,
         elf: &Path,
         module_text: &str,
+        negative: Negative,
     ) -> R<ObjectAudit> {
         let insns = symbol_insns(dis, symbol)?;
         let mut mnemonics: BTreeMap<&str, u32> = BTreeMap::new();
@@ -589,6 +602,14 @@ mod app {
 
         // No gfx12 waits, scratch, flat/global, barriers, lane moves, FP-mode writes; LDS data and barriers only in E8P.
         let e8p = spec.codec == Codec::E8p;
+        // The BF16 MQ4 GateUp entry owns the per-epoch lockstep barrier (2 per K loop trip) and the
+        // BF16 MQ4 Down entry the unrolled K=640 pipeline (5, one after each epoch's issue).
+        let lockstep = spec.codec == Codec::Mq4 && !spec.acc;
+        let barriers_expected = match (lockstep, spec.kind) {
+            (true, Kind::GateUp) => 2,
+            (true, Kind::Down) if negative == Negative::None => 5,
+            _ => 0,
+        };
         for i in &insns {
             let m = i.mnemonic.as_str();
             let bad = m.starts_with("s_wait_")
@@ -597,7 +618,7 @@ mod app {
                 || m.starts_with("global_")
                 || (!e8p && m.starts_with("ds_load"))
                 || (!e8p && m.starts_with("ds_store"))
-                || (!e8p && m.starts_with("s_barrier"))
+                || (!e8p && barriers_expected == 0 && m.starts_with("s_barrier"))
                 || m.starts_with("v_readlane")
                 || (!e8p && m.starts_with("v_writelane"))
                 || m == "s_denorm_mode"
@@ -609,6 +630,12 @@ mod app {
                     i.addr
                 ));
             }
+        }
+        if !e8p && barriers_expected != 0 && count("s_barrier") != barriers_expected {
+            return Err(format!(
+                "{symbol}: {} s_barrier, the lockstep design requires exactly {barriers_expected}",
+                count("s_barrier")
+            ));
         }
         // E8P: exactly the stage and unpack census of the authored design (see `e8p.rs`).
         if e8p {
@@ -1035,7 +1062,14 @@ mod app {
             if m7["lift"].as_str() != Some("byte-exact") || m7["obligations"] != json!({}) {
                 return Err(format!("{symbol}: M7 not clean: {m7}"));
             }
-            let audit = audit_object(spec, &symbol, &build.disassembly, &build.elf, &text)?;
+            let audit = audit_object(
+                spec,
+                &symbol,
+                &build.disassembly,
+                &build.elf,
+                &text,
+                negative,
+            )?;
             let mut row = json!({
                 "symbol": symbol, "variant": variant, "threads": spec.threads,
                 "source_sha256": sha256(e.s_text.as_bytes()),
@@ -1330,7 +1364,8 @@ mod app {
                         "legacy" => CodecSet::Legacy,
                         "e8p" => CodecSet::E8p,
                         "all" => CodecSet::All,
-                        other => return Err(format!("--codec {other} (legacy|e8p|all)")),
+                        "w3" => CodecSet::W3,
+                        other => return Err(format!("--codec {other} (legacy|e8p|all|w3)")),
                     }
                 }
                 "--work-dir" => {

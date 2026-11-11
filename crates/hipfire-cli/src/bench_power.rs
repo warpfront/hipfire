@@ -477,6 +477,11 @@ impl PowerProbe {
         }
     }
 
+    /// The resolved card, when the device resolved.
+    pub(crate) fn device(&self) -> Option<&PowerDevice> {
+        self.device.as_ref().ok()
+    }
+
     /// The `power_device` report object.
     pub(crate) fn device_json(&self) -> Value {
         match &self.device {

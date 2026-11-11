@@ -14,12 +14,13 @@
 
 use crate::bundle::Qwen4Bundle;
 use crate::weights::{Qwen4EpPlacement, Qwen4Manifest, WeightError};
+use hipfire_dispatch::pipeline::{ExpertBindingCache, ExpertTable};
 use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::model_source::{capture_file_identity, SourceIdentity};
 use hipfire_runtime::sealed_moe::{
-    plan_packed_expert_parallel, source_generation_fingerprint, ExpertExecutionPlan,
-    PackedExpertGroup,
+    adapt_expert_execution_plan, plan_packed_expert_parallel, source_generation_fingerprint,
+    ExpertExecutionPlan, PackedExpertGroup,
 };
 use hipfire_runtime::weight_store::WeightOrigin;
 use std::path::Path;
@@ -68,7 +69,67 @@ pub fn qwen4_source_generation(hfq: &HfqFile, model_path: &Path) -> Result<Strin
     if overlay.exists() {
         files.push(identity(&overlay)?);
     }
+    let hc8 = hipfire_config::memory::hc8_sidecar_path(model_path);
+    if hc8.exists() {
+        files.push(identity(&hc8)?);
+    }
     Ok(source_generation_fingerprint(&files))
+}
+
+/// DESIGN F1: `source` with every routed expert stack that `manifest` declares drop-zero planar
+/// (`MQ4G256V2P` / `MQ4G128V2P`) re-described as its planar representation: the dtype name and
+/// the stack's total encoded bytes (`experts * planar bytes per expert`). `None` when the
+/// manifest declares no planar stack. All-or-nothing across the stacks (one layout per device).
+fn planar_source_identity(
+    manifest: &Qwen4Manifest,
+    source: &SourceIdentity,
+) -> Result<Option<SourceIdentity>, String> {
+    use hipfire_runtime::mq4_planar::{self, Mq4PlanarKind};
+    let mut rewritten = source.clone();
+    let (mut planar, mut shipped) = (0usize, 0usize);
+    for entry in manifest
+        .weights
+        .iter()
+        .filter(|entry| entry.name.ends_with(GATE_UP) || entry.name.ends_with(DOWN))
+    {
+        if !entry.dtype.is_mq4_planar() {
+            shipped += 1;
+            continue;
+        }
+        planar += 1;
+        let kind = if entry.name.ends_with(GATE_UP) {
+            Mq4PlanarKind::GateUp
+        } else {
+            Mq4PlanarKind::Down
+        };
+        let range = rewritten
+            .manifest
+            .iter_mut()
+            .find(|range| range.name == entry.name)
+            .ok_or_else(|| format!("{} is absent from the source index", entry.name))?;
+        let [experts, rows, k] = range.logical_shape[..] else {
+            return Err(format!(
+                "{} shape {:?} is not [experts, rows, cols]",
+                entry.name, range.logical_shape
+            ));
+        };
+        let per_expert = mq4_planar::planar_bytes(kind, rows, k)
+            .map_err(|error| format!("{}: {error}", entry.name))?;
+        range.length = (experts as u64)
+            .checked_mul(per_expert as u64)
+            .ok_or_else(|| format!("{} planar bytes overflow", entry.name))?;
+        range.dtype = match kind {
+            Mq4PlanarKind::GateUp => mq4_planar::NAME_GATE_UP,
+            Mq4PlanarKind::Down => mq4_planar::NAME_DOWN,
+        }
+        .to_string();
+    }
+    if planar > 0 && shipped > 0 {
+        return Err(format!(
+            "expert drop-zero is all-or-nothing: {planar} routed stacks planar, {shipped} shipped"
+        ));
+    }
+    Ok((planar > 0).then_some(rewritten))
 }
 
 impl Qwen4EpSeal {
@@ -111,6 +172,11 @@ impl Qwen4EpSeal {
                 "the manifest declares no routed expert stacks".into(),
             ));
         }
+        // DESIGN F1: a drop-zero planar manifest seals the PLANAR representation of the routed
+        // stacks (dtype and per-expert encoded bytes), so the sealed table's resources describe
+        // the bytes the compact upload / unit arenas actually put on the device.
+        let planar_source = planar_source_identity(manifest, source).map_err(refuse)?;
+        let source = planar_source.as_ref().unwrap_or(source);
         let plans = plan_packed_expert_parallel(
             &groups,
             "qwen4",
@@ -205,6 +271,15 @@ impl Qwen4EpSeal {
         }
         Ok(placement)
     }
+
+    /// Owner rank of every global expert, read from the sealed plans (every
+    /// group shares it: [`Self::placement`] proved the stride on each).
+    pub fn owner_ranks(&self) -> Vec<usize> {
+        let plan = &self.plans[0];
+        (0..plan.n_experts())
+            .map(|expert| plan.owner_rank(expert).expect("sealed owner"))
+            .collect()
+    }
 }
 
 /// A rank's binding to its load's seal (`Qwen4Bundle::bind_ep_seal`).
@@ -212,6 +287,65 @@ impl Qwen4EpSeal {
 pub struct Qwen4EpRankSeal {
     pub seal: Arc<Qwen4EpSeal>,
     pub rank: usize,
+}
+
+impl Qwen4EpRankSeal {
+    /// This rank's dispatch binding of routed group `group` (a trunk layer,
+    /// or the trunk layer count for the MTP head), adapted from the sealed
+    /// plan: real owner ranks and compact local slots under the owner-routed
+    /// EP contract. Refuses, before any table is published, a placement of
+    /// another rank or mesh, a plan of another mesh epoch, a cache sealed for
+    /// another device and a rank that owns no expert.
+    pub(crate) fn expert_binding(
+        &self,
+        group: usize,
+        placement: Qwen4EpPlacement,
+        device: i32,
+    ) -> Result<(ExpertTable, ExpertBindingCache), String> {
+        let sealed = Qwen4EpPlacement {
+            rank: self.rank,
+            ranks: self.seal.ranks(),
+        };
+        if placement != sealed {
+            return Err(format!(
+                "qwen4 EP binding: placement {placement:?} is not the sealed rank {sealed:?}"
+            ));
+        }
+        let plan = self
+            .seal
+            .plans
+            .iter()
+            .find(|plan| plan.layer() == Some(group))
+            .ok_or_else(|| format!("qwen4 EP binding: the seal has no expert group {group}"))?;
+        let (table, cache) = adapt_expert_execution_plan(plan, self.rank)?;
+        let contract = table
+            .execution_contract()
+            .ok_or("qwen4 EP binding: the adapted table carries no contract")?;
+        let epoch = self.seal.mesh().epoch().as_u64();
+        if contract.mesh_epoch() != epoch || !contract.is_owner_routed_ep() {
+            return Err(format!(
+                "qwen4 EP binding: group {group} contract (epoch {}, '{}') is not this seal's \
+                 owner-routed EP route (epoch {})",
+                contract.mesh_epoch(),
+                contract.execution(),
+                epoch
+            ));
+        }
+        if cache.physical_device() != device {
+            return Err(format!(
+                "qwen4 EP binding: rank {} is sealed to device {}, executing on {device}",
+                self.rank,
+                cache.physical_device()
+            ));
+        }
+        if cache.local_expert_ids().is_empty() {
+            return Err(format!(
+                "qwen4 EP binding: rank {} owns no expert of group {group}",
+                self.rank
+            ));
+        }
+        Ok((table, cache))
+    }
 }
 
 impl Qwen4Bundle {
@@ -326,6 +460,73 @@ mod tests {
         assert_ne!(a.origin(1), b.origin(1));
     }
 
+    /// Every rank's dispatch binding carries the sealed owners and compact
+    /// slots (not a rank-0-of-1 stand-in) and is refused for another rank,
+    /// device or group; two seals of one shape bind different epochs.
+    #[test]
+    fn rank_binding_carries_sealed_owners_and_refuses_stale_bindings() {
+        let manifest = Qwen4Manifest::build(&crate::config::compact_test_config()).unwrap();
+        let source = source_of(&manifest, 10);
+        let ranks = 3;
+        let devices = [4, 5, 6];
+        let seal =
+            Arc::new(Qwen4EpSeal::seal(&manifest, 48, ranks, &devices, &source, "g1").unwrap());
+        let owners = seal.owner_ranks();
+        for rank in 0..ranks {
+            let placement = seal.placement(rank).unwrap();
+            assert_eq!(
+                owners.iter().filter(|&&owner| owner == rank).count(),
+                placement.local_count(owners.len())
+            );
+            let bound = Qwen4EpRankSeal {
+                seal: seal.clone(),
+                rank,
+            };
+            for group in [0, 47, 48] {
+                let (table, cache) = bound
+                    .expert_binding(group, placement, devices[rank])
+                    .unwrap();
+                assert_eq!((cache.local_rank(), cache.rank_count()), (rank, ranks));
+                for record in table.experts() {
+                    let expert = record.global_id();
+                    assert_eq!(record.owner_rank(), owners[expert]);
+                    assert_eq!(record.owner_rank(), expert % ranks);
+                    if record.owner_rank() == rank {
+                        assert_eq!(cache.local_slot(expert), Some(expert / ranks));
+                    }
+                }
+                let contract = table.execution_contract().unwrap();
+                assert!(contract.is_owner_routed_ep());
+                assert_eq!(contract.mesh_epoch(), seal.mesh().epoch().as_u64());
+            }
+        }
+        let bound = Qwen4EpRankSeal {
+            seal: seal.clone(),
+            rank: 1,
+        };
+        let placement = seal.placement(1).unwrap();
+        let wrong_rank = bound
+            .expert_binding(0, seal.placement(2).unwrap(), devices[1])
+            .unwrap_err();
+        assert!(wrong_rank.contains("not the sealed rank"), "{wrong_rank}");
+        let wrong_device = bound.expert_binding(0, placement, devices[0]).unwrap_err();
+        assert!(wrong_device.contains("sealed to device"), "{wrong_device}");
+        let no_group = bound.expert_binding(49, placement, devices[1]).unwrap_err();
+        assert!(no_group.contains("no expert group"), "{no_group}");
+        let other = Qwen4EpRankSeal {
+            seal: Arc::new(
+                Qwen4EpSeal::seal(&manifest, 48, ranks, &devices, &source, "g1").unwrap(),
+            ),
+            rank: 1,
+        };
+        let (a, _) = bound.expert_binding(0, placement, devices[1]).unwrap();
+        let (b, _) = other.expert_binding(0, placement, devices[1]).unwrap();
+        assert_ne!(
+            a.execution_contract().unwrap().contract_id(),
+            b.execution_contract().unwrap().contract_id()
+        );
+    }
+
     /// The generation covers the trunk-overlay sidecar beside the model: one
     /// that appears, is rewritten, or vanishes reads as another generation.
     #[test]
@@ -352,6 +553,36 @@ mod tests {
         std::fs::write(&overlay, b"bb").unwrap();
         assert_ne!(qwen4_source_generation(&hfq, &model).unwrap(), with_overlay);
         std::fs::remove_file(&overlay).unwrap();
+        assert_eq!(qwen4_source_generation(&hfq, &model).unwrap(), base);
+        drop(hfq);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The generation covers the `.hc8` sidecar beside the model too.
+    #[test]
+    fn source_generation_binds_the_hc8_sidecar() {
+        use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-qwen4-ep-gen-hc8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("m.hfq");
+        let tensor = HfqMemTensor {
+            name: "t".into(),
+            quant_type: 1,
+            shape: vec![2],
+            group_size: 0,
+            data: vec![0; 4],
+        };
+        write_hfqm_package_mem(&model, crate::ARCH_ID, "{}", &[tensor]).unwrap();
+        let hfq = HfqFile::open(&model).unwrap();
+        let base = qwen4_source_generation(&hfq, &model).unwrap();
+        let sidecar = hipfire_config::memory::hc8_sidecar_path(&model);
+        std::fs::write(&sidecar, b"a").unwrap();
+        let with_sidecar = qwen4_source_generation(&hfq, &model).unwrap();
+        assert_ne!(with_sidecar, base);
+        std::fs::write(&sidecar, b"bb").unwrap();
+        assert_ne!(qwen4_source_generation(&hfq, &model).unwrap(), with_sidecar);
+        std::fs::remove_file(&sidecar).unwrap();
         assert_eq!(qwen4_source_generation(&hfq, &model).unwrap(), base);
         drop(hfq);
         std::fs::remove_dir_all(&dir).unwrap();

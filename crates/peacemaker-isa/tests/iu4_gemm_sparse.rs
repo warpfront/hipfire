@@ -250,6 +250,72 @@ fn block_families_refuse_the_other_spec() {
     }
 }
 
+/// The sparse fine steps (`sparse_block_begin`, `sparse_fragments`,
+/// `sparse_wmma_group`, `sparse_scale_loads`, `sparse_scale_tail`) refuse a
+/// dense spec; x64 has one SWMMAC bundle per slab (no sub-block 1, no `_s1`
+/// scale tail); the x32 sub-block is 0 or 1.
+#[test]
+fn sparse_fine_steps_refuse_the_wrong_spec() {
+    for mma in [Mma::Dense, Mma::S24X64, Mma::S24X32] {
+        let g = Gen::new(spec(Epi::Set, mma)).unwrap();
+        let mut b = Builder::new(g.kernel_spec(), g.plan().unwrap());
+        let mut wg = Wg::new(&mut b).unwrap();
+        let lds = blocks::declare_lds(&mut wg, &g).unwrap();
+        let end = wg.exit(END).unwrap();
+        let (ra, rw, rd, rs) = blocks::prologue(&mut wg, &g, &end, lds).unwrap();
+        let begin = blocks::sparse_block_begin(
+            &mut wg,
+            &g,
+            "x",
+            0,
+            ".Lnext",
+            true,
+            ra.cur_index(),
+            rd.cur_index(),
+        );
+        if mma == Mma::Dense {
+            let frag = blocks::sparse_fragments(&mut wg, &g, &ra, &rw);
+            let wmma = blocks::sparse_wmma_group(wg.isa(), &g, 0, true, false);
+            let loads = blocks::sparse_scale_loads(&mut wg, &g, ".Lx0", &rs);
+            let tail = blocks::sparse_scale_tail(&mut wg, &g, ".Lx1", &rs);
+            for (what, r) in [
+                ("block_begin", begin),
+                ("fragments", frag),
+                ("wmma", wmma),
+                ("scale_loads", loads),
+                ("scale_tail", tail),
+            ] {
+                let e = r.expect_err(what);
+                assert!(e.contains("the spec is dense"), "{what}: {e}");
+            }
+            continue;
+        }
+        // The steps in the block's order: head, fragments, scale loads (the
+        // SWMMAC groups' emission is the twin's and the emulator's to check:
+        // here only their refusals, which emit nothing).
+        begin.unwrap_or_else(|e| panic!("{mma:?} block_begin: {e}"));
+        blocks::sparse_fragments(&mut wg, &g, &ra, &rw).unwrap();
+        assert!(
+            blocks::sparse_wmma_group(wg.isa(), &g, 2, false, false).is_err(),
+            "sub-block 2 is not a sub-block"
+        );
+        if mma == Mma::S24X64 {
+            // x64's one bundle covers the slab: there is no sub-block 1.
+            let e = blocks::sparse_wmma_group(wg.isa(), &g, 1, false, true)
+                .expect_err("x64 sub-block 1");
+            assert!(e.contains("covers the whole K64 slab"), "{e}");
+        }
+        blocks::sparse_scale_loads(&mut wg, &g, ".Lx0", &rs).unwrap();
+        let tail = blocks::sparse_scale_tail(&mut wg, &g, ".Lx1", &rs);
+        if mma == Mma::S24X64 {
+            let e = tail.expect_err("x64 scale tail");
+            assert!(e.contains("no sub-block 1"), "{e}");
+        } else {
+            tail.unwrap();
+        }
+    }
+}
+
 /// Digests of the sparse kernels' `s_text`, pinned so a schedule change is deliberate.
 const PINNED: &[(&str, &str)] = &[
     (

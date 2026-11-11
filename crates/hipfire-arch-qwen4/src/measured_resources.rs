@@ -705,9 +705,13 @@ pub fn preload_component_union(
             args.max_seq,
             args.vmm_granularity,
         );
-        let (resident, build_scratch) =
-            crate::mtp_gpu::Qwen4MtpGpu::allocation_sizes(args.config, &census_context, head)
-                .ok_or_else(|| format!("{HERE}: native MTP head allocation sizes overflow"))?;
+        let (resident, build_scratch) = crate::mtp_gpu::Qwen4MtpGpu::allocation_sizes(
+            args.config,
+            &census_context,
+            head,
+            false,
+        )
+        .ok_or_else(|| format!("{HERE}: native MTP head allocation sizes overflow"))?;
         let request = crate::mtp_spec::native_mtp_request_allocation_sizes(
             args.config,
             census_context.max_seq,

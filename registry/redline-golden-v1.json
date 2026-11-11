@@ -7,15 +7,15 @@
     "file": "qwen3.6-35b-a3b.mq4r",
     "size_bytes": 18700048128,
     "sha256": "4685c140c46b1a6f31a0fd9053bf09d5faf1d2529d715b84794249b66cde0428",
-    "registry_card_sha256": "67ddf7fea2eae1a7c7a35452d248625e5651b423cfa68054dc406f42b8f95ede",
+    "registry_card_sha256": "5fd754c281e42dfc8455968c7b79dcd25b11630a6d387d77d63d09911d57ef1b",
     "sampling_profile": "general",
-    "sampling_sha256": "6d64d79ecd36dd3f1b026db2fb1ddbcf2e40433349df61c5c182f482e18c6ce4",
+    "sampling_sha256": "637cd6b2b964452603fc54d6e77b3f89a4b184f46589a60c14621520b53ea0f4",
     "sampling": {
       "temperature": 1.0,
       "top_p": 0.95,
       "top_k": 20,
       "min_p": 0.0,
-      "presence_penalty": 1.5,
+      "presence_penalty": 0.0,
       "repeat_penalty": 1.0
     }
   },

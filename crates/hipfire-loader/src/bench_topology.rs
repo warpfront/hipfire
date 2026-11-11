@@ -14,7 +14,7 @@
 //! classifies it. The classification is a pure function of
 //! [`TopologyFacts`], so every route is unit-testable without a GPU.
 
-use crate::{carrier_for, pp_unsupported_message, EpArch, LoadedModel};
+use crate::{carrier_for, pp_unsupported_message, LoadedModel, PpBenchRoute};
 use hipfire_runtime::device_mesh::DimKind;
 use hipfire_runtime::multi_gpu::Gpus;
 
@@ -97,6 +97,10 @@ pub enum BenchRoute {
     Ds4Ep,
     /// MiniMax expert parallelism.
     MinimaxEp,
+    /// A pipeline-parallel carrier whose own bench hooks drive the bundle
+    /// (it fans the single-device calls out over its bands); the mesh quiesce
+    /// syncs every `pp_gpus` device.
+    CarrierPp,
 }
 
 impl BenchRoute {
@@ -104,7 +108,10 @@ impl BenchRoute {
     /// `bench_decode_prime` / `bench_decode_run` hooks (which drive the
     /// daemon's own `Gpu`) are the entrypoints.
     pub fn uses_carrier_hooks(self) -> bool {
-        matches!(self, BenchRoute::Single | BenchRoute::Qwen4Ep)
+        matches!(
+            self,
+            BenchRoute::Single | BenchRoute::Qwen4Ep | BenchRoute::CarrierPp
+        )
     }
 
     /// True for every route whose forward spans model devices the daemon's
@@ -163,10 +170,19 @@ fn mesh_topology(mesh: &MeshFacts) -> Result<BenchTopology, String> {
     Ok(BenchTopology::new(mesh.pp, mesh.tp, mesh.ep, &mesh.devices))
 }
 
+/// The bench route a carrier's declared pipeline bench family selects.
+pub fn pp_bench_route(bench: PpBenchRoute) -> BenchRoute {
+    match bench {
+        PpBenchRoute::Qwen35Pp => BenchRoute::Qwen35Pp,
+        PpBenchRoute::Qwen4Pp => BenchRoute::Qwen4Pp,
+        PpBenchRoute::Carrier => BenchRoute::CarrierPp,
+    }
+}
+
 /// Classify a loaded model's topology. Refusals reuse `serve`'s own sentences:
-/// both degrees at once is [`PP_EP_EXCLUSIVE_MESSAGE`]; an architecture with no
-/// pipeline path is the carrier's [`pp_unsupported_message`]. Inconsistent
-/// facts (a degree without the devices that carry it) fail closed.
+/// both degrees at once is [`PP_EP_EXCLUSIVE_MESSAGE`]; an architecture whose
+/// carrier declares no pipeline path is the carrier's [`pp_unsupported_message`].
+/// Inconsistent facts (a degree without the devices that carry it) fail closed.
 pub fn classify(facts: &TopologyFacts) -> Result<(BenchRoute, BenchTopology), String> {
     let ep_loaded = facts.ep.is_some() || facts.qwen4_ep.is_some();
     if facts.ep.is_some() && facts.qwen4_ep.is_some() {
@@ -187,11 +203,11 @@ pub fn classify(facts: &TopologyFacts) -> Result<(BenchRoute, BenchTopology), St
                 facts.pp, topology.pp, topology.tp, topology.ep
             ));
         }
-        let route = match facts.arch_id {
-            5 | 6 => BenchRoute::Qwen35Pp,
-            16 => BenchRoute::Qwen4Pp,
-            other => {
-                let family = carrier_for(other).map_or("model", |carrier| carrier.name());
+        let route = match carrier_for(facts.arch_id).and_then(|carrier| carrier.topology_caps().pp)
+        {
+            Some(pp_caps) => pp_bench_route(pp_caps.bench),
+            None => {
+                let family = carrier_for(facts.arch_id).map_or("model", |carrier| carrier.name());
                 return Err(pp_unsupported_message(family, false, facts.pp));
             }
         };
@@ -237,15 +253,10 @@ impl LoadedModel {
     /// resident: the PP/EP `Gpus` meshes (axes and device handles) and the
     /// Qwen4 bundle's EP mesh. `single_card` is the daemon `Gpu`'s ordinal.
     pub fn bench_topology_facts(&self, single_card: i32) -> TopologyFacts {
-        let ep = self.ep.as_ref().map(|state| {
-            let kind = match &state.inner {
-                EpArch::Ds4 { .. } => EpKind::Ds4,
-                EpArch::Minimax { .. } => EpKind::Minimax,
-                EpArch::Qwen35 { .. } => EpKind::Qwen35Moe,
-                EpArch::Qwen35DenseTp { .. } | EpArch::Qwen35MeshTp { .. } => EpKind::Qwen35DenseTp,
-            };
-            (kind, MeshFacts::from_gpus(&state.gpus))
-        });
+        let ep = self
+            .ep
+            .as_ref()
+            .map(|state| (state.inner.kind(), MeshFacts::from_gpus(&state.gpus)));
         let qwen4_ep = self
             .qwen4()
             .and_then(|bundle| bundle.ep_mesh())
@@ -433,5 +444,32 @@ mod tests {
         f.ep = Some((EpKind::Qwen35Moe, mesh(1, 1, 2, &[0, 1])));
         f.qwen4_ep = Some(mesh(1, 1, 2, &[0, 1]));
         assert!(classify(&f).unwrap_err().contains("two expert-parallel"));
+    }
+
+    #[test]
+    fn declared_pp_bench_families_map_to_their_routes() {
+        assert_eq!(pp_bench_route(PpBenchRoute::Qwen35Pp), BenchRoute::Qwen35Pp);
+        assert_eq!(pp_bench_route(PpBenchRoute::Qwen4Pp), BenchRoute::Qwen4Pp);
+        assert_eq!(pp_bench_route(PpBenchRoute::Carrier), BenchRoute::CarrierPp);
+        // The carrier route runs the carrier's hooks across devices the daemon
+        // `Gpu` does not own: both a carrier-hook route and a mesh route.
+        assert!(BenchRoute::CarrierPp.uses_carrier_hooks() && BenchRoute::CarrierPp.is_mesh());
+    }
+
+    #[test]
+    fn every_declared_pp_carrier_classifies_to_its_declared_bench_route() {
+        for carrier in crate::registry_carriers() {
+            let Some(pp_caps) = carrier.topology_caps().pp else {
+                continue;
+            };
+            let arch = (0u32..64)
+                .find(|id| carrier_for(*id).is_some_and(|c| c.name() == carrier.name()))
+                .unwrap_or_else(|| panic!("{} claims no arch id below 64", carrier.name()));
+            let mut f = facts(arch);
+            f.pp = 2;
+            f.pp_mesh = Some(mesh(2, 1, 1, &[0, 1]));
+            let (route, _) = classify(&f).unwrap();
+            assert_eq!(route, pp_bench_route(pp_caps.bench), "{}", carrier.name());
+        }
     }
 }

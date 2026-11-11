@@ -124,6 +124,91 @@ pub fn trip_end(b: &mut Builder, g: &Gen) -> Result<(), String> {
     )
 }
 
+fn ring3_only(what: &str, g: &Gen) -> Result<(), String> {
+    if g.depth() != 3 {
+        return Err(format!("{what}: only a ring-depth-3 generator has it"));
+    }
+    Ok(())
+}
+
+/// Depth-3 group end: the group offsets move on one K group after every read of them in the group
+/// (the activation descriptors step at the start of their block instead, see
+/// [`step_descriptor`]).
+pub fn group_end(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    ring3_only("group_end", g)?;
+    for r in [g.goff, g.goff1] {
+        op(
+            b,
+            format!("s_add_co_i32 s{0}, s{0}, 0xc8", r),
+            &[s(r)],
+            &[s(r)],
+        )?;
+    }
+    Ok(())
+}
+
+/// Depth-3 trip counter: drops by one after the three groups of a loop trip.
+pub fn trips_dec(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    ring3_only("trips_dec", g)?;
+    op(
+        b,
+        format!("s_add_co_i32 s{0}, s{0}, -1", g.trips),
+        &[s(g.trips)],
+        &[s(g.trips)],
+    )
+}
+
+/// Depth-3 K split, from the kernel argument only: with `n = K/256 - 1` full groups before the
+/// peeled one, `q = n / 3` loop trips replace the trip counter (`g.trips`) and `r = n % 3` leading
+/// groups go to scalar `tmp` (the arm selector, [`ring3_cmp_insn`]). The slot of slab `s` is
+/// `(s - r) mod 3`, so the loop body (three groups) and the peeled group start at slot phase 0.
+pub fn ring3_split(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    ring3_only("ring3_split", g)?;
+    let (r, q, t) = (g.tmp, g.tmp + 1, g.tmp + 2);
+    // q = floor(n * 0xAAAAAAAB / 2^33) is exact for every 32-bit n.
+    op(
+        b,
+        format!("s_mul_hi_u32 s{q}, s{}, 0xaaaaaaab", g.trips),
+        &[s(q)],
+        &[s(g.trips)],
+    )?;
+    op(b, format!("s_lshr_b32 s{q}, s{q}, 1"), &[s(q)], &[s(q)])?;
+    op(b, format!("s_mul_i32 s{t}, s{q}, 3"), &[s(t)], &[s(q)])?;
+    op(
+        b,
+        format!("s_sub_co_i32 s{r}, s{}, s{t}", g.trips),
+        &[s(r)],
+        &[s(g.trips), s(t)],
+    )?;
+    op(
+        b,
+        format!("s_mov_b32 s{}, s{q}", g.trips),
+        &[s(g.trips)],
+        &[s(q)],
+    )
+}
+
+/// The compare of the arm selector `r` ([`ring3_split`]) with an immediate: `cmp` as in
+/// [`trips_cmp_insn`]. The caller consumes it with `scmp_wg_uniform`.
+pub fn ring3_cmp_insn(g: &Gen, cmp: &str, imm: u32) -> Result<Instruction, String> {
+    ring3_only("ring3_cmp", g)?;
+    let ok = ["eq", "lg", "lt", "le", "gt", "ge"].iter().any(|c| {
+        ["u32", "i32"]
+            .iter()
+            .any(|t| cmp == format!("s_cmp_{c}_{t}"))
+    });
+    if !ok || imm > 64 {
+        return Err(format!(
+            "ring3_cmp: `{cmp} {imm}` is not a 32-bit scalar compare with an inline constant"
+        ));
+    }
+    Ok(Instruction::new(
+        format!("{cmp} s{}, {imm}", g.tmp),
+        vec![],
+        vec![s(g.tmp)],
+    ))
+}
+
 fn between(a: &str, b: &str) -> Live {
     Live::Between(a.into(), b.into())
 }
@@ -281,13 +366,15 @@ pub fn step_load_insns(
     step: u32,
     set: usize,
 ) -> Result<[Instruction; 3], String> {
-    if slot > 1 || step > 3 || set > 1 {
+    if slot >= g.depth() || step > 3 || set > 1 {
         return Err(format!(
-            "step_loads: slot {slot} / step {step} / set {set} out of range (2 / 4 / 2)"
+            "step_loads: slot {slot} / step {step} / set {set} out of range ({} / 4 / 2)",
+            g.depth()
         ));
     }
     let f = g.f[set];
     let l = g.spec.tile.layout();
+    let (wb, ab) = (l.w_slot(slot)?, l.a_slot(slot)?);
     let o = 512 * step;
     let w = publish::ds_load(
         format!(
@@ -295,7 +382,7 @@ pub fn step_load_insns(
             f,
             f + 3,
             g.fr_w,
-            super::ds_offset(l.w[slot] + o)
+            super::ds_offset(wb + o)
         ),
         vr(f, 4),
         g.fr_w,
@@ -308,7 +395,7 @@ pub fn step_load_insns(
                 dst,
                 dst + 3,
                 g.fr_a,
-                super::ds_offset(l.a[slot] + o + 2048 * half)
+                super::ds_offset(ab + o + 2048 * half)
             ),
             vr(dst, 4),
             g.fr_a,

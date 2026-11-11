@@ -1370,6 +1370,27 @@
       }
     },
 
+    "qwen3.8:flash-next-mq4-xts-symtrunk": {
+      "repo": "hipfire-models/qwen3.8-flash-next",
+      "file": "qwen3.8-flash-next-base.mq4-xts-symtrunk",
+      "size_gb": 70.9,
+      "min_vram_gb": 72,
+      "desc": "Qwen3.8-Flash-Next MQ4 XTS symmetric-trunk variant (Qwen4 HFQM, arch 16): the fixture of the 0.4.5 dual-R9700 EP2 serve measurements. Same recipe and size as qwen3.8:flash-next-mq4-xts, but the MQ6 (qt47) trunk tensors are symmetric (zero point -32 x scale), which enables the int8 trunk route on gfx1201, and it pairs with an HC8 hyper-connection sidecar (qwen3.8-flash-next-base.mq4-xts-symtrunk.hc8, 0.66 GB, fetched automatically on gfx1201 and GPU-less hosts). EP2 sidecars published beside it: .ep.expert-hotset and .ep.hot-units. KLD vs the BF16 source on gfx1201, default route, q4 PLE rows, Top-256 screen, 512-token chunks (hipfire 0.4.5 release-prep c62754942a, two fresh processes on two R9700 cards, identical results; canonical mq4-xts measured the same way in the same job): WikiText-2 0.098631 (canonical 0.104233), code24 0.087610 (canonical 0.105146); top-1 0.8787 / 0.9168 (canonical 0.8778 / 0.9121). Split base (70.9 GB) with no PLE rows of its own: it loads them from the shared qwen3.8-flash-next.ple-q4 (29.1 GB) or exact .ple-q8 (54.4 GB), so the download is about 100.0 GB with the q4 rows or 125.3 GB with the q8 rows. Not an alias of qwen3.8:flash-next, which stays the canonical affine-trunk base.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20
+      },
+      "ple": {
+        "q4": {
+          "file": "qwen3.8-flash-next.ple-q4"
+        },
+        "q8": {
+          "file": "qwen3.8-flash-next.ple-q8"
+        }
+      }
+    },
+
     "qwen3.8:flash-next-mq3-xts": {
       "repo": "hipfire-models/qwen3.8-flash-next",
       "file": "qwen3.8-flash-next-base.mq3-xts",
@@ -1726,6 +1747,31 @@
       "min_vram_gb": 2.2,
       "desc": "LFM2.5 1.2B Thinking dense (Q8, reasoning)",
       "quant_recipe": "v3-awq-f1"
+    },
+    "raon-1-mini-preview": {
+      "repo": "hipfire-models/raon-1-mini-preview",
+      "file": "raon-1-mini-preview.mq4-xts",
+      "size_gb": 17.9,
+      "min_vram_gb": 20.0,
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.5,
+        "repeat_penalty": 1.0
+      },
+      "desc": "KRAFTON Raon-1-mini-preview 28.8B/4.3B-active MoE (arch_id=19; RDA gated-delta + MLA + mHC, SiTU experts). MQ4 XTS v2 (~17.9GB): routed experts symmetric MQ4v2 qt44 with AWQ+GPTQ refit; the always-active shared-expert and dense layer-0 FFN, attention and lm_head Q8F16; 20 GB-card fit pending real-hardware measurement (32K+ context admitted under 7900 XT capacity emulation). Reasoning model (<think>, QwenJinja template; thinking on by default), XML <tool_call> tools. Registry defaults temp=1.0/top_p=0.95/top_k=20/presence_penalty=0.5 (KRAFTON card: 1.5; hipfire lowered it to 0.5 by a pre-registered sweep, loop and code-pass rates within noise; presence applies to generated tokens only).",
+      "dflash": {
+        "file": "raon-1-mini-preview-dflash2.mq4"
+      }
+    },
+    "raon-1-mini-preview:draft": {
+      "repo": "hipfire-models/raon-1-mini-preview",
+      "file": "raon-1-mini-preview-dflash2.mq4",
+      "size_gb": 0.75,
+      "min_vram_gb": 20.0,
+      "desc": "KRAFTON Raon-1-mini-preview-dflash2 DFlash2 draft, MQ4V2 with F16 fc, for raon-1-mini-preview; the paired auto draft (opt out with speculation.dflash=off)."
     },
     "qwen3.5:2b-mq3": {
       "repo": "hipfire-models/qwen3.5-2b",

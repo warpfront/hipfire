@@ -29,6 +29,10 @@ impl Operand {
     }
 }
 
+/// Workgroup ids: gfx1100 pads the two user SGPRs to `user + system (X, Y) = 16` (LLVM `FeatureUserSGPRInit16Bug`).
+const WGX: usize = Arch::Gfx1100.declared_user_sgprs(2, 2) as usize;
+const WGY: usize = WGX + 1;
+
 struct Mapping(Vec<(String, Vec<Operand>)>, usize);
 
 impl Mapping {
@@ -42,7 +46,7 @@ impl Mapping {
         let start = if epi == Epi::Silu {
             "s_and_b32 s4, s30,"
         } else {
-            "s_and_b32 s4, s14,"
+            "s_and_b32 s4, s62,"
         };
         let lines: Vec<_> = text.lines().map(str::trim).collect();
         let first = lines
@@ -51,7 +55,7 @@ impl Mapping {
             .unwrap();
         let last = lines[first..]
             .iter()
-            .position(|line| *line == "s_cselect_b32 s3, s6, s3")
+            .position(|line| *line == format!("s_cselect_b32 s{WGY}, s6, s{WGY}"))
             .unwrap()
             + first;
         Self(
@@ -65,14 +69,14 @@ impl Mapping {
                     )
                 })
                 .collect(),
-            if epi == Epi::Silu { 30 } else { 14 },
+            if epi == Epi::Silu { 30 } else { 62 },
         )
     }
 
     fn run(&self, x: u32, y: u32, m: u32, n: u32) -> (u32, u32) {
         let mut registers = std::array::from_fn(|index| 0xa500_0000 + index as u32);
-        registers[2] = x;
-        registers[3] = y;
+        registers[WGX] = x;
+        registers[WGY] = y;
         registers[self.1] = m;
         registers[16] = n;
         let original = registers;
@@ -102,8 +106,9 @@ impl Mapping {
         }
         // Only workgroup IDs and the four already-reserved temporaries change.
         assert_eq!(&registers[..2], &original[..2]);
-        assert_eq!(&registers[8..], &original[8..]);
-        (registers[2], registers[3])
+        assert_eq!(&registers[8..WGX], &original[8..WGX]);
+        assert_eq!(&registers[WGY + 1..], &original[WGY + 1..]);
+        (registers[WGX], registers[WGY])
     }
 }
 

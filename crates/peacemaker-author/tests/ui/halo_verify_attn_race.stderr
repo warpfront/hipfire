@@ -11,5 +11,5 @@ error[E0308]: mismatched types
 note: function defined here
   --> src/lds.rs
    |
-   | pub fn rotate<R: 'static>(
+   | pub fn rotate<R: 'static, const D: usize>(
    |        ^^^^^^

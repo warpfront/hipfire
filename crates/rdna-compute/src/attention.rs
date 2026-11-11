@@ -134,7 +134,7 @@ pub fn q8_flash_tile_size(
 /// Dynamic LDS of the gfx1201 Q-resident v2 attention bodies: two KT48
 /// buffers (K8 12 KiB + V8 12 KiB + f32 K/V scales 2 x 192 B each) and the
 /// 8-byte position-bounds pair at 49,920 (`attention_q8_0_fa2_gqa.gfx1201.hip`).
-const QRESIDENT_V2_LDS_BYTES: u32 = 2 * (2 * 12288 + 2 * 192) + 16;
+pub(crate) const QRESIDENT_V2_LDS_BYTES: u32 = 2 * (2 * 12288 + 2 * 192) + 16;
 const _: () = assert!(QRESIDENT_V2_LDS_BYTES == 49936);
 
 // Full Q planes and active native-cache prefix; no arithmetic uses tensor shape
@@ -178,6 +178,56 @@ fn a3b_qresident_args(ptrs: [*mut c_void; 6], rows: usize) -> [u8; 68] {
     }
     args[64..68].copy_from_slice(&(1.0f32 / 16.0).to_le_bytes());
     args
+}
+
+/// hipcc export names of the A3B native-fp8 Q-resident attention (module
+/// `attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201`).
+const A3B_QRESIDENT_HIPCC_DIRECT: &str = "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201";
+const A3B_QRESIDENT_HIPCC_RANGE: &str =
+    "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_gfx1201";
+
+/// Kernel arm of the A3B Q-resident attention launch: the hipcc module or the embedded
+/// PeaceMaker twin ([`crate::fa_qresident_pm`]). Production follows
+/// `HIPFIRE_FA_QRESIDENT_PM` (default on for exact gfx1201; `0` selects hipcc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum A3bQresRoute {
+    Hipcc,
+    Pm,
+}
+
+impl A3bQresRoute {
+    fn from_flag(fa_qresident_pm: bool) -> Self {
+        if fa_qresident_pm {
+            Self::Pm
+        } else {
+            Self::Hipcc
+        }
+    }
+}
+
+/// PM twin of a hipcc A3B Q-resident export (direct -> direct, range -> range).
+fn a3b_qresident_pm_symbol(symbol: &str) -> Option<&'static str> {
+    match symbol {
+        A3B_QRESIDENT_HIPCC_DIRECT => Some(crate::fa_qresident_pm::SYMBOL_DIRECT),
+        A3B_QRESIDENT_HIPCC_RANGE => Some(crate::fa_qresident_pm::SYMBOL_RANGE),
+        _ => None,
+    }
+}
+
+/// Symbol actually launched for `route`; the hipcc arm is the incoming symbol unchanged.
+fn a3b_qresident_launch_symbol(route: A3bQresRoute, symbol: &'static str) -> Option<&'static str> {
+    match route {
+        A3bQresRoute::Hipcc => Some(symbol),
+        A3bQresRoute::Pm => a3b_qresident_pm_symbol(symbol),
+    }
+}
+
+fn a3b_qresident_grid(batch_size: usize) -> [u32; 3] {
+    [
+        (batch_size.min(512) * 8).div_ceil(384) as u32,
+        2,
+        batch_size.div_ceil(512) as u32,
+    ]
 }
 
 /// Context ceiling of the gfx1201 Q8 FA2 prefill body: the model's 262144
@@ -373,6 +423,11 @@ pub const ATTENTION_FLASH_DECODE_VMM_ROWS_SRC: &str =
 pub enum VmmFlashDecodeRoute {
     /// `attention_flash_fp8_e4m3_tile_gqa_gfx1201` + `attention_flash_reduce_dsplit_gfx1201`.
     Fp8GqaGfx1201,
+    /// A3B group 8: `attention_flash_fp8_e4m3_tile_gqa8_gfx1201` +
+    /// `attention_flash_reduce_dsplit_gfx1201` (or the fused gated reduce,
+    /// [`Gpu::attention_flash_decode_vmm_gated_mq_rotate`]); admitted exactly
+    /// for H16/KV2, head_dim 256, tile 128 on gfx1201.
+    Fp8Gqa8Gfx1201,
     /// `attention_flash_q8_0_tile` + `attention_flash_q8_0_reduce`.
     Q8Generic,
 }
@@ -395,6 +450,16 @@ pub struct VmmFlashDecodePlan {
 /// byte-identical), then append the row wrappers. Fails if the entry
 /// signature is not found, so a body change cannot silently miscompile.
 pub fn vmm_rows_source(body: &str, kernel: &str, define: &str) -> HipResult<String> {
+    vmm_rows_source_from(ATTENTION_FLASH_DECODE_VMM_ROWS_SRC, body, kernel, define)
+}
+
+/// [`vmm_rows_source`] with an explicit wrapper file (`rows_src`).
+pub fn vmm_rows_source_from(
+    rows_src: &str,
+    body: &str,
+    kernel: &str,
+    define: &str,
+) -> HipResult<String> {
     let missing =
         || hip_bridge::HipError::new(0, &format!("vmm_rows_source: entry `{kernel}` not found"));
     let sig = format!("__global__ void {kernel}(");
@@ -407,10 +472,75 @@ pub fn vmm_rows_source(body: &str, kernel: &str, define: &str) -> HipResult<Stri
         return Err(missing());
     }
     Ok(format!(
-        "{KV_SLOT_DESC_VMM_H}\n#define {define} 1\n{}__device__ __forceinline__ void {kernel}_vmm_row_body({}\n{ATTENTION_FLASH_DECODE_VMM_ROWS_SRC}",
+        "{KV_SLOT_DESC_VMM_H}\n#define {define} 1\n{}__device__ __forceinline__ void {kernel}_vmm_row_body({}\n{rows_src}",
         &body[..ext],
         &body[at + sig.len()..],
     ))
+}
+
+/// A3B (H16/KV2) row wrappers: the group-8 fp8 tile and the fused
+/// reduce + gate + rotate epilogue. Separate from
+/// [`ATTENTION_FLASH_DECODE_VMM_ROWS_SRC`] so the group-6 modules' sources are
+/// unchanged.
+pub const ATTENTION_FLASH_DECODE_VMM_ROWS_A3B_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_decode_vmm_rows_a3b.hip");
+
+/// Row-batched fused attention epilogue module/entry (A3B, non-AWQ).
+pub const VMM_FLASH_GATED_REDUCE_KERNEL: &str =
+    "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201_vmm";
+
+/// Module/kernel names, singleton sources and defines of one
+/// [`VmmFlashDecodeRoute`]'s row-batched tile and head-dim-split/Q8 reduce.
+struct VmmFlashKernels {
+    tile: &'static str,
+    tile_body: &'static str,
+    tile_src: &'static str,
+    tile_rows_src: &'static str,
+    tile_def: &'static str,
+    reduce: &'static str,
+    reduce_body: &'static str,
+    reduce_src: &'static str,
+    reduce_def: &'static str,
+}
+
+impl VmmFlashKernels {
+    fn of(route: VmmFlashDecodeRoute) -> Self {
+        match route {
+            VmmFlashDecodeRoute::Fp8GqaGfx1201 => Self {
+                tile: "attention_flash_fp8_e4m3_tile_gqa_gfx1201_vmm",
+                tile_body: "attention_flash_fp8_e4m3_tile_gqa_gfx1201",
+                tile_src: kernels::ATTENTION_FLASH_FP8_E4M3_TILE_GQA_GFX1201_SRC,
+                tile_rows_src: ATTENTION_FLASH_DECODE_VMM_ROWS_SRC,
+                tile_def: "VMM_ROWS_FP8_GQA_TILE",
+                reduce: "attention_flash_reduce_dsplit_gfx1201_vmm",
+                reduce_body: "attention_flash_reduce_dsplit_gfx1201",
+                reduce_src: kernels::ATTENTION_FLASH_REDUCE_DSPLIT_GFX1201_SRC,
+                reduce_def: "VMM_ROWS_DSPLIT_REDUCE",
+            },
+            VmmFlashDecodeRoute::Fp8Gqa8Gfx1201 => Self {
+                tile: "attention_flash_fp8_e4m3_tile_gqa8_gfx1201_vmm",
+                tile_body: "attention_flash_fp8_e4m3_tile_gqa8_gfx1201",
+                tile_src: kernels::ATTENTION_FLASH_FP8_E4M3_TILE_GQA_GFX1201_SRC,
+                tile_rows_src: ATTENTION_FLASH_DECODE_VMM_ROWS_A3B_SRC,
+                tile_def: "VMM_ROWS_FP8_GQA8_TILE",
+                reduce: "attention_flash_reduce_dsplit_gfx1201_vmm",
+                reduce_body: "attention_flash_reduce_dsplit_gfx1201",
+                reduce_src: kernels::ATTENTION_FLASH_REDUCE_DSPLIT_GFX1201_SRC,
+                reduce_def: "VMM_ROWS_DSPLIT_REDUCE",
+            },
+            VmmFlashDecodeRoute::Q8Generic => Self {
+                tile: "attention_flash_q8_0_tile_vmm",
+                tile_body: "attention_flash_q8_0_tile",
+                tile_src: kernels::ATTENTION_FLASH_Q8_0_TILE_SRC,
+                tile_rows_src: ATTENTION_FLASH_DECODE_VMM_ROWS_SRC,
+                tile_def: "VMM_ROWS_Q8_TILE",
+                reduce: "attention_flash_q8_0_reduce_vmm",
+                reduce_body: "attention_flash_q8_0_reduce",
+                reduce_src: kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
+                reduce_def: "VMM_ROWS_Q8_REDUCE",
+            },
+        }
+    }
 }
 
 /// Launch grid for the adaptive-KV transcode kernels: one block per
@@ -486,21 +616,25 @@ fn fp8_decode_attn_gqa_pair(
     fp8_decode_gqa_pair_for_heads(n_heads, n_kv_heads)
 }
 
-/// Group-6-only predicate the VMM plan still uses: the row-batched VMM twin
-/// mirrors the group-6 singleton pair only, so H16/KV2 (newly admitted above
-/// to the group-8 pair) must keep refusing here rather than mapping to the
-/// old `Fp8GqaGfx1201` route.
-fn fp8_decode_attn_gqa_admitted(
+/// Route of the VMM row-batched flash decode whose singleton pair is the
+/// admitted fp8 GQA pair of [`fp8_decode_attn_gqa_pair`]: group 6 (any kv head
+/// count) or exactly H16/KV2 at group 8 (A3B). `None` = the singleton runs the
+/// reference tile, which has no VMM twin.
+fn fp8_decode_attn_gqa_vmm_route(
     gpu: &Gpu,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
     tile_size: usize,
-) -> bool {
-    matches!(
-        fp8_decode_attn_gqa_pair(gpu, n_heads, n_kv_heads, head_dim, tile_size),
-        Some(pair) if pair.tile == FP8_DECODE_GQA_GFX1201.tile
-    )
+) -> Option<VmmFlashDecodeRoute> {
+    let pair = fp8_decode_attn_gqa_pair(gpu, n_heads, n_kv_heads, head_dim, tile_size)?;
+    if pair.tile == FP8_DECODE_GQA_GFX1201.tile {
+        Some(VmmFlashDecodeRoute::Fp8GqaGfx1201)
+    } else if pair.tile == FP8_DECODE_GQA8_GFX1201.tile {
+        Some(VmmFlashDecodeRoute::Fp8Gqa8Gfx1201)
+    } else {
+        None
+    }
 }
 
 /// gfx1151 Q8_0 decode attention through the GQA-shared tile and the
@@ -759,7 +893,7 @@ enum VerifyGqaRef {
 /// Resolved native-fp8 split-KV FA2 verifier route
 /// (`HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Fp8Fa2SplitRoute {
+pub(crate) struct Fp8Fa2SplitRoute {
     /// KV splits (workgroups per kv head).
     splits: usize,
     /// First live context length (`max_position + 1`) the route serves.
@@ -792,7 +926,7 @@ fn fp8_fa2_split_verify_route() -> Option<Fp8Fa2SplitRoute> {
 }
 
 /// Pure body of [`fp8_fa2_split_verify_route`] for the raw env value.
-fn fp8_fa2_split_verify_route_for(raw: Option<&str>) -> Option<Fp8Fa2SplitRoute> {
+pub(crate) fn fp8_fa2_split_verify_route_for(raw: Option<&str>) -> Option<Fp8Fa2SplitRoute> {
     match raw {
         None => Some(Fp8Fa2SplitRoute {
             splits: FP8_FA2_SPLIT_DEFAULT_SPLITS,
@@ -832,7 +966,7 @@ const FP8_FA2_SPLIT_DEFAULT_MAX_ROWS: usize = 16;
 /// serves a non-tree, non-recording call of `batch_size` rows at `route_ctx`
 /// live context over `partials_numel` f32 of caller scratch.
 #[allow(clippy::too_many_arguments)]
-fn fp8_fa2_split_verify_admission(
+pub(crate) fn fp8_fa2_split_verify_admission(
     route: Option<Fp8Fa2SplitRoute>,
     arch: &str,
     route_ctx: usize,
@@ -859,7 +993,7 @@ fn fp8_fa2_split_verify_admission(
 /// the bench split path (B4 pending): it always runs the f16 partial/merge
 /// entries. The pre-convert and merge symbols are bound from the partial
 /// symbol's module object.
-fn fa2_gqa_split_gfx1201_symbols(
+pub(crate) fn fa2_gqa_split_gfx1201_symbols(
     fp8_kv: bool,
 ) -> (&'static str, &'static str, &'static str, &'static str) {
     if fp8_kv {
@@ -4706,8 +4840,8 @@ impl Gpu {
 
     /// Admit and size the row-batched VMM flash decode for one batch. Picks
     /// the SAME route and tile size as the singleton decode on this device
-    /// (`attention_flash_fp8_e4m3_tile` → gfx1201 GQA pair;
-    /// `attention_flash_q8_0` → generic tile + reduce) from the model's
+    /// (`attention_flash_fp8_e4m3_tile` → gfx1201 GQA pair, group 6 or the A3B
+    /// group 8; `attention_flash_q8_0` → generic tile + reduce) from the model's
     /// `model_max_seq`, so each row is bitwise equal to its isolated singleton
     /// decode. `max_ctx` (>= every row's position + 1) sizes the partials;
     /// routes without a VMM twin are refused, never substituted.
@@ -4733,10 +4867,13 @@ impl Gpu {
             q8_flash_tile_size(&self.arch, n_heads, n_kv_heads, head_dim, model_max_seq);
         let route = match format {
             VmmKvFormat::Fp8E4M3 => {
-                if !fp8_decode_attn_gqa_admitted(self, n_heads, n_kv_heads, head_dim, tile_size) {
-                    return refuse("singleton fp8 decode is not the gfx1201 GQA pair here");
+                match fp8_decode_attn_gqa_vmm_route(self, n_heads, n_kv_heads, head_dim, tile_size)
+                {
+                    Some(route) => route,
+                    None => {
+                        return refuse("singleton fp8 decode is not a gfx1201 GQA pair here");
+                    }
                 }
-                VmmFlashDecodeRoute::Fp8GqaGfx1201
             }
             VmmKvFormat::Q8 => {
                 let gfx1151_dpp = self.arch_caps.is_gfx1151()
@@ -4787,67 +4924,253 @@ impl Gpu {
         if rows == 0 {
             return Ok(());
         }
+        self.vmm_flash_rows_check("attention_flash_decode_vmm", plan, rows, partials)?;
+        self.bind_thread()?;
+        let k = VmmFlashKernels::of(plan.route);
+        self.ensure_vmm_rows_module(k.reduce, k.reduce_body, k.reduce_src, k.reduce_def)?;
+        self.launch_vmm_flash_tile(
+            plan, q, positions, n_heads, n_kv_heads, head_dim, rows, partials, vmm_descs, row_slot,
+        )?;
+        let ts = plan.tile_size;
+        let o_ptr = out.buf.as_ptr();
+        let p_ptr = partials.buf.as_ptr();
+        let pos_ptr = positions.buf.as_ptr();
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let tsi = ts as i32;
+        let mt = plan.max_tiles as i32;
+        let (reduce_grid, reduce_shared) = match plan.route {
+            VmmFlashDecodeRoute::Fp8GqaGfx1201 | VmmFlashDecodeRoute::Fp8Gqa8Gfx1201 => {
+                ([n_heads as u32, (head_dim / 32) as u32, rows as u32], 0u32)
+            }
+            VmmFlashDecodeRoute::Q8Generic => (
+                [n_heads as u32, 1, rows as u32],
+                (plan.max_tiles * 4) as u32,
+            ),
+        };
+        let mut params: Vec<*mut c_void> = vec![
+            &p_ptr as *const _ as *mut c_void,
+            &o_ptr as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &tsi as *const _ as *mut c_void,
+            &mt as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            k.reduce,
+            reduce_grid,
+            [256, 1, 1],
+            reduce_shared,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(p_ptr);
+                b.push_ptr(o_ptr);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_ptr(pos_ptr);
+                b.push_i32(tsi);
+                b.push_i32(mt);
+                b
+            },
+        )
+    }
+
+    /// Row-batched A3B flash decode with the singleton's FUSED epilogue:
+    /// [`Self::attention_flash_decode_vmm`]'s group-8 tile, then
+    /// `attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201` per row (reduce +
+    /// sigmoid(`gate`) output gate + FWHT rotate), writing row r's rotated `wo`
+    /// input to `out_rot[r * n_heads * head_dim ..]`. `q`, `gate` and `out_rot`
+    /// are `[rows, n_heads, head_dim]`. Only the
+    /// [`VmmFlashDecodeRoute::Fp8Gqa8Gfx1201`] plan is admitted (H16/KV2,
+    /// head_dim 256, no AWQ scale). Same host/device contracts as
+    /// `attention_flash_decode_vmm`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_decode_vmm_gated_mq_rotate(
+        &mut self,
+        plan: &VmmFlashDecodePlan,
+        q: &GpuTensor,
+        gate: &GpuTensor,
+        out_rot: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        rows: usize,
+        partials: &GpuTensor,
+        vmm_descs: &GpuTensor,
+        row_slot: &GpuTensor,
+    ) -> HipResult<()> {
+        const WHAT: &str = "attention_flash_decode_vmm_gated_mq_rotate";
+        if rows == 0 {
+            return Ok(());
+        }
+        if plan.route != VmmFlashDecodeRoute::Fp8Gqa8Gfx1201
+            || head_dim != 256
+            || n_heads != 8 * n_kv_heads
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{WHAT}: only the H16/KV2 group-8 fp8 route is admitted"),
+            ));
+        }
+        self.vmm_flash_rows_check(WHAT, plan, rows, partials)?;
+        let row_floats = n_heads * head_dim;
+        for (what, t) in [("q", q), ("gate", gate), ("out_rot", out_rot)] {
+            if t.byte_size() < rows * row_floats * 4 {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "{WHAT}: {what} {} B < {rows} rows x {row_floats} f32",
+                        t.byte_size()
+                    ),
+                ));
+            }
+        }
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_vmm_rows_module_from(
+            VMM_FLASH_GATED_REDUCE_KERNEL,
+            "HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL",
+            kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1201_SRC,
+            ATTENTION_FLASH_DECODE_VMM_ROWS_A3B_SRC,
+            "VMM_ROWS_ATTN_REDUCE_GATED_MQ",
+        )?;
+        self.launch_vmm_flash_tile(
+            plan, q, positions, n_heads, n_kv_heads, head_dim, rows, partials, vmm_descs, row_slot,
+        )?;
+        let p_ptr = partials.buf.as_ptr();
+        let o_ptr = out_rot.buf.as_ptr();
+        let g_ptr = gate.buf.as_ptr();
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let pos_ptr = positions.buf.as_ptr();
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let ts = plan.tile_size as i32;
+        let mt = plan.max_tiles as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &p_ptr as *const _ as *mut c_void,
+            &o_ptr as *const _ as *mut c_void,
+            &g_ptr as *const _ as *mut c_void,
+            &s1_ptr as *const _ as *mut c_void,
+            &s2_ptr as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &ts as *const _ as *mut c_void,
+            &mt as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            VMM_FLASH_GATED_REDUCE_KERNEL,
+            [n_heads as u32, 1, rows as u32],
+            [256, 1, 1],
+            ((plan.max_tiles + head_dim) * 4) as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(p_ptr);
+                b.push_ptr(o_ptr);
+                b.push_ptr(g_ptr);
+                b.push_ptr(s1_ptr);
+                b.push_ptr(s2_ptr);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_ptr(pos_ptr);
+                b.push_i32(ts);
+                b.push_i32(mt);
+                b
+            },
+        )
+    }
+
+    fn vmm_flash_rows_check(
+        &self,
+        what: &str,
+        plan: &VmmFlashDecodePlan,
+        rows: usize,
+        partials: &GpuTensor,
+    ) -> HipResult<()> {
         if rows > u16::MAX as usize {
             return Err(hip_bridge::HipError::new(
                 0,
-                "attention_flash_decode_vmm: rows exceed grid.z",
+                &format!("{what}: rows exceed grid.z"),
             ));
         }
         if partials.byte_size() < rows * plan.partial_floats_per_row * 4 {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_flash_decode_vmm: partials {} B < {} rows x {} f32",
+                    "{what}: partials {} B < {} rows x {} f32",
                     partials.byte_size(),
                     rows,
                     plan.partial_floats_per_row
                 ),
             ));
         }
-        self.bind_thread()?;
-        let (
-            tile_fn,
-            tile_body_fn,
-            tile_src,
-            tile_def,
-            reduce_fn,
-            reduce_body_fn,
-            reduce_src,
-            reduce_def,
-        ) = match plan.route {
-            VmmFlashDecodeRoute::Fp8GqaGfx1201 => (
-                "attention_flash_fp8_e4m3_tile_gqa_gfx1201_vmm",
-                "attention_flash_fp8_e4m3_tile_gqa_gfx1201",
-                kernels::ATTENTION_FLASH_FP8_E4M3_TILE_GQA_GFX1201_SRC,
-                "VMM_ROWS_FP8_GQA_TILE",
-                "attention_flash_reduce_dsplit_gfx1201_vmm",
-                "attention_flash_reduce_dsplit_gfx1201",
-                kernels::ATTENTION_FLASH_REDUCE_DSPLIT_GFX1201_SRC,
-                "VMM_ROWS_DSPLIT_REDUCE",
-            ),
-            VmmFlashDecodeRoute::Q8Generic => (
-                "attention_flash_q8_0_tile_vmm",
-                "attention_flash_q8_0_tile",
-                kernels::ATTENTION_FLASH_Q8_0_TILE_SRC,
-                "VMM_ROWS_Q8_TILE",
-                "attention_flash_q8_0_reduce_vmm",
-                "attention_flash_q8_0_reduce",
-                kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
-                "VMM_ROWS_Q8_REDUCE",
-            ),
-        };
-        for (func, body_fn, src, def) in [
-            (tile_fn, tile_body_fn, tile_src, tile_def),
-            (reduce_fn, reduce_body_fn, reduce_src, reduce_def),
-        ] {
-            if !self.functions.contains_key(func) {
-                let module = vmm_rows_source(src, body_fn, def)?;
-                self.ensure_kernel(func, &module, func)?;
-            }
+        Ok(())
+    }
+
+    /// Compile (once) the row-batched module `func` from singleton body `src`
+    /// with the group-6 wrapper file.
+    fn ensure_vmm_rows_module(
+        &mut self,
+        func: &str,
+        body_fn: &str,
+        src: &str,
+        define: &str,
+    ) -> HipResult<()> {
+        self.ensure_vmm_rows_module_from(
+            func,
+            body_fn,
+            src,
+            ATTENTION_FLASH_DECODE_VMM_ROWS_SRC,
+            define,
+        )
+    }
+
+    fn ensure_vmm_rows_module_from(
+        &mut self,
+        func: &str,
+        body_fn: &str,
+        src: &str,
+        rows_src: &str,
+        define: &str,
+    ) -> HipResult<()> {
+        if !self.functions.contains_key(func) {
+            let module = vmm_rows_source_from(rows_src, src, body_fn, define)?;
+            self.ensure_kernel(func, &module, func)?;
         }
+        Ok(())
+    }
+
+    /// The tile launch of a row-batched VMM flash decode (blockIdx.z = row):
+    /// ensures the route's tile module and fills `partials`.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_vmm_flash_tile(
+        &mut self,
+        plan: &VmmFlashDecodePlan,
+        q: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        rows: usize,
+        partials: &GpuTensor,
+        vmm_descs: &GpuTensor,
+        row_slot: &GpuTensor,
+    ) -> HipResult<()> {
+        let k = VmmFlashKernels::of(plan.route);
+        self.ensure_vmm_rows_module_from(
+            k.tile,
+            k.tile_body,
+            k.tile_src,
+            k.tile_rows_src,
+            k.tile_def,
+        )?;
         let ts = plan.tile_size;
         let q_ptr = q.buf.as_ptr();
-        let o_ptr = out.buf.as_ptr();
         let p_ptr = partials.buf.as_ptr();
         let pos_ptr = positions.buf.as_ptr();
         let d_ptr = vmm_descs.buf.as_ptr();
@@ -4859,9 +5182,8 @@ impl Gpu {
         let ms = (plan.max_tiles * ts) as i32;
         let sc = 1.0f32 / (head_dim as f32).sqrt();
         let tsi = ts as i32;
-        let mt = plan.max_tiles as i32;
         let (tile_grid, tile_block, tile_shared) = match plan.route {
-            VmmFlashDecodeRoute::Fp8GqaGfx1201 => (
+            VmmFlashDecodeRoute::Fp8GqaGfx1201 | VmmFlashDecodeRoute::Fp8Gqa8Gfx1201 => (
                 [
                     n_kv_heads as u32,
                     plan.max_tiles.min(FP8_DECODE_GQA_GFX1201.grid_y_cap) as u32,
@@ -4890,7 +5212,7 @@ impl Gpu {
             &rs_ptr as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            tile_fn,
+            k.tile,
             tile_grid,
             tile_block,
             tile_shared,
@@ -4908,42 +5230,6 @@ impl Gpu {
                 b.push_i32(tsi);
                 b.push_ptr(d_ptr);
                 b.push_ptr(rs_ptr);
-                b
-            },
-        )?;
-        let (reduce_grid, reduce_shared) = match plan.route {
-            VmmFlashDecodeRoute::Fp8GqaGfx1201 => {
-                ([n_heads as u32, (head_dim / 32) as u32, rows as u32], 0u32)
-            }
-            VmmFlashDecodeRoute::Q8Generic => (
-                [n_heads as u32, 1, rows as u32],
-                (plan.max_tiles * 4) as u32,
-            ),
-        };
-        let mut params: Vec<*mut c_void> = vec![
-            &p_ptr as *const _ as *mut c_void,
-            &o_ptr as *const _ as *mut c_void,
-            &nh as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-            &pos_ptr as *const _ as *mut c_void,
-            &tsi as *const _ as *mut c_void,
-            &mt as *const _ as *mut c_void,
-        ];
-        self.launch_maybe_blob(
-            reduce_fn,
-            reduce_grid,
-            [256, 1, 1],
-            reduce_shared,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(p_ptr);
-                b.push_ptr(o_ptr);
-                b.push_i32(nh);
-                b.push_i32(hd);
-                b.push_ptr(pos_ptr);
-                b.push_i32(tsi);
-                b.push_i32(mt);
                 b
             },
         )
@@ -7548,8 +7834,10 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        let route = A3bQresRoute::from_flag(self.flags.fa_qresident_pm);
         self.qresident_a3b_launch(
-            "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201",
+            route,
+            A3B_QRESIDENT_HIPCC_DIRECT,
             q,
             k_cache,
             v_cache,
@@ -7583,8 +7871,10 @@ impl Gpu {
         q_total_rows: usize,
         q_row_offset: usize,
     ) -> HipResult<()> {
+        let route = A3bQresRoute::from_flag(self.flags.fa_qresident_pm);
         self.qresident_a3b_launch(
-            "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_gfx1201",
+            route,
+            A3B_QRESIDENT_HIPCC_RANGE,
             q,
             k_cache,
             v_cache,
@@ -7600,9 +7890,85 @@ impl Gpu {
         )
     }
 
+    /// A3B Q-resident attention with the kernel arm chosen by the caller, not by
+    /// `HIPFIRE_FA_QRESIDENT_PM` (byte oracle / timing harness; identical validation).
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_routed_gfx1201(
+        &mut self,
+        route: A3bQresRoute,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.qresident_a3b_launch(
+            route,
+            A3B_QRESIDENT_HIPCC_DIRECT,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            batch_size,
+            0,
+        )
+    }
+
+    /// Range form of [`Self::attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_routed_gfx1201`].
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_routed_gfx1201(
+        &mut self,
+        route: A3bQresRoute,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        q_total_rows: usize,
+        q_row_offset: usize,
+    ) -> HipResult<()> {
+        self.qresident_a3b_launch(
+            route,
+            A3B_QRESIDENT_HIPCC_RANGE,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            q_total_rows,
+            q_row_offset,
+        )
+    }
+
+    /// `symbol` is the hipcc export name; [`A3bQresRoute::Pm`] launches its PM twin from
+    /// [`crate::fa_qresident_pm`] with the identical argument blob, grid, block and LDS.
     #[allow(clippy::too_many_arguments)]
     fn qresident_a3b_launch(
         &mut self,
+        route: A3bQresRoute,
         symbol: &'static str,
         q: &GpuTensor,
         k_cache: &GpuTensor,
@@ -7662,12 +8028,18 @@ impl Gpu {
                 return Err(invalid());
             }
         }
-        if !self.functions.contains_key(symbol) {
-            self.ensure_kernel(
-                "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201",
-                kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A3B_GFX1201_SRC,
-                symbol,
-            )?;
+        let launch_symbol = a3b_qresident_launch_symbol(route, symbol).ok_or_else(invalid)?;
+        match route {
+            A3bQresRoute::Hipcc => {
+                if !self.functions.contains_key(symbol) {
+                    self.ensure_kernel(
+                        "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201",
+                        kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A3B_GFX1201_SRC,
+                        symbol,
+                    )?;
+                }
+            }
+            A3bQresRoute::Pm => self.fa_qresident_pm_load(launch_symbol)?,
         }
         let qp = unsafe { (q.buf.as_ptr() as *mut u8).add(code_off) as *mut c_void };
         let sq = unsafe { (q.buf.as_ptr() as *mut u8).add(scale_off) as *mut c_void };
@@ -7685,12 +8057,8 @@ impl Gpu {
         // Same capture/recording posture as dense qresident, no eager-only gate.
         // KT48 double buffers: 2*(2*12288 + 2*192) + 16 = 49936 bytes.
         self.launch_blob_recorded(
-            symbol,
-            [
-                (batch_size.min(512) * 8).div_ceil(384) as u32,
-                2,
-                batch_size.div_ceil(512) as u32,
-            ],
+            launch_symbol,
+            a3b_qresident_grid(batch_size),
             [768, 1, 1],
             QRESIDENT_V2_LDS_BYTES,
             &mut args,
@@ -22255,6 +22623,89 @@ impl Gpu {
         )
     }
 
+    /// Resolve the 16-bit-exchange graph reduce kernel before graph capture
+    /// (JIT compilation is not capture-safe).
+    pub fn ensure_tp_graph_signal_reduce16_gfx1100_kernel(
+        &mut self,
+        fmt: crate::norm::TpExchange16,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1201") {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "tp_graph_signal_reduce16 requires gfx1100 or gfx1201, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "tp_graph_signal_reduce_gfx1100",
+            kernels::TP_GRAPH_SIGNAL_GFX1100_SRC,
+            fmt.graph_reduce_kernel(),
+        )
+    }
+
+    /// 16-bit-exchange twin of [`Self::tp_graph_signal_reduce_gfx1100`]: the
+    /// local f32 partial is published as `2 * count` bytes of 16-bit `fmt`
+    /// into the peer's coherent shadow, and both ranks add
+    /// `x + (r(p0) + r(p1))` (`r` = the 16-bit round trip) in rank order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tp_graph_signal_reduce16_gfx1100(
+        &mut self,
+        fmt: crate::norm::TpExchange16,
+        local_signal: &DeviceBuffer,
+        peer_signal: &DeviceBuffer,
+        x: &DeviceBuffer,
+        local_partial: &DeviceBuffer,
+        peer_shadow: *mut c_void,
+        local_shadow: *const c_void,
+        local_is_first: bool,
+        count: usize,
+    ) -> HipResult<()> {
+        self.ensure_tp_graph_signal_reduce16_gfx1100_kernel(fmt)?;
+
+        let local_ptr = local_signal.as_ptr();
+        let peer_ptr = peer_signal.as_ptr();
+        let x_ptr = x.as_ptr();
+        let local_partial_ptr = local_partial.as_ptr();
+        let local_is_first_arg = i32::from(local_is_first);
+        let count_arg = i32::try_from(count)
+            .map_err(|_| hip_bridge::HipError::new(0, "TP2 graph reduce count exceeds i32"))?;
+        let wait_block = self.device_wait_block()?;
+        let mut params: [*mut c_void; 9] = [
+            &local_ptr as *const _ as *mut c_void,
+            &peer_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &local_partial_ptr as *const _ as *mut c_void,
+            &peer_shadow as *const _ as *mut c_void,
+            &local_shadow as *const _ as *mut c_void,
+            &local_is_first_arg as *const _ as *mut c_void,
+            &count_arg as *const _ as *mut c_void,
+            &wait_block as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            fmt.graph_reduce_kernel(),
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(local_ptr);
+                b.push_ptr(peer_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(local_partial_ptr);
+                b.push_ptr(peer_shadow);
+                b.push_ptr(local_shadow);
+                b.push_i32(local_is_first_arg);
+                b.push_i32(count_arg);
+                b.push_ptr(wait_block);
+                b
+            },
+        )
+    }
+
     /// Publish one TP graph barrier epoch with system-scope release semantics.
     pub fn tp_graph_signal_store_gfx1201(
         &mut self,
@@ -26359,6 +26810,95 @@ mod tests {
         )
         .is_err());
         assert_eq!(super::QRESIDENT_V2_LDS_BYTES, 49936);
+    }
+
+    #[test]
+    fn a3b_qresident_pm_symbol_mapping_and_route_selection() {
+        use super::{
+            a3b_qresident_launch_symbol, a3b_qresident_pm_symbol, A3bQresRoute,
+            A3B_QRESIDENT_HIPCC_DIRECT, A3B_QRESIDENT_HIPCC_RANGE,
+        };
+        use crate::fa_qresident_pm as pm;
+        assert_eq!(
+            a3b_qresident_pm_symbol(A3B_QRESIDENT_HIPCC_DIRECT),
+            Some(pm::SYMBOL_DIRECT)
+        );
+        assert_eq!(
+            a3b_qresident_pm_symbol(A3B_QRESIDENT_HIPCC_RANGE),
+            Some(pm::SYMBOL_RANGE)
+        );
+        assert_eq!(a3b_qresident_pm_symbol(pm::SYMBOL_DIRECT), None);
+        assert_eq!(
+            a3b_qresident_pm_symbol("attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201"),
+            None
+        );
+        // Flag off (route Hipcc) keeps the hipcc symbol untouched.
+        for hipcc in [A3B_QRESIDENT_HIPCC_DIRECT, A3B_QRESIDENT_HIPCC_RANGE] {
+            assert_eq!(
+                a3b_qresident_launch_symbol(A3bQresRoute::Hipcc, hipcc),
+                Some(hipcc)
+            );
+        }
+        assert_eq!(
+            a3b_qresident_launch_symbol(A3bQresRoute::Pm, A3B_QRESIDENT_HIPCC_DIRECT),
+            Some(pm::SYMBOL_DIRECT)
+        );
+        assert_eq!(
+            a3b_qresident_launch_symbol(A3bQresRoute::Pm, A3B_QRESIDENT_HIPCC_RANGE),
+            Some(pm::SYMBOL_RANGE)
+        );
+        assert_eq!(
+            a3b_qresident_launch_symbol(A3bQresRoute::Pm, "unknown"),
+            None
+        );
+    }
+
+    #[test]
+    fn a3b_qresident_route_follows_the_flag_and_defaults_to_pm_on_gfx1201() {
+        use super::A3bQresRoute;
+        assert_eq!(A3bQresRoute::from_flag(false), A3bQresRoute::Hipcc);
+        assert_eq!(A3bQresRoute::from_flag(true), A3bQresRoute::Pm);
+        let mut flags = crate::feature_flags::FeatureFlags::for_test("gfx1201");
+        assert_eq!(
+            A3bQresRoute::from_flag(flags.fa_qresident_pm),
+            A3bQresRoute::Pm
+        );
+        flags.fa_qresident_pm = false;
+        assert_eq!(
+            A3bQresRoute::from_flag(flags.fa_qresident_pm),
+            A3bQresRoute::Hipcc
+        );
+    }
+
+    #[test]
+    fn a3b_qresident_grid_and_args_are_route_independent() {
+        use super::{a3b_qresident_args, a3b_qresident_grid};
+        use crate::fa_qresident_pm as pm;
+        assert_eq!(a3b_qresident_args([std::ptr::null_mut(); 6], 1).len(), 68);
+        assert_eq!(
+            a3b_qresident_args([std::ptr::null_mut(); 6], 1).len(),
+            pm::KERNARG_BYTES
+        );
+        for (batch, grid) in [
+            (1usize, [1u32, 2, 1]),
+            (48, [1, 2, 1]),
+            (64, [2, 2, 1]),
+            (511, [11, 2, 1]),
+            (512, [11, 2, 1]),
+            (513, [11, 2, 2]),
+            (8192, [11, 2, 16]),
+        ] {
+            assert_eq!(a3b_qresident_grid(batch), grid, "batch {batch}");
+            // The pre-wiring inline formula.
+            assert_eq!(
+                grid,
+                [
+                    (batch.min(512) * 8).div_ceil(384) as u32,
+                    2,
+                    batch.div_ceil(512) as u32
+                ]
+            );
+        }
     }
 
     #[test]

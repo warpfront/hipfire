@@ -1041,6 +1041,53 @@ impl MtpSpecState {
         })
     }
 
+    /// Device bytes the first request's lazily created `MtpSpecState` takes
+    /// ([`Self::new_for_slot_with_kv_mode_and_verify_capacity`] with
+    /// `MtpKvMode::Q8`, then the compressed-vocab scratches when the head
+    /// ships them, as `Qwen35MtpDrafter::ensure_state` builds it), from shape
+    /// arithmetic alone. `trunk_snapshot_bytes` is
+    /// `DeltaNetSnapshot::bytes_for(dn_state)` (the `trunk_snap` owner); the
+    /// head KV and flash partials are sized by `head.config.max_seq`.
+    pub fn requested_bytes(
+        arch: &str,
+        config: &Qwen35Config,
+        trunk_snapshot_bytes: usize,
+        head_config: &mtp_head::Qwen35MtpHeadConfig,
+        compressed_vocab: Option<usize>,
+        max_n: usize,
+        verify_capacity: usize,
+    ) -> Result<usize, String> {
+        let dim = config.dim;
+        let vocab = config.vocab_size;
+        let rows = verify_capacity + 1;
+        let cvs = compressed_vocab;
+        let f32_elems = dim // prev_hidden
+            + rows * dim // verify_hidden
+            + rows * vocab // verify_logits
+            + rows * dim // verify_rot
+            + rows // verify_argmax
+            + 3 * max_n * dim // mtp_t_outs, mtp_lm_tmp, mtp_lm_rot
+            + max_n * vocab // mtp_lm_logits
+            + max_n // mtp_lm_argmax
+            + (max_n + 1) // mtp_token_chain
+            + dim // mtp_token_embed
+            + max_n // mtp_positions
+            + rows * dim // takeover_fill_hidden
+            + 2 + 2 + 2 // topk idx/logp, sample result
+            + PENALTY_REPEAT_CAP + rows // mtp_sample_repeat_buf
+            + 1 + 1 + 2 * max_n // gather idx/prob draft + verify
+            + cvs.map_or(0, |c| max_n * c); // mtp_lm_logits_compressed
+        let pbs = PrefillBatchScratch::projected_allocation_bytes(config, rows, true)
+            .map_err(|e| format!("MTP trunk PBS sizing: {e}"))?;
+        let pbs = usize::try_from(pbs).map_err(|_| "MTP trunk PBS sizing overflow".to_string())?;
+        Ok(f32_elems * 4
+            + trunk_snapshot_bytes
+            + pbs
+            + GdnTape::requested_bytes(config, rows, true)
+            + Qwen35MtpHeadScratch::requested_bytes(arch, head_config, cvs)
+            + Qwen35MtpHeadKvCache::q8_requested_bytes(head_config))
+    }
+
     /// Configure sampling (temp/top_p/top_k/min_p) and reseed the per-state RNG.
     /// `cfg.temp == 0.0` keeps the legacy greedy path. `cfg.temp > 0` enables
     /// residual-acceptance sampling per the Unsloth/llama.cpp MTP recipe.
@@ -3376,6 +3423,185 @@ fn mtp_prompt_fill_scratch_rows(prompt_len: usize, prefill_max_batch: usize) -> 
     }
 }
 
+/// Whether the head's prompt fill takes the batched route (and so allocates the
+/// per-request fill scratch + rotation buffer at all).
+pub fn mtp_head_fills_batched(head: &Qwen35MtpHead) -> bool {
+    mtp_head::mtp_prompt_fill_uses_batched(
+        mtp_head::MtpKvMode::Q8,
+        &[
+            head.weights.eh_proj.gpu_dtype,
+            head.weights.wq.gpu_dtype,
+            head.weights.wk.gpu_dtype,
+            head.weights.wv.gpu_dtype,
+        ],
+    )
+}
+
+/// Temporary device bytes [`prefill_trunk_and_mtp_cache_parts`] allocates per
+/// request for a prompt of at least `prefill_max_batch` tokens: the pairing
+/// hidden window `(rows + 1) * dim` F32 and, when `batched`, the head fill
+/// scratch plus rotation buffer at the legacy `rows = prefill_max_batch`. The
+/// lean wide-slice layout (`new_for_prompt_fill`) never exceeds this legacy
+/// byte budget (its row count is chosen against it), so this bounds both.
+pub fn mtp_prompt_fill_requested_bytes(
+    config: &Qwen35Config,
+    head_config: &mtp_head::Qwen35MtpHeadConfig,
+    batched: bool,
+    prefill_max_batch: usize,
+) -> usize {
+    let rows = prefill_max_batch.max(1);
+    let hidden = (rows + 1) * config.dim * 4;
+    if !batched {
+        return hidden;
+    }
+    let legacy_rotation_k = (2 * config.dim)
+        .max(head_config.n_ff)
+        .max(config.dim)
+        .max(head_config.n_head * head_config.head_dim);
+    hidden
+        + Qwen35MtpHeadBatchedScratch::legacy_prompt_fill_bytes(
+            head_config,
+            rows,
+            legacy_rotation_k,
+        )
+}
+
+#[cfg(test)]
+mod lazy_state_bytes_tests {
+    use super::*;
+    use crate::mtp_head::{Qwen35MtpFfnKind, Qwen35MtpHeadConfig};
+
+    fn config_27b() -> Qwen35Config {
+        Qwen35Config {
+            dim: 5120,
+            n_layers: 64,
+            vocab_size: 248320,
+            norm_eps: 1e-6,
+            eos_token: 2,
+            n_heads: 24,
+            n_kv_heads: 4,
+            head_dim: 256,
+            rope_theta: 500000.0,
+            partial_rotary_factor: 0.25,
+            is_vl_text: false,
+            mrope_interleaved: false,
+            mrope_section: [0, 0, 0],
+            linear_num_key_heads: 16,
+            linear_num_value_heads: 48,
+            linear_key_head_dim: 128,
+            linear_value_head_dim: 128,
+            conv_kernel_dim: 4,
+            hidden_dim: 17408,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            has_shared_expert: false,
+            norm_topk_prob: false,
+            layer_types: (0..48)
+                .map(|_| LayerType::LinearAttention)
+                .chain((0..16).map(|_| LayerType::FullAttention))
+                .collect(),
+            paged_experts: false,
+            vram_budget_bytes: u64::MAX,
+            reap_keep: None,
+        }
+    }
+
+    fn head_27b(max_seq: usize) -> Qwen35MtpHeadConfig {
+        Qwen35MtpHeadConfig {
+            n_embd: 5120,
+            n_head: 24,
+            n_head_kv: 4,
+            head_dim: 256,
+            n_ff: 17408,
+            ffn_kind: Qwen35MtpFfnKind::Dense,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            norm_topk_prob: false,
+            vocab_size: 248320,
+            rope_theta: 10_000_000.0,
+            n_rot: 64,
+            rms_norm_eps: 1e-6,
+            max_seq,
+            tie_word_embeddings: false,
+        }
+    }
+
+    #[test]
+    fn gdn_tape_bytes_match_shape_arithmetic() {
+        let c = config_27b();
+        // 48 LA layers x rows x (qkv 10240 + 2 x 48 heads) + 2 x k_dim(2048)
+        // + 4 x v_dim(6144) per row, F32.
+        let rows = 8usize;
+        let capture = (48 * rows * (10240 + 96) + rows * (2 * 2048 + 4 * 6144)) * 4;
+        assert_eq!(GdnTape::requested_bytes(&c, rows, false), capture);
+        // Replay arming adds 4 shared regions of 48 x rows x 6144 F32 plus the
+        // two 48-row pointer tables.
+        let replay = 4 * 48 * rows * 6144 * 4
+            + 48 * (std::mem::size_of::<rdna_compute::dflash_gdn_replay::DflashReplayPreLayer>()
+                + std::mem::size_of::<rdna_compute::dflash_gdn_replay::GdnLayerTable>());
+        assert_eq!(GdnTape::requested_bytes(&c, rows, true), capture + replay);
+    }
+
+    #[test]
+    fn spec_state_bytes_match_shape_arithmetic() {
+        let c = config_27b();
+        let h = head_27b(95664);
+        let (max_n, vc) = (5usize, 5usize);
+        let rows = vc + 1;
+        let snap = 123_456_789usize;
+        let got = MtpSpecState::requested_bytes("gfx1100", &c, snap, &h, None, max_n, vc).unwrap();
+        let small = 5120
+            + 3 * rows * 5120
+            + rows * 248320
+            + rows
+            + 3 * max_n * 5120
+            + max_n * 248320
+            + max_n
+            + (max_n + 1)
+            + 5120
+            + max_n
+            + 6
+            + PENALTY_REPEAT_CAP
+            + rows
+            + 2
+            + 2 * max_n;
+        let expect = small * 4
+            + snap
+            + PrefillBatchScratch::projected_allocation_bytes(&c, rows, true).unwrap() as usize
+            + GdnTape::requested_bytes(&c, rows, true)
+            + Qwen35MtpHeadScratch::requested_bytes("gfx1100", &h, None)
+            + Qwen35MtpHeadKvCache::q8_requested_bytes(&h);
+        assert_eq!(got, expect);
+        // A compressed-vocab head adds the sidecar logits scratch pair.
+        let cvs = 32768usize;
+        let with =
+            MtpSpecState::requested_bytes("gfx1100", &c, snap, &h, Some(cvs), max_n, vc).unwrap();
+        assert_eq!(with, got + (max_n * cvs + cvs) * 4);
+        // Head KV: K + V, 95664 x 4 heads x 8 blocks x 34 B.
+        assert_eq!(
+            Qwen35MtpHeadKvCache::q8_requested_bytes(&h),
+            2 * 95664 * 32 * 34
+        );
+    }
+
+    #[test]
+    fn prompt_fill_bytes_match_shape_arithmetic() {
+        let c = config_27b();
+        let h = head_27b(95664);
+        let hidden = 513 * 5120 * 4;
+        assert_eq!(mtp_prompt_fill_requested_bytes(&c, &h, false, 512), hidden);
+        // Legacy layout: 565_252 B/row of scratch + a 17408-wide rotation row.
+        assert_eq!(
+            mtp_prompt_fill_requested_bytes(&c, &h, true, 512),
+            hidden + 512 * 565_252 + 512 * 17408 * 4
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_trunk_and_mtp_cache(
     gpu: &mut Gpu,
@@ -3395,7 +3621,7 @@ pub fn prefill_trunk_and_mtp_cache(
         prompt_tokens,
         start_pos,
         route,
-        |_gpu, _target, _committed_pos| Ok(()),
+        |_gpu, _target, _kv, _committed_pos| Ok(()),
     )
 }
 
@@ -3419,7 +3645,7 @@ pub fn prefill_trunk_and_mtp_cache_with_boundary<F>(
     on_committed_boundary: F,
 ) -> HipResult<TrunkSpinePrefillTimings>
 where
-    F: FnMut(&mut Gpu, &DeltaNetState, usize) -> HipResult<()>,
+    F: FnMut(&mut Gpu, &DeltaNetState, &KvCache, usize) -> HipResult<()>,
 {
     let mut parts = MtpPrefillTarget {
         weights: &target.weights,
@@ -3463,7 +3689,7 @@ pub fn prefill_trunk_and_mtp_cache_parts<F>(
     mut on_committed_boundary: F,
 ) -> HipResult<TrunkSpinePrefillTimings>
 where
-    F: FnMut(&mut Gpu, &DeltaNetState, usize) -> HipResult<()>,
+    F: FnMut(&mut Gpu, &DeltaNetState, &KvCache, usize) -> HipResult<()>,
 {
     let Some(head_rows) =
         mtp_prompt_fill_scratch_rows(prompt_tokens.len(), qwen35::prefill_max_batch(gpu))
@@ -3475,13 +3701,17 @@ where
     // the MTP buffers below take memory, as AR's query sees it.
     let trunk_chunk_max = match route {
         MtpPromptRoute::Own => head_rows,
-        MtpPromptRoute::ArRoute => match qwen35::ordinary_prefill_chunk_limit(
+        MtpPromptRoute::ArRoute => match qwen35::prefill::ordinary_prefill_chunk_limit_deducting(
             gpu,
             &target.weights,
             &target.config,
             &target.dn_state,
             &target.kv_cache,
-            None,
+            qwen35::prefill::request_kv_growth_deduction(
+                gpu,
+                &target.kv_cache,
+                start_pos + prompt_tokens.len(),
+            ),
         ) {
             Ok(limit) => limit,
             Err(e) => {
@@ -3546,10 +3776,18 @@ where
         legacy_rotation_k
     };
     // The head pairs token `p` with the trunk hidden of position `p - 1`, as
-    // decode does. Row 0 holds the partner of the first fill token; row
-    // `j + 1` holds the hidden of position `start_pos + j`. Fill row `j`
-    // therefore pairs `prompt_tokens[j]` with row `j`.
-    let prompt_hidden = gpu.alloc_tensor(&[(prompt_tokens.len() + 1) * dim], DType::F32)?;
+    // decode does. The pairing buffer holds one outer chunk plus its partner
+    // row, not the whole prompt (a whole-prompt F32 buffer is 20 KiB/token on
+    // a 5120-dim trunk, allocated per request and charged nowhere): row 0
+    // holds the partner of the chunk's first token, row `j + 1` the hidden of
+    // chunk position `j`, so chunk row `j` pairs `chunk[j]` with row `j`.
+    // After each chunk its last hidden moves to row 0 for the next chunk.
+    let chunk_cap = match route {
+        MtpPromptRoute::Own => head_rows,
+        MtpPromptRoute::ArRoute => trunk_chunk_max.max(1),
+    };
+    let window_rows = prompt_tokens.len().min(chunk_cap);
+    let prompt_hidden = gpu.alloc_tensor(&[(window_rows + 1) * dim], DType::F32)?;
     let mut mtp_prefill_scratch = if use_batched_mtp_fill {
         let created = if fill_fast_wide {
             Qwen35MtpHeadBatchedScratch::new_for_prompt_fill(gpu, &head.config, head_rows)
@@ -3615,8 +3853,8 @@ where
             let chunk_start_pos = start_pos + off;
             let committed_pos = start_pos + end;
 
-            // Per-chunk hidden destination: rows `off + 1..` of the pairing buffer.
-            let chunk_hidden = prompt_hidden.sub_offset((off + 1) * dim, chunk.len() * dim);
+            // Per-chunk hidden destination: rows `1..` of the pairing window.
+            let chunk_hidden = prompt_hidden.sub_offset(dim, chunk.len() * dim);
 
             let t_trunk = Instant::now();
             match route {
@@ -3658,7 +3896,8 @@ where
                 while slice_off < end {
                     let slice_end = ((slice_off / head_rows + 1) * head_rows).min(end);
                     let slice = &prompt_tokens[slice_off..slice_end];
-                    let slice_hidden = prompt_hidden.sub_offset(slice_off * dim, slice.len() * dim);
+                    let slice_hidden =
+                        prompt_hidden.sub_offset((slice_off - off) * dim, slice.len() * dim);
                     let positions: Vec<i32> = (start_pos + slice_off..start_pos + slice_end)
                         .map(|position| position as i32)
                         .collect();
@@ -3679,7 +3918,7 @@ where
                 }
             } else {
                 for (i, &token) in chunk.iter().enumerate() {
-                    let hidden_row = prompt_hidden.sub_offset((off + i) * dim, dim);
+                    let hidden_row = prompt_hidden.sub_offset(i * dim, dim);
                     mtp_head::mtp_head_forward_block_only(
                         gpu,
                         head,
@@ -3694,20 +3933,39 @@ where
                 }
             }
             mtp_prompt_fill_secs += t_mtp_fill.elapsed().as_secs_f64();
+            // Carry the chunk's last hidden (row `chunk.len()`) to row 0: it
+            // partners the next chunk's first token and, after the last
+            // chunk, seeds `prev_hidden`. Ordered after the fill on the
+            // active stream when there is one.
+            match gpu.active_stream.as_ref() {
+                Some(stream) => gpu.hip.memcpy_dtod_async_at(
+                    &prompt_hidden.buf,
+                    0,
+                    &prompt_hidden.buf,
+                    chunk.len() * dim_bytes,
+                    dim_bytes,
+                    stream,
+                )?,
+                None => gpu.hip.memcpy_dtod_at(
+                    &prompt_hidden.buf,
+                    0,
+                    &prompt_hidden.buf,
+                    chunk.len() * dim_bytes,
+                    dim_bytes,
+                )?,
+            }
 
             // Committed boundary: trunk + MTP private KV now cover [0, committed_pos).
-            on_committed_boundary(gpu, target.dn_state, committed_pos)?;
+            on_committed_boundary(gpu, target.dn_state, &*target.kv_cache, committed_pos)?;
+            // `prefill_progress` for the request's prompt prefill (live only
+            // inside a `prompt_phase`; silent for decode-time replays).
+            hipfire_runtime::prefill_progress::report(end, prompt_tokens.len());
             off = end;
         }
 
         let last = prompt_tokens.len() - 1;
-        gpu.hip.memcpy_dtod_at(
-            &state.prev_hidden.buf,
-            0,
-            &prompt_hidden.buf,
-            (last + 1) * dim_bytes,
-            dim_bytes,
-        )?;
+        gpu.hip
+            .memcpy_dtod_at(&state.prev_hidden.buf, 0, &prompt_hidden.buf, 0, dim_bytes)?;
         state.prev_hidden_pos = Some(start_pos + last);
         Ok(TrunkSpinePrefillTimings {
             trunk_prefill_secs,

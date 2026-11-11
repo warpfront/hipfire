@@ -33,7 +33,9 @@ run() {
 run bash scripts/leanup-ratchets.sh
 run python3 scripts/check-crate-maps.py --check
 run python3 scripts/check-scratch-growth.py
+run python3 scripts/test_qsa_mrope_position.py
 run python3 scripts/check-changelog.py
+run python3 scripts/check-conflict-markers.py
 run bash scripts/ratchet-diff.sh ${1:+"$1"}
 if cargo deny --version >/dev/null 2>&1; then
     run cargo deny check bans licenses sources
@@ -47,6 +49,10 @@ run bash scripts/ci-rustfmt-changed.sh
 run cargo clippy --workspace --all-targets --locked
 run python3 scripts/check-env-docs.py
 run python3 scripts/check-lifecycle.py
+run python3 scripts/check-selector-receipts.py
+run python3 scripts/check-mtp-parity-ratchet.py --self-test
+run python3 scripts/check-mtp-parity-ratchet.py fixture
+run python3 scripts/check-mtp-parity-ratchet.py guard --base "${1:-origin/beta}"
 
 echo
 if [[ ${#failed[@]} -gt 0 ]]; then

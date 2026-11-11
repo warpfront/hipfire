@@ -1,0 +1,14 @@
+# rda_layer_node bench (R9700 gfx1201, fabric j5910 timing, binary g3prep-4a6ef7510b rda_layer_node md5 123db16f27697a762186479b14e7d0fc)
+# ms per RDA layer (conv q/k/v + prepare + chunked core + gated norm), 18 back-to-back layers over 3 rotating input sets, median of 5 reps per process, 3 fresh processes per arm alternating
+# A = HIPFIRE_RAON_RDA_FUSED_PREP=0 HIPFIRE_RAON_RDA_SEGMENT=0 (incumbent), D = default (both on). Outputs bit-identical at every row count (digest, ev/f1/digest_*.jsonl).
+rows A_ms_layer(3 procs) D_ms_layer(3 procs) delta
+64 A=0.1261,0.1218,0.1194 D=0.0818,0.0829,0.0828 delta=-32.0%
+128 A=0.1714,0.1716,0.1718 D=0.1306,0.1355,0.1324 delta=-22.8%
+192 A=0.2236,0.2226,0.2214 D=0.1747,0.1715,0.1722 delta=-22.6%
+256 A=0.2861,0.2841,0.2887 D=0.2325,0.2316,0.2310 delta=-19.0%
+384 A=0.4313,0.4289,0.4270 D=0.3667,0.3665,0.3582 delta=-14.5%
+512 A=0.6060,0.6038,0.6024 D=0.4627,0.4611,0.4607 delta=-23.6%
+1024 A=1.2129,1.2324,1.2404 D=0.9321,0.9178,0.9234 delta=-25.1%
+2048 A=2.4481,2.4391,2.4254 D=1.7968,1.8059,1.8169 delta=-26.0%
+4096 A=4.8410,4.8430,4.8151 D=3.6096,3.5951,3.6187 delta=-25.4%
+16384 A=19.2942,19.4414,19.3411 D=14.4854,14.6093,14.5766 delta=-24.6%

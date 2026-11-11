@@ -614,6 +614,96 @@ fn fifo_cohort_incompatible_head_blocks_later_compatible() {
     assert!(sched.commit_lane(lane_for_k3, &k3, admission(&k3)));
 }
 
+/// `assignable_front` is the read-only twin of `try_assign_one`: it names the request that
+/// would be assigned (a free lane and a matching cohort) and changes nothing, so an
+/// admission gate can leave the front queued exactly as a full lane set does.
+#[test]
+fn assignable_front_peeks_what_try_assign_one_would_assign() {
+    let _l = begin();
+    let mut sched = ContinuousBatchScheduler::new(1, 4096);
+    let k1 = AttemptKey::new("r1", 1);
+    let k2 = AttemptKey::new("r2", 2);
+    let k3 = AttemptKey::new("r3", 3);
+    batch_announce_terminal(&k1.id, k1.attempt_id);
+    batch_announce_terminal(&k2.id, k2.attempt_id);
+    batch_announce_terminal(&k3.id, k3.attempt_id);
+    // Nothing queued.
+    assert!(sched.assignable_front().is_none());
+    sched.enqueue(req(k1.clone(), sampling(0.3, 1.0)));
+    sched.enqueue(req(k2.clone(), sampling(0.7, 1.0)));
+    sched.enqueue(req(k3.clone(), sampling(0.3, 1.0)));
+    // A free lane and no cohort: the front. Peeking pops and binds nothing.
+    assert_eq!(sched.assignable_front(), Some(&k1));
+    assert_eq!(sched.assignable_front(), Some(&k1));
+    assert_eq!(sched.inbox.len(), 3);
+    assert_eq!(sched.active_count(), 0);
+    let (assigned, _ticket) = sched.try_assign_one().unwrap();
+    assert_eq!(&assigned, &k1);
+    // No free lane: nothing is assignable, the front stays queued.
+    assert!(sched.assignable_front().is_none());
+    assert_eq!(sched.inbox.front(), Some(&k2));
+}
+
+/// A stale ticket, an unknown lane, another request's key or a latched client abort changes nothing: the caller
+/// then fails the request instead of putting it back in line.
+#[test]
+fn requeue_lane_refuses_a_stale_or_aborted_request() {
+    let _l = begin();
+    let mut sched = ContinuousBatchScheduler::new(1, 4096);
+    let k1 = AttemptKey::new("r1", 1);
+    let k2 = AttemptKey::new("r2", 2);
+    batch_announce_terminal(&k1.id, k1.attempt_id);
+    batch_announce_terminal(&k2.id, k2.attempt_id);
+    sched.enqueue(req(k1.clone(), sampling(0.3, 1.0)));
+    sched.enqueue(req(k2.clone(), sampling(0.3, 1.0)));
+    let (_assigned, ticket) = sched.try_assign_one().unwrap();
+    assert_eq!(sched.inbox.front(), Some(&k2));
+    let admission_k1 = admission(&k1);
+    // Wrong key / wrong lane / wrong admission: nothing changes.
+    assert!(!sched.requeue_lane(0, &k2, admission(&k2)));
+    assert!(!sched.requeue_lane(3, &k1, admission_k1));
+    assert!(!sched.requeue_lane(0, &k1, admission(&k2)));
+    assert_eq!(sched.active_count(), 1);
+    assert_eq!(sched.inbox.len(), 1);
+    // A latched client abort is not requeued (the caller fails the request instead).
+    batch_apply_terminal_control("abort", &k1.id, k1.attempt_id);
+    assert!(!sched.requeue_lane(ticket.lane, &k1, admission_k1));
+    assert_eq!(sched.active_count(), 1);
+}
+
+/// A step that failed on a capacity condition before its request emitted anything puts the request back at the
+/// FRONT of the inbox: the lane is empty again (generation advanced), the pending entry and the admission stay,
+/// the terminal registry is `Queued` again, and the same request is assigned a lane once more, ahead of later
+/// arrivals.
+#[test]
+fn requeue_lane_assigns_the_same_request_again_ahead_of_later_arrivals() {
+    let _l = begin();
+    let mut sched = ContinuousBatchScheduler::new(1, 4096);
+    let k1 = AttemptKey::new("r1", 1);
+    let k2 = AttemptKey::new("r2", 2);
+    batch_announce_terminal(&k1.id, k1.attempt_id);
+    batch_announce_terminal(&k2.id, k2.attempt_id);
+    sched.enqueue(req(k1.clone(), sampling(0.3, 1.0)));
+    sched.enqueue(req(k2.clone(), sampling(0.3, 1.0)));
+    let (_a, first) = sched.try_assign_one().unwrap();
+    assert!(sched.requeue_lane(first.lane, &k1, admission(&k1)));
+    assert_eq!(sched.active_count(), 0);
+    assert_eq!(sched.inbox.front(), Some(&k1));
+    assert_eq!(sched.inbox.back(), Some(&k2));
+    assert!(sched.pending.contains_key(&k1), "the pending entry stays");
+    let (again, second) = sched.try_assign_one().unwrap();
+    assert_eq!(again, k1, "the same request goes first");
+    assert_eq!(second.lane, first.lane);
+    assert!(
+        second.generation > first.generation,
+        "a fresh lane generation"
+    );
+    // It is an ordinary running lane again: it commits like any other.
+    let pending =
+        serde_json::json!({"type":"done","id":k1.id,"attempt_id":k1.attempt_id,"tokens":1});
+    assert!(sched.mark_awaiting_commit(second.lane, pending));
+}
+
 #[test]
 fn refill_reservation_awaiting_client_not_reused_until_commit() {
     let _l = begin();

@@ -19,8 +19,12 @@ use crate::{
 enum Shape {
     F16,
     Bf16,
+    /// `v_wmma_f32_16x16x16_{fp8,bf8}_{fp8,bf8}` (gfx1201): A format, B format.
+    F8(mma::Fmt, mma::Fmt),
     Iu8,
-    Iu4 { k: usize },
+    Iu4 {
+        k: usize,
+    },
 }
 
 pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result<()> {
@@ -31,6 +35,10 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
         (Arch::Gfx1151 | Arch::Gfx1201, "v_wmma_f32_16x16x16_f16") => Shape::F16,
         (Arch::Gfx1151 | Arch::Gfx1201, "v_wmma_f32_16x16x16_bf16") => Shape::Bf16,
         (Arch::Gfx1151 | Arch::Gfx1201, "v_wmma_i32_16x16x16_iu8") => Shape::Iu8,
+        (Arch::Gfx1201, "v_wmma_f32_16x16x16_fp8_fp8") => Shape::F8(mma::Fmt::Fp8, mma::Fmt::Fp8),
+        (Arch::Gfx1201, "v_wmma_f32_16x16x16_fp8_bf8") => Shape::F8(mma::Fmt::Fp8, mma::Fmt::Bf8),
+        (Arch::Gfx1201, "v_wmma_f32_16x16x16_bf8_fp8") => Shape::F8(mma::Fmt::Bf8, mma::Fmt::Fp8),
+        (Arch::Gfx1201, "v_wmma_f32_16x16x16_bf8_bf8") => Shape::F8(mma::Fmt::Bf8, mma::Fmt::Bf8),
         (Arch::Gfx1151, "v_wmma_i32_16x16x16_iu4") => Shape::Iu4 { k: 16 },
         (Arch::Gfx1201, "v_wmma_i32_16x16x32_iu4") => Shape::Iu4 { k: 32 },
         _ => return Err(format!("{name} on {arch:?}: no source-verified fragment mapping and probed numerics; refusing to approximate")),
@@ -58,6 +66,7 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
     let (a_regs, b_regs) = match shape {
         Shape::F16 | Shape::Bf16 => (if gfx12 { 4 } else { 8 }, if gfx12 { 4 } else { 8 }),
         Shape::Iu8 => (if gfx12 { 2 } else { 4 }, if gfx12 { 2 } else { 4 }),
+        Shape::F8(..) => (2, 2),
         Shape::Iu4 { .. } => (2, 2),
     };
     vgprs(&o[0], 8, "D")?;
@@ -130,6 +139,31 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
                 for col in 0..16 {
                     let (lane, vgpr) = acc_loc(arch, row, col);
                     out[vgpr][lane] = model(arch, &a[row], &b[col], c[row][col]);
+                }
+            }
+        }
+        Shape::F8(fa, fb) => {
+            // Hardware (receipt gfx1201-fp8wmma-r1/r2, float_edges.md): the FP8/BF8 kinds ignore NEG_LO[2]/NEG_HI[2] on C
+            // (identical D over every captured word), have no CLAMP, and have no neg bits on A/B; anything else is refused.
+            if m.clamp || (m.neg_lo | m.neg_hi) & 0b011 != 0 {
+                return Err(format!(
+                    "{name}: clamp and A/B neg_lo/neg_hi do not exist on the FP8/BF8 WMMA forms"
+                ));
+            }
+            let mut a = [[0u8; 16]; 16];
+            let mut b = [[0u8; 16]; 16];
+            for idx in 0..16 {
+                for k in 0..16 {
+                    let (lane, vgpr, n) = iu8_loc(arch, idx, k);
+                    a[idx][k] = (s.read(&o[1], lane, vgpr)? >> (8 * n)) as u8;
+                    b[idx][k] = (s.read(&o[2], lane, vgpr)? >> (8 * n)) as u8;
+                }
+            }
+            for row in 0..16 {
+                for col in 0..16 {
+                    let (lane, vgpr) = acc_loc(arch, row, col);
+                    let c = s.read(&o[3], lane, vgpr)?;
+                    out[vgpr][lane] = mma::wmma_f32_f8(arch, &a[row], &b[col], c, fa, fb);
                 }
             }
         }
@@ -724,8 +758,10 @@ mod tests {
         State {
             s: [0; 106],
             t: [0; 16],
-            v: Box::new([[0; 32]; 256]),
-            exec: u32::MAX,
+            v: Box::new([[0; 64]; 256]),
+            lanes: 32,
+            nan_loose: false,
+            exec: 0xffff_ffff,
             vcc: 0,
             scc: false,
             m0: 0,
@@ -733,6 +769,7 @@ mod tests {
             ended: false,
             barrier: None,
             signals: 0,
+            scratch: Vec::new(),
         }
     }
     fn reg(base: u16, len: u8) -> Operand {
@@ -905,7 +942,7 @@ mod tests {
     fn gfx11_divergent_replicas_are_hard_errors() {
         let f16 = |a_hi: bool, b_hi: bool, exec: u32| {
             let mut st = state();
-            st.exec = exec;
+            st.exec = u64::from(exec);
             for lane in [5, 21] {
                 put_half(&mut st, A, 6, lane, 1, 0x4200);
             }
@@ -941,7 +978,7 @@ mod tests {
         }
         let iu4 = |a_hi: bool, b_hi: bool, exec: u32| {
             let mut st = state();
-            st.exec = exec;
+            st.exec = u64::from(exec);
             for lane in [3, 19] {
                 put_nib(&mut st, A, 1, lane, 2, 0xe);
             }
@@ -2120,28 +2157,39 @@ mod tests {
         }
     }
 
-    // gfx1151 IU8 CLAMP has no receipt: refused; the unclamped wrap is unchanged.
+    // gfx1151 IU8 CLAMP (Halo receipt pmrevive/PmBf16Halo/rcpt, 295,680 words per clamp variant, 0 mismatches):
+    // the accumulator saturates after `C + products(K 0..2)` and again after every following K pair. One final
+    // saturation (or the gfx1201 two-halves rule) gives a different word; the unclamped wrap is unchanged.
     #[test]
-    fn gfx1151_iu8_clamp_is_refused() {
-        let mut st = state();
-        let clamped = Modifiers {
-            clamp: true,
-            ..mods(3, 0)
+    fn gfx1151_iu8_clamp_saturates_after_every_k_pair() {
+        // D[0,0] = C[0,0] + sum_k A[0,k] * B[k,0], A/B signed: k0,k1 give +127*127 each (the pair overshoots
+        // C = MAX-100 and saturates), k2,k3 give -128*127 each (pull the saturated value back); k >= 4 are zero.
+        let run = |clamp: bool| -> i32 {
+            let mut st = state();
+            // gfx11 fragments are replicated across lanes 0..15 and 16..31: A row 0 / B col 0 sit in lanes 0 and 16,
+            // byte k in VGPR k>>2, byte k&3.
+            for lane in [0usize, 16] {
+                st.v[usize::from(A)][lane] = 0x8080_7f7f;
+                st.v[usize::from(B)][lane] = 0x7f7f_7f7f;
+            }
+            st.v[usize::from(C)][0] = (i32::MAX - 100) as u32;
+            let m = Modifiers {
+                clamp,
+                ..mods(3, 0)
+            };
+            let i = insn(
+                Arch::Gfx1151,
+                "v_wmma_i32_16x16x16_iu8",
+                [reg(D, 8), reg(A, 4), reg(B, 4), reg(C, 8)],
+                m,
+            );
+            execute(Arch::Gfx1151, "v_wmma_i32_16x16x16_iu8", &i, &mut st).unwrap();
+            st.v[usize::from(D)][0] as i32
         };
-        let i = insn(
-            Arch::Gfx1151,
-            "v_wmma_i32_16x16x16_iu8",
-            [reg(D, 8), reg(A, 4), reg(B, 4), reg(C, 8)],
-            clamped,
-        );
-        assert!(execute(Arch::Gfx1151, "v_wmma_i32_16x16x16_iu8", &i, &mut st).is_err());
-        let plain = insn(
-            Arch::Gfx1151,
-            "v_wmma_i32_16x16x16_iu8",
-            [reg(D, 8), reg(A, 4), reg(B, 4), reg(C, 8)],
-            mods(3, 0),
-        );
-        assert!(execute(Arch::Gfx1151, "v_wmma_i32_16x16x16_iu8", &plain, &mut st).is_ok());
+        let exact = i64::from(i32::MAX) - 100 + 2 * 127 * 127 - 2 * 128 * 127;
+        assert_eq!(run(false), exact as i32);
+        // Pair rule: sat(MAX-100+32258) = MAX, then MAX - 32512; one final saturation would give MAX - 354.
+        assert_eq!(run(true), i32::MAX - 2 * 128 * 127);
     }
 
     #[test]
@@ -2153,9 +2201,9 @@ mod tests {
             [reg(D, 8), reg(A, 4), reg(B, 4), reg(C, 8)],
             mods(0, 0),
         );
-        // BF16-out and FP8 have no probed model: still refused.
+        // BF16-out has no probed model: still refused. The dense FP8/BF8 kinds exist on gfx1201 only.
         assert!(execute(Arch::Gfx1201, "v_wmma_bf16_16x16x16_bf16", &i, &mut st).is_err());
-        assert!(execute(Arch::Gfx1201, "v_wmma_f32_16x16x16_fp8_fp8", &i, &mut st).is_err());
+        assert!(execute(Arch::Gfx1151, "v_wmma_f32_16x16x16_fp8_fp8", &i, &mut st).is_err());
         // BF16 is not modeled on gfx1100 (no probe corpus).
         assert!(execute(Arch::Gfx1100, "v_wmma_f32_16x16x16_bf16", &i, &mut st).is_err());
         assert!(execute(Arch::Gfx1100, "v_wmma_f32_16x16x16_f16", &i, &mut st).is_err());
@@ -2588,7 +2636,7 @@ mod tests {
                     enc(of, 1.0)
                 };
                 for vgpr in 0..8 {
-                    st.v[usize::from(D) + vgpr] = [word; 32];
+                    st.v[usize::from(D) + vgpr] = [word; 64];
                 }
             };
             for (lo, hi) in [(1, 0), (0, 1), (2, 2), (3, 3)] {
@@ -2601,5 +2649,242 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- dense FP8/BF8 WMMA (gfx1201): hardware waves of receipts fp8wmma-r1/r2 through the register path ----
+    const F8_NAMES: [&str; 4] = [
+        "v_wmma_f32_16x16x16_fp8_fp8",
+        "v_wmma_f32_16x16x16_fp8_bf8",
+        "v_wmma_f32_16x16x16_bf8_fp8",
+        "v_wmma_f32_16x16x16_bf8_bf8",
+    ];
+    fn f8_state(a: &[u32], b: &[u32], c: &[u32]) -> State {
+        let mut st = state();
+        for lane in 0..32 {
+            for v in 0..2 {
+                st.v[usize::from(A) + v][lane] = a[v * 32 + lane];
+                st.v[usize::from(B) + v][lane] = b[v * 32 + lane];
+            }
+            for v in 0..8 {
+                st.v[usize::from(C) + v][lane] = c[v * 32 + lane];
+                st.v[usize::from(D) + v][lane] = 0xdead_beef; // D is a pure output
+            }
+        }
+        st
+    }
+    fn f8_insn(kind: usize, mods: Modifiers) -> Inst {
+        insn(
+            Arch::Gfx1201,
+            F8_NAMES[kind],
+            [reg(D, 8), reg(A, 2), reg(B, 2), reg(C, 8)],
+            mods,
+        )
+    }
+    fn f8_d(st: &State) -> Vec<u32> {
+        (0..8)
+            .flat_map(|v| (0..32).map(move |l| (v, l)))
+            .map(|(v, l)| st.v[usize::from(D) + v][l])
+            .collect()
+    }
+    #[test]
+    fn fp8_wmma_hardware_waves_through_the_register_path() {
+        use crate::emu::fp8_fixtures::WAVES;
+        let mut kinds = [0usize; 4];
+        for w in &WAVES {
+            let kind = usize::from(w.kind);
+            let mut st = f8_state(&w.a, &w.b, &w.c);
+            execute(
+                Arch::Gfx1201,
+                F8_NAMES[kind],
+                &f8_insn(kind, mods(0, 0)),
+                &mut st,
+            )
+            .unwrap();
+            assert_eq!(f8_d(&st), w.d.to_vec(), "{} wave {}", F8_NAMES[kind], w.tag);
+            // A, B and C survive; D is fully overwritten (no stale 0xdeadbeef).
+            for lane in 0..32 {
+                for v in 0..2 {
+                    assert_eq!(st.v[usize::from(A) + v][lane], w.a[v * 32 + lane]);
+                    assert_eq!(st.v[usize::from(B) + v][lane], w.b[v * 32 + lane]);
+                }
+                for v in 0..8 {
+                    assert_eq!(st.v[usize::from(C) + v][lane], w.c[v * 32 + lane]);
+                }
+            }
+            kinds[kind] += 1;
+        }
+        assert!(
+            kinds.iter().all(|&n| n >= 4),
+            "every kind has control, dense, special and subnormal waves"
+        );
+    }
+    // The hardware ignores EXEC (every lane is read and written) and allows D == C (the accumulator form hipcc emits).
+    #[test]
+    fn fp8_wmma_ignores_exec_and_allows_the_accumulator_form() {
+        use crate::emu::fp8_fixtures::WAVES;
+        let w = &WAVES[4];
+        let kind = usize::from(w.kind);
+        let mut st = f8_state(&w.a, &w.b, &w.c);
+        st.exec = 1;
+        execute(
+            Arch::Gfx1201,
+            F8_NAMES[kind],
+            &f8_insn(kind, mods(0, 0)),
+            &mut st,
+        )
+        .unwrap();
+        assert_eq!(f8_d(&st), w.d.to_vec());
+        let mut acc = f8_state(&w.a, &w.b, &w.c);
+        let i = insn(
+            Arch::Gfx1201,
+            F8_NAMES[kind],
+            [reg(C, 8), reg(A, 2), reg(B, 2), reg(C, 8)],
+            mods(0, 0),
+        );
+        execute(Arch::Gfx1201, F8_NAMES[kind], &i, &mut acc).unwrap();
+        let d: Vec<u32> = (0..8)
+            .flat_map(|v| (0..32).map(move |l| (v, l)))
+            .map(|(v, l)| acc.v[usize::from(C) + v][l])
+            .collect();
+        assert_eq!(d, w.d.to_vec());
+    }
+    // NEG_LO[2]/NEG_HI[2] on C: hardware output identical to the unmodified instruction (receipt: 85,536 cases x 256
+    // words per kind and modifier, 0 differences), so they execute as no-ops; A/B neg bits, clamp, OPSEL and gfx1151
+    // are refused.
+    #[test]
+    fn fp8_wmma_c_neg_modifiers_are_noops_everything_else_is_refused() {
+        use crate::emu::fp8_fixtures::WAVES;
+        for kind in 0..4 {
+            let w = WAVES
+                .iter()
+                .find(|w| usize::from(w.kind) == kind && w.tag == "dense")
+                .unwrap();
+            for (neg_lo, neg_hi) in [(4, 0), (0, 4), (4, 4)] {
+                let mut st = f8_state(&w.a, &w.b, &w.c);
+                execute(
+                    Arch::Gfx1201,
+                    F8_NAMES[kind],
+                    &f8_insn(kind, mods(neg_lo, neg_hi)),
+                    &mut st,
+                )
+                .unwrap();
+                assert_eq!(
+                    f8_d(&st),
+                    w.d.to_vec(),
+                    "{} neg_lo {neg_lo} neg_hi {neg_hi}",
+                    F8_NAMES[kind]
+                );
+            }
+            for (neg_lo, neg_hi) in [(1, 0), (2, 0), (0, 1), (0, 2), (3, 7)] {
+                let mut st = f8_state(&w.a, &w.b, &w.c);
+                assert!(
+                    execute(
+                        Arch::Gfx1201,
+                        F8_NAMES[kind],
+                        &f8_insn(kind, mods(neg_lo, neg_hi)),
+                        &mut st
+                    )
+                    .is_err(),
+                    "{} neg_lo {neg_lo} neg_hi {neg_hi}",
+                    F8_NAMES[kind]
+                );
+            }
+            let mut st = f8_state(&w.a, &w.b, &w.c);
+            let clamp = Modifiers {
+                clamp: true,
+                ..mods(0, 0)
+            };
+            assert!(execute(
+                Arch::Gfx1201,
+                F8_NAMES[kind],
+                &f8_insn(kind, clamp),
+                &mut st
+            )
+            .is_err());
+            let opsel = Modifiers {
+                op_sel: 1,
+                ..mods(0, 0)
+            };
+            assert!(execute(
+                Arch::Gfx1201,
+                F8_NAMES[kind],
+                &f8_insn(kind, opsel),
+                &mut st
+            )
+            .is_err());
+            let mut st11 = state();
+            assert!(execute(
+                Arch::Gfx1151,
+                F8_NAMES[kind],
+                &f8_insn(kind, mods(0, 0)),
+                &mut st11
+            )
+            .is_err());
+        }
+    }
+    /// Replays every case of the `wmma` receipt files of a directory through the register path, for every kind,
+    /// modifier variant and MODE index present: `PM_FP8_RECEIPT_DIR=<outdir> cargo test --release -p peacemaker-ir
+    /// --lib fp8_wmma_receipt_replay -- --ignored`.
+    #[test]
+    #[ignore = "needs a hardware receipt directory (PM_FP8_RECEIPT_DIR)"]
+    fn fp8_wmma_receipt_replay() {
+        let dir = std::env::var("PM_FP8_RECEIPT_DIR").expect("PM_FP8_RECEIPT_DIR");
+        let (mut words, mut cases_total) = (0u64, 0u64);
+        for (kind, name) in F8_NAMES.iter().enumerate() {
+            let inb = std::fs::read(format!("{dir}/fwmma.{name}.in.bin")).unwrap();
+            let ncase = inb.len() / 1536;
+            for v in 0..4u8 {
+                for m in 0..8 {
+                    let Ok(outb) = std::fs::read(format!("{dir}/fwmma.{name}.v{v}.m{m}.out.bin"))
+                    else {
+                        continue;
+                    };
+                    let nn = (outb.len() / 1024).min(ncase);
+                    let md = mods(
+                        if v & 1 != 0 { 4 } else { 0 },
+                        if v & 2 != 0 { 4 } else { 0 },
+                    );
+                    let i = f8_insn(kind, md);
+                    let word = |o: &[u8], n: usize| {
+                        u32::from_le_bytes(o[4 * n..4 * n + 4].try_into().unwrap())
+                    };
+                    for c in 0..nn {
+                        let rec = &inb[c * 1536..(c + 1) * 1536];
+                        let mut st = state();
+                        for lane in 0..32usize {
+                            let (r, h) = (lane & 15, lane >> 4);
+                            for vg in 0..2 {
+                                for byte in 0..4 {
+                                    let k = 8 * h + 4 * vg + byte;
+                                    st.v[usize::from(A) + vg][lane] |=
+                                        u32::from(rec[r * 16 + k]) << (8 * byte);
+                                    st.v[usize::from(B) + vg][lane] |=
+                                        u32::from(rec[256 + r * 16 + k]) << (8 * byte);
+                                }
+                            }
+                            for j in 0..8 {
+                                st.v[usize::from(C) + j][lane] =
+                                    word(&rec[512..], (8 * h + j) * 16 + r);
+                            }
+                        }
+                        execute(Arch::Gfx1201, name, &i, &mut st).unwrap();
+                        for j in 0..8 {
+                            for lane in 0..32 {
+                                let want = word(&outb, (c * 8 + j) * 32 + lane);
+                                assert_eq!(
+                                    st.v[usize::from(D) + j][lane],
+                                    want,
+                                    "{name} v{v} m{m} case {c} vgpr {j} lane {lane}"
+                                );
+                            }
+                        }
+                        words += 256;
+                    }
+                    cases_total += nn as u64;
+                }
+            }
+        }
+        assert!(words > 0);
+        println!("fp8 wmma replay: {cases_total} waves, {words} D words identical");
     }
 }

@@ -81,7 +81,7 @@ fn iu8_chain<T: MmaIu4, const W: u8>(arch: Arch) -> Emitted
 where
     Iu8: MmaKind<T, Input = V<W>>,
 {
-    let mut regs = RegPlan::new(32, 8).unwrap();
+    let mut regs = RegPlan::new(32, 16).unwrap();
     let a = regs.v::<W>("a", 0, Live::Whole).unwrap();
     let x = regs.v::<W>("x", 4, Live::Whole).unwrap();
     let c0 = regs.v::<8>("c0", 8, Live::Whole).unwrap();
@@ -142,6 +142,7 @@ fn corpus() -> Vec<Unit> {
                                 act,
                                 arch,
                                 mma: iu4_gemm::Mma::Dense,
+                                tune: iu4_gemm::Tune::default(),
                             }) {
                                 single(&mut units, e)
                             }
@@ -213,6 +214,7 @@ fn corpus() -> Vec<Unit> {
                     raster: mq6_i8_gemm::Raster::Banded,
                     tile,
                     arch,
+                    tune: Default::default(),
                 }) {
                     single(&mut units, e)
                 }

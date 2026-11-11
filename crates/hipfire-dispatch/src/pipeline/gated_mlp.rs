@@ -698,6 +698,25 @@ fn swiglu_down_residual(
                 },
             )
         }
+        // GGUF-native: SiLU·mul into `hidden`, then the mmvq accumulate export
+        // adds `W_down · hidden` into the residual stream (q8_1 producer + one
+        // GEMV launch, no temporary).
+        dtype if dtype.is_ggml() => {
+            gpu.silu_mul_f32(gate, up, hidden).map_err(hip)?;
+            GEMV.run(
+                ctx,
+                gpu,
+                &GemvParams {
+                    w: &wr,
+                    x: hidden,
+                    y: x,
+                    variant: GemvVariant::WithResidual,
+                    residual: None,
+                    gate: None,
+                    up: None,
+                },
+            )
+        }
         DType::HFQ4G256 | DType::HFQ3G256 | DType::HFQ6G256 => {
             gpu.silu_mul_f32(gate, up, hidden).map_err(hip)?;
             gpu.maybe_capture_activation(w_down.buf, hidden, 1, w_down.k);

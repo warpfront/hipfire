@@ -6,12 +6,14 @@
 //! decision using machine counters and published receipts. Never initialize HIP
 //! or start a daemon here; GPU-dependent placement remains explicitly bounded.
 
+mod capacity;
 mod host;
 mod qwen4;
 mod remote;
 pub(crate) mod types;
 
 use anyhow::Result;
+use capacity::{BestDevice, GpuCapacity};
 use clap::Args;
 use hipfire_loader::admission::{
     admit_source_with_options, qwen4_kv_adaptive_requested, qwen_default_q8_enabled,
@@ -19,6 +21,7 @@ use hipfire_loader::admission::{
     SourceAdmissionOptions, QWEN35_MIN_AUTO_CONTEXT,
 };
 use hipfire_registry::{receipts, ModelEntry, RegistryV1};
+use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
 use hipfire_runtime::loader_api::{CaskConfig, ModelSource, SpecLoadCfg};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -26,6 +29,11 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::Path;
 use types::{gib, Finding, FitDevice, FitHost, PlacementPlan, Verdict};
+
+/// `plan.basis` in the JSON report.
+const PLAN_BASIS: &str = "pre-load";
+/// The text plan's `basis` line: what its numbers are, and what the load adds.
+const PLAN_BASIS_TEXT: &str = "pre-load estimate from file headers + sysfs; the load re-measures free VRAM after weights, drafts and scratch (max_seq fit) and may admit less";
 
 #[derive(Args, Debug)]
 pub(crate) struct FitArgs {
@@ -43,6 +51,79 @@ pub(crate) struct FitArgs {
     /// Also print the source-cited derivation lines (always in --json).
     #[arg(short = 'v', long)]
     pub verbose: bool,
+    /// One-shot KV format for this load, validated as `run --kv-mode` does.
+    #[arg(long)]
+    pub kv_mode: Option<String>,
+    /// Qwen-only K-format override (same values as `run --kv-k`).
+    #[arg(long = "kv-k")]
+    pub kv_k: Option<String>,
+    /// Qwen-only V-format override (same values as `run --kv-v`).
+    #[arg(long = "kv-v")]
+    pub kv_v: Option<String>,
+    /// Speculation selector for this load, as `run --spec`: off, auto, ngram,
+    /// dflash, mtp, or dspark. Overrides `speculation.mode`.
+    #[arg(
+        long = "spec",
+        alias = "speculation",
+        value_parser = ["off", "auto", "ngram", "dflash", "mtp", "dspark"]
+    )]
+    pub spec: Option<String>,
+    /// Tensor/expert-parallel degree for this load (same parser and range as
+    /// `run --tp`); admission answers for it exactly as the daemon would.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
+    pub tp: Option<u64>,
+}
+
+impl FitArgs {
+    /// The same one-shot overrides `hipfire run` layers over the config.
+    fn load_overrides(&self) -> crate::LoadOverrides<'_> {
+        crate::LoadOverrides {
+            kv_mode: self.kv_mode.as_deref(),
+            kv_k: self.kv_k.as_deref(),
+            kv_v: self.kv_v.as_deref(),
+            speculation: self.spec.as_deref(),
+            ..Default::default()
+        }
+    }
+}
+
+/// The one-shot overrides this fit applied, echoed in the report (`null` =
+/// not set, the config decides).
+#[derive(Serialize)]
+struct OverridesEcho {
+    kv_mode: Option<String>,
+    kv_k: Option<String>,
+    kv_v: Option<String>,
+    spec: Option<String>,
+    tp: Option<u64>,
+}
+
+impl From<&FitArgs> for OverridesEcho {
+    fn from(args: &FitArgs) -> Self {
+        Self {
+            kv_mode: args.kv_mode.clone(),
+            kv_k: args.kv_k.clone(),
+            kv_v: args.kv_v.clone(),
+            spec: args.spec.clone(),
+            tp: args.tp,
+        }
+    }
+}
+
+impl OverridesEcho {
+    /// The flags as `hipfire run` would take them, each led by a space.
+    fn flags(&self) -> String {
+        [
+            ("--kv-mode", &self.kv_mode),
+            ("--kv-k", &self.kv_k),
+            ("--kv-v", &self.kv_v),
+            ("--spec", &self.spec),
+        ]
+        .iter()
+        .filter_map(|(flag, value)| value.as_deref().map(|value| format!(" {flag} {value}")))
+        .chain(self.tp.map(|tp| format!(" --tp {tp}")))
+        .collect()
+    }
 }
 
 fn parse_context(raw: &str) -> std::result::Result<usize, String> {
@@ -72,6 +153,9 @@ struct Route {
 
 #[derive(Serialize)]
 struct Plan {
+    /// Where the plan's numbers come from: `pre-load` (file headers and
+    /// sysfs; the load re-measures before it admits).
+    basis: &'static str,
     device_index: usize,
     topology: String,
     kv_backend: String,
@@ -81,8 +165,25 @@ struct Plan {
     bound: String,
     model_ctx: Option<usize>,
     projection: Option<Value>,
+    /// The visible GPU that holds the most context (additive; set when more
+    /// than one GPU is visible and the plan is a checked single-GPU one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_device: Option<BestDevice>,
+    /// Every visible GPU's projection, for the machine rows, the best-GPU line
+    /// and the tier table.
+    #[serde(skip)]
+    gpus: Vec<GpuCapacity>,
+    /// The context was left automatic (the loader's own minimum applies).
+    #[serde(skip)]
+    automatic: bool,
+    /// `hardware.devices` is set, so it alone selects a GPU.
+    #[serde(skip)]
+    devices_pinned: bool,
     placement: PlacementPlan,
     decode_route: String,
+    /// Why the load takes that route (the setting that selected it, or the
+    /// one that kept AR).
+    decode_reason: String,
     routes: Vec<Route>,
 }
 
@@ -92,6 +193,9 @@ struct TierRow {
     size_bytes: Option<u64>,
     verdict: Verdict,
     summary: String,
+    /// The GPU the tier's capacity was projected on (its best one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_gpu: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -99,6 +203,8 @@ struct Report {
     schema: &'static str,
     hipfire: Value,
     input: String,
+    /// The one-shot load overrides this report was computed with.
+    overrides: OverridesEcho,
     model: ModelInfo,
     machine: FitHost,
     plan: Option<Plan>,
@@ -149,6 +255,37 @@ fn supply_visible_device_count(process: &hipfire_config::ProcessConfig, machine:
     std::env::set_var(hipfire_config::devices::ROCR_VISIBLE_DEVICES, all);
 }
 
+/// `hardware.devices` is set: it alone selects the GPU (it wins over
+/// `HIP_VISIBLE_DEVICES`, hipfire_config::devices).
+fn devices_pinned() -> bool {
+    hipfire_config::active_process_config()
+        .and_then(|process| process.legacy_value("HIPFIRE_DEVICES"))
+        .is_some_and(|spec| !spec.trim().is_empty())
+}
+
+/// The admission projection on every visible GPU, from the same facts and
+/// function the plan's own device uses.
+fn visible_gpu_capacities(
+    source: &ModelSource,
+    inputs: &AdmissionInputs<'_>,
+    machine: &FitHost,
+) -> Vec<GpuCapacity> {
+    machine
+        .devices
+        .iter()
+        .map(|device| {
+            GpuCapacity::new(
+                device,
+                hipfire_loader::admission::qwen35_card_projection(
+                    source,
+                    &device.arch,
+                    inputs.hints(device),
+                ),
+            )
+        })
+        .collect()
+}
+
 fn fold_findings(findings: &[Finding]) -> Verdict {
     findings.iter().fold(Verdict::Fits, |v, f| v.and(f.verdict))
 }
@@ -181,7 +318,7 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
         Ok(hipfire_config::devices::Claim::Claimed)
     })
     .err();
-    let (machine, host_notes) = host::detect_with_notes(paths);
+    let (mut machine, host_notes) = host::detect_with_notes(paths);
     let mut findings = preflight_findings(paths);
     if let Some(error) = visibility_error {
         findings.push(Finding::fails("admission", error.to_string(),
@@ -208,14 +345,7 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
         ));
     }
     supply_visible_device_count(process, &machine);
-    let analysis = analyze_model(
-        paths,
-        registry,
-        &args.model,
-        args.ctx,
-        args.no_fetch,
-        &machine,
-    )?;
+    let analysis = analyze_model(paths, registry, &args.model, &args, &machine)?;
     let mut tiers = Vec::new();
     let family = crate::pull_select::family_tiers(registry, &analysis.model.tag);
     // Every other tier runs the same admission concurrently: each one walks its
@@ -229,10 +359,9 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
                 .map(|tier| {
                     let tag = tier.tag;
                     let machine = &machine;
+                    let args = &args;
                     (tag != analysis.model.tag).then(|| {
-                        scope.spawn(move || {
-                            analyze_model(paths, registry, tag, args.ctx, args.no_fetch, machine)
-                        })
+                        scope.spawn(move || analyze_model(paths, registry, tag, args, machine))
                     })
                 })
                 .collect();
@@ -266,39 +395,67 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
                     size_bytes: tier.entry.size_bytes,
                     verdict: Verdict::Undetermined,
                     summary: format!("not evaluated: {error:#}"),
+                    best_gpu: None,
                 });
                 continue;
             }
         };
         // The tier's own fit: machine-level blockers (the runtime preflight,
         // device visibility) are reported once above and apply to every tier.
-        let verdict = fold_findings(&evaluated.findings);
-        // A tier that does not fit is summarized by the first term that fails;
-        // otherwise by its capacity and placement.
-        let failing = evaluated
-            .findings
-            .iter()
-            .find(|f| f.verdict == Verdict::DoesNotFit);
-        let mut summary = match failing {
-            Some(finding) => format!("{}: {}", finding.id, finding.detail),
-            None => evaluated
-                .plan
-                .as_ref()
-                .map(|p| {
-                    p.projection
+        // A tier whose context was projected per GPU is judged on its best GPU
+        // (its largest context, or that its weights do not fit anywhere).
+        let on_best = evaluated
+            .plan
+            .as_ref()
+            .filter(|p| !p.gpus.is_empty())
+            .and_then(|p| {
+                capacity::tier_on_best_gpu(
+                    &p.gpus,
+                    p.max_seq,
+                    p.automatic,
+                    machine.devices.len() > 1,
+                )
+            });
+        let (verdict, mut summary, best_gpu) = match on_best {
+            Some(best) => {
+                let rest = evaluated
+                    .findings
+                    .iter()
+                    .filter(|f| f.id != "context")
+                    .fold(Verdict::Fits, |v, f| v.and(f.verdict));
+                (rest.and(best.verdict), best.summary, Some(best.gpu))
+            }
+            None => {
+                let verdict = fold_findings(&evaluated.findings);
+                // A tier that does not fit is summarized by the first term that
+                // fails; otherwise by its capacity and placement.
+                let failing = evaluated
+                    .findings
+                    .iter()
+                    .find(|f| f.verdict == Verdict::DoesNotFit);
+                let summary = match failing {
+                    Some(finding) => format!("{}: {}", finding.id, finding.detail),
+                    None => evaluated
+                        .plan
                         .as_ref()
-                        .and_then(|v| v["card_cap"].as_u64())
-                        .map(|cap| format!("up to {cap} tokens; {}", p.placement.summary))
-                        .unwrap_or_else(|| p.placement.summary.clone())
-                })
-                .unwrap_or_else(|| {
-                    evaluated
-                        .findings
-                        .iter()
-                        .map(|f| f.detail.as_str())
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                }),
+                        .map(|p| {
+                            p.projection
+                                .as_ref()
+                                .and_then(|v| v["card_cap"].as_u64())
+                                .map(|cap| format!("up to {cap} tokens; {}", p.placement.summary))
+                                .unwrap_or_else(|| p.placement.summary.clone())
+                        })
+                        .unwrap_or_else(|| {
+                            evaluated
+                                .findings
+                                .iter()
+                                .map(|f| f.detail.as_str())
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        }),
+                };
+                (verdict, summary, None)
+            }
         };
         let differs = crate::resolved_for_model(paths, tier.tag, Some(tier.tag), Some(tier.entry))
             .ok()
@@ -315,7 +472,20 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
             size_bytes: evaluated.model.size_bytes,
             verdict,
             summary,
+            best_gpu,
         });
+    }
+    // Each visible GPU's projected capacity for the fitted model, beside its
+    // memory facts in `machine`.
+    if let Some(plan) = &analysis.plan {
+        for gpu in &plan.gpus {
+            if let Some(device) = machine.devices.iter_mut().find(|d| d.index == gpu.index) {
+                device.capacity = gpu.capacity().map(|tokens| tokens as u64);
+                device.capacity_shown = gpu
+                    .projection
+                    .map(|p| capacity::capped(p.card_cap, Some(p.model_ctx)).0 as u64);
+            }
+        }
     }
     let published = matching_receipts(&analysis.model.tag, &machine, analysis.plan.as_ref());
     findings.extend(analysis.findings);
@@ -328,6 +498,7 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
         schema: "hipfire-fit-1",
         hipfire: json!({"version": env!("HIPFIRE_BUILD_VERSION"), "commit": crate::BUILD_COMMIT}),
         input: safe_name(&args.model),
+        overrides: OverridesEcho::from(&args),
         model: analysis.model,
         machine,
         plan: analysis.plan,
@@ -381,8 +552,7 @@ fn analyze_model(
     paths: &crate::Paths,
     registry: &RegistryV1,
     input: &str,
-    ctx: Option<usize>,
-    no_fetch: bool,
+    args: &FitArgs,
     machine: &FitHost,
 ) -> Result<Analysis> {
     let card = crate::model_card(paths, registry, input);
@@ -415,7 +585,7 @@ fn analyze_model(
         Some(path) => path,
         None => {
             let entry = entry.expect("registry entry checked above");
-            if no_fetch {
+            if args.no_fetch {
                 result.findings.push(missing_header(
                     tag,
                     "not installed; fit needs the model header",
@@ -446,8 +616,12 @@ fn analyze_model(
         .ok()
         .map(|m| m.len())
         .or(result.model.size_bytes);
-    let params = match model_params(paths, input, Some(tag), entry, &path, ctx) {
-        Ok(params) => params,
+    let FitLoad {
+        params,
+        selector,
+        draft_missing,
+    } = match model_params(paths, input, Some(tag), entry, &path, args) {
+        Ok(load) => load,
         Err(error) => {
             let detail = error.to_string();
             result
@@ -456,18 +630,26 @@ fn analyze_model(
             return Ok(result);
         }
     };
+    if let Some(missing) = &draft_missing {
+        report_missing_draft(&mut result, &params, tag, missing);
+    }
     let Some(device) = machine.devices.first() else {
         return Ok(result);
     };
     let inputs = admission_inputs(&params);
     let admitted = match inputs.admit(&path, device) {
         Ok(admitted) => admitted,
-        Err(detail) => {
-            result
-                .findings
-                .push(Finding::fails("admission", &detail, admission_fix(&detail)));
-            return Ok(result);
-        }
+        Err(detail) => match inputs.capacity_refusal(&path, device) {
+            // An automatic context refused for lack of room is a capacity
+            // answer (per GPU, per tier), not a setting to correct.
+            Some(admitted) => admitted,
+            None => {
+                result
+                    .findings
+                    .push(Finding::fails("admission", &detail, admission_fix(&detail)));
+                return Ok(result);
+            }
+        },
     };
     result.model.arch_id = Some(admitted.arch_id);
     if entry.is_none() {
@@ -480,9 +662,23 @@ fn analyze_model(
         .as_ref()
         .map(|s| s.model_ctx)
         .or_else(|| source_context(&admitted.source));
+    let decode = decode_plan(
+        &params,
+        &DecodeFacts {
+            selector: &selector,
+            from_flag: args.spec.is_some(),
+            // The carrier's own declaration. Unknown across ranks: the load
+            // attaches MTP there only on an explicit request.
+            mtp_measured_ar_floor: matches!(admitted.topology, EffectiveTopology::Single)
+                .then(|| admitted.carrier.map(|c| c.mtp_measured_ar_floor()))
+                .flatten(),
+            draft_missing: draft_missing.as_ref(),
+        },
+    );
     let mut plan = Plan {
+        basis: PLAN_BASIS,
         device_index: device.index,
-        topology: topology_key(admitted.topology),
+        topology: plan_topology_key(&admitted),
         kv_backend: admitted.kv_backend.as_str().into(),
         kv_backend_reason: admitted.kv_backend_reason.clone(),
         kv_mode: match admitted.sequence.as_ref() {
@@ -511,13 +707,18 @@ fn analyze_model(
             .into(),
         model_ctx,
         projection: None,
+        best_device: None,
+        gpus: Vec::new(),
+        automatic: inputs.max_seq == 0,
+        devices_pinned: devices_pinned(),
         placement: PlacementPlan {
             summary: "fully resident".into(),
             expert_layers_resident: None,
             host_mapped_bytes: Some(0),
             decided_at_load: false,
         },
-        decode_route: decode_route(&params),
+        decode_route: decode.route,
+        decode_reason: decode.reason,
         routes: link_routes(device),
     };
     match admitted.topology {
@@ -543,13 +744,26 @@ fn analyze_model(
                 // The projection admission itself refused on: the load's own
                 // context check, so its verdict is the fit verdict.
                 Some(projection) => {
-                    result.findings.push(context_finding(
+                    let automatic = inputs.max_seq == 0;
+                    let gpus = visible_gpu_capacities(&admitted.source, &inputs, machine);
+                    let best = capacity::best_gpu(&gpus);
+                    let better = best.filter(|b| {
+                        b.index != device.index
+                            && b.capacity().is_some_and(|c| c > projection.card_cap)
+                    });
+                    result.findings.push(capacity::context_finding(
                         projection,
                         admitted.max_seq,
-                        inputs.max_seq == 0,
+                        automatic,
+                        device,
+                        better,
                     ));
                     plan.model_ctx = Some(projection.model_ctx);
                     plan.projection = Some(projection_json(projection));
+                    if machine.devices.len() > 1 {
+                        plan.best_device = best.and_then(capacity::best_device);
+                    }
+                    plan.gpus = gpus;
                 }
                 // No stored projection (MoE on a discrete GPU, or legacy KV):
                 // the daemon does not check this context before load, so fit
@@ -630,31 +844,69 @@ fn missing_header(tag: &str, detail: &str) -> Finding {
     )
 }
 
+/// The load parameters fit admits, plus what only fit explains.
+struct FitLoad {
+    params: Value,
+    /// The effective speculation selector: `--spec`, else `speculation.mode`.
+    selector: String,
+    /// A registry DFlash draft the final mode wants that is not installed.
+    draft_missing: Option<MissingDraft>,
+}
+
+struct MissingDraft {
+    file: String,
+    /// The registry's size for the draft; fit never fetches it.
+    size_bytes: Option<u64>,
+}
+
 fn model_params(
     paths: &crate::Paths,
     input: &str,
     tag: Option<&str>,
     entry: Option<&ModelEntry>,
     path: &Path,
-    ctx: Option<usize>,
-) -> Result<Value> {
+    args: &FitArgs,
+) -> Result<FitLoad> {
     let resolved = crate::resolved_for_model(paths, input, tag, entry)?;
-    let mut params = crate::load_params(
+    let overrides = args.load_overrides();
+    // The one sequence `hipfire run` builds its params with: config, `--kv-mode`,
+    // `--kv-k`/`--kv-v`, the effective `--spec` selector, the draft it keeps.
+    let mut params = crate::load_params_with_overrides(
         &resolved,
         entry,
         &paths.models,
         path,
         0,
-        None,
-        None,
         tag,
-        false,
-        None,
+        &overrides,
     )?;
+    let selector = crate::effective_speculation_selector(&resolved, overrides.speculation)?;
+    // run_command's resolve_dflash_sidecar for the final selector (config-off +
+    // `--spec dflash` is only visible here). It refuses a missing draft; fit
+    // keeps the plan and reports the missing draft itself.
+    let mut draft_missing = match crate::locate_dflash_sidecar(&params, entry, &paths.models, path)?
+    {
+        crate::DflashSidecar::Unresolved => None,
+        crate::DflashSidecar::Found(draft) => {
+            params["draft"] = json!(draft.display().to_string());
+            None
+        }
+        crate::DflashSidecar::NotPulled(file) => Some(MissingDraft {
+            size_bytes: entry
+                .and_then(|entry| entry.dflash.as_ref())
+                .and_then(|sidecar| sidecar.size_bytes),
+            file,
+        }),
+    };
     // main.rs run_command forwards --max-seq after load_params, without any
     // max_tokens inflation; --ctx has precisely that same precedence.
-    if let Some(ctx) = ctx {
+    if let Some(ctx) = args.ctx {
         params["max_seq"] = json!(ctx);
+    }
+    // run_command forwards `--tp` after load_params the same way; a degree of
+    // 1 is the default and is not sent.
+    if let Some(tp) = args.tp.filter(|&tp| tp > 1) {
+        params["tp"] = json!(tp);
     }
     // daemon/main.rs:1675-1693 and vision_ladder.rs:49-59: sample the
     // developer override ladders outside the pure params mapper, including
@@ -665,6 +917,10 @@ fn model_params(
     ] {
         if let Ok(value) = hipfire_config::developer_var(variable) {
             params[key] = json!(value);
+            if key == "draft" {
+                // The ladder names the draft (or opts out): none is missing.
+                draft_missing = None;
+            }
         }
     }
     // daemon/main.rs:1813-1820 and :1845-1862 use these process fallbacks
@@ -704,7 +960,45 @@ fn model_params(
     // admission inputs. Keep environmental resolution outside the pure mapper.
     let mut message = json!({"params": params});
     hipfire_config::topology::resolve_load_pp(&mut message).map_err(anyhow::Error::msg)?;
-    Ok(message["params"].take())
+    Ok(FitLoad {
+        params: message["params"].take(),
+        selector,
+        draft_missing,
+    })
+}
+
+/// A registry DFlash draft that the final mode wants and the machine lacks.
+/// `on` is a load refusal (the engine's own text), so an installed model
+/// does not fit; for a model fit only read the header of, `hipfire pull`
+/// fetches the draft with it, so the answer is open. `auto` runs without the
+/// draft. Fit never downloads the draft: the size is the registry's.
+fn report_missing_draft(result: &mut Analysis, params: &Value, tag: &str, missing: &MissingDraft) {
+    let size = missing
+        .size_bytes
+        .map(|bytes| {
+            format!(
+                " ({} per the registry; fit does not download it)",
+                gib(bytes)
+            )
+        })
+        .unwrap_or_else(|| " (fit does not download it)".into());
+    if params["dflash_mode"].as_str() == Some("on") {
+        let detail = format!(
+            "{}{size}",
+            crate::dflash_draft_not_pulled(&missing.file, Some(tag))
+        );
+        let fix = format!("`hipfire pull {tag}` (it fetches the draft), or choose another --spec");
+        result.findings.push(if result.model.installed {
+            Finding::fails("draft", detail, fix)
+        } else {
+            Finding::undetermined("draft", detail, Some(fix))
+        });
+    } else {
+        result.notes.push(format!(
+            "DFlash draft {} is not installed{size}; speculation.dflash = auto runs without it, `hipfire pull {tag}` fetches it",
+            missing.file
+        ));
+    }
 }
 
 fn source_context(source: &ModelSource) -> Option<usize> {
@@ -719,6 +1013,21 @@ fn source_context(source: &ModelSource) -> Option<usize> {
         .and_then(|v| usize::try_from(v).ok())
 }
 
+/// The plan's topology string. Qwen4 expert parallelism admits as `Single`
+/// with an Ep axis on the admitted mesh; the plan names it `ep<N>` so it is not
+/// read (or matched against receipts) as a single-GPU load.
+fn plan_topology_key(admitted: &SourceAdmission) -> String {
+    ep_axis_key(admitted.topology, &admitted.mesh.mesh)
+}
+
+fn ep_axis_key(topology: EffectiveTopology, mesh: &DeviceMesh) -> String {
+    let ep = mesh.size_of(DimKind::Ep);
+    match topology {
+        EffectiveTopology::Single if ep > 1 => format!("ep{ep}"),
+        topology => topology_key(topology),
+    }
+}
+
 fn topology_key(topology: EffectiveTopology) -> String {
     match topology {
         EffectiveTopology::Single => "single".into(),
@@ -727,18 +1036,149 @@ fn topology_key(topology: EffectiveTopology) -> String {
     }
 }
 
-fn decode_route(params: &Value) -> String {
-    if params["draft"].as_str().is_some_and(|v| !v.is_empty())
-        && params["dflash_mode"].as_str() != Some("off")
-    {
-        "dflash".into()
-    } else {
-        match params["mtp_mode"].as_str().unwrap_or("auto") {
-            "on" => "mtp".into(),
-            "auto" => "mtp / ar (auto; weights and route decided at load)".into(),
-            _ => "ar".into(),
+/// The facts besides the params that decide which route the load takes.
+struct DecodeFacts<'a> {
+    /// The effective speculation selector, and whether `--spec` set it.
+    selector: &'a str,
+    from_flag: bool,
+    /// The architecture's declared measured autoregressive floor
+    /// (`Carrier::mtp_measured_ar_floor`), which lets `auto` MTP attach;
+    /// `None` when the carrier is not resolved before load.
+    mtp_measured_ar_floor: Option<bool>,
+    draft_missing: Option<&'a MissingDraft>,
+}
+
+struct DecodePlan {
+    route: String,
+    reason: String,
+}
+
+/// Every decode route the params select and why. The load installs one
+/// speculator, the first armed of DSpark, DFlash, MTP, n-gram
+/// (`hipfire_loader::spec_build::build_speculator`, and the carrier's DSpark
+/// arm before it); with none armed it decodes autoregressively.
+fn decode_plan(params: &Value, facts: &DecodeFacts<'_>) -> DecodePlan {
+    let dflash_mode = params["dflash_mode"].as_str().unwrap_or("auto");
+    let mtp = hipfire_config::MtpMode::parse(params["mtp_mode"].as_str().unwrap_or("auto"));
+    // What armed a route: the flag, the config selector, or its own setting.
+    let chosen = |name: &str, setting: String| -> String {
+        match (facts.selector == name, facts.from_flag) {
+            (true, true) => format!("`--spec {name}`"),
+            (true, false) => format!("speculation.mode = {name}"),
+            (false, _) => setting,
         }
+    };
+    let mut armed: Vec<(String, String)> = Vec::new();
+    if params["dspark_mode"].as_str() == Some("on") {
+        armed.push((
+            "dspark".into(),
+            format!(
+                "DSpark drafter ({}); its sidecar and architecture support are checked at load",
+                chosen("dspark", "dspark_mode = on".into())
+            ),
+        ));
     }
+    let setting = format!("speculation.dflash = {dflash_mode}");
+    match (
+        (dflash_mode != "off")
+            .then(|| str_param(params, "draft"))
+            .flatten(),
+        facts.draft_missing.filter(|_| dflash_mode == "on"),
+    ) {
+        (Some(draft), _) => {
+            let file = safe_name(draft);
+            armed.push((
+                format!("dflash (draft {file})"),
+                format!(
+                    "DFlash draft {file} attached ({})",
+                    chosen("dflash", setting)
+                ),
+            ));
+        }
+        (None, Some(missing)) => armed.push((
+            format!("dflash (draft {} not installed)", missing.file),
+            format!(
+                "DFlash is on ({}) but its draft is not installed: the load refuses",
+                chosen("dflash", setting)
+            ),
+        )),
+        (None, None) => {}
+    }
+    match mtp {
+        hipfire_config::MtpMode::On => armed.push((
+            "mtp".into(),
+            format!(
+                "MTP head attached ({}), also over host-mapped experts; a missing head refuses at load",
+                chosen("mtp", "speculation.mtp = on".into())
+            ),
+        )),
+        hipfire_config::MtpMode::Auto if facts.mtp_measured_ar_floor == Some(true) => {
+            armed.push((
+                "mtp (auto)".into(),
+                format!(
+                    "speculation.mtp = auto: this architecture declares a measured AR floor, so the head attaches at load; it stays AR when the head is absent or experts are host-mapped ({})",
+                    hipfire_config::mtp_host_spill_reason()
+                ),
+            ))
+        }
+        _ => {}
+    }
+    if params["ngram_draft"].as_bool() == Some(true) {
+        armed.push((
+            "ngram".into(),
+            format!(
+                "model-free n-gram drafter ({}); only architectures with an n-gram speculator arm it, the rest stay AR",
+                chosen("ngram", "speculation.ngram = on".into())
+            ),
+        ));
+    }
+    if mtp == hipfire_config::MtpMode::Auto && facts.mtp_measured_ar_floor.is_none() {
+        armed.push((
+            "mtp / ar (auto; decided at load)".into(),
+            "speculation.mtp = auto attaches the head only where the architecture declares a measured AR floor and experts are not host-mapped; both are decided at load for this topology".into(),
+        ));
+    }
+    let mut armed = armed.into_iter();
+    let Some((route, mut reason)) = armed.next() else {
+        let reason = if facts.selector == "off" {
+            format!(
+                "{} disables every speculative route",
+                if facts.from_flag {
+                    "`--spec off`"
+                } else {
+                    "speculation.mode = off (config)"
+                }
+            )
+        } else {
+            let dflash = match (dflash_mode, facts.draft_missing) {
+                ("off", _) => "dflash off".to_owned(),
+                (_, Some(missing)) => format!(
+                    "dflash {dflash_mode} runs without its draft {} (not installed)",
+                    missing.file
+                ),
+                _ => format!("dflash {dflash_mode} has no draft for this artifact"),
+            };
+            let mtp = match mtp {
+                hipfire_config::MtpMode::Auto => {
+                    "mtp auto keeps AR (this architecture declares no measured AR floor; `--spec mtp` opts in)"
+                }
+                _ => "mtp off",
+            };
+            format!("no speculative route is enabled: {dflash}, {mtp}, ngram off")
+        };
+        return DecodePlan {
+            route: "ar".into(),
+            reason,
+        };
+    };
+    let rest: Vec<String> = armed.map(|(route, _)| route).collect();
+    if !rest.is_empty() {
+        reason.push_str(&format!(
+            "; also enabled, not installed ahead of it: {}",
+            rest.join(", ")
+        ));
+    }
+    DecodePlan { route, reason }
 }
 
 fn link_routes(device: &FitDevice) -> Vec<Route> {
@@ -792,12 +1232,7 @@ fn unchecked_context_finding(
                 gib(p.scratch as u64),
                 gib(p.page_rounding as u64),
             ),
-            (max_seq > p.card_cap).then(|| {
-                format!(
-                    "lower --ctx to at most {} (`hipfire config set memory.max_seq {}`) or free GPU memory",
-                    p.card_cap, p.card_cap
-                )
-            }),
+            (max_seq > p.card_cap).then(|| capacity::context_fix(&p, None)),
         ),
         Err(error) => Finding::undetermined(
             "context",
@@ -807,46 +1242,24 @@ fn unchecked_context_finding(
     }
 }
 
-fn context_finding(p: Qwen35CardProjection, requested: usize, automatic: bool) -> Finding {
-    let charges = format!(
-        "free {} - weights {} - prefill scratch {} - page rounding {}",
-        gib(p.free as u64),
-        gib(p.weights as u64),
-        gib(p.scratch as u64),
-        gib(p.page_rounding as u64)
-    );
-    let fix = format!("lower --ctx to at most {} (`hipfire config set memory.max_seq {}`), free GPU memory, or pick a smaller tier", p.card_cap, p.card_cap);
-    if automatic && p.card_cap < QWEN35_MIN_AUTO_CONTEXT {
-        return Finding::fails(
-            "context",
-            format!(
-                "projected card capacity {} is below the minimum automatic context {} ({charges})",
-                p.card_cap, QWEN35_MIN_AUTO_CONTEXT
-            ),
-            "free GPU memory or pick a smaller tier to provide the minimum automatic context",
-        );
-    }
-    if automatic {
-        Finding::fits("context", format!("automatic context: min(trained window {}, card capacity measured after weights load); projected {} tokens ({charges})", p.model_ctx, p.card_cap))
-    } else {
-        let detail = format!("a {requested}-token context needs {requested} x {} bytes of KV; the projection leaves room for {} tokens ({charges})", p.bytes_per_token, p.card_cap);
-        if requested <= p.card_cap {
-            Finding::fits("context", detail)
-        } else {
-            Finding::fails("context", detail, fix)
-        }
-    }
-}
-
 fn admission_fix(message: &str) -> String {
     if message.contains("max_seq") || message.contains("context") {
         "lower --ctx (or `hipfire config set memory.max_seq 512`), free GPU memory, or pick a smaller tier; apply any bound named above".into()
+    } else if ["DFlash", "MTP", "DSpark", "n-gram", "speculat"]
+        .iter()
+        .any(|word| message.contains(word))
+    {
+        "choose another speculation mode (`--spec off|auto|ngram|mtp|dflash|dspark`, or `hipfire config set speculation.mode off`), or provide the sidecar the message names".into()
     } else if message.contains("reload without") || message.contains("set ") {
         format!("apply the setting or reload change named above: {message}")
     } else if message.contains("kv") || message.contains("KV") {
-        "select a KV mode/backend supported by this model and GPU using `hipfire config set memory.kv_cache q8` and `hipfire config set memory.kv_backend vmm`; apply the admission message if it names a different required mode".into()
-    } else if message.contains("topology") || message.contains("pp=") || message.contains("tp=") {
-        "use a supported topology (`hipfire config set topology.pp 1` and `hipfire config set topology.ep 1`) or select the model/topology named above".into()
+        "change `--kv-mode`/`--kv-k`/`--kv-v`, or select a KV mode/backend supported by this model and GPU using `hipfire config set memory.kv_cache q8` and `hipfire config set memory.kv_backend vmm`; apply the admission message if it names a different required mode".into()
+    } else if message.contains("topology")
+        || message.contains("pp=")
+        || message.contains("tp=")
+        || message.contains("--tp")
+    {
+        "use a supported topology (`hipfire config set topology.pp 1`, `hipfire config set topology.ep 1`, and no `--tp`) or select the model/topology named above".into()
     } else {
         "see the message; change the named load setting or choose a supported smaller tier with `hipfire ls`, then rerun `hipfire fit`".into()
     }
@@ -965,6 +1378,7 @@ fn render_text(report: &Report, verbose: bool) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "hipfire fit {}", report.input);
     let _ = writeln!(out, "this machine");
+    let plan_window = report.plan.as_ref().and_then(|p| p.model_ctx);
     for device in &report.machine.devices {
         let free = device.free.map(gib).unwrap_or_else(|| "unknown".into());
         let total = device
@@ -974,9 +1388,20 @@ fn render_text(report: &Report, verbose: bool) -> String {
         let link = device.link.as_ref().map(|l| l.detail.as_str()).unwrap_or(
             "not calibrated: run `hipfire calibrate` (the engine probes the link at load)",
         );
+        // Per-GPU capacity of the fitted model, only where it tells GPUs apart.
+        let cap_text = device
+            .capacity
+            .filter(|_| report.machine.devices.len() > 1)
+            .map(|tokens| {
+                format!(
+                    "  capacity: {}",
+                    capacity::device_capacity_text(tokens, plan_window)
+                )
+            })
+            .unwrap_or_default();
         let _ = writeln!(
             out,
-            "  GPU{} {}  {free} free of {total}  link: {link}",
+            "  GPU{} {}  {free} free of {total}{cap_text}  link: {link}",
             device.index, device.arch
         );
     }
@@ -1022,9 +1447,11 @@ fn render_text(report: &Report, verbose: bool) -> String {
     if let Some(plan) = &report.plan {
         let _ = writeln!(
             out,
-            "plan (what `hipfire run` would load on GPU{})",
+            "plan (what `hipfire run{}` would load on GPU{})",
+            report.overrides.flags(),
             plan.device_index
         );
+        let _ = writeln!(out, "  basis      {PLAN_BASIS_TEXT}");
         let _ = writeln!(
             out,
             "  topology   {}",
@@ -1048,11 +1475,33 @@ fn render_text(report: &Report, verbose: bool) -> String {
                 .unwrap_or_else(|| "decided at load".into())
         );
         if let Some(p) = &plan.projection {
-            let n = |key: &str| p[key].as_u64().unwrap_or(0);
-            let _ = writeln!(out, "  capacity   up to {} tokens ({} free - {} weights - {} prefill scratch - {} rounding; {} B/token)", n("card_cap"), gib(n("free")), gib(n("weights")), gib(n("scratch")), gib(n("page_rounding")), n("bytes_per_token"));
+            let device = report
+                .machine
+                .devices
+                .iter()
+                .find(|d| d.index == plan.device_index);
+            let mut lines = capacity::capacity_lines(p, device).into_iter();
+            if let Some(first) = lines.next() {
+                let _ = writeln!(out, "  capacity   {first}");
+            }
+            for line in lines {
+                let _ = writeln!(out, "               {line}");
+            }
+        }
+        // The best visible GPU, when it is not the one this plan loads on.
+        if let Some(best) = plan
+            .best_device
+            .as_ref()
+            .filter(|best| best.index != plan.device_index)
+            .and_then(|best| plan.gpus.iter().find(|g| g.index == best.index))
+        {
+            if let Some(line) = capacity::best_gpu_line(best, plan.devices_pinned) {
+                let _ = writeln!(out, "  best GPU   {line}");
+            }
         }
         let _ = writeln!(out, "  placement  {}", plan.placement.summary);
         let _ = writeln!(out, "  decode     {}", plan.decode_route);
+        let _ = writeln!(out, "               {}", plan.decode_reason);
         for route in &plan.routes {
             let _ = writeln!(
                 out,
@@ -1089,7 +1538,12 @@ fn render_text(report: &Report, verbose: bool) -> String {
     if !report.tiers.is_empty() {
         let _ = writeln!(
             out,
-            "quant tiers (model fit only; pull default: {})",
+            "quant tiers (model fit only{}; pull default: {})",
+            if report.machine.devices.len() > 1 {
+                ", on each tier's best GPU"
+            } else {
+                ""
+            },
             report.model.tag
         );
         for tier in &report.tiers {
@@ -1116,8 +1570,13 @@ fn render_text(report: &Report, verbose: bool) -> String {
             out,
             "largest tier that fits at {context}: {}",
             largest
-                .map(|t| t.tag.as_str())
-                .unwrap_or("none established")
+                .map(|t| match t.best_gpu {
+                    Some(gpu) if report.machine.devices.len() > 1 => {
+                        format!("{} (on GPU{gpu})", t.tag)
+                    }
+                    _ => t.tag.clone(),
+                })
+                .unwrap_or_else(|| "none established".into())
         );
     }
     let _ = writeln!(
@@ -1220,6 +1679,15 @@ impl AdmissionInputs<'_> {
         path: &Path,
         device: &FitDevice,
     ) -> std::result::Result<SourceAdmission, String> {
+        self.admit_at(path, device, self.max_seq)
+    }
+
+    fn admit_at(
+        &self,
+        path: &Path,
+        device: &FitDevice,
+        max_seq: usize,
+    ) -> std::result::Result<SourceAdmission, String> {
         if let Some(error) = &self.error {
             return Err(error.clone());
         }
@@ -1234,10 +1702,32 @@ impl AdmissionInputs<'_> {
             self.vision,
             self.vision_mode,
             self.head,
-            self.max_seq,
+            max_seq,
             self.hints(device),
             self.options,
         )
+    }
+
+    /// The admission of an automatic context the loader refused because the
+    /// projection leaves less than its minimum (`resolve_sequence`), taken at
+    /// the minimum explicit context so the projection it refused on is
+    /// available; the sequence is then what the automatic load would resolve
+    /// (trained window, pending the measured capacity). `None` when this is
+    /// not that refusal.
+    fn capacity_refusal(&self, path: &Path, device: &FitDevice) -> Option<SourceAdmission> {
+        if self.max_seq != 0 {
+            return None;
+        }
+        let mut admitted = self.admit_at(path, device, QWEN35_MIN_AUTO_CONTEXT).ok()?;
+        let sequence = admitted.sequence.as_mut()?;
+        let projection = sequence.projection?;
+        if projection.card_cap >= QWEN35_MIN_AUTO_CONTEXT {
+            return None;
+        }
+        sequence.max_seq = projection.model_ctx;
+        sequence.bound = "pending";
+        admitted.max_seq = projection.model_ctx;
+        Some(admitted)
     }
 }
 
@@ -1452,6 +1942,10 @@ mod tests {
             vram_total: Some(32 << 30),
             free: Some(31 << 30),
             link: None,
+            capacity: None,
+            capacity_shown: None,
+            env_selector: "0".into(),
+            config_selector: "GPU-0".into(),
         }
     }
 
@@ -1480,6 +1974,13 @@ mod tests {
             schema: "hipfire-fit-1",
             hipfire: json!({"version": "0.4.3", "commit": "test"}),
             input: "example:mq4".into(),
+            overrides: OverridesEcho {
+                kv_mode: None,
+                kv_k: None,
+                kv_v: None,
+                spec: None,
+                tp: None,
+            },
             model: ModelInfo {
                 tag: "example:mq4".into(),
                 file: Some("example.mq4".into()),
@@ -1498,6 +1999,7 @@ mod tests {
                 devices: vec![device()],
             },
             plan: Some(Plan {
+                basis: PLAN_BASIS,
                 device_index: 0,
                 topology: "single".into(),
                 kv_backend: "vmm".into(),
@@ -1507,6 +2009,10 @@ mod tests {
                 bound: "user".into(),
                 model_ctx: Some(p.model_ctx),
                 projection: Some(projection_json(p)),
+                best_device: None,
+                gpus: Vec::new(),
+                automatic: false,
+                devices_pinned: false,
                 placement: PlacementPlan {
                     summary: "fully resident".into(),
                     expert_layers_resident: None,
@@ -1514,6 +2020,7 @@ mod tests {
                     decided_at_load: false,
                 },
                 decode_route: "ar".into(),
+                decode_reason: "no speculative route is enabled".into(),
                 routes: vec![Route {
                     name: "prefill_chunk".into(),
                     value: "512".into(),
@@ -1522,7 +2029,7 @@ mod tests {
             }),
             findings: vec![
                 Finding::fits("preflight", "runtime preflight ok"),
-                context_finding(p, 65_536, false),
+                capacity::context_finding(p, 65_536, false, &device(), None),
                 Finding::fails(
                     "host_ram",
                     "host RAM gate failed",
@@ -1678,10 +2185,10 @@ mod tests {
     #[test]
     fn context_user_fits_and_exceeds() {
         assert_eq!(
-            context_finding(projection(), 65_536, false).verdict,
+            capacity::context_finding(projection(), 65_536, false, &device(), None).verdict,
             Verdict::Fits
         );
-        let failure = context_finding(projection(), 262_144, false);
+        let failure = capacity::context_finding(projection(), 262_144, false, &device(), None);
         assert_eq!(failure.verdict, Verdict::DoesNotFit);
         assert!(failure.detail.contains("49152 bytes"));
         assert!(failure.fix.unwrap().contains("200000"));
@@ -1689,14 +2196,14 @@ mod tests {
 
     #[test]
     fn context_automatic_and_minimum_floor() {
-        let automatic = context_finding(projection(), 0, true);
+        let automatic = capacity::context_finding(projection(), 0, true, &device(), None);
         assert_eq!(automatic.verdict, Verdict::Fits);
         assert!(automatic
             .detail
             .contains("automatic context: min(trained window"));
         let mut p = projection();
         p.card_cap = QWEN35_MIN_AUTO_CONTEXT - 1;
-        let failure = context_finding(p, 0, true);
+        let failure = capacity::context_finding(p, 0, true, &device(), None);
         assert_eq!(failure.verdict, Verdict::DoesNotFit);
         assert!(!failure.fix.unwrap().is_empty());
     }
@@ -1799,6 +2306,8 @@ mod tests {
             "routes",
             "verdict: DOES NOT FIT",
             "expected speed",
+            "basis      pre-load estimate",
+            "(pre-load estimate:",
         ] {
             assert!(text.contains(line), "missing {line}");
         }
@@ -1819,6 +2328,14 @@ mod tests {
         assert_eq!(value["model"]["file"], "example.mq4");
         assert_eq!(value["plan"]["topology"], "single");
         assert_eq!(value["verdict"], "does-not-fit");
+        assert_eq!(value["plan"]["basis"], "pre-load");
+        assert_eq!(value["plan"]["decode_route"], "ar");
+        assert!(value["plan"]["decode_reason"].is_string());
+        assert_eq!(value["input"], "example:mq4");
+        assert_eq!(
+            value["overrides"],
+            json!({"kv_mode": null, "kv_k": null, "kv_v": null, "spec": null, "tp": null})
+        );
         let encoded = serde_json::to_string(&value).unwrap();
         assert!(!encoded.contains("/home/"));
         assert!(!encoded.contains("private-user"));
@@ -1875,5 +2392,515 @@ mod tests {
         let fix = finding.fix.unwrap();
         assert!(fix.contains("hipfire pull example:mq4"));
         assert!(fix.contains("without --no-fetch"));
+    }
+
+    fn fit_args(flags: &[&str]) -> FitArgs {
+        let mut argv = vec!["hipfire", "fit", "example:mq4"];
+        argv.extend(flags);
+        match crate::Cli::try_parse_from(argv).unwrap().command {
+            Some(crate::Commands::Fit(args)) => args,
+            _ => panic!("fit dispatch variant missing"),
+        }
+    }
+
+    /// A private home holding one model file; `model_params` never opens it.
+    fn fixture(label: &str) -> (crate::Paths, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("hipfire-fit-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let config = hipfire_config::ConfigPaths::under(&root);
+        std::fs::create_dir_all(&config.models).unwrap();
+        let model = config.models.join("example.mq4");
+        std::fs::write(&model, b"params never open the model file").unwrap();
+        let paths = crate::Paths {
+            models: config.models.clone(),
+            registry: hipfire_registry::RegistryPaths {
+                cache: root.join("registry.cache.json"),
+            },
+            root,
+            config,
+        };
+        (paths, model)
+    }
+
+    /// A registry whose one model declares a DFlash draft (0.5 GiB).
+    fn declared_registry() -> RegistryV1 {
+        RegistryV1::parse(
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{
+                "example:mq4":{"repo":"x","file":"example.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",
+                    "dflash":{"file":"example-dflash.hfq","size_bytes":557265920}}},"aliases":{}}"#,
+            "test",
+        )
+        .unwrap()
+    }
+
+    fn analysis(installed: bool) -> Analysis {
+        Analysis {
+            model: ModelInfo {
+                tag: "example:mq4".into(),
+                file: None,
+                installed,
+                replica: !installed,
+                size_bytes: None,
+                arch_id: None,
+                quant: None,
+            },
+            plan: None,
+            findings: Vec::new(),
+            notes: Vec::new(),
+            details: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn clap_fit_accepts_run_kv_and_spec_overrides() {
+        let args = fit_args(&[
+            "--kv-mode",
+            "q8",
+            "--kv-k",
+            "fwht3",
+            "--kv-v",
+            "q8",
+            "--spec",
+            "mtp",
+        ]);
+        let o = args.load_overrides();
+        assert_eq!(
+            (o.kv_mode, o.kv_k, o.kv_v, o.speculation),
+            (Some("q8"), Some("fwht3"), Some("q8"), Some("mtp"))
+        );
+        assert_eq!(
+            OverridesEcho::from(&args).flags(),
+            " --kv-mode q8 --kv-k fwht3 --kv-v q8 --spec mtp"
+        );
+        assert_eq!(
+            fit_args(&["--speculation", "dflash"]).spec.as_deref(),
+            Some("dflash")
+        );
+        for spec in ["off", "auto", "ngram", "dflash", "mtp", "dspark"] {
+            assert!(fit_args(&["--spec", spec]).spec.as_deref() == Some(spec));
+        }
+        assert!(
+            crate::Cli::try_parse_from(["hipfire", "fit", "example", "--spec", "turbo"]).is_err()
+        );
+        let none = fit_args(&[]);
+        assert!(none.kv_mode.is_none() && none.kv_k.is_none() && none.spec.is_none());
+        assert_eq!(OverridesEcho::from(&none).flags(), "");
+    }
+
+    #[test]
+    fn model_params_thread_overrides_exactly_like_run() {
+        let (paths, model) = fixture("thread");
+        let args = fit_args(&[
+            "--kv-mode",
+            "q8",
+            "--kv-k",
+            "fwht3",
+            "--kv-v",
+            "q8",
+            "--spec",
+            "mtp",
+        ]);
+        let load = model_params(&paths, "example:mq4", None, None, &model, &args).unwrap();
+        let p = &load.params;
+        assert_eq!(load.selector, "mtp");
+        assert_eq!(
+            (
+                p["kv_mode"].as_str(),
+                p["kv_k"].as_str(),
+                p["kv_v"].as_str()
+            ),
+            (Some("q8"), Some("fwht3"), Some("q8"))
+        );
+        assert_eq!(
+            (
+                p["mtp_mode"].as_str(),
+                p["dflash_mode"].as_str(),
+                p["ngram_draft"].as_bool(),
+                p["dspark_mode"].as_str()
+            ),
+            (Some("on"), Some("off"), Some(false), Some("off"))
+        );
+        // The admission inputs carry the overrides, so the engine's own
+        // refusal (an unsupported KV pair, MTP without a head) is the finding.
+        let a = admission_inputs(p);
+        assert!(a.error.is_none());
+        assert_eq!(
+            (a.kv_mode, a.kv_k, a.kv_v),
+            (Some("q8"), Some("fwht3"), Some("q8"))
+        );
+        assert_eq!(a.options.spec.mtp, Some(true));
+        assert_eq!(a.hints(&device()).kv_k, Some("fwht3"));
+        // And the same helper `hipfire run` calls builds the same params.
+        let resolved = crate::resolved_for_model(&paths, "example:mq4", None, None).unwrap();
+        let run = crate::load_params_with_overrides(
+            &resolved,
+            None,
+            &paths.models,
+            &model,
+            0,
+            None,
+            &args.load_overrides(),
+        )
+        .unwrap();
+        for key in [
+            "kv_mode",
+            "kv_k",
+            "kv_v",
+            "mtp_mode",
+            "dflash_mode",
+            "ngram_draft",
+            "dspark_mode",
+        ] {
+            assert_eq!(p[key], run[key], "{key}");
+        }
+    }
+
+    #[test]
+    fn tp_flag_matches_run_range_and_reaches_the_admission_inputs() {
+        let (paths, model) = fixture("tp");
+        let args = fit_args(&["--tp", "2"]);
+        assert_eq!(args.tp, Some(2));
+        assert_eq!(OverridesEcho::from(&args).flags(), " --tp 2");
+        let load = model_params(&paths, "example:mq4", None, None, &model, &args).unwrap();
+        assert_eq!(load.params["tp"], 2);
+        assert_eq!(admission_inputs(&load.params).tp, 2);
+        // One rank is the default: nothing is sent, admission reads tp = 1.
+        let one = fit_args(&["--tp", "1"]);
+        let load = model_params(&paths, "example:mq4", None, None, &model, &one).unwrap();
+        assert!(load.params.get("tp").is_none());
+        assert_eq!(admission_inputs(&load.params).tp, 1);
+        // The same 1..=64 range as `run --tp`.
+        for bad in ["0", "65"] {
+            assert!(
+                crate::Cli::try_parse_from(["hipfire", "fit", "example", "--tp", bad]).is_err(),
+                "--tp {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen4_ep_plans_report_the_ep_degree_not_single_gpu() {
+        assert_eq!(topology_key(EffectiveTopology::Single), "single");
+        assert_eq!(topology_key(EffectiveTopology::Pipeline(2)), "pp2");
+        assert_eq!(topology_key(EffectiveTopology::Expert(4)), "ep4");
+        // Qwen4 EP admits as `Single` with an Ep axis on the admitted mesh.
+        let mesh = DeviceMesh::rect(&[(DimKind::Ep, 2)]).expect("ep mesh");
+        let key = ep_axis_key(EffectiveTopology::Single, &mesh);
+        assert_eq!(key, "ep2");
+        // The receipt key follows the plan string exactly: an `ep2` receipt
+        // matches this plan and a single-GPU receipt no longer does.
+        let ep_receipt = receipts::Receipt {
+            topology: "ep2".into(),
+            ..receipt()
+        };
+        assert!(receipt_matches(
+            &ep_receipt,
+            "example:mq4",
+            "gfx1201",
+            &key,
+            "resident"
+        ));
+        assert!(!receipt_matches(
+            &receipt(),
+            "example:mq4",
+            "gfx1201",
+            &key,
+            "resident"
+        ));
+        let single = DeviceMesh::single().unwrap();
+        assert_eq!(ep_axis_key(EffectiveTopology::Single, &single), "single");
+        assert_eq!(ep_axis_key(EffectiveTopology::Pipeline(2), &single), "pp2");
+    }
+
+    #[test]
+    fn model_params_without_overrides_follow_the_config_selector() {
+        let (paths, model) = fixture("config");
+        let resolved = crate::resolved_for_model(&paths, "example:mq4", None, None).unwrap();
+        let load = model_params(&paths, "example:mq4", None, None, &model, &fit_args(&[])).unwrap();
+        assert_eq!(
+            load.selector,
+            crate::effective_speculation_selector(&resolved, None).unwrap()
+        );
+        assert!(load.params.get("kv_k").is_none() && load.params.get("kv_v").is_none());
+        assert!(load.draft_missing.is_none());
+    }
+
+    #[test]
+    fn model_params_refuse_what_run_refuses() {
+        let (paths, model) = fixture("refuse");
+        let refused = |flags: &[&str]| {
+            model_params(&paths, "example:mq4", None, None, &model, &fit_args(flags))
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default()
+        };
+        assert!(refused(&["--kv-mode", "bogus"]).contains("invalid value for memory.kv_cache"));
+        assert!(refused(&["--kv-k", "bogus"]).starts_with("--kv-k bogus:"));
+        // `--spec dflash` on an artifact with no declared draft: run's refusal.
+        assert!(refused(&["--spec", "dflash"]).starts_with("DFlash needs a draft model:"));
+        // Every refusal reaches the plan as an `admission` finding whose fix
+        // names the flag.
+        assert!(admission_fix("DFlash needs a draft model: x").contains("--spec"));
+    }
+
+    #[test]
+    fn spec_dflash_reports_a_missing_draft_and_never_fetches_it() {
+        let (paths, model) = fixture("draft");
+        let registry = declared_registry();
+        let (_, entry) = registry.model("example:mq4").unwrap();
+        let args = fit_args(&["--spec", "dflash"]);
+        let load = || {
+            model_params(
+                &paths,
+                "example:mq4",
+                Some("example:mq4"),
+                Some(entry),
+                &model,
+                &args,
+            )
+            .ok()
+            .unwrap()
+        };
+        let missing_load = load();
+        let missing = missing_load
+            .draft_missing
+            .as_ref()
+            .expect("draft not installed");
+        assert_eq!(
+            (missing.file.as_str(), missing.size_bytes),
+            ("example-dflash.hfq", Some(557_265_920))
+        );
+        assert!(str_param(&missing_load.params, "draft").is_none());
+        let facts = |selector, missing| DecodeFacts {
+            selector,
+            from_flag: true,
+            mtp_measured_ar_floor: Some(false),
+            draft_missing: missing,
+        };
+        let plan = decode_plan(&missing_load.params, &facts("dflash", Some(missing)));
+        assert_eq!(
+            plan.route,
+            "dflash (draft example-dflash.hfq not installed)"
+        );
+        assert!(plan.reason.contains("`--spec dflash`") && plan.reason.contains("refuses"));
+        // An installed model that lacks the draft does not load: run's text.
+        let mut result = analysis(true);
+        report_missing_draft(&mut result, &missing_load.params, "example:mq4", missing);
+        let finding = &result.findings[0];
+        assert_eq!(
+            (finding.id, finding.verdict),
+            ("draft", Verdict::DoesNotFit)
+        );
+        assert!(finding.detail.starts_with(&crate::dflash_draft_not_pulled(
+            "example-dflash.hfq",
+            Some("example:mq4")
+        )));
+        assert!(finding.detail.contains("0.5 GiB per the registry"));
+        assert!(finding
+            .fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("hipfire pull example:mq4")));
+        // A header replica is not installed: `hipfire pull` brings both.
+        let mut replica = analysis(false);
+        report_missing_draft(&mut replica, &missing_load.params, "example:mq4", missing);
+        assert_eq!(replica.findings[0].verdict, Verdict::Undetermined);
+        // `auto` runs without the draft: a note, never a finding.
+        let mut auto = analysis(true);
+        report_missing_draft(
+            &mut auto,
+            &json!({"dflash_mode": "auto"}),
+            "example:mq4",
+            missing,
+        );
+        assert!(auto.findings.is_empty());
+        assert!(auto.notes[0].contains("example-dflash.hfq") && auto.notes[0].contains("auto"));
+        // Once the draft is on disk the route names it.
+        std::fs::write(paths.models.join("example-dflash.hfq"), b"draft").unwrap();
+        let found = load();
+        assert!(found.draft_missing.is_none());
+        assert!(
+            str_param(&found.params, "draft").is_some_and(|d| d.ends_with("example-dflash.hfq"))
+        );
+        let plan = decode_plan(&found.params, &facts("dflash", None));
+        assert_eq!(plan.route, "dflash (draft example-dflash.hfq)");
+    }
+
+    fn spec_params(dflash: &str, mtp: &str, ngram: bool, dspark: &str) -> Value {
+        json!({"dflash_mode": dflash, "mtp_mode": mtp, "ngram_draft": ngram, "dspark_mode": dspark})
+    }
+
+    fn plan_for(
+        params: &Value,
+        selector: &str,
+        from_flag: bool,
+        floor: Option<bool>,
+    ) -> DecodePlan {
+        decode_plan(
+            params,
+            &DecodeFacts {
+                selector,
+                from_flag,
+                mtp_measured_ar_floor: floor,
+                draft_missing: None,
+            },
+        )
+    }
+
+    #[test]
+    fn decode_route_ar_says_why() {
+        let off = spec_params("off", "off", false, "off");
+        let flag = plan_for(&off, "off", true, Some(false));
+        assert_eq!(flag.route, "ar");
+        assert!(flag.reason.contains("`--spec off`"));
+        let config = plan_for(&off, "off", false, Some(false));
+        assert!(config.reason.contains("speculation.mode = off (config)"));
+        // The default: MTP `auto` on an architecture with no measured AR floor.
+        let auto = plan_for(
+            &spec_params("off", "auto", false, "auto"),
+            "auto",
+            false,
+            Some(false),
+        );
+        assert_eq!(auto.route, "ar");
+        assert!(auto.reason.contains("no measured AR floor") && auto.reason.contains("--spec mtp"));
+        assert!(auto.reason.contains("dflash off") && auto.reason.contains("ngram off"));
+    }
+
+    #[test]
+    fn decode_route_names_every_armed_route() {
+        let mtp = plan_for(
+            &spec_params("off", "on", false, "off"),
+            "mtp",
+            true,
+            Some(false),
+        );
+        assert_eq!(mtp.route, "mtp");
+        assert!(mtp.reason.contains("`--spec mtp`") && mtp.reason.contains("host-mapped"));
+        let configured = plan_for(
+            &spec_params("off", "on", false, "auto"),
+            "auto",
+            false,
+            Some(false),
+        );
+        assert!(configured.reason.contains("speculation.mtp = on"));
+        // MTP `auto` attaches only where the architecture declares an AR floor,
+        // and never over host-mapped experts.
+        let auto = spec_params("off", "auto", false, "auto");
+        let floor = plan_for(&auto, "auto", false, Some(true));
+        assert_eq!(floor.route, "mtp (auto)");
+        assert!(floor
+            .reason
+            .contains(hipfire_config::mtp_host_spill_reason()));
+        let unknown = plan_for(&auto, "auto", false, None);
+        assert!(unknown.route.starts_with("mtp / ar (auto"));
+        let ngram = plan_for(
+            &spec_params("off", "off", true, "off"),
+            "ngram",
+            true,
+            Some(false),
+        );
+        assert_eq!(ngram.route, "ngram");
+        assert!(ngram.reason.contains("`--spec ngram`"));
+        let dspark = plan_for(
+            &spec_params("off", "off", false, "on"),
+            "dspark",
+            true,
+            Some(false),
+        );
+        assert_eq!(dspark.route, "dspark");
+        let mut drafted = spec_params("on", "off", true, "off");
+        drafted["draft"] = json!("/models/qwen35-9b-dflash-mq4.hfq");
+        let dflash = plan_for(&drafted, "auto", false, Some(false));
+        assert_eq!(dflash.route, "dflash (draft qwen35-9b-dflash-mq4.hfq)");
+        assert!(dflash.reason.contains("also enabled") && dflash.reason.contains("ngram"));
+        // `--spec auto` and the registry draft with DFlash off: the mode wins.
+        drafted["dflash_mode"] = json!("off");
+        assert_eq!(plan_for(&drafted, "off", true, Some(false)).route, "ngram");
+    }
+
+    #[test]
+    fn text_plan_states_its_basis_overrides_and_decode_reason() {
+        let mut report = report();
+        report.overrides = OverridesEcho {
+            kv_mode: Some("q8".into()),
+            kv_k: None,
+            kv_v: None,
+            spec: Some("mtp".into()),
+            tp: None,
+        };
+        let text = render_text(&report, false);
+        assert!(
+            text.contains("plan (what `hipfire run --kv-mode q8 --spec mtp` would load on GPU0)")
+        );
+        assert!(text.contains("  basis      pre-load estimate from file headers + sysfs; the load re-measures free VRAM after weights, drafts and scratch (max_seq fit) and may admit less"));
+        assert!(text.contains("  capacity   up to 200000 tokens (pre-load estimate: "));
+        assert!(text.contains("  decode     ar\n               no speculative route is enabled"));
+        let value = json_report(&report).unwrap();
+        assert_eq!(
+            value["overrides"],
+            json!({"kv_mode": "q8", "kv_k": null, "kv_v": null, "spec": "mtp", "tp": null})
+        );
+    }
+
+    #[test]
+    fn busy_gpu_report_names_the_best_gpu_rows_tiers_and_json() {
+        let mut report = report();
+        let busy = {
+            let mut p = projection();
+            p.free = 2 << 30;
+            p.card_cap = 0;
+            p
+        };
+        let mut roomy = projection();
+        roomy.card_cap = 1_600_000;
+        let mut gpu0 = device();
+        gpu0.free = Some(2 << 30);
+        gpu0.capacity = Some(0);
+        let mut gpu2 = device();
+        gpu2.index = 2;
+        gpu2.capacity = Some(1_600_000);
+        gpu2.capacity_shown = Some(262_144);
+        gpu2.env_selector = "2".into();
+        gpu2.config_selector = "GPU-0000000000000002".into();
+        let gpus = vec![
+            GpuCapacity::new(&gpu0, Ok(busy)),
+            GpuCapacity::new(&gpu2, Ok(roomy)),
+        ];
+        report.machine.devices = vec![gpu0, gpu2];
+        let plan = report.plan.as_mut().unwrap();
+        plan.projection = Some(projection_json(busy));
+        plan.best_device = capacity::best_gpu(&gpus).and_then(capacity::best_device);
+        plan.gpus = gpus;
+        report.tiers = vec![TierRow {
+            tag: "example:mq4".into(),
+            size_bytes: Some(20 << 30),
+            verdict: Verdict::Fits,
+            summary: "up to 1600000 tokens on GPU2".into(),
+            best_gpu: Some(2),
+        }];
+        let text = render_text(&report, false);
+        assert!(text.contains(
+            "  GPU0 gfx1201  2.0 GiB free of 32.0 GiB  capacity: weights don't fit  link:"
+        ));
+        assert!(text.contains(
+            "  GPU2 gfx1201  31.0 GiB free of 32.0 GiB  capacity: up to 262144 tokens (model limit; KV room for 1.60M)  link:"
+        ));
+        assert!(text.contains("  capacity   weights + prefill scratch exceed free memory (2.0 GiB free of 32.0 GiB; 30.0 GiB held by other processes or the desktop)"));
+        assert!(text.contains("  best GPU   GPU2 (32.0 GiB free): up to 262144 tokens (model limit; KV room for 1.60M) — select it with HIP_VISIBLE_DEVICES=2 (or `hipfire config set hardware.devices GPU-0000000000000002`)"));
+        assert!(text.contains("quant tiers (model fit only, on each tier's best GPU;"));
+        assert!(text.contains("  example:mq4  20.0 GiB  FITS  up to 1600000 tokens on GPU2"));
+        assert!(text.contains("largest tier that fits at 65536 tokens: example:mq4 (on GPU2)"));
+        let value = json_report(&report).unwrap();
+        assert_eq!(value["plan"]["best_device"]["index"], 2);
+        assert_eq!(value["plan"]["best_device"]["capacity"], 1_600_000);
+        assert_eq!(value["plan"]["best_device"]["capacity_shown"], 262_144);
+        assert_eq!(value["machine"]["devices"][1]["capacity_shown"], 262_144);
+        assert!(value["plan"]["best_device"]["free_bytes"]
+            .as_u64()
+            .is_some());
+        assert_eq!(value["machine"]["devices"][0]["capacity"], 0);
+        assert_eq!(value["machine"]["devices"][1]["capacity"], 1_600_000);
+        assert_eq!(value["tiers"][0]["best_gpu"], 2);
+        assert!(value["machine"]["devices"][0].get("env_selector").is_none());
     }
 }

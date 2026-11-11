@@ -302,6 +302,44 @@ impl TileKind {
     }
 }
 
+/// The numerical/cohort class a tile takes in the window's route state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TileClass {
+    /// Runs the K2 grouped kernels: its route ids join the window's stable grouping.
+    K2,
+    /// A K1 short-tail cohort tile (a slab short tail or a one-row decode call).
+    K1,
+    /// An aggregate F32-tail cohort tile (accumulates in place per binding).
+    Tail,
+}
+
+/// The class a tile of `kind` takes in a window whose SP flag is `sp`
+/// ([`PromptRouteStorage::set_sp`]).
+///
+/// Without SP every kind keeps its own class.  Under SP the aggregate F16 route's tiles and the
+/// slab route's K2 tiles exist: an [`TileKind::AggregateF32Tail`] tile is K2-ized (it rotates
+/// its activations to F16 and joins the K2 grouping, because a range-masked cohort is unsafe
+/// over sparse streamed groups), a [`TileKind::SlabK2`] tile (mq3-xts) stays a K2 tile, and
+/// every other kind is refused (a one-row decode tile, a slab K1 tail and the IU4 aggregate
+/// route never belong to an SP window).
+pub fn sp_tile_class(kind: TileKind, sp: bool) -> Result<TileClass, DispatchError> {
+    if !sp {
+        return Ok(match kind {
+            TileKind::SlabK2 | TileKind::AggregateWmma | TileKind::AggregateIu4 => TileClass::K2,
+            TileKind::SlabK1Tail | TileKind::Decode => TileClass::K1,
+            TileKind::AggregateF32Tail => TileClass::Tail,
+        });
+    }
+    match kind {
+        TileKind::AggregateWmma | TileKind::AggregateF32Tail | TileKind::SlabK2 => {
+            Ok(TileClass::K2)
+        }
+        other => Err(bail(format!(
+            "a {other:?} tile does not run inside an SP window"
+        ))),
+    }
+}
+
 /// Grouped rows the aggregate route's panel-local slot map holds: the S1 panel bound.
 pub const AGGREGATE_PANEL_ROWS: usize = PanelLimits::S1.max_grouped_rows;
 
@@ -357,11 +395,40 @@ pub struct PromptRouteLayout {
     local_sorted: usize,
     k1_tmp: usize,
     cohort_counts: usize,
+    /// SP only (zero otherwise): byte offsets of the hybrid BF16 row table
+    /// `[grouped_rows, hidden]` and of the hybrid inverse `[rows * 10]` I32.  Both are the LAST
+    /// fields of the region, so every other offset equals the non-SP layout's.
+    sp_rows: usize,
+    sp_inverse: usize,
+    /// Bytes of the hybrid row table (`grouped_rows * hidden * 2`); 0 when SP is not carved.
+    sp_rows_bytes: usize,
     total: usize,
 }
 
 impl PromptRouteLayout {
     pub fn new(dims: &PromptRouteDims) -> Result<Self, DispatchError> {
+        Self::build(dims, false)
+    }
+
+    /// The window layout of an SP window: [`Self::new`]'s fields at the same offsets, then the
+    /// SP hybrid row table (BF16 `[H_max, hidden]`, `H_max` = the grouped-row bound of
+    /// `10 * rows`) and the hybrid inverse (I32 `[rows * 10]`), carved last in the same
+    /// region.  SP K2-izes the aggregate F32-tail tiles and has no cohort, so the dims must be
+    /// the aggregate F16 route or the slab route (mq3-xts: the window also carries the rotated
+    /// F16 activations the CPU arm reads) with `k1_rows == 0` and `tail_rows == 0`.
+    pub fn with_sp_rows(dims: &PromptRouteDims) -> Result<Self, DispatchError> {
+        if !matches!(dims.route, WindowRoute::Aggregate | WindowRoute::SlabIu4)
+            || dims.k1_rows != 0
+            || dims.tail_rows != 0
+        {
+            return Err(bail(format!(
+                "an SP window layout is the aggregate F16 or the slab route with no K1/tail cohort: {dims:?}"
+            )));
+        }
+        Self::build(dims, true)
+    }
+
+    fn build(dims: &PromptRouteDims, sp: bool) -> Result<Self, DispatchError> {
         let d = *dims;
         let cohort_rows = d.k1_rows.checked_add(d.tail_rows);
         if d.rows == 0
@@ -421,8 +488,12 @@ impl PromptRouteLayout {
         // the decode cohort's per-binding scratch rows (one decode tile's `[10, hidden]`).
         let aggregate = d.route.is_aggregate_layout();
         let wmma = d.route == WindowRoute::Aggregate && d.rows > d.k1_rows + d.tail_rows;
+        // An SP window on the slab route also carries the rotated F16 activations: the CPU arm
+        // (E1) reads them, as the aggregate route's WMMA arm does; the slab K2 arm reads the A4
+        // sidecar instead and has no panel-local slot map.
+        let slab_sp = sp && d.route == WindowRoute::SlabIu4;
         let tail_ids = field(mul(mul(d.tail_rows, K_TOP)?, I32_BYTES)?)?;
-        let x_f16 = field(if wmma {
+        let x_f16 = field(if wmma || slab_sp {
             mul(mul(d.rows, d.hidden)?, F16_BYTES)?
         } else {
             0
@@ -443,6 +514,15 @@ impl PromptRouteLayout {
         } else {
             0
         })?;
+        // SP's own fields, last so that every field above keeps the non-SP offset (zero bytes,
+        // hence no growth, when `sp` is off).
+        let sp_rows_bytes = if sp {
+            mul(mul(grouped_rows, d.hidden)?, BF16_BYTES)?
+        } else {
+            0
+        };
+        let sp_rows = field(sp_rows_bytes)?;
+        let sp_inverse = field(if sp { mul(slots, I32_BYTES)? } else { 0 })?;
         Ok(Self {
             dims: d,
             grouped_rows,
@@ -466,6 +546,9 @@ impl PromptRouteLayout {
             local_sorted,
             k1_tmp,
             cohort_counts,
+            sp_rows,
+            sp_inverse,
+            sp_rows_bytes,
             total: next,
         })
     }
@@ -499,11 +582,14 @@ impl PromptRouteLayout {
     }
 
     /// Aggregate route: the window's rotated F16 activations `[rows, hidden]` (inside the
-    /// region, counted by [`Self::total_bytes`]); 0 on the slab route and for an aggregate
-    /// window with no WMMA-arm rows (`rows == k1_rows + tail_rows`).
+    /// region, counted by [`Self::total_bytes`]); 0 for an aggregate window with no WMMA-arm
+    /// rows (`rows == k1_rows + tail_rows`) and on the slab route except in an SP window
+    /// ([`Self::with_sp_rows`]), where the CPU arm reads the same plane.
     pub fn x_f16_bytes(&self) -> usize {
         let d = &self.dims;
-        if d.route == WindowRoute::Aggregate && d.rows > d.k1_rows + d.tail_rows {
+        let aggregate_wmma = d.route == WindowRoute::Aggregate && d.rows > d.k1_rows + d.tail_rows;
+        let slab_sp = d.route == WindowRoute::SlabIu4 && self.sp_rows_bytes != 0;
+        if aggregate_wmma || slab_sp {
             d.rows * d.hidden * F16_BYTES
         } else {
             0
@@ -596,6 +682,26 @@ impl PromptRouteLayout {
     /// Upper bound of the padded grouped rows of the window (`G`).
     pub fn grouped_rows_bound(&self) -> usize {
         self.grouped_rows
+    }
+
+    /// Bytes of the SP hybrid row table, BF16 `[grouped_rows_bound, hidden]`; 0 for a layout
+    /// without SP fields ([`Self::new`]).
+    pub fn sp_rows_bytes(&self) -> usize {
+        self.sp_rows_bytes
+    }
+
+    /// Bytes of the SP hybrid inverse, I32 `[rows * 10]`; 0 for a layout without SP fields.
+    pub fn sp_inverse_bytes(&self) -> usize {
+        if self.has_sp() {
+            self.dims.rows * K_TOP * I32_BYTES
+        } else {
+            0
+        }
+    }
+
+    /// Whether the layout carries the SP fields ([`Self::with_sp_rows`]).
+    pub fn has_sp(&self) -> bool {
+        self.sp_rows_bytes != 0
     }
 }
 
@@ -987,6 +1093,9 @@ pub struct PromptRouteStorage {
     window_xq: Option<Int4MmqPrepared>,
     /// The window's stable grouping has run (set by [`finish_route_plan`], per layer).
     planned: bool,
+    /// The window runs SP ([`Self::set_sp`]): `prepare_routes` K2-izes F32-tail tiles and
+    /// refuses decode tiles.  Window-level: [`Self::reset_for_layer`] keeps it.
+    sp: bool,
 }
 
 impl PromptRouteStorage {
@@ -1033,6 +1142,7 @@ impl PromptRouteStorage {
             tiles: Vec::new(),
             window_xq: None,
             planned: false,
+            sp: false,
         })
     }
 
@@ -1067,6 +1177,64 @@ impl PromptRouteStorage {
     /// The layer's routed+shared output, F32 `[rows, hidden]` (the tiles' `moe_output`).
     pub fn combined(&self) -> &GpuTensor {
         &self.combined
+    }
+
+    /// Arm (or disarm) the SP branch of [`prepare_routes`] for this window.  Arming requires
+    /// the SP layout ([`PromptRouteLayout::with_sp_rows`]); arming a layout without the SP
+    /// fields is a caller bug and panics.
+    pub fn set_sp(&mut self, on: bool) {
+        assert!(
+            !on || self.layout.has_sp(),
+            "set_sp(true) needs a PromptRouteLayout built with with_sp_rows"
+        );
+        self.sp = on;
+    }
+
+    /// Whether the window runs SP.
+    pub fn sp(&self) -> bool {
+        self.sp
+    }
+
+    /// The SP hybrid row table, BF16 `[grouped_rows_bound * hidden]` (a view into the route
+    /// region; do not free).  Panics on a layout without the SP fields.
+    pub fn sp_rows(&self) -> GpuTensor {
+        assert!(self.layout.has_sp(), "the layout carries no SP fields");
+        self.view(self.layout.sp_rows, self.layout.sp_rows_bytes, DType::BF16)
+    }
+
+    /// The SP hybrid inverse, I32 `[rows * 10]` bytes (a view into the route region).  Panics
+    /// on a layout without the SP fields.
+    pub fn sp_inverse(&self) -> GpuTensor {
+        assert!(self.layout.has_sp(), "the layout carries no SP fields");
+        self.view(
+            self.layout.sp_inverse,
+            self.layout.sp_inverse_bytes(),
+            DType::Raw,
+        )
+    }
+
+    /// The grouped slot map the stable scatter writes, raw I32 `[grouped_rows_bound]` (valid
+    /// after the scatter; the SP barrier hook downloads it).
+    pub fn sorted(&self) -> GpuTensor {
+        self.view(
+            self.layout.sorted,
+            self.layout.grouped_rows * I32_BYTES,
+            DType::Raw,
+        )
+    }
+
+    /// The window's rotated F16 activations of rows `[row0, row0 + rows)`, F16
+    /// `[rows * hidden]` (aggregate F16 route; written by `prepare_routes`).
+    pub fn x_f16_rows(&self, row0: usize, rows: usize) -> Result<GpuTensor, DispatchError> {
+        let d = self.layout.dims;
+        if self.layout.x_f16_bytes() == 0 || row0.checked_add(rows).is_none_or(|e| e > d.rows) {
+            return Err(bail("the rows are outside the window's F16 activations"));
+        }
+        Ok(self.view(
+            self.layout.x_f16 + row0 * d.hidden * F16_BYTES,
+            rows * d.hidden * F16_BYTES,
+            DType::F16,
+        ))
     }
 
     fn view(&self, offset: usize, bytes: usize, dtype: DType) -> GpuTensor {
@@ -1172,8 +1340,12 @@ pub fn prepare_routes(
             ));
         }
     }
-    let k1 = !call.k2;
-    let tail = call.kind == TileKind::AggregateF32Tail;
+    // Under SP an F32-tail tile is K2-ized (rotated F16 + route ids, no cohort row); a decode
+    // tile is refused here, before anything runs.
+    let class = sp_tile_class(call.kind, dst.sp)?;
+    let k1 = class != TileClass::K2;
+    let tail = class == TileClass::Tail;
+    let k2_tail = dst.sp && call.kind == TileKind::AggregateF32Tail;
     if tail {
         if dst.tail_used + call.rows > d.tail_rows {
             return Err(bail("the F32 tail cohort exceeds its reserved rows"));
@@ -1248,7 +1420,10 @@ pub fn prepare_routes(
         hip(gpu.slowlink_fill_bytes(&route_ids, 0xFF, slots * I32_BYTES))?;
     } else {
         let params = *call.params();
-        if call.kind == TileKind::AggregateWmma {
+        if call.kind == TileKind::AggregateWmma
+            || k2_tail
+            || (dst.sp && call.kind == TileKind::SlabK2)
+        {
             // The aggregate K2 arm reads the rotated F16 activations, the bytes the incumbent's
             // own gate/up rotation produces (`rotate_x_mq_batched_f16` is the F32 rotation
             // rounded to F16 row by row, whatever the tile's row count): rotate the tile once
@@ -1261,7 +1436,9 @@ pub fn prepare_routes(
                 &x16,
                 call.rows * d.hidden * F16_BYTES,
             )?;
-        } else {
+        }
+        if call.kind != TileKind::AggregateWmma {
+            // (A K2-ized SP tail keeps this copy too: only its F16 rows feed the K2 arm.)
             copy(
                 gpu,
                 layout.x_norm + call.row0 * d.hidden * F32_BYTES,
@@ -1551,7 +1728,19 @@ impl LayerRoutePlan {
 pub fn finish_route_plan(
     gpu: &mut Gpu,
     routes: &mut PromptRouteStorage,
+    limits: PanelLimits,
+) -> Result<LayerRoutePlan, DispatchError> {
+    finish_route_plan_with(gpu, routes, limits, &mut |_, _| Ok(()))
+}
+
+/// [`finish_route_plan`] with a hook that runs right after the stable scatter has been
+/// enqueued and before the count barrier (the SP hook enqueues the `sorted` download on the
+/// compute stream here, so the barrier's own synchronous download proves it complete).
+pub fn finish_route_plan_with(
+    gpu: &mut Gpu,
+    routes: &mut PromptRouteStorage,
     _limits: PanelLimits,
+    after_scatter: &mut dyn FnMut(&mut Gpu, &PromptRouteStorage) -> Result<(), DispatchError>,
 ) -> Result<LayerRoutePlan, DispatchError> {
     let layout = routes.layout.clone();
     let d = layout.dims;
@@ -1599,6 +1788,7 @@ pub fn finish_route_plan(
         d.n_exp,
         layout.grouped_rows,
     ))?;
+    after_scatter(gpu, &*routes)?;
     // The cohort (K1 / F32-tail / decode tiles): count its slots per expert on the device into
     // the layout's `cohort_counts` words (zeroed here), so the ONE barrier below reads both
     // count arrays and no token-route id ever reaches the host.
@@ -1905,38 +2095,19 @@ impl<'a> OrderedCombineCursor<'a> {
     }
 }
 
-/// One panel: the K2 GEMMs over the panel's grouped rows and its ordered combine, then the K1
-/// cohort against the panel's binding when the schedule says so.
-pub fn execute_panel(
+/// The K2 grouped GEMMs of one panel's rows (none for a zero-row panel), the down GEMM writing
+/// its BF16 rows to `y_down` (row 0 = the panel's first row).  [`execute_panel`] passes the
+/// model's grouped down scratch; the SP GPU arm passes a view of the hybrid row table.
+fn panel_gemms(
     gpu: &mut Gpu,
     weights: ExpertPanelBinding<'_>,
-    panel: RoutedPanelView<'_>,
-    scratch: &mut PanelScratch<'_>,
-    combine: &mut OrderedCombineCursor<'_>,
-    hook: &mut dyn TileScopeHook,
+    routes: &PromptRouteStorage,
+    range: &PanelRange,
+    params: &MoePrefillParams<'_>,
+    y_down: &GpuTensor,
 ) -> Result<(), DispatchError> {
-    let (routes, range) = (panel.routes, panel.panel);
     let layout = &routes.layout;
     let d = layout.dims;
-    if combine.combined
-        || range.index != combine.panels_done
-        || range.index >= combine.expected_panels
-    {
-        return Err(bail("panels must execute once each in schedule order"));
-    }
-    if range.rows > scratch.limits.max_grouped_rows {
-        return Err(bail("a panel exceeds the hard row bound"));
-    }
-    if range.rows > 0 && range.row_base != combine.next_row_base {
-        return Err(bail("panel rows are not contiguous"));
-    }
-    let covers = |lo: usize, hi: usize| weights.expert_lo <= lo && hi <= weights.expert_hi;
-    if (range.rows > 0 && !covers(range.expert_lo, range.expert_hi))
-        || (range.k1 && !covers(range.bind_lo, range.bind_hi))
-    {
-        return Err(bail("the weight binding does not hold the panel's experts"));
-    }
-    let params = scratch.params;
     let slots = d.rows * K_TOP;
     if range.rows > 0 {
         let tile0 = range.row_base / MOE_GROUPED_BLOCK_M;
@@ -1963,19 +2134,47 @@ pub fn execute_panel(
                     .window_xq
                     .as_ref()
                     .ok_or_else(|| bail("the window's route plan has not run"))?;
-                hip(gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
-                    weights.gate_up_table,
-                    &tiles,
-                    &sorted,
-                    xq,
-                    params.y_gate_up_grouped,
-                    2 * d.mi,
-                    d.hidden,
-                    K_TOP,
-                    range.rows,
-                    d.rows,
-                    false,
-                ))?;
+                // A slab layer's experts carry a codec each (MQ4 hot + the cold codec): the
+                // K2 pair runs per codec bucket on codec-masked tiles, the ordinary slab tile
+                // lowering's arithmetic over this binding's device tables. The symmetric
+                // aggregate route is MQ4 throughout.
+                let slab_layer = if d.route == WindowRoute::SlabIu4 {
+                    Some(super::slab_route::layer(
+                        &gpu.arch,
+                        params.route_policy.as_ref(),
+                        &params.dtypes,
+                        params.expert_dtype_tags,
+                    )?)
+                } else {
+                    None
+                };
+                if let Some(layer) = slab_layer {
+                    super::slab_route::k2_panel_gate_up(
+                        gpu,
+                        layer,
+                        weights.gate_up_table,
+                        &tiles,
+                        &sorted,
+                        xq,
+                        params.y_gate_up_grouped,
+                        (2 * d.mi, d.hidden, K_TOP),
+                        (range.rows, d.rows),
+                    )?;
+                } else {
+                    hip(gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
+                        weights.gate_up_table,
+                        &tiles,
+                        &sorted,
+                        xq,
+                        params.y_gate_up_grouped,
+                        2 * d.mi,
+                        d.hidden,
+                        K_TOP,
+                        range.rows,
+                        d.rows,
+                        false,
+                    ))?;
+                }
                 let xdown = hip(gpu.qwen4_moe_rotate128_i4(
                     params.y_gate_up_grouped,
                     &sorted,
@@ -1983,19 +2182,33 @@ pub fn execute_panel(
                     range.rows,
                     slots,
                 ))?;
-                hip(gpu.gemm_qwen4_moe_down_iu4_sym(
-                    weights.down_table,
-                    &tiles,
-                    &sorted,
-                    &xdown,
-                    params.y_down_grouped,
-                    d.hidden,
-                    d.mi,
-                    1,
-                    range.rows,
-                    slots,
-                    false,
-                ))?;
+                if d.route == WindowRoute::SlabIu4 {
+                    super::slab_route::k2_panel_down(
+                        gpu,
+                        slab_layer.expect("the slab route resolved its layer"),
+                        weights.down_table,
+                        &tiles,
+                        &sorted,
+                        &xdown,
+                        y_down,
+                        (d.hidden, d.mi),
+                        (range.rows, slots),
+                    )?;
+                } else {
+                    hip(gpu.gemm_qwen4_moe_down_iu4_sym(
+                        weights.down_table,
+                        &tiles,
+                        &sorted,
+                        &xdown,
+                        y_down,
+                        d.hidden,
+                        d.mi,
+                        1,
+                        range.rows,
+                        slots,
+                        false,
+                    ))?;
+                }
             }
             WindowRoute::Aggregate => {
                 if !routes.planned || range.rows > AGGREGATE_PANEL_ROWS {
@@ -2036,7 +2249,7 @@ pub fn execute_panel(
                     &tiles,
                     &local,
                     &x_down,
-                    params.y_down_grouped,
+                    y_down,
                     d.hidden,
                     d.mi,
                     range.rows,
@@ -2045,6 +2258,92 @@ pub fn execute_panel(
             }
         }
     }
+    Ok(())
+}
+
+/// One SP GPU-arm panel: [`execute_panel`]'s K2 GEMMs over the panel's grouped rows, the down
+/// rows written to `y_rows` (BF16 `[panel.rows, hidden]`, typically a view of the hybrid row
+/// table at the panel's compact placement).  No combine and no K1 cohort: the layer's
+/// [`sp_finish_combine`] applies every contribution once.
+pub fn execute_panel_rows(
+    gpu: &mut Gpu,
+    weights: ExpertPanelBinding<'_>,
+    panel: RoutedPanelView<'_>,
+    scratch: &mut PanelScratch<'_>,
+    y_rows: &GpuTensor,
+) -> Result<(), DispatchError> {
+    let (routes, range) = (panel.routes, panel.panel);
+    let layout = &routes.layout;
+    if !routes.sp {
+        return Err(bail("execute_panel_rows runs inside an SP window only"));
+    }
+    if range.k1 {
+        return Err(bail("an SP panel carries no K1 cohort"));
+    }
+    if range.rows > scratch.limits.max_grouped_rows {
+        return Err(bail("a panel exceeds the hard row bound"));
+    }
+    if range.rows % MOE_GROUPED_BLOCK_M != 0
+        || range.row_base % MOE_GROUPED_BLOCK_M != 0
+        || range
+            .row_base
+            .checked_add(range.rows)
+            .is_none_or(|end| end > layout.grouped_rows)
+    {
+        return Err(bail(
+            "a panel's rows must be 16-aligned and inside the grouped rows",
+        ));
+    }
+    if range.rows > 0
+        && !(weights.expert_lo <= range.expert_lo && range.expert_hi <= weights.expert_hi)
+    {
+        return Err(bail("the weight binding does not hold the panel's experts"));
+    }
+    let need = mul(mul(range.rows, layout.dims.hidden)?, BF16_BYTES)?;
+    if y_rows.buf.size() < need {
+        return Err(bail(format!(
+            "the panel's row view holds {} bytes, {} rows need {need}",
+            y_rows.buf.size(),
+            range.rows
+        )));
+    }
+    let params = scratch.params;
+    panel_gemms(gpu, weights, routes, range, &params, y_rows)
+}
+
+/// One panel: the K2 GEMMs over the panel's grouped rows and its ordered combine, then the K1
+/// cohort against the panel's binding when the schedule says so.
+pub fn execute_panel(
+    gpu: &mut Gpu,
+    weights: ExpertPanelBinding<'_>,
+    panel: RoutedPanelView<'_>,
+    scratch: &mut PanelScratch<'_>,
+    combine: &mut OrderedCombineCursor<'_>,
+    hook: &mut dyn TileScopeHook,
+) -> Result<(), DispatchError> {
+    let (routes, range) = (panel.routes, panel.panel);
+    let layout = &routes.layout;
+    let d = layout.dims;
+    if combine.combined
+        || range.index != combine.panels_done
+        || range.index >= combine.expected_panels
+    {
+        return Err(bail("panels must execute once each in schedule order"));
+    }
+    if range.rows > scratch.limits.max_grouped_rows {
+        return Err(bail("a panel exceeds the hard row bound"));
+    }
+    if range.rows > 0 && range.row_base != combine.next_row_base {
+        return Err(bail("panel rows are not contiguous"));
+    }
+    let covers = |lo: usize, hi: usize| weights.expert_lo <= lo && hi <= weights.expert_hi;
+    if (range.rows > 0 && !covers(range.expert_lo, range.expert_hi))
+        || (range.k1 && !covers(range.bind_lo, range.bind_hi))
+    {
+        return Err(bail("the weight binding does not hold the panel's experts"));
+    }
+    let params = scratch.params;
+    panel_gemms(gpu, weights, routes, range, &params, params.y_down_grouped)?;
     // The ordered combine; a zero-row panel still applies its ownership range.
     let route_ids = routes.ids_view(layout.route_ids, 0, d.rows);
     let weights_t = routes.f32_rows(layout.topk_weights, 0, d.rows, K_TOP);
@@ -2247,6 +2546,63 @@ fn run_k1_cohort(
         })?;
     }
     Ok(())
+}
+
+// ───────────────────────────── SP combine ─────────────────────────────
+
+/// The SP layer's one canonical combine: zero the accumulator (+0.0, as
+/// [`OrderedCombineCursor::start`]), ONE `slowlink_combine_panel` over the hybrid row table
+/// (`hybrid_rows` rows from row 0, ownership `[0, n_exp)`, the hybrid inverse) and the terminal
+/// products.  The kernel applies every valid slot of a token in ascending expert id (ties by
+/// rank) whichever arm produced its row, so the result is the canonical combine over the rows
+/// `sp_inverse` names.  The caller has ordered the GEMM panels and the CPU-rows upload before
+/// this launch.
+pub fn sp_finish_combine(
+    gpu: &mut Gpu,
+    routes: &PromptRouteStorage,
+    hybrid_rows: usize,
+) -> Result<(), DispatchError> {
+    let layout = &routes.layout;
+    let d = layout.dims;
+    if !routes.sp || !routes.planned {
+        return Err(bail(
+            "sp_finish_combine needs an SP window past its barrier",
+        ));
+    }
+    if routes.filled != d.rows {
+        return Err(bail("the window's rows are not all prepared"));
+    }
+    if hybrid_rows > layout.grouped_rows {
+        return Err(bail(format!(
+            "{hybrid_rows} hybrid rows exceed the grouped-row bound {}",
+            layout.grouped_rows
+        )));
+    }
+    let route_ids = routes.ids_view(layout.route_ids, 0, d.rows);
+    let weights = routes.f32_rows(layout.topk_weights, 0, d.rows, K_TOP);
+    let inverse = routes.sp_inverse();
+    let hybrid = routes.view(
+        layout.sp_rows,
+        hybrid_rows * d.hidden * BF16_BYTES,
+        DType::BF16,
+    );
+    hip(gpu.slowlink_fill_bytes(&routes.combined, 0, layout.accumulator_bytes()))?;
+    hip(gpu.slowlink_combine_panel(
+        &hybrid,
+        &inverse,
+        &route_ids,
+        &weights,
+        &routes.combined,
+        d.hidden,
+        d.rows,
+        d.n_exp,
+        hybrid_rows,
+        0,
+        hybrid_rows,
+        0,
+        d.n_exp,
+    ))?;
+    hip(gpu.slowlink_combine_pad(&route_ids, &routes.combined, d.hidden, d.rows, d.n_exp))
 }
 
 // ───────────────────────────── finish ─────────────────────────────
@@ -5539,5 +5895,334 @@ mod slowlink_panel_tests {
         .unwrap();
         let some = PromptRouteLayout::new(&dims(1536)).unwrap();
         assert!(some.total_bytes() >= none.total_bytes() + 512 * 4);
+    }
+
+    // ───────────── SP (short-prompt prefill) primitives: layout, class, delegation ─────────────
+
+    /// Every pre-SP field offset of a layout, in declaration order, plus the legacy total.
+    fn legacy_offsets(l: &PromptRouteLayout) -> [usize; 20] {
+        [
+            l.grouped_rows,
+            l.x_norm,
+            l.route_ids,
+            l.topk_ids,
+            l.topk_weights,
+            l.sorted,
+            l.tiles,
+            l.inverse,
+            l.counts,
+            l.offsets,
+            l.accumulator,
+            l.shared_hidden,
+            l.shared_scalar,
+            l.k1_y0,
+            l.k1_ids,
+            l.k1_shared,
+            l.tail_ids,
+            l.x_f16,
+            l.local_sorted,
+            l.k1_tmp,
+        ]
+    }
+
+    #[test]
+    fn slowlink_sp_layout_prefix_is_the_non_sp_layout_and_fields_are_aligned() {
+        for rows in [5usize, 16, 768, 1024, 1536, 2048, 4096, 5376] {
+            let d = aggregate_dims(rows, 0, 0);
+            let base = PromptRouteLayout::new(&d).unwrap();
+            let sp = PromptRouteLayout::with_sp_rows(&d).unwrap();
+            // `new` carries no SP field and does not move: its SP offsets sit at the region end
+            // with zero bytes, and the SP builder only appends.
+            assert!(!base.has_sp());
+            assert_eq!((base.sp_rows_bytes(), base.sp_inverse_bytes()), (0, 0));
+            assert_eq!((base.sp_rows, base.sp_inverse), (base.total, base.total));
+            assert_eq!(
+                base,
+                PromptRouteLayout::new(&d).unwrap(),
+                "new is deterministic"
+            );
+            // Non-SP layout byte-equal to `new`: every legacy offset and the cohort-count field
+            // of the SP layout is the non-SP one, and only the two appended fields grow the total.
+            assert_eq!(legacy_offsets(&sp), legacy_offsets(&base), "rows {rows}");
+            assert_eq!(sp.cohort_counts, base.cohort_counts);
+            assert_eq!(sp.dims(), base.dims());
+            assert!(sp.has_sp());
+            // H_max is the grouped-row bound of 10 * rows slots: each slot adds at most one
+            // 16-row pad run, and at most `n_exp` experts pad (`slots + 15 * min(slots, 512)`).
+            let slots = 10 * rows;
+            let h_max = (slots + 15 * slots.min(512)).div_ceil(16) * 16;
+            assert_eq!(sp.grouped_rows_bound(), h_max, "rows {rows}");
+            assert_eq!(sp.sp_rows_bytes(), h_max * 2560 * BF16_BYTES);
+            assert_eq!(sp.sp_inverse_bytes(), rows * 10 * I32_BYTES);
+            // The two SP fields are carved last, aligned and disjoint.
+            assert_eq!(sp.sp_rows, base.total_bytes());
+            assert_eq!(
+                sp.sp_inverse,
+                sp.sp_rows + align_up(sp.sp_rows_bytes()).unwrap()
+            );
+            assert_eq!(
+                sp.total_bytes(),
+                sp.sp_inverse + align_up(sp.sp_inverse_bytes()).unwrap()
+            );
+            assert_eq!(
+                sp.total_bytes(),
+                base.total_bytes()
+                    + align_up(sp.sp_rows_bytes()).unwrap()
+                    + align_up(sp.sp_inverse_bytes()).unwrap()
+            );
+            let fields = [
+                sp.x_norm,
+                sp.route_ids,
+                sp.topk_ids,
+                sp.topk_weights,
+                sp.sorted,
+                sp.tiles,
+                sp.inverse,
+                sp.counts,
+                sp.offsets,
+                sp.accumulator,
+                sp.shared_hidden,
+                sp.shared_scalar,
+                sp.k1_y0,
+                sp.k1_ids,
+                sp.k1_shared,
+                sp.tail_ids,
+                sp.x_f16,
+                sp.local_sorted,
+                sp.k1_tmp,
+                sp.cohort_counts,
+                sp.sp_rows,
+                sp.sp_inverse,
+                sp.total,
+            ];
+            assert!(fields.iter().all(|f| f % ALIGN == 0), "rows {rows}");
+            assert!(fields.windows(2).all(|w| w[0] <= w[1]), "rows {rows}");
+            // The SP fields are strictly new bytes (the hybrid table cannot overlap `x_f16`).
+            assert!(sp.sp_rows >= sp.local_sorted + AGGREGATE_PANEL_ROWS * I32_BYTES);
+            // A window with SP fields and the F16 activations is the WMMA window.
+            assert_eq!(sp.x_f16_bytes(), rows * 2560 * F16_BYTES);
+        }
+    }
+
+    /// The slab route's SP window carries the rotated F16 activations the CPU arm reads
+    /// (`x_f16`, hidden * 2 B per row) and the hybrid row table and inverse; every field of the
+    /// non-SP slab layout keeps its offset (the F16 plane is carved where the aggregate route's
+    /// is, after the zero-sized cohort fields, so nothing before it moves), the plane is not
+    /// charged to a non-SP slab window, and the SP fields sit past it.
+    #[test]
+    fn slowlink_sp_slab_layout_adds_the_f16_plane_and_the_hybrid_rows_only_under_sp() {
+        let slab = |rows: usize| PromptRouteDims {
+            k1_rows: 0,
+            ..dims(rows)
+        };
+        for rows in [5usize, 128, 1105, 5376] {
+            let base = PromptRouteLayout::new(&slab(rows)).unwrap();
+            let sp = PromptRouteLayout::with_sp_rows(&slab(rows)).unwrap();
+            assert_eq!(base.x_f16_bytes(), 0, "rows {rows}");
+            assert_eq!(sp.x_f16_bytes(), rows * 2560 * F16_BYTES, "rows {rows}");
+            // Every field up to the F16 plane is at the non-SP offset.
+            assert_eq!(
+                (
+                    sp.x_norm,
+                    sp.sorted,
+                    sp.tiles,
+                    sp.accumulator,
+                    sp.k1_shared,
+                    sp.tail_ids
+                ),
+                (
+                    base.x_norm,
+                    base.sorted,
+                    base.tiles,
+                    base.accumulator,
+                    base.k1_shared,
+                    base.tail_ids
+                )
+            );
+            assert_eq!(sp.x_f16, base.x_f16);
+            // The plane, the hybrid row table and the inverse are strictly new bytes.
+            assert!(sp.sp_rows >= sp.x_f16 + align_up(sp.x_f16_bytes()).unwrap());
+            assert!(sp.sp_inverse > sp.sp_rows && sp.total > sp.sp_inverse);
+            assert!(sp.total_bytes() > base.total_bytes());
+            // The A4 sidecars are the same Gpu scratch either way.
+            assert_eq!(sp.a4_sidecar_bytes(), base.a4_sidecar_bytes());
+        }
+    }
+
+    #[test]
+    fn slowlink_sp_layout_refuses_cohort_rows_and_other_routes() {
+        assert!(PromptRouteLayout::with_sp_rows(&aggregate_dims(1024, 0, 0)).is_ok());
+        assert!(PromptRouteLayout::with_sp_rows(&aggregate_dims(1024, 1, 0)).is_err());
+        assert!(PromptRouteLayout::with_sp_rows(&aggregate_dims(1024, 0, 1)).is_err());
+        assert!(PromptRouteLayout::with_sp_rows(&sym_iu4_dims(1024, 0, 0)).is_err());
+        // The slab route (`dims` is a slab window) is an SP layout only without a cohort.
+        assert!(PromptRouteLayout::with_sp_rows(&dims(1024)).is_err());
+        let slab = |rows: usize| PromptRouteDims {
+            k1_rows: 0,
+            ..dims(rows)
+        };
+        assert!(PromptRouteLayout::with_sp_rows(&slab(1024)).is_ok());
+        let mut degenerate = aggregate_dims(1024, 0, 0);
+        degenerate.rows = 0;
+        assert!(PromptRouteLayout::with_sp_rows(&degenerate).is_err());
+    }
+
+    /// The product S1 profile's route-region budget: the aggregate route at its full window
+    /// (16,896 rows, K1 48, F32-tail 3,066), which is what `census.route_storage` charges.
+    fn product_route_region_bytes() -> usize {
+        PromptRouteLayout::new(&aggregate_dims(16_896, 48, 3_066))
+            .unwrap()
+            .total_bytes()
+    }
+
+    /// Largest window rows whose SP layout fits `budget` bytes.
+    fn max_sp_rows_within(budget: usize) -> usize {
+        let fits = |rows: usize| {
+            PromptRouteLayout::with_sp_rows(&aggregate_dims(rows, 0, 0))
+                .is_ok_and(|l| l.total_bytes() <= budget)
+        };
+        assert!(fits(1));
+        let (mut lo, mut hi) = (1usize, 16_896usize);
+        assert!(
+            !fits(hi),
+            "the SP layout at the full window cannot fit its own budget"
+        );
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2;
+            if fits(mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    #[test]
+    fn slowlink_sp_fit_limit_on_the_product_profile_is_pinned() {
+        let budget = product_route_region_bytes();
+        // The design's 462.3 MiB route region of the product profile.
+        assert_eq!(budget, 484_716_032, "product route region bytes");
+        let limit = max_sp_rows_within(budget);
+        assert_eq!(
+            limit, 5_593,
+            "max SP window rows that fit the product route region"
+        );
+        // The pin is exact: one more row does not fit, the limit itself does.
+        let total = |rows: usize| {
+            PromptRouteLayout::with_sp_rows(&aggregate_dims(rows, 0, 0))
+                .unwrap()
+                .total_bytes()
+        };
+        assert!(total(limit) <= budget && total(limit + 1) > budget);
+        // The design's cap (5,376 rows, §5/§6) fits with margin; the memory table's rows too.
+        for rows in [1024usize, 4096, 5376] {
+            assert!(total(rows) <= budget, "rows {rows}");
+        }
+        assert!(total(5376) < budget);
+        // MiB of the SP window layout at 1K / 4K / 5,376 rows (design §6: 115 / 349 / 446).
+        let mib = |rows: usize| total(rows) as f64 / (1024.0 * 1024.0);
+        assert!((mib(1024) - 115.0).abs() < 1.0, "{}", mib(1024));
+        assert!((mib(4096) - 349.0).abs() < 1.0, "{}", mib(4096));
+        assert!((mib(5376) - 446.0).abs() < 1.0, "{}", mib(5376));
+    }
+
+    #[test]
+    fn slowlink_sp_tile_class_k2_izes_the_f32_tail_only_under_sp() {
+        use TileClass::{Tail, K1, K2};
+        let kinds = [
+            TileKind::SlabK2,
+            TileKind::SlabK1Tail,
+            TileKind::AggregateWmma,
+            TileKind::AggregateIu4,
+            TileKind::AggregateF32Tail,
+            TileKind::Decode,
+        ];
+        // Without SP every kind keeps today's class (the K2 kinds are `TileKind::is_k2`).
+        let plain = [K2, K1, K2, K2, Tail, K1];
+        for (kind, want) in kinds.into_iter().zip(plain) {
+            assert_eq!(sp_tile_class(kind, false).unwrap(), want, "{kind:?}");
+            assert_eq!(want == K2, kind.is_k2(), "{kind:?}");
+        }
+        // Under SP: the F32 tail becomes K2, the WMMA tile and the slab K2 tile stay K2, a
+        // decode tile is an error (an SP window never holds one), and so is every other kind
+        // outside the aggregate F16 and slab routes.
+        assert_eq!(sp_tile_class(TileKind::AggregateF32Tail, true).unwrap(), K2);
+        assert_eq!(sp_tile_class(TileKind::AggregateWmma, true).unwrap(), K2);
+        assert_eq!(sp_tile_class(TileKind::SlabK2, true).unwrap(), K2);
+        for kind in [
+            TileKind::Decode,
+            TileKind::SlabK1Tail,
+            TileKind::AggregateIu4,
+        ] {
+            assert!(sp_tile_class(kind, true).is_err(), "{kind:?}");
+        }
+        // F32-tail is a cohort tile ONLY without SP.
+        assert_eq!(
+            sp_tile_class(TileKind::AggregateF32Tail, false).unwrap(),
+            Tail
+        );
+        for kind in kinds {
+            if let Ok(class) = sp_tile_class(kind, true) {
+                assert_eq!(class, K2, "{kind:?}: SP tiles are all K2");
+            }
+        }
+    }
+
+    /// The source text of the item that starts at `head` and ends at its first column-0 `}`.
+    fn item_source<'a>(src: &'a str, head: &str) -> &'a str {
+        let start = src.find(head).unwrap_or_else(|| panic!("{head} not found"));
+        let len = src[start..].find("\n}\n").expect("item end");
+        &src[start..start + len + 2]
+    }
+
+    #[test]
+    fn slowlink_finish_route_plan_delegates_to_the_hooked_body_with_a_noop() {
+        let src = include_str!("slowlink_prefill.rs");
+        let plain = item_source(src, "pub fn finish_route_plan(");
+        assert!(
+            plain.contains("finish_route_plan_with(gpu, routes, limits, &mut |_, _| Ok(()))"),
+            "{plain}"
+        );
+        // It owns no barrier work of its own.
+        for forbidden in ["scatter", "sync_download", "Instant", "planned"] {
+            assert!(!plain.contains(forbidden), "{forbidden}");
+        }
+        // The hooked body keeps the original sequence; the hook runs once, after the stable
+        // scatter and before the cohort counts and the one barrier.
+        let with = item_source(src, "pub fn finish_route_plan_with(");
+        let at = |needle: &str| with.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let scatter = at("hip(scatter(");
+        let hook = at("after_scatter(gpu, &*routes)?;");
+        let cohort = at("let cohort = (layout.dims.k1_rows");
+        let barrier = at("let started = Instant::now();");
+        let planned = at("routes.planned = true;");
+        assert!(scatter < hook && hook < cohort && cohort < barrier && barrier < planned);
+        assert_eq!(with.matches("after_scatter(").count(), 1);
+    }
+
+    #[test]
+    fn slowlink_execute_panel_passes_the_model_down_scratch_to_the_shared_gemm_block() {
+        // `execute_panel` runs the extracted GEMM block over `params.y_down_grouped` (so it is the
+        // pre-SP bytes) and the SP rows entry over the caller's hybrid row view.
+        let src = include_str!("slowlink_prefill.rs");
+        let panel = item_source(src, "pub fn execute_panel(");
+        assert!(panel.contains(
+            "panel_gemms(gpu, weights, routes, range, &params, params.y_down_grouped)?;"
+        ));
+        assert!(!panel.contains("gemm_mq4g128v2_moe_grouped_top10_xf16"));
+        let rows = item_source(src, "pub fn execute_panel_rows(");
+        assert!(rows.contains("panel_gemms(gpu, weights, routes, range, &params, y_rows)"));
+        assert!(
+            !rows.contains("combine"),
+            "the SP panel entry never combines"
+        );
+        let gemms = item_source(src, "fn panel_gemms(");
+        assert_eq!(
+            gemms.matches("y_down,").count(),
+            3,
+            "the slab K2 helper, the symmetric MQ4 GEMM and the aggregate down all write y_down"
+        );
+        assert!(!gemms.contains("y_down_grouped"));
     }
 }

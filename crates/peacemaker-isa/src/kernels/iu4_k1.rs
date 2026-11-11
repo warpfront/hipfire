@@ -8,6 +8,7 @@
 //! Each pair follows the pinned K1 arithmetic DAG: `float(C)-12582912`,
 //! `RN(scale*d)`, `RN(acc + scale*d*(float(C)-12582912))`.
 use crate::{
+    kernels::common::{op, v},
     kernels::iu4_fold::MAGIC,
     reg::{Vb, Vp},
     vopd::{Src0, VopdF32, VopdF32Op},
@@ -324,6 +325,41 @@ pub fn emit_fold_scale_paired(
             2 => fmac_subrev::<0, 1, 0, 1, 2, 3>(b, a, t, c, c2)?,
             _ => fmac_subrev::<1, 0, 1, 0, 3, 2>(b, a, t, c, c2)?,
         }
+    }
+    Ok(())
+}
+
+/// Stage 2 of accumulator `k` as the non-fused twin of [`emit_fold_scale`]
+/// (`FoldOp::MulAdd`): the same four `mul` packets form `t = RN(sc * d)`, then
+/// each element is `t = RN(t * x)` and `acc = RN(acc + t)` with `x = float(C) -
+/// magic` already in `cacc` (stage 1). The product register `t` is dead after
+/// its element's add, so it carries the second product. Not bit-identical to
+/// the fused accumulate; requires stage 1 of `k` and the scale rows of `rg`.
+pub fn emit_fold_scale_muladd(
+    b: &mut Builder,
+    regs: FoldRegisters,
+    k: usize,
+) -> Result<(), String> {
+    gfx12(b)?;
+    emit_products(b, regs, k)?;
+    for j in 0..8u8 {
+        let (a, t, c) = (
+            regs.acc[k].base() + j,
+            t_at(regs.t, j).base(),
+            regs.cacc[k].base() + j,
+        );
+        op(
+            b,
+            format!("v_mul_f32_e32 v{t}, v{t}, v{c}"),
+            &[v(t)],
+            &[v(t), v(c)],
+        )?;
+        op(
+            b,
+            format!("v_add_f32_e32 v{a}, v{a}, v{t}"),
+            &[v(a)],
+            &[v(a), v(t)],
+        )?;
     }
     Ok(())
 }

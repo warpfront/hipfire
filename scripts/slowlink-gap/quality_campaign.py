@@ -830,6 +830,10 @@ def prepare(args):
         if sha256_file(recipe["verified_cache"]["path"]) != recipe["verified_cache"]["sha256"]:
             raise Refusal("verified cache file differs from the recipe seal")
     beta = validate_beta(args.beta_dir, plan_sha if recipe is None else recipe["source"]["reference_plan_sha256"])
+    selected = parse_arms(args.arms)
+    bounds = verify_bounds_file(args.bounds_file)
+    label = args.label or "s1-quality-" + time.strftime("%Y%m%d", time.gmtime())
+    harness = harness_hashes(HERE)
     os.makedirs(root)
     camp = {
         "schema": CAMPAIGN_SCHEMA, "label": label, "created_utc": utc_now(), "root": root, "harness": harness,
@@ -1144,6 +1148,7 @@ def verify_phase_dir(camp, arm, phase):
             probs.append("observed environment[%s]=%r, expected %r" % (k, env.get(k), v))
     if env.get(EXPLICIT_LAYERS_ENV, None) is not None:
         probs.append("observed %s is set" % EXPLICIT_LAYERS_ENV)
+    ld = s.get("load") or {}
     arch = camp_arch(camp)
     recipe_exp = ((camp.get("execution_recipe") or {}).get("expect")) if camp.get("execution_recipe") else None
     want_n = recipe_exp["resident_layers"] if recipe_exp else RESIDENT_LAYERS

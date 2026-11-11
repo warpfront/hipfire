@@ -276,6 +276,9 @@ __device__ __forceinline__ void grouped_top10_o4_body(
         for (int slot = 0; slot < R; ++slot) {
             const int grouped_slot = slot_start + slot;
             if (grouped_slot >= grouped_rows) continue;
+#ifdef HF_NODZ
+            if (!live[slot]) continue;   // pad slot of a live tile: dead scratch, not stored (sentinel tiles already exit above)
+#endif
 #pragma unroll
             for (int r = 0; r < 4; ++r)
                 if (row_valid[r])

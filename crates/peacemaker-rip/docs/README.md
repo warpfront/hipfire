@@ -52,6 +52,7 @@ model on both arches (`tests/cookbook_a.rs`, `tests/cookbook_b.rs`).
 | [14 qwen4_moe_sym blocks](cookbook/14-qwen4-moe-blocks.md) | `moent::*` / `moe1::*`: per-tile branches, wait placement and the gate/up LDS hand-off as script statements |
 | [15 fa_prefill blocks](cookbook/15-fa-prefill-blocks.md) | `fa::*` on the raw `Builder`: two schedules (two planes / one reused stage), subtiles, barrier lists, what the Builder refuses |
 | [16 producers](cookbook/16-producers.md) | `c8::*`, `rot::*`, `gdn::*` on the raw `Builder`: reorder the norm's phases, the prefetch and the LDS exchange in a fused producer |
+| [17 fine iu4 K-loop natives](cookbook/17-iu4-kloop-natives.md) | `iu4::fragments_body` (the script body `rip_fragments`), `wmma`, `publish_*`, `wait`, `fetch_*`, ...: write the K128 block from typed steps, move the wait/publish placement, what the driver refuses |
 
 Every ```` ```rip ```` block in these documents is compiled by
 `tests/docs.rs`, so the examples track the compiler.

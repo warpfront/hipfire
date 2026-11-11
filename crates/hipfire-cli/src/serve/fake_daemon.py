@@ -89,6 +89,8 @@ def scenario_from(req):
         "t11-gated-nonstream",
         "t11-open-think-stop",
         "t21-think-text",
+        "t43-prefill-progress-error",
+        "t43-prefill-progress",
     )
     for tag in tags:
         if tag in blob:
@@ -229,6 +231,16 @@ def handle_generate(req):
         "type": "gen_start",
         "contract_version": 2,
     }, rid, aid)
+
+    # Prefill progress rides between gen_start and the first token.
+    if scenario in ("t43-prefill-progress", "t43-prefill-progress-error"):
+        for done in (512, 1024):
+            emit_correlated({"type": "prefill_progress", "done": done, "total": 2048}, rid, aid)
+        if scenario == "t43-prefill-progress-error":
+            emit_typed_error(rid, aid, "validation failed after prefill", cls="validation", retryable=False)
+            return
+        success_stop(rid, aid)
+        return
 
     # --- Task 15 scenarios ---
     if scenario == "t15-transient-once":

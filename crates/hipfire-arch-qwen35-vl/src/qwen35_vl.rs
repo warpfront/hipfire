@@ -110,6 +110,9 @@ pub fn vision_config_from_hfq(hfq: &HfqFile) -> Option<VisionConfig> {
 pub enum TowerResidency {
     /// Every matrix is uploaded to VRAM at load.
     Resident,
+    /// Large matrices stay in GPU-addressable host RAM and are read directly.
+    /// Small tensors and the patch projection retain their resident placement.
+    HostMapped,
     /// The matrices stay on host/disk. Each block streams through two fixed
     /// VRAM staging slots while an image encodes ([`TowerStream`]), so no
     /// tower weights hold VRAM between encodes.
@@ -117,13 +120,20 @@ pub enum TowerResidency {
 }
 
 impl TowerResidency {
-    /// `vision.mode` -> residency: `"resident"` => [`Self::Resident`], every
-    /// other mode => [`Self::Streamed`].
+    /// Resolve the existing vision mode. The developer host-mapped opt-in
+    /// only applies to auto/on; explicit resident and off retain their policy.
     pub fn from_vision_mode(mode: &str) -> Self {
-        if mode == "resident" {
-            Self::Resident
-        } else {
-            Self::Streamed
+        Self::with_host_mapped(
+            mode,
+            hipfire_config::developer_bool("HIPFIRE_VISION_HOST_MAPPED", false),
+        )
+    }
+
+    fn with_host_mapped(mode: &str, host_mapped: bool) -> Self {
+        match mode {
+            "resident" => Self::Resident,
+            "auto" | "on" if host_mapped => Self::HostMapped,
+            _ => Self::Streamed,
         }
     }
 }
@@ -214,8 +224,14 @@ enum MergerFc {
 
 impl VisionWeights {
     pub fn residency(&self) -> TowerResidency {
-        match self.mats {
-            TowerMats::Resident { .. } => TowerResidency::Resident,
+        match &self.mats {
+            TowerMats::Resident { layers, .. } => {
+                if layers.first().is_some_and(|l| l.qkv_w.buf.is_host_mapped()) {
+                    TowerResidency::HostMapped
+                } else {
+                    TowerResidency::Resident
+                }
+            }
             TowerMats::Streamed(_) => TowerResidency::Streamed,
         }
     }
@@ -475,8 +491,21 @@ fn load_f16_bytes<'a>(
 }
 
 fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor> {
+    load_f16_gpu_at(hfq, gpu, name, false)
+}
+
+fn load_f16_gpu_at(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    host_mapped: bool,
+) -> HipResult<GpuTensor> {
     let (bytes, n) = load_f16_bytes(hfq, name)?;
-    gpu.upload_raw(&bytes, &[n])
+    if host_mapped {
+        gpu.upload_raw_host_mapped(&bytes, &[n])
+    } else {
+        gpu.upload_raw(&bytes, &[n])
+    }
 }
 
 /// Upload a `[rows, cols]` F16 weight at row pitch `pitch >= cols`, the
@@ -490,6 +519,7 @@ fn load_f16_gpu_padded(
     rows: usize,
     cols: usize,
     pitch: usize,
+    host_mapped: bool,
 ) -> HipResult<GpuTensor> {
     let (bytes, n) = load_f16_bytes(hfq, name)?;
     if n != rows * cols || bytes.len() < n * 2 || pitch < cols {
@@ -504,7 +534,11 @@ fn load_f16_gpu_padded(
             .copy_from_slice(&bytes[r * cols * 2..(r + 1) * cols * 2]);
     }
     // Typed F16: the pitched LDS entries assert their operand dtype.
-    let mut t = gpu.upload_raw(&padded, &[rows * pitch])?;
+    let mut t = if host_mapped {
+        gpu.upload_raw_host_mapped(&padded, &[rows * pitch])?
+    } else {
+        gpu.upload_raw(&padded, &[rows * pitch])?
+    };
     t.dtype = DType::F16;
     Ok(t)
 }
@@ -697,12 +731,14 @@ fn load_resident_tensors(
     }
 }
 
-/// [`TowerResidency::Resident`]: upload every large matrix to VRAM.
-fn load_resident_mats(
+/// Persistent matrices use the same conversion, pitch and transactional
+/// ownership whether their allocation lives in VRAM or mapped host RAM.
+fn load_persistent_mats(
     hfq: &HfqFile,
     config: &VisionConfig,
     gpu: &mut Gpu,
     fc2_ld: usize,
+    host_mapped: bool,
 ) -> HipResult<TowerMats> {
     let h = config.hidden_size;
     let mut layers: Vec<VisionLayerMats> = Vec::with_capacity(config.num_layers);
@@ -716,14 +752,22 @@ fn load_resident_mats(
         let group = load_group(
             gpu,
             [
-                &|g| load_f16_gpu(hfq, g, &format!("{p}.attn.qkv.weight")),
-                &|g| load_f16_gpu(hfq, g, &format!("{p}.attn.proj.weight")),
-                &|g| load_f16_gpu(hfq, g, &format!("{p}.mlp.linear_fc1.weight")),
+                &|g| load_f16_gpu_at(hfq, g, &format!("{p}.attn.qkv.weight"), host_mapped),
+                &|g| load_f16_gpu_at(hfq, g, &format!("{p}.attn.proj.weight"), host_mapped),
+                &|g| load_f16_gpu_at(hfq, g, &format!("{p}.mlp.linear_fc1.weight"), host_mapped),
                 &|g| {
                     if fc2_ld != config.mlp_dim {
-                        load_f16_gpu_padded(hfq, g, &fc2_name, h, config.mlp_dim, fc2_ld)
+                        load_f16_gpu_padded(
+                            hfq,
+                            g,
+                            &fc2_name,
+                            h,
+                            config.mlp_dim,
+                            fc2_ld,
+                            host_mapped,
+                        )
                     } else {
-                        load_f16_gpu(hfq, g, &fc2_name)
+                        load_f16_gpu_at(hfq, g, &fc2_name, host_mapped)
                     }
                 },
             ],
@@ -748,8 +792,22 @@ fn load_resident_mats(
             load_group(
                 gpu,
                 [
-                    &|g| load_f16_gpu(hfq, g, "model.visual.merger.linear_fc1.weight"),
-                    &|g| load_f16_gpu(hfq, g, "model.visual.merger.linear_fc2.weight"),
+                    &|g| {
+                        load_f16_gpu_at(
+                            hfq,
+                            g,
+                            "model.visual.merger.linear_fc1.weight",
+                            host_mapped,
+                        )
+                    },
+                    &|g| {
+                        load_f16_gpu_at(
+                            hfq,
+                            g,
+                            "model.visual.merger.linear_fc2.weight",
+                            host_mapped,
+                        )
+                    },
                 ],
             )
         }
@@ -845,8 +903,12 @@ pub fn load_vision_weights(
         };
         eprintln!("  vision weight format: {fmt}");
     }
-    if residency == TowerResidency::Resident {
-        eprintln!("  loading vision weights (GPU)...");
+    match residency {
+        TowerResidency::Resident => eprintln!("  loading vision weights (GPU)..."),
+        TowerResidency::HostMapped => {
+            eprintln!("  loading vision weights (host-mapped direct reads)...")
+        }
+        TowerResidency::Streamed => {}
     }
     // Host-only; read before any upload so a missing table strands no VRAM.
     let pos_embed = load_f32_cpu(
@@ -863,7 +925,8 @@ pub fn load_vision_weights(
     let fc2_ld = vision_fc2_pitch(gpu, config);
     let small = load_resident_tensors(hfq, config, gpu, fc2_ld)?;
     let mats = match residency {
-        TowerResidency::Resident => load_resident_mats(hfq, config, gpu, fc2_ld),
+        TowerResidency::Resident => load_persistent_mats(hfq, config, gpu, fc2_ld, false),
+        TowerResidency::HostMapped => load_persistent_mats(hfq, config, gpu, fc2_ld, true),
         TowerResidency::Streamed => {
             TowerStream::new(hfq, config, gpu, fc2_ld).map(TowerMats::Streamed)
         }
@@ -2168,6 +2231,23 @@ mod tests {
                 TowerResidency::Streamed,
                 "{mode:?}"
             );
+        }
+    }
+
+    #[test]
+    fn host_mapped_opt_in_preserves_explicit_vision_policy() {
+        use TowerResidency::*;
+        for (mode, enabled, expected) in [
+            ("auto", false, Streamed),
+            ("on", false, Streamed),
+            ("auto", true, HostMapped),
+            ("on", true, HostMapped),
+            ("resident", false, Resident),
+            ("resident", true, Resident),
+            ("off", true, Streamed),
+            ("", true, Streamed),
+        ] {
+            assert_eq!(TowerResidency::with_host_mapped(mode, enabled), expected);
         }
     }
 

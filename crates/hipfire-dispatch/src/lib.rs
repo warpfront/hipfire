@@ -31,6 +31,7 @@ pub use offload_split::{
     seed, PassbackOptions, ShapeSnapshot, SplitCalibration,
 };
 pub mod resource;
+pub mod sp_plan;
 pub mod tables;
 pub mod traits;
 pub mod types;

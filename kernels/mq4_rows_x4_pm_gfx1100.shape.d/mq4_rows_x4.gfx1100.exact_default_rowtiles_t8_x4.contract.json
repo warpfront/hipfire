@@ -1,5 +1,5 @@
 {
-  "amdgpu_metadata": "---\namdhsa.kernels:\n  - .args:\n      - .actual_access: read_only\n        .address_space: global\n        .name: A0\n        .offset: 0\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: read_only\n        .address_space: global\n        .name: A1\n        .offset: 8\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: read_only\n        .address_space: global\n        .name: A2\n        .offset: 16\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: read_only\n        .address_space: global\n        .name: A3\n        .offset: 24\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: read_only\n        .address_space: global\n        .name: x\n        .offset: 32\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: write_only\n        .address_space: global\n        .name: y0\n        .offset: 40\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: write_only\n        .address_space: global\n        .name: y1\n        .offset: 48\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: write_only\n        .address_space: global\n        .name: y2\n        .offset: 56\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: write_only\n        .address_space: global\n        .name: y3\n        .offset: 64\n        .size: 8\n        .value_kind: global_buffer\n      - \n        .name: M0\n        .offset: 72\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: M1\n        .offset: 76\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: M2\n        .offset: 80\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: M3\n        .offset: 84\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: K\n        .offset: 88\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: R\n        .offset: 92\n        .size: 4\n        .value_kind: by_value\n    .group_segment_fixed_size: 0\n    .kernarg_segment_align: 8\n    .kernarg_segment_size: 96\n    .max_flat_workgroup_size: 32\n    .name: gemv_mq4g256v2_rows_x4_t8_pm_gfx1100\n    .private_segment_fixed_size: 0\n    .sgpr_count: 82\n    .sgpr_spill_count: 0\n    .symbol: gemv_mq4g256v2_rows_x4_t8_pm_gfx1100.kd\n    .uniform_work_group_size: 1\n    .uses_dynamic_stack: false\n    .vgpr_count: 121\n    .vgpr_spill_count: 0\n    .wavefront_size: 32\n    .workgroup_processor_mode: 1\namdhsa.target: amdgcn-amd-amdhsa--gfx1100\namdhsa.version: [1, 2]\n...\n.end_amdgpu_metadata\n.text\n\t.p2alignl 7, 3214868480\n\t.fill 96, 4, 3214868480\n",
+  "amdgpu_metadata": "---\namdhsa.kernels:\n  - .args:\n      - .actual_access: read_only\n        .address_space: global\n        .name: A0\n        .offset: 0\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: read_only\n        .address_space: global\n        .name: A1\n        .offset: 8\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: read_only\n        .address_space: global\n        .name: A2\n        .offset: 16\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: read_only\n        .address_space: global\n        .name: A3\n        .offset: 24\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: read_only\n        .address_space: global\n        .name: x\n        .offset: 32\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: write_only\n        .address_space: global\n        .name: y0\n        .offset: 40\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: write_only\n        .address_space: global\n        .name: y1\n        .offset: 48\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: write_only\n        .address_space: global\n        .name: y2\n        .offset: 56\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: write_only\n        .address_space: global\n        .name: y3\n        .offset: 64\n        .size: 8\n        .value_kind: global_buffer\n      - \n        .name: M0\n        .offset: 72\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: M1\n        .offset: 76\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: M2\n        .offset: 80\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: M3\n        .offset: 84\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: K\n        .offset: 88\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: R\n        .offset: 92\n        .size: 4\n        .value_kind: by_value\n    .group_segment_fixed_size: 0\n    .kernarg_segment_align: 8\n    .kernarg_segment_size: 96\n    .max_flat_workgroup_size: 32\n    .name: gemv_mq4g256v2_rows_x4_t8_pm_gfx1100\n    .private_segment_fixed_size: 0\n    .sgpr_count: 90\n    .sgpr_spill_count: 0\n    .symbol: gemv_mq4g256v2_rows_x4_t8_pm_gfx1100.kd\n    .uniform_work_group_size: 1\n    .uses_dynamic_stack: false\n    .vgpr_count: 121\n    .vgpr_spill_count: 0\n    .wavefront_size: 32\n    .workgroup_processor_mode: 1\namdhsa.target: amdgcn-amd-amdhsa--gfx1100\namdhsa.version: [1, 2]\n...\n.end_amdgpu_metadata\n.text\n\t.p2alignl 7, 3214868480\n\t.fill 96, 4, 3214868480\n",
   "arch": "gfx1100",
   "builder_proof": {
     "arch": "gfx1100",
@@ -23454,7 +23454,7 @@
         "iterations": 2
       }
     ],
-    "next_free_sgpr": 80,
+    "next_free_sgpr": 88,
     "next_free_vgpr": 121,
     "reg_plan": [
       {
@@ -23472,7 +23472,7 @@
         "name": "weight_resource"
       },
       {
-        "base": 8,
+        "base": 80,
         "kind": "s",
         "len": 8,
         "live": "Whole",
@@ -23675,14 +23675,14 @@
         "name": "column_bases1"
       },
       {
-        "base": 2,
+        "base": 14,
         "kind": "s",
         "len": 1,
         "live": "Whole",
         "name": "workgroup_id"
       },
       {
-        "base": 3,
+        "base": 15,
         "kind": "s",
         "len": 1,
         "live": "Whole",
@@ -23864,7 +23864,7 @@
         "name": "x_ring1"
       }
     ],
-    "s_text_sha256": "2e6b15eaade98c357b33c67a32dcab14ece65377f765176d7db16f9776815f8f",
+    "s_text_sha256": "26c49c6b0a10dfb59dc000a6b3af5a0566b274c96851ffe707b552aa618ae1a3",
     "variant": "exact_default_rowtiles_t8_x4",
     "vopd_pairs": 396,
     "waits": [
@@ -29974,7 +29974,7 @@
     "barriers": 0,
     "ds": 360,
     "instructions": 13017,
-    "next_free_sgpr": 80,
+    "next_free_sgpr": 88,
     "next_free_vgpr": 121,
     "valu_slots": 6232,
     "vmem": 470,
@@ -30006,7 +30006,7 @@
   "require_wave32": true,
   "require_zero_private": true,
   "require_zero_spills": true,
-  "sgpr_max": 80,
+  "sgpr_max": 88,
   "symbol": "gemv_mq4g256v2_rows_x4_t8_pm_gfx1100",
   "vgpr_max": 121
 }

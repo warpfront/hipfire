@@ -195,6 +195,99 @@ fn structural(receipt: &Value) -> Vec<String> {
             bad.push(format!("receipt key {key} missing or not an array"));
         }
     }
+    bad.extend(sp_problems(receipt));
+    bad
+}
+
+/// The optional `sp` object of a receipt (present only when the SP short-prompt
+/// hook's developer knob was on at load): every problem with its shape. Absent
+/// is acceptable: the knob-off receipt has no `sp` key.
+///
+/// `{knob: true, armed, decline: string|null, decline_reason: string|null,
+/// unavailable: string|null, engaged_windows, windows: [{rows, engaged,
+/// bypass: string|null, layers, streamed_bytes, streamed_experts, cpu_experts,
+/// cpu_slots}]}`. An armed hook has no decline; an unarmed one engaged no
+/// window; `engaged_windows` is the count of engaged windows; an incumbent
+/// receipt engaged none (SP only ever runs inside a layer-major window).
+pub fn sp_problems(receipt: &Value) -> Vec<String> {
+    let mut bad = Vec::new();
+    let Some(sp) = receipt.get("sp") else {
+        return bad;
+    };
+    let Some(object) = sp.as_object() else {
+        return vec!["receipt key sp is not an object".into()];
+    };
+    if object.get("knob") != Some(&Value::Bool(true)) {
+        bad.push("sp.knob must be true: the object exists only with the knob on".into());
+    }
+    let armed = object.get("armed").and_then(Value::as_bool);
+    if armed.is_none() {
+        bad.push("sp.armed missing or not a bool".into());
+    }
+    for key in ["decline", "decline_reason", "unavailable"] {
+        match object.get(key) {
+            Some(Value::Null) | Some(Value::String(_)) => {}
+            _ => bad.push(format!("sp.{key} missing (string or null)")),
+        }
+    }
+    let named = |key: &str| object.get(key).is_some_and(|value| !value.is_null());
+    if armed == Some(true) && (named("decline") || named("unavailable")) {
+        bad.push("sp is armed but names a decline or an unavailable reason".into());
+    }
+    if armed == Some(false) && !named("decline") && !named("unavailable") {
+        bad.push("sp is not armed but names neither a decline nor an unavailable reason".into());
+    }
+    let Some(windows) = object.get("windows").and_then(Value::as_array) else {
+        bad.push("sp.windows missing or not an array".into());
+        return bad;
+    };
+    let mut engaged = 0u64;
+    for (index, window) in windows.iter().enumerate() {
+        let flag = window.get("engaged").and_then(Value::as_bool);
+        if window.get("rows").and_then(Value::as_u64).is_none() || flag.is_none() {
+            bad.push(format!("sp.windows[{index}] has no rows or engaged flag"));
+            continue;
+        }
+        match window.get("bypass") {
+            Some(Value::Null) | Some(Value::String(_)) => {}
+            _ => bad.push(format!(
+                "sp.windows[{index}].bypass missing (string or null)"
+            )),
+        }
+        for key in [
+            "layers",
+            "streamed_bytes",
+            "streamed_experts",
+            "cpu_experts",
+            "cpu_slots",
+        ] {
+            if window.get(key).and_then(Value::as_u64).is_none() {
+                bad.push(format!(
+                    "sp.windows[{index}].{key} missing or not an integer"
+                ));
+            }
+        }
+        if flag == Some(true) {
+            engaged += 1;
+            if armed != Some(true) {
+                bad.push(format!("sp.windows[{index}] engaged while sp is not armed"));
+            }
+            if !window["bypass"].is_null() {
+                bad.push(format!("sp.windows[{index}] is engaged but names a bypass"));
+            }
+            if window.get("layers").and_then(Value::as_u64) == Some(0) {
+                bad.push(format!("sp.windows[{index}] is engaged but ran no layer"));
+            }
+        }
+    }
+    if object.get("engaged_windows").and_then(Value::as_u64) != Some(engaged) {
+        bad.push(format!(
+            "sp.engaged_windows is not the {engaged} engaged windows"
+        ));
+    }
+    if engaged > 0 && receipt.get("route").and_then(Value::as_str) != Some("layer-major") {
+        bad.push("an SP window cannot run outside a layer-major receipt".into());
+    }
     bad
 }
 

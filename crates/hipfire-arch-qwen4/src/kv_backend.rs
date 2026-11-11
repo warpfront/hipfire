@@ -50,22 +50,44 @@ impl From<KvBackend> for Qwen4KvBackend {
     }
 }
 
-/// The architectures whose Qwen4 QSA VMM state is certified: gfx1151 (F32
-/// state) and gfx1201 (fp8 state).
-const VMM_ARCHS: [&str; 2] = ["gfx1151", "gfx1201"];
+/// The architectures whose Qwen4 QSA VMM state is certified unconditionally:
+/// gfx1151 (F32 state), gfx1201 (fp8 state) and gfx942 (F32 or FNUZ fp8
+/// state). gfx1100 is admitted too unless the `HIPFIRE_QWEN4_VMM_GFX1100=0`
+/// kill switch is set.
+const VMM_ARCHS: [&str; 3] = ["gfx1151", "gfx1201", "gfx942"];
 
 /// Why Qwen4 QSA context arenas on a `gpu_arch` device cannot be VMM owners,
-/// or `None` when they can: exactly gfx1151 or gfx1201, not Windows (whose
-/// driver needs the full-map workaround), the platform VMM KV refusal
+/// or `None` when they can: exactly gfx1151, gfx1201, gfx942 or (unless
+/// `HIPFIRE_QWEN4_VMM_GFX1100=0`) gfx1100, not Windows (whose driver needs the
+/// full-map workaround), the platform VMM KV refusal
 /// ([`hipfire_config::devices::vmm_kv_platform_refusal`]) clear, and a HIP
 /// VMM runtime that reports an allocation granularity
 /// (`vmm_runtime_available`). Load admission resolves the backend from this.
 pub fn qwen4_vmm_refusal(gpu_arch: &str, vmm_runtime_available: bool) -> Option<String> {
+    qwen4_vmm_refusal_with(
+        gpu_arch,
+        vmm_runtime_available,
+        hipfire_config::devices::qwen4_vmm_gfx1100_enabled(),
+    )
+}
+
+/// [`qwen4_vmm_refusal`] with the gfx1100 kill-switch state explicit
+/// (`gfx1100_enabled` is false when `HIPFIRE_QWEN4_VMM_GFX1100=0`).
+fn qwen4_vmm_refusal_with(
+    gpu_arch: &str,
+    vmm_runtime_available: bool,
+    gfx1100_enabled: bool,
+) -> Option<String> {
     if cfg!(windows) {
         Some("Windows maps whole VMM reservations; Qwen4 QSA keeps legacy storage".to_string())
-    } else if !VMM_ARCHS.contains(&gpu_arch) {
+    } else if gpu_arch == "gfx1100" && !gfx1100_enabled {
         Some(format!(
-            "Qwen4 VMM QSA state is certified only on {}, not {gpu_arch}",
+            "Qwen4 VMM QSA state on gfx1100 is disabled by {}=0",
+            hipfire_config::devices::QWEN4_VMM_GFX1100
+        ))
+    } else if !VMM_ARCHS.contains(&gpu_arch) && gpu_arch != "gfx1100" {
+        Some(format!(
+            "Qwen4 VMM QSA state is certified only on {}, gfx1100, not {gpu_arch}",
             VMM_ARCHS.join(", ")
         ))
     } else if let Some(reason) = hipfire_config::devices::vmm_kv_platform_refusal() {
@@ -230,20 +252,44 @@ mod tests {
     use rdna_compute::tensor_ops::QsaKvFormat;
 
     #[test]
-    fn vmm_is_refused_off_gfx1151_gfx1201_and_without_the_runtime() {
-        assert!(qwen4_vmm_refusal("gfx1100", true).is_some_and(|reason| {
-            reason.contains("gfx1151") && reason.contains("gfx1201") && reason.contains("gfx1100")
+    fn vmm_is_refused_off_certified_arches_and_without_the_runtime() {
+        // gfx1100: admitted by default, refused (naming the switch) when
+        // HIPFIRE_QWEN4_VMM_GFX1100=0.
+        let off = qwen4_vmm_refusal_with("gfx1100", true, false);
+        assert!(off.is_some_and(|reason| {
+            reason.contains("HIPFIRE_QWEN4_VMM_GFX1100=0") && reason.contains("gfx1100")
         }));
-        assert!(qwen4_vmm_refusal("gfx1200", true).is_some());
-        for arch in ["gfx1151", "gfx1201"] {
+        // Other arches are unaffected by the gfx1100 switch.
+        for gfx1100_enabled in [false, true] {
+            assert!(
+                qwen4_vmm_refusal_with("gfx1200", true, gfx1100_enabled).is_some_and(
+                    |reason| reason.contains("gfx1151")
+                        && reason.contains("gfx1201")
+                        && reason.contains("gfx942")
+                        && reason.contains("gfx1100")
+                        && reason.contains("gfx1200")
+                )
+            );
+        }
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx942"] {
             if cfg!(windows) || hipfire_config::devices::vmm_kv_platform_refusal().is_some() {
-                assert!(qwen4_vmm_refusal(arch, true).is_some());
+                assert!(qwen4_vmm_refusal_with(arch, true, true).is_some());
             } else {
-                assert_eq!(qwen4_vmm_refusal(arch, true), None);
-                assert!(qwen4_vmm_refusal(arch, false)
+                assert_eq!(qwen4_vmm_refusal_with(arch, true, true), None);
+                assert!(qwen4_vmm_refusal_with(arch, false, true)
                     .is_some_and(|reason| reason.contains("granularity")));
             }
         }
+        // The process-reading wrapper agrees with the explicit form (the
+        // test process leaves the switch unset, i.e. enabled).
+        assert_eq!(
+            qwen4_vmm_refusal("gfx1100", true),
+            qwen4_vmm_refusal_with(
+                "gfx1100",
+                true,
+                hipfire_config::devices::qwen4_vmm_gfx1100_enabled()
+            )
+        );
     }
 
     #[test]

@@ -18,6 +18,8 @@
 pub mod build;
 pub mod definedness;
 pub mod profile;
+pub mod region;
+pub mod uniformity;
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -146,14 +148,15 @@ pub fn apply(base: &[u8], options: Options, rewrite: Rewrite) -> Result<Certifie
     let (bytes, relifted) = emit::checked(&current.program, options)?;
     let edited = kernel(&current.program, &symbol);
     let emitted = kernel(&relifted.program, &symbol);
-    let definedness = definedness::check(&base_kernel, edited, emitted);
+    let definedness =
+        definedness::check(current.program.target.arch, &base_kernel, edited, emitted);
     let new_obligations: Vec<Obligation> = current
         .obligations
         .iter()
         .filter(|o| !base_obligations.contains(&key(o)))
         .cloned()
         .collect();
-    admit(&rewrite, edited, base, &bytes)?;
+    admit(&rewrite, current.program.target.arch, edited, base, &bytes)?;
     let receipt = Receipt {
         base_object_sha256: base_sha,
         object_sha256: sha256(&bytes),
@@ -180,6 +183,7 @@ pub fn apply(base: &[u8], options: Options, rewrite: Rewrite) -> Result<Certifie
 /// The equivalence rule (architecture.md §3 "two claims, never conflated").
 fn admit(
     rewrite: &Rewrite,
+    arch: Arch,
     edited: &Kernel,
     base: &[u8],
     bytes: &[u8],
@@ -211,7 +215,7 @@ fn admit(
                 if inst.prov.edit.is_none() {
                     continue;
                 }
-                let text = inst.text(Arch::Gfx1201).unwrap_or_default();
+                let text = inst.text(arch).unwrap_or_default();
                 if !matches!(inst.effects.control, Control::None | Control::Wait) {
                     return refuse(format!(
                         "inserted `{text}` is control flow, a barrier or a window"

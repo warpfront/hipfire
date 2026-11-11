@@ -138,7 +138,18 @@ fn load(purpose: Purpose) -> Hw {
     // No resident floor: the actual count must be the maximal count that fits
     // (selected fits, one more does not, a host layer remains), judged from
     // the scalar witness of the shared quote against the bundle's own counts.
-    {
+    // A tier profile (HIPFIRE_QWEN4_S1_TIER) keeps no whole layer resident by design: the
+    // ranked hot set takes the capacity, so there is no maximal-resident-layers witness.
+    let tier_profile = bundle
+        .slowlink_profile()
+        .is_some_and(|profile| profile.tier);
+    if tier_profile {
+        assert_eq!(
+            resident_layers, 0,
+            "a tier profile keeps no whole layer resident"
+        );
+        println!("S1 tier profile: hot set takes the slack at zero resident layers");
+    } else {
         let profile = bundle.slowlink_profile().expect("an admitted S1 profile");
         let witness = admission_witness(profile);
         let bad = admission_witness_problems(
@@ -490,4 +501,147 @@ fn slowlink_receipt_adaptive_resident_counts_validate_without_a_floor() {
     assert!(!validate(Some(&open), Expect::LayerMajor, &limits).is_empty());
     assert!(!validate(Some(&receipt(TRUNK_LAYERS)), Expect::LayerMajor, &limits).is_empty());
     assert_eq!(PREFERRED_RESIDENT_LAYERS, 10);
+}
+
+/// The SP short-prompt hook's `sp` object is optional (the knob-off receipt
+/// has none and validates unchanged); present, it must be coherent.
+#[test]
+fn slowlink_receipt_sp_object_is_optional_and_checked_when_present() {
+    let receipt = |route: &str| {
+        json!({
+            "schema": RECEIPT_SCHEMA, "route": route, "selected_by": "auto", "bypass_reason": null,
+            "entry_pos": 0, "prompt_rows": 1024, "windows": [{"start": 0, "rows": 1024}], "launch_cuts": [768, 1024],
+            "tile_rows": 768, "retained_scratch_rows": 768, "sweeps": 1, "resident_layers": 10, "host_layers": 38,
+            "host_expert_bytes_total": 50_803_507_200u64, "submitted_bytes": 20_000_000_000u64,
+            "useful_bytes": 19_000_000_000u64, "unused_prefetched_bytes": 1_000_000_000u64,
+            "reserve": {"tile": 1u64 << 30, "arena": 1u64 << 29, "ring": 167_772_160u64,
+                        "lookahead": 1_336_000_000u64, "tables": 1u64 << 20, "total": 4_000_000_000u64},
+            "spans_ms": {"wall": 1.0, "copy": 0.5, "compute": 0.5, "route_barrier": 0.0, "nonexpert": 0.1},
+            "overlap": {"cross_layer_intersections": 0, "cross_layer_overlap_ms": 0.0, "copy_idle_ms": 0.0,
+                        "page_full_stalls": 0, "copy_starved_stalls": 0},
+            "peak_vram_bytes": 1,
+        })
+    };
+    let limits = Limits {
+        expected_tile_rows: Some(768),
+        ..Limits::default()
+    };
+    let window = |engaged: bool, bypass: Value, layers: u64| {
+        json!({"rows": 1024, "engaged": engaged, "bypass": bypass, "layers": layers,
+               "streamed_bytes": 100u64, "streamed_experts": 5u64, "cpu_experts": 7u64, "cpu_slots": 9u64})
+    };
+    let sp = |armed: bool, decline: Value, unavailable: Value, windows: Vec<Value>| {
+        let engaged = windows
+            .iter()
+            .filter(|w| w["engaged"] == json!(true))
+            .count();
+        json!({"knob": true, "armed": armed, "decline": decline, "decline_reason": decline.clone(),
+               "unavailable": unavailable, "engaged_windows": engaged, "windows": windows})
+    };
+    // No sp key: the knob-off receipt validates exactly as before.
+    let off = receipt("layer-major");
+    assert!(validate(Some(&off), Expect::LayerMajor, &limits).is_empty());
+    assert!(sp_problems(&off).is_empty());
+    // An armed hook that ran its window.
+    let mut ran = receipt("layer-major");
+    ran["sp"] = sp(
+        true,
+        Value::Null,
+        Value::Null,
+        vec![window(true, Value::Null, 38)],
+    );
+    assert!(
+        validate(Some(&ran), Expect::LayerMajor, &limits).is_empty(),
+        "{:?}",
+        validate(Some(&ran), Expect::LayerMajor, &limits)
+    );
+    // A declined hook names why, and its window never engaged.
+    let mut declined = receipt("layer-major");
+    declined["sp"] = sp(
+        false,
+        json!("sp: arch not calibrated"),
+        Value::Null,
+        vec![window(false, Value::Null, 0)],
+    );
+    assert!(validate(Some(&declined), Expect::LayerMajor, &limits).is_empty());
+    // A bypassed window of an armed hook names its reason.
+    let mut bypassed = receipt("layer-major");
+    bypassed["sp"] = sp(
+        true,
+        Value::Null,
+        Value::Null,
+        vec![window(
+            false,
+            json!("sp_bypass: 17000 rows exceeds the 5376-row maximum"),
+            0,
+        )],
+    );
+    assert!(validate(Some(&bypassed), Expect::LayerMajor, &limits).is_empty());
+    // The incumbent receipt of an armed hook names the hook's state, engaging nothing.
+    let mut incumbent = receipt("incumbent");
+    incumbent["reserve"] =
+        json!({"tile": 0, "arena": 0, "ring": 0, "lookahead": 0, "tables": 0, "total": 0});
+    incumbent["sweeps"] = json!(0);
+    incumbent["sp"] = sp(true, Value::Null, Value::Null, Vec::new());
+    assert!(sp_problems(&incumbent).is_empty());
+    // Incoherent objects are refused.
+    let broken = |mutate: &dyn Fn(&mut Value)| {
+        let mut r = receipt("layer-major");
+        r["sp"] = sp(
+            true,
+            Value::Null,
+            Value::Null,
+            vec![window(true, Value::Null, 38)],
+        );
+        mutate(&mut r["sp"]);
+        sp_problems(&r)
+    };
+    assert!(
+        !broken(&|s| s["armed"] = json!(false)).is_empty(),
+        "engaged while unarmed"
+    );
+    assert!(
+        !broken(&|s| s["decline"] = json!("sp: route")).is_empty(),
+        "armed with a decline"
+    );
+    assert!(
+        !broken(&|s| s["engaged_windows"] = json!(0)).is_empty(),
+        "count mismatch"
+    );
+    assert!(
+        !broken(&|s| s["knob"] = json!(false)).is_empty(),
+        "knob must be true"
+    );
+    assert!(
+        !broken(&|s| s["windows"][0]["bypass"] = json!("x")).is_empty(),
+        "engaged with a bypass"
+    );
+    assert!(
+        !broken(&|s| s["windows"][0]["layers"] = json!(0)).is_empty(),
+        "engaged, no layer"
+    );
+    assert!(!broken(&|s| {
+        s.as_object_mut().unwrap().remove("windows");
+    })
+    .is_empty());
+    let mut not_object = receipt("layer-major");
+    not_object["sp"] = json!(true);
+    assert!(!sp_problems(&not_object).is_empty());
+    let mut unarmed_silent = receipt("layer-major");
+    unarmed_silent["sp"] = sp(false, Value::Null, Value::Null, Vec::new());
+    assert!(
+        !sp_problems(&unarmed_silent).is_empty(),
+        "unarmed without a reason"
+    );
+    let mut engaged_incumbent = receipt("incumbent");
+    engaged_incumbent["sp"] = sp(
+        true,
+        Value::Null,
+        Value::Null,
+        vec![window(true, Value::Null, 38)],
+    );
+    assert!(
+        !sp_problems(&engaged_incumbent).is_empty(),
+        "SP cannot engage on the incumbent"
+    );
 }

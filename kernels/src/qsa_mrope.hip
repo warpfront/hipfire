@@ -36,16 +36,6 @@ static __device__ __forceinline__ void qsa_index_store(__hip_bfloat16* slot, __h
     *slot = value;
 }
 
-static __device__ __forceinline__ int qsa_mrope_position(
-    int position, int frequency, const int* positions, int prompt_rows,
-    int delta, int section_h, int section_w) {
-    if (positions == nullptr) return position;
-    if (position >= prompt_rows) return position + delta;
-    int axis = frequency % 3 == 1 && frequency < 3 * section_h ? 1
-        : frequency % 3 == 2 && frequency < 3 * section_w ? 2 : 0;
-    return positions[position * 3 + axis];
-}
-
 static __device__ __forceinline__ float qsa_norm_mrope_head(
     const float* head_values,
     const __hip_bfloat16* norm,
@@ -176,8 +166,8 @@ static __device__ __forceinline__ void qsa_pool_mrope(
         float other = bf16_to_f32(bf16_round(
             bf16_to_f32(other_bf16) * inv * (1.0f + other_norm)));
         int pair = channel < half ? channel : partner;
-        float angle = (float)qsa_mrope_position(block * compress, pair,
-            positions, prompt_rows, delta, section_h, section_w)
+        float angle = (float)qsa_pooled_key_position(first_block, (int)blockIdx.x,
+            compress, pair, positions, prompt_rows, delta, section_h, section_w)
             * powf(10000000.0f, -((float)(2 * pair)) / (float)rotary_dim);
         float sine, cosine;
         rope_yarn_sincos(angle, pair, yarn, &sine, &cosine);

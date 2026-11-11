@@ -103,6 +103,18 @@ fn module_digests() -> Vec<(String, String)> {
     }
     let (_, text, _) = qwen4_moe_down_gp::emit_module(Arch::Gfx1201).unwrap();
     out.push((qwen4_moe_down_gp::module_name(Arch::Gfx1201), sha(&text)));
+    // F1 drop-zero planar twins (gfx1201).
+    let (_, text, _) = moe::emit_module_codec(Arch::Gfx1201, WeightCodec::Mq4SymPlanar).unwrap();
+    out.push((
+        Spec::module_codec(Arch::Gfx1201, WeightCodec::Mq4SymPlanar),
+        sha(&text),
+    ));
+    let (_, text, _) =
+        qwen4_moe_down_gp::emit_module_codec(Arch::Gfx1201, WeightCodec::Mq4SymPlanar).unwrap();
+    out.push((
+        qwen4_moe_down_gp::module_name_codec(Arch::Gfx1201, WeightCodec::Mq4SymPlanar),
+        sha(&text),
+    ));
     out
 }
 
@@ -160,7 +172,7 @@ const ENTRIES: &[(&str, &str)] = &[
     ),
     (
         "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8",
-        "3baebc60a656e7c5b7343887c6fde75813f080f4a9dfb1385e0bbc662b555901",
+        "904f6d5a54d1facb2a96e65095b7729eb764fc68eb8fa4a7a09e140f79c31c40",
     ),
     (
         "qwen4_moe_down_iu4_sym_pm_gfx1201_nt8",
@@ -228,7 +240,7 @@ const R4: &[(&str, &str)] = &[
     ),
     (
         "r4_gate_up_nt8_c1_p1_g0",
-        "3baebc60a656e7c5b7343887c6fde75813f080f4a9dfb1385e0bbc662b555901",
+        "904f6d5a54d1facb2a96e65095b7729eb764fc68eb8fa4a7a09e140f79c31c40",
     ),
     (
         "r4_gate_up_nt8_c1_p1_g1",
@@ -378,7 +390,7 @@ const MODULES: &[(&str, &str)] = &[
     ),
     (
         "qwen4_moe_iu4_sym_pm_gfx1201",
-        "090eef8c1d73e25588f1cb5fc6e604eff3dbc57b6a0a94acbf92fb50ed3d493b",
+        "d234c9beb45dabf4a1f6b89a9ba2c289778f48e71efbc659e65e57bf6a9533a5",
     ),
     (
         "qwen4_moe_iu4_sym_w3_pm_gfx1151",
@@ -395,6 +407,14 @@ const MODULES: &[(&str, &str)] = &[
     (
         "qwen4_moe_down_gp_pm_gfx1201",
         "a745708078c40797dc4fae02d8d2162fbf4c339f90644a5dd870c93b4ce70a78",
+    ),
+    (
+        "qwen4_moe_iu4_sym_p_pm_gfx1201",
+        "be2cd77565503dac50bf3e1c248203398477ea1484a92ba3a4e36c315e955c9e",
+    ),
+    (
+        "qwen4_moe_down_gp_p_pm_gfx1201",
+        "f50bfdda13ecb1648541c32470f93ee32efee9bf1bb481afeac6c94d597c0d71",
     ),
 ];
 

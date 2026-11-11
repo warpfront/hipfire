@@ -1282,7 +1282,7 @@ impl App {
             reasoning_content: None,
         });
         self.chat.sending = true;
-        self.chat.status = "streaming from hipfire serve".into();
+        self.chat.status = CHAT_STREAMING_STATUS.into();
         self.chat.gen_start = Some(Instant::now());
         self.chat.gen_model = self.active_model.clone();
         self.chat.gen_tokens = 0;
@@ -1654,6 +1654,7 @@ impl App {
             while let Ok(event) = rx.try_recv() {
                 match event {
                     ChatEvent::Reasoning(text) => {
+                        self.chat.end_prefill();
                         if let Some(last) = self.chat.messages.last_mut() {
                             let rc = last.reasoning_content.get_or_insert_with(String::new);
                             rc.push_str(&text);
@@ -1661,10 +1662,19 @@ impl App {
                         self.chat.gen_tokens += 1;
                     }
                     ChatEvent::Content(text) => {
+                        self.chat.end_prefill();
                         if let Some(last) = self.chat.messages.last_mut() {
                             last.content.push_str(&text);
                         }
                         self.chat.gen_tokens += 1;
+                    }
+                    ChatEvent::PrefillProgress { done, total } => {
+                        self.chat.prefill = Some((done, total));
+                        let elapsed = self
+                            .chat
+                            .gen_start
+                            .map_or(std::time::Duration::ZERO, |start| start.elapsed());
+                        self.chat.status = prefill_status_text(done, total, elapsed);
                     }
                     ChatEvent::Usage { completion_tokens } => {
                         self.chat.gen_usage = Some(completion_tokens);
@@ -1717,6 +1727,23 @@ impl App {
             }
         }
     }
+}
+
+/// Chat status while a reply streams (also what the prefill readout yields to).
+const CHAT_STREAMING_STATUS: &str = "streaming from hipfire serve";
+
+/// Chat status while the server prefills the prompt, e.g.
+/// `prefilling 512/2048 (25%) · ETA 6s`. `elapsed` is the time since the
+/// request was sent; the ETA extrapolates the rate so far (`?` until one exists).
+fn prefill_status_text(done: u64, total: u64, elapsed: std::time::Duration) -> String {
+    let eta = match hipfire_client::prefill_eta_secs(done, total, elapsed) {
+        Some(secs) => format!("{secs:.0}"),
+        None => "?".to_owned(),
+    };
+    format!(
+        "prefilling {done}/{total} ({}%) · ETA {eta}s",
+        hipfire_client::prefill_percent(done, total)
+    )
 }
 
 /// Help note shown in the Chat transcript by `/help` (never a message).
@@ -1815,6 +1842,9 @@ pub struct ChatState {
     /// Server-reported completion tokens for this generation, once the final
     /// usage chunk has arrived.
     gen_usage: Option<usize>,
+    /// Latest `(done, total)` prompt-token prefill progress of the in-flight
+    /// generation; cleared when the first content/reasoning arrives.
+    pub prefill: Option<(u64, u64)>,
     /// Stats of the most recent completed generation (shown under the reply).
     pub last_stats: Option<GenStats>,
     rx: Option<Receiver<ChatEvent>>,
@@ -1841,6 +1871,7 @@ impl Default for ChatState {
             gen_model: String::new(),
             gen_tokens: 0,
             gen_usage: None,
+            prefill: None,
             last_stats: None,
             rx: None,
             input_focused: true,
@@ -1875,6 +1906,7 @@ impl ChatState {
     /// abort-before-first-token) so it isn't rendered or sent in the next turn.
     fn finalize_generation(&mut self) -> Option<(GenStats, f64)> {
         let mut recorded = None;
+        self.prefill = None;
         if let Some(start) = self.gen_start.take() {
             let (count, exact) = match self.gen_usage {
                 Some(n) => (n, true),
@@ -1903,6 +1935,13 @@ impl ChatState {
         }
         self.prune_stopped();
         recorded
+    }
+
+    /// The first content/reasoning arrived: the prefill readout is over.
+    fn end_prefill(&mut self) {
+        if self.prefill.take().is_some() {
+            self.status = CHAT_STREAMING_STATUS.into();
+        }
     }
 
     /// Forget `[stopped]` marks whose message no longer exists.
@@ -1936,6 +1975,7 @@ impl ChatState {
     fn reset_stats(&mut self) {
         self.last_stats = None;
         self.gen_start = None;
+        self.prefill = None;
         self.gen_tokens = 0;
         self.gen_usage = None;
     }
@@ -2306,6 +2346,53 @@ mod tests {
             "no stats when zero tokens streamed"
         );
         assert!(!app.chat.sending);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prefill_text_reports_tokens_percent_and_eta() {
+        assert_eq!(
+            prefill_status_text(512, 2048, std::time::Duration::from_secs(2)),
+            "prefilling 512/2048 (25%) · ETA 6s"
+        );
+        assert_eq!(
+            prefill_status_text(0, 2048, std::time::Duration::from_secs(1)),
+            "prefilling 0/2048 (0%) · ETA ?s"
+        );
+    }
+
+    #[test]
+    fn prefill_progress_shows_until_first_content_then_streams() {
+        let (mut app, dir) = test_app();
+        app.tab = Tab::Chat;
+        app.chat.messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: String::new(),
+            reasoning_content: None,
+        }];
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.chat.rx = Some(rx);
+        app.chat.sending = true;
+        app.chat.status = CHAT_STREAMING_STATUS.into();
+        app.chat.gen_start = Some(Instant::now());
+        tx.send(ChatEvent::PrefillProgress {
+            done: 512,
+            total: 2048,
+        })
+        .unwrap();
+        app.drain_chat_events();
+        assert_eq!(app.chat.prefill, Some((512, 2048)));
+        assert!(
+            app.chat
+                .status
+                .starts_with("prefilling 512/2048 (25%) · ETA "),
+            "{}",
+            app.chat.status
+        );
+        tx.send(ChatEvent::Content("hi".into())).unwrap();
+        app.drain_chat_events();
+        assert_eq!(app.chat.prefill, None);
+        assert_eq!(app.chat.status, CHAT_STREAMING_STATUS);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2696,15 +2783,12 @@ mod tests {
 
     /// Fake `hipfire` that appends its arguments to `<dir>/serve-calls.log`.
     fn fake_cli(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let log = dir.join("serve-calls.log");
         let bin = dir.join("fake-hipfire");
-        std::fs::write(
+        crate::test_support::write_executable(
             &bin,
-            format!("#!/bin/sh\necho \"$@\" >> '{}'\n", log.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            &format!("#!/bin/sh\necho \"$@\" >> '{}'\n", log.display()),
+        );
         (bin, log)
     }
 
@@ -3008,18 +3092,15 @@ mod tests {
     /// Install a fake CLI that records `"$@"` (one line per call) and exits 1
     /// unless `$1` is `pull`; returns the record path.
     fn pull_recorder(dir: &std::path::Path) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let record = dir.join("pull-argv.txt");
         let bin = dir.join("hipfire-fake");
-        std::fs::write(
+        crate::test_support::write_executable(
             &bin,
-            format!(
+            &format!(
                 "#!/bin/sh\n[ \"$1\" = pull ] || exit 1\necho \"$@\" >> '{}'\nexit 0\n",
                 record.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         std::env::set_var("HIPFIRE_CLI_BIN", &bin);
         record
     }

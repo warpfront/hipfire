@@ -1240,8 +1240,27 @@ pub mod wide {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Spec {
         pub x4: bool,
+        pub arch: Arch,
     }
     impl Spec {
+        /// Workgroup id x SGPR: right after the DECLARED user SGPRs (gfx1100 pads them so that
+        /// user + system >= 16, LLVM `FeatureUserSGPRInit16Bug`, which moves the ids to s14/s15).
+        pub const fn sw(&self) -> u8 {
+            self.arch.declared_user_sgprs(USER_SGPRS, SYSTEM_SGPRS)
+        }
+        /// Rowtile system workgroup id y, the SGPR after [`Spec::sw`].
+        pub const fn tile_y(&self) -> u8 {
+            self.sw() + 1
+        }
+        /// x4 weight pointers `A0..A3` (s[8:15] on gfx1151). On gfx1100 s14/s15 are the workgroup ids,
+        /// so they live in an aligned block above every other SGPR.
+        pub const fn pa(&self) -> u8 {
+            if self.sw() == USER_SGPRS {
+                8
+            } else {
+                PA_PADDED
+            }
+        }
         /// Physical tile rows; total logical rows live in the `R` kernarg.
         pub const fn cap(&self) -> u8 {
             8
@@ -1258,11 +1277,14 @@ pub mod wide {
         }
     }
 
-    // SGPRs. s0:1 kernarg, s2 workgroup id x (`user_sgpr_count = 2`).
+    // SGPRs. s0:1 kernarg (`user_sgpr_count = 2`); workgroup ids x, y follow the declared
+    // user SGPRs (s2, s3; gfx1100: s14, s15, see `Spec::sw`).
+    const USER_SGPRS: u8 = 2;
+    const SYSTEM_SGPRS: u8 = 2;
     const KARG: u8 = 0;
-    const SW: u8 = 2;
     const SRD: u8 = 4;
-    const PA: u8 = 8;
+    /// gfx1100 x4 weight-pointer block (the gfx1151 `s[8:15]` collides with the padded ids).
+    const PA_PADDED: u8 = 64;
     const PXY: u8 = 16;
     const XP: u8 = 16;
     const Y0: u8 = 18;
@@ -1296,8 +1318,7 @@ pub mod wide {
     const STMP: u8 = 51;
     const SVAL: u8 = 52;
     const R0B: u8 = 53;
-    /// Rowtile-only system workgroup id y and its logical row origin.
-    const TILE_Y: u8 = 3;
+    /// Rowtile logical row origin.
     const TILE_ROW: u8 = 54;
     /// `XT[t] = (8t + wave) * K * 4`: byte offset of tile `t`'s producer row.
     const XT: u8 = 56;
@@ -1334,8 +1355,13 @@ pub mod wide {
         usize::from(ACC0) + 4 * usize::from(cap)
     }
     /// High-water SGPR index + 1.
-    fn sgpr_high_water() -> usize {
-        usize::from(XT) + 4
+    fn sgpr_high_water(spec: Spec) -> usize {
+        let top = usize::from(XT) + 4;
+        if spec.x4 {
+            top.max(usize::from(spec.pa()) + 8)
+        } else {
+            top
+        }
     }
     fn acc(row: u32, stream: u32) -> u8 {
         let n = usize::from(ACC0) + 4 * row as usize + stream as usize;
@@ -1353,7 +1379,7 @@ pub mod wide {
                 spec.vgpr_budget()
             ));
         }
-        let sw = sgpr_high_water();
+        let sw = sgpr_high_water(spec);
         if sw > usize::from(SGPR_BUDGET) {
             return Err(format!(
                 "mq6 wide needs {sw} SGPRs (> budget {SGPR_BUDGET})"
@@ -1381,14 +1407,14 @@ pub mod wide {
         let mut regs = RegPlan::new(spec.vgpr_budget(), SGPR_BUDGET)?;
         let mut s_ranges: Vec<(&str, u8, u8)> = vec![
             ("kernarg", KARG, 2),
-            ("workgroup_id", SW, 1),
+            ("workgroup_id", spec.sw(), 1),
             ("weight_resource", SRD, 4),
-            ("workgroup_id_y", TILE_Y, 1),
+            ("workgroup_id_y", spec.tile_y(), 1),
             ("tile_row", TILE_ROW, 1),
         ];
         if spec.x4 {
             s_ranges.extend([
-                ("weight_pointers", PA, 8),
+                ("weight_pointers", spec.pa(), 8),
                 ("x_y_pointers", PXY, 8),
                 ("y3_m01", Y3, 4),
                 ("m23_k_r", M2, 4),
@@ -1464,7 +1490,7 @@ pub mod wide {
                 arch.name()
             ));
         }
-        emit_impl(Spec { x4 }, arch)
+        emit_impl(Spec { x4, arch }, arch)
     }
 
     fn emit_impl(spec: Spec, arch: Arch) -> Result<Emitted, String> {
@@ -1501,13 +1527,19 @@ pub mod wide {
                 arch.name()
             ),
             kernargs,
-            user_sgpr_count: 2,
+            user_sgpr_count: USER_SGPRS,
             system_sgpr_workgroup_id_y: true,
             workgroup_size: BLOCK,
             group_segment_fixed_size: LDS_BYTES,
             wave32: true,
             cu_mode: false,
         };
+        let ids = kspec.workgroup_ids(false)?;
+        if ids.x != crate::arch::WgIdSource::Sgpr(spec.sw())
+            || ids.y != crate::arch::WgIdSource::Sgpr(spec.tile_y())
+        {
+            return Err(format!("mq6 rowtile workgroup ids moved: {ids:?}"));
+        }
         let regs = plan_impl(spec)?;
         let mut b = Builder::new(kspec, regs);
         b.enable_delay_alu();
@@ -1573,8 +1605,9 @@ pub mod wide {
     }
 
     fn prologue(b: &mut Builder, spec: Spec) -> R {
+        let (sw, tile_y) = (spec.sw(), spec.tile_y());
         if spec.x4 {
-            smem(b, PA, 8, KARG, 0)?;
+            smem(b, spec.pa(), 8, KARG, 0)?;
             smem(b, PXY, 8, KARG, 32)?;
             smem(b, Y3, 4, KARG, 64)?;
             smem(b, M2, 4, KARG, 80)?;
@@ -1664,14 +1697,14 @@ pub mod wide {
         }
         // Workgroups past the sum return; so does an R outside 1..=64 (all
         // uniform, before the first barrier).
-        sop(b, format!("s_cmp_ge_u32 s{SW}, s{CP3}"), &[], &[SW, CP3])?;
+        sop(b, format!("s_cmp_ge_u32 s{sw}, s{CP3}"), &[], &[sw, CP3])?;
         branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "end")))?;
         sop(b, format!("s_cmp_eq_u32 s{SR}, 0"), &[], &[SR])?;
         branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "end")))?;
         sop(b, format!("s_cmp_gt_u32 s{SR}, 64"), &[], &[SR])?;
         branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "end")))?;
         if spec.x4 {
-            route(b)?;
+            route(b, spec)?;
         } else {
             sop(b, format!("s_mov_b32 s{SBASE}, 0"), &[SBASE], &[])?;
         }
@@ -1685,15 +1718,15 @@ pub mod wide {
         )?;
         sop(b, format!("s_cmp_lg_u32 s{TMP}, 0"), &[], &[TMP])?;
         branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "end")))?;
-        sop(b, format!("s_cmp_ge_u32 s{TILE_Y}, 8"), &[], &[TILE_Y])?;
+        sop(b, format!("s_cmp_ge_u32 s{tile_y}, 8"), &[], &[tile_y])?;
         branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "end")))?;
         // Uniformly reject dead grid-y tiles before any barrier. Convert
         // total R to this tile's live count; all body guards stay local.
         sop(
             b,
-            format!("s_lshl_b32 s{TILE_ROW}, s{TILE_Y}, 3"),
+            format!("s_lshl_b32 s{TILE_ROW}, s{tile_y}, 3"),
             &[TILE_ROW],
-            &[TILE_Y],
+            &[tile_y],
         )?;
         sop(
             b,
@@ -1735,9 +1768,9 @@ pub mod wide {
         // This wave's matrix-local column m = 8*(w - base) + wave, and whether it exists.
         sop(
             b,
-            format!("s_sub_i32 s{ROW0}, s{SW}, s{SBASE}"),
+            format!("s_sub_i32 s{ROW0}, s{sw}, s{SBASE}"),
             &[ROW0],
-            &[SW, SBASE],
+            &[sw, SBASE],
         )?;
         sop(
             b,
@@ -1808,22 +1841,23 @@ pub mod wide {
 
     /// x4: workgroup `w` -> the first matrix `i` with `w < end_i` (prefix sums
     /// of `ceil(max(Mi,0)/8)`): its A/y/M and the base workgroup of the matrix.
-    fn route(b: &mut Builder) -> R {
+    fn route(b: &mut Builder, spec: Spec) -> R {
+        let (sw, pa) = (spec.sw(), spec.pa());
         let pair = |n: u8| sr(n, 2);
         // Matrix 3, then matrices 2, 1, 0 override it while `w < end_i`.
-        sop(b, format!("s_cmp_lt_u32 s{SW}, s{CP2}"), &[], &[SW, CP2])?;
+        sop(b, format!("s_cmp_lt_u32 s{sw}, s{CP2}"), &[], &[sw, CP2])?;
         op(
             b,
             format!(
                 "s_cselect_b64 s[{SRD}:{}], s[{}:{}], s[{}:{}]",
                 SRD + 1,
-                PA + 4,
-                PA + 5,
-                PA + 6,
-                PA + 7
+                pa + 4,
+                pa + 5,
+                pa + 6,
+                pa + 7
             ),
             &[pair(SRD)],
-            &[pair(PA + 4), pair(PA + 6)],
+            &[pair(pa + 4), pair(pa + 6)],
         )?;
         op(
             b,
@@ -1848,18 +1882,18 @@ pub mod wide {
             &[SBASE],
             &[CP1, CP2],
         )?;
-        sop(b, format!("s_cmp_lt_u32 s{SW}, s{CP1}"), &[], &[SW, CP1])?;
+        sop(b, format!("s_cmp_lt_u32 s{sw}, s{CP1}"), &[], &[sw, CP1])?;
         op(
             b,
             format!(
                 "s_cselect_b64 s[{SRD}:{}], s[{}:{}], s[{SRD}:{}]",
                 SRD + 1,
-                PA + 2,
-                PA + 3,
+                pa + 2,
+                pa + 3,
                 SRD + 1
             ),
             &[pair(SRD)],
-            &[pair(PA + 2), pair(SRD)],
+            &[pair(pa + 2), pair(SRD)],
         )?;
         op(
             b,
@@ -1884,17 +1918,17 @@ pub mod wide {
             &[SBASE],
             &[CP0, SBASE],
         )?;
-        sop(b, format!("s_cmp_lt_u32 s{SW}, s{CP0}"), &[], &[SW, CP0])?;
+        sop(b, format!("s_cmp_lt_u32 s{sw}, s{CP0}"), &[], &[sw, CP0])?;
         op(
             b,
             format!(
-                "s_cselect_b64 s[{SRD}:{}], s[{PA}:{}], s[{SRD}:{}]",
+                "s_cselect_b64 s[{SRD}:{}], s[{pa}:{}], s[{SRD}:{}]",
                 SRD + 1,
-                PA + 1,
+                pa + 1,
                 SRD + 1
             ),
             &[pair(SRD)],
-            &[pair(PA), pair(SRD)],
+            &[pair(pa), pair(SRD)],
         )?;
         op(
             b,
@@ -2370,7 +2404,12 @@ pub mod wide {
         fn rowtiles_keep_fixed_resources_and_halo_operand_order() {
             assert_eq!(vgpr_high_water(8), 72);
             for x4 in [false, true] {
-                plan_impl(Spec { x4 }).expect("fixed8 plan");
+                let spec = Spec {
+                    x4,
+                    arch: Arch::Gfx1151,
+                };
+                plan_impl(spec).expect("fixed8 plan");
+                let tile_y = spec.tile_y();
                 let e = emit_rowtiles(x4).expect("rowtile emission");
                 let symbol = format!(
                     "gemv_mq6g256v2_rows_{}t8_pm_gfx1151",
@@ -2381,7 +2420,7 @@ pub mod wide {
                     ".amdhsa_system_sgpr_workgroup_id_y 1".into(),
                     ".amdhsa_group_segment_fixed_size 8192".into(),
                     format!("s_cmp_gt_u32 s{SR}, 64"),
-                    format!("s_lshl_b32 s{TILE_ROW}, s{TILE_Y}, 3"),
+                    format!("s_lshl_b32 s{TILE_ROW}, s{tile_y}, 3"),
                     format!("s_sub_u32 s{SR}, s{SR}, s{TILE_ROW}"),
                     format!("s_min_u32 s{SR}, s{SR}, 8"),
                     format!("v_mul_f32_e32 v{DOT}, v{}, v{}", WS + 1, XS + 1),
@@ -2396,7 +2435,7 @@ pub mod wide {
                 for guard in [
                     format!("s_cmp_eq_u32 s{SR}, 0"),
                     format!("s_cmp_gt_u32 s{SR}, 64"),
-                    format!("s_cmp_ge_u32 s{TILE_Y}, 8"),
+                    format!("s_cmp_ge_u32 s{tile_y}, 8"),
                     format!("s_cmp_ge_u32 s{TILE_ROW}, s{SR}"),
                     format!("s_and_b32 s{TMP}, s{SK}, {}", lit(255)),
                 ] {
@@ -2432,6 +2471,16 @@ pub mod wide {
                 );
                 assert_eq!(e.proof.arch, Arch::Gfx1100);
                 assert_eq!(e.shape.next_free_vgpr, 72);
+                // FeatureUserSGPRInit16Bug: 14 padded user + 2 system SGPRs; ids s14/s15.
+                let spec = Spec {
+                    x4,
+                    arch: Arch::Gfx1100,
+                };
+                assert_eq!((spec.sw(), spec.tile_y()), (14, 15));
+                assert!(e.s_text.contains(".amdhsa_user_sgpr_count 14\n"));
+                assert!(e.s_text.contains("s_lshl_b32 s54, s15, 3\n"));
+                assert!(e.s_text.contains("s_cmp_ge_u32 s15, 8\n"));
+                assert_eq!(spec.pa(), PA_PADDED);
                 assert!(e.shape.next_free_sgpr <= SGPR_BUDGET);
                 for text in [
                     format!("{symbol}:"),
@@ -2557,7 +2606,10 @@ pub mod wide {
         fn register_ceilings_hold_in_rowtile_arithmetic() {
             assert_eq!(vgpr_high_water(8), 72);
             for x4 in [false, true] {
-                let spec = Spec { x4 };
+                let spec = Spec {
+                    x4,
+                    arch: Arch::Gfx1151,
+                };
                 layout(spec).expect("fits");
                 assert!(vgpr_high_water(8) <= usize::from(spec.vgpr_budget()));
                 // The last accumulator is addressable as u8 and the plan accepts the layout.
@@ -2567,7 +2619,14 @@ pub mod wide {
                 );
                 plan_impl(spec).expect("plan");
             }
-            assert!(sgpr_high_water() <= usize::from(SGPR_BUDGET));
+            for arch in [Arch::Gfx1151, Arch::Gfx1100] {
+                for x4 in [false, true] {
+                    let spec = Spec { x4, arch };
+                    assert!(sgpr_high_water(spec) <= usize::from(SGPR_BUDGET));
+                    layout(spec).expect("fits");
+                    plan_impl(spec).expect("plan");
+                }
+            }
             assert_eq!(usize::from(vgpr_high_water(8)), 72);
             // LDS address registers, weights, X slots, temps and accumulators are disjoint.
             assert_eq!(usize::from(TS) + 8, usize::from(ACC0));

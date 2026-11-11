@@ -678,6 +678,26 @@ impl SingleQueuePm4Ib {
     }
 
     unsafe fn replay_and_wait_inner_checked(&mut self) -> Result<(), (ReplayError, Quiescence)> {
+        // SAFETY: forwarded from this method's caller.
+        unsafe { self.replay_submit_checked()? };
+        self.wait_replay_checked()
+    }
+
+    /// Publish one replay of the retained indirect buffer and return without
+    /// waiting: the first half of [`Self::replay_and_wait_checked`], with the
+    /// same state transitions on failure. `Ok(())` means the replay is in
+    /// flight ([`Self::in_flight`]); quiescence is only reached by
+    /// [`Self::wait_replay_checked`], [`Self::quiesce`] or drop. Until then the
+    /// queue refuses another replay (`AlreadyInFlight`).
+    ///
+    /// # Safety
+    ///
+    /// All code, kernarg, and pointee addresses encoded in the retained IB
+    /// must remain live and GPU-accessible until a later
+    /// [`Self::wait_replay_checked`] returns `Ok` (or, after any error, through
+    /// this object's destruction), and no host write to the memory the IB
+    /// reads may race the in-flight replay.
+    pub unsafe fn replay_submit_checked(&mut self) -> Result<(), (ReplayError, Quiescence)> {
         if !self.usable {
             return Err((ReplayError::GraphInactive, Quiescence::Proven));
         }
@@ -707,6 +727,28 @@ impl SingleQueuePm4Ib {
             );
             return Err((error.into(), Quiescence::Proven));
         }
+        Ok(())
+    }
+
+    /// `true` when [`Self::wait_replay_checked`] would return without
+    /// polling: no replay is in flight, the completion signal has reached
+    /// zero, or a queue fault is latched (the wait reports it). Non-blocking;
+    /// it changes no state, so quiescence is still only established by the
+    /// wait.
+    pub fn replay_complete(&self) -> bool {
+        !self.in_flight || self.completion.is_complete() || self.queues.check_faults().is_err()
+    }
+
+    /// Wait, with the finite default bound, for the replay published by
+    /// [`Self::replay_submit_checked`]: the second half of
+    /// [`Self::replay_and_wait_checked`] with unchanged timeout, watchdog
+    /// and quiescence semantics. `Ok(())` immediately when no replay is in
+    /// flight. On timeout or queue fault the queues are inactivated and the
+    /// error carries `Proven` only when that teardown succeeded.
+    pub fn wait_replay_checked(&mut self) -> Result<(), (ReplayError, Quiescence)> {
+        if !self.in_flight {
+            return Ok(());
+        }
         match self
             .queues
             .wait_signal(&self.completion, DEFAULT_WAIT_TIMEOUT)
@@ -719,39 +761,147 @@ impl SingleQueuePm4Ib {
                 );
                 Ok(())
             }
-            Err(operation) => {
-                if let Some((start_tick, end_tick)) = self.timestamp_progress() {
-                    eprintln!(
-                        "HIPFIRE_REDLINE_PM4_PROGRESS start_tick={start_tick} end_tick={end_tick}"
-                    );
-                }
-                match self.queues.inactivate_all() {
-                    Ok(()) => {
-                        apply_quiescence_transition(
-                            &mut self.in_flight,
-                            &mut self.usable,
-                            QuiescenceTransition::Cancelled,
-                        );
-                        Err((operation.into(), Quiescence::Proven))
+            Err(operation) => self.teardown_after_wait_failure(operation),
+        }
+    }
+
+    /// Shared timeout/fault teardown: report progress, inactivate every
+    /// queue, and record the resulting quiescence transition.
+    fn teardown_after_wait_failure(
+        &mut self,
+        operation: RuntimeError,
+    ) -> Result<(), (ReplayError, Quiescence)> {
+        if let Some((start_tick, end_tick)) = self.timestamp_progress() {
+            eprintln!("HIPFIRE_REDLINE_PM4_PROGRESS start_tick={start_tick} end_tick={end_tick}");
+        }
+        match self.queues.inactivate_all() {
+            Ok(()) => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Cancelled,
+                );
+                Err((operation.into(), Quiescence::Proven))
+            }
+            Err(teardown) => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Failed,
+                );
+                Err((
+                    RuntimeError::OperationAndTeardown {
+                        operation: Box::new(operation),
+                        teardown: Box::new(teardown),
                     }
-                    Err(teardown) => {
-                        apply_quiescence_transition(
-                            &mut self.in_flight,
-                            &mut self.usable,
-                            QuiescenceTransition::Failed,
-                        );
-                        Err((
-                            RuntimeError::OperationAndTeardown {
-                                operation: Box::new(operation),
-                                teardown: Box::new(teardown),
-                            }
-                            .into(),
-                            Quiescence::Unknown,
-                        ))
-                    }
-                }
+                    .into(),
+                    Quiescence::Unknown,
+                ))
             }
         }
+    }
+
+    /// Like [`Self::wait_replay_checked`] with a caller `timeout`, but a plain
+    /// timeout is not a failure: it returns `Ok(ReplayWait::Pending)` with no
+    /// inactivation and no state change (the replay stays in flight). Not in
+    /// flight returns `Ok(Complete)`; a signal that reached zero applies the
+    /// `Completed` transition. Any other error (queue fault) takes the same
+    /// teardown path as [`Self::wait_replay_checked`].
+    pub fn wait_replay_bounded_checked(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ReplayWait, (ReplayError, Quiescence)> {
+        if !self.in_flight {
+            return Ok(ReplayWait::Complete);
+        }
+        match classify_bounded_wait(self.queues.wait_signal(&self.completion, timeout)) {
+            BoundedWait::Complete => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Completed,
+                );
+                Ok(ReplayWait::Complete)
+            }
+            BoundedWait::Timeout => Ok(ReplayWait::Pending),
+            BoundedWait::Fault(operation) => self
+                .teardown_after_wait_failure(operation)
+                .map(|()| ReplayWait::Complete),
+        }
+    }
+
+    /// Cancel the in-flight replay: inactivate every queue (an error records
+    /// the `Failed` transition and is returned), record `Cancelled`, then poll
+    /// the completion signal for up to `observe`.
+    ///
+    /// Evidence rule: the only in-tree statement about `hsa_queue_inactivate`
+    /// (redline-rocr `runtime.rs`, `inactivate_all`) is that inactivation
+    /// aborts pending executions and has no public wall-clock bound; it does
+    /// not say all waves are retired on return. So
+    /// [`CancelEvidence::RetirementObserved`] is reported only when the same
+    /// end-of-pipe completion signal that proves normal quiescence reached
+    /// zero after inactivation; otherwise [`CancelEvidence::InactivatedOnly`],
+    /// which callers must treat as `Quiescence::Unknown`. Not in flight
+    /// returns `RetirementObserved`.
+    pub fn cancel_replay_observed(
+        &mut self,
+        observe: Duration,
+    ) -> Result<CancelEvidence, ReplayError> {
+        if !self.in_flight {
+            return Ok(CancelEvidence::RetirementObserved);
+        }
+        if let Err(error) = self.queues.inactivate_all() {
+            apply_quiescence_transition(
+                &mut self.in_flight,
+                &mut self.usable,
+                QuiescenceTransition::Failed,
+            );
+            return Err(error.into());
+        }
+        apply_quiescence_transition(
+            &mut self.in_flight,
+            &mut self.usable,
+            QuiescenceTransition::Cancelled,
+        );
+        Ok(cancel_evidence(
+            self.queues.wait_signal(&self.completion, observe),
+        ))
+    }
+}
+
+/// Outcome of [`SingleQueuePm4Ib::wait_replay_bounded_checked`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplayWait {
+    Complete,
+    Pending,
+}
+
+/// What [`SingleQueuePm4Ib::cancel_replay_observed`] could prove.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelEvidence {
+    RetirementObserved,
+    InactivatedOnly,
+}
+
+#[derive(Debug)]
+enum BoundedWait {
+    Complete,
+    Timeout,
+    Fault(RuntimeError),
+}
+
+fn classify_bounded_wait(result: Result<(), RuntimeError>) -> BoundedWait {
+    match result {
+        Ok(()) => BoundedWait::Complete,
+        Err(RuntimeError::SignalTimeout { .. }) => BoundedWait::Timeout,
+        Err(other) => BoundedWait::Fault(other),
+    }
+}
+
+fn cancel_evidence(observed: Result<(), RuntimeError>) -> CancelEvidence {
+    match observed {
+        Ok(()) => CancelEvidence::RetirementObserved,
+        Err(_) => CancelEvidence::InactivatedOnly,
     }
 }
 
@@ -3575,6 +3725,66 @@ mod tests {
     }
 
     #[test]
+    fn gfx11_builder_streams_decode_and_patch_in_workgroup_counts() {
+        use redline_rocr::{Gfx10KernelImage, Gfx10Pm4CommandBuffer};
+        let image = Gfx10KernelImage {
+            code_entry: 0x1_0000_0000,
+            compute_pgm_rsrc1: 0x60af_0000,
+            compute_pgm_rsrc2: 0x84,
+            compute_pgm_rsrc3: 0,
+            group_segment_size: 0,
+            private_segment_size: 0,
+            dynamic_callstack: false,
+            wave32: true,
+            kernel_code_properties: 1 << 10,
+        };
+        let mut commands = Gfx10Pm4CommandBuffer::new_stateful();
+        for (grid, block) in [([5, 2, 1], [256, 1, 1]), ([96, 1, 1], [128, 1, 1])] {
+            commands
+                .dispatch_image(
+                    &image,
+                    crate::aql::LaunchGeometry::from_hip_workgroups(grid, block).unwrap(),
+                    0,
+                    &[0x1000, 0],
+                )
+                .unwrap();
+            commands.wait_compute_idle();
+        }
+        let mut bytes = commands
+            .dwords()
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        // gfx10/gfx11 `DISPATCH_DIRECT` carries workgroup COUNTS, and the
+        // workgroup size in force comes from COMPUTE_NUM_THREAD.
+        let decoded = decode_pm4_dispatches(&bytes).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].dimensions, [5, 2, 1]);
+        assert_eq!(decoded[0].workgroup, Some([256, 1, 1]));
+        assert_eq!(decoded[1].dimensions, [96, 1, 1]);
+        assert_eq!(decoded[1].workgroup, Some([128, 1, 1]));
+        // The patch offsets address exactly those three dimension dwords.
+        let offsets = pm4_dispatch_workgroup_offsets(&bytes).unwrap();
+        assert_eq!(offsets.len(), 2);
+        for (&offset, want) in offsets.iter().zip([[5u32, 2, 1], [96, 1, 1]]) {
+            let got: Vec<u32> = bytes[offset..offset + 12]
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                .collect();
+            assert_eq!(got, want);
+        }
+        // Patching the first dispatch's workgroup counts changes only it.
+        for (axis, value) in [9u32, 3, 1].into_iter().enumerate() {
+            bytes[offsets[0] + axis * 4..offsets[0] + axis * 4 + 4]
+                .copy_from_slice(&value.to_le_bytes());
+        }
+        let decoded = decode_pm4_dispatches(&bytes).unwrap();
+        assert_eq!(decoded[0].dimensions, [9, 3, 1]);
+        assert_eq!(decoded[1].dimensions, [96, 1, 1]);
+        assert_eq!(decoded[0].workgroup, Some([256, 1, 1]));
+    }
+
+    #[test]
     fn decoded_dispatches_carry_the_workgroup_size_in_force() {
         // SET NUM_THREAD (64,2,1); dispatch; SET only X (a cached/elided
         // register run keeps Y,Z); dispatch.
@@ -3772,5 +3982,68 @@ mod tests {
         assert!(!in_flight);
         // Still unusable (needs re-prepare), but quiescence now Proven so safe to free/reprepare
         assert!(!usable);
+    }
+
+    #[test]
+    fn bounded_wait_classifies_timeout_fault_and_completion() {
+        assert!(matches!(
+            classify_bounded_wait(Ok(())),
+            BoundedWait::Complete
+        ));
+        assert!(matches!(
+            classify_bounded_wait(Err(RuntimeError::SignalTimeout {
+                signal: 1,
+                timeout: Duration::from_millis(1),
+            })),
+            BoundedWait::Timeout
+        ));
+        assert!(matches!(
+            classify_bounded_wait(Err(RuntimeError::QueueInactive { queue_id: 7 })),
+            BoundedWait::Fault(RuntimeError::QueueInactive { queue_id: 7 })
+        ));
+    }
+
+    #[test]
+    fn pending_bounded_wait_applies_no_transition() {
+        let (mut in_flight, mut usable) = (true, true);
+        // Pending applies no transition: state is exactly as before.
+        if let BoundedWait::Timeout = classify_bounded_wait(Err(RuntimeError::SignalTimeout {
+            signal: 1,
+            timeout: Duration::ZERO,
+        })) {
+            // no apply_quiescence_transition call
+        } else {
+            apply_quiescence_transition(
+                &mut in_flight,
+                &mut usable,
+                QuiescenceTransition::Completed,
+            );
+        }
+        assert!(in_flight);
+        assert!(usable);
+    }
+
+    #[test]
+    fn cancel_transitions_clear_or_keep_in_flight() {
+        let (mut in_flight, mut usable) = (true, true);
+        apply_quiescence_transition(&mut in_flight, &mut usable, QuiescenceTransition::Cancelled);
+        assert!(!in_flight);
+        assert!(!usable);
+        let (mut in_flight, mut usable) = (true, true);
+        apply_quiescence_transition(&mut in_flight, &mut usable, QuiescenceTransition::Failed);
+        assert!(in_flight);
+        assert!(!usable);
+    }
+
+    #[test]
+    fn cancel_evidence_requires_signal_reaching_zero() {
+        assert_eq!(cancel_evidence(Ok(())), CancelEvidence::RetirementObserved);
+        assert_eq!(
+            cancel_evidence(Err(RuntimeError::SignalTimeout {
+                signal: 1,
+                timeout: Duration::ZERO,
+            })),
+            CancelEvidence::InactivatedOnly
+        );
     }
 }

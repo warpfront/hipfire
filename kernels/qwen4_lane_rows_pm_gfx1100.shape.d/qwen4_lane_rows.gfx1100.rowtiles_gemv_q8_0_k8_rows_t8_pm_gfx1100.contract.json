@@ -1,5 +1,5 @@
 {
-  "amdgpu_metadata": "---\namdhsa.kernels:\n  - .args:\n      - .actual_access: read_only\n        .address_space: global\n        .name: A\n        .offset: 0\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: read_only\n        .address_space: global\n        .name: x\n        .offset: 8\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: write_only\n        .address_space: global\n        .name: y\n        .offset: 16\n        .size: 8\n        .value_kind: global_buffer\n      - \n        .name: M\n        .offset: 24\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: K\n        .offset: 28\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: R\n        .offset: 32\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: scale\n        .offset: 36\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: hc_act\n        .offset: 40\n        .size: 4\n        .value_kind: by_value\n    .group_segment_fixed_size: 16384\n    .kernarg_segment_align: 8\n    .kernarg_segment_size: 44\n    .max_flat_workgroup_size: 512\n    .name: gemv_q8_0_k8_rows_t8_pm_gfx1100\n    .private_segment_fixed_size: 0\n    .sgpr_count: 51\n    .sgpr_spill_count: 0\n    .symbol: gemv_q8_0_k8_rows_t8_pm_gfx1100.kd\n    .uniform_work_group_size: 1\n    .uses_dynamic_stack: false\n    .vgpr_count: 48\n    .vgpr_spill_count: 0\n    .wavefront_size: 32\n    .workgroup_processor_mode: 1\namdhsa.target: amdgcn-amd-amdhsa--gfx1100\namdhsa.version: [1, 2]\n...\n.end_amdgpu_metadata\n.text\n\t.p2alignl 7, 3214868480\n\t.fill 96, 4, 3214868480\n",
+  "amdgpu_metadata": "---\namdhsa.kernels:\n  - .args:\n      - .actual_access: read_only\n        .address_space: global\n        .name: A\n        .offset: 0\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: read_only\n        .address_space: global\n        .name: x\n        .offset: 8\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: write_only\n        .address_space: global\n        .name: y\n        .offset: 16\n        .size: 8\n        .value_kind: global_buffer\n      - \n        .name: M\n        .offset: 24\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: K\n        .offset: 28\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: R\n        .offset: 32\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: scale\n        .offset: 36\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: hc_act\n        .offset: 40\n        .size: 4\n        .value_kind: by_value\n    .group_segment_fixed_size: 16384\n    .kernarg_segment_align: 8\n    .kernarg_segment_size: 44\n    .max_flat_workgroup_size: 512\n    .name: gemv_q8_0_k8_rows_t8_pm_gfx1100\n    .private_segment_fixed_size: 0\n    .sgpr_count: 53\n    .sgpr_spill_count: 0\n    .symbol: gemv_q8_0_k8_rows_t8_pm_gfx1100.kd\n    .uniform_work_group_size: 1\n    .uses_dynamic_stack: false\n    .vgpr_count: 48\n    .vgpr_spill_count: 0\n    .wavefront_size: 32\n    .workgroup_processor_mode: 1\namdhsa.target: amdgcn-amd-amdhsa--gfx1100\namdhsa.version: [1, 2]\n...\n.end_amdgpu_metadata\n.text\n\t.p2alignl 7, 3214868480\n\t.fill 96, 4, 3214868480\n",
   "arch": "gfx1100",
   "arithmetic_recipe": "gfx1100 actual HC singleton, eight fixed K partitions",
   "builder_proof": {
@@ -2201,7 +2201,7 @@
         "iterations": 2
       }
     ],
-    "next_free_sgpr": 49,
+    "next_free_sgpr": 51,
     "next_free_vgpr": 48,
     "reg_plan": [
       {
@@ -2212,7 +2212,7 @@
         "name": "kernarg_ptr0"
       },
       {
-        "base": 2,
+        "base": 14,
         "kind": "s",
         "len": 1,
         "live": "Whole",
@@ -2240,7 +2240,7 @@
         "name": "m_k0"
       },
       {
-        "base": 3,
+        "base": 15,
         "kind": "s",
         "len": 1,
         "live": "Whole",
@@ -2254,14 +2254,14 @@
         "name": "r_scale0"
       },
       {
-        "base": 14,
+        "base": 50,
         "kind": "s",
         "len": 1,
         "live": "Whole",
         "name": "hc_act0"
       },
       {
-        "base": 15,
+        "base": 49,
         "kind": "s",
         "len": 1,
         "live": "Whole",
@@ -2520,7 +2520,7 @@
         "name": "accumulators0"
       }
     ],
-    "s_text_sha256": "872d2ecd5658011902efe81db058455de1b51b105390944ce0a7512211fde4b5",
+    "s_text_sha256": "e1988f26e815d2f74b1a88ab4a08fb2811061863b01530a33006a2d059c5f2ab",
     "variant": "rowtiles_gemv_q8_0_k8_rows_t8_pm_gfx1100",
     "vopd_pairs": 0,
     "waits": [
@@ -8782,7 +8782,7 @@
     "barriers": 65,
     "ds": 482,
     "instructions": 2815,
-    "next_free_sgpr": 49,
+    "next_free_sgpr": 51,
     "next_free_vgpr": 48,
     "valu_slots": 538,
     "vmem": 217,
@@ -8814,7 +8814,7 @@
   "require_wave32": true,
   "require_zero_private": true,
   "require_zero_spills": true,
-  "sgpr_max": 49,
+  "sgpr_max": 51,
   "shape_domain": {
     "K": "K>0 && K%256==0"
   },

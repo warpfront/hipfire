@@ -12,6 +12,9 @@ certify = ["peacemaker-isa/toolchain"]
 # The `hw_diff` example only. Keeps the GPU launcher and its `hip-bridge`
 # dev-dependency out of the default build (`ungated_examples` ratchet).
 hw-diff = []
+# The `rip_l1` example only: the edit -> offline-ready latency probe of a
+# script-native body (emit, link, M7, twin, CPU-emulator differential).
+l1 = ["certify"]
 
 [dependencies]
 peacemaker-isa = { path = "../peacemaker-isa" }
@@ -25,6 +28,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 hip-bridge = { path = "../hip-bridge" }
+sha2.workspace = true
 
 [[bin]]
 name = "peacemaker-rip"
@@ -34,3 +38,14 @@ path = "src/bin/peacemaker-rip.rs"
 name = "hw_diff"
 path = "examples/hw_diff.rs"
 required-features = ["hw-diff"]
+
+[[example]]
+name = "rip_l1"
+path = "examples/rip_l1.rs"
+required-features = ["l1"]
+
+# Verified kernel-variant search (S0-S4 on the CPU). Certification needs the toolchain.
+[[bin]]
+name = "rip-search"
+path = "src/bin/rip-search.rs"
+required-features = ["certify"]

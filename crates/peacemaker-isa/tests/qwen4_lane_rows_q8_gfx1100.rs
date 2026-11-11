@@ -222,6 +222,29 @@ fn five_exports_freeze_arch_abi_and_resources() {
     }
 }
 
+/// gfx1100 `FeatureUserSGPRInit16Bug` (LLVM): >= 16 user + system SGPRs, so the two kernarg SGPRs are padded
+/// to 14 user SGPRs and the workgroup ids x, y are s14, s15 (gfx1151: s2, s3). The wave index and the HC flag
+/// that used to sit in s15/s14 live above the old plan (s49/s50).
+#[test]
+fn workgroup_ids_follow_the_padded_user_sgprs() {
+    for (e, entry) in build_rowtiles_gfx1100().unwrap().iter().zip(ENTRIES) {
+        let t = &e.s_text;
+        let user = metadata_numbers(t, ".amdhsa_user_sgpr_count");
+        assert_eq!(user, [14], "{}", entry.symbol());
+        assert!(
+            u32::from(Arch::Gfx1100.min_user_system_sgprs()) <= user[0] + 2,
+            "{}",
+            entry.symbol()
+        );
+        for line in ["s_lshl_b32 s15, s15, 3\n", "v_readfirstlane_b32 s49, v13\n"] {
+            assert!(t.contains(line), "{}: {line}", entry.symbol());
+        }
+        assert!(!t.contains("s_lshl_b32 s3, s3, 3"), "{}", entry.symbol());
+        // `native::assemble` refuses a gfx1100 descriptor with user + system < 16.
+        peacemaker_isa::native::assemble(t, Arch::Gfx1100).expect("assemble");
+    }
+}
+
 const KA: u64 = 0x10000;
 // Every operand crosses a low-word boundary during live address arithmetic.
 const A: [u64; 2] = [0xffff_ffc0, 0x2_ffff_ffc0];

@@ -1294,7 +1294,8 @@ mod tests {
             "Accurate: not measured on this GPU."
         );
         assert!(line("developer.qwen4_moe_sym_iu4", "gfx1151", NotLanded).contains("36% closer"));
-        // Only Strix Halo was measured for Flash-Next experts.
+        // Strix Halo and the 7900 XTX were measured for Flash-Next experts.
+        assert!(line("developer.qwen4_moe_sym_iu4", "gfx1100", NotLanded).contains("closer"));
         assert_eq!(
             line("developer.qwen4_moe_sym_iu4", "gfx1201", NotLanded),
             "Accurate: not measured on this GPU."

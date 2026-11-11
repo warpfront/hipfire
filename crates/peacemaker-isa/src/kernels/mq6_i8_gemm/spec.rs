@@ -3,6 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Variant axes and fixed geometry of the MQ6G256V2 x `block_i8_128` GEMM.
+pub use crate::kernels::iu4_gemm::RingDepth;
 use crate::{kernels::iu4_k1::Variant, Arch, KernargLayout};
 
 /// Epilogue: F32 overwrite, BF16 bits (`isfinite(v) ? RNE : u >> 16`, `v = 0 + y`), or F32 overwrite of
@@ -46,12 +47,30 @@ pub enum Tile {
     T256x128,
     T128x256,
 }
+/// Generator knobs that leave the product's math unchanged: scheduling only, every result bit
+/// equals the default's. The default is today's exact codegen (every emitted byte, register map
+/// and LDS map of a default-`Tune` spec is unchanged).
+///
+/// `ring` is the depth of the A/W payload rings (the DS/SZ metadata planes stay two-deep):
+/// `Two` is the shipped schedule; `Three` publishes two slabs ahead (two raw prefetch register
+/// sets, three A/W slabs in LDS, the K-loop unrolled over a three-group period; see
+/// [`ring3_budget`] for what it costs and [`Spec::validate`] for where it fits).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Tune {
+    pub ring: RingDepth,
+}
+impl Tune {
+    pub fn is_default(self) -> bool {
+        self == Self::default()
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Spec {
     pub epi: Epi,
     pub raster: Raster,
     pub tile: Tile,
     pub arch: Arch,
+    pub tune: Tune,
 }
 
 /// The shipped tile: 128 weight rows x 128 tokens x 8 waves (32 rows x 64 tokens per wave). The
@@ -102,6 +121,87 @@ pub const LAYOUT: Layout = Layout {
 /// The dynamic LDS bytes the shipped tile's launch must pass (the same figure as the hipcc
 /// twin's `MQ6_I8_GFX12_LDS_BYTES`); see [`Tile::layout`] for the others.
 pub const LAUNCH_LDS_BYTES: u32 = 36864;
+
+impl Layout {
+    /// Base of A slab buffer `slot`: `0`, `1` of every layout, and `2`, the third buffer of a depth-3
+    /// ring, placed after the depth-2 launch region (so the depth-2 buffers keep their offsets).
+    pub fn a_slot(&self, slot: usize) -> Result<u32, String> {
+        match slot {
+            0 | 1 => Ok(self.a[slot]),
+            2 => Ok(self.launch),
+            _ => Err(format!("A slab buffer {slot} out of range (0..3)")),
+        }
+    }
+    /// Base of W slab buffer `slot` (see [`Layout::a_slot`]; the third buffer follows the third A).
+    pub fn w_slot(&self, slot: usize) -> Result<u32, String> {
+        match slot {
+            0 | 1 => Ok(self.w[slot]),
+            2 => Ok(self.launch + self.a_bytes),
+            _ => Err(format!("W slab buffer {slot} out of range (0..3)")),
+        }
+    }
+    /// The dynamic LDS bytes of a launch whose A/W rings are `depth` deep (`2` or `3`).
+    pub fn launch_for(&self, depth: RingDepth) -> u32 {
+        match depth {
+            RingDepth::Two => self.launch,
+            RingDepth::Three => self.launch + self.a_bytes + self.w_bytes,
+        }
+    }
+}
+
+/// gfx1201 limits the depth-3 legality check reads: the per-workgroup LDS limit, the LDS of a
+/// WGP, the VGPRs of a SIMD32 (wave32), and the architectural VGPRs per lane.
+pub const WG_LDS_LIMIT: u32 = 65536;
+pub const WGP_LDS: u32 = 131072;
+pub const SIMD_VGPRS: u32 = 1536;
+pub const VGPR_ARCH_MAX: u32 = 256;
+
+/// What a depth-3 A/W ring costs on `tile` against what the target allows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ring3Budget {
+    /// VGPRs of the second raw prefetch set (`2 * a_rounds + 3 * w_rounds`).
+    pub pf_vgprs: u32,
+    /// VGPRs the depth-3 kernel needs: the depth-2 [`VGPR_CEILING`] map plus the second set.
+    pub vgprs: u32,
+    /// The VGPR budget at the occupancy the depth-3 LDS footprint leaves: workgroups per WGP by
+    /// LDS (`WGP_LDS / lds`, capped at what fits), times the tile's waves, over four SIMDs, then
+    /// `SIMD_VGPRS` over that, in granules of eight, capped at [`VGPR_ARCH_MAX`].
+    pub vgpr_budget: u32,
+    /// Dynamic LDS bytes of the depth-3 launch (three A+W slabs plus the DS/SZ planes).
+    pub lds: u32,
+    /// The per-workgroup LDS limit ([`WG_LDS_LIMIT`]).
+    pub lds_limit: u32,
+    /// Workgroups per WGP the depth-3 LDS leaves (evaluated at the launch limit when `lds`
+    /// exceeds it).
+    pub wg_per_wgp: u32,
+}
+impl Ring3Budget {
+    pub fn lds_fits(&self) -> bool {
+        self.lds <= self.lds_limit
+    }
+    pub fn vgprs_fit(&self) -> bool {
+        self.vgprs <= self.vgpr_budget
+    }
+}
+/// The depth-3 need-vs-budget numbers of `tile` (the feasibility record: see [`Spec::validate`]).
+pub fn ring3_budget(tile: Tile) -> Ring3Budget {
+    let pf_vgprs = tile.a_rounds() * 2 + tile.w_rounds() * 3;
+    let lds = tile.layout().launch_for(RingDepth::Three);
+    // Workgroups per WGP by LDS; a footprint over the launch limit is evaluated at the limit
+    // (the best occupancy any trimmed layout could reach), so the budget is still reported.
+    let wg_per_wgp = WGP_LDS / lds.min(WG_LDS_LIMIT);
+    let waves_wgp = wg_per_wgp * tile.waves();
+    let per_simd = waves_wgp.div_ceil(4);
+    let vgpr_budget = (SIMD_VGPRS / per_simd / 8 * 8).min(VGPR_ARCH_MAX);
+    Ring3Budget {
+        pf_vgprs,
+        vgprs: u32::from(VGPR_CEILING) + pf_vgprs,
+        vgpr_budget,
+        lds,
+        lds_limit: WG_LDS_LIMIT,
+        wg_per_wgp,
+    }
+}
 
 impl Tile {
     pub const ALL: [Tile; 3] = [Tile::T128x128, Tile::T256x128, Tile::T128x256];
@@ -229,6 +329,7 @@ impl Spec {
             raster: Raster::Banded,
             tile: Tile::T128x128,
             arch: Arch::Gfx1201,
+            tune: Tune::default(),
         }
     }
     /// The interpreter twin: identical data path, linear raster.
@@ -238,11 +339,21 @@ impl Spec {
             raster: Raster::Linear,
             tile: Tile::T128x128,
             arch: Arch::Gfx1201,
+            tune: Tune::default(),
         }
     }
     /// The same spec on another tile.
     pub fn with_tile(self, tile: Tile) -> Self {
         Self { tile, ..self }
+    }
+    /// The same spec with other generator knobs.
+    pub fn with_tune(self, tune: Tune) -> Self {
+        Self { tune, ..self }
+    }
+    /// Whether the kernel takes `s_delay_alu` hints and (at ring depth 2) the stacked work-queue
+    /// schedule: every epilogue but `SetNr`, whose shipped bytes are the plain schedule's.
+    pub fn stacked(self) -> bool {
+        self.epi != Epi::SetNr
     }
     pub fn module() -> &'static str {
         "gemm_mq6g256v2_mmq_i8_pm_gfx1201"
@@ -258,14 +369,20 @@ impl Spec {
             Raster::Linear => format!("{base}_linear"),
         }
     }
+    /// The variant name; a non-default generator knob adds a suffix (`-r3`), so every existing
+    /// variant name is unchanged.
     pub fn variant_name(self) -> String {
         format!(
-            "{}-{}{}",
+            "{}-{}{}{}",
             self.tile.name(),
             self.epi.name(),
             match self.raster {
                 Raster::Banded => "",
                 Raster::Linear => "-linear",
+            },
+            match self.tune.ring {
+                RingDepth::Two => String::new(),
+                RingDepth::Three => format!("-r{}", self.tune.ring.name()),
             }
         )
     }
@@ -288,6 +405,11 @@ impl Spec {
             .pointer("norm", NR_NORM_OFFSET)
             .pointer("rope", NR_ROPE_OFFSET)
     }
+    /// Reject combinations that have no generator, with the numbers when a budget is the reason.
+    ///
+    /// Ring depth 3 (`tune.ring`) needs, besides the unrolled three-group K-loop, a third A/W slab in
+    /// LDS and a second raw prefetch set in VGPRs ([`ring3_budget`]): it is refused where either
+    /// does not fit, and for the epilogue that reuses LDS after the K-loop (`SetNr`).
     pub fn validate(self) -> Result<(), String> {
         if self.arch != Arch::Gfx1201 {
             return Err("mq6_i8_gemm targets gfx1201 only".into());
@@ -295,7 +417,67 @@ impl Spec {
         if self.epi == Epi::SetNr && self.tile != Tile::T256x128 {
             return Err("mq6_i8_gemm set_nr runs on the 256x128 tile only".into());
         }
+        if self.tune.ring == RingDepth::Three {
+            let n = ring3_budget(self.tile);
+            if self.epi == Epi::SetNr {
+                return Err(
+                    "ring depth 3 is not generated for set_nr: its epilogue reuses the K-loop's \
+                     LDS rings (the depth-3 rings end in another state)"
+                        .into(),
+                );
+            }
+            if !n.lds_fits() {
+                return Err(format!(
+                    "ring depth 3 does not fit the {} tile: the launch needs {} B of LDS (three \
+                     {} B A + {} B W slabs and {} B of DS/SZ planes), the workgroup limit is {} B \
+                     (the depth-2 launch is {} B)",
+                    self.tile.name(),
+                    n.lds,
+                    self.tile.layout().a_bytes,
+                    self.tile.layout().w_bytes,
+                    2 * (self.tile.layout().ds_bytes + self.tile.layout().sz_bytes),
+                    n.lds_limit,
+                    self.tile.layout().launch,
+                ));
+            }
+            if !n.vgprs_fit() {
+                return Err(format!(
+                    "ring depth 3 does not fit the {} tile: the second prefetch set needs {} VGPRs \
+                     on top of the {} of the depth-2 map ({} total), the budget at {} workgroup(s) \
+                     per WGP is {}",
+                    self.tile.name(),
+                    n.pf_vgprs,
+                    VGPR_CEILING,
+                    n.vgprs,
+                    n.wg_per_wgp,
+                    n.vgpr_budget,
+                ));
+            }
+        }
         Ok(())
+    }
+    /// The VGPR budget of this spec's register plan: the depth-2 [`VGPR_CEILING`], or at depth 3
+    /// the occupancy budget of [`ring3_budget`].
+    pub fn vgpr_budget(self) -> u16 {
+        match self.tune.ring {
+            RingDepth::Two => VGPR_CEILING,
+            RingDepth::Three => ring3_budget(self.tile).vgpr_budget as u16,
+        }
+    }
+    /// The dynamic LDS bytes this spec's launch passes: always the depth-2 launch (the product
+    /// launcher passes one fixed size per symbol and the tune table carries none). A depth-3
+    /// object declares the third A/W slab as static LDS ([`Spec::static_lds`]), so fixed +
+    /// dynamic covers the depth-3 layout ([`Spec::total_lds`]).
+    pub fn launch_lds(self) -> u32 {
+        self.tile.layout().launch
+    }
+    /// The kernel's `group_segment_fixed_size`: `0` at depth 2, the third A+W slab at depth 3.
+    pub fn static_lds(self) -> u32 {
+        self.total_lds() - self.tile.layout().launch
+    }
+    /// LDS bytes the kernel addresses: fixed + dynamic (`Layout::launch_for`).
+    pub fn total_lds(self) -> u32 {
+        self.tile.layout().launch_for(self.tune.ring)
     }
 }
 impl std::str::FromStr for Epi {

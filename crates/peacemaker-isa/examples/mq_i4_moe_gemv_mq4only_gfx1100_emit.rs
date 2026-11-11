@@ -199,7 +199,8 @@ mod tests {
     }
 
     /// The 96-byte kernarg: the 88-byte R5 block, `n_experts@88` and the zero `reserved@92`, in the metadata, the
-    /// descriptor and the scalar loads (one `s_load_b32` of `n_experts` into the spare `s4`).
+    /// descriptor and the scalar loads (one `s_load_b32` of `n_experts` into the spare `s4`; the first kernarg block is
+    /// `s[80:87]`, past the workgroup ids the gfx1100 `FeatureUserSGPRInit16Bug` padding moves to `s14` / `s15`).
     #[test]
     fn kernarg_is_96_bytes_with_n_experts_and_reserved() {
         assert_eq!(mq_i4_moe_gemv_gfx1100::KERNARG_BYTES, 96);
@@ -225,7 +226,7 @@ mod tests {
                 .collect();
             assert_eq!(&names[15..], ["n_experts", "reserved"], "{symbol}");
             for load in [
-                "s_load_b256 s[8:15], s[0:1], null",
+                "s_load_b256 s[80:87], s[0:1], null",
                 "s_load_b256 s[16:23], s[0:1], 0x20",
                 "s_load_b128 s[24:27], s[0:1], 0x40",
                 "s_load_b64 s[28:29], s[0:1], 0x50",
@@ -237,7 +238,7 @@ mod tests {
     }
 
     /// The `n_experts` guard: the word lives in the spare `s4` (touched only by its load and the compare, so every other
-    /// register assignment and the SGPR ceiling of 80 are unchanged); `s_cmp_ge_u32 s34, s4` plus the existing exit
+    /// register assignment is unchanged; the SGPR ceiling is 88: the kernarg block is relocated to `s[80:87]`); `s_cmp_ge_u32 s34, s4` plus the existing exit
     /// branch follow the offsets guard and precede `expert_id * 8` and the expert-table `s_load_b64`.
     #[test]
     fn n_experts_guard_precedes_the_table_index() {
@@ -246,7 +247,7 @@ mod tests {
             let symbol = spec.symbol();
             let l = lines(&e.s_text);
             let exit = format!(".Lmqi4moe_{}_exit", spec.tag());
-            assert_eq!(e.shape.next_free_sgpr, 80, "{symbol}: sgpr ceiling");
+            assert_eq!(e.shape.next_free_sgpr, 88, "{symbol}: sgpr ceiling");
             let load = l
                 .iter()
                 .position(|t| *t == "s_load_b32 s4, s[0:1], 0x58")

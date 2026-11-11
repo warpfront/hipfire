@@ -981,6 +981,9 @@ pub fn forward(
         }
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::Ggml(dtype) => {
+            gpu.ggml_embedding_lookup(dtype, &weights.token_embd, &x, token, dim)?
+        }
         _ => panic!("unsupported embedding format"),
     }
 
@@ -1957,6 +1960,9 @@ pub fn forward_scratch(
         EmbeddingFormat::F32 => {
             gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?
         }
+        EmbeddingFormat::Ggml(dtype) => {
+            gpu.ggml_embedding_lookup(dtype, &weights.token_embd, &scratch.x, token, dim)?
+        }
         _ => panic!("unsupported embedding format"),
     }
     rdna_compute::gap_timing::add_since(rdna_compute::gap_timing::Slot::Embed, embed_started);
@@ -2131,6 +2137,9 @@ pub fn prepare_scratch_inputs(
         EmbeddingFormat::F32 => {
             gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, config.dim)?
         }
+        EmbeddingFormat::Ggml(dtype) => {
+            gpu.ggml_embedding_lookup(dtype, &weights.token_embd, &scratch.x, token, config.dim)?
+        }
         other => {
             return Err(HipError::new(
                 0,
@@ -2184,6 +2193,9 @@ pub fn forward_scratch_with_hidden(
         }
         EmbeddingFormat::F32 => {
             gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?
+        }
+        EmbeddingFormat::Ggml(dtype) => {
+            gpu.ggml_embedding_lookup(dtype, &weights.token_embd, &scratch.x, token, dim)?
         }
         _ => panic!("unsupported embedding format"),
     }
@@ -3650,6 +3662,7 @@ fn dense_tp_allreduce_add(
         return gpus.all_reduce_sum_f32_peer_add_routed(
             &partial_refs,
             &residuals,
+            1,
             count,
             Some(partial_slot),
         );
@@ -3684,7 +3697,13 @@ fn dense_tp_allreduce_batched(
             .map(|pbs| pbs.x_batch.sub_offset(0, count))
             .collect();
         let residual_refs: Vec<_> = residuals.iter().map(|tensor| &tensor.buf).collect();
-        return gpus.all_reduce_sum_f32_peer_add_routed(&partial_refs, &residual_refs, count, None);
+        return gpus.all_reduce_sum_f32_peer_add_routed(
+            &partial_refs,
+            &residual_refs,
+            n,
+            count,
+            None,
+        );
     }
     dense_tp_all_reduce_sum_f32(gpus, &partial_refs, count)?;
     for (rank, (pbs, partial)) in pbs_vec.iter().zip(partials.iter()).enumerate() {
@@ -5620,6 +5639,9 @@ pub fn forward_gpu(
         }
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::Ggml(dtype) => {
+            gpu.ggml_embedding_lookup(dtype, &weights.token_embd, &x, token, dim)?
+        }
         _ => panic!("unsupported embedding format"),
     }
     forward_from_x_gpu(gpu, weights, config, x, pos, kv_cache, dn_state)

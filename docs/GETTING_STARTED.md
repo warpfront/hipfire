@@ -73,7 +73,7 @@ Both `master` and `beta` are mutable. For a reproducible install, pin and
 inspect the installer itself, then ask it to install the same tag or commit:
 
 ```bash
-PIN=v0.4.1
+PIN=v0.4.5
 curl -fsSL "https://raw.githubusercontent.com/warpfront/hipfire/${PIN}/scripts/install.sh" \
   -o /tmp/hipfire-install.sh
 sha256sum /tmp/hipfire-install.sh
@@ -81,7 +81,7 @@ less /tmp/hipfire-install.sh
 bash /tmp/hipfire-install.sh --ref "$PIN"
 ```
 
-Use `--tag v0.4.1` when the kind is known, or `--commit <full-sha>` for an
+Use `--tag v0.4.5` when the kind is known, or `--commit <full-sha>` for an
 immutable commit. Fetching a pinned script but omitting the selector installs
 `master`, so keep the two pins together.
 
@@ -140,7 +140,7 @@ directory or URL holding the assets (`https://…`, `file:///…`, or a plain
 path), for mirrors and offline installs:
 
 ```bash
-bash install.sh --tag v0.4.0 --kernel-pack-url file:///srv/hipfire-packs/v0.4.0
+bash install.sh --tag v0.4.5 --kernel-pack-url file:///srv/hipfire-packs/v0.4.5
 ```
 
 `hipfire kernel-pack install --tag <tag> --arch <arch> --source ~/.hipfire/src`
@@ -196,9 +196,9 @@ Repository variables choose another image
 publish from a local toolchain instead:
 
 ```bash
-scripts/build-kernel-pack.sh --tag v0.4.0 --out dist            # every admitted arch
-scripts/build-kernel-pack.sh --tag v0.4.0 --out dist gfx1201    # or a subset
-gh release upload v0.4.0 dist/hipfire-kernels-v0.4.0-*
+scripts/build-kernel-pack.sh --tag v0.4.5 --out dist            # every admitted arch
+scripts/build-kernel-pack.sh --tag v0.4.5 --out dist gfx1201    # or a subset
+gh release upload v0.4.5 dist/hipfire-kernels-v0.4.5-*
 ```
 
 The script compiles `git archive` of the tag's commit with a fresh `HOME` and
@@ -517,7 +517,7 @@ one build, then prints one `fix:` line per problem
 hipfire update                  # advance the currently selected branch
 hipfire update @beta            # auto-detect branch/tag/commit
 hipfire update --branch master
-hipfire update --tag v0.4.1
+hipfire update --tag v0.4.5
 hipfire update --commit <sha>
 ```
 
@@ -608,7 +608,7 @@ pick a compact `kv_cache` mode (see [CONFIG.md](CONFIG.md)). CASK/TriAttention
 eviction is deprecated and will be removed in 0.5.0 — off by default, not
 supported, and not a recommended route to long context.
 
-**YaRN context extension (0.4.2, Qwen3.8-Flash-Next only).** The engine can
+**YaRN context extension (since 0.4.2, Qwen3.8-Flash-Next only).** The engine can
 apply YaRN RoPE scaling at load through `attention.yarn_factor` (env
 `HIPFIRE_YARN_FACTOR`): unset/`null` keeps the checkpoint's own
 `rope_parameters`, a value above 1 extends the admitted context to
@@ -633,11 +633,9 @@ tokens and should not be read as full-context Q8 support. Long-context decode
 slowdown is expected O(N) full-attention bandwidth, not by itself an admission
 regression.
 
-## Flash-Next on 0.4.2 (beta)
+## Flash-Next multi-device and NPU defaults
 
-These behaviors are on the 0.4.2 line (CHANGELOG "Unreleased (0.4.2)"); the
-latest tagged release is v0.4.1. Install them with `--branch beta` until 0.4.2
-is tagged.
+These behaviors shipped in 0.4.2 and are in every later release.
 
 - **Strix Halo NPU trunk (gfx1151).** `fusions.npu_trunk` /
   `HIPFIRE_QWEN4_NPU_TRUNK` (`off|auto|on|emulate`) defaults to `auto`. Auto
@@ -645,6 +643,14 @@ is tagged.
   logs one reason and runs GPU-only. Every other architecture resolves auto
   silently to off. `off` is the kill switch; timings are fixture-bound and live
   in the CHANGELOG, not here. Keys: [CONFIG.md](CONFIG.md).
+- **Qwen3.8-Flash-Next PLE residency.** The artifact embeds its PLE rows as
+  Q8 (54.4 GB); `hipfire ple derive --format q4 <model>` writes a `.ple-q4`
+  sidecar beside it that the load picks up automatically, dropping those rows
+  to 28.8 GB. Measured on a gfx1151 host (Ryzen AI Max+ PRO 495, 192 GB):
+  25.6 GB less residency, the load admits at 154.7 GB free, and generation
+  stays coherent - but numerics change (a greedy paragraph differs from the
+  embedded-q8 run), so treat the sidecar as a capacity lever for 128 GB-class
+  hosts, not a free default.
 - **EP owner-routed prefill and expert staging.** With `topology.ep` 2..=8,
   `HIPFIRE_EP_OWNER_ROUTED_PREFILL` defaults on when every admission condition
   holds (exact gfx1201 on the symmetric IU4 route, exact gfx1100 on the F16

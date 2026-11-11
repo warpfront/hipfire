@@ -693,15 +693,10 @@ mod tests {
                 33 + stream * 8
             )));
         }
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../kernels/pm-decode/gfx1201");
-        std::fs::create_dir_all(&root).unwrap();
-        // Concurrent crate tests must not overwrite the certified production object.
-        let object = root.join(format!("{MODULE}.test.{}.co", std::process::id()));
         let elf = crate::native::assemble(&e.s_text, Arch::Gfx1201).unwrap();
-        std::fs::write(&object, elf).unwrap();
-        let m7 = crate::pm_check::m7(&object, "gfx1201", "fused_qkv_mq4g256v2");
-        std::fs::remove_file(&object).unwrap();
+        let object = crate::test_tmp::TmpObject::write(MODULE, elf);
+        let m7 = crate::pm_check::m7(object.path(), "gfx1201", "fused_qkv_mq4g256v2");
+        drop(object);
         let m7 = m7.unwrap();
         assert_eq!(m7["obligations"], serde_json::json!({}));
         assert_eq!(m7["ambiguous_delays"], 0);

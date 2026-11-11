@@ -62,9 +62,9 @@
       "tok_s": 353.0,
       "date": "2026-07-19",
       "source": "docs/BENCHMARKS.md",
-      "quote": "| Qwen 3.5 0.8B | **10,861** | 4,622 | **12,962** | 7,117 | **353**",
+      "quote": "| Qwen 3.5 0.8B | **10,861** | **12,962** | **353**",
       "historical": true,
-      "note": "Historical 'vs ollama (Q4_K_M GGUF)' table, 7900 XTX, hipfire MQ4 with asym3 KV and FlashAttention, matched 128-token generation. The date is the page inventory date, not a measurement date."
+      "note": "Historical '7900 XTX small-model snapshot (hipfire only)' table, hipfire MQ4 with asym3 KV and FlashAttention, matched 128-token generation. The date is the page inventory date, not a measurement date."
     },
     {
       "tag": "qwen3.5:4b",
@@ -78,9 +78,9 @@
       "tok_s": 165.0,
       "date": "2026-07-19",
       "source": "docs/BENCHMARKS.md",
-      "quote": "| Qwen 3.5 4B | **3,304** | 1,972 | **3,321** | 2,670 | **165**",
+      "quote": "| Qwen 3.5 4B | **3,304** | **3,321** | **165**",
       "historical": true,
-      "note": "Historical 'vs ollama (Q4_K_M GGUF)' table, 7900 XTX, hipfire MQ4 with asym3 KV and FlashAttention, matched 128-token generation. The date is the page inventory date, not a measurement date."
+      "note": "Historical '7900 XTX small-model snapshot (hipfire only)' table, hipfire MQ4 with asym3 KV and FlashAttention, matched 128-token generation. The date is the page inventory date, not a measurement date."
     },
     {
       "tag": "qwen3.5:9b",
@@ -94,9 +94,9 @@
       "tok_s": 122.0,
       "date": "2026-07-19",
       "source": "docs/BENCHMARKS.md",
-      "quote": "| Qwen 3.5 9B | **1,920** | 1,428 | 1,919 | **1,970** | **122**",
+      "quote": "| Qwen 3.5 9B | **1,920** | 1,919 | **122**",
       "historical": true,
-      "note": "Historical 'vs ollama (Q4_K_M GGUF)' table, 7900 XTX, hipfire MQ4 with asym3 KV and FlashAttention, matched 128-token generation. The date is the page inventory date, not a measurement date."
+      "note": "Historical '7900 XTX small-model snapshot (hipfire only)' table, hipfire MQ4 with asym3 KV and FlashAttention, matched 128-token generation. The date is the page inventory date, not a measurement date."
     },
     {
       "tag": "qwen3.8:27b-mq4-xts",

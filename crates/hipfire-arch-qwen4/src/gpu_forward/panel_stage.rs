@@ -54,6 +54,9 @@ const EXTENT_ALIGN: usize = 256;
 pub(crate) const MAX_GROUP_EXPERTS: usize = 32;
 /// Largest per-layer expert table.
 pub(crate) const MAX_TABLE_EXPERTS: usize = 1024;
+/// Range key of a tier layer's device-resident extents in [`plan_group_layout`] (the host
+/// ranges are 0 and 1).
+const DEVICE_RANGE: usize = 2;
 
 fn align_up(value: usize, align: usize) -> Option<usize> {
     value.checked_add(align - 1).map(|v| v & !(align - 1))
@@ -99,7 +102,18 @@ pub(crate) struct LayerExpertSources {
     /// (gate/up, then down: separate pinned allocations).
     ranges: SmallVec<[(usize, usize); 2]>,
     experts: Vec<Option<ExpertSource>>,
+    /// A tier layer's device-resident experts (S1 over a ranked hot set): their extents are
+    /// DEVICE addresses inside `device.range`, copied into the page by a device-to-device copy
+    /// instead of an H2D copy. `None` for every other layer.
+    device: Option<DeviceSet>,
     owner: Arc<dyn Any + Send + Sync>,
+}
+
+/// The device-resident experts of one tier layer: the tier's device owner range
+/// `(base, bytes)` and, per expert id, whether that expert's extents live in it.
+struct DeviceSet {
+    range: (usize, usize),
+    experts: Vec<bool>,
 }
 
 impl LayerExpertSources {
@@ -119,7 +133,41 @@ impl LayerExpertSources {
         let mut ranges = SmallVec::new();
         ranges.push((host_base, host_bytes));
         // SAFETY: forwarded from this function's contract.
-        unsafe { Self::build(layer, ranges, experts, owner) }
+        unsafe { Self::build(layer, ranges, experts, None, owner) }
+    }
+
+    /// A hot-set TIER layer: cold experts' extents are CPU addresses inside the one pinned host
+    /// owner `host = (cpu_base, bytes)`; `device_experts[id]` experts' extents are device
+    /// addresses inside the tier's device owner `device = (base, bytes)`, which the ring copies
+    /// device-to-device (VRAM bandwidth, no link bytes). Every projection of every held expert is
+    /// bounds checked against the range of its own kind.
+    ///
+    /// # Safety
+    /// As [`Self::new`] for `host`, and `[device.0, device.0 + device.1)` must be live device
+    /// memory that stays valid and unmodified for as long as `owner` (or a clone) lives.
+    pub(crate) unsafe fn new_tier(
+        layer: usize,
+        host: (usize, usize),
+        device: (usize, usize),
+        experts: Vec<Option<ExpertSource>>,
+        device_experts: Vec<bool>,
+        owner: Arc<dyn Any + Send + Sync>,
+    ) -> R<Self> {
+        if device_experts.len() != experts.len() {
+            return Err(invalid(format!(
+                "panel sources layer {layer}: {} device flags for {} experts",
+                device_experts.len(),
+                experts.len()
+            )));
+        }
+        let mut ranges = SmallVec::new();
+        ranges.push(host);
+        let set = DeviceSet {
+            range: device,
+            experts: device_experts,
+        };
+        // SAFETY: forwarded from this function's contract.
+        unsafe { Self::build(layer, ranges, experts, Some(set), owner) }
     }
 
     /// Gate/up extents in `gate_up` and down extents in `down`: two separate
@@ -139,7 +187,7 @@ impl LayerExpertSources {
         ranges.push(gate_up);
         ranges.push(down);
         // SAFETY: forwarded from this function's contract.
-        unsafe { Self::build(layer, ranges, experts, owner) }
+        unsafe { Self::build(layer, ranges, experts, None, owner) }
     }
 
     /// `ranges[0]` bounds gate/up extents; `ranges[last]` bounds down extents.
@@ -147,6 +195,7 @@ impl LayerExpertSources {
         layer: usize,
         ranges: SmallVec<[(usize, usize); 2]>,
         experts: Vec<Option<ExpertSource>>,
+        device: Option<DeviceSet>,
         owner: Arc<dyn Any + Send + Sync>,
     ) -> R<Self> {
         if experts.is_empty() || experts.len() > MAX_TABLE_EXPERTS {
@@ -169,21 +218,35 @@ impl LayerExpertSources {
                 )));
             }
         }
+        let device_end = match device.as_ref() {
+            Some(set) => Some(set.range.0.checked_add(set.range.1).ok_or_else(|| {
+                invalid(format!(
+                    "panel sources layer {layer}: device range overflows"
+                ))
+            })?),
+            None => None,
+        };
         for (id, expert) in experts.iter().enumerate() {
             let Some(expert) = expert else { continue };
+            let on_device = device
+                .as_ref()
+                .is_some_and(|set| set.experts.get(id).copied().unwrap_or(false));
             for (name, extent, range) in [
                 ("gate_up", expert.gate_up, 0),
                 ("down", expert.down, ranges.len() - 1),
             ] {
-                let (host_base, host_bytes) = ranges[range];
+                let (kind, base, bytes, limit) = match (on_device, device.as_ref(), device_end) {
+                    (true, Some(set), Some(end)) => ("device", set.range.0, set.range.1, end),
+                    _ => ("host", ranges[range].0, ranges[range].1, ends[range]),
+                };
                 let end = extent.addr.checked_add(extent.len).ok_or_else(|| {
                     invalid(format!(
                         "panel sources layer {layer} expert {id} {name} extent overflows"
                     ))
                 })?;
-                if extent.len == 0 || extent.addr < host_base || end > ends[range] {
+                if extent.len == 0 || extent.addr < base || end > limit {
                     return Err(invalid(format!(
-                        "panel sources layer {layer} expert {id} {name} extent [{:#x}, +{}) is outside the host owner [{host_base:#x}, +{host_bytes})",
+                        "panel sources layer {layer} expert {id} {name} extent [{:#x}, +{}) is outside the {kind} owner [{base:#x}, +{bytes})",
                         extent.addr, extent.len
                     )));
                 }
@@ -193,6 +256,7 @@ impl LayerExpertSources {
             layer,
             ranges,
             experts,
+            device,
             owner,
         })
     }
@@ -246,6 +310,24 @@ impl LayerExpertSources {
 
     pub(crate) fn expert(&self, id: usize) -> Option<&ExpertSource> {
         self.experts.get(id).and_then(Option::as_ref)
+    }
+
+    /// Whether expert `id`'s extents are device addresses of a tier layer's device owner.
+    pub(crate) fn is_device(&self, id: usize) -> bool {
+        self.device
+            .as_ref()
+            .is_some_and(|set| set.experts.get(id).copied().unwrap_or(false))
+    }
+
+    /// Number of held experts served by device-to-device copy.
+    pub(crate) fn device_experts(&self) -> usize {
+        self.device.as_ref().map_or(0, |set| {
+            set.experts
+                .iter()
+                .zip(&self.experts)
+                .filter(|(device, held)| **device && held.is_some())
+                .count()
+        })
     }
 
     /// Provenance: the gate/up (or only) host range `(base, bytes)`.
@@ -371,6 +453,8 @@ struct CopyRun {
     src: usize,
     dst: usize,
     len: usize,
+    /// `src` is a device address (copied device-to-device), not pinned host memory.
+    device: bool,
 }
 
 /// Where a group's bytes sit in a page.
@@ -388,8 +472,21 @@ struct GroupLayout {
 }
 
 impl GroupLayout {
+    /// Bytes copied into the page: every run, host (over the link) and device (tier layer's
+    /// hot experts, device-to-device) alike, so a window's one-sweep and useful-bytes
+    /// invariants hold unchanged over a tier layer.
     fn submitted_bytes(&self) -> usize {
         self.runs.iter().map(|run| run.len).sum()
+    }
+
+    /// The part of [`Self::submitted_bytes`] copied device-to-device from a tier layer's device
+    /// owner; the link bytes of the group are the difference.
+    fn device_bytes(&self) -> usize {
+        self.runs
+            .iter()
+            .filter(|run| run.device)
+            .map(|run| run.len)
+            .sum()
     }
 }
 
@@ -410,15 +507,25 @@ fn plan_group_layout(experts: &[usize], sources: &LayerExpertSources) -> R<Group
                 sources.layer()
             ))
         })?;
+        // A device-resident expert (tier layer) sorts and merges in its own range key.
+        let on_device = sources.is_device(id);
         items.push((
-            sources.range_of(false),
+            if on_device {
+                DEVICE_RANGE
+            } else {
+                sources.range_of(false)
+            },
             expert.gate_up.addr,
             expert.gate_up.len,
             index,
             false,
         ));
         items.push((
-            sources.range_of(true),
+            if on_device {
+                DEVICE_RANGE
+            } else {
+                sources.range_of(true)
+            },
             expert.down.addr,
             expert.down.len,
             index,
@@ -451,10 +558,11 @@ fn plan_group_layout(experts: &[usize], sources: &LayerExpertSources) -> R<Group
     let mut layout = GroupLayout {
         runs: runs
             .iter()
-            .map(|&(_, start, end, dst)| CopyRun {
+            .map(|&(range, start, end, dst)| CopyRun {
                 src: start,
                 dst,
                 len: end - start,
+                device: range == DEVICE_RANGE,
             })
             .collect(),
         gate_up: SmallVec::from_elem(0, experts.len()),
@@ -679,8 +787,12 @@ pub(crate) struct PanelStats {
     pub(crate) retired: u64,
     /// Retired without ever being acquired (prefetched, then unused).
     pub(crate) discarded: u64,
-    /// Bytes H2D-copied as payload (submitted).
+    /// Bytes copied into pages as payload (submitted): host bytes over the link plus a tier
+    /// layer's device-to-device bytes ([`Self::device_payload_bytes`]).
     pub(crate) submitted_payload_bytes: u64,
+    /// The part of the submitted bytes copied device-to-device from a tier layer's device owner
+    /// (no link bytes): the link bytes are `submitted_payload_bytes - device_payload_bytes`.
+    pub(crate) device_payload_bytes: u64,
     /// Sum of the experts' own extent lengths of those groups.
     pub(crate) extent_bytes: u64,
     pub(crate) table_bytes: u64,
@@ -860,6 +972,16 @@ pub(crate) trait PanelBackend {
         rec: Option<usize>,
     ) -> R<()>;
     fn copy_payload(
+        &mut self,
+        ctx: &Self::Ctx,
+        slot: usize,
+        src: usize,
+        dst: usize,
+        len: usize,
+    ) -> R<()>;
+    /// Copy stream: copy `len` bytes from DEVICE address `src` (a tier layer's device-resident
+    /// expert) into the page at `dst`.
+    fn copy_payload_device(
         &mut self,
         ctx: &Self::Ctx,
         slot: usize,
@@ -1346,8 +1468,13 @@ impl<B: PanelBackend> RingCore<B> {
         fill_tables(layout, &group.experts, base, gate_up, down)?;
         self.backend.copy_begin(ctx, slot, wait_free, rec)?;
         for run in &layout.runs {
-            self.backend
-                .copy_payload(ctx, slot, run.src, run.dst, run.len)?;
+            if run.device {
+                self.backend
+                    .copy_payload_device(ctx, slot, run.src, run.dst, run.len)?;
+            } else {
+                self.backend
+                    .copy_payload(ctx, slot, run.src, run.dst, run.len)?;
+            }
         }
         self.backend
             .copy_zero(ctx, slot, layout.used, ARENA_TAIL_PAD_BYTES)?;
@@ -1356,6 +1483,7 @@ impl<B: PanelBackend> RingCore<B> {
         self.pages[slot].state = PageState::Ready;
         self.stats.enqueued += 1;
         self.stats.submitted_payload_bytes += layout.submitted_bytes() as u64;
+        self.stats.device_payload_bytes += layout.device_bytes() as u64;
         self.stats.extent_bytes += layout.extent_bytes as u64;
         self.stats.table_bytes += (2 * self.spec.num_experts * std::mem::size_of::<u64>()) as u64;
         Ok(())
@@ -1563,6 +1691,46 @@ impl<B: PanelBackend> RingCore<B> {
 
 // ── layer-ahead schedule ─────────────────────────────────────────────
 
+/// The weight schedule a window runs against the page ring.
+///
+/// [`PanelSchedule`] is S1's page-order sweep (layer ahead, one transfer per
+/// group, prefetching before the route exists); [`SpSchedule`] is the
+/// short-prompt hook's selective schedule (one layer at a time, only the
+/// groups the planner chose, no lookahead). Both drive the same [`RingCore`],
+/// so page lifecycle, tickets, events, drain and quarantine are shared.
+pub(crate) trait RingSchedule {
+    /// Start of the window; returns the number of groups enqueued.
+    fn prime<B: PanelBackend>(&mut self, core: &mut RingCore<B>, ctx: &B::Ctx) -> R<usize>;
+
+    /// Compute reaches host layer `layer`; returns the groups enqueued.
+    fn enter_layer<B: PanelBackend>(
+        &mut self,
+        core: &mut RingCore<B>,
+        ctx: &B::Ctx,
+        layer: usize,
+    ) -> R<usize>;
+
+    /// Enqueue whatever the schedule's policy allows (call after each retire).
+    fn pump<B: PanelBackend>(&mut self, core: &mut RingCore<B>, ctx: &B::Ctx) -> R<usize>;
+
+    /// The ticket of current-layer `group`, which compute needs now.
+    fn require<B: PanelBackend>(
+        &mut self,
+        core: &mut RingCore<B>,
+        ctx: &B::Ctx,
+        layer: usize,
+        group: u32,
+    ) -> R<PanelTicket>;
+
+    /// The ticket of `(layer, group)` once enqueued.
+    fn ticket(&self, layer: usize, group: u32) -> Option<PanelTicket>;
+
+    /// Payload bytes this window's schedule submits: the full sweep for
+    /// [`PanelSchedule`], the bytes of the groups enqueued so far this window
+    /// for [`SpSchedule`] (equal to the sum of their layouts' submitted bytes).
+    fn submitted_bytes(&self) -> u64;
+}
+
 struct ScheduledLayer {
     sources: LayerExpertSources,
     groups: Vec<ExpertGroupPlan>,
@@ -1653,6 +1821,17 @@ impl PanelSchedule {
         )
     }
 
+    /// The expert sources of host layer `layer`.
+    pub(crate) fn sources_of(&self, layer: usize) -> Option<&LayerExpertSources> {
+        self.layers
+            .iter()
+            .find(|l| l.sources.layer() == layer)
+            .map(|l| &l.sources)
+    }
+
+    // The [`RingSchedule`] operations are also inherent, so callers that
+    // drive a `PanelSchedule` directly need not import the trait.
+
     /// Start of the window: lookahead covers the first host layer while
     /// resident layers compute. Pumps immediately.
     pub(crate) fn prime<B: PanelBackend>(
@@ -1660,6 +1839,50 @@ impl PanelSchedule {
         core: &mut RingCore<B>,
         ctx: &B::Ctx,
     ) -> R<usize> {
+        RingSchedule::prime(self, core, ctx)
+    }
+
+    /// Compute reaches host layer `layer` (the next in the schedule).
+    pub(crate) fn enter_layer<B: PanelBackend>(
+        &mut self,
+        core: &mut RingCore<B>,
+        ctx: &B::Ctx,
+        layer: usize,
+    ) -> R<usize> {
+        RingSchedule::enter_layer(self, core, ctx, layer)
+    }
+
+    /// Enqueue as many groups as free pages allow: the current layer's
+    /// missing groups first, then the next layer's.
+    pub(crate) fn pump<B: PanelBackend>(
+        &mut self,
+        core: &mut RingCore<B>,
+        ctx: &B::Ctx,
+    ) -> R<usize> {
+        RingSchedule::pump(self, core, ctx)
+    }
+
+    /// The ticket of `(layer, group)` once enqueued.
+    pub(crate) fn ticket(&self, layer: usize, group: u32) -> Option<PanelTicket> {
+        RingSchedule::ticket(self, layer, group)
+    }
+
+    /// The ticket of a current-layer group compute needs now, enqueueing the
+    /// groups before it if the pool allowed none yet. Errors (no state
+    /// change) when the pool is full: retire earlier tickets first.
+    pub(crate) fn require<B: PanelBackend>(
+        &mut self,
+        core: &mut RingCore<B>,
+        ctx: &B::Ctx,
+        layer: usize,
+        group: u32,
+    ) -> R<PanelTicket> {
+        RingSchedule::require(self, core, ctx, layer, group)
+    }
+}
+
+impl RingSchedule for PanelSchedule {
+    fn prime<B: PanelBackend>(&mut self, core: &mut RingCore<B>, ctx: &B::Ctx) -> R<usize> {
         self.current = None;
         for layer in &mut self.layers {
             layer.next_group = 0;
@@ -1667,11 +1890,10 @@ impl PanelSchedule {
         }
         core.begin_window(ctx)?;
         self.apply_window(core)?;
-        self.pump(core, ctx)
+        RingSchedule::pump(self, core, ctx)
     }
 
-    /// Compute reaches host layer `layer` (the next in the schedule).
-    pub(crate) fn enter_layer<B: PanelBackend>(
+    fn enter_layer<B: PanelBackend>(
         &mut self,
         core: &mut RingCore<B>,
         ctx: &B::Ctx,
@@ -1691,16 +1913,10 @@ impl PanelSchedule {
         }
         self.current = Some(expected);
         self.apply_window(core)?;
-        self.pump(core, ctx)
+        RingSchedule::pump(self, core, ctx)
     }
 
-    /// Enqueue as many groups as free pages allow: the current layer's
-    /// missing groups first, then the next layer's.
-    pub(crate) fn pump<B: PanelBackend>(
-        &mut self,
-        core: &mut RingCore<B>,
-        ctx: &B::Ctx,
-    ) -> R<usize> {
+    fn pump<B: PanelBackend>(&mut self, core: &mut RingCore<B>, ctx: &B::Ctx) -> R<usize> {
         let mut issued = 0;
         for index in [self.current, self.next_index()].into_iter().flatten() {
             let layer = &mut self.layers[index];
@@ -1719,33 +1935,299 @@ impl PanelSchedule {
         Ok(issued)
     }
 
-    /// The ticket of `(layer, group)` once enqueued.
-    pub(crate) fn ticket(&self, layer: usize, group: u32) -> Option<PanelTicket> {
-        self.layers
-            .iter()
-            .find(|l| l.sources.layer() == layer)
-            .and_then(|l| l.tickets.get(group as usize).copied().flatten())
-    }
-
-    /// The ticket of a current-layer group compute needs now, enqueueing the
-    /// groups before it if the pool allowed none yet. Errors (no state
-    /// change) when the pool is full: retire earlier tickets first.
-    pub(crate) fn require<B: PanelBackend>(
+    fn require<B: PanelBackend>(
         &mut self,
         core: &mut RingCore<B>,
         ctx: &B::Ctx,
         layer: usize,
         group: u32,
     ) -> R<PanelTicket> {
-        if let Some(ticket) = self.ticket(layer, group) {
+        if let Some(ticket) = RingSchedule::ticket(&*self, layer, group) {
             return Ok(ticket);
         }
-        self.pump(core, ctx)?;
-        self.ticket(layer, group).ok_or_else(|| {
+        RingSchedule::pump(self, core, ctx)?;
+        RingSchedule::ticket(&*self, layer, group).ok_or_else(|| {
             invalid(format!(
                 "panel layer {layer} group {group} cannot be enqueued: the pool is full or the layer is not current"
             ))
         })
+    }
+
+    fn ticket(&self, layer: usize, group: u32) -> Option<PanelTicket> {
+        self.layers
+            .iter()
+            .find(|l| l.sources.layer() == layer)
+            .and_then(|l| l.tickets.get(group as usize).copied().flatten())
+    }
+
+    fn submitted_bytes(&self) -> u64 {
+        self.sweep_bytes
+    }
+}
+
+// ── selective (short-prompt) schedule ────────────────────────────────
+
+/// One layer's planned groups and what the ring did with them.
+struct SpPlannedLayer {
+    layer: usize,
+    groups: Vec<ExpertGroupPlan>,
+    /// Per group: `(submitted payload bytes, payload end of its page layout)`.
+    layouts: Vec<(u64, usize)>,
+    tickets: Vec<Option<PanelTicket>>,
+    /// `enter_layer` enqueued the groups.
+    entered: bool,
+}
+
+/// The short-prompt hook's schedule: per layer, only the groups the planner
+/// chose (sparse ascending experts), all enqueued at layer entry, never
+/// prefetched and never waited for. Sources come from the window's
+/// [`PanelSchedule`] (borrowed, read-only). One transfer per group per window.
+///
+/// Per layer the order is `plan_layer(L, groups)` then `enter_layer(L)`; every
+/// group's tickets must be retired before the next layer is entered.
+pub(crate) struct SpSchedule<'a> {
+    sources: &'a PanelSchedule,
+    plan: Option<SpPlannedLayer>,
+    /// The last layer entered this window.
+    current: Option<usize>,
+    submitted: u64,
+}
+
+#[allow(dead_code)]
+impl<'a> SpSchedule<'a> {
+    pub(crate) fn new(sources: &'a PanelSchedule) -> Self {
+        Self {
+            sources,
+            plan: None,
+            current: None,
+            submitted: 0,
+        }
+    }
+
+    /// Plan host layer `layer`'s streamed set: `groups` are ascending expert
+    /// ids, each group `1..=MAX_GROUP_EXPERTS` long, ascending across groups
+    /// (so no expert streams twice), one codec per group. An empty list is a
+    /// layer that streams nothing. Pure: no ring or device state is touched,
+    /// and a refusal leaves the previous state unchanged.
+    pub(crate) fn plan_layer(&mut self, layer: usize, groups: &[Vec<u16>]) -> R<()> {
+        if let Some(open) = self.plan.as_ref().filter(|p| !p.entered) {
+            return Err(invalid(format!(
+                "sp schedule: layer {} is planned but not entered; layer {layer} cannot be planned over it",
+                open.layer
+            )));
+        }
+        if let Some(current) = self.current.filter(|&c| layer <= c) {
+            return Err(invalid(format!(
+                "sp schedule: layer {layer} is not after the entered layer {current}"
+            )));
+        }
+        let sources = self
+            .sources
+            .sources_of(layer)
+            .ok_or_else(|| invalid(format!("sp schedule: layer {layer} is not a host layer")))?;
+        let mut plans = Vec::with_capacity(groups.len());
+        let mut layouts = Vec::with_capacity(groups.len());
+        let mut previous: Option<usize> = None;
+        for (index, ids) in groups.iter().enumerate() {
+            let group = u32::try_from(index)
+                .map_err(|_| invalid("sp schedule: group index overflows u32"))?;
+            if ids.is_empty() || ids.len() > MAX_GROUP_EXPERTS {
+                return Err(invalid(format!(
+                    "sp schedule layer {layer} group {group}: {} experts is outside 1..={MAX_GROUP_EXPERTS}",
+                    ids.len()
+                )));
+            }
+            let experts: SmallVec<[usize; MAX_GROUP_EXPERTS]> =
+                ids.iter().map(|&id| usize::from(id)).collect();
+            for &id in &experts {
+                if previous.is_some_and(|p| id <= p) {
+                    return Err(invalid(format!(
+                        "sp schedule layer {layer} group {group}: expert {id} is not strictly ascending across the layer's groups"
+                    )));
+                }
+                previous = Some(id);
+            }
+            let codec = sources
+                .expert(experts[0])
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "sp schedule layer {layer} group {group}: expert {} is not held",
+                        experts[0]
+                    ))
+                })?
+                .codec;
+            for &id in &experts {
+                match sources.expert(id) {
+                    Some(expert) if expert.codec == codec => {}
+                    Some(_) => {
+                        return Err(invalid(format!(
+                            "sp schedule layer {layer} group {group}: expert {id} does not share codec {codec:?}"
+                        )))
+                    }
+                    None => {
+                        return Err(invalid(format!(
+                            "sp schedule layer {layer} group {group}: expert {id} is not held"
+                        )))
+                    }
+                }
+            }
+            let layout = plan_group_layout(&experts, sources)?;
+            layouts.push((layout.submitted_bytes() as u64, layout.used));
+            plans.push(ExpertGroupPlan {
+                layer,
+                group,
+                codec,
+                experts,
+            });
+        }
+        self.plan = Some(SpPlannedLayer {
+            layer,
+            tickets: vec![None; plans.len()],
+            groups: plans,
+            layouts,
+            entered: false,
+        });
+        Ok(())
+    }
+
+    /// The planned groups of `layer` (the layer last planned).
+    pub(crate) fn planned_groups(&self, layer: usize) -> Option<&[ExpertGroupPlan]> {
+        self.plan
+            .as_ref()
+            .filter(|p| p.layer == layer)
+            .map(|p| p.groups.as_slice())
+    }
+}
+
+impl RingSchedule for SpSchedule<'_> {
+    /// `begin_window` plus `set_layers(None, None)`: zero enqueues.
+    fn prime<B: PanelBackend>(&mut self, core: &mut RingCore<B>, ctx: &B::Ctx) -> R<usize> {
+        self.plan = None;
+        self.current = None;
+        self.submitted = 0;
+        core.begin_window(ctx)?;
+        core.set_layers(None, None)?;
+        Ok(0)
+    }
+
+    /// Enqueue every planned group of `layer` at once. Every refusal that can
+    /// be decided from the plan (not planned, more groups than free pages, an
+    /// oversized group) happens before the ring is touched. A group the ring
+    /// then cannot take is a protocol bug: the ring is quarantined and the
+    /// caller must drain; the host never waits for a page.
+    fn enter_layer<B: PanelBackend>(
+        &mut self,
+        core: &mut RingCore<B>,
+        ctx: &B::Ctx,
+        layer: usize,
+    ) -> R<usize> {
+        core.check_live()?;
+        let base = self.sources;
+        let plan = match self.plan.as_mut() {
+            Some(plan) if plan.layer == layer && !plan.entered => plan,
+            Some(plan) if plan.layer == layer => {
+                return Err(invalid(format!(
+                    "sp schedule: layer {layer} was already entered this window"
+                )))
+            }
+            other => {
+                return Err(invalid(format!(
+                    "sp schedule: layer {layer} entered without plan_layer (planned {:?})",
+                    other.map(|p| p.layer)
+                )))
+            }
+        };
+        let sources = base
+            .sources_of(layer)
+            .ok_or_else(|| invalid(format!("sp schedule: layer {layer} is not a host layer")))?;
+        if sources.num_experts() != core.spec.num_experts {
+            return Err(invalid(format!(
+                "sp schedule: sources hold a {}-entry table, the pool {}",
+                sources.num_experts(),
+                core.spec.num_experts
+            )));
+        }
+        let groups = plan.groups.len();
+        if groups > core.free.len() {
+            return Err(invalid(format!(
+                "sp schedule layer {layer}: {groups} groups need {groups} pages, the ring has {} free of {}",
+                core.free.len(),
+                core.pages.len()
+            )));
+        }
+        let page_bytes = core
+            .spec
+            .page_bytes()
+            .ok_or_else(|| invalid("panel page size overflows"))?;
+        for (group, &(_, used)) in plan.groups.iter().zip(&plan.layouts) {
+            if group.experts.len() > core.spec.experts_per_slot {
+                return Err(invalid(format!(
+                    "sp schedule layer {layer} group {}: {} experts exceed the pool's {} per page",
+                    group.group,
+                    group.experts.len(),
+                    core.spec.experts_per_slot
+                )));
+            }
+            if used
+                .checked_add(ARENA_TAIL_PAD_BYTES)
+                .map_or(true, |need| need > page_bytes)
+            {
+                return Err(invalid(format!(
+                    "sp schedule layer {layer} group {} needs {used} payload bytes plus pad, a page holds {page_bytes}",
+                    group.group
+                )));
+            }
+        }
+        core.set_layers(Some(layer), None)?;
+        plan.entered = true;
+        self.current = Some(layer);
+        for index in 0..groups {
+            match core.try_enqueue_scheduled(ctx, &plan.groups[index], sources)? {
+                Some(ticket) => {
+                    plan.tickets[index] = Some(ticket);
+                    self.submitted += plan.layouts[index].0;
+                }
+                None => {
+                    core.poisoned = true;
+                    return Err(invalid(format!(
+                        "sp schedule layer {layer} group {index}: no free page after {index} of {groups} groups although {groups} pages were free (protocol bug; drain the ring)"
+                    )));
+                }
+            }
+        }
+        Ok(groups)
+    }
+
+    /// Nothing is prefetched or refilled: every group of the layer already
+    /// holds its page.
+    fn pump<B: PanelBackend>(&mut self, _core: &mut RingCore<B>, _ctx: &B::Ctx) -> R<usize> {
+        Ok(0)
+    }
+
+    /// The ticket of an enqueued group; never enqueues or waits.
+    fn require<B: PanelBackend>(
+        &mut self,
+        _core: &mut RingCore<B>,
+        _ctx: &B::Ctx,
+        layer: usize,
+        group: u32,
+    ) -> R<PanelTicket> {
+        RingSchedule::ticket(&*self, layer, group).ok_or_else(|| {
+            invalid(format!(
+                "sp schedule layer {layer} group {group} has no ticket: it is not in the entered layer's plan"
+            ))
+        })
+    }
+
+    fn ticket(&self, layer: usize, group: u32) -> Option<PanelTicket> {
+        self.plan
+            .as_ref()
+            .filter(|p| p.layer == layer && p.entered)
+            .and_then(|p| p.tickets.get(group as usize).copied().flatten())
+    }
+
+    fn submitted_bytes(&self) -> u64 {
+        self.submitted
     }
 }
 
@@ -1977,6 +2459,24 @@ impl PanelBackend for HipPanelBackend {
         Ok(())
     }
 
+    fn copy_payload_device(
+        &mut self,
+        gpu: &Gpu,
+        slot: usize,
+        src: usize,
+        dst: usize,
+        len: usize,
+    ) -> R<()> {
+        // SAFETY: `src..src+len` was checked against the tier layer's device owner range in
+        // `LayerExpertSources::new_tier`; the ring retains the owner until this copy is known
+        // complete, and the borrowed view is never freed.
+        let source =
+            unsafe { hip_bridge::DeviceBuffer::from_raw(src as *mut std::ffi::c_void, len) };
+        gpu.hip
+            .memcpy_dtod_async_at(&self.payloads[slot].buf, dst, &source, 0, len, &self.copy)?;
+        Ok(())
+    }
+
     fn copy_zero(&mut self, gpu: &Gpu, slot: usize, dst: usize, len: usize) -> R<()> {
         gpu.hip.memset_async(
             &self.payloads[slot].buf.byte_view(dst, len),
@@ -2144,30 +2644,30 @@ impl ExpertPanelRing {
 
     /// Start a window and prefetch the first host layer's groups (no compute
     /// layer yet). Returns the number of groups enqueued.
-    pub(crate) fn prime(&mut self, gpu: &Gpu, schedule: &mut PanelSchedule) -> R<usize> {
+    pub(crate) fn prime<S: RingSchedule>(&mut self, gpu: &Gpu, schedule: &mut S) -> R<usize> {
         schedule.prime(&mut self.core, gpu)
     }
 
     /// Compute reached host layer `layer`.
-    pub(crate) fn enter_layer(
+    pub(crate) fn enter_layer<S: RingSchedule>(
         &mut self,
         gpu: &Gpu,
-        schedule: &mut PanelSchedule,
+        schedule: &mut S,
         layer: usize,
     ) -> R<usize> {
         schedule.enter_layer(&mut self.core, gpu, layer)
     }
 
-    /// Enqueue whatever free pages allow (call after each retire).
-    pub(crate) fn pump(&mut self, gpu: &Gpu, schedule: &mut PanelSchedule) -> R<usize> {
+    /// Enqueue whatever the schedule allows (call after each retire).
+    pub(crate) fn pump<S: RingSchedule>(&mut self, gpu: &Gpu, schedule: &mut S) -> R<usize> {
         schedule.pump(&mut self.core, gpu)
     }
 
-    /// Ticket of current-layer `group`, enqueueing it if still missing.
-    pub(crate) fn require(
+    /// Ticket of current-layer `group`, enqueueing it if the schedule does so.
+    pub(crate) fn require<S: RingSchedule>(
         &mut self,
         gpu: &Gpu,
-        schedule: &mut PanelSchedule,
+        schedule: &mut S,
         layer: usize,
         group: u32,
     ) -> R<PanelTicket> {
@@ -2261,6 +2761,10 @@ pub(crate) struct ImageCheck {
 /// entry, rebased onto `page_base`) must equal the source extent byte for
 /// byte, the tail pad must be zero, group entries must point inside the
 /// payload and every other table entry must be zero.
+///
+/// A device-resident expert of a tier layer (see [`LayerExpertSources::new_tier`]) has no
+/// pinned host source: `device_source` reads `len` bytes at a device address (the selftest
+/// passes a D2H download); `None` makes such an expert an error.
 fn verify_page_image(
     image: &[u8],
     used: usize,
@@ -2269,6 +2773,7 @@ fn verify_page_image(
     sources: &LayerExpertSources,
     gate_up_table: &[u64],
     down_table: &[u64],
+    device_source: Option<&dyn Fn(usize, usize) -> R<Vec<u8>>>,
 ) -> R<ImageCheck> {
     let layer = sources.layer();
     let fail = |what: String| invalid(format!("panel image layer {layer}: {what}"));
@@ -2336,10 +2841,20 @@ fn verify_page_image(
                         extent.len
                     ))
                 })?;
-            // SAFETY: the extent was bounds-checked against the pinned host
-            // range of `sources`, which its owner keeps alive and unmodified.
-            let source =
-                unsafe { std::slice::from_raw_parts(extent.addr as *const u8, extent.len) };
+            let device_bytes;
+            let source: &[u8] = if sources.is_device(id) {
+                let read = device_source.ok_or_else(|| {
+                    fail(format!(
+                        "expert {id} is device-resident and no device reader was given"
+                    ))
+                })?;
+                device_bytes = read(extent.addr, extent.len)?;
+                &device_bytes
+            } else {
+                // SAFETY: the extent was bounds-checked against the pinned host
+                // range of `sources`, which its owner keeps alive and unmodified.
+                unsafe { std::slice::from_raw_parts(extent.addr as *const u8, extent.len) }
+            };
             if let Some(at) = source
                 .iter()
                 .zip(&image[offset..end])
@@ -2613,6 +3128,15 @@ fn run_selftest(
         let gate_up = decode(&image[page_bytes..page_bytes + table_bytes]);
         let down = decode(&image[page_bytes + table_bytes..page_bytes + 2 * table_bytes]);
         let sources = &schedule.layers[reader.layer_index].sources;
+        let device_source = |addr: usize, len: usize| -> R<Vec<u8>> {
+            // SAFETY: `addr..addr+len` was bounds checked against the tier layer's device
+            // owner in `LayerExpertSources::new_tier`; the borrowed view is never freed.
+            let view =
+                unsafe { hip_bridge::DeviceBuffer::from_raw(addr as *mut std::ffi::c_void, len) };
+            let mut bytes = vec![0u8; len];
+            gpu.hip.memcpy_dtoh(bytes.as_mut_slice(), &view)?;
+            Ok(bytes)
+        };
         let check = verify_page_image(
             &image[..page_bytes],
             reader.used,
@@ -2621,6 +3145,7 @@ fn run_selftest(
             sources,
             &gate_up,
             &down,
+            Some(&device_source),
         )?;
         report.groups_checked += 1;
         report.payload_bytes_compared += check.payload_bytes;
@@ -3424,6 +3949,7 @@ mod slowlink_ring {
         AwaitCopyDone(usize),
         Begin(usize, bool),
         Payload(usize, usize, usize, usize),
+        PayloadDevice(usize, usize, usize, usize),
         Zero(usize, usize, usize),
         Tables(usize),
         End(usize),
@@ -3456,10 +3982,15 @@ mod slowlink_ring {
 
     impl Mock {
         fn new(pages: usize) -> Self {
+            Self::sized(pages, EXPERTS)
+        }
+
+        /// A mock whose per-page pointer tables hold `experts` entries.
+        fn sized(pages: usize, experts: usize) -> Self {
             Self {
                 ops: Vec::new(),
                 tables: (0..pages)
-                    .map(|_| (vec![0; EXPERTS], vec![0; EXPERTS]))
+                    .map(|_| (vec![0; experts], vec![0; experts]))
                     .collect(),
                 clock: 0.0,
                 times: HashMap::new(),
@@ -3520,6 +4051,16 @@ mod slowlink_ring {
             len: usize,
         ) -> R<()> {
             self.op(Op::Payload(slot, src, dst, len))
+        }
+        fn copy_payload_device(
+            &mut self,
+            _: &(),
+            slot: usize,
+            src: usize,
+            dst: usize,
+            len: usize,
+        ) -> R<()> {
+            self.op(Op::PayloadDevice(slot, src, dst, len))
         }
         fn copy_zero(&mut self, _: &(), slot: usize, dst: usize, len: usize) -> R<()> {
             self.op(Op::Zero(slot, dst, len))
@@ -3632,6 +4173,204 @@ mod slowlink_ring {
 
     fn err_text(error: Qwen4GpuForwardError) -> String {
         error.to_string()
+    }
+
+    const DEVICE: usize = 0x5_0000_0000;
+
+    /// A tier layer: experts `0..EXPERTS`, every third one device-resident (device owner packs
+    /// them in REVERSE id order with a gap between experts, so no two are adjacent), the others cold in the pinned host
+    /// owner in id order.
+    fn tier_sources(layer: usize) -> LayerExpertSources {
+        let hot: Vec<usize> = (0..EXPERTS).filter(|id| id % 3 == 0).collect();
+        let experts: Vec<_> = (0..EXPERTS)
+            .map(|id| {
+                let (gate_up, down) = match hot.iter().rev().position(|&h| h == id) {
+                    Some(slot) => {
+                        let base = DEVICE + slot * 2 * (GU + DN);
+                        (base, base + GU)
+                    }
+                    None => {
+                        let base = HOST + id * (GU + DN);
+                        (base, base + GU)
+                    }
+                };
+                Some(ExpertSource {
+                    codec: PanelCodec(0),
+                    gate_up: ExpertExtent {
+                        addr: gate_up,
+                        len: GU,
+                    },
+                    down: ExpertExtent {
+                        addr: down,
+                        len: DN,
+                    },
+                })
+            })
+            .collect();
+        let on_device = (0..EXPERTS).map(|id| id % 3 == 0).collect();
+        // SAFETY: the mock backend never dereferences a source address.
+        unsafe {
+            LayerExpertSources::new_tier(
+                layer,
+                (HOST, EXPERTS * (GU + DN)),
+                (DEVICE, hot.len() * 2 * (GU + DN)),
+                experts,
+                on_device,
+                Arc::new(0u8),
+            )
+        }
+        .unwrap()
+    }
+
+    #[test]
+    fn s1_tier_layout_copies_hot_experts_device_to_device_and_cold_over_the_link() {
+        let s = tier_sources(5);
+        assert_eq!(
+            s.device_experts(),
+            (0..EXPERTS).filter(|id| id % 3 == 0).count()
+        );
+        assert!(s.is_device(3) && !s.is_device(4));
+        // One group of 4 consecutive experts: ids 12..16 -> 12 hot, 13/14/15: 15 hot.
+        let g = group(&s, 3);
+        assert_eq!(g.experts.as_slice(), &[12, 13, 14, 15]);
+        let layout = plan_group_layout(&g.experts, &s).unwrap();
+        let device_bytes: usize = layout.runs.iter().filter(|r| r.device).map(|r| r.len).sum();
+        let host_bytes: usize = layout
+            .runs
+            .iter()
+            .filter(|r| !r.device)
+            .map(|r| r.len)
+            .sum();
+        // Two hot experts (12, 15), two cold (13, 14).
+        assert_eq!(device_bytes, 2 * (GU + DN));
+        assert_eq!(host_bytes, 2 * (GU + DN));
+        assert_eq!(layout.device_bytes(), device_bytes);
+        assert_eq!(
+            layout.submitted_bytes(),
+            host_bytes + device_bytes,
+            "submitted counts every run; the link bytes are the host runs"
+        );
+        assert_eq!(layout.extent_bytes, device_bytes + host_bytes);
+        // The two cold experts are adjacent in the host owner: one merged host run.
+        assert_eq!(layout.runs.iter().filter(|r| !r.device).count(), 1);
+        // Hot experts 12 and 15 sit at device slots (reverse order) with a gap: two runs.
+        assert_eq!(layout.runs.iter().filter(|r| r.device).count(), 2);
+        // Every run keeps the source address congruence and runs never overlap in the page.
+        let mut spans: Vec<_> = layout.runs.iter().map(|r| (r.dst, r.dst + r.len)).collect();
+        spans.sort_unstable();
+        assert!(spans.windows(2).all(|w| w[0].1 <= w[1].0));
+        for run in &layout.runs {
+            assert_eq!(run.dst % EXTENT_ALIGN, run.src % EXTENT_ALIGN);
+        }
+        // The tables point every group expert (hot and cold) into the page, others zero.
+        let (mut gu, mut dn) = (vec![u64::MAX; EXPERTS], vec![u64::MAX; EXPERTS]);
+        let base = 0x2_0000_0000usize;
+        fill_tables(&layout, &g.experts, base, &mut gu, &mut dn).unwrap();
+        for &id in &g.experts {
+            assert!(gu[id] as usize >= base && gu[id] as usize <= base + layout.used);
+            assert_eq!(dn[id] - gu[id], GU as u64);
+        }
+        assert_eq!(gu.iter().filter(|&&v| v != 0).count(), 4);
+    }
+
+    #[test]
+    fn s1_tier_ring_issues_device_copies_and_counts_device_bytes_apart() {
+        let mut ring = core(2, 0);
+        ring.begin_window(&()).unwrap();
+        ring.set_layers(Some(0), None).unwrap();
+        let s = tier_sources(0);
+        let g = group(&s, 3);
+        let ticket = ring.enqueue(&(), &g, &s).unwrap();
+        let ops = &ring.backend.ops;
+        let device: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::PayloadDevice(_, src, _, len) => Some((*src, *len)),
+                _ => None,
+            })
+            .collect();
+        let host: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Payload(_, src, _, len) => Some((*src, *len)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(device.len(), 2);
+        assert!(device.iter().all(|(src, _)| *src >= DEVICE));
+        assert_eq!(host.len(), 1);
+        assert!(host.iter().all(|(src, _)| (HOST..DEVICE).contains(src)));
+        assert_eq!(ring.stats.submitted_payload_bytes, 4 * (GU + DN) as u64);
+        assert_eq!(ring.stats.device_payload_bytes, 2 * (GU + DN) as u64);
+        ring.acquire(&(), ticket).unwrap();
+        ring.retire(&(), ticket).unwrap();
+    }
+
+    #[test]
+    fn s1_tier_sources_bound_every_extent_by_its_own_kind_of_owner() {
+        // A hot expert whose extent lies in the HOST range (or a cold one in the device range) is
+        // refused: the kind decides which owner bounds the extent.
+        let one = |gate_up: usize, down: usize, device: bool| {
+            let experts = vec![Some(ExpertSource {
+                codec: PanelCodec(0),
+                gate_up: ExpertExtent {
+                    addr: gate_up,
+                    len: GU,
+                },
+                down: ExpertExtent {
+                    addr: down,
+                    len: DN,
+                },
+            })];
+            // SAFETY: never dereferenced.
+            unsafe {
+                LayerExpertSources::new_tier(
+                    0,
+                    (HOST, 4 * (GU + DN)),
+                    (DEVICE, 4 * (GU + DN)),
+                    experts,
+                    vec![device],
+                    Arc::new(0u8),
+                )
+            }
+        };
+        assert!(one(DEVICE, DEVICE + GU, true).is_ok());
+        assert!(one(HOST, HOST + GU, false).is_ok());
+        let hot_in_host = err_text(one(HOST, HOST + GU, true).err().unwrap());
+        assert!(hot_in_host.contains("device owner"), "{hot_in_host}");
+        let cold_in_device = err_text(one(DEVICE, DEVICE + GU, false).err().unwrap());
+        assert!(cold_in_device.contains("host owner"), "{cold_in_device}");
+        // Past the end of the device owner.
+        assert!(one(DEVICE + 4 * (GU + DN) - GU, DEVICE + 4 * (GU + DN), true).is_err());
+        // Flags must cover every expert.
+        let experts = vec![None, None];
+        // SAFETY: never dereferenced.
+        let bad = unsafe {
+            LayerExpertSources::new_tier(
+                0,
+                (HOST, 1),
+                (DEVICE, 1),
+                experts,
+                vec![false],
+                Arc::new(0u8),
+            )
+        };
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn s1_tier_pages_stay_within_the_admitted_worst_case_payload() {
+        // The admission sizes a page for 32 experts plus the worst-case unmerged-run slack
+        // (`2 * experts_per_page` extents of at most `2 * 255` bytes each); an all-unmerged
+        // mixed group (alternating hot/cold, device owner in reverse order) must fit it.
+        let s = tier_sources(0);
+        for group in ExpertGroupPlan::partition(&s, MAX_GROUP_EXPERTS).unwrap() {
+            let layout = plan_group_layout(&group.experts, &s).unwrap();
+            let bound = group.experts.len() * (GU + DN) + 2 * group.experts.len() * 2 * 255;
+            assert!(layout.used <= bound, "{} > {bound}", layout.used);
+            assert_eq!(layout.submitted_bytes(), group.experts.len() * (GU + DN));
+            assert!(layout.device_bytes() <= layout.submitted_bytes());
+        }
     }
 
     #[test]
@@ -3942,6 +4681,64 @@ mod slowlink_ring {
             }
             .is_err());
         }
+    }
+
+    /// A mixed MQ4 + W3 slab arena (mq3-xts): each expert's panel source is its OWN codec
+    /// extent (`codec_slot_bytes`), so the last expert ends exactly at the arena's end. The
+    /// dense-dtype stride the expert view carries (`m * row_stride`: 1,280 rows x 2,560 B =
+    /// 3,276,800 B for a planar W3 gate/up) overruns the host owner on the last W3 expert, the
+    /// 'extent is outside the host owner' load failure of the first S1 slab card run.
+    #[test]
+    fn slowlink_ring_slab_alias_uses_each_experts_own_codec_extent() {
+        use crate::expert_arena::{codec_slot_bytes, CODEC_MQ4, CODEC_W3};
+        const EXPERTS: usize = 512;
+        let alias_base = 0x5000_0000usize;
+        // Every third expert MQ4 (hot), the rest W3: expert 511 is W3 (511 % 3 == 1).
+        let codecs: Vec<u8> = (0..EXPERTS)
+            .map(|id| if id % 3 == 0 { CODEC_MQ4 } else { CODEC_W3 })
+            .collect();
+        let mut cursor = 0usize;
+        let mut real = Vec::new();
+        let mut dense = Vec::new();
+        for codec in &codecs {
+            let (gate_up, down) = codec_slot_bytes(*codec).unwrap();
+            real.push(Some(AliasExpert {
+                codec: PanelCodec(0),
+                gate_up_addr: alias_base + cursor,
+                gate_up_len: gate_up,
+                down_addr: alias_base + cursor + gate_up,
+                down_len: down,
+            }));
+            // The dense row-stride arithmetic: 1,280 x 2,560 and 2,560 x 640 bytes for W3.
+            let (dense_gate_up, dense_down) = if *codec == CODEC_MQ4 {
+                (gate_up, down)
+            } else {
+                (1280 * 2560, 2560 * 640)
+            };
+            dense.push(Some(AliasExpert {
+                codec: PanelCodec(0),
+                gate_up_addr: alias_base + cursor,
+                gate_up_len: dense_gate_up,
+                down_addr: alias_base + cursor + gate_up,
+                down_len: dense_down,
+            }));
+            cursor += gate_up + down;
+        }
+        let arena_bytes = cursor;
+        assert_eq!(arena_bytes, 171 * 2_611_200 + 341 * 1_920_000);
+        // SAFETY: never dereferenced.
+        let sources = unsafe {
+            LayerExpertSources::from_alias(15, HOST, alias_base, arena_bytes, &real, Arc::new(0u8))
+        }
+        .unwrap();
+        let last = sources.expert(EXPERTS - 1).unwrap();
+        assert_eq!(last.gate_up.len, 1_280_000);
+        assert_eq!(last.down.addr + last.down.len, HOST + arena_bytes);
+        // SAFETY: construction must fail.
+        let overrun = unsafe {
+            LayerExpertSources::from_alias(15, HOST, alias_base, arena_bytes, &dense, Arc::new(0u8))
+        };
+        assert!(overrun.is_err());
     }
 
     #[test]
@@ -4296,7 +5093,7 @@ mod slowlink_ring {
         let experts = [3usize, 4, 9, 40];
         let base = 0x2_0000_0000usize;
         let (image, used, gu, dn) = page_image(&s, &experts, base);
-        let check = verify_page_image(&image, used, base, &experts, &s, &gu, &dn).unwrap();
+        let check = verify_page_image(&image, used, base, &experts, &s, &gu, &dn, None).unwrap();
         assert_eq!(check.payload_bytes, (4 * (GU + DN)) as u64);
         assert_eq!(check.table_entries, 2 * EXPERTS as u64);
         assert_eq!(check.pad_bytes, ARENA_TAIL_PAD_BYTES as u64);
@@ -4310,7 +5107,7 @@ mod slowlink_ring {
         let base = 0x2_0000_0000usize;
         let (image, used, gu, dn) = page_image(&s, &experts, base);
         let ok = |image: &[u8], gu: &[u64], dn: &[u64]| {
-            verify_page_image(image, used, base, &experts, &s, gu, dn)
+            verify_page_image(image, used, base, &experts, &s, gu, dn, None)
         };
         assert!(ok(&image, &gu, &dn).is_ok());
         // A refilled page: any payload byte differing from the pinned source.
@@ -4360,10 +5157,10 @@ mod slowlink_ring {
         let (img_a, used_a, gu_a, dn_a) = page_image(&s, &a, base);
         let (img_b, used_b, gu_b, dn_b) = page_image(&s, &b, base);
         assert_eq!(used_a, used_b);
-        verify_page_image(&img_a, used_a, base, &a, &s, &gu_a, &dn_a).unwrap();
-        verify_page_image(&img_b, used_b, base, &b, &s, &gu_b, &dn_b).unwrap();
-        assert!(verify_page_image(&img_b, used_a, base, &a, &s, &gu_a, &dn_a).is_err());
-        assert!(verify_page_image(&img_a, used_a, base, &a, &s, &gu_b, &dn_b).is_err());
+        verify_page_image(&img_a, used_a, base, &a, &s, &gu_a, &dn_a, None).unwrap();
+        verify_page_image(&img_b, used_b, base, &b, &s, &gu_b, &dn_b, None).unwrap();
+        assert!(verify_page_image(&img_b, used_a, base, &a, &s, &gu_a, &dn_a, None).is_err());
+        assert!(verify_page_image(&img_a, used_a, base, &a, &s, &gu_b, &dn_b, None).is_err());
     }
 
     #[test]
@@ -4811,5 +5608,398 @@ mod slowlink_ring {
         assert_eq!(timeline.stats.timeline_overflow, 1);
         // Closing a layer that was never marked is an error (no invented data).
         assert!(ring.mark_layer_end(&(), 9).is_err());
+    }
+
+    // ── SP selective schedule on the CPU model of the ring ───────────
+
+    /// `experts` experts back to back, one codec.
+    fn sp_sources(layer: usize, experts: usize) -> LayerExpertSources {
+        let table = (0..experts)
+            .map(|id| {
+                let base = HOST + id * (GU + DN);
+                Some(ExpertSource {
+                    codec: PanelCodec(1),
+                    gate_up: ExpertExtent {
+                        addr: base,
+                        len: GU,
+                    },
+                    down: ExpertExtent {
+                        addr: base + GU,
+                        len: DN,
+                    },
+                })
+            })
+            .collect();
+        // SAFETY: the mock backend never dereferences a source address.
+        unsafe { LayerExpertSources::new(layer, HOST, experts * (GU + DN), table, Arc::new(0u8)) }
+            .unwrap()
+    }
+
+    fn sp_spec(pages: usize, experts: usize, per_slot: usize) -> PanelPoolSpec {
+        PanelPoolSpec {
+            active_slots: 2,
+            lookahead_pages: pages - 2,
+            experts_per_slot: per_slot,
+            num_experts: experts,
+            payload_bytes: per_slot * (GU + DN),
+            timeline_records: 64,
+            timeline_layers: 8,
+        }
+    }
+
+    fn sp_ring(pages: usize, experts: usize, per_slot: usize) -> RingCore<Mock> {
+        RingCore::new(
+            sp_spec(pages, experts, per_slot),
+            Mock::sized(pages, experts),
+        )
+        .unwrap()
+    }
+
+    fn ids(group: &[u16]) -> Vec<usize> {
+        group.iter().map(|&id| usize::from(id)).collect()
+    }
+
+    /// Consume every group of the entered layer, one acquire/retire each.
+    fn sp_consume(sp: &mut SpSchedule<'_>, ring: &mut RingCore<Mock>, layer: usize, groups: usize) {
+        for group in 0..groups as u32 {
+            let ticket = sp.require(ring, &(), layer, group).unwrap();
+            ring.acquire(&(), ticket).unwrap();
+            ring.retire(&(), ticket).unwrap();
+            assert_eq!(sp.pump(ring, &()).unwrap(), 0, "SP never refills a page");
+        }
+    }
+
+    #[test]
+    fn sp_ring_prime_enqueues_nothing_and_declares_no_layer() {
+        let sweep = PanelSchedule::new(vec![sources(2), sources(5)], 4).unwrap();
+        let mut sp = SpSchedule::new(&sweep);
+        let mut ring = core(2, 16);
+        assert_eq!(sp.prime(&mut ring, &()).unwrap(), 0);
+        assert_eq!(
+            ring.backend.ops,
+            vec![Op::Base],
+            "only the window's base mark"
+        );
+        assert_eq!(ring.stats().enqueued, 0);
+        assert_eq!(ring.stats().submitted_payload_bytes, 0);
+        assert_eq!(sp.submitted_bytes(), 0);
+        assert_eq!((ring.current, ring.next), (None, None));
+        // No layer is current, so the page-order prefetch cannot sneak in.
+        let s = sources(2);
+        assert!(ring.try_enqueue(&(), &group(&s, 0), &s).is_err());
+        assert_eq!(sp.pump(&mut ring, &()).unwrap(), 0);
+        assert_eq!(ring.backend.ops, vec![Op::Base]);
+        // The sweep schedule on the same sources would have primed 16 groups.
+        let mut other = PanelSchedule::new(vec![sources(2), sources(5)], 4).unwrap();
+        let mut ring2 = core(2, 16);
+        assert_eq!(other.prime(&mut ring2, &()).unwrap(), 16);
+    }
+
+    #[test]
+    fn sp_ring_enter_layer_enqueues_exactly_the_plan() {
+        let sweep = PanelSchedule::new(vec![sources(3), sources(7)], 4).unwrap();
+        let mut sp = SpSchedule::new(&sweep);
+        let mut ring = core(2, 4);
+        sp.prime(&mut ring, &()).unwrap();
+        let groups: Vec<Vec<u16>> = vec![vec![1, 5, 9, 13], vec![20, 21, 40, 41], vec![63]];
+        sp.plan_layer(3, &groups).unwrap();
+        assert_eq!(ring.stats().enqueued, 0, "planning touches no page");
+        assert_eq!(ring.backend.ops, vec![Op::Base]);
+        assert_eq!(sp.enter_layer(&mut ring, &(), 3).unwrap(), 3);
+        assert_eq!(ring.stats().enqueued, 3);
+        assert_eq!(ring.stats().page_full_stalls, 0);
+        assert_eq!(ring.current, Some(3));
+        assert_eq!(sp.planned_groups(3).unwrap().len(), 3);
+        for (index, group) in groups.iter().enumerate() {
+            let ticket = sp.ticket(3, index as u32).unwrap();
+            assert_eq!((ticket.layer, ticket.group), (3, index as u32));
+            assert_eq!(sp.require(&mut ring, &(), 3, index as u32).unwrap(), ticket);
+            // The page's pointer tables name exactly the planned (sparse) experts.
+            let (gate_up, down) = &ring.backend.tables[ticket.slot];
+            for table in [gate_up, down] {
+                let held: Vec<usize> = table
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &entry)| entry != 0)
+                    .map(|(id, _)| id)
+                    .collect();
+                assert_eq!(held, ids(group));
+            }
+        }
+        // Nothing beyond the plan exists.
+        assert!(sp.ticket(3, 3).is_none());
+        assert!(sp.require(&mut ring, &(), 3, 3).is_err());
+        assert!(sp.require(&mut ring, &(), 7, 0).is_err());
+        sp_consume(&mut sp, &mut ring, 3, 3);
+        assert_eq!(ring.stats().enqueued, 3, "retires never refill");
+        assert_eq!(ring.stats().discarded, 0);
+        // A layer that streams nothing (k = 0) still advances the window.
+        sp.plan_layer(7, &[]).unwrap();
+        assert_eq!(sp.enter_layer(&mut ring, &(), 7).unwrap(), 0);
+        assert_eq!(ring.current, Some(7));
+        assert_eq!(ring.stats().enqueued, 3);
+    }
+
+    #[test]
+    fn sp_ring_submitted_bytes_equal_the_layout_sum() {
+        let sweep = PanelSchedule::new(vec![sources(3), sources(7)], 4).unwrap();
+        let plans: Vec<(usize, Vec<Vec<u16>>)> = vec![
+            (
+                3,
+                vec![vec![0, 1, 2, 3], vec![10, 12, 14, 16], vec![30, 31]],
+            ),
+            (7, vec![vec![2, 40, 41, 42], vec![50]]),
+        ];
+        let mut expected = 0u64;
+        let mut experts = 0usize;
+        for (layer, groups) in &plans {
+            let held = sweep.sources_of(*layer).unwrap();
+            for group in groups {
+                let layout = plan_group_layout(&ids(group), held).unwrap();
+                expected += layout.submitted_bytes() as u64;
+                experts += group.len();
+            }
+        }
+        assert_eq!(expected, (experts * (GU + DN)) as u64);
+        let mut sp = SpSchedule::new(&sweep);
+        let mut ring = core(2, 4);
+        sp.prime(&mut ring, &()).unwrap();
+        for (layer, groups) in &plans {
+            sp.plan_layer(*layer, groups).unwrap();
+            assert_eq!(
+                sp.enter_layer(&mut ring, &(), *layer).unwrap(),
+                groups.len()
+            );
+            sp_consume(&mut sp, &mut ring, *layer, groups.len());
+        }
+        let stats = ring.stats();
+        assert_eq!(stats.submitted_payload_bytes, expected);
+        assert_eq!(sp.submitted_bytes(), expected);
+        assert_eq!(stats.acquired_payload_bytes, expected);
+        assert_eq!(stats.enqueued, 5);
+        assert_eq!((stats.retired, stats.discarded), (5, 0));
+        assert!(
+            sp.submitted_bytes() < sweep.sweep_bytes(),
+            "a selective window submits less than the full sweep"
+        );
+    }
+
+    #[test]
+    fn sp_ring_sixteen_groups_of_thirty_two_enqueue_without_stall() {
+        for pages in [16usize, 18] {
+            let sweep = PanelSchedule::new(vec![sp_sources(0, 512)], 32).unwrap();
+            let mut sp = SpSchedule::new(&sweep);
+            let mut ring = sp_ring(pages, 512, 32);
+            sp.prime(&mut ring, &()).unwrap();
+            let groups: Vec<Vec<u16>> = (0..16)
+                .map(|g| (0..32).map(|i| (g * 32 + i) as u16).collect())
+                .collect();
+            sp.plan_layer(0, &groups).unwrap();
+            assert_eq!(sp.enter_layer(&mut ring, &(), 0).unwrap(), 16);
+            let stats = ring.stats();
+            assert_eq!(stats.enqueued, 16);
+            assert_eq!(stats.page_full_stalls, 0, "{pages} pages never stall");
+            assert_eq!(stats.submitted_payload_bytes, (512 * (GU + DN)) as u64);
+            assert_eq!(ring.free.len(), pages - 16);
+            sp_consume(&mut sp, &mut ring, 0, 16);
+            assert_eq!(ring.free.len(), pages);
+        }
+        // Sparse: every other expert, eight groups of 32 ascending experts.
+        let sweep = PanelSchedule::new(vec![sp_sources(0, 512)], 32).unwrap();
+        let mut sp = SpSchedule::new(&sweep);
+        let mut ring = sp_ring(16, 512, 32);
+        sp.prime(&mut ring, &()).unwrap();
+        let groups: Vec<Vec<u16>> = (0..8)
+            .map(|g| (0..32).map(|i| (2 * (g * 32 + i)) as u16).collect())
+            .collect();
+        sp.plan_layer(0, &groups).unwrap();
+        assert_eq!(sp.enter_layer(&mut ring, &(), 0).unwrap(), 8);
+        assert_eq!(ring.stats().page_full_stalls, 0);
+        assert_eq!(
+            ring.stats().submitted_payload_bytes,
+            (256 * (GU + DN)) as u64
+        );
+    }
+
+    #[test]
+    fn sp_ring_a_plan_beyond_the_pages_is_refused_before_any_enqueue() {
+        let sweep = PanelSchedule::new(vec![sp_sources(0, 512)], 32).unwrap();
+        let mut sp = SpSchedule::new(&sweep);
+        let mut ring = sp_ring(16, 512, 32);
+        sp.prime(&mut ring, &()).unwrap();
+        // 17 groups of 30 experts: more groups than the ring's 16 pages.
+        let groups: Vec<Vec<u16>> = (0..17)
+            .map(|g| (0..30).map(|i| (g * 30 + i) as u16).collect())
+            .collect();
+        sp.plan_layer(0, &groups).unwrap();
+        let error = err_text(sp.enter_layer(&mut ring, &(), 0).unwrap_err());
+        assert!(error.contains("17 groups"), "{error}");
+        assert_eq!(ring.stats().enqueued, 0);
+        assert_eq!(ring.stats().page_full_stalls, 0);
+        assert_eq!(ring.backend.ops, vec![Op::Base], "no copy was issued");
+        assert!(
+            !ring.is_quarantined(),
+            "a pre-enqueue refusal is not a failure"
+        );
+        assert_eq!(ring.current, None);
+        assert!(sp.ticket(0, 0).is_none());
+        // A new window recovers with a plan that fits.
+        sp.prime(&mut ring, &()).unwrap();
+        sp.plan_layer(0, &groups[..16]).unwrap();
+        assert_eq!(sp.enter_layer(&mut ring, &(), 0).unwrap(), 16);
+
+        // An oversized group for the pool's pages is also refused up front.
+        let small = PanelSchedule::new(vec![sources(3)], 4).unwrap();
+        let mut sp = SpSchedule::new(&small);
+        let mut ring = core(2, 4);
+        sp.prime(&mut ring, &()).unwrap();
+        sp.plan_layer(3, &[vec![0, 1, 2, 3], vec![4, 5, 6, 7, 8]])
+            .unwrap();
+        let error = err_text(sp.enter_layer(&mut ring, &(), 3).unwrap_err());
+        assert!(error.contains("per page"), "{error}");
+        assert_eq!(ring.stats().enqueued, 0);
+        assert_eq!(ring.backend.ops, vec![Op::Base]);
+        assert!(!ring.is_quarantined());
+    }
+
+    #[test]
+    fn sp_ring_failure_then_drain_refuses_the_stale_ticket() {
+        let sweep = PanelSchedule::new(vec![sources(3), sources(7)], 4).unwrap();
+        let mut sp = SpSchedule::new(&sweep);
+        let mut ring = core(2, 4);
+        sp.prime(&mut ring, &()).unwrap();
+        let groups: Vec<Vec<u16>> = vec![vec![0, 1, 2, 3], vec![8, 9, 10, 11], vec![16, 17]];
+        sp.plan_layer(3, &groups).unwrap();
+        // Begin, Payload, Zero, Tables, End = 5 ops per dense group: fail the
+        // second group's copy.
+        ring.backend.fail_at = Some(ring.backend.ops.len() + 5);
+        assert!(sp.enter_layer(&mut ring, &(), 3).is_err());
+        assert!(ring.is_quarantined());
+        let first = sp.ticket(3, 0).expect("the group before the failure");
+        assert!(sp.ticket(3, 1).is_none());
+        assert_eq!(ring.stats().enqueued, 1);
+        assert!(err_text(ring.acquire(&(), first).unwrap_err()).contains("quarantined"));
+        // Nothing but the drain is accepted while quarantined.
+        assert!(sp.prime(&mut ring, &()).is_err());
+        ring.drain(&()).unwrap();
+        assert!(!ring.is_quarantined());
+        assert!(ring.acquire(&(), first).is_err());
+        assert!(ring.retire(&(), first).is_err());
+        // The next window refills the page under a new epoch: the old ticket
+        // stays refused as stale.
+        sp.prime(&mut ring, &()).unwrap();
+        sp.plan_layer(3, &groups).unwrap();
+        assert_eq!(sp.enter_layer(&mut ring, &(), 3).unwrap(), 3);
+        let fresh = sp.ticket(3, 0).unwrap();
+        assert!(fresh.epoch > first.epoch);
+        let error = err_text(ring.acquire(&(), first).unwrap_err());
+        assert!(error.contains("stale"), "{error}");
+        sp_consume(&mut sp, &mut ring, 3, 3);
+        assert_eq!(ring.stats().submitted_payload_bytes, sp.submitted_bytes());
+    }
+
+    #[test]
+    fn sp_ring_windows_alternate_with_stream_all_windows() {
+        let layers = [2usize, 5];
+        let mut sweep = PanelSchedule::new(vec![sources(2), sources(5)], 4).unwrap();
+        let mut ring = core(2, 16);
+        let sp_window =
+            |sweep: &PanelSchedule, ring: &mut RingCore<Mock>, plan: &[(usize, Vec<Vec<u16>>)]| {
+                let mut sp = SpSchedule::new(sweep);
+                assert_eq!(sp.prime(ring, &()).unwrap(), 0);
+                let mut groups = 0u64;
+                for (layer, planned) in plan {
+                    sp.plan_layer(*layer, planned).unwrap();
+                    assert_eq!(sp.enter_layer(ring, &(), *layer).unwrap(), planned.len());
+                    sp_consume(&mut sp, ring, *layer, planned.len());
+                    groups += planned.len() as u64;
+                }
+                let stats = ring.stats();
+                assert_eq!(stats.enqueued, groups, "stats restart with each window");
+                assert_eq!(stats.submitted_payload_bytes, sp.submitted_bytes());
+                assert_eq!((stats.retired, stats.discarded), (groups, 0));
+                sp.submitted_bytes()
+            };
+        let first = vec![
+            (2usize, vec![vec![1u16, 5, 9, 13], vec![20, 21, 40, 41]]),
+            (5, vec![vec![63]]),
+        ];
+        let second = vec![(2usize, vec![vec![0u16, 2, 4, 6]]), (5, vec![])];
+
+        let a = sp_window(&sweep, &mut ring, &first);
+        assert_eq!(a, (9 * (GU + DN)) as u64);
+
+        // A stream-all window on the same ring: one full sweep.
+        sweep.prime(&mut ring, &()).unwrap();
+        for &layer in &layers {
+            sweep.enter_layer(&mut ring, &(), layer).unwrap();
+            for group in 0..16u32 {
+                let ticket = sweep.require(&mut ring, &(), layer, group).unwrap();
+                ring.acquire(&(), ticket).unwrap();
+                ring.retire(&(), ticket).unwrap();
+                sweep.pump(&mut ring, &()).unwrap();
+            }
+        }
+        assert_eq!(ring.stats().submitted_payload_bytes, sweep.sweep_bytes());
+        assert_eq!(RingSchedule::submitted_bytes(&sweep), sweep.sweep_bytes());
+        assert_eq!(ring.stats().enqueued, 32);
+
+        let b = sp_window(&sweep, &mut ring, &second);
+        assert_eq!(b, (4 * (GU + DN)) as u64);
+        // And back again: the first plan replays to the same bytes.
+        assert_eq!(sp_window(&sweep, &mut ring, &first), a);
+    }
+
+    #[test]
+    fn sp_ring_plan_and_layer_protocol_refusals_touch_nothing() {
+        let mixed = sources_with(3, Arc::new(0u8), |id| if id < 2 { 1 } else { 2 });
+        let sweep = PanelSchedule::new(vec![mixed, sources(7)], 4).unwrap();
+        let mut sp = SpSchedule::new(&sweep);
+        let mut ring = core(2, 4);
+        sp.prime(&mut ring, &()).unwrap();
+        let too_many: Vec<u16> = (0..33).collect();
+        for (layer, bad) in [
+            (4usize, vec![vec![0u16]]),               // not a host layer
+            (7, vec![vec![5, 3]]),                    // descending inside a group
+            (7, vec![vec![1, 2], vec![2, 3]]),        // an expert streamed twice
+            (7, vec![vec![4, 5], vec![0, 1]]),        // descending across groups
+            (7, vec![vec![]]),                        // empty group
+            (7, vec![too_many]),                      // more than a page holds
+            (7, vec![vec![0, (EXPERTS + 1) as u16]]), // expert not held
+            (3, vec![vec![0, 2]]),                    // two codecs in one group
+        ] {
+            assert!(sp.plan_layer(layer, &bad).is_err(), "{layer}: {bad:?}");
+        }
+        assert_eq!(ring.backend.ops, vec![Op::Base]);
+        // Refusals leave no plan behind.
+        assert!(sp.enter_layer(&mut ring, &(), 3).is_err());
+        assert!(sp.planned_groups(3).is_none() && sp.planned_groups(7).is_none());
+        // The codec boundary is a legal group boundary.
+        sp.plan_layer(3, &[vec![0, 1], vec![2, 3]]).unwrap();
+        // One plan at a time; the entered layer is the planned one, once.
+        assert!(sp.plan_layer(7, &[vec![1]]).is_err());
+        assert!(sp.enter_layer(&mut ring, &(), 7).is_err());
+        assert_eq!(sp.enter_layer(&mut ring, &(), 3).unwrap(), 2);
+        let live = [sp.ticket(3, 0).unwrap(), sp.ticket(3, 1).unwrap()];
+        assert!(sp.enter_layer(&mut ring, &(), 3).is_err());
+        assert!(
+            sp.plan_layer(3, &[vec![1]]).is_err(),
+            "not after the entered layer"
+        );
+        // The next layer cannot be entered while a page of this one is live;
+        // the refusal is not a device failure.
+        sp.plan_layer(7, &[vec![1]]).unwrap();
+        assert!(sp.enter_layer(&mut ring, &(), 7).is_err());
+        assert!(!ring.is_quarantined());
+        assert_eq!(ring.current, Some(3));
+        for ticket in live {
+            ring.acquire(&(), ticket).unwrap();
+            ring.retire(&(), ticket).unwrap();
+        }
+        assert_eq!(sp.enter_layer(&mut ring, &(), 7).unwrap(), 1);
+        assert_eq!(ring.current, Some(7));
+        // A layer is entered once per window, even after a drain.
+        ring.drain(&()).unwrap();
+        assert!(sp.enter_layer(&mut ring, &(), 7).is_err());
     }
 }

@@ -903,6 +903,11 @@ fn model_entry(
             }
             entry["architecture"] = architecture;
         }
+        // The daemon's one-line "what is on/off and why" for this load;
+        // absent when the ack predates it.
+        if loaded.load_summary.is_object() {
+            entry["load_summary"] = loaded.load_summary.clone();
+        }
     }
     entry
 }
@@ -1042,7 +1047,7 @@ async fn handle_request(
         }
         (Method::GET, "/stats") => {
             let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "model": meta.current_model,
                 "uptime_sec": meta.started.elapsed().as_secs(),
                 "queue_depth": shared.admission.inflight(),
@@ -1053,6 +1058,14 @@ async fn handle_request(
                 "loaded_config": loaded_config_json(&meta),
                 "swap": meta.loaded.swap.clone(),
             });
+            // Per-position speculative acceptance folded from lane done events
+            // (`draft_positions`, `spec_cycles`, `spec_committed_tokens`).
+            if let (Some(obj), Some(spec)) = (
+                body.as_object_mut(),
+                shared.metrics.spec_positions.stats_json().as_object(),
+            ) {
+                obj.extend(spec.clone());
+            }
             json_response(body, 200)
         }
         (Method::GET, "/metrics") => {
@@ -2378,6 +2391,13 @@ pub(crate) fn sse_event(name: &str, value: &serde_json::Value) -> Vec<u8> {
     bytes
 }
 
+/// The SSE comment frame announcing prefill progress (`: prefill 512/2048`).
+/// Conforming SSE parsers ignore it; `hipfire_client::read_openai_sse` turns
+/// it into `OpenAiSseEvent::PrefillProgress`.
+pub(crate) fn sse_prefill_comment(done: u64, total: u64) -> Vec<u8> {
+    format!(": prefill {done}/{total}\n\n").into_bytes()
+}
+
 /// The per-process part of a [`request_id`] (`chatcmpl-PID-N` → `PID-N`),
 /// from which the Anthropic `msg_…` and Responses `resp_…` ids derive.
 pub(crate) fn id_suffix(request_id: &str) -> &str {
@@ -2491,10 +2511,44 @@ impl SseSink {
     /// plain (no-ack) SSE bytes. No-delta mid-stream events are silent —
     /// terminal ack handles pure-tool delivery.
     fn forward_event(&self, event: &serde_json::Value) -> Result<(), hipfire_client::ClientError> {
+        if event.get("type").and_then(serde_json::Value::as_str) == Some("prefill_progress") {
+            return self.forward_progress(event);
+        }
         let Some(bytes) = self.encoder.borrow_mut().event(event) else {
             return Ok(());
         };
         self.send(ResponseChunk::plain(bytes))
+    }
+
+    /// Forward daemon prefill progress as a `: prefill <done>/<total>` SSE
+    /// comment. Progress never commits the response: until the 200 is on the
+    /// wire (a pre-commit failure must still be a JSON error) it is dropped,
+    /// and nothing follows the terminal frame. Every frame it does send
+    /// restarts the keepalive timer like any other.
+    fn forward_progress(
+        &self,
+        event: &serde_json::Value,
+    ) -> Result<(), hipfire_client::ClientError> {
+        let (Some(done), Some(total)) = (
+            event.get("done").and_then(serde_json::Value::as_u64),
+            event.get("total").and_then(serde_json::Value::as_u64),
+        ) else {
+            return Ok(());
+        };
+        if self.terminal_sent.get() {
+            return Ok(());
+        }
+        if !self.committed.get() {
+            // The handler also commits on its own silence deadline, so the
+            // shared state, not only this worker's copy, says whether the
+            // 200 is out.
+            let state = self.commit.lock().unwrap_or_else(|e| e.into_inner());
+            if !matches!(*state, StreamCommit::Committed) {
+                return Ok(());
+            }
+            self.committed.set(true);
+        }
+        self.send(ResponseChunk::plain(sse_prefill_comment(done, total)))
     }
 
     /// Serialize the terminal (released tool calls, finish, usage; chat adds
@@ -2747,6 +2801,168 @@ mod tests {
         assert!(next(&mut body).await.is_none());
     }
 
+    fn progress_event(done: u64, total: u64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "prefill_progress",
+            "id": "chatcmpl-1-1",
+            "attempt_id": 1,
+            "done": done,
+            "total": total,
+        })
+    }
+
+    fn token_event(text: &str) -> serde_json::Value {
+        serde_json::json!({ "type": "token", "id": "chatcmpl-1-1", "attempt_id": 1, "text": text })
+    }
+
+    type TestSink = (
+        SseSink,
+        Arc<Mutex<StreamCommit>>,
+        tokio::sync::mpsc::Receiver<ResponseChunk>,
+    );
+
+    fn test_sink(encoding: ResponseEncoding) -> TestSink {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let commit = Arc::new(Mutex::new(StreamCommit::Pending));
+        let sink = SseSink {
+            tx,
+            commit: Arc::clone(&commit),
+            committed: Cell::new(false),
+            terminal_sent: Cell::new(false),
+            id: "chatcmpl-1-1".to_owned(),
+            created: 0,
+            encoder: RefCell::new(encoding.stream("chatcmpl-1-1", 0, "m")),
+            stall_timeout: None,
+        };
+        (sink, commit, rx)
+    }
+
+    /// Progress before the response commits is dropped: it sends nothing,
+    /// does not commit, and a failure right after it is still the worker's
+    /// ordinary pre-commit rejection (a JSON error, never a 200 stream).
+    #[test]
+    fn prefill_progress_before_commit_is_dropped_and_does_not_commit() {
+        let (sink, commit, mut rx) = test_sink(ResponseEncoding::Chat {
+            include_usage: false,
+        });
+        sink.forward_event(&progress_event(512, 2048)).unwrap();
+        sink.forward_event(&progress_event(1024, 2048)).unwrap();
+        assert!(rx.try_recv().is_err(), "nothing may reach the wire");
+        assert!(!sink.committed.get());
+        assert!(matches!(*commit.lock().unwrap(), StreamCommit::Pending));
+        sink.finish(Err(anyhow!("model failed")), &Metrics::default());
+        assert!(
+            matches!(*commit.lock().unwrap(), StreamCommit::Rejected(_)),
+            "the failure must stay a pre-commit rejection"
+        );
+    }
+
+    /// After the first frame the comment goes out, exactly framed, in every
+    /// API's stream; the encoders never turn it into a delta or an event.
+    #[test]
+    fn prefill_progress_after_commit_is_a_comment_frame_in_every_api() {
+        let responses = responses::lower_request(&serde_json::json!({
+            "model": "m", "input": "hi", "stream": true
+        }))
+        .unwrap()
+        .echo;
+        for encoding in [
+            ResponseEncoding::Chat {
+                include_usage: false,
+            },
+            ResponseEncoding::Anthropic,
+            ResponseEncoding::Responses(responses),
+        ] {
+            let api = encoding.api();
+            let (sink, commit, mut rx) = test_sink(encoding);
+            assert!(
+                sink.encoder
+                    .borrow_mut()
+                    .event(&progress_event(1, 2))
+                    .is_none(),
+                "{api:?}: progress is not a delta"
+            );
+            sink.forward_event(&token_event("hi")).unwrap();
+            assert!(matches!(*commit.lock().unwrap(), StreamCommit::Committed));
+            let first = rx.try_recv().expect("token frame");
+            assert_ne!(first.bytes.first(), Some(&b':'), "{api:?}");
+            sink.forward_event(&progress_event(512, 2048)).unwrap();
+            let frame = rx.try_recv().expect("progress frame");
+            assert_eq!(frame.bytes, b": prefill 512/2048\n\n", "{api:?}");
+            assert!(!frame.last && frame.ack.is_none());
+            // Malformed progress is ignored, not framed.
+            sink.forward_event(&serde_json::json!({"type": "prefill_progress"}))
+                .unwrap();
+            assert!(rx.try_recv().is_err(), "{api:?}");
+        }
+    }
+
+    /// The handler also commits on its silence deadline while a long prefill
+    /// is still running; progress then flows even though no frame was sent.
+    #[test]
+    fn prefill_progress_flows_once_the_handler_has_committed() {
+        let (sink, commit, mut rx) = test_sink(ResponseEncoding::Chat {
+            include_usage: false,
+        });
+        sink.forward_event(&progress_event(512, 2048)).unwrap();
+        assert!(rx.try_recv().is_err());
+        commit_stream(&commit).unwrap();
+        sink.forward_event(&progress_event(1024, 2048)).unwrap();
+        assert_eq!(
+            rx.try_recv().expect("progress frame").bytes,
+            b": prefill 1024/2048\n\n"
+        );
+    }
+
+    /// Nothing follows the terminal frame, progress included.
+    #[test]
+    fn prefill_progress_never_follows_the_terminal_frame() {
+        let (sink, _commit, mut rx) = test_sink(ResponseEncoding::Chat {
+            include_usage: false,
+        });
+        sink.forward_event(&token_event("hi")).unwrap();
+        rx.try_recv().expect("token frame");
+        sink.terminal_sent.set(true);
+        sink.forward_event(&progress_event(2047, 2048)).unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A progress frame is activity: the keepalive timer restarts from it.
+    #[tokio::test]
+    async fn prefill_progress_frame_restarts_the_keepalive_timer() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut body = ChannelBody::new(
+            VecDeque::new(),
+            rx,
+            FlushAcks::new(),
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(120),
+        );
+        let started = Instant::now();
+        tx.send(ResponseChunk::plain(sse_prefill_comment(512, 2048)))
+            .await
+            .unwrap();
+        let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+            .await
+            .expect("frame")
+            .expect("data frame")
+            .into_data()
+            .expect("data");
+        assert_eq!(frame, &b": prefill 512/2048\n\n"[..]);
+        let next = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+            .await
+            .expect("frame")
+            .expect("data frame")
+            .into_data()
+            .expect("data");
+        assert_eq!(next, SSE_KEEPALIVE);
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "keepalive fired {:?} after the progress frame",
+            started.elapsed()
+        );
+    }
+
     /// Every `/v1/embeddings` input-shape refusal is the caller's request, not
     /// a server fault: bare content arrays, list arity, marker/image count and
     /// a bad data URL all answer 400.
@@ -2948,6 +3164,36 @@ mod tests {
             ))),
             500
         );
+    }
+
+    #[test]
+    fn model_entry_publishes_the_load_summary_only_for_the_resident_model() {
+        let summary = serde_json::json!({
+            "line": "hipfire load summary: m (qwen3_5) | spec: off (no speculator armed)",
+            "spec": "off (no speculator armed)",
+            "kv": "fp8 (vmm, automatic)",
+            "context": "4096 (user-set; model 8192, card 8192)",
+            "placement": "fully resident",
+            "prefill": "per-prompt chunking",
+        });
+        let loaded = LoadedInfo {
+            n_embd: 2048,
+            load_summary: summary.clone(),
+            ..LoadedInfo::default()
+        };
+        let resident = model_entry("qwen3.5:2b", None, Some((&loaded, 4096)));
+        assert_eq!(resident["load_summary"], summary);
+        // A pre-summary daemon ack leaves the field absent, not null.
+        let old_ack = LoadedInfo {
+            n_embd: 2048,
+            ..LoadedInfo::default()
+        };
+        assert!(model_entry("qwen3.5:2b", None, Some((&old_ack, 4096)))
+            .get("load_summary")
+            .is_none());
+        assert!(model_entry("qwen3.6:27b", None, None)
+            .get("load_summary")
+            .is_none());
     }
 
     #[test]

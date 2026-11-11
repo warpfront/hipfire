@@ -140,11 +140,12 @@ fn best_entry(pool: &[VmmPrefixEntry], rendered: &[u32]) -> Option<(usize, Reuse
 pub fn checkpoint(
     checkpoints: &mut Checkpoints,
     dn: &DeltaNetState,
+    kv: &hipfire_runtime::llama::KvCache,
     gpu: &mut rdna_compute::Gpu,
     pos: usize,
 ) {
     if ckpt_resume_enabled() {
-        speculative::take_dn_checkpoint(checkpoints, dn, gpu, pos, ckpt_interval(), ckpt_max());
+        speculative::take_dn_checkpoint(checkpoints, dn, kv, gpu, pos, ckpt_interval(), ckpt_max());
     }
 }
 

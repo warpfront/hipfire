@@ -133,9 +133,7 @@ pub(crate) fn handle_bench_prefill(
         m.seq_pos = 0;
         m.conversation_tokens.clear();
         let _ = hipfire_generate::common::reset_qwen35_recurrent(m, gpu);
-        if let Some(st) = m.state.as_mut() {
-            let _ = st.as_mut().reset_session_state(gpu);
-        }
+        let _ = m.reset_arch_session_state(gpu);
     } else if let Err(reason) = hipfire_generate::bench_topology::reset_mesh_for_bench(m, gpu) {
         emit_uncorrelated_error(
             stdout,
@@ -167,7 +165,7 @@ pub(crate) fn handle_bench_prefill(
             return;
         }
     }
-    if !bench_route.uses_carrier_hooks() {
+    if bench_route.is_mesh() {
         if let Err(reason) = hipfire_generate::bench_topology::quiesce_mesh(bench_route, m) {
             emit_uncorrelated_error(
                 stdout,
@@ -226,9 +224,7 @@ pub(crate) fn handle_bench_prefill(
         m.seq_pos = 0;
         m.conversation_tokens.clear();
         let _ = hipfire_generate::common::reset_qwen35_recurrent(m, gpu);
-        if let Some(st) = m.state.as_mut() {
-            let _ = st.as_mut().reset_session_state(gpu);
-        }
+        let _ = m.reset_arch_session_state(gpu);
     } else if let Err(reason) = hipfire_generate::bench_topology::reset_mesh_for_bench(m, gpu) {
         emit_uncorrelated_error(
             stdout,
@@ -393,11 +389,12 @@ pub(crate) fn handle_bench_decode(
         && m.arch_id != 13
         && m.arch_id != 14
         && m.arch_id != 16
+        && m.arch_id != 19
     {
         emit_uncorrelated_error(
             stdout,
             None,
-            "bench_decode requires a Qwen3.5, Qwen4, Gemma4, or Muse Glimmer model",
+            "bench_decode requires a Qwen3.5, Qwen4, Gemma4, Muse Glimmer, or Raon model",
             "unsupported",
             false,
             false,
@@ -531,16 +528,15 @@ pub(crate) fn handle_bench_decode(
             hipfire_loader::BenchDecodeRoute::Qwen35
             | hipfire_loader::BenchDecodeRoute::Qwen4
             | hipfire_loader::BenchDecodeRoute::Gemma4
-            | hipfire_loader::BenchDecodeRoute::MuseGlimmer => {
-                hipfire_loader::carrier_for(m.arch_id)
-                    .and_then(|c| c.bench_decode_prime(m, gpu, &synthetic))
-                    .unwrap_or_else(|| {
-                        Some(format!(
-                            "bench_decode_prime: carrier missing or unimplemented for arch_id={}",
-                            m.arch_id
-                        ))
-                    })
-            }
+            | hipfire_loader::BenchDecodeRoute::MuseGlimmer
+            | hipfire_loader::BenchDecodeRoute::Raon => hipfire_loader::carrier_for(m.arch_id)
+                .and_then(|c| c.bench_decode_prime(m, gpu, &synthetic))
+                .unwrap_or_else(|| {
+                    Some(format!(
+                        "bench_decode_prime: carrier missing or unimplemented for arch_id={}",
+                        m.arch_id
+                    ))
+                }),
             _ => Some(format!(
                 "bench_decode unsupported for arch_id={}",
                 m.arch_id
@@ -589,7 +585,7 @@ pub(crate) fn handle_bench_decode(
         gpu.replay.begin_replay_observation_window();
     }
     let replay_before = gpu.replay.replay_observation();
-    if !bench_route.uses_carrier_hooks() {
+    if bench_route.is_mesh() {
         if let Err(reason) = hipfire_generate::bench_topology::quiesce_mesh(bench_route, m) {
             emit_uncorrelated_error(
                 stdout,
@@ -628,11 +624,10 @@ pub(crate) fn handle_bench_decode(
             hipfire_loader::BenchDecodeRoute::Qwen35
             | hipfire_loader::BenchDecodeRoute::Qwen4
             | hipfire_loader::BenchDecodeRoute::Gemma4
-            | hipfire_loader::BenchDecodeRoute::MuseGlimmer => {
-                hipfire_loader::carrier_for(m.arch_id)
-                    .and_then(|c| c.bench_decode_run(m, gpu, context, iterations, &mut decode_err))
-                    .unwrap_or(false)
-            }
+            | hipfire_loader::BenchDecodeRoute::MuseGlimmer
+            | hipfire_loader::BenchDecodeRoute::Raon => hipfire_loader::carrier_for(m.arch_id)
+                .and_then(|c| c.bench_decode_run(m, gpu, context, iterations, &mut decode_err))
+                .unwrap_or(false),
             _ => {
                 decode_err = Some(format!(
                     "bench_decode unsupported for arch_id={}",

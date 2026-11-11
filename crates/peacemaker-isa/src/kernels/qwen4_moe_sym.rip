@@ -151,9 +151,15 @@ fn kloop<T: Target>(wg: &mut Wg<T>, g: &MoeNtGen) -> Result<(), String> {
     let no_trip = wg.scmp_wg_uniform(moent::trips_zero_insn())?;
     wg.wg_skip_if(no_trip, g.label("k_loop_end"), (), |wg, st| {
         wg.loop_carried(g.label("k_loop"), (), |wg, st| {
+            if g.gate_up() && g.nt() == 8 {
+                wg.barrier(())?;
+            }
             moent::load_w(wg, g, 1)?;
             compute(wg, g, 0, "l0", Some(1))?;
             moent::advance(wg)?;
+            if g.gate_up() && g.nt() == 8 {
+                wg.barrier(())?;
+            }
             moent::load_w(wg, g, 0)?;
             compute(wg, g, 1, "l1", Some(0))?;
             moent::trips_dec(wg)?;

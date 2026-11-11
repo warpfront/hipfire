@@ -30,11 +30,14 @@ pub trait DynDriver {
     fn join(&mut self, parts: &[RegionId]) -> Res<RegionId>;
     fn split(&mut self, r: RegionId, first: usize) -> Res<(RegionId, RegionId)>;
     fn ring(&mut self, name: &str, first: RegionId, second: RegionId) -> Res<RingId>;
+    fn ring_n(&mut self, name: &str, regions: &[RegionId]) -> Res<RingId>;
+    fn ring_start_at(&mut self, g: RingId, k: usize) -> Res<()>;
     fn ring_steady(&mut self, g: RingId) -> Res<()>;
     fn region_phase(&self, r: RegionId) -> Res<Phase>;
     fn ring_phases(&self, g: RingId) -> Res<(Phase, Phase)>;
     fn cur_index(&self, g: RingId) -> Res<usize>;
     fn next_index(&self, g: RingId) -> Res<usize>;
+    fn ring_depth(&self, g: RingId) -> Res<usize>;
     fn begin_write(&mut self, to: Place) -> Res<()>;
     fn ds_store(&mut self, to: Place, insn: Instruction) -> Res<()>;
     fn ds_store2(&mut self, x: Place, y: Place, insn: Instruction) -> Res<()>;
@@ -82,6 +85,14 @@ pub trait DynDriver {
     fn if_else(
         &mut self,
         cond: Cond,
+        else_label: &str,
+        join: &str,
+        then: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
+        els: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
+    ) -> Res<()>;
+    fn wg_if_else(
+        &mut self,
+        cond: WgCond,
         else_label: &str,
         join: &str,
         then: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
@@ -190,6 +201,12 @@ impl<'b, T: SplitOps> DynDriver for Driver<'b, T, Builder> {
     fn ring(&mut self, name: &str, first: RegionId, second: RegionId) -> Res<RingId> {
         Driver::ring(self, name, first, second)
     }
+    fn ring_n(&mut self, name: &str, regions: &[RegionId]) -> Res<RingId> {
+        Driver::ring_n(self, name, regions)
+    }
+    fn ring_start_at(&mut self, g: RingId, k: usize) -> Res<()> {
+        Driver::ring_start_at(self, g, k)
+    }
     fn ring_steady(&mut self, g: RingId) -> Res<()> {
         Driver::ring_steady(self, g)
     }
@@ -204,6 +221,9 @@ impl<'b, T: SplitOps> DynDriver for Driver<'b, T, Builder> {
     }
     fn next_index(&self, g: RingId) -> Res<usize> {
         Driver::next_index(self, g)
+    }
+    fn ring_depth(&self, g: RingId) -> Res<usize> {
+        Driver::ring_depth(self, g)
     }
     fn begin_write(&mut self, to: Place) -> Res<()> {
         Driver::begin_write(self, to)
@@ -303,6 +323,16 @@ impl<'b, T: SplitOps> DynDriver for Driver<'b, T, Builder> {
     ) -> Res<()> {
         Driver::if_else(self, cond, else_label, join, |d| then(d), |d| els(d))
     }
+    fn wg_if_else(
+        &mut self,
+        cond: WgCond,
+        else_label: &str,
+        join: &str,
+        then: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
+        els: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
+    ) -> Res<()> {
+        Driver::wg_if_else(self, cond, else_label, join, |d| then(d), |d| els(d))
+    }
     fn loop_until(
         &mut self,
         head: &str,
@@ -397,6 +427,7 @@ pub fn drive<'a>(
         Arch::Gfx1151 => drive_t::<Gfx1151>(bld, body),
         Arch::Gfx1201 => drive_t::<Gfx1201>(bld, body),
         Arch::Gfx1100 => drive_t::<Gfx1100>(bld, body),
+        Arch::Gfx1200 => Err("the .rip front end has no gfx1200 builder target (only sealed hip_twin objects target gfx1200)".into()),
         Arch::Gfx942 => Err("the .rip front end lowers onto the RDNA builder; gfx942 kernels use peacemaker_isa::cdna".into()),
     }
 }

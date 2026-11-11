@@ -195,7 +195,7 @@ pub fn generate_qwen4_vl(
         crate::ar::GenerationRoute::Qwen4Ar,
         &prompt,
         vocab_size,
-        eos_token,
+        &[eos_token],
         params.temp,
         params.top_p,
         controls.top_k,
@@ -208,8 +208,10 @@ pub fn generate_qwen4_vl(
         params.max_think_tokens,
         started_in_think,
         controls.stop,
+        0,     // Image requests currently require min_tokens == 0.
+        false, // No tool protocol on the image route.
+        0,     // Cold image prefill never restores a text cache entry.
         false,
-        0,
         false,
         |model, gpu, prompt, logits| {
             let bundle = model.qwen4_mut().ok_or("qwen4 vision bundle disappeared")?;

@@ -25,6 +25,108 @@ use std::ffi::c_void;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::sync::Mutex;
 
+/// The HIP calls [`VmmArena::reserve`], [`VmmArena::map_next`] and
+/// [`VmmArena::release`] make. [`HipRuntime`] is the production driver; unit
+/// tests substitute a recording driver so the map/unmap sequence of the arena
+/// lifecycle is checkable without a device.
+pub trait VmmDriver {
+    fn device_count(&self) -> HipResult<i32>;
+    fn set_device(&self, id: i32) -> HipResult<()>;
+    fn can_access_peer(&self, device: i32, peer_device: i32) -> HipResult<bool>;
+    fn device_synchronize(&self) -> HipResult<()>;
+    fn mem_get_allocation_granularity(
+        &self,
+        prop: &HipMemAllocationProp,
+        option: u32,
+    ) -> HipResult<usize>;
+    fn mem_address_reserve(&self, size: usize, alignment: usize) -> HipResult<*mut c_void>;
+    fn mem_create(
+        &self,
+        size: usize,
+        prop: &HipMemAllocationProp,
+    ) -> HipResult<HipMemGenericAllocationHandle>;
+    /// # Safety
+    /// As [`HipRuntime::mem_map`].
+    unsafe fn mem_map(
+        &self,
+        ptr: *mut c_void,
+        size: usize,
+        handle: HipMemGenericAllocationHandle,
+    ) -> HipResult<()>;
+    /// # Safety
+    /// As [`HipRuntime::mem_set_access`].
+    unsafe fn mem_set_access(
+        &self,
+        ptr: *mut c_void,
+        size: usize,
+        descs: &[HipMemAccessDesc],
+    ) -> HipResult<()>;
+    /// # Safety
+    /// As [`HipRuntime::mem_unmap`].
+    unsafe fn mem_unmap(&self, ptr: *mut c_void, size: usize) -> HipResult<()>;
+    /// # Safety
+    /// As [`HipRuntime::mem_release`].
+    unsafe fn mem_release(&self, handle: HipMemGenericAllocationHandle) -> HipResult<()>;
+}
+
+impl VmmDriver for HipRuntime {
+    fn device_count(&self) -> HipResult<i32> {
+        HipRuntime::device_count(self)
+    }
+    fn set_device(&self, id: i32) -> HipResult<()> {
+        HipRuntime::set_device(self, id)
+    }
+    fn can_access_peer(&self, device: i32, peer_device: i32) -> HipResult<bool> {
+        HipRuntime::can_access_peer(self, device, peer_device)
+    }
+    fn device_synchronize(&self) -> HipResult<()> {
+        HipRuntime::device_synchronize(self)
+    }
+    fn mem_get_allocation_granularity(
+        &self,
+        prop: &HipMemAllocationProp,
+        option: u32,
+    ) -> HipResult<usize> {
+        HipRuntime::mem_get_allocation_granularity(self, prop, option)
+    }
+    fn mem_address_reserve(&self, size: usize, alignment: usize) -> HipResult<*mut c_void> {
+        HipRuntime::mem_address_reserve(self, size, alignment)
+    }
+    fn mem_create(
+        &self,
+        size: usize,
+        prop: &HipMemAllocationProp,
+    ) -> HipResult<HipMemGenericAllocationHandle> {
+        HipRuntime::mem_create(self, size, prop)
+    }
+    unsafe fn mem_map(
+        &self,
+        ptr: *mut c_void,
+        size: usize,
+        handle: HipMemGenericAllocationHandle,
+    ) -> HipResult<()> {
+        // SAFETY: forwarded under this method's contract.
+        unsafe { HipRuntime::mem_map(self, ptr, size, handle) }
+    }
+    unsafe fn mem_set_access(
+        &self,
+        ptr: *mut c_void,
+        size: usize,
+        descs: &[HipMemAccessDesc],
+    ) -> HipResult<()> {
+        // SAFETY: forwarded under this method's contract.
+        unsafe { HipRuntime::mem_set_access(self, ptr, size, descs) }
+    }
+    unsafe fn mem_unmap(&self, ptr: *mut c_void, size: usize) -> HipResult<()> {
+        // SAFETY: forwarded under this method's contract.
+        unsafe { HipRuntime::mem_unmap(self, ptr, size) }
+    }
+    unsafe fn mem_release(&self, handle: HipMemGenericAllocationHandle) -> HipResult<()> {
+        // SAFETY: forwarded under this method's contract.
+        unsafe { HipRuntime::mem_release(self, handle) }
+    }
+}
+
 /// Retired VA a process may accumulate before new reservations are refused.
 /// User VA is 47 bits (128 TiB); one model load reserves tens of GiB of KV.
 const RETIRED_VA_CAP_BYTES: usize = 64 << 40;
@@ -272,7 +374,7 @@ pub fn retry_pending_granule_releases(hip: &HipRuntime) -> HipResult<usize> {
     }
 }
 
-fn release_granule_handle(hip: &HipRuntime, handle: usize) -> HipResult<()> {
+fn release_granule_handle(hip: &impl VmmDriver, handle: usize) -> HipResult<()> {
     if let Some(err) = take_fault(VmmFaultKind::Release) {
         return Err(err);
     }
@@ -493,7 +595,11 @@ pub struct VmmArena {
 unsafe impl Send for VmmArena {}
 
 impl VmmArena {
-    pub fn reserve(hip: &HipRuntime, owner_device: i32, requested_bytes: usize) -> HipResult<Self> {
+    pub fn reserve(
+        hip: &impl VmmDriver,
+        owner_device: i32,
+        requested_bytes: usize,
+    ) -> HipResult<Self> {
         Self::reserve_kind(
             hip,
             owner_device,
@@ -643,7 +749,7 @@ impl VmmArena {
     /// `requested_bytes` to be a non-zero multiple of the allocation
     /// granularity (imports map a whole physical allocation).
     fn reserve_kind(
-        hip: &HipRuntime,
+        hip: &impl VmmDriver,
         owner_device: i32,
         requested_bytes: usize,
         kind: VmmArenaKind,
@@ -744,7 +850,7 @@ impl VmmArena {
 
     pub fn map_next(
         &mut self,
-        hip: &HipRuntime,
+        hip: &impl VmmDriver,
         size: usize,
         access_devices: &[i32],
     ) -> HipResult<()> {
@@ -1524,7 +1630,7 @@ impl VmmArena {
     /// Unmap every segment and release every physical handle. The VA range is
     /// kept reserved and retired, never freed (see the module docs).
     /// Cleanup continues after an individual failure and returns the first one.
-    pub fn release(&mut self, hip: &HipRuntime) -> HipResult<()> {
+    pub fn release(&mut self, hip: &impl VmmDriver) -> HipResult<()> {
         if self.is_released() {
             return Ok(());
         }
@@ -1553,7 +1659,7 @@ impl VmmArena {
 /// Granule segments drop their mapping lease; their handle is released only
 /// at the last lease.
 fn teardown_segments(
-    hip: &HipRuntime,
+    hip: &impl VmmDriver,
     base: *mut c_void,
     segments: &mut Vec<VmmSegment>,
 ) -> HipResult<()> {
@@ -2239,6 +2345,396 @@ mod tests {
         assert_eq!(
             retry_pending_granule_releases(&hip).expect("retry pending"),
             0
+        );
+    }
+
+    // ---- Map-only discipline (gfx1100 hardware defects), CPU only ----------
+    //
+    // gfx1100 defect B: after `hipMemUnmap` + `hipMemMap` of other handles a VA
+    // keeps translating to the old backing, so a live VA must never be
+    // unmapped and remapped mid-life (module docs). Defect A: `hipMemSetAccess`
+    // rejects some 4 KiB-offset sub-ranges. The recording driver below stands
+    // in for the HIP runtime so the real `reserve` / `map_next` / `release`
+    // bodies run on a host with no device.
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum DriverOp {
+        Reserve { size: usize },
+        Create { size: usize },
+        Map { offset: usize, size: usize },
+        SetAccess { offset: usize, size: usize },
+        Unmap { offset: usize, size: usize },
+        Release,
+        Sync,
+    }
+
+    struct RecordingDriver {
+        granularity: usize,
+        ops: std::cell::RefCell<Vec<DriverOp>>,
+        /// Base of the most recent reservation; the next one is placed above
+        /// it, never at a returned base (retired ranges stay reserved).
+        next_base: Cell<usize>,
+        bases: std::cell::RefCell<Vec<usize>>,
+        fail_map: Cell<bool>,
+        next_handle: Cell<usize>,
+    }
+
+    impl RecordingDriver {
+        fn new(granularity: usize) -> Self {
+            Self {
+                granularity,
+                ops: Default::default(),
+                next_base: Cell::new(0x7f00_0000_0000),
+                bases: Default::default(),
+                fail_map: Cell::new(false),
+                next_handle: Cell::new(0x100),
+            }
+        }
+
+        fn ops(&self) -> Vec<DriverOp> {
+            self.ops.borrow().clone()
+        }
+
+        fn take_ops(&self) -> Vec<DriverOp> {
+            std::mem::take(&mut *self.ops.borrow_mut())
+        }
+
+        fn log(&self, op: DriverOp) {
+            self.ops.borrow_mut().push(op);
+        }
+
+        fn offset_of(&self, ptr: *mut c_void) -> usize {
+            let base = *self.bases.borrow().last().expect("a reservation");
+            ptr as usize - base
+        }
+    }
+
+    impl VmmDriver for RecordingDriver {
+        fn device_count(&self) -> HipResult<i32> {
+            Ok(1)
+        }
+        fn set_device(&self, _: i32) -> HipResult<()> {
+            Ok(())
+        }
+        fn can_access_peer(&self, _: i32, _: i32) -> HipResult<bool> {
+            Ok(true)
+        }
+        fn device_synchronize(&self) -> HipResult<()> {
+            self.log(DriverOp::Sync);
+            Ok(())
+        }
+        fn mem_get_allocation_granularity(
+            &self,
+            _: &HipMemAllocationProp,
+            _: u32,
+        ) -> HipResult<usize> {
+            Ok(self.granularity)
+        }
+        fn mem_address_reserve(&self, size: usize, _: usize) -> HipResult<*mut c_void> {
+            self.log(DriverOp::Reserve { size });
+            let base = self.next_base.get();
+            self.next_base.set(base + size.next_multiple_of(1 << 30));
+            self.bases.borrow_mut().push(base);
+            Ok(base as *mut c_void)
+        }
+        fn mem_create(
+            &self,
+            size: usize,
+            _: &HipMemAllocationProp,
+        ) -> HipResult<HipMemGenericAllocationHandle> {
+            self.log(DriverOp::Create { size });
+            let handle = self.next_handle.get();
+            self.next_handle.set(handle + 1);
+            Ok(handle as HipMemGenericAllocationHandle)
+        }
+        unsafe fn mem_map(
+            &self,
+            ptr: *mut c_void,
+            size: usize,
+            _: HipMemGenericAllocationHandle,
+        ) -> HipResult<()> {
+            self.log(DriverOp::Map {
+                offset: self.offset_of(ptr),
+                size,
+            });
+            if self.fail_map.replace(false) {
+                return Err(HipError::new(1, "injected map failure"));
+            }
+            Ok(())
+        }
+        unsafe fn mem_set_access(
+            &self,
+            ptr: *mut c_void,
+            size: usize,
+            _: &[HipMemAccessDesc],
+        ) -> HipResult<()> {
+            self.log(DriverOp::SetAccess {
+                offset: self.offset_of(ptr),
+                size,
+            });
+            Ok(())
+        }
+        unsafe fn mem_unmap(&self, ptr: *mut c_void, size: usize) -> HipResult<()> {
+            self.log(DriverOp::Unmap {
+                offset: self.offset_of(ptr),
+                size,
+            });
+            Ok(())
+        }
+        unsafe fn mem_release(&self, _: HipMemGenericAllocationHandle) -> HipResult<()> {
+            self.log(DriverOp::Release);
+            Ok(())
+        }
+    }
+
+    /// Every VA range a driver ever mapped, with the rules the gfx1100 defects
+    /// impose on a live arena: maps land exactly at the mapped frontier, never
+    /// overlap a range that was mapped before (live or not), and access calls
+    /// never begin at an offset only 4 KiB-aligned.
+    #[derive(Default)]
+    struct VaLedger {
+        mapped_end: usize,
+        ever_mapped: Vec<(usize, usize)>,
+        unmaps: usize,
+    }
+
+    impl VaLedger {
+        fn apply(&mut self, op: &DriverOp, small_granularity: bool) {
+            match *op {
+                DriverOp::Map { offset, size } => {
+                    assert_eq!(
+                        offset, self.mapped_end,
+                        "a map must start at the mapped frontier, not inside or past it"
+                    );
+                    assert!(
+                        self.ever_mapped
+                            .iter()
+                            .all(|&(start, end)| offset >= end || offset + size <= start),
+                        "remapped a VA range that was mapped before: {offset}+{size}"
+                    );
+                    self.ever_mapped.push((offset, offset + size));
+                    self.mapped_end = offset + size;
+                }
+                DriverOp::SetAccess { offset, size } => {
+                    assert!(
+                        offset + size <= self.mapped_end,
+                        "access past the mapped prefix"
+                    );
+                    // Defect A: a sub-range starting at a 4 KiB-only offset is
+                    // rejected by ROCm 7.2; allowed starts are the base or a
+                    // 2 MiB boundary.
+                    assert!(
+                        offset == 0 || offset % (2 << 20) == 0,
+                        "hipMemSetAccess at 4 KiB-only offset {offset}"
+                    );
+                    if small_granularity {
+                        assert_eq!(offset, 0, "small pages re-apply access from the base");
+                    }
+                }
+                DriverOp::Unmap { .. } => self.unmaps += 1,
+                _ => {}
+            }
+        }
+    }
+
+    fn reserve_recorded(driver: &RecordingDriver, bytes: usize) -> VmmArena {
+        VmmArena::reserve(driver, 0, bytes).expect("reserve on the recording driver")
+    }
+
+    /// QSA arena growth (`grow_context_arena` -> `grow_vmm_tensor` ->
+    /// `map_next`, the gather workspace's `map_qsa_gather_prefix` likewise):
+    /// every growth step maps one new segment at the frontier and sets access
+    /// on the new range (>= 2 MiB pages) or from the base (4 KiB pages); no
+    /// step unmaps, releases or remaps anything, at either page size the
+    /// gfx1100 reports (4 KiB minimum, 2 MiB recommended).
+    #[test]
+    fn gfx1100_vmm_growth_is_map_only_at_the_frontier() {
+        const MIB: usize = 1 << 20;
+        for granularity in [2 * MIB, 4096] {
+            let driver = RecordingDriver::new(granularity);
+            let mut arena = reserve_recorded(&driver, 512 * MIB);
+            let mut ledger = VaLedger::default();
+            for op in driver.take_ops() {
+                assert!(matches!(op, DriverOp::Reserve { .. }));
+            }
+            // Request-shaped growth: first tile, an 8K prefill, a decode
+            // map-ahead, then single-page steps up to the reserve.
+            let steps = [
+                granularity,
+                8 * MIB,
+                2 * MIB,
+                granularity,
+                32 * MIB,
+                MIB.max(granularity),
+            ];
+            for size in steps {
+                let before = arena.mapped_bytes();
+                arena.map_next(&driver, size, &[0]).expect("map_next");
+                assert_eq!(arena.mapped_bytes(), before + size);
+                let ops = driver.take_ops();
+                assert!(
+                    !ops.iter()
+                        .any(|op| matches!(op, DriverOp::Unmap { .. } | DriverOp::Release)),
+                    "growth unmapped or released: {ops:?}"
+                );
+                assert!(matches!(ops.first(), Some(DriverOp::Create { .. })));
+                for op in &ops {
+                    ledger.apply(op, granularity < 2 * MIB);
+                }
+                assert_eq!(ledger.mapped_end, arena.mapped_bytes());
+            }
+            assert_eq!(ledger.unmaps, 0);
+            // A map past the reserve is refused before any driver call.
+            let overshoot = 512 * MIB;
+            assert!(arena.map_next(&driver, overshoot, &[0]).is_err());
+            assert!(driver.take_ops().is_empty());
+        }
+    }
+
+    /// A map the driver refuses leaves nothing mapped and the arena intact; the
+    /// retry lands on the same never-mapped frontier (the only legal re-use of
+    /// a VA offset), and the live prefix is never touched.
+    #[test]
+    fn gfx1100_vmm_failed_map_leaves_the_live_prefix_untouched() {
+        const MIB: usize = 1 << 20;
+        let driver = RecordingDriver::new(2 * MIB);
+        let mut arena = reserve_recorded(&driver, 64 * MIB);
+        arena.map_next(&driver, 2 * MIB, &[0]).unwrap();
+        driver.take_ops();
+        driver.fail_map.set(true);
+        assert!(arena.map_next(&driver, 2 * MIB, &[0]).is_err());
+        let ops = driver.take_ops();
+        assert_eq!(
+            ops,
+            vec![
+                DriverOp::Create { size: 2 * MIB },
+                DriverOp::Map {
+                    offset: 2 * MIB,
+                    size: 2 * MIB
+                },
+                DriverOp::Release,
+            ],
+            "a failed map releases only its fresh handle"
+        );
+        assert_eq!(arena.mapped_bytes(), 2 * MIB);
+        arena.map_next(&driver, 2 * MIB, &[0]).unwrap();
+        assert!(!driver
+            .ops()
+            .iter()
+            .any(|op| matches!(op, DriverOp::Unmap { .. })));
+    }
+
+    /// A failed `hipMemSetAccess` unmaps only the segment it just mapped (no
+    /// kernel has touched it) and poisons the arena: a retry would remap that
+    /// VA to a new handle the GPU may still translate to the released one.
+    #[test]
+    fn gfx1100_vmm_failed_access_poisons_instead_of_remapping() {
+        const MIB: usize = 1 << 20;
+        let driver = RecordingDriver::new(2 * MIB);
+        let mut arena = reserve_recorded(&driver, 64 * MIB);
+        arena.map_next(&driver, 2 * MIB, &[0]).unwrap();
+        driver.take_ops();
+        clear_vmm_faults();
+        inject_vmm_fault(VmmFaultKind::AccessReset, 1);
+        assert!(arena.map_next(&driver, 2 * MIB, &[0]).is_err());
+        clear_vmm_faults();
+        let ops = driver.take_ops();
+        let unmaps: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match op {
+                DriverOp::Unmap { offset, size } => Some((*offset, *size)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            unmaps,
+            vec![(2 * MIB, 2 * MIB)],
+            "only the fresh, never-used segment may be unmapped"
+        );
+        // Poisoned: no later growth reaches the driver at all.
+        assert!(arena.map_next(&driver, 2 * MIB, &[0]).is_err());
+        assert!(driver.take_ops().is_empty(), "a poisoned arena remapped");
+    }
+
+    /// The only mid-life unmap is `release`: it synchronizes, unmaps every
+    /// segment once (newest first) and releases its handles, retires the VA
+    /// (never freed, so no later reserve can land on it) and refuses any
+    /// further map on the released arena (the old range is never reused).
+    #[test]
+    fn gfx1100_vmm_release_retires_the_va_and_never_reuses_it() {
+        const MIB: usize = 1 << 20;
+        let driver = RecordingDriver::new(2 * MIB);
+        let mut arena = reserve_recorded(&driver, 64 * MIB);
+        let first_base = arena.base_address();
+        for size in [2 * MIB, 4 * MIB, 2 * MIB] {
+            arena.map_next(&driver, size, &[0]).unwrap();
+        }
+        driver.take_ops();
+        let retired_before = retired_va_bytes();
+        arena.release(&driver).expect("release");
+        assert!(arena.is_released());
+        assert!(retired_va_bytes() >= retired_before + 64 * MIB);
+        let ops = driver.take_ops();
+        let unmaps: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match op {
+                DriverOp::Unmap { offset, size } => Some((*offset, *size)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            unmaps,
+            vec![(6 * MIB, 2 * MIB), (2 * MIB, 4 * MIB), (0, 2 * MIB)]
+        );
+        assert!(
+            ops.iter().position(|op| *op == DriverOp::Sync)
+                < ops
+                    .iter()
+                    .position(|op| matches!(op, DriverOp::Unmap { .. })),
+            "release must synchronize before unmapping"
+        );
+        assert_eq!(ops.iter().filter(|op| **op == DriverOp::Release).count(), 3);
+        // The released VA is gone: no remap, and a new reservation (the gather
+        // workspace's replacement) is a different range.
+        assert!(arena.map_next(&driver, 2 * MIB, &[0]).is_err());
+        assert!(driver.take_ops().is_empty());
+        let replacement = reserve_recorded(&driver, 64 * MIB);
+        assert_ne!(replacement.base_address(), first_base);
+        assert_eq!(arena.base_address(), 0);
+    }
+
+    /// `hipMemUnmap` has exactly three call sites in the VMM module, each a
+    /// teardown of a segment that is not live: import abort, the fresh segment
+    /// of a failed access call, and `release`'s teardown. A new call site must
+    /// extend this list on purpose.
+    #[test]
+    fn mem_unmap_call_sites_in_the_vmm_module_are_the_audited_teardowns() {
+        let source = include_str!("vmm.rs");
+        let production = &source[..source.find("#[cfg(test)]").expect("test module")];
+        let mut current = String::new();
+        let mut sites = Vec::new();
+        for line in production.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed
+                .strip_prefix("pub fn ")
+                .or_else(|| trimmed.strip_prefix("fn "))
+                .or_else(|| trimmed.strip_prefix("pub unsafe fn "))
+            {
+                current = rest
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+            }
+            if !trimmed.starts_with("//") && line.contains(".mem_unmap(") {
+                sites.push(current.clone());
+            }
+        }
+        sites.sort();
+        assert_eq!(
+            sites,
+            ["abort_import", "map_next", "teardown_segments"],
+            "unreviewed hipMemUnmap call site in the VMM module"
         );
     }
 }

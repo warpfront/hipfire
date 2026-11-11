@@ -62,7 +62,12 @@ fn entries_are_deterministic_and_target_only_their_arches() {
             // Only the expert-run gate/up hands its gate rows over LDS: one
             // barrier on each of the gate and up paths.
             let handoff = spec.kind == Kind::GateUp && spec.nt > 1;
-            assert_eq!(a.shape.barriers, if handoff { 2 } else { 0 }, "{spec:?}");
+            // The gfx1201 NT8 gate/up additionally holds its four waves to one
+            // rendezvous per K128 epoch: two barriers in the K-loop trip.
+            let epoch_lock =
+                spec.arch == Arch::Gfx1201 && spec.kind == Kind::GateUp && spec.nt == 8;
+            let want = if handoff { 2 } else { 0 } + if epoch_lock { 2 } else { 0 };
+            assert_eq!(a.shape.barriers, want, "{spec:?}");
             assert_eq!(
                 a.s_text.contains("ds_store") || a.s_text.contains("ds_load"),
                 handoff,

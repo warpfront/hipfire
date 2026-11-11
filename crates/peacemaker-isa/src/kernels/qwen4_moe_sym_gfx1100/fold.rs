@@ -26,16 +26,15 @@
 //! reviewed dependency order.
 use super::*;
 
-/// Fold the epoch whose operands are in the registers.
-pub(super) fn compute(b: &mut Builder, g: &Gen) -> Result<(), String> {
-    let a = g.spec.arch;
-    let tn = g.tn();
-    for t in 0..tn {
+/// f16 -> f32 scale and the eight `ds_swizzle` row broadcasts per tensor, from the
+/// f16 scale dword in `src(t)` into `SCF` (through `HF`).
+pub(super) fn broadcast(b: &mut Builder, g: &Gen, src: impl Fn(u8) -> u8) -> Result<(), String> {
+    for t in 0..g.tn() {
         op(
             b,
-            format!("v_cvt_f32_f16_e64 v{}, v{}.l", HF + t, g.hs(t)),
+            format!("v_cvt_f32_f16_e64 v{}, v{}.l", HF + t, src(t)),
             &[v(HF + t)],
-            &[v(g.hs(t))],
+            &[v(src(t))],
         )?;
         for j in 0..8u8 {
             let text = format!(
@@ -49,6 +48,17 @@ pub(super) fn compute(b: &mut Builder, g: &Gen) -> Result<(), String> {
                     .memory(MemoryClass::DsLoad),
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Scale broadcast (when `bcast`; else it was issued under the previous epoch's fold), unpack
+/// and the exact integer WMMA chain of the epoch whose operands are in the registers.
+pub(super) fn chain(b: &mut Builder, g: &Gen, bcast: bool) -> Result<(), String> {
+    let a = g.spec.arch;
+    let tn = g.tn();
+    if bcast {
+        broadcast(b, g, |t| g.hs(t))?;
     }
     unpack::unpack_epoch(b, g)?;
     for i in 0..8u8 {
@@ -64,7 +74,12 @@ pub(super) fn compute(b: &mut Builder, g: &Gen) -> Result<(), String> {
             )?;
         }
     }
-    for t in 0..tn {
+    Ok(())
+}
+
+/// The ordered F32 fold of the chain's accumulators.
+pub(super) fn fold(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    for t in 0..g.tn() {
         iu4_fold::fold_pass(b, CACC + 8 * t, SUM + 8 * t, SCF + 8 * t, g.d(), TPROD)?;
     }
     Ok(())

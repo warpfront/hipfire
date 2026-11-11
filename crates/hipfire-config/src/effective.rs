@@ -371,21 +371,12 @@ fn a8_rule(out: &mut Effective, builtin: bool, ctx: &ArchCtx) {
 }
 
 /// `developer.qwen4_moe_sym_iu4`: the route is read on gfx1100, gfx1151 and
-/// gfx1201. An unset key requests it on gfx1151/gfx1201 and keeps it off on
-/// gfx1100 (the aggregate gfx1100 route is default OFF until qualified; `=1`
-/// opts in).
+/// gfx1201. An unset key requests it on all three (`=0` / `false` is the kill
+/// switch).
 fn sym_iu4_rule(out: &mut Effective, unset: bool, ctx: &ArchCtx) {
     let arch = ctx.arch();
     out.used_by_model = known_model(ctx).then_some(ctx.model_arch_id == Some(QWEN4_ARCH_ID));
-    let on_arch = matches!(arch, "gfx1151" | "gfx1201");
-    if arch == "gfx1100" {
-        if unset {
-            out.value = ConfigValue::Bool(false);
-            out.by_arch_rule = true;
-            out.reason = Some("unset: off on gfx1100".into());
-        }
-        return;
-    }
+    let on_arch = matches!(arch, "gfx1100" | "gfx1151" | "gfx1201");
     if !arch.is_empty() && !on_arch {
         out.used_on_gpu = false;
         if unset {
@@ -397,7 +388,7 @@ fn sym_iu4_rule(out: &mut Effective, unset: bool, ctx: &ArchCtx) {
     if unset {
         out.value = ConfigValue::Bool(true);
         out.by_arch_rule = on_arch;
-        out.reason = Some("unset: on for gfx1151/gfx1201".into());
+        out.reason = Some("unset: on for gfx1100/gfx1151/gfx1201".into());
     }
 }
 
@@ -864,15 +855,17 @@ mod tests {
     }
 
     #[test]
-    fn sym_iu4_unset_is_on_for_gfx1151_and_gfx1201() {
-        for arch in ["gfx1151", "gfx1201"] {
+    fn sym_iu4_unset_is_on_for_gfx1100_gfx1151_and_gfx1201() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             let e = eff(SYM_IU4_KEY, &ctx(arch));
             assert_eq!(e.value, ConfigValue::Bool(true), "{arch}");
             assert!(e.by_arch_rule && e.used_on_gpu);
-            assert_eq!(e.reason.as_deref(), Some("unset: on for gfx1151/gfx1201"));
+            assert_eq!(
+                e.reason.as_deref(),
+                Some("unset: on for gfx1100/gfx1151/gfx1201")
+            );
             assert_eq!(e.applies, Applies::ServeRestart);
         }
-        let e = eff(SYM_IU4_KEY, &ctx("gfx1100"));
         let mut c = ctx("gfx1151");
         c.model_arch_id = Some(16);
         assert_eq!(eff(SYM_IU4_KEY, &c).used_by_model, Some(true));
@@ -881,21 +874,15 @@ mod tests {
     }
 
     #[test]
-    fn sym_iu4_unset_is_off_on_gfx1100_and_unused_elsewhere() {
-        // gfx1100: the aggregate route exists but is default OFF; `=1` opts in.
-        let e = eff(SYM_IU4_KEY, &ctx("gfx1100"));
-        assert!(e.used_on_gpu);
-        assert_eq!(e.value, ConfigValue::Bool(false));
-        assert!(e.by_arch_rule);
-        assert_eq!(e.reason.as_deref(), Some("unset: off on gfx1100"));
-        assert_eq!(e.applies, Applies::ServeRestart);
+    fn sym_iu4_is_unused_on_other_arches_and_explicit_gfx1100_is_kept() {
         for arch in ["gfx1030", "gfx1101", "gfx942"] {
             let e = eff(SYM_IU4_KEY, &ctx(arch));
             assert!(!e.used_on_gpu, "{arch}");
             assert_eq!(e.value, ConfigValue::Bool(false), "{arch}");
             assert_eq!(e.reason.as_deref(), Some("not used on this GPU"), "{arch}");
         }
-        // An explicit value on gfx1100 is kept and the route is read there.
+        // An explicit value on gfx1100 (`false` is the kill switch) is kept and the route is
+        // read there.
         for value in [false, true] {
             let resolved =
                 resolve([user_layer(&[(SYM_IU4_KEY, ConfigValue::Bool(value))])]).unwrap();

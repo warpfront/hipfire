@@ -901,6 +901,49 @@ __device__ __forceinline__ void wlds_wmma_stage(
 ) {
     constexpr int WROWS = 16 * WP;
     constexpr int WCOLS = 16 * WQ;
+    if constexpr (WP == 5 && WQ == 1 && KT == 4 && BM == 80 && BN == 32) {
+        // HC input_mix_down fill tile (gemm_wmma_lds_80_32_80_16_k64_p): 80-row wave tile, five
+        // chains share one B fragment. The fragments are NAMED variables: hipcc rebuilds every element
+        // of an array-held half16 through two identity 16-bit moves and, with one register buffer, gates
+        // every WMMA on lgkmcnt(0). Here all 12 LDS reads of step kt+1 are pinned behind step kt's 5
+        // WMMA with sched_group_barrier (2 of 20 WMMA gated by lgkmcnt(0), 182 VGPR, no spill).
+        // Per output element the chain is the generic loop's: acc starts at zero, then one WMMA per
+        // 16-K substep in ascending k with the same A/B fragment rows (only which wave owns a tile,
+        // when fragments are read, and how many tiles a wave holds change).
+        const _Float16* ap = &a_lds[(wave_m * WROWS + ml) * 16 + WLDS_FRAG_OFFSET];
+        const _Float16* bp = &x_lds[(wave_n * WCOLS + ml) * 16 + WLDS_FRAG_OFFSET];
+#define HCF_FA(i, k) (*(const wlds_frag_t*)(ap + ((k) * BM + (i) * 16) * 16))
+#define HCF_FB(k) (*(const wlds_frag_t*)(bp + ((k) * BN) * 16))
+#define HCF_LOADS(K_, B0, A0, A1, A2, A3, A4) \
+        B0 = HCF_FB(K_); A0 = HCF_FA(0, K_); A1 = HCF_FA(1, K_); A2 = HCF_FA(2, K_); A3 = HCF_FA(3, K_); A4 = HCF_FA(4, K_);
+#define HCF_MMA(B0, A0, A1, A2, A3, A4) \
+        acc[0] = WLDS_WMMA(A0, B0, acc[0]); acc[1] = WLDS_WMMA(A1, B0, acc[1]); acc[2] = WLDS_WMMA(A2, B0, acc[2]); \
+        acc[3] = WLDS_WMMA(A3, B0, acc[3]); acc[4] = WLDS_WMMA(A4, B0, acc[4]);
+#define HCF_W(n_) __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); __builtin_amdgcn_sched_group_barrier(0x100, n_, 0);
+        wlds_frag_t x0, x1, x2, x3, x4, x5;
+        wlds_frag_t y0, y1, y2, y3, y4, y5;
+        HCF_LOADS(0, x0, x1, x2, x3, x4, x5)
+        HCF_LOADS(1, y0, y1, y2, y3, y4, y5)
+        HCF_MMA(x0, x1, x2, x3, x4, x5)
+        HCF_LOADS(2, x0, x1, x2, x3, x4, x5)
+        HCF_MMA(y0, y1, y2, y3, y4, y5)
+        HCF_LOADS(3, y0, y1, y2, y3, y4, y5)
+        HCF_MMA(x0, x1, x2, x3, x4, x5)
+        HCF_MMA(y0, y1, y2, y3, y4, y5)
+        __builtin_amdgcn_sched_group_barrier(0x100, 12, 0);
+#define HCF_ROUND HCF_W(3) HCF_W(3) HCF_W(2) HCF_W(2) HCF_W(2)
+        HCF_ROUND
+        HCF_ROUND
+        HCF_ROUND
+#undef HCF_ROUND
+        __builtin_amdgcn_sched_group_barrier(0x008, 5, 0);
+#undef HCF_W
+#undef HCF_MMA
+#undef HCF_LOADS
+#undef HCF_FA
+#undef HCF_FB
+        return;
+    }
     #pragma unroll
     for (int kt = 0; kt < KT; kt++) {
         // All WP A fragments stay live and are reused across every B subtile;
@@ -1437,6 +1480,14 @@ WLDS_KERNEL(gemm_wmma_lds_64_64_32_64_k64_p,     64,  64, 2, 4, 64, false, true)
 // 64 x 64 tile's, so the bytes are identical; measured 3.10 vs 3.66 ms at N = 8192.
 WLDS_KERNEL(gemm_wmma_lds_160_64_32_64_k64_p,   160,  64, 2, 4, 64, false, true)
 WLDS_KERNEL(gemm_wmma_lds_160_64_32_64_k64,     160,  64, 2, 4, 64, false, false)
+#if defined(__gfx1100__)
+// gfx1100 HC input_mix_down fill tile (HIPFIRE_QWEN4_HC_MIX_FILL80_GFX1100; M = 320, K % 64 == 0): the
+// incumbent 64 x 64 tile's 5 x 12 = 60 workgroups of 2 waves leave 120 waves for 96 SIMDs with 8 chains each;
+// here an 80 x 32 workgroup is 2 waves of 80 x 16 (WP = 5, WQ = 1), grid 4 x 24 = 96 workgroups / 192 waves,
+// 5 chains per wave, with the pinned fragment schedule in wlds_wmma_stage. Each output element keeps the
+// incumbent's ascending-K WMMA chain from +0 (no split-K), so the bytes equal gemm_wmma_lds_64_64_32_64_k64_p.
+WLDS_KERNEL(gemm_wmma_lds_80_32_80_16_k64_p,      80,  32, 5, 1, 64, false, true)
+#endif
 
 // --- Fused-epilogue instantiations ------------------------------------------
 // Only the five tiles Gpu::lds_tile_for can return (the three per-arch

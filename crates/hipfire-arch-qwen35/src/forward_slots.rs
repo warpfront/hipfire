@@ -3357,6 +3357,250 @@ fn final_logits_per_slot(
         return Ok(());
     }
 
+    if batched_head_v2_admitted(gpu, weights, batch, pbs, lm_head_skip, dim) {
+        batched_head_v2(
+            gpu,
+            weights,
+            config,
+            batch,
+            pbs,
+            s,
+            logits_out,
+            lm_head_skip,
+        )?;
+        if batched_head_verify_enabled() {
+            verify_batched_head_v2(
+                gpu,
+                weights,
+                config,
+                batch,
+                pbs,
+                s,
+                logits_out,
+                lm_head_skip,
+            )?;
+        }
+        return Ok(());
+    }
+    per_slot_head(
+        gpu,
+        weights,
+        config,
+        batch,
+        pbs,
+        s,
+        logits_out,
+        lm_head_skip,
+    )
+}
+
+/// `HIPFIRE_BATCHED_HEAD` kill switch (developer, read once per process):
+/// unset or any value but `0` keeps the batched MQ4G256V2 lm_head on for exact
+/// gfx1201; `0` restores one single-vector lm_head GEMV per slot.
+fn batched_head_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_BATCHED_HEAD").as_deref() != Ok("0")
+    });
+    *ENABLED
+}
+
+/// `HIPFIRE_BATCHED_HEAD_VERIFY=1` (developer lab check, read once per
+/// process): after every batched head, also run the per-slot head into a side
+/// buffer and byte-compare every head row; any mismatch is an error. Needs the
+/// step to be eager (`HIPFIRE_SLOTS_DECODE_GRAPH=0`): the compare downloads.
+fn batched_head_verify_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_BATCHED_HEAD_VERIFY").as_deref() == Ok("1")
+    });
+    *ENABLED
+}
+
+/// Whether this step's final heads run as one multi-column launch per run of
+/// consecutive slots: an MQ4G256V2 head on exact gfx1201 (the shape the PM
+/// multi-column `multirow_r2` twin is byte-identical to the singleton head
+/// for), at least two head rows, no CPU-offloaded weights.
+fn batched_head_v2_admitted(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    batch: &SlotBatch,
+    pbs: &PrefillBatchScratch,
+    lm_head_skip: &[bool],
+    dim: usize,
+) -> bool {
+    if !batched_head_enabled()
+        || weights.output.gpu_dtype != DType::MQ4G256V2
+        || !gpu.arch_caps.is_gfx1201()
+        || gpu.owns_host_cpu_weights()
+        || pbs.x_rot_batch.numel() < batch.m_per_slot.len() * dim
+    {
+        return false;
+    }
+    let head_rows = batch
+        .m_per_slot
+        .iter()
+        .enumerate()
+        .filter(|&(slot, &m)| m > 0 && !lm_head_skip.get(slot).copied().unwrap_or(false))
+        .count();
+    head_rows >= 2
+}
+
+/// Batched MQ4G256V2 head: per head slot the singleton's own `rmsnorm_f32` +
+/// lm_head input rotate, the rotated row parked at row `slot` of
+/// `pbs.x_rot_batch`, then ONE `pm_xbatch::multirow_r2` launch per run of up
+/// to `PM_XBATCH_MAX` consecutive head slots writing straight into
+/// `logits_out` rows (weights read once per run instead of once per slot).
+/// The twin is column-identical to the singleton `gemv_mq4g256v2_multirow_r2`.
+#[allow(clippy::too_many_arguments)]
+fn batched_head_v2(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    batch: &SlotBatch,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    logits_out: &GpuTensor,
+    lm_head_skip: &[bool],
+) -> HipResult<()> {
+    let dim = config.dim;
+    let vocab = config.vocab_size;
+    let dim_row_bytes = dim * 4;
+    let n_slots = batch.m_per_slot.len();
+    let wr = weights.output.dispatch_ref();
+    let family = GemvFamily::new();
+    let mut is_head = vec![false; n_slots];
+    let mut row_off = 0usize;
+    for (slot, &m) in batch.m_per_slot.iter().enumerate() {
+        if m > 0 && !lm_head_skip.get(slot).copied().unwrap_or(false) {
+            let last_row = row_off + m - 1;
+            gpu.memcpy_dtod_at_auto(
+                &s.x.buf,
+                0,
+                &pbs.x_batch.buf,
+                last_row * dim_row_bytes,
+                dim_row_bytes,
+            )?;
+            gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
+            let ctx = DispatchCtx::new(gpu);
+            let rot = family
+                .rotate(&ctx, gpu, &wr, &s.tmp, &RotateInputs::default())
+                .map_err(|e| HipError::new(0, &e.to_string()))?;
+            // `rotate` returns an alias of one shared scratch buffer: copy
+            // each slot's row out before the next iteration overwrites it.
+            gpu.memcpy_dtod_at_auto(
+                &pbs.x_rot_batch.buf,
+                slot * dim_row_bytes,
+                &rot.buf().buf,
+                0,
+                dim_row_bytes,
+            )?;
+            is_head[slot] = true;
+        }
+        row_off += m;
+    }
+    debug_assert_eq!(row_off, batch.total_rows());
+    let mut s0 = 0usize;
+    while s0 < n_slots {
+        if !is_head[s0] {
+            s0 += 1;
+            continue;
+        }
+        let mut s1 = s0 + 1;
+        while s1 < n_slots && is_head[s1] && s1 - s0 < rdna_compute::pm_xbatch::PM_XBATCH_MAX {
+            s1 += 1;
+        }
+        hipfire_dispatch::ops::pm_xbatch::multirow_r2(
+            gpu,
+            &weights.output.buf,
+            &pbs.x_rot_batch.sub_offset(s0 * dim, (s1 - s0) * dim),
+            &logits_out.sub_offset(s0 * vocab, (s1 - s0) * vocab),
+            vocab,
+            dim,
+            s1 - s0,
+        )?;
+        s0 = s1;
+    }
+    Ok(())
+}
+
+/// Lab byte-compare (`HIPFIRE_BATCHED_HEAD_VERIFY=1`): the per-slot head into a
+/// side buffer must equal `logits_out` byte for byte on every head row.
+#[allow(clippy::too_many_arguments)]
+fn verify_batched_head_v2(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    batch: &SlotBatch,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    logits_out: &GpuTensor,
+    lm_head_skip: &[bool],
+) -> HipResult<()> {
+    let vocab = config.vocab_size;
+    let n_slots = batch.m_per_slot.len();
+    let reference = gpu.alloc_tensor(&[n_slots * vocab], DType::F32)?;
+    let ran = per_slot_head(
+        gpu,
+        weights,
+        config,
+        batch,
+        pbs,
+        s,
+        &reference,
+        lm_head_skip,
+    );
+    let mut bad = Vec::new();
+    let mut compared = 0usize;
+    if ran.is_ok() {
+        let got = gpu.download_f32(logits_out)?;
+        let want = gpu.download_f32(&reference)?;
+        for (slot, &m) in batch.m_per_slot.iter().enumerate() {
+            if m == 0 || lm_head_skip.get(slot).copied().unwrap_or(false) {
+                continue;
+            }
+            compared += 1;
+            let r = slot * vocab..(slot + 1) * vocab;
+            let diff = got[r.clone()]
+                .iter()
+                .zip(&want[r])
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            if diff != 0 {
+                bad.push((slot, diff));
+            }
+        }
+    }
+    gpu.free_tensor(reference)?;
+    ran?;
+    static ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let total = ROWS.fetch_add(compared, std::sync::atomic::Ordering::Relaxed) + compared;
+    if bad.is_empty() {
+        if total.is_power_of_two() || total % 4096 < compared {
+            eprintln!("[batched-head-verify] {total} head rows byte-identical so far");
+        }
+        Ok(())
+    } else {
+        eprintln!("[batched-head-verify] MISMATCH (slot, differing f32 words): {bad:?}");
+        Err(HipError::new(
+            0,
+            "batched lm_head differs from the per-slot head (HIPFIRE_BATCHED_HEAD_VERIFY)",
+        ))
+    }
+}
+
+/// One single-vector `rmsnorm_f32` + `Step::Gemv` lm_head per active,
+/// non-skipped slot: the reference every batched head is byte-identical to.
+#[allow(clippy::too_many_arguments)]
+fn per_slot_head(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    batch: &SlotBatch,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    logits_out: &GpuTensor,
+    lm_head_skip: &[bool],
+) -> HipResult<()> {
+    let dim = config.dim;
     let mut row_off = 0usize;
     for (slot, &m) in batch.m_per_slot.iter().enumerate() {
         if m > 0 {

@@ -477,7 +477,10 @@ pub fn batch_chunk_delta_net_input_projection(
     // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
-    let is_lowbit = matches!(layer.wqkv.dtype, DType::TQ2G128 | DType::BQ1G128);
+    // GGUF-native weights (`DType::Ggml*`) take the same unfused plain-GEMM
+    // strategy (dequantise + F16 / F32 GEMM inside `run_plain_gemm_key`).
+    let is_lowbit =
+        matches!(layer.wqkv.dtype, DType::TQ2G128 | DType::BQ1G128) || layer.wqkv.dtype.is_ggml();
     // qt=52 re-arm anchor: all four LA projections Lloyd → FP8-LUT launcher.
     // Mixed Lloyd/uniform is a fail-closed HipError at the dispatch arm.
     let is_mq4v2_lloyd = all_mq4v2_lloyd(&[
@@ -546,7 +549,13 @@ pub fn batch_chunk_delta_net_input_projection(
             n,
             !fold_betaalpha,
         )?;
-        if iu4_prep.is_none() {
+        if iu4_prep.is_none()
+            && mq3v25_a4_consumers_agree(
+                gpu,
+                layer.wqkv.dtype,
+                &[layer.wz.dtype, layer.w_beta.dtype, layer.w_alpha.dtype],
+            )
+        {
             // gfx1201 slices-2: fused rmsnorm+quant producer (bit-identical).
             iu4_prep = try_gfx12_rmsnorm_quant_fused_prepared(
                 gpu,
@@ -646,7 +655,36 @@ pub fn batch_chunk_delta_net_input_projection(
             layer.w_alpha.k,
             n,
         )?;
-    } else if let Some(prep) = &iu4_prep {
+    } else if let Some(prep) = iu4_prep.as_ref().filter(|_| {
+        mq3v25_a4_weight(gpu, layer.wqkv.dtype)
+            && [layer.wz.dtype, layer.w_beta.dtype, layer.w_alpha.dtype]
+                .iter()
+                .all(|&dtype| dtype == layer.wqkv.dtype)
+    }) {
+        // Symmetric qt49 A4 (gfx1201): four SETs over one producer. It
+        // bypasses the MQ4-only beta/alpha fold, the zba SET and the fused
+        // QKVZ + `gdn_chunk_prep` epilogue (the caller runs the ordinary prep).
+        gpu.gemm_qkvza_mq3v25_iu4_prepared(
+            &layer.wqkv.buf,
+            &layer.wz.buf,
+            &layer.w_beta.buf,
+            &layer.w_alpha.buf,
+            prep,
+            &pbs.dn_qkv_batch,
+            &pbs.dn_z_batch,
+            &pbs.dn_beta_batch,
+            &pbs.dn_alpha_batch,
+            layer.wqkv.m,
+            layer.wz.m,
+            layer.w_beta.m,
+            layer.w_alpha.m,
+            layer.wqkv.k,
+            n,
+        )?;
+    } else if let Some(prep) = iu4_prep
+        .as_ref()
+        .filter(|_| !mq3v25_a4_weight(gpu, layer.wqkv.dtype))
+    {
         if fold_betaalpha {
             gpu.gemm_qkvza_mq4g256v2_wmma_iu4_fold_prepared(
                 &layer.wqkv.buf,
@@ -682,7 +720,10 @@ pub fn batch_chunk_delta_net_input_projection(
                     return Ok(true);
                 }
             }
-            gpu.gemm_qkvza_mq4g256v2_wmma_iu4_prepared(
+            // gfx1201 verify (n <= 128): one SET over the Z fold + a copy
+            // kernel instead of separate Z / beta / alpha SETs; other shapes
+            // and archs run the unchanged four-GEMM sequence.
+            gpu.gemm_qkvza_mq4g256v2_wmma_iu4_prepared_zba(
                 &layer.wqkv.buf,
                 &layer.wz.buf,
                 &layer.w_beta.buf,
@@ -690,6 +731,7 @@ pub fn batch_chunk_delta_net_input_projection(
                 &pbs.x_rot_batch,
                 prep,
                 &pbs.dn_qkv_batch,
+                &pbs.dn_z_fold_batch,
                 &pbs.dn_z_batch,
                 &pbs.dn_beta_batch,
                 &pbs.dn_alpha_batch,

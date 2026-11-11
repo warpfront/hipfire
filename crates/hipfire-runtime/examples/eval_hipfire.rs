@@ -87,6 +87,13 @@
 //! Output: HFKSEQ format (see kldref_format.py) — per-sequence (mean, p99)
 //! KLD as fp64 pairs.
 //!
+//! `--per-token-output <path>` (any scoring mode, default off) additionally
+//! writes HFKTOK v1: `HFKTOK\0\0`, u32 version=1, u32 n_chunk, u32
+//! scored_per_chunk, u32 reserved=0, then `n_chunk * scored_per_chunk`
+//! little-endian f64 per-token KLDs in scoring order — the exact values whose
+//! sequential f64 sum / count is each chunk's HFKSEQ `mean_kld` (bit for bit).
+//! Without the flag the kldseq bytes and behaviour are unchanged.
+//!
 //! Plan: docs/plans/issue-113-quant-quality-eval.md (rev-3.2).
 //!
 //! Multi-arch dispatch (Tier-1): mirrors `calib_sweep.rs` arch detection
@@ -122,6 +129,8 @@ fn main() {
         scoring_mode: String,
         max_chunks: Option<usize>,
         scored_max_batch: Option<usize>,
+        tp: Option<usize>,
+        per_token_output: Option<PathBuf>,
     }
     // Every mode's kernel admission, shared by the --scoring-mode error and
     // --help text (kept in sync with the module docs above).
@@ -147,6 +156,8 @@ fn main() {
     let mut scoring_mode = "prefill".to_string();
     let mut max_chunks: Option<usize> = None;
     let mut scored_max_batch: Option<usize> = None;
+    let mut tp: Option<usize> = None;
+    let mut per_token_output: Option<PathBuf> = None;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -210,6 +221,14 @@ fn main() {
                 max_chunks = Some(argv[i + 1].parse().expect("--max-chunks must be integer"));
                 i += 2;
             }
+            "--per-token-output" => {
+                per_token_output = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--tp" => {
+                tp = Some(argv[i + 1].parse().expect("--tp must be integer"));
+                i += 2;
+            }
             "--scored-max-batch" => {
                 let n: usize = argv[i + 1]
                     .parse()
@@ -222,7 +241,8 @@ fn main() {
                 i += 2;
             }
             "-h" | "--help" => {
-                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--kv-v q8] [--scoring-mode prefill|prefill-whole|prefill-prompt|per-token] [--max-chunks N] [--scored-max-batch N]\n{SCORING_MODE_HELP}");
+                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--kv-v q8] [--scoring-mode prefill|prefill-whole|prefill-prompt|per-token] [--max-chunks N] [--scored-max-batch N] [--tp N (qwen35 dense, prefill, q8/q8 KV)]\n{SCORING_MODE_HELP}");
+                eprintln!("       [--per-token-output <path.ktok>]  (HFKTOK v1 per-token KLD f64s, any scoring mode; kldseq bytes unchanged)");
                 std::process::exit(0);
             }
             other => {
@@ -240,10 +260,30 @@ fn main() {
         scoring_mode,
         max_chunks,
         scored_max_batch,
+        tp,
+        per_token_output,
     };
     if args.scored_max_batch.is_some() && args.scoring_mode != "prefill" {
         eprintln!("--scored-max-batch applies to --scoring-mode prefill only");
         std::process::exit(1);
+    }
+    if let Some(tp) = args.tp {
+        if !(2..=8).contains(&tp) {
+            eprintln!("--tp must be in 2..=8 (got {tp})");
+            std::process::exit(1);
+        }
+        if args.scoring_mode != "prefill" || args.scored_max_batch.is_some() {
+            eprintln!("--tp applies to --scoring-mode prefill only (no --scored-max-batch)");
+            std::process::exit(1);
+        }
+        if args.kv_mode != "q8" || args.kv_v != "q8" {
+            eprintln!("--tp requires --kv-mode q8 --kv-v q8 (per-rank q8 KV)");
+            std::process::exit(1);
+        }
+        if args.model.is_dir() {
+            eprintln!("--tp is not supported for safetensors/paro model directories");
+            std::process::exit(1);
+        }
     }
 
     // -------- eval-mode env vars (must precede Gpu::init / forward) --------
@@ -305,7 +345,23 @@ fn main() {
     // HFQ header is authoritative for file models; for safetensors dirs we
     // probe SafetensorsSource. This is byte-identical to calib_sweep's
     // `arch = arg("--arch").unwrap_or(hfq.arch_id)` dispatch.
-    let arch_id: u32 = if args.model.is_dir() {
+    // GGUF-native model (`HIPFIRE_GGUF_NATIVE=1`; refuses with `load refused:` when
+    // the switch is off): the file is parsed, admitted per tensor and its bpw
+    // census / G3 badge logged before any GPU weight upload.
+    let gguf_model = if args.model.extension().is_some_and(|e| e == "gguf") {
+        Some(
+            hipfire_loader::gguf_native::GgufNativeModel::open(&args.model).unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(1)
+            }),
+        )
+    } else {
+        None
+    };
+    let arch_id: u32 = if let Some(m) = &gguf_model {
+        eprintln!("eval_hipfire: detected arch_id={} (GGUF)", m.arch_id);
+        m.arch_id
+    } else if args.model.is_dir() {
         let src = hipfire_runtime::safetensors_source::SafetensorsSource::open(&args.model)
             .unwrap_or_else(|e| {
                 eprintln!("safetensors open {}: {e}", args.model.display());
@@ -328,6 +384,12 @@ fn main() {
     let is_gemma = arch_id == 13;
     let is_glimmer = arch_id == 14;
     let is_lfm = arch_id == 11;
+    if args.tp.is_some() && !is_qwen35 {
+        eprintln!(
+            "eval_hipfire: --tp is implemented for qwen35 (arch_id 5|6) only (got {arch_id})"
+        );
+        std::process::exit(1);
+    }
     if !(is_llama || is_qwen35 || is_gemma || is_glimmer || is_lfm) {
         eprintln!(
             "unsupported arch_id {arch_id}: eval_hipfire wires dense 0|1 (llama), 5|6 (qwen35), 13 (gemma4), 14 (glimmer), 11 (lfm2) — matches calib_sweep.rs:658"
@@ -412,12 +474,248 @@ fn main() {
     let mut p99_kld_per_seq: Vec<f64> = Vec::with_capacity(effective_n_chunk);
     let mut mean_nll_per_seq: Vec<f64> = Vec::with_capacity(effective_n_chunk);
     let mut block_buf = vec![0u8; per_token_block_bytes];
+    // HFKTOK v1 per-token KLDs (only with --per-token-output): the very f64s
+    // whose chunk mean the HFKSEQ `mean_kld` records.
+    let mut ktok: Option<hipfire_runtime::eval_common::TokenKldRecorder> =
+        args.per_token_output.as_ref().map(|_| {
+            hipfire_runtime::eval_common::TokenKldRecorder::new(scored_per_chunk, effective_n_chunk)
+        });
     let t0 = Instant::now();
     let mut total_scored_done = 0usize;
     let scoring_start = n_ctx / 2;
 
     // ===== Arch dispatch (mirrors calib_sweep.rs:684ff) =====
-    if is_qwen35 {
+    if let (true, Some(tp)) = (is_qwen35, args.tp) {
+        // ----- qwen35 dense tensor-parallel prefill scoring (`--tp N`) -----
+        // Hand dense-TP route over `tp` devices: the prefix and the scored
+        // region go through `forward_prefill_dense_tp_with_hidden` (the scored
+        // call captures the post-output-norm hidden row of every token on
+        // rank 0); the per-row lm_head + KLD scoring is the single-card code
+        // on rank 0's full output weights. `forward_prefill_dense_tp_with_hidden`
+        // chunks internally (`prefill_max_batch_tp`) and allocates its own
+        // per-call PrefillBatchScratch, so the rank `Qwen35Scratch` only needs
+        // the decode-batch width (128, as the serve loader) plus `kv_max`.
+        use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+        use hipfire_runtime::multi_gpu::Gpus;
+        use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+
+        // A device-0 context from the single-card init above would sit beside
+        // rank 0's own; the TP route owns every device.
+        drop(gpu);
+
+        let mut hfq = HfqFile::open(&args.model).expect("open model");
+        let global = qwen35::config_from_hfq(&hfq).expect("read config");
+        if global.num_experts != 0 {
+            eprintln!(
+                "eval_hipfire: --tp is dense-only (num_experts={})",
+                global.num_experts
+            );
+            std::process::exit(1);
+        }
+        if ref_n_vocab != global.vocab_size {
+            eprintln!(
+                "vocab mismatch: ref says {ref_n_vocab}, model says {}",
+                global.vocab_size
+            );
+            std::process::exit(2);
+        }
+        let shard = ShardConfig::new(tp, false, 0, ExpertAssign::Stride).unwrap_or_else(|e| {
+            eprintln!("eval_hipfire: --tp {tp}: {e:?}");
+            std::process::exit(1)
+        });
+        let layouts = qwen35::dense_tp_rank_layouts(&global, &shard).unwrap_or_else(|e| {
+            eprintln!("eval_hipfire: --tp {tp}: dense TP layout: {e}");
+            std::process::exit(1)
+        });
+        qwen35::preflight_weights_dense_tp(&hfq, &global, &shard).unwrap_or_else(|e| {
+            eprintln!("eval_hipfire: --tp {tp}: dense TP preflight: {e}");
+            std::process::exit(1)
+        });
+        let configs: Vec<qwen35::Qwen35Config> = layouts
+            .iter()
+            .map(|l| qwen35::local_dense_tp_config(&global, l))
+            .collect();
+
+        let n_tokens = n_ctx * n_chunk;
+        let mut tokens_raw = vec![0u8; n_tokens * 4];
+        ref_in.read_exact(&mut tokens_raw).expect("read ref tokens");
+        let tokens: Vec<u32> = tokens_raw
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+
+        let mut gpus = Gpus::init_tp(tp, global.n_layers).expect("init_tp");
+        let kv_max = n_ctx + 16;
+        let (mut weights, mut scratches, mut kvs, mut dns) = (vec![], vec![], vec![], vec![]);
+        for (rank, g) in gpus.devices.iter_mut().enumerate() {
+            g.bind_thread().expect("bind rank thread");
+            g.active_stream = Some(g.hip.stream_create().expect("rank stream"));
+            let local = &configs[rank];
+            weights.push(
+                qwen35::load_weights_dense_tp_rank(&mut hfq, &global, g, &layouts[rank])
+                    .unwrap_or_else(|e| panic!("load TP rank {rank}: {e:?}")),
+            );
+            scratches
+                .push(Qwen35Scratch::new_with_kv_max(g, local, 128, kv_max).expect("rank scratch"));
+            kvs.push(
+                KvCache::new_gpu_q8(g, local.n_layers, local.n_kv_heads, local.head_dim, kv_max)
+                    .expect("rank kv"),
+            );
+            dns.push(DeltaNetState::new(g, local).expect("rank DeltaNet state"));
+        }
+        let peer = gpus.can_access_peer_all().expect("can_access_peer_all");
+        if peer {
+            gpus.prepare_tp2_whole_token_graph(global.n_layers * 2, global.dim * 4)
+                .expect("prepare_tp2_whole_token_graph");
+            assert!(gpus.enable_peer_all().expect("enable_peer_all"));
+        }
+        eprintln!("eval_hipfire: dense TP route=hand tp={tp} peer_access={peer}");
+        {
+            let mut knobs: Vec<(String, String)> = std::env::vars()
+                .filter(|(k, _)| k.starts_with("HIPFIRE_TP_"))
+                .collect();
+            knobs.sort();
+            if knobs.is_empty() {
+                eprintln!("eval_hipfire: no HIPFIRE_TP_* env set");
+            }
+            for (k, v) in knobs {
+                eprintln!("eval_hipfire: {k}={v}");
+            }
+        }
+
+        gpus.devices[0].bind_thread().expect("bind rank 0");
+        let h_buf = gpus.devices[0]
+            .alloc_tensor(
+                &[scored_per_chunk + usize::from(pad_scoring_tail), global.dim],
+                DType::F32,
+            )
+            .expect("alloc hidden_buf");
+        let vocab = global.vocab_size;
+        let f16_lmhead = weights[0].output.gpu_dtype == DType::F16;
+
+        for c in 0..effective_n_chunk {
+            for (rank, g) in gpus.devices.iter_mut().enumerate() {
+                g.bind_thread().expect("bind rank thread");
+                dns[rank].reset(g).expect("reset DeltaNet state");
+            }
+            let chunk_tokens = &tokens[c * n_ctx..(c + 1) * n_ctx];
+            let mut chunk_klds: Vec<f64> = Vec::with_capacity(scored_per_chunk);
+            let mut chunk_nll_sum: f64 = 0.0;
+            let mut chunk_nll_count: usize = 0;
+
+            qwen35::forward_prefill_dense_tp_with_hidden(
+                &mut gpus,
+                &shard,
+                &weights,
+                &configs,
+                &chunk_tokens[0..scoring_start],
+                0,
+                &mut kvs,
+                &mut dns,
+                &scratches,
+                None,
+            )
+            .expect("forward_prefill_dense_tp prefix");
+            qwen35::forward_prefill_dense_tp_with_hidden(
+                &mut gpus,
+                &shard,
+                &weights,
+                &configs,
+                &chunk_tokens[scoring_start..(n_ctx - 1 + usize::from(pad_scoring_tail))],
+                scoring_start,
+                &mut kvs,
+                &mut dns,
+                &scratches,
+                Some(&h_buf),
+            )
+            .expect("forward_prefill_dense_tp scored");
+
+            gpus.devices[0].bind_thread().expect("bind rank 0");
+            let gpu0 = &mut gpus.devices[0];
+            let batched_logits: Option<rdna_compute::GpuTensor> = if f16_lmhead {
+                let alloc = gpu0
+                    .alloc_tensor(&[scored_per_chunk, vocab], DType::F32)
+                    .expect("alloc batched lm_head logits");
+                gpu0.gemm_f16_batched_lmhead(
+                    &weights[0].output.buf,
+                    &h_buf,
+                    &alloc,
+                    vocab,
+                    global.dim,
+                    scored_per_chunk,
+                )
+                .expect("gemm_f16_batched_lmhead");
+                Some(alloc)
+            } else {
+                None
+            };
+
+            for j in 0..scored_per_chunk {
+                let logits_view = if let Some(all_logits) = &batched_logits {
+                    all_logits.sub_offset(j * vocab, vocab)
+                } else {
+                    let row_view = h_buf.sub_offset(j * global.dim, global.dim);
+                    let ctx = hipfire_runtime::llama::DispatchCtx::new(gpu0);
+                    let _ = hipfire_runtime::llama::gemv_family()
+                        .run_auto(
+                            &ctx,
+                            gpu0,
+                            &weights[0].output.dispatch_ref(),
+                            &row_view,
+                            &scratches[0].logits,
+                        )
+                        .expect("gemv lm_head");
+                    scratches[0].logits.sub_offset(0, vocab)
+                };
+                let pos = scoring_start + j;
+                let actual_next = chunk_tokens[pos + 1] as usize;
+                ref_in.read_exact(&mut block_buf).expect("read ref block");
+                let cand_logits = gpu0.download_f32(&logits_view).expect("download logits");
+                let (kld, nll) = kld_from_block(&cand_logits, &block_buf, top_k, actual_next);
+                chunk_klds.push(kld);
+                if let Some(n) = nll {
+                    chunk_nll_sum += n;
+                    chunk_nll_count += 1;
+                }
+                total_scored_done += 1;
+                if total_scored_done % 1024 == 0 || total_scored_done == total_scored {
+                    let pct = total_scored_done as f64 * 100.0 / total_scored as f64;
+                    let elapsed = t0.elapsed().as_secs_f64();
+                    let rate = total_scored_done as f64 / elapsed.max(1e-9);
+                    eprint!(
+                        "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
+                        c + 1,
+                        effective_n_chunk,
+                        total_scored_done,
+                        total_scored,
+                        pct,
+                        rate
+                    );
+                }
+            }
+            if let Some(alloc) = batched_logits {
+                let _ = gpus.devices[0].free_tensor(alloc);
+            }
+
+            if let Some(r) = ktok.as_mut() {
+                r.push_chunk(&chunk_klds).unwrap_or_else(|e| {
+                    eprintln!("eval_hipfire: {e}");
+                    std::process::exit(1);
+                });
+            }
+
+            let (mean, p99, mean_nll) = hipfire_runtime::eval_common::seq_stats(
+                &chunk_klds,
+                chunk_nll_sum,
+                chunk_nll_count,
+            );
+            mean_kld_per_seq.push(mean);
+            p99_kld_per_seq.push(p99);
+            mean_nll_per_seq.push(mean_nll);
+        }
+        let _ = gpus.devices[0].free_tensor(h_buf);
+        let _ = gpus.free_peer_reduce_scratch();
+    } else if is_qwen35 {
         // ----- qwen35 5|6 — WIRED (preserved byte-identical behavior) -----
         // Quant dtypes admitted: MQ4G256 (campaign --format mq4), MQ8G256,
         // HFQ4G256, Q8_0, F32, BF16 (via HIPFIRE_CALIB_BF16 / F32 widen). The
@@ -427,7 +725,11 @@ fn main() {
 
         // Auto-route safetensors directories (ParoQuant / AWQ / HF native) — mirrors
         // daemon.rs:1500-1504. HFQ files take the canonical HFQ path below.
-        let (config, weights) = if args.model.is_dir() {
+        let (config, weights) = if let Some(m) = &gguf_model {
+            eprintln!("  loading via GGUF-native source arch_id={arch_id}");
+            let weights = m.load_qwen35_weights(&mut gpu).expect("load GGUF weights");
+            (m.hparams.config.clone(), weights)
+        } else if args.model.is_dir() {
             use hipfire_runtime::safetensors_source::SafetensorsSource;
             let source = SafetensorsSource::open(&args.model).expect("safetensors open");
             let config = qwen35::config_from_safetensors(&source).expect("config_from_safetensors");
@@ -894,6 +1196,13 @@ fn main() {
                 }
             }
 
+            if let Some(r) = ktok.as_mut() {
+                r.push_chunk(&chunk_klds).unwrap_or_else(|e| {
+                    eprintln!("eval_hipfire: {e}");
+                    std::process::exit(1);
+                });
+            }
+
             // Per-sequence (mean, p99, mean NLL): `eval_common::seq_stats`
             // (extracted from here; executed by the golden test).
             let (mean, p99, mean_nll) = hipfire_runtime::eval_common::seq_stats(
@@ -1047,6 +1356,12 @@ fn main() {
                     );
                 }
             }
+            if let Some(r) = ktok.as_mut() {
+                r.push_chunk(&chunk_klds).unwrap_or_else(|e| {
+                    eprintln!("eval_hipfire: {e}");
+                    std::process::exit(1);
+                });
+            }
             if chunk_klds.is_empty() {
                 mean_kld_per_seq.push(0.0);
                 p99_kld_per_seq.push(0.0);
@@ -1198,6 +1513,12 @@ fn main() {
                         );
                     }
                 }
+            }
+            if let Some(r) = ktok.as_mut() {
+                r.push_chunk(&chunk_klds).unwrap_or_else(|e| {
+                    eprintln!("eval_hipfire: {e}");
+                    std::process::exit(1);
+                });
             }
             if chunk_klds.is_empty() {
                 mean_kld_per_seq.push(0.0);
@@ -1444,6 +1765,12 @@ fn main() {
                     }
                 }
             }
+            if let Some(r) = ktok.as_mut() {
+                r.push_chunk(&chunk_klds).unwrap_or_else(|e| {
+                    eprintln!("eval_hipfire: {e}");
+                    std::process::exit(1);
+                });
+            }
             if chunk_klds.is_empty() {
                 mean_kld_per_seq.push(0.0);
                 p99_kld_per_seq.push(0.0);
@@ -1577,6 +1904,12 @@ fn main() {
                 }
             }
 
+            if let Some(r) = ktok.as_mut() {
+                r.push_chunk(&chunk_klds).unwrap_or_else(|e| {
+                    eprintln!("eval_hipfire: {e}");
+                    std::process::exit(1);
+                });
+            }
             if chunk_klds.is_empty() {
                 mean_kld_per_seq.push(0.0);
                 p99_kld_per_seq.push(0.0);
@@ -1624,6 +1957,19 @@ fn main() {
         &mean_nll_per_seq,
     )
     .unwrap();
+    if let Some(path) = &args.per_token_output {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).expect("create per-token output parent dir");
+            }
+        }
+        let mut tok_out = BufWriter::new(File::create(path).expect("create per-token output"));
+        ktok.as_ref()
+            .expect("per-token recorder")
+            .write(&mut tok_out)
+            .expect("write per-token output");
+        eprintln!("eval_hipfire: wrote {} (HFKTOK v1)", path.display());
+    }
 
     let overall_mean: f64 =
         mean_kld_per_seq.iter().copied().sum::<f64>() / mean_kld_per_seq.len() as f64;

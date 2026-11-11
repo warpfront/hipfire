@@ -62,6 +62,13 @@ The subset hash identifies a safetensors file with a rewritten visual-only
 header and unchanged source payloads. These are local receipt identities,
 not a registry publication or a claim that a future export has identical metadata.
 
+New exports record a canonical pinned `hf://owner/repo@revision` source when
+exporting remotely. Local exports record the source kind and sorted shard
+basenames without embedding absolute filesystem paths; they do not assert an
+unverified upstream revision. Registry artifacts should use the pinned remote
+export command above. The historical artifact hash in this table predates
+this metadata change.
+
 ## Serving and execution scope
 
 With the separately downloaded text trunk already available:
@@ -130,6 +137,36 @@ The implementation lives in `hipfire-arch-qwen4`'s `vision` and
 optional QSA mRoPE bindings in `rdna-compute/src/qsa_mrope.rs`. The three image
 exports live in their own `qsa_mrope` module; the shared `tensor_ops` source is
 byte-identical to beta, preserving the measured text-route pack hashes.
+
+## Image compatibility and host-only regression coverage
+
+The decoded-image header cap and resized-workspace limit are local to the
+Flash-Next request adapter. The shared Qwen3.5/3.8-VL file-path loader keeps its
+existing decode-and-downscale behavior for images larger than 16 megapixels;
+its WMMA attention route is not restricted by a naive attention score-row LDS
+limit. Flash-Next validates its own resized patch count before preprocessing
+allocates the resized image, and reports invalid dimensions as a request
+validation error.
+
+`python3 scripts/test_qsa_mrope_position.py` compiles the same pure scalar
+position helper embedded in the production HIP module, using a host C++
+compiler only. It checks first-token T/H/W positions across an image boundary,
+incremental pooling offsets and decode positions, and rejects both wrong-block
+and last-token mutations. This test runs in the required no-GPU gates and the
+local pre-commit checks; it does not substitute for the GPU mRoPE oracle or
+the served image battery.
+
+The full 16,128-patch workspace remains necessary even with the default
+2,000,000-pixel resize target: minimum-edge rounding can exceed that target.
+For example, a valid 254,016-by-1 image resizes to 129,024-by-32, exactly
+16,128 patches. A CPU regression checks this admitted boundary; lowering the
+reservation to the nominal pixel target would underprice a supported input.
+
+Architecture debt retained for this port: the Qwen4 adapter reuses the shared
+Qwen35-VL tower, performs the embedding splice through a direct device copy,
+and has a family-specific daemon vision route. The image mRoPE launches remain
+inside the dispatch layer's eager-only closures. Moving the remaining adapter
+orchestration into reusable runtime/dispatch owners is a separate change.
 
 ## Halo validation (2026-10-27)
 

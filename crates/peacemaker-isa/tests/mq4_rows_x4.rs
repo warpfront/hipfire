@@ -325,7 +325,9 @@ fn rowtile_name_determinism_abi_and_fixed_eight_row_resources() {
             (".vgpr_spill_count:", 0),
             (".sgpr_spill_count:", 0),
             (".vgpr_count:", 121),
-            (".sgpr_count:", 82),
+            // gfx1100: the A0..A3 block s[80:87] clears the workgroup ids s14/s15
+            // (`FeatureUserSGPRInit16Bug`), so next_free_sgpr is 88.
+            (".sgpr_count:", if arch == Arch::Gfx1100 { 90 } else { 82 }),
         ] {
             assert_eq!(metadata_numbers(text, key), [expected], "{arch:?}: {key}");
         }
@@ -438,12 +440,14 @@ fn rowtile_arch_y_register_domain_guards_and_full_window_rebasing() {
             assert!(i < first_data_load, "{arch:?}: {guard} after data load");
         }
         assert!(at("s_and_b32 s45, s30, 0xff") < at("s_cmp_lg_u32 s45, 0"));
+        // gfx1100: the Y workgroup id follows the 14 declared user SGPRs (s15).
+        let y_id = if arch == Arch::Gfx1100 { 15 } else { 3 };
         let y_read = if arch.gfx12() {
-            "s_and_b32 s56, ttmp7, 0xffff"
+            "s_and_b32 s56, ttmp7, 0xffff".to_string()
         } else {
-            "s_mov_b32 s56, s3"
+            format!("s_mov_b32 s56, s{y_id}")
         };
-        assert!(at(y_read) < at("s_cmp_ge_u32 s56, 8"));
+        assert!(at(&y_read) < at("s_cmp_ge_u32 s56, 8"));
         assert!(at("s_cmp_ge_u32 s56, 8") < at("s_lshl_b32 s56, s56, 3"));
         assert!(at("s_lshl_b32 s56, s56, 3") < at("s_cmp_ge_u32 s56, s57"));
         assert!(at("s_cmp_gt_u32 s31, 8") < at("s_cselect_b32 s31, 8, s31"));
@@ -460,6 +464,7 @@ fn rowtile_arch_y_register_domain_guards_and_full_window_rebasing() {
         }
         if arch.gfx12() {
             assert!(!tile.s_text.contains("s_mov_b32 s56, s3"));
+            assert!(!tile.s_text.contains("s_mov_b32 s56, s15"));
         } else {
             assert!(!tile.s_text.contains("ttmp"));
             assert!(!tile.s_text.contains("scope:SCOPE"));

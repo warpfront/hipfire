@@ -5,7 +5,8 @@
 //! Row-local R128 / K640 `block_i4_128` (A4) producer for the sub-4-bit down
 //! projection (K3), emitted with the checked ISA builder for gfx1201 only:
 //! the single symbol `mq_i4_a4_r128_k640` in the module `mq_i4_a4_pm_gfx1201`
-//! (bundle `kernels/mq_i4_a4_pm_gfx1201.hxaco`). It is the PM form of
+//! (no standalone image is committed: the arithmetic ships inside the dispatched
+//! `moe_rotate_i4_pm_gfx1201`, which builds from this file). It is the PM form of
 //! `kernels/src/qwen4_moe_rotate128_i4.hip` for the FN down profile (rotation
 //! width 128, `K = 640` = five K128 groups, MQ-I4 qt132/qt134), emitting the
 //! same bytes as that kernel's C2 `{5,7}` quantizer under the standalone lane
@@ -293,6 +294,10 @@ pub(super) fn mad64(b: &mut Builder, dst: u8, base: u8, x: u8, imm: u32) -> R {
 
 /// `dst = base + x * s[mult]` over a 64-bit SGPR pair (`x`, `mult` unsigned SGPRs); clobbers `T0`, `T1`.
 pub(super) fn mad64_reg(b: &mut Builder, dst: u8, base: u8, x: u8, mult: u8) -> R {
+    // `T0` is written before `s_mul_hi_u32` reads `x`: an index in T0/T1 would be clobbered.
+    if x == T0 || x == T1 {
+        return Err(format!("mad64: index s{x} aliases the T0/T1 scratch pair"));
+    }
     let a = b.spec.arch;
     sop(
         b,
@@ -397,19 +402,21 @@ fn prologue(b: &mut Builder) -> R {
         &[H_PTR + 1],
     )?;
     // xq + 72 * (g*L + slot).
+    // The record index goes to ROWS5 (dead after the pad-row test), not T0: `mad64` clobbers T0, and
+    // `s_mul_hi_u32` must read the index, not the low product.
     sop(
         b,
-        format!("s_mul_i32 s{T0}, s{GRP}, s{ARG_L}"),
-        &[T0],
+        format!("s_mul_i32 s{ROWS5}, s{GRP}, s{ARG_L}"),
+        &[ROWS5],
         &[GRP, ARG_L],
     )?;
     sop(
         b,
-        format!("{} s{T0}, s{T0}, s{SLOT}", s_add_i32(a)),
-        &[T0],
-        &[T0, SLOT],
+        format!("{} s{ROWS5}, s{ROWS5}, s{SLOT}", s_add_i32(a)),
+        &[ROWS5],
+        &[ROWS5, SLOT],
     )?;
-    mad64(b, XQ_PTR, ARG_XQ, T0, RECORD_BYTES)?;
+    mad64(b, XQ_PTR, ARG_XQ, ROWS5, RECORD_BYTES)?;
     lane_setup(b)
 }
 

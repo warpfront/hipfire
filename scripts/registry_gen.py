@@ -347,6 +347,9 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
     # Maple-Preview: natively-ternary 256-expert MoE, its own arch crate.
     if family == "maple-preview":
         return 15
+    # KRAFTON Raon-1-mini-preview: RDA + MLA + mHC MoE (arch 19, RaonCarrier).
+    if family == "raon-1-mini-preview":
+        return 19
     if family == "vibethinker":
         return 7   # Qwen2 dense (WeiboAI/VibeThinker-3B base)
     # FLUX.1 MMDiT trunk packs (per-component HFQ, arch 40; sidecar ids
@@ -362,8 +365,9 @@ def quant_for(file: str) -> str | None:
     if m and m.group(1) in KNOWN_QUANTS:
         return m.group(1)
     # Product ladder files: model.mq4 / model.mq4-xt / model.mq4-xts / model.mq4-pro → quant mq4;
-    # an -xts suffix may carry a hot-expert count (model.mq2-xts-4500 → quant mq2)
-    m = re.search(r"\.(mq\d)(?:-(?:xts?(?:-\d+)?|pro))?$", file)
+    # an -xts suffix may carry a hot-expert count (model.mq2-xts-4500 → quant mq2) or the
+    # symmetric-trunk marker (model.mq4-xts-symtrunk → quant mq4)
+    m = re.search(r"\.(mq\d)(?:-(?:xts?(?:-\d+|-symtrunk)?|pro))?$", file)
     if m and m.group(1) in KNOWN_QUANTS:
         return m.group(1)
     ext = file.rsplit(".", 1)[-1]

@@ -188,10 +188,14 @@ fn legacy_entries_stay_lds_free_and_mutations_are_codec_scoped() {
                 e.s_text.contains(".group_segment_fixed_size: 0"),
                 "{codec:?} {kind:?}"
             );
-            assert!(
-                !e.s_text.contains("s_barrier") && !e.s_text.contains("ds_load_b32"),
+            // The BF16 MQ4 gate/up (lockstep) and down (K=640 pipeline) entries carry workgroup
+            // barriers, never LDS accesses; every other legacy entry has neither.
+            assert_eq!(
+                e.s_text.contains("s_barrier"),
+                codec == Codec::Mq4,
                 "{codec:?} {kind:?}"
             );
+            assert!(!e.s_text.contains("ds_load_b32"), "{codec:?} {kind:?}");
             for bad in [
                 Negative::WrongLut,
                 Negative::WrongSignMask,
@@ -256,4 +260,32 @@ fn wrong_fold_epoch_drops_only_the_activation_sum() {
             );
         }
     }
+}
+
+/// R2 card winners: the BF16 MQ4 gate/up entry (two lockstep barriers per two-epoch trip) and the
+/// BF16 MQ4 down entry (K = 640 pipeline: one barrier after each of its five epoch issues) are the
+/// only legacy entries with workgroup barriers; the `_acc` twins and W2/W3 keep the old loop.
+#[test]
+fn mq4_bf16_entries_carry_the_round2_barriers() {
+    let barriers = |kind, acc| {
+        let e = gfx1100::emit(spec(Codec::Mq4, kind, acc, Negative::None)).expect("builds");
+        e.s_text
+            .lines()
+            .filter(|l| l.trim_start().starts_with("s_barrier"))
+            .count()
+    };
+    assert_eq!(barriers(Kind::GateUp, false), 2);
+    assert_eq!(barriers(Kind::Down, false), 5);
+    assert_eq!(barriers(Kind::GateUp, true), 0);
+    assert_eq!(barriers(Kind::Down, true), 0);
+    for codec in [Codec::W2, Codec::W3] {
+        for kind in Kind::ALL {
+            let e = gfx1100::emit(spec(codec, kind, false, Negative::None)).expect("builds");
+            assert!(!e.s_text.contains("s_barrier"), "{codec:?} {kind:?}");
+        }
+    }
+    // A mutated down entry keeps the plain loop (the pipeline is the candidate's only).
+    let m = gfx1100::emit(spec(Codec::Mq4, Kind::Down, false, Negative::ReversedEpoch))
+        .expect("builds");
+    assert!(!m.s_text.contains("s_barrier"));
 }

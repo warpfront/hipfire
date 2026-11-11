@@ -22,7 +22,7 @@ const S_ENDPGM: [u8; 4] = 0xbfb0_0000u32.to_le_bytes();
 
 /// A kernel that is only `s_endpgm`.
 fn kernel(arch: Arch, symbol: &str) -> Emitted {
-    let mut plan = RegPlan::new(16, 8).unwrap();
+    let mut plan = RegPlan::new(16, 16).unwrap();
     plan.v::<1>("a", 0, Live::Whole).unwrap();
     let mut b = Builder::new(
         KernelSpec {

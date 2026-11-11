@@ -61,7 +61,7 @@ impl Verdict {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct Finding {
     /// Stable id: `preflight`, `admission`, `vram`, `context`, `experts`,
-    /// `host_ram`, `gtt`, `weights`.
+    /// `host_ram`, `gtt`, `weights`, `draft`.
     pub id: &'static str,
     pub verdict: Verdict,
     /// What was found, with the numbers it was decided on.
@@ -141,6 +141,22 @@ pub(crate) struct FitDevice {
     pub free: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link: Option<LinkFacts>,
+    /// Tokens of context the model being fitted projects on this GPU (`0`: its
+    /// weights do not fit the free memory). Filled by the model analysis; absent
+    /// where no projection ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<u64>,
+    /// `capacity` capped at the model's trained window (what the report shows).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capacity_shown: Option<u64>,
+    /// `HIP_VISIBLE_DEVICES` value that selects this GPU (UUID, else ROCr
+    /// ordinal). Report text only.
+    #[serde(skip)]
+    pub env_selector: String,
+    /// `hardware.devices` value that selects this GPU (UUID, else PCI
+    /// address). Report text only.
+    #[serde(skip)]
+    pub config_selector: String,
 }
 
 /// Host memory facts the admission gates read.

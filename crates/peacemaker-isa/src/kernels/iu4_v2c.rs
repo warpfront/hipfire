@@ -143,8 +143,14 @@ impl Spec {
     }
 }
 
-/// Kernel-argument SGPRs: SET/ADD `s_load_b256 s[8:15]` (A, Xq, Y, M, K) +
-/// `s_load_b32 s16` (N); gate/up `s_load_b256 s[8:15]` (G, U, Xq, Y) +
+/// Real user SGPRs (the kernarg pointer) and enabled system SGPRs (workgroup ids X, Y).
+const USER_SGPRS: u8 = 2;
+const SYSTEM_SGPRS: u8 = 2;
+/// `.amdhsa_user_sgpr_count` of the gfx1100 descriptor (`Arch::declared_user_sgprs`: user + system >= 16).
+const DECLARED_USER_SGPRS: u8 = Arch::Gfx1100.declared_user_sgprs(USER_SGPRS, SYSTEM_SGPRS);
+
+/// Kernel-argument SGPRs: SET/ADD `s_load_b256 s[56:63]` (A, Xq, Y, M, K) +
+/// `s_load_b32 s16` (N); gate/up `s_load_b256 s[56:63]` (G, U, Xq, Y) +
 /// `s_load_b64 s[30:31]` (M, K) + `s_load_b32 s16` (N).
 #[derive(Clone, Copy)]
 struct Args {
@@ -158,9 +164,9 @@ struct Args {
 fn args(epi: Epi) -> Args {
     if epi.silu() {
         Args {
-            a: 8,
-            xq: 12,
-            y: 14,
+            a: 56,
+            xq: 60,
+            y: 62,
             m: 30,
             k: 31,
             n: 16,
@@ -220,12 +226,14 @@ impl Regs {
     const SILU_T: [u8; 4] = [136, 145, 4, 13];
     // SGPRs
     const KARG: u8 = 0;
-    const WGX: u8 = 2;
-    const WGY: u8 = 3;
+    // gfx1100 `FeatureUserSGPRInit16Bug`: the kernarg pointer s[0:1] is padded with dead user SGPRs
+    // to `user + system (X, Y) = 16`, so the workgroup ids follow the declared count: s14, s15.
+    const WGX: u8 = DECLARED_USER_SGPRS;
+    const WGY: u8 = DECLARED_USER_SGPRS + 1;
     const T0: u8 = 4;
     const T1: u8 = 5;
     const T64: u8 = 6;
-    const ARGS: u8 = 8; // A s[8:9], Xq s[10:11], Y s[12:13], M s14, K s15
+    const ARGS: u8 = 56; // A s[56:57], Xq s[58:59], Y s[60:61], M s62, K s63 (s14/s15 are the workgroup ids)
     const N: u8 = 16;
     const ROWB: u8 = 17;
     const WAVE: u8 = 18;
@@ -237,11 +245,11 @@ impl Regs {
     const M64: u8 = 27;
     const WR: u8 = 28;
     const WC: u8 = 29;
-    const A: u8 = 8;
-    const XQ: u8 = 10;
-    const Y: u8 = 12;
-    const M: u8 = 14;
-    const K: u8 = 15;
+    const A: u8 = 56;
+    const XQ: u8 = 58;
+    const Y: u8 = 60;
+    const M: u8 = 62;
+    const K: u8 = 63;
     // Gate/up: M, K s[30:31]; staging base (gate or up rows of this wave)
     // s[32:33]; the up-row scale base s[34:35] (SA holds the gate-row one);
     // SiLU lane masks s36, s38, .., s50 (one aligned pair each).
@@ -1667,7 +1675,7 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
         arch: spec.arch,
         symbol: spec.symbol(),
         kernargs: spec.kernargs(),
-        user_sgpr_count: 2,
+        user_sgpr_count: USER_SGPRS,
         system_sgpr_workgroup_id_y: true,
         workgroup_size: THREADS,
         group_segment_fixed_size: 0,

@@ -8,7 +8,7 @@
 //! ```text
 //! cargo run --release -p hipfire-arch-qwen35-vl --features lab --example vl_tower_dump -- \
 //!   --model qwen3.8-27b-vision.hfq (--patches pixel_values.bin --grid-h H --grid-w W | --image IMG) \
-//!   --out DIR [--reps R] [--stages 1] [--residency resident|streamed]
+//!   --out DIR [--reps R] [--stages 1] [--residency resident|host-mapped|streamed]
 //! ```
 //!
 //! * `--patches` is raw little-endian F32 `[grid_h*grid_w, 1536]` in HF
@@ -48,7 +48,7 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
 const USAGE: &str = "usage: vl_tower_dump --model VISION.hfq \
 (--patches F32.bin --grid-h H --grid-w W | --image IMG) --out DIR [--reps R] [--stages 1] \
-[--residency resident|streamed]";
+[--residency resident|host-mapped|streamed]";
 
 fn digest(path: &Path) -> Res<String> {
     let mut file = fs::File::open(path)?;
@@ -111,9 +111,12 @@ fn main() -> Res<()> {
     };
     let residency = match flags.get("--residency") {
         Some(&"resident") => TowerResidency::Resident,
+        Some(&"host-mapped") => TowerResidency::HostMapped,
         Some(&"streamed") | None => TowerResidency::Streamed,
         Some(other) => {
-            return Err(format!("--residency takes resident or streamed, got {other}").into())
+            return Err(
+                format!("--residency takes resident, host-mapped or streamed, got {other}").into(),
+            )
         }
     };
     let dump_child = flags.get("--dump-child") == Some(&"1");
@@ -191,6 +194,7 @@ fn main() -> Res<()> {
     let mut gpu = Gpu::init()?;
     let arch = gpu.arch.clone();
     let weights = load_vision_weights(&hfq, &config, &mut gpu, residency)?;
+    assert_eq!(weights.residency(), residency, "loader ignored placement");
 
     if dump_child {
         // Single untimed run; per-stage dumps land in `out` via HIPFIRE_VL_DUMP_DIR.
@@ -215,6 +219,19 @@ fn main() -> Res<()> {
                 } else {
                     eprintln!("[vl_tower_dump] rep {rep}/{reps} {ms:.1} ms");
                     rep_ms.push(ms);
+                }
+                if output.iter().any(|v| !v.is_finite()) || !output.iter().any(|v| *v != 0.0) {
+                    failure = Some("non-finite or unwritten tower output".into());
+                    break;
+                }
+                if !last.is_empty()
+                    && !output
+                        .iter()
+                        .zip(&last)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                {
+                    failure = Some("tower output changed across identical image requests".into());
+                    break;
                 }
                 last = output;
             }
@@ -285,6 +302,7 @@ fn main() -> Res<()> {
         "stages": stages,
         "residency": match residency {
             TowerResidency::Resident => "resident",
+            TowerResidency::HostMapped => "host-mapped",
             TowerResidency::Streamed => "streamed",
         },
         "HIPFIRE_VIT_ATTN": selector("HIPFIRE_VIT_ATTN"),

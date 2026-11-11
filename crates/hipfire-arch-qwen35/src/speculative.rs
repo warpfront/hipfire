@@ -2121,6 +2121,41 @@ impl GdnTape {
         Self::new_armed(gpu, config, max_n, false)
     }
 
+    /// Device bytes [`Self::new_for_config`] allocates for `max_n` rows, computed
+    /// from the config alone (no allocation): the per-LA-layer qkv/alpha/beta
+    /// capture buffers plus the six replay scratches (all F32). With
+    /// `replay_ml` the multi-layer replay arming is charged too: the shared
+    /// q/k/v/out scratch (4 regions of `n_la * rows * v_dim` F32, `rows` capped
+    /// at the replay step ceiling) and the two per-layer pointer tables. The
+    /// scratch is shared per shape on a `Gpu`, so this is an upper bound when
+    /// another tape of the same shape is already armed.
+    pub fn requested_bytes(config: &qwen35::Qwen35Config, max_n: usize, replay_ml: bool) -> usize {
+        let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+        let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+        let qkv_dim = k_dim * 2 + v_dim;
+        let n_v_heads = config.linear_num_value_heads;
+        let n_la = config
+            .layer_types
+            .iter()
+            .filter(|t| **t == qwen35::LayerType::LinearAttention)
+            .count();
+        let f32_elems = n_la * max_n * (qkv_dim + 2 * n_v_heads) + max_n * (2 * k_dim + 4 * v_dim);
+        let mut bytes = f32_elems * 4;
+        if replay_ml && n_la != 0 {
+            let rows = max_n.min(rdna_compute::dflash_gdn_replay::DFLASH_GDN_REPLAY_MAX_STEPS);
+            let shape = rdna_compute::dflash_gdn_replay::GdnReplayScratchShape {
+                n_layers: n_la,
+                rows,
+                v_dim,
+            };
+            bytes += 4 * shape.region_bytes()
+                + n_la
+                    * (std::mem::size_of::<rdna_compute::dflash_gdn_replay::DflashReplayPreLayer>(
+                    ) + std::mem::size_of::<rdna_compute::dflash_gdn_replay::GdnLayerTable>());
+        }
+        bytes
+    }
+
     /// DFlash replay tape: [`Self::new_for_config`] plus, when
     /// `HIPFIRE_DN_SNAPSHOT_FLIP` is on, the D8 snapshot-source tables that
     /// [`Self::replay_gdn_from_snapshot`] needs.
@@ -13020,6 +13055,7 @@ pub fn spec_step_ddtree_batched(
 pub fn take_dn_checkpoint(
     cks: &mut Vec<(usize, DeltaNetSnapshot)>,
     dn: &DeltaNetState,
+    kv: &KvCache,
     gpu: &mut Gpu,
     pos: usize,
     interval: usize,
@@ -13033,7 +13069,12 @@ pub fn take_dn_checkpoint(
         Some(p) if p == pos => return,
         _ => {}
     }
-    let mut snap = if cks.len() >= cap {
+    // A new snapshot beyond the ring's first (the charged one) is allowed only
+    // from memory the admitted context does not need; otherwise the oldest is
+    // recycled, shrinking the ring to what fits.
+    let recycle =
+        cks.len() >= cap || (!cks.is_empty() && !checkpoint_fits_admitted_context(gpu, kv, dn));
+    let mut snap = if recycle {
         cks.remove(0).1
     } else {
         match DeltaNetSnapshot::new_for(gpu, dn) {
@@ -13052,6 +13093,29 @@ pub fn take_dn_checkpoint(
         return;
     }
     cks.push((pos, snap));
+}
+
+/// Whether one more DeltaNet snapshot can be allocated without eating what the
+/// admitted context still needs: `free_now >= snapshot + KV mapping growth to
+/// the admitted tokens + the fit's reserve`. No floor set => always true; a
+/// memory query or growth-plan error => false (do not allocate).
+fn checkpoint_fits_admitted_context(gpu: &Gpu, kv: &KvCache, dn: &DeltaNetState) -> bool {
+    let Some(floor) = gpu.kv_fit_floor else {
+        return true;
+    };
+    let Ok((free_now, _)) = gpu.device_mem_info() else {
+        return false;
+    };
+    let Ok(growth) = kv.planned_mapped_growth_bytes(gpu, floor.admitted_tokens) else {
+        return false;
+    };
+    let Ok(snapshot) = usize::try_from(DeltaNetSnapshot::bytes_for(dn)) else {
+        return false;
+    };
+    free_now
+        >= snapshot
+            .saturating_add(growth)
+            .saturating_add(floor.reserve_bytes)
 }
 
 /// Outer chunk ceiling of the DFlash prompt seed ([`SeedPrefill::plan`]):
@@ -13242,14 +13306,14 @@ struct SeedPrefill {
 }
 
 impl SeedPrefill {
-    fn plan(gpu: &Gpu, target: &DflashTargetParts<'_>) -> Self {
+    fn plan(gpu: &Gpu, target: &DflashTargetParts<'_>, end_tokens: usize) -> Self {
         let ceiling = match dflash_seed_ceiling(
             gpu,
             target.weights,
             target.config,
             target.dn_state,
             target.kv_cache,
-            0,
+            qwen35::prefill::request_kv_growth_deduction(gpu, target.kv_cache, end_tokens),
         ) {
             Ok(limit) => limit,
             Err(e) => {
@@ -13416,7 +13480,7 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
             snap.free_gpu(gpu);
         }
     }
-    let mut seed = SeedPrefill::plan(gpu, target);
+    let mut seed = SeedPrefill::plan(gpu, target, prompt_tokens.len());
     LAST_DFLASH_SEED_CEILING.store(seed.ceiling, std::sync::atomic::Ordering::Relaxed);
     let result = (|| -> HipResult<bool> {
         let mut seq_pos: usize = 0;
@@ -13446,8 +13510,18 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
                 )?;
                 seq_pos += piece;
             }
+            // Prompt-prefill progress (silent outside a `prompt_phase`).
+            hipfire_runtime::prefill_progress::report(seq_pos, prompt_tokens.len());
             if let Some(cks) = checkpoints.as_deref_mut() {
-                take_dn_checkpoint(cks, target.dn_state, gpu, seq_pos, ckpt_interval, ckpt_cap);
+                take_dn_checkpoint(
+                    cks,
+                    target.dn_state,
+                    target.kv_cache,
+                    gpu,
+                    seq_pos,
+                    ckpt_interval,
+                    ckpt_cap,
+                );
             }
         }
         Ok(false)
@@ -13516,7 +13590,7 @@ pub fn seed_target_hidden_suffix_abortable_parts(
     ckpt_interval: usize,
     ckpt_cap: usize,
 ) -> HipResult<bool> {
-    let mut seed = SeedPrefill::plan(gpu, target);
+    let mut seed = SeedPrefill::plan(gpu, target, start_pos + suffix.len());
     let result = (|| -> HipResult<bool> {
         let mut off: usize = 0;
         let mut pos = start_pos;
@@ -13538,8 +13612,19 @@ pub fn seed_target_hidden_suffix_abortable_parts(
                 pos += piece;
                 off += piece;
             }
+            // Prompt-prefill progress (silent outside a `prompt_phase`, so
+            // forced advances and terminal repair stay quiet).
+            hipfire_runtime::prefill_progress::report(off, suffix.len());
             if let Some(cks) = checkpoints.as_deref_mut() {
-                take_dn_checkpoint(cks, target.dn_state, gpu, pos, ckpt_interval, ckpt_cap);
+                take_dn_checkpoint(
+                    cks,
+                    target.dn_state,
+                    target.kv_cache,
+                    gpu,
+                    pos,
+                    ckpt_interval,
+                    ckpt_cap,
+                );
             }
         }
         Ok(false)

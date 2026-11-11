@@ -8,7 +8,10 @@
 //! `iu4_gemm::emit` (a scratch worktree of origin/beta, this file copied in). A change to any digest is a change
 //! to a production kernel and must be intentional.
 
-use peacemaker_isa::kernels::iu4_gemm::{emit, ALayout, Cacc, Epi, Fold, Mma, Spec, Tile};
+use peacemaker_isa::kernels::iu4_gemm::{
+    emit, emit_module, module_tune, verify64_tune, ALayout, Cacc, Epi, Fold, Mma, QkvStore, Spec,
+    Tile, Tune, WaitPlace,
+};
 use peacemaker_isa::Arch;
 use sha2::{Digest, Sha256};
 
@@ -94,6 +97,7 @@ fn digests() -> Vec<(String, String)> {
                             act,
                             arch: Arch::Gfx1201,
                             mma: Mma::Dense,
+                            tune: Tune::default(),
                         };
                         if spec.validate().is_err() {
                             continue;
@@ -123,4 +127,134 @@ fn iu4_gemm_emit_digests_pinned() {
     }
     let got: Vec<(&str, &str)> = got.iter().map(|(n, d)| (n.as_str(), d.as_str())).collect();
     assert_eq!(got, PINNED, "iu4_gemm emitted bytes changed");
+}
+
+/// The shipped 27B gate/up export (`gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s`, `Tune::shipped_gate_up_slab`): the sha256 of
+/// its `emit(spec).s_text` and of the symbol's code in the committed `_b1s` module (see `native_identity.rs`).
+const PINNED_GATE_UP_SLAB_WINDOW: (&str, &str) = (
+    "k128-128x128x8-cacc1-slab-silu-wwindow-fschain",
+    "baf26d529895ede82d7484ed851ced347fa777c28bc9c869d219bbf6a67fdacc",
+);
+
+fn gate_up_slab(tune: Tune) -> Spec {
+    Spec {
+        fold: Fold::K128,
+        tile: Tile::T128x128x8,
+        cacc: Cacc::One,
+        epi: Epi::GateUpSilu,
+        act: ALayout::Slab,
+        arch: Arch::Gfx1201,
+        mma: Mma::Dense,
+        tune,
+    }
+}
+
+#[test]
+fn iu4_gemm_gate_up_slab_window_digest_pinned() {
+    let spec = gate_up_slab(Tune::shipped_gate_up_slab());
+    assert_eq!(spec.tune.wait, WaitPlace::Window);
+    let e = emit(spec).unwrap();
+    assert_eq!(spec.variant_name(), PINNED_GATE_UP_SLAB_WINDOW.0);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(e.s_text.as_bytes())),
+        PINNED_GATE_UP_SLAB_WINDOW.1,
+        "the shipped gate/up window schedule changed"
+    );
+}
+
+/// The module emission gives the window tune to that one export and the default tune to every other symbol of every
+/// module (token and slab, both tiles): each module symbol's bytes are `emit` of its spec with `module_tune`, and only
+/// the 128x128x8 slab `silu` one has a non-default tune.
+#[test]
+fn only_the_gate_up_slab_export_takes_the_window_tune() {
+    for tile in [Tile::T128x128x8, Tile::T256x128x16] {
+        for act in [ALayout::Token, ALayout::Slab] {
+            // The 16-wave tile has no slab layout: no such module.
+            let Ok((emitted, _, _)) = emit_module(Fold::K128, tile, Cacc::One, act, Arch::Gfx1201)
+            else {
+                assert_eq!((tile, act), (Tile::T256x128x16, ALayout::Slab));
+                continue;
+            };
+            let mut matched = 0;
+            for epi in [
+                Epi::Set,
+                Epi::Add,
+                Epi::GateUpSilu,
+                Epi::GateUpSiluBf16,
+                Epi::QkvzaGdn,
+                Epi::AddSigmoid,
+            ] {
+                let tune = module_tune(tile, act, epi);
+                let spec = Spec {
+                    epi,
+                    tile,
+                    act,
+                    tune,
+                    ..gate_up_slab(Tune::default())
+                };
+                if spec.validate().is_err() {
+                    continue;
+                }
+                let Some(e) = emitted
+                    .iter()
+                    .find(|e| e.proof.variant == spec.variant_name())
+                else {
+                    continue;
+                };
+                matched += 1;
+                let windowed =
+                    tile == Tile::T128x128x8 && act == ALayout::Slab && epi == Epi::GateUpSilu;
+                assert_eq!(tune.is_default(), !windowed, "{}", e.proof.variant);
+                assert_eq!(e.s_text, emit(spec).unwrap().s_text, "{}", e.proof.variant);
+            }
+            // The slab module's extra export: the fused projection with plain QKV stores.
+            if tile == Tile::T128x128x8 && act == ALayout::Slab {
+                let spec = Spec {
+                    epi: Epi::QkvzaGdn,
+                    tile,
+                    act,
+                    tune: Tune {
+                        qkv: QkvStore::Set,
+                        ..Tune::default()
+                    },
+                    ..gate_up_slab(Tune::default())
+                };
+                let e = emitted
+                    .iter()
+                    .find(|e| e.proof.variant == spec.variant_name())
+                    .expect("the slab module exports the qkvzaset kernel");
+                matched += 1;
+                assert_eq!(e.s_text, emit(spec).unwrap().s_text, "{}", e.proof.variant);
+                // The small-N `_v64` exports: the four N-keyed schedules of `verify64_tune`.
+                for (epi, qkv_set) in [
+                    (Epi::GateUpSilu, false),
+                    (Epi::Add, false),
+                    (Epi::Set, false),
+                    (Epi::QkvzaGdn, true),
+                ] {
+                    let tune = verify64_tune(epi, qkv_set);
+                    assert!(tune.n64 && !tune.is_default());
+                    let spec = Spec {
+                        epi,
+                        tile,
+                        act,
+                        tune,
+                        ..gate_up_slab(Tune::default())
+                    };
+                    assert!(spec.symbol().ends_with("_b1s_v64"), "{}", spec.symbol());
+                    let e = emitted
+                        .iter()
+                        .find(|e| e.proof.variant == spec.variant_name())
+                        .expect("the slab module exports the v64 kernels");
+                    matched += 1;
+                    assert_eq!(e.s_text, emit(spec).unwrap().s_text, "{}", e.proof.variant);
+                }
+            }
+            assert_eq!(
+                matched,
+                emitted.len(),
+                "{tile:?} {act:?}: every module symbol"
+            );
+        }
+    }
 }

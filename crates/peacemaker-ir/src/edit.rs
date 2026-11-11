@@ -755,7 +755,10 @@ pub fn lower_labels(body: &Body, arch: Arch) -> Result<Vec<Inst>, EditError> {
 /// Encode a kernel body (labels lowered from its current layout) with the
 /// selected target codec. Never reads `prov.bytes`.
 pub fn encode_stream(body: &Body, arch: Arch) -> Result<Vec<u32>, EditError> {
-    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
+    if !matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+    ) {
         return Err(EditError::Unsupported(format!("no codec for {arch:?}")));
     }
     let mut words = Vec::new();
@@ -1217,7 +1220,10 @@ fn entry_cell_dword(cell: EntryCell) -> usize {
 /// exactly the declared entry facts plus MODE (defined because the FP state is declared);
 /// nothing else, in particular no EXEC, VCC, M0, SCC, flat-scratch/aperture or hwreg state.
 fn entry_seed(kern: &Kernel, arch: Arch) -> Result<Bits, EditError> {
-    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
+    if !matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+    ) {
         return Err(EditError::Unsupported(format!(
             "no ABI entry table for {arch:?}"
         )));
@@ -1228,7 +1234,7 @@ fn entry_seed(kern: &Kernel, arch: Arch) -> Result<Bits, EditError> {
         // COMPUTE_PGM_RSRC2.USER_SGPR_COUNT user SGPRs in order TGID_X
         // (bit 7), TGID_Y (bit 8), TGID_Z (bit 9), TG_SIZE (bit 10); there
         // are no workgroup-id TTMPs.
-        Abi::Hsa { descriptor, .. } if arch != Arch::Gfx1201 => {
+        Abi::Hsa { descriptor, .. } if !arch.is_gfx12() => {
             let rsrc2 = descriptor.compute_pgm_rsrc2.0;
             let user = (rsrc2 >> 1 & 0x1f) as usize;
             let system = (7..=10).filter(|bit| rsrc2 >> bit & 1 != 0).count();
@@ -4366,6 +4372,57 @@ mod tests {
             L("done"),
             I(endpgm()),
         ]
+    }
+
+    /// Regression (s47@0x20b0 in the FA prep twin): FMAMK's destination is not
+    /// a read, so a source-defined `s_fmamk_f32 s47,s50,K,s22` /
+    /// `v_fmamk_f32 v69,v40,K,v70` must define its destination without a
+    /// definedness-entry obligation. Fails against the old table rows that
+    /// listed the destination in `uses`.
+    #[test]
+    fn literal_fma_first_definition_has_no_definedness_obligation() {
+        let dec = |words: &[u32]| crate::codec::gfx12::decode(words).unwrap().0;
+        // SOP2 0x46: 0x80000000 | op<<23 | sdst<<16 | ssrc1<<8 | ssrc0.
+        let s_fmamk = dec(&[0xa32f_1632, 0x3b80_0000]);
+        // VOP2 0x2c: op<<25 | vdst<<17 | vsrc1<<9 | (256+vsrc0).
+        let v_fmamk = dec(&[0x588a_8d28, 0x3b80_0000]);
+        let h1151 = crate::codec::gfx11::decode(Arch::Gfx1151, &[0x588a_8d28, 0x3b80_0000])
+            .unwrap()
+            .0;
+
+        let scalar = vec![
+            I(smov(s(50), s(0))),
+            I(smov(s(22), s(0))),
+            I(s_fmamk),
+            I(smov(s(60), s(47))),
+            I(endpgm()),
+        ];
+        let scalar_missing = missing_entry(scalar);
+        assert!(
+            scalar_missing.is_empty(),
+            "s47 first definition: {scalar_missing:?}"
+        );
+        let vector = vec![
+            I(vmov(40, s(0))),
+            I(vmov(70, s(0))),
+            I(v_fmamk),
+            I(vadd(71, 69, 69)),
+            I(endpgm()),
+        ];
+        assert!(missing_entry(vector).is_empty());
+        assert!(!h1151.effects.uses.contains(&vreg(69, 1)));
+        assert_eq!(h1151.effects.defs.as_slice(), &[vreg(69, 1)]);
+        assert!(h1151.effects.uses.contains(&vreg(40, 1)));
+        assert!(h1151.effects.uses.contains(&vreg(70, 1)));
+        // A genuine accumulator still reads its destination: v_fmac into an
+        // undefined v69 is a real obligation.
+        let fmac = vec![
+            I(vmov(40, s(0))),
+            I(vmov(70, s(0))),
+            I(mk("v_fmac_f32_e32", vec![v(69), v(40), v(70)])),
+            I(endpgm()),
+        ];
+        assert!(!missing_entry(fmac).is_empty());
     }
 
     /// Repeated forward diamonds with one immutable scalar definition and a

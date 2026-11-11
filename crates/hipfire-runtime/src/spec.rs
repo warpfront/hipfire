@@ -263,8 +263,8 @@ pub trait SpecTarget {
     /// from the current state (cache-hit suffix, or the partial-accept replay).
     ///
     /// `hidden_out`: when `Some` and `dflash_extract_layers()` is `Some(layers)`,
-    /// the target appends, per processed position, the concat of residual hidden
-    /// at `layers` (`layers.len() × dim` f32/row) to the provided `Vec`. Ignored
+    /// the target appends, per processed position, the capture of the residual hidden
+    /// at `layers` (`layers.len() × dflash_streams_per_layer() × dim` f32/row) to the provided `Vec`. Ignored
     /// (no-op) when `None` or when `dflash_extract_layers()` returns `None`.
     fn spec_advance(
         &mut self,
@@ -288,8 +288,8 @@ pub trait SpecTarget {
     /// snapshot nothing.
     ///
     /// `hidden_out`: when `Some` and `dflash_extract_layers()` is `Some(layers)`,
-    /// the target appends, per processed position, the concat of residual hidden
-    /// at `layers` (`layers.len() × dim` f32/row). Ignored when `None` or when
+    /// the target appends, per processed position, the capture of the residual hidden
+    /// at `layers` (`layers.len() × dflash_streams_per_layer() × dim` f32/row). Ignored when `None` or when
     /// `dflash_extract_layers()` returns `None`.
     fn verify_block(
         &mut self,
@@ -393,12 +393,24 @@ pub trait SpecTarget {
 
     /// The layer indices whose residual hidden states the drafter wants captured,
     /// in order. When `Some(layers)`, the target should, on each processed
-    /// position, append `layers.len() × dim` f32 values to the `hidden_out` sink
+    /// position, append `layers.len() × dflash_streams_per_layer() × dim` f32 values to the `hidden_out` sink
     /// passed to [`spec_advance`](Self::spec_advance) / [`verify_block`](Self::verify_block).
     ///
     /// `None` (default) means this target cannot feed a hidden-conditioned drafter.
     fn dflash_extract_layers(&self) -> Option<&[usize]> {
         None
+    }
+
+    /// Hidden rows the target captures per extract layer per position (default
+    /// 1: one `dim`-wide residual row per layer; a target whose residual has
+    /// several streams either averages them down to 1 or exposes all of them).
+    /// A feature row is `layers.len() × dflash_streams_per_layer() × dim` F32,
+    /// layer-major in [`set_dflash_extract_layers`](Self::set_dflash_extract_layers)
+    /// order, then stream-major, then hidden. A hidden-conditioned drafter
+    /// refuses a target whose value differs from its own
+    /// `target_streams_per_layer`.
+    fn dflash_streams_per_layer(&self) -> usize {
+        1
     }
 
     /// Apply the target's lm_head to `n` rows of residual hidden states
@@ -449,10 +461,63 @@ pub trait SpecTarget {
         Err("target does not expose verify_block_logits".into())
     }
 
+    /// One committed target row: feed `token` at `position` (a drafter's
+    /// one-row step, whose row is always kept), capture its feature row into
+    /// `hidden_out` as [`verify_block`](Self::verify_block) does, and return
+    /// its argmax, or its full logits when `want_logits`. Leaves the target at
+    /// `position + 1` with no verify outstanding. Since nothing is rolled back,
+    /// a target may skip the snapshot a verify takes; on `Err` the target
+    /// state is then undefined and the caller resets it (as it does on any
+    /// failed spec step). Default: a one-row verify plus
+    /// [`commit_prefix`](Self::commit_prefix).
+    fn commit_row(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        hidden_out: Option<&mut Vec<f32>>,
+        want_logits: bool,
+    ) -> Result<RowPick, String> {
+        let block = [token];
+        let pick = if want_logits {
+            RowPick::Logits(self.verify_block_logits(gpu, &block, position, scratch, hidden_out)?)
+        } else {
+            let picks = self.verify_block(gpu, &block, position, scratch, hidden_out)?;
+            RowPick::Argmax(*picks.first().ok_or("verify returned no pick")?)
+        };
+        self.commit_prefix(gpu, &block, 0, position, scratch)?;
+        Ok(pick)
+    }
+
+    /// [`commit_row`](Self::commit_row) with `want_logits`, into caller-owned
+    /// storage: `logits` is replaced by the row's full logits, reusing its
+    /// allocation, and the feature row is appended to `hidden_out`, which a
+    /// drafter may point straight at its own feature log. A target that can
+    /// enqueue both readbacks and wait once overrides it. Default: the
+    /// allocating [`commit_row`](Self::commit_row).
+    fn commit_row_logits(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        hidden_out: Option<&mut Vec<f32>>,
+        logits: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        match self.commit_row(gpu, token, position, scratch, hidden_out, true)? {
+            RowPick::Logits(row) => {
+                *logits = row;
+                Ok(())
+            }
+            RowPick::Argmax(_) => Err("commit_row returned an argmax for a logits request".into()),
+        }
+    }
+
     /// Like [`verify_block`](Self::verify_block), but captures the per-position
     /// extract-layer residual hidden into the caller-owned GPU buffer
     /// `hidden_gpu` (position-major `[n_pos × dflash_extract_layers().len() ×
-    /// dim]` F32) instead of a host `Vec` — keeping the DSpark accepted-prefix-
+    /// dflash_streams_per_layer() × dim]` F32) instead of a host `Vec` — keeping the DSpark accepted-prefix-
     /// hidden reuse entirely on-device (no D2H+H2D per window; ~free on UMA, a
     /// real saving on a discrete-VRAM GPU).
     ///
@@ -461,7 +526,7 @@ pub trait SpecTarget {
     /// whose batched capture path can't run for this block (e.g. llama with
     /// `block.len() < 4`) returns `false` and leaves `hidden_gpu` untouched, and
     /// the caller re-bootstraps the next window. `hidden_gpu` must be
-    /// `≥ block.len() × dflash_extract_layers().len() × dim` F32.
+    /// `≥ block.len() × dflash_extract_layers().len() × dflash_streams_per_layer() × dim` F32.
     ///
     /// Same snapshot/advance contract as [`verify_block`](Self::verify_block).
     /// Returns `Err` by default (target has no GPU-resident hidden capture).
@@ -556,6 +621,20 @@ pub trait SpecTarget {
     /// re-derives its base from the end position). Default: keep every row.
     fn set_dflash_feature_window(&mut self, _rows: usize) {}
 
+    /// The measured spec → AR break-even line of a DFlash2 drafter on this
+    /// target and device (`draft_quantized`: the draft carries MQ weights),
+    /// in AR decode steps per spec cycle ([`crate::spec_retire::BreakEven`]).
+    /// `Some` also arms the drafter's AR step, so a request whose drafts do
+    /// not pay continues as plain AR. Default `None`: no measured line, the
+    /// drafter never retires.
+    fn dflash_retire_break_even(
+        &self,
+        _gpu: &Gpu,
+        _draft_quantized: bool,
+    ) -> Option<crate::spec_retire::BreakEven> {
+        None
+    }
+
     /// Roll back a verify whose window will not reach
     /// [`commit_prefix`](Self::commit_prefix) (the drafter failed after the
     /// verify ran): restore whatever the verify snapshotted into `scratch`.
@@ -566,6 +645,23 @@ pub trait SpecTarget {
         _scratch: &mut dyn SpecScratch,
     ) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Roll the target back to the start `position` of the window the last
+    /// [`commit_prefix`](Self::commit_prefix) committed and re-run `replay`,
+    /// a prefix of that window's committed tokens (a terminal stop inside
+    /// the window, [`Speculator::repair_terminal_prefix`]). Valid only
+    /// before the next verify, advance or reset. `Ok(false)`: no window is
+    /// retained or it does not match; the target is unchanged. Default:
+    /// nothing retained.
+    fn repair_committed_prefix(
+        &mut self,
+        _gpu: &mut Gpu,
+        _scratch: &mut dyn SpecScratch,
+        _position: usize,
+        _replay: &[u32],
+    ) -> Result<bool, String> {
+        Ok(false)
     }
 
     /// Capture the target's residual hidden states at `layers` for a freshly-
@@ -645,6 +741,14 @@ pub trait SpecScratch {
     /// Forget per-window state that names target state a reset discarded
     /// (an outstanding verify ticket). Default: nothing to forget.
     fn clear(&mut self) {}
+}
+
+/// Outcome of [`SpecTarget::commit_row`]: the row's argmax, or its full
+/// `vocab` logits.
+#[derive(Debug, Clone)]
+pub enum RowPick {
+    Argmax(u32),
+    Logits(Vec<f32>),
 }
 
 /// Outcome of [`SpecTarget::spec_advance`].
@@ -860,20 +964,50 @@ pub trait Speculator {
         false
     }
 
-    /// One greedy target-only token for a request the spec-retire policy
-    /// retired: feed `seed` at absolute `position` through the target, keep
+    /// One target-only token for a request the spec-retire policy retired:
+    /// feed `seed` at absolute `position` through the target, keep
     /// drafter-local per-position state in sync (a later request that hits
-    /// this prompt cache drafts from those rows), and return the target's
-    /// argmax next token. No draft runs.
+    /// this prompt cache drafts from those rows), and return the next token:
+    /// the target's argmax, or for a sampled request on a speculator with
+    /// [`Self::supports_sampled_ar_step`] a draw from the request's sampling
+    /// law. No draft runs. `emitted` is the committed generation so far with
+    /// the pending `seed` last, as [`Self::step`] receives it: the penalty
+    /// history of a speculator that [`Self::supports_penalties`].
     fn ar_step(
         &mut self,
         gpu: &mut Gpu,
         target: &mut dyn SpecTarget,
         position: usize,
         seed: u32,
+        emitted: &[u32],
     ) -> Result<u32, String> {
-        let _ = (gpu, target, position, seed);
+        let _ = (gpu, target, position, seed, emitted);
         Err(format!("{}: speculator has no AR step", self.name()))
+    }
+
+    /// Whether this speculator reproduces AR under non-neutral
+    /// repeat/presence/frequency penalties: every verify row (and the AR
+    /// step) is penalized against `suffix_W(history || emitted || earlier
+    /// drafts)` with AR's own arithmetic, `history` being the prompt unless
+    /// [`SpecRequestConfig::penalty_generated_only`]. Route selection admits
+    /// a penalized request to a speculator only when this is `true`.
+    /// Default `false`: the speculator refuses or ignores penalties.
+    fn supports_penalties(&self) -> bool {
+        false
+    }
+
+    /// Whether [`Self::ar_step`] samples a temperature > 0 request with the
+    /// request's own law (so the spec-retire policy may retire a sampled
+    /// request). Default: greedy AR steps only.
+    fn supports_sampled_ar_step(&self) -> bool {
+        false
+    }
+
+    /// The drafter's measured spec → AR break-even line for this target
+    /// ([`crate::spec_retire::BreakEven`]; `HIPFIRE_SPEC_RETIRE` overrides it).
+    /// `None`: the shared [`crate::spec_retire::DEFAULT_BREAK_EVEN`].
+    fn retire_break_even(&self) -> Option<crate::spec_retire::BreakEven> {
+        None
     }
 
     /// Repair a terminal that consumed only a strict prefix of the most recent
@@ -1103,6 +1237,12 @@ pub struct SpecRequestConfig {
     /// [`Speculator::token_logits`] keeps the target logit row behind each
     /// emitted token. Default `false`, which keeps no rows.
     pub logprobs: bool,
+    /// The three penalties see the generated tokens only, not the rendered
+    /// prompt (Raon's AR producer: `penalty_generated_only`). Default `false`:
+    /// every other producer penalizes `prompt ‖ generated`. Read by the
+    /// speculators that own a [`crate::spec_sampling::PenaltyHistory`]; they
+    /// seed it with an empty prompt when set.
+    pub penalty_generated_only: bool,
 }
 
 impl Default for SpecRequestConfig {
@@ -1123,6 +1263,7 @@ impl Default for SpecRequestConfig {
             frequency_penalty: 0.0,
             stop_sequences: false,
             logprobs: false,
+            penalty_generated_only: false,
         }
     }
 }
@@ -1146,7 +1287,8 @@ impl SpecRequestConfig {
     /// exact predicate `sampler::sample_cpu` (and the GPU sampler) applies.
     /// A penalty-capable verifier reproduces AR only if every verify row
     /// is penalized against `suffix_W(prompt || emitted || earlier drafts)`
-    /// — the full rendered prompt included, not the generated ids alone.
+    /// — the full rendered prompt included, not the generated ids alone —
+    /// unless [`Self::penalty_generated_only`] drops the prompt.
     pub fn penalties_active(&self) -> bool {
         self.repeat_window > 0
             && (self.repeat_penalty != 1.0
@@ -1737,6 +1879,10 @@ pub struct SpecEmitCtx<'a> {
     pub enable_grammar: bool,
     /// User stop sequences matched against the decoded suffix.
     pub stop: Vec<String>,
+    /// vLLM-compatible `min_tokens`: EOS, decoded end-of-turn markers and user
+    /// stop sequences are inactive until this many tokens have been committed
+    /// (0 ⇒ always active). See [`crate::stop_sequence::MinTokens`].
+    pub min_tokens: usize,
     /// `max_think_tokens` budget (0 ⇒ no think force-close).
     pub max_think: usize,
     /// The turn's `max_tokens` cap. Used by arches whose emitter sizes a

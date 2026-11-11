@@ -48,8 +48,8 @@ impl VmmSpecEngine {
     /// `head` loaded with the per-lane context cap; `k` = the singleton
     /// speculator's window (`mtp_k`, clamped like `Qwen35MtpDrafter`);
     /// `max_lanes * (k + 1)` plans the shared verify scratch rows, clamped to
-    /// the effective chunk cap (63, or up to 128 on the wide verify route with
-    /// `HIPFIRE_CB_VERIFY_CHUNK128`; [`MtpCbScratch::new`]).
+    /// the effective chunk cap (63, or up to 128 on the wide verify route, default on for
+    /// gfx1201, `HIPFIRE_CB_VERIFY_CHUNK128=0` restores 63; [`MtpCbScratch::new`]).
     ///
     /// One lane's MTP state is probed for the store's memory admission:
     /// allocated shaped from `template_dn` exactly as a lane is
@@ -249,7 +249,7 @@ impl Qwen35VmmStore {
                     prompt,
                     0,
                     route,
-                    |_, _, _| Ok(()),
+                    |_, _, _, _| Ok(()),
                 )
                 .map_err(|e| e.to_string())
             });

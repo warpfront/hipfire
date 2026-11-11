@@ -18,11 +18,18 @@ pub mod arch;
 pub mod author;
 /// The CDNA (wave64, gfx942 first) arm: checked builder, hazard pass, code-object emission.
 pub mod cdna;
+mod corr;
 pub mod emit;
+/// Builder methods of the global memory model and the task-body region ABI.
+mod global_sync;
 pub mod hazard;
+pub mod hip_twin;
 pub mod insn;
 pub mod lds;
 pub mod ledger;
+/// CFG-aware wait verification of an emitted program (`Builder::finish` runs it).
+pub mod ledger_cfg;
+pub mod libm;
 pub mod native;
 #[path = "kernels/npu_trunk.rs"]
 pub mod npu_trunk;
@@ -33,9 +40,17 @@ pub mod profile;
 #[path = "kernels/railgun_guard.rs"]
 pub mod railgun_guard;
 pub mod reg;
+pub mod regalloc;
+pub mod sync;
+#[cfg(test)]
+pub(crate) mod test_tmp;
+pub mod valu_sched;
 pub mod vopd;
 pub mod kernels {
+    pub mod argmax_pair_merge_pm;
+    pub mod argmax_regrid_pm;
     pub mod bf16;
+    pub mod ceil_probe;
     pub mod common;
     pub mod dflash_accept;
     pub mod e8p_i4_moe_gemv;
@@ -43,10 +58,13 @@ pub mod kernels {
     pub mod ep_tile_mask;
     pub mod fa_prefill;
     pub mod fa_qprep;
+    pub mod fa_qresident;
     pub mod fp8_gemm;
     pub mod gdn_chunk_prep;
     pub mod gdn_scan;
     pub mod gemm_uk;
+    pub mod gemv_mq2_xbatch_pm_gfx1201;
+    pub mod hc8_wmma_gfx1201;
     pub mod iu4_c8_producer;
     pub mod iu4_fold;
     pub mod iu4_gemm;
@@ -57,6 +75,10 @@ pub mod kernels {
     pub mod lane_rows_bf16_gfx1201;
     pub mod lane_rows_mq6_gfx1201;
     pub mod legacy_mq4_rowtiles;
+    pub mod libm_exact;
+    /// A persistent pool dispatcher hosting lifted hipcc bodies as regions (MegaM0's
+    /// P0 task ABI; lab only, no product route).
+    pub mod lifted_dispatch_gfx1201;
     pub mod moe_rotate_i4_pm;
     pub mod moe_slot_ops;
     pub mod mq4_fp8_verify;
@@ -71,6 +93,11 @@ pub mod kernels {
     pub mod mq_i4_rows;
     pub mod mtp_dense_det_gfx11;
     pub mod mtp_q8_det_gfx11;
+    /// EXPAND_LIVE (P0 template 1) standalone wrapper around the native `expand_body` region.
+    pub mod p0_expand_gfx1201;
+    /// A trivial persistent dispatcher around the MQ2 xbatch body region, and the
+    /// two-workgroup event handoff smoke kernels (lab only; no product route).
+    pub mod persistent_dispatch_gfx1201;
     pub mod pm_decode;
     #[path = "qsa_gather.rip.rs"]
     pub mod qsa_gather;
@@ -84,6 +111,7 @@ pub mod kernels {
     pub mod qwen4_bf16_rows_gfx1100;
     /// BF16 singleton-DAG verify twins: fixed eight-row physical tiles, logical rows 1..64, ordinary x4 and k4 HC entries.
     pub mod qwen4_bf16_rows_wide;
+    pub mod qwen4_ep_owner_assign_pinned_pm;
     pub mod qwen4_ep_owner_assign_pm;
     pub mod qwen4_lane_rows;
     pub mod qwen4_lane_rows_mq6;
@@ -103,6 +131,7 @@ pub mod kernels {
     pub mod qwen4_slab_union_plan;
     pub mod spec_accept_pm;
     pub mod spec_sampling_rows_pm;
+    pub mod topk8_partial_blocks_pm;
     /// gfx942 (CDNA3) kernels built with `crate::cdna::builder`.
     pub mod cdna {
         pub mod fp8_act_producer;
@@ -151,6 +180,20 @@ pub struct Builder {
     hazard: Gfx12Sgpr,
     gfx11_hazard: Gfx11Hazards,
     delay_alu: Option<DelayAlu>,
+    /// `enable_valu_schedule`: the buffered run of plain VALU instructions.
+    valu_window: Option<Vec<Instruction>>,
+    /// `vgpr_pass(Pass::Record)`: the final-order instruction stream, the submission hashes and the VALU window schedules.
+    vgpr_rec: Option<regalloc::Recording>,
+    /// `set_vgpr_map`: the renaming applied to each submission by its id.
+    vgpr_map: Option<regalloc::VgprMap>,
+    /// Number of `emit` calls so far (the submission id of the next one).
+    vgpr_sub: usize,
+    /// Submission ids of the instructions buffered in `valu_window`, in buffer order.
+    window_subs: Vec<usize>,
+    /// Index of the next window schedule of the installed map (`flush_valu` replays them in order).
+    vgpr_cursor: usize,
+    /// The last single-slot `s_delay_alu` (pc, its target pc) a later hint may merge into.
+    delay_merge: Option<(usize, usize)>,
     labels: Vec<String>,
     current_label: String,
     lds_access_allowed: bool,
@@ -166,6 +209,23 @@ pub struct Builder {
     /// Code falls through to the current point: false after a typed `s_branch`
     /// until a join brings in the state of a branch to this point.
     reachable: bool,
+    /// Global release/acquire obligations at the current point (`sync`).
+    sync: sync::SyncState,
+    /// Obligations assumed at each placed label (back edges must stay within them).
+    sync_at_label: std::collections::BTreeMap<String, sync::SyncState>,
+    /// Obligations carried by forward branches to labels not yet placed.
+    sync_forward: std::collections::BTreeMap<String, sync::SyncState>,
+    /// Declared release signals, polls and fences (`sync::verify` replays them).
+    pub syncs: Vec<sync::SyncProof>,
+    /// The open task-body region (`region`): no `s_endpgm`, no hardware workgroup ids.
+    open_region: Option<String>,
+    /// Emitting an event poll or a synchronization-variable RMW (`global_sync`).
+    sync_access: bool,
+    /// Heads of the `loop_` fixpoints being emitted, innermost last.
+    loop_heads: Vec<String>,
+    /// Obligations their back edges carried (joined into the head by the fixpoint).
+    sync_back: std::collections::BTreeMap<String, sync::SyncState>,
+    pub regions: Vec<plan::RegionProof>,
 }
 /// Loop bodies emitted before the back-edge state must have converged.
 const MAX_LOOP_RUNS: u8 = 8;
@@ -214,6 +274,13 @@ impl Builder {
             hazard: Gfx12Sgpr::default(),
             gfx11_hazard: Gfx11Hazards::for_arch(arch),
             delay_alu: None,
+            valu_window: None,
+            vgpr_rec: None,
+            vgpr_map: None,
+            vgpr_sub: 0,
+            window_subs: vec![],
+            vgpr_cursor: 0,
+            delay_merge: None,
             labels: vec!["entry".into()],
             current_label: "entry".into(),
             lds_access_allowed: false,
@@ -223,20 +290,195 @@ impl Builder {
             seal: Default::default(),
             exits: vec![],
             reachable: true,
+            sync: Default::default(),
+            sync_at_label: Default::default(),
+            sync_forward: Default::default(),
+            syncs: vec![],
+            open_region: None,
+            sync_access: false,
+            loop_heads: vec![],
+            sync_back: Default::default(),
+            regions: vec![],
         }
     }
     /// The program so far (read-only).
     pub fn program(&self) -> &Program {
+        self.assert_flushed();
         &self.program
     }
     /// The wait ledger at the current point (read-only).
     pub fn ledger(&self) -> &Ledger {
+        self.assert_flushed();
         &self.ledger
     }
     /// Emit `s_delay_alu` issue hints before dependent VALU instructions (see
     /// `hazard::DelayAlu`). Opt-in, so existing kernels keep their bytes.
     pub fn enable_delay_alu(&mut self) {
         self.delay_alu = Some(DelayAlu::default())
+    }
+    /// gfx12: buffer each run of plain VALU instructions and list-schedule it
+    /// (latency, memory waits) with VOPD dual-issue packing (`valu_sched`).
+    /// Opt-in, so existing kernels keep their bytes.
+    pub fn enable_valu_schedule(&mut self) -> Result<(), String> {
+        if !self.spec.arch.gfx12() || !self.spec.wave32 {
+            return Err("valu schedule: gfx12 wave32 only (VOPD)".into());
+        }
+        self.valu_window = Some(vec![]);
+        Ok(())
+    }
+    /// Record every submitted instruction for `regalloc::vgpr_compaction` (pass 1 of `compact_vgprs`).
+    pub fn record_vgpr_stream(&mut self) {
+        self.vgpr_rec = Some(Default::default());
+    }
+    /// Rename every VGPR operand by `map`, keyed by submission id (pass 2 of `compact_vgprs`). The wait
+    /// ledger, hazard trackers and the VALU scheduler see the renamed program.
+    pub fn set_vgpr_map(&mut self, map: regalloc::VgprMap) {
+        self.vgpr_map = Some(map);
+    }
+    /// Enter pass `pass` of `regalloc::compact_vgprs`.
+    pub fn vgpr_pass(&mut self, pass: regalloc::Pass) {
+        match pass {
+            regalloc::Pass::Record => self.record_vgpr_stream(),
+            regalloc::Pass::Spread(map) => {
+                self.record_vgpr_stream();
+                self.set_vgpr_map(map.clone())
+            }
+            regalloc::Pass::Apply(map) => self.set_vgpr_map(map.clone()),
+        }
+    }
+    /// Emit the buffered VALU run in scheduled order. Every point that reads or
+    /// appends the program other than a buffered VALU flushes first; emitters
+    /// that compare `ledger()` across a body call this before reading it.
+    pub fn flush_valu(&mut self) -> Result<(), String> {
+        let pending = match self.valu_window.as_mut() {
+            Some(w) if !w.is_empty() => std::mem::take(w),
+            _ => return Ok(()),
+        };
+        let arch = self.spec.arch;
+        let subs = std::mem::take(&mut self.window_subs);
+        if let Some(map) = self.vgpr_map.clone().filter(|m| m.replays()) {
+            // Pass 2 of `compact_vgprs`: replay the schedule pass 1 chose (the renaming was proven on that order).
+            let steps = map.window(self.vgpr_cursor, pending.len())?;
+            self.vgpr_cursor += 1;
+            for step in steps {
+                match step {
+                    regalloc::Step::One(a) => {
+                        self.emit_now(pending[*a].clone(), [subs[*a], usize::MAX])?
+                    }
+                    regalloc::Step::Pair(a, b) => {
+                        let packet = valu_sched::pair(arch, &pending[*a], &pending[*b])
+                            .ok_or_else(|| {
+                                format!(
+                                    "vgpr map: `{}` and `{}` no longer form a VOPD packet",
+                                    pending[*a].text, pending[*b].text
+                                )
+                            })?;
+                        self.emit_now(packet, [subs[*a], subs[*b]])?
+                    }
+                    regalloc::Step::Wait(set) => {
+                        let required = self.merged_wait(set.iter().map(|k| &pending[*k]));
+                        self.emit_required(required)?
+                    }
+                }
+            }
+            return Ok(());
+        }
+        // The last VALU instructions before the window still stall its first slots.
+        let before = self
+            .delay_alu
+            .as_ref()
+            .map_or(vec![], DelayAlu::recent_defs);
+        let dag = valu_sched::Dag::new(pending, valu_sched::VALU_LATENCY, &before);
+        let n = dag.len();
+        let mut press = valu_sched::Pressure::new(&dag.insns);
+        let mut issued: Vec<Option<usize>> = vec![None; n];
+        let mut done = 0;
+        let mut now = 0;
+        let mut window: Vec<regalloc::Step> = vec![];
+        // A wait the ledger would need before the instruction: none sorts first,
+        // then the weakest (largest remaining count).
+        let wait_key = |b: &Builder, i: &Instruction| -> usize {
+            b.ledger
+                .required(i)
+                .iter()
+                .map(|(_, c, _)| 256 - usize::from(*c))
+                .sum()
+        };
+        while done < n {
+            let ready: Vec<usize> = (0..n).filter(|i| dag.ready(&issued, *i)).collect();
+            if ready.iter().all(|i| wait_key(self, &dag.insns[*i]) > 0) {
+                // Every ready instruction waits on memory: one wait for the strongest requirement among
+                // them instead of the weakest-first chain the issue order would emit.
+                let required = self.merged_wait(ready.iter().map(|i| &dag.insns[*i]));
+                self.emit_required(required)?;
+                window.push(regalloc::Step::Wait(ready.clone()));
+            }
+            // Over the pressure budget, ties on (wait, stall) go to the node that ends the most live ranges.
+            let over = press.live() > valu_sched::PRESSURE_BUDGET;
+            let key = |i: usize| {
+                (
+                    wait_key(self, &dag.insns[i]),
+                    dag.stall(&issued, i, now),
+                    if over { press.delta(i) } else { 0 },
+                    usize::MAX - dag.height[i],
+                    i,
+                )
+            };
+            let a = *ready.iter().min_by_key(|i| key(**i)).unwrap();
+            let ka = key(a);
+            let partner = ready
+                .iter()
+                .copied()
+                .filter(|b| *b != a && wait_key(self, &dag.insns[*b]) <= ka.0)
+                .filter_map(|b| {
+                    valu_sched::pair(arch, &dag.insns[a], &dag.insns[b]).map(|p| (b, p))
+                })
+                .min_by_key(|(b, _)| key(*b));
+            issued[a] = Some(now);
+            done += 1;
+            press.issue(a);
+            match partner {
+                Some((b, packet)) => {
+                    issued[b] = Some(now);
+                    done += 1;
+                    press.issue(b);
+                    window.push(regalloc::Step::Pair(a, b));
+                    self.emit_now(packet, [subs[a], subs[b]])?
+                }
+                None => {
+                    window.push(regalloc::Step::One(a));
+                    self.emit_now(dag.insns[a].clone(), [subs[a], usize::MAX])?
+                }
+            }
+            now += 1;
+        }
+        if let Some(rec) = &mut self.vgpr_rec {
+            rec.windows.push(window);
+        }
+        Ok(())
+    }
+    /// The strongest wait (smallest remaining count per counter) any of `insns` needs now.
+    fn merged_wait<'a>(
+        &self,
+        insns: impl IntoIterator<Item = &'a Instruction>,
+    ) -> Vec<(Counter, u8, Reason)> {
+        let mut merged: Vec<(Counter, u8, Reason)> = vec![];
+        for insn in insns {
+            for (counter, count, reason) in self.ledger.required(insn) {
+                match merged.iter_mut().find(|m| m.0 == counter) {
+                    Some(m) if count < m.1 => *m = (counter, count, reason),
+                    Some(_) => {}
+                    None => merged.push((counter, count, reason)),
+                }
+            }
+        }
+        merged
+    }
+    fn assert_flushed(&self) {
+        assert!(
+            self.valu_window.as_ref().map_or(true, Vec::is_empty),
+            "read the program/ledger after Builder::flush_valu"
+        )
     }
     /// Enable the descriptor's workgroup Z input without changing instructions.
     ///
@@ -257,11 +499,34 @@ impl Builder {
         self.place_label(name)
     }
     fn place_label(&mut self, name: &str) -> Result<(), String> {
+        self.flush_valu()?;
+        self.delay_merge = None;
         if self.labels.iter().any(|l| l == name) {
             return Err(format!("duplicate label {name}"));
         }
         self.labels.push(name.into());
         self.current_label = name.into();
+        if let Some(rec) = &mut self.vgpr_rec {
+            rec.stream.push(regalloc::StreamItem::Label(name.into()));
+            rec.submitted.push(regalloc::StreamItem::Label(name.into()));
+        }
+        // Obligations at the label: the forward branches' joined with the fall-through
+        // (absent after an unconditional `s_branch`/`s_endpgm`).
+        let falls_through = !self
+            .program
+            .instructions
+            .iter()
+            .rev()
+            .find(|i| !i.text.ends_with(':'))
+            .is_some_and(|i| matches!(i.mnemonic(), "s_branch" | "s_endpgm"));
+        if let Some(forward) = self.sync_forward.remove(name) {
+            self.sync = if falls_through {
+                self.sync.join(forward)
+            } else {
+                forward
+            };
+        }
+        self.sync_at_label.insert(name.into(), self.sync);
         if let Some(d) = &mut self.delay_alu {
             d.label()
         }
@@ -270,7 +535,30 @@ impl Builder {
             .push(Instruction::new(format!("{name}:"), vec![], vec![]));
         Ok(())
     }
+    /// `Pass::Record`/`Spread`: the pending VMEM stores' source registers stay locked until here (a full drain of the
+    /// store counter or `depctr_vm_vsrc(0)`), so the program records a read of them: no renaming may put a
+    /// redefinition between the store and the release.
+    fn note_store_release(&mut self) {
+        let Some(rec) = &mut self.vgpr_rec else {
+            return;
+        };
+        let uses = self.ledger.pending_store_sources();
+        if uses.is_empty() {
+            return;
+        }
+        let marker = Instruction::new("; store sources released", vec![], uses);
+        for stream in [&mut rec.stream, &mut rec.submitted] {
+            stream.push(regalloc::StreamItem::Insn {
+                insn: marker.clone(),
+                subs: [usize::MAX, usize::MAX],
+            });
+        }
+    }
     fn emit_wait(&mut self, c: Counter, n: u8, reason: Reason) -> Result<(), String> {
+        self.flush_valu()?;
+        if n == 0 && matches!(c, Counter::Store | Counter::Vs) {
+            self.note_store_release();
+        }
         let entries = Ledger::wait_instruction(self.spec.arch, &[(c, n, reason.clone())])?;
         for (_, _, text, _) in entries {
             let pc_index = self.program.instructions.len();
@@ -292,6 +580,13 @@ impl Builder {
         self.emit_wait(c, n, Reason::Barrier)
     }
     fn emit_required(&mut self, mut required: Vec<(Counter, u8, Reason)>) -> Result<(), String> {
+        self.flush_valu()?;
+        if required
+            .iter()
+            .any(|(c, n, _)| *n == 0 && matches!(c, Counter::Store | Counter::Vs))
+        {
+            self.note_store_release();
+        }
         let (first_counter, second_counter, _) = combined_wait(self.spec.arch, 0, 0);
         let first = required
             .iter()
@@ -335,12 +630,46 @@ impl Builder {
         let required = self.ledger.clone().drain();
         self.emit_required(required)
     }
+    /// Wait every memory counter of the arch to zero whatever the ledger holds. The ledger
+    /// runs linearly across raw branches, so a label entered from a dispatch switch may see a
+    /// state that is not its predecessors' join (e.g. a previous task's release increment
+    /// still in flight); a task-body region's entry uses this to start from the kernel-start
+    /// counter state on every path.
+    pub fn drain_all_counters(&mut self) -> Result<(), String> {
+        let counters: &[Counter] = if self.spec.arch.gfx12() {
+            &[Counter::Load, Counter::Store, Counter::Ds, Counter::Km]
+        } else if self.spec.arch == Arch::Gfx942 {
+            &[Counter::Vm, Counter::Lgkm]
+        } else {
+            &[Counter::Vm, Counter::Vs, Counter::Lgkm]
+        };
+        self.emit_required(counters.iter().map(|&c| (c, 0, Reason::Barrier)).collect())
+    }
+    /// Emit now the waits an instruction defining `regs` would need (the hazards of loads still
+    /// in flight into them, of stores still reading them): the minimal counter waits of the
+    /// ledger, nothing when there is none. A caller about to open a clause settles its members'
+    /// destinations first, since a clause takes no waits inside.
+    ///
+    /// Under `compact_vgprs` (pass 2) `regs` name the emitter's registers: they are translated to the renamed
+    /// registers of the next submission that names them.
+    pub fn settle_defs(&mut self, regs: &[reg::RegRef]) -> Result<(), String> {
+        self.flush_valu()?;
+        let regs = match &self.vgpr_map {
+            Some(map) => map.translate_defs(self.vgpr_sub, regs),
+            None => regs.to_vec(),
+        };
+        let probe = Instruction::new("", regs, Vec::new());
+        let required = self.ledger.required(&probe);
+        self.emit_required(required)
+    }
     /// gfx12 `s_wait_alu depctr_vm_vsrc(0)`: every issued VMEM store has read its
     /// sources, so they may be redefined without waiting for store completion.
     pub fn release_store_sources(&mut self) -> Result<(), String> {
+        self.flush_valu()?;
         if !self.spec.arch.gfx12() {
             return Err("depctr_vm_vsrc requires gfx12".into());
         }
+        self.note_store_release();
         let pc_index = self.program.instructions.len();
         let text = "s_wait_alu depctr_vm_vsrc(0)".to_string();
         self.program
@@ -359,16 +688,28 @@ impl Builder {
     /// `ds_load`/`ds_store`. The builder inserts its waits and hazard guards.
     pub fn push(&mut self, insn: Instruction) -> Result<(), String> {
         insn.check_raw()?;
+        let m = insn.mnemonic();
         if matches!(
-            insn.mnemonic(),
-            "s_clause" | "global_inv" | "buffer_gl0_inv" | "buffer_gl1_inv"
+            m,
+            "s_clause" | "global_inv" | "global_wb" | "buffer_gl0_inv" | "buffer_gl1_inv"
         ) {
             return Err("clauses and global visibility require their builder methods".into());
+        }
+        if m.contains("_atomic_")
+            || insn
+                .memory
+                .is_some_and(|c| matches!(c, MemoryClass::VmemAtomic { .. }))
+        {
+            return Err(format!(
+                "{m}: global atomics go through global_atomic/event_rmw (their ledger and release accounting)"
+            ));
         }
         self.emit(insn)
     }
     /// Untyped kernels' branches and program end (`s_branch`, `s_cbranch_*`,
     /// `s_endpgm`): the typed core emits its own, so a sealed builder refuses.
+    /// Inside a task-body `region` the program end is refused: a region exits to
+    /// its caller through its exit label.
     pub fn control(&mut self, insn: Instruction) -> Result<(), String> {
         self.untyped()?;
         let m = insn.mnemonic();
@@ -377,10 +718,82 @@ impl Builder {
         {
             return Err(format!("{:?} is not a branch or s_endpgm", insn.text));
         }
+        if m == "s_endpgm" {
+            if let Some(r) = &self.open_region {
+                return Err(format!(
+                    "region {r}: a task body ends at its exit label, not s_endpgm"
+                ));
+            }
+        }
+        self.branch_sync(&insn.text)?;
         self.emit(insn)
     }
-    /// Every instruction goes through here: waits, hazard guards, ledger.
-    fn emit(&mut self, insn: Instruction) -> Result<(), String> {
+    /// Carry the release/acquire obligations of a branch to its target: joined
+    /// into a forward target's state, checked against a placed (loop head) label's.
+    fn branch_sync(&mut self, text: &str) -> Result<(), String> {
+        let Some(target) = sync::branch_target(text) else {
+            return Ok(());
+        };
+        if let Some(head) = self.sync_at_label.get(target).copied() {
+            if self.loop_heads.iter().any(|h| h == target) {
+                // A `loop_` head: the fixpoint joins this into the head and re-emits.
+                let state = self.sync;
+                let back = self.sync_back.entry(target.to_string()).or_default();
+                *back = back.join(state);
+            } else if !self.sync.within(head) {
+                return Err(format!(
+                    "back edge to {target} carries a release/acquire obligation its head does not assume ({:?} at the branch, {head:?} at the head)",
+                    self.sync
+                ));
+            }
+        } else {
+            let state = self.sync;
+            let entry = self.sync_forward.entry(target.to_string()).or_default();
+            *entry = entry.join(state);
+        }
+        Ok(())
+    }
+    /// Every instruction goes through here; with `enable_valu_schedule` a plain
+    /// VALU instruction is checked and buffered, anything else flushes the run.
+    fn emit(&mut self, mut insn: Instruction) -> Result<(), String> {
+        if let Some(map) = &self.vgpr_map {
+            insn = map.rewrite(self.vgpr_sub, insn)?;
+        }
+        let sub = self.vgpr_sub;
+        if let Some(rec) = &mut self.vgpr_rec {
+            rec.hashes.push(regalloc::text_hash(&insn.text));
+            rec.submitted.push(regalloc::StreamItem::Insn {
+                insn: insn.clone(),
+                subs: [sub, usize::MAX],
+            });
+        }
+        self.vgpr_sub += 1;
+        self.emit_submitted(sub, insn)
+    }
+    /// A renamed submission reaches the program (or the VALU window).
+    fn emit_submitted(&mut self, sub: usize, insn: Instruction) -> Result<(), String> {
+        if self.valu_window.is_some() && valu_sched::schedulable(&insn) {
+            insn.validate(self.spec.arch)?;
+            for r in insn.defs.iter().chain(&insn.uses) {
+                self.regs
+                    .verify_access(*r, &self.current_label, &self.labels)?
+            }
+            self.window_subs.push(sub);
+            self.valu_window.as_mut().unwrap().push(insn);
+            return Ok(());
+        }
+        self.flush_valu()?;
+        self.emit_now(insn, [sub, usize::MAX])
+    }
+    /// Waits, hazard guards, ledger.
+    /// `subs`: the submission ids this instruction (or VOPD packet) carries (`usize::MAX` for none).
+    fn emit_now(&mut self, insn: Instruction, subs: [usize; 2]) -> Result<(), String> {
+        if let Some(rec) = &mut self.vgpr_rec {
+            rec.stream.push(regalloc::StreamItem::Insn {
+                insn: insn.clone(),
+                subs,
+            });
+        }
         insn.validate(self.spec.arch)?;
         if self
             .program
@@ -393,15 +806,50 @@ impl Builder {
         if insn.mnemonic().starts_with("ds_") && !self.lds_access_allowed {
             return Err("DS access must carry an LDS slot through ds_load/ds_store".into());
         }
+        if let Some(r) = &self.open_region {
+            // gfx12 workgroup ids are ttmp9 (X) and ttmp7 (Y, Z): a region body runs at a
+            // virtual coordinate its caller passes in a declared input SGPR.
+            if insn.text.contains("ttmp") {
+                return Err(format!(
+                    "region {r}: `{}` reads a hardware workgroup id; a task body takes its coordinate as a declared input",
+                    insn.text
+                ));
+            }
+        }
+        let data_load = matches!(
+            insn.memory,
+            Some(
+                MemoryClass::VmemLoad
+                    | MemoryClass::SmemLoad
+                    | MemoryClass::VmemAtomic { returns: true }
+            )
+        );
+        if data_load && self.sync.unacquired && !self.sync_access {
+            return Err(format!(
+                "`{}`: a load after a relaxed event observation needs acquire() first (missing acquire)",
+                insn.text
+            ));
+        }
         for r in insn.defs.iter().chain(&insn.uses) {
             self.regs
                 .verify_access(*r, &self.current_label, &self.labels)?
         }
         self.emit_required(self.ledger.required(&insn))?;
+        if matches!(
+            insn.memory,
+            Some(MemoryClass::VmemStore | MemoryClass::VmemAtomic { .. })
+        ) && !self.sync_access
+        {
+            self.sync.write()
+        }
         let mnemonic = insn.mnemonic();
+        if insn::control_flow(mnemonic) {
+            // a merged hint's consumer must stay inside its block
+            self.delay_merge = None;
+        }
         let pipe = if matches!(
             insn.memory,
-            Some(MemoryClass::VmemLoad | MemoryClass::VmemStore)
+            Some(MemoryClass::VmemLoad | MemoryClass::VmemStore | MemoryClass::VmemAtomic { .. })
         ) {
             Pipeline::Vmem
         } else if insn.memory == Some(MemoryClass::SmemLoad) {
@@ -489,14 +937,44 @@ impl Builder {
                 .and_then(|d| d.step(mnemonic, &insn.uses, &insn.defs))
             {
                 let pc_index = self.program.instructions.len();
-                self.program
-                    .instructions
-                    .push(Instruction::new(text.clone(), vec![], vec![]));
-                self.hazards.push(HazardProof {
-                    pc_index,
-                    insn: text,
-                    rule: "VALU dependency issue hint".into(),
-                });
+                // Scheduled code: fold a single-dependency hint into the previous
+                // hint's second slot (`instskip`/`instid1`, as AMDGPUInsertDelayAlu
+                // does) when its target is 1..=5 instructions after that hint's.
+                let merged = match (self.valu_window.is_some(), self.delay_merge) {
+                    (true, Some((at, target)))
+                        if !text.contains('|') && (1..=5).contains(&(pc_index - target)) =>
+                    {
+                        let d = pc_index - target;
+                        let skip = if d == 1 {
+                            "NEXT".to_string()
+                        } else {
+                            format!("SKIP_{}", d - 1)
+                        };
+                        let second = text.trim_start_matches("s_delay_alu instid0");
+                        let old = &mut self.program.instructions[at].text;
+                        *old = format!("{old} | instskip({skip}) | instid1{second}");
+                        self.hazards
+                            .iter_mut()
+                            .rev()
+                            .find(|h| h.pc_index == at)
+                            .expect("merged hint has its proof")
+                            .insn = old.clone();
+                        self.delay_merge = None;
+                        true
+                    }
+                    _ => false,
+                };
+                if !merged {
+                    self.program
+                        .instructions
+                        .push(Instruction::new(text.clone(), vec![], vec![]));
+                    self.hazards.push(HazardProof {
+                        pc_index,
+                        insn: text.clone(),
+                        rule: "VALU dependency issue hint".into(),
+                    });
+                    self.delay_merge = (!text.contains('|')).then_some((pc_index, pc_index + 1));
+                }
             }
         }
         self.ledger.record(self.spec.arch, &insn);
@@ -531,11 +1009,23 @@ impl Builder {
         self.ds_store_slot(slot, insn)
     }
     fn ds_store_slot(&mut self, slot: usize, insn: Instruction) -> Result<(), String> {
+        self.ds_store_with(insn, |lds| lds.store(slot))
+    }
+    /// A wave-private store (`Lds::private_store`); only the typed core's
+    /// `Backend` reaches it.
+    fn ds_store_private_slot(&mut self, slot: usize, insn: Instruction) -> Result<(), String> {
+        self.ds_store_with(insn, |lds| lds.private_store(slot))
+    }
+    fn ds_store_with(
+        &mut self,
+        insn: Instruction,
+        step: impl FnOnce(&mut Lds) -> Result<(), String>,
+    ) -> Result<(), String> {
         if insn.memory != Some(MemoryClass::DsStore) || !insn.mnemonic().starts_with("ds_store") {
             return Err("ds_store requires an LDS store instruction".into());
         }
         let old = self.lds.clone();
-        self.lds.store(slot)?;
+        step(&mut self.lds)?;
         self.lds_access_allowed = true;
         let result = self.push(insn);
         self.lds_access_allowed = false;
@@ -549,11 +1039,24 @@ impl Builder {
         self.ds_load_slot(slot, insn)
     }
     fn ds_load_slot(&mut self, slot: usize, insn: Instruction) -> Result<(), String> {
+        self.ds_load_with(slot, insn, |lds| lds.load(slot))
+    }
+    /// A wave-private load (`Lds::private_load`); only the typed core's
+    /// `Backend` reaches it.
+    fn ds_load_private_slot(&mut self, slot: usize, insn: Instruction) -> Result<(), String> {
+        self.ds_load_with(slot, insn, |lds| lds.private_load(slot))
+    }
+    fn ds_load_with(
+        &mut self,
+        slot: usize,
+        insn: Instruction,
+        step: impl FnOnce(&mut Lds) -> Result<(), String>,
+    ) -> Result<(), String> {
         if insn.memory != Some(MemoryClass::DsLoad) || !insn.mnemonic().starts_with("ds_load") {
             return Err("ds_load requires an LDS load instruction".into());
         }
         let old = self.lds.clone();
-        self.lds.load(slot)?;
+        step(&mut self.lds)?;
         self.lds_access_allowed = true;
         let result = self
             .push(insn)
@@ -637,6 +1140,7 @@ impl Builder {
         &mut self,
         body: impl FnOnce(&mut Builder) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.flush_valu()?;
         let mut draft = self.clone();
         let start = draft.program.instructions.len();
         body(&mut draft)?;
@@ -677,6 +1181,7 @@ impl Builder {
         self.signal(transitions)
     }
     fn signal(&mut self, transitions: &[Transition]) -> Result<(), String> {
+        self.flush_valu()?;
         if !self.spec.arch.gfx12() {
             return Err("split barriers require gfx12".into());
         }
@@ -694,6 +1199,7 @@ impl Builder {
         self.arrive()
     }
     fn arrive(&mut self) -> Result<(), String> {
+        self.flush_valu()?;
         let transitions = self
             .pending_barrier
             .take()
@@ -770,12 +1276,16 @@ impl Builder {
         head: &str,
         body: impl Fn(&mut Builder) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.flush_valu()?;
         let entry = self.ledger.shape();
         let mut start = self.clone();
         for runs in 1..=MAX_LOOP_RUNS {
             let mut run = start.clone();
             run.label(head)?;
-            body(&mut run)?;
+            run.loop_heads.push(head.into());
+            let result = body(&mut run).and_then(|()| run.flush_valu());
+            run.loop_heads.pop();
+            result?;
             if run.ledger.shape() != entry {
                 return Err(format!(
                     "loop {head}: back-edge ledger must equal the entry ledger"
@@ -785,9 +1295,16 @@ impl Builder {
             // entry's up to ids), everything else joined with its back edge.
             let mut next = start.clone();
             next.ledger = run.ledger.clone();
-            let grew = next
+            let mut grew = next
                 .join_back_edge(&run)
                 .map_err(|e| format!("loop {head} back edge: {e}"))?;
+            // Release/acquire obligations the back edges carry join into the head's.
+            if let Some(back) = run.sync_back.remove(head) {
+                if !back.within(start.sync) {
+                    next.sync = start.sync.join(back);
+                    grew = true;
+                }
+            }
             // At least two runs: the second runs from the back-edge ledger.
             if runs >= 2 && !grew {
                 *self = run;
@@ -833,13 +1350,45 @@ impl Builder {
             }
         }
     }
+    /// Verify the emitted program so far (`ledger_cfg::verify`): every use, WAR and WAW has
+    /// its wait on every control-flow path, where the builder's linear ledger only follows
+    /// the preceding instruction across raw branches. Region bodies are decoded through the
+    /// lift's instruction table (`ledger_cfg::region_spans`). Not run by `finish`: callers
+    /// and the pin/pool tests (`tests/ledger_cfg_pins.rs`) choose when a finding is fatal.
+    pub fn verify_waits(&mut self) -> Result<ledger_cfg::Stats, String> {
+        self.flush_valu()?;
+        ledger_cfg::verify(&self.program, &ledger_cfg::region_spans(&self.regions))
+    }
     /// Finish only after every declared lifetime has both endpoints and all live aliases are disjoint.
-    pub fn finish(self) -> Result<Emitted, String> {
+    pub fn finish(mut self) -> Result<Emitted, String> {
+        self.flush_valu()?;
         if self.pending_barrier.is_some() {
             return Err("unmatched barrier signal".into());
         }
         if let Some(e) = self.exits.iter().find(|e| !self.labels.contains(e)) {
             return Err(format!("kernel exit {e} is never placed"));
+        }
+        if let Some(r) = &self.open_region {
+            return Err(format!("region {r} is never closed"));
+        }
+        if let Some(target) = self.sync_forward.keys().next() {
+            return Err(format!("branch to {target}, which is never placed"));
+        }
+        if let Some(map) = &self.vgpr_map {
+            if self.vgpr_sub != map.len() || (map.replays() && self.vgpr_cursor != map.windows()) {
+                return Err(format!(
+                    "vgpr map: {} instructions / {} windows submitted, {} / {} recorded (emission is not deterministic)",
+                    self.vgpr_sub,
+                    self.vgpr_cursor,
+                    map.len(),
+                    map.windows()
+                ));
+            }
+        }
+        global_sync::check_region_entries(&self.program, &self.regions)?;
+        if !self.syncs.is_empty() {
+            sync::verify(&self.program, &self.syncs)
+                .map_err(|e| format!("independent release/acquire replay: {e}"))?;
         }
         if self
             .program
@@ -868,6 +1417,7 @@ impl Builder {
             &self.program,
             self.workgroup_id_z,
             next_free_sgpr,
+            &lds::private_windows(&self.lds.all_slots()),
         )?;
         let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
         let mut shape = IsaShape {
@@ -916,11 +1466,16 @@ impl Builder {
             loop_fixpoints: self.loop_fixpoints,
             forbidden_mnemonics_checked: vec!["s_waitcnt (gfx12)".into(), "scratch_*".into()],
             s_text_sha256: hash,
+            syncs: self.syncs,
+            regions: self.regions,
         };
         Ok(Emitted {
             s_text: text,
             proof,
             shape,
+            program: self.program,
+            vgpr_record: self.vgpr_rec,
+            vgpr_stats: None,
         })
     }
 }

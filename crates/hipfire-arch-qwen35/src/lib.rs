@@ -96,6 +96,14 @@ pub mod draft_vocab;
 /// for weight/config/scratch types, hence deltanet-gated like it.
 #[cfg(feature = "deltanet")]
 pub mod forward_slots;
+/// GGUF -> hipfire tensor-name map and hyper-parameters for the dense
+/// Qwen3.5 family (the GGUF-native carrier's per-arch block).
+#[cfg(feature = "deltanet")]
+pub mod gguf_map;
+/// GGUF-native weight source for the dense Qwen3.5 family: ggml block bytes
+/// as `DType::Ggml*` weights with the exporter's data edits undone.
+#[cfg(feature = "deltanet")]
+pub mod gguf_source;
 #[cfg(feature = "deltanet")]
 pub(crate) mod layer_driver;
 #[cfg(feature = "deltanet")]

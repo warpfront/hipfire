@@ -74,9 +74,13 @@
 //!
 //! # What differs from gfx1201 (and only that)
 //!  * Workgroup ids are **system SGPRs**, not `ttmp`: with `user_sgpr_count = 2` (kernarg pointer)
-//!    and `system_sgpr_workgroup_id_y` set, x is `s2` and y is `s3` (`Arch::workgroup_ids`). Both
-//!    are declared in the register plan; `s3` is the whole y id (gfx1201's `ttmp7[15:0]` mask does
-//!    not exist here).
+//!    and `system_sgpr_workgroup_id_y` set they follow the DECLARED user SGPRs. gfx1100's
+//!    `FeatureUserSGPRInit16Bug` (LLVM `allocateSystemSGPRs`) requires user + system >= 16, so the
+//!    descriptor declares 14 user SGPRs (kernarg pointer + 12 dead pads) and x is `s14`, y is `s15`
+//!    (`Arch::workgroup_ids`); the `_t8` entries also enable z and declare 13, so x / y / z are
+//!    `s13` / `s14` / `s15`. All are declared in the register plan; the y id is the whole y id
+//!    (gfx1201's `ttmp7[15:0]` mask does not exist here). The kernarg pointer block that used to sit at
+//!    `s[8:15]` is `s[80:87]`.
 //!  * Scalar add/sub spellings are the gfx11 ones (`s_add_u32`/`s_addc_u32`/`s_add_i32`/`s_sub_i32`),
 //!    SMEM zero offset is `null`, and the raw buffer load soffset is `0`; all come from
 //!    `kernels::common`, which is arch-switched.
@@ -86,8 +90,16 @@
 //!    and records them in the proof; this emitter never hand-places a wait. They are required by
 //!    the architecture, so the shape contract must not forbid them (it counts them instead).
 //!  * Raw buffer descriptor word 3 is `common::SRD_WORD3` (GPU-proven on gfx1100).
-//!  * `Mq3I4` and the optimized packet network are not ported: `Mq2I4` replaces `Mq3I4`
-//!    (a one-byte packet, no shift, no second load).
+//!  * `Mq3I4` (W3, planar MQ3-I4 qt131/qt132) is ported separately, as the exact `Reference` network of the
+//!    gfx1201 generator: [`mq3_specs`], module `mq_i4_moe_gemv_mq3_pm_gfx1100` (artifact stem
+//!    `mq_i4_moe_gemv_mq3only_pm_gfx1100`, `peacemaker-isa emit --kernel mq_i4_moe_gemv_mq3only`), symbols
+//!    `mq_i4_moe_gemv_mq3i4_{r256_gate_up,r128_down}[_t8]_pm_gfx1100`. A row is `K*3/8` code bytes (48 per
+//!    128-column group, eight 3-bit codes per three bytes, little-endian bit stream), the f16 scale plane starts
+//!    at `base + M*K*3/8`; lane `l` owns codes `4l..4l+3` of the group, the 12-bit packet at group bit `12l`
+//!    (bytes `(3l)>>1` and `+1` as two `global_load_u8`, `b0 | b1<<8`, `>> 4*(l&1)`), and `w = RN(float(d) *
+//!    float(2c-7))`: bit-identical to the CPU planar decoder `hipfire_cpu::quant::decode_planar_group`. The
+//!    one-`u16`-load `Optimized` packet network is not ported. It is not a member of [`Codec::ALL`] or
+//!    [`module_specs`], so the W2/MQ4 module and the MQ4-only landing object are unchanged.
 //!
 //! Read-once C8 structure is unchanged: weights are loaded and dequantized once per group, then
 //! the up-to-eight slots run their own chains on the shared weights, skipped by scalar branches
@@ -126,6 +138,9 @@ pub const USER_SGPRS: u8 = 2;
 pub enum Codec {
     /// Planar 2-bit codes, `2c - 3`, one f16 scale per row-group, plane offset `M*K/4`.
     Mq2I4,
+    /// Planar 3-bit codes (qt131/qt132), `2c - 7`, one f16 scale per row-group, plane offset `M*K*3/8`. Not a member
+    /// of [`Codec::ALL`] / [`module_specs`]: it lives in its own module (`Spec::module_mq3`, [`mq3_specs`]).
+    Mq3I4,
     /// Pointer-addressed MQ4 (qt44 gate group 136 B / qt53 down group 68 B), `d*q + z`.
     Mq4Sym,
 }
@@ -134,6 +149,7 @@ impl Codec {
     pub fn tag(self) -> &'static str {
         match self {
             Self::Mq2I4 => "mq2i4",
+            Self::Mq3I4 => "mq3i4",
             Self::Mq4Sym => "mq4sym",
         }
     }
@@ -183,6 +199,10 @@ impl Spec {
     pub fn module(arch: Arch) -> String {
         format!("mq_i4_moe_gemv_pm_{}", arch.name())
     }
+    /// The W3 K1 module (`mq_i4_moe_gemv_mq3_pm_<arch>`): the [`mq3_specs`] entries only.
+    pub fn module_mq3(arch: Arch) -> String {
+        format!("mq_i4_moe_gemv_mq3_pm_{}", arch.name())
+    }
     pub fn validate(&self) -> R {
         if self.arch != Arch::Gfx1100 {
             return Err("mq_i4_moe_gemv_gfx1100 builder is exact-gfx1100 only".into());
@@ -218,21 +238,44 @@ pub fn module_specs(arch: Arch) -> Vec<Spec> {
         .collect()
 }
 
+/// The two W3 (`Mq3I4`) entries of one architecture: gate/up then down. Kept out of [`module_specs`] so the
+/// existing W2/MQ4 module and the MQ4-only landing object stay byte-identical.
+pub fn mq3_specs(arch: Arch) -> Vec<Spec> {
+    Kind::ALL
+        .into_iter()
+        .map(|kind| Spec {
+            arch,
+            codec: Codec::Mq3I4,
+            kind,
+        })
+        .collect()
+}
+
 // ----------------------------------------------------------------------- SGPRs
-// s0:1 kernarg pointer; s2 / s3 workgroup id x / y (system SGPRs after the two user SGPRs).
+// s0:1 kernarg pointer; the workgroup ids are the system SGPRs after the DECLARED user SGPRs. gfx1100's
+// `FeatureUserSGPRInit16Bug` pads the user SGPRs to user + system >= 16 (`Arch::declared_user_sgprs`), so the ids
+// are s14 / s15 (x / y; the plain entries) and s13 / s14 / s15 (x / y / z; the `_t8` entries).
 const KARG: u8 = 0;
-const WGX: u8 = USER_SGPRS;
-const WGY: u8 = USER_SGPRS + 1;
-const WGZ: u8 = USER_SGPRS + 2;
+/// First SGPR of the workgroup ids (`rowtiles` enables the z id too).
+const fn wg_x(rowtiles: bool) -> u8 {
+    Arch::Gfx1100.declared_user_sgprs(USER_SGPRS, if rowtiles { 3 } else { 2 })
+}
+const fn wg_y(rowtiles: bool) -> u8 {
+    wg_x(rowtiles) + 1
+}
+const fn wg_z() -> u8 {
+    wg_x(true) + 2
+}
 const TILE_SNEXP: u8 = 5;
 const TILE_WORKGROUP_SIZE: u32 = 256;
 const TILE_DESCRIPTOR_BYTES: u32 = 1928;
 const TILE_CAPACITY: u32 = 80;
-/// Kernargs (s_load_b256 @0, b256 @0x20, b128 @0x40, b64 @0x50).
-const WPTRS: u8 = 8;
-const EIDS: u8 = 10;
-const OFFS: u8 = 12;
-const SLOTS: u8 = 14;
+/// Kernargs (s_load_b256 @0, b256 @0x20, b128 @0x40, b64 @0x50). The first block sits past the plan's other
+/// SGPRs, at s[80:87]: the workgroup ids occupy s13..15.
+const WPTRS: u8 = 80;
+const EIDS: u8 = WPTRS + 2;
+const OFFS: u8 = WPTRS + 4;
+const SLOTS: u8 = WPTRS + 6;
 const XROT: u8 = 16;
 const Y0: u8 = 18;
 const Y1: u8 = 20;
@@ -278,7 +321,7 @@ const MI: u8 = 77;
 const ROWM: u8 = 78;
 const ROWIN: u8 = 79;
 /// SGPRs the plan declares (the honest ceiling, `sgpr_max` of the contract).
-const SGPRS: u8 = 80;
+const SGPRS: u8 = WPTRS + 8;
 /// `n_experts@88`, the extent of the `expert_weight_ptrs` table: `s4`, the first SGPR after the system workgroup ids,
 /// which no other instruction of the entry touches (the plan's SGPR ceiling and the physical assignment of every
 /// other register are unchanged). An `expert_ids` entry at or past it is never used to index the table.
@@ -374,6 +417,14 @@ impl Lay {
     fn ac(&self, i: u32, c: u8) -> u8 {
         self.acc + i as u8 * self.chains + c
     }
+    /// Second code byte of the `Mq3I4` 12-bit packet (the otherwise unused `zero_point` register).
+    fn pkt1(&self) -> u8 {
+        self.z
+    }
+    /// Bit shift `4*(lane & 1)` of the `Mq3I4` packet (the otherwise unused `header_lane_offset` register).
+    fn shift(&self) -> u8 {
+        self.hl
+    }
 }
 
 fn lbl(tag: &str, name: &str) -> String {
@@ -399,8 +450,8 @@ fn plan(l: &Lay, rowtiles: bool) -> Result<RegPlan, String> {
     let mut regs = RegPlan::new(u16::from(l.end), u16::from(SGPRS))?;
     for (name, base, len) in [
         ("kernarg", KARG, 2),
-        ("workgroup_id_x", WGX, 1),
-        ("workgroup_id_y", WGY, 1),
+        ("workgroup_id_x", wg_x(rowtiles), 1),
+        ("workgroup_id_y", wg_y(rowtiles), 1),
         ("kernel_arguments_ptrs", WPTRS, 8),
         ("kernel_arguments_x_y_m_k", XROT, 8),
         ("kernel_arguments_u_c_div_src", SU, 4),
@@ -446,7 +497,7 @@ fn plan(l: &Lay, rowtiles: bool) -> Result<RegPlan, String> {
         declare(&mut regs, name, RKind::S, base, len)?;
     }
     if rowtiles {
-        declare(&mut regs, "workgroup_id_z", RKind::S, WGZ, 1)?;
+        declare(&mut regs, "workgroup_id_z", RKind::S, wg_z(), 1)?;
     }
     for (name, base, len) in [
         ("lane", LANE, 1),
@@ -624,10 +675,12 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay, rowtiles: bool) -> R {
     let snexp = if rowtiles { TILE_SNEXP } else { SNEXP };
     smem(b, snexp, 1, KARG, 0x58)?;
     // gfx11 workgroup ids are system SGPRs (after the user SGPRs), not ttmp registers.
-    let ids = a.workgroup_ids(USER_SGPRS)?;
-    if (ids.x, ids.y) != (WgIdSource::Sgpr(WGX), WgIdSource::Sgpr(WGY)) {
+    let ids = b.spec.workgroup_ids(rowtiles)?;
+    let (wgx, wgy) = (wg_x(rowtiles), wg_y(rowtiles));
+    if (ids.x, ids.y) != (WgIdSource::Sgpr(wgx), WgIdSource::Sgpr(wgy)) {
         return Err(format!("unexpected workgroup id ABI {ids:?}"));
     }
+    let wgz = wg_z();
     if rowtiles {
         // v0 is the linear workitem id. Scalar registers are wave-private;
         // each wave runs the original complete K sweep for one output row.
@@ -644,7 +697,7 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay, rowtiles: bool) -> R {
             &[s(TMP)],
             &[v(l.exch)],
         )?;
-        sop(b, format!("s_lshl_b32 s{ROW}, s{WGX}, 3"), &[ROW], &[WGX])?;
+        sop(b, format!("s_lshl_b32 s{ROW}, s{wgx}, 3"), &[ROW], &[wgx])?;
         sop(
             b,
             format!("s_add_u32 s{ROW}, s{ROW}, s{TMP}"),
@@ -670,26 +723,26 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay, rowtiles: bool) -> R {
         branch(b, &format!("s_cbranch_scc1 {exit}"))?;
         sop(b, format!("s_cmp_gt_u32 s{SC}, 64"), &[], &[SC])?;
         branch(b, &format!("s_cbranch_scc1 {exit}"))?;
-        sop(b, format!("s_cmp_ge_u32 s{WGZ}, 8"), &[], &[WGZ])?;
+        sop(b, format!("s_cmp_ge_u32 s{wgz}, 8"), &[], &[wgz])?;
         branch(b, &format!("s_cbranch_scc1 {exit}"))?;
-        sop(b, format!("s_lshl_b32 s{TMP}, s{WGZ}, 3"), &[TMP], &[WGZ])?;
+        sop(b, format!("s_lshl_b32 s{TMP}, s{wgz}, 3"), &[TMP], &[wgz])?;
         sop(b, format!("s_cmp_ge_u32 s{TMP}, s{SC}"), &[], &[TMP, SC])?;
         branch(b, &format!("s_cbranch_scc1 {exit}"))?;
         sop(b, format!("s_cmp_eq_u32 s{SDIV}, 0"), &[], &[SDIV])?;
         branch(b, &format!("s_cbranch_scc1 {exit}"))?;
         sop(
             b,
-            format!("s_mul_i32 s{TMP}, s{WGZ}, {}", lit(TILE_DESCRIPTOR_BYTES)),
+            format!("s_mul_i32 s{TMP}, s{wgz}, {}", lit(TILE_DESCRIPTOR_BYTES)),
             &[TMP],
-            &[WGZ],
+            &[wgz],
         )?;
         for ptr in [EIDS, OFFS, SLOTS] {
             add64(b, ptr, ptr, TMP)?;
         }
     } else {
-        sop(b, format!("s_mov_b32 s{ROW}, s{WGX}"), &[ROW], &[WGX])?;
+        sop(b, format!("s_mov_b32 s{ROW}, s{wgx}"), &[ROW], &[wgx])?;
     }
-    sop(b, format!("s_mov_b32 s{UIDX}, s{WGY}"), &[UIDX], &[WGY])?;
+    sop(b, format!("s_mov_b32 s{UIDX}, s{wgy}"), &[UIDX], &[wgy])?;
     sop(b, format!("s_cmp_ge_u32 s{ROW}, s{SM}"), &[], &[ROW, SM])?;
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
     sop(b, format!("s_cmp_ge_u32 s{UIDX}, s{SU}"), &[], &[UIDX, SU])?;
@@ -761,6 +814,59 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay, rowtiles: bool) -> R {
                 format!("s_lshr_b32 s{ROW_BYTES}, s{SK}, 2"),
                 &[ROW_BYTES],
                 &[SK],
+            )?;
+            sop(
+                b,
+                format!("s_mul_i32 s{CODES_BYTES}, s{SM}, s{ROW_BYTES}"),
+                &[CODES_BYTES],
+                &[SM, ROW_BYTES],
+            )?;
+            sop(
+                b,
+                format!("s_mul_i32 s{TMP}, s{ROW}, s{ROW_BYTES}"),
+                &[TMP],
+                &[ROW, ROW_BYTES],
+            )?;
+            add64(b, ROW_PTR, WPTR, TMP)?;
+            sop(
+                b,
+                format!("s_mul_i32 s{TMP2}, s{ROW}, s{GROUPS}"),
+                &[TMP2],
+                &[ROW, GROUPS],
+            )?;
+            sop(
+                b,
+                format!("s_lshl_b32 s{TMP2}, s{TMP2}, 1"),
+                &[TMP2],
+                &[TMP2],
+            )?;
+            sop(
+                b,
+                format!("{} s{TMP2}, s{TMP2}, s{CODES_BYTES}", s_add_i32(a)),
+                &[TMP2],
+                &[TMP2, CODES_BYTES],
+            )?;
+            add64(b, SCALE_PTR, WPTR, TMP2)?;
+        }
+        (Codec::Mq3I4, _) => {
+            // Row bytes K*3/8 = (K>>3)*3; the code plane is M*K*3/8 bytes and the scale plane follows it.
+            sop(
+                b,
+                format!("s_lshr_b32 s{GROUPS}, s{SK}, 7"),
+                &[GROUPS],
+                &[SK],
+            )?;
+            sop(
+                b,
+                format!("s_lshr_b32 s{ROW_BYTES}, s{SK}, 3"),
+                &[ROW_BYTES],
+                &[SK],
+            )?;
+            sop(
+                b,
+                format!("s_mul_i32 s{ROW_BYTES}, s{ROW_BYTES}, 3"),
+                &[ROW_BYTES],
+                &[ROW_BYTES],
             )?;
             sop(
                 b,
@@ -926,6 +1032,37 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay, rowtiles: bool) -> R {
             &[LANE],
             &[],
         )?,
+        (Codec::Mq3I4, _) => {
+            // Code byte (3l) >> 1 of the group and the packet's bit shift 4*(l & 1).
+            valu(
+                b,
+                &format!("v_mul_u32_u24_e32 v{}, 3, v{LANE}", l.cl),
+                &[l.cl],
+                &[LANE],
+                &[],
+            )?;
+            valu(
+                b,
+                &format!("v_lshrrev_b32_e32 v{0}, 1, v{0}", l.cl),
+                &[l.cl],
+                &[l.cl],
+                &[],
+            )?;
+            valu(
+                b,
+                &format!("v_and_b32_e32 v{}, 1, v{LANE}", l.shift()),
+                &[l.shift()],
+                &[LANE],
+                &[],
+            )?;
+            valu(
+                b,
+                &format!("v_lshlrev_b32_e32 v{0}, 2, v{0}", l.shift()),
+                &[l.shift()],
+                &[l.shift()],
+                &[],
+            )?;
+        }
         (Codec::Mq4Sym, Kind::GateUp) => {
             // Payload word 4*l; header half (bytes 0 or 4) 4*(l >> 4).
             valu(
@@ -1110,6 +1247,22 @@ fn group(b: &mut Builder, spec: Spec, l: &Lay, chain: u8, inst: &str) -> R {
                 &[GI],
             )?;
         }
+        Codec::Mq3I4 => {
+            // 128 columns * 3 bits = 48 code bytes per group; 512 X bytes; one f16 scale.
+            sop(
+                b,
+                format!("s_mul_i32 s{G_CODE}, s{GI}, 48"),
+                &[G_CODE],
+                &[GI],
+            )?;
+            sop(b, format!("s_lshl_b32 s{G_X}, s{GI}, 9"), &[G_X], &[GI])?;
+            sop(
+                b,
+                format!("s_lshl_b32 s{G_SCALE}, s{GI}, 1"),
+                &[G_SCALE],
+                &[GI],
+            )?;
+        }
         Codec::Mq4Sym => {
             sop(
                 b,
@@ -1136,7 +1289,7 @@ fn group(b: &mut Builder, spec: Spec, l: &Lay, chain: u8, inst: &str) -> R {
         &[G_CODE],
     )?;
     match (spec.codec, spec.kind) {
-        (Codec::Mq2I4, _) => valu(
+        (Codec::Mq2I4 | Codec::Mq3I4, _) => valu(
             b,
             &format!("v_mov_b32_e32 v{}, s{G_SCALE}", l.saddr),
             &[l.saddr],
@@ -1168,6 +1321,12 @@ fn group(b: &mut Builder, spec: Spec, l: &Lay, chain: u8, inst: &str) -> R {
     match (spec.codec, spec.kind) {
         (Codec::Mq2I4, _) => {
             gload(b, "global_load_u8", l.pkt, l.caddr, ROW_PTR, "")?;
+            gload(b, "global_load_u16", l.d, l.saddr, SCALE_PTR, "")?;
+        }
+        (Codec::Mq3I4, _) => {
+            // The 12-bit packet is bytes (3l)>>1 and +1 of the group (never past byte 47 of the 48-byte group).
+            gload(b, "global_load_u8", l.pkt, l.caddr, ROW_PTR, "")?;
+            gload(b, "global_load_u8", l.pkt1(), l.caddr, ROW_PTR, " offset:1")?;
             gload(b, "global_load_u16", l.d, l.saddr, SCALE_PTR, "")?;
         }
         (Codec::Mq4Sym, Kind::GateUp) => {
@@ -1208,7 +1367,7 @@ fn group(b: &mut Builder, spec: Spec, l: &Lay, chain: u8, inst: &str) -> R {
         }
         let dot = l.dot + (i % 2) as u8;
         let x = l.xr(i);
-        // Mq2I4: p = RN(w0*x0), then fma(w_j, x_j, p) for j = 1..; Mq4Sym (the production contraction of the
+        // Mq2I4 / Mq3I4: p = RN(w0*x0), then fma(w_j, x_j, p) for j = 1..; Mq4Sym (the production contraction of the
         // old MQ4 kernels): p = RN(w1*x1), then fma(w0, x0, p), then fma(w_j, x_j, p) for j = 2.. ascending.
         let first = if spec.codec == Codec::Mq4Sym { 1 } else { 0 };
         valu(
@@ -1288,6 +1447,62 @@ fn unpack(b: &mut Builder, spec: Spec, l: &Lay) -> R {
                 valu(
                     b,
                     &format!("v_add_nc_u32_e32 v{w}, -3, v{w}"),
+                    &[w],
+                    &[w],
+                    &[],
+                )?;
+                valu(b, &format!("v_cvt_f32_i32_e32 v{w}, v{w}"), &[w], &[w], &[])?;
+                valu(
+                    b,
+                    &format!("v_mul_f32_e32 v{w}, v{}, v{w}", l.d),
+                    &[w],
+                    &[l.d, w],
+                    &[],
+                )?;
+            }
+        }
+        Codec::Mq3I4 => {
+            valu(
+                b,
+                &format!("v_cvt_f32_f16_e64 v{0}, v{0}.l", l.d),
+                &[l.d],
+                &[l.d],
+                &[],
+            )?;
+            // packet = b0 | b1 << 8, then >> 4*(l&1): the lane's four 3-bit codes are bits [0, 12).
+            valu(
+                b,
+                &format!("v_lshl_or_b32 v{0}, v{1}, 8, v{0}", l.pkt, l.pkt1()),
+                &[l.pkt],
+                &[l.pkt1(), l.pkt],
+                &[],
+            )?;
+            valu(
+                b,
+                &format!("v_lshrrev_b32_e32 v{0}, v{1}, v{0}", l.pkt, l.shift()),
+                &[l.pkt],
+                &[l.shift(), l.pkt],
+                &[],
+            )?;
+            for i in 0..4u8 {
+                let w = l.w + i;
+                valu(
+                    b,
+                    &format!("v_bfe_u32 v{w}, v{}, {}, 3", l.pkt, u32::from(i) * 3),
+                    &[w],
+                    &[l.pkt],
+                    &[],
+                )?;
+                valu(
+                    b,
+                    &format!("v_lshlrev_b32_e32 v{w}, 1, v{w}"),
+                    &[w],
+                    &[w],
+                    &[],
+                )?;
+                valu(
+                    b,
+                    &format!("v_add_nc_u32_e32 v{w}, -7, v{w}"),
                     &[w],
                     &[w],
                     &[],
@@ -1604,7 +1819,10 @@ mod rowtile_tests {
 
     #[test]
     fn rowtiles_keep_the_gfx1100_singleton_dag_and_resources() {
-        for spec in module_specs(Arch::Gfx1100) {
+        for spec in module_specs(Arch::Gfx1100)
+            .into_iter()
+            .chain(mq3_specs(Arch::Gfx1100))
+        {
             let singleton = emit(spec).unwrap();
             let tiled = emit_rowtiles(spec).unwrap();
             assert_eq!(arithmetic(&tiled.s_text), arithmetic(&singleton.s_text));
@@ -1639,13 +1857,17 @@ mod rowtile_tests {
 
     #[test]
     fn rowtile_descriptor_abi_uses_z_and_full_window_bases() {
-        for spec in module_specs(Arch::Gfx1100) {
+        for spec in module_specs(Arch::Gfx1100)
+            .into_iter()
+            .chain(mq3_specs(Arch::Gfx1100))
+        {
             let e = emit_rowtiles(spec).unwrap();
             let t = &e.s_text;
             assert!(t.contains(".amdhsa_system_sgpr_workgroup_id_z 1"));
             assert!(t.contains("s_load_b32 s5, s[0:1], 0x58"));
             assert!(t.contains(&format!(
-                "s_mul_i32 s{TMP}, s{WGZ}, {}",
+                "s_mul_i32 s{TMP}, s{}, {}",
+                wg_z(),
                 lit(TILE_DESCRIPTOR_BYTES)
             )));
             assert!(t.contains(&format!("s_cmp_eq_u32 s{SU}, {}", lit(TILE_CAPACITY))));
@@ -1654,12 +1876,12 @@ mod rowtile_tests {
             assert!(t.contains(&format!("s_cmp_gt_u32 s{OFF1}, {}", lit(TILE_CAPACITY))));
             assert!(t.contains(&format!("s_cmp_ge_u32 s{EID}, s{TILE_SNEXP}")));
             assert!(t.contains(&format!("v_and_b32_e32 v{LANE}, 31, v{LANE}")));
-            assert!(t.contains(&format!("s_lshl_b32 s{ROW}, s{WGX}, 3")));
+            assert!(t.contains(&format!("s_lshl_b32 s{ROW}, s{}, 3", wg_x(true))));
             assert!(e
                 .proof
                 .reg_plan
                 .iter()
-                .any(|r| r.name.as_ref() == "workgroup_id_z" && r.base == WGZ));
+                .any(|r| r.name.as_ref() == "workgroup_id_z" && r.base == wg_z()));
             // Singleton and tile local labels must coexist in the same image.
             assert!(!t.contains(&format!(".Lmqi4moe_{}_exit:", spec.tag())));
             assert!(t.contains(&format!(".Lmqi4moe_{}_t8_exit:", spec.tag())));

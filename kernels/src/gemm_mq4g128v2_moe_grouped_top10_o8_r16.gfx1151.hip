@@ -120,6 +120,11 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151(
                  "s"(flat_idx[9]), "s"(flat_idx[10]), "s"(flat_idx[11]),
                  "s"(flat_idx[12]), "s"(flat_idx[13]), "s"(flat_idx[14]),
                  "s"(flat_idx[15]), "s"(expert));
+#ifdef HF_NODZ
+    // HIPFIRE_QWEN4_MOE_DEAD_STORES=0 (default): a sentinel tile (expert id outside [0, n_exp)) has no live slot; it exits
+    // without storing. Its Y rows are dead scratch (the combine reads Y only through inverse_perm).
+    if (!(expert >= 0 && expert < n_exp)) return;
+#endif
     float acc[HF_ROWS][16];
     const float* x_rows[16];
     bool row_valid[HF_ROWS];
@@ -332,6 +337,9 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151(
         for (int slot = 0; slot < 16; ++slot) {
             const int grouped_slot = slot_start + slot;
             if (grouped_slot >= grouped_rows) continue;
+#ifdef HF_NODZ
+            if (flat_idx[slot] < 0) continue;   // pad slot of a live tile: dead scratch, not stored
+#endif
             #pragma unroll
             for (int r = 0; r < HF_ROWS; ++r) {
                 if (row_valid[r])

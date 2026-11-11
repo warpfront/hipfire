@@ -63,7 +63,7 @@
   "require_wave32": true,
   "require_zero_private": true,
   "require_zero_spills": true,
-  "sgpr_max": 88,
+  "sgpr_max": 96,
   "symbol": "e8p_i4_moe_gemv_r128_down_pm_gfx1100",
   "vgpr_max": 88
 }

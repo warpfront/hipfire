@@ -315,6 +315,38 @@ pub fn emitted_object(
     })
 }
 
+/// `s_text` (one emitted kernel, `peacemaker-isa emit` layout) with the body of `symbol` replaced by a
+/// single `s_endpgm`: the kernel descriptor (registers, LDS, kernarg) and the symbol are unchanged.
+pub fn null_kernel_text(s_text: &str, symbol: &str) -> Result<String> {
+    let (head, tail) = (format!("\n{symbol}:\n"), format!(".L{symbol}_end:\n"));
+    let a = s_text
+        .find(&head)
+        .ok_or_else(|| format!("emitted text has no `{symbol}:` label"))?
+        + head.len();
+    let b = s_text[a..]
+        .find(&tail)
+        .ok_or_else(|| format!("emitted text has no `.L{symbol}_end:` label"))?
+        + a;
+    Ok(format!("{}\ts_endpgm\n{}", &s_text[..a], &s_text[b..]))
+}
+
+/// The null object of an emitted kernel: [`null_kernel_text`] linked with the native writer.
+pub fn null_object(
+    s_text: &str,
+    arch: peacemaker_isa::Arch,
+    symbol: &str,
+    what: &str,
+) -> Result<Object> {
+    let elf = peacemaker_isa::native::assemble(&null_kernel_text(s_text, symbol)?, arch)?;
+    Ok(Object {
+        source: json!({"source": what, "body": "s_endpgm", "sha256": sha256_hex(&elf)}),
+        desc: json!({"null_of": symbol}),
+        exports: vec![symbol.to_owned()],
+        launch_symbol: symbol.to_owned(),
+        bytes: elf,
+    })
+}
+
 /// `--rip FILE`: the script's path and text.
 pub type RipSource = Option<(String, String)>;
 
@@ -464,7 +496,7 @@ pub fn emu_run(
     )
     .map_err(|e| format!("lift: {e:?}"))?;
     // Reports the first opcode without semantics, if any.
-    let emu = Emulator::new(&lifted.program, symbol)?;
+    let emu = Emulator::new(&lifted.program, symbol)?.hw_model();
     let kernel = lifted
         .program
         .kernels

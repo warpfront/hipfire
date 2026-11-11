@@ -1642,3 +1642,104 @@ fn abort_effects_suppress_calls_cache_and_normal_done() {
         .all(|e| !(e["type"] == "done" && e["finish_reason"] == "tool_calls")));
     assert!(events.iter().all(|e| e["attempt_id"] == 12));
 }
+
+/// Drive the producer like the AR decode loop with `min_tokens`; returns the
+/// visible text and the index of the chunk whose commit ended the turn.
+fn drive_with_min_tokens(
+    chunks: &[&str],
+    stop: &[&str],
+    min_tokens: usize,
+) -> (String, Option<usize>, QwenArSemanticProducer) {
+    let _guard = begin_terminal_test("t1", 7);
+    set_active_attempt_id(7);
+    let stop: Vec<String> = stop.iter().map(|s| (*s).to_owned()).collect();
+    let mut producer = QwenArSemanticProducer::new("t1", false)
+        .with_stop(&stop)
+        .with_min_tokens(min_tokens, 0);
+    let mut sink = Vec::new();
+    let (mut conversation_tokens, mut streamed_tokens, mut seq_pos) = (Vec::new(), Vec::new(), 0);
+    let mut ended = None;
+    for (i, c) in chunks.iter().enumerate() {
+        let stopped = producer
+            .commit_and_observe(
+                &mut sink,
+                &mut conversation_tokens,
+                &mut streamed_tokens,
+                &mut seq_pos,
+                1000 + i as u32,
+                c.as_bytes(),
+            )
+            .expect("commit");
+        if stopped {
+            ended = Some(i);
+            break;
+        }
+    }
+    let tokens: String = parse_jsonl(&String::from_utf8_lossy(&sink))
+        .iter()
+        .filter(|e| e["type"] == "token")
+        .map(|e| e["text"].as_str().unwrap().to_owned())
+        .collect();
+    (tokens, ended, producer)
+}
+
+#[test]
+fn min_tokens_zero_stops_on_the_first_marker_as_before() {
+    let (visible, ended, producer) = drive_with_min_tokens(&["hi", "<|im_end|>", "x"], &[], 0);
+    assert_eq!(ended, Some(1));
+    assert_eq!(visible, "hi");
+    assert!(producer.last_stops_active);
+}
+
+#[test]
+fn min_tokens_holds_the_end_of_turn_marker_inactive_until_reached() {
+    // 4th chunk is the first that may stop; the two earlier markers are
+    // dropped from the stream, not shown and not a stop.
+    let chunks = [
+        "a",
+        "<|im_end|>",
+        "b",
+        "<|endoftext|>",
+        "c",
+        "<|im_end|>",
+        "never",
+    ];
+    let (visible, ended, producer) = drive_with_min_tokens(&chunks, &[], 4);
+    assert_eq!(ended, Some(5), "stops on the first marker after 4 commits");
+    assert_eq!(visible, "abc");
+    assert!(producer.last_stops_active);
+    assert_eq!(producer.raw_committed.len(), 6);
+}
+
+#[test]
+fn min_tokens_flag_tells_decode_loops_to_ignore_an_eos_id() {
+    // The loops gate their own EOS-id check on `last_stops_active`.
+    let (_, ended, producer) = drive_with_min_tokens(&["a", "b"], &[], 3);
+    assert_eq!(ended, None);
+    assert!(
+        !producer.last_stops_active,
+        "below min_tokens: EOS id ignored"
+    );
+    let (_, _, producer) = drive_with_min_tokens(&["a", "b", "c", "d"], &[], 3);
+    assert!(producer.last_stops_active, "the 4th token may stop");
+}
+
+#[test]
+fn min_tokens_holds_stop_sequences_inactive_until_reached() {
+    // `END` completes inside the first three commits: ignored and shown. The
+    // second `END` lands after min_tokens and trims.
+    let chunks = ["x END ", "y", "z", "q E", "ND tail", "never"];
+    let (visible, ended, _) = drive_with_min_tokens(&chunks, &["END"], 3);
+    assert_eq!(ended, Some(4));
+    assert_eq!(visible, "x END yzq ");
+}
+
+#[test]
+fn min_tokens_counts_tokens_a_promoted_producer_already_emitted() {
+    let _guard = begin_terminal_test("t1", 7);
+    set_active_attempt_id(7);
+    let producer = QwenArSemanticProducer::new("t1", false).with_min_tokens(5, 5);
+    assert!(producer.last_stops_active, "already at the minimum");
+    let producer = QwenArSemanticProducer::new("t1", false).with_min_tokens(5, 2);
+    assert!(!producer.last_stops_active);
+}

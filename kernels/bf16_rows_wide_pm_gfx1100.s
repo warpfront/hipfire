@@ -6,12 +6,12 @@
 .p2align 8
 .type gemv_bf16_xf32_rows_x4_t8_pm_gfx1100,@function
 gemv_bf16_xf32_rows_x4_t8_pm_gfx1100:
-	s_load_b256 s[8:15], s[0:1], null
+	s_load_b256 s[72:79], s[0:1], null
 	s_load_b256 s[16:23], s[0:1], 0x20
 	s_load_b128 s[24:27], s[0:1], 0x40
 	s_load_b128 s[28:31], s[0:1], 0x50
 	s_waitcnt lgkmcnt(0)
-	s_mov_b32 s60, s2
+	s_mov_b32 s60, s14
 	s_cmp_lt_u32 s60, s26
 	s_cbranch_scc1 .Lbf16xtx_t8_x4_matrix0
 	s_sub_u32 s60, s60, s26
@@ -26,29 +26,29 @@ gemv_bf16_xf32_rows_x4_t8_pm_gfx1100:
 	s_sub_u32 s60, s60, s29
 	s_branch .Lbf16xtx_t8_x4_end
 	.Lbf16xtx_t8_x4_matrix0:
-	s_mov_b32 s4, s8
-	s_mov_b32 s5, s9
+	s_mov_b32 s4, s72
+	s_mov_b32 s5, s73
 	s_mov_b32 s32, s18
 	s_mov_b32 s33, s19
 	s_mov_b32 s34, s26
 	s_branch .Lbf16xtx_t8_x4_selected
 	.Lbf16xtx_t8_x4_matrix1:
-	s_mov_b32 s4, s10
-	s_mov_b32 s5, s11
+	s_mov_b32 s4, s74
+	s_mov_b32 s5, s75
 	s_mov_b32 s32, s20
 	s_mov_b32 s33, s21
 	s_mov_b32 s34, s27
 	s_branch .Lbf16xtx_t8_x4_selected
 	.Lbf16xtx_t8_x4_matrix2:
-	s_mov_b32 s4, s12
-	s_mov_b32 s5, s13
+	s_mov_b32 s4, s76
+	s_mov_b32 s5, s77
 	s_mov_b32 s32, s22
 	s_mov_b32 s33, s23
 	s_mov_b32 s34, s28
 	s_branch .Lbf16xtx_t8_x4_selected
 	.Lbf16xtx_t8_x4_matrix3:
-	s_mov_b32 s4, s14
-	s_mov_b32 s5, s15
+	s_mov_b32 s4, s78
+	s_mov_b32 s5, s79
 	s_mov_b32 s32, s24
 	s_mov_b32 s33, s25
 	s_mov_b32 s34, s29
@@ -63,7 +63,7 @@ gemv_bf16_xf32_rows_x4_t8_pm_gfx1100:
 	s_cbranch_scc1 .Lbf16xtx_t8_x4_end
 	s_cmp_le_i32 s30, 0
 	s_cbranch_scc1 .Lbf16xtx_t8_x4_end
-	s_lshl_b32 s41, s3, 3
+	s_lshl_b32 s41, s15, 3
 	s_cmp_ge_u32 s41, s31
 	s_cbranch_scc1 .Lbf16xtx_t8_x4_end
 	s_sub_u32 s45, s31, s41
@@ -986,7 +986,7 @@ gemv_bf16_xf32_rows_x4_t8_pm_gfx1100:
 	.amdhsa_group_segment_fixed_size 0
 	.amdhsa_private_segment_fixed_size 0
 	.amdhsa_kernarg_size 96
-	.amdhsa_user_sgpr_count 2
+	.amdhsa_user_sgpr_count 14
 	.amdhsa_user_sgpr_dispatch_ptr 0
 	.amdhsa_user_sgpr_queue_ptr 0
 	.amdhsa_user_sgpr_kernarg_segment_ptr 1
@@ -1030,24 +1030,24 @@ gemv_bf16_xf32_rows_x4_t8_pm_gfx1100:
 .p2align 8
 .type gemv_bf16_xf32_k4_rows_t8_pm_gfx1100,@function
 gemv_bf16_xf32_k4_rows_t8_pm_gfx1100:
-	s_load_b256 s[8:15], s[0:1], null
+	s_load_b256 s[72:79], s[0:1], null
 	s_load_b128 s[16:19], s[0:1], 0x20
 	s_waitcnt lgkmcnt(0)
 	s_mov_b32 s44, s16
 	s_mov_b32 s61, s17
 	s_mov_b32 s31, s18
-	s_mov_b32 s16, s10
-	s_mov_b32 s17, s11
-	s_mov_b32 s32, s12
-	s_mov_b32 s33, s13
-	s_mov_b32 s34, s14
-	s_mov_b32 s30, s15
-	s_mov_b32 s60, s2
+	s_mov_b32 s16, s74
+	s_mov_b32 s17, s75
+	s_mov_b32 s32, s76
+	s_mov_b32 s33, s77
+	s_mov_b32 s34, s78
+	s_mov_b32 s30, s79
+	s_mov_b32 s60, s14
 	v_lshrrev_b32_e32 v13, 5, v0
 	s_delay_alu instid0(VALU_DEP_1)
 	v_readfirstlane_b32 s43, v13
-	s_mov_b32 s4, s8
-	s_mov_b32 s5, s9
+	s_mov_b32 s4, s72
+	s_mov_b32 s5, s73
 	s_cmp_ge_u32 s60, s34
 	s_cbranch_scc1 .Lbf16xtx_t8_hc_end
 	s_cmp_eq_u32 s31, 0
@@ -1056,7 +1056,7 @@ gemv_bf16_xf32_k4_rows_t8_pm_gfx1100:
 	s_cbranch_scc1 .Lbf16xtx_t8_hc_end
 	s_cmp_le_i32 s30, 0
 	s_cbranch_scc1 .Lbf16xtx_t8_hc_end
-	s_lshl_b32 s41, s3, 3
+	s_lshl_b32 s41, s15, 3
 	s_cmp_ge_u32 s41, s31
 	s_cbranch_scc1 .Lbf16xtx_t8_hc_end
 	s_sub_u32 s45, s31, s41
@@ -2929,7 +2929,7 @@ gemv_bf16_xf32_k4_rows_t8_pm_gfx1100:
 	.amdhsa_group_segment_fixed_size 128
 	.amdhsa_private_segment_fixed_size 0
 	.amdhsa_kernarg_size 48
-	.amdhsa_user_sgpr_count 2
+	.amdhsa_user_sgpr_count 14
 	.amdhsa_user_sgpr_dispatch_ptr 0
 	.amdhsa_user_sgpr_queue_ptr 0
 	.amdhsa_user_sgpr_kernarg_segment_ptr 1

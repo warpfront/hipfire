@@ -284,6 +284,10 @@ fn embed_lookup(
             .embedding_lookup(&weights.embed_tokens, &state.x, token_id, dim)
             .map_err(|e| format!("gemma4: embed f32: {e:?}"))?,
         EmbeddingFormat::Q4K => return Err("gemma4: Q4K embedding format unsupported".to_string()),
+        EmbeddingFormat::Ggml(_) => return Err(
+            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only"
+                .to_string(),
+        ),
     }
     gpu.scale_f32(&state.x, cfg.embed_scale)
         .map_err(|e| format!("gemma4: embed scale: {e:?}"))?;
@@ -314,6 +318,10 @@ fn embedding_lookup_to(
             .embedding_lookup(table, dst, token_id, dim)
             .map_err(|e| format!("gemma4: {label} f32: {e:?}")),
         EmbeddingFormat::Q4K => Err(format!("gemma4: {label} Q4K embedding format unsupported")),
+        EmbeddingFormat::Ggml(_) => Err(
+            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only"
+                .to_string(),
+        ),
     }
 }
 
@@ -337,6 +345,10 @@ fn embedding_lookup_batched_to(
         }
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(table, dst, token_ids, batch, dim),
         EmbeddingFormat::F32 | EmbeddingFormat::Q4K => return Ok(false),
+        EmbeddingFormat::Ggml(_) => return Err(
+            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only"
+                .to_string(),
+        ),
     };
     result
         .map(|_| true)
@@ -1178,6 +1190,10 @@ fn embed_lookup_row(
             .embedding_lookup(&weights.embed_tokens, dst, token_id, dim)
             .map_err(|e| format!("gemma4 forward_batch embed f32: {e:?}")),
         EmbeddingFormat::Q4K => Err("gemma4 forward_batch: Q4K embedding unsupported".to_string()),
+        EmbeddingFormat::Ggml(_) => Err(
+            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only"
+                .to_string(),
+        ),
     }
 }
 
