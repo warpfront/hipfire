@@ -66,3 +66,7 @@ required-features = ["lab"]
 [[example]]
 name = "shared_vmm_fd_probe"
 required-features = ["lab"]
+
+[[example]]
+name = "vmm_tlb_flush_soak"
+required-features = ["lab"]
