@@ -94,6 +94,7 @@ struct State {
     published: ResidencySnapshot,
     completed: Vec<Option<ResidencySlotTicket>>,
     active: bool,
+    active_rows: usize,
     poisoned: bool,
 }
 
@@ -125,6 +126,10 @@ impl PartialEq for MutableExpertResidency {
 impl Eq for MutableExpertResidency {}
 
 impl MutableExpertResidency {
+    /// Qualified maximum for a single stable-table few-row verify reader.
+    /// Larger grouped/prefill routes require independent qualification.
+    pub const MAX_VERIFY_ROWS: usize = 8;
+
     /// Bind fixed ownership and an initially canonical pair of device tables.
     ///
     /// # Safety
@@ -231,6 +236,7 @@ impl MutableExpertResidency {
                 published,
                 completed,
                 active: false,
+                active_rows: 0,
                 poisoned: false,
             }),
         })))
@@ -301,6 +307,20 @@ impl MutableExpertResidency {
     /// The architecture must hold all layer guards through the token's final
     /// proven GPU wait, including error paths. This is not a CPU launch guard.
     pub fn begin_token(&self, expected_epoch: u64) -> Result<ResidencyTokenGuard> {
+        self.begin_rows(expected_epoch, 1)
+    }
+
+    /// Acquire one stable-table reader for an entire bounded verify batch.
+    /// All rows share this epoch until one proven GPU retirement. This does
+    /// not authorize ordinary prefill, CPU/EP routes or retained batch tapes.
+    pub fn begin_verify(&self, expected_epoch: u64, rows: usize) -> Result<ResidencyTokenGuard> {
+        if !(2..=Self::MAX_VERIFY_ROWS).contains(&rows) {
+            return Err("mutable residency: verify rows outside 2..=8".into());
+        }
+        self.begin_rows(expected_epoch, rows)
+    }
+
+    fn begin_rows(&self, expected_epoch: u64, rows: usize) -> Result<ResidencyTokenGuard> {
         let mut state = self
             .0
             .state
@@ -314,11 +334,28 @@ impl MutableExpertResidency {
         }
         let snapshot = state.published.clone();
         state.active = true;
+        state.active_rows = rows;
         Ok(ResidencyTokenGuard {
             residency: self.clone(),
             snapshot,
+            rows,
             retired: false,
         })
+    }
+
+    /// Require the exact reader shape acquired before this launch. The
+    /// canonical/tier/table identity and current host mirrors are validated
+    /// separately, so a matching shape alone is never launch authority.
+    pub fn validate_active_rows(&self, rows: usize) -> Result<()> {
+        let state = self
+            .0
+            .state
+            .lock()
+            .map_err(|_| "mutable residency: mutex poisoned")?;
+        if state.poisoned || !state.active || state.active_rows != rows {
+            return Err("mutable residency: launch rows differ from active reader".into());
+        }
+        Ok(())
     }
 
     /// Check a host mirror during load/binding, including a warm seed already
@@ -470,14 +507,19 @@ impl MutableExpertResidency {
     }
 }
 
-/// An active single-token reader. Drop without a proven GPU retirement poisons
+/// An active token or bounded-verify reader. Drop without proven GPU retirement poisons
 /// the authority permanently; a CPU error cannot silently reopen table writes.
 pub struct ResidencyTokenGuard {
     residency: MutableExpertResidency,
     snapshot: ResidencySnapshot,
+    rows: usize,
     retired: bool,
 }
 impl ResidencyTokenGuard {
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
     pub fn snapshot(&self) -> &ResidencySnapshot {
         &self.snapshot
     }
@@ -492,10 +534,15 @@ impl ResidencyTokenGuard {
             .state
             .lock()
             .map_err(|_| "mutable residency: mutex poisoned")?;
-        if state.poisoned || !state.active || state.published.epoch != self.snapshot.epoch {
+        if state.poisoned
+            || !state.active
+            || state.active_rows != self.rows
+            || state.published.epoch != self.snapshot.epoch
+        {
             return Err("mutable residency: invalid token retirement".into());
         }
         state.active = false;
+        state.active_rows = 0;
         self.retired = true;
         Ok(())
     }

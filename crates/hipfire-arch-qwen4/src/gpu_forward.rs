@@ -1719,7 +1719,7 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     /// then be an S1 host layer. Meaningless (false) for a layer without a tier.
     s1_tier_ok: bool,
     tier_identity: Option<hipfire_dispatch::families::moe::ExpertTierIdentity>,
-    /// Stable authority for decode-only pointer publication. Canonical expert
+    /// Stable authority for AR and bounded verify pointer publication. Canonical expert
     /// views and the tier identity above remain immutable throughout the load.
     mutable_residency: Option<hipfire_dispatch::families::moe::MutableExpertResidency>,
     /// `Some` on a trunk layer of an expert-slab artifact: the layer's experts
@@ -2209,6 +2209,17 @@ impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
     ) -> Option<&hipfire_dispatch::families::moe::MutableExpertResidency> {
         self.mutable_residency.as_ref()
     }
+
+    fn mutable_pointer_entries(
+        &self,
+    ) -> Option<hipfire_dispatch::families::moe::MoePointerEntries<'_>> {
+        self.mutable_residency.as_ref().map(|_| {
+            hipfire_dispatch::families::moe::MoePointerEntries {
+                gate_up: &self.expert_gate_up_entries,
+                down: &self.expert_down_entries,
+            }
+        })
+    }
 }
 
 /// A layer's runtime seen through a window the D2 split must not serve: the
@@ -2252,6 +2263,12 @@ impl RoutedExpertWeights for SplitlessExperts {
         &self,
     ) -> Option<&hipfire_dispatch::families::moe::MutableExpertResidency> {
         self.0.mutable_residency()
+    }
+
+    fn mutable_pointer_entries(
+        &self,
+    ) -> Option<hipfire_dispatch::families::moe::MoePointerEntries<'_>> {
+        self.0.mutable_pointer_entries()
     }
 
     // Every other trait method is forwarded so the prefill binding is identical
@@ -11149,6 +11166,9 @@ pub struct Qwen4GpuForward {
     cache_routes: Option<ExpertCacheRoutes>,
     cache_active: bool,
     cache_host_prefill_active: bool,
+    /// Set only by the dedicated native-MTP verify entry, never by a prompt
+    /// or a generic hidden-capture caller.
+    cache_native_mtp_active: bool,
     cache_replay_quiescent: Cell<bool>,
     cpu_deferred_experts: bool,
     /// Trunk layers armed for the D2 tier split (a distinct numerical mode:
@@ -11553,13 +11573,17 @@ struct RouteTrace {
     out: std::io::BufWriter<std::fs::File>,
 }
 
-/// One token's routed ids. The typed copy after each MoE is part of the
-/// retained tape; the one pinned readback and wait stay outside capture.
+/// Stable [layer][row][top-k] route storage. Singleton copies are part of the
+/// retained AR tape; native-MTP batches use the same copies eagerly and one
+/// whole-batch pinned readback/wait.
 struct ExpertCacheRoutes {
     device: GpuTensor,
     landing: hip_bridge::PinnedTransferBuffer,
     ids: Vec<i32>,
     topk: usize,
+    layers: usize,
+    max_rows: usize,
+    rows: usize,
 }
 
 // SAFETY: the landing buffer has one owner; every access requires &mut self,
@@ -11567,9 +11591,23 @@ struct ExpertCacheRoutes {
 unsafe impl Send for ExpertCacheRoutes {}
 
 impl ExpertCacheRoutes {
-    fn new(gpu: &mut Gpu, layers: usize, topk: usize) -> Result<Self, Qwen4GpuForwardError> {
+    fn new(
+        gpu: &mut Gpu,
+        layers: usize,
+        topk: usize,
+        max_rows: usize,
+    ) -> Result<Self, Qwen4GpuForwardError> {
+        if layers == 0
+            || topk == 0
+            || topk > 512
+            || !(1..=hipfire_dispatch::families::moe::MutableExpertResidency::MAX_VERIFY_ROWS)
+                .contains(&max_rows)
+        {
+            return Err(invalid("invalid bounded cache route shape"));
+        }
         let slots = layers
             .checked_mul(topk)
+            .and_then(|x| x.checked_mul(max_rows))
             .ok_or_else(|| invalid("cache route extent overflows"))?;
         let bytes = slots
             .checked_mul(4)
@@ -11581,30 +11619,63 @@ impl ExpertCacheRoutes {
             landing,
             ids: vec![-1; slots],
             topk,
+            layers,
+            max_rows,
+            rows: 0,
         })
     }
 
-    fn reset(&mut self, gpu: &Gpu) -> Result<(), Qwen4GpuForwardError> {
+    fn reset(&mut self, gpu: &Gpu, rows: usize) -> Result<(), Qwen4GpuForwardError> {
+        if rows == 0 || rows > self.max_rows {
+            return Err(invalid("cache route rows exceed resolved capacity"));
+        }
+        self.rows = rows;
         gpu.hip.memset_d32_async(
             &self.device.buf,
             -1,
-            self.ids.len(),
+            self.layers * self.rows * self.topk,
             gpu.active_stream.as_ref(),
         )?;
         Ok(())
     }
 
+    fn capture_layer(
+        &self,
+        gpu: &mut Gpu,
+        layer: usize,
+        source: &GpuTensor,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        if self.rows == 0 || layer >= self.layers {
+            return Err(invalid("cache route capture outside active batch"));
+        }
+        let slots = self.rows * self.topk;
+        let bytes = slots
+            .checked_mul(4)
+            .ok_or_else(|| invalid("cache route byte extent overflow"))?;
+        if source.buf.size() < bytes {
+            return Err(invalid("cache route source is too small"));
+        }
+        // IDs are opaque i32 bits, including denorm-shaped F32 words.
+        let mut ids = foreign_packed_source(source.buf.as_ptr() as usize, bytes, DType::F32);
+        ids.shape[0] = slots;
+        gpu.copy_f32_buffer(&self.device.sub_offset(layer * slots, slots), &ids, slots)?;
+        Ok(())
+    }
+
     fn collect(&mut self, gpu: &Gpu) -> Result<&[i32], Qwen4GpuForwardError> {
+        if self.rows == 0 {
+            return Err(invalid("cache route readback has no active batch"));
+        }
+        let slots = self.layers * self.rows * self.topk;
         self.landing.download_async(
             &gpu.hip,
             &self.device.buf,
             0,
-            self.ids.len() * 4,
+            slots * 4,
             gpu.active_stream.as_ref(),
         )?;
         self.landing.complete(&gpu.hip)?;
-        for (id, bytes) in self
-            .ids
+        for (id, bytes) in self.ids[..slots]
             .iter_mut()
             .zip(self.landing.as_bytes_mut().chunks_exact(4))
         {
@@ -11615,7 +11686,7 @@ impl ExpertCacheRoutes {
                 ));
             }
         }
-        Ok(&self.ids)
+        Ok(&self.ids[..slots])
     }
 }
 
@@ -13679,6 +13750,7 @@ impl Qwen4GpuForward {
             cache_routes: None,
             cache_active: false,
             cache_host_prefill_active: false,
+            cache_native_mtp_active: false,
             cache_replay_quiescent: Cell::new(true),
             borrow_class_rows,
             borrow_runtimes_active: false,
@@ -14825,7 +14897,12 @@ impl Qwen4GpuForward {
             })
         });
         let routes = built.and_then(|()| {
-            ExpertCacheRoutes::new(gpu, config.num_hidden_layers, config.num_experts_per_tok)
+            ExpertCacheRoutes::new(
+                gpu,
+                config.num_hidden_layers,
+                config.num_experts_per_tok,
+                policy.verify_rows,
+            )
         });
         let routes = match routes {
             Ok(routes) => routes,
@@ -14841,7 +14918,7 @@ impl Qwen4GpuForward {
         self.moe_cache_prefill = prefill_runtimes;
         self.cache_routes = Some(routes);
         self.expert_cache = Some(cache);
-        eprintln!("  qwen4 exact expert cache: decode-only, tail={}%, max-inflight={}, routed ids unchanged", policy.tail_percent, policy.max_inflight);
+        eprintln!("  qwen4 exact expert cache: AR, verify capacity={} rows, tail={}%, max-inflight={}, routed ids unchanged", policy.verify_rows, policy.tail_percent, policy.max_inflight);
         eprintln!("  qwen4 exact expert cache: dirty prompt tiles below {} rows read immutable core/host tables", self.cache_prefill_stage_min_rows(gpu));
         Ok(())
     }
@@ -14885,6 +14962,49 @@ impl Qwen4GpuForward {
             || qwen4_expert_stage_min_rows(gpu, self.scratch.max_chunk).0,
             |stage| stage.min_rows,
         )
+    }
+
+    pub(crate) fn expert_cache_verify_rows(&self) -> Option<usize> {
+        self.expert_cache.as_ref().map(|cache| cache.verify_rows())
+    }
+
+    /// The only cache entry that permits wide hidden capture and multiple
+    /// rows. It retains the original batched HIP program and row-ring state;
+    /// the existing retained-AR eligibility still excludes hidden capture.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_native_mtp_verify(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        logits: &GpuTensor,
+        top1: Option<&GpuTensor>,
+        wide_hidden: &GpuTensor,
+        output_rows: Qwen4OutputRows,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        if self.prefill_scope
+            || bundle.mtp.is_none()
+            || bundle.dflash.is_some()
+            || self
+                .expert_cache_verify_rows()
+                .is_none_or(|cap| tokens.is_empty() || tokens.len() > cap)
+        {
+            return Err(invalid(
+                "native MTP cache verify lacks its admitted owner/row scope",
+            ));
+        }
+        let prior = std::mem::replace(&mut self.cache_native_mtp_active, true);
+        let result = self.forward_chunk(
+            bundle,
+            gpu,
+            tokens,
+            logits,
+            top1,
+            Some(wide_hidden),
+            output_rows,
+        );
+        self.cache_native_mtp_active = prior;
+        result
     }
 
     pub(crate) fn tile_moe(&self) -> &[Option<Qwen4MoeLayerRuntime>] {
@@ -16124,6 +16244,9 @@ impl Qwen4GpuForward {
             && bundle.pp.is_none()
             && bundle.pp_band.is_none()
             && !hipfire_dispatch::pipeline::qsa_projection_hook_installed();
+        let rows = self
+            .expert_cache_verify_rows()
+            .map_or(rows, |cap| rows.min(cap));
         qwen4_scoped_verify_rows(rows, eligible_single_fn, self.native_mtp_cpu_window_rows())
     }
 
@@ -16656,22 +16779,35 @@ impl Qwen4GpuForward {
             self.cache_host_prefill_active = prior;
             return result;
         }
-        if tokens.len() != 1
+        let rows = tokens.len();
+        let native_verify = self.cache_native_mtp_active;
+        if rows == 0
+            || rows
+                > self
+                    .expert_cache
+                    .as_ref()
+                    .expect("cache present")
+                    .verify_rows()
+            || (rows != 1 && !native_verify)
             || self.qsa_tap.is_some()
             || self.layer_capture.is_some()
             || self.lane_scope
             || self.mesh_segment.is_some()
-            || wide_hidden_capture.is_some()
+            || (wide_hidden_capture.is_some() != native_verify)
             || gpu.graphs.capture_mode
         {
-            return Err(invalid("exact expert cache serves singleton AR decode; prompt entries use the canonical prefill scope"));
+            return Err(invalid(
+                "exact expert cache requires singleton AR or its bounded native-MTP verify scope",
+            ));
         }
+        let cache = self.expert_cache.as_mut().expect("cache present");
         let mut token = Some(
-            self.expert_cache
-                .as_mut()
-                .expect("cache present")
-                .begin_token(gpu)
-                .map_err(invalid)?,
+            if rows == 1 {
+                cache.begin_token(gpu)
+            } else {
+                cache.begin_rows(gpu, rows)
+            }
+            .map_err(invalid)?,
         );
         // No independent retained queue has submitted yet. Checked replay updates
         // this proof around submission; HIP synchronization alone cannot prove PM4.
@@ -16684,7 +16820,7 @@ impl Qwen4GpuForward {
             self.cache_routes
                 .as_mut()
                 .expect("cache route storage")
-                .reset(gpu)?;
+                .reset(gpu, rows)?;
             self.cache_active = true;
             let forwarded = self.forward_chunk_tile(
                 bundle,
@@ -16707,24 +16843,35 @@ impl Qwen4GpuForward {
             // SAFETY: successful retained replay waited for its queue, and collect
             // retired the HIP readback. The manager retires the bank window too.
             unsafe {
-                self.expert_cache
-                    .as_mut()
-                    .expect("cache present")
-                    .finish_token(gpu, token.take().expect("active cache token"), &ids)
-                    .map_err(invalid)?;
+                let cache = self.expert_cache.as_mut().expect("cache present");
+                let token = token.take().expect("active cache token");
+                if rows == 1 {
+                    cache.finish_token(gpu, token, &ids)
+                } else {
+                    cache.finish_rows(gpu, token, rows, &ids)
+                }
+                .map_err(invalid)?;
             }
             if let Some(trace) = self.route_trace.as_mut() {
                 use std::io::Write;
-                let mut line = position.to_string();
-                for id in &ids {
-                    line.push(' ');
-                    line.push_str(&id.to_string());
+                for row in 0..rows {
+                    let mut line = (position + row).to_string();
+                    for layer in 0..self.moe_cache.len() {
+                        let offset = (layer * rows + row) * 10;
+                        for id in &ids[offset..offset + 10] {
+                            line.push(' ');
+                            line.push_str(&id.to_string());
+                        }
+                    }
+                    line.push('\n');
+                    trace
+                        .out
+                        .write_all(line.as_bytes())
+                        .map_err(|error| invalid(format!("{ROUTE_TRACE_ENV}: {error}")))?;
                 }
-                line.push('\n');
                 trace
                     .out
-                    .write_all(line.as_bytes())
-                    .and_then(|()| trace.out.flush())
+                    .flush()
                     .map_err(|error| invalid(format!("{ROUTE_TRACE_ENV}: {error}")))?;
             }
             Ok(())
@@ -18480,7 +18627,6 @@ impl Qwen4GpuForward {
                     match (ple_split, trace) {
                         (split, _) if cache_routes.is_some() => {
                             let routes = cache_routes.expect("cache route collector");
-                            let k = routes.topk;
                             let mut start = 0usize;
                             let mut layer = 0usize;
                             for index in 0..steps.len() {
@@ -18492,25 +18638,14 @@ impl Qwen4GpuForward {
                                 if matches!(steps[index], Step::Moe(_)) {
                                     execute(gpu, &steps[start..=index])?;
                                     start = index + 1;
-                                    if (layer + 1) * k > routes.ids.len() {
+                                    if layer >= routes.layers {
                                         return Err(invalid("exact-cache collector has too many MoE layers"));
                                     }
-                                    // The typed copy preserves opaque ID bits
-                                    // and is recorded in the retained tape.
-                                    let bytes = k.checked_mul(4).ok_or_else(|| invalid("cache route byte extent overflow"))?;
-                                    if self.scratch.moe_topk_indices.buf.size() < bytes {
-                                        return Err(invalid("cache route source is too small"));
-                                    }
-                                    let mut ids = foreign_packed_source(
-                                        self.scratch.moe_topk_indices.buf.as_ptr() as usize,
-                                        bytes, DType::F32,
-                                    );
-                                    ids.shape[0] = k;
-                                    gpu.copy_f32_buffer(&routes.device.sub_offset(layer * k, k), &ids, k)?;
+                                    routes.capture_layer(gpu, layer, &self.scratch.moe_topk_indices)?;
                                     layer += 1;
                                 }
                             }
-                            if layer * k != routes.ids.len() {
+                            if layer != routes.layers {
                                 return Err(invalid("exact-cache collector is missing a MoE layer"));
                             }
                             if start < steps.len() { execute(gpu, &steps[start..])?; }

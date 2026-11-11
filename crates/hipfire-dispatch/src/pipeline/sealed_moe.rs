@@ -3795,6 +3795,9 @@ fn validate_decode(
             params.batch_size
         )));
     }
+    if let Some(residency) = params.routed_experts.mutable_residency() {
+        residency.validate_active_rows(1).map_err(invalid)?;
+    }
     if params.hidden == 0 || params.mi == 0 {
         return Err(invalid("decode dimensions must be nonzero"));
     }
@@ -3937,16 +3940,60 @@ fn validate_decode(
     Ok(())
 }
 
+fn validate_mutable_verify(
+    ctx: &DispatchCtx,
+    params: &MoePrefillParams<'_>,
+) -> Result<(), DispatchError> {
+    let Some(residency) = params.routed_experts.mutable_residency() else {
+        return Ok(());
+    };
+    if ctx.arch.arch() != "gfx1201"
+        || !(2..=MutableExpertResidency::MAX_VERIFY_ROWS).contains(&params.batch_size)
+        || ctx.batch_size != params.batch_size
+    {
+        return Err(invalid(
+            "mutable residency requires exact gfx1201 bounded verify rows and matching context",
+        ));
+    }
+    if params.cpu_deferred_experts
+        || params.routed_experts.cpu_split().is_some()
+        || !matches!(params.prelude.route, PrefillRouteMode::Replicated)
+        || params.ep_row_gather.is_some()
+        || params.ep_tile_exchange.is_some()
+        || params.routed_out.is_some()
+        || params.shared_down_out.is_some()
+        || params.expert_stage_ptrs.is_some()
+    {
+        return Err(invalid(
+            "mutable verify refuses CPU splice/split, EP and staging overrides",
+        ));
+    }
+    if params.dtypes.routed_gate_up != DType::MQ4G256V2
+        || params.dtypes.routed_down != DType::MQ4G128V2
+        || params.dtypes.routed_has_mixed_experts
+        || params.expert_down_awq_ptrs.is_some()
+        || params.expert_dtype_tags.is_some()
+        || params.down_awq_scale.is_some()
+        || !params
+            .route_policy
+            .as_ref()
+            .is_some_and(|policy| matches!(policy.capability, MoeRouteCapability::Qt44Qt53Grouped))
+    {
+        return Err(invalid(
+            "mutable verify requires the qualified QT44/QT53 route without AWQ/tags",
+        ));
+    }
+    residency
+        .validate_active_rows(params.batch_size)
+        .map_err(invalid)
+}
+
 fn validate_prefill(
-    _ctx: &DispatchCtx,
+    ctx: &DispatchCtx,
     experts: &BoundMoeExperts<'_>,
     params: &MoePrefillParams<'_>,
 ) -> Result<(), DispatchError> {
-    if params.routed_experts.mutable_residency().is_some() {
-        return Err(invalid(
-            "mutable residency is decode-only; prefill requires frozen resources",
-        ));
-    }
+    validate_mutable_verify(ctx, params)?;
     if params.batch_size == 0 {
         return Err(invalid("grouped prefill batch_size is zero"));
     }
@@ -4052,7 +4099,7 @@ fn validate_prefill(
         params.expert_down_ptrs,
         params.expert_down_awq_ptrs,
         params.expert_dtype_tags,
-        None,
+        params.routed_experts.mutable_pointer_entries(),
     )?;
     validate_dtype_tag_table(
         params.expert_dtype_tags,
@@ -5053,6 +5100,10 @@ pub fn validate_retained_moe_binding(
     dtype_tags: Option<&GpuTensor>,
     host_entries: Option<MoePointerEntries<'_>>,
 ) -> Result<(), DispatchError> {
+    if let Some(residency) = routed_experts.mutable_residency() {
+        // The retained body is the qualified singleton decode body only.
+        residency.validate_active_rows(1).map_err(invalid)?;
+    }
     validate_live_binding(
         experts,
         Some(routed_experts),
@@ -6006,7 +6057,7 @@ mod tests {
             None,
         );
         let error = validate_prefill(&ctx, &bound, &params).unwrap_err();
-        assert!(format!("{error:?}").contains("decode-only"), "{error:?}");
+        assert!(format!("{error:?}").contains("bounded verify rows"), "{error:?}");
     }
 
     #[test]

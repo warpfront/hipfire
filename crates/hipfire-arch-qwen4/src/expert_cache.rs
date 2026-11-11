@@ -1,4 +1,4 @@
-//! Decode-only exact LRU of immutable Flash-Next expert payloads.
+//! Exact LRU of immutable Flash-Next expert payloads for AR and bounded verify.
 //!
 //! A token uses the tables acquired at its start. Misses execute from immutable
 //! mapped host backing; asynchronous copies serve later tokens. Dirty short
@@ -50,12 +50,16 @@ pub(crate) struct ExpertCacheToken {
     guards: Vec<ResidencyTokenGuard>,
     outstanding: Arc<AtomicBool>,
     reader: Option<WindowReadLease<'static>>,
+    rows: usize,
 }
 /// Cumulative logical byte counters and host-observed wall durations. Timings
 /// cover these manager methods, not the caller's route readback or GPU step.
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub(crate) struct ExpertCacheStats {
+    /// Executed target rows, including speculative/replayed rows, not emitted tokens.
     pub tokens: u64,
+    pub verify_batches: u64,
+    pub max_guard_rows: usize,
     pub selected: u64,
     pub core_hits: u64,
     pub cache_hits: u64,
@@ -118,6 +122,7 @@ pub(crate) struct ExpertCache {
     pending: VecDeque<PendingFill>,
     events: CopyEvents,
     max_inflight: usize,
+    verify_rows: usize,
     warm_order: Vec<Vec<usize>>,
     needs_seed: bool,
     dirty: bool,
@@ -228,6 +233,39 @@ fn account_routes(
         }
     }
     Ok(())
+}
+
+/// Validate the entire readback before accounting or cache policy can change.
+/// Expert IDs may repeat between rows, but never within one router's top-k.
+fn validate_routes(rows: usize, ids: &[i32]) -> Result<()> {
+    if !(1..=MutableExpertResidency::MAX_VERIFY_ROWS).contains(&rows)
+        || ids.len() != LAYERS * rows * TOPK
+    {
+        return Err("expert cache route readback shape mismatch".into());
+    }
+    for selected in ids.chunks_exact(TOPK) {
+        let mut seen = [false; EXPERTS];
+        for &id in selected {
+            let expert =
+                usize::try_from(id).map_err(|_| "expert cache negative selected expert")?;
+            if expert >= EXPERTS || std::mem::replace(&mut seen[expert], true) {
+                return Err("expert cache invalid/duplicate selected expert".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn touch_unique(order: &mut Vec<usize>, expert: usize) {
+    if let Some(index) = order.iter().position(|&id| id == expert) {
+        order.remove(index);
+    }
+    order.push(expert);
+}
+
+struct LayerVisits {
+    misses: Vec<usize>,
+    accesses: Vec<usize>,
 }
 
 /// The sole slot/fill-generation authority. Policy metadata selects a slot,
@@ -379,6 +417,41 @@ impl CacheBank {
     fn touch(&mut self, slot: usize) {
         self.clock = self.clock.saturating_add(1);
         self.last_used[slot] = self.clock;
+    }
+    /// Visit every executed row before choosing any victim. Repeated misses
+    /// request one fill; repeated reads still retain their last visit order.
+    fn visit_routes(
+        &mut self,
+        ids: &[i32],
+        host: &[Option<HostPair>],
+        index: &[Option<usize>],
+    ) -> LayerVisits {
+        let mut visits = LayerVisits {
+            misses: Vec::new(),
+            accesses: Vec::new(),
+        };
+        for &id in ids {
+            let expert = id as usize;
+            if host[expert].is_none() {
+                continue;
+            }
+            touch_unique(&mut visits.accesses, expert);
+            if let Some(slot) = index[expert] {
+                self.touch(slot);
+            } else {
+                touch_unique(&mut visits.misses, expert);
+            }
+        }
+        visits
+    }
+    /// Reservations may evict a key visited earlier in this batch. Only the
+    /// current index may affect recency; an old snapshot never revives a key.
+    fn touch_survivors(&mut self, accesses: &[usize], index: &[Option<usize>]) {
+        for &expert in accesses {
+            if let Some(slot) = index[expert] {
+                self.touch(slot);
+            }
+        }
     }
     fn choose(&self, slots: &[usize]) -> Option<usize> {
         slots
@@ -664,8 +737,13 @@ impl ExpertCache {
         config: ExpertCacheConfig,
         rank: &[u32],
     ) -> Result<Self> {
-        if gpu.arch != "gfx1201" || config.max_inflight == 0 {
-            return Err("expert cache requires gfx1201 and a bounded nonzero queue".into());
+        if gpu.arch != "gfx1201"
+            || config.max_inflight == 0
+            || !(1..=MutableExpertResidency::MAX_VERIFY_ROWS).contains(&config.verify_rows)
+        {
+            return Err(
+                "expert cache requires gfx1201, bounded verify rows and a nonzero queue".into(),
+            );
         }
         gpu.bind_thread().map_err(|e| error("bind", e))?;
         let warm_order = warm_order(rank)?;
@@ -694,6 +772,7 @@ impl ExpertCache {
             pending: VecDeque::new(),
             events: CopyEvents::new(),
             max_inflight: config.max_inflight,
+            verify_rows: config.verify_rows,
             warm_order,
             needs_seed: true,
             dirty: false,
@@ -841,6 +920,9 @@ impl ExpertCache {
     pub(crate) fn stats(&self) -> ExpertCacheStats {
         self.stats
     }
+    pub(crate) fn verify_rows(&self) -> usize {
+        self.verify_rows
+    }
     pub(crate) fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -896,8 +978,14 @@ impl ExpertCache {
         gpu.bind_thread().map_err(|e| error("bind", e))
     }
     pub(crate) fn begin_token(&mut self, gpu: &mut Gpu) -> Result<ExpertCacheToken> {
+        self.begin_rows(gpu, 1)
+    }
+    pub(crate) fn begin_rows(&mut self, gpu: &mut Gpu, rows: usize) -> Result<ExpertCacheToken> {
+        if rows == 0 || rows > self.verify_rows {
+            return Err("expert cache verify exceeds resolved row capacity".into());
+        }
         let started = Instant::now();
-        let result = self.begin_token_inner(gpu);
+        let result = self.begin_token_inner(gpu, rows);
         self.stats.begin_token_wall_ns = self
             .stats
             .begin_token_wall_ns
@@ -905,7 +993,7 @@ impl ExpertCache {
         result
     }
 
-    fn begin_token_inner(&mut self, gpu: &mut Gpu) -> Result<ExpertCacheToken> {
+    fn begin_token_inner(&mut self, gpu: &mut Gpu, rows: usize) -> Result<ExpertCacheToken> {
         self.check(gpu)?;
         let result = (|| {
             if self.needs_seed {
@@ -915,9 +1003,13 @@ impl ExpertCache {
             let mut guards = Vec::with_capacity(LAYERS);
             for layer in &self.layers {
                 let cap = &layer.binding.residency;
-                let acquired = cap
-                    .snapshot()
-                    .and_then(|snapshot| cap.begin_token(snapshot.epoch));
+                let acquired = cap.snapshot().and_then(|snapshot| {
+                    if rows == 1 {
+                        cap.begin_token(snapshot.epoch)
+                    } else {
+                        cap.begin_verify(snapshot.epoch, rows)
+                    }
+                });
                 match acquired {
                     Ok(guard) => guards.push(guard),
                     Err(error) => {
@@ -944,6 +1036,7 @@ impl ExpertCache {
                 guards,
                 reader: Some(reader),
                 outstanding: self.outstanding.clone(),
+                rows,
             })
         })();
         if let Err(reason) = &result {
@@ -996,15 +1089,31 @@ impl ExpertCache {
         token: ExpertCacheToken,
         ids: &[i32],
     ) -> Result<()> {
+        // SAFETY: forwarded; the wrapper retains the singleton AR contract.
+        unsafe { self.finish_rows(gpu, token, 1, ids) }
+    }
+
+    /// # Safety
+    /// Every row's independent PM4 reader is proven retired. IDs are the complete
+    /// [layer][row][top-k] readback under this one stable-table reader.
+    pub(crate) unsafe fn finish_rows(
+        &mut self,
+        gpu: &mut Gpu,
+        token: ExpertCacheToken,
+        rows: usize,
+        ids: &[i32],
+    ) -> Result<()> {
         let started = Instant::now();
+        let valid = if rows != token.rows || rows == 0 || rows > self.verify_rows {
+            Err("expert cache completion rows differ from acquired reader".into())
+        } else {
+            validate_routes(rows, ids)
+        };
         let snapshots: Vec<_> = token.guards.iter().map(|g| g.snapshot().clone()).collect();
         // SAFETY: forwarded from this function's caller; HIP work is fenced in cancellation.
         let result = unsafe { self.cancel_after_gpu_wait(gpu, token) }.and_then(|()| {
-            if ids.len() != LAYERS * TOPK || ids.iter().any(|id| !(0..EXPERTS as i32).contains(id))
-            {
-                return Err("expert cache invalid route readback".into());
-            }
-            self.observe_and_fill(gpu, ids, &snapshots)
+            valid?;
+            self.observe_and_fill(gpu, rows, ids, &snapshots)
         });
         self.stats.finish_token_wall_ns = self
             .stats
@@ -1022,30 +1131,28 @@ impl ExpertCache {
     fn observe_and_fill(
         &mut self,
         gpu: &Gpu,
+        rows: usize,
         ids: &[i32],
         snapshots: &[ResidencySnapshot],
     ) -> Result<()> {
-        self.stats.tokens = self.stats.tokens.saturating_add(1);
+        self.stats.tokens = self.stats.tokens.saturating_add(rows as u64);
+        self.stats.max_guard_rows = self.stats.max_guard_rows.max(rows);
+        if rows > 1 {
+            self.stats.verify_batches = self.stats.verify_batches.saturating_add(1);
+        }
         let bank = self.bank.as_mut().expect("live bank");
         let mut misses = vec![Vec::new(); LAYERS];
+        let mut accesses = vec![Vec::new(); LAYERS];
         for layer in 0..LAYERS {
-            let selected = &ids[layer * TOPK..(layer + 1) * TOPK];
-            account_routes(
-                &mut self.stats,
-                selected,
-                &self.layers[layer].host,
-                &snapshots[layer].mapping,
-            )?;
-            for &expert in selected {
-                let expert = expert as usize;
-                if self.layers[layer].host[expert].is_none() {
-                    continue;
-                }
-                if let Some(slot) = self.layers[layer].index[expert] {
-                    bank.touch(slot);
-                } else if !self.layers[layer].slot_ids.is_empty() {
-                    misses[layer].push(expert);
-                }
+            let selected = &ids[layer * rows * TOPK..(layer + 1) * rows * TOPK];
+            let state = &self.layers[layer];
+            for row in selected.chunks_exact(TOPK) {
+                account_routes(&mut self.stats, row, &state.host, &snapshots[layer].mapping)?;
+            }
+            let visits = bank.visit_routes(selected, &state.host, &state.index);
+            accesses[layer] = visits.accesses;
+            if !state.slot_ids.is_empty() {
+                misses[layer] = visits.misses;
             }
         }
         bank.retire_idle()?;
@@ -1085,6 +1192,11 @@ impl ExpertCache {
             last_served = Some(layer);
         }
         self.next_layer = (last_served.unwrap_or(self.next_layer) + 1) % LAYERS;
+        if rows > 1 {
+            for (layer, visits) in accesses.iter().enumerate() {
+                bank.touch_survivors(visits, &self.layers[layer].index);
+            }
+        }
         for layer in 0..LAYERS {
             if changed[layer] {
                 self.publish(gpu, layer, std::mem::take(&mut mappings[layer]), Vec::new())?;
@@ -1644,6 +1756,7 @@ mod tests {
                     guards: Vec::new(),
                     reader: Some(reader),
                     outstanding: outstanding.clone(),
+                    rows: 1,
                 });
                 assert!(outstanding.load(Ordering::Acquire));
             } else {

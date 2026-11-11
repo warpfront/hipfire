@@ -1533,6 +1533,13 @@ pub trait RoutedExpertWeights {
         None
     }
 
+    /// Architecture-maintained mirrors of the actual published device tables.
+    /// Bounded mutable verify validates these independently of the authority's
+    /// own snapshot. Frozen callers keep the original default contract.
+    fn mutable_pointer_entries(&self) -> Option<MoePointerEntries<'_>> {
+        None
+    }
+
     /// Whether the routed experts live in host-mapped memory. Expert views are
     /// borrowed byte views, so the owner's placement must be carried here; a
     /// layer's experts share one residency. `false` by default; an explicit

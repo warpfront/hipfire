@@ -5,6 +5,9 @@ use rdna_compute::railgun_check::CheckMode;
 pub const EXPERT_CACHE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_CACHE";
 pub const EXPERT_CACHE_TAIL_PERCENT_ENV: &str = "HIPFIRE_QWEN4_EXPERT_CACHE_TAIL_PERCENT";
 pub const EXPERT_CACHE_INFLIGHT_ENV: &str = "HIPFIRE_QWEN4_EXPERT_CACHE_INFLIGHT";
+/// The cache's allocation and typed mutable-read capability share one row bound.
+pub const EXPERT_CACHE_MAX_VERIFY_ROWS: usize =
+    hipfire_dispatch::families::moe::MutableExpertResidency::MAX_VERIFY_ROWS;
 
 const IMMUTABLE_WEIGHTS_CHECK_REASON: &str =
     "is incompatible with HIPFIRE_RAILGUN_CHECK=always: physical donor-slot payloads are mutable, but the check compares a fixed Weights digest baseline";
@@ -36,6 +39,12 @@ fn admit_railgun_check(cache_enabled: bool, always: bool) -> Result<(), String> 
 pub struct ExpertCacheConfig {
     pub tail_percent: u32,
     pub max_inflight: usize,
+    /// Resolved per-load window capacity, including the native MTP seed row.
+    /// This is not an environment override: the loader derives it from the same
+    /// proposal bound as the GDN row ring before placement or materialization.
+    /// A later auto-only decline keeps this conservative admitted allocation;
+    /// it does not re-plan expert placement or resize runtime route storage.
+    pub verify_rows: usize,
 }
 
 /// The immutable ranked load decision, used only to seed cache recency.
@@ -92,7 +101,19 @@ impl ExpertCacheConfig {
         Ok(enabled.then_some(Self {
             tail_percent,
             max_inflight,
+            verify_rows: 1,
         }))
+    }
+
+    pub fn with_verify_rows(mut self, rows: usize) -> Result<Self, String> {
+        if !(1..=EXPERT_CACHE_MAX_VERIFY_ROWS).contains(&rows) {
+            return Err(format!(
+                "exact expert cache native MTP window requires {rows} rows; supported capacity is \
+                 1..={EXPERT_CACHE_MAX_VERIFY_ROWS}; reduce the native MTP proposal bound"
+            ));
+        }
+        self.verify_rows = rows;
+        Ok(self)
     }
 
     pub fn tail_bytes(self, resident_owner_bytes: u64) -> Result<u64, String> {
@@ -114,12 +135,14 @@ impl ExpertCacheConfig {
         experts: usize,
         topk: usize,
     ) -> Result<u64, String> {
+        self.with_verify_rows(self.verify_rows)?;
         let tables = layers
             .checked_mul(experts)
             .and_then(|x| x.checked_mul(16))
             .ok_or("expert-cache table budget overflows")?;
         let routes = layers
             .checked_mul(topk)
+            .and_then(|x| x.checked_mul(self.verify_rows))
             .and_then(|x| x.checked_mul(4))
             .ok_or("expert-cache route budget overflows")?;
         u64::try_from(tables)

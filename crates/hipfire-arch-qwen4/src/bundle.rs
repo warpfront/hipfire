@@ -1006,6 +1006,9 @@ impl Qwen4Bundle {
         config: crate::expert_cache_config::ExpertCacheConfig,
         warm_rank: Vec<u32>,
     ) -> Result<(), BundleError> {
+        config
+            .with_verify_rows(config.verify_rows)
+            .map_err(BundleError::Forward)?;
         if self.execution.is_some()
             || self.expert_cache.is_some()
             || self.mtp.is_some()

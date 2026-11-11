@@ -15250,6 +15250,7 @@ mod qwen4_admission_tests {
         let cache = ExpertCacheConfig {
             tail_percent: 50,
             max_inflight: 64,
+            verify_rows: 1,
         };
         let run = |total, cache, share| {
             super::qwen4_plan_hotset_placement_with_cache(
