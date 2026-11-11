@@ -6289,7 +6289,7 @@ mod tests {
                         .map(|spec| (spec.elements * spec.dtype.size()) as u64)
                         .collect()
                 };
-                let mut expected = part(&[".recurrent", ".conv"]);
+                let mut expected = part(&[".recurrent", ".ef_residual", ".conv"]);
                 expected.extend(part(&[".selected_indices"]));
                 expected.extend(part(&["ple_conv"]));
                 expected.extend(part(&["hyper_feedback"]));
