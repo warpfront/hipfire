@@ -1115,6 +1115,11 @@ pub trait Speculator {
         Vec::new()
     }
 
+    /// The request's user-turn boundary (`prompt_frame::user_turn_resume_boundary`),
+    /// `None` when its prompt is not user-terminated. Set before the prompt
+    /// prefill; a speculator with a checkpoint ring snapshots there. Default: ignored.
+    fn set_turn_boundary(&mut self, _boundary: Option<usize>) {}
+
     /// Whether the drafter can continue a target restored or continued live
     /// at `start` of `prompt` (a prompt-cache hit). Default `true`. The Qwen4
     /// session planner prefills cold when it cannot.
@@ -1473,6 +1478,12 @@ pub trait MtpDrafter {
         Vec::new()
     }
 
+    /// The request's user-turn boundary (`prompt_frame::user_turn_resume_boundary`),
+    /// `None` when its prompt is not user-terminated. A drafter with a checkpoint
+    /// ring snapshots its target there during the prompt prefill and keeps that
+    /// snapshot through the following tool-result requests. Default: ignored.
+    fn mtp_set_turn_boundary(&mut self, _boundary: Option<usize>) {}
+
     /// Restore the MTP target's recurrent state to an advertised checkpoint
     /// and discard checkpoints from the now-stale future.
     fn mtp_rewind_to(
@@ -1708,6 +1719,10 @@ impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
 
     fn checkpoint_prefix_hashes(&self) -> Vec<(usize, u64)> {
         self.arch.mtp_checkpoint_prefix_hashes()
+    }
+
+    fn set_turn_boundary(&mut self, boundary: Option<usize>) {
+        self.arch.mtp_set_turn_boundary(boundary);
     }
 
     fn rewind_to(

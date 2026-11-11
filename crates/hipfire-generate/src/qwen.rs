@@ -3787,6 +3787,21 @@ pub fn generate_dflash(
         Some(p) => p.rendered.clone(),
         None => prompt_tokens,
     };
+    // The next user turn's re-render diverges right after this prompt's assistant
+    // opener when the prompt is user-terminated: tell the speculator so its prefill
+    // snapshots the recurrent state there (and keeps it through tool-result turns).
+    if !is_qwen4 {
+        let turn_boundary = m.tokenizer.as_ref().and_then(|tok| {
+            hipfire_runtime::prompt_frame::user_turn_resume_boundary(
+                tok,
+                messages_history,
+                &prompt_tokens,
+            )
+        });
+        if let Some(spec) = m.speculator.as_mut() {
+            spec.set_turn_boundary(turn_boundary);
+        }
+    }
     let (mut prefill_tokens, mut prefill_start, mut cache_hit, mut cached_tokens_dflash): (
         Vec<u32>,
         usize,
@@ -6353,11 +6368,24 @@ pub fn generate_multi(
     // Borrow `tokenizer` per-use (never held across whole-`m` calls): the
     // pre-prefill resets below reborrow `m` through the canonical reset.
     let prompt_est = m.tokenizer.as_ref().unwrap().encode(prompt).len() + 20;
-    if m.seq_pos
-        .saturating_add(prompt_est)
-        .saturating_add(max_tokens)
-        > m.max_seq
-    {
+    // A full render (history through the chat template) cold-resets below anyway
+    // and re-occupies the same positions, so a reset here could never create room.
+    let full_render = crate::ar::full_render_path(
+        messages_history.is_some(),
+        m.chat_template.is_some(),
+        hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0"),
+    );
+    if crate::ar::context_full_resets(
+        true,
+        full_render,
+        m.seq_pos,
+        prompt_est,
+        max_tokens,
+        m.max_seq,
+    ) {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq

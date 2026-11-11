@@ -972,6 +972,16 @@ A -> B` line, and lowers the published context (and `card_cap`) to it; below 512
 the load is refused. An explicit `max_seq` that does not fit is refused at load,
 naming the largest fitting value; with `memory.oom_guard` off it loads and only
 warns.
+A user-terminated prompt (its render ends in a generation prompt) also snapshots the
+DeltaNet state at the newest prefill chunk end at or before its
+`<|im_start|>assistant\n` opener (the start of the chunk that holds it), in the same
+ring and regardless of the `HIPFIRE_CACHE_CKPT_INTERVAL` stride, and the ring never
+recycles the newest such snapshot. The chunk plan is not changed for it, so the
+prefill's output is unchanged. Qwen3.5-style
+templates drop the reasoning of every assistant turn before the latest user message,
+so the next user turn's re-render diverges from the stored stream at that opener; the
+turn resumes from that snapshot after any number of tool rounds instead of
+cold-prefilling the whole conversation, replaying at most one outer prefill chunk.
 Larger prefill PBS allocations are lazy: each request chooses, once per prompt,
 the widest rung that fits currently free VRAM after mapped (not virtually
 reserved) KV minus the KV the same prompt will still map (the AR, vision,

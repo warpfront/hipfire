@@ -13074,6 +13074,28 @@ pub fn take_dn_checkpoint(
     cap: usize,
     prefix: (&[u32], &[u32]),
 ) {
+    take_dn_checkpoint_pinned(cks, dn, kv, gpu, pos, interval, cap, None, prefix);
+}
+
+/// [`take_dn_checkpoint`] that never recycles the entry at `pin` when the ring
+/// is full: the oldest *other* entry goes instead (the ring stays ascending).
+/// The pin is the position the next user turn's re-render diverges at (see
+/// `prompt_frame::user_turn_resume_boundary`); the stride checkpoints taken
+/// while a long tool chain extends the conversation must not push it out
+/// before that turn arrives. If every resident entry is the pin, a non-pin
+/// snapshot is skipped rather than evicting it.
+#[allow(clippy::too_many_arguments)]
+pub fn take_dn_checkpoint_pinned(
+    cks: &mut Vec<(usize, DeltaNetSnapshot)>,
+    dn: &DeltaNetState,
+    kv: &KvCache,
+    gpu: &mut Gpu,
+    pos: usize,
+    interval: usize,
+    cap: usize,
+    pin: Option<usize>,
+    prefix: (&[u32], &[u32]),
+) {
     if pos == 0 || cap == 0 {
         return;
     }
@@ -13088,7 +13110,10 @@ pub fn take_dn_checkpoint(
     let recycle =
         cks.len() >= cap || (!cks.is_empty() && !checkpoint_fits_admitted_context(gpu, kv, dn));
     let mut snap = if recycle {
-        cks.remove(0).1
+        let Some(victim) = ring_recycle_victim(cks.iter().map(|(p, _)| *p), pin) else {
+            return;
+        };
+        cks.remove(victim).1
     } else {
         match DeltaNetSnapshot::new_for(gpu, dn) {
             Ok(s) => s,
@@ -13097,10 +13122,17 @@ pub fn take_dn_checkpoint(
                     // Memory pressure the fit gate did not predict: slide the
                     // ring forward on its oldest buffers instead of freezing it
                     // at the last position that did fit.
+                    // The pinned user-turn boundary is never the one recycled.
+                    let Some(victim) = ring_recycle_victim(cks.iter().map(|(p, _)| *p), pin) else {
+                        eprintln!(
+                            "take_dn_checkpoint: pos={pos} skipped: snapshot allocation failed ({e}); only the pinned checkpoint is resident"
+                        );
+                        return;
+                    };
                     eprintln!(
-                        "take_dn_checkpoint: pos={pos} snapshot allocation failed ({e}); recycling the oldest checkpoint"
+                        "take_dn_checkpoint: pos={pos} snapshot allocation failed ({e}); recycling the oldest unpinned checkpoint"
                     );
-                    cks.remove(0).1
+                    cks.remove(victim).1
                 }
                 SnapshotAllocFailure::Skip => {
                     eprintln!(
@@ -13175,6 +13207,121 @@ pub fn attested_checkpoint_positions(ring: &[(usize, u64)], conversation: &[u32]
         .filter(|&&(pos, stored)| checkpoint_prefix_attests(stored, pos, conversation))
         .map(|&(pos, _)| pos)
         .collect()
+}
+
+/// Snapshot the DeltaNet state at a user-turn boundary: unconditionally (no
+/// stride), and pinned against recycling by later stride snapshots.
+pub fn take_dn_boundary_checkpoint(
+    cks: &mut Vec<(usize, DeltaNetSnapshot)>,
+    dn: &DeltaNetState,
+    kv: &KvCache,
+    gpu: &mut Gpu,
+    pos: usize,
+    cap: usize,
+    prefix: (&[u32], &[u32]),
+) {
+    take_dn_checkpoint_pinned(cks, dn, kv, gpu, pos, 0, cap, Some(pos), prefix);
+}
+
+/// User-turn boundary handling for one prompt prefill's checkpoint ring:
+/// `boundary` is this request's user-turn boundary (its prompt is
+/// user-terminated); `pin` is the newest user-turn snapshot (this request's,
+/// once taken, else the previous one) that stride snapshots must not recycle.
+/// `Default` is the plain stride behaviour.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TurnCheckpoint {
+    pub boundary: Option<usize>,
+    pub pin: Option<usize>,
+}
+
+/// Before forwarding the prefill chunk `[pos, pos + len)`: when the chunk holds
+/// the user-turn boundary, `pos` is the newest existing chunk end at or before
+/// it (or the prefill's start), so snapshot there regardless of stride and pin
+/// it (`turn.pin`). Never changes the chunk plan, so numerics are untouched.
+#[allow(clippy::too_many_arguments)]
+pub fn take_turn_checkpoint_before_chunk(
+    cks: &mut Vec<(usize, DeltaNetSnapshot)>,
+    dn: &DeltaNetState,
+    kv: &KvCache,
+    gpu: &mut Gpu,
+    pos: usize,
+    len: usize,
+    cap: usize,
+    turn: &mut TurnCheckpoint,
+    prefix: (&[u32], &[u32]),
+) {
+    if !hipfire_runtime::prompt_frame::chunk_holds_turn_boundary(pos, len, turn.boundary) {
+        return;
+    }
+    take_dn_boundary_checkpoint(cks, dn, kv, gpu, pos, cap, prefix);
+    if cks.iter().any(|(p, _)| *p == pos) {
+        turn.pin = Some(pos);
+    }
+}
+
+/// Stride snapshot at a prefill chunk end that spares the pinned user-turn
+/// snapshot.
+#[allow(clippy::too_many_arguments)]
+pub fn take_turn_checkpoint(
+    cks: &mut Vec<(usize, DeltaNetSnapshot)>,
+    dn: &DeltaNetState,
+    kv: &KvCache,
+    gpu: &mut Gpu,
+    pos: usize,
+    interval: usize,
+    cap: usize,
+    turn: TurnCheckpoint,
+    prefix: (&[u32], &[u32]),
+) {
+    take_dn_checkpoint_pinned(cks, dn, kv, gpu, pos, interval, cap, turn.pin, prefix);
+}
+
+/// Ring index recycled when the ring is full: the oldest entry that is not the
+/// pinned user-turn boundary. `None` when every entry is the pin.
+fn ring_recycle_victim(
+    positions: impl Iterator<Item = usize>,
+    pin: Option<usize>,
+) -> Option<usize> {
+    positions
+        .enumerate()
+        .find(|&(_, p)| Some(p) != pin)
+        .map(|(i, _)| i)
+}
+
+#[cfg(test)]
+mod ring_pin_tests {
+    use super::ring_recycle_victim;
+
+    #[test]
+    fn full_ring_recycles_oldest_but_never_the_pinned_boundary() {
+        // Unpinned: oldest goes (the historical behaviour).
+        assert_eq!(
+            ring_recycle_victim([521, 2048, 4096].into_iter(), None),
+            Some(0)
+        );
+        // The pin is the oldest entry (a user-turn boundary far behind the
+        // stride checkpoints a long tool chain adds): the next-oldest goes.
+        assert_eq!(
+            ring_recycle_victim([521, 2048, 4096].into_iter(), Some(521)),
+            Some(1)
+        );
+        // Pin in the middle / newest: the oldest still goes.
+        assert_eq!(
+            ring_recycle_victim([521, 2048, 4096].into_iter(), Some(2048)),
+            Some(0)
+        );
+        assert_eq!(
+            ring_recycle_victim([521, 2048, 4096].into_iter(), Some(4096)),
+            Some(0)
+        );
+        // Only the pin resident: nothing may be recycled for a stride snapshot.
+        assert_eq!(ring_recycle_victim([521].into_iter(), Some(521)), None);
+        // A stale pin matching no resident entry protects nothing.
+        assert_eq!(
+            ring_recycle_victim([2048, 4096].into_iter(), Some(521)),
+            Some(0)
+        );
+    }
 }
 
 /// Whether one more DeltaNet snapshot can be allocated without eating what the
@@ -13529,6 +13676,7 @@ pub fn seed_target_hidden_from_prompt_abortable(
     checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
     ckpt_interval: usize,
     ckpt_cap: usize,
+    turn: &mut TurnCheckpoint,
 ) -> HipResult<bool> {
     let mut parts = DflashTargetParts::from_slot(target);
     seed_target_hidden_from_prompt_abortable_parts(
@@ -13541,6 +13689,7 @@ pub fn seed_target_hidden_from_prompt_abortable(
         checkpoints,
         ckpt_interval,
         ckpt_cap,
+        turn,
     )
 }
 
@@ -13556,6 +13705,7 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
     mut checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
     ckpt_interval: usize,
     ckpt_cap: usize,
+    turn: &mut TurnCheckpoint,
 ) -> HipResult<bool> {
     target.reset_state(gpu)?;
     if let Some(host) = target_hidden_host.as_deref_mut() {
@@ -13584,7 +13734,21 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
                 }
                 return Ok(true);
             }
-            let end = seq_pos + seed.next_len(prompt_tokens.len() - seq_pos);
+            let outer = seed.next_len(prompt_tokens.len() - seq_pos);
+            if let Some(cks) = checkpoints.as_deref_mut() {
+                take_turn_checkpoint_before_chunk(
+                    cks,
+                    target.dn_state,
+                    target.kv_cache,
+                    gpu,
+                    seq_pos,
+                    outer,
+                    ckpt_cap,
+                    turn,
+                    (&prompt_tokens[..seq_pos], &[]),
+                );
+            }
+            let end = seq_pos + outer;
             while seq_pos < end {
                 let piece = SeedPrefill::piece_len(hidden_rb, end - seq_pos);
                 let chunk = &prompt_tokens[seq_pos..seq_pos + piece];
@@ -13600,7 +13764,7 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
             // Prompt-prefill progress (silent outside a `prompt_phase`).
             hipfire_runtime::prefill_progress::report(seq_pos, prompt_tokens.len());
             if let Some(cks) = checkpoints.as_deref_mut() {
-                take_dn_checkpoint(
+                take_turn_checkpoint(
                     cks,
                     target.dn_state,
                     target.kv_cache,
@@ -13608,6 +13772,7 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
                     seq_pos,
                     ckpt_interval,
                     ckpt_cap,
+                    *turn,
                     (&prompt_tokens[..seq_pos], &[]),
                 );
             }
@@ -13651,6 +13816,7 @@ pub fn seed_target_hidden_suffix_abortable(
     checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
     ckpt_interval: usize,
     ckpt_cap: usize,
+    turn: &mut TurnCheckpoint,
 ) -> HipResult<bool> {
     let mut parts = DflashTargetParts::from_slot(target);
     seed_target_hidden_suffix_abortable_parts(
@@ -13664,6 +13830,7 @@ pub fn seed_target_hidden_suffix_abortable(
         checkpoints,
         ckpt_interval,
         ckpt_cap,
+        turn,
     )
 }
 
@@ -13682,6 +13849,7 @@ pub fn seed_target_hidden_suffix_abortable_parts(
     mut checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
     ckpt_interval: usize,
     ckpt_cap: usize,
+    turn: &mut TurnCheckpoint,
 ) -> HipResult<bool> {
     let mut seed = SeedPrefill::plan(gpu, target, start_pos + suffix.len());
     let result = (|| -> HipResult<bool> {
@@ -13691,7 +13859,21 @@ pub fn seed_target_hidden_suffix_abortable_parts(
             if abort_check() {
                 return Ok(true);
             }
-            let end = off + seed.next_len(suffix.len() - off);
+            let outer = seed.next_len(suffix.len() - off);
+            if let Some(cks) = checkpoints.as_deref_mut() {
+                take_turn_checkpoint_before_chunk(
+                    cks,
+                    target.dn_state,
+                    target.kv_cache,
+                    gpu,
+                    pos,
+                    outer,
+                    ckpt_cap,
+                    turn,
+                    (prefix_head, &suffix[..off]),
+                );
+            }
+            let end = off + outer;
             while off < end {
                 let piece = SeedPrefill::piece_len(hidden_rb, end - off);
                 seed.forward(
@@ -13709,7 +13891,7 @@ pub fn seed_target_hidden_suffix_abortable_parts(
             // forced advances and terminal repair stay quiet).
             hipfire_runtime::prefill_progress::report(off, suffix.len());
             if let Some(cks) = checkpoints.as_deref_mut() {
-                take_dn_checkpoint(
+                take_turn_checkpoint(
                     cks,
                     target.dn_state,
                     target.kv_cache,
@@ -13717,6 +13899,7 @@ pub fn seed_target_hidden_suffix_abortable_parts(
                     pos,
                     ckpt_interval,
                     ckpt_cap,
+                    *turn,
                     (prefix_head, &suffix[..off]),
                 );
             }

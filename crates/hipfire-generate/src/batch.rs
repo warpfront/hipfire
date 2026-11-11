@@ -2598,6 +2598,10 @@ struct VmmLaneCtl {
     decode_start: usize,
     /// Finished and feeding its last rows; `commit_ready` follows.
     drain: Option<VmmDrain>,
+    /// The request's user-turn boundary (the singleton's `turn_boundary`): its
+    /// prompt prefill snapshots at its newest chunk end at or before it, so a
+    /// follow-up user turn resumes from there.
+    turn: hipfire_arch_qwen35::speculative::TurnCheckpoint,
     /// Verbatim assistant turn stored when the client commits.
     turn_store: Option<(TurnCacheAction, Vec<u32>)>,
 }
@@ -4532,6 +4536,9 @@ pub fn drive_qwen_vmm_continuous_batch(
                 lane.prompt_len = rendered.len();
                 lane.conversation_tokens = rendered.clone();
             }
+            let turn_boundary = model.tokenizer.as_ref().and_then(|tok| {
+                hipfire_runtime::prompt_frame::user_turn_resume_boundary(tok, None, &rendered)
+            });
             ctl[lane_idx] = VmmLaneCtl {
                 started_in_think,
                 think,
@@ -4540,6 +4547,10 @@ pub fn drive_qwen_vmm_continuous_batch(
                 cached: start,
                 prefill_tokens: rendered.len() - start,
                 decode_start: rendered.len(),
+                turn: hipfire_arch_qwen35::speculative::TurnCheckpoint {
+                    boundary: turn_boundary,
+                    pin: None,
+                },
                 ..VmmLaneCtl::default()
             };
             loop_guards[lane_idx] =
@@ -4921,6 +4932,34 @@ pub fn drive_qwen_vmm_continuous_batch(
                 )
             }
         };
+        // User-turn snapshot before a lane's prefill chunk that holds its
+        // boundary, on the singleton's own chunk plan (exact route), as the
+        // singleton takes it.
+        if let Some(store) = vmm_bundle(&mut model.state).and_then(|b| b.vmm_store.as_ref()) {
+            for (i, len) in planner.forced_prefill_len.iter().enumerate() {
+                let (Some(len), true) = (*len, ctl[i].keep) else {
+                    continue;
+                };
+                let Some(st) = store.request_state(&epochs[i]) else {
+                    continue;
+                };
+                let stream: &[u32] = match &sched.lanes[i] {
+                    BatchLane::Running(lane) => &lane.conversation_tokens,
+                    _ => &[],
+                };
+                let lane = &mut ctl[i];
+                crate::vmm_conv::turn_checkpoint_before_chunk(
+                    &mut lane.checkpoints,
+                    &st.dn,
+                    &st.kv,
+                    gpu,
+                    st.position,
+                    len,
+                    stream,
+                    &mut lane.turn,
+                );
+            }
+        }
         // Device-memory grants: a lane whose KV growth this step would leave
         // the admitted lanes unable to complete (`Qwen35VmmStore::
         // step_grants`) waits a step with its state untouched, as a lane
@@ -5273,6 +5312,7 @@ pub fn drive_qwen_vmm_continuous_batch(
                         hipfire_runtime::slot_batch::RequestStepKind::Ar => ctl[idx].main_row,
                         _ => false,
                     };
+                let turn = ctl[idx].turn;
                 if let (true, Some(st)) = (take, store.request_state(&r.epoch)) {
                     let stream: &[u32] = match &sched.lanes[idx] {
                         BatchLane::Running(lane) => &lane.conversation_tokens,
@@ -5285,6 +5325,7 @@ pub fn drive_qwen_vmm_continuous_batch(
                         gpu,
                         st.position,
                         stream,
+                        turn,
                     );
                 }
                 // `prefill_progress` for this lane's prompt chunk (silent on

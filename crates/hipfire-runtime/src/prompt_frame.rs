@@ -1610,6 +1610,65 @@ fn pick_splice_sentinels(tok: &Tokenizer, n: usize, avoid: &[u32]) -> Option<Vec
     Some(picked)
 }
 
+/// Boundary of the final assistant opener in a rendered prompt: the position
+/// right after the last `im_start` + `opener` run, when it is followed by
+/// something (a generation primer such as `<think>\n`). `None` when the prompt
+/// does not end in an assistant opener, or the opener is the last thing in it.
+///
+/// Pure token logic behind [`user_turn_resume_boundary`].
+pub fn final_assistant_opener_end(
+    rendered: &[u32],
+    im_start: u32,
+    opener: &[u32],
+) -> Option<usize> {
+    let q = rendered.iter().rposition(|&t| t == im_start)?;
+    let end = q.checked_add(opener.len())?;
+    (rendered.get(q..end)? == opener && end < rendered.len()).then_some(end)
+}
+
+/// Token position at which the *next* user turn's re-render of this
+/// conversation diverges from this request's stream, for a user-terminated
+/// render: right after the `<|im_start|>assistant\n` opener of the generation
+/// prompt. Templates that strip reasoning from assistant turns before the
+/// latest user message (Qwen3.5/MoE) render that turn bare, and ones that
+/// re-emit an empty think block diverge one token later; either way the
+/// divergence is at or after this position, so a recurrent-state snapshot taken
+/// here is a valid resume point for the follow-up request however long the
+/// intervening tool chain was.
+///
+/// `history` is the request's message list (`None`: a synthesized single user
+/// turn). Only a user-terminated prompt has such a boundary; after a tool
+/// result the follow-up is a pure extension and needs no snapshot. Derived from
+/// the rendered tokens, not from model identity: `None` when the tokenizer has
+/// no `<|im_start|>` special token or the prompt does not end in the opener.
+pub fn user_turn_resume_boundary(
+    tokenizer: &Tokenizer,
+    history: Option<&[Message]>,
+    rendered: &[u32],
+) -> Option<usize> {
+    if let Some(last) = history.and_then(<[Message]>::last) {
+        if !matches!(last.role, Role::User) {
+            return None;
+        }
+    }
+    let im_start = tokenizer.special_token_id("<|im_start|>")?;
+    final_assistant_opener_end(
+        rendered,
+        im_start,
+        &tokenizer.encode("<|im_start|>assistant\n"),
+    )
+}
+
+/// Whether the prefill chunk `[pos, pos + len)` holds the user-turn `boundary`.
+/// Checked before forwarding each chunk: `pos` is then the newest existing
+/// chunk end at or before the boundary (or the prefill's start), which is where
+/// the user-turn snapshot is taken. The chunk plan itself is never changed, so
+/// the snapshot only copies state and the prefill's numerics stay untouched
+/// (an added chunk boundary moves the logits of long prompts).
+pub fn chunk_holds_turn_boundary(pos: usize, len: usize, boundary: Option<usize>) -> bool {
+    matches!(boundary, Some(b) if pos <= b && b < pos + len)
+}
+
 /// Does this template already emit `primer` at the head of a HISTORY
 /// assistant turn?
 ///
@@ -5084,5 +5143,135 @@ SYS:{{ build_system_message(system_message) }}:END
         .expect("cached render");
         let plain = t.encode(&frame.render_messages(&messages, None, None).unwrap());
         assert_eq!(rendered, plain, "undelimitable span must miss");
+    }
+
+    /// Qwen3.5-style reasoning strip: assistant turns before the latest user
+    /// message render bare, later ones keep `<think>` reasoning.
+    const STRIP_TEMPLATE: &str = "{% set ns = namespace(lq=-1) %}{% for m in messages %}{% if m.role == 'user' %}{% set ns.lq = loop.index0 %}{% endif %}{% endfor %}{% for m in messages %}<|im_start|>{{ m.role }}\n{% if m.role == 'assistant' and loop.index0 > ns.lq %}<think>\n{{ m.reasoning_content }}\n</think>\n\n{% endif %}{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n<think>\n{% endif %}";
+
+    fn lcp(a: &[u32], b: &[u32]) -> usize {
+        a.iter().zip(b).take_while(|(x, y)| x == y).count()
+    }
+
+    #[test]
+    fn user_turn_boundary_precedes_reasoning_strip_divergence() {
+        let t = make_tokenizer();
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template: STRIP_TEMPLATE,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let render = |msgs: &[Message]| t.encode(&frame.render_messages(msgs, None, None).unwrap());
+
+        // Request 1: user-terminated; its render ends `assistant\n<think>\n`.
+        let u0 = qmsg(Role::User, "fix the test", None);
+        let r0 = render(&[u0.clone()]);
+        let primer = t.encode("<think>\n");
+        let b0 = user_turn_resume_boundary(&t, Some(&[u0.clone()]), &r0)
+            .expect("user-terminated render has a boundary");
+        assert_eq!(
+            b0,
+            r0.len() - primer.len(),
+            "boundary is right after the opener"
+        );
+        assert_eq!(
+            &r0[b0..],
+            &primer[..],
+            "only the generation primer follows it"
+        );
+        // No history (synthesized single user turn) is user-terminated too.
+        assert_eq!(user_turn_resume_boundary(&t, None, &r0), Some(b0));
+
+        // The conversation after a tool round: the tool-result request is a pure
+        // extension of request 1's stream and has no boundary of its own.
+        let a0 = qmsg(Role::Assistant, "calling a tool", Some("plan"));
+        let tool = qmsg(Role::Tool, "result", None);
+        let msgs_tool = vec![u0.clone(), a0.clone(), tool.clone()];
+        let r_tool = render(&msgs_tool);
+        assert_eq!(
+            user_turn_resume_boundary(&t, Some(&msgs_tool), &r_tool),
+            None
+        );
+        assert_eq!(
+            lcp(&r0, &r_tool),
+            b0 + primer.len(),
+            "tool turn extends request 1 past the primer"
+        );
+
+        // Request 3: a new user message after the chain. The template drops the
+        // earlier assistant turn's reasoning, so the re-render leaves the prior
+        // stream (`r_tool` plus its generation) exactly at the boundary.
+        let a1 = qmsg(Role::Assistant, "done", Some("more plan"));
+        let u1 = qmsg(Role::User, "and the other one?", None);
+        let msgs_next = vec![u0.clone(), a0, tool, a1, u1];
+        let r_next = render(&msgs_next);
+        let mut prior = r_tool.clone();
+        prior.extend(t.encode("more plan\n</think>\n\ndone<|im_end|>\n"));
+        let l = lcp(&prior, &r_next);
+        assert!(
+            l < prior.len(),
+            "reasoning-stripped re-render must diverge from the prior stream"
+        );
+        assert!(
+            l >= b0,
+            "resume checkpoint at {b0} must be at or before lcp {l}"
+        );
+        assert_eq!(l, b0, "this template diverges exactly at the boundary");
+        // And the follow-up request has its own boundary for the turn after it.
+        let b1 = user_turn_resume_boundary(&t, Some(&msgs_next), &r_next).unwrap();
+        assert_eq!(b1, r_next.len() - primer.len());
+        assert!(b1 > b0);
+    }
+
+    #[test]
+    fn final_assistant_opener_end_rejects_non_openers() {
+        let (im_start, opener) = (1u32, [1u32, 2, 3]);
+        // Primer after the opener: boundary right behind it.
+        assert_eq!(
+            final_assistant_opener_end(&[9, 1, 4, 3, 1, 2, 3, 5, 3], im_start, &opener),
+            Some(7)
+        );
+        // Opener is the last thing in the prompt: nothing to split off.
+        assert_eq!(
+            final_assistant_opener_end(&[9, 1, 2, 3], im_start, &opener),
+            None
+        );
+        // Last `im_start` opens another role, or the prompt has none.
+        assert_eq!(
+            final_assistant_opener_end(&[1, 2, 3, 7, 1, 4, 3, 8], im_start, &opener),
+            None
+        );
+        assert_eq!(final_assistant_opener_end(&[5, 6], im_start, &opener), None);
+        // Truncated opener at the very end.
+        assert_eq!(
+            final_assistant_opener_end(&[7, 1, 2], im_start, &opener),
+            None
+        );
+    }
+
+    #[test]
+    fn turn_snapshot_sits_on_an_existing_chunk_start() {
+        // 20K prompt in 8192-row chunks, boundary 20010: only the chunk that
+        // starts at 16384 holds it, so the snapshot lands there.
+        let plan = [(0usize, 8192usize), (8192, 8192), (16384, 3700)];
+        let hits: Vec<usize> = plan
+            .iter()
+            .filter(|&&(p, l)| chunk_holds_turn_boundary(p, l, Some(20_010)))
+            .map(|&(p, _)| p)
+            .collect();
+        assert_eq!(hits, vec![16384]);
+        // Boundary exactly on a chunk end: the next chunk starts on it.
+        assert!(chunk_holds_turn_boundary(8192, 8192, Some(8192)));
+        assert!(!chunk_holds_turn_boundary(0, 8192, Some(8192)));
+        // Boundary in the first chunk: the prefill start.
+        assert!(chunk_holds_turn_boundary(19_456, 3559, Some(20_010)));
+        // Boundary behind the prefill, or none.
+        assert!(!chunk_holds_turn_boundary(600, 64, Some(521)));
+        assert!(!chunk_holds_turn_boundary(0, 512, None));
     }
 }

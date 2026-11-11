@@ -20,7 +20,9 @@ use crate::mtp_spec::{
     spec_step_mtp_compressed_serial_with_takeover_candidates, MtpPromptRoute, MtpSamplingConfig,
     MtpSpecResult, MtpSpecState, PENALTY_REPEAT_CAP,
 };
-use crate::speculative::{take_dn_checkpoint, DeltaNetSnapshot, ModelSlot};
+use crate::speculative::{
+    take_dn_boundary_checkpoint, take_turn_checkpoint, DeltaNetSnapshot, ModelSlot, TurnCheckpoint,
+};
 use hipfire_runtime::ngram_mod::{MtpNgramContext, NgramModConfig};
 use hipfire_runtime::spec::{
     terminal_prefix_replay, MtpDrafter, MtpRequestStats, MtpSpeculator, MtpWindow, PrefillOutcome,
@@ -106,6 +108,12 @@ pub struct Qwen35MtpDrafter {
     checkpoint_resume: bool,
     checkpoint_interval: usize,
     checkpoint_cap: usize,
+    /// This request's user-turn boundary (`Speculator::set_turn_boundary`), taken by
+    /// the prompt prefill.
+    turn_boundary: Option<usize>,
+    /// Position of the newest user-turn snapshot in `checkpoints`, protected from
+    /// recycling until the next user turn replaces it.
+    pinned_boundary: Option<usize>,
     /// Strict-prefix terminal-repair enablement, resolved once at construction
     /// from [`hipfire_config::mtp_cache_policy`] (config-owned). The repair
     /// path performs no policy reads of its own.
@@ -148,6 +156,8 @@ impl Qwen35MtpDrafter {
             checkpoint_resume: policy.checkpoint_resume,
             checkpoint_interval: policy.checkpoint_interval,
             checkpoint_cap: policy.checkpoint_cap,
+            turn_boundary: None,
+            pinned_boundary: None,
             window_rollback: policy.window_rollback,
             prompt_route,
         }
@@ -461,6 +471,14 @@ impl MtpDrafter for Qwen35MtpDrafter {
         let prompt_route = self.prompt_route;
         let checkpoint_interval = self.checkpoint_interval;
         let checkpoint_cap = self.checkpoint_cap;
+        // This request's user-turn boundary: the prefill snapshots at its newest
+        // chunk end at or before it; that snapshot stays pinned through the
+        // following tool-result requests (`pinned_boundary`) until the next user
+        // turn. One-shot: a realign re-prefill inside the request does not see it.
+        let mut turn = TurnCheckpoint {
+            boundary: self.turn_boundary.take().filter(|_| checkpoint_resume),
+            pin: self.pinned_boundary,
+        };
         let prefill = prefill_trunk_and_mtp_cache_with_boundary(
             gpu,
             slot,
@@ -469,9 +487,29 @@ impl MtpDrafter for Qwen35MtpDrafter {
             fill_tokens,
             start_pos,
             prompt_route,
-            |gpu, dn_state, kv, position| {
-                if checkpoint_resume {
-                    take_dn_checkpoint(
+            turn.boundary,
+            |gpu, dn_state, kv, position, at_turn| {
+                if !checkpoint_resume {
+                    return Ok(());
+                }
+                // The ring covers prompt rows only: `[0..position]` of the
+                // canonical prompt this request resumed or cold-seeded.
+                let prefix = (prompt_tokens.get(..position).unwrap_or(&[]), &[][..]);
+                if at_turn {
+                    take_dn_boundary_checkpoint(
+                        &mut checkpoints,
+                        dn_state,
+                        kv,
+                        gpu,
+                        position,
+                        checkpoint_cap,
+                        prefix,
+                    );
+                    if checkpoints.iter().any(|(p, _)| *p == position) {
+                        turn.pin = Some(position);
+                    }
+                } else {
+                    take_turn_checkpoint(
                         &mut checkpoints,
                         dn_state,
                         kv,
@@ -479,15 +517,15 @@ impl MtpDrafter for Qwen35MtpDrafter {
                         position,
                         checkpoint_interval,
                         checkpoint_cap,
-                        // The ring covers prompt rows only: `[0..position]` of
-                        // the canonical prompt this request resumed or cold-seeded.
-                        (prompt_tokens.get(..position).unwrap_or(&[]), &[]),
+                        turn,
+                        prefix,
                     );
                 }
                 Ok(())
             },
         );
         self.checkpoints = checkpoints;
+        self.pinned_boundary = turn.pin;
         prefill.map_err(|e| format!("mtp prefill: {e}"))?;
         if abort() {
             return Ok(PrefillOutcome::Aborted);
@@ -774,6 +812,10 @@ impl MtpDrafter for Qwen35MtpDrafter {
                 .map_err(|e| format!("qwen35-mtp drafter realign reset: {e}"))?;
         }
         Ok(())
+    }
+
+    fn mtp_set_turn_boundary(&mut self, boundary: Option<usize>) {
+        self.turn_boundary = boundary;
     }
 
     fn mtp_checkpoint_positions(&self) -> Vec<usize> {

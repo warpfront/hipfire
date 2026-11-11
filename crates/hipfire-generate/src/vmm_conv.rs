@@ -136,7 +136,8 @@ fn best_entry(pool: &[VmmPrefixEntry], rendered: &[u32]) -> Option<(usize, Reuse
         .map(|(i, r, _)| (i, r))
 }
 
-/// Snapshot `dn` into `checkpoints` at the singleton's cadence. `stream` is the
+/// Snapshot `dn` into `checkpoints` at the singleton's cadence, sparing the
+/// lane's pinned user-turn snapshot (`turn.pin`). `stream` is the
 /// lane's committed token stream; the snapshot is attested against
 /// `stream[..pos]` (unattested when the lane's record is shorter than `pos`).
 pub fn checkpoint(
@@ -146,9 +147,10 @@ pub fn checkpoint(
     gpu: &mut rdna_compute::Gpu,
     pos: usize,
     stream: &[u32],
+    turn: speculative::TurnCheckpoint,
 ) {
     if ckpt_resume_enabled() {
-        speculative::take_dn_checkpoint(
+        speculative::take_turn_checkpoint(
             checkpoints,
             dn,
             kv,
@@ -156,6 +158,36 @@ pub fn checkpoint(
             pos,
             ckpt_interval(),
             ckpt_max(),
+            turn,
+            (stream.get(..pos).unwrap_or(&[]), &[]),
+        );
+    }
+}
+
+/// Before the lane forwards its prefill chunk `[pos, pos + len)` (the
+/// singleton's chunk plan): the user-turn snapshot exactly as the singleton
+/// takes it (`speculative::take_turn_checkpoint_before_chunk`).
+#[allow(clippy::too_many_arguments)]
+pub fn turn_checkpoint_before_chunk(
+    checkpoints: &mut Checkpoints,
+    dn: &DeltaNetState,
+    kv: &hipfire_runtime::llama::KvCache,
+    gpu: &mut rdna_compute::Gpu,
+    pos: usize,
+    len: usize,
+    stream: &[u32],
+    turn: &mut speculative::TurnCheckpoint,
+) {
+    if ckpt_resume_enabled() {
+        speculative::take_turn_checkpoint_before_chunk(
+            checkpoints,
+            dn,
+            kv,
+            gpu,
+            pos,
+            len,
+            ckpt_max(),
+            turn,
             (stream.get(..pos).unwrap_or(&[]), &[]),
         );
     }

@@ -846,6 +846,79 @@ pub fn ckpt_resume_enabled() -> bool {
         .as_deref()
         != Some("0")
 }
+/// Whether the request renders the whole conversation through the chat template
+/// (messages history + a template), as opposed to appending `prompt` to the
+/// resident session.
+pub(crate) fn full_render_path(has_history: bool, has_template: bool, jinja_enabled: bool) -> bool {
+    has_history && has_template && jinja_enabled
+}
+
+/// The context-full pre-check: reset the resident conversation to make room.
+/// Only where a reset can create room: an append path (`prompt` is added to the
+/// resident session). A full render holds the whole history in both `seq_pos` and
+/// the prompt, so after a cold prefill it occupies the same positions and the
+/// reset would only destroy the cache.
+pub(crate) fn context_full_resets(
+    no_eviction: bool,
+    full_render: bool,
+    seq_pos: usize,
+    prompt_est: usize,
+    max_tokens: usize,
+    max_seq: usize,
+) -> bool {
+    no_eviction
+        && !full_render
+        && seq_pos
+            .saturating_add(prompt_est)
+            .saturating_add(max_tokens)
+            > max_seq
+}
+
+/// Generation budget clamped to the room left after `used` tokens; with no room
+/// left it is returned unchanged so the caller's refusal reports the render that
+/// itself does not fit.
+pub(crate) fn clamp_generation_to_context(max_tokens: usize, used: usize, cap: usize) -> usize {
+    match cap.saturating_sub(used) {
+        0 => max_tokens,
+        room => max_tokens.min(room),
+    }
+}
+
+#[cfg(test)]
+mod context_guard_tests {
+    use super::*;
+
+    #[test]
+    fn full_render_never_resets_for_context_full() {
+        // 20K-token session, 12K generation ask on a 32K context: the old check
+        // wiped the conversation on every tool-result request.
+        assert!(!context_full_resets(
+            true, true, 20_173, 800, 12_288, 32_768
+        ));
+        // The append path keeps its reset where it can create room.
+        assert!(context_full_resets(
+            true, false, 20_173, 800, 12_288, 32_768
+        ));
+        // Eviction never resets; a request that fits never resets.
+        assert!(!context_full_resets(
+            false, false, 20_173, 800, 12_288, 32_768
+        ));
+        assert!(!context_full_resets(true, false, 1_000, 800, 2_048, 32_768));
+        assert!(full_render_path(true, true, true));
+        assert!(!full_render_path(false, true, true));
+        assert!(!full_render_path(true, true, false));
+    }
+
+    #[test]
+    fn generation_is_clamped_to_the_remaining_context() {
+        assert_eq!(clamp_generation_to_context(12_288, 23_000, 32_768), 9_768);
+        assert_eq!(clamp_generation_to_context(2_048, 23_000, 32_768), 2_048);
+        // No room: unchanged, so the render is refused through the existing path.
+        assert_eq!(clamp_generation_to_context(2_048, 32_768, 32_768), 2_048);
+        assert_eq!(clamp_generation_to_context(2_048, 40_000, 32_768), 2_048);
+    }
+}
+
 pub fn ckpt_interval() -> usize {
     hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_INTERVAL")
         .ok()
@@ -3814,7 +3887,19 @@ pub fn generate(
     // covers >= 1 byte, so byte length over-approximates the token count
     // and a byte-fit implies a token-fit. Near-boundary requests still
     // measure exactly, so reset decisions are unchanged.
+    // The rendered conversation (messages history through the chat template)
+    // already holds the whole cached history, so a reset could never create room:
+    // the full render lands on the same absolute positions after a cold prefill.
+    let full_render = full_render_path(
+        messages_history.is_some(),
+        m.chat_template.is_some(),
+        hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0"),
+    );
     let prompt_est = if m.eviction.is_none()
+        && !full_render
         && m.seq_pos
             .saturating_add(prompt.len())
             .saturating_add(20)
@@ -3836,12 +3921,14 @@ pub fn generate(
             m.seq_pos
         );
     }
-    if m.eviction.is_none()
-        && m.seq_pos
-            .saturating_add(prompt_est)
-            .saturating_add(max_tokens)
-            > m.max_seq
-    {
+    if context_full_resets(
+        m.eviction.is_none(),
+        full_render,
+        m.seq_pos,
+        prompt_est,
+        max_tokens,
+        m.max_seq,
+    ) {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq
@@ -4321,6 +4408,10 @@ pub fn generate(
         );
     }
     let mut cached_tokens_count: usize = 0;
+    // Position where the next user turn's re-render diverges (see
+    // `prompt_frame::user_turn_resume_boundary`); the prefill below snapshots the
+    // recurrent state at its newest chunk end at or before it.
+    let mut turn_boundary: Option<usize> = None;
     let new_tokens: Vec<u32> = if cache_eligible {
         let history = messages_history.unwrap();
         let trace_cache = hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
@@ -4442,6 +4533,11 @@ pub fn generate(
                 &rendered,
             );
         }
+        turn_boundary = hipfire_runtime::prompt_frame::user_turn_resume_boundary(
+            tokenizer,
+            messages_history,
+            &rendered,
+        );
         // LCP detection vs m.conversation_tokens.
         let prior_len = m.conversation_tokens.len();
         let max_match = prior_len.min(rendered.len());
@@ -4760,6 +4856,11 @@ pub fn generate(
             rendered[lcp..].to_vec()
         }
     } else {
+        turn_boundary = hipfire_runtime::prompt_frame::user_turn_resume_boundary(
+            tokenizer,
+            messages_history,
+            &new_tokens,
+        );
         new_tokens
     };
 
@@ -4855,6 +4956,19 @@ pub fn generate(
             })
             .unwrap_or(0),
     );
+    // Full-render path: the generation budget is clamped to the room left in the
+    // context (decode then ends with finish_reason "length" at the cap) instead of
+    // wiping the session; only a render that itself does not fit (no room left)
+    // reaches the refusal below.
+    let max_tokens = if full_render && m.eviction.is_none() {
+        clamp_generation_to_context(
+            max_tokens,
+            m.seq_pos + new_tokens.len() + trailer,
+            m.physical_cap,
+        )
+    } else {
+        max_tokens
+    };
     let max_tokens = if m.eviction.is_none() {
         crate::common::fit_max_tokens(
             max_tokens,
@@ -5022,6 +5136,14 @@ pub fn generate(
         // does a full re-prefill from scratch, which is the same cost
         // as letting the abandoned prefill drain — but the client
         // gets control back immediately instead of waiting.
+        // The newest user-turn boundary stays pinned in the checkpoint ring
+        // until the next user turn; a tool-result request keeps the previous one.
+        // The snapshot sits on the newest existing chunk end at or before the
+        // boundary: the chunk plan is untouched (numerics-neutral).
+        let mut turn = speculative::TurnCheckpoint {
+            boundary: turn_boundary.filter(|_| ckpt_resume_enabled()),
+            pin: m.user_turn_ckpt,
+        };
         let mut prefill_aborted = false;
         if let Some(ref ev) = m.eviction {
             let window = ev.budget() + ev.beta();
@@ -5166,6 +5288,21 @@ pub fn generate(
                 let remaining = new_tokens.len() - start;
                 let outer = qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, chunk_max)
                     .unwrap_or(remaining.min(chunk_max).max(1));
+                if ckpt_resume_enabled() {
+                    speculative::take_turn_checkpoint_before_chunk(
+                        &mut m.prefill_checkpoints,
+                        dn,
+                        kv,
+                        gpu,
+                        m.seq_pos,
+                        outer,
+                        ckpt_max(),
+                        &mut turn,
+                        // Committed conversation + the chunks forwarded so far.
+                        (&m.conversation_tokens, &new_tokens[..start]),
+                    );
+                    m.user_turn_ckpt = turn.pin;
+                }
                 let end = (start + outer).min(new_tokens.len());
                 let chunk = &new_tokens[start..end];
                 if let Err(e) = qwen35::forward_prefill_batch(
@@ -5240,7 +5377,8 @@ pub fn generate(
                 // (&mut m.dn_state) and &mut m.prefill_checkpoints are disjoint
                 // fields, so this composes with the live kv/dn borrows.
                 if ckpt_resume_enabled() {
-                    speculative::take_dn_checkpoint(
+                    // Stride snapshot that spares the pinned user-turn snapshot.
+                    speculative::take_turn_checkpoint(
                         &mut m.prefill_checkpoints,
                         dn,
                         kv,
@@ -5248,6 +5386,7 @@ pub fn generate(
                         m.seq_pos,
                         ckpt_interval(),
                         ckpt_max(),
+                        turn,
                         // Committed conversation + the chunk forwarded so far.
                         (&m.conversation_tokens, &new_tokens[..end]),
                     );
@@ -5779,7 +5918,7 @@ pub fn generate(
             // render diverges within it — without replaying the whole
             // generation. No-op under eviction (compact_offset != 0).
             if ckpt_resume_enabled() {
-                speculative::take_dn_checkpoint(
+                speculative::take_dn_checkpoint_pinned(
                     &mut m.prefill_checkpoints,
                     dn,
                     kv,
@@ -5787,6 +5926,7 @@ pub fn generate(
                     m.seq_pos,
                     ckpt_interval(),
                     ckpt_max(),
+                    m.user_turn_ckpt,
                     // `conversation_tokens` IS the forwarded stream here (each
                     // token is committed as it is forwarded); under eviction
                     // `seq_pos` is physical, the lengths differ and the

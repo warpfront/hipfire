@@ -1259,6 +1259,12 @@ pub struct LoadedModel {
     pub kv_adaptive: Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
     pub conversation_tokens: Vec<u32>,
     pub prefill_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
+    /// Position of the newest user-turn boundary snapshot in `prefill_checkpoints`
+    /// (`prompt_frame::user_turn_resume_boundary`): the AR ring recycles every other
+    /// entry before it, so the follow-up user turn's re-render finds it after a long
+    /// tool chain. Position-keyed and only ever protects the entry at that position,
+    /// so a stale value left by a reset is harmless.
+    pub user_turn_ckpt: Option<usize>,
     pub dflash_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
     pub asst_turn_cache: AsstTurnCache,
     /// Content fingerprints (sha256 of the image bytes, in order) of the images
@@ -1332,6 +1338,7 @@ impl LoadedModel {
             asst_turn_cache: AsstTurnCache::new_from_env(),
             vl_image_fingerprints: Vec::new(),
             prefill_checkpoints: Vec::new(),
+            user_turn_ckpt: None,
             dflash_checkpoints: Vec::new(),
             decoded_vocab: None,
             model_path,

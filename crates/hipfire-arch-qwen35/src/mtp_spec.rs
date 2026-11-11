@@ -3621,14 +3621,19 @@ pub fn prefill_trunk_and_mtp_cache(
         prompt_tokens,
         start_pos,
         route,
-        |_gpu, _target, _kv, _committed_pos| Ok(()),
+        None,
+        |_gpu, _target, _kv, _committed_pos, _turn| Ok(()),
     )
 }
 
 /// Like [`prefill_trunk_and_mtp_cache`], but invokes `on_committed_boundary`
 /// after each trunk chunk and its MTP fill commit, with the trunk DeltaNet
 /// state and the exclusive end position of the committed prefix
-/// (`start_pos + tokens_written_so_far`).
+/// (`start_pos + tokens_written_so_far`), and the flag `false`. Before
+/// forwarding the chunk that holds `turn_boundary`, it is invoked once more
+/// with that chunk's start position and the flag `true` (the newest existing
+/// chunk end at or before the boundary, or the prefill start; see
+/// `prompt_frame::chunk_holds_turn_boundary`). The chunk plan never changes.
 ///
 /// The callback runs while `target.kv_cache` holds the just-written prefix.
 /// Failures propagate and abort the remaining prefill (caller must free MTP
@@ -3642,10 +3647,11 @@ pub fn prefill_trunk_and_mtp_cache_with_boundary<F>(
     prompt_tokens: &[u32],
     start_pos: usize,
     route: MtpPromptRoute,
+    turn_boundary: Option<usize>,
     on_committed_boundary: F,
 ) -> HipResult<TrunkSpinePrefillTimings>
 where
-    F: FnMut(&mut Gpu, &DeltaNetState, &KvCache, usize) -> HipResult<()>,
+    F: FnMut(&mut Gpu, &DeltaNetState, &KvCache, usize, bool) -> HipResult<()>,
 {
     let mut parts = MtpPrefillTarget {
         weights: &target.weights,
@@ -3662,6 +3668,7 @@ where
         prompt_tokens,
         start_pos,
         route,
+        turn_boundary,
         on_committed_boundary,
     )
 }
@@ -3686,10 +3693,11 @@ pub fn prefill_trunk_and_mtp_cache_parts<F>(
     prompt_tokens: &[u32],
     start_pos: usize,
     route: MtpPromptRoute,
+    turn_boundary: Option<usize>,
     mut on_committed_boundary: F,
 ) -> HipResult<TrunkSpinePrefillTimings>
 where
-    F: FnMut(&mut Gpu, &DeltaNetState, &KvCache, usize) -> HipResult<()>,
+    F: FnMut(&mut Gpu, &DeltaNetState, &KvCache, usize, bool) -> HipResult<()>,
 {
     let Some(head_rows) =
         mtp_prompt_fill_scratch_rows(prompt_tokens.len(), qwen35::prefill_max_batch(gpu))
@@ -3848,6 +3856,19 @@ where
                         .unwrap_or(remaining.min(trunk_chunk_max).max(1))
                 }
             };
+            if hipfire_runtime::prompt_frame::chunk_holds_turn_boundary(
+                start_pos + off,
+                outer,
+                turn_boundary,
+            ) {
+                on_committed_boundary(
+                    gpu,
+                    target.dn_state,
+                    &*target.kv_cache,
+                    start_pos + off,
+                    true,
+                )?;
+            }
             let end = off + outer;
             let chunk = &prompt_tokens[off..end];
             let chunk_start_pos = start_pos + off;
@@ -3956,7 +3977,13 @@ where
             }
 
             // Committed boundary: trunk + MTP private KV now cover [0, committed_pos).
-            on_committed_boundary(gpu, target.dn_state, &*target.kv_cache, committed_pos)?;
+            on_committed_boundary(
+                gpu,
+                target.dn_state,
+                &*target.kv_cache,
+                committed_pos,
+                false,
+            )?;
             // `prefill_progress` for the request's prompt prefill (live only
             // inside a `prompt_phase`; silent for decode-time replays).
             hipfire_runtime::prefill_progress::report(end, prompt_tokens.len());
