@@ -11690,6 +11690,43 @@ impl ExpertCacheRoutes {
     }
 }
 
+/// Lab-only access to the actual production collector. Sources contain one
+/// layer's [rows][top-k] i32 bytes; this API changes no routing policy.
+#[cfg(feature = "lab")]
+pub struct ExpertCacheRouteOracle(ExpertCacheRoutes);
+
+#[cfg(feature = "lab")]
+impl ExpertCacheRouteOracle {
+    pub fn new(
+        gpu: &mut Gpu,
+        layers: usize,
+        topk: usize,
+        max_rows: usize,
+    ) -> Result<Self, Qwen4GpuForwardError> {
+        ExpertCacheRoutes::new(gpu, layers, topk, max_rows).map(Self)
+    }
+    pub fn reset(&mut self, gpu: &Gpu, rows: usize) -> Result<(), Qwen4GpuForwardError> {
+        self.0.reset(gpu, rows)
+    }
+    pub fn capture_layer(
+        &self,
+        gpu: &mut Gpu,
+        layer: usize,
+        source: &GpuTensor,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        self.0.capture_layer(gpu, layer, source)
+    }
+    pub fn collect(&mut self, gpu: &Gpu) -> Result<Vec<i32>, Qwen4GpuForwardError> {
+        self.0.collect(gpu).map(<[i32]>::to_vec)
+    }
+    pub fn free_gpu(mut self, gpu: &mut Gpu) -> Result<(), Qwen4GpuForwardError> {
+        self.0.landing.complete(&gpu.hip)?;
+        gpu.hip.device_synchronize()?;
+        gpu.free_tensor(self.0.device)?;
+        Ok(())
+    }
+}
+
 /// Dense IU4 trunk (`HIPFIRE_QWEN4_TRUNK_IU4=<mask>`, see
 /// [`rdna_compute::Qwen4TrunkMask`]) over a trunk that may mix symmetric
 /// MQ4G256V2 (QT44) and other tiers (MQ6 ...) per tensor: check on the device
@@ -14949,12 +14986,24 @@ impl Qwen4GpuForward {
                 cache.check_idle_for_state_op(gpu).map_err(invalid)?;
                 Ok(Some(serde_json::json!({
                     "enabled": true,
+                    "rows_cap": cache.verify_rows(),
                     "dirty": cache.is_dirty(),
                     "stage_min_rows": self.cache_prefill_stage_min_rows(gpu),
                     "stats": cache.stats(),
                 })))
             }
         }
+    }
+
+    /// Full cache publication/ticket metadata, without a copy-fence query,
+    /// publication, host/device wait or mutation of the actual cache policy.
+    #[cfg(feature = "lab")]
+    pub(crate) fn expert_cache_snapshot(&self) -> Result<serde_json::Value, Qwen4GpuForwardError> {
+        self.expert_cache
+            .as_ref()
+            .ok_or_else(|| invalid("exact expert cache is not attached"))?
+            .diagnostic_snapshot()
+            .map_err(invalid)
     }
 
     fn cache_prefill_stage_min_rows(&self, gpu: &Gpu) -> usize {

@@ -29,15 +29,20 @@ somewhere in this file).
 `HIPFIRE_QWEN4_EXPERT_CACHE=1` (typed boolean; default off) enables the
 exact expert LRU described in [CONFIG.md](CONFIG.md). It requires one gfx1201
 GPU, uniform QT44/QT53 Flash-Next weights and an applicable ranked hotset.
-Set speculation off, `HIPFIRE_QWEN4_DECODE_SHARE=off` and
-`HIPFIRE_OFFLOAD_EXEC=pcie`. CPU/D2, EP/PP/TP, continuous batching, NPU, S1,
+AR and greedy native MTP are supported. The loader derives one native window
+bound of 1..=8 target rows, including the seed, for both route allocation and
+mutable guards; wider proposals fail before fulfillment. DFlash, DSpark and
+the independent n-gram drafter remain refused. With an actual cache owner,
+sampled requests use ordinary AR; a later greedy request can use native MTP
+again on the same server. Cache-off native sampling policy is unchanged.
+Set `HIPFIRE_QWEN4_DECODE_SHARE=off` and `HIPFIRE_OFFLOAD_EXEC=pcie`. CPU/D2, EP/PP/TP, continuous batching, NPU, S1,
 expert-keep and whole-first placement are refused. Routing is unchanged; a
 miss runs from canonical mapped host bytes and schedules a bounded paired
 fill for later tokens. Dirty prefill tiles below the effective expert-staging
 threshold (2048 rows by default on gfx1201) use independent immutable tables:
 core experts stay in VRAM; donors and cold experts read their immutable host
 backing. This route preserves pending fills and decode LRU without draining
-copies, restoring donor bytes or widening mutable residency beyond one row;
+copies, restoring donor bytes or borrowing a mutable decode/verify window;
 it never stages experts. Other prefill tiles retain the frozen resident view
 and restore donor bytes when required, including long staged prefill and its
 subsequent clean short tail.
@@ -58,7 +63,7 @@ extra immutable host mirror. `HIPFIRE_QWEN4_EXPERT_CACHE_INFLIGHT` defaults to
 the host margin covers both additional expert runtimes (decode and immutable
 short prefill), binding identities, LRU state and upload/readback storage. The
 short prefill route borrows existing canonical tables and payloads and adds
-no expert payload or GPU table allocation.
+no per-call expert payload or GPU table allocation.
 These margins are reserves, not measured peak-memory receipts. Invalid
 explicit values fail the load, including when the cache is disabled. Periodic
 cache statistics are emitted only at tracing DEBUG level. This opt-in path

@@ -2,7 +2,8 @@
 
 ## Unreleased — 2026-11-11
 
-- **Opt-in exact Flash-Next expert LRU on one gfx1201 PCIe GPU:** immutable host experts can fill paired gate-up/down VRAM slots between AR tokens, using beta's shared SlotBank generations and reader leases. Dirty short prefills read independent core/host tables; long prefills restore the original donor bytes before staging. The fixed hot budget is preserved and mirror/queue memory is charged. Cache-off placement and reporting remain unchanged; lanes, native MTP, EP and incompatible routes are refused.
+- **Greedy native MTP with exact Flash-Next expert LRU:** one shared-bank reader window covers up to eight actual target verify rows, including the seed, and paired fills observe all executed rows without changing routing. Admission, route storage and mutable seals share the same strict bound; target/head rollback keeps cache generations independent. With an actual cache owner, sampled requests route to ordinary AR and later greedy requests can return to native MTP. Cache-off sampling policy is unchanged.
+- **Opt-in exact Flash-Next expert LRU on one gfx1201 PCIe GPU:** immutable host experts can fill paired gate-up/down VRAM slots between AR tokens, using beta's shared SlotBank generations and reader leases. Dirty short prefills read independent core/host tables; long prefills restore the original donor bytes before staging. The fixed hot budget is preserved and mirror/queue memory is charged. Cache-off placement and reporting remain unchanged; lanes, EP and incompatible routes are refused.
 - **Exact-cache failure handling:** setup, route-reset and readback errors cancel the active reader only after typed retained-queue quiescence and a HIP fence. Unknown submission retains the complete model owner set; state operations and teardown refuse an outstanding reader. Recurring cache statistics use developer DEBUG logging.
 
 ## v0.4.5 — 2026-11-11 (re-cut)

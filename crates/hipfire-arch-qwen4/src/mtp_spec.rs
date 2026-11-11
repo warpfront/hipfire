@@ -12369,6 +12369,68 @@ mod tests {
     }
 
     #[test]
+    fn exact_cache_refuses_sampled_native_without_changing_uncached_policy() {
+        for mode in [SampledMode::Leviathan, SampledMode::Naive] {
+            let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
+            drafter.sampled_enabled = true;
+            drafter.sampled_mode = Ok(mode);
+            drafter.configure_request(SpecRequestConfig {
+                temp: 0.8,
+                rng_seed: 123,
+                ..Default::default()
+            });
+            assert!(drafter.sampled.is_some());
+            assert!(drafter.require_supported_request().is_ok());
+            let error = drafter.require_supported_cache_request(true).unwrap_err();
+            assert!(error.contains("greedy native MTP only"));
+            assert!(drafter.require_supported_cache_request(false).is_ok());
+            assert!(
+                drafter.sampled.is_some(),
+                "refusal must not silently switch to AR"
+            );
+            assert_eq!(drafter.request.temp, 0.8);
+            assert_eq!(drafter.request.rng_seed, 123);
+
+            drafter.configure_request(SpecRequestConfig::default());
+            assert!(drafter.sampled.is_none());
+            assert!(drafter.require_supported_cache_request(true).is_ok());
+        }
+    }
+
+    #[test]
+    fn exact_cache_sampled_backstop_uses_request_even_when_router_disallows_sampling() {
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None).with_sampled_allowed(false);
+        drafter.configure_request(SpecRequestConfig {
+            temp: 0.3,
+            rng_seed: 123,
+            ..Default::default()
+        });
+        assert!(drafter.sampled.is_none());
+        let error = drafter.require_supported_cache_request(true).unwrap_err();
+        assert!(error.contains("greedy native MTP only"));
+        assert_eq!(drafter.request.temp, 0.3);
+        assert_eq!(drafter.request.rng_seed, 123);
+        // The actual route selector and sampled constructor both treat this
+        // epsilon as greedy. The cache backstop must accept the same requests.
+        for temp in [0.0, 1.0e-7, 1.0e-6] {
+            drafter.configure_request(SpecRequestConfig {
+                temp,
+                rng_seed: 123,
+                ..Default::default()
+            });
+            assert!(drafter.sampled.is_none());
+            drafter.require_supported_cache_request(true).unwrap();
+            assert_eq!(drafter.request.temp, temp);
+        }
+        // Returning from epsilon-greedy must not disable the sampled backstop.
+        drafter.configure_request(SpecRequestConfig {
+            temp: 0.3,
+            ..Default::default()
+        });
+        assert!(drafter.require_supported_cache_request(true).is_err());
+    }
+
+    #[test]
     fn q8_ef_sampled_requests_route_to_ar() {
         use crate::GdnStateFormat;
         assert!(!qwen4_mtp_sampled_allowed(GdnStateFormat::Q8Ef));

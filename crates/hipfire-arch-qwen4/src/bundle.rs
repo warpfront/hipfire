@@ -61,6 +61,40 @@ pub use pp::{Qwen4PpLaneExecutor, Qwen4PpWindow};
 
 const PLE_RESET_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Check the existing head session schema against its independent live control
+/// flags before selecting the boundary byte range for a diagnostic digest.
+#[cfg(feature = "lab")]
+fn lab_mtp_boundary_valid(
+    meta: &[u8],
+    position: usize,
+    saved: Option<usize>,
+    restored: Option<usize>,
+) -> Result<bool, BundleError> {
+    // MtpGpuState::session_parts: boundary + six marks; Qwen4MtpGpu then
+    // appends two draft-policy words. Reject a changed schema explicitly.
+    if meta.len() != 9 * std::mem::size_of::<u64>() {
+        return Err(BundleError::Forward(
+            "lab MTP head session metadata shape changed".into(),
+        ));
+    }
+    let word =
+        |index: usize| u64::from_le_bytes(meta[index * 8..index * 8 + 8].try_into().unwrap());
+    let valid = saved == Some(position);
+    let expected = if valid {
+        (position as u64)
+            .checked_add(1)
+            .ok_or_else(|| BundleError::Forward("lab MTP head boundary position overflow".into()))?
+    } else {
+        0
+    };
+    if word(0) != expected || word(5) != position as u64 || (restored == Some(position) && !valid) {
+        return Err(BundleError::Forward(
+            "lab MTP head boundary metadata/control mismatch".into(),
+        ));
+    }
+    Ok(valid)
+}
+
 fn pp_owner_required() -> BundleError {
     BundleError::Forward(
         "qwen4 topology.pp requires the admitted Gpus owner; use the mesh entry point".into(),
@@ -6211,6 +6245,109 @@ impl Qwen4Bundle {
         }
     }
 
+    /// Read actual idle shared-bank tickets and published pointer pairs for
+    /// lab verification. This does not drain pending copies or prove GPU wait.
+    #[cfg(feature = "lab")]
+    pub fn dev_expert_cache_snapshot(&self) -> Result<serde_json::Value, BundleError> {
+        self.check_expert_cache_readers_idle()?;
+        self.execution
+            .as_ref()
+            .ok_or_else(|| {
+                BundleError::Forward("exact expert cache forward is not attached".into())
+            })?
+            .expert_cache_snapshot()
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// Intrusive active-head numerical receipt: waits for HIP and downloads
+    /// live bytes. Compare only the same actual native draft/append schedule.
+    /// It is not an async-overlap or performance probe.
+    #[cfg(feature = "lab")]
+    pub fn dev_mtp_active_digest(&self, gpu: &Gpu) -> Result<Vec<(String, String)>, BundleError> {
+        use sha2::{Digest, Sha256};
+        self.check_expert_cache_idle(gpu)?;
+        self.ep_refuse("lab active native MTP head digest")?;
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
+        let head = self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| BundleError::Forward("Qwen4 MTP resources are not attached".into()))?;
+        if head.ep_bound || head.lane_local || head.s4_round.is_some() {
+            return Err(BundleError::Forward(
+                "lab MTP active digest requires the ordinary single head owner".into(),
+            ));
+        }
+        let (saved, restored, boundary_base, boundary_size) =
+            head.parity_state().lab_boundary_controls();
+        let (meta, layout) = head
+            .session_parts()
+            .map_err(|error| BundleError::Forward(error.to_string()))?;
+        let valid_boundary = lab_mtp_boundary_valid(&meta, head.position(), saved, restored)?;
+        if layout.fixed.len() != 4 || layout.rows.len() != 4 {
+            return Err(BundleError::Forward(
+                "lab MTP head session layout shape changed".into(),
+            ));
+        }
+        let boundary = &layout.fixed[3];
+        let boundary_bytes = head.parity_state().parity_buffers().wide_hidden.byte_size();
+        if boundary.offset != 0
+            || boundary.bytes != boundary_bytes
+            || boundary.bytes != boundary_size
+            || boundary.buf.as_ptr() as usize != boundary_base
+            || boundary.bytes > boundary.buf.size()
+        {
+            return Err(BundleError::Forward(
+                "lab MTP head boundary range shape changed".into(),
+            ));
+        }
+        // Existing production helper synchronizes once, then reads exact active
+        // KV/index extents, selected_len indices, device length, wide and marks.
+        let mut items = crate::mtp_gpu::lab_head_items(gpu, head.parity_state())
+            .map_err(BundleError::Forward)?;
+        items.push(("head.session_metadata".into(), meta));
+        if valid_boundary {
+            let mut bytes = vec![0; boundary.bytes];
+            gpu.hip
+                .memcpy_dtoh(&mut bytes, boundary.buf)
+                .map_err(BundleError::Hip)?;
+            items.push(("head.boundary_hidden".into(), bytes));
+        }
+        let mut rows = items
+            .into_iter()
+            .map(|(name, bytes)| {
+                let hash = Sha256::digest(&bytes)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                (name, format!("{hash} bytes={}", bytes.len()))
+            })
+            .collect::<Vec<_>>();
+        rows.push(("head.boundary_saved".into(), format!("{saved:?}")));
+        rows.push(("head.boundary_restored".into(), format!("{restored:?}")));
+        Ok(rows)
+    }
+
+    /// Raw owner/rollback bookkeeping, kept separately from active digest
+    /// equality because process-local generations and physical capacities vary.
+    #[cfg(feature = "lab")]
+    pub fn dev_mtp_control_census(&self) -> Result<serde_json::Value, BundleError> {
+        self.check_expert_cache_readers_idle()?;
+        let head = self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| BundleError::Forward("Qwen4 MTP resources are not attached".into()))?;
+        Ok(serde_json::json!({
+            "schema": "hipfire-mtp-control-census-v1",
+            "state": head.parity_state().lab_control_census(),
+            "operator": { "max_seq": head.max_seq, "ep_bound": head.ep_bound,
+                "lane_local": head.lane_local, "s4_round_active": head.s4_round.is_some(),
+                "moe_steps": head.moe_steps, "has_moe": head.moe.is_some(),
+                "has_lane_full_moe": head.moe_full.is_some() },
+        }))
+    }
+
     /// Optional operations with no error return keep every owner and ticket on
     /// refusal. The next fallible state operation reports the same failure.
     fn refuse_expert_cache_state_op(&self, gpu: Option<&Gpu>, operation: &str) -> bool {
@@ -7954,5 +8091,34 @@ pub(crate) fn spec_hidden_capacity_rows(
         Some(rows.max(chunk.checked_mul(2)?))
     } else {
         Some(rows)
+    }
+}
+
+#[cfg(all(test, feature = "lab"))]
+mod mtp_active_digest_tests {
+    use super::lab_mtp_boundary_valid;
+
+    #[test]
+    fn head_boundary_digest_requires_actual_controls_and_exact_session_schema() {
+        let mut words = [0u64; 9];
+        words[0] = 43;
+        words[5] = 42;
+        let pack = |words: &[u64]| {
+            words
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        let meta = pack(&words);
+        assert!(lab_mtp_boundary_valid(&meta, 42, Some(42), Some(42)).unwrap());
+        assert!(lab_mtp_boundary_valid(&meta[..64], 42, Some(42), None).is_err());
+        assert!(lab_mtp_boundary_valid(&meta, 41, Some(41), None).is_err());
+        assert!(lab_mtp_boundary_valid(&meta, 42, Some(41), None).is_err());
+        words[0] = 0;
+        let stale = pack(&words);
+        assert!(!lab_mtp_boundary_valid(&stale, 42, Some(41), None).unwrap());
+        assert!(lab_mtp_boundary_valid(&stale, 42, Some(41), Some(42)).is_err());
+        words[5] = 43;
+        assert!(lab_mtp_boundary_valid(&pack(&words), 42, None, None).is_err());
     }
 }

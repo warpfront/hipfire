@@ -607,6 +607,70 @@ mod tests {
     }
 
     #[test]
+    fn verify_reader_freezes_the_epoch_and_requires_exact_rows() {
+        for rows in [2, 4, MutableExpertResidency::MAX_VERIFY_ROWS] {
+            let r = fixture();
+            let guard = r.begin_verify(0, rows).unwrap();
+            assert_eq!(guard.rows(), rows);
+            r.validate_active_rows(rows).unwrap();
+            assert!(r.validate_active_rows(1).is_err());
+            assert!(r.validate_active_rows(rows + 1).is_err());
+            assert!(r.begin_token(0).is_err());
+            let called = AtomicBool::new(false);
+            // SAFETY: metadata only; publication must stop before callback.
+            assert!(unsafe {
+                r.publish_after_gpu_wait(publication(0, 1, 0), |_| {
+                    called.store(true, AtomicOrdering::Relaxed);
+                    Ok(())
+                })
+            }
+            .is_err());
+            assert!(!called.load(AtomicOrdering::Relaxed));
+            assert_eq!(r.snapshot().unwrap().epoch, 0);
+            // SAFETY: no GPU work exists in this metadata-only test.
+            unsafe { guard.retire_after_gpu_wait() }.unwrap();
+            assert!(r.validate_active_rows(rows).is_err());
+            // SAFETY: simulated batch retired before slot reuse.
+            let published = unsafe { publish(&r, publication(0, 1, 1)) }.unwrap();
+            assert_eq!(published.epoch, 1);
+            assert_eq!(published.gate_up[1], 0x8000);
+            assert_eq!(published.down[1], 0x9000);
+            assert!(r.begin_verify(0, rows).is_err());
+        }
+        let r = fixture();
+        for rows in [0, 1, 9, usize::MAX] {
+            assert!(r.begin_verify(0, rows).is_err());
+        }
+        let guard = r.begin_token(0).unwrap();
+        assert_eq!(guard.rows(), 1);
+        // SAFETY: failed admissions submitted no GPU work.
+        unsafe { guard.retire_after_gpu_wait() }.unwrap();
+    }
+
+    #[test]
+    fn dropped_verify_reader_never_reopens_publication() {
+        let r = fixture();
+        drop(
+            r.begin_verify(0, MutableExpertResidency::MAX_VERIFY_ROWS)
+                .unwrap(),
+        );
+        assert!(r.snapshot().is_err());
+        assert!(r
+            .validate_active_rows(MutableExpertResidency::MAX_VERIFY_ROWS)
+            .is_err());
+        let called = AtomicBool::new(false);
+        // SAFETY: metadata-only; the poisoned capability must reject before upload.
+        assert!(unsafe {
+            r.publish_after_gpu_wait(publication(0, 1, 0), |_| {
+                called.store(true, AtomicOrdering::Relaxed);
+                Ok(())
+            })
+        }
+        .is_err());
+        assert!(!called.load(AtomicOrdering::Relaxed));
+    }
+
+    #[test]
     fn publication_preserves_binding_and_retired_token_allows_next_epoch() {
         let r = fixture();
         let identity = r.stable_fingerprint().to_owned();

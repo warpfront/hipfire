@@ -15375,6 +15375,22 @@ mod qwen4_admission_tests {
         // The frozen resident prefill uses the same original donor experts.
         assert_eq!(cache_stage, plain_stage);
         assert!(cache.device_reserve_bytes(48, 512, 10).unwrap() > 32 << 20);
+        let batch_config = cache.with_verify_rows(8).unwrap();
+        let (batch, batch_pin, batch_stage) = run(128 << 20, Some(batch_config), None).unwrap();
+        assert_eq!(batch_pin, cache_pin);
+        assert_eq!(batch_stage, cache_stage);
+        assert_eq!(batch.logical_digest(), cached.logical_digest());
+        let tight_single_total = cache_pin
+            + cache_stage
+            + super::qwen4_expert_table_bytes(true, (48, 512, false)).unwrap()
+            - hipfire_arch_qwen4::expert_residency::EXPERT_TIER_TABLE_BYTES
+            + cache.device_reserve_bytes(48, 512, 10).unwrap()
+            + cached.owner_bytes(Placement::Device)
+            - plain.owner_bytes(Placement::Device);
+        assert!(run(tight_single_total, Some(cache), None).is_ok());
+        // The same pinned expert set is no permission to omit the wider route
+        // landing extent: a budget that fits singleton must refuse this batch.
+        assert!(run(tight_single_total, Some(batch_config), None).is_err());
         // The plain fixed pin fits exactly; the same quote must refuse the
         // extra cache owners instead of shrinking the requested ranked prefix.
         let tight =
@@ -15395,6 +15411,117 @@ mod qwen4_admission_tests {
         )
         .unwrap();
         assert_eq!(plain.logical_digest(), off.logical_digest());
+    }
+
+    #[test]
+    fn expert_cache_native_mtp_capacity_follows_the_resolved_mode_and_proposal_bound() {
+        use hipfire_arch_qwen4::expert_cache_config::ExpertCacheConfig;
+        let cache = ExpertCacheConfig::parse(Some("1"), None, None)
+            .unwrap()
+            .unwrap();
+        for mtp in [None, Some(false)] {
+            let spec = SpecLoadCfg {
+                mtp,
+                ..SpecLoadCfg::default()
+            };
+            // Auto may legitimately resolve off. The cache does not arm MTP,
+            // and an unused proposal bound must not widen an AR allocation.
+            let actual = super::qwen4_expert_cache_for_native_mtp(Some(cache), spec, false, 63)
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual.verify_rows, 1);
+        }
+        for mtp in [None, Some(true)] {
+            let spec = SpecLoadCfg {
+                mtp,
+                ..SpecLoadCfg::default()
+            };
+            for (drafts, rows) in [(1, 2), (3, 4), (7, 8)] {
+                let actual =
+                    super::qwen4_expert_cache_for_native_mtp(Some(cache), spec, true, drafts)
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(actual.verify_rows, rows);
+            }
+            // The native copy lane's proposal authority may be wider than K.
+            // Never clamp its 9/64-row requests down to a cache-supported 8.
+            for drafts in [8, 63] {
+                let error =
+                    super::qwen4_expert_cache_for_native_mtp(Some(cache), spec, true, drafts)
+                        .unwrap_err();
+                assert!(error.contains("supported capacity"));
+            }
+        }
+        let explicit = SpecLoadCfg {
+            mtp: Some(true),
+            ..SpecLoadCfg::default()
+        };
+        assert!(
+            super::qwen4_expert_cache_for_native_mtp(Some(cache), explicit, false, 3)
+                .unwrap_err()
+                .contains("explicit native MTP")
+        );
+        let off = SpecLoadCfg {
+            mtp: Some(false),
+            ..SpecLoadCfg::default()
+        };
+        assert!(super::qwen4_expert_cache_for_native_mtp(Some(cache), off, true, 3).is_err());
+        // Cache-off retains the ordinary loader's decisions and capacities.
+        assert!(
+            super::qwen4_expert_cache_for_native_mtp(None, explicit, true, 63)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn expert_cache_native_mtp_does_not_admit_independent_drafters() {
+        use hipfire_arch_qwen4::expert_cache_config::ExpertCacheConfig;
+        let cache = ExpertCacheConfig::parse(Some("1"), None, None)
+            .unwrap()
+            .unwrap();
+        for spec in [
+            SpecLoadCfg {
+                dflash: Some(true),
+                ..SpecLoadCfg::default()
+            },
+            SpecLoadCfg {
+                dspark: Some(true),
+                ..SpecLoadCfg::default()
+            },
+            SpecLoadCfg {
+                ngram_draft: Some(true),
+                ..SpecLoadCfg::default()
+            },
+        ] {
+            let error =
+                super::qwen4_expert_cache_for_native_mtp(Some(cache), spec, true, 7).unwrap_err();
+            assert!(
+                error.contains("does not support DFlash, DSpark or the independent n-gram drafter")
+            );
+        }
+        for mtp in [None, Some(false), Some(true)] {
+            let spec = SpecLoadCfg {
+                mtp,
+                ..SpecLoadCfg::default()
+            };
+            for cache_enabled in [false, true] {
+                assert!(super::qwen4_refuse_explicit_mtp_decline(
+                    cache_enabled,
+                    spec,
+                    false,
+                    "test route"
+                )
+                .is_ok());
+                let declined = super::qwen4_refuse_explicit_mtp_decline(
+                    cache_enabled,
+                    spec,
+                    true,
+                    "host spill test",
+                );
+                assert_eq!(declined.is_err(), cache_enabled && mtp == Some(true));
+            }
+        }
     }
 
     /// Uniform metadata slabs (padded payload 1,536 B per expert) and the id

@@ -414,6 +414,42 @@ impl CacheBank {
             _ => None,
         }
     }
+    /// Resolve a diagnostic ticket against the real shared-bank cell rather
+    /// than inferring slot ownership from the mutable publication snapshot.
+    #[cfg(feature = "lab")]
+    fn diagnostic_slot(
+        &self,
+        global: usize,
+        layer: usize,
+        local: usize,
+        expert: usize,
+        generation: u64,
+        phase: SlotPhaseView,
+    ) -> Result<()> {
+        let cell = self
+            .cells
+            .get(global)
+            .and_then(Option::as_ref)
+            .ok_or("expert cache diagnostic slot has no bank cell")?;
+        let identity = match cell {
+            SlotCell::Filling(slot) => (slot.slot(), slot.fill_generation(), slot.occupant()),
+            SlotCell::Resident(slot) => (slot.slot(), slot.fill_generation(), slot.occupant()),
+            _ => {
+                return Err("expert cache diagnostic slot has no live fill/resident ticket".into())
+            }
+        };
+        if layer >= LAYERS
+            || expert >= EXPERTS
+            || self.meta.get(global) != Some(&(layer, local))
+            || cell.phase() != phase
+            || identity != (global as u32, generation, (layer * EXPERTS + expert) as u64)
+        {
+            return Err(
+                "expert cache diagnostic bank ticket disagrees with layer/local identity".into(),
+            );
+        }
+        Ok(())
+    }
     fn touch(&mut self, slot: usize) {
         self.clock = self.clock.saturating_add(1);
         self.last_used[slot] = self.clock;
@@ -923,6 +959,128 @@ impl ExpertCache {
     pub(crate) fn verify_rows(&self) -> usize {
         self.verify_rows
     }
+    /// Idle CPU metadata only: never polls a copy fence, waits for DMA,
+    /// publishes tables, updates policy, or makes a device-quiescence claim.
+    #[cfg(feature = "lab")]
+    pub(crate) fn diagnostic_snapshot(&self) -> Result<serde_json::Value> {
+        self.check_readers_idle()?;
+        let bank = self
+            .bank
+            .as_ref()
+            .ok_or("expert cache diagnostic bank is absent")?;
+        if bank.bank.is_none()
+            || bank.generation.is_none()
+            || bank.backing.is_some()
+            || self.layers.len() != LAYERS
+        {
+            return Err("expert cache diagnostic bank has no idle sealed generation".into());
+        }
+        let snapshots = self
+            .layers
+            .iter()
+            .map(|state| state.binding.residency.snapshot())
+            .collect::<Result<Vec<_>>>()?;
+        let mut pending = Vec::new();
+        let mut pending_slots = vec![false; bank.meta.len()];
+        for fill in &self.pending {
+            for &(global, generation) in fill.batch.fills() {
+                let global = global as usize;
+                let &(layer, local) = bank
+                    .meta
+                    .get(global)
+                    .ok_or("expert cache diagnostic pending global slot is absent")?;
+                let expert = match bank.cells.get(global).and_then(Option::as_ref) {
+                    Some(SlotCell::Filling(slot)) => {
+                        usize::try_from(slot.occupant())
+                            .map_err(|_| "expert cache diagnostic occupant overflow")?
+                            % EXPERTS
+                    }
+                    _ => return Err("expert cache diagnostic pending slot is not Filling".into()),
+                };
+                bank.diagnostic_slot(
+                    global,
+                    layer,
+                    local,
+                    expert,
+                    generation,
+                    SlotPhaseView::Filling,
+                )?;
+                let state = self
+                    .layers
+                    .get(layer)
+                    .ok_or("expert cache diagnostic pending layer is absent")?;
+                let slot = state
+                    .slots
+                    .get(local)
+                    .ok_or("expert cache diagnostic pending local slot is absent")?;
+                if std::mem::replace(&mut pending_slots[global], true)
+                    || state.slot_ids.get(local) != Some(&global)
+                    || state.index.get(expert) != Some(&Some(global))
+                    || snapshots[layer].mapping[expert] != ResidencyLocation::Canonical
+                {
+                    return Err(
+                        "expert cache diagnostic pending ticket/index/publication mismatch".into(),
+                    );
+                }
+                pending.push(serde_json::json!({
+                    "layer": layer, "slot": local, "global_slot": global,
+                    "expert": expert, "generation": generation,
+                    "gate_up": slot.ranges.gate_up_device.0,
+                    "gate_up_bytes": slot.ranges.gate_up_device.1,
+                    "down": slot.ranges.down_device.0,
+                    "down_bytes": slot.ranges.down_device.1,
+                }));
+            }
+        }
+        let layers = self.layers.iter().zip(&snapshots).enumerate().map(|(layer, (state, snapshot))| {
+            let cap = &state.binding.residency;
+            let mapping = snapshot.mapping.iter().enumerate().map(|(expert, location)| {
+                match location {
+                    ResidencyLocation::Canonical => Ok(serde_json::Value::Null),
+                    ResidencyLocation::Slot(ticket) => {
+                        let global = *state.slot_ids.get(ticket.slot)
+                            .ok_or("expert cache diagnostic published local slot is absent")?;
+                        let slot = state.slots.get(ticket.slot)
+                            .ok_or("expert cache diagnostic published slot ranges are absent")?;
+                        bank.diagnostic_slot(global, layer, ticket.slot, expert,
+                            ticket.generation, SlotPhaseView::Resident)?;
+                        if ticket.expert != expert || state.index.get(expert) != Some(&Some(global))
+                            || snapshot.gate_up[expert] != slot.ranges.gate_up_device.0
+                            || snapshot.down[expert] != slot.ranges.down_device.0
+                            || cap.canonical_gate_up()[expert].bytes != slot.ranges.gate_up_device.1
+                            || cap.canonical_down()[expert].bytes != slot.ranges.down_device.1
+                        {
+                            return Err("expert cache diagnostic published GU/DN pair disagrees with bank ticket".into());
+                        }
+                        Ok(serde_json::json!({
+                            "slot": ticket.slot, "global_slot": global, "expert": ticket.expert,
+                            "generation": ticket.generation,
+                            "gate_up": slot.ranges.gate_up_device.0,
+                            "gate_up_bytes": slot.ranges.gate_up_device.1,
+                            "down": slot.ranges.down_device.0,
+                            "down_bytes": slot.ranges.down_device.1,
+                        }))
+                    }
+                }
+            }).collect::<Result<Vec<_>>>()?;
+            Ok(serde_json::json!({
+                "layer": layer, "epoch": snapshot.epoch,
+                "gate_up": snapshot.gate_up.as_ref(), "down": snapshot.down.as_ref(),
+                "canonical_gate_up": cap.canonical_gate_up().iter().map(|span| span.address).collect::<Vec<_>>(),
+                "canonical_down": cap.canonical_down().iter().map(|span| span.address).collect::<Vec<_>>(),
+                "mapping": mapping,
+            }))
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(serde_json::json!({
+            "schema": "hipfire-expert-cache-snapshot-v1",
+            "slot_authority": "railgun::sealed_table::generation::SlotBank",
+            "observation": "idle CPU metadata; no copy-fence query or device wait",
+            "bank_epoch": bank.epoch, "stats": self.stats,
+            "rows_cap": self.verify_rows, "outstanding": self.outstanding.load(Ordering::Acquire),
+            "poisoned": self.poisoned, "pending": pending, "layers": layers,
+        }))
+    }
+
     pub(crate) fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -1722,6 +1880,83 @@ mod tests {
             .pop()
             .unwrap()
     }
+    #[cfg(feature = "lab")]
+    #[test]
+    fn expert_cache_diagnostic_tickets_resolve_real_bank_global_and_local_slots() {
+        let mut bank = CacheBank::new(
+            (0x70000, 64),
+            7,
+            vec![
+                vec![
+                    SlotSpan {
+                        offset: 0,
+                        bytes: 16,
+                    },
+                    SlotSpan {
+                        offset: 16,
+                        bytes: 16,
+                    },
+                ],
+                vec![
+                    SlotSpan {
+                        offset: 32,
+                        bytes: 16,
+                    },
+                    SlotSpan {
+                        offset: 48,
+                        bytes: 16,
+                    },
+                ],
+            ],
+            vec![(2, 0), (5, 0)],
+            vec![Binding {
+                base: 0x71000,
+                bytes: 16,
+            }],
+        )
+        .unwrap();
+        assert!(bank
+            .diagnostic_slot(1, 5, 0, 19, 1, SlotPhaseView::Filling)
+            .is_err());
+        bank.retire_idle().unwrap();
+        let ticket = bank.start_fill(1, (5 * EXPERTS + 19) as u64).unwrap();
+        bank.diagnostic_slot(1, 5, 0, 19, 1, SlotPhaseView::Filling)
+            .unwrap();
+        // The local slot is zero on both layers, but only global slot 1 owns this ticket.
+        for (global, layer, local, expert, generation, phase) in [
+            (0, 5, 0, 19, 1, SlotPhaseView::Filling),
+            (1, 2, 0, 19, 1, SlotPhaseView::Filling),
+            (1, 5, 1, 19, 1, SlotPhaseView::Filling),
+            (1, 5, 0, 20, 1, SlotPhaseView::Filling),
+            (1, 5, 0, 19, 2, SlotPhaseView::Filling),
+            (1, 5, 0, 19, 1, SlotPhaseView::Resident),
+        ] {
+            assert!(bank
+                .diagnostic_slot(global, layer, local, expert, generation, phase)
+                .is_err());
+        }
+        let mut fence = cpu_fence(false);
+        let raw = bank.bank.as_mut().unwrap();
+        let pending = raw
+            .issue_fills(vec![ticket], &mut fence, &mut |_| Ok(()))
+            .unwrap();
+        assert_eq!(pending.fills(), &[(1, 1)]);
+        let complete = raw
+            .complete_fills(pending, &mut fence, true)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            bank.complete(1, complete).unwrap(),
+            ((5 * EXPERTS + 19) as u64, 1)
+        );
+        bank.diagnostic_slot(1, 5, 0, 19, 1, SlotPhaseView::Resident)
+            .unwrap();
+        assert!(bank
+            .diagnostic_slot(1, 5, 0, 19, 1, SlotPhaseView::Filling)
+            .is_err());
+    }
+
     #[test]
     fn expert_cache_bank_reader_blocks_publication_and_known_cancellation_returns_authority() {
         let mut bank = bank_fixture(0x10000);
@@ -1747,24 +1982,26 @@ mod tests {
     }
     #[test]
     fn expert_cache_bank_unknown_reader_and_dropped_token_never_reopen_backing() {
-        for drop_token in [false, true] {
-            let mut bank = bank_fixture(0x20000);
-            let reader = bank.acquire_reader().unwrap();
-            if drop_token {
-                let outstanding = Arc::new(AtomicBool::new(true));
-                drop(ExpertCacheToken {
-                    guards: Vec::new(),
-                    reader: Some(reader),
-                    outstanding: outstanding.clone(),
-                    rows: 1,
-                });
-                assert!(outstanding.load(Ordering::Acquire));
-            } else {
-                assert!(bank.finish_reader(reader, &mut cpu_fence(true)).is_err());
+        for rows in [1, MutableExpertResidency::MAX_VERIFY_ROWS] {
+            for drop_token in [false, true] {
+                let mut bank = bank_fixture(0x20000);
+                let reader = bank.acquire_reader().unwrap();
+                if drop_token {
+                    let outstanding = Arc::new(AtomicBool::new(true));
+                    drop(ExpertCacheToken {
+                        guards: Vec::new(),
+                        reader: Some(reader),
+                        outstanding: outstanding.clone(),
+                        rows,
+                    });
+                    assert!(outstanding.load(Ordering::Acquire));
+                } else {
+                    assert!(bank.finish_reader(reader, &mut cpu_fence(true)).is_err());
+                }
+                assert!(bank.retire_idle().is_err());
+                assert!(bank.require_backing().is_err());
+                assert_eq!(bank.bank.as_ref().unwrap().live_generations(), 1);
             }
-            assert!(bank.retire_idle().is_err());
-            assert!(bank.require_backing().is_err());
-            assert_eq!(bank.bank.as_ref().unwrap().live_generations(), 1);
         }
     }
     #[test]
@@ -1796,6 +2033,121 @@ mod tests {
         assert!(
             b.choose(&[0]).is_none(),
             "partial pair cannot be reused or published"
+        );
+    }
+
+    #[test]
+    fn expert_cache_batch_readback_requires_every_layer_and_row() {
+        let rows = MutableExpertResidency::MAX_VERIFY_ROWS;
+        let ids: Vec<_> = (0..LAYERS)
+            .flat_map(|layer| {
+                (0..rows).flat_map(move |row| {
+                    (0..TOPK).map(move |k| ((layer + row + k) % EXPERTS) as i32)
+                })
+            })
+            .collect();
+        validate_routes(rows, &ids).unwrap();
+        assert!(validate_routes(rows, &ids[..LAYERS * TOPK]).is_err());
+        let mut incomplete = ids.clone();
+        *incomplete.last_mut().unwrap() = -1;
+        assert!(validate_routes(rows, &incomplete).is_err());
+        incomplete[ids.len() - 1] = 512;
+        assert!(validate_routes(rows, &incomplete).is_err());
+        let mut duplicate = ids.clone();
+        duplicate[TOPK] = duplicate[TOPK + 1];
+        assert!(validate_routes(rows, &duplicate).is_err());
+        // Different executed rows may select identical expert sets.
+        let mut repeated_rows = ids;
+        repeated_rows[TOPK..2 * TOPK].copy_from_slice(&(0..TOPK as i32).collect::<Vec<_>>());
+        repeated_rows[..TOPK].copy_from_slice(&(0..TOPK as i32).collect::<Vec<_>>());
+        validate_routes(rows, &repeated_rows).unwrap();
+        for rows in [0, 9, usize::MAX] {
+            assert!(validate_routes(rows, &[]).is_err());
+        }
+    }
+
+    #[test]
+    fn expert_cache_batch_counts_repeated_reads_without_duplicate_fills_or_victim_revival() {
+        let mut bank = bank_fixture(0x60000);
+        bank.retire_idle().unwrap();
+        let done = cpu_completed(&mut bank, 10);
+        assert_eq!(bank.complete(0, done).unwrap(), (10, 1));
+        bank.seal_idle().unwrap();
+
+        let pair = HostPair {
+            gate_up: (0, 2),
+            down: (0, 3),
+        };
+        let mut host = vec![None; EXPERTS];
+        host[10] = Some(pair);
+        host[11] = Some(pair);
+        let mut index = vec![None; EXPERTS];
+        index[10] = Some(0);
+        let mut mapping = vec![ResidencyLocation::Canonical; EXPERTS];
+        mapping[10] = ResidencyLocation::Slot(ResidencySlotTicket {
+            slot: 0,
+            expert: 10,
+            generation: 1,
+        });
+        let row = [10, 11, 0, 1, 2, 3, 4, 5, 6, 7];
+        let ids = [row, row].concat();
+        let mut stats = ExpertCacheStats::default();
+        for selected in ids.chunks_exact(TOPK) {
+            account_routes(&mut stats, selected, &host, &mapping).unwrap();
+        }
+        assert_eq!(
+            (
+                stats.selected,
+                stats.core_hits,
+                stats.cache_hits,
+                stats.host_misses,
+                stats.miss_bytes
+            ),
+            (20, 16, 2, 2, 10)
+        );
+        let visits = bank.visit_routes(&ids, &host, &index);
+        assert_eq!(
+            visits.misses,
+            [11],
+            "cross-row miss must request exactly one paired fill"
+        );
+        assert_eq!(visits.accesses, [10, 11]);
+
+        // Exercise the production bank transitions after whole-batch collection:
+        // the only victim becomes Canonical before its slot starts filling.
+        bank.retire_idle().unwrap();
+        let slot = bank.choose(&[0]).unwrap();
+        let victim = bank.occupant(slot).unwrap() as usize;
+        index[victim] = None;
+        mapping[victim] = ResidencyLocation::Canonical;
+        bank.evict(slot).unwrap();
+        let ticket = bank.start_fill(slot, visits.misses[0] as u64).unwrap();
+        index[11] = Some(slot);
+        bank.touch_survivors(&visits.accesses, &index);
+        assert_eq!(mapping[10], ResidencyLocation::Canonical);
+        assert!(index[10].is_none());
+        assert_eq!(bank.occupant(slot), Some(11));
+        assert_eq!(bank.phase(slot), SlotPhaseView::Filling);
+        assert!(
+            bank.choose(&[0]).is_none(),
+            "pending pair must not be selected again"
+        );
+        assert_eq!(ticket.write_spans().len(), 2);
+        let mut fence = cpu_fence(false);
+        let raw = bank.bank.as_mut().unwrap();
+        let pending = raw
+            .issue_fills(vec![ticket], &mut fence, &mut |_| Ok(()))
+            .unwrap();
+        let done = raw
+            .complete_fills(pending, &mut fence, true)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(bank.complete(slot, done).unwrap(), (11, 2));
+        assert_eq!(
+            (stats.cache_hits, stats.host_misses),
+            (2, 2),
+            "later publication cannot rewrite the batch's executed reads"
         );
     }
 

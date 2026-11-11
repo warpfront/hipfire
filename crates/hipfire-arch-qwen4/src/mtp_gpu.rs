@@ -2163,6 +2163,44 @@ impl MtpGpuState {
         self.position
     }
 
+    /// Actual boundary flags and range identity scalars. The latter only
+    /// checks the existing session layout; no owner or mutable tensor escapes.
+    #[cfg(feature = "lab")]
+    pub(crate) fn lab_boundary_controls(&self) -> (Option<usize>, Option<usize>, usize, usize) {
+        (
+            self.boundary_saved,
+            self.boundary_restored,
+            self.boundary_hidden.buf.as_ptr() as usize,
+            self.boundary_hidden.byte_size(),
+        )
+    }
+
+    /// Physical/transaction bookkeeping for lab receipts. These process-local
+    /// identities and rollback arena marks are not cross-process state hashes.
+    #[cfg(feature = "lab")]
+    pub(crate) fn lab_control_census(&self) -> serde_json::Value {
+        let arena = &self.snapshot_arena;
+        serde_json::json!({
+            "position": self.position, "step_index": self.step_index,
+            "full_len": self.full_len, "raw_len": self.raw_len,
+            "pooled_len": self.pooled_len, "selected_len": self.selected_len,
+            "boundary_saved": self.boundary_saved, "boundary_restored": self.boundary_restored,
+            "compress": self.compress, "backend": format!("{:?}", self.backend),
+            "mapped_tokens": self.mapped_tokens,
+            "full_capacity": self.full_capacity, "raw_capacity": self.raw_capacity,
+            "pooled_capacity": self.pooled_capacity, "selected_capacity": self.selected_capacity,
+            "request_epoch": self.request_epoch, "generation": self.generation,
+            "model_id": self.model_id,
+            "snapshot_arena": {
+                "active": arena.active, "retained": arena.retained,
+                "generation": arena.generation, "model_id": arena.model_id,
+                "mark": { "position": arena.mark.position, "step_index": arena.mark.step_index,
+                    "full_len": arena.mark.full_len, "raw_len": arena.mark.raw_len,
+                    "pooled_len": arena.mark.pooled_len, "selected_len": arena.mark.selected_len },
+            },
+        })
+    }
+
     pub(crate) fn parity_metadata(&self) -> MtpStateParityMetadata {
         MtpStateParityMetadata::from_state(self)
     }

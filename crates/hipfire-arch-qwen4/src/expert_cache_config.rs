@@ -223,7 +223,7 @@ mod tests {
         let c = ExpertCacheConfig::parse(Some("true"), None, None)
             .unwrap()
             .unwrap();
-        assert_eq!((c.tail_percent, c.max_inflight), (50, 64));
+        assert_eq!((c.tail_percent, c.max_inflight, c.verify_rows), (50, 64, 1));
         for raw in ["", "yes", "2"] {
             assert!(ExpertCacheConfig::parse(Some(raw), None, None).is_err());
         }
@@ -339,5 +339,37 @@ mod tests {
                 "cache={cache_enabled} check={setting:?}",
             );
         }
+    }
+
+    #[test]
+    fn expert_cache_verify_window_reserve_matches_the_exact_route_extent() {
+        let single = ExpertCacheConfig::parse(Some("1"), None, None)
+            .unwrap()
+            .unwrap();
+        let tables = 48 * 512 * 16;
+        let ids_per_row = 48 * 10 * std::mem::size_of::<u32>();
+        for rows in [1, 2, 4, EXPERT_CACHE_MAX_VERIFY_ROWS] {
+            let config = single.with_verify_rows(rows).unwrap();
+            assert_eq!(
+                config.device_reserve_bytes(48, 512, 10).unwrap(),
+                (tables + ids_per_row * rows + (32 << 20)) as u64,
+            );
+        }
+        for rows in [0, EXPERT_CACHE_MAX_VERIFY_ROWS + 1, usize::MAX] {
+            let error = single.with_verify_rows(rows).unwrap_err();
+            assert!(error.contains(&format!("{rows} rows")));
+            assert!(error.contains("supported capacity"));
+            // Public policy fields cannot bypass validation at byte admission.
+            let invalid = ExpertCacheConfig {
+                verify_rows: rows,
+                ..single
+            };
+            assert!(invalid.device_reserve_bytes(48, 512, 10).is_err());
+        }
+        let batch = single
+            .with_verify_rows(EXPERT_CACHE_MAX_VERIFY_ROWS)
+            .unwrap();
+        assert!(batch.device_reserve_bytes(1, usize::MAX, 10).is_err());
+        assert!(batch.device_reserve_bytes(48, 512, usize::MAX).is_err());
     }
 }
