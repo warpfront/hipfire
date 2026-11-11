@@ -1122,6 +1122,13 @@ impl QueueDepthReport {
     }
 }
 
+// `amd_queue_t` byte offsets of the scratch fields (ROCr `inc/amd_hsa_queue.h`,
+// identical in v1 and v2).
+const COMPUTE_TMPRING_SIZE: usize = 140;
+const SCRATCH_RESOURCE_DESCRIPTOR: usize = 144;
+const SCRATCH_BACKING_MEMORY_LOCATION: usize = 160;
+const SCRATCH_WAVE64_LANE_BYTE_SIZE: usize = 176;
+
 /// One distinct ROCr user-mode queue.
 pub struct AqlQueue {
     runtime: Option<Arc<RuntimeInner>>,
@@ -1500,12 +1507,9 @@ impl AqlQueue {
     /// starts; retained PM4 queues carry barrier and PM4-IB packets only.
     /// The caller keeps the backing alive for the queue's lifetime.
     pub fn bind_scratch(&mut self, scratch: &Gfx10Scratch) {
-        // `amd_queue_t` byte offsets (ROCr `inc/amd_hsa_queue.h`, also v2).
-        const COMPUTE_TMPRING_SIZE: usize = 140;
-        const SCRATCH_RESOURCE_DESCRIPTOR: usize = 144;
-        const SCRATCH_BACKING_MEMORY_LOCATION: usize = 160;
-        const SCRATCH_WAVE64_LANE_BYTE_SIZE: usize = 176;
         let base = scratch.base_address();
+        let records = u32::try_from(scratch.plan().backing_bytes())
+            .expect("Gfx10ScratchPlan caps the ring backing below 4 GiB");
         let queue = self.raw.as_ptr().cast::<u8>();
         // SAFETY: ROCr's queue object is an `amd_queue_t`, live until Drop;
         // `&mut self` excludes concurrent publication on this queue.
@@ -1518,10 +1522,7 @@ impl AqlQueue {
                 word(SCRATCH_RESOURCE_DESCRIPTOR + 4),
                 (srd1 & 0xffff_0000) | ((base >> 32) as u32 & 0xffff),
             );
-            ptr::write_volatile(
-                word(SCRATCH_RESOURCE_DESCRIPTOR + 8),
-                scratch.plan().backing_bytes() as u32,
-            );
+            ptr::write_volatile(word(SCRATCH_RESOURCE_DESCRIPTOR + 8), records);
             ptr::write_volatile(
                 queue.add(SCRATCH_BACKING_MEMORY_LOCATION).cast::<u64>(),
                 base,
@@ -1533,6 +1534,20 @@ impl AqlQueue {
             ptr::write_volatile(word(COMPUTE_TMPRING_SIZE), scratch.tmpring_size());
         }
         std::sync::atomic::fence(Ordering::Release);
+    }
+
+    /// The scratch ring the command processor restores this queue with:
+    /// `amd_queue_t` (`compute_tmpring_size`, `scratch_backing_memory_location`).
+    /// `(0, 0)` for a queue without one; see [`Self::bind_scratch`].
+    pub fn scratch_binding(&self) -> (u32, u64) {
+        let queue = self.raw.as_ptr().cast::<u8>();
+        // SAFETY: ROCr's queue object is an `amd_queue_t`, live until Drop.
+        unsafe {
+            (
+                ptr::read_volatile(queue.add(COMPUTE_TMPRING_SIZE).cast::<u32>()),
+                ptr::read_volatile(queue.add(SCRATCH_BACKING_MEMORY_LOCATION).cast::<u64>()),
+            )
+        }
     }
 
     fn descriptor(&self) -> &abi::Queue {
@@ -1836,6 +1851,11 @@ impl QueueSet {
         self.queues
             .get_mut(lane)
             .map(|queue| queue.bind_scratch(scratch))
+    }
+
+    /// [`AqlQueue::scratch_binding`] of lane `lane`; `None` when out of range.
+    pub fn scratch_binding(&self, lane: usize) -> Option<(u32, u64)> {
+        self.queues.get(lane).map(AqlQueue::scratch_binding)
     }
 
     /// Read lane `lane`'s effective CU affinity via `AqlQueue::cu_mask`.
