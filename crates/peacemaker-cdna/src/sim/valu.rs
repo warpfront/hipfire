@@ -1114,12 +1114,19 @@ impl V {
                     mask |= u64::from(r) << l;
                 }
             }
-            CmpEqU64 | CmpNeU64 => {
+            CmpEqU64 | CmpNeU64 | CmpGtI64 | CmpGeI64 => {
                 self.plain()?;
                 self.check(w, 0, Out::Ignore, 0)?;
                 for l in self.lanes(w) {
                     let (a, b) = (self.q(w, 0, l)?, self.q(w, 1, l)?);
-                    mask |= u64::from(if op == CmpEqU64 { a == b } else { a != b }) << l;
+                    let (sa, sb) = (a as i64, b as i64);
+                    let t = match op {
+                        CmpEqU64 => a == b,
+                        CmpNeU64 => a != b,
+                        CmpGtI64 => sa > sb,
+                        _ => sa >= sb,
+                    };
+                    mask |= u64::from(t) << l;
                 }
             }
             _ => {

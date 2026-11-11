@@ -862,6 +862,8 @@ const DEDICATED: &[&str] = &[
     "v_lshl_add_u64",
     "v_cmp_eq_u64",
     "v_cmp_ne_u64",
+    "v_cmp_gt_i64",
+    "v_cmp_ge_i64",
 ];
 
 #[test]
@@ -1045,6 +1047,86 @@ fn vopc_u64_compares() {
             let eq = w.v[10][l] == w.v[12][l] && w.v[11][l] == w.v[13][l];
             let want = w.exec >> l & 1 != 0 && (eq == (op == VopcOp::CmpEqU64));
             assert_eq!(w.vcc >> l & 1 != 0, want, "{} lane {l}", op.name());
+        }
+    }
+}
+
+#[test]
+fn vopc_i64_signed_compares() {
+    let edges: [u64; 12] = [
+        0,
+        1,
+        u64::MAX,
+        i64::MAX as u64,
+        i64::MIN as u64,
+        (i64::MIN as u64) + 1,
+        0x0000_0000_ffff_ffff,
+        0x0000_0001_0000_0000,
+        0xffff_ffff_0000_0000,
+        0xffff_ffff_ffff_fffe,
+        0x8000_0000_0000_0001,
+        0x7fff_ffff_0000_0000,
+    ];
+    let exec_masks = [u64::MAX, 0xffff_0000_ffff_00ffu64, 0xaaaa_aaaa_aaaa_aaaa, 0];
+    for op in [VopcOp::CmpGtI64, VopcOp::CmpGeI64] {
+        let ge = op == VopcOp::CmpGeI64;
+        let want = |a: u64, b: u64| {
+            if ge {
+                (a as i64) >= (b as i64)
+            } else {
+                (a as i64) > (b as i64)
+            }
+        };
+        let mut r = Rng(0x1f64);
+        for &exec in &exec_masks {
+            for vop3_form in [false, true] {
+                let mut pairs: Vec<(u64, u64)> = Vec::new();
+                for &a in &edges {
+                    for &b in &edges {
+                        pairs.push((a, b));
+                    }
+                }
+                for l in 0..64 {
+                    let a = r.next();
+                    pairs.push((a, if l % 4 == 0 { a } else { r.next() }));
+                }
+                while pairs.len() % WAVE != 0 {
+                    pairs.push((0, 0));
+                }
+                for chunk in pairs.chunks(WAVE) {
+                    let mut w = wave();
+                    w.exec = exec;
+                    for (l, &(a, b)) in chunk.iter().enumerate() {
+                        w.v[10][l] = a as u32;
+                        w.v[11][l] = (a >> 32) as u32;
+                        w.v[12][l] = b as u32;
+                        w.v[13][l] = (b >> 32) as u32;
+                    }
+                    let inst = if vop3_form {
+                        v3(vop3(Vop3Op::C(op), Src::Sgpr(8), &[vg(10), vg(12)]))
+                    } else {
+                        vc(op, vg(10), vg(12))
+                    };
+                    exec_ok(&mut w, &inst);
+                    assert_eq!(w.exec, exec);
+                    let got = if vop3_form {
+                        assert_eq!(
+                            w.vcc,
+                            u64::from(POISON) | u64::from(POISON) << 32,
+                            "VOP3 compare must not touch VCC"
+                        );
+                        u64::from(w.s[8]) | u64::from(w.s[9]) << 32
+                    } else {
+                        w.vcc
+                    };
+                    let exp = chunk
+                        .iter()
+                        .enumerate()
+                        .filter(|&(l, &(a, b))| exec >> l & 1 != 0 && want(a, b))
+                        .fold(0u64, |m, (l, _)| m | 1 << l);
+                    assert_eq!(got, exp, "{} exec={exec:#x} vop3={vop3_form}", op.name());
+                }
+            }
         }
     }
 }

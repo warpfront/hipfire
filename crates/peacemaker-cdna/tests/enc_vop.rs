@@ -1195,3 +1195,46 @@ fn unordered_float_compares_pinned() {
         assert_eq!(inst.to_string(), format!("{name}_e32 vcc, s0, v0"));
     }
 }
+
+/// Signed 64-bit compares (gfx942 opcodes 228 / 230), bytes proven against
+/// the hardware oracle: `v_cmp_gt_i64 vcc, v[0:1], v[2:3]` = `00 05 c8 7d`,
+/// `v_cmp_ge_i64 vcc, v[0:1], v[2:3]` = `00 05 cc 7d`.
+#[test]
+fn signed_i64_compares_pinned() {
+    for (op, word, name, opcode) in [
+        (VopcOp::CmpGtI64, 0x7dc8_0500u32, "v_cmp_gt_i64", 228u8),
+        (VopcOp::CmpGeI64, 0x7dcc_0500, "v_cmp_ge_i64", 230),
+    ] {
+        assert_eq!(op.name(), name);
+        assert_eq!(op.opcode(A), Some(opcode));
+        assert_eq!(op.src_dwords(), 2);
+        assert!(!op.is_cmpx());
+        let inst = ic(op, Vgpr(0), Vgpr(2), VopExt::None);
+        assert_eq!(inst.words(A).unwrap(), [word], "{name}");
+        assert_eq!(
+            Inst::decode(A, &[word]).unwrap(),
+            (inst.clone(), 1),
+            "{name}"
+        );
+        assert_eq!(inst.to_string(), format!("{name}_e32 vcc, v[0:1], v[2:3]"));
+
+        // Width bounds: a pair at v254 is the last legal VSRC1; v255 and an
+        // odd-width operand fall off the file / are refused.
+        assert!(ic(op, Vgpr(2), Vgpr(254), VopExt::None).words(A).is_ok());
+        assert!(ic(op, Vgpr(2), Vgpr(255), VopExt::None).words(A).is_err());
+        // No SDWA / DPP form for a 64-bit compare.
+        assert!(ic(op, Vgpr(2), Vgpr(4), VopExt::Sdwa(sdwa()))
+            .words(A)
+            .is_err());
+
+        let f = ic(op, Sgpr(4), Vgpr(6), VopExt::None).footprint();
+        assert!(
+            has(&f.uses, RegFile::Exec, 0, 2)
+                && has(&f.uses, RegFile::Sgpr, 4, 2)
+                && has(&f.uses, RegFile::Vgpr, 6, 2)
+                && has(&f.defs, RegFile::Vcc, 0, 2)
+                && !has(&f.defs, RegFile::Exec, 0, 2),
+            "{name}"
+        );
+    }
+}

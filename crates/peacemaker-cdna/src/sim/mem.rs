@@ -405,7 +405,7 @@ fn ds(w: &Wave, i: &Ds) -> SimResult<Prepared> {
         ReadU8 | ReadI8 => (1, true, i.op == ReadI8, false, false, None),
         ReadU16 | ReadI16 => (2, true, i.op == ReadI16, false, false, None),
         WriteB8 => (1, false, false, false, false, None),
-        WriteB16 => (2, false, false, false, false, None),
+        WriteB16 | WriteB16D16Hi => (2, false, false, false, false, None),
         WriteB32 => (4, false, false, false, false, None),
         WriteB64 => (8, false, false, false, false, None),
         WriteB96 => (12, false, false, false, false, None),
@@ -487,12 +487,16 @@ fn ds(w: &Wave, i: &Ds) -> SimResult<Prepared> {
                         dst,
                     }
                 } else {
-                    Action::Store(store_data(
-                        w,
-                        required(if part == 0 { i.data0 } else { i.data1 }, "DS store data")?,
-                        lane,
-                        size,
-                    )?)
+                    let src = required(if part == 0 { i.data0 } else { i.data1 }, "DS store data")?;
+                    if i.op == WriteB16D16Hi {
+                        // Upper 16 bits of the data dword, stored as two LDS bytes.
+                        let hi = w.read_v(src, lane, Ty::B32)?.to_le_bytes();
+                        let mut data = [0; 16];
+                        data[..2].copy_from_slice(&hi[2..]);
+                        Action::Store(data)
+                    } else {
+                        Action::Store(store_data(w, src, lane, size)?)
+                    }
                 };
                 accesses.push(Access {
                     lane,

@@ -259,7 +259,8 @@ impl Vop3Op {
             | C(K::CmpGtU32) | C(K::CmpNeU32) | C(K::CmpGeU32) | C(K::CmpxEqU32)
             | C(K::CmpxNeU32) | C(K::CmpxGtU32) | C(K::CmpxLtU32) | C(K::CmpxGtI32)
             | C(K::CmpxLtI32) | C(K::CmpxGtF32) | C(K::CmpxLtF32) => (2, 1, 1, 0),
-            C(K::CmpEqU64) | C(K::CmpNeU64) | Only(O::AddF64) | Only(O::MulF64) => (2, 2, 2, 0),
+            C(K::CmpEqU64) | C(K::CmpNeU64) | C(K::CmpGtI64) | C(K::CmpGeI64) | Only(O::AddF64)
+            | Only(O::MulF64) => (2, 2, 2, 0),
             V2(B::CndmaskB32) | V2(B::AddcCoU32) | V2(B::SubbCoU32) | V2(B::SubbrevCoU32) => {
                 (1, 1, 1, 2)
             }

@@ -170,6 +170,8 @@ op_table!(VopcOp {
     CmpxLtF32,
     CmpEqU64,
     CmpNeU64,
+    CmpGtI64,
+    CmpGeI64,
 });
 
 impl Vop1Op {
@@ -228,7 +230,10 @@ impl VopcOp {
     }
     /// Source dword width (2 for the `_u64` compares).
     pub fn src_dwords(self) -> u8 {
-        if matches!(self, Self::CmpEqU64 | Self::CmpNeU64) {
+        if matches!(
+            self,
+            Self::CmpEqU64 | Self::CmpNeU64 | Self::CmpGtI64 | Self::CmpGeI64
+        ) {
             2
         } else {
             1
@@ -1961,6 +1966,8 @@ impl VopcOp {
                 Self::CmpxLtF32 => 81,
                 Self::CmpEqU64 => 234,
                 Self::CmpNeU64 => 237,
+                Self::CmpGtI64 => 228,
+                Self::CmpGeI64 => 230,
             }),
         }
     }
@@ -2001,6 +2008,8 @@ impl VopcOp {
             Self::CmpxLtF32 => "v_cmpx_lt_f32",
             Self::CmpEqU64 => "v_cmp_eq_u64",
             Self::CmpNeU64 => "v_cmp_ne_u64",
+            Self::CmpGtI64 => "v_cmp_gt_i64",
+            Self::CmpGeI64 => "v_cmp_ge_i64",
         }
     }
 }
