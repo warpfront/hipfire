@@ -3397,8 +3397,8 @@ pub(crate) fn qwen4_expert_table_entries(
 /// Residency proof of an EP table against its sealed binding: `sealed[e]` is expert `e`'s sealed
 /// `(owner_rank, local_slot)`. An owned expert must name this rank's own source at its slot, any
 /// other expert the zero dummy (decode tables) or its sealed owner's source at its slot (chunk
-/// tables). Unit-arena entries are addressed by the unit map, so only their owner is checked.
-/// Pruned entries (both pointers null) carry no residency.
+/// tables). Unit-arena entries must name their owner's unit-map slot. EP tables are never
+/// pruned (`pruned_expert_entries` refuses them), so a null entry is refused like any other.
 pub(crate) fn check_sealed_residency(
     layout: &Qwen4ExpertTableLayout<'_>,
     local: Qwen4PeerExpertSource,
@@ -3428,9 +3428,6 @@ pub(crate) fn check_sealed_residency(
         )
     };
     for (expert, (entry, &(owner, slot))) in entries.iter().zip(sealed).enumerate() {
-        if entry.gate_up_ptr == 0 && entry.down_ptr == 0 {
-            continue;
-        }
         let peer = |owner: usize| match layout {
             Qwen4ExpertTableLayout::Full { peers, .. } => peers.get(owner).copied(),
             Qwen4ExpertTableLayout::FullUnits { peers, .. } => match peers.get(owner) {
@@ -3440,9 +3437,24 @@ pub(crate) fn check_sealed_residency(
             _ => None,
         };
         let ptrs = Some((entry.gate_up_ptr, entry.down_ptr));
+        let unit = |owner: usize, host: bool| {
+            let arenas = match layout {
+                Qwen4ExpertTableLayout::EpUnits { layer, .. } if owner == rank => layer,
+                Qwen4ExpertTableLayout::FullUnits { peers, .. } => match peers.get(owner) {
+                    Some(PeerLayerSource::Units(arenas)) => arenas,
+                    _ => return false,
+                },
+                _ => return false,
+            };
+            matches!(
+                unit_expert_ptrs("sealed", arenas, expert),
+                Ok(Some((tier, gate_up, down)))
+                    if (tier == UnitTier::Host, Some((gate_up, down))) == (host, ptrs)
+            )
+        };
         let ok = match entry.origin {
             Qwen4ExpertOrigin::Local => owner == rank && ptrs == Some(at(&local, slot)),
-            Qwen4ExpertOrigin::Unit { .. } => owner == rank,
+            Qwen4ExpertOrigin::Unit { host } => owner == rank && unit(owner, host),
             Qwen4ExpertOrigin::Dummy => match layout {
                 Qwen4ExpertTableLayout::Ep { dummy, .. }
                 | Qwen4ExpertTableLayout::EpUnits { dummy, .. } => {
@@ -3456,8 +3468,9 @@ pub(crate) fn check_sealed_residency(
                     && peer(owner).map(|source| at(&source, slot)) == ptrs
             }
             Qwen4ExpertOrigin::PeerUnit {
-                rank: peer_rank, ..
-            } => peer_rank == owner && owner != rank,
+                rank: peer_rank,
+                host,
+            } => peer_rank == owner && owner != rank && unit(owner, host),
             Qwen4ExpertOrigin::Tier => false,
         };
         if !ok {
@@ -3468,6 +3481,24 @@ pub(crate) fn check_sealed_residency(
         }
     }
     Ok(())
+}
+
+/// The dispatch binding a layer table runs under: an EP table's sealed rank binding as given,
+/// a single-device table the rank-0-of-1 table over `metadata`.
+pub(crate) fn layer_table_binding(
+    sealed: Option<(ExpertTable, ExpertBindingCache)>,
+    metadata: Vec<ExpertMetadata>,
+    device: i32,
+) -> Result<(ExpertTable, ExpertBindingCache), Qwen4GpuForwardError> {
+    if let Some(sealed) = sealed {
+        return Ok(sealed);
+    }
+    let table = ExpertTable::new(metadata)
+        .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("expert table: {error:?}")))?;
+    let cache = table
+        .prepare_binding(0, 1, device)
+        .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("expert binding: {error:?}")))?;
+    Ok((table, cache))
 }
 
 /// `expert` is outside the layer's `qwen4.expert_keep` row; dense layers
@@ -5693,20 +5724,7 @@ impl Qwen4MoeLayerRuntime {
             })?;
             metadata.push(if absent { record.into_absent() } else { record });
         }
-        let (table, mut cache) = match sealed {
-            Some(sealed) => sealed,
-            None => {
-                let table = ExpertTable::new(metadata).map_err(|error| {
-                    Qwen4GpuForwardError::Dispatch(format!("expert table: {error:?}"))
-                })?;
-                let cache = table
-                    .prepare_binding(0, 1, gpu.device_id)
-                    .map_err(|error| {
-                        Qwen4GpuForwardError::Dispatch(format!("expert binding: {error:?}"))
-                    })?;
-                (table, cache)
-            }
-        };
+        let (table, mut cache) = layer_table_binding(sealed, metadata, gpu.device_id)?;
 
         let gate_entries = experts
             .iter()
@@ -19355,6 +19373,81 @@ mod ep_table_tests {
         }
         assert!(unit_peers_seen > 0, "no mixed layer was exercised");
         assert!(compact_peers_seen > 0, "no whole-layer peer was exercised");
+    }
+
+    /// The residency proof holds unit tables to their owner's unit-map slot: aliased or
+    /// swapped unit entries, a flipped tier, a peer unit naming this rank's arena and a
+    /// nulled entry are refused; the generated tables pass.
+    #[test]
+    fn residency_proof_pins_unit_entries_to_the_unit_map_and_refuses_null_entries() {
+        use super::check_sealed_residency as check;
+        let mut units_checked = 0usize;
+        for ranks in [2usize, 3] {
+            let sealed: Vec<(usize, usize)> =
+                (0..EXPERTS).map(|e| (e % ranks, e / ranks)).collect();
+            let plan = unit_plan(ranks, 0x5eed + ranks as u64, 200);
+            for layer in 0..UNIT_LAYERS {
+                let maps: Vec<EpUnitLayerMap> =
+                    (0..ranks).map(|rank| plan.layer_map(rank, layer)).collect();
+                if !maps.iter().all(EpUnitLayerMap::is_mixed) {
+                    continue;
+                }
+                let sources: Vec<PeerLayerSource<'_>> = maps
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, map)| PeerLayerSource::Units(arenas_of(map, rank, layer)))
+                    .collect();
+                for rank in 0..ranks {
+                    let placement = Qwen4EpPlacement { rank, ranks };
+                    let (own, next) = (rank, rank + ranks);
+                    let peer = (rank + 1) % ranks;
+                    for layout in [
+                        Qwen4ExpertTableLayout::EpUnits {
+                            placement,
+                            dummy: dummy(),
+                            layer: arenas_of(&maps[rank], rank, layer),
+                        },
+                        Qwen4ExpertTableLayout::FullUnits {
+                            placement,
+                            peers: &sources,
+                        },
+                    ] {
+                        let table = entries(&layout, NO_LOCAL).unwrap();
+                        let proof = |table: &[Qwen4ExpertEntry]| {
+                            check(&layout, NO_LOCAL, table, &sealed, GATE_UP, DOWN)
+                        };
+                        proof(&table).unwrap();
+                        let mut aliased = table.clone();
+                        aliased[next] = table[own];
+                        proof(&aliased).unwrap_err();
+                        let mut swapped = table.clone();
+                        swapped.swap(own, next);
+                        proof(&swapped).unwrap_err();
+                        let mut flipped = table.clone();
+                        if let Qwen4ExpertOrigin::Unit { host } = flipped[own].origin {
+                            flipped[own].origin = Qwen4ExpertOrigin::Unit { host: !host };
+                        }
+                        proof(&flipped).unwrap_err();
+                        let mut nulled = table.clone();
+                        nulled[own].gate_up_ptr = 0;
+                        nulled[own].down_ptr = 0;
+                        proof(&nulled).unwrap_err();
+                        if matches!(layout, Qwen4ExpertTableLayout::FullUnits { .. }) {
+                            let mut stolen = table.clone();
+                            let host =
+                                matches!(table[own].origin, Qwen4ExpertOrigin::Unit { host: true });
+                            stolen[peer] = Qwen4ExpertEntry {
+                                origin: Qwen4ExpertOrigin::PeerUnit { rank: peer, host },
+                                ..table[own]
+                            };
+                            proof(&stolen).unwrap_err();
+                        }
+                        units_checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(units_checked > 0, "no all-mixed layer was exercised");
     }
 
     /// Flag-off identity: a whole-layer plan's unit tables name exactly the pointers today's

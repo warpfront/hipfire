@@ -652,6 +652,35 @@ mod tests {
         }
     }
 
+    /// An EP layer runtime runs under its sealed (rank, contract) binding, never the
+    /// single-device rank-0-of-1 stand-in.
+    #[test]
+    fn ep_layer_table_binds_the_sealed_rank_not_the_single_stand_in() {
+        use crate::gpu_forward::layer_table_binding;
+        let manifest = Qwen4Manifest::build(&crate::config::compact_test_config()).unwrap();
+        let source = source_of(&manifest, 10);
+        for ranks in [2usize, 3, 4] {
+            let devices: Vec<i32> = (0..ranks as i32).collect();
+            let seal =
+                Arc::new(Qwen4EpSeal::seal(&manifest, 48, ranks, &devices, &source, "g1").unwrap());
+            for rank in 0..ranks {
+                let bound = Qwen4EpRankSeal {
+                    seal: seal.clone(),
+                    rank,
+                };
+                let sealed = bound
+                    .expert_binding(0, seal.placement(rank).unwrap(), devices[rank])
+                    .unwrap();
+                let (table, cache) =
+                    layer_table_binding(Some(sealed), Vec::new(), devices[rank]).unwrap();
+                assert_eq!((cache.local_rank(), cache.rank_count()), (rank, ranks));
+                assert!(table
+                    .execution_contract()
+                    .is_some_and(|contract| contract.is_owner_routed_ep()));
+            }
+        }
+    }
+
     /// The generation covers the trunk-overlay sidecar beside the model: one
     /// that appears, is rewritten, or vanishes reads as another generation.
     #[test]
