@@ -652,6 +652,51 @@ impl ThinkCtl {
         let bytes = stream();
         let raw_str = std::str::from_utf8(&bytes).unwrap_or("");
         let in_think = hipfire_runtime::emit_text::currently_in_think(raw_str, started_in_think);
+        self.account(Some(id), in_think, force_answer_now, generated, max_tokens, close_len)
+    }
+
+    /// The think state the singleton AR loop holds after committing
+    /// `committed` (stream bytes `tokenizer`-decoded, as [`Self::step`] sees
+    /// them), for a request moved off a route that enforces only
+    /// `max_think_tokens` (the spec emitter's `ThinkBudget`, which counts the
+    /// same span tokens). `None` when the budget acted on any of them (a
+    /// close, a stop or a latch): that route's enforcement then shaped the
+    /// text, and a lane continuing under this state would not match it.
+    pub fn replay(
+        max_think_tokens: usize,
+        started_in_think: bool,
+        tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+        committed: &[u32],
+    ) -> Option<Self> {
+        let mut ctl = Self::new(max_think_tokens);
+        if !ctl.budgeted() {
+            return Some(ctl);
+        }
+        let mut bytes = Vec::new();
+        let mut scan = InThinkScan::new(started_in_think);
+        for (i, &t) in committed.iter().enumerate() {
+            let fed = bytes.len();
+            tokenizer.decode_token_bytes_into(t, &mut bytes);
+            let in_think = scan.update(&bytes, fed);
+            if ctl.account(None, in_think, false, i + 1, usize::MAX, 0) != ThinkAction::Continue
+                || ctl.force_answer_latched
+            {
+                return None;
+            }
+        }
+        Some(ctl)
+    }
+
+    /// [`Self::step`] after the stream scan; `id` is `None` for a silent replay.
+    fn account(
+        &mut self,
+        id: Option<&str>,
+        in_think: bool,
+        force_answer_now: bool,
+        generated: usize,
+        max_tokens: usize,
+        close_len: usize,
+    ) -> ThinkAction {
         if in_think {
             self.total_think_tokens += 1;
         }
@@ -665,19 +710,23 @@ impl ThinkCtl {
             && in_think
             && self.total_think_tokens >= self.max_total_think + 256
         {
-            eprintln!(
-                "[think-cap] id={} — total think {} exceeded cap {}+256 while still thinking; forcing EOS",
-                id, self.total_think_tokens, self.max_total_think
-            );
+            if let Some(id) = id {
+                eprintln!(
+                    "[think-cap] id={} — total think {} exceeded cap {}+256 while still thinking; forcing EOS",
+                    id, self.total_think_tokens, self.max_total_think
+                );
+            }
             return ThinkAction::Eos;
         }
         if let Some(mark) = self.latch_gen_mark {
             if generated.saturating_sub(mark) >= self.post_latch_budget {
-                eprintln!(
-                    "[think-cap] id={} — {} tokens since think-cap latch without finishing; forcing EOS",
-                    id,
-                    generated.saturating_sub(mark)
-                );
+                if let Some(id) = id {
+                    eprintln!(
+                        "[think-cap] id={} — {} tokens since think-cap latch without finishing; forcing EOS",
+                        id,
+                        generated.saturating_sub(mark)
+                    );
+                }
                 return ThinkAction::Eos;
             }
         }
@@ -701,22 +750,82 @@ impl ThinkCtl {
             &mut self.latch_gen_mark,
         );
         if in_think && (budget_hit || force_answer_now || self.force_answer_latched) {
-            if latched_now {
-                eprintln!(
+            match id {
+                Some(id) if latched_now => eprintln!(
                     "[think-cap] id={} — per-request think cap {} reached; closing <think>",
                     id, self.max_think_tokens
-                );
-            } else if force_answer_now {
-                eprintln!(
+                ),
+                Some(id) if force_answer_now => eprintln!(
                     "[force-answer] id={} — closing <think> mid-turn to commit to the answer",
                     id
-                );
+                ),
+                _ => {}
             }
             self.think_count = 0;
             self.prev_in_think = false;
             return ThinkAction::Close(close_len.min(max_tokens.saturating_sub(generated)));
         }
         ThinkAction::Continue
+    }
+}
+
+/// Incremental `currently_in_think(from_utf8(stream).unwrap_or(""), started)`
+/// over a stream that only grows: the UTF-8 check and the tag search look at
+/// the new bytes only (the tags are ASCII, so a byte match is a `str` match).
+struct InThinkScan {
+    started_in_think: bool,
+    valid_up_to: usize,
+    invalid: bool,
+    last_open: Option<usize>,
+    last_close: Option<usize>,
+}
+
+impl InThinkScan {
+    const OPEN: &'static [u8] = b"<think>";
+    const CLOSE: &'static [u8] = b"</think>";
+
+    fn new(started_in_think: bool) -> Self {
+        Self {
+            started_in_think,
+            valid_up_to: 0,
+            invalid: false,
+            last_open: None,
+            last_close: None,
+        }
+    }
+
+    /// `bytes` is the whole stream; `fed` its length before this token.
+    fn update(&mut self, bytes: &[u8], fed: usize) -> bool {
+        if !self.invalid {
+            match std::str::from_utf8(&bytes[self.valid_up_to..]) {
+                Ok(_) => self.valid_up_to = bytes.len(),
+                Err(e) => {
+                    self.valid_up_to += e.valid_up_to();
+                    // A bad sequence (not a truncated tail) never becomes valid.
+                    self.invalid = e.error_len().is_some();
+                }
+            }
+        }
+        let from = fed.saturating_sub(Self::CLOSE.len() - 1);
+        let last = |tag: &[u8], seen: Option<usize>| {
+            bytes[from..]
+                .windows(tag.len())
+                .rposition(|w| w == tag)
+                .map(|p| from + p)
+                .max(seen)
+        };
+        self.last_open = last(Self::OPEN, self.last_open);
+        self.last_close = last(Self::CLOSE, self.last_close);
+        if self.valid_up_to < bytes.len() {
+            // `from_utf8` fails: the scan sees "".
+            return self.started_in_think;
+        }
+        match (self.last_open, self.last_close) {
+            (Some(o), Some(c)) => o > c,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => self.started_in_think,
+        }
     }
 }
 
@@ -732,4 +841,63 @@ pub struct PromotedConv {
     /// Prompt tokens the singleton prefilled (`prefill_tokens` of the done);
     /// 0 = the lane's `prompt_len`.
     pub prefill_tokens: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hipfire_runtime::emit_text::currently_in_think;
+
+    /// The incremental scan equals the whole-stream scan the AR loop runs, at
+    /// every prefix: tags split across pieces, UTF-8 split across pieces, a
+    /// bad sequence, both start states.
+    #[test]
+    fn in_think_scan_matches_whole_stream_scan() {
+        let streams: [&[&[u8]]; 4] = [
+            &[b"ok <th", b"ink>a", b"b</thi", b"nk>", b"\n<think>", b"x"],
+            &[b"</think>", b"ans", b"<", b"/", b"think>", b"<think><think>"],
+            &[b"<think>\xE2", b"\x82", b"\xAC</think>", b"y"],
+            &[b"<think>", b"\xFF", b"</think>", b"z"],
+        ];
+        for started in [false, true] {
+            for pieces in streams {
+                let mut scan = InThinkScan::new(started);
+                let mut bytes = Vec::new();
+                for piece in pieces {
+                    let fed = bytes.len();
+                    bytes.extend_from_slice(piece);
+                    let whole =
+                        currently_in_think(std::str::from_utf8(&bytes).unwrap_or(""), started);
+                    assert_eq!(scan.update(&bytes, fed), whole, "{started} {bytes:?}");
+                }
+            }
+        }
+    }
+
+    /// Replaying the span count the singleton loop stepped gives its state,
+    /// and a count that reached the cap (the loop closed there) refuses.
+    #[test]
+    fn think_account_replay_stops_at_the_cap() {
+        let mut stepped = ThinkCtl {
+            max_think_tokens: 3,
+            ..ThinkCtl::default()
+        };
+        for (i, in_think) in [true, true, false, true].into_iter().enumerate() {
+            assert_eq!(
+                stepped.account(None, in_think, false, i + 1, usize::MAX, 0),
+                ThinkAction::Continue
+            );
+        }
+        assert_eq!((stepped.think_count, stepped.prev_in_think), (1, true));
+        assert!(!stepped.force_answer_latched);
+        assert_eq!(
+            stepped.account(None, true, false, 5, usize::MAX, 0),
+            ThinkAction::Continue
+        );
+        assert!(matches!(
+            stepped.account(None, true, false, 6, usize::MAX, 0),
+            ThinkAction::Close(_)
+        ));
+        assert!(stepped.force_answer_latched);
+    }
 }
