@@ -3433,6 +3433,82 @@ pub(crate) fn qwen4_expert_table_entries(
     Ok(entries)
 }
 
+/// Residency proof of an EP table against its sealed binding: `sealed[e]` is expert `e`'s sealed
+/// `(owner_rank, local_slot)`. An owned expert must name this rank's own source at its slot, any
+/// other expert the zero dummy (decode tables) or its sealed owner's source at its slot (chunk
+/// tables). Unit-arena entries are addressed by the unit map, so only their owner is checked.
+/// Pruned entries (both pointers null) carry no residency.
+pub(crate) fn check_sealed_residency(
+    layout: &Qwen4ExpertTableLayout<'_>,
+    local: Qwen4PeerExpertSource,
+    entries: &[Qwen4ExpertEntry],
+    sealed: &[(usize, usize)],
+    gate_up_expert_bytes: usize,
+    down_expert_bytes: usize,
+) -> Result<(), String> {
+    let rank = match layout {
+        Qwen4ExpertTableLayout::Ep { placement, .. }
+        | Qwen4ExpertTableLayout::Full { placement, .. }
+        | Qwen4ExpertTableLayout::EpUnits { placement, .. }
+        | Qwen4ExpertTableLayout::FullUnits { placement, .. } => placement.rank,
+        _ => return Err("single-device tables have no sealed rank binding".into()),
+    };
+    if entries.len() != sealed.len() {
+        return Err(format!(
+            "table has {} experts, the sealed binding {}",
+            entries.len(),
+            sealed.len()
+        ));
+    }
+    let at = |source: &Qwen4PeerExpertSource, slot: usize| {
+        (
+            source.gate_up_base + slot * gate_up_expert_bytes,
+            source.down_base + slot * down_expert_bytes,
+        )
+    };
+    for (expert, (entry, &(owner, slot))) in entries.iter().zip(sealed).enumerate() {
+        if entry.gate_up_ptr == 0 && entry.down_ptr == 0 {
+            continue;
+        }
+        let peer = |owner: usize| match layout {
+            Qwen4ExpertTableLayout::Full { peers, .. } => peers.get(owner).copied(),
+            Qwen4ExpertTableLayout::FullUnits { peers, .. } => match peers.get(owner) {
+                Some(PeerLayerSource::Compact(source)) => Some(*source),
+                _ => None,
+            },
+            _ => None,
+        };
+        let ptrs = Some((entry.gate_up_ptr, entry.down_ptr));
+        let ok = match entry.origin {
+            Qwen4ExpertOrigin::Local => owner == rank && ptrs == Some(at(&local, slot)),
+            Qwen4ExpertOrigin::Unit { .. } => owner == rank,
+            Qwen4ExpertOrigin::Dummy => match layout {
+                Qwen4ExpertTableLayout::Ep { dummy, .. }
+                | Qwen4ExpertTableLayout::EpUnits { dummy, .. } => {
+                    owner != rank && ptrs == Some(at(dummy, 0))
+                }
+                _ => false,
+            },
+            Qwen4ExpertOrigin::Peer(peer_rank) => {
+                peer_rank == owner
+                    && owner != rank
+                    && peer(owner).map(|source| at(&source, slot)) == ptrs
+            }
+            Qwen4ExpertOrigin::PeerUnit {
+                rank: peer_rank, ..
+            } => peer_rank == owner && owner != rank,
+            Qwen4ExpertOrigin::Tier => false,
+        };
+        if !ok {
+            return Err(format!(
+                "expert {expert} entry {:?} at {:#x}/{:#x} is not the sealed owner {owner} slot {slot} (rank {rank})",
+                entry.origin, entry.gate_up_ptr, entry.down_ptr
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `expert` is outside the layer's `qwen4.expert_keep` row; dense layers
 /// (`ids == None`) have no absent experts.
 fn expert_pruned(ids: Option<&[u16]>, expert: usize) -> bool {
@@ -4099,7 +4175,7 @@ const fn tile_ranks_supported(ranks: usize) -> bool {
 
 /// The little-endian i32 owner of every expert the launcher reads, from the
 /// sealed ownership ([`crate::ep_seal::Qwen4EpSeal::owner_ranks`]).
-fn tile_owner_table_bytes(owners: &[usize]) -> Vec<u8> {
+pub(crate) fn tile_owner_table_bytes(owners: &[usize]) -> Vec<u8> {
     owners
         .iter()
         .flat_map(|&owner| (owner as i32).to_le_bytes())
@@ -5001,7 +5077,8 @@ impl Qwen4MoeLayerRuntime {
     /// (`sealed`, required exactly for the `Ep` and `Full` layouts) are the
     /// rank's binding adapted from the sealed plan: real owners and compact
     /// slots, while the views name whatever allocation each entry uses
-    /// (local, zero dummy or peer).
+    /// (local, zero dummy or peer). Every EP entry must match its sealed
+    /// owner and slot ([`check_sealed_residency`]) or the build refuses.
     #[allow(clippy::too_many_arguments)]
     fn build(
         gpu: &mut Gpu,
@@ -5435,6 +5512,22 @@ impl Qwen4MoeLayerRuntime {
                 other => other,
             })?,
         };
+        if let Some((table, _)) = sealed.as_ref() {
+            let owners: Vec<(usize, usize)> = table
+                .experts()
+                .iter()
+                .map(|meta| (meta.owner_rank(), meta.local_slot()))
+                .collect();
+            check_sealed_residency(
+                &layout,
+                local,
+                &table_entries,
+                &owners,
+                gate_up_expert_bytes,
+                down_expert_bytes,
+            )
+            .map_err(|message| invalid(format!("layer {layer_label}: {message}")))?;
+        }
         // Whole-tensor windows over each peer rank's compact experts; the
         // per-expert views below are cut from them. `qwen4_expert_table_entries`
         // proved every slot lies inside its window.
