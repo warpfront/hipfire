@@ -457,6 +457,8 @@ fn run() -> R<i32> {
                 "completed_rows_before_tile": head,
                 "complete_tile_rows": full,
                 "sign_flip_control_detected": control_detected,
+                "complete_tile_nonfinite": a_nonfinite,
+                "complete_tile_nonzero": a_nonzero,
                 "r_pass": n_pass,
                 "r_total": MICRO - 1,
                 "per_r": per_r,

@@ -259,6 +259,8 @@ fn run() -> R<i32> {
             "complete_tile_rows": full_rows,
             "complete_tile_route": {"kkt_batched": a.route.kkt_batched, "mseg": a.route.mseg, "segments": a.route.segments},
             "sign_flip_control_detected": control_detected,
+            "complete_tile_nonfinite": a_nonfinite,
+            "complete_tile_nonzero": a_nonzero,
             "r_pass": n_pass,
             "r_total": 63,
             "per_r": per_r,
