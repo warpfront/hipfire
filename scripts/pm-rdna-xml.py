@@ -9,8 +9,17 @@ operands (for example the X and Y halves of VOPD).
 LLVM is an independent oracle, not the source of the instruction inventory.
 Failed oracle candidates remain present with an explicit diagnostic; they are
 never labelled verified or silently discarded. Numeric semantics are not inferred.
+
+SOP1_OVERRIDES names every ENC_SOP1 row whose XML condition
+(Nothas_lit_0_Nothas_lit_1) is undefined, pinned to each XML SHA-256. With
+--sop1-evidence, llvm-mc disassemble/reassemble proves each row in register,
+inline-constant and literal form and writes sop1-overrides.json: corrected
+predicates (SSRC0 != 255, or SSRC0 == 0 for source-less rows) only where the
+probes prove them, explicit named unavailable rows otherwise. The catalogs keep
+the original XML condition; evidence is never merged into catalog rows.
 """
 import argparse
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import itertools
@@ -25,6 +34,215 @@ GRAPHICS_ENCODINGS = frozenset({
     'ENC_EXP', 'ENC_VEXPORT', 'ENC_VINTERP', 'ENC_MIMG', 'MIMG_NSA1',
     'ENC_VIMAGE', 'ENC_VSAMPLE',
 })
+
+SOP1_EVIDENCE = 'sop1-overrides.json'
+# SSRC0 forms probed per row: a plain SGPR, the inline constant 0, and the literal marker.
+SOP1_FORMS = (('register', 0), ('inline', 128), ('literal', 255))
+SOP1_LITERAL = 0x41234567
+SOP1_ENCODING_BASE = 0xbe800000
+SOP1_PREDICATES = {
+    # The XML name means "no literal on source 0": exclude the literal marker.
+    'ssrc0-not-literal': {'field': 'SSRC0', 'op': '!=', 'value': 255},
+    # Source-less rows (s_getpc_b64): LLVM only round-trips an all-zero field.
+    'ssrc0-zero': {'field': 'SSRC0', 'op': '==', 'value': 0},
+    # Rows whose accepted sources are a strict LLVM-derived subset: the row's own
+    # `domain_ranges` (sorted inclusive [lo, hi] SSRC0 ranges proven by llvm-mc) applies.
+    'ssrc0-in-domain': {'field': 'SSRC0', 'op': 'in-ranges'},
+}
+# SSRC0 selector classes for per-form domain evidence (inclusive ranges).
+SOP1_FORM_RANGES = {'register': (0, 127), 'inline': (128, 254), 'literal': (255, 255)}
+SOP1_CONDITION = 'Nothas_lit_0_Nothas_lit_1'
+# Every ENC_SOP1 row whose XML EncodingCondition is the undefined name above, by XML SHA-256.
+SOP1_OVERRIDES = {
+    'gfx1100': {
+        'xml_sha256': '6eee5f8737172adf08c0e7d5994ea916e9555b9c23ccb9ec80d9ee38678733b4',
+        'rows': (
+            's_mov_b32', 's_mov_b64', 's_cmov_b32', 's_cmov_b64', 's_brev_b32', 's_brev_b64',
+            's_ctz_i32_b32', 's_ctz_i32_b64', 's_clz_i32_u32', 's_clz_i32_u64', 's_cls_i32',
+            's_cls_i32_i64', 's_sext_i32_i8', 's_sext_i32_i16', 's_bitset0_b32',
+            's_bitset0_b64', 's_bitset1_b32', 's_bitset1_b64', 's_bitreplicate_b64_b32',
+            's_abs_i32', 's_bcnt0_i32_b32', 's_bcnt0_i32_b64', 's_bcnt1_i32_b32',
+            's_bcnt1_i32_b64', 's_quadmask_b32', 's_quadmask_b64', 's_wqm_b32', 's_wqm_b64',
+            's_not_b32', 's_not_b64', 's_and_saveexec_b32', 's_and_saveexec_b64',
+            's_or_saveexec_b32', 's_or_saveexec_b64', 's_xor_saveexec_b32',
+            's_xor_saveexec_b64', 's_nand_saveexec_b32', 's_nand_saveexec_b64',
+            's_nor_saveexec_b32', 's_nor_saveexec_b64', 's_xnor_saveexec_b32',
+            's_xnor_saveexec_b64', 's_and_not0_saveexec_b32', 's_and_not0_saveexec_b64',
+            's_or_not0_saveexec_b32', 's_or_not0_saveexec_b64', 's_and_not1_saveexec_b32',
+            's_and_not1_saveexec_b64', 's_or_not1_saveexec_b32', 's_or_not1_saveexec_b64',
+            's_and_not0_wrexec_b32', 's_and_not0_wrexec_b64', 's_and_not1_wrexec_b32',
+            's_and_not1_wrexec_b64', 's_movrels_b32', 's_movrels_b64', 's_movreld_b32',
+            's_movreld_b64', 's_movrelsd_2_b32', 's_getpc_b64', 's_setpc_b64', 's_swappc_b64',
+            's_rfe_b64',
+        )},
+    'gfx1151': {
+        'xml_sha256': 'c36b6d79b1e940d74107221c985f5a7fde248025da251d2c6ef756c4cd31391a',
+        'rows': (
+            's_mov_b32', 's_mov_b64', 's_cmov_b32', 's_cmov_b64', 's_brev_b32', 's_brev_b64',
+            's_ctz_i32_b32', 's_ctz_i32_b64', 's_clz_i32_u32', 's_clz_i32_u64', 's_cls_i32',
+            's_cls_i32_i64', 's_sext_i32_i8', 's_sext_i32_i16', 's_bitset0_b32',
+            's_bitset0_b64', 's_bitset1_b32', 's_bitset1_b64', 's_bitreplicate_b64_b32',
+            's_abs_i32', 's_bcnt0_i32_b32', 's_bcnt0_i32_b64', 's_bcnt1_i32_b32',
+            's_bcnt1_i32_b64', 's_quadmask_b32', 's_quadmask_b64', 's_wqm_b32', 's_wqm_b64',
+            's_not_b32', 's_not_b64', 's_and_saveexec_b32', 's_and_saveexec_b64',
+            's_or_saveexec_b32', 's_or_saveexec_b64', 's_xor_saveexec_b32',
+            's_xor_saveexec_b64', 's_nand_saveexec_b32', 's_nand_saveexec_b64',
+            's_nor_saveexec_b32', 's_nor_saveexec_b64', 's_xnor_saveexec_b32',
+            's_xnor_saveexec_b64', 's_and_not0_saveexec_b32', 's_and_not0_saveexec_b64',
+            's_or_not0_saveexec_b32', 's_or_not0_saveexec_b64', 's_and_not1_saveexec_b32',
+            's_and_not1_saveexec_b64', 's_or_not1_saveexec_b32', 's_or_not1_saveexec_b64',
+            's_and_not0_wrexec_b32', 's_and_not0_wrexec_b64', 's_and_not1_wrexec_b32',
+            's_and_not1_wrexec_b64', 's_movrels_b32', 's_movrels_b64', 's_movreld_b32',
+            's_movreld_b64', 's_movrelsd_2_b32', 's_getpc_b64', 's_setpc_b64', 's_swappc_b64',
+            's_rfe_b64', 's_ceil_f32', 's_floor_f32', 's_trunc_f32', 's_rndne_f32',
+            's_cvt_f32_i32', 's_cvt_f32_u32', 's_cvt_i32_f32', 's_cvt_u32_f32', 's_cvt_f16_f32',
+            's_cvt_f32_f16', 's_cvt_hi_f32_f16', 's_ceil_f16', 's_floor_f16', 's_trunc_f16',
+            's_rndne_f16',
+        )},
+    'gfx12': {
+        'xml_sha256': 'f8a290c8471e26a1071b08b61a33e4d9efa46ec6cedcdb8e5ba57d7969b60692',
+        'rows': (
+            's_mov_b32', 's_mov_b64', 's_cmov_b32', 's_cmov_b64', 's_brev_b32', 's_brev_b64',
+            's_ctz_i32_b32', 's_ctz_i32_b64', 's_clz_i32_u32', 's_clz_i32_u64', 's_cls_i32',
+            's_cls_i32_i64', 's_sext_i32_i8', 's_sext_i32_i16', 's_bitset0_b32',
+            's_bitset0_b64', 's_bitset1_b32', 's_bitset1_b64', 's_bitreplicate_b64_b32',
+            's_abs_i32', 's_bcnt0_i32_b32', 's_bcnt0_i32_b64', 's_bcnt1_i32_b32',
+            's_bcnt1_i32_b64', 's_quadmask_b32', 's_quadmask_b64', 's_wqm_b32', 's_wqm_b64',
+            's_not_b32', 's_not_b64', 's_and_saveexec_b32', 's_and_saveexec_b64',
+            's_or_saveexec_b32', 's_or_saveexec_b64', 's_xor_saveexec_b32',
+            's_xor_saveexec_b64', 's_nand_saveexec_b32', 's_nand_saveexec_b64',
+            's_nor_saveexec_b32', 's_nor_saveexec_b64', 's_xnor_saveexec_b32',
+            's_xnor_saveexec_b64', 's_and_not0_saveexec_b32', 's_and_not0_saveexec_b64',
+            's_or_not0_saveexec_b32', 's_or_not0_saveexec_b64', 's_and_not1_saveexec_b32',
+            's_and_not1_saveexec_b64', 's_or_not1_saveexec_b32', 's_or_not1_saveexec_b64',
+            's_and_not0_wrexec_b32', 's_and_not0_wrexec_b64', 's_and_not1_wrexec_b32',
+            's_and_not1_wrexec_b64', 's_movrels_b32', 's_movrels_b64', 's_movreld_b32',
+            's_movreld_b64', 's_movrelsd_2_b32', 's_getpc_b64', 's_setpc_b64', 's_swappc_b64',
+            's_rfe_b64', 's_barrier_signal', 's_barrier_signal_isfirst', 's_alloc_vgpr',
+            's_sleep_var', 's_ceil_f32', 's_floor_f32', 's_trunc_f32', 's_rndne_f32',
+            's_cvt_f32_i32', 's_cvt_f32_u32', 's_cvt_i32_f32', 's_cvt_u32_f32', 's_cvt_f16_f32',
+            's_cvt_f32_f16', 's_cvt_hi_f32_f16', 's_ceil_f16', 's_floor_f16', 's_trunc_f16',
+            's_rndne_f16',
+        )},
+}
+
+
+def sop1_probe(mc, cpu, row, ssrc0, literal):
+    """Disassemble then reassemble one SOP1 word; never infer success from partial output."""
+    word = SOP1_ENCODING_BASE | row['opcode'] << 8 | ssrc0
+    data = word.to_bytes(4, 'little') + (SOP1_LITERAL.to_bytes(4, 'little') if literal else b'')
+    args = [str(mc), '--triple=amdgcn-amd-amdhsa', f'--mcpu={cpu}']
+    result = {'ssrc0': ssrc0, 'candidate': data.hex()}
+    dec = subprocess.run(args + ['--disassemble'], input=' '.join(f'0x{x:02x}' for x in data) + '\n',
+                         text=True, capture_output=True, check=False)
+    lines = [x.strip() for x in dec.stdout.splitlines() if x.strip() and x.strip() != '.text']
+    result['decoded'] = lines
+    if dec.returncode or dec.stderr.strip() or len(lines) != 1:
+        return result | {'status': 'decode-rejected', 'diagnostic': dec.stderr.strip() or 'not exactly one instruction'}
+    if '/*' in lines[0]:
+        return result | {'status': 'decode-invalid', 'diagnostic': lines[0]}
+    names = {row['name'], *row['aliases']}
+    if lines[0].split()[0] not in names:
+        return result | {'status': 'name-mismatch'}
+    enc = subprocess.run(args + ['--show-encoding'], input=lines[0] + '\n', text=True,
+                         capture_output=True, check=False)
+    chunks = re.findall(r'encoding: \[([^]]+)\]', enc.stdout)
+    if enc.returncode or not chunks:
+        return result | {'status': 'encode-rejected', 'diagnostic': enc.stderr.strip()}
+    encoded = bytes(int(v.strip(), 16) for c in chunks for v in c.split(',')
+                    if re.fullmatch(r'0x[0-9a-fA-F]{2}', v.strip()))
+    return result | {'status': 'verified' if encoded == data else 'byte-mismatch',
+                     'reencoded': encoded.hex()}
+
+
+def sop1_decide(proofs):
+    """Derive the corrected predicate solely from the observed llvm-mc outcomes."""
+    statuses = {name: proofs[name]['status'] for name, _ in SOP1_FORMS}
+    if statuses['register'] != 'verified':
+        # LLVM-unknown only when no form decodes to an instruction at all.
+        if all(not proofs[name]['decoded'] for name in statuses):
+            return None, 'llvm-unknown'
+        return None, f"register-form-{statuses['register']}"
+    if statuses['inline'] == 'verified':
+        return 'ssrc0-not-literal', None
+    # Source-less: the field is ignored on decode (inline re-encodes to zero) and the
+    # literal dword is never consumed as part of the instruction.
+    register = proofs['register']['decoded']
+    if (statuses['inline'] == 'byte-mismatch' and proofs['inline']['decoded'] == register
+            and statuses['literal'] != 'verified' and proofs['literal']['decoded'][:1] == register):
+        return 'ssrc0-zero', None
+    return None, f"inline-constant-{statuses['inline']}"
+
+
+def sop1_ranges(values):
+    ranges = []
+    for value in sorted(values):
+        if ranges and ranges[-1][1] == value - 1:
+            ranges[-1][1] = value
+        else:
+            ranges.append([value, value])
+    return ranges
+
+
+def sop1_domain(mc, cpu, row):
+    """Probe all 256 SSRC0 selectors (selector 255 carries a literal dword)."""
+    outcomes = {s: sop1_probe(mc, cpu, row, s, s == 255) for s in range(256)}
+    by_form = {}
+    for form, (low, high) in SOP1_FORM_RANGES.items():
+        refused = {}
+        for s in range(low, high + 1):
+            if outcomes[s]['status'] != 'verified':
+                refused.setdefault(outcomes[s]['status'], []).append(s)
+        by_form[form] = {'selectors': sop1_ranges(s for s in range(low, high + 1)
+                                                  if outcomes[s]['status'] == 'verified'),
+                         'refused': {k: sop1_ranges(v) for k, v in sorted(refused.items())}}
+    return {'probed': 256, 'selectors': sop1_ranges(s for s, o in outcomes.items()
+                                                    if o['status'] == 'verified'),
+            'by_form': by_form}
+
+
+def sop1_evidence(mc, isa, jobs):
+    """Probe every named override row and return the evidence document."""
+    document = {'schema': 1, 'xml_condition': SOP1_CONDITION, 'predicates': SOP1_PREDICATES,
+                'forms': {name: value for name, value in SOP1_FORMS},
+                'literal': SOP1_LITERAL,
+                'llvm': subprocess.check_output([str(mc), '--version'], text=True).splitlines()[0],
+                'llvm_sha256': hashlib.sha256(mc.read_bytes()).hexdigest(), 'targets': {}}
+    for target, table in SOP1_OVERRIDES.items():
+        header, *catalog = [json.loads(x) for x in (isa / f'{target}.xml.jsonl').read_text().splitlines()]
+        if header['sha256'] != table['xml_sha256']:
+            raise ValueError(f'{target}: catalog XML hash differs from SOP1_OVERRIDES')
+        found = {r['name']: r for r in catalog
+                 if r['encoding'] == 'ENC_SOP1' and r['condition'] == SOP1_CONDITION}
+        if list(found) != list(table['rows']):
+            raise ValueError(f'{target}: SOP1_OVERRIDES rows differ from catalog')
+        cpu = 'gfx1201' if target == 'gfx12' else target
+        def probe(row):
+            proofs = {name: sop1_probe(mc, cpu, row, value, name == 'literal')
+                      for name, value in SOP1_FORMS}
+            predicate, reason = sop1_decide(proofs)
+            key = {k: row[k] for k in header['key']}
+            domain = None
+            if predicate is None:
+                domain = sop1_domain(mc, cpu, row)
+                if domain['selectors']:
+                    predicate, reason = 'ssrc0-in-domain', None
+            result = {'name': row['name'], 'key': key, 'xml_condition': row['condition'],
+                      'xml_predicate': header['encodings']['ENC_SOP1']['conditions'][row['condition']],
+                      'status': 'corrected' if predicate else 'unavailable',
+                      'corrected_predicate': predicate, 'unavailable_reason': reason,
+                      'proofs': proofs}
+            if predicate == 'ssrc0-in-domain':
+                result['domain_ranges'] = domain['selectors']
+            if domain is not None:
+                result['domain'] = domain
+            return result
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            rows = list(pool.map(probe, found.values()))
+        document['targets'][target] = {'xml': header['xml'], 'xml_sha256': header['sha256'],
+                                       'cpu': cpu, 'rows': rows}
+    return document
+
 
 
 def number(node):
@@ -222,19 +440,29 @@ def generate(source, mc, target, xmlname, jobs):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--xml-dir', required=True, type=Path)
+    parser.add_argument('--xml-dir', type=Path)
     parser.add_argument('--llvm-mc', required=True, type=Path)
     parser.add_argument('--output-dir', type=Path, default=Path(__file__).resolve().parents[1] / 'crates/peacemaker-ir/isa')
     parser.add_argument('--target', choices=TARGETS, action='append')
     parser.add_argument('--jobs', type=int, default=4)
+    parser.add_argument('--sop1-evidence', action='store_true',
+                        help='write sop1-overrides.json from the committed catalogs only')
     args = parser.parse_args()
+    if args.sop1_evidence:
+        document = sop1_evidence(args.llvm_mc, args.output_dir, args.jobs)
+        (args.output_dir / SOP1_EVIDENCE).write_text(
+            json.dumps(document, sort_keys=True, indent=1) + '\n')
+        for target, entry in document['targets'].items():
+            print(target, dict(Counter((r['status'], r['unavailable_reason']) for r in entry['rows'])))
+        return
+    if args.xml_dir is None:
+        parser.error('--xml-dir is required unless --sop1-evidence is given')
     for target in args.target or TARGETS:
         header, rows = generate(args.xml_dir, args.llvm_mc, target, TARGETS[target], args.jobs)
         path = args.output_dir / f'{target}.xml.jsonl'
         with path.open('w') as stream:
             for row in [header, *rows]:
                 stream.write(json.dumps(row, sort_keys=True, separators=(',', ':')) + '\n')
-        from collections import Counter
         print(target, header['rows'], dict(Counter(r['oracle']['status'] for r in rows)))
 
 

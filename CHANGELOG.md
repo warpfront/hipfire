@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- PeaceMaker RDNA: pin a named SOP1 XML-condition override table to all three source hashes, with per-row LLVM register, inline and literal byte-round-trip evidence. Preserve the malformed source condition; exhaustively prove all 256 selectors for restricted operand domains instead of disabling valid register forms along with invalid inline/literal forms.
+
 ### Fixes: CI and platform builds
 
 - **Fixed: the Windows MSVC build links again.** The EP skew log's `clock_gettime` (hipfire-arch-qwen4) and the `HIPFIRE_DEBUG_FORCE_EVICT_MS` repro knob's `mmap`/`madvise`/`dlopen`/`dlsym` (rdna-compute PM4 replay) were declared as libc externs on every OS, so `link.exe` failed with LNK1120. Both are Linux-only now: off Linux the skew log timestamps from a process-local monotonic clock, and the force-evict knob is reported once and ignored. The hipfire-config hot-units sidecar test, hidden behind the link failure, now uses a path that is absolute on Windows too.
