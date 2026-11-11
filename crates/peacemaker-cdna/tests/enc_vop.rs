@@ -1217,6 +1217,11 @@ fn signed_i64_compares_pinned() {
             "{name}"
         );
         assert_eq!(inst.to_string(), format!("{name}_e32 vcc, v[0:1], v[2:3]"));
+        let inv_two_pi = ic(op, Float(InlineFloat::InvTwoPi), Vgpr(8), VopExt::None);
+        assert_eq!(
+            inv_two_pi.to_string(),
+            format!("{name}_e32 vcc, 0.15915494309189532, v[8:9]")
+        );
 
         // Width bounds: a pair at v254 is the last legal VSRC1; v255 and an
         // odd-width operand fall off the file / are refused.

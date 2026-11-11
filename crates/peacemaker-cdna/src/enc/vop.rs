@@ -1048,6 +1048,11 @@ fn dpp_text(d: &Dpp) -> String {
 /// An e32 source: `lit(…)` for a literal llvm would otherwise fold.
 fn e32_text(s: Src, dwords: u8, lit: LitTy) -> String {
     match s {
+        // Integer 64-bit operands use the f64 inline constant spelling, unlike
+        // packed pairs of f32 values, which also occupy two dwords.
+        Src::Float(crate::operand::InlineFloat::InvTwoPi) if lit == LitTy::I64 => {
+            "0.15915494309189532".into()
+        }
         Src::Lit(v) => lit.text(v),
         s => s.fmt(dwords),
     }
