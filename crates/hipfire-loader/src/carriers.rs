@@ -3588,7 +3588,7 @@ pub fn qwen4_ep_vram_layers(
             // The hot-unit loan (`HIPFIRE_EP_HOT_UNITS`, `HIPFIRE_EP_HOT_LOAN_MIB`): resolved once
             // here and applied inside `qwen4_ep_unit_plan` after the staged walk. `None` (no
             // sidecar next to the model, or a kill switch) is today's placement exactly.
-            let hot_loan = qwen4_ep_hot_loan(src, ranks, &gpu.arch)?;
+            let hot_loan = qwen4_ep_hot_loan(src, spans.ranks(), &gpu.arch)?;
             // `HIPFIRE_EP_UNIT_RESERVE=1` with a decoupled reserve plan: the units are
             // budgeted against the decoupled census and whole-resident donor layers
             // replace the plan's suffix donors.
