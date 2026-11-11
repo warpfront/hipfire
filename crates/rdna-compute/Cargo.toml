@@ -1363,3 +1363,7 @@ required-features = ["lab"]
 [[example]]
 name = "gdn_chunk_pm_oracle"
 required-features = ["lab"]
+
+[[example]]
+name = "fn_expert_table_indirection"
+required-features = ["lab"]

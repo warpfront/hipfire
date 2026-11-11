@@ -697,6 +697,17 @@ const fn reach(program: Program, domain: &'static str, seen_by: &'static str) ->
 
 pub const DECISIONS: &[Decision] = &[
     Decision {
+        id: "qwen4-exact-cache-capture-refusal",
+        predicates: &[CaptureMode],
+        condition: "Qwen4 forward_cache_chunk refuses a cache decode transaction while HIP graph capture is active, before begin_token or any route reset; immutable prefill uses the existing canonical scope",
+        effect: Refusal,
+        switches: "active capture returns an error before acquiring a cache reader; eager singleton AR acquires the shared SlotBank window",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "admission only: no alternate kernel or capture branch is selected by this check, and no cache token or dispatch is submitted on refusal",
+        reaches: &[],
+    },
+    Decision {
         id: "mq6-explicit-railgun-refusal",
         predicates: &[IsRecording, CaptureMode, G0Observing],
         condition: "rdna-compute mq6_railgun::check_gpu rejects Redline recording, G0 observation and HIP graph capture before preparing or replaying an explicit fixed-binding MQ6 program; an active stream capture is also refused",
@@ -1903,6 +1914,12 @@ pub const DECISIONS: &[Decision] = &[
     },
 ];
 pub const SITES: &[Site] = &[
+    Site {
+        file: "hipfire-arch-qwen4/src/gpu_forward.rs",
+        function: "forward_cache_chunk",
+        occurrences: 1,
+        decisions: &["qwen4-exact-cache-capture-refusal"],
+    },
     Site {
         file: "hipfire-arch-raon/src/bundle.rs",
         function: "resolve",

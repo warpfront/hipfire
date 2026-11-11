@@ -152,9 +152,9 @@ v_cmpx_gt_f32_e32	vopc	0x94	SRC0:32,VSRC1:32	implicit	SRC0,VSRC1	exec:w	-	v_cmpx
 v_cmpx_neq_f32_e32	vopc	0x9d	SRC0:32,VSRC1:32,literal@last	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_neq_f32_e32 0xff800000, v173	7D3B5AFF FF800000	-
 v_cmpx_eq_u32_e32	vopc	0xca	SRC0:32,VSRC1:32	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_eq_u32_e32 0, v0	7D940080	-
 v_dual_fmac_f32	vopd	0x0	VDSTX:32,SRCX0:32,VSRCX1:32	VDSTX	SRCX0,VSRCX1,VDSTX	-	-	v_dual_fmac_f32 v172, v210, v170 :: v_dual_mul_f32 v105, v131, v105	C80755D2 AC68D383	-
-v_dual_mul_f32	vopd	0x3	VDSTX:32,SRCX0:32,VSRCX1:32	VDSTX	SRCX0,VSRCX1	-	-	v_dual_mul_f32 v222, v194, v214 :: v_dual_mul_f32 v223, v194, v215	C8C7ADC2 DEDFAFC2	-
-v_dual_add_f32	vopd	0x4	VDSTX:32,SRCX0:32,VSRCX1:32	VDSTX	SRCX0,VSRCX1	-	-	v_dual_add_f32 v177, v175, v173 :: v_dual_mul_f32 v180, v170, v173	C9075BAF B1B55BAA	-
-v_dual_sub_f32	vopd	0x5	VDSTX:32,SRCX0:32,VSRCX1:32	VDSTX	SRCX0,VSRCX1	-	-	v_dual_sub_f32 v173, v215, v209 :: v_dual_sub_f32 v174, v214, v209	C94BA3D7 ADAFA3D6	-
+v_dual_mul_f32	vopd	0x3	VDSTX:32,SRCX0:32,VSRCX1:32	VDSTX	SRCX0,VSRCX1	-	-	v_dual_mul_f32 v222, v194, v214 :: v_dual_mul_f32 v223, v195, v215	C8C7ADC2 DEDFAFC3	-
+v_dual_add_f32	vopd	0x4	VDSTX:32,SRCX0:32,VSRCX1:32	VDSTX	SRCX0,VSRCX1	-	-	v_dual_add_f32 v177, v175, v173 :: v_dual_mul_f32 v180, v170, v174	C9075BAF B1B55DAA	-
+v_dual_sub_f32	vopd	0x5	VDSTX:32,SRCX0:32,VSRCX1:32	VDSTX	SRCX0,VSRCX1	-	-	v_dual_sub_f32 v173, v215, v209 :: v_dual_sub_f32 v174, v214, v210	C94BA3D7 ADAFA5D6	-
 v_dual_mov_b32	vopd	0x8	VDSTX:32,SRCX0:32,literal@last	VDSTX	SRCX0	-	-	v_dual_mov_b32 v1, 0xc300 :: v_dual_mov_b32 v2, -1	CA1000FF 010200C1 0000C300	-
 v_dual_cndmask_b32	vopd	0x9	VDSTX:32,SRCX0:32,VSRCX1:32	VDSTX	SRCX0,VSRCX1,implicit	-	-	v_dual_cndmask_b32 v17, -1, v9 :: v_dual_and_b32 v10, v188, v15	CA6412C1 110A1FBC	-
 v_dual_add_nc_u32	vopd	0x10	VDSTY:32,SRCY0:32,VSRCY1:32	VDSTY	SRCY0,VSRCY1	-	-	v_dual_mov_b32 v1, 0 :: v_dual_add_nc_u32 v4, v1, v4	CA200080 01040901	-
@@ -476,7 +476,7 @@ v_cmpx_ngt_f32_e32	vopc	0x9b	SRC0:32,VSRC1:32	implicit	SRC0,VSRC1	exec:w	-	v_cmp
 v_cmpx_eq_u16_e32	vopc	0xba	SRC0:16,VSRC1:16	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_eq_u16_e32 1, v9.l	7D741281	-
 v_cmpx_ne_u16_e32	vopc	0xbd	SRC0:16,VSRC1:16	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_ne_u16_e32 0, v1.l	7D7A0280	-
 v_cmpx_lt_u32_e32	vopc	0xc9	SRC0:32,VSRC1:32	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_lt_u32_e32 7, v0	7D920087	-
-v_dual_min_num_f32	vopd	0xb	VDSTX:32,SRCX0:32,VSRCX1:32	VDSTX	SRCX0,VSRCX1	-	-	v_dual_min_num_f32 v6, v6, v7 :: v_dual_max_num_f32 v7, v8, v7	CAD40F06 06060F08	-
+v_dual_min_num_f32	vopd	0xb	VDSTX:32,SRCX0:32,VSRCX1:32	VDSTX	SRCX0,VSRCX1	-	-	v_dual_min_num_f32 v6, v6, v7 :: v_dual_max_num_f32 v7, v8, v8	CAD40F06 06061108	-
 # pm/native-emit (2026-10-02): PM corpus v_wmma_i32_16x16x16_iu8 (wave32: A/B 2 VGPRs each); sample = pinned llvm-mc -mcpu=gfx1201 encoding.
 v_wmma_i32_16x16x16_iu8	vop3p	0x44	VDST:256,SRC0:64,SRC1:64,SRC2:256	VDST	SRC0,SRC1,SRC2	-	-	v_wmma_i32_16x16x16_iu8 v[8:15], v[0:1], v[4:5], v[8:15] neg_lo:[1,1,0]	CC444008 7C220900	w0_extra:ignored:0x800000:0x0
 # pm/aco-pilot (2026-10-11): Mesa 60e95b7 aco_opcodes.py SOP2 s_bfm_b32 gfx11+=0x2a dst(U32) (no SCC def); SOPC s_cmp_lg_i32 0x01 dst(SCC); samples = pinned llvm-mc -mcpu=gfx1201 words from the MQ4 RADV/ACO binary.
