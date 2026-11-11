@@ -54,11 +54,10 @@ const INC_GRP_SHIPPED: &str =
 const INC_GRP_PLANAR: &str =
     include_str!("../../../kernels/src/gemm_mq4g128v2p_moe_grouped_top10_o8_r16.gfx1201.hip");
 
-// Lab-only best-exact per-pick reference (MoeDn32 dni, moekern-out/hb_dn): NOT in the shipped tree, loaded by
-// absolute path so the timing arm can state "A8 vs the best exact decode" next to the production incumbent.
-const LAB_DNI: &str =
-    include_str!("/home/kaden/qcal/release-0.4.5/mgmtp/moekern-out/hb_dn/dni_prod.hip");
-const MOD_DNI: &str = "e1dn_lab_dni";
+// Production per-pick exact F32 DNI comparator. Reuse the shipped launcher's source;
+// the independent scalar A8 oracle and original indexed/grouped incumbents are unchanged.
+const DNI_SRC: &str = rdna_compute::kernels::GEMV_MQ4G128V2_MOE_DOWN_TOP10_DNI_GFX1201_SRC;
+const MOD_DNI: &str = "e1dn_production_dni";
 const F_DNI_S: &str = "gemv_mq4g128v2_moe_down_top10_dni_k640";
 const F_DNI_P: &str = "gemv_mq4g128v2p_moe_down_top10_dni_k640";
 const MOD_A8: &str = "e1dn_a8";
@@ -231,10 +230,10 @@ fn load_all(gpu: &mut Gpu) {
         .expect("flush kernel");
     gpu.ensure_kernel_public(MOD_FLUSH, FLUSH_SRC, F_STREAM)
         .expect("stream kernel");
-    gpu.ensure_kernel_public(MOD_DNI, LAB_DNI, F_DNI_S)
-        .expect("lab dni shipped");
-    gpu.ensure_kernel_public(MOD_DNI, LAB_DNI, F_DNI_P)
-        .expect("lab dni planar");
+    gpu.ensure_kernel_public(MOD_DNI, DNI_SRC, F_DNI_S)
+        .expect("production dni shipped");
+    gpu.ensure_kernel_public(MOD_DNI, DNI_SRC, F_DNI_P)
+        .expect("production dni planar");
 }
 
 fn gpu_gate() -> Option<Gpu> {
@@ -2336,7 +2335,7 @@ impl Arm {
             Arm::A8Prod => "a8_producer_only",
             Arm::Stream => "roofline_stream",
             Arm::Null => "null_launch_floor",
-            Arm::Dni => "lab_dni_exact_f32",
+            Arm::Dni => "production_dni_exact_f32",
             Arm::A8GrpAtDecode => "a8_down_only[wmma grouped]",
             Arm::A8IdxAtWide => "a8_down_only[dot4 per-pick]",
         }

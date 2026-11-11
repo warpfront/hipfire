@@ -1031,11 +1031,10 @@ impl Qwen4Bundle {
         let storage = self.cpu_storage_capacity_rows();
         let cpu = self.has_cpu_deferred_experts() || storage > 0;
         let default = spec_verify_rows_cap(cpu);
-        if cpu {
-            storage.max(default)
-        } else {
-            default
-        }
+        let cap = if cpu { storage.max(default) } else { default };
+        self.expert_cache
+            .as_ref()
+            .map_or(cap, |cache| cap.min(cache.config.verify_rows))
     }
 
     /// Refuse a `rows`-row speculative verify or replay on an armed CPU
@@ -1062,6 +1061,10 @@ impl Qwen4Bundle {
         scratch: &mut dyn SpecScratch,
         read_picks: bool,
     ) -> Result<Vec<u32>, String> {
+        if self.expert_cache_enabled() {
+            self.check_expert_cache_idle(ops.gpu()?)
+                .map_err(|error| error.to_string())?;
+        }
         let mesh = ops.is_mesh();
         // Drafter-internal under EP: runs only inside a fan-out (mesh detached).
         if !mesh {
@@ -1790,6 +1793,8 @@ impl SpecTarget for Qwen4Bundle {
         gpu: &mut Gpu,
         scratch: &mut dyn SpecScratch,
     ) -> Result<(), String> {
+        self.check_expert_cache_idle(gpu)
+            .map_err(|error| error.to_string())?;
         let ticket = scratch
             .as_any_mut()
             .downcast_mut::<Qwen4SpecScratch>()
@@ -1822,6 +1827,8 @@ impl SpecTarget for Qwen4Bundle {
         position: usize,
         scratch: &mut dyn SpecScratch,
     ) -> Result<(), String> {
+        self.check_expert_cache_idle(gpu)
+            .map_err(|error| error.to_string())?;
         self.ep_refuse("speculative decoding (commit prefix)")
             .map_err(|error| error.to_string())?;
         if block.is_empty() {
@@ -1909,6 +1916,8 @@ impl SpecTarget for Qwen4Bundle {
         position: usize,
         replay: &[u32],
     ) -> Result<bool, String> {
+        self.check_expert_cache_idle(gpu)
+            .map_err(|error| error.to_string())?;
         let Some((ticket, start, end)) = scratch
             .as_any_mut()
             .downcast_mut::<Qwen4SpecScratch>()
@@ -5510,11 +5519,36 @@ impl Qwen4MtpDrafter {
         }
     }
 
+    /// Refuse only a request that actually reaches sampled native MTP with
+    /// mutable expert residency. Ordinary AR sampling never enters this gate.
+    fn require_supported_cache_request(&self, cache_enabled: bool) -> Result<(), String> {
+        if cache_enabled && self.request.temp > 1.0e-6 {
+            Err("exact expert cache supports greedy native MTP only; sampled native MTP is not qualified".into())
+        } else {
+            self.require_supported_request()
+        }
+    }
+
     fn bundle<'a>(target: &'a mut dyn SpecTarget) -> Result<&'a mut Qwen4Bundle, String> {
         target
             .as_any_mut()
             .downcast_mut::<Qwen4Bundle>()
             .ok_or_else(|| "Qwen4MtpDrafter: target is not a Qwen4Bundle".to_string())
+    }
+
+    /// Pending payload copies may overlap native state work, but an active
+    /// or unknown trunk reader must retain its state, tickets and owners.
+    fn require_cache_idle(
+        ops: &mut Qwen4Ops<'_>,
+        target: &mut dyn SpecTarget,
+    ) -> Result<(), String> {
+        let bundle = Self::bundle(target)?;
+        if bundle.expert_cache_enabled() {
+            bundle
+                .check_expert_cache_idle(ops.gpu()?)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     /// Latch this load's speculative verify-row cap from the target (the CPU
@@ -5551,6 +5585,7 @@ impl Qwen4MtpDrafter {
         ops: &mut Qwen4Ops<'_>,
         target: &mut dyn SpecTarget,
     ) -> Result<(), String> {
+        Self::require_cache_idle(ops, target)?;
         self.bind_arch(ops.gpu()?);
         self.bind_spec_rows(target)?;
         // The copy lane's take cap reads the single card's row-exact rows; a
@@ -6850,8 +6885,9 @@ impl Qwen4MtpDrafter {
         eos: u32,
         probe: Option<TakeoverProbe>,
     ) -> Result<MtpWindow, String> {
+        Self::require_cache_idle(&mut Qwen4Ops::Single(&mut *gpu), target)?;
         let eos = self.end_of_turn.unwrap_or(eos);
-        self.require_supported_request()?;
+        self.require_supported_cache_request(Self::bundle(target)?.expert_cache_enabled())?;
         // The window's penalty history restarts from `emitted` (idempotent
         // after `mtp_step`'s own `begin_window`).
         if let Some(s) = self.sampled.as_mut() {
@@ -8723,6 +8759,8 @@ impl Qwen4MtpDrafter {
         eos: u32,
         plan: &WindowPlan,
     ) -> Result<MtpWindow, String> {
+        Self::require_cache_idle(ops, target)?;
+        self.require_supported_cache_request(Self::bundle(target)?.expert_cache_enabled())?;
         #[cfg(feature = "lab")]
         let observed = self.lab_window_begin(target, position, seed, plan);
         let prior_ngram = self.stats.ngram_mod_windows;
@@ -9351,6 +9389,8 @@ impl Qwen4MtpDrafter {
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
+        Self::require_cache_idle(ops, target)?;
+        self.require_supported_cache_request(Self::bundle(target)?.expert_cache_enabled())?;
         // The whole prompt is one decode-share / EP-reserve prompt: the donor
         // tail is restored once, after its last tile (`share_finish_prompt`).
         // `!ops.is_mesh()` names the single-context route; it does not exclude
@@ -9719,6 +9759,7 @@ impl Qwen4MtpDrafter {
         start_pos: usize,
         abort: &dyn Fn() -> bool,
     ) -> Result<bool, String> {
+        Self::require_cache_idle(ops, target)?;
         if ops.is_mesh() {
             self.refuse_unsupported_under_pp()?;
         }
@@ -9763,6 +9804,7 @@ impl Qwen4MtpDrafter {
         window_seed: u32,
         consumed: &[u32],
     ) -> Result<bool, String> {
+        Self::require_cache_idle(ops, target)?;
         self.derived_drop_pending();
         let Some(window) = self.retained.take() else {
             return Ok(false);
@@ -10114,7 +10156,8 @@ impl MtpDrafter for Qwen4MtpDrafter {
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
-        self.require_supported_request()?;
+        Self::require_cache_idle(&mut Qwen4Ops::Single(&mut *gpu), target)?;
+        self.require_supported_cache_request(Self::bundle(target)?.expert_cache_enabled())?;
         validate_native_mtp_prefill_request(prompt_tokens, fill_tokens, start_pos, cache_hit)?;
         // Expert parallelism: rank 0 and every peer's replica run the whole
         // prefill in one fan-out. A request this drafter cannot serve under EP
@@ -10214,6 +10257,8 @@ impl MtpDrafter for Qwen4MtpDrafter {
         eos: u32,
         _grammar: Option<&mut dyn SpecGrammar>,
     ) -> Result<MtpWindow, String> {
+        Self::require_cache_idle(&mut Qwen4Ops::Single(&mut *gpu), target)?;
+        self.require_supported_cache_request(Self::bundle(target)?.expert_cache_enabled())?;
         let ep = Self::bundle(target)?.ep_mesh().is_some();
         if ep {
             self.refuse_naive_under_ep()?;
@@ -10583,7 +10628,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
 /// `copy_lane` runs that pool as the copy lane
 /// (`hipfire_config::mtp_ngram_copy_enabled_for_arch`); `gdn` is the loaded
 /// GDN state format, which gates sampled verification
-/// ([`qwen4_mtp_sampled_allowed`]).
+/// ([`qwen4_mtp_sampled_allowed`]). `cache_enabled` is the actual attached
+/// expert-cache owner: it keeps sampled requests on the existing AR selector,
+/// while greedy requests retain native MTP and cache-off policy is unchanged.
 pub fn build_qwen4_mtp_speculator(
     max_k: usize,
     explicit_mtp_k: Option<usize>,
@@ -10593,6 +10640,7 @@ pub fn build_qwen4_mtp_speculator(
     ngram: Option<NgramModConfig>,
     copy_lane: bool,
     gdn: crate::GdnStateFormat,
+    cache_enabled: bool,
     measured_load_identity: Option<
         std::sync::Arc<crate::measured_identity::Qwen4MeasuredLoadIdentity>,
     >,
@@ -10601,7 +10649,7 @@ pub fn build_qwen4_mtp_speculator(
         .with_explicit_mtp_k_override(explicit_mtp_k)
         .with_ngram(ngram)
         .with_copy_lane(copy_lane)
-        .with_sampled_allowed(qwen4_mtp_sampled_allowed(gdn))
+        .with_sampled_allowed(qwen4_mtp_sampled_allowed(gdn) && !cache_enabled)
         .with_measured_load_identity(measured_load_identity);
     drafter.think_close = think_close;
     Box::new(MtpSpeculator::new(drafter))
@@ -10957,7 +11005,7 @@ pub fn native_mtp_device_bytes_ring(
 /// row plus `max_k` clamped to the widest verify forward
 /// (`QWEN4_SPEC_VERIFY_ROWS - 1` drafts). The verify hidden rows and the GDN
 /// row capture of every band are sized by it.
-pub(crate) fn native_mtp_window_rows(max_k: usize) -> usize {
+pub fn native_mtp_window_rows(max_k: usize) -> usize {
     max_k.clamp(1, QWEN4_SPEC_VERIFY_ROWS - 1) + 1
 }
 
@@ -12321,6 +12369,68 @@ mod tests {
     }
 
     #[test]
+    fn exact_cache_refuses_sampled_native_without_changing_uncached_policy() {
+        for mode in [SampledMode::Leviathan, SampledMode::Naive] {
+            let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
+            drafter.sampled_enabled = true;
+            drafter.sampled_mode = Ok(mode);
+            drafter.configure_request(SpecRequestConfig {
+                temp: 0.8,
+                rng_seed: 123,
+                ..Default::default()
+            });
+            assert!(drafter.sampled.is_some());
+            assert!(drafter.require_supported_request().is_ok());
+            let error = drafter.require_supported_cache_request(true).unwrap_err();
+            assert!(error.contains("greedy native MTP only"));
+            assert!(drafter.require_supported_cache_request(false).is_ok());
+            assert!(
+                drafter.sampled.is_some(),
+                "refusal must not silently switch to AR"
+            );
+            assert_eq!(drafter.request.temp, 0.8);
+            assert_eq!(drafter.request.rng_seed, 123);
+
+            drafter.configure_request(SpecRequestConfig::default());
+            assert!(drafter.sampled.is_none());
+            assert!(drafter.require_supported_cache_request(true).is_ok());
+        }
+    }
+
+    #[test]
+    fn exact_cache_sampled_backstop_uses_request_even_when_router_disallows_sampling() {
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None).with_sampled_allowed(false);
+        drafter.configure_request(SpecRequestConfig {
+            temp: 0.3,
+            rng_seed: 123,
+            ..Default::default()
+        });
+        assert!(drafter.sampled.is_none());
+        let error = drafter.require_supported_cache_request(true).unwrap_err();
+        assert!(error.contains("greedy native MTP only"));
+        assert_eq!(drafter.request.temp, 0.3);
+        assert_eq!(drafter.request.rng_seed, 123);
+        // The actual route selector and sampled constructor both treat this
+        // epsilon as greedy. The cache backstop must accept the same requests.
+        for temp in [0.0, 1.0e-7, 1.0e-6] {
+            drafter.configure_request(SpecRequestConfig {
+                temp,
+                rng_seed: 123,
+                ..Default::default()
+            });
+            assert!(drafter.sampled.is_none());
+            drafter.require_supported_cache_request(true).unwrap();
+            assert_eq!(drafter.request.temp, temp);
+        }
+        // Returning from epsilon-greedy must not disable the sampled backstop.
+        drafter.configure_request(SpecRequestConfig {
+            temp: 0.3,
+            ..Default::default()
+        });
+        assert!(drafter.require_supported_cache_request(true).is_err());
+    }
+
+    #[test]
     fn q8_ef_sampled_requests_route_to_ar() {
         use crate::GdnStateFormat;
         assert!(!qwen4_mtp_sampled_allowed(GdnStateFormat::Q8Ef));
@@ -12335,6 +12445,7 @@ mod tests {
             None,
             false,
             GdnStateFormat::Q8Ef,
+            false,
             None,
         );
         assert!(speculator.requires_greedy());
@@ -12357,8 +12468,9 @@ mod tests {
         let plain = Qwen4MtpDrafter::new(3, 4096, None);
         assert_eq!(plain.sampled_enabled, sampled);
         for gdn in [GdnStateFormat::Q8, GdnStateFormat::F32] {
-            let speculator =
-                build_qwen4_mtp_speculator(3, None, 4096, None, None, None, false, gdn, None);
+            let speculator = build_qwen4_mtp_speculator(
+                3, None, 4096, None, None, None, false, gdn, false, None,
+            );
             assert_eq!(speculator.supports_temp_verify(), sampled, "{gdn:?}");
             assert_eq!(speculator.requires_greedy(), !sampled, "{gdn:?}");
             let gated = Qwen4MtpDrafter::new(3, 4096, None)

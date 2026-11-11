@@ -208,6 +208,8 @@ def qwen4_shadow_failures(shadow):
             failures.append("recovery forward is not on HIP")
         if not failure.get("recovered_bit_exact_against_clean_hip"):
             failures.append("recovery forward is not bit-exact against clean HIP")
+        if failure.get("recovery_error"):
+            failures.append(f"recovery forward failed: {failure['recovery_error']}")
     return failures
 
 
@@ -619,7 +621,8 @@ def main():
         choices=("q8", "fp8", "fwht2", "fwht3", "fwht4", "bf16"),
         help=(
             "KV layout used by capture, shadow replay, and the HIP oracle "
-            "(default: q8; bf16 with --qwen4, whose KV is BF16 only)"
+            "(default: q8; bf16 with --qwen4; Qwen4 also accepts fp8 on "
+            "devices/model geometries admitted by the engine)"
         ),
     )
     parser.add_argument("--capture-repeats", type=int, default=2)
@@ -779,8 +782,11 @@ def main():
     args = parser.parse_args()
     if args.kv_mode is None:
         args.kv_mode = "bf16" if args.qwen4 else "q8"
-    if args.qwen4 and args.kv_mode != "bf16":
-        sys.exit(f"--qwen4 requires --kv-mode bf16 (got {args.kv_mode})")
+    # Qwen4's shadow snapshot reads full_row_units in each tensor's native
+    # dtype and compares raw storage bytes. FP8 rows include their scale
+    # headers; they do not require a BF16/F32 conversion for parity.
+    if args.qwen4 and args.kv_mode not in ("bf16", "fp8"):
+        sys.exit(f"--qwen4 requires --kv-mode bf16 or fp8 (got {args.kv_mode})")
 
     model = Path(args.model).expanduser().resolve()
     daemon_path = Path(args.daemon).expanduser().resolve()

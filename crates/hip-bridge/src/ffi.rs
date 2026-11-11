@@ -1124,6 +1124,15 @@ fn host_maps_qwen4_experts() -> bool {
 }
 
 impl HipRuntime {
+    /// Pin the loaded runtime after GPU work could not be proven retired.
+    ///
+    /// This deliberately retains one library reference until process exit. It
+    /// makes no HIP call: a HIP synchronize cannot prove retirement of an
+    /// independently submitted queue, and unloading its runtime is unsafe.
+    pub fn retain_library_on_quarantine(&self) {
+        std::mem::forget(Arc::clone(&self._lib));
+    }
+
     /// Address of this runtime's resolved `hipEventRecord` implementation.
     ///
     /// Compare only while both runtime owners are alive, in the same process.

@@ -195,3 +195,15 @@ required-features = ["lab"]
 [[example]]
 name = "hc8_screen"
 required-features = ["lab"]
+
+[[example]]
+name = "fn_expert_cache_publication"
+required-features = ["lab"]
+
+[[example]]
+name = "fn_expert_cache_ar_numerical"
+required-features = ["lab"]
+
+[[example]]
+name = "fn_mtp_lru_oracle"
+required-features = ["lab", "reference-parity"]
