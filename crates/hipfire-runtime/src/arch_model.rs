@@ -94,9 +94,42 @@ pub trait ArchModel: Send + std::any::Any {
     }
 
     /// Prompt tokens the next prefill on `route` can restore instead of
-    /// computing; 0 when nothing is cached.
-    fn session_plan(&self, _prompt: &[u32], _route: crate::session_cache::SessionRoute) -> usize {
+    /// computing; 0 when nothing is cached. Do not override: an arch
+    /// implements only [`Self::session_plan_capped`], which this and the
+    /// resumable walk ([`crate::session_cache::plan_resumable`]) both read.
+    fn session_plan(&self, prompt: &[u32], route: crate::session_cache::SessionRoute) -> usize {
+        self.session_plan_capped(prompt, route, prompt.len())
+    }
+
+    /// [`Self::session_plan`] restricted to reuse points `<= cap`; never
+    /// returns more than `cap`. The one plan method a model with a session
+    /// cache implements (mesh routing included); default no cache.
+    fn session_plan_capped(
+        &self,
+        _prompt: &[u32],
+        _route: crate::session_cache::SessionRoute,
+        _cap: usize,
+    ) -> usize {
         0
+    }
+
+    /// Whether a planned reuse of `reused` tokens continues live (or parked)
+    /// state rather than restoring a snapshot. Request tracing only.
+    fn session_plan_is_live(
+        &self,
+        _prompt: &[u32],
+        _route: crate::session_cache::SessionRoute,
+        _reused: usize,
+    ) -> bool {
+        false
+    }
+
+    /// Whether the speculative target restores a session reuse point: a
+    /// speculative request whose speculator names a session route
+    /// ([`crate::spec::Speculator::session_route`]) then prefills from the
+    /// deepest point it can resume instead of cold. Default `false`.
+    fn spec_session_reuse(&self) -> bool {
+        false
     }
 
     /// Publish the snapshots the last prefill captured. Call once the turn's
@@ -171,6 +204,13 @@ pub trait ArchModel: Send + std::any::Any {
     /// single-device reset on the daemon `gpu`.
     fn reset_session_state_mesh(&mut self, gpu: &mut Gpu, _gpus: &mut Gpus) -> Result<(), String> {
         self.reset_session_state(gpu)
+    }
+
+    /// [`Self::session_commit_live`] for a model run with the daemon's mesh
+    /// `Gpus` (a pipeline-parallel model publishes every band). Default is
+    /// the single-device commit.
+    fn session_commit_live_mesh(&mut self, _gpus: &mut Gpus, consumed: &[u32]) {
+        self.session_commit_live(consumed)
     }
 
     /// [`Self::map_ahead_for_decode`] for a model that owns a mesh lifecycle:

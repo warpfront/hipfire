@@ -436,6 +436,10 @@ impl Speculator for Dflash2Speculator {
         "dflash2"
     }
 
+    fn session_route(&self) -> Option<crate::session_cache::SessionRoute> {
+        Some(crate::session_cache::SessionRoute::Ar)
+    }
+
     fn prefill(
         &mut self,
         gpu: &mut Gpu,
