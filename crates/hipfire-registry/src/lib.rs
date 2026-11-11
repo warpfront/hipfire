@@ -404,8 +404,7 @@ pub struct HotUnitsSidecarPin {
 
 /// Hot-unit loan sidecars known to this client, keyed by exact base artifact identity.
 pub const HOT_UNITS_SIDECAR_PINS: &[HotUnitsSidecarPin] = &[
-    // The Flash-Next MQ4 XTS symmetric-trunk base. Pinned ahead of the Hugging Face upload,
-    // which happens at release (v0.4.5 is embargoed).
+    // The Flash-Next MQ4 XTS symmetric-trunk base; hosted on the Hugging Face repo.
     HotUnitsSidecarPin {
         base_sha256: "27dfff6692eba3385655959d134771fcff154c6279ab0a6c43cb8c7d81a7fa31",
         base_size: 70_888_270_360,
@@ -414,7 +413,7 @@ pub const HOT_UNITS_SIDECAR_PINS: &[HotUnitsSidecarPin] = &[
         file: "qwen3.8-flash-next-base.mq4-xts-symtrunk.ep.hot-units",
         sha256: "a50317cf2014f88d306d88366131212757d875c4c6e65572d659d361ec17db13",
         size_bytes: 67_526,
-        published: false,
+        published: true,
     },
 ];
 
@@ -574,7 +573,7 @@ pub const EP_EXPERT_HOTSET_PINS: &[ExpertHotsetPin] = &[
         size_bytes: 312_036,
     },
     // The symmetric-trunk base (the ranking `HOT_UNITS_SIDECAR_PINS` is calibrated under).
-    // Pinned ahead of the Hugging Face upload; see [`UNPUBLISHED_PIN_FILES`].
+    // Published to the Hugging Face repo with the hot-units sidecar.
     ExpertHotsetPin {
         base_sha256: "27dfff6692eba3385655959d134771fcff154c6279ab0a6c43cb8c7d81a7fa31",
         base_size: 70_888_270_360,
@@ -585,11 +584,10 @@ pub const EP_EXPERT_HOTSET_PINS: &[ExpertHotsetPin] = &[
     },
 ];
 
-/// Pinned sidecar files that are not on Hugging Face yet (both upload at the release).
-/// `hipfire pull` never requests them and never touches a local copy; a local copy beside the
-/// model is still size- and sha256-checked against its pin and reported.
-pub const UNPUBLISHED_PIN_FILES: &[&str] =
-    &["qwen3.8-flash-next-base.mq4-xts-symtrunk.ep.expert-hotset"];
+/// Pinned sidecar files that are not on Hugging Face yet. `hipfire pull` never requests them
+/// and never touches a local copy; a local copy beside the model is still size- and sha256-checked
+/// against its pin and reported. Empty: every pinned sidecar is published.
+pub const UNPUBLISHED_PIN_FILES: &[&str] = &[];
 
 /// A resolved expert hotset: the repo that hosts it and its sidecar identity.
 #[derive(Clone, Debug, PartialEq)]
@@ -2425,7 +2423,7 @@ mod tests {
             "a50317cf2014f88d306d88366131212757d875c4c6e65572d659d361ec17db13"
         );
         assert_eq!(pin.size_bytes, 67_526);
-        assert!(!pin.published, "pinned ahead of the release upload");
+        assert!(pin.published, "uploaded to the Hugging Face repo");
         for digest in [pin.base_sha256, pin.ranking_sha256, pin.sha256] {
             assert_eq!(digest.len(), 64);
             assert!(digest
@@ -2450,7 +2448,7 @@ mod tests {
             }
         );
         assert_eq!(units.ranking_sha256, pin.ranking_sha256);
-        assert!(!units.published);
+        assert!(units.published);
         let mut upper = entry.clone();
         upper.sha256 = upper.sha256.map(|sha| sha.to_ascii_uppercase());
         assert!(upper.hot_units_sidecar().is_some());
@@ -2525,10 +2523,10 @@ mod tests {
             resolved.sidecar.sha256.as_deref(),
             Some(units.ranking_sha256)
         );
-        // Both upload together at the release.
-        assert!(!resolved.published);
-        assert!(!units.published);
-        assert!(UNPUBLISHED_PIN_FILES.contains(&ranking.file));
+        // Both are on the repo.
+        assert!(resolved.published);
+        assert!(units.published);
+        assert!(!UNPUBLISHED_PIN_FILES.contains(&ranking.file));
         // The split base's ranking stays published and is not the hot units' ranking.
         let split =
             ep_expert_hotset_in(&stock_split_base_entry(), EP_EXPERT_HOTSET_PINS, true).unwrap();
