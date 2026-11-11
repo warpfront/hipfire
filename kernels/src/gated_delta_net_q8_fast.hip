@@ -209,14 +209,29 @@ __global__ void HIPFIRE_GDN_KERNEL(
 #define HIPFIRE_GDN_SCALES_IN s_scales
 #define HIPFIRE_GDN_SQ_IN sq_base
 #endif
+#if defined(HIPFIRE_GDN_STATE_SRC)
+    const __half* ef_src = s_ef_in;
+#else
+    const __half* ef_src = s_ef_residual;
+#endif
     for (int r = 0; r < TILE_ROWS; r++) {
         const float scale = HIPFIRE_GDN_SCALES_IN[lane * n_heads * HD + h * HD + row_start + r];
         const signed char* src = HIPFIRE_GDN_SQ_IN + r * HD;
-        S_f4[HIPFIRE_GDN_S_INDEX(r, tid)] = make_float4(
+        float4 initial = make_float4(
             scale * (float)src[tid],
             scale * (float)src[tid + 32],
             scale * (float)src[tid + 64],
             scale * (float)src[tid + 96]);
+        // Effective incoming state is Q*scale + F16 EF residual; reconstruct it
+        // before the recurrence so decay/delta updates apply to the residual too.
+        if (s_ef_residual != nullptr) {
+            const __half* residual = ef_src + state_lane_base + h * HD * HD + (row_start + r) * HD;
+            initial.x += __half2float(residual[tid]);
+            initial.y += __half2float(residual[tid + 32]);
+            initial.z += __half2float(residual[tid + 64]);
+            initial.w += __half2float(residual[tid + 96]);
+        }
+        S_f4[HIPFIRE_GDN_S_INDEX(r, tid)] = initial;
     }
 
 
@@ -510,18 +525,6 @@ __global__ void HIPFIRE_GDN_KERNEL(
         float s0 = s.x, s1 = s.y, s2 = s.z, s3 = s.w;
 
         __half* efr = use_ef ? (s_ef_residual + state_lane_base + h * HD * HD + rr * HD) : nullptr;
-#if defined(HIPFIRE_GDN_STATE_SRC)
-        const __half* efr_in = use_ef ? (s_ef_in + state_lane_base + h * HD * HD + rr * HD) : nullptr;
-#define HIPFIRE_GDN_EFR_IN efr_in
-#else
-#define HIPFIRE_GDN_EFR_IN efr
-#endif
-        if (use_ef) {
-            s0 += __half2float(HIPFIRE_GDN_EFR_IN[tid]);
-            s1 += __half2float(HIPFIRE_GDN_EFR_IN[tid+32]);
-            s2 += __half2float(HIPFIRE_GDN_EFR_IN[tid+64]);
-            s3 += __half2float(HIPFIRE_GDN_EFR_IN[tid+96]);
-        }
 
         float my_max = fmaxf(fmaxf(fabsf(s0), fabsf(s1)), fmaxf(fabsf(s2), fabsf(s3)));
         for (int o = 16; o > 0; o >>= 1)
@@ -571,7 +574,6 @@ __global__ void HIPFIRE_GDN_KERNEL(
 #undef HIPFIRE_GDN_S_INDEX
 #undef HIPFIRE_GDN_SCALES_IN
 #undef HIPFIRE_GDN_SQ_IN
-#undef HIPFIRE_GDN_EFR_IN
 }
 
 #if !defined(HIPFIRE_GDN_LAYER_TABLE)
@@ -630,11 +632,21 @@ __global__ void gated_delta_net_q8_fast_independent_masked(
     for (int r = 0; r < TILE_ROWS; r++) {
         const float scale = s_scales[lane * n_heads * HD + h * HD + row_start + r];
         const signed char* src = sq_base + r * HD;
-        S_f4[HIPFIRE_GDN_S_INDEX_M(r, tid)] = make_float4(
+        float4 initial = make_float4(
             scale * (float)src[tid],
             scale * (float)src[tid + 32],
             scale * (float)src[tid + 64],
             scale * (float)src[tid + 96]);
+        // Effective incoming state is Q*scale + F16 EF residual; reconstruct it
+        // before the recurrence so decay/delta updates apply to the residual too.
+        if (s_ef_residual != nullptr) {
+            const __half* residual = s_ef_residual + state_lane_base + h * HD * HD + (row_start + r) * HD;
+            initial.x += __half2float(residual[tid]);
+            initial.y += __half2float(residual[tid + 32]);
+            initial.z += __half2float(residual[tid + 64]);
+            initial.w += __half2float(residual[tid + 96]);
+        }
+        S_f4[HIPFIRE_GDN_S_INDEX_M(r, tid)] = initial;
     }
 
     for (int t = 0; t < n_tokens; t++) {
@@ -757,12 +769,6 @@ __global__ void gated_delta_net_q8_fast_independent_masked(
         float s0 = s.x, s1 = s.y, s2 = s.z, s3 = s.w;
 
         __half* efr = use_ef ? (s_ef_residual + state_lane_base + h * HD * HD + rr * HD) : nullptr;
-        if (use_ef) {
-            s0 += __half2float(efr[tid]);
-            s1 += __half2float(efr[tid+32]);
-            s2 += __half2float(efr[tid+64]);
-            s3 += __half2float(efr[tid+96]);
-        }
 
         float my_max = fmaxf(fmaxf(fabsf(s0), fabsf(s1)), fmaxf(fabsf(s2), fabsf(s3)));
         for (int o = 16; o > 0; o >>= 1)
