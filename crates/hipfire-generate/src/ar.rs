@@ -827,6 +827,19 @@ pub fn qwen_ar_eviction_prefill_chunk_limit(
     }
 }
 
+/// Whether a decode-phase cancel of the AR route may keep the live
+/// conversation (`production_cancel_epilogue`): the validated configuration is
+/// a resident single-GPU Qwen3.5-class bundle without KV eviction/compaction,
+/// adaptive KV or a speculator (whose drafter state an AR turn does not
+/// advance).
+pub fn ar_cancel_keeps_committed_prefix(m: &LoadedModel) -> bool {
+    m.pp <= 1
+        && m.eviction.is_none()
+        && m.kv_adaptive.is_none()
+        && m.speculator.is_none()
+        && m.qwen35().is_some_and(|b| b.kv_cache.compact_offset == 0)
+}
+
 pub fn ckpt_resume_enabled() -> bool {
     hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_RESUME")
         .ok()
@@ -4571,17 +4584,32 @@ pub fn generate(
             // invalidate the resident prefix. `seq_pos < rendered.len()` on the
             // chosen checkpoint guarantees ≥1 token is re-prefilled.
             //
-            // SAFETY INVARIANT (fix/deltanet-truncation-resume-guard): this
-            // restore-checkpoint-at-rpos + replay rendered[rpos..] is exact iff the
-            // checkpoint at rpos reflects the committed prefix rendered[..rpos].
-            // That holds because (a) rpos <= lcp => rendered[..rpos] ==
-            // conversation_tokens[..rpos] (lcp is their longest common prefix), and
-            // (b) ALL abort paths now full-reset, so a retained checkpoint can never
-            // carry UNCOMMITTED tokens — the poison that used to drift the
-            // non-reversible DeltaNet state into garbage. If you ever remove an
-            // abort-reset (or let conversation_tokens diverge from the forwarded
-            // stream), this resume becomes unsound: re-validate with a per-checkpoint
-            // prefix hash (llama.cpp's tokens_hash contract) or cold-recompute.
+            // SAFETY INVARIANT: this restore-checkpoint-at-rpos + replay
+            // rendered[rpos..] is exact iff the checkpoint at rpos reflects the
+            // committed prefix rendered[..rpos]. That is ATTESTED, not assumed:
+            //  (a) every checkpoint stores a fingerprint of the token stream
+            //      [0..pos] it was taken over (`take_dn_checkpoint` `prefix`:
+            //      the AR prefill/decode loops, the MTP/DFlash prompt seeds and
+            //      the VMM lanes all pass the stream they forwarded), and a
+            //      resume restores only a checkpoint whose fingerprint equals
+            //      the fingerprint of `conversation_tokens[..pos]`
+            //      (`checkpoint_prefix_attests`); an unattested or mismatching
+            //      checkpoint is skipped and the render prefills from an
+            //      earlier attested checkpoint or cold;
+            //  (b) rpos <= lcp => rendered[..rpos] == conversation_tokens[..rpos]
+            //      (lcp is their longest common prefix), so what is hashed is
+            //      exactly what the restored state is about to be extended on;
+            //  (c) a decode-phase client cancel keeps only the COMMITTED prefix
+            //      (`conversation_tokens` / `seq_pos` = prompt + fed tokens,
+            //      the sampled-but-unfed token excluded) through
+            //      `production_cancel_epilogue` / `production_cancel_epilogue_live`
+            //      (checkpoints past the kept length are freed); a boundary
+            //      the cursors cannot attest, prefill aborts, errors, explicit
+            //      resets and model swaps full-reset.
+            // A path that lets conversation_tokens diverge from the forwarded
+            // stream still cannot make a resume unsound: the fingerprints taken
+            // from the forwarded stream no longer match, so the resume degrades
+            // to a cold prefill.
             // Guarded by scripts/test-qwen35-abort-resume.sh.
             let evict_safe = m.pp <= 1
                 && m.eviction.is_none()
@@ -4610,9 +4638,32 @@ pub fn generate(
                     .as_ref()
                     .map_or(false, |s| s.as_ref().arch_key() == "qwen35")
             {
-                m.prefill_checkpoints
-                    .iter()
-                    .rposition(|(p, _)| *p <= lcp && *p < rendered.len())
+                // Latest checkpoint at or before the LCP that leaves >=1 token to
+                // prefill AND whose stored prefix fingerprint proves it covers
+                // exactly `conversation_tokens[..pos]` (== `rendered[..pos]`,
+                // since pos <= lcp). Newest first, so only the checkpoints that
+                // are candidates get hashed.
+                let mut rejected = 0usize;
+                let found = m.prefill_checkpoints.iter().rposition(|(p, snap)| {
+                    if *p > lcp || *p >= rendered.len() {
+                        return false;
+                    }
+                    let attested = speculative::checkpoint_prefix_attests(
+                        snap.prefix_hash,
+                        *p,
+                        &m.conversation_tokens,
+                    );
+                    if !attested {
+                        rejected += 1;
+                    }
+                    attested
+                });
+                if rejected > 0 {
+                    eprintln!(
+                        "[qwen-cache resume] {rejected} newer checkpoint(s) rejected: prefix hash does not attest the conversation (lcp={lcp})"
+                    );
+                }
+                found
             } else {
                 None
             };
@@ -5197,6 +5248,8 @@ pub fn generate(
                         m.seq_pos,
                         ckpt_interval(),
                         ckpt_max(),
+                        // Committed conversation + the chunk forwarded so far.
+                        (&m.conversation_tokens, &new_tokens[..end]),
                     );
                 }
                 start = end;
@@ -5524,12 +5577,15 @@ pub fn generate(
             // Emit aborted+done so the CLI's drain loop terminates
             // cleanly without an extra max_tokens worth of wasted decode.
             if check_abort(id) {
-                // Drop live bundle borrows before production fail-closed rollback.
-                // Tokens so far are uncommitted; DN is non-reversible — full
-                // cold reset via the common attestation path (not a partial
-                // manual clear). Terminal is aborted+done only when attested.
+                // Drop live bundle borrows before the epilogue. At this loop
+                // top every fed token is already committed (`conversation_tokens`
+                // / `seq_pos`), the sampled `next_token` is not yet fed: the
+                // state is a committed prefix, kept for the next request when
+                // the configuration is the validated one; else the full
+                // fail-closed reset. Terminal is aborted+done only when attested.
                 let _ = (kv, dn, weights, config, scratch);
-                let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                let eligible = ar_cancel_keeps_committed_prefix(m);
+                let ep = crate::common::production_cancel_epilogue(m, gpu, eligible);
                 crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
                 return;
             }
@@ -5731,6 +5787,11 @@ pub fn generate(
                     m.seq_pos,
                     ckpt_interval(),
                     ckpt_max(),
+                    // `conversation_tokens` IS the forwarded stream here (each
+                    // token is committed as it is forwarded); under eviction
+                    // `seq_pos` is physical, the lengths differ and the
+                    // snapshot stays unattested.
+                    (&m.conversation_tokens, &[]),
                 );
             }
             if let Err(err) = qwen_ar_evict(&mut m.seq_pos, |at| match &m.eviction {
@@ -6377,7 +6438,10 @@ pub fn generate(
         let effects =
             crate::qwen::qwen_client_commit_effects(decision, intended_release, intended_store);
         if !effects.emit_done {
-            let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+            // The turn finished and every fed token is committed: the client
+            // leaving before `done` keeps the prefix like a decode cancel.
+            let eligible = ar_cancel_keeps_committed_prefix(m);
+            let ep = crate::common::production_cancel_epilogue(m, gpu, eligible);
             crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return;
         }

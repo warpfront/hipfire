@@ -30,6 +30,7 @@ use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weig
 use hip_bridge::{DeviceBuffer, HipError, HipResult, Stream};
 use hipfire_dispatch::families::kv_tier::KTier;
 use hipfire_dispatch::pipeline::batched::{verify_dense_math, DenseBatchMath};
+use hipfire_runtime::checkpoint_pool::{prefix_fingerprint, prefix_fingerprint_chain};
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
@@ -1414,6 +1415,10 @@ pub struct DeltaNetSnapshot {
     /// against. Save/restore re-fingerprint the passed state and fall back
     /// to memcpy on any mismatch (never copy through stale descriptors).
     bulk_fingerprint: u64,
+    /// Fingerprint of the committed token prefix this snapshot reflects
+    /// ([`checkpoint_prefix_hash`] over the stream `[0..pos]`). `0` = not
+    /// attested: a restore driven by the resume planner never uses it.
+    pub prefix_hash: u64,
 }
 
 impl DeltaNetSnapshot {
@@ -1615,6 +1620,7 @@ impl DeltaNetSnapshot {
             bulk_rev: None,
             bulk_n_items: 0,
             bulk_fingerprint: Self::bulk_fingerprint(state),
+            prefix_hash: 0,
         };
         // Arm the bulk route (gfx1100 / gfx1151 / gfx1201): JIT + table upload happen
         // here at setup, never in a decode cycle. Any failure leaves the
@@ -13052,6 +13058,12 @@ pub fn spec_step_ddtree_batched(
 /// memcpy of the recurrent S/scale/conv buffers; no KV copy (FullAttention KV is
 /// positional and stays resident, so resume only restores the recurrent state).
 /// Gating (resume enabled / no eviction) is the caller's responsibility.
+///
+/// `prefix` is the committed token stream `[0..pos]` the snapshot reflects, as
+/// two slices (`head ++ tail`); its fingerprint is stored on the snapshot
+/// ([`checkpoint_prefix_hash`]) and is what every later resume validates
+/// ([`checkpoint_prefix_attests`]) before restoring non-reversible DeltaNet
+/// state onto a conversation.
 pub fn take_dn_checkpoint(
     cks: &mut Vec<(usize, DeltaNetSnapshot)>,
     dn: &DeltaNetState,
@@ -13060,6 +13072,7 @@ pub fn take_dn_checkpoint(
     pos: usize,
     interval: usize,
     cap: usize,
+    prefix: (&[u32], &[u32]),
 ) {
     if pos == 0 || cap == 0 {
         return;
@@ -13079,10 +13092,23 @@ pub fn take_dn_checkpoint(
     } else {
         match DeltaNetSnapshot::new_for(gpu, dn) {
             Ok(s) => s,
-            Err(e) => {
-                eprintln!("take_dn_checkpoint: pos={pos} skipped: snapshot allocation failed: {e}");
-                return;
-            }
+            Err(e) => match snapshot_alloc_failure_action(cks.len()) {
+                SnapshotAllocFailure::RecycleOldest => {
+                    // Memory pressure the fit gate did not predict: slide the
+                    // ring forward on its oldest buffers instead of freezing it
+                    // at the last position that did fit.
+                    eprintln!(
+                        "take_dn_checkpoint: pos={pos} snapshot allocation failed ({e}); recycling the oldest checkpoint"
+                    );
+                    cks.remove(0).1
+                }
+                SnapshotAllocFailure::Skip => {
+                    eprintln!(
+                        "take_dn_checkpoint: pos={pos} skipped: snapshot allocation failed: {e}"
+                    );
+                    return;
+                }
+            },
         }
     };
     if let Err(e) = snap.save_from(dn, gpu) {
@@ -13092,7 +13118,63 @@ pub fn take_dn_checkpoint(
         snap.free_gpu(gpu);
         return;
     }
+    snap.prefix_hash = checkpoint_prefix_hash(pos, prefix);
     cks.push((pos, snap));
+}
+
+/// What [`take_dn_checkpoint`] does when allocating a NEW snapshot fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotAllocFailure {
+    /// The ring has an entry: reuse its oldest buffers for the new checkpoint
+    /// (the same path as the cap / fit recycle).
+    RecycleOldest,
+    /// The ring is empty: nothing to reuse, no checkpoint at this position.
+    Skip,
+}
+
+/// Decision for a failed new-snapshot allocation, given the ring length.
+pub fn snapshot_alloc_failure_action(ring_len: usize) -> SnapshotAllocFailure {
+    if ring_len > 0 {
+        SnapshotAllocFailure::RecycleOldest
+    } else {
+        SnapshotAllocFailure::Skip
+    }
+}
+
+/// The fingerprint a checkpoint at `pos` stores: [`prefix_fingerprint_chain`]
+/// over the committed token stream `[0..pos]` the snapshot reflects, given as
+/// two slices (`head ++ tail`) so callers hash the live conversation plus the
+/// chunk being prefilled without allocating. `0` ("not attested") when the
+/// slices do not cover exactly `pos` tokens (KV eviction makes a physical
+/// position differ from the token count), so an unprovable snapshot can never
+/// certify a resume.
+pub fn checkpoint_prefix_hash(pos: usize, prefix: (&[u32], &[u32])) -> u64 {
+    if prefix.0.len() + prefix.1.len() != pos {
+        return 0;
+    }
+    prefix_fingerprint_chain(prefix.0, prefix.1)
+}
+
+/// Whether a snapshot's stored fingerprint proves it covers exactly
+/// `conversation[..pos]`. An unattested snapshot (`0`) or a position past the
+/// conversation never qualifies.
+pub fn checkpoint_prefix_attests(stored: u64, pos: usize, conversation: &[u32]) -> bool {
+    stored != 0
+        && conversation
+            .get(..pos)
+            .is_some_and(|prefix| stored == prefix_fingerprint(prefix))
+}
+
+/// The checkpoint positions of a ring (`(position, stored fingerprint)` pairs,
+/// oldest first) that are attested against `conversation` (the committed
+/// stream the resident KV/DeltaNet state describes). The resume planner only
+/// ever sees these, so a checkpoint that does not provably cover the
+/// conversation prefix it would be restored onto degrades to a cold prefill.
+pub fn attested_checkpoint_positions(ring: &[(usize, u64)], conversation: &[u32]) -> Vec<usize> {
+    ring.iter()
+        .filter(|&&(pos, stored)| checkpoint_prefix_attests(stored, pos, conversation))
+        .map(|&(pos, _)| pos)
+        .collect()
 }
 
 /// Whether one more DeltaNet snapshot can be allocated without eating what the
@@ -13526,6 +13608,7 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
                     seq_pos,
                     ckpt_interval,
                     ckpt_cap,
+                    (&prompt_tokens[..seq_pos], &[]),
                 );
             }
         }
@@ -13560,6 +13643,7 @@ pub fn seed_target_hidden_suffix_abortable(
     hidden_rb: &mut HiddenStateRingBuffer,
     suffix: &[u32],
     start_pos: usize,
+    prefix_head: &[u32],
     abort_check: &dyn Fn() -> bool,
     // Optional DeltaNet checkpoint ring (see from_prompt variant). Lets a HIT
     // or a resume keep adding checkpoints as the conversation grows, so a later
@@ -13575,6 +13659,7 @@ pub fn seed_target_hidden_suffix_abortable(
         hidden_rb,
         suffix,
         start_pos,
+        prefix_head,
         abort_check,
         checkpoints,
         ckpt_interval,
@@ -13590,6 +13675,9 @@ pub fn seed_target_hidden_suffix_abortable_parts(
     hidden_rb: &mut HiddenStateRingBuffer,
     suffix: &[u32],
     start_pos: usize,
+    // The committed tokens `[0..start_pos]` the target state already covers
+    // (attests the checkpoints this call takes; see [`take_dn_checkpoint`]).
+    prefix_head: &[u32],
     abort_check: &dyn Fn() -> bool,
     mut checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
     ckpt_interval: usize,
@@ -13629,6 +13717,7 @@ pub fn seed_target_hidden_suffix_abortable_parts(
                     pos,
                     ckpt_interval,
                     ckpt_cap,
+                    (prefix_head, &suffix[..off]),
                 );
             }
         }
@@ -15024,6 +15113,7 @@ mod dn_exchange_tests {
             bulk_rev: Some(buf(REV0, 8)),
             bulk_n_items: 3,
             bulk_fingerprint: DeltaNetSnapshot::bulk_fingerprint(live),
+            prefix_hash: 0,
         }
     }
 

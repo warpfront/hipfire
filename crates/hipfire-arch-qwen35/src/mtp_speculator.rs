@@ -479,6 +479,9 @@ impl MtpDrafter for Qwen35MtpDrafter {
                         position,
                         checkpoint_interval,
                         checkpoint_cap,
+                        // The ring covers prompt rows only: `[0..position]` of
+                        // the canonical prompt this request resumed or cold-seeded.
+                        (prompt_tokens.get(..position).unwrap_or(&[]), &[]),
                     );
                 }
                 Ok(())
@@ -778,6 +781,17 @@ impl MtpDrafter for Qwen35MtpDrafter {
             self.checkpoints
                 .iter()
                 .map(|(position, _)| *position)
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn mtp_checkpoint_prefix_hashes(&self) -> Vec<(usize, u64)> {
+        if self.checkpoint_resume {
+            self.checkpoints
+                .iter()
+                .map(|(position, snapshot)| (*position, snapshot.prefix_hash))
                 .collect()
         } else {
             Vec::new()

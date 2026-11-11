@@ -1105,6 +1105,16 @@ pub trait Speculator {
         Vec::new()
     }
 
+    /// `(position, prefix fingerprint)` of every checkpoint in the ring, in the
+    /// same order as [`Self::checkpoint_positions`]. The fingerprint is the
+    /// one stored when the checkpoint was taken (`0` = not attested); the
+    /// resume planner restores only checkpoints whose fingerprint matches the
+    /// conversation prefix they would be restored onto. Default empty: a
+    /// drafter with no attested ring never resumes.
+    fn checkpoint_prefix_hashes(&self) -> Vec<(usize, u64)> {
+        Vec::new()
+    }
+
     /// Whether the drafter can continue a target restored or continued live
     /// at `start` of `prompt` (a prompt-cache hit). Default `true`. The Qwen4
     /// session planner prefills cold when it cannot.
@@ -1457,6 +1467,12 @@ pub trait MtpDrafter {
         Vec::new()
     }
 
+    /// `(position, prefix fingerprint)` of the MTP checkpoint ring (see
+    /// [`Speculator::checkpoint_prefix_hashes`]). Default empty.
+    fn mtp_checkpoint_prefix_hashes(&self) -> Vec<(usize, u64)> {
+        Vec::new()
+    }
+
     /// Restore the MTP target's recurrent state to an advertised checkpoint
     /// and discard checkpoints from the now-stale future.
     fn mtp_rewind_to(
@@ -1688,6 +1704,10 @@ impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
 
     fn checkpoint_positions(&self) -> Vec<usize> {
         self.arch.mtp_checkpoint_positions()
+    }
+
+    fn checkpoint_prefix_hashes(&self) -> Vec<(usize, u64)> {
+        self.arch.mtp_checkpoint_prefix_hashes()
     }
 
     fn rewind_to(

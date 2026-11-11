@@ -136,16 +136,28 @@ fn best_entry(pool: &[VmmPrefixEntry], rendered: &[u32]) -> Option<(usize, Reuse
         .map(|(i, r, _)| (i, r))
 }
 
-/// Snapshot `dn` into `checkpoints` at the singleton's cadence.
+/// Snapshot `dn` into `checkpoints` at the singleton's cadence. `stream` is the
+/// lane's committed token stream; the snapshot is attested against
+/// `stream[..pos]` (unattested when the lane's record is shorter than `pos`).
 pub fn checkpoint(
     checkpoints: &mut Checkpoints,
     dn: &DeltaNetState,
     kv: &hipfire_runtime::llama::KvCache,
     gpu: &mut rdna_compute::Gpu,
     pos: usize,
+    stream: &[u32],
 ) {
     if ckpt_resume_enabled() {
-        speculative::take_dn_checkpoint(checkpoints, dn, kv, gpu, pos, ckpt_interval(), ckpt_max());
+        speculative::take_dn_checkpoint(
+            checkpoints,
+            dn,
+            kv,
+            gpu,
+            pos,
+            ckpt_interval(),
+            ckpt_max(),
+            (stream.get(..pos).unwrap_or(&[]), &[]),
+        );
     }
 }
 

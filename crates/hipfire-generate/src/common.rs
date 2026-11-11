@@ -256,6 +256,185 @@ pub fn production_fail_closed_rollback_live(
     epilogue
 }
 
+/// What a mid-decode client cancel does with the live conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelDisposition {
+    /// The target KV / recurrent state is exactly the committed stream of
+    /// `len` tokens (prompt + every decode token actually fed): the cancelled
+    /// request is a committed turn prefix, so keep it for the next request.
+    KeepCommitted { len: usize },
+    /// The cursors cannot attest the boundary (or the route is outside the
+    /// validated configuration): the full fail-closed reset.
+    FullReset,
+}
+
+/// The one decision a mid-decode cancel makes (host-side, no device work).
+///
+/// `eligible` is the route/configuration gate the caller proves (single GPU,
+/// resident Qwen3.5-class target, no KV eviction/compaction, no adaptive KV,
+/// no stale drafter). `stream_len` is the length of the host record of the
+/// committed token stream (`None` = it could not be reconstructed) and `fed`
+/// the device cursor: how many tokens the target KV / DeltaNet state has
+/// consumed. The boundary is attested only when both agree.
+pub fn cancel_disposition(
+    eligible: bool,
+    stream_len: Option<usize>,
+    fed: usize,
+) -> CancelDisposition {
+    match stream_len {
+        Some(len) if eligible && fed > 0 && len == fed => {
+            CancelDisposition::KeepCommitted { len: fed }
+        }
+        _ => CancelDisposition::FullReset,
+    }
+}
+
+/// Committed stream of a speculative decode at a cycle boundary (the top of
+/// the decode loop): `prompt` plus the decode tokens already fed into the
+/// target, i.e. `emitted` without its pending seed (the seed is emitted to the
+/// client but not yet fed). `None` unless the cursors agree: `position` is the
+/// number of tokens fed, `emitted` holds exactly one pending seed beyond the
+/// fed decode tokens (`pending_seed`, `None` when the last token is not
+/// committable) and that seed is its last element.
+pub fn spec_cancel_committed_stream(
+    prompt: &[u32],
+    emitted: &[u32],
+    position: usize,
+    pending_seed: Option<u32>,
+) -> Option<Vec<u32>> {
+    let fed_decode = position.checked_sub(prompt.len())?;
+    if emitted.len() != fed_decode + usize::from(pending_seed.is_some()) {
+        return None;
+    }
+    if let Some(seed) = pending_seed {
+        if emitted.last() != Some(&seed) {
+            return None;
+        }
+    }
+    let mut stream = Vec::with_capacity(position);
+    stream.extend_from_slice(prompt);
+    stream.extend_from_slice(&emitted[..fed_decode]);
+    Some(stream)
+}
+
+/// Free every checkpoint beyond the committed length (it would describe
+/// tokens the kept conversation no longer contains).
+fn free_checkpoints_past(
+    cks: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    committed_len: usize,
+    gpu: &mut rdna_compute::Gpu,
+) {
+    let mut i = 0;
+    while i < cks.len() {
+        if cks[i].0 > committed_len {
+            cks.remove(i).1.free_gpu(gpu);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Kept-prefix settlement: drop checkpoints past the kept length, drain the
+/// device so the terminal follows an attested state. No graph or replay
+/// invalidation: a cycle boundary is the state a normal end-of-turn leaves.
+fn settle_kept_prefix(
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    committed_len: usize,
+    gpu: &mut rdna_compute::Gpu,
+) -> RollbackEpilogue {
+    free_checkpoints_past(prefill_checkpoints, committed_len, gpu);
+    free_checkpoints_past(dflash_checkpoints, committed_len, gpu);
+    let epilogue = fail_closed_epilogue_after_sync(Ok(()), fail_closed_device_sync(gpu));
+    if epilogue.rolled_back {
+        eprintln!("[qwen-cache cancel] kept committed prefix pos={committed_len}");
+    }
+    epilogue
+}
+
+/// Boundary evidence for [`production_cancel_epilogue_live`].
+pub struct CancelBoundary {
+    /// The route/configuration gate (see [`cancel_disposition`]).
+    pub eligible: bool,
+    /// Tokens the target KV / DeltaNet state has consumed.
+    pub fed: usize,
+    /// Host record of those tokens (see [`spec_cancel_committed_stream`]).
+    pub stream: Option<Vec<u32>>,
+}
+
+/// Mid-decode cancel epilogue for the speculative route (live-slot form, the
+/// sibling of [`production_fail_closed_rollback_live`]). A cancel at a
+/// committed cycle boundary keeps the session: `seq_pos`/`conversation_tokens`
+/// become the committed stream, the assistant-turn cache, checkpoint rings
+/// (at or before the kept length) and drafter state are left as a normal turn
+/// end leaves them, and the device is synchronized. Anything the cursors
+/// cannot attest, or a failed synchronize, takes the full fail-closed reset.
+#[allow(clippy::too_many_arguments)]
+pub fn production_cancel_epilogue_live(
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+    slot: &mut dyn SpecTarget,
+    spec: &mut dyn Speculator,
+    boundary: CancelBoundary,
+) -> RollbackEpilogue {
+    let CancelBoundary {
+        eligible,
+        fed,
+        stream,
+    } = boundary;
+    if let (CancelDisposition::KeepCommitted { len }, Some(stream)) = (
+        cancel_disposition(eligible, stream.as_ref().map(Vec::len), fed),
+        stream,
+    ) {
+        *seq_pos = len;
+        *conversation_tokens = stream;
+        let epilogue = settle_kept_prefix(prefill_checkpoints, dflash_checkpoints, len, gpu);
+        if epilogue.rolled_back {
+            return epilogue;
+        }
+    }
+    production_fail_closed_rollback_live(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        slot,
+        spec,
+    )
+}
+
+/// Mid-decode cancel epilogue for the AR route: `seq_pos` and
+/// `conversation_tokens` are already the committed stream (every fed token is
+/// committed as it is forwarded), so a cancel at the top of the decode loop
+/// keeps them when they agree and `eligible`, else the full reset
+/// ([`production_fail_closed_rollback`]).
+pub fn production_cancel_epilogue(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    eligible: bool,
+) -> RollbackEpilogue {
+    if let CancelDisposition::KeepCommitted { len } =
+        cancel_disposition(eligible, Some(m.conversation_tokens.len()), m.seq_pos)
+    {
+        let epilogue = settle_kept_prefix(
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            len,
+            gpu,
+        );
+        if epilogue.rolled_back {
+            return epilogue;
+        }
+    }
+    production_fail_closed_rollback(m, gpu, None, None)
+}
+
 fn qwen4_pp_owns_reset(pp: usize, active_qwen4_mesh: bool) -> bool {
     pp > 1 && active_qwen4_mesh
 }

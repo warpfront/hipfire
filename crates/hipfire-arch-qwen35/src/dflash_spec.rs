@@ -2525,6 +2525,7 @@ impl Speculator for DflashSpeculator {
                 &mut df.hidden_rb,
                 prefill_tokens,
                 prefill_start,
+                prompt_tokens.get(..prefill_start).unwrap_or(&[]),
                 abort,
                 ckpt_sink,
                 ck_interval,
@@ -2639,6 +2640,7 @@ impl Speculator for DflashSpeculator {
             &mut df.hidden_rb,
             tokens,
             start_pos,
+            &[],
             abort,
             None,
             self.ck_interval,
@@ -3240,6 +3242,13 @@ impl Speculator for DflashSpeculator {
 
     fn checkpoint_positions(&self) -> Vec<usize> {
         self.checkpoints.iter().map(|(p, _)| *p).collect()
+    }
+
+    fn checkpoint_prefix_hashes(&self) -> Vec<(usize, u64)> {
+        self.checkpoints
+            .iter()
+            .map(|(p, snap)| (*p, snap.prefix_hash))
+            .collect()
     }
 
     fn rewind_to(
@@ -3900,6 +3909,7 @@ pub fn dflash_repair_terminal_prefix_parts(
         &mut df.hidden_rb,
         &replay,
         position,
+        &[],
         &|| false,
         policy.resume_enabled.then_some(checkpoints),
         policy.interval,

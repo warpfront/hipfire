@@ -5274,12 +5274,17 @@ pub fn drive_qwen_vmm_continuous_batch(
                         _ => false,
                     };
                 if let (true, Some(st)) = (take, store.request_state(&r.epoch)) {
+                    let stream: &[u32] = match &sched.lanes[idx] {
+                        BatchLane::Running(lane) => &lane.conversation_tokens,
+                        _ => &[],
+                    };
                     crate::vmm_conv::checkpoint(
                         &mut ctl[idx].checkpoints,
                         &st.dn,
                         &st.kv,
                         gpu,
                         st.position,
+                        stream,
                     );
                 }
                 // `prefill_progress` for this lane's prompt chunk (silent on

@@ -3684,10 +3684,7 @@ pub fn generate_dflash(
     } else {
         (
             &m.conversation_tokens[..],
-            m.speculator
-                .as_ref()
-                .map(|s| s.checkpoint_positions())
-                .unwrap_or_default(),
+            attested_spec_checkpoint_positions(m.speculator.as_deref(), &m.conversation_tokens),
         )
     };
     let cache_eligible = !cache_disabled
@@ -4142,7 +4139,8 @@ pub fn generate_dflash(
                     *store_cache,
                 );
                 if !effects.emit_done {
-                    let ep = production_fail_closed_rollback(m, gpu, None, None);
+                    let ep =
+                        production_cancel_epilogue(m, gpu, spec_cancel_keeps_committed_prefix(m));
                     emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
                     return true;
                 }
@@ -4301,7 +4299,7 @@ pub fn generate_dflash(
         let intended_store = cache_action.store && !cached_seq.is_empty();
         let effects = qwen_client_commit_effects(decision, intended_release, intended_store);
         if !effects.emit_done {
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            let ep = production_cancel_epilogue(m, gpu, spec_cancel_keeps_committed_prefix(m));
             emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
             return true;
         }
@@ -5111,8 +5109,14 @@ pub fn generate_spec(
         // mid-decode leaves the spec-decode loop running for max_tokens
         // worth of wasted work.
         if check_abort(id) {
-            // Mid-decode cancel: reset+sync first; terminal follows attestation.
-            let ep = spec_rollback_live(
+            // Mid-decode cancel at a committed cycle boundary (the pending seed
+            // is emitted, not yet fed). A client cancel is not a failure: the
+            // target KV / DeltaNet state is exactly the committed prefix, so
+            // `spec_cancel_epilogue_live` keeps it for the next request (which
+            // hits it or resumes from the latest attested checkpoint) and only
+            // falls back to the full reset when the cursors cannot attest it.
+            // The device is synchronized before the terminal either way.
+            let ep = spec_cancel_epilogue_live(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
@@ -5122,6 +5126,11 @@ pub fn generate_spec(
                 pp.as_deref_mut(),
                 slot,
                 spec.as_mut(),
+                m.eviction.is_some(),
+                &prompt_tokens,
+                &emitted,
+                position,
+                pending_seed_committable.then_some(seed_token),
             );
             emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return None;
@@ -5973,7 +5982,9 @@ pub fn generate_spec(
         let tx = spec_terminal_pending_seed_tx(seed_token);
         if check_abort(id) {
             let _ = classify_forced_gpu_advance(true);
-            let ep = spec_rollback_live(
+            // The seed is emitted but not yet fed: same committed boundary as
+            // the loop-top cancel.
+            let ep = spec_cancel_epilogue_live(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
@@ -5983,6 +5994,11 @@ pub fn generate_spec(
                 pp.as_deref_mut(),
                 slot,
                 spec.as_mut(),
+                m.eviction.is_some(),
+                &prompt_tokens,
+                &emitted,
+                position,
+                pending_seed_committable.then_some(seed_token),
             );
             emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             drop(guard);
@@ -11301,6 +11317,32 @@ pub fn emit_spec_prefill_terminal(
     }
 }
 
+/// Resume-planner view of the speculator's DeltaNet checkpoint ring: only the
+/// checkpoints whose stored prefix fingerprint proves they cover exactly
+/// `conversation[..position]` (the stream the resident state describes). A
+/// checkpoint that cannot prove it is excluded, so a divergence it would have
+/// served prefills cold instead of restoring non-reversible state onto a
+/// prefix it does not match.
+fn attested_spec_checkpoint_positions(
+    spec: Option<&dyn Speculator>,
+    conversation: &[u32],
+) -> Vec<usize> {
+    let Some(spec) = spec else {
+        return Vec::new();
+    };
+    let ring = spec.checkpoint_prefix_hashes();
+    let attested = speculative::attested_checkpoint_positions(&ring, conversation);
+    if attested.len() != ring.len() {
+        eprintln!(
+            "[qwen-cache resume] {} of {} checkpoint(s) rejected: prefix hash does not attest the conversation (kept {:?})",
+            ring.len() - attested.len(),
+            ring.len(),
+            attested,
+        );
+    }
+    attested
+}
+
 /// [`production_fail_closed_rollback_live`] for the spec loop: the mesh form
 /// (all-band reset plus the drafter's) on a pipeline-parallel Qwen4 model, the
 /// single-GPU form otherwise.
@@ -11338,6 +11380,84 @@ fn spec_rollback_live(
             spec,
         ),
     }
+}
+
+/// Cancel epilogue of the spec loop at a committed boundary: the pending seed
+/// is emitted to the client but not yet fed, so the target KV / DeltaNet state
+/// is exactly `prompt_tokens` + the fed part of `emitted` (`position` tokens).
+/// [`production_cancel_epilogue_live`] keeps that prefix as the conversation
+/// when the cursors attest it; the validated configuration is a resident
+/// single-GPU Qwen3.5-class target (`ModelSlot`, no KV eviction/compaction) on
+/// the MTP or DFlash speculator. A pipeline-parallel mesh, every other target
+/// and every unattestable cursor keep the full reset ([`spec_rollback_live`]).
+#[allow(clippy::too_many_arguments)]
+fn spec_cancel_epilogue_live(
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+    pp: Option<&mut hipfire_runtime::multi_gpu::Gpus>,
+    slot: &mut dyn SpecTarget,
+    spec: &mut dyn Speculator,
+    eviction_active: bool,
+    prompt_tokens: &[u32],
+    emitted: &[u32],
+    position: usize,
+    pending_seed: Option<u32>,
+) -> RollbackEpilogue {
+    if pp.is_some() {
+        return spec_rollback_live(
+            seq_pos,
+            conversation_tokens,
+            prefill_checkpoints,
+            dflash_checkpoints,
+            asst_turn_cache,
+            gpu,
+            pp,
+            slot,
+            spec,
+        );
+    }
+    let eligible = !eviction_active
+        && matches!(spec.name(), "mtp" | "dflash")
+        && slot
+            .as_any_mut()
+            .downcast_mut::<speculative::ModelSlot>()
+            .is_some_and(|ms| ms.kv_cache.compact_offset == 0);
+    production_cancel_epilogue_live(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        slot,
+        spec,
+        CancelBoundary {
+            eligible,
+            fed: position,
+            stream: spec_cancel_committed_stream(prompt_tokens, emitted, position, pending_seed),
+        },
+    )
+}
+
+/// Whether a client cancel at the terminal commit handshake of the spec route
+/// (the turn finished, the client left before `done`) may keep the conversation
+/// the turn already baked: the same validated configuration as
+/// [`spec_cancel_epilogue_live`] (resident single-GPU Qwen3.5-class bundle on
+/// the MTP or DFlash speculator, no KV eviction/compaction). Nothing was
+/// reverted, so the host record and device cursor agree by construction;
+/// [`production_cancel_epilogue`] still checks that they do.
+fn spec_cancel_keeps_committed_prefix(m: &LoadedModel) -> bool {
+    m.pp <= 1
+        && m.eviction.is_none()
+        && m.kv_adaptive.is_none()
+        && m.speculator
+            .as_ref()
+            .is_some_and(|s| matches!(s.name(), "mtp" | "dflash"))
+        && m.qwen35().is_some_and(|b| b.kv_cache.compact_offset == 0)
 }
 
 /// `Speculator::prefill` of the spec loop, on the mesh for a pipeline-parallel
