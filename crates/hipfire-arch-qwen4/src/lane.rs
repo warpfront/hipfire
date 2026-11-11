@@ -87,8 +87,8 @@ pub(crate) mod groups;
 pub mod pages;
 use groups::GroupPlanner;
 
-/// Most lanes one store holds.
-pub(crate) const MAX_LANES: usize = 64;
+/// Most lanes one store holds (gfx942 stock-FP8 serves 64: 259 MiB/lane [MEAS], ~16.6 GB).
+pub const MAX_LANES: usize = 64;
 
 /// Topology of THIS rank's bundle. Expert parallelism is read from the
 /// rank's own weights (peers hold no root `bundle.ep`); a band that is not the
