@@ -131,6 +131,7 @@ op_table!(Vop2Op {
     AddU16,
     SubU16,
     LshlrevB16,
+    LshrrevB16,
     AshrrevI16,
     MulLoU16,
 });
@@ -384,7 +385,7 @@ enum LitTy {
     B32,
     /// 16-bit float: 0..=64, 0xfff0..=0xffff (-16..=-1) and the f16 patterns.
     F16,
-    /// 16-bit integer: 0..=64 only.
+    /// 16-bit integer: unsigned or sign-extended signed literal; 0..=64 fold inline.
     I16,
     /// 64-bit integer: 0..=64 only (the literal is extended, §6.2.1 p.32).
     I64,
@@ -414,7 +415,8 @@ impl LitTy {
     }
     fn check(self, name: &str, v: u32) -> Result<()> {
         match self {
-            Self::F16 | Self::I16 if v > 0xffff => Err(format!("{name}: literal {v:#x} does not fit the 16-bit operand")),
+            Self::F16 if v > 0xffff => Err(format!("{name}: literal {v:#x} does not fit the 16-bit operand")),
+            Self::I16 if v > 0xffff && v < 0xffff_8000 => Err(format!("{name}: literal {v:#x} is neither unsigned nor sign-extended signed 16-bit")),
             Self::F64 if v <= 64 => Err(format!(
                 "{name}: 64-bit-float literal {v:#x} (high dword) has no llvm spelling: llvm prints it as {v:#x}, which assembles as the inline integer {v}"
             )),
@@ -422,6 +424,11 @@ impl LitTy {
         }
     }
     fn text(self, v: u32) -> String {
+        // LLVM's disassembler masks these to 16 bits, losing the literal's upper
+        // halfword. Signed forced-literal syntax preserves the exact encoding.
+        if self == Self::I16 && v >= 0xffff_8000 {
+            return format!("lit({})", v as i32);
+        }
         if self.inline_equivalent(v) {
             format!("lit({v:#x})")
         } else {
@@ -553,7 +560,12 @@ impl Vop2Op {
             LitTy::F16
         } else if matches!(
             self,
-            Self::AddU16 | Self::SubU16 | Self::LshlrevB16 | Self::AshrrevI16 | Self::MulLoU16
+            Self::AddU16
+                | Self::SubU16
+                | Self::LshlrevB16
+                | Self::LshrrevB16
+                | Self::AshrrevI16
+                | Self::MulLoU16
         ) {
             LitTy::I16
         } else {
@@ -1875,6 +1887,7 @@ impl Vop2Op {
                 Self::AddU16 => 38,
                 Self::SubU16 => 39,
                 Self::LshlrevB16 => 42,
+                Self::LshrrevB16 => 43,
                 Self::AshrrevI16 => 44,
                 Self::MulLoU16 => 41,
             }),
@@ -1923,6 +1936,7 @@ impl Vop2Op {
             Self::AddU16 => "v_add_u16",
             Self::SubU16 => "v_sub_u16",
             Self::LshlrevB16 => "v_lshlrev_b16",
+            Self::LshrrevB16 => "v_lshrrev_b16",
             Self::AshrrevI16 => "v_ashrrev_i16",
             Self::MulLoU16 => "v_mul_lo_u16",
         }

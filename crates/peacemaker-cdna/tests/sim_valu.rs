@@ -667,6 +667,9 @@ fn cases() -> Vec<Case> {
         c2(B::LshlrevB16, &[U, U], |s, _| {
             ((s[1] as u16) << (s[0] & 15)) as u32
         }),
+        c2(B::LshrrevB16, &[U, U], |s, _| {
+            ((s[1] as u16) >> (s[0] & 15)) as u32
+        }),
         c2(B::AshrrevI16, &[U, U], |s, _| {
             ((s[1] as u16 as i16) >> (s[0] & 15)) as u16 as u32
         }),
@@ -1496,6 +1499,20 @@ fn f16_vop1_vop2_zero_high_half_and_inline_constants() {
         valu::exec(&mut w, &v3(v)),
         Err(SimError::Unsupported(_))
     ));
+}
+
+#[test]
+fn integer16_sign_extended_literal_uses_low_half_and_zeroes_high_result() {
+    let mut w = wave();
+    w.exec = 1;
+    for value in [-1i32, -256, -32768] {
+        let inst = v2(Vop2Op::AddU16, vg(1), Src::Lit(value as u32), vg(10));
+        for low in 0..=u16::MAX {
+            w.v[10][0] = 0xa5a5_0000 | u32::from(low);
+            exec_ok(&mut w, &inst);
+            assert_eq!(w.v[1][0], u32::from(low.wrapping_add(value as u16)));
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------

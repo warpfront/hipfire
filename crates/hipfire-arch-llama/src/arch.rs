@@ -438,7 +438,7 @@ impl Llama {
             }
 
             // ── RoPE ────────────────────────────────────────────
-            gpu.rope_f32(
+            gpu.rope_scaled_f32(
                 &scratch.q,
                 &scratch.k,
                 &scratch.pos_buf,
@@ -446,6 +446,7 @@ impl Llama {
                 n_kv_heads,
                 head_dim,
                 config.rope_freq_base,
+                config.rope_llama3,
             )?;
 
             // ── KV cache write + attention (dispatched) ────────

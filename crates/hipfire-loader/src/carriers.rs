@@ -5324,8 +5324,16 @@ pub fn qwen4_preload_resource_plan(
             .ok_or_else(|| format!("qwen4 preload plan: {what} overflows"))
     };
     // Admit-only artifact read: config, manifest and recipe. No allocation.
-    let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(hfq, Some(&gpu.arch))
-        .map_err(|error| format!("qwen4 preload plan: artifact admission: {error}"))?;
+    let stock_mtp = crate::admission::resolve_stock_mtp_sidecar(hfq, shared.spec.mtp)
+        .map_err(|error| format!("qwen4 preload plan: {error}"))?
+        .sidecar;
+    let receipt = hipfire_arch_qwen4::artifact::admit_hfqm_artifact_with(
+        hfq,
+        Some(&gpu.arch),
+        hipfire_arch_qwen4::weights::trunk_shard::trunk_shard_drops_mtp_head(),
+        stock_mtp.as_ref(),
+    )
+    .map_err(|error| format!("qwen4 preload plan: artifact admission: {error}"))?;
     let recipe = receipt.recipe().clone();
     let config = receipt.config;
     // Own the admitted metadata for the placement probe below (no weights
@@ -5352,8 +5360,12 @@ pub fn qwen4_preload_resource_plan(
     // `tensor_data` (no payload access).
     let bytes_of = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
         crate::qwen4_slab::qwen4_entry_bytes(&recipe, entry, |entry| {
-            hfq.find_tensor_info(&entry.name)
-                .map(|info| info.data_size as u64)
+            hipfire_arch_qwen4::stock_mtp_sidecar::Qwen4StockSources {
+                base: hfq,
+                mtp: stock_mtp.as_ref().map(|bound| &bound.hfq),
+            }
+            .find_tensor_info(&entry.name)
+            .map(|info| info.data_size as u64)
         })
     };
     // Conservative supported scratch-mode union without the payload scan:
@@ -6746,8 +6758,28 @@ fn load_qwen4_rank_unscoped(
     let choice = crate::admission::resolve_qwen4_ple_rows_hfq(&mut hfq, ctx.path, &ctx.gpu.arch)?;
     // GPU-arch admission: an artifact the device cannot run is refused here,
     // before any allocation or mapping drop.
-    let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(&hfq, Some(&ctx.gpu.arch))
-        .map_err(|error| error.to_string())?;
+    // The stock-FP8 MTP head sidecar (`<model>.mtp`): resolved by the same §7.1 policy
+    // admission applied, bound once for this load (payload sha256 verified there), and
+    // refused (R7) if it is not the sidecar admission bound.
+    let mut stock_mtp = crate::admission::resolve_stock_mtp_sidecar(&hfq, ctx.spec.mtp)?.sidecar;
+    crate::admission::check_admitted_stock_mtp(
+        hfq.path(),
+        &hipfire_arch_qwen4::stock_mtp_sidecar::qwen4_stock_mtp_sidecar_path(hfq.path()),
+        stock_mtp.as_ref().map(|bound| bound.index_sha256),
+    )?;
+    if let Some(bound) = &stock_mtp {
+        eprintln!(
+            "{}",
+            hipfire_arch_qwen4::stock_mtp_sidecar::stock_mtp_attached_line(bound)
+        );
+    }
+    let receipt = hipfire_arch_qwen4::artifact::admit_hfqm_artifact_with(
+        &hfq,
+        Some(&ctx.gpu.arch),
+        hipfire_arch_qwen4::weights::trunk_shard::trunk_shard_drops_mtp_head(),
+        stock_mtp.as_ref(),
+    )
+    .map_err(|error| error.to_string())?;
     // Refused before any allocation (source admission applies the same
     // check): an inventory-valid developer profile the executor cannot
     // run would otherwise fail after the weights were fulfilled.
@@ -7015,6 +7047,11 @@ fn load_qwen4_rank_unscoped(
                 b"qwen4-ple-rows",
                 ple_identity.as_bytes(),
             ]));
+        // A snapshot taken with one head is never served under another head or none.
+        crate::admission::push_stock_mtp_domain_digest(
+            &mut domain.sidecar_digests,
+            stock_mtp.as_ref().map(|bound| &bound.index_sha256),
+        );
         domain
     });
     let configured_session_budget = hipfire_config::memory::session_cache_bytes();
@@ -7119,13 +7156,14 @@ fn load_qwen4_rank_unscoped(
         // A slab layer arena is sized from the recipe's plan, never looked up
         // in the tensor index.
         crate::qwen4_slab::qwen4_entry_bytes(&recipe, entry, |entry| {
-            if use_ranges {
-                hfq.find_tensor_info(&entry.name)
-                    .map(|info| info.data_size as u64)
-            } else {
-                hfq.tensor_data(&entry.name)
-                    .map(|(_, bytes)| bytes.len() as u64)
+            // Ordinary data_size equals tensor_data().len(); the two-file view routes
+            // `mtp.*` to the stock-FP8 head sidecar.
+            hipfire_arch_qwen4::stock_mtp_sidecar::Qwen4StockSources {
+                base: &hfq,
+                mtp: stock_mtp.as_ref().map(|bound| &bound.hfq),
             }
+            .find_tensor_info(&entry.name)
+            .map(|info| info.data_size as u64)
         })
     };
     // Expert parallelism with the embedding table in pinned host RAM
@@ -9221,6 +9259,13 @@ fn load_qwen4_rank_unscoped(
         .is_some_and(|lease| lease.decode_share().is_some());
     let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq, &ctx.gpu.arch);
     let mut source = HfqModelSource::from_hfq(hfq);
+    // The stock-FP8 head sidecar is served `Borrowed` from its own mmap (never a range:
+    // a second backing file would fail the direct reader's identity check).
+    let mtp_source = stock_mtp.take().map(|bound| {
+        let mut sidecar = HfqModelSource::from_hfq(bound.hfq);
+        sidecar.set_prefer_ranges(false);
+        sidecar
+    });
     // Preserve the incumbent direct-read path outside the admission-owned S1 arenas.
     // A sealed EP rank fulfills through `fulfill_manifest_from_payloads` on the
     // seal's mesh (no `EpFulfill` argument, no direct reader); the arenas path
@@ -9246,8 +9291,9 @@ fn load_qwen4_rank_unscoped(
                 return payload;
             }
         }
-        crate::qwen4_slab::qwen4_fulfillment_payload(
+        crate::qwen4_slab::qwen4_routed_payload(
             &source,
+            mtp_source.as_ref(),
             &recipe,
             entry,
             qwen4_use_range_payload(

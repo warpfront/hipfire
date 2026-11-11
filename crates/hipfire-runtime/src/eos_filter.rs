@@ -176,8 +176,9 @@ impl EosFilter {
         }
         // Force-classify remaining raw. At EOS, trailing partial marker
         // prefixes are ordinary prose and must be emitted; open-think
-        // content stays suppressed inside `pump(at_eos=true)`.
-        let _ = self.pump(true);
+        // content stays suppressed inside `pump(at_eos=true)`. Stop
+        // markers still end the stream here.
+        let _ = self.pump(true, true);
         let pending = if self.state.in_think {
             // Do not leak hidden reasoning; leave no residual reusable state.
             Vec::new()
@@ -212,6 +213,18 @@ impl EosFilter {
     /// Feed newly-decoded bytes from a single token. Returns the next
     /// action.
     pub fn observe(&mut self, raw_bytes: &[u8]) -> FilterAction {
+        self.observe_with(raw_bytes, true)
+    }
+
+    /// Like [`Self::observe`], but a configured stop marker does not end
+    /// the turn. The marker bytes are emitted as text, `stopped` stays
+    /// clear, and later chunks are still emitted. `min_tokens` suspension
+    /// still drops the marker.
+    pub fn observe_suppressing_stops(&mut self, raw_bytes: &[u8]) -> FilterAction {
+        self.observe_with(raw_bytes, false)
+    }
+
+    fn observe_with(&mut self, raw_bytes: &[u8], honor_stops: bool) -> FilterAction {
         if self.state.stopped || self.state.finished {
             return FilterAction::Hold;
         }
@@ -223,7 +236,7 @@ impl EosFilter {
         }
         self.state.raw.extend_from_slice(raw_bytes);
 
-        if let Some(action) = self.pump(false) {
+        if let Some(action) = self.pump(false, honor_stops) {
             return action;
         }
 
@@ -245,7 +258,11 @@ impl EosFilter {
     /// as ordinary prose and flushed into visible (true end-of-stream
     /// disambiguation). Open-think content is still discarded. Incomplete
     /// UTF-8 tails are emitted as-is at EOS (no further bytes will arrive).
-    fn pump(&mut self, at_eos: bool) -> Option<FilterAction> {
+    ///
+    /// `honor_stops`: when false, a complete stop marker is kept as visible
+    /// text and scanning continues. The filter does not latch `stopped`.
+    /// `stops_suspended` still discards the marker (`min_tokens`).
+    fn pump(&mut self, at_eos: bool, honor_stops: bool) -> Option<FilterAction> {
         const OPEN: &[u8] = b"<think>";
         const CLOSE: &[u8] = b"</think>";
 
@@ -353,7 +370,14 @@ impl EosFilter {
                     match ev.kind {
                         EventKind::Stop if self.stops_suspended => {
                             // `min_tokens` not reached: the marker is not a
-                            // stop yet; its bytes are discarded.
+                            // stop yet. Drop it and keep scanning.
+                            continue;
+                        }
+                        EventKind::Stop if !honor_stops => {
+                            // The caller is holding the turn open. The marker
+                            // is argument text, so it stays in the stream.
+                            let marker = self.state.raw[cursor + ev.at..self.state.cursor].to_vec();
+                            self.push_visible(&marker);
                             continue;
                         }
                         EventKind::Stop => {
@@ -852,6 +876,43 @@ mod tests {
         let mut f = EosFilter::new(cfg_im_end());
         assert_eq!(f.observe(b"<|im_"), FilterAction::Hold);
         assert_eq!(f.observe(b"end|>"), FilterAction::Stop);
+    }
+
+    #[test]
+    fn suppressing_stops_keeps_the_marker_and_the_stream_open() {
+        let mut f = EosFilter::new(cfg_qwen_ar(false));
+        assert_eq!(f.observe(b"hi"), FilterAction::Emit(b"hi".to_vec()));
+        assert_eq!(
+            f.observe_suppressing_stops(b"<|im_end|>"),
+            FilterAction::Emit(b"<|im_end|>".to_vec())
+        );
+        assert_eq!(
+            f.observe_suppressing_stops(b"more"),
+            FilterAction::Emit(b"more".to_vec())
+        );
+        assert_eq!(f.observe(b"<|endoftext|>"), FilterAction::Stop);
+    }
+
+    #[test]
+    fn suppressing_stops_emits_prose_around_the_marker() {
+        let mut f = EosFilter::new(cfg_qwen_ar(false));
+        assert_eq!(
+            f.observe_suppressing_stops(b"foo<|im_end|>bar"),
+            FilterAction::Emit(b"foo<|im_end|>bar".to_vec())
+        );
+    }
+
+    #[test]
+    fn suppressing_stops_spans_a_split_marker() {
+        let mut f = EosFilter::new(cfg_im_end());
+        assert_eq!(
+            f.observe_suppressing_stops(b"foo<|im_"),
+            FilterAction::Emit(b"foo".to_vec())
+        );
+        assert_eq!(
+            f.observe_suppressing_stops(b"end|>bar"),
+            FilterAction::Emit(b"<|im_end|>bar".to_vec())
+        );
     }
 
     #[test]

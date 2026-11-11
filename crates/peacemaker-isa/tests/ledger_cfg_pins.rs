@@ -194,13 +194,13 @@ impl Report {
     }
 }
 
-/// The gfx942 anchors (hipcc) and twins (PM) with typed coverage: the rows16 BF16 MFMA object
-/// and the FP8 grouped MoE object. Each is lifted by `peacemaker_lift::cdna` and every kernel is
+/// The gfx942 anchors (hipcc) and twins (PM) with typed coverage: the rows16 and P1b wide
+/// BF16 MFMA objects and the FP8 grouped MoE object. Each is lifted and every kernel is
 /// certified by `peacemaker_isa::cdna::lifted::certify` (CDNA hazards + typed CFG wait ledger).
 /// Their absence fails the gate. Every other gfx942 image stays an explicit not-verified entry.
 /// Each entry is the committed file and the exact kernel symbols it must contain, and nothing
 /// else.
-const CDNA_CERTIFIED: [(&str, &[&str]); 4] = [
+const CDNA_CERTIFIED: [(&str, &[&str]); 10] = [
     (
         "gemm_bf16_mfma_gfx942_rows16_hipcc_gfx942.co",
         &[
@@ -218,6 +218,22 @@ const CDNA_CERTIFIED: [(&str, &[&str]); 4] = [
         ],
     ),
     (
+        "gemm_bf16_mfma_wide_gfx942_hipcc_gfx942.co",
+        &[
+            "gemm_bf16_mfma_gfx942_wide64",
+            "gemm_bf16_mfma_gfx942_wide64_m32",
+            "gemm_bf16_mfma_gfx942_wide64_m64",
+        ],
+    ),
+    (
+        "gemm_bf16_mfma_wide_gfx942_pm_gfx942.hxaco",
+        &[
+            "gemm_bf16_mfma_gfx942_wide64",
+            "gemm_bf16_mfma_gfx942_wide64_m32",
+            "gemm_bf16_mfma_gfx942_wide64_m64",
+        ],
+    ),
+    (
         "gemm_fp8b128_moe_grouped_bf16mfma_hipcc_gfx942.co",
         &[
             "gemm_fp8b128_moe_grouped_bf16mfma",
@@ -231,6 +247,36 @@ const CDNA_CERTIFIED: [(&str, &[&str]); 4] = [
             "gemm_fp8b128_moe_grouped_bf16mfma",
             "gemm_fp8b128_moe_grouped_bf16mfma_xbf16",
             "gemm_fp8b128_moe_tile_desc_pad16",
+        ],
+    ),
+    (
+        "qwen4_g942_glue_elem_hipcc_gfx942.co",
+        &[
+            "qwen4_g942_gemm_bf16_rows16_hc_act",
+            "qwen4_g942_gemm_bf16_rows16_hc_act_x2",
+        ],
+    ),
+    (
+        "qwen4_g942_glue_elem_pm_gfx942.hxaco",
+        &[
+            "qwen4_g942_gemm_bf16_rows16_hc_act",
+            "qwen4_g942_gemm_bf16_rows16_hc_act_x2",
+        ],
+    ),
+    (
+        "qwen4_g942_glue_moe_hipcc_gfx942.co",
+        &[
+            "qwen4_g942_moe_group_scatter_desc",
+            "qwen4_g942_moe_unscatter_act",
+            "qwen4_g942_moe_combine_shared_add",
+        ],
+    ),
+    (
+        "qwen4_g942_glue_moe_pm_gfx942.hxaco",
+        &[
+            "qwen4_g942_moe_group_scatter_desc",
+            "qwen4_g942_moe_unscatter_act",
+            "qwen4_g942_moe_combine_shared_add",
         ],
     ),
 ];

@@ -7,9 +7,7 @@
 //! certified lowering implement, so a missing capability is a rustc error
 //! rather than a run-time `Err` from the builder.
 //!
-//! M0 covers the three bench architectures (RDNA3 gfx1100, RDNA3.5 gfx1151,
-//! RDNA4 gfx1201). gfx942 and its FNUZ fp8 type are a documented future
-//! extension (design §4.1, §4.4), not part of this core.
+//! RDNA3, RDNA3.5, RDNA4 and CDNA3 expose their own wait and barrier models.
 
 mod sealed {
     pub trait Sealed {}
@@ -32,6 +30,13 @@ pub trait WaitModel: sealed::Sealed + Copy + 'static {
 /// gfx11 counters: VMcnt, LGKMcnt, EXPcnt, VScnt.
 #[derive(Clone, Copy, Debug)]
 pub enum Gfx11Waits {}
+/// CDNA3 counters: VMcnt (loads and stores), LGKMcnt, EXPcnt.
+#[derive(Clone, Copy, Debug)]
+pub enum CdnaWaits {}
+impl sealed::Sealed for CdnaWaits {}
+impl WaitModel for CdnaWaits {
+    const LDS: LdsCounter = LdsCounter::Lgkm;
+}
 /// gfx12 counters: LOADcnt, STOREcnt, DScnt, KMcnt.
 #[derive(Clone, Copy, Debug)]
 pub enum Gfx12Waits {}
@@ -77,6 +82,16 @@ pub struct Gfx1151;
 /// RDNA4 (Navi 48).
 #[derive(Clone, Copy, Debug)]
 pub struct Gfx1201;
+/// CDNA3 (MI300X), wave64.
+#[derive(Clone, Copy, Debug)]
+pub struct Gfx942;
+impl sealed::Sealed for Gfx942 {}
+impl Target for Gfx942 {
+    const NAME: &'static str = "gfx942";
+    const LDS_BYTES: u32 = 65536;
+    type Waits = CdnaWaits;
+    type Barrier = Full;
+}
 impl sealed::Sealed for Gfx1100 {}
 impl sealed::Sealed for Gfx1151 {}
 impl sealed::Sealed for Gfx1201 {}

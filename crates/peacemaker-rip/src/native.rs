@@ -177,6 +177,8 @@ pub(crate) const COMMON_FNS: &[&str] = &[
     "vr",
     "s",
     "sr",
+    "a",
+    "ar",
     "lit",
     "op",
     "mem",
@@ -350,6 +352,7 @@ pub fn assoc_const<'a>(ty: &str, item: &str) -> Option<Value<'a>> {
         ("Arch", "Gfx1151") => nat(Nat::Arch(Arch::Gfx1151)),
         ("Arch", "Gfx1201") => nat(Nat::Arch(Arch::Gfx1201)),
         ("Arch", "Gfx1100") => nat(Nat::Arch(Arch::Gfx1100)),
+        ("Arch", "Gfx942") => nat(Nat::Arch(Arch::Gfx942)),
         ("MemoryClass", "VmemLoad") => nat(Nat::Mem(MemoryClass::VmemLoad)),
         ("MemoryClass", "VmemStore") => nat(Nat::Mem(MemoryClass::VmemStore)),
         ("MemoryClass", "DsLoad") => nat(Nat::Mem(MemoryClass::DsLoad)),
@@ -953,6 +956,14 @@ pub fn call_fn<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut C
             need(2)?;
             Ok(nat(Nat::Reg(common::sr(u8_of(it, &a[0], "sr")?, u8_of(it, &a[1], "sr")?))))
         }
+        "a" => {
+            need(1)?;
+            Ok(nat(Nat::Reg(RegRef { kind: RegKind::A, base: u8_of(it, &a[0], "a")?, len: 1 })))
+        }
+        "ar" => {
+            need(2)?;
+            Ok(nat(Nat::Reg(RegRef { kind: RegKind::A, base: u8_of(it, &a[0], "ar")?, len: u8_of(it, &a[1], "ar")? })))
+        }
         "lit" => {
             need(1)?;
             Ok(Value::str(common::lit(u32_of(it, &a[0], "lit")?)))
@@ -1361,15 +1372,26 @@ pub fn method<'a>(
             _ => None,
         },
         Nat::Plan(p) => match name {
+            "with_agpr_budget" => {
+                need(1)?;
+                let plan = p
+                    .borrow()
+                    .clone()
+                    .with_agpr_budget(u16_of(it, &a[0], "AGPR budget")?);
+                Some(done_with(plan, |plan| {
+                    nat(Nat::Plan(Rc::new(RefCell::new(plan))))
+                }))
+            }
             "add_range" => {
                 need(5)?;
                 let kind = str_of(it, &a[1], "add_range kind")?;
                 let kind = match kind.as_str() {
                     "v" => RegKind::V,
                     "s" => RegKind::S,
+                    "a" => RegKind::A,
                     _ => {
                         return Err(format!(
-                            "add_range: unknown register kind `{kind}` (expected v, s)"
+                            "add_range: unknown register kind `{kind}` (expected v, s, a)"
                         )
                         .into())
                     }
@@ -1385,7 +1407,7 @@ pub fn method<'a>(
                     live,
                 )))
             }
-            "s" | "v" => {
+            "s" | "v" | "a" => {
                 need(3)?;
                 let width = match targs.first() {
                     Some(t) => t
@@ -1402,7 +1424,11 @@ pub fn method<'a>(
                 let Some(Nat::Live(live)) = nat_of(it, &a[2]) else {
                     return Err("the last argument is a Live range".into());
                 };
-                let kind = if name == "s" { RegKind::S } else { RegKind::V };
+                let kind = match name {
+                    "s" => RegKind::S,
+                    "a" => RegKind::A,
+                    _ => RegKind::V,
+                };
                 let r = p.borrow_mut().add_range(&nm, kind, base, width, live);
                 Some(done_with(r, |()| {
                     nat(Nat::Reg(RegRef {
@@ -1418,6 +1444,10 @@ pub fn method<'a>(
             )),
             "next_free_sgpr" => Some(Value::int(
                 i128::from(p.borrow().next_free_sgpr()),
+                IntTy::U16,
+            )),
+            "next_free_agpr" => Some(Value::int(
+                i128::from(p.borrow().next_free_agpr()),
                 IntTy::U16,
             )),
             "scratch_pool" => {

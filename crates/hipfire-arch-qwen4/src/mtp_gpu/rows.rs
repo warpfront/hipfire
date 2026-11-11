@@ -157,7 +157,7 @@ struct RowsView {
 impl MtpRowsScratch {
     /// Element count and dtype of each tensor, in field order; `None` for a
     /// dense-FFN head (the batched rounds run the MoE head only).
-    fn shapes(
+    pub(super) fn shapes(
         config: &Qwen4Config,
     ) -> Result<Option<[(usize, DType); ROWS_SCRATCH_TENSORS]>, MtpGpuError> {
         let config = config.mtp_geometry();

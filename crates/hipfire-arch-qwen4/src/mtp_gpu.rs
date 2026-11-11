@@ -11,8 +11,8 @@
 
 use crate::config::Qwen4Config;
 use crate::gpu_forward::{
-    dense_ref, hyper_desc, hyper_read_desc, program_dims, qsa_desc, seal_moe_decode, MtpEpGather,
-    Qwen4EpDummyExpert, Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
+    dense_ref, hyper_desc, hyper_read_desc, program_dims, qsa_desc, seal_moe_decode, seal_moe_rows,
+    MtpEpGather, Qwen4EpDummyExpert, Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
     Qwen4PeerLayerSource,
 };
 use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
@@ -105,6 +105,10 @@ pub(crate) const MTP_DRAFT_ROUNDS_ENV: &str = "HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS";
 
 mod rows;
 pub(crate) use rows::{draft_rounds_enabled, DraftRow, MtpRowsScratch};
+mod fp8_moe;
+#[cfg(feature = "lab")]
+pub use fp8_moe::LabHeadRouting;
+pub(crate) use fp8_moe::MtpFp8MoeScratch;
 #[cfg(feature = "lab")]
 mod lab;
 #[cfg(feature = "lab")]
@@ -2546,6 +2550,9 @@ pub struct Qwen4MtpGpu {
     /// `e % 2`). `Some` only with [`DRAFT_SHARDED_MOE_ENV`] on, two ranks, at
     /// [`Self::install_lane_local_moe`].
     pub(crate) s4_owners: Option<GpuTensor>,
+    /// The grouped-route scratch of a stock-FP8 (qt=55) MoE head's one-row
+    /// steps ([`MtpFp8MoeScratch`]); `None` for every other head.
+    pub(crate) fp8_moe: Option<MtpFp8MoeScratch>,
 }
 
 /// Draft-head front: tokens below this id, plus EOS and the control ids
@@ -3083,7 +3090,8 @@ impl Qwen4MtpGpu {
             .checked_add(Qwen4MoeLayerRuntime::device_bytes(config)?)?
             .checked_add(head_d2_device_bytes(config, head_d2)?)?
             .checked_add(draft)?
-            .checked_add(MtpRowsScratch::device_bytes(config)?)?;
+            .checked_add(MtpRowsScratch::device_bytes(config)?)?
+            .checked_add(MtpFp8MoeScratch::device_bytes(config)?)?;
         Some((resident, scratch))
     }
 
@@ -3116,6 +3124,7 @@ impl Qwen4MtpGpu {
         }
         resident.extend(widen(draft)?);
         resident.extend(MtpRowsScratch::allocation_sizes(config)?);
+        resident.extend(MtpFp8MoeScratch::allocation_sizes(config)?);
         Some((resident, widen(draft_scratch)?))
     }
 
@@ -3238,6 +3247,24 @@ impl Qwen4MtpGpu {
                 return Err(error);
             }
         };
+        // A stock-FP8 (qt=55) MoE head has no indexed decode route: its one-row
+        // steps run the grouped route, whose scratch is allocated here, after
+        // the rows scratch (nothing for any other head).
+        let fp8_moe = match moe.as_ref().filter(|moe| moe.is_fp8()) {
+            Some(_) => MtpFp8MoeScratch::new(gpu, config),
+            None => Ok(None),
+        };
+        let fp8_moe = match fp8_moe {
+            Ok(fp8_moe) => fp8_moe,
+            Err(error) => {
+                let _ = rows.and_then(|rows| rows.free_gpu(gpu));
+                let _ = draft.free_gpu(gpu);
+                let _ = moe.map(|moe| moe.free_gpu(gpu));
+                let _ = state.free_gpu(gpu);
+                let _ = scratch.free_gpu(gpu);
+                return Err(error);
+            }
+        };
         Ok(Self {
             scratch,
             state,
@@ -3251,6 +3278,7 @@ impl Qwen4MtpGpu {
             s4_round: None,
             s4_owners: None,
             rows,
+            fp8_moe,
         })
     }
 
@@ -3412,6 +3440,7 @@ impl Qwen4MtpGpu {
             moe_full,
             draft,
             rows,
+            fp8_moe,
             s4_owners,
             ..
         } = self;
@@ -3421,6 +3450,7 @@ impl Qwen4MtpGpu {
         let moe_error = moe.and_then(|moe| moe.free_gpu(gpu));
         let moe_full_error = moe_full.and_then(|moe| moe.free_gpu(gpu));
         let rows_error = rows.and_then(|rows| rows.free_gpu(gpu));
+        let fp8_moe_error = fp8_moe.and_then(|fp8_moe| fp8_moe.free_gpu(gpu));
         let s4_error = s4_owners.and_then(|table| gpu.free_tensor(table).err());
         draft_error
             .or(scratch_error)
@@ -3428,6 +3458,7 @@ impl Qwen4MtpGpu {
             .or(moe_error)
             .or(moe_full_error)
             .or(rows_error)
+            .or(fp8_moe_error)
             .or(s4_error)
             .map_or(Ok(()), |error| Err(MtpGpuError::Hip(error)))
     }
@@ -3924,12 +3955,39 @@ impl Qwen4MtpGpu {
             } else {
                 self.moe.as_ref()
             };
+            // A stock-FP8 (qt=55) head has no indexed decode route: its one-row
+            // step seals the grouped call (`seal_moe_rows` at one routing row),
+            // over the grouped scratch allocated at attach and the one-row
+            // scratch's HC rows and FFN output.
+            let fp8_router = match (head_moe, self.fp8_moe.as_ref()) {
+                (Some(runtime), Some(fp8)) if runtime.is_fp8() && step != MtpStep::Append => {
+                    Some(fp8.router_view(config)?)
+                }
+                _ => None,
+            };
+            let fp8_layer = match (self.fp8_moe.as_ref(), fp8_router.as_ref()) {
+                (Some(fp8), Some(router)) => Some(fp8.layer_scratch(scratch, router)),
+                _ => None,
+            };
             // The MTP layer's FFN is the trunk's kind (`attach` refuses a
             // head whose FFN weights disagree with the profile).
             let ffn = if step == MtpStep::Append {
                 None
             } else {
                 Some(match (&mtp.ffn, head_moe) {
+                    (Qwen4FfnWeights::Moe(_), Some(runtime)) if runtime.is_fp8() => {
+                        if moe_ep.is_some() {
+                            return Err(invalid(
+                                "stock-FP8 head experts run on one device; they take no EP row gather",
+                            ));
+                        }
+                        let layer = fp8_layer.as_ref().ok_or_else(|| {
+                            invalid(
+                                "a stock-FP8 MTP head step needs the head's grouped MoE scratch",
+                            )
+                        })?;
+                        MtpFfnCall::Moe(seal_moe_rows(&ctx, config, 0, runtime, 1, layer, None)?)
+                    }
                     (Qwen4FfnWeights::Moe(_), Some(runtime)) => {
                         MtpFfnCall::Moe(seal_moe_decode(
                             &ctx,

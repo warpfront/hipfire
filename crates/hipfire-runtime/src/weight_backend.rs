@@ -132,6 +132,9 @@ pub fn load_embedding(
 ) -> HipResult<(GpuTensor, EmbeddingFormat)> {
     match embed_classify(quant_type)? {
         EmbedPlan::Raw(fmt) => {
+            if fmt == EmbeddingFormat::HFQ4G128 {
+                validate_hfq4g128_extent(data.len(), vocab, dim, "token_embd")?;
+            }
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok((buf, fmt))
         }
@@ -745,19 +748,23 @@ pub fn hfq_weight_dtype(quant_type: u8) -> Option<DType> {
     raw_codec(quant_type).map(|codec| codec.dtype)
 }
 
-/// Decode a passthrough quant format: enforce the K%256 guard (via DType),
-/// upload bytes verbatim to `target`, build the `WeightTensor` with the dtype +
-/// its DType-derived row_stride. `name` is the caller context for the guard
-/// error. AWQ sidecars are attached by the caller (hfq), never here.
-pub(crate) fn decode_raw_codec(
-    gpu: &mut Gpu,
+/// HFQ4-G128 per-row extent for loaders that upload qt7 without
+/// [`decode_raw_codec`]: a pre-`b4846285e` file packs groups across rows and
+/// decodes to NaN. Same rule as the weight_store manifest paths.
+pub fn validate_hfq4g128_extent(len: usize, m: usize, k: usize, name: &str) -> HipResult<()> {
+    crate::weight_store::validate_payload_extent(&[m, k], DType::HFQ4G128, len).map_err(|reason| {
+        hip_bridge::HipError::new(0, &format!("tensor {name}: {reason}{BLOB_FIX}"))
+    })
+}
+
+/// GPU-free length/K checks of [`decode_raw_codec`], before any upload.
+fn validate_raw_codec_payload(
     codec: &RawCodec,
     data: &[u8],
     m: usize,
     k: usize,
     name: &str,
-    target: MemoryTarget,
-) -> HipResult<WeightTensor> {
+) -> HipResult<()> {
     // Low-bit layout validation — centralized before any upload/host-dequant.
     // TQ2G128: 34 B per 128-elem group, BQ1G128: 18 B per 128-elem group.
     // Both require K%128==0 and exact packed length m*(k/128)*block_bytes.
@@ -773,9 +780,20 @@ pub(crate) fn decode_raw_codec(
             ),
         ));
     }
-    if codec.dtype == DType::HFQ4G128 {
-        // Same per-row extent the weight_store manifest paths enforce: a
-        // pre-`b4846285e` file packs groups across rows and decodes to NaN.
+    if matches!(
+        codec.dtype,
+        DType::HFQ4G128
+            | DType::HFQ6G256
+            | DType::HFQ4G256
+            | DType::HFQ2G128
+            | DType::HFQ3G128
+            | DType::Q4F16G64
+            | DType::Q4K
+            | DType::Q8_0
+    ) {
+        // Same per-row extent the weight_store manifest paths enforce: older
+        // quantizers packed ragged-K matrices across rows, which the per-row
+        // kernels decode to garbage or NaN.
         crate::weight_store::validate_payload_extent(&[m, k], codec.dtype, data.len()).map_err(
             |reason| hip_bridge::HipError::new(0, &format!("tensor {name}: {reason}{BLOB_FIX}")),
         )?;
@@ -922,6 +940,23 @@ pub(crate) fn decode_raw_codec(
             ));
         }
     }
+    Ok(())
+}
+
+/// Decode a passthrough quant format: enforce the K%256 guard (via DType),
+/// upload bytes verbatim to `target`, build the `WeightTensor` with the dtype +
+/// its DType-derived row_stride. `name` is the caller context for the guard
+/// error. AWQ sidecars are attached by the caller (hfq), never here.
+pub(crate) fn decode_raw_codec(
+    gpu: &mut Gpu,
+    codec: &RawCodec,
+    data: &[u8],
+    m: usize,
+    k: usize,
+    name: &str,
+    target: MemoryTarget,
+) -> HipResult<WeightTensor> {
+    validate_raw_codec_payload(codec, data, m, k, name)?;
     let buf = match target {
         MemoryTarget::Device => gpu.upload_raw(data, &[data.len()])?,
         // Zero-copy CPU copy into the registered host pointer; the pad past the
@@ -2019,6 +2054,29 @@ mod tests {
     fn bq1g128_quant_type_41_maps_to_bq1g128() {
         let c = raw_codec(41).expect("no RAW_CODECS row for qt=41");
         assert_eq!(c.dtype, DType::BQ1G128);
+    }
+
+    #[test]
+    fn raw_codec_refuses_cross_row_hfq4g128_payload() {
+        let c = raw_codec(7).expect("qt=7 row");
+        // SmolLM2 q_proj [960, 960]: a pre-`b4846285e` file packs 7.5 groups per
+        // row (518400 B); the per-row layout pads each row to 8 groups.
+        let err = validate_raw_codec_payload(c, &vec![0; 960 * 540], 960, 960, "q").unwrap_err();
+        assert!(err.message.contains("expected 552960"), "{}", err.message);
+        assert!(validate_raw_codec_payload(c, &vec![0; 960 * 576], 960, 960, "q").is_ok());
+        // K % 128 == 0 has one layout; it must still load.
+        assert!(validate_raw_codec_payload(c, &vec![0; 64 * 8 * 72], 64, 1024, "q").is_ok());
+    }
+
+    #[test]
+    fn raw_codec_refuses_ragged_k_floor_stride_payloads() {
+        // HIPF-209: every floor-stride format, not only qt 7, refuses a ragged K
+        // (1000 is no whole number of 32-, 64-, 128- or 256-element groups).
+        for qt in [0u8, 3, 4, 6, 8, 10, 12] {
+            let c = raw_codec(qt).expect("raw codec row");
+            let r = validate_raw_codec_payload(c, &[], 4, 1000, "w");
+            assert!(r.is_err(), "qt={qt} {:?} accepted a ragged K", c.dtype);
+        }
     }
 
     // ── Low-bit layout-validation contract (GPU-free) ─────────────────────────

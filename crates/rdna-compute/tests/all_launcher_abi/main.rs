@@ -3966,3 +3966,245 @@ fn repeat_arrays_and_chain_loops_are_traced_per_element_and_fail_closed() {
         );
     }
 }
+
+#[test]
+fn scoped_const_repeats_resolve_aliases_and_qualified_modules_without_guessing() {
+    const PATH: &str = "crates/demo/src/cdna/gfx942.rs";
+    let world = World::from_sources(
+        Path::new("."),
+        vec![
+            (
+                PATH.into(),
+                "const GLOBAL: usize = 9; const N: usize = 9;".into(),
+            ),
+            (
+                "crates/demo/src/gemm.rs".into(),
+                "const COUNT: usize = 4;".into(),
+            ),
+            (
+                "crates/demo/src/other.rs".into(),
+                "const COUNT: usize = 7;".into(),
+            ),
+        ],
+    )
+    .unwrap();
+    let eval = |body: &str, expression: &str| {
+        let tokens = lex::lex(body).unwrap();
+        let idx = scan::BindIndex::build(&tokens);
+        let ctx = scan::Ctx {
+            file: PATH,
+            body: &tokens,
+            params: Default::default(),
+            idx: &idx,
+        };
+        world.repeat_len_at(&lex::lex(expression).unwrap(), &ctx, &[tokens.len()])
+    };
+    assert_eq!(eval("const N: usize = 4;", "N"), Some(4));
+    assert_eq!(eval("const N: usize = crate::gemm::COUNT;", "N"), Some(4));
+    assert_eq!(
+        eval("const N: usize = A + 1; const A: usize = 3;", "N"),
+        Some(4)
+    );
+    assert_eq!(eval("", "crate::gemm::COUNT"), Some(4));
+    assert_eq!(eval("", "super::super::gemm::COUNT"), Some(4));
+    assert_eq!(eval("", "crate::other::COUNT"), Some(7));
+    assert_eq!(eval("", "GLOBAL"), Some(9));
+    assert_eq!(eval("const N: usize = 1_024;", "N"), Some(1024));
+    assert_eq!(eval("const N: usize = 0b100 + 0o4 + 0x4;", "N"), Some(12));
+    assert_eq!(eval("const N: usize = 4u8 as usize;", "N"), Some(4));
+    for (body, expression) in [
+        ("", "COUNT"),                 // ambiguous across modules
+        ("", "crate::missing::COUNT"), // do not fall back to the final name
+        ("", "crate::other::GLOBAL"),
+        ("", "foreign_crate::gemm::COUNT"),
+        ("const N: usize = runtime_count();", "N"),
+        ("let N = 4;", "N"), // a runtime binding is not a constant
+        ("static N: usize = 4;", "N"),
+        ("const N: usize = N;", "N"), // no outer/global fallback on a cycle
+        ("const N: usize = A; const A: usize = N;", "N"),
+        ("const N: usize = 4; let N = 8;", "N"),
+        ("const N: usize = 4; const N: usize = 8;", "N"),
+        ("", "GLOBAL + runtime"),
+        ("const N: usize = 256u32 as u8 as usize;", "N"),
+        ("const N: usize = 4f32 as usize;", "N"),
+        ("const N: usize = 9223372036854775807 + 1;", "N"),
+        ("const N: usize = 9223372036854775807 * 2;", "N"),
+    ] {
+        assert_eq!(eval(body, expression), None, "{body}: {expression}");
+    }
+    // The sibling block's const must not leak, nor may a later runtime shadow
+    // change the already fixed type of an earlier repeat array.
+    assert_eq!(eval("{ const N: usize = 4; }", "N"), Some(9));
+    let tokens = lex::lex("const N: usize = 4; let values = [0i32; N]; let N = 8;").unwrap();
+    let idx = scan::BindIndex::build(&tokens);
+    let ctx = scan::Ctx {
+        file: PATH,
+        body: &tokens,
+        params: Default::default(),
+        idx: &idx,
+    };
+    let b = idx.map["values"].first().unwrap();
+    assert_eq!(
+        world.repeat_len_at(&lex::lex("N").unwrap(), &ctx, &b.loc),
+        Some(4)
+    );
+    let nested = lex::lex("const N: usize = 4; { const N: usize = 2; marker(); }").unwrap();
+    let nested_idx = scan::BindIndex::build(&nested);
+    let nested_ctx = scan::Ctx {
+        file: PATH,
+        body: &nested,
+        params: Default::default(),
+        idx: &nested_idx,
+    };
+    let group = nested.iter().position(|t| t.is_g('{')).unwrap();
+    assert_eq!(
+        world.repeat_len_at(
+            &lex::lex("N").unwrap(),
+            &nested_ctx,
+            &[group, nested[group].group().unwrap().len()]
+        ),
+        Some(2)
+    );
+}
+
+#[test]
+fn local_const_repeat_lengths_check_real_params_and_blob_extents() {
+    let source = r#"impl Gpu {
+        fn go(&mut self) {
+            const N: usize = 2;
+            let mut pointers = [std::ptr::null_mut::<c_void>(); N];
+            let mut params: Vec<*mut c_void> =
+                pointers.iter().map(|p| p as *const _ as *mut c_void).collect();
+            self.launch_maybe_blob("repeat_local", g, b, 0, &mut params, || {
+                let mut blob = KernargBlob::new();
+                for p in pointers { blob.push_ptr(p); }
+                blob
+            })
+        }
+    }"#;
+    let symbols = [("repeat_local", Decl::from_scalars(&[(8, 'p'), (8, 'p')]))];
+    let (abi, coverage) = run_synth(source, &symbols, &no_policy());
+    assert!(
+        abi.is_empty() && coverage.is_empty(),
+        "{abi:?} {coverage:?}"
+    );
+    for bad in [
+        source.replace("const N: usize = 2;", "const N: usize = 3;"),
+        source.replace("const N: usize = 2;", "const N: usize = 0;"),
+        source.replace("const N: usize = 2;", "const N: usize = runtime();"),
+        source.replace("const N: usize = 2;", "let N = 2;"),
+        source.replace("const N: usize = 2;", "const N: usize = N;"),
+    ] {
+        let (abi, coverage) = run_synth(&bad, &symbols, &no_policy());
+        assert!(
+            !abi.is_empty() || !coverage.is_empty(),
+            "unproved/wrong repeat: {bad}"
+        );
+    }
+}
+
+#[test]
+fn actual_wide_selector_and_loader_feed_all_three_abi_checked_launches() {
+    let root = root();
+    let paths = vec![
+        "crates/rdna-compute/src/cdna/gfx942.rs".to_string(),
+        "crates/rdna-compute/src/gemm.rs".to_string(),
+    ];
+    let world = World::load(&root, &paths).unwrap();
+    let hip =
+        std::fs::read_to_string(root.join("kernels/src/gemm_bf16_mfma_wide.gfx942.hip")).unwrap();
+    let declarations = hip::decls_of(&hip).unwrap();
+    let names = [
+        "gemm_bf16_mfma_gfx942_wide64",
+        "gemm_bf16_mfma_gfx942_wide64_m32",
+        "gemm_bf16_mfma_gfx942_wide64_m64",
+    ];
+    let mut symbols = Symbols::default();
+    for name in names {
+        symbols.hip.insert(
+            name.into(),
+            vec![("actual wide HIP".into(), declarations[name].clone())],
+        );
+    }
+    // Match the full fixture's changed-source provenance, not only its names:
+    // the loader references the source constant rather than a literal entry.
+    symbols
+        .changed_consts
+        .insert(("GEMM_BF16_MFMA_WIDE_SRC".into(), paths[0].clone()));
+    let inventory = load_inventory();
+    let mut p = no_policy();
+    for helper in ["g942_wide_ensure", "wide_entry"] {
+        let k = format!("{}::{helper}", paths[0]);
+        p.non_launching.insert(
+            k.clone(),
+            inventory["non_launching"][&k].as_str().unwrap().into(),
+        );
+        let f = world
+            .file(&paths[0])
+            .unwrap()
+            .fns
+            .iter()
+            .find(|f| f.name == helper)
+            .unwrap();
+        assert!(
+            scan::find_sites(&f.body).unwrap().is_empty(),
+            "{helper} must not launch"
+        );
+    }
+    let launcher = world
+        .file(&paths[0])
+        .unwrap()
+        .fns
+        .iter()
+        .find(|f| f.name == "gemm_bf16_mfma_gfx942_wide")
+        .unwrap();
+    let mut calls = std::collections::BTreeSet::new();
+    check::call_names(&launcher.body, &mut calls);
+    assert!(calls.contains("wide_entry") && calls.contains("g942_wide_ensure"));
+    let analysis = analyze(&world, &symbols, &p);
+    let (abi, coverage) = violations(&analysis, &p);
+    assert!(
+        abi.is_empty() && coverage.is_empty(),
+        "{abi:?} {coverage:?}"
+    );
+    let report = analysis
+        .reports
+        .iter()
+        .find(|r| r.func == launcher.name)
+        .unwrap();
+    for name in names {
+        assert!(analysis.covered.contains(name), "{name}");
+        assert!(
+            report
+                .sites
+                .iter()
+                .any(|(_, candidates)| candidates.iter().any(|candidate| candidate == name)),
+            "{name}"
+        );
+    }
+    // Classification never supplies coverage: without the terminal launcher,
+    // none of the selector's entry names can count as a checked launch.
+    let sources = paths
+        .iter()
+        .map(|path| {
+            let source = std::fs::read_to_string(root.join(path)).unwrap();
+            (
+                path.clone(),
+                source.replace("self.launch_maybe_blob(", "self.not_a_launcher("),
+            )
+        })
+        .collect();
+    let missing = World::from_sources(&root, sources).unwrap();
+    let missing = analyze(&missing, &symbols, &p);
+    // changed_kernel_coverage_is_closed requires every symbol in `covered`;
+    // per-function violations alone do not enforce that global obligation.
+    let uncovered: Vec<_> = names
+        .iter()
+        .copied()
+        .filter(|name| !missing.covered.contains(*name))
+        .collect();
+    assert_eq!(
+        uncovered, names,
+        "classifications cannot stand in for a launch"
+    );
+}

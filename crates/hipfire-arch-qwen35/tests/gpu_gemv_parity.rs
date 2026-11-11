@@ -267,7 +267,7 @@ fn compare(
         Ok(()) => {}
         Err(hipfire_dispatch::types::DispatchError::MissingImpl { key }) => {
             // The *production launcher* has no dense GEMV for this dtype on this
-            // arch (e.g. `GemvHfq3G256` on gfx12): the format cannot appear as a
+            // arch (e.g. `GemvHfq3G256` on wave64 gfx906 / gfx942): the format cannot appear as a
             // `Step::Gemv` weight here, so there is nothing to compare against.
             // Its decode is still pinned by `hipfire-cpu`'s expectation table
             // where a canonical arm exists. Reported, never silently skipped.

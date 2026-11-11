@@ -428,8 +428,12 @@ fn swizzle_offset(imm: u16) -> String {
     format!(" offset:{imm}")
 }
 
-impl fmt::Display for Ds {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Ds {
+    pub(crate) fn fmt_assembly(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_impl(f, true)
+    }
+
+    fn fmt_impl(&self, f: &mut fmt::Formatter<'_>, lossless: bool) -> fmt::Result {
         let (wv, w0, w1) = self.op.widths();
         f.write_str(self.op.name())?;
         let mut sep = " ";
@@ -451,7 +455,7 @@ impl fmt::Display for Ds {
             if self.offset1 != 0 {
                 write!(f, " offset1:{}", self.offset1)?
             }
-        } else if self.op == DsOp::SwizzleB32 {
+        } else if self.op == DsOp::SwizzleB32 && !lossless {
             f.write_str(&swizzle_offset(self.offset()))?;
         } else if self.offset() != 0 {
             write!(f, " offset:{}", self.offset())?;
@@ -460,6 +464,12 @@ impl fmt::Display for Ds {
             f.write_str(" gds")?;
         }
         Ok(())
+    }
+}
+
+impl fmt::Display for Ds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_impl(f, false)
     }
 }
 

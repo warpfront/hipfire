@@ -11,8 +11,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/warpfront/hipfire/releases"><img alt="Release v0.4.5" src="https://img.shields.io/badge/release-v0.4.5-24292f?style=flat-square" /></a>
-  <a href="CHANGELOG.md"><img alt="Changelog" src="https://img.shields.io/badge/changelog-v0.4.5-f04b24?style=flat-square" /></a>
+  <a href="https://github.com/warpfront/hipfire/releases"><img alt="Release v0.4.6" src="https://img.shields.io/badge/release-v0.4.6-24292f?style=flat-square" /></a>
+  <a href="CHANGELOG.md"><img alt="Changelog" src="https://img.shields.io/badge/changelog-v0.4.6-f04b24?style=flat-square" /></a>
   <a href="docs/MODELS.md"><img alt="94 curated registry entries" src="https://img.shields.io/badge/registry-94%20curated%20entries-ff8a1f?style=flat-square" /></a>
   <a href="https://discord.gg/F3BaywB8Rs"><img alt="Join Discord" src="https://img.shields.io/badge/chat-Discord-5865F2?style=flat-square" /></a>
 </p>
@@ -424,10 +424,10 @@ notice (see `scripts/mirror_split.py`).
 Linux with ROCm 6 or newer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.5/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.6/scripts/install.sh | bash
 
 # Or install the integration branch for testing:
-curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.5/scripts/install.sh \
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.6/scripts/install.sh \
   | bash -s -- --branch beta
 ```
 
@@ -447,7 +447,7 @@ and the daemon. To switch revisions, use `hipfire update @beta`,
 uninstall while keeping models and settings:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.5/scripts/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.6/scripts/uninstall.sh | bash
 ```
 
 `--dry-run` previews the uninstall. `--purge` also deletes `~/.hipfire` and
@@ -471,7 +471,7 @@ curl http://127.0.0.1:11435/v1/models
 ```
 
 The image is `ghcr.io/warpfront/hipfire:latest` (`docker pull
-ghcr.io/warpfront/hipfire:0.4.5`); `HIPFIRE_IMAGE=ghcr.io/warpfront/hipfire:0.4.5`
+ghcr.io/warpfront/hipfire:0.4.6`); `HIPFIRE_IMAGE=ghcr.io/warpfront/hipfire:0.4.6`
 pins compose to a release.
 
 ## Deprecated features

@@ -1,7 +1,7 @@
 # `.rip` documentation
 
 `.rip` is PeaceMaker's Rust-shaped kernel script language for RDNA (gfx1100,
-gfx1151, gfx1201; wave32). A script runs at compile time and emits instructions
+gfx1151, gfx1201; wave32) and CDNA3 (gfx942 / MI300X; wave64). A script runs at compile time and emits instructions
 into a checked builder; `peacemaker-rip` compiles it to AMDGCN assembly without
 rustc.
 
@@ -28,6 +28,30 @@ peacemaker-rip build kernel.rip gfx1201 NAME out.s      # write the assembly
 Workgroup driver's LDS/wait/barrier checks, per-instruction encoding validation
 for the target arch, defs/uses validation, native assembly, and the
 register-definedness check. It then prints the VGPR, SGPR and LDS use per target.
+`--arch gfx942` uses CDNA instruction footprints and the checked CDNA builder,
+then runs the CDNA hazard checker and CFG wait ledger on the final code object.
+See the reference's CDNA3 ABI section for wave64 masks, AGPR plans and DS spellings.
+
+## CDNA MoE port
+
+[`gemm_fp8b128_moe_grouped_bf16mfma.gfx942.rip`](../../../kernels/src/gemm_fp8b128_moe_grouped_bf16mfma.gfx942.rip)
+authors the grouped FP8 MoE kernel directly in wave64 lane layout, including the
+F32-X, BF16-X and pad16 descriptor exports with their production argument layouts.
+Its accumulator chain and integer BF16 rounding follow the HIP anchor; the ELF
+is newly emitted rather than required to match the anchor's instruction stream.
+
+From the repository root:
+
+```sh
+peacemaker-rip build --certify --module \
+  kernels/src/gemm_fp8b128_moe_grouped_bf16mfma.gfx942.rip \
+  gfx942 f32,xbf16,pad16 fp8_moe_cdna out.s
+```
+
+`tests/cdna.rs` checks the native three-entry module, both X types, masked rows,
+descriptor tails, and independent exact dyadic sums across K blocks, scale rows
+and expert strides. Hardware output identity is a separate MoE oracle receipt,
+not a consequence of compilation or emulator certification.
 
 ## Cookbook
 

@@ -25231,19 +25231,32 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // Pre-zero Y: gemm_mw16_residual_wmma does Y += acc.
-        match self.active_stream.as_ref() {
-            Some(stream) => self
-                .hip
-                .memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
-            None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
-        }
-        // Ensure kernel is compiled.
-        self.ensure_kernel(
-            "gemm_mw16_residual_wmma",
-            kernels::GEMM_MW16_RESIDUAL_WMMA_SRC,
-            "gemm_mw16_residual_wmma",
-        )?;
+        // Exact gfx1151 at 1..=16 rows takes `gemm_f16_wmma_gfx1151_xlds`: same
+        // per-output WMMA chain (byte-identical), 4 waves x 16 rows per block and
+        // b128 weight loads; ~150 GB/s vs the base kernel's ~70 on the 1.24 GB
+        // DSpark drafter head. It writes 0 + acc itself, so Y needs no pre-zero.
+        let xlds = self.gfx1151_xlds_active(batch_size, k)
+            && (w_f16.buf.as_ptr() as usize).is_multiple_of(16)
+            && (x_f16.buf.as_ptr() as usize).is_multiple_of(16);
+        let (kname, ksrc) = if xlds {
+            (
+                "gemm_f16_wmma_gfx1151_xlds",
+                kernels::GEMM_F16_WMMA_GFX1151_XLDS_SRC,
+            )
+        } else {
+            // Pre-zero Y: gemm_mw16_residual_wmma does Y += acc.
+            match self.active_stream.as_ref() {
+                Some(stream) => self
+                    .hip
+                    .memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+                None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+            }
+            (
+                "gemm_mw16_residual_wmma",
+                kernels::GEMM_MW16_RESIDUAL_WMMA_SRC,
+            )
+        };
+        self.ensure_kernel(kname, ksrc, kname)?;
         let wp = w_f16.buf.as_ptr();
         let xp = x_f16.buf.as_ptr();
         let yp = y.buf.as_ptr();
@@ -25258,15 +25271,18 @@ impl Gpu {
             &ki as *const _ as *mut c_void,
             &ni as *const _ as *mut c_void,
         ];
-        let rows = ((m + 15) / 16) as u32;
+        let (rows, threads) = if xlds {
+            (m.div_ceil(64) as u32, 128)
+        } else {
+            (m.div_ceil(16) as u32, 32)
+        };
         let batches = ((batch_size + 15) / 16) as u32;
         let bytes = m * k * 2 + batch_size * k * 2 + batch_size * m * 4 * 2;
-        let timer =
-            crate::profile::begin_timer(&self.hip, "gemm", "gemm_mw16_residual_wmma", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
         let result = self.launch_maybe_blob(
-            "gemm_mw16_residual_wmma",
+            kname,
             [rows, batches, 1],
-            [32, 1, 1],
+            [threads, 1, 1],
             0,
             &mut params,
             || {
@@ -28428,6 +28444,17 @@ impl Gpu {
             return self.gemm_gate_up_q8_0_wmma_gfx12(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
             );
+        }
+        // Exact gfx1151 at 1..=16 rows: this kernel's byte-wise weight loads run
+        // at ~30 GB/s (4 ms for the DSpark drafter's 2 x 12288 x 4096 gate_up).
+        // Two XLDS `gemm_q8_0_wmma` launches run the same per-output WMMA chain
+        // (byte-identical) at ~200 GB/s.
+        if self.gfx1151_xlds_active(batch_size, k)
+            && (a_gate.buf.as_ptr() as usize).is_multiple_of(16)
+            && (a_up.buf.as_ptr() as usize).is_multiple_of(16)
+        {
+            self.gemm_q8_0_wmma(a_gate, x, y_gate, gate_m, k, batch_size)?;
+            return self.gemm_q8_0_wmma(a_up, x, y_up, up_m, k, batch_size);
         }
         debug_assert_eq!(
             k % 32,
@@ -34924,7 +34951,7 @@ impl Gpu {
     /// Arch, extent and buffer-size checks shared by the BF16 MFMA entries;
     /// returns the bytes the launch touches (for the profile timer).
     #[allow(clippy::too_many_arguments)]
-    fn gemm_bf16_mfma_gfx942_check(
+    pub(crate) fn gemm_bf16_mfma_gfx942_check(
         &mut self,
         a: &DeviceBuffer,
         b: &DeviceBuffer,
@@ -35877,7 +35904,12 @@ impl Gpu {
         n: usize,
     ) -> bool {
         matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
-            && self.iu4_producer_sidecar_active(n, k)
+            // The load-time Z fold stays on for fused-A8 loads (the A8 SETs read
+            // only Z's leading rows); the IU4 sidecar gate itself declines A8 shapes.
+            && (self.iu4_producer_sidecar_active(n, k)
+                || (self.flags.iu4_producer_sidecar_enabled()
+                    && self.flags.a8_fused_prod
+                    && self.a8_prefill_active(n, k)))
             && self.mq4v2_symmetric
             && self.flags.gfx11_iu4_symfold
             && *DISPATCH_IU4_SYMFOLD

@@ -216,6 +216,7 @@ fn cases() -> Vec<Inst> {
             Vop2Op::AddU16
             | Vop2Op::SubU16
             | Vop2Op::LshlrevB16
+            | Vop2Op::LshrrevB16
             | Vop2Op::AshrrevI16
             | Vop2Op::MulLoU16 => (Lit(0xfff0), Lit(0x40)),
             _ => (Lit(0x1234_5678), Lit(0xffff_fff0)),
@@ -739,6 +740,45 @@ fn round_trip_against_llvm() {
         bad.len(),
         bad.join("\n")
     );
+}
+
+#[test]
+fn integer16_signed_literals_keep_the_full_encoded_dword() {
+    let mut texts = Vec::new();
+    let mut bytes = Vec::new();
+    for op in [
+        Vop2Op::AddU16,
+        Vop2Op::SubU16,
+        Vop2Op::LshlrevB16,
+        Vop2Op::LshrrevB16,
+        Vop2Op::AshrrevI16,
+        Vop2Op::MulLoU16,
+    ] {
+        for value in [-1i32, -16, -256, -32768] {
+            let inst = i2(op, Vgpr(0), Lit(value as u32), Vgpr(1), VopExt::None);
+            let words = inst.words(A).expect("signed16 literal encodes");
+            assert_eq!(words.len(), 2);
+            assert_eq!(words[1], value as u32, "never truncate or normalize");
+            assert_eq!(Inst::decode(A, &words).unwrap(), (inst.clone(), 2));
+            assert!(inst.to_string().contains(&format!("lit({value})")));
+            texts.push(inst.to_string());
+            bytes.push(oracle::bytes(&words));
+        }
+        for value in [0x1_0000, 0xffff_0000, 0xffff_7fff] {
+            assert!(i2(op, Vgpr(0), Lit(value), Vgpr(1), VopExt::None)
+                .words(A)
+                .is_err());
+        }
+    }
+    if !oracle::disabled() {
+        // LLVM prints a masked halfword even for a sign-extended raw literal.
+        // Compare the assembled bytes of our lossless signed spelling, not that
+        // lossy pretty-print. The ordinary canonical corpus still checks both.
+        let encoded = oracle::mc_encode(A, &texts).unwrap();
+        for ((_, actual), expected) in encoded.iter().zip(&bytes) {
+            assert_eq!(actual, expected);
+        }
+    }
 }
 
 #[test]

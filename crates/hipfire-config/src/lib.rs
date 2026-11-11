@@ -5240,6 +5240,17 @@ pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151: usize = 8;
 /// proves the arch at that many rows (`rdna_compute::prefill_invariant`
 /// re-exports this value).
 pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201: usize = 8;
+/// gfx942 (MI300X) row-exact verify rows. M-K measured `forward_chunk(N)`
+/// bitwise equal to N single-row `forward_token`s on the default (MFMA) route
+/// at N = 1, 2, 3, 4, 6, 8 and 16 (both contexts, six fresh processes, max
+/// |diff| 0, argmax N/N); the singleton drafter never drafts past
+/// [`QWEN4_FEW_ROW_ROUTE_ROWS`] rows (depth <= 7), and N = 5 and 7 are covered
+/// only by the end-to-end greedy identity oracle. Rows 9..=16 are measured by
+/// M-K but not served: raising this needs the drafter, floor and capture
+/// tables widened with it. Not valid under `HIPFIRE_G942_TRUNK_GEMV=1`,
+/// whose one-row decode is not bitwise the chunk for N >= 2 (the drafter
+/// refuses native MTP there).
+pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX942: usize = 8;
 /// Per-arch proven row-exact Qwen4 verify rows without the developer/oracle
 /// overrides (other arches [`QWEN4_FEW_ROW_ROUTE_ROWS`]). The runtime value is
 /// `rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows`, which layers
@@ -5249,6 +5260,7 @@ pub fn qwen4_row_exact_verify_rows_table(gpu_arch: &str) -> usize {
     match gpu_arch {
         "gfx1151" => QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151,
         "gfx1201" => QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201,
+        "gfx942" => QWEN4_ROW_EXACT_VERIFY_ROWS_GFX942,
         _ => QWEN4_FEW_ROW_ROUTE_ROWS,
     }
 }

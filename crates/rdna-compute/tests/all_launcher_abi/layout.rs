@@ -163,15 +163,40 @@ pub(crate) fn contains_id(ts: &[Tt], name: &str) -> bool {
 }
 
 fn parse_int(s: &str) -> Option<i64> {
-    if let Some(h) = s.strip_prefix("0x") {
-        let hex: String = h.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
-        return i64::from_str_radix(&hex, 16).ok();
-    }
-    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
-        None
+    let (digits, radix) = if let Some(d) = s.strip_prefix("0x") {
+        (d, 16)
+    } else if let Some(d) = s.strip_prefix("0o") {
+        (d, 8)
+    } else if let Some(d) = s.strip_prefix("0b") {
+        (d, 2)
     } else {
-        digits.parse::<i64>().ok()
+        (s, 10)
+    };
+    let end = digits
+        .find(|c: char| c != '_' && !c.is_digit(radix))
+        .unwrap_or(digits.len());
+    if !matches!(
+        &digits[end..],
+        "" | "usize"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+    ) {
+        return None;
+    }
+    let digits = &digits[..end];
+    if digits.contains('_') {
+        i64::from_str_radix(&digits.replace('_', ""), radix).ok()
+    } else {
+        i64::from_str_radix(digits, radix).ok()
     }
 }
 
@@ -184,6 +209,7 @@ struct Ev<'a> {
     p: usize,
     file: &'a str,
     depth: u32,
+    scope: Option<(&'a Ctx<'a>, &'a [usize])>,
 }
 
 impl<'a> Ev<'a> {
@@ -192,10 +218,10 @@ impl<'a> Ev<'a> {
         loop {
             if self.ts.get(self.p).map_or(false, |t| t.is_p('+')) {
                 self.p += 1;
-                v += self.term()?;
+                v = v.checked_add(self.term()?)?;
             } else if self.ts.get(self.p).map_or(false, |t| t.is_p('-')) {
                 self.p += 1;
-                v -= self.term()?;
+                v = v.checked_sub(self.term()?)?;
             } else {
                 return Some(v);
             }
@@ -205,7 +231,7 @@ impl<'a> Ev<'a> {
         let mut v = self.factor()?;
         while self.ts.get(self.p).map_or(false, |t| t.is_p('*')) {
             self.p += 1;
-            v *= self.factor()?;
+            v = v.checked_mul(self.factor()?)?;
         }
         Some(v)
     }
@@ -217,9 +243,24 @@ impl<'a> Ev<'a> {
             }
             Tt::Id(name, _) => {
                 self.p += 1;
-                match self.env.get(name) {
-                    Some(v) => *v,
-                    None => self.w.const_value_in(name, self.file, self.depth)?,
+                if self.ts.get(self.p).is_some_and(|t| t.is_p(':')) {
+                    let mut path = vec![name.as_str()];
+                    while self.ts.get(self.p).is_some_and(|t| t.is_p(':'))
+                        && self.ts.get(self.p + 1).is_some_and(|t| t.is_p(':'))
+                    {
+                        path.push(self.ts.get(self.p + 2)?.id()?);
+                        self.p += 3;
+                    }
+                    if path.len() == 1 {
+                        return None;
+                    }
+                    self.w.const_path_value_in(&path, self.file, self.depth)?
+                } else if let Some(v) = self.env.get(name) {
+                    *v
+                } else if let Some((ctx, loc)) = self.scope {
+                    self.w.scoped_const_value(name, ctx, loc, self.depth)?
+                } else {
+                    self.w.const_value_in(name, self.file, self.depth)?
                 }
             }
             Tt::G('(', c, _) => {
@@ -231,6 +272,7 @@ impl<'a> Ev<'a> {
                     p: 0,
                     file: self.file,
                     depth: self.depth,
+                    scope: self.scope,
                 };
                 let v = sub.sum()?;
                 if sub.p != c.len() {
@@ -241,6 +283,23 @@ impl<'a> Ev<'a> {
             _ => return None,
         };
         while self.ts.get(self.p).map_or(false, |t| t.is_id("as")) {
+            // A cast is usable only if it preserves the known integer exactly.
+            // Treating a narrowing/wrapping cast as a no-op could invent an
+            // array length and hide a real parameter/blob extent mismatch.
+            let exact = match self.ts.get(self.p + 1)?.id()? {
+                "u8" => u8::try_from(v).is_ok(),
+                "u16" => u16::try_from(v).is_ok(),
+                "u32" => u32::try_from(v).is_ok(),
+                "u64" | "u128" | "usize" => v >= 0,
+                "i8" => i8::try_from(v).is_ok(),
+                "i16" => i16::try_from(v).is_ok(),
+                "i32" => i32::try_from(v).is_ok(),
+                "i64" | "i128" | "isize" => true,
+                _ => false,
+            };
+            if !exact {
+                return None;
+            }
             self.p += 2;
         }
         Some(v)
@@ -287,6 +346,7 @@ impl World {
             p: 0,
             file: &path,
             depth: depth + 1,
+            scope: None,
         };
         let v = e.sum()?;
         if e.p != init.len() {
@@ -308,12 +368,138 @@ impl World {
             p: 0,
             file,
             depth: 0,
+            scope: None,
         };
         let v = e.sum()?;
         if e.p != ts.len() {
             return None;
         }
         Some(v)
+    }
+
+    /// Qualified constants must resolve in the named module, never by a matching
+    /// final identifier in some other module. Inline/aliased modules are refused.
+    fn const_path_value_in(&self, path: &[&str], file: &str, depth: u32) -> Option<i64> {
+        let (root, relative) = file.split_once("/src/")?;
+        let mut module: Vec<_> = relative.strip_suffix(".rs")?.split('/').collect();
+        if matches!(module.last(), Some(&"lib" | &"main" | &"mod")) {
+            module.pop();
+        }
+        let mut at = 1;
+        match path[0] {
+            "crate" => module.clear(),
+            "self" => {}
+            "super" => {
+                module.pop()?;
+                while path.get(at) == Some(&"super") {
+                    module.pop()?;
+                    at += 1;
+                }
+            }
+            _ => return None,
+        }
+        if at >= path.len() {
+            return None;
+        }
+        module.extend_from_slice(&path[at..path.len() - 1]);
+        let stem = format!("{root}/src/{}", module.join("/"));
+        let candidates = if module.is_empty() {
+            vec![format!("{root}/src/lib.rs"), format!("{root}/src/main.rs")]
+        } else {
+            vec![format!("{stem}.rs"), format!("{stem}/mod.rs")]
+        };
+        let mut files = candidates.iter().filter_map(|p| self.file(p));
+        let target = files.next()?;
+        if files.next().is_some() {
+            return None;
+        }
+        // Unlike the unqualified lookup, a missing member cannot fall back to
+        // the workspace's only same-named constant.
+        if target.consts.get(*path.last()?)?.len() != 1 {
+            return None;
+        }
+        self.const_value_in(path.last()?, &target.path, depth)
+    }
+
+    fn scoped_const_value(&self, name: &str, ctx: &Ctx, loc: &[usize], depth: u32) -> Option<i64> {
+        if depth > 4 {
+            return None;
+        }
+        // Local const items are in scope throughout their lexical block, also
+        // before their declaration. Keep their own scope for alias evaluation;
+        // cycles must fail, not accidentally resolve an outer same-named item.
+        let mut selected: Option<&super::scan::Binding> = None;
+        for b in ctx.idx.map.get(name).into_iter().flatten() {
+            let (at, parent) = b.loc.split_last()?;
+            let tokens = tokens_at(ctx.body, parent)?;
+            if !loc.starts_with(parent) || !tokens.get(*at)?.is_id("const") {
+                continue;
+            }
+            match selected {
+                Some(old) if old.loc.len() > b.loc.len() => {}
+                Some(old) if old.loc.len() == b.loc.len() => return None,
+                _ => selected = Some(b),
+            }
+        }
+        if let Some(visible) = ctx.idx.visible(name, loc) {
+            let (at, parent) = visible.loc.split_last()?;
+            if !tokens_at(ctx.body, parent)?.get(*at)?.is_id("const")
+                && selected.is_none_or(|b| b.loc.len() <= visible.loc.len())
+            {
+                return None; // A runtime binding or static is not a const.
+            }
+        }
+        if let Some(b) = selected {
+            let env = HashMap::new();
+            let mut e = Ev {
+                w: self,
+                env: &env,
+                ts: &b.init,
+                p: 0,
+                file: ctx.file,
+                depth: depth + 1,
+                scope: Some((ctx, &b.loc)),
+            };
+            let value = e.sum()?;
+            return (e.p == b.init.len()).then_some(value);
+        }
+        if ctx.params.contains(name) {
+            return None;
+        }
+        self.const_value_in(name, ctx.file, depth)
+    }
+
+    pub(crate) fn repeat_len_at(&self, count: &[Tt], ctx: &Ctx, loc: &[usize]) -> Option<usize> {
+        let env = HashMap::new();
+        let mut e = Ev {
+            w: self,
+            env: &env,
+            ts: count,
+            p: 0,
+            file: ctx.file,
+            depth: 0,
+            scope: Some((ctx, loc)),
+        };
+        let value = e.sum()?;
+        if e.p != count.len() {
+            return None;
+        }
+        usize::try_from(value).ok()
+    }
+
+    pub(crate) fn array_elems_at(
+        &self,
+        g: &[Tt],
+        ctx: &Ctx,
+        loc: &[usize],
+    ) -> Result<Vec<Option<Vec<Tt>>>, String> {
+        if let Some(semi) = g.iter().position(|t| t.is_p(';')) {
+            let n = self
+                .repeat_len_at(&g[semi + 1..], ctx, loc)
+                .ok_or("array repeat count is not a scoped constant")?;
+            return Ok(vec![None; n]);
+        }
+        super::scan::array_elems(g)
     }
 
     // ---- blob pushes ----------------------------------------------------------
@@ -537,7 +723,7 @@ impl World {
                 ));
             }
             let count = self
-                .array_elems_in(init[0].group().unwrap(), ctx.file)?
+                .array_elems_at(init[0].group().unwrap(), ctx, &bindings[0].loc)?
                 .len();
             for idx in 0..count {
                 out.push(Some(vec![
@@ -651,7 +837,7 @@ fn mapped_param_elems(
     }
     if let Some(semi) = semi {
         let count = world
-            .repeat_len(&group[semi + 1..], ctx.file)
+            .repeat_len_at(&group[semi + 1..], ctx, &binding.loc)
             .filter(|n| *n > 0)
             .ok_or_else(|| {
                 format!("params mapping source `{name}`: repeat count is not a positive constant")
@@ -726,7 +912,7 @@ pub fn repeat_param_value(
     }
     let group = binding.init[0].group()?;
     let semi = group.iter().position(|t| t.is_p(';'))?;
-    if index >= world.repeat_len(&group[semi + 1..], ctx.file)? {
+    if index >= world.repeat_len_at(&group[semi + 1..], ctx, &binding.loc)? {
         return None;
     }
     let init = group[..semi].to_vec();

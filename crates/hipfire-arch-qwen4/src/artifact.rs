@@ -16,6 +16,7 @@ use crate::expert_slab_table::{build_expert_slab_table_with_keep, ExpertSlabTabl
 use crate::expert_slabs::{self, parse_expert_entry_name, ExpertSlabsError};
 use crate::gpu_forward::{qwen4_forward_scratch_mode, Qwen4ForwardScratchMode};
 use crate::ple::PleHashMetadata;
+use crate::stock_mtp_sidecar::BoundStockMtpSidecar;
 use crate::weights::{
     is_ple_shard_name_within, Qwen4BandScope, Qwen4Manifest, Qwen4Placement, Qwen4TierRecipe,
     WeightError, RECIPE_METADATA_KEY,
@@ -170,10 +171,24 @@ pub struct Qwen4HfqmArtifact {
     pub placements: Vec<Qwen4Placement>,
     pub source_tensor_count: usize,
     pub source_identity: Arc<SourceIdentity>,
+    /// The bound `<model>.mtp` head sidecar's own source seal; `None` for the AR-only
+    /// artifact (no sidecar, or one not requested).
+    pub mtp_sidecar: Option<Qwen4MtpSidecarReceipt>,
     /// The PLE rows source the bundle must be assembled with
     /// (`Qwen4Bundle::assemble_with_ple_rows`); [`Qwen4PleRows::Absent`] when
     /// the profile has no PLE.
     pub ple_rows: Qwen4PleRows,
+}
+
+/// The stock-FP8 MTP head sidecar an admitted artifact was merged with.
+#[derive(Clone, Debug)]
+pub struct Qwen4MtpSidecarReceipt {
+    pub path: PathBuf,
+    /// The sidecar file's own exact-source seal (one backing file).
+    pub source_identity: Arc<SourceIdentity>,
+    /// sha256 of the sidecar's index bytes.
+    pub index_sha256: [u8; 32],
+    pub payload_bytes: u64,
 }
 
 impl Qwen4HfqmArtifact {
@@ -1267,7 +1282,9 @@ fn admit_ple_metadata(
 /// `hipfire_profile` marker.  Only a build with the explicit
 /// `qwen4-dev-profiles` feature routes the developer marker to the developer
 /// parser; there is no environment or config key that does.
-fn parse_artifact_config(metadata_json: &str) -> Result<Qwen4Config, Qwen4ArtifactError> {
+pub(crate) fn parse_artifact_config(
+    metadata_json: &str,
+) -> Result<Qwen4Config, Qwen4ArtifactError> {
     #[cfg(feature = "qwen4-dev-profiles")]
     let parsed = Qwen4Config::from_developer_metadata_json(metadata_json);
     #[cfg(not(feature = "qwen4-dev-profiles"))]
@@ -1314,6 +1331,7 @@ fn manifest_for_metadata(
     config: Qwen4Config,
     metadata_json: &str,
     drop_head: bool,
+    head_sidecar: bool,
 ) -> Result<(Qwen4Config, Qwen4Manifest), Qwen4ArtifactError> {
     let value: serde_json::Value = serde_json::from_str(metadata_json).map_err(|error| {
         Qwen4ArtifactError::new(format!("qwen4: recipe metadata admission failed: {error}"))
@@ -1333,6 +1351,12 @@ fn manifest_for_metadata(
     };
     if config.profile.is_flash_next() {
         let Some(id) = id else {
+            if head_sidecar {
+                return Err(Qwen4ArtifactError::new(format!(
+                    "qwen4: base recipe is \"<absent>\", the MTP sidecar extends \"{}\"",
+                    crate::weights::STOCK_FP8_RECIPE_ID
+                )));
+            }
             let config = if drop_head {
                 config.into_headless().map_err(|error| {
                     Qwen4ArtifactError::new(format!(
@@ -1352,9 +1376,23 @@ fn manifest_for_metadata(
                 crate::weights::STOCK_FP8_RECIPE_ID
             ))
         })?;
-        let config = config.into_ar_only().map_err(|error| {
-            Qwen4ArtifactError::new(format!("qwen4: AR-only config admission failed: {error}"))
-        })?;
+        if head_sidecar && !recipe.is_stock_fp8() {
+            return Err(Qwen4ArtifactError::new(format!(
+                "qwen4: base recipe is {id:?}, the MTP sidecar extends \"{}\"",
+                crate::weights::STOCK_FP8_RECIPE_ID
+            )));
+        }
+        let config = if head_sidecar {
+            config.into_stock_mtp().map_err(|error| {
+                Qwen4ArtifactError::new(format!(
+                    "qwen4: stock-FP8 MTP config admission failed: {error}"
+                ))
+            })?
+        } else {
+            config.into_ar_only().map_err(|error| {
+                Qwen4ArtifactError::new(format!("qwen4: AR-only config admission failed: {error}"))
+            })?
+        };
         let manifest = Qwen4Manifest::build_with_recipe(&config, recipe).map_err(manifest_error)?;
         return Ok((config, manifest));
     }
@@ -1405,7 +1443,7 @@ fn admit_inventory(
             "qwen4: source arch_id={arch_id} does not match reserved arch_id={ARCH_ID}"
         )));
     }
-    let (config, manifest) = manifest_for_metadata(config, metadata_json, drop_head)?;
+    let (config, manifest) = manifest_for_metadata(config, metadata_json, drop_head, false)?;
     let source_tensor_count =
         validate_manifest_inventory(&head_free_tensors(&config, tensors), &manifest, 0, 0)?;
     let ple = admit_ple_metadata(metadata_json, &config)?;
@@ -1482,16 +1520,18 @@ pub fn admit_hfqm_artifact_on(
         hfq,
         slab_device,
         crate::weights::trunk_shard::trunk_shard_drops_mtp_head(),
+        None,
     )
 }
 
 /// [`admit_hfqm_artifact_on`] with the head policy passed in: `drop_head` admits a packed
 /// Flash-Next artifact headless ([`manifest_for_metadata`]). The one place the trunk shard's
 /// switch reaches admission; the CPU tests drive it with an explicit value.
-pub(crate) fn admit_hfqm_artifact_with(
+pub fn admit_hfqm_artifact_with(
     hfq: &HfqFile,
     slab_device: Option<&str>,
     drop_head: bool,
+    mtp: Option<&BoundStockMtpSidecar>,
 ) -> Result<Qwen4HfqmArtifact, Qwen4ArtifactError> {
     if hfq.arch_id != ARCH_ID {
         return Err(Qwen4ArtifactError::new(format!(
@@ -1511,8 +1551,14 @@ pub(crate) fn admit_hfqm_artifact_with(
         ));
     }
     let slab = expert_slab_plan(&hfq.metadata_json, hfq.tensors(), slab_device)?;
+    if mtp.is_some() && slab.is_some() {
+        return Err(Qwen4ArtifactError::new(
+            "qwen4: the stock-FP8 MTP sidecar does not combine with an expert-slab artifact",
+        ));
+    }
     let config = parse_artifact_config(&hfq.metadata_json)?;
-    let (config, mut manifest) = manifest_for_metadata(config, &hfq.metadata_json, drop_head)?;
+    let (config, mut manifest) =
+        manifest_for_metadata(config, &hfq.metadata_json, drop_head, mtp.is_some())?;
     if let Some(plan) = &slab {
         manifest = slab_manifest(&config, &manifest, plan)?;
     }
@@ -1557,6 +1603,21 @@ pub(crate) fn admit_hfqm_artifact_with(
             head_free = head_free_tensors(&config, hfq.tensors());
             (&head_free[..], &manifest)
         };
+    // With the head sidecar the inventory is the concatenation of both files' index
+    // records: names, shapes and geometry only (no offsets), so one pass is exact, and a
+    // name present in both files is a duplicate the manifest does not declare twice.
+    let merged_inventory: Vec<HfqTensorInfo>;
+    let inventory_tensors: &[HfqTensorInfo] = match mtp {
+        Some(side) => {
+            merged_inventory = inventory_tensors
+                .iter()
+                .chain(side.hfq.tensors())
+                .cloned()
+                .collect();
+            &merged_inventory
+        }
+        None => inventory_tensors,
+    };
     let source_tensor_count = validate_manifest_inventory(
         inventory_tensors,
         inventory_manifest,
@@ -1569,6 +1630,15 @@ pub(crate) fn admit_hfqm_artifact_with(
     // keeps the bounded host reads tied to the same source identity as all
     // later external-row reads.
     let source_identity = validate_source_identity(hfq, slab.is_some())?;
+    let mtp_sidecar = match mtp {
+        Some(side) => Some(Qwen4MtpSidecarReceipt {
+            path: side.path.clone(),
+            source_identity: validate_source_identity(&side.hfq, false)?,
+            index_sha256: side.index_sha256,
+            payload_bytes: side.payload_bytes,
+        }),
+        None => None,
+    };
     let ple_rows = match (ple_config, &ple) {
         (Some(ple_config), Some(ple)) => {
             validate_ple_records(hfq, ple_config, ple)?;
@@ -1588,6 +1658,7 @@ pub(crate) fn admit_hfqm_artifact_with(
         source_tensor_count,
         source_identity,
         ple_rows,
+        mtp_sidecar,
     })
 }
 
@@ -4036,6 +4107,59 @@ mod tests {
             assert_eq!(local.replica_geometry(), kept.config);
             assert!(local.num_attention_heads < kept.config.num_attention_heads);
         }
+    }
+
+    /// U4 (inventory level): base + sidecar headers merge into one exact inventory under the
+    /// headed stock profile (`base + 31` records); a duplicate name across the files, a missing
+    /// sidecar entry and the base alone against the headed manifest are refused; a packed base
+    /// (no recipe id) cannot take the head sidecar.
+    #[test]
+    fn stock_mtp_sidecar_inventory_merges_both_files() {
+        let flash = crate::config::compact_test_config();
+        let headed_config = flash.clone().into_stock_mtp().unwrap();
+        let headed = oracle_headers(
+            &Qwen4Manifest::build_with_recipe(&headed_config, Qwen4TierRecipe::StockFp8).unwrap(),
+        );
+        let base = stock_fp8_headers();
+        let (sidecar, rest): (Vec<_>, Vec<_>) = headed
+            .iter()
+            .cloned()
+            .partition(|header| header.name.starts_with("mtp."));
+        assert_eq!(sidecar.len(), 31);
+        assert_eq!(rest.len(), base.len());
+        let json = stock_fp8_json("stock-fp8");
+        let (config, manifest) = manifest_for_metadata(flash.clone(), &json, false, true).unwrap();
+        assert_eq!(
+            config.profile,
+            crate::config::Qwen4Profile::FlashNextStockMtp
+        );
+        assert!(config.mtp.is_some());
+        let merged: Vec<_> = base.iter().chain(&sidecar).cloned().collect();
+        assert_eq!(
+            validate_manifest_inventory(&merged, &manifest, 0, 0).unwrap(),
+            base.len() + 31
+        );
+        // The AR-only form of the same metadata is unchanged.
+        let (ar_config, _) = manifest_for_metadata(flash.clone(), &json, false, false).unwrap();
+        assert!(ar_config.profile.is_ar_only() && ar_config.mtp.is_none());
+        // A name present in both files is refused.
+        let mut duplicate = merged.clone();
+        duplicate.push(sidecar[0].clone());
+        assert!(validate_manifest_inventory(&duplicate, &manifest, 0, 0).is_err());
+        // A missing sidecar entry, and the base alone, are refused.
+        let mut missing = merged.clone();
+        missing.pop();
+        assert!(validate_manifest_inventory(&missing, &manifest, 0, 0).is_err());
+        assert!(validate_manifest_inventory(&base, &manifest, 0, 0).is_err());
+        // A packed base (no recipe id) or another recipe cannot take the head sidecar.
+        let error = manifest_for_metadata(flash.clone(), &flash_next_json(), false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("base recipe is")
+                && error.contains("the MTP sidecar extends \"stock-fp8\""),
+            "{error}"
+        );
     }
 
     fn stock_fp8_json(id: &str) -> String {

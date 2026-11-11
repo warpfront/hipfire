@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+build = "../hipfire-cli/build.rs"
+
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }
 serde_json.workspace = true

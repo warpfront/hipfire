@@ -305,7 +305,7 @@
           "ledger": {
             "barriers": 18,
             "branches": 100,
-            "label_states": 337,
+            "label_states": 311,
             "labels": 69,
             "memory": {
               "ds_load": 24,
@@ -315,8 +315,8 @@
               "vmem_load": 32,
               "vmem_store": 8
             },
-            "steps": 12232,
-            "verifier": "peacemaker_isa::ledger_cfg::verify",
+            "steps": 11905,
+            "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
             "waitcnt": 63,
             "waitcnt_lgkmcnt_partial": 1,
             "waitcnt_vmcnt_partial": 46
@@ -490,7 +490,7 @@
           "ledger": {
             "barriers": 18,
             "branches": 148,
-            "label_states": 616,
+            "label_states": 590,
             "labels": 101,
             "memory": {
               "ds_load": 24,
@@ -500,8 +500,8 @@
               "vmem_load": 48,
               "vmem_store": 8
             },
-            "steps": 26543,
-            "verifier": "peacemaker_isa::ledger_cfg::verify",
+            "steps": 26216,
+            "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
             "waitcnt": 77,
             "waitcnt_lgkmcnt_partial": 1,
             "waitcnt_vmcnt_partial": 62

@@ -124,6 +124,8 @@ pub mod slowlink_sp;
 pub mod state;
 #[cfg(any(test, feature = "reference-parity"))]
 pub mod state_parity;
+/// The stock-FP8 MTP head sidecar (`<model>.mtp`): bind, routing and log lines.
+pub mod stock_mtp_sidecar;
 pub mod sym_verdict_cache;
 pub(crate) mod trunk_a8;
 pub mod trunk_overlay;

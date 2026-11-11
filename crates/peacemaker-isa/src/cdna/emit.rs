@@ -435,7 +435,7 @@ pub fn assembly(kernels: &[&Kernel], version: CodeObjectVersion) -> Result<Strin
                     }
                 }
                 _ => {
-                    let _ = writeln!(s, "\t{inst}");
+                    let _ = writeln!(s, "\t{}", inst.assembly());
                 }
             }
             at = starts.get(index + 1).copied().unwrap_or(k.words.len());

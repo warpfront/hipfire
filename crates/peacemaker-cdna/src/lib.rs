@@ -32,6 +32,9 @@
 //!   conversions, bit-exact (CDNA3 ISA §7.2 p.50-52).
 //! - [`kd`]: the 64-byte gfx90a+ kernel descriptor layout.
 //! - [`sim`]: the wave64 workgroup emulator.
+//! - [`text`]: the text assembler, [`text::parse_line`]: one canonical
+//!   `Display` / llvm-mc assembly line into a typed [`Inst`], validated by the
+//!   real encoder (labels are the caller's).
 //! - [`oracle`]: ROCm `llvm-mc` / `llvm-objdump` invocation for tests (test
 //!   oracle only; nothing in the production path runs a ROCm tool).
 //!
@@ -75,6 +78,7 @@ pub mod float;
 pub mod kd;
 pub mod oracle;
 pub mod sim;
+pub mod text;
 
 pub use arch::{Arch, Caps};
 pub use inst::{decode_all, encode_all, Format, Inst};

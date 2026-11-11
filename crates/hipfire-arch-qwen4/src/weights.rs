@@ -773,8 +773,8 @@ pub enum Qwen4TierRecipe {
     /// routed experts qt=55 `FP8E4M3B128` (OCP e4m3 codes + BF16 `s_inv`
     /// 128x128 blocks, gate_up `[E, 1280, 2560]`, down `[E, 2560, 640]`),
     /// every other tensor source BF16 (qt=16) loaded raw, PLE rows qt=56
-    /// `FP8E4M3PT`.  AR-only: the artifact carries no MTP head, so it is
-    /// declared for [`crate::config::Qwen4Profile::FlashNextArOnly`] only.
+    /// `FP8E4M3PT`.  The head is optional: the base artifact carries no MTP head
+    /// (`FlashNextArOnly`); a bound `<model>.mtp` sidecar adds it (`FlashNextStockMtp`).
     /// Selected by `qwen4_recipe.id = "stock-fp8"`; no environment knob
     /// moves it.
     StockFp8,
@@ -838,7 +838,7 @@ impl Qwen4Manifest {
     /// [`Qwen4TierRecipe::StockFp8`].  A synthetic developer profile ignores
     /// both knobs and declares [`Qwen4TierRecipe::SyntheticSourceBf16`].
     pub fn build(config: &Qwen4Config) -> Result<Self, WeightError> {
-        let tier = if config.profile.is_ar_only() {
+        let tier = if config.profile.is_stock_fp8() {
             Qwen4TierRecipe::StockFp8
         } else if config.profile.is_flash_next() {
             Qwen4TierRecipe::FlashNextPacked {
@@ -897,7 +897,7 @@ impl Qwen4Manifest {
             Qwen4TierRecipe::FlashNextPacked { .. } | Qwen4TierRecipe::FlashNextSlab { .. } => {
                 config.profile.is_packed_flash_next()
             }
-            Qwen4TierRecipe::StockFp8 => config.profile.is_ar_only(),
+            Qwen4TierRecipe::StockFp8 => config.profile.is_stock_fp8(),
             Qwen4TierRecipe::SyntheticSourceBf16 | Qwen4TierRecipe::SyntheticPacked => {
                 config.profile.is_synthetic()
             }
@@ -1008,6 +1008,7 @@ impl Qwen4Manifest {
                 packed,
                 mtp_source,
                 synthetic_packed,
+                stock_fp8,
             )
         };
         let mtp_layer = |name: &str,
@@ -1027,6 +1028,7 @@ impl Qwen4Manifest {
                 packed,
                 mtp_source,
                 synthetic_packed,
+                stock_fp8,
             )
         };
         let hidden = positive("hidden_size", config.hidden_size)?;
@@ -1955,12 +1957,15 @@ fn mtp_entry(
     packed: bool,
     mtp_source: bool,
     synthetic_packed: bool,
+    stock_fp8: bool,
 ) -> WeightEntry {
     // A synthetic profile never takes the Flash-Next tier knobs: its MTP
     // tensors are source-exact BF16, or the synthetic packed recipe's per-role
     // decision when that recipe is declared.
     if !packed {
-        let dtype = if synthetic_packed {
+        let dtype = if stock_fp8 {
+            stock_fp8_dtype(name, &shape)
+        } else if synthetic_packed {
             synthetic_packed_decision(name, &shape).dtype
         } else {
             DType::BF16
@@ -4542,6 +4547,7 @@ pub(crate) fn admit_executable_profile(config: &Qwen4Config) -> Result<(), Weigh
     match &config.profile {
         Qwen4Profile::FlashNext
         | Qwen4Profile::FlashNextArOnly
+        | Qwen4Profile::FlashNextStockMtp
         | Qwen4Profile::FlashNextHeadless => {
             if !matches!(
                 &config.ffn,
@@ -5258,6 +5264,114 @@ mod tests {
         ] {
             let error = Fp8B128ExpertTable::from_tensor("t", &tensor).unwrap_err();
             assert!(error.to_string().contains(needle), "{needle}: {error}");
+        }
+    }
+
+    /// U2 (regression for the `mtp_entry` stock dtype bug): the headed stock manifest is the
+    /// AR-only stock manifest plus the tied alias plus 31 head entries, and the head's routed
+    /// experts are qt=55 while every other head entry is BF16.
+    #[test]
+    fn headed_stock_manifest_is_the_ar_manifest_plus_the_31_head_entries() {
+        let flash = pinned_config();
+        let ar = flash.clone().into_ar_only().unwrap();
+        let stock = flash.clone().into_stock_mtp().unwrap();
+        admit_executable_profile(&stock).expect("headed stock profile is executable");
+        let ar_manifest = Qwen4Manifest::build_with_recipe(&ar, Qwen4TierRecipe::StockFp8).unwrap();
+        let head = Qwen4Manifest::build_with_recipe(&stock, Qwen4TierRecipe::StockFp8).unwrap();
+        assert_eq!(head.identity.recipe, Qwen4TierRecipe::StockFp8);
+        assert_eq!(head.identity.profile_id, "qwen3.8-flash-next-fp8-mtp");
+        let ar_names: std::collections::BTreeSet<&str> = ar_manifest
+            .weights
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        let extra: Vec<&WeightEntry> = head
+            .weights
+            .iter()
+            .filter(|entry| !ar_names.contains(entry.name.as_str()))
+            .collect();
+        assert!(extra.iter().all(|entry| entry.name.starts_with("mtp.")));
+        let (tied, stored): (Vec<&&WeightEntry>, Vec<&&WeightEntry>) = extra
+            .iter()
+            .partition(|entry| matches!(entry.policy, ShardPolicy::Tied { .. }));
+        assert_eq!(tied.len(), 1);
+        assert_eq!(tied[0].name, "mtp.embed_tokens.weight");
+        assert_eq!(stored.len(), 31);
+        assert_eq!(head.weights.len(), ar_manifest.weights.len() + 32);
+        assert_eq!(
+            head.source_tensor_count(),
+            ar_manifest.source_tensor_count() + 31
+        );
+        for entry in &stored {
+            let expert = entry.name.ends_with(".mlp.experts.gate_up_proj")
+                || entry.name.ends_with(".mlp.experts.down_proj");
+            let want = if expert {
+                DType::FP8E4M3B128
+            } else {
+                DType::BF16
+            };
+            assert_eq!(entry.dtype, want, "{}", entry.name);
+        }
+        assert_eq!(
+            stored
+                .iter()
+                .filter(|entry| entry.dtype == DType::FP8E4M3B128)
+                .count(),
+            2
+        );
+        // The recipe is stock-only: the head profile refuses the packed recipe.
+        assert!(Qwen4Manifest::build_with_recipe(
+            &stock,
+            Qwen4Manifest::build(&flash).unwrap().identity.recipe
+        )
+        .is_err());
+    }
+
+    /// U8 (CPU part): the head's two stock tables have the geometry `fp8_expert_tables`
+    /// checks against the config (`E / 2*moe / hidden` and `E / hidden / moe`), and the
+    /// qt=55 accessor accepts them.
+    #[test]
+    fn head_fp8_expert_tables_match_the_config_geometry() {
+        let config = pinned_config();
+        let entries = crate::stock_mtp_sidecar::expected_stock_mtp_entries(&config).unwrap();
+        let table = |suffix: &str| {
+            let name = format!("mtp.layers.0.mlp.experts.{suffix}");
+            entries.iter().find(|entry| entry.name == name).unwrap()
+        };
+        let (gate_up, down) = (table("gate_up_proj"), table("down_proj"));
+        let gate_up_shape = vec![
+            config.num_experts,
+            2 * config.moe_intermediate_size,
+            config.hidden_size,
+        ];
+        let down_shape = vec![
+            config.num_experts,
+            config.hidden_size,
+            config.moe_intermediate_size,
+        ];
+        assert_eq!(gate_up.logical_shape, gate_up_shape);
+        assert_eq!(down.logical_shape, down_shape);
+        let base = 0x7f00_0000_0000usize;
+        for (entry, stride) in [(gate_up, 3_277_312usize), (down, 1_638_656)] {
+            let table = Fp8B128ExpertTable::from_tensor(
+                &entry.name,
+                &fake_tensor(
+                    base,
+                    512 * stride,
+                    entry.logical_shape.clone(),
+                    DType::FP8E4M3B128,
+                ),
+            )
+            .unwrap();
+            assert_eq!(
+                (table.experts, table.rows, table.k, table.stride),
+                (
+                    entry.logical_shape[0],
+                    entry.logical_shape[1],
+                    entry.logical_shape[2],
+                    stride
+                )
+            );
         }
     }
 

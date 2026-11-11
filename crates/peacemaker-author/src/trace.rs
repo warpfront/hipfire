@@ -459,12 +459,20 @@ impl Backend for Trace {
     }
     fn exec_from_scc(&mut self, auth: &Auth) -> Result<(), String> {
         self.seal.check(auth)?;
-        self.emit("s_cselect_b32 exec_lo, -1, 0");
+        self.emit(if self.arch == "gfx942" {
+            "s_cselect_b64 exec, -1, 0"
+        } else {
+            "s_cselect_b32 exec_lo, -1, 0"
+        });
         Ok(())
     }
     fn exec_all(&mut self, auth: &Auth) -> Result<(), String> {
         self.seal.check(auth)?;
-        self.emit("s_mov_b32 exec_lo, -1");
+        self.emit(if self.arch == "gfx942" {
+            "s_mov_b64 exec, -1"
+        } else {
+            "s_mov_b32 exec_lo, -1"
+        });
         Ok(())
     }
     fn loop_(

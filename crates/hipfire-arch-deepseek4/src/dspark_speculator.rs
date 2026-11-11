@@ -391,6 +391,30 @@ mod tests {
         Gpu::init().ok()
     }
 
+    fn tiny_core_weights(cfg: &DeepseekV4Config) -> CoreDsparkWeights {
+        CoreDsparkWeights {
+            cfg: CoreDsparkConfig {
+                block_size: 2,
+                target_layer_ids: vec![0],
+                markov_rank: 0,
+                noise_token_id: 0,
+                enable_confidence: false,
+                confidence_uses_normed: false,
+                rms_norm_eps: cfg.rms_norm_eps,
+                draft_vocab_size: 0,
+                partial_rotary_factor: 1.0,
+                rope_theta: 1_000_000.0,
+            },
+            main_proj: None,
+            main_norm: None,
+            markov_w1: None,
+            markov_w2: None,
+            confidence_proj: None,
+            confidence_bias: None,
+            d2t: None,
+        }
+    }
+
     /// Production behavior: a dirtied `dspark_swa_k` ring must not survive
     /// `DsparkBody::reset_for_retry` (the path `DsparkDrafter::mtp_reset` uses).
     #[test]
@@ -472,27 +496,7 @@ mod tests {
         let lm_head = gpu
             .zeros(&[cfg.vocab_size * cfg.hidden_size], DType::F32)
             .expect("lm");
-        let core_weights = CoreDsparkWeights {
-            cfg: CoreDsparkConfig {
-                block_size: 2,
-                target_layer_ids: vec![0],
-                markov_rank: 0,
-                noise_token_id: 0,
-                enable_confidence: false,
-                confidence_uses_normed: false,
-                rms_norm_eps: cfg.rms_norm_eps,
-                draft_vocab_size: 0,
-                partial_rotary_factor: 1.0,
-                rope_theta: 1_000_000.0,
-            },
-            main_proj: None,
-            main_norm: None,
-            markov_w1: None,
-            markov_w2: None,
-            confidence_proj: None,
-            confidence_bias: None,
-            d2t: None,
-        };
+        let core_weights = tiny_core_weights(&cfg);
 
         let mut spec = build_dspark_speculator(
             body,
@@ -509,5 +513,154 @@ mod tests {
         let _ = spec.reset(&mut gpu);
         spec.free(&mut gpu);
         let _ = gpu.free_tensor(emb);
+    }
+
+    /// HIPF-257: a cold (`cache_hit=false`) prefill must drain the body SWA
+    /// rings left by the previous request; a warm prefill keeps them.
+    #[test]
+    fn dspark_cold_prefill_drains_body_swa_rings() {
+        use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
+        use std::{cell::Cell, rc::Rc};
+
+        struct Probe {
+            inner: Deepseek4DsparkBody,
+            rings: Rc<Cell<usize>>,
+        }
+        impl DsparkBody for Probe {
+            fn draft_block(
+                &mut self,
+                _: &mut Gpu,
+                _: &CoreDsparkWeights,
+                _: &GpuTensor,
+                _: &[usize],
+                _: u32,
+                _: usize,
+                _: usize,
+                _: &GpuTensor,
+            ) -> Result<(), String> {
+                unimplemented!()
+            }
+            fn block_size(&self) -> usize {
+                self.inner.block_size()
+            }
+            fn free(self: Box<Self>, gpu: &mut Gpu) {
+                Box::new(self.inner).free(gpu)
+            }
+            fn reset_for_retry(&mut self, gpu: &mut Gpu) {
+                self.inner.reset_for_retry(gpu);
+                self.rings.set(self.inner.draft_state.dspark_swa_k.len());
+            }
+        }
+
+        struct Bare;
+        impl SpecTarget for Bare {
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+            fn reset_recurrent(&mut self, _: &mut Gpu) -> Result<(), String> {
+                Ok(())
+            }
+            fn new_spec_scratch(
+                &mut self,
+                _: &mut Gpu,
+                _: usize,
+            ) -> Result<Box<dyn SpecScratch>, String> {
+                unimplemented!()
+            }
+            fn spec_advance(
+                &mut self,
+                _: &mut Gpu,
+                _: &[u32],
+                _: usize,
+                _: bool,
+                _: &dyn Fn() -> bool,
+                _: Option<&mut Vec<f32>>,
+            ) -> Result<SpecAdvance, String> {
+                Ok(SpecAdvance::Ready {
+                    last_argmax: 0,
+                    last_logits: None,
+                })
+            }
+            fn verify_block(
+                &mut self,
+                _: &mut Gpu,
+                _: &[u32],
+                _: usize,
+                _: &mut dyn SpecScratch,
+                _: Option<&mut Vec<f32>>,
+            ) -> Result<Vec<u32>, String> {
+                unimplemented!()
+            }
+            fn commit_prefix(
+                &mut self,
+                _: &mut Gpu,
+                _: &[u32],
+                _: usize,
+                _: usize,
+                _: &mut dyn SpecScratch,
+            ) -> Result<(), String> {
+                unimplemented!()
+            }
+            fn eos_token(&self) -> u32 {
+                0
+            }
+            fn ctx_capacity(&self) -> usize {
+                0
+            }
+        }
+
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let cfg = tiny_cfg();
+        for (cache_hit, rings_after) in [(true, 1), (false, 0)] {
+            let mut draft_state = DeepseekV4State::new(&cfg).expect("DeepseekV4State::new");
+            draft_state
+                .dspark_swa_k
+                .push(Some(gpu.upload_f32(&[1.0f32; 4], &[4]).expect("ring")));
+            let rings = Rc::new(Cell::new(1));
+            let emb = gpu
+                .zeros(&[cfg.vocab_size * cfg.hidden_size], DType::F32)
+                .expect("emb");
+            let body = Box::new(Probe {
+                inner: Deepseek4DsparkBody {
+                    config: cfg.clone(),
+                    stages_shallow: Vec::new(),
+                    token_embd: emb.shallow_clone(),
+                    draft_state,
+                },
+                rings: rings.clone(),
+            });
+            let stage_norm = gpu.zeros(&[cfg.hidden_size], DType::F32).expect("sn");
+            let lm_head = gpu
+                .zeros(&[cfg.vocab_size * cfg.hidden_size], DType::F32)
+                .expect("lm");
+            let mut spec = build_dspark_speculator(
+                body,
+                tiny_core_weights(&cfg),
+                stage_norm,
+                lm_head,
+                2,
+                8,
+                0.3,
+                false,
+                DS4_DSPARK_WINDOW_COST,
+            );
+            spec.prefill(
+                &mut gpu,
+                &mut Bare,
+                &[1, 2],
+                &[2],
+                1,
+                cache_hit,
+                None,
+                &|| false,
+            )
+            .expect("prefill");
+            assert_eq!(rings.get(), rings_after, "cache_hit={cache_hit}");
+            spec.free(&mut gpu);
+            let _ = gpu.free_tensor(emb);
+        }
     }
 }

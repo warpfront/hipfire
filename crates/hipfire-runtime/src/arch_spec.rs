@@ -24,7 +24,7 @@
 use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;
-use hipfire_dispatch::pipeline::sandwich::{Rope, RopeKind};
+use hipfire_dispatch::pipeline::sandwich::Rope;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::RotationPlan;
 use rdna_compute::{Gpu, GpuTensor};
@@ -36,7 +36,7 @@ pub struct DenseKnobs {
     pub attn_bias: bool,
     /// Apply per-head Q/K RMSNorm before RoPE (Qwen3-style; llama/qwen2: false).
     pub qk_norm: bool,
-    pub rope_theta: f32,
+    pub rope: Rope,
     pub norm_eps: f32,
     pub n_heads: usize,
     pub n_kv_heads: usize,
@@ -240,10 +240,7 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
             n_heads: k.n_heads,
             n_kv_heads: k.n_kv_heads,
             head_dim: k.head_dim,
-            rope: Rope {
-                kind: RopeKind::RotateHalf,
-                theta: k.rope_theta,
-            },
+            rope: k.rope,
         });
 
         let o_proj = Step::GemvResidual {

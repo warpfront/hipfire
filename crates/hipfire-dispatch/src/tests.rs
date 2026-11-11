@@ -3521,6 +3521,35 @@ fn mq6_hfq6_gemv_resolves_on_rdna1_rdna2_and_keeps_prior_archs() {
         .is_err());
 }
 
+/// HIPF-222: `GemvHfq3G128` was gated on sdot4, so gfx1151/RDNA3 resolved
+/// MissingImpl and LLaMA hfq3 files failed at the first generate. The kernel is
+/// wave32 scalar: every wave32 arch resolves, CDNA wave64 stays excluded.
+#[test]
+fn hfq3g128_gemv_resolves_on_wave32_only() {
+    use crate::families::gemv::GemvFamily;
+    let fam = GemvFamily::new();
+    for arch in ["gfx1010", "gfx1030", "gfx1100", "gfx1151", "gfx1201"] {
+        let r = fam.resolve(
+            DType::HFQ3G128,
+            GemvVariant::Plain,
+            false,
+            &DispatchCtx::for_test(arch),
+            None,
+        );
+        assert!(r.is_ok(), "HFQ3G128 must resolve on {arch}: {r:?}");
+    }
+    for arch in ["gfx906", "gfx942"] {
+        let r = fam.resolve(
+            DType::HFQ3G128,
+            GemvVariant::Plain,
+            false,
+            &DispatchCtx::for_test(arch),
+            None,
+        );
+        assert!(r.is_err(), "HFQ3G128 must stay rejected on {arch}");
+    }
+}
+
 #[test]
 fn arch_has_hfq6_gemv_is_mmq_union_wave32() {
     assert!(ArchPredicate::HasHfq6Gemv.eval_arch(&ctx_rdna1()));
@@ -3529,4 +3558,32 @@ fn arch_has_hfq6_gemv_is_mmq_union_wave32() {
     assert!(ArchPredicate::HasHfq6Gemv.eval_arch(&ctx_rdna4()));
     assert!(ArchPredicate::HasHfq6Gemv.eval_arch(&ctx_gfx906()));
     assert!(!ArchPredicate::HasHfq6Gemv.eval_arch(&DispatchCtx::for_test("gfx942")));
+}
+
+/// HIPF-241: `GemvHfq3G256` was gated on sdot4 + gfx110x, so gfx1151/gfx12
+/// resolved MissingImpl and LLaMA hfq3g256 files failed at the first prefill.
+/// The generic kernel is wave32 scalar: every wave32 arch resolves, CDNA wave64
+/// stays excluded.
+#[test]
+fn hfq3g256_gemv_resolves_on_wave32_only() {
+    use crate::families::gemv::GemvFamily;
+    let fam = GemvFamily::new();
+    for (arch, ok) in [
+        ("gfx1010", true),
+        ("gfx1030", true),
+        ("gfx1100", true),
+        ("gfx1151", true),
+        ("gfx1201", true),
+        ("gfx906", false),
+        ("gfx942", false),
+    ] {
+        let r = fam.resolve(
+            DType::HFQ3G256,
+            GemvVariant::Plain,
+            false,
+            &DispatchCtx::for_test(arch),
+            None,
+        );
+        assert_eq!(r.is_ok(), ok, "HFQ3G256 on {arch}: {r:?}");
+    }
 }

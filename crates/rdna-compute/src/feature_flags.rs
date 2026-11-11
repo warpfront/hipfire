@@ -194,6 +194,12 @@ pub struct FeatureFlags {
     /// selects the named ones, `0` none. Exact gfx1201 only (see
     /// [`FeatureFlags::qwen4_moe_glue_fold_enabled`]).
     pub qwen4_moe_glue_fold: u8,
+    /// gfx942 stock-FP8 MoE glue folds (`HIPFIRE_QWEN4_G942_FOLD_MOE`, default on, the Route-A twin
+    /// is sealed; `=0` kills): the sealed qt=55 grouped route's seven glue launches
+    /// (stable-scatter ranks / prefix / scatter + tile descriptors; routed unscatter-SiLU, shared
+    /// activation, shared scaled add) run as two folded launches plus a combine that carries the
+    /// shared add. Exact gfx942 only (see [`FeatureFlags::qwen4_g942_fold_moe_enabled`]).
+    pub qwen4_g942_fold_moe: bool,
     /// Multi-lane fn-lanes GDN decode core (`HIPFIRE_QWEN4_GDN_LANES`), default
     /// on for gfx1151 and gfx1201 (`=0` kills it), off elsewhere.
     pub qwen4_gdn_lanes: bool,
@@ -615,9 +621,10 @@ pub struct FeatureFlags {
     /// `HIPFIRE_GFX1151_XLDS` selects the exact-gfx1151 1..=16-row MQ4V2 and
     /// HFQ4G256/MQ4G256 v1 WMMA GEMMs (`*_gfx1151_xlds`: 4 waves x 16 rows per
     /// block, X slab staged in LDS) for gate_up/qkvza/qkv/residual (residual also
-    /// carries the 4-bit batched lm_head), and the matching Q8_0
-    /// `gemm_q8_0_wmma_gfx1151_xlds` (DFlash Q8 lm_head). Default on for exact gfx1151, false
-    /// elsewhere; outputs are byte-identical to the base kernels.
+    /// carries the 4-bit batched lm_head), the matching Q8_0
+    /// `gemm_q8_0_wmma_gfx1151_xlds` (DFlash Q8 lm_head, Q8 gate_up) and the F16
+    /// `gemm_f16_wmma_gfx1151_xlds` (DSpark drafter lm_head). Default on for exact
+    /// gfx1151, false elsewhere; outputs are byte-identical to the base kernels.
     /// `HIPFIRE_GFX1151_XLDS=0` restores the historical base kernels.
     pub gfx1151_xlds: bool,
     /// Exact-K5120 MQ4V2 gate/up decode on gfx1100: default on (byte-identical
@@ -1339,6 +1346,7 @@ impl FeatureFlags {
             qwen4_moe_glue_fold: parse_moe_glue_fold(
                 value("HIPFIRE_QWEN4_MOE_GLUE_FOLD").ok().as_deref(),
             ),
+            qwen4_g942_fold_moe: parse_bool("HIPFIRE_QWEN4_G942_FOLD_MOE").unwrap_or(true),
             qwen4_gdn_lanes: parse_bool("HIPFIRE_QWEN4_GDN_LANES").unwrap_or(matches!(arch, "gfx1151" | "gfx1201")),
             qwen4_qsa_lanes: parse_bool("HIPFIRE_QWEN4_QSA_LANES").unwrap_or(arch == "gfx1201"),
             qwen4_gdn_lanes_rows: parse_bool("HIPFIRE_QWEN4_GDN_LANES_ROWS").unwrap_or(true),
@@ -2208,6 +2216,12 @@ impl FeatureFlags {
         self.qwen4_moe_glue_fold & bit != 0 && self.arch == "gfx1201"
     }
 
+    /// gfx942 stock-FP8 MoE glue folds (`HIPFIRE_QWEN4_G942_FOLD_MOE`): exact gfx942 only,
+    /// default on (`=0` kills).
+    pub fn qwen4_g942_fold_moe_enabled(&self) -> bool {
+        self.qwen4_g942_fold_moe && self.arch == "gfx942"
+    }
+
     pub fn qwen4_decode_zba_x3_enabled(&self) -> bool {
         self.qwen4_decode_zba_x3 && self.arch == "gfx1151"
     }
@@ -2500,6 +2514,7 @@ impl FeatureFlags {
             qwen4_router_fast: false,
             qwen4_moe_scatter_scan: false,
             qwen4_moe_glue_fold: 0,
+            qwen4_g942_fold_moe: false,
             qwen4_gdn_lanes: false,
             qwen4_qsa_lanes: false,
             qwen4_gdn_lanes_rows: false,

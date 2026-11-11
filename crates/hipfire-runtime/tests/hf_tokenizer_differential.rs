@@ -945,7 +945,7 @@ impl FuzzGen {
             5 => {
                 let mut s = (*self.rng.pick(COMBINING_BASES)).to_string();
                 for _ in 0..self.rng.range(1, 4) {
-                    s.push_str(self.rng.pick(COMBINING_MARKS));
+                    s.push_str(*self.rng.pick(COMBINING_MARKS));
                 }
                 s
             }
@@ -1050,14 +1050,14 @@ impl FuzzGen {
     fn random_case(&mut self) -> String {
         let mut s = String::new();
         if self.rng.below(6) == 0 {
-            s.push_str(self.rng.pick(ASCII_WS));
+            s.push_str(*self.rng.pick(ASCII_WS));
         }
         let n = self.rng.range(1, 10);
         for i in 0..n {
             if i > 0 {
                 match self.rng.below(5) {
                     0 | 1 => s.push(' '),
-                    2 => s.push_str(self.rng.pick(ASCII_WS)),
+                    2 => s.push_str(*self.rng.pick(ASCII_WS)),
                     _ => {}
                 }
             }
@@ -1067,7 +1067,7 @@ impl FuzzGen {
             }
         }
         if self.rng.below(6) == 0 {
-            s.push_str(self.rng.pick(ASCII_WS));
+            s.push_str(*self.rng.pick(ASCII_WS));
         }
         s.chars().take(MAX_FUZZ_CHARS).collect()
     }

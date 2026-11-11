@@ -999,6 +999,8 @@ pub(crate) fn route_for(args: &QuantizeArgs) -> crate::cli::Route {
         Route::Flux
     } else if args.qwen4_flash_next {
         Route::Qwen4
+    } else if args.recipe.as_deref() == Some("stock-fp8-mtp-sidecar") {
+        Route::Qwen4StockMtpSidecar
     } else if args.recipe.is_some() {
         Route::Qwen4StockFp8
     } else if args.raon_shared_ffn.is_some() || args.raon_shared_ffn_verify.is_some() {
@@ -1098,6 +1100,50 @@ pub(crate) fn run() {
             }
             Err(error) => {
                 eprintln!("error: qwen4 streaming pack: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // ── Stock FP8 MTP head sidecar (`--recipe stock-fp8-mtp-sidecar`) ───
+    // Production-only dedicated producer; `reject_unreachable` has already
+    // refused every flag it does not read.
+    if args.recipe.as_deref() == Some("stock-fp8-mtp-sidecar") {
+        let input = args
+            .input
+            .as_deref()
+            .expect("--input is required with --recipe stock-fp8-mtp-sidecar");
+        let Some(base) = args.base.as_deref() else {
+            eprintln!("error: --recipe stock-fp8-mtp-sidecar requires --base <model.hfq>");
+            std::process::exit(2);
+        };
+        let output = (!args.output.is_empty()).then(|| Path::new(&args.output));
+        match crate::qwen4::run_stock_fp8_mtp_sidecar_cli(
+            Path::new(input),
+            Path::new(base),
+            output,
+            args.base_sha256.as_deref(),
+        ) {
+            Ok(summary) => {
+                eprintln!(
+                    "stock-fp8-mtp-sidecar: wrote {} ({} entries: {} experts; \
+                     mtp fp8 tensors scanned={}; payload={} bytes; sidecar={} bytes sha256={}; \
+                     base sha256={}; receipt={}; {:.1}s)",
+                    summary.output.display(),
+                    summary.entries,
+                    summary.expert_entries,
+                    summary.mtp_fp8_scanned,
+                    summary.payload_bytes,
+                    summary.sidecar_bytes,
+                    summary.sidecar_sha256,
+                    summary.base_sha256,
+                    summary.receipt_path.display(),
+                    summary.elapsed_seconds
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("error: stock-fp8-mtp-sidecar: {error}");
                 std::process::exit(2);
             }
         }
@@ -1968,17 +2014,15 @@ pub(crate) fn run() {
     // linear_attn.{in_proj_qkv,in_proj_z,in_proj_a,in_proj_b,out_proj}
     // (linear-attention layers via SSM-naming). Norms / biases / 1D scalars /
     // conv1d / lookup tables have no imatrix entry.
+    // The table itself is loaded once config.json is parsed (below): the
+    // `--awq-fix-la-head-order` V-head permutation needs the model's
+    // linear_num_{key,value}_heads / linear_value_head_dim.
     let imatrix_path = args.imatrix.clone();
     if let Some(path) = &imatrix_path {
         if !path.exists() {
             eprintln!("error: --imatrix path not found: {}", path.display());
             std::process::exit(1);
         }
-        let table = load_imatrix(path, args.awq_fix_la_head_order);
-        IMATRIX
-            .set(table)
-            .expect("IMATRIX set twice — should not happen");
-        eprintln!("imatrix loaded from {}", path.display());
     }
 
     // ── Phase A Stage A: AWQ (Activation-aware Weight Quantization) ──
@@ -2208,7 +2252,7 @@ pub(crate) fn run() {
         );
     }
     if awq_enabled {
-        if IMATRIX.get().is_none() {
+        if imatrix_path.is_none() {
             eprintln!(
                 "error: --awq requires --imatrix (we derive RMS_act per channel from imatrix in_sum2 values)"
             );
@@ -2481,6 +2525,27 @@ pub(crate) fn run() {
         eprintln!("Architecture: {arch_str} (id={arch_id})");
     }
     let is_moe = arch_id == 6;
+
+    // Load the imatrix now that the checkpoint's config is available: the
+    // grouped-V-head (GatedDeltaNet) out_proj re-index is geometry-driven, so
+    // the loader needs linear_num_{key,value}_heads / linear_value_head_dim.
+    if let Some(path) = &imatrix_path {
+        match load_imatrix(path, la_head_geometry(&config), args.awq_fix_la_head_order) {
+            Ok(loaded) => {
+                for warning in &loaded.warnings {
+                    eprintln!("{warning}");
+                }
+                IMATRIX
+                    .set(loaded.table)
+                    .expect("IMATRIX set twice — should not happen");
+                eprintln!("imatrix loaded from {}", path.display());
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     // DeepSeek V4 (arch_id=9 post-2026-05-26 upstream merge that promoted
     // Qwen2-dense to 7 and dots.ocr to 8) is also MoE but ships per-expert
     // separate 2D tensors (`layers.L.ffn.experts.E.{w1,w2,w3}.weight`)
@@ -8547,6 +8612,44 @@ fn handle_main_quant(
                     std::process::exit(1);
                 }
             }
+            // These encoders pack groups flat across rows, but their kernels
+            // read `K / group` groups per row, so a `[rows, K]` matrix with a
+            // ragged K would decode as garbage. Re-encode it in a row-padded
+            // format: Q8 keeps HFQ6's precision and is the embedding format
+            // (Q8 itself needs K % 32 == 0; a ragged embedding is refused),
+            // HFQ4-G128 pads each row. Higher ranks (conv1d) stay flat.
+            let floor_stride_group = match qt {
+                QuantType::HFQ6G256 | QuantType::HFQ4G256 | QuantType::Q4K => 256,
+                QuantType::HFQ2G128 | QuantType::HFQ3G128 => 128,
+                QuantType::Q4F16G64 => 64,
+                QuantType::Q8F16 => 32,
+                _ => 0,
+            };
+            let (quantized, qt, gs, label) = if meta.shape.len() == 2
+                && floor_stride_group != 0
+                && !meta.shape[1].is_multiple_of(floor_stride_group)
+            {
+                awq_sidecar_scales = None;
+                let (m, k) = (meta.shape[0], meta.shape[1]);
+                let is_embed = name.contains("embed_tokens");
+                if (qt == QuantType::HFQ6G256 || is_embed) && k.is_multiple_of(32) {
+                    eprintln!("  {name}: K={k} % {floor_stride_group} != 0, {label} -> Q8_F16");
+                    (quantize_q8f16(&f32_data), QuantType::Q8F16, 32u32, "Q8_F16")
+                } else if is_embed {
+                    eprintln!("error: embedding {name} has K={k} not divisible by 32 (no tail-safe lookup kernel)");
+                    std::process::exit(2);
+                } else {
+                    eprintln!("  {name}: K={k} % {floor_stride_group} != 0, {label} -> HFQ4G128");
+                    (
+                        quantize_hfq4g128_2d(&f32_data, m, k),
+                        QuantType::HFQ4G128,
+                        128u32,
+                        "HFQ4G128",
+                    )
+                }
+            } else {
+                (quantized, qt, gs, label)
+            };
 
             // Compute quantization error (skip for Q8 embeddings — always negligible)
             let block_size = gs as usize;

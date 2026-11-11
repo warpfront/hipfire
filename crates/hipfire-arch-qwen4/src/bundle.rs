@@ -3957,6 +3957,25 @@ impl Qwen4Bundle {
         }
     }
 
+    /// Lab-only: the MTP head's last one-row stock-FP8 MoE routing (raw F32
+    /// router logits `[num_experts]`, top-k ids and renormalised weights;
+    /// exact semantics on [`crate::mtp_gpu::LabHeadRouting`]). Call it right
+    /// after the head Predict step it should describe. `Ok(None)` when the
+    /// head is not a stock-FP8 MoE head (no grouped MoE scratch).
+    #[cfg(feature = "lab")]
+    pub fn mtp_lab_fp8_head_routing(
+        &self,
+        gpu: &Gpu,
+    ) -> Result<Option<crate::mtp_gpu::LabHeadRouting>, BundleError> {
+        self.mtp
+            .as_ref()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })?
+            .lab_fp8_head_routing(gpu, &self.config)
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
     /// The last MTP step of a chain: append only its K/V and index-key cache
     /// rows (see [`MtpStep::Append`]); the next step must bring its own
     /// backbone hidden and a fresh selection.

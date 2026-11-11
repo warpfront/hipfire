@@ -56,7 +56,7 @@ use hipfire_dispatch::pipeline::gated_mlp::{
 };
 use hipfire_dispatch::pipeline::sealed_moe::{
     retained_body_action, specialized_sealed_moe_retained_admission, RetainedBodyAction,
-    SealedMoeCall,
+    SealedMoeCall, SpecializedRouteAdmission,
 };
 use hipfire_dispatch::pipeline::{
     execute_embedding, execute_validated_steps, execute_validated_steps_with_moe_hooks,
@@ -393,6 +393,35 @@ pub(crate) fn qwen4_ar_launch(
     }
     Qwen4ArLaunch::Recorded
 }
+
+/// Admission of the Qwen4 retained body on this controller and arch: `admission`
+/// unless the transport is known not to prepare the tape, which refuses before
+/// anything records. The measurement-only diagnostic capture never prepares, so
+/// it is not refused. One answer for the boundary and `ar_launch_reference`.
+pub(crate) fn qwen4_retained_admission(
+    replay: &rdna_compute::replay::ReplayController,
+    arch: &str,
+    admission: SpecializedRouteAdmission,
+) -> SpecializedRouteAdmission {
+    // The GDN conv carries a position kernarg; the gfx1151 MQ6 LM-head GEMV
+    // (gemv_mq6g256v2_k2560_u2) uses scratch, and gfx11 PM4 decode parity is HIPF-254.
+    const NEEDS: rdna_compute::replay::RetainedTapeNeeds =
+        rdna_compute::replay::RetainedTapeNeeds {
+            position_kernargs: true,
+            gfx10_11_pm4_unvalidated: true,
+        };
+    match (admission, replay.transport_refusal(arch, NEEDS)) {
+        (SpecializedRouteAdmission::Admitted, Some(reason)) => {
+            SpecializedRouteAdmission::Refused { reason }
+        }
+        (admission, _) => admission,
+    }
+}
+
+/// Appended to every Qwen4 fallback after a recording forward.
+const RECORDED_FORWARD_NOTE: &str = "the forward that recorded the tape ran on the recorded \
+     route, so its output (and the state it wrote) may not be byte-identical to plain HIP; \
+     later forwards are plain HIP";
 
 pub(crate) fn qwen4_spec_logit_rows(max_chunk: usize) -> usize {
     QWEN4_SPEC_VERIFY_ROWS.min(max_chunk)
@@ -4642,6 +4671,12 @@ impl Qwen4MoeLayerRuntime {
         )
     }
 
+    /// Whether the layer's routed experts are qt=55 stock-FP8 tables (the
+    /// gfx942 [`MoeRouteCapability::Fp8B128Grouped`] route).
+    pub(crate) fn is_fp8(&self) -> bool {
+        self.fp8
+    }
+
     /// The sealed expert-slab layer's cold codec for its route policy
     /// ([`MoeRoutePolicy::slab_cold_codec`]): W3 (1) or E8P (3), `None` for an
     /// MQ4-only slab layer and for every non-slab layer. Read from the layer's
@@ -7570,7 +7605,7 @@ pub(crate) struct Qwen4MoeScratch<'a> {
 /// list (the MTP head); the caller clears `output` with a preceding
 /// `Step::Clear`. A stock-FP8 runtime has no indexed decode route (its decode
 /// is the grouped prefill route, sealed by `program::seal_moe_for_layer`) and
-/// is refused here.
+/// is refused here: the MTP head seals it through [`seal_moe_rows`] at one row.
 pub(crate) fn seal_moe_decode<'a>(
     ctx: &'a DispatchCtx,
     config: &Qwen4Config,
@@ -7584,7 +7619,7 @@ pub(crate) fn seal_moe_decode<'a>(
     if runtime.fp8 {
         return Err(invalid(
             "qt=55 FP8 experts have no indexed decode route; seal them through \
-             program::seal_moe_for_layer (grouped prefill at every row count)",
+             seal_moe_rows (program::seal_moe_for_layer, grouped prefill at every row count)",
         ));
     }
     let dtypes = MoeDtypes {
@@ -7704,6 +7739,13 @@ pub(crate) fn seal_moe_decode<'a>(
 /// forward's row-gather hook with the head's shared-down output tensor
 /// (`MoeSharedPrefill`'s unfused shared down) and `layer_index` the head's
 /// gather index (`num_hidden_layers + parity`); otherwise `layer_index` is 0.
+///
+/// A stock-FP8 (qt=55) `runtime` declares [`MoeRouteCapability::Fp8B128Grouped`]
+/// and seals the grouped prefill call at every row count, one routing row
+/// (the head's decode / draft step) included, exactly as the trunk seals its
+/// qt=55 layers; `scratch` must then carry the grouped route's F32 buffers
+/// (`MtpFp8MoeScratch` for one row, the rows scratch for `rows >= 2`). Stock
+/// FP8 loads on one device, so it takes no EP row gather.
 pub(crate) fn seal_moe_rows<'a>(
     ctx: &'a DispatchCtx,
     config: &Qwen4Config,
@@ -7713,9 +7755,9 @@ pub(crate) fn seal_moe_rows<'a>(
     scratch: &'a Qwen4LayerScratch<'a>,
     row_gather: Option<(&'a dyn MoeRowGather, &'a GpuTensor)>,
 ) -> Result<SealedMoeCall<'a>, Qwen4GpuForwardError> {
-    if runtime.fp8 {
+    if runtime.fp8 && row_gather.is_some() {
         return Err(invalid(
-            "qt=55 FP8 experts have no head row route; the MTP head rows need QT44/QT53 experts",
+            "qt=55 FP8 experts load on one device; the head takes no EP row gather for them",
         ));
     }
     if row_gather.is_some() {
@@ -15715,7 +15757,16 @@ impl Qwen4GpuForward {
             && self.qsa_tap.is_none()
             && self.mesh_route_rows.is_none()
             && self.cut_layers.is_none()
-            && !hipfire_dispatch::pipeline::qsa_projection_hook_installed();
+            && !hipfire_dispatch::pipeline::qsa_projection_hook_installed()
+            // A transport the boundary refuses never records.
+            && !matches!(
+                qwen4_retained_admission(
+                    &gpu.replay,
+                    &gpu.arch,
+                    specialized_sealed_moe_retained_admission(),
+                ),
+                SpecializedRouteAdmission::Refused { .. }
+            );
         qwen4_ar_launch(
             retained_candidate,
             gpu.replay.request(),
@@ -17605,17 +17656,24 @@ impl Qwen4GpuForward {
                 None
             };
             if shadow_route.is_none() {
-                match retained_body_action(
-                    eligible,
-                    gpu.replay.state(),
+                let admission = qwen4_retained_admission(
+                    &gpu.replay,
+                    &gpu.arch,
                     specialized_sealed_moe_retained_admission(),
-                ) {
+                );
+                match retained_body_action(eligible, gpu.replay.state(), admission) {
                     RetainedBodyAction::Ineligible => {}
                     RetainedBodyAction::Refuse { reason } => {
                         // The route cannot be retained: poison before the body so this
                         // and every later forward runs on HIP.
                         gpu.replay.poison(reason);
-                        eprintln!("[redline] qwen4 retained body unavailable: {reason}");
+                        eprintln!(
+                            "[redline] qwen4: retained body not armed on {} ({} transport): \
+                             {reason}; running plain HIP, output is byte-identical to \
+                             HIPFIRE_REPLAY_BACKEND=hip",
+                            gpu.arch,
+                            gpu.replay.transport_name()
+                        );
                     }
                     RetainedBodyAction::Arm { diagnostic } => {
                         diagnostic_capture = diagnostic;
@@ -18177,12 +18235,18 @@ fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool) {
     if let Err(reason) = gpu.hip.device_synchronize() {
         let reason = format!("qwen4 capture sync failed: {reason:?}");
         gpu.replay.poison(reason.clone());
-        eprintln!("[redline] qwen4 capture could not be closed or prepared: {reason}");
+        eprintln!(
+            "[redline] qwen4 capture could not be closed or prepared: {reason}; \
+             {RECORDED_FORWARD_NOTE}"
+        );
         return;
     }
     if let Err(reason) = gpu.replay.finish_capture() {
-        gpu.replay.poison(reason);
-        eprintln!("[redline] qwen4 capture could not be closed or prepared: {reason}");
+        gpu.replay.poison(reason.clone());
+        eprintln!(
+            "[redline] qwen4 capture could not be closed or prepared: {reason}; \
+             {RECORDED_FORWARD_NOTE}"
+        );
         return;
     }
     let launches = gpu.replay.recorded_launches().len();
@@ -18203,15 +18267,41 @@ fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool) {
         Err(reason) => {
             let reason = format!("Redline prepare after warmup failed: {reason}");
             gpu.replay.poison(reason.clone());
-            eprintln!("[redline] falling back to HIP: {reason}");
+            eprintln!("[redline] falling back to HIP: {reason}; {RECORDED_FORWARD_NOTE}");
         }
     }
 }
 
 #[cfg(test)]
 mod wide_verify_guard_tests {
-    use super::{qwen4_ar_launch, qwen4_spec_logit_rows, Qwen4ArLaunch};
-    use rdna_compute::replay::{ReplayBackendRequest as Request, ReplayState as State};
+    use super::{qwen4_ar_launch, qwen4_retained_admission, qwen4_spec_logit_rows, Qwen4ArLaunch};
+    use hipfire_dispatch::pipeline::sealed_moe::SpecializedRouteAdmission as Admission;
+    use rdna_compute::replay::{
+        ReplayBackendRequest as Request, ReplayController, ReplayState as State,
+    };
+
+    /// HIPF-225: the transports that cannot prepare the Qwen4 tape are refused
+    /// before recording; the diagnostic census still records.
+    #[test]
+    fn retained_admission_refuses_unpreparable_transports() {
+        let refused = |c: &ReplayController, arch| {
+            matches!(
+                qwen4_retained_admission(c, arch, Admission::Admitted),
+                Admission::Refused { .. }
+            )
+        };
+        let (aql, pm4) = (
+            ReplayController::new_manual_aql(),
+            ReplayController::new_manual_pm4(),
+        );
+        assert!(refused(&aql, "gfx1151") && refused(&aql, "gfx1201"));
+        assert!(refused(&pm4, "gfx1151") && refused(&pm4, "gfx1100"));
+        assert!(!refused(&pm4, "gfx1201"));
+        assert_eq!(
+            qwen4_retained_admission(&aql, "gfx1151", Admission::DiagnosticCapture),
+            Admission::DiagnosticCapture
+        );
+    }
 
     #[test]
     fn ar_launch_truth_table() {

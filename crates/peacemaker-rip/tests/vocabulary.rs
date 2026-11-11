@@ -175,7 +175,7 @@ fn add_range_preserves_checked_allocator_refusals() {
     for (declarations, expected) in [
         (
             r#"p.add_range("bad", "v", 0, 3, Live::Whole)?;"#,
-            "register width must be 1, 2, 4 or 8",
+            "register width must be 1, 2, 4 or 8 (16 for AGPRs)",
         ),
         (
             r#"p.add_range("bad", "s", 1, 2, Live::Whole)?;"#,
@@ -660,7 +660,7 @@ fn string_mappings_and_wmma_shapes_reject_unknown_values() {
             false,
         ),
         Arch::Gfx1201,
-        "add_range: unknown register kind `V` (expected v, s)",
+        "add_range: unknown register kind `V` (expected v, s, a)",
     );
     refuses(
         &kernel(r#"b.barrier_with_scope(&[], "device")?;"#),

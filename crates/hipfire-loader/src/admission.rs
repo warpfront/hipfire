@@ -342,6 +342,185 @@ pub(crate) fn qwen4_native_mtp_for_head(
     }
 }
 
+/// Whether the base's metadata declares `qwen4_recipe.id == "stock-fp8"`.
+pub(crate) fn stock_fp8_base(hfq: &hipfire_runtime::hfq::HfqFile) -> bool {
+    serde_json::from_str::<serde_json::Value>(&hfq.metadata_json)
+        .ok()
+        .and_then(|meta| {
+            meta.pointer("/qwen4_recipe/id")
+                .and_then(|id| id.as_str().map(|id| id == "stock-fp8"))
+        })
+        .unwrap_or(false)
+}
+
+/// What the §7.1 policy table decided for one load.
+#[derive(Debug)]
+pub struct StockMtpDecision<T> {
+    /// The bound sidecar to attach (`None` = AR).
+    pub sidecar: Option<T>,
+    /// L1 `REFUSED` line (auto, bind failed).
+    pub refused: Option<String>,
+}
+
+impl<T> StockMtpDecision<T> {
+    fn ar() -> Self {
+        Self {
+            sidecar: None,
+            refused: None,
+        }
+    }
+}
+
+/// The §7.1 table with the filesystem passed in. `off` calls neither closure (never
+/// stats, never opens); `auto` stats the sidecar and, only when it exists, binds it
+/// (bound = attach, bind failed = L1 REFUSED line and AR); `on` refuses
+/// R1 (absent) or R2 (bind failed) before any allocation.
+pub(crate) fn stock_mtp_decision<T>(
+    mode: hipfire_config::MtpMode,
+    path: &std::path::Path,
+    exists: impl FnOnce() -> bool,
+    bind: impl FnOnce() -> Result<T, String>,
+) -> Result<StockMtpDecision<T>, String> {
+    use hipfire_config::MtpMode;
+    match mode {
+        MtpMode::Off => Ok(StockMtpDecision::ar()),
+        MtpMode::Auto => {
+            if !exists() {
+                return Ok(StockMtpDecision::ar());
+            }
+            Ok(match bind() {
+                Ok(bound) => StockMtpDecision {
+                    sidecar: Some(bound),
+                    ..StockMtpDecision::ar()
+                },
+                Err(reason) => StockMtpDecision {
+                    refused: Some(
+                        hipfire_arch_qwen4::stock_mtp_sidecar::stock_mtp_refusal_line(
+                            path, &reason,
+                        ),
+                    ),
+                    ..StockMtpDecision::ar()
+                },
+            })
+        }
+        MtpMode::On => {
+            if !exists() {
+                return Err(format!(
+                    "qwen4: native MTP (--spec mtp) needs the stock-FP8 MTP head sidecar {}, which does not \
+                     exist; build it with `hipfire-quantize --recipe stock-fp8-mtp-sidecar --input <fp8-checkpoint-dir> --base <model>` \
+                     (2.70 GB) or leave speculation.mtp unset",
+                    path.display()
+                ));
+            }
+            match bind() {
+                Ok(bound) => Ok(StockMtpDecision {
+                    sidecar: Some(bound),
+                    ..StockMtpDecision::ar()
+                }),
+                Err(reason) => Err(format!(
+                    "qwen4: native MTP (--spec mtp) refused: stock-FP8 MTP sidecar {}: {reason}; rebuild it \
+                     against this base or leave speculation.mtp unset",
+                    path.display()
+                )),
+            }
+        }
+    }
+}
+
+/// Resolve the stock-FP8 head sidecar beside `hfq`'s own path. A base that is not the
+/// stock-FP8 recipe never has one.
+pub fn resolve_stock_mtp_sidecar(
+    hfq: &hipfire_runtime::hfq::HfqFile,
+    spec_mtp: Option<bool>,
+) -> Result<StockMtpDecision<hipfire_arch_qwen4::stock_mtp_sidecar::BoundStockMtpSidecar>, String> {
+    let mode = hipfire_config::MtpMode::from_tri_state(spec_mtp);
+    if mode == hipfire_config::MtpMode::Off || !stock_fp8_base(hfq) {
+        return Ok(StockMtpDecision::ar());
+    }
+    let path = hipfire_arch_qwen4::stock_mtp_sidecar::qwen4_stock_mtp_sidecar_path(hfq.path());
+    stock_mtp_decision(
+        mode,
+        &path,
+        || std::fs::metadata(&path).is_ok(),
+        || hipfire_arch_qwen4::stock_mtp_sidecar::bind_stock_mtp_sidecar(hfq, &path),
+    )
+}
+
+/// The sidecar index sha256 admission bound for each model path (`None` = AR), so the
+/// carrier can refuse a sidecar that changed in between (R7).
+static ADMITTED_STOCK_MTP: std::sync::Mutex<
+    Option<std::collections::BTreeMap<std::path::PathBuf, Option<[u8; 32]>>>,
+> = std::sync::Mutex::new(None);
+
+pub(crate) fn record_admitted_stock_mtp(model: &std::path::Path, index_sha256: Option<[u8; 32]>) {
+    ADMITTED_STOCK_MTP
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(model.to_path_buf(), index_sha256);
+}
+
+/// R7 against the admission record for `model` (no record = no admission ran here).
+pub(crate) fn check_admitted_stock_mtp(
+    model: &std::path::Path,
+    sidecar_path: &std::path::Path,
+    bound: Option<[u8; 32]>,
+) -> Result<(), String> {
+    let admitted = ADMITTED_STOCK_MTP
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .and_then(|map| map.get(model).copied());
+    match admitted {
+        Some(admitted) => stock_mtp_r7(sidecar_path, admitted, bound),
+        None => Ok(()),
+    }
+}
+
+/// R7: the sidecar the carrier bound differs from the one admission bound.
+pub(crate) fn stock_mtp_r7(
+    path: &std::path::Path,
+    admitted: Option<[u8; 32]>,
+    bound: Option<[u8; 32]>,
+) -> Result<(), String> {
+    if admitted == bound {
+        return Ok(());
+    }
+    let hex = |sha: Option<[u8; 32]>| {
+        sha.map_or_else(
+            || "none".to_string(),
+            |sha| sha.iter().map(|byte| format!("{byte:02x}")).collect(),
+        )
+    };
+    Err(format!(
+        "qwen4: stock-FP8 MTP sidecar {} changed between admission and load (index sha256 {} -> {}); reload",
+        path.display(),
+        hex(admitted),
+        hex(bound)
+    ))
+}
+
+/// The cache-domain identity of an attached head: a session or prefix snapshot taken
+/// with one head is never served under another head or under none.
+pub(crate) fn stock_mtp_domain_digest(
+    index_sha256: &[u8; 32],
+) -> hipfire_runtime::serve_contract::Digest {
+    hipfire_runtime::serve_contract::sha256_len_prefixed(&[
+        b"qwen4-mtp-sidecar",
+        index_sha256.as_slice(),
+    ])
+}
+
+/// Push [`stock_mtp_domain_digest`] into `sidecar_digests` iff the head is attached.
+pub(crate) fn push_stock_mtp_domain_digest(
+    sidecar_digests: &mut Vec<hipfire_runtime::serve_contract::Digest>,
+    index_sha256: Option<&[u8; 32]>,
+) {
+    if let Some(index_sha256) = index_sha256 {
+        sidecar_digests.push(stock_mtp_domain_digest(index_sha256));
+    }
+}
+
 /// Sidecar PLE rows (`memory.ple_format`), the hot-row store
 /// (`memory.ple_hot_store_bytes`), the prewarm and the rank table are
 /// Flash-Next-only: a developer profile reads its embedded rows directly.  An
@@ -519,6 +698,16 @@ pub struct Qwen4SourceAdmission {
     pub modality: InputModality,
     pub native_mtp: bool,
     pub manifest_source_tensors: usize,
+    /// The stock-FP8 MTP head sidecar that bound at admission (`None` = AR only).
+    pub mtp_sidecar: Option<Qwen4MtpSidecarAdmission>,
+}
+
+/// Path and index sha256 of the sidecar admission bound; the carrier rebinds and
+/// must see the same index sha256 (R7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qwen4MtpSidecarAdmission {
+    pub path: std::path::PathBuf,
+    pub index_sha256: [u8; 32],
 }
 
 /// Refuse unsupported Qwen4 request dimensions before touching source records.
@@ -1000,8 +1189,26 @@ pub fn admit_qwen4_source(
     let ModelSource::Hfq(hfq) = source else {
         return Err(QWEN4_SAFETENSORS_REFUSAL.into());
     };
-    let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(hfq, Some(gpu_arch))
-        .map_err(|error| error.to_string())?;
+    // §7.1: the stock-FP8 head sidecar is resolved before artifact admission and only
+    // when the base is the stock-FP8 recipe. `off` never touches the filesystem.
+    let decision = resolve_stock_mtp_sidecar(hfq, spec_mtp)?;
+    if let Some(refused) = &decision.refused {
+        eprintln!("{refused}");
+    }
+    let mtp_sidecar = decision.sidecar;
+    if stock_fp8_base(hfq) {
+        record_admitted_stock_mtp(
+            hfq.path(),
+            mtp_sidecar.as_ref().map(|bound| bound.index_sha256),
+        );
+    }
+    let receipt = hipfire_arch_qwen4::artifact::admit_hfqm_artifact_with(
+        hfq,
+        Some(gpu_arch),
+        hipfire_arch_qwen4::weights::trunk_shard::trunk_shard_drops_mtp_head(),
+        mtp_sidecar.as_ref(),
+    )
+    .map_err(|error| error.to_string())?;
     // An inventory-valid developer profile the executor cannot run (a
     // synthetic MoE, a RoPE base the QSA kernels lack, a build without
     // `qwen4-dev-profiles`) is refused here, not after the weights upload.
@@ -1035,6 +1242,7 @@ pub fn admit_qwen4_source(
         effective_mesh,
         native_mtp,
         host_mapped_experts && receipt.recipe().fp8_experts(),
+        mtp_sidecar.is_some(),
     )
     .map_err(|error| error.to_string())?;
     qwen4_developer_ple_policy(
@@ -1049,6 +1257,10 @@ pub fn admit_qwen4_source(
         modality,
         native_mtp,
         manifest_source_tensors: receipt.source_tensor_count,
+        mtp_sidecar: mtp_sidecar.as_ref().map(|bound| Qwen4MtpSidecarAdmission {
+            path: bound.path.clone(),
+            index_sha256: bound.index_sha256,
+        }),
     })
 }
 
@@ -3867,10 +4079,17 @@ mod tests {
         );
         // A `.mq4r` load on a retained-default GPU is the retained AR route.
         assert_eq!(
-            qwen4_native_mtp(with(None), "gfx1151", mq4r, 1, 1, 1),
+            qwen4_native_mtp(with(None), "gfx1201", mq4r, 1, 1, 1),
             Ok(false)
         );
-        assert!(qwen4_native_mtp(with(Some(true)), "gfx1151", mq4r, 1, 1, 1).is_err());
+        assert!(qwen4_native_mtp(with(Some(true)), "gfx1201", mq4r, 1, 1, 1).is_err());
+        // gfx1100/gfx1151 never retain Qwen4 (HIPF-254): the head stays on.
+        for gpu_arch in ["gfx1100", "gfx1151"] {
+            assert_eq!(
+                qwen4_native_mtp(with(None), gpu_arch, mq4r, 1, 1, 1),
+                Ok(true)
+            );
+        }
         // Off the retained-default GPUs the name does not claim the load.
         assert_eq!(
             qwen4_native_mtp(with(None), "gfx1030", mq4r, 1, 1, 1),
@@ -7414,5 +7633,153 @@ mod qwen4_pp_admission_tests {
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_dir(path.parent().unwrap());
         }
+    }
+}
+
+#[cfg(test)]
+mod stock_mtp_policy_tests {
+    use super::*;
+    use hipfire_config::MtpMode;
+    use std::cell::Cell;
+    use std::path::Path;
+
+    const P: &str = "/unreadable/model.hfq.mtp";
+
+    /// Run one cell of the §7.1 table; returns the decision and how often each
+    /// closure ran (`exists`, `bind`).
+    fn cell(
+        mode: MtpMode,
+        present: bool,
+        binds: bool,
+    ) -> (Result<StockMtpDecision<u8>, String>, u32, u32) {
+        let stats = Cell::new(0u32);
+        let opens = Cell::new(0u32);
+        let decision = stock_mtp_decision(
+            mode,
+            Path::new(P),
+            || {
+                stats.set(stats.get() + 1);
+                present
+            },
+            || {
+                opens.set(opens.get() + 1);
+                if binds {
+                    Ok(7u8)
+                } else {
+                    Err("tensor x: payload sha256 a differs from the manifest's b".to_string())
+                }
+            },
+        );
+        (decision, stats.get(), opens.get())
+    }
+
+    #[test]
+    fn off_never_stats_or_opens_even_for_an_unreadable_path() {
+        for (present, binds) in [(false, false), (true, true), (true, false)] {
+            let (decision, stats, opens) = cell(MtpMode::Off, present, binds);
+            let decision = decision.unwrap();
+            assert!(decision.sidecar.is_none());
+            assert!(decision.refused.is_none());
+            assert_eq!((stats, opens), (0, 0));
+        }
+        // The resolver short-circuits `off` before computing the path at all.
+        assert_eq!(
+            MtpMode::from_tri_state(Some(false)),
+            MtpMode::Off,
+            "--spec off lowers to the off row"
+        );
+    }
+
+    #[test]
+    fn auto_attaches_a_bound_sidecar_logs_l1_on_bind_failure_and_is_silent_when_absent() {
+        // Absent: AR, silent, stat once, never opened.
+        let (absent, stats, opens) = cell(MtpMode::Auto, false, false);
+        let absent = absent.unwrap();
+        assert!(absent.sidecar.is_none() && absent.refused.is_none());
+        assert_eq!((stats, opens), (1, 0));
+        // Present and binds: attach, no REFUSED line.
+        let (bound, _, opens) = cell(MtpMode::Auto, true, true);
+        let bound = bound.unwrap();
+        assert_eq!(bound.sidecar, Some(7));
+        assert!(bound.refused.is_none());
+        assert_eq!(opens, 1);
+        // Present, bind fails: AR plus the L1 REFUSED line.
+        let (failed, _, _) = cell(MtpMode::Auto, true, false);
+        let failed = failed.unwrap();
+        assert!(failed.sidecar.is_none());
+        let line = failed.refused.unwrap();
+        assert!(
+            line.contains("REFUSED") && line.contains(P) && line.contains("AR only"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn on_refuses_r1_when_absent_and_r2_when_the_bind_fails_else_attaches() {
+        let (absent, _, opens) = cell(MtpMode::On, false, false);
+        let r1 = absent.unwrap_err();
+        assert!(
+            r1.starts_with("qwen4: native MTP (--spec mtp) needs the stock-FP8 MTP head sidecar")
+                && r1.contains(P)
+                && r1.contains("which does not exist")
+                && r1.contains("--recipe stock-fp8-mtp-sidecar"),
+            "{r1}"
+        );
+        assert_eq!(opens, 0);
+        let (failed, _, _) = cell(MtpMode::On, true, false);
+        let r2 = failed.unwrap_err();
+        assert!(
+            r2.starts_with("qwen4: native MTP (--spec mtp) refused: stock-FP8 MTP sidecar")
+                && r2.contains(P)
+                && r2.contains("payload sha256 a differs")
+                && r2.ends_with("rebuild it against this base or leave speculation.mtp unset"),
+            "{r2}"
+        );
+        let (bound, _, opens) = cell(MtpMode::On, true, true);
+        assert_eq!(bound.unwrap().sidecar, Some(7));
+        assert_eq!(opens, 1);
+    }
+
+    #[test]
+    fn r7_names_both_index_digests() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        assert!(stock_mtp_r7(Path::new(P), Some(a), Some(a)).is_ok());
+        assert!(stock_mtp_r7(Path::new(P), None, None).is_ok());
+        let error = stock_mtp_r7(Path::new(P), Some(a), Some(b)).unwrap_err();
+        assert!(
+            error.contains(P)
+                && error.contains("changed between admission and load")
+                && error.contains(&"01".repeat(32))
+                && error.contains(&format!("{} -> {}", "01".repeat(32), "02".repeat(32)))
+                && error.ends_with("; reload"),
+            "{error}"
+        );
+        assert!(stock_mtp_r7(Path::new(P), Some(a), None)
+            .unwrap_err()
+            .contains("-> none"));
+    }
+
+    #[test]
+    fn cache_domain_digest_is_pushed_iff_the_head_is_attached() {
+        let index = [9u8; 32];
+        let mut digests = vec![vec![1u8]];
+        push_stock_mtp_domain_digest(&mut digests, None);
+        assert_eq!(digests, vec![vec![1u8]]);
+        push_stock_mtp_domain_digest(&mut digests, Some(&index));
+        assert_eq!(digests.len(), 2);
+        assert_eq!(
+            digests[1],
+            hipfire_runtime::serve_contract::sha256_len_prefixed(&[
+                b"qwen4-mtp-sidecar".as_slice(),
+                index.as_slice()
+            ])
+        );
+        let mut other = Vec::new();
+        push_stock_mtp_domain_digest(&mut other, Some(&[8u8; 32]));
+        assert_ne!(
+            other[0], digests[1],
+            "a different head is a different domain"
+        );
     }
 }

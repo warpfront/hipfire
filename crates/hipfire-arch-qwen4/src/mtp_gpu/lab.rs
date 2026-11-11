@@ -131,3 +131,21 @@ impl MtpGpuState {
         Ok(())
     }
 }
+
+impl Qwen4MtpGpu {
+    /// The head's last one-row stock-FP8 MoE routing (raw router logits, top-k
+    /// ids and weights; exact semantics on [`LabHeadRouting`]), downloaded
+    /// after the active stream's pending work. `None` unless the head carries
+    /// the stock-FP8 grouped MoE scratch. Only a head Predict step writes it,
+    /// so call it right after the Predict step of interest.
+    pub fn lab_fp8_head_routing(
+        &self,
+        gpu: &Gpu,
+        config: &Qwen4Config,
+    ) -> Result<Option<LabHeadRouting>, MtpGpuError> {
+        self.fp8_moe
+            .as_ref()
+            .map(|fp8| fp8.lab_read_routing(gpu, config))
+            .transpose()
+    }
+}

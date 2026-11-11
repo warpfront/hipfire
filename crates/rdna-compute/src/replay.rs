@@ -73,6 +73,17 @@ enum Pm4Architecture {
     Gfx12,
 }
 
+/// What a model's retained tape is known to need from the transport, declared
+/// up front so [`ReplayController::transport_refusal`] can refuse before recording.
+#[derive(Clone, Copy, Debug)]
+pub struct RetainedTapeNeeds {
+    /// Kernargs derived from the decode position (rebinding needs PM4).
+    pub position_kernargs: bool,
+    /// Not validated on GFX10/GFX11 PM4 (scratch kernels, or decode parity vs HIP
+    /// not yet shown).
+    pub gfx10_11_pm4_unvalidated: bool,
+}
+
 /// Per-stream producer/consumer visibility for legacy (gfx10/gfx11) PM4 IBs.
 ///
 /// `CsPartialFlush` retains the historical EVENT_WRITE path. `ReleaseWait` is
@@ -384,7 +395,8 @@ impl Pm4Commands {
                 }
                 .with_dispatch_initiator_policy(dispatch_initiator_policy)
                 .with_dispatch_interleave(dispatch_interleave)
-                .with_resource_limits_policy(resource_limits_policy);
+                .with_resource_limits_policy(resource_limits_policy)
+                .with_gfx11_cwsr_priv(gfx11_cwsr_priv(architecture));
                 Self::Legacy {
                     architecture,
                     commands,
@@ -3460,6 +3472,125 @@ fn gfx1100_experiment_alias(architecture: Pm4Architecture, device_name: &str) ->
     }
 }
 
+/// GFX11 raw-PM4 dispatches must set `COMPUTE_PGM_RSRC1.PRIV` (bit 20) for
+/// CWSR. The AQL dispatch microcode sets it implicitly; without it a queue
+/// preemption (CWSR save/restore) during a retained PM4 dispatch faulted on
+/// gfx1100 with an SQC page-0 read (see
+/// docs/investigations/2026-10-29-gfx11-pm4-cwsr-priv.md).
+///
+/// Negative control (test-only, default off):
+/// `HIPFIRE_DEBUG_PM4_NO_CWSR_PRIV=1` leaves the bit clear on GFX11 so the
+/// fault can be reproduced against the same build.
+fn gfx11_cwsr_priv(architecture: Pm4Architecture) -> bool {
+    if architecture != Pm4Architecture::Gfx11 {
+        return false;
+    }
+    if hipfire_config::process_value("HIPFIRE_DEBUG_PM4_NO_CWSR_PRIV").as_deref() == Some("1") {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            eprintln!("[redline] DEBUG negative control: gfx11 COMPUTE_PGM_RSRC1.PRIV not set")
+        });
+        return false;
+    }
+    true
+}
+
+/// DEBUG (test-only, default off): `HIPFIRE_DEBUG_FORCE_EVICT_MS=N` starts one
+/// background thread, on the first PM4 replay, that registers a 2 MiB
+/// anonymous host buffer with `hipHostRegister` (a KFD userptr BO) and every
+/// N ms drops and re-faults one of its pages (`madvise(MADV_DONTNEED)` plus a
+/// write). Each drop fires the userptr MMU notifier, so KFD evicts (preempts,
+/// CWSR-saves) and later restores every queue of the process. It drives the
+/// queue-preemption path without a profiler; it is a repro aid, not a
+/// production setting.
+fn debug_force_evict_start() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let Some(ms) = hipfire_config::process_value("HIPFIRE_DEBUG_FORCE_EVICT_MS")
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+    else {
+        return;
+    };
+    ONCE.call_once(move || {
+        unsafe extern "C" {
+            fn dlopen(name: *const std::ffi::c_char, flags: i32) -> *mut std::ffi::c_void;
+            fn dlsym(
+                h: *mut std::ffi::c_void,
+                name: *const std::ffi::c_char,
+            ) -> *mut std::ffi::c_void;
+            fn mmap(
+                addr: *mut std::ffi::c_void,
+                len: usize,
+                prot: i32,
+                flags: i32,
+                fd: i32,
+                offset: i64,
+            ) -> *mut std::ffi::c_void;
+            fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+        }
+        const PROT_READ_WRITE: i32 = 0x1 | 0x2;
+        const MAP_PRIVATE_ANONYMOUS: i32 = 0x02 | 0x20;
+        const RTLD_LAZY_NOLOAD: i32 = 0x1 | 0x4;
+        const MADV_DONTNEED: i32 = 4;
+        let len: usize = 2 << 20;
+        let buf = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                len,
+                PROT_READ_WRITE,
+                MAP_PRIVATE_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if buf as isize == -1 {
+            eprintln!("[force-evict] mmap failed");
+            return;
+        }
+        unsafe { std::ptr::write_bytes(buf as *mut u8, 1, len) };
+        // The HIP runtime is already loaded by the time a PM4 replay runs.
+        let handle = [c"libamdhip64.so", c"libamdhip64.so.6", c"libamdhip64.so.7"]
+            .iter()
+            .map(|name| unsafe { dlopen(name.as_ptr(), RTLD_LAZY_NOLOAD) })
+            .find(|h| !h.is_null());
+        let Some(handle) = handle else {
+            eprintln!("[force-evict] libamdhip64 not loaded");
+            return;
+        };
+        let register = unsafe { dlsym(handle, c"hipHostRegister".as_ptr()) };
+        if register.is_null() {
+            eprintln!("[force-evict] hipHostRegister missing");
+            return;
+        }
+        let register: unsafe extern "C" fn(*mut std::ffi::c_void, usize, u32) -> i32 =
+            unsafe { std::mem::transmute(register) };
+        let status = unsafe { register(buf, len, 0) };
+        eprintln!("[force-evict] hipHostRegister({len} B) status={status} period={ms} ms");
+        if status != 0 {
+            return;
+        }
+        let addr = buf as usize;
+        std::thread::Builder::new()
+            .name("force-evict".into())
+            .spawn(move || {
+                let mut drops: u64 = 0;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                    let page = addr + ((drops as usize % 512) << 12);
+                    unsafe {
+                        madvise(page as *mut std::ffi::c_void, 4096, MADV_DONTNEED);
+                        std::ptr::write_volatile(page as *mut u8, 1);
+                    }
+                    drops += 1;
+                    if drops.is_multiple_of(1000) {
+                        eprintln!("[force-evict] {drops} drops");
+                    }
+                }
+            })
+            .ok();
+    });
+}
+
 fn gfx10_dispatch_initiator_policy(
     architecture: Pm4Architecture,
     device_name: &str,
@@ -5315,6 +5446,7 @@ impl PreparedPm4Replay {
                 });
             }
         }
+        debug_force_evict_start();
         let patch_started = crate::gap_timing::now();
         // Patch typed kernarg bindings while queue is quiescent.
         // Single code path shared with recorded-HIP replay: both transports
@@ -8458,6 +8590,33 @@ impl ReplayController {
         self.transport == ReplayTransport::Pm4Ib
     }
 
+    /// Why this transport cannot prepare a retained tape with `needs` on `arch`,
+    /// known before anything records. A model refuses at arm time on `Some` so
+    /// the arming forward runs on plain HIP instead of on the recorded route
+    /// (a prepare that fails after recording leaves that forward's output).
+    pub fn transport_refusal(&self, arch: &str, needs: RetainedTapeNeeds) -> Option<&'static str> {
+        match self.transport {
+            ReplayTransport::AqlPackets if needs.position_kernargs => Some(
+                "linear AQL cannot rebind the position-derived kernargs of this tape (it needs PM4)",
+            ),
+            ReplayTransport::AqlPackets => None,
+            ReplayTransport::Pm4Ib => match Pm4Architecture::from_name(arch) {
+                Err(_) => Some("retained PM4 has no register map for this arch"),
+                // ponytail: lift Gfx11 with HIPF-254 (after HIPF-253 gfx11 scratch);
+                // Gfx10 stays until gfx10 PM4 scratch exists.
+                Ok(Pm4Architecture::Gfx10 | Pm4Architecture::Gfx11)
+                    if needs.gfx10_11_pm4_unvalidated =>
+                {
+                    Some(
+                        "GFX10/GFX11 PM4 replay of this tape is unvalidated (scratch dispatch: \
+                         HIPF-253; decode parity vs HIP: HIPF-254)",
+                    )
+                }
+                Ok(_) => None,
+            },
+        }
+    }
+
     /// Whether the *current forward* is inside the retained body: the controller
     /// would record this forward into the tape, or route it through a prepared
     /// plan.
@@ -9132,6 +9291,30 @@ mod tests {
         // The Legacy arch gate is untouched: the gfx11 flag path still
         // reports false on gfx12 even when configured.
         assert!(!pm4_vmem_acquire_arch_enabled(Pm4Architecture::Gfx12, true));
+    }
+
+    #[test]
+    fn transport_refusal_is_known_before_recording() {
+        let qwen4 = RetainedTapeNeeds {
+            position_kernargs: true,
+            gfx10_11_pm4_unvalidated: true,
+        };
+        let plain = RetainedTapeNeeds {
+            position_kernargs: false,
+            gfx10_11_pm4_unvalidated: false,
+        };
+        let mut c = ReplayController::new(ReplayBackendRequest::Auto);
+        c.transport = ReplayTransport::AqlPackets;
+        assert!(c.transport_refusal("gfx1201", qwen4).is_some());
+        assert!(c.transport_refusal("gfx1151", plain).is_none());
+        c.transport = ReplayTransport::Pm4Ib;
+        for arch in ["gfx1151", "gfx1100", "gfx1030"] {
+            assert!(c.transport_refusal(arch, qwen4).is_some(), "{arch}");
+            assert!(c.transport_refusal(arch, plain).is_none(), "{arch}");
+        }
+        assert!(c.transport_refusal("gfx1201", qwen4).is_none());
+        // No PM4 register map: prepare would fail after recording.
+        assert!(c.transport_refusal("gfx942", plain).is_some());
     }
 
     #[test]

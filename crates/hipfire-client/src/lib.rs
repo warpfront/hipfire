@@ -70,6 +70,16 @@ pub mod error_class {
 pub enum ClientError {
     #[error("daemon binary not found: {0}")]
     MissingDaemon(PathBuf),
+    #[error(
+        "daemon at {path} reports build {daemon_commit} but this client was built from {client_commit}: \
+         a mixed install. Both binaries must come from one hipfire home - re-run `hipfire setup` \
+         or point HIPFIRE_HOME/PATH at a single install"
+    )]
+    DaemonBuildMismatch {
+        path: PathBuf,
+        daemon_commit: String,
+        client_commit: String,
+    },
     #[error("failed to spawn daemon {path}: {source}")]
     Spawn {
         path: PathBuf,
@@ -688,6 +698,89 @@ struct EngineInner {
 /// process owns and nothing else on the machine.
 static OWNED_DAEMONS: Mutex<Vec<Weak<EngineInner>>> = Mutex::new(Vec::new());
 
+/// Workspace HEAD this client crate was compiled from (`build.rs` stamps it
+/// the same way `hipfire-cli` stamps its own; `unknown` outside a repo).
+const CLIENT_BUILD_COMMIT: &str = env!("HIPFIRE_BUILD_COMMIT");
+
+/// The commit from a `hipfire-daemon <version> <full build commit>` version
+/// line; `None` for anything else (the daemon answers `--version` with
+/// exactly this shape before any GPU or IPC work).
+fn daemon_commit_from_version_line(line: &str) -> Option<&str> {
+    let mut parts = line.trim().split_whitespace();
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("hipfire-daemon"), Some(_version), Some(commit)) if !commit.is_empty() => {
+            Some(commit)
+        }
+        _ => None,
+    }
+}
+
+/// Refuse a daemon binary from a different build before speaking to it.
+///
+/// A mixed install (a CLI from one tree driving a daemon from another) used to
+/// surface as an arbitrary daemon startup failure - on this reporting host, a
+/// newer CLI sent `serve.multi_slot_max_sessions` and the older daemon died
+/// with `FATAL: failed to resolve startup configuration: unknown
+/// configuration key`, naming neither the cause nor the fix. The probe runs
+/// the daemon's `--version` (answered before process init) and fails only on
+/// a positive mismatch: an unparseable answer, a spawn failure, or an
+/// `unknown` stamp on either side passes, so dev fixtures and override-built
+/// binaries are unaffected.
+fn check_daemon_build_matches(daemon: &Path) -> Result<()> {
+    if CLIENT_BUILD_COMMIT == "unknown" {
+        return Ok(());
+    }
+    let mut child = match std::process::Command::new(daemon)
+        .arg("--version")
+        // A daemon fixture that reads stdin must see EOF, not this caller's
+        // pipes; the real daemon answers before touching stdin anyway.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return Ok(()),
+    };
+    // The real daemon answers --version before any process init. Anything
+    // still running after the deadline is not a version answer (a fixture
+    // that ignores the flag), not evidence of skew: kill it and pass.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(());
+            }
+        }
+    };
+    if !status.success() {
+        return Ok(());
+    }
+    // The child has exited, so reading its piped stdout cannot block.
+    let mut stdout = String::new();
+    let read = child.stdout.take().map_or(false, |mut pipe| {
+        std::io::Read::read_to_string(&mut pipe, &mut stdout).is_ok()
+    });
+    if !read {
+        return Ok(());
+    }
+    let commit = daemon_commit_from_version_line(&stdout).unwrap_or("");
+    if commit.is_empty() || commit == "unknown" || commit == CLIENT_BUILD_COMMIT {
+        return Ok(());
+    }
+    Err(ClientError::DaemonBuildMismatch {
+        path: daemon.to_owned(),
+        daemon_commit: commit.to_owned(),
+        client_commit: CLIENT_BUILD_COMMIT.to_owned(),
+    })
+}
+
 impl EngineInner {
     /// Kill the daemon if it still runs and reap it. `wait` returns only once
     /// the kernel has finished tearing the process down, and the daemon's
@@ -740,6 +833,7 @@ impl Engine {
         if !daemon.is_file() {
             return Err(ClientError::MissingDaemon(daemon.to_owned()));
         }
+        check_daemon_build_matches(daemon)?;
         let mut command = Command::new(daemon);
         command
             .stdin(Stdio::piped())
@@ -2973,6 +3067,124 @@ done
         config: &hipfire_config::ProcessConfig,
     ) -> Engine {
         Engine::spawn_configured(daemon, &BTreeMap::new(), config, None).unwrap()
+    }
+
+    #[test]
+    fn daemon_version_line_parses_commit_only_in_the_daemon_shape() {
+        assert_eq!(
+            daemon_commit_from_version_line("hipfire-daemon 0.4.4 abc123def456"),
+            Some("abc123def456")
+        );
+        assert_eq!(
+            daemon_commit_from_version_line("hipfire-daemon 0.4.4 unknown"),
+            Some("unknown")
+        );
+        // Not the daemon's line shape, or truncated.
+        assert_eq!(daemon_commit_from_version_line("hipfire 0.4.4 abc"), None);
+        assert_eq!(
+            daemon_commit_from_version_line("hipfire-daemon 0.4.4"),
+            None
+        );
+        assert_eq!(daemon_commit_from_version_line(""), None);
+    }
+
+    /// The client must stamp its build commit through the same build script as
+    /// `hipfire-cli` (which `hipfire-daemon` already shares). A divergent
+    /// script once watched only `.git/HEAD`, which still reads
+    /// `ref: refs/heads/...` after a commit, so the client kept the previous
+    /// commit while the daemon restamped on HEAD and index - and after a
+    /// commit that touched no client sources, every spawn would refuse as a
+    /// mixed install (review of this PR).
+    #[test]
+    fn client_shares_the_cli_build_stamp_source() {
+        let manifest = include_str!("../Cargo.toml");
+        assert!(
+            manifest
+                .lines()
+                .any(|line| line.trim() == "build = \"../hipfire-cli/build.rs\""),
+            "hipfire-client must share hipfire-cli's build script, not stamp its own commit"
+        );
+    }
+
+    /// A daemon that answers `--version` with a different build commit is the
+    /// mixed-install state; the spawn must name it instead of surfacing the
+    /// daemon's own startup failure later. Skipped when the client itself was
+    /// built outside a repo (`unknown` stamp passes everything by design).
+    #[cfg(unix)]
+    #[test]
+    fn mixed_build_daemon_is_refused_with_a_named_cause() {
+        if CLIENT_BUILD_COMMIT == "unknown" {
+            eprintln!("client built without a commit stamp; probe passes by design");
+            return;
+        }
+        let root = env::temp_dir().join(format!(
+            "hipfire_client_mixed_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let daemon = write_fake_daemon(
+            &root,
+            "#!/bin/sh\nprintf 'hipfire-daemon 0.0.0 deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\\n'\n",
+        );
+        let err = match Engine::spawn(&daemon, &BTreeMap::new()) {
+            Err(err) => err,
+            Ok(_) => panic!("a daemon from a different build must be refused"),
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("mixed install"), "{rendered}");
+        assert!(rendered.contains(daemon.to_str().unwrap()), "{rendered}");
+        assert!(rendered.contains("deadbeef"), "{rendered}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An unparseable `--version` answer is not evidence of skew: the probe
+    /// passes and the spawn proceeds to fail (or succeed) for its real reason.
+    /// A daemon that ignores `--version` entirely and blocks (a stdin-reading
+    /// fixture) is killed at the probe deadline and also passes.
+    #[cfg(unix)]
+    #[test]
+    fn unparseable_daemon_version_passes_the_build_probe() {
+        let root = env::temp_dir().join(format!(
+            "hipfire_client_unparseable_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let daemon = write_fake_daemon(
+            &root,
+            "#!/bin/sh\ncase \"$1\" in --version) printf 'not a version line\\n';; esac\nexit 0\n",
+        );
+        match Engine::spawn(&daemon, &BTreeMap::new()) {
+            Err(ClientError::DaemonBuildMismatch { .. }) => {
+                panic!("an unparseable version answer must pass the probe")
+            }
+            _ => {}
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A `--version` that never exits (a fixture that ignores the flag and
+    /// reads stdin forever) is killed at the deadline, not awaited forever.
+    #[cfg(unix)]
+    #[test]
+    fn blocking_daemon_version_probe_times_out_and_passes() {
+        let root = env::temp_dir().join(format!(
+            "hipfire_client_blocking_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let daemon = write_fake_daemon(&root, "#!/bin/sh\nwhile read line; do :; done\n");
+        let started = std::time::Instant::now();
+        match Engine::spawn(&daemon, &BTreeMap::new()) {
+            Err(ClientError::DaemonBuildMismatch { .. }) => {
+                panic!("a blocked version probe must pass, not report skew")
+            }
+            _ => {}
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "probe must not wait on a daemon that ignores --version"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[cfg(unix)]
