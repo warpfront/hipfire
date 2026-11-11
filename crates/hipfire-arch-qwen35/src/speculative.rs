@@ -15882,6 +15882,52 @@ mod dn_stream_tests {
     }
 
     #[test]
+    fn begin_append_restamps_sealed_and_requires_open_cursors_to_agree() {
+        let mut owner = GdnStreamOwner::new(LAYERS, 1, None);
+        owner.bind_recipe(5).unwrap();
+        owner
+            .begin_append(100)
+            .expect("a Sealed stream starts a prefill phase at the call's start");
+        for m in &owner.meta {
+            assert_eq!(m.phase, GdnStreamPhase::Sealed);
+            assert_eq!(
+                (m.position, m.phase_start, m.frame_base, m.tile_base, m.pending_rows),
+                (100, 100, 100, 100, 0)
+            );
+            assert_eq!(m.recipe_id, 5);
+        }
+        open_at(&mut owner, 70, 5);
+        let before = owner.meta.clone();
+        assert!(err_text(owner.begin_append(71)).contains("Open"));
+        assert_eq!(owner.meta, before, "a refused begin mutates nothing");
+        owner.begin_append(70).expect("an Open stream continues at its own cursor");
+        assert!(owner
+            .meta
+            .iter()
+            .all(|m| m.phase == GdnStreamPhase::Open && m.position == 70));
+    }
+
+    #[test]
+    fn commit_candidates_publishes_every_layer_or_none() {
+        let mut owner = GdnStreamOwner::new(LAYERS, 1, None);
+        owner.bind_recipe(5).unwrap();
+        let mut cand = owner.meta[0];
+        cand.phase = GdnStreamPhase::Open;
+        cand.position = 128;
+        cand.frame_base = 0;
+        let before = owner.meta.clone();
+        let mut partial: Vec<Option<_>> = vec![Some(cand); LAYERS];
+        partial[LAYERS - 1] = None;
+        assert!(owner.commit_candidates(&partial).is_err());
+        assert_eq!(owner.meta, before, "an incomplete candidate set publishes nothing");
+        let full: Vec<Option<_>> = vec![Some(cand); LAYERS];
+        owner.commit_candidates(&full).expect("every layer succeeded");
+        assert!(owner.meta.iter().all(|m| m.position == 128
+            && m.phase == GdnStreamPhase::Open
+            && m.owner_generation == owner.generation));
+    }
+
+    #[test]
     fn reset_meta_drops_to_empty_sealed_keeping_recipe_and_bumping_generation() {
         let mut owner = GdnStreamOwner::new(LAYERS, 1, None);
         owner.bind_recipe(5).unwrap();

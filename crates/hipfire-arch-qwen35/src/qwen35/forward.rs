@@ -1770,6 +1770,20 @@ fn ar_graph_binding(
     h.max(1)
 }
 
+/// Decode/verify reads the Q8/EF planes directly; they are authoritative only on a
+/// `Sealed` stream (CHUNK-CANONICAL-DESIGN §3.5). An `Open` ordinary-prefill phase must be
+/// finished by `DeltaNetState::seal_streams` at the actual prompt end first; fail closed
+/// instead of decoding from a stale quantized plane.
+pub(crate) fn refuse_open_gdn_stream(dn_state: &DeltaNetState, site: &str) -> HipResult<()> {
+    if dn_state.stream.is_open() {
+        return Err(HipError::new(
+            0,
+            &format!("{site}: the GDN stream is Open; seal it at the prompt end before decode/verify"),
+        ));
+    }
+    Ok(())
+}
+
 /// Zero-alloc forward pass using pre-allocated scratch buffers.
 /// Logits stay on GPU in scratch.logits. Returns nothing — caller uses scratch.logits.
 pub fn forward_scratch(
@@ -1782,6 +1796,7 @@ pub fn forward_scratch(
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
+    refuse_open_gdn_stream(dn_state, "forward_scratch")?;
     #[cfg(feature = "moe-oracle")]
     crate::qwen35::oracle::set_decode_position(pos).map_err(|e| HipError::new(0, &e))?;
     let required_tokens = checked_kv_end(pos, 1, "forward_scratch")?;
@@ -2428,6 +2443,7 @@ fn forward_scratch_layers(
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
     mrope: Option<&MropeCtx>,
 ) -> HipResult<()> {
+    refuse_open_gdn_stream(dn_state, "forward_scratch_layers")?;
     let ctx = DispatchCtx::new(gpu);
     if let Some(mc) = mrope {
         debug_assert_eq!(
