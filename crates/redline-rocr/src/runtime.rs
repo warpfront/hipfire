@@ -12,7 +12,7 @@ use hipfire_config::emu_budget;
 
 use super::abi;
 use super::packet::{AQL_PACKET_BYTES, KernelMetadata, LaunchGeometry, PacketImage};
-use super::pm4_gfx10_scratch::Gfx10ScratchTopology;
+use super::pm4_gfx10_scratch::{Gfx10Scratch, Gfx10ScratchTopology};
 
 /// Default bound for host-side queue-capacity and completion polling.
 ///
@@ -1487,6 +1487,54 @@ impl AqlQueue {
         Ok(Some(unsafe { self.publish_batch(packets) }))
     }
 
+    /// Make `scratch` this queue's own scratch ring in `amd_queue_t`, the way
+    /// ROCr's `AqlQueue::InitScratchSRD` publishes a ring it allocated.
+    ///
+    /// The command processor reprograms `COMPUTE_TMPRING_SIZE` and the scratch
+    /// base from these fields whenever KFD maps the queue again after an
+    /// eviction (ROCr `AsyncReclaimMainScratch`: "CP will check amd_queue_
+    /// fields on re-map"), replacing what a PM4 IB wrote. A retained PM4 queue
+    /// that leaves ROCr's empty fields stalls after a restore (no scratch
+    /// slots, HIPF-347). ROCr rewrites the fields only from its own scratch
+    /// bookkeeping, which only an AQL kernel dispatch with a private segment
+    /// starts; retained PM4 queues carry barrier and PM4-IB packets only.
+    /// The caller keeps the backing alive for the queue's lifetime.
+    pub fn bind_scratch(&mut self, scratch: &Gfx10Scratch) {
+        // `amd_queue_t` byte offsets (ROCr `inc/amd_hsa_queue.h`, also v2).
+        const COMPUTE_TMPRING_SIZE: usize = 140;
+        const SCRATCH_RESOURCE_DESCRIPTOR: usize = 144;
+        const SCRATCH_BACKING_MEMORY_LOCATION: usize = 160;
+        const SCRATCH_WAVE64_LANE_BYTE_SIZE: usize = 176;
+        let base = scratch.base_address();
+        let queue = self.raw.as_ptr().cast::<u8>();
+        // SAFETY: ROCr's queue object is an `amd_queue_t`, live until Drop;
+        // `&mut self` excludes concurrent publication on this queue.
+        unsafe {
+            let word = |offset: usize| queue.add(offset).cast::<u32>();
+            // Words 1 and 3 keep ROCr's SWIZZLE_ENABLE and format bits.
+            let srd1 = ptr::read_volatile(word(SCRATCH_RESOURCE_DESCRIPTOR + 4));
+            ptr::write_volatile(word(SCRATCH_RESOURCE_DESCRIPTOR), base as u32);
+            ptr::write_volatile(
+                word(SCRATCH_RESOURCE_DESCRIPTOR + 4),
+                (srd1 & 0xffff_0000) | ((base >> 32) as u32 & 0xffff),
+            );
+            ptr::write_volatile(
+                word(SCRATCH_RESOURCE_DESCRIPTOR + 8),
+                scratch.plan().backing_bytes() as u32,
+            );
+            ptr::write_volatile(
+                queue.add(SCRATCH_BACKING_MEMORY_LOCATION).cast::<u64>(),
+                base,
+            );
+            ptr::write_volatile(
+                word(SCRATCH_WAVE64_LANE_BYTE_SIZE),
+                scratch.bytes_per_wave() / 64,
+            );
+            ptr::write_volatile(word(COMPUTE_TMPRING_SIZE), scratch.tmpring_size());
+        }
+        std::sync::atomic::fence(Ordering::Release);
+    }
+
     fn descriptor(&self) -> &abi::Queue {
         // SAFETY: the runtime owns the descriptor until queue_destroy, which
         // only runs from this object's Drop.
@@ -1781,6 +1829,13 @@ impl QueueSet {
 
     pub fn size(&self, lane: usize) -> Option<u32> {
         self.queues.get(lane).map(AqlQueue::size)
+    }
+
+    /// [`AqlQueue::bind_scratch`] on lane `lane`; `None` when out of range.
+    pub fn bind_scratch(&mut self, lane: usize, scratch: &Gfx10Scratch) -> Option<()> {
+        self.queues
+            .get_mut(lane)
+            .map(|queue| queue.bind_scratch(scratch))
     }
 
     /// Read lane `lane`'s effective CU affinity via `AqlQueue::cu_mask`.

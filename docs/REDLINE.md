@@ -282,7 +282,10 @@ AND no drafter is installed
 The `.mq3-xt` decode tape contains `gemv_mq3g256v2_residual`, which has a
 16-byte private segment per lane, so the route needs the GFX10/GFX11 PM4
 scratch rings (`HIPFIRE_PMSCRATCH_PM4_SCRATCH`, default on; at `=0` the prepare
-refuses and the load falls back closed to the HIP graph). Receipts (xtx, qwen3.8-27b
+refuses and the load falls back closed to the HIP graph). Each lane's ring is also
+published in its queue's `amd_queue_t` scratch fields (`QueueSet::bind_scratch`):
+the command processor reloads the scratch registers from there when KFD maps the
+queue again after an eviction, and a queue without them stalls (HIPF-347). Receipts (xtx, qwen3.8-27b
 `.mq3-xt`, served daemon `generate`, driver `tools/redline/serve_identity_ab.py`
 which acks `commit_ready` as `serve` does): greedy token ids identical between
 the retained route (default selection and explicit `redline`), the HIP graph and
