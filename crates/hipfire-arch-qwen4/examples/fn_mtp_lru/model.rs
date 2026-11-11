@@ -1115,8 +1115,6 @@ pub(super) fn run(args: &Args) -> R<Value> {
             .to_string();
         // Both arms reserve K7, while actual native windows below remain K3
         // (or the explicitly requested K). R8 target proof needs no second load.
-        let sizing = SpecTarget::new_spec_scratch(&mut bundle, &mut gpu, 8)?;
-        sizing.free(&mut gpu);
         ensure(
             oracle::dev_effective_row_exact_rows(&bundle, &gpu) >= 8,
             "product load did not admit the requested R8 target proof",
