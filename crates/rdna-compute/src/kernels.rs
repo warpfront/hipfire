@@ -2535,17 +2535,27 @@ pub const GEMV_MQ4G256V2_LUT_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_MQ4G256V2_KERNEL gemv_mq4g256v2_lloyd\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+    include_str!("../../../kernels/src/gemv_mq4g256v2_lloyd.hip")
 );
 /// Residual-epilogue twin of `GEMV_MQ4G256V2_LUT_SRC` (`y +=`, symbol
-/// `gemv_mq4g256v2_residual_lloyd`): dual-row residual body (2 rows/wave,
-/// hoisted float4 x reused across both rows, SRD buffer loads) with the LUT
-/// decode folded in. Same symbol and kernarg ABI as before.
+/// `gemv_mq4g256v2_residual_lloyd`): the single-row Lloyd body, kept for
+/// non-gfx1100 arches (the dual-row body below regressed gfx1151 decode by
+/// ~3%). Lloyd-only source, so the uniform residual pin is untouched.
 pub const GEMV_MQ4G256V2_RESIDUAL_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE 1\n#define HIPFIRE_MQ4G256V2_KERNEL gemv_mq4g256v2_residual_lloyd\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+);
+/// Dual-row residual twin (2 rows/wave, hoisted float4 x reused across both
+/// rows, SRD buffer loads) with the LUT decode folded in. Exact-gfx1100 only
+/// (launcher-gated); same symbol and kernarg ABI as the single-row twin, but
+/// a distinct module so the two never alias.
+pub const GEMV_MQ4G256V2_RESIDUAL_LUT_DUALROW_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE 1\n#define HIPFIRE_RESIDUAL_KERNEL gemv_mq4g256v2_residual_lloyd\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    include_str!("../../../kernels/src/gemv_mq4g256v2_residual.hip")
+    include_str!("../../../kernels/src/gemv_mq4g256v2_residual_lloyd.hip")
 );
 /// MQ5G256V2: dual-scale 5-bit (qt=48). Same 168 B stride and 5-bit payload as MQ5G256, header dual fp16.
 pub const GEMV_MQ5G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq5g256v2.hip");
@@ -7299,7 +7309,7 @@ pub const FUSED_QKVZA_MQ4G256V2_LUT_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_mq4g256v2_lloyd\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    include_str!("../../../kernels/src/fused_qkvza_mq4g256v2.hip")
+    include_str!("../../../kernels/src/fused_qkvza_mq4g256v2_lloyd.hip")
 );
 /// Lloyd LUT + R-hoist_x32 twin (D4): same as `FUSED_QKVZA_MQ4G256V2_LUT_SRC`
 /// plus the plain-float4 x-hoist schedule (K-agnostic; selected for exact
@@ -7308,7 +7318,7 @@ pub const FUSED_QKVZA_MQ4G256V2_LUT_HOIST_X32_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_RDNA3_QKVZA_HOIST_X32 1\n#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_mq4g256v2_lloyd_hoist_x32_gfx1100\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    include_str!("../../../kernels/src/fused_qkvza_mq4g256v2.hip")
+    include_str!("../../../kernels/src/fused_qkvza_mq4g256v2_lloyd.hip")
 );
 pub const FUSED_QKVZA_MQ4G256V2_K2048_HOIST_X32_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_RDNA3_QKVZA_K2048 1\n",
@@ -7652,7 +7662,7 @@ pub const FUSED_QKV_MQ4G256V2_LUT_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_mq4g256v2_lloyd\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    include_str!("../../../kernels/src/fused_qkv_mq4g256v2.hip")
+    include_str!("../../../kernels/src/fused_qkv_mq4g256v2_lloyd.hip")
 );
 pub const FUSED_QKV_MQ5G256V2_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
@@ -8555,7 +8565,7 @@ pub const FUSED_GATE_UP_MQ4G256V2_LUT_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_FUSED_GATE_UP_KERNEL fused_gate_up_mq4g256v2_lloyd\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    include_str!("../../../kernels/src/fused_gate_up_mq4g256v2.hip")
+    include_str!("../../../kernels/src/fused_gate_up_mq4g256v2_lloyd.hip")
 );
 pub const FUSED_GATE_UP_MQ5G256V2_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",

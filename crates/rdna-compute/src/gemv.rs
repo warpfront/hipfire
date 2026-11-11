@@ -13050,9 +13050,12 @@ impl Gpu {
         result
     }
 
-    /// MQ4G256V2-Lloyd (qt=52) residual GEMV (`y +=`): LUT twin over the
-    /// dual-row residual body (2 rows/wave, `row0 = blockIdx.x << 1`;
-    /// grid is `m.div_ceil(2)` so no empty exiting blocks launch).
+    /// MQ4G256V2-Lloyd (qt=52) residual GEMV (`y +=`): LUT twin. Exact
+    /// gfx1100 takes the dual-row residual body (2 rows/wave,
+    /// `row0 = blockIdx.x << 1`; grid is `m.div_ceil(2)` so no empty exiting
+    /// blocks launch); every other arch keeps the single-row body (the
+    /// dual-row body regressed gfx1151 decode ~3%). Distinct modules so the
+    /// two never alias; same symbol and kernarg ABI.
     pub fn gemv_hfq4g256_residual_mq4v2_lloyd(
         &mut self,
         a_raw: &GpuTensor,
@@ -13072,14 +13075,23 @@ impl Gpu {
             ));
         }
         // No multirow LUT variant exists (fail-open to uniform multirow would
-        // decode on the wrong grid); the dual-row residual body covers two
-        // rows per wave, so the grid is halved (odd M exits cleanly).
+        // decode on the wrong grid). Exact gfx1100 covers two rows per wave
+        // with the dual-row body (odd M exits cleanly); other arches keep the
+        // single-row body.
+        let dual_row = self.arch == "gfx1100";
+        let (module, src) = if dual_row {
+            (
+                "gemv_mq4g256v2_residual_lloyd_dualrow",
+                kernels::GEMV_MQ4G256V2_RESIDUAL_LUT_DUALROW_SRC,
+            )
+        } else {
+            (
+                "gemv_mq4g256v2_residual_lloyd",
+                kernels::GEMV_MQ4G256V2_RESIDUAL_LUT_SRC,
+            )
+        };
         let func_name = "gemv_mq4g256v2_residual_lloyd";
-        self.ensure_kernel(
-            func_name,
-            kernels::GEMV_MQ4G256V2_RESIDUAL_LUT_SRC,
-            func_name,
-        )?;
+        self.ensure_kernel(module, src, func_name)?;
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
         let mut y_ptr = y.buf.as_ptr();
@@ -13110,9 +13122,10 @@ impl Gpu {
         ];
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemv", func_name, bytes);
+        let grid = if dual_row { m.div_ceil(2) } else { m };
         let result = self.launch_maybe_blob(
             func_name,
-            [m.div_ceil(2) as u32, 1, 1],
+            [grid as u32, 1, 1],
             [32, 1, 1],
             0,
             &mut params,
