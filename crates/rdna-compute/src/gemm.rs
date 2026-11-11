@@ -1158,6 +1158,16 @@ impl<'a> GemmEpilogue<'a> {
 /// large-batch regression.
 pub(crate) const LDSSTAGE_MAX_BATCH: usize = 96;
 
+impl Gpu {
+    /// The gfx12 small-batch LDS-staged F16 kernels (`LDSSTAGE_MAX_BATCH`) are a verify-window
+    /// optimization whose bytes need not equal the bulk kernels'. Under the ordinary prefill
+    /// intent every extent takes the bulk (BT / FP8 / IU4) route, never this one.
+    #[inline]
+    pub(crate) fn ldsstage_batch_ok(&self, n: usize) -> bool {
+        n <= LDSSTAGE_MAX_BATCH && !self.ordinary_prefill_active()
+    }
+}
+
 /// gfx11 (RDNA3 / RDNA3.5), both dGPU and iGPU. Re-measured on the PINNED 3.6
 /// trunk `86a5f80f…` (the fixture rule: measure 3.6 when it exists), which
 /// reproduced the earlier 3.5 numbers within +/-0.7 percentage points at every
@@ -11118,7 +11128,9 @@ impl Gpu {
             && !self.a8_prefill_active(n, k)
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && (n >= G12_FP8_F2_MIN_N || *G12_FP8_F2_FORCE_SMALL_N)
+            && (n >= G12_FP8_F2_MIN_N
+                || *G12_FP8_F2_FORCE_SMALL_N
+                || (n > 0 && self.ordinary_prefill_active()))
             && k > 0
             && k % 256 == 0
             && !dims.is_empty()
@@ -14295,7 +14307,7 @@ impl Gpu {
         // A 0.8b canary is NOT valid for this decision — it measured +11..+23% at
         // batch 512-8192 where 27B measures -3.5..-5.4% (see
         // .research/round5-verify-cost.md §17).
-        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH {
+        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && self.ldsstage_batch_ok(batch_size) {
             let kname = "gemm_gate_up_hfq4g256_wmma_gfx12_ldsstage";
             let ksrc = kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_SRC;
             self.ensure_kernel(kname, ksrc, kname)?;
@@ -14471,7 +14483,7 @@ impl Gpu {
         // site serves BOTH o_proj and down_proj in dense prefill/verify
         // (`GemmHfq4G256Residual`), so an ungated enable regressed 27B prefill
         // 3.5-5.4% while the verify regime (B=16) gains ~9%.
-        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH {
+        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && self.ldsstage_batch_ok(batch_size) {
             let kname = "gemm_hfq4g256_residual_wmma_gfx12_ldsstage";
             let ksrc = kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC;
             self.ensure_kernel(kname, ksrc, kname)?;
@@ -22421,11 +22433,25 @@ impl Gpu {
         // A partial N grid can still use FULL=true for every complete column
         // tile when M itself is full. The guarded wrapper below targets only
         // the one remaining column tile while retaining the original N stride.
-        let gridspec = self.flags.gfx11_iu4_gridspec
+        let gridspec_flag = self.flags.gfx11_iu4_gridspec
             && matches!(self.arch.as_str(), "gfx1151" | "gfx1100")
             && m % 128 == 0
             && batch_size >= 128
             && batch_size % 128 != 0;
+        // Ordinary prefill: the partial column tile (and every `n < 128` call) runs as a complete
+        // zero-padded 128-column tile ([`Self::gfx11_iu4_canonical_tail`]) so its fold is the
+        // symmetric one of every complete tile; the complete tiles take the interior launch.
+        let canonical_tail = symfold_requested
+            && self.ordinary_prefill_active()
+            && matches!(self.arch.as_str(), "gfx1151" | "gfx1100")
+            && m % 128 == 0
+            && batch_size % 128 != 0
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode;
+        if canonical_tail && batch_size < 128 {
+            return self.gfx11_iu4_canonical_tail(a_raw, x_i4_ptr, y, m, k, batch_size, add);
+        }
+        let gridspec = gridspec_flag || (canonical_tail && batch_size >= 128);
         let symfold = symfold_requested && (full || gridspec);
         // gfx1151/gfx1100 + eager + unchecked tiles → column-adjacent entries.
         // A grid-specialized partial N uses the same order for its unchecked
@@ -22754,7 +22780,7 @@ impl Gpu {
             }
         };
         self.ensure_kernel(module, source, kernel_name)?;
-        if gridspec {
+        if gridspec && !canonical_tail {
             self.ensure_kernel(module, source, GRIDSPEC_TAIL)?;
         }
         let mut a_ptr = a_raw.buf.as_ptr();
@@ -22814,6 +22840,7 @@ impl Gpu {
             );
             match interior_result {
                 Err(error) => Err(error),
+                Ok(()) if canonical_tail => Ok(()),
                 Ok(()) => self.launch_maybe_blob(
                     GRIDSPEC_TAIL,
                     [row_tiles as u32, 1, 1],
@@ -22855,6 +22882,81 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
+        if canonical_tail {
+            result?;
+            return self.gfx11_iu4_canonical_tail(a_raw, x_i4_ptr, y, m, k, batch_size, add);
+        }
+        result
+    }
+
+    /// gfx1100/gfx1151 canonical partial column tile of the symmetric IU4 SET/ADD (ordinary
+    /// prefill intent). A partial N tile reaches the guarded tail entry whose fold differs from
+    /// the symmetric one of a complete 128-column tile (measured: off by up to 4e-6), so a row's
+    /// bytes would depend on whether it lands in a whole or a partial tile of its call. The last
+    /// `n % 128` columns are therefore re-run as ONE complete, zero-padded 128-column tile: the
+    /// `block_i4_128` records of those tokens are copied out of the live token-layout sidecar
+    /// (`[K/128][N]`, 72 B records) into a private `[K/128][128]` sidecar (padding records are
+    /// all-zero: zero activations project to zero rows), run through the same consumer a complete
+    /// tile takes, and only the live rows are copied back. `add` preloads the live rows of `y`
+    /// into the private output first (ADD semantics); padded rows never reach `y`.
+    #[allow(clippy::too_many_arguments)]
+    fn gfx11_iu4_canonical_tail(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_i4_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        const TILE: usize = 128;
+        const RECORD: usize = 72;
+        let r = n % TILE;
+        let n_full = n - r;
+        let kb = k / 128;
+        debug_assert!(r != 0 && m % 128 == 0 && k % 256 == 0);
+        let tail_x_elems = kb * TILE * RECORD / 4;
+        let tail_x = self.alloc_tensor(&[tail_x_elems], DType::F32)?;
+        let tail_y = self.alloc_tensor(&[TILE * m], DType::F32)?;
+        let result = (|| -> HipResult<()> {
+            self.hip.memset(&tail_x.buf, 0, tail_x.byte_size())?;
+            self.hip.memset(&tail_y.buf, 0, tail_y.byte_size())?;
+            for b in 0..kb {
+                // SAFETY: the sidecar scratch holds `kb * n` records of `RECORD` bytes
+                // (`int4_mmq_x_needed`); the view covers records `[b * n + n_full, b * n + n)`.
+                let src = unsafe {
+                    hip_bridge::DeviceBuffer::from_raw(
+                        (x_i4_ptr as *mut u8).add((b * n + n_full) * RECORD) as *mut c_void,
+                        r * RECORD,
+                    )
+                };
+                let dst = tail_x.buf.byte_view(b * TILE * RECORD, r * RECORD);
+                self.hip.memcpy_dtod(&dst, &src, r * RECORD)?;
+            }
+            if add {
+                let live = y.buf.byte_view(n_full * m * 4, r * m * 4);
+                let dst = tail_y.buf.byte_view(0, r * m * 4);
+                self.hip.memcpy_dtod(&dst, &live, r * m * 4)?;
+            }
+            // A complete 128-column tile: the same consumer (and symmetric fold) a whole tile of
+            // the bulk call runs.
+            self.gemm_mq4g256v2_mmq_prequant_iu4(
+                a_raw,
+                tail_x.buf.as_ptr(),
+                &tail_y,
+                m,
+                k,
+                TILE,
+                add,
+                None,
+            )?;
+            let live = tail_y.buf.byte_view(0, r * m * 4);
+            let dst = y.buf.byte_view(n_full * m * 4, r * m * 4);
+            self.hip.memcpy_dtod(&dst, &live, r * m * 4)
+        })();
+        self.free_tensor(tail_x)?;
+        self.free_tensor(tail_y)?;
         result
     }
 
@@ -35899,8 +36001,11 @@ impl Gpu {
         self.gemm_mq4g256v2_mmq_set_prequant_iu4(a, xq, y, m, k, batch_size)
     }
 
-    /// Exact symmetric MQ4V2 producer/consumer route. Only a complete IU4
-    /// column tile may omit the otherwise necessary F32 rotated X.
+    /// Exact symmetric MQ4V2 producer/consumer route. Outside the ordinary prefill intent only a
+    /// complete IU4 column tile (`n >= 128`, `n % 128 == 0`) may omit the otherwise necessary
+    /// F32 rotated X; under the intent the fold is a static weight/geometry decision for every
+    /// extent (partial tiles run the canonical padded tile,
+    /// [`Self::gfx11_iu4_canonical_tail`], from the sidecar alone).
     pub fn mq4v2_fold_betaalpha_active(
         &self,
         qkv_m: usize,
@@ -35928,8 +36033,7 @@ impl Gpu {
             && beta_m == 48
             && alpha_m == 48
             && k == 5120
-            && n >= 128
-            && n % 128 == 0
+            && ((n >= 128 && n % 128 == 0) || (n > 0 && self.ordinary_prefill_active()))
     }
     /// Z's expanded M must be a complete tile of whichever SET kernel the
     /// architecture selects (M128 for V2C/X5, M256 for Halo v2b).
@@ -37780,7 +37884,7 @@ impl Gpu {
             self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_up, xq, y_up, up_m, k, batch_size)?;
             return Ok(());
         }
-        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH {
+        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && self.ldsstage_batch_ok(batch_size) {
             let kname = "gemm_gate_up_hfq4g256_wmma_gfx12_ldsstage";
             let ksrc = kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_SRC;
             let func_name = "gemm_gate_up_mq4g256v2_wmma_gfx12_ldsstage";
@@ -40420,7 +40524,7 @@ impl Gpu {
             self.gemm_mq4g256v2_mmq_add_prequant_iu4(a_raw, xq, y, m, k, batch_size)?;
             return Ok(());
         }
-        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH {
+        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && self.ldsstage_batch_ok(batch_size) {
             let kname = "gemm_hfq4g256_residual_wmma_gfx12_ldsstage";
             let ksrc = kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC;
             let func_name = "gemm_mq4g256v2_residual_wmma_gfx12_ldsstage";
@@ -50234,7 +50338,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH {
+        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && self.ldsstage_batch_ok(batch_size) {
             let kname = "gemm_gate_up_mq4cg256_wmma_gfx12_ldsstage";
             let ksrc = kernels::GEMM_GATE_UP_MQ4CG256_WMMA_GFX12_SRC;
             self.ensure_kernel(kname, ksrc, kname)?;
@@ -50466,7 +50570,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH {
+        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && self.ldsstage_batch_ok(batch_size) {
             let kname = "gemm_mq4cg256_residual_wmma_gfx12_ldsstage";
             let ksrc = kernels::GEMM_MQ4CG256_RESIDUAL_WMMA_GFX12_SRC;
             self.ensure_kernel(kname, ksrc, kname)?;
@@ -53322,6 +53426,39 @@ mod qwen4_trunk_ragged_tests {
         ] {
             assert_eq!(super::qwen4_trunk_iu4_ragged_rows(rows), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod qwen4_trunk_ordinary_prefill_tests {
+    use crate::prefill_invariant::PrefillRouteIntent as I;
+
+    /// Ordinary prefill: every positive extent is exactly one of dense (whole 128-row tiles) or
+    /// ragged (padded to whole 256-row tiles), never both, never neither; product / invariant
+    /// keep the 512-row floor. The padded count always covers the live rows and is a whole V2B tile.
+    #[test]
+    fn ordinary_prefill_partitions_every_extent() {
+        for rows in (1usize..=1300).chain([4097, 8151, 8191, 8192, 8193]) {
+            let dense = super::qwen4_trunk_iu4_dense_rows_for(I::OrdinaryPrefill, rows);
+            let ragged = super::qwen4_trunk_iu4_ragged_rows_for(I::OrdinaryPrefill, rows);
+            assert_ne!(dense, ragged.is_some(), "rows {rows}: exactly one of dense/ragged");
+            assert_eq!(dense, rows % 128 == 0, "rows {rows}");
+            if let Some(pad) = ragged {
+                assert!(pad >= rows && pad % 256 == 0 && pad - rows < 256, "rows {rows} pad {pad}");
+            }
+            for product in [I::Product, I::InvariantProfile] {
+                assert_eq!(
+                    super::qwen4_trunk_iu4_dense_rows_for(product, rows),
+                    super::qwen4_trunk_iu4_dense_rows(rows)
+                );
+                assert_eq!(
+                    super::qwen4_trunk_iu4_ragged_rows_for(product, rows),
+                    super::qwen4_trunk_iu4_ragged_rows(rows)
+                );
+            }
+        }
+        assert!(!super::qwen4_trunk_iu4_dense_rows_for(I::OrdinaryPrefill, 0));
+        assert_eq!(super::qwen4_trunk_iu4_ragged_rows_for(I::OrdinaryPrefill, 0), None);
     }
 }
 

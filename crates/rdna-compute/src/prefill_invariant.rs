@@ -803,6 +803,28 @@ mod tests {
         }
     }
 
+    /// The typed intents: ordinary prefill and the invariant profile both route canonically
+    /// (rows as [`QWEN4_PREFILL_CANON_ROWS`]); only the invariant profile suppresses the native
+    /// trunk IU4 route; product routes by the real rows.
+    #[test]
+    fn prefill_route_intent_semantics() {
+        assert!(!PrefillRouteIntent::Product.canonical_routing());
+        assert!(PrefillRouteIntent::InvariantProfile.canonical_routing());
+        assert!(PrefillRouteIntent::OrdinaryPrefill.canonical_routing());
+        assert!(!PrefillRouteIntent::Product.suppresses_trunk_iu4());
+        assert!(PrefillRouteIntent::InvariantProfile.suppresses_trunk_iu4());
+        assert!(!PrefillRouteIntent::OrdinaryPrefill.suppresses_trunk_iu4());
+        // Canonical routing wins over the EP-wave routing-row cap at every extent, a one-row
+        // tail included.
+        for rows in [1usize, 2, 8, 9, 25, 63, 64, 511, 512, 537, 8192] {
+            let canon = PrefillRouteIntent::OrdinaryPrefill.canonical_routing();
+            assert_eq!(
+                route_rows_of(canon, QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP, rows),
+                QWEN4_PREFILL_CANON_ROWS
+            );
+        }
+    }
+
     #[test]
     fn append_route_disabled_is_never_taken() {
         for prefill in [false, true] {

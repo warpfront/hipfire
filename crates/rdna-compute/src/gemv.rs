@@ -22098,14 +22098,17 @@ impl Gpu {
         )
     }
 
-    /// Whether a PREFILL call of `rows` rows sits at or above the lane WMMA prefill floor
-    /// ([`Gpu::qwen4_prefill_lwmma_floor`], `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR`) but within the
-    /// 16..=64-row decode-shaped window: such calls step off the decode-shaped lane WMMA / HC8
-    /// arms onto the row-count-invariant prefill entries. Pure. The floor is
-    /// `WIDE_VERIFY_MAX_ROWS + 1` (so this is never true) outside a Qwen4 prefill forward's tile
-    /// scopes: decode, verify, lane AR steps and MTP drafting never see a lowered floor.
+    /// Whether a PREFILL call of `rows` rows takes the row-count-invariant prefill lane-WMMA
+    /// entries instead of the 16..=64-row decode-shaped lane WMMA / HC8 arms: at or above the lane
+    /// WMMA prefill floor ([`Gpu::qwen4_prefill_lwmma_floor`],
+    /// `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR`) within that window, or ANY `2..=64`-row call under
+    /// the ordinary prefill intent ([`Gpu::ordinary_prefill_active`]), so a row's arithmetic does
+    /// not depend on the call's length. Pure. The floor is `WIDE_VERIFY_MAX_ROWS + 1` (so the
+    /// floor arm is never true) outside a Qwen4 prefill forward's tile scopes: decode, verify,
+    /// lane AR steps and MTP drafting never see a lowered floor, and never the ordinary intent.
     pub fn prefill_small_lane_rows(&self, rows: usize) -> bool {
         (self.qwen4_prefill_lwmma_floor..=WIDE_VERIFY_MAX_ROWS).contains(&rows)
+            || (self.ordinary_prefill_active() && (2..=WIDE_VERIFY_MAX_ROWS).contains(&rows))
     }
 
     /// Whether a lane WMMA projection of `rows` activation rows is taken: the

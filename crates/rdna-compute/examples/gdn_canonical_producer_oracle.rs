@@ -403,7 +403,7 @@ fn main() {
             }
             // The raw-tail materializer (carry rows of an incomplete scan tile) must produce the
             // reference rows' QKV/beta/alpha bytes as an independent `rows`-row call.
-            if arm == Arm::Prep && scope_on {
+            if arm == Arm::Prep && scope_on && gpu.iu4_producer_quant_fused_active(512, geo.k) {
                 let (mut raw_calls, mut raw_bad) = (0usize, 0usize);
                 for &rows in &[1usize, 2, 3, 15, 16, 17, 25, 31, 32, 33, 63, 64, 65, 100, 127, 128, 129] {
                     for &off in &[0usize, 5, 64, 1000, 8191 - rows] {
@@ -521,6 +521,16 @@ fn main() {
             bad += fused_bad;
         }
     }
+    // The other ordinary-prefill consumers the same gates reached: full-attention QKV, FFN
+    // gate/up, residual (ADD into a live residual) and the shared-expert down.
+    if !args.iter().any(|a| a == "--no-sites") {
+        let (c, b, first) = other_sites(&mut gpu, scope_on, quick);
+        total += c;
+        bad += b;
+        if first_bad.is_none() {
+            first_bad = first;
+        }
+    }
     println!(
         "{}",
         json!({"summary": true, "oracle": "gdn_canonical_producer", "config": config,
@@ -530,6 +540,140 @@ fn main() {
     if bad != 0 || cross_bad != 0 {
         std::process::exit(1);
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Site {
+    FaQkv,
+    GateUp,
+    ResidualAdd,
+    SharedDown,
+}
+
+/// `(name, k, output rows)` per site (A3B/27B-like shapes).
+fn site_shape(s: Site) -> (&'static str, usize, Vec<usize>) {
+    match s {
+        Site::FaQkv => ("fa_qkv", 2048, vec![8192, 512, 512]),
+        Site::GateUp => ("gate_up", 2048, vec![4096, 4096]),
+        Site::ResidualAdd => ("residual_add", 4096, vec![2048]),
+        Site::SharedDown => ("shared_down", 512, vec![2048]),
+    }
+}
+
+fn run_site(
+    gpu: &mut Gpu,
+    s: Site,
+    w: &[GpuTensor],
+    x: &GpuTensor,
+    ys: &[GpuTensor],
+    y0: &GpuTensor,
+    off: usize,
+    n: usize,
+) -> R {
+    let (_, k, ms) = site_shape(s);
+    let xv = x.sub_offset(off * k, n * k);
+    let y: Vec<GpuTensor> = ms.iter().zip(ys).map(|(m, t)| t.sub_offset(0, n * m)).collect();
+    match s {
+        Site::ResidualAdd => {
+            let r0 = y0.sub_offset(off * ms[0], n * ms[0]);
+            gpu.hip.memcpy_dtod(&y[0].buf, &r0.buf, r0.byte_size())?;
+        }
+        _ => {
+            for t in &y {
+                gpu.hip.memset(&t.buf, SENTINEL, t.byte_size())?;
+            }
+        }
+    }
+    match s {
+        Site::FaQkv => gpu.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2(
+            &w[0], &w[1], &w[2], &xv, &y[0], &y[1], &y[2], ms[0], ms[1], ms[2], k, n,
+        ),
+        Site::GateUp => gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2(
+            &w[0], &w[1], &xv, &y[0], &y[1], ms[0], ms[1], k, n,
+        ),
+        Site::ResidualAdd => gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2(&w[0], &xv, &y[0], ms[0], k, n),
+        Site::SharedDown => gpu.gemm_mq4g256v2(&w[0], &xv, &y[0], ms[0], k, n),
+    }
+}
+
+fn other_sites(gpu: &mut Gpu, scope_on: bool, quick: bool) -> (usize, usize, Option<Value>) {
+    let (mut total, mut bad) = (0usize, 0usize);
+    let mut first: Option<Value> = None;
+    for s in [Site::FaQkv, Site::GateUp, Site::ResidualAdd, Site::SharedDown] {
+        let (name, k, ms) = site_shape(s);
+        let w: Vec<GpuTensor> = ms
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let b = synth_sym_mq4g256v2(*m, k, 0x51de + 0x100 * i as u64 + k as u64);
+                gpu.upload_raw(&b, &[b.len()]).unwrap()
+            })
+            .collect();
+        let x = gpu
+            .upload_f32(&synth_x(REF_ROWS, k, 0x7a11 + k as u64), &[REF_ROWS, k])
+            .unwrap();
+        let y0 = gpu
+            .upload_f32(&synth_x(REF_ROWS, ms[0], 0x7a12), &[REF_ROWS, ms[0]])
+            .unwrap();
+        let ys: Vec<GpuTensor> = ms
+            .iter()
+            .map(|m| gpu.alloc_tensor(&[REF_ROWS, *m], DType::F32).unwrap())
+            .collect();
+        let dl = |gpu: &Gpu, n: usize| -> Vec<Vec<u8>> {
+            ms.iter()
+                .zip(&ys)
+                .map(|(m, t)| gpu.download_raw_bytes(&t.sub_offset(0, n * m)).unwrap())
+                .collect()
+        };
+        run_site(gpu, s, &w, &x, &ys, &y0, 0, REF_ROWS).expect("site reference");
+        gpu.hip.device_synchronize().unwrap();
+        let refo = dl(gpu, REF_ROWS);
+        let (mut calls, mut mism) = (0usize, 0usize);
+        let mut site_first: Option<Value> = None;
+        let mut failing_n: Vec<usize> = Vec::new();
+        for &n in N_LIST {
+            if quick && !(n <= 70 || n == 128 || n == 512 || n == 537 || n == 8192) {
+                continue;
+            }
+            for off in offsets_for(n) {
+                let prev = scope_on.then(|| gpu.ordinary_prefill_enter());
+                let res = run_site(gpu, s, &w, &x, &ys, &y0, off, n);
+                if let Some(p) = prev {
+                    gpu.ordinary_prefill_exit(p);
+                }
+                res.unwrap_or_else(|e| panic!("{name} n={n} off={off}: {e:?}"));
+                gpu.hip.device_synchronize().unwrap();
+                let got = dl(gpu, n);
+                let mut ok = true;
+                for (f, m) in ms.iter().enumerate() {
+                    if let Some(b) = first_diff(&got[f], &refo[f][off * m * 4..(off + n) * m * 4]) {
+                        ok = false;
+                        if site_first.is_none() {
+                            site_first = Some(json!({"site": name, "n": n, "off": off, "field": f,
+                                "row": b / 4 / m, "col": b / 4 % m}));
+                        }
+                    }
+                }
+                calls += 1;
+                mism += usize::from(!ok);
+                if !ok && off == 0 {
+                    failing_n.push(n);
+                }
+            }
+        }
+        println!(
+            "{}",
+            json!({"site": name, "calls": calls, "mismatching_calls": mism, "first_mismatch": site_first,
+                "failing_n_at_off0": failing_n, "flags": {"fp8_qkv": gpu.flags.gfx12_mq4v2_fp8_qkv,
+                "fp8_gateup": gpu.flags.gfx12_mq4v2_fp8_gateup, "fp8_resid": gpu.flags.gfx12_mq4v2_fp8_resid}})
+        );
+        total += calls;
+        bad += mism;
+        if first.is_none() {
+            first = site_first;
+        }
+    }
+    (total, bad, first)
 }
 
 /// One extent of the fused-versus-plain GDN preamble comparison on the 27B dims. `Ok(None)`: the
