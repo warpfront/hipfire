@@ -1424,7 +1424,8 @@ impl Qwen4ExpertStage {
             full_keys: Vec::new(),
             compact_bound: Vec::new(),
             first_host,
-            placement: None,
+            ep_slots: None,
+            ep_rank: 0,
             bytes: lent.map_or([0, 0], |(window, _)| window),
             copy_stream: gpu.hip.stream_create_non_blocking()?,
             ready: Vec::with_capacity(2),
@@ -1738,7 +1739,8 @@ impl Qwen4ExpertStage {
             full_keys: Vec::new(),
             compact_bound: Vec::new(),
             first_host,
-            placement: None,
+            ep_slots: None,
+            ep_rank: 0,
             bytes: [0, 0],
             copy_stream,
             ready: Vec::with_capacity(2),
@@ -2144,12 +2146,12 @@ impl Qwen4ExpertStage {
         // placement's pinned experts: refused here as the S2 stage refuses its own (the loader's
         // plan-time aggregate check already counted them).
         if let Some(lent) = borrow {
-            let layer_bytes = (0..placement.ranks)
-                .map(|rank| plan.stage_borrow_buffer_bytes(rank).iter().sum::<u64>())
-                .max()
-                .unwrap_or(0) as usize;
+            // Each rank's own lent bytes, summed (not the largest rank's times `ranks`).
+            let rank_layer_bytes: Vec<usize> = (0..placement.ranks)
+                .map(|rank| plan.stage_borrow_buffer_bytes(rank).iter().sum::<u64>() as usize)
+                .collect();
             let mirror_bytes =
-                crate::expert_residency::expert_stage_mirror_bytes(layer_bytes, placement.ranks)
+                crate::expert_residency::expert_stage_mirror_bytes(&rank_layer_bytes)
                     .map_err(invalid)?;
             let admitted = crate::expert_residency::check_host_ram(
                 mirror_bytes,
@@ -2220,7 +2222,10 @@ impl Qwen4ExpertStage {
             full_keys: Vec::new(),
             compact_bound: Vec::new(),
             first_host,
-            placement: Some(placement),
+            // EP marker only (compact-route gate): a unit stage rebases its own
+            // slab tables and never redirects through sealed donor slots.
+            ep_slots: Some(Vec::new()),
+            ep_rank: rank,
             bytes: if borrow.is_some() { lent_bytes } else { [0, 0] },
             copy_stream,
             ready: Vec::with_capacity(2),
@@ -2627,7 +2632,7 @@ impl Qwen4ExpertStage {
                  slots over {served_layers} layers ({:.1} MiB not copied, {rejected} live slots \
                  refused); merge gap {} units: {bridged_pieces} slot-live pieces ({:.1} MiB) \
                  copied anyway inside the staged bytes",
-                self.placement.map_or(0, |placement| placement.rank),
+                self.ep_rank,
                 state.forwards,
                 mib(staged),
                 mib(tail_off),
@@ -2973,7 +2978,7 @@ impl Qwen4GpuForward {
             "qwen4 EP rank {}: D2 tail prefill stage on: {} mixed staged layers name live tail \
              slots in their stage tables and skip those units' H2D bytes (copy runs merge across \
              slot-live gaps shorter than {} units)",
-            stage.placement.map_or(0, |placement| placement.rank),
+            stage.ep_rank,
             slots.layers.len(),
             slots.gap_units
         );

@@ -9,6 +9,7 @@
 //! cargo build --release -p hipfire-runtime --features lab --example ep_row_gather_probe
 //! ep_row_gather_probe bytes  --ranks 4 [--stream real|null]
 //! ep_row_gather_probe timing --ranks 4 --reps 200 --warmups 10 [--map balanced|skewed|recorded]
+//! HIPFIRE_EMULATE_GPUS=2 ep_row_gather_probe boundary
 //! ```
 //! Device selection is the caller's (fabric exports `HIPFIRE_DEVICES` /
 //! `ROCR_VISIBLE_DEVICES`); rank r = logical device r.
@@ -38,6 +39,15 @@
 //! host thread), then a stream synchronize of every rank; timed with the host
 //! monotonic clock. Output is JSONL: a `meta` line, one `timing` line per rep
 //! and a `summary` line. Eager only: no graph capture/replay is involved.
+//!
+//! # `boundary`
+//!
+//! Two ranks, kernel boundaries (`HIPFIRE_EP_BOUNDARY=kernel` transport, no
+//! model), one host thread per rank through `exchange`: rows must be bit-exact
+//! and `check_step` must pass; a rank delayed 800 ms (past the 500 ms bounded
+//! wait) must leave a `device wait timeout` on its peer; a rank's host failure
+//! must leave `EP boundary poisoned` on its peer. Runs under logical emulation
+//! on any arch: it tests the transport, not gfx12 cache coherence.
 
 use hipfire_runtime::ep_row_gather::{EpRowGather, EpRowGatherSpec, EpSlotOwners};
 use rdna_compute::{Gpu, GpuTensor};
@@ -172,14 +182,19 @@ struct Rig {
     bufs: Vec<Vec<GpuTensor>>,
     real_stream: bool,
     warm: Vec<(GpuTensor, GpuTensor)>,
+    /// Build transports with device kernel boundaries (`boundary` mode).
+    kernel: bool,
 }
 
 impl Rig {
     fn new(n: usize, real_stream: bool, warm_bytes: usize) -> R<Self> {
+        // `HIPFIRE_EMULATE_GPUS` aliases every logical rank onto device 0.
+        let emulated = std::env::var_os("HIPFIRE_EMULATE_GPUS").is_some();
         let mut gpus = Vec::with_capacity(n);
         for r in 0..n {
+            let device = if emulated { 0 } else { r as i32 };
             gpus.push(ctx(
-                Gpu::init_with_device(r as i32),
+                Gpu::init_with_device(device),
                 &format!("init rank {r}"),
             )?);
         }
@@ -219,6 +234,7 @@ impl Rig {
             bufs,
             real_stream,
             warm,
+            kernel: false,
         })
     }
 
@@ -255,7 +271,8 @@ impl Rig {
             slots: SLOTS,
             row_bytes: ROW_BYTES,
         })
-        .device_waits(true);
+        .device_waits(true)
+        .kernel_boundaries(self.kernel);
         for r in 0..self.n {
             let set: Vec<&GpuTensor> = self.bufs[r].iter().take(k).collect();
             ctx(
@@ -350,9 +367,19 @@ enum Fault {
     FlipOwnerSource {
         slot: usize,
     },
-    /// `rank` never gathers.
     SkipGather {
         rank: usize,
+    },
+    /// `rank` sleeps `ms` before its exchange of `round`.
+    DelayRank {
+        rank: usize,
+        round: usize,
+        ms: u64,
+    },
+    /// `rank` fails on the host before its exchange of `round`.
+    FailRank {
+        rank: usize,
+        round: usize,
     },
 }
 
@@ -360,6 +387,8 @@ struct CaseOut {
     mismatched_bufs: usize,
     compared_bytes: usize,
     first: Option<String>,
+    /// Kernel-boundary runs only: issue, `check_step` and per-rank wait-block errors.
+    errors: Vec<String>,
 }
 
 /// One rank's exclusive view for its worker thread. `Gpu` and device handles are
@@ -441,6 +470,21 @@ fn run_case(
                         let (gpu, bufs, d) = unsafe { (&mut *job.gpu, &*job.bufs, &*job.data) };
                         let body = (|| -> R<()> {
                             for round in 0..rounds {
+                                match fault {
+                                    Fault::DelayRank {
+                                        rank: r,
+                                        round: at,
+                                        ms,
+                                    } if r == rank && at == round => {
+                                        std::thread::sleep(Duration::from_millis(ms));
+                                    }
+                                    Fault::FailRank { rank: r, round: at }
+                                        if r == rank && at == round =>
+                                    {
+                                        return Err(format!("rank {rank} injected host failure"));
+                                    }
+                                    _ => {}
+                                }
                                 let parity = round % k;
                                 ctx(
                                     gpu.copy_f32_buffer(&bufs[parity], &d.staging[round], words),
@@ -536,9 +580,27 @@ fn run_case(
             Ok(())
         })()
     };
+    let mut errors = Vec::new();
+    if rig.kernel {
+        if let Err(e) = &issue_err {
+            errors.push(e.clone());
+        }
+        if let Err(e) = transport.check_step() {
+            errors.push(format!("check_step: {e}"));
+        }
+    }
     let sync_err = rig.sync_all();
+    if rig.kernel {
+        for (r, g) in rig.gpus.iter().enumerate() {
+            if let Err(e) = g.take_device_wait_error() {
+                errors.push(format!("rank {r}: {e}"));
+            }
+        }
+    }
     let rel = rig.release_transport(&transport);
-    issue_err?;
+    if !rig.kernel {
+        issue_err?;
+    }
     sync_err?;
     rel?;
 
@@ -546,6 +608,7 @@ fn run_case(
         mismatched_bufs: 0,
         compared_bytes: 0,
         first: None,
+        errors,
     };
     for r in 0..n {
         for round in 0..rounds {
@@ -657,6 +720,68 @@ fn bytes_mode(n: usize, real_stream: bool) -> R<bool> {
             ),
         );
     }
+    rig.teardown()?;
+    Ok(all_ok)
+}
+
+// ───────────────────────────── boundary mode ─────────────────────────────
+
+fn boundary_mode() -> R<bool> {
+    let mut rig = Rig::new(2, true, 0)?;
+    rig.kernel = true;
+    let experts = map_experts("balanced", 2)?;
+    let mut all_ok = true;
+    let mut report = |ok: bool, line: String| {
+        println!("{} {line}", if ok { "PASS" } else { "FAIL" });
+        all_ok &= ok;
+    };
+    let errs = |o: &CaseOut| o.errors.join(" | ");
+    let o = run_case(&mut rig, &experts, true, Fault::None, BYTES_ROUNDS, 2)?;
+    report(
+        o.mismatched_bufs == 0 && o.errors.is_empty(),
+        format!(
+            "boundary bytes ranks=2 rounds={BYTES_ROUNDS} compared={}B mismatched_snapshots={} errors=[{}]{}",
+            o.compared_bytes,
+            o.mismatched_bufs,
+            errs(&o),
+            o.first.as_deref().map(|f| format!(" first: {f}")).unwrap_or_default()
+        ),
+    );
+    // Round 0 meets on the host; round 1 is a pure device boundary.
+    let o = run_case(
+        &mut rig,
+        &experts,
+        true,
+        Fault::DelayRank {
+            rank: 1,
+            round: 1,
+            ms: 800,
+        },
+        2,
+        2,
+    )?;
+    report(
+        o.errors.iter().any(|e| e.contains("device wait timeout")),
+        format!(
+            "boundary delayed-rank-800ms: errors=[{}] (must contain `device wait timeout`)",
+            errs(&o)
+        ),
+    );
+    let o = run_case(
+        &mut rig,
+        &experts,
+        true,
+        Fault::FailRank { rank: 1, round: 1 },
+        2,
+        2,
+    )?;
+    report(
+        o.errors.iter().any(|e| e.contains("EP boundary poisoned")),
+        format!(
+            "boundary host-failure: errors=[{}] (must contain `EP boundary poisoned`)",
+            errs(&o)
+        ),
+    );
     rig.teardown()?;
     Ok(all_ok)
 }
@@ -841,7 +966,8 @@ fn timing_mode(cfg: &TimingCfg) -> R<()> {
 
 fn usage() -> &'static str {
     "usage: ep_row_gather_probe bytes  --ranks N [--stream real|null]\n       \
-     ep_row_gather_probe timing --ranks N --reps N --warmups N [--map balanced|skewed|recorded] [--stream real|null] [--warm-seconds S] [--label S]"
+     ep_row_gather_probe timing --ranks N --reps N --warmups N [--map balanced|skewed|recorded] [--stream real|null] [--warm-seconds S] [--label S]\n       \
+     ep_row_gather_probe boundary"
 }
 
 fn run() -> R<bool> {
@@ -885,6 +1011,7 @@ fn run() -> R<bool> {
     }
     match mode.as_str() {
         "bytes" => bytes_mode(cfg.n, cfg.real_stream),
+        "boundary" => boundary_mode(),
         "timing" => {
             if cfg.reps == 0 {
                 return Err("--reps must be >= 1".into());

@@ -17,7 +17,7 @@
 //! The hook is taken out of the thread for the duration of the split launch,
 //! so nested entry points never exchange twice.
 
-use crate::families::gemv::{weight_row_bytes, WeightRef};
+use crate::families::gemv::WeightRef;
 use crate::types::DispatchError;
 use rdna_compute::{Gpu, GpuTensor};
 use smallvec::SmallVec;
@@ -81,7 +81,9 @@ pub(crate) fn is_split(gpu: &Gpu, weight: &WeightRef<'_>, rows: usize) -> bool {
 }
 
 /// A band the launch can take: equal bands of whole rows whose byte view
-/// lies inside the weight's allocation. BF16 weights never band: their lazy
+/// lies inside the weight's allocation, with the allocation's row stride
+/// equal to the dtype's encoded row (planar formats and pooled buffers larger
+/// than the weight never band). BF16 weights never band: their lazy
 /// F16 shadows are keyed by the weight's device pointer, which the first band
 /// shares with the whole matrix.
 fn band_of(
@@ -94,9 +96,32 @@ fn band_of(
         return None;
     }
     let (lo, hi) = hook.band(gpu, weight, rows)?;
-    let row_bytes = weight_row_bytes(weight)?;
+    band_geometry(
+        weight.dtype,
+        weight.m,
+        weight.k,
+        weight.buf.buf.size(),
+        lo,
+        hi,
+    )
+}
+
+/// [`band_of`] past the hook: `(lo, hi, row_bytes)` when the `alloc`-byte
+/// weight of `m` rows is exactly `m` encoded rows of `k` and `[lo, hi)` is an
+/// equal band of whole rows.
+fn band_geometry(
+    dtype: rdna_compute::DType,
+    m: usize,
+    k: usize,
+    alloc: usize,
+    lo: usize,
+    hi: usize,
+) -> Option<(usize, usize, usize)> {
+    let row_bytes = dtype
+        .row_bytes(k)
+        .filter(|&b| m.checked_mul(b) == Some(alloc))?;
     let width = hi.checked_sub(lo)?;
-    (width > 0 && hi <= weight.m && lo.is_multiple_of(width) && weight.m.is_multiple_of(width))
+    (width > 0 && hi <= m && lo.is_multiple_of(width) && m.is_multiple_of(width))
         .then_some((lo, hi, row_bytes))
 }
 
@@ -211,4 +236,39 @@ pub(crate) fn split_projections(
         .collect();
     hook.exchange(gpu, buffer, &exchange)
         .map_err(DispatchError::Hip)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::band_geometry;
+    use rdna_compute::DType;
+
+    #[test]
+    fn bands_only_whole_encoded_rows_of_an_exact_allocation() {
+        // MQ6G256V2, k = 2048: 8 groups x 200 B = 1600 B per row.
+        let (m, k, row) = (4096, 2048, 1600);
+        assert_eq!(
+            band_geometry(DType::MQ6G256V2, m, k, m * row, 2048, 4096),
+            Some((2048, 4096, row))
+        );
+        // A pooled buffer larger than the weight (still a multiple of m).
+        assert_eq!(
+            band_geometry(DType::MQ6G256V2, m, k, m * (row + 16), 0, 2048),
+            None
+        );
+        // Planar MQ-I4: no per-row stride, whatever the allocation divides into.
+        assert_eq!(
+            band_geometry(DType::MQ3I4G128R256, m, k, m * row, 0, 2048),
+            None
+        );
+        // Unequal or out-of-range bands.
+        assert_eq!(
+            band_geometry(DType::MQ6G256V2, m, k, m * row, 0, 1365),
+            None
+        );
+        assert_eq!(
+            band_geometry(DType::MQ6G256V2, m, k, m * row, 4096, 6144),
+            None
+        );
+    }
 }
