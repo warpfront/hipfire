@@ -74,27 +74,37 @@ extern "C" __global__ void hetero_publish_cold(
 }
 
 // One thread. Bounded wait for the layer's response; on timeout record the
-// expected sequence in the slot's error word (the host fails the request).
+// expected sequence in the slot's error word (the host fails the request) and
+// in the load-wide poison word. A wait that finds the split already poisoned
+// (an earlier timeout, or the responder stopped) gives up at once: it checks
+// the word on entry and every 1024 polls, so a dead expert device costs one
+// bounded wait per forward, not one per remaining layer.
 extern "C" __global__ void hetero_await_cold(
     const unsigned* __restrict__ counter,
     unsigned layer,
     unsigned layers,
     const unsigned* resp_seq,
     unsigned* error,
-    unsigned max_polls) {
+    unsigned max_polls,
+    unsigned* poison) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
     const unsigned want = hs_seq(counter[0], layer, layers);
     // Relaxed polling, one acquire on the match: a system-scope acquire per poll
     // invalidates the device caches every few hundred cycles, which stalls the
     // other streams' kernels for the whole wait.
-    for (unsigned n = 0; n < max_polls; ++n) {
+    bool poisoned = __hip_atomic_load(poison, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) != 0u;
+    for (unsigned n = 0; !poisoned && n < max_polls; ++n) {
         if (__hip_atomic_load(const_cast<unsigned*>(resp_seq), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) == want) {
             __atomic_thread_fence(__ATOMIC_ACQUIRE);
             return;
         }
+        if ((n & 1023u) == 1023u) {
+            poisoned = __hip_atomic_load(poison, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) != 0u;
+        }
         __builtin_amdgcn_s_sleep(8);
     }
     hs_store(error, want);
+    if (!poisoned) hs_store(poison, want);
 }
 
 // One block per routed slot. Copy the cold slots' rows from the mailbox into

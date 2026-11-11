@@ -60,6 +60,9 @@ impl Mailbox {
             ids: b + ids as u64,
             weights: b + weights as u64,
             cold_out: b + cold_out as u64,
+            // Per slot here (a free word of its header), so the deliberate
+            // timeout of one case does not short-circuit the next case's wait.
+            poison: b + 224,
         }
     }
 }
@@ -320,6 +323,29 @@ fn main() {
     if dt > Duration::from_millis(100) {
         fail("d", format!("timed-out wait took {dt:?}"));
     }
+    if word(s1.poison).load(Ordering::Acquire) != seq_for(1, 1, LAYERS) {
+        fail("d", "the timeout did not set the poison word".into());
+    }
+
+    // ---- (d2): a wait on a poisoned split gives up at once (layer 3, a bound
+    // that would poll for minutes), sets its error word, and leaves the
+    // poison word's first value.
+    let s3 = mb.slot(3);
+    word(s3.poison).store(0xdead, Ordering::Release);
+    let t = Instant::now();
+    gpu.hetero_await_cold(&counter, 3, LAYERS, &s3, 50_000_000)
+        .unwrap();
+    gpu.hip.device_synchronize().unwrap();
+    let dt = t.elapsed();
+    if word(s3.error).load(Ordering::Acquire) != seq_for(1, 3, LAYERS) {
+        fail("d2", "a poisoned wait did not set its error word".into());
+    }
+    if word(s3.poison).load(Ordering::Acquire) != 0xdead {
+        fail("d2", "a poisoned wait overwrote the poison word".into());
+    }
+    if dt > Duration::from_millis(100) {
+        fail("d2", format!("a poisoned wait took {dt:?}"));
+    }
 
     // ---- (e): zero cold slots still pair (layer 2).
     let none = upload_u8(&mut gpu, &vec![0u8; N_EXP]);
@@ -375,6 +401,8 @@ fn main() {
     unsafe { std::ptr::write_bytes(pb, 0, p_total) };
     let pa = pb as u64;
     let p_err = pa;
+    // The chunk's poison word: a free header word before `p_x`.
+    let p_poison = pa + 448;
     let req = move |i: usize| pa + (64 * (1 + 3 * i)) as u64;
     let resp = move |i: usize| req(i) + 64;
     let meta = move |i: usize| req(i) + 128;
@@ -465,6 +493,7 @@ fn main() {
                 ids: 0,
                 weights: 0,
                 cold_out: 0,
+                poison: p_poison,
             };
             gpu.hetero_await_cold(&counter, layer, LAYERS, &slot, polls)
                 .unwrap();
@@ -569,6 +598,7 @@ fn main() {
         // SAFETY: poison the partial so a wrong add would show; clear the error.
         unsafe { std::ptr::write_bytes((pa + p_part as u64) as *mut u8, 0x41, PROWS * DIM * 2) };
         word(p_err).store(0, Ordering::Release);
+        word(p_poison).store(0, Ordering::Release);
         let before = gpu.download_f32(&x_batch).unwrap();
         let r = respond(layer, answer);
         chunk(&mut gpu, &bitmap_t, layer, 20_000);
@@ -584,6 +614,7 @@ fn main() {
         }
     }
     word(p_err).store(0, Ordering::Release);
+    word(p_poison).store(0, Ordering::Release);
     // (h) zero cold: masked == ids.
     gpu.hetero_publish_rows(
         &xs_t,

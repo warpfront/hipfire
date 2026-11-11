@@ -23,6 +23,9 @@ pub struct HeteroSlotPtrs {
     pub ids: u64,
     pub weights: u64,
     pub cold_out: u64,
+    /// The load-wide poison word (shared by every slot): nonzero once any wait
+    /// timed out or the responder stopped; later waits give up at once.
+    pub poison: u64,
 }
 
 fn p<T>(v: &T) -> *mut c_void {
@@ -131,7 +134,8 @@ impl Gpu {
     }
 
     /// Bounded wait (one thread) for the layer's response; on timeout the slot's
-    /// error word gets the expected sequence.
+    /// error word and the poison word get the expected sequence. Returns at once
+    /// (timed out) when the poison word is already set.
     pub fn hetero_await_cold(
         &mut self,
         counter: &GpuTensor,
@@ -142,7 +146,16 @@ impl Gpu {
     ) -> HipResult<()> {
         let c = counter.buf.as_ptr();
         let (rs, er) = (slot.resp_seq as *mut c_void, slot.error as *mut c_void);
-        let mut params = vec![p(&c), p(&layer), p(&layers), p(&rs), p(&er), p(&max_polls)];
+        let pz = slot.poison as *mut c_void;
+        let mut params = vec![
+            p(&c),
+            p(&layer),
+            p(&layers),
+            p(&rs),
+            p(&er),
+            p(&max_polls),
+            p(&pz),
+        ];
         self.hetero_launch("hetero_await_cold", 1, 1, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(c);
@@ -151,6 +164,7 @@ impl Gpu {
             b.push_ptr(rs);
             b.push_ptr(er);
             b.push_u32(max_polls);
+            b.push_ptr(pz);
             b
         })
     }

@@ -789,9 +789,6 @@ fn report_gpu_init_failure(err: &hip_bridge::HipError) {
     eprintln!("  Run `hipfire diag` for a full environment report.");
 }
 
-/// Validate and install process policy, resolving `hardware.devices` against
-/// the KFD topology before any GPU runtime initializes. `claim` reserves each
-/// resolved card as part of that same step.
 /// `HIPFIRE_QWEN_CACHE_TRACE=1`: how long the process sat idle before a
 /// `generate` arm (since the previous arm ended) and how long the arm ran,
 /// to tell a client-side wait from work done here after a `done`.
@@ -843,6 +840,9 @@ impl Drop for GenerateArmTrace {
     }
 }
 
+/// Validate and install process policy, resolving `hardware.devices` against
+/// the KFD topology before any GPU runtime initializes. `claim` reserves each
+/// resolved card as part of that same step.
 fn install_process_config(
     config: hipfire_config::ProcessConfig,
     claim: &mut hipfire_config::devices::ClaimFn<'_>,

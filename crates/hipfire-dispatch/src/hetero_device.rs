@@ -142,6 +142,8 @@ struct PrefillSlot {
 /// caller (the layer-major schedule keeps several tiles in flight).
 pub struct HeteroPrefillShared {
     pub mailbox: u64,
+    /// The load-wide poison word ([`HeteroSlotPtrs::poison`]).
+    pub poison: u64,
     /// `sub_chunks` is a slot's count; a chunk uses
     /// [`PrefillGeometry::sub_chunks_for`] of them.
     pub geom: PrefillGeometry,
@@ -186,6 +188,7 @@ impl HeteroPrefillShared {
     pub fn new(
         gpu: &mut Gpu,
         mailbox: u64,
+        poison: u64,
         slot_offsets: &[PrefillOffsets],
         geom: PrefillGeometry,
         n_experts: usize,
@@ -231,6 +234,7 @@ impl HeteroPrefillShared {
         }
         Ok(Self {
             mailbox,
+            poison,
             geom,
             n_experts: n_experts as i32,
             counter,
@@ -259,6 +263,41 @@ impl HeteroPrefillShared {
 
     pub fn slots(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Release the primary's buffers, events and side streams at unload.
+    /// The caller has drained the device; every layer's split (which holds
+    /// this exchange) is gone. Reports the first failure and keeps freeing.
+    pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let mut first: Option<hip_bridge::HipError> = None;
+        let mut keep = |r: hip_bridge::HipResult<()>| {
+            if let Err(e) = r {
+                first.get_or_insert(e);
+            }
+        };
+        for slot in self.slots {
+            for t in [
+                slot.x_f16,
+                slot.xq,
+                slot.partial,
+                slot.err_local,
+                slot.route_local,
+            ] {
+                keep(gpu.free_tensor(t));
+            }
+            keep(gpu.hip.event_destroy(slot.published));
+            keep(gpu.hip.event_destroy(slot.returned));
+        }
+        for stream in [self.out, self.back] {
+            if let Some(s) = stream.into_inner().ok().flatten() {
+                keep(gpu.hip.stream_destroy(s));
+            }
+        }
+        if let Some(trace) = self.trace {
+            keep(gpu.hip.event_destroy(trace.start));
+            keep(gpu.hip.event_destroy(trace.hot));
+        }
+        first.map_or(Ok(()), |e| Err(hip(e)))
     }
 
     /// The slot the next publish uses (the layer-major schedule's tile).
@@ -323,6 +362,25 @@ pub struct HeteroPrefillSplit {
     pub cold_bitmap: GpuTensor,
     /// The primary's routed ids with cold slots masked to -1 (`max_rows x top_k`).
     pub masked_ids: GpuTensor,
+}
+
+impl HeteroDeviceSplit {
+    /// Release the layer's own buffers (the cold bitmap and masked ids) at
+    /// unload; `counter` is a view of the load's counter and stays.
+    pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let a = gpu.free_tensor(self.cold_bitmap);
+        let b = gpu.free_tensor(self.masked_ids);
+        a.and(b).map_err(hip)
+    }
+}
+
+impl HeteroPrefillSplit {
+    /// Release the layer's masked ids at unload; `cold_bitmap` is a view of
+    /// the decode split's, and the shared exchange is dropped here (freed by
+    /// its owner once the last layer let go).
+    pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        gpu.free_tensor(self.masked_ids).map_err(hip)
+    }
 }
 
 /// Run `f` with `slot`'s stream as the active stream, restoring both.
@@ -578,6 +636,7 @@ impl HeteroPrefillSplit {
                     ids: 0,
                     weights: 0,
                     cold_out: 0,
+                    poison: sh.poison,
                 };
                 gpu.hetero_await_cold(&sh.counter, self.layer, self.layers, &slot, sh.max_polls)
                     .map_err(hip)?;
